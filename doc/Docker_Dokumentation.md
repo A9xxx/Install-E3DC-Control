@@ -2,8 +2,14 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.4b`. Die Tags `latest`, `v5.4.4b` und
-`5.4.4b` müssen auf denselben geprüften Multi-Arch-Digest verweisen.
+Der aktuelle Stable-Stand ist `v5.4.4c`. Die Tags `latest`, `v5.4.4c` und
+`5.4.4c` bezeichnen denselben Stable-Stand.
+
+5.4.4c korrigiert ausschließlich den Update- und Reparaturpfad. Der direkte
+Bare-Metal-Ziel-Updater ist unabhängig vom Nutzer-`.git`, arbeitet mit
+Vollbackup, ruhender Daten-Nachsicherung und genau einem kurzen Dienststopp und
+verwendet weder alten Finalizer noch Recovery-Bootblock. Das Containerprodukt
+erhält gegenüber 5.4.4b keine neue EMS- oder Hardwarelogik.
 
 5.4.4b erweitert den Host-Updater um die semantisch gebundene Migration der
 veröffentlichten 5.3.2b-Compose-Struktur und der bekannten 5.4.2-Bestände. Die
@@ -299,7 +305,7 @@ unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.4b` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.4c` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -326,7 +332,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.4b` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.4c` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash

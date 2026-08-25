@@ -1,18 +1,28 @@
 {
-  "version": "5.4.4b",
+  "version": "5.4.4c",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.4b",
-  "release_date": "2026-08-24",
-  "description": "v5.4.4b - Universelles Update, robuste Verbraucherbudgets und sichere Messwerterfassung",
+  "stable_release": "v5.4.4c",
+  "release_date": "2026-08-25",
+  "description": "v5.4.4c - Git-unabhängiger Update- und Reparaturpfad mit kurzer Unterbrechung",
+  "update_strategy": "backup_replace_restart_v1",
   "installer_requires": "python3",
   "sanitized_republication": false,
   "history_transition": {
-    "strategy": "installer_bootstrap",
+    "strategy": "downloaded_release_updater",
     "manual_git_pull_supported": false,
-    "requires_verified_external_backup": true,
-    "requires_exact_target_sha": true,
-    "requires_safe_actor_state": true,
-    "requires_boot_service_http_ha_health_validation": true
+    "existing_git_required": false,
+    "local_product_changes": "replace_after_backup",
+    "missing_product_files": "restore_from_release",
+    "wrong_permissions": "repair",
+    "requires_verified_full_backup": true,
+    "service_stop_scope": "cutover_only",
+    "typical_abort_reasons": [
+      "installation_ambiguous",
+      "backup_failed",
+      "release_unavailable",
+      "write_or_root_unavailable",
+      "required_service_failed"
+    ]
   },
   "legacy_hybrid_updates": [
     {
@@ -35,7 +45,7 @@
       "rollback_root": true,
       "bare_metal_supported": false,
       "docker_supported": true,
-      "notes": "Sanitierter parentloser Docker-Rollback-Root; wegen des fehlenden zielgebundenen Finalizers kein Bare-Metal-Programm-Rollback."
+      "notes": "Sanitierter parentloser Docker-Rollback-Root; ohne den aktuellen Git-unabhängigen Ziel-Updater kein unterstützter Bare-Metal-Programm-Rückfall."
     }
   ],
   "rollback_release_shas": {
@@ -66,6 +76,7 @@
     "/var/www/html/data/morning_boost_state.json"
   ],
   "apt_packages": [
+    "rsync",
     "php-sqlite3",
     "php-mbstring",
     "libapache2-mod-php",

@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.4b Stable</span>
+            <span class="badge bg-success text-light">v5.4.4c Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem geprüften Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.4b</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.4c</code> in <code>.env</code> gesetzt.</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
 if [ -f ./docker_compose_update.py ]; then
   E3DC_DOCKER_HELPER=./docker_compose_update.py
@@ -212,6 +212,28 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                         <li>Nach der Freigabe im Account den RESTful API Security Token erzeugen.</li>
                         <li>Im Config-Editor unter <em>Tarif</em> den ENTSO-E-Token als Fallback-Token eintragen und mit <em>ENTSO-E testen</em> prüfen.</li>
                     </ol>
+                </div>
+            </div>
+        </div>
+
+        <h4 class="mb-4 text-accent"><i class="fas fa-shield-halved me-2"></i>Stable 5.4.4c: Git-unabhängiges Update und Reparatur</h4>
+        <div class="col-12 faq-item" data-tags="5.4.4c stable update bootstrap backup reparatur git dienststopp finalizer bootblock">
+            <div class="card bg-card border-0 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <span class="tag">5.4.4c</span>
+                        Was ändert das Stable-Release 5.4.4c am Update?
+                    </h5>
+                    <ul>
+                        <li><strong>Nutzer-Git ist irrelevant:</strong> Der Ziel-Updater sichert den betriebenen Bestand und ersetzt lokale Produktänderungen, fehlende Dateien oder falsche Rechte direkt aus dem veröffentlichten Release. Ein altes oder beschädigtes <code>.git</code>-Verzeichnis blockiert nicht.</li>
+                        <li><strong>Eine kurze Unterbrechung:</strong> Das Vollbackup entsteht bei laufenden Diensten. Danach werden die Dienste genau einmal kurz gestoppt, die nun ruhenden veränderlichen Daten nachgesichert und Produktdateien, Rechte, Core-Units sowie Launcher ausgetauscht.</li>
+                        <li><strong>Direkter Wechsel:</strong> Der normale Pfad verwendet weder den alten Release-Finalizer noch seine Same-Filesystem-Bedingung oder den persistenten Recovery-Bootblock. Anschließend werden die benötigten Dienste neu gestartet und der installierte Stand geprüft.</li>
+                        <li><strong>Eindeutiger Fehlerstand:</strong> Scheitert der Austausch nach der ersten Produktänderung, werden Vollbackup und die neuere ruhende Daten-Nachsicherung wiederhergestellt, bevor frühere Dienste erneut anlaufen. Ein bereits bestätigter Zielstand bleibt bei einem späteren Bereinigungsfehler erhalten.</li>
+                        <li><strong>Rollenrichtig:</strong> Standalone-Dienste starten ohne Zusatzbedienung. Im HA-Betrieb gibt ein einziges lokales Starttor die verwalteten Dienste nur mit gültiger Owner-Lease frei; Shadow bleibt read-only.</li>
+                        <li><strong>Reparatur derselben Version:</strong> Der Update-Button darf denselben Stable-Stand erneut installieren. Die Versionsanzeige ist rein informativ und blockiert den Start weder bei gleicher Version noch bei einem fehlgeschlagenen Netzwerkcheck.</li>
+                        <li><strong>Einmalige Altstandsbrücke:</strong> Erreicht ein defekter 5.4.4b-Launcher den neuen Updater noch nicht, kopiere einmalig <code>e3dc-update-bootstrap</code> auf den Raspberry Pi und starte <code>sudo /bin/sh ./e3dc-update-bootstrap</code>.</li>
+                        <li><strong>Keine Regelungsänderung:</strong> EMS-, Speicher-, Wallbox-, Wärmepumpen-, Direktvermarktungs- und Hardwarelogik entsprechen unverändert 5.4.4b.</li>
+                    </ul>
                 </div>
             </div>
         </div>
@@ -1339,12 +1361,11 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                         <li>Über das Dashboard (Kachel Konfiguration -> "Update suchen").</li>
                         <li>Bei aktuellen Ständen direkt über den Menüpunkt <em>Update</em> im Installer.</li>
                     </ol>
-                    <p>Weboberfläche, Konsole, Installer-Menü und automatische Updateprüfung starten denselben root-eigenen Hintergrundauftrag. Der lokale Git-, Rechte- oder Änderungszustand ist keine vorgelagerte Startautorität. Erst der heruntergeladene Ziel-Updater erstellt und prüft das Backup, beendet die Writer, projiziert Dateien und Rechte und bestätigt danach Dienststart und Gesundheit.</p>
+                    <p>Weboberfläche, Konsole und Installer-Menü starten denselben root-eigenen Hintergrundauftrag. Die automatische Updateprüfung verwendet dieselbe Stable-Quelle und informiert nur über einen neuen Stand. Der lokale Git-, Rechte- oder Änderungszustand ist keine vorgelagerte Startautorität. Der heruntergeladene Ziel-Updater erstellt das Vollbackup, stoppt die betroffenen Dienste einmal kurz, ersetzt Dateien und Rechte und bestätigt danach den Wiederanlauf.</p>
                     <p>Für eine heterogene Altinstallation genügt genau eine auf den Raspberry Pi kopierte Datei. Im Ablageverzeichnis wird sie ohne Pfad- oder Rollenargument gestartet:</p>
                     <pre>sudo /bin/sh ./e3dc-update-bootstrap</pre>
                     <p>Der damit gestartete veröffentlichte Updatepfad ermittelt Installationsordner, Installationsbenutzer und Anlagenrolle selbst und arbeitet im Hintergrund. Der Start gibt Status- und Protokollbefehl aus; das Terminal kann danach geschlossen werden. Bei mehreren gleichrangig erkannten Installationen oder einer widersprüchlichen Rolle stoppt der Auftrag mit Diagnose, statt zu raten.</p>
-                    <p>Auch ein erneut gestarteter Auftrag folgt dem vollständigen Ziel-Updatervertrag. Es gibt keinen ungeprüften Schnellpfad: Backup, Writer-Ruhe, Projektion, Dienststart und Gesundheit werden vom Zielrelease kontrolliert.</p>
-                    <p>Der Release-Finalizer zeigt seine Phasen und alle 30 Sekunden ein Lebenszeichen. Erst nach 30 Minuten Finalizerlauf wird hart abgebrochen; danach versucht der Installer die verifizierte Wiederherstellung des Ausgangszustands. Nur bei vollständigem Dienst-, Rollen- und Gesundheitsnachweis werden die Writer wieder freigegeben, andernfalls bleiben sie fail-closed gestoppt. Backup und Wiederherstellung selbst liegen außerhalb dieses Zeitlimits.</p>
+                    <p>Auch bei derselben installierten Version bleibt der Ablauf gleich: Vollbackup, ein kurzer Dienststopp, Austausch, Rechtekorrektur, Neustart und Ergebnisprüfung.</p>
                     <p><strong>Einmaliger Altstandsübergang:</strong> Auch bei einem fehlenden oder defekten lokalen Updater wird ausschließlich der oben gezeigte Ein-Datei-Bootstrap verwendet. Ein fester Installationspfad, ein vorgeschaltetes <code>chmod</code> oder ein direkter Aufruf von <code>installer_main.py</code> ist nicht erforderlich.</p>
                     <p>Verwenden Sie für den einmaligen Wechsel auf die bereinigte Historie keinen manuellen <code>git pull --ff-only</code>-Ablauf. Der Installer erstellt und prüft zuerst das externe Backup und validiert anschließend Zielstand, Dienste und Weboberfläche.</p>
                     Updates werden im Changelog oben rechts im Dashboard signalisiert.

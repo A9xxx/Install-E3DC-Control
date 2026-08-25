@@ -13,12 +13,12 @@ import glob
 import ipaddress
 from datetime import datetime
 import logging
-from logging.handlers import RotatingFileHandler
 import pwd
 import grp
 import socket
 import stat
 import uuid
+import sys
 from pathlib import Path
 
 try:
@@ -26,11 +26,23 @@ try:
 except ImportError:  # pragma: no cover - HA owner leases require POSIX flock
     fcntl = None
 
-from config_secret_permissions import config_secret_dir_mode_text, config_secret_file_mode, config_secret_file_mode_text
-from quiet_logging import install_quiet_info_filter
 try:
+    from Installer.config_secret_permissions import (
+        config_secret_dir_mode,
+        config_secret_dir_mode_text,
+        config_secret_file_mode,
+        config_secret_file_mode_text,
+    )
+    from Installer.quiet_logging import install_quiet_info_filter
     from Installer.ha_writer_admission import instance_role_anchor_matches
 except ImportError:
+    from config_secret_permissions import (
+        config_secret_dir_mode,
+        config_secret_dir_mode_text,
+        config_secret_file_mode,
+        config_secret_file_mode_text,
+    )
+    from quiet_logging import install_quiet_info_filter
     from ha_writer_admission import instance_role_anchor_matches
 
 PATHS_FILE = "/var/www/html/e3dc_paths.json"
@@ -88,8 +100,37 @@ def _rsync_remote(user, host_ip, path):
     return f"{user}@{host}:{path}"
 
 
-# Pfade: Der ausgeführte Release-Baum ist die lokale Vertrauenswurzel.
-INSTALL_PATH = _validated_install_path(Path(__file__).resolve().parent.parent)
+def _runtime_binding(argv=None):
+    """Bindet den privilegierten HA-Prozess an Root-Unit-Argumente.
+
+    Der Fallback hält reine Modulimporte und unprivilegierte Diagnoseaufrufe
+    kompatibel. Der eigentliche Root-Daemon verlangt weiter unten zwingend die
+    explizite Bindung aus seiner root-eigenen systemd-Unit.
+    """
+
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == "--install-root":
+        if len(args) != 4 or args[2] != "--install-user":
+            raise RuntimeError("HA-Root-Laufzeitargumente sind unvollständig")
+        install_path = _validated_install_path(args[1])
+        try:
+            account = pwd.getpwnam(str(args[3]))
+        except KeyError as exc:
+            raise RuntimeError("HA-Installationsbenutzer existiert nicht") from exc
+        if account.pw_uid == 0 or account.pw_name in {"root", "www-data"}:
+            raise RuntimeError("HA-Installationsbenutzer ist unzulässig")
+        return install_path, account.pw_name, True
+    fallback = _validated_install_path(Path(__file__).resolve().parent.parent)
+    try:
+        fallback_user = pwd.getpwuid(Path(fallback).stat().st_uid).pw_name
+    except (KeyError, OSError):
+        fallback_user = ""
+    return fallback, fallback_user, False
+
+
+# Die root-eigene HA-Unit übergibt Produktpfad und Installationsbenutzer als
+# feste Argumente. Der Produktbaum wird damit nur noch als Datenziel benutzt.
+INSTALL_PATH, INSTALL_USER, PRIVILEGED_RUNTIME_BOUND = _runtime_binding()
 p_data = read_paths_config()
 if p_data.get('install_path'):
     configured_install_path = _validated_install_path(p_data['install_path'])
@@ -187,7 +228,11 @@ def catalog_managed_services():
             continue
         if not unit_name.endswith(".service"):
             unit_name += ".service"
-        if unit_name in {LEGACY_E3DC_SERVICE, "e3dc-ha.service"}:
+        if unit_name in {
+            LEGACY_E3DC_SERVICE,
+            "e3dc-ha.service",
+            "e3dc-shadow-sync.service",
+        }:
             continue
         if unit_name not in services:
             services.append(unit_name)
@@ -202,12 +247,11 @@ def catalog_managed_services():
 MANAGED_SERVICES = catalog_managed_services()
 
 def setup_logging():
-    """Initialisiert das rotierende Logfile für den HA Manager."""
-    os.makedirs(LOG_DIR, exist_ok=True)
-    log_file = os.path.join(LOG_DIR, "ha_manager.log")
+    """Schreibt den privilegierten HA-Prozess ausschließlich ins Journal."""
+
     logger = logging.getLogger("HAManager")
     logger.setLevel(logging.INFO)
-    handler = RotatingFileHandler(log_file, maxBytes=1024*1024, backupCount=2, encoding='utf-8')
+    handler = logging.StreamHandler()
     formatter = logging.Formatter('%(asctime)s - [%(levelname)s] - %(message)s', datefmt='%d.%m %H:%M:%S')
     handler.setFormatter(formatter)
     if not logger.handlers:
@@ -218,11 +262,6 @@ def setup_logging():
         warning_min_interval_s=30.0,
         warning_max_interval_s=3600.0,
     )
-    try:
-        os.chmod(log_file, 0o664)
-        st = os.stat(LOG_DIR)
-        os.chown(log_file, st.st_uid, st.st_gid)
-    except: pass
     return logger
 
 logger = setup_logging()
@@ -379,6 +418,7 @@ class OwnerLease:
         self._lock_file = None
         self._mode = ""
         self._peer_ip = ""
+        self.resumed_same_context = False
         self.last_error = ""
 
     def _open_lock(self):
@@ -454,7 +494,69 @@ class OwnerLease:
         _write_private_json(self.lease_path, payload)
         return payload
 
+    def _same_context_predecessor(self, prior, mode, peer_ip, now=None):
+        """Erkennt die aufgegebene Lease desselben lokalen HA-Prozesses."""
+
+        if not isinstance(prior, dict):
+            return False
+        try:
+            renewed_at = float(prior.get("renewed_at"))
+            expires_at = float(prior.get("expires_at"))
+            current_time = float(self.clock() if now is None else now)
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            prior.get("schema") == 1
+            and prior.get("context_valid") is True
+            and prior.get("released") is False
+            and str(prior.get("owner_id") or "")
+            and str(prior.get("owner_id") or "") != self.owner_id
+            and str(prior.get("node_id") or "") == self.node_id
+            and str(prior.get("mode") or "") == str(mode)
+            and validate_peer_ip(prior.get("peer_ip")) == peer_ip
+            and renewed_at <= current_time + 5.0
+            and current_time - renewed_at <= self.ttl_s
+            and expires_at > current_time
+            and expires_at <= renewed_at + self.ttl_s + 5.0
+        )
+
+    def resume_same_context_only(self, mode, peer_ip, context_valid=True):
+        """Übernimmt ausschließlich den frischen eigenen HA-Vorzustand.
+
+        Diese Vorstufe darf einen bestätigten lokalen Neustart fortsetzen,
+        bevor der Peer erneut erreichbar ist. Ein neuer, abgelaufener oder
+        fremder Owner erhält hier ausdrücklich keine Schreiberfreigabe.
+        """
+
+        self.resumed_same_context = False
+        normalized_peer = validate_peer_ip(peer_ip)
+        if not context_valid or mode not in ("master", "slave") or not normalized_peer:
+            self.last_error = "lease_context_invalid"
+            return False
+        if self._lock_file is not None:
+            return False
+        if not self._open_lock():
+            return False
+        self._mode = str(mode)
+        self._peer_ip = normalized_peer
+        prior = self._read_record()
+        now = float(self.clock())
+        if not self._same_context_predecessor(prior, self._mode, normalized_peer, now=now):
+            self.last_error = self.last_error or "same_context_predecessor_missing_or_invalid"
+            self._unlock()
+            return False
+        try:
+            self._write_record(context_valid=True)
+        except Exception as exc:
+            self.last_error = "lease_record_write_failed:%s" % type(exc).__name__
+            self._unlock()
+            return False
+        self.resumed_same_context = True
+        self.last_error = ""
+        return True
+
     def acquire(self, mode, peer_ip, context_valid=True):
+        self.resumed_same_context = False
         normalized_peer = validate_peer_ip(peer_ip)
         if not context_valid or mode not in ("master", "slave") or not normalized_peer:
             self.last_error = "lease_context_invalid"
@@ -467,15 +569,27 @@ class OwnerLease:
         self._peer_ip = normalized_peer
         prior = self._read_record()
         now = float(self.clock())
-        if prior is None or (
+        unexpired_foreign_owner = bool(
             prior
             and not prior.get("released")
             and float(prior.get("expires_at", 0.0) or 0.0) > now
             and str(prior.get("owner_id") or "") != self.owner_id
-        ):
+        )
+        # Die erfolgreich übernommene flock-Sperre belegt, dass der frühere
+        # lokale HA-Prozess nicht mehr Schreiber sein kann. Nur sein exakt
+        # gleicher Knoten-/Rollen-/Peer-Kontext darf deshalb ohne die alte
+        # TTL-Wartezeit fortgesetzt werden; jede fremde Lease bleibt gesperrt.
+        same_context_restart = unexpired_foreign_owner and self._same_context_predecessor(
+            prior,
+            self._mode,
+            normalized_peer,
+            now=now,
+        )
+        if prior is None or (unexpired_foreign_owner and not same_context_restart):
             self.last_error = self.last_error or "unexpired_foreign_owner"
             self._unlock()
             return False
+        self.resumed_same_context = bool(same_context_restart)
         try:
             self._write_record(context_valid=True)
         except Exception as exc:
@@ -572,17 +686,127 @@ class OwnerLease:
             pass
 
 def set_web_permissions(filepath, data=None):
-    """Setzt die Dateirechte auf install_user:www-data."""
+    """Setzt Webrechte über den geöffneten Inode, niemals über einen Symlink."""
+
+    descriptor = -1
     try:
         base = os.path.basename(str(filepath))
         mode = config_secret_file_mode(data) if "e3dc_v4.json" in base else 0o664
-        os.chmod(filepath, mode)
-        install_user = read_paths_config().get('install_user', 'pi')
-        uid = pwd.getpwnam(install_user).pw_uid
-        gid = grp.getgrnam("www-data").gr_gid
-        os.chown(filepath, uid, gid)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(filepath, flags)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise OSError("Webdatei ist keine einzelne reguläre Datei")
+        os.fchown(
+            descriptor,
+            pwd.getpwnam(INSTALL_USER).pw_uid,
+            grp.getgrnam("www-data").gr_gid,
+        )
+        os.fchmod(descriptor, mode)
     except Exception as e:
         logger.error(f"Konnte Rechte für {filepath} nicht setzen: {e}")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _read_web_json(path, max_bytes=4 * 1024 * 1024):
+    """Liest eine Web-/Ramdisk-JSON ohne Symlink- oder Wechselrennen."""
+
+    absolute = os.path.abspath(path)
+    parent, name = os.path.split(absolute)
+    directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(parent, directory_flags)
+    descriptor = -1
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size < 1
+            or before.st_size > max_bytes
+            or stat.S_IMODE(before.st_mode) & 0o002
+        ):
+            raise OSError("Web-JSON besitzt unsichere Metadaten")
+        raw = bytearray()
+        while len(raw) <= max_bytes:
+            chunk = os.read(descriptor, min(64 * 1024, max_bytes + 1 - len(raw)))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        after = os.fstat(descriptor)
+        named_after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+
+        def token(item):
+            return (
+                item.st_dev,
+                item.st_ino,
+                item.st_size,
+                item.st_mtime_ns,
+                item.st_ctime_ns,
+                item.st_nlink,
+            )
+
+        if len(raw) > max_bytes or token(before) != token(after) or token(after) != token(named_after):
+            raise OSError("Web-JSON wechselte beim Lesen")
+        value = json.loads(bytes(raw).decode("utf-8-sig"))
+        if not isinstance(value, dict):
+            raise ValueError("Web-JSON ist kein Objekt")
+        return value
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(directory_fd)
+
+
+def _atomic_write_web_json(path, payload, *, mode=0o664):
+    """Ersetzt eine Web-/Ramdisk-JSON atomar über einen gebundenen Parent-FD."""
+
+    absolute = os.path.abspath(path)
+    parent, name = os.path.split(absolute)
+    directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(parent, directory_flags)
+    temporary = ".%s.%d.%s.tmp" % (name, os.getpid(), uuid.uuid4().hex)
+    descriptor = -1
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise OSError("Temporäre Web-JSON ist keine einzelne reguläre Datei")
+        os.fchown(
+            descriptor,
+            pwd.getpwnam(INSTALL_USER).pw_uid,
+            grp.getgrnam("www-data").gr_gid,
+        )
+        os.fchmod(descriptor, int(mode))
+        raw = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        offset = 0
+        while offset < len(raw):
+            offset += os.write(descriptor, raw[offset:])
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        try:
+            os.fsync(directory_fd)
+        except OSError:
+            pass
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        os.close(directory_fd)
 
 
 def _mode5_user_start_nodes_safe(
@@ -597,22 +821,21 @@ def _mode5_user_start_nodes_safe(
         group = grp.getgrnam("www-data")
         parent = os.lstat(os.path.dirname(request_path))
         parent_mode = stat.S_IMODE(parent.st_mode)
+        expected_parent_mode = int(config_secret_dir_mode())
+        required_parent_mode = (
+            expected_parent_mode & 0o777
+            if legacy_parent
+            else expected_parent_mode
+        )
         if (
             stat.S_ISLNK(parent.st_mode)
             or not stat.S_ISDIR(parent.st_mode)
             or bool(parent_mode & 0o002)
             or parent.st_gid != int(group.gr_gid)
-            or (
-                parent_mode != 0o775
-                if legacy_parent
-                else parent_mode != 0o2775
-            )
+            or parent_mode != required_parent_mode
         ):
             return False
-        install_user = str(
-            read_paths_config().get("install_user", "pi") or "pi"
-        )
-        manager_uid = int(pwd.getpwnam(install_user).pw_uid)
+        manager_uid = int(pwd.getpwnam(INSTALL_USER).pw_uid)
         allowed_parent_uids = {int(account.pw_uid), manager_uid}
         if parent.st_uid not in allowed_parent_uids:
             return False
@@ -656,7 +879,7 @@ def _mode5_user_start_surfaces_safe(
 def _repair_mode5_user_start_legacy_parent(
     request_path=WALLBOX_MODE5_USER_START_REQUEST_FILE,
 ):
-    """Hebt ausschließlich den bekannten 0775-Parent descriptorgebunden an."""
+    """Ergänzt ausschließlich dem konfigurierten Datenmodus das Setgid-Bit."""
 
     if _mode5_user_start_surfaces_safe(request_path):
         return True
@@ -668,11 +891,10 @@ def _repair_mode5_user_start_legacy_parent(
         before = os.lstat(directory)
         group = grp.getgrnam("www-data")
         account = pwd.getpwnam("www-data")
-        install_user = str(
-            read_paths_config().get("install_user", "pi") or "pi"
-        )
-        manager_uid = int(pwd.getpwnam(install_user).pw_uid)
+        manager_uid = int(pwd.getpwnam(INSTALL_USER).pw_uid)
         allowed_parent_uids = {int(account.pw_uid), manager_uid}
+        expected_parent_mode = int(config_secret_dir_mode())
+        legacy_parent_mode = expected_parent_mode & 0o777
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(directory, flags)
@@ -682,17 +904,17 @@ def _repair_mode5_user_start_legacy_parent(
             or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
             or current.st_uid not in allowed_parent_uids
             or current.st_gid != int(group.gr_gid)
-            or stat.S_IMODE(current.st_mode) != 0o775
+            or stat.S_IMODE(current.st_mode) != legacy_parent_mode
         ):
             return False
-        os.fchmod(descriptor, 0o2775)
+        os.fchmod(descriptor, expected_parent_mode)
         changed = os.fstat(descriptor)
         named = os.lstat(directory)
         if (
-            stat.S_IMODE(changed.st_mode) != 0o2775
+            stat.S_IMODE(changed.st_mode) != expected_parent_mode
             or (named.st_dev, named.st_ino) != (changed.st_dev, changed.st_ino)
             or named.st_uid not in allowed_parent_uids
-            or stat.S_IMODE(named.st_mode) != 0o2775
+            or stat.S_IMODE(named.st_mode) != expected_parent_mode
         ):
             return False
     except (KeyError, OSError, TypeError, ValueError):
@@ -728,10 +950,9 @@ def load_config():
     config = {}
     if os.path.exists(CONFIG_PATH):
         try:
-            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                for k, v in data.items():
-                    config[str(k).strip().lower()] = str(v).strip()
+            data = _read_web_json(CONFIG_PATH)
+            for k, v in data.items():
+                config[str(k).strip().lower()] = str(v).strip()
         except Exception as e:
             logger.error(f"Fehler beim Laden der Config ({CONFIG_PATH}): {e}")
     return config
@@ -748,7 +969,7 @@ def get_local_ips():
         pass
     try:
         result = subprocess.run(
-            ["hostname", "-I"],
+            ["/usr/bin/hostname", "-I"],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -767,17 +988,52 @@ def peer_points_to_self(peer_ip):
 
 def send_telegram(msg):
     """Sendet Telegram-Nachrichten via boot_notify.sh (Watchdog)."""
-    if os.path.exists(NOTIFY_SCRIPT):
-        try: subprocess.run([NOTIFY_SCRIPT, msg], timeout=10)
-        except Exception: pass
+    if _trusted_root_executable(NOTIFY_SCRIPT):
+        try:
+            subprocess.run([NOTIFY_SCRIPT, msg], timeout=10)
+        except Exception:
+            pass
+    elif os.path.lexists(NOTIFY_SCRIPT):
+        logger.warning("Unsicherer Root-Benachrichtigungshelfer wurde nicht ausgeführt.")
     logger.info(f"Benachrichtigung: {msg}")
+
+
+def _trusted_root_executable(path):
+    """Akzeptiert nur Root-Code unter vollständig geschützten Elternpfaden."""
+
+    candidate = Path(path)
+    try:
+        metadata = candidate.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != 0
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+            or not stat.S_IMODE(metadata.st_mode) & 0o111
+        ):
+            return False
+        for parent in (candidate.parent, *candidate.parents):
+            parent_metadata = parent.lstat()
+            if (
+                not stat.S_ISDIR(parent_metadata.st_mode)
+                or stat.S_ISLNK(parent_metadata.st_mode)
+                or parent_metadata.st_uid != 0
+                or stat.S_IMODE(parent_metadata.st_mode) & 0o022
+            ):
+                return False
+            if parent == Path("/"):
+                break
+        return True
+    except OSError:
+        return False
 
 def is_host_online(ip):
     """Prüft per Ping, ob der Partner erreichbar ist."""
     ip = validate_peer_ip(ip)
     if not ip:
         return False
-    res = subprocess.run(["ping", "-c", "1", "-W", "2", ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    res = subprocess.run(["/usr/bin/ping", "-c", "1", "-W", "2", ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return res.returncode == 0
 
 
@@ -788,11 +1044,11 @@ def query_peer_writer_state(peer_ip, runner=subprocess.run):
         return "unknown"
     services = get_managed_services("stop")
     command = [
-        "sudo", "-u", "pi", "ssh",
+        "/usr/bin/sudo", "-u", INSTALL_USER, "/usr/bin/ssh",
         "-o", "StrictHostKeyChecking=accept-new",
         "-o", "BatchMode=yes",
         "-o", "ConnectTimeout=5",
-        f"pi@{peer_ip}",
+        f"{INSTALL_USER}@{peer_ip}",
         "systemctl", "is-active",
     ] + services
     try:
@@ -855,11 +1111,11 @@ def write_status(mode, state, peer_online, last_sync=0, owner_lease=None, safety
             "owner_lease_expires_at": (owner_lease.snapshot().get("expires_at", 0) if owner_lease else 0),
             "safety_reason": str(safety_reason or ""),
         }
-        tmp_file = "/var/www/html/ramdisk/ha_status.tmp"
-        with open(tmp_file, "w") as f:
-            json.dump(status_data, f)
-        set_web_permissions(tmp_file)
-        os.replace(tmp_file, "/var/www/html/ramdisk/ha_status.json")
+        _atomic_write_web_json(
+            "/var/www/html/ramdisk/ha_status.json",
+            status_data,
+            mode=0o664,
+        )
     except Exception as e:
         logger.error(f"Fehler beim Schreiben des HA-Status: {e}")
 
@@ -873,20 +1129,13 @@ def merge_config(src, dest):
     # 1. Lokale HA-Parameter und Secrets des Slaves retten
     if os.path.exists(dest):
         try:
-            with open(dest, 'r', encoding='utf-8') as f:
-                slave_data = json.load(f)
-                if not isinstance(slave_data, dict):
-                    slave_data = {}
+            slave_data = _read_web_json(dest)
         except Exception as e:
             logger.error(f"Fehler beim Lesen der Slave-Config: {e}")
 
     # 2. Master-Config einlesen
     try:
-        with open(src, 'r', encoding='utf-8') as f:
-            master_data = json.load(f)
-            if not isinstance(master_data, dict):
-                logger.error("Master-Config ist kein JSON-Objekt.")
-                return
+        master_data = _read_web_json(src)
     except Exception as e:
         logger.error(f"Fehler beim Lesen der Master-Config: {e}")
         return
@@ -900,12 +1149,12 @@ def merge_config(src, dest):
             protected_count += 1
 
     # 4. Sicher schreiben
-    tmp_dest = dest + ".tmp"
     try:
-        with open(tmp_dest, 'w', encoding='utf-8') as f:
-            json.dump(merged_data, f, indent=4)
-        set_web_permissions(tmp_dest, merged_data)
-        os.replace(tmp_dest, dest)
+        _atomic_write_web_json(
+            dest,
+            merged_data,
+            mode=config_secret_file_mode(merged_data),
+        )
         logger.info(f"Master-Config gemergt, {protected_count} lokale Slave-Werte geschützt.")
     except Exception as e:
         logger.error(f"Fehler beim Speichern der gemergten Config: {e}")
@@ -938,10 +1187,10 @@ def rsync_data(target_ip, push=True, owner_lease=None, peer_state_getter=query_p
         )
         return False
 
-    user = "pi"
+    user = INSTALL_USER
     ssh_transport = "ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
     base_args = [
-        "sudo", "-u", user, "rsync", "-au",
+        "/usr/bin/sudo", "-u", user, "/usr/bin/rsync", "-au",
         "--exclude", "*.tmp",
         "--exclude", "*.flag",
         "--exclude", "*_status.json",
@@ -1036,44 +1285,49 @@ def rsync_data(target_ip, push=True, owner_lease=None, peer_state_getter=query_p
                 ")", "-prune", "-o",
             ]
             subprocess.run([
-                "sudo", "find", "-P", "/var/www/html/ramdisk", "-xdev",
+                "/usr/bin/sudo", "/usr/bin/find", "-P", "/var/www/html/ramdisk", "-xdev",
                 *protected_ramdisk, "-type", "l", "-prune", "-o",
-                "-exec", "chown", "pi:www-data", "{}", "+",
+                "-exec", "/usr/bin/chown", f"{INSTALL_USER}:www-data", "{}", "+",
             ], check=True)
             subprocess.run([
-                "sudo", "find", "-P", "/var/www/html/data", "-xdev",
+                "/usr/bin/sudo", "/usr/bin/find", "-P", "/var/www/html/data", "-xdev",
                 "-mindepth", "1", *protected_data,
                 "-type", "l", "-prune", "-o",
-                "-exec", "chown", "pi:www-data", "{}", "+",
+                "-exec", "/usr/bin/chown", f"{INSTALL_USER}:www-data", "{}", "+",
             ], check=True)
             subprocess.run([
-                "sudo", "find", "-P", "/var/www/html/ramdisk", "-xdev",
-                *protected_ramdisk, "-type", "f", "-exec", "chmod", "664", "{}", "+",
+                "/usr/bin/sudo", "/usr/bin/find", "-P", "/var/www/html/ramdisk", "-xdev",
+                *protected_ramdisk, "-type", "f", "-exec", "/usr/bin/chmod", "664", "{}", "+",
             ], check=True)
             subprocess.run(
-                ["sudo", "chown", "pi:www-data", "/var/www/html/data"],
+                ["/usr/bin/sudo", "/usr/bin/chown", f"{INSTALL_USER}:www-data", "/var/www/html/data"],
                 check=True,
             )
             subprocess.run(
-                ["sudo", "chmod", "2775", "/var/www/html/data"],
+                [
+                    "/usr/bin/sudo",
+                    "/usr/bin/chmod",
+                    config_secret_dir_mode_text(),
+                    "/var/www/html/data",
+                ],
                 check=True,
             )
             subprocess.run([
-                "sudo", "find", "-P", "/var/www/html/data", "-xdev",
+                "/usr/bin/sudo", "/usr/bin/find", "-P", "/var/www/html/data", "-xdev",
                 "-mindepth", "1", *protected_data,
-                "-type", "d", "-exec", "chmod", "775", "{}", "+",
+                "-type", "d", "-exec", "/usr/bin/chmod", "775", "{}", "+",
             ])
             subprocess.run([
-                "sudo", "find", "-P", "/var/www/html/data", "-xdev",
+                "/usr/bin/sudo", "/usr/bin/find", "-P", "/var/www/html/data", "-xdev",
                 "-mindepth", "1", *protected_data,
-                "-type", "f", "-exec", "chmod", "664", "{}", "+",
+                "-type", "f", "-exec", "/usr/bin/chmod", "664", "{}", "+",
             ])
-            subprocess.run(["sudo", "chmod", config_secret_file_mode_text(), "/var/www/html/data/e3dc_v4.json"], stderr=subprocess.DEVNULL)
-            subprocess.run(["sudo", "chmod", config_secret_dir_mode_text(), "/var/www/html/data/config_backups"], stderr=subprocess.DEVNULL)
+            subprocess.run(["/usr/bin/sudo", "/usr/bin/chmod", config_secret_file_mode_text(), "/var/www/html/data/e3dc_v4.json"], stderr=subprocess.DEVNULL)
+            subprocess.run(["/usr/bin/sudo", "/usr/bin/chmod", config_secret_dir_mode_text(), "/var/www/html/data/config_backups"], stderr=subprocess.DEVNULL)
             migration_backup_dir = "/var/www/html/data/config_backups/aux_inverter_migration"
             protected_backup = ["-path", migration_backup_dir, "-prune", "-o"]
-            subprocess.run(["sudo", "find", "-P", "/var/www/html/data/config_backups", *protected_backup, "-type", "d", "-exec", "chmod", config_secret_dir_mode_text(), "{}", "+"], stderr=subprocess.DEVNULL)
-            subprocess.run(["sudo", "find", "-P", "/var/www/html/data/config_backups", *protected_backup, "-type", "f", "-exec", "chmod", config_secret_file_mode_text(), "{}", "+"], stderr=subprocess.DEVNULL)
+            subprocess.run(["/usr/bin/sudo", "/usr/bin/find", "-P", "/var/www/html/data/config_backups", *protected_backup, "-type", "d", "-exec", "/usr/bin/chmod", config_secret_dir_mode_text(), "{}", "+"], stderr=subprocess.DEVNULL)
+            subprocess.run(["/usr/bin/sudo", "/usr/bin/find", "-P", "/var/www/html/data/config_backups", *protected_backup, "-type", "f", "-exec", "/usr/bin/chmod", config_secret_file_mode_text(), "{}", "+"], stderr=subprocess.DEVNULL)
             if not _harden_aux_inverter_migration_backups(migration_backup_dir):
                 logger.error("Zusatz-WR-Migrationsbackups konnten nicht sicher gehärtet werden.")
                 return False
@@ -1135,9 +1389,9 @@ def _harden_aux_inverter_migration_backups(path):
     if not _aux_inverter_migration_backup_structure_safe(path):
         return False
     try:
-        subprocess.run(["sudo", "chmod", "00700", path], check=True, stderr=subprocess.DEVNULL)
-        subprocess.run(["sudo", "find", "-P", path, "-type", "d", "-exec", "chmod", "00700", "{}", "+"], check=True, stderr=subprocess.DEVNULL)
-        subprocess.run(["sudo", "find", "-P", path, "-type", "f", "-exec", "chmod", "00600", "{}", "+"], check=True, stderr=subprocess.DEVNULL)
+        subprocess.run(["/usr/bin/sudo", "/usr/bin/chmod", "00700", path], check=True, stderr=subprocess.DEVNULL)
+        subprocess.run(["/usr/bin/sudo", "/usr/bin/find", "-P", path, "-type", "d", "-exec", "/usr/bin/chmod", "00700", "{}", "+"], check=True, stderr=subprocess.DEVNULL)
+        subprocess.run(["/usr/bin/sudo", "/usr/bin/find", "-P", path, "-type", "f", "-exec", "/usr/bin/chmod", "00600", "{}", "+"], check=True, stderr=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return False
     return _verify_aux_inverter_migration_backup_modes(path)
@@ -1155,7 +1409,7 @@ def service_exists(service):
 def service_is_active(service):
     """True, wenn systemd die Unit als aktiv meldet."""
     result = subprocess.run(
-        ["systemctl", "is-active", "--quiet", service],
+        ["/usr/bin/systemctl", "is-active", "--quiet", service],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -1164,7 +1418,7 @@ def service_is_active(service):
 def service_is_enabled(service):
     """True, wenn die Unit beim HA-Aktivstart mitgestartet werden darf."""
     result = subprocess.run(
-        ["systemctl", "is-enabled", service],
+        ["/usr/bin/systemctl", "is-enabled", service],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
@@ -1206,7 +1460,7 @@ def _legacy_manage_services_unverified(action="start"):
                 continue
 
             result = subprocess.run(
-                ["sudo", "systemctl", action, srv],
+                ["/usr/bin/sudo", "/usr/bin/systemctl", action, srv],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=20,
@@ -1222,7 +1476,7 @@ def _legacy_manage_services_unverified(action="start"):
 def _systemctl_service_action(action, service):
     try:
         result = subprocess.run(
-            ["sudo", "systemctl", action, service],
+            ["/usr/bin/sudo", "/usr/bin/systemctl", action, service],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=20,
@@ -1375,13 +1629,13 @@ def _legacy_main_loop_unsafe():
                 current_config_mtime = os.path.getmtime(CONFIG_PATH)
                 if current_config_mtime != last_config_mtime:
                     try:
-                        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-                            master_data = json.load(f)
+                        master_data = _read_web_json(CONFIG_PATH)
                         sync_payload = ha_sync_config_payload(master_data)
-                        with open("/var/www/html/ramdisk/master_e3dc_v4.tmp", 'w', encoding='utf-8') as f:
-                            json.dump(sync_payload, f, indent=4)
-                        set_web_permissions("/var/www/html/ramdisk/master_e3dc_v4.tmp")
-                        os.replace("/var/www/html/ramdisk/master_e3dc_v4.tmp", "/var/www/html/ramdisk/master_e3dc_v4.json")
+                        _atomic_write_web_json(
+                            "/var/www/html/ramdisk/master_e3dc_v4.json",
+                            sync_payload,
+                            mode=0o664,
+                        )
                         last_config_mtime = current_config_mtime
                         logger.info("Konfiguration ohne lokale Secrets für automatischen Sync zum Slave bereitgestellt.")
                     except Exception as e:
@@ -1418,11 +1672,11 @@ def _legacy_main_loop_unsafe():
                     logger.info("Starte Dienste auf dem Master neu...")
                     subprocess.run(
                         [
-                            "sudo", "-u", "pi",
-                            "ssh",
+                            "/usr/bin/sudo", "-u", INSTALL_USER,
+                            "/usr/bin/ssh",
                             "-o", "StrictHostKeyChecking=accept-new",
                             "-o", "BatchMode=yes",
-                            f"pi@{peer_ip}",
+                            f"{INSTALL_USER}@{peer_ip}",
                             "sudo", "systemctl", "restart", "e3dc-live",
                         ],
                         timeout=30,
@@ -1563,6 +1817,12 @@ def main_loop():
             peer_online = is_host_online(peer_ip)
             peer_writer_state = query_peer_writer_state(peer_ip) if peer_online else "unknown"
             already_owner = owner_lease.valid(mode="master", peer_ip=peer_ip)
+            if not already_owner and peer_writer_state != "active":
+                already_owner = owner_lease.resume_same_context_only(
+                    "master",
+                    peer_ip,
+                    context_valid=True,
+                )
             if not owner_admission_allowed("master", already_owner, peer_writer_state):
                 if owner_lease.held:
                     manage_services("stop", owner_lease=owner_lease)
@@ -1582,6 +1842,12 @@ def main_loop():
                 )
                 time.sleep(60)
                 continue
+            if owner_lease.resumed_same_context:
+                # Kontrollierter Neustart desselben lokalen Owners: Der Peer
+                # war vor der Übernahme bereits als stillstehend bestätigt.
+                # Ein Rücklesen vom Slave würde nur die Downtime verlängern.
+                master_auto_recovered = True
+                logger.info("HA same-context owner lease resumed after local restart.")
             if peer_writer_state == "active":
                 stopped = manage_services("stop", owner_lease=owner_lease)
                 write_status(
@@ -1615,14 +1881,13 @@ def main_loop():
                 current_config_mtime = os.path.getmtime(CONFIG_PATH)
                 if current_config_mtime != last_config_mtime:
                     try:
-                        with open(CONFIG_PATH, "r", encoding="utf-8") as config_file:
-                            master_data = json.load(config_file)
+                        master_data = _read_web_json(CONFIG_PATH)
                         sync_payload = ha_sync_config_payload(master_data)
-                        sync_tmp = "/var/www/html/ramdisk/master_e3dc_v4.tmp"
-                        with open(sync_tmp, "w", encoding="utf-8") as sync_file:
-                            json.dump(sync_payload, sync_file, indent=4)
-                        set_web_permissions(sync_tmp)
-                        os.replace(sync_tmp, "/var/www/html/ramdisk/master_e3dc_v4.json")
+                        _atomic_write_web_json(
+                            "/var/www/html/ramdisk/master_e3dc_v4.json",
+                            sync_payload,
+                            mode=0o664,
+                        )
                         last_config_mtime = current_config_mtime
                     except Exception as exc:
                         logger.error("HA config sync preparation failed: %s", exc)
@@ -1640,6 +1905,7 @@ def main_loop():
             master_online = is_host_online(peer_ip)
             peer_writer_state = query_peer_writer_state(peer_ip)
             safety_reason = ""
+            resumed_slave_continuity = False
             if master_online:
                 fail_counter = 0
                 if was_active_as_slave:
@@ -1665,7 +1931,28 @@ def main_loop():
             else:
                 fail_counter += 1
                 logger.warning("HA master offline: %s/%s minutes", fail_counter, fail_timeout)
-                if fail_counter == fail_timeout:
+                if (
+                    peer_writer_state != "active"
+                    and not owner_lease.valid(mode="slave", peer_ip=peer_ip)
+                ):
+                    resumed_slave_continuity = owner_lease.resume_same_context_only(
+                        "slave",
+                        peer_ip,
+                        context_valid=True,
+                    )
+                    if resumed_slave_continuity:
+                        was_active_as_slave = True
+                        logger.info("HA slave failover lease resumed after local restart.")
+                if resumed_slave_continuity:
+                    if not manage_services(
+                        "start",
+                        owner_lease=owner_lease,
+                        mode="slave",
+                        peer_ip=peer_ip,
+                    ):
+                        safety_reason = "failover_resume_writer_start_failed"
+                        was_active_as_slave = False
+                elif fail_counter == fail_timeout:
                     if auto_failover:
                         if not owner_admission_allowed("slave", False, peer_writer_state):
                             safety_reason = "failover_blocked_peer_writer_%s" % peer_writer_state
@@ -1707,4 +1994,8 @@ def main_loop():
 
 
 if __name__ == "__main__":
+    if os.geteuid() == 0 and not PRIVILEGED_RUNTIME_BOUND:
+        raise SystemExit(
+            "HA-Manager verweigert Root-Start ohne root-eigene Laufzeitbindung."
+        )
     main_loop()

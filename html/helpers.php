@@ -3681,6 +3681,81 @@ function e3dcCompareReleaseVersions($left, $right) {
     return strnatcasecmp($a[3], $b[3]);
 }
 
+function e3dcStableUpdateCheck() {
+    $current = readInstalledVersion();
+    if ($current === '') {
+        return [
+            'success' => false,
+            'missing' => 0,
+            'error' => 'Die installierte VERSION ist nicht lesbar.',
+        ];
+    }
+
+    $latestUrl = 'https://github.com/A9xxx/Install-E3DC-Control/releases/latest';
+    $releasePrefix = 'https://github.com/A9xxx/Install-E3DC-Control/releases/tag/';
+    $curl = '/usr/bin/curl';
+    if (!is_file($curl) || !is_executable($curl)) {
+        return [
+            'success' => false,
+            'missing' => 0,
+            'error' => 'curl fehlt; der Stable-Release kann nicht geprüft werden.',
+        ];
+    }
+    $request = e3dcRunArgvProcess(
+        [
+            $curl,
+            '-q',
+            '--fail',
+            '--silent',
+            '--show-error',
+            '--location',
+            '--proto',
+            '=https',
+            '--tlsv1.2',
+            '--output',
+            '/dev/null',
+            '--write-out',
+            '%{url_effective}',
+            $latestUrl,
+        ],
+        25.0,
+        ['max_output_bytes' => 4096]
+    );
+    $effectiveUrl = trim((string)($request['stdout'] ?? ''));
+    if (empty($request['ok']) || strpos($effectiveUrl, $releasePrefix) !== 0) {
+        $detail = trim((string)($request['stderr'] ?? ''));
+        return [
+            'success' => false,
+            'missing' => 0,
+            'error' => 'Der aktuelle GitHub Stable-Release ist nicht erreichbar.'
+                . ($detail !== '' ? ' ' . $detail : ''),
+        ];
+    }
+
+    $targetTag = trim(substr($effectiveUrl, strlen($releasePrefix)), '/');
+    $normalizedTag = e3dcNormalizeReleaseTag($targetTag);
+    if ($normalizedTag === null || $normalizedTag !== $targetTag) {
+        return [
+            'success' => false,
+            'missing' => 0,
+            'error' => 'GitHub lieferte keinen eindeutigen Stable-Release-Tag.',
+        ];
+    }
+    $target = e3dcReleaseVersionValue($targetTag);
+    $comparison = e3dcCompareReleaseVersions($current, $target);
+    return [
+        'success' => true,
+        'missing' => $comparison < 0 ? 1 : 0,
+        'missing_exact' => true,
+        'same_release' => $comparison === 0,
+        'ahead' => $comparison > 0,
+        'current_version' => $current,
+        'target_version' => $target,
+        'target_tag' => $targetTag,
+        'upstream' => 'github_latest_stable_release',
+    ];
+}
+
 function e3dcReadUpdatePolicy() {
     $policyFiles = ['/var/www/html/UPDATE_POLICY.json'];
     foreach (getFooterInstallRootCandidates() as $root) {
@@ -4105,6 +4180,7 @@ function e3dcInspectServiceWrapper($wrapper) {
 
 function e3dcInspectWebUpdateLauncher() {
     $launcher = '/usr/local/sbin/e3dc-web-update-launcher';
+    $requiredContract = 'e3dc-download-bootstrap-v2';
     $result = ['ok' => false, 'path' => $launcher, 'status' => 'missing'];
     if (realpath($launcher) !== $launcher || is_link($launcher)) {
         $result['status'] = 'unbound_path';
@@ -4145,11 +4221,7 @@ function e3dcInspectWebUpdateLauncher() {
                 return $result;
             }
         }
-        $result['ok'] = true;
-        $result['status'] = 'ok';
-        $result['inspection'] = 'metadata_only';
-        $result['dev'] = (int)$metadata['dev'];
-        $result['ino'] = (int)$metadata['ino'];
+        $result['status'] = 'not_readable';
         return $result;
     }
     $openedBefore = @fstat($handle);
@@ -4165,6 +4237,12 @@ function e3dcInspectWebUpdateLauncher() {
             $result['status'] = 'read_drift';
             return $result;
         }
+    }
+    if (!is_string($actual)
+        || substr($actual, 0, 12) !== "#!/bin/bash\n"
+        || substr_count($actual, $requiredContract) !== 1) {
+        $result['status'] = 'outdated_contract';
+        return $result;
     }
     $result['ok'] = true;
     $result['status'] = 'ok';
@@ -4389,81 +4467,18 @@ function handleUpdatePreparation() {
     }
 }
 
-function runInstallerWrapperUpdateCheck($repoDir) {
-    $wrapper = rtrim($repoDir, '/') . '/Installer/installer_wrapper.sh';
-    $wrapperInspection = e3dcInspectInstallerWrapper($wrapper);
-    if (empty($wrapperInspection['ok'])) {
-        $nextStep = !empty($wrapperInspection['repairable'])
-            ? 'Bitte Rechte-Reparatur ausführen.'
-            : 'Die automatische Reparatur bleibt aus Sicherheitsgründen gesperrt.';
-        return [
-            'ok' => false,
-            'error' => ucfirst(e3dcInstallerWrapperIssueText($wrapperInspection)) . '. ' . $nextStep,
-            'wrapper' => $wrapper,
-            'wrapper_status' => $wrapperInspection['status'] ?? 'unknown',
-        ];
-    }
-
-    $wrapperOut = [];
-    $wrapperCmd = "timeout 25s " . escapeshellarg($wrapper) . " update_check 2>&1";
-    exec($wrapperCmd, $wrapperOut, $wrapperRet);
-    $wrapperText = trim(implode("\n", $wrapperOut));
-    $jsonStart = strpos($wrapperText, '{');
-    $decoded = $jsonStart === false ? null : json_decode(substr($wrapperText, $jsonStart), true);
-    if ($wrapperRet === 0 && is_array($decoded) && array_key_exists('success', $decoded)) {
-        $headSha = strtolower(trim((string)($decoded['head_sha'] ?? '')));
-        $targetSha = strtolower(trim((string)($decoded['target_sha'] ?? '')));
-        $hasExactShaEvidence = (
-            preg_match('/^[0-9a-f]{40}$/', $headSha) === 1
-            && preg_match('/^[0-9a-f]{40}$/', $targetSha) === 1
-        );
-        $sameRelease = (
-            $hasExactShaEvidence
-            && ($decoded['same_release'] ?? null) === true
-            && hash_equals($headSha, $targetSha)
-        );
-        return [
-            'ok' => true,
-            'result' => [
-                'success' => (bool)($decoded['success'] ?? false),
-                'missing' => (int)($decoded['missing'] ?? 0),
-                'same_release' => $sameRelease,
-                'head_sha' => $headSha,
-                'target_sha' => $targetSha,
-                'repo' => (string)($decoded['repo'] ?? $repoDir),
-                'upstream' => (string)($decoded['upstream'] ?? ''),
-            ] + (
-                (!$decoded['success'] && isset($decoded['error']))
-                    ? ['error' => (string)$decoded['error']]
-                    : []
-            )
-        ];
-    }
-
-    return [
-        'ok' => false,
-        'error' => trim($wrapperText) !== ''
-            ? $wrapperText
-            : 'Installer-Wrapper update_check konnte nicht ausgeführt werden.',
-        'code' => $wrapperRet,
-        'wrapper' => $wrapper
-    ];
-}
-
 /**
- * Prüft das native V4-Installer-Repo auf neue Commits.
- * Der anschließende Update-Lauf nutzt denselben Git-Stand.
+ * Vergleicht die installierte VERSION mit dem veröffentlichten Stable-Release.
+ * Die Anzeige ist rein informativ und keine Voraussetzung für den Update-Start.
  */
 function handleUpdateCheck() {
     if (isset($_GET['action']) && $_GET['action'] === 'check_update') {
         e3dcRequirePostMutation(true);
-        // Keine Browser-/Proxy-Caches: Update-Zahlen müssen live sein.
         header('Cache-Control: no-cache, no-store, must-revalidate');
         header('Pragma: no-cache');
         header('Expires: 0');
         header('Content-Type: application/json');
 
-        // Docker-Installationen werden über Image/Container-Updates aktualisiert.
         if (e3dcIsDockerEnvironment()) {
             echo json_encode([
                 'success' => true,
@@ -4476,7 +4491,6 @@ function handleUpdateCheck() {
             exit;
         }
 
-        // Automatische Checks respektieren die Config, manuelle Checks dürfen immer laufen.
         $confData = loadE3dcConfig();
         $checkUpdates = $confData['config']['check_updates'] ?? '1';
         if ($checkUpdates === '0' && !isset($_GET['force_check'])) {
@@ -4485,55 +4499,25 @@ function handleUpdateCheck() {
         }
 
         $cacheFile = '/var/www/html/ramdisk/e3dc_update_status.json';
-
-        // Kurzer Cache gegen GitHub-Spam; ?force_check=1 umgeht ihn.
         if (!isset($_GET['force_check']) && file_exists($cacheFile) && (time() - filemtime($cacheFile) < 840)) {
-            echo file_get_contents($cacheFile);
-            exit;
-        }
-
-        $paths = getInstallPaths();
-        $repoCandidates = !empty($paths['valid'])
-            ? [rtrim($paths['install_path'], '/')]
-            : [];
-
-        $repoDir = null;
-        foreach ($repoCandidates as $candidate) {
-            $real = realpath($candidate);
-            if ($real && is_dir($real . '/.git')) {
-                $repoDir = $real;
-                break;
+            $cachedRaw = (string)file_get_contents($cacheFile);
+            $cachedData = json_decode($cachedRaw, true);
+            if (!is_array($cachedData) || empty($cachedData['updating'])) {
+                echo $cachedRaw;
+                exit;
             }
         }
-
-        if (!$repoDir) {
-            $res = ['success' => false, 'missing' => 0, 'error' => 'Git-Repository nicht gefunden.'];
-            file_put_contents($cacheFile, json_encode($res));
-            @chmod($cacheFile, 0666);
-            echo json_encode($res);
-            exit;
-        }
-
-        $wrapperCheck = runInstallerWrapperUpdateCheck($repoDir);
-        $res = $wrapperCheck['ok']
-            ? $wrapperCheck['result']
-            : [
-                'success' => false,
-                'missing' => 0,
-                'repo' => $repoDir,
-                'error' => "Installer-Wrapper update_check fehlgeschlagen:\n" . ($wrapperCheck['error'] ?? 'unbekannter Fehler')
-            ];
-
-        file_put_contents($cacheFile, json_encode($res));
+        $result = e3dcStableUpdateCheck();
+        file_put_contents($cacheFile, json_encode($result));
         @chmod($cacheFile, 0666);
-        echo json_encode($res);
+        echo json_encode($result);
         exit;
     }
 }
 
 /**
- * Prüft auf Updates für den Installer/Diagramme (A9xxx).
- * Cache-Dauer: 4 Stunden.
+ * Prüft den veröffentlichten Stable-Release für die Update-Anzeige.
+ * Cache-Dauer: 4 Stunden; der eigentliche Update-Start bleibt davon unabhängig.
  */
 function handleSelfUpdateCheck() {
     if (isset($_GET['action']) && $_GET['action'] === 'check_self_update') {
@@ -4541,7 +4525,6 @@ function handleSelfUpdateCheck() {
         header('Cache-Control: no-cache, no-store, must-revalidate');
         header('Content-Type: application/json');
 
-        // Docker: Updates erfolgen über Watchtower / Image Pull
         if (e3dcIsDockerEnvironment()) {
             echo json_encode([
                 'success' => true,
@@ -4557,98 +4540,19 @@ function handleSelfUpdateCheck() {
         $cacheFile = '/var/www/html/ramdisk/e3dc_self_update_status.json';
         $forceCheck = isset($_GET['force']) || isset($_GET['force_check']);
         if (!$forceCheck && file_exists($cacheFile) && (time() - filemtime($cacheFile) < 14400)) {
-            $cachedRaw = file_get_contents($cacheFile);
+            $cachedRaw = (string)file_get_contents($cacheFile);
             $cachedData = json_decode($cachedRaw, true);
-            if (is_array($cachedData) && !empty($cachedData['updating'])) {
-                $pidFile = '/run/e3dc-web-update/pid';
-                $stillRunning = false;
-                if (file_exists($pidFile)) {
-                    $pid = (int)trim((string)file_get_contents($pidFile));
-                    if ($pid > 0 && file_exists("/proc/$pid")) {
-                        $stillRunning = true;
-                    }
-                }
-                if ($stillRunning) {
-                    echo $cachedRaw;
-                    exit;
-                }
-                // Update läuft nicht mehr -> Stale Cache ignorieren und frisch prüfen
-            } else {
+            if (!is_array($cachedData) || empty($cachedData['updating'])) {
                 echo $cachedRaw;
                 exit;
             }
+            // Ein Startmarker ist kein vier Stunden gültiges Prüfergebnis.
+            // Nach dem Start folgt deshalb wieder der normale Stable-Vergleich.
         }
-
-        $paths = getInstallPaths();
-        if (empty($paths['valid'])) {
-            echo json_encode(['success' => false, 'missing' => 0, 'error' => $paths['error'] ?? 'Installationskontext fehlt.']);
-            exit;
-        }
-        $installDir = rtrim($paths['install_path'], '/');
-
-        $missing = 0;
-
-        // Git-Prüfung läuft unprivilegiert über die read-only Wrapper-Aktion.
-        // Dafür ist weder eine sudoers-Freigabe noch Root-Code erforderlich.
-        if (is_dir($installDir . '/.git')) {
-            $wrapperCheck = runInstallerWrapperUpdateCheck($installDir);
-            if ($wrapperCheck['ok']) {
-                $res = $wrapperCheck['result'];
-                file_put_contents($cacheFile, json_encode($res));
-                @chmod($cacheFile, 0666);
-                echo json_encode($res);
-                exit;
-            }
-
-            $res = [
-                'success' => false,
-                'missing' => 0,
-                'repo' => $installDir,
-                'error' => "Installer-Wrapper update_check fehlgeschlagen:\n" . ($wrapperCheck['error'] ?? 'unbekannter Fehler')
-            ];
-            file_put_contents($cacheFile, json_encode($res));
-            @chmod($cacheFile, 0666);
-            echo json_encode($res);
-            exit;
-        } else {
-            // Fallback: Wenn kein Git, prüfen wir über Python Skript (Release-API Methode)
-            $script = $installDir . '/Installer/self_update.py';
-            if (file_exists($script)) {
-                $cmd = "/usr/bin/python3 " . escapeshellarg($script) . " --silent --check 2>&1";
-                exec($cmd, $out, $ret);
-                $output = implode("\n", $out);
-                if ($ret !== 0) {
-                    $res = [
-                        'success' => false,
-                        'missing' => 0,
-                        'error' => 'Unprivilegierte Update-Prüfung fehlgeschlagen: ' . trim($output),
-                    ];
-                    file_put_contents($cacheFile, json_encode($res));
-                    @chmod($cacheFile, 0666);
-                    echo json_encode($res);
-                    exit;
-                }
-                // Wenn die API NICHT sagt "ist aktuell" und auch kein Netzwerkfehler vorliegt, setzen wir 1 Update als fällig an
-                if (strpos($output, 'aktuell') === false && strpos($output, 'Netzwerkfehler') === false && strpos($output, 'Fehler') === false) {
-                    $missing = 1;
-                }
-            } else {
-                $res = [
-                    'success' => false,
-                    'missing' => 0,
-                    'error' => 'Unprivilegierte Update-Prüfung ist nicht verfügbar: self_update.py fehlt.',
-                ];
-                file_put_contents($cacheFile, json_encode($res));
-                @chmod($cacheFile, 0666);
-                echo json_encode($res);
-                exit;
-            }
-        }
-
-        $res = ['success' => true, 'missing' => $missing];
-        file_put_contents($cacheFile, json_encode($res));
+        $result = e3dcStableUpdateCheck();
+        file_put_contents($cacheFile, json_encode($result));
         @chmod($cacheFile, 0666);
-        echo json_encode($res);
+        echo json_encode($result);
         exit;
     }
 }
@@ -4659,7 +4563,9 @@ function handleSelfUpdateCheck() {
 function e3dcSelfUpdateLogHasCanonicalSuccess($log) {
     return preg_match(
         '/(?:^|\R)\[OK\]\s+(?:self-update auf [0-9a-f]{40} abgeschlossen\.|'
-        . 'Du bist auf dem neuesten Stand: [0-9a-f]{40}\.)\s*(?:\R|$)/i',
+        . 'Du bist auf dem neuesten Stand: [0-9a-f]{40}\.|'
+        . 'Update abgeschlossen\.\s*\RVersion:\s*v?\d+\.\d+\.\d+[A-Za-z0-9._-]*)'
+        . '\s*(?:\R|$)/i',
         (string)$log
     ) === 1;
 }
@@ -4727,8 +4633,12 @@ function handleRunSelfUpdate() {
             // Kompatibilitätsbrücke für einen Lauf, den eine ältere Webdatei
             // noch ohne Exitcode-Datei gestartet hat. Der zurückgegebene
             // Marker wird auch von älteren bereits geladenen Browsern erkannt.
-            if (strpos($log, 'Update abgeschlossen') === false) {
+            if (strpos($log, '[OK] Update abgeschlossen.') === false) {
                 $log .= "\n[OK] Update abgeschlossen.\n";
+                $installedVersion = readInstalledVersion();
+                if ($installedVersion !== '') {
+                    $log .= 'Version: ' . $installedVersion . "\n";
+                }
             }
         }
 
@@ -4772,7 +4682,13 @@ function handleRunSelfUpdate() {
                 'success' => false,
                 'message' => 'Der root-eigene Web-Update-Launcher ist nicht sicher gebunden ('
                     . (string)($launcherInspection['status'] ?? 'unbekannt')
-                    . '). Bitte einmal administrativ die Rechte-Reparatur des aktuellen Releases ausführen.',
+                    . "). Lösung: Führe einmalig diesen Befehl aus:\n"
+                    . 'bootstrap_file="$(mktemp)" && '
+                    . "curl -q -fsS --proto '=https' --tlsv1.2 "
+                    . '-o "$bootstrap_file" '
+                    . "https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control/v5.4.4c/e3dc-update-bootstrap "
+                    . '&& sudo /bin/sh "$bootstrap_file"; rc=$?; '
+                    . 'rm -f -- "$bootstrap_file"; exit $rc',
             ]);
             exit;
         }

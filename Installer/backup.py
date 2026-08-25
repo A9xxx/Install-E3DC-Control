@@ -1,8 +1,10 @@
 import os
 import datetime
+import pwd
 import stat
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 # Standard-Ausgabe auf UTF-8 erzwingen
@@ -46,6 +48,7 @@ from .backup_integrity import (
 from .installer_config import get_install_path, get_user_ids, get_www_data_gid, load_config
 from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
 from .service_catalog import allowed_services
+from .ha_root_runtime import HA_ROOT_RUNTIME_BASE
 
 INSTALL_PATH = get_install_path()
 backup_logger = get_or_create_logger("backup")
@@ -54,6 +57,97 @@ SYSTEMD_UNIT_DIRS = (
     Path("/usr/lib/systemd/system"),
     Path("/lib/systemd/system"),
 )
+APACHE_SECURITY_CONFIG = Path("/etc/apache2/conf-available/e3dc-control-security.conf")
+MANAGER_LOCK_TMPFILES_CONFIG = Path("/etc/tmpfiles.d/e3dc-control-locks.conf")
+WEB_ROOT = Path("/var/www/html")
+WEB_PERSISTENT_FILE_NAMES = (
+    "e3dc.config.txt",
+    "e3dc.strompreise.txt",
+    "e3dc.wallbox.out",
+    "e3dc.wallbox.txt",
+    "e3dc_paths.json",
+    "live_history.txt",
+)
+WEB_HISTORY_BACKUPS = WEB_ROOT / "history_backups"
+
+
+@dataclass(frozen=True)
+class BackupProfileOptions:
+    """Enger Backup-Vertrag; der strenge Pfad bleibt der Standard."""
+
+    name: str
+    keep_root_ownership: bool = False
+    raise_errors: bool = False
+    tolerate_replaceable_entries: bool = False
+    allow_quiesced_source_drift: bool = False
+    include_optional_ml: bool = True
+    enforce_systemd_mask_contract: bool = True
+    retention_failure_is_fatal: bool = True
+
+
+STRICT_BACKUP_PROFILE = BackupProfileOptions(name="strict")
+REPAIR_UPDATE_BACKUP_PROFILE = BackupProfileOptions(
+    name="repair-update",
+    keep_root_ownership=True,
+    raise_errors=True,
+    tolerate_replaceable_entries=True,
+    allow_quiesced_source_drift=True,
+    include_optional_ml=False,
+    enforce_systemd_mask_contract=False,
+    retention_failure_is_fatal=False,
+)
+
+
+def _bootstrap_repair_update_profile_bound(install_path) -> bool:
+    """Aktiviert das Reparaturprofil nur für den vollständig gebundenen Runner."""
+
+    values = {
+        "target": str(os.environ.get("E3DC_BOOTSTRAP_ROOT") or "").strip(),
+        "runner": str(os.environ.get("E3DC_BOOTSTRAP_RUNNER_ROOT") or "").strip(),
+        "user": str(os.environ.get("E3DC_BOOTSTRAP_USER") or "").strip(),
+        "mode": str(os.environ.get("E3DC_BOOTSTRAP_ENTRY_MODE") or "").strip(),
+    }
+    if not all(values.values()) or not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return False
+    if values["mode"] not in {"regular", "rescue"} or values["user"] in {"root", "www-data"}:
+        return False
+    try:
+        pwd.getpwnam(values["user"])
+        target = _lexical_absolute(values["target"])
+        runner = _lexical_absolute(values["runner"])
+        install = _lexical_absolute(install_path or INSTALL_PATH)
+        module_root = _lexical_absolute(Path(__file__).absolute().parent.parent)
+        common = Path(os.path.commonpath((str(runner), str(target))))
+    except (KeyError, OSError, ValueError, BackupIntegrityError):
+        return False
+    return (
+        target == install
+        and runner == module_root
+        and runner != target
+        and common not in {runner, target}
+    )
+
+
+def _selected_backup_profile(profile, install_path) -> BackupProfileOptions:
+    if isinstance(profile, BackupProfileOptions):
+        return profile
+    if profile is None:
+        return (
+            REPAIR_UPDATE_BACKUP_PROFILE
+            if _bootstrap_repair_update_profile_bound(install_path)
+            else STRICT_BACKUP_PROFILE
+        )
+    name = str(profile).strip().lower()
+    if name == STRICT_BACKUP_PROFILE.name:
+        return STRICT_BACKUP_PROFILE
+    if name == REPAIR_UPDATE_BACKUP_PROFILE.name:
+        return REPAIR_UPDATE_BACKUP_PROFILE
+    raise BackupIntegrityError(f"Unbekanntes Backup-Profil: {profile}")
+
+
+def _warn_backup(message: str) -> None:
+    print(f"[WARNUNG] {message}")
+    log_warning("backup", message)
 
 
 def _prepare_private_ml_store_for_backup(
@@ -178,6 +272,15 @@ def _systemd_admin_unit_paths():
     return sorted(path for path in _systemd_unit_paths() if path.parent == SYSTEMD_ADMIN_UNIT_DIR)
 
 
+def _systemd_dropin_paths():
+    """Liefert ausschließlich Drop-in-Verzeichnisse des gebundenen Dienstkatalogs."""
+
+    return tuple(
+        path.parent / f"{path.name}.d"
+        for path in _systemd_admin_unit_paths()
+    )
+
+
 def _systemd_mask_state_contract():
     entries = []
     for path in _systemd_admin_unit_paths():
@@ -218,47 +321,184 @@ def get_backup_root(install_path=None):
     return str(default_backup_root(install))
 
 
-def _persistent_sources(install_path=None, systemd_mask_state=None):
+def _persistent_sources(
+    install_path=None,
+    systemd_mask_state=None,
+    *,
+    profile=STRICT_BACKUP_PROFILE,
+):
     """Return the complete legacy and current recovery surface."""
     install = _lexical_absolute(install_path or INSTALL_PATH)
-    configured_venv = str(load_config().get("venv_name") or ".venv_e3dc").strip()
+    options = _selected_backup_profile(profile, install)
+    try:
+        configured_venv = str(load_config().get("venv_name") or ".venv_e3dc").strip()
+    except Exception as exc:
+        if options.name != REPAIR_UPDATE_BACKUP_PROFILE.name:
+            raise
+        configured_venv = ".venv_e3dc"
+        _warn_backup(
+            "Die alte Installer-Konfiguration ist nicht lesbar; "
+            f"für den Backup-Ausschluss wird der Standard verwendet: {exc}"
+        )
     venv_exclusions = tuple(
         sorted({name for name in (configured_venv, ".venv_e3dc", ".venv", "venv") if name and "/" not in name and "\\" not in name})
     )
+    replaceable_policy = (
+        "diagnose-skip" if options.tolerate_replaceable_entries else "fail"
+    )
+    install_exclusions = [
+        ".git", "backups", "e3dc-control-backups",
+        ".e3dc-control-backups", *venv_exclusions,
+    ]
+    if options.name == REPAIR_UPDATE_BACKUP_PROFILE.name:
+        install_exclusions.extend(("data", "e3dc.config.txt"))
+    web_program_exclusions = ["data", "logs", "ramdisk", "tmp"]
+    if options.name == REPAIR_UPDATE_BACKUP_PROFILE.name:
+        web_program_exclusions.extend((*WEB_PERSISTENT_FILE_NAMES, "history_backups"))
     sources = [
         PersistentSource(
             "install-tree",
             install,
-            exclude_top_level=(
-                ".git", "backups", "e3dc-control-backups",
-                ".e3dc-control-backups", *venv_exclusions,
-            ),
+            exclude_top_level=tuple(install_exclusions),
             exclude_anywhere=("__pycache__", "node_modules"),
+            unsafe_entry_policy=replaceable_policy,
+            allow_live_drift=options.tolerate_replaceable_entries,
         ),
+    ]
+    if options.name == REPAIR_UPDATE_BACKUP_PROFILE.name:
+        sources.extend((
+            PersistentSource(
+                "install-config",
+                install / "e3dc.config.txt",
+                allow_live_drift=options.allow_quiesced_source_drift,
+            ),
+            PersistentSource(
+                "install-data",
+                install / "data",
+                allow_live_drift=options.allow_quiesced_source_drift,
+            ),
+        ))
+    sources.extend((
         PersistentSource(
             "web-data",
-            Path("/var/www/html/data"),
+            WEB_ROOT / "data",
             exclude_top_level=(LEGACY_ML_MODEL.name,),
+            allow_live_drift=options.allow_quiesced_source_drift,
         ),
         PersistentSource(
             "web-program",
-            Path("/var/www/html"),
-            exclude_top_level=("data", "logs", "ramdisk", "tmp"),
+            WEB_ROOT,
+            exclude_top_level=tuple(web_program_exclusions),
+            unsafe_entry_policy=replaceable_policy,
+            allow_live_drift=options.tolerate_replaceable_entries,
         ),
-        PersistentSource("system-state", Path("/var/lib/e3dc-control")),
-        PersistentSource("system-config", Path("/etc/e3dc-control")),
-    ]
-    mask_entries = _mask_entries_by_path(systemd_mask_state or _systemd_mask_state_contract())
+        PersistentSource(
+            "system-state",
+            Path("/var/lib/e3dc-control"),
+            exclude_top_level=(() if options.include_optional_ml else ("ml",)),
+            allow_live_drift=options.allow_quiesced_source_drift,
+        ),
+        PersistentSource(
+            "system-config",
+            Path("/etc/e3dc-control"),
+            allow_live_drift=options.allow_quiesced_source_drift,
+        ),
+        PersistentSource(
+            "service-launcher",
+            Path("/usr/local/sbin/e3dc-service-control"),
+            unsafe_entry_policy=replaceable_policy,
+            allow_live_drift=options.tolerate_replaceable_entries,
+        ),
+        PersistentSource(
+            "update-launcher",
+            Path("/usr/local/sbin/e3dc-web-update-launcher"),
+            unsafe_entry_policy=replaceable_policy,
+            allow_live_drift=options.tolerate_replaceable_entries,
+        ),
+        PersistentSource(
+            "ha-root-runtime",
+            HA_ROOT_RUNTIME_BASE,
+            unsafe_entry_policy=replaceable_policy,
+            allow_live_drift=options.tolerate_replaceable_entries,
+        ),
+        PersistentSource(
+            "sudoers",
+            Path("/etc/sudoers.d/020_e3dc_services"),
+            unsafe_entry_policy=replaceable_policy,
+            allow_live_drift=options.tolerate_replaceable_entries,
+        ),
+        PersistentSource(
+            "apache-config",
+            APACHE_SECURITY_CONFIG,
+            unsafe_entry_policy=replaceable_policy,
+            allow_live_drift=options.tolerate_replaceable_entries,
+        ),
+        PersistentSource(
+            "tmpfiles-config",
+            MANAGER_LOCK_TMPFILES_CONFIG,
+            unsafe_entry_policy=replaceable_policy,
+            allow_live_drift=options.tolerate_replaceable_entries,
+        ),
+    ))
+    if options.name == REPAIR_UPDATE_BACKUP_PROFILE.name:
+        sources.extend(
+            PersistentSource(
+                "web-root-persistent",
+                WEB_ROOT / name,
+                allow_live_drift=options.allow_quiesced_source_drift,
+            )
+            for name in WEB_PERSISTENT_FILE_NAMES
+        )
+        sources.append(
+            PersistentSource(
+                "web-history-backups",
+                WEB_HISTORY_BACKUPS,
+                allow_live_drift=options.allow_quiesced_source_drift,
+            )
+        )
+    mask_entries = None
+    if options.enforce_systemd_mask_contract:
+        mask_entries = _mask_entries_by_path(
+            systemd_mask_state or _systemd_mask_state_contract()
+        )
     for unit_path in _systemd_unit_paths():
         # Eine kanonische /dev/null-Maske ist kein Unit-Payload. Sie wird als
         # vollständiger SHA-256-gebundener Zustandsvertrag manifestiert. Der
         # synthetische missing-Source-Eintrag wird erst nach der Dateikopie
         # ergänzt, damit Restore die Maskenstelle transaktional freiräumt.
-        if unit_path.parent == SYSTEMD_ADMIN_UNIT_DIR and mask_entries[unit_path]["state"] == "masked":
+        if (
+            mask_entries is not None
+            and unit_path.parent == SYSTEMD_ADMIN_UNIT_DIR
+            and mask_entries[unit_path]["state"] == "masked"
+        ):
             continue
-        sources.append(PersistentSource("systemd", unit_path))
+        sources.append(
+            PersistentSource(
+                "systemd",
+                unit_path,
+                unsafe_entry_policy=replaceable_policy,
+                allow_live_drift=options.tolerate_replaceable_entries,
+            )
+        )
+    for dropin_path in _systemd_dropin_paths():
+        service_name = dropin_path.name.removesuffix(".service.d")
+        sources.append(
+            PersistentSource(
+                f"systemd-dropin-{service_name}",
+                dropin_path,
+                unsafe_entry_policy=replaceable_policy,
+                allow_live_drift=options.tolerate_replaceable_entries,
+            )
+        )
     for watchdog in (Path("/usr/local/bin/boot_notify.sh"), Path("/usr/local/bin/pi_guard.sh")):
-        sources.append(PersistentSource("watchdog", watchdog))
+        sources.append(
+            PersistentSource(
+                "watchdog",
+                watchdog,
+                unsafe_entry_policy=replaceable_policy,
+                allow_live_drift=options.tolerate_replaceable_entries,
+            )
+        )
     return sources
 
 
@@ -279,9 +519,21 @@ def _restore_allowlist(install_path=None):
         Path("/var/www/html"),
         Path("/var/lib/e3dc-control"),
         Path("/etc/e3dc-control"),
+        HA_ROOT_RUNTIME_BASE,
+        *_systemd_dropin_paths(),
     ]
     files = _systemd_unit_paths()
-    files.extend((Path("/usr/local/bin/boot_notify.sh"), Path("/usr/local/bin/pi_guard.sh")))
+    files.extend(
+        (
+            Path("/usr/local/bin/boot_notify.sh"),
+            Path("/usr/local/bin/pi_guard.sh"),
+            Path("/usr/local/sbin/e3dc-service-control"),
+            Path("/usr/local/sbin/e3dc-web-update-launcher"),
+            Path("/etc/sudoers.d/020_e3dc_services"),
+            APACHE_SECURITY_CONFIG,
+            MANAGER_LOCK_TMPFILES_CONFIG,
+        )
+    )
     return roots, files
 
 
@@ -289,31 +541,89 @@ def _backup_current_version_v2(
     install_path=None,
     preserve_backup_paths=None,
     verified_pre_chown_callback=None,
+    *,
+    profile=STRICT_BACKUP_PROFILE,
 ):
     active_install_path = _lexical_absolute(install_path or INSTALL_PATH)
+    options = _selected_backup_profile(profile, active_install_path)
     backup_dir = None
     try:
         # A legacy web Pickle is deliberately excluded above. A private model
         # is copied only after its non-executable manifest/hash contract passes.
-        _prepare_private_ml_store_for_backup(PRIVATE_ML_ROOT)
+        if options.include_optional_ml:
+            _prepare_private_ml_store_for_backup(PRIVATE_ML_ROOT)
+        elif os.path.lexists(str(PRIVATE_ML_ROOT)):
+            _warn_backup(
+                "Der optionale ML-Store bleibt für das Core-Update unverändert "
+                "und wird nicht Bestandteil des Rückfallbackups."
+            )
         backup_root = default_backup_root(active_install_path)
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
         backup_dir = backup_root / timestamp
         os.mkdir(str(backup_dir), 0o700)
-        print(f"→ Erstelle verifiziertes Backup unter {backup_dir}…")
-        systemd_mask_state = _systemd_mask_state_contract()
-        mask_entries = _mask_entries_by_path(systemd_mask_state)
+        print(
+            f"→ Erstelle verifiziertes Backup unter {backup_dir} "
+            f"(Profil: {options.name})…"
+        )
+        systemd_mask_state = None
+        mask_entries = {}
+        mask_state_before = None
+        if options.enforce_systemd_mask_contract:
+            systemd_mask_state = _systemd_mask_state_contract()
+            mask_entries = _mask_entries_by_path(systemd_mask_state)
+        else:
+            try:
+                mask_state_before = _systemd_mask_state_contract()
+            except Exception as exc:
+                _warn_backup(
+                    "Der alte systemd-Maskenzustand ist nicht eindeutig lesbar und "
+                    f"wird beim Reparaturupdate nicht als Rückfallvoraussetzung verwendet: {exc}"
+                )
         mapped_entries, source_records = copy_persistent_sources(
             backup_dir,
-            _persistent_sources(active_install_path, systemd_mask_state),
+            _persistent_sources(
+                active_install_path,
+                systemd_mask_state,
+                profile=options,
+            ),
         )
-        source_records.extend(
-            _missing_systemd_source_record(path)
-            for path, entry in mask_entries.items()
-            if entry["state"] == "masked"
-        )
-        if _systemd_mask_state_contract() != systemd_mask_state:
-            raise BackupIntegrityError("Systemd-Maskenzustand driftete während des Backups")
+        if options.enforce_systemd_mask_contract:
+            source_records.extend(
+                _missing_systemd_source_record(path)
+                for path, entry in mask_entries.items()
+                if entry["state"] == "masked"
+            )
+            if _systemd_mask_state_contract() != systemd_mask_state:
+                raise BackupIntegrityError("Systemd-Maskenzustand driftete während des Backups")
+        else:
+            try:
+                mask_state_after = _systemd_mask_state_contract()
+            except Exception as exc:
+                mask_state_after = None
+                _warn_backup(
+                    "Der systemd-Maskenzustand war nach dem Reparaturbackup nicht "
+                    f"eindeutig lesbar; das verifizierte Backup bleibt gültig: {exc}"
+                )
+            if (
+                mask_state_before is not None
+                and mask_state_after is not None
+                and mask_state_after != mask_state_before
+            ):
+                _warn_backup(
+                    "Der systemd-Maskenzustand änderte sich während des Live-Backups; "
+                    "das Reparaturupdate ersetzt die betroffenen Core-Units direkt."
+                )
+        skipped = [
+            (record.get("source"), item)
+            for record in source_records
+            for item in record.get("skipped_entries", [])
+            if isinstance(record, dict) and isinstance(item, dict)
+        ]
+        for source, item in skipped:
+            _warn_backup(
+                "Backupquelle wurde nofollow übersprungen: "
+                f"{source} / {item.get('path')} ({item.get('reason')})"
+            )
         if not mapped_entries:
             raise BackupIntegrityError("Es wurden keine wiederherstellbaren Dateien gesichert.")
         secure_backup_tree(backup_dir)
@@ -323,7 +633,9 @@ def _backup_current_version_v2(
             source_records,
             kind=SYSTEM_BACKUP_KIND,
             install_root=active_install_path,
-            systemd_mask_state=systemd_mask_state,
+            systemd_mask_state=(
+                systemd_mask_state if options.enforce_systemd_mask_contract else None
+            ),
         )
         manifest = verify_backup(backup_dir, expected_kind=SYSTEM_BACKUP_KIND)
         if verified_pre_chown_callback is not None:
@@ -335,7 +647,7 @@ def _backup_current_version_v2(
         # hierfür erzeugte Transaktionsbaum bleibt deshalb root:root 0700;
         # normale manuelle Backups ohne Receipt behalten ihr bisheriges
         # Besitzmodell.
-        if verified_pre_chown_callback is None:
+        if verified_pre_chown_callback is None and not options.keep_root_ownership:
             try:
                 uid, _ = get_user_ids()
                 gid = get_www_data_gid()
@@ -350,14 +662,22 @@ def _backup_current_version_v2(
                     f"Backup-Besitzrechte konnten nicht sicher gesetzt werden: {exc}"
                 )
         preserve = list(preserve_backup_paths or ()) + [backup_dir]
-        retention = prune_install_backups(
-            active_install_path,
-            backup_root=backup_root,
-            preserve_paths=preserve,
-            logger=backup_logger,
-        )
-        if not retention.get("success"):
-            raise BackupIntegrityError("Backup-Retention ist fehlgeschlagen.")
+        try:
+            retention = prune_install_backups(
+                active_install_path,
+                backup_root=backup_root,
+                preserve_paths=preserve,
+                logger=backup_logger,
+            )
+            if not retention.get("success"):
+                raise BackupIntegrityError("Backup-Retention ist fehlgeschlagen.")
+        except Exception as exc:
+            if options.retention_failure_is_fatal:
+                raise
+            _warn_backup(
+                "Alte Backups konnten nicht vollständig bereinigt werden; "
+                f"das neue verifizierte Backup bleibt gültig: {exc}"
+            )
         count = len(manifest.get("files", []))
         print(f"  ✓ Manifest und SHA-256 für {count} Dateien verifiziert")
         log_task_completed("Backup erstellen", details=f"{count} Dateien in {backup_dir.name}")
@@ -367,6 +687,8 @@ def _backup_current_version_v2(
         # Leave incomplete, non-manifested directories quarantined. Retention
         # ignores them; a recursive cleanup here would reopen a TOCTOU window.
         print(f"✗ Fehler beim Backup: {exc}\n")
+        if options.raise_errors:
+            raise
         return None
 
 
@@ -374,12 +696,16 @@ def backup_current_version(
     install_path=None,
     preserve_backup_paths=None,
     verified_pre_chown_callback=None,
+    *,
+    profile=None,
 ):
     """Create the only supported, complete, manifest-verified system backup."""
+    options = _selected_backup_profile(profile, install_path or INSTALL_PATH)
     return _backup_current_version_v2(
         install_path=install_path,
         preserve_backup_paths=preserve_backup_paths,
         verified_pre_chown_callback=verified_pre_chown_callback,
+        profile=options,
     )
 
 
@@ -387,17 +713,31 @@ def _quiesced_overlay_sources(install_path=None):
     """Kleine, nach Aktorruhe erneut zu versiegelnde Veränderungsfläche."""
 
     install = _lexical_absolute(install_path or INSTALL_PATH)
-    return [
+    repair_update = _bootstrap_repair_update_profile_bound(install)
+    # Der versionsgebundene Restorevertrag erlaubt bewusst nur diese exakten
+    # Ziele. Weitere Webroot-Legacydateien bleiben im verifizierten Vollbackup,
+    # bis Backup- und Restorevertrag gemeinsam erweitert werden können.
+    sources = [
         PersistentSource("install-config", install / "e3dc.config.txt"),
         PersistentSource("install-data", install / "data"),
         PersistentSource(
             "web-data",
-            Path("/var/www/html/data"),
+            WEB_ROOT / "data",
             exclude_top_level=(LEGACY_ML_MODEL.name,),
         ),
-        PersistentSource("system-state", Path("/var/lib/e3dc-control")),
+        PersistentSource("web-history-backups", WEB_HISTORY_BACKUPS),
+        PersistentSource(
+            "system-state",
+            Path("/var/lib/e3dc-control"),
+            exclude_top_level=(("ml",) if repair_update else ()),
+        ),
         PersistentSource("system-config", Path("/etc/e3dc-control")),
     ]
+    sources.extend(
+        PersistentSource("web-root-persistent", WEB_ROOT / name)
+        for name in WEB_PERSISTENT_FILE_NAMES
+    )
+    return sources
 
 
 def estimate_quiesced_overlay_size(install_path=None):
@@ -417,14 +757,14 @@ def create_quiesced_overlay(
 ):
     """Versiegelt mutable Nutzerdaten nach bestätigtem Dienststopp.
 
-    Das große Systembackup bleibt der vollständige Rückfall. Dieses kleine,
-    root-eigene Overlay hält ausschließlich den späteren, quieszierten Stand
-    der während des Live-Backups noch veränderbaren Daten fest.
+    Das große Systembackup bleibt der vollständige Rückfall. Diese kleine,
+    root-eigene ruhende Daten-Nachsicherung hält ausschließlich den späteren,
+    ruhenden Stand der während des Live-Backups noch veränderbaren Daten fest.
     """
 
     if not hasattr(os, "geteuid") or os.geteuid() != 0:
         raise BackupIntegrityError(
-            "Quiesced-Overlay darf ausschließlich Root erzeugen"
+            "Ruhende Daten-Nachsicherung darf ausschließlich Root erzeugen"
         )
     install = _lexical_absolute(install_path or INSTALL_PATH)
     transaction = _normalized_transaction_id(transaction_id)
@@ -445,7 +785,7 @@ def create_quiesced_overlay(
         or target != expected_target
     ):
         raise BackupIntegrityError(
-            "Quiesced-Overlay-Ziel ist nicht an Parent-Backup und Transaktion gebunden"
+            "Ziel der ruhenden Daten-Nachsicherung ist nicht an Vollbackup und Transaktion gebunden"
         )
 
     collection_descriptor = _open_root_controlled_backup_directory_chain(
@@ -500,7 +840,7 @@ def create_quiesced_overlay(
             parent_metadata.st_ino,
         ):
             raise BackupIntegrityError(
-                "Parent-Backup driftete vor der Overlay-Anlage"
+                "Parent-Backup driftete vor der ruhenden Daten-Nachsicherung"
             )
         try:
             os.stat(
@@ -511,7 +851,7 @@ def create_quiesced_overlay(
         except FileNotFoundError:
             pass
         else:
-            raise BackupIntegrityError("Quiesced-Overlay-Ziel existiert bereits")
+            raise BackupIntegrityError("Ziel der ruhenden Daten-Nachsicherung existiert bereits")
         os.mkdir(target.name, 0o700, dir_fd=collection_descriptor)
         os.fsync(collection_descriptor)
         target_before = os.stat(
@@ -530,7 +870,7 @@ def create_quiesced_overlay(
             != (target_metadata.st_dev, target_metadata.st_ino)
         ):
             raise BackupIntegrityError(
-                "Quiesced-Overlay wurde während der Anlage ausgetauscht"
+                "Ruhende Daten-Nachsicherung wurde während der Anlage ausgetauscht"
             )
 
         mapped_entries, source_records = copy_persistent_sources(
@@ -571,7 +911,7 @@ def create_quiesced_overlay(
             != (parent_metadata.st_dev, parent_metadata.st_ino)
         ):
             raise BackupIntegrityError(
-                "Quiesced-Overlay oder Parent-Backup driftete vor dem Receipt"
+                "Ruhende Daten-Nachsicherung oder Vollbackup driftete vor dem Receipt"
             )
         guard = QuiescedOverlayRestoreGuard(
             transaction_id=transaction,
@@ -591,15 +931,15 @@ def create_quiesced_overlay(
             collection_ino=int(collection_metadata.st_ino),
         )
         print(
-            "  ✓ Quiesced-Zustands-Overlay für {} Dateien verifiziert".format(
+            "  ✓ Ruhende Daten-Nachsicherung für {} Dateien verifiziert".format(
                 len(manifest.get("files", []))
             )
         )
         return str(target), manifest, guard
     except Exception:
-        # Unvollständige Overlays bleiben absichtlich root-privat für die
-        # Diagnose liegen. Ohne vollständiges Manifest autorisieren sie
-        # niemals einen Restore.
+        # Eine unvollständige ruhende Daten-Nachsicherung bleibt absichtlich
+        # root-privat für die Diagnose liegen. Ohne vollständiges Manifest
+        # autorisiert sie niemals einen Restore.
         raise
     finally:
         if target_descriptor is not None:
@@ -615,7 +955,7 @@ def restore_quiesced_overlay(
     *,
     guard: QuiescedOverlayRestoreGuard,
 ):
-    """Spielt den verifizierten quieszierten Zustand über das Vollbackup."""
+    """Spielt den verifizierten ruhenden Datenstand über das Vollbackup."""
 
     install = _lexical_absolute(install_path or INSTALL_PATH)
     if (
@@ -624,18 +964,22 @@ def restore_quiesced_overlay(
         or _lexical_absolute(guard.overlay_dir) != _lexical_absolute(overlay_dir)
     ):
         raise BackupIntegrityError(
-            "Quiesced-Overlay-Restore widerspricht Pfad oder Installations-Guard"
+            "Wiederherstellung der ruhenden Daten-Nachsicherung widerspricht Pfad oder Installations-Guard"
         )
     return restore_persistent_payload(
         overlay_dir,
         expected_kind=QUIESCED_OVERLAY_KIND,
         allowed_roots=(
             install / "data",
-            Path("/var/www/html/data"),
+            WEB_ROOT / "data",
+            WEB_HISTORY_BACKUPS,
             Path("/var/lib/e3dc-control"),
             Path("/etc/e3dc-control"),
         ),
-        allowed_files=(install / "e3dc.config.txt",),
+        allowed_files=(
+            install / "e3dc.config.txt",
+            *(WEB_ROOT / name for name in WEB_PERSISTENT_FILE_NAMES),
+        ),
         overlay_restore_guard=guard,
     )
 

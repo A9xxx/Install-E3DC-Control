@@ -11775,41 +11775,15 @@ def get_repo_url(repo_dir: str) -> str | None:
 
 
 def check_for_updates(repo_dir: str) -> int | None:
-    """
-    Prueft ob Updates verfuegbar sind.
-    Gibt die Anzahl fehlender Commits zurueck, None bei Fehler.
-    """
-    install_user = get_install_user()
-    try:
-        _require_bound_origin(repo_dir, install_user)
-        official = _official_remote_refs("refs/heads/main")["refs/heads/main"]
-    except RuntimeError as exc:
-        log_warning('update', f'GitHub-main konnte nicht gebunden werden: {exc}')
-        return None
-    fetch = _git_argv(
-        repo_dir,
-        install_user,
-        "fetch",
-        "--no-tags",
-        SELFUPDATE_REPO,
-        "+refs/heads/main:refs/remotes/origin/main",
-        timeout=120,
-    )
-    if not fetch['success']:
-        log_warning('update', f'git fetch fehlgeschlagen: {fetch["stderr"]}')
-        return None
-    fetched = _resolve_git_commit(repo_dir, "refs/remotes/origin/main", install_user)
-    if not fetched or not _exact_commit_matches(fetched, official):
-        log_warning('update', 'Gefetchtes origin/main weicht vom isoliert gebundenen GitHub-Ref ab')
-        return None
+    """Kompatibilitätseinstieg für den Git-unabhängigen Stable-Versionscheck."""
 
-    count = _git_argv(repo_dir, install_user, "rev-list", "--count", "HEAD..origin/main", timeout=5)
-    if count['success']:
-        try:
-            return int(count['stdout'].strip())
-        except ValueError:
-            return None
-    return None
+    from .release_version import stable_update_check
+
+    result = stable_update_check(Path(repo_dir))
+    if not result.get("success"):
+        log_warning('update', f"Stable-Release konnte nicht geprüft werden: {result.get('error')}")
+        return None
+    return int(result.get("missing") or 0)
 
 
 def list_pending_commits(repo_dir: str) -> str:

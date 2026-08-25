@@ -1,10 +1,23 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.4.4b
+Dokumentation Stand: 5.4.4c
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
 Installationspfad und Python-Umgebung aus dem geprüften Installationskontext.
+
+Der Installer-Anteil von 5.4.4c ersetzt die bisherige Finalizer- und
+Recovery-Bootblock-Kette durch einen direkten Ziel-Updater. Das `.git`-
+Verzeichnis der Nutzerinstallation ist weder Eingangsbedingung noch
+Updateautorität. Der Ziel-Updater erstellt bei laufenden Diensten das
+Vollbackup, stoppt die betroffenen Dienste danach genau einmal kurz und sichert
+die nun ruhenden veränderlichen Daten nach. Anschließend ersetzt er
+Produktdateien und Webdateien, setzt Rechte, Core-Units sowie root-eigene
+Launcher und startet die benötigten Dienste neu. Eine Same-Version-Reparatur
+verwendet denselben Ablauf. Die Stable-Versionsanzeige ist rein informativ und
+blockiert den Start nicht. Ein defekter 5.4.4b-Launcher kann für den ersten
+Übergang einmalig `sudo /bin/sh ./e3dc-update-bootstrap` benötigen. EMS- und
+Hardwarelogik entsprechen unverändert 5.4.4b.
 
 Der Installer-Anteil von 5.4.4b macht den heruntergeladenen Ziel-Updater zur
 einzigen Autorität für Inventar, Backup, Projektion und Recovery. Eine laufende
@@ -99,13 +112,12 @@ widersprüchliche Anker sowie HA- und Shadow-Rollen bleiben fail-closed und
 werden nicht automatisch repariert.
 
 Der Web-Update-Launcher ist ein kleiner gemeinsamer Download-Dispatcher. Er
-startet denselben root-eigenen Hintergrundauftrag wie Konsole, Installer-Menü
-und automatische Updateprüfung. Lokale Git-Metadaten, getrackte Änderungen und
-historische Dateimodi sind keine vorgelagerte Startautorität mehr. Der
-heruntergeladene Ziel-Updater entscheidet nach verifiziertem Backup über
-Normalisierung oder harten Abbruch; unklare Links, Spezialdateien,
-konkurrierende Writer sowie fehlgeschlagene Backup- oder Gesundheitsprüfungen
-bleiben gesperrt.
+startet für Dashboard, Konsole und Installer-Menü denselben root-eigenen
+Hintergrundauftrag. Die automatische Prüfung verwendet dieselbe Stable-Quelle,
+informiert aber nur über einen neuen Stand. Lokale Git-Metadaten, getrackte
+Änderungen und historische Dateimodi sind keine vorgelagerte Startautorität
+mehr. Der heruntergeladene Ziel-Updater erstellt das Vollbackup, ersetzt den
+Programmstand und bestätigt anschließend den Wiederanlauf.
 
 Der Installer-Anteil von 5.4.3l bindet den updater-eigenen Git-Rückweg vor
 der ersten Dienstmutation an Repository, `old_commit`, root-eigenes
@@ -261,12 +273,11 @@ systemctl status e3dc-live e3dc-epex-manager e3dc-weather-manager \
   --no-pager
 ```
 
-`--update-e3dc` startet denselben Hintergrundauftrag wie Web und automatische
-Updateprüfung. Auch wenn der exakte Release bereits vorhanden ist, folgt der
-Auftrag dem vollständigen Backup-, Ruhe-, Finalizer-, Gesundheits- und
-Rücklaufvertrag. `--reinstall-current` bleibt eine getrennte, ausdrücklich
-gewählte administrative Reparaturaktion. Details und Zeitgrenzen stehen in
-[Update.md](Update.md).
+`--update-e3dc` startet denselben Hintergrundauftrag wie das Web. Auch wenn der
+exakte Release bereits vorhanden ist, erstellt der Ziel-Updater das Vollbackup,
+stoppt die betroffenen Dienste einmal kurz, ersetzt Programmstand, Rechte und
+Units und prüft den Wiederanlauf. Die automatische Updateprüfung informiert nur
+über einen neuen Stable-Stand. Details stehen in [Update.md](Update.md).
 
 Seit 5.4.2 unterscheidet der Einstieg drei Zustände:
 

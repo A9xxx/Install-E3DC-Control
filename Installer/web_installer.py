@@ -64,6 +64,7 @@ try:
     )
     from .service_catalog import READ_ACTIONS, SERVICE_ACTIONS, get_module, iter_modules
     from .installer_config import get_install_path
+    from .release_version import stable_update_check
     from .git_commit_reader import (
         read_commit_entries,
         repository_git_reader_user,
@@ -90,6 +91,7 @@ except ImportError:  # pragma: no cover - direct script execution fallback
     if package_root not in sys.path:
         sys.path.insert(0, package_root)
     from Installer.installer_config import get_install_path
+    from Installer.release_version import stable_update_check
     from Installer.git_commit_reader import (
         read_commit_entries,
         repository_git_reader_user,
@@ -244,7 +246,7 @@ SERVICE_WRAPPER_SOURCE = INSTALLER_DIR / "service_wrapper.sh"
 SERVICE_WRAPPER = Path("/usr/local/sbin/e3dc-service-control")
 WEB_UPDATE_LAUNCHER_SOURCE = INSTALLER_DIR / "web_update_launcher.sh"
 WEB_UPDATE_LAUNCHER = Path("/usr/local/sbin/e3dc-web-update-launcher")
-WEB_UPDATE_DISPATCHER_CONTRACT = b'e3dc-download-bootstrap-v1'
+WEB_UPDATE_DISPATCHER_CONTRACT = b'e3dc-download-bootstrap-v2'
 SERVICE_WRAPPER_ACTIONS = (
     "start",
     "stop",
@@ -2150,143 +2152,9 @@ def installer_status() -> dict[str, Any]:
 
 
 def update_check() -> dict[str, Any]:
-    """Prüft origin/main ohne Fetch, Ref-Schreibzugriff oder Privilegwechsel."""
-    repo_dir = INSTALL_ROOT.resolve()
-    if not (repo_dir / ".git").is_dir():
-        return {
-            "success": False,
-            "missing": 0,
-            "repo": str(repo_dir),
-            "error": "Git-Repository nicht gefunden.",
-        }
+    """Vergleicht die installierte VERSION mit dem neuesten Stable-Release."""
 
-    git_prefix = [
-        "/usr/bin/env",
-        "GIT_OPTIONAL_LOCKS=0",
-        "GIT_CONFIG_NOSYSTEM=1",
-        "/usr/bin/git",
-        "-c",
-        f"safe.directory={repo_dir}",
-        "-c",
-        "core.fileMode=false",
-        "-c",
-        "protocol.ext.allow=never",
-        "-c",
-        "protocol.file.allow=never",
-        "-C",
-        str(repo_dir),
-    ]
-
-    # ls-remote liest den Ziel-Ref direkt, ohne origin/main oder sonstige
-    # lokale Refs zu aktualisieren. Die Prüfung bleibt damit auch im
-    # Webserverkontext vollständig mutationsfrei.
-    remote = run_cmd(
-        [
-            *git_prefix,
-            "ls-remote",
-            "--exit-code",
-            "origin",
-            "refs/heads/main",
-        ],
-        timeout=20,
-    )
-    if not remote.get("ok"):
-        return {
-            "success": False,
-            "missing": 0,
-            "repo": str(repo_dir),
-            "upstream": "refs/heads/main",
-            "error": "\n".join(
-                part
-                for part in [remote.get("stdout", ""), remote.get("stderr", "")]
-                if part
-            ),
-        }
-
-    remote_lines = [
-        line.strip()
-        for line in str(remote.get("stdout") or "").splitlines()
-        if line.strip()
-    ]
-    remote_match = (
-        re.fullmatch(r"([0-9a-fA-F]{40})\s+refs/heads/main", remote_lines[0])
-        if len(remote_lines) == 1
-        else None
-    )
-    if remote_match is None:
-        return {
-            "success": False,
-            "missing": 0,
-            "repo": str(repo_dir),
-            "upstream": "refs/heads/main",
-            "error": "origin/main lieferte keine eindeutig gebundene Commit-SHA.",
-        }
-    target_sha = remote_match.group(1).lower()
-
-    def resolve_full_commit(ref: str) -> tuple[str, str]:
-        resolved = run_cmd(
-            [
-                *git_prefix,
-                "rev-parse",
-                "--verify",
-                f"{ref}^{{commit}}",
-            ],
-            timeout=5,
-        )
-        value = resolved.get("stdout", "").strip().lower()
-        if not resolved.get("ok") or re.fullmatch(r"[0-9a-f]{40}", value) is None:
-            diagnostic = "\n".join(
-                part
-                for part in [
-                    resolved.get("stdout", ""),
-                    resolved.get("stderr", ""),
-                ]
-                if part
-            ).strip()
-            return "", diagnostic or f"{ref} ist keine volle Commit-SHA."
-        return value, ""
-
-    head_sha, head_error = resolve_full_commit("HEAD")
-    if not head_sha:
-        return {
-            "success": False,
-            "missing": 0,
-            "same_release": False,
-            "head_sha": head_sha,
-            "target_sha": target_sha,
-            "repo": str(repo_dir),
-            "upstream": "refs/heads/main",
-            "error": f"HEAD: {head_error}",
-        }
-
-    same_release = head_sha == target_sha
-    missing = 0 if same_release else 1
-    count_exact = same_release
-    target_local = run_cmd(
-        [*git_prefix, "cat-file", "-e", f"{target_sha}^{{commit}}"],
-        timeout=5,
-    )
-    if target_local.get("ok"):
-        count = run_cmd(
-            [*git_prefix, "rev-list", "--count", f"HEAD..{target_sha}"],
-            timeout=5,
-        )
-        raw_count = str(count.get("stdout") or "").strip()
-        if count.get("ok") and raw_count.isdecimal():
-            missing = int(raw_count)
-            count_exact = True
-
-    return {
-        "success": True,
-        "missing": missing,
-        "missing_exact": count_exact,
-        "same_release": same_release,
-        "head_sha": head_sha,
-        "target_sha": target_sha,
-        "repo": str(repo_dir),
-        "upstream": "refs/heads/main",
-    }
-
+    return stable_update_check(INSTALL_ROOT.resolve())
 
 def job_status() -> dict[str, Any]:
     return {

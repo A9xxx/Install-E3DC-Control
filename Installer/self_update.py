@@ -73,16 +73,20 @@ def main() -> int:
 
     try:
         if is_check:
-            from Installer.update import check_for_updates
-            missing = check_for_updates(repo_root)
-            if missing == 0:
-                print("System ist aktuell.")
-                return 0
-            elif missing is None:
-                print("Fehler bei der Update-Prüfung.")
+            from Installer.release_version import stable_update_check
+
+            result = stable_update_check(os.path.abspath(repo_root))
+            if not result.get("success"):
+                print("Fehler bei der Update-Prüfung: " + str(result.get("error") or "unbekannt"))
                 return 1
+            if int(result.get("missing") or 0) == 0:
+                print(f"System ist aktuell ({result.get('current_version')}).")
+                return 0
             else:
-                print(f"{missing} Commits verfügbar.")
+                print(
+                    f"Stable-Release {result.get('target_version')} ist verfügbar "
+                    f"(installiert: {result.get('current_version')})."
+                )
                 return 0
         elif is_fix_permissions:
             from Installer.permissions import run_permissions_wizard

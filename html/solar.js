@@ -5675,68 +5675,24 @@ function checkInstallerUpdate(force = false) {
     }).catch(e => console.error("Self update check failed", e));
 }
 
-// Beim Laden prüfen
-// Der reguläre Seitenstart respektiert den Vierstunden-Cache. Nur eine
-// ausdrücklich angestoßene Updateaktion darf den Netzwerkcheck erzwingen.
+// Beim Laden nur informativ prüfen. Der Update-Start ist weder von diesem
+// Netzwerkcheck noch von einem Versionsvergleich abhängig.
 document.addEventListener('DOMContentLoaded', () => checkInstallerUpdate(false));
-
-function hasExactSameReleaseEvidence(data) {
-    if (!data || data.success !== true || data.same_release !== true) return false;
-    const headSha = String(data.head_sha || '').trim().toLowerCase();
-    const targetSha = String(data.target_sha || '').trim().toLowerCase();
-    return /^[0-9a-f]{40}$/.test(headSha)
-        && /^[0-9a-f]{40}$/.test(targetSha)
-        && headSha === targetSha;
-}
 
 function startInstallerUpdate(btnId = 'btn-update-installer') {
     const btn = document.getElementById(btnId);
     let origText = '';
     if(btn) {
         origText = btn.innerHTML;
-        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Prüfe...';
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Starte...';
         btn.disabled = true;
     }
-
-    e3dcPostAction('action=check_self_update&force=1&t=' + Date.now())
-        .then(r => e3dcParseJsonResponse(r, 'System-Update-Check'))
-        .then(data => {
-            if (data && data.docker) {
-                const message = data.message
-                    || 'Docker-Installation erkannt. Bitte das Container-Image auf dem Docker-Host aktualisieren.';
-                alert(message);
-                if (btn) { btn.innerHTML = origText; btn.disabled = false; }
-                return;
-            }
-            if (!data || data.success !== true) {
-                alert("Der System-Update-Check ist fehlgeschlagen:\n"
-                    + ((data && (data.error || data.message)) || "Unbekannter Fehler")
-                    + "\n\nDas Update wurde nicht gestartet.");
-                if (btn) { btn.innerHTML = origText; btn.disabled = false; }
-                return;
-            }
-            const missing = Number(data && data.missing);
-            const sameRelease = hasExactSameReleaseEvidence(data);
-            if (sameRelease) {
-                alert("E3DC-Control ist bereits auf dem veröffentlichten aktuellen Stand.\n\nEine Neuinstallation derselben Version bleibt im Web gesperrt und ist nur administrativ möglich.");
-                if (btn) { btn.innerHTML = origText; btn.disabled = false; }
-                return;
-            }
-            let question = "Möchtest Du E3DC-Control auf den veröffentlichten Stable-Stand aktualisieren?";
-            if (data && data.success && Number.isFinite(missing) && missing > 0) {
-                question = `Es sind ${missing} System-Update(s) verfügbar.\nJetzt installieren?`;
-            }
-            if (!confirm(question)) {
-                if (btn) { btn.innerHTML = origText; btn.disabled = false; }
-                return;
-            }
-            startInstallerUpdateRun(btn, origText);
-        })
-        .catch(err => {
-            alert("Der System-Update-Check ist fehlgeschlagen:\n" + err.message
-                + "\n\nDas Update wurde nicht gestartet.");
-            if (btn) { btn.innerHTML = origText; btn.disabled = false; }
-        });
+    const question = "Möchtest Du E3DC-Control auf den veröffentlichten Stable-Stand aktualisieren oder die installierte Version reparieren?\n\nDer Updater erstellt zuerst ein Backup und startet die Dienste nach dem kurzen Dateiaustausch neu.";
+    if (!confirm(question)) {
+        if (btn) { btn.innerHTML = origText; btn.disabled = false; }
+        return;
+    }
+    startInstallerUpdateRun(btn, origText);
 }
 
 function startInstallerUpdateRun(btn, origText) {
@@ -5805,7 +5761,9 @@ function e3dcClassifyInstallerUpdatePoll(data) {
     const payload = (data && typeof data === "object") ? data : {};
     const logText = (typeof payload.log === "string") ? payload.log : "";
     const running = payload.running === true;
-    const successMarkerFound = logText.includes("Update erfolgreich abgeschlossen") ||
+    const releaseCompletionFound = /(?:^|\r?\n)\[OK\]\s+Update abgeschlossen\.\s*(?:\r?\n)+Version:\s*v?\d+\.\d+\.\d+[A-Za-z0-9._-]*/i.test(logText);
+    const successMarkerFound = releaseCompletionFound ||
+                               logText.includes("Update erfolgreich abgeschlossen") ||
                                logText.includes("Update abgeschlossen") ||
                                /\[OK\]\s+self-update auf [0-9a-f]{40} abgeschlossen\./i.test(logText) ||
                                logText.includes("Du bist auf dem neuesten Stand");
@@ -5985,7 +5943,9 @@ function pollUpdate(log, spinner, closeBtn, finishBtn) {
                 modalBody.scrollTop = modalBody.scrollHeight;
 
                 const logText = data.log || "";
-                const successFound = logText.includes("Update erfolgreich abgeschlossen") ||
+                const releaseCompletionFound = /(?:^|\r?\n)\[OK\]\s+Update abgeschlossen\.\s*(?:\r?\n)+Version:\s*v?\d+\.\d+\.\d+[A-Za-z0-9._-]*/i.test(logText);
+                const successFound = releaseCompletionFound ||
+                                     logText.includes("Update erfolgreich abgeschlossen") ||
                                      logText.includes("Update abgeschlossen") ||
                                      logText.includes("Du bist auf dem neuesten Stand") ||
                                      logText.includes("Vorgang abgebrochen");

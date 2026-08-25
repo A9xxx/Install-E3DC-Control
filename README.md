@@ -1,12 +1,12 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.4b</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.4c</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.4.4b**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur geprüften Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.4.4c**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
 
 > [!WARNING]
 > **⚠️ Achtung: Nutzung auf eigenes Risiko!**
@@ -19,6 +19,8 @@ Die aktuelle stabile Version ist **5.4.4b**. Hinweise zum Web-, Konsolen- und Do
 > **Config-Schutz:** Standardinstallationen speichern `data/e3dc_v4.json` und lokale Config-Backups mit `660` für Install-User und `www-data`, damit WebUI und Dienste weiter automatisch starten, die Datei aber nicht mehr weltlesbar ist. Der normale Config-Download ist redigiert; der Raw-Download enthält Zugangsdaten und wird nur angeboten, wenn eine Web-PIN gesetzt ist. Der Kompatibilitätsmodus (`664`) ist nur für eigene externe Leser gedacht.
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
+
+> **Neu in 5.4.4c Stable:** Der Ziel-Updater behandelt das `.git`-Verzeichnis der Nutzerinstallation nicht mehr als Updateautorität. Er erstellt bei laufenden Diensten das Vollbackup, stoppt die Dienste genau einmal kurz, sichert die nun ruhenden veränderlichen Daten nach und tauscht Produktdateien, Rechte, Core-Units und Launcher direkt aus. Der alte Finalizer, seine Same-Filesystem-Bedingung und der persistente Recovery-Bootblock gehören nicht zum neuen Normalpfad. Standalone-Dienste erhalten keine HA-Startbedingung; ein Fehler stellt den exakt zuvor aktiven Dienstsatz wieder her. Eine Same-Version-Reparatur ist erlaubt; die Stable-Versionsanzeige bleibt rein informativ. Kann ein defekter 5.4.4b-Launcher den neuen Updater noch nicht erreichen, ist einmalig `sudo /bin/sh ./e3dc-update-bootstrap` nötig. EMS- und Hardwarelogik entsprechen unverändert 5.4.4b.
 
 > **Neu in 5.4.4b Stable:** Der aktuelle Ziel-Updater erkennt eine laufende Einzelinstanz unabhängig von Benutzer- und Ordnernamen, erstellt und prüft das vollständige Backup vor dem kurzen Writer-Stopp und liefert bei einem kontrollierten Abbruch Ursache, Systemzustand und den nächsten sicheren Befehl. Docker-Installationen erhalten einen hostseitigen, geprüften Migrations- und Rückfallweg. In der Regelung bleiben echter PV-Überschuss und typisierte Pre-Dump-Zusatzentladung getrennt; eine allein aktive openWB Pro kann mit 0,1 A regeln und eine laufende Ladung wird während einer ausstehenden Phasenempfehlung nicht unnötig beendet. `wp_type = 6` liest einen E3DC-Leistungsmesser fail-closed, während Dashboard und Direktvermarktung Budget- beziehungsweise Preisursachen eindeutiger ausweisen.
 
@@ -127,9 +129,9 @@ Die aktuelle stabile Version ist **5.4.4b**. Hinweise zum Web-, Konsolen- und Do
 * **Betriebswartung:** Log-Rotation und begrenzte Update-/Installer-Backups reduzieren den Speicherbedarf. Die Rechteprüfung kann bekannte Abweichungen korrigieren; Systemzustand und freier Speicher bleiben zu überwachen.
 
 ### 🔄 Auto-Update & Rollback
-* **Ein gemeinsamer Updateauftrag:** Web-Dashboard, Konsole, Installer-Menü und automatische Updateprüfung starten denselben root-eigenen Hintergrundjob. Lokale Git-Änderungen, historische Dateirechte oder ein abweichender Installationsordner blockieren die Jobannahme nicht; der Ziel-Updater behält Backup-, Writer-, Sicherheits- und Gesundheitsprüfung.
+* **Ein gemeinsamer Updateauftrag:** Web-Dashboard, Konsole und Installer-Menü starten denselben root-eigenen Hintergrundjob. Die automatische Prüfung verwendet dieselbe Stable-Quelle und informiert über einen neuen Stand, startet ihn aber nicht ungefragt. Lokale Git-Änderungen, historische Dateirechte oder ein abweichender Installationsordner blockieren die Jobannahme nicht; der Ziel-Updater erstellt das Backup, ersetzt den Programmstand und prüft den Wiederanlauf.
 * **Ein-Datei-Bootstrap für Altinstallationen:** `e3dc-update-bootstrap` wird an einen beliebigen Ort auf den Raspberry Pi kopiert und mit `sudo /bin/sh ./e3dc-update-bootstrap` gestartet. Der veröffentlichte Updatepfad ermittelt Installationsordner, Installationsbenutzer und Rolle selbst, arbeitet als systemd-Auftrag im Hintergrund und führt den vorhandenen Alt-Updater nicht aus. Der genaue Ablauf und die verbleibenden echten Stop-Gründe stehen in [doc/Update.md](doc/Update.md).
-* **Optionale Updateprüfung:** Das System kann nachts nach einem freigegebenen Stable-Stand suchen und den geprüften Installerweg starten.
+* **Optionale Updateprüfung:** Das System kann nachts nach einem freigegebenen Stable-Stand suchen und ihn im Dashboard anzeigen.
 * **Umgebungsgebundener Rückfall:** Docker kann auf das in `UPDATE_POLICY.json` exakt gebundene Image `v5.3.2b` zurückgesetzt werden. Bare-Metal-Installationen bieten für diesen Altstand keinen Programm-Rückfall an; verifizierte Datei-Backups bleiben wiederherstellbar.
 
 ## 💬 Community & Support
@@ -508,7 +510,7 @@ sudo docker compose logs --tail=80 e3dc-control
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin wird
-> `E3DC_IMAGE_TAG=v5.4.4b` in `.env` gesetzt. `config --images` zeigt vor dem
+> `E3DC_IMAGE_TAG=v5.4.4c` in `.env` gesetzt. `config --images` zeigt vor dem
 > Pull das tatsächlich gewählte Image.
 >
 > Vor dem `pull` prüft der Helfer mindestens 2 GiB freien Platz im

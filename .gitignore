@@ -140,6 +140,8 @@
 !/Installer/generate_vapid.py
 !/Installer/git_commit_reader.py
 !/Installer/ha_manager.py
+!/Installer/ha_systemd_start_gate.py
+!/Installer/ha_root_runtime.py
 !/Installer/ha_writer_admission.py
 !/Installer/heat_actuator_safety.py
 !/Installer/heizstab_manager.py
@@ -224,6 +226,8 @@
 !/Installer/uninstall.py
 !/Installer/uninstall_docker.py
 !/Installer/update.py
+!/Installer/release_version.py
+!/Installer/update_simple.py
 !/Installer/update_legacy_forward.py
 !/Installer/update_offline_preflight.py
 !/Installer/update_prejournal_construction.py

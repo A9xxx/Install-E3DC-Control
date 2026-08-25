@@ -1611,6 +1611,7 @@ def _render_managed_service_unit(
     documentation="",
     syslog_identifier="",
     manager_lock_prestart="",
+    environment=(),
 ):
     """Rendert den einzigen freigegebenen Unitvertrag des Core-Helpers."""
 
@@ -1664,6 +1665,12 @@ def _render_managed_service_unit(
     if not normalized_argv:
         raise ValueError("systemd-ExecStart-Vertrag ist leer")
     exec_start = " ".join(shlex.quote(item) for item in normalized_argv)
+    environment_lines = ""
+    for assignment in environment or ():
+        value = str(assignment)
+        if not value or any(character in value for character in "\r\n\x00\""):
+            raise ValueError("Ungültige systemd-Umgebungsvariable")
+        environment_lines += f'Environment="{value}"\n'
 
     return f"""[Unit]
 Description={description}
@@ -1675,7 +1682,7 @@ Type=simple
 User={runtime_user}
 Group={runtime_group}
 WorkingDirectory={working_dir}
-{manager_lock_prestart}ExecStart={exec_start}
+{environment_lines}{manager_lock_prestart}ExecStart={exec_start}
 Restart={restart_policy}
 RestartSec={restart_sec}
 {service_tuning}
@@ -1872,40 +1879,63 @@ def _create_service_file(
     service_path = f"/etc/systemd/system/{service_name}.service"
 
     # Der Code kann aus einem versiegelten Release-Snapshot importiert sein.
-    # Units dürfen ausschließlich auf den gebundenen Produktbaum zeigen.
+    # Unprivilegierte Units zeigen auf den gebundenen Produktbaum. Der einzige
+    # Root-Python-Daemon erhält dagegen eine eigene root-eigene Laufzeitkopie.
     installer_dir = os.path.join(get_install_path(), "Installer")
+    root_ha_runtime = service_name == "e3dc-ha" and runtime_user == "root"
+    service_environment = ()
+    if root_ha_runtime:
+        try:
+            from .ha_root_runtime import project_ha_root_runtime
 
-    script_abs_path = os.path.normpath(os.path.join(installer_dir, python_script_rel_path))
-    working_dir = os.path.dirname(script_abs_path)
-
-    if not os.path.isfile(script_abs_path):
-        service_logger.error(f"FATAL: Skript {script_abs_path} nicht gefunden!")
-        print(f"✗ Skript für Service {service_name} fehlt: {script_abs_path}")
-        return False
-
-    # Alle über diesen Core-Helper installierten Dienste erben standardmäßig
-    # den harten venv-Vertrag. Nur ein ausdrücklich nicht zum Core gehörender
-    # Aufrufer darf den System-Python-Pfad freigeben.
-    try:
-        _venv_name, bound_venv_path = resolve_venv_target(install_user)
-        if require_venv or os.path.lexists(bound_venv_path):
-            runtime = require_bound_venv_runtime(
+            bundle, bound_root, bound_user = project_ha_root_runtime(
+                Path(installer_dir),
+                install_root=Path(get_install_path()),
                 install_user=install_user,
-                venv_path=bound_venv_path,
             )
-            script_executor = runtime["python"]
-        else:
-            script_executor = _trusted_executable(
-                "/usr/bin/python3",
-                {0},
-                "System-Python für optionalen Nicht-Core-Dienst",
+            script_abs_path = str(bundle / "ha_manager.py")
+            working_dir = "/"
+            script_executor = "/usr/bin/python3"
+            service_environment = (
+                "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+                "PYTHONNOUSERSITE=1",
+                "PYTHONPATH=",
             )
-    except Exception as exc:
-        print(
-            f"✗ Service {service_name} besitzt keinen vertrauensgebundenen "
-            f"Python-Laufzeitvertrag: {exc}"
-        )
-        return False
+        except Exception as exc:
+            print(f"✗ Root-Laufzeit für e3dc-ha konnte nicht projiziert werden: {exc}")
+            return False
+    else:
+        script_abs_path = os.path.normpath(os.path.join(installer_dir, python_script_rel_path))
+        working_dir = os.path.dirname(script_abs_path)
+
+        if not os.path.isfile(script_abs_path):
+            service_logger.error(f"FATAL: Skript {script_abs_path} nicht gefunden!")
+            print(f"✗ Skript für Service {service_name} fehlt: {script_abs_path}")
+            return False
+
+        # Alle über diesen Core-Helper installierten Dienste erben standardmäßig
+        # den harten venv-Vertrag. Nur ein ausdrücklich nicht zum Core gehörender
+        # Aufrufer darf den System-Python-Pfad freigeben.
+        try:
+            _venv_name, bound_venv_path = resolve_venv_target(install_user)
+            if require_venv or os.path.lexists(bound_venv_path):
+                runtime = require_bound_venv_runtime(
+                    install_user=install_user,
+                    venv_path=bound_venv_path,
+                )
+                script_executor = runtime["python"]
+            else:
+                script_executor = _trusted_executable(
+                    "/usr/bin/python3",
+                    {0},
+                    "System-Python für optionalen Nicht-Core-Dienst",
+                )
+        except Exception as exc:
+            print(
+                f"✗ Service {service_name} besitzt keinen vertrauensgebundenen "
+                f"Python-Laufzeitvertrag: {exc}"
+            )
+            return False
 
     manager_lock_prestart = ""
     if service_name in MANAGER_LOCK_FILES:
@@ -1916,8 +1946,23 @@ def _create_service_file(
             f"{MANAGER_LOCK_TMPFILES_CONFIG}\n"
         )
 
-    exec_argv = [str(script_executor), str(script_abs_path)]
-    exec_argv.extend(str(argument) for argument in (script_args or ()))
+    exec_argv = [str(script_executor)]
+    if root_ha_runtime:
+        exec_argv.extend(
+            (
+                "-B",
+                "-E",
+                "-s",
+                str(script_abs_path),
+                "--install-root",
+                str(bound_root),
+                "--install-user",
+                bound_user,
+            )
+        )
+    else:
+        exec_argv.append(str(script_abs_path))
+        exec_argv.extend(str(argument) for argument in (script_args or ()))
     service_content = _render_managed_service_unit(
         description=description,
         runtime_user=runtime_user,
@@ -1935,6 +1980,7 @@ def _create_service_file(
         documentation=documentation,
         syslog_identifier=syslog_identifier,
         manager_lock_prestart=manager_lock_prestart,
+        environment=service_environment,
     )
     tmp_path = None
     staged_service_path = f"{service_path}.e3dc-control-{os.getpid()}.tmp"

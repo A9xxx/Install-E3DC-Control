@@ -1,6 +1,6 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.4b
+Dokumentation Stand: 5.4.4c
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
@@ -9,9 +9,24 @@ in [E3DC-Control Installer](Installer.md) beschrieben.
 Für heterogene Altinstallationen wird genau eine Datei auf den Raspberry Pi
 kopiert. Der Aufruf `sudo /bin/sh ./e3dc-update-bootstrap` erkennt
 Installationsordner, Installationsbenutzer und Rolle selbst und startet den
-gemeinsamen systemd-Hintergrundauftrag. Nach diesem einmaligen Übergang nutzen
-Dashboard, Konsole, Installer-Menü und automatische Updateprüfung denselben
-Dispatcher.
+gemeinsamen systemd-Hintergrundauftrag. Nach diesem einmaligen Übergang starten
+Dashboard, Konsole und Installer-Menü denselben Dispatcher. Die automatische
+Updateprüfung verwendet dieselbe Stable-Quelle, informiert aber nur über einen
+neuen Stand.
+
+Der Installer-Anteil von 5.4.4c verwendet den heruntergeladenen Ziel-Updater
+direkt. Das `.git`-Verzeichnis des Nutzers, lokale Produktänderungen, fehlende
+Dateien und frühere Rechte entscheiden nicht über die Annahme des Updates. Das
+Vollbackup wird bei laufenden Diensten erstellt; nach genau einem kurzen
+Dienststopp folgt die Nachsicherung der nun ruhenden veränderlichen Daten.
+Danach werden Dateien, Rechte, Core-Units und Launcher auf den Releasezustand
+gebracht und die benötigten Dienste neu gestartet. Der alte Release-Finalizer,
+die Bedingung eines Ziel-Updaters auf demselben Produkt-Dateisystem und der
+persistente Recovery-Bootblock gehören nicht zum Normalpfad. Derselbe
+Stable-Stand darf zur Reparatur erneut installiert werden; der Versionscheck
+bleibt eine reine Anzeige. Für einen defekten 5.4.4b-Launcher kann einmalig der
+portable `e3dc-update-bootstrap` nötig sein. Regelung und Hardwareausgänge
+bleiben gegenüber 5.4.4b unverändert.
 
 Der Installer-Anteil von 5.4.4b bindet eine laufende Einzelinstanz aus ihrem
 systemd-Dienst und verwendet den aktuellen Ziel-Updater für Inventar, Backup,

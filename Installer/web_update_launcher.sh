@@ -5,7 +5,7 @@
 # Der eingebettete Installationspfad und -benutzer sind ausschließlich Hinweise
 # für die aktuelle Release-Discovery. Der installierte Produktbaum und seine
 # Git-Metadaten sind keine Autorität für den Start des Updates: Der Systemjob
-# lädt den Bootstrap des neuesten veröffentlichten Releases in ein privates
+# lädt das neueste veröffentlichte Release genau einmal in ein privates
 # Root-Verzeichnis; dessen Discovery bindet Installation, Benutzer und Rolle.
 
 set -euo pipefail
@@ -13,7 +13,7 @@ umask 027
 
 readonly INSTALL_ROOT=@E3DC_INSTALL_ROOT@
 readonly INSTALL_USER=@E3DC_INSTALL_USER@
-readonly DISPATCHER_CONTRACT="e3dc-download-bootstrap-v1"
+readonly DISPATCHER_CONTRACT="e3dc-download-bootstrap-v2"
 readonly LAUNCHER="/usr/local/sbin/e3dc-web-update-launcher"
 readonly UNIT="e3dc-web-update.service"
 readonly RUNTIME_DIR="/run/e3dc-web-update"
@@ -38,26 +38,32 @@ DOWNLOAD_DIR=""
 fail() {
     local message="$1"
     local exit_code="${2:-1}"
+    local explicit_solution="${3:-}"
     local solution
-    case "$exit_code" in
-        64)
-            solution="Starte den installierten Web-Update-Dispatcher ohne zusätzliche Argumente."
-            ;;
-        75)
-            solution="Warte auf den laufenden Updatejob und prüfe: systemctl status --no-pager ${UNIT}"
-            ;;
-        77)
-            solution="Starte den Dispatcher über die Weboberfläche oder mit sudo."
-            ;;
-        126)
-            solution="Repariere den root-eigenen Dispatcher einmalig mit dem aktuellen Community-Bootstrap und starte danach das Webupdate erneut."
-            ;;
-        *)
-            solution="Prüfe die unmittelbar vorherige Ursache sowie ${LOG_FILE} und starte denselben Updatebefehl anschließend erneut."
-            ;;
-    esac
+    if [[ -n "$explicit_solution" ]]; then
+        solution="$explicit_solution"
+    else
+        case "$exit_code" in
+            64)
+                solution="Starte den installierten Web-Update-Dispatcher ohne zusätzliche Argumente."
+                ;;
+            75)
+                solution="Warte auf den laufenden Updatejob und prüfe: systemctl status --no-pager ${UNIT}"
+                ;;
+            77)
+                solution="Starte den Dispatcher über die Weboberfläche oder mit sudo."
+                ;;
+            126)
+                solution="Repariere den root-eigenen Dispatcher einmalig mit dem aktuellen Community-Bootstrap und starte danach das Webupdate erneut."
+                ;;
+            *)
+                solution="Prüfe die unmittelbar vorherige Ursache sowie ${LOG_FILE} und starte denselben Updatebefehl anschließend erneut."
+                ;;
+        esac
+    fi
     printf '\n[ABBRUCH] E3DC-UPD-WEB-%s\n' "$exit_code" >&2
     printf 'Was ist passiert: %s\n' "$message" >&2
+    printf 'Systemzustand: E3DC-Produktdateien und laufende E3DC-Dienste wurden nicht verändert.\n' >&2
     printf 'Lösung: %s\n' "$solution" >&2
     exit "$exit_code"
 }
@@ -89,14 +95,20 @@ require_secure_root_directory() {
 
 prepare_runtime_paths() {
     local www_data_gid
-    www_data_gid="$(/usr/bin/getent group www-data | /usr/bin/cut -d: -f3)"
+    www_data_gid="$(/usr/bin/getent group www-data | /usr/bin/cut -d: -f3)" \
+        || fail "www-data-Gruppe konnte nicht gelesen werden" 1 \
+            "Prüfe die Gruppe mit: getent group www-data ; starte danach erneut: sudo ${LAUNCHER}"
     [[ "$www_data_gid" =~ ^[0-9]+$ ]] || fail "www-data-Gruppe fehlt" 126
     [[ ! -L "$RUNTIME_DIR" && ! -L "$LOG_DIR" ]] \
         || fail "Runtime- oder Logpfad ist ein Symlink" 126
     require_secure_root_directory /run
     require_secure_root_directory /var/log
-    /usr/bin/install -d -o root -g www-data -m 0750 -- "$RUNTIME_DIR"
-    /usr/bin/install -d -o root -g root -m 0755 -- "$LOG_DIR"
+    /usr/bin/install -d -o root -g www-data -m 0750 -- "$RUNTIME_DIR" \
+        || fail "Runtime-Verzeichnis konnte nicht angelegt oder repariert werden" 1 \
+            "Führe sudo /usr/bin/install -d -o root -g www-data -m 0750 ${RUNTIME_DIR} aus und starte danach erneut: sudo ${LAUNCHER}"
+    /usr/bin/install -d -o root -g root -m 0755 -- "$LOG_DIR" \
+        || fail "Log-Verzeichnis konnte nicht angelegt oder repariert werden" 1 \
+            "Führe sudo /usr/bin/install -d -o root -g root -m 0755 ${LOG_DIR} aus und starte danach erneut: sudo ${LAUNCHER}"
     require_root_path "$RUNTIME_DIR" 750 "$www_data_gid"
     require_root_path "$LOG_DIR" 755 0
 }
@@ -106,7 +118,9 @@ prepare_lock_file() {
     local metadata
     if [[ -e "$lock_path" || -L "$lock_path" ]]; then
         if [[ -L "$lock_path" ]]; then
-            /usr/bin/unlink -- "$lock_path"
+            /usr/bin/unlink -- "$lock_path" \
+                || fail "Unsicherer Update-Lock konnte nicht entfernt werden: ${lock_path}" 1 \
+                    "Führe sudo /usr/bin/unlink ${lock_path} aus und starte danach erneut: sudo ${LAUNCHER}"
         else
             metadata="$(/usr/bin/stat -c '%u %g %F %h' -- "$lock_path")" \
                 || fail "Update-Lock ist nicht prüfbar" 126
@@ -125,19 +139,28 @@ prepare_lock_file() {
     [[ "$metadata" == "0 0 regular file 1" \
         || "$metadata" == "0 0 regular empty file 1" ]] \
         || fail "Update-Lock besitzt nach Anlage unzulässige Metadaten" 126
-    /usr/bin/chown root:root -- "$lock_path"
-    /usr/bin/chmod 0600 -- "$lock_path"
+    /usr/bin/chown root:root -- "$lock_path" \
+        || fail "Update-Lock konnte nicht root übergeben werden: ${lock_path}" 1 \
+            "Führe sudo /usr/bin/chown root:root ${lock_path} aus und starte danach erneut: sudo ${LAUNCHER}"
+    /usr/bin/chmod 0600 -- "$lock_path" \
+        || fail "Update-Lock konnte nicht sicher gesetzt werden: ${lock_path}" 1 \
+            "Führe sudo /usr/bin/chmod 0600 ${lock_path} aus und starte danach erneut: sudo ${LAUNCHER}"
 }
 
 write_runtime_value() {
     local target="$1"
     local value="$2"
     local temporary
-    temporary="$(/usr/bin/mktemp "${RUNTIME_DIR}/.$(/usr/bin/basename "$target").XXXXXX")"
-    printf '%s\n' "$value" > "$temporary"
-    /usr/bin/chown root:www-data -- "$temporary"
-    /usr/bin/chmod 0640 -- "$temporary"
-    /usr/bin/mv -fT -- "$temporary" "$target"
+    temporary="$(/usr/bin/mktemp "${RUNTIME_DIR}/.$(/usr/bin/basename "$target").XXXXXX")" \
+        || return 1
+    printf '%s\n' "$value" > "$temporary" \
+        || return 1
+    /usr/bin/chown root:www-data -- "$temporary" \
+        || return 1
+    /usr/bin/chmod 0640 -- "$temporary" \
+        || return 1
+    /usr/bin/mv -fT -- "$temporary" "$target" \
+        || return 1
 }
 
 prepare_log() {
@@ -152,9 +175,15 @@ prepare_log() {
         || fail "Updateprotokoll ist nicht prüfbar" 126
     [[ "$metadata" == "regular file 1" || "$metadata" == "regular empty file 1" ]] \
         || fail "Updateprotokoll besitzt einen unzulässigen Pfadtyp" 126
-    /usr/bin/chown root:www-data -- "$LOG_FILE"
-    /usr/bin/chmod 0640 -- "$LOG_FILE"
-    : > "$LOG_FILE"
+    /usr/bin/chown root:www-data -- "$LOG_FILE" \
+        || fail "Updateprotokoll konnte nicht root:www-data übergeben werden" 1 \
+            "Führe sudo /usr/bin/chown root:www-data ${LOG_FILE} aus und starte danach erneut: sudo ${LAUNCHER}"
+    /usr/bin/chmod 0640 -- "$LOG_FILE" \
+        || fail "Updateprotokoll konnte nicht sicher gesetzt werden" 1 \
+            "Führe sudo /usr/bin/chmod 0640 ${LOG_FILE} aus und starte danach erneut: sudo ${LAUNCHER}"
+    : > "$LOG_FILE" \
+        || fail "Updateprotokoll konnte nicht geleert werden" 1 \
+            "Prüfe den freien Speicher mit: df -h /var/log ; starte danach erneut: sudo ${LAUNCHER}"
     printf '=== E3DC-Control Update %s ===\n' "$(/usr/bin/date --iso-8601=seconds)" >> "$LOG_FILE"
 }
 
@@ -164,10 +193,20 @@ validate_launcher_contract() {
         [[ -x "$binary" ]] || fail "Fest gebundenes Systemprogramm fehlt: ${binary}" 126
     done
     for parent in /usr/local /usr/local/sbin; do
+        [[ ! -L "$parent" ]] \
+            || fail "Launcher-Elternpfad ist ein Symlink: ${parent}" 126
         metadata="$(/usr/bin/stat -c '%u %g %a %F' -- "$parent")" \
             || fail "Launcher-Elternpfad ist nicht prüfbar: ${parent}" 126
-        [[ "$metadata" =~ ^0\ 0\ [0-7]+\ directory$ ]] \
-            || fail "Launcher-Elternpfad ist nicht root-eigen: ${parent}" 126
+        [[ "$metadata" =~ ^[0-9]+\ [0-9]+\ [0-7]+\ directory$ ]] \
+            || fail "Launcher-Elternpfad ist kein echtes Verzeichnis: ${parent}" 126
+        /usr/bin/chown root:root -- "$parent" \
+            || fail "Launcher-Elternpfad konnte nicht root übergeben werden: ${parent}" 126
+        /usr/bin/chmod 0755 -- "$parent" \
+            || fail "Launcher-Elternpfad konnte nicht sicher gesetzt werden: ${parent}" 126
+        metadata="$(/usr/bin/stat -c '%u %g %a %F' -- "$parent")" \
+            || fail "Reparierter Launcher-Elternpfad ist nicht prüfbar: ${parent}" 126
+        [[ "$metadata" == "0 0 755 directory" ]] \
+            || fail "Launcher-Elternpfad blieb nach Reparatur unsicher: ${parent}" 126
         parent_mode="$(/usr/bin/stat -c '%a' -- "$parent")"
         [[ $((8#$parent_mode & 8#022)) -eq 0 ]] \
             || fail "Launcher-Elternpfad ist für Gruppe oder Andere schreibbar: ${parent}" 126
@@ -179,9 +218,17 @@ validate_launcher_contract() {
     launcher_mode="$(/usr/bin/stat -c '%a' -- "$LAUNCHER")"
     launcher_kind="$(/usr/bin/stat -c '%F' -- "$LAUNCHER")"
     launcher_links="$(/usr/bin/stat -c '%h' -- "$LAUNCHER")"
-    [[ "$launcher_owner" == "0" && "$launcher_links" == "1" \
+    [[ "$launcher_links" == "1" \
         && ( "$launcher_kind" == "regular file" || "$launcher_kind" == "regular empty file" ) ]] \
-        || fail "Installierter Update-Dispatcher ist nicht root-eigen/regulär/nlink=1" 126
+        || fail "Installierter Update-Dispatcher ist nicht regulär/nlink=1" 126
+    /usr/bin/chown root:root -- "$LAUNCHER" \
+        || fail "Installierter Update-Dispatcher konnte nicht root übergeben werden" 126
+    /usr/bin/chmod 0755 -- "$LAUNCHER" \
+        || fail "Installierter Update-Dispatcher konnte nicht sicher gesetzt werden" 126
+    launcher_owner="$(/usr/bin/stat -c '%u' -- "$LAUNCHER")"
+    launcher_mode="$(/usr/bin/stat -c '%a' -- "$LAUNCHER")"
+    [[ "$launcher_owner" == "0" ]] \
+        || fail "Installierter Update-Dispatcher blieb nach Reparatur fremdbesessen" 126
     [[ $((8#$launcher_mode & 8#022)) -eq 0 \
         && $((8#$launcher_mode & 8#500)) -eq $((8#500)) ]] \
         || fail "Installierter Update-Dispatcher ist nicht sicher root-lesbar/ausführbar" 126
@@ -215,8 +262,8 @@ isolated_git() {
         "$@"
 }
 
-resolve_release_binding() {
-    local effective_latest tag refs tag_object target_sha
+resolve_release_tag() {
+    local effective_latest tag
     effective_latest="$($CURL -q \
         --fail --silent --show-error --location \
         --proto '=https' --tlsv1.2 \
@@ -228,68 +275,69 @@ resolve_release_binding() {
     esac
     [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+[a-z]?$ ]] \
         || fail "Release-Tag besitzt ein unerwartetes Format: ${tag}"
-    refs="$(/usr/bin/mktemp "${RUNTIME_DIR}/release-refs.XXXXXX")"
-    isolated_git ls-remote --tags "$GIT_URL" \
-        "refs/tags/$tag" "refs/tags/$tag^{}" >"$refs" \
-        || fail "Release-Referenzen konnten nicht gebunden werden"
-    tag_object="$(/usr/bin/awk -v ref="refs/tags/$tag" '$2 == ref {print $1}' "$refs")"
-    target_sha="$(/usr/bin/awk -v ref="refs/tags/$tag^{}" '$2 == ref {print $1}' "$refs")"
-    /usr/bin/unlink "$refs"
-    [[ "$tag_object" =~ ^[0-9a-f]{40}$ && "$target_sha" =~ ^[0-9a-f]{40}$ \
-        && "$tag_object" != "$target_sha" ]] \
-        || fail "Release-Tag besitzt keine eindeutige annotierte Commitbindung"
-    printf '%s\t%s\t%s\n' "$tag" "$tag_object" "$target_sha"
+    printf '%s\n' "$tag"
 }
 
-download_release_bootstrap() {
-    local target="$1"
+download_release_checkout() {
+    local checkout="$1"
     local tag="$2"
-    local tag_object="$3"
-    local target_sha="$4"
-    local binding_repo fetched_tag fetched_sha expected_blob actual_blob metadata size
-    [[ "$target" == /run/e3dc-update-download.*'/e3dc-update-bootstrap' ]] \
-        || fail "Bootstrap-Ziel liegt nicht im privaten Runtime-Pfad" 126
-    [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+[a-z]?$ \
-        && "$tag_object" =~ ^[0-9a-f]{40}$ \
-        && "$target_sha" =~ ^[0-9a-f]{40}$ \
-        && "$tag_object" != "$target_sha" ]] \
-        || fail "Bootstrap-Download besitzt keine vollständige Release-Bindung" 126
-    binding_repo="${DOWNLOAD_DIR}/binding"
-    /usr/bin/mkdir -m 0700 -- "$binding_repo"
-    isolated_git -c init.defaultBranch=main init "$binding_repo" >/dev/null
-    isolated_git -C "$binding_repo" remote add origin "$GIT_URL"
-    isolated_git -C "$binding_repo" fetch \
+    local fetched_tag fetched_sha head_sha metadata version required command_error
+    local runtime_solution remote_solution retry_solution
+    runtime_solution="Prüfe freien Speicher mit: df -h /run / ; starte danach erneut mit: sudo ${LAUNCHER}"
+    remote_solution="Prüfe den GitHub-Zugriff mit: /usr/bin/curl -q -fsSI --proto '=https' --tlsv1.2 ${REPOSITORY_URL}/releases/tag/${tag} ; starte danach erneut mit: sudo ${LAUNCHER}"
+    retry_solution="Starte den Release-Download erneut mit: sudo ${LAUNCHER} ; tritt derselbe Fehler erneut auf, zeige das Protokoll mit: sudo journalctl -u ${UNIT} --no-pager -n 200"
+    [[ "$checkout" == /run/e3dc-update-download.*'/release' ]] \
+        || fail "Release-Ziel liegt nicht im privaten Runtime-Pfad" 126
+    [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+[a-z]?$ ]] \
+        || fail "Release-Download besitzt keinen gültigen Release-Tag" 126
+    if ! command_error="$(/usr/bin/mkdir -m 0700 -- "$checkout" 2>&1)"; then
+        fail "Privates Release-Verzeichnis konnte nicht angelegt werden: ${command_error:-keine Detailausgabe}" 1 "$runtime_solution"
+    fi
+    if ! command_error="$(isolated_git -c init.defaultBranch=main init "$checkout" 2>&1)"; then
+        fail "Privates Release-Verzeichnis konnte nicht als Git-Checkout initialisiert werden: ${command_error:-keine Detailausgabe}" 1 "$runtime_solution"
+    fi
+    if ! command_error="$(isolated_git -C "$checkout" remote add origin "$GIT_URL" 2>&1)"; then
+        fail "Release-Quelle konnte im privaten Checkout nicht eingetragen werden: ${command_error:-keine Detailausgabe}" 1 "$runtime_solution"
+    fi
+    if ! command_error="$(isolated_git -C "$checkout" fetch \
         --no-tags --depth=1 origin \
-        "+refs/tags/$tag:refs/tags/$tag" >/dev/null
-    fetched_tag="$(isolated_git -C "$binding_repo" rev-parse --verify "refs/tags/$tag")"
-    fetched_sha="$(isolated_git -C "$binding_repo" rev-parse --verify "refs/tags/$tag^{commit}")"
-    [[ "$fetched_tag" == "$tag_object" && "$fetched_sha" == "$target_sha" ]] \
-        || fail "Geladener Release-Tag widerspricht der Vorbindung" 126
-    expected_blob="$(isolated_git -C "$binding_repo" rev-parse --verify \
-        "${target_sha}:e3dc-update-bootstrap")"
-    [[ "$expected_blob" =~ ^[0-9a-f]{40,64}$ ]] \
-        || fail "Release-Bootstrap besitzt keinen gebundenen Git-Blob" 126
-    isolated_git -C "$binding_repo" show \
-        "${target_sha}:e3dc-update-bootstrap" >"$target" \
-        || fail "Commitgebundener Release-Bootstrap konnte nicht extrahiert werden"
-    actual_blob="$(isolated_git -C "$binding_repo" hash-object -- "$target")"
-    [[ "$actual_blob" == "$expected_blob" ]] \
-        || fail "Extrahierter Release-Bootstrap widerspricht seinem Git-Blob" 126
-    /usr/bin/chown root:root -- "$target"
-    /usr/bin/chmod 0500 -- "$target"
-    metadata="$(/usr/bin/stat -c '%u %g %a %F %h' -- "$target")" \
-        || fail "Release-Bootstrap ist nicht prüfbar" 126
-    [[ "$metadata" == "0 0 500 regular file 1" ]] \
-        || fail "Release-Bootstrap besitzt unzulässige Metadaten" 126
-    size="$(/usr/bin/stat -c '%s' -- "$target")"
-    [[ "$size" =~ ^[0-9]+$ && "$size" -ge 512 && "$size" -le 262144 ]] \
-        || fail "Release-Bootstrap besitzt eine unzulässige Größe" 126
-    [[ "$(/usr/bin/head -n 1 -- "$target")" == '#!/bin/sh' ]] \
-        || fail "Release-Bootstrap besitzt keinen erwarteten Interpretervertrag" 126
+        "+refs/tags/$tag:refs/tags/$tag" 2>&1)"; then
+        fail "Release ${tag} konnte nicht geladen werden: ${command_error:-keine Detailausgabe}" 1 "$remote_solution"
+    fi
+    if ! fetched_tag="$(isolated_git -C "$checkout" rev-parse --verify "refs/tags/$tag" 2>&1)"; then
+        fail "Geladener Release-Tag ${tag} konnte nicht aufgelöst werden: ${fetched_tag:-keine Detailausgabe}" 1 "$retry_solution"
+    fi
+    if ! fetched_sha="$(isolated_git -C "$checkout" rev-parse --verify "refs/tags/$tag^{commit}" 2>&1)"; then
+        fail "Commit von Release ${tag} konnte nicht aufgelöst werden: ${fetched_sha:-keine Detailausgabe}" 1 "$retry_solution"
+    fi
+    [[ "$fetched_tag" =~ ^[0-9a-f]{40}$ && "$fetched_sha" =~ ^[0-9a-f]{40}$ ]] \
+        || fail "Geladener Release-Tag besitzt keine eindeutige Commitbindung" 126
+    isolated_git -C "$checkout" checkout --detach "$fetched_sha" >/dev/null \
+        || fail "Gebundener Release-Commit konnte nicht ausgecheckt werden"
+    if ! head_sha="$(isolated_git -C "$checkout" rev-parse --verify HEAD 2>&1)"; then
+        fail "Ausgecheckter Release-Commit konnte nicht gelesen werden: ${head_sha:-keine Detailausgabe}" 1 "$retry_solution"
+    fi
+    [[ "$head_sha" == "$fetched_sha" ]] \
+        || fail "Privater Release-Checkout widerspricht der Commitbindung" 126
+    metadata="$(/usr/bin/stat -c '%u %g %a %F' -- "$checkout")" \
+        || fail "Privater Release-Checkout ist nicht prüfbar" 126
+    [[ "$metadata" == "0 0 700 directory" ]] \
+        || fail "Privater Release-Checkout ist nicht ausschließlich root-zugänglich" 126
+    for required in \
+        VERSION e3dc-bootstrap e3dc-update-bootstrap \
+        Installer/update_bootstrap_discovery.py Installer/update_simple.py
+    do
+        [[ -f "$checkout/$required" && ! -L "$checkout/$required" ]] \
+            || fail "Release-Datei fehlt oder ist kein regulärer Pfad: ${required}" 126
+    done
+    version="$(<"$checkout/VERSION")"
+    [[ -n "$version" && "v$version" == "$tag" ]] \
+        || fail "VERSION und geladener Release-Tag widersprechen sich" 126
+    printf '%s\t%s\n' "$fetched_tag" "$fetched_sha"
 }
 
 run_worker() {
-    local result=1 release_binding tab remainder tag tag_object target_sha bootstrap
+    local result=1 release_binding tab tag tag_object target_sha release_dir
     [[ "${E3DC_WEB_UPDATE_WORKER:-}" == "1" && -n "${INVOCATION_ID:-}" ]] \
         || fail "Worker besitzt keinen systemd-Ausführungsvertrag" 126
     [[ -z "${SUDO_USER:-}" ]] || fail "Worker übernimmt keinen sudo-Aufrufer" 126
@@ -305,33 +353,41 @@ run_worker() {
             && "$DOWNLOAD_DIR" == /run/e3dc-update-download.* ]]; then
             /usr/bin/find "$DOWNLOAD_DIR" -depth -delete
         fi
-        write_runtime_value "$STATUS_FILE" "$exit_code"
+        write_runtime_value "$STATUS_FILE" "$exit_code" || true
         /usr/bin/unlink "$PID_FILE" 2>/dev/null || true
         return "$exit_code"
     }
     trap cleanup EXIT
     exec >> "$LOG_FILE" 2>&1
-    write_runtime_value "$PID_FILE" "$$"
-    write_runtime_value "$STATUS_FILE" "running"
+    write_runtime_value "$PID_FILE" "$$" \
+        || fail "PID-Datei des Updatejobs konnte nicht geschrieben werden" 1 \
+            "Prüfe den freien Speicher mit: df -h /run ; starte danach erneut: sudo ${LAUNCHER}"
+    write_runtime_value "$STATUS_FILE" "running" \
+        || fail "Statusdatei des Updatejobs konnte nicht geschrieben werden" 1 \
+            "Prüfe den freien Speicher mit: df -h /run ; starte danach erneut: sudo ${LAUNCHER}"
     printf '%s\n' "[INFO] Update-Dispatcher-Vertrag: ${DISPATCHER_CONTRACT}"
     validate_launcher_contract
 
-    release_binding="$(resolve_release_binding)"
+    tag="$(resolve_release_tag)"
+    DOWNLOAD_DIR="$(/usr/bin/mktemp -d /run/e3dc-update-download.XXXXXX)" \
+        || fail "Privates Download-Verzeichnis konnte nicht angelegt werden" 1 \
+            "Prüfe den freien Speicher mit: df -h /run / ; starte danach erneut: sudo ${LAUNCHER}"
+    /usr/bin/chown root:root -- "$DOWNLOAD_DIR" \
+        || fail "Privates Download-Verzeichnis konnte nicht root übergeben werden" 1 \
+            "Starte denselben Updatebefehl erneut: sudo ${LAUNCHER}"
+    /usr/bin/chmod 0700 -- "$DOWNLOAD_DIR" \
+        || fail "Privates Download-Verzeichnis konnte nicht sicher gesetzt werden" 1 \
+            "Starte denselben Updatebefehl erneut: sudo ${LAUNCHER}"
+    release_dir="${DOWNLOAD_DIR}/release"
+    release_binding="$(download_release_checkout "$release_dir" "$tag")"
     tab=$'\t'
-    [[ "$release_binding" == *"$tab"*"$tab"* ]] \
+    [[ "$release_binding" == *"$tab"* ]] \
         || fail "Release-Bindung ist unvollständig" 126
-    tag="${release_binding%%"$tab"*}"
-    remainder="${release_binding#*"$tab"}"
-    tag_object="${remainder%%"$tab"*}"
-    target_sha="${remainder#*"$tab"}"
+    tag_object="${release_binding%%"$tab"*}"
+    target_sha="${release_binding#*"$tab"}"
     [[ "$target_sha" != *"$tab"* ]] \
         || fail "Release-Bindung besitzt überzählige Felder" 126
-    DOWNLOAD_DIR="$(/usr/bin/mktemp -d /run/e3dc-update-download.XXXXXX)"
-    /usr/bin/chown root:root -- "$DOWNLOAD_DIR"
-    /usr/bin/chmod 0700 -- "$DOWNLOAD_DIR"
-    bootstrap="${DOWNLOAD_DIR}/e3dc-update-bootstrap"
-    download_release_bootstrap "$bootstrap" "$tag" "$tag_object" "$target_sha"
-    printf '[OK] Release-Bootstrap %s/%s commitgebunden root-privat geladen.\n' \
+    printf '[OK] Release %s/%s mit einem privaten Fetch geladen.\n' \
         "$tag" "$target_sha"
     printf '[OK] Lokaler Git-/Dirty-/Dateimodus-Stand ist keine Startautorität.\n'
 
@@ -345,10 +401,10 @@ run_worker() {
         E3DC_BOOTSTRAP_EXPECTED_TAG="$tag" \
         E3DC_BOOTSTRAP_EXPECTED_TAG_OBJECT="$tag_object" \
         E3DC_BOOTSTRAP_EXPECTED_SHA="$target_sha" \
-        E3DC_BOOTSTRAP_VERIFY_SELF=1 \
+        E3DC_BOOTSTRAP_RELEASE_DIR="$release_dir" \
         E3DC_BOOTSTRAP_INLINE_WORKER=1 \
         E3DC_BOOTSTRAP_LOCK_HELD=1 \
-        /bin/sh "$bootstrap"
+        /bin/sh "$release_dir/e3dc-update-bootstrap"
     result=$?
     set -e
     if (( result == 0 )); then
@@ -383,7 +439,9 @@ start_worker() {
         return 0
     fi
     prepare_log
-    write_runtime_value "$STATUS_FILE" "launching"
+    write_runtime_value "$STATUS_FILE" "launching" \
+        || fail "Startstatus des Updatejobs konnte nicht geschrieben werden" 1 \
+            "Prüfe den freien Speicher mit: df -h /run ; starte danach erneut: sudo ${LAUNCHER}"
     /usr/bin/unlink "$PID_FILE" 2>/dev/null || true
     $SYSTEMCTL reset-failed "$UNIT" 2>/dev/null || true
     set +e
@@ -405,7 +463,7 @@ start_worker() {
     if (( launch_status != 0 )); then
         printf '[!] Update-Systemjob konnte nicht gestartet werden (Exit %d).\n%s\n' \
             "$launch_status" "$launch_output" >> "$LOG_FILE"
-        write_runtime_value "$STATUS_FILE" "$launch_status"
+        write_runtime_value "$STATUS_FILE" "$launch_status" || true
         fail "Update-Systemjob konnte nicht gestartet werden" "$launch_status"
     fi
     [[ -z "$launch_output" ]] || printf '%s\n' "$launch_output"

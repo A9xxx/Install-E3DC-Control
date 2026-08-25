@@ -1,6 +1,11 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.4b, gegen den Release-Betriebsvertrag geprüft am 2026-08-24
+> **Stand:** v5.4.4c, fachliche Regelung unverändert gegenüber v5.4.4b
+>
+> **Hinweis zu 5.4.4c:** Dieses Release korrigiert ausschließlich den Update-
+> und Reparaturpfad. Speicherentscheidung, Direktvermarktung, Wallbox- und
+> Wärmepumpenbudgets, RSCP-Ausgang und Hardwaregrenzen entsprechen unverändert
+> 5.4.4b.
 >
 > **Neu in 5.4.4b:** Im Sonnenmodus bleibt der batterieneutrale
 > PV-Überschuss ein unantastbarer Wallbox-Mindestrahmen. Das Storage-Budget

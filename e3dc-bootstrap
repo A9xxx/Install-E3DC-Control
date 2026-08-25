@@ -44,8 +44,27 @@ PYTHON=${PYTHON:-python3}
 }
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-[ -f "$SCRIPT_DIR/installer_main.py" ] || {
-    echo "installer_main.py fehlt im Release-Archiv." >&2
+[ -f "$SCRIPT_DIR/Installer/update_simple.py" ] || {
+    echo "Der einfache Ziel-Updater fehlt im Release-Archiv." >&2
+    exit 1
+}
+[ "${E3DC_RELEASE_CHECKOUT_VERIFIED:-}" = "1" ] || {
+    echo "Der Ziel-Updater wurde nicht aus dem bestätigten privaten Release-Checkout gestartet." >&2
+    exit 1
+}
+"$PYTHON" - "$SCRIPT_DIR/VERSION" "$TAG" <<'PY' || {
+from pathlib import Path
+import sys
+
+version_path = Path(sys.argv[1])
+tag = sys.argv[2]
+try:
+    version = version_path.read_text(encoding="utf-8").strip()
+except OSError:
+    raise SystemExit(1)
+raise SystemExit(0 if version and f"v{version}" == tag else 1)
+PY
+    echo "VERSION und gebundener Release-Tag widersprechen sich." >&2
     exit 1
 }
 
@@ -87,12 +106,11 @@ if [ "$(id -u)" -eq 0 ]; then
         E3DC_BOOTSTRAP_RUNNER_ROOT="$SCRIPT_DIR" \
         E3DC_BOOTSTRAP_USER="$INSTALL_USER" \
         E3DC_BOOTSTRAP_ENTRY_MODE="$ENTRY_MODE" \
-        "$PYTHON" "$SCRIPT_DIR/installer_main.py" \
-        --unattended \
-        --install-release-tag "$TAG" \
-        --bootstrap-install-path "$TARGET" \
-        --expected-release-sha "$EXPECTED_SHA" \
-        --expected-ha-role "$EXPECTED_ROLE"
+        "$PYTHON" -I -B "$SCRIPT_DIR/Installer/update_simple.py" \
+        --target "$TARGET" \
+        --install-user "$INSTALL_USER" \
+        --tag "$TAG" \
+        --role "$EXPECTED_ROLE"
 fi
 
 exec sudo -- env \
@@ -100,9 +118,8 @@ exec sudo -- env \
     E3DC_BOOTSTRAP_RUNNER_ROOT="$SCRIPT_DIR" \
     E3DC_BOOTSTRAP_USER="$INSTALL_USER" \
     E3DC_BOOTSTRAP_ENTRY_MODE="$ENTRY_MODE" \
-    "$PYTHON" "$SCRIPT_DIR/installer_main.py" \
-    --unattended \
-    --install-release-tag "$TAG" \
-    --bootstrap-install-path "$TARGET" \
-    --expected-release-sha "$EXPECTED_SHA" \
-    --expected-ha-role "$EXPECTED_ROLE"
+    "$PYTHON" -I -B "$SCRIPT_DIR/Installer/update_simple.py" \
+    --target "$TARGET" \
+    --install-user "$INSTALL_USER" \
+    --tag "$TAG" \
+    --role "$EXPECTED_ROLE"

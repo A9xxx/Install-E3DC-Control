@@ -14,7 +14,6 @@ export PATH
 REPOSITORY_URL="https://github.com/A9xxx/Install-E3DC-Control"
 GIT_URL="${REPOSITORY_URL}.git"
 LATEST_URL="${REPOSITORY_URL}/releases/latest"
-RAW_BASE_URL="https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control"
 UNIT="e3dc-web-update.service"
 RUNTIME_DIR="/run/e3dc-web-update"
 LOG_DIR="/var/log/e3dc-control"
@@ -61,7 +60,6 @@ fail() {
 dependency_package() {
     case "$1" in
         awk) printf '%s\n' gawk ;;
-        cmp) printf '%s\n' diffutils ;;
         curl) printf '%s\n' curl ;;
         find) printf '%s\n' findutils ;;
         flock) printf '%s\n' util-linux ;;
@@ -78,7 +76,7 @@ dependency_package() {
 
 require_commands() {
     for command in \
-        awk cmp curl basename cat chmod chown date dirname env find flock getent git id \
+        awk curl basename cat chmod chown date dirname env find flock getent git id \
         install journalctl mkdir mktemp mv python3 rm stat systemctl systemd-run unlink
     do
         if ! command -v "$command" >/dev/null 2>&1; then
@@ -278,20 +276,10 @@ isolated_git() {
         "$@"
 }
 
-resolve_release_binding() {
-    expected_tag=${E3DC_BOOTSTRAP_EXPECTED_TAG:-}
-    expected_tag_object=${E3DC_BOOTSTRAP_EXPECTED_TAG_OBJECT:-}
-    expected_sha=${E3DC_BOOTSTRAP_EXPECTED_SHA:-}
-    if [ -n "$expected_tag$expected_tag_object$expected_sha" ]; then
-        [ -n "$expected_tag" ] && [ -n "$expected_tag_object" ] && [ -n "$expected_sha" ] \
-            || fail "Vorverifizierte Release-Bindung ist unvollständig"
-        [ "${#expected_tag_object}" -eq 40 ] && [ "${#expected_sha}" -eq 40 ] \
-            && [ "$expected_tag_object" != "$expected_sha" ] \
-            || fail "Vorverifizierte Release-SHAs sind unvollständig"
-        case "$expected_tag_object:$expected_sha" in
-            *[!0-9a-f:]*) fail "Vorverifizierte Release-SHAs sind nicht hexadezimal" ;;
-        esac
-        tag=$expected_tag
+resolve_release_tag() {
+    if [ "$BOUND_ENTRY_MODE" = "regular" ]; then
+        tag=${E3DC_BOOTSTRAP_EXPECTED_TAG:-}
+        [ -n "$tag" ] || fail "Regular-Modus besitzt keinen gebundenen Release-Tag"
     else
         effective_latest=$(curl -q \
             --fail --silent --show-error --location \
@@ -314,37 +302,7 @@ import re
 import sys
 raise SystemExit(0 if re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+[a-z]?", sys.argv[1]) else 1)
 PY
-    refs=$(mktemp "${RUNTIME_DIR}/release-refs.XXXXXX") \
-        || fail_with_solution \
-            "E3DC-UPD-RUN-004" \
-            "Die private Datei für die Release-Bindung konnte nicht angelegt werden." \
-            "Es wurde noch kein Release ausgecheckt; Installation und Dienste blieben unverändert." \
-            "$RUNTIME_DIR" \
-            "sudo stat -c '%U %G %a %F %n' $RUNTIME_DIR"
-    isolated_git ls-remote --tags "$GIT_URL" \
-        "refs/tags/$tag" "refs/tags/$tag^{}" >"$refs" \
-        || fail_with_solution \
-            "E3DC-UPD-GIT-001" \
-            "Die signierten Release-Referenzen konnten nicht aus dem Repository gelesen werden." \
-            "Es wurde noch kein Release ausgecheckt; Installation und Dienste blieben unverändert." \
-            "$GIT_URL, Tag $tag" \
-            "git ls-remote --tags $GIT_URL refs/tags/$tag 'refs/tags/$tag^{}'"
-    tag_object=$(awk -v ref="refs/tags/$tag" '$2 == ref {print $1}' "$refs")
-    target_sha=$(awk -v ref="refs/tags/$tag^{}" '$2 == ref {print $1}' "$refs")
-    rm -f "$refs"
-    [ "${#tag_object}" -eq 40 ] && [ "${#target_sha}" -eq 40 ] \
-        || fail "Release-Tag besitzt keine eindeutige annotierte SHA-Bindung"
-    case "$tag_object:$target_sha" in
-        *[!0-9a-f:]*) fail "Release-Referenzen sind nicht hexadezimal" ;;
-    esac
-    [ "$tag_object" != "$target_sha" ] || fail "aktueller Release-Tag ist nicht annotiert"
-    if [ -n "$expected_tag" ]; then
-        [ "$tag" = "$expected_tag" ] \
-            && [ "$tag_object" = "$expected_tag_object" ] \
-            && [ "$target_sha" = "$expected_sha" ] \
-            || fail "Vorverifizierte Tag-/Commitbindung driftete vor dem Ziel-Updater"
-    fi
-    printf '%s\t%s\t%s\n' "$tag" "$tag_object" "$target_sha"
+    printf '%s\n' "$tag"
 }
 
 bind_entry_mode() {
@@ -356,10 +314,10 @@ bind_entry_mode() {
         regular)
             [ "${E3DC_BOOTSTRAP_INLINE_WORKER:-}" = "1" ] \
                 && [ "${E3DC_BOOTSTRAP_LOCK_HELD:-}" = "1" ] \
-                && [ "${E3DC_BOOTSTRAP_VERIFY_SELF:-}" = "1" ] \
                 && [ -n "${E3DC_BOOTSTRAP_EXPECTED_TAG:-}" ] \
                 && [ -n "${E3DC_BOOTSTRAP_EXPECTED_TAG_OBJECT:-}" ] \
                 && [ -n "${E3DC_BOOTSTRAP_EXPECTED_SHA:-}" ] \
+                && [ -n "${E3DC_BOOTSTRAP_RELEASE_DIR:-}" ] \
                 || fail "Regular-Modus besitzt keinen root-eigenen Dispatcher-Vertrag"
             BOUND_ENTRY_MODE=regular
             ;;
@@ -377,25 +335,6 @@ validate_private_file() {
 }
 
 stage_release_contract() {
-    target_sha=$1
-    self_path=$(python3 - "$0" <<'PY'
-import os
-from pathlib import Path
-import stat
-import sys
-
-path = Path(sys.argv[1])
-if not path.is_absolute():
-    path = Path.cwd() / path
-metadata = os.lstat(path)
-if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-    raise SystemExit("Bootstrap-Quelle ist keine reguläre Datei")
-resolved = path.resolve(strict=True)
-if resolved != path.absolute() or metadata.st_nlink != 1:
-    raise SystemExit("Bootstrap-Quelle ist nicht eindeutig gebunden")
-print(resolved)
-PY
-    ) || fail "Bootstrap-Quelle konnte nicht sicher gebunden werden"
     stage_dir=$(mktemp -d /run/e3dc-update-bootstrap.XXXXXX) \
         || fail_with_solution \
             "E3DC-UPD-RUN-005" \
@@ -417,45 +356,19 @@ PY
             "Der Arbeitsbereich wird nicht als Updatequelle verwendet; Installation und Dienste blieben unverändert." \
             "$stage_dir" \
             "sudo stat -c '%U %G %a %F %n' $stage_dir"
-    install -o root -g root -m 0500 "$self_path" "$stage_dir/e3dc-update-bootstrap" \
-        || fail_with_solution \
-            "E3DC-UPD-FS-213" \
-            "Der geprüfte Bootstrap konnte nicht in den privaten Arbeitsbereich kopiert werden." \
-            "Der eigentliche Updater wurde nicht gestartet; Installation und Dienste blieben unverändert." \
-            "$stage_dir/e3dc-update-bootstrap" \
-            "sudo stat -c '%U %G %a %F %n' $self_path $stage_dir"
-    discovery="$stage_dir/update_bootstrap_discovery.py"
-    curl -q \
-        --fail --silent --show-error --location \
-        --proto '=https' --tlsv1.2 \
-        --output "$discovery" \
-        "${RAW_BASE_URL}/${target_sha}/${DISCOVERY_RELATIVE}" \
-        || fail_with_solution \
-            "E3DC-UPD-NET-002" \
-            "Die Installationserkennung des gebundenen Release konnte nicht über HTTPS geladen werden." \
-            "Der eigentliche Updater wurde nicht gestartet; Installation und Dienste blieben unverändert." \
-            "${RAW_BASE_URL}/${target_sha}/${DISCOVERY_RELATIVE}" \
-            "curl -I --proto '=https' --tlsv1.2 ${RAW_BASE_URL}/${target_sha}/${DISCOVERY_RELATIVE}"
-    chown root:root "$discovery" \
-        || fail_with_solution \
-            "E3DC-UPD-FS-214" \
-            "Die geladene Installationserkennung konnte nicht root zugeordnet werden." \
-            "Der eigentliche Updater wurde nicht gestartet; Installation und Dienste blieben unverändert." \
-            "$discovery" \
-            "sudo stat -c '%U %G %a %F %n' $discovery"
-    chmod 0500 "$discovery" \
-        || fail_with_solution \
-            "E3DC-UPD-FS-215" \
-            "Die Installationserkennung konnte nicht auf root und Nur-Lesen beschränkt werden." \
-            "Der eigentliche Updater wurde nicht gestartet; Installation und Dienste blieben unverändert." \
-            "$discovery" \
-            "sudo stat -c '%U %G %a %F %n' $discovery"
-    validate_private_file "$stage_dir/e3dc-update-bootstrap" 500
-    validate_private_file "$discovery" 500
-    size=$(stat -c '%s' "$discovery")
-    [ "$size" -ge 4096 ] && [ "$size" -le 131072 ] \
-        || fail "Release-Discovery besitzt eine unzulässige Größe"
     printf '%s\n' "$stage_dir"
+}
+
+cleanup_synchronous_stage() {
+    cleanup_status=$?
+    trap - EXIT
+    set +e
+    case "${STAGE_DIR:-}" in
+        /run/e3dc-update-bootstrap.*)
+            [ ! -d "$STAGE_DIR" ] || find "$STAGE_DIR" -depth -delete 2>/dev/null
+            ;;
+    esac
+    exit "$cleanup_status"
 }
 
 bind_with_discovery() {
@@ -618,21 +531,25 @@ prepare_release_and_binding() {
     explicit_user=$2
     sudo_user=$3
     requested_role=$4
-    release_binding=$(resolve_release_binding)
-    tab=$(printf '\t')
-    case "$release_binding" in
-        *"$tab"*"$tab"*) ;;
-        *) fail "Release-Bindung ist unvollständig" ;;
-    esac
-    BOUND_TAG=${release_binding%%"$tab"*}
-    remainder=${release_binding#*"$tab"}
-    BOUND_TAG_OBJECT=${remainder%%"$tab"*}
-    BOUND_SHA=${remainder#*"$tab"}
-    case "$BOUND_SHA" in
-        *"$tab"*) fail "Release-Bindung besitzt überzählige Felder" ;;
-    esac
-    STAGE_DIR=$(stage_release_contract "$BOUND_SHA")
-    select_console_target "$STAGE_DIR/update_bootstrap_discovery.py" "$explicit_root"
+    BOUND_TAG=$(resolve_release_tag)
+    STAGE_DIR=$(stage_release_contract)
+    if [ "${SYNCHRONOUS_STAGE_OWNED:-}" = "1" ]; then
+        trap cleanup_synchronous_stage EXIT
+    fi
+    if [ "$BOUND_ENTRY_MODE" = "regular" ]; then
+        RELEASE_DIR=${E3DC_BOOTSTRAP_RELEASE_DIR:-}
+        validate_release_checkout \
+            "$RELEASE_DIR" "$BOUND_TAG" \
+            "${E3DC_BOOTSTRAP_EXPECTED_TAG_OBJECT:-}" \
+            "${E3DC_BOOTSTRAP_EXPECTED_SHA:-}"
+    else
+        RELEASE_DIR="$STAGE_DIR/release"
+        download_release_checkout "$RELEASE_DIR" "$BOUND_TAG"
+    fi
+    BOUND_TAG_OBJECT=$RELEASE_TAG_OBJECT
+    BOUND_SHA=$RELEASE_SHA
+    discovery="$RELEASE_DIR/$DISCOVERY_RELATIVE"
+    select_console_target "$discovery" "$explicit_root"
     binding_error=$(mktemp "${STAGE_DIR}/binding-error.XXXXXX") \
         || fail_with_solution \
             "E3DC-UPD-RUN-007" \
@@ -641,7 +558,7 @@ prepare_release_and_binding() {
             "$STAGE_DIR" \
             "sudo stat -c '%U %G %a %F %n' $STAGE_DIR"
     if ! binding=$(bind_with_discovery \
-        "$STAGE_DIR/update_bootstrap_discovery.py" \
+        "$discovery" \
         "$SELECTED_EXPLICIT_ROOT" "$explicit_user" "$sudo_user" "$requested_role" \
         2>"$binding_error"); then
         cat "$binding_error" >&2
@@ -657,11 +574,73 @@ prepare_release_and_binding() {
     parse_binding "$binding"
 }
 
+validate_release_checkout() {
+    checkout_dir=$1
+    tag=$2
+    expected_tag_object=${3:-}
+    expected_sha=${4:-}
+    canonical_checkout=$(CDPATH= cd -- "$checkout_dir" 2>/dev/null && pwd -P) \
+        || fail "Privater Release-Checkout ist nicht erreichbar: $checkout_dir"
+    [ "$canonical_checkout" = "$checkout_dir" ] \
+        || fail "Privater Release-Checkout ist nicht kanonisch gebunden"
+    checkout_parent=${checkout_dir%/release}
+    case "$BOUND_ENTRY_MODE:$checkout_parent" in
+        regular:/run/e3dc-update-download.*) checkout_suffix=${checkout_parent#/run/e3dc-update-download.} ;;
+        rescue:/run/e3dc-update-bootstrap.*) checkout_suffix=${checkout_parent#/run/e3dc-update-bootstrap.} ;;
+        *) fail "Release-Checkout liegt nicht im privaten root-Arbeitsbereich" ;;
+    esac
+    case "$checkout_suffix" in
+        ""|*/*) fail "Release-Checkout besitzt keinen eindeutigen privaten Elternpfad" ;;
+    esac
+    [ ! -L "$checkout_parent" ] && [ ! -L "$checkout_dir" ] \
+        || fail "Privater Release-Checkout darf kein Symlink sein"
+    parent_metadata=$(stat -c '%u %g %a %F' "$checkout_parent") \
+        || fail "Privater Release-Elternpfad ist nicht prüfbar"
+    checkout_metadata=$(stat -c '%u %g %a %F' "$checkout_dir") \
+        || fail "Privater Release-Checkout ist nicht prüfbar"
+    [ "$parent_metadata" = "0 0 700 directory" ] \
+        && [ "$checkout_metadata" = "0 0 700 directory" ] \
+        || fail "Privater Release-Checkout ist nicht ausschließlich root-zugänglich"
+    for required in \
+        VERSION e3dc-bootstrap e3dc-update-bootstrap \
+        "$DISCOVERY_RELATIVE" Installer/update_simple.py
+    do
+        [ -f "$checkout_dir/$required" ] && [ ! -L "$checkout_dir/$required" ] \
+            || fail "Release-Datei fehlt oder ist kein regulärer Pfad: $required"
+    done
+    fetched_tag=$(isolated_git -C "$checkout_dir" rev-parse --verify "refs/tags/$tag") \
+        || fail "Geladener Release-Tag fehlt im privaten Checkout"
+    fetched_sha=$(isolated_git -C "$checkout_dir" rev-parse --verify "refs/tags/$tag^{commit}") \
+        || fail "Geladener Release-Commit fehlt im privaten Checkout"
+    head_sha=$(isolated_git -C "$checkout_dir" rev-parse --verify HEAD) \
+        || fail "Privater Release-Checkout besitzt keinen eindeutigen HEAD"
+    [ "${#fetched_tag}" -eq 40 ] && [ "${#fetched_sha}" -eq 40 ] \
+        && [ "$head_sha" = "$fetched_sha" ] \
+        || fail "Tag, Commit und Checkout sind nicht eindeutig gebunden"
+    case "$fetched_tag:$fetched_sha" in
+        *[!0-9a-f:]*) fail "Release-Bindung ist nicht hexadezimal" ;;
+    esac
+    if [ -n "$expected_tag_object$expected_sha" ]; then
+        [ -n "$expected_tag_object" ] && [ -n "$expected_sha" ] \
+            && [ "$fetched_tag" = "$expected_tag_object" ] \
+            && [ "$fetched_sha" = "$expected_sha" ] \
+            || fail "Privater Release-Checkout widerspricht der Dispatcher-Bindung"
+    fi
+    release_version=$(cat "$checkout_dir/VERSION") \
+        || fail "VERSION des privaten Release konnte nicht gelesen werden"
+    [ -n "$release_version" ] && [ "v$release_version" = "$tag" ] \
+        || fail "VERSION, Tag und Commit des privaten Release widersprechen sich"
+    if [ "$BOUND_ENTRY_MODE" = "regular" ]; then
+        [ "$0" = "$checkout_dir/e3dc-update-bootstrap" ] \
+            || fail "Regular-Modus läuft nicht aus dem privaten Release-Checkout"
+    fi
+    RELEASE_TAG_OBJECT=$fetched_tag
+    RELEASE_SHA=$fetched_sha
+}
+
 download_release_checkout() {
     checkout_dir=$1
     tag=$2
-    tag_object=$3
-    target_sha=$4
     mkdir -m 0700 "$checkout_dir" \
         || fail_with_solution \
             "E3DC-UPD-RUN-008" \
@@ -682,7 +661,7 @@ download_release_checkout() {
             "Die feste GitHub-Quelle konnte im privaten Checkout nicht gebunden werden." \
             "Es wurde kein Release geladen; die Installation wurde nicht verändert." \
             "$GIT_URL" \
-            "git ls-remote --exit-code $GIT_URL HEAD"
+            "curl -I --proto '=https' --tlsv1.2 $REPOSITORY_URL"
     isolated_git -C "$checkout_dir" fetch \
         --no-tags --depth=1 origin \
         "+refs/tags/$tag:refs/tags/$tag" >/dev/null \
@@ -691,68 +670,40 @@ download_release_checkout() {
             "Der gebundene Release-Tag konnte nicht in den privaten Checkout geladen werden." \
             "Der temporäre Checkout ist unvollständig und wird verworfen; die Installation wurde nicht verändert." \
             "$GIT_URL, Tag $tag" \
-            "git ls-remote --exit-code --tags $GIT_URL refs/tags/$tag"
+            "curl -I --proto '=https' --tlsv1.2 $REPOSITORY_URL/releases/tag/$tag"
     fetched_tag=$(isolated_git -C "$checkout_dir" rev-parse --verify "refs/tags/$tag") \
         || fail_with_solution \
             "E3DC-UPD-GIT-005" \
             "Das geladene Tag-Objekt konnte im privaten Checkout nicht bestätigt werden." \
             "Der temporäre Checkout wird verworfen; die Installation wurde nicht verändert." \
             "Tag $tag" \
-            "git ls-remote --exit-code --tags $GIT_URL refs/tags/$tag"
+            "curl -I --proto '=https' --tlsv1.2 $REPOSITORY_URL/releases/tag/$tag"
     fetched_sha=$(isolated_git -C "$checkout_dir" rev-parse --verify "refs/tags/$tag^{commit}") \
         || fail_with_solution \
             "E3DC-UPD-GIT-006" \
             "Der Commit des geladenen Release-Tags konnte nicht bestätigt werden." \
             "Der temporäre Checkout wird verworfen; die Installation wurde nicht verändert." \
             "Tag $tag" \
-            "git ls-remote --exit-code --tags $GIT_URL 'refs/tags/$tag^{}'"
-    [ "$fetched_tag" = "$tag_object" ] && [ "$fetched_sha" = "$target_sha" ] \
-        || fail "temporärer Ziel-Checkout weicht von der Release-Bindung ab"
-    isolated_git -C "$checkout_dir" checkout --detach "$target_sha" >/dev/null \
+            "curl -I --proto '=https' --tlsv1.2 $REPOSITORY_URL/releases/tag/$tag"
+    [ "${#fetched_tag}" -eq 40 ] && [ "${#fetched_sha}" -eq 40 ] \
+        || fail "Geladener Release-Tag besitzt keine eindeutige Commitbindung"
+    case "$fetched_tag:$fetched_sha" in
+        *[!0-9a-f:]*) fail "Geladene Release-Bindung ist nicht hexadezimal" ;;
+    esac
+    isolated_git -C "$checkout_dir" checkout --detach "$fetched_sha" >/dev/null \
         || fail_with_solution \
             "E3DC-UPD-GIT-007" \
             "Der verifizierte Zielcommit konnte nicht als privater Checkout bereitgestellt werden." \
             "Der temporäre Checkout wird verworfen; die Installation wurde nicht verändert." \
-            "Commit $target_sha" \
-            "git ls-remote --exit-code --tags $GIT_URL refs/tags/$tag"
-    [ -f "$checkout_dir/e3dc-bootstrap" ] && [ ! -L "$checkout_dir/e3dc-bootstrap" ] \
-        || fail "Ziel-Updater fehlt im Release-Checkout"
-    [ -f "$checkout_dir/$DISCOVERY_RELATIVE" ] \
-        && [ ! -L "$checkout_dir/$DISCOVERY_RELATIVE" ] \
-        || fail "zentrale Release-Discovery fehlt im Ziel-Checkout"
+            "Commit $fetched_sha" \
+            "curl -I --proto '=https' --tlsv1.2 $REPOSITORY_URL/releases/tag/$tag"
+    validate_release_checkout "$checkout_dir" "$tag" "$fetched_tag" "$fetched_sha"
 }
 
 run_bound_update() (
-    release_dir=$(mktemp -d /run/e3dc-update-release.XXXXXX) \
-        || fail_with_solution \
-            "E3DC-UPD-RUN-009" \
-            "Der private Arbeitsbereich für den Release-Checkout konnte nicht angelegt werden." \
-            "Der eigentliche Updater wurde nicht gestartet; die Installation wurde nicht verändert." \
-            "/run/e3dc-update-release.*" \
-            "sudo stat -c '%U %G %a %F %n' /run"
-    cleanup_release() {
-        find "$release_dir" -depth -delete 2>/dev/null || true
-    }
-    trap cleanup_release EXIT HUP INT TERM
-    checkout="$release_dir/release"
-    download_release_checkout \
-        "$checkout" "$BOUND_TAG" "$BOUND_TAG_OBJECT" "$BOUND_SHA"
-    cmp -s "$STAGE_DIR/update_bootstrap_discovery.py" \
-        "$checkout/$DISCOVERY_RELATIVE" \
-        || fail "vorab geprüfte Discovery widerspricht dem gebundenen Release-Checkout"
-    rebound=$(bind_with_discovery \
-        "$checkout/$DISCOVERY_RELATIVE" \
-        "$BOUND_ROOT" "$BOUND_USER" "" auto) \
-        || fail "Installation oder Rolle driftete vor dem Ziel-Updater"
-    expected_rebound=$(printf '%s\t%s\t%s' "$BOUND_ROOT" "$BOUND_USER" "$BOUND_ROLE")
-    [ "$rebound" = "$expected_rebound" ] \
-        || fail "Root-/Benutzer-/Rollenbindung driftete vor dem Ziel-Updater"
-    if [ "${E3DC_BOOTSTRAP_VERIFY_SELF:-}" = "1" ]; then
-        [ -n "${E3DC_BOOTSTRAP_EXPECTED_TAG:-}" ] \
-            || fail "Bootstrap-Selbstprüfung besitzt keinen erwarteten Tag"
-        cmp -s "$0" "$checkout/e3dc-update-bootstrap" \
-            || fail "geladener Bootstrap widerspricht dem gebundenen Release"
-    fi
+    checkout="$RELEASE_DIR"
+    [ -f "$checkout/e3dc-bootstrap" ] && [ ! -L "$checkout/e3dc-bootstrap" ] \
+        || fail "Der bestätigte private Release-Checkout fehlt vor dem Ziel-Updater"
     echo "E3DC-Control Update-Bootstrap"
     echo "  Installation : $BOUND_ROOT"
     echo "  Benutzer     : $BOUND_USER"
@@ -769,12 +720,11 @@ run_bound_update() (
         LC_ALL=C.UTF-8 \
         E3DC_BOOTSTRAP_USER="$BOUND_USER" \
         E3DC_BOOTSTRAP_ENTRY_MODE="$BOUND_ENTRY_MODE" \
+        E3DC_RELEASE_CHECKOUT_VERIFIED=1 \
         /bin/sh "$checkout/e3dc-bootstrap" \
         "$BOUND_ROOT" "$BOUND_TAG" "$BOUND_SHA" "$BOUND_ROLE"
     result=$?
     set -e
-    trap - EXIT HUP INT TERM
-    cleanup_release
     return "$result"
 )
 
@@ -821,6 +771,7 @@ start_background_job() {
         printf 'Lösung: Führe genau diesen sicheren Befehl aus:\n  sudo systemctl status --no-pager %s\n' "$UNIT"
         return 0
     fi
+    SYNCHRONOUS_STAGE_OWNED=0
     prepare_release_and_binding \
         "$explicit_root" "" "${SUDO_USER:-}" "$requested_role"
     prepare_log
@@ -848,7 +799,7 @@ start_background_job() {
         --setenv="E3DC_BOOTSTRAP_USER=$BOUND_USER" \
         --setenv="E3DC_BOOTSTRAP_BOUND_ROLE=$BOUND_ROLE" \
         --setenv=SUDO_USER= \
-        /bin/sh "$STAGE_DIR/e3dc-update-bootstrap" --systemd-worker 2>&1)
+        /bin/sh "$STAGE_DIR/release/e3dc-update-bootstrap" --systemd-worker 2>&1)
     launch_status=$?
     set -e
     if [ "$launch_status" -ne 0 ]; then
@@ -880,10 +831,11 @@ validate_worker_environment() {
         /run/e3dc-update-bootstrap.*) ;;
         *) fail "Hintergrund-Worker besitzt keinen privaten Bootstrap-Pfad" ;;
     esac
-    [ "$0" = "$STAGE_DIR/e3dc-update-bootstrap" ] \
-        || fail "Hintergrund-Worker läuft nicht aus seiner privaten Kopie"
-    validate_private_file "$0" 500
-    validate_private_file "$STAGE_DIR/update_bootstrap_discovery.py" 500
+    RELEASE_DIR="$STAGE_DIR/release"
+    [ "$0" = "$RELEASE_DIR/e3dc-update-bootstrap" ] \
+        || fail "Hintergrund-Worker läuft nicht aus dem privaten Zielrelease"
+    [ -f "$0" ] && [ ! -L "$0" ] \
+        || fail "Hintergrund-Worker ist keine reguläre Releasedatei"
     BOUND_TAG=${E3DC_BOOTSTRAP_TAG:-}
     BOUND_TAG_OBJECT=${E3DC_BOOTSTRAP_TAG_OBJECT:-}
     BOUND_SHA=${E3DC_BOOTSTRAP_SHA:-}
@@ -895,6 +847,8 @@ validate_worker_environment() {
     case "$BOUND_TAG_OBJECT:$BOUND_SHA" in
         *[!0-9a-f:]*) fail "Hintergrund-Worker besitzt ungültige Release-SHAs" ;;
     esac
+    validate_release_checkout \
+        "$RELEASE_DIR" "$BOUND_TAG" "$BOUND_TAG_OBJECT" "$BOUND_SHA"
     case "$BOUND_ROLE" in
         off|master|slave|shadow) ;;
         *) fail "Hintergrund-Worker besitzt keine gültige Rollenbindung" ;;
@@ -990,6 +944,7 @@ run_synchronous_update() {
                 "$START_LOCK_FILE" \
                 "sudo systemctl status --no-pager $UNIT"
     fi
+    SYNCHRONOUS_STAGE_OWNED=1
     prepare_release_and_binding \
         "$explicit_root" "${E3DC_BOOTSTRAP_USER:-}" "${SUDO_USER:-}" "$requested_role"
     set +e
@@ -997,6 +952,7 @@ run_synchronous_update() {
     result=$?
     set -e
     find "$STAGE_DIR" -depth -delete 2>/dev/null || true
+    trap - EXIT
     return "$result"
 }
 

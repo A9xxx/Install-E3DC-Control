@@ -1,27 +1,25 @@
 # Update-Prozess
 
 Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
-`git pull --ff-only` ist für den einmaligen Wechsel auf die bereinigte
-Release-Historie ungeeignet, weil alter und neuer Git-Stand nicht miteinander
-verwandt sein müssen.
+`git pull` ist kein unterstützter Updateweg. Das `.git`-Verzeichnis einer
+Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
+Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.4.4b`. Der Ziel-Updater bindet den
-freigegebenen Zielstand vor Backup und Dienststopp eindeutig an Version,
-Herkunft und Anlagenrolle. Fortschritt und Lebenszeichen bleiben auf
-langsameren Raspberry Pis sichtbar. Auch ein erneut gestarteter Auftrag folgt
-dem einheitlichen Ziel-Updatervertrag; er ist kein ungeprüfter Schnellpfad.
-Das Dashboard darf ausschließlich das reguläre Update über einen
-argumentlosen, root-eigenen Systemjob starten. Freie Installer-Aktionen,
-Pfade, Release-Tags, Reparaturen, Neuinstallationen und Rückfälle bleiben im
-Web gesperrt und erfolgen über den geschützten Konsolenweg.
+Der aktuelle Stable-Stand ist `v5.4.4c`. Das Dashboard startet ausschließlich
+den argumentlosen, root-eigenen Systemjob. Dieser installiert den neuesten
+veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
+Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
+Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
 
 ## Normales Update
 
 Der bevorzugte Weg ist der Update-Button der Weboberfläche. Weboberfläche,
 Installer-Menü und Konsole starten denselben root-eigenen Hintergrundauftrag.
-Der lokale Git-, Rechte- oder Änderungszustand entscheidet nicht mehr darüber,
-ob dieser Auftrag angenommen wird. Der eigentliche Ziel-Updater prüft weiterhin
-Backup, Writer-Ruhe, Zielstand, Rechte, Dienste und Gesundheit.
+Der lokale Git-, Rechte- oder Änderungszustand entscheidet nicht darüber, ob
+dieser Auftrag angenommen wird. Der Ziel-Updater erstellt das Vollbackup,
+sichert nach dem kurzen Dienststopp die nun ruhenden veränderlichen Daten nach,
+tauscht Dateien, Rechte, Core-Units und Launcher aus und startet die benötigten
+Dienste neu.
 
 Nach einmaliger Installation des gemeinsamen Dispatchers kann der Auftrag auch
 direkt auf der Konsole gestartet werden:
@@ -68,26 +66,45 @@ aus. Ein sicherer kanonischer Rollenanker hat Vorrang; nur wenn er fehlt, wird
 eine eindeutige vorhandene Konfiguration als Fallback verwendet. Ein
 widersprüchlicher Rollen- oder Installationsbestand stoppt mit Diagnose.
 
-Die vorhandene `.git`-Fläche ist dabei keine Eingangsbedingung. Der Rettungsweg
+Die vorhandene `.git`-Fläche ist dabei keine Eingangsbedingung. Der Ziel-Updater
 liest weder ihre Rechte noch ihren Index oder ihre lokale Historie als
-Updateautorität, sondern baut die für den Zielstand benötigten Git-Metadaten
-nach dem Backup frisch auf. Die neue `.git`-Fläche entsteht dabei als der
-zuvor eindeutig gebundene Installationsbenutzer. Gesichert werden die
-tatsächlich betriebenen Produkt- und Konfigurationsdateien, nicht ein
-möglicherweise beschädigter Git-Zwischenspeicher.
+Updateautorität und muss sie für den Releasewechsel nicht neu aufbauen.
+Gesichert werden die tatsächlich betriebenen Produkt-, Konfigurations- und
+Betriebsdateien, nicht ein möglicherweise beschädigter Git-Zwischenspeicher.
 
-Der Ziel-Updater erstellt und prüft zuerst das Backup, stoppt danach die
-bekannten Writer, projiziert Release-Dateien, Rechte und Dienste auf den
-kanonischen Zielzustand und prüft anschließend den Wiederanlauf. Abweichende
-Besitzer oder Modi bekannter Produktdateien sind dabei zu normalisierender
-Altbestand und kein eigener Abbruchgrund. Unklare Symlinks, Spezialdateien,
-konkurrierende Updates, nicht stoppbare Writer sowie ein fehlgeschlagenes
-Backup oder Dienst-Endgate bleiben harte Stopps.
+Der Ziel-Updater erstellt zuerst das Vollbackup bei laufenden Diensten. Danach
+stoppt er die betroffenen Dienste genau einmal kurz, sichert die ruhenden
+veränderlichen Daten nach, projiziert Release-Dateien, Rechte, Core-Units und
+Launcher und startet die Dienste neu. Abweichende Besitzer oder Modi bekannter
+Produktdateien sind zu reparierender Altbestand und kein eigener Abbruchgrund.
+Eine mehrdeutige laufende Installation, ein fehlgeschlagenes Backup, ein nicht
+verfügbarer Release, fehlende Root- oder Schreibrechte und ein nicht startender
+Pflichtdienst bleiben klare Stopps mit konkreter Lösungsausgabe.
 
-**Einmaliger Übergang aus einem Altstand:** Der oben gezeigte Ein-Datei-Befehl
-installiert den gemeinsamen root-eigenen Dispatcher. Danach verwenden
-Dashboard, Konsole, Installer-Menü und automatische Updateprüfung denselben
-Hintergrundauftrag; ein weiterer Altstands-Workaround ist nicht nötig.
+Ein vorhandener Altregler wird vor dem Dateiaustausch nur gestoppt. Erst nach
+dem bestätigten Start des neuen, zur Anlagenrolle passenden Dienstsatzes wird
+er deaktiviert. Scheitert der Wechsel nach begonnener Produktmutation, stellt
+der Ziel-Updater zuerst das Vollbackup und danach die neuere ruhende
+Daten-Nachsicherung wieder her; erst anschließend startet er den exakt zuvor
+aktiven Dienstsatz. Ein bereits bestätigter Zielstand wird bei einem
+späteren Bereinigungsfehler nicht zurückgesetzt. Bei HA startet ausschließlich
+der HA-Manager die verwalteten
+Dienste. Deren lokales systemd-Starttor akzeptiert im HA-Betrieb nur eine
+gültige Owner-Lease. Standalone-Dienste erhalten weder dieses Starttor noch
+eine Abhängigkeit vom HA-Dienst. Im Shadow-Betrieb bleiben lokale Regel- und Watchdog-Dienste
+gestoppt.
+
+Ein vorhandener alter `wp-manager.service` wird beim Wechsel vollständig auf
+`energy_manager.service` übertragen: War die alte Unit aktiv, wird die neue
+Unit projiziert, gestartet und als Pflichtdienst geprüft. War sie nur
+aktiviert, wird die neue Unit ebenfalls nur aktiviert. Erst nach dem
+bestätigten Zielstand wird die alte Unit deaktiviert.
+
+**Einmaliger Übergang aus einem Altstand:** Ein defekter 5.4.4b-Launcher kann
+abbrechen, bevor er den neuen Ziel-Updater erreicht. Dann installiert der oben
+gezeigte Ein-Datei-Befehl einmalig den neuen Stand samt root-eigenem Dispatcher.
+Danach verwenden Dashboard, Konsole und Installer-Menü denselben
+Hintergrundauftrag.
 
 ### Übergang aus älteren 5.4.2-Beständen
 
@@ -120,6 +137,28 @@ dem Root-Lock aus demselben gültigen Nicht-Root-Eigentümer von Repository und
 `.git`, lokales Benutzerkonto und Nutzerwert unmittelbar vor dem ersten
 Import aus dem Zielcode erneut geprüft. Die fail-closed Grenzen und alle
 übrigen Härtungen aus 5.4.3j bleiben unverändert.
+
+### 5.4.4c: direkter, Git-unabhängiger Updatepfad
+
+5.4.4c lädt den veröffentlichten Ziel-Updater und lässt diesen den betriebenen
+Bestand sichern und ersetzen. Das Nutzer-`.git`, lokale Produktänderungen,
+fehlende Produktdateien und historische Rechte blockieren den Start nicht. Die
+Updateanzeige vergleicht nur die installierte `VERSION` mit dem neuesten
+Stable-Release und bleibt vom eigentlichen Startpfad getrennt. Damit kann auch
+dieselbe Version bewusst als Reparatur erneut installiert werden.
+
+Das Vollbackup entsteht bei laufenden Diensten. Danach gibt es genau einen
+kurzen Dienststopp: Zuerst werden veränderliche Daten im ruhenden Zustand
+nachgesichert, anschließend Produkt- und Webdateien, Rechte, Core-Units und
+root-eigene Launcher direkt aus dem Zielrelease projiziert. Nach dem Neustart
+werden installierte Version und Pflichtdienste geprüft.
+
+Der Normalpfad verwendet keinen alten Release-Finalizer, verlangt keinen
+Ziel-Updater auf demselben Produkt-Dateisystem und setzt keinen persistenten
+Recovery-Bootblock. Kann ein bereits installierter 5.4.4b-Launcher den neuen
+Pfad noch nicht erreichen, bleibt `sudo /bin/sh ./e3dc-update-bootstrap` die
+einmalige portable Brücke. 5.4.4c ändert gegenüber 5.4.4b keine EMS- oder
+Hardwarelogik.
 
 ### 5.4.4b: universeller Ziel-Updater mit geringer Ausfallzeit
 
@@ -365,7 +404,11 @@ einheitlicher Rettungsweg. Er prüft Installationsnutzer, Stable-Tag,
 Commit-SHA, Zielpfad und Rolle im heruntergeladenen Zielstand erneut. Bei einem
 Fehler bleibt das verifizierte Backup der Rückweg.
 
-Ab dem Release mit Ziel-Updater-Handoff lädt die laufende Version zunächst
+Die folgenden Absätze dokumentieren ausschließlich den historischen
+Ziel-Updater-/Finalizer-Pfad bis 5.4.4b. Sie beschreiben nicht den normalen
+Updateablauf ab 5.4.4c.
+
+Ab dem damaligen Release mit Ziel-Updater-Handoff lud die laufende Version zunächst
 ausschließlich die Git-Objekte des freigegebenen Zielstands. Sie bindet
 Repository-Origin, volle Commit-SHA, annotierten Stable-Tag,
 VERSION-/Policy-Zuordnung und die vorhandene Anlagenrolle. Danach startet sie
@@ -396,7 +439,7 @@ dadurch nicht parallel zu einem weiterlaufenden Ziel-Finalizer arbeiten. Nach
 erfolgreicher Installation des neuen Vertrags verwenden alle folgenden Updates
 den Ziel-Updater-Handoff.
 
-Der gemeinsame Update-Einstieg verwendet auch beim bereits aktuellen Bestand
+Der damalige gemeinsame Update-Einstieg verwendete auch beim bereits aktuellen Bestand
 den vollständigen Ziel-Updater-Vertrag: Backup erstellen und prüfen, Dienste
 kontrolliert anhalten, den veröffentlichten Stand samt Rechten projizieren,
 Dienste starten und ihren Zustand prüfen. Lokale Git-Metadaten, abweichende
@@ -409,7 +452,7 @@ Schreiber und ein fehlgeschlagener Wiederanlauf bleiben harte Abbruchgründe.
 administrative Vorgänge und dürfen nicht mit `--update-e3dc` kombiniert
 werden.
 
-Der versiegelte Release-Finalizer meldet seine Phasen und während langer
+Der versiegelte Release-Finalizer meldete seine Phasen und während langer
 Arbeit alle 30 Sekunden einen Heartbeat. Für langsame Raspberry Pis gilt ein
 hartes Gesamtzeitlimit von 30 Minuten ausschließlich für diese mutierende
 Finalizer-Phase. Backup und verifizierte Wiederherstellung liegen außerhalb

@@ -6,6 +6,26 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.4c] – 2026-08-25
+
+### 🔄 Git-unabhängiges Update und Same-Version-Reparatur
+
+- **Der veröffentlichte Ziel-Updater entscheidet:** Der vorhandene Produktbaum und sein `.git`-Verzeichnis sind keine Updateautorität mehr. Lokale Produktänderungen, fehlende Dateien, falsche Rechte und eine alte oder beschädigte Git-Fläche werden nach dem Backup durch den Releasebestand ersetzt beziehungsweise repariert.
+- **Vollbackup und ruhende Daten-Nachsicherung:** Das vollständige Backup entsteht bei laufenden Diensten. Anschließend werden die betroffenen Dienste genau einmal kurz gestoppt und die nun ruhenden, während des Backups noch veränderlichen Daten nachgesichert, bevor Produktdateien, Rechte, Core-Units und die root-eigenen Launcher direkt ausgetauscht werden.
+- **Keine alte Finalizer- und Bootblock-Kette:** Der normale Updatepfad benötigt weder einen Ziel-Updater auf demselben Produkt-Dateisystem noch den bisherigen Release-Finalizer oder einen persistenten Recovery-Bootblock. Nach dem Austausch werden die benötigten Dienste neu gestartet und der installierte Stand geprüft.
+- **Kein gemischter Fehlerstand:** Ein alter C++-Regler oder ein belegter abgelöster Hardware-Writer wird beim kurzen Dateiaustausch zunächst nur gestoppt und erst nach bestätigtem Zielstand deaktiviert. Scheitert der Wechsel vor der ersten Produktmutation, startet der exakt zuvor aktive Dienstsatz wieder. Scheitert er nach begonnener Produktmutation, stellt der Updater zuerst das Vollbackup und anschließend die neuere ruhende Daten-Nachsicherung wieder her; erst danach wird ebenfalls exakt dieser Vorzustand gestartet. Nach bestätigtem Zielstand gibt es keinen verspäteten Rückfall.
+- **Keine HA-Zusatzbedingung im Einzelbetrieb:** Normale Standalone-Dienste erhalten weder ein HA-Starttor noch eine Abhängigkeit von `e3dc-ha.service`. Nur Master, Slave und Shadow erhalten den zu ihrer Rolle gehörenden Owner-Lease-Schutz. Eine aus dem Release neu angelegte Rollenunit wird rebootfest aktiviert, eine bereits vorhandene und bewusst deaktivierte Rollenunit bleibt aus.
+- **HA-Neustart ohne Lease-Wartezeit:** Beim Releasewechsel wird der Rollenmanager vor seinen verwalteten Diensten gestoppt. Sobald die exklusive lokale Sperre den alten HA-Prozess sicher ausschließt, darf sein Nachfolger die noch nicht abgelaufene Lease desselben Knotens, derselben Rolle und desselben Peers unmittelbar übernehmen – auch wenn der Peer während dieses kurzen Neustarts nicht erreichbar ist. Das gilt ebenso für die Fortsetzung eines bereits aktiven Slave-Failovers; ein inzwischen aktiver Peer stoppt die lokalen Schreiber weiterhin sofort. Fremde, abgelaufene oder abweichende Kontexte bleiben fail-closed. Ein zuvor aktiver Master gilt erst bei gültiger Schreiberfreigabe und nach dem stabilen Wiederanlauf seines bisherigen Dienstsatzes als aktualisiert.
+- **HA-Sync mit privatem Datenverzeichnis:** Die Modus-5-Schutzprüfung folgt dem tatsächlich konfigurierten Datenverzeichnis-Modus. Der sichere Standard `2770` wird ebenso korrekt akzeptiert wie der bewusst gewählte Kompatibilitätsmodus `2775`; ein passender Altmodus ohne Setgid-Bit wird gezielt auf den jeweiligen Sollmodus angehoben. Unsichere Besitzer, Gruppen, Links oder Dateimodi bleiben gesperrt.
+- **Alte Wärmepumpen-Unit wird vollständig übernommen:** Ein zuvor aktiver oder aktivierter `wp-manager.service` wird auf `energy_manager.service` migriert. Der neue Dienst wird projiziert und übernimmt den bisherigen Start-/Enable-Zustand; erst nach bestätigtem Zielstand wird die alte Unit deaktiviert.
+- **Downloadfehler mit direkter Lösung:** Fehler beim Anlegen des privaten Releaseordners oder beim einzigen GitHub-Download nennen den unveränderten Systemzustand und einen kopierbaren Prüf- beziehungsweise Wiederholungsbefehl.
+- **Reparatur auch ohne neue Version:** Derselbe Stable-Stand kann erneut installiert werden. Die Updateanzeige vergleicht ausschließlich die installierte `VERSION` mit dem neuesten Stable-Release und ist rein informativ; ein fehlgeschlagener Check oder dieselbe Version blockiert den Start nicht.
+- **Einmalige Brücke für einen defekten Alt-Launcher:** Kann ein bereits installiertes 5.4.4b-System den neuen Ziel-Updater noch nicht erreichen, genügt einmalig die portable Datei `e3dc-update-bootstrap` mit `sudo /bin/sh ./e3dc-update-bootstrap`. Danach ist der neue Launcher Bestandteil der Installation.
+
+### ⚡ Unveränderte Regelung
+
+- 5.4.4c ändert gegenüber 5.4.4b keine EMS-, Speicher-, Wallbox-, Wärmepumpen-, Direktvermarktungs- oder Hardwarelogik.
+
 ## [5.4.4b] – 2026-08-24
 
 ### 🔄 Universelles Update mit kurzer Betriebsunterbrechung

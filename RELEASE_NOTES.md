@@ -1,3 +1,69 @@
+# E3DC-Control v5.4.4c
+
+E3DC-Control 5.4.4c korrigiert ausschließlich den Update- und Reparaturpfad
+aufbauend auf 5.4.4b. EMS-, Speicher-, Wallbox-, Wärmepumpen-,
+Direktvermarktungs- und Hardwarelogik bleiben gegenüber 5.4.4b unverändert.
+
+## Backup, kurzer Wechsel und direkter Wiederanlauf
+
+- Der heruntergeladene Ziel-Updater arbeitet unabhängig vom `.git`-Verzeichnis
+  der Nutzerinstallation. Lokale Produktänderungen, fehlende Dateien und falsche
+  Rechte werden im Update gesichert und anschließend auf den Releasezustand
+  gebracht.
+- Das Vollbackup entsteht bei laufenden Diensten. Danach folgt genau ein kurzer
+  Dienststopp, eine Nachsicherung der nun ruhenden veränderlichen Daten und der
+  direkte Austausch von Produktdateien, Webdateien, Rechten, Core-Units und
+  root-eigenen Launchern.
+- Der reguläre Pfad verwendet weder den bisherigen Release-Finalizer noch die
+  Same-Filesystem-Bedingung für den Ziel-Updater oder den persistenten
+  Recovery-Bootblock. Nach der Projektion werden die benötigten Dienste neu
+  gestartet und der installierte Stand geprüft.
+- Alte C++- oder belegte Fremdregler werden erst nach einem bestätigten
+  Wiederanlauf des neuen Dienstsatzes dauerhaft deaktiviert. Scheitert der
+  Wechsel vor dem Dateiaustausch, startet der zuvor laufende Dienstsatz wieder.
+  Scheitert er nach begonnener Produktmutation, werden zuerst Vollbackup und
+  ruhende Daten-Nachsicherung wiederhergestellt und erst danach wird exakt der
+  zuvor aktive Dienstsatz gestartet. Ein bereits bestätigter Zielstand wird bei
+  einem späteren Bereinigungsfehler nicht zurückgesetzt.
+- HA-Master und HA-Slave überlassen den Start der verwalteten Dienste
+  ausschließlich dem HA-Manager. Ein einziges lokales systemd-Starttor gibt
+  diese Dienste nur bei einer gültigen Owner-Lease frei. Standalone-Dienste
+  erhalten weder dieses Starttor noch eine Abhängigkeit vom HA-Dienst. Eine
+  Shadow-Instanz startet nur den
+  read-only Shadow-Dienst und hält lokale Regler sowie PiGuard aus. Fehlende
+  Rollenunits werden aus dem Release rebootfest repariert, bewusst deaktivierte
+  Rollenunits bleiben aus.
+- Nach einem HA-Dienstneustart übernimmt der neue Prozess die aufgegebene Lease
+  desselben Knotens, derselben Rolle und desselben Peers sofort, sobald die
+  exklusive lokale Sperre frei ist. Das funktioniert auch bei einer während des
+  Neustarts fehlenden Peer-Antwort und setzt ebenso einen bereits aktiven
+  Slave-Failover fort. Meldet sich der Peer inzwischen als aktiver Schreiber,
+  werden die lokalen Schreiber weiterhin sofort gestoppt. Fremde, abgelaufene
+  oder abweichende Lease-Kontexte bleiben gesperrt; die frühere Wartezeit bis
+  zum Ablauf der 180-Sekunden-Lease entfällt. Beim Releasewechsel stoppt zuerst
+  der Rollenmanager; Erfolg wird auf einem zuvor aktiven Master erst bei
+  gültiger Schreiberfreigabe und nach dem stabilen Wiederanlauf seines
+  bisherigen Dienstsatzes gemeldet.
+- Die Schutzprüfung vor dem HA-Datensync akzeptiert den konfigurierten privaten
+  Standardmodus `2770` des Web-Datenverzeichnisses ebenso wie den ausdrücklich
+  gewählten Kompatibilitätsmodus `2775`. Nur das jeweils fehlende Setgid-Bit
+  eines sonst exakt passenden Altmodus wird repariert; unsichere Eigentümer,
+  Gruppen, Links oder Dateimodi bleiben gesperrt.
+- Ein zuvor aktiver oder aktivierter `wp-manager.service` wird vollständig auf
+  `energy_manager.service` übertragen. Der neue Dienst wird vor dem Start
+  projiziert und die alte Unit erst nach bestätigtem Zielstand deaktiviert.
+- Bereits der Release-Download nennt bei Fehlern den unveränderten
+  Systemzustand und einen direkt ausführbaren nächsten Prüf- oder
+  Wiederholungsbefehl.
+- Die gleiche Stable-Version darf erneut installiert werden und repariert dabei
+  den Produktbestand. Die Updateanzeige vergleicht nur installierte `VERSION`
+  und neuesten Stable-Release; sie ist keine Startbedingung.
+- Kann ein defekter 5.4.4b-Launcher den neuen Updater noch nicht laden, dient
+  `sudo /bin/sh ./e3dc-update-bootstrap` einmalig als portable Brücke. Der neue
+  Launcher wird mit 5.4.4c direkt installiert.
+
+---
+
 # E3DC-Control v5.4.4b
 
 E3DC-Control 5.4.4b verbindet den universellen, backupgestützten Updateweg mit

@@ -576,23 +576,37 @@ def evaluate_writer_admission(
     lease_directory: str = LEASE_DIRECTORY,
     now_s: Optional[float] = None,
     hostname: Optional[str] = None,
+    allow_off_anchor_config_repair: bool = False,
 ) -> Dict[str, Any]:
     """Prüft Rolle, tatsächlichen Lockhalter und frischen Lease-Datensatz."""
 
     now = _finite_float(time.time() if now_s is None else now_s)
     if now is None or now < 0:
         return _result(False, "ha_time_invalid")
+    local_node = str(hostname or socket.gethostname()).strip()
+    config_repair_fallback = False
     try:
         config = _read_canonical_config(config_path)
     except FileNotFoundError:
-        return _result(False, "ha_config_missing")
+        if not (
+            allow_off_anchor_config_repair
+            and instance_role_anchor_matches("off", hostname=local_node)
+        ):
+            return _result(False, "ha_config_missing")
+        config = {"ha_mode": "off"}
+        config_repair_fallback = True
     except Exception as exc:
-        return _result(False, "ha_config_invalid", error=type(exc).__name__)
+        if not (
+            allow_off_anchor_config_repair
+            and instance_role_anchor_matches("off", hostname=local_node)
+        ):
+            return _result(False, "ha_config_invalid", error=type(exc).__name__)
+        config = {"ha_mode": "off"}
+        config_repair_fallback = True
 
     mode = str(config.get("ha_mode") or "").strip().lower()
     if mode not in {"off", "master", "slave", "shadow"}:
         return _result(False, "ha_mode_missing_or_invalid", mode=mode)
-    local_node = str(hostname or socket.gethostname()).strip()
     peer_ip = _normalized_ip(config.get("ha_peer_ip"))
     if not instance_role_anchor_matches(
         mode,
@@ -636,9 +650,16 @@ def evaluate_writer_admission(
         if mode == "off":
             return _result(
                 not lock_held,
-                "ha_off_clear" if not lock_held else "ha_off_lease_still_held",
+                (
+                    "ha_off_config_repair_clear"
+                    if config_repair_fallback and not lock_held
+                    else "ha_off_clear"
+                    if not lock_held
+                    else "ha_off_lease_still_held"
+                ),
                 mode=mode,
                 lease_lock_held=lock_held,
+                config_repair_fallback=config_repair_fallback,
             )
 
         try:

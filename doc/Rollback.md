@@ -12,6 +12,23 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
+## Backup und direkter Updateweg in 5.4.4c
+
+5.4.4c erstellt das Vollbackup bei laufenden Diensten und ergänzt nach genau
+einem kurzen Dienststopp die Nachsicherung der nun ruhenden veränderlichen
+Daten. Erst danach werden Produktdateien, Webdateien, Rechte, Core-Units und
+Launcher direkt aus dem Zielrelease ausgetauscht und die benötigten Dienste neu
+gestartet. Der Backup-Pfad bleibt in der Ausgabe sichtbar und ist der
+Wiederherstellungspunkt für Betriebsdaten.
+
+Der Normalpfad verwendet weder den alten Release-Finalizer noch dessen
+Same-Filesystem-Bedingung oder den persistenten Recovery-Bootblock. Das
+Nutzer-`.git` ist keine Update- oder Rückfallautorität. Ein erneut gestarteter
+Same-Version-Lauf dient der Reparatur des installierten Releasebestands. Kann
+ein defekter 5.4.4b-Launcher den Ziel-Updater noch nicht erreichen, ist einmalig
+`sudo /bin/sh ./e3dc-update-bootstrap` nötig. EMS- und Hardwarelogik bleiben
+gegenüber 5.4.4b unverändert.
+
 ## Kurze Updateunterbrechung und gebundener Rückweg in 5.4.4b
 
 5.4.4b lässt Dienste und Hardware-Writer während Download, Zielprüfung und
@@ -155,7 +172,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand `v5.4.4b` führt den gebundenen Rückfallvertrag fort.
+Der aktuelle Stable-Stand ist `v5.4.4c`.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten
@@ -165,8 +182,9 @@ systemd-Textausgabe verwerfen; echte Maskenabweichungen bleiben blockierend.
 
 `v5.4.2` bietet den öffentlichen Rollback-Root `v5.3.2b` ausschließlich als
 Docker-Image an. Dieser Root enthält keinen älteren öffentlichen Tag. Auf Bare
-Metal wird er nicht als Programm-Rückfall angeboten, weil ihm der
-zielgebundene Release-Finalizer des aktuellen Transaktionsvertrags fehlt.
+Metal wird er nicht als Programm-Rückfall angeboten, weil ihm der mit 5.4.4c
+eingeführte Git-unabhängige Ziel-Updater und dessen aktueller
+Projektionsvertrag fehlen.
 
 Freie Commit-Hashes und Zwischencommits sind keine Rückfallversionen. Sie
 können weder im Konsolenmenü noch über den Installer ausgeführt werden.

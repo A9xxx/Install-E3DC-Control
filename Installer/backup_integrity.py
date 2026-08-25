@@ -60,6 +60,16 @@ _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 PRIVATE_ML_ROOT = Path("/var/lib/e3dc-control/ml")
 LEGACY_ML_MODEL = Path("/var/www/html/data/ml_model.pkl")
+QUIESCED_WEB_ROOT = Path("/var/www/html")
+QUIESCED_WEB_PERSISTENT_FILES = frozenset({
+    QUIESCED_WEB_ROOT / "e3dc.config.txt",
+    QUIESCED_WEB_ROOT / "e3dc.strompreise.txt",
+    QUIESCED_WEB_ROOT / "e3dc.wallbox.out",
+    QUIESCED_WEB_ROOT / "e3dc.wallbox.txt",
+    QUIESCED_WEB_ROOT / "e3dc_paths.json",
+    QUIESCED_WEB_ROOT / "live_history.txt",
+})
+QUIESCED_WEB_HISTORY_BACKUPS = QUIESCED_WEB_ROOT / "history_backups"
 ML_MODEL_MANIFEST_NAME = "ml_model.manifest.json"
 ML_MODEL_LOCK_NAME = ".ml_model.lock"
 ML_MODEL_SCHEMA_VERSION = 1
@@ -154,6 +164,8 @@ class PersistentSource:
     source: Path
     exclude_top_level: Tuple[str, ...] = field(default_factory=tuple)
     exclude_anywhere: Tuple[str, ...] = field(default_factory=tuple)
+    unsafe_entry_policy: str = "fail"
+    allow_live_drift: bool = False
 
 
 @dataclass(frozen=True)
@@ -1474,6 +1486,38 @@ def copy_persistent_sources(
     source_records: List[Dict[str, object]] = []
     restore_destinations: Set[str] = set()
 
+    def record_skipped_entry(
+        record: Dict[str, object],
+        relative: Path,
+        metadata: Optional[os.stat_result],
+        reason: str,
+    ) -> None:
+        skipped = record.setdefault("skipped_entries", [])
+        if not isinstance(skipped, list):  # pragma: no cover - nur interne Abwehr
+            raise BackupIntegrityError("Interner Backup-Diagnosevertrag ist ungültig")
+        skipped.append({
+            "path": relative.as_posix() if relative.parts else ".",
+            "reason": reason,
+            "mode": int(stat.S_IFMT(metadata.st_mode)) if metadata is not None else 0,
+            "nlink": int(metadata.st_nlink) if metadata is not None else 0,
+        })
+
+    def may_skip_unsafe_entry(item: PersistentSource) -> bool:
+        policy = str(item.unsafe_entry_policy or "fail")
+        if policy not in {"fail", "diagnose-skip"}:
+            raise BackupIntegrityError(
+                "Unbekannte Backup-Richtlinie für unsichere Einträge: {}".format(policy)
+            )
+        return policy == "diagnose-skip"
+
+    def is_live_drift_open_error(exc: OSError) -> bool:
+        return exc.errno in {
+            errno.ENOENT,
+            errno.ENOTDIR,
+            errno.ELOOP,
+            getattr(errno, "ESTALE", -1),
+        }
+
     def copy_open_file(
         category: str,
         archive_root: Path,
@@ -1482,17 +1526,23 @@ def copy_persistent_sources(
         metadata: os.stat_result,
         relative: Path,
         root_is_file: bool,
-    ) -> None:
+        item: PersistentSource,
+        record: Dict[str, object],
+    ) -> bool:
         restore_text = str(source_path)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        if not stat.S_ISREG(metadata.st_mode):
             raise BackupIntegrityError(
-                "Backupquelle ist keine eigenständige reguläre Datei: {}".format(
-                    source_path
-                )
+                "Backupquelle ist keine reguläre Datei: {}".format(source_path)
+            )
+        if metadata.st_nlink != 1:
+            if may_skip_unsafe_entry(item):
+                record_skipped_entry(record, relative, metadata, "hardlink")
+                return False
+            raise BackupIntegrityError(
+                "Backupquelle ist keine eigenständige reguläre Datei: {}".format(source_path)
             )
         if restore_text in restore_destinations:
             raise BackupIntegrityError("Restore-Ziel ist doppelt definiert: {}".format(source_path))
-        restore_destinations.add(restore_text)
         archive_relative = _archive_path(category, archive_root, relative, root_is_file)
         destination = backup / archive_relative
         suffix = source_path.suffix.lower()
@@ -1507,6 +1557,10 @@ def copy_persistent_sources(
             or not stat.S_ISREG(after.st_mode)
             or after.st_nlink != 1
         ):
+            if item.allow_live_drift:
+                _unlink_if_exists(destination)
+                record_skipped_entry(record, relative, after, "live-drift")
+                return False
             raise BackupIntegrityError("Quelle wurde waehrend des Backups ausgetauscht: {}".format(source_path))
         if not sqlite_source and (
             after.st_size != metadata.st_size
@@ -1517,6 +1571,10 @@ def copy_persistent_sources(
             or stat.S_IMODE(after.st_mode) != stat.S_IMODE(metadata.st_mode)
             or size != metadata.st_size
         ):
+            if item.allow_live_drift:
+                _unlink_if_exists(destination)
+                record_skipped_entry(record, relative, after, "live-drift")
+                return False
             raise BackupIntegrityError(
                 "Quelle wurde während des Backups in-place verändert: {}. "
                 "Das Update hat noch keinen Dienst gestoppt; bitte den erneut "
@@ -1524,6 +1582,7 @@ def copy_persistent_sources(
                     source_path
                 )
             )
+        restore_destinations.add(restore_text)
         mapped_entries.append({
             "backup_path": archive_relative.as_posix(),
             "restore_path": restore_text,
@@ -1534,6 +1593,7 @@ def copy_persistent_sources(
             "size": size,
             "sha256": sha,
         })
+        return True
 
     def walk_directory(
         category: str,
@@ -1542,23 +1602,42 @@ def copy_persistent_sources(
         relative: Path,
         item: PersistentSource,
         seen_directories: List[Dict[str, int | str]],
+        record: Dict[str, object],
     ) -> int:
         copied = 0
         for name in sorted(os.listdir(directory_descriptor)):
             if _persistent_entry_is_excluded(name, relative, item):
                 continue
-            metadata = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
             child_relative = relative / name
             child_path = source_root / child_relative
+            try:
+                metadata = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                if item.allow_live_drift:
+                    record_skipped_entry(record, child_relative, None, "live-drift")
+                    continue
+                raise
             if stat.S_ISLNK(metadata.st_mode):
+                if may_skip_unsafe_entry(item):
+                    record_skipped_entry(record, child_relative, metadata, "symlink")
+                    continue
                 raise BackupIntegrityError("Symlink in Backupquelle ist nicht erlaubt: {}".format(child_path))
             if stat.S_ISDIR(metadata.st_mode):
-                child_descriptor = os.open(
-                    name, os.O_RDONLY | _DIRECTORY | _NOFOLLOW, dir_fd=directory_descriptor
-                )
+                try:
+                    child_descriptor = os.open(
+                        name, os.O_RDONLY | _DIRECTORY | _NOFOLLOW, dir_fd=directory_descriptor
+                    )
+                except OSError as exc:
+                    if item.allow_live_drift and is_live_drift_open_error(exc):
+                        record_skipped_entry(record, child_relative, metadata, "live-drift")
+                        continue
+                    raise
                 try:
                     opened = os.fstat(child_descriptor)
                     if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                        if item.allow_live_drift:
+                            record_skipped_entry(record, child_relative, opened, "live-drift")
+                            continue
                         raise BackupIntegrityError("Quellverzeichnis wurde ausgetauscht: {}".format(child_path))
                     seen_directories.append({
                         "path": child_relative.as_posix(),
@@ -1573,22 +1652,45 @@ def copy_persistent_sources(
                         child_relative,
                         item,
                         seen_directories,
+                        record,
                     )
                 finally:
                     os.close(child_descriptor)
             elif stat.S_ISREG(metadata.st_mode):
                 if _sqlite_sidecar_is_excluded(directory_descriptor, name):
                     continue
-                file_descriptor = os.open(name, os.O_RDONLY | _NOFOLLOW, dir_fd=directory_descriptor)
+                try:
+                    file_descriptor = os.open(name, os.O_RDONLY | _NOFOLLOW, dir_fd=directory_descriptor)
+                except OSError as exc:
+                    if item.allow_live_drift and is_live_drift_open_error(exc):
+                        record_skipped_entry(record, child_relative, metadata, "live-drift")
+                        continue
+                    raise
                 try:
                     opened = os.fstat(file_descriptor)
                     if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                        if item.allow_live_drift:
+                            record_skipped_entry(record, child_relative, opened, "live-drift")
+                            continue
                         raise BackupIntegrityError("Quelldatei wurde ausgetauscht: {}".format(child_path))
-                    copy_open_file(category, source_root, child_path, file_descriptor, opened, child_relative, False)
-                    copied += 1
+                    if copy_open_file(
+                        category,
+                        source_root,
+                        child_path,
+                        file_descriptor,
+                        opened,
+                        child_relative,
+                        False,
+                        item,
+                        record,
+                    ):
+                        copied += 1
                 finally:
                     os.close(file_descriptor)
             else:
+                if may_skip_unsafe_entry(item):
+                    record_skipped_entry(record, child_relative, metadata, "special")
+                    continue
                 raise BackupIntegrityError("Nicht regulaerer Eintrag in Backupquelle: {}".format(child_path))
         return copied
 
@@ -1604,6 +1706,7 @@ def copy_persistent_sources(
             "exclude_top_level": list(source.exclude_top_level),
             "exclude_anywhere": list(source.exclude_anywhere),
             "directories": [],
+            "skipped_entries": [],
         }
         source_records.append(record)
         try:
@@ -1617,26 +1720,68 @@ def copy_persistent_sources(
                 continue
             record["present"] = True
             if stat.S_ISLNK(metadata.st_mode):
+                if may_skip_unsafe_entry(source):
+                    record["source_type"] = "skipped"
+                    record_skipped_entry(record, Path(), metadata, "symlink")
+                    continue
                 raise BackupIntegrityError("Backupquelle darf kein Symlink sein: {}".format(source_path))
             if stat.S_ISREG(metadata.st_mode):
                 record["source_type"] = "file"
-                descriptor = os.open(source_path.name, os.O_RDONLY | _NOFOLLOW, dir_fd=parent_descriptor)
+                try:
+                    descriptor = os.open(
+                        source_path.name,
+                        os.O_RDONLY | _NOFOLLOW,
+                        dir_fd=parent_descriptor,
+                    )
+                except OSError as exc:
+                    if source.allow_live_drift and is_live_drift_open_error(exc):
+                        record["source_type"] = "skipped"
+                        record_skipped_entry(record, Path(), metadata, "live-drift")
+                        continue
+                    raise
                 try:
                     opened = os.fstat(descriptor)
                     if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                        if source.allow_live_drift:
+                            record["source_type"] = "skipped"
+                            record_skipped_entry(record, Path(), opened, "live-drift")
+                            continue
                         raise BackupIntegrityError("Backupquelle wurde ausgetauscht: {}".format(source_path))
-                    copy_open_file(category, source_path, source_path, descriptor, opened, Path(source_path.name), True)
-                    record["files"] = 1
+                    if copy_open_file(
+                        category,
+                        source_path,
+                        source_path,
+                        descriptor,
+                        opened,
+                        Path(source_path.name),
+                        True,
+                        source,
+                        record,
+                    ):
+                        record["files"] = 1
                 finally:
                     os.close(descriptor)
             elif stat.S_ISDIR(metadata.st_mode):
                 record["source_type"] = "directory"
-                descriptor = os.open(
-                    source_path.name, os.O_RDONLY | _DIRECTORY | _NOFOLLOW, dir_fd=parent_descriptor
-                )
+                try:
+                    descriptor = os.open(
+                        source_path.name,
+                        os.O_RDONLY | _DIRECTORY | _NOFOLLOW,
+                        dir_fd=parent_descriptor,
+                    )
+                except OSError as exc:
+                    if source.allow_live_drift and is_live_drift_open_error(exc):
+                        record["source_type"] = "skipped"
+                        record_skipped_entry(record, Path(), metadata, "live-drift")
+                        continue
+                    raise
                 try:
                     opened = os.fstat(descriptor)
                     if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                        if source.allow_live_drift:
+                            record["source_type"] = "skipped"
+                            record_skipped_entry(record, Path(), opened, "live-drift")
+                            continue
                         raise BackupIntegrityError("Backupquelle wurde ausgetauscht: {}".format(source_path))
                     record["mode"] = stat.S_IMODE(opened.st_mode)
                     record["uid"] = int(opened.st_uid)
@@ -1649,11 +1794,16 @@ def copy_persistent_sources(
                         Path(),
                         source,
                         directories,
+                        record,
                     )
                     record["directories"] = directories
                 finally:
                     os.close(descriptor)
             else:
+                if may_skip_unsafe_entry(source):
+                    record["source_type"] = "skipped"
+                    record_skipped_entry(record, Path(), metadata, "special")
+                    continue
                 raise BackupIntegrityError("Backupquelle ist kein regulaerer Pfad: {}".format(source_path))
         finally:
             os.close(parent_descriptor)
@@ -1929,9 +2079,36 @@ def verify_backup(
         if not isinstance(record, dict):
             raise BackupIntegrityError("Ungueltiger Source-Eintrag im Manifest")
         source_type = str(record.get("source_type") or "")
-        if source_type not in {"file", "directory", "missing"}:
+        if source_type not in {"file", "directory", "missing", "skipped"}:
             raise BackupIntegrityError("Ungueltiger Source-Typ im Manifest")
         _lexical_absolute(str(record.get("source") or ""))
+        skipped_entries = record.get("skipped_entries", [])
+        if not isinstance(skipped_entries, list):
+            raise BackupIntegrityError("Übersprungene Backup-Einträge müssen eine Liste sein")
+        skipped_paths: Set[str] = set()
+        for skipped in skipped_entries:
+            if not isinstance(skipped, dict) or set(skipped) != {"path", "reason", "mode", "nlink"}:
+                raise BackupIntegrityError("Ungültiger Diagnoseeintrag im Backup-Manifest")
+            skipped_path = str(skipped.get("path") or "")
+            if skipped_path == ".":
+                if source_type != "skipped":
+                    raise BackupIntegrityError("Nur eine vollständig übersprungene Quelle darf '.' verwenden")
+            else:
+                skipped_path = _safe_relative_path(skipped_path).as_posix()
+            if skipped_path in skipped_paths:
+                raise BackupIntegrityError("Doppelter übersprungener Backup-Eintrag")
+            skipped_paths.add(skipped_path)
+            if skipped.get("reason") not in {"symlink", "hardlink", "special", "live-drift"}:
+                raise BackupIntegrityError("Unbekannter Diagnosegrund im Backup-Manifest")
+            try:
+                skipped_mode = int(skipped.get("mode", -1))
+                skipped_nlink = int(skipped.get("nlink", -1))
+            except (TypeError, ValueError) as exc:
+                raise BackupIntegrityError("Ungültige Diagnosemetadaten im Backup-Manifest") from exc
+            if skipped_mode < 0 or skipped_mode > 0o170000 or skipped_nlink < 0:
+                raise BackupIntegrityError("Ungültige Diagnosemetadaten im Backup-Manifest")
+        if source_type == "skipped" and not bool(record.get("present")):
+            raise BackupIntegrityError("Übersprungene Backupquelle muss als vorhanden markiert sein")
         if source_type == "directory" and bool(record.get("present")):
             directory_entries = [record, *list(record.get("directories") or [])]
             for directory in directory_entries:
@@ -2208,7 +2385,13 @@ def _exact_cleanup_candidates(
     cleanup_files: Dict[str, Dict[str, object]] = {}
     cleanup_dirs: Dict[str, Dict[str, object]] = {}
 
-    def scan_directory(source: Path, exclude_top: Set[str], exclude_anywhere: Set[str], original_dirs: Set[Path]) -> None:
+    def scan_directory(
+        source: Path,
+        exclude_top: Set[str],
+        exclude_anywhere: Set[str],
+        original_dirs: Set[Path],
+        skipped_paths: Set[str],
+    ) -> None:
         if not os.path.lexists(str(source)):
             return
         root_meta = os.lstat(str(source))
@@ -2222,6 +2405,9 @@ def _exact_cleanup_candidates(
                 if not relative.parts and _is_private_local_entry(name):
                     continue
                 if name in exclude_anywhere or (not relative.parts and name in exclude_top):
+                    continue
+                candidate_relative = (relative / name).as_posix()
+                if candidate_relative in skipped_paths:
                     continue
                 candidate = directory_path / name
                 metadata = os.lstat(str(candidate))
@@ -2239,6 +2425,9 @@ def _exact_cleanup_candidates(
                 if not relative.parts and _is_private_local_entry(name):
                     continue
                 if name in exclude_anywhere or (not relative.parts and name in exclude_top):
+                    continue
+                candidate_relative = (relative / name).as_posix()
+                if candidate_relative in skipped_paths:
                     continue
                 candidate = directory_path / name
                 metadata = os.lstat(str(candidate))
@@ -2266,12 +2455,17 @@ def _exact_cleanup_candidates(
                 raise BackupIntegrityError("Ungueltiger Source-Ausschluss im Manifest")
         source_type = str(record.get("source_type") or "")
         present = bool(record.get("present"))
+        skipped_paths = {
+            _safe_relative_path(str(item.get("path") or "")).as_posix()
+            for item in record.get("skipped_entries", [])
+            if isinstance(item, dict) and str(item.get("path") or "") != "."
+        }
         original_dirs: Set[Path] = set()
         for item in record.get("directories", []):
             relative_value = item.get("path") if isinstance(item, dict) else item
             original_dirs.add(source / _safe_relative_path(str(relative_value)))
         if source_type == "directory" and present:
-            scan_directory(source, exclude_top, exclude_anywhere, original_dirs)
+            scan_directory(source, exclude_top, exclude_anywhere, original_dirs, skipped_paths)
         elif source_type == "missing" and not present and os.path.lexists(str(source)):
             metadata = os.lstat(str(source))
             if stat.S_ISREG(metadata.st_mode):
@@ -2286,7 +2480,9 @@ def _exact_cleanup_candidates(
                 }
             else:
                 raise BackupIntegrityError("Neu entstandene Source-Flaeche ist unsicher: {}".format(source))
-        elif source_type not in {"file", "directory", "missing"}:
+        elif source_type == "skipped":
+            continue
+        elif source_type not in {"file", "directory", "missing", "skipped"}:
             raise BackupIntegrityError("Ungueltiger Source-Typ im Manifest")
     return list(cleanup_files.values()), list(cleanup_dirs.values())
 
@@ -2896,11 +3092,15 @@ def restore_persistent_payload(
         guarded_install = _lexical_absolute(overlay_restore_guard.install_root)
         expected_roots = {
             guarded_install / "data",
-            Path("/var/www/html/data"),
+            QUIESCED_WEB_ROOT / "data",
+            QUIESCED_WEB_HISTORY_BACKUPS,
             Path("/var/lib/e3dc-control"),
             Path("/etc/e3dc-control"),
         }
-        expected_files = {guarded_install / "e3dc.config.txt"}
+        expected_files = {
+            guarded_install / "e3dc.config.txt",
+            *QUIESCED_WEB_PERSISTENT_FILES,
+        }
         if set(roots) != expected_roots or set(files) != expected_files:
             raise BackupIntegrityError(
                 "Quiesced-Overlay-Restore besitzt keine exakte Ziel-Positivliste"

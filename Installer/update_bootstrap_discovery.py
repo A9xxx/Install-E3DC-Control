@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from dataclasses import dataclass
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,7 @@ import sys
 
 
 VALID_ROLES = frozenset({"off", "master", "slave", "shadow"})
+ACTIVE_UNIT_STATES = frozenset({"active", "activating"})
 CONTROL_CHARACTERS = ("\x00", "\t", "\r", "\n")
 PRODUCT_MARKERS = (
     ("VERSION", "file"),
@@ -31,7 +33,6 @@ PRODUCT_MARKERS = (
 )
 INSTANCE_ANCHOR_DIRECTORY = Path("/etc/e3dc-control/instances.d")
 INSTANCE_ANCHOR_SCHEMA = "e3dc_update_instance_v1"
-MARKERLESS_AUTHORITY_TIERS = frozenset({0, 1})
 
 
 @dataclass(frozen=True)
@@ -92,17 +93,15 @@ def canonical_product_root(
     text = text.strip()
     if not text.startswith("/"):
         return None
-    candidate = Path(os.path.abspath(text))
+    lexical = Path(os.path.abspath(text))
+    try:
+        candidate = lexical.resolve(strict=True)
+    except OSError:
+        return None
     if str(candidate) in {"/", "/bin", "/etc", "/home", "/lib", "/sbin", "/usr", "/var"}:
         return None
-    current = Path(candidate.anchor)
     try:
-        for component in candidate.parts[1:]:
-            current /= component
-            metadata = os.lstat(current)
-            if stat.S_ISLNK(metadata.st_mode):
-                return None
-        if not stat.S_ISDIR(os.lstat(candidate).st_mode):
+        if not stat.S_ISDIR(os.stat(candidate).st_mode):
             return None
         if not ignore_product_markers:
             missing_markers = 0
@@ -119,7 +118,7 @@ def canonical_product_root(
                     else stat.S_ISDIR(metadata.st_mode)
                 )
                 if stat.S_ISLNK(metadata.st_mode) or not valid_kind:
-                    return None
+                    missing_markers += 1
             allowed_missing = (
                 len(PRODUCT_MARKERS)
                 if allow_all_missing_markers
@@ -239,6 +238,8 @@ def _unit_properties(name: str) -> dict[str, str] | None:
                 "--property=FragmentPath",
                 "--property=WorkingDirectory",
                 "--property=User",
+                "--property=ExecStart",
+                "--property=MainPID",
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -258,10 +259,233 @@ def _unit_properties(name: str) -> dict[str, str] | None:
     return fields
 
 
+def _decode_systemd_word(raw: object) -> str | None:
+    """Dekodiert genau ein von ``systemctl show`` ausgegebenes Wort.
+
+    Unbekannte Escape-Sequenzen werden bewusst nicht geraten. Damit können
+    Pfade mit den üblichen systemd-ASCII- und UTF-8-Hex-Escapes verwendet
+    werden, ohne aus beliebigem Unit-Text einen Shell-Ausdruck zu machen.
+    """
+
+    value = str(raw or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    result: list[str] = []
+    index = 0
+    while index < len(value):
+        if value[index] != "\\":
+            result.append(value[index])
+            index += 1
+            continue
+        if index + 1 >= len(value):
+            return None
+        escape = value[index + 1]
+        if escape == "x":
+            encoded = bytearray()
+            while (
+                index + 3 < len(value)
+                and value[index : index + 2] == "\\x"
+                and re.fullmatch(r"[0-9A-Fa-f]{2}", value[index + 2 : index + 4])
+            ):
+                encoded.append(int(value[index + 2 : index + 4], 16))
+                index += 4
+            if not encoded:
+                return None
+            try:
+                result.append(encoded.decode("utf-8"))
+            except UnicodeDecodeError:
+                return None
+            continue
+        replacements = {"s": " ", "\\": "\\", '"': '"', "'": "'"}
+        if escape not in replacements:
+            return None
+        result.append(replacements[escape])
+        index += 2
+    decoded = "".join(result)
+    if _has_control_characters(decoded):
+        return None
+    return decoded
+
+
+def _absolute_exec_start_hints(raw: object) -> tuple[str, ...]:
+    """Liefert ausschließlich literale absolute Pfade aus ExecStart."""
+
+    payload = str(raw or "")
+    if not payload or _has_control_characters(payload):
+        return ()
+    lexer = shlex.shlex(
+        payload.replace("{", " ").replace("}", " ").replace(";", " "),
+        posix=False,
+    )
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    hints: set[str] = set()
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return ()
+    for token in tokens:
+        for prefix in ("path=", "argv[]=", "argv="):
+            if token.startswith(prefix):
+                token = token[len(prefix) :]
+                break
+        decoded = _decode_systemd_word(token)
+        if decoded is not None and decoded.startswith("/"):
+            hints.add(decoded)
+    return tuple(sorted(hints))
+
+
+def _product_root_from_process_hint(raw: object) -> Path | None:
+    """Bindet einen belegbaren Prozesspfad an einen existierenden Produktroot."""
+
+    decoded = _decode_systemd_word(raw)
+    if decoded is None or not decoded.startswith("/"):
+        return None
+    lexical = Path(os.path.abspath(decoded))
+    parts = lexical.parts
+    try:
+        installer_index = parts.index("Installer")
+    except ValueError:
+        installer_index = -1
+    if installer_index > 1:
+        return canonical_product_root(
+            Path(*parts[:installer_index]),
+            ignore_product_markers=True,
+        )
+    if lexical.name in {"installer_main.py", "e3dc-bootstrap", "e3dc-update-bootstrap"}:
+        return canonical_product_root(
+            lexical.parent,
+            ignore_product_markers=True,
+        )
+    return product_root_from_hint(lexical, allow_one_missing_marker=True)
+
+
+def _read_proc_regular(path: Path, maximum_bytes: int) -> bytes:
+    """Liest eine kleine proc-Datei ohne Symlink-Following und mit Inodebindung."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError("proc-Eintrag ist keine reguläre Datei")
+        raw = bytearray()
+        while len(raw) <= maximum_bytes:
+            chunk = os.read(descriptor, min(8192, maximum_bytes + 1 - len(raw)))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        after = os.fstat(descriptor)
+        named_after = os.stat(path, follow_symlinks=False)
+        stable_before = (before.st_dev, before.st_ino, before.st_uid, before.st_mode)
+        stable_after = (after.st_dev, after.st_ino, after.st_uid, after.st_mode)
+        stable_named = (
+            named_after.st_dev,
+            named_after.st_ino,
+            named_after.st_uid,
+            named_after.st_mode,
+        )
+        if len(raw) > maximum_bytes or stable_before != stable_after or stable_after != stable_named:
+            raise OSError("proc-Eintrag wechselte während des Lesens")
+        return bytes(raw)
+    finally:
+        os.close(descriptor)
+
+
+def _proc_start_time(raw: bytes) -> str:
+    """Extrahiert Linux ``/proc/<pid>/stat`` Feld 22 ohne den comm-Inhalt zu raten."""
+
+    try:
+        text = raw.decode("utf-8", errors="strict").strip()
+    except UnicodeError as exc:
+        raise OSError("proc-Status ist nicht UTF-8") from exc
+    closing = text.rfind(")")
+    if closing < 2:
+        raise OSError("proc-Status ist unvollständig")
+    fields = text[closing + 1 :].strip().split()
+    if len(fields) <= 19 or not fields[19].isdigit():
+        raise OSError("proc-Startzeit fehlt")
+    return fields[19]
+
+
+def _stable_main_pid_hints(
+    unit_name: str,
+    fields: dict[str, str],
+) -> tuple[tuple[str, str], ...]:
+    """Liest cwd/cmdline nur für die stabil an die aktive Unit gebundene MainPID."""
+
+    if fields.get("ActiveState") not in ACTIVE_UNIT_STATES:
+        return ()
+    raw_pid = str(fields.get("MainPID", "")).strip()
+    if not raw_pid.isdigit() or int(raw_pid) <= 1:
+        return ()
+    pid = int(raw_pid)
+    proc_root = Path("/proc") / str(pid)
+    stat_path = proc_root / "stat"
+    cmdline_path = proc_root / "cmdline"
+    cwd_path = proc_root / "cwd"
+    try:
+        start_before = _proc_start_time(_read_proc_regular(stat_path, 64 * 1024))
+        cmdline_before = _read_proc_regular(cmdline_path, 1024 * 1024)
+        cwd_before = os.lstat(cwd_path)
+        if not stat.S_ISLNK(cwd_before.st_mode):
+            return ()
+        cwd_target_before = os.readlink(cwd_path)
+        cwd_after = os.lstat(cwd_path)
+        if not stat.S_ISLNK(cwd_after.st_mode):
+            return ()
+        cwd_target_after = os.readlink(cwd_path)
+        cmdline_after = _read_proc_regular(cmdline_path, 1024 * 1024)
+        start_after = _proc_start_time(_read_proc_regular(stat_path, 64 * 1024))
+    except OSError:
+        return ()
+    cwd_token_before = (
+        cwd_before.st_dev,
+        cwd_before.st_ino,
+        cwd_before.st_uid,
+        cwd_before.st_mode,
+    )
+    cwd_token_after = (
+        cwd_after.st_dev,
+        cwd_after.st_ino,
+        cwd_after.st_uid,
+        cwd_after.st_mode,
+    )
+    if (
+        start_before != start_after
+        or cmdline_before != cmdline_after
+        or cwd_token_before != cwd_token_after
+        or cwd_target_before != cwd_target_after
+    ):
+        return ()
+    rebound = _unit_properties(unit_name)
+    if (
+        rebound is None
+        or rebound.get("ActiveState") not in ACTIVE_UNIT_STATES
+        or str(rebound.get("MainPID", "")).strip() != raw_pid
+    ):
+        return ()
+    hints: set[tuple[str, str]] = set()
+    if cwd_target_before.startswith("/") and not _has_control_characters(cwd_target_before):
+        hints.add((cwd_target_before, "cwd"))
+    for raw_argument in cmdline_before.split(b"\x00"):
+        if not raw_argument:
+            continue
+        try:
+            argument = raw_argument.decode("utf-8", errors="strict")
+        except UnicodeError:
+            continue
+        if argument.startswith("/") and not _has_control_characters(argument):
+            hints.add((argument, "cmdline"))
+    return tuple(sorted(hints))
+
+
 def _collect_installation_evidence(
 ) -> tuple[list[dict[str, set[str]]], list[dict[str, set[str]]]]:
     tiers: list[dict[str, set[str]]] = [defaultdict(set) for _ in range(5)]
     tier_users: list[dict[str, set[str]]] = [defaultdict(set) for _ in range(5)]
+    live_active_users: dict[str, set[str]] = defaultdict(set)
+    other_active_users: dict[str, set[str]] = defaultdict(set)
 
     def add(
         raw: object,
@@ -273,7 +497,7 @@ def _collect_installation_evidence(
         allow_all_missing_markers: bool = False,
         ignore_product_markers: bool = False,
         exact_root: bool = False,
-    ) -> None:
+    ) -> str | None:
         if exact_root:
             root = canonical_product_root(
                 raw,
@@ -289,12 +513,13 @@ def _collect_installation_evidence(
                 ignore_product_markers=ignore_product_markers,
             )
         if root is None:
-            return
+            return None
         key = str(root)
         tiers[tier][key].add(source)
         selected_user = valid_user(user)
         if selected_user:
             tier_users[tier][key].add(selected_user)
+        return key
 
     launcher = Path("/usr/local/sbin/e3dc-web-update-launcher")
     if _safe_root_file(launcher, require_root_read_execute=True):
@@ -379,22 +604,73 @@ def _collect_installation_evidence(
             continue
         fragment_text = fields.get("FragmentPath", "")
         fragment = Path(fragment_text) if fragment_text.startswith("/") else None
-        if fragment is None or not _safe_root_file(fragment):
+        active = fields.get("ActiveState") in ACTIVE_UNIT_STATES
+        if not active and (fragment is None or not _safe_root_file(fragment)):
             continue
-        active = fields.get("ActiveState") == "active"
-        add(
-            (
-                _unit_working_directory_root(fields.get("WorkingDirectory", ""))
-                if active
-                else fields.get("WorkingDirectory", "").lstrip("-")
-            ),
+        if not active:
+            add(
+                fields.get("WorkingDirectory", "").lstrip("-"),
+                f"systemd:{name}:WorkingDirectory",
+                fields.get("User", ""),
+                tier=2,
+            )
+            continue
+
+        active_roots: set[str] = set()
+        working_root = _unit_working_directory_root(fields.get("WorkingDirectory", ""))
+        working_key = add(
+            working_root,
             f"systemd:{name}:WorkingDirectory",
-            fields.get("User", ""),
-            tier=0 if active else 2,
-            allow_one_missing_marker=active,
-            ignore_product_markers=active,
-            exact_root=active,
+            tier=0,
+            allow_one_missing_marker=True,
+            ignore_product_markers=True,
+            exact_root=True,
         )
+        if working_key:
+            active_roots.add(working_key)
+
+        for hint in _absolute_exec_start_hints(fields.get("ExecStart", "")):
+            root = _product_root_from_process_hint(hint)
+            key = add(
+                root,
+                f"systemd:{name}:ExecStart",
+                tier=0,
+                ignore_product_markers=True,
+                exact_root=True,
+            )
+            if key:
+                active_roots.add(key)
+
+        for hint, origin in _stable_main_pid_hints(name, fields):
+            root = _product_root_from_process_hint(hint)
+            key = add(
+                root,
+                f"systemd:{name}:MainPID:{origin}",
+                tier=0,
+                ignore_product_markers=True,
+                exact_root=True,
+            )
+            if key:
+                active_roots.add(key)
+
+        selected_user = valid_user(fields.get("User", ""))
+        if selected_user:
+            user_map = (
+                live_active_users
+                if name == "e3dc-live.service" or name.startswith("e3dc-live@")
+                else other_active_users
+            )
+            for root in active_roots:
+                user_map[root].add(selected_user)
+
+    # Der Kernprozess e3dc-live ist die primäre Benutzerautorität. Ein
+    # optionaler Dienst mit historisch falschem User darf dieselbe Installation
+    # nicht mehrdeutig machen; sein anderer Produktroot bleibt aber weiterhin
+    # ein eigener aktiver Installationskandidat.
+    for root in tiers[0]:
+        authoritative = live_active_users.get(root) or other_active_users.get(root)
+        if authoritative:
+            tier_users[0][root].update(authoritative)
 
     for metadata_path, tier in (
         (Path("/var/www/html/data/e3dc_v4.json"), 3),
@@ -426,11 +702,7 @@ def _collect_installation_evidence(
         except (KeyError, OSError):
             owner_user = None
         selected_user = declared_user or owner_user
-        if selected_user is None or (
-            owner_user is not None
-            and declared_user is not None
-            and owner_user != declared_user
-        ):
+        if selected_user is None:
             continue
         add(root, f"Pfadmetadaten:{metadata_path}", selected_user, tier=tier)
 
@@ -518,20 +790,13 @@ def discover_installation(
             raise DiscoveryError(
                 "E3DC-UPD-PATH-002",
                 f"Expliziter Installationspfad ist ungültig: {explicit}",
-                "Prüfe, ob das Verzeichnis existiert, absolut angegeben ist und sein "
-                "Pfad keine Symlinks enthält.",
+                "Prüfe, ob das Verzeichnis existiert und als absoluter lokaler Pfad "
+                "aufgelöst werden kann.",
             )
         selected_key = str(selected)
-        if marker_bound is None and not any(
-            selected_key in tiers[tier] for tier in MARKERLESS_AUTHORITY_TIERS
-        ):
-            raise DiscoveryError(
-                "E3DC-UPD-PATH-003",
-                "Der explizite Installationspfad besitzt keine vollständigen "
-                f"Produktmarker und keine unabhängige Systembindung: {selected_key}",
-                "Starte den Bootstrap ohne Pfadangabe bei laufenden E3DC-Diensten oder "
-                "installiere den root-eigenen Web-Update-Dispatcher für diese Instanz.",
-            )
+        # Eine explizite Konsolenwahl ist selbst die Autorität. Fehlende
+        # Produktmarker und falsche Altberechtigungen sind gerade der
+        # Reparaturauftrag des Ziel-Updaters, nicht nochmals ein Startveto.
     else:
         selected_tier = next((index for index, values in enumerate(tiers) if values), None)
         candidates = sorted(tiers[selected_tier]) if selected_tier is not None else []
@@ -626,7 +891,46 @@ def _configured_signal(value: object) -> bool:
     }
 
 
+def _active_role_services() -> frozenset[str]:
+    active: set[str] = set()
+    for unit in ("e3dc-ha.service", "e3dc-shadow-sync.service"):
+        fields = _unit_properties(unit)
+        if fields is not None and fields.get("ActiveState") in ACTIVE_UNIT_STATES:
+            active.add(unit)
+    return frozenset(active)
+
+
+def _validate_anchor_role_against_services(
+    role: str,
+    active_services: frozenset[str],
+) -> None:
+    ha_active = "e3dc-ha.service" in active_services
+    shadow_active = "e3dc-shadow-sync.service" in active_services
+    if ha_active and shadow_active:
+        raise RuntimeError(
+            "e3dc-ha.service und e3dc-shadow-sync.service sind gleichzeitig aktiv; "
+            "die Instanzrolle ist widersprüchlich"
+        )
+    if ha_active and role not in {"master", "slave"}:
+        raise RuntimeError(
+            f"Rollenanker mode={role} widerspricht dem aktiven e3dc-ha.service; "
+            "für diesen Dienst muss mode master oder slave eindeutig im Rollenanker stehen"
+        )
+    if shadow_active and role != "shadow":
+        raise RuntimeError(
+            f"Rollenanker mode={role} widerspricht dem aktiven "
+            "e3dc-shadow-sync.service; dafür muss mode shadow im Rollenanker stehen"
+        )
+
+
 def discover_role(target: Path) -> str:
+    active_role_services = _active_role_services()
+    if {
+        "e3dc-ha.service",
+        "e3dc-shadow-sync.service",
+    }.issubset(active_role_services):
+        _validate_anchor_role_against_services("off", active_role_services)
+
     anchor = Path("/etc/e3dc-control/instance_role.json")
     try:
         anchor_entry = os.lstat(anchor)
@@ -654,13 +958,31 @@ def discover_role(target: Path) -> str:
             role = str(value.get("mode") if isinstance(value, dict) else "").strip().lower()
             if role not in VALID_ROLES:
                 raise RuntimeError("Rollenanker besitzt keine gültige Rolle")
-        except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError) as exc:
-            raise RuntimeError(f"Root-eigener Rollenanker ist ungültig: {exc}") from exc
-        return role
+        except (OSError, UnicodeError, json.JSONDecodeError, RuntimeError):
+            # Ein beschädigter oder falsch berechtigter Altanker ist bei einem
+            # ausdrücklich gestarteten Update reparierbarer Bestand. Die Rolle
+            # wird dann aus laufendem Dienst und Nutzerkonfiguration ermittelt;
+            # echte HA-Mehrdeutigkeit bleibt weiter gesperrt.
+            pass
+        else:
+            _validate_anchor_role_against_services(role, active_role_services)
+            return role
 
     fallback_roles: list[tuple[str, str]] = []
     invalid_sources: list[str] = []
     ha_indicators: list[str] = []
+    ha_peer_ips: list[tuple[str, str]] = []
+
+    def collect_ha_peer(source: str, raw: object) -> None:
+        value = str(raw or "").strip()
+        if not value:
+            return
+        try:
+            normalized = str(ipaddress.ip_address(value))
+        except ValueError:
+            invalid_sources.append(f"{source}:ha_peer_ip ungültig")
+            return
+        ha_peer_ips.append((source, normalized))
 
     def collect_json_role(path: Path) -> None:
         try:
@@ -677,6 +999,9 @@ def discover_role(target: Path) -> str:
         if not isinstance(value, dict):
             invalid_sources.append(f"{path}:kein Objekt")
             return
+        nested = value.get("config")
+        if isinstance(nested, dict):
+            value = {**nested, **value}
         raw_role = str(value.get("ha_mode") or "").strip().lower()
         if raw_role:
             if raw_role in VALID_ROLES:
@@ -686,10 +1011,13 @@ def discover_role(target: Path) -> str:
         for key in ("ha_peer_ip", "shadow_master_url", "shadow_master_ip"):
             if _configured_signal(value.get(key)):
                 ha_indicators.append(f"{path}:{key}")
+                if key == "ha_peer_ip":
+                    collect_ha_peer(str(path), value.get(key))
 
     for path in (
         Path("/var/www/html/data/e3dc_v4.json"),
         target / "data/e3dc_v4.json",
+        target / "Installer/installer_config.json",
     ):
         collect_json_role(path)
     for path in (target / "e3dc.config.txt", target / "data/e3dc.config.txt"):
@@ -719,29 +1047,46 @@ def discover_role(target: Path) -> str:
             )
             if peer_match and _configured_signal(peer_match.group(2)):
                 ha_indicators.append(f"{path}:{peer_match.group(1)}")
+                if peer_match.group(1) == "ha_peer_ip":
+                    collect_ha_peer(str(path), peer_match.group(2))
 
-    for unit in ("e3dc-ha.service", "e3dc-shadow-sync.service"):
-        fields = _unit_properties(unit)
-        if fields is not None and (
-            fields.get("LoadState") not in {None, "", "not-found"}
-            or fields.get("ActiveState") == "active"
-        ):
-            ha_indicators.append(f"systemd:{unit}")
+    if "e3dc-shadow-sync.service" in active_role_services:
+        fallback_roles.append(("systemd:e3dc-shadow-sync.service", "shadow"))
 
     unique_roles = sorted({role for _source, role in fallback_roles})
     if not unique_roles:
-        blockers = sorted(set(invalid_sources + ha_indicators))
-        if blockers:
+        if "e3dc-ha.service" in active_role_services:
+            raise RuntimeError(
+                "e3dc-ha.service ist aktiv, aber weder ein gültiger Rollenanker noch "
+                "eine eindeutige alte ha_mode-Konfiguration bindet master oder slave"
+            )
+        if ha_indicators:
             raise RuntimeError(
                 "Rolle ist wegen vorhandener HA-/Konfigurationsindizien nicht als off bindbar: "
-                + "; ".join(blockers)
+                + "; ".join(sorted(set(ha_indicators)))
             )
+        # Ungültige Alt-Konfigurationsdateien und ein reparierbarer Altanker
+        # erzeugen ohne jedes HA-Signal keine zweite Instanzrolle.
         return "off"
     if len(unique_roles) != 1:
         details = "; ".join(
             f"{source}={role}" for source, role in sorted(set(fallback_roles))
         )
         raise RuntimeError(f"Fallback-Rollenquellen widersprechen sich: {details}")
+    if "e3dc-ha.service" in active_role_services:
+        if unique_roles[0] not in {"master", "slave"}:
+            raise RuntimeError(
+                f"Aktives e3dc-ha.service widerspricht der eindeutigen Altrolle {unique_roles[0]}"
+            )
+        unique_peer_ips = sorted({peer for _source, peer in ha_peer_ips})
+        if len(unique_peer_ips) != 1:
+            details = "; ".join(
+                f"{source}={peer}" for source, peer in sorted(set(ha_peer_ips))
+            ) or "keine gültige ha_peer_ip"
+            raise RuntimeError(
+                "Aktives e3dc-ha.service benötigt genau eine gültige alte ha_peer_ip: "
+                + details
+            )
     if unique_roles[0] == "off" and ha_indicators:
         raise RuntimeError(
             "Rolle off widerspricht vorhandenen HA-Indizien: "

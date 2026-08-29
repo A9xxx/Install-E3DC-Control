@@ -4,5 +4,6 @@ e3dc-setup text eol=lf
 e3dc-update-bootstrap text eol=lf
 Installer/update_bootstrap_discovery.py text eol=lf
 Installer/logrotate/e3dc-control text eol=lf
+Installer/docker-logrotate.conf text eol=lf
 Dockerfile text eol=lf
 .github/workflows/*.yml text eol=lf

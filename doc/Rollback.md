@@ -12,9 +12,9 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
-## Backup und Rückweg in 5.4.4e
+## Backup und Rückweg in 5.4.4f
 
-5.4.4e lässt den heruntergeladenen Ziel-Updater das Vollbackup bei laufenden
+5.4.4f lässt den heruntergeladenen Ziel-Updater das Vollbackup bei laufenden
 Diensten erstellen. Erst für die ruhende Daten-Nachsicherung, Releaseprojektion
 und Rechte-Reparatur werden die betroffenen Dienste kurz gestoppt; danach
 startet der benötigte Dienstsatz neu. Das Nutzer-`.git` ist weder Update- noch
@@ -27,6 +27,24 @@ eigenen bestätigten Mountroot entfernt. Nach einem Rücklauf normalisiert der Z
 Webrechte vor dem Neustart. Master und Slave übergeben aktivierte
 Regelungsdienste an HA; Shadow und zuvor aktive, aber deaktivierte Dienste
 werden direkt gestartet, ohne zusätzliches festes Zeit-Endgate.
+
+Nach der Projektion stellt der Ziel-Updater für eine beibehaltene
+`external_pv_topology.json` den Installationsnutzer, die Webgruppe und den
+gemeinsamen Lesemodus `0664` wieder her. Die übrigen Konfigurations- und
+Geheimnisdateien behalten ihre strengeren Rechteverträge.
+
+Der private Release-Checkout bleibt `0700`/`0600`; der Live-Produktbaum wird
+mit definierten Lese- und Ausführungsrechten veröffentlicht. Kann `www-data`
+danach den gebundenen Pfadresolver oder die Installer-Importkette nicht lesen,
+gilt der Zielzustand als unbestätigt und der Updater stellt Vollbackup und
+ruhende Daten-Nachsicherung wieder her, bevor der alte Dienstsatz startet.
+
+Die ruhende Nachsicherung gehört während dieses Fensters zur Familie ihres
+Vollbackups. Nach bestätigtem Zielstand wird sie sicher entfernt. Dauerhaft
+gilt ein Zielbestand von maximal drei automatisch verwalteten
+System-Backup-Familien und separat maximal drei Web-Installer-Sicherungen.
+Schutzbindungen dürfen diese Zielgrenzen vorübergehend überschreiten; ein
+aktuell geschützter Rückfallstand wird niemals erzwungen gelöscht.
 
 `ENOSPC`, `EROFS`, `EACCES` und mehrere gleichrangige Installationen werden mit
 einer konkreten Prüf- und Fortsetzungsanweisung ausgegeben. Bei mehreren
@@ -193,7 +211,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand ist `v5.4.4e`.
+Der aktuelle Stable-Stand ist `v5.4.4f`.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

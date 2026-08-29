@@ -6,6 +6,78 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.4f] – 2026-08-29
+
+### 🚗 PV-Kurve startet mit belegtem Überschuss
+
+- **Einphasige Fahrzeuge starten ohne unnötige Verzögerung:** Im Modus `PV-Kurve ruhig` wird belegter physischer PV-Überschuss bereits vor der sanften Anfahrrampe berücksichtigt. Ein startbereites einphasiges Fahrzeug bleibt dadurch nicht allein wegen dieser Rampe unter seiner Mindestleistung.
+- **Batterieneutraler PV-Anteil bleibt erhalten:** Der separat belegte batterieneutrale PV-Anteil wird in der ruhigen PV-Kurve nicht erneut durch einen bereits von der Speicheraufnahme beeinflussten Netzpunktwert verkleinert. Eine zentral freigegebene einphasige Ladung wird dadurch nicht allein von diesem zusätzlichen Filter unter die Mindestleistung gedrückt.
+- **Schutzdeckel bleiben unverändert:** Speicherbudget, physischer Überschuss, gemeinsames Wallboxbudget sowie Hausanschluss-, Fahrzeug- und Hardwaregrenzen begrenzen die Freigabe weiterhin. Die Korrektur erzeugt weder eine Netzladefreigabe noch eine zusätzliche Batterieentladefreigabe.
+- **Kein falscher 0-kW-Zwischenstand:** Der Manager bindet das sichtbare Wallboxbudget an Regelzyklus, Modus und Revision. Ein unvollständiger Übergangssatz erscheint als `--` statt als reale Null; ein bestätigtes Sicherheits-, Stopp- oder Regelbudget von `0 kW` bleibt dagegen sofort sichtbar. Alte Payloads ohne den neuen Vertrag bleiben darstellbar und blenden höchstens den ersten unerklärten Nullsatz nach einem positiven Budget aus.
+
+### 🖥️ Eindeutige Wallbox- und Speicheranzeige
+
+- **Keine erfundene zweite Wallbox:** Die Gerätefamilie `Multi` gilt nicht mehr als Beleg für zwei Ladepunkte. Ein vorhandenes leeres oder ausdrücklich abgeschaltetes WB2-Typfeld verhindert jetzt auch intern Discovery, Instanziierung, Planung und Speicheranrechnung der zweiten Wallbox. Fehlt das Feld in einer echten Altinstallation vollständig, bleibt die bisherige Dual-openWB-Autoerkennung kompatibel erhalten.
+- **Legacy-Erkennung bleibt eindeutig und flüchtig:** Die Autoerkennung bindet WB2 nur bei genau zwei verschiedenen positiven Ladepunkt-IDs, frischer direkter Bestätigung und zwei verschiedenen physischen Ausgängen. Drei oder mehr Ladepunkte bleiben als mehrdeutig gesperrt. Der bestätigte Runtime-Vertrag erreicht Speicherregelung und Plantransaktion, wird aber niemals in die Anlagenkonfiguration geschrieben.
+- **Keine doppelte Leistungsanrechnung:** Meldungen mit derselben gebundenen physischen Ausgangsidentität werden nur einmal gezählt. Verschiedene reale Ausgänge bleiben auch bei einer beobachtenden zweiten Rolle vollständig in der gemessenen Gesamtleistung enthalten.
+- **Veralteter Fallback bleibt topologieneutral:** Während eines kurzen Anzeige-Rückfalls dürfen zuletzt plausible Messwerte weiter sichtbar bleiben, aber ein zwischengespeicherter Typ erzeugt keine zusätzliche Wallboxkarte.
+- **Speicherplan und Direktvermarktung klar getrennt:** Fehlende, zu kurze, ungültige oder nicht zum aktuellen Plan passende SoC-Prognosen werden als solche benannt und nicht als scheinbar gültige Kurve dargestellt. Wenn die Direktvermarktung die klassische Prognose bewusst ersetzt, zeigt die Oberfläche den geplanten, angeforderten oder bestätigten Zustand der Aktion. „Bestätigt wirksam“ setzt einen kanonischen, konsistenten Effektvertrag mit exakt derselben aktuellen Planrevision und passendem Effektstatus voraus; sonst bleibt die Wirkung unbelegt.
+
+### ☀️ Solarerzeugung vollständig summiert
+
+- **Summenpunkt auf Desktop und Mobil:** Der gemeinsame Energiefluss rendert den Erzeugungs-Summenknoten samt Leitungen immer als verborgenes Skeleton. Sobald Konfiguration, persistierte Topologie oder frische Live-Evidenz einen Zusatzwechselrichter belegt, wird er ohne Seitenneuladen in beiden Ansichten eingeblendet.
+- **Kompatible Alt-Payloads ohne Doppelzählung:** Fehlt das neue Validitätsfeld, gilt eine externe Erzeugung nur bei einer kohärenten positiven Bilanz `Gesamt = E3/DC-PV + Zusatz-WR` als Topologieevidenz. Die Summe verwendet den bereits gelieferten Gesamtwert und addiert den externen Anteil nicht ein zweites Mal.
+- **Layouts bleiben stabil:** Dynamische Direkt- und Aggregatpositionen verhindern Überlagerungen. Bereits gespeicherte Nutzerpositionen werden nicht überschrieben; ein verborgenes optionales Skeleton beeinflusst die automatische Verteilung nicht.
+
+### 🔄 Rechte der erhaltenen PV-Topologie
+
+- **Gemeinsame Lesbarkeit bleibt erhalten:** Der Ziel-Updater normalisiert die beibehaltene Datei `external_pv_topology.json` auf den Installationsnutzer, die Webgruppe und den Modus `0664`. Die übrigen Rechteverträge werden dadurch nicht gelockert.
+
+### 🔄 Lesbarer Live-Produktbaum
+
+- **Privates Staging bleibt privat:** Der heruntergeladene Release-Checkout bleibt während der Vorbereitung `root`-eigen und mit `0700`/`0600` geschützt. Beim Dateiaustausch werden diese privaten Quellmodi nicht mehr in den betriebenen Produktbaum übernommen.
+- **Ein gemeinsamer Update-Lock ohne Altbestandsfalle:** Direkter Ziel-Updater und Installationszentrale verwenden `/run/lock/e3dc-control/update.lock`. Sichere root-eigene Altmodi `0755`/`0644` werden vor jeder Produkt- oder Dienständerung auf `0700`/`0600` normalisiert. Unsichere Knoten stoppen kontrolliert vor der Mutation; ist der Lock belegt, fordert die Oberfläche zum Warten auf.
+- **Explizite Live-Rechte:** Produktverzeichnisse werden als Installationsnutzer und Webgruppe mit `0755` veröffentlicht, normale Produktdateien mit `0644` und Startskripte mit Interpreterzeile mit `0755`. Die spezielleren Rechte für Konfigurationen, Zugangsdaten und Laufzeitdaten werden anschließend unverändert wiederhergestellt.
+- **Installationszentrale real geprüft:** Vor dem Dienststart müssen die PHP-Pfadauflösung und die Installer-Importkette in einer bereinigten Umgebung als `www-data` exakt den gebundenen Installationspfad lesen können. Ein Fehler führt kontrolliert in den bestehenden Rücklauf statt zu einem scheinbar erfolgreichen Update mit unlesbarer Installationszentrale.
+- **Alte Pfadvarianten bleiben ohne globale Rechteöffnung unterstützt:** Direkte und verschachtelte Home-Installationen sowie `/opt`-Installationen bleiben zulässig. Owner-private, nicht-setgid Vorfahren bindet der Zielcode eng an die Webgruppe und ergänzt nur deren Traversierrecht; eine vorhandene gezielte POSIX-ACL für `www-data` wird akzeptiert. Gemeinsam genutzte oder setgid Vorfahren werden ohne diese ACL vor der Produktmutation mit konkreter Anleitung gesperrt; `Other-Execute` wird nie automatisch gesetzt.
+
+### 💾 Zielbestand von drei Backup-Generationen
+
+- **Drei Systemfamilien und drei Web-Sicherungen:** Der Zielbestand beträgt maximal drei automatisch verwaltete System-Backup-Familien und separat maximal drei Web-Installer-Sicherungen. Eine ruhende Daten-Nachsicherung gehört zu ihrem Vollbackup und belegt keinen zusätzlichen Familienplatz.
+- **Schutz zählt innerhalb der Grenze:** Das neue Backup und ein aktuell gebundener Rückfallstand zählen zu den drei Plätzen und werden niemals erzwungen gelöscht. Nach einem bestätigten Update wird die nur für den Rücklauf benötigte ruhende Nachsicherung sicher und vollständig gebunden entfernt.
+- **Kein Abbruch wegen mehrerer Schutzbackups:** Schutzbindungen dürfen den Zielbestand vorübergehend überschreiten. Ungeschützte Altbestände werden soweit sicher möglich entfernt; die offene Zielgrenze bleibt sichtbar und wird beim nächsten sicheren Wartungslauf erneut angewendet. Fremde, unvollständige oder nicht verifizierbare Verzeichnisse bleiben unangetastet.
+- **Rückweg vor erzwungener Bereinigung:** Kann die ruhende Nachsicherung nach dem bestätigten Update nicht erneut eindeutig zugeordnet und entfernt werden, bleibt sie erhalten und der Abschluss meldet eine Warnung. Die Drei-Generationen-Grenze senkt den dauerhaften Speicherbedarf, nicht die vollständige Schreibmenge eines einzelnen Updates.
+
+### ♻️ Luxtronik-Warmwasser bleibt am Budget gebunden
+
+- **55-°C-Freigabe endet nach Budgetverlust:** Ein direkter PV-, Pre-Dump- oder Preis-Boost bleibt während der bestehenden Signalhaltezeit und der konfigurierten Defizitfrist stabil. Fehlt danach weiterhin ein startfähiges Budget, wird ausschließlich das Warmwasserziel auf den aktiven Timerwert beziehungsweise die normale Luxtronik-Regelung zurückgegeben.
+- **Heiztakt ist kein Warmwasserlauf:** Nur physisch belegte Warmwasser-Evidenz schützt einen begonnenen WW-Zyklus. Ein laufender Heizverdichter verlängert die 55-°C-Freigabe nicht; unbekannte oder widersprüchliche Zustände werden konservativ nicht blind beendet.
+- **Kein Wiederanlauf aus einer alten Entscheidung:** Nach einer bestätigten Rücknahme öffnet erst ein frisches, zur aktuellen Wärmeanfrage gehörendes Folgebudget den direkten Boost erneut.
+
+### 🏠 Matter-Kopplung transaktionsgebunden zurücksetzen
+
+- **Ein bestätigter Webweg für Bare Metal und Docker:** Eine bestehende Matter-Kopplung kann in der Matter-Seite ausdrücklich zurückgesetzt werden. Die Weboberfläche löscht keine privaten Fabric-Daten selbst, sondern übergibt einen eng gebundenen Auftrag an den vorhandenen privilegierten Wrapper beziehungsweise den Container-Startwächter.
+- **Wiederanlauf nur nach aktueller Freigabe:** Bare Metal startet den zuvor aktiven Dienst erst nach einem erneuten Binden von Konfiguration, Unit-Zustand sowie Eigentümer- und Gruppenvertrag. `matter_bridge` muss weiterhin aktiv, die Unit aktiviert beziehungsweise laufzeitaktiviert, startbar und noch `inactive/dead` sein. Nutzer-`Aus` gewinnt; jeder Resetfehler nach dem Stop lässt Matter gestoppt.
+- **Reservierter Namensraum bleibt privat:** Ein vollständig geschriebener Marker wird zuerst in einer zufälligen privaten `.matter-storage-reset-stage-<32 Kleinhexzeichen>` vorbereitet und erst dann ohne Überschreiben als feste Prepare-Phase veröffentlicht. Zufällige Stage-Reste sind unverbindlich und werden niemals gesucht, fortgesetzt oder gelöscht. Nur feste Prepare-, Quarantäne- und Receipt-Namen sind markergebundene Transaktionsautorität; das Parent-Receipt wird WAL-artig als zweiter Name desselben Marker-Inodes veröffentlicht. Allgemeine Update-, Rechte- und HA-Läufe schützen auch den reservierten Stage-Präfix. Symlinks, fremde Mounts, Rootaustausch und Identitätsdrift bleiben fail-closed.
+- **Nur eigene Transaktionen werden fortgesetzt:** Ausschließlich ein passender Marker autorisiert einen weiteren Löschschritt. Eine unmarkierte oder fremd markierte Namenskollision bleibt vollständig unangetastet und wird mit einer konkreten Prüf- und reversiblen Umbenennungsanweisung gemeldet.
+- **Keine geratene Rechte-Reparatur:** Der Reset verändert keine beliebigen historischen Besitz- oder Modusfehler. Solche Bestände werden zuerst über das reguläre Update beziehungsweise die Rechte-Reparatur normalisiert und erst danach bewusst zurückgesetzt.
+- **Sicher wiederholbar statt halb gelöscht:** Nur der Marker an einem festen Transaktionsnamen bindet den erreichten Stand. Bei Zeitlimit, Neustart oder Teilfehler setzt ein weiterer bestätigter Versuch ausschließlich diesen belegten privaten Vertrag fort; zufällige Stage-Reste, Pairingdatei und Docker-Auftrag gelten nicht als Löschfreigabe.
+- **Plattformgerechte Anzeige:** Im Docker-Kontext zeigt die Matter-Seite den Auftrag und den Container-Neustart, aber keine widersprüchliche Bare-Metal-systemd- oder Installationsmeldung.
+- **Docker bleibt altkompatibel:** Ein versionierter Resetauftrag wird nur von einem dazu fähigen Image verarbeitet. Ältere Images ohne diesen Vertrag starten weiter mit ihrer bisherigen Storage-Härtung und verbrauchen den neuen Auftrag nicht versehentlich.
+
+### 🚗 Netzbezug ohne unnötigen Wallbox-Stopp
+
+- **Regelträgheit wird gedämpft:** Gewöhnlicher Netzbezug führt zuerst zu einer zügigen Absenkung auf den physischen Mindeststrom. Erst der gemeinsame Wh-Integralvertrag darf anschließend einen Phasenwechsel von drei auf eine Phase beziehungsweise einen Stopp freigeben.
+- **Kein direkter 0-A-Nebenweg:** Ein errechnetes Ziel unterhalb des Mindeststroms darf die Mindeststrom-/Wh-Sequenz nicht mehr über einen zweiten Treiberpfad umgehen. Nutzer-`Aus`, Hausanschluss-, Reserve-, Daten- und Hardware-Schutzgrenzen bleiben davon getrennt und wirken weiterhin sofort.
+- **Akku-Unterstützung bleibt budgetgebunden:** Ein kurzer Leistungsfehlbetrag beendet eine laufende PV-Kurvenladung nicht allein, wenn der zentrale Speichervertrag diesen Anteil aktuell freigibt. Ohne belegtes Budget wird keine Batterieentladung erfunden.
+
+### 📈 Lückenloser, rein lesender DV-Fahrplan
+
+- **Zusammenhängende Zeiträume statt Viertelstundenflut:** Semantisch gleiche, direkt angrenzende Hausversorgungs- und Marktzeiträume werden in der Anzeige verbunden. Preis-, Verkaufs-, Reserve-, Budget- und Vertragsgrenzen bleiben als echte Trenner sichtbar.
+- **Planlücken bleiben sichtbar:** Fehlende, überlappende oder nicht freigegebene Aktionsverträge werden als `EVIDENCE_LIMIT` ausgewiesen und nicht still als Hausversorgung ergänzt. Nicht freigegebene Verkaufskandidaten erzeugen keinen Hardwarebefehl.
+- **Standardprognose bleibt erhalten:** PV-Ertrag, Standard-SoC und Tagessummen werden auch bei aktiver Direktvermarktung weiter angezeigt. Die zusätzliche DV-SoC-Linie ist ausschließlich eine Backend-Projektion geplanter Fenster; Browser und PHP berechnen keine eigene Speicherwirkung.
+- **Exakte Restdauer im laufenden Slot:** Wird die Projektion im aktuellen Viertelstundenfenster am Live-SoC neu gebunden, integriert sie nur vom Erzeugungszeitpunkt bis zum Slotende. Zukünftige Slots bleiben exakt 900 Sekunden lang. Auswahl, Ausführbarkeit, Befehlsfreigabe und Hardwarewirkung bleiben für diese Anzeige aus.
+
 ## [5.4.4e] – 2026-08-26
 
 ### 🔄 Webupdate auf Systemen mit RAM-Disk

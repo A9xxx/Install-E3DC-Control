@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import json
 import os
+import pwd
 import re
 import shutil
 import stat
@@ -51,11 +52,18 @@ def _reject_privileged_web_invocation() -> None:
 _reject_privileged_web_invocation()
 
 try:
-    from .backup_retention import WEB_INSTALLER_BACKUP_KEEP_COUNT, prune_backup_dir
+    from .backup_retention import (
+        WEB_INSTALLER_BACKUP_KEEP_COUNT,
+        WEB_INSTALLER_BACKUP_MAX_AGE_DAYS,
+        WEB_INSTALLER_BACKUP_MIN_KEEP_COUNT,
+        prune_backup_dir,
+    )
     from .backup_integrity import (
+        BackupIntegrityError,
         WEB_SNAPSHOT_KIND,
         default_backup_root,
         finalize_backup,
+        projected_backup_root,
         secure_backup_tree,
     )
     from .config_secret_permissions import (
@@ -74,11 +82,18 @@ try:
     )
     from .utils import MANAGER_LOCK_TMPFILES_CONFIG, ensure_manager_lock_namespace
 except ImportError:  # pragma: no cover - direct script execution fallback
-    from backup_retention import WEB_INSTALLER_BACKUP_KEEP_COUNT, prune_backup_dir
+    from backup_retention import (
+        WEB_INSTALLER_BACKUP_KEEP_COUNT,
+        WEB_INSTALLER_BACKUP_MAX_AGE_DAYS,
+        WEB_INSTALLER_BACKUP_MIN_KEEP_COUNT,
+        prune_backup_dir,
+    )
     from backup_integrity import (
+        BackupIntegrityError,
         WEB_SNAPSHOT_KIND,
         default_backup_root,
         finalize_backup,
+        projected_backup_root,
         secure_backup_tree,
     )
     from config_secret_permissions import (
@@ -212,6 +227,39 @@ READ_ONLY_ACTIONS = {
 }
 
 
+def backup_root_projection() -> dict[str, Any]:
+    """Liefert nur den sicheren Zielpfadstatus für unprivilegierte Anzeigen."""
+
+    try:
+        path = projected_backup_root(INSTALL_ROOT) / "web_installer"
+    except BackupIntegrityError:
+        return {
+            "success": False,
+            "path": None,
+            "access": "administrative_only",
+            "contents_inspected": False,
+            "writer_validation": "invalid_path_policy",
+            "message": (
+                "Die Backup-Zielkonfiguration verletzt die sichere Pfad-Policy. "
+                "Entferne E3DC_BACKUP_ROOT für den Standardpfad "
+                "/srv/e3dc-control-backups oder verwende einen absoluten, "
+                "vom Installations-, Home- und Webroot getrennten Pfad mit "
+                "dem Namen e3dc-control-backups."
+            ),
+        }
+    return {
+        "success": True,
+        "path": str(path),
+        "access": "administrative_only",
+        "contents_inspected": False,
+        "writer_validation": "required",
+        "message": (
+            "Nur der Zielpfad wurde projiziert. Existenz, Eigentümer, Modus, "
+            "Marker und Inhalt prüft erst der administrative Schreibjob."
+        ),
+    }
+
+
 def configure_utf8_stdio() -> None:
     """Hält die JSON-Ausgabe auch unter einer alten latin-1-Locale gültig."""
 
@@ -259,6 +307,8 @@ SERVICE_WRAPPER_ACTIONS = (
     "enable",
     "disable",
 )
+MATTER_RESET_ACTION = "reset-matter-pairing"
+MATTER_RESET_UNIT = "e3dc-matter-bridge.service"
 SERVICE_WRAPPER_UNITS = (
     "e3dc-live.service",
     "energy_manager.service",
@@ -294,6 +344,20 @@ SUDOERS_DIR = Path("/etc/sudoers.d")
 VISUDO = Path("/usr/sbin/visudo")
 MAX_BACKUP_FILE_BYTES = 10 * 1024 * 1024
 EXPECTED_RELEASE_COMMIT_ENV = "E3DC_RELEASE_EXPECTED_COMMIT"
+
+
+def _validate_service_wrapper_embedded_python(payload: bytes) -> None:
+    """Kompiliert den privilegierten Inline-Pythonblock zusätzlich zu bash -n."""
+
+    begin = b"# E3DC_MATTER_RESET_PYTHON_BEGIN\n"
+    end = b"# E3DC_MATTER_RESET_PYTHON_END\n"
+    if payload.count(begin) != 1 or payload.count(end) != 1:
+        raise RuntimeError("Service-Launcher besitzt keinen eindeutigen Matter-Reset-Pythonblock")
+    source = payload.split(begin, 1)[1].split(end, 1)[0]
+    try:
+        compile(source.decode("utf-8", errors="strict"), "<matter-reset>", "exec")
+    except (SyntaxError, UnicodeError) as exc:
+        raise RuntimeError("Matter-Reset-Pythonblock im Service-Launcher ist ungültig") from exc
 
 
 def _git_head_wrapper_bytes(repo_root: Path) -> tuple[str, dict[str, bytes]]:
@@ -341,6 +405,8 @@ def _git_head_wrapper_bytes(repo_root: Path) -> tuple[str, dict[str, bytes]]:
         payload, sealed_mode = entries[relative_path]
         if sealed_mode != 0o555 or not payload.startswith(b"#!/bin/bash\n") or b"\r" in payload:
             raise RuntimeError(f"HEAD-Blob ist kein LF-kodierter Bash-Wrapper: {relative_path}")
+        if relative_path == "Installer/service_wrapper.sh":
+            _validate_service_wrapper_embedded_python(payload)
         canonical[relative_path] = payload
     return commit, canonical
 
@@ -965,13 +1031,184 @@ def web_update_launcher_integrity_preview(
     }
 
 
+def _readiness_verification_scope(bound_install_user: str | None = None) -> str:
+    """Bindet den Readiness-Kontext fail-closed an Root, Install-User oder Web."""
+
+    euid = os.geteuid()
+    if euid == 0:
+        return "root"
+    try:
+        current_user = pwd.getpwuid(euid).pw_name
+        web_uid = int(pwd.getpwnam("www-data").pw_uid)
+    except KeyError:
+        return "other"
+    if euid == web_uid and current_user == "www-data":
+        return "web"
+    try:
+        owner_uid = int(INSTALL_ROOT.lstat().st_uid)
+    except OSError:
+        return "other"
+    expected_user = bound_install_user if bound_install_user is not None else install_user()
+    if current_user == expected_user and euid == owner_uid:
+        return "install_user"
+    return "other"
+
+
+def _caller_can_verify_release_git() -> bool:
+    """Nur der exakt erkannte Webkontext darf auf den lokalen Root-Vertrag fallen."""
+
+    return _readiness_verification_scope() != "web"
+
+
+def _local_service_launcher_integrity_preview() -> dict[str, Any]:
+    """Prüft den lokalen Root-Launcher ohne Zugriff auf die Git-Objektdatenbank."""
+
+    source_item: dict[str, Any] = {
+        "path": str(SERVICE_WRAPPER_SOURCE),
+        "status": "unknown",
+    }
+    try:
+        install_meta = os.lstat(INSTALL_ROOT)
+        try:
+            web_uid = int(pwd.getpwnam("www-data").pw_uid)
+        except KeyError:
+            web_uid = -1
+        if (
+            stat.S_ISLNK(install_meta.st_mode)
+            or not stat.S_ISDIR(install_meta.st_mode)
+            or install_meta.st_uid in {0, web_uid}
+        ):
+            raise RuntimeError("Installationsroot besitzt keinen sicheren Nicht-Root-Eigentümer")
+        owner_uid = int(install_meta.st_uid)
+        parent_checks = []
+        for parent in (INSTALL_ROOT, SERVICE_WRAPPER_SOURCE.parent):
+            parent_meta = os.lstat(parent)
+            ok = (
+                stat.S_ISDIR(parent_meta.st_mode)
+                and not stat.S_ISLNK(parent_meta.st_mode)
+                and parent_meta.st_uid == owner_uid
+                and not parent_meta.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            )
+            parent_checks.append({"path": str(parent), "ok": ok})
+        metadata = os.lstat(SERVICE_WRAPPER_SOURCE)
+        source_item.update({
+            "uid": int(metadata.st_uid),
+            "gid": int(metadata.st_gid),
+            "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+            "nlink": int(metadata.st_nlink),
+            "size": int(metadata.st_size),
+        })
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != owner_uid
+            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or stat.S_IMODE(metadata.st_mode) & 0o500 != 0o500
+            or metadata.st_size < 512
+            or metadata.st_size > 64 * 1024
+            or not all(item["ok"] for item in parent_checks)
+        ):
+            raise RuntimeError("Service-Launcher-Quelle besitzt keinen sicheren lokalen Vertrag")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(SERVICE_WRAPPER_SOURCE, flags)
+        try:
+            bound = os.fstat(descriptor)
+            payload = b""
+            while len(payload) <= 64 * 1024:
+                chunk = os.read(descriptor, 64 * 1024 + 1 - len(payload))
+                if not chunk:
+                    break
+                payload += chunk
+            rebound = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        named_rebound = os.stat(SERVICE_WRAPPER_SOURCE, follow_symlinks=False)
+        stable = (
+            bound.st_dev == metadata.st_dev
+            and bound.st_ino == metadata.st_ino
+            and bound.st_size == metadata.st_size
+            and bound.st_mtime_ns == metadata.st_mtime_ns
+            and rebound.st_dev == bound.st_dev
+            and rebound.st_ino == bound.st_ino
+            and rebound.st_size == bound.st_size
+            and rebound.st_mtime_ns == bound.st_mtime_ns
+            and named_rebound.st_dev == rebound.st_dev
+            and named_rebound.st_ino == rebound.st_ino
+            and named_rebound.st_size == rebound.st_size
+            and named_rebound.st_mtime_ns == rebound.st_mtime_ns
+        )
+        if (
+            not stable
+            or not payload.startswith(b"#!/bin/bash\n# E3DC-Control V4 Service Launcher\n")
+            or b"\r" in payload
+            or payload.count(b"# E3DC_MATTER_RESET_PYTHON_BEGIN\n") != 1
+            or payload.count(b"# E3DC_MATTER_RESET_PYTHON_END\n") != 1
+        ):
+            raise RuntimeError("Service-Launcher-Quelle ist nicht stabil und vertragskonform")
+        _validate_service_wrapper_embedded_python(payload)
+        source_item.update({
+            "status": "ok",
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        })
+    except Exception as exc:
+        source_item.update({"status": "invalid", "error": str(exc)})
+        return {
+            "success": False,
+            "path": str(SERVICE_WRAPPER),
+            "source": str(SERVICE_WRAPPER_SOURCE),
+            "status": "local_source_invalid",
+            "commit_proven": False,
+            "verification_scope": "local_root_contract",
+            "source_item": source_item,
+        }
+
+    item = _classify_wrapper(SERVICE_WRAPPER, payload)
+    root_parent_checks = []
+    for parent in (SERVICE_WRAPPER.parent.parent, SERVICE_WRAPPER.parent):
+        try:
+            parent_meta = os.lstat(parent)
+            ok = (
+                stat.S_ISDIR(parent_meta.st_mode)
+                and not stat.S_ISLNK(parent_meta.st_mode)
+                and parent_meta.st_uid == 0
+                and parent_meta.st_gid == 0
+                and not parent_meta.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            )
+        except OSError:
+            ok = False
+        root_parent_checks.append({"path": str(parent), "ok": ok})
+    success = bool(
+        item.get("uid") == 0
+        and item.get("gid") == 0
+        and item.get("status") == "ok"
+        and all(check["ok"] for check in root_parent_checks)
+    )
+    return {
+        "success": success,
+        "path": str(SERVICE_WRAPPER),
+        "source": str(SERVICE_WRAPPER_SOURCE),
+        "status": "ok" if success else "local_root_contract_invalid",
+        "commit_proven": False,
+        "verification_scope": "local_root_contract",
+        "item": item,
+        "source_item": source_item,
+        "parent_checks": root_parent_checks,
+    }
+
+
 def service_launcher_integrity_preview() -> dict[str, Any]:
-    """Prüft Quelle aus Git-HEAD und installierten root-eigenen Launcher."""
+    """Prüft administrativ Git-exakt, im Webkontext den lokalen Root-Vertrag."""
 
     try:
         head, canonical = _git_head_wrapper_bytes(INSTALL_ROOT)
         payload = canonical["Installer/service_wrapper.sh"]
     except Exception as exc:
+        if not _caller_can_verify_release_git():
+            fallback = _local_service_launcher_integrity_preview()
+            fallback["git_status"] = "administrative_only"
+            fallback["git_error"] = str(exc)
+            return fallback
         return {
             "success": False,
             "path": str(SERVICE_WRAPPER),
@@ -1005,6 +1242,8 @@ def service_launcher_integrity_preview() -> dict[str, Any]:
         "path": str(SERVICE_WRAPPER),
         "source": str(SERVICE_WRAPPER_SOURCE),
         "head": head,
+        "commit_proven": True,
+        "verification_scope": "release_commit",
         "status": (
             "ok"
             if success
@@ -1363,7 +1602,10 @@ def create_bound_preimage_snapshot(
         retention = prune_backup_dir(
             collection_root,
             keep_count=WEB_INSTALLER_BACKUP_KEEP_COUNT,
+            min_keep_count=WEB_INSTALLER_BACKUP_MIN_KEEP_COUNT,
+            max_age_days=WEB_INSTALLER_BACKUP_MAX_AGE_DAYS,
             expected_kind=WEB_SNAPSHOT_KIND,
+            preserve_paths=[backup_root],
         )
         return {
             "success": True,
@@ -1454,7 +1696,7 @@ def validate_bound_preimage_snapshot(
     }
 
 
-def desired_sudoers_lines() -> list[str]:
+def desired_www_data_sudoers_lines() -> list[str]:
     service_lines = [
         (
             f"www-data ALL=(root) NOPASSWD: "
@@ -1465,8 +1707,22 @@ def desired_sudoers_lines() -> list[str]:
     ]
     return [
         *service_lines,
+        (
+            f"www-data ALL=(root) NOPASSWD: "
+            f"{SERVICE_WRAPPER} {MATTER_RESET_ACTION} {MATTER_RESET_UNIT}"
+        ),
         f'www-data ALL=(root) NOPASSWD: {WEB_UPDATE_LAUNCHER} ""',
-        f'{install_user()} ALL=(root) NOPASSWD: {WEB_UPDATE_LAUNCHER} ""',
+    ]
+
+
+def desired_install_user_sudoers_lines() -> list[str]:
+    return [f'{install_user()} ALL=(root) NOPASSWD: {WEB_UPDATE_LAUNCHER} ""']
+
+
+def desired_sudoers_lines() -> list[str]:
+    return [
+        *desired_www_data_sudoers_lines(),
+        *desired_install_user_sudoers_lines(),
     ]
 
 
@@ -2188,16 +2444,34 @@ def file_check(path: Path, label: str, executable: bool = False, hard: bool = Tr
     }
 
 
-def desired_sudoers_command_specs() -> set[str]:
-    """Liefert den exakten wirksamen NOPASSWD-Kommandosatz."""
+def _sudoers_command_specs(lines: list[str]) -> set[str]:
+    """Normalisiert den NOPASSWD-Kommandosatz einer Subjektprojektion."""
 
     return {
         " ".join(line.split("NOPASSWD:", 1)[1].split())
-        for line in desired_sudoers_lines()
+        for line in lines
     }
 
 
-def parse_effective_www_data_sudoers(listing_text: str) -> dict[str, Any]:
+def desired_www_data_sudoers_command_specs() -> set[str]:
+    return _sudoers_command_specs(desired_www_data_sudoers_lines())
+
+
+def desired_install_user_sudoers_command_specs() -> set[str]:
+    return _sudoers_command_specs(desired_install_user_sudoers_lines())
+
+
+def desired_sudoers_command_specs() -> set[str]:
+    """Kompatibler Gesamtsatz für Diagnose- und Bestandsaufrufer."""
+
+    return _sudoers_command_specs(desired_sudoers_lines())
+
+
+def parse_effective_www_data_sudoers(
+    listing_text: str,
+    *,
+    desired_specs: set[str] | None = None,
+) -> dict[str, Any]:
     """Parst ausschließlich explizite `(root) NOPASSWD:`-Einträge."""
 
     specs: list[str] = []
@@ -2236,14 +2510,18 @@ def parse_effective_www_data_sudoers(listing_text: str) -> dict[str, Any]:
                 ambiguous_lines.append(stripped)
 
     effective_specs = sorted(set(specs))
-    desired_specs = desired_sudoers_command_specs()
+    expected_specs = (
+        desired_www_data_sudoers_command_specs()
+        if desired_specs is None
+        else set(desired_specs)
+    )
     return {
         "effective_specs": effective_specs,
         "missing_effective_specs": sorted(
-            desired_specs.difference(effective_specs)
+            expected_specs.difference(effective_specs)
         ),
         "unexpected_effective_specs": sorted(
-            set(effective_specs).difference(desired_specs)
+            set(effective_specs).difference(expected_specs)
         ),
         "ambiguous_lines": list(dict.fromkeys(ambiguous_lines)),
     }
@@ -2259,39 +2537,65 @@ def sudoers_context() -> dict[str, Any]:
     except Exception:
         pass
 
-    www_data_listing = run_cmd(
-        ["/usr/bin/sudo", "-n", "-l", "-U", "www-data"],
-        timeout=5,
-    )
+    bound_install_user = install_user()
+    verification_scope = _readiness_verification_scope(bound_install_user)
+    try:
+        current_user = pwd.getpwuid(os.geteuid()).pw_name
+    except KeyError:
+        current_user = ""
+    www_data_command = ["/usr/bin/sudo", "-n", "-l"] if verification_scope == "web" else [
+        "/usr/bin/sudo", "-n", "-l", "-U", "www-data"
+    ]
+    www_data_listing = run_cmd(www_data_command, timeout=5)
     effective_output = (
         str(www_data_listing.get("stdout") or "")
         + "\n"
         + str(www_data_listing.get("stderr") or "")
     )
-    effective = parse_effective_www_data_sudoers(effective_output)
-    listing_ok = www_data_listing.get("ok") is True
-    bound_install_user = install_user()
-    install_user_listing = run_cmd(
-        ["/usr/bin/sudo", "-n", "-l", "-U", bound_install_user],
-        timeout=5,
+    effective = parse_effective_www_data_sudoers(
+        effective_output,
+        desired_specs=desired_www_data_sudoers_command_specs(),
     )
+    listing_ok = www_data_listing.get("ok") is True
+    install_user_checked = verification_scope in {"root", "install_user"}
+    if install_user_checked:
+        install_user_command = (
+            ["/usr/bin/sudo", "-n", "-l"]
+            if current_user == bound_install_user
+            else ["/usr/bin/sudo", "-n", "-l", "-U", bound_install_user]
+        )
+        install_user_listing = run_cmd(install_user_command, timeout=5)
+    else:
+        install_user_listing = {
+            "ok": False,
+            "returncode": None,
+            "stdout": "",
+            "stderr": "",
+            "status": "not_checked",
+        }
     install_user_output = (
         str(install_user_listing.get("stdout") or "")
         + "\n"
         + str(install_user_listing.get("stderr") or "")
     )
-    install_user_effective = parse_effective_www_data_sudoers(install_user_output)
+    install_user_effective = parse_effective_www_data_sudoers(
+        install_user_output,
+        desired_specs=desired_install_user_sudoers_command_specs(),
+    )
     update_launcher_spec = f'{WEB_UPDATE_LAUNCHER} ""'
-    install_user_contract_proven = bool(
-        install_user_listing.get("ok") is True
+    install_user_contract_proven = (
+        True
+        if install_user_listing.get("ok") is True
         and update_launcher_spec in install_user_effective["effective_specs"]
+        else False
+        if install_user_checked
+        else None
     )
     effective_contract_proven = bool(
         listing_ok
         and not effective["missing_effective_specs"]
         and not effective["unexpected_effective_specs"]
         and not effective["ambiguous_lines"]
-        and install_user_contract_proven
     )
     effective_status = (
         "effective_sudoers_exact"
@@ -2299,6 +2603,15 @@ def sudoers_context() -> dict[str, Any]:
         else "effective_sudoers_unproven"
         if not listing_ok or effective["ambiguous_lines"]
         else "effective_sudoers_mismatch"
+    )
+    install_user_listing_status = (
+        "not_checked"
+        if not install_user_checked
+        else "proven"
+        if install_user_contract_proven is True
+        else "unproven"
+        if install_user_listing.get("ok") is not True
+        else "mismatch"
     )
 
     sudoers_text = "\n".join(sudoers_chunks)
@@ -2376,18 +2689,38 @@ def sudoers_context() -> dict[str, Any]:
         "unexpected_effective_specs": effective["unexpected_effective_specs"],
         "effective_ambiguous_lines": effective["ambiguous_lines"],
         "effective_contract_proven": effective_contract_proven,
+        "www_data_contract_proven": effective_contract_proven,
+        "verification_scope": verification_scope,
         "install_user": bound_install_user,
-        "install_user_listing_ok": install_user_listing.get("ok") is True,
+        "install_user_listing_ok": (
+            install_user_listing.get("ok") is True
+            if install_user_checked
+            else None
+        ),
+        "install_user_listing_status": install_user_listing_status,
         "install_user_update_launcher_proven": install_user_contract_proven,
         "install_user_effective_specs": install_user_effective["effective_specs"],
         "file_findings": file_findings,
     }
 
 
-def write_readiness(ignore_active_lock: bool = False) -> dict[str, Any]:
+def write_readiness(
+    ignore_active_lock: bool = False,
+    *,
+    require_administrative: bool = False,
+) -> dict[str, Any]:
     sudoers = sudoers_context()
     sudoers_text = sudoers["text"]
     sudoers_source = sudoers["source"]
+    verification_scope = str(sudoers.get("verification_scope") or "other")
+    web_display_scope = verification_scope == "web" and not require_administrative
+    administrative_checks_hard = not web_display_scope
+    administrative_context_proven = verification_scope in {"root", "install_user"}
+    scope_ok = (
+        administrative_context_proven
+        if require_administrative
+        else verification_scope in {"root", "install_user", "web"}
+    )
 
     service_launcher = service_launcher_integrity_preview()
     service_wrapper = {
@@ -2417,13 +2750,16 @@ def write_readiness(ignore_active_lock: bool = False) -> dict[str, Any]:
         ),
         "details": web_update_launcher,
     }
-    installer_wrapper = file_check(INSTALLER_WRAPPER, "Installer-Wrapper", executable=True)
+    installer_wrapper = file_check(
+        INSTALLER_WRAPPER,
+        "Installer-Wrapper",
+        executable=True,
+        hard=administrative_checks_hard,
+    )
     wrapper_integrity = wrapper_integrity_preview()
     wrapper_integrity_ok = bool(wrapper_integrity.get("success")) and not wrapper_integrity.get("repair_needed")
     sudoers_exists = SUDOERS_FILE.exists()
-    sudoers_has_service = all(
-        line in sudoers_text for line in desired_sudoers_lines()
-    )
+    sudoers_has_service = sudoers.get("effective_contract_proven") is True
     sudoers_has_installer = str(INSTALLER_WRAPPER) in sudoers_text
     sudoers_direct_systemctl = bool(sudoers["direct_systemctl_lines"])
     sudoers_direct_web_commands = bool(
@@ -2435,6 +2771,19 @@ def write_readiness(ignore_active_lock: bool = False) -> dict[str, Any]:
     catalog_legacy = any((module.service_unit or "") == "e3dc.service" for module in iter_modules())
 
     checks = [
+        {
+            "label": "Readiness-Prüfkontext",
+            "ok": scope_ok,
+            "hard": True,
+            "status": verification_scope,
+            "issue": (
+                None
+                if scope_ok
+                else "Administrative Commit- und Benutzerprüfung erforderlich"
+                if require_administrative
+                else "Readiness-Aufrufer ist keinem erlaubten Systemkontext zugeordnet"
+            ),
+        },
         {
             "label": "Schreibmodus",
             "ok": not WRITE_ACTIONS_ENABLED,
@@ -2455,9 +2804,18 @@ def write_readiness(ignore_active_lock: bool = False) -> dict[str, Any]:
         {
             "label": "Wrapperintegrität gegen lokalen Git-HEAD",
             "ok": wrapper_integrity_ok,
-            "hard": True,
-            "status": wrapper_integrity.get("head") or "nicht gebunden",
-            "issue": None if wrapper_integrity_ok else "Wrapper fehlen, haben CRLF-Drift oder weichen unsicher von Git-HEAD ab",
+            "hard": administrative_checks_hard,
+            "status": (
+                wrapper_integrity.get("head") or
+                ("administrative_only" if web_display_scope else "nicht gebunden")
+            ),
+            "issue": (
+                None
+                if wrapper_integrity_ok
+                else "Wrapper fehlen, haben CRLF-Drift oder weichen unsicher von Git-HEAD ab"
+                if administrative_checks_hard
+                else "Git-Commitbindung wird ausschließlich administrativ geprüft"
+            ),
             "details": wrapper_integrity,
         },
         {
@@ -2491,6 +2849,19 @@ def write_readiness(ignore_active_lock: bool = False) -> dict[str, Any]:
                 "unexpected": sudoers["unexpected_effective_specs"],
                 "ambiguous": sudoers["effective_ambiguous_lines"],
             },
+        },
+        {
+            "label": "sudoers: Update-Launcher für Installationsbenutzer",
+            "ok": sudoers.get("install_user_update_launcher_proven") is True,
+            "hard": administrative_checks_hard,
+            "status": sudoers.get("install_user_listing_status", "unproven"),
+            "issue": (
+                None
+                if sudoers.get("install_user_update_launcher_proven") is True
+                else "Nur administrativ prüfbar"
+                if not administrative_checks_hard
+                else "Argumentloser Update-Launcher ist für den Installationsbenutzer nicht nachgewiesen"
+            ),
         },
         {
             "label": "sudoers: kein breiter privilegierter Installer-Webzugang",
@@ -2555,6 +2926,8 @@ def write_readiness(ignore_active_lock: bool = False) -> dict[str, Any]:
         "success": True,
         "write_actions_enabled": WRITE_ACTIONS_ENABLED,
         "privileged_installer_web_enabled": False,
+        "verification_scope": verification_scope,
+        "administrative_context_proven": administrative_context_proven,
         "web_update_launcher_ready": bool(web_update_launcher.get("success") and service_wrapper_ready),
         "service_wrapper_ready": service_wrapper_ready,
         "ready_for_manual_enable": False,
@@ -2668,7 +3041,17 @@ def backup_plan(module_key: str | None = None) -> dict[str, Any]:
             "error": f"Unbekanntes Modul: {module_key}",
         }
 
-    base_backup_dir = INSTALL_ROOT / "backups" / "web_installer"
+    backup_root_status = backup_root_projection()
+    if not backup_root_status.get("success"):
+        return {
+            "success": False,
+            "read_only": True,
+            "error": backup_root_status["message"],
+            "backup_root": None,
+            "backup_root_status": backup_root_status,
+        }
+
+    base_backup_dir = Path(str(backup_root_status["path"]))
     timestamp_hint = "YYYYmmdd-HHMMSS"
     config_files = [
         DATA_DIR / "e3dc_v4.json",
@@ -2739,6 +3122,7 @@ def backup_plan(module_key: str | None = None) -> dict[str, Any]:
         "module": module_key,
         "modules": module_names,
         "backup_root": str(base_backup_dir),
+        "backup_root_status": backup_root_status,
         "timestamp_hint": timestamp_hint,
         "would_backup_count": len(existing),
         "missing_count": len(missing),
@@ -2758,6 +3142,7 @@ def backup_plan(module_key: str | None = None) -> dict[str, Any]:
         "safety_rules": [
             "Dieser Plan liest nur; er erstellt noch kein Backup.",
             "Echte Backups dürfen nur über den Installer-Wrapper entstehen.",
+            "Der Backup-Root bleibt administrativ geschützt; der Read-only-Plan öffnet ihn nicht und listet keine Inhalte auf.",
             "Backup-Snapshots liegen außerhalb des Webroots.",
             "Freie Pfade aus der WebUI bleiben verboten.",
             "Historische Daten und Konfiguration werden bei Tests auf Feldsystemen nicht verändert.",
@@ -2908,7 +3293,10 @@ def create_backup_snapshot(action: str, module_key: str | None = None) -> dict[s
     retention = prune_backup_dir(
         collection_root,
         keep_count=WEB_INSTALLER_BACKUP_KEEP_COUNT,
+        min_keep_count=WEB_INSTALLER_BACKUP_MIN_KEEP_COUNT,
+        max_age_days=WEB_INSTALLER_BACKUP_MAX_AGE_DAYS,
         expected_kind=WEB_SNAPSHOT_KIND,
+        preserve_paths=[backup_root],
     )
 
     return {
@@ -3171,6 +3559,7 @@ def module_install_dry_run(module_key: str | None = None) -> dict[str, Any]:
     modules = [get_module(module_key)] if module_key else list(iter_modules())
     docker = is_docker()
     cfg = load_config()
+    backup_root_status = backup_root_projection()
     result = {}
     diagnosis = diagnose_module(module_key)
     for module in modules:
@@ -3191,6 +3580,10 @@ def module_install_dry_run(module_key: str | None = None) -> dict[str, Any]:
 
         dependency_states = {}
         blocked_reasons = []
+        if not backup_root_status.get("success"):
+            blocked_reasons.append(
+                "Backup-Zielkonfiguration verletzt die sichere Pfad-Policy"
+            )
         for dep in module_dependency_keys(module.key, cfg, tuple(module.dependencies)):
             dep_diag = diagnose_module(dep).get(dep, {})
             dep_state = {
@@ -3320,7 +3713,16 @@ def module_install_dry_run(module_key: str | None = None) -> dict[str, Any]:
                 else [
                     f"Dienst stoppen: systemctl stop {module.service_unit}",
                     f"Autostart deaktivieren: systemctl disable {module.service_unit}",
-                    "Falls eine alte Unit ersetzt wurde: Backup-Snapshot aus <Installationspfad>/backups/web_installer wiederherstellen.",
+                    (
+                        "Falls eine alte Unit ersetzt wurde: Backup-Snapshot aus {} wiederherstellen.".format(
+                            backup_root_status["path"]
+                        )
+                        if backup_root_status.get("success")
+                        else (
+                            "Backup-Zielkonfiguration zuerst administrativ korrigieren; "
+                            "ohne verifiziertes Backup keine Unit ersetzen."
+                        )
+                    ),
                     "systemctl daemon-reload ausführen.",
                     "Log, Alive-Datei und Dienststatus erneut prüfen.",
                 ]
@@ -3350,6 +3752,7 @@ def module_install_dry_run(module_key: str | None = None) -> dict[str, Any]:
             "docker": docker,
             "write_actions_enabled": WRITE_ACTIONS_ENABLED,
             "would_change": would_change,
+            "backup_root_status": backup_root_status,
             "summary": "Installations-Dry-Run: keine Änderungen am System ausgeführt.",
             "service": {
                 "unit": module.service_unit,
@@ -3714,7 +4117,10 @@ def control_service(module_key: str | None, action: str) -> dict[str, Any]:
             "message": "Docker-Dienste werden über Config/Container-Ablauf gesteuert, nicht per systemd-Webaktion.",
         }
 
-    readiness = write_readiness(ignore_active_lock=True)
+    readiness = write_readiness(
+        ignore_active_lock=True,
+        require_administrative=True,
+    )
     if readiness.get("hard_blocker_count", 1) != 0:
         return {
             "success": False,
@@ -3798,7 +4204,10 @@ def install_module(module_key: str | None = None) -> dict[str, Any]:
     if not module.service_unit:
         raise RuntimeError("Modul hat keinen erlaubten systemd-Dienst im Katalog.")
 
-    readiness = write_readiness(ignore_active_lock=True)
+    readiness = write_readiness(
+        ignore_active_lock=True,
+        require_administrative=True,
+    )
     if readiness.get("hard_blocker_count", 1) != 0:
         return {
             "success": False,
@@ -3900,7 +4309,10 @@ def remove_module(module_key: str | None = None) -> dict[str, Any]:
     if not module.service_unit:
         raise RuntimeError("Modul hat keinen erlaubten systemd-Dienst im Katalog.")
 
-    readiness = write_readiness(ignore_active_lock=True)
+    readiness = write_readiness(
+        ignore_active_lock=True,
+        require_administrative=True,
+    )
     if readiness.get("hard_blocker_count", 1) != 0:
         return {
             "success": False,
@@ -4098,7 +4510,17 @@ def repair_permissions(
     bound_privileged_preimages: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Ersetzt atomar nur die commitgebundenen Wrapper und sudoers-Fragmente."""
-    readiness = write_readiness()
+    readiness = write_readiness(require_administrative=True)
+    if readiness.get("administrative_context_proven") is not True:
+        return {
+            "success": False,
+            "message": (
+                "Rechte-Reparatur abgebrochen: Nur Root oder der an das "
+                "Installationsverzeichnis gebundene Installationsbenutzer darf "
+                "diesen administrativen Pfad ausführen."
+            ),
+            "readiness": readiness,
+        }
     if repair_runtime:
         return {
             "success": False,
@@ -4460,7 +4882,10 @@ def repair_permissions(
         # Dieser Abschlusscheck laeuft noch innerhalb des eigenen Job-Locks.
         # Der Lock ist hier kein Fehler, sondern der Schutzrahmen des gerade
         # erfolgreich ausgefuehrten Reparaturjobs.
-        post = write_readiness(ignore_active_lock=True)
+        post = write_readiness(
+            ignore_active_lock=True,
+            require_administrative=True,
+        )
         success = bool(syntax_final.get("ok")) and bool(syntax_all.get("ok")) and post.get("hard_blocker_count", 1) == 0
         rollback = None
         if not success:

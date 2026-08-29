@@ -44,7 +44,10 @@ SHADOW_DIFF_BRIEF_F = os.path.join(RAMDISK, "storage_parallel_diff_brief.json")
 SHADOW_DIFF_BRIEF_TXT_F = os.path.join(RAMDISK, "storage_parallel_diff_brief.txt")
 
 DIFF_LOG = logging.getLogger("StorageManager.ShadowCompare")
-DISABLED_WALLBOX_TYPES = {"none", "disabled", "deaktiviert", "keine", "keine_wallbox", "no_wallbox", "off"}
+DISABLED_WALLBOX_TYPES = {
+    "none", "disabled", "deaktiviert", "aus", "keine", "keine_wallbox",
+    "no_wallbox", "off", "false", "no", "0", "-1",
+}
 
 MODE_AUTO = 0
 MODE_IDLE = 1
@@ -518,6 +521,106 @@ def _wallbox_configured(cfg: Dict[str, Any], wb_id: int) -> bool:
     if int(wb_id) == 2 and wb_type == "":
         return False
     return bool(wb_type and wb_type not in DISABLED_WALLBOX_TYPES)
+
+
+def _runtime_wallbox_topology_ids(
+    wb_intent: Dict[str, Any],
+    now_s: float,
+    max_age_s: float = 60.0,
+) -> Tuple[set, set, bool]:
+    """Liest ausschließlich einen frischen Managervertrag für Legacy-WB2."""
+
+    if not isinstance(wb_intent, dict):
+        return set(), set(), False
+    topology = wb_intent.get("wallbox_runtime_topology")
+    if (
+        wb_intent.get("schema_version") != "wallbox_storage_intent_v2"
+        or wb_intent.get("source") != "wallbox_manager"
+        or not isinstance(topology, dict)
+        or topology.get("schema_version") != "wallbox_runtime_topology_v1"
+        or topology.get("valid") is not True
+    ):
+        return set(), set(), False
+    try:
+        intent_ts = float(wb_intent.get("ts", 0.0) or 0.0)
+        manager_ts = float(topology.get("manager_ts", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return set(), set(), False
+    intent_age_s = float(now_s) - intent_ts
+    manager_age_s = float(now_s) - manager_ts
+    if not (
+        intent_ts > 0.0
+        and manager_ts > 0.0
+        and -5.0 <= intent_age_s <= float(max_age_s)
+        and -5.0 <= manager_age_s <= float(max_age_s)
+        and abs(intent_ts - manager_ts) <= 1.0
+    ):
+        return set(), set(), False
+
+    def _strict_ids(value):
+        if not isinstance(value, list):
+            return None
+        ids = []
+        for raw in value:
+            if isinstance(raw, bool):
+                return None
+            try:
+                wb_id = int(raw)
+            except (TypeError, ValueError):
+                return None
+            if wb_id not in (1, 2) or wb_id in ids:
+                return None
+            ids.append(wb_id)
+        return set(ids)
+
+    configured = _strict_ids(topology.get("configured_wb_ids"))
+    active = _strict_ids(topology.get("active_mode_wb_ids"))
+    runtime_wb2 = topology.get("runtime_wb2")
+    if (
+        configured is None
+        or active is None
+        or not active.issubset(configured)
+        or not {1, 2}.issubset(configured)
+        or not isinstance(runtime_wb2, dict)
+        or runtime_wb2.get("schema_version") != "wallbox_runtime_wb2_v1"
+        or runtime_wb2.get("valid") is not True
+        or runtime_wb2.get("status_confirmed") is not True
+        or runtime_wb2.get("physical_output_allowed") is not True
+        or str(runtime_wb2.get("source") or "")
+        != "manager_simpleapi_direct"
+    ):
+        return set(), set(), False
+    try:
+        cp_id = int(runtime_wb2.get("cp_id", 0) or 0)
+        peer_cp_id = int(runtime_wb2.get("peer_cp_id", 0) or 0)
+        detected_at = float(runtime_wb2.get("detected_at", 0.0) or 0.0)
+        confirmed_ts = float(
+            runtime_wb2.get("status_confirmed_ts", 0.0) or 0.0
+        )
+    except (TypeError, ValueError):
+        return set(), set(), False
+    output_identity = str(
+        runtime_wb2.get("physical_output_identity") or ""
+    )
+    peer_output_identity = str(
+        runtime_wb2.get("peer_physical_output_identity") or ""
+    )
+    if not (
+        cp_id > 0
+        and peer_cp_id > 0
+        and cp_id != peer_cp_id
+        and detected_at > 0.0
+        and detected_at <= manager_ts + 5.0
+        and confirmed_ts >= detected_at
+        and confirmed_ts <= manager_ts + 5.0
+        and str(runtime_wb2.get("controller_identity") or "")
+        and str(runtime_wb2.get("endpoint_kind") or "")
+        and output_identity
+        and peer_output_identity
+        and output_identity != peer_output_identity
+    ):
+        return set(), set(), False
+    return {2}, ({2} if 2 in active else set()), True
 
 
 def _read_json(path: str, max_age_s: Optional[float] = None) -> Dict[str, Any]:
@@ -2362,14 +2465,22 @@ class ParallelStorageRegulator:
             1: _normalize_wb_mode(self.cfg.get("wb1_mode", 0)),
             2: _normalize_wb_mode(self.cfg.get("wb2_mode", 0)),
         }
-        wb_configured_ids = {
+        persistent_wb_configured_ids = {
             cid for cid in (1, 2)
             if _wallbox_configured(self.cfg, cid)
         }
+        (
+            runtime_wb_configured_ids,
+            runtime_wb_active_mode_ids,
+            wb_runtime_topology_valid,
+        ) = _runtime_wallbox_topology_ids(wb_intent, now_s)
+        wb_configured_ids = (
+            persistent_wb_configured_ids | runtime_wb_configured_ids
+        )
         wb_active_mode_ids = {
-            cid for cid in wb_configured_ids
+            cid for cid in persistent_wb_configured_ids
             if wb_modes.get(cid, 0) != 0
-        }
+        } | runtime_wb_active_mode_ids
         wallbox_ngna = bool(
             not _cfg_bool(self.cfg, "wb_native_enable", False)
             or not wb_configured_ids
@@ -3017,6 +3128,7 @@ class ParallelStorageRegulator:
             "wb_modes": wb_modes,
             "wb_configured_ids": sorted(wb_configured_ids),
             "wb_active_mode_ids": sorted(wb_active_mode_ids),
+            "wb_runtime_topology_valid": bool(wb_runtime_topology_valid),
             "wb_storage_floor_active": wb_storage_floor_active,
             "wb_storage_floor_requested": wb_storage_floor_requested,
             "wb_possible_w": wb_possible_w,

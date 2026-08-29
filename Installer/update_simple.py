@@ -11,6 +11,7 @@ verifizierten Vollbackup durch den heruntergeladenen Zielbaum ersetzt.
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import grp
 import hashlib
@@ -27,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -75,8 +77,27 @@ LEGACY_SERVICE_MIGRATIONS = {
 OPTIONAL_APT_PACKAGES_BY_MODULE = {
     "mqtt": ("mosquitto-clients",),
 }
+SIMPLE_UPDATE_RUNTIME_APT_PACKAGES = ("php-cli",)
 SERVICE_WRAPPER_ACTIONS = ("start", "stop", "restart", "status", "enable", "disable")
+MATTER_RESET_ACTION = "reset-matter-pairing"
+MATTER_RESET_UNIT = "e3dc-matter-bridge.service"
+MATTER_RESET_QUARANTINE_NAME = ".matter-storage-reset-quarantine"
+MATTER_RESET_QUARANTINE_PREPARE_NAME = ".matter-storage-reset-quarantine.prepare"
+MATTER_RESET_RECEIPT_NAME = ".e3dc-matter-reset-transaction.json"
+MATTER_RESET_STAGE_PREFIX = ".matter-storage-reset-stage-"
+MATTER_RESET_PROTECTED_DATA_NAMES = frozenset(
+    {
+        MATTER_RESET_QUARANTINE_NAME,
+        MATTER_RESET_QUARANTINE_PREPARE_NAME,
+        MATTER_RESET_RECEIPT_NAME,
+    }
+)
+MATTER_RESET_PROTECTED_DATA_PREFIXES = (MATTER_RESET_STAGE_PREFIX,)
 ROOT_UPDATE_LOCK = Path("/run/lock/e3dc-control/update.lock")
+UPDATE_LOCK_ENV = "E3DC_UPDATE_LOCK_FD"
+PREJOURNAL_CONSTRUCTION_PATH = Path(
+    "/var/lib/e3dc-update-safety/prejournal-construction.json"
+)
 SERVICE_WRAPPER = Path("/usr/local/sbin/e3dc-service-control")
 WEB_UPDATE_LAUNCHER = Path("/usr/local/sbin/e3dc-web-update-launcher")
 SUDOERS_FILE = Path("/etc/sudoers.d/020_e3dc_services")
@@ -113,7 +134,7 @@ CONFIRMED_HARDWARE_WRITER_SCRIPTS = frozenset(
 )
 
 
-@dataclass(frozen=True)
+@dataclass
 class UpdateFailure(RuntimeError):
     code: str
     happened: str
@@ -195,6 +216,28 @@ class ServicePrestate:
     @property
     def fragment_path_map(self) -> dict[str, str]:
         return dict(self.fragment_paths)
+
+
+@dataclass(frozen=True)
+class DirectoryMetadataPrestate:
+    """Exakter, rückrollbarer Metadatenvertrag eines benannten Verzeichnisses."""
+
+    path: str
+    parent_device: int
+    parent_inode: int
+    device: int
+    inode: int
+    uid: int
+    gid: int
+    mode: int
+
+
+@dataclass(frozen=True)
+class DirectoryMetadataTransition:
+    """Rückfallvertrag einer bestätigten Verzeichnismetadaten-Projektion."""
+
+    previous: DirectoryMetadataPrestate
+    projected: DirectoryMetadataPrestate
 
 
 def _fail(
@@ -733,18 +776,189 @@ def _capture_active_services(target_root: Path | None = None) -> tuple[str, ...]
     return _capture_service_prestate(target_root).active
 
 
+def _open_update_lock_directory(lock_path: Path) -> int:
+    """Bindet oder normalisiert den privaten Update-Locknamespace nofollow."""
+
+    lock_path = Path(lock_path)
+    private_path = lock_path.parent
+    shared_path = private_path.parent
+    if (
+        not lock_path.is_absolute()
+        or lock_path.name != "update.lock"
+        or private_path.name != "e3dc-control"
+        or shared_path.name != "lock"
+    ):
+        raise RuntimeError("Update-Lockpfad weicht vom festen Produktvertrag ab")
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    if not nofollow or not directory:
+        raise RuntimeError("Sichere Update-Lockbindung ist nicht verfügbar")
+    flags = os.O_RDONLY | nofollow | directory | cloexec
+
+    shared_named = os.lstat(shared_path)
+    shared_mode = stat.S_IMODE(shared_named.st_mode)
+    if (
+        stat.S_ISLNK(shared_named.st_mode)
+        or not stat.S_ISDIR(shared_named.st_mode)
+        or shared_named.st_uid != 0
+        or shared_named.st_gid != 0
+        or (
+            shared_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            and not shared_named.st_mode & stat.S_ISVTX
+        )
+    ):
+        raise RuntimeError("Systemweites Update-Lockverzeichnis ist nicht vertrauenswürdig")
+
+    shared_fd = os.open(shared_path, flags)
+    private_fd = -1
+    try:
+        shared_opened = os.fstat(shared_fd)
+        if (
+            (shared_opened.st_dev, shared_opened.st_ino)
+            != (shared_named.st_dev, shared_named.st_ino)
+            or not stat.S_ISDIR(shared_opened.st_mode)
+        ):
+            raise RuntimeError("Systemweiter Update-Locknamespace driftete beim Öffnen")
+        try:
+            os.mkdir(private_path.name, 0o700, dir_fd=shared_fd)
+        except FileExistsError:
+            pass
+
+        private_named = os.stat(
+            private_path.name,
+            dir_fd=shared_fd,
+            follow_symlinks=False,
+        )
+        private_fd = os.open(private_path.name, flags, dir_fd=shared_fd)
+        private_opened = os.fstat(private_fd)
+        private_mode = stat.S_IMODE(private_opened.st_mode)
+        if (
+            not stat.S_ISDIR(private_named.st_mode)
+            or not stat.S_ISDIR(private_opened.st_mode)
+            or (private_named.st_dev, private_named.st_ino)
+            != (private_opened.st_dev, private_opened.st_ino)
+            or private_opened.st_uid != 0
+            or private_opened.st_gid != 0
+            or private_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise RuntimeError("Privater Update-Locknamespace ist nicht sicher bindbar")
+
+        # Ein älterer direkter Ziel-Updater konnte diesen root-eigenen, nicht
+        # fremdbeschreibbaren Ordner mit 0755 anlegen. Genau dieser sichere
+        # Altfall wird auf den gemeinsamen 0700-Vertrag normalisiert.
+        os.fchmod(private_fd, 0o700)
+        os.fsync(private_fd)
+        private_after = os.fstat(private_fd)
+        private_rebound = os.stat(
+            private_path.name,
+            dir_fd=shared_fd,
+            follow_symlinks=False,
+        )
+        if (
+            (private_after.st_dev, private_after.st_ino)
+            != (private_opened.st_dev, private_opened.st_ino)
+            or (private_rebound.st_dev, private_rebound.st_ino)
+            != (private_opened.st_dev, private_opened.st_ino)
+            or private_after.st_uid != 0
+            or private_after.st_gid != 0
+            or stat.S_IMODE(private_after.st_mode) != 0o700
+        ):
+            raise RuntimeError("Privater Update-Locknamespace blieb nach der Bindung abweichend")
+        result = private_fd
+        private_fd = -1
+        return result
+    finally:
+        if private_fd >= 0:
+            os.close(private_fd)
+        os.close(shared_fd)
+
+
 def _acquire_update_lock() -> int:
     """Verhindert genau einen konkurrierenden alten oder neuen Updatelauf."""
 
-    ROOT_UPDATE_LOCK.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(
-        ROOT_UPDATE_LOCK,
-        os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
-        0o600,
-    )
     try:
-        os.fchown(descriptor, 0, 0)
-        os.fchmod(descriptor, 0o600)
+        directory_fd = _open_update_lock_directory(ROOT_UPDATE_LOCK)
+        try:
+            before = None
+            try:
+                before = os.stat(
+                    ROOT_UPDATE_LOCK.name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            descriptor = os.open(
+                ROOT_UPDATE_LOCK.name,
+                os.O_RDWR
+                | os.O_CREAT
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=directory_fd,
+            )
+            opened = os.fstat(descriptor)
+            named = os.stat(
+                ROOT_UPDATE_LOCK.name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or not stat.S_ISREG(named.st_mode)
+                or opened.st_nlink != 1
+                or opened.st_uid != 0
+                or opened.st_gid != 0
+                or stat.S_IMODE(opened.st_mode) & (stat.S_IWGRP | stat.S_IWOTH)
+                or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+                or (
+                    before is not None
+                    and (
+                        not stat.S_ISREG(before.st_mode)
+                        or before.st_nlink != 1
+                        or before.st_uid != 0
+                        or before.st_gid != 0
+                        or stat.S_IMODE(before.st_mode) & (stat.S_IWGRP | stat.S_IWOTH)
+                        or (before.st_dev, before.st_ino)
+                        != (opened.st_dev, opened.st_ino)
+                    )
+                )
+            ):
+                raise RuntimeError("Update-Lockdatei besitzt keinen sicheren Vertrag")
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+            secured = os.fstat(descriptor)
+            rebound = os.stat(
+                ROOT_UPDATE_LOCK.name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if (
+                (secured.st_dev, secured.st_ino)
+                != (rebound.st_dev, rebound.st_ino)
+                or secured.st_nlink != 1
+                or secured.st_uid != 0
+                or secured.st_gid != 0
+                or stat.S_IMODE(secured.st_mode) != 0o600
+            ):
+                raise RuntimeError("Update-Lockdatei driftete nach der Bindung")
+        finally:
+            os.close(directory_fd)
+    except Exception as exc:
+        if "descriptor" in locals():
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        _fail(
+            "E3DC-UPD-LOCK-001",
+            f"Der gemeinsame Update-Lock ist nicht sicher bindbar: {exc}",
+            "Prüfe /run/lock/e3dc-control auf einen echten root-eigenen Ordner und starte danach denselben Updatebefehl erneut.",
+        )
+
+    try:
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         os.close(descriptor)
@@ -757,6 +971,21 @@ def _acquire_update_lock() -> int:
         os.close(descriptor)
         raise
     return descriptor
+
+
+@contextmanager
+def _bound_update_lock_environment(descriptor: int):
+    """Reicht den gehaltenen Lock nur an synchrone Backup-Primitiven weiter."""
+
+    previous = os.environ.get(UPDATE_LOCK_ENV)
+    os.environ[UPDATE_LOCK_ENV] = str(int(descriptor))
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(UPDATE_LOCK_ENV, None)
+        else:
+            os.environ[UPDATE_LOCK_ENV] = previous
 
 
 def _load_policy(release_root: Path) -> dict:
@@ -777,24 +1006,34 @@ def _load_policy(release_root: Path) -> dict:
     return policy
 
 
-def _load_existing_config(target_root: Path) -> dict:
-    """Liest nur vorhandene Nutzereinstellungen; ungültige Altdateien blockieren nicht."""
+def _load_existing_config(
+    target_root: Path,
+    target_binding: DirectoryMetadataPrestate,
+) -> dict:
+    """Liest Alt-Konfigurationen nofollow; syntaktische Altfehler bleiben reparierbar."""
 
     merged: dict = {}
-    paths = (
-        target_root / "Installer/installer_config.json",
-        Path("/var/www/html/data/e3dc_v4.json"),
+    readers = (
+        (
+            target_root / "Installer/installer_config.json",
+            lambda: _read_live_installer_json(
+                target_binding,
+                "installer_config.json",
+                missing_ok=True,
+            ),
+        ),
+        (
+            Path("/var/www/html/data/e3dc_v4.json"),
+            lambda: _read_live_web_v4_json(missing_ok=True),
+        ),
     )
-    for path in paths:
+    for path, reader in readers:
         try:
-            value = json.loads(path.read_text(encoding="utf-8-sig"))
+            value = reader()
         except FileNotFoundError:
             continue
         except (OSError, UnicodeError, ValueError) as exc:
             print(f"[WARNUNG] Bestehende Konfiguration ist nicht lesbar ({path}): {exc}")
-            continue
-        if not isinstance(value, dict):
-            print(f"[WARNUNG] Bestehende Konfiguration ist kein Objekt: {path}")
             continue
         nested = value.get("config")
         if isinstance(nested, dict):
@@ -944,15 +1183,30 @@ def _validate_inputs(
         )
 
 
-def _create_backup(target_root: Path) -> Path:
+def _create_backup(
+    target_root: Path,
+    target_binding: DirectoryMetadataPrestate,
+) -> Path:
     print("[1/4] Erstelle verifiziertes Vollbackup …", flush=True)
     try:
         from Installer.backup import REPAIR_UPDATE_BACKUP_PROFILE, backup_current_version
 
+        def verify_source_binding(*_args: object) -> None:
+            _assert_named_directory_binding(target_binding)
+
+        verify_source_binding()
         backup = backup_current_version(
             install_path=str(target_root),
             profile=REPAIR_UPDATE_BACKUP_PROFILE,
+            verified_pre_chown_callback=verify_source_binding,
+            expected_install_root_identity=(
+                target_binding.parent_device,
+                target_binding.parent_inode,
+                target_binding.device,
+                target_binding.inode,
+            ),
         )
+        verify_source_binding()
     except Exception as exc:
         detail = str(exc).strip() or exc.__class__.__name__
         normalized = detail.lower()
@@ -1031,6 +1285,9 @@ def _validated_apt_packages(
                 ):
                     packages.append(package)
     for package in sorted(selected_optional_packages):
+        if package not in packages:
+            packages.append(package)
+    for package in SIMPLE_UPDATE_RUNTIME_APT_PACKAGES:
         if package not in packages:
             packages.append(package)
     return tuple(packages)
@@ -1704,6 +1961,20 @@ def _clear_legacy_update_blockers(backup_path: Path) -> Path | None:
     return quarantine if archived else None
 
 
+def _assert_no_prejournal_construction_state() -> None:
+    """Vermischt den Simple-Updater nie mit einem laufenden Full-Updater-Präfix."""
+
+    if not os.path.lexists(PREJOURNAL_CONSTRUCTION_PATH):
+        return
+    _fail(
+        "E3DC-UPD-PREJOURNAL-001",
+        "Ein unterbrochener Aufbau des regulären Update-Recovery-Journals ist noch offen.",
+        "Lösche keine Recovery-Datei und kein Backup manuell. Starte den regulären "
+        "E3DC-Control-Updater für dieselbe Installation erneut; nur dieser kann den "
+        "gebundenen Vorbereitungszustand sicher fortsetzen oder bereinigen.",
+    )
+
+
 def _disable_competing_controllers(
     role: str,
     extra_units: Iterable[str] = (),
@@ -1907,7 +2178,11 @@ def _confirm_cutover_quiet(extra_units: Iterable[str] = ()) -> None:
         )
 
 
-def _create_stopped_data_backup(target_root: Path, backup_path: Path) -> tuple[Path, object]:
+def _create_stopped_data_backup(
+    target_root: Path,
+    backup_path: Path,
+    target_binding: DirectoryMetadataPrestate,
+) -> tuple[Path, object]:
     """Sichert nach bestätigtem Stopp nur noch die zuletzt veränderbaren Daten."""
 
     from Installer.backup import create_quiesced_overlay
@@ -1927,8 +2202,86 @@ def _create_stopped_data_backup(target_root: Path, backup_path: Path) -> tuple[P
         transaction_id=transaction,
         parent_backup_dir=backup_path,
         parent_backup_id=str(manifest.get("backup_id") or ""),
+        expected_install_root_identity=(
+            target_binding.parent_device,
+            target_binding.parent_inode,
+            target_binding.device,
+            target_binding.inode,
+        ),
     )
     return Path(created), guard
+
+
+def _remove_stopped_data_backup(overlay_path: Path, guard: object) -> None:
+    """Entfernt nur das terminal bestätigte, vollständig guardgebundene Overlay."""
+
+    from Installer.backup_retention import delete_bound_quiesced_overlay
+
+    delete_bound_quiesced_overlay(overlay_path, guard=guard)  # type: ignore[arg-type]
+    if os.path.lexists(str(overlay_path)):
+        raise RuntimeError(
+            "Ruhende Daten-Nachsicherung blieb nach bestätigtem Cleanup vorhanden"
+        )
+
+
+def _retry_backup_retention_after_confirmed_start(
+    target_root: Path,
+    backup_path: Path,
+    quiesced_backup: Path | None,
+    lock_descriptor: int,
+) -> list[str]:
+    """Rotiert nach dem Neustart best-effort und schützt den aktuellen Rückweg."""
+
+    warnings: list[str] = []
+    preserve_paths = [backup_path]
+    if quiesced_backup is not None:
+        preserve_paths.append(quiesced_backup)
+    try:
+        from Installer.backup_retention import prune_install_backups
+
+        with _bound_update_lock_environment(lock_descriptor):
+            retention = prune_install_backups(
+                target_root,
+                backup_root=backup_path.parent,
+                preserve_paths=preserve_paths,
+            )
+        if not isinstance(retention, dict):
+            raise RuntimeError("Backup-Retention lieferte keinen Ergebnisvertrag")
+    except Exception as exc:
+        detail = str(exc).strip() or exc.__class__.__name__
+        return [
+            "Der bestätigte neue Release bleibt aktiv; der nachgelagerte "
+            "Backup-Limit-Lauf konnte nicht ausgeführt werden: {}. Das aktuelle "
+            "Vollbackup und eine gegebenenfalls verbliebene ruhende "
+            "Daten-Nachsicherung bleiben erhalten.".format(detail)
+        ]
+
+    if retention.get("blocked"):
+        warnings.append(
+            "Der bestätigte neue Release bleibt aktiv; der nachgelagerte "
+            "Backup-Limit-Lauf war noch blockiert: {}.".format(
+                retention.get("blocker")
+                or "Updateabschluss oder Recovery-Zustand ist noch offen"
+            )
+        )
+    if retention.get("success") is not True:
+        warnings.append(
+            "Der bestätigte neue Release bleibt aktiv; der nachgelagerte "
+            "Backup-Limit-Lauf meldete einen Bereinigungsfehler. Das aktuelle "
+            "Vollbackup bleibt geschützt."
+        )
+    if retention.get("limit_satisfied") is not True:
+        warnings.append(
+            "Die Grenze von maximal drei verifizierten System-Backup-Familien "
+            "und drei Web-Sicherungen ist noch offen; geschützte oder nicht "
+            "sicher klassifizierbare Sicherungen wurden nicht gelöscht."
+        )
+    if not warnings:
+        print(
+            "[OK] Backup-Limit nach bestätigtem Dienststart angewendet.",
+            flush=True,
+        )
+    return warnings
 
 
 def _fd_mount_id(descriptor: int) -> str:
@@ -2016,6 +2369,7 @@ def _project_regular_file(
     uid: int,
     gid: int,
     mode: int | None = None,
+    executable_from_shebang: bool = False,
 ) -> None:
     """Publiziert eine neue Inode; Ziel-Hardlinks und Symlink-Referenten bleiben unberührt."""
 
@@ -2061,6 +2415,20 @@ def _project_regular_file(
             elif not stat.S_ISLNK(target_metadata.st_mode):
                 _projection_failure(display_path, "Spezialdatei steht anstelle einer Release-Datei")
 
+        if mode is not None and executable_from_shebang:
+            raise RuntimeError(
+                "Releaseprojektion besitzt zwei widersprüchliche Dateimodusregeln"
+            )
+        if executable_from_shebang:
+            header = os.pread(source_fd, 2, 0)
+            final_mode = 0o755 if header == b"#!" else 0o644
+        else:
+            final_mode = (
+                stat.S_IMODE(source_opened.st_mode) & 0o777
+                if mode is None
+                else mode
+            )
+
         temporary_fd = os.open(
             temporary_name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | cloexec,
@@ -2074,11 +2442,6 @@ def _project_regular_file(
             offset = 0
             while offset < len(chunk):
                 offset += os.write(temporary_fd, chunk[offset:])
-        final_mode = (
-            stat.S_IMODE(source_opened.st_mode) & 0o777
-            if mode is None
-            else mode
-        )
         os.fchown(temporary_fd, uid, gid)
         os.fchmod(temporary_fd, final_mode)
         os.fsync(temporary_fd)
@@ -2089,6 +2452,17 @@ def _project_regular_file(
             dst_dir_fd=parent_fd,
         )
         os.fsync(parent_fd)
+        published = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(published.st_mode)
+            or published.st_nlink != 1
+            or published.st_uid != uid
+            or published.st_gid != gid
+            or stat.S_IMODE(published.st_mode) != final_mode
+        ):
+            raise RuntimeError(
+                f"Projizierte Release-Datei besitzt falsche Metadaten: {display_path}"
+            )
         replaced = True
     finally:
         os.close(source_fd)
@@ -2183,8 +2557,10 @@ def _project_release_tree(
     root_mode: int,
     directory_mode: int | None = None,
     file_mode: int | None = None,
+    executable_from_shebang: bool = False,
     excluded_top_level: frozenset[str] = frozenset(),
-) -> None:
+    expected_target_binding: DirectoryMetadataPrestate | None = None,
+) -> DirectoryMetadataPrestate:
     """Projiziert Release-Dateien fd-relativ, nofollow und mountgebunden."""
 
     nofollow = getattr(os, "O_NOFOLLOW", 0)
@@ -2192,12 +2568,27 @@ def _project_release_tree(
     cloexec = getattr(os, "O_CLOEXEC", 0)
     if not nofollow or not directory:
         raise RuntimeError("Sichere fd-relative Releaseprojektion ist nicht verfügbar")
+    if file_mode is not None and executable_from_shebang:
+        raise RuntimeError(
+            "Releaseprojektion besitzt zwei widersprüchliche Dateimodusregeln"
+        )
     source_root = source_root.resolve(strict=True)
-    target_root.mkdir(parents=True, exist_ok=True)
-    root_fd = os.open(target_root, os.O_RDONLY | nofollow | directory | cloexec)
-    completed = False
+    target_root = Path(os.path.normpath(os.path.abspath(str(target_root))))
+    if expected_target_binding is None:
+        target_root.mkdir(parents=True, exist_ok=True)
+    elif str(target_root) != expected_target_binding.path:
+        raise RuntimeError("Releaseprojektion erhielt einen fremden Zielpfadvertrag")
+    parent_fd, root_fd, parent_metadata, root_metadata = _open_bound_named_directory(
+        target_root
+    )
+    original = _directory_prestate(target_root, root_metadata, parent_metadata)
+    if expected_target_binding is not None and original != expected_target_binding:
+        os.close(root_fd)
+        os.close(parent_fd)
+        raise RuntimeError(
+            f"Der Produktstamm driftete vor der Releaseprojektion: {target_root}"
+        )
     try:
-        root_metadata = os.fstat(root_fd)
         root_device = root_metadata.st_dev
         root_mount_id = _fd_mount_id(root_fd)
         os.fchown(root_fd, 0, 0)
@@ -2230,6 +2621,15 @@ def _project_release_tree(
                         os.fchown(child_fd, uid, gid)
                         os.fchmod(child_fd, mode)
                         os.fsync(child_fd)
+                        secured = os.fstat(child_fd)
+                        if (
+                            secured.st_uid != uid
+                            or secured.st_gid != gid
+                            or stat.S_IMODE(secured.st_mode) != mode
+                        ):
+                            raise RuntimeError(
+                                f"Projiziertes Release-Verzeichnis besitzt falsche Metadaten: {display}"
+                            )
                     finally:
                         os.close(child_fd)
                 elif stat.S_ISREG(metadata.st_mode):
@@ -2243,6 +2643,7 @@ def _project_release_tree(
                         uid=uid,
                         gid=gid,
                         mode=file_mode,
+                        executable_from_shebang=executable_from_shebang,
                     )
                 elif stat.S_ISLNK(metadata.st_mode):
                     _project_release_symlink(
@@ -2264,37 +2665,701 @@ def _project_release_tree(
         os.fchown(root_fd, uid, gid)
         os.fchmod(root_fd, root_mode)
         os.fsync(root_fd)
-        completed = True
+        secured_root = os.fstat(root_fd)
+        if (
+            secured_root.st_uid != uid
+            or secured_root.st_gid != gid
+            or stat.S_IMODE(secured_root.st_mode) != root_mode
+        ):
+            raise RuntimeError(
+                f"Projizierter Release-Stamm besitzt falsche Metadaten: {target_root}"
+            )
+        rebound = _read_bound_directory_prestate(target_root)
+        if (
+            rebound.parent_device != original.parent_device
+            or rebound.parent_inode != original.parent_inode
+            or rebound.device != secured_root.st_dev
+            or rebound.inode != secured_root.st_ino
+            or rebound.uid != uid
+            or rebound.gid != gid
+            or rebound.mode != root_mode
+        ):
+            raise RuntimeError(
+                f"Der benannte Release-Stamm driftete während der Projektion: {target_root}"
+            )
+        return rebound
+    except Exception as original_error:
+        rollback_error: Exception | None = None
+        try:
+            os.fchown(root_fd, root_metadata.st_uid, root_metadata.st_gid)
+            os.fchmod(root_fd, stat.S_IMODE(root_metadata.st_mode))
+            os.fsync(root_fd)
+            restored = os.fstat(root_fd)
+            if (
+                restored.st_uid != root_metadata.st_uid
+                or restored.st_gid != root_metadata.st_gid
+                or stat.S_IMODE(restored.st_mode)
+                != stat.S_IMODE(root_metadata.st_mode)
+            ):
+                raise RuntimeError("Metadaten des gebundenen Zielstamms blieben abweichend")
+        except Exception as exc:
+            rollback_error = exc
+        if rollback_error is not None:
+            raise RuntimeError(
+                "Die Releaseprojektion scheiterte und die Metadaten des gebundenen "
+                f"Zielstamms konnten nicht sicher zurückgestellt werden: {target_root} "
+                f"({rollback_error})"
+            ) from original_error
+        raise
     finally:
-        if not completed:
-            try:
-                os.fchown(root_fd, root_metadata.st_uid, root_metadata.st_gid)
-                os.fchmod(root_fd, stat.S_IMODE(root_metadata.st_mode))
-            except (OSError, UnboundLocalError):
-                pass
         os.close(root_fd)
+        os.close(parent_fd)
 
 
 def _replace_product_tree(
     target_root: Path,
     release_root: Path,
     install_user: str,
-) -> None:
+    expected_target_binding: DirectoryMetadataPrestate,
+) -> DirectoryMetadataPrestate:
     """Projiziert den Zielbaum; vorhandene Git-Metadaten bleiben unbeachtet."""
 
     account = pwd.getpwnam(install_user)
     web_gid = grp.getgrnam("www-data").gr_gid
-    _project_release_tree(
+    return _project_release_tree(
         release_root,
         target_root,
         uid=account.pw_uid,
         gid=web_gid,
         root_mode=0o755,
+        directory_mode=0o755,
+        executable_from_shebang=True,
         excluded_top_level=frozenset({".git"}),
+        expected_target_binding=expected_target_binding,
     )
 
 
-def _delete_approved_stale_paths(target_root: Path, policy: dict) -> None:
+def _open_absolute_directory_chain(path: Path) -> int:
+    """Öffnet einen absoluten Verzeichnispfad komponentenweise ohne Symlinks."""
+
+    normalized = Path(os.path.normpath(os.path.abspath(str(path))))
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    flags = os.O_RDONLY | nofollow | directory | getattr(os, "O_CLOEXEC", 0)
+    if not nofollow or not directory or not normalized.is_absolute():
+        raise RuntimeError("Sichere Verzeichnisbindung ist nicht verfügbar")
+    descriptor = os.open(os.sep, flags)
+    try:
+        for component in normalized.parts[1:]:
+            named = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            if not stat.S_ISDIR(named.st_mode):
+                raise RuntimeError(
+                    f"Pfadkomponente ist kein echtes Verzeichnis: {normalized}"
+                )
+            child = os.open(component, flags, dir_fd=descriptor)
+            opened = os.fstat(child)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (named.st_dev, named.st_ino)
+            ):
+                os.close(child)
+                raise RuntimeError(
+                    f"Pfadkomponente driftete beim Öffnen: {normalized}"
+                )
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _open_bound_named_directory(
+    path: Path,
+) -> tuple[int, int, os.stat_result, os.stat_result]:
+    """Bindet Elternpfad und benanntes Verzeichnis ohne Symlinkauflösung."""
+
+    normalized = Path(os.path.normpath(os.path.abspath(str(path))))
+    if normalized == Path(os.sep):
+        raise RuntimeError("Der Dateisystemstamm ist kein zulässiger Produktpfad")
+    parent = _open_absolute_directory_chain(normalized.parent)
+    descriptor = -1
+    try:
+        parent_metadata = os.fstat(parent)
+        named = os.stat(normalized.name, dir_fd=parent, follow_symlinks=False)
+        descriptor = os.open(
+            normalized.name,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent,
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(named.st_mode)
+            or not stat.S_ISDIR(opened.st_mode)
+            or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise RuntimeError(f"Verzeichnis driftete beim Öffnen: {normalized}")
+        return parent, descriptor, parent_metadata, opened
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent)
+        raise
+
+
+def _directory_prestate(
+    path: Path,
+    metadata: os.stat_result,
+    parent_metadata: os.stat_result,
+) -> DirectoryMetadataPrestate:
+    return DirectoryMetadataPrestate(
+        path=str(path),
+        parent_device=int(parent_metadata.st_dev),
+        parent_inode=int(parent_metadata.st_ino),
+        device=int(metadata.st_dev),
+        inode=int(metadata.st_ino),
+        uid=int(metadata.st_uid),
+        gid=int(metadata.st_gid),
+        mode=int(stat.S_IMODE(metadata.st_mode)),
+    )
+
+
+def _read_bound_directory_prestate(path: Path) -> DirectoryMetadataPrestate:
+    normalized = Path(os.path.normpath(os.path.abspath(str(path))))
+    parent, descriptor, parent_metadata, opened = _open_bound_named_directory(
+        normalized
+    )
+    try:
+        return _directory_prestate(normalized, opened, parent_metadata)
+    finally:
+        os.close(descriptor)
+        os.close(parent)
+
+
+def _assert_named_directory_binding(expected: DirectoryMetadataPrestate) -> None:
+    """Bestätigt Namen, Elternpfad, Inode und Metadaten eines Verzeichnisses."""
+
+    current = _read_bound_directory_prestate(Path(expected.path))
+    if current != expected:
+        raise RuntimeError(
+            "Der gebundene Installationspfad änderte sich während des Updates: "
+            f"{expected.path}"
+        )
+
+
+def _assert_named_directory_identity(expected: DirectoryMetadataPrestate) -> None:
+    """Bestätigt Elternpfad und Inode, auch wenn Restore Metadaten ändert."""
+
+    current = _read_bound_directory_prestate(Path(expected.path))
+    if (
+        current.parent_device != expected.parent_device
+        or current.parent_inode != expected.parent_inode
+        or current.device != expected.device
+        or current.inode != expected.inode
+    ):
+        raise RuntimeError(
+            "Der gebundene Installationspfad wurde durch einen anderen Baum ersetzt: "
+            f"{expected.path}"
+        )
+
+
+def _web_account_can_traverse_bound_directory(
+    expected: DirectoryMetadataPrestate,
+) -> bool:
+    """Prüft x-only-Zugriff als www-data auf exakt dem gebundenen Inode."""
+
+    runuser = Path("/usr/sbin/runuser")
+    test_binary = Path("/usr/bin/test")
+    if not runuser.is_file() or not os.access(runuser, os.X_OK):
+        raise RuntimeError("runuser fehlt für die gebundene Webzugriffsprüfung")
+    if not test_binary.is_file() or not os.access(test_binary, os.X_OK):
+        raise RuntimeError("/usr/bin/test fehlt für die gebundene Webzugriffsprüfung")
+
+    path = Path(expected.path)
+    parent, descriptor, parent_metadata, opened = _open_bound_named_directory(path)
+    try:
+        current = _directory_prestate(path, opened, parent_metadata)
+        if current != expected:
+            raise RuntimeError(
+                f"Installationspfad-Vorfahre driftete vor der Webzugriffsprüfung: {path}"
+            )
+        try:
+            result = subprocess.run(
+                [
+                    os.fspath(runuser),
+                    "-u",
+                    "www-data",
+                    "--",
+                    "/usr/bin/env",
+                    "-i",
+                    "PATH=/usr/bin:/bin",
+                    os.fspath(test_binary),
+                    "-x",
+                    f"/proc/self/fd/{descriptor}",
+                ],
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                check=False,
+                timeout=20,
+                pass_fds=(descriptor,),
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(
+                f"Webzugriff auf Installationspfad-Vorfahre konnte nicht geprüft werden: {path}"
+            ) from exc
+        rebound = _read_bound_directory_prestate(path)
+        if rebound != expected or _directory_prestate(path, os.fstat(descriptor), parent_metadata) != expected:
+            raise RuntimeError(
+                f"Installationspfad-Vorfahre driftete während der Webzugriffsprüfung: {path}"
+            )
+        return result.returncode == 0
+    finally:
+        os.close(descriptor)
+        os.close(parent)
+
+
+def _bound_directory_has_extended_acl(
+    expected: DirectoryMetadataPrestate,
+) -> bool:
+    """Erkennt ACLs am exakt gebundenen Vorfahren vor jeder chmod-Mutation."""
+
+    path = Path(expected.path)
+    parent, descriptor, parent_metadata, opened = _open_bound_named_directory(path)
+    try:
+        if _directory_prestate(path, opened, parent_metadata) != expected:
+            raise RuntimeError(
+                f"Installationspfad-Vorfahre driftete vor der ACL-Prüfung: {path}"
+            )
+        try:
+            names = set(os.listxattr(descriptor))
+        except OSError as exc:
+            if exc.errno in {errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP}:
+                names = set()
+            else:
+                raise RuntimeError(
+                    f"ACLs des Installationspfad-Vorfahren konnten nicht gebunden geprüft werden: {path}"
+                ) from exc
+        rebound = _read_bound_directory_prestate(path)
+        if rebound != expected or _directory_prestate(path, os.fstat(descriptor), parent_metadata) != expected:
+            raise RuntimeError(
+                f"Installationspfad-Vorfahre driftete während der ACL-Prüfung: {path}"
+            )
+        return bool(
+            {"system.posix_acl_access", "system.posix_acl_default"} & names
+        )
+    finally:
+        os.close(descriptor)
+        os.close(parent)
+
+
+def _web_traversal_projection_strategy(
+    previous: DirectoryMetadataPrestate,
+    *,
+    install_user: str,
+    install_uid: int,
+    web_gid: int,
+) -> str:
+    """Klassifiziert eine enge Pfadfreigabe, ohne globale Rechte zu öffnen."""
+
+    if previous.mode & 0o001 or (
+        previous.gid == int(web_gid) and previous.mode & 0o010
+    ) or _web_account_can_traverse_bound_directory(previous):
+        return "ready"
+    if previous.uid != int(install_uid):
+        raise RuntimeError(
+            "Ein nicht traversierbarer Installationspfad-Vorfahre gehört nicht "
+            f"dem Installationsbenutzer: {previous.path}"
+        )
+
+    if _bound_directory_has_extended_acl(previous):
+        quoted = shlex.quote(previous.path)
+        raise RuntimeError(
+            "Ein Installationspfad-Vorfahre mit vorhandener POSIX-ACL wird "
+            "nicht automatisch per chgrp/chmod verändert: "
+            f"{previous.path}. Ergänze gezielt den bestehenden ACL-Vertrag "
+            f"(`sudo setfacl -m u:www-data:--x -- {quoted}`) und starte "
+            "denselben Updatebefehl erneut."
+        )
+
+    group_has_other_users = any(
+        entry.pw_name != install_user and entry.pw_gid == previous.gid
+        for entry in pwd.getpwall()
+    )
+    try:
+        group_has_other_users = group_has_other_users or any(
+            member != install_user
+            for member in grp.getgrgid(previous.gid).gr_mem
+        )
+    except KeyError:
+        group_has_other_users = True
+
+    if previous.gid == int(web_gid):
+        return "web-group"
+    if not group_has_other_users and not (previous.mode & stat.S_ISGID):
+        return "private-group-rebind"
+    quoted = shlex.quote(previous.path)
+    raise RuntimeError(
+        "Ein gemeinsam genutzter oder setgid-Installationspfad-Vorfahre kann "
+        "nicht automatisch freigegeben werden, ohne globale Rechte zu öffnen: "
+        f"{previous.path}. Richte gezielt eine POSIX-ACL ein "
+        f"(`sudo setfacl -m u:www-data:--x -- {quoted}`) oder verlege den "
+        "Installationspfad unter einen owner-privaten, nicht-setgid Vorfahren."
+    )
+
+
+def _apply_bound_directory_transition(
+    expected: DirectoryMetadataPrestate,
+    *,
+    uid: int,
+    gid: int,
+    mode: int,
+) -> DirectoryMetadataPrestate:
+    """Ändert nur den exakt erwarteten Inode und bindet seinen Namen erneut."""
+
+    path = Path(expected.path)
+    parent = _open_absolute_directory_chain(path.parent)
+    descriptor = -1
+    rebound_parent = -1
+    changed = False
+    try:
+        parent_before = os.fstat(parent)
+        named = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent,
+        )
+        opened = os.fstat(descriptor)
+        current = _directory_prestate(path, opened, parent_before)
+        if (
+            not stat.S_ISDIR(named.st_mode)
+            or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+            or current != expected
+        ):
+            raise RuntimeError(f"Verzeichnismetadaten drifteten: {path}")
+        os.fchown(descriptor, int(uid), int(gid))
+        changed = True
+        os.fchmod(descriptor, int(mode))
+        os.fsync(descriptor)
+        after = os.fstat(descriptor)
+        projected = _directory_prestate(path, after, parent_before)
+        rebound_parent = _open_absolute_directory_chain(path.parent)
+        rebound_parent_metadata = os.fstat(rebound_parent)
+        rebound = os.stat(path.name, dir_fd=rebound_parent, follow_symlinks=False)
+        if (
+            (rebound_parent_metadata.st_dev, rebound_parent_metadata.st_ino)
+            != (parent_before.st_dev, parent_before.st_ino)
+            or (after.st_dev, after.st_ino) != (expected.device, expected.inode)
+            or (rebound.st_dev, rebound.st_ino) != (after.st_dev, after.st_ino)
+            or projected.uid != int(uid)
+            or projected.gid != int(gid)
+            or projected.mode != int(mode)
+            or rebound.st_uid != int(uid)
+            or rebound.st_gid != int(gid)
+            or stat.S_IMODE(rebound.st_mode) != int(mode)
+        ):
+            raise RuntimeError(f"Verzeichnismetadaten blieben abweichend: {path}")
+        return projected
+    except Exception as original_error:
+        if changed and descriptor >= 0:
+            rollback_error: Exception | None = None
+            try:
+                os.fchown(descriptor, expected.uid, expected.gid)
+                os.fchmod(descriptor, expected.mode)
+                os.fsync(descriptor)
+                restored = os.fstat(descriptor)
+                restored_parent = _open_absolute_directory_chain(path.parent)
+                try:
+                    restored_parent_metadata = os.fstat(restored_parent)
+                    restored_named = os.stat(
+                        path.name,
+                        dir_fd=restored_parent,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        (restored_parent_metadata.st_dev, restored_parent_metadata.st_ino)
+                        != (expected.parent_device, expected.parent_inode)
+                        or (restored.st_dev, restored.st_ino)
+                        != (expected.device, expected.inode)
+                        or (restored_named.st_dev, restored_named.st_ino)
+                        != (expected.device, expected.inode)
+                        or restored.st_uid != expected.uid
+                        or restored.st_gid != expected.gid
+                        or stat.S_IMODE(restored.st_mode) != expected.mode
+                        or restored_named.st_uid != expected.uid
+                        or restored_named.st_gid != expected.gid
+                        or stat.S_IMODE(restored_named.st_mode) != expected.mode
+                    ):
+                        raise RuntimeError(
+                            f"Verzeichnismetadaten wurden nicht vollständig restauriert: {path}"
+                        )
+                finally:
+                    os.close(restored_parent)
+            except Exception as exc:
+                rollback_error = exc
+            if rollback_error is not None:
+                raise RuntimeError(
+                    "Die Verzeichnismetadaten-Projektion scheiterte und ihr lokaler "
+                    f"Rückfall blieb unvollständig: {path} ({rollback_error})"
+                ) from original_error
+        raise
+    finally:
+        if rebound_parent >= 0:
+            os.close(rebound_parent)
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent)
+
+
+def _project_web_home_traversal(
+    install_user: str,
+    target_root: Path,
+) -> tuple[DirectoryMetadataTransition, ...]:
+    """Gibt www-data nur auf echten nötigen Pfadvorfahren Traversierrecht."""
+
+    account = pwd.getpwnam(install_user)
+    home = Path(os.path.normpath(os.path.abspath(account.pw_dir)))
+    normalized_target = Path(os.path.normpath(os.path.abspath(str(target_root))))
+    try:
+        relative_to_home = normalized_target.relative_to(home)
+    except ValueError:
+        return ()
+    if not relative_to_home.parts:
+        return ()
+
+    ancestors = [home]
+    current = home
+    for component in relative_to_home.parts[:-1]:
+        current /= component
+        ancestors.append(current)
+
+    web_gid = int(grp.getgrnam("www-data").gr_gid)
+    plan: list[tuple[DirectoryMetadataPrestate, str]] = []
+    for ancestor in ancestors:
+        previous = _read_bound_directory_prestate(ancestor)
+        strategy = _web_traversal_projection_strategy(
+            previous,
+            install_user=install_user,
+            install_uid=int(account.pw_uid),
+            web_gid=web_gid,
+        )
+        plan.append((previous, strategy))
+
+    transitions: list[DirectoryMetadataTransition] = []
+    try:
+        for previous, strategy in plan:
+            if strategy == "ready":
+                transitions.append(
+                    DirectoryMetadataTransition(previous=previous, projected=previous)
+                )
+                continue
+            if strategy == "web-group":
+                desired_gid = web_gid
+                desired_mode = previous.mode | 0o010
+            elif strategy == "private-group-rebind":
+                desired_gid = web_gid
+                desired_mode = (previous.mode & ~0o070) | 0o010
+            else:
+                raise RuntimeError(
+                    f"Unbekannte Traversal-Projektionsstrategie: {strategy}"
+                )
+
+            projected = _apply_bound_directory_transition(
+                previous,
+                uid=previous.uid,
+                gid=desired_gid,
+                mode=desired_mode,
+            )
+            transitions.append(
+                DirectoryMetadataTransition(previous=previous, projected=projected)
+            )
+        return tuple(transitions)
+    except Exception as original_error:
+        try:
+            _restore_web_home_traversal(tuple(transitions))
+        except Exception as rollback_error:
+            raise RuntimeError(
+                "Die Traversierrechte-Projektion scheiterte und der Rückfall ihrer "
+                f"bereits geänderten Vorfahren blieb unvollständig ({rollback_error})"
+            ) from original_error
+        raise
+
+
+def _preflight_web_home_traversal(install_user: str, target_root: Path) -> None:
+    """Belegt vor Backup und Cutover, dass keine globale Freigabe nötig wird."""
+
+    account = pwd.getpwnam(install_user)
+    home = Path(os.path.normpath(os.path.abspath(account.pw_dir)))
+    normalized_target = Path(os.path.normpath(os.path.abspath(str(target_root))))
+    try:
+        relative_to_home = normalized_target.relative_to(home)
+    except ValueError:
+        return
+    if not relative_to_home.parts:
+        return
+    current = home
+    ancestors = [home]
+    for component in relative_to_home.parts[:-1]:
+        current /= component
+        ancestors.append(current)
+    web_gid = int(grp.getgrnam("www-data").gr_gid)
+    for ancestor in ancestors:
+        previous = _read_bound_directory_prestate(ancestor)
+        _web_traversal_projection_strategy(
+            previous,
+            install_user=install_user,
+            install_uid=int(account.pw_uid),
+            web_gid=web_gid,
+        )
+
+
+def _restore_web_home_traversal(
+    transitions: Iterable[DirectoryMetadataTransition] | None,
+) -> None:
+    failures: list[str] = []
+    for transition in reversed(tuple(transitions or ())):
+        if transition.previous == transition.projected:
+            continue
+        try:
+            _apply_bound_directory_transition(
+                transition.projected,
+                uid=transition.previous.uid,
+                gid=transition.previous.gid,
+                mode=transition.previous.mode,
+            )
+        except Exception as exc:
+            failures.append(f"{transition.previous.path}: {exc}")
+    if failures:
+        raise RuntimeError(
+            "Traversierrechte konnten nicht vollständig restauriert werden: "
+            + "; ".join(failures)
+        )
+
+
+def _validate_live_install_context(target_root: Path) -> None:
+    """Belegt den projizierten Produktstamm real aus Sicht des Webservers."""
+
+    runuser = _runuser_binary(code="E3DC-UPD-PROJECTION-002")
+    php = Path("/usr/bin/php")
+    if not php.is_file() or not os.access(php, os.X_OK):
+        _fail(
+            "E3DC-UPD-PROJECTION-002",
+            "PHP fehlt; der Installationskontext kann nach der Projektion nicht bestätigt werden.",
+            "Installiere das Paket php-cli und starte danach denselben Ein-Datei-Updater erneut.",
+        )
+
+    # Simple-/Full-Updater sind Bare-Metal-Pfade und weisen Docker vorher ab.
+    # Deshalb wird bewusst keine private oder optionale venv als www-data
+    # geöffnet, sondern derselbe feste Systeminterpreter wie im Bare-Metal-UI.
+    probe_python = Path("/usr/bin/python3")
+    if not probe_python.is_file() or not os.access(probe_python, os.X_OK):
+        _fail(
+            "E3DC-UPD-PROJECTION-002",
+            "Der von der Installationszentrale verwendete Python-Interpreter fehlt; "
+            "die Installer-Importkette kann nicht bestätigt werden.",
+            "Installiere das Paket python3 und starte danach denselben Ein-Datei-Updater erneut.",
+        )
+
+    php_probe = _run(
+        [
+            runuser,
+            "-u",
+            "www-data",
+            "--",
+            "/usr/bin/env",
+            "-i",
+            "PATH=/usr/bin:/bin",
+            "HOME=/var/www",
+            php,
+            "-r",
+            (
+                "require '/var/www/html/helpers.php';"
+                "$p=getInstallPaths();"
+                "echo json_encode($p, JSON_UNESCAPED_SLASHES);"
+            ),
+        ],
+        timeout=30,
+    )
+    try:
+        paths = json.loads(php_probe.stdout)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        paths = None
+    expected_root = str(target_root.resolve(strict=True))
+    actual_root = ""
+    if isinstance(paths, dict):
+        actual_root = str(paths.get("install_path") or "").rstrip("/")
+    if (
+        php_probe.returncode != 0
+        or not isinstance(paths, dict)
+        or paths.get("valid") is not True
+        or actual_root != expected_root
+    ):
+        detail = ""
+        if isinstance(paths, dict):
+            detail = str(paths.get("error") or "").strip()
+        if not detail:
+            detail = (php_probe.stderr or php_probe.stdout or "keine PHP-Antwort").strip()
+        _fail(
+            "E3DC-UPD-PROJECTION-002",
+            "Der Webserver kann den projizierten Installationspfad nicht eindeutig lesen"
+            + (f": {detail}" if detail else "."),
+            "Prüfe die Produktrechte mit sudo namei -l "
+            + shlex.quote(str(target_root / "Installer/installer_config.py"))
+            + " und starte danach denselben Ein-Datei-Updater erneut.",
+        )
+
+    import_probe = _run(
+        [
+            runuser,
+            "-u",
+            "www-data",
+            "--",
+            "/usr/bin/env",
+            "-i",
+            "PATH=/usr/bin:/bin",
+            "HOME=/var/www",
+            probe_python,
+            "-I",
+            "-B",
+            "-c",
+            (
+                "import os,sys;"
+                "root=os.path.realpath(sys.argv[1]);"
+                "sys.path.insert(0,root);"
+                "import Installer.web_installer as module;"
+                "loaded=os.path.realpath(module.__file__);"
+                "assert loaded.startswith(root+os.sep), (loaded,root)"
+            ),
+            target_root,
+        ],
+        timeout=60,
+    )
+    if import_probe.returncode != 0:
+        detail = (import_probe.stderr or import_probe.stdout or "Import fehlgeschlagen").strip()
+        _fail(
+            "E3DC-UPD-PROJECTION-002",
+            "Der Webserver kann die projizierte Installer-Importkette nicht lesen: "
+            + detail,
+            "Prüfe die Produktrechte mit sudo namei -l "
+            + shlex.quote(str(target_root / "Installer/web_installer.py"))
+            + " und starte danach denselben Ein-Datei-Updater erneut.",
+        )
+
+
+def _delete_approved_stale_paths(
+    target_root: Path,
+    policy: dict,
+    *,
+    target_binding: DirectoryMetadataPrestate | None = None,
+) -> None:
     """Entfernt freigegebene Altdateien fd-relativ, nofollow und mountgebunden."""
 
     raw_deletes = tuple(policy.get("delete_files") or ())
@@ -2310,8 +3375,64 @@ def _delete_approved_stale_paths(target_root: Path, policy: dict) -> None:
             "Python beziehungsweise das Linux-System aktualisieren und danach denselben Updatebefehl erneut starten.",
         )
 
+    normalized_target_root = Path(os.path.abspath(target_root))
+    if target_binding is not None and Path(target_binding.path) != normalized_target_root:
+        raise RuntimeError("Stale-Löschung besitzt eine fremde Zielroot-Bindung")
+
+    normalized_deletes: list[Path] = []
+    unbound_target_deletes: list[Path] = []
+    for raw in raw_deletes:
+        candidate = Path(str(raw))
+        if not candidate.is_absolute():
+            candidate = target_root / candidate
+        candidate = Path(os.path.abspath(candidate))
+        normalized_deletes.append(candidate)
+        try:
+            target_relative = candidate.relative_to(normalized_target_root)
+        except ValueError:
+            continue
+        if target_relative.parts and target_binding is None:
+            unbound_target_deletes.append(candidate)
+    if unbound_target_deletes:
+        _fail(
+            "E3DC-UPD-WRITE-004",
+            "Freigegebene Altdateien unter dem Installationspfad können ohne "
+            "gebundene Zielroot nicht sicher entfernt werden. Es wurden keine "
+            "Altdateien entfernt: "
+            + ", ".join(str(path) for path in unbound_target_deletes),
+            "Starte den aktuellen Ein-Datei-Updater erneut. Alte Aufrufer dürfen "
+            "ohne Zielroot-Bindung weiterhin ausschließlich Webdateien entfernen.",
+        )
+
+    def verify_root_name(
+        root: Path,
+        parent_fd: int,
+        root_fd: int,
+        expected: tuple[int, int, int, int],
+    ) -> None:
+        parent = os.fstat(parent_fd)
+        opened_root = os.fstat(root_fd)
+        named_root = os.stat(
+            root.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        actual = (
+            int(parent.st_dev),
+            int(parent.st_ino),
+            int(opened_root.st_dev),
+            int(opened_root.st_ino),
+        )
+        if (
+            actual != expected
+            or not stat.S_ISDIR(named_root.st_mode)
+            or (named_root.st_dev, named_root.st_ino)
+            != (opened_root.st_dev, opened_root.st_ino)
+        ):
+            raise RuntimeError(f"Stale-Löschwurzel wurde ausgetauscht: {root}")
+
     allowed_root_candidates = [
-        Path(os.path.abspath(target_root)),
+        normalized_target_root,
         Path("/var/www/html"),
     ]
     # Nur ein tatsächlich bestätigter eigener tmpfs-Mount benötigt einen
@@ -2329,11 +3450,7 @@ def _delete_approved_stale_paths(target_root: Path, policy: dict) -> None:
         )
     )
     errors: list[str] = []
-    for raw in raw_deletes:
-        candidate = Path(str(raw))
-        if not candidate.is_absolute():
-            candidate = target_root / candidate
-        candidate = Path(os.path.abspath(candidate))
+    for candidate in normalized_deletes:
         selected_root: Path | None = None
         relative: Path | None = None
         for root in allowed_roots:
@@ -2350,14 +3467,39 @@ def _delete_approved_stale_paths(target_root: Path, policy: dict) -> None:
             continue
 
         cloexec = getattr(os, "O_CLOEXEC", 0)
+        root_parent_fd = -1
         root_fd = -1
         opened: list[int] = []
         try:
-            root_fd = os.open(
-                selected_root,
-                os.O_RDONLY | nofollow | directory | cloexec,
+            (
+                root_parent_fd,
+                root_fd,
+                root_parent_metadata,
+                root_metadata,
+            ) = _open_bound_named_directory(selected_root)
+            root_identity = (
+                int(root_parent_metadata.st_dev),
+                int(root_parent_metadata.st_ino),
+                int(root_metadata.st_dev),
+                int(root_metadata.st_ino),
             )
-            root_metadata = os.fstat(root_fd)
+            if selected_root == normalized_target_root and target_binding is not None:
+                expected_target_identity = (
+                    target_binding.parent_device,
+                    target_binding.parent_inode,
+                    target_binding.device,
+                    target_binding.inode,
+                )
+                if root_identity != expected_target_identity:
+                    raise RuntimeError(
+                        "Installationsroot driftete vor der Stale-Löschung"
+                    )
+            verify_root_name(
+                selected_root,
+                root_parent_fd,
+                root_fd,
+                root_identity,
+            )
             root_device = root_metadata.st_dev
             root_mount_id = _fd_mount_id(root_fd)
             if selected_root == RAMDISK_PATH:
@@ -2366,12 +3508,15 @@ def _delete_approved_stale_paths(target_root: Path, policy: dict) -> None:
                 # Probe darf nicht unbemerkt einen neuen Löschroot autorisieren.
                 if not _probe_ramdisk_tmpfs():
                     raise RuntimeError("RAM-Disk ist kein bestätigtes tmpfs")
-                confirmation_fd = os.open(
-                    selected_root,
-                    os.O_RDONLY | nofollow | directory | cloexec,
-                )
+                confirmation_parent_fd = -1
+                confirmation_fd = -1
                 try:
-                    confirmation_metadata = os.fstat(confirmation_fd)
+                    (
+                        confirmation_parent_fd,
+                        confirmation_fd,
+                        _confirmation_parent,
+                        confirmation_metadata,
+                    ) = _open_bound_named_directory(selected_root)
                     if (
                         (confirmation_metadata.st_dev, confirmation_metadata.st_ino)
                         != (root_metadata.st_dev, root_metadata.st_ino)
@@ -2381,11 +3526,19 @@ def _delete_approved_stale_paths(target_root: Path, policy: dict) -> None:
                             "RAM-Disk-Mount änderte sich während der Bestätigung"
                         )
                 finally:
-                    os.close(confirmation_fd)
+                    if confirmation_fd >= 0:
+                        os.close(confirmation_fd)
+                    if confirmation_parent_fd >= 0:
+                        os.close(confirmation_parent_fd)
             parent_fd = root_fd
             missing = False
             for depth, component in enumerate(relative.parts[:-1], start=1):
                 try:
+                    named_child = os.stat(
+                        component,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
                     child_fd = os.open(
                         component,
                         os.O_RDONLY | nofollow | directory | cloexec,
@@ -2396,7 +3549,10 @@ def _delete_approved_stale_paths(target_root: Path, policy: dict) -> None:
                     break
                 child_metadata = os.fstat(child_fd)
                 if (
-                    child_metadata.st_dev != root_device
+                    not stat.S_ISDIR(named_child.st_mode)
+                    or (named_child.st_dev, named_child.st_ino)
+                    != (child_metadata.st_dev, child_metadata.st_ino)
+                    or child_metadata.st_dev != root_device
                     or _fd_mount_id(child_fd) != root_mount_id
                 ):
                     os.close(child_fd)
@@ -2416,19 +3572,49 @@ def _delete_approved_stale_paths(target_root: Path, policy: dict) -> None:
             if stat.S_ISDIR(metadata.st_mode):
                 raise RuntimeError("Löschliste darf keine Verzeichnisse entfernen")
             if stat.S_ISREG(metadata.st_mode):
+                if metadata.st_nlink != 1:
+                    raise RuntimeError("Löschziel besitzt Hardlinks")
                 target_fd = os.open(name, os.O_RDONLY | nofollow | cloexec, dir_fd=parent_fd)
                 try:
+                    bound = os.fstat(target_fd)
                     if (
-                        os.fstat(target_fd).st_dev != root_device
+                        (bound.st_dev, bound.st_ino)
+                        != (metadata.st_dev, metadata.st_ino)
+                        or bound.st_nlink != 1
+                        or bound.st_dev != root_device
                         or _fd_mount_id(target_fd) != root_mount_id
                     ):
-                        raise RuntimeError("Löschziel ist ein verschachtelter Mount")
+                        raise RuntimeError("Löschziel driftete oder liegt auf Fremdmount")
+                    current = os.stat(
+                        name,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                    rebound = os.fstat(target_fd)
+                    if (
+                        not stat.S_ISREG(current.st_mode)
+                        or (current.st_dev, current.st_ino, current.st_nlink)
+                        != (bound.st_dev, bound.st_ino, 1)
+                        or (rebound.st_dev, rebound.st_ino, rebound.st_nlink)
+                        != (bound.st_dev, bound.st_ino, 1)
+                    ):
+                        raise RuntimeError("Löschziel wurde vor unlink ersetzt")
+                    os.unlink(name, dir_fd=parent_fd)
+                    if os.fstat(target_fd).st_nlink != 0:
+                        raise RuntimeError("Entferntes Löschziel blieb verlinkt")
                 finally:
                     os.close(target_fd)
             elif not stat.S_ISLNK(metadata.st_mode):
                 raise RuntimeError("Löschziel ist eine Spezialdatei")
-            os.unlink(name, dir_fd=parent_fd)
+            else:
+                os.unlink(name, dir_fd=parent_fd)
             os.fsync(parent_fd)
+            verify_root_name(
+                selected_root,
+                root_parent_fd,
+                root_fd,
+                root_identity,
+            )
         except OSError as exc:
             errors.append(f"{candidate}: {exc}")
         except RuntimeError as exc:
@@ -2438,6 +3624,8 @@ def _delete_approved_stale_paths(target_root: Path, policy: dict) -> None:
                 os.close(descriptor)
             if root_fd >= 0:
                 os.close(root_fd)
+            if root_parent_fd >= 0:
+                os.close(root_parent_fd)
     if errors:
         _fail(
             "E3DC-UPD-WRITE-004",
@@ -2618,10 +3806,13 @@ def _ensure_core_services(
     dropin_payload: bytes | None,
     role: str = "off",
     masked_units: Iterable[str] = (),
+    *,
+    release_root: Path | None = None,
 ) -> None:
     """Ersetzt die Pflicht-Units direkt; der Altzustand ist keine Hürde."""
 
     installer = target_root / "Installer"
+    release_installer = (release_root or target_root) / "Installer"
     specs = (
         {
             "unit": "e3dc-live.service",
@@ -2708,7 +3899,7 @@ def _ensure_core_services(
     start_condition: tuple[str, ...] = ()
     if role in {"master", "slave", "shadow"}:
         start_gate = installer / "ha_systemd_start_gate.py"
-        if not start_gate.is_file():
+        if not (release_installer / "ha_systemd_start_gate.py").is_file():
             _fail(
                 "E3DC-UPD-SERVICE-004",
                 f"Das lokale HA-Starttor des neuen Releases fehlt: {start_gate}",
@@ -2721,7 +3912,7 @@ def _ensure_core_services(
         if str(spec["unit"]) in masked:
             continue
         script = installer / str(spec["script"])
-        if not script.is_file():
+        if not (release_installer / str(spec["script"])).is_file():
             _fail(
                 "E3DC-UPD-SERVICE-004",
                 f"Das Pflichtskript des neuen Releases fehlt: {script}",
@@ -2779,6 +3970,7 @@ def _ensure_role_service(
             install_user=install_user,
         )
         script = bundle / "ha_manager.py"
+        source_script = script
         working_directory = Path("/")
         argv = (
             "/usr/bin/python3",
@@ -2803,6 +3995,7 @@ def _ensure_role_service(
     else:
         description = "E3DC-Control Shadow Synchronisation"
         script = target_root / "Installer/shadow_sync.py"
+        source_script = (release_root or RELEASE_ROOT) / "Installer/shadow_sync.py"
         working_directory = script.parent
         argv = (str(python), str(script))
         environment = ()
@@ -2810,7 +4003,7 @@ def _ensure_role_service(
         service_user = install_user
         service_group = "www-data"
         syslog_identifier = "e3dc-shadow-sync"
-    if not script.is_file():
+    if not source_script.is_file():
         _fail(
             "E3DC-UPD-SERVICE-004",
             f"Das Rollenskript des neuen Releases fehlt: {script}",
@@ -2958,6 +4151,7 @@ def _prepare_selected_release_dependencies(
 
 def _ensure_selected_catalog_services(
     target_root: Path,
+    release_root: Path,
     install_user: str,
     python: Path,
     role: str,
@@ -2972,6 +4166,7 @@ def _ensure_selected_catalog_services(
 
     warnings: list[str] = []
     installer = target_root / "Installer"
+    release_installer = release_root / "Installer"
     excluded = set(CORE_RESULT_SERVICES) | set(ROLE_SERVICE_BY_MODE.values())
     masked = {_normalize_unit(unit) for unit in masked_units}
     prepared_npm = {_normalize_unit(unit) for unit in prepared_npm_units}
@@ -2984,7 +4179,7 @@ def _ensure_selected_catalog_services(
     start_condition: tuple[str, ...] = ()
     if selected and role in {"master", "slave", "shadow"}:
         start_gate = installer / "ha_systemd_start_gate.py"
-        if not start_gate.is_file():
+        if not (release_installer / "ha_systemd_start_gate.py").is_file():
             _fail(
                 "E3DC-UPD-SERVICE-004",
                 f"Das lokale HA-Starttor des neuen Releases fehlt: {start_gate}",
@@ -2995,14 +4190,20 @@ def _ensure_selected_catalog_services(
         module = get_module_by_service(unit)
         if module is None or not module.script:
             continue
-        script = _catalog_target_path(installer, module.script, label="Modulskript")
-        workdir = _catalog_target_path(
-            installer,
+        release_script = _catalog_target_path(
+            release_installer,
+            module.script,
+            label="Modulskript",
+        )
+        release_workdir = _catalog_target_path(
+            release_installer,
             module.working_directory or ".",
             label="Modul-Arbeitsverzeichnis",
         )
+        script = installer / release_script.relative_to(release_installer)
+        workdir = installer / release_workdir.relative_to(release_installer)
         load_profile = service_load_profile(module)
-        if not script.is_file() or not workdir.is_dir():
+        if not release_script.is_file() or not release_workdir.is_dir():
             message = (
                 f"Das Ziel-Release enthält das zuvor verwendete Modul {unit} nicht vollständig "
                 f"(Script: {script}, Arbeitsverzeichnis: {workdir})."
@@ -3064,14 +4265,50 @@ def _ensure_selected_catalog_services(
     return warnings
 
 
+def _release_web_program_contract(
+    release_root: Path,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Bindet die vollständige Web-Produktliste des entpackten Releases."""
+
+    source = (release_root / "html").resolve(strict=True)
+    files = {"VERSION", "CHANGELOG.md", "UPDATE_POLICY.json"}
+    directories = set()
+
+    def walk(directory: Path, relative: tuple[str, ...]) -> None:
+        for entry in sorted(os.scandir(directory), key=lambda item: item.name):
+            metadata = entry.stat(follow_symlinks=False)
+            child = (*relative, entry.name)
+            if not relative and entry.name in PRESERVED_WEB_ENTRIES:
+                raise RuntimeError(
+                    f"Release-Webquelle kollidiert mit erhaltener Laufzeitfläche: {entry.name}"
+                )
+            projected = "/".join(child)
+            if stat.S_ISDIR(metadata.st_mode):
+                directories.add(projected)
+                walk(directory / entry.name, child)
+            elif stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1:
+                files.add(projected)
+            else:
+                raise RuntimeError(
+                    f"Release-Webquelle enthält Link, Spezialdatei oder Hardlink: {projected}"
+                )
+
+    walk(source, ())
+    if not {"index.php", "helpers.php"}.issubset(files):
+        raise RuntimeError("Release-Webquelle ist unvollständig")
+    return tuple(sorted(files)), tuple(
+        sorted(directories, key=lambda value: (value.count("/"), value))
+    )
+
+
 def _sync_web_tree(
-    target_root: Path,
-    install_user: str,
+    release_root: Path,
     destination: Path = Path("/var/www/html"),
-) -> None:
-    source = target_root / "html"
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    source = release_root / "html"
+    program_contract = _release_web_program_contract(release_root)
     www_gid = grp.getgrnam("www-data").gr_gid
-    _project_release_tree(
+    web_binding = _project_release_tree(
         source,
         destination,
         uid=0,
@@ -3085,9 +4322,18 @@ def _sync_web_tree(
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     directory = getattr(os, "O_DIRECTORY", 0)
     cloexec = getattr(os, "O_CLOEXEC", 0)
-    root_fd = os.open(destination, os.O_RDONLY | nofollow | directory | cloexec)
+    parent_fd, root_fd, _parent_metadata, opened_root = _open_bound_named_directory(
+        destination
+    )
     try:
         root_metadata = os.fstat(root_fd)
+        if (
+            (opened_root.st_dev, opened_root.st_ino)
+            != (web_binding.device, web_binding.inode)
+        ):
+            raise RuntimeError(
+                f"Der Webroot driftete nach der Releaseprojektion: {destination}"
+            )
         root_device = root_metadata.st_dev
         root_mount_id = _fd_mount_id(root_fd)
         for name in sorted(PRESERVED_WEB_DIRS):
@@ -3116,7 +4362,7 @@ def _sync_web_tree(
                 os.close(runtime_fd)
         for name in ("VERSION", "CHANGELOG.md", "UPDATE_POLICY.json"):
             _project_regular_file(
-                target_root / name,
+                release_root / name,
                 root_fd,
                 name,
                 destination / name,
@@ -3128,6 +4374,9 @@ def _sync_web_tree(
             )
     finally:
         os.close(root_fd)
+        os.close(parent_fd)
+    _assert_named_directory_binding(web_binding)
+    return program_contract
 
 
 def _permission_contract_for_preserved_entry(
@@ -3154,6 +4403,8 @@ def _permission_contract_for_preserved_entry(
             ("wallbox_mode5_user_start_request.json.lock",),
         }:
             return www_uid, www_gid, data_dir_mode, 0o660
+        if relative == ("external_pv_topology.json",):
+            return install_uid, www_gid, data_dir_mode, 0o664
         return install_uid, www_gid, data_dir_mode, data_file_mode
     if top_name == "history_backups":
         return install_uid, www_gid, 0o750, 0o640
@@ -3309,6 +4560,15 @@ def _normalize_preserved_web_permissions(
             if (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
                 raise RuntimeError(f"Erhaltener Web-Pfad wechselte beim Öffnen: {name}")
             for child_name in sorted(os.listdir(descriptor)):
+                if (
+                    top_name == "data"
+                    and not relative
+                    and (
+                        child_name in MATTER_RESET_PROTECTED_DATA_NAMES
+                        or child_name.startswith(MATTER_RESET_PROTECTED_DATA_PREFIXES)
+                    )
+                ):
+                    continue
                 child = os.stat(child_name, dir_fd=descriptor, follow_symlinks=False)
                 child_relative = (*relative, child_name)
                 uid, gid, dir_mode, file_mode = _permission_contract_for_preserved_entry(
@@ -3428,8 +4688,465 @@ def _read_json_dict(path: Path, *, missing_ok: bool) -> dict:
     return value
 
 
+def _verify_bound_directory_handles(
+    expected: DirectoryMetadataPrestate,
+    parent_fd: int,
+    directory_fd: int,
+) -> None:
+    """Bestätigt einen gehaltenen Verzeichnis-FD samt weiterhin gebundenem Namen."""
+
+    path = Path(expected.path)
+    parent = os.fstat(parent_fd)
+    opened = os.fstat(directory_fd)
+    named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+    current = _directory_prestate(path, opened, parent)
+    if (
+        current != expected
+        or not stat.S_ISDIR(named.st_mode)
+        or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+        or named.st_uid != expected.uid
+        or named.st_gid != expected.gid
+        or stat.S_IMODE(named.st_mode) != expected.mode
+    ):
+        raise RuntimeError(f"Gebundenes Konfigurationsverzeichnis driftete: {path}")
+
+
+def _read_bound_directory_json(
+    directory_binding: DirectoryMetadataPrestate,
+    name: str,
+    *,
+    missing_ok: bool,
+    maximum_bytes: int = 1024 * 1024,
+) -> dict:
+    """Liest eine einzelne JSON-Datei fd-relativ und ohne Symlinkfolge."""
+
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+        raise RuntimeError("Konfigurationsdateiname ist ungültig")
+    parent_fd, directory_fd, _parent, _opened = _open_bound_named_directory(
+        Path(directory_binding.path)
+    )
+    descriptor = -1
+    try:
+        _verify_bound_directory_handles(directory_binding, parent_fd, directory_fd)
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=directory_fd,
+            )
+        except FileNotFoundError:
+            if missing_ok:
+                _verify_bound_directory_handles(
+                    directory_binding,
+                    parent_fd,
+                    directory_fd,
+                )
+                return {}
+            raise
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size > int(maximum_bytes)
+        ):
+            raise RuntimeError("Konfiguration ist keine sichere Einzeldatei")
+        payload = b""
+        while len(payload) < metadata.st_size:
+            block = os.read(descriptor, metadata.st_size - len(payload))
+            if not block:
+                raise RuntimeError("Konfiguration endet unerwartet")
+            payload += block
+        if os.read(descriptor, 1):
+            raise RuntimeError("Konfiguration wuchs während des Lesens")
+        after = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            != (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+            )
+            or (named.st_dev, named.st_ino)
+            != (metadata.st_dev, metadata.st_ino)
+        ):
+            raise RuntimeError("Konfiguration driftete beim Lesen")
+        _verify_bound_directory_handles(directory_binding, parent_fd, directory_fd)
+        value = json.loads(payload.decode("utf-8-sig"))
+        if not isinstance(value, dict):
+            raise ValueError("JSON-Wurzel ist kein Objekt")
+        return value
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(directory_fd)
+        os.close(parent_fd)
+
+
+def _write_bound_directory_file(
+    directory_binding: DirectoryMetadataPrestate,
+    name: str,
+    payload: bytes,
+    *,
+    uid: int,
+    gid: int,
+    mode: int,
+) -> None:
+    """Publiziert eine Datei atomar innerhalb eines exakt gebundenen Verzeichnisses."""
+
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name) or len(payload) > 1024 * 1024:
+        raise RuntimeError("Konfigurationsdateivertrag ist ungültig")
+    parent_fd, directory_fd, _parent, _opened = _open_bound_named_directory(
+        Path(directory_binding.path)
+    )
+    temporary_name = f".{name}.update-{os.getpid()}-{os.urandom(12).hex()}"
+    descriptor = -1
+    published = False
+    try:
+        _verify_bound_directory_handles(directory_binding, parent_fd, directory_fd)
+        try:
+            existing = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and (
+            not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1
+        ):
+            raise RuntimeError("Konfigurationsziel ist keine sichere Einzeldatei")
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(descriptor, payload[offset:])
+        os.fchown(descriptor, uid, gid)
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+        staged = os.fstat(descriptor)
+        _verify_bound_directory_handles(directory_binding, parent_fd, directory_fd)
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+        published = True
+        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            (named.st_dev, named.st_ino) != (staged.st_dev, staged.st_ino)
+            or named.st_uid != uid
+            or named.st_gid != gid
+            or stat.S_IMODE(named.st_mode) != mode
+            or named.st_size != len(payload)
+        ):
+            raise RuntimeError("Konfigurationsdatei blieb nach dem Schreiben abweichend")
+        _verify_bound_directory_handles(directory_binding, parent_fd, directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if not published:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        os.close(directory_fd)
+        os.close(parent_fd)
+    _assert_named_directory_binding(directory_binding)
+
+
+def _read_live_web_v4_json(*, missing_ok: bool) -> dict:
+    """Liest die V4-Konfiguration nur aus einem echten, stabil gebundenen data-Ordner."""
+
+    data_dir = Path("/var/www/html/data")
+    try:
+        binding = _read_bound_directory_prestate(data_dir)
+    except FileNotFoundError:
+        if missing_ok:
+            return {}
+        raise
+    return _read_bound_directory_json(
+        binding,
+        "e3dc_v4.json",
+        missing_ok=missing_ok,
+    )
+
+
+def _bind_live_installer_directory(
+    target_binding: DirectoryMetadataPrestate,
+) -> tuple[int, int, int, os.stat_result]:
+    """Bindet Produktstamm und Installer-Unterverzeichnis komponentenweise."""
+
+    target_root = Path(target_binding.path)
+    parent_fd, root_fd, parent_metadata, root_metadata = _open_bound_named_directory(
+        target_root
+    )
+    installer_fd = -1
+    try:
+        current_root = _directory_prestate(
+            target_root,
+            root_metadata,
+            parent_metadata,
+        )
+        if current_root != target_binding:
+            raise RuntimeError("Produktstamm driftete vor der Installer-Bindung")
+        installer_named = os.stat(
+            "Installer",
+            dir_fd=root_fd,
+            follow_symlinks=False,
+        )
+        installer_fd = os.open(
+            "Installer",
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=root_fd,
+        )
+        installer_opened = os.fstat(installer_fd)
+        if (
+            not stat.S_ISDIR(installer_named.st_mode)
+            or not stat.S_ISDIR(installer_opened.st_mode)
+            or (installer_named.st_dev, installer_named.st_ino)
+            != (installer_opened.st_dev, installer_opened.st_ino)
+        ):
+            raise RuntimeError("Installer-Verzeichnis driftete bei der Bindung")
+        return parent_fd, root_fd, installer_fd, installer_opened
+    except Exception:
+        if installer_fd >= 0:
+            os.close(installer_fd)
+        os.close(root_fd)
+        os.close(parent_fd)
+        raise
+
+
+def _verify_live_installer_binding(
+    target_binding: DirectoryMetadataPrestate,
+    parent_fd: int,
+    root_fd: int,
+    installer_fd: int,
+    installer_expected: os.stat_result,
+) -> None:
+    target_root = Path(target_binding.path)
+    root_opened = os.fstat(root_fd)
+    root_named = os.stat(
+        target_root.name,
+        dir_fd=parent_fd,
+        follow_symlinks=False,
+    )
+    installer_opened = os.fstat(installer_fd)
+    installer_named = os.stat(
+        "Installer",
+        dir_fd=root_fd,
+        follow_symlinks=False,
+    )
+    if (
+        (root_opened.st_dev, root_opened.st_ino)
+        != (target_binding.device, target_binding.inode)
+        or (root_named.st_dev, root_named.st_ino)
+        != (target_binding.device, target_binding.inode)
+        or root_opened.st_uid != target_binding.uid
+        or root_opened.st_gid != target_binding.gid
+        or stat.S_IMODE(root_opened.st_mode) != target_binding.mode
+        or (installer_opened.st_dev, installer_opened.st_ino)
+        != (installer_expected.st_dev, installer_expected.st_ino)
+        or (installer_named.st_dev, installer_named.st_ino)
+        != (installer_expected.st_dev, installer_expected.st_ino)
+        or installer_opened.st_uid != installer_expected.st_uid
+        or installer_opened.st_gid != installer_expected.st_gid
+        or stat.S_IMODE(installer_opened.st_mode)
+        != stat.S_IMODE(installer_expected.st_mode)
+        or installer_named.st_uid != installer_expected.st_uid
+        or installer_named.st_gid != installer_expected.st_gid
+        or stat.S_IMODE(installer_named.st_mode)
+        != stat.S_IMODE(installer_expected.st_mode)
+    ):
+        raise RuntimeError("Produkt- oder Installer-Bindung driftete")
+
+
+def _read_live_installer_json(
+    target_binding: DirectoryMetadataPrestate,
+    name: str,
+    *,
+    missing_ok: bool,
+) -> dict:
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+        raise RuntimeError("Installer-Dateiname ist ungültig")
+    parent_fd, root_fd, installer_fd, installer_metadata = (
+        _bind_live_installer_directory(target_binding)
+    )
+    descriptor = -1
+    try:
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=installer_fd,
+            )
+        except FileNotFoundError:
+            if missing_ok:
+                _verify_live_installer_binding(
+                    target_binding,
+                    parent_fd,
+                    root_fd,
+                    installer_fd,
+                    installer_metadata,
+                )
+                return {}
+            raise
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size > 1024 * 1024
+        ):
+            raise RuntimeError("Installer-Konfiguration ist keine sichere Einzeldatei")
+        payload = b""
+        while len(payload) < metadata.st_size:
+            block = os.read(descriptor, metadata.st_size - len(payload))
+            if not block:
+                raise RuntimeError("Installer-Konfiguration endet unerwartet")
+            payload += block
+        if os.read(descriptor, 1):
+            raise RuntimeError("Installer-Konfiguration wuchs während des Lesens")
+        after = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=installer_fd, follow_symlinks=False)
+        if (
+            (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            != (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
+            or (named.st_dev, named.st_ino)
+            != (metadata.st_dev, metadata.st_ino)
+        ):
+            raise RuntimeError("Installer-Konfiguration driftete beim Lesen")
+        _verify_live_installer_binding(
+            target_binding,
+            parent_fd,
+            root_fd,
+            installer_fd,
+            installer_metadata,
+        )
+        value = json.loads(payload.decode("utf-8-sig"))
+        if not isinstance(value, dict):
+            raise ValueError("JSON-Wurzel ist kein Objekt")
+        return value
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(installer_fd)
+        os.close(root_fd)
+        os.close(parent_fd)
+
+
+def _write_live_installer_file(
+    target_binding: DirectoryMetadataPrestate,
+    name: str,
+    payload: bytes,
+    *,
+    uid: int,
+    gid: int,
+    mode: int,
+) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name) or len(payload) > 1024 * 1024:
+        raise RuntimeError("Installer-Dateivertrag ist ungültig")
+    parent_fd, root_fd, installer_fd, installer_metadata = (
+        _bind_live_installer_directory(target_binding)
+    )
+    temporary_name = f".{name}.update-{os.getpid()}-{os.urandom(12).hex()}"
+    descriptor = -1
+    published = False
+    try:
+        try:
+            existing = os.stat(name, dir_fd=installer_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and (
+            not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1
+        ):
+            raise RuntimeError("Installer-Zieldatei ist keine sichere Einzeldatei")
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=installer_fd,
+        )
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(descriptor, payload[offset:])
+        os.fchown(descriptor, uid, gid)
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+        staged = os.fstat(descriptor)
+        _verify_live_installer_binding(
+            target_binding,
+            parent_fd,
+            root_fd,
+            installer_fd,
+            installer_metadata,
+        )
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=installer_fd,
+            dst_dir_fd=installer_fd,
+        )
+        os.fsync(installer_fd)
+        published = True
+        named = os.stat(name, dir_fd=installer_fd, follow_symlinks=False)
+        if (
+            (named.st_dev, named.st_ino) != (staged.st_dev, staged.st_ino)
+            or named.st_uid != uid
+            or named.st_gid != gid
+            or stat.S_IMODE(named.st_mode) != mode
+            or named.st_size != len(payload)
+        ):
+            raise RuntimeError("Installer-Datei blieb nach dem Schreiben abweichend")
+        _verify_live_installer_binding(
+            target_binding,
+            parent_fd,
+            root_fd,
+            installer_fd,
+            installer_metadata,
+        )
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if not published:
+            try:
+                os.unlink(temporary_name, dir_fd=installer_fd)
+            except FileNotFoundError:
+                pass
+        os.close(installer_fd)
+        os.close(root_fd)
+        os.close(parent_fd)
+
+
 def _project_path_metadata(
     target_root: Path,
+    target_binding: DirectoryMetadataPrestate,
     install_user: str,
     role: str,
     config: dict,
@@ -3442,10 +5159,15 @@ def _project_path_metadata(
 
     account = pwd.getpwnam(install_user)
     www_gid = grp.getgrnam("www-data").gr_gid
-    installer_config = target_root / "Installer/installer_config.json"
     local: dict = {}
     try:
-        local.update(_read_json_dict(installer_config, missing_ok=True))
+        local.update(
+            _read_live_installer_json(
+                target_binding,
+                "installer_config.json",
+                missing_ok=True,
+            )
+        )
     except (OSError, UnicodeError, ValueError):
         pass
     # Die vor dem Backup gebundene V4-/Rollen-Konfiguration ist die aktuelle
@@ -3470,8 +5192,9 @@ def _project_path_metadata(
         if peer_ip:
             local["ha_peer_ip"] = peer_ip
     local_payload = (json.dumps(local, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-    _atomic_write_file(
-        installer_config,
+    _write_live_installer_file(
+        target_binding,
+        "installer_config.json",
         local_payload,
         uid=account.pw_uid,
         gid=www_gid,
@@ -3479,10 +5202,14 @@ def _project_path_metadata(
     )
 
     data_dir = Path("/var/www/html/data")
-    data_dir.mkdir(parents=True, exist_ok=True)
+    data_binding = _read_bound_directory_prestate(data_dir)
     v4_path = data_dir / "e3dc_v4.json"
     try:
-        v4 = _read_json_dict(v4_path, missing_ok=True)
+        v4 = _read_bound_directory_json(
+            data_binding,
+            "e3dc_v4.json",
+            missing_ok=True,
+        )
     except (OSError, UnicodeError, ValueError) as exc:
         v4 = None
         print(
@@ -3505,15 +5232,20 @@ def _project_path_metadata(
         if role in {"master", "slave"} and peer_ip:
             v4["ha_peer_ip"] = peer_ip
         v4_payload = (json.dumps(v4, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-        _atomic_write_file(
-            v4_path,
+        _write_bound_directory_file(
+            data_binding,
+            "e3dc_v4.json",
             v4_payload,
             uid=account.pw_uid,
             gid=www_gid,
             mode=config_secret_file_mode(secret_mode_source),
         )
-    os.chown(data_dir, account.pw_uid, www_gid)
-    os.chmod(data_dir, config_secret_dir_mode(secret_mode_source))
+    _apply_bound_directory_transition(
+        data_binding,
+        uid=account.pw_uid,
+        gid=www_gid,
+        mode=config_secret_dir_mode(secret_mode_source),
+    )
 
     paths = {
         "install_user": install_user,
@@ -3577,6 +5309,20 @@ def _release_script(path: Path, *, label: str) -> bytes:
     return payload
 
 
+def _validate_service_wrapper_embedded_python(payload: bytes) -> None:
+    """Kompiliert den privilegierten Inline-Pythonblock zusätzlich zu bash -n."""
+
+    begin = b"# E3DC_MATTER_RESET_PYTHON_BEGIN\n"
+    end = b"# E3DC_MATTER_RESET_PYTHON_END\n"
+    if payload.count(begin) != 1 or payload.count(end) != 1:
+        raise RuntimeError("Service-Launcher besitzt keinen eindeutigen Matter-Reset-Pythonblock")
+    source = payload.split(begin, 1)[1].split(end, 1)[0]
+    try:
+        compile(source.decode("utf-8", errors="strict"), "<matter-reset>", "exec")
+    except (SyntaxError, UnicodeError) as exc:
+        raise RuntimeError("Matter-Reset-Pythonblock im Service-Launcher ist ungültig") from exc
+
+
 def _canonical_shell_literal(value: str) -> bytes:
     """Kodiert Dispatcherwerte immer in der von der Discovery gelesenen Form."""
 
@@ -3616,6 +5362,7 @@ def _install_privileged_entrypoints(
         release_root / "Installer/service_wrapper.sh",
         label="Service-Launcher",
     )
+    _validate_service_wrapper_embedded_python(service_payload)
     template = _release_script(
         release_root / "Installer/web_update_launcher.sh",
         label="Web-Update-Launcher",
@@ -3671,6 +5418,10 @@ def _install_privileged_entrypoints(
         for action in SERVICE_WRAPPER_ACTIONS
         for unit in wrapper_service_names
     )
+    sudoers_lines.append(
+        f"www-data ALL=(root) NOPASSWD: {SERVICE_WRAPPER} "
+        f"{MATTER_RESET_ACTION} {MATTER_RESET_UNIT}"
+    )
     sudoers_lines.extend(
         (
             f'www-data ALL=(root) NOPASSWD: {WEB_UPDATE_LAUNCHER} ""',
@@ -3721,9 +5472,18 @@ def _repair_units_and_permissions(
     prepared_npm_units: Iterable[str] = (),
     *,
     require_role_peer: bool = False,
+    target_binding: DirectoryMetadataPrestate,
+    web_program_files: tuple[str, ...] | None = None,
+    web_program_directories: tuple[str, ...] | None = None,
 ) -> list[str]:
     warnings: list[str] = []
-    _delete_approved_stale_paths(target_root, policy)
+    _assert_named_directory_binding(target_binding)
+    _delete_approved_stale_paths(
+        target_root,
+        policy,
+        target_binding=target_binding,
+    )
+    _assert_named_directory_binding(target_binding)
     dropin_payload, ramdisk_warnings = _prepare_ramdisk_dropin(install_user)
     warnings.extend(ramdisk_warnings)
     _ensure_core_services(
@@ -3733,6 +5493,7 @@ def _repair_units_and_permissions(
         dropin_payload,
         role,
         (() if service_prestate is None else service_prestate.masked),
+        release_root=release_root,
     )
     _ensure_role_service(
         target_root,
@@ -3747,6 +5508,7 @@ def _repair_units_and_permissions(
         warnings.extend(
             _ensure_selected_catalog_services(
                 target_root,
+                release_root,
                 install_user,
                 venv_python,
                 role,
@@ -3760,21 +5522,37 @@ def _repair_units_and_permissions(
                 prepared_npm_units,
             )
         )
+    _assert_named_directory_binding(target_binding)
     _project_path_metadata(
         target_root,
+        target_binding,
         install_user,
         role,
         config,
         require_peer=require_role_peer,
     )
+    _assert_named_directory_binding(target_binding)
     _normalize_preserved_web_permissions(
         Path("/var/www/html"),
         install_user,
         config,
     )
+    from Installer.permissions import harden_web_program_permissions
+
+    if not harden_web_program_permissions(
+        web_root="/var/www/html",
+        install_user=install_user,
+        program_files=web_program_files,
+        program_directories=web_program_directories,
+    ):
+        raise RuntimeError(
+            "Der Web-Programmbaum konnte nicht auf den gemeinsamen Live-Vertrag gehärtet werden"
+        )
+    _validate_live_install_context(target_root)
+    _assert_named_directory_binding(target_binding)
     warnings.extend(_install_privileged_entrypoints(release_root, target_root, install_user))
 
-    apache_source = target_root / "Installer/apache/e3dc-control-security.conf"
+    apache_source = release_root / "Installer/apache/e3dc-control-security.conf"
     apache_target = Path("/etc/apache2/conf-available/e3dc-control-security.conf")
     if apache_source.is_file() and apache_target.parent.is_dir():
         installed = _run(
@@ -3799,6 +5577,7 @@ def _repair_units_and_permissions(
                 "Die Apache-Konfiguration konnte nicht vollständig aus dem neuen Release aktiviert werden.",
                 "Führe sudo apache2ctl configtest aus, behebe die ausgegebene Zeile und starte danach denselben Updatebefehl erneut.",
             )
+    _assert_named_directory_binding(target_binding)
     return warnings
 
 
@@ -4097,6 +5876,7 @@ def _start_services(
 
 def _final_confirmation(
     target_root: Path,
+    target_binding: DirectoryMetadataPrestate,
     expected_version: str,
     required_services: tuple[str, ...],
     forbidden_services: Iterable[str] = (),
@@ -4104,7 +5884,9 @@ def _final_confirmation(
     required_writer_admission_mode: str = "",
     masked_units: Iterable[str] = (),
 ) -> list[str]:
+    _assert_named_directory_binding(target_binding)
     version = (target_root / "VERSION").read_text(encoding="utf-8").strip()
+    _assert_named_directory_binding(target_binding)
     if version != expected_version:
         _fail(
             "E3DC-UPD-END-001",
@@ -4209,12 +5991,14 @@ def _final_confirmation(
             break
         time.sleep(1.0)
     if not http_ok:
+        _assert_named_directory_binding(target_binding)
         return [
             "Apache läuft, aber http://127.0.0.1/index.php antwortet nicht mit "
             "HTTP 2xx oder einer lokalen Weiterleitung. Eine abweichende lokale "
             "Port-/VirtualHost-Konfiguration kann die Ursache sein; prüfe bei Bedarf "
             "sudo journalctl -u apache2 --no-pager -n 120."
         ]
+    _assert_named_directory_binding(target_binding)
     return []
 
 
@@ -4526,8 +6310,16 @@ def _restore_preupdate_state(
     install_user: str,
     config: dict,
     role: str,
+    home_traversal_transition: tuple[DirectoryMetadataTransition, ...] | None,
+    target_prebinding: DirectoryMetadataPrestate,
 ) -> tuple[bool, str]:
     """Stellt nach begonnener Zielmutation den gesicherten Altstand wieder her."""
+
+    traversal_restore_error = ""
+    try:
+        _restore_web_home_traversal(home_traversal_transition)
+    except Exception as exc:
+        traversal_restore_error = str(exc).strip() or exc.__class__.__name__
 
     stop_scope = tuple(
         dict.fromkeys(
@@ -4540,37 +6332,88 @@ def _restore_preupdate_state(
     )
     stop_failed = _stop_services_for_restore_best_effort(stop_scope)
     if stop_failed:
+        traversal_detail = (
+            "; zusätzlich blieben die früheren Pfad-Traversierrechte abweichend: "
+            + traversal_restore_error
+            if traversal_restore_error
+            else ""
+        )
         return (
             False,
             "Der automatische Rücklauf begann nicht, weil diese Zieldienste nicht "
-            "sicher gestoppt werden konnten: " + ", ".join(stop_failed),
+            "sicher gestoppt werden konnten: "
+            + ", ".join(stop_failed)
+            + traversal_detail,
         )
 
     try:
         from Installer.backup import restore_quiesced_overlay, restore_verified_backup
+        from Installer.backup_integrity import bind_persistent_install_root
 
-        restore_verified_backup(backup_path, install_path=target_root)
-        restore_quiesced_overlay(
-            quiesced_backup,
-            install_path=target_root,
-            guard=quiesced_guard,
+        def assert_product_identity(*_args: object) -> None:
+            _assert_named_directory_identity(target_prebinding)
+
+        expected_identity = (
+            target_prebinding.parent_device,
+            target_prebinding.parent_inode,
+            target_prebinding.device,
+            target_prebinding.inode,
         )
-        _clear_legacy_update_blockers(backup_path)
-        # Die Zielprojektion schützt erhaltene Laufzeitverzeichnisse während
-        # des Austauschs vor parallelen Schreibern. Nach einem Rücklauf müssen
-        # deren veröffentlichte Alt-Rechte vor jedem Dienststart wieder gelten.
-        _normalize_preserved_web_permissions(
-            Path("/var/www/html"),
-            install_user,
-            config,
-        )
+        with bind_persistent_install_root(
+            target_root,
+            expected_identity=expected_identity,
+        ) as bound_install_root:
+            assert_product_identity()
+            restore_verified_backup(
+                backup_path,
+                install_path=target_root,
+                verified_manifest_guard=assert_product_identity,
+                restored_payload_guard=assert_product_identity,
+                bound_install_root=bound_install_root,
+            )
+            assert_product_identity()
+            restore_quiesced_overlay(
+                quiesced_backup,
+                install_path=target_root,
+                guard=quiesced_guard,
+                restored_payload_guard=assert_product_identity,
+                bound_install_root=bound_install_root,
+            )
+            assert_product_identity()
+            _clear_legacy_update_blockers(backup_path)
+            # Die Zielprojektion schützt erhaltene Laufzeitverzeichnisse während
+            # des Austauschs vor parallelen Schreibern. Nach einem Rücklauf müssen
+            # deren veröffentlichte Alt-Rechte vor jedem Dienststart wieder gelten.
+            _normalize_preserved_web_permissions(
+                Path("/var/www/html"),
+                install_user,
+                config,
+            )
+            assert_product_identity()
     except Exception as exc:
         detail = str(exc).strip() or exc.__class__.__name__
+        traversal_detail = (
+            "; frühere Pfad-Traversierrechte blieben ebenfalls abweichend: "
+            + traversal_restore_error
+            if traversal_restore_error
+            else ""
+        )
         return (
             False,
             "Der automatische Rücklauf aus Vollbackup und ruhender "
             f"Daten-Nachsicherung blieb unvollständig ({detail}). Die E3DC-Control-"
-            "Dienste bleiben gestoppt.",
+            "Dienste bleiben gestoppt"
+            + traversal_detail
+            + ".",
+        )
+
+    if traversal_restore_error:
+        return (
+            False,
+            "Der gesicherte Datei- und Webstand wurde wiederhergestellt, aber die "
+            "früheren Pfad-Traversierrechte blieben abweichend: "
+            + traversal_restore_error
+            + ". Die E3DC-Control-Dienste bleiben gestoppt.",
         )
 
     apache_restored, apache_detail = _restore_apache_security_enablement_best_effort(
@@ -4620,6 +6463,16 @@ def _restore_preupdate_state(
             + ". Die E3DC-Control-Dienste bleiben gestoppt.",
         )
 
+    try:
+        _assert_named_directory_identity(target_prebinding)
+    except Exception as exc:
+        detail = str(exc).strip() or exc.__class__.__name__
+        return (
+            False,
+            "Der Altstand wurde restauriert, aber sein gebundener Produktstamm "
+            f"driftete vor dem Dienststart ({detail}). Die Dienste bleiben gestoppt.",
+        )
+
     start_failed = _start_previous_services_best_effort(
         prestate.active,
         allow_legacy=True,
@@ -4656,7 +6509,9 @@ def _recover_failed_cutover(
     config: dict,
     role: str,
     product_mutated: bool,
+    target_prebinding: DirectoryMetadataPrestate | None,
     replacement_confirmed: bool,
+    home_traversal_transition: tuple[DirectoryMetadataTransition, ...] | None,
 ) -> tuple[str, str | None]:
     """Ordnet den Fehlerpfad ausschließlich nach der erreichten Updatephase."""
 
@@ -4673,6 +6528,7 @@ def _recover_failed_cutover(
             or quiesced_backup is None
             or quiesced_guard is None
             or prestate is None
+            or target_prebinding is None
         ):
             return (
                 "Der Zielbaum wurde bereits verändert, aber der vollständige "
@@ -4692,6 +6548,8 @@ def _recover_failed_cutover(
             install_user=install_user,
             config=config,
             role=role,
+            home_traversal_transition=home_traversal_transition,
+            target_prebinding=target_prebinding,
         )
         return (
             f"{detail} Vollbackup: {backup_path}; ruhende Daten-Nachsicherung: "
@@ -4756,7 +6614,11 @@ def perform_update(
 
     lock_descriptor = _acquire_update_lock()
     try:
-        existing_config = _load_existing_config(target_root)
+        target_prebinding = _read_bound_directory_prestate(target_root)
+        _preflight_web_home_traversal(install_user, target_root)
+        _assert_named_directory_binding(target_prebinding)
+        existing_config = _load_existing_config(target_root, target_prebinding)
+        _assert_named_directory_binding(target_prebinding)
         role_service_intended = False
         config = dict(existing_config)
         active_before: tuple[str, ...] = ()
@@ -4770,9 +6632,14 @@ def perform_update(
         services: tuple[str, ...] = ()
         enable_services: tuple[str, ...] = ()
         prepared_npm_units: frozenset[str] = frozenset()
+        home_traversal_transition: tuple[DirectoryMetadataTransition, ...] | None = None
         warnings: list[str] = []
         try:
-            backup_path = _create_backup(target_root)
+            _assert_no_prejournal_construction_state()
+            _assert_named_directory_binding(target_prebinding)
+            with _bound_update_lock_environment(lock_descriptor):
+                backup_path = _create_backup(target_root, target_prebinding)
+            _assert_named_directory_binding(target_prebinding)
             print(f"[OK] Vollbackup: {backup_path}", flush=True)
             role_service_intended = _role_service_intended(role)
             config = _bind_role_context(
@@ -4784,6 +6651,7 @@ def perform_update(
                 ),
             )
             service_prestate = _capture_service_prestate(target_root)
+            _assert_named_directory_binding(target_prebinding)
             selected_catalog_units = tuple(
                 dict.fromkeys(
                     (
@@ -4821,13 +6689,17 @@ def perform_update(
                 selected_catalog_units,
             )
             warnings.extend(npm_warnings)
+            _assert_named_directory_binding(target_prebinding)
             active_before = service_prestate.active
             cutover_started = True
             _stop_for_cutover(service_prestate.cutover_scope)
+            _assert_named_directory_binding(target_prebinding)
             quiesced_backup, quiesced_guard = _create_stopped_data_backup(
                 target_root,
                 backup_path,
+                target_prebinding,
             )
+            _assert_named_directory_binding(target_prebinding)
             print(f"[OK] Ruhende Daten-Nachsicherung: {quiesced_backup}", flush=True)
             quarantine = _clear_legacy_update_blockers(backup_path)
             if quarantine is not None:
@@ -4835,8 +6707,19 @@ def perform_update(
             _confirm_cutover_quiet(service_prestate.cutover_scope)
             print("[3/4] Ersetze Produktdateien und repariere Rechte …", flush=True)
             product_mutated = True
-            _replace_product_tree(target_root, release_root, install_user)
-            _sync_web_tree(target_root, install_user)
+            target_binding = _replace_product_tree(
+                target_root,
+                release_root,
+                install_user,
+                target_prebinding,
+            )
+            home_traversal_transition = _project_web_home_traversal(
+                install_user,
+                target_root,
+            )
+            _assert_named_directory_binding(target_binding)
+            web_program_files, web_program_directories = _sync_web_tree(release_root)
+            _assert_named_directory_binding(target_binding)
             warnings.extend(
                 _repair_units_and_permissions(
                     target_root,
@@ -4852,6 +6735,9 @@ def perform_update(
                     require_role_peer=(
                         role in {"master", "slave"} and role_service_intended
                     ),
+                    target_binding=target_binding,
+                    web_program_files=web_program_files,
+                    web_program_directories=web_program_directories,
                 )
             )
             services = _services_to_start(
@@ -4905,6 +6791,7 @@ def perform_update(
             warnings.extend(
                 _final_confirmation(
                     target_root,
+                    target_binding,
                     tag.removeprefix("v"),
                     required,
                     _forbidden_services_after_start(
@@ -4941,6 +6828,35 @@ def perform_update(
                     ),
                 ),
             )
+            if quiesced_backup is not None and quiesced_guard is not None:
+                try:
+                    with _bound_update_lock_environment(lock_descriptor):
+                        _remove_stopped_data_backup(
+                            quiesced_backup,
+                            quiesced_guard,
+                        )
+                    print(
+                        "[OK] Temporäre ruhende Daten-Nachsicherung entfernt.",
+                        flush=True,
+                    )
+                    quiesced_backup = None
+                    quiesced_guard = None
+                except Exception as exc:
+                    detail = str(exc).strip() or exc.__class__.__name__
+                    warnings.append(
+                        "Die bestätigte neue Version bleibt aktiv; die temporäre "
+                        "ruhende Daten-Nachsicherung konnte nicht sicher bestätigt "
+                        "entfernt werden: {}. Prüfe später im Install-Center das "
+                        "Backup-Limit; lösche das Verzeichnis nicht manuell.".format(detail)
+                    )
+            warnings.extend(
+                _retry_backup_retention_after_confirmed_start(
+                    target_root,
+                    backup_path,
+                    quiesced_backup,
+                    lock_descriptor,
+                )
+            )
         except UpdateFailure as exc:
             if cutover_started:
                 state, recovery_solution = _safe_recover_failed_cutover(
@@ -4956,7 +6872,9 @@ def perform_update(
                     config=config,
                     role=role,
                     product_mutated=product_mutated,
+                    target_prebinding=target_prebinding,
                     replacement_confirmed=replacement_confirmed,
+                    home_traversal_transition=home_traversal_transition,
                 )
             elif backup_path is not None:
                 recovery_solution = None
@@ -4989,7 +6907,9 @@ def perform_update(
                     config=config,
                     role=role,
                     product_mutated=product_mutated,
+                    target_prebinding=target_prebinding,
                     replacement_confirmed=replacement_confirmed,
+                    home_traversal_transition=home_traversal_transition,
                 )
             else:
                 recovery_solution = None

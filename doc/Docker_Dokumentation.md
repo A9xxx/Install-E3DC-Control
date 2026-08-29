@@ -2,8 +2,21 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.4e`. Die Tags `latest`, `v5.4.4e` und
-`5.4.4e` bezeichnen denselben Stable-Stand.
+Der aktuelle Stable-Stand ist `v5.4.4f`. Die Tags `latest`, `v5.4.4f` und
+`5.4.4f` bezeichnen denselben Stable-Stand.
+
+5.4.4f enthält den korrigierten Start in `PV-Kurve ruhig`, die eindeutige
+Wallboxanzahl sowie die präzisere Projektion von Speicherplan und
+Direktvermarktungsaktion. Die vorhandenen Speicher-, Wallbox-,
+Hausanschluss-, Fahrzeug- und Hardwaregrenzen bleiben wirksam. Die
+Rechtenormalisierung der erhaltenen externen PV-Topologie und die Prüfung des
+Live-Installationspfads als `www-data` betreffen den Bare-Metal-Ziel-Updater.
+Installer-verwaltete System-Backup-Familien und Web-Sicherungen werden auf
+jeweils drei Generationen begrenzt; persistente Docker-Volumes und fremde
+Host-Backups werden dadurch nicht gelöscht. Eine bewusst zurückgesetzte
+Matter-Kopplung wird über einen versionierten privaten Auftrag beim nächsten
+Containerstart verarbeitet. Ein älteres Image ohne diesen Vertrag verbraucht
+den Auftrag nicht.
 
 5.4.4e korrigiert den Bare-Metal-Webupdatepfad für die produktive RAM-Disk und
 den Rücklauf nach einem Projektionsfehler. Das Containerprodukt und seine
@@ -104,6 +117,22 @@ Unmittelbar vor dem Workerstart wird derselbe Root erneut gegen die beim Boot
 gebundene Identität geprüft. Der Worker setzt als `www-data` vor Node.js
 zusätzlich `umask 077`; dadurch bleiben auch während des Betriebs neu erzeugte
 Fabric-, Endpoint-, Event- und Sessiondateien privat.
+
+Ein über die Matter-Seite bestätigter Kopplungsreset schreibt ausschließlich
+den privaten, versionierten Auftrag in das persistente Datenvolume und fordert
+den vorgesehenen vollständigen Container-Neustart an. Vor dem Matter-Worker
+verschiebt der root-eigene Wächter den gebundenen Storage atomar in die feste
+private `.matter-storage-reset-quarantine`, leert sie iterativ und entfernt
+Pairingdatei sowie Auftrag erst nach dem vollständigen Erfolgsbeweis. Bei einem
+Zeitlimit oder Teilfehler bleibt der Auftrag erhalten und derselbe Ablauf kann
+sicher wiederholt werden. Ein alter Wächter ohne die neue Fähigkeit führt
+weiter nur seine bisherige Härtung aus. Vor jedem Reset läuft derselbe normale
+Startup-Preflight: Nur ein vollständig bindbarer regulärer Baum darf dabei auf
+den vorgesehenen Besitzer und die privaten Modi normalisiert werden. Der Reset
+selbst repariert keine alten Rechte und erteilt keine Löschautorität für
+Hardlinks, fremde Mounts, Symlinks, Sonderknoten, Rootaustausch oder
+Identitätsdrift; diese Fälle bleiben unverändert fail-closed und erhalten eine
+konkrete Reparaturmeldung.
 
 Docker ist ausschließlich für eine eigenständige Instanz mit exakt
 `ha_mode=off` freigegeben. HA-Master/-Slave und die read-only Shadow-Instanz
@@ -315,7 +344,7 @@ unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.4e` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.4f` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -342,7 +371,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.4e` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.4f` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash

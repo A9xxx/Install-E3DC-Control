@@ -696,7 +696,50 @@ function e3dcWbTxTruthy($value) {
     return in_array(strtolower(trim((string)$value)), ['1', 'true', 'yes', 'on'], true);
 }
 
-function e3dcWbTxManualPlanRequired(array $flat, $wbId) {
+function e3dcWbTxRuntimeWb2CandidateContract($path, $nowTs = null) {
+    $raw = e3dcReadRegularFileBound($path, 4194304);
+    $payload = !is_string($raw) || strlen($raw) < 2
+        ? null
+        : json_decode($raw, true);
+    $now = is_numeric($nowTs) ? (float)$nowTs : (float)time();
+    if (!e3dcWallbox2RuntimeEvidence($payload, $now, 60.0)) return null;
+
+    $details = [];
+    foreach (($payload['wb_details'] ?? []) as $detail) {
+        if (!is_array($detail)) continue;
+        $id = (int)($detail['id'] ?? 0);
+        if (($id === 1 || $id === 2) && !isset($details[$id])) {
+            $details[$id] = $detail;
+        }
+    }
+    $discovery = $details[2]['chargepoint_discovery_contract'];
+    $wb1Output = $details[1]['physical_output_contract'];
+    $wb2Output = $details[2]['physical_output_contract'];
+    return [
+        'schema_version' => 'wallbox_candidate_runtime_wb2_v1',
+        'valid' => true,
+        'manager_ts' => (float)$payload['ts'],
+        'source' => (string)$discovery['source'],
+        'detected_at' => (float)$discovery['detected_at'],
+        'status_confirmed' => true,
+        'status_confirmed_ts' => (float)$discovery['status_confirmed_ts'],
+        'controller_identity' => (string)$wb2Output['controller_identity'],
+        'endpoint_kind' => (string)$wb2Output['endpoint_kind'],
+        'cp_id' => (int)$discovery['cp_id'],
+        'peer_cp_id' => (int)$discovery['peer_cp_id'],
+        'physical_output_identity' => (string)$wb2Output['identity'],
+        'peer_physical_output_identity' => (string)$wb1Output['identity'],
+        'physical_output_allowed' => true,
+    ];
+}
+
+function e3dcWbTxManualPlanRequired(array $flat, $wbId, $runtimeWb2 = null) {
+    if ((int)$wbId === 2) {
+        if (isWallbox2ExplicitlyDisabledConfig($flat)) return false;
+        if (!hasWallbox2ExplicitConfig($flat) && !is_array($runtimeWb2)) {
+            return false;
+        }
+    }
     $modeKey = 'wb' . $wbId . '_mode';
     if (array_key_exists($modeKey, $flat) && trim((string)$flat[$modeKey]) !== '' && (int)$flat[$modeKey] === 0) return false;
     $legacy = $wbId === 1 ? ($flat['wbhour'] ?? $flat['Wbhour'] ?? 0) : 0;
@@ -1195,13 +1238,24 @@ function e3dcWallboxPlanTransaction(array $updates, array $options = []) {
         }
 
         $flatCandidate = e3dcWbTxFlattenConfig($candidate);
+        $runtimeWb2 = null;
+        if (!isWallbox2ExplicitlyDisabledConfig($flatCandidate)
+            && !hasWallbox2ExplicitConfig($flatCandidate)) {
+            $runtimeWb2 = e3dcWbTxRuntimeWb2CandidateContract(
+                $ramdisk . '/wallbox_native.json'
+            );
+        }
         $required = [];
-        foreach ([1, 2] as $wbId) if (e3dcWbTxManualPlanRequired($flatCandidate, $wbId)) $required[] = $wbId;
-        if (!e3dcWbTxPrivateJson($jobDir . '/candidate_request.json', [
+        foreach ([1, 2] as $wbId) if (e3dcWbTxManualPlanRequired($flatCandidate, $wbId, $runtimeWb2)) $required[] = $wbId;
+        $candidateRequest = [
             'schema' => E3DC_WB_TX_SCHEMA,
             'operation' => $operation,
             'require_plan' => $required,
-        ])) throw new RuntimeException('Planner-Auftrag konnte nicht geschrieben werden.');
+        ];
+        if (is_array($runtimeWb2)) {
+            $candidateRequest['runtime_wb2'] = $runtimeWb2;
+        }
+        if (!e3dcWbTxPrivateJson($jobDir . '/candidate_request.json', $candidateRequest)) throw new RuntimeException('Planner-Auftrag konnte nicht geschrieben werden.');
         if (!e3dcWbTxPrivateJson($jobDir . '/candidate_config.json', $candidate)) {
             throw new RuntimeException('Konfigurationskandidat konnte nicht geschrieben werden.');
         }

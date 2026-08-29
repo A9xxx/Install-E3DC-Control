@@ -1,7 +1,7 @@
 # Backup-System
 
 Der Installer legt vor jedem Update und Rollback einen verifizierten
-Sicherungspunkt an. Ein fehlendes, leeres, unvollstaendiges oder nicht lesbares
+Sicherungspunkt an. Ein fehlendes, leeres, unvollständiges oder nicht lesbares
 Backup bricht den Vorgang ab. Diese Sperre kann nicht umgangen werden.
 
 Die Konsolenbeispiele verwenden den zuvor geprüften absoluten Produktpfad:
@@ -13,7 +13,7 @@ test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 
 ## Speicherort und Schutz
 
-Der Standardpfad liegt ausserhalb von Installations- und Benutzer-Home-Baeumen
+Der Standardpfad liegt außerhalb von Installations- und Benutzer-Home-Bäumen
 im dafür vorgesehenen System-Backupbereich:
 
 ```text
@@ -30,10 +30,10 @@ Backup-Verzeichnisse erhalten Modus `0700`, Dateien `0600`.
 
 ## Gesicherter Umfang
 
-Vorhandene Quellen werden vollstaendig und ohne Dateiendungsfilter erfasst:
+Vorhandene Quellen werden vollständig und ohne Dateiendungsfilter erfasst:
 
 - der gesamte Installationsbaum ohne Versionsmetadaten, lokale Entwicklungs-/
-  Koordinationsverzeichnisse und Backup-Baeume;
+  Koordinationsverzeichnisse und Backup-Bäume;
 - V4- und Legacy-Konfiguration, Statistiken und Datenbanken;
 - Matter-Kopplungsdaten, Lernprofile, Manual-Locks und weitere Zustandsdaten;
 - Web-Programmdateien und Web-Daten;
@@ -42,22 +42,42 @@ Vorhandene Quellen werden vollstaendig und ohne Dateiendungsfilter erfasst:
 
 Fehlende optionale Quellen werden im Manifest vermerkt. Ist eine vorhandene
 Quelle nur teilweise lesbar, gilt das gesamte Backup als fehlgeschlagen. Der
-unvollstaendige, manifestlose Ordner bleibt als Quarantaenebeleg liegen und
+unvollständige, manifestlose Ordner bleibt als Quarantänebeleg liegen und
 wird weder von der Retention gelöscht noch als Restore angeboten.
 
 ## Manifest, Restore und Retention
 
-Jeder gueltige Sicherungspunkt enthaelt `backup-manifest.json` und
-`backup-manifest.sha256`. Das Manifest fuehrt Dateisatz, Groesse, Besitzer,
+Jeder gültige Sicherungspunkt enthält `backup-manifest.json` und
+`backup-manifest.sha256`. Das Manifest führt Dateisatz, Größe, Besitzer,
 Gruppe, Modus, Verzeichnisstruktur, Kategorie, Restore-Ziel und SHA-256 auf.
 SQLite wird über die Online-Backup-Schnittstelle konsistent gesichert.
 
 Beim Restore wird zuerst der gesamte Satz geprüft und vorbereitet. Alle Ziele
 bilden eine Transaktion: Scheitert ein Austausch, werden bereits ersetzte
-Dateien exakt zurueckgesetzt und neu angelegte Ziele entfernt. Die Retention
-loescht nur verifizierte direkte Kindverzeichnisse des passenden Backup-Typs;
-fremde Dateien, Symlinks, unvollstaendige Ordner und der gerade ausgewaehlte
+Dateien exakt zurückgesetzt und neu angelegte Ziele entfernt. Die Retention
+löscht nur verifizierte direkte Kindverzeichnisse des passenden Backup-Typs;
+fremde Dateien, Symlinks, unvollständige Ordner und der gerade ausgewählte
 Rollback-Sicherungspunkt bleiben unangetastet.
+
+Nach der Verifikation des neuen Backups gelten zwei getrennte Zielgrenzen des
+automatisch verwalteten Bestands: maximal drei System-Backup-Familien und
+maximal drei Web-Installer-Sicherungen. Eine ruhende Daten-Nachsicherung gehört zu ihrem
+Vollbackup und belegt keinen zusätzlichen Familienplatz. Das frisch erzeugte
+Backup sowie ein für den Rollback ausgewähltes Backup zählen innerhalb der
+drei Plätze, bleiben während ihrer Schutzbindung aber immer erhalten.
+
+Bei einem aktiven Update- oder Recovery-Beleg bleibt die gesamte Retention ein
+mutationsfreier Sicherheitsstopp. Sind in einem ansonsten freien
+Wartungslauf ausnahmsweise mehr als drei gültige Familien gleichzeitig
+geschützt, wird der Vorgang nicht abgebrochen: Ungeschützte Altbestände werden
+soweit sicher möglich entfernt, die noch offene Grenze wird sichtbar gemeldet
+und bei der nächsten sicheren Backup-Bereinigung erneut angewendet. Nicht
+verifizierbare, fremde oder quarantänisierte Verzeichnisse werden niemals zur
+Einhaltung einer bloßen Zahl zwangsweise gelöscht.
+
+Die Drei-Generationen-Grenze reduziert den dauerhaften Speicherbedarf. Vor
+einem Update wird weiterhin ein vollständiges neues Backup geschrieben; die
+Grenze allein reduziert daher nicht die Schreibmenge dieses einzelnen Updates.
 
 ## Manuelles Backup
 
@@ -65,4 +85,4 @@ Rollback-Sicherungspunkt bleiben unangetastet.
 bash "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
-Waehle **`13) System-Backup erstellen / verwalten`**.
+Wähle **`6) Backup erstellen / verwalten`**.

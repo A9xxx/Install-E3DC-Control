@@ -13054,6 +13054,11 @@ def apply_direct_marketing_parallel_auto_reservation_cap(
     if not bool(
         cfg_bool(cfg, "direct_marketing_enable", False)
         and configured_mode == "eco_plus"
+        and cfg_bool(
+            cfg,
+            "direct_marketing_passive_normal_zero_charge_enable",
+            False,
+        )
     ):
         return decision
 
@@ -31002,6 +31007,8 @@ def _phase5_fresh_power_settings_target_confirmed(
 
 
 def _phase5_charge_block_wait_continuation_contract(
+    cfg: Dict[str, Any],
+    plan: Dict[str, Any],
     arbitration: Dict[str, Any],
     power_settings: Dict[str, Any],
     previous_state: Optional[Dict[str, Any]],
@@ -31098,6 +31105,54 @@ def _phase5_charge_block_wait_continuation_contract(
         "DIRECT_MARKETING_CHARGE_BLOCK_WAIT_SAFE_FALLBACK",
     }:
         result["reason"] = "previous_charge_block_owner_missing"
+        return result
+
+    direct = direct_marketing_plan(plan if isinstance(plan, dict) else {})
+    policy_ctx = direct_marketing_policy_context(direct)
+    canonical = (
+        arbitration.get("canonical_direct_marketing_slot")
+        if isinstance(
+            arbitration.get("canonical_direct_marketing_slot"),
+            dict,
+        )
+        else {}
+    )
+    current_action = str(canonical.get("action") or "").strip().upper()
+    target_state = str(policy_ctx.get("target_state") or "").strip().upper()
+    if target_state == "NORMAL" and current_action not in {
+        "CHARGE_BLOCK_WAIT",
+        "PV_STORE",
+        "ECONOMIC_EXPORT",
+        "HEADROOM_EXPORT",
+        "GRID_CHARGE",
+    }:
+        passive_zero_charge_enabled = cfg_bool(
+            cfg,
+            "direct_marketing_passive_normal_zero_charge_enable",
+            False,
+        )
+        passive_normal_binding = direct_marketing_passive_normal_slot_binding(
+            plan if isinstance(plan, dict) else {},
+            now_s,
+        )
+        if not bool(
+            passive_zero_charge_enabled
+            and passive_normal_binding.get("valid") is True
+        ):
+            result.update({
+                "reason": (
+                    "passive_normal_zero_charge_not_enabled"
+                    if not passive_zero_charge_enabled
+                    else "passive_normal_binding_invalid"
+                ),
+                "passive_normal_zero_charge_enabled": (
+                    passive_zero_charge_enabled
+                ),
+                "passive_normal_binding": passive_normal_binding,
+            })
+            return result
+    elif not target_state and not current_action:
+        result["reason"] = "current_direct_marketing_action_missing"
         return result
 
     field_active = bool(
@@ -31433,6 +31488,7 @@ def _phase5_active_direct_marketing_restrictive_fallback(
     arbitration: Dict[str, Any],
     path_contract: Dict[str, Any],
     reason_code: Optional[str],
+    now_s: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     """Hält aktives DV bei jedem kanonischen Fehler einseitig ladegesperrt.
 
@@ -31481,6 +31537,60 @@ def _phase5_active_direct_marketing_restrictive_fallback(
         )
     )
     if not active_owner:
+        return None
+
+    policy_ctx = direct_marketing_policy_context(direct)
+    target_state = str(policy_ctx.get("target_state") or "").strip().upper()
+    canonical = (
+        arbitration.get("canonical_direct_marketing_slot")
+        if isinstance(
+            arbitration.get("canonical_direct_marketing_slot"),
+            dict,
+        )
+        else {}
+    )
+    current_action = str(canonical.get("action") or "").strip().upper()
+    ready_no_action = (
+        arbitration.get("ready_no_action_release")
+        if isinstance(arbitration.get("ready_no_action_release"), dict)
+        else {}
+    )
+    ready_no_action_house_supply = bool(
+        current_action == "HOUSE_SUPPLY"
+        and ready_no_action.get("schema")
+        == "phase5_ready_no_action_house_supply_v1"
+        and ready_no_action.get("valid") is True
+        and ready_no_action.get("effect") == "LEGACY_AUTO_UNCHANGED"
+        and ready_no_action.get("commands_allowed") is False
+        and ready_no_action.get("selected_action") == "HOUSE_SUPPLY"
+        and arbitration.get("selected") is True
+        and arbitration.get("executable") is False
+        and arbitration.get("commands_allowed") is False
+        and max(0, safe_int(arbitration.get("selected_power_w"), 0)) == 0
+    )
+    if target_state == "NORMAL" and not current_action:
+        # Ein vollständig ungebundener neutraler Slot besitzt keine
+        # Aktionsbehauptung. Hier bleibt die vorhandene E3/DC-Automatik
+        # unangetastet; Diagnose und Prognose bleiben rein lesend.
+        return None
+    if target_state == "NORMAL" and ready_no_action_house_supply:
+        # Der streng gebundene HOUSE_SUPPLY-Vertrag wird im regulären Pfad
+        # als befehlslose AUTO-Freigabe behandelt. Ein Fehler außerhalb dieses
+        # Vertrags darf dagegen niemals eine behauptete oder unbekannte
+        # DV-Aktion in den permissiven Legacy-Laderahmen zurückfallen lassen.
+        if not cfg_bool(
+            cfg,
+            "direct_marketing_passive_normal_zero_charge_enable",
+            False,
+        ):
+            return None
+        passive_normal_binding = direct_marketing_passive_normal_slot_binding(
+            plan,
+            time.time() if now_s is None else float(now_s),
+        )
+        if passive_normal_binding.get("valid") is not True:
+            return None
+    elif not target_state and not current_action:
         return None
 
     owner_safety_veto = _phase5_owner_safety_veto_contract(
@@ -31615,6 +31725,7 @@ def _phase5_owner_aware_fallback(
     arbitration: Dict[str, Any],
     path_contract: Dict[str, Any],
     reason_code: Optional[str] = None,
+    now_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     restricted = _phase5_active_direct_marketing_restrictive_fallback(
         cfg,
@@ -31624,6 +31735,7 @@ def _phase5_owner_aware_fallback(
         arbitration,
         path_contract,
         reason_code,
+        now_s,
     )
     if restricted is not None:
         return restricted
@@ -35094,13 +35206,12 @@ def _phase5_direct_marketing_default_charge_guard_contract(
     path_contract: Dict[str, Any],
     now_s: float,
 ) -> Dict[str, Any]:
-    """Sperrt im aktiven DV-Plan jede nicht explizit autorisierte Ladung.
+    """Sperrt aktive DV-Aktionen ohne explizit autorisierte Ladung.
 
-    DV ist eine positive Lade-Whitelist: Nur ein vollständig kanonischer,
-    aktuell ausgewählter ``PV_STORE``-Slot darf ``max_charge_w > 0`` öffnen.
-    Jeder andere aktuelle DV-Slot bleibt einseitig ladegesperrt. Dadurch kann
-    weder eine neue Slotart noch eine kurz unvollständige Replan-Generation auf
-    den permissiven E3/DC-AUTO-Ladepfad zurückfallen.
+    Ein vollständig kanonischer ``PV_STORE``-Slot darf laden. Echte Export-
+    und Ladeblockaktionen bleiben dagegen einseitig gesperrt. Ein passiver
+    ``NORMAL``-/Hausversorgungsslot greift nur mit dem anlagenspezifischen
+    0-W-Pilot und seiner vollständigen Slotbindung in E3/DC-AUTO ein.
     """
 
     result: Dict[str, Any] = {
@@ -35191,6 +35302,41 @@ def _phase5_direct_marketing_default_charge_guard_contract(
         if isinstance(direct.get("policy_decision"), dict)
         else {}
     )
+    policy_target_state = str(
+        policy.get("dv_target_state") or ""
+    ).strip().upper()
+    canonical_action = str(
+        canonical_direct.get("action") or ""
+    ).strip().upper()
+    if policy_target_state == "NORMAL" and canonical_action not in {
+        "CHARGE_BLOCK_WAIT",
+        "PV_STORE",
+        "ECONOMIC_EXPORT",
+        "HEADROOM_EXPORT",
+        "GRID_CHARGE",
+    }:
+        passive_zero_charge_enabled = cfg_bool(
+            cfg,
+            "direct_marketing_passive_normal_zero_charge_enable",
+            False,
+        )
+        passive_normal_binding = direct_marketing_passive_normal_slot_binding(
+            plan,
+            now_s,
+        )
+        result.update({
+            "passive_normal_zero_charge_enabled": passive_zero_charge_enabled,
+            "passive_normal_binding": passive_normal_binding,
+        })
+        if not passive_zero_charge_enabled:
+            result["reason"] = "passive_normal_zero_charge_not_enabled"
+            return result
+        if passive_normal_binding.get("valid") is not True:
+            result["reason"] = "passive_normal_binding_invalid"
+            return result
+    elif not policy_target_state and not canonical_action:
+        result["reason"] = "current_direct_marketing_action_missing"
+        return result
     timeline = (
         direct.get("policy_timeline")
         if isinstance(direct.get("policy_timeline"), list)
@@ -35870,6 +36016,7 @@ def apply_storage_dispatch_phase5(
             diagnostic,
             path_contract,
             reason_code,
+            now_value,
         )
 
     baseline_state = str(baseline.get("state") or "")
@@ -35920,6 +36067,8 @@ def apply_storage_dispatch_phase5(
             "hardware_effect": False,
         }
         continuation = _phase5_charge_block_wait_continuation_contract(
+            cfg,
+            plan,
             arbitration,
             power_settings if isinstance(power_settings, dict) else {},
             previous_state,
@@ -36376,6 +36525,8 @@ def apply_storage_dispatch_phase5(
             },
         })
     continuation = _phase5_charge_block_wait_continuation_contract(
+        cfg,
+        plan,
         arbitration,
         power_settings if isinstance(power_settings, dict) else {},
         previous_state,
@@ -36447,9 +36598,23 @@ def apply_storage_dispatch_phase5(
 
     if str(arbitration.get("selected_action") or "").upper() == "HOUSE_SUPPLY":
         house_contract = storage_action_contract("HOUSE_SUPPLY") or {}
+        ready_no_action = (
+            arbitration.get("ready_no_action_release")
+            if isinstance(
+                arbitration.get("ready_no_action_release"),
+                dict,
+            )
+            else {}
+        )
         if bool(
             house_contract.get("effect") == "AUTO_CHARGE_CAP"
             and house_contract.get("phase5_command") is False
+            and ready_no_action.get("schema")
+            == "phase5_ready_no_action_house_supply_v1"
+            and ready_no_action.get("valid") is True
+            and ready_no_action.get("effect") == "LEGACY_AUTO_UNCHANGED"
+            and ready_no_action.get("commands_allowed") is False
+            and ready_no_action.get("selected_action") == "HOUSE_SUPPLY"
             and arbitration.get("selected") is True
             and arbitration.get("executable") is False
             and arbitration.get("commands_allowed") is False
@@ -36459,6 +36624,58 @@ def apply_storage_dispatch_phase5(
             )
             == 0
         ):
+            passive_zero_charge_enabled = cfg_bool(
+                cfg,
+                "direct_marketing_passive_normal_zero_charge_enable",
+                False,
+            )
+            passive_normal_binding = (
+                direct_marketing_passive_normal_slot_binding(
+                    plan,
+                    now_value,
+                )
+            )
+            if not bool(
+                passive_zero_charge_enabled
+                and passive_normal_binding.get("valid") is True
+            ):
+                released = _phase5_effectless_hold(
+                    baseline,
+                    arbitration,
+                )
+                diagnostic = released["storage_dispatch_phase5"]
+                diagnostic.update({
+                    "selected_source": (
+                        "canonical_phase5_passive_house_supply_release"
+                    ),
+                    "selection_class": "passive_auto_release",
+                    "attempted": False,
+                    "acknowledged": False,
+                    "confirmed": False,
+                    "ready_no_action_release": ready_no_action,
+                    "execution_intent": {
+                        "class": "passive_auto_release",
+                        "authorized": False,
+                        "action": "HOUSE_SUPPLY",
+                        "power_w": 0,
+                        "owner": "legacy_storage_manager",
+                    },
+                    "translation": {
+                        "action": "HOUSE_SUPPLY",
+                        "requested_power_w": 0,
+                        "translated": False,
+                        "reason_code": (
+                            "PASSIVE_NORMAL_ZERO_CHARGE_NOT_ENABLED"
+                            if not passive_zero_charge_enabled
+                            else "PASSIVE_NORMAL_BINDING_INVALID"
+                        ),
+                    },
+                    "passive_normal_zero_charge_enabled": (
+                        passive_zero_charge_enabled
+                    ),
+                    "passive_normal_binding": passive_normal_binding,
+                })
+                return released
             return _phase5_passive_house_supply_auto_cap(
                 cfg,
                 baseline,
@@ -36482,6 +36699,7 @@ def apply_storage_dispatch_phase5(
             arbitration,
             path_contract,
             "PHASE5_ACTIVE_DIRECT_MARKETING_HOLD_CHARGE_BLOCK",
+            now_value,
         )
         if restrictive_hold is not None:
             return restrictive_hold

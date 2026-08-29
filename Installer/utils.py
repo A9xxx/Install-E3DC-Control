@@ -1046,7 +1046,7 @@ def _persist_bound_venv_binding(
 
 V4_SYSTEM_PACKAGES = [
     # Web-Server
-    "apache2", "php", "libapache2-mod-php", "php-curl", "php-sqlite3", "php-mbstring",
+    "apache2", "php", "php-cli", "libapache2-mod-php", "php-curl", "php-sqlite3", "php-mbstring",
     # Python Grundausstattung
     "python3", "python3-pip", "python3-venv",
     "python3-websockets",

@@ -915,7 +915,7 @@ $tooltips = [
     "wb1_e3dc_wbchar6_compat_enable" => "Empfohlene Community-Regelung für E3/DC efy, Easy Connect und bestehende E3/DC-Anlagen: Modus und Strom laufen über den flüchtigen WBchar6-Rahmen. Startimpulse sind je bestätigter Stop-Episode begrenzt.",
     "wb_native_ip"           => "IP-Adresse Wallbox 1 (leer bei E3DC-eigener Wallbox, die per RSCP gesteuert wird).",
     "wb1_topic_prefix"       => "MQTT Topic Prefix für openWB 1, z.B. 'openWB/simpleAPI/chargepoint'.",
-    "wb_native_type2"        => "Hardware-Typ Wallbox 2 (optional). Leer = keine zweite Wallbox.",
+    "wb_native_type2"        => "Hardware-Typ Wallbox 2 (optional). Ein fehlender oder leerer Altbestandswert bleibt unverändert und erlaubt nur die frisch bestätigte openWB-Autoerkennung; 'none' schaltet Wallbox 2 ausdrücklich aus.",
     "wb_native_ip2"          => "IP-Adresse Wallbox 2.",
     "wb2_topic_prefix"       => "MQTT Topic Prefix für openWB 2.",
     "wbminsoc"               => "Minimaler Batterie-SoC (%) damit die Wallbox laden darf. Unter diesem Wert: Laden gesperrt.",
@@ -1090,6 +1090,49 @@ function e3dc_cfg_scalar($data, $key, $default = '') {
     $value = $data[$key];
     if (is_array($value) || is_object($value)) return $default;
     return trim((string)$value);
+}
+
+/**
+ * Bewahrt fehlende und historisch leere WB2-Typen einer Altinstallation.
+ *
+ * Der Formular-Sentinel wird nie gespeichert. Ein altes, bereits geöffnetes
+ * Formular kann weiterhin einen Leerstring senden; solange der Schlüssel im
+ * gebundenen Bestand wirklich fehlt, darf auch das keine unbeabsichtigte
+ * Abschaltung erzeugen. `none` bleibt die ausdrückliche Nutzerentscheidung.
+ */
+function e3dc_config_editor_preserve_missing_wb2_type($postedValues, $existing) {
+    if (!is_array($postedValues) || !is_array($existing)) {
+        return is_array($postedValues) ? $postedValues : [];
+    }
+    if (!array_key_exists('wb_native_type2', $postedValues)) {
+        return $postedValues;
+    }
+    $postedType = $postedValues['wb_native_type2'];
+    if (is_array($postedType) || is_object($postedType)) {
+        return $postedValues;
+    }
+    $normalized = strtolower(trim((string)$postedType));
+    $existingMissing = !array_key_exists('wb_native_type2', $existing);
+    $existingBlank = !$existingMissing
+        && !is_array($existing['wb_native_type2'])
+        && !is_object($existing['wb_native_type2'])
+        && trim((string)$existing['wb_native_type2']) === '';
+    if ($normalized === '__legacy_missing__') {
+        unset($postedValues['wb_native_type2']);
+    } elseif ($normalized === '__legacy_blank__') {
+        if ($existingBlank) {
+            $postedValues['wb_native_type2'] = '';
+        } else {
+            unset($postedValues['wb_native_type2']);
+        }
+    } elseif (($existingMissing || $existingBlank) && $normalized === '') {
+        if ($existingMissing) {
+            unset($postedValues['wb_native_type2']);
+        } else {
+            $postedValues['wb_native_type2'] = '';
+        }
+    }
+    return $postedValues;
 }
 
 function e3dc_cfg_has_address($data, $key) {
@@ -2892,6 +2935,10 @@ if ($configEditorRequestMethod === 'POST') {
 
         // Alle geposteten Werte übernehmen & Typen konvertieren
         $guard_warnings = [];
+        $posted_values = e3dc_config_editor_preserve_missing_wb2_type(
+            $posted_values,
+            $v4_data
+        );
         $old_wp_type = e3dc_cfg_scalar($v4_data, 'wp_type', $defaults['wp_type'] ?? '-1');
         $new_wp_type = e3dc_cfg_scalar($posted_values, 'wp_type', $old_wp_type);
         $safe_wp_type = in_array($old_wp_type, ['0', '1', '3', '4', '5', '6'], true)
@@ -3167,7 +3214,8 @@ if ($configEditorRequestMethod === 'POST') {
         if ($normalize_wb_type_for_save($v4_data['wb_native_type'] ?? '') !== 'openwb') {
             $v4_data['wb1_topic_prefix'] = '';
         }
-        if ($normalize_wb_type_for_save($v4_data['wb_native_type2'] ?? '') !== 'openwb') {
+        if (array_key_exists('wb_native_type2', $v4_data)
+            && $normalize_wb_type_for_save($v4_data['wb_native_type2']) !== 'openwb') {
             $v4_data['wb2_topic_prefix'] = '';
         }
 
@@ -4605,8 +4653,21 @@ async function readConfirmedConfigJson(response) {
             } elseif ($simpleWpType === '-1' && $simpleLuxEnabled && $simpleDetectedWpType !== '-1') {
                 $simpleWpType = $simpleDetectedWpType;
             }
-            $simpleWbType1 = strtolower(trim($simpleRaw('wb_native_type', 'e3dc_auto')));
-            $simpleWbType2 = strtolower(trim($simpleRaw('wb_native_type2', '')));
+            $simpleWbType1 = normalizeWallboxTypeConfig($simpleRaw('wb_native_type', 'e3dc_auto'));
+            $simpleWbType2Present = array_key_exists('wb_native_type2', $config);
+            $simpleWbType2Raw = $simpleWbType2Present
+                ? trim($simpleRaw('wb_native_type2', ''))
+                : '';
+            $simpleWbType2 = !$simpleWbType2Present
+                ? '__legacy_missing__'
+                : ($simpleWbType2Raw === ''
+                    ? '__legacy_blank__'
+                    : normalizeWallboxTypeConfig($simpleWbType2Raw));
+            if ($simpleWbType2Present
+                && $simpleWbType2Raw !== ''
+                && !isConfiguredWallboxTypeConfig($simpleWbType2)) {
+                $simpleWbType2 = 'none';
+            }
             $simpleTypeOptions = [
                 'none' => 'Keine Wallbox',
                 'e3dc_auto' => 'E3/DC automatisch (efy / easy connect / multi connect)',
@@ -4855,7 +4916,12 @@ async function readConfirmedConfigJson(response) {
                         <div class="col-md-6">
                             <label class="config-label">Wallbox 2</label>
                             <select class="form-select config-input" name="values[wb_native_type2]" data-simple-config-field>
-                                <option value="" <?= $simpleWbType2 === '' ? 'selected' : '' ?>>Keine zweite Wallbox</option>
+                                <?php if (!$simpleWbType2Present): ?>
+                                    <option value="__legacy_missing__" selected>Altbestand automatisch erkennen (unverändert)</option>
+                                <?php elseif ($simpleWbType2 === '__legacy_blank__'): ?>
+                                    <option value="__legacy_blank__" selected>Leerer Altbestandswert – automatisch erkennen (unverändert)</option>
+                                <?php endif; ?>
+                                <option value="none" <?= $simpleWbType2 === 'none' ? 'selected' : '' ?>>Keine zweite Wallbox</option>
                                 <?php foreach (array_diff_key($simpleTypeOptions, ['none' => true]) as $typeValue => $typeLabel): ?>
                                     <option value="<?= htmlspecialchars($typeValue) ?>" <?= $simpleWbType2 === $typeValue ? 'selected' : '' ?>><?= htmlspecialchars($typeLabel) ?></option>
                                 <?php endforeach; ?>
@@ -5990,8 +6056,21 @@ async function readConfirmedConfigJson(response) {
                 // Aber wir schreiben ihn nicht hart in das Value-Attribut wenn es leer bleiben soll
                 $wbTypeDisplay = ($wbType === '') ? ($defaults['wb_native_type'] ?? '') : $wbType;
                 $wbTypeDisplay = $normaliseWbType($wbTypeDisplay);
-                $wbType2 = $normaliseWbType($val('wb_native_type2'));
-                $hasSecondWallbox = !in_array($wbType2, ['', 'none'], true);
+                $wbType2Present = array_key_exists('wb_native_type2', $config);
+                $wbType2Raw = $wbType2Present
+                    ? trim($rawVal('wb_native_type2'))
+                    : '';
+                $wbType2 = !$wbType2Present
+                    ? '__legacy_missing__'
+                    : ($wbType2Raw === ''
+                        ? '__legacy_blank__'
+                        : $normaliseWbType($wbType2Raw));
+                if ($wbType2Present
+                    && $wbType2Raw !== ''
+                    && !isConfiguredWallboxTypeConfig($wbType2)) {
+                    $wbType2 = 'none';
+                }
+                $hasSecondWallbox = !in_array($wbType2, ['', 'none', '__legacy_missing__', '__legacy_blank__'], true);
                 $openWbAutoDiscovery = $isTrue('wb_openwb_auto_discovery');
                 $openWbAutoRole = $isTrue('wb_openwb_auto_role_enable');
                 $openWbCpOptions1 = ($wbTypeDisplay === 'openwb') ? e3dc_openwb_discover_chargepoints($rawVal('wb_native_ip')) : [];
@@ -6103,7 +6182,12 @@ async function readConfirmedConfigJson(response) {
                     <div class="col-md-6" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
                         <label class="config-label text-info" data-tooltip="Modell der zweiten Wallbox (optional).">Wallbox 2 Modell / API</label>
                         <select id="wb_type_2" class="form-select config-input" name="values[wb_native_type2]" onchange="updateWbIpStatus(2)">
-                            <option value="" <?= ($wbType2 === '') ? 'selected' : '' ?>>Deaktiviert</option>
+                            <?php if (!$wbType2Present): ?>
+                                <option value="__legacy_missing__" selected>Altbestand automatisch erkennen (unverändert)</option>
+                            <?php elseif ($wbType2 === '__legacy_blank__'): ?>
+                                <option value="__legacy_blank__" selected>Leerer Altbestandswert – automatisch erkennen (unverändert)</option>
+                            <?php endif; ?>
+                            <option value="none" <?= ($wbType2 === 'none') ? 'selected' : '' ?>>Deaktiviert / keine Wallbox 2</option>
                             <option value="go-e" <?= ($wbType2 === 'go-e') ? 'selected' : '' ?>>go-eCharger (HTTP API v2)</option>
                             <option value="openwb" <?= ($wbType2 === 'openwb') ? 'selected' : '' ?>>openWB Controller (HTTP simpleAPI 2.1.9)</option>
                             <option value="openwb_pro" <?= ($wbType2 === 'openwb_pro') ? 'selected' : '' ?>>openWB Pro (connect.php)</option>
@@ -6293,7 +6377,7 @@ async function readConfirmedConfigJson(response) {
                                 const buttonWrap = document.getElementById('wallbox_second_toggle_wrap');
                                 if (forceSecond === true && addButton) addButton.dataset.forceSecond = '1';
                                 if (forceSecond === false && addButton) delete addButton.dataset.forceSecond;
-                                const configured = !['', 'none', 'off', 'disabled'].includes(type2);
+                                const configured = !['', 'none', 'off', 'disabled', '__legacy_missing__', '__legacy_blank__'].includes(type2);
                                 const showSecond = configured || addButton?.dataset.forceSecond === '1';
 
                                 document.querySelectorAll('.wallbox-device-grid, .wallbox-limits-grid').forEach((grid) => {
@@ -6334,7 +6418,7 @@ async function readConfirmedConfigJson(response) {
                                 }
                                 updateOpenWbUiVisibility();
                                 if (id === 2) {
-                                    const configured = !['', 'none', 'off', 'disabled'].includes(
+                                    const configured = !['', 'none', 'off', 'disabled', '__legacy_missing__', '__legacy_blank__'].includes(
                                         String(typeSelect.value || '').toLowerCase()
                                     );
                                     updateWallboxColumnLayout(configured);

@@ -216,6 +216,17 @@ fi
 MATTER_DIR="/app/pi/Install/Installer/matter"
 MATTER_STORAGE="/var/www/html/data/matter-storage"
 MATTER_STORAGE_GUARD="/usr/local/bin/e3dc-docker-matter-storage-guard"
+MATTER_RESET_REQUEST="/var/www/html/data/matter_pairing_reset.request"
+MATTER_RESET_REPAIR_REQUEST="/var/www/html/data/matter_pairing_reset_repair.request"
+MATTER_PAIRING_FILE="/var/www/html/ramdisk/matter_pairing.json"
+MATTER_RESET_STATUS="/var/www/html/ramdisk/matter_reset_status.code"
+MATTER_RESET_QUARANTINE="/var/www/html/data/.matter-storage-reset-quarantine"
+MATTER_RESET_PREPARE="/var/www/html/data/.matter-storage-reset-quarantine.prepare"
+MATTER_RESET_STAGE_PREFIX="/var/www/html/data/.matter-storage-reset-stage-"
+MATTER_RESET_TRANSACTION="/var/www/html/data/.e3dc-matter-reset-transaction.json"
+MATTER_RESET_CAPABILITY="e3dc-matter-pairing-reset-v2"
+MATTER_RESET_CAPABLE=0
+MATTER_RESET_BLOCKED=0
 MODE5_USER_START_REQUEST="/var/www/html/data/wallbox_mode5_user_start_request.json"
 MODE5_USER_START_LOCK="${MODE5_USER_START_REQUEST}.lock"
 
@@ -321,7 +332,13 @@ fi
 
 # Rechte des persistenten Daten-Ordners korrigieren
 find -P /var/www/html/data -xdev \
-    \( -path "$MATTER_STORAGE" -o -path "$MODE5_USER_START_REQUEST" \
+    \( -path "$MATTER_STORAGE" -o -path "$MATTER_RESET_REQUEST" \
+       -o -path "$MATTER_RESET_REPAIR_REQUEST" \
+       -o -path "$MATTER_RESET_QUARANTINE" \
+       -o -path "$MATTER_RESET_PREPARE" \
+       -o -path "${MATTER_RESET_STAGE_PREFIX}*" \
+       -o -path "$MATTER_RESET_TRANSACTION" \
+       -o -path "$MODE5_USER_START_REQUEST" \
        -o -path "$MODE5_USER_START_LOCK" \) -prune -o \
     \( -type d -o -type f \) \
     -exec chown -h www-data:www-data -- {} +
@@ -330,24 +347,81 @@ if ! mode5_user_start_surface_is_safe; then
     echo "-> FEHLER: Persistente Modus-5-Anforderungsfläche wechselte während der Datenrechteprüfung."
     exit 1
 fi
-if [ ! -f "$MATTER_STORAGE_GUARD" ]; then
-    echo "-> FEHLER: Descriptorprüfer für Matter-Storage fehlt."
-    exit 1
-fi
-MATTER_STORAGE_IDENTITY="$(
+matter_reset_request_present() {
+    [ -e "$MATTER_RESET_REQUEST" ] || [ -L "$MATTER_RESET_REQUEST" ] \
+        || [ -e "$MATTER_RESET_REPAIR_REQUEST" ] || [ -L "$MATTER_RESET_REPAIR_REQUEST" ]
+}
+
+matter_guard_file_safe() {
+    [ -f "$MATTER_STORAGE_GUARD" ] \
+        && [ ! -L "$MATTER_STORAGE_GUARD" ] \
+        && [ "$(stat -c '%u:%g:%a:%h' -- "$MATTER_STORAGE_GUARD" 2>/dev/null)" = "0:0:555:1" ]
+}
+
+matter_storage_harden() {
     /usr/bin/python3 -I -B "$MATTER_STORAGE_GUARD" \
         --mode harden \
         --path "$MATTER_STORAGE" \
         --owner www-data \
-        --group www-data
-)"
-case "$MATTER_STORAGE_IDENTITY" in
-    e3dc-matter-storage-v1:*) ;;
-    *)
-        echo "-> FEHLER: Matter-Storage lieferte keine gebundene Rootidentität."
+        --group www-data \
+        2>/dev/null
+}
+
+matter_storage_identity_valid() {
+    case "${1:-}" in
+        e3dc-matter-storage-v1:*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+MATTER_STORAGE_IDENTITY=""
+MATTER_RESET_STATUS_CODE=""
+if ! matter_guard_file_safe; then
+    if matter_reset_request_present; then
+        MATTER_RESET_BLOCKED=1
+        MATTER_RESET_STATUS_CODE="MATTER_RESET_ERROR_DOCKER_GUARD"
+        echo "-> WARNUNG: Matter-Reset bleibt gesperrt, weil der root-eigene Docker-Guard fehlt oder unsicher ist."
+    else
+        echo "-> FEHLER: Descriptorprüfer für Matter-Storage fehlt oder ist unsicher."
         exit 1
-        ;;
-esac
+    fi
+else
+    MATTER_GUARD_CAPABILITIES="$(
+        /usr/bin/python3 -I -B "$MATTER_STORAGE_GUARD" --mode capabilities 2>/dev/null || true
+    )"
+    if [ "$MATTER_GUARD_CAPABILITIES" = "$MATTER_RESET_CAPABILITY" ]; then
+        MATTER_RESET_CAPABLE=1
+    elif matter_reset_request_present; then
+        MATTER_RESET_BLOCKED=1
+        MATTER_RESET_STATUS_CODE="MATTER_RESET_ERROR_DOCKER_CAPABILITY"
+        echo "-> WARNUNG: Matter-Reset bleibt bis zu einem regulären Image-Update gesperrt."
+    fi
+
+    # Der normale Startup-Preflight bindet immer zuerst den vollständigen Baum.
+    # Er darf nur sicher bindbare Besitzer-/Modusdrift korrigieren; der
+    # Resetauftrag selbst erteilt keine Reparatur- oder Löschautorität.
+    if ! MATTER_STORAGE_IDENTITY="$(matter_storage_harden)"; then
+        MATTER_STORAGE_IDENTITY=""
+        if matter_reset_request_present; then
+            MATTER_RESET_BLOCKED=1
+            MATTER_RESET_STATUS_CODE="MATTER_RESET_ERROR_DOCKER_BINDING"
+            echo "-> WARNUNG: Matter-Storage konnte vor dem Reset nicht sicher gebunden werden; Matter bleibt gestoppt."
+        else
+            echo "-> FEHLER: Matter-Storage konnte nicht descriptorgebunden gehärtet werden."
+            exit 1
+        fi
+    elif ! matter_storage_identity_valid "$MATTER_STORAGE_IDENTITY"; then
+        MATTER_STORAGE_IDENTITY=""
+        if matter_reset_request_present; then
+            MATTER_RESET_BLOCKED=1
+            MATTER_RESET_STATUS_CODE="MATTER_RESET_ERROR_DOCKER_BINDING"
+            echo "-> WARNUNG: Matter-Storage lieferte vor dem Reset keine gebundene Rootidentität; Matter bleibt gestoppt."
+        else
+            echo "-> FEHLER: Matter-Storage lieferte keine gebundene Rootidentität."
+            exit 1
+        fi
+    fi
+fi
 mkdir -p /var/www/html/tmp
 chown -R www-data:www-data /var/www/html/tmp
 chmod 2775 /var/www/html/tmp
@@ -387,6 +461,90 @@ mkdir -p "$RAMDISK_DIR"
 chown -R www-data:www-data "$RAMDISK_DIR"
 chmod 2775 "$RAMDISK_DIR"
 restore_ramdisk_cache
+
+publish_matter_reset_status() {
+    local status_code="${1:-}"
+    local status_tmp="${MATTER_RESET_STATUS}.tmp.$$"
+    local web_gid=""
+    case "$status_code" in
+        MATTER_RESET_IDLE|MATTER_RESET_OK_DOCKER|MATTER_RESET_OK_DOCKER_QUARANTINED|MATTER_RESET_ERROR_DOCKER_GUARD|MATTER_RESET_ERROR_DOCKER_CAPABILITY|MATTER_RESET_ERROR_DOCKER_BINDING|MATTER_RESET_ERROR_DOCKER_CLEAR|MATTER_RESET_ERROR_DOCKER_COMMIT|MATTER_RESET_ERROR_DOCKER_CONTRACT|MATTER_RESET_ERROR_DOCKER_FOREIGN_MOUNT|MATTER_RESET_ERROR_DOCKER_HARDLINK|MATTER_RESET_ERROR_DOCKER_LIMIT|MATTER_RESET_ERROR_DOCKER_TIMEOUT|MATTER_RESET_ERROR_DOCKER_PAIRING_BINDING|MATTER_RESET_ERROR_DOCKER_PAIRING_CLEAR|MATTER_RESET_ERROR_DOCKER_PAIRING_HARDLINK|MATTER_RESET_ERROR_DOCKER_QUARANTINE_COLLISION|MATTER_RESET_ERROR_DOCKER_REQUEST_COLLISION|MATTER_RESET_ERROR_DOCKER_REQUEST_INVALID|MATTER_RESET_ERROR_DOCKER_REQUEST_REPAIR_BLOCKED)
+            ;;
+        *)
+            status_code="MATTER_RESET_ERROR_DOCKER_CONTRACT"
+            ;;
+    esac
+    if [ -e "$status_tmp" ] || [ -L "$status_tmp" ]; then
+        return 1
+    fi
+    if ! (umask 077; set -o noclobber; printf '%s\n' "$status_code" > "$status_tmp"); then
+        return 1
+    fi
+    chown root:www-data -- "$status_tmp"
+    chmod 0644 -- "$status_tmp"
+    mv -Tf -- "$status_tmp" "$MATTER_RESET_STATUS"
+    web_gid="$(id -g www-data 2>/dev/null)"
+    [ -n "$web_gid" ] \
+        && [ "$(stat -c '%u:%g:%a:%h' -- "$MATTER_RESET_STATUS" 2>/dev/null)" = "0:${web_gid}:644:1" ]
+}
+
+# Ein persistenter Reset wird vor Apache und jedem Matter-Worker konsumiert.
+# Bei jedem unsicheren Zustand bleibt die Anforderung erhalten; nur Matter wird
+# für diesen Containerlauf gesperrt, damit kein PID-1-Neustartloop entsteht.
+if matter_reset_request_present && [ "$MATTER_RESET_BLOCKED" -eq 0 ]; then
+    if [ "$MATTER_RESET_CAPABLE" -eq 1 ]; then
+        MATTER_RESET_ERROR_FILE="/run/e3dc-matter-reset-error.$$"
+        (umask 077; set -o noclobber; : > "$MATTER_RESET_ERROR_FILE")
+        MATTER_RESET_RESULT="$(
+            /usr/bin/python3 -I -B "$MATTER_STORAGE_GUARD" \
+                --mode consume-reset \
+                --path "$MATTER_STORAGE" \
+                --request-path "$MATTER_RESET_REQUEST" \
+                --repair-request-path "$MATTER_RESET_REPAIR_REQUEST" \
+                --pairing-path "$MATTER_PAIRING_FILE" \
+                --owner www-data \
+                --group www-data \
+                --expected-identity "$MATTER_STORAGE_IDENTITY" \
+                2>"$MATTER_RESET_ERROR_FILE"
+        )" || MATTER_RESET_RESULT=""
+        if [ "$MATTER_RESET_RESULT" = "reset-complete" ] \
+            || [ "$MATTER_RESET_RESULT" = "reset-complete-quarantined" ]; then
+            if MATTER_STORAGE_IDENTITY="$(matter_storage_harden)" \
+                && matter_storage_identity_valid "$MATTER_STORAGE_IDENTITY"; then
+                if [ "$MATTER_RESET_RESULT" = "reset-complete-quarantined" ]; then
+                    MATTER_RESET_STATUS_CODE="MATTER_RESET_OK_DOCKER_QUARANTINED"
+                else
+                    MATTER_RESET_STATUS_CODE="MATTER_RESET_OK_DOCKER"
+                fi
+                echo "   -> Matter-Kopplungsdaten wurden vor dem Workerstart sicher zurückgesetzt."
+            else
+                MATTER_RESET_BLOCKED=1
+                MATTER_STORAGE_IDENTITY=""
+                MATTER_RESET_STATUS_CODE="MATTER_RESET_ERROR_DOCKER_BINDING"
+                echo "-> WARNUNG: Matter-Storage konnte nach dem Reset nicht sicher gebunden werden; Matter bleibt gestoppt."
+            fi
+        else
+            MATTER_RESET_BLOCKED=1
+            MATTER_STORAGE_IDENTITY=""
+            MATTER_RESET_STATUS_CODE="$(sed -n '1p' "$MATTER_RESET_ERROR_FILE" 2>/dev/null || true)"
+            case "$MATTER_RESET_STATUS_CODE" in
+                MATTER_RESET_ERROR_DOCKER_*) ;;
+                *) MATTER_RESET_STATUS_CODE="MATTER_RESET_ERROR_DOCKER_CONTRACT" ;;
+            esac
+            echo "-> WARNUNG: Matter-Reset konnte nicht vollständig bestätigt werden; Matter bleibt gestoppt."
+        fi
+        rm -f -- "$MATTER_RESET_ERROR_FILE"
+    else
+        MATTER_RESET_BLOCKED=1
+        MATTER_RESET_STATUS_CODE="MATTER_RESET_ERROR_DOCKER_CAPABILITY"
+        echo "-> WARNUNG: Matter-Reset kann mit diesem Laufzeitvertrag nicht sicher ausgeführt werden; Matter bleibt gestoppt."
+    fi
+fi
+if [ -z "$MATTER_RESET_STATUS_CODE" ]; then
+    MATTER_RESET_STATUS_CODE="MATTER_RESET_IDLE"
+fi
+if ! publish_matter_reset_status "$MATTER_RESET_STATUS_CODE"; then
+    echo "-> WARNUNG: Redigierter Matter-Resetstatus konnte nicht sicher veröffentlicht werden."
+fi
 
 # Root-kontrollierter Einzelschreiber-Namespace (nicht in der www-data-Ramdisk).
 LOCK_NAMESPACE_ROOT="/run/e3dc-control"
@@ -616,6 +774,18 @@ PY
     exit 1
 fi
 
+if [ "$MATTER_RESET_BLOCKED" -eq 1 ]; then
+    OPTIONAL_SERVICE_PROJECTION="$(
+        while IFS= read -r configured_service; do
+            if [ "$configured_service" != "e3dc-matter-bridge" ]; then
+                printf '%s\n' "$configured_service"
+            fi
+        done <<EOF
+$OPTIONAL_SERVICE_PROJECTION
+EOF
+    )"
+fi
+
 optional_service_selected() {
     local requested_service="$1"
     local configured_service=""
@@ -653,12 +823,13 @@ if [ "$(stat -c '%u:%g:%a:%h' -- "$DOCKER_HEALTH_OPTIONALS")" != "0:0:444:1" ]; 
 fi
 
 if optional_service_selected "e3dc-matter-bridge"; then
-    if [ ! -f "$MATTER_DIR/package.json" ] \
+    if [ "$MATTER_RESET_BLOCKED" -eq 1 ]; then
+        echo "   -> Matter Bridge bleibt wegen eines nicht bestätigten Pairing-Resets gestoppt."
+    elif [ ! -f "$MATTER_DIR/package.json" ] \
         || [ ! -f "$MATTER_DIR/package-lock.json" ]; then
         echo "-> FEHLER: Matter Bridge ist aktiviert, aber Paket- oder Lockdatei fehlt."
         exit 1
-    fi
-    if [ ! -d "$MATTER_DIR/node_modules" ]; then
+    elif [ ! -d "$MATTER_DIR/node_modules" ]; then
         echo "-> Installiere Matter-Abhängigkeiten..."
         cd "$MATTER_DIR"
         npm ci --omit=dev --ignore-scripts
@@ -812,50 +983,54 @@ nohup $PYTHON_EXEC notification_manager.py > /var/www/html/logs/notification_man
 
 # Matter Bridge (optional, read-only Statusendpunkte)
 if optional_service_selected "e3dc-matter-bridge"; then
-    echo "-> Starte D-Bus und Avahi für Matter mDNS..."
-    if ! service dbus start >/dev/null 2>&1 \
-        || [ ! -S /run/dbus/system_bus_socket ]; then
-        echo "-> FEHLER: D-Bus konnte für Matter nicht sicher gestartet werden."
-        exit 1
-    fi
-    if [ ! -x /usr/sbin/avahi-daemon ]; then
-        echo "-> FEHLER: Avahi-Daemon fehlt; Matter mDNS bleibt gestoppt."
-        exit 1
-    fi
-    /usr/sbin/avahi-daemon -s &
-    AVAHI_PID=$!
-    AVAHI_READY=0
-    for _avahi_wait in $(seq 1 25); do
-        if ! kill -0 "$AVAHI_PID" 2>/dev/null; then
-            echo "-> FEHLER: Avahi endete vor dem mDNS-Bereitschaftsnachweis."
+    if [ "$MATTER_RESET_BLOCKED" -eq 1 ]; then
+        echo "-> Matter Bridge bleibt fail-closed gestoppt; andere Containerdienste laufen weiter."
+    else
+        echo "-> Starte D-Bus und Avahi für Matter mDNS..."
+        if ! service dbus start >/dev/null 2>&1 \
+            || [ ! -S /run/dbus/system_bus_socket ]; then
+            echo "-> FEHLER: D-Bus konnte für Matter nicht sicher gestartet werden."
+            exit 1
+        fi
+        if [ ! -x /usr/sbin/avahi-daemon ]; then
+            echo "-> FEHLER: Avahi-Daemon fehlt; Matter mDNS bleibt gestoppt."
+            exit 1
+        fi
+        /usr/sbin/avahi-daemon -s &
+        AVAHI_PID=$!
+        AVAHI_READY=0
+        for _avahi_wait in $(seq 1 25); do
+            if ! kill -0 "$AVAHI_PID" 2>/dev/null; then
+                echo "-> FEHLER: Avahi endete vor dem mDNS-Bereitschaftsnachweis."
+                wait "$AVAHI_PID" || true
+                exit 1
+            fi
+            if /usr/sbin/avahi-daemon --check >/dev/null 2>&1; then
+                AVAHI_READY=1
+                break
+            fi
+            sleep 0.2
+        done
+        if [ "$AVAHI_READY" -ne 1 ]; then
+            echo "-> FEHLER: Avahi lieferte keinen mDNS-Bereitschaftsnachweis."
+            kill "$AVAHI_PID" 2>/dev/null || true
             wait "$AVAHI_PID" || true
             exit 1
         fi
-        if /usr/sbin/avahi-daemon --check >/dev/null 2>&1; then
-            AVAHI_READY=1
-            break
+        echo "   -> Matter Bridge aktiv."
+        if ! /usr/bin/python3 -I -B "$MATTER_STORAGE_GUARD" \
+            --mode verify \
+            --path "$MATTER_STORAGE" \
+            --owner www-data \
+            --group www-data \
+            --expected-identity "$MATTER_STORAGE_IDENTITY" \
+            >/dev/null; then
+            echo "-> FEHLER: Matter-Storage driftete vor dem Workerstart."
+            exit 1
         fi
-        sleep 0.2
-    done
-    if [ "$AVAHI_READY" -ne 1 ]; then
-        echo "-> FEHLER: Avahi lieferte keinen mDNS-Bereitschaftsnachweis."
-        kill "$AVAHI_PID" 2>/dev/null || true
-        wait "$AVAHI_PID" || true
-        exit 1
+        nohup runuser -u www-data -- sh -c "umask 077; cd '$MATTER_DIR' && exec npm run start" \
+            > /var/www/html/logs/matter_bridge.log 2>&1 &
     fi
-    echo "   -> Matter Bridge aktiv."
-    if ! /usr/bin/python3 -I -B "$MATTER_STORAGE_GUARD" \
-        --mode verify \
-        --path "$MATTER_STORAGE" \
-        --owner www-data \
-        --group www-data \
-        --expected-identity "$MATTER_STORAGE_IDENTITY" \
-        >/dev/null; then
-        echo "-> FEHLER: Matter-Storage driftete vor dem Workerstart."
-        exit 1
-    fi
-    nohup runuser -u www-data -- sh -c "umask 077; cd '$MATTER_DIR' && exec npm run start" \
-        > /var/www/html/logs/matter_bridge.log 2>&1 &
 fi
 
 echo "-> Alle Dienste gestartet. Container laeuft."

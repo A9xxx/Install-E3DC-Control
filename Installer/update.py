@@ -51,16 +51,21 @@ from .backup_integrity import (
     BACKUP_ESTIMATE_FILE_OVERHEAD_BYTES,
     BACKUP_ESTIMATE_FIXED_OVERHEAD_BYTES,
     BACKUP_ESTIMATE_SOURCE_OVERHEAD_BYTES,
+    BoundPersistentInstallRoot,
     DEFAULT_BACKUP_ROOT,
     MANIFEST_NAME,
     QuiescedOverlayRestoreGuard,
     QUIESCED_OVERLAY_KIND,
     SYSTEM_BACKUP_KIND,
+    _descriptor_mount_id,
     _open_directory_nofollow,
     _open_regular_file_nofollow,
+    bind_persistent_install_root,
+    bind_persistent_source_root,
     configured_backup_root,
     ensure_external_backup_root,
     validate_existing_backup_root,
+    verify_bound_persistent_install_root,
     verify_backup,
 )
 from .update_offline_preflight import (
@@ -163,6 +168,7 @@ UPDATE_FINALIZER_RUNTIME_MAX_S = 35 * 60
 UPDATE_FINALIZER_TIMEOUT_STOP_S = 15
 UPDATE_FINALIZER_TERMINAL_STABLE_READS = 3
 UPDATE_FINALIZER_TERMINAL_STABLE_INTERVAL_S = 0.2
+RECOVERY_WORKTREE_MOUNT_SCAN_TIMEOUT_S = 300.0
 
 FULL_COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
 PACKAGE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]*\Z")
@@ -213,17 +219,29 @@ APPROVED_STALE_DELETE_FILES = frozenset({
     "/var/www/html/assets/vendor/ASSET_PROVENANCE.json",
 })
 APPROVED_STALE_DELETE_DIRS = frozenset({"/var/www/html/app"})
+PRESERVED_WEB_DIRS = frozenset({"data", "logs", "ramdisk", "tmp"})
+PRESERVED_WEB_FILES = frozenset({
+    "e3dc.config.txt",
+    "e3dc.strompreise.txt",
+    "e3dc.wallbox.out",
+    "e3dc.wallbox.txt",
+    "e3dc_paths.json",
+    "live_history.txt",
+})
+PRESERVED_WEB_ENTRIES = (
+    PRESERVED_WEB_DIRS | PRESERVED_WEB_FILES | {"history_backups"}
+)
 
 # Package changes are release code, not arbitrary policy input.  A verified
 # policy may select from these reviewed sets, but it cannot inject options,
 # shell fragments or new package sources.
 APPROVED_APT_PACKAGES = frozenset({
-    "php-sqlite3", "php-mbstring", "libapache2-mod-php", "mosquitto-clients",
+    "php-cli", "php-sqlite3", "php-mbstring", "libapache2-mod-php", "mosquitto-clients",
     "python3-sklearn", "python3-numpy", "python3-cryptography",
     "python3-websockets", "nodejs", "npm", "avahi-daemon", "avahi-utils",
     "dbus", "rsync",
 })
-UPDATE_RUNTIME_APT_PACKAGES = ("rsync",)
+UPDATE_RUNTIME_APT_PACKAGES = ("rsync", "php-cli")
 # Alte signierte Policies führen diese optionalen Pakete noch im Core-Block.
 # Sie bleiben prüfbar, werden aber ausschließlich vom Matter-Installer gesetzt.
 MATTER_ONLY_APT_PACKAGES = frozenset({
@@ -257,6 +275,7 @@ TARGET_FINALIZER_RELATIVE_FILES = (
     "Installer/update_recovery_context.py",
     "Installer/update_recovery_journal.py",
     "Installer/update_recovery_surface.py",
+    "Installer/update_simple.py",
 )
 TARGET_EXECUTION_SNAPSHOT_ROOT_FILES = (
     "VERSION",
@@ -388,6 +407,18 @@ class ActionableUpdateAbort(RuntimeError):
         ):
             raise ValueError("Strukturierter Updateabbruch ist unvollständig")
         super().__init__(self.detail)
+
+
+class RecoveryInstallRootBindingError(RuntimeError):
+    """Die gehaltene Recovery-Wurzel verlor Name, Inode oder Mountbindung."""
+
+
+class RecoveryWorktreeMountScanError(RecoveryInstallRootBindingError):
+    """Der vollständige nofollow-Mountbeweis des Recovery-Worktrees scheiterte."""
+
+
+class RecoveryWorktreeMountScanTimeout(RecoveryWorktreeMountScanError):
+    """Der vollständige Worktree-Mountbeweis überschritt seine Gesamtdeadline."""
 
 
 def _print_actionable_update_abort(error: ActionableUpdateAbort) -> None:
@@ -958,6 +989,9 @@ class ReconstructedRecoveryTransaction:
     static_bootblock_contract: RecoveryBootblockContract | None
     overlay_receipt: QuiescedOverlayReceipt | None
     offline_receipt: OfflinePackageReceipt | None
+    # v1-Kontexte besitzen diesen additiven v2-Vertrag noch nicht. ``None``
+    # hält ihre bereits persistierten Recovery-Reste weiterhin lesbar.
+    install_root_identity: tuple[int, int, int, int] | None = None
 
 
 @dataclass
@@ -1286,6 +1320,627 @@ def _git_argv(
         isolated_git_command(repo_dir, *args, run_as_user=git_user),
         timeout=timeout,
     )
+
+
+def _verify_recovery_install_binding(
+    bound_install_root: BoundPersistentInstallRoot,
+    root_path: str,
+) -> None:
+    """Bindet einen Recovery-Aufruf an Root-FD, Namen und Mount-ID."""
+
+    try:
+        root = Path(os.path.abspath(str(root_path or "")))
+        if (
+            not isinstance(bound_install_root, BoundPersistentInstallRoot)
+            or root != bound_install_root.path
+        ):
+            raise RecoveryInstallRootBindingError(
+                "Recovery besitzt keine zum Installationspfad passende Root-Bindung"
+            )
+        verify_bound_persistent_install_root(bound_install_root)
+        if (
+            _descriptor_mount_id(bound_install_root.root_descriptor)
+            != bound_install_root.mount_id
+        ):
+            raise RecoveryInstallRootBindingError(
+                "Recovery-Installationsroot wechselte seinen Mount"
+            )
+    except RecoveryInstallRootBindingError:
+        raise
+    except Exception as exc:
+        raise RecoveryInstallRootBindingError(
+            "Recovery-Installationsroot verlor Name, Inode oder Mountbindung"
+        ) from exc
+
+
+def _verify_optional_recovery_install_binding(
+    bound_install_root: BoundPersistentInstallRoot | None,
+    root_path: str | None = None,
+) -> None:
+    if bound_install_root is None:
+        return
+    _verify_recovery_install_binding(
+        bound_install_root,
+        str(root_path or bound_install_root.path),
+    )
+
+
+def _authorize_recovery_service_action(
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
+    action_authorizer=None,
+) -> bool:
+    """Prüft die Rootbindung unmittelbar an einer externen Dienstaktion."""
+
+    _verify_optional_recovery_install_binding(bound_install_root)
+    if action_authorizer is not None:
+        if not callable(action_authorizer):
+            raise ValueError("Recovery-Dienstaktions-Autorizer ist nicht aufrufbar")
+        if action_authorizer() is not True:
+            raise RecoveryInstallRootBindingError(
+                "Recovery-Dienstaktion verlor ihre Root-Bindung"
+            )
+    return True
+
+
+def _run_recovery_service_argv(
+    argv,
+    *,
+    timeout: int = 30,
+    env=None,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
+    action_authorizer=None,
+) -> dict:
+    """Führt genau einen argv-Aufruf zwischen zwei Rootbindungsbeweisen aus."""
+
+    _authorize_recovery_service_action(
+        bound_install_root=bound_install_root,
+        action_authorizer=action_authorizer,
+    )
+    try:
+        return _run_argv(argv, timeout=timeout, env=env)
+    finally:
+        _authorize_recovery_service_action(
+            bound_install_root=bound_install_root,
+            action_authorizer=action_authorizer,
+        )
+
+
+def _run_recovery_service_command(
+    command: str,
+    *,
+    timeout: int = 30,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
+    action_authorizer=None,
+) -> dict:
+    """Führt genau einen Legacy-Shellaufruf zwischen Rootbindungsbeweisen aus."""
+
+    _authorize_recovery_service_action(
+        bound_install_root=bound_install_root,
+        action_authorizer=action_authorizer,
+    )
+    try:
+        return run_command(command, timeout=timeout)
+    finally:
+        _authorize_recovery_service_action(
+            bound_install_root=bound_install_root,
+            action_authorizer=action_authorizer,
+        )
+
+
+def _bound_recovery_systemd_runner(
+    bound_install_root: BoundPersistentInstallRoot | None,
+):
+    """Verifiziert die Root-Bindung vor und nach jedem systemd-Unterkommando."""
+
+    if bound_install_root is None:
+        return None
+    _verify_recovery_install_binding(
+        bound_install_root,
+        str(bound_install_root.path),
+    )
+
+    def runner(argv):
+        _verify_recovery_install_binding(
+            bound_install_root,
+            str(bound_install_root.path),
+        )
+        try:
+            return subprocess.run(
+                tuple(str(item) for item in argv),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+                check=False,
+                shell=False,
+                env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+            )
+        finally:
+            _verify_recovery_install_binding(
+                bound_install_root,
+                str(bound_install_root.path),
+            )
+
+    return runner
+
+
+def _verify_bound_worktree_mount_tree(
+    bound_install_root: BoundPersistentInstallRoot,
+    *,
+    timeout_s: float = RECOVERY_WORKTREE_MOUNT_SCAN_TIMEOUT_S,
+) -> None:
+    """Beweist den gesamten Worktree iterativ, nofollow und auf einem Mount."""
+
+    if not hasattr(os, "O_PATH"):
+        raise RecoveryWorktreeMountScanError(
+            "Gebundene Worktree-Mountprüfung benötigt Linux O_PATH"
+        )
+    if (
+        isinstance(timeout_s, bool)
+        or not isinstance(timeout_s, (int, float))
+        or not math.isfinite(float(timeout_s))
+        or float(timeout_s) < 0.0
+    ):
+        raise ValueError("Worktree-Mountprüfung besitzt keine gültige Gesamtdeadline")
+    deadline = time.monotonic() + float(timeout_s)
+
+    def check_deadline() -> None:
+        if time.monotonic() >= deadline:
+            raise RecoveryWorktreeMountScanTimeout(
+                "Recovery-Worktree-Mountprüfung überschritt ihre Gesamtdeadline"
+            )
+
+    _verify_recovery_install_binding(
+        bound_install_root,
+        str(bound_install_root.path),
+    )
+    check_deadline()
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    path_flags = (
+        os.O_PATH
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    current_descriptor = os.dup(bound_install_root.root_descriptor)
+    frames: list[dict[str, object]] = []
+
+    def current_label(extra: str | None = None) -> str:
+        parts = [
+            str(frame["entry_name"])
+            for frame in frames[1:]
+        ]
+        if extra is not None:
+            parts.append(str(extra))
+        return os.path.join(*parts) if parts else "."
+
+    def verify_directory_descriptor(
+        descriptor: int,
+        *,
+        expected_device: int,
+        expected_inode: int,
+        label: str,
+    ) -> None:
+        check_deadline()
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino)
+            != (expected_device, expected_inode)
+            or _descriptor_mount_id(descriptor) != bound_install_root.mount_id
+        ):
+            raise RecoveryWorktreeMountScanError(
+                "Recovery-Worktree-Verzeichnis driftete oder überschreitet "
+                f"einen Mount: {label}"
+            )
+        check_deadline()
+
+    def open_entry(parent_descriptor: int, name: str, before) -> int:
+        check_deadline()
+        flags = (
+            directory_flags
+            if stat.S_ISDIR(before.st_mode) and not stat.S_ISLNK(before.st_mode)
+            else path_flags
+        )
+        descriptor = -1
+        try:
+            descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+            opened = os.fstat(descriptor)
+            if (
+                (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+                or _descriptor_mount_id(descriptor) != bound_install_root.mount_id
+            ):
+                raise RecoveryWorktreeMountScanError(
+                    "Recovery-Worktree-Eintrag driftete oder überschreitet "
+                    f"einen Mount: {current_label(name)}"
+                )
+            check_deadline()
+            return descriptor
+        except BaseException:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise
+
+    def verify_rebound_entry(
+        parent_descriptor: int,
+        name: str,
+        expected_device: int,
+        expected_inode: int,
+    ) -> None:
+        check_deadline()
+        current = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (current.st_dev, current.st_ino) != (
+            expected_device,
+            expected_inode,
+        ):
+            raise RecoveryWorktreeMountScanError(
+                "Recovery-Worktree-Eintrag wurde ausgetauscht: "
+                + current_label(name)
+            )
+        rebound_descriptor = open_entry(parent_descriptor, name, current)
+        try:
+            rebound = os.fstat(rebound_descriptor)
+            if (rebound.st_dev, rebound.st_ino) != (
+                expected_device,
+                expected_inode,
+            ):
+                raise RecoveryWorktreeMountScanError(
+                    "Recovery-Worktree-Eintrag driftete beim Endreadback: "
+                    + current_label(name)
+                )
+            check_deadline()
+        finally:
+            os.close(rebound_descriptor)
+
+    try:
+        verify_directory_descriptor(
+            current_descriptor,
+            expected_device=int(bound_install_root.device),
+            expected_inode=int(bound_install_root.inode),
+            label=".",
+        )
+        frames.append(
+            {
+                "entry_name": None,
+                "device": int(bound_install_root.device),
+                "inode": int(bound_install_root.inode),
+                "initial_names": tuple(sorted(os.listdir(current_descriptor))),
+                "next_index": 0,
+            }
+        )
+
+        # Der Stack hält nur Metadaten. Zum Aufstieg wird der Parent über den
+        # gehaltenen Child-FD geöffnet und sofort gegen die eingefrorene
+        # Parent-Identität und Mount-ID geprüft. Damit bleiben Laufzeit und
+        # Deskriptorbedarf auch bei sehr tiefen Altinstallationen linear.
+        while frames:
+            check_deadline()
+            frame = frames[-1]
+            initial_names = frame["initial_names"]
+            next_index = int(frame["next_index"])
+            if next_index < len(initial_names):
+                name = str(initial_names[next_index])
+                frame["next_index"] = next_index + 1
+                before = os.stat(
+                    name,
+                    dir_fd=current_descriptor,
+                    follow_symlinks=False,
+                )
+                child_descriptor = open_entry(
+                    current_descriptor,
+                    name,
+                    before,
+                )
+                try:
+                    opened = os.fstat(child_descriptor)
+                    if stat.S_ISDIR(opened.st_mode) and not stat.S_ISLNK(
+                        opened.st_mode
+                    ):
+                        verify_directory_descriptor(
+                            child_descriptor,
+                            expected_device=int(opened.st_dev),
+                            expected_inode=int(opened.st_ino),
+                            label=current_label(name),
+                        )
+                        child_names = tuple(
+                            sorted(os.listdir(child_descriptor))
+                        )
+                        frames.append(
+                            {
+                                "entry_name": name,
+                                "device": int(opened.st_dev),
+                                "inode": int(opened.st_ino),
+                                "initial_names": child_names,
+                                "next_index": 0,
+                            }
+                        )
+                        os.close(current_descriptor)
+                        current_descriptor = child_descriptor
+                        child_descriptor = -1
+                    else:
+                        verify_rebound_entry(
+                            current_descriptor,
+                            name,
+                            int(opened.st_dev),
+                            int(opened.st_ino),
+                        )
+                finally:
+                    if child_descriptor >= 0:
+                        os.close(child_descriptor)
+                continue
+
+            if tuple(sorted(os.listdir(current_descriptor))) != initial_names:
+                raise RecoveryWorktreeMountScanError(
+                    "Recovery-Worktree-Inventar driftete während der "
+                    "Mountprüfung: "
+                    + current_label()
+                )
+            verify_directory_descriptor(
+                current_descriptor,
+                expected_device=int(frame["device"]),
+                expected_inode=int(frame["inode"]),
+                label=current_label(),
+            )
+            if len(frames) == 1:
+                frames.pop()
+                break
+
+            completed = frames.pop()
+            parent = frames[-1]
+            parent_descriptor = os.open(
+                "..",
+                directory_flags,
+                dir_fd=current_descriptor,
+            )
+            try:
+                verify_directory_descriptor(
+                    parent_descriptor,
+                    expected_device=int(parent["device"]),
+                    expected_inode=int(parent["inode"]),
+                    label=current_label(),
+                )
+            except BaseException:
+                os.close(parent_descriptor)
+                raise
+            os.close(current_descriptor)
+            current_descriptor = parent_descriptor
+            verify_rebound_entry(
+                current_descriptor,
+                str(completed["entry_name"]),
+                int(completed["device"]),
+                int(completed["inode"]),
+            )
+
+        _verify_recovery_install_binding(
+            bound_install_root,
+            str(bound_install_root.path),
+        )
+        check_deadline()
+    except RecoveryInstallRootBindingError:
+        raise
+    except Exception as exc:
+        raise RecoveryWorktreeMountScanError(
+            "Recovery-Worktree-Mountprüfung konnte nicht vollständig gebunden werden"
+        ) from exc
+    finally:
+        os.close(current_descriptor)
+
+
+def _git_argv_under_bound_install_root(
+    bound_install_root: BoundPersistentInstallRoot,
+    install_user: str,
+    *args: str,
+    timeout: int = 30,
+    mount_scan_timeout_s: float = RECOVERY_WORKTREE_MOUNT_SCAN_TIMEOUT_S,
+) -> dict:
+    """Führt Recovery-Git ausschließlich über gehaltene Root- und Git-FDs aus.
+
+    ``sudo`` ist hier absichtlich ausgeschlossen: dessen FD-Policy würde den
+    an die alte Installation gebundenen Deskriptorvertrag aufheben. Falls der
+    Updater als Root läuft, senkt ``subprocess`` die Identität direkt vor
+    ``execve`` auf den Installationsnutzer samt dessen Gruppen ab.
+    """
+
+    if not args or any("\x00" in str(item) for item in args):
+        raise ValueError("Gebundener Git-Aufruf besitzt ungültige Argumente")
+    if not isinstance(timeout, int) or timeout < 1:
+        raise ValueError("Gebundener Git-Aufruf besitzt kein gültiges Zeitlimit")
+    _verify_recovery_install_binding(
+        bound_install_root,
+        str(bound_install_root.path),
+    )
+    try:
+        account = pwd.getpwnam(str(install_user or ""))
+    except KeyError as exc:
+        raise RuntimeError("Gebundener Git-Installationsbenutzer fehlt lokal") from exc
+    if account.pw_uid == 0:
+        raise RuntimeError("Gebundener Git-Installationsbenutzer darf nicht Root sein")
+
+    effective_uid = os.geteuid() if hasattr(os, "geteuid") else -1
+    credential_kwargs: dict = {}
+    if effective_uid == 0:
+        credential_kwargs = {
+            "user": int(account.pw_uid),
+            "group": int(account.pw_gid),
+            "extra_groups": tuple(
+                sorted(
+                    {
+                        int(group_id)
+                        for group_id in os.getgrouplist(
+                            account.pw_name,
+                            account.pw_gid,
+                        )
+                    }
+                )
+            ),
+        }
+    elif effective_uid != int(account.pw_uid):
+        raise RuntimeError(
+            "Gebundener Git-Aufruf läuft weder als Root noch als Installationsnutzer"
+        )
+
+    root_descriptor = os.dup(bound_install_root.root_descriptor)
+    git_descriptor = -1
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        root_metadata = os.fstat(root_descriptor)
+        if (
+            (root_metadata.st_dev, root_metadata.st_ino)
+            != (bound_install_root.device, bound_install_root.inode)
+            or _descriptor_mount_id(root_descriptor)
+            != bound_install_root.mount_id
+        ):
+            raise RuntimeError("Gebundener Git-Root-FD driftete")
+        named_git = os.stat(
+            ".git",
+            dir_fd=root_descriptor,
+            follow_symlinks=False,
+        )
+        git_descriptor = os.open(
+            ".git",
+            directory_flags,
+            dir_fd=root_descriptor,
+        )
+        opened_git = os.fstat(git_descriptor)
+        if (
+            not stat.S_ISDIR(named_git.st_mode)
+            or not stat.S_ISDIR(opened_git.st_mode)
+            or (named_git.st_dev, named_git.st_ino)
+            != (opened_git.st_dev, opened_git.st_ino)
+            or _descriptor_mount_id(git_descriptor)
+            != bound_install_root.mount_id
+        ):
+            raise RuntimeError("Gebundene Git-Metadaten drifteten beim Öffnen")
+
+        _verify_bound_worktree_mount_tree(
+            bound_install_root,
+            timeout_s=mount_scan_timeout_s,
+        )
+
+        root_fd_path = f"/proc/self/fd/{root_descriptor}"
+        git_fd_path = f"/proc/self/fd/{git_descriptor}"
+        environment = {}
+        for assignment in isolated_git_environment_assignments():
+            key, separator, value = assignment.partition("=")
+            if not separator or not key:
+                raise RuntimeError("Isolierte Git-Umgebung ist ungültig")
+            environment[key] = value
+        argv = [
+            "/usr/bin/git",
+            "--no-replace-objects",
+            "-c",
+            f"safe.directory={bound_install_root.path}",
+            "-c",
+            f"safe.directory={root_fd_path}",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            "core.attributesFile=/dev/null",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "core.askPass=/bin/false",
+            "-c",
+            "protocol.ext.allow=never",
+            "-c",
+            "protocol.file.allow=never",
+            f"--git-dir={git_fd_path}",
+            f"--work-tree={root_fd_path}",
+            *(str(item) for item in args),
+        ]
+        try:
+            completed = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+                env=environment,
+                pass_fds=(root_descriptor, git_descriptor),
+                close_fds=True,
+                **credential_kwargs,
+            )
+            result = {
+                "success": completed.returncode == 0,
+                "stdout": completed.stdout or "",
+                "stderr": completed.stderr or "",
+                "returncode": completed.returncode,
+                "timed_out": False,
+            }
+        except subprocess.TimeoutExpired as exc:
+            result = {
+                "success": False,
+                "stdout": "",
+                "stderr": str(exc),
+                "returncode": -1,
+                "timed_out": True,
+            }
+        except OSError as exc:
+            result = {
+                "success": False,
+                "stdout": "",
+                "stderr": str(exc),
+                "returncode": -1,
+                "timed_out": False,
+            }
+
+        _verify_bound_worktree_mount_tree(
+            bound_install_root,
+            timeout_s=mount_scan_timeout_s,
+        )
+        _verify_recovery_install_binding(
+            bound_install_root,
+            str(bound_install_root.path),
+        )
+        current_git = os.stat(
+            ".git",
+            dir_fd=root_descriptor,
+            follow_symlinks=False,
+        )
+        rebound_git_descriptor = os.open(
+            ".git",
+            directory_flags,
+            dir_fd=root_descriptor,
+        )
+        try:
+            rebound_git = os.fstat(rebound_git_descriptor)
+            if (
+                not stat.S_ISDIR(current_git.st_mode)
+                or not stat.S_ISDIR(rebound_git.st_mode)
+                or (current_git.st_dev, current_git.st_ino)
+                != (opened_git.st_dev, opened_git.st_ino)
+                or (rebound_git.st_dev, rebound_git.st_ino)
+                != (opened_git.st_dev, opened_git.st_ino)
+                or _descriptor_mount_id(rebound_git_descriptor)
+                != bound_install_root.mount_id
+            ):
+                raise RuntimeError(
+                    "Gebundene Git-Metadaten wurden während Reset ersetzt"
+                )
+        finally:
+            os.close(rebound_git_descriptor)
+        return result
+    finally:
+        if git_descriptor >= 0:
+            os.close(git_descriptor)
+        os.close(root_descriptor)
 
 
 def _root_git_call_kwargs(enabled: bool) -> dict[str, bool]:
@@ -2417,6 +3072,9 @@ def _assert_committed_finalizer_lease_inactive(
         UpdateSafetyContract
         | legacy_safety_codec.LegacyUpdateSafetyReceipt
     ),
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
+    action_authorizer=None,
 ) -> None:
     """Bindet eine vollständig inaktive oder bereits entladene transiente Lease."""
 
@@ -2432,7 +3090,7 @@ def _assert_committed_finalizer_lease_inactive(
         "Transient",
         "RuntimeDirectory",
     )
-    result = _run_argv(
+    result = _run_recovery_service_argv(
         [
             "systemctl",
             "show",
@@ -2442,6 +3100,8 @@ def _assert_committed_finalizer_lease_inactive(
         ],
         timeout=15,
         env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+        bound_install_root=bound_install_root,
+        action_authorizer=action_authorizer,
     )
     values = {}
     for line in str(result.get("stdout") or "").splitlines():
@@ -3041,6 +3701,8 @@ def _finish_committed_update_safety_residue_if_safe() -> bool:
 
 def _finish_committed_package_gate_cleanup(
     contract: PreparedPackageReceipt,
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> PreparedPackageReceipt:
     """Vollendet den statischen Bootblock und Apache nur aus committed Beleg."""
 
@@ -3088,6 +3750,7 @@ def _finish_committed_package_gate_cleanup(
             static_contract.units,
             expected_present=False,
             transaction_id=static_contract.transaction_id,
+            bound_install_root=bound_install_root,
         )
     elif os.path.lexists(RECOVERY_BOOTBLOCK_MARKER):
         raise RuntimeError(
@@ -3098,6 +3761,7 @@ def _finish_committed_package_gate_cleanup(
             expected_available=current.apache_available,
             expected_active=current.apache_was_active,
             expected_unit_file_state=current.apache_unit_file_state,
+            bound_install_root=bound_install_root,
         )
     return current
 
@@ -3457,6 +4121,7 @@ def _reload_and_verify_recovery_dropins(
     *,
     expected_present: bool,
     transaction_id: str,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> None:
     transaction_id = str(transaction_id or "")
     if not RECOVERY_BOOTBLOCK_TRANSACTION_RE.fullmatch(transaction_id):
@@ -3467,11 +4132,15 @@ def _reload_and_verify_recovery_dropins(
     )
     systemd_env = dict(os.environ)
     systemd_env.update({"LC_ALL": "C", "LANG": "C"})
-    reload_result = _run_argv(
-        ["systemctl", "daemon-reload"],
-        timeout=30,
-        env=systemd_env,
-    )
+    _verify_optional_recovery_install_binding(bound_install_root)
+    try:
+        reload_result = _run_argv(
+            ["systemctl", "daemon-reload"],
+            timeout=30,
+            env=systemd_env,
+        )
+    finally:
+        _verify_optional_recovery_install_binding(bound_install_root)
     if (
         not reload_result.get("success")
         or reload_result.get("timed_out")
@@ -4007,7 +4676,22 @@ def _arm_persistent_recovery_bootblock(
     *,
     transaction_id: str | None = None,
     recovery_journal_contract: recovery_journal.RecoveryJournalContract | None = None,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> RecoveryBootblockContract:
+    if bound_install_root is None and recovery_journal_contract is not None:
+        verified_journal = recovery_journal.verify_recovery_journal(
+            recovery_journal_contract
+        )
+        with bind_persistent_install_root(
+            verified_journal.payload.install_root,
+        ) as fresh_binding:
+            return _arm_persistent_recovery_bootblock(
+                contract,
+                transaction_id=transaction_id,
+                recovery_journal_contract=verified_journal,
+                bound_install_root=fresh_binding,
+            )
+    _verify_optional_recovery_install_binding(bound_install_root)
     if contract is None:
         value = str(transaction_id or "")
         if not RECOVERY_BOOTBLOCK_TRANSACTION_RE.fullmatch(value):
@@ -4049,8 +4733,14 @@ def _arm_persistent_recovery_bootblock(
             prepared.units,
             expected_present=True,
             transaction_id=prepared.transaction_id,
+            bound_install_root=bound_install_root,
         )
         return prepared
+    except RecoveryInstallRootBindingError:
+        # Eine erkannte Root-/Mount-Drift ist kein partieller Arm-Fehler. Der
+        # Caller darf danach weder denselben Arm erneut versuchen noch weitere
+        # Dienstaktionen ausführen.
+        raise
     except Exception as arm_exc:
         # Ab dem ersten eigenen Inode bleibt der Contract erhalten. Ein
         # Folgeversuch bindet exakt diese Inodes und vervollständigt Marker/
@@ -4061,7 +4751,11 @@ def _arm_persistent_recovery_bootblock(
         ) from arm_exc
 
 
-def _clear_recovery_bootblock_marker(contract: RecoveryBootblockContract) -> None:
+def _clear_recovery_bootblock_marker(
+    contract: RecoveryBootblockContract,
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
+) -> None:
     contract = _rebind_owned_recovery_dropins(contract, recreate_missing=False)
     # Vor dem Öffnen des Gates muss die aktuelle systemd-Sicht nach Restore
     # erneut beweisen, dass jede inzwischen geladene Unit exakt unsere eine
@@ -4071,6 +4765,7 @@ def _clear_recovery_bootblock_marker(contract: RecoveryBootblockContract) -> Non
         contract.units,
         expected_present=True,
         transaction_id=contract.transaction_id,
+        bound_install_root=bound_install_root,
     )
     marker_payload = _recovery_bootblock_marker_payload(contract.transaction_id)
     state_descriptor = _open_recovery_bootblock_state_directory()
@@ -4093,11 +4788,14 @@ def _clear_recovery_bootblock_marker(contract: RecoveryBootblockContract) -> Non
         contract.units,
         expected_present=True,
         transaction_id=contract.transaction_id,
+        bound_install_root=bound_install_root,
     )
 
 
 def _remove_persistent_recovery_bootblock(
     contract: RecoveryBootblockContract,
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> None:
     """Entfernt nur den exakt gebundenen Block nach erfolgreichem Endgate."""
 
@@ -4147,6 +4845,7 @@ def _remove_persistent_recovery_bootblock(
         contract.units,
         expected_present=False,
         transaction_id=contract.transaction_id,
+        bound_install_root=bound_install_root,
     )
 
 
@@ -5113,16 +5812,21 @@ def _reload_and_verify_update_safety_dropins(
     contract: UpdateSafetyContract,
     *,
     expected_present: bool,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> None:
     """Bindet daemon-reload, Condition-OR und Lease-Abhängigkeiten gemeinsam."""
 
     if expected_present:
         _rebind_update_safety_dropins(contract)
-    reload_result = _run_argv(
-        ["systemctl", "daemon-reload"],
-        timeout=30,
-        env={**os.environ, "LC_ALL": "C", "LANG": "C"},
-    )
+    _verify_optional_recovery_install_binding(bound_install_root)
+    try:
+        reload_result = _run_argv(
+            ["systemctl", "daemon-reload"],
+            timeout=30,
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+        )
+    finally:
+        _verify_optional_recovery_install_binding(bound_install_root)
     if (
         not reload_result.get("success")
         or reload_result.get("timed_out")
@@ -5256,7 +5960,10 @@ def _reload_and_verify_update_safety_dropins(
 
 def _arm_update_safety_contract(
     contract: UpdateSafetyContract,
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> UpdateSafetyContract:
+    _verify_optional_recovery_install_binding(bound_install_root)
     contract = _validate_update_safety_contract(contract, expected_state="pending")
     _rebind_update_safety_dropins(contract)
     marker_payload = _recovery_bootblock_marker_payload(contract.transaction_id)
@@ -5272,14 +5979,26 @@ def _arm_update_safety_contract(
     finally:
         os.close(state_descriptor)
     _verify_update_safety_marker(contract, expected_present=True)
-    _reload_and_verify_update_safety_dropins(contract, expected_present=True)
+    _reload_and_verify_update_safety_dropins(
+        contract,
+        expected_present=True,
+        bound_install_root=bound_install_root,
+    )
     return contract
 
 
-def _clear_update_safety_marker(contract: UpdateSafetyContract) -> None:
+def _clear_update_safety_marker(
+    contract: UpdateSafetyContract,
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
+) -> None:
     _validate_update_safety_contract(contract)
     _rebind_update_safety_dropins(contract)
-    _reload_and_verify_update_safety_dropins(contract, expected_present=True)
+    _reload_and_verify_update_safety_dropins(
+        contract,
+        expected_present=True,
+        bound_install_root=bound_install_root,
+    )
     marker_payload = _recovery_bootblock_marker_payload(contract.transaction_id)
     state_descriptor = _open_recovery_bootblock_state_directory()
     try:
@@ -5298,7 +6017,11 @@ def _clear_update_safety_marker(contract: UpdateSafetyContract) -> None:
     _verify_update_safety_marker(contract, expected_present=False)
 
 
-def _remove_update_safety_dropins(contract: UpdateSafetyContract) -> None:
+def _remove_update_safety_dropins(
+    contract: UpdateSafetyContract,
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
+) -> None:
     _validate_update_safety_contract(contract)
     _verify_update_safety_marker(contract, expected_present=False)
     identities = {
@@ -5312,15 +6035,25 @@ def _remove_update_safety_dropins(contract: UpdateSafetyContract) -> None:
         payload=_render_update_safety_dropin(contract.transaction_id),
         allow_missing=False,
     )
-    _reload_and_verify_update_safety_dropins(contract, expected_present=False)
+    _reload_and_verify_update_safety_dropins(
+        contract,
+        expected_present=False,
+        bound_install_root=bound_install_root,
+    )
 
 
 def _commit_update_safety_receipt(
     contract: UpdateSafetyContract,
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> UpdateSafetyContract:
     contract = _validate_update_safety_contract(contract, expected_state="pending")
     _verify_update_safety_marker(contract, expected_present=True)
-    _reload_and_verify_update_safety_dropins(contract, expected_present=True)
+    _reload_and_verify_update_safety_dropins(
+        contract,
+        expected_present=True,
+        bound_install_root=bound_install_root,
+    )
     return _replace_update_safety_receipt(
         contract,
         _update_safety_record_from_contract(contract, state="committed"),
@@ -5331,6 +6064,7 @@ def _finish_committed_update_safety_cleanup(
     contract: UpdateSafetyContract,
     *,
     remove_receipt: bool,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> UpdateSafetyContract:
     """Räumt eigene Gates und vollendet danach Apache; niemals Altpreimages."""
 
@@ -5367,12 +6101,19 @@ def _finish_committed_update_safety_cleanup(
         payload=_render_update_safety_dropin(contract.transaction_id),
         allow_missing=True,
     )
-    _reload_and_verify_update_safety_dropins(contract, expected_present=False)
+    _reload_and_verify_update_safety_dropins(
+        contract,
+        expected_present=False,
+        bound_install_root=bound_install_root,
+    )
     # Erst das durable committed Receipt autorisiert den extern erreichbaren
     # Webabschluss. Der Aufruf bleibt wiederholbar: fehlende eigene Gate-Namen
     # sind oben zulässig, systemctl start ist idempotent und HTTP wird erneut
     # ausschließlich über Loopback geprüft.
-    _complete_committed_apache_from_receipt(contract)
+    _complete_committed_apache_from_receipt(
+        contract,
+        bound_install_root=bound_install_root,
+    )
     if remove_receipt:
         _remove_exact_update_safety_receipt(contract)
     return contract
@@ -5380,9 +6121,12 @@ def _finish_committed_update_safety_cleanup(
 
 def _rearm_pending_update_safety_contract(
     contract: UpdateSafetyContract,
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> UpdateSafetyContract:
     """Vervollständigt denselben tx-/payloadgebundenen pending Vertrag erneut."""
 
+    _verify_optional_recovery_install_binding(bound_install_root)
     # Dieser Contract wurde bereits am Managed-Finalizer-Endgate vollständig
     # gebunden. Ein atomar ersetztes, nur ähnlich geformtes Receipt darf hier
     # weder neue 00-Inodes noch einen Marker, Stop oder Restore autorisieren.
@@ -5457,25 +6201,47 @@ def _rearm_pending_update_safety_contract(
                 dropin_identities=new_identities,
             ),
         )
-    return _arm_update_safety_contract(current)
+    return _arm_update_safety_contract(
+        current,
+        bound_install_root=bound_install_root,
+    )
 
 
 def _enforce_update_safety_fail_closed(
     contract: UpdateSafetyContract,
     *,
     repo_dir: str,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> UpdateSafetyContract:
     """Rearmed denselben Vertrag und beweist danach Writer-Ruhe ohne Start."""
 
-    current = _rearm_pending_update_safety_contract(contract)
-    if not _stop_v4_services(V4_SERVICES):
+    if bound_install_root is None:
+        with bind_persistent_install_root(repo_dir) as fresh_binding:
+            return _enforce_update_safety_fail_closed(
+                contract,
+                repo_dir=repo_dir,
+                bound_install_root=fresh_binding,
+            )
+    _verify_optional_recovery_install_binding(bound_install_root, repo_dir)
+    current = _rearm_pending_update_safety_contract(
+        contract,
+        bound_install_root=bound_install_root,
+    )
+    if not _stop_v4_services(
+        V4_SERVICES,
+        bound_install_root=bound_install_root,
+    ):
         raise RuntimeError("Dynamischer Fail-closed-Stop blieb unvollständig")
     _assert_strict_update_writer_quiescence(
         repo_dir=repo_dir,
         transaction_id=current.transaction_id,
     )
     _verify_update_safety_marker(current, expected_present=True)
-    _reload_and_verify_update_safety_dropins(current, expected_present=True)
+    _reload_and_verify_update_safety_dropins(
+        current,
+        expected_present=True,
+        bound_install_root=bound_install_root,
+    )
     return current
 
 
@@ -5703,6 +6469,7 @@ def _wait_for_systemd_end_state(
     *,
     timeout_s: int = SYSTEMD_SETTLE_TIMEOUT_S,
     poll_s: int = SYSTEMD_SETTLE_POLL_S,
+    action_authorizer=None,
 ) -> tuple[bool, tuple[str, str, str], dict]:
     """Gibt einem nach Timeout noch konvergierenden Dienst ein begrenztes Fenster."""
 
@@ -5718,10 +6485,23 @@ def _wait_for_systemd_end_state(
         remaining_before_probe = deadline - time.monotonic()
         if remaining_before_probe <= 0:
             return False, last_state, last_result
-        load_state, unit_file_state, active_state, last_result = _systemd_show_end_state(
-            service,
-            timeout_s=max(1, min(10, math.ceil(remaining_before_probe))),
+        _authorize_recovery_service_action(
+            action_authorizer=action_authorizer,
         )
+        try:
+            load_state, unit_file_state, active_state, last_result = (
+                _systemd_show_end_state(
+                    service,
+                    timeout_s=max(
+                        1,
+                        min(10, math.ceil(remaining_before_probe)),
+                    ),
+                )
+            )
+        finally:
+            _authorize_recovery_service_action(
+                action_authorizer=action_authorizer,
+            )
         last_state = (load_state, unit_file_state, active_state)
         if last_state == ("loaded", "enabled", "active"):
             return True, last_state, last_result
@@ -6599,88 +7379,33 @@ def _repair_mode5_user_start_legacy_parent(
     return _mode5_user_start_request_surface_safe(path)
 
 
-def _fix_webroot_permissions() -> bool:
-    install_user = shlex.quote(get_install_user())
-    secret_file_mode = config_secret_file_mode_text()
-    secret_dir_mode = config_secret_dir_mode_text()
-    repo_v4_config = shlex.quote(os.path.join(get_install_path(), "data", "e3dc_v4.json"))
-    web_backup_dir = "/var/www/html/data/config_backups"
-    repo_backup_dir = os.path.join(get_install_path(), "data", "config_backups")
+def _fix_webroot_permissions(
+    *,
+    program_files=None,
+    program_directories=None,
+) -> bool:
+    """Repariert nur bekannte Runtime- und Produktflächen im Webroot."""
+
     protected_mode5_request = WALLBOX_MODE5_USER_START_REQUEST_FILE
-    protected_mode5_lock = protected_mode5_request + ".lock"
     if not _repair_mode5_user_start_legacy_parent(protected_mode5_request):
         raise RuntimeError(
             "Persistente Modus-5-Anforderungsfläche ist unsicher; "
             "keine Webroot-Reparatur ausgeführt"
         )
-    run_command(f"sudo usermod -aG www-data {install_user} 2>/dev/null || true", timeout=10)
-    protected_wallbox_jobs = "/var/www/html/data/.wallbox_plan_jobs"
-    protected_matter_storage = "/var/www/html/data/matter-storage"
-    run_command(
-        "sudo find -P /var/www/html -xdev "
-        f"\\( -path {protected_wallbox_jobs} "
-        f"-o -path {protected_mode5_request} "
-        f"-o -path {protected_mode5_lock} \\) -prune -o "
-        f"\\( -type d -o -type f \\) -exec chown {install_user}:www-data {{}} +",
-        timeout=60,
+    from .permissions import (
+        _normalize_web_runtime_permissions,
+        harden_web_program_permissions,
     )
-    run_command(
-        "sudo find -P /var/www/html -xdev "
-        "\\( -path /var/www/html/data/e3dc_v4.json "
-        "-o -path /var/www/html/data/config_backups "
-        f"-o -path {protected_matter_storage} "
-        f"-o -path {protected_wallbox_jobs} "
-        f"-o -path {protected_mode5_request} "
-        f"-o -path {protected_mode5_lock} \\) -prune -o "
-        "-type d -exec chmod 775 {} +",
-        timeout=60,
-    )
-    run_command(
-        "sudo find -P /var/www/html -xdev "
-        "\\( -path /var/www/html/data/e3dc_v4.json "
-        "-o -path /var/www/html/data/config_backups "
-        f"-o -path {protected_matter_storage} "
-        f"-o -path {protected_wallbox_jobs} "
-        f"-o -path {protected_mode5_request} "
-        f"-o -path {protected_mode5_lock} \\) -prune -o "
-        "-type f -exec chmod 664 {} +",
-        timeout=60,
-    )
-    permission_steps = (
-        (
-            f"sudo chmod {secret_dir_mode} /var/www/html/data",
-            "Datenverzeichnis",
-        ),
-        (
-            "sudo chmod 2775 /var/www/html/logs /var/www/html/ramdisk /var/www/html/tmp",
-            "Laufzeitverzeichnisse",
-        ),
-    )
-    for command, label in permission_steps:
-        result = run_command(command, timeout=10)
-        if not isinstance(result, dict) or not result.get("success"):
-            detail = str((result or {}).get("stderr") or (result or {}).get("stdout") or "unbekannter Fehler")
-            raise RuntimeError(f"{label} konnten nicht auf den Sollmodus gesetzt werden: {detail}")
-    run_command(f"sudo chmod {secret_file_mode} /var/www/html/data/e3dc_v4.json 2>/dev/null || true", timeout=5)
-    run_command(f"sudo chmod {secret_file_mode} {repo_v4_config} 2>/dev/null || true", timeout=5)
-    for raw_backup_dir in (web_backup_dir, repo_backup_dir):
-        raw_migration_dir = os.path.join(raw_backup_dir, "aux_inverter_migration")
-        config_backup_dir = shlex.quote(raw_backup_dir)
-        migration_backup_dir = shlex.quote(raw_migration_dir)
-        run_command(f"sudo chmod {secret_dir_mode} {config_backup_dir} 2>/dev/null || true", timeout=5)
-        run_command(
-            f"sudo find -P {config_backup_dir} -path {migration_backup_dir} -prune -o "
-            f"-type d -exec chmod {secret_dir_mode} {{}} + 2>/dev/null || true",
-            timeout=10,
-        )
-        run_command(
-            f"sudo find -P {config_backup_dir} -path {migration_backup_dir} -prune -o "
-            f"-type f -exec chmod {secret_file_mode} {{}} + 2>/dev/null || true",
-            timeout=10,
-        )
-        if not _harden_aux_inverter_migration_backups(raw_migration_dir):
-            raise RuntimeError("Zusatz-WR-Migrationsbackups konnten nicht sicher gehärtet werden")
-    run_command("sudo chmod 664 /var/www/html/ramdisk/value_filter.json 2>/dev/null || true", timeout=5)
+
+    _normalize_web_runtime_permissions("/var/www/html")
+    if not harden_web_program_permissions(
+        web_root="/var/www/html",
+        install_user=get_install_user(),
+        web_group="www-data",
+        program_files=program_files,
+        program_directories=program_directories,
+    ):
+        raise RuntimeError("Web-Produkt-Positivliste konnte nicht gehärtet werden")
     if not _mode5_user_start_request_surface_safe(protected_mode5_request):
         raise RuntimeError(
             "Persistente Modus-5-Anforderungsfläche wechselte während der "
@@ -6864,7 +7589,148 @@ def _delete_approved_stale_paths(
     allowed_files=APPROVED_STALE_DELETE_FILES,
     allowed_dirs=APPROVED_STALE_DELETE_DIRS,
 ) -> tuple[bool, list[str]]:
-    """Delete only exact, code-reviewed stale targets from a positive list."""
+    """Löscht nur exakte Stales über gehaltene, nofollow-geöffnete Wurzeln."""
+
+    def mount_id(descriptor: int) -> str:
+        with open(
+            f"/proc/self/fdinfo/{int(descriptor)}",
+            "r",
+            encoding="ascii",
+            errors="strict",
+        ) as handle:
+            for line in handle:
+                if line.startswith("mnt_id:"):
+                    value = line.partition(":")[2].strip()
+                    if value.isdigit():
+                        return value
+        raise RuntimeError("Mount-ID des Stale-Löschpfads ist nicht lesbar")
+
+    def verify_root(root_path: str, descriptor: int, expected: tuple[int, int]) -> None:
+        opened = os.fstat(descriptor)
+        rebound = _open_directory_nofollow(root_path)
+        try:
+            named = os.fstat(rebound)
+        finally:
+            os.close(rebound)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != expected
+            or (named.st_dev, named.st_ino) != expected
+        ):
+            raise RuntimeError("Stale-Löschwurzel wurde ausgetauscht")
+
+    def remove_tree_at(
+        parent_fd: int,
+        name: str,
+        *,
+        expected: tuple[int, int],
+        expected_mount_id: str,
+        depth: int = 0,
+    ) -> None:
+        if depth > 64:
+            raise RuntimeError("Stale-Verzeichnisbaum ist unplausibel tief")
+        descriptor = os.open(
+            name,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                (opened.st_dev, opened.st_ino) != expected
+                or mount_id(descriptor) != expected_mount_id
+            ):
+                raise RuntimeError("Stale-Verzeichnis driftete oder liegt auf Fremdmount")
+            for child_name in sorted(os.listdir(descriptor)):
+                child = os.stat(
+                    child_name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                if stat.S_ISDIR(child.st_mode) and not stat.S_ISLNK(child.st_mode):
+                    remove_tree_at(
+                        descriptor,
+                        child_name,
+                        expected=(int(child.st_dev), int(child.st_ino)),
+                        expected_mount_id=expected_mount_id,
+                        depth=depth + 1,
+                    )
+                elif stat.S_ISREG(child.st_mode):
+                    if child.st_nlink != 1:
+                        raise RuntimeError("Hardlink im Stale-Verzeichnisbaum")
+                    child_fd = os.open(
+                        child_name,
+                        os.O_RDONLY
+                        | getattr(os, "O_NOFOLLOW", 0)
+                        | getattr(os, "O_CLOEXEC", 0),
+                        dir_fd=descriptor,
+                    )
+                    try:
+                        bound = os.fstat(child_fd)
+                        if (
+                            (bound.st_dev, bound.st_ino)
+                            != (child.st_dev, child.st_ino)
+                            or bound.st_nlink != 1
+                            or mount_id(child_fd) != expected_mount_id
+                        ):
+                            raise RuntimeError("Datei im Stale-Baum driftete")
+                        current = os.stat(
+                            child_name,
+                            dir_fd=descriptor,
+                            follow_symlinks=False,
+                        )
+                        rebound = os.fstat(child_fd)
+                        if (
+                            not stat.S_ISREG(current.st_mode)
+                            or (
+                                current.st_dev,
+                                current.st_ino,
+                                current.st_nlink,
+                            )
+                            != (
+                                bound.st_dev,
+                                bound.st_ino,
+                                1,
+                            )
+                            or (
+                                rebound.st_dev,
+                                rebound.st_ino,
+                                rebound.st_nlink,
+                            )
+                            != (
+                                bound.st_dev,
+                                bound.st_ino,
+                                1,
+                            )
+                        ):
+                            raise RuntimeError(
+                                "Datei im Stale-Baum wurde vor unlink ersetzt"
+                            )
+                        os.unlink(child_name, dir_fd=descriptor)
+                        detached = os.fstat(child_fd)
+                        if detached.st_nlink != 0:
+                            raise RuntimeError(
+                                "Entfernte Stale-Datei blieb unerwartet verlinkt"
+                            )
+                    finally:
+                        os.close(child_fd)
+                    os.fsync(descriptor)
+                elif stat.S_ISLNK(child.st_mode):
+                    os.unlink(child_name, dir_fd=descriptor)
+                else:
+                    raise RuntimeError("Spezialdatei im Stale-Verzeichnisbaum")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != expected:
+            raise RuntimeError("Stale-Verzeichnis wurde vor rmdir ausgetauscht")
+        os.rmdir(name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+
     errors: list[str] = []
     for raw_path in paths or []:
         if not isinstance(raw_path, str) or not raw_path.startswith('/'):
@@ -6874,27 +7740,165 @@ def _delete_approved_stale_paths(
         if path != raw_path:
             errors.append(f'Nicht normalisierter Stale-Pfad: {raw_path}')
             continue
+        if path not in allowed_files and path not in allowed_dirs:
+            errors.append(f'Nicht freigegebener Stale-Pfad: {path}')
+            continue
+        root_path = "/var/www/html"
         try:
-            if path in allowed_files:
-                if not os.path.lexists(path):
+            relative = Path(path).relative_to(root_path)
+        except ValueError:
+            errors.append(f'Stale-Pfad liegt außerhalb des Webroots: {path}')
+            continue
+        if not relative.parts:
+            errors.append(f'Stale-Pfad darf nicht der Webroot sein: {path}')
+            continue
+
+        # Die produktive Ramdisk ist die einzige native separate Mountkante.
+        if relative.parts[0] == "ramdisk":
+            try:
+                from .ramdisk_guard import probe_ramdisk_tmpfs
+
+                probe = probe_ramdisk_tmpfs(ramdisk_path="/var/www/html/ramdisk")
+            except Exception:
+                probe = {"ok": False}
+            if probe.get("ok"):
+                root_path = "/var/www/html/ramdisk"
+                relative = Path(*relative.parts[1:])
+                if not relative.parts:
+                    errors.append(f'Stale-Pfad darf nicht die Ramdisk-Wurzel sein: {path}')
                     continue
-                metadata = os.lstat(path)
-                if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
-                    errors.append(f'Erwartete Datei ist ein Verzeichnis: {path}')
-                    continue
-                os.unlink(path)
-            elif path in allowed_dirs:
-                if not os.path.lexists(path):
-                    continue
-                metadata = os.lstat(path)
-                if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
-                    _remove_tree_nofollow(path)
-                else:
-                    os.unlink(path)
+
+        root_fd = -1
+        opened_parents: list[int] = []
+        try:
+            root_fd = _open_directory_nofollow(root_path)
+            root_metadata = os.fstat(root_fd)
+            root_identity = (int(root_metadata.st_dev), int(root_metadata.st_ino))
+            root_mount_id = mount_id(root_fd)
+            verify_root(root_path, root_fd, root_identity)
+            parent_fd = root_fd
+            missing = False
+            for component in relative.parts[:-1]:
+                try:
+                    named_parent = os.stat(
+                        component,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    missing = True
+                    break
+                if stat.S_ISLNK(named_parent.st_mode) or not stat.S_ISDIR(
+                    named_parent.st_mode
+                ):
+                    raise RuntimeError("Stale-Zwischenpfad ist kein echtes Verzeichnis")
+                child_fd = os.open(
+                    component,
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=parent_fd,
+                )
+                opened = os.fstat(child_fd)
+                if (
+                    (opened.st_dev, opened.st_ino)
+                    != (named_parent.st_dev, named_parent.st_ino)
+                    or mount_id(child_fd) != root_mount_id
+                ):
+                    os.close(child_fd)
+                    raise RuntimeError("Stale-Zwischenpfad driftete oder liegt auf Fremdmount")
+                opened_parents.append(child_fd)
+                parent_fd = child_fd
+            if missing:
+                continue
+            name = relative.parts[-1]
+            try:
+                metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if path in allowed_dirs and stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(
+                metadata.st_mode
+            ):
+                remove_tree_at(
+                    parent_fd,
+                    name,
+                    expected=(int(metadata.st_dev), int(metadata.st_ino)),
+                    expected_mount_id=root_mount_id,
+                )
+            elif stat.S_ISLNK(metadata.st_mode):
+                os.unlink(name, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            elif stat.S_ISREG(metadata.st_mode):
+                if path in allowed_dirs:
+                    raise RuntimeError("Erwartetes Stale-Verzeichnis ist eine Datei")
+                if metadata.st_nlink != 1:
+                    raise RuntimeError("Stale-Datei besitzt Hardlinks")
+                file_fd = os.open(
+                    name,
+                    os.O_RDONLY
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=parent_fd,
+                )
+                try:
+                    opened = os.fstat(file_fd)
+                    if (
+                        (opened.st_dev, opened.st_ino)
+                        != (metadata.st_dev, metadata.st_ino)
+                        or opened.st_nlink != 1
+                        or mount_id(file_fd) != root_mount_id
+                    ):
+                        raise RuntimeError("Stale-Datei driftete oder liegt auf Fremdmount")
+                    current = os.stat(
+                        name,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                    rebound = os.fstat(file_fd)
+                    if (
+                        not stat.S_ISREG(current.st_mode)
+                        or (
+                            current.st_dev,
+                            current.st_ino,
+                            current.st_nlink,
+                        )
+                        != (
+                            opened.st_dev,
+                            opened.st_ino,
+                            1,
+                        )
+                        or (
+                            rebound.st_dev,
+                            rebound.st_ino,
+                            rebound.st_nlink,
+                        )
+                        != (
+                            opened.st_dev,
+                            opened.st_ino,
+                            1,
+                        )
+                    ):
+                        raise RuntimeError("Stale-Datei wurde vor unlink ersetzt")
+                    os.unlink(name, dir_fd=parent_fd)
+                    detached = os.fstat(file_fd)
+                    if detached.st_nlink != 0:
+                        raise RuntimeError(
+                            "Entfernte Stale-Datei blieb unerwartet verlinkt"
+                        )
+                finally:
+                    os.close(file_fd)
+                os.fsync(parent_fd)
             else:
-                errors.append(f'Nicht freigegebener Stale-Pfad: {path}')
+                raise RuntimeError("Stale-Ziel besitzt einen unzulässigen Typ")
+            verify_root(root_path, root_fd, root_identity)
         except Exception as exc:
             errors.append(f'Stale-Pfad konnte nicht entfernt werden ({path}): {exc}')
+        finally:
+            for descriptor in reversed(opened_parents):
+                os.close(descriptor)
+            if root_fd >= 0:
+                os.close(root_fd)
     return not errors, errors
 
 
@@ -7121,6 +8125,31 @@ def _bind_bootstrap_git_prestate(
     if commit:
         return commit, False
     raise RuntimeError("Aktueller HEAD konnte nicht als volle Commit-SHA verifiziert werden")
+
+
+def _capture_install_root_identity(repo_dir: str) -> tuple[int, int, int, int]:
+    """Bindet Parent und Installationswurzel ohne persistentes Schemasignal."""
+
+    with bind_persistent_source_root(repo_dir) as binding:
+        return (
+            int(binding.parent_device),
+            int(binding.parent_inode),
+            int(binding.device),
+            int(binding.inode),
+        )
+
+
+def _verify_install_root_identity(
+    repo_dir: str,
+    expected_identity: tuple[int, int, int, int],
+) -> None:
+    """Belegt, dass derselbe benannte Produktbaum weiterhin aktiv ist."""
+
+    with bind_persistent_source_root(
+        repo_dir,
+        expected_identity=expected_identity,
+    ):
+        return
 
 
 def _repo_descriptor_has_unsafe_xattrs(descriptor: int) -> bool:
@@ -7402,12 +8431,43 @@ def _verify_recovered_repo_contract(
         raise RuntimeError("Repo-Recovery-Endvertrag fehlt")
     root = os.path.abspath(repo_dir)
     account = pwd.getpwnam(str(install_user))
+    product_gid = int(grp.getgrnam("www-data").gr_gid)
     if (
         contract.install_root != root
         or contract.install_user != str(install_user)
         or _bound_release_head_commit(root, install_user) != contract.expected_commit
     ):
         raise RuntimeError("Repo-Recovery-Endvertrag weicht vom Rückfallziel ab")
+    expected_git_entries = tuple(
+        (relative_path, git_mode, git_oid)
+        for relative_path, git_mode, git_oid, _sha, _size, _mode, _uid, _gid
+        in contract.tracked_files
+    )
+    current_git_entries = tuple(
+        _tracked_release_file_contracts(
+            root,
+            install_user,
+            target_commit=contract.expected_commit,
+        )
+    )
+    live_entries = tuple(
+        _tracked_release_live_file_contracts(
+            root,
+            install_user,
+            target_commit=contract.expected_commit,
+        )
+    )
+    if current_git_entries != expected_git_entries or tuple(
+        (path, object_id) for path, _mode, object_id in live_entries
+    ) != tuple(
+        (path, object_id) for path, _mode, object_id in expected_git_entries
+    ):
+        raise RuntimeError(
+            "Repo-Recovery-Endvertrag besitzt einen abweichenden Commit-Dateivertrag"
+        )
+    live_mode_by_path = {
+        path: mode for path, mode, _object_id in live_entries
+    }
     dirty_paths = []
     for (
         relative_path,
@@ -7426,8 +8486,9 @@ def _verify_recovered_repo_contract(
                 not stat.S_ISREG(before.st_mode)
                 or before.st_nlink != 1
                 or before.st_uid != account.pw_uid
-                or before.st_gid != account.pw_gid
-                or stat.S_IMODE(before.st_mode) != git_mode
+                or before.st_gid != product_gid
+                or stat.S_IMODE(before.st_mode)
+                != live_mode_by_path[relative_path]
                 or before.st_size != expected_size
                 or _repo_descriptor_has_unsafe_xattrs(descriptor)
                 or _descriptor_plain_sha256(descriptor, expected_size) != expected_sha256
@@ -8711,6 +9772,8 @@ def _secure_repo_permissions(
     """
     root = os.path.abspath(repo_dir)
     account = pwd.getpwnam(str(install_user))
+    web_group = grp.getgrnam("www-data")
+    product_gid = int(web_group.gr_gid)
     if not isinstance(root_git_authority, bool):
         raise ValueError("Git-Rechteprojektionsautorität muss boolesch sein")
     if root_git_authority and (
@@ -8735,7 +9798,7 @@ def _secure_repo_permissions(
             "Repository-HEAD weicht vor der Rechtehärtung vom gebundenen "
             "Produkt-Commit ab"
         )
-    tracked_entries = _tracked_release_file_contracts(
+    tracked_entries = _tracked_release_live_file_contracts(
         root,
         install_user,
         target_commit=bound_commit,
@@ -8966,7 +10029,7 @@ def _secure_repo_permissions(
             # zweite fsync nach den Metadaten bindet anschließend den finalen
             # Inodevertrag.
             os.fsync(temporary_descriptor)
-            os.fchown(temporary_descriptor, account.pw_uid, account.pw_gid)
+            os.fchown(temporary_descriptor, account.pw_uid, product_gid)
             os.fchmod(temporary_descriptor, expected_mode)
             os.utime(
                 temporary_descriptor,
@@ -8981,7 +10044,7 @@ def _secure_repo_permissions(
                 not stat.S_ISREG(hardened.st_mode)
                 or hardened.st_nlink != 1
                 or hardened.st_uid != account.pw_uid
-                or hardened.st_gid != account.pw_gid
+                or hardened.st_gid != product_gid
                 or stat.S_IMODE(hardened.st_mode) != expected_mode
                 or hardened.st_size != source_metadata.st_size
                 or not descriptor_content_matches(
@@ -9164,7 +10227,7 @@ def _secure_repo_permissions(
                         or (opened.st_dev, opened.st_ino)
                         != (before.st_dev, before.st_ino)
                         or opened.st_uid != account.pw_uid
-                        or opened.st_gid != account.pw_gid
+                        or opened.st_gid != product_gid
                         or stat.S_IMODE(opened.st_mode) != expected_mode
                         or not descriptor_content_matches(
                             descriptor,
@@ -9279,8 +10342,8 @@ def _secure_repo_permissions(
                     "Getracktes Produktverzeichnis besitzt unsichere Metadaten: "
                     + (relative_directory or root)
                 )
-            if before.st_uid != account.pw_uid or before.st_gid != account.pw_gid:
-                os.fchown(descriptor, account.pw_uid, account.pw_gid)
+            if before.st_uid != account.pw_uid or before.st_gid != product_gid:
+                os.fchown(descriptor, account.pw_uid, product_gid)
             if stat.S_IMODE(before.st_mode) != 0o755:
                 os.fchmod(descriptor, 0o755)
             # Auch Verzeichnis-Metadaten müssen vor dem Recovery-Endgate auf
@@ -9308,7 +10371,7 @@ def _secure_repo_permissions(
                 != (before.st_dev, before.st_ino)
                 or directory_contract(live_after) != directory_contract(after)
                 or after.st_uid != account.pw_uid
-                or after.st_gid != account.pw_gid
+                or after.st_gid != product_gid
                 or stat.S_IMODE(after.st_mode) != 0o755
             ):
                 raise RuntimeError(
@@ -9402,7 +10465,7 @@ def _secure_repo_permissions(
                     )
                 if (
                     stable_before_mutation.st_uid != account.pw_uid
-                    or stable_before_mutation.st_gid != account.pw_gid
+                    or stable_before_mutation.st_gid != product_gid
                     or stat.S_IMODE(stable_before_mutation.st_mode)
                     != expected_mode
                     or _repo_descriptor_has_unsafe_xattrs(descriptor)
@@ -9424,7 +10487,7 @@ def _secure_repo_permissions(
                     not stat.S_ISREG(after.st_mode)
                     or after.st_nlink != 1
                     or after.st_uid != account.pw_uid
-                    or after.st_gid != account.pw_gid
+                    or after.st_gid != product_gid
                     or stat.S_IMODE(after.st_mode) != expected_mode
                     or not descriptor_content_matches(
                         descriptor,
@@ -9475,7 +10538,7 @@ def _secure_repo_permissions(
                     "Projizierte Git-Metadaten sind für den Installationsbenutzer "
                     "nicht commitgebunden lesbar"
                 )
-            user_entries = _tracked_release_file_contracts(
+            user_entries = _tracked_release_live_file_contracts(
                 root,
                 install_user,
                 target_commit=bound_commit,
@@ -11824,7 +12887,11 @@ def _normalize_restart_services(services) -> list:
     return normalized
 
 
-def _read_stopped_unit_contract(service: str) -> dict[str, object]:
+def _read_stopped_unit_contract(
+    service: str,
+    *,
+    action_authorizer=None,
+) -> dict[str, object]:
     """Liest den vollständigen Stopzustand einer Unit in genau einem Readback."""
 
     unit = _unit_name(service)
@@ -11833,7 +12900,7 @@ def _read_stopped_unit_contract(service: str) -> dict[str, object]:
         f"sudo journalctl -u {unit} --no-pager -n 100"
     )
     properties = ("LoadState", "ActiveState", "SubState", "MainPID")
-    result = _run_argv(
+    result = _run_recovery_service_argv(
         [
             "systemctl",
             "show",
@@ -11842,6 +12909,7 @@ def _read_stopped_unit_contract(service: str) -> dict[str, object]:
             unit,
         ],
         timeout=10,
+        action_authorizer=action_authorizer,
     )
     stdout = str(result.get("stdout") or "")
     if (
@@ -11898,10 +12966,14 @@ def _normalize_stopped_unit_contract(
     service: str,
     *,
     allow_failed_reset: bool = True,
+    action_authorizer=None,
 ) -> dict[str, object]:
     """Setzt ausschließlich stale ``failed/PID0`` auf ``inactive/dead`` zurück."""
 
-    state = _read_stopped_unit_contract(service)
+    state = _read_stopped_unit_contract(
+        service,
+        action_authorizer=action_authorizer,
+    )
     diagnostic_hint = (
         f"Prüfen: sudo systemctl status --no-pager {state['unit']}; "
         f"sudo journalctl -u {state['unit']} --no-pager -n 100"
@@ -11934,9 +13006,10 @@ def _normalize_stopped_unit_contract(
                 f"in failed ({state_text(state)}); ein zweites reset-failed "
                 f"ist nicht zulässig. {diagnostic_hint}"
             )
-        reset = _run_argv(
+        reset = _run_recovery_service_argv(
             ["sudo", "systemctl", "reset-failed", str(state["unit"])],
             timeout=10,
+            action_authorizer=action_authorizer,
         )
         if (
             not reset.get("success")
@@ -11950,7 +13023,10 @@ def _normalize_stopped_unit_contract(
                 + _command_result_diagnostic(reset)
                 + f". {diagnostic_hint}"
             )
-        state = _read_stopped_unit_contract(service)
+        state = _read_stopped_unit_contract(
+            service,
+            action_authorizer=action_authorizer,
+        )
     if not (
         state["load_state"] in {"loaded", "masked", "not-found"}
         and state["active_state"] == "inactive"
@@ -11964,12 +13040,30 @@ def _normalize_stopped_unit_contract(
     return state
 
 
-def _stop_v4_services_impl(services=None):
+def _stop_v4_services_impl(
+    services=None,
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
+    action_authorizer=None,
+):
     """Stop every catalogued writer/integration plus watchdog and legacy core."""
+    if action_authorizer is not None and not callable(action_authorizer):
+        raise ValueError("Stop-Dienstaktions-Autorizer ist nicht aufrufbar")
+
+    def authorize_action() -> bool:
+        return _authorize_recovery_service_action(
+            bound_install_root=bound_install_root,
+            action_authorizer=action_authorizer,
+        )
+
     print('\n[->] Stoppe E3DC-Control-Dienste fuer Release-Wechsel...')
     errors = []
     try:
+        authorize_action()
         all_names = [unit.removesuffix(".service") for unit in _catalog_units_strict()]
+        authorize_action()
+    except RecoveryInstallRootBindingError:
+        raise
     except Exception as exc:
         print(f"  [!] Service-Katalog nicht lesbar: {exc}")
         return False
@@ -11984,14 +13078,20 @@ def _stop_v4_services_impl(services=None):
     # zurückgesetzt und muss danach frisch inactive/dead/MainPID=0 liefern.
     stop_results = {}
     for srv in stop_order:
-        stop_results[srv] = _run_argv(
+        stop_results[srv] = _run_recovery_service_argv(
             ["sudo", "systemctl", "stop", _unit_name(srv)],
             timeout=15,
+            action_authorizer=authorize_action,
         )
     for srv in stop_order:
         stopped = stop_results[srv]
         try:
-            stopped_state = _normalize_stopped_unit_contract(srv)
+            stopped_state = _normalize_stopped_unit_contract(
+                srv,
+                action_authorizer=authorize_action,
+            )
+        except RecoveryInstallRootBindingError:
+            raise
         except Exception as exc:
             errors.append(
                 f"{_unit_name(srv)} ist nach Sofortstop nicht sicher gebunden: "
@@ -12015,19 +13115,39 @@ def _stop_v4_services_impl(services=None):
     for screen_user in screen_users:
         for screen_name in ("e3dc", "E3DC"):
             prefix = ["sudo", "-u", screen_user] if screen_user != "root" else ["sudo"]
-            _run_argv([*prefix, "screen", "-S", screen_name, "-X", "quit"], timeout=10)
-    _run_argv(["sudo", "pkill", "-x", "E3DC-Control"], timeout=10)
-    _run_argv(["sudo", "pkill", "-f", r"(^|/)E3DC\.sh([[:space:]]|$)"], timeout=10)
+            _run_recovery_service_argv(
+                [*prefix, "screen", "-S", screen_name, "-X", "quit"],
+                timeout=10,
+                action_authorizer=authorize_action,
+            )
+    _run_recovery_service_argv(
+        ["sudo", "pkill", "-x", "E3DC-Control"],
+        timeout=10,
+        action_authorizer=authorize_action,
+    )
+    _run_recovery_service_argv(
+        ["sudo", "pkill", "-f", r"(^|/)E3DC\.sh([[:space:]]|$)"],
+        timeout=10,
+        action_authorizer=authorize_action,
+    )
     for probe in (
         ["pgrep", "-x", "E3DC-Control"],
         ["pgrep", "-f", r"(^|/)[E]3DC\.sh([[:space:]]|$)"],
     ):
-        result = _run_argv(probe, timeout=10)
+        result = _run_recovery_service_argv(
+            probe,
+            timeout=10,
+            action_authorizer=authorize_action,
+        )
         if result.get("returncode") != 1:
             errors.append("Legacy-Screen-/Prozesspfad ist nicht beweisbar gestoppt")
     for screen_user in screen_users:
         prefix = ["sudo", "-u", screen_user] if screen_user != "root" else ["sudo"]
-        listing = _run_argv([*prefix, "screen", "-ls"], timeout=10)
+        listing = _run_recovery_service_argv(
+            [*prefix, "screen", "-ls"],
+            timeout=10,
+            action_authorizer=authorize_action,
+        )
         sessions = listing.get("stdout", "")
         if re.search(r"\.(?:e3dc|E3DC)(?:\s|$)", sessions):
             errors.append(f"Legacy-Screen-Session fuer {screen_user} ist weiterhin aktiv")
@@ -12040,7 +13160,10 @@ def _stop_v4_services_impl(services=None):
             stopped_state = _normalize_stopped_unit_contract(
                 srv,
                 allow_failed_reset=False,
+                action_authorizer=authorize_action,
             )
+        except RecoveryInstallRootBindingError:
+            raise
         except Exception as exc:
             errors.append(
                 f"{_unit_name(srv)} ist im globalen Stop-Endgate nicht sicher "
@@ -12057,11 +13180,24 @@ def _stop_v4_services_impl(services=None):
     return True
 
 
-def _stop_v4_services(services=None):
+def _stop_v4_services(
+    services=None,
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
+    action_authorizer=None,
+):
     """Totaler Fail-closed-Wrapper: kein lokaler Bindefehler verlässt den Stop."""
 
     try:
-        return bool(_stop_v4_services_impl(services))
+        return bool(
+            _stop_v4_services_impl(
+                services,
+                bound_install_root=bound_install_root,
+                action_authorizer=action_authorizer,
+            )
+        )
+    except RecoveryInstallRootBindingError:
+        raise
     except Exception as exc:
         print(f"  [!] Stop-/Endgateprüfung brach intern ab: {exc}")
         update_logger.error("Stop-/Endgateprüfung brach intern ab: %s", exc)
@@ -12719,8 +13855,17 @@ def _post_update_healthcheck(
     projected_piguard: bool = False,
     check_web: bool = True,
     check_http: bool = True,
+    action_authorizer=None,
 ) -> bool:
     """Kleiner Gesundheitstest nach Update oder Release-Rueckfall."""
+
+    def run_health_command(command: str, *, timeout: int) -> dict:
+        return _run_recovery_service_command(
+            command,
+            timeout=timeout,
+            action_authorizer=action_authorizer,
+        )
+
     print('\n[->] Gesundheitstest...')
     errors = []
     try:
@@ -12738,7 +13883,10 @@ def _post_update_healthcheck(
             errors.append('/var/www/html/index.php fehlt')
 
         if shutil.which('php') and os.path.exists('/var/www/html/index.php'):
-            lint = run_command('php -l /var/www/html/index.php', timeout=15)
+            lint = run_health_command(
+                'php -l /var/www/html/index.php',
+                timeout=15,
+            )
             if not lint['success']:
                 errors.append('PHP-Lint index.php fehlgeschlagen: ' + (lint['stderr'] or lint['stdout']).strip())
 
@@ -12767,7 +13915,10 @@ def _post_update_healthcheck(
             if expected:
                 errors.append(f'{_unit_name(srv)} fehlt, obwohl erwartet ({reason})')
             continue
-        status = run_command(f'systemctl is-active {srv}', timeout=10)
+        status = run_health_command(
+            f'systemctl is-active {srv}',
+            timeout=10,
+        )
         activity = status.get('stdout', '').strip().lower()
         if not expected or srv in ha_slave_services:
             if activity not in {'inactive', 'failed'}:
@@ -12777,7 +13928,10 @@ def _post_update_healthcheck(
             errors.append(f'{srv} ist nicht aktiv')
 
     if _service_unit_exists("e3dc"):
-        legacy = run_command("systemctl is-active e3dc", timeout=10)
+        legacy = run_health_command(
+            "systemctl is-active e3dc",
+            timeout=10,
+        )
         legacy_activity = legacy.get("stdout", "").strip().lower()
         if legacy_recovery and state.legacy_e3dc_activity == "active":
             if not legacy.get("success") or legacy_activity != "active":
@@ -12788,7 +13942,15 @@ def _post_update_healthcheck(
     if not isinstance(check_http, bool):
         errors.append("HTTP-Gesundheitsvertrag ist nicht boolesch")
     elif check_http:
-        errors.extend(_local_http_healthcheck())
+        _authorize_recovery_service_action(
+            action_authorizer=action_authorizer,
+        )
+        try:
+            errors.extend(_local_http_healthcheck())
+        finally:
+            _authorize_recovery_service_action(
+                action_authorizer=action_authorizer,
+            )
 
     if errors:
         for error in errors[:8]:
@@ -12850,16 +14012,35 @@ def _verify_prepared_service_quiesced(service: str) -> None:
 LEGACY_E3DC_ADMIN_UNIT = "/etc/systemd/system/e3dc.service"
 
 
-def _normalize_legacy_e3dc_service() -> None:
+def _normalize_legacy_e3dc_service(*, action_authorizer=None) -> None:
     """Projiziert den bekannten C++-Altdienst auf einen kanonischen Auszustand."""
+
+    if action_authorizer is not None and not callable(action_authorizer):
+        raise ValueError("Legacy-Dienstaktions-Autorizer ist nicht aufrufbar")
+
+    def run_authorized_argv(argv, *, timeout: int) -> dict:
+        return _run_recovery_service_argv(
+            argv,
+            timeout=timeout,
+            action_authorizer=action_authorizer,
+        )
 
     # Der Altzustand ist im verifizierten Backup enthalten. Ab hier zählt der
     # kanonische Releasezustand: gestoppt, disabled und persistent maskiert.
     # Das gilt auch für generierte/transiente Altunits, die keinen der vier
     # klassischen Unit-Dateipfade besitzen.
-    _run_argv(["sudo", "systemctl", "stop", "e3dc.service"], timeout=30)
-    _run_argv(["sudo", "systemctl", "unmask", "e3dc.service"], timeout=30)
-    _run_argv(["sudo", "systemctl", "disable", "e3dc.service"], timeout=30)
+    run_authorized_argv(
+        ["sudo", "systemctl", "stop", "e3dc.service"],
+        timeout=30,
+    )
+    run_authorized_argv(
+        ["sudo", "systemctl", "unmask", "e3dc.service"],
+        timeout=30,
+    )
+    run_authorized_argv(
+        ["sudo", "systemctl", "disable", "e3dc.service"],
+        timeout=30,
+    )
 
     if os.path.lexists(LEGACY_E3DC_ADMIN_UNIT):
         metadata = os.lstat(LEGACY_E3DC_ADMIN_UNIT)
@@ -12868,19 +14049,22 @@ def _normalize_legacy_e3dc_service() -> None:
                 "e3dc.service besitzt am kanonischen Unitpfad einen "
                 "nicht normalisierbaren Dateityp"
             )
-        removed = _run_argv(
+        removed = run_authorized_argv(
             ["sudo", "rm", "-f", "--", LEGACY_E3DC_ADMIN_UNIT],
             timeout=15,
         )
         if not removed.get("success") or os.path.lexists(LEGACY_E3DC_ADMIN_UNIT):
             raise RuntimeError("Alte e3dc.service-Unit konnte nicht ersetzt werden")
 
-    masked = _run_argv(
+    masked = run_authorized_argv(
         ["sudo", "systemctl", "mask", "--force", "e3dc.service"],
         timeout=30,
     )
-    reloaded = _run_argv(["sudo", "systemctl", "daemon-reload"], timeout=30)
-    _run_argv(
+    reloaded = run_authorized_argv(
+        ["sudo", "systemctl", "daemon-reload"],
+        timeout=30,
+    )
+    run_authorized_argv(
         ["sudo", "systemctl", "reset-failed", "e3dc.service"],
         timeout=30,
     )
@@ -12895,7 +14079,7 @@ def _normalize_legacy_e3dc_service() -> None:
     if not stat.S_ISLNK(metadata.st_mode) or target != "/dev/null":
         raise RuntimeError("Persistente e3dc.service-Maske ist nicht kanonisch")
 
-    show = _run_argv(
+    show = run_authorized_argv(
         [
             "systemctl",
             "show",
@@ -13056,8 +14240,24 @@ def _restart_v4_services(
     legacy_recovery: bool = False,
     prepared_start_only: bool = False,
     projected_piguard: bool = False,
+    action_authorizer=None,
 ) -> bool:
     """Startet die installierten E3DC-Control-Dienste neu."""
+    if action_authorizer is not None and not callable(action_authorizer):
+        raise ValueError("Dienstaktions-Autorizer ist nicht aufrufbar")
+
+    def authorize_action() -> bool:
+        return _authorize_recovery_service_action(
+            action_authorizer=action_authorizer,
+        )
+
+    def run_authorized_command(command: str, *, timeout: int) -> dict:
+        return _run_recovery_service_command(
+            command,
+            timeout=timeout,
+            action_authorizer=authorize_action,
+        )
+
     try:
         state = transition_state or _capture_transition_state()
         _verify_transition_state(state, expect_legacy_config_missing=legacy_recovery)
@@ -13093,7 +14293,11 @@ def _restart_v4_services(
         ))
         if legacy_unit_present and not legacy_recovery:
             try:
-                _normalize_legacy_e3dc_service()
+                _normalize_legacy_e3dc_service(
+                    action_authorizer=authorize_action,
+                )
+            except RecoveryInstallRootBindingError:
+                raise
             except Exception as exc:
                 print(f'  [!] Legacy e3dc.service konnte nicht normalisiert werden: {exc}')
                 return False
@@ -13103,12 +14307,30 @@ def _restart_v4_services(
         if legacy_recovery:
             print('  [OK] Legacy-Betriebszustand bleibt fuer die Recovery erhalten.')
         else:
-            run_command(f'sudo -u {install_user} screen -S e3dc -X quit 2>/dev/null', timeout=5)
-            run_command(f'sudo -u {install_user} screen -S E3DC -X quit 2>/dev/null', timeout=5)
-            run_command('sudo screen -S e3dc -X quit 2>/dev/null', timeout=5)
-            run_command('sudo screen -S E3DC -X quit 2>/dev/null', timeout=5)
-            run_command('sudo pkill -x E3DC-Control 2>/dev/null', timeout=5)
-            run_command(r"sudo pkill -f '(^|/)E3DC\.sh([[:space:]]|$)' 2>/dev/null", timeout=5)
+            run_authorized_command(
+                f'sudo -u {install_user} screen -S e3dc -X quit 2>/dev/null',
+                timeout=5,
+            )
+            run_authorized_command(
+                f'sudo -u {install_user} screen -S E3DC -X quit 2>/dev/null',
+                timeout=5,
+            )
+            run_authorized_command(
+                'sudo screen -S e3dc -X quit 2>/dev/null',
+                timeout=5,
+            )
+            run_authorized_command(
+                'sudo screen -S E3DC -X quit 2>/dev/null',
+                timeout=5,
+            )
+            run_authorized_command(
+                'sudo pkill -x E3DC-Control 2>/dev/null',
+                timeout=5,
+            )
+            run_authorized_command(
+                r"sudo pkill -f '(^|/)E3DC\.sh([[:space:]]|$)' 2>/dev/null",
+                timeout=5,
+            )
             print('  [OK] Legacy-Cleanup abgeschlossen; der alte C++ Kern wird nicht gestartet.')
 
     print('\n[->] E3DC-Control-Dienste werden aktiviert und gestartet...')
@@ -13142,8 +14364,14 @@ def _restart_v4_services(
                     except Exception as exc:
                         errors.append(str(exc))
                 else:
-                    stopped = run_command(f'sudo systemctl stop {srv}', timeout=15)
-                    inactive = run_command(f'systemctl is-active {srv}', timeout=10)
+                    stopped = run_authorized_command(
+                        f'sudo systemctl stop {srv}',
+                        timeout=15,
+                    )
+                    inactive = run_authorized_command(
+                        f'systemctl is-active {srv}',
+                        timeout=10,
+                    )
                     activity = inactive.get('stdout', '').strip().lower()
                     if not stopped['success'] or activity not in {'inactive', 'failed'}:
                         errors.append(f'{srv} konnte fuer Standby nicht sicher gestoppt werden')
@@ -13161,19 +14389,31 @@ def _restart_v4_services(
                     "returncode": 0,
                 }
             else:
-                run_command(f'sudo systemctl reset-failed {srv} 2>/dev/null || true', timeout=10)
-                enable = run_command(f'sudo systemctl enable {srv}', timeout=15)
+                run_authorized_command(
+                    f'sudo systemctl reset-failed {srv} 2>/dev/null || true',
+                    timeout=10,
+                )
+                enable = run_authorized_command(
+                    f'sudo systemctl enable {srv}',
+                    timeout=15,
+                )
             start_action = "start" if prepared_start_only else "restart"
-            res = run_command(
+            res = run_authorized_command(
                 f'sudo systemctl {start_action} {srv}',
                 timeout=15,
             )
-            enabled_probe = run_command(f'systemctl is-enabled {srv}', timeout=10)
+            enabled_probe = run_authorized_command(
+                f'systemctl is-enabled {srv}',
+                timeout=10,
+            )
             enabled_state = _systemd_state_from_result(
                 enabled_probe,
                 SYSTEMD_KNOWN_UNIT_FILE_STATES,
             )
-            active_probe = run_command(f'systemctl is-active {srv}', timeout=10)
+            active_probe = run_authorized_command(
+                f'systemctl is-active {srv}',
+                timeout=10,
+            )
             active_state = _systemd_state_from_result(
                 active_probe,
                 {"active", "inactive", "failed", "activating", "deactivating", "reloading"},
@@ -13211,7 +14451,12 @@ def _restart_v4_services(
                     f"  [i] {srv}: langsamer systemd-Übergang; "
                     f"warte höchstens {SYSTEMD_SETTLE_TIMEOUT_S} Sekunden auf den Endzustand."
                 )
-                settled_after_timeout, settle_state, settle_result = _wait_for_systemd_end_state(srv)
+                settled_after_timeout, settle_state, settle_result = (
+                    _wait_for_systemd_end_state(
+                        srv,
+                        action_authorizer=authorize_action,
+                    )
+                )
                 if settled_after_timeout:
                     _load_state, enabled_state, active_state = settle_state
             # Release-Dienste müssen nach einem Update rebootfest aktiviert
@@ -13353,6 +14598,331 @@ def _remove_tree_nofollow(path: str) -> None:
         os.close(parent_fd)
 
 
+def _validate_bound_inventory_contract(
+    inventory: frozenset[str],
+    *,
+    excluded_top: tuple[str, ...],
+    excluded_anywhere: tuple[str, ...],
+) -> frozenset[str]:
+    """Normalisiert keinen Pfad, sondern akzeptiert nur kanonische Relativpfade."""
+
+    if not isinstance(inventory, frozenset):
+        raise RuntimeError("Gebundenes Recovery-Inventar ist nicht eingefroren")
+    validated: set[str] = set()
+    for raw_entry in inventory:
+        entry = str(raw_entry)
+        if (
+            not entry
+            or entry in {".", ".."}
+            or os.path.isabs(entry)
+            or os.path.normpath(entry) != entry
+            or any(component in {"", ".", ".."} for component in entry.split(os.sep))
+        ):
+            raise RuntimeError(
+                f"Gebundenes Recovery-Inventar enthält einen unsicheren Pfad: {entry!r}"
+            )
+        validated.add(entry)
+    for label, exclusions in (
+        ("Top-Level-Ausnahme", excluded_top),
+        ("Baum-Ausnahme", excluded_anywhere),
+    ):
+        if not isinstance(exclusions, tuple) or any(
+            not isinstance(name, str)
+            or not name
+            or name in {".", ".."}
+            or os.sep in name
+            or (os.altsep is not None and os.altsep in name)
+            for name in exclusions
+        ):
+            raise RuntimeError(f"Gebundene {label} ist ungültig")
+    return frozenset(validated)
+
+
+def _open_bound_recovery_directory_entry(
+    parent_descriptor: int,
+    name: str,
+    before,
+    bound_install_root: BoundPersistentInstallRoot,
+) -> int:
+    descriptor = os.open(
+        name,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=parent_descriptor,
+    )
+    opened = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(before.st_mode)
+        or not stat.S_ISDIR(opened.st_mode)
+        or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+        or _descriptor_mount_id(descriptor) != bound_install_root.mount_id
+    ):
+        os.close(descriptor)
+        raise RuntimeError(
+            "Recovery-Inventarverzeichnis driftete oder überschreitet einen Mount"
+        )
+    return descriptor
+
+
+def _unlink_bound_recovery_entry(
+    parent_descriptor: int,
+    name: str,
+    before,
+    *,
+    bound_install_root: BoundPersistentInstallRoot,
+    label: str,
+) -> None:
+    """Entfernt genau den nofollow geöffneten Nicht-Verzeichnis-Inode."""
+
+    path_flags = (
+        getattr(os, "O_PATH", os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor = os.open(name, path_flags, dir_fd=parent_descriptor)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            stat.S_ISDIR(before.st_mode)
+            or stat.S_ISDIR(opened.st_mode)
+            or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+            or _descriptor_mount_id(descriptor) != bound_install_root.mount_id
+        ):
+            raise RuntimeError(f"Recovery-Eintrag driftete beim Öffnen: {label}")
+        _verify_recovery_install_binding(
+            bound_install_root,
+            str(bound_install_root.path),
+        )
+        current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+            raise RuntimeError(f"Recovery-Eintrag driftete vor unlink: {label}")
+        prior_links = int(opened.st_nlink)
+        if prior_links < 1:
+            raise RuntimeError(f"Recovery-Eintrag besitzt keinen Link: {label}")
+        os.unlink(name, dir_fd=parent_descriptor)
+        detached = os.fstat(descriptor)
+        if int(detached.st_nlink) != prior_links - 1:
+            raise RuntimeError(f"Recovery-unlink ist nicht beweisbar: {label}")
+        _verify_recovery_install_binding(
+            bound_install_root,
+            str(bound_install_root.path),
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _remove_bound_recovery_tree_entry(
+    parent_descriptor: int,
+    name: str,
+    before,
+    *,
+    bound_install_root: BoundPersistentInstallRoot,
+    label: str,
+) -> None:
+    """Entfernt einen vollständigen Baum relativ zum gehaltenen Root-FD."""
+
+    if not stat.S_ISDIR(before.st_mode) or stat.S_ISLNK(before.st_mode):
+        _unlink_bound_recovery_entry(
+            parent_descriptor,
+            name,
+            before,
+            bound_install_root=bound_install_root,
+            label=label,
+        )
+        return
+    descriptor = _open_bound_recovery_directory_entry(
+        parent_descriptor,
+        name,
+        before,
+        bound_install_root,
+    )
+    try:
+        for child_name in sorted(os.listdir(descriptor)):
+            child = os.stat(
+                child_name,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+            _remove_bound_recovery_tree_entry(
+                descriptor,
+                child_name,
+                child,
+                bound_install_root=bound_install_root,
+                label=os.path.join(label, child_name),
+            )
+        if os.listdir(descriptor):
+            raise RuntimeError(f"Recovery-Baum erhielt neue Einträge: {label}")
+        _verify_recovery_install_binding(
+            bound_install_root,
+            str(bound_install_root.path),
+        )
+        current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        opened = os.fstat(descriptor)
+        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+            raise RuntimeError(f"Recovery-Verzeichnis driftete vor rmdir: {label}")
+        os.rmdir(name, dir_fd=parent_descriptor)
+        if int(os.fstat(descriptor).st_nlink) != 0:
+            raise RuntimeError(f"Recovery-rmdir ist nicht beweisbar: {label}")
+        _verify_recovery_install_binding(
+            bound_install_root,
+            str(bound_install_root.path),
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _remove_entries_not_in_inventory_bound(
+    root_path: str,
+    inventory: frozenset[str],
+    *,
+    bound_install_root: BoundPersistentInstallRoot,
+    remove_git: bool,
+    excluded_top: tuple[str, ...],
+    excluded_anywhere: tuple[str, ...],
+) -> None:
+    """Bereinigt das Installationsinventar ausschließlich fd-relativ."""
+
+    root = os.path.abspath(str(root_path or ""))
+    if root != str(root_path) or Path(root) != bound_install_root.path:
+        raise RuntimeError("Gebundene Inventarbereinigung besitzt einen Pfaddrift")
+    inventory = _validate_bound_inventory_contract(
+        inventory,
+        excluded_top=excluded_top,
+        excluded_anywhere=excluded_anywhere,
+    )
+    excluded_top_set = frozenset(excluded_top)
+    excluded_anywhere_set = frozenset(excluded_anywhere)
+    _verify_recovery_install_binding(bound_install_root, root)
+    root_descriptor = os.dup(bound_install_root.root_descriptor)
+
+    def clean_directory(descriptor: int, relative: str) -> None:
+        initial_names = tuple(sorted(os.listdir(descriptor)))
+        survivors: set[str] = set()
+        for name in initial_names:
+            child_relative = name if not relative else os.path.join(relative, name)
+            excluded = name in excluded_anywhere_set or (
+                not relative and name in excluded_top_set
+            )
+            if excluded:
+                survivors.add(name)
+                continue
+            before = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISDIR(before.st_mode) and not stat.S_ISLNK(before.st_mode):
+                child_descriptor = _open_bound_recovery_directory_entry(
+                    descriptor,
+                    name,
+                    before,
+                    bound_install_root,
+                )
+                try:
+                    clean_directory(child_descriptor, child_relative)
+                    if child_relative in inventory:
+                        current = os.stat(
+                            name,
+                            dir_fd=descriptor,
+                            follow_symlinks=False,
+                        )
+                        opened = os.fstat(child_descriptor)
+                        if (current.st_dev, current.st_ino) != (
+                            opened.st_dev,
+                            opened.st_ino,
+                        ):
+                            raise RuntimeError(
+                                "Recovery-Inventarverzeichnis wurde ersetzt: "
+                                + child_relative
+                            )
+                        survivors.add(name)
+                    else:
+                        if os.listdir(child_descriptor):
+                            raise RuntimeError(
+                                "Nicht inventarisiertes Recovery-Verzeichnis ist nicht leer: "
+                                + child_relative
+                            )
+                        _verify_recovery_install_binding(
+                            bound_install_root,
+                            root,
+                        )
+                        current = os.stat(
+                            name,
+                            dir_fd=descriptor,
+                            follow_symlinks=False,
+                        )
+                        opened = os.fstat(child_descriptor)
+                        if (current.st_dev, current.st_ino) != (
+                            opened.st_dev,
+                            opened.st_ino,
+                        ):
+                            raise RuntimeError(
+                                "Recovery-Inventarverzeichnis driftete vor rmdir: "
+                                + child_relative
+                            )
+                        os.rmdir(name, dir_fd=descriptor)
+                        if int(os.fstat(child_descriptor).st_nlink) != 0:
+                            raise RuntimeError(
+                                "Recovery-Inventar-rmdir ist nicht beweisbar: "
+                                + child_relative
+                            )
+                        _verify_recovery_install_binding(
+                            bound_install_root,
+                            root,
+                        )
+                finally:
+                    os.close(child_descriptor)
+            elif child_relative in inventory:
+                if stat.S_ISLNK(before.st_mode):
+                    raise RuntimeError(
+                        "Symlink ist kein zulässiger Recovery-Inventareintrag: "
+                        + child_relative
+                    )
+                survivors.add(name)
+            else:
+                _unlink_bound_recovery_entry(
+                    descriptor,
+                    name,
+                    before,
+                    bound_install_root=bound_install_root,
+                    label=child_relative,
+                )
+        if set(os.listdir(descriptor)) != survivors:
+            raise RuntimeError(
+                "Recovery-Inventar driftete während der Bereinigung: "
+                + (relative or ".")
+            )
+
+    try:
+        root_metadata = os.fstat(root_descriptor)
+        if (
+            (root_metadata.st_dev, root_metadata.st_ino)
+            != (bound_install_root.device, bound_install_root.inode)
+            or _descriptor_mount_id(root_descriptor)
+            != bound_install_root.mount_id
+        ):
+            raise RuntimeError("Gebundener Inventar-Root-FD driftete")
+        clean_directory(root_descriptor, "")
+        if remove_git:
+            try:
+                git_metadata = os.stat(
+                    ".git",
+                    dir_fd=root_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                _remove_bound_recovery_tree_entry(
+                    root_descriptor,
+                    ".git",
+                    git_metadata,
+                    bound_install_root=bound_install_root,
+                    label=".git",
+                )
+        _verify_recovery_install_binding(bound_install_root, root)
+    finally:
+        os.close(root_descriptor)
+
+
 def _remove_entries_not_in_inventory(
     root_path: str,
     inventory: frozenset[str],
@@ -13360,7 +14930,18 @@ def _remove_entries_not_in_inventory(
     remove_git: bool = False,
     excluded_top: tuple[str, ...] = (".git",),
     excluded_anywhere: tuple[str, ...] = (),
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> None:
+    if bound_install_root is not None:
+        _remove_entries_not_in_inventory_bound(
+            root_path,
+            inventory,
+            bound_install_root=bound_install_root,
+            remove_git=remove_git,
+            excluded_top=excluded_top,
+            excluded_anywhere=excluded_anywhere,
+        )
+        return
     root = os.path.abspath(root_path)
     found_files: list[tuple[str, str]] = []
     found_dirs: list[tuple[str, str]] = []
@@ -13812,6 +15393,7 @@ def _capture_apache_service_prestate(
     *,
     settle_timeout_s: float = 8.0,
     poll_s: float = 0.25,
+    action_authorizer=None,
 ) -> tuple[bool, bool, str]:
     """Bindet Load-, Aktivitäts- und Enablementzustand in einem Show-Snapshot."""
 
@@ -13832,7 +15414,7 @@ def _capture_apache_service_prestate(
         "linked-runtime",
     }
     while True:
-        result = _run_argv(
+        result = _run_recovery_service_argv(
             [
                 "systemctl",
                 "show",
@@ -13844,6 +15426,7 @@ def _capture_apache_service_prestate(
             ],
             timeout=15,
             env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+            action_authorizer=action_authorizer,
         )
         values: dict[str, str] = {}
         for line in str(result.get("stdout") or "").splitlines():
@@ -13891,22 +15474,37 @@ def _capture_apache_service_prestate(
         time.sleep(max(0.01, min(float(poll_s), 1.0)))
 
 
-def _quiesce_apache_for_cutover(preimage: ApacheSecurityPreimage) -> None:
+def _quiesce_apache_for_cutover(
+    preimage: ApacheSecurityPreimage,
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
+    action_authorizer=None,
+) -> None:
     """Stoppt ausschließlich einen zuvor aktiven Apache und beweist Web-Schreibruhe."""
 
     if not isinstance(preimage, ApacheSecurityPreimage):
         raise RuntimeError("Apache-Cutover besitzt kein gebundenes Preimage")
+
+    def authorize_action() -> bool:
+        return _authorize_recovery_service_action(
+            bound_install_root=bound_install_root,
+            action_authorizer=action_authorizer,
+        )
+
     if preimage.apache_available and preimage.apache_was_active:
-        stopped = _run_argv(
+        stopped = _run_recovery_service_argv(
             ["sudo", "systemctl", "stop", "apache2.service"],
             timeout=30,
+            action_authorizer=authorize_action,
         )
         if not stopped.get("success"):
             raise RuntimeError(
                 "Apache konnte für das kurze Daten-/Web-Cutover nicht gestoppt werden: "
                 + _combined_process_diagnostics(stopped, maximum=800)
             )
-    available, active, unit_state = _capture_apache_service_prestate()
+    available, active, unit_state = _capture_apache_service_prestate(
+        action_authorizer=authorize_action,
+    )
     if (
         available != preimage.apache_available
         or active
@@ -13923,23 +15521,35 @@ def _restore_apache_after_successful_cutover(
     expected_available: bool,
     expected_active: bool,
     expected_unit_file_state: str,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
+    action_authorizer=None,
 ) -> None:
     """Stellt vor dem HTTP-Gate exakt den gebundenen Apache-Aktivzustand her."""
 
     if not isinstance(expected_available, bool) or not isinstance(expected_active, bool):
         raise RuntimeError("Apache-Zielzustand ist nicht boolesch gebunden")
+
+    def authorize_action() -> bool:
+        return _authorize_recovery_service_action(
+            bound_install_root=bound_install_root,
+            action_authorizer=action_authorizer,
+        )
+
     unit_state = str(expected_unit_file_state or "").strip().lower()
     if expected_available and expected_active:
-        started = _run_argv(
+        started = _run_recovery_service_argv(
             ["sudo", "systemctl", "start", "apache2.service"],
             timeout=30,
+            action_authorizer=authorize_action,
         )
         if not started.get("success"):
             raise RuntimeError(
                 "Apache konnte nach dem Cutover nicht gestartet werden: "
                 + _combined_process_diagnostics(started, maximum=800)
             )
-    available, active, current_unit_state = _capture_apache_service_prestate()
+    available, active, current_unit_state = _capture_apache_service_prestate(
+        action_authorizer=authorize_action,
+    )
     if (available, active, current_unit_state) != (
         expected_available,
         expected_active,
@@ -13991,6 +15601,7 @@ def _complete_bound_apache_after_commit(
     expected_available: bool,
     expected_active: bool,
     expected_unit_file_state: str,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> None:
     """Stellt Apache nach Commit idempotent her und prüft nur lokalen HTTP-Zugriff."""
 
@@ -14024,6 +15635,7 @@ def _complete_bound_apache_after_commit(
         expected_available=expected_available,
         expected_active=expected_active,
         expected_unit_file_state=unit_state,
+        bound_install_root=bound_install_root,
     )
     http_errors = _local_http_healthcheck()
     if http_errors:
@@ -14032,6 +15644,8 @@ def _complete_bound_apache_after_commit(
 
 def _complete_committed_apache_from_receipt(
     contract: UpdateSafetyContract,
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> None:
     """Bindet einen wiederholten Apache-Abschluss an das durable Commit-Receipt."""
 
@@ -14042,10 +15656,14 @@ def _complete_committed_apache_from_receipt(
         expected_available=current.apache_available,
         expected_active=current.apache_was_active,
         expected_unit_file_state=current.apache_unit_file_state,
+        bound_install_root=bound_install_root,
     )
 
 
-def _capture_apache_security_preimage() -> ApacheSecurityPreimage:
+def _capture_apache_security_preimage(
+    *,
+    action_authorizer=None,
+) -> ApacheSecurityPreimage:
     available_path = APACHE_SECURITY_CONF_AVAILABLE
     enabled_path = APACHE_SECURITY_CONF_ENABLED
     payload = b""
@@ -14117,7 +15735,9 @@ def _capture_apache_security_preimage() -> ApacheSecurityPreimage:
         apache_available,
         apache_was_active,
         apache_unit_file_state,
-    ) = _capture_apache_service_prestate()
+    ) = _capture_apache_service_prestate(
+        action_authorizer=action_authorizer,
+    )
     if apache_available:
         apache_ctl = os.lstat("/usr/sbin/apache2ctl")
         if (
@@ -14141,8 +15761,19 @@ def _capture_apache_security_preimage() -> ApacheSecurityPreimage:
     )
 
 
-def _restore_apache_unit_file_state(preimage: ApacheSecurityPreimage) -> None:
+def _restore_apache_unit_file_state(
+    preimage: ApacheSecurityPreimage,
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
+    action_authorizer=None,
+) -> None:
     """Stellt nur die gebundene Apache-Enablementklasse wieder her."""
+
+    def authorize_action() -> bool:
+        return _authorize_recovery_service_action(
+            bound_install_root=bound_install_root,
+            action_authorizer=action_authorizer,
+        )
 
     target = preimage.apache_unit_file_state
     if target == "absent":
@@ -14171,14 +15802,20 @@ def _restore_apache_unit_file_state(preimage: ApacheSecurityPreimage) -> None:
     else:
         # static/indirect/generated/alias/linked werden nicht künstlich in
         # einen anderen Enablementtyp übersetzt. Sie müssen unverändert sein.
-        available, _active, current = _capture_apache_service_prestate()
+        available, _active, current = _capture_apache_service_prestate(
+            action_authorizer=authorize_action,
+        )
         if not available or current != target:
             raise RuntimeError(
                 "Apache-Enablementklasse kann nicht verlustfrei wiederhergestellt werden"
             )
         return
     for command in commands:
-        result = _run_argv(command, timeout=30)
+        result = _run_recovery_service_argv(
+            command,
+            timeout=30,
+            action_authorizer=authorize_action,
+        )
         if not result.get("success"):
             raise RuntimeError(
                 "Apache-Enablementzustand konnte nach Recovery nicht wiederhergestellt werden"
@@ -14189,14 +15826,24 @@ def _restore_apache_security_preimage(
     preimage: ApacheSecurityPreimage,
     *,
     restore_activity: bool = True,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
+    action_authorizer=None,
 ) -> None:
     """Stellt Dateien/Enablement her; der Prozessstart kann bis zum Endgate warten."""
 
     if not isinstance(restore_activity, bool):
         raise RuntimeError("Apache-Recovery-Aktivitätsvertrag ist nicht boolesch")
-    remove_enabled = _run_argv(
+
+    def authorize_action() -> bool:
+        return _authorize_recovery_service_action(
+            bound_install_root=bound_install_root,
+            action_authorizer=action_authorizer,
+        )
+
+    remove_enabled = _run_recovery_service_argv(
         ["sudo", "rm", "-f", APACHE_SECURITY_CONF_ENABLED],
         timeout=15,
+        action_authorizer=authorize_action,
     )
     if not remove_enabled["success"]:
         raise RuntimeError("Apache-Schutzaktivierung konnte nicht zurückgesetzt werden")
@@ -14219,7 +15866,7 @@ def _restore_apache_security_preimage(
                 temporary.flush()
                 os.fsync(temporary.fileno())
                 temporary_path = temporary.name
-            restored = _run_argv(
+            restored = _run_recovery_service_argv(
                 [
                     "sudo",
                     "install",
@@ -14233,6 +15880,7 @@ def _restore_apache_security_preimage(
                     APACHE_SECURITY_CONF_AVAILABLE,
                 ],
                 timeout=30,
+                action_authorizer=authorize_action,
             )
             if not restored["success"]:
                 raise RuntimeError(
@@ -14242,9 +15890,10 @@ def _restore_apache_security_preimage(
             if temporary_path and os.path.exists(temporary_path):
                 os.unlink(temporary_path)
     else:
-        removed = _run_argv(
+        removed = _run_recovery_service_argv(
             ["sudo", "rm", "-f", APACHE_SECURITY_CONF_AVAILABLE],
             timeout=15,
+            action_authorizer=authorize_action,
         )
         if not removed["success"]:
             raise RuntimeError(
@@ -14264,7 +15913,7 @@ def _restore_apache_security_preimage(
             != os.path.realpath(APACHE_SECURITY_CONF_AVAILABLE)
         ):
             raise RuntimeError("Apache-Aktivierungs-Preimage ist ungültig")
-        enabled = _run_argv(
+        enabled = _run_recovery_service_argv(
             [
                 "sudo",
                 "ln",
@@ -14273,6 +15922,7 @@ def _restore_apache_security_preimage(
                 APACHE_SECURITY_CONF_ENABLED,
             ],
             timeout=15,
+            action_authorizer=authorize_action,
         )
         if not enabled["success"]:
             raise RuntimeError(
@@ -14280,17 +15930,22 @@ def _restore_apache_security_preimage(
             )
 
     if preimage.apache_available:
-        configtest = _run_argv(
+        configtest = _run_recovery_service_argv(
             ["sudo", "/usr/sbin/apache2ctl", "configtest"],
             timeout=30,
+            action_authorizer=authorize_action,
         )
         if not configtest["success"]:
             raise RuntimeError("Apache-Konfiguration ist nach Recovery ungültig")
-        _restore_apache_unit_file_state(preimage)
+        _restore_apache_unit_file_state(
+            preimage,
+            action_authorizer=authorize_action,
+        )
         action = "start" if restore_activity and preimage.apache_was_active else "stop"
-        service_result = _run_argv(
+        service_result = _run_recovery_service_argv(
             ["sudo", "systemctl", action, "apache2.service"],
             timeout=30,
+            action_authorizer=authorize_action,
         )
         if not service_result.get("success"):
             raise RuntimeError(
@@ -14298,9 +15953,10 @@ def _restore_apache_security_preimage(
                 "wiederhergestellt werden"
             )
         if restore_activity and preimage.apache_was_active:
-            reload_result = _run_argv(
+            reload_result = _run_recovery_service_argv(
                 ["sudo", "systemctl", "reload", "apache2.service"],
                 timeout=30,
+                action_authorizer=authorize_action,
             )
             if not reload_result.get("success"):
                 raise RuntimeError(
@@ -14312,7 +15968,9 @@ def _restore_apache_security_preimage(
         if restore_activity
         else replace(preimage, apache_was_active=False)
     )
-    if _capture_apache_security_preimage() != expected:
+    if _capture_apache_security_preimage(
+        action_authorizer=authorize_action,
+    ) != expected:
         raise RuntimeError("Apache-Recovery weicht vom gebundenen Preimage ab")
 
 
@@ -14569,6 +16227,7 @@ def _persist_preproduct_recovery_bundle(
     full_backup_manifest: dict,
     repo_recovery_contract: RepoRecoveryContract | None,
     backup_receipt: RecoveryBackupReceipt | None,
+    install_root_identity: tuple[int, int, int, int] | None = None,
 ) -> PersistentRecoveryBundle:
     """Persistiert alle Altstandsbelege vor Bootblock und Paketmutation."""
 
@@ -14711,6 +16370,12 @@ def _persist_preproduct_recovery_bundle(
             ),
             surface_receipt=_context_receipt_reference(surface_binding),
             systemd_receipt=_context_receipt_reference(systemd_binding),
+            install_root_identity=install_root_identity,
+            schema=(
+                recovery_context_codec.RECOVERY_CONTEXT_SCHEMA
+                if install_root_identity is not None
+                else recovery_context_codec.RECOVERY_CONTEXT_SCHEMA_V1
+            ),
         )
         try:
             context_binding = recovery_context_codec.write_recovery_context(context)
@@ -15423,6 +17088,7 @@ def _restore_recovery_surface(
     state: TransitionState,
     *,
     restore_legacy_systemd_surface: bool = True,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> None:
     # Die aktuellen Zustände aller privilegierten Nebenflächen werden als
     # Restore-Guard gebunden, bevor die erste davon verändert wird. Der Guard
@@ -15465,9 +17131,14 @@ def _restore_recovery_surface(
     _restore_apache_security_preimage(
         inventory.apache_security,
         restore_activity=False,
+        bound_install_root=bound_install_root,
     )
     if restore_legacy_systemd_surface:
-        daemon_reload = run_command("sudo systemctl daemon-reload", timeout=20)
+        daemon_reload = _run_recovery_service_command(
+            "sudo systemctl daemon-reload",
+            timeout=20,
+            bound_install_root=bound_install_root,
+        )
         if not daemon_reload["success"]:
             raise RuntimeError("systemd daemon-reload nach Recovery fehlgeschlagen")
         for unit, previous in inventory.unit_enablement:
@@ -15479,7 +17150,11 @@ def _restore_recovery_surface(
                 command = f"sudo systemctl disable {unit}"
             else:
                 continue
-            result = run_command(command, timeout=20)
+            result = _run_recovery_service_command(
+                command,
+                timeout=20,
+                bound_install_root=bound_install_root,
+            )
             if not result["success"]:
                 raise RuntimeError(
                     f"Enablement von {unit} konnte nicht wiederhergestellt werden"
@@ -15726,11 +17401,67 @@ def _ensure_apache_canonical_running() -> None:
         )
 
 
+def _web_program_contract_from_commit(
+    repo_dir: str,
+    target_commit: str,
+    install_user: str,
+    *,
+    root_authority: bool = False,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Leitet die vollständige Web-Positivliste aus genau einem Commit ab."""
+
+    entries = read_commit_entries(
+        os.path.abspath(repo_dir),
+        _validate_full_commit(target_commit),
+        (),
+        include_all=True,
+        run_as_user=_commit_reader_user(
+            install_user,
+            root_authority=root_authority,
+        ),
+        maximum_files=TARGET_EXECUTION_SNAPSHOT_MAX_FILES,
+        maximum_file_bytes=TARGET_EXECUTION_SNAPSHOT_MAX_FILE_BYTES,
+        maximum_total_bytes=TARGET_EXECUTION_SNAPSHOT_MAX_TOTAL_BYTES,
+    )
+    files: set[str] = set()
+    for relative_path in entries:
+        if relative_path in {"VERSION", "CHANGELOG.md", "UPDATE_POLICY.json"}:
+            projected = relative_path
+        elif relative_path.startswith("html/"):
+            projected = relative_path[len("html/"):]
+        else:
+            continue
+        parts = projected.split("/")
+        if (
+            not projected
+            or any(part in {"", ".", ".."} for part in parts)
+            or parts[0] in PRESERVED_WEB_ENTRIES
+        ):
+            if parts and parts[0] in PRESERVED_WEB_ENTRIES:
+                continue
+            raise RuntimeError("Commitgebundene Webprojektion besitzt einen ungültigen Pfad")
+        files.add(projected)
+    required = {"index.php", "helpers.php", "VERSION", "UPDATE_POLICY.json"}
+    if not required.issubset(files):
+        raise RuntimeError("Commitgebundene Webprojektion ist unvollständig")
+    directories = {
+        "/".join(parts[:depth])
+        for relative in files
+        for parts in (relative.split("/"),)
+        for depth in range(1, len(parts))
+    }
+    return tuple(sorted(files)), tuple(
+        sorted(directories, key=lambda value: (value.count("/"), value))
+    )
+
+
 def _sync_release_web(
     repo_dir: str,
     policy: dict,
     *,
     allow_config_bootstrap: bool = False,
+    program_files=None,
+    program_directories=None,
 ) -> None:
     html_src = os.path.join(repo_dir, "html")
     errors = _required_web_file_errors(html_src)
@@ -15740,10 +17471,14 @@ def _sync_release_web(
     if not _ensure_rsync_available(allow_install=False):
         raise RuntimeError("rsync ist nicht verfuegbar")
     _prepare_webroot_dirs()
-    result = _run_argv(
+    preserved_arguments = [
+        argument
+        for name in sorted(PRESERVED_WEB_ENTRIES)
+        for argument in ("--exclude", name)
+    ]
+    result = _run_recovery_service_argv(
         [
-            "sudo", "rsync", "-a", "--delete", "--delete-delay",
-            "--exclude", "data", "--exclude", "logs", "--exclude", "ramdisk", "--exclude", "tmp",
+            "sudo", "rsync", "-a", *preserved_arguments,
             html_src.rstrip(os.sep) + os.sep,
             "/var/www/html/",
         ],
@@ -15781,11 +17516,18 @@ def _sync_release_web(
             "konnte unter gestopptem Apache nicht vorbereitet werden"
         )
     if not policy.get("run_permissions", True):
-        if _fix_webroot_permissions() is not True:
+        if _fix_webroot_permissions(
+            program_files=program_files,
+            program_directories=program_directories,
+        ) is not True:
             raise RuntimeError("Webroot-Rechtehärtung fehlgeschlagen")
 
 
-def _restore_legacy_runtime_state(state: TransitionState) -> bool:
+def _restore_legacy_runtime_state(
+    state: TransitionState,
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
+) -> bool:
     """Restore and prove the pre-bootstrap legacy service activity only during recovery."""
 
     desired = state.legacy_e3dc_activity
@@ -15794,10 +17536,18 @@ def _restore_legacy_runtime_state(state: TransitionState) -> bool:
     if desired not in {"active", "inactive", "failed"} or not _service_unit_exists("e3dc"):
         return False
     action = "start" if desired == "active" else "stop"
-    changed = _run_argv(["sudo", "systemctl", action, "e3dc.service"], timeout=30)
+    changed = _run_recovery_service_argv(
+        ["sudo", "systemctl", action, "e3dc.service"],
+        timeout=30,
+        bound_install_root=bound_install_root,
+    )
     if not changed["success"]:
         return False
-    status = _run_argv(["systemctl", "is-active", "e3dc.service"], timeout=15)
+    status = _run_recovery_service_argv(
+        ["systemctl", "is-active", "e3dc.service"],
+        timeout=15,
+        bound_install_root=bound_install_root,
+    )
     activity = status.get("stdout", "").strip().lower()
     if desired == "active":
         return bool(status.get("success") and activity == "active")
@@ -16095,6 +17845,12 @@ def finalize_release_from_target(
     watchdog_runtime_required = _watchdog_runtime_venv_required(state)
 
     install_user = get_install_user()
+    web_program_files, web_program_directories = _web_program_contract_from_commit(
+        target_root,
+        commit,
+        install_user,
+        root_authority=explicit_download_bootstrap,
+    )
     policy = _read_policy_from_commit(
         target_root,
         commit,
@@ -16209,6 +17965,8 @@ def finalize_release_from_target(
         target_root,
         policy,
         allow_config_bootstrap=state.bootstrap_legacy_config,
+        program_files=web_program_files,
+        program_directories=web_program_directories,
     )
     if bootstrap_projection is not None and state.bootstrap_legacy_config:
         legacy_config, legacy_raw = _read_json_nofollow(state.config_path)
@@ -16232,6 +17990,8 @@ def finalize_release_from_target(
                 headless=True,
                 release_quiesced=True,
                 bound_privileged_preimages=privileged_preimages,
+                program_files=web_program_files,
+                program_directories=web_program_directories,
             ) is False:
                 raise RuntimeError("Berechtigungsreparatur fehlgeschlagen")
         finally:
@@ -16257,8 +18017,12 @@ def finalize_release_from_target(
     )
     if not ensure_private_ml_model_store():
         raise RuntimeError("Privater ML-Modellspeicher konnte nicht sicher vorbereitet werden")
-    if not harden_web_program_permissions():
+    if not harden_web_program_permissions(
+        program_files=web_program_files,
+        program_directories=web_program_directories,
+    ):
         raise RuntimeError("Web-Programmrechte konnten nicht gehärtet werden")
+    _validate_live_install_context_as_web(target_root)
     _announce_finalizer_phase(4, phase_total, "Kernservices und Migrationen vorbereiten")
     expected_service_dropins = (
         _update_safety_expected_dropins(safety_contract)
@@ -18133,6 +19897,7 @@ def _complete_dynamic_recovery_start(
     state: TransitionState,
     post_service_guard=None,
     remove_receipt: bool = True,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> bool:
     """Öffnet das Recovery-Gate signalgeschützt und rearmed jeden Fehler."""
 
@@ -18148,9 +19913,18 @@ def _complete_dynamic_recovery_start(
     try:
         # Wegen BindsTo/After muss die dynamische Abhängigkeit vor dem ersten
         # Altstart vollständig aus der effektiven Unitansicht verschwinden.
-        _clear_update_safety_marker(contract)
-        _remove_update_safety_dropins(contract)
-        if not _recover_pretransaction_service_state(state):
+        _clear_update_safety_marker(
+            contract,
+            bound_install_root=bound_install_root,
+        )
+        _remove_update_safety_dropins(
+            contract,
+            bound_install_root=bound_install_root,
+        )
+        if not _recover_pretransaction_service_state(
+            state,
+            bound_install_root=bound_install_root,
+        ):
             raise RuntimeError("Recovery-Altstart blieb unvollständig")
         if post_service_guard is not None:
             post_service_guard()
@@ -18158,12 +19932,19 @@ def _complete_dynamic_recovery_start(
             _remove_exact_update_safety_receipt(contract)
     except BaseException as exc:
         original_error = exc
+        if isinstance(exc, RecoveryInstallRootBindingError):
+            signal_guard.restore()
+            raise
         try:
             _enforce_update_safety_fail_closed(
                 contract,
                 repo_dir=repo_dir,
+                bound_install_root=bound_install_root,
             )
         except BaseException as enforcement_exc:
+            if isinstance(enforcement_exc, RecoveryInstallRootBindingError):
+                signal_guard.restore()
+                raise
             rearm_error = enforcement_exc
     requested_signum = signal_guard.requested_signum
     signal_guard.restore()
@@ -18196,6 +19977,7 @@ def _complete_static_recovery_start(
     recovery_transaction_id: str,
     state: TransitionState,
     post_service_guard=None,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> RecoveryTransitionResult:
     """Entfernt BindsTo-Gates vor dem Altstart und rearmed jeden Fehler."""
 
@@ -18214,18 +19996,35 @@ def _complete_static_recovery_start(
         # Altstart nicht mehr in der effektiven Unitansicht liegen. Der
         # erhaltene Inodevertrag kann die Startsperre bei jedem Folgefehler
         # exakt neu anlegen.
-        _clear_recovery_bootblock_marker(contract)
-        _remove_persistent_recovery_bootblock(contract)
-        if not _recover_pretransaction_service_state(state):
+        _clear_recovery_bootblock_marker(
+            contract,
+            bound_install_root=bound_install_root,
+        )
+        _remove_persistent_recovery_bootblock(
+            contract,
+            bound_install_root=bound_install_root,
+        )
+        if not _recover_pretransaction_service_state(
+            state,
+            bound_install_root=bound_install_root,
+        ):
             raise RuntimeError("Statischer Recovery-Altstart blieb unvollständig")
         if post_service_guard is not None:
             post_service_guard()
     except BaseException as exc:
         original_error = exc
-        enforcement = _enforce_fail_closed_after_recovery_failure(
-            contract,
-            recovery_transaction_id=recovery_transaction_id,
-        )
+        if isinstance(exc, RecoveryInstallRootBindingError):
+            signal_guard.restore()
+            raise
+        try:
+            enforcement = _enforce_fail_closed_after_recovery_failure(
+                contract,
+                recovery_transaction_id=recovery_transaction_id,
+                bound_install_root=bound_install_root,
+            )
+        except RecoveryInstallRootBindingError:
+            signal_guard.restore()
+            raise
         latest_contract = enforcement.bootblock_contract
     requested_signum = signal_guard.requested_signum
     signal_guard.restore()
@@ -18267,8 +20066,83 @@ def _recover_failed_transition(
     persistent_recovery_transaction: (
         ReconstructedRecoveryTransaction | None
     ) = None,
+    install_root_identity: tuple[int, int, int, int] | None = None,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
+) -> RecoveryTransitionResult:
+    """Hält den Installationsroot über Restore und Altstart durchgehend offen.
+
+    systemd löst persistente ``ExecStart``-Pfade weiterhin lexikalisch auf;
+    ein geöffneter Verzeichnis-FD kann diesem Kernel-/systemd-Übergang nicht
+    als Ausführungspfad übergeben werden. Die Root-Bindung erkennt einen
+    Austausch vor und nach dem gesamten Altstart fail-closed. Diese technisch
+    bedingte Evidenzgrenze bleibt im Recovery-Protokoll sichtbar.
+    """
+
+    def recover_under(binding: BoundPersistentInstallRoot):
+        return _recover_failed_transition_under_bound_install_root(
+            repo_dir=repo_dir,
+            install_user=install_user,
+            backup_dir=backup_dir,
+            old_commit=old_commit,
+            git_created=git_created,
+            inventory=inventory,
+            recovery_inventory=recovery_inventory,
+            state=state,
+            package_transaction=package_transaction,
+            repo_recovery_contract=repo_recovery_contract,
+            backup_receipt=backup_receipt,
+            bootblock_contract=bootblock_contract,
+            update_safety_contract=update_safety_contract,
+            recovery_transaction_id=recovery_transaction_id,
+            quiesced_overlay_receipt=quiesced_overlay_receipt,
+            recovery_journal_contract=recovery_journal_contract,
+            persistent_recovery_transaction=persistent_recovery_transaction,
+            install_root_identity=install_root_identity,
+            bound_install_root=binding,
+        )
+
+    if bound_install_root is not None:
+        _verify_recovery_install_binding(bound_install_root, repo_dir)
+        return recover_under(bound_install_root)
+    with bind_persistent_install_root(
+        repo_dir,
+        expected_identity=install_root_identity,
+    ) as fresh_binding:
+        return recover_under(fresh_binding)
+
+
+def _recover_failed_transition_under_bound_install_root(
+    *,
+    repo_dir: str,
+    install_user: str,
+    backup_dir: str,
+    old_commit: str | None,
+    git_created: bool,
+    inventory: frozenset[str],
+    recovery_inventory: RecoverySurfaceInventory,
+    state: TransitionState,
+    package_transaction: PackageTransactionState | None = None,
+    repo_recovery_contract: RepoRecoveryContract | None = None,
+    backup_receipt: RecoveryBackupReceipt | None = None,
+    bootblock_contract: (
+        RecoveryBootblockContract | RecoveryBootblockPartialContract | None
+    ) = None,
+    update_safety_contract: UpdateSafetyContract | None = None,
+    recovery_transaction_id: str | None = None,
+    quiesced_overlay_receipt: QuiescedOverlayReceipt | None = None,
+    recovery_journal_contract: (
+        recovery_journal.RecoveryJournalContract | None
+    ) = None,
+    persistent_recovery_transaction: (
+        ReconstructedRecoveryTransaction | None
+    ) = None,
+    install_root_identity: tuple[int, int, int, int] | None = None,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> RecoveryTransitionResult:
     """Restore old Git/tree/persistent state and verify role/services after any mutation failure."""
+    if bound_install_root is None:
+        raise RuntimeError("Vollständiger Recovery-Kern besitzt keine Root-Bindung")
+    _verify_recovery_install_binding(bound_install_root, repo_dir)
     recovery_ok = True
     if (
         not isinstance(
@@ -18291,6 +20165,8 @@ def _recover_failed_transition(
         )
         or persistent_recovery_transaction.bundle.journal
         != recovery_journal_contract
+        or persistent_recovery_transaction.install_root_identity
+        != install_root_identity
     ):
         update_logger.error("Rekonstruierte Recovery-Transaktion driftete")
         return RecoveryTransitionResult(False, None)
@@ -18311,7 +20187,10 @@ def _recover_failed_transition(
             update_safety_contract = _enforce_update_safety_fail_closed(
                 update_safety_contract,
                 repo_dir=repo_dir,
+                bound_install_root=bound_install_root,
             )
+        except RecoveryInstallRootBindingError:
+            raise
         except Exception as exc:
             update_logger.error(
                 "Dynamischer Recovery-Bootblock ist nicht vollständig beweisbar: %s",
@@ -18320,7 +20199,14 @@ def _recover_failed_transition(
             return RecoveryTransitionResult(False, None)
     else:
         try:
-            initial_quiesced = bool(_stop_v4_services(V4_SERVICES))
+            initial_quiesced = bool(
+                _stop_v4_services(
+                    V4_SERVICES,
+                    bound_install_root=bound_install_root,
+                )
+            )
+        except RecoveryInstallRootBindingError:
+            raise
         except Exception as exc:
             initial_quiesced = False
             update_logger.error(
@@ -18332,7 +20218,10 @@ def _recover_failed_transition(
                 "Recovery-Sofortstop vor persistentem Bootblock ist nicht vollständig beweisbar"
             )
         try:
-            arm_kwargs = {"transaction_id": recovery_transaction_id}
+            arm_kwargs = {
+                "transaction_id": recovery_transaction_id,
+                "bound_install_root": bound_install_root,
+            }
             if bootblock_contract is None:
                 arm_kwargs["recovery_journal_contract"] = recovery_journal_contract
             bootblock_contract = _arm_persistent_recovery_bootblock(
@@ -18346,6 +20235,8 @@ def _recover_failed_transition(
                 exc,
             )
             return RecoveryTransitionResult(False, exc.contract)
+        except RecoveryInstallRootBindingError:
+            raise
         except Exception as exc:
             update_logger.error(
                 "Recovery-Bootblock konnte nicht rebootfest aktiviert werden: %s",
@@ -18353,7 +20244,14 @@ def _recover_failed_transition(
             )
             return RecoveryTransitionResult(False, None)
         try:
-            final_quiesced = bool(_stop_v4_services(V4_SERVICES))
+            final_quiesced = bool(
+                _stop_v4_services(
+                    V4_SERVICES,
+                    bound_install_root=bound_install_root,
+                )
+            )
+        except RecoveryInstallRootBindingError:
+            raise
         except Exception as exc:
             final_quiesced = False
             update_logger.error(
@@ -18386,7 +20284,12 @@ def _recover_failed_transition(
                 )
             if stop_apache:
                 break
-            _quiesce_apache_for_cutover(recovery_inventory.apache_security)
+            _quiesce_apache_for_cutover(
+                recovery_inventory.apache_security,
+                bound_install_root=bound_install_root,
+            )
+    except RecoveryInstallRootBindingError:
+        raise
     except Exception as exc:
         print(f"[ABBRUCH] E3DC-UPD-RECOVERY-EVIDENCE: {exc}")
         print(f"Vollbackup: {backup_dir}")
@@ -18402,10 +20305,21 @@ def _recover_failed_transition(
             exc,
         )
         return RecoveryTransitionResult(False, bootblock_contract)
-    if old_commit and not git_created:
-        reset = _git_argv(repo_dir, install_user, "reset", "--hard", old_commit, timeout=120)
-        recovery_ok = recovery_ok and reset["success"]
     try:
+        # Git-Objektdatenbank, Worktree und historischer Inventarabgleich
+        # verwenden denselben gehaltenen Root-FD wie die beiden Restorestufen.
+        # Ein Austausch des sichtbaren Installationsnamens kann damit weder den
+        # Ersatzbaum resetten noch dessen Einträge bereinigen.
+        if old_commit and not git_created:
+            reset = _git_argv_under_bound_install_root(
+                bound_install_root,
+                install_user,
+                "reset",
+                "--hard",
+                old_commit,
+                timeout=120,
+            )
+            recovery_ok = recovery_ok and reset["success"]
         top_exclusions, anywhere_exclusions = _install_tree_exclusions()
         _remove_entries_not_in_inventory(
             repo_dir,
@@ -18413,6 +20327,7 @@ def _recover_failed_transition(
             remove_git=git_created,
             excluded_top=top_exclusions,
             excluded_anywhere=anywhere_exclusions,
+            bound_install_root=bound_install_root,
         )
         restore_manifest_guard = None
         if old_commit is not None:
@@ -18476,6 +20391,7 @@ def _recover_failed_transition(
                 restored_payload_guard if backup_receipt is not None else None
             ),
             restore_metadata_overrides=restore_metadata_overrides,
+            bound_install_root=bound_install_root,
         )
         restore_quiesced_overlay(
             quiesced_overlay_receipt.overlay_dir,
@@ -18483,6 +20399,7 @@ def _recover_failed_transition(
             guard=_overlay_restore_guard_from_receipt(
                 quiesced_overlay_receipt
             ),
+            bound_install_root=bound_install_root,
         )
         # apt-/pip-Rückläufe können über Paket-Maintainer-Skripte Apache,
         # Unitdateien oder Enablement erneut verändern. Sie müssen deshalb
@@ -18498,6 +20415,7 @@ def _recover_failed_transition(
             restore_legacy_systemd_surface=(
                 persistent_recovery_transaction is None
             ),
+            bound_install_root=bound_install_root,
         )
         if backup_receipt is not None:
             _verify_restored_privileged_files(
@@ -18546,8 +20464,30 @@ def _recover_failed_transition(
         # Recovery installiert keine Units aus dem temporären Archivbaum. Die
         # verifizierte Sicherung stellt die alten Unitdateien wieder her; hier
         # werden ausschließlich Web- und Repo-Rechte am Zielbaum gehärtet.
-        if not _fix_webroot_permissions():
+        recovery_web_files = None
+        recovery_web_directories = None
+        if old_commit is not None:
+            recovery_web_files, recovery_web_directories = (
+                _web_program_contract_from_commit(
+                    repo_dir,
+                    old_commit,
+                    install_user,
+                )
+            )
+        if not _fix_webroot_permissions(
+            program_files=recovery_web_files,
+            program_directories=recovery_web_directories,
+        ):
             raise RuntimeError("Web-Programmrechte konnten nach Recovery nicht gehärtet werden")
+        from .permissions import harden_web_program_permissions
+        if not harden_web_program_permissions(
+            program_files=recovery_web_files,
+            program_directories=recovery_web_directories,
+        ):
+            raise RuntimeError(
+                "Web-Programmdateien konnten nach Recovery nicht auf den "
+                "read-only Laufzeitvertrag zurückgeführt werden"
+            )
         recovery_permission_args = {}
         if repo_recovery_contract is not None or backup_receipt is not None:
             recovery_permission_args = {
@@ -18566,6 +20506,8 @@ def _recover_failed_transition(
             state,
             expect_legacy_config_missing=state.bootstrap_legacy_config,
         )
+    except RecoveryInstallRootBindingError:
+        raise
     except Exception as exc:
         update_logger.error(f"Automatische Wiederherstellung fehlgeschlagen: {exc}")
         recovery_ok = False
@@ -18576,6 +20518,8 @@ def _recover_failed_transition(
                 install_user,
                 allow_storage_owner_promotion=True,
             )
+        except RecoveryInstallRootBindingError:
+            raise
         except Exception as exc:
             update_logger.error(
                 "Privilegierter Restore-Endvertrag fehlgeschlagen: %s",
@@ -18592,14 +20536,18 @@ def _recover_failed_transition(
             expected_unit_file_state=(
                 recovery_inventory.apache_security.apache_unit_file_state
             ),
+            bound_install_root=bound_install_root,
         )
 
     if persistent_recovery_transaction is not None:
         try:
             rolled_back = _restore_persistent_systemd_prestate(
-                persistent_recovery_transaction
+                persistent_recovery_transaction,
+                bound_install_root=bound_install_root,
             )
             restore_recovery_apache()
+        except RecoveryInstallRootBindingError:
+            raise
         except Exception as exc:
             update_logger.error(
                 "Persistenter systemd-/Apache-Altstart blieb unvollständig: %s",
@@ -18615,6 +20563,7 @@ def _recover_failed_transition(
             state=state,
             post_service_guard=restore_recovery_apache,
             remove_receipt=False,
+            bound_install_root=bound_install_root,
         ):
             return RecoveryTransitionResult(False, None)
         rolled_back = _advance_persistent_recovery_rolled_back(
@@ -18626,6 +20575,7 @@ def _recover_failed_transition(
         recovery_transaction_id=str(recovery_transaction_id),
         state=state,
         post_service_guard=restore_recovery_apache,
+        bound_install_root=bound_install_root,
     )
     if not static_result.recovered:
         return static_result
@@ -18635,7 +20585,11 @@ def _recover_failed_transition(
     return RecoveryTransitionResult(True, None, rolled_back)
 
 
-def _recover_pretransaction_service_state(state: TransitionState) -> bool:
+def _recover_pretransaction_service_state(
+    state: TransitionState,
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
+) -> bool:
     """Stellt exakt den vor dem Stop gebundenen Aktivitätszustand wieder her."""
 
     if not state.preactive_units.issubset(state.preinstalled_units):
@@ -18664,11 +20618,16 @@ def _recover_pretransaction_service_state(state: TransitionState) -> bool:
     for unit in prior_units:
         should_be_active = unit in state.preactive_units
         action = "start" if should_be_active else "stop"
-        changed = run_command(
+        changed = _run_recovery_service_command(
             f"sudo systemctl {action} {unit}",
             timeout=30,
+            bound_install_root=bound_install_root,
         )
-        status = _run_argv(["systemctl", "is-active", unit], timeout=10)
+        status = _run_recovery_service_argv(
+            ["systemctl", "is-active", unit],
+            timeout=10,
+            bound_install_root=bound_install_root,
+        )
         activity = status.get("stdout", "").strip().lower()
         end_state_ok = _systemd_activity_readback_matches(
             status,
@@ -18684,7 +20643,10 @@ def _recover_pretransaction_service_state(state: TransitionState) -> bool:
             recovered = False
 
     if state.bootstrap_legacy_config or "e3dc.service" in state.preinstalled_units:
-        if not _restore_legacy_runtime_state(state):
+        if not _restore_legacy_runtime_state(
+            state,
+            bound_install_root=bound_install_root,
+        ):
             recovered = False
 
     # Ein später gestarteter Dienst kann über systemd-Abhängigkeiten eine
@@ -18694,7 +20656,11 @@ def _recover_pretransaction_service_state(state: TransitionState) -> bool:
     # tatsächlich erreichten globalen Endzustand.
     for unit in prior_units:
         should_be_active = unit in state.preactive_units
-        status = _run_argv(["systemctl", "is-active", unit], timeout=10)
+        status = _run_recovery_service_argv(
+            ["systemctl", "is-active", unit],
+            timeout=10,
+            bound_install_root=bound_install_root,
+        )
         activity = status.get("stdout", "").strip().lower()
         end_state_ok = _systemd_activity_readback_matches(
             status,
@@ -18730,10 +20696,38 @@ def _abort_before_product_mutation(
     persistent_recovery_transaction: (
         ReconstructedRecoveryTransaction | None
     ) = None,
+    install_root_identity: tuple[int, int, int, int] | None = None,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> bool:
     """Öffnet nach reinem Cutoverfehler den unveränderten Altstand kontrolliert."""
 
+    if bound_install_root is None:
+        with bind_persistent_install_root(
+            repo_dir,
+            expected_identity=install_root_identity,
+        ) as fresh_binding:
+            return _abort_before_product_mutation(
+                repo_dir=repo_dir,
+                state=state,
+                apache_preimage=apache_preimage,
+                transaction_id=transaction_id,
+                bootblock_contract=bootblock_contract,
+                update_safety_contract=update_safety_contract,
+                overlay_receipt=overlay_receipt,
+                package_transaction=package_transaction,
+                packages_mutated=packages_mutated,
+                recovery_inventory=recovery_inventory,
+                recovery_journal_contract=recovery_journal_contract,
+                persistent_recovery_transaction=persistent_recovery_transaction,
+                install_root_identity=install_root_identity,
+                bound_install_root=fresh_binding,
+            )
+
     try:
+        _verify_optional_recovery_install_binding(
+            bound_install_root,
+            repo_dir,
+        )
         if (
             not isinstance(
                 recovery_journal_contract,
@@ -18757,11 +20751,17 @@ def _abort_before_product_mutation(
         ):
             raise RuntimeError("Rekonstruierte Vorprodukt-Transaktion driftete")
         if persistent_recovery_transaction is not None:
-            if not _stop_v4_services(V4_SERVICES):
+            if not _stop_v4_services(
+                V4_SERVICES,
+                bound_install_root=bound_install_root,
+            ):
                 raise RuntimeError(
                     "Aktor-/Writer-Ruhe vor persistentem Vorprodukt-Rücklauf fehlt"
                 )
-            _quiesce_apache_for_cutover(apache_preimage)
+            _quiesce_apache_for_cutover(
+                apache_preimage,
+                bound_install_root=bound_install_root,
+            )
         if packages_mutated:
             if package_transaction is None:
                 raise RuntimeError("Paketrücklauf besitzt kein gebundenes Preimage")
@@ -18778,11 +20778,13 @@ def _abort_before_product_mutation(
                 restore_legacy_systemd_surface=(
                     persistent_recovery_transaction is None
                 ),
+                bound_install_root=bound_install_root,
             )
         else:
             _restore_apache_security_preimage(
                 apache_preimage,
                 restore_activity=False,
+                bound_install_root=bound_install_root,
             )
 
         def restore_bound_apache() -> None:
@@ -18790,11 +20792,13 @@ def _abort_before_product_mutation(
                 expected_available=apache_preimage.apache_available,
                 expected_active=apache_preimage.apache_was_active,
                 expected_unit_file_state=apache_preimage.apache_unit_file_state,
+                bound_install_root=bound_install_root,
             )
 
         if persistent_recovery_transaction is not None:
             _restore_persistent_systemd_prestate(
-                persistent_recovery_transaction
+                persistent_recovery_transaction,
+                bound_install_root=bound_install_root,
             )
             restore_bound_apache()
         elif update_safety_contract is not None:
@@ -18804,6 +20808,7 @@ def _abort_before_product_mutation(
                 state=state,
                 post_service_guard=restore_bound_apache,
                 remove_receipt=False,
+                bound_install_root=bound_install_root,
             ):
                 raise RuntimeError("Dynamischer Altstart blieb unvollständig")
         elif isinstance(bootblock_contract, RecoveryBootblockContract):
@@ -18812,12 +20817,16 @@ def _abort_before_product_mutation(
                 recovery_transaction_id=transaction_id,
                 state=state,
                 post_service_guard=restore_bound_apache,
+                bound_install_root=bound_install_root,
             )
             bootblock_contract = static_result.bootblock_contract
             if not static_result.recovered:
                 raise RuntimeError("Statischer Altstart blieb unvollständig")
         else:
-            if not _recover_pretransaction_service_state(state):
+            if not _recover_pretransaction_service_state(
+                state,
+                bound_install_root=bound_install_root,
+            ):
                 raise RuntimeError("Altstart ohne Bootblock blieb unvollständig")
             restore_bound_apache()
 
@@ -18830,6 +20839,8 @@ def _abort_before_product_mutation(
                 recovery_journal_contract
             )
         return True
+    except RecoveryInstallRootBindingError:
+        raise
     except Exception as exc:
         print(f"[ABBRUCH] E3DC-UPD-PREMUTATION-RECOVERY: {exc}")
         print(
@@ -18867,7 +20878,10 @@ def _abort_before_product_mutation(
                 _enforce_update_safety_fail_closed(
                     update_safety_contract,
                     repo_dir=repo_dir,
+                    bound_install_root=bound_install_root,
                 )
+            except RecoveryInstallRootBindingError:
+                raise
             except Exception as enforcement_exc:
                 update_logger.critical(
                     "Dynamischer Bootblock blieb zusätzlich unbewiesen: %s",
@@ -18878,6 +20892,7 @@ def _abort_before_product_mutation(
                 bootblock_contract,
                 recovery_transaction_id=transaction_id,
                 recovery_journal_contract=recovery_journal_contract,
+                bound_install_root=bound_install_root,
             )
         return False
 
@@ -18891,13 +20906,35 @@ def _enforce_fail_closed_after_recovery_failure(
     recovery_journal_contract: (
         recovery_journal.RecoveryJournalContract | None
     ) = None,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> RecoveryBootblockEnforcementResult:
     """Setzt rebootfestes Startgate, stoppt Writer und beweist beide Schranken."""
 
+    if bound_install_root is None and recovery_journal_contract is not None:
+        verified_journal = recovery_journal.verify_recovery_journal(
+            recovery_journal_contract
+        )
+        with bind_persistent_install_root(
+            verified_journal.payload.install_root,
+        ) as fresh_binding:
+            return _enforce_fail_closed_after_recovery_failure(
+                bootblock_contract,
+                recovery_transaction_id=recovery_transaction_id,
+                recovery_journal_contract=verified_journal,
+                bound_install_root=fresh_binding,
+            )
+    _verify_optional_recovery_install_binding(bound_install_root)
     blocked = False
     latest_contract = bootblock_contract
     try:
-        initial_quiesced = bool(_stop_v4_services(V4_SERVICES))
+        initial_quiesced = bool(
+            _stop_v4_services(
+                V4_SERVICES,
+                bound_install_root=bound_install_root,
+            )
+        )
+    except RecoveryInstallRootBindingError:
+        raise
     except Exception as exc:
         initial_quiesced = False
         update_logger.error(
@@ -18909,7 +20946,10 @@ def _enforce_fail_closed_after_recovery_failure(
             "Fail-closed-Sofortstop vor persistentem Bootblock ist nicht vollständig beweisbar"
         )
     try:
-        arm_kwargs = {"transaction_id": recovery_transaction_id}
+        arm_kwargs = {
+            "transaction_id": recovery_transaction_id,
+            "bound_install_root": bound_install_root,
+        }
         if bootblock_contract is None:
             arm_kwargs["recovery_journal_contract"] = recovery_journal_contract
         latest_contract = _arm_persistent_recovery_bootblock(
@@ -18928,6 +20968,7 @@ def _enforce_fail_closed_after_recovery_failure(
             latest_contract = _arm_persistent_recovery_bootblock(
                 exc.contract,
                 transaction_id=recovery_transaction_id,
+                bound_install_root=bound_install_root,
             )
             blocked = True
         except RecoveryBootblockArmError as retry_exc:
@@ -18937,16 +20978,27 @@ def _enforce_fail_closed_after_recovery_failure(
                 "partiell; neuester Inodevertrag wurde erhalten: %s",
                 retry_exc,
             )
+        except RecoveryInstallRootBindingError:
+            raise
         except Exception as retry_exc:
             update_logger.error(
                 "Persistenter Recovery-Bootblock ist auch mit eigenem "
                 "Inodevertrag nicht beweisbar: %s",
                 retry_exc,
             )
+    except RecoveryInstallRootBindingError:
+        raise
     except Exception as exc:
         update_logger.error("Persistenter Recovery-Bootblock ist nicht beweisbar: %s", exc)
     try:
-        final_quiesced = bool(_stop_v4_services(V4_SERVICES))
+        final_quiesced = bool(
+            _stop_v4_services(
+                V4_SERVICES,
+                bound_install_root=bound_install_root,
+            )
+        )
+    except RecoveryInstallRootBindingError:
+        raise
     except Exception as exc:
         final_quiesced = False
         update_logger.error(
@@ -18991,18 +21043,30 @@ def _bound_release_head_commit(
     install_user: str,
     *,
     root_authority: bool = False,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> str:
     """Bindet HEAD ausschließlich als vollständigen Commit-Hash."""
 
-    result = _git_argv(
-        repo_dir,
-        install_user,
-        "rev-parse",
-        "--verify",
-        "HEAD^{commit}",
-        timeout=10,
-        **_root_git_call_kwargs(root_authority),
-    )
+    if bound_install_root is not None:
+        _verify_recovery_install_binding(bound_install_root, repo_dir)
+        result = _git_argv_under_bound_install_root(
+            bound_install_root,
+            install_user,
+            "rev-parse",
+            "--verify",
+            "HEAD^{commit}",
+            timeout=10,
+        )
+    else:
+        result = _git_argv(
+            repo_dir,
+            install_user,
+            "rev-parse",
+            "--verify",
+            "HEAD^{commit}",
+            timeout=10,
+            **_root_git_call_kwargs(root_authority),
+        )
     if not result.get("success"):
         raise RuntimeError(
             "Repository-HEAD ist nicht lesbar: "
@@ -19014,14 +21078,14 @@ def _bound_release_head_commit(
         raise RuntimeError("Repository-HEAD ist kein vollständiger Commit") from exc
 
 
-def _tracked_release_file_contracts(
+def _tracked_release_file_contract_details(
     repo_dir: str,
     install_user: str,
     *,
     target_commit: str | None = None,
     root_authority: bool = False,
-) -> list[tuple[str, int, str]]:
-    """Bindet Pfad, Modus und Blob-ID aus einem exakten Produkt-Commit."""
+) -> list[tuple[str, int, int, str]]:
+    """Bindet Pfad, Git-Modus, Live-Modus und Blob-ID aus einem Commit."""
 
     commit = (
         _validate_full_commit(target_commit)
@@ -19047,7 +21111,7 @@ def _tracked_release_file_contracts(
         maximum_total_bytes=TARGET_EXECUTION_SNAPSHOT_MAX_TOTAL_BYTES,
     )
     root = os.path.abspath(repo_dir)
-    entries: list[tuple[str, int, str]] = []
+    entries: list[tuple[str, int, int, str]] = []
     for relative_path, (payload, sealed_mode) in sorted(verified_entries.items()):
         target = os.path.abspath(os.path.join(root, relative_path))
         if os.path.commonpath((root, target)) != root or target == root:
@@ -19060,13 +21124,56 @@ def _tracked_release_file_contracts(
         entries.append(
             (
                 relative_path,
-                0o755 if sealed_mode == 0o555 else 0o644,
+                0o755 if stat.S_IMODE(sealed_mode) == 0o555 else 0o644,
+                0o755 if payload.startswith(b"#!") else 0o644,
                 object_id,
             )
         )
     if not entries:
         raise RuntimeError("Git-Dateivertrag ist leer")
     return entries
+
+
+def _tracked_release_file_contracts(
+    repo_dir: str,
+    install_user: str,
+    *,
+    target_commit: str | None = None,
+    root_authority: bool = False,
+) -> list[tuple[str, int, str]]:
+    """Bindet den stabilen Recovery-v1-Vertrag: Pfad, Git-Modus, Blob-ID."""
+
+    return [
+        (relative_path, git_mode, object_id)
+        for relative_path, git_mode, _live_mode, object_id
+        in _tracked_release_file_contract_details(
+            repo_dir,
+            install_user,
+            target_commit=target_commit,
+            root_authority=root_authority,
+        )
+    ]
+
+
+def _tracked_release_live_file_contracts(
+    repo_dir: str,
+    install_user: str,
+    *,
+    target_commit: str | None = None,
+    root_authority: bool = False,
+) -> list[tuple[str, int, str]]:
+    """Leitet den Live-Modus ausschließlich aus commitgebundenen Payloadbytes ab."""
+
+    return [
+        (relative_path, live_mode, object_id)
+        for relative_path, _git_mode, live_mode, object_id
+        in _tracked_release_file_contract_details(
+            repo_dir,
+            install_user,
+            target_commit=target_commit,
+            root_authority=root_authority,
+        )
+    ]
 
 
 def _tracked_release_file_modes(
@@ -19077,7 +21184,7 @@ def _tracked_release_file_modes(
 
     return [
         (relative_path, mode)
-        for relative_path, mode, _object_id in _tracked_release_file_contracts(
+        for relative_path, mode, _object_id in _tracked_release_live_file_contracts(
             repo_dir,
             install_user,
         )
@@ -19298,6 +21405,8 @@ def _same_release_integrity_errors(
     status = _git_argv(
         repo_dir,
         install_user,
+        "-c",
+        "core.fileMode=false",
         "status",
         "--porcelain=v1",
         "--untracked-files=no",
@@ -19345,7 +21454,7 @@ def _same_release_integrity_errors(
             path=source,
             relative_path=relative_path,
             expected_uid=account.pw_uid,
-            expected_gid=account.pw_gid,
+            expected_gid=web_group.gr_gid,
             expected_mode=expected_mode,
             label="Getrackte Produktdatei",
             errors=errors,
@@ -19354,7 +21463,7 @@ def _same_release_integrity_errors(
     _append_directory_metadata_errors(
         directories=repo_directories,
         expected_uid=account.pw_uid,
-        expected_gid=account.pw_gid,
+        expected_gid=web_group.gr_gid,
         expected_mode=0o755,
         label="Produktverzeichnis",
         errors=errors,
@@ -19386,16 +21495,25 @@ def _same_release_integrity_errors(
             (os.path.join(repo_dir, name), os.path.join(web_root, name))
         )
 
-    web_directories = {os.path.abspath(web_root)}
+    web_root_absolute = os.path.abspath(web_root)
+    web_directories: set[str] = set()
     for _source, target in projected_sources:
         current = os.path.dirname(os.path.abspath(target))
-        while os.path.commonpath((os.path.abspath(web_root), current)) == os.path.abspath(
-            web_root
-        ):
-            web_directories.add(current)
-            if current == os.path.abspath(web_root):
+        while os.path.commonpath((web_root_absolute, current)) == web_root_absolute:
+            if current != web_root_absolute:
+                web_directories.add(current)
+            if current == web_root_absolute:
                 break
             current = os.path.dirname(current)
+    _append_directory_metadata_errors(
+        directories={web_root_absolute},
+        expected_uid=0,
+        expected_gid=web_group.gr_gid,
+        expected_mode=0o755,
+        label="Web-Programmroot",
+        errors=errors,
+        maximum=maximum,
+    )
     _append_directory_metadata_errors(
         directories=web_directories,
         expected_uid=account.pw_uid,
@@ -19446,6 +21564,14 @@ def _same_release_integrity_errors(
                 f"Webprojektion weicht ab: {relative_target}"
             )
     return errors[:maximum]
+
+
+def _validate_live_install_context_as_web(target_root: str) -> None:
+    """Verwendet für Full-/Legacy-Pfade denselben realen Webvertrag wie Simple."""
+
+    from .update_simple import _validate_live_install_context
+
+    _validate_live_install_context(Path(os.path.abspath(target_root)))
 
 
 def _download_bootstrap_entry_mode(target_install_path: str | None) -> str:
@@ -19526,6 +21652,14 @@ def _probe_regular_download_bootstrap_current(
         raise RuntimeError("Regular-Probe verlor ihre Tag-/Commitbindung")
     restart_services = _validated_restart_services(policy, state)
     errors = _same_release_integrity_errors(root, install_user)
+    if len(errors) < 12:
+        try:
+            _validate_live_install_context_as_web(root)
+        except Exception as exc:
+            errors.append(
+                "Installationszentrale kann den Live-Installationskontext nicht "
+                f"vollständig lesen: {exc}"
+            )
     if len(errors) < 12:
         errors.extend(
             _same_release_service_errors(
@@ -20895,6 +23029,8 @@ def _static_bootblock_namespace_present() -> bool:
 
 def _rebind_or_rearm_static_bootblock(
     transaction_id: str,
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> RecoveryBootblockContract:
     """Bindet einen frühen statischen Gate-Crash und vervollständigt nur ihn."""
 
@@ -20927,6 +23063,7 @@ def _rebind_or_rearm_static_bootblock(
     return _arm_persistent_recovery_bootblock(
         partial,
         transaction_id=transaction_id,
+        bound_install_root=bound_install_root,
     )
 
 
@@ -20982,6 +23119,8 @@ def _assert_dynamic_safety_matches_journal(
 
 def _bind_persisted_runtime_receipts(
     bundle: PersistentRecoveryBundle,
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> tuple[
     PreparedPackageReceipt | PackageRecoveryReceipt | None,
     PackageTransactionState | None,
@@ -20994,6 +23133,10 @@ def _bind_persisted_runtime_receipts(
 
     journal_contract = recovery_journal.verify_recovery_journal(bundle.journal)
     payload = journal_contract.payload
+    _verify_optional_recovery_install_binding(
+        bound_install_root,
+        payload.install_root,
+    )
     terminal = payload.phase in {
         recovery_journal.PHASE_COMMITTED,
         recovery_journal.PHASE_ROLLED_BACK,
@@ -21068,6 +23211,7 @@ def _bind_persisted_runtime_receipts(
                         _reload_and_verify_update_safety_dropins(
                             update_safety_contract,
                             expected_present=True,
+                            bound_install_root=bound_install_root,
                         )
                     else:
                         # Ein Stromausfall kann exakt zwischen Gateöffnung und
@@ -21075,7 +23219,8 @@ def _bind_persisted_runtime_receipts(
                         # receiptgebundenen 00-Inodes dürfen den Marker derselben
                         # Transaktion wieder scharf stellen.
                         update_safety_contract = _arm_update_safety_contract(
-                            update_safety_contract
+                            update_safety_contract,
+                            bound_install_root=bound_install_root,
                         )
                         _assert_dynamic_safety_matches_journal(
                             update_safety_contract,
@@ -21104,12 +23249,14 @@ def _bind_persisted_runtime_receipts(
                             static_bootblock_contract.units,
                             expected_present=True,
                             transaction_id=static_bootblock_contract.transaction_id,
+                            bound_install_root=bound_install_root,
                         )
                     else:
                         static_bootblock_contract = (
                             _arm_persistent_recovery_bootblock(
                                 static_bootblock_contract,
                                 transaction_id=payload.transaction_id,
+                                bound_install_root=bound_install_root,
                             )
                         )
                         if (
@@ -21138,7 +23285,8 @@ def _bind_persisted_runtime_receipts(
                 raise RuntimeError("Ungebundenes Safety-Receipt gehört nicht zum Journal")
         elif payload.phase == recovery_journal.PHASE_PREPRODUCT and _static_bootblock_namespace_present():
             static_bootblock_contract = _rebind_or_rearm_static_bootblock(
-                payload.transaction_id
+                payload.transaction_id,
+                bound_install_root=bound_install_root,
             )
 
     overlay_receipt = _read_quiesced_overlay_receipt(allow_missing=True)
@@ -21186,8 +23334,40 @@ def _bind_persisted_runtime_receipts(
 
 def _reconstruct_persisted_recovery_transaction(
     journal_contract: recovery_journal.RecoveryJournalContract,
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> ReconstructedRecoveryTransaction:
     bundle = _load_persistent_recovery_bundle(journal_contract)
+    if bound_install_root is None and bundle.context is not None:
+        context = bundle.context.context
+        with bind_persistent_install_root(
+            context.install_root,
+            expected_identity=context.install_root_identity,
+        ) as fresh_binding:
+            return _reconstruct_persisted_recovery_transaction(
+                journal_contract,
+                bound_install_root=fresh_binding,
+            )
+    if bound_install_root is not None:
+        _verify_recovery_install_binding(
+            bound_install_root,
+            bundle.journal.payload.install_root,
+        )
+        if bundle.context is not None:
+            expected_identity = bundle.context.context.install_root_identity
+            actual_identity = (
+                int(bound_install_root.parent_device),
+                int(bound_install_root.parent_inode),
+                int(bound_install_root.device),
+                int(bound_install_root.inode),
+            )
+            if (
+                expected_identity is not None
+                and actual_identity != tuple(expected_identity)
+            ):
+                raise RuntimeError(
+                    "Recovery-Rekonstruktion widerspricht ihrer Root-Identität"
+                )
     (
         package_receipt,
         package_transaction,
@@ -21195,7 +23375,10 @@ def _reconstruct_persisted_recovery_transaction(
         static_bootblock_contract,
         overlay_receipt,
         offline_receipt,
-    ) = _bind_persisted_runtime_receipts(bundle)
+    ) = _bind_persisted_runtime_receipts(
+        bundle,
+        bound_install_root=bound_install_root,
+    )
     phase = bundle.journal.payload.phase
     rollback_finish_pending = bool(
         phase == recovery_journal.PHASE_ROLLED_BACK
@@ -21229,6 +23412,11 @@ def _reconstruct_persisted_recovery_transaction(
             static_bootblock_contract=static_bootblock_contract,
             overlay_receipt=overlay_receipt,
             offline_receipt=offline_receipt,
+            install_root_identity=(
+                bundle.context.context.install_root_identity
+                if bundle.context is not None
+                else None
+            ),
         )
     if bundle.context is None or bundle.surface is None or bundle.systemd is None:
         raise RuntimeError("Nichtterminale Recovery-Transaktion ist unvollständig")
@@ -21262,6 +23450,7 @@ def _reconstruct_persisted_recovery_transaction(
         static_bootblock_contract=static_bootblock_contract,
         overlay_receipt=overlay_receipt,
         offline_receipt=offline_receipt,
+        install_root_identity=context.install_root_identity,
     )
 
 
@@ -21317,6 +23506,8 @@ def _persistent_gate_dropin_preimages(
 
 def _restore_persistent_systemd_prestate(
     transaction: ReconstructedRecoveryTransaction,
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> recovery_journal.RecoveryJournalContract:
     """Restauriert systemd offline und entscheidet vor Gateöffnung durable Alt."""
 
@@ -21324,6 +23515,12 @@ def _restore_persistent_systemd_prestate(
     if bundle.systemd is None:
         raise RuntimeError("Persistentes systemd-Recovery-Receipt fehlt")
     journal_contract = recovery_journal.verify_recovery_journal(bundle.journal)
+    _verify_optional_recovery_install_binding(
+        bound_install_root,
+        journal_contract.payload.install_root,
+    )
+    systemd_runner = _bound_recovery_systemd_runner(bound_install_root)
+    runner_kwargs = {"_runner": systemd_runner} if systemd_runner is not None else {}
     if journal_contract.payload.phase not in {
         recovery_journal.PHASE_PREPRODUCT,
         recovery_journal.PHASE_PRODUCT_MUTATING,
@@ -21336,6 +23533,10 @@ def _restore_persistent_systemd_prestate(
     receipt = bundle.systemd.receipt
 
     def closed_gate_verifier(transaction_id: str, units: tuple[str, ...]) -> bool:
+        _verify_optional_recovery_install_binding(
+            bound_install_root,
+            journal_contract.payload.install_root,
+        )
         current_journal = recovery_journal.read_recovery_journal()
         if (
             current_journal is None
@@ -21351,7 +23552,11 @@ def _restore_persistent_systemd_prestate(
         if safety is not None:
             _validate_update_safety_contract(safety, expected_state="pending")
             _verify_update_safety_marker(safety, expected_present=True)
-            _reload_and_verify_update_safety_dropins(safety, expected_present=True)
+            _reload_and_verify_update_safety_dropins(
+                safety,
+                expected_present=True,
+                bound_install_root=bound_install_root,
+            )
         else:
             _validate_recovery_bootblock_contract(static_gate)
             _verify_recovery_bootblock_marker(static_gate, expected_present=True)
@@ -21359,11 +23564,13 @@ def _restore_persistent_systemd_prestate(
                 static_gate.units,
                 expected_present=True,
                 transaction_id=static_gate.transaction_id,
+                bound_install_root=bound_install_root,
             )
         return True
 
     guard = recovery_surface_codec.capture_systemd_recovery_restore_guard(
-        receipt
+        receipt,
+        **runner_kwargs,
     )
     preserved = _persistent_gate_dropin_preimages(
         guard,
@@ -21375,11 +23582,16 @@ def _restore_persistent_systemd_prestate(
         guard,
         closed_gate_verifier=closed_gate_verifier,
         preserved_gate_dropins=preserved,
+        **runner_kwargs,
     )
     rolled_back_journal = None
 
     def start_authorizer(transaction_id: str, units: tuple[str, ...]) -> bool:
         nonlocal rolled_back_journal
+        _verify_optional_recovery_install_binding(
+            bound_install_root,
+            journal_contract.payload.install_root,
+        )
         if closed_gate_verifier(transaction_id, units) is not True:
             return False
         # Ab hier ist Produkt-, Paket-, Nebenflächen- und systemd-Preimage
@@ -21389,10 +23601,20 @@ def _restore_persistent_systemd_prestate(
         rolled_back_journal = _advance_persistent_recovery_rolled_back(
             journal_contract
         )
+        _verify_optional_recovery_install_binding(
+            bound_install_root,
+            journal_contract.payload.install_root,
+        )
         if safety is not None:
-            _clear_update_safety_marker(safety)
+            _clear_update_safety_marker(
+                safety,
+                bound_install_root=bound_install_root,
+            )
         else:
-            _clear_recovery_bootblock_marker(static_gate)
+            _clear_recovery_bootblock_marker(
+                static_gate,
+                bound_install_root=bound_install_root,
+            )
         return True
 
     try:
@@ -21400,8 +23622,11 @@ def _restore_persistent_systemd_prestate(
             receipt,
             plan,
             start_authorizer=start_authorizer,
+            **runner_kwargs,
         )
-    except BaseException:
+    except BaseException as recovery_error:
+        if isinstance(recovery_error, RecoveryInstallRootBindingError):
+            raise
         terminal = _read_matching_rolled_back_recovery_journal(
             journal_contract,
             allow_missing=True,
@@ -21409,12 +23634,18 @@ def _restore_persistent_systemd_prestate(
         if terminal is None:
             try:
                 if safety is not None:
-                    _rearm_pending_update_safety_contract(safety)
+                    _rearm_pending_update_safety_contract(
+                        safety,
+                        bound_install_root=bound_install_root,
+                    )
                 else:
                     _arm_persistent_recovery_bootblock(
                         static_gate,
                         transaction_id=journal_contract.payload.transaction_id,
+                        bound_install_root=bound_install_root,
                     )
+            except RecoveryInstallRootBindingError:
+                raise
             except Exception as gate_error:
                 update_logger.critical(
                     "Systemd-Recovery-Gate konnte nach Startfehler nicht erneut gebunden werden: %s",
@@ -21437,15 +23668,22 @@ def _settle_terminal_finalizer_lease(
         | RecoveryBootblockContract
         | legacy_safety_codec.LegacyUpdateSafetyReceipt
     ),
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> None:
     """Akzeptiert failed/PID0 erst nach bestätigtem reset-failed-Readback."""
 
     try:
-        _assert_committed_finalizer_lease_inactive(contract)
+        _assert_committed_finalizer_lease_inactive(
+            contract,
+            bound_install_root=bound_install_root,
+        )
         return
+    except RecoveryInstallRootBindingError:
+        raise
     except Exception as original_error:
         properties = ("Id", "ActiveState", "SubState", "MainPID")
-        result = _run_argv(
+        result = _run_recovery_service_argv(
             [
                 "systemctl",
                 "show",
@@ -21455,6 +23693,7 @@ def _settle_terminal_finalizer_lease(
             ],
             timeout=15,
             env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+            bound_install_root=bound_install_root,
         )
         values = {}
         for line in str(result.get("stdout") or "").splitlines():
@@ -21476,10 +23715,11 @@ def _settle_terminal_finalizer_lease(
         ):
             raise original_error
         _assert_no_same_transaction_finalizer_processes(contract)
-        reset = _run_argv(
+        reset = _run_recovery_service_argv(
             ["systemctl", "reset-failed", "--", contract.finalizer_unit],
             timeout=15,
             env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+            bound_install_root=bound_install_root,
         )
         if (
             not reset.get("success")
@@ -21490,7 +23730,10 @@ def _settle_terminal_finalizer_lease(
             raise RuntimeError(
                 "Beendete failed Finalizer-Lease konnte nicht zurückgesetzt werden"
             ) from original_error
-        _assert_committed_finalizer_lease_inactive(contract)
+        _assert_committed_finalizer_lease_inactive(
+            contract,
+            bound_install_root=bound_install_root,
+        )
 
 
 def _assert_transaction_gate_absent(transaction_id: str) -> None:
@@ -21504,8 +23747,30 @@ def _assert_transaction_gate_absent(transaction_id: str) -> None:
             )
 
 
+def _committed_recovery_requires_bound_root(
+    transaction: ReconstructedRecoveryTransaction,
+) -> bool:
+    """Trennt reinen Journal-Cleanup von jedem servicefähigen Restzustand."""
+
+    if transaction.bundle.journal.payload.phase != recovery_journal.PHASE_COMMITTED:
+        return False
+    return bool(
+        transaction.bundle.surface is not None
+        or transaction.bundle.systemd is not None
+        or transaction.package_receipt is not None
+        or transaction.package_transaction is not None
+        or transaction.update_safety_contract is not None
+        or transaction.static_bootblock_contract is not None
+        or transaction.overlay_receipt is not None
+        or transaction.offline_receipt is not None
+        or _static_bootblock_namespace_present()
+    )
+
+
 def _finish_committed_recovery_transaction(
     transaction: ReconstructedRecoveryTransaction,
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> None:
     """Vollendet ausschließlich den dauerhaft bestätigten neuen Stand."""
 
@@ -21513,10 +23778,22 @@ def _finish_committed_recovery_transaction(
     payload = bundle.journal.payload
     if payload.phase != recovery_journal.PHASE_COMMITTED:
         raise RuntimeError("PostCommit-Abschluss besitzt kein committed Journal")
+    if (
+        _committed_recovery_requires_bound_root(transaction)
+        and bound_install_root is None
+    ):
+        raise RecoveryInstallRootBindingError(
+            "Servicefähiger committed Recovery-Rest besitzt keine Root-Bindung"
+        )
+    _verify_optional_recovery_install_binding(
+        bound_install_root,
+        payload.install_root,
+    )
     current_head = _bound_release_head_commit(
         payload.install_root,
         payload.install_user,
         root_authority=True,
+        bound_install_root=bound_install_root,
     )
     if not _exact_commit_matches(current_head, payload.target.commit):
         raise RuntimeError(
@@ -21528,9 +23805,15 @@ def _finish_committed_recovery_transaction(
     static_gate = transaction.static_bootblock_contract
     postcommit_health_required = True
     if safety is not None:
-        _settle_terminal_finalizer_lease(safety)
+        _settle_terminal_finalizer_lease(
+            safety,
+            bound_install_root=bound_install_root,
+        )
         if safety.state == "pending":
-            safety = _commit_update_safety_receipt(safety)
+            safety = _commit_update_safety_receipt(
+                safety,
+                bound_install_root=bound_install_root,
+            )
         elif safety.state != "committed":
             raise RuntimeError("Committed Journal besitzt einen unbekannten Safety-Zustand")
         if isinstance(package_receipt, PreparedPackageReceipt):
@@ -21538,9 +23821,16 @@ def _finish_committed_recovery_transaction(
                 package_receipt = _commit_prepared_package_receipt(package_receipt)
             elif package_receipt.state != "committed":
                 raise RuntimeError("Committed Journal besitzt keinen commitfähigen Paketzustand")
-        _finish_committed_update_safety_cleanup(safety, remove_receipt=False)
+        _finish_committed_update_safety_cleanup(
+            safety,
+            remove_receipt=False,
+            bound_install_root=bound_install_root,
+        )
     elif static_gate is not None:
-        _settle_terminal_finalizer_lease(static_gate)
+        _settle_terminal_finalizer_lease(
+            static_gate,
+            bound_install_root=bound_install_root,
+        )
         if isinstance(package_receipt, PreparedPackageReceipt):
             if package_receipt.state == "prepared":
                 package_receipt = _commit_prepared_package_receipt(package_receipt)
@@ -21549,7 +23839,8 @@ def _finish_committed_recovery_transaction(
         if package_receipt is None:
             raise RuntimeError("Statischer PostCommit besitzt kein Paket-Receipt")
         package_receipt = _finish_committed_package_gate_cleanup(
-            package_receipt
+            package_receipt,
+            bound_install_root=bound_install_root,
         )
     else:
         _assert_transaction_gate_absent(payload.transaction_id)
@@ -21575,17 +23866,32 @@ def _finish_committed_recovery_transaction(
             root_authority=True,
         )
         services = _validated_restart_services(policy, state)
+        health_action_authorizer = None
+        if bound_install_root is not None:
+            def authorize_service_action() -> bool:
+                _verify_recovery_install_binding(
+                    bound_install_root,
+                    payload.install_root,
+                )
+                return True
+
+            health_action_authorizer = authorize_service_action
         services_healthy = _post_update_healthcheck(
             services=services,
             transition_state=state,
             check_web=False,
             check_http=False,
+            action_authorizer=health_action_authorizer,
         )
         if not services_healthy:
+            restart_kwargs = {}
+            if health_action_authorizer is not None:
+                restart_kwargs["action_authorizer"] = health_action_authorizer
             if not _restart_v4_services(
                 headless=True,
                 services=services,
                 transition_state=state,
+                **restart_kwargs,
             ):
                 raise RuntimeError(
                     "Committed Zieldienste konnten nicht vollständig aktiviert werden"
@@ -21595,6 +23901,7 @@ def _finish_committed_recovery_transaction(
                 transition_state=state,
                 check_web=False,
                 check_http=False,
+                action_authorizer=health_action_authorizer,
             ):
                 raise RuntimeError(
                     "Committed Zieldienste bestanden das Dienst-/HA-Gesundheitsgate nicht"
@@ -21615,6 +23922,7 @@ def _finish_committed_recovery_transaction(
             transition_state=state,
             check_web=True,
             check_http=apache_was_active,
+            action_authorizer=health_action_authorizer,
         ):
             raise RuntimeError(
                 "Committed Zielstand bestand das Web-/HTTP-Endgate nicht"
@@ -21671,17 +23979,26 @@ def _terminal_gate_dropin_contracts(
 
 def _finish_rolled_back_recovery_transaction(
     transaction: ReconstructedRecoveryTransaction,
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> None:
     """Führt nach durable rolled_back ausschließlich den Cleanup fort."""
 
     if transaction.bundle.journal.payload.phase != recovery_journal.PHASE_ROLLED_BACK:
         raise RuntimeError("Altstands-Cleanup besitzt kein rolled_back Journal")
+    _verify_optional_recovery_install_binding(
+        bound_install_root,
+        transaction.bundle.journal.payload.install_root,
+    )
     terminal_lease = (
         transaction.update_safety_contract
         or transaction.static_bootblock_contract
     )
     if terminal_lease is not None:
-        _settle_terminal_finalizer_lease(terminal_lease)
+        _settle_terminal_finalizer_lease(
+            terminal_lease,
+            bound_install_root=bound_install_root,
+        )
     if transaction.transition_state is not None:
         if (
             transaction.bundle.systemd is None
@@ -21691,11 +24008,13 @@ def _finish_rolled_back_recovery_transaction(
         if os.path.lexists(RECOVERY_BOOTBLOCK_MARKER):
             if transaction.update_safety_contract is not None:
                 _clear_update_safety_marker(
-                    transaction.update_safety_contract
+                    transaction.update_safety_contract,
+                    bound_install_root=bound_install_root,
                 )
             else:
                 _clear_recovery_bootblock_marker(
-                    transaction.static_bootblock_contract
+                    transaction.static_bootblock_contract,
+                    bound_install_root=bound_install_root,
                 )
 
         terminal_journal = recovery_journal.verify_recovery_journal(
@@ -21708,9 +24027,15 @@ def _finish_rolled_back_recovery_transaction(
             units: tuple[str, ...],
         ) -> bool:
             try:
+                _verify_optional_recovery_install_binding(
+                    bound_install_root,
+                    terminal_journal.payload.install_root,
+                )
                 current = recovery_journal.verify_recovery_journal(
                     terminal_journal
                 )
+            except RecoveryInstallRootBindingError:
+                raise
             except Exception:
                 return False
             return bool(
@@ -21719,16 +24044,22 @@ def _finish_rolled_back_recovery_transaction(
                 and tuple(units) == tuple(item.unit for item in receipt.units)
             )
 
+        systemd_runner = _bound_recovery_systemd_runner(bound_install_root)
+        runner_kwargs = (
+            {"_runner": systemd_runner} if systemd_runner is not None else {}
+        )
         recovery_surface_codec.resume_systemd_pre_active_state_after_gate_open(
             receipt,
             gate_dropins=_terminal_gate_dropin_contracts(transaction),
             start_authorizer=terminal_start_authorizer,
+            **runner_kwargs,
         )
         apache = transaction.recovery_inventory.apache_security
         _restore_apache_after_successful_cutover(
             expected_available=apache.apache_available,
             expected_active=apache.apache_was_active,
             expected_unit_file_state=apache.apache_unit_file_state,
+            bound_install_root=bound_install_root,
         )
     _assert_transaction_gate_absent(
         transaction.bundle.journal.payload.transaction_id
@@ -21745,14 +24076,144 @@ def _finish_rolled_back_recovery_transaction(
 
 def _dispatch_persisted_recovery_transaction(
     transaction: ReconstructedRecoveryTransaction,
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
 ) -> None:
+    """Bindet Resume-Aktionen an den persistierten Installationsroot.
+
+    Alte v1-Kontexte besitzen noch keine persistierte 4-Tuple-Identität. Sie
+    bleiben kompatibel, werden aber für diesen Prozess frisch nofollow
+    gebunden; die Identität vor ihrem historischen Prozessabbruch bleibt dabei
+    naturgemäß ``EVIDENCE_LIMIT``. Ist der Context nach einem nachweislich
+    terminalen Abschluss bereits entfernt, darf der bisherige reine
+    Artefakt-Cleanup weiterlaufen.
+    """
+
+    if not isinstance(transaction, ReconstructedRecoveryTransaction):
+        raise TypeError("Persistente Recovery besitzt den falschen Transaktionstyp")
+    payload = transaction.bundle.journal.payload
+    context_contract = transaction.bundle.context
+    if context_contract is None:
+        if payload.phase not in {
+            recovery_journal.PHASE_COMMITTED,
+            recovery_journal.PHASE_ROLLED_BACK,
+        }:
+            raise RuntimeError(
+                "Nichtterminaler Recovery-Resume besitzt keinen Root-Context"
+            )
+        requires_fresh_binding = bool(
+            payload.phase == recovery_journal.PHASE_COMMITTED
+            and _committed_recovery_requires_bound_root(transaction)
+        )
+        if requires_fresh_binding and bound_install_root is None:
+            binding_entered = False
+            try:
+                with bind_persistent_install_root(
+                    payload.install_root,
+                ) as fresh_binding:
+                    binding_entered = True
+                    _dispatch_persisted_recovery_transaction_under_bound_root(
+                        transaction,
+                        bound_install_root=fresh_binding,
+                    )
+                return
+            except RecoveryInstallRootBindingError:
+                raise
+            except Exception as exc:
+                if binding_entered:
+                    raise
+                raise ActionableUpdateAbort(
+                    "E3DC-UPD-COMMITTED-CONTEXT-001",
+                    "Der committed Zielstand besitzt noch servicefähige "
+                    "Recovery-Reste, aber sein kanonischer Installationsroot "
+                    "konnte vor jeder Aktion nicht frisch nofollow gebunden "
+                    "werden.",
+                    system_state=(
+                        "NEUSTAND_COMMITTED_ROOTBINDUNG_FEHLT_FAIL_CLOSED"
+                    ),
+                    target=(
+                        "Denselben committed Recovery-Abschluss mit eindeutigem "
+                        "Installationsroot wiederholen"
+                    ),
+                    solution=(
+                        "Prüfe den Installationspfad ohne Symlink oder fremden "
+                        "Mount und starte denselben Updatebefehl erneut; bleibt "
+                        "die Bindung unmöglich, stelle über das lokale "
+                        "Backup-Menü das verifizierte Vollbackup dieser "
+                        "Transaktion wieder her"
+                    ),
+                ) from exc
+        _verify_optional_recovery_install_binding(
+            bound_install_root,
+            payload.install_root,
+        )
+        _dispatch_persisted_recovery_transaction_under_bound_root(
+            transaction,
+            bound_install_root=bound_install_root,
+        )
+        return
+
+    context = context_contract.context
+    if (
+        context.install_root != payload.install_root
+        or transaction.install_root_identity != context.install_root_identity
+    ):
+        raise RuntimeError(
+            "Persistenter Recovery-Resume widerspricht seiner Root-Bindung"
+        )
+    if bound_install_root is not None:
+        _verify_recovery_install_binding(
+            bound_install_root,
+            payload.install_root,
+        )
+        actual_identity = (
+            int(bound_install_root.parent_device),
+            int(bound_install_root.parent_inode),
+            int(bound_install_root.device),
+            int(bound_install_root.inode),
+        )
+        if (
+            transaction.install_root_identity is not None
+            and actual_identity != tuple(transaction.install_root_identity)
+        ):
+            raise RuntimeError(
+                "Persistenter Recovery-Dispatcher verlor seine Root-Identität"
+            )
+        _dispatch_persisted_recovery_transaction_under_bound_root(
+            transaction,
+            bound_install_root=bound_install_root,
+        )
+        return
+    with bind_persistent_install_root(
+        payload.install_root,
+        expected_identity=transaction.install_root_identity,
+    ) as bound_install_root:
+        _dispatch_persisted_recovery_transaction_under_bound_root(
+            transaction,
+            bound_install_root=bound_install_root,
+        )
+
+
+def _dispatch_persisted_recovery_transaction_under_bound_root(
+    transaction: ReconstructedRecoveryTransaction,
+    *,
+    bound_install_root: BoundPersistentInstallRoot | None = None,
+) -> None:
+    """Führt nur unter der vom Dispatcher gehaltenen Root-Bindung fort."""
+
     payload = transaction.bundle.journal.payload
     phase = payload.phase
     if phase == recovery_journal.PHASE_COMMITTED:
-        _finish_committed_recovery_transaction(transaction)
+        _finish_committed_recovery_transaction(
+            transaction,
+            bound_install_root=bound_install_root,
+        )
         return
     if phase == recovery_journal.PHASE_ROLLED_BACK:
-        _finish_rolled_back_recovery_transaction(transaction)
+        _finish_rolled_back_recovery_transaction(
+            transaction,
+            bound_install_root=bound_install_root,
+        )
         return
     if (
         transaction.transition_state is None
@@ -21794,6 +24255,7 @@ def _dispatch_persisted_recovery_transaction(
                 recovery_inventory=transaction.recovery_inventory,
                 recovery_journal_contract=transaction.bundle.journal,
                 persistent_recovery_transaction=transaction,
+                bound_install_root=bound_install_root,
             )
             if not recovered:
                 raise RuntimeError("Automatischer preproduct-Rücklauf blieb unvollständig")
@@ -21824,6 +24286,8 @@ def _dispatch_persisted_recovery_transaction(
             quiesced_overlay_receipt=transaction.overlay_receipt,
             recovery_journal_contract=transaction.bundle.journal,
             persistent_recovery_transaction=transaction,
+            install_root_identity=transaction.install_root_identity,
+            bound_install_root=bound_install_root,
         )
         if not result.recovered:
             raise RuntimeError("Automatischer Vollrücklauf blieb unvollständig")
@@ -22501,16 +24965,37 @@ def _resume_or_cleanup_recovery_namespace(
             "[OK] Unterbrochene Journal-Veröffentlichung wurde anhand des "
             "Construction-Receipts automatisch abgeschlossen."
         )
-    transaction = _reconstruct_persisted_recovery_transaction(
-        journal_contract
-    )
-    print(
-        "[i] Offene Update-Transaktion erkannt; der aktuelle Updater setzt "
-        f"Phase {journal_contract.payload.phase} automatisch fort."
-    )
-    _dispatch_persisted_recovery_transaction(transaction)
-    if recovery_journal.read_recovery_journal(allow_missing=True) is not None:
-        raise RuntimeError("Master-Journal blieb nach dem automatischen Abschluss erhalten")
+    resume_bundle = _load_persistent_recovery_bundle(journal_contract)
+
+    def resume_under_root_binding(
+        bound_install_root: BoundPersistentInstallRoot | None,
+    ) -> None:
+        transaction = _reconstruct_persisted_recovery_transaction(
+            journal_contract,
+            bound_install_root=bound_install_root,
+        )
+        print(
+            "[i] Offene Update-Transaktion erkannt; der aktuelle Updater setzt "
+            f"Phase {journal_contract.payload.phase} automatisch fort."
+        )
+        _dispatch_persisted_recovery_transaction(
+            transaction,
+            bound_install_root=bound_install_root,
+        )
+        if recovery_journal.read_recovery_journal(allow_missing=True) is not None:
+            raise RuntimeError(
+                "Master-Journal blieb nach dem automatischen Abschluss erhalten"
+            )
+
+    if resume_bundle.context is None:
+        resume_under_root_binding(None)
+    else:
+        context = resume_bundle.context.context
+        with bind_persistent_install_root(
+            context.install_root,
+            expected_identity=context.install_root_identity,
+        ) as bound_install_root:
+            resume_under_root_binding(bound_install_root)
     print("[OK] Vorherige Update-Transaktion wurde sicher abgeschlossen.")
     return True
 
@@ -22535,6 +25020,18 @@ def _prepare_true_update_entry(requested_install_root: str) -> bool:
             "Strukturierter Updateabbruch %s: %s",
             exc.code,
             exc.detail,
+        )
+        return False
+    except RecoveryInstallRootBindingError as exc:
+        print(f"[ABBRUCH] E3DC-UPD-ROOT-BINDING-001: {exc}")
+        print(
+            "Lösung: Keine Recovery-Datei und keinen Dienstzustand manuell "
+            "verändern. Prüfe Installationspfad und Mountbelegung und starte "
+            "danach denselben Updatebefehl erneut."
+        )
+        update_logger.critical(
+            "Recovery-Rootbindung ging beim Resume verloren: %s",
+            exc,
         )
         return False
     except Exception as exc:
@@ -22734,6 +25231,7 @@ def _execute_update_transaction(
                 transaction_repo_dir or INSTALL_PATH
             )
         )
+        install_root_identity = _capture_install_root_identity(repo_dir)
         old_commit, bootstrap_rebuild_git = _bind_bootstrap_git_prestate(
             repo_dir,
             explicit_bootstrap=bool(target_install_path),
@@ -22757,6 +25255,7 @@ def _execute_update_transaction(
             state,
             bound_install_user,
         )
+        _verify_install_root_identity(repo_dir, install_root_identity)
     except Exception as exc:
         print(f"[!] Release-Preflight fehlgeschlagen: {exc}")
         update_logger.error(f"Release-Preflight fehlgeschlagen: {exc}")
@@ -22788,6 +25287,7 @@ def _execute_update_transaction(
     offline_preparation_plan = None
     offline_package_receipt = None
     try:
+        _verify_install_root_identity(repo_dir, install_root_identity)
         prepared_install_user = get_install_user()
         if prepared_install_user != bound_install_user:
             raise RuntimeError(
@@ -22878,6 +25378,7 @@ def _execute_update_transaction(
             prepared_package_transaction,
             offline_package_receipt,
         )
+        _verify_install_root_identity(repo_dir, install_root_identity)
     except Exception as exc:
         cleanup_error = None
         try:
@@ -22910,12 +25411,14 @@ def _execute_update_transaction(
     full_backup_manifest = None
     if old_commit is not None:
         try:
+            _verify_install_root_identity(repo_dir, install_root_identity)
             preflight_install_user = get_install_user()
             repo_recovery_contract = _capture_repo_recovery_contract(
                 repo_dir,
                 preflight_install_user,
                 old_commit,
             )
+            _verify_install_root_identity(repo_dir, install_root_identity)
         except Exception as exc:
             print(f"[!] Recovery-Preimage konnte nicht sicher eingefroren werden: {exc}")
             update_logger.error(f"Recovery-Preimage-Preflight fehlgeschlagen: {exc}")
@@ -23013,10 +25516,13 @@ def _execute_update_transaction(
             )
 
     try:
+        _verify_install_root_identity(repo_dir, install_root_identity)
         backup_dir = backup_current_version(
             install_path=repo_dir,
             verified_pre_chown_callback=freeze_backup_receipt,
+            expected_install_root_identity=install_root_identity,
         )
+        _verify_install_root_identity(repo_dir, install_root_identity)
     except Exception as exc:
         backup_dir = None
         update_logger.error(f"Backup vor Release-Wechsel fehlgeschlagen: {exc}")
@@ -23057,6 +25563,7 @@ def _execute_update_transaction(
             full_backup_manifest=full_backup_manifest,
             repo_recovery_contract=repo_recovery_contract,
             backup_receipt=backup_receipt,
+            install_root_identity=install_root_identity,
         )
         print("  [OK] Rebootfester Recovery-Kontext und Master-Journal bestätigt.")
     except BaseException as exc:
@@ -23238,7 +25745,10 @@ def _execute_update_transaction(
                 packages_mutated=packages_mutated,
                 recovery_inventory=recovery_inventory,
                 recovery_journal_contract=persistent_recovery_bundle.journal,
+                install_root_identity=install_root_identity,
             )
+        except RecoveryInstallRootBindingError:
+            raise
         except Exception as recovery_binding_exc:
             recovered = False
             update_logger.critical(
@@ -23325,7 +25835,10 @@ def _execute_update_transaction(
                 packages_mutated=packages_mutated,
                 recovery_inventory=recovery_inventory,
                 recovery_journal_contract=persistent_recovery_bundle.journal,
+                install_root_identity=install_root_identity,
             )
+        except RecoveryInstallRootBindingError:
+            raise
         except Exception as recovery_binding_exc:
             recovered = False
             update_logger.critical(
@@ -23463,7 +25976,10 @@ def _execute_update_transaction(
                 packages_mutated=packages_mutated,
                 recovery_inventory=recovery_inventory,
                 recovery_journal_contract=persistent_recovery_bundle.journal,
+                install_root_identity=install_root_identity,
             )
+        except RecoveryInstallRootBindingError:
+            raise
         except Exception as recovery_binding_exc:
             recovered = False
             update_logger.critical(
@@ -23497,6 +26013,7 @@ def _execute_update_transaction(
     target_commit = None
     try:
         _quiesce_apache_for_cutover(recovery_inventory.apache_security)
+        _verify_install_root_identity(repo_dir, install_root_identity)
         (
             quiesced_overlay_dir,
             _overlay_manifest,
@@ -23507,7 +26024,9 @@ def _execute_update_transaction(
             transaction_id=recovery_transaction_id,
             parent_backup_dir=backup_dir,
             parent_backup_id=str(full_backup_manifest.get("backup_id") or ""),
+            expected_install_root_identity=install_root_identity,
         )
+        _verify_install_root_identity(repo_dir, install_root_identity)
         quiesced_overlay_receipt = _capture_quiesced_overlay_receipt(
             overlay_dir=quiesced_overlay_dir,
             backup_dir=backup_dir,
@@ -23549,6 +26068,7 @@ def _execute_update_transaction(
             # Ab hier beginnt die erste Produkt-/Systemmutation. Das reine
             # Stoppen sowie das versiegelte Overlay bleiben bis zu diesem
             # Punkt über den schlanken Vor-Mutations-Rückweg reversibel.
+            _verify_install_root_identity(repo_dir, install_root_identity)
             mutated = True
             storage_unit_promoted = bool(
                 _migrate_approved_storage_manager_unit_owner(
@@ -23764,6 +26284,8 @@ def _execute_update_transaction(
             phase=recovery_journal.PHASE_COMMITTED,
         )
     except BaseException as exc:
+        if isinstance(exc, RecoveryInstallRootBindingError):
+            raise
         print(f"[!] {transition_name} fehlgeschlagen: {exc}")
         update_logger.error(f"{transition_name} fehlgeschlagen: {exc}")
         try:
@@ -23864,6 +26386,7 @@ def _execute_update_transaction(
                     recovery_transaction_id=recovery_transaction_id,
                     quiesced_overlay_receipt=quiesced_overlay_receipt,
                     recovery_journal_contract=current_recovery_journal,
+                    install_root_identity=install_root_identity,
                 )
                 recovered = bool(recovery_result)
                 bootblock_contract = recovery_result.bootblock_contract
@@ -23885,11 +26408,14 @@ def _execute_update_transaction(
                     packages_mutated=packages_mutated,
                     recovery_inventory=recovery_inventory,
                     recovery_journal_contract=current_recovery_journal,
+                    install_root_identity=install_root_identity,
                 )
             else:
                 raise RuntimeError(
                     f"Unzulässige Recovery-Journalphase: {journal_phase}"
                 )
+        except RecoveryInstallRootBindingError:
+            raise
         except Exception as recovery_binding_exc:
             update_logger.critical(
                 "Paket-Receipt konnte am Transaktionsrücklauf nicht gebunden werden: %s",
@@ -23922,6 +26448,8 @@ def _execute_update_transaction(
                         update_safety_contract,
                         repo_dir=repo_dir,
                     )
+                except RecoveryInstallRootBindingError:
+                    raise
                 except Exception as enforcement_exc:
                     update_logger.critical(
                         "Dynamischer Update-Bootblock ist nicht vollständig beweisbar: %s",
@@ -24199,6 +26727,17 @@ def execute_verified_target_update(
     )
     if bound_tag != tag:
         raise RuntimeError("Ziel-Tag driftete gegenüber dem versiegelten Updater-Handoff")
+
+    # Der eng begrenzte x-only-Zugriff auf echte Installationspfad-Vorfahren
+    # ist eine eigenständige, idempotente Infrastrukturreparatur vor Backup,
+    # Dienststopp und Recoveryjournal. Dadurch bleibt der transaktionale
+    # Release-Rückfall vollständig, ohne kompatible 0700-Homes auszusperren.
+    from .permissions import repair_web_install_traversal_preflight
+    if not repair_web_install_traversal_preflight():
+        raise RuntimeError(
+            "Installationspfad-Traversierrechte konnten vor dem Releasewechsel "
+            "nicht sicher vorbereitet werden"
+        )
     strict_forward_update = False
     if (
         requested is None
@@ -24232,6 +26771,14 @@ def execute_verified_target_update(
             install_user,
         )
         if len(integrity_errors) < 12:
+            try:
+                _validate_live_install_context_as_web(product_root)
+            except Exception as exc:
+                integrity_errors.append(
+                    "Installationszentrale kann den Live-Installationskontext nicht "
+                    f"vollständig lesen: {exc}"
+                )
+        if len(integrity_errors) < 12:
             integrity_errors.extend(
                 _same_release_service_errors(
                     restart_services,
@@ -24245,6 +26792,8 @@ def execute_verified_target_update(
                 print(f"    - {error}")
             print(
                 "    Keine Produkt- oder Webdatei und kein Dienstzustand wurde verändert. "
+                "Eine erforderliche enge x-only-Traversierreparatur des "
+                "Installationspfads bleibt als eigenständige Infrastrukturkorrektur bestehen. "
                 "Starte ausdrücklich --reinstall-current, um diese Version nach "
                 "verifiziertem Backup neu einzuspielen."
             )
@@ -24252,6 +26801,8 @@ def execute_verified_target_update(
         print(f"[OK] Du bist auf dem neuesten Stand: {commit}.")
         print(
             "    Keine Produkt- oder Webdatei und kein Dienstzustand wurde verändert. "
+            "Eine erforderliche enge x-only-Traversierreparatur des "
+            "Installationspfads bleibt als eigenständige Infrastrukturkorrektur bestehen. "
             "Kein Backup und kein Dienststopp erforderlich."
         )
         return UPDATE_ALREADY_CURRENT

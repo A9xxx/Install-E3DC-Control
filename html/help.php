@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.4e Stable</span>
+            <span class="badge bg-success text-light">v5.4.4f Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.4e</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.4f</code> in <code>.env</code> gesetzt.</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
 if [ -f ./docker_compose_update.py ]; then
   E3DC_DOCKER_HELPER=./docker_compose_update.py
@@ -212,6 +212,31 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                         <li>Nach der Freigabe im Account den RESTful API Security Token erzeugen.</li>
                         <li>Im Config-Editor unter <em>Tarif</em> den ENTSO-E-Token als Fallback-Token eintragen und mit <em>ENTSO-E testen</em> prüfen.</li>
                     </ol>
+                </div>
+            </div>
+        </div>
+
+        <h4 class="mb-4 text-accent"><i class="fas fa-shield-halved me-2"></i>Stable 5.4.4f: PV-Start, Backup-Zielbestand, Produktrechte und Matter-Reset</h4>
+        <div class="col-12 faq-item" data-tags="5.4.4f stable wallbox pv kurve null budget speicher direktvermarktung topologie update rechte installationszentrale backup drei generationen matter reset kopplung docker">
+            <div class="card bg-card border-0 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <span class="tag">5.4.4f</span>
+                        Was korrigiert das Stable-Release 5.4.4f?
+                    </h5>
+                    <ul>
+                        <li><strong>PV-Kurvenstart:</strong> Belegter physischer PV-Überschuss kann ein startbereites einphasiges Fahrzeug ohne unnötige Verzögerung über die Mindestleistung bringen. Der separat belegte batterieneutrale PV-Anteil wird nicht erneut durch einen bereits von der Speicheraufnahme beeinflussten Netzpunktwert verkleinert. Speicherbudget, gemeinsames Wallboxbudget sowie Hausanschluss-, Fahrzeug- und Hardwaregrenzen bleiben wirksam; Netzladen oder zusätzliche Batterieentladung werden dadurch nicht freigegeben.</li>
+                        <li><strong>Kein falscher 0-kW-Zwischenstand:</strong> Der Manager bindet das sichtbare Budget an Regelzyklus, Modus und Revision. Ein unvollständiger Übergang erscheint als <code>--</code>; ein bestätigtes Sicherheits-, Stopp- oder Regelbudget von 0&nbsp;kW bleibt sofort sichtbar. Alte Payloads bleiben darstellbar und blenden höchstens den ersten unerklärten Nullsatz nach einem positiven Budget aus.</li>
+                        <li><strong>Wallboxanzahl:</strong> Die Bezeichnung <code>Multi</code> allein erzeugt keine zweite Wallbox mehr. Ein vorhandenes leeres oder abgeschaltetes WB2-Typfeld verhindert auch intern Discovery, Instanziierung, Planung und Speicheranrechnung. Fehlt das Feld in einer echten Altinstallation vollständig, bleibt deren bisherige Dual-openWB-Autoerkennung erhalten.</li>
+                        <li><strong>Solar-Summenpunkt:</strong> Desktop und Mobil enthalten ein dynamisches Erzeugungsaggregat. Es erscheint, sobald Konfiguration, persistierte Topologie oder eine kohärente Live-Bilanz einen Zusatzwechselrichter belegt. Der externe Anteil wird nicht doppelt addiert; gespeicherte Nutzerpositionen bleiben erhalten.</li>
+                        <li><strong>Speicherplan und Direktvermarktung:</strong> Fehlende, unvollständige, ungültige oder planfremde SoC-Prognosen werden eindeutig benannt. Ersetzt eine Direktvermarktungsaktion die klassische Prognose, unterscheidet die Anzeige zwischen geplant, angefordert und bestätigt wirksam. Die bestätigte Wirkung muss kanonisch und konsistent an exakt dieselbe aktuelle Planrevision gebunden sein; sonst bleibt sie als nicht belegt markiert.</li>
+                        <li><strong>PV-Topologiedatei:</strong> Der Ziel-Updater stellt für die beibehaltene <code>external_pv_topology.json</code> den vorgesehenen gemeinsamen Lesemodus <code>0664</code> wieder her, ohne andere Rechteverträge zu lockern.</li>
+                        <li><strong>Backup-Zielbestand:</strong> Der Zielbestand beträgt maximal drei automatisch verwaltete System-Backup-Familien und separat maximal drei Web-Installer-Sicherungen. Schutzbindungen dürfen die Zielgrenzen vorübergehend überschreiten; ungeschützte Altbestände werden weiter sicher bereinigt und die offene Zielgrenze bleibt sichtbar.</li>
+                        <li><strong>Installationszentrale:</strong> Der private Downloadbereich bleibt geschützt. Direkter Ziel-Updater und Installationszentrale teilen denselben root-eigenen Lock; sichere Altmodi werden vor jeder Mutation normalisiert. Ein unsicherer Knoten bricht vor Produkt- und Dienständerungen kontrolliert ab, ein belegter Lock fordert zum Warten auf. Beim Dateiaustausch erhält nur der betriebene Produktbaum definierte Leserechte. Vor dem Dienststart prüft der Updater die PHP-Pfadauflösung und die Installer-Importkette real als <code>www-data</code>; Konfigurationen, Zugangsdaten, Laufzeitdaten und die private Service-Pythonumgebung bleiben separat geschützt. Liegt die Installation unter einem privaten Home-Pfad, ergänzt der Updater auf echten benötigten Vorfahren nur das Traversierrecht; Auflisten, Lesen und Schreiben bleiben gesperrt.</li>
+                        <li><strong>Matter-Kopplung:</strong> Die Matter-Seite kann die Kopplung über einen eng freigegebenen Bare-Metal- oder Docker-Auftrag zurücksetzen. Zufällige Stage-Reste sind unverbindlich und bleiben unangetastet; erst feste Prepare-, Quarantäne- und Receipt-Namen mit passendem Marker autorisieren die Fortsetzung. Das Parent-Receipt ist derselbe Marker-Inode unter einem zweiten Namen. Update-, Rechte- und HA-Läufe schützen auch den Stage-Präfix. Bare Metal bindet Konfiguration, Unit und Eigentümervertrag nach dem Reset erneut; Nutzer-<code>Aus</code> gewinnt und ein Resetfehler nach dem Stop lässt Matter gestoppt. Eine fremde Kollision bleibt unangetastet und wird mit einer konkreten Prüf- und Umbenennungsanweisung gemeldet. Docker zeigt keine Bare-Metal-systemd-Meldung. Historische Rechtefehler werden zuerst über den regulären Update-/Rechteweg behoben; ein älteres Docker-Image ohne den neuen Vertrag verbraucht den Auftrag nicht.</li>
+                        <li><strong>Wallbox bei Netzbezug:</strong> Gewöhnlicher Netzbezug wird zunächst bis zum physischen Mindeststrom ausgeregelt. Erst der gemeinsame Wh-Integralvertrag darf danach einen 3-zu-1-Phasenwechsel beziehungsweise Stopp auslösen; ein paralleler Direct-0-A-Pfad kann diese Reihenfolge nicht umgehen. Harte Nutzer-, Hausanschluss-, Reserve-, Daten- und Hardware-Vetos bleiben sofort wirksam.</li>
+                        <li><strong>DV-Fahrplan und SoC:</strong> Semantisch gleiche Viertelstunden erscheinen zusammenhängend, echte Preis-, Verkaufs-, Reserve-, Budget- und Vertragsgrenzen bleiben getrennt. Unbelegte Lücken werden als <code>EVIDENCE_LIMIT</code> sichtbar. Standard-PV, Standard-SoC und Tagessummen bleiben erhalten; die zusätzliche DV-SoC-Linie ist rein lesend und rechnet im bereits laufenden Slot nur mit der Restdauer. Sie erzeugt keine Auswahl, Befehlsfreigabe oder Hardwarewirkung.</li>
+                    </ul>
                 </div>
             </div>
         </div>
@@ -950,6 +975,7 @@ Was korrigiert das Stable-Release 5.4.1d?
                 <div class="faq-answer">
                     <p><strong>Aus / autonom:</strong> ist NGNA. E3DC-Control beobachtet die Wallbox, sendet aber keine laufenden Ladebefehle. Nur ein bewusster Wechsel auf <code>Aus</code> in der Wallbox-WebUI gibt die Wallbox einmalig auf ihre Grundeinstellung frei.</p>
                     <p><strong>PV-Kurve ruhig:</strong> lädt entlang der Speicher-Ladekurve mit Hysterese. Kurze Wolken und Lastwechsel werden geglättet, damit die Wallbox nicht taktet. Eine bereits laufende Ladung darf dafür kurzzeitig eine auf 75&nbsp;Wh begrenzte Batteriestützung nutzen; ein Kaltstart oder Phasenwechsel wird nicht aus dem Hausspeicher finanziert. Der Modus <strong>PV + Akku</strong> bleibt davon getrennt.</p>
+                    <p><strong>Kurze Anzeige von 0&nbsp;kW:</strong> Wird ein einzelner unplausibler Messwertsatz aus Sicherheitsgründen verworfen, kann das Wallboxbudget kurz 0&nbsp;kW anzeigen. Das ist nicht automatisch ein Ladeabbruch. Mit dem nächsten gültigen Messwertsatz wird neu geregelt; wiederholte Nullwerte sind dagegen ein Diagnosehinweis.</p>
                     <p><strong>Grundladung stabil:</strong> hält bewusst eine 6A-Grundladung, solange wbminSoC beziehungsweise das Speicherziel erreichbar bleibt. Das ist die Anti-Flatter-Variante für empfindliche Fahrzeuge und Wallboxen.</p>
                     <p><strong>PV + Akku bis Untergrenze:</strong> das Auto darf PV und Hausakku bis zur Hausakku-Reserve nutzen. Bis zu dieser Untergrenze lädt das Auto normal; Netz bleibt aus. Wenn die Wallbox mehr Leistung will, stützt der Akku darunter nur Hausverbrauch und Wärmepumpe.</p>
                     <p><strong>Sofort bis Preislimit:</strong> startet sofort mit PV und Speicher. Netzstrom wird nur genutzt, wenn der aktuelle Preis unter dem eingestellten Wallbox-Preislimit liegt. Damit wird kein Auto versehentlich zu extremen Preisen geladen.</p>
@@ -1143,7 +1169,7 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                 <div class="faq-answer">
                     <p>Wenn die Ladeleistung von evcc nicht erscheint, prüfen Sie folgende Punkte:</p>
                     <ul>
-                        <li><strong>Zweite Wallbox aktiv?</strong> Wenn Sie nur eine evcc-Wallbox haben, darf in der Konfiguration <code>wb2_ip</code> und <code>wb2_topic</code> <strong>nicht</strong> befüllt sein, sonst versucht das System evcc als Zweit-Wallbox zu behandeln.</li>
+                        <li><strong>Zweite Wallbox aktiv?</strong> Wenn nur eine evcc-Wallbox vorhanden ist, muss der aktuelle Typ für WB2 auf <strong>Keine / Aus</strong> stehen. In älteren Konfigurationen ohne diesen Typ-Schlüssel gelten eine befüllte <code>wb2_ip</code> oder ein <code>wb2_topic</code> weiterhin als positiver Bestandsbeleg.</li>
                         <li><strong>MQTT Topics:</strong> evcc sendet die Ladeleistung standardmäßig auf <code>evcc/loadpoints/1/chargePower</code>. Dieses Topic gehoert im Config Editor unter <strong>Schnittstellen & MQTT</strong> in <strong>Wallbox-Leistung per MQTT</strong> -> <code>wb_topic</code>, nicht in das Fahrzeug-SoC-Feld.</li>
                         <li><strong>SoC getrennt lassen:</strong> <code>evcc/loadpoints/1/vehicleSoc</code> bleibt bei <code>mqtt_hub_sub_soc_topic</code>. Ladeleistung und Fahrzeug-SoC sind zwei getrennte MQTT-Abos.</li>
                         <li><strong>Zugangsdaten:</strong> Falls Ihr Mosquitto-Broker passwortgeschützt ist, müssen die Daten für den direkten Wallbox-Leistungsbroker bei <code>wb_user</code> & <code>wb_pass</code> eingetragen werden.</li>
@@ -1185,9 +1211,9 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                     <i class="fas fa-chevron-down"></i>
                 </div>
                 <div class="faq-answer">
-                    Das Dashboard blendet die zweite Wallbox automatisch ein, sobald in der Konfiguration entweder eine <strong>IP-Adresse</strong> bei <code>wb2_ip</code> oder ein <strong>Topic</strong> bei <code>wb2_topic</code> hinterlegt ist.
+                    Das Dashboard blendet die zweite Wallbox bei einer positiven WB2-Typkonfiguration oder frischen Laufzeitdaten für Ladepunkt 2 ein. Nur bei älteren Konfigurationen ohne aktuellen Typ-Schlüssel gelten eine <strong>IP-Adresse</strong> bei <code>wb2_ip</code> oder ein <strong>Topic</strong> bei <code>wb2_topic</code> als Bestandsbeleg.
                     <br><br>
-                    <strong>Lösung:</strong> Leeren Sie diese beiden Felder im Konfigurations-Editor, wenn Sie nur eine Ladestation besitzen.
+                    <strong>Lösung:</strong> Stellen Sie den Typ von WB2 im Konfigurations-Editor ausdrücklich auf <strong>Keine / Aus</strong>. Diese Nutzerwahl hat Vorrang vor alten IP-, Topic-, Detail-, Slot-, Typ- und Prioritätswerten.
                 </div>
             </div>
         </div>
@@ -1363,6 +1389,7 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                 </div>
                 <div class="faq-answer">
                     Das System legt Update- und Wiederherstellungsbackups in einem konfigurierten Sicherungsverzeichnis außerhalb des Installationsbaums ab. Jedes vollständige Backup besitzt ein Manifest und SHA-256-Prüfsummen; leere oder unlesbare Sicherungen gelten als Fehler.
+                    <p>Der Zielbestand beträgt maximal drei automatisch verwaltete System-Backup-Familien und separat maximal drei Web-Installer-Sicherungen. Eine ruhende Daten-Nachsicherung zählt zusammen mit ihrem Vollbackup als eine Familie. Schutzbindungen dürfen die Zielgrenzen vorübergehend überschreiten; ungeschützte Altbestände werden weiter sicher bereinigt, die offene Zielgrenze bleibt sichtbar und wird bei der nächsten sicheren Backup-Bereinigung erneut angewendet.</p>
                     <p>Für ein zusätzliches externes Ziel wählen Sie im Installer <em>Cloud-/Rclone-Backup</em>. Konfiguration, Statistikdatenbank, Matter-Kopplungsdaten und persistente Betriebszustände werden nur dann als gesichert gemeldet, wenn die Pflichtdateien lesbar geprüft wurden.</p>
                 </div>
             </div>
@@ -1401,7 +1428,8 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                         <li>Über das Dashboard (Kachel Konfiguration -> "Update suchen").</li>
                         <li>Bei aktuellen Ständen direkt über den Menüpunkt <em>Update</em> im Installer.</li>
                     </ol>
-                    <p>Weboberfläche, Konsole und Installer-Menü starten denselben root-eigenen Hintergrundauftrag. Die automatische Updateprüfung verwendet dieselbe Stable-Quelle und informiert nur über einen neuen Stand. Der lokale Git-, Rechte- oder Änderungszustand ist keine vorgelagerte Startautorität. Der heruntergeladene Ziel-Updater erstellt das Vollbackup, stoppt die betroffenen Dienste einmal kurz, ersetzt Dateien und Rechte und bestätigt danach den Wiederanlauf.</p>
+                    <p>Weboberfläche, Konsole und Installer-Menü starten denselben root-eigenen Hintergrundauftrag und verwenden gemeinsam <code>/run/lock/e3dc-control/update.lock</code>. Sichere root-eigene Altmodi <code>0755</code>/<code>0644</code> werden vor jeder Mutation auf <code>0700</code>/<code>0600</code> normalisiert. Ein unsicherer Lockknoten bricht vor Produkt- oder Dienständerungen kontrolliert ab; bei einem belegten Lock muss der laufende Update- oder Backupauftrag zuerst beendet werden. Die automatische Updateprüfung verwendet dieselbe Stable-Quelle und informiert nur über einen neuen Stand. Der lokale Git-, Rechte- oder Änderungszustand ist keine vorgelagerte Startautorität. Der heruntergeladene Ziel-Updater erstellt das Vollbackup, stoppt die betroffenen Dienste einmal kurz, ersetzt Dateien und Rechte und bestätigt danach den Wiederanlauf.</p>
+                    <p><strong>Private Vorbereitung, lesbarer Betrieb:</strong> Der private Downloadbereich bleibt root-eigen mit <code>0700</code>/<code>0600</code>. Beim Dateiaustausch erhält nur der betriebene Produktbaum definierte Live-Rechte. Konfigurationen, Zugangsdaten und Laufzeitdaten behalten ihre strengeren Regeln. Vor dem Dienststart müssen PHP-Pfadauflösung und Installer-Importkette den gebundenen Pfad in einer bereinigten Umgebung als <code>www-data</code> lesen können; die private Service-Pythonumgebung wird dafür nicht geöffnet. Unter einem privaten Home-Pfad ergänzt der Updater auf echten benötigten Vorfahren nur das Traversierrecht; Auflisten, Lesen und Schreiben bleiben gesperrt.</p>
                     <p>Für eine heterogene Altinstallation genügt genau eine auf den Raspberry Pi kopierte Datei. Im Ablageverzeichnis wird sie ohne Pfad- oder Rollenargument gestartet:</p>
                     <pre>sudo /bin/sh ./e3dc-update-bootstrap</pre>
                     <p>Der damit gestartete veröffentlichte Updatepfad ermittelt Installationsordner, Installationsbenutzer und Anlagenrolle selbst und arbeitet im Hintergrund. Der Start gibt Status- und Protokollbefehl aus; das Terminal kann danach geschlossen werden. Bei mehreren gleichrangig erkannten Installationen oder einer widersprüchlichen Rolle stoppt der Auftrag mit Diagnose, statt zu raten.</p>

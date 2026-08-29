@@ -15,6 +15,7 @@ import logging
 import re
 import base64
 import math
+import hashlib
 
 import requests as _requests
 
@@ -208,11 +209,15 @@ def discover_openwb_chargepoints(ip, timeout=3.0):
         return []
 
     found = []
+    seen_ids = set()
     for key, value in payload.items():
         match = re.match(r"^chargepoint_(\d+)$", str(key))
         if not match or not isinstance(value, dict):
             continue
         cp_id = int(match.group(1))
+        if cp_id <= 0 or cp_id in seen_ids:
+            continue
+        seen_ids.add(cp_id)
         name = str(value.get("config_name") or value.get("name") or f"Ladepunkt {cp_id}").strip()
         found.append({
             "id": cp_id,
@@ -660,16 +665,24 @@ class OpenWBCharger(WallboxDriver):
         import re
         cfg_prefix = config.get(f"wb{wb_id}_topic_prefix", "")
         self.cp_id = ""
+        cp_source = ""
         if cfg_prefix:
             m = re.search(r'(?:chargepoint|lp)[/\\](\d+)', cfg_prefix)
             if m:
-                self.cp_id = int(m.group(1))
-        # Alternativ direkt aus Config
-        cp_cfg = config.get(f"wb_native_cp_id", None)
-        if cp_cfg is not None and str(cp_cfg).strip().isdigit():
-            self.cp_id = int(cp_cfg)
-        elif cp_cfg == "":
-            self.cp_id = ""
+                prefix_cp = int(m.group(1))
+                if prefix_cp > 0:
+                    self.cp_id = prefix_cp
+                    cp_source = "config_topic_prefix"
+        # Der historische globale CP-Key gehört ausschließlich zu WB1. Ein
+        # per-Slot-Prefix hat immer Vorrang; sonst würden WB1 und WB2 trotz
+        # unterschiedlicher Prefixe denselben physischen Ladepunkt ansteuern.
+        if self.cp_id == "" and int(wb_id or 1) == 1:
+            cp_cfg = config.get("wb_native_cp_id", None)
+            if cp_cfg is not None and str(cp_cfg).strip().isdigit():
+                cp_int = int(cp_cfg)
+                if cp_int > 0:
+                    self.cp_id = cp_int
+                    cp_source = "config_global_cp_id"
 
         self.cp_suffix = f"/{self.cp_id}" if self.cp_id != "" else ""
         self.native_prefix   = f"openWB/chargepoint{self.cp_suffix}/get"
@@ -760,6 +773,67 @@ class OpenWBCharger(WallboxDriver):
             or ""
         ).strip()
         self.topic_prefix    = cfg_prefix or self.native_prefix
+        discovery_contract = config.get(
+            f"_wb{int(wb_id or 1)}_openwb_discovery_contract",
+            {},
+        )
+        discovery_contract = (
+            dict(discovery_contract)
+            if isinstance(discovery_contract, dict)
+            else {}
+        )
+        discovery_cp = discovery_contract.get("cp_id")
+        try:
+            discovery_cp = int(discovery_cp)
+        except (TypeError, ValueError):
+            discovery_cp = 0
+        discovery_valid = bool(
+            discovery_contract.get("valid") is True
+            and discovery_cp > 0
+            and self.cp_id == discovery_cp
+            and float(discovery_contract.get("detected_at", 0.0) or 0.0) > 0.0
+        )
+        self._auto_discovery_bound = discovery_valid
+        self._auto_discovery_status_confirmed = False
+        if discovery_valid:
+            cp_source = str(
+                discovery_contract.get("source")
+                or "manager_simpleapi_discovery"
+            )
+            discovery_contract = {
+                "schema_version": "openwb_chargepoint_discovery_v1",
+                "valid": True,
+                "source": cp_source,
+                "detected_at": int(
+                    float(discovery_contract.get("detected_at", 0.0) or 0.0)
+                ),
+                "controller_identity": str(
+                    discovery_contract.get("controller_identity") or ""
+                ),
+                "cp_id": discovery_cp,
+                "peer_cp_id": int(
+                    float(discovery_contract.get("peer_cp_id", 0) or 0)
+                ),
+                "status_confirmed": False,
+                "status_confirmed_ts": 0,
+            }
+        else:
+            discovery_contract = {}
+        self.state["cp_id"] = self.cp_id
+        self.state["chargepoint_detection_source"] = cp_source
+        self.state["chargepoint_discovery_contract"] = discovery_contract
+        # Ein automatisch hinzugefügter WB2 beginnt ohne Schreibautorität. Der
+        # Manager hebt diese Sperre erst nach frischem Status und nachweislich
+        # eindeutiger Befehlsidentität auf.
+        self._physical_output_blocked = bool(
+            discovery_valid and int(wb_id or 1) == 2
+        )
+        self._physical_output_block_reason = (
+            "auto_discovery_waits_for_fresh_distinct_actuator"
+            if self._physical_output_blocked
+            else ""
+        )
+        self._physical_output_last_log_ts = 0.0
         self._last_command_key = None
         self._last_command_ts = 0.0
         self._primary_pending_current_amp = None
@@ -836,6 +910,120 @@ class OpenWBCharger(WallboxDriver):
             f"CP={self.cp_id} (vorher {old_cp if old_cp != '' else 'AUTO'})"
         )
         return True
+
+    @staticmethod
+    def _identity_digest(material):
+        return "sha256:" + hashlib.sha256(
+            str(material or "").encode("utf-8")
+        ).hexdigest()
+
+    def physical_output_identity_contract(self):
+        """Beschreibt den tatsächlich verwendeten openWB-Schreibausgang.
+
+        Der Vertrag leitet sich ausschließlich aus den bereits implementierten
+        SimpleAPI-, HTTP-V1- und Modbus-Pfaden ab. Er erfindet keine Discovery
+        und keinen Geräteendpunkt.
+        """
+        host = str(self.ip or "").strip().lower()
+        controller_identity = (
+            self._identity_digest("openwb-controller|" + host)
+            if host
+            else ""
+        )
+        try:
+            cp_id = int(self.cp_id)
+        except (TypeError, ValueError):
+            cp_id = 0
+        role = str(
+            self.state.get("effective_role")
+            or self._configured_role()
+            or ""
+        ).strip().lower()
+        endpoint_kind = ""
+        material = ""
+        endpoint_detail = ""
+        if self.primary_mode_enabled:
+            endpoint_kind = "primary_simpleapi"
+            if host and cp_id > 0:
+                material = f"{host}|simpleapi|chargepoint|{cp_id}"
+                endpoint_detail = f"chargepoint:{cp_id}"
+        elif self.modbus_enabled:
+            endpoint_kind = "secondary_modbus"
+            try:
+                port = int(self.modbus_port)
+                unit = int(self.modbus_unit)
+                current_register = int(self._modbus_register(10171))
+            except (TypeError, ValueError, OverflowError):
+                port = unit = current_register = -1
+            if host and 0 < port <= 65535 and 0 <= unit <= 247 and current_register >= 0:
+                material = (
+                    f"{host}|modbus|{port}|{unit}|register|"
+                    f"{current_register}"
+                )
+                endpoint_detail = (
+                    f"unit:{unit}:register:{current_register}"
+                )
+        else:
+            endpoint_kind = "secondary_http_v1"
+            try:
+                duo_num = int(self.api_duo_num)
+            except (TypeError, ValueError, OverflowError):
+                duo_num = -1
+            if host and duo_num >= 0:
+                material = (
+                    f"{host}|http_v1|internal_chargepoint|{duo_num}|"
+                    "set_current"
+                )
+                endpoint_detail = f"internal_chargepoint:{duo_num}"
+
+        discovery = self.state.get("chargepoint_discovery_contract")
+        discovery = discovery if isinstance(discovery, dict) else {}
+        binding_valid = bool(
+            not self._auto_discovery_bound
+            or self._auto_discovery_status_confirmed
+        )
+        contract = {
+            "schema_version": "openwb_physical_output_identity_v1",
+            "valid": bool(material and binding_valid),
+            "identity": self._identity_digest(material) if material else "",
+            "controller_identity": controller_identity,
+            "endpoint_kind": endpoint_kind,
+            "endpoint_detail": endpoint_detail,
+            "effective_role": role,
+            "cp_id": cp_id,
+            "chargepoint_detection_source": str(
+                self.state.get("chargepoint_detection_source") or ""
+            ),
+            "auto_discovery_bound": bool(self._auto_discovery_bound),
+            "auto_discovery_status_confirmed": bool(
+                self._auto_discovery_status_confirmed
+            ),
+            "discovery_source": str(discovery.get("source") or ""),
+        }
+        self.state["physical_output_identity"] = dict(contract)
+        return contract
+
+    def _physical_output_write_allowed(self, action):
+        if not bool(getattr(self, "_physical_output_blocked", False)):
+            return True
+        now = time.time()
+        if now - float(self._physical_output_last_log_ts or 0.0) >= 30.0:
+            self._physical_output_last_log_ts = now
+            logger.warning(
+                "[WB%d] openWB-Schreibausgang %s blockiert: %s",
+                int(self.wb_id or 0),
+                str(action or "command"),
+                str(
+                    self._physical_output_block_reason
+                    or "physical_output_identity_not_unique"
+                ),
+            )
+        self.state["physical_output_blocked"] = True
+        self.state["physical_output_block_reason"] = str(
+            self._physical_output_block_reason
+            or "physical_output_identity_not_unique"
+        )
+        return False
 
     def _http_headers(self, extra=None):
         """Gemeinsame HTTP-Header für openWB simpleAPI/V1, optional mit Basic Auth."""
@@ -1264,6 +1452,8 @@ class OpenWBCharger(WallboxDriver):
         """Sendet Steuerbefehl per HTTP POST an openWB simpleapi.php."""
         import urllib.request
         import urllib.error
+        if not self._physical_output_write_allowed("simpleapi"):
+            return False
         if not command_gate.allow_command(
             self,
             action="openwb_http_post",
@@ -1514,6 +1704,8 @@ class OpenWBCharger(WallboxDriver):
         """Schreibt/liest openWB HTTP-API V1 Topics (Port 8443)."""
         import ssl
         import urllib.request
+        if not self._physical_output_write_allowed("http_v1"):
+            return None
         if not command_gate.allow_command(
             self,
             action="openwb_http_v1_post",
@@ -1726,6 +1918,8 @@ class OpenWBCharger(WallboxDriver):
         mbap = struct.pack(">HHHB", transaction_id, 0, len(pdu) + 1, int(self.modbus_unit))
         is_write = int(function_code) == 6
         write_payload = {"function_code": int(function_code), "address": int(address), "value": int(value_or_count)}
+        if is_write and not self._physical_output_write_allowed("modbus"):
+            return b""
         if is_write and not command_gate.allow_command(
             self,
             action="openwb_modbus_write_connect",
@@ -1979,7 +2173,26 @@ class OpenWBCharger(WallboxDriver):
             return False
         if self.cp_id == "" and detected_cp_id is not None:
             self._set_runtime_chargepoint_id(detected_cp_id)
+        if (
+            self._auto_discovery_bound
+            and self.cp_id != ""
+            and int(self.cp_id) == int(
+                (self.state.get("chargepoint_discovery_contract") or {}).get(
+                    "cp_id", 0
+                )
+                or 0
+            )
+        ):
+            confirmed_ts = int(time.time())
+            self._auto_discovery_status_confirmed = True
+            discovery = dict(
+                self.state.get("chargepoint_discovery_contract") or {}
+            )
+            discovery["status_confirmed"] = True
+            discovery["status_confirmed_ts"] = confirmed_ts
+            self.state["chargepoint_discovery_contract"] = discovery
         self._apply_role_detection(cp_data)
+        self.physical_output_identity_contract()
 
         plug_state = self._bool_value(cp_data.get("plug_state"), self.state.get("plug_state", False))
         charge_state = self._bool_value(cp_data.get("charge_state"), self.state.get("charge_state", False))
@@ -2273,6 +2486,10 @@ class OpenWBCharger(WallboxDriver):
             'command_blocked_until': int(self.state.get('command_blocked_until', 0) or 0),
             'connected_phases':   self.state.get('connected_phases', 0),
             'chargepoint_detection_source': self.state.get('chargepoint_detection_source', ''),
+            'chargepoint_discovery_contract': self.state.get('chargepoint_discovery_contract', {}),
+            'physical_output_identity': self.physical_output_identity_contract(),
+            'physical_output_blocked': bool(getattr(self, '_physical_output_blocked', False)),
+            'physical_output_block_reason': str(getattr(self, '_physical_output_block_reason', '') or ''),
             'daily_imported_wh': round(self.state['daily_imported_wh'], 0),
             'imported_total_wh': round(self.state['imported_total_wh'], 0),
             'chargemode':        self.state['chargemode_str'],
@@ -5486,10 +5703,15 @@ DISABLED_WALLBOX_TYPES = {
     "none",
     "disabled",
     "deaktiviert",
+    "aus",
     "keine",
     "keine_wallbox",
     "no_wallbox",
     "off",
+    "false",
+    "no",
+    "0",
+    "-1",
 }
 
 def create_charger(wb_type, ip, wb_id, config=None):

@@ -943,6 +943,7 @@ def _bind_passive_normal_identity(decision, mode):
         and str(source.get("dv_target_state") or "").upper() == "NORMAL"
         and str(source.get("source_action") or "") == "eco_plus_house_supply"
         and source.get("executable_action") is None
+        and source.get("execution_window") is None
         and str(selected.get("action") or "") == "eco_plus_house_supply"
         and min(
             start_ts,
@@ -969,6 +970,7 @@ def _bind_passive_normal_identity(decision, mode):
     source["policy_action_id"] = binding["policy_action_id"]
     source["policy_slot_id"] = binding["policy_slot_id"]
     source["passive_normal_binding"] = binding
+    source["execution_window_match_count"] = 0
     return source
 
 
@@ -2760,8 +2762,15 @@ def _build_policy_decision_legacy(
                 "end_ts": headroom_window.get("end_ts"),
                 "window_id": _policy_window_id(headroom_window),
                 "next_charge_window_start_ts": headroom_window.get("negative_headroom_next_start_ts"),
-                "headroom_export_selected": bool(headroom_window.get("headroom_export_selected")),
-                "headroom_export_budget_wh": headroom_window.get("headroom_export_budget_wh"),
+                # Ohne positive Exportfreigabe ist dies nur noch ein
+                # wirkungsloser Speicherplatz-Hold. Die rohe Allokation bleibt
+                # Diagnose, darf aber keine aktive Projektion vortäuschen.
+                "headroom_export_selected": active_headroom_export,
+                "headroom_export_budget_wh": (
+                    headroom_window.get("headroom_export_budget_wh")
+                    if active_headroom_export
+                    else 0.0
+                ),
                 "headroom_required_wh": headroom_window.get("negative_headroom_required_wh"),
                 "headroom_free_before_wh": headroom_window.get("negative_headroom_free_before_wh"),
                 "headroom_additional_wh": headroom_window.get("negative_headroom_additional_wh"),
@@ -3210,8 +3219,16 @@ def _enrich_policy_candidate_contract(decision, windows, now_ms):
             continue
         execution_matches.append(window)
 
+    target_state = str(result.get("dv_target_state") or "").strip().upper()
+    budget = result.get("storage_budget") if isinstance(result.get("storage_budget"), dict) else {}
+    execution_required = bool(
+        target_state in DIRECT_MARKETING_ACTIVE_TARGETS
+        and result.get("commands_allowed")
+        and not result.get("blocked")
+        and selected_action
+    )
     execution_window = None
-    if len(execution_matches) == 1:
+    if execution_required and len(execution_matches) == 1:
         plan_window = execution_matches[0]
         execution_window = {
             "contract_version": 1,
@@ -3229,7 +3246,11 @@ def _enrich_policy_candidate_contract(decision, windows, now_ms):
             "source": "active_plan_window",
         }
     result["execution_window"] = execution_window
-    result["execution_window_match_count"] = len(execution_matches)
+    # Kandidaten bleiben sichtbar, passive NORMAL-/HOLD-Slots erhalten aber
+    # absichtlich keinen Hardwarevertrag.
+    result["execution_window_match_count"] = (
+        len(execution_matches) if execution_required else 0
+    )
     result["candidate_actions"] = candidate_actions
     result["selected_candidate"] = dict(selected) if selected else None
     result["source_action"] = selected_action or None
@@ -3242,14 +3263,6 @@ def _enrich_policy_candidate_contract(decision, windows, now_ms):
         if action != selected_action
     ]
 
-    target_state = str(result.get("dv_target_state") or "").strip().upper()
-    budget = result.get("storage_budget") if isinstance(result.get("storage_budget"), dict) else {}
-    execution_required = bool(
-        target_state in DIRECT_MARKETING_ACTIVE_TARGETS
-        and result.get("commands_allowed")
-        and not result.get("blocked")
-        and selected_action
-    )
     if execution_required and execution_window is None:
         budget = dict(budget)
         budget["charge_budget_w"] = 0
@@ -3641,12 +3654,51 @@ def _build_charge_block_wait_policy_slots(
         ]
 
     slot_decisions = [(slot, decisions_for_slot(slot)) for slot in slots]
+
+    def passive_normal_slot(slot, source_reason):
+        neutral = _policy_empty_decision("", {}, flags)
+        window_id = "passive-normal:%d" % slot["start_ts"]
+        neutral.update({
+            "commands_allowed": False,
+            "dv_target_state": "NORMAL",
+            "blocked": False,
+            "block_reason": (
+                "Hausversorgung: Speicherregelung bleibt im normalen "
+                "AUTO-Pfad"
+            ),
+            "start_ts": slot["start_ts"],
+            "end_ts": slot["end_ts"],
+            "source_action": "eco_plus_house_supply",
+            "source_reason": source_reason,
+            "executable_action": None,
+            "execution_window": None,
+            "selected_window": {
+                "action": "eco_plus_house_supply",
+                "reason": source_reason,
+                "start_ts": slot["start_ts"],
+                "end_ts": slot["end_ts"],
+                "window_id": window_id,
+            },
+        })
+        return neutral
+
     waits = []
     synthesized_neutral_slots = []
     neutral_slots = 0
     existing_action_slots = 0
     action_gaps = 0
     for slot, matches in slot_decisions:
+        partial_matches = [
+            item for item in decisions
+            if safe_int(item.get("start_ts"), 0) < slot["end_ts"]
+            and safe_int(item.get("end_ts"), 0) > slot["start_ts"]
+            and item not in matches
+        ]
+        if partial_matches:
+            # Ein nur teilweise überlappender Aktionsvertrag darf nicht als
+            # scheinbar unbesetzter AUTO-Slot neutralisiert werden.
+            action_gaps += 1
+            continue
         if len(matches) > 1:
             # Eine überlappende Policy-Auswahl wäre eine zweite implizite
             # Entscheiderkante. Sie bleibt ein sichtbarer Safety-Gap.
@@ -3657,26 +3709,9 @@ def _build_charge_block_wait_policy_slots(
             # Ein vorhandener, vollständig validierter 900-s-Inputslot ohne
             # gerichtete Policy-Aktion ist semantisch Hausversorgung/AUTO.
             # Er ist keine Lücke und rechtfertigt keinen Hardware-Intent.
-            neutral = _policy_empty_decision("", {}, flags)
-            neutral.update({
-                "commands_allowed": False,
-                "dv_target_state": "NORMAL",
-                "blocked": False,
-                "block_reason": "Hausversorgung: Speicherregelung bleibt im normalen AUTO-Pfad",
-                "start_ts": slot["start_ts"],
-                "end_ts": slot["end_ts"],
-                "source_action": "eco_plus_house_supply",
-                "source_reason": "neutral_dv_slot",
-                "executable_action": None,
-                "execution_window": None,
-                "selected_window": {
-                    "action": "eco_plus_house_supply",
-                    "reason": "neutral_dv_slot",
-                    "start_ts": slot["start_ts"],
-                    "end_ts": slot["end_ts"],
-                },
-            })
-            synthesized_neutral_slots.append(neutral)
+            synthesized_neutral_slots.append(
+                passive_normal_slot(slot, "neutral_dv_slot")
+            )
             neutral_slots += 1
             continue
         target = str(decision.get("dv_target_state") or "").upper()
@@ -3728,13 +3763,56 @@ def _build_charge_block_wait_policy_slots(
         if (
             target not in {"HOLD", "NORMAL"}
             and not headroom_hold
-        ) or decision.get("blocked") is True:
+        ):
             action_gaps += 1
             continue
         if target in {"HOLD", "NORMAL"} and not headroom_hold:
+            bound_passive = _bind_passive_normal_identity(decision, mode)
+            if bound_passive.get("passive_normal_binding"):
+                neutral_slots += 1
+                continue
+            execution = decision.get("execution_window")
+            non_executable_policy = bool(
+                decision.get("commands_allowed") is False
+                and decision.get("executable_action") is None
+                and execution is None
+                and _policy_contract_zero(
+                    storage_budget.get("charge_budget_w")
+                )
+                and _policy_contract_zero(
+                    storage_budget.get("export_budget_w")
+                )
+                and (
+                    target == "HOLD"
+                    or decision.get("blocked") is False
+                )
+            )
+            if not non_executable_policy:
+                action_gaps += 1
+                continue
+            # Die wirtschaftliche Kandidatenentscheidung bleibt im lesenden
+            # Plan sichtbar. Sie ist durch fehlende Freigabe, Nullbudget und
+            # fehlenden Ausführungsvertrag bereits ein passiver AUTO-Slot;
+            # ein Ersatz durch Hausversorgung würde nur die Erklärung und
+            # UI-Kandidateninformation verlieren.
             neutral_slots += 1
             continue
+        if not _headroom_hold_source_contract_valid(decision):
+            # Ein unvollständig gebundener Headroom-Ursprung darf nicht durch
+            # neu erzeugte, befehlsfähige Warteslots aufgewertet werden.
+            action_gaps += 1
+            continue
         window_id = "charge-block-wait:%d" % slot["start_ts"]
+        source_selected = (
+            decision.get("selected_window")
+            if isinstance(decision.get("selected_window"), dict)
+            else {}
+        )
+        source_window_id = _policy_window_id(source_selected) or str(
+            decision.get("window_id") or ""
+        )
+        source_start_ts = safe_int(decision.get("start_ts"), 0)
+        source_end_ts = safe_int(decision.get("end_ts"), 0)
         selected_window = {
             "action": "direct_marketing_charge_block_wait",
             "reason": "headroom_reservation_hold",
@@ -3744,6 +3822,13 @@ def _build_charge_block_wait_policy_slots(
         }
         wait = dict(decision)
         wait.update({
+            "start_ts": slot["start_ts"],
+            "end_ts": slot["end_ts"],
+            "window_id": window_id,
+            "window_origin_start_ts": slot["start_ts"],
+            "headroom_source_window_id": source_window_id,
+            "headroom_source_start_ts": source_start_ts,
+            "headroom_source_end_ts": source_end_ts,
             "commands_allowed": True,
             "dv_target_state": "CHARGE_BLOCK_WAIT",
             "storage_budget": {
@@ -3789,8 +3874,319 @@ def _build_charge_block_wait_policy_slots(
         "reason": "ok" if action_gaps == 0 else "typed_action_coverage_incomplete",
     })
     if not report["complete"]:
-        return [], [], report
+        # Bereits vollständig unberührte Passivslots sind eigenständige,
+        # wirkungslose Verträge. Eine getrennte Aktionslücke darf sie nicht
+        # global entfernen; sie bleibt über den unvollständigen Report und
+        # den fehlenden Aktionsvertrag weiterhin fail-closed sichtbar.
+        return [], synthesized_neutral_slots, report
     return waits, synthesized_neutral_slots, report
+
+
+def _policy_contract_zero(value):
+    """Akzeptiert für Nullbudgets nur endliche, typisierte Zahlen."""
+
+    return bool(
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and float(value) == 0.0
+    )
+
+
+def _headroom_hold_source_contract_valid(policy):
+    """Validiert den kanonischen Ursprung eines Headroom-Warteslots."""
+
+    if not isinstance(policy, dict):
+        return False
+    selected = (
+        policy.get("selected_window")
+        if isinstance(policy.get("selected_window"), dict)
+        else {}
+    )
+    execution = (
+        policy.get("execution_window")
+        if isinstance(policy.get("execution_window"), dict)
+        else {}
+    )
+    budget = (
+        policy.get("storage_budget")
+        if isinstance(policy.get("storage_budget"), dict)
+        else {}
+    )
+    start_ts = safe_int(policy.get("start_ts"), 0)
+    end_ts = safe_int(policy.get("end_ts"), 0)
+    selected_start_ts = safe_int(selected.get("start_ts"), 0)
+    selected_end_ts = safe_int(selected.get("end_ts"), 0)
+    execution_start_ts = safe_int(execution.get("start_ts"), 0)
+    execution_end_ts = safe_int(execution.get("end_ts"), 0)
+    plan_start_ts = safe_int(execution.get("plan_window_start_ts"), 0)
+    plan_end_ts = safe_int(execution.get("plan_window_end_ts"), 0)
+    selected_window_id = str(selected.get("window_id") or "")
+    execution_window_id = str(execution.get("window_id") or "")
+    execution_plan_window_id = str(execution.get("plan_window_id") or "")
+    action = "eco_plus_negative_headroom_hold"
+    return bool(
+        policy.get("schema") == POLICY_SCHEMA
+        and policy.get("commands_allowed") is True
+        and policy.get("blocked") is False
+        and str(policy.get("dv_target_state") or "").upper()
+        == "HEADROOM_EXPORT"
+        and str(policy.get("source_action") or "") == action
+        and str(policy.get("executable_action") or "") == action
+        and str(selected.get("action") or "") == action
+        and str(execution.get("action") or "") == action
+        and direct_marketing_typed_int_equals(
+            execution.get("contract_version"),
+            1,
+        )
+        and direct_marketing_typed_int_equals(
+            policy.get("execution_window_match_count"),
+            1,
+        )
+        and execution.get("source") == "active_plan_window"
+        and selected_window_id
+        and execution_window_id == selected_window_id
+        and execution_plan_window_id == selected_window_id
+        and selected_start_ts <= start_ts < end_ts <= selected_end_ts
+        and execution_start_ts <= start_ts < end_ts <= execution_end_ts
+        and plan_start_ts <= start_ts < end_ts <= plan_end_ts
+        and budget.get("headroom_hold_active") is True
+        and _policy_contract_zero(budget.get("charge_budget_w"))
+        and _policy_contract_zero(budget.get("export_budget_w"))
+    )
+
+
+def _charge_block_wait_contract_valid(wait):
+    """Validiert den vollständigen, befehlsfähigen Warteslot-Vertrag."""
+
+    if not isinstance(wait, dict):
+        return False
+    start_ts = safe_int(wait.get("start_ts"), 0)
+    end_ts = safe_int(wait.get("end_ts"), 0)
+    selected = (
+        wait.get("selected_window")
+        if isinstance(wait.get("selected_window"), dict)
+        else {}
+    )
+    execution = (
+        wait.get("execution_window")
+        if isinstance(wait.get("execution_window"), dict)
+        else {}
+    )
+    budget = (
+        wait.get("storage_budget")
+        if isinstance(wait.get("storage_budget"), dict)
+        else {}
+    )
+    action = "direct_marketing_charge_block_wait"
+    window_id = str(wait.get("window_id") or "")
+    selected_window_id = str(selected.get("window_id") or "")
+    execution_window_id = str(execution.get("window_id") or "")
+    execution_plan_window_id = str(execution.get("plan_window_id") or "")
+    return bool(
+        wait.get("schema") == POLICY_SCHEMA
+        and wait.get("commands_allowed") is True
+        and wait.get("blocked") is False
+        and str(wait.get("dv_target_state") or "").upper()
+        == "CHARGE_BLOCK_WAIT"
+        and str(wait.get("source_action") or "") == action
+        and str(wait.get("executable_action") or "") == action
+        and str(selected.get("action") or "") == action
+        and str(execution.get("action") or "") == action
+        and end_ts - start_ts == SLOT_MS
+        and safe_int(selected.get("start_ts"), 0) == start_ts
+        and safe_int(selected.get("end_ts"), 0) == end_ts
+        and safe_int(execution.get("start_ts"), 0) == start_ts
+        and safe_int(execution.get("end_ts"), 0) == end_ts
+        and safe_int(execution.get("plan_window_start_ts"), 0) == start_ts
+        and safe_int(execution.get("plan_window_end_ts"), 0) == end_ts
+        and direct_marketing_typed_int_equals(
+            execution.get("contract_version"),
+            1,
+        )
+        and direct_marketing_typed_int_equals(
+            wait.get("execution_window_match_count"),
+            1,
+        )
+        and execution.get("source") == "active_plan_window"
+        and window_id
+        and selected_window_id == window_id
+        and execution_window_id == window_id
+        and execution_plan_window_id == window_id
+        and _policy_contract_zero(budget.get("charge_budget_w"))
+        and _policy_contract_zero(budget.get("export_budget_w"))
+    )
+
+
+def _charge_block_wait_replaces_policy(policy, wait_slots):
+    """Belegt die vollständige, slotgenaue Ersetzung eines Headroom-Holds."""
+
+    if not _headroom_hold_source_contract_valid(policy):
+        return False
+    budget = (
+        policy.get("storage_budget")
+        if isinstance(policy.get("storage_budget"), dict)
+        else {}
+    )
+    target = str(policy.get("dv_target_state") or "").upper()
+    headroom_hold = bool(
+        target == "HEADROOM_EXPORT"
+        and (
+            budget.get("headroom_hold_active") is True
+            or safe_float(budget.get("export_budget_w"), 0.0) < 300.0
+        )
+    )
+    if not headroom_hold:
+        return False
+    start_ts = safe_int(policy.get("start_ts"), 0)
+    end_ts = safe_int(policy.get("end_ts"), 0)
+    if start_ts <= 0 or end_ts <= start_ts:
+        return False
+    selected = (
+        policy.get("selected_window")
+        if isinstance(policy.get("selected_window"), dict)
+        else {}
+    )
+    source_window_id = _policy_window_id(selected) or str(
+        policy.get("window_id") or ""
+    )
+    source_replacements = [
+        item
+        for item in (wait_slots or [])
+        if isinstance(item, dict)
+        and safe_int(item.get("headroom_source_start_ts"), 0) == start_ts
+        and safe_int(item.get("headroom_source_end_ts"), 0) == end_ts
+        and str(item.get("headroom_source_window_id") or "")
+        == source_window_id
+    ]
+    if not source_replacements or not all(
+        _charge_block_wait_contract_valid(item)
+        for item in source_replacements
+    ):
+        return False
+    replacements = sorted(
+        (
+            safe_int(item.get("start_ts"), 0),
+            safe_int(item.get("end_ts"), 0),
+        )
+        for item in source_replacements
+    )
+    if not replacements or replacements[0][0] != start_ts:
+        return False
+    cursor = start_ts
+    for slot_start, slot_end in replacements:
+        if slot_start != cursor or slot_end - slot_start != SLOT_MS:
+            return False
+        cursor = slot_end
+    return cursor == end_ts
+
+
+def _replace_charge_block_wait_source_policies(policy_timeline, wait_slots):
+    """Ersetzt ausschließlich vollständig materialisierte Headroom-Holds."""
+
+    retained = []
+    replaced = 0
+    for policy in policy_timeline or []:
+        if _charge_block_wait_replaces_policy(policy, wait_slots):
+            replaced += 1
+            continue
+        retained.append(policy)
+    retained.extend(wait_slots or [])
+    return retained, replaced
+
+
+def _passive_normal_slots_replace_policy(policy, passive_slots):
+    """Belegt die vollständige Ersetzung eines wirkungslosen HOLD-Segments."""
+
+    if not isinstance(policy, dict):
+        return False
+    target = str(policy.get("dv_target_state") or "").upper()
+    budget = (
+        policy.get("storage_budget")
+        if isinstance(policy.get("storage_budget"), dict)
+        else {}
+    )
+    if not bool(
+        target in {"HOLD", "NORMAL"}
+        and policy.get("commands_allowed") is False
+        and policy.get("executable_action") is None
+        and policy.get("execution_window") is None
+        and _policy_contract_zero(budget.get("charge_budget_w"))
+        and _policy_contract_zero(budget.get("export_budget_w"))
+        and (target == "HOLD" or policy.get("blocked") is False)
+    ):
+        return False
+    start_ts = safe_int(policy.get("start_ts"), 0)
+    end_ts = safe_int(policy.get("end_ts"), 0)
+    replacements = sorted(
+        (
+            safe_int(item.get("start_ts"), 0),
+            safe_int(item.get("end_ts"), 0),
+        )
+        for item in (passive_slots or [])
+        if isinstance(item, dict)
+        and item.get("source_reason") == "non_executable_policy_slot"
+        and safe_int(item.get("start_ts"), 0) >= start_ts
+        and safe_int(item.get("end_ts"), 0) <= end_ts
+    )
+    if start_ts <= 0 or end_ts <= start_ts or not replacements:
+        return False
+    cursor = start_ts
+    for slot_start, slot_end in replacements:
+        if slot_start != cursor or slot_end - slot_start != SLOT_MS:
+            return False
+        cursor = slot_end
+    return cursor == end_ts
+
+
+def _replace_non_executable_source_policies(
+    policy_timeline,
+    passive_slots,
+):
+    """Ersetzt nur vollständig abgedeckte HOLD-Segmente durch AUTO-Slots."""
+
+    retained = [
+        policy
+        for policy in (policy_timeline or [])
+        if not _passive_normal_slots_replace_policy(
+            policy,
+            passive_slots,
+        )
+    ]
+    retained.extend(passive_slots or [])
+    return retained
+
+
+def _policy_timeline_exact_slot_coverage(policy_timeline, slots):
+    """Prüft, dass jeder kanonische Viertelstundenslot genau eine Policy hat."""
+
+    invalid = 0
+    for slot in slots or []:
+        if not isinstance(slot, dict):
+            invalid += 1
+            continue
+        start_ts = safe_int(_slot_ts(slot), 0)
+        end_ts = safe_int(_slot_end_ts(slot), 0)
+        matches = [
+            policy
+            for policy in (policy_timeline or [])
+            if isinstance(policy, dict)
+            and safe_int(policy.get("start_ts"), 0) <= start_ts
+            and end_ts <= safe_int(policy.get("end_ts"), 0)
+        ]
+        invalid_wait = any(
+            str(policy.get("dv_target_state") or "").upper()
+            == "CHARGE_BLOCK_WAIT"
+            and not _charge_block_wait_contract_valid(policy)
+            for policy in matches
+        )
+        if (
+            end_ts - start_ts != SLOT_MS
+            or len(matches) != 1
+            or invalid_wait
+        ):
+            invalid += 1
+    return invalid == 0, invalid
 
 
 def _base_plan(mode, reason, now_ms, blocked_reasons=None, economics=None, reserve=None, flags=None):
@@ -6099,6 +6495,43 @@ def _apply_negative_headroom_holds(entries, annotated, reserve, capacity_wh, fla
         required_export_wh = min(required_export_wh, available_export_wh)
         if max_cycle_wh > 0.0:
             required_export_wh = min(required_export_wh, max_cycle_wh)
+        budget_material = {
+            "schema": "direct_marketing_headroom_export_budget_v1",
+            "energy_basis": (
+                "stored_battery_energy_delta_before_discharge_loss_v1"
+            ),
+            "source_action": "eco_plus_negative_headroom_hold",
+            "source_mode": _normalize_mode(
+                config.get("direct_marketing_mode", "safe")
+            ),
+            "next_charge_start_ts": charge_start,
+            "next_charge_end_ts": safe_int(
+                sample.get("negative_headroom_next_end_ts"),
+                0,
+            ),
+            "reserve_floor_soc_pct": round(reserve_floor, 3),
+            "target_soc_pct": round(target_soc, 3),
+            "required_export_wh": round(required_export_wh, 3),
+            "candidate_slots": [
+                {
+                    "start_ts": safe_int(sorted_entries[idx].get("start_ts"), 0),
+                    "end_ts": safe_int(sorted_entries[idx].get("end_ts"), 0),
+                }
+                for idx in sorted(
+                    candidate_indices,
+                    key=lambda item: safe_int(
+                        sorted_entries[item].get("start_ts"),
+                        0,
+                    ),
+                )
+            ],
+        }
+        budget_revision = _policy_sha256_contract(budget_material)
+        headroom_export_budget_id = (
+            "headroom-budget:%s" % budget_revision[7:]
+            if budget_revision.startswith("sha256:")
+            else ""
+        )
         remaining_wh = required_export_wh
         selected_wh = 0.0
         ordered_candidates = sorted(
@@ -6116,21 +6549,1291 @@ def _apply_negative_headroom_holds(entries, annotated, reserve, capacity_wh, fla
             if take_wh >= 50.0 and duration_h > 0.0:
                 entry["max_power_w"] = int(round(take_wh / duration_h))
                 entry["headroom_export_selected"] = True
+                entry["headroom_export_slot_energy_wh"] = round(take_wh, 3)
                 selected_wh += take_wh
                 remaining_wh -= take_wh
             else:
                 entry["max_power_w"] = 0
                 entry["headroom_export_selected"] = False
+                entry["headroom_export_slot_energy_wh"] = 0.0
             entry["headroom_export_budget_wh"] = round(required_export_wh, 0)
             entry["headroom_export_selected_wh"] = round(selected_wh, 0)
             entry["headroom_export_remaining_wh"] = round(max(0.0, remaining_wh), 0)
             entry["headroom_export_charge_start_ts"] = charge_start
         for idx in candidate_indices:
-            sorted_entries[idx]["headroom_export_selected_wh"] = round(selected_wh, 0)
-            sorted_entries[idx]["headroom_export_remaining_wh"] = round(max(0.0, remaining_wh), 0)
+            entry = sorted_entries[idx]
+            entry["headroom_export_selected_wh"] = round(selected_wh, 0)
+            entry["headroom_export_remaining_wh"] = round(max(0.0, remaining_wh), 0)
+            entry["headroom_export_budget_id"] = headroom_export_budget_id
+            entry.setdefault("headroom_export_slot_energy_wh", 0.0)
 
     sorted_entries.sort(key=lambda item: safe_float(item.get("start_ts"), 0.0))
     return sorted_entries, changed
+
+
+def _reconcile_headroom_projection_policy(
+    entries,
+    windows,
+    policy_timeline,
+    policy_decision,
+    mode,
+    now_ms,
+):
+    """Bindet den Read-only-Sidecar an die finale Policy-Rollierung.
+
+    Die erste Headroom-Allokation kennt den später bis zum Verkaufsfenster
+    fortgeschriebenen Hausverbrauch noch nicht. Die finale Policy kennt ihn.
+    Nur deren vollständig gebundene, weiterhin nicht zentral freigegebene
+    HEADROOM_EXPORT-Slots oder die eng gebundene read-only Doppelrolle eines
+    positiven 0-W-CHARGE_BLOCK_WAIT dürfen in die SoC-Projektion gelangen.
+    Diese Funktion verändert weder Aktionswahl noch Ausführungsfreigaben.
+    """
+
+    source_action = "eco_plus_negative_headroom_hold"
+    energy_basis = "stored_battery_energy_delta_before_discharge_loss_v1"
+    reconciled_entries = [
+        dict(item) if isinstance(item, dict) else item
+        for item in (entries or [])
+    ]
+    reconciled_windows = [
+        dict(item) if isinstance(item, dict) else item
+        for item in (windows or [])
+    ]
+    reconciled_timeline = [
+        dict(item) if isinstance(item, dict) else item
+        for item in (policy_timeline or [])
+    ]
+    reconciled_decision = (
+        dict(policy_decision)
+        if isinstance(policy_decision, dict)
+        else policy_decision
+    )
+
+    def result(valid, reason):
+        return {
+            "valid": valid is True,
+            "reason": str(reason or ""),
+            "entries": reconciled_entries,
+            "windows": reconciled_windows,
+            "policy_timeline": reconciled_timeline,
+            "policy_decision": reconciled_decision,
+        }
+
+    def finite(value):
+        return _policy_finite_contract_number(value)
+
+    def exact_zero(value):
+        return bool(finite(value) and float(value) == 0.0)
+
+    if _normalize_mode(mode) != "eco_plus":
+        return result(True, "mode_without_headroom_projection")
+
+    def projection_neutral_headroom_hold(policy):
+        """Erkennt nur den vollständig gebundenen 0-W-Haltezustand.
+
+        HEADROOM_EXPORT ist bei diesem Zustand die Herkunft der fachlichen
+        Speicherplatzreserve, aber ausdrücklich keine positive
+        Exportprojektion. Jede positive oder unvollständige Mischform fällt
+        weiterhin in die strenge Exportprüfung und bleibt fail-closed.
+        """
+
+        if not _headroom_hold_source_contract_valid(policy):
+            return False
+        selected = policy.get("selected_window")
+        selected_candidate = policy.get("selected_candidate")
+        budget = policy.get("storage_budget")
+        if not all(
+            isinstance(item, dict)
+            for item in (selected, selected_candidate, budget)
+        ):
+            return False
+        selected_core = {
+            key: selected.get(key)
+            for key in (
+                "action",
+                "start_ts",
+                "end_ts",
+                "window_id",
+                "headroom_export_selected",
+                "headroom_export_budget_wh",
+                "next_charge_window_start_ts",
+            )
+        }
+        candidate_core = {
+            key: selected_candidate.get(key)
+            for key in selected_core
+        }
+        start_ts = policy.get("start_ts")
+        end_ts = policy.get("end_ts")
+        duration_ms = (
+            end_ts - start_ts
+            if type(start_ts) is int and type(end_ts) is int
+            else 0
+        )
+        return bool(
+            duration_ms >= SLOT_MS
+            and duration_ms % SLOT_MS == 0
+            and policy.get("candidate_actions") == [source_action]
+            and policy.get("suppressed_candidates") == []
+            and selected_core == candidate_core
+            and selected.get("headroom_export_selected") is False
+            and exact_zero(selected.get("headroom_export_budget_wh"))
+            and budget.get("headroom_hold_active") is True
+            and exact_zero(budget.get("charge_budget_w"))
+            and exact_zero(budget.get("export_budget_w"))
+            and exact_zero(budget.get("sellable_wh"))
+            and exact_zero(budget.get("headroom_deficit_wh"))
+        )
+
+    all_headroom_indices = [
+        index
+        for index, item in enumerate(reconciled_timeline)
+        if isinstance(item, dict)
+        and str(item.get("dv_target_state") or "").strip().upper()
+        == "HEADROOM_EXPORT"
+    ]
+    passive_headroom_indices = {
+        index
+        for index in all_headroom_indices
+        if projection_neutral_headroom_hold(reconciled_timeline[index])
+    }
+    passive_headroom_bounds = {
+        (
+            reconciled_timeline[index].get("start_ts"),
+            reconciled_timeline[index].get("end_ts"),
+        )
+        for index in passive_headroom_indices
+    }
+    if len(passive_headroom_bounds) != len(passive_headroom_indices):
+        return result(False, "duplicate_passive_headroom_hold")
+    final_headroom_indices = [
+        index
+        for index in all_headroom_indices
+        if index not in passive_headroom_indices
+    ]
+
+    entry_indices_by_bounds = {}
+    for index, item in enumerate(reconciled_entries):
+        if not isinstance(item, dict) or item.get("action") != source_action:
+            continue
+        bounds = (item.get("start_ts"), item.get("end_ts"))
+        entry_indices_by_bounds.setdefault(bounds, []).append(index)
+
+    claims = []
+    seen_bounds = set()
+    seen_policy_bounds = set()
+    for timeline_index in final_headroom_indices:
+        policy = reconciled_timeline[timeline_index]
+        selected = (
+            policy.get("selected_window")
+            if isinstance(policy.get("selected_window"), dict)
+            else {}
+        )
+        selected_candidate = (
+            policy.get("selected_candidate")
+            if isinstance(policy.get("selected_candidate"), dict)
+            else {}
+        )
+        execution = (
+            policy.get("execution_window")
+            if isinstance(policy.get("execution_window"), dict)
+            else {}
+        )
+        budget = (
+            policy.get("storage_budget")
+            if isinstance(policy.get("storage_budget"), dict)
+            else {}
+        )
+        start_ts = policy.get("start_ts")
+        end_ts = policy.get("end_ts")
+        bounds = (start_ts, end_ts)
+        selected_window_id = str(selected.get("window_id") or "")
+        selected_core = {
+            key: selected.get(key)
+            for key in (
+                "action",
+                "start_ts",
+                "end_ts",
+                "window_id",
+                "headroom_export_selected",
+                "headroom_export_budget_wh",
+                "next_charge_window_start_ts",
+            )
+        }
+        candidate_core = {
+            key: selected_candidate.get(key)
+            for key in selected_core
+        }
+        policy_valid = bool(
+            policy.get("schema") == POLICY_SCHEMA
+            and type(start_ts) is int
+            and type(end_ts) is int
+            and end_ts - start_ts >= SLOT_MS
+            and (end_ts - start_ts) % SLOT_MS == 0
+            and bounds not in seen_policy_bounds
+            and policy.get("commands_allowed") is True
+            and policy.get("blocked") is False
+            and str(policy.get("source_action") or "") == source_action
+            and str(policy.get("executable_action") or "") == source_action
+            and policy.get("candidate_actions") == [source_action]
+            and policy.get("suppressed_candidates") == []
+            and type(policy.get("execution_window_match_count")) is int
+            and policy.get("execution_window_match_count") == 1
+            and selected_core == candidate_core
+            and selected.get("action") == source_action
+            and selected.get("headroom_export_selected") is True
+            and type(selected.get("start_ts")) is int
+            and type(selected.get("end_ts")) is int
+            and selected.get("start_ts") == start_ts
+            and selected.get("end_ts") == end_ts
+            and selected_window_id
+            and finite(selected.get("headroom_export_budget_wh"))
+            and float(selected.get("headroom_export_budget_wh")) > 0.0
+            and execution.get("action") == source_action
+            and type(execution.get("contract_version")) is int
+            and execution.get("contract_version") == 1
+            and execution.get("source") == "active_plan_window"
+            and execution.get("window_id") == selected_window_id
+            and execution.get("plan_window_id") == selected_window_id
+            and all(
+                type(execution.get(key)) is int
+                for key in (
+                    "start_ts",
+                    "end_ts",
+                    "origin_start_ts",
+                    "plan_window_start_ts",
+                    "plan_window_end_ts",
+                )
+            )
+            and execution.get("start_ts") == start_ts
+            and execution.get("end_ts") == end_ts
+            and execution.get("plan_window_start_ts") == start_ts
+            and execution.get("plan_window_end_ts") == end_ts
+            and budget.get("headroom_hold_active") is False
+            and exact_zero(budget.get("charge_budget_w"))
+            and finite(budget.get("export_budget_w"))
+            and float(budget.get("export_budget_w")) >= 300.0
+            and finite(budget.get("sellable_wh"))
+            and float(budget.get("sellable_wh")) > 0.0
+            and finite(budget.get("headroom_deficit_wh"))
+            and float(budget.get("headroom_deficit_wh")) > 0.0
+            and finite(budget.get("protected_reserve_wh"))
+            and float(budget.get("protected_reserve_wh")) >= 0.0
+        )
+        if not policy_valid:
+            return result(False, "final_headroom_policy_contract_invalid")
+
+        entry_indices = sorted(
+            (
+                index
+                for index, item in enumerate(reconciled_entries)
+                if isinstance(item, dict)
+                and item.get("action") == source_action
+                and type(item.get("start_ts")) is int
+                and type(item.get("end_ts")) is int
+                and start_ts <= item.get("start_ts")
+                and item.get("end_ts") <= end_ts
+            ),
+            key=lambda index: (
+                reconciled_entries[index]["start_ts"],
+                reconciled_entries[index]["end_ts"],
+            ),
+        )
+        source_window_indices = [
+            index
+            for index, item in enumerate(reconciled_windows)
+            if isinstance(item, dict)
+            and item.get("action") == source_action
+            and type(item.get("start_ts")) is int
+            and type(item.get("end_ts")) is int
+            and item.get("start_ts") == start_ts
+            and item.get("end_ts") == end_ts
+            and _policy_window_id(item) == selected_window_id
+        ]
+        expected_entry_count = (end_ts - start_ts) // SLOT_MS
+        entry_bounds = [
+            (
+                reconciled_entries[index]["start_ts"],
+                reconciled_entries[index]["end_ts"],
+            )
+            for index in entry_indices
+        ]
+        entries_cover_policy = bool(
+            len(entry_indices) == expected_entry_count
+            and entry_bounds
+            and entry_bounds[0][0] == start_ts
+            and entry_bounds[-1][1] == end_ts
+            and all(
+                slot_end - slot_start == SLOT_MS
+                for slot_start, slot_end in entry_bounds
+            )
+            and all(
+                left[1] == right[0]
+                for left, right in zip(entry_bounds, entry_bounds[1:])
+            )
+        )
+        if not entries_cover_policy or len(source_window_indices) != 1:
+            return result(False, "final_headroom_source_binding_invalid")
+        window_index = source_window_indices[0]
+        source_window = reconciled_windows[window_index]
+        export_w = int(round(float(budget.get("export_budget_w"))))
+        for entry_index in entry_indices:
+            entry = reconciled_entries[entry_index]
+            entry_bound = (entry.get("start_ts"), entry.get("end_ts"))
+            raw_budget_id = str(entry.get("headroom_export_budget_id") or "")
+            if not bool(
+                entry_bound not in seen_bounds
+                and entry.get("headroom_export_selected") is True
+                and finite(entry.get("max_power_w"))
+                and float(entry.get("max_power_w")) + 0.001 >= export_w
+                and finite(entry.get("headroom_export_budget_wh"))
+                and float(entry.get("headroom_export_budget_wh")) > 0.0
+                and raw_budget_id.startswith("headroom-budget:")
+                and len(raw_budget_id) == len("headroom-budget:") + 64
+                and source_window.get("headroom_export_selected") is True
+                and finite(source_window.get("headroom_export_budget_wh"))
+                and abs(
+                    float(source_window.get("headroom_export_budget_wh"))
+                    - float(entry.get("headroom_export_budget_wh"))
+                )
+                <= 0.001
+                and abs(
+                    float(selected.get("headroom_export_budget_wh"))
+                    - float(entry.get("headroom_export_budget_wh"))
+                )
+                <= 0.001
+            ):
+                return result(False, "final_headroom_budget_lineage_invalid")
+            seen_bounds.add(entry_bound)
+            claims.append({
+                "claim_kind": "active_headroom_policy",
+                "timeline_index": timeline_index,
+                "entry_index": entry_index,
+                "window_index": window_index,
+                "start_ts": entry_bound[0],
+                "end_ts": entry_bound[1],
+                "policy_start_ts": start_ts,
+                "policy_end_ts": end_ts,
+                "raw_budget_id": raw_budget_id,
+                "selected_window_id": selected_window_id,
+                "export_w": export_w,
+                "runtime_sellable_wh": float(budget.get("sellable_wh")),
+                "runtime_deficit_wh": float(budget.get("headroom_deficit_wh")),
+                "raw_budget_wh": float(entry.get("headroom_export_budget_wh")),
+            })
+        seen_policy_bounds.add(bounds)
+
+    active_budget_ids = {claim["raw_budget_id"] for claim in claims}
+    for timeline_index, policy in enumerate(reconciled_timeline):
+        if not isinstance(policy, dict) or str(
+            policy.get("dv_target_state") or ""
+        ).strip().upper() != "CHARGE_BLOCK_WAIT":
+            continue
+        budget = (
+            policy.get("storage_budget")
+            if isinstance(policy.get("storage_budget"), dict)
+            else {}
+        )
+        if not bool(
+            finite(budget.get("sellable_wh"))
+            and float(budget.get("sellable_wh")) > 0.0
+            and finite(budget.get("headroom_deficit_wh"))
+            and float(budget.get("headroom_deficit_wh")) > 0.0
+        ):
+            # Ein aufgebrauchter Headroom-Rest ist ein reiner 0-W-Warteslot
+            # und darf keine weitere SoC-Absenkung projizieren.
+            continue
+        source_start_ts = policy.get("headroom_source_start_ts")
+        source_end_ts = policy.get("headroom_source_end_ts")
+        source_window_id = str(
+            policy.get("headroom_source_window_id") or ""
+        )
+        bounds = (source_start_ts, source_end_ts)
+        entry_indices = entry_indices_by_bounds.get(bounds) or []
+        selected_entries = [
+            index for index in entry_indices
+            if reconciled_entries[index].get("headroom_export_selected")
+            is True
+            and finite(reconciled_entries[index].get("max_power_w"))
+            and float(reconciled_entries[index].get("max_power_w")) > 0.0
+        ]
+        if not selected_entries:
+            continue
+        source_window_indices = [
+            index
+            for index, item in enumerate(reconciled_windows)
+            if isinstance(item, dict)
+            and item.get("action") == source_action
+            and item.get("start_ts") == source_start_ts
+            and item.get("end_ts") == source_end_ts
+            and _policy_window_id(item) == source_window_id
+        ]
+        wait_action = "direct_marketing_charge_block_wait"
+        suppressed = [{
+            "action": source_action,
+            "reason": "superseded_by:%s" % wait_action,
+        }]
+        wait_valid = bool(
+            _charge_block_wait_contract_valid(policy)
+            and type(source_start_ts) is int
+            and type(source_end_ts) is int
+            and source_end_ts - source_start_ts == SLOT_MS
+            and source_start_ts == policy.get("start_ts")
+            and source_end_ts == policy.get("end_ts")
+            and source_window_id
+            and policy.get("candidate_actions")
+            == [source_action, wait_action]
+            and policy.get("suppressed_candidates") == suppressed
+            and budget.get("headroom_hold_active") is True
+            and exact_zero(budget.get("charge_budget_w"))
+            and exact_zero(budget.get("export_budget_w"))
+            and len(selected_entries) == 1
+            and len(source_window_indices) == 1
+        )
+        if not wait_valid:
+            return result(False, "headroom_wait_projection_binding_invalid")
+        entry_index = selected_entries[0]
+        window_index = source_window_indices[0]
+        entry = reconciled_entries[entry_index]
+        source_window = reconciled_windows[window_index]
+        raw_budget_id = str(entry.get("headroom_export_budget_id") or "")
+        if raw_budget_id in active_budget_ids:
+            # Sobald derselbe Energiehaushalt echte finale Headroom-Aktionen
+            # besitzt, bleibt ein nachfolgender Warteslot rein passiv.
+            continue
+        raw_slot_energy_wh = entry.get("headroom_export_slot_energy_wh")
+        projected_power_w = (
+            int(
+                round(
+                    float(raw_slot_energy_wh)
+                    / (SLOT_MS / 3600000.0)
+                )
+            )
+            if finite(raw_slot_energy_wh)
+            else 0
+        )
+        if not bool(
+            projected_power_w > 0
+            and finite(entry.get("max_power_w"))
+            and abs(float(entry.get("max_power_w")) - projected_power_w)
+            <= 0.001
+            and finite(entry.get("headroom_export_budget_wh"))
+            and float(entry.get("headroom_export_budget_wh")) > 0.0
+            and raw_budget_id.startswith("headroom-budget:")
+            and len(raw_budget_id) == len("headroom-budget:") + 64
+            and source_window.get("headroom_export_selected") is True
+            and finite(source_window.get("headroom_export_budget_wh"))
+            and abs(
+                float(source_window.get("headroom_export_budget_wh"))
+                - float(entry.get("headroom_export_budget_wh"))
+            )
+            <= 0.001
+        ):
+            return result(False, "headroom_wait_budget_lineage_invalid")
+        claims.append({
+            "claim_kind": "charge_block_wait_projection",
+            "timeline_index": timeline_index,
+            "entry_index": entry_index,
+            "window_index": window_index,
+            "start_ts": source_start_ts,
+            "end_ts": source_end_ts,
+            "policy_start_ts": policy.get("start_ts"),
+            "policy_end_ts": policy.get("end_ts"),
+            "raw_budget_id": raw_budget_id,
+            "selected_window_id": source_window_id,
+            "export_w": projected_power_w,
+            "runtime_sellable_wh": float(budget.get("sellable_wh")),
+            "runtime_deficit_wh": float(budget.get("headroom_deficit_wh")),
+            "raw_budget_wh": float(entry.get("headroom_export_budget_wh")),
+        })
+
+    if isinstance(reconciled_decision, dict) and str(
+        reconciled_decision.get("dv_target_state") or ""
+    ).strip().upper() == "HEADROOM_EXPORT":
+        current_bounds = (
+            reconciled_decision.get("start_ts"),
+            reconciled_decision.get("end_ts"),
+        )
+        if current_bounds in passive_headroom_bounds:
+            if not projection_neutral_headroom_hold(reconciled_decision):
+                return result(
+                    False,
+                    "current_passive_headroom_hold_invalid",
+                )
+            current_matches = [
+                item for item in claims
+                if (
+                    item.get("policy_start_ts", item["start_ts"]),
+                    item.get("policy_end_ts", item["end_ts"]),
+                ) == current_bounds
+            ]
+            if current_matches:
+                return result(
+                    False,
+                    "passive_headroom_projection_claim_conflict",
+                )
+        else:
+            current_matches = [
+                item for item in claims
+                if (
+                    item.get("policy_start_ts", item["start_ts"]),
+                    item.get("policy_end_ts", item["end_ts"]),
+                ) == current_bounds
+            ]
+            if not current_matches:
+                return result(False, "current_headroom_policy_binding_invalid")
+
+    claims_by_budget = {}
+    for claim in claims:
+        claims_by_budget.setdefault(claim["raw_budget_id"], []).append(claim)
+
+    active_entry_indices = set()
+    active_window_indices = set()
+    timeline_rows_by_bounds = {}
+    group_diagnostics = {}
+    for raw_budget_id, group_claims in claims_by_budget.items():
+        group_claims.sort(key=lambda item: (item["start_ts"], item["end_ts"]))
+        wait_projection_only = all(
+            item["claim_kind"] == "charge_block_wait_projection"
+            for item in group_claims
+        )
+        first = group_claims[0]
+        initial_sellable_wh = round(first["runtime_sellable_wh"], 3)
+        initial_deficit_wh = round(first["runtime_deficit_wh"], 3)
+        reconciled_budget_wh = round(
+            min(
+                first["raw_budget_wh"],
+                initial_sellable_wh,
+                initial_deficit_wh,
+            ),
+            3,
+        )
+        if reconciled_budget_wh <= 0.0:
+            return result(False, "final_headroom_budget_empty")
+
+        cumulative_effective_wh = 0.0
+        runtime_budget_by_policy = {}
+        budget_slots = []
+        for claim in group_claims:
+            expected_sellable_wh = round(
+                max(0.0, initial_sellable_wh - cumulative_effective_wh),
+                0,
+            )
+            expected_deficit_wh = round(
+                max(0.0, initial_deficit_wh - cumulative_effective_wh),
+                0,
+            )
+            policy_bounds = (
+                claim.get("policy_start_ts", claim["start_ts"]),
+                claim.get("policy_end_ts", claim["end_ts"]),
+            )
+            policy_runtime = runtime_budget_by_policy.setdefault(
+                policy_bounds,
+                (expected_sellable_wh, expected_deficit_wh),
+            )
+            if not bool(
+                (
+                    abs(
+                        claim["runtime_sellable_wh"]
+                        - initial_sellable_wh
+                    )
+                    <= 0.001
+                    and abs(
+                        claim["runtime_deficit_wh"]
+                        - initial_deficit_wh
+                    )
+                    <= 0.001
+                )
+                if wait_projection_only
+                else (
+                    abs(
+                        claim["runtime_sellable_wh"]
+                        - policy_runtime[0]
+                    )
+                    <= 0.001
+                    and abs(
+                        claim["runtime_deficit_wh"]
+                        - policy_runtime[1]
+                    )
+                    <= 0.001
+                )
+            ):
+                return result(False, "final_headroom_budget_rollforward_invalid")
+            effective_start_ts = max(claim["start_ts"], safe_int(now_ms, 0))
+            effective_duration_s = max(
+                0.0,
+                (claim["end_ts"] - effective_start_ts) / 1000.0,
+            )
+            full_slot_energy_wh = round(
+                claim["export_w"] * (SLOT_MS / 3600000.0),
+                3,
+            )
+            effective_slot_energy_wh = round(
+                claim["export_w"] * effective_duration_s / 3600.0,
+                3,
+            )
+            if not bool(
+                effective_duration_s > 0.0
+                and full_slot_energy_wh > 0.0
+                and effective_slot_energy_wh > 0.0
+                and effective_slot_energy_wh
+                <= claim["runtime_sellable_wh"] + 1.0
+                and effective_slot_energy_wh
+                <= claim["runtime_deficit_wh"] + 1.0
+            ):
+                return result(False, "final_headroom_slot_energy_invalid")
+            claim["full_slot_energy_wh"] = full_slot_energy_wh
+            claim["effective_slot_energy_wh"] = effective_slot_energy_wh
+            cumulative_effective_wh += effective_slot_energy_wh
+            budget_slots.append({
+                "start_ts": claim["start_ts"],
+                "end_ts": claim["end_ts"],
+                "policy_window_id": claim["selected_window_id"],
+                "projected_power_w": claim["export_w"],
+                "headroom_export_slot_energy_wh": effective_slot_energy_wh,
+            })
+        if cumulative_effective_wh > reconciled_budget_wh + 1.0:
+            return result(False, "final_headroom_group_energy_overrun")
+
+        budget_revision = _policy_sha256_contract({
+            "schema": (
+                "direct_marketing_headroom_export_budget_"
+                "policy_reconciled_v1"
+            ),
+            "energy_basis": energy_basis,
+            "source_action": source_action,
+            "source_mode": "eco_plus",
+            "source_headroom_export_budget_id": raw_budget_id,
+            "headroom_export_budget_wh": reconciled_budget_wh,
+            "sellable_wh": initial_sellable_wh,
+            "headroom_deficit_wh": initial_deficit_wh,
+            "slots": budget_slots,
+        })
+        reconciled_budget_id = (
+            "headroom-budget:%s" % budget_revision[7:]
+            if budget_revision.startswith("sha256:")
+            else ""
+        )
+        if not reconciled_budget_id:
+            return result(False, "final_headroom_budget_identity_invalid")
+
+        remaining_wh = round(
+            max(0.0, reconciled_budget_wh - cumulative_effective_wh),
+            3,
+        )
+        group_diagnostics[raw_budget_id] = {
+            "budget_wh": reconciled_budget_wh,
+            "selected_wh": round(cumulative_effective_wh, 3),
+            "remaining_wh": remaining_wh,
+        }
+        for claim in group_claims:
+            entry = reconciled_entries[claim["entry_index"]]
+            entry.update({
+                "max_power_w": claim["export_w"],
+                "headroom_export_selected": True,
+                "headroom_export_slot_energy_wh": claim[
+                    "full_slot_energy_wh"
+                ],
+                "headroom_export_budget_wh": reconciled_budget_wh,
+                "headroom_export_selected_wh": round(
+                    cumulative_effective_wh,
+                    3,
+                ),
+                "headroom_export_remaining_wh": remaining_wh,
+                "headroom_export_budget_id": reconciled_budget_id,
+                "_headroom_projection_sellable_wh": initial_sellable_wh,
+                "_headroom_projection_deficit_wh": initial_deficit_wh,
+            })
+            source_window = reconciled_windows[claim["window_index"]]
+            source_window.update({
+                "max_power_w": claim["export_w"],
+                "theoretical_kwh": round(
+                    claim["export_w"] * _entry_duration_h(source_window)
+                    / 1000.0,
+                    3,
+                ),
+                "headroom_export_selected": True,
+                "headroom_export_budget_wh": reconciled_budget_wh,
+                "headroom_export_selected_wh": round(
+                    cumulative_effective_wh,
+                    3,
+                ),
+                "headroom_export_remaining_wh": remaining_wh,
+            })
+            policy = reconciled_timeline[claim["timeline_index"]]
+            if claim["claim_kind"] == "active_headroom_policy":
+                selected = dict(policy.get("selected_window") or {})
+                selected_candidate = dict(
+                    policy.get("selected_candidate") or {}
+                )
+                selected["headroom_export_budget_wh"] = (
+                    reconciled_budget_wh
+                )
+                selected_candidate["headroom_export_budget_wh"] = (
+                    reconciled_budget_wh
+                )
+                policy["selected_window"] = selected
+                policy["selected_candidate"] = selected_candidate
+            active_entry_indices.add(claim["entry_index"])
+            active_window_indices.add(claim["window_index"])
+            timeline_rows_by_bounds[
+                (
+                    claim.get("policy_start_ts", claim["start_ts"]),
+                    claim.get("policy_end_ts", claim["end_ts"]),
+                )
+            ] = (
+                policy
+            )
+
+    for index, entry in enumerate(reconciled_entries):
+        if not isinstance(entry, dict) or entry.get("action") != source_action:
+            continue
+        if index in active_entry_indices:
+            continue
+        raw_budget_id = str(entry.get("headroom_export_budget_id") or "")
+        diagnostics = group_diagnostics.get(raw_budget_id, {})
+        entry.update({
+            "max_power_w": 0,
+            "headroom_export_selected": False,
+            "headroom_export_slot_energy_wh": 0.0,
+        })
+        if diagnostics:
+            entry.update({
+                "headroom_export_budget_wh": diagnostics["budget_wh"],
+                "headroom_export_selected_wh": diagnostics["selected_wh"],
+                "headroom_export_remaining_wh": diagnostics["remaining_wh"],
+            })
+    for index, window in enumerate(reconciled_windows):
+        if not isinstance(window, dict) or window.get("action") != source_action:
+            continue
+        if index in active_window_indices:
+            continue
+        window.update({
+            "max_power_w": 0,
+            "theoretical_kwh": 0.0,
+            "headroom_export_selected": False,
+        })
+
+    if isinstance(reconciled_decision, dict):
+        decision_bounds = (
+            reconciled_decision.get("start_ts"),
+            reconciled_decision.get("end_ts"),
+        )
+        if decision_bounds in timeline_rows_by_bounds:
+            reconciled_decision = timeline_rows_by_bounds[decision_bounds]
+
+    return result(True, "final_policy_rollforward_reconciled")
+
+
+def _build_headroom_projection_plan(
+    entries,
+    reserve,
+    mode,
+    capacity_wh,
+    now_ms,
+    source_contract_valid=True,
+):
+    """Materialisiert eine strikt wirkungslose Headroom-Projektion.
+
+    Der Sidecar beschreibt nur die erwartete Energiewirkung bereits final
+    priorisierter Headroom-Slots. Er ist weder Policyentscheidung noch
+    Ausführungsfreigabe und enthält deshalb absichtlich keine aktiven
+    Manager-/Hardwarefelder.
+    """
+
+    schema = "direct_marketing_headroom_projection_plan_v1"
+    source_action = "eco_plus_negative_headroom_hold"
+    energy_basis = "stored_battery_energy_delta_before_discharge_loss_v1"
+    projected_mode = _normalize_mode(mode)
+    generated_at_ts = safe_int(now_ms, 0)
+    reserve_floor_soc_pct = round(
+        _clamp(
+            safe_float((reserve or {}).get("effective_min_soc_pct"), 0.0),
+            0.0,
+            100.0,
+        ),
+        3,
+    )
+    capacity_wh = max(0.0, safe_float(capacity_wh, 0.0))
+    protected_reserve_wh = round(
+        reserve_floor_soc_pct / 100.0 * capacity_wh,
+        3,
+    )
+    default_sellable_wh = round(
+        max(
+            0.0,
+            safe_float((reserve or {}).get("available_export_wh"), 0.0),
+        ),
+        3,
+    )
+    projection_entries = entries if projected_mode == "eco_plus" else ()
+    candidates = sorted(
+        (
+            dict(entry)
+            for entry in (projection_entries or [])
+            if isinstance(entry, dict)
+            and entry.get("action") == source_action
+            and entry.get("headroom_export_selected") is True
+            and safe_float(entry.get("max_power_w"), 0.0) > 0.0
+        ),
+        key=lambda item: (
+            safe_int(item.get("start_ts"), 0),
+            safe_int(item.get("end_ts"), 0),
+        ),
+    )
+    slots = []
+    invalid_slot_count = 0 if source_contract_valid is True else 1
+    seen_bounds = set()
+    previous_slot_end_ts = 0
+    for entry in candidates:
+        start_ts = safe_int(entry.get("start_ts"), 0)
+        end_ts = safe_int(entry.get("end_ts"), 0)
+        effective_start_ts = max(start_ts, generated_at_ts)
+        effective_duration_s = round(
+            max(0, end_ts - effective_start_ts) / 1000.0,
+            3,
+        )
+        bounds = (start_ts, end_ts)
+        allocated_slot_energy_wh = entry.get("headroom_export_slot_energy_wh")
+        projected_power_w = (
+            int(
+                round(
+                    float(allocated_slot_energy_wh)
+                    / (SLOT_MS / 3600000.0)
+                )
+            )
+            if _policy_finite_contract_number(allocated_slot_energy_wh)
+            else 0
+        )
+        slot_energy_wh = round(
+            projected_power_w * effective_duration_s / 3600.0,
+            3,
+        )
+        budget_wh = entry.get("headroom_export_budget_wh")
+        budget_id = str(entry.get("headroom_export_budget_id") or "")
+        next_charge_start_ts = safe_int(
+            entry.get("negative_headroom_next_start_ts"),
+            0,
+        )
+        next_charge_end_ts = safe_int(
+            entry.get("negative_headroom_next_end_ts"),
+            0,
+        )
+        required_pct = _clamp(
+            safe_float(entry.get("negative_headroom_required_pct"), 0.0),
+            0.0,
+            100.0,
+        )
+        target_soc_pct = round(
+            max(reserve_floor_soc_pct, 100.0 - required_pct),
+            3,
+        )
+        headroom_required_wh = round(
+            max(
+                0.0,
+                safe_float(entry.get("negative_headroom_required_wh"), 0.0),
+            ),
+            3,
+        )
+        headroom_free_before_wh = round(
+            max(
+                0.0,
+                safe_float(entry.get("negative_headroom_free_before_wh"), 0.0),
+            ),
+            3,
+        )
+        forecast_absorption_wh = round(
+            max(
+                0.0,
+                safe_float(
+                    entry.get("negative_headroom_forecast_surplus_wh"),
+                    0.0,
+                ),
+            ),
+            3,
+        )
+        headroom_deficit_wh = round(
+            max(
+                0.0,
+                safe_float(
+                    entry.get("_headroom_projection_deficit_wh"),
+                    budget_wh,
+                ),
+            ),
+            3,
+        )
+        sellable_wh = round(
+            max(
+                0.0,
+                safe_float(
+                    entry.get("_headroom_projection_sellable_wh"),
+                    default_sellable_wh,
+                ),
+            ),
+            3,
+        )
+        allocated_power_energy_wh = projected_power_w * (
+            SLOT_MS / 3600000.0
+        )
+        valid = bool(
+            start_ts > 0
+            and end_ts - start_ts == SLOT_MS
+            and bounds not in seen_bounds
+            and start_ts >= previous_slot_end_ts
+            and start_ts <= effective_start_ts < end_ts
+            and 0.0 < effective_duration_s <= SLOT_MS / 1000.0
+            and abs(
+                effective_duration_s
+                - (end_ts - effective_start_ts) / 1000.0
+            ) <= 0.000001
+            and projected_power_w > 0
+            and _policy_finite_contract_number(allocated_slot_energy_wh)
+            and float(allocated_slot_energy_wh) > 0.0
+            and abs(
+                float(allocated_slot_energy_wh) - allocated_power_energy_wh
+            ) <= 0.125001
+            and slot_energy_wh > 0.0
+            and _policy_finite_contract_number(budget_wh)
+            and float(budget_wh) >= float(slot_energy_wh)
+            and budget_id.startswith("headroom-budget:")
+            and len(budget_id) == len("headroom-budget:") + 64
+            and next_charge_start_ts >= end_ts
+            and next_charge_end_ts > next_charge_start_ts
+        )
+        if not valid:
+            invalid_slot_count += 1
+            continue
+        seen_bounds.add(bounds)
+        previous_slot_end_ts = end_ts
+        slot_identity = {
+            "schema": schema,
+            "energy_basis": energy_basis,
+            "headroom_export_budget_id": budget_id,
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "effective_start_ts": effective_start_ts,
+            "effective_duration_s": effective_duration_s,
+            "projected_action": "HEADROOM_EXPORT",
+            "projected_source_action": source_action,
+            "projected_mode": projected_mode,
+            "projected_power_w": projected_power_w,
+            "headroom_export_slot_energy_wh": round(float(slot_energy_wh), 3),
+            "headroom_export_budget_wh": round(float(budget_wh), 3),
+            "reserve_floor_soc_pct": reserve_floor_soc_pct,
+            "target_soc_pct": target_soc_pct,
+            "next_charge_start_ts": next_charge_start_ts,
+            "next_charge_end_ts": next_charge_end_ts,
+        }
+        slot_revision = _policy_sha256_contract(slot_identity)
+        headroom_export_slot_id = (
+            "headroom-slot:%s" % slot_revision[7:]
+            if slot_revision.startswith("sha256:")
+            else ""
+        )
+        if not headroom_export_slot_id:
+            invalid_slot_count += 1
+            continue
+        window_revision = _policy_sha256_contract({
+            "schema": schema,
+            "energy_basis": energy_basis,
+            "headroom_export_budget_id": budget_id,
+            "next_charge_start_ts": next_charge_start_ts,
+            "next_charge_end_ts": next_charge_end_ts,
+        })
+        segment_revision = _policy_sha256_contract({
+            "schema": schema,
+            "energy_basis": energy_basis,
+            "headroom_export_budget_id": budget_id,
+            "reserve_floor_soc_pct": reserve_floor_soc_pct,
+            "target_soc_pct": target_soc_pct,
+        })
+        window_id = (
+            "headroom-window:%s" % window_revision[7:]
+            if window_revision.startswith("sha256:")
+            else ""
+        )
+        segment_id = (
+            "headroom-segment:%s" % segment_revision[7:]
+            if segment_revision.startswith("sha256:")
+            else ""
+        )
+        if not window_id or not segment_id:
+            invalid_slot_count += 1
+            continue
+        slots.append({
+            "headroom_export_slot_id": headroom_export_slot_id,
+            "projection_id": headroom_export_slot_id,
+            "headroom_export_budget_id": budget_id,
+            "window_id": window_id,
+            "segment_id": segment_id,
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "duration_s": SLOT_MS // 1000,
+            "effective_start_ts": effective_start_ts,
+            "effective_duration_s": effective_duration_s,
+            "energy_basis": energy_basis,
+            "projection_only": True,
+            "executable": False,
+            "commands_allowed": False,
+            "hardware_effect": False,
+            "projected_action": "HEADROOM_EXPORT",
+            "projected_source_action": source_action,
+            "projected_mode": projected_mode,
+            "projected_power_w": projected_power_w,
+            "headroom_export_slot_energy_wh": round(float(slot_energy_wh), 3),
+            "headroom_export_budget_wh": round(float(budget_wh), 3),
+            "reserve_floor_soc_pct": reserve_floor_soc_pct,
+            "target_soc_pct": target_soc_pct,
+            "protected_reserve_wh": protected_reserve_wh,
+            "sellable_wh": sellable_wh,
+            "headroom_deficit_wh": headroom_deficit_wh,
+            "headroom_required_wh": headroom_required_wh,
+            "headroom_free_before_wh": headroom_free_before_wh,
+            "forecast_absorption_wh": forecast_absorption_wh,
+            "next_charge_start_ts": next_charge_start_ts,
+            "next_charge_end_ts": next_charge_end_ts,
+        })
+
+    groups_by_budget_id = {}
+    for slot in slots:
+        budget_id = slot["headroom_export_budget_id"]
+        group = groups_by_budget_id.setdefault(
+            budget_id,
+            {
+                "headroom_export_budget_id": budget_id,
+                "headroom_export_budget_wh": slot["headroom_export_budget_wh"],
+                "projected_energy_wh": 0.0,
+                "energy_basis": slot["energy_basis"],
+                "window_id": slot["window_id"],
+                "segment_id": slot["segment_id"],
+                "window_start_ts": slot["start_ts"],
+                "window_end_ts": slot["end_ts"],
+                "effective_start_ts": slot["effective_start_ts"],
+                "effective_end_ts": slot["end_ts"],
+                "effective_duration_s": 0.0,
+                "projection_horizon_contract": (
+                    "ordered_unique_slots_non_contiguous_allowed_v1"
+                ),
+                "reserve_floor_soc_pct": slot["reserve_floor_soc_pct"],
+                "target_soc_pct": slot["target_soc_pct"],
+                "protected_reserve_wh": slot["protected_reserve_wh"],
+                "sellable_wh": slot["sellable_wh"],
+                "headroom_deficit_wh": slot["headroom_deficit_wh"],
+                "headroom_required_wh": slot["headroom_required_wh"],
+                "headroom_free_before_wh": slot["headroom_free_before_wh"],
+                "forecast_absorption_wh": slot["forecast_absorption_wh"],
+                "next_charge_start_ts": slot["next_charge_start_ts"],
+                "next_charge_end_ts": slot["next_charge_end_ts"],
+                "slot_ids": [],
+            },
+        )
+        consistent = bool(
+            abs(
+                group["headroom_export_budget_wh"]
+                - slot["headroom_export_budget_wh"]
+            ) <= 0.001
+            and group["energy_basis"] == slot["energy_basis"]
+            and group["window_id"] == slot["window_id"]
+            and group["segment_id"] == slot["segment_id"]
+            and abs(
+                group["reserve_floor_soc_pct"]
+                - slot["reserve_floor_soc_pct"]
+            ) <= 0.001
+            and abs(group["target_soc_pct"] - slot["target_soc_pct"]) <= 0.001
+            and abs(
+                group["protected_reserve_wh"]
+                - slot["protected_reserve_wh"]
+            ) <= 0.001
+            and abs(group["sellable_wh"] - slot["sellable_wh"]) <= 0.001
+            and abs(
+                group["headroom_deficit_wh"]
+                - slot["headroom_deficit_wh"]
+            ) <= 0.001
+            and abs(
+                group["headroom_required_wh"]
+                - slot["headroom_required_wh"]
+            ) <= 0.001
+            and abs(
+                group["headroom_free_before_wh"]
+                - slot["headroom_free_before_wh"]
+            ) <= 0.001
+            and abs(
+                group["forecast_absorption_wh"]
+                - slot["forecast_absorption_wh"]
+            ) <= 0.001
+            and group["next_charge_start_ts"] == slot["next_charge_start_ts"]
+            and group["next_charge_end_ts"] == slot["next_charge_end_ts"]
+        )
+        if not consistent:
+            invalid_slot_count += 1
+        group["window_start_ts"] = min(
+            group["window_start_ts"],
+            slot["start_ts"],
+        )
+        group["window_end_ts"] = max(
+            group["window_end_ts"],
+            slot["end_ts"],
+        )
+        group["effective_start_ts"] = min(
+            group["effective_start_ts"],
+            slot["effective_start_ts"],
+        )
+        group["effective_end_ts"] = max(
+            group["effective_end_ts"],
+            slot["end_ts"],
+        )
+        group["effective_duration_s"] += slot["effective_duration_s"]
+        group["projected_energy_wh"] += slot["headroom_export_slot_energy_wh"]
+        group["slot_ids"].append(slot["headroom_export_slot_id"])
+
+    groups = []
+    for budget_id in sorted(groups_by_budget_id):
+        group = groups_by_budget_id[budget_id]
+        group["projected_energy_wh"] = round(group["projected_energy_wh"], 3)
+        group["effective_duration_s"] = round(
+            group["effective_duration_s"],
+            3,
+        )
+        if (
+            group["projected_energy_wh"]
+            > group["headroom_export_budget_wh"] + 1.0
+        ):
+            invalid_slot_count += 1
+        group_slots = [
+            slot
+            for slot in slots
+            if slot["headroom_export_budget_id"] == budget_id
+        ]
+        if any(
+            left["end_ts"] > right["start_ts"]
+            for left, right in zip(group_slots, group_slots[1:])
+        ):
+            invalid_slot_count += 1
+        window_revision = _policy_sha256_contract({
+            "schema": schema,
+            "energy_basis": energy_basis,
+            "headroom_export_budget_id": budget_id,
+            "window_start_ts": group["window_start_ts"],
+            "window_end_ts": group["window_end_ts"],
+            "effective_start_ts": group["effective_start_ts"],
+            "effective_end_ts": group["effective_end_ts"],
+            "effective_duration_s": group["effective_duration_s"],
+        })
+        segment_revision = _policy_sha256_contract({
+            "schema": schema,
+            "energy_basis": energy_basis,
+            "headroom_export_budget_id": budget_id,
+            "reserve_floor_soc_pct": group["reserve_floor_soc_pct"],
+            "target_soc_pct": group["target_soc_pct"],
+            "effective_start_ts": group["effective_start_ts"],
+            "effective_end_ts": group["effective_end_ts"],
+            "effective_duration_s": group["effective_duration_s"],
+        })
+        group["window_id"] = (
+            "headroom-window:%s" % window_revision[7:]
+            if window_revision.startswith("sha256:")
+            else ""
+        )
+        group["segment_id"] = (
+            "headroom-segment:%s" % segment_revision[7:]
+            if segment_revision.startswith("sha256:")
+            else ""
+        )
+        if not group["window_id"] or not group["segment_id"]:
+            invalid_slot_count += 1
+        final_slot_ids = []
+        for slot in group_slots:
+            slot["window_id"] = group["window_id"]
+            slot["segment_id"] = group["segment_id"]
+            slot["window_start_ts"] = group["window_start_ts"]
+            slot["window_end_ts"] = group["window_end_ts"]
+            slot["effective_window_start_ts"] = group["effective_start_ts"]
+            slot["effective_window_end_ts"] = group["effective_end_ts"]
+            slot["effective_window_duration_s"] = group[
+                "effective_duration_s"
+            ]
+            slot["projection_horizon_contract"] = group[
+                "projection_horizon_contract"
+            ]
+            slot_revision = _policy_sha256_contract({
+                "schema": schema,
+                "energy_basis": energy_basis,
+                "headroom_export_budget_id": budget_id,
+                "window_id": group["window_id"],
+                "segment_id": group["segment_id"],
+                "start_ts": slot["start_ts"],
+                "end_ts": slot["end_ts"],
+                "effective_start_ts": slot["effective_start_ts"],
+                "effective_duration_s": slot["effective_duration_s"],
+                "effective_window_start_ts": group["effective_start_ts"],
+                "effective_window_end_ts": group["effective_end_ts"],
+                "effective_window_duration_s": group[
+                    "effective_duration_s"
+                ],
+                "projected_action": slot["projected_action"],
+                "projected_source_action": slot[
+                    "projected_source_action"
+                ],
+                "projected_mode": slot["projected_mode"],
+                "projected_power_w": slot["projected_power_w"],
+                "headroom_export_slot_energy_wh": slot[
+                    "headroom_export_slot_energy_wh"
+                ],
+            })
+            final_slot_id = (
+                "headroom-slot:%s" % slot_revision[7:]
+                if slot_revision.startswith("sha256:")
+                else ""
+            )
+            if not final_slot_id:
+                invalid_slot_count += 1
+            slot["headroom_export_slot_id"] = final_slot_id
+            slot["projection_id"] = final_slot_id
+            final_slot_ids.append(final_slot_id)
+        group["slot_ids"] = final_slot_ids
+        groups.append(group)
+
+    complete = invalid_slot_count == 0
+    if not complete:
+        slots = []
+        groups = []
+    effective_start_ts = min(
+        (slot["effective_start_ts"] for slot in slots),
+        default=None,
+    )
+    effective_end_ts = max(
+        (slot["end_ts"] for slot in slots),
+        default=None,
+    )
+    effective_duration_s = round(
+        sum(slot["effective_duration_s"] for slot in slots),
+        3,
+    )
+    plan = {
+        "schema": schema,
+        "energy_basis": energy_basis,
+        "generated_at_ts": generated_at_ts,
+        "effective_start_ts": effective_start_ts,
+        "effective_end_ts": effective_end_ts,
+        "effective_duration_s": effective_duration_s,
+        "projection_only": True,
+        "executable": False,
+        "commands_allowed": False,
+        "hardware_effect": False,
+        "slot_duration_s": SLOT_MS // 1000,
+        "projected_action": "HEADROOM_EXPORT",
+        "projected_source_action": source_action,
+        "projected_mode": projected_mode,
+        "complete": complete,
+        "status": "complete" if complete else "invalid_slot_contract",
+        "invalid_slot_count": invalid_slot_count,
+        "slot_count": len(slots),
+        "group_count": len(groups),
+        "groups": groups,
+        "slots": slots,
+    }
+    plan["revision"] = _policy_sha256_contract(plan)
+    return plan
 
 
 def _uniform_plateau_allocation(candidates, budget_wh):
@@ -9003,14 +10706,17 @@ def build_direct_marketing_shadow_plan(
         now_ms,
     )
     if neutral_policy_slots:
-        policy_timeline.extend(neutral_policy_slots)
+        policy_timeline = _replace_non_executable_source_policies(
+            policy_timeline,
+            neutral_policy_slots,
+        )
 
     if charge_block_wait_slots:
-        windows.extend(
+        candidate_windows = list(windows) + [
             dict(item["selected_window"])
             for item in charge_block_wait_slots
             if isinstance(item.get("selected_window"), dict)
-        )
+        ]
         # Der veröffentlichte DV-Plan ist selbsttragend. Neue Warteslots werden
         # deshalb bereits im Producer vollständig an ihr einziges aktives
         # Zeitfenster gebunden; Test- und Runtime-Consumer dürfen den Vertrag
@@ -9023,12 +10729,50 @@ def build_direct_marketing_shadow_plan(
             if end_ts > probe_ms:
                 probe_ms = min(end_ts - 1, probe_ms)
             enriched_charge_block_wait_slots.append(
-                _enrich_policy_candidate_contract(item, windows, probe_ms)
+                _enrich_policy_candidate_contract(
+                    item,
+                    candidate_windows,
+                    probe_ms,
+                )
             )
-        policy_timeline.extend(enriched_charge_block_wait_slots)
-        # Das erneuerte Zeitfenster ist enger als ein neutraler Ursprungsslot
-        # und muss deshalb bei gleichem Now-Zeitpunkt vor ihm gewählt werden.
-        valid_until_ts = _plan_valid_until_ts(windows, now_ms)
+        candidate_policy_timeline, replaced_policy_count = (
+            _replace_charge_block_wait_source_policies(
+                policy_timeline,
+                enriched_charge_block_wait_slots,
+            )
+        )
+        coverage_ok, invalid_policy_slots = (
+            _policy_timeline_exact_slot_coverage(
+                candidate_policy_timeline,
+                timeline_horizon_slots if timeline_horizon_slots else annotated,
+            )
+        )
+        charge_block_wait_plan["replaced_policy_count"] = replaced_policy_count
+        charge_block_wait_plan["policy_timeline_invalid_slot_count"] = (
+            invalid_policy_slots
+        )
+        if coverage_ok and replaced_policy_count > 0:
+            windows[:] = candidate_windows
+            policy_timeline = candidate_policy_timeline
+            # Das erneuerte Zeitfenster ist enger als ein neutraler Ursprungsslot
+            # und muss deshalb bei gleichem Now-Zeitpunkt vor ihm gewählt werden.
+            valid_until_ts = _plan_valid_until_ts(windows, now_ms)
+        else:
+            charge_block_wait_plan.update({
+                "complete": False,
+                "action_gap_slot_count": max(
+                    1,
+                    safe_int(
+                        charge_block_wait_plan.get("action_gap_slot_count"),
+                        0,
+                    ) + invalid_policy_slots,
+                ),
+                "reason": (
+                    "materialized_headroom_policy_replacement_incomplete"
+                    if replaced_policy_count <= 0
+                    else "policy_timeline_not_one_to_one"
+                ),
+            })
     policy_timeline.sort(
         key=lambda item: (
             safe_int(item.get("start_ts"), 0),
@@ -9109,6 +10853,33 @@ def build_direct_marketing_shadow_plan(
         "lcos_model": "base_plus_depth",
         "temperature_guard": "not_available" if not cfg_bool(config.get("_runtime_direct_marketing_battery_temperature_valid"), False) else "runtime_input",
     }
+    headroom_projection_reconciliation = (
+        _reconcile_headroom_projection_policy(
+            entries,
+            windows,
+            policy_timeline,
+            policy_decision,
+            mode,
+            now_ms,
+        )
+    )
+    if headroom_projection_reconciliation["valid"]:
+        entries = headroom_projection_reconciliation["entries"]
+        windows = headroom_projection_reconciliation["windows"]
+        policy_timeline = headroom_projection_reconciliation[
+            "policy_timeline"
+        ]
+        policy_decision = headroom_projection_reconciliation[
+            "policy_decision"
+        ]
+    headroom_projection_plan = _build_headroom_projection_plan(
+        headroom_projection_reconciliation["entries"],
+        reserve,
+        mode,
+        capacity_wh,
+        now_ms,
+        source_contract_valid=headroom_projection_reconciliation["valid"],
+    )
 
     return {
         "active": bool(windows),
@@ -9139,6 +10910,7 @@ def build_direct_marketing_shadow_plan(
         "policy_decision": policy_decision,
         "policy_timeline": policy_timeline,
         "charge_block_wait_plan": charge_block_wait_plan,
+        "headroom_projection_plan": headroom_projection_plan,
         "pv_store_allocation": pv_store_allocation,
         "pv_store_marginal_contract": pv_store_marginal_contract,
         "future_export_credit": future_export_credit,

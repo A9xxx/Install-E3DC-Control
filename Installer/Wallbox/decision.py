@@ -1816,6 +1816,7 @@ def phase_observation_contract(
     )
     detected = valid_phase_count(detected_phases, 1) or 1
     target = valid_phase_count(phase_target, valid_phase_count(st.get("phases_target"), 0))
+    reported_target = valid_phase_count(st.get("phases_target"), 0)
     in_use = valid_phase_count(st.get("phases_in_use"), 0)
     actual = valid_phase_count(st.get("phases_actual"), 0)
     switch_phases = valid_phase_count(phase_switch_phases, 0)
@@ -1848,6 +1849,7 @@ def phase_observation_contract(
     evse_supply_phases = max(1, min(3, int(wallbox_phases or cable_phases or 3)))
 
     measured_phases = 0
+    measured_phase_power_w = 0.0
     if bool(st.get("phase_power_verified", False)):
         phase_values = []
         for key in ("phase_power_l1_w", "phase_power_l2_w", "phase_power_l3_w"):
@@ -1855,6 +1857,7 @@ def phase_observation_contract(
                 phase_values.append(abs(float(st.get(key, 0.0) or 0.0)))
             except (TypeError, ValueError):
                 phase_values.append(0.0)
+        measured_phase_power_w = sum(phase_values)
         measured_phases = sum(1 for value in phase_values if value > 250.0)
         measured_phases = valid_phase_count(measured_phases, 0)
 
@@ -1881,6 +1884,50 @@ def phase_observation_contract(
     if charger_class_name == "E3DCCharger" and normalized_driver == "e3dc_native":
         can_switch = False
     evse_phase_switch_capable = bool(can_switch)
+
+    phase_power_target_transition = bool(
+        evse_phase_switch_capable
+        and target == 3
+        and reported_target == 3
+        and in_use == 3
+        and vehicle_profile_phase_bound
+        and vehicle_phases >= 3
+        and measured_phases in (1, 2)
+        and measured_phase_power_w < 6.0 * 230.0 * 3.0
+        and st.get("driver_status_valid") is True
+        and st.get("driver_status_stale") is not True
+        and st.get("driver_status_degraded") is not True
+        and st.get("driver_status_glitch") is not True
+        and st.get("driver_status_plausible") is not False
+    )
+    if phase_power_target_transition:
+        # Beim Anlauf/Abwurf kann der phasenweise Leistungszähler einen Zyklus
+        # hinter dem frischen EVSE-Readback liegen. Ein bekannter 3p-Wagen mit
+        # übereinstimmendem target+in_use bleibt unterhalb der 3p-Mindestlast
+        # deshalb 3p; andernfalls würde derselbe Übergang als 1p budgetiert und
+        # einen gefährlich hohen Stromsollwert erzeugen.
+        actual_phases = 3
+        actual_source = "phases_in_use_target_transition"
+
+    idle_confirmed_target = bool(
+        evse_phase_switch_capable
+        and target in (1, 3)
+        and reported_target == target
+        and st.get("driver_status_valid") is True
+        and st.get("driver_status_stale") is not True
+        and st.get("driver_status_degraded") is not True
+        and st.get("driver_status_glitch") is not True
+        and st.get("driver_status_plausible") is not False
+        and bool(
+            st.get("plug_state")
+            or st.get("car") == 2
+            or st.get("plug")
+            or st.get("connected")
+        )
+        and not real_charging
+        and status_real_power(st) <= 100.0
+        and st.get("cp_interrupt_isactive") in (False, 0)
+    )
 
     native_fixed_three_phase = bool(
         (charger_class_name in ("E3DCCharger", "E3DCMultiConnectCharger") or normalized_driver in ("e3dc_native", "e3dc_multi_connect", "e3dc_rscp"))
@@ -1913,6 +1960,19 @@ def phase_observation_contract(
             reason_code = "vehicle_profile_1p_on_fixed_3p_evse"
         else:
             reason_code = "vehicle_profile_1p"
+    elif idle_confirmed_target:
+        # Bei einer phasenumschaltbaren EVSE ist das Fahrzeugprofil die
+        # maximale AC-Fähigkeit, nicht die gegenwärtige Verdrahtung. Während
+        # des physisch stromlosen Wiederanlaufs gibt es naturgemäß noch keine
+        # Istphasen. Ein frischer, ruhiger und zum Managerziel passender
+        # Geräte-Readback ist dann der maßgebliche Topologiebeleg. Andernfalls
+        # entstünde ein Zirkelschluss: 3p-Mindestbudget trotz bestätigtem 1p,
+        # aber keine Istphasen vor dem ersten Ladestrom.
+        effective = target
+        basis = "idle_confirmed_target"
+        phase_evidence_valid = True
+        vehicle_phase_source = "evse_idle_target_readback"
+        reason_code = f"evse_idle_confirmed_target_{target}p"
     elif vehicle_profile_phase_bound and vehicle_phases >= 3:
         effective = min(evse_supply_phases, vehicle_phases)
         basis = "vehicle_profile"
@@ -1973,6 +2033,8 @@ def phase_observation_contract(
         "reason_code": str(reason_code),
         "detected_phases": int(detected),
         "target_phases": int(target),
+        "reported_target_phases": int(reported_target),
+        "idle_confirmed_target": bool(idle_confirmed_target),
         "switch_phases": int(switch_phases),
         "cap_phases": int(cap_phases),
         "cable_phases": int(cable_phases),
@@ -1986,6 +2048,10 @@ def phase_observation_contract(
         ),
         "wallbox_phases": int(wallbox_phases),
         "measured_phases": int(measured_phases),
+        "measured_phase_power_w": float(measured_phase_power_w),
+        "phase_power_target_transition": bool(
+            phase_power_target_transition
+        ),
         "phase_power_verified": bool(st.get("phase_power_verified", False)),
         "can_switch_phases": bool(can_switch),
         "phase_switch_capability": str(cap.get("capability", st.get("phase_switch_capability", "")) or ""),
@@ -2600,6 +2666,7 @@ def pv_hybrid_energy_gate(
     stop_hold_s: Any = 180.0,
     stop_energy_wh: Any = 75.0,
     hard_import_w: Any = 2500.0,
+    ordinary_grid_import_sequence_active: bool = False,
     enabled: bool = True,
 ) -> Dict[str, Any]:
     """Sammelt PV-Energiebelege für ruhige Start-/Stoppentscheidungen der Wallbox.
@@ -2607,11 +2674,12 @@ def pv_hybrid_energy_gate(
     Bei starkem Überschuss darf die Regelung schnell starten, ein nur knapp
     ausreichendes 6-A-Fenster muss jedoch zeitlich oder energetisch Bestand
     haben. Stopps verhalten sich spiegelbildlich: Kurzzeitig negative Energie
-    wird überbrückt, während ein harter Netzbezug aus Sicherheitsgründen ein
-    sofortiger Stoppgrund bleibt. Das negative Integral nutzt die gemessene oder
-    konservativ abgeleitete laufende Leistung. Deshalb verbraucht ein großes,
-    batteriegestütztes Defizit den Übergangspuffer früher als eine kurze kleine
-    Wolkendelle.
+    wird überbrückt. Gewöhnlicher Netzbezug einer laufenden PV-Ladung wird vom
+    zentralen Mindeststrom-/Importintegral behandelt und darf dieses ältere
+    Energiegate nicht als Sofort-Stopp umgehen. Das negative Integral nutzt die
+    gemessene oder konservativ abgeleitete laufende Leistung. Deshalb verbraucht
+    ein großes, batteriegestütztes Defizit den Übergangspuffer früher als eine
+    kurze kleine Wolkendelle.
     """
 
     prev = previous if isinstance(previous, dict) else {}
@@ -2652,7 +2720,10 @@ def pv_hybrid_energy_gate(
         else max(0.0, inferred_running_power_w)
     )
     uncovered_hold_w = max(0.0, running_power_w - budget, grid_w) if running else 0.0
-    hard_stop = bool(grid_w >= hard_import)
+    hard_stop = bool(
+        grid_w >= hard_import
+        and not ordinary_grid_import_sequence_active
+    )
     start_signal = bool(
         charger_connected
         and not running
@@ -2660,7 +2731,10 @@ def pv_hybrid_energy_gate(
         and budget >= max(1.0, min_power - 120.0)
         and not hard_stop
     )
-    stop_signal = bool(running and (budget < max(0.0, min_power - 120.0) or hard_stop))
+    stop_signal = bool(
+        running
+        and (budget < max(0.0, min_power - 120.0) or hard_stop)
+    )
     strong_start = bool(start_signal and (budget >= min_power + strong_w or cap >= minimum + 2))
 
     positive_wh = max(0.0, _safe_float(prev.get("positive_wh", 0.0), 0.0))
@@ -2679,10 +2753,14 @@ def pv_hybrid_energy_gate(
         negative_age = 0.0
         negative_wh = 0.0
     elif stop_signal:
-        negative_age += dt_s
-        negative_wh += uncovered_hold_w * dt_s / 3600.0
         positive_age = 0.0
         positive_wh = 0.0
+        if ordinary_grid_import_sequence_active:
+            negative_age = 0.0
+            negative_wh = 0.0
+        else:
+            negative_age += dt_s
+            negative_wh += uncovered_hold_w * dt_s / 3600.0
     else:
         positive_age = 0.0
         positive_wh = 0.0
@@ -2700,9 +2778,14 @@ def pv_hybrid_energy_gate(
     stop_allowed = bool(
         not enabled
         or not stop_signal
-        or hard_stop
-        or negative_age >= stop_hold
-        or negative_wh >= stop_wh
+        or (
+            not ordinary_grid_import_sequence_active
+            and (
+                hard_stop
+                or negative_age >= stop_hold
+                or negative_wh >= stop_wh
+            )
+        )
     )
 
     reason = "disabled"
@@ -2711,6 +2794,8 @@ def pv_hybrid_energy_gate(
             reason = "hard_import"
         elif start_signal and not running:
             reason = "start_allowed" if start_allowed else "start_integral_wait"
+        elif stop_signal and ordinary_grid_import_sequence_active:
+            reason = "minimum_current_import_sequence"
         elif stop_signal:
             reason = "stop_allowed" if stop_allowed else "stop_integral_hold"
         else:
@@ -2732,6 +2817,9 @@ def pv_hybrid_energy_gate(
         "stop_signal": bool(stop_signal),
         "strong_start": bool(strong_start),
         "hard_stop": bool(hard_stop),
+        "ordinary_grid_import_sequence_active": bool(
+            ordinary_grid_import_sequence_active
+        ),
         "positive_wh": float(positive_wh),
         "negative_wh": float(negative_wh),
         "positive_age_s": float(positive_age),
@@ -2778,6 +2866,9 @@ def pv_hybrid_hold_action(
     running = bool(gate_running or st.get("running", False))
     start_allowed = bool(st.get("start_allowed", True))
     hold_allowed = bool(st.get("hold_allowed", False))
+    import_sequence_active = bool(
+        st.get("ordinary_grid_import_sequence_active", False)
+    )
     quiet = bool(mode_switch_quiet_active)
 
     if enabled and cap > 0 and not running and (not start_allowed or quiet):
@@ -2812,6 +2903,23 @@ def pv_hybrid_hold_action(
         and hold_allowed
         and not floor_battery_guard_active
     ):
+        if import_sequence_active:
+            # Typisierter Non-Output-Hold: Zwischen zwei Fast-Grid-Takten darf
+            # kein älterer Nullbudgetpfad stoppen oder einen Strom setzen. Die
+            # bestätigte Hardwareausgabe bleibt unangetastet; nur Fast-Grid
+            # darf sie reduzieren.
+            return {
+                "action": "HOLD_GRID_IMPORT_SEQUENCE",
+                "target_amp": 0.0,
+                "allowed_w": budget_w,
+                "min_power_w": min_power,
+                "log_key": "minimum_current_import_sequence_hold",
+                "reason": "minimum_current_import_sequence",
+                "ordinary_grid_import_sequence_active": True,
+                "negative_age_s": 0.0,
+                "negative_wh": 0.0,
+            }
+
         # Kein Vollstrom aus dem Akku: Bei fehlendem nachhaltigem Budget wird
         # zuerst auf den fahrzeugseitigen Mindeststrom abgesenkt. So überbrückt
         # die Hysterese kurze PV-Dellen ohne unnötiges Schalten, bleibt aber ein
@@ -2859,6 +2967,11 @@ def zero_budget_contract_from_pv_hybrid_gate(
     )
     hard_stop = bool(active and st.get("hard_stop", False))
     hold_allowed = bool(active and st.get("hold_allowed", False) and not hard_stop)
+    import_sequence_active = bool(
+        active
+        and hold_allowed
+        and st.get("ordinary_grid_import_sequence_active", False)
+    )
     stop_allowed = bool(active and (st.get("stop_allowed", False) or hard_stop))
     released = bool(active and stop_allowed and not hold_allowed)
     return {
@@ -2870,6 +2983,9 @@ def zero_budget_contract_from_pv_hybrid_gate(
         "age_s": max(0.0, _safe_float(st.get("negative_age_s", 0.0), 0.0)),
         "deficit_wh": max(0.0, _safe_float(st.get("negative_wh", 0.0), 0.0)),
         "hold_allowed": bool(hold_allowed),
+        "ordinary_grid_import_sequence_active": bool(
+            import_sequence_active
+        ),
         "stop_allowed": bool(stop_allowed),
         "released": bool(released),
         "hard_stop": bool(hard_stop),
@@ -3044,6 +3160,13 @@ def start_stop_hold_action(
         zero_budget_active
         and zero_budget.get("hold_allowed", False)
         and not zero_budget.get("hard_stop", False)
+    )
+    zero_budget_import_sequence_active = bool(
+        zero_budget_hold_allowed
+        and zero_budget.get(
+            "ordinary_grid_import_sequence_active",
+            False,
+        )
     )
     zero_budget_stop_allowed = bool(
         zero_budget_active
@@ -3243,6 +3366,58 @@ def start_stop_hold_action(
         and not local_grid_allowed
         and not price_boost_wallbox_active
     )
+
+    if (
+        zero_budget_import_sequence_active
+        and charger_connected
+        and mode > 0
+        and wbminsoc_gate_open
+        and not priority_forced_stop
+        and not budget_timeout
+        and not openwb_floor_zero_budget_stop_active
+        and not native_battery_drain_zero_budget_active
+        and not wbminsoc_floor_grid_stop
+        and not (
+            local_price_optimizing_active
+            or local_grid_allowed
+            or price_boost_wallbox_active
+            or predump_wallbox_active
+        )
+    ):
+        return {
+            "action": "HOLD_GRID_IMPORT_SEQUENCE",
+            "target_amp": 0.0,
+            "hold_amp": 0.0,
+            "is_new_start": False,
+            "min_charge_hold_active": False,
+            "multi_zero_budget_hold": False,
+            "openwb_zero_budget_hold": False,
+            "native_running_charge_hold": False,
+            "native_current_down_hold": False,
+            "native_mode_no_stop_wait": False,
+            "native_start_grace_active": False,
+            "native_battery_drain_zero_budget_active": False,
+            "native_verified_pv_sink_hold_active": False,
+            "openwb_phase_transition_grace_active": False,
+            "openwb_phase_transition_offer_active": False,
+            "transient_hold_active": False,
+            "transient_offer_active": False,
+            "transient_hold_reason": "",
+            "zero_budget_contract_valid": bool(zero_budget_valid),
+            "zero_budget_contract_active": bool(zero_budget_active),
+            "zero_budget_hold_allowed": True,
+            "zero_budget_stop_allowed": False,
+            "zero_budget_hard_stop": False,
+            "zero_budget_age_s": 0.0,
+            "zero_budget_deficit_wh": 0.0,
+            "ordinary_grid_import_sequence_active": True,
+            "zero_budget_contract_source": str(
+                zero_budget.get("source", "pv_hybrid_energy_gate")
+                or "pv_hybrid_energy_gate"
+            ),
+            "need_stop_toggle": False,
+            "reason": "minimum_current_import_sequence",
+        }
 
     min_charge_hold_active = bool(
         min_charge_s > 0.0
@@ -3672,6 +3847,104 @@ def start_stop_effective_action_contract(
     }
 
 
+def ordinary_grid_import_sequence_required(
+    *,
+    grid_power_w: Any,
+    threshold_w: Any,
+    grid_import_down_active: bool,
+    charger_connected: bool,
+    charging_running: bool,
+    control_mode: Any,
+    public_mode: Any,
+    safety_blocked: bool,
+    priority_forced_stop: bool,
+    budget_timeout: bool,
+    grid_allowed: bool,
+    price_optimizing_active: bool,
+    price_boost_active: bool,
+    predump_active: bool,
+    scheduled_slot_active: bool,
+) -> bool:
+    """Bindet gewöhnlichen Netzbezug an die Mindeststrom-/Wh-Sequenz.
+
+    Die Funktion gibt keine Hardwareaktion frei. Sie verhindert lediglich,
+    dass ältere Phasen- oder PV-Hybrid-Pfade den zentralen Ablauf zwischen zwei
+    Fast-Grid-Takten überholen. Explizite Netzlade- und Schutzmodi bleiben
+    außerhalb dieses Vertrags.
+    """
+
+    return bool(
+        (
+            _safe_float(grid_power_w, 0.0)
+            > max(0.0, _safe_float(threshold_w, 0.0))
+            or grid_import_down_active
+        )
+        and charger_connected
+        and charging_running
+        and _safe_int(control_mode, 0) > 0
+        and _safe_int(public_mode, 0) > 0
+        and not safety_blocked
+        and not priority_forced_stop
+        and not budget_timeout
+        and not (
+            grid_allowed
+            or price_optimizing_active
+            or price_boost_active
+            or predump_active
+            or scheduled_slot_active
+        )
+    )
+
+
+def curve_direct_shared_minimum_hold_required(
+    *,
+    charging_running: bool,
+    current_amp: Any,
+    direct_target_amp: Any,
+    min_amp: Any,
+    explicit_stop_or_safety_blocked: bool,
+) -> bool:
+    """Übergibt einen Direct-0A-Rand an die gemeinsame Halte-/Stopppolicy.
+
+    Der Direct-Regler bleibt für physisch ladbare Sollströme zuständig. Fällt
+    sein finales, bereits allokiertes Ziel bei laufender Ladung unter den
+    Mindeststrom, darf er daraus jedoch keinen eigenen Stop ableiten. Ohne
+    harte oder explizite Stopkante entscheiden dann Fast-Min beziehungsweise
+    das PV-Hybrid-Energiegate über Halten, Phasenwechsel oder Stop.
+    """
+
+    minimum = max(6.0, _safe_float(min_amp, 6.0))
+    # Die bestätigte Charge-Truth ist hier maßgeblich. Eine fehlende oder
+    # unterminimierte Stromtelemetrie darf keinen eigenen Direct-0A-Ausgang
+    # wieder freigeben; sie wird erst im gemeinsamen Folgepfad bewertet.
+    return bool(
+        charging_running
+        and not explicit_stop_or_safety_blocked
+        and _safe_float(direct_target_amp, 0.0) < minimum
+    )
+
+
+def openwb_mode9_pv_phase_down_required(
+    *,
+    openwb_phase_capable: bool,
+    current_phases: Any,
+    pv_power_w: Any,
+    grid_power_w: Any,
+    ordinary_grid_import_sequence_active: bool,
+) -> bool:
+    """Schützt den alten Modus-9-Phasenpfad vor einer zweiten Netzregelung."""
+
+    return bool(
+        openwb_phase_capable
+        and _safe_int(current_phases, 0) != 1
+        and not ordinary_grid_import_sequence_active
+        and (
+            _safe_float(pv_power_w, 0.0) < 4500.0
+            or _safe_float(grid_power_w, 0.0) > 200.0
+        )
+    )
+
+
 def phase_switch_recommendation(
     *,
     openwb_phase_capable: bool,
@@ -3713,6 +3986,7 @@ def phase_switch_recommendation(
     phase_confirm_timeout_s: float,
     prefer_current_first_before_phase_up: bool = False,
     phase_up_min_runtime_s: float = 0.0,
+    ordinary_grid_import_sequence_active: bool = False,
 ) -> Dict[str, Any]:
     """Empfiehlt eine Phasenaktion, ohne einen Wallbox-Befehl zu senden."""
 
@@ -3831,6 +4105,14 @@ def phase_switch_recommendation(
     if start_1p_needed:
         return wait("SWITCH_1P", 1, "start_1p", 0, 0)
 
+    budget_phase_down_needed = bool(
+        not ordinary_grid_import_sequence_active
+        and (
+            cap == 0
+            or (openwb_pro and cap <= 6)
+            or grid_w > _safe_float(phase_down_grid_w, 0.0)
+        )
+    )
     phase_down_needed = bool(
         mode > 0
         and not local_price_optimizing_active
@@ -3838,20 +4120,22 @@ def phase_switch_recommendation(
         and phase_configured_3p
         and switch_phases >= 3
         and not phase_3p_keep_supported
-        and (
-            cap == 0
-            or (openwb_pro and cap <= 6)
-            or grid_w > _safe_float(phase_down_grid_w, 0.0)
-            or not wbminsoc_gate_open
-        )
+        and (budget_phase_down_needed or not wbminsoc_gate_open)
     )
     if phase_down_needed:
         down_reason = "effective_cap"
-        if grid_w > _safe_float(phase_down_grid_w, 0.0):
+        if (
+            not ordinary_grid_import_sequence_active
+            and grid_w > _safe_float(phase_down_grid_w, 0.0)
+        ):
             down_reason = "grid_import"
-        elif cap == 0:
+        elif not ordinary_grid_import_sequence_active and cap == 0:
             down_reason = "no_3p_budget"
-        elif openwb_pro and cap <= 6:
+        elif (
+            not ordinary_grid_import_sequence_active
+            and openwb_pro
+            and cap <= 6
+        ):
             down_reason = "3p_minimum"
         elif not wbminsoc_gate_open:
             down_reason = "wbminsoc_floor"
@@ -3883,6 +4167,7 @@ def phase_switch_recommendation(
 
     phase_up_possible = bool(
         mode > 0
+        and not ordinary_grid_import_sequence_active
         and cap > 0
         and phase_3p_supported
         and not vehicle_1p_only
@@ -3930,7 +4215,11 @@ def phase_switch_recommendation(
     return {
         "action": "KEEP_PHASES",
         "target_phases": 0,
-        "reason": "stable",
+        "reason": (
+            "minimum_current_import_sequence"
+            if ordinary_grid_import_sequence_active
+            else "stable"
+        ),
         "wait_s": 0,
         "remaining_s": 0,
     }
@@ -4477,6 +4766,14 @@ def driver_command_from_decision_payload(payload: Optional[Dict[str, Any]]) -> D
     elif start_action == "SUPPRESS_NATIVE_STOP":
         kind = "noop"
         reason = reason or "suppress_native_stop"
+    elif start_action == "HOLD_GRID_IMPORT_SEQUENCE":
+        # Dieser Hold besitzt bewusst keinen eigenen Stromausgang. Die
+        # Fast-Grid-Regelung senkt den bestätigten Strom schrittweise; dieser
+        # Vertrag verhindert nur, dass ein nachgelagerter Nullbudgetpfad
+        # parallel stoppt oder einen Phasenwechsel auslöst.
+        kind = "noop"
+        amp = 0
+        reason = reason or "minimum_current_import_sequence"
     elif start_action.startswith("HOLD_") and start_action not in CURRENT_OUTPUT_HOLD_ACTIONS:
         kind = "noop"
         amp = 0

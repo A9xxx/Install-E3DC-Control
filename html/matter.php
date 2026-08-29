@@ -7,82 +7,75 @@ $resetNotice = null;
 $resetOk = null;
 
 function matterServiceInstalled() {
+    if (e3dcIsDockerEnvironment()) {
+        $matterDir = '/app/pi/Install/Installer/matter';
+        return is_file($matterDir . '/package.json')
+            && is_file($matterDir . '/package-lock.json')
+            && is_file($matterDir . '/matter_bridge.js');
+    }
     exec('/bin/systemctl list-unit-files e3dc-matter-bridge.service --no-legend 2>/dev/null', $out, $code);
     return $code === 0 && !empty($out);
 }
 
 function matterServiceActive() {
+    if (e3dcIsDockerEnvironment()) {
+        // Docker besitzt keinen belastbaren systemd-Dienststatus. Der Worker
+        // wird ausschließlich durch PID 1 des Containers verwaltet.
+        return null;
+    }
     exec('/bin/systemctl is-active e3dc-matter-bridge.service 2>/dev/null', $out, $code);
     return $code === 0 && trim(implode("\n", $out)) === 'active';
-}
-
-function clearMatterDir($dir) {
-    if (!is_dir($dir)) return true;
-    $ok = true;
-    $items = new RecursiveIteratorIterator(
-        new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS),
-        RecursiveIteratorIterator::CHILD_FIRST
-    );
-    foreach ($items as $item) {
-        $path = $item->getPathname();
-        $ok = $item->isDir() ? (@rmdir($path) && $ok) : (@unlink($path) && $ok);
-    }
-    return $ok;
 }
 
 // Pairing Reset Handle
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['reset_pairing'])) {
     e3dcRequireCsrfToken(false);
-    $matterStorageDir = '/var/www/html/data/matter-storage';
-    $pairingFile = '/var/www/html/ramdisk/matter_pairing.json';
-
-    if (!matterServiceInstalled()) {
-        $storageOk = clearMatterDir($matterStorageDir);
-        $pairingRemoval = e3dcRemoveRuntimeCommandFile($pairingFile);
-        $resetOk = false;
-        $resetNotice = ($storageOk && !empty($pairingRemoval['success']))
-            ? "Matter-Kopplungsdaten wurden gelöscht, aber der Dienst e3dc-matter-bridge ist nicht installiert. Installiere das Matter-Modul, um einen neuen Code zu erzeugen."
-            : "Matter-Kopplungsdaten konnten nicht vollständig gelöscht werden. Bitte führe im Installationscenter „Rechte reparieren“ aus.";
+    $reset = e3dcResetMatterPairing();
+    $resetOk = !empty($reset['success']);
+    if (!$resetOk) {
+        $resetNotice = (string)($reset['message'] ?? 'Matter-Kopplung konnte nicht sicher zurückgesetzt werden.');
+    } elseif (!empty($reset['restart_queued'])) {
+        $resetNotice = "Matter-Reset wurde sicher angefordert. Der Container startet neu und erzeugt danach einen neuen Kopplungscode.";
+    } elseif (!empty($reset['service_missing'])) {
+        $resetNotice = "Matter-Kopplungsdaten wurden sicher gelöscht. Der Matter-Dienst ist nicht installiert und wurde deshalb nicht gestartet.";
+    } elseif (!empty($reset['service_preserved_inactive'])) {
+        $resetNotice = "Matter-Kopplungsdaten wurden sicher gelöscht. Der zuvor gestoppte Matter-Dienst bleibt wie gewünscht gestoppt.";
     } else {
-        $stop = e3dcRunServiceWrapperAction('stop', ['e3dc-matter-bridge']);
-        if (empty($stop['success'])) {
-            $resetOk = false;
-            $resetNotice = "Matter-Dienst konnte vor dem Löschen nicht sicher gestoppt werden. Es wurden keine Kopplungsdaten verändert: "
-                . implode("; ", $stop['errors'] ?? []);
-        } else {
-            $storageOk = clearMatterDir($matterStorageDir);
-            $pairingRemoval = e3dcRemoveRuntimeCommandFile($pairingFile);
-            $start = e3dcRunServiceWrapperAction('start', ['e3dc-matter-bridge']);
-            $startOk = !empty($start['success'])
-                && in_array('e3dc-matter-bridge.service', (array)($start['changed'] ?? []), true);
-            $resetOk = $storageOk && !empty($pairingRemoval['success']) && $startOk;
-            if ($resetOk) {
-                $resetNotice = "Matter-Kopplung wurde zurückgesetzt. Der bestätigte Dienststart erzeugt gleich einen neuen Code.";
-            } elseif (!$storageOk || empty($pairingRemoval['success'])) {
-                $resetNotice = "Matter-Kopplung wurde nicht vollständig gelöscht. Der Dienststart wurde anschließend "
-                    . ($startOk ? "bestätigt." : "ebenfalls nicht bestätigt. Bitte „Rechte reparieren“ ausführen.");
-            } else {
-                $resetNotice = "Matter-Kopplung wurde gelöscht, aber der Dienststart nicht bestätigt: "
-                    . implode("; ", $start['errors'] ?? []);
-            }
-        }
+        $resetNotice = "Matter-Kopplung wurde sicher zurückgesetzt. Der stabil bestätigte Dienststart erzeugt gleich einen neuen Code.";
+    }
+    if ($resetOk && !empty($reset['storage_quarantined'])) {
+        $resetNotice .= ' Der alte Matter-Storage wurde in der privaten Resettransaktion isoliert, descriptorgebunden geleert und die Quarantäne anschließend vollständig entfernt.';
     }
 }
 
+if ($resetNotice === null && e3dcIsDockerEnvironment()) {
+    $dockerResetStatus = e3dcMatterResetDockerStatus();
+    if (in_array($dockerResetStatus, ['MATTER_RESET_OK_DOCKER', 'MATTER_RESET_OK_DOCKER_QUARANTINED'], true)) {
+        $resetOk = true;
+        $resetNotice = 'Matter-Kopplungsdaten wurden vor dem Workerstart sicher gelöscht. Die Matter Bridge darf mit einem neuen Kopplungscode starten.';
+        if ($dockerResetStatus === 'MATTER_RESET_OK_DOCKER_QUARANTINED') {
+            $resetNotice .= ' Der alte Matter-Storage wurde isoliert, descriptorgebunden geleert und die private Quarantäne vollständig entfernt.';
+        }
+    } elseif (str_starts_with($dockerResetStatus, 'MATTER_RESET_ERROR_DOCKER_')) {
+        $resetOk = false;
+        $resetNotice = e3dcMatterResetFailureMessage($dockerResetStatus);
+    }
+}
+
+$matterDocker = e3dcIsDockerEnvironment();
 $matterInstalled = matterServiceInstalled();
 $matterActive = matterServiceActive();
 
 // Pairing Datei lesen (wird vom matter_bridge.js Knoten geschrieben)
 $pairingFile = '/var/www/html/ramdisk/matter_pairing.json';
 
-$pairingData = ['isCommissioned' => false, 'manual' => ''];
-
-if (file_exists($pairingFile)) {
-    $content = file_get_contents($pairingFile);
-    $data = @json_decode($content, true);
-    if ($data) {
-        $pairingData = array_merge($pairingData, $data);
-    }
+$pairingNamed = @lstat($pairingFile);
+$pairingRaw = e3dcReadRegularFileBound($pairingFile, 16384);
+$pairingData = e3dcNormalizeMatterPairingPayload($pairingRaw);
+$pairingDiagnostic = (string)($pairingData['diagnostic'] ?? '');
+if (!is_array($pairingNamed) && $pairingRaw === null) {
+    // Eine noch nicht erzeugte Datei ist beim Dienststart ein normaler Zustand.
+    $pairingDiagnostic = '';
 }
 ?>
 <!-- matter.php wird nun direkt ins Dashboard eingebettet -->
@@ -107,13 +100,23 @@ if (file_exists($pairingFile)) {
                             </div>
                         <?php endif; ?>
 
+                        <?php if ($pairingDiagnostic !== ''): ?>
+                            <div class="alert alert-secondary mb-4">
+                                <i class="fas fa-circle-info me-2"></i>Die lokale Matter-Statusdatei ist derzeit nicht sicher lesbar. Die Seite zeigt deshalb vorsorglich „nicht gekoppelt“ an.
+                            </div>
+                        <?php endif; ?>
+
                         <?php if (!$matterInstalled): ?>
                             <div class="alert alert-danger mb-4">
                                 <i class="fas fa-plug-circle-xmark me-2"></i>Der Matter-Dienst ist noch nicht installiert. Bitte die Matter-Bridge einmal im Installer oder über die Service-Installation einrichten.
                             </div>
-                        <?php elseif (!$matterActive): ?>
+                        <?php elseif (!$matterDocker && !$matterActive): ?>
                             <div class="alert alert-warning mb-4">
-                                <i class="fas fa-rotate me-2"></i>Der Matter-Dienst ist installiert, läuft aber gerade nicht. Ein Neustart wird beim Zurücksetzen versucht.
+                                <i class="fas fa-pause me-2"></i>Der Matter-Dienst ist installiert, läuft aber gerade nicht. Beim Zurücksetzen bleibt dieser gewünschte Stoppzustand erhalten.
+                            </div>
+                        <?php elseif ($matterDocker): ?>
+                            <div class="alert alert-info mb-4">
+                                <i class="fas fa-cube me-2"></i>Die Matter Bridge wird in Docker durch den Container verwaltet. Ein systemd-Status aus dem Container wird deshalb bewusst nicht angezeigt.
                             </div>
                         <?php endif; ?>
 
@@ -135,7 +138,7 @@ if (file_exists($pairingFile)) {
 
                                 <div class="mt-2 p-2 bg-body-tertiary rounded">
                                     <div class="small text-muted mb-1 text-uppercase fw-bold">Oder manueller Code</div>
-                                    <h4 class="font-monospace tracking-wide m-0"><?= htmlspecialchars($pairingData['manual']) ?></h4>
+                                    <h4 class="font-monospace tracking-wide m-0"><?= htmlspecialchars((string)$pairingData['manual'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') ?></h4>
                                 </div>
                             <?php else: ?>
                                 <div class="alert alert-warning mt-4">
@@ -164,7 +167,9 @@ if (file_exists($pairingFile)) {
                         <ul class="list-group list-group-flush">
                             <li class="list-group-item d-flex justify-content-between align-items-center">
                                 Bridge Node-JS Daemon
-                                <?php if ($matterActive): ?>
+                                <?php if ($matterDocker && $matterInstalled): ?>
+                                    <span class="badge bg-info text-dark rounded-pill">Containerverwaltet</span>
+                                <?php elseif ($matterActive): ?>
                                     <span class="badge bg-success rounded-pill">Aktiv (Port 5540)</span>
                                 <?php elseif ($matterInstalled): ?>
                                     <span class="badge bg-warning text-dark rounded-pill">Installiert, gestoppt</span>

@@ -1930,6 +1930,8 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     $dashWbCfg = $confData['config'] ?? [];
                     $dashHasWb1 = hasWallbox1Config($dashWbCfg);
                     $dashHasWb2 = hasWallbox2Config($dashWbCfg);
+                    $dashWb2ExplicitlyConfigured = hasWallbox2ExplicitConfig($dashWbCfg);
+                    $dashWb2ExplicitlyDisabled = isWallbox2ExplicitlyDisabledConfig($dashWbCfg);
                     $dashWbTypeLabels = [
                         'openwb' => 'openWB',
                         'openwb_pro' => 'openWB Pro',
@@ -2722,6 +2724,105 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
             return Math.round(watts).toLocaleString('de-DE') + ' W';
         }
 
+        function wallboxBudgetDisplayProjection(data, candidateW = null, surface = 'default', preferContractEffective = false) {
+            data = data && typeof data === 'object' ? data : {};
+            const finiteBudget = (value) => {
+                if (value === null || value === undefined || value === '') return null;
+                const parsed = Number(value);
+                return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+            };
+            const states = wallboxBudgetDisplayProjection._legacyStates
+                || (wallboxBudgetDisplayProjection._legacyStates = new Map());
+            const stateKey = String(surface || 'default');
+            const contractDeclared = Object.prototype.hasOwnProperty.call(data, 'wb_budget_display_contract');
+            const contract = contractDeclared && data.wb_budget_display_contract
+                && typeof data.wb_budget_display_contract === 'object'
+                ? data.wb_budget_display_contract
+                : null;
+
+            if (contractDeclared) {
+                const effectiveW = contract ? finiteBudget(contract.effective_budget_w) : null;
+                const grossW = contract ? finiteBudget(contract.gross_group_budget_w) : null;
+                const revision = String(contract && contract.revision || '');
+                const cycleToken = String(contract && contract.cycle_token || '');
+                const publicMode = Number(contract && contract.public_mode);
+                const zeroSemantics = String(contract && contract.zero_semantics || '');
+                const bound = !!(
+                    contract
+                    && contract.schema_version === 'wallbox_budget_display_v1'
+                    && contract.valid === true
+                    && /^sha256:[0-9a-f]{64}$/.test(revision)
+                    && /^[A-Za-z0-9:._-]{1,128}$/.test(cycleToken)
+                    && [0, 2, 3, 4, 5, 12].includes(publicMode)
+                    && effectiveW !== null
+                    && grossW !== null
+                    && ['safety_or_control', 'positive_budget'].includes(zeroSemantics)
+                );
+                if (!bound) {
+                    return {
+                        value: null,
+                        bound: false,
+                        transition: true,
+                        source: 'contract',
+                        reason: String(contract && contract.reason || 'unbound_transition')
+                    };
+                }
+                // Ein gebundener 0-W-Entscheid bleibt auf jeder Oberfläche
+                // zwingend 0 W. Bei positiver Freigabe dürfen Detail-Badges
+                // dagegen ihren engeren Kandidatenwert (Kurve, Rest oder
+                // Pre-Dump-Budget) zeigen; nur die Gruppenanzeige fordert den
+                // vertraglichen Gesamtdeckel ausdrücklich an.
+                const candidate = finiteBudget(candidateW);
+                const projected = effectiveW <= 0
+                    ? 0
+                    : (preferContractEffective || candidate === null ? effectiveW : candidate);
+                states.set(stateKey, {positiveSeen: projected > 0, pendingZero: false});
+                return {
+                    value: projected,
+                    bound: true,
+                    transition: false,
+                    source: 'contract',
+                    reason: String(contract.reason || 'controller_budget'),
+                    revision,
+                    grossW,
+                    effectiveW
+                };
+            }
+
+            // Alte Manager kennen den optionalen Vertrag nicht. Ihre Werte
+            // bleiben darstellbar; nur genau der erste Nullsatz nach einem
+            // positiven Wert wird als ungebundener Übergang mit "--" gezeigt.
+            const projected = finiteBudget(candidateW);
+            if (projected === null) {
+                return {value: null, bound: false, transition: false, source: 'legacy', reason: 'budget_missing'};
+            }
+            const explicitZero = projected === 0 && (
+                data.manual_pause === true
+                || data.wb_runtime_manual_pause === true
+                || data.wb2_runtime_manual_pause === true
+                || String(data.operator_hint_code || '').toLowerCase() === 'emergency_stop'
+                || String(data.status_msg || '').toLowerCase().includes('not-aus')
+                || ['stop', 'timeout'].includes(String(data.wb_budget_state || '').toLowerCase())
+            );
+            const previous = states.get(stateKey) || {positiveSeen: false, pendingZero: false};
+            if (projected > 0) {
+                states.set(stateKey, {positiveSeen: true, pendingZero: false});
+                return {value: projected, bound: false, transition: false, source: 'legacy', reason: 'legacy_positive'};
+            }
+            if (!explicitZero && previous.positiveSeen && !previous.pendingZero) {
+                states.set(stateKey, {positiveSeen: true, pendingZero: true});
+                return {value: null, bound: false, transition: true, source: 'legacy', reason: 'legacy_zero_transition'};
+            }
+            states.set(stateKey, {positiveSeen: false, pendingZero: false});
+            return {
+                value: 0,
+                bound: false,
+                transition: false,
+                source: 'legacy',
+                reason: explicitZero ? 'legacy_explicit_zero' : 'legacy_confirmed_zero'
+            };
+        }
+
         function updatePeakShaving(data) {
             if (typeof updateDailySavedStats === 'function') {
                 updateDailySavedStats(data, '');
@@ -3143,11 +3244,18 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     const hasNativeBudget = effExtraW != null || effLimitW != null || data.fuzzy_factor != null;
                     const storageState = String(data.storage_state || data.wb_budget_storage_state || '');
                     const isPredumpConsumerBudget = storageState === 'pre_discharge_wait' || storageState === 'pre_discharge_consumer_auto';
-                    const displayW = isPredumpConsumerBudget
+                    const rawDisplayW = isPredumpConsumerBudget
                         ? grossW
                         : (hasNativeBudget
                             ? (curveW != null ? curveW : (effExtraW != null ? effExtraW : effLimitW))
                             : grossW);
+                    const budgetProjection = wallboxBudgetDisplayProjection(
+                        data,
+                        rawDisplayW,
+                        'storage-budget',
+                        false
+                    );
+                    const displayW = budgetProjection.value;
                     const capAmp = data.cap_amp != null ? parseInt(data.cap_amp, 10) : 0;
                     budgetBadge.textContent = displayW != null
                         ? ((isPredumpConsumerBudget ? 'Akku frei: ' : (hasNativeBudget ? 'WB-Zusatz: ' : 'Frei: ')) + Math.round(displayW) + ' W')
@@ -3179,8 +3287,15 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     } else {
                         setStableLiveTitle(budgetBadge, grossW != null ? 'Brutto-Freigabe für lokale Verbraucher aus dem Storage Manager.' : '');
                     }
+                    if (budgetProjection.transition) {
+                        setStableLiveTitle(
+                            budgetBadge,
+                            'Budget-Zyklus wird gerade gebunden; dieser Übergang wird nicht als echte 0-W-Freigabe gewertet.'
+                        );
+                    }
                     // Farbe nach wirksamer WB-Freigabe, nicht nach Brutto-Storage.
-                    if (displayW > 2000) { budgetBadge.style.background='rgba(16,185,129,0.15)'; budgetBadge.style.color='#10b981'; }
+                    if (displayW === null) { budgetBadge.style.background='rgba(108,117,125,0.15)'; budgetBadge.style.color='#94a3b8'; }
+                    else if (displayW > 2000) { budgetBadge.style.background='rgba(16,185,129,0.15)'; budgetBadge.style.color='#10b981'; }
                     else if (displayW > 0 || (hasNativeBudget && capAmp >= 6)) { budgetBadge.style.background='rgba(245,158,11,0.15)'; budgetBadge.style.color='#f59e0b'; }
                     else { budgetBadge.style.background='rgba(239,68,68,0.15)'; budgetBadge.style.color='#ef4444'; }
                 }
@@ -3910,6 +4025,42 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
         let nativeWallboxDisplayCache = null;
         const nativeWallboxHoldMs = 18000;
 
+        function nativeWallboxDetailsForDisplay(data = {}, dashboardWb2ExplicitlyConfigured = false, topologyEvidenceFresh = true, dashboardWb2ExplicitlyDisabled = false) {
+            let details = Array.isArray(data.wb_details) ? data.wb_details.slice() : [];
+            const runtimeWb2Configured = topologyEvidenceFresh
+                && data.wb2_configured === true;
+            const wb2Visible = !dashboardWb2ExplicitlyDisabled
+                && (dashboardWb2ExplicitlyConfigured || runtimeWb2Configured);
+
+            // Der zehnminütige Anzeige-Fallback darf Messwerte halten, aber
+            // ohne Konfigurationsbeleg keine alte WB2-Topologie fortschreiben.
+            // Ein ausdrückliches Nutzer-Aus hat auch vor frischer Live-Evidenz Vorrang.
+            if (!wb2Visible) {
+                details = details.filter(wb => parseInt(wb && wb.id, 10) !== 2);
+            }
+            return details;
+        }
+
+        function nativeWallboxCountForDisplay(data = {}, wbDetails = [], dashboardWb2ExplicitlyConfigured = false, topologyEvidenceFresh = true, dashboardWb2ExplicitlyDisabled = false) {
+            if (dashboardWb2ExplicitlyDisabled) return 1;
+            const runtimeWb2Configured = topologyEvidenceFresh
+                && data.wb2_configured === true;
+            return dashboardWb2ExplicitlyConfigured || runtimeWb2Configured
+                ? 2
+                : 1;
+        }
+
+        function nativeWallboxPriorityModeForDisplay(rawMode, wbCount) {
+            const mode = parseInt(rawMode, 10);
+            return wbCount > 1 && [1, 2].includes(mode) ? mode : 0;
+        }
+
+        function nativeWallboxReportedTypeForDisplay(data = {}, topologyEvidenceFresh = true, dashboardWb2ExplicitlyDisabled = false) {
+            return topologyEvidenceFresh && !dashboardWb2ExplicitlyDisabled
+                ? String(data.wb_type || '')
+                : '';
+        }
+
         function escapeHtmlText(value) {
             return String(value ?? '').replace(/[&<>"']/g, function(ch) {
                 return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[ch]);
@@ -4069,7 +4220,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     curPower = prevPower;
                     held = true;
                 }
-                ['set_amp', 'cap_amp', 'detected_phases', 'fuzzy_factor', 'status_msg', 'wb_type', 'wb_control_label', 'wb_control_status', 'wb_control_detail', 'wb_control_level'].forEach(key => {
+                ['set_amp', 'cap_amp', 'detected_phases', 'fuzzy_factor', 'status_msg', 'wb_control_label', 'wb_control_status', 'wb_control_detail', 'wb_control_level'].forEach(key => {
                     const v = data[key];
                     const isZeroAmpStatus = key === 'status_msg' && String(v || '').replace(/\s/g, '').toLowerCase().includes('0a');
                     if ((isZeroAmpStatus || v === undefined || v === null || v === '' || v === 0 || v === '0') &&
@@ -4124,6 +4275,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 const response = await fetch('get_live_json.php?wallbox_native_snapshot=1&t=' + new Date().getTime());
                 let hideWallboxData = false;
                 let data = {};
+                let wallboxTopologyEvidenceFresh = false;
 
                 if (!response.ok) {
                     hideWallboxData = true;
@@ -4138,6 +4290,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     data = Object.assign({ ui_hold: true }, nativeWallboxDisplayCache.data);
                     hideWallboxData = false;
                 } else if (!hideWallboxData) {
+                    wallboxTopologyEvidenceFresh = true;
                     data = smoothNativeWallboxData(data);
                 }
 
@@ -4157,35 +4310,26 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     setTimeout(() => { wbAlert.style.transition = 'opacity 0.5s'; wbAlert.style.opacity = 1; }, 50);
                 }
 
-                // Werte einfügen
-                let wbDetails = Array.isArray(data.wb_details) ? data.wb_details : [];
-                if (data.wb_multi_contract && data.wb_multi_contract.slots && typeof data.wb_multi_contract.slots === 'object') {
-                    const slotMap = data.wb_multi_contract.slots;
-                    const existingIds = new Set(wbDetails.map(w => parseInt(w.id, 10)));
-                    Object.keys(slotMap).forEach(key => {
-                        const slot = slotMap[key];
-                        if (slot && slot.id && !existingIds.has(parseInt(slot.id, 10))) {
-                            wbDetails.push({
-                                id: parseInt(slot.id, 10),
-                                amp: slot.effective_amp || slot.allocated_amp || 0,
-                                current_set_amp: slot.allocated_amp || 0,
-                                cap_amp: 0,
-                                target_amp: slot.effective_amp || 0,
-                                status_amp: slot.effective_amp || 0,
-                                state: slot.reason === 'no_vehicle' ? 'Idle' : (slot.running ? 'Lade' : (slot.reason || 'Idle')),
-                                state_level: slot.running ? 'success' : 'secondary',
-                                state_reason: slot.reason || '',
-                                power_w: 0,
-                                plug: slot.connected || false,
-                                charging: slot.running || false,
-                                max_amp: 32
-                            });
-                        }
-                    });
-                }
-                const dashboardWb2Configured = <?= !empty($dashHasWb2) ? 'true' : 'false' ?>;
-                const wbCount = (dashboardWb2Configured || (data.wb_type && String(data.wb_type).toLowerCase().includes('multi'))) ? Math.max(2, wbDetails.length) : 1;
-                if ((dashboardWb2Configured || wbCount > 1) && wbDetails.length < 2) {
+                // Werte einfügen. Ein Anzeige-Fallback darf Messwerte halten,
+                // aber ohne Konfigurationsbeleg keine alte WB2-Topologie tragen.
+                const dashboardWb2ExplicitlyConfigured = <?= !empty($dashWb2ExplicitlyConfigured) ? 'true' : 'false' ?>;
+                const dashboardWb2ExplicitlyDisabled = <?= !empty($dashWb2ExplicitlyDisabled) ? 'true' : 'false' ?>;
+                let wbDetails = nativeWallboxDetailsForDisplay(
+                    data,
+                    dashboardWb2ExplicitlyConfigured,
+                    wallboxTopologyEvidenceFresh,
+                    dashboardWb2ExplicitlyDisabled
+                );
+                const wbCount = nativeWallboxCountForDisplay(
+                    data,
+                    wbDetails,
+                    dashboardWb2ExplicitlyConfigured,
+                    wallboxTopologyEvidenceFresh,
+                    dashboardWb2ExplicitlyDisabled
+                );
+                const dashboardWb2RuntimeConfigured = wallboxTopologyEvidenceFresh
+                    && data.wb2_configured === true;
+                if ((dashboardWb2ExplicitlyConfigured || dashboardWb2RuntimeConfigured) && wbDetails.length < 2) {
                     const existingIds = new Set(wbDetails.map(w => parseInt(w.id, 10)));
                     [1, 2].forEach(id => {
                         if (!existingIds.has(id)) {
@@ -4208,7 +4352,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     });
                 }
                 const wbPriorityModeRaw = data.wb_priority_mode ?? data.wb_native_distribution_mode ?? data.wb_distribution_mode ?? 0;
-                const wbPriorityMode = [1, 2].includes(parseInt(wbPriorityModeRaw, 10)) ? parseInt(wbPriorityModeRaw, 10) : 0;
+                const wbPriorityMode = nativeWallboxPriorityModeForDisplay(wbPriorityModeRaw, wbCount);
                 const wbPriorityLabel = wbPriorityMode === 1 ? 'Prio WB1' : (wbPriorityMode === 2 ? 'Prio WB2' : (wbCount > 1 ? 'Balance' : ''));
                 const fmtAmp = (amp, minPrecision = 0) => {
                     const value = parseFloat(amp || 0);
@@ -4336,9 +4480,16 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     ? finiteBudgetW(wbPowerLedger.managed_budget_w)
                     : null;
                 const fallbackGroupCapW = finiteBudgetW(data.wb_effective_budget_w);
-                const wbGroupCapW = wbGroupGrossBudgetW !== null
+                const rawWbGroupCapW = wbGroupGrossBudgetW !== null
                     ? wbGroupGrossBudgetW
                     : fallbackGroupCapW;
+                const wbGroupBudgetProjection = wallboxBudgetDisplayProjection(
+                    data,
+                    rawWbGroupCapW,
+                    'native-wallbox-budget',
+                    true
+                );
+                const wbGroupCapW = wbGroupBudgetProjection.value;
                 const getWbPhases = (wb) => {
                     if (wb && wb.phases > 0) return wb.phases;
                     const p = parseInt(
@@ -4396,9 +4547,14 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     wbAmpLabelEl.title = wbAmpTitleParts.join('\n');
                 }
                 const e3dcInfo = nativeWallboxE3dcInfo(wbDetails);
+                const reportedWallboxType = nativeWallboxReportedTypeForDisplay(
+                    data,
+                    wallboxTopologyEvidenceFresh,
+                    dashboardWb2ExplicitlyDisabled
+                );
                 document.getElementById('wb-native-type').textContent = wbCount > 1
                     ? `Multi (${wbCount} WB)`
-                    : (e3dcInfo.familyLabel || data.wb_type || 'Wallbox');
+                    : (e3dcInfo.familyLabel || reportedWallboxType || 'Wallbox');
                 if (wbAmpEl) {
                     wbAmpEl.textContent = multiPowerDisplay
                         ? (wbPrimaryPowerW / 1000).toFixed(1).replace('.', ',')
@@ -4430,7 +4586,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     wbNativeStatusEl.className = nativeHintClasses[nativeHintLevel] || nativeHintClasses.info;
                     const statusDetailEl = document.getElementById('wb-native-status-detail');
                     if (statusDetailEl) {
-                        const wallboxType = wbCount > 1 ? `Multi (${wbCount} WB)` : (e3dcInfo.familyLabel || data.wb_type || 'Wallbox');
+                        const wallboxType = wbCount > 1 ? `Multi (${wbCount} WB)` : (e3dcInfo.familyLabel || reportedWallboxType || 'Wallbox');
                         const controlInfo = nativeWallboxControlInfo(data, wbDetails);
                         const rscpInfo = nativeWallboxRscpInfo(data, wbDetails);
                         const controlHtml = controlInfo.label
@@ -4535,9 +4691,11 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 const capEl = document.getElementById('wb-cap-amp');
                 if (capEl) {
                     capEl.textContent = wbGroupCapW !== null ? fmtKw(wbGroupCapW) + ' kW' : '--';
-                    capEl.title = wbGroupCapW !== null
+                    capEl.title = wbGroupBudgetProjection.transition
+                        ? 'Budget-Zyklus wird gerade gebunden; der Übergang ist kein bestätigtes 0-kW-Budget.'
+                        : (wbGroupCapW !== null
                         ? 'Typisiertes wirksames Gruppenbudget der Wallbox-Regelung.'
-                        : 'Kein belastbarer Gruppen-Leistungsdeckel verfügbar.';
+                        : 'Kein belastbarer Gruppen-Leistungsdeckel verfügbar.');
                 }
                 const phEl = document.getElementById('wb-phases-badge');
                 if (phEl) {
@@ -4589,7 +4747,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
 
                 // Multi-Wallbox Details anzeigen, falls vorhanden
                 const multiDiv = document.getElementById('wb-native-multi-details');
-                const showMultiSlots = multiDiv && (wbDetails.length > 1 || wbCount > 1);
+                const showMultiSlots = multiDiv && wbCount > 1;
                 if (multiDiv) {
                     multiDiv.classList.toggle('d-none', !showMultiSlots);
                 }

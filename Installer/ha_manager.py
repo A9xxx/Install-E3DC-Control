@@ -139,6 +139,27 @@ if p_data.get('install_path'):
 
 CONFIG_PATH = "/var/www/html/data/e3dc_v4.json"
 WEB_DATA_DIR = "/var/www/html/data"
+MATTER_RESET_QUARANTINE_NAME = ".matter-storage-reset-quarantine"
+MATTER_RESET_QUARANTINE_PATH = os.path.join(
+    WEB_DATA_DIR,
+    MATTER_RESET_QUARANTINE_NAME,
+)
+MATTER_RESET_QUARANTINE_PREPARE_NAME = ".matter-storage-reset-quarantine.prepare"
+MATTER_RESET_QUARANTINE_PREPARE_PATH = os.path.join(
+    WEB_DATA_DIR,
+    MATTER_RESET_QUARANTINE_PREPARE_NAME,
+)
+MATTER_RESET_RECEIPT_NAME = ".e3dc-matter-reset-transaction.json"
+MATTER_RESET_RECEIPT_PATH = os.path.join(
+    WEB_DATA_DIR,
+    MATTER_RESET_RECEIPT_NAME,
+)
+MATTER_RESET_STAGE_PREFIX = ".matter-storage-reset-stage-"
+MATTER_RESET_STAGE_PATTERN = f"{MATTER_RESET_STAGE_PREFIX}*"
+MATTER_RESET_STAGE_PATH_PATTERN = os.path.join(
+    WEB_DATA_DIR,
+    MATTER_RESET_STAGE_PATTERN,
+)
 WALLBOX_MODE5_USER_START_REQUEST_FILE = os.path.join(
     WEB_DATA_DIR,
     "wallbox_mode5_user_start_request.json",
@@ -1221,6 +1242,14 @@ def rsync_data(target_ip, push=True, owner_lease=None, peer_state_getter=query_p
         "--exclude", "config_backups/",
         "--exclude", "matter-storage",
         "--exclude", "matter-storage/",
+        "--exclude", MATTER_RESET_QUARANTINE_NAME,
+        "--exclude", f"{MATTER_RESET_QUARANTINE_NAME}/",
+        "--exclude", MATTER_RESET_QUARANTINE_PREPARE_NAME,
+        "--exclude", f"{MATTER_RESET_QUARANTINE_PREPARE_NAME}/",
+        "--exclude", MATTER_RESET_RECEIPT_NAME,
+        "--exclude", f"{MATTER_RESET_RECEIPT_NAME}/",
+        "--exclude", MATTER_RESET_STAGE_PATTERN,
+        "--exclude", f"{MATTER_RESET_STAGE_PATTERN}/",
         "--exclude", ".wallbox_plan_jobs",
         "--exclude", ".wallbox_plan_jobs/",
         "--exclude", "wallbox_mode5_user_start_request.json",
@@ -1279,6 +1308,10 @@ def rsync_data(target_ip, push=True, owner_lease=None, peer_state_getter=query_p
                 "-path", "/var/www/html/data/e3dc.config.txt", "-o",
                 "-path", "/var/www/html/data/config_backups", "-o",
                 "-path", "/var/www/html/data/matter-storage", "-o",
+                "-path", MATTER_RESET_QUARANTINE_PATH, "-o",
+                "-path", MATTER_RESET_QUARANTINE_PREPARE_PATH, "-o",
+                "-path", MATTER_RESET_RECEIPT_PATH, "-o",
+                "-path", MATTER_RESET_STAGE_PATH_PATTERN, "-o",
                 "-path", "/var/www/html/data/.wallbox_plan_jobs", "-o",
                 "-path", "/var/www/html/data/wallbox_mode5_user_start_request.json", "-o",
                 "-path", "/var/www/html/data/wallbox_mode5_user_start_request.json.lock",

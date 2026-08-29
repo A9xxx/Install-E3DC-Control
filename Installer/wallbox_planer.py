@@ -69,6 +69,56 @@ PRE_CONDITION_MAX_PRICE_PREMIUM_CT = 0.5
 # 0.005 ct pro Stunde Abstand zur Abfahrt = sehr sanft, Preis hat klar Vorrang.
 JIT_BONUS_CT_PER_H = 0.005
 
+DISABLED_WALLBOX_TYPES = {
+    "none", "disabled", "deaktiviert", "aus", "keine", "keine_wallbox",
+    "no_wallbox", "off", "false", "no", "0", "-1",
+}
+
+
+def _wb2_runtime_discovery_present(config):
+    """Akzeptiert nur den nicht persistierten, direkt bestätigten WB2-Vertrag."""
+
+    if not isinstance(config, dict):
+        return False
+    contract = config.get("_wb2_openwb_discovery_contract")
+    if not isinstance(contract, dict) or contract.get("valid") is not True:
+        return False
+    try:
+        cp_id = int(contract.get("cp_id", 0) or 0)
+        peer_cp_id = int(contract.get("peer_cp_id", 0) or 0)
+        detected_at = float(contract.get("detected_at", 0.0) or 0.0)
+        confirmed_ts = float(contract.get("status_confirmed_ts", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        cp_id > 0
+        and peer_cp_id > 0
+        and cp_id != peer_cp_id
+        and detected_at > 0.0
+        and confirmed_ts >= detected_at
+        and contract.get("status_confirmed") is True
+        and contract.get("physical_output_allowed") is True
+        and str(contract.get("controller_identity") or "")
+        and str(contract.get("physical_output_identity") or "")
+    )
+
+
+def _wb2_configured_or_discovered(config):
+    if not isinstance(config, dict):
+        return False
+    raw = str(config.get("wb_native_type2", "") or "").strip().lower()
+    if raw in DISABLED_WALLBOX_TYPES:
+        return False
+    # Der Manager setzt für einen Legacy-Fund den Typ nur in seiner
+    # Runtime-Kopie auf openwb. Solange der zugehörige interne Vertrag
+    # vorhanden ist, darf dieses technische Bindungsfeld nicht wie eine
+    # ausdrückliche Nutzerkonfiguration den Status-/Ausgangsbeleg umgehen.
+    if isinstance(config.get("_wb2_openwb_discovery_contract"), dict):
+        return _wb2_runtime_discovery_present(config)
+    if raw:
+        return True
+    return _wb2_runtime_discovery_present(config)
+
 MISSING_SOC_WARNING_INTERVAL_S = 600
 _last_missing_soc_warning_ts = 0.0
 _CANDIDATE_MODE = False
@@ -392,10 +442,11 @@ def generate_native_charging_schedule(config, wb_id=None):
         all_slots = []
         for _wb_id in (1, 2):
             if _wb_id == 2:
-                wb2_type = str(config.get("wb2_type", config.get("wb_native_type2", ""))).strip().lower()
-                wb2_has_plan = any(str(config.get(k, "")).strip() not in ("", "0", "0.0")
-                                   for k in ("wb2_plan_hours", "wb2_wbhour", "wb2_wbvon", "wb2_wbbis"))
-                if not wb2_type and not wb2_has_plan:
+                if not _wb2_configured_or_discovered(config):
+                    # Der Einzelpfad entfernt auch einen noch vorhandenen
+                    # WB2-Altplan. Fehlend/leer ist nur mit dem frischen
+                    # Runtime-Vertrag eine vorhandene Wallbox.
+                    generate_native_charging_schedule(config, wb_id=2)
                     continue
             all_slots.extend(generate_native_charging_schedule(config, wb_id=_wb_id) or [])
 
@@ -418,6 +469,13 @@ def generate_native_charging_schedule(config, wb_id=None):
 
     wb_id = int(wb_id or 1)
     schedule_file = os.path.join(RAMDISK_DIR, f"native_wallbox_schedule_wb{wb_id}.json")
+    if wb_id == 2 and not _wb2_configured_or_discovered(config):
+        if os.path.exists(schedule_file):
+            _remove_schedule_file(
+                schedule_file,
+                reason="Wallbox 2 ist nicht eindeutig vorhanden - alten Schedule gelöscht.",
+            )
+        return []
 
     smart_enable   = str(config.get(f"wb{wb_id}_smart_wbhour_enable", config.get("smart_wbhour_enable", "0"))).strip().lower() in ("1", "true", "yes")
     wb_native      = str(config.get("wb_native_enable", "0")).strip().lower() in ("1", "true", "yes")
@@ -1037,7 +1095,7 @@ def generate_native_charging_schedule(config, wb_id=None):
 # ---------------------------------------------------------------------------
 # Status: Ist aktuell ein Ladefenster aktiv?
 # ---------------------------------------------------------------------------
-def get_planned_charging_status(wb_id=None):
+def get_planned_charging_status(wb_id=None, config=None):
     """
     Prueft ob der aktuelle Zeitstempel in einem geplanten Ladefenster liegt.
 
@@ -1048,11 +1106,15 @@ def get_planned_charging_status(wb_id=None):
     current_ts  = int(time.time())
     NATIVE_TYPES = {'openwb', 'openwb_pro', 'go-e', 'e3dc', 'e3dc_auto', 'e3dc_efy', 'e3dc_easy_connect', 'e3dc_multi', 'e3dc_multi_connect', 'e3dc_multi_connect_ii', 'dummy'}
 
+    wb2_explicitly_disabled = False
     try:
-        cfg       = get_config()
+        cfg       = config if isinstance(config, dict) else get_config()
         is_native = str(cfg.get("wb_native_enable", "0")).strip().lower() in ("1", "true")
         native_type_key = "wb_native_type2" if int(wb_id or 1) == 2 else "wb_native_type"
         wb_type   = str(cfg.get(native_type_key, cfg.get("wb_native_type", ""))).strip().lower()
+        if int(wb_id or 1) == 2 and not _wb2_configured_or_discovered(cfg):
+            wb2_explicitly_disabled = True
+            return False
     except Exception:
         is_native = False
         wb_type   = ""
@@ -1066,6 +1128,12 @@ def get_planned_charging_status(wb_id=None):
 
     def _slot_matches_wb(slot):
         if wb_id is None:
+            if wb2_explicitly_disabled and "wb_id" in slot:
+                try:
+                    if int(slot.get("wb_id", 0) or 0) == 2:
+                        return False
+                except Exception:
+                    pass
             return True
         if "wb_id" not in slot:
             # Alte Plaene ohne WB-ID sind Legacy und gelten fuer WB1.
@@ -1323,7 +1391,79 @@ def _candidate_int(value, default=0):
         return default
 
 
+def _validate_candidate_runtime_wb2(raw, now_ts=None):
+    """Validiert den privaten Runtime-Overlay, ohne candidate_config zu ändern."""
+
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("candidate_runtime_wb2_invalid")
+    if len(json.dumps(raw, ensure_ascii=False).encode("utf-8")) > 4096:
+        raise ValueError("candidate_runtime_wb2_invalid")
+    if (
+        raw.get("schema_version") != "wallbox_candidate_runtime_wb2_v1"
+        or raw.get("valid") is not True
+        or raw.get("status_confirmed") is not True
+        or raw.get("physical_output_allowed") is not True
+    ):
+        raise ValueError("candidate_runtime_wb2_invalid")
+    try:
+        manager_ts = float(raw.get("manager_ts", 0.0) or 0.0)
+        detected_at = float(raw.get("detected_at", 0.0) or 0.0)
+        confirmed_ts = float(raw.get("status_confirmed_ts", 0.0) or 0.0)
+        cp_id = int(raw.get("cp_id", 0) or 0)
+        peer_cp_id = int(raw.get("peer_cp_id", 0) or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("candidate_runtime_wb2_invalid") from exc
+    now_value = float(time.time() if now_ts is None else now_ts)
+    manager_age_s = now_value - manager_ts
+    identity = str(raw.get("physical_output_identity") or "")
+    peer_identity = str(raw.get("peer_physical_output_identity") or "")
+    if not (
+        manager_ts > 0.0
+        and -5.0 <= manager_age_s <= 60.0
+        and detected_at > 0.0
+        and detected_at <= manager_ts + 5.0
+        and confirmed_ts >= detected_at
+        and confirmed_ts <= manager_ts + 5.0
+        and cp_id > 0
+        and peer_cp_id > 0
+        and cp_id != peer_cp_id
+        and str(raw.get("source") or "") == "manager_simpleapi_direct"
+        and str(raw.get("controller_identity") or "")
+        and str(raw.get("endpoint_kind") or "")
+        and identity
+        and peer_identity
+        and identity != peer_identity
+    ):
+        raise ValueError("candidate_runtime_wb2_invalid")
+    return {
+        "schema_version": "openwb_chargepoint_discovery_v1",
+        "valid": True,
+        "source": str(raw.get("source") or ""),
+        "detected_at": detected_at,
+        "controller_identity": str(raw.get("controller_identity") or ""),
+        "cp_id": cp_id,
+        "peer_cp_id": peer_cp_id,
+        "status_confirmed": True,
+        "status_confirmed_ts": confirmed_ts,
+        "physical_output_allowed": True,
+        "physical_output_identity": identity,
+        "peer_physical_output_identity": peer_identity,
+        "endpoint_kind": str(raw.get("endpoint_kind") or ""),
+    }
+
+
+def _candidate_wb2_explicitly_disabled(config):
+    if not isinstance(config, dict) or "wb_native_type2" not in config:
+        return False
+    value = str(config.get("wb_native_type2") or "").strip().lower()
+    return value in DISABLED_WALLBOX_TYPES
+
+
 def _candidate_manual_plan_required(config, wb_id):
+    if int(wb_id) == 2 and not _wb2_configured_or_discovered(config):
+        return False
     mode_value = config.get(f"wb{wb_id}_mode")
     if mode_value is not None and str(mode_value).strip() != "" and _candidate_int(mode_value, 0) == 0:
         return False
@@ -1385,6 +1525,29 @@ def _validate_candidate_plan(path, wb_id=None):
     return normalized
 
 
+def _candidate_prune_disabled_wb2_plans(directory, config):
+    """Entfernt WB2-Pläne ohne explizite oder frische Runtime-Präsenz."""
+    if _wb2_configured_or_discovered(config):
+        return
+
+    wb2_path = os.path.join(directory, "native_wallbox_schedule_wb2.json")
+    if os.path.lexists(wb2_path):
+        _candidate_read_private_json(wb2_path)
+        os.remove(wb2_path)
+
+    combined_path = os.path.join(directory, "native_wallbox_schedule.json")
+    if not os.path.lexists(combined_path):
+        return
+    combined = _validate_candidate_plan(combined_path)
+    filtered = [entry for entry in combined if int(entry.get("wb_id", 0) or 0) != 2]
+    if len(filtered) == len(combined):
+        return
+    if filtered:
+        _candidate_atomic_json(combined_path, filtered)
+    else:
+        os.remove(combined_path)
+
+
 def run_candidate_directory(candidate_dir):
     """Erzeugt und prüft einen Plan vollständig in einem privaten Transaktionslauf."""
     global RAMDISK_DIR, V4_CONFIG_FILE, CONFIG_FILE, INSTALL_DIR, _CANDIDATE_MODE
@@ -1401,6 +1564,16 @@ def run_candidate_directory(candidate_dir):
         raise ValueError("candidate_operation_invalid")
     raw_config = _candidate_read_private_json(config_path)
     config = _validate_candidate_config(raw_config)
+    runtime_wb2 = _validate_candidate_runtime_wb2(
+        request.get("runtime_wb2")
+    )
+    if runtime_wb2 is not None:
+        if _candidate_wb2_explicitly_disabled(config):
+            raise ValueError("candidate_runtime_wb2_conflicts_disabled")
+        config = dict(config)
+        config["_wb2_openwb_discovery_contract"] = runtime_wb2
+        if not str(config.get("wb_native_type2", "") or "").strip():
+            config["wb_native_type2"] = "openwb"
     required = request.get("require_plan", [])
     if not isinstance(required, list) or any(int(value) not in (1, 2) for value in required):
         raise ValueError("candidate_required_plan_invalid")
@@ -1435,7 +1608,10 @@ def run_candidate_directory(candidate_dir):
             now_ns = time.time_ns()
             os.utime(config_path, ns=(now_ns, now_ns))
             generate_native_charging_schedule(config)
-        # preserve prüft ausschließlich und lässt kopierte Pläne byteidentisch.
+        # preserve lässt gültige kopierte Pläne byteidentisch. Eine inzwischen
+        # ausdrücklich deaktivierte WB2 ist die einzige Ausnahme: Ihr Altplan
+        # wird auch in diesem Pfad entfernt und das Kombinat neu materialisiert.
+        _candidate_prune_disabled_wb2_plans(directory, config)
 
         final_raw_config = _candidate_read_private_json(config_path)
         _validate_candidate_config(final_raw_config)

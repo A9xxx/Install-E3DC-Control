@@ -66,6 +66,7 @@ _FINALIZER_FILES = (
     "Installer/update_recovery_context.py",
     "Installer/update_recovery_journal.py",
     "Installer/update_recovery_surface.py",
+    "Installer/update_simple.py",
 )
 _SNAPSHOT_MAX_FILES = 4096
 _SNAPSHOT_MAX_FILE_BYTES = 8 * 1024 * 1024
@@ -3184,6 +3185,18 @@ def _run_active_legacy_v1_forward(
         != execution_root
     ):
         raise RuntimeError("Installer.web_installer stammt nicht aus dem Ziel-Snapshot")
+    from Installer.permissions import (  # pylint: disable=import-outside-toplevel
+        repair_web_install_traversal_preflight,
+    )
+
+    # Auch veröffentlichte v1-Eltern erreichen diesen Pfad direkt. Die enge,
+    # idempotente x-only-Korrektur bleibt deshalb eine eigenständige Vorstufe
+    # des Zielcodes und sperrt kompatible 0700-Homes nicht aus.
+    if not repair_web_install_traversal_preflight():
+        raise RuntimeError(
+            "Installationspfad-Traversierrechte konnten vor dem aktiven "
+            "Legacy-v1-Abschluss nicht sicher vorbereitet werden"
+        )
     sudoers_findings = web_installer_module.sudoers_file_findings()
     privileged_paths = {
         web_installer_module.SERVICE_WRAPPER,

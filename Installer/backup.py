@@ -17,9 +17,15 @@ except Exception:
     pass
 
 from .core import register_command
-from .backup_retention import UPDATE_BACKUP_KEEP_COUNT, delete_verified_backup, prune_install_backups
+from .backup_retention import (
+    UPDATE_BACKUP_KEEP_COUNT,
+    WEB_INSTALLER_BACKUP_KEEP_COUNT,
+    delete_verified_backup_family,
+    prune_install_backups,
+)
 from .backup_integrity import (
     BackupIntegrityError,
+    BoundPersistentInstallRoot,
     LEGACY_ML_MODEL,
     PRIVATE_ML_ROOT,
     PersistentSource,
@@ -31,6 +37,7 @@ from .backup_integrity import (
     _normalized_backup_id,
     _normalized_transaction_id,
     _open_root_controlled_backup_directory_chain,
+    bind_persistent_source_root,
     build_systemd_mask_state_contract,
     copy_persistent_sources,
     default_backup_root,
@@ -42,6 +49,7 @@ from .backup_integrity import (
     validate_existing_backup_root,
     validate_private_ml_store,
     verify_backup,
+    verify_bound_persistent_install_root,
     verified_manifest_sha256,
     verify_systemd_mask_state_contract,
 )
@@ -330,16 +338,15 @@ def _persistent_sources(
     """Return the complete legacy and current recovery surface."""
     install = _lexical_absolute(install_path or INSTALL_PATH)
     options = _selected_backup_profile(profile, install)
-    try:
-        configured_venv = str(load_config().get("venv_name") or ".venv_e3dc").strip()
-    except Exception as exc:
-        if options.name != REPAIR_UPDATE_BACKUP_PROFILE.name:
-            raise
+    if options.name == REPAIR_UPDATE_BACKUP_PROFILE.name:
+        # Der Reparatur-Updater bindet den Installationsroot separat. Sein venv
+        # liegt nach aktuellem Vertrag direkt im Benutzer-Home; ein privilegierter
+        # Altconfig-Read ist für die Produktsicherung weder nötig noch zulässig.
         configured_venv = ".venv_e3dc"
-        _warn_backup(
-            "Die alte Installer-Konfiguration ist nicht lesbar; "
-            f"für den Backup-Ausschluss wird der Standard verwendet: {exc}"
-        )
+    else:
+        configured_venv = str(
+            load_config().get("venv_name") or ".venv_e3dc"
+        ).strip()
     venv_exclusions = tuple(
         sorted({name for name in (configured_venv, ".venv_e3dc", ".venv", "venv") if name and "/" not in name and "\\" not in name})
     )
@@ -543,6 +550,7 @@ def _backup_current_version_v2(
     verified_pre_chown_callback=None,
     *,
     profile=STRICT_BACKUP_PROFILE,
+    expected_install_root_identity=None,
 ):
     active_install_path = _lexical_absolute(install_path or INSTALL_PATH)
     options = _selected_backup_profile(profile, active_install_path)
@@ -579,14 +587,19 @@ def _backup_current_version_v2(
                     "Der alte systemd-Maskenzustand ist nicht eindeutig lesbar und "
                     f"wird beim Reparaturupdate nicht als Rückfallvoraussetzung verwendet: {exc}"
                 )
-        mapped_entries, source_records = copy_persistent_sources(
-            backup_dir,
-            _persistent_sources(
-                active_install_path,
-                systemd_mask_state,
-                profile=options,
-            ),
-        )
+        with bind_persistent_source_root(
+            active_install_path,
+            expected_identity=expected_install_root_identity,
+        ) as source_binding:
+            mapped_entries, source_records = copy_persistent_sources(
+                backup_dir,
+                _persistent_sources(
+                    active_install_path,
+                    systemd_mask_state,
+                    profile=options,
+                ),
+                bound_source_root=source_binding,
+            )
         if options.enforce_systemd_mask_contract:
             source_records.extend(
                 _missing_systemd_source_record(path)
@@ -671,6 +684,14 @@ def _backup_current_version_v2(
             )
             if not retention.get("success"):
                 raise BackupIntegrityError("Backup-Retention ist fehlgeschlagen.")
+            if not retention.get("limit_satisfied", True):
+                _warn_backup(
+                    "Das neue verifizierte Backup bleibt gültig; das Limit von "
+                    "maximal drei Backup-Familien konnte wegen einer laufenden "
+                    "Schutz- oder Recovery-Bindung noch nicht vollständig angewendet "
+                    "werden. Der nächste sichere Retention-Lauf wendet die Grenze nach "
+                    "Ende der Bindung erneut an."
+                )
         except Exception as exc:
             if options.retention_failure_is_fatal:
                 raise
@@ -698,6 +719,7 @@ def backup_current_version(
     verified_pre_chown_callback=None,
     *,
     profile=None,
+    expected_install_root_identity=None,
 ):
     """Create the only supported, complete, manifest-verified system backup."""
     options = _selected_backup_profile(profile, install_path or INSTALL_PATH)
@@ -706,6 +728,7 @@ def backup_current_version(
         preserve_backup_paths=preserve_backup_paths,
         verified_pre_chown_callback=verified_pre_chown_callback,
         profile=options,
+        expected_install_root_identity=expected_install_root_identity,
     )
 
 
@@ -754,6 +777,7 @@ def create_quiesced_overlay(
     transaction_id,
     parent_backup_dir,
     parent_backup_id,
+    expected_install_root_identity=None,
 ):
     """Versiegelt mutable Nutzerdaten nach bestätigtem Dienststopp.
 
@@ -873,10 +897,15 @@ def create_quiesced_overlay(
                 "Ruhende Daten-Nachsicherung wurde während der Anlage ausgetauscht"
             )
 
-        mapped_entries, source_records = copy_persistent_sources(
-            target,
-            _quiesced_overlay_sources(install),
-        )
+        with bind_persistent_source_root(
+            install,
+            expected_identity=expected_install_root_identity,
+        ) as source_binding:
+            mapped_entries, source_records = copy_persistent_sources(
+                target,
+                _quiesced_overlay_sources(install),
+                bound_source_root=source_binding,
+            )
         secure_backup_tree(target)
         finalize_backup(
             target,
@@ -954,6 +983,8 @@ def restore_quiesced_overlay(
     install_path=None,
     *,
     guard: QuiescedOverlayRestoreGuard,
+    restored_payload_guard=None,
+    bound_install_root: BoundPersistentInstallRoot = None,
 ):
     """Spielt den verifizierten ruhenden Datenstand über das Vollbackup."""
 
@@ -965,6 +996,17 @@ def restore_quiesced_overlay(
     ):
         raise BackupIntegrityError(
             "Wiederherstellung der ruhenden Daten-Nachsicherung widerspricht Pfad oder Installations-Guard"
+        )
+    if (
+        bound_install_root is not None
+        and (
+            not isinstance(bound_install_root, BoundPersistentInstallRoot)
+            or _lexical_absolute(bound_install_root.path) != install
+        )
+    ):
+        raise BackupIntegrityError(
+            "Ruhende Daten-Nachsicherung widerspricht der gebundenen "
+            "Installationswurzel"
         )
     return restore_persistent_payload(
         overlay_dir,
@@ -981,6 +1023,8 @@ def restore_quiesced_overlay(
             *(WEB_ROOT / name for name in WEB_PERSISTENT_FILE_NAMES),
         ),
         overlay_restore_guard=guard,
+        restored_payload_guard=restored_payload_guard,
+        bound_install_root=bound_install_root,
     )
 
 
@@ -1263,6 +1307,7 @@ def _restore_payload_with_mask_contract(
     verified_manifest_guard=None,
     restored_payload_guard=None,
     restore_metadata_overrides=None,
+    bound_install_root: BoundPersistentInstallRoot = None,
 ):
     contract = manifest.get("systemd_mask_state")
     if contract is None:
@@ -1276,15 +1321,20 @@ def _restore_payload_with_mask_contract(
             restored_payload_guard=restored_payload_guard,
             restore_metadata_overrides=restore_metadata_overrides,
             verified_manifest_guard=verified_manifest_guard,
+            bound_install_root=bound_install_root,
         )
 
     entries = _mask_entries_by_path(contract)
     expected = {path: entry["state"] == "masked" for path, entry in entries.items()}
     original = {path: _systemd_path_state(path) == "masked" for path in entries}
+    if bound_install_root is not None:
+        verify_bound_persistent_install_root(bound_install_root)
     try:
         for path in sorted(entries):
             if original[path]:
                 _remove_canonical_systemd_mask(path)
+        if bound_install_root is not None:
+            verify_bound_persistent_install_root(bound_install_root)
     except Exception as exc:
         try:
             _apply_systemd_mask_states(original, allow_existing=True)
@@ -1296,10 +1346,14 @@ def _restore_payload_with_mask_contract(
         raise
 
     def apply_masks_before_commit():
+        if bound_install_root is not None:
+            verify_bound_persistent_install_root(bound_install_root)
         created = {}
         try:
             created = _apply_systemd_mask_states(expected)
             _reload_and_verify_systemd_mask_states(expected)
+            if bound_install_root is not None:
+                verify_bound_persistent_install_root(bound_install_root)
         except Exception as exc:
             try:
                 _remove_created_systemd_masks(created)
@@ -1319,6 +1373,7 @@ def _restore_payload_with_mask_contract(
             restored_payload_guard=restored_payload_guard,
             restore_metadata_overrides=restore_metadata_overrides,
             verified_manifest_guard=verified_manifest_guard,
+            bound_install_root=bound_install_root,
         )
     except Exception as exc:
         try:
@@ -1338,6 +1393,8 @@ def restore_verified_backup(
     verified_manifest_guard=None,
     restored_payload_guard=None,
     restore_metadata_overrides=None,
+    *,
+    bound_install_root: BoundPersistentInstallRoot = None,
 ):
     """Restore the complete manifested recovery surface without prompting."""
     manifest = verify_backup(backup_path, expected_kind=SYSTEM_BACKUP_KIND)
@@ -1345,7 +1402,18 @@ def restore_verified_backup(
         if not callable(verified_manifest_guard):
             raise BackupIntegrityError("Restore-Manifestguard ist nicht aufrufbar")
         verified_manifest_guard(manifest)
-    allowed_roots, allowed_files = _restore_allowlist(install_path)
+    install = _lexical_absolute(install_path or INSTALL_PATH)
+    if (
+        bound_install_root is not None
+        and (
+            not isinstance(bound_install_root, BoundPersistentInstallRoot)
+            or _lexical_absolute(bound_install_root.path) != install
+        )
+    ):
+        raise BackupIntegrityError(
+            "Vollrestore widerspricht der gebundenen Installationswurzel"
+        )
+    allowed_roots, allowed_files = _restore_allowlist(install)
     restored = _restore_payload_with_mask_contract(
         backup_path,
         manifest,
@@ -1354,6 +1422,7 @@ def restore_verified_backup(
         verified_manifest_guard=verified_manifest_guard,
         restored_payload_guard=restored_payload_guard,
         restore_metadata_overrides=restore_metadata_overrides,
+        bound_install_root=bound_install_root,
     )
     validate_private_ml_store(PRIVATE_ML_ROOT, allow_missing=True)
     return restored
@@ -1408,12 +1477,24 @@ def delete_backup():
         return False
 
     try:
-        delete_verified_backup(
+        deleted = delete_verified_backup_family(
             backup_path,
             get_backup_root(),
-            expected_kind=SYSTEM_BACKUP_KIND,
+            INSTALL_PATH,
         )
-        print("✓ Backup gelöscht.\n")
+        overlay_count = int(deleted.get("removed_quiesced_overlays", 0))
+        if overlay_count == 1:
+            print(
+                "✓ Backup einschließlich einer ruhenden Daten-Nachsicherung gelöscht.\n"
+            )
+        elif overlay_count:
+            print(
+                "✓ Backup einschließlich {} ruhender Daten-Nachsicherungen gelöscht.\n".format(
+                    overlay_count
+                )
+            )
+        else:
+            print("✓ Backup gelöscht.\n")
         backup_logger.info(f"Backup gelöscht: {os.path.basename(backup_path)}")
         log_task_completed("Backup löschen", details=os.path.basename(backup_path))
         return True
@@ -1425,22 +1506,69 @@ def delete_backup():
 
 def apply_backup_limit():
     """Wendet das Backup-Limit manuell auf vorhandene Backups an."""
-    retention = prune_install_backups(
-        INSTALL_PATH,
-        backup_root=get_backup_root(),
-        logger=backup_logger,
+    try:
+        retention = prune_install_backups(
+            INSTALL_PATH,
+            backup_root=get_backup_root(),
+            logger=backup_logger,
+            explicit_maintenance=True,
+        )
+    except Exception as exc:
+        print(f"\n✗ Backup-Bereinigung sicher abgebrochen: {exc}\n")
+        log_error("backup", f"Backup-Bereinigung sicher abgebrochen: {exc}", exc)
+        return False
+    removed_quiesced = len(
+        retention.get("quiesced_overlays", {}).get("removed", [])
     )
     removed_update = len(retention.get("update_backups", {}).get("removed", []))
     removed_web = len(retention.get("web_installer_backups", {}).get("removed", []))
+    skipped_quiesced = len(
+        retention.get("quiesced_overlays", {}).get("skipped", [])
+    )
     print("\n=== Backup-Limit ===")
-    print(f"System-Backups behalten: {UPDATE_BACKUP_KEEP_COUNT}")
-    print(f"Entfernte alte Backups: {removed_update + removed_web}")
-    if not retention.get("success", True):
+    print(f"System-Backup-Familien maximal: {UPDATE_BACKUP_KEEP_COUNT}")
+    print(f"Web-Installer-Sicherungen maximal: {WEB_INSTALLER_BACKUP_KEEP_COUNT}")
+    print(f"Entfernte ruhende Daten-Nachsicherungen: {removed_quiesced}")
+    print(f"Entfernte alte System-/Web-Backups: {removed_update + removed_web}")
+    if retention.get("blocked"):
+        print(
+            "⚠ Bereinigung blockiert: {}".format(
+                retention.get("blocker") or "Updateabschluss oder Recovery ist noch aktiv."
+            )
+        )
+    elif skipped_quiesced:
+        if skipped_quiesced == 1:
+            print(
+                "⚠ Eine nicht sicher klassifizierbare ruhende Daten-Nachsicherung blieb unangetastet."
+            )
+        else:
+            print(
+                "⚠ {} nicht sicher klassifizierbare ruhende Daten-Nachsicherungen blieben unangetastet.".format(
+                    skipped_quiesced
+                )
+            )
+    if retention.get("blocked"):
+        print("⚠ Es wurden keine weiteren Backups rotiert.")
+    elif not retention.get("success", True):
         print("⚠ Einzelne Backups konnten nicht entfernt werden. Details stehen im Installer-Log.")
+    elif skipped_quiesced:
+        print(
+            "⚠ Die Systembackup-Rotation wurde deshalb aus Sicherheitsgründen nicht ausgeführt."
+        )
+    elif not retention.get("limit_satisfied", False):
+        print(
+            "⚠ Das Limit ist wegen einer laufenden Schutz- oder Recovery-Bindung "
+            "noch nicht vollständig erreicht; geschützte Backups bleiben erhalten."
+        )
     else:
         print("✓ Backup-Limit angewendet.")
     print("")
-    return bool(retention.get("success", True))
+    return bool(
+        retention.get("success", True)
+        and not retention.get("blocked")
+        and retention.get("limit_satisfied", False)
+        and not skipped_quiesced
+    )
 
 
 def backup_full():

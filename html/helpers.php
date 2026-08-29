@@ -598,6 +598,217 @@ function e3dcPublishRuntimeCommandFile($targetFile, $payload, $mode = 0664, $tem
     }
 }
 
+function e3dcInspectExactRuntimeCommandFile($targetFile, $payload, $mode = 0660) {
+    $targetFile = (string)$targetFile;
+    $payload = (string)$payload;
+    $mode = (int)$mode & 0777;
+    if ($targetFile === '' || $payload === '' || $mode !== 0660
+        || !function_exists('posix_geteuid') || !function_exists('posix_getegid')) {
+        return [
+            'success' => false,
+            'missing' => false,
+            'collision' => true,
+            'message' => 'Der exklusive Laufzeit-Dateivertrag ist nicht verfügbar.',
+        ];
+    }
+    $targetDir = dirname($targetFile);
+    $dirBefore = @lstat($targetDir);
+    if (!is_array($dirBefore)
+        || (((int)($dirBefore['mode'] ?? 0)) & 0170000) !== 0040000
+        || is_link($targetDir)) {
+        return [
+            'success' => false,
+            'missing' => false,
+            'collision' => true,
+            'message' => 'Das Elternverzeichnis des reservierten Laufzeitnamens ist nicht sicher gebunden.',
+        ];
+    }
+    $before = @lstat($targetFile);
+    if (!is_array($before)) {
+        return ['success' => false, 'missing' => true, 'collision' => false];
+    }
+    $expectedUid = (int)posix_geteuid();
+    $expectedGid = (int)posix_getegid();
+    $metadataOk = ((((int)($before['mode'] ?? 0)) & 0170000) === 0100000)
+        && !is_link($targetFile)
+        && (int)($before['nlink'] ?? 0) === 1
+        && (int)($before['uid'] ?? -1) === $expectedUid
+        && (int)($before['gid'] ?? -1) === $expectedGid
+        && ((((int)($before['mode'] ?? 0)) & 0777) === $mode)
+        && (int)($before['size'] ?? -1) === strlen($payload);
+    if (!$metadataOk) {
+        return [
+            'success' => false,
+            'missing' => false,
+            'collision' => true,
+            'message' => 'Der reservierte Laufzeitname ist bereits mit einem fremden Dateivertrag belegt.',
+        ];
+    }
+    $handle = @fopen($targetFile, 'rb');
+    if (!is_resource($handle)) {
+        @clearstatcache(true, $targetFile);
+        return @lstat($targetFile) === false
+            ? ['success' => false, 'missing' => true, 'collision' => false]
+            : [
+                'success' => false,
+                'missing' => false,
+                'collision' => true,
+                'message' => 'Der reservierte Laufzeitname konnte nicht stabil gebunden werden.',
+            ];
+    }
+    $content = @stream_get_contents($handle, strlen($payload) + 1);
+    $opened = @fstat($handle);
+    @fclose($handle);
+    @clearstatcache(true, $targetFile);
+    $after = @lstat($targetFile);
+    $dirAfter = @lstat($targetDir);
+    $stable = is_array($opened)
+        && is_array($after)
+        && is_array($dirAfter)
+        && $content === $payload
+        && (int)($dirAfter['dev'] ?? -1) === (int)($dirBefore['dev'] ?? -2)
+        && (int)($dirAfter['ino'] ?? -1) === (int)($dirBefore['ino'] ?? -2)
+        && (int)($opened['dev'] ?? -1) === (int)($before['dev'] ?? -2)
+        && (int)($opened['ino'] ?? -1) === (int)($before['ino'] ?? -2)
+        && (int)($after['dev'] ?? -1) === (int)($before['dev'] ?? -2)
+        && (int)($after['ino'] ?? -1) === (int)($before['ino'] ?? -2)
+        && (int)($opened['nlink'] ?? 0) === 1
+        && (int)($after['nlink'] ?? 0) === 1
+        && (int)($opened['uid'] ?? -1) === $expectedUid
+        && (int)($opened['gid'] ?? -1) === $expectedGid
+        && ((((int)($opened['mode'] ?? 0)) & 0777) === $mode)
+        && (int)($opened['size'] ?? -1) === strlen($payload);
+    return $stable
+        ? ['success' => true, 'missing' => false, 'collision' => false, 'already_present' => true]
+        : [
+            'success' => false,
+            'missing' => false,
+            'collision' => true,
+            'message' => 'Der reservierte Laufzeitname weicht vom exakten E3DC-Vertrag ab.',
+        ];
+}
+
+function e3dcPublishIdempotentRuntimeCommandFile($targetFile, $payload, $mode = 0660, $temporaryPrefix = '.e3dc_exclusive.') {
+    $targetFile = (string)$targetFile;
+    $payload = (string)$payload;
+    $mode = (int)$mode & 0777;
+    $temporaryPrefix = preg_replace('/[^a-z0-9_.-]/i', '', (string)$temporaryPrefix);
+    if ($targetFile === '' || $payload === '' || strlen($payload) > 4096
+        || $mode !== 0660 || $temporaryPrefix === '') {
+        return [
+            'success' => false,
+            'collision' => true,
+            'message' => 'Die exklusive Laufzeit-Anforderung besitzt keinen zulässigen Vertrag.',
+        ];
+    }
+    $existing = e3dcInspectExactRuntimeCommandFile($targetFile, $payload, $mode);
+    if (!empty($existing['success'])) return $existing;
+    if (empty($existing['missing'])) return $existing;
+
+    $targetDir = dirname($targetFile);
+    $dirBefore = @lstat($targetDir);
+    if (!is_array($dirBefore)
+        || (((int)($dirBefore['mode'] ?? 0)) & 0170000) !== 0040000
+        || is_link($targetDir)) {
+        return [
+            'success' => false,
+            'collision' => false,
+            'message' => 'Das Laufzeitverzeichnis ist nicht sicher verfügbar.',
+        ];
+    }
+    try {
+        $suffix = bin2hex(random_bytes(16));
+    } catch (Throwable $error) {
+        return [
+            'success' => false,
+            'collision' => false,
+            'message' => 'Die Laufzeit-Anforderung konnte nicht eindeutig vorbereitet werden.',
+        ];
+    }
+    $temporary = $targetDir . '/' . $temporaryPrefix . $suffix . '.tmp';
+    $oldUmask = @umask((~$mode) & 0777);
+    $handle = @fopen($temporary, 'x+b');
+    if (is_int($oldUmask)) @umask($oldUmask);
+    if (!is_resource($handle)) {
+        return [
+            'success' => false,
+            'collision' => false,
+            'message' => 'Die Laufzeit-Anforderung konnte nicht exklusiv vorbereitet werden.',
+        ];
+    }
+    $linked = false;
+    try {
+        $written = 0;
+        $payloadLength = strlen($payload);
+        while ($written < $payloadLength) {
+            $count = @fwrite($handle, substr($payload, $written));
+            if ($count === false || $count <= 0) break;
+            $written += $count;
+        }
+        $flushed = $written === $payloadLength && @fflush($handle);
+        if ($flushed && function_exists('fsync')) $flushed = @fsync($handle);
+        $opened = @fstat($handle);
+        $dirAfter = @lstat($targetDir);
+        @clearstatcache(true, $targetFile);
+        $targetAfter = @lstat($targetFile);
+        $prepared = $flushed
+            && is_array($opened)
+            && ((((int)($opened['mode'] ?? 0)) & 0170000) === 0100000)
+            && (int)($opened['nlink'] ?? 0) === 1
+            && (int)($opened['uid'] ?? -1) === (int)posix_geteuid()
+            && (int)($opened['gid'] ?? -1) === (int)posix_getegid()
+            && ((((int)($opened['mode'] ?? 0)) & 0777) === $mode)
+            && (int)($opened['size'] ?? -1) === $payloadLength
+            && is_array($dirAfter)
+            && (int)($dirAfter['dev'] ?? -1) === (int)($dirBefore['dev'] ?? -2)
+            && (int)($dirAfter['ino'] ?? -1) === (int)($dirBefore['ino'] ?? -2)
+            && !is_array($targetAfter);
+        if (!$prepared) {
+            return [
+                'success' => false,
+                'collision' => is_array($targetAfter),
+                'message' => is_array($targetAfter)
+                    ? 'Der reservierte Laufzeitname wurde konkurrierend belegt.'
+                    : 'Die Laufzeit-Anforderung konnte nicht vollständig vorbereitet werden.',
+            ];
+        }
+        // link() ist der atomare NOREPLACE-Commit: Ein vorhandener Zielname
+        // wird weder überschrieben noch entfernt.
+        if (!@link($temporary, $targetFile)) {
+            $raced = e3dcInspectExactRuntimeCommandFile($targetFile, $payload, $mode);
+            if (!empty($raced['success'])) return $raced;
+            return [
+                'success' => false,
+                'collision' => true,
+                'message' => 'Der reservierte Laufzeitname ist bereits abweichend belegt; nichts wurde überschrieben.',
+            ];
+        }
+        $linked = true;
+        if (!@unlink($temporary)) {
+            return [
+                'success' => false,
+                'collision' => true,
+                'message' => 'Die exklusive Anforderung besitzt nach dem Commit noch einen zusätzlichen Link.',
+            ];
+        }
+        $linked = false;
+        $final = e3dcInspectExactRuntimeCommandFile($targetFile, $payload, $mode);
+        if (!empty($final['success'])) {
+            $final['already_present'] = false;
+            return $final;
+        }
+        if (!empty($final['missing'])) {
+            return ['success' => true, 'consumed' => true, 'already_present' => false];
+        }
+        return $final;
+    } finally {
+        @fclose($handle);
+        if (!$linked && (file_exists($temporary) || is_link($temporary))) {
+            @unlink($temporary);
+        }
+    }
+}
+
 function e3dcRemoveRuntimeCommandFile($targetFile) {
     $targetFile = (string)$targetFile;
     $before = @lstat($targetFile);
@@ -2013,7 +2224,7 @@ function e3dcRunArgvProcess(array $argv, $timeoutSeconds = 20.0, array $options 
         $result['error'] = 'Interpreter oder Programm nicht verfügbar.';
         return $result;
     }
-    $timeoutSeconds = max(0.1, min(300.0, (float)$timeoutSeconds));
+    $timeoutSeconds = max(0.1, min(600.0, (float)$timeoutSeconds));
     $maxOutput = max(1024, min(1024 * 1024, (int)($options['max_output_bytes'] ?? 65536)));
     $cwd = isset($options['cwd']) && is_string($options['cwd']) && is_dir($options['cwd'])
         ? $options['cwd']
@@ -3859,7 +4070,10 @@ function normalizeWallboxTypeConfig($type) {
         'off' => 'none',
         'disabled' => 'none',
         'deaktiviert' => 'none',
+        'aus' => 'none',
         'keine' => 'none',
+        'keine_wallbox' => 'none',
+        'no_wallbox' => 'none',
         'false' => 'none',
         'no' => 'none',
         '0' => 'none',
@@ -3907,44 +4121,275 @@ function hasWallbox1Config($cfg) {
     return false;
 }
 
-function hasWallbox2Config($cfg) {
+function hasWallbox2ExplicitConfig($cfg) {
     if (!is_array($cfg)) return false;
 
-    // Ein leerer oder abgeschalteter aktueller Typ bedeutet ausdrücklich:
-    // keine zweite Wallbox, auch wenn alte Adresswerte noch vorhanden sind.
+    // Nur ein nichtleerer aktueller Typ ist eine ausdrückliche WB2-Wahl.
+    // Fehlend/leer bleibt Legacy-ambig; alte Adress-/Topicreste allein sind
+    // weder Präsenz- noch Steuerbeleg.
     if (array_key_exists('wb_native_type2', $cfg)) {
         return isConfiguredWallboxTypeConfig($cfg['wb_native_type2']);
     }
+    return false;
+}
 
-    if (cfgHasAddress($cfg['wb2_topic'] ?? '')
-        || cfgHasAddress($cfg['wb2_ip'] ?? '')
-        || cfgHasAddress($cfg['shelly_wb2_ip'] ?? '')
-        || cfgHasAddress($cfg['wb2_topic_prefix'] ?? '')) {
-        return true;
+/**
+ * Normalisiert ausschließlich den kleinen lokalen Matter-Pairingvertrag.
+ * Defekte oder nicht skalare Felder werden nie in die Seite übernommen.
+ */
+function e3dcNormalizeMatterPairingPayload($raw) {
+    $fallback = [
+        'isCommissioned' => false,
+        'manual' => '',
+        'diagnostic' => 'PAIRING_STATUS_UNAVAILABLE',
+    ];
+    if (!is_string($raw) || strlen($raw) > 16384) {
+        return $fallback;
+    }
+    $decoded = @json_decode($raw);
+    if (!is_object($decoded) || json_last_error() !== JSON_ERROR_NONE) {
+        $fallback['diagnostic'] = 'PAIRING_STATUS_INVALID_JSON';
+        return $fallback;
     }
 
-    if (cfgHasAddress($cfg['wb_native_ip2'] ?? '')) {
-        return true;
+    $commissioned = false;
+    if (property_exists($decoded, 'isCommissioned')) {
+        if (!is_bool($decoded->isCommissioned)) {
+            $fallback['diagnostic'] = 'PAIRING_STATUS_INVALID_COMMISSIONED';
+            return $fallback;
+        }
+        $commissioned = $decoded->isCommissioned;
     }
 
-    // Bei aktivem nativen Multi-Wallbox Manager in der Ramdisk
-    if (is_file('/var/www/html/ramdisk/wallbox_native.json')) {
-        $raw = @file_get_contents('/var/www/html/ramdisk/wallbox_native.json');
+    $manual = '';
+    if (property_exists($decoded, 'manual') && $decoded->manual !== null) {
+        if (is_string($decoded->manual) || is_int($decoded->manual)) {
+            $manual = trim((string)$decoded->manual);
+        } else {
+            $fallback['diagnostic'] = 'PAIRING_STATUS_INVALID_MANUAL';
+            return $fallback;
+        }
+        if (
+            strlen($manual) > 128
+            || preg_match('//u', $manual) !== 1
+            || preg_match('/[\x00-\x1F\x7F]/u', $manual) === 1
+        ) {
+            $fallback['diagnostic'] = 'PAIRING_STATUS_INVALID_MANUAL';
+            return $fallback;
+        }
+    }
+
+    return [
+        'isCommissioned' => $commissioned,
+        'manual' => $manual,
+        'diagnostic' => '',
+    ];
+}
+
+function isWallbox2ExplicitlyDisabledConfig($cfg) {
+    if (!is_array($cfg) || !array_key_exists('wb_native_type2', $cfg)) {
+        return false;
+    }
+    return normalizeWallboxTypeConfig($cfg['wb_native_type2']) === 'none';
+}
+
+/**
+ * Prüft den frischen, direkt gebundenen WB2-Runtimevertrag.
+ *
+ * Weder eine zweite Detail-ID noch eine Multi-/Slot-Zählung genügt. Beide
+ * Ladepunkte müssen aktuell gültigen Status, verschiedene positive CP-IDs und
+ * verschiedene, freigegebene physische Ausgänge desselben Discovery-Vertrags
+ * belegen. Zusätzliche Felder bleiben für zukünftige Schemas zulässig.
+ */
+function e3dcWallbox2RuntimeEvidence($payload, $nowTs = null, $maxAgeS = 60.0) {
+    if (!is_array($payload)) return false;
+    $now = is_numeric($nowTs) ? (float)$nowTs : (float)time();
+    $maxAge = max(1.0, (float)$maxAgeS);
+    $freshTs = static function($value) use ($now, $maxAge) {
+        if (!is_numeric($value)) return false;
+        $ts = (float)$value;
+        return is_finite($ts) && $ts > 0.0
+            && ($now - $ts) >= -5.0
+            && ($now - $ts) <= $maxAge;
+    };
+    if (!$freshTs($payload['ts'] ?? null)) return false;
+    if (!isset($payload['wb_details']) || !is_array($payload['wb_details'])) {
+        return false;
+    }
+
+    $details = [];
+    foreach ($payload['wb_details'] as $detail) {
+        if (!is_array($detail)) continue;
+        $id = (int)($detail['id'] ?? 0);
+        if (($id === 1 || $id === 2) && !isset($details[$id])) {
+            $details[$id] = $detail;
+        }
+    }
+    if (!isset($details[1], $details[2])) return false;
+
+    $cpIds = [];
+    $outputIdentities = [];
+    $controllerIdentities = [];
+    $endpointKinds = [];
+    foreach ([1, 2] as $id) {
+        $detail = $details[$id];
+        if (($detail['driver_status_valid'] ?? null) !== true
+            || ($detail['driver_status_stale'] ?? null) !== false
+            || ($detail['driver_status_degraded'] ?? null) !== false
+            || !$freshTs($detail['driver_status_last_ok_ts'] ?? null)) {
+            return false;
+        }
+        $cpId = is_numeric($detail['cp_id'] ?? null)
+            ? (int)$detail['cp_id']
+            : 0;
+        if ($cpId <= 0) return false;
+        $cpIds[$id] = $cpId;
+
+        $output = $detail['physical_output_contract'] ?? null;
+        if (!is_array($output)
+            || ($output['valid'] ?? null) !== true
+            || ($output['output_allowed'] ?? null) !== true
+            || ($output['observe_only'] ?? null) !== false
+            || ($detail['physical_output_blocked'] ?? null) !== false) {
+            return false;
+        }
+        $identity = trim((string)($output['identity'] ?? ''));
+        $controller = trim((string)($output['controller_identity'] ?? ''));
+        $outputCp = is_numeric($output['cp_id'] ?? null)
+            ? (int)$output['cp_id']
+            : 0;
+        if ($identity === '' || $controller === '' || $outputCp !== $cpId) {
+            return false;
+        }
+        $outputIdentities[$id] = $identity;
+        $controllerIdentities[$id] = $controller;
+        $endpointKinds[$id] = trim((string)($output['endpoint_kind'] ?? ''));
+    }
+    if ($cpIds[1] === $cpIds[2]
+        || $outputIdentities[1] === $outputIdentities[2]
+        || $controllerIdentities[1] !== $controllerIdentities[2]
+        || $endpointKinds[1] === ''
+        || $endpointKinds[1] !== $endpointKinds[2]) {
+        return false;
+    }
+
+    $discovery = $details[2]['chargepoint_discovery_contract'] ?? null;
+    if (!is_array($discovery)
+        || ($discovery['valid'] ?? null) !== true
+        || ($discovery['status_confirmed'] ?? null) !== true
+        || !is_numeric($discovery['detected_at'] ?? null)
+        || (float)$discovery['detected_at'] <= 0.0
+        || (float)$discovery['detected_at'] > $now + 5.0
+        || !is_numeric($discovery['status_confirmed_ts'] ?? null)
+        || (float)$discovery['status_confirmed_ts'] < (float)$discovery['detected_at']
+        || (int)($discovery['cp_id'] ?? 0) !== $cpIds[2]
+        || (int)($discovery['peer_cp_id'] ?? 0) !== $cpIds[1]
+        || trim((string)($discovery['controller_identity'] ?? '')) !== $controllerIdentities[2]
+        || trim((string)($discovery['source'] ?? '')) !== 'manager_simpleapi_direct'
+        || trim((string)($details[2]['chargepoint_detection_source'] ?? '')) === '') {
+        return false;
+    }
+    return true;
+}
+
+/**
+ * Reduziert den nativen Wallbox-Budgetvertrag auf UI-sichere Felder.
+ *
+ * `null` bedeutet: altes Payload ohne diesen optionalen Vertrag. Ein
+ * vorhandener, aber unvollständiger Vertrag bleibt dagegen ausdrücklich
+ * `valid=false`, damit eine Übergangs-Null nicht als Regelwert erscheint.
+ */
+function e3dcNormalizeWallboxBudgetDisplayContract($raw) {
+    $invalid = [
+        'schema_version' => 'wallbox_budget_display_v1',
+        'valid' => false,
+        'revision' => '',
+        'cycle_token' => '',
+        'source_revision' => '',
+        'source_bound' => false,
+        'public_mode' => null,
+        'effective_budget_w' => null,
+        'gross_group_budget_w' => null,
+        'reason' => 'unbound_transition',
+        'zero_semantics' => 'unbound_transition',
+    ];
+    if ($raw === null) {
+        return null;
+    }
+    if (!is_array($raw)
+        || ($raw['schema_version'] ?? null) !== 'wallbox_budget_display_v1') {
+        return $invalid;
+    }
+    if (($raw['valid'] ?? null) !== true) {
+        return $invalid;
+    }
+
+    $revision = is_string($raw['revision'] ?? null)
+        ? trim($raw['revision'])
+        : '';
+    $cycleToken = is_string($raw['cycle_token'] ?? null)
+        ? trim($raw['cycle_token'])
+        : '';
+    $sourceRevision = is_string($raw['source_revision'] ?? null)
+        ? trim($raw['source_revision'])
+        : '';
+    $publicModeRaw = $raw['public_mode'] ?? null;
+    $effectiveRaw = $raw['effective_budget_w'] ?? null;
+    $grossRaw = $raw['gross_group_budget_w'] ?? null;
+    $zeroSemantics = is_string($raw['zero_semantics'] ?? null)
+        ? trim($raw['zero_semantics'])
+        : '';
+    $reasonRaw = is_string($raw['reason'] ?? null)
+        ? trim($raw['reason'])
+        : '';
+
+    $publicMode = is_numeric($publicModeRaw) ? (int)$publicModeRaw : -1;
+    $effective = is_numeric($effectiveRaw) ? (float)$effectiveRaw : NAN;
+    $gross = is_numeric($grossRaw) ? (float)$grossRaw : NAN;
+    $valid = preg_match('/^sha256:[0-9a-f]{64}$/D', $revision) === 1
+        && preg_match('/^[A-Za-z0-9:._-]{1,128}$/D', $cycleToken) === 1
+        && ($sourceRevision === ''
+            || preg_match('/^sha256:[0-9a-f]{64}$/D', $sourceRevision) === 1)
+        && in_array($publicMode, [0, 2, 3, 4, 5, 12], true)
+        && is_finite($effective) && $effective >= 0.0
+        && is_finite($gross) && $gross >= 0.0
+        && in_array($zeroSemantics, ['safety_or_control', 'positive_budget'], true)
+        && preg_match('/^[a-z0-9_]{1,64}$/D', $reasonRaw) === 1;
+    if (!$valid) {
+        return $invalid;
+    }
+
+    return [
+        'schema_version' => 'wallbox_budget_display_v1',
+        'valid' => true,
+        'revision' => $revision,
+        'cycle_token' => $cycleToken,
+        'source_revision' => $sourceRevision,
+        'source_bound' => $sourceRevision !== '',
+        'public_mode' => $publicMode,
+        'effective_budget_w' => $effective,
+        'gross_group_budget_w' => $gross,
+        'reason' => $reasonRaw,
+        'zero_semantics' => $zeroSemantics,
+    ];
+}
+
+function hasWallbox2Config($cfg) {
+    if (!is_array($cfg)) return false;
+
+    // Eine ausdrückliche Abschaltung darf durch Live-/Cachewerte niemals
+    // wieder aufgehoben werden.
+    if (isWallbox2ExplicitlyDisabledConfig($cfg)) return false;
+    if (hasWallbox2ExplicitConfig($cfg)) return true;
+
+    // Fehlend/leer bleibt kompatibel, wird aber nur durch den direkten,
+    // frischen CP-/Ausgangsvertrag zur tatsächlichen WB2.
+    $runtimePath = '/var/www/html/ramdisk/wallbox_native.json';
+    if (is_file($runtimePath)) {
+        $raw = @file_get_contents($runtimePath);
         if ($raw) {
             $nw = @json_decode($raw, true);
-            if (is_array($nw)) {
-                if (isset($nw['wb_multi_contract']['slots']) && is_array($nw['wb_multi_contract']['slots']) && count($nw['wb_multi_contract']['slots']) > 1) {
-                    return true;
-                }
-                if (isset($nw['wb_details']) && is_array($nw['wb_details'])) {
-                    foreach ($nw['wb_details'] as $det) {
-                        if (is_array($det) && (int)($det['id'] ?? 0) === 2) return true;
-                    }
-                }
-                if (preg_match('/Multi\s*\((\d+)/i', (string)($nw['wb_type'] ?? ''), $m) && (int)$m[1] > 1) {
-                    return true;
-                }
-            }
+            if (e3dcWallbox2RuntimeEvidence($nw)) return true;
         }
     }
 
@@ -3965,14 +4410,47 @@ function hasNativeWallboxStatusConfig($cfg) {
  * Das Konfigurationsflag ist der Vertrag; alte Ramdisk-, Session- oder
  * Zählerwerte dürfen einen deaktivierten Slot nicht wieder sichtbar machen.
  */
-function e3dcApplyWallboxPresenceProjection(&$data, $wb1Configured, $wb2Configured) {
+function e3dcApplyWallboxPresenceProjection(&$data, $wb1Configured, $wb2Configured, $wb2ExplicitlyDisabled = false) {
     if (!is_array($data)) $data = [];
     $wb1Configured = (bool)$wb1Configured;
     $wb2Configured = (bool)$wb2Configured;
+    $wb2ExplicitlyDisabled = (bool)$wb2ExplicitlyDisabled;
 
-    // Falls ein nativer Multi-Wallbox Vertrag aktiv ist, wird WB2 nie gekappt
-    if (isset($data['wb_multi_contract']['slots']) && is_array($data['wb_multi_contract']['slots']) && count($data['wb_multi_contract']['slots']) > 1) {
-        $wb2Configured = true;
+    if ($wb2ExplicitlyDisabled) {
+        $wb2Configured = false;
+    }
+
+    if (!$wb2Configured
+        && isset($data['wb_multi_contract']['slots'])
+        && is_array($data['wb_multi_contract']['slots'])) {
+        $data['wb_multi_contract']['slots'] = array_filter(
+            $data['wb_multi_contract']['slots'],
+            static function($slot, $key) {
+                $slotId = is_array($slot) ? (int)($slot['id'] ?? 0) : 0;
+                return $slotId !== 2 && (int)$key !== 2;
+            },
+            ARRAY_FILTER_USE_BOTH
+        );
+        foreach (['mode', 'priority_target_id'] as $key) {
+            if (array_key_exists($key, $data['wb_multi_contract'])) {
+                $data['wb_multi_contract'][$key] = 0;
+            }
+        }
+        foreach (['priority_target_connected', 'priority_target_active', 'priority_target_running'] as $key) {
+            if (array_key_exists($key, $data['wb_multi_contract'])) {
+                $data['wb_multi_contract'][$key] = false;
+            }
+        }
+    }
+
+    if (!$wb2Configured) {
+        if (preg_match('/^\s*Multi\s*\(\s*\d+\s*WB\s*\)\s*$/i', (string)($data['wb_type'] ?? ''))) {
+            $data['wb_type'] = 'Multi (1 WB)';
+        }
+        foreach (['wb_priority_mode', 'wb_native_distribution_mode', 'wb_distribution_mode'] as $key) {
+            if (array_key_exists($key, $data)) $data[$key] = 0;
+        }
+        if (array_key_exists('wb_priority_label', $data)) $data['wb_priority_label'] = '';
     }
 
     if (isset($data['wb_details']) && is_array($data['wb_details'])) {
@@ -5361,7 +5839,7 @@ function e3dcClassifySelfUpdateCompletion($running, $exitCode, $log) {
 
 function e3dcCommunityBootstrapReleaseTag() {
     // RELEASE_MARKER: Beim Versionssprung gemeinsam mit VERSION/Release Notes aktualisieren.
-    return 'v5.4.4e';
+    return 'v5.4.4f';
 }
 
 function e3dcCommunityBootstrapCommand() {
@@ -5533,6 +6011,290 @@ function e3dcFindServiceWrapper() {
         }
     }
     return null;
+}
+
+function e3dcDockerMatterResetGuardReady() {
+    $guard = '/usr/local/bin/e3dc-docker-matter-storage-guard';
+    $python = '/usr/bin/python3';
+    foreach (['/usr/local', '/usr/local/bin'] as $parent) {
+        $metadata = @lstat($parent);
+        if (!is_array($metadata)
+            || (((int)($metadata['mode'] ?? 0)) & 0170000) !== 0040000
+            || (int)($metadata['uid'] ?? -1) !== 0
+            || (int)($metadata['gid'] ?? -1) !== 0
+            || (((int)($metadata['mode'] ?? 0)) & 0022) !== 0
+            || is_link($parent)) {
+            return false;
+        }
+    }
+    $metadata = @lstat($guard);
+    if (!is_array($metadata)
+        || (((int)($metadata['mode'] ?? 0)) & 0170000) !== 0100000
+        || (int)($metadata['nlink'] ?? 0) !== 1
+        || (int)($metadata['uid'] ?? -1) !== 0
+        || (int)($metadata['gid'] ?? -1) !== 0
+        || (((int)($metadata['mode'] ?? 0)) & 0777) !== 0555
+        || is_link($guard)
+        || !is_file($python)
+        || !is_executable($python)) {
+        return false;
+    }
+    $process = e3dcRunArgvProcess(
+        [$python, '-I', '-B', $guard, '--mode', 'capabilities'],
+        5.0,
+        ['max_output_bytes' => 1024]
+    );
+    return !empty($process['success'])
+        && (int)($process['exit_code'] ?? 1) === 0
+        && trim((string)($process['stdout'] ?? '')) === 'e3dc-matter-pairing-reset-v2'
+        && trim((string)($process['stderr'] ?? '')) === '';
+}
+
+function e3dcMatterResetFailureMessage($code) {
+    $code = trim((string)$code);
+    $messages = [
+        'MATTER_RESET_ERROR_UNIT_MASKED' => 'Der Matter-Dienst ist maskiert. Hebe ausschließlich die Maskierung des Matter-Dienstes im Installationscenter auf und führe den Reset erneut aus.',
+        'MATTER_RESET_ERROR_UNIT_STATE' => 'Der Matter-Dienst ist fehlgeschlagen oder wechselt gerade den Zustand. Stoppe ihn im Installationscenter vollständig und führe den Reset erneut aus.',
+        'MATTER_RESET_ERROR_UNIT_LOAD_STATE' => 'Der Matter-Dienst besitzt keinen sicher bindbaren Ladezustand. Repariere die Matter-Dienstinstallation im Installationscenter und führe den Reset erneut aus.',
+        'MATTER_RESET_ERROR_STORAGE_FOREIGN_MOUNT' => 'Unter „/var/www/html/data/matter-storage“ ist ein fremder Mount aktiv. Hänge genau diesen Mount aus und führe den Reset erneut aus.',
+        'MATTER_RESET_ERROR_DOCKER_FOREIGN_MOUNT' => 'Unter „/var/www/html/data/matter-storage“ ist ein fremder Mount aktiv. Hänge genau diesen Mount im Container-Host aus und führe den Reset erneut aus.',
+        'MATTER_RESET_ERROR_STORAGE_HARDLINK' => 'Im Matter-Storage wurde eine reguläre Datei mit zusätzlichem Hardlink gefunden. E3DC-Control hat Datei, externen Alias und Storage nicht verändert. Sichere und prüfe beide Namen, löse ausschließlich diesen Hardlink manuell auf und starte den Reset danach erneut.',
+        'MATTER_RESET_ERROR_DOCKER_HARDLINK' => 'Im persistenten Docker-Matter-Storage wurde eine reguläre Datei mit zusätzlichem Hardlink gefunden. E3DC-Control hat Datei, externen Alias und Storage nicht verändert. Sichere und prüfe beide Namen auf dem Container-Host, löse ausschließlich diesen Hardlink manuell auf und starte den Reset danach erneut.',
+        'MATTER_RESET_ERROR_PAIRING_HARDLINK' => 'Der feste Pairing-Name driftete während des nofollow-Resets. Führe denselben Reset erneut aus.',
+        'MATTER_RESET_ERROR_DOCKER_PAIRING_HARDLINK' => 'Der feste Docker-Pairing-Name driftete während des nofollow-Resets. Führe denselben Reset erneut aus.',
+        'MATTER_RESET_ERROR_STORAGE_LIMIT' => 'Die automatische private Storage-Quarantäne konnte nicht vollständig bestätigt werden. Führe denselben Reset erneut aus; ein enger Quarantänerest wird dabei zuerst bereinigt.',
+        'MATTER_RESET_ERROR_DOCKER_LIMIT' => 'Die automatische private Docker-Storage-Quarantäne konnte nicht vollständig bestätigt werden. Führe denselben Reset erneut aus; ein enger Quarantänerest wird dabei zuerst bereinigt.',
+        'MATTER_RESET_ERROR_STORAGE_TIMEOUT' => 'Die gebundene Matter-Resettransaktion überschritt ihr Sicherheitszeitfenster. Führe denselben Reset erneut aus; ein bereits isolierter Quarantänerest wird dabei zuerst weiter bereinigt.',
+        'MATTER_RESET_ERROR_DOCKER_TIMEOUT' => 'Die gebundene Docker-Matter-Resettransaktion überschritt ihr Sicherheitszeitfenster. Führe denselben Reset erneut aus; ein bereits isolierter Quarantänerest wird dabei zuerst weiter bereinigt.',
+        'MATTER_RESET_ERROR_QUARANTINE_COLLISION' => 'Der reservierte Matter-Quarantänenamespace oder sein Transaktionsmarker ist abweichend belegt. Der fremde Bestand blieb vollständig unangetastet. Prüfe im Datenverzeichnis ausschließlich „.matter-storage-reset-quarantine“, „.matter-storage-reset-quarantine.prepare“ und „.e3dc-matter-reset-transaction.json“ und benenne den fremden Knoten nach eigener Sicherung manuell um.',
+        'MATTER_RESET_ERROR_DOCKER_QUARANTINE_COLLISION' => 'Der reservierte Docker-Matter-Quarantänenamespace oder sein Transaktionsmarker ist abweichend belegt. Der fremde Bestand blieb vollständig unangetastet. Prüfe im persistenten data-Volume ausschließlich „.matter-storage-reset-quarantine“, „.matter-storage-reset-quarantine.prepare“ und „.e3dc-matter-reset-transaction.json“ und benenne den fremden Knoten nach eigener Sicherung manuell um.',
+        'MATTER_RESET_ERROR_DOCKER_REQUEST_COLLISION' => '„matter_pairing_reset.request“ oder „matter_pairing_reset_repair.request“ ist bereits mit einem abweichenden Datei-, Rechte- oder Inhaltsvertrag belegt. E3DC-Control hat den vorhandenen Knoten weder überschrieben noch gelöscht. Benenne ausschließlich den kollidierenden Knoten nach eigener Prüfung manuell um und starte den Reset erneut.',
+        'MATTER_RESET_ERROR_DOCKER_REQUEST_INVALID' => '„matter_pairing_reset.request“ besitzt einen abweichenden Datei-, Rechte- oder Inhaltsvertrag und blieb vollständig unangetastet. Prüfe und sichere genau diesen Knoten im persistenten data-Volume. Benenne ihn anschließend reversibel unter einer neuen, noch nicht vorhandenen Sicherungsbezeichnung um und starte den Reset erneut.',
+        'MATTER_RESET_ERROR_DOCKER_REQUEST_REPAIR_BLOCKED' => '„matter_pairing_reset_repair.request“ besitzt einen abweichenden Datei-, Rechte- oder Inhaltsvertrag und blieb vollständig unangetastet. Prüfe und sichere genau diesen Knoten im persistenten data-Volume. Benenne ihn anschließend reversibel unter einer neuen, noch nicht vorhandenen Sicherungsbezeichnung um und starte den Reset erneut.',
+        'MATTER_RESET_ERROR_DOCKER_GUARD' => 'Der root-eigene Docker-Guard fehlt oder ist unsicher. Aktualisiere das Container-Image regulär und führe den Reset erneut aus.',
+        'MATTER_RESET_ERROR_DOCKER_CAPABILITY' => 'Das laufende Container-Image unterstützt den reparierbaren Matter-Reset noch nicht. Aktualisiere das Image regulär und führe den Reset erneut aus.',
+        'MATTER_RESET_ERROR_DOCKER_BINDING' => 'Der persistente Docker-Matter-Storage konnte vor dem Reset nicht sicher gebunden werden und blieb unverändert. Führe zunächst die reguläre Rechte-Reparatur aus. Bleibt der Fehler bestehen, sichere und prüfe genau „matter-storage“ auf Datei, Symlink, Sonderknoten, zusätzliche Hardlinks oder einen fremden Mount; lösche oder ändere nichts blind.',
+        'MATTER_RESET_ERROR_STORAGE_BINDING' => 'Der Bare-Metal-Matter-Storage konnte vor dem Reset nicht sicher gebunden werden und blieb unverändert. Führe zunächst die reguläre Rechte-Reparatur aus. Bleibt der Fehler bestehen, sichere und prüfe genau „matter-storage“ auf Datei, Symlink, Sonderknoten, zusätzliche Hardlinks oder einen fremden Mount; lösche oder ändere nichts blind.',
+        'MATTER_RESET_ERROR_START_FAILED' => 'Die Kopplungsdaten sind gelöscht, aber der zuvor laufende Matter-Dienst konnte nicht starten. Repariere oder starte ausschließlich den Matter-Dienst im Installationscenter.',
+        'MATTER_RESET_ERROR_START_UNSTABLE' => 'Die Kopplungsdaten sind gelöscht, aber der zuvor laufende Matter-Dienst blieb nicht stabil. Prüfe den Matter-Dienst im Installationscenter und starte ihn nach der Reparatur erneut.',
+        'MATTER_RESET_ERROR_START_STOP_FAILED' => 'Die Kopplungsdaten sind zurückgesetzt, aber nach dem fehlgeschlagenen Start konnte auch der gestoppte Endzustand des Matter-Dienstes nicht bestätigt werden. Klicke den Reset nicht wiederholt an. Prüfe im Installationscenter den Dienststatus und das Matter-Protokoll und stoppe ausschließlich diesen Dienst kontrolliert.',
+        'MATTER_RESET_ERROR_CONFIG_BINDING' => 'Die Matter-Konfiguration konnte für den sicheren Reset oder Wiederanlauf nicht unverändert gebunden werden. Matter bleibt gestoppt. Prüfe die Konfiguration, führe bei einem Rechtefehler „Rechte reparieren“ aus und starte den Reset danach erneut.',
+        'MATTER_RESET_ERROR_LOCK' => 'Der root-kontrollierte Matter-Lock ist nicht sicher bindbar. Führe im Installationscenter „Rechte reparieren“ aus und starte den Reset erneut.',
+        'MATTER_RESET_ERROR_UPDATE_BUSY' => 'Ein Update oder Backup läuft bereits. Warte dessen Abschluss ab und starte den Matter-Reset danach erneut.',
+        'MATTER_RESET_ERROR_UPDATE_LOCK' => 'Der gemeinsame Update-/Backup-Lock ist nicht sicher bindbar. Führe im Installationscenter „Rechte reparieren“ aus und starte den Matter-Reset danach erneut.',
+    ];
+    if (isset($messages[$code])) {
+        return $messages[$code] . ' Fehlercode: ' . $code;
+    }
+    if (str_starts_with($code, 'MATTER_RESET_ERROR_DOCKER_PAIRING_')
+        || str_starts_with($code, 'MATTER_RESET_ERROR_PAIRING_')) {
+        return 'Die feste Ramdisk-Pairingdatei konnte nicht sicher gebunden oder entfernt werden. '
+            . 'Stoppe Matter vollständig, führe „Rechte reparieren“ aus und starte den Reset erneut. Fehlercode: ' . $code;
+    }
+    if (str_starts_with($code, 'MATTER_RESET_ERROR_DOCKER_')
+        || str_starts_with($code, 'MATTER_RESET_ERROR_STORAGE_')
+        || in_array($code, [
+            'MATTER_RESET_ERROR_RUNTIME',
+            'MATTER_RESET_ERROR_UNIT_QUERY',
+            'MATTER_RESET_ERROR_UNIT_CONTRACT',
+            'MATTER_RESET_ERROR_UNIT_OWNER',
+            'MATTER_RESET_ERROR_STOP_FAILED',
+            'MATTER_RESET_ERROR_INACTIVE_UNCONFIRMED',
+            'MATTER_RESET_ERROR_INTERNAL',
+        ], true)) {
+        return 'Der Matter-Reset blieb fail-closed. Führe im Installationscenter „Rechte reparieren“ aus, '
+            . 'stoppe Matter vollständig und starte den Reset erneut. Fehlercode: ' . $code;
+    }
+    return 'Der privilegierte Matter-Reset blieb fail-closed. Führe im Installationscenter „Rechte reparieren“ aus und starte den Reset erneut. Fehlercode: MATTER_RESET_ERROR_INTERNAL';
+}
+
+function e3dcMatterResetDockerStatus() {
+    $raw = e3dcReadRegularFileBound('/var/www/html/ramdisk/matter_reset_status.code', 256);
+    if (!is_string($raw)) {
+        return '';
+    }
+    $code = trim($raw);
+    return preg_match('/^MATTER_RESET_(?:IDLE|OK_DOCKER(?:_QUARANTINED)?|ERROR_DOCKER_[A-Z_]+)$/D', $code)
+        ? $code
+        : '';
+}
+
+function e3dcQueueDockerContainerRestart() {
+    $restartFlag = '/var/www/html/ramdisk/restart_container.flag';
+    $published = e3dcPublishIdempotentRuntimeCommandFile(
+        $restartFlag,
+        "1\n",
+        0660,
+        '.restart_container.'
+    );
+    if (empty($published['success'])) {
+        return [
+            'success' => false,
+            'message' => !empty($published['collision'])
+                ? 'Docker-Neustartflag ist abweichend belegt; nichts wurde überschrieben.'
+                : (string)($published['message'] ?? 'Docker-Neustartflag konnte nicht sicher geschrieben werden.'),
+        ];
+    }
+
+    @clearstatcache(true, $restartFlag);
+    $namedBefore = @lstat($restartFlag);
+    if (!is_array($namedBefore)) {
+        // Der PID-1-Wächter darf das vollständig publizierte Flag sofort
+        // verbrauchen. Die persistente Reset-Anforderung bleibt dabei erhalten.
+        return ['success' => true, 'consumed' => true];
+    }
+    if (
+        (((int)($namedBefore['mode'] ?? 0)) & 0170000) !== 0100000
+        || (int)($namedBefore['nlink'] ?? 0) !== 1
+        || (int)($namedBefore['size'] ?? -1) !== 2
+        || (((int)($namedBefore['mode'] ?? 0)) & 0777) !== 0660
+        || is_link($restartFlag)
+    ) {
+        return [
+            'success' => false,
+            'message' => 'Docker-Neustartflag besitzt keinen sicheren Endvertrag.',
+        ];
+    }
+    $handle = @fopen($restartFlag, 'rb');
+    if (!is_resource($handle)) {
+        @clearstatcache(true, $restartFlag);
+        return @lstat($restartFlag) === false
+            ? ['success' => true, 'consumed' => true]
+            : ['success' => false, 'message' => 'Docker-Neustartflag konnte nicht gebunden gelesen werden.'];
+    }
+    $payload = @fread($handle, 3);
+    $opened = @fstat($handle);
+    @fclose($handle);
+    @clearstatcache(true, $restartFlag);
+    $namedAfter = @lstat($restartFlag);
+    if (!is_array($namedAfter)) {
+        return ['success' => true, 'consumed' => true];
+    }
+    $stable = $payload === "1\n"
+        && is_array($opened)
+        && (int)($opened['dev'] ?? -1) === (int)($namedBefore['dev'] ?? -2)
+        && (int)($opened['ino'] ?? -1) === (int)($namedBefore['ino'] ?? -2)
+        && (int)($namedAfter['dev'] ?? -1) === (int)($namedBefore['dev'] ?? -2)
+        && (int)($namedAfter['ino'] ?? -1) === (int)($namedBefore['ino'] ?? -2)
+        && (int)($namedAfter['nlink'] ?? 0) === 1
+        && (int)($namedAfter['size'] ?? -1) === 2
+        && ((((int)($namedAfter['mode'] ?? 0)) & 0777) === 0660);
+    return $stable
+        ? ['success' => true, 'consumed' => false]
+        : ['success' => false, 'message' => 'Docker-Neustartflag driftete nach der Veröffentlichung.'];
+}
+
+function e3dcResetMatterPairing() {
+    if (e3dcIsDockerEnvironment()) {
+        if (!e3dcDockerMatterResetGuardReady()) {
+            return [
+                'success' => false,
+                'message' => 'Der installierte Docker-Guard unterstützt den sicheren Matter-Reset noch nicht. Bitte zuerst regulär aktualisieren.',
+            ];
+        }
+        $repairPath = '/var/www/html/data/matter_pairing_reset_repair.request';
+        $repairPayload = "e3dc-matter-pairing-reset-repair-v1\n";
+        $repairExisting = e3dcInspectExactRuntimeCommandFile(
+            $repairPath,
+            $repairPayload,
+            0660
+        );
+        if (empty($repairExisting['success']) && empty($repairExisting['missing'])) {
+            return [
+                'success' => false,
+                'message' => e3dcMatterResetFailureMessage('MATTER_RESET_ERROR_DOCKER_REQUEST_COLLISION'),
+                'error_code' => 'MATTER_RESET_ERROR_DOCKER_REQUEST_COLLISION',
+            ];
+        }
+        $request = e3dcPublishIdempotentRuntimeCommandFile(
+            '/var/www/html/data/matter_pairing_reset.request',
+            "e3dc-matter-pairing-reset-v1\n",
+            0660,
+            '.matter_reset.'
+        );
+        if (empty($request['success'])) {
+            if (!empty($request['collision'])) {
+                return [
+                    'success' => false,
+                    'message' => e3dcMatterResetFailureMessage('MATTER_RESET_ERROR_DOCKER_REQUEST_COLLISION'),
+                    'error_code' => 'MATTER_RESET_ERROR_DOCKER_REQUEST_COLLISION',
+                ];
+            }
+            $request = e3dcPublishIdempotentRuntimeCommandFile(
+                $repairPath,
+                $repairPayload,
+                0660,
+                '.matter_reset_repair.'
+            );
+            if (empty($request['success'])) {
+                return [
+                    'success' => false,
+                    'message' => !empty($request['collision'])
+                        ? e3dcMatterResetFailureMessage('MATTER_RESET_ERROR_DOCKER_REQUEST_COLLISION')
+                        : (string)($request['message'] ?? 'Die Docker-Matter-Resetanforderung konnte nicht sicher geschrieben werden.'),
+                    'error_code' => !empty($request['collision'])
+                        ? 'MATTER_RESET_ERROR_DOCKER_REQUEST_COLLISION'
+                        : 'MATTER_RESET_ERROR_DOCKER_CONTRACT',
+                ];
+            }
+        }
+        $restart = e3dcQueueDockerContainerRestart();
+        if (empty($restart['success'])) {
+            return [
+                'success' => false,
+                'message' => (string)($restart['message'] ?? 'Der Docker-Neustart konnte nicht sicher angefordert werden.')
+                    . ' Die sichere Reset-Anforderung bleibt gespeichert und wird beim nächsten regulären Containerstart automatisch erneut geprüft.',
+            ];
+        }
+        return [
+            'success' => true,
+            'restart_queued' => true,
+            'service_started' => false,
+            'service_missing' => false,
+        ];
+    }
+
+    $wrapper = e3dcFindServiceWrapper();
+    $sudo = '/usr/bin/sudo';
+    if ($wrapper === null || !is_file($sudo) || !is_executable($sudo)) {
+        return [
+            'success' => false,
+            'message' => 'Der gebundene Service-Wrapper ist nicht verfügbar. Bitte im Installationscenter „Rechte reparieren“ ausführen.',
+        ];
+    }
+    $process = e3dcRunArgvProcess(
+        [$sudo, '-n', $wrapper, 'reset-matter-pairing', 'e3dc-matter-bridge.service'],
+        390.0,
+        ['max_output_bytes' => 8192]
+    );
+    $stdout = trim((string)($process['stdout'] ?? ''));
+    $stdoutLines = preg_split('/\R/', $stdout) ?: [];
+    $started = in_array('MATTER_RESET_OK_STARTED', $stdoutLines, true);
+    $missing = in_array('MATTER_RESET_OK_UNIT_MISSING', $stdoutLines, true);
+    $inactive = in_array('MATTER_RESET_OK_LEFT_INACTIVE', $stdoutLines, true);
+    $quarantined = in_array('MATTER_RESET_STORAGE_QUARANTINED', $stdoutLines, true);
+    if (empty($process['success'])
+        || (int)($process['exit_code'] ?? 1) !== 0
+        || ((int)$started + (int)$missing + (int)$inactive) !== 1) {
+        $combined = (string)($process['stderr'] ?? '') . "\n" . $stdout;
+        $errorCode = 'MATTER_RESET_ERROR_INTERNAL';
+        if (preg_match('/^MATTER_RESET_ERROR_[A-Z_]+$/m', $combined, $match)) {
+            $errorCode = (string)$match[0];
+        }
+        return [
+            'success' => false,
+            'message' => e3dcMatterResetFailureMessage($errorCode),
+            'error_code' => $errorCode,
+        ];
+    }
+    return [
+        'success' => true,
+        'restart_queued' => false,
+        'service_started' => $started,
+        'service_missing' => $missing,
+        'service_preserved_inactive' => $inactive,
+        'storage_quarantined' => $quarantined,
+    ];
 }
 
 function e3dcRunServiceWrapperAction($action, array $services) {
@@ -7711,16 +8473,43 @@ function renderEnergyFlow($layout = 'mobile', $extraClass = '', $extraAttributes
         $shadow = htmlspecialchars($rgba($color, 0.38));
         return 'top: ' . $pct($p['y']) . '%; left: ' . $pct($p['x']) . '%; --flow-node-color: ' . $color . '; border-color: ' . $color . '; color: ' . $color . '; box-shadow: 0 0 ' . $nodeGlow . 'px ' . $shadow . '; ' . $extra;
     };
-    $nodeAttrs = function($nodeKey) use ($positions, $pct) {
+    $generationPositionPresets = [
+        'pv' => [
+            'direct' => ['x' => 20, 'y' => 25],
+            'aggregate' => ['x' => $layout === 'desktop' ? 15 : 10, 'y' => 32],
+        ],
+        'external_pv' => [
+            'direct' => ['x' => 20, 'y' => 50],
+            'aggregate' => ['x' => $layout === 'desktop' ? 15 : 10, 'y' => 68],
+        ],
+        'generation' => [
+            'direct' => ['x' => $layout === 'desktop' ? 35 : 34, 'y' => 50],
+            'aggregate' => ['x' => $layout === 'desktop' ? 35 : 30, 'y' => 50],
+        ],
+    ];
+    $nodeAttrs = function($nodeKey) use ($positions, $pct, $storedNodes, $generationPositionPresets) {
         $p = $positions[$nodeKey] ?? ['x' => 50.0, 'y' => 50.0];
-        return 'data-flow-x="' . $pct($p['x']) . '" data-flow-y="' . $pct($p['y']) . '"';
+        $attrs = 'data-flow-x="' . $pct($p['x']) . '" data-flow-y="' . $pct($p['y']) . '"';
+        if (isset($generationPositionPresets[$nodeKey])) {
+            $preset = $generationPositionPresets[$nodeKey];
+            $stored = isset($storedNodes[$nodeKey]) && is_array($storedNodes[$nodeKey])
+                && (array_key_exists('x', $storedNodes[$nodeKey]) || array_key_exists('y', $storedNodes[$nodeKey]));
+            $attrs .= ' data-flow-position-custom="' . ($stored ? '1' : '0') . '"'
+                . ' data-flow-direct-x="' . $pct($preset['direct']['x']) . '"'
+                . ' data-flow-direct-y="' . $pct($preset['direct']['y']) . '"'
+                . ' data-flow-aggregate-x="' . $pct($preset['aggregate']['x']) . '"'
+                . ' data-flow-aggregate-y="' . $pct($preset['aggregate']['y']) . '"';
+        }
+        return $attrs;
     };
-    $linePair = function($nodeKey, $fromKey, $toKey, $colorKey, $lineId, $dotId) use ($positions, $colors, $pct) {
+    $linePair = function($nodeKey, $fromKey, $toKey, $colorKey, $lineId, $dotId, $extraAttrs = '') use ($positions, $colors, $pct) {
         $from = $positions[$fromKey];
         $to = $positions[$toKey];
         $color = htmlspecialchars($colors[$colorKey] ?? '#6c757d');
-        return '<line x1="' . $pct($from['x']) . '%" y1="' . $pct($from['y']) . '%" x2="' . $pct($to['x']) . '%" y2="' . $pct($to['y']) . '%" class="flow-line" stroke="' . $color . '" id="' . $lineId . '" data-flow-line="' . $nodeKey . '" data-flow-from="' . $fromKey . '" data-flow-to="' . $toKey . '" data-flow-color-key="' . $colorKey . '" />
-            <line x1="' . $pct($from['x']) . '%" y1="' . $pct($from['y']) . '%" x2="' . $pct($to['x']) . '%" y2="' . $pct($to['y']) . '%" class="flow-dots" id="' . $dotId . '" stroke="' . $color . '" data-flow-line="' . $nodeKey . '" data-flow-from="' . $fromKey . '" data-flow-to="' . $toKey . '" data-flow-color-key="' . $colorKey . '" />';
+        $attrs = trim((string)$extraAttrs);
+        $attrs = $attrs !== '' ? ' ' . $attrs : '';
+        return '<line x1="' . $pct($from['x']) . '%" y1="' . $pct($from['y']) . '%" x2="' . $pct($to['x']) . '%" y2="' . $pct($to['y']) . '%" class="flow-line" stroke="' . $color . '" id="' . $lineId . '" data-flow-line="' . $nodeKey . '" data-flow-from="' . $fromKey . '" data-flow-to="' . $toKey . '" data-flow-color-key="' . $colorKey . '"' . $attrs . ' />
+            <line x1="' . $pct($from['x']) . '%" y1="' . $pct($from['y']) . '%" x2="' . $pct($to['x']) . '%" y2="' . $pct($to['y']) . '%" class="flow-dots" id="' . $dotId . '" stroke="' . $color . '" data-flow-line="' . $nodeKey . '" data-flow-from="' . $fromKey . '" data-flow-to="' . $toKey . '" data-flow-color-key="' . $colorKey . '"' . $attrs . ' />';
     };
 
     $colorOptions = [
@@ -7738,7 +8527,7 @@ function renderEnergyFlow($layout = 'mobile', $extraClass = '', $extraAttributes
     if ($showWp) $colorOptions['heatpump'] = 'WP';
     if ($showHs) $colorOptions['heater'] = 'Heizstab';
     if ($showClimate) $colorOptions['climate'] = 'Klima';
-    if ($aggregateGeneration) $colorOptions['generation'] = 'Erzeugung';
+    $colorOptions['generation'] = 'Erzeugung';
     if ($aggregateConsumption) $colorOptions['consumption'] = 'Verbrauch';
     $colorOptions['center'] = 'E3DC-Control';
     $colorSelect = '';
@@ -7765,12 +8554,9 @@ function renderEnergyFlow($layout = 'mobile', $extraClass = '', $extraAttributes
         </div>
         <div class="flow-canvas" data-flow-canvas>
         <svg class="flow-svg">
-            ' . ($aggregateGeneration
-                ? $linePair('pv', 'pv', 'generation', 'pv', 'flow-line-pv', 'flow-dot-pv')
-                    . $linePair('external_pv', 'external_pv', 'generation', 'external_pv', 'flow-line-external-pv', 'flow-dot-external-pv')
-                    . $linePair('generation', 'generation', 'center', 'generation', 'flow-line-generation', 'flow-dot-generation')
-                : $linePair('pv', 'pv', 'center', 'pv', 'flow-line-pv', 'flow-dot-pv')
-                    . $linePair('external_pv', 'external_pv', 'center', 'external_pv', 'flow-line-external-pv', 'flow-dot-external-pv')) . '
+            ' . $linePair('pv', 'pv', $aggregateGeneration ? 'generation' : 'center', 'pv', 'flow-line-pv', 'flow-dot-pv') . '
+            ' . $linePair('external_pv', 'external_pv', $aggregateGeneration ? 'generation' : 'center', 'external_pv', 'flow-line-external-pv', 'flow-dot-external-pv', $showExternalWr ? '' : 'style="display:none"') . '
+            ' . $linePair('generation', 'generation', 'center', 'generation', 'flow-line-generation', 'flow-dot-generation', 'data-flow-generation-aggregate="1"' . ($aggregateGeneration ? '' : ' style="display:none"')) . '
             ' . $linePair('grid', 'grid', 'center', 'grid', 'flow-line-grid', 'flow-dot-grid') . '
             ' . $linePair('battery', 'battery', 'center', 'battery', 'flow-line-bat', 'flow-dot-bat') . '
             ' . ($aggregateConsumption ? $linePair('consumption', 'center', 'consumption', 'consumption', 'flow-line-consumption', 'flow-dot-consumption') : '') . '
@@ -7784,7 +8570,7 @@ function renderEnergyFlow($layout = 'mobile', $extraClass = '', $extraAttributes
 
         <div class="flow-node-back" id="f-node-bat-back" data-flow-back="battery" ' . $nodeAttrs('battery') . ' style="top: '.$pct($positions['battery']['y']).'%; left: '.$pct($positions['battery']['x']).'%;"></div>
 
-        ' . ($aggregateGeneration ? '<div class="flow-node node-aggregate node-generation" id="f-node-generation" data-flow-node="generation" data-flow-color-key="generation" ' . $nodeAttrs('generation') . ' style="' . $nodeStyle('generation', 'generation') . '"><i class="fas fa-bolt fa-icon"></i><div class="val" id="f-val-generation">0W</div><div class="label" data-flow-label-key="generation">' . $labelFor('generation', 'Erzeugung') . '</div></div>' : '') . '
+        <div class="flow-node node-aggregate node-generation" id="f-node-generation" data-flow-node="generation" data-flow-optional="1" data-flow-color-key="generation" ' . ($aggregateGeneration ? '' : 'hidden ') . $nodeAttrs('generation') . ' style="' . $nodeStyle('generation', 'generation') . '"><i class="fas fa-bolt fa-icon"></i><div class="val" id="f-val-generation">0W</div><div class="label" data-flow-label-key="generation">' . $labelFor('generation', 'Erzeugung') . '</div></div>
         ' . ($aggregateConsumption ? '<div class="flow-node node-aggregate node-consumption" id="f-node-consumption" data-flow-node="consumption" data-flow-color-key="consumption" ' . $nodeAttrs('consumption') . ' style="' . $nodeStyle('consumption', 'consumption') . '"><i class="fas fa-gauge-high fa-icon"></i><div class="val" id="f-val-consumption">0W</div><div class="label" data-flow-label-key="consumption">' . $labelFor('consumption', 'Verbrauch') . '</div></div>' : '') . '
 
         <div class="flow-node node-pv" id="f-node-pv" data-flow-node="pv" data-flow-color-key="pv" ' . $nodeAttrs('pv') . ' style="' . $nodeStyle('pv', 'pv') . '"><i class="fas fa-sun fa-icon"></i><div class="val" id="f-val-pv">0W</div><div class="label flow-pv-split" id="f-val-pv-split" style="display:none;"></div><div class="label" data-flow-label-key="pv">' . $labelFor('pv', 'E3DC-PV') . '</div><div class="price-tag" id="f-val-pv-yield" style="display:none;"></div><span class="flow-zero-export-badge" id="f-pv-zero-export-badge" role="status" aria-live="polite" hidden><i class="fas fa-shield-alt" aria-hidden="true"></i><span id="f-pv-zero-export-label">LUOX 0 W</span></span></div>

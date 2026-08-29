@@ -145,6 +145,15 @@ gestarteten Zyklus vor einem EMS-bedingten Abbruch. Er zwingt die Wärmepumpe
 nicht zum Überheizen: Erreicht die Luxtronik den Zielwert und beendet den Lauf
 selbst, wird der externe Auftrag freigegeben.
 
+Ein direkter 55-°C-Boost aus PV-Überschuss, Pre-Dump oder Preislogik bleibt
+bei einem kurzen Budgetwechsel während der Signalhaltezeit und der
+konfigurierten Defizitfrist stabil. Fehlt anschließend weiterhin ein
+startfähiges Budget, wird ausschließlich das Warmwasserziel auf den aktiven
+Timerwert oder auf die normale Luxtronik-Regelung zurückgegeben. Ein Heiztakt
+gilt dabei nicht als Warmwasserlauf. Ein physisch belegter WW-Zyklus bleibt
+geschützt; nach der Rücknahme öffnet erst eine neue, zur aktuellen
+Wärmeanfrage gehörende Budgetentscheidung den direkten Boost erneut.
+
 ---
 
 ## 6. Dateistruktur

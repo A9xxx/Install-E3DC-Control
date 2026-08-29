@@ -25,7 +25,8 @@ import stat
 from typing import Mapping
 
 
-RECOVERY_CONTEXT_SCHEMA = "e3dc_update_recovery_context_v1"
+RECOVERY_CONTEXT_SCHEMA_V1 = "e3dc_update_recovery_context_v1"
+RECOVERY_CONTEXT_SCHEMA = "e3dc_update_recovery_context_v2"
 RECOVERY_CONTEXT_NAME = "recovery-context.json"
 RECOVERY_CONTEXT_DIRECTORY = "/var/lib/e3dc-update-safety"
 RECOVERY_CONTEXT_PATH = os.path.join(
@@ -209,6 +210,8 @@ class RecoveryContext:
     privileged_backup_payloads: tuple[PrivilegedBackupPayloadBinding, ...]
     surface_receipt: RecoveryReceiptReference
     systemd_receipt: RecoveryReceiptReference
+    install_root_identity: tuple[int, int, int, int] | None = None
+    schema: str = RECOVERY_CONTEXT_SCHEMA_V1
 
 
 @dataclass(frozen=True)
@@ -734,11 +737,52 @@ def _validate_privileged_payload(
     return payload
 
 
+def _validate_install_root_identity(
+    value: tuple[int, int, int, int] | None,
+    *,
+    required: bool,
+) -> tuple[int, int, int, int] | None:
+    if value is None:
+        if required:
+            raise ValueError("Recovery-Kontext v2 benötigt eine Installationsroot-Identität")
+        return None
+    if not isinstance(value, tuple) or len(value) != 4:
+        raise ValueError("Installationsroot-Identität besitzt keine vier Werte")
+    normalized = (
+        _strict_integer(value[0], label="Installationsroot-Parent-Device"),
+        _strict_integer(
+            value[1],
+            label="Installationsroot-Parent-Inode",
+            minimum=1,
+        ),
+        _strict_integer(value[2], label="Installationsroot-Device"),
+        _strict_integer(
+            value[3],
+            label="Installationsroot-Inode",
+            minimum=1,
+        ),
+    )
+    if normalized != value:
+        raise ValueError("Installationsroot-Identität ist nicht kanonisch")
+    return normalized
+
+
 def validate_recovery_context(context: RecoveryContext) -> RecoveryContext:
     """Validiert alle Typen, Sortierungen und transaktionsweiten Querbindungen."""
 
     if not isinstance(context, RecoveryContext):
         raise ValueError("Recovery-Kontext besitzt den falschen Typ")
+    if context.schema not in {RECOVERY_CONTEXT_SCHEMA_V1, RECOVERY_CONTEXT_SCHEMA}:
+        raise ValueError("Recovery-Kontext besitzt ein unbekanntes Schema")
+    _validate_install_root_identity(
+        context.install_root_identity,
+        required=context.schema == RECOVERY_CONTEXT_SCHEMA,
+    )
+    if (
+        context.schema == RECOVERY_CONTEXT_SCHEMA_V1
+        and context.install_root_identity is not None
+    ):
+        raise ValueError("Recovery-Kontext v1 darf keine Root-Identität vortäuschen")
     _strict_sha256(context.transaction_id, label="Transaktions-ID")
     _canonical_absolute_path(context.install_root, label="Installationsroot")
     if not isinstance(context.install_user, str) or not _USER_RE.fullmatch(
@@ -810,6 +854,20 @@ def _receipt_mapping(reference: RecoveryReceiptReference) -> dict[str, object]:
 
 def _context_mapping(context: RecoveryContext) -> dict[str, object]:
     validate_recovery_context(context)
+    install_mapping: dict[str, object] = {
+        "root": context.install_root,
+        "user": context.install_user,
+    }
+    if context.schema == RECOVERY_CONTEXT_SCHEMA:
+        identity = context.install_root_identity
+        if identity is None:
+            raise ValueError("Recovery-Kontext v2 verlor seine Root-Identität")
+        install_mapping["root_identity"] = {
+            "parent_device": identity[0],
+            "parent_inode": identity[1],
+            "root_device": identity[2],
+            "root_inode": identity[3],
+        }
     repo_mapping = None
     if context.repo is not None:
         repo_mapping = {
@@ -825,13 +883,10 @@ def _context_mapping(context: RecoveryContext) -> dict[str, object]:
             "dirty_paths": list(context.repo.dirty_paths),
         }
     return {
-        "schema": RECOVERY_CONTEXT_SCHEMA,
+        "schema": context.schema,
         "state": "complete",
         "transaction_id": context.transaction_id,
-        "install": {
-            "root": context.install_root,
-            "user": context.install_user,
-        },
+        "install": install_mapping,
         "source": {
             "old_commit": context.source.old_commit,
             "bootstrap_without_git": context.source.bootstrap_without_git,
@@ -1032,13 +1087,41 @@ def parse_recovery_context(
         },
         label="Recovery-Kontext",
     )
-    if top["schema"] != RECOVERY_CONTEXT_SCHEMA or top["state"] != "complete":
+    schema = top["schema"]
+    if schema not in {RECOVERY_CONTEXT_SCHEMA_V1, RECOVERY_CONTEXT_SCHEMA} or top[
+        "state"
+    ] != "complete":
         raise ValueError("Recovery-Kontext besitzt Schema oder Status nicht")
     install = _exact_mapping(
         top["install"],
-        keys={"root", "user"},
+        keys=(
+            {"root", "user"}
+            if schema == RECOVERY_CONTEXT_SCHEMA_V1
+            else {"root", "user", "root_identity"}
+        ),
         label="Installationsbindung",
     )
+    install_root_identity = None
+    if schema == RECOVERY_CONTEXT_SCHEMA:
+        identity_mapping = _exact_mapping(
+            install["root_identity"],
+            keys={
+                "parent_device",
+                "parent_inode",
+                "root_device",
+                "root_inode",
+            },
+            label="Installationsroot-Identität",
+        )
+        install_root_identity = _validate_install_root_identity(
+            (
+                identity_mapping["parent_device"],
+                identity_mapping["parent_inode"],
+                identity_mapping["root_device"],
+                identity_mapping["root_inode"],
+            ),
+            required=True,
+        )
     source_map = _exact_mapping(
         top["source"],
         keys={"old_commit", "bootstrap_without_git", "bootstrap_rebuild_git"},
@@ -1242,6 +1325,8 @@ def parse_recovery_context(
             receipts_map["systemd"],
             label="systemd-Receipt",
         ),
+        install_root_identity=install_root_identity,
+        schema=schema,
     )
     validate_recovery_context(context)
     if (
@@ -1833,6 +1918,7 @@ __all__ = [
     "PrivilegedBackupPayloadBinding",
     "RECOVERY_CONTEXT_PATH",
     "RECOVERY_CONTEXT_SCHEMA",
+    "RECOVERY_CONTEXT_SCHEMA_V1",
     "RecoveryBackupBinding",
     "RecoveryContext",
     "RecoveryContextContract",

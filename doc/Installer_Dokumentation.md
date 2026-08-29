@@ -1,6 +1,6 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.4e
+Dokumentation Stand: 5.4.4f
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
@@ -14,7 +14,7 @@ Dashboard, Konsole und Installer-Menü denselben Dispatcher. Die automatische
 Updateprüfung verwendet dieselbe Stable-Quelle, informiert aber nur über einen
 neuen Stand.
 
-Der Installer-Anteil von 5.4.4e lässt den heruntergeladenen Ziel-Updater
+Der Installer-Anteil von 5.4.4f lässt den heruntergeladenen Ziel-Updater
 Vollbackup, kurze ruhende Daten-Nachsicherung, Releaseprojektion, Reparatur
 bekannter Rechte und Dienstneustart durchführen. Das Nutzer-`.git`, lokale
 Produktänderungen, fehlende Produktdateien und historische Rechte sind keine
@@ -26,6 +26,34 @@ Backup-/Updateauftrag. Alle sichtbaren zustandsändernden
 Webaktionen werten Anmeldung, CSRF, HTTP-Ergebnis, Antwortinhalt und Teilfehler
 aus, bevor sie Erfolg anzeigen. Für private Modus-5-Daten gilt `02770`; der
 ausdrücklich gewählte Kompatibilitätsmodus `02775` bleibt zulässig.
+
+Für eine beibehaltene `external_pv_topology.json` stellt 5.4.4f den
+Installationsnutzer, die Webgruppe und den gemeinsamen Lesemodus `0664`
+wieder her. Die übrigen Konfigurations- und Geheimnisdateien bleiben bei ihren
+strengeren Rechteverträgen.
+
+Der private Release-Checkout bleibt root-eigen und auf `0700`/`0600`
+begrenzt. Der betriebene Produktbaum erhält beim Cutover dagegen definierte
+Live-Rechte: Verzeichnisse `0755`, normale Dateien `0644` und echte
+Startskripte mit Interpreterzeile `0755`, jeweils als Installationsnutzer und
+Webgruppe. Vor dem Dienststart werden PHP-Pfadauflösung und Installer-Importkette in einer
+bereinigten Umgebung real als `www-data` geprüft. Die separate
+Service-Pythonumgebung bleibt privat; ein Fehler aktiviert den bestehenden
+Rücklauf.
+
+Bei Installationen unter einem privaten Home-Pfad bindet der Zielcode
+owner-private, nicht-setgid Vorfahren eng an die Webgruppe und ergänzt nur
+deren Traversierrecht. Eine vorhandene gezielte POSIX-ACL für `www-data` wird
+akzeptiert. Gemeinsam genutzte oder setgid Vorfahren werden ohne diese ACL vor
+der Produktmutation mit einer konkreten Anleitung gesperrt. Globales
+`Other-Execute`, Auflisten, Lesen und Schreiben bleiben gesperrt. Direkte und
+verschachtelte Home-Pfade sowie `/opt` bleiben gültige Installationsvarianten.
+
+Der Zielbestand beträgt maximal drei automatisch verwaltete
+System-Backup-Familien und separat maximal drei Web-Installer-Sicherungen.
+Schutzbindungen dürfen die Zielgrenzen vorübergehend überschreiten und werden
+nicht erzwungen gelöscht. Die offene Grenze bleibt sichtbar und wird bei der
+nächsten sicheren Backup-Bereinigung erneut angewendet.
 
 Die exakt bestätigte RAM-Disk unter `/var/www/html/ramdisk` bleibt beim
 Dateiaustausch erhalten. Nach einem Rücklauf werden ihre und die übrigen

@@ -260,12 +260,21 @@ class SafeLuxtronik:
 
                     if ww_mode == 1 and ww_temp and ist_ww is not None:
                         target_ww = float(ww_temp)
-                        ww_physically_running = heatpump_compressor_running(wp_data)
+                        ww_physically_running = heatpump_ww_cycle_running(
+                            {},
+                            wp_data,
+                            ww_requested=True,
+                        )
                         if ist_ww >= target_ww:
                             new_ww_mode = 0
-                        elif ww_physically_running or getattr(self, 'curr_ext_ww', 0) == 1:
-                            # Einen realen Zyklus beziehungsweise einen bereits
-                            # übernommenen Sollwert bis zur Zieltemperatur halten.
+                        elif (
+                            ww_physically_running
+                            or getattr(self, 'curr_ext_ww', 0) == 1
+                        ):
+                            # Einen realen Zyklus oder den bestätigt gesetzten
+                            # Auftrag bis zur zentralen Rücknahmekante stabil
+                            # halten. curr_ext_ww ist nur Auftragskontinuität,
+                            # ausdrücklich keine physische WW-Laufevidenz.
                             new_ww_mode = 1
                         elif ist_ww < (target_ww - 8.0):
                             new_ww_mode = 1
@@ -4676,6 +4685,35 @@ def luxtronik_ww_command_request(
     return None, None, None
 
 
+def luxtronik_ww_target_readback_confirmed(
+    target_ww_mode,
+    target_ww_temp,
+    wp_status=None,
+):
+    """Bestätigt einen bereits ohne neuen Write erreichten WW-Rückfall."""
+
+    status = wp_status if isinstance(wp_status, dict) else {}
+    if status.get("valid") is not True or target_ww_mode is None:
+        return False
+    live_mode = normalize_luxtronik_shi_mode(
+        status.get("SHI_WW_Mode", status.get("WW_Mode"))
+    )
+    target_mode = normalize_luxtronik_shi_mode(target_ww_mode)
+    if target_mode == 0:
+        return live_mode == 0
+    if target_mode != 1 or live_mode != 1 or target_ww_temp is None:
+        return False
+    live_temp = status.get("SHI_WW_Setpoint", status.get("WW_Setpoint"))
+    return bool(
+        live_temp is not None
+        and abs(
+            _safe_float(live_temp, -999.0)
+            - _safe_float(target_ww_temp, 999.0)
+        )
+        <= 0.5
+    )
+
+
 def heatpump_ww_timer_target_allowed(
     wp_type,
     automatic_heat_start_allowed,
@@ -4710,6 +4748,7 @@ _LUXTRONIK_TIMER_BUDGET_WITHDRAWAL_REASONS = frozenset({
     "typed_demand_ended",
     "price_or_predump_stop",
     "pv_budget_deficit_stop",
+    "luxtronik_ww_start_budget_expired",
 })
 
 
@@ -5604,29 +5643,139 @@ def _market_release_end_ts_s(release):
     end_ms = _safe_float(contract.get("end_ts"), 0.0)
     return end_ms / 1000.0 if end_ms > 0 else None
 
-def heatpump_ww_cycle_running(wp_status=None, wp_data=None, ww_requested=False):
-    """Return true only when warm-water mode is physically active.
+def luxtronik_ww_runtime_state(wp_status=None, wp_data=None):
+    """Klassifiziert einen Verdichterlauf domänenscharf als Warmwasser.
 
-    Some Luxtronik values expose ``WW_Mode=1`` while the compressor and pumps are
-    idle. Treating that as a running WW cycle would keep the productive heat
-    policy in a protected hold without a real cycle to protect.
+    SHI-WW-Modus und Sollwert sind nur unser Auftrag. Sie dürfen weder einen
+    Heiztakt noch einen stehenden Verdichter in einen laufenden WW-Zyklus
+    umdeuten. Als WW-Evidenz gelten ausschließlich der laufende Verdichter plus
+    dokumentierter Betriebs-/WW-Status oder die frische vorhandene BUP-Kante.
+    Bei widersprüchlicher Heiz- und WW-Evidenz gewinnt der WW-Schutz; der
+    Konflikt bleibt als Diagnosegrund sichtbar und wird nicht blind beendet.
     """
 
     status = wp_status if isinstance(wp_status, dict) else {}
     data = wp_data if isinstance(wp_data, dict) else {}
-    physical_ww_status = data.get("Status_Warmwasser", status.get("Status_Warmwasser"))
-    if physical_ww_status is not None and _safe_int(physical_ww_status, -1) == 3:
+    compressor_running = heatpump_compressor_running(data, status)
+    if not compressor_running:
+        return {
+            "state": "not_running",
+            "ww_running": False,
+            "compressor_running": False,
+            "reason": "compressor_off",
+        }
+
+    operating_raw = data.get("Betriebsart", status.get("Betriebsart"))
+    ww_status_raw = data.get(
+        "Status_Warmwasser",
+        status.get("Status_Warmwasser"),
+    )
+    heating_status_raw = data.get(
+        "Status_Heizen",
+        status.get("Status_Heizen"),
+    )
+    operating_mode = (
+        _safe_int(operating_raw, -1)
+        if operating_raw is not None
+        else None
+    )
+    ww_status = (
+        _safe_int(ww_status_raw, -1)
+        if ww_status_raw is not None
+        else None
+    )
+    heating_status = (
+        _safe_int(heating_status_raw, -1)
+        if heating_status_raw is not None
+        else None
+    )
+    bup_raw = data.get("BUP", status.get("BUP"))
+    bup_fresh = bool(status.get("source_fresh") is True)
+
+    ww_evidence = []
+    other_domain_evidence = []
+    if operating_mode == 1:
+        ww_evidence.append("operating_mode_ww")
+    elif operating_mode is not None and operating_mode >= 0:
+        other_domain_evidence.append("operating_mode_other")
+    if ww_status == 3:
+        ww_evidence.append("warmwater_status_active")
+    if heating_status == 3:
+        other_domain_evidence.append("heating_status_active")
+    if bup_fresh and _safe_int(bup_raw, 0) > 0:
+        ww_evidence.append("bup_active")
+
+    if ww_evidence:
+        return {
+            "state": "ww_running",
+            "ww_running": True,
+            "compressor_running": True,
+            "reason": (
+                "ww_running_with_conflict"
+                if other_domain_evidence
+                else ww_evidence[0]
+            ),
+            "ww_evidence": ww_evidence,
+            "other_domain_evidence": other_domain_evidence,
+        }
+    if other_domain_evidence:
+        return {
+            "state": "other_domain",
+            "ww_running": False,
+            "compressor_running": True,
+            "reason": other_domain_evidence[0],
+            "ww_evidence": [],
+            "other_domain_evidence": other_domain_evidence,
+        }
+    return {
+        "state": "unknown",
+        "ww_running": False,
+        "compressor_running": True,
+        "reason": "compressor_domain_unbound",
+        "ww_evidence": [],
+        "other_domain_evidence": [],
+    }
+
+
+def heatpump_ww_cycle_running(wp_status=None, wp_data=None, ww_requested=False):
+    """Kompatibler herstellerübergreifender WW-Laufvertrag.
+
+    Luxtronik-spezifische Entscheidungen verwenden zusätzlich
+    ``luxtronik_ww_runtime_state``. Andere Treiber besitzen nicht zwingend die
+    Luxtronik-Domänenfelder und behalten deshalb ihre bisherige Kombination
+    aus WW-Anforderung und physischer Verdichterevidenz.
+    """
+
+    status = wp_status if isinstance(wp_status, dict) else {}
+    data = wp_data if isinstance(wp_data, dict) else {}
+    physical_ww_status = data.get(
+        "Status_Warmwasser",
+        status.get("Status_Warmwasser"),
+    )
+    if (
+        physical_ww_status is not None
+        and _safe_int(physical_ww_status, -1) == 3
+    ):
         return True
 
     operating_mode = data.get("Betriebsart", status.get("Betriebsart"))
     compressor_running = heatpump_compressor_running(data, status)
-    if operating_mode is not None and _safe_int(operating_mode, -1) == 1 and compressor_running:
+    if (
+        operating_mode is not None
+        and _safe_int(operating_mode, -1) == 1
+        and compressor_running
+    ):
         return True
-
     if not ww_requested:
         return False
     ww_mode = normalize_luxtronik_shi_mode(
-        status.get("SHI_WW_Mode", status.get("WW_Mode", data.get("WW_Mode", data.get("Modus Warmw."))))
+        status.get(
+            "SHI_WW_Mode",
+            status.get(
+                "WW_Mode",
+                data.get("WW_Mode", data.get("Modus Warmw.")),
+            ),
+        )
     )
     if ww_mode != 1:
         return False
@@ -5636,6 +5785,150 @@ def heatpump_ww_cycle_running(wp_status=None, wp_data=None, ww_requested=False):
         if _safe_int(data.get(key, status.get(key)), 0) > 0:
             return True
     return False
+
+
+def luxtronik_ww_fresh_start_budget_allowed(
+    demand_active,
+    command_cap_w,
+    required_start_w,
+    boost_permission_active,
+    start_budget_gate=None,
+):
+    """Akzeptiert nur ein zur aktuellen Demand-Generation gehörendes Budget."""
+
+    gate = start_budget_gate if isinstance(start_budget_gate, dict) else {}
+    return bool(
+        demand_active
+        and gate.get("allowed") is True
+        and _safe_int(command_cap_w, 0) >= max(
+            1,
+            _safe_int(required_start_w, 1),
+        )
+        and boost_permission_active is True
+    )
+
+
+def luxtronik_ww_budget_loss_guard(
+    state=None,
+    *,
+    demand_active,
+    signal_active,
+    fresh_start_budget,
+    runtime_state,
+    duration_s,
+    signal_release_allowed,
+    clock_sample=None,
+):
+    """Begrenzt eine nicht angenommene direkte WW-Startfreigabe.
+
+    Die globale 600-s-Signalhaltezeit bleibt unangetastet. Erst nach Ablauf
+    dieser Hardwarekante *und* der konfigurierten Defizitfrist wird der
+    WW-Sollwert blockiert. Ein echter WW-Lauf bleibt geschützt; ein Heiztakt
+    darf die WW-Lease dagegen nicht verlängern. Nach Ablauf kann ausschließlich
+    ein neues frisches startfähiges Command-Budget die Lease wieder öffnen.
+    """
+
+    source = copy.deepcopy(state) if isinstance(state, dict) else {}
+    runtime = str(runtime_state or "unknown").strip().casefold()
+    current_sample = (
+        copy.deepcopy(clock_sample)
+        if isinstance(clock_sample, dict)
+        else control_time.sample()
+    )
+    duration = max(1.0, _safe_float(duration_s, 600.0))
+
+    if not demand_active:
+        return {
+            "blocked": False,
+            "effective_block": False,
+            "timer_guard": {},
+            "runtime_state": runtime,
+            "reason": "demand_ended",
+            "evidence_limit": False,
+        }
+    if fresh_start_budget:
+        return {
+            "blocked": False,
+            "effective_block": False,
+            "timer_guard": {},
+            "runtime_state": runtime,
+            "reason": "fresh_start_budget",
+            "evidence_limit": False,
+        }
+    if source.get("blocked") is True:
+        return {
+            "blocked": True,
+            "effective_block": bool(
+                signal_release_allowed
+                and runtime in ("not_running", "other_domain")
+            ),
+            "timer_guard": {},
+            "runtime_state": runtime,
+            "reason": (
+                "latched_but_physical_ww_protected"
+                if runtime == "ww_running"
+                else str(source.get("reason") or "budget_loss_latched")
+            ),
+            "evidence_limit": runtime == "unknown",
+        }
+    if runtime == "ww_running":
+        return {
+            "blocked": False,
+            "effective_block": False,
+            "timer_guard": {},
+            "runtime_state": runtime,
+            "reason": "physical_ww_cycle_running",
+            "evidence_limit": False,
+        }
+    if runtime == "unknown":
+        return {
+            "blocked": False,
+            "effective_block": False,
+            "timer_guard": copy.deepcopy(source.get("timer_guard") or {}),
+            "runtime_state": runtime,
+            "reason": "ww_runtime_evidence_limit",
+            "evidence_limit": True,
+        }
+    if not signal_active:
+        return {
+            "blocked": False,
+            "effective_block": False,
+            "timer_guard": {},
+            "runtime_state": runtime,
+            "reason": "waiting_for_positive_signal",
+            "evidence_limit": False,
+        }
+
+    previous_guard = source.get("timer_guard")
+    if isinstance(previous_guard, dict) and previous_guard:
+        timer_guard = control_time.evaluate_guard(
+            previous_guard,
+            current_sample,
+            minimum_s=duration,
+        )
+    else:
+        timer_guard = control_time.begin_guard(
+            duration,
+            current_sample,
+            minimum_s=duration,
+            epoch_mode=control_time.EPOCH_MODE_SAME_BOOT_MONOTONIC,
+        )
+    blocked = bool(
+        timer_guard.get("active") is not True
+        or timer_guard.get("fail_closed") is True
+    )
+    return {
+        "blocked": blocked,
+        "effective_block": bool(blocked and signal_release_allowed),
+        "timer_guard": {} if blocked else copy.deepcopy(timer_guard),
+        "runtime_state": runtime,
+        "reason": (
+            "budget_loss_expired"
+            if blocked
+            else "budget_loss_grace_active"
+        ),
+        "evidence_limit": bool(timer_guard.get("fail_closed") is True),
+    }
 
 def heatpump_ww_temperature_below_target(wp_status=None, wp_data=None, target_temp_c=None, fallback_target_c=0.0):
     """Return (below_target, actual, target) for warm-water stop protection."""
@@ -6226,6 +6519,7 @@ def build_heatpump_policy_decision(
     previous_sg_ready_state=heat_policy.SG_READY_NORMAL,
     previous_available_budget_w=0,
     forecast_result=None,
+    wp_type=None,
 ):
     """Translate Energy-Manager state into the central heat policy contract."""
 
@@ -6258,6 +6552,16 @@ def build_heatpump_policy_decision(
     battery_empty_soc = _safe_float(_heat_config_value(config, ("heat_price_block_empty_soc",), max(5.0, min(15.0, _safe_float(min_soc, 80.0) - 20.0))), 10.0)
     summer_mode = _safe_float(at_mittel, 20.0) > _safe_float(heizgrenze_temp, 10.0)
     ww_requested = bool(boost_active or price_boost_active or predump_heatpump_active or is_ww_timer_running)
+    ww_cycle_running = bool(
+        luxtronik_ww_runtime_state(wp_status, wp_data).get("ww_running")
+        is True
+        if _safe_int(wp_type, -1) == 0
+        else heatpump_ww_cycle_running(
+            wp_status,
+            wp_data,
+            ww_requested=ww_requested,
+        )
+    )
     operating_mode = normalize_luxtronik_operating_mode(
         wp_data.get("Betriebsart") if isinstance(wp_data, dict) else None
     )
@@ -6309,7 +6613,7 @@ def build_heatpump_policy_decision(
         temperature_min_c=temp_ctx["temperature_min_c"],
         temperature_max_c=temp_ctx["temperature_max_c"],
         ww_cycle_requested=bool(price_action == "BOOST" and summer_mode),
-        ww_cycle_running=heatpump_ww_cycle_running(wp_status, wp_data, ww_requested=ww_requested),
+        ww_cycle_running=ww_cycle_running,
         ww_cycle_started_ts=ww_cycle_started_ts,
         defrost_active=defrost_active,
         legionella_active=legionella_active,
@@ -6504,6 +6808,8 @@ ENERGY_RESTART_CHECKPOINT_KEYS = (
     "heatpump_positive_signal_started_ts",
     "heatpump_positive_signal_demand_class",
     "heatpump_positive_signal_hold_guard",
+    "luxtronik_ww_budget_loss_guard_state",
+    "luxtronik_ww_budget_loss_blocked_until_fresh_budget",
     "heatpump_budget_demand_first_seen_ts",
     "wp_last_ww_cycle_start_ts",
     "wp_last_ww_cycle_target_c",
@@ -6528,6 +6834,7 @@ ENERGY_RESTART_SEMANTIC_KEYS = (
     "pv_pause_active",
     "heatpump_positive_signal_started_ts",
     "heatpump_positive_signal_demand_class",
+    "luxtronik_ww_budget_loss_blocked_until_fresh_budget",
     "wp_last_ww_cycle_start_ts",
     "wp_last_ww_cycle_target_c",
     "wp_curr_ext_ww",
@@ -7370,6 +7677,8 @@ def main():
     heatpump_positive_signal_restart_budget_rearm_pending = False
     heatpump_positive_signal_hold_guard = {}
     heatpump_positive_signal_start_reservation_allowed = False
+    luxtronik_ww_budget_loss_guard_state = {}
+    luxtronik_ww_budget_loss_blocked_until_fresh_budget = False
     heatpump_budget_demand_active_class = "none"
     heatpump_budget_demand_first_seen_ts = 0.0
     predump_heatpump_started_ts = 0.0
@@ -7503,6 +7812,37 @@ def main():
                     and restored_demand_first_seen <= time.time()
                     else time.time()
                 )
+            saved_ww_budget_loss_guard = saved.get(
+                "luxtronik_ww_budget_loss_guard_state"
+            )
+            saved_ww_budget_loss_pending = bool(
+                saved.get(
+                    "luxtronik_ww_budget_loss_blocked_until_fresh_budget"
+                )
+                is True
+                or (
+                    isinstance(saved_ww_budget_loss_guard, dict)
+                    and (
+                        saved_ww_budget_loss_guard.get("blocked") is True
+                        or bool(saved_ww_budget_loss_guard.get("timer_guard"))
+                    )
+                )
+            )
+            if saved_ww_budget_loss_pending:
+                # Ein Neustart darf die Ablaufzeit einer bereits budgetlosen
+                # 55-°C-Lease nicht neu minten. Bis zu einem frischen
+                # startfähigen Folgebudget bleibt sie daher konservativ
+                # abgelaufen; ein physisch belegter WW-Lauf wird unten dennoch
+                # geschützt.
+                luxtronik_ww_budget_loss_guard_state = {
+                    "blocked": True,
+                    "effective_block": False,
+                    "timer_guard": {},
+                    "runtime_state": "unknown",
+                    "reason": "restart_budget_loss_conservative",
+                    "evidence_limit": True,
+                }
+                luxtronik_ww_budget_loss_blocked_until_fresh_budget = True
             wp_last_ww_cycle_start_ts = restart_revalidation["ww_cycle_started_ts"]
             wp_last_ww_cycle_target_c = restart_revalidation["ww_cycle_target_c"]
             pv_pause_blocked_until = restart_revalidation["pv_pause_blocked_until"]
@@ -7998,6 +8338,13 @@ def main():
             wp_status = {}
             wp_compressor_running_now = False
             wp_compressor_observation_valid = False
+            luxtronik_ww_runtime_contract = {
+                "state": "unknown",
+                "ww_running": False,
+                "compressor_running": False,
+                "reason": "runtime_not_sampled",
+            }
+            luxtronik_ww_budget_loss_effective_block = False
             wp_live_ts = None
             wp_live_age_s = None
             wp_live_fresh = False
@@ -9804,6 +10151,7 @@ def main():
                             )
                         ),
                         previous_available_budget_w=heat_policy_budget_w,
+                        wp_type=wp_type,
                     )
                     heat_intent_export, heat_intent_runtime_validation = (
                         build_heat_intent_shadow_projection(
@@ -10341,6 +10689,95 @@ def main():
                         central_heatpump_effective_budget_source = (
                             "accepted_running_accounting"
                         )
+
+                    luxtronik_ww_runtime_contract = (
+                        luxtronik_ww_runtime_state(wp_status, wp_data)
+                    )
+                    luxtronik_ww_budget_demand_active = bool(
+                        wp_type == 0
+                        and at_mittel > HEIZGRENZE_TEMP
+                        and str(
+                            heatpump_budget_demand_class or "none"
+                        ).strip().casefold()
+                        in {
+                            "pv_surplus",
+                            "pre_dump",
+                            "market_price",
+                            "price",
+                        }
+                    )
+                    luxtronik_ww_required_start_w = max(
+                        1,
+                        _safe_int(
+                            central_heatpump_start_budget_gate.get(
+                                "required_start_w"
+                            ),
+                            abs(_safe_int(GRID_START_LIMIT, -3500)),
+                        ),
+                    )
+                    luxtronik_ww_fresh_start_budget = (
+                        luxtronik_ww_fresh_start_budget_allowed(
+                            luxtronik_ww_budget_demand_active,
+                            central_heatpump_command_cap_w,
+                            luxtronik_ww_required_start_w,
+                            central_heatpump_boost_permission_active,
+                            central_heatpump_start_budget_gate,
+                        )
+                    )
+                    luxtronik_ww_budget_loss_guard_state = (
+                        luxtronik_ww_budget_loss_guard(
+                            luxtronik_ww_budget_loss_guard_state,
+                            demand_active=(
+                                luxtronik_ww_budget_demand_active
+                            ),
+                            signal_active=bool(
+                                heatpump_positive_signal_started_ts > 0.0
+                                or boost_active
+                            ),
+                            fresh_start_budget=(
+                                luxtronik_ww_fresh_start_budget
+                            ),
+                            runtime_state=(
+                                luxtronik_ww_runtime_contract.get("state")
+                            ),
+                            duration_s=max(
+                                1.0,
+                                _safe_float(STOP_DELAY_MINUTES, 10.0)
+                                * 60.0,
+                            ),
+                            signal_release_allowed=bool(
+                                heatpump_positive_signal_window.get(
+                                    "normal_release_allowed"
+                                )
+                                is True
+                            ),
+                            clock_sample=control_time.sample(),
+                        )
+                    )
+                    luxtronik_ww_budget_loss_blocked_until_fresh_budget = bool(
+                        luxtronik_ww_budget_loss_guard_state.get("blocked")
+                        is True
+                    )
+                    luxtronik_ww_budget_loss_effective_block = bool(
+                        luxtronik_ww_budget_loss_guard_state.get(
+                            "effective_block"
+                        )
+                        is True
+                    )
+                    if luxtronik_ww_budget_loss_effective_block:
+                        heatpump_positive_output_blocked_this_cycle = True
+                        if (
+                            "luxtronik_ww_start_budget_expired"
+                            not in heatpump_positive_output_block_reasons
+                        ):
+                            heatpump_positive_output_block_reasons.append(
+                                "luxtronik_ww_start_budget_expired"
+                            )
+                        automatic_heat_start_allowed = False
+                        central_heatpump_command_cap_w = 0
+                        central_heatpump_start_budget_gate[
+                            "luxtronik_ww_start_budget_expired"
+                        ] = True
 
                     # Nach der aktortypisierten Startlease endet nur die volle
                     # ungenutzte Reserve (SG-Ready 150 s, Modbus direkt 25 s).
@@ -11115,7 +11552,8 @@ def main():
                             is True
                         )
                         luxtronik_boost_permission_active = (
-                            luxtronik_direct_setpoint_permission(
+                            not luxtronik_ww_budget_loss_effective_block
+                            and luxtronik_direct_setpoint_permission(
                                 wp_type,
                                 central_heatpump_boost_permission_active,
                                 bool(
@@ -11136,6 +11574,7 @@ def main():
                             timer_target_c=ww_timer_target_c,
                             boost_requested=bool(
                                 not force_pause
+                                and not luxtronik_ww_budget_loss_effective_block
                                 and (
                                     boost_active
                                     or luxtronik_boost_permission_active
@@ -11212,6 +11651,18 @@ def main():
                                     if heatpump_budget_demand_target_c is not None
                                     else boost_ww_temp
                                 )
+                        elif (
+                            wp_type == 0
+                            and luxtronik_ww_budget_loss_effective_block
+                        ):
+                            # Nur den WW-Auftrag zurücknehmen. Ein gleichzeitig
+                            # laufender Heizverdichter und dessen HZ-SHI bleiben
+                            # unangetastet.
+                            target_ww_mode = luxtronik_ww_target.get("mode")
+                            target_ww_temp = luxtronik_ww_target.get("target_c")
+                            if target_ww_mode is None:
+                                target_ww_mode = 0
+                                target_ww_temp = CONF_WWW
                         elif manual_ww_active:
                             target_ww_mode = 0
                             target_ww_temp = CONF_WWW
@@ -11277,6 +11728,12 @@ def main():
                             latched_target_c=wp_last_ww_cycle_target_c,
                             min_runtime_s=heat_policy.WW_CYCLE_MIN_RUNTIME_S,
                             abort_allowed=ww_cycle_abort_allowed,
+                            physical_running=(
+                                luxtronik_ww_runtime_contract.get("state")
+                                == "ww_running"
+                                if wp_type == 0
+                                else None
+                            ),
                         )
                         if ww_cycle_guard.get("hold_active") and (time.time() - last_ww_off_guard_log_time) > 300.0:
                             logger.info(
@@ -11319,6 +11776,45 @@ def main():
                             WW_HEARTBEAT_SECS,
                         )
 
+                        ww_positive_bookkeeping_active = bool(
+                            heatpump_positive_signal_started_ts > 0.0
+                            or boost_active
+                            or price_boost_active
+                        )
+                        ww_budget_release_readback_confirmed = bool(
+                            luxtronik_ww_budget_loss_effective_block
+                            and ww_positive_bookkeeping_active
+                            and send_ww_mode is None
+                            and luxtronik_ww_target_readback_confirmed(
+                                target_ww_mode,
+                                target_ww_temp,
+                                wp_status,
+                            )
+                        )
+                        if ww_budget_release_readback_confirmed:
+                            heatpump_positive_signal_started_ts = 0.0
+                            heatpump_positive_signal_demand_class = "none"
+                            heatpump_positive_signal_restored_unconfirmed = False
+                            heatpump_positive_signal_start_reservation_allowed = False
+                            heatpump_positive_signal_hold_guard = {}
+                            heatpump_boost_permission_active = False
+                            boost_active = False
+                            price_boost_active = False
+                            wp_last_pv_boost_stop_ts = time.time()
+                            heatpump_budget_demand_active_class = "none"
+                            heatpump_budget_demand_first_seen_ts = 0.0
+                            deficit_start_time = None
+                            pv_boost_pending_start = None
+                            cycle_actions.append({
+                                "action": "ww_boost_budget_release",
+                                "owner": "luxtronik_ww",
+                                "confirmed": True,
+                                "confirmation_source": "fresh_shi_readback",
+                                "mode": target_ww_mode,
+                                "target_c": target_ww_temp,
+                                "new_start_requires_followup_budget": True,
+                            })
+
                         if ww_update_reason is not None and send_ww_mode == 0:
                             ww_below_target, ww_actual_c, ww_target_c = heatpump_ww_temperature_below_target(
                                 wp_status,
@@ -11338,7 +11834,16 @@ def main():
                                 or ww_positive_output_hard_blocked
                             )
                             if (
-                                heatpump_ww_cycle_running(wp_status, wp_data, ww_requested=True)
+                                (
+                                    luxtronik_ww_runtime_contract.get("state")
+                                    in ("ww_running", "unknown")
+                                    if wp_type == 0
+                                    else heatpump_ww_cycle_running(
+                                        wp_status,
+                                        wp_data,
+                                        ww_requested=True,
+                                    )
+                                )
                                 and ww_below_target
                                 and not ww_off_abort_allowed
                             ):
@@ -11367,12 +11872,11 @@ def main():
                                 and heatpump_positive_signal_started_ts <= 0.0
                             )
                             ww_positive_stop_attempt = bool(
-                                send_ww_mode == 0
-                                and (
-                                    heatpump_positive_signal_started_ts > 0.0
-                                    or boost_active
-                                    or price_boost_active
+                                (
+                                    send_ww_mode == 0
+                                    or luxtronik_ww_budget_loss_effective_block
                                 )
+                                and ww_positive_bookkeeping_active
                             )
                             if ww_positive_stop_attempt:
                                 heatpump_positive_output_blocked_this_cycle = True
@@ -11387,12 +11891,36 @@ def main():
                                 wp.last_ww_mode = send_ww_mode
                                 wp.last_ww_temp = send_ww_temp
                                 wp.last_ww_cmd_time = time.time()
-                                if (
+                                if ww_positive_stop_attempt:
+                                    heatpump_positive_signal_started_ts = 0.0
+                                    heatpump_positive_signal_demand_class = "none"
+                                    heatpump_positive_signal_restored_unconfirmed = False
+                                    heatpump_positive_signal_start_reservation_allowed = False
+                                    heatpump_positive_signal_hold_guard = {}
+                                    heatpump_boost_permission_active = False
+                                    boost_active = False
+                                    price_boost_active = False
+                                    wp_last_pv_boost_stop_ts = time.time()
+                                    heatpump_budget_demand_active_class = "none"
+                                    heatpump_budget_demand_first_seen_ts = 0.0
+                                    deficit_start_time = None
+                                    pv_boost_pending_start = None
+                                    cycle_actions.append({
+                                        "action": "ww_boost_budget_release",
+                                        "owner": "luxtronik_ww",
+                                        "confirmed": True,
+                                        "mode": send_ww_mode,
+                                        "target_c": send_ww_temp,
+                                        "new_start_requires_followup_budget": True,
+                                    })
+                                elif (
                                     send_ww_mode == 1
                                     and luxtronik_boost_target_active
                                 ):
                                     heatpump_boost_permission_active = True
                                 if (
+                                    not ww_positive_stop_attempt
+                                    and
                                     send_ww_mode == 1
                                     and (
                                         heatpump_positive_signal_restored_unconfirmed
@@ -11449,7 +11977,10 @@ def main():
                                         )
                                         or {}
                                     )
-                                elif send_ww_mode == 0:
+                                elif (
+                                    not ww_positive_stop_attempt
+                                    and send_ww_mode == 0
+                                ):
                                     heatpump_positive_signal_started_ts = 0.0
                                     heatpump_positive_signal_demand_class = "none"
                                     heatpump_positive_signal_restored_unconfirmed = False
@@ -11696,6 +12227,18 @@ def main():
                 "manual_ww_boost_active": manual_ww_boost_active_export,
                 "wp_last_pv_boost_start_ts": wp_last_pv_boost_start_ts,
                 "wp_last_pv_boost_stop_ts": wp_last_pv_boost_stop_ts,
+                "luxtronik_ww_runtime": dict(
+                    luxtronik_ww_runtime_contract
+                ),
+                "luxtronik_ww_budget_loss_guard_state": copy.deepcopy(
+                    luxtronik_ww_budget_loss_guard_state
+                ),
+                "luxtronik_ww_budget_loss_blocked_until_fresh_budget": bool(
+                    luxtronik_ww_budget_loss_blocked_until_fresh_budget
+                ),
+                "luxtronik_ww_budget_loss_effective_block": bool(
+                    luxtronik_ww_budget_loss_effective_block
+                ),
                 "pv_boost_start_outcome": dict(pv_boost_last_outcome),
                 "pv_boost_retry_not_before_ts": pv_boost_retry_not_before_ts,
                 "wp_last_ww_cycle_start_ts": wp_last_ww_cycle_start_ts,

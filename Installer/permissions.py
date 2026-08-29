@@ -27,7 +27,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from Installer.core import CAT_ENV, register_command
     from Installer.utils import run_command
-    from Installer.installer_config import CONFIG_FILE, get_install_path, get_install_user, get_home_dir, get_www_data_gid, load_config
+    from Installer.installer_config import CONFIG_FILE, get_install_path, get_install_user, get_home_dir, get_venv_path, get_www_data_gid, load_config
     from Installer.logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
     from Installer.config_manager import run_config_wizard
     from Installer.config_secret_permissions import (
@@ -45,7 +45,7 @@ if __package__ in (None, ""):
 else:
     from .core import CAT_ENV, register_command
     from .utils import run_command
-    from .installer_config import CONFIG_FILE, get_install_path, get_install_user, get_home_dir, get_www_data_gid, load_config
+    from .installer_config import CONFIG_FILE, get_install_path, get_install_user, get_home_dir, get_venv_path, get_www_data_gid, load_config
     from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
     from .config_manager import run_config_wizard
     from .config_secret_permissions import (
@@ -105,6 +105,18 @@ PI_GUARD_PATH = "/usr/local/bin/pi_guard.sh"
 PIGUARD_SERVICE = "/etc/systemd/system/piguard.service"
 WATCHDOG_UPDATE_PAUSE_FILE = "/var/www/html/ramdisk/watchdog.update_pause"
 WALLBOX_PLAN_JOB_ROOT = "/var/www/html/data/.wallbox_plan_jobs"
+MATTER_RESET_QUARANTINE_NAME = ".matter-storage-reset-quarantine"
+MATTER_RESET_QUARANTINE_PREPARE_NAME = ".matter-storage-reset-quarantine.prepare"
+MATTER_RESET_RECEIPT_NAME = ".e3dc-matter-reset-transaction.json"
+MATTER_RESET_STAGE_PREFIX = ".matter-storage-reset-stage-"
+MATTER_RESET_PROTECTED_DATA_NAMES = frozenset(
+    {
+        MATTER_RESET_QUARANTINE_NAME,
+        MATTER_RESET_QUARANTINE_PREPARE_NAME,
+        MATTER_RESET_RECEIPT_NAME,
+    }
+)
+MATTER_RESET_PROTECTED_DATA_PREFIXES = (MATTER_RESET_STAGE_PREFIX,)
 WALLBOX_MODE5_USER_START_REQUEST_FILE = (
     "/var/www/html/data/wallbox_mode5_user_start_request.json"
 )
@@ -672,6 +684,626 @@ def _ensure_install_user_www_data_group() -> bool:
     return False
 
 
+def _open_absolute_directory_nofollow(path):
+    """Öffnet jede Komponente eines absoluten Pfads ohne Symlink-Folge."""
+
+    normalized = os.path.normpath(os.path.abspath(str(path)))
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    flags = os.O_RDONLY | nofollow | directory | getattr(os, "O_CLOEXEC", 0)
+    if not nofollow or not directory or not normalized.startswith(os.sep):
+        raise RuntimeError("Sichere Verzeichnisbindung ist nicht verfügbar")
+    descriptor = os.open(os.sep, flags)
+    try:
+        for component in [part for part in normalized.split(os.sep) if part]:
+            named = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            if not stat.S_ISDIR(named.st_mode):
+                raise RuntimeError(
+                    f"Pfadkomponente ist kein echtes Verzeichnis: {normalized}"
+                )
+            child = os.open(component, flags, dir_fd=descriptor)
+            opened = os.fstat(child)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (named.st_dev, named.st_ino)
+            ):
+                os.close(child)
+                raise RuntimeError(
+                    f"Pfadkomponente driftete beim Öffnen: {normalized}"
+                )
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _set_live_directory_metadata(path, *, uid, gid, mode=0o755):
+    """Ändert ein komponentenweise gebundenes Verzeichnis, nie seinen Inhalt."""
+
+    normalized = os.path.normpath(os.path.abspath(str(path)))
+    parent_path, name = os.path.split(normalized)
+    if not name:
+        raise RuntimeError("Dateisystemwurzel ist kein zulässiges Rechteziel")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    flags = os.O_RDONLY | nofollow | directory | getattr(os, "O_CLOEXEC", 0)
+    parent = _open_absolute_directory_nofollow(parent_path)
+    descriptor = -1
+    rebound_parent = -1
+    changed = False
+    before = None
+    try:
+        parent_identity = os.fstat(parent)
+        named_before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        descriptor = os.open(name, flags, dir_fd=parent)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or not stat.S_ISDIR(named_before.st_mode)
+            or (before.st_dev, before.st_ino)
+            != (named_before.st_dev, named_before.st_ino)
+        ):
+            raise RuntimeError(f"Rechteziel ist kein echtes Verzeichnis: {normalized}")
+        os.fchown(descriptor, int(uid), int(gid))
+        changed = True
+        os.fchmod(descriptor, int(mode))
+        os.fsync(descriptor)
+        after = os.fstat(descriptor)
+        named_after = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        rebound_parent = _open_absolute_directory_nofollow(parent_path)
+        rebound_parent_metadata = os.fstat(rebound_parent)
+        rebound_named = os.stat(
+            name,
+            dir_fd=rebound_parent,
+            follow_symlinks=False,
+        )
+        if (
+            (rebound_parent_metadata.st_dev, rebound_parent_metadata.st_ino)
+            != (parent_identity.st_dev, parent_identity.st_ino)
+            or not stat.S_ISDIR(after.st_mode)
+            or not stat.S_ISDIR(named_after.st_mode)
+            or not stat.S_ISDIR(rebound_named.st_mode)
+            or (after.st_dev, after.st_ino)
+            != (before.st_dev, before.st_ino)
+            or (named_after.st_dev, named_after.st_ino)
+            != (after.st_dev, after.st_ino)
+            or (rebound_named.st_dev, rebound_named.st_ino)
+            != (after.st_dev, after.st_ino)
+            or after.st_uid != int(uid)
+            or after.st_gid != int(gid)
+            or stat.S_IMODE(after.st_mode) != int(mode)
+            or named_after.st_uid != int(uid)
+            or named_after.st_gid != int(gid)
+            or stat.S_IMODE(named_after.st_mode) != int(mode)
+            or rebound_named.st_uid != int(uid)
+            or rebound_named.st_gid != int(gid)
+            or stat.S_IMODE(rebound_named.st_mode) != int(mode)
+        ):
+            raise RuntimeError(f"Verzeichnisrechte blieben abweichend: {normalized}")
+    except Exception as original_error:
+        if changed and descriptor >= 0 and before is not None:
+            rollback_error = None
+            try:
+                os.fchown(descriptor, before.st_uid, before.st_gid)
+                os.fchmod(descriptor, stat.S_IMODE(before.st_mode))
+                os.fsync(descriptor)
+                restored = os.fstat(descriptor)
+                restore_parent = _open_absolute_directory_nofollow(parent_path)
+                try:
+                    restore_parent_identity = os.fstat(restore_parent)
+                    restored_named = os.stat(
+                        name,
+                        dir_fd=restore_parent,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        (restore_parent_identity.st_dev, restore_parent_identity.st_ino)
+                        != (parent_identity.st_dev, parent_identity.st_ino)
+                        or (restored.st_dev, restored.st_ino)
+                        != (before.st_dev, before.st_ino)
+                        or (restored_named.st_dev, restored_named.st_ino)
+                        != (before.st_dev, before.st_ino)
+                        or restored.st_uid != before.st_uid
+                        or restored.st_gid != before.st_gid
+                        or stat.S_IMODE(restored.st_mode)
+                        != stat.S_IMODE(before.st_mode)
+                        or restored_named.st_uid != before.st_uid
+                        or restored_named.st_gid != before.st_gid
+                        or stat.S_IMODE(restored_named.st_mode)
+                        != stat.S_IMODE(before.st_mode)
+                    ):
+                        raise RuntimeError(
+                            f"Verzeichnisrechte wurden nicht vollständig restauriert: {normalized}"
+                        )
+                finally:
+                    os.close(restore_parent)
+            except Exception as exc:
+                rollback_error = exc
+            if rollback_error is not None:
+                raise RuntimeError(
+                    "Die Verzeichnisrechte-Projektion scheiterte und ihr lokaler "
+                    f"Rückfall blieb unvollständig: {normalized} ({rollback_error})"
+                ) from original_error
+        raise
+    finally:
+        if rebound_parent >= 0:
+            os.close(rebound_parent)
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent)
+
+
+def _set_live_regular_file_metadata(path, *, uid, gid, mode):
+    """Projiziert Metadaten auf eine komponentenweise gebundene Einzeldatei."""
+
+    normalized = os.path.normpath(os.path.abspath(str(path)))
+    parent_path, name = os.path.split(normalized)
+    if not name:
+        raise RuntimeError("Dateisystemwurzel ist kein zulässiges Rechteziel")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | nofollow
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    if not nofollow:
+        raise RuntimeError("Sichere Dateibindung ist nicht verfügbar")
+    parent = _open_absolute_directory_nofollow(parent_path)
+    descriptor = -1
+    rebound_parent = -1
+    changed = False
+    before = None
+    try:
+        parent_identity = os.fstat(parent)
+        named_before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if not stat.S_ISREG(named_before.st_mode) or named_before.st_nlink != 1:
+            raise RuntimeError(f"Rechteziel ist keine reguläre Einzeldatei: {normalized}")
+        descriptor = os.open(name, flags, dir_fd=parent)
+        before = os.fstat(descriptor)
+        stable = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_nlink,
+        )
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or (before.st_dev, before.st_ino)
+            != (named_before.st_dev, named_before.st_ino)
+        ):
+            raise RuntimeError(f"Rechteziel driftete beim Öffnen: {normalized}")
+        os.fchown(descriptor, int(uid), int(gid))
+        changed = True
+        os.fchmod(descriptor, int(mode))
+        os.fsync(descriptor)
+        after = os.fstat(descriptor)
+        named_after = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        rebound_parent = _open_absolute_directory_nofollow(parent_path)
+        rebound_parent_metadata = os.fstat(rebound_parent)
+        rebound_named = os.stat(
+            name,
+            dir_fd=rebound_parent,
+            follow_symlinks=False,
+        )
+        if (
+            (rebound_parent_metadata.st_dev, rebound_parent_metadata.st_ino)
+            != (parent_identity.st_dev, parent_identity.st_ino)
+            or (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_nlink,
+            )
+            != stable
+            or (
+                named_after.st_dev,
+                named_after.st_ino,
+                named_after.st_size,
+                named_after.st_mtime_ns,
+                named_after.st_nlink,
+            )
+            != stable
+            or (
+                rebound_named.st_dev,
+                rebound_named.st_ino,
+                rebound_named.st_size,
+                rebound_named.st_mtime_ns,
+                rebound_named.st_nlink,
+            )
+            != stable
+            or after.st_uid != int(uid)
+            or after.st_gid != int(gid)
+            or stat.S_IMODE(after.st_mode) != int(mode)
+            or named_after.st_uid != int(uid)
+            or named_after.st_gid != int(gid)
+            or stat.S_IMODE(named_after.st_mode) != int(mode)
+            or rebound_named.st_uid != int(uid)
+            or rebound_named.st_gid != int(gid)
+            or stat.S_IMODE(rebound_named.st_mode) != int(mode)
+        ):
+            raise RuntimeError(f"Dateirechte blieben abweichend: {normalized}")
+    except Exception as original_error:
+        if changed and descriptor >= 0 and before is not None:
+            rollback_error = None
+            try:
+                os.fchown(descriptor, before.st_uid, before.st_gid)
+                os.fchmod(descriptor, stat.S_IMODE(before.st_mode))
+                os.fsync(descriptor)
+                restored = os.fstat(descriptor)
+                restore_parent = _open_absolute_directory_nofollow(parent_path)
+                try:
+                    restore_parent_identity = os.fstat(restore_parent)
+                    restored_named = os.stat(
+                        name,
+                        dir_fd=restore_parent,
+                        follow_symlinks=False,
+                    )
+                    restored_stable = (
+                        restored.st_dev,
+                        restored.st_ino,
+                        restored.st_size,
+                        restored.st_mtime_ns,
+                        restored.st_nlink,
+                    )
+                    restored_named_stable = (
+                        restored_named.st_dev,
+                        restored_named.st_ino,
+                        restored_named.st_size,
+                        restored_named.st_mtime_ns,
+                        restored_named.st_nlink,
+                    )
+                    if (
+                        (restore_parent_identity.st_dev, restore_parent_identity.st_ino)
+                        != (parent_identity.st_dev, parent_identity.st_ino)
+                        or restored_stable != stable
+                        or restored_named_stable != stable
+                        or restored.st_uid != before.st_uid
+                        or restored.st_gid != before.st_gid
+                        or stat.S_IMODE(restored.st_mode)
+                        != stat.S_IMODE(before.st_mode)
+                        or restored_named.st_uid != before.st_uid
+                        or restored_named.st_gid != before.st_gid
+                        or stat.S_IMODE(restored_named.st_mode)
+                        != stat.S_IMODE(before.st_mode)
+                    ):
+                        raise RuntimeError(
+                            f"Dateirechte wurden nicht vollständig restauriert: {normalized}"
+                        )
+                finally:
+                    os.close(restore_parent)
+            except Exception as exc:
+                rollback_error = exc
+            if rollback_error is not None:
+                raise RuntimeError(
+                    "Die Dateirechte-Projektion scheiterte und ihr lokaler Rückfall "
+                    f"blieb unvollständig: {normalized} ({rollback_error})"
+                ) from original_error
+        raise
+    finally:
+        if rebound_parent >= 0:
+            os.close(rebound_parent)
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent)
+
+
+def _validated_configured_venv_path():
+    """Bindet ausschließlich das kanonische, strukturell belegte Benutzer-venv."""
+
+    account = pwd.getpwnam(INSTALL_USER)
+    home = os.path.normpath(os.path.abspath(account.pw_dir))
+    candidate = os.path.normpath(os.path.abspath(get_venv_path(INSTALL_USER)))
+    raw_name = os.path.basename(candidate)
+    if (
+        not raw_name
+        or len(raw_name) > 128
+        or raw_name in {".", ".."}
+        or re.fullmatch(r"[A-Za-z0-9._-]+", raw_name) is None
+        or os.path.dirname(candidate) != home
+        or candidate == os.path.normpath(os.path.abspath(INSTALL_PATH))
+    ):
+        raise RuntimeError(
+            "Konfigurierter venv-Pfad ist nicht das kanonische direkte Home-venv"
+        )
+    if not os.path.lexists(candidate):
+        return raw_name, "", None
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    parent_descriptor = _open_absolute_directory_nofollow(home)
+    descriptor = -1
+    try:
+        parent_metadata = os.fstat(parent_descriptor)
+        named = os.stat(raw_name, dir_fd=parent_descriptor, follow_symlinks=False)
+        descriptor = os.open(
+            raw_name,
+            os.O_RDONLY | nofollow | directory | cloexec,
+            dir_fd=parent_descriptor,
+        )
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino)
+            != (named.st_dev, named.st_ino)
+            or metadata.st_uid not in {0, account.pw_uid}
+            or (metadata.st_uid == 0 and stat.S_IMODE(metadata.st_mode) & 0o022)
+        ):
+            raise RuntimeError("Konfiguriertes venv besitzt keinen sicheren Stamm")
+
+        marker_fd = os.open(
+            "pyvenv.cfg",
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=descriptor,
+        )
+        try:
+            marker = os.fstat(marker_fd)
+            if (
+                not stat.S_ISREG(marker.st_mode)
+                or marker.st_nlink != 1
+                or marker.st_size <= 0
+                or marker.st_size > 64 * 1024
+                or marker.st_uid not in {0, account.pw_uid}
+            ):
+                raise RuntimeError("pyvenv.cfg besitzt keinen sicheren Dateivertrag")
+            payload = os.read(marker_fd, marker.st_size + 1)
+            text = payload.decode("utf-8", errors="strict")
+            if len(payload) != marker.st_size or not any(
+                line.strip().lower().startswith("home =")
+                for line in text.splitlines()
+            ):
+                raise RuntimeError("pyvenv.cfg belegt keine Python-Umgebung")
+        finally:
+            os.close(marker_fd)
+
+        bin_named = os.stat("bin", dir_fd=descriptor, follow_symlinks=False)
+        bin_fd = os.open(
+            "bin",
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=descriptor,
+        )
+        try:
+            bin_opened = os.fstat(bin_fd)
+            if (
+                not stat.S_ISDIR(bin_named.st_mode)
+                or (bin_named.st_dev, bin_named.st_ino)
+                != (bin_opened.st_dev, bin_opened.st_ino)
+            ):
+                raise RuntimeError("venv-bin-Verzeichnis ist nicht eindeutig")
+            for executable in ("python3", "pip"):
+                entry = os.stat(
+                    executable,
+                    dir_fd=bin_fd,
+                    follow_symlinks=False,
+                )
+                if not (stat.S_ISREG(entry.st_mode) or stat.S_ISLNK(entry.st_mode)):
+                    raise RuntimeError(
+                        f"venv-{executable} ist weder Datei noch zulässiger Symlink"
+                    )
+                resolved = os.path.realpath(os.path.join(candidate, "bin", executable))
+                resolved_metadata = os.stat(resolved)
+                if (
+                    not stat.S_ISREG(resolved_metadata.st_mode)
+                    or resolved_metadata.st_uid not in {0, account.pw_uid}
+                    or (
+                        resolved_metadata.st_uid == 0
+                        and stat.S_IMODE(resolved_metadata.st_mode) & 0o022
+                    )
+                ):
+                    raise RuntimeError(f"venv-{executable} besitzt kein sicheres Ziel")
+        finally:
+            os.close(bin_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent_descriptor)
+    return (
+        raw_name,
+        candidate,
+        (
+            int(parent_metadata.st_dev),
+            int(parent_metadata.st_ino),
+            int(metadata.st_dev),
+            int(metadata.st_ino),
+        ),
+    )
+
+
+def _required_web_traversal_ancestors():
+    """Liefert nur echte Vorfahren zwischen Home und Installationsstamm."""
+
+    home = os.path.normpath(os.path.abspath(str(INSTALL_HOME)))
+    target = os.path.normpath(os.path.abspath(str(INSTALL_PATH)))
+    if not os.path.lexists(target) or target == home:
+        return ()
+    try:
+        if os.path.commonpath((home, target)) != home:
+            return ()
+    except ValueError:
+        return ()
+    relative = os.path.relpath(target, home)
+    parts = tuple(part for part in relative.split(os.sep) if part and part != ".")
+    if not parts:
+        return ()
+    ancestors = [home]
+    current = home
+    for component in parts[:-1]:
+        current = os.path.join(current, component)
+        ancestors.append(current)
+    return tuple(ancestors)
+
+
+def _bound_directory_metadata(path):
+    descriptor = _open_absolute_directory_nofollow(path)
+    try:
+        return os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _web_can_traverse(metadata, web_gid, path=None):
+    if bool(metadata.st_mode & 0o001) or (
+        metadata.st_gid == int(web_gid) and bool(metadata.st_mode & 0o010)
+    ):
+        return True
+    if path is None:
+        return False
+    if __package__ in (None, ""):
+        from Installer.update_simple import (
+            _read_bound_directory_prestate,
+            _web_account_can_traverse_bound_directory,
+        )
+    else:
+        from .update_simple import (
+            _read_bound_directory_prestate,
+            _web_account_can_traverse_bound_directory,
+        )
+    expected = _read_bound_directory_prestate(path)
+    if (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_uid),
+        int(metadata.st_gid),
+        int(stat.S_IMODE(metadata.st_mode)),
+    ) != (
+        expected.device,
+        expected.inode,
+        expected.uid,
+        expected.gid,
+        expected.mode,
+    ):
+        raise RuntimeError(f"Installationspfad-Vorfahre driftete: {path}")
+    return _web_account_can_traverse_bound_directory(expected)
+
+
+def _project_required_web_traversal(paths):
+    """Projiziert benötigte Vorfahren eng und rollt Teilfolgen strikt zurück."""
+
+    if __package__ in (None, ""):
+        from Installer.update_simple import (
+            DirectoryMetadataTransition,
+            _apply_bound_directory_transition,
+            _read_bound_directory_prestate,
+            _web_traversal_projection_strategy,
+        )
+    else:
+        from .update_simple import (
+            DirectoryMetadataTransition,
+            _apply_bound_directory_transition,
+            _read_bound_directory_prestate,
+            _web_traversal_projection_strategy,
+        )
+
+    account = pwd.getpwnam(INSTALL_USER)
+    web_gid = int(grp.getgrnam("www-data").gr_gid)
+    plan = []
+    for path in paths:
+        current = _read_bound_directory_prestate(path)
+        strategy = _web_traversal_projection_strategy(
+            current,
+            install_user=INSTALL_USER,
+            install_uid=int(account.pw_uid),
+            web_gid=web_gid,
+        )
+        plan.append((current, strategy))
+    transitions = []
+    try:
+        for current, strategy in plan:
+            if strategy == "ready":
+                continue
+            current_mode = current.mode
+            if strategy == "web-group":
+                desired_gid = web_gid
+                desired_mode = current_mode | 0o010
+            elif strategy == "private-group-rebind":
+                desired_gid = web_gid
+                desired_mode = (current_mode & ~0o070) | 0o010
+            else:
+                raise RuntimeError(
+                    f"Unbekannte Traversal-Projektionsstrategie: {strategy}"
+                )
+            projected = _apply_bound_directory_transition(
+                current,
+                uid=current.uid,
+                gid=desired_gid,
+                mode=desired_mode,
+            )
+            transitions.append(
+                DirectoryMetadataTransition(
+                    previous=current,
+                    projected=projected,
+                )
+            )
+    except Exception as original_error:
+        rollback_failures = []
+        for transition in reversed(transitions):
+            try:
+                _apply_bound_directory_transition(
+                    transition.projected,
+                    uid=transition.previous.uid,
+                    gid=transition.previous.gid,
+                    mode=transition.previous.mode,
+                )
+            except Exception as exc:
+                rollback_failures.append(f"{transition.previous.path}: {exc}")
+        if rollback_failures:
+            raise RuntimeError(
+                "Traversierrechte-Projektion und ihr Rückfall blieben unvollständig: "
+                + "; ".join(rollback_failures)
+            ) from original_error
+        raise
+    return tuple(transitions)
+
+
+def repair_web_install_traversal_preflight():
+    """Repariert den engen Pfadzugriff als eigene transaktionsfreie Vorstufe."""
+
+    paths = _required_web_traversal_ancestors()
+    if not paths:
+        return True
+    try:
+        web_gid = get_www_data_gid()
+        missing = tuple(
+            path
+            for path in paths
+            if not _web_can_traverse(
+                _bound_directory_metadata(path), web_gid, path
+            )
+        )
+        if missing:
+            _project_required_web_traversal(missing)
+        for path in paths:
+            if not _web_can_traverse(
+                _bound_directory_metadata(path), web_gid, path
+            ):
+                raise RuntimeError(
+                    f"Installationspfad-Vorfahre blieb für www-data gesperrt: {path}"
+                )
+    except Exception as exc:
+        print(
+            f"{RED}[!]{RESET} Installationspfad-Reparatur wurde sicher gesperrt: {exc}"
+        )
+        perm_logger.error(
+            "Eigenständige Installationspfad-Reparatur fehlgeschlagen: %s",
+            exc,
+        )
+        return False
+    return True
+
+
 def check_permissions():
     """Prüft Installation-Verzeichnis."""
     print("\n=== Verzeichnis-Rechteprüfung ===\n")
@@ -688,23 +1320,42 @@ def check_permissions():
         return ", ".join(details) if details else "unbekannte Abweichung"
 
     issues = []
-    # Home-Verzeichnis muss für www-data betretbar sein (execute-bit)
-    try:
-        st_home = os.stat(INSTALL_HOME)
-        www_data_gid = get_www_data_gid()
-        other_x = bool(st_home.st_mode & 0o001)
-        group_x = st_home.st_gid == www_data_gid and bool(st_home.st_mode & 0o010)
-        if not other_x and not group_x:
-            print(f"{RED}✗{RESET} {INSTALL_HOME} ist NICHT für www-data erreichbar")
-            perm_logger.error(f"Home-Verzeichnis nicht für www-data erreichbar: {INSTALL_HOME}")
-            issues.append("home")
-        else:
-            print(f"{GREEN}✓{RESET} {INSTALL_HOME} ist für www-data erreichbar")
-            perm_logger.info(f"Home-Verzeichnis OK: {INSTALL_HOME}")
-    except Exception as e:
-        print(f"{RED}✗{RESET} Fehler beim Prüfen von {INSTALL_HOME}: {e}")
-        perm_logger.error(f"Fehler beim Prüfen von {INSTALL_HOME}: {e}")
-        issues.append("home")
+    # Nur die tatsächlich zwischen Home und Installation liegenden Vorfahren
+    # müssen für www-data betretbar sein. Installationen unter /opt verändern
+    # das Benutzer-Home deshalb nicht.
+    www_data_gid = get_www_data_gid()
+    for traversal_path in _required_web_traversal_ancestors():
+        issue_key = (
+            "home"
+            if os.path.normpath(traversal_path)
+            == os.path.normpath(os.path.abspath(str(INSTALL_HOME)))
+            else f"web_traversal:{traversal_path}"
+        )
+        try:
+            metadata = _bound_directory_metadata(traversal_path)
+            if not _web_can_traverse(metadata, www_data_gid, traversal_path):
+                print(
+                    f"{RED}✗{RESET} {traversal_path} ist NICHT für www-data erreichbar"
+                )
+                perm_logger.error(
+                    "Installationspfad-Vorfahre nicht für www-data erreichbar: %s",
+                    traversal_path,
+                )
+                issues.append(issue_key)
+            else:
+                print(f"{GREEN}✓{RESET} {traversal_path} ist für www-data erreichbar")
+                perm_logger.info(
+                    "Installationspfad-Vorfahre OK: %s",
+                    traversal_path,
+                )
+        except Exception as e:
+            print(f"{RED}✗{RESET} Fehler beim Prüfen von {traversal_path}: {e}")
+            perm_logger.error(
+                "Fehler beim Prüfen des Installationspfad-Vorfahren %s: %s",
+                traversal_path,
+                e,
+            )
+            issues.append(issue_key)
 
     if not _install_user_in_www_data_group():
         print(f"{RED}✗{RESET} {INSTALL_USER} ist nicht Mitglied der Gruppe www-data")
@@ -728,15 +1379,15 @@ def check_permissions():
         st = os.stat(INSTALL_PATH)
         owner = pwd.getpwuid(st.st_uid).pw_name
         group = grp.getgrgid(st.st_gid).gr_name
-        mode = oct(st.st_mode)[-3:]
-        if owner != INSTALL_USER or group != INSTALL_GROUP:
-            details = format_dir_issue(owner, group, mode, INSTALL_USER, INSTALL_GROUP, "755")
+        mode = f"{stat.S_IMODE(st.st_mode):o}"
+        if owner != INSTALL_USER or group != "www-data":
+            details = format_dir_issue(owner, group, mode, INSTALL_USER, "www-data", "755")
             print(f"{RED}✗{RESET} {INSTALL_PATH} Problem: {details}")
             perm_logger.error(f"INSTALL_PATH Besitzer/Gruppe falsch: {details}")
             issues.append("owner")
         else:
-            print(f"{GREEN}✓{RESET} {INSTALL_PATH} gehört {INSTALL_USER}:{INSTALL_GROUP}")
-            perm_logger.info(f"INSTALL_PATH Besitzer OK: {INSTALL_USER}:{INSTALL_GROUP}")
+            print(f"{GREEN}✓{RESET} {INSTALL_PATH} gehört {INSTALL_USER}:www-data")
+            perm_logger.info(f"INSTALL_PATH Besitzer OK: {INSTALL_USER}:www-data")
         if mode != "755":
             print(f"{RED}✗{RESET} {INSTALL_PATH} hat Rechte {mode} statt 755")
             perm_logger.error(f"INSTALL_PATH Modus falsch: {mode} (soll: 755)")
@@ -751,9 +1402,9 @@ def check_permissions():
             st_installer = os.stat(INSTALLER_DIR)
             installer_owner = pwd.getpwuid(st_installer.st_uid).pw_name
             installer_group = grp.getgrgid(st_installer.st_gid).gr_name
-            installer_mode = oct(st_installer.st_mode)[-3:]
-            if installer_owner != INSTALL_USER or installer_group != INSTALL_GROUP or installer_mode != "755":
-                details = format_dir_issue(installer_owner, installer_group, installer_mode, INSTALL_USER, INSTALL_GROUP, "755")
+            installer_mode = f"{stat.S_IMODE(st_installer.st_mode):o}"
+            if installer_owner != INSTALL_USER or installer_group != "www-data" or installer_mode != "755":
+                details = format_dir_issue(installer_owner, installer_group, installer_mode, INSTALL_USER, "www-data", "755")
                 print(f"{RED}x{RESET} {INSTALLER_DIR} Problem: {details}")
                 perm_logger.error(f"INSTALLER_DIR fuer Web-Diagnose nicht betretbar: {details}")
                 issues.append("installer_dir")
@@ -762,13 +1413,13 @@ def check_permissions():
                 perm_logger.info("INSTALLER_DIR Modus OK: 755")
 
         # VENV prüfen (falls vorhanden)
-        venv_name = load_config().get("venv_name", ".venv_e3dc")
-        venv_path = ""
-        if venv_name:
-            if os.path.exists(os.path.join(INSTALL_HOME, venv_name)):
-                venv_path = os.path.join(INSTALL_HOME, venv_name)
-            elif os.path.exists(os.path.join(INSTALL_PATH, venv_name)):
-                venv_path = os.path.join(INSTALL_PATH, venv_name)
+        try:
+            venv_name, venv_path, _venv_identity = _validated_configured_venv_path()
+        except Exception as exc:
+            print(f"{RED}✗{RESET} Konfigurierter venv-Pfad ist unsicher: {exc}")
+            perm_logger.error("Unsicherer venv-Pfad: %s", exc)
+            issues.append("venv_unsafe")
+            venv_name, venv_path = "", ""
 
         if venv_name and venv_path:
             st_venv = os.stat(venv_path)
@@ -1043,7 +1694,7 @@ def check_webportal_permissions(include_service_checks=True):
             return issues
         owner = pwd.getpwuid(st.st_uid).pw_name
         group = grp.getgrgid(st.st_gid).gr_name
-        mode = oct(st.st_mode)[-3:]
+        mode = f"{stat.S_IMODE(st.st_mode):o}"
 
         # KRITISCH: Prüfe ob www-data das Verzeichnis überhaupt betreten kann.
         # Nach 'git pull' kann /var/www/html auf 500 (dr-x------) fallen →
@@ -1093,11 +1744,7 @@ def check_webportal_permissions(include_service_checks=True):
                     )
                     issues.append(f"{os.path.basename(folder_path)}_unsafe")
                     continue
-                # Mode-Erkennung: 4 Stellen für S-Bit (z.B. 2775), sonst 3
-                if len(expected_mode) == 4:
-                    mode_sub = oct(st_sub.st_mode)[-4:]
-                else:
-                    mode_sub = oct(st_sub.st_mode)[-3:]
+                mode_sub = f"{stat.S_IMODE(st_sub.st_mode):o}"
                 owner_sub = pwd.getpwuid(st_sub.st_uid).pw_name
                 group_sub = grp.getgrgid(st_sub.st_gid).gr_name
                 # Prüfe Owner/Group separat
@@ -1187,6 +1834,123 @@ def check_webportal_permissions(include_service_checks=True):
         print(f"{RED}✗{RESET} Fehler beim Prüfen: {e}")
         issues.append("error")
     return issues
+
+
+# Gebundene Resolver-/Import-Closure von install_center.php -> helpers.php ->
+# web_installer.py. Diese Liste ist bewusst endlich: Der Reparaturassistent
+# darf keine unbekannten lokalen Dateien durch einen rekursiven Produktbaum-
+# Scan vereinnahmen.
+LIVE_INSTALL_CENTER_PRODUCT_CLOSURE = (
+    "VERSION",
+    "Installer/__init__.py",
+    "Installer/backup_integrity.py",
+    "Installer/backup_retention.py",
+    "Installer/config_secret_permissions.py",
+    "Installer/git_commit_reader.py",
+    "Installer/installer_config.py",
+    "Installer/logging_manager.py",
+    "Installer/release_version.py",
+    "Installer/secure_file_transaction.py",
+    "Installer/service_catalog.py",
+    "Installer/utils.py",
+    "Installer/web_installer.py",
+)
+
+
+# Vollständige, eingecheckte Web-Produkt-Positivliste für veröffentlichte
+# Alt-Aufrufer, die noch keinen zielcommitgebundenen Inventarvertrag übergeben.
+# Die Liste wird bei jedem Release gegen ``git ls-files html`` getestet. Sie
+# darf keine Laufzeitfläche enthalten; unbekannte lokale Webpfade bleiben
+# dadurch auch im Kompatibilitätsweg unangetastet.
+WEB_PROGRAM_FALLBACK_FILES = (
+    "CHANGELOG.md",
+    "UPDATE_POLICY.json",
+    "VERSION",
+    "Wallbox.php",
+    "app-icon-192.png",
+    "app-icon-512.png",
+    "assets/vendor/bootstrap-icons/LICENSE.txt",
+    "assets/vendor/bootstrap-icons/bootstrap-icons.min.css",
+    "assets/vendor/bootstrap-icons/fonts/bootstrap-icons.woff",
+    "assets/vendor/bootstrap-icons/fonts/bootstrap-icons.woff2",
+    "assets/vendor/bootstrap/LICENSE.txt",
+    "assets/vendor/bootstrap/css/bootstrap.min.css",
+    "assets/vendor/bootstrap/js/bootstrap.bundle.min.js",
+    "assets/vendor/chart.js/LICENSE.txt",
+    "assets/vendor/chart.js/chart.umd.min.js",
+    "assets/vendor/chartjs-plugin-zoom/LICENSE.txt",
+    "assets/vendor/chartjs-plugin-zoom/chartjs-plugin-zoom.min.js",
+    "assets/vendor/fontawesome/LICENSE.txt",
+    "assets/vendor/fontawesome/css/all.min.css",
+    "assets/vendor/fontawesome/webfonts/fa-brands-400.ttf",
+    "assets/vendor/fontawesome/webfonts/fa-brands-400.woff2",
+    "assets/vendor/fontawesome/webfonts/fa-regular-400.ttf",
+    "assets/vendor/fontawesome/webfonts/fa-regular-400.woff2",
+    "assets/vendor/fontawesome/webfonts/fa-solid-900.ttf",
+    "assets/vendor/fontawesome/webfonts/fa-solid-900.woff2",
+    "assets/vendor/fontawesome/webfonts/fa-v4compatibility.ttf",
+    "assets/vendor/fontawesome/webfonts/fa-v4compatibility.woff2",
+    "assets/vendor/hammerjs/LICENSE.txt",
+    "assets/vendor/hammerjs/hammer.min.js",
+    "assets/vendor/jquery/LICENSE.txt",
+    "assets/vendor/jquery/jquery-3.6.0.min.js",
+    "backup_history.php",
+    "config_editor.php",
+    "eeg_tariff_tables.php",
+    "fahrzeug.php",
+    "favicon.ico",
+    "get_chart_data.php",
+    "get_forecast_data.php",
+    "get_live_json.php",
+    "get_shadow_snapshot.php",
+    "help.php",
+    "helpers.php",
+    "history.php",
+    "index.html",
+    "index.php",
+    "install_center.php",
+    "install_wizard.php",
+    "klima.php",
+    "langzeit.php",
+    "logic.php",
+    "manifest.json",
+    "manifest_mobile.json",
+    "manual_bat_cmd.php",
+    "matter.php",
+    "mobile.php",
+    "openwb_cmd.php",
+    "repair_wb_history.php",
+    "rule_calm_analysis.php",
+    "send_daily_telegram.php",
+    "send_status_telegram.php",
+    "send_weekly_telegram.php",
+    "service_control.php",
+    "solar.js",
+    "solar.min.js",
+    "style.css",
+    "sw.js",
+    "vitals.php",
+    "waermepumpe.php",
+    "wallbox_transaction.php",
+    "webhook.php",
+    "webpush_api.php",
+)
+WEB_PROGRAM_FALLBACK_DIRECTORIES = (
+    "assets",
+    "assets/vendor",
+    "assets/vendor/bootstrap",
+    "assets/vendor/bootstrap-icons",
+    "assets/vendor/bootstrap-icons/fonts",
+    "assets/vendor/bootstrap/css",
+    "assets/vendor/bootstrap/js",
+    "assets/vendor/chart.js",
+    "assets/vendor/chartjs-plugin-zoom",
+    "assets/vendor/fontawesome",
+    "assets/vendor/fontawesome/css",
+    "assets/vendor/fontawesome/webfonts",
+    "assets/vendor/hammerjs",
+    "assets/vendor/jquery",
+)
 
 
 # Definition der zu prüfenden Dateien und ihrer Berechtigungen
@@ -1333,6 +2097,24 @@ FILE_DEFINITIONS = [
     {"path": "/var/www/html/ramdisk/value_filter.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
 ]
 
+for _relative_product_path in LIVE_INSTALL_CENTER_PRODUCT_CLOSURE:
+    _absolute_product_path = os.path.join(INSTALL_ROOT, _relative_product_path)
+    if not any(
+        os.path.abspath(str(_definition.get("path") or ""))
+        == os.path.abspath(_absolute_product_path)
+        for _definition in FILE_DEFINITIONS
+    ):
+        FILE_DEFINITIONS.append(
+            {
+                "path": _absolute_product_path,
+                "mode": "644",
+                "owner": INSTALL_USER,
+                "group": "www-data",
+                "optional": False,
+                "executable": False,
+            }
+        )
+
 
 _WEB_WRITABLE_TOP = frozenset({"data", "logs", "ramdisk", "tmp"})
 _WEB_PRIVATE_RUNTIME_FILES = frozenset(
@@ -1348,6 +2130,41 @@ _WEB_PRIVATE_RUNTIME_FILES = frozenset(
 _WEB_PRIVATE_RUNTIME_DIRECTORIES = frozenset({"history_backups"})
 
 
+def _live_product_file_mode(path):
+    """Spiegelt den Live-Vertrag des Ziel-Updaters ohne Git-Modusannahme."""
+
+    descriptor = -1
+    parent = -1
+    try:
+        normalized = os.path.normpath(os.path.abspath(str(path)))
+        parent_path, name = os.path.split(normalized)
+        if not name:
+            return "644"
+        parent = _open_absolute_directory_nofollow(parent_path)
+        descriptor = os.open(
+            name,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent,
+        )
+        metadata = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            return "644"
+        if (metadata.st_dev, metadata.st_ino) != (named.st_dev, named.st_ino):
+            return "644"
+        return "755" if os.read(descriptor, 2) == b"#!" else "644"
+    except OSError:
+        return "644"
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if parent >= 0:
+            os.close(parent)
+
+
 # Program and Git files may be world-readable/executable where required, but
 # are writable only by the installation user. Shared operational files remain
 # under /var/www with their explicit www-data contract.
@@ -1359,10 +2176,9 @@ for _definition in FILE_DEFINITIONS:
     except ValueError:
         _inside_repo = False
     if _inside_repo:
-        # Der Legacy-Preis-Fallback ist keine Geheimniskonfiguration und wird
-        # weiterhin direkt vom PHP-Frontend gelesen. Alle anderen Repo-Dateien
-        # bleiben an die private Installationsgruppe gebunden.
-        _definition["group"] = "www-data" if _definition_basename == "e3dc.strompreise.txt" else INSTALL_GROUP
+        # Privates Release-Staging bleibt getrennt. Der betriebene Produktbaum
+        # folgt dagegen demselben lesbaren Vertrag wie update_simple.py.
+        _definition["group"] = "www-data"
         if _definition_basename in {
             "e3dc_v4.json",
             "e3dc.config.txt",
@@ -1370,8 +2186,10 @@ for _definition in FILE_DEFINITIONS:
             "e3dc.strompreise.txt",
         }:
             _definition["mode"] = "640"
+            _definition["executable"] = False
         else:
-            _definition["mode"] = "755" if _definition.get("executable") else "644"
+            _definition["mode"] = _live_product_file_mode(_definition_path)
+            _definition["executable"] = _definition["mode"] == "755"
     _web_root = os.path.abspath("/var/www/html")
     try:
         _inside_web = os.path.commonpath((_definition_path, _web_root)) == _web_root
@@ -1488,7 +2306,9 @@ def _normalize_permission_tree_fd(
     contract,
     *,
     excluded_top_level=(),
+    excluded_top_level_prefixes=(),
     reject_unsafe_entries=False,
+    expected_root_identity=None,
 ):
     """Projiziert Baumrechte fd-relativ, nofollow-, mount- und hardlinksicher.
 
@@ -1504,12 +2324,49 @@ def _normalize_permission_tree_fd(
     cloexec = getattr(os, "O_CLOEXEC", 0)
     if not nofollow or not directory:
         raise RuntimeError("Sichere fd-relative Rechteprojektion ist nicht verfügbar")
-    before_root = os.lstat(root)
-    if stat.S_ISLNK(before_root.st_mode) or not stat.S_ISDIR(before_root.st_mode):
-        raise RuntimeError(f"Rechtewurzel ist kein echtes Verzeichnis: {root}")
-    root_fd = os.open(root, os.O_RDONLY | nofollow | directory | cloexec)
+    root_parent_fd = -1
+    if expected_root_identity is None:
+        root_fd = _open_absolute_directory_nofollow(root)
+    else:
+        parent_path, root_name = os.path.split(root)
+        if not root_name:
+            raise RuntimeError("Gebundene Rechtewurzel besitzt keinen Dateinamen")
+        expected_parent_dev, expected_parent_ino, expected_dev, expected_ino = (
+            int(item) for item in expected_root_identity
+        )
+        root_parent_fd = _open_absolute_directory_nofollow(parent_path)
+        parent_metadata = os.fstat(root_parent_fd)
+        named_metadata = os.stat(
+            root_name,
+            dir_fd=root_parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            (parent_metadata.st_dev, parent_metadata.st_ino)
+            != (expected_parent_dev, expected_parent_ino)
+            or not stat.S_ISDIR(named_metadata.st_mode)
+            or (named_metadata.st_dev, named_metadata.st_ino)
+            != (expected_dev, expected_ino)
+        ):
+            os.close(root_parent_fd)
+            raise RuntimeError("Gebundene Rechtewurzel wurde vor der Projektion ersetzt")
+        root_fd = os.open(
+            root_name,
+            os.O_RDONLY | nofollow | directory | cloexec,
+            dir_fd=root_parent_fd,
+        )
+    before_root = os.fstat(root_fd)
+    if expected_root_identity is not None and (
+        before_root.st_dev,
+        before_root.st_ino,
+    ) != (expected_dev, expected_ino):
+        os.close(root_fd)
+        os.close(root_parent_fd)
+        raise RuntimeError("Gebundene Rechtewurzel driftete beim Öffnen")
     skipped = []
     excluded = frozenset(str(item) for item in excluded_top_level)
+    excluded_prefixes = tuple(str(item) for item in excluded_top_level_prefixes)
+    rebound_root = -1
 
     def desired_values(metadata, result):
         if result is None:
@@ -1618,7 +2475,9 @@ def _normalize_permission_tree_fd(
 
     def walk(parent_fd, relative, mount_id):
         for name in sorted(os.listdir(parent_fd)):
-            if not relative and name in excluded:
+            if not relative and (
+                name in excluded or name.startswith(excluded_prefixes)
+            ):
                 continue
             child_relative = (*relative, name)
             metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -1649,18 +2508,46 @@ def _normalize_permission_tree_fd(
             os.fchown(root_fd, uid, gid)
             os.fchmod(root_fd, mode)
             secured = os.fstat(root_fd)
-            named = os.lstat(root)
+            rebound_root = _open_absolute_directory_nofollow(root)
+            named = os.fstat(rebound_root)
             if (
-                stat.S_ISLNK(named.st_mode)
-                or not stat.S_ISDIR(named.st_mode)
+                not stat.S_ISDIR(named.st_mode)
                 or (secured.st_dev, secured.st_ino) != (named.st_dev, named.st_ino)
                 or secured.st_uid != uid
                 or secured.st_gid != gid
                 or stat.S_IMODE(secured.st_mode) != mode
             ):
                 raise RuntimeError(f"Rechtewurzel blieb nach der Projektion nicht gebunden: {root}")
+        else:
+            secured = os.fstat(root_fd)
+            rebound_root = _open_absolute_directory_nofollow(root)
+            named = os.fstat(rebound_root)
+            if (secured.st_dev, secured.st_ino) != (named.st_dev, named.st_ino):
+                raise RuntimeError(f"Rechtewurzel driftete während der Projektion: {root}")
+        if expected_root_identity is not None:
+            parent_after = os.fstat(root_parent_fd)
+            named_after = os.stat(
+                root_name,
+                dir_fd=root_parent_fd,
+                follow_symlinks=False,
+            )
+            if (
+                (parent_after.st_dev, parent_after.st_ino)
+                != (expected_parent_dev, expected_parent_ino)
+                or (named_after.st_dev, named_after.st_ino)
+                != (expected_dev, expected_ino)
+                or (secured.st_dev, secured.st_ino)
+                != (expected_dev, expected_ino)
+            ):
+                raise RuntimeError(
+                    f"Gebundene Rechtewurzel wurde während der Projektion ersetzt: {root}"
+                )
     finally:
+        if rebound_root >= 0:
+            os.close(rebound_root)
         os.close(root_fd)
+        if root_parent_fd >= 0:
+            os.close(root_parent_fd)
     if skipped:
         perm_logger.warning(
             "Rechteprojektion ließ %d Symlink-/Spezialeinträge unverändert: %s",
@@ -1753,33 +2640,152 @@ def _normalize_web_runtime_permissions(web_root="/var/www/html", config=None):
     web_account = pwd.getpwnam("www-data")
     web_group = grp.getgrnam("www-data")
     runtime_config = dict(config or load_config() or {})
-    for top_name in ("data", "history_backups", "logs", "ramdisk", "tmp"):
-        target = os.path.join(os.path.abspath(str(web_root)), top_name)
-        if not os.path.lexists(target):
-            continue
-        _normalize_permission_tree_fd(
-            target,
-            _web_runtime_permission_contract(
+    root = os.path.abspath(str(web_root))
+    root_fd = _open_absolute_directory_nofollow(root)
+    try:
+        root_metadata = os.fstat(root_fd)
+        root_mount_id = _permission_mount_id(root_fd)
+        docker_environment = os.path.exists("/.dockerenv")
+        for top_name in ("data", "history_backups", "logs", "ramdisk", "tmp"):
+            target = os.path.join(root, top_name)
+            try:
+                named = os.stat(top_name, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(named.st_mode) or not stat.S_ISDIR(named.st_mode):
+                raise RuntimeError(
+                    f"Web-Laufzeitfläche ist kein echtes Verzeichnis: {target}"
+                )
+            child_fd = os.open(
                 top_name,
-                account.pw_uid,
-                web_account.pw_uid,
-                web_group.gr_gid,
-                runtime_config,
-            ),
-        )
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=root_fd,
+            )
+            try:
+                opened = os.fstat(child_fd)
+                if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+                    raise RuntimeError(
+                        f"Web-Laufzeitfläche driftete beim Öffnen: {target}"
+                    )
+                child_mount_id = _permission_mount_id(child_fd)
+            finally:
+                os.close(child_fd)
+
+            separate_mount_allowed = bool(
+                docker_environment and top_name in {"data", "logs"}
+            )
+            if top_name == "ramdisk" and child_mount_id != root_mount_id:
+                probe = probe_ramdisk_tmpfs(ramdisk_path=target)
+                if not probe.get("ok"):
+                    raise RuntimeError(
+                        "Separate Ramdisk ist nicht als exakter tmpfs-Produktmount gebunden"
+                    )
+                separate_mount_allowed = True
+            if child_mount_id != root_mount_id and not separate_mount_allowed:
+                raise RuntimeError(
+                    f"Fremder Mount auf Web-Laufzeitfläche wird nicht verändert: {target}"
+                )
+
+            _normalize_permission_tree_fd(
+                target,
+                _web_runtime_permission_contract(
+                    top_name,
+                    account.pw_uid,
+                    web_account.pw_uid,
+                    web_group.gr_gid,
+                    runtime_config,
+                ),
+                excluded_top_level=(
+                    MATTER_RESET_PROTECTED_DATA_NAMES
+                    if top_name == "data"
+                    else ()
+                ),
+                excluded_top_level_prefixes=(
+                    MATTER_RESET_PROTECTED_DATA_PREFIXES
+                    if top_name == "data"
+                    else ()
+                ),
+                expected_root_identity=(
+                    int(root_metadata.st_dev),
+                    int(root_metadata.st_ino),
+                    int(opened.st_dev),
+                    int(opened.st_ino),
+                ),
+            )
+    finally:
+        os.close(root_fd)
     return True
 
 
-def harden_web_program_permissions(web_root="/var/www/html", install_user=None, web_group="www-data"):
-    """Hält den Web-Programmbaum lesbar, aber für den Webprozess unveränderlich."""
+def harden_web_program_permissions(
+    web_root="/var/www/html",
+    install_user=None,
+    web_group="www-data",
+    *,
+    program_files=None,
+    program_directories=None,
+):
+    """Härtet ausschließlich eine explizite Web-Produkt-Positivliste.
+
+    Ohne übergebenen Zielvertrag wird aus Kompatibilitätsgründen nur die
+    bestehende statische Produktdateiliste berücksichtigt. Unbekannte lokale
+    Pfade und persistente Laufzeitdateien bleiben immer unverändert.
+    """
 
     root = os.path.abspath(str(web_root))
     account_name = str(install_user or INSTALL_USER)
-    writable_top = _WEB_WRITABLE_TOP
+    explicit_contract = program_files is not None or program_directories is not None
     root_descriptor = -1
     try:
         account = pwd.getpwnam(account_name)
         group = grp.getgrnam(str(web_group))
+        preserved = (
+            set(_WEB_WRITABLE_TOP)
+            | set(_WEB_PRIVATE_RUNTIME_FILES)
+            | set(_WEB_PRIVATE_RUNTIME_DIRECTORIES)
+        )
+
+        def _normalize_relative(value):
+            raw = str(value or "").replace("\\", "/")
+            parts = tuple(raw.split("/"))
+            if (
+                not raw
+                or raw.startswith("/")
+                or any(part in {"", ".", ".."} for part in parts)
+                or parts[0] in preserved
+            ):
+                raise RuntimeError("Web-Produktvertrag enthält einen unzulässigen Pfad")
+            return parts
+
+        if not explicit_contract:
+            selected_files = {
+                "/".join(_normalize_relative(item))
+                for item in WEB_PROGRAM_FALLBACK_FILES
+            }
+            selected_directories = {
+                "/".join(_normalize_relative(item))
+                for item in WEB_PROGRAM_FALLBACK_DIRECTORIES
+            }
+        else:
+            selected_files = {
+                "/".join(_normalize_relative(item))
+                for item in (program_files or ())
+            }
+            selected_directories = {
+                "/".join(_normalize_relative(item))
+                for item in (program_directories or ())
+            }
+        if selected_files & selected_directories:
+            raise RuntimeError("Web-Produktvertrag enthält Datei-/Verzeichniskollisionen")
+        for relative in tuple(selected_files) + tuple(selected_directories):
+            parts = relative.split("/")
+            selected_directories.update(
+                "/".join(parts[:depth]) for depth in range(1, len(parts))
+            )
+
         root_info = os.lstat(root)
         if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
             raise RuntimeError("Web-Programmroot ist kein sicheres Verzeichnis")
@@ -1819,134 +2825,153 @@ def harden_web_program_permissions(web_root="/var/www/html", install_user=None, 
         ):
             raise RuntimeError("Webroot-Owner- oder Namensvertrag ist nicht wirksam")
         root_device = secured_root.st_dev
+        root_mount_id = _permission_mount_id(root_descriptor)
 
-        def _entry_metadata(parent_fd, name):
-            return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-
-        def _open_program_directory(parent_fd, name):
-            named_before = _entry_metadata(parent_fd, name)
-            if (
-                stat.S_ISLNK(named_before.st_mode)
-                or not stat.S_ISDIR(named_before.st_mode)
-                or named_before.st_dev != root_device
-            ):
-                raise RuntimeError("Unsicheres Verzeichnis im Web-Programmbaum")
-            child_fd = os.open(
-                name,
-                os.O_RDONLY | nofollow | directory | getattr(os, "O_CLOEXEC", 0),
-                dir_fd=parent_fd,
-            )
-            opened = os.fstat(child_fd)
-            if (
-                not stat.S_ISDIR(opened.st_mode)
-                or (opened.st_dev, opened.st_ino)
-                != (named_before.st_dev, named_before.st_ino)
-            ):
-                os.close(child_fd)
-                raise RuntimeError("Web-Programmverzeichnis wechselte beim Öffnen")
-            return child_fd
-
-        def _secure_directory_tree(parent_fd, *, top_level=False, private=False):
-            # Eltern werden zuerst schreibgeschützt. Damit kann der laufende
-            # Webprozess die darunter anschließend fd-relativ bearbeiteten
-            # Namen nicht mehr zwischen Prüfung und fchown/fchmod austauschen.
-            for name in sorted(os.listdir(parent_fd)):
-                if top_level and name in writable_top:
-                    continue
-                metadata = _entry_metadata(parent_fd, name)
-                if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
-                    child_private = bool(
-                        private
-                        or (top_level and name in _WEB_PRIVATE_RUNTIME_DIRECTORIES)
+        def _open_parent(parts):
+            descriptor = os.dup(root_descriptor)
+            try:
+                for component in parts:
+                    named = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+                    if stat.S_ISLNK(named.st_mode) or not stat.S_ISDIR(named.st_mode):
+                        raise RuntimeError("Web-Produktparent ist kein echtes Verzeichnis")
+                    child = os.open(
+                        component,
+                        os.O_RDONLY | nofollow | directory | getattr(os, "O_CLOEXEC", 0),
+                        dir_fd=descriptor,
                     )
-                    directory_mode = 0o750 if child_private else 0o755
-                    child_fd = _open_program_directory(parent_fd, name)
-                    try:
-                        os.fchown(child_fd, account.pw_uid, group.gr_gid)
-                        os.fchmod(child_fd, directory_mode)
-                        changed = os.fstat(child_fd)
-                        named_after = _entry_metadata(parent_fd, name)
-                        if (
-                            (changed.st_dev, changed.st_ino)
-                            != (named_after.st_dev, named_after.st_ino)
-                            or changed.st_uid != account.pw_uid
-                            or changed.st_gid != group.gr_gid
-                            or stat.S_IMODE(changed.st_mode) != directory_mode
-                        ):
-                            raise RuntimeError("Web-Programmverzeichnis blieb nicht gebunden")
-                        _secure_directory_tree(
-                            child_fd,
-                            top_level=False,
-                            private=child_private,
-                        )
-                    finally:
-                        os.close(child_fd)
-                elif not stat.S_ISREG(metadata.st_mode):
-                    raise RuntimeError("Special- oder Symlinkeintrag im Web-Programmbaum")
+                    opened = os.fstat(child)
+                    if (
+                        (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+                        or _permission_mount_id(child) != root_mount_id
+                    ):
+                        os.close(child)
+                        raise RuntimeError("Web-Produktparent driftete oder liegt auf Fremdmount")
+                    os.close(descriptor)
+                    descriptor = child
+                return descriptor
+            except Exception:
+                os.close(descriptor)
+                raise
 
-        def _secure_file_tree(parent_fd, *, top_level=False, private=False):
-            for name in sorted(os.listdir(parent_fd)):
-                if top_level and name in writable_top:
-                    continue
-                metadata = _entry_metadata(parent_fd, name)
-                if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
-                    child_private = bool(
-                        private
-                        or (top_level and name in _WEB_PRIVATE_RUNTIME_DIRECTORIES)
+        for relative in sorted(
+            selected_directories,
+            key=lambda value: (value.count("/"), value),
+        ):
+            parts = relative.split("/")
+            try:
+                parent_fd = _open_parent(parts[:-1])
+            except FileNotFoundError:
+                if explicit_contract:
+                    raise RuntimeError(
+                        f"Web-Produktparent fehlt: {relative}"
                     )
-                    child_fd = _open_program_directory(parent_fd, name)
-                    try:
-                        _secure_file_tree(
-                            child_fd,
-                            top_level=False,
-                            private=child_private,
+                continue
+            try:
+                try:
+                    named = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    if explicit_contract:
+                        raise RuntimeError(f"Web-Produktverzeichnis fehlt: {relative}")
+                    continue
+                if stat.S_ISLNK(named.st_mode) or not stat.S_ISDIR(named.st_mode):
+                    raise RuntimeError(f"Web-Produktverzeichnis ist unsicher: {relative}")
+                child_fd = os.open(
+                    parts[-1],
+                    os.O_RDONLY | nofollow | directory | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=parent_fd,
+                )
+                try:
+                    opened = os.fstat(child_fd)
+                    if (
+                        (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+                        or opened.st_dev != root_device
+                        or _permission_mount_id(child_fd) != root_mount_id
+                    ):
+                        raise RuntimeError(f"Web-Produktverzeichnis driftete: {relative}")
+                    os.fchown(child_fd, account.pw_uid, group.gr_gid)
+                    os.fchmod(child_fd, 0o755)
+                    changed = os.fstat(child_fd)
+                    named_after = os.stat(
+                        parts[-1], dir_fd=parent_fd, follow_symlinks=False
+                    )
+                    if (
+                        not stat.S_ISDIR(changed.st_mode)
+                        or (changed.st_dev, changed.st_ino)
+                        != (named_after.st_dev, named_after.st_ino)
+                        or changed.st_uid != account.pw_uid
+                        or changed.st_gid != group.gr_gid
+                        or stat.S_IMODE(changed.st_mode) != 0o755
+                    ):
+                        raise RuntimeError(
+                            f"Web-Produktverzeichnis blieb nicht gebunden: {relative}"
                         )
-                    finally:
-                        os.close(child_fd)
+                finally:
+                    os.close(child_fd)
+            finally:
+                os.close(parent_fd)
+
+        for relative in sorted(selected_files):
+            parts = relative.split("/")
+            try:
+                parent_fd = _open_parent(parts[:-1])
+            except FileNotFoundError:
+                if explicit_contract:
+                    raise RuntimeError(
+                        f"Web-Produktparent fehlt: {relative}"
+                    )
+                continue
+            try:
+                try:
+                    named = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    if explicit_contract:
+                        raise RuntimeError(f"Web-Produktdatei fehlt: {relative}")
                     continue
                 if (
-                    stat.S_ISLNK(metadata.st_mode)
-                    or not stat.S_ISREG(metadata.st_mode)
-                    or metadata.st_nlink != 1
-                    or metadata.st_dev != root_device
+                    not stat.S_ISREG(named.st_mode)
+                    or named.st_nlink != 1
+                    or named.st_dev != root_device
                 ):
-                    raise RuntimeError("Unsichere Datei im Web-Programmbaum")
+                    raise RuntimeError(f"Web-Produktdatei ist unsicher: {relative}")
                 file_fd = os.open(
-                    name,
+                    parts[-1],
                     os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
                     dir_fd=parent_fd,
                 )
                 try:
                     opened = os.fstat(file_fd)
                     if (
-                        not stat.S_ISREG(opened.st_mode)
+                        (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
                         or opened.st_nlink != 1
-                        or (opened.st_dev, opened.st_ino)
-                        != (metadata.st_dev, metadata.st_ino)
+                        or _permission_mount_id(file_fd) != root_mount_id
                     ):
-                        raise RuntimeError("Web-Programmdatei wechselte beim Öffnen")
-                    file_private = bool(
-                        private
-                        or (top_level and name in _WEB_PRIVATE_RUNTIME_FILES)
-                    )
-                    file_mode = 0o640 if file_private else 0o644
+                        raise RuntimeError(f"Web-Produktdatei driftete: {relative}")
                     os.fchown(file_fd, account.pw_uid, group.gr_gid)
-                    os.fchmod(file_fd, file_mode)
+                    os.fchmod(file_fd, 0o644)
                     changed = os.fstat(file_fd)
-                    named_after = _entry_metadata(parent_fd, name)
+                    named_after = os.stat(
+                        parts[-1], dir_fd=parent_fd, follow_symlinks=False
+                    )
                     if (
                         (changed.st_dev, changed.st_ino)
                         != (named_after.st_dev, named_after.st_ino)
                         or changed.st_uid != account.pw_uid
                         or changed.st_gid != group.gr_gid
-                        or stat.S_IMODE(changed.st_mode) != file_mode
+                        or stat.S_IMODE(changed.st_mode) != 0o644
                     ):
-                        raise RuntimeError("Web-Programmdatei blieb nicht gebunden")
+                        raise RuntimeError(f"Web-Produktdatei blieb nicht gebunden: {relative}")
                 finally:
                     os.close(file_fd)
+            finally:
+                os.close(parent_fd)
 
-        _secure_directory_tree(root_descriptor, top_level=True)
-        _secure_file_tree(root_descriptor, top_level=True)
+        named_root = os.lstat(root)
+        current_root = os.fstat(root_descriptor)
+        if (named_root.st_dev, named_root.st_ino) != (
+            current_root.st_dev,
+            current_root.st_ino,
+        ):
+            raise RuntimeError("Web-Programmroot driftete während der Positivlisten-Härtung")
         return True
     except Exception as exc:
         perm_logger.error("Web-Programmrechte konnten nicht gehaertet werden: %s", exc)
@@ -1970,15 +2995,35 @@ def check_file_permissions():
     # Logfile-Pfad aus V4 JSON lesen (Single Source of Truth)
     try:
         v4_path = "/var/www/html/data/e3dc_v4.json"
-        if os.path.exists(v4_path):
-            import json as _json
-            with open(v4_path, "r", encoding="utf-8") as f:
-                v4_data = _json.load(f)
+        if os.path.lexists(v4_path):
+            v4_data = _read_release_config_nofollow(v4_path)
             log_val = str(v4_data.get("logfile", "") or "").strip().strip('"').strip("'")
             if log_val:
-                full_log_path = log_val if log_val.startswith("/") else os.path.join(INSTALL_PATH, log_val)
-                dynamic_log_file = full_log_path
-                if not any(d['path'] == full_log_path for d in FILE_DEFINITIONS):
+                full_log_path = os.path.abspath(
+                    log_val if log_val.startswith("/") else os.path.join(INSTALL_PATH, log_val)
+                )
+                allowed_log_roots = (
+                    os.path.abspath(os.path.join(INSTALL_PATH, "logs")),
+                    os.path.abspath("/var/www/html/logs"),
+                )
+                log_path_allowed = any(
+                    full_log_path != root
+                    and os.path.commonpath((root, full_log_path)) == root
+                    for root in allowed_log_roots
+                )
+                if not log_path_allowed:
+                    print(
+                        f"{YELLOW}[i]{RESET} Benutzerdefinierter Logpfad liegt "
+                        "außerhalb der verwalteten Logverzeichnisse und bleibt unverändert"
+                    )
+                    perm_logger.warning(
+                        "Benutzerdefinierter Logpfad wird aus Kompatibilitäts- und "
+                        "Sicherheitsgründen nicht automatisch verändert: %s",
+                        full_log_path,
+                    )
+                else:
+                    dynamic_log_file = full_log_path
+                if dynamic_log_file and not any(d['path'] == full_log_path for d in FILE_DEFINITIONS):
                     FILE_DEFINITIONS.append({
                         "path": full_log_path, "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False
                     })
@@ -1986,35 +3031,9 @@ def check_file_permissions():
     except Exception:
         pass
 
-    # Alle Python-Skripte im INSTALL_PATH dynamisch erfassen und prüfen
-    if os.path.exists(INSTALL_PATH):
-        try:
-            for fname in os.listdir(INSTALL_PATH):
-                if fname.endswith(".py"):
-                    fpath = os.path.join(INSTALL_PATH, fname)
-                    # Wenn noch nicht in der Liste, hinzufügen
-                    if not any(d['path'] == fpath for d in FILE_DEFINITIONS):
-                        FILE_DEFINITIONS.append({
-                            "path": fpath, "mode": "755", "owner": INSTALL_USER, "group": INSTALL_GROUP, "optional": False, "executable": True
-                        })
-        except Exception:
-            pass
-
-    # Alle Python-Skripte im INSTALLER_DIR rekursiv erfassen (z.B. neue Module wie Wallbox, luxtronik)
-    if os.path.exists(INSTALLER_DIR):
-        try:
-            for root, dirs, files in os.walk(INSTALLER_DIR):
-                if ".git" in root or "__pycache__" in root:
-                    continue
-                for fname in files:
-                    if fname.endswith(".py"):
-                        fpath = os.path.join(root, fname)
-                        if not any(d['path'] == fpath for d in FILE_DEFINITIONS):
-                            FILE_DEFINITIONS.append({
-                                "path": fpath, "mode": "755", "owner": INSTALL_USER, "group": INSTALL_GROUP, "optional": False, "executable": True
-                            })
-        except Exception:
-            pass
+    # Unbekannte lokale Dateien sind keine Produktinventar-Autorität. Nur die
+    # explizite Definitionstabelle darf dieser Legacy-Prüfer verändern; die
+    # vollständige Releaseprojektion gehört ausschließlich dem Ziel-Updater.
 
     issues = {}
     for fdef in FILE_DEFINITIONS:
@@ -2026,14 +3045,18 @@ def check_file_permissions():
         is_executable = fdef["executable"]
         file_name = os.path.basename(path)
 
-        if not os.path.exists(path):
+        if not os.path.lexists(path):
             if not is_optional:
                 print(f"{RED}✗{RESET} {file_name} fehlt")
                 issues[path] = {"missing": True}
             continue
         try:
-            st = os.stat(path)
-            mode = oct(st.st_mode)[-3:]
+            st = os.stat(path, follow_symlinks=False)
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                print(f"{RED}✗{RESET} {file_name} ist keine reguläre Einzeldatei")
+                issues[path] = {"unsafe": True}
+                continue
+            mode = f"{stat.S_IMODE(st.st_mode):o}"
             owner = pwd.getpwuid(st.st_uid).pw_name
             group = grp.getgrgid(st.st_gid).gr_name
             allowed_owners = {expected_owner}
@@ -2092,61 +3115,84 @@ def fix_permissions(issues):
             print(f"{GREEN}✓{RESET} {INSTALL_USER}: Gruppenmitgliedschaft www-data gesetzt")
         else:
             success = False
-    if "home" in issues:
-        print(f"  → Setze Execute-Bit auf Home-Verzeichnis: {INSTALL_HOME} (soll: für www-data betretbar)")
-        result = run_command(f"sudo chmod o+x {INSTALL_HOME}")
-        if result['success']:
-            print(f"{GREEN}✓{RESET} {INSTALL_HOME}: Execute-Bit für Others gesetzt")
-        else:
+    traversal_paths = []
+    required_traversal = _required_web_traversal_ancestors()
+    for path in required_traversal:
+        issue_key = (
+            "home"
+            if os.path.normpath(path)
+            == os.path.normpath(os.path.abspath(str(INSTALL_HOME)))
+            else f"web_traversal:{path}"
+        )
+        if issue_key in issues:
+            traversal_paths.append(path)
+    if traversal_paths:
+        print("  → Binde enge Traversierrechte auf benötigte Installationspfad-Vorfahren")
+        try:
+            _project_required_web_traversal(tuple(traversal_paths))
+            for path in traversal_paths:
+                print(f"{GREEN}✓{RESET} {path}: Traversierrecht sicher gesetzt")
+        except Exception as exc:
+            print(
+                f"{RED}[!]{RESET} Installationspfad-Traversierrechte wurden "
+                f"nicht verändert: {exc}"
+            )
+            perm_logger.error(
+                "Installationspfad-Traversierrechte konnten nicht sicher gesetzt werden: %s",
+                exc,
+            )
             success = False
     if "owner" in issues or "mode" in issues:
         print(
-            f"  → Projiziere Installationsrechte sicher: "
-            f"{INSTALL_PATH} -> {INSTALL_USER}:{INSTALL_GROUP}, Verzeichnisse 755"
+            f"  → Setze gebundene Stammrechte sicher: "
+            f"{INSTALL_PATH} -> {INSTALL_USER}:www-data, Verzeichnis 755"
         )
         try:
             account = pwd.getpwnam(INSTALL_USER)
-            group = grp.getgrnam(INSTALL_GROUP)
-            configured_venv = str(load_config().get("venv_name") or ".venv_e3dc")
-
-            def install_contract(_relative, metadata, is_directory):
-                return (
-                    account.pw_uid if "owner" in issues else None,
-                    group.gr_gid if "owner" in issues else None,
-                    0o755 if "mode" in issues and is_directory else None,
-                )
-
-            _normalize_permission_tree_fd(
+            group = grp.getgrnam("www-data")
+            _set_live_directory_metadata(
                 INSTALL_PATH,
-                install_contract,
-                excluded_top_level={
-                    ".git",
-                    ".venv",
-                    ".venv_e3dc",
-                    "venv",
-                    configured_venv,
-                },
+                uid=account.pw_uid,
+                gid=group.gr_gid,
+                mode=0o755,
             )
-            print(f"{GREEN}✓{RESET} {INSTALL_PATH}: Rechte fd-relativ und mountgebunden projiziert")
+            print(f"{GREEN}✓{RESET} {INSTALL_PATH}: Stammrechte fd-gebunden gesetzt")
         except Exception as exc:
-            print(f"{RED}✗{RESET} Sichere Installations-Rechteprojektion fehlgeschlagen: {exc}")
-            perm_logger.error("Sichere Installations-Rechteprojektion fehlgeschlagen: %s", exc)
+            print(f"{RED}✗{RESET} Sichere Installations-Stammrechte fehlgeschlagen: {exc}")
+            perm_logger.error("Sichere Installations-Stammrechte fehlgeschlagen: %s", exc)
             success = False
     if "installer_dir" in issues:
-        print(f"  -> Setze Installer-Verzeichnisrechte: {INSTALLER_DIR} -> {INSTALL_USER}:{INSTALL_GROUP}, 755")
-        owner_result = run_command(f"sudo chown {INSTALL_USER}:{INSTALL_GROUP} {INSTALLER_DIR}")
-        mode_result = run_command(f"sudo chmod 755 {INSTALLER_DIR}")
-        if owner_result['success'] and mode_result['success']:
+        print(f"  -> Setze Installer-Verzeichnisrechte: {INSTALLER_DIR} -> {INSTALL_USER}:www-data, 755")
+        try:
+            account = pwd.getpwnam(INSTALL_USER)
+            group = grp.getgrnam("www-data")
+            _set_live_directory_metadata(
+                INSTALLER_DIR,
+                uid=account.pw_uid,
+                gid=group.gr_gid,
+                mode=0o755,
+            )
             print(f"{GREEN}OK{RESET} {INSTALLER_DIR}: fuer Web-Diagnose betretbar")
-        else:
+        except Exception as exc:
+            perm_logger.error("Sichere Installer-Verzeichnisrechte fehlgeschlagen: %s", exc)
             success = False
+    if "venv_unsafe" in issues:
+        print(
+            f"{RED}✗{RESET} Unsicherer venv-Pfad wird nicht automatisch verändert; "
+            "bitte venv_name auf einen einzelnen Verzeichnisnamen zurücksetzen"
+        )
+        success = False
     if "venv_owner" in issues or "venv_mode" in issues:
-        venv_name = load_config().get("venv_name", ".venv_e3dc")
+        try:
+            venv_name, venv_path, venv_identity = _validated_configured_venv_path()
+        except Exception as exc:
+            print(f"{RED}✗{RESET} Sichere venv-Bindung fehlgeschlagen: {exc}")
+            perm_logger.error("Sichere venv-Bindung fehlgeschlagen: %s", exc)
+            return False
         print(f"  → Projiziere Python-Umgebung sicher: {venv_name}")
-        # Pfad erneut ermitteln
-        venv_path = os.path.join(INSTALL_HOME, venv_name)
-        if not os.path.exists(venv_path) and os.path.exists(os.path.join(INSTALL_PATH, venv_name)):
-            venv_path = os.path.join(INSTALL_PATH, venv_name)
+        if not venv_path:
+            print(f"{RED}✗{RESET} Konfigurierte Python-Umgebung fehlt")
+            return False
         try:
             account = pwd.getpwnam(INSTALL_USER)
 
@@ -2163,7 +3209,11 @@ def fix_permissions(issues):
                     mode,
                 )
 
-            _normalize_permission_tree_fd(venv_path, venv_contract)
+            _normalize_permission_tree_fd(
+                venv_path,
+                venv_contract,
+                expected_root_identity=venv_identity,
+            )
             print(f"{GREEN}✓{RESET} {venv_name}: Rechte sicher projiziert")
         except Exception as exc:
             print(f"{RED}✗{RESET} Sichere venv-Rechteprojektion fehlgeschlagen: {exc}")
@@ -2175,7 +3225,7 @@ def fix_permissions(issues):
     if "apache_php_module" in issues:
         print("  → Repariere Apache PHP-Modul…")
         run_command("sudo apt-get update", timeout=120)
-        run_command("sudo apt-get install -y php libapache2-mod-php php-curl php-sqlite3 php-mbstring", timeout=300)
+        run_command("sudo apt-get install -y php php-cli libapache2-mod-php php-curl php-sqlite3 php-mbstring", timeout=300)
         run_command("sudo a2dismod mpm_event mpm_worker >/dev/null 2>&1 || true", timeout=30)
         run_command("sudo a2enmod mpm_prefork", timeout=30)
         php_cmd = (
@@ -2251,7 +3301,7 @@ def fix_webportal_permissions(issues):
     if "apache_php_module" in issues:
         print("  -> Repariere Apache PHP-Modul")
         run_command("sudo apt-get update", timeout=120)
-        run_command("sudo apt-get install -y php libapache2-mod-php php-curl php-sqlite3 php-mbstring", timeout=300)
+        run_command("sudo apt-get install -y php php-cli libapache2-mod-php php-curl php-sqlite3 php-mbstring", timeout=300)
         run_command("sudo a2dismod mpm_event mpm_worker >/dev/null 2>&1 || true", timeout=30)
         run_command("sudo a2enmod mpm_prefork", timeout=30)
         php_cmd = (
@@ -2564,42 +3614,16 @@ def _harden_aux_inverter_migration_backups(path):
     return _verify_aux_inverter_migration_backup_modes(path)
 
 
-def cleanup_root_owned_files():
-    """Sucht und bereinigt root-eigene Dateien in INSTALL_PATH, INSTALL_ROOT und /var/www/html."""
-    print("\n■ Prüfe auf root-eigene Dateien…\n")
-    
-    paths_to_check = [
-        (INSTALL_PATH, INSTALL_USER, INSTALL_GROUP),
-        (INSTALL_ROOT, INSTALL_USER, "www-data"),
-    ]
+def cleanup_root_owned_files(*, program_files=None, program_directories=None):
+    """Härtet ausschließlich die explizit getrennten Web-Programmpfade.
+
+    Der Produktbaum wird vom Ziel-Updater über das gebundene Releaseinventar
+    projiziert. Ein rekursiver Chown unbekannter Dateien wäre weder eine
+    belastbare Produktinventur noch mit privaten lokalen Nebenpfaden vereinbar.
+    """
+    print("\n■ Prüfe gebundene Web-Programmrechte…\n")
 
     try:
-        seen = set()
-        configured_venv = str(load_config().get("venv_name") or ".venv_e3dc")
-        for base_dir, owner_name, group_name in paths_to_check:
-            canonical = os.path.abspath(base_dir)
-            if canonical in seen or not os.path.exists(canonical):
-                continue
-            seen.add(canonical)
-            account = pwd.getpwnam(owner_name)
-            group = grp.getgrnam(group_name)
-
-            def root_owned_contract(_relative, metadata, _is_directory):
-                if metadata.st_uid != 0:
-                    return None
-                return account.pw_uid, group.gr_gid, None
-
-            _normalize_permission_tree_fd(
-                canonical,
-                root_owned_contract,
-                excluded_top_level={
-                    ".git",
-                    ".venv",
-                    ".venv_e3dc",
-                    "venv",
-                    configured_venv,
-                },
-            )
         # Der Webroot selbst bleibt root-kontrolliert; Programminhalte und
         # Laufzeitflächen werden durch zwei getrennte fd-relative Verträge
         # normalisiert.
@@ -2608,6 +3632,8 @@ def cleanup_root_owned_files():
                 web_root="/var/www/html",
                 install_user=INSTALL_USER,
                 web_group="www-data",
+                program_files=program_files,
+                program_directories=program_directories,
             ):
                 return False
             _normalize_web_runtime_permissions("/var/www/html", config=load_config())
@@ -2615,7 +3641,7 @@ def cleanup_root_owned_files():
         print(f"{RED}✗{RESET} Fehler beim Scannen: {e}")
         return False
 
-    print(f"{GREEN}✓{RESET} Root-eigene Dateien bereinigt\n")
+    print(f"{GREEN}✓{RESET} Gebundene Web-Programmrechte geprüft\n")
     return True
 
 
@@ -2700,46 +3726,242 @@ def cleanup_stale_v4_processes():
         print(f"{GREEN}✓{RESET} Keine alten V4-Prozesse gefunden")
 
 def cleanup_legacy_plots():
-    """Entfernt alte Python-Plot-Skripte, HTML-Fragmente und Lock-Dateien."""
-    paths_to_delete = [
-        os.path.join(INSTALL_PATH, "plot_soc_changes.py"),
-        os.path.join(INSTALL_PATH, "plot_live_history.py"),
-        os.path.join(INSTALL_PATH, "diagram_helpers.py"),
-        "/var/www/html/diagramm.html",
-        "/var/www/html/archiv_diagramm.html",
-        "/var/www/html/diagramm_mobile.html",
-        "/var/www/html/live_diagramm.html",
-        os.path.join(INSTALL_PATH, "diagram_config.json"),
-        "/var/www/html/tmp/plot_soc_done",
-        "/var/www/html/tmp/plot_soc_done_archiv",
-        "/var/www/html/tmp/plot_soc_done_mobile",
-        "/var/www/html/tmp/plot_soc_error",
-        "/var/www/html/tmp/plot_soc_error_archiv",
-        "/var/www/html/tmp/plot_soc_error_mobile",
-        "/var/www/html/tmp/plot_live_history_last_run",
-        "/var/www/html/tmp/plot_soc_last_run",
-        "/var/www/html/tmp/plot_soc_running",
-        "/var/www/html/tmp/plot_soc_running_mobile",
-        "/var/www/html/tmp/plot_soc_running_archiv",
-        "/var/www/html/tmp/plot_live_history_running"
-    ]
-    
-    # Versteckte, wachsende Log-Reste bereinigen (Platzbedarf)
-    nohup_file = os.path.join(INSTALL_PATH, "nohup.out")
-    if os.path.exists(nohup_file) and os.path.getsize(nohup_file) > 1024 * 1024:
-        paths_to_delete.append(nohup_file)
-        
-    has_cleaned = False
-    for p in paths_to_delete:
-        if os.path.exists(p):
+    """Entfernt nur feste Legacy-Leaves aus gehaltenen, echten Verzeichnissen."""
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    if not nofollow or not directory:
+        perm_logger.error("Sichere Legacy-Plot-Bereinigung ist nicht verfügbar")
+        return False
+
+    bindings = []
+
+    def verify_root(binding):
+        parent = os.fstat(binding["parent_fd"])
+        opened = os.fstat(binding["root_fd"])
+        named = os.stat(
+            binding["name"],
+            dir_fd=binding["parent_fd"],
+            follow_symlinks=False,
+        )
+        if (
+            (parent.st_dev, parent.st_ino) != binding["parent_identity"]
+            or not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(named.st_mode)
+            or (opened.st_dev, opened.st_ino) != binding["root_identity"]
+            or (named.st_dev, named.st_ino) != binding["root_identity"]
+        ):
+            raise RuntimeError(
+                f"Legacy-Cleanup-Wurzel wurde ausgetauscht: {binding['path']}"
+            )
+
+    def bind_root(path, *, parent_binding=None, require_mount_id=None):
+        normalized = os.path.abspath(str(path))
+        parent_path, name = os.path.split(normalized)
+        if not name:
+            raise RuntimeError("Dateisystemwurzel ist kein Legacy-Cleanup-Ziel")
+        if parent_binding is None:
             try:
-                os.remove(p)
-                has_cleaned = True
-            except: pass
-            
+                parent_fd = _open_absolute_directory_nofollow(parent_path)
+            except FileNotFoundError:
+                return None
+        else:
+            verify_root(parent_binding)
+            parent_fd = os.dup(parent_binding["root_fd"])
+        root_fd = -1
+        try:
+            try:
+                named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                os.close(parent_fd)
+                return None
+            if stat.S_ISLNK(named.st_mode) or not stat.S_ISDIR(named.st_mode):
+                raise RuntimeError(f"Legacy-Cleanup-Wurzel ist unsicher: {normalized}")
+            root_fd = os.open(
+                name,
+                os.O_RDONLY | nofollow | directory | cloexec,
+                dir_fd=parent_fd,
+            )
+            opened = os.fstat(root_fd)
+            if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+                raise RuntimeError(
+                    f"Legacy-Cleanup-Wurzel driftete beim Öffnen: {normalized}"
+                )
+            mount_id = _permission_mount_id(root_fd)
+            if require_mount_id is not None and mount_id != require_mount_id:
+                raise RuntimeError(
+                    f"Fremder Mount ist kein Legacy-Cleanup-Ziel: {normalized}"
+                )
+            parent = os.fstat(parent_fd)
+            binding = {
+                "path": normalized,
+                "name": name,
+                "parent_fd": parent_fd,
+                "root_fd": root_fd,
+                "parent_identity": (parent.st_dev, parent.st_ino),
+                "root_identity": (opened.st_dev, opened.st_ino),
+                "mount_id": mount_id,
+            }
+            verify_root(binding)
+            bindings.append(binding)
+            return binding
+        except Exception:
+            if root_fd >= 0:
+                os.close(root_fd)
+            os.close(parent_fd)
+            raise
+
+    def delete_leaf(binding, name, *, large_only=False):
+        verify_root(binding)
+        try:
+            before = os.stat(name, dir_fd=binding["root_fd"], follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if large_only and (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+        ):
+            perm_logger.warning("Unsicheres optionales nohup.out bleibt unverändert")
+            return False
+        if stat.S_ISREG(before.st_mode):
+            if before.st_nlink != 1:
+                raise RuntimeError(f"Legacy-Cleanup-Leaf besitzt Hardlinks: {name}")
+            opened_receipt = None
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | nofollow
+                | getattr(os, "O_NONBLOCK", 0)
+                | cloexec,
+                dir_fd=binding["root_fd"],
+            )
+            try:
+                opened = os.fstat(descriptor)
+                if (
+                    (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+                    or opened.st_nlink != 1
+                    or _permission_mount_id(descriptor) != binding["mount_id"]
+                ):
+                    raise RuntimeError(f"Legacy-Cleanup-Leaf driftete: {name}")
+                if large_only and opened.st_size <= 1024 * 1024:
+                    return False
+                opened_receipt = (
+                    opened.st_dev,
+                    opened.st_ino,
+                    opened.st_mode,
+                    opened.st_nlink,
+                    opened.st_size,
+                    opened.st_mtime_ns,
+                    opened.st_ctime_ns,
+                )
+            finally:
+                os.close(descriptor)
+        elif stat.S_ISLNK(before.st_mode) and not large_only:
+            pass
+        else:
+            raise RuntimeError(f"Legacy-Cleanup-Leaf besitzt unsicheren Typ: {name}")
+
+        verify_root(binding)
+        current = os.stat(name, dir_fd=binding["root_fd"], follow_symlinks=False)
+        current_receipt = (
+            current.st_dev,
+            current.st_ino,
+            current.st_mode,
+            current.st_nlink,
+            current.st_size,
+            current.st_mtime_ns,
+            current.st_ctime_ns,
+        )
+        expected_receipt = (
+            opened_receipt
+            if stat.S_ISREG(before.st_mode)
+            else (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_nlink,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+        )
+        if current_receipt != expected_receipt:
+            raise RuntimeError(f"Legacy-Cleanup-Leaf wurde vor dem Löschen ersetzt: {name}")
+        os.unlink(name, dir_fd=binding["root_fd"])
+        os.fsync(binding["root_fd"])
+        verify_root(binding)
+        return True
+
+    install_names = (
+        "plot_soc_changes.py",
+        "plot_live_history.py",
+        "diagram_helpers.py",
+        "diagram_config.json",
+    )
+    web_names = (
+        "diagramm.html",
+        "archiv_diagramm.html",
+        "diagramm_mobile.html",
+        "live_diagramm.html",
+    )
+    tmp_names = (
+        "plot_soc_done",
+        "plot_soc_done_archiv",
+        "plot_soc_done_mobile",
+        "plot_soc_error",
+        "plot_soc_error_archiv",
+        "plot_soc_error_mobile",
+        "plot_live_history_last_run",
+        "plot_soc_last_run",
+        "plot_soc_running",
+        "plot_soc_running_mobile",
+        "plot_soc_running_archiv",
+        "plot_live_history_running",
+    )
+
+    has_cleaned = False
+    try:
+        install_binding = bind_root(INSTALL_PATH)
+        web_binding = bind_root("/var/www/html")
+        tmp_binding = (
+            bind_root(
+                "/var/www/html/tmp",
+                parent_binding=web_binding,
+                require_mount_id=web_binding["mount_id"],
+            )
+            if web_binding is not None
+            else None
+        )
+        if install_binding is not None:
+            for name in install_names:
+                has_cleaned = delete_leaf(install_binding, name) or has_cleaned
+            has_cleaned = (
+                delete_leaf(install_binding, "nohup.out", large_only=True)
+                or has_cleaned
+            )
+        if web_binding is not None:
+            for name in web_names:
+                has_cleaned = delete_leaf(web_binding, name) or has_cleaned
+        if tmp_binding is not None:
+            for name in tmp_names:
+                has_cleaned = delete_leaf(tmp_binding, name) or has_cleaned
+        for binding in bindings:
+            verify_root(binding)
+    except Exception as exc:
+        perm_logger.error("Legacy-Plot-Bereinigung wurde fail-closed beendet: %s", exc)
+        print(f"{RED}✗{RESET} Sichere Legacy-Plot-Bereinigung fehlgeschlagen: {exc}")
+        return False
+    finally:
+        for binding in reversed(bindings):
+            os.close(binding["root_fd"])
+            os.close(binding["parent_fd"])
+
     if has_cleaned:
         print(f"  {GREEN}✓{RESET} Veraltete Python-Plot-Skripte und HTML-Caches entfernt")
         perm_logger.info("Veraltete Plot-Skripte und Caches entfernt.")
+    return True
 
 def fix_file_permissions(issues):
     """Korrigiert Datei-Rechte basierend auf den FILE_DEFINITIONS."""
@@ -2752,44 +3974,42 @@ def fix_file_permissions(issues):
     for path, file_issues in issues.items():
         if path not in defs_map:
             perm_logger.warning(f"Keine Definition für Pfad gefunden: {path}")
+            success = False
             continue
         definition = defs_map[path]
         expected_owner = definition["owner"]
         expected_group = definition["group"]
         expected_mode = definition["mode"]
         file_name = os.path.basename(path)
-        # Fehlende Dateien anlegen
+        # Produkt- und Webprogrammdateien dürfen niemals als leere Attrappe
+        # erzeugt werden. Ihre Bytes kann nur ein gebundener Release-Updater
+        # wiederherstellen.
         if file_issues.get("missing"):
-            print(f"  → Erstelle fehlende Datei: {path}")
-            # `touch` erstellt eine leere Datei, die danach weiter bearbeitet wird
-            result = run_command(f"sudo touch {path}")
-            if result['success']:
-                print(f"{GREEN}✓{RESET} {file_name}: Datei erstellt")
-            else:
-                success = False
-                perm_logger.error(f"Konnte fehlende Datei nicht erstellen: {path}")
-                continue  # Springe zur nächsten Datei wenn Erstellen fehlschlägt
-        # Setze Besitzer:Gruppe, wenn Problem vorliegt oder Datei neu erstellt wurde
-        if file_issues.get("owner") or file_issues.get("group") or file_issues.get("missing"):
-            print(f"  → Setze Besitzer: {path} -> {expected_owner}:{expected_group}")
-            result = run_command(f"sudo chown {expected_owner}:{expected_group} {path}")
-            if result['success']:
-                print(f"{GREEN}✓{RESET} {file_name}: Besitzer auf {expected_owner}:{expected_group} gesetzt")
-            else:
-                success = False
-                perm_logger.error(f"Besitzer für {file_name} konnte nicht gesetzt werden.")
-        # Setze Modus, wenn Problem vorliegt oder Datei neu erstellt wurde
-        if file_issues.get("mode") or file_issues.get("missing") or file_issues.get("exec"):
-            print(f"  → Setze Rechte: {path} -> {expected_mode}")
-            result = run_command(f"sudo chmod {expected_mode} {path}")
-            if result['success']:
-                print(f"{GREEN}✓{RESET} {file_name}: Rechte auf {expected_mode} gesetzt")
-            else:
-                success = False
-                perm_logger.error(f"Rechte für {file_name} konnten nicht auf {expected_mode} gesetzt werden.")
-        # BOM still entfernen bei Skripten (Shebang-Kompatibilitaet)
-        if file_name.endswith((".py", ".sh")):
-            _strip_utf8_bom(path)
+            print(f"{RED}✗{RESET} {file_name} fehlt; Wiederherstellung aus dem gebundenen Release erforderlich")
+            perm_logger.error("Fehlende Produktdatei wird nicht leer erzeugt: %s", path)
+            success = False
+            continue
+        if file_issues.get("unsafe"):
+            print(f"{RED}✗{RESET} {file_name} besitzt einen unsicheren Pfadtyp")
+            success = False
+            continue
+        try:
+            owner = pwd.getpwnam(expected_owner)
+            group = grp.getgrnam(expected_group)
+            _set_live_regular_file_metadata(
+                path,
+                uid=owner.pw_uid,
+                gid=group.gr_gid,
+                mode=int(str(expected_mode), 8),
+            )
+            print(
+                f"{GREEN}✓{RESET} {file_name}: "
+                f"{expected_owner}:{expected_group} {expected_mode} fd-gebunden gesetzt"
+            )
+        except Exception as exc:
+            success = False
+            perm_logger.error("Sichere Dateirechteprojektion fehlgeschlagen für %s: %s", path, exc)
+            print(f"{RED}✗{RESET} {file_name}: sichere Rechteprojektion fehlgeschlagen")
     return success
 
 def cleanup_legacy_cronjobs():
@@ -3196,10 +4416,8 @@ def check_services():
     ha_mode = "off"
     try:
         v4_path = "/var/www/html/data/e3dc_v4.json"
-        if os.path.exists(v4_path):
-            import json as _json
-            with open(v4_path, "r", encoding="utf-8") as f:
-                v4_data = _json.load(f)
+        if os.path.lexists(v4_path):
+            v4_data = _read_release_config_nofollow(v4_path)
             ha_mode = str(v4_data.get("ha_mode", "off")).strip().lower()
     except Exception: pass
 
@@ -3525,7 +4743,11 @@ def _release_configured_missing_optional_services(config):
 def _read_release_config_nofollow(path="/var/www/html/data/e3dc_v4.json"):
     descriptor, before = _open_regular_file_nofollow(path)
     try:
-        if before.st_size < 2 or before.st_size > 4 * 1024 * 1024:
+        if (
+            before.st_nlink != 1
+            or before.st_size < 2
+            or before.st_size > 4 * 1024 * 1024
+        ):
             raise RuntimeError("Betriebskonfiguration besitzt eine unzulässige Größe")
         chunks = []
         remaining = before.st_size
@@ -3539,8 +4761,21 @@ def _read_release_config_nofollow(path="/var/www/html/data/e3dc_v4.json"):
         after = os.fstat(descriptor)
         if (
             len(payload) != before.st_size
-            or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or after.st_nlink != 1
+            or (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
         ):
             raise RuntimeError("Betriebskonfiguration änderte sich während der Prüfung")
     finally:
@@ -3555,6 +4790,8 @@ LEGACY_532B_COMMIT = "4b19d7136bcd7c5906dcdd2d49903a2fd4645192"
 LEGACY_532B_UPDATE_SOURCE_SHA256 = "e32ab215f8396381ce114b986792fd46eed5a9bf38448659d5f37df0862f49b6"
 LEGACY_532B_HYBRID_POLICY_KEY = "legacy_hybrid_updates"
 LEGACY_532B_SAFE_APT_PACKAGES = (
+    "rsync",
+    "php-cli",
     "php-sqlite3",
     "php-mbstring",
     "libapache2-mod-php",
@@ -3931,6 +5168,8 @@ def run_permissions_wizard(
     headless=False,
     release_quiesced=None,
     bound_privileged_preimages=None,
+    program_files=None,
+    program_directories=None,
 ):
     """Hauptlogik für Rechteprüfung und -korrektur."""
     if release_quiesced is None:
@@ -4051,12 +5290,17 @@ def run_permissions_wizard(
         forecast_evidence_store_ready = True
 
     # Als erstes: Bereinige root-eigene Dateien falls vorhanden
-    cleanup_success = cleanup_root_owned_files()
+    cleanup_success = cleanup_root_owned_files(
+        program_files=program_files,
+        program_directories=program_directories,
+    )
     if not cleanup_success:
-        print("⚠ Warnung: Cleanup von root-Dateien hatte Fehler")
-        log_warning("permissions", "Cleanup von root-Dateien hatte Fehler")
+        print(f"{RED}[!]{RESET} Webrechte-Reparatur wurde sicher abgebrochen.")
+        log_warning("permissions", "Webrechte-Reparatur wurde fail-closed beendet")
+        return False
 
-    cleanup_legacy_plots()
+    if cleanup_legacy_plots() is not True:
+        return False
     
     # Nur lesen: Erst die persistente Notifier-/Watchdog-Transaktion darf
     # Cron-Vorzustände verändern und bei Stromausfall wiederherstellen.
@@ -4064,6 +5308,22 @@ def run_permissions_wizard(
         return False
 
     issues = check_permissions()
+    traversal_issues = tuple(
+        issue
+        for issue in issues
+        if issue == "home" or str(issue).startswith("web_traversal:")
+    )
+    if release_quiesced and traversal_issues:
+        print(
+            f"{RED}[!]{RESET} Installationspfad-Traversierrechte drifteten nach "
+            "der eigenständigen Update-Vorstufe; im Release-Fenster werden sie "
+            "nicht erneut verändert."
+        )
+        perm_logger.error(
+            "Release-Fenster sah abweichende Traversierrechte: %s",
+            ", ".join(str(item) for item in traversal_issues),
+        )
+        return False
     wp_issues = check_webportal_permissions(include_service_checks=not release_quiesced)
     ramdisk_issue_keys = {
         "ramdisk_missing",
@@ -4093,7 +5353,10 @@ def run_permissions_wizard(
     legacy_issues = [] if release_quiesced else check_legacy_autostart()
     watchdog_installed = os.path.exists(PI_GUARD_PATH) or os.path.exists(PIGUARD_SERVICE)
     watchdog_refreshed = True if release_quiesced else refresh_watchdog_guard_script()
-    web_program_hardened = harden_web_program_permissions()
+    web_program_hardened = harden_web_program_permissions(
+        program_files=program_files,
+        program_directories=program_directories,
+    )
 
     has_issues = bool(issues) or bool(wp_issues) or bool(file_issues) or bool(sudo_issues) or bool(service_issues) or bool(legacy_issues) or not watchdog_refreshed or not web_program_hardened or not apache_runtime_protected or not ml_store_ready or not forecast_evidence_store_ready
     if not has_issues:
@@ -4141,7 +5404,10 @@ def run_permissions_wizard(
     if legacy_issues:
         success = fix_legacy_autostart(legacy_issues)
         all_success = all_success and success
-    all_success = harden_web_program_permissions() and all_success
+    all_success = harden_web_program_permissions(
+        program_files=program_files,
+        program_directories=program_directories,
+    ) and all_success
 
     if all_success:
         print(f"\n{GREEN}✓{RESET} Alle Probleme korrigiert.\n")

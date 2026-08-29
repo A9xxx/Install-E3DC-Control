@@ -136,6 +136,25 @@ ECONOMIC_HOLD_ALLOWED_BLOCKERS = frozenset({
 ECONOMIC_HOLD_DERIVATIVE_BLOCKERS = frozenset({
     "CANONICAL_DIRECT_MARKETING_SLOT_NOT_SELECTED",
 })
+READY_NO_ACTION_INPUT_BLOCKERS = frozenset({
+    "FORECAST_INPUT_BINDING_INVALID",
+    "RESERVE_INPUT_BINDING_INVALID",
+    "INPUT_BINDING_INCOMPLETE",
+})
+READY_NO_ACTION_SUPPRESSIBLE_BLOCKERS = frozenset({
+    "SHADOW_INPUT_BINDING_INVALID",
+    "FORECAST_SCENARIO_OR_RESERVE_CONTRACT_INCOMPLETE",
+    "CURRENT_FORECAST_SCENARIO_INCOMPLETE",
+    "CANONICAL_CANDIDATE_INVALID",
+    "DIRECT_MARKETING_ACTION_NOT_EXECUTION_READY",
+    "CANONICAL_DIRECT_MARKETING_SLOT_NOT_SELECTED",
+    "CANONICAL_GRID_CHARGE_SELECTION_CONTRACT_UNAVAILABLE",
+    "CANONICAL_HEADROOM_EXPORT_NOT_RELEASED",
+})
+READY_NO_ACTION_ALLOWED_BLOCKERS = frozenset({
+    "PHASE5_MODE_SHADOW",
+    *READY_NO_ACTION_SUPPRESSIBLE_BLOCKERS,
+})
 
 def _float(value: Any, default: Optional[float] = None) -> Optional[float]:
     try:
@@ -2429,6 +2448,381 @@ def _shadow_execution_readiness_current_contract(
     }
 
 
+def _ready_no_action_house_supply_contract(
+    plan: Dict[str, Any],
+    shadow_slot: Dict[str, Any],
+    resolved: Dict[str, Any],
+    candidate: Dict[str, Any],
+    input_binding: Dict[str, Any],
+    readiness: Dict[str, Any],
+    live_contract: Dict[str, Any],
+    settings_contract: Dict[str, Any],
+    blockers: Iterable[str],
+    now_ms: int,
+) -> Dict[str, Any]:
+    """Bindet einen wirkungslosen HOUSE_SUPPLY-Zyklus fail-closed.
+
+    Fehlende Prognosequantile dürfen eine reale Speicheraktion nie freigeben.
+    Wenn derselbe Plan aber ausdrücklich keinerlei DV-Aktionsrolle enthält,
+    darf Phase 5 den bereits bestehenden Legacy-AUTO-Entscheid beibehalten.
+    Der Vertrag autorisiert weder POWER_SETTINGS noch einen RSCP-Sollwert.
+    """
+
+    def finite_zero(value: Any) -> bool:
+        return bool(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            and abs(float(value)) <= 0.000001
+        )
+
+    slot = (
+        resolved.get("plan_slot")
+        if isinstance(resolved.get("plan_slot"), dict)
+        else {}
+    )
+    projection = (
+        slot.get("projection")
+        if isinstance(slot.get("projection"), dict)
+        else {}
+    )
+    roles = (
+        projection.get("direct_marketing_action_roles")
+        if isinstance(
+            projection.get("direct_marketing_action_roles"), dict
+        )
+        else {}
+    )
+    direct = (
+        plan.get("direct_marketing")
+        if isinstance(plan.get("direct_marketing"), dict)
+        else {}
+    )
+    flags = (
+        direct.get("flags")
+        if isinstance(direct.get("flags"), dict)
+        else {}
+    )
+    policy = (
+        direct.get("policy_decision")
+        if isinstance(direct.get("policy_decision"), dict)
+        else {}
+    )
+    timeline = (
+        direct.get("policy_timeline")
+        if isinstance(direct.get("policy_timeline"), list)
+        else []
+    )
+    budget = (
+        policy.get("storage_budget")
+        if isinstance(policy.get("storage_budget"), dict)
+        else {}
+    )
+    lineage = (
+        policy.get("export_window_gate_lineage")
+        if isinstance(policy.get("export_window_gate_lineage"), dict)
+        else {}
+    )
+    passive_binding = (
+        projection.get("direct_marketing_passive_normal_binding_v1")
+        if isinstance(
+            projection.get("direct_marketing_passive_normal_binding_v1"),
+            dict,
+        )
+        else {}
+    )
+    input_blockers = {
+        str(code) for code in input_binding.get("blockers") or [] if str(code)
+    }
+    input_components = (
+        input_binding.get("components")
+        if isinstance(input_binding.get("components"), dict)
+        else {}
+    )
+    price_input = (
+        input_components.get("price")
+        if isinstance(input_components.get("price"), dict)
+        else {}
+    )
+    terminal_input = (
+        input_components.get("terminal")
+        if isinstance(input_components.get("terminal"), dict)
+        else {}
+    )
+    current_blockers = [str(code) for code in blockers if str(code)]
+    unexpected_blockers = [
+        code for code in current_blockers
+        if code not in READY_NO_ACTION_ALLOWED_BLOCKERS
+    ]
+    slot_start_ms = _int(slot.get("start_ts_ms"), 0)
+    slot_end_ms = _int(slot.get("end_ts_ms"), 0)
+    generated_at_ms = _int(plan.get("generated_at_ts_ms"), 0)
+    direct_created_ms = _int(direct.get("created_ts"), 0)
+    direct_valid_until_ms = _int(direct.get("valid_until_ts"), 0)
+    overlapping_policies = [
+        item
+        for item in timeline
+        if isinstance(item, dict)
+        and _int(item.get("start_ts"), 0) < slot_end_ms
+        and _int(item.get("end_ts"), 0) > slot_start_ms
+    ]
+    mode = _normalized_direct_marketing_mode(direct.get("mode"))
+    policy_lineage_valid = direct_marketing_export_gate_contract_valid(
+        policy,
+        policy.get("economics"),
+        allowed_lineage_statuses={"SUSPENDED"},
+        current_window_id=policy.get("window_id"),
+    )
+    input_identity_valid = bool(
+        input_binding.get("applicable") is True
+        and input_binding.get("schema_version")
+        == SHADOW_INPUT_BINDING_SCHEMA
+        and not (
+            input_blockers - READY_NO_ACTION_INPUT_BLOCKERS
+        )
+        and (
+            input_binding.get("valid") is True
+            or bool(input_blockers)
+        )
+        and price_input.get("complete") is True
+        and terminal_input.get("complete") is True
+    )
+    roles_neutral = bool(
+        roles.get("schema_version")
+        == DIRECT_MARKETING_ACTION_ROLES_SCHEMA
+        and roles.get("status") == "CONSISTENT"
+        and roles.get("candidate_action") is None
+        and roles.get("candidate_only") is False
+        and roles.get("plan_selected_action") is None
+        and roles.get("plan_executable_action") is None
+        and roles.get("effective_action") is None
+        and roles.get("runtime_effect_claim_allowed") is False
+    )
+    projection_neutral = bool(
+        (
+            str(slot.get("planned_action") or "").upper()
+            == "HOUSE_SUPPLY"
+            and str(projection.get("market_action") or "").upper()
+            == "HOUSE_SUPPLY"
+            or passive_binding
+            and str(slot.get("planned_action") or "").upper()
+            in {"HOLD", "HOUSE_SUPPLY"}
+            and str(projection.get("market_action") or "").upper()
+            in {"HOLD", "HOUSE_SUPPLY"}
+        )
+        and projection.get("direct_marketing_candidate") is False
+        and projection.get("direct_marketing_selected") is False
+        and projection.get("direct_marketing_plan_executable") is False
+        and projection.get("direct_marketing_plan_commands_allowed") is False
+        and projection.get("direct_marketing_action") is None
+        and projection.get("direct_marketing_plan_action") is None
+        and projection.get("direct_marketing_effective_action") is None
+        and finite_zero(projection.get("direct_marketing_candidate_w"))
+        and finite_zero(projection.get("direct_marketing_planned_w"))
+        and finite_zero(projection.get("direct_marketing_charge_w"))
+        and finite_zero(projection.get("direct_marketing_export_w"))
+    )
+    shadow_comparison_no_effect = bool(
+        shadow_slot.get("shadow_only") is True
+        and shadow_slot.get("executable") is False
+        and shadow_slot.get("commands_allowed") is False
+        and shadow_slot.get("requested") is False
+        and shadow_slot.get("acknowledged") is False
+        and shadow_slot.get("readback_confirmed") is False
+        and str(shadow_slot.get("block_reason_code") or "")
+        in {
+            "NO_STORAGE_ACTION_CANDIDATE",
+            "SHADOW_ONLY_NOT_RUNTIME_AUTHORIZED",
+        }
+        and (
+            shadow_slot.get("selected") is False
+            and shadow_slot.get("candidate") is False
+            or shadow_slot.get("selected") is True
+            and shadow_slot.get("candidate") is True
+            and shadow_slot.get("selection_scope")
+            == "SHADOW_COMPARISON_ONLY"
+        )
+    )
+    readiness_valid = bool(
+        readiness.get("valid") is True
+        and readiness.get("status") == "READY_NO_ACTION"
+        and readiness.get("execution_ready") is True
+        and readiness.get("execution_class") == "NO_ACTION"
+        and not readiness.get("blockers")
+        and not readiness.get("readiness_blockers")
+        and readiness.get("candidate_action") is None
+        and readiness.get("plan_selected_action") is None
+        and readiness.get("plan_executable_action") is None
+    )
+    candidate_comparison_only = bool(
+        candidate.get("valid") is True
+        and str(candidate.get("action") or "").upper()
+        == str(shadow_slot.get("planned_action") or "").upper()
+        and abs(
+            (_float(candidate.get("battery_w"), 0.0) or 0.0)
+            - (_float(shadow_slot.get("battery_w"), 0.0) or 0.0)
+        )
+        <= 0.001
+        and abs(
+            (_float(candidate.get("power_w"), 0.0) or 0.0)
+            - (_float(shadow_slot.get("selected_power_w"), 0.0) or 0.0)
+        )
+        <= 0.001
+        and shadow_comparison_no_effect
+    )
+    suspended_owner_valid = bool(
+        direct.get("active") is True
+        and direct.get("shadow") is True
+        and mode == "eco_plus"
+        and direct.get("controller_owner") == "storage_manager"
+        and direct.get("plan_owner") == "direct_marketing:eco_plus"
+        and type(direct.get("owner_contract_version")) is int
+        and direct.get("owner_contract_version") == 1
+        and type(flags.get("owner_contract_version")) is int
+        and flags.get("owner_contract_version") == 1
+        and flags.get("commands_allowed") is False
+        and generated_at_ms > 0
+        and direct_created_ms > 0
+        and abs(direct_created_ms - generated_at_ms) <= 60_000
+        and direct_created_ms < direct_valid_until_ms
+        and direct_valid_until_ms >= slot_end_ms
+        and direct_created_ms <= int(now_ms) < direct_valid_until_ms
+    )
+    passive_owner_valid = bool(
+        direct.get("active") is True
+        and direct.get("shadow") is False
+        and mode == "eco_plus"
+        and direct.get("controller_owner") == "storage_manager"
+        and direct.get("plan_owner") == "direct_marketing:eco_plus"
+        and type(direct.get("owner_contract_version")) is int
+        and direct.get("owner_contract_version") == 1
+        and flags.get("commands_allowed") is True
+        and generated_at_ms > 0
+        and direct_created_ms > 0
+        and abs(direct_created_ms - generated_at_ms) <= 60_000
+        and direct_created_ms < direct_valid_until_ms
+        and direct_valid_until_ms >= slot_end_ms
+        and direct_created_ms <= int(now_ms) < direct_valid_until_ms
+    )
+    suspended_policy_valid = bool(
+        policy.get("schema") == "direct_marketing_policy_v1"
+        and str(policy.get("dv_target_state") or "").upper() == "HOLD"
+        and policy.get("commands_allowed") is False
+        and policy.get("blocked") is True
+        and policy.get("executable_action") is None
+        and policy.get("execution_window") is None
+        and _int(policy.get("execution_window_match_count"), -1) == 0
+        and policy.get("continuation_active") is False
+        and str(policy.get("source_action") or "")
+        == "eco_plus_export_candidate"
+        and str(policy.get("block_reason") or "")
+        == "suspended:SUSPENDED_INPUT_OR_FORECAST_EVIDENCE_INCOMPLETE"
+        and abs(_float(budget.get("charge_budget_w"), -1.0) or 0.0)
+        <= 0.000001
+        and abs(_float(budget.get("export_budget_w"), -1.0) or 0.0)
+        <= 0.000001
+        and _int(policy.get("start_ts"), 0)
+        <= slot_start_ms
+        < slot_end_ms
+        <= _int(policy.get("end_ts"), 0)
+        and sum(1 for item in timeline if item == policy) == 1
+        and len(overlapping_policies) == 1
+        and overlapping_policies[0] == policy
+        and lineage.get("schema") == "export_window_gate_lineage_v1"
+        and lineage.get("status") == "SUSPENDED"
+        and lineage.get("effect_contract")
+        == "STATUS_ONLY_NO_EXECUTION_AUTHORITY"
+        and lineage.get("transition_reason_codes")
+        == ["SUSPENDED_INPUT_OR_FORECAST_EVIDENCE_INCOMPLETE"]
+        and policy_lineage_valid
+    )
+    passive_policy_valid = bool(
+        passive_binding.get("schema")
+        == "direct_marketing_passive_normal_binding_v1"
+        and passive_binding.get("policy_action_id")
+        == policy.get("policy_action_id")
+        and passive_binding.get("policy_slot_id")
+        == policy.get("policy_slot_id")
+        and policy.get("passive_normal_binding") == passive_binding
+        and policy.get("schema") == "direct_marketing_policy_v1"
+        and str(policy.get("dv_target_state") or "").upper() == "NORMAL"
+        and policy.get("commands_allowed") is False
+        and policy.get("blocked") is False
+        and policy.get("executable_action") is None
+        and policy.get("execution_window") is None
+        and _int(policy.get("execution_window_match_count"), -1) == 0
+        and str(policy.get("source_action") or "")
+        == "eco_plus_house_supply"
+        and abs(_float(budget.get("charge_budget_w"), -1.0) or 0.0)
+        <= 0.000001
+        and abs(_float(budget.get("export_budget_w"), -1.0) or 0.0)
+        <= 0.000001
+        and _int(policy.get("start_ts"), 0)
+        <= slot_start_ms
+        < slot_end_ms
+        <= _int(policy.get("end_ts"), 0)
+        and len(overlapping_policies) == 1
+        and overlapping_policies[0] == policy
+    )
+    owner_valid = bool(suspended_owner_valid or passive_owner_valid)
+    policy_valid = bool(suspended_policy_valid or passive_policy_valid)
+    owner_policy_pair_valid = bool(
+        suspended_owner_valid and suspended_policy_valid
+        or passive_owner_valid and passive_policy_valid
+    )
+    valid = bool(
+        resolved.get("valid") is True
+        and slot_start_ms > 0
+        and slot_end_ms - slot_start_ms == SLOT_DURATION_MS
+        and not unexpected_blockers
+        and input_identity_valid
+        and roles_neutral
+        and projection_neutral
+        and shadow_comparison_no_effect
+        and readiness_valid
+        and candidate_comparison_only
+        and owner_policy_pair_valid
+        and live_contract.get("valid") is True
+        and settings_contract.get("valid") is True
+    )
+    return {
+        "schema": "phase5_ready_no_action_house_supply_v1",
+        "valid": valid,
+        "effect": "LEGACY_AUTO_UNCHANGED",
+        "commands_allowed": False,
+        "selected_action": "HOUSE_SUPPLY" if valid else None,
+        "plan_id": resolved.get("plan_id"),
+        "slot_id": resolved.get("slot_id"),
+        "input_binding_diagnostic_blockers": sorted(input_blockers),
+        "suppressed_blockers": (
+            [
+                code for code in current_blockers
+                if code in READY_NO_ACTION_SUPPRESSIBLE_BLOCKERS
+            ]
+            if valid
+            else []
+        ),
+        "unexpected_blockers": unexpected_blockers,
+        "checks": {
+            "input_identity_valid": input_identity_valid,
+            "roles_neutral": roles_neutral,
+            "projection_neutral": projection_neutral,
+            "shadow_comparison_no_effect": shadow_comparison_no_effect,
+            "readiness_valid": readiness_valid,
+            "candidate_comparison_only": candidate_comparison_only,
+            "owner_valid": owner_valid,
+            "policy_valid": policy_valid,
+            "owner_policy_pair_valid": owner_policy_pair_valid,
+            "current_policy_unique": bool(
+                len(overlapping_policies) == 1
+                and overlapping_policies[0] == policy
+            ),
+            "live_valid": live_contract.get("valid") is True,
+            "power_settings_valid": settings_contract.get("valid") is True,
+        },
+    }
+
+
 def _restrictive_active_policy_hold_contract(
     plan: Dict[str, Any],
     candidate: Dict[str, Any],
@@ -2972,6 +3366,24 @@ def phase5_arbitration_contract(
         suppressed = set(pv_store_diagnostic_release.get("suppressed_blockers") or [])
         blockers = [code for code in blockers if code not in suppressed]
 
+    ready_no_action_release = _ready_no_action_house_supply_contract(
+        plan,
+        shadow_slot,
+        resolved,
+        candidate,
+        input_binding,
+        readiness_validation,
+        live_contract,
+        settings_contract,
+        blockers,
+        now_value,
+    )
+    if ready_no_action_release.get("valid") is True:
+        suppressed = set(
+            ready_no_action_release.get("suppressed_blockers") or []
+        )
+        blockers = [code for code in blockers if code not in suppressed]
+
     if not applicable:
         # Eine abgeschaltete DV-Capability ist kein Preis-/Forecast-/Runtimefehler.
         # Die typisierte Aktivierungssperre bleibt sichtbar, alle technischen
@@ -3020,8 +3432,18 @@ def phase5_arbitration_contract(
     decision_only_hold = bool(
         decision_only_economic_hold or decision_only_restrictive_hold
     )
-    selected_action = "HOLD" if decision_only_hold else candidate.get("action") or "HOLD"
-    selected_power_w = 0.0 if decision_only_hold else float(candidate.get("power_w") or 0.0)
+    selected_action = (
+        "HOUSE_SUPPLY"
+        if ready_no_action_release.get("valid") is True
+        else "HOLD"
+        if decision_only_hold
+        else candidate.get("action") or "HOLD"
+    )
+    selected_power_w = (
+        0.0
+        if ready_no_action_release.get("valid") is True or decision_only_hold
+        else float(candidate.get("power_w") or 0.0)
+    )
     selected_since_ts = now_value / 1000.0
     stability = {"active": False, "reason_code": None, "previous_direction": None}
     previous = previous_state if isinstance(previous_state, dict) else {}
@@ -3167,7 +3589,14 @@ def phase5_arbitration_contract(
         and selected_action != "HOLD"
         and selected_action_contract.get("phase5_command") is True
     )
-    decision_available = bool(applicable and resolved.get("valid") and candidate.get("valid"))
+    decision_available = bool(
+        applicable
+        and resolved.get("valid")
+        and (
+            candidate.get("valid")
+            or ready_no_action_release.get("valid") is True
+        )
+    )
     shadow_would_select = bool(applicable and not technical_blockers)
     return {
         "schema_version": PHASE5_SCHEMA,
@@ -3190,13 +3619,17 @@ def phase5_arbitration_contract(
         "economic_export_diagnostic_release": (
             economic_export_diagnostic_release
         ),
+        "ready_no_action_release": ready_no_action_release,
         "candidate_action": candidate.get("action"),
         "candidate_power_w": candidate.get("power_w"),
         "selected": field_selected,
         "executable": field_executable,
         "commands_allowed": field_executable,
         "selection_class": (
-            "decision_only_hold"
+            "ready_no_action"
+            if field_selected
+            and ready_no_action_release.get("valid") is True
+            else "decision_only_hold"
             if field_selected and selected_action == "HOLD"
             else "passive_auto_effect"
             if field_selected and not field_executable
@@ -3224,7 +3657,10 @@ def phase5_arbitration_contract(
             ),
         },
         "selected_source": (
-            "canonical_phase5_decision_only_hold"
+            "canonical_phase5_ready_no_action"
+            if field_selected
+            and ready_no_action_release.get("valid") is True
+            else "canonical_phase5_decision_only_hold"
             if field_selected and selected_action == "HOLD"
             else "canonical_phase5"
             if field_selected

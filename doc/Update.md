@@ -5,7 +5,7 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.4.4e`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.4.4f`. Das Dashboard startet ausschließlich
 den argumentlosen, root-eigenen Systemjob. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
@@ -38,6 +38,15 @@ unabhängig vom SSH-Fenster weiter:
 systemctl status --no-pager e3dc-web-update.service
 journalctl -fu e3dc-web-update.service
 ```
+
+Direkter Ziel-Updater, Weboberfläche, Konsole und Installer-Menü teilen den
+Lock `/run/lock/e3dc-control/update.lock`. Sichere root-eigene Altbestände mit
+Verzeichnismodus `0755` und Dateimodus `0644` werden vor jeder Produkt- oder
+Dienständerung auf `0700`/`0600` normalisiert. Unsichere Verzeichnisse,
+Symlinks, Mehrfachlinks oder fremd beschreibbare Knoten stoppen kontrolliert
+vor der Mutation. Ist der Lock belegt, wartet E3DC-Control nicht in einer
+Neustartschleife, sondern fordert dazu auf, den laufenden Update- oder
+Backupauftrag zuerst abzuschließen.
 
 ### Rettungsweg für heterogene Altinstallationen
 
@@ -141,6 +150,76 @@ dem Root-Lock aus demselben gültigen Nicht-Root-Eigentümer von Repository und
 `.git`, lokales Benutzerkonto und Nutzerwert unmittelbar vor dem ersten
 Import aus dem Zielcode erneut geprüft. Die fail-closed Grenzen und alle
 übrigen Härtungen aus 5.4.3j bleiben unverändert.
+
+### 5.4.4f: PV-Kurvenstart, Backup-Grenze und klare Rechteprojektion
+
+5.4.4f berücksichtigt im Modus `PV-Kurve ruhig` belegten physischen
+PV-Überschuss bereits vor der sanften Anfahrrampe. Die Freigabe bleibt durch
+Speicherbudget, physischen Überschuss, gemeinsames Wallboxbudget sowie
+Hausanschluss-, Fahrzeug- und Hardwaregrenzen gedeckelt; Netzladen oder eine
+zusätzliche Batterieentladung werden dadurch nicht freigegeben.
+
+Die Weboberfläche leitet eine zweite Wallbox nicht mehr aus der Gerätefamilie
+`Multi` oder einem veralteten Typ-Fallback ab. Dafür sind eine positive
+Konfiguration oder frische Detaildaten mit Ladepunkt 2 nötig; ein ausdrücklich
+konfiguriertes WB2-`Aus` gewinnt vor alten Detail-, Slot-, Typ- und
+Prioritätswerten.
+Fehlende, zu kurze, ungültige oder planfremde SoC-Prognosen werden benannt;
+eine ersetzende Direktvermarktungsaktion erscheint als geplant, angefordert
+oder bestätigt wirksam. Die bestätigte Wirkung verlangt einen kanonischen,
+konsistenten Effektvertrag mit exakt derselben aktuellen Planrevision und
+passendem Effektstatus; andernfalls bleibt sie unbelegt.
+
+Nach der Releaseprojektion stellt der Ziel-Updater für eine beibehaltene
+`external_pv_topology.json` den Installationsnutzer, die Webgruppe und den
+gemeinsamen Lesemodus `0664` wieder her. Die übrigen Konfigurations- und
+Geheimnisdateien behalten ihre strengeren Rechteverträge.
+
+Auch Matter-Resettransaktionen bleiben von der Releaseprojektion getrennt:
+Die festen Prepare-, Quarantäne- und Receipt-Namen sowie jeder Knoten unter dem
+reservierten Präfix `.matter-storage-reset-stage-*` werden weder ersetzt noch
+bereinigt oder durch die allgemeine Rechteprojektion verändert.
+
+Der root-eigene private Downloadbereich bleibt während Download und Vorbereitung mit
+`0700`/`0600` privat. Beim Cutover übernimmt der Ziel-Updater diese Quellmodi
+nicht mehr in den betriebenen Produktbaum, sondern setzt dort einen expliziten
+Live-Vertrag: Verzeichnisse `0755`, normale Produktdateien `0644` und echte
+Startskripte mit Interpreterzeile `0755`, jeweils als Installationsnutzer und
+Webgruppe. Danach
+werden die spezielleren Metadatenverträge für Konfigurationen, Zugangsdaten und
+Laufzeitdaten erneut angewendet.
+
+Vor dem Dienststart müssen die PHP-Pfadauflösung und die Installer-Importkette
+in einer bereinigten Umgebung als `www-data` exakt den gebundenen
+Installationspfad lesen können. Die Webprobe verwendet auf Bare Metal wie die
+Installationszentrale `/usr/bin/python3`; die private Service-Pythonumgebung
+bleibt dem Installationsnutzer vorbehalten. Ein Fehler beendet den Cutover
+nicht grün, sondern aktiviert den bestehenden Rücklauf aus Vollbackup und
+ruhender Daten-Nachsicherung.
+
+Liegt die Installation direkt oder verschachtelt unter einem privaten
+Home-Pfad, prüft der direkte Bootstrap-Ziel-Updater bereits vor Vollbackup,
+Dienststopp und Produktmutation, ob `www-data` alle echten Pfadvorfahren eng
+traversieren kann. Owner-private, nicht-setgid Vorfahren bindet er erst nach
+der Produktprojektion an die Webgruppe und ergänzt nur deren Traversierrecht;
+bei einem Rückfall stellt er diese Metadaten wieder her. Der veröffentlichte
+Legacy-Fullpfad führt dieselbe sichere Korrektur als eigenständige Vorstufe aus.
+Eine bereits vorhandene gezielte POSIX-ACL für `www-data` wird in beiden Wegen
+ohne Mutation akzeptiert. Gemeinsam genutzte oder setgid Vorfahren werden ohne
+diese ACL vor der Produktmutation mit einer konkreten Anleitung gesperrt;
+globales `Other-Execute`, Auflisten, Lesen und Schreiben werden nicht
+freigegeben. Installationen außerhalb des Homes, insbesondere unter `/opt`,
+ändern dafür keine Home-Rechte.
+
+Der Zielbestand beträgt maximal drei automatisch verwaltete
+System-Backup-Familien und separat maximal drei Web-Installer-Sicherungen. Die ruhende
+Daten-Nachsicherung gehört zu ihrem Vollbackup. Das neue und ein aktuell für
+den Rückfall gebundenes Backup zählen innerhalb der drei Plätze; nach
+bestätigtem Update wird das nur noch für den Rücklauf benötigte Overlay sicher
+entfernt. Mehrere geschützte Backups führen nicht zum Abbruch oder zu einer
+erzwungenen Löschung und dürfen die Zielgrenzen vorübergehend überschreiten:
+Ungeschützte Altbestände werden soweit sicher möglich entfernt, eine offene
+Zielgrenze wird gemeldet und später erneut angewendet.
 
 ### 5.4.4e: RAM-Disk und verlässlicher Rücklauf
 

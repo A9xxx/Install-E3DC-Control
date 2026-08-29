@@ -388,22 +388,57 @@ def _reservation_output_bound(reservation):
     """Erkennt jede Reservation mit möglicher oder bestätigter Ausgangskante."""
 
     item = reservation if isinstance(reservation, dict) else {}
+    proof = item.get("preoutput_supersession_evidence")
+    proof = proof if isinstance(proof, dict) else {}
+    reservation_id = str(
+        item.get("transition_id") or item.get("reservation_id") or ""
+    )
+    expired_preoutput_without_output = bool(
+        str(item.get("stage") or "") == "recovery_hold"
+        and str(item.get("grant_state") or "") == "expired"
+        and str(item.get("blocker") or "")
+        in ("lease_expired", "lease_elapsed_output_bound")
+        and max(0, _int(item.get("committed_w"), 0)) == 0
+        and _float(item.get("committed_ts"), 0.0) <= 0.0
+        and max(0, _int(item.get("valid_frames"), 0)) == 0
+        and proof.get("schema_version")
+        == "wallbox_phase_preoutput_supersession_v1"
+        and proof.get("eligible") is True
+        and reservation_id
+        and str(proof.get("reservation_id") or "") == reservation_id
+        and _int(proof.get("target_phases"), 0)
+        == _int(item.get("target_phases"), 0)
+        and not any(
+            proof.get(key) is True
+            for key in (
+                "sequence_bound",
+                "output_intent_bound",
+                "output_ack_bound",
+                "recovery_hold_bound",
+                "restart_authorized_bound",
+                "wakeup_active",
+            )
+        )
+    )
     return bool(
         _int(item.get("committed_w"), 0) > 0
         or _float(item.get("committed_ts"), 0.0) > 0.0
-        or str(item.get("stage") or "")
-        in (
-            "request_output",
-            "phase_switch",
-            "ramp_to_zero",
-            "zero_settle",
-            "set_phase",
-            "cp_interrupt",
-            "restart_delay",
-            "cooldown",
-            "confirming",
-            "confirm_target",
-            "recovery_hold",
+        or (
+            not expired_preoutput_without_output
+            and str(item.get("stage") or "")
+            in (
+                "request_output",
+                "phase_switch",
+                "ramp_to_zero",
+                "zero_settle",
+                "set_phase",
+                "cp_interrupt",
+                "restart_delay",
+                "cooldown",
+                "confirming",
+                "confirm_target",
+                "recovery_hold",
+            )
         )
     )
 
@@ -648,7 +683,7 @@ def update_reservation(
         else:
             reservation.update({
                 "active": False,
-                "stage": "recovery_hold",
+                "stage": "expired",
                 "grant_state": "expired",
                 "blocker": "lease_expired",
             })

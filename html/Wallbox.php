@@ -433,9 +433,12 @@ function readJsonArrayWallbox($path, $default = []) {
     return is_array($data) ? $data : $default;
 }
 
-function wallboxCurrentPlanSlot($wbId, $nowTs = null) {
+function wallboxCurrentPlanSlot($wbId, $nowTs = null, $config = null) {
     $wbId = max(1, min(2, (int)$wbId));
     $nowTs = $nowTs ?? time();
+    if ($wbId === 2 && isWallbox2ExplicitlyDisabledConfig($config)) {
+        return ['active' => false, 'wb' => $wbId];
+    }
     $files = [
         "/var/www/html/ramdisk/native_wallbox_schedule_wb{$wbId}.json",
         '/var/www/html/ramdisk/native_wallbox_schedule.json',
@@ -2367,8 +2370,8 @@ $wallbox_out_file = $base_path . 'e3dc.wallbox.out';
 $nativePlanHashFile = '/var/www/html/ramdisk/native_wallbox_schedule.json';
 $currentPlanHash = file_exists($nativePlanHashFile) ? md5_file($nativePlanHashFile) : ((file_exists($wallbox_out_file)) ? md5_file($wallbox_out_file) : '');
 $activePlanSlotsBeforePost = [
-    1 => wallboxCurrentPlanSlot(1),
-    2 => wallboxCurrentPlanSlot(2),
+    1 => wallboxCurrentPlanSlot(1, null, $wallboxConfig),
+    2 => wallboxCurrentPlanSlot(2, null, $wallboxConfig),
 ];
 
 // Ladeleistungen für die Kostenvorschau aus der Konfiguration laden
@@ -2530,6 +2533,9 @@ if (file_exists('/var/www/html/ramdisk/native_wallbox_schedule.json') && is_read
 
             $modeStr = $entry['mode'] ?? 'auto';
             $entryWbId = (int)($entry['wb_id'] ?? 1);
+            if ($entryWbId === 2 && isWallbox2ExplicitlyDisabledConfig($wallboxConfig)) {
+                continue;
+            }
             if ($entryWbId === 2) {
                 $modeStr = 'wb2-' . $modeStr;
             }

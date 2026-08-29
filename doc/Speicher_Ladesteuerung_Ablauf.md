@@ -1,6 +1,22 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.4e
+> **Stand:** v5.4.4f
+>
+> **Neu in 5.4.4f:** Im Modus `PV-Kurve ruhig` wird belegter physischer
+> PV-Überschuss bereits vor der sanften Anfahrrampe berücksichtigt. Speicher-,
+> Wallbox-, Hausanschluss-, Fahrzeug- und Hardwaregrenzen bleiben wirksam; es
+> entsteht weder eine Netzladefreigabe noch eine zusätzliche
+> Batterieentladefreigabe. Die Weboberfläche unterscheidet fehlende,
+> unvollständige oder planfremde SoC-Prognosen und zeigt eine ersetzende
+> Direktvermarktungsaktion als geplant, angefordert oder bestätigt wirksam.
+> Der separat belegte batterieneutrale PV-Anteil wird dabei nicht erneut durch
+> einen bereits von der Speicheraufnahme beeinflussten Netzpunktwert
+> verkleinert. Eine zentral freigegebene einphasige Ladung fällt dadurch nicht
+> allein wegen dieses zusätzlichen Filters wieder unter ihre Mindestleistung.
+> Wird ein einzelner unplausibler Messwertsatz aus Sicherheitsgründen
+> verworfen, kann das Wallboxbudget kurz `0 kW` anzeigen. Das ist nicht
+> automatisch ein Ladeabbruch; mit dem nächsten gültigen Messwertsatz wird neu
+> geregelt. Wiederholte Nullwerte bleiben ein Diagnosehinweis.
 >
 > **Hinweis zu 5.4.4e:** Dieses Release korrigiert ausschließlich den
 > Webupdate- und Rücklaufpfad für die produktive RAM-Disk. Speicherentscheidung,

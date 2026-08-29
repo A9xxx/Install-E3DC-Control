@@ -12,7 +12,9 @@ if ($install_path === '' || !is_dir($install_path . '/Installer')) {
     exit;
 }
 $installer_path = $install_path . '/Installer';
-$python = file_exists('/opt/venv/bin/python3') ? '/opt/venv/bin/python3' : '/usr/bin/python3';
+$python = e3dcIsDockerEnvironment() && file_exists('/opt/venv/bin/python3')
+    ? '/opt/venv/bin/python3'
+    : '/usr/bin/python3';
 $web_installer = $installer_path . '/web_installer.py';
 $installer_wrapper = $installer_path . '/installer_wrapper.sh';
 
@@ -263,7 +265,7 @@ function installCenterModuleConfigFields($moduleKey) {
             ], 'Modus und Strom laufen über WB_REQ_SET_EXTERN. Ein explizites Aus bleibt erhalten.'),
             installCenterConfigField('wb_native_ip', 'Wallbox 1 IP-Adresse', 'text', [], '', false, 'leer bei E3DC RSCP'),
             installCenterConfigField('wb1_topic_prefix', 'openWB Topic Prefix WB1', 'text', [], '', false, 'openWB/simpleAPI/chargepoint'),
-            installCenterConfigField('wb_native_type2', 'Wallbox 2 Modell / API', 'select', array_merge([['value' => '', 'label' => 'Deaktiviert']], array_slice($wbTypes, 1))),
+            installCenterConfigField('wb_native_type2', 'Wallbox 2 Modell / API', 'select', $wbTypes, 'Ein fehlender oder leerer Altbestandswert bleibt unverändert und darf nur nach frischer, eindeutiger openWB-Erkennung als WB2 gelten. Erst „Deaktiviert“ schaltet WB2 ausdrücklich aus.'),
             installCenterConfigField('wb2_e3dc_wbchar6_compat_enable', 'WB2 E3/DC WBchar6-Regelbackend', 'select', [
                 ['value' => '1', 'label' => 'Empfohlen: efy/Easy Community-Kompatibilitätsregelung'],
                 ['value' => '0', 'label' => 'Nur Status (keine E3/DC-Regelbefehle)'],
@@ -584,10 +586,34 @@ function installCenterBuildModuleConfigPayload($moduleKey) {
     $config = $loaded['config'] ?? [];
     foreach ($fields as &$field) {
         $key = strtolower($field['key']);
+        $legacyWb2Missing = (
+            $key === 'wb_native_type2'
+            && !array_key_exists('wb_native_type2', $config)
+        );
+        $legacyWb2Blank = (
+            $key === 'wb_native_type2'
+            && array_key_exists('wb_native_type2', $config)
+            && trim((string)$config['wb_native_type2']) === ''
+        );
         $hasValue = array_key_exists($key, $config) && (string)$config[$key] !== '';
         $field['has_value'] = $hasValue;
         $field['value'] = !empty($field['secret']) ? '' : (string)($config[$key] ?? '');
         $field = installCenterDecorateConfigField($field, $config);
+        if ($legacyWb2Missing) {
+            array_unshift($field['options'], [
+                'value' => '__legacy_missing__',
+                'label' => 'Altbestand automatisch erkennen (unverändert)',
+            ]);
+            $field['value'] = '__legacy_missing__';
+            $field['has_value'] = false;
+        } elseif ($legacyWb2Blank) {
+            array_unshift($field['options'], [
+                'value' => '__legacy_blank__',
+                'label' => 'Leerer Altbestandswert – automatisch erkennen (unverändert)',
+            ]);
+            $field['value'] = '__legacy_blank__';
+            $field['has_value'] = false;
+        }
     }
     unset($field);
     return [
@@ -610,6 +636,36 @@ function installCenterNormalizeConfigValue($field, $value) {
         return strpos((string)$value, '.') !== false ? (float)$value : (int)$value;
     }
     return $value;
+}
+
+function installCenterPreserveMissingWb2Type($postedValues, $existingConfig) {
+    if (!is_array($postedValues)) {
+        return [];
+    }
+    if (!array_key_exists('wb_native_type2', $postedValues)) {
+        return $postedValues;
+    }
+    $existingConfig = is_array($existingConfig) ? $existingConfig : [];
+    $postedType = trim((string)$postedValues['wb_native_type2']);
+    $existingMissing = !array_key_exists('wb_native_type2', $existingConfig);
+    $existingBlank = !$existingMissing
+        && trim((string)$existingConfig['wb_native_type2']) === '';
+    if ($postedType === '__legacy_missing__') {
+        unset($postedValues['wb_native_type2']);
+    } elseif ($postedType === '__legacy_blank__') {
+        if ($existingBlank) {
+            $postedValues['wb_native_type2'] = '';
+        } else {
+            unset($postedValues['wb_native_type2']);
+        }
+    } elseif ($postedType === '' && ($existingMissing || $existingBlank)) {
+        if ($existingMissing) {
+            unset($postedValues['wb_native_type2']);
+        } else {
+            $postedValues['wb_native_type2'] = '';
+        }
+    }
+    return $postedValues;
 }
 
 function installCenterBackupConfig(&$error = null, $options = []) {
@@ -642,6 +698,7 @@ function installCenterSaveModuleConfig($moduleKey, $postedValues) {
         return ['success' => false, 'error' => 'Konfiguration konnte nicht geladen werden'];
     }
     $config = $loaded['config'] ?? [];
+    $postedValues = installCenterPreserveMissingWb2Type($postedValues, $config);
     $updates = [];
     $shadowDefaults = [
         'shadow_sync_interval_s' => '5',
@@ -5518,6 +5575,17 @@ function renderBackupSnapshot(snapshot) {
     if (!snapshot) return '';
     const copied = snapshot.copied || [];
     const skipped = snapshot.skipped || [];
+    const retention = snapshot.retention || null;
+    const retentionOk = !retention || (
+        retention.success !== false
+        && !retention.blocked
+        && retention.limit_satisfied !== false
+    );
+    const retentionDetail = retention
+        ? (retention.blocker || retention.error || (retentionOk
+            ? `maximal ${retention.keep_count ?? 3} Generationen`
+            : 'geschützte oder nicht sicher bereinigbare Sicherungen bleiben erhalten'))
+        : '';
     const copyRows = copied.slice(0, 8).map(item => `
         <li><i class="fas fa-check-circle ok me-1"></i><span class="small-code">${esc(item.path || '')}</span>
             <div class="text-secondary small">Backup: <span class="small-code">${esc(item.backup || '')}</span></div>
@@ -5537,7 +5605,9 @@ function renderBackupSnapshot(snapshot) {
                 <div class="result-tile"><strong>Status</strong>${boolBadge(Boolean(snapshot.success), 'angelegt', 'Fehler', true)}</div>
                 <div class="result-tile"><strong>Gesichert</strong>${esc(snapshot.copied_count ?? copied.length)} Datei(en)<div class="text-secondary mt-1">${esc(snapshot.skipped_count ?? skipped.length)} übersprungen</div></div>
                 <div class="result-tile"><strong>Pfad</strong><span class="small-code">${esc(snapshot.root || '')}</span></div>
+                ${retention ? `<div class="result-tile"><strong>Aufbewahrung</strong>${boolBadge(retentionOk, 'Limit angewendet', 'Grenze offen', true)}<div class="text-secondary mt-1">${esc(retentionDetail)}</div></div>` : ''}
             </div>
+            ${retention && !retentionOk ? '<div class="warn small mt-2"><i class="fas fa-triangle-exclamation me-1"></i>Der neue Snapshot bleibt gültig; die Aufbewahrungsgrenze konnte noch nicht vollständig angewendet werden.</div>' : ''}
             ${copyRows ? `<ul class="result-list">${copyRows}</ul>${moreCopied}` : '<div class="text-secondary small">Keine vorhandenen Dateien mussten gesichert werden.</div>'}
             ${skippedRows ? `<div class="mt-2"><strong>Übersprungen</strong><ul class="result-list">${skippedRows}</ul>${moreSkipped}</div>` : ''}
         </div>

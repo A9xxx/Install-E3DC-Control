@@ -8,7 +8,7 @@ grid permission, battery support and the allowed wallbox power budget.
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
-from .modes import MODE_CURVE, MODE_OFF, MODE_PRICE
+from .modes import CONTROL_CURVE, MODE_CURVE, MODE_OFF, MODE_PRICE
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -362,6 +362,16 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
             budget_w = free_w * fz
             allowed_w = min(wb_actual + budget_w, phys_surplus)
 
+        # ``mode`` ist hier bereits der interne Controllerpfad (PV-Kurve = 3).
+        # Die öffentliche PV-Kurve darf belegten physischen PV-Überschuss vor
+        # der Fuzzy-Skalierung projizieren. Das bestehende interne Mode-2-
+        # Verhalten bleibt getrennt; Storage- und Schutzdeckel folgen weiter.
+        public_curve_pv_projection = bool(
+            mode == CONTROL_CURVE
+            and ctx.effective_public_wb_mode == MODE_CURVE
+            and ctx.budget_ok
+            and _safe_float(ctx.pv_power_raw, 0.0) > 100.0
+        )
         if mode == 2:
             pv_only_w = max(
                 0.0,
@@ -370,6 +380,22 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
             )
             if pv_only_w > 0.0:
                 allowed_w = max(allowed_w, min(phys_surplus, pv_only_w) if phys_surplus > 0.0 else pv_only_w)
+        elif public_curve_pv_projection:
+            # ``phys_surplus`` ist im Manager für diesen Pfad noch der vom
+            # Netzpunkt abgeleitete Altwert. Im Stillstand kann der Storage
+            # Manager den PV-Überschuss bereits aufnehmen und diesen Wert
+            # dadurch unter die 6-A-Startschwelle drücken. Die öffentliche
+            # PV-Kurve projiziert deshalb hier den separat belegten,
+            # batterieneutralen PV-Kandidaten. Nutzer-Aus, physikalisches
+            # WR-Limit, Peak-Shaving und der finale Storage-Vertrag bleiben
+            # als nachgelagerte harte Deckel erhalten.
+            public_curve_pv_w = max(
+                0.0,
+                _safe_float(ctx.pv_only_allowed_w, 0.0),
+                _safe_float(ctx.pv_surplus_ex_wb_w, 0.0),
+            )
+            if public_curve_pv_w > 0.0:
+                allowed_w = max(allowed_w, public_curve_pv_w)
 
         if free_w > 0.0:
             direct_pv_surplus_w = min(max(0.0, wb_actual + free_w), max(0.0, phys_surplus))

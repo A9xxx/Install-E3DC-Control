@@ -29,6 +29,7 @@ try:
     )
     from .direct_marketing_actions import (
         DIRECT_MARKETING_RELEASED_PLAN_ACTIONS,
+        direct_marketing_action_contract,
         direct_marketing_export_gate_contract_valid,
         direct_marketing_source_action_mode_valid,
         direct_marketing_source_action_released,
@@ -42,6 +43,7 @@ except ImportError:
     )
     from direct_marketing_actions import (  # type: ignore
         DIRECT_MARKETING_RELEASED_PLAN_ACTIONS,
+        direct_marketing_action_contract,
         direct_marketing_export_gate_contract_valid,
         direct_marketing_source_action_mode_valid,
         direct_marketing_source_action_released,
@@ -57,6 +59,33 @@ SHADOW_INPUT_BINDING_SCHEMA = "storage_dispatch_shadow_input_binding_v2"
 PRICE_HORIZON_SCHEMA = "storage_dispatch_price_horizon_v2"
 DIRECT_MARKETING_PLAN_PROJECTION_SCHEMA = "direct_marketing_plan_projection_v1"
 DIRECT_MARKETING_TRAJECTORY_SCHEMA = "direct_marketing_trajectory_v1"
+DIRECT_MARKETING_SOC_INTEGRATOR_CONTRACT = (
+    "direct_marketing_energy_integrator_v1"
+)
+DIRECT_MARKETING_STANDARD_SOC_PASSTHROUGH_CONTRACT = (
+    "canonical_standard_soc_passthrough_v1"
+)
+DIRECT_MARKETING_STANDARD_TRANSITION_REBASED_CONTRACT = (
+    "canonical_standard_transition_rebased_v1"
+)
+DIRECT_MARKETING_STANDARD_TRANSITION_DURATION_CONTRACT = (
+    "canonical_standard_transition_duration_v1"
+)
+DIRECT_MARKETING_HEADROOM_PROJECTION_PLAN_SCHEMA = (
+    "direct_marketing_headroom_projection_plan_v1"
+)
+DIRECT_MARKETING_HEADROOM_PROJECTION_BINDING_SCHEMA = (
+    "direct_marketing_headroom_projection_binding_v1"
+)
+DIRECT_MARKETING_HEADROOM_ENERGY_BASIS = (
+    "stored_battery_energy_delta_before_discharge_loss_v1"
+)
+DIRECT_MARKETING_HEADROOM_ENERGY_BINDING_SCHEMA = (
+    "direct_marketing_headroom_energy_binding_v1"
+)
+DIRECT_MARKETING_STANDARD_PROJECTION_BINDING_SCHEMA = (
+    "canonical_standard_projection_binding_v1"
+)
 DIRECT_MARKETING_SELECTED_ACTION_FALLBACK_SCHEMA = (
     "direct_marketing_selected_action_fallback_v1"
 )
@@ -1388,12 +1417,26 @@ def _plan_material(plan: Dict[str, Any]) -> Dict[str, Any]:
         # dagegen vollständig Teil des Planmaterials.
         trajectory["plan_id"] = None
         trajectory["trajectory_revision"] = None
-        trajectory["slots"] = [
-            {**item, "slot_id": None}
-            if isinstance(item, dict)
-            else item
-            for item in trajectory.get("slots") or []
-        ]
+        normalized_trajectory_slots = []
+        for item in trajectory.get("slots") or []:
+            if not isinstance(item, dict):
+                normalized_trajectory_slots.append(item)
+                continue
+            normalized = copy.deepcopy(item)
+            normalized["slot_id"] = None
+            provenance = (
+                normalized.get("provenance")
+                if isinstance(normalized.get("provenance"), dict)
+                else None
+            )
+            if provenance is not None:
+                # Die Vorgänger-Slot-ID hängt wie ``slot_id`` selbst vom
+                # fachlichen Planhash ab. Für den Planhash wird nur diese
+                # Selbstidentität neutralisiert; der Trajektorienhash bindet
+                # danach wieder die konkrete Vorgängerkette.
+                provenance["predecessor_slot_id"] = None
+            normalized_trajectory_slots.append(normalized)
+        trajectory["slots"] = normalized_trajectory_slots
         material["direct_marketing_trajectory"] = trajectory
     return material
 
@@ -2769,12 +2812,72 @@ def _direct_marketing_slot_has_active_action_claim(
     )
     if current is not None:
         decisions.append(current)
-    active_targets = {"FORCE_EXPORT", "FORCE_CHARGE_PV", "CHARGE_BLOCK_WAIT"}
+    active_targets = {
+        "FORCE_EXPORT",
+        "FORCE_CHARGE_PV",
+        "CHARGE_BLOCK_WAIT",
+        "DV_CURVE_CHARGE",
+    }
     active_source_actions = {
         "eco_plus_export_candidate",
         "eco_plus_store_pv_candidate",
         "direct_marketing_charge_block_wait",
+        "eco_plus_curve_charge_candidate",
     }
+
+    def passive_candidate_contract_valid(
+        decision: Dict[str, Any],
+        selected: Dict[str, Any],
+        execution: Dict[str, Any],
+        budget: Dict[str, Any],
+        target: str,
+        source_action: str,
+        selected_action: str,
+    ) -> bool:
+        """Erlaubt sichtbare Kandidaten nur als streng wirkungslosen HOLD."""
+
+        candidate_actions = decision.get("candidate_actions")
+        selected_start_ms = _to_ts_ms(selected.get("start_ts"))
+        selected_end_ms = _to_ts_ms(selected.get("end_ts"))
+        decision_start_ms = _to_ts_ms(decision.get("start_ts"))
+        decision_end_ms = _to_ts_ms(decision.get("end_ts"))
+        zero_budgets = all(
+            type(budget.get(key)) in {int, float}
+            and math.isfinite(float(budget.get(key)))
+            and abs(float(budget.get(key))) <= 0.001
+            for key in ("export_budget_w", "charge_budget_w")
+        )
+        return bool(
+            target == "HOLD"
+            and decision.get("blocked") is True
+            and decision.get("commands_allowed") is False
+            and decision.get("executable_action") in {None, ""}
+            and decision.get("execution_window") is None
+            and type(decision.get("execution_window_match_count")) is int
+            and decision.get("execution_window_match_count") == 0
+            and not execution
+            and zero_budgets
+            and source_action in active_source_actions
+            and selected_action == source_action
+            and isinstance(candidate_actions, list)
+            and source_action in candidate_actions
+            and str(selected.get("window_id") or "")
+            and selected_start_ms <= decision_start_ms
+            and decision_start_ms <= slot_start_ms
+            and slot_end_ms <= decision_end_ms
+            and decision_end_ms <= selected_end_ms
+            and not any(
+                decision.get(key) is True
+                for key in (
+                    "requested",
+                    "attempted",
+                    "issued",
+                    "confirmed",
+                    "hardware_effect",
+                )
+            )
+        )
+
     for decision in decisions:
         start_ms = _to_ts_ms(decision.get("start_ts"))
         end_ms = _to_ts_ms(decision.get("end_ts"))
@@ -2785,12 +2888,57 @@ def _direct_marketing_slot_has_active_action_claim(
             if isinstance(decision.get("selected_window"), dict)
             else {}
         )
+        execution = (
+            decision.get("execution_window")
+            if isinstance(decision.get("execution_window"), dict)
+            else {}
+        )
+        budget = (
+            decision.get("storage_budget")
+            if isinstance(decision.get("storage_budget"), dict)
+            else {}
+        )
+        target = str(decision.get("dv_target_state") or "").upper()
+        source_action = str(decision.get("source_action") or "")
+        selected_action = str(selected.get("action") or "")
+        execution_action = str(execution.get("action") or "")
+        if passive_candidate_contract_valid(
+            decision,
+            selected,
+            execution,
+            budget,
+            target,
+            source_action,
+            selected_action,
+        ):
+            continue
+        # Der zentral nicht freigegebene Headroom-Claim wird ausschließlich
+        # durch den exakten Sidecar-/Window-/Budgetvertrag validiert. Er darf
+        # hier nicht als generischer Runtimeclaim die reine Anzeige sperren.
         if bool(
-            str(decision.get("dv_target_state") or "").upper()
-            in active_targets
-            or str(decision.get("source_action") or "")
-            in active_source_actions
-            or str(selected.get("action") or "") in active_source_actions
+            target == "HEADROOM_EXPORT"
+            or source_action == "eco_plus_negative_headroom_hold"
+            or selected_action == "eco_plus_negative_headroom_hold"
+            or execution_action == "eco_plus_negative_headroom_hold"
+        ):
+            continue
+        budget_claim = False
+        for key in ("export_budget_w", "charge_budget_w"):
+            raw_value = budget.get(key)
+            if raw_value is None:
+                continue
+            value = _canonical_trajectory_finite_number(raw_value)
+            if value is None or abs(value) > 0.001:
+                budget_claim = True
+                break
+        if bool(
+            target in active_targets
+            or source_action in active_source_actions
+            or selected_action in active_source_actions
+            or execution_action in active_source_actions
+            or decision.get("commands_allowed") is True
+            or decision.get("executable_action") not in {None, ""}
+            or budget_claim
         ):
             return True
     return False
@@ -2802,6 +2950,267 @@ def _direct_marketing_trajectory_material(
     material = copy.deepcopy(trajectory)
     material.pop("trajectory_revision", None)
     return material
+
+
+def _direct_marketing_trajectory_shape_valid(
+    trajectory: Dict[str, Any],
+) -> bool:
+    """Versiegelt das neue Anzeige-Schema für jede Trajektorienrolle."""
+
+    root_base_keys = {
+        "schema_version",
+        "active",
+        "complete",
+        "status",
+        "plan_id",
+        "trajectory_revision",
+        "generated_at_ts_ms",
+        "valid_from_ts_ms",
+        "horizon_end_ts_ms",
+        "slot_duration_s",
+        "input_revisions",
+        "meta",
+        "slots",
+    }
+    status = str(trajectory.get("status") or "")
+    if status == "HEADROOM_PROJECTION_PLAN_INVALID":
+        expected_root_keys = root_base_keys | {"reason_code"}
+    elif bool(
+        "bounded_slot_count" in trajectory
+        or "evidence_limit_slot_count" in trajectory
+    ):
+        expected_root_keys = root_base_keys | {
+            "bounded_slot_count",
+            "evidence_limit_slot_count",
+        }
+    else:
+        expected_root_keys = root_base_keys
+    if set(trajectory) != expected_root_keys:
+        return False
+
+    meta = trajectory.get("meta")
+    if not isinstance(meta, dict):
+        return False
+    base_meta_keys = {
+        "soc_integrator",
+        "runtime_authorization_separate",
+        "candidate_effect",
+        "shadow_effect",
+    }
+    expanded_meta_keys = base_meta_keys | {
+        "capacity_wh",
+        "capacity_source",
+        "initial_soc_source",
+        "efficiencies",
+        "hardware_limits_w",
+        "signs",
+        "balance_contract",
+        "load_aggregation_contract",
+        "pv_aggregation_contract",
+    }
+    meta_keyset = frozenset(meta)
+    if meta_keyset not in {
+        frozenset(base_meta_keys),
+        frozenset(expanded_meta_keys),
+    }:
+        return False
+    if set(meta) == expanded_meta_keys and not bool(
+        isinstance(meta.get("efficiencies"), dict)
+        and set(meta["efficiencies"])
+        == {"roundtrip_pct", "charge", "discharge"}
+        and isinstance(meta.get("hardware_limits_w"), dict)
+        and set(meta["hardware_limits_w"]) == {"charge", "discharge"}
+        and isinstance(meta.get("signs"), dict)
+        and set(meta["signs"]) == {"battery_w", "grid_w", "residual_w"}
+    ):
+        return False
+
+    slots = trajectory.get("slots")
+    if not isinstance(slots, list):
+        return False
+    regular_slot_keys = {
+        "slot_id",
+        "start_ts_ms",
+        "end_ts_ms",
+        "soc_start_pct",
+        "soc_end_pct",
+        "hard_reserve_soc_pct",
+        "ceiling_soc_pct",
+        "battery_w",
+        "grid_w",
+        "pv_w",
+        "pv_axis_evidence",
+        "loads_w",
+        "residual_before_storage_w",
+        "residual_after_storage_w",
+        "action",
+        "projection_status",
+        "selection",
+        "delegation",
+        "passive_binding",
+        "standard_projection_binding",
+        "reason_code",
+        "provenance",
+    }
+    projection_slot_keys = regular_slot_keys | {
+        "action_role",
+        "projection_only",
+        "hardware_effect",
+        "headroom_projection",
+    }
+    regular_selection_keys = {
+        "selected",
+        "executable",
+        "commands_allowed",
+        "requested_w",
+        "action_id",
+        "window_id",
+        "segment_id",
+        "source_action",
+        "source_mode",
+        "pv_store_source_contract",
+    }
+    projection_selection_keys = {
+        "selected",
+        "executable",
+        "commands_allowed",
+        "projected_action",
+        "projected_w",
+        "projection_id",
+    }
+    base_provenance_keys = {
+        "balance_source",
+        "soc_projection_contract",
+        "action_source",
+        "candidate_effect",
+        "shadow_effect",
+        "pv_axis_evidence_class",
+    }
+    rebased_provenance_keys = base_provenance_keys | {
+        "soc_transition_contract",
+        "predecessor_slot_id",
+        "canonical_standard_start_soc_pct",
+        "rebased_start_soc_pct",
+        "standard_requested_battery_w",
+        "integration_duration_contract",
+        "integration_anchor_ts_ms",
+        "integration_duration_s",
+    }
+    headroom_provenance_keys = base_provenance_keys | {
+        "headroom_energy_binding",
+    }
+    delegation_keys = {
+        "schema_version",
+        "active",
+        "commands_allowed",
+        "action",
+        "reason",
+        "max_curve_charge_w",
+        "max_storage_before_window_wh",
+        "valid_until_ts_ms",
+        "next_window_start_ts_ms",
+        "next_window_end_ts_ms",
+        "source",
+        "pv_store_source_contract",
+        "no_grid_charge",
+    }
+    passive_binding_keys = {
+        "schema",
+        "action",
+        "start_ts",
+        "end_ts",
+        "selected_start_ts",
+        "selected_end_ts",
+        "window_id",
+        "policy_slot_id",
+        "policy_action_id",
+    }
+    standard_binding_keys = {
+        "schema",
+        "projection_only",
+        "executable",
+        "commands_allowed",
+        "hardware_effect",
+        "source_schema",
+        "source_revision",
+    }
+    for slot in slots:
+        if not isinstance(slot, dict):
+            return False
+        projection_only = bool(
+            slot.get("projection_only") is True
+            or slot.get("action_role") == "PROJECTION_ONLY"
+            or "headroom_projection" in slot
+        )
+        if set(slot) != (
+            projection_slot_keys if projection_only else regular_slot_keys
+        ):
+            return False
+        selection = slot.get("selection")
+        provenance = slot.get("provenance")
+        pv_values = slot.get("pv_w")
+        load_values = slot.get("loads_w")
+        pv_axis_evidence = slot.get("pv_axis_evidence")
+        if not bool(
+            isinstance(selection, dict)
+            and set(selection)
+            == (
+                projection_selection_keys
+                if projection_only
+                else regular_selection_keys
+            )
+            and isinstance(provenance, dict)
+            and isinstance(pv_values, dict)
+            and set(pv_values) == {"total", "e3dc_dc", "external_ac"}
+            and isinstance(load_values, dict)
+            and set(load_values)
+            == {"house", "heat", "wp", "climate", "wallbox", "total"}
+            and isinstance(pv_axis_evidence, dict)
+            and set(pv_axis_evidence)
+            == {
+                "schema_version",
+                "class",
+                "source",
+                "producer_evidence_revision",
+            }
+        ):
+            return False
+        if projection_only:
+            if set(provenance) != headroom_provenance_keys:
+                return False
+        elif provenance.get("soc_transition_contract") is not None:
+            if set(provenance) != rebased_provenance_keys:
+                return False
+        elif set(provenance) != base_provenance_keys:
+            return False
+        delegation = slot.get("delegation")
+        passive_binding = slot.get("passive_binding")
+        standard_binding = slot.get("standard_projection_binding")
+        if bool(
+            delegation is not None
+            and (
+                not isinstance(delegation, dict)
+                or set(delegation) != delegation_keys
+            )
+        ):
+            return False
+        if bool(
+            passive_binding is not None
+            and (
+                not isinstance(passive_binding, dict)
+                or set(passive_binding) != passive_binding_keys
+            )
+        ):
+            return False
+        if bool(
+            standard_binding is not None
+            and (
+                not isinstance(standard_binding, dict)
+                or set(standard_binding) != standard_binding_keys
+            )
+        ):
+            return False
+    return True
 
 
 def _sha256_revision_valid(value: Any) -> bool:
@@ -2842,6 +3251,2307 @@ def _canonical_trajectory_finite_number(value: Any) -> Optional[float]:
     except (OverflowError, TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _read_only_authority_marker_present(
+    value: Any,
+    *,
+    path: Tuple[str, ...] = (),
+    allowed_true_paths: Optional[set] = None,
+    allowed_power_paths: Optional[set] = None,
+    allowed_action_paths: Optional[set] = None,
+    allowed_headroom_alias_paths: Optional[set] = None,
+) -> bool:
+    """Findet Autoritätsmarker in reinen Anzeigeverträgen pfadgenau."""
+
+    allowed_true_paths = allowed_true_paths or set()
+    allowed_power_paths = allowed_power_paths or set()
+    allowed_action_paths = allowed_action_paths or set()
+    allowed_headroom_alias_paths = allowed_headroom_alias_paths or set()
+    boolean_authority_keys = {
+        "acknowledged",
+        "attempted",
+        "commands_allowed",
+        "confirmed",
+        "dispatch_authorized",
+        "executable",
+        "field_released",
+        "hardware_effect",
+        "issued",
+        "requested",
+        "runtime_effect_claim_allowed",
+        "selected",
+    }
+    power_authority_keys = {
+        "charge_budget_w",
+        "export_budget_w",
+        "issued_power_w",
+        "issued_w",
+        "power_w",
+        "requested_power_w",
+        "requested_w",
+        "selected_power_w",
+        "selected_w",
+        "val",
+    }
+    action_authority_keys = {
+        "action",
+        "candidate_action",
+        "dv_target_state",
+        "effective_action",
+        "executable_action",
+        "issued_action",
+        "plan_executable_action",
+        "plan_action",
+        "plan_selected_action",
+        "requested_action",
+        "runtime_selected_action",
+        "selected_action",
+        "source_action",
+        "target_state",
+        "translated_action",
+    }
+    command_keys = {
+        "auto_limit",
+        "command",
+        "commands",
+        "hardware_command",
+        "mode",
+        "mode_name",
+        "mode_value",
+        "priority",
+        "rscp_command_path",
+        "rscp_path",
+        "state",
+    }
+    headroom_aliases = {
+        "HEADROOM_EXPORT",
+        "DIRECT_MARKETING_HEADROOM_EXPORT",
+    }
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized_key = str(key).strip().lower()
+            item_path = path + (normalized_key,)
+            if bool(
+                normalized_key in boolean_authority_keys
+                and item is True
+                and item_path not in allowed_true_paths
+            ):
+                return True
+            if bool(
+                normalized_key in power_authority_keys
+                and item_path not in allowed_power_paths
+                and item is not None
+            ):
+                number = _canonical_trajectory_finite_number(item)
+                if number is None or abs(number) > 0.001:
+                    return True
+            if bool(
+                normalized_key in action_authority_keys
+                and item_path not in allowed_action_paths
+                and item not in {None, ""}
+            ):
+                return True
+            if bool(
+                normalized_key in command_keys
+                and item not in {None, "", False, 0}
+            ):
+                return True
+            if _read_only_authority_marker_present(
+                item,
+                path=item_path,
+                allowed_true_paths=allowed_true_paths,
+                allowed_power_paths=allowed_power_paths,
+                allowed_action_paths=allowed_action_paths,
+                allowed_headroom_alias_paths=allowed_headroom_alias_paths,
+            ):
+                return True
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(
+            _read_only_authority_marker_present(
+                item,
+                path=path,
+                allowed_true_paths=allowed_true_paths,
+                allowed_power_paths=allowed_power_paths,
+                allowed_action_paths=allowed_action_paths,
+                allowed_headroom_alias_paths=allowed_headroom_alias_paths,
+            )
+            for item in value
+        )
+    return bool(
+        type(value) is str
+        and value.strip().upper() in headroom_aliases
+        and path not in allowed_headroom_alias_paths
+    )
+
+
+_LEGACY_POLICY_FORBIDDEN_AUTHORITY_KEYS = frozenset({
+    "acknowledged",
+    "action",
+    "attempted",
+    "auto_limit",
+    "candidate_action",
+    "command",
+    "command_allowed",
+    "commands",
+    "commands_allowed",
+    "confirmed",
+    "control_effect",
+    "dispatch_authorized",
+    "direct_marketing_action",
+    "direct_marketing_plan_action",
+    "direct_marketing_policy_target_state",
+    "direct_marketing_target_state",
+    "dv_target_state",
+    "effective_action",
+    "export_budget_w",
+    "executable",
+    "executable_action",
+    "execution_intent",
+    "field_released",
+    "hardware_command",
+    "hardware_effect",
+    "hardware_effect_claim_allowed",
+    "issued",
+    "issued_action",
+    "issued_power_w",
+    "issued_w",
+    "mode",
+    "mode_name",
+    "mode_value",
+    "plan_executable_action",
+    "plan_action",
+    "plan_selected_action",
+    "power_w",
+    "priority",
+    "charge_budget_w",
+    "request_lifecycle",
+    "requested",
+    "requested_action",
+    "requested_power_w",
+    "requested_w",
+    "runtime_effect_claim_allowed",
+    "runtime_selected_action",
+    "rscp_command_path",
+    "rscp_path",
+    "selected",
+    "selected_action",
+    "selected_power_w",
+    "selected_w",
+    "source_action",
+    "translated_action",
+    "translated_power_w",
+    "state",
+    "target_state",
+    "val",
+})
+
+_READ_ONLY_EXTENSION_AUTHORITY_SUFFIXES = (
+    "_acknowledged",
+    "_action",
+    "_attempted",
+    "_charge_budget_w",
+    "_command",
+    "_command_allowed",
+    "_commands_allowed",
+    "_confirmed",
+    "_dispatch_authorized",
+    "_effective_action",
+    "_executable",
+    "_export_budget_w",
+    "_field_released",
+    "_hardware_effect",
+    "_hardware_effect_claim_allowed",
+    "_issued",
+    "_issued_w",
+    "_plan_commands_allowed",
+    "_plan_executable",
+    "_planned_w",
+    "_requested",
+    "_requested_w",
+    "_runtime_effect_claim_allowed",
+    "_selected",
+    "_selected_w",
+    "_target_state",
+)
+
+
+def _read_only_extension_authority_key(key: Any) -> bool:
+    """Erkennt auch namespacete Autoritätsfelder in Erweiterungen."""
+
+    normalized_key = str(key).strip().lower()
+    return bool(
+        normalized_key in _LEGACY_POLICY_FORBIDDEN_AUTHORITY_KEYS
+        or normalized_key.endswith(_READ_ONLY_EXTENSION_AUTHORITY_SUFFIXES)
+    )
+
+
+def _read_only_extension_authority_marker_present(
+    value: Any,
+    *,
+    path: Tuple[str, ...] = (),
+    allowed_authority_paths: Optional[set] = None,
+    allowed_headroom_alias_paths: Optional[set] = None,
+) -> bool:
+    """Prüft erweiterbare Anzeigeverträge ohne Voll-Keyset-Sperre."""
+
+    allowed_authority_paths = allowed_authority_paths or set()
+    allowed_headroom_alias_paths = allowed_headroom_alias_paths or set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized_key = str(key).strip().lower()
+            item_path = path + (normalized_key,)
+            if bool(
+                _read_only_extension_authority_key(normalized_key)
+                and item_path not in allowed_authority_paths
+            ):
+                return True
+            if _read_only_extension_authority_marker_present(
+                item,
+                path=item_path,
+                allowed_authority_paths=allowed_authority_paths,
+                allowed_headroom_alias_paths=allowed_headroom_alias_paths,
+            ):
+                return True
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(
+            _read_only_extension_authority_marker_present(
+                item,
+                path=path,
+                allowed_authority_paths=allowed_authority_paths,
+                allowed_headroom_alias_paths=allowed_headroom_alias_paths,
+            )
+            for item in value
+        )
+    return bool(
+        type(value) is str
+        and value.strip().upper()
+        in DIRECT_MARKETING_HEADROOM_RUNTIME_ALIASES
+        and path not in allowed_headroom_alias_paths
+    )
+
+
+def _legacy_policy_extension_security_valid(
+    value: Any,
+    *,
+    path: Tuple[str, ...] = (),
+    allowed_authority_paths: Optional[set] = None,
+    allowed_headroom_alias_paths: Optional[set] = None,
+) -> bool:
+    """Toleriert Diagnose-Erweiterungen, aber keine neue Autorität.
+
+    Alte Policy-Verträge dürfen zusätzliche harmlose Diagnosefelder erhalten.
+    Autoritäts-, Lifecycle- und Command-Schlüssel werden dagegen unabhängig
+    vom konkreten Wert nur an explizit gebundenen Legacy-Pfaden zugelassen.
+    """
+
+    allowed_authority_paths = allowed_authority_paths or set()
+    allowed_headroom_alias_paths = allowed_headroom_alias_paths or set()
+    headroom_aliases = {
+        "HEADROOM_EXPORT",
+        "DIRECT_MARKETING_HEADROOM_EXPORT",
+    }
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized_key = str(key).strip().lower()
+            item_path = path + (normalized_key,)
+            if bool(
+                _read_only_extension_authority_key(normalized_key)
+                and item_path not in allowed_authority_paths
+            ):
+                return False
+            if not _legacy_policy_extension_security_valid(
+                item,
+                path=item_path,
+                allowed_authority_paths=allowed_authority_paths,
+                allowed_headroom_alias_paths=allowed_headroom_alias_paths,
+            ):
+                return False
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(
+            _legacy_policy_extension_security_valid(
+                item,
+                path=path,
+                allowed_authority_paths=allowed_authority_paths,
+                allowed_headroom_alias_paths=allowed_headroom_alias_paths,
+            )
+            for item in value
+        )
+    return not bool(
+        type(value) is str
+        and value.strip().upper() in headroom_aliases
+        and path not in allowed_headroom_alias_paths
+    )
+
+
+def _headroom_projection_prefixed_id(value: Any, prefix: str) -> bool:
+    text = str(value or "")
+    suffix = text[len(prefix):] if text.startswith(prefix) else ""
+    return bool(
+        len(suffix) == 64
+        and all(char in "0123456789abcdef" for char in suffix)
+    )
+
+
+def _headroom_projection_energy_binding(
+    sidecar_slot: Dict[str, Any],
+    *,
+    soc_start_pct: Any,
+    hard_floor_pct: Any,
+    capacity_wh: Any,
+    discharge_efficiency: Any,
+    max_discharge_w: Any,
+) -> Optional[Dict[str, Any]]:
+    """Rekonstruiert ausschließlich die read-only AC-/SoC-Projektion.
+
+    Die Producer-Energie ist gespeicherte Batterieenergie vor Entladeverlust.
+    Die veröffentlichte AC-Leistung gilt nur während der expliziten effektiven
+    Restdauer des Slots. So wird ein laufendes Viertelstundenfenster weder als
+    volle Viertelstunde integriert noch still in eine Runtimefreigabe gehoben.
+    """
+
+    stored_delta_rate_w = _canonical_trajectory_finite_number(
+        sidecar_slot.get("projected_power_w")
+    )
+    requested_stored_delta_wh = _canonical_trajectory_finite_number(
+        sidecar_slot.get("headroom_export_slot_energy_wh")
+    )
+    effective_duration_s = _canonical_trajectory_finite_number(
+        sidecar_slot.get("effective_duration_s")
+    )
+    values = {
+        "soc_start_pct": _canonical_trajectory_finite_number(soc_start_pct),
+        "hard_floor_pct": _canonical_trajectory_finite_number(hard_floor_pct),
+        "capacity_wh": _canonical_trajectory_finite_number(capacity_wh),
+        "discharge_efficiency": _canonical_trajectory_finite_number(
+            discharge_efficiency
+        ),
+        "max_discharge_w": _canonical_trajectory_finite_number(
+            max_discharge_w
+        ),
+    }
+    effective_start_ts = sidecar_slot.get("effective_start_ts")
+    if not bool(
+        sidecar_slot.get("energy_basis")
+        == DIRECT_MARKETING_HEADROOM_ENERGY_BASIS
+        and type(effective_start_ts) is int
+        and stored_delta_rate_w is not None
+        and stored_delta_rate_w > 0.0
+        and requested_stored_delta_wh is not None
+        and requested_stored_delta_wh > 0.0
+        and effective_duration_s is not None
+        and 0.0 < effective_duration_s <= SLOT_DURATION_S
+        and all(value is not None for value in values.values())
+        and 0.0 <= (values["soc_start_pct"] or 0.0) <= 100.0
+        and 0.0 <= (values["hard_floor_pct"] or 0.0) <= 100.0
+        and (values["capacity_wh"] or 0.0) > 0.0
+        and 0.0 < (values["discharge_efficiency"] or 0.0) <= 1.0
+        and (values["max_discharge_w"] or 0.0) >= 0.0
+    ):
+        return None
+
+    effective_hours = (effective_duration_s or 0.0) / 3600.0
+    efficiency = values["discharge_efficiency"] or 1.0
+    desired_ac_w = (stored_delta_rate_w or 0.0) * efficiency
+    slot_energy_ac_limit_w = (
+        (requested_stored_delta_wh or 0.0) * efficiency / effective_hours
+    )
+    reserve_available_stored_wh = max(
+        0.0,
+        (
+            (values["soc_start_pct"] or 0.0)
+            - (values["hard_floor_pct"] or 0.0)
+        )
+        / 100.0
+        * (values["capacity_wh"] or 0.0),
+    )
+    reserve_ac_limit_w = (
+        reserve_available_stored_wh * efficiency / effective_hours
+    )
+    caps = (
+        ("desired_ac_discharge_w", desired_ac_w),
+        ("hardware_discharge_limit_w", values["max_discharge_w"] or 0.0),
+        ("slot_energy_ac_discharge_limit_w", slot_energy_ac_limit_w),
+        ("reserve_ac_discharge_limit_w", reserve_ac_limit_w),
+    )
+    applied_ac_w = max(0.0, min(value for _name, value in caps))
+    applied_stored_delta_wh = applied_ac_w * effective_hours / efficiency
+    limiting_factors = [
+        name
+        for name, value in caps
+        if abs(value - applied_ac_w) <= 0.001
+    ]
+    bounded = applied_ac_w + 0.001 < desired_ac_w
+    bounding_status = (
+        "ZERO_BOUNDED"
+        if applied_ac_w <= 0.001 and desired_ac_w > 0.001
+        else "BOUNDED"
+        if bounded
+        else "UNBOUNDED"
+    )
+    return {
+        "schema": DIRECT_MARKETING_HEADROOM_ENERGY_BINDING_SCHEMA,
+        "energy_basis": DIRECT_MARKETING_HEADROOM_ENERGY_BASIS,
+        "axis_duration_s": SLOT_DURATION_S,
+        "effective_start_ts": effective_start_ts,
+        "effective_duration_s": round(effective_duration_s, 3),
+        "stored_delta_rate_w": round(stored_delta_rate_w, 3),
+        "requested_stored_delta_wh": round(
+            requested_stored_delta_wh,
+            3,
+        ),
+        "discharge_efficiency": round(efficiency, 6),
+        "desired_ac_discharge_w": round(desired_ac_w, 3),
+        "hardware_discharge_limit_w": round(
+            values["max_discharge_w"] or 0.0,
+            3,
+        ),
+        "reserve_available_stored_wh": round(
+            reserve_available_stored_wh,
+            3,
+        ),
+        "slot_energy_ac_discharge_limit_w": round(
+            slot_energy_ac_limit_w,
+            3,
+        ),
+        "reserve_ac_discharge_limit_w": round(reserve_ac_limit_w, 3),
+        "applied_ac_discharge_w": round(applied_ac_w, 3),
+        "applied_stored_delta_wh": round(applied_stored_delta_wh, 3),
+        "bounded": bounded,
+        "bounding_status": bounding_status,
+        "limiting_factors": limiting_factors,
+    }
+
+
+def _headroom_projection_active_marker_present(
+    projection: Dict[str, Any],
+) -> bool:
+    """Verhindert, dass ein Anzeige-Sidecar einen Dispatchvertrag überlagert."""
+
+    if any(
+        projection.get(key) is True
+        for key in (
+            "direct_marketing_selected",
+            "direct_marketing_executable",
+            "direct_marketing_commands_allowed",
+            "direct_marketing_plan_executable",
+            "direct_marketing_plan_commands_allowed",
+            "direct_marketing_shadow_selected",
+        )
+    ):
+        return True
+    if any(
+        projection.get(key) not in {None, ""}
+        for key in (
+            "direct_marketing_plan_action",
+            "direct_marketing_plan_source_action",
+            "direct_marketing_plan_source_mode",
+            "direct_marketing_plan_action_id",
+            "direct_marketing_plan_segment_id",
+            "direct_marketing_window_id",
+            "direct_marketing_action_horizon_contract",
+            "direct_marketing_headroom_export_gate",
+            "direct_marketing_plan_selected_action",
+            "direct_marketing_plan_executable_action",
+            "direct_marketing_effective_action",
+        )
+    ):
+        return True
+    for key in (
+        "direct_marketing_planned_w",
+        "direct_marketing_requested_w",
+    ):
+        raw_value = projection.get(key)
+        if raw_value is None:
+            continue
+        value = _canonical_trajectory_finite_number(raw_value)
+        if value is None or abs(value) > 0.001:
+            return True
+    roles = (
+        projection.get("direct_marketing_action_roles")
+        if isinstance(projection.get("direct_marketing_action_roles"), dict)
+        else {}
+    )
+    return bool(
+        roles.get("plan_selected_action") not in {None, ""}
+        or roles.get("plan_executable_action") not in {None, ""}
+        or roles.get("effective_action") not in {None, ""}
+        or roles.get("runtime_effect_claim_allowed") is True
+    )
+
+
+def _headroom_projection_canonical_authority_marker_present(
+    canonical: Dict[str, Any],
+    canonical_slot: Dict[str, Any],
+) -> bool:
+    """Sperrt zusätzliche Autoritätsmarker im gebundenen Anzeige-Slot.
+
+    Der gewachsene kanonische Plan bleibt erweiterbar. Geprüft werden deshalb
+    nur sicherheitsrelevante generische Root-Schlüssel und der konkrete
+    Sidecar-Slot. Der bereits streng validierte Sidecar-Unterbaum wird nicht
+    doppelt als Runtimeclaim interpretiert.
+    """
+
+    security_root_keys = {
+        "acknowledged",
+        "action",
+        "attempted",
+        "auto_limit",
+        "candidate_action",
+        "charge_budget_w",
+        "command",
+        "commands",
+        "commands_allowed",
+        "confirmed",
+        "dispatch_authorized",
+        "direct_marketing_action",
+        "direct_marketing_plan_action",
+        "direct_marketing_policy_target_state",
+        "direct_marketing_target_state",
+        "dv_target_state",
+        "effective_action",
+        "executable",
+        "executable_action",
+        "export_budget_w",
+        "field_released",
+        "hardware_command",
+        "hardware_effect",
+        "issued",
+        "issued_action",
+        "issued_power_w",
+        "issued_w",
+        "mode",
+        "mode_name",
+        "mode_value",
+        "plan_action",
+        "plan_executable_action",
+        "plan_selected_action",
+        "power_w",
+        "priority",
+        "requested",
+        "requested_action",
+        "requested_power_w",
+        "requested_w",
+        "runtime_effect_claim_allowed",
+        "runtime_selected_action",
+        "rscp_command_path",
+        "rscp_path",
+        "selected",
+        "selected_action",
+        "selected_power_w",
+        "selected_w",
+        "source_action",
+        "state",
+        "target_state",
+        "translated_action",
+        "val",
+    }
+    root_probe = {
+        key: copy.deepcopy(value)
+        for key, value in canonical.items()
+        if str(key).strip().lower() in security_root_keys
+    }
+    if _read_only_authority_marker_present(root_probe):
+        return True
+    if any(
+        canonical.get(key) not in {None, "", False, 0}
+        for key in (
+            "direct_marketing_action",
+            "direct_marketing_plan_action",
+            "direct_marketing_policy_target_state",
+            "direct_marketing_target_state",
+        )
+    ):
+        return True
+
+    known_complex_root_keys = {
+        "anchor_registry",
+        "compatibility",
+        "consumption_forecast",
+        "curve_anchors",
+        "direct_marketing",
+        "direct_marketing_trajectory",
+        "eco_dump_days",
+        "forecast_shortfall_aux_ac_config",
+        "forecast_shortfall_joint_horizon_evidence",
+        "hardening_contracts",
+        "headroom_topology",
+        "heat_intent_candidate",
+        "heat_price_boost_config",
+        "input_revisions",
+        "intermediate_anchors",
+        "market_plan",
+        "planned_loads",
+        "planner",
+        "pv_topology",
+        "published_target_floor_curve",
+        "shadow_dispatch",
+        "slots",
+        "soc_ceiling_curve",
+        "soc_min_curve",
+        "storm_grid_charge",
+        "storm_guard",
+        "target_curve_meta",
+        "target_reach_chargeability_contract",
+        "target_reach_source_evidence_reasons",
+        "target_timeline",
+        "terminal_value",
+        "timeline",
+        "wallbox_config_target_reach",
+    }
+    root_extensions = {
+        key: copy.deepcopy(value)
+        for key, value in canonical.items()
+        if str(key).strip().lower() not in known_complex_root_keys
+    }
+    if _read_only_extension_authority_marker_present(root_extensions):
+        return True
+
+    direct = (
+        canonical.get("direct_marketing")
+        if isinstance(canonical.get("direct_marketing"), dict)
+        else {}
+    )
+    known_direct_keys = {
+        "active",
+        "battery_wear_budget",
+        "blocked_reasons",
+        "charge_block_wait_plan",
+        "controller_owner",
+        "created_ts",
+        "economics",
+        "flags",
+        "future_export_credit",
+        "future_pv_store_reservation",
+        "headroom_projection_plan",
+        "market_windows",
+        "mode",
+        "owner_contract_version",
+        "plan_owner",
+        "policy_decision",
+        "policy_timeline",
+        "price_quality",
+        "pv_store_allocation",
+        "pv_store_marginal_contract",
+        "reason",
+        "reserve",
+        "settlement_accounting",
+        "shadow",
+        "valid_until_ts",
+        "windows",
+    }
+    direct_extensions = {
+        key: copy.deepcopy(value)
+        for key, value in direct.items()
+        if str(key).strip().lower() not in known_direct_keys
+    }
+    if _read_only_extension_authority_marker_present(direct_extensions):
+        return True
+
+    slot_probe = copy.deepcopy(canonical_slot)
+    projection = (
+        slot_probe.get("projection")
+        if isinstance(slot_probe.get("projection"), dict)
+        else {}
+    )
+    projection.pop("direct_marketing_headroom_projection", None)
+    slot_probe["projection"] = projection
+    if bool(
+        projection.get("direct_marketing_action") is not None
+        or projection.get("direct_marketing_effective_action") is not None
+        or projection.get("direct_marketing_target_state") is not None
+        or projection.get("direct_marketing_policy_target_state") is not None
+    ):
+        return True
+    roles_prefix = ("projection", "direct_marketing_action_roles")
+    if _read_only_authority_marker_present(
+        slot_probe,
+        allowed_action_paths={
+            ("candidate", "action"),
+            (
+                "projection",
+                "direct_marketing_action_horizon_contract",
+                "action",
+            ),
+            roles_prefix + ("candidate_action",),
+            roles_prefix + ("plan_selected_action",),
+            roles_prefix + ("plan_executable_action",),
+            roles_prefix + ("effective_action",),
+        },
+        allowed_power_paths={("candidate", "power_w")},
+    ):
+        return True
+    return _read_only_extension_authority_marker_present(
+        slot_probe,
+        allowed_authority_paths={
+            ("planned_action",),
+            ("planned_w",),
+            ("candidate", "action"),
+            ("candidate", "power_w"),
+            ("projection", "direct_marketing_action"),
+            (
+                "projection",
+                "direct_marketing_action_horizon_contract",
+                "action",
+            ),
+            roles_prefix + ("candidate_action",),
+            roles_prefix + ("plan_selected_action",),
+            roles_prefix + ("plan_executable_action",),
+            roles_prefix + ("effective_action",),
+            roles_prefix + ("runtime_effect_claim_allowed",),
+            ("projection", "direct_marketing_candidate_action"),
+            ("projection", "direct_marketing_commands_allowed"),
+            ("projection", "direct_marketing_effective_action"),
+            ("projection", "direct_marketing_executable"),
+            ("projection", "direct_marketing_plan_action"),
+            (
+                "projection",
+                "direct_marketing_plan_commands_allowed",
+            ),
+            ("projection", "direct_marketing_plan_executable"),
+            (
+                "projection",
+                "direct_marketing_plan_executable_action",
+            ),
+            (
+                "projection",
+                "direct_marketing_plan_selected_action",
+            ),
+            ("projection", "direct_marketing_plan_source_action"),
+            ("projection", "direct_marketing_planned_w"),
+            ("projection", "direct_marketing_requested_w"),
+            ("projection", "direct_marketing_selected"),
+            ("projection", "direct_marketing_shadow_selected"),
+            ("projection", "market_action"),
+        },
+    )
+
+
+def _headroom_projection_runtime_hold_contract(
+    direct: Dict[str, Any],
+    canonical_slot: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Bindet die zulässige Doppelrolle an exakt einen 0-W-Wartevertrag.
+
+    Der bestehende ``CHARGE_BLOCK_WAIT`` bleibt die kanonische Runtime-/Policy-
+    Auswahl. Der Headroom-Sidecar darf daneben ausschließlich die erwartete
+    SoC-Wirkung projizieren. Andere aktive Aktionen oder ein positiver
+    Runtime-Cap sind keine zulässige Doppelrolle.
+    """
+
+    projection = (
+        canonical_slot.get("projection")
+        if isinstance(canonical_slot.get("projection"), dict)
+        else {}
+    )
+    contract = _direct_marketing_policy_projection_for_slot(
+        direct,
+        canonical_slot,
+    )
+    if not isinstance(contract, dict):
+        return None
+    slot_start_ms = _safe_int(canonical_slot.get("start_ts_ms"), 0)
+    slot_end_ms = _safe_int(canonical_slot.get("end_ts_ms"), 0)
+    selected_semantic_fields = (
+        "action",
+        "reason",
+        "start_ts",
+        "end_ts",
+        "window_id",
+    )
+    execution_semantic_fields = (
+        "contract_version",
+        "action",
+        "start_ts",
+        "end_ts",
+        "plan_window_start_ts",
+        "plan_window_end_ts",
+        "origin_start_ts",
+        "window_id",
+        "plan_window_id",
+        "source",
+    )
+    budget_semantic_fields = (
+        "export_budget_w",
+        "charge_budget_w",
+        "protected_reserve_wh",
+        "sellable_wh",
+        "headroom_deficit_wh",
+        "headroom_required_wh",
+        "headroom_free_before_wh",
+        "headroom_target_soc_pct",
+        "headroom_hold_active",
+    )
+
+    def semantic_fields(value: Any, fields: Tuple[str, ...]) -> Dict[str, Any]:
+        source = value if isinstance(value, dict) else {}
+        return {key: copy.deepcopy(source.get(key)) for key in fields}
+
+    def hold_semantic_material(decision: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "schema": decision.get("schema"),
+            "start_ts": decision.get("start_ts"),
+            "end_ts": decision.get("end_ts"),
+            "dv_target_state": decision.get("dv_target_state"),
+            "source_action": decision.get("source_action"),
+            "executable_action": decision.get("executable_action"),
+            "commands_allowed": decision.get("commands_allowed"),
+            "blocked": decision.get("blocked"),
+            "execution_window_match_count": decision.get(
+                "execution_window_match_count"
+            ),
+            "candidate_actions": copy.deepcopy(
+                decision.get("candidate_actions")
+            ),
+            "suppressed_candidates": copy.deepcopy(
+                decision.get("suppressed_candidates")
+            ),
+            "selected_window": semantic_fields(
+                decision.get("selected_window"),
+                selected_semantic_fields,
+            ),
+            "selected_candidate": semantic_fields(
+                decision.get("selected_candidate"),
+                selected_semantic_fields,
+            ),
+            "execution_window": semantic_fields(
+                decision.get("execution_window"),
+                execution_semantic_fields,
+            ),
+            "storage_budget": semantic_fields(
+                decision.get("storage_budget"),
+                budget_semantic_fields,
+            ),
+        }
+
+    raw_decisions = [
+        item
+        for item in direct.get("policy_timeline") or []
+        if isinstance(item, dict)
+    ]
+    current_decision = direct.get("policy_decision")
+    if isinstance(current_decision, dict):
+        raw_decisions.append(current_decision)
+    relevant_decisions: Dict[str, Dict[str, Any]] = {}
+    for item in raw_decisions:
+        if not bool(
+            _to_ts_ms(item.get("start_ts")) <= slot_start_ms
+            and slot_end_ms <= _to_ts_ms(item.get("end_ts"))
+            and (
+                str(item.get("dv_target_state") or "").upper()
+                == "CHARGE_BLOCK_WAIT"
+                or str(item.get("source_action") or "")
+                == "direct_marketing_charge_block_wait"
+            )
+        ):
+            continue
+        if not _legacy_policy_extension_security_valid(
+            item,
+            allowed_authority_paths={
+                ("commands_allowed",),
+                ("dv_target_state",),
+                ("executable_action",),
+                ("source_action",),
+                ("selected_window", "action"),
+                ("selected_candidate", "action"),
+                ("execution_window", "action"),
+                ("suppressed_candidates", "action"),
+                ("storage_budget", "charge_budget_w"),
+                ("storage_budget", "export_budget_w"),
+            },
+        ):
+            return None
+        relevant_decisions[revision_hash(hold_semantic_material(item))] = item
+    if len(relevant_decisions) != 1:
+        return None
+    raw_decision = next(iter(relevant_decisions.values()))
+    raw_selected = (
+        raw_decision.get("selected_window")
+        if isinstance(raw_decision.get("selected_window"), dict)
+        else {}
+    )
+    raw_selected_candidate = (
+        raw_decision.get("selected_candidate")
+        if isinstance(raw_decision.get("selected_candidate"), dict)
+        else {}
+    )
+    raw_execution = (
+        raw_decision.get("execution_window")
+        if isinstance(raw_decision.get("execution_window"), dict)
+        else {}
+    )
+    raw_budget = (
+        raw_decision.get("storage_budget")
+        if isinstance(raw_decision.get("storage_budget"), dict)
+        else {}
+    )
+    wait_window_id = "charge-block-wait:%s" % slot_start_ms
+    raw_budget_numeric_keys = {
+        "export_budget_w",
+        "charge_budget_w",
+        "protected_reserve_wh",
+        "sellable_wh",
+        "headroom_deficit_wh",
+        "headroom_required_wh",
+        "headroom_free_before_wh",
+        "headroom_target_soc_pct",
+    }
+    raw_budget_values = {
+        key: _canonical_trajectory_finite_number(raw_budget.get(key))
+        for key in raw_budget_numeric_keys
+    }
+    raw_hold_valid = bool(
+        _legacy_policy_extension_security_valid(
+            raw_decision,
+            allowed_authority_paths={
+                ("commands_allowed",),
+                ("dv_target_state",),
+                ("executable_action",),
+                ("source_action",),
+                ("selected_window", "action"),
+                ("selected_candidate", "action"),
+                ("execution_window", "action"),
+                ("suppressed_candidates", "action"),
+                ("storage_budget", "charge_budget_w"),
+                ("storage_budget", "export_budget_w"),
+            },
+        )
+        and raw_decision.get("schema") == "direct_marketing_policy_v1"
+        and type(raw_decision.get("start_ts")) is int
+        and raw_decision.get("start_ts") == slot_start_ms
+        and type(raw_decision.get("end_ts")) is int
+        and raw_decision.get("end_ts") == slot_end_ms
+        and raw_decision.get("dv_target_state") == "CHARGE_BLOCK_WAIT"
+        and raw_decision.get("source_action")
+        == "direct_marketing_charge_block_wait"
+        and raw_decision.get("executable_action")
+        == "direct_marketing_charge_block_wait"
+        and raw_decision.get("commands_allowed") is True
+        and raw_decision.get("blocked") is False
+        and type(raw_decision.get("execution_window_match_count")) is int
+        and raw_decision.get("execution_window_match_count") == 1
+        and semantic_fields(
+            raw_selected_candidate,
+            selected_semantic_fields,
+        )
+        == semantic_fields(raw_selected, selected_semantic_fields)
+        and raw_decision.get("candidate_actions")
+        == [
+            "eco_plus_negative_headroom_hold",
+            "direct_marketing_charge_block_wait",
+        ]
+        and raw_decision.get("suppressed_candidates")
+        == [{
+            "action": "eco_plus_negative_headroom_hold",
+            "reason": (
+                "superseded_by:direct_marketing_charge_block_wait"
+            ),
+        }]
+        and raw_selected.get("action")
+        == "direct_marketing_charge_block_wait"
+        and raw_selected.get("reason") == "headroom_reservation_hold"
+        and type(raw_selected.get("start_ts")) is int
+        and raw_selected.get("start_ts") == slot_start_ms
+        and type(raw_selected.get("end_ts")) is int
+        and raw_selected.get("end_ts") == slot_end_ms
+        and raw_selected.get("window_id") == wait_window_id
+        and type(raw_execution.get("contract_version")) is int
+        and raw_execution.get("contract_version") == 1
+        and raw_execution.get("action")
+        == "direct_marketing_charge_block_wait"
+        and all(
+            type(raw_execution.get(key)) is int
+            and raw_execution.get(key) == expected
+            for key, expected in (
+                ("start_ts", slot_start_ms),
+                ("end_ts", slot_end_ms),
+                ("plan_window_start_ts", slot_start_ms),
+                ("plan_window_end_ts", slot_end_ms),
+                ("origin_start_ts", slot_start_ms),
+            )
+        )
+        and raw_execution.get("window_id") == wait_window_id
+        and raw_execution.get("plan_window_id") == wait_window_id
+        and raw_execution.get("source") == "active_plan_window"
+        and all(value is not None for value in raw_budget_values.values())
+        and abs(raw_budget_values["export_budget_w"] or 0.0) <= 0.001
+        and abs(raw_budget_values["charge_budget_w"] or 0.0) <= 0.001
+        and raw_budget.get("headroom_hold_active") is True
+        and _optional_numeric_equal(
+            raw_budget_values["protected_reserve_wh"],
+            contract.get("protected_reserve_wh"),
+            tolerance=0.001,
+        )
+        and _optional_numeric_equal(
+            raw_budget_values["sellable_wh"],
+            contract.get("sellable_wh"),
+            tolerance=0.001,
+        )
+        and all(
+            (raw_budget_values[key] or 0.0) >= 0.0
+            for key in raw_budget_numeric_keys
+        )
+    )
+    if not raw_hold_valid:
+        return None
+    planned_w = _canonical_trajectory_finite_number(contract.get("planned_w"))
+    requested_w = _canonical_trajectory_finite_number(
+        projection.get("direct_marketing_requested_w")
+    )
+    projected_planned_w = _canonical_trajectory_finite_number(
+        projection.get("direct_marketing_planned_w")
+    )
+    roles = projection.get("direct_marketing_action_roles")
+    roles_valid = True
+    if roles is not None:
+        roles_valid = bool(
+            isinstance(roles, dict)
+            and roles.get("schema_version")
+            == DIRECT_MARKETING_ACTION_ROLES_SCHEMA
+            and roles.get("status") == "CONSISTENT"
+            and roles.get("candidate_action") == "CHARGE_BLOCK_WAIT"
+            and roles.get("candidate_only") is False
+            and roles.get("plan_selected_action") == "CHARGE_BLOCK_WAIT"
+            and roles.get("plan_executable_action") == "CHARGE_BLOCK_WAIT"
+            and roles.get("effective_action") is None
+            and roles.get("runtime_effect_claim_allowed") is False
+            and _safe_int(roles.get("slot_start_ts_ms"), 0)
+            == _safe_int(canonical_slot.get("start_ts_ms"), 0)
+            and _safe_int(roles.get("slot_end_ts_ms"), 0)
+            == _safe_int(canonical_slot.get("end_ts_ms"), 0)
+        )
+    return (
+        copy.deepcopy(contract)
+        if bool(
+            contract.get("schema_version")
+            == DIRECT_MARKETING_PLAN_PROJECTION_SCHEMA
+            and contract.get("selected") is True
+            and contract.get("plan_executable") is True
+            and contract.get("plan_commands_allowed") is True
+            and contract.get("action") == "CHARGE_BLOCK_WAIT"
+            and contract.get("source_action")
+            == "direct_marketing_charge_block_wait"
+            and contract.get("source_mode") == "eco_plus"
+            and contract.get("source_action_execution_released") is True
+            and planned_w is not None
+            and abs(planned_w) <= 0.001
+            and projection.get("direct_marketing_selected") is True
+            and projection.get("direct_marketing_plan_executable") is True
+            and projection.get("direct_marketing_plan_commands_allowed")
+            is True
+            and projection.get("direct_marketing_plan_action")
+            == "CHARGE_BLOCK_WAIT"
+            and projection.get("direct_marketing_plan_selected_action")
+            in {None, "CHARGE_BLOCK_WAIT"}
+            and projection.get("direct_marketing_plan_executable_action")
+            in {None, "CHARGE_BLOCK_WAIT"}
+            and projection.get("direct_marketing_effective_action") is None
+            and projection.get("direct_marketing_plan_source_action")
+            == contract.get("source_action")
+            and projection.get("direct_marketing_plan_source_mode")
+            == contract.get("source_mode")
+            and projection.get(
+                "direct_marketing_plan_source_action_execution_released"
+            )
+            is True
+            and projection.get("direct_marketing_plan_action_id")
+            == contract.get("action_id")
+            and projection.get("direct_marketing_plan_action_lineage_id")
+            == contract.get("action_lineage_id")
+            and projection.get("direct_marketing_plan_segment_id")
+            == contract.get("segment_id")
+            and projection.get("direct_marketing_window_id")
+            == contract.get("window_id")
+            and requested_w is not None
+            and abs(requested_w) <= 0.001
+            and projected_planned_w is not None
+            and abs(projected_planned_w) <= 0.001
+            and projection.get("direct_marketing_economic_export_gate")
+            is None
+            and projection.get("direct_marketing_headroom_export_gate")
+            is None
+            and projection.get(
+                "direct_marketing_plan_pv_store_source_contract"
+            )
+            is None
+            and roles_valid
+        )
+        else None
+    )
+
+
+def _headroom_projection_policy_window_id(window: Dict[str, Any]) -> str:
+    """Prüft die Producer-ID gegen das kanonische Headroom-Fenstermaterial."""
+
+    explicit = str(
+        window.get("export_plateau_id")
+        or window.get("market_window_id")
+        or window.get("window_id")
+        or ""
+    )
+    action = str(window.get("action") or "")
+    start_raw = window.get("start_ts")
+    end_raw = window.get("end_ts")
+    if not bool(
+        action
+        and type(start_raw) is int
+        and type(end_raw) is int
+        and start_raw > 0
+        and end_raw > start_raw
+    ):
+        return ""
+    material = {
+        "action": action,
+        "start_ts": start_raw,
+        "end_ts": end_raw,
+        "reason": str(window.get("reason") or ""),
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            material,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    canonical = "policy-window:%s" % digest[:24]
+    return canonical if explicit == canonical else ""
+
+
+def _headroom_projection_unreleased_claim_valid(
+    direct: Dict[str, Any],
+    canonical_slot: Dict[str, Any],
+    sidecar_slot: Dict[str, Any],
+) -> bool:
+    """Bindet einen rohen HEADROOM-Policyclaim ohne ihn freizugeben.
+
+    Der Producer kann den wirtschaftlichen Headroom-Slot bereits als Policy
+    beschreiben, obwohl die zentrale Aktionsmatrix diese Hardwarekante bewusst
+    nicht freigibt. Nur der exakt gleiche Slot darf als Anzeigegrundlage
+    dienen; jede Abweichung bleibt ein Konflikt.
+    """
+
+    forbidden_authority_keys = {
+        "acknowledged",
+        "action",
+        "attempted",
+        "auto_limit",
+        "candidate_action",
+        "charge_budget_w",
+        "command",
+        "command_allowed",
+        "commands",
+        "commands_allowed",
+        "confirmed",
+        "control_effect",
+        "dispatch_authorized",
+        "direct_marketing_action",
+        "direct_marketing_plan_action",
+        "direct_marketing_policy_target_state",
+        "direct_marketing_target_state",
+        "dv_target_state",
+        "effective_action",
+        "export_budget_w",
+        "executable",
+        "executable_action",
+        "execution_intent",
+        "field_released",
+        "hardware_command",
+        "hardware_effect",
+        "hardware_effect_claim_allowed",
+        "issued",
+        "issued_action",
+        "issued_power_w",
+        "issued_w",
+        "mode",
+        "mode_name",
+        "mode_value",
+        "plan_executable_action",
+        "plan_action",
+        "plan_selected_action",
+        "power_w",
+        "priority",
+        "request_lifecycle",
+        "requested",
+        "requested_action",
+        "requested_power_w",
+        "requested_w",
+        "runtime_effect_claim_allowed",
+        "runtime_selected_action",
+        "rscp_command_path",
+        "rscp_path",
+        "selected",
+        "selected_action",
+        "selected_power_w",
+        "selected_w",
+        "source_action",
+        "translated_action",
+        "translated_power_w",
+        "state",
+        "target_state",
+        "val",
+    }
+    allowed_authority_paths = {
+        ("commands_allowed",),
+        ("dv_target_state",),
+        ("executable_action",),
+        ("source_action",),
+        ("selected_window", "action"),
+        ("selected_window", "headroom_export_selected"),
+        ("selected_candidate", "action"),
+        ("selected_candidate", "headroom_export_selected"),
+        ("execution_window", "action"),
+        ("storage_budget", "charge_budget_w"),
+        ("storage_budget", "export_budget_w"),
+        ("source_window", "action"),
+        ("source_window", "headroom_export_selected"),
+        ("source_window", "storage_action"),
+    }
+    headroom_aliases = {
+        "HEADROOM_EXPORT",
+        "DIRECT_MARKETING_HEADROOM_EXPORT",
+    }
+    allowed_headroom_alias_paths = {("dv_target_state",)}
+
+    def raw_claim_security_valid(
+        value: Any,
+        path: Tuple[str, ...] = (),
+    ) -> bool:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                normalized_key = str(key).strip().lower()
+                item_path = path + (normalized_key,)
+                if bool(
+                    (
+                        normalized_key in forbidden_authority_keys
+                        or _read_only_extension_authority_key(
+                            normalized_key
+                        )
+                    )
+                    and item_path not in allowed_authority_paths
+                ):
+                    return False
+                if not raw_claim_security_valid(item, item_path):
+                    return False
+            return True
+        if isinstance(value, (list, tuple)):
+            return all(raw_claim_security_valid(item, path) for item in value)
+        return not bool(
+            type(value) is str
+            and value.strip().upper() in headroom_aliases
+            and path not in allowed_headroom_alias_paths
+        )
+
+    start_ms = _safe_int(canonical_slot.get("start_ts_ms"), 0)
+    end_ms = _safe_int(canonical_slot.get("end_ts_ms"), 0)
+    source_action = "eco_plus_negative_headroom_hold"
+
+    def semantic_fields(value: Any, fields: Tuple[str, ...]) -> Dict[str, Any]:
+        source = value if isinstance(value, dict) else {}
+        return {key: copy.deepcopy(source.get(key)) for key in fields}
+
+    selected_semantic_fields = (
+        "action",
+        "end_ts",
+        "headroom_additional_wh",
+        "headroom_export_budget_wh",
+        "headroom_export_selected",
+        "headroom_free_before_wh",
+        "headroom_required_wh",
+        "next_charge_window_start_ts",
+        "reason",
+        "start_ts",
+        "window_id",
+    )
+    execution_semantic_fields = (
+        "action",
+        "contract_version",
+        "end_ts",
+        "origin_start_ts",
+        "plan_window_end_ts",
+        "plan_window_id",
+        "plan_window_start_ts",
+        "source",
+        "start_ts",
+        "window_id",
+    )
+    budget_semantic_fields = (
+        "charge_budget_w",
+        "export_budget_w",
+        "headroom_deficit_wh",
+        "headroom_free_before_wh",
+        "headroom_hold_active",
+        "headroom_required_wh",
+        "headroom_target_soc_pct",
+        "protected_reserve_wh",
+        "sellable_wh",
+    )
+
+    def raw_claim_semantic_material(decision: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "schema": decision.get("schema"),
+            "start_ts": decision.get("start_ts"),
+            "end_ts": decision.get("end_ts"),
+            "commands_allowed": decision.get("commands_allowed"),
+            "blocked": decision.get("blocked"),
+            "dv_target_state": decision.get("dv_target_state"),
+            "source_action": decision.get("source_action"),
+            "executable_action": decision.get("executable_action"),
+            "execution_window_match_count": decision.get(
+                "execution_window_match_count"
+            ),
+            "candidate_actions": copy.deepcopy(
+                decision.get("candidate_actions")
+            ),
+            "suppressed_candidates": copy.deepcopy(
+                decision.get("suppressed_candidates")
+            ),
+            "selected_window": semantic_fields(
+                decision.get("selected_window"),
+                selected_semantic_fields,
+            ),
+            "selected_candidate": semantic_fields(
+                decision.get("selected_candidate"),
+                selected_semantic_fields,
+            ),
+            "execution_window": semantic_fields(
+                decision.get("execution_window"),
+                execution_semantic_fields,
+            ),
+            "storage_budget": semantic_fields(
+                decision.get("storage_budget"),
+                budget_semantic_fields,
+            ),
+        }
+
+    relevant: Dict[str, Dict[str, Any]] = {}
+    decisions = [
+        item
+        for item in direct.get("policy_timeline") or []
+        if isinstance(item, dict)
+    ]
+    current = direct.get("policy_decision")
+    if isinstance(current, dict):
+        decisions.append(current)
+    for decision in decisions:
+        decision_start_ms = _to_ts_ms(decision.get("start_ts"))
+        decision_end_ms = _to_ts_ms(decision.get("end_ts"))
+        if not (
+            decision_start_ms <= start_ms
+            and end_ms <= decision_end_ms
+        ):
+            continue
+        selected = (
+            decision.get("selected_window")
+            if isinstance(decision.get("selected_window"), dict)
+            else {}
+        )
+        execution = (
+            decision.get("execution_window")
+            if isinstance(decision.get("execution_window"), dict)
+            else {}
+        )
+        if bool(
+            str(decision.get("dv_target_state") or "").upper()
+            == "HEADROOM_EXPORT"
+            or str(decision.get("source_action") or "") == source_action
+            or str(selected.get("action") or "") == source_action
+            or str(execution.get("action") or "") == source_action
+        ):
+            if not raw_claim_security_valid(decision):
+                return False
+            relevant[
+                revision_hash(raw_claim_semantic_material(decision))
+            ] = decision
+    if not relevant:
+        return True
+    if len(relevant) != 1:
+        return False
+
+    decision = next(iter(relevant.values()))
+    selected = (
+        decision.get("selected_window")
+        if isinstance(decision.get("selected_window"), dict)
+        else {}
+    )
+    execution = (
+        decision.get("execution_window")
+        if isinstance(decision.get("execution_window"), dict)
+        else {}
+    )
+    budget = (
+        decision.get("storage_budget")
+        if isinstance(decision.get("storage_budget"), dict)
+        else {}
+    )
+    selected_candidate = (
+        decision.get("selected_candidate")
+        if isinstance(decision.get("selected_candidate"), dict)
+        else {}
+    )
+    decision_times_typed = bool(
+        type(decision.get("start_ts")) is int
+        and type(decision.get("end_ts")) is int
+        and decision.get("end_ts") - decision.get("start_ts")
+        >= SLOT_DURATION_S * 1000
+        and (
+            decision.get("end_ts") - decision.get("start_ts")
+        ) % (SLOT_DURATION_S * 1000) == 0
+        and decision.get("start_ts") <= start_ms
+        and end_ms <= decision.get("end_ts")
+    )
+    selected_times_typed = bool(
+        type(selected.get("start_ts")) is int
+        and type(selected.get("end_ts")) is int
+    )
+    execution_times_typed = all(
+        type(execution.get(key)) is int
+        for key in (
+            "start_ts",
+            "end_ts",
+            "origin_start_ts",
+            "plan_window_start_ts",
+            "plan_window_end_ts",
+        )
+    )
+    if not bool(
+        raw_claim_security_valid(decision)
+        and decision_times_typed
+        and selected_times_typed
+        and execution_times_typed
+        and semantic_fields(
+            selected_candidate,
+            selected_semantic_fields,
+        )
+        == semantic_fields(selected, selected_semantic_fields)
+        and decision.get("candidate_actions") == [source_action]
+        and decision.get("suppressed_candidates") == []
+    ):
+        return False
+    selected_window_id = _headroom_projection_policy_window_id(selected)
+    source_windows = [
+        item
+        for item in direct.get("windows") or []
+        if isinstance(item, dict)
+        and item.get("action") == source_action
+        and _to_ts_ms(item.get("start_ts")) <= start_ms
+        and end_ms <= _to_ts_ms(item.get("end_ts"))
+        and _headroom_projection_policy_window_id(item)
+        == selected_window_id
+        and item.get("headroom_export_selected") is True
+    ]
+    if len(source_windows) != 1:
+        return False
+    source_window = source_windows[0]
+    if not bool(
+        raw_claim_security_valid(source_window, ("source_window",))
+        and type(source_window.get("start_ts")) is int
+        and type(source_window.get("end_ts")) is int
+    ):
+        return False
+    source_window_id = _headroom_projection_policy_window_id(source_window)
+    projected_w = _canonical_trajectory_finite_number(
+        sidecar_slot.get("projected_power_w")
+    )
+    slot_energy_wh = _canonical_trajectory_finite_number(
+        sidecar_slot.get("headroom_export_slot_energy_wh")
+    )
+    budget_wh = _canonical_trajectory_finite_number(
+        sidecar_slot.get("headroom_export_budget_wh")
+    )
+    sidecar_sellable_wh = _canonical_trajectory_finite_number(
+        sidecar_slot.get("sellable_wh")
+    )
+    sidecar_deficit_wh = _canonical_trajectory_finite_number(
+        sidecar_slot.get("headroom_deficit_wh")
+    )
+    sidecar_budget_id = str(
+        sidecar_slot.get("headroom_export_budget_id") or ""
+    )
+    raw_projection_plan = (
+        direct.get("headroom_projection_plan")
+        if isinstance(direct.get("headroom_projection_plan"), dict)
+        else {}
+    )
+    # Ein fachliches Headroom-Fenster darf für die Anzeige zusammengefasst
+    # sein, während der Sidecar absichtlich viertelstundengenau bleibt. Alle
+    # Sidecar-Slots desselben Policyfensters binden daher an dessen Budget am
+    # Fensteranfang; erst das nächste Policyfenster muss den Rollforward tragen.
+    decision_start_ms = _to_ts_ms(decision.get("start_ts"))
+    prior_effective_energy_wh = 0.0
+    prior_budget_slots_valid = True
+    for item in raw_projection_plan.get("slots") or []:
+        if not isinstance(item, dict):
+            prior_budget_slots_valid = False
+            break
+        if str(item.get("headroom_export_budget_id") or "") != sidecar_budget_id:
+            continue
+        item_end_ms = item.get("end_ts")
+        if type(item_end_ms) is not int or item_end_ms > decision_start_ms:
+            continue
+        item_energy_wh = _canonical_trajectory_finite_number(
+            item.get("headroom_export_slot_energy_wh")
+        )
+        if item_energy_wh is None or item_energy_wh <= 0.0:
+            prior_budget_slots_valid = False
+            break
+        prior_effective_energy_wh += item_energy_wh
+    expected_runtime_sellable_wh = (
+        round(max(0.0, sidecar_sellable_wh - prior_effective_energy_wh), 0)
+        if sidecar_sellable_wh is not None
+        else None
+    )
+    expected_runtime_deficit_wh = (
+        round(max(0.0, sidecar_deficit_wh - prior_effective_energy_wh), 0)
+        if sidecar_deficit_wh is not None
+        else None
+    )
+    comparable_pairs = (
+        (budget.get("export_budget_w"), projected_w),
+        (budget.get("charge_budget_w"), 0.0),
+        (
+            budget.get("protected_reserve_wh"),
+            sidecar_slot.get("protected_reserve_wh"),
+        ),
+        (budget.get("sellable_wh"), expected_runtime_sellable_wh),
+        (budget.get("headroom_deficit_wh"), expected_runtime_deficit_wh),
+        (
+            selected.get("headroom_export_budget_wh"),
+            budget_wh,
+        ),
+        (
+            selected.get("headroom_required_wh"),
+            sidecar_slot.get("headroom_required_wh"),
+        ),
+        (
+            selected.get("headroom_free_before_wh"),
+            sidecar_slot.get("headroom_free_before_wh"),
+        ),
+        (source_window.get("max_power_w"), projected_w),
+        (
+            source_window.get("headroom_export_budget_wh"),
+            budget_wh,
+        ),
+        (
+            source_window.get("negative_headroom_required_wh"),
+            sidecar_slot.get("headroom_required_wh"),
+        ),
+        (
+            source_window.get("negative_headroom_free_before_wh"),
+            sidecar_slot.get("headroom_free_before_wh"),
+        ),
+        (
+            source_window.get("negative_headroom_forecast_surplus_wh"),
+            sidecar_slot.get("forecast_absorption_wh"),
+        ),
+        (
+            source_window.get("soc_ceiling_pct"),
+            sidecar_slot.get("target_soc_pct"),
+        ),
+    )
+    if not bool(
+        prior_budget_slots_valid
+        and all(
+            _canonical_trajectory_finite_number(left) is not None
+            and _canonical_trajectory_finite_number(right) is not None
+            and abs(float(left) - float(right)) <= 0.001
+            for left, right in comparable_pairs
+        )
+    ):
+        return False
+    source_start_ms = _to_ts_ms(source_window.get("start_ts"))
+    source_end_ms = _to_ts_ms(source_window.get("end_ts"))
+    source_duration_h = (source_end_ms - source_start_ms) / 3_600_000.0
+    source_theoretical_kwh = _canonical_trajectory_finite_number(
+        source_window.get("theoretical_kwh")
+    )
+    source_power_w = _canonical_trajectory_finite_number(
+        source_window.get("max_power_w")
+    )
+    source_required_pct = _canonical_trajectory_finite_number(
+        source_window.get("negative_headroom_required_pct")
+    )
+    if not bool(
+        source_theoretical_kwh is not None
+        and source_power_w is not None
+        and source_required_pct is not None
+        and source_duration_h > 0.0
+        and abs(
+            source_theoretical_kwh * 1000.0
+            - source_power_w * source_duration_h
+        )
+        <= 0.501
+        and abs(
+            float(sidecar_slot.get("target_soc_pct"))
+            - max(
+                float(sidecar_slot.get("reserve_floor_soc_pct")),
+                100.0 - source_required_pct,
+            )
+        )
+        <= 0.001
+    ):
+        return False
+    action_matrix = direct_marketing_action_contract("HEADROOM_EXPORT")
+    source_releases = (
+        action_matrix.get("source_action_execution_release")
+        if isinstance(action_matrix, dict)
+        and isinstance(
+            action_matrix.get("source_action_execution_release"),
+            dict,
+        )
+        else {}
+    )
+    return bool(
+        _normalized_direct_marketing_mode(direct.get("mode")) == "eco_plus"
+        and isinstance(action_matrix, dict)
+        and action_matrix.get("plan_action") == "HEADROOM_EXPORT"
+        and action_matrix.get("canonical_execution_released") is False
+        and source_action in set(action_matrix.get("source_actions") or ())
+        and source_releases.get(source_action) is False
+        and direct_marketing_source_action_mode_valid(
+            "HEADROOM_EXPORT",
+            source_action,
+            "eco_plus",
+        )
+        and not direct_marketing_source_action_released(
+            "HEADROOM_EXPORT",
+            source_action,
+        )
+        and decision.get("schema") == "direct_marketing_policy_v1"
+        and decision.get("commands_allowed") is True
+        and decision.get("blocked") is False
+        and str(decision.get("dv_target_state") or "").upper()
+        == "HEADROOM_EXPORT"
+        and str(decision.get("source_action") or "") == source_action
+        and str(decision.get("executable_action") or "") == source_action
+        and str(selected.get("action") or "") == source_action
+        and str(execution.get("action") or "") == source_action
+        and type(execution.get("contract_version")) is int
+        and execution.get("contract_version") == 1
+        and execution.get("source") == "active_plan_window"
+        and type(decision.get("execution_window_match_count")) is int
+        and decision.get("execution_window_match_count") == 1
+        and budget.get("headroom_hold_active") is False
+        and selected.get("headroom_export_selected") is True
+        and selected.get("next_charge_window_start_ts")
+        == sidecar_slot.get("next_charge_start_ts")
+        and source_window.get("negative_headroom_next_start_ts")
+        == sidecar_slot.get("next_charge_start_ts")
+        and source_window.get("negative_headroom_next_end_ts")
+        == sidecar_slot.get("next_charge_end_ts")
+        and selected_window_id
+        and selected_window_id == source_window_id
+        and str(execution.get("window_id") or "") == selected_window_id
+        and str(execution.get("plan_window_id") or "") == source_window_id
+        and _to_ts_ms(selected.get("start_ts")) == source_start_ms
+        and _to_ts_ms(selected.get("end_ts")) == source_end_ms
+        and _to_ts_ms(execution.get("start_ts")) <= start_ms
+        and end_ms <= _to_ts_ms(execution.get("end_ts"))
+        and _to_ts_ms(execution.get("plan_window_start_ts"))
+        == source_start_ms
+        and _to_ts_ms(execution.get("plan_window_end_ts"))
+        == source_end_ms
+    )
+
+
+def _direct_marketing_headroom_projection_state(
+    direct: Dict[str, Any],
+    canonical: Dict[str, Any],
+    valid_from_ms: int,
+    horizon_end_ms: int,
+    capacity_wh: float,
+) -> Dict[str, Any]:
+    """Validiert den strikt wirkungslosen Headroom-Projektions-Sidecar.
+
+    Der Vertrag stammt aus bereits final priorisierten Producer-Slots. Er ist
+    ausdrücklich weder Policyentscheidung noch Runtimefreigabe. Jeder Fehler
+    verwirft deshalb die gesamte Anzeige-Trajektorie, ohne den Dispatchplan zu
+    verändern.
+    """
+
+    raw_plan = direct.get("headroom_projection_plan")
+    absent = {
+        "present": False,
+        "valid": True,
+        "reason_code": None,
+        "plan_revision": None,
+        "bindings_by_slot": {},
+        "projection_ids": set(),
+    }
+    if raw_plan is None:
+        return absent
+
+    def invalid(code: str) -> Dict[str, Any]:
+        return {
+            "present": True,
+            "valid": False,
+            "reason_code": code,
+            "plan_revision": None,
+            "bindings_by_slot": {},
+            "projection_ids": set(),
+        }
+
+    if not isinstance(raw_plan, dict):
+        return invalid("HEADROOM_PROJECTION_PLAN_TYPE_INVALID")
+    plan = raw_plan
+    revision = plan.get("revision")
+    revision_material = copy.deepcopy(plan)
+    revision_material.pop("revision", None)
+    slots_raw = plan.get("slots")
+    groups_raw = plan.get("groups")
+    root_keys = {
+        "schema",
+        "energy_basis",
+        "generated_at_ts",
+        "effective_start_ts",
+        "effective_end_ts",
+        "effective_duration_s",
+        "projection_only",
+        "executable",
+        "commands_allowed",
+        "hardware_effect",
+        "slot_duration_s",
+        "projected_action",
+        "projected_source_action",
+        "projected_mode",
+        "complete",
+        "status",
+        "invalid_slot_count",
+        "slot_count",
+        "group_count",
+        "groups",
+        "slots",
+        "revision",
+    }
+    root_mode = _normalized_direct_marketing_mode(plan.get("projected_mode"))
+    direct_mode = _normalized_direct_marketing_mode(direct.get("mode"))
+    generated_at_ts = plan.get("generated_at_ts")
+    effective_root_duration_s = _canonical_trajectory_finite_number(
+        plan.get("effective_duration_s")
+    )
+    if not bool(
+        set(plan) == root_keys
+        and plan.get("schema")
+        == DIRECT_MARKETING_HEADROOM_PROJECTION_PLAN_SCHEMA
+        and plan.get("energy_basis")
+        == DIRECT_MARKETING_HEADROOM_ENERGY_BASIS
+        and type(generated_at_ts) is int
+        and type(direct.get("created_ts")) is int
+        and generated_at_ts == direct.get("created_ts")
+        and effective_root_duration_s is not None
+        and effective_root_duration_s >= 0.0
+        and plan.get("projection_only") is True
+        and plan.get("executable") is False
+        and plan.get("commands_allowed") is False
+        and plan.get("hardware_effect") is False
+        and type(plan.get("slot_duration_s")) is int
+        and plan.get("slot_duration_s") == SLOT_DURATION_S
+        and plan.get("projected_action") == "HEADROOM_EXPORT"
+        and plan.get("projected_source_action")
+        == "eco_plus_negative_headroom_hold"
+        and direct_mode == root_mode
+        and (
+            root_mode == "eco_plus"
+            or (
+                isinstance(slots_raw, list)
+                and not slots_raw
+                and isinstance(groups_raw, list)
+                and not groups_raw
+            )
+        )
+        and (
+            (
+                bool(slots_raw)
+                and type(plan.get("effective_start_ts")) is int
+                and type(plan.get("effective_end_ts")) is int
+                and plan.get("effective_start_ts")
+                < plan.get("effective_end_ts")
+                and effective_root_duration_s > 0.0
+            )
+            or (
+                not slots_raw
+                and plan.get("effective_start_ts") is None
+                and plan.get("effective_end_ts") is None
+                and effective_root_duration_s == 0.0
+            )
+        )
+        and plan.get("complete") is True
+        and plan.get("status") == "complete"
+        and type(plan.get("invalid_slot_count")) is int
+        and plan.get("invalid_slot_count") == 0
+        and isinstance(slots_raw, list)
+        and isinstance(groups_raw, list)
+        and type(plan.get("slot_count")) is int
+        and plan.get("slot_count") == len(slots_raw)
+        and type(plan.get("group_count")) is int
+        and plan.get("group_count") == len(groups_raw)
+        and _sha256_revision_valid(revision)
+        and revision == revision_hash(revision_material)
+    ):
+        return invalid("HEADROOM_PROJECTION_PLAN_ROOT_INVALID")
+
+    canonical_slots = {
+        (
+            _safe_int(item.get("start_ts_ms"), 0),
+            _safe_int(item.get("end_ts_ms"), 0),
+        ): item
+        for item in canonical.get("slots") or []
+        if isinstance(item, dict)
+    }
+    bindings_by_slot: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    slots_by_budget: Dict[str, List[Dict[str, Any]]] = {}
+    projection_ids = set()
+    previous_start_ms: Optional[int] = None
+    numeric_keys = (
+        "effective_duration_s",
+        "effective_window_duration_s",
+        "projected_power_w",
+        "headroom_export_slot_energy_wh",
+        "headroom_export_budget_wh",
+        "reserve_floor_soc_pct",
+        "target_soc_pct",
+        "protected_reserve_wh",
+        "sellable_wh",
+        "headroom_deficit_wh",
+        "headroom_required_wh",
+        "headroom_free_before_wh",
+        "forecast_absorption_wh",
+    )
+    slot_keys = {
+        "headroom_export_slot_id",
+        "projection_id",
+        "headroom_export_budget_id",
+        "window_id",
+        "segment_id",
+        "start_ts",
+        "end_ts",
+        "duration_s",
+        "effective_start_ts",
+        "effective_duration_s",
+        "energy_basis",
+        "projection_only",
+        "executable",
+        "commands_allowed",
+        "hardware_effect",
+        "projected_action",
+        "projected_source_action",
+        "projected_mode",
+        "projected_power_w",
+        "headroom_export_slot_energy_wh",
+        "headroom_export_budget_wh",
+        "reserve_floor_soc_pct",
+        "target_soc_pct",
+        "protected_reserve_wh",
+        "sellable_wh",
+        "headroom_deficit_wh",
+        "headroom_required_wh",
+        "headroom_free_before_wh",
+        "forecast_absorption_wh",
+        "next_charge_start_ts",
+        "next_charge_end_ts",
+        "window_start_ts",
+        "window_end_ts",
+        "effective_window_start_ts",
+        "effective_window_end_ts",
+        "effective_window_duration_s",
+        "projection_horizon_contract",
+    }
+    for item in slots_raw:
+        if not isinstance(item, dict) or set(item) != slot_keys:
+            return invalid("HEADROOM_PROJECTION_SLOT_TYPE_INVALID")
+        values = {
+            key: _canonical_trajectory_finite_number(item.get(key))
+            for key in numeric_keys
+        }
+        start_ms = item.get("start_ts")
+        end_ms = item.get("end_ts")
+        effective_start_ms = item.get("effective_start_ts")
+        effective_duration_s = values["effective_duration_s"]
+        window_start_ms = item.get("window_start_ts")
+        window_end_ms = item.get("window_end_ts")
+        effective_window_start_ms = item.get("effective_window_start_ts")
+        effective_window_end_ms = item.get("effective_window_end_ts")
+        effective_window_duration_s = values[
+            "effective_window_duration_s"
+        ]
+        next_charge_start_ms = item.get("next_charge_start_ts")
+        next_charge_end_ms = item.get("next_charge_end_ts")
+        budget_id = str(item.get("headroom_export_budget_id") or "")
+        window_id = str(item.get("window_id") or "")
+        segment_id = str(item.get("segment_id") or "")
+        slot_id = str(item.get("headroom_export_slot_id") or "")
+        projection_id = str(item.get("projection_id") or "")
+        if not bool(
+            type(start_ms) is int
+            and type(end_ms) is int
+            and type(effective_start_ms) is int
+            and type(window_start_ms) is int
+            and type(window_end_ms) is int
+            and type(effective_window_start_ms) is int
+            and type(effective_window_end_ms) is int
+            and type(next_charge_start_ms) is int
+            and type(next_charge_end_ms) is int
+            and end_ms - start_ms == SLOT_DURATION_S * 1000
+            and type(item.get("duration_s")) is int
+            and item.get("duration_s") == SLOT_DURATION_S
+            and effective_start_ms == max(start_ms, generated_at_ts)
+            and effective_duration_s is not None
+            and 0.0 < effective_duration_s <= SLOT_DURATION_S
+            and abs(
+                effective_duration_s
+                - (end_ms - effective_start_ms) / 1000.0
+            )
+            <= 0.000001
+            and item.get("energy_basis")
+            == DIRECT_MARKETING_HEADROOM_ENERGY_BASIS
+            and valid_from_ms <= start_ms < end_ms <= horizon_end_ms
+            and window_start_ms <= start_ms < end_ms <= window_end_ms
+            and effective_window_start_ms
+            <= effective_start_ms < end_ms <= effective_window_end_ms
+            and effective_window_duration_s is not None
+            and effective_window_duration_s > 0.0
+            and window_end_ms <= next_charge_start_ms < next_charge_end_ms
+            and item.get("projection_horizon_contract")
+            == "ordered_unique_slots_non_contiguous_allowed_v1"
+            and item.get("projection_only") is True
+            and item.get("executable") is False
+            and item.get("commands_allowed") is False
+            and item.get("hardware_effect") is False
+            and item.get("projected_action") == "HEADROOM_EXPORT"
+            and item.get("projected_source_action")
+            == "eco_plus_negative_headroom_hold"
+            and _normalized_direct_marketing_mode(item.get("projected_mode"))
+            == root_mode
+            and item.get("selected") is not True
+            and item.get("requested_w") is None
+            and item.get("plan_action") is None
+            and item.get("runtime_effect_claim_allowed") is not True
+            and all(value is not None for value in values.values())
+            and _headroom_projection_prefixed_id(
+                budget_id,
+                "headroom-budget:",
+            )
+            and _headroom_projection_prefixed_id(
+                window_id,
+                "headroom-window:",
+            )
+            and _headroom_projection_prefixed_id(
+                segment_id,
+                "headroom-segment:",
+            )
+            and _headroom_projection_prefixed_id(
+                slot_id,
+                "headroom-slot:",
+            )
+            and projection_id == slot_id
+            and projection_id not in projection_ids
+            and (start_ms, end_ms) not in bindings_by_slot
+            and (start_ms, end_ms) in canonical_slots
+            and (previous_start_ms is None or start_ms > previous_start_ms)
+        ):
+            return invalid("HEADROOM_PROJECTION_SLOT_BINDING_INVALID")
+
+        projected_w = values["projected_power_w"] or 0.0
+        slot_energy_wh = values["headroom_export_slot_energy_wh"] or 0.0
+        budget_wh = values["headroom_export_budget_wh"] or 0.0
+        reserve_floor_pct = values["reserve_floor_soc_pct"] or 0.0
+        target_soc_pct = values["target_soc_pct"] or 0.0
+        protected_reserve_wh = values["protected_reserve_wh"] or 0.0
+        sellable_wh = values["sellable_wh"] or 0.0
+        deficit_wh = values["headroom_deficit_wh"] or 0.0
+        expected_slot_wh = (
+            projected_w * (effective_duration_s or 0.0) / 3600.0
+        )
+        expected_protected_wh = reserve_floor_pct / 100.0 * capacity_wh
+        if not bool(
+            projected_w > 0.0
+            and slot_energy_wh > 0.0
+            and budget_wh >= slot_energy_wh
+            and abs(slot_energy_wh - expected_slot_wh) <= 0.125001
+            and 0.0 <= reserve_floor_pct <= target_soc_pct <= 100.0
+            and protected_reserve_wh >= 0.0
+            and abs(protected_reserve_wh - expected_protected_wh) <= 1.0
+            and sellable_wh > 0.0
+            and deficit_wh > 0.0
+            and budget_wh <= sellable_wh + 1.0
+            and budget_wh <= deficit_wh + 1.0
+            and all(
+                (values[key] or 0.0) >= 0.0
+                for key in (
+                    "headroom_required_wh",
+                    "headroom_free_before_wh",
+                    "forecast_absorption_wh",
+                )
+            )
+        ):
+            return invalid("HEADROOM_PROJECTION_SLOT_CONTRACT_INVALID")
+        canonical_slot = canonical_slots[(start_ms, end_ms)]
+        canonical_projection = (
+            canonical_slot.get("projection")
+            if isinstance(canonical_slot.get("projection"), dict)
+            else {}
+        )
+        if bool(
+            _headroom_projection_active_marker_present(canonical_projection)
+            and _headroom_projection_runtime_hold_contract(
+                direct,
+                canonical_slot,
+            )
+            is None
+        ):
+            return invalid("HEADROOM_PROJECTION_ACTIVE_MARKER_PRESENT")
+        if not _headroom_projection_unreleased_claim_valid(
+            direct,
+            canonical_slot,
+            item,
+        ):
+            return invalid("HEADROOM_PROJECTION_POLICY_BINDING_INVALID")
+        binding = {
+            "schema": DIRECT_MARKETING_HEADROOM_PROJECTION_BINDING_SCHEMA,
+            "projection_only": True,
+            "projection_plan_revision": revision,
+            "slot": copy.deepcopy(item),
+        }
+        bindings_by_slot[(start_ms, end_ms)] = binding
+        slots_by_budget.setdefault(budget_id, []).append(item)
+        projection_ids.add(projection_id)
+        previous_start_ms = start_ms
+
+    groups_by_budget: Dict[str, Dict[str, Any]] = {}
+    group_keys = {
+        "headroom_export_budget_id",
+        "headroom_export_budget_wh",
+        "projected_energy_wh",
+        "energy_basis",
+        "window_id",
+        "segment_id",
+        "window_start_ts",
+        "window_end_ts",
+        "effective_start_ts",
+        "effective_end_ts",
+        "effective_duration_s",
+        "projection_horizon_contract",
+        "reserve_floor_soc_pct",
+        "target_soc_pct",
+        "protected_reserve_wh",
+        "sellable_wh",
+        "headroom_deficit_wh",
+        "headroom_required_wh",
+        "headroom_free_before_wh",
+        "forecast_absorption_wh",
+        "next_charge_start_ts",
+        "next_charge_end_ts",
+        "slot_ids",
+    }
+    for group in groups_raw:
+        if not isinstance(group, dict) or set(group) != group_keys:
+            return invalid("HEADROOM_PROJECTION_GROUP_TYPE_INVALID")
+        budget_id = str(group.get("headroom_export_budget_id") or "")
+        if budget_id in groups_by_budget:
+            return invalid("HEADROOM_PROJECTION_GROUP_DUPLICATE")
+        groups_by_budget[budget_id] = group
+    if set(groups_by_budget) != set(slots_by_budget):
+        return invalid("HEADROOM_PROJECTION_GROUP_COVERAGE_INVALID")
+    for budget_id, group_slots in slots_by_budget.items():
+        group = groups_by_budget[budget_id]
+        ordered = sorted(group_slots, key=lambda item: item["start_ts"])
+        first = ordered[0]
+        projected_energy_wh = sum(
+            float(item["headroom_export_slot_energy_wh"])
+            for item in ordered
+        )
+        window_start_ms = min(item["start_ts"] for item in ordered)
+        window_end_ms = max(item["end_ts"] for item in ordered)
+        effective_start_ms = min(
+            item["effective_start_ts"] for item in ordered
+        )
+        effective_end_ms = max(item["end_ts"] for item in ordered)
+        effective_duration_s = round(
+            sum(float(item["effective_duration_s"]) for item in ordered),
+            3,
+        )
+        expected_slot_ids = [
+            item["headroom_export_slot_id"] for item in ordered
+        ]
+        group_numeric_keys = (
+            "headroom_export_budget_wh",
+            "projected_energy_wh",
+            "effective_duration_s",
+            "reserve_floor_soc_pct",
+            "target_soc_pct",
+            "protected_reserve_wh",
+            "sellable_wh",
+            "headroom_deficit_wh",
+            "headroom_required_wh",
+            "headroom_free_before_wh",
+            "forecast_absorption_wh",
+        )
+        group_values = {
+            key: _canonical_trajectory_finite_number(group.get(key))
+            for key in group_numeric_keys
+        }
+        if not bool(
+            all(value is not None for value in group_values.values())
+            and group.get("energy_basis")
+            == DIRECT_MARKETING_HEADROOM_ENERGY_BASIS
+            and group.get("energy_basis") == first.get("energy_basis")
+            and group.get("window_id") == first.get("window_id")
+            and group.get("segment_id") == first.get("segment_id")
+            and type(group.get("window_start_ts")) is int
+            and group.get("window_start_ts") == window_start_ms
+            and type(group.get("window_end_ts")) is int
+            and group.get("window_end_ts") == window_end_ms
+            and type(group.get("effective_start_ts")) is int
+            and group.get("effective_start_ts") == effective_start_ms
+            and type(group.get("effective_end_ts")) is int
+            and group.get("effective_end_ts") == effective_end_ms
+            and abs(
+                (group_values["effective_duration_s"] or 0.0)
+                - effective_duration_s
+            )
+            <= 0.001
+            and group.get("projection_horizon_contract")
+            == "ordered_unique_slots_non_contiguous_allowed_v1"
+            and group.get("slot_ids") == expected_slot_ids
+            and type(group.get("next_charge_start_ts")) is int
+            and group.get("next_charge_start_ts")
+            == first.get("next_charge_start_ts")
+            and type(group.get("next_charge_end_ts")) is int
+            and group.get("next_charge_end_ts")
+            == first.get("next_charge_end_ts")
+            and all(
+                abs((group_values[key] or 0.0) - float(first[key]))
+                <= 0.001
+                for key in group_numeric_keys
+                if key not in {"projected_energy_wh", "effective_duration_s"}
+            )
+            and abs(
+                (group_values["projected_energy_wh"] or 0.0)
+                - projected_energy_wh
+            )
+            <= 0.001
+            and projected_energy_wh
+            <= (group_values["headroom_export_budget_wh"] or 0.0) + 1.0
+            and all(
+                left["end_ts"] <= right["start_ts"]
+                for left, right in zip(ordered, ordered[1:])
+            )
+        ):
+            return invalid("HEADROOM_PROJECTION_GROUP_CONTRACT_INVALID")
+
+        expected_window_revision = revision_hash({
+            "schema": DIRECT_MARKETING_HEADROOM_PROJECTION_PLAN_SCHEMA,
+            "energy_basis": DIRECT_MARKETING_HEADROOM_ENERGY_BASIS,
+            "headroom_export_budget_id": budget_id,
+            "window_start_ts": window_start_ms,
+            "window_end_ts": window_end_ms,
+            "effective_start_ts": effective_start_ms,
+            "effective_end_ts": effective_end_ms,
+            "effective_duration_s": effective_duration_s,
+        })
+        expected_segment_revision = revision_hash({
+            "schema": DIRECT_MARKETING_HEADROOM_PROJECTION_PLAN_SCHEMA,
+            "energy_basis": DIRECT_MARKETING_HEADROOM_ENERGY_BASIS,
+            "headroom_export_budget_id": budget_id,
+            "reserve_floor_soc_pct": round(
+                float(first["reserve_floor_soc_pct"]),
+                3,
+            ),
+            "target_soc_pct": round(float(first["target_soc_pct"]), 3),
+            "effective_start_ts": effective_start_ms,
+            "effective_end_ts": effective_end_ms,
+            "effective_duration_s": effective_duration_s,
+        })
+        expected_window_id = (
+            "headroom-window:%s" % expected_window_revision[7:]
+        )
+        expected_segment_id = (
+            "headroom-segment:%s" % expected_segment_revision[7:]
+        )
+        for item in ordered:
+            slot_identity = {
+                "schema": DIRECT_MARKETING_HEADROOM_PROJECTION_PLAN_SCHEMA,
+                "energy_basis": DIRECT_MARKETING_HEADROOM_ENERGY_BASIS,
+                "headroom_export_budget_id": budget_id,
+                "window_id": expected_window_id,
+                "segment_id": expected_segment_id,
+                "start_ts": item["start_ts"],
+                "end_ts": item["end_ts"],
+                "effective_start_ts": item["effective_start_ts"],
+                "effective_duration_s": item["effective_duration_s"],
+                "effective_window_start_ts": effective_start_ms,
+                "effective_window_end_ts": effective_end_ms,
+                "effective_window_duration_s": effective_duration_s,
+                "projected_action": "HEADROOM_EXPORT",
+                "projected_source_action": (
+                    "eco_plus_negative_headroom_hold"
+                ),
+                "projected_mode": root_mode,
+                "projected_power_w": item["projected_power_w"],
+                "headroom_export_slot_energy_wh": item[
+                    "headroom_export_slot_energy_wh"
+                ],
+            }
+            expected_slot_revision = revision_hash(slot_identity)
+            expected_slot_id = (
+                "headroom-slot:%s" % expected_slot_revision[7:]
+            )
+            if not bool(
+                item.get("window_id") == expected_window_id
+                and item.get("segment_id") == expected_segment_id
+                and item.get("window_start_ts") == window_start_ms
+                and item.get("window_end_ts") == window_end_ms
+                and item.get("effective_window_start_ts")
+                == effective_start_ms
+                and item.get("effective_window_end_ts") == effective_end_ms
+                and _optional_numeric_equal(
+                    item.get("effective_window_duration_s"),
+                    effective_duration_s,
+                    tolerance=0.001,
+                )
+                and item.get("headroom_export_slot_id") == expected_slot_id
+                and item.get("projection_id") == expected_slot_id
+            ):
+                return invalid("HEADROOM_PROJECTION_GROUP_IDENTITY_INVALID")
+
+    all_sidecar_slots = [
+        item
+        for group_slots in slots_by_budget.values()
+        for item in group_slots
+    ]
+    expected_root_start_ms = min(
+        (item["effective_start_ts"] for item in all_sidecar_slots),
+        default=None,
+    )
+    expected_root_end_ms = max(
+        (item["end_ts"] for item in all_sidecar_slots),
+        default=None,
+    )
+    expected_root_duration_s = round(
+        sum(float(item["effective_duration_s"]) for item in all_sidecar_slots),
+        3,
+    )
+    if not bool(
+        plan.get("effective_start_ts") == expected_root_start_ms
+        and plan.get("effective_end_ts") == expected_root_end_ms
+        and _optional_numeric_equal(
+            plan.get("effective_duration_s"),
+            expected_root_duration_s,
+            tolerance=0.001,
+        )
+    ):
+        return invalid("HEADROOM_PROJECTION_ROOT_HORIZON_INVALID")
+
+    return {
+        "present": True,
+        "valid": True,
+        "reason_code": None,
+        "plan_revision": revision,
+        "bindings_by_slot": bindings_by_slot,
+        "projection_ids": projection_ids,
+    }
 
 
 def _direct_marketing_pv_axis_evidence_for_slot(
@@ -2997,6 +5707,74 @@ def _direct_marketing_pv_axis_evidence_for_slot(
     }
 
 
+def _canonical_pre_valid_from_soc_chain_valid(
+    source: Dict[str, Any],
+    canonical_slots: List[Dict[str, Any]],
+    valid_from_ms: int,
+) -> bool:
+    """Belegt einen natürlichen SoC-Rollforward vor dem gültigen Horizont."""
+
+    current = [
+        slot
+        for slot in canonical_slots
+        if _safe_int(slot.get("start_ts_ms"), 0) == valid_from_ms
+    ]
+    previous = sorted(
+        (
+            slot
+            for slot in canonical_slots
+            if _safe_int(slot.get("start_ts_ms"), 0) < valid_from_ms
+        ),
+        key=lambda slot: _safe_int(slot.get("start_ts_ms"), 0),
+    )
+    if len(current) != 1 or not previous:
+        return False
+    chain = [*previous, current[0]]
+    source_soc = _canonical_trajectory_finite_number(
+        source.get("current_soc")
+    )
+    axes: List[tuple[int, int, float, float]] = []
+    for slot in chain:
+        start_ms = _safe_int(slot.get("start_ts_ms"), 0)
+        end_ms = _safe_int(slot.get("end_ts_ms"), 0)
+        soc = (
+            slot.get("soc_pct")
+            if isinstance(slot.get("soc_pct"), dict)
+            else {}
+        )
+        soc_start = _canonical_trajectory_finite_number(soc.get("start"))
+        soc_end = _canonical_trajectory_finite_number(soc.get("end"))
+        if not bool(
+            end_ms - start_ms == SLOT_DURATION_S * 1000
+            and soc_start is not None
+            and 0.0 <= soc_start <= 100.0
+            and soc_end is not None
+            and 0.0 <= soc_end <= 100.0
+        ):
+            return False
+        axes.append((start_ms, end_ms, soc_start, soc_end))
+    if not bool(
+        source_soc is not None
+        and _optional_numeric_equal(
+            axes[0][2],
+            source_soc,
+            tolerance=0.0015,
+        )
+        and axes[-2][1] == valid_from_ms
+        and axes[-1][0] == valid_from_ms
+    ):
+        return False
+    return all(
+        left[1] == right[0]
+        and _optional_numeric_equal(
+            left[3],
+            right[2],
+            tolerance=0.0015,
+        )
+        for left, right in zip(axes, axes[1:])
+    )
+
+
 def _materialize_direct_marketing_trajectory(
     source: Dict[str, Any],
     canonical: Dict[str, Any],
@@ -3043,21 +5821,80 @@ def _materialize_direct_marketing_trajectory(
     }
     if not _direct_marketing_enabled(direct):
         return base
-    if not _direct_marketing_execution_enabled(direct):
+    canonical_slots = [
+        slot
+        for slot in canonical.get("slots") or []
+        if isinstance(slot, dict)
+    ]
+    slots = [
+        slot
+        for slot in canonical_slots
+        if _safe_int(slot.get("start_ts_ms"), 0) >= valid_from_ms
+    ]
+    pre_valid_from_soc_chain_valid = (
+        _canonical_pre_valid_from_soc_chain_valid(
+            source,
+            canonical_slots,
+            valid_from_ms,
+        )
+    )
+    capacity_wh = _battery_capacity_wh(source)
+    headroom_projection_state = (
+        _direct_marketing_headroom_projection_state(
+            direct,
+            canonical,
+            valid_from_ms,
+            _safe_int(canonical.get("horizon_end_ts_ms"), 0),
+            capacity_wh,
+        )
+    )
+    if (
+        headroom_projection_state.get("present") is True
+        and headroom_projection_state.get("valid") is not True
+    ):
+        base.update({
+            "active": True,
+            "complete": False,
+            "status": "HEADROOM_PROJECTION_PLAN_INVALID",
+            "reason_code": headroom_projection_state.get("reason_code"),
+            "slots": [],
+        })
+        return base
+    headroom_projection_bindings = (
+        headroom_projection_state.get("bindings_by_slot")
+        if isinstance(
+            headroom_projection_state.get("bindings_by_slot"),
+            dict,
+        )
+        else {}
+    )
+    standard_projection_binding_template = (
+        {
+            "schema": DIRECT_MARKETING_STANDARD_PROJECTION_BINDING_SCHEMA,
+            "projection_only": True,
+            "executable": False,
+            "commands_allowed": False,
+            "hardware_effect": False,
+            "source_schema": (
+                DIRECT_MARKETING_HEADROOM_PROJECTION_PLAN_SCHEMA
+            ),
+            "source_revision": headroom_projection_state.get(
+                "plan_revision"
+            ),
+        }
+        if headroom_projection_bindings
+        else None
+    )
+    if not bool(
+        _direct_marketing_execution_enabled(direct)
+        or headroom_projection_bindings
+    ):
         base.update({
             "active": True,
             "complete": False,
             "status": "DIRECT_MARKETING_POLICY_NOT_EXECUTION_READY",
         })
         return base
-
-    slots = [
-        slot
-        for slot in canonical.get("slots") or []
-        if isinstance(slot, dict)
-        and _safe_int(slot.get("start_ts_ms"), 0) >= valid_from_ms
-    ]
-    capacity_wh = _battery_capacity_wh(source)
     first_soc_contract = (
         slots[0].get("soc_pct")
         if slots and isinstance(slots[0].get("soc_pct"), dict)
@@ -3086,8 +5923,8 @@ def _materialize_direct_marketing_trajectory(
         85.0,
     ) or 85.0
     roundtrip = max(0.5, min(0.99, roundtrip_pct / 100.0))
-    charge_efficiency = math.sqrt(roundtrip)
-    discharge_efficiency = math.sqrt(roundtrip)
+    charge_efficiency = round(math.sqrt(roundtrip), 6)
+    discharge_efficiency = round(math.sqrt(roundtrip), 6)
     max_charge_raw = _safe_float(
         canonical.get("max_charge_w", source.get("max_charge_w")),
         None,
@@ -3099,6 +5936,7 @@ def _materialize_direct_marketing_trajectory(
         ),
         None,
     )
+    capacity_wh = round(capacity_wh, 3)
     max_charge_w = (
         max_charge_raw
         if max_charge_raw is not None
@@ -3113,6 +5951,8 @@ def _materialize_direct_marketing_trajectory(
         and max_discharge_raw > 0.0
         else 0.0
     )
+    max_charge_w = round(max_charge_w, 3)
+    max_discharge_w = round(max_discharge_w, 3)
     base.update({
         "active": True,
         "complete": False,
@@ -3181,6 +6021,9 @@ def _materialize_direct_marketing_trajectory(
             slot.get("projection")
             if isinstance(slot.get("projection"), dict)
             else {}
+        )
+        headroom_projection_binding = headroom_projection_bindings.get(
+            (start_ms, end_ms)
         )
         soc_contract = (
             slot.get("soc_pct")
@@ -3275,11 +6118,41 @@ def _materialize_direct_marketing_trajectory(
                 _safe_float(soc_contract.get("reserve_floor"), None)
             )
         contract = _direct_marketing_policy_projection_for_slot(direct, slot)
-        if contract is None and _direct_marketing_slot_has_active_action_claim(
+        active_action_claim = _direct_marketing_slot_has_active_action_claim(
             direct,
             start_ms,
             end_ms,
+        )
+        runtime_hold_contract = (
+            _headroom_projection_runtime_hold_contract(direct, slot)
+            if headroom_projection_binding is not None
+            else None
+        )
+        if bool(
+            headroom_projection_binding is not None
+            and _headroom_projection_canonical_authority_marker_present(
+                canonical,
+                slot,
+            )
         ):
+            base.update({
+                "complete": False,
+                "status": "HEADROOM_PROJECTION_ACTIVE_MARKER_PRESENT",
+                "slots": [],
+            })
+            return base
+        if bool(
+            headroom_projection_binding is not None
+            and (contract is not None or active_action_claim)
+            and runtime_hold_contract is None
+        ):
+            base.update({
+                "complete": False,
+                "status": "HEADROOM_PROJECTION_ACTIVE_ACTION_CONFLICT",
+                "slots": [],
+            })
+            return base
+        if contract is None and active_action_claim:
             base.update({
                 "complete": False,
                 "status": "ACTIVE_ACTION_CLAIM_INVALID",
@@ -3290,6 +6163,22 @@ def _materialize_direct_marketing_trajectory(
             protected_reserve_wh = _safe_float(
                 contract.get("protected_reserve_wh"),
                 None,
+            )
+            if protected_reserve_wh is not None:
+                hard_floor_values.append(
+                    max(0.0, protected_reserve_wh) / capacity_wh * 100.0
+                )
+        if isinstance(headroom_projection_binding, dict):
+            headroom_slot_contract = (
+                headroom_projection_binding.get("slot")
+                if isinstance(
+                    headroom_projection_binding.get("slot"),
+                    dict,
+                )
+                else {}
+            )
+            protected_reserve_wh = _canonical_trajectory_finite_number(
+                headroom_slot_contract.get("protected_reserve_wh")
             )
             if protected_reserve_wh is not None:
                 hard_floor_values.append(
@@ -3322,7 +6211,18 @@ def _materialize_direct_marketing_trajectory(
         battery_w = 0.0
         delegation = None
         passive_binding = None
+        standard_projection_binding = None
         slot_projection_status = "complete"
+        standard_passthrough = False
+        standard_transition = None
+        standard_integration_anchor_ts_ms = start_ms
+        standard_integration_duration_s = float(SLOT_DURATION_S)
+        headroom_stored_delta_wh = None
+        headroom_energy_binding = None
+        projection_only = isinstance(headroom_projection_binding, dict)
+        action_role = None
+        hardware_effect = False
+        bounded_reference_w = 0.0
         selected = isinstance(contract, dict)
         if selected:
             action = str(contract.get("action") or "").upper()
@@ -3330,7 +6230,42 @@ def _materialize_direct_marketing_trajectory(
                 0.0,
                 _safe_float(contract.get("planned_w"), 0.0) or 0.0,
             )
-        if selected and action in {"PV_STORE", "DV_CURVE_CHARGE"}:
+            bounded_reference_w = requested_w
+        if projection_only:
+            headroom_slot_contract = headroom_projection_binding["slot"]
+            action = "HEADROOM_EXPORT"
+            action_role = "PROJECTION_ONLY"
+            reason_code = "DIRECT_MARKETING_HEADROOM_PROJECTION_ONLY"
+            headroom_energy_binding = _headroom_projection_energy_binding(
+                headroom_slot_contract,
+                soc_start_pct=round(planned_soc, 3),
+                hard_floor_pct=round(hard_floor_pct, 3),
+                capacity_wh=capacity_wh,
+                discharge_efficiency=discharge_efficiency,
+                max_discharge_w=max_discharge_w,
+            )
+            if headroom_energy_binding is None:
+                base.update({
+                    "complete": False,
+                    "status": "HEADROOM_PROJECTION_ENERGY_BINDING_INVALID",
+                    "slots": [],
+                })
+                return base
+            bounded_reference_w = float(
+                headroom_energy_binding["desired_ac_discharge_w"]
+            )
+            discharge_w = float(
+                headroom_energy_binding["applied_ac_discharge_w"]
+            )
+            battery_w = -discharge_w if discharge_w > 0.0 else 0.0
+            headroom_stored_delta_wh = float(
+                headroom_energy_binding["applied_stored_delta_wh"]
+            )
+            projection[
+                "direct_marketing_headroom_projection"
+            ] = copy.deepcopy(headroom_projection_binding)
+            slot["projection"] = projection
+        elif selected and action in {"PV_STORE", "DV_CURVE_CHARGE"}:
             reason_code = (
                 "DIRECT_MARKETING_SELECTED_DV_CURVE_CHARGE"
                 if action == "DV_CURVE_CHARGE"
@@ -3413,7 +6348,10 @@ def _materialize_direct_marketing_trajectory(
                             slot,
                         )
                     )
-                    if passive_binding is None:
+                    if (
+                        passive_binding is None
+                        and not headroom_projection_bindings
+                    ):
                         base.update({
                             "complete": False,
                             "status": "PASSIVE_POLICY_BINDING_MISSING",
@@ -3451,20 +6389,148 @@ def _materialize_direct_marketing_trajectory(
                         max(0.0, e3dc_dc_w),
                         room_wh / charge_efficiency / slot_hours,
                     )
-            elif passive_binding is not None:
+            elif not selected and bool(
+                passive_binding is not None
+                or standard_projection_binding_template is not None
+            ):
+                if passive_binding is None:
+                    standard_projection_binding = copy.deepcopy(
+                        standard_projection_binding_template
+                    )
                 reason_code = "DIRECT_MARKETING_PASSIVE_NORMAL_BINDING"
-                deficit_w = max(0.0, -residual_before_w)
-                available_wh = max(0.0, energy_start_wh - floor_wh)
-                discharge_w = min(
-                    deficit_w,
-                    (
-                        max_discharge_w
-                        if max_discharge_w > 0.0
-                        else deficit_w
-                    ),
-                    available_wh * discharge_efficiency / slot_hours,
+                standard_requested_battery_w = (
+                    _canonical_trajectory_finite_number(
+                        projection.get("battery_w")
+                    )
                 )
-                battery_w = -discharge_w
+                if standard_requested_battery_w is None:
+                    base.update({
+                        "complete": False,
+                        "status": "PASSIVE_STANDARD_TRANSITION_INVALID",
+                        "slots": [],
+                    })
+                    return base
+                direct_created_ms = _to_ts_ms(direct.get("created_ts"))
+                current_slot = bool(
+                    start_ms <= direct_created_ms < end_ms
+                )
+                standard_rebase = not current_slot
+                if current_slot:
+                    # Der aktuelle Slot bleibt exakt die bereits kanonische
+                    # Standardprojektion. Die read-only DV-Projektion darf ihn
+                    # weder neu integrieren noch auf einen Reserveboden heben.
+                    if _optional_numeric_equal(
+                        soc_start_axis,
+                        planned_soc,
+                        tolerance=0.0015,
+                    ):
+                        standard_passthrough = True
+                        battery_w = standard_requested_battery_w
+                    elif pre_valid_from_soc_chain_valid:
+                        # Der Live-SoC gehört zum Erzeugungszeitpunkt im
+                        # laufenden Slot. Eine lückenlose kanonische
+                        # Vorslotkette belegt die abweichende Slotachse; der
+                        # bestehende read-only Rebase darf sie übernehmen. Die
+                        # Fortschreibung beginnt am Planzeitpunkt und umfasst
+                        # deshalb nur die verbleibende Slotdauer.
+                        generated_at_ms = _safe_int(
+                            canonical.get("generated_at_ts_ms"),
+                            0,
+                        )
+                        if not start_ms <= generated_at_ms < end_ms:
+                            base.update({
+                                "complete": False,
+                                "status": (
+                                    "PASSIVE_STANDARD_CURRENT_SOC_BINDING_INVALID"
+                                ),
+                                "slots": [],
+                            })
+                            return base
+                        standard_integration_anchor_ts_ms = generated_at_ms
+                        standard_integration_duration_s = (
+                            end_ms - generated_at_ms
+                        ) / 1000.0
+                        standard_rebase = True
+                    else:
+                        base.update({
+                            "complete": False,
+                            "status": (
+                                "PASSIVE_STANDARD_CURRENT_SOC_BINDING_INVALID"
+                            ),
+                            "slots": [],
+                        })
+                        return base
+                if standard_rebase:
+                    standard_integration_hours = (
+                        standard_integration_duration_s / 3600.0
+                    )
+                    rebased_energy_start_wh = (
+                        round(planned_soc, 3) / 100.0 * capacity_wh
+                    )
+                    rebased_floor_wh = (
+                        round(hard_floor_pct, 3) / 100.0 * capacity_wh
+                    )
+                    rebased_ceiling_wh = (
+                        round(ceiling_pct, 3) / 100.0 * capacity_wh
+                    )
+                    standard_transition = {
+                        "soc_transition_contract": (
+                            DIRECT_MARKETING_STANDARD_TRANSITION_REBASED_CONTRACT
+                        ),
+                        "predecessor_slot_id": None,
+                        "canonical_standard_start_soc_pct": round(
+                            soc_start_axis,
+                            3,
+                        ),
+                        "rebased_start_soc_pct": round(planned_soc, 3),
+                        "standard_requested_battery_w": round(
+                            standard_requested_battery_w,
+                            3,
+                        ),
+                        "integration_duration_contract": (
+                            DIRECT_MARKETING_STANDARD_TRANSITION_DURATION_CONTRACT
+                        ),
+                        "integration_anchor_ts_ms": (
+                            standard_integration_anchor_ts_ms
+                        ),
+                        "integration_duration_s": round(
+                            standard_integration_duration_s,
+                            3,
+                        ),
+                    }
+                    bounded_reference_w = abs(
+                        standard_requested_battery_w
+                    )
+                    if standard_requested_battery_w > 0.0:
+                        room_wh = max(
+                            0.0,
+                            rebased_ceiling_wh - rebased_energy_start_wh,
+                        )
+                        battery_w = min(
+                            standard_requested_battery_w,
+                            max_charge_w,
+                            max(0.0, residual_before_w),
+                            room_wh
+                            / charge_efficiency
+                            / standard_integration_hours,
+                        )
+                    elif standard_requested_battery_w < 0.0:
+                        deficit_w = max(0.0, -residual_before_w)
+                        available_wh = max(
+                            0.0,
+                            rebased_energy_start_wh - rebased_floor_wh,
+                        )
+                        discharge_w = min(
+                            abs(standard_requested_battery_w),
+                            max_discharge_w,
+                            deficit_w,
+                            available_wh
+                            * discharge_efficiency
+                            / standard_integration_hours,
+                        )
+                        battery_w = -discharge_w
+                    else:
+                        battery_w = 0.0
 
             else:
                 # CHARGE_BLOCK_WAIT deckt nur den Hausbedarf und exportiert
@@ -3477,27 +6543,131 @@ def _materialize_direct_marketing_trajectory(
                     available_wh * discharge_efficiency / slot_hours,
                 )
                 battery_w = -discharge_w
-        if battery_w >= 0.0:
+        energy_integration_hours = (
+            standard_integration_duration_s / 3600.0
+            if standard_transition is not None
+            else slot_hours
+        )
+        if standard_passthrough:
+            energy_end_wh = soc_end_axis / 100.0 * capacity_wh
+        elif projection_only and headroom_stored_delta_wh is not None:
+            energy_end_wh = (
+                round(planned_soc, 3) / 100.0 * capacity_wh
+                - headroom_stored_delta_wh
+            )
+        elif battery_w >= 0.0:
             energy_end_wh = (
                 energy_start_wh
-                + battery_w * slot_hours * charge_efficiency
+                + battery_w * energy_integration_hours * charge_efficiency
             )
         else:
             energy_end_wh = (
                 energy_start_wh
-                - abs(battery_w) * slot_hours / discharge_efficiency
+                - abs(battery_w)
+                * energy_integration_hours
+                / discharge_efficiency
             )
         # Ebenso sind Boden und Soll-Decke keine Energiequelle/-senke. Die
         # vorherigen Leistungsgrenzen verhindern Be- und Entladung über ihre
         # Schranken; der Integrator klemmt nur an die physische Kapazität.
         energy_end_wh = max(0.0, min(capacity_wh, energy_end_wh))
         soc_end_pct = energy_end_wh / capacity_wh * 100.0
-        grid_w = loads_total_w + battery_w - pv_total_w
+        grid_w = (
+            _canonical_trajectory_finite_number(projection.get("grid_w"))
+            if standard_passthrough
+            else loads_total_w + battery_w - pv_total_w
+        )
+        if grid_w is None:
+            base.update({
+                "complete": False,
+                "status": "PASSIVE_STANDARD_TRANSITION_INVALID",
+                "slots": [],
+            })
+            return base
         residual_after_w = pv_total_w - loads_total_w - battery_w
-        if abs(battery_w) + 0.001 < requested_w:
+        if abs(battery_w) + 0.001 < bounded_reference_w:
             bounded_slots += 1
         if slot_projection_status != "complete":
             evidence_limit_slots += 1
+        if projection_only:
+            headroom_slot_contract = headroom_projection_binding["slot"]
+            selection_contract = {
+                "selected": False,
+                "executable": False,
+                "commands_allowed": False,
+                "projected_action": "HEADROOM_EXPORT",
+                # Autoritative AC-Batterieleistung der Anzeige. Die Producer-
+                # Leistung im Sidecar bleibt dagegen die Rate der gespeicherten
+                # Batterieenergie vor Entladeverlust.
+                "projected_w": round(abs(battery_w), 3),
+                "projection_id": headroom_slot_contract.get(
+                    "projection_id"
+                ),
+            }
+        else:
+            selection_contract = {
+                "selected": selected,
+                "executable": bool(
+                    selected and contract.get("plan_executable") is True
+                ),
+                "commands_allowed": bool(
+                    selected
+                    and contract.get("plan_commands_allowed") is True
+                ),
+                "requested_w": round(requested_w, 3),
+                "action_id": contract.get("action_id") if selected else None,
+                "window_id": contract.get("window_id") if selected else None,
+                "segment_id": contract.get("segment_id") if selected else None,
+                "source_action": (
+                    contract.get("source_action") if selected else None
+                ),
+                "source_mode": (
+                    contract.get("source_mode") if selected else None
+                ),
+                "pv_store_source_contract": (
+                    contract.get("pv_store_source_contract")
+                    if selected
+                    else None
+                ),
+            }
+        provenance = {
+            "balance_source": "canonical_slot_projection",
+            "soc_projection_contract": (
+                DIRECT_MARKETING_STANDARD_SOC_PASSTHROUGH_CONTRACT
+                if standard_passthrough
+                else (
+                    DIRECT_MARKETING_STANDARD_TRANSITION_REBASED_CONTRACT
+                    if standard_transition is not None
+                    else DIRECT_MARKETING_SOC_INTEGRATOR_CONTRACT
+                )
+            ),
+            "action_source": (
+                "direct_marketing.headroom_projection_plan"
+                if projection_only
+                else (
+                    "canonical_direct_marketing_selected_policy"
+                    if selected
+                    else (
+                        "direct_marketing.future_pv_store_reservation"
+                        if delegation is not None
+                        else (
+                            "canonical_standard_projection"
+                            if standard_projection_binding is not None
+                            else "canonical_passive_house_supply"
+                        )
+                    )
+                )
+            ),
+            "candidate_effect": False,
+            "shadow_effect": False,
+            "pv_axis_evidence_class": pv_axis_evidence.get("class"),
+        }
+        if headroom_energy_binding is not None:
+            provenance["headroom_energy_binding"] = copy.deepcopy(
+                headroom_energy_binding
+            )
+        if standard_transition is not None:
+            provenance.update(standard_transition)
         trajectory_slots.append({
             "slot_id": None,
             "start_ts_ms": start_ms,
@@ -3525,50 +6695,27 @@ def _materialize_direct_marketing_trajectory(
             "residual_before_storage_w": round(residual_before_w, 3),
             "residual_after_storage_w": round(residual_after_w, 3),
             "action": action,
+            **(
+                {
+                    "action_role": "PROJECTION_ONLY",
+                    "projection_only": True,
+                    "hardware_effect": False,
+                    "headroom_projection": copy.deepcopy(
+                        headroom_projection_binding
+                    ),
+                }
+                if projection_only
+                else {}
+            ),
             "projection_status": slot_projection_status,
-            "selection": {
-                "selected": selected,
-                "executable": bool(
-                    selected and contract.get("plan_executable") is True
-                ),
-                "commands_allowed": bool(
-                    selected
-                    and contract.get("plan_commands_allowed") is True
-                ),
-                "requested_w": round(requested_w, 3),
-                "action_id": contract.get("action_id") if selected else None,
-                "window_id": contract.get("window_id") if selected else None,
-                "segment_id": contract.get("segment_id") if selected else None,
-                "source_action": (
-                    contract.get("source_action") if selected else None
-                ),
-                "source_mode": (
-                    contract.get("source_mode") if selected else None
-                ),
-                "pv_store_source_contract": (
-                    contract.get("pv_store_source_contract")
-                    if selected
-                    else None
-                ),
-            },
+            "selection": selection_contract,
             "delegation": copy.deepcopy(delegation),
             "passive_binding": copy.deepcopy(passive_binding),
+            "standard_projection_binding": copy.deepcopy(
+                standard_projection_binding
+            ),
             "reason_code": reason_code,
-            "provenance": {
-                "balance_source": "canonical_slot_projection",
-                "action_source": (
-                    "canonical_direct_marketing_selected_policy"
-                    if selected
-                    else (
-                        "direct_marketing.future_pv_store_reservation"
-                        if delegation is not None
-                        else "canonical_passive_house_supply"
-                    )
-                ),
-                "candidate_effect": False,
-                "shadow_effect": False,
-                "pv_axis_evidence_class": pv_axis_evidence.get("class"),
-            },
+            "provenance": provenance,
         })
         planned_soc = soc_end_pct
 
@@ -3808,6 +6955,14 @@ def _materialize_shadow_execution_readiness(
 ) -> None:
     """Versiegelt die aktuelle Action-/Revision-/Slotrolle fail-closed."""
 
+    def finite_zero(value: Any) -> bool:
+        return bool(
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            and abs(float(value)) <= 0.000001
+        )
+
     shadow = (
         canonical.get("shadow_dispatch")
         if isinstance(canonical.get("shadow_dispatch"), dict)
@@ -3816,6 +6971,36 @@ def _materialize_shadow_execution_readiness(
     projection = (
         generation_slot.get("projection")
         if isinstance(generation_slot.get("projection"), dict)
+        else {}
+    )
+    direct = (
+        canonical.get("direct_marketing")
+        if isinstance(canonical.get("direct_marketing"), dict)
+        else {}
+    )
+    flags = (
+        direct.get("flags")
+        if isinstance(direct.get("flags"), dict)
+        else {}
+    )
+    policy = (
+        direct.get("policy_decision")
+        if isinstance(direct.get("policy_decision"), dict)
+        else {}
+    )
+    policy_timeline = (
+        direct.get("policy_timeline")
+        if isinstance(direct.get("policy_timeline"), list)
+        else []
+    )
+    policy_budget = (
+        policy.get("storage_budget")
+        if isinstance(policy.get("storage_budget"), dict)
+        else {}
+    )
+    policy_lineage = (
+        policy.get("export_window_gate_lineage")
+        if isinstance(policy.get("export_window_gate_lineage"), dict)
         else {}
     )
     roles = (
@@ -3848,6 +7033,206 @@ def _materialize_shadow_execution_readiness(
     executable_action = _optional_direct_marketing_action(
         roles.get("plan_executable_action")
     )
+    generation_start_ms = _safe_int(
+        generation_slot.get("start_ts_ms"), 0
+    )
+    generation_end_ms = _safe_int(
+        generation_slot.get("end_ts_ms"), 0
+    )
+    generated_at_ms = _safe_int(canonical.get("generated_at_ts_ms"), 0)
+    overlapping_policies = [
+        item
+        for item in policy_timeline
+        if isinstance(item, dict)
+        and _safe_int(item.get("start_ts"), 0) < generation_end_ms
+        and _safe_int(item.get("end_ts"), 0) > generation_start_ms
+    ]
+    matching_shadow_slots = [
+        item
+        for item in shadow.get("slots") or []
+        if (
+            isinstance(item, dict)
+            and _safe_int(item.get("start_ts_ms"), 0)
+            == generation_start_ms
+            and _safe_int(item.get("end_ts_ms"), 0)
+            == generation_end_ms
+        )
+    ]
+    shadow_slot = (
+        matching_shadow_slots[0]
+        if len(matching_shadow_slots) == 1
+        else {}
+    )
+    roles_no_action = bool(
+        roles.get("schema_version")
+        == DIRECT_MARKETING_ACTION_ROLES_SCHEMA
+        and roles.get("status") == "CONSISTENT"
+        and roles.get("candidate_only") is False
+        and roles.get("effective_action") is None
+        and roles.get("runtime_effect_claim_allowed") is False
+        and candidate_action is None
+        and selected_action is None
+        and executable_action is None
+    )
+    suspended_policy_no_action = bool(
+        direct.get("active") is True
+        and direct.get("shadow") is True
+        and _normalized_direct_marketing_mode(direct.get("mode"))
+        == "eco_plus"
+        and direct.get("controller_owner") == "storage_manager"
+        and direct.get("plan_owner") == "direct_marketing:eco_plus"
+        and type(direct.get("owner_contract_version")) is int
+        and direct.get("owner_contract_version") == 1
+        and type(flags.get("owner_contract_version")) is int
+        and flags.get("owner_contract_version") == 1
+        and flags.get("commands_allowed") is False
+        and generated_at_ms > 0
+        and _safe_int(direct.get("created_ts"), 0) > 0
+        and abs(
+            _safe_int(direct.get("created_ts"), 0) - generated_at_ms
+        )
+        <= 60_000
+        and _safe_int(direct.get("created_ts"), 0)
+        < _safe_int(direct.get("valid_until_ts"), 0)
+        and generation_end_ms
+        <= _safe_int(direct.get("valid_until_ts"), 0)
+        and policy.get("schema") == "direct_marketing_policy_v1"
+        and str(policy.get("dv_target_state") or "").upper() == "HOLD"
+        and policy.get("commands_allowed") is False
+        and policy.get("blocked") is True
+        and policy.get("executable_action") is None
+        and policy.get("execution_window") is None
+        and _safe_int(policy.get("execution_window_match_count"), -1) == 0
+        and policy.get("continuation_active") is False
+        and str(policy.get("source_action") or "")
+        == "eco_plus_export_candidate"
+        and str(policy.get("block_reason") or "")
+        == "suspended:SUSPENDED_INPUT_OR_FORECAST_EVIDENCE_INCOMPLETE"
+        and finite_zero(policy_budget.get("charge_budget_w"))
+        and finite_zero(policy_budget.get("export_budget_w"))
+        and _safe_int(policy.get("start_ts"), 0)
+        <= generation_start_ms
+        < generation_end_ms
+        <= _safe_int(policy.get("end_ts"), 0)
+        and sum(1 for item in policy_timeline if item == policy) == 1
+        and len(overlapping_policies) == 1
+        and overlapping_policies[0] == policy
+        and policy_lineage.get("schema")
+        == "export_window_gate_lineage_v1"
+        and policy_lineage.get("status") == "SUSPENDED"
+        and policy_lineage.get("effect_contract")
+        == "STATUS_ONLY_NO_EXECUTION_AUTHORITY"
+        and policy_lineage.get("transition_reason_codes")
+        == ["SUSPENDED_INPUT_OR_FORECAST_EVIDENCE_INCOMPLETE"]
+        and direct_marketing_export_gate_contract_valid(
+            policy,
+            policy.get("economics"),
+            allowed_lineage_statuses={"SUSPENDED"},
+            current_window_id=policy.get("window_id"),
+        )
+    )
+    passive_normal_binding = (
+        _direct_marketing_passive_normal_binding_for_slot(
+            direct,
+            generation_slot,
+        )
+    )
+    passive_policy_no_action = bool(
+        passive_normal_binding is not None
+        and direct.get("active") is True
+        and direct.get("shadow") is False
+        and _normalized_direct_marketing_mode(direct.get("mode"))
+        == "eco_plus"
+        and direct.get("controller_owner") == "storage_manager"
+        and direct.get("plan_owner") == "direct_marketing:eco_plus"
+        and type(direct.get("owner_contract_version")) is int
+        and direct.get("owner_contract_version") == 1
+        and flags.get("commands_allowed") is True
+        and generated_at_ms > 0
+        and _safe_int(direct.get("created_ts"), 0) > 0
+        and abs(
+            _safe_int(direct.get("created_ts"), 0) - generated_at_ms
+        )
+        <= 60_000
+        and _safe_int(direct.get("created_ts"), 0)
+        < _safe_int(direct.get("valid_until_ts"), 0)
+        and generation_end_ms
+        <= _safe_int(direct.get("valid_until_ts"), 0)
+        and policy.get("schema") == "direct_marketing_policy_v1"
+        and str(policy.get("dv_target_state") or "").upper() == "NORMAL"
+        and policy.get("commands_allowed") is False
+        and policy.get("blocked") is False
+        and policy.get("executable_action") is None
+        and policy.get("execution_window") is None
+        and _safe_int(policy.get("execution_window_match_count"), -1) == 0
+        and str(policy.get("source_action") or "")
+        == "eco_plus_house_supply"
+        and finite_zero(policy_budget.get("charge_budget_w"))
+        and finite_zero(policy_budget.get("export_budget_w"))
+        and len(overlapping_policies) == 1
+        and overlapping_policies[0] == policy
+        and policy.get("passive_normal_binding")
+        == passive_normal_binding
+        and projection.get(
+            DIRECT_MARKETING_PASSIVE_NORMAL_BINDING_SCHEMA
+        )
+        == passive_normal_binding
+    )
+    direct_policy_no_action = bool(
+        suspended_policy_no_action or passive_policy_no_action
+    )
+    shadow_comparison_no_effect = bool(
+        len(matching_shadow_slots) == 1
+        and shadow_slot.get("shadow_only") is True
+        and shadow_slot.get("commands_allowed") is False
+        and shadow_slot.get("executable") is False
+        and shadow_slot.get("requested") is False
+        and shadow_slot.get("acknowledged") is False
+        and shadow_slot.get("readback_confirmed") is False
+        and str(shadow_slot.get("block_reason_code") or "")
+        in {
+            "NO_STORAGE_ACTION_CANDIDATE",
+            "SHADOW_ONLY_NOT_RUNTIME_AUTHORIZED",
+        }
+        and (
+            shadow_slot.get("selected") is False
+            and shadow_slot.get("candidate") is False
+            or shadow_slot.get("selected") is True
+            and shadow_slot.get("candidate") is True
+            and shadow_slot.get("selection_scope")
+            == "SHADOW_COMPARISON_ONLY"
+        )
+    )
+    no_action = bool(
+        roles_no_action
+        and direct_policy_no_action
+        and (
+            str(generation_slot.get("planned_action") or "").upper()
+            == "HOUSE_SUPPLY"
+            and str(projection.get("market_action") or "").upper()
+            == "HOUSE_SUPPLY"
+            or passive_policy_no_action
+            and str(generation_slot.get("planned_action") or "").upper()
+            in {"HOLD", "HOUSE_SUPPLY"}
+            and str(projection.get("market_action") or "").upper()
+            in {"HOLD", "HOUSE_SUPPLY"}
+        )
+        and projection.get("direct_marketing_candidate") is False
+        and projection.get("direct_marketing_selected") is False
+        and projection.get("direct_marketing_plan_executable") is False
+        and projection.get("direct_marketing_plan_commands_allowed") is False
+        and projection.get("direct_marketing_candidate_action") is None
+        and projection.get("direct_marketing_action") is None
+        and projection.get("direct_marketing_plan_action") is None
+        and projection.get("direct_marketing_plan_selected_action") is None
+        and projection.get("direct_marketing_plan_executable_action") is None
+        and projection.get("direct_marketing_effective_action") is None
+        and finite_zero(projection.get("direct_marketing_candidate_w"))
+        and finite_zero(projection.get("direct_marketing_planned_w"))
+        and finite_zero(projection.get("direct_marketing_charge_w"))
+        and finite_zero(projection.get("direct_marketing_export_w"))
+        and shadow_comparison_no_effect
+    )
     blockers: List[str] = []
 
     def block(condition: bool, code: str) -> None:
@@ -3871,22 +7256,24 @@ def _materialize_shadow_execution_readiness(
         ),
         "SHADOW_EXECUTION_SOURCE_REVISIONS_INCOMPLETE",
     )
+    binding_identity_valid = bool(
+        binding.get("schema_version") == SHADOW_INPUT_BINDING_SCHEMA
+        and binding.get("applicable") is True
+        and binding.get("source_revisions") == revisions
+    )
+    binding_execution_complete = bool(
+        binding_identity_valid
+        and binding.get("field_activation_input_complete") is True
+    )
     block(
-        binding.get("schema_version") != SHADOW_INPUT_BINDING_SCHEMA
-        or binding.get("applicable") is not True
-        or binding.get("source_revisions") != revisions
-        or binding.get("field_activation_input_complete") is not True,
+        not binding_identity_valid
+        or (not no_action and not binding_execution_complete),
         "SHADOW_INPUT_BINDING_NOT_EXECUTION_READY",
     )
 
     canonical_action = bool(
         candidate_action == selected_action == executable_action
         and executable_action in DIRECT_MARKETING_EXECUTION_READY_ACTIONS
-    )
-    no_action = bool(
-        candidate_action is None
-        and selected_action is None
-        and executable_action is None
     )
     if not canonical_action and not no_action:
         block(
@@ -3905,7 +7292,7 @@ def _materialize_shadow_execution_readiness(
             "CANONICAL_ACTION"
             if canonical_action
             else "NO_ACTION"
-            if no_action
+            if roles_no_action
             else "EVIDENCE_LIMIT"
         )
     elif canonical_action:
@@ -4289,11 +7676,24 @@ def build_canonical_dispatch_plan(
     )
     if trajectory is not None:
         trajectory["plan_id"] = plan_id
+        predecessor_slot_id = None
         for trajectory_slot in trajectory.get("slots") or []:
             if isinstance(trajectory_slot, dict):
                 trajectory_slot["slot_id"] = slot_ids_by_start.get(
                     _safe_int(trajectory_slot.get("start_ts_ms"), 0)
                 )
+                provenance = (
+                    trajectory_slot.get("provenance")
+                    if isinstance(trajectory_slot.get("provenance"), dict)
+                    else {}
+                )
+                if (
+                    provenance.get("soc_transition_contract")
+                    == DIRECT_MARKETING_STANDARD_TRANSITION_REBASED_CONTRACT
+                ):
+                    provenance["predecessor_slot_id"] = predecessor_slot_id
+                    trajectory_slot["provenance"] = provenance
+                predecessor_slot_id = trajectory_slot.get("slot_id")
         trajectory["trajectory_revision"] = revision_hash(
             _direct_marketing_trajectory_material(trajectory)
         )
@@ -4323,9 +7723,26 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
         return {"valid": False, "block_reason_code": "PLAN_ID_INVALID", "plan_id": plan_id or None, "slot": None}
     if revision_hash(_plan_material(plan)) != plan_id:
         return {"valid": False, "block_reason_code": "PLAN_HASH_MISMATCH", "plan_id": plan_id, "slot": None}
+    plan_axis_keys = (
+        "generated_at_ts_ms",
+        "valid_from_ts_ms",
+        "valid_until_ts_ms",
+        "horizon_end_ts_ms",
+        "slot_duration_s",
+    )
+    if not all(type(plan.get(key)) is int for key in plan_axis_keys):
+        return {
+            "valid": False,
+            "block_reason_code": "PLAN_TIME_AXIS_TYPE_INVALID",
+            "plan_id": plan_id,
+            "slot": None,
+        }
     valid_from = _safe_int(plan.get("valid_from_ts_ms"), 0)
     valid_until = _safe_int(plan.get("valid_until_ts_ms"), 0)
-    if not valid_from < valid_until:
+    if not bool(
+        plan.get("slot_duration_s") == SLOT_DURATION_S
+        and valid_from < valid_until
+    ):
         return {"valid": False, "block_reason_code": "PLAN_VALIDITY_INVALID", "plan_id": plan_id, "slot": None}
     slots = plan.get("slots") if isinstance(plan.get("slots"), list) else []
     direct = plan.get("direct_marketing") if isinstance(plan.get("direct_marketing"), dict) else {}
@@ -4334,6 +7751,16 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
     for item in slots:
         if not isinstance(item, dict):
             return {"valid": False, "block_reason_code": "PLAN_SLOT_INVALID", "plan_id": plan_id, "slot": None}
+        if not bool(
+            type(item.get("start_ts_ms")) is int
+            and type(item.get("end_ts_ms")) is int
+        ):
+            return {
+                "valid": False,
+                "block_reason_code": "PLAN_SLOT_TIME_TYPE_INVALID",
+                "plan_id": plan_id,
+                "slot": None,
+            }
         projection = item.get("projection") if isinstance(item.get("projection"), dict) else {}
         planned_w = _safe_float(projection.get("direct_marketing_planned_w"), 0.0) or 0.0
         direct_selection_claim = bool(
@@ -4382,6 +7809,58 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(plan.get("direct_marketing_trajectory"), dict)
         else None
     )
+    headroom_projection_state = _direct_marketing_headroom_projection_state(
+        direct,
+        plan,
+        valid_from,
+        _safe_int(plan.get("horizon_end_ts_ms"), 0),
+        _battery_capacity_wh(plan),
+    )
+    headroom_projection_bindings = (
+        headroom_projection_state.get("bindings_by_slot")
+        if isinstance(
+            headroom_projection_state.get("bindings_by_slot"),
+            dict,
+        )
+        else {}
+    )
+    expected_standard_projection_binding = (
+        {
+            "schema": DIRECT_MARKETING_STANDARD_PROJECTION_BINDING_SCHEMA,
+            "projection_only": True,
+            "executable": False,
+            "commands_allowed": False,
+            "hardware_effect": False,
+            "source_schema": (
+                DIRECT_MARKETING_HEADROOM_PROJECTION_PLAN_SCHEMA
+            ),
+            "source_revision": headroom_projection_state.get(
+                "plan_revision"
+            ),
+        }
+        if headroom_projection_bindings
+        else None
+    )
+    if (
+        headroom_projection_state.get("present") is True
+        and headroom_projection_state.get("valid") is not True
+        and not bool(
+            isinstance(trajectory, dict)
+            and trajectory.get("active") is True
+            and trajectory.get("complete") is False
+            and trajectory.get("status")
+            == "HEADROOM_PROJECTION_PLAN_INVALID"
+            and trajectory.get("reason_code")
+            == headroom_projection_state.get("reason_code")
+            and trajectory.get("slots") == []
+        )
+    ):
+        return {
+            "valid": False,
+            "block_reason_code": "HEADROOM_PROJECTION_FAIL_CLOSED_INVALID",
+            "plan_id": plan_id,
+            "slot": None,
+        }
     if trajectory is None:
         if not _direct_marketing_not_applicable(direct):
             return {
@@ -4398,6 +7877,15 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                 "plan_id": plan_id,
                 "slot": None,
             }
+        if not _direct_marketing_trajectory_shape_valid(trajectory):
+            return {
+                "valid": False,
+                "block_reason_code": (
+                    "DIRECT_MARKETING_TRAJECTORY_SHAPE_INVALID"
+                ),
+                "plan_id": plan_id,
+                "slot": None,
+            }
         if trajectory.get("plan_id") != plan_id:
             return {
                 "valid": False,
@@ -4409,6 +7897,24 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
             return {
                 "valid": False,
                 "block_reason_code": "DIRECT_MARKETING_TRAJECTORY_INPUT_REVISION_MISMATCH",
+                "plan_id": plan_id,
+                "slot": None,
+            }
+        trajectory_axis_keys = (
+            "generated_at_ts_ms",
+            "valid_from_ts_ms",
+            "horizon_end_ts_ms",
+            "slot_duration_s",
+        )
+        if not all(
+            type(trajectory.get(key)) is int
+            for key in trajectory_axis_keys
+        ):
+            return {
+                "valid": False,
+                "block_reason_code": (
+                    "DIRECT_MARKETING_TRAJECTORY_TIME_AXIS_TYPE_INVALID"
+                ),
                 "plan_id": plan_id,
                 "slot": None,
             }
@@ -4531,12 +8037,26 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                 if isinstance(item, dict)
             }
             seen_trajectory_slots = set()
+            seen_headroom_projection_ids = set()
             previous_trajectory_soc_end: Optional[float] = None
+            previous_trajectory_slot_id: Optional[str] = None
             for trajectory_slot in trajectory_slots:
                 if not isinstance(trajectory_slot, dict):
                     return {
                         "valid": False,
                         "block_reason_code": "DIRECT_MARKETING_TRAJECTORY_SLOT_INVALID",
+                        "plan_id": plan_id,
+                        "slot": None,
+                    }
+                if not bool(
+                    type(trajectory_slot.get("start_ts_ms")) is int
+                    and type(trajectory_slot.get("end_ts_ms")) is int
+                ):
+                    return {
+                        "valid": False,
+                        "block_reason_code": (
+                            "DIRECT_MARKETING_TRAJECTORY_SLOT_TIME_TYPE_INVALID"
+                        ),
                         "plan_id": plan_id,
                         "slot": None,
                     }
@@ -4594,8 +8114,22 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                     if isinstance(trajectory_slot.get("delegation"), dict)
                     else {}
                 )
+                provenance = (
+                    trajectory_slot.get("provenance")
+                    if isinstance(trajectory_slot.get("provenance"), dict)
+                    else {}
+                )
+                projection_only_slot = bool(
+                    trajectory_slot.get("projection_only") is True
+                    or trajectory_slot.get("action_role")
+                    == "PROJECTION_ONLY"
+                    or trajectory_slot.get("headroom_projection") is not None
+                )
                 selection_requested_w = _canonical_trajectory_finite_number(
                     selection.get("requested_w")
+                )
+                selection_projected_w = _canonical_trajectory_finite_number(
+                    selection.get("projected_w")
                 )
                 delegation_max_curve_charge_raw = delegation.get(
                     "max_curve_charge_w"
@@ -4610,7 +8144,139 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                     or delegation_max_curve_charge_w is not None
                 )
                 action = str(trajectory_slot.get("action") or "").upper()
-                if selection.get("selected") is True:
+                if projection_only_slot:
+                    expected_headroom_binding = (
+                        headroom_projection_bindings.get((start_ms, end_ms))
+                    )
+                    projection_id = str(
+                        selection.get("projection_id") or ""
+                    )
+                    if not bool(
+                        set(trajectory_slot)
+                        == {
+                            "slot_id",
+                            "start_ts_ms",
+                            "end_ts_ms",
+                            "soc_start_pct",
+                            "soc_end_pct",
+                            "hard_reserve_soc_pct",
+                            "ceiling_soc_pct",
+                            "battery_w",
+                            "grid_w",
+                            "pv_w",
+                            "pv_axis_evidence",
+                            "loads_w",
+                            "residual_before_storage_w",
+                            "residual_after_storage_w",
+                            "action",
+                            "action_role",
+                            "projection_only",
+                            "hardware_effect",
+                            "headroom_projection",
+                            "projection_status",
+                            "selection",
+                            "delegation",
+                            "passive_binding",
+                            "standard_projection_binding",
+                            "reason_code",
+                            "provenance",
+                        }
+                        and action == "HEADROOM_EXPORT"
+                        and trajectory_slot.get("action_role")
+                        == "PROJECTION_ONLY"
+                        and trajectory_slot.get("projection_only") is True
+                        and trajectory_slot.get("hardware_effect") is False
+                        and set(selection)
+                        == {
+                            "selected",
+                            "executable",
+                            "commands_allowed",
+                            "projected_action",
+                            "projected_w",
+                            "projection_id",
+                        }
+                        and selection.get("selected") is False
+                        and selection.get("executable") is False
+                        and selection.get("commands_allowed") is False
+                        and selection.get("projected_action")
+                        == "HEADROOM_EXPORT"
+                        and selection_projected_w is not None
+                        and selection_projected_w >= 0.0
+                        and _headroom_projection_prefixed_id(
+                            projection_id,
+                            "headroom-slot:",
+                        )
+                        and projection_id
+                        not in seen_headroom_projection_ids
+                        and isinstance(expected_headroom_binding, dict)
+                        and trajectory_slot.get("headroom_projection")
+                        == expected_headroom_binding
+                        and canonical_projection.get(
+                            "direct_marketing_headroom_projection"
+                        )
+                        == expected_headroom_binding
+                        and not (
+                            _headroom_projection_canonical_authority_marker_present(
+                                plan,
+                                canonical_slot,
+                            )
+                        )
+                        and (
+                            not _headroom_projection_active_marker_present(
+                                canonical_projection
+                            )
+                            or _headroom_projection_runtime_hold_contract(
+                                direct,
+                                canonical_slot,
+                            )
+                            is not None
+                        )
+                        and not delegation
+                        and trajectory_slot.get("passive_binding") is None
+                        and trajectory_slot.get(
+                            "standard_projection_binding"
+                        )
+                        is None
+                        and provenance.get("action_source")
+                        == "direct_marketing.headroom_projection_plan"
+                        and provenance.get("candidate_effect") is False
+                        and provenance.get("shadow_effect") is False
+                    ):
+                        return {
+                            "valid": False,
+                            "block_reason_code": (
+                                "HEADROOM_PROJECTION_TRAJECTORY_IDENTITY_INVALID"
+                            ),
+                            "plan_id": plan_id,
+                            "slot": None,
+                        }
+                    expected_slot_contract = expected_headroom_binding["slot"]
+                    if not bool(
+                        projection_id
+                        == expected_slot_contract.get("projection_id")
+                    ):
+                        return {
+                            "valid": False,
+                            "block_reason_code": (
+                                "HEADROOM_PROJECTION_TRAJECTORY_BINDING_MISMATCH"
+                            ),
+                            "plan_id": plan_id,
+                            "slot": None,
+                        }
+                    seen_headroom_projection_ids.add(projection_id)
+                elif selection.get("selected") is True:
+                    if trajectory_slot.get(
+                        "standard_projection_binding"
+                    ) is not None:
+                        return {
+                            "valid": False,
+                            "block_reason_code": (
+                                "DIRECT_MARKETING_STANDARD_PROJECTION_"
+                                "BINDING_INVALID"
+                            ),
+                            "plan_id": plan_id,
+                            "slot": None,
+                        }
                     if not bool(
                         selection.get("executable") is True
                         and selection.get("commands_allowed") is True
@@ -4678,6 +8344,18 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                             "slot": None,
                         }
                 elif action == "PV_STORE":
+                    if trajectory_slot.get(
+                        "standard_projection_binding"
+                    ) is not None:
+                        return {
+                            "valid": False,
+                            "block_reason_code": (
+                                "DIRECT_MARKETING_STANDARD_PROJECTION_"
+                                "BINDING_INVALID"
+                            ),
+                            "plan_id": plan_id,
+                            "slot": None,
+                        }
                     if not bool(
                         delegation.get("schema_version")
                         == "direct_marketing_future_pv_store_delegation_v1"
@@ -4707,13 +8385,33 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                             "slot": None,
                         }
                 elif action == "PASSIVE_NORMAL" and not bool(
-                    isinstance(trajectory_slot.get("passive_binding"), dict)
-                    and trajectory_slot.get("passive_binding", {}).get("schema")
-                    == DIRECT_MARKETING_PASSIVE_NORMAL_BINDING_SCHEMA
-                    and canonical_projection.get(
-                        DIRECT_MARKETING_PASSIVE_NORMAL_BINDING_SCHEMA
+                    (
+                        isinstance(
+                            trajectory_slot.get("passive_binding"),
+                            dict,
+                        )
+                        and trajectory_slot.get("passive_binding", {}).get(
+                            "schema"
+                        )
+                        == DIRECT_MARKETING_PASSIVE_NORMAL_BINDING_SCHEMA
+                        and canonical_projection.get(
+                            DIRECT_MARKETING_PASSIVE_NORMAL_BINDING_SCHEMA
+                        )
+                        == trajectory_slot.get("passive_binding")
                     )
-                    == trajectory_slot.get("passive_binding")
+                    or (
+                        trajectory_slot.get("standard_projection_binding")
+                        == expected_standard_projection_binding
+                        and expected_standard_projection_binding is not None
+                        and trajectory_slot.get("passive_binding") is None
+                        and provenance.get("soc_projection_contract")
+                        in {
+                            DIRECT_MARKETING_STANDARD_SOC_PASSTHROUGH_CONTRACT,
+                            DIRECT_MARKETING_STANDARD_TRANSITION_REBASED_CONTRACT,
+                        }
+                        and provenance.get("action_source")
+                        == "canonical_standard_projection"
+                    )
                 ):
                     return {
                         "valid": False,
@@ -4847,6 +8545,219 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                 residual_after_w = _canonical_trajectory_finite_number(
                     trajectory_slot.get("residual_after_storage_w")
                 )
+                canonical_soc = (
+                    canonical_slot.get("soc_pct")
+                    if isinstance(canonical_slot.get("soc_pct"), dict)
+                    else {}
+                )
+                canonical_soc_start_pct = (
+                    _canonical_trajectory_finite_number(
+                        canonical_soc.get("start")
+                    )
+                )
+                canonical_soc_end_pct = _canonical_trajectory_finite_number(
+                    canonical_soc.get("end")
+                )
+                canonical_battery_w = _canonical_trajectory_finite_number(
+                    canonical_projection.get("battery_w")
+                )
+                canonical_grid_w = _canonical_trajectory_finite_number(
+                    canonical_projection.get("grid_w")
+                )
+                plan_current_soc_pct = _canonical_trajectory_finite_number(
+                    plan.get("current_soc")
+                )
+                initial_soc_source = str(meta.get("initial_soc_source") or "")
+                initial_soc_binding_valid = bool(
+                    previous_trajectory_soc_end is not None
+                    or (
+                        initial_soc_source == "plan_current_soc"
+                        and plan_current_soc_pct is not None
+                        and _optional_numeric_equal(
+                            soc_start_pct,
+                            plan_current_soc_pct,
+                            tolerance=0.0015,
+                        )
+                    )
+                    or (
+                        initial_soc_source
+                        == "canonical_first_slot_soc_start"
+                        and plan_current_soc_pct is None
+                        and canonical_soc_start_pct is not None
+                        and _optional_numeric_equal(
+                            soc_start_pct,
+                            canonical_soc_start_pct,
+                            tolerance=0.0015,
+                        )
+                    )
+                )
+                soc_projection_contract = provenance.get(
+                    "soc_projection_contract"
+                )
+                standard_passthrough_valid = bool(
+                    soc_projection_contract
+                    == DIRECT_MARKETING_STANDARD_SOC_PASSTHROUGH_CONTRACT
+                    and action == "PASSIVE_NORMAL"
+                    and start_ms
+                    <= _to_ts_ms(direct.get("created_ts"))
+                    < end_ms
+                    and initial_soc_binding_valid
+                    and None
+                    not in {
+                        canonical_soc_start_pct,
+                        canonical_soc_end_pct,
+                        canonical_battery_w,
+                        canonical_grid_w,
+                    }
+                    and _optional_numeric_equal(
+                        soc_start_pct,
+                        canonical_soc_start_pct,
+                        tolerance=0.0015,
+                    )
+                    and _optional_numeric_equal(
+                        soc_end_pct,
+                        canonical_soc_end_pct,
+                        tolerance=0.0015,
+                    )
+                    and _optional_numeric_equal(
+                        battery_w,
+                        canonical_battery_w,
+                        tolerance=0.001,
+                    )
+                    and _optional_numeric_equal(
+                        grid_w,
+                        canonical_grid_w,
+                        tolerance=0.001,
+                    )
+                )
+                standard_requested_battery_w = (
+                    _canonical_trajectory_finite_number(
+                        provenance.get("standard_requested_battery_w")
+                    )
+                )
+                standard_integration_duration_s = (
+                    _canonical_trajectory_finite_number(
+                        provenance.get("integration_duration_s")
+                    )
+                )
+                standard_integration_anchor_ts_ms = provenance.get(
+                    "integration_anchor_ts_ms"
+                )
+                provenance_canonical_start_pct = (
+                    _canonical_trajectory_finite_number(
+                        provenance.get(
+                            "canonical_standard_start_soc_pct"
+                        )
+                    )
+                )
+                provenance_rebased_start_pct = (
+                    _canonical_trajectory_finite_number(
+                        provenance.get("rebased_start_soc_pct")
+                    )
+                )
+                standard_current_slot = bool(
+                    start_ms
+                    <= _to_ts_ms(direct.get("created_ts"))
+                    < end_ms
+                )
+                expected_standard_integration_anchor_ts_ms = (
+                    _safe_int(plan.get("generated_at_ts_ms"), 0)
+                    if standard_current_slot
+                    else start_ms
+                )
+                expected_standard_integration_duration_s = (
+                    (end_ms - expected_standard_integration_anchor_ts_ms)
+                    / 1000.0
+                )
+                standard_rebased_valid = bool(
+                    soc_projection_contract
+                    == DIRECT_MARKETING_STANDARD_TRANSITION_REBASED_CONTRACT
+                    and provenance.get("soc_transition_contract")
+                    == DIRECT_MARKETING_STANDARD_TRANSITION_REBASED_CONTRACT
+                    and action == "PASSIVE_NORMAL"
+                    and not projection_only_slot
+                    and selection.get("selected") is False
+                    and selection.get("executable") is False
+                    and selection.get("commands_allowed") is False
+                    and selection_requested_w == 0.0
+                    and provenance.get("predecessor_slot_id")
+                    == previous_trajectory_slot_id
+                    and None
+                    not in {
+                        canonical_soc_start_pct,
+                        canonical_battery_w,
+                        standard_requested_battery_w,
+                        standard_integration_duration_s,
+                        provenance_canonical_start_pct,
+                        provenance_rebased_start_pct,
+                        soc_start_pct,
+                    }
+                    and _optional_numeric_equal(
+                        provenance_canonical_start_pct,
+                        canonical_soc_start_pct,
+                        tolerance=0.0015,
+                    )
+                    and _optional_numeric_equal(
+                        provenance_rebased_start_pct,
+                        soc_start_pct,
+                        tolerance=0.0015,
+                    )
+                    and _optional_numeric_equal(
+                        standard_requested_battery_w,
+                        canonical_battery_w,
+                        tolerance=0.001,
+                    )
+                    and provenance.get("integration_duration_contract")
+                    == DIRECT_MARKETING_STANDARD_TRANSITION_DURATION_CONTRACT
+                    and type(standard_integration_anchor_ts_ms) is int
+                    and standard_integration_anchor_ts_ms
+                    == expected_standard_integration_anchor_ts_ms
+                    and start_ms
+                    <= expected_standard_integration_anchor_ts_ms
+                    < end_ms
+                    and 0.0 < standard_integration_duration_s
+                    <= float(SLOT_DURATION_S)
+                    and _optional_numeric_equal(
+                        standard_integration_duration_s,
+                        expected_standard_integration_duration_s,
+                        tolerance=0.001,
+                    )
+                )
+                energy_integrator_valid = bool(
+                    soc_projection_contract
+                    == DIRECT_MARKETING_SOC_INTEGRATOR_CONTRACT
+                    and not standard_passthrough_valid
+                    and not standard_rebased_valid
+                )
+                trajectory_headroom_binding = (
+                    trajectory_slot.get("headroom_projection")
+                    if isinstance(
+                        trajectory_slot.get("headroom_projection"),
+                        dict,
+                    )
+                    else {}
+                )
+                trajectory_headroom_slot_contract = (
+                    trajectory_headroom_binding.get("slot")
+                    if isinstance(
+                        trajectory_headroom_binding.get("slot"),
+                        dict,
+                    )
+                    else {}
+                )
+                integration_duration_s = (
+                    _canonical_trajectory_finite_number(
+                        trajectory_headroom_slot_contract.get(
+                            "effective_duration_s"
+                        )
+                    )
+                    if projection_only_slot
+                    else (
+                        standard_integration_duration_s
+                        if standard_rebased_valid
+                        else float(SLOT_DURATION_S)
+                    )
+                )
                 expected_soc_end_pct = None
                 if None not in {
                     battery_w,
@@ -4854,12 +8765,13 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                     capacity_wh,
                     charge_efficiency,
                     discharge_efficiency,
+                    integration_duration_s,
                 }:
                     if (battery_w or 0.0) >= 0.0:
                         expected_soc_end_pct = (
                             (soc_start_pct or 0.0)
                             + (battery_w or 0.0)
-                            * (SLOT_DURATION_S / 3600.0)
+                            * ((integration_duration_s or 0.0) / 3600.0)
                             * (charge_efficiency or 0.0)
                             / (capacity_wh or 1.0)
                             * 100.0
@@ -4868,7 +8780,7 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                         expected_soc_end_pct = (
                             (soc_start_pct or 0.0)
                             - abs(battery_w or 0.0)
-                            * (SLOT_DURATION_S / 3600.0)
+                            * ((integration_duration_s or 0.0) / 3600.0)
                             / (discharge_efficiency or 1.0)
                             / (capacity_wh or 1.0)
                             * 100.0
@@ -4917,7 +8829,60 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                     if not math.isfinite(available_discharge_hi_w):
                         available_discharge_hi_w = None
                 action_power_invalid = False
-                if action in {"PV_STORE", "DV_CURVE_CHARGE"} and (battery_w or 0.0) >= 0.0:
+                if projection_only_slot:
+                    expected_headroom_energy_binding = (
+                        _headroom_projection_energy_binding(
+                            trajectory_headroom_slot_contract,
+                            soc_start_pct=soc_start_pct,
+                            hard_floor_pct=hard_reserve_pct,
+                            capacity_wh=capacity_wh,
+                            discharge_efficiency=discharge_efficiency,
+                            max_discharge_w=max_discharge_w,
+                        )
+                    )
+                    expected_headroom_ac_w = (
+                        _canonical_trajectory_finite_number(
+                            expected_headroom_energy_binding.get(
+                                "applied_ac_discharge_w"
+                            )
+                        )
+                        if isinstance(
+                            expected_headroom_energy_binding,
+                            dict,
+                        )
+                        else None
+                    )
+                    action_power_invalid = bool(
+                        action != "HEADROOM_EXPORT"
+                        or selection_projected_w is None
+                        or expected_headroom_ac_w is None
+                        or trajectory_headroom_slot_contract.get("energy_basis")
+                        != DIRECT_MARKETING_HEADROOM_ENERGY_BASIS
+                        or set(provenance)
+                        != {
+                            "balance_source",
+                            "soc_projection_contract",
+                            "action_source",
+                            "candidate_effect",
+                            "shadow_effect",
+                            "pv_axis_evidence_class",
+                            "headroom_energy_binding",
+                        }
+                        or provenance.get("headroom_energy_binding")
+                        != expected_headroom_energy_binding
+                        or (battery_w or 0.0) > 0.001
+                        or not _optional_numeric_equal(
+                            abs(battery_w or 0.0),
+                            expected_headroom_ac_w,
+                            tolerance=0.001,
+                        )
+                        or not _optional_numeric_equal(
+                            selection_projected_w,
+                            abs(battery_w or 0.0),
+                            tolerance=0.001,
+                        )
+                    )
+                elif action in {"PV_STORE", "DV_CURVE_CHARGE"} and (battery_w or 0.0) >= 0.0:
                     source_contract = str(
                         selection.get("pv_store_source_contract")
                         if selection.get("selected") is True
@@ -4966,27 +8931,62 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                         > (available_discharge_hi_w or 0.0) + 0.0005
                     )
                 elif action == "PASSIVE_NORMAL":
-                    if (battery_w or 0.0) >= 0.0:
-                        action_power_invalid = bool(
-                            max_charge_w is None
-                            or (battery_w or 0.0)
-                            > min(
-                                max(0.0, (residual_before_w or 0.0)),
-                                max_charge_w or 0.0,
-                            )
-                            + 0.01
-                        )
+                    if standard_passthrough_valid:
+                        action_power_invalid = False
+                    elif not standard_rebased_valid:
+                        action_power_invalid = True
                     else:
-                        action_power_invalid = bool(
-                            available_discharge_hi_w is None
-                            or abs(battery_w or 0.0)
-                            > min(
-                                max(0.0, -(residual_before_w or 0.0)),
-                                max_discharge_w or 0.0,
+                        standard_integration_hours = (
+                            (standard_integration_duration_s or 0.0)
+                            / 3600.0
+                        )
+                        rebased_energy_start_wh = (
+                            (soc_start_pct or 0.0)
+                            / 100.0
+                            * (capacity_wh or 0.0)
+                        )
+                        rebased_floor_wh = (
+                            (hard_reserve_pct or 0.0)
+                            / 100.0
+                            * (capacity_wh or 0.0)
+                        )
+                        rebased_ceiling_wh = (
+                            (ceiling_pct or 0.0)
+                            / 100.0
+                            * (capacity_wh or 0.0)
+                        )
+                        if (standard_requested_battery_w or 0.0) > 0.0:
+                            expected_standard_battery_w = min(
+                                standard_requested_battery_w or 0.0,
+                                max_charge_w or 0.0,
+                                max(0.0, residual_before_w or 0.0),
+                                max(
+                                    0.0,
+                                    rebased_ceiling_wh
+                                    - rebased_energy_start_wh,
+                                )
+                                / (charge_efficiency or 1.0)
+                                / standard_integration_hours,
                             )
-                            + 0.01
-                            or abs(battery_w or 0.0)
-                            > (available_discharge_hi_w or 0.0) + 0.0005
+                        elif (standard_requested_battery_w or 0.0) < 0.0:
+                            expected_standard_battery_w = -min(
+                                abs(standard_requested_battery_w or 0.0),
+                                max_discharge_w or 0.0,
+                                max(0.0, -(residual_before_w or 0.0)),
+                                max(
+                                    0.0,
+                                    rebased_energy_start_wh
+                                    - rebased_floor_wh,
+                                )
+                                * (discharge_efficiency or 0.0)
+                                / standard_integration_hours,
+                            )
+                        else:
+                            expected_standard_battery_w = 0.0
+                        action_power_invalid = not _optional_numeric_equal(
+                            battery_w,
+                            round(expected_standard_battery_w, 3),
+                            tolerance=0.001,
                         )
                 elif action == "CHARGE_BLOCK_WAIT":
                     action_power_invalid = bool(
@@ -5000,6 +9000,20 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                         or abs(battery_w or 0.0)
                         > (available_discharge_hi_w or 0.0) + 0.0005
                     )
+                if projection_only_slot:
+                    selection_contract_power_w = selection_projected_w
+                elif selection.get("selected") is True:
+                    selection_contract_power_w = selection_requested_w
+                elif delegation:
+                    selection_contract_power_w = (
+                        delegation_max_curve_charge_w
+                    )
+                else:
+                    # PASSIVE_NORMAL und CHARGE_BLOCK_WAIT besitzen bewusst
+                    # keinen Leistungsauftrag. Für die numerische
+                    # Trajektorienform ist das ein explizites 0-W-Budget und
+                    # kein fehlender Mess- oder Vertragswert.
+                    selection_contract_power_w = 0.0
                 if bool(
                     None
                     in {
@@ -5017,9 +9031,15 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                         expected_soc_end_pct,
                         hard_reserve_pct,
                         ceiling_pct,
-                        selection_requested_w,
+                        selection_contract_power_w,
                     }
                     or not delegation_power_type_valid
+                    or not initial_soc_binding_valid
+                    or not (
+                        energy_integrator_valid
+                        or standard_passthrough_valid
+                        or standard_rebased_valid
+                    )
                     or not (0.0 <= (soc_start_pct or 0.0) <= 100.0)
                     or not (0.0 <= (soc_end_pct or 0.0) <= 100.0)
                     or not (
@@ -5037,11 +9057,14 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                         )
                         > 0.002
                     )
-                    or abs(
-                        (soc_end_pct or 0.0)
-                        - (expected_soc_end_pct or 0.0)
+                    or (
+                        not standard_passthrough_valid
+                        and abs(
+                            (soc_end_pct or 0.0)
+                            - (expected_soc_end_pct or 0.0)
+                        )
+                        > 0.002
                     )
-                    > 0.002
                     or abs(
                         (house_w or 0.0)
                         + (heat_w or 0.0)
@@ -5078,6 +9101,10 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                         action == "CHARGE_BLOCK_WAIT"
                         and (battery_w or 0.0) > 0.001
                     )
+                    or (
+                        action == "HEADROOM_EXPORT"
+                        and not projection_only_slot
+                    )
                     or action_power_invalid
                 ):
                     return {
@@ -5087,6 +9114,7 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                         "slot": None,
                     }
                 previous_trajectory_soc_end = soc_end_pct
+                previous_trajectory_slot_id = trajectory_slot.get("slot_id")
             if trajectory.get("complete") is True:
                 expected_starts = {
                     _safe_int(item.get("start_ts_ms"), 0)
@@ -5098,6 +9126,17 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                     return {
                         "valid": False,
                         "block_reason_code": "DIRECT_MARKETING_TRAJECTORY_SLOT_COVERAGE_INCOMPLETE",
+                        "plan_id": plan_id,
+                        "slot": None,
+                    }
+                if seen_headroom_projection_ids != set(
+                    headroom_projection_state.get("projection_ids") or set()
+                ):
+                    return {
+                        "valid": False,
+                        "block_reason_code": (
+                            "HEADROOM_PROJECTION_TRAJECTORY_COVERAGE_INVALID"
+                        ),
                         "plan_id": plan_id,
                         "slot": None,
                     }
@@ -6686,6 +10725,220 @@ def _default_charge_guard_runtime_safety_claim(
     }
 
 
+DIRECT_MARKETING_HEADROOM_RUNTIME_ALIASES = frozenset({
+    "HEADROOM_EXPORT",
+    "DIRECT_MARKETING_HEADROOM_EXPORT",
+})
+
+DIRECT_MARKETING_HEADROOM_RUNTIME_AUTHORITY_BOOL_KEYS = frozenset({
+    "acknowledged",
+    "ac_charge_commanded",
+    "attempted",
+    "aux_ac_allowed",
+    "canonical_execution_released",
+    "command_allowed",
+    "commands_allowed",
+    "confirmed",
+    "control_effect",
+    "dispatch_authorized",
+    "enabled",
+    "executable",
+    "execution_released",
+    "field_released",
+    "grid_ac_allowed",
+    "hardware_effect",
+    "hardware_effect_claim_allowed",
+    "issued",
+    "permission_only",
+    "power_limits_used",
+    "release",
+    "requested",
+    "runtime_effect_claim_allowed",
+    "selected",
+    "source_action_execution_release",
+})
+
+DIRECT_MARKETING_HEADROOM_RUNTIME_ZERO_POWER_KEYS = frozenset({
+    "charge_budget_w",
+    "charge_w",
+    "export_budget_w",
+    "export_w",
+    "hardware_cap_w",
+    "issued_power_w",
+    "issued_w",
+    "max_charge_w",
+    "max_discharge_w",
+    "power_w",
+    "requested_charge_cap_w",
+    "requested_power_w",
+    "requested_w",
+    "runtime_cap_w",
+    "selected_power_w",
+    "selected_w",
+    "translated_power_w",
+    "val",
+})
+
+DIRECT_MARKETING_HEADROOM_RUNTIME_COMMAND_KEYS = frozenset({
+    "command",
+    "commands",
+    "hardware_command",
+    "mode",
+    "mode_name",
+    "mode_value",
+    "priority",
+    "rscp_command_path",
+    "rscp_path",
+    "translated_mode",
+    "translated_mode_name",
+    "translated_state",
+})
+
+DIRECT_MARKETING_HEADROOM_RUNTIME_BOOL_SUFFIXES = (
+    "_acknowledged",
+    "_attempted",
+    "_command_allowed",
+    "_commands_allowed",
+    "_confirmed",
+    "_dispatch_authorized",
+    "_executable",
+    "_field_released",
+    "_hardware_effect",
+    "_hardware_effect_claim_allowed",
+    "_issued",
+    "_plan_commands_allowed",
+    "_plan_executable",
+    "_requested",
+    "_runtime_effect_claim_allowed",
+    "_selected",
+)
+
+DIRECT_MARKETING_HEADROOM_RUNTIME_ZERO_POWER_SUFFIXES = (
+    "_charge_budget_w",
+    "_export_budget_w",
+    "_issued_w",
+    "_planned_w",
+    "_requested_w",
+    "_selected_w",
+)
+
+DIRECT_MARKETING_HEADROOM_RUNTIME_ACTION_SUFFIXES = (
+    "_action",
+    "_target_state",
+)
+
+DIRECT_MARKETING_HEADROOM_RUNTIME_COMMAND_SUFFIXES = (
+    "_command",
+)
+
+
+def _contains_direct_marketing_headroom_runtime_alias(value: Any) -> bool:
+    """Erkennt HEADROOM-Autorität auch in unbekannten Phase-5-Formen."""
+
+    if isinstance(value, dict):
+        return any(
+            _contains_direct_marketing_headroom_runtime_alias(item)
+            for item in value.values()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(
+            _contains_direct_marketing_headroom_runtime_alias(item)
+            for item in value
+        )
+    return bool(
+        type(value) is str
+        and value.strip().upper()
+        in DIRECT_MARKETING_HEADROOM_RUNTIME_ALIASES
+    )
+
+
+def _direct_marketing_headroom_runtime_presence(
+    phase5_raw: Any,
+    payload: Dict[str, Any],
+) -> bool:
+    payload_root_alias = any(
+        type(value) is str
+        and value.strip().upper()
+        in DIRECT_MARKETING_HEADROOM_RUNTIME_ALIASES
+        and bool(
+            str(key).strip().lower() in {"action", "target_state"}
+            or str(key).strip().lower().endswith("_action")
+            or str(key).strip().lower().endswith("_target_state")
+        )
+        for key, value in payload.items()
+    )
+    return bool(
+        _contains_direct_marketing_headroom_runtime_alias(phase5_raw)
+        or payload_root_alias
+        or _actual_action(payload) == "HEADROOM_EXPORT"
+    )
+
+
+def _scrub_direct_marketing_headroom_runtime_aliases(value: Any) -> Any:
+    if isinstance(value, dict):
+        sanitized: Dict[str, Any] = {}
+        for key, item in value.items():
+            normalized_key = str(key).strip().lower()
+            if bool(
+                normalized_key in {"action", "target_state"}
+                or normalized_key.endswith(
+                    DIRECT_MARKETING_HEADROOM_RUNTIME_ACTION_SUFFIXES
+                )
+            ):
+                sanitized[key] = None
+            elif bool(
+                normalized_key in (
+                    DIRECT_MARKETING_HEADROOM_RUNTIME_AUTHORITY_BOOL_KEYS
+                )
+                or normalized_key.endswith(
+                    DIRECT_MARKETING_HEADROOM_RUNTIME_BOOL_SUFFIXES
+                )
+            ):
+                sanitized[key] = False
+            elif bool(
+                normalized_key in (
+                    DIRECT_MARKETING_HEADROOM_RUNTIME_ZERO_POWER_KEYS
+                )
+                or normalized_key.endswith(
+                    DIRECT_MARKETING_HEADROOM_RUNTIME_ZERO_POWER_SUFFIXES
+                )
+            ):
+                sanitized[key] = 0
+            elif bool(
+                normalized_key in (
+                    DIRECT_MARKETING_HEADROOM_RUNTIME_COMMAND_KEYS
+                )
+                or normalized_key.endswith(
+                    DIRECT_MARKETING_HEADROOM_RUNTIME_COMMAND_SUFFIXES
+                )
+            ):
+                sanitized[key] = None
+            elif _read_only_extension_authority_key(normalized_key):
+                sanitized[key] = None
+            else:
+                sanitized[key] = (
+                    _scrub_direct_marketing_headroom_runtime_aliases(item)
+                )
+        return sanitized
+    if isinstance(value, list):
+        return [
+            _scrub_direct_marketing_headroom_runtime_aliases(item)
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _scrub_direct_marketing_headroom_runtime_aliases(item)
+            for item in value
+        )
+    if bool(
+        type(value) is str
+        and value.strip().upper()
+        in DIRECT_MARKETING_HEADROOM_RUNTIME_ALIASES
+    ):
+        return None
+    return value
+
+
 def _direct_marketing_runtime_plan_binding(
     plan: Dict[str, Any],
     slot: Dict[str, Any],
@@ -6701,16 +10954,24 @@ def _direct_marketing_runtime_plan_binding(
     candidate = phase5.get("candidate") if isinstance(phase5.get("candidate"), dict) else {}
     action = str(candidate.get("action") or "").upper()
     selected_action = str(phase5.get("selected_action") or "").upper()
+    headroom_runtime_claim = _direct_marketing_headroom_runtime_presence(
+        phase5,
+        payload,
+    )
     runtime_claim = bool(
-        action in {"ECONOMIC_EXPORT", "PV_STORE", "GRID_CHARGE", "CHARGE_BLOCK_WAIT", "DV_CURVE_CHARGE"}
-        and any(
-            (
-                phase5.get("selected") is True and selected_action == action,
-                phase5.get("executable") is True,
-                phase5.get("commands_allowed") is True,
-                phase5.get("requested") is True,
-                phase5.get("issued") is True,
-                phase5.get("hardware_effect") is True,
+        headroom_runtime_claim
+        or (
+            action in {"ECONOMIC_EXPORT", "PV_STORE", "GRID_CHARGE", "CHARGE_BLOCK_WAIT", "DV_CURVE_CHARGE"}
+            and any(
+                (
+                    phase5.get("selected") is True
+                    and selected_action == action,
+                    phase5.get("executable") is True,
+                    phase5.get("commands_allowed") is True,
+                    phase5.get("requested") is True,
+                    phase5.get("issued") is True,
+                    phase5.get("hardware_effect") is True,
+                )
             )
         )
     )
@@ -6924,12 +11185,16 @@ def _direct_marketing_runtime_plan_binding(
         slot_id=slot_id,
     )
     valid = bool(
-        safety_claim.get("valid")
+        False
+        if headroom_runtime_claim
+        else safety_claim.get("valid")
         if safety_claim.get("applicable")
         else not runtime_claim or exact_candidate
     )
     reason_code = (
-        safety_claim.get("reason_code")
+        "DIRECT_MARKETING_HEADROOM_RUNTIME_FORBIDDEN"
+        if headroom_runtime_claim
+        else safety_claim.get("reason_code")
         if safety_claim.get("applicable")
         else None
         if valid
@@ -6938,6 +11203,7 @@ def _direct_marketing_runtime_plan_binding(
     return {
         "valid": valid,
         "runtime_claim": runtime_claim,
+        "headroom_runtime_claim": headroom_runtime_claim,
         "plan_selected": plan_selected,
         "generation_match": generation_match,
         "exact_candidate": exact_candidate,
@@ -6969,32 +11235,63 @@ def build_runtime_overlay(
     now_value = int(now_ms if now_ms is not None else (_safe_float(payload.get("ts"), dt.datetime.now().timestamp()) or 0.0) * 1000)
     validation = validate_canonical_plan(plan, now_value)
     slot = validation.get("slot") if isinstance(validation.get("slot"), dict) else {}
-    phase5 = payload.get("storage_dispatch_phase5") if isinstance(payload.get("storage_dispatch_phase5"), dict) else {}
+    raw_phase5 = payload.get("storage_dispatch_phase5")
+    phase5 = raw_phase5 if isinstance(raw_phase5, dict) else {}
     explicit_phase5 = bool(phase5.get("schema_version") == "storage_dispatch_phase5_v1")
-    direct_marketing_binding = _direct_marketing_runtime_plan_binding(
-        plan,
-        slot,
-        phase5,
+    headroom_runtime_presence = _direct_marketing_headroom_runtime_presence(
+        raw_phase5,
         payload,
-        plan_id=validation.get("plan_id"),
-        slot_id=validation.get("slot_id"),
-    ) if explicit_phase5 else {
-        "valid": True,
-        "runtime_claim": False,
-        "plan_selected": False,
-        "generation_match": False,
-        "exact_candidate": False,
-        "safety_claim": {
-            "applicable": False,
+    )
+    phase5_evidence = bool(explicit_phase5 or headroom_runtime_presence)
+    if explicit_phase5:
+        direct_marketing_binding = _direct_marketing_runtime_plan_binding(
+            plan,
+            slot,
+            phase5,
+            payload,
+            plan_id=validation.get("plan_id"),
+            slot_id=validation.get("slot_id"),
+        )
+    elif headroom_runtime_presence:
+        direct_marketing_binding = {
             "valid": False,
-            "claim_type": None,
-            "action": None,
+            "runtime_claim": True,
+            "headroom_runtime_claim": True,
+            "plan_selected": False,
+            "generation_match": False,
+            "exact_candidate": False,
+            "safety_claim": {
+                "applicable": False,
+                "valid": False,
+                "claim_type": None,
+                "action": None,
+                "reason_code": None,
+            },
+            "reason_code": "DIRECT_MARKETING_HEADROOM_RUNTIME_FORBIDDEN",
+        }
+    else:
+        direct_marketing_binding = {
+            "valid": True,
+            "runtime_claim": False,
+            "headroom_runtime_claim": False,
+            "plan_selected": False,
+            "generation_match": False,
+            "exact_candidate": False,
+            "safety_claim": {
+                "applicable": False,
+                "valid": False,
+                "claim_type": None,
+                "action": None,
+                "reason_code": None,
+            },
             "reason_code": None,
-        },
-        "reason_code": None,
-    }
-    if explicit_phase5 and not direct_marketing_binding.get("valid"):
+        }
+    if phase5_evidence and not direct_marketing_binding.get("valid"):
         phase5 = copy.deepcopy(phase5)
+        if direct_marketing_binding.get("headroom_runtime_claim") is True:
+            phase5 = _scrub_direct_marketing_headroom_runtime_aliases(
+                phase5
+            )
         phase5.update({
             "selected": False,
             "executable": False,
@@ -7007,6 +11304,8 @@ def build_runtime_overlay(
             "hardware_effect": False,
             "selected_action": None,
             "selected_power_w": 0.0,
+            "charge_budget_w": 0,
+            "export_budget_w": 0,
             "block_reason_code": direct_marketing_binding.get("reason_code"),
             "technical_block_reason_code": direct_marketing_binding.get("reason_code"),
         })
@@ -7031,7 +11330,7 @@ def build_runtime_overlay(
         == "default_charge_guard"
     )
     evaluated_candidate: Optional[Dict[str, Any]] = None
-    if explicit_phase5:
+    if phase5_evidence:
         phase5_candidate = phase5.get("candidate") if isinstance(phase5.get("candidate"), dict) else {}
         candidate = {
             "action": phase5_candidate.get("action") or "HOLD",
@@ -7101,12 +11400,12 @@ def build_runtime_overlay(
     )
     actual_action = (
         str(phase5.get("selected_action") or _actual_action(payload)).upper()
-        if explicit_phase5 and phase5.get("requested")
+        if phase5_evidence and phase5.get("requested")
         else _actual_action(payload)
     )
     selected = (
         bool(phase5.get("selected"))
-        if explicit_phase5
+        if phase5_evidence
         else bool(validation.get("valid") and candidate_action == actual_action)
     )
     live_valid = bool(
@@ -7117,18 +11416,18 @@ def build_runtime_overlay(
     )
     executable = (
         bool(phase5.get("executable") and live_valid and not payload.get("ems_budget_runtime_veto"))
-        if explicit_phase5
+        if phase5_evidence
         else bool(selected and live_valid and not payload.get("ems_budget_runtime_veto"))
     )
     mode_name = str(payload.get("mode_name") or payload.get("mode") or "AUTO").upper()
     value_w = max(0, _safe_int(payload.get("val"), 0))
     commands_allowed = (
         bool(phase5.get("commands_allowed") and executable)
-        if explicit_phase5
+        if phase5_evidence
         else bool(executable and candidate_action in ACTIVE_ACTIONS and mode_name != "AUTO" and value_w > 0)
     )
-    block_reason = phase5.get("block_reason_code") if explicit_phase5 else validation.get("block_reason_code")
-    if not explicit_phase5:
+    block_reason = phase5.get("block_reason_code") if phase5_evidence else validation.get("block_reason_code")
+    if not phase5_evidence:
         if validation.get("valid") and not selected:
             block_reason = "CANDIDATE_NOT_SELECTED"
         elif selected and not live_valid:
@@ -7142,7 +11441,7 @@ def build_runtime_overlay(
 
     runtime_selected_action = (
         _runtime_storage_action(phase5.get("selected_action"))
-        if explicit_phase5 and selected
+        if phase5_evidence and selected
         else _runtime_storage_action(actual_action)
         if selected
         else None
@@ -7205,7 +11504,7 @@ def build_runtime_overlay(
         and readback_age_ms is not None
         and -5_000 <= readback_age_ms <= 30_000
     )
-    if explicit_phase5:
+    if phase5_evidence:
         acknowledged = phase5.get("acknowledged")
         historical_confirmation = bool(phase5.get("confirmed"))
     elif "acknowledged" in power_diag:
@@ -7215,7 +11514,7 @@ def build_runtime_overlay(
         acknowledged = bool(power_diag.get("response_codes") is not None or power_diag.get("confirmed"))
         historical_confirmation = bool(power_diag.get("confirmed"))
     charge_block_lifecycle = bool(
-        explicit_phase5
+        phase5_evidence
         and str(phase5.get("selected_action") or "").upper() in {
             "DIRECT_MARKETING_CHARGE_BLOCK_WAIT",
             "DIRECT_MARKETING_CHARGE_BLOCK_WAIT_SAFE_FALLBACK",
@@ -7247,17 +11546,17 @@ def build_runtime_overlay(
         "power_w": value_w,
         "rscp_path": payload.get("rscp_command_path"),
         "issued_by": "storage_manager",
-        "requested": bool(phase5.get("requested")) if explicit_phase5 else bool(selected and executable),
-        "attempted": bool(phase5.get("attempted")) if explicit_phase5 else bool(selected and executable),
+        "requested": bool(phase5.get("requested")) if phase5_evidence else bool(selected and executable),
+        "attempted": bool(phase5.get("attempted")) if phase5_evidence else bool(selected and executable),
         "acknowledged": acknowledged,
-        "issued": bool(phase5.get("issued")) if explicit_phase5 else bool(selected and executable),
+        "issued": bool(phase5.get("issued")) if phase5_evidence else bool(selected and executable),
         "confirmed": confirmed,
         "historical_confirmation": historical_confirmation,
         "hardware_effect": (
             bool(phase5.get("hardware_effect") and confirmed)
             if charge_block_lifecycle
             else bool(phase5.get("hardware_effect"))
-            if explicit_phase5
+            if phase5_evidence
             else bool(selected and executable)
         ),
         "dispatch_authorized": bool(selected and executable and commands_allowed),
@@ -7322,18 +11621,18 @@ def build_runtime_overlay(
         "executable": executable,
         "commands_allowed": commands_allowed,
         "owner": "storage_manager",
-        "selection_source": phase5.get("selected_source") if explicit_phase5 else "legacy_runtime_projection",
+        "selection_source": phase5.get("selected_source") if phase5_evidence else "legacy_runtime_projection",
         "plan_runtime_selection_invariant": direct_marketing_binding,
         "block_reason_code": block_reason,
-        "technical_block_reason_code": phase5.get("technical_block_reason_code") if explicit_phase5 else block_reason,
-        "blockers": copy.deepcopy(phase5.get("blockers")) if explicit_phase5 else ([block_reason] if block_reason else []),
+        "technical_block_reason_code": phase5.get("technical_block_reason_code") if phase5_evidence else block_reason,
+        "blockers": copy.deepcopy(phase5.get("blockers")) if phase5_evidence else ([block_reason] if block_reason else []),
         "charge_budget_w": charge_budget_w,
         "export_budget_w": export_budget_w,
         "requested": requested,
         "ack": {
             "acknowledged": acknowledged,
             "dispatch_acknowledged": bool(
-                explicit_phase5
+                phase5_evidence
                 and phase5.get("acknowledged") is True
                 and phase5.get("issued") is True
             ),
@@ -7364,8 +11663,8 @@ def build_runtime_overlay(
             "valid": live_valid,
             "ts_ms": _to_ts_ms(live.get("_ts", payload.get("ts"))) or now_value,
         },
-        "legacy_baseline": copy.deepcopy(phase5.get("legacy_baseline")) if explicit_phase5 else None,
-        "phase5": copy.deepcopy(phase5) if explicit_phase5 else None,
+        "legacy_baseline": copy.deepcopy(phase5.get("legacy_baseline")) if phase5_evidence else None,
+        "phase5": copy.deepcopy(phase5) if phase5_evidence else None,
     }
     runtime["effective_storage_plan"] = _effective_storage_plan_projection(
         plan,

@@ -754,6 +754,8 @@ def _publish_webportal_transaction(authority):
                     web_root=web_root,
                     install_user=authority["install_user"],
                     web_group="www-data",
+                    program_files=tuple(sorted(desired_payloads)),
+                    program_directories=tuple(desired_directories),
                 ):
                     raise RuntimeError("Web-Programmrechte sind nach der Projektion nicht sicher")
                 _require_web_directory_contract(
@@ -908,6 +910,8 @@ def _publish_webportal_transaction(authority):
                                 web_root=web_root,
                                 install_user=authority["install_user"],
                                 web_group="www-data",
+                                program_files=tuple(sorted(target_files)),
+                                program_directories=tuple(sorted(target_directories)),
                             ):
                                 raise RuntimeError("Rollback-Hardening fehlgeschlagen")
                             _require_web_runtime_top_level_types(

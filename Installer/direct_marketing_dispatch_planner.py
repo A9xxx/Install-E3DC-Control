@@ -57,6 +57,7 @@ KNOWN_SOURCE_ACTIONS = {
     "charge_block_wait",
     "dv_curve_charge",
     "eco_plus_curve_charge",
+    "eco_plus_curve_charge_candidate",
 }
 
 
@@ -864,7 +865,11 @@ def _mapped_action(item: Dict[str, Any]) -> Tuple[str, str, str]:
         return "PV_STORE", "PV_SHIFT", "EXPLICIT_PV_STORE_WINDOW"
     if target in {"GRID_CHARGE", "FORCE_GRID_CHARGE"} or source_action == "arbitrage_grid_charge_candidate":
         return "GRID_CHARGE", "PRICE_ARBITRAGE", "EXPLICIT_GRID_CHARGE_WINDOW"
-    if target == "DV_CURVE_CHARGE" or source_action in {"dv_curve_charge", "eco_plus_curve_charge"}:
+    if target == "DV_CURVE_CHARGE" or source_action in {
+        "dv_curve_charge",
+        "eco_plus_curve_charge",
+        "eco_plus_curve_charge_candidate",
+    }:
         return "DV_CURVE_CHARGE", "NIGHT_RESERVE_PROTECTION", "NIGHT_AUTARKY_CURVE_CHARGE"
     if (
         target == "HEADROOM_EXPORT"
@@ -896,7 +901,7 @@ def _policy_binding_valid(
     start_ms: int,
     end_ms: int,
 ) -> bool:
-    if action in {"HOUSE_SUPPLY", "DV_CURVE_CHARGE"}:
+    if action == "HOUSE_SUPPLY":
         return True
     if item.get("commands_allowed") is not True or item.get("blocked") is True:
         return False
@@ -963,6 +968,10 @@ def _policy_binding_valid(
                 "keep_headroom",
                 "charge_block_wait",
             },
+        ),
+        "DV_CURVE_CHARGE": (
+            {"DV_CURVE_CHARGE"},
+            {"eco_plus_curve_charge_candidate"},
         ),
     }
     expected_targets, expected_sources = expected_actions.get(
@@ -1507,6 +1516,29 @@ def _execution_contract(action: str, requested_w: float, max_discharge_w: float)
     }
 
 
+def _dv_curve_execution_contract_valid(
+    execution: Dict[str, Any],
+    max_discharge_w: float,
+) -> bool:
+    """Versiegelt die passive AUTO-Sidecar-Semantik der Kurvenladung."""
+
+    return bool(
+        isinstance(execution, dict)
+        and execution.get("class") == "PASSIVE_RELEASE"
+        and execution.get("effect") == "AUTO_CHARGE_CAP"
+        and execution.get("mode") == "AUTO"
+        and execution.get("commands_allowed") is False
+        and execution.get("max_charge_w") is None
+        and _safe_float(execution.get("max_discharge_w"), None)
+        == max_discharge_w
+        and _safe_float(execution.get("requested_power_w"), None) == 0.0
+        and execution.get("release_existing_dv_limits") is True
+        and execution.get("would_require_runtime_command") is False
+        and execution.get("runtime_command_condition") is None
+        and execution.get("steady_state_command_required") is False
+    )
+
+
 def build_dv_plan_v1(
     source: Dict[str, Any],
     planning_input: Dict[str, Any],
@@ -2048,17 +2080,9 @@ def validate_dv_plan_v1(
                     str(passive_projection["tighten_code"]),
                 )
         elif action == "DV_CURVE_CHARGE":
-            if not (
-                execution.get("class") == "PASSIVE_RELEASE"
-                and execution.get("mode") == "AUTO"
-                and execution.get("commands_allowed") is False
-                and _safe_float(execution.get("max_discharge_w"), None)
-                == max_discharge_w
-                and _safe_float(
-                    execution.get("requested_power_w"),
-                    None,
-                )
-                == 0.0
+            if not _dv_curve_execution_contract_valid(
+                execution,
+                max_discharge_w,
             ):
                 _append_once(slot_rejects, "DV_CURVE_CHARGE_SEMANTICS_INVALID")
             passive_projection = _project_passive_power(

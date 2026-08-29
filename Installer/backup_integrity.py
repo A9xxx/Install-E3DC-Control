@@ -29,7 +29,7 @@ import stat
 import tempfile
 import time
 import uuid
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
@@ -169,6 +169,34 @@ class PersistentSource:
 
 
 @dataclass(frozen=True)
+class BoundPersistentSourceRoot:
+    """Gehaltene Quellwurzel für mehrere konsistente Backup-Teilquellen."""
+
+    path: Path
+    parent_descriptor: int
+    root_descriptor: int
+    parent_device: int
+    parent_inode: int
+    device: int
+    inode: int
+    mount_id: str
+
+
+@dataclass(frozen=True)
+class BoundPersistentInstallRoot:
+    """Gehaltene Installationswurzel für einen vollständigen Restore."""
+
+    path: Path
+    parent_descriptor: int
+    root_descriptor: int
+    parent_device: int
+    parent_inode: int
+    device: int
+    inode: int
+    mount_id: str
+
+
+@dataclass(frozen=True)
 class PersistentSourceSizeEstimate:
     """Rein lesende Größenabschätzung für einen PersistentSource-Satz.
 
@@ -303,6 +331,28 @@ def _open_directory_nofollow(path: PathValue) -> int:
         raise
 
 
+def _descriptor_mount_id(descriptor: int) -> str:
+    """Liest die Kernel-Mount-ID eines bereits geöffneten Dateideskriptors."""
+
+    try:
+        with open(
+            "/proc/self/fdinfo/{}".format(int(descriptor)),
+            "r",
+            encoding="ascii",
+            errors="strict",
+        ) as handle:
+            for line in handle:
+                if line.startswith("mnt_id:"):
+                    value = line.partition(":")[2].strip()
+                    if value.isdigit():
+                        return value
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise BackupIntegrityError(
+            "Mount-ID des Restore-Pfads ist nicht sicher lesbar"
+        ) from exc
+    raise BackupIntegrityError("Mount-ID des Restore-Pfads fehlt")
+
+
 def _open_regular_file_nofollow(path: PathValue) -> Tuple[int, os.stat_result]:
     candidate = _lexical_absolute(path)
     parent_descriptor = _open_directory_nofollow(candidate.parent)
@@ -317,6 +367,245 @@ def _open_regular_file_nofollow(path: PathValue) -> Tuple[int, os.stat_result]:
             raise BackupIntegrityError("Quelldatei wurde waehrend des Oeffnens ausgetauscht: {}".format(candidate))
         return descriptor, opened
     finally:
+        os.close(parent_descriptor)
+
+
+def _verify_bound_persistent_source_root(binding: BoundPersistentSourceRoot) -> None:
+    reopened_descriptor = -1
+    try:
+        parent = os.fstat(binding.parent_descriptor)
+        opened = os.fstat(binding.root_descriptor)
+        named = os.stat(
+            binding.path.name,
+            dir_fd=binding.parent_descriptor,
+            follow_symlinks=False,
+        )
+        reopened_descriptor = os.open(
+            binding.path.name,
+            os.O_RDONLY | _DIRECTORY | _NOFOLLOW,
+            dir_fd=binding.parent_descriptor,
+        )
+        reopened = os.fstat(reopened_descriptor)
+        opened_mount_id = _descriptor_mount_id(binding.root_descriptor)
+        named_mount_id = _descriptor_mount_id(reopened_descriptor)
+    except OSError as exc:
+        raise BackupIntegrityError(
+            "Gebundene Backup-Quellwurzel ist nicht mehr vollständig lesbar: "
+            "{}".format(binding.path)
+        ) from exc
+    finally:
+        if reopened_descriptor >= 0:
+            os.close(reopened_descriptor)
+    if (
+        (parent.st_dev, parent.st_ino)
+        != (binding.parent_device, binding.parent_inode)
+        or not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(named.st_mode)
+        or not stat.S_ISDIR(reopened.st_mode)
+        or (opened.st_dev, opened.st_ino) != (binding.device, binding.inode)
+        or (named.st_dev, named.st_ino) != (binding.device, binding.inode)
+        or (reopened.st_dev, reopened.st_ino) != (binding.device, binding.inode)
+        or opened_mount_id != binding.mount_id
+        or named_mount_id != binding.mount_id
+    ):
+        raise BackupIntegrityError(
+            "Gebundene Backup-Quellwurzel wurde während der Sicherung ersetzt: "
+            "{}".format(binding.path)
+        )
+
+
+@contextmanager
+def bind_persistent_source_root(
+    path: PathValue,
+    *,
+    expected_identity: Optional[Tuple[int, int, int, int]] = None,
+):
+    """Hält Parent und Quellroot über alle install-relativen Backupquellen offen."""
+
+    root = _lexical_absolute(path)
+    if root == Path(root.anchor):
+        raise BackupIntegrityError("Dateisystemwurzel ist keine zulässige Backup-Quellwurzel")
+    parent_descriptor = _open_directory_nofollow(root.parent)
+    root_descriptor = -1
+    try:
+        parent = os.fstat(parent_descriptor)
+        named = os.stat(root.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        root_descriptor = os.open(
+            root.name,
+            os.O_RDONLY | _DIRECTORY | _NOFOLLOW,
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(root_descriptor)
+        if (
+            not stat.S_ISDIR(named.st_mode)
+            or not stat.S_ISDIR(opened.st_mode)
+            or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise BackupIntegrityError("Backup-Quellwurzel driftete beim Öffnen")
+        actual = (
+            int(parent.st_dev),
+            int(parent.st_ino),
+            int(opened.st_dev),
+            int(opened.st_ino),
+        )
+        if expected_identity is not None and actual != tuple(
+            int(item) for item in expected_identity
+        ):
+            raise BackupIntegrityError(
+                "Backup-Quellwurzel stimmt nicht mit der gebundenen Installation überein"
+            )
+        binding = BoundPersistentSourceRoot(
+            path=root,
+            parent_descriptor=parent_descriptor,
+            root_descriptor=root_descriptor,
+            parent_device=actual[0],
+            parent_inode=actual[1],
+            device=actual[2],
+            inode=actual[3],
+            mount_id=_descriptor_mount_id(root_descriptor),
+        )
+        _verify_bound_persistent_source_root(binding)
+        try:
+            yield binding
+        finally:
+            _verify_bound_persistent_source_root(binding)
+    finally:
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
+        os.close(parent_descriptor)
+
+
+def _verify_bound_persistent_install_root(
+    binding: BoundPersistentInstallRoot,
+) -> None:
+    """Prüft Root-FD und seinen weiterhin sichtbaren kanonischen Namen."""
+
+    if not isinstance(binding, BoundPersistentInstallRoot):
+        raise BackupIntegrityError("Restore besitzt keine gebundene Installationswurzel")
+    reopened_descriptor = -1
+    try:
+        parent = os.fstat(binding.parent_descriptor)
+        opened = os.fstat(binding.root_descriptor)
+        named = os.stat(
+            binding.path.name,
+            dir_fd=binding.parent_descriptor,
+            follow_symlinks=False,
+        )
+        reopened_descriptor = os.open(
+            binding.path.name,
+            os.O_RDONLY | _DIRECTORY | _NOFOLLOW,
+            dir_fd=binding.parent_descriptor,
+        )
+        reopened = os.fstat(reopened_descriptor)
+        opened_mount_id = _descriptor_mount_id(binding.root_descriptor)
+        named_mount_id = _descriptor_mount_id(reopened_descriptor)
+    except OSError as exc:
+        raise BackupIntegrityError(
+            "Gebundene Restore-Installationswurzel ist nicht mehr vollständig lesbar: "
+            "{}".format(binding.path)
+        ) from exc
+    finally:
+        if reopened_descriptor >= 0:
+            os.close(reopened_descriptor)
+    if (
+        (parent.st_dev, parent.st_ino)
+        != (binding.parent_device, binding.parent_inode)
+        or not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(named.st_mode)
+        or not stat.S_ISDIR(reopened.st_mode)
+        or (opened.st_dev, opened.st_ino) != (binding.device, binding.inode)
+        or (named.st_dev, named.st_ino) != (binding.device, binding.inode)
+        or (reopened.st_dev, reopened.st_ino) != (binding.device, binding.inode)
+        or opened_mount_id != binding.mount_id
+        or named_mount_id != binding.mount_id
+    ):
+        raise BackupIntegrityError(
+            "Gebundene Restore-Installationswurzel wurde während der "
+            "Transaktion ersetzt: {}".format(binding.path)
+        )
+
+
+def verify_bound_persistent_install_root(
+    binding: BoundPersistentInstallRoot,
+) -> None:
+    """Prüft eine gehaltene Restore-Wurzel idempotent und ohne Mutation."""
+
+    _verify_bound_persistent_install_root(binding)
+
+
+@contextmanager
+def bind_persistent_install_root(
+    path: PathValue,
+    *,
+    expected_identity: Optional[Tuple[int, int, int, int]] = None,
+):
+    """Hält Parent und Installationsroot über einen Restore hinweg offen.
+
+    Der Kontext ist additiv: Bestehende Restore-Aufrufer können weiterhin ohne
+    Bindung arbeiten. Sicherheitskritische Updatepfade können dagegen genau
+    eine früh gebundene Root-Identität durch Voll- und Overlay-Restore reichen.
+    """
+
+    root = _lexical_absolute(path)
+    if root == Path(root.anchor):
+        raise BackupIntegrityError(
+            "Dateisystemwurzel ist keine zulässige Restore-Installationswurzel"
+        )
+    parent_descriptor = _open_directory_nofollow(root.parent)
+    root_descriptor = -1
+    try:
+        parent = os.fstat(parent_descriptor)
+        named = os.stat(root.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        root_descriptor = os.open(
+            root.name,
+            os.O_RDONLY | _DIRECTORY | _NOFOLLOW,
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(root_descriptor)
+        if (
+            not stat.S_ISDIR(named.st_mode)
+            or not stat.S_ISDIR(opened.st_mode)
+            or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise BackupIntegrityError(
+                "Restore-Installationswurzel driftete beim Öffnen"
+            )
+        actual = (
+            int(parent.st_dev),
+            int(parent.st_ino),
+            int(opened.st_dev),
+            int(opened.st_ino),
+        )
+        if expected_identity is not None:
+            try:
+                expected = tuple(int(item) for item in expected_identity)
+            except (TypeError, ValueError) as exc:
+                raise BackupIntegrityError(
+                    "Erwartete Restore-Root-Identität ist ungültig"
+                ) from exc
+            if len(expected) != 4 or actual != expected:
+                raise BackupIntegrityError(
+                    "Restore-Installationswurzel stimmt nicht mit der früh "
+                    "gebundenen Installation überein"
+                )
+        binding = BoundPersistentInstallRoot(
+            path=root,
+            parent_descriptor=parent_descriptor,
+            root_descriptor=root_descriptor,
+            parent_device=actual[0],
+            parent_inode=actual[1],
+            device=actual[2],
+            inode=actual[3],
+            mount_id=_descriptor_mount_id(root_descriptor),
+        )
+        _verify_bound_persistent_install_root(binding)
+        try:
+            yield binding
+        finally:
+            _verify_bound_persistent_install_root(binding)
+    finally:
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
         os.close(parent_descriptor)
 
 
@@ -861,10 +1150,9 @@ def _account_home_boundaries() -> Set[Path]:
     return boundaries
 
 
-def _validate_backup_root_path(backup_root: PathValue, install_root: PathValue) -> Tuple[Path, Path]:
-    root = _lexical_absolute(backup_root)
-    install = _lexical_absolute(install_root)
-    _assert_no_symlink_components(install)
+def _validate_backup_root_location(root: Path, install: Path) -> Tuple[Path, Path]:
+    """Prüft nur die lexikalische Lage eines bereits normalisierten Backup-Roots."""
+
     if root.name not in BACKUP_ROOT_NAMES:
         raise BackupIntegrityError(
             "Backup-Root muss ein eigener Unterbaum namens {} sein.".format(
@@ -885,6 +1173,14 @@ def _validate_backup_root_path(backup_root: PathValue, install_root: PathValue) 
     for forbidden_parent in (Path("/etc"), Path("/usr"), Path("/bin"), Path("/sbin"), Path("/lib"), Path("/proc"), Path("/sys"), Path("/dev"), Path("/run"), Path("/var/www")):
         if _is_within(root, forbidden_parent):
             raise BackupIntegrityError("Backup-Root liegt unter einem geschuetzten Systempfad: {}".format(root))
+    return root, install
+
+
+def _validate_backup_root_path(backup_root: PathValue, install_root: PathValue) -> Tuple[Path, Path]:
+    root = _lexical_absolute(backup_root)
+    install = _lexical_absolute(install_root)
+    _assert_no_symlink_components(install)
+    root, install = _validate_backup_root_location(root, install)
     _assert_no_symlink_components(root.parent)
     if root.exists() or root.is_symlink():
         _assert_no_symlink_components(root)
@@ -1064,6 +1360,23 @@ def _read_root_marker(root: Path) -> Dict[str, object]:
     if not isinstance(payload, dict):
         raise BackupIntegrityError("Backup-Root-Marker ist ungueltig.")
     return payload
+
+
+def projected_backup_root(install_root: PathValue) -> Path:
+    """Projiziert den konfigurierten Zielpfad ohne Zugriff auf den Backup-Root.
+
+    Diese Funktion ist ausschließlich für unprivilegierte Read-only-Anzeigen
+    gedacht. Sie prüft die lexikalische Pfad- und Home-/Systemgrenzen-Policy,
+    liest aber weder Root, Marker noch Sicherungsinhalte. Schreibende Aufrufer
+    müssen weiterhin ``configured_backup_root`` beziehungsweise
+    ``default_backup_root`` und damit die vollständige Root-Prüfung verwenden.
+    """
+
+    install = _lexical_absolute(install_root)
+    configured = os.environ.get("E3DC_BACKUP_ROOT", "").strip()
+    root = _lexical_absolute(configured) if configured else DEFAULT_BACKUP_ROOT
+    root, _ = _validate_backup_root_location(root, install)
+    return root
 
 
 def configured_backup_root(install_root: PathValue) -> Path:
@@ -1478,6 +1791,8 @@ def estimate_persistent_sources_size(
 def copy_persistent_sources(
     backup_dir: PathValue,
     sources: Sequence[PersistentSource],
+    *,
+    bound_source_root: Optional[BoundPersistentSourceRoot] = None,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
     """Copy recovery sources through no-follow directory descriptors."""
 
@@ -1485,6 +1800,52 @@ def copy_persistent_sources(
     mapped_entries: List[Dict[str, object]] = []
     source_records: List[Dict[str, object]] = []
     restore_destinations: Set[str] = set()
+
+    if bound_source_root is not None:
+        _verify_bound_persistent_source_root(bound_source_root)
+
+    def open_source_parent(source_path: Path) -> Tuple[int, str]:
+        """Öffnet install-relative Quellen stets über denselben gehaltenen Root-FD."""
+
+        if bound_source_root is None:
+            return _open_directory_nofollow(source_path.parent), source_path.name
+        try:
+            relative = source_path.relative_to(bound_source_root.path)
+        except ValueError:
+            return _open_directory_nofollow(source_path.parent), source_path.name
+        _verify_bound_persistent_source_root(bound_source_root)
+        if not relative.parts:
+            # Die exakte Rootquelle wird ebenfalls über den bereits gehaltenen
+            # Root-FD geöffnet. Ein Parent-Rename kann daher keine andere
+            # Installation in den install-tree-Teil einschleusen.
+            return os.dup(bound_source_root.root_descriptor), "."
+        descriptor = os.dup(bound_source_root.root_descriptor)
+        try:
+            for component in relative.parts[:-1]:
+                named = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+                child = os.open(
+                    component,
+                    os.O_RDONLY | _DIRECTORY | _NOFOLLOW,
+                    dir_fd=descriptor,
+                )
+                opened = os.fstat(child)
+                if (
+                    not stat.S_ISDIR(named.st_mode)
+                    or (named.st_dev, named.st_ino)
+                    != (opened.st_dev, opened.st_ino)
+                ):
+                    os.close(child)
+                    raise BackupIntegrityError(
+                        "Install-relative Backupquelle driftete beim Öffnen: {}".format(
+                            source_path
+                        )
+                    )
+                os.close(descriptor)
+                descriptor = child
+            return descriptor, relative.parts[-1]
+        except Exception:
+            os.close(descriptor)
+            raise
 
     def record_skipped_entry(
         record: Dict[str, object],
@@ -1695,6 +2056,8 @@ def copy_persistent_sources(
         return copied
 
     for source in sources:
+        if bound_source_root is not None:
+            _verify_bound_persistent_source_root(bound_source_root)
         category = _validate_category(source.category)
         source_path = _lexical_absolute(source.source)
         record: Dict[str, object] = {
@@ -1710,12 +2073,12 @@ def copy_persistent_sources(
         }
         source_records.append(record)
         try:
-            parent_descriptor = _open_directory_nofollow(source_path.parent)
+            parent_descriptor, source_name = open_source_parent(source_path)
         except FileNotFoundError:
             continue
         try:
             try:
-                metadata = os.stat(source_path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+                metadata = os.stat(source_name, dir_fd=parent_descriptor, follow_symlinks=False)
             except FileNotFoundError:
                 continue
             record["present"] = True
@@ -1729,7 +2092,7 @@ def copy_persistent_sources(
                 record["source_type"] = "file"
                 try:
                     descriptor = os.open(
-                        source_path.name,
+                        source_name,
                         os.O_RDONLY | _NOFOLLOW,
                         dir_fd=parent_descriptor,
                     )
@@ -1765,7 +2128,7 @@ def copy_persistent_sources(
                 record["source_type"] = "directory"
                 try:
                     descriptor = os.open(
-                        source_path.name,
+                        source_name,
                         os.O_RDONLY | _DIRECTORY | _NOFOLLOW,
                         dir_fd=parent_descriptor,
                     )
@@ -1807,6 +2170,10 @@ def copy_persistent_sources(
                 raise BackupIntegrityError("Backupquelle ist kein regulaerer Pfad: {}".format(source_path))
         finally:
             os.close(parent_descriptor)
+        if bound_source_root is not None:
+            _verify_bound_persistent_source_root(bound_source_root)
+    if bound_source_root is not None:
+        _verify_bound_persistent_source_root(bound_source_root)
     return mapped_entries, source_records
 
 
@@ -2321,6 +2688,30 @@ def _validate_quiesced_overlay_restore_guard(
         os.close(collection_descriptor)
 
 
+def validate_quiesced_overlay_guard(
+    guard: QuiescedOverlayRestoreGuard,
+) -> Dict[str, object]:
+    """Bindet einen Quiesced-Overlay-Guard erneut an beide Manifeste.
+
+    Restore und terminales Cleanup verwenden damit dieselbe vollständige
+    Pfad-, Inode-, Transaktions- und Parent-Bindung. Die Funktion mutiert
+    weder Backup noch Installation.
+    """
+
+    if not isinstance(guard, QuiescedOverlayRestoreGuard):
+        raise BackupIntegrityError(
+            "Ruhende Daten-Nachsicherung besitzt keinen expliziten Guard"
+        )
+    overlay = _lexical_absolute(guard.overlay_dir)
+    manifest = verify_backup(
+        overlay,
+        expected_kind=QUIESCED_OVERLAY_KIND,
+        expected_manifest_sha256=guard.manifest_sha256,
+    )
+    _validate_quiesced_overlay_restore_guard(overlay, manifest, guard)
+    return manifest
+
+
 def _read_small_file_bytes(path: PathValue, maximum: int) -> bytes:
     descriptor, metadata = _open_regular_file_nofollow(path)
     try:
@@ -2352,6 +2743,103 @@ def _restore_target_allowed(destination: Path, allowed_roots: Sequence[Path], al
     return any(_is_within(destination, root) for root in allowed_roots)
 
 
+def _bound_install_relative(
+    path: PathValue,
+    binding: Optional[BoundPersistentInstallRoot],
+) -> Optional[Path]:
+    """Liefert den logischen Root-relativen Pfad ohne Dateisystemauflösung."""
+
+    if binding is None:
+        return None
+    candidate = _lexical_absolute(path)
+    try:
+        return candidate.relative_to(binding.path)
+    except ValueError:
+        return None
+
+
+def _open_bound_install_directory(
+    path: PathValue,
+    binding: BoundPersistentInstallRoot,
+) -> int:
+    """Öffnet ein Installationsverzeichnis nur vom gehaltenen Root-FD aus."""
+
+    candidate = _lexical_absolute(path)
+    relative = _bound_install_relative(candidate, binding)
+    if relative is None:
+        raise BackupIntegrityError(
+            "Pfad liegt außerhalb der gebundenen Restore-Installation: {}".format(
+                candidate
+            )
+        )
+    _verify_bound_persistent_install_root(binding)
+    descriptor = os.dup(binding.root_descriptor)
+    try:
+        for component in relative.parts:
+            named = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            child = os.open(
+                component,
+                os.O_RDONLY | _DIRECTORY | _NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            opened = os.fstat(child)
+            if (
+                not stat.S_ISDIR(named.st_mode)
+                or not stat.S_ISDIR(opened.st_mode)
+                or (named.st_dev, named.st_ino)
+                != (opened.st_dev, opened.st_ino)
+                or _descriptor_mount_id(child) != binding.mount_id
+            ):
+                os.close(child)
+                raise BackupIntegrityError(
+                    "Install-relatives Restore-Verzeichnis driftete beim Öffnen: "
+                    "{}".format(candidate)
+                )
+            os.close(descriptor)
+            descriptor = child
+        _verify_bound_persistent_install_root(binding)
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _open_restore_directory(
+    path: PathValue,
+    bound_install_root: Optional[BoundPersistentInstallRoot],
+) -> int:
+    """Öffnet install-relative Verzeichnisse gebunden, externe wie bisher."""
+
+    candidate = _lexical_absolute(path)
+    if _bound_install_relative(candidate, bound_install_root) is not None:
+        return _open_bound_install_directory(candidate, bound_install_root)
+    return _open_directory_nofollow(candidate)
+
+
+def _open_restore_target_parent(
+    destination: PathValue,
+    bound_install_root: Optional[BoundPersistentInstallRoot],
+) -> Tuple[int, str, bool]:
+    """Öffnet den Ziel-Parent und hält Installationsziele am Root-FD fest."""
+
+    target = _lexical_absolute(destination)
+    relative = _bound_install_relative(target, bound_install_root)
+    if relative is None:
+        return _open_directory_nofollow(target.parent), target.name, False
+    _verify_bound_persistent_install_root(bound_install_root)
+    if not relative.parts:
+        return (
+            os.dup(bound_install_root.parent_descriptor),
+            bound_install_root.path.name,
+            True,
+        )
+    return (
+        _open_bound_install_directory(target.parent, bound_install_root),
+        target.name,
+        True,
+    )
+
+
 def _copy_open_descriptor_to_temp(source_descriptor: int, parent: Path, prefix: str) -> Path:
     descriptor, name = tempfile.mkstemp(prefix=prefix, dir=str(parent))
     temporary = Path(name)
@@ -2375,6 +2863,8 @@ def _exact_cleanup_candidates(
     manifest: Dict[str, object],
     roots: Sequence[Path],
     files: Sequence[Path],
+    *,
+    bound_install_root: Optional[BoundPersistentInstallRoot] = None,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
     """Find files and directories created after the manifested backup."""
     expected_paths = {
@@ -2439,6 +2929,122 @@ def _exact_cleanup_candidates(
                         "mode": stat.S_IMODE(metadata.st_mode), "uid": metadata.st_uid, "gid": metadata.st_gid,
                     }
 
+    def scan_bound_directory(
+        source: Path,
+        exclude_top: Set[str],
+        exclude_anywhere: Set[str],
+        original_dirs: Set[Path],
+        skipped_paths: Set[str],
+    ) -> None:
+        """Scannt eine Installationsquelle ausschließlich unter dem Root-FD."""
+
+        try:
+            source_descriptor = _open_bound_install_directory(
+                source,
+                bound_install_root,
+            )
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise BackupIntegrityError(
+                "Restore-Fläche ist nicht sicher über die gebundene "
+                "Installationswurzel lesbar: {}".format(source)
+            ) from exc
+        try:
+            source_metadata = os.fstat(source_descriptor)
+            if not stat.S_ISDIR(source_metadata.st_mode):
+                raise BackupIntegrityError(
+                    "Restore-Fläche ist kein sicheres Verzeichnis: {}".format(
+                        source
+                    )
+                )
+
+            def walk(
+                directory_descriptor: int,
+                relative: Path,
+                depth: int,
+            ) -> None:
+                if depth > MAX_CLEANUP_TREE_DEPTH:
+                    raise BackupIntegrityError(
+                        "Cleanup-Baum ist tiefer als {} Ebenen: {}".format(
+                            MAX_CLEANUP_TREE_DEPTH,
+                            source,
+                        )
+                    )
+                for name in sorted(os.listdir(directory_descriptor)):
+                    if not relative.parts and _is_private_local_entry(name):
+                        continue
+                    if name in exclude_anywhere or (
+                        not relative.parts and name in exclude_top
+                    ):
+                        continue
+                    candidate_relative = relative / name
+                    if candidate_relative.as_posix() in skipped_paths:
+                        continue
+                    candidate = source / candidate_relative
+                    metadata = os.stat(
+                        name,
+                        dir_fd=directory_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if stat.S_ISLNK(metadata.st_mode):
+                        raise BackupIntegrityError(
+                            "Unsicherer Eintrag in Restore-Fläche: {}".format(
+                                candidate
+                            )
+                        )
+                    if stat.S_ISDIR(metadata.st_mode):
+                        if candidate not in original_dirs:
+                            cleanup_dirs[str(candidate)] = {
+                                "path": candidate,
+                                "dev": metadata.st_dev,
+                                "ino": metadata.st_ino,
+                                "mode": stat.S_IMODE(metadata.st_mode),
+                                "uid": metadata.st_uid,
+                                "gid": metadata.st_gid,
+                            }
+                            continue
+                        child = os.open(
+                            name,
+                            os.O_RDONLY | _DIRECTORY | _NOFOLLOW,
+                            dir_fd=directory_descriptor,
+                        )
+                        try:
+                            opened = os.fstat(child)
+                            if (
+                                not stat.S_ISDIR(opened.st_mode)
+                                or (opened.st_dev, opened.st_ino)
+                                != (metadata.st_dev, metadata.st_ino)
+                            ):
+                                raise BackupIntegrityError(
+                                    "Restore-Verzeichnis wurde beim Cleanup-Scan "
+                                    "ausgetauscht: {}".format(candidate)
+                                )
+                            walk(child, candidate_relative, depth + 1)
+                        finally:
+                            os.close(child)
+                    elif stat.S_ISREG(metadata.st_mode):
+                        if candidate not in expected_paths:
+                            cleanup_files[str(candidate)] = {
+                                "path": candidate,
+                                "dev": metadata.st_dev,
+                                "ino": metadata.st_ino,
+                                "mode": stat.S_IMODE(metadata.st_mode),
+                                "uid": metadata.st_uid,
+                                "gid": metadata.st_gid,
+                            }
+                    else:
+                        raise BackupIntegrityError(
+                            "Unsicherer Eintrag in Restore-Fläche: {}".format(
+                                candidate
+                            )
+                        )
+
+            walk(source_descriptor, Path(), 0)
+        finally:
+            os.close(source_descriptor)
+        _verify_bound_persistent_install_root(bound_install_root)
+
     source_records = manifest.get("sources", [])
     if not isinstance(source_records, list):
         raise BackupIntegrityError("Manifest-Sources muessen eine Liste sein")
@@ -2465,9 +3071,56 @@ def _exact_cleanup_candidates(
             relative_value = item.get("path") if isinstance(item, dict) else item
             original_dirs.add(source / _safe_relative_path(str(relative_value)))
         if source_type == "directory" and present:
-            scan_directory(source, exclude_top, exclude_anywhere, original_dirs, skipped_paths)
-        elif source_type == "missing" and not present and os.path.lexists(str(source)):
-            metadata = os.lstat(str(source))
+            if _bound_install_relative(source, bound_install_root) is not None:
+                scan_bound_directory(
+                    source,
+                    exclude_top,
+                    exclude_anywhere,
+                    original_dirs,
+                    skipped_paths,
+                )
+            else:
+                scan_directory(
+                    source,
+                    exclude_top,
+                    exclude_anywhere,
+                    original_dirs,
+                    skipped_paths,
+                )
+        elif source_type == "missing" and not present:
+            relative_to_install = _bound_install_relative(
+                source,
+                bound_install_root,
+            )
+            if relative_to_install is None:
+                # Externe Ziele behalten exakt den bisherigen lexikalischen
+                # Restorevertrag.
+                if not os.path.lexists(str(source)):
+                    continue
+                metadata = os.lstat(str(source))
+            else:
+                try:
+                    parent_descriptor, source_name, _is_bound = (
+                        _open_restore_target_parent(source, bound_install_root)
+                    )
+                except FileNotFoundError:
+                    continue
+                try:
+                    try:
+                        metadata = os.stat(
+                            source_name,
+                            dir_fd=parent_descriptor,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        continue
+                finally:
+                    os.close(parent_descriptor)
+                if relative_to_install == Path():
+                    raise BackupIntegrityError(
+                        "Manifest darf die gebundene Installationswurzel nicht als "
+                        "fehlende Cleanup-Fläche deklarieren"
+                    )
             if stat.S_ISREG(metadata.st_mode):
                 cleanup_files[str(source)] = {
                     "path": source, "dev": metadata.st_dev, "ino": metadata.st_ino,
@@ -2484,6 +3137,8 @@ def _exact_cleanup_candidates(
             continue
         elif source_type not in {"file", "directory", "missing", "skipped"}:
             raise BackupIntegrityError("Ungueltiger Source-Typ im Manifest")
+    if bound_install_root is not None:
+        _verify_bound_persistent_install_root(bound_install_root)
     return list(cleanup_files.values()), list(cleanup_dirs.values())
 
 
@@ -2719,6 +3374,44 @@ def _verify_parent_binding(parent_path: Path, parent_descriptor: int, expected: 
         raise BackupIntegrityError("Restore-Zielverzeichnis wurde waehrend der Transaktion ausgetauscht: {}".format(parent_path))
 
 
+def _verify_restore_parent_binding(
+    destination: Path,
+    parent_descriptor: int,
+    expected: os.stat_result,
+    bound_install_root: Optional[BoundPersistentInstallRoot],
+) -> None:
+    """Prüft install-relative Parents erneut vom gehaltenen Root-FD aus."""
+
+    target = _lexical_absolute(destination)
+    relative = _bound_install_relative(target, bound_install_root)
+    if relative is None:
+        _verify_parent_binding(target.parent, parent_descriptor, expected)
+        return
+    _verify_bound_persistent_install_root(bound_install_root)
+    if not relative.parts:
+        current_descriptor = os.dup(bound_install_root.parent_descriptor)
+    else:
+        current_descriptor = _open_bound_install_directory(
+            target.parent,
+            bound_install_root,
+        )
+    try:
+        current = os.fstat(current_descriptor)
+    finally:
+        os.close(current_descriptor)
+    opened = os.fstat(parent_descriptor)
+    identity = (expected.st_dev, expected.st_ino)
+    if (
+        (opened.st_dev, opened.st_ino) != identity
+        or (current.st_dev, current.st_ino) != identity
+    ):
+        raise BackupIntegrityError(
+            "Install-relatives Restore-Zielverzeichnis wurde während der "
+            "Transaktion ausgetauscht: {}".format(target.parent)
+        )
+    _verify_bound_persistent_install_root(bound_install_root)
+
+
 def _manifest_directory_entries(
     manifest: Dict[str, object],
     roots: Sequence[Path],
@@ -2759,19 +3452,42 @@ def _manifest_directory_entries(
     return sorted(result.values(), key=lambda item: (len(Path(str(item["path"])).parts), str(item["path"])))
 
 
-def _open_or_create_exact_directory(path: Path) -> Dict[str, object]:
-    parent_descriptor = _open_directory_nofollow(path.parent)
+def _open_or_create_exact_directory(
+    path: Path,
+    *,
+    bound_install_root: Optional[BoundPersistentInstallRoot] = None,
+) -> Dict[str, object]:
+    parent_descriptor, target_name, is_bound = _open_restore_target_parent(
+        path,
+        bound_install_root,
+    )
     created = False
     try:
         try:
-            before = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+            before = os.stat(
+                target_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
         except FileNotFoundError:
-            os.mkdir(path.name, 0o700, dir_fd=parent_descriptor)
+            if is_bound and path == bound_install_root.path:
+                raise BackupIntegrityError(
+                    "Gebundene Restore-Installationswurzel ist verschwunden"
+                )
+            os.mkdir(target_name, 0o700, dir_fd=parent_descriptor)
             created = True
-            before = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+            before = os.stat(
+                target_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
         if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
             raise BackupIntegrityError("Restore-Verzeichnis ist unsicher: {}".format(path))
-        descriptor = os.open(path.name, os.O_RDONLY | _DIRECTORY | _NOFOLLOW, dir_fd=parent_descriptor)
+        descriptor = os.open(
+            target_name,
+            os.O_RDONLY | _DIRECTORY | _NOFOLLOW,
+            dir_fd=parent_descriptor,
+        )
         opened = os.fstat(descriptor)
         if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
             os.close(descriptor)
@@ -2792,7 +3508,7 @@ def _open_or_create_exact_directory(path: Path) -> Dict[str, object]:
     except Exception:
         if created:
             try:
-                os.rmdir(path.name, dir_fd=parent_descriptor)
+                os.rmdir(target_name, dir_fd=parent_descriptor)
             except OSError:
                 pass
         os.close(parent_descriptor)
@@ -2810,10 +3526,102 @@ def _current_open_descriptor_count() -> int:
         ) from exc
 
 
-def _cleanup_tree_descriptor_peak(candidate: Dict[str, object]) -> int:
+def _cleanup_tree_descriptor_peak(
+    candidate: Dict[str, object],
+    *,
+    bound_install_root: Optional[BoundPersistentInstallRoot] = None,
+) -> int:
     """Belegt read-only die zusätzlich nötige FD-Tiefe eines Cleanup-Baums."""
 
     root = _lexical_absolute(str(candidate["path"]))
+    if _bound_install_relative(root, bound_install_root) is not None:
+        parent_descriptor, root_name, _is_bound = _open_restore_target_parent(
+            root,
+            bound_install_root,
+        )
+        descriptor = None
+        try:
+            root_metadata = os.stat(
+                root_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            descriptor = os.open(
+                root_name,
+                os.O_RDONLY | _DIRECTORY | _NOFOLLOW,
+                dir_fd=parent_descriptor,
+            )
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or (root_metadata.st_dev, root_metadata.st_ino)
+                != (candidate["dev"], candidate["ino"])
+                or (opened.st_dev, opened.st_ino)
+                != (candidate["dev"], candidate["ino"])
+            ):
+                raise BackupIntegrityError(
+                    "Post-Backup-Verzeichnis driftete vor FD-Budgetierung: "
+                    "{}".format(root)
+                )
+            peak = 2
+
+            def walk(current: int, depth: int) -> None:
+                nonlocal peak
+                if depth > MAX_CLEANUP_TREE_DEPTH:
+                    raise BackupIntegrityError(
+                        "Cleanup-Baum ist tiefer als {} Ebenen: {}".format(
+                            MAX_CLEANUP_TREE_DEPTH,
+                            root,
+                        )
+                    )
+                peak = max(peak, depth + 2)
+                for name in sorted(os.listdir(current)):
+                    metadata = os.stat(
+                        name,
+                        dir_fd=current,
+                        follow_symlinks=False,
+                    )
+                    if stat.S_ISLNK(metadata.st_mode):
+                        raise BackupIntegrityError(
+                            "Unsicherer Eintrag im Cleanup-Baum: {}".format(
+                                root / name
+                            )
+                        )
+                    if stat.S_ISDIR(metadata.st_mode):
+                        child = os.open(
+                            name,
+                            os.O_RDONLY | _DIRECTORY | _NOFOLLOW,
+                            dir_fd=current,
+                        )
+                        try:
+                            child_metadata = os.fstat(child)
+                            if (
+                                not stat.S_ISDIR(child_metadata.st_mode)
+                                or (child_metadata.st_dev, child_metadata.st_ino)
+                                != (metadata.st_dev, metadata.st_ino)
+                            ):
+                                raise BackupIntegrityError(
+                                    "Cleanup-Verzeichnis wurde bei der "
+                                    "FD-Budgetierung ausgetauscht: {}".format(name)
+                                )
+                            walk(child, depth + 1)
+                        finally:
+                            os.close(child)
+                    elif not stat.S_ISREG(metadata.st_mode):
+                        raise BackupIntegrityError(
+                            "Unsicherer Eintrag im Cleanup-Baum: {}".format(
+                                root / name
+                            )
+                        )
+
+            walk(descriptor, 0)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(parent_descriptor)
+        _verify_bound_persistent_install_root(bound_install_root)
+        return peak
+
     root_metadata = os.lstat(str(root))
     if (
         stat.S_ISLNK(root_metadata.st_mode)
@@ -3026,6 +3834,7 @@ def restore_persistent_payload(
     restore_metadata_overrides=None,
     verified_manifest_guard=None,
     overlay_restore_guard: Optional[QuiescedOverlayRestoreGuard] = None,
+    bound_install_root: Optional[BoundPersistentInstallRoot] = None,
 ) -> int:
     """Restore one fd-bound transaction in the isolated single-thread updater."""
 
@@ -3088,8 +3897,24 @@ def restore_persistent_payload(
         raise BackupIntegrityError("Restore-Payloadguard ist nicht aufrufbar")
     roots = [_lexical_absolute(path) for path in allowed_roots]
     files = [_lexical_absolute(path) for path in allowed_files]
+    if bound_install_root is not None:
+        _verify_bound_persistent_install_root(bound_install_root)
+        if not any(
+            _is_within(path, bound_install_root.path)
+            for path in (*roots, *files)
+        ):
+            raise BackupIntegrityError(
+                "Gebundene Installationswurzel gehört nicht zur Restore-Positivliste"
+            )
     if expected_kind == QUIESCED_OVERLAY_KIND:
         guarded_install = _lexical_absolute(overlay_restore_guard.install_root)
+        if (
+            bound_install_root is not None
+            and guarded_install != bound_install_root.path
+        ):
+            raise BackupIntegrityError(
+                "Overlay-Guard widerspricht der gebundenen Installationswurzel"
+            )
         expected_roots = {
             guarded_install / "data",
             QUIESCED_WEB_ROOT / "data",
@@ -3105,7 +3930,12 @@ def restore_persistent_payload(
             raise BackupIntegrityError(
                 "Quiesced-Overlay-Restore besitzt keine exakte Ziel-Positivliste"
             )
-    cleanup_candidates, cleanup_directories = _exact_cleanup_candidates(manifest, roots, files)
+    cleanup_candidates, cleanup_directories = _exact_cleanup_candidates(
+        manifest,
+        roots,
+        files,
+        bound_install_root=bound_install_root,
+    )
     directory_entries = _manifest_directory_entries(manifest, roots, files)
     restorable_files = sum(
         1
@@ -3119,7 +3949,10 @@ def restore_persistent_payload(
         + 2 * len(cleanup_directories)
     )
     for candidate in cleanup_directories:
-        _cleanup_tree_descriptor_peak(candidate)
+        _cleanup_tree_descriptor_peak(
+            candidate,
+            bound_install_root=bound_install_root,
+        )
     descriptor_budget = (
         _current_open_descriptor_count()
         + persistent_descriptors
@@ -3141,7 +3974,10 @@ def restore_persistent_payload(
             descriptor_budget
         )
         for expected in directory_entries:
-            directory = _open_or_create_exact_directory(Path(str(expected["path"])))
+            directory = _open_or_create_exact_directory(
+                Path(str(expected["path"])),
+                bound_install_root=bound_install_root,
+            )
             directory.update({
                 "expected_mode": int(expected["mode"]),
                 "expected_uid": int(expected["uid"]),
@@ -3156,12 +3992,17 @@ def restore_persistent_payload(
             destination = _lexical_absolute(str(restore_path))
             if not _restore_target_allowed(destination, roots, files):
                 raise BackupIntegrityError("Restore-Ziel liegt ausserhalb der Positivliste: {}".format(destination))
-            parent_descriptor = _open_directory_nofollow(destination.parent)
+            parent_descriptor, destination_name, _is_bound = (
+                _open_restore_target_parent(destination, bound_install_root)
+            )
             parent_metadata = os.fstat(parent_descriptor)
             try:
-                original_metadata = _entry_metadata(parent_descriptor, destination.name)
+                original_metadata = _entry_metadata(
+                    parent_descriptor,
+                    destination_name,
+                )
                 original_exists = True
-                original_sha = _entry_sha256(parent_descriptor, destination.name)
+                original_sha = _entry_sha256(parent_descriptor, destination_name)
                 original_mode = stat.S_IMODE(original_metadata.st_mode)
                 original_uid = int(original_metadata.st_uid)
                 original_gid = int(original_metadata.st_gid)
@@ -3179,7 +4020,7 @@ def restore_persistent_payload(
                 new_name = _copy_fd_to_temp_at(
                     source_descriptor,
                     parent_descriptor,
-                    ".{}.e3dc-new-".format(destination.name),
+                    ".{}.e3dc-new-".format(destination_name),
                 )
             finally:
                 os.close(source_descriptor)
@@ -3209,6 +4050,7 @@ def restore_persistent_payload(
                 )
             staged.append({
                 "destination": destination,
+                "destination_name": destination_name,
                 "parent_fd": parent_descriptor,
                 "parent_metadata": parent_metadata,
                 "new_name": new_name,
@@ -3243,14 +4085,17 @@ def restore_persistent_payload(
 
         for candidate in cleanup_candidates:
             destination = Path(str(candidate["path"]))
-            parent_descriptor = _open_directory_nofollow(destination.parent)
-            current = _entry_metadata(parent_descriptor, destination.name)
+            parent_descriptor, destination_name, _is_bound = (
+                _open_restore_target_parent(destination, bound_install_root)
+            )
+            current = _entry_metadata(parent_descriptor, destination_name)
             if (current.st_dev, current.st_ino) != (candidate["dev"], candidate["ino"]):
                 os.close(parent_descriptor)
                 raise BackupIntegrityError("Post-Backup-Datei wurde vor Staging ersetzt: {}".format(destination))
             cleanup_items.append({
                 **candidate,
                 "destination": destination,
+                "destination_name": destination_name,
                 "parent_fd": parent_descriptor,
                 "parent_metadata": os.fstat(parent_descriptor),
                 "sha256": _entry_sha256(parent_descriptor, destination.name),
@@ -3267,8 +4112,14 @@ def restore_persistent_payload(
 
         for candidate in cleanup_directories:
             destination = Path(str(candidate["path"]))
-            parent_descriptor = _open_directory_nofollow(destination.parent)
-            descriptor = os.open(destination.name, os.O_RDONLY | _DIRECTORY | _NOFOLLOW, dir_fd=parent_descriptor)
+            parent_descriptor, destination_name, _is_bound = (
+                _open_restore_target_parent(destination, bound_install_root)
+            )
+            descriptor = os.open(
+                destination_name,
+                os.O_RDONLY | _DIRECTORY | _NOFOLLOW,
+                dir_fd=parent_descriptor,
+            )
             current = os.fstat(descriptor)
             if (current.st_dev, current.st_ino) != (candidate["dev"], candidate["ino"]):
                 os.close(descriptor)
@@ -3277,6 +4128,7 @@ def restore_persistent_payload(
             cleanup_directory_items.append({
                 **candidate,
                 "destination": destination,
+                "destination_name": destination_name,
                 "parent_fd": parent_descriptor,
                 "parent_metadata": os.fstat(parent_descriptor),
                 "fd": descriptor,
@@ -3412,7 +4264,12 @@ def restore_persistent_payload(
                     int(item["new_gid"]),
                     (int(item["new_dev"]), int(item["new_ino"])),
                 )
-                _verify_parent_binding(destination.parent, parent_descriptor, item["parent_metadata"])
+                _verify_restore_parent_binding(
+                    destination,
+                    parent_descriptor,
+                    item["parent_metadata"],
+                    bound_install_root,
+                )
 
             for item in cleanup_items:
                 parent_descriptor = int(item["parent_fd"])
@@ -3453,7 +4310,12 @@ def restore_persistent_payload(
                     or quarantined.st_gid != item["gid"]
                 ):
                     raise BackupIntegrityError("Post-Backup-Datei-Swap erkannt: {}".format(destination))
-                _verify_parent_binding(destination.parent, parent_descriptor, item["parent_metadata"])
+                _verify_restore_parent_binding(
+                    destination,
+                    parent_descriptor,
+                    item["parent_metadata"],
+                    bound_install_root,
+                )
 
             for item in cleanup_directory_items:
                 parent_descriptor = int(item["parent_fd"])
@@ -3485,7 +4347,12 @@ def restore_persistent_payload(
                 item["placeholder_gid"] = int(placeholder_metadata.st_gid)
                 if _directory_tree_digest(descriptor) != item["tree_digest"]:
                     raise BackupIntegrityError("Post-Backup-Verzeichnis-Swap erkannt: {}".format(destination))
-                _verify_parent_binding(destination.parent, parent_descriptor, item["parent_metadata"])
+                _verify_restore_parent_binding(
+                    destination,
+                    parent_descriptor,
+                    item["parent_metadata"],
+                    bound_install_root,
+                )
 
             for item in directory_items:
                 descriptor = int(item["fd"])
@@ -3497,10 +4364,11 @@ def restore_persistent_payload(
                     str(item["path"]),
                 )
                 item["metadata_applied"] = True
-                _verify_parent_binding(
-                    Path(str(item["path"])).parent,
+                _verify_restore_parent_binding(
+                    Path(str(item["path"])),
                     int(item["parent_fd"]),
                     item["parent_metadata"],
+                    bound_install_root,
                 )
 
             # Final pre-commit gate: every installed target, displaced original,
@@ -3521,7 +4389,12 @@ def restore_persistent_payload(
                 if old_name:
                     if _refresh_original_binding_if_changed(item, parent_descriptor, str(old_name)):
                         raise BackupIntegrityError("Restore-Original driftete vor Commit: {}".format(destination))
-                _verify_parent_binding(destination.parent, parent_descriptor, item["parent_metadata"])
+                _verify_restore_parent_binding(
+                    destination,
+                    parent_descriptor,
+                    item["parent_metadata"],
+                    bound_install_root,
+                )
 
             for item in cleanup_items:
                 parent_descriptor = int(item["parent_fd"])
@@ -3544,7 +4417,12 @@ def restore_persistent_payload(
                     raise BackupIntegrityError("Cleanup-Quarantaene driftete vor Commit: {}".format(destination))
                 os.unlink(destination.name, dir_fd=parent_descriptor)
                 item["placeholder_removed"] = True
-                _verify_parent_binding(destination.parent, parent_descriptor, item["parent_metadata"])
+                _verify_restore_parent_binding(
+                    destination,
+                    parent_descriptor,
+                    item["parent_metadata"],
+                    bound_install_root,
+                )
 
             for item in cleanup_directory_items:
                 parent_descriptor = int(item["parent_fd"])
@@ -3562,7 +4440,12 @@ def restore_persistent_payload(
                     raise BackupIntegrityError("Cleanup-Verzeichnis driftete vor Commit: {}".format(destination))
                 os.unlink(destination.name, dir_fd=parent_descriptor)
                 item["placeholder_removed"] = True
-                _verify_parent_binding(destination.parent, parent_descriptor, item["parent_metadata"])
+                _verify_restore_parent_binding(
+                    destination,
+                    parent_descriptor,
+                    item["parent_metadata"],
+                    bound_install_root,
+                )
 
             # Durability-Gate: Der receiptgebundene Guard und insbesondere der
             # nachfolgende systemd-Callback dürfen erst laufen, wenn sowohl die
@@ -3631,22 +4514,24 @@ def restore_persistent_payload(
                             path
                         )
                     )
-                _verify_parent_binding(
-                    path.parent,
+                _verify_restore_parent_binding(
+                    path,
                     parent_descriptor,
                     item["parent_metadata"],
+                    bound_install_root,
                 )
 
             parent_bindings: Dict[
-                Tuple[int, int], Tuple[Path, int, os.stat_result]
+                Tuple[int, int], Tuple[Path, Path, int, os.stat_result]
             ] = {}
             parent_sources = [
-                *((Path(str(item["destination"])).parent, item) for item in staged),
-                *((Path(str(item["destination"])).parent, item) for item in cleanup_items),
-                *((Path(str(item["destination"])).parent, item) for item in cleanup_directory_items),
-                *((Path(str(item["path"])).parent, item) for item in directory_items),
+                *((Path(str(item["destination"])), item) for item in staged),
+                *((Path(str(item["destination"])), item) for item in cleanup_items),
+                *((Path(str(item["destination"])), item) for item in cleanup_directory_items),
+                *((Path(str(item["path"])), item) for item in directory_items),
             ]
-            for parent_path, item in parent_sources:
+            for destination_path, item in parent_sources:
+                parent_path = destination_path.parent
                 descriptor = int(item["parent_fd"])
                 expected = item["parent_metadata"]
                 opened = os.fstat(descriptor)
@@ -3660,7 +4545,12 @@ def restore_persistent_payload(
                             parent_path
                         )
                     )
-                _verify_parent_binding(parent_path, descriptor, expected)
+                _verify_restore_parent_binding(
+                    destination_path,
+                    descriptor,
+                    expected,
+                    bound_install_root,
+                )
                 previous = parent_bindings.get(identity)
                 if previous is not None and previous[0] != parent_path:
                     raise BackupIntegrityError(
@@ -3670,22 +4560,31 @@ def restore_persistent_payload(
                     )
                 parent_bindings.setdefault(
                     identity,
-                    (parent_path, descriptor, expected),
+                    (parent_path, destination_path, descriptor, expected),
                 )
 
-            for parent_path, descriptor, expected in sorted(
+            for parent_path, destination_path, descriptor, expected in sorted(
                 parent_bindings.values(),
                 key=lambda value: (len(value[0].parts), str(value[0])),
                 reverse=True,
             ):
                 os.fsync(descriptor)
-                _verify_parent_binding(parent_path, descriptor, expected)
+                _verify_restore_parent_binding(
+                    destination_path,
+                    descriptor,
+                    expected,
+                    bound_install_root,
+                )
 
             # Der receiptgebundene Payloadguard läuft nach allen sichtbaren
             # Swaps und Metadaten, aber vor jeder systemd-Maskenprojektion und
             # damit vor dem ersten daemon-reload auf restaurierte Unitnamen.
+            if bound_install_root is not None:
+                _verify_bound_persistent_install_root(bound_install_root)
             if restored_payload_guard is not None:
                 restored_payload_guard()
+            if bound_install_root is not None:
+                _verify_bound_persistent_install_root(bound_install_root)
 
             # Dieser Callback ist die letzte fehlschlagbare Änderung am
             # sichtbaren Zustand. Ein Fehler läuft in den vollständigen
@@ -3694,6 +4593,8 @@ def restore_persistent_payload(
             # Quarantänebereinigung ist reine Nacharbeit nach dem Commit.
             if before_commit is not None:
                 before_commit()
+            if bound_install_root is not None:
+                _verify_bound_persistent_install_root(bound_install_root)
             committed = True
         except Exception as restore_exc:
             rollback_errors: List[str] = []
@@ -3749,7 +4650,12 @@ def restore_persistent_payload(
                             int(item["uid"]),
                             int(item["gid"]),
                         )
-                    _verify_parent_binding(destination.parent, parent_descriptor, item["parent_metadata"])
+                    _verify_restore_parent_binding(
+                        destination,
+                        parent_descriptor,
+                        item["parent_metadata"],
+                        bound_install_root,
+                    )
                 except Exception as rollback_exc:
                     rollback_errors.append("{}: {}".format(destination, rollback_exc))
 
@@ -3801,7 +4707,12 @@ def restore_persistent_payload(
                             raise BackupIntegrityError("Neu angelegtes Ziel blieb nach Ruecklauf bestehen")
                         except FileNotFoundError:
                             pass
-                    _verify_parent_binding(destination.parent, parent_descriptor, item["parent_metadata"])
+                    _verify_restore_parent_binding(
+                        destination,
+                        parent_descriptor,
+                        item["parent_metadata"],
+                        bound_install_root,
+                    )
                 except Exception as rollback_exc:
                     rollback_errors.append("{}: {}".format(destination, rollback_exc))
 
@@ -3819,7 +4730,12 @@ def restore_persistent_payload(
                             int(item["original_gid"]),
                             str(path),
                         )
-                    _verify_parent_binding(path.parent, int(item["parent_fd"]), item["parent_metadata"])
+                    _verify_restore_parent_binding(
+                        path,
+                        int(item["parent_fd"]),
+                        item["parent_metadata"],
+                        bound_install_root,
+                    )
                 except Exception as rollback_exc:
                     rollback_errors.append("{}: {}".format(path, rollback_exc))
 
@@ -3928,3 +4844,5 @@ def restore_persistent_payload(
                 os.close(int(item["parent_fd"]))
         finally:
             _restore_descriptor_budget(previous_descriptor_limit)
+            if bound_install_root is not None:
+                _verify_bound_persistent_install_root(bound_install_root)

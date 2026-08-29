@@ -61,24 +61,32 @@ class ScheduleService:
 
     def __init__(self, planer=None):
         self._planer = planer or _planer
+        self._runtime_config = None
 
     def generate_native_charging_schedule(self, config, wb_id=None):
         """Delegiere die Planerzeugung und liefere unveraendert dessen Slots."""
         return self._planer.generate_native_charging_schedule(config, wb_id=wb_id)
 
-    def get_planned_charging_status(self, wb_id=None):
+    def get_planned_charging_status(self, wb_id=None, config=None):
         """Delegiere die Pruefung, ob fuer eine Wallbox ein Slot aktiv ist."""
-        return self._planer.get_planned_charging_status(wb_id=wb_id)
+        return self._planer.get_planned_charging_status(
+            wb_id=wb_id,
+            config=config,
+        )
 
     def refresh(self, config, now_ts=None, wb_id=None):
         """Aktualisiere den kanonischen Plan und gib seine Slotliste zurueck."""
         del now_ts  # Reserviert; die kanonische Planner-Uhr bleibt autoritativ.
+        self._runtime_config = dict(config) if isinstance(config, dict) else None
         return self.generate_native_charging_schedule(config, wb_id=wb_id)
 
     def evaluate(self, wb_id=None, now_ts=None):
         """Liefere das bestehende boolesche Aktivsignal des Planers."""
         del now_ts  # Reserviert; die kanonische Planner-Uhr bleibt autoritativ.
-        return self.get_planned_charging_status(wb_id=wb_id)
+        return self.get_planned_charging_status(
+            wb_id=wb_id,
+            config=self._runtime_config,
+        )
 
     def active_charger_ids(self, charger_ids, now_ts=None):
         """Liefere die IDs mit aktuell aktivem kanonischem Ladeplan."""

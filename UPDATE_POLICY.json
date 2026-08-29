@@ -1,9 +1,9 @@
 {
-  "version": "5.4.4e",
+  "version": "5.4.4f",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.4e",
-  "release_date": "2026-08-26",
-  "description": "v5.4.4e - Webupdate mit RAM-Disk-Unterstützung und verlässlichem Rücklauf",
+  "stable_release": "v5.4.4f",
+  "release_date": "2026-08-29",
+  "description": "v5.4.4f - PV-Kurvenstart, echte WB2-Aus-Semantik, Solar-Summenpunkt, drei Backup-Generationen, lesbarer Live-Produktbaum und sicherer Matter-Kopplungsreset",
   "update_strategy": "backup_replace_restart_v1",
   "installer_requires": "python3",
   "sanitized_republication": false,

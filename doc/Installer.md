@@ -1,12 +1,12 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.4.4e
+Dokumentation Stand: 5.4.4f
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
 Installationspfad und Python-Umgebung aus dem geprüften Installationskontext.
 
-Der Installer-Anteil von 5.4.4e führt Backup, kurze Umschaltphase,
+Der Installer-Anteil von 5.4.4f führt Backup, kurze Umschaltphase,
 Releaseprojektion, Reparatur bekannter Rechte und Dienstneustart vollständig im
 heruntergeladenen Ziel-Updater aus. Das Nutzer-`.git`, lokale
 Produktänderungen, fehlende Produktdateien und historische Rechte sind keine
@@ -23,6 +23,35 @@ der aktuelle Einzel-Bootstrap den Zielbaum selbst und gleicht ihn mit Tag und
 Commit ab. Eine neue Ziel-Pythonumgebung sowie optionale Abhängigkeiten werden
 vor dem einmaligen Dienststopp vorbereitet; fremde System-Python-Pakete sind
 keine Updatebedingung.
+
+5.4.4f stellt nach der Releaseprojektion für eine beibehaltene
+`external_pv_topology.json` den Installationsnutzer, die Webgruppe und den
+gemeinsamen Lesemodus `0664` wieder her. Die übrigen Konfigurations- und
+Geheimnisdateien behalten ihre strengeren Rechteverträge.
+
+Der private Downloadbereich bleibt root-eigen mit `0700`/`0600`. Beim
+Dateiaustausch veröffentlicht 5.4.4f den Live-Produktbaum dagegen mit einem
+expliziten Vertrag aus Installationsnutzer, Webgruppe, Verzeichnissen `0755`,
+normalen Dateien `0644` und Startskripten mit Interpreterzeile `0755`.
+Anschließend müssen die PHP-Pfadauflösung und die Installer-Importkette als `www-data` den exakt
+gebundenen Zielpfad lesen können. Die private Service-Pythonumgebung wird dafür
+nicht geöffnet. Ein Fehler führt vor dem Dienststart in den gesicherten
+Rücklauf.
+
+Liegt die Installation unter einem privaten Home-Pfad, bindet der Updater
+owner-private, nicht-setgid Vorfahren eng an die Webgruppe und ergänzt nur
+deren Traversierrecht. Eine vorhandene gezielte POSIX-ACL für `www-data` wird
+akzeptiert. Gemeinsam genutzte oder setgid Vorfahren werden ohne diese ACL vor
+der Produktmutation mit einer konkreten Anleitung gesperrt; globales
+`Other-Execute`, Auflisten, Lesen und Schreiben werden nicht freigegeben.
+Direkte und verschachtelte Home-Installationen sowie `/opt`-Installationen
+bleiben damit unterstützt.
+
+Der Zielbestand beträgt maximal drei automatisch verwaltete
+System-Backup-Familien und separat maximal drei Web-Installer-Sicherungen.
+Schutzbindungen dürfen diese Zielgrenzen vorübergehend überschreiten.
+Ungeschützte Altbestände werden weiter sicher bereinigt; die offene Zielgrenze
+bleibt sichtbar und wird später erneut angewendet.
 
 5.4.4e akzeptiert dabei die exakt bestätigte produktive RAM-Disk unter
 `/var/www/html/ramdisk`. Eine ausdrücklich benannte Altdatei wird über den

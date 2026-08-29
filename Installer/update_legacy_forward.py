@@ -862,6 +862,14 @@ def finalize_active_legacy_v1_release(
     )
     watchdog_runtime_required = update_module._watchdog_runtime_venv_required(state)
     install_user = update_module.get_install_user()
+    web_program_files, web_program_directories = (
+        update_module._web_program_contract_from_commit(
+            target_root,
+            commit,
+            install_user,
+            root_authority=explicit_download_bootstrap,
+        )
+    )
     policy = update_module._read_policy_from_commit(
         target_root,
         commit,
@@ -991,6 +999,8 @@ def finalize_active_legacy_v1_release(
         target_root,
         policy,
         allow_config_bootstrap=state.bootstrap_legacy_config,
+        program_files=web_program_files,
+        program_directories=web_program_directories,
     )
     if bootstrap_projection is not None and state.bootstrap_legacy_config:
         legacy_config, legacy_raw = update_module._read_json_nofollow(
@@ -1023,6 +1033,8 @@ def finalize_active_legacy_v1_release(
                 headless=True,
                 release_quiesced=True,
                 bound_privileged_preimages=privileged_preimages,
+                program_files=web_program_files,
+                program_directories=web_program_directories,
             ) is False:
                 raise RuntimeError("Berechtigungsreparatur fehlgeschlagen")
         finally:
@@ -1056,8 +1068,12 @@ def finalize_active_legacy_v1_release(
 
     if not ensure_private_ml_model_store():
         raise RuntimeError("Privater ML-Modellspeicher konnte nicht vorbereitet werden")
-    if not harden_web_program_permissions():
+    if not harden_web_program_permissions(
+        program_files=web_program_files,
+        program_directories=web_program_directories,
+    ):
         raise RuntimeError("Web-Programmrechte konnten nicht gehärtet werden")
+    update_module._validate_live_install_context_as_web(target_root)
     update_module._announce_finalizer_phase(
         4,
         7,

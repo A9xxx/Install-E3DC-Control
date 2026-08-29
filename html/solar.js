@@ -207,6 +207,33 @@ function updateEnergyFlowLines(container = document.getElementById('flow-view'))
     });
 }
 
+function setEnergyFlowGenerationAggregateVisible(container, visible) {
+    if (!container) return false;
+    const generation = container.querySelector('[data-flow-node="generation"]');
+    const active = visible === true && !!generation;
+    if (generation) generation.hidden = !active;
+    container.classList.toggle('flow-has-generation-aggregate', active);
+    container.querySelectorAll('[data-flow-generation-aggregate="1"]').forEach(line => {
+        line.style.display = active ? '' : 'none';
+    });
+    container.querySelectorAll('#flow-line-pv, #flow-dot-pv, #flow-line-external-pv, #flow-dot-external-pv').forEach(line => {
+        line.dataset.flowTo = active ? 'generation' : 'center';
+    });
+    ['pv', 'external_pv', 'generation'].forEach(key => {
+        const node = container.querySelector(`[data-flow-node="${key}"]`);
+        if (!node || node.dataset.flowPositionCustom === '1') return;
+        const x = Number(active ? node.dataset.flowAggregateX : node.dataset.flowDirectX);
+        const y = Number(active ? node.dataset.flowAggregateY : node.dataset.flowDirectY);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+        node.style.left = `${x}%`;
+        node.style.top = `${y}%`;
+        node.dataset.flowX = String(x);
+        node.dataset.flowY = String(y);
+    });
+    updateEnergyFlowLines(container);
+    return active;
+}
+
 function applyEnergyFlowBaseColors(container = document.getElementById('flow-view')) {
     if (!container) return;
     container.querySelectorAll('[data-flow-color-key]').forEach(el => {
@@ -224,7 +251,10 @@ function snapshotEnergyFlow(container) {
     const nodes = {};
     container.querySelectorAll('[data-flow-node]').forEach(node => {
         const key = node.dataset.flowNode;
-        nodes[key] = flowNodePosition(node);
+        nodes[key] = {
+            ...flowNodePosition(node),
+            custom: node.dataset.flowPositionCustom === '1'
+        };
     });
     const ui = window.UI_ENERGY_FLOW || {};
     return {
@@ -236,7 +266,7 @@ function snapshotEnergyFlow(container) {
     };
 }
 
-function setFlowNodePosition(container, key, x, y) {
+function setFlowNodePosition(container, key, x, y, options = {}) {
     const node = flowNodeByKey(container, key);
     if (!node) return;
     const canvas = flowCanvas(container);
@@ -256,6 +286,7 @@ function setFlowNodePosition(container, key, x, y) {
     node.style.top = `${py}%`;
     node.dataset.flowX = String(Math.round(px * 100) / 100);
     node.dataset.flowY = String(Math.round(py * 100) / 100);
+    if (options.custom === true) node.dataset.flowPositionCustom = '1';
     if (key === 'battery') {
         const back = container.querySelector('[data-flow-back="battery"]');
         if (back) {
@@ -321,7 +352,11 @@ function setFlowEditorSelected(container, key) {
 
 function restoreEnergyFlowSnapshot(container, snapshot) {
     if (!container || !snapshot) return;
-    Object.entries(snapshot.nodes || {}).forEach(([key, pos]) => setFlowNodePosition(container, key, pos.x, pos.y));
+    Object.entries(snapshot.nodes || {}).forEach(([key, pos]) => {
+        setFlowNodePosition(container, key, pos.x, pos.y);
+        const node = flowNodeByKey(container, key);
+        if (node) node.dataset.flowPositionCustom = pos.custom === true ? '1' : '0';
+    });
     window.UI_ENERGY_FLOW = window.UI_ENERGY_FLOW || {};
     window.UI_ENERGY_FLOW.colors = {...FLOW_COLOR_DEFAULTS, ...(snapshot.colors || {})};
     window.UI_ENERGY_FLOW.labels = {...(snapshot.labels || {})};
@@ -335,6 +370,7 @@ function restoreEnergyFlowSnapshot(container, snapshot) {
 function autoDistributeEnergyFlow(container) {
     setFlowNodePosition(container, 'center', 50, 50);
     const nodes = [...container.querySelectorAll('[data-flow-node]')]
+        .filter(node => !(node.hidden && node.dataset.flowOptional === '1'))
         .map(node => node.dataset.flowNode)
         .filter(key => key && key !== 'center');
     if (nodes.length === 0) return;
@@ -365,11 +401,14 @@ function autoDistributeEnergyFlow(container) {
             });
         }
         updateEnergyFlowLines(container);
+        container.querySelectorAll('[data-flow-node]').forEach(node => {
+            if (!node.hidden) node.dataset.flowPositionCustom = '1';
+        });
         return;
     }
     ordered.forEach((key, idx) => {
         const angle = (-90 + idx * (360 / ordered.length)) * Math.PI / 180;
-        setFlowNodePosition(container, key, 50 + Math.cos(angle) * rx, 50 + Math.sin(angle) * ry);
+        setFlowNodePosition(container, key, 50 + Math.cos(angle) * rx, 50 + Math.sin(angle) * ry, {custom: true});
     });
 }
 
@@ -455,6 +494,8 @@ function applyEnergyFlowSavedState(container, state, layout) {
     const savedNodes = state[layout] && state[layout].nodes;
     Object.entries(savedNodes || {}).forEach(([key, position]) => {
         setFlowNodePosition(container, key, Number(position.x), Number(position.y));
+        const node = flowNodeByKey(container, key);
+        if (node) node.dataset.flowPositionCustom = '1';
     });
     applyEnergyFlowBaseColors(container);
     applyEnergyFlowLabels(container);
@@ -644,7 +685,7 @@ function initEnergyFlowLayoutEditor() {
                 const rect = flowCanvas(container).getBoundingClientRect();
                 const x = ((event.clientX - rect.left) / rect.width) * 100;
                 const y = ((event.clientY - rect.top) / rect.height) * 100;
-                setFlowNodePosition(container, key, x, y);
+                setFlowNodePosition(container, key, x, y, {custom: true});
             });
             handle.addEventListener('pointerup', clearDrag);
             handle.addEventListener('pointercancel', clearDrag);
@@ -1282,7 +1323,7 @@ function directMarketingTrajectoryViewModel(data = {}) {
         planId: '',
         meta: null,
         slots: [],
-        series: {soc: [], pvStoreW: [], economicExportW: [], chargeBlock: []}
+        series: {soc: [], pvStoreW: [], economicExportW: [], headroomProjectionW: [], chargeBlock: []}
     };
     if (disabled) return inactive;
 
@@ -1292,23 +1333,28 @@ function directMarketingTrajectoryViewModel(data = {}) {
         ? planMeta.plan_id
         : '';
     const actionFallback = directMarketingSelectedActionFallbackViewModel(data, planId, planMeta);
-    const evidenceLimit = reasonCode => ({
+    const evidenceLimit = reasonCode => {
+        const headroomContractInvalid = String(reasonCode || '').includes('HEADROOM_PROJECTION');
+        const actionFallbackAllowed = actionFallback.state === 'complete' && !headroomContractInvalid;
+        return ({
         active: true,
-        state: actionFallback.state === 'complete' ? 'actions_only' : 'evidence_limit',
+        state: actionFallbackAllowed ? 'actions_only' : 'evidence_limit',
         reasonCode: reasonCode || 'DIRECT_MARKETING_TRAJECTORY_INCOMPLETE',
         actionReasonCode: actionFallback.reasonCode,
         planId,
         meta: contract && typeof contract === 'object' && contract.meta && typeof contract.meta === 'object'
             ? contract.meta
             : null,
-        slots: actionFallback.state === 'complete' ? actionFallback.slots : [],
+        slots: actionFallbackAllowed ? actionFallback.slots : [],
         series: {
             soc: [],
-            pvStoreW: actionFallback.state === 'complete' ? actionFallback.series.pvStoreW : [],
-            economicExportW: actionFallback.state === 'complete' ? actionFallback.series.economicExportW : [],
-            chargeBlock: actionFallback.state === 'complete' ? actionFallback.series.chargeBlock : []
+            pvStoreW: actionFallbackAllowed ? actionFallback.series.pvStoreW : [],
+            economicExportW: actionFallbackAllowed ? actionFallback.series.economicExportW : [],
+            headroomProjectionW: [],
+            chargeBlock: actionFallbackAllowed ? actionFallback.series.chargeBlock : []
         }
     });
+    };
     if (!/^sha256:[0-9a-f]{64}$/.test(planId)) return evidenceLimit('DIRECT_MARKETING_PLAN_ID_INVALID');
     if (!contract || typeof contract !== 'object') return evidenceLimit('DIRECT_MARKETING_TRAJECTORY_MISSING');
     if (contract.schema_version !== 'direct_marketing_trajectory_v1') return evidenceLimit('DIRECT_MARKETING_TRAJECTORY_SCHEMA_INVALID');
@@ -1341,6 +1387,11 @@ function directMarketingTrajectoryViewModel(data = {}) {
     }
     let previousEnd = null;
     let previousSocEnd = null;
+    let previousSlotId = null;
+    const headroomProjectionIds = new Set();
+    const hasHeadroomProjectionContract = contract.slots.some(slot => slot && typeof slot === 'object'
+        && (slot.action === 'HEADROOM_EXPORT' || slot.action_role === 'PROJECTION_ONLY'
+            || slot.projection_only === true || slot.headroom_projection !== null && slot.headroom_projection !== undefined));
     const slots = [];
     for (const source of contract.slots) {
         if (!source || typeof source !== 'object') return evidenceLimit('DIRECT_MARKETING_SLOT_INVALID');
@@ -1350,6 +1401,9 @@ function directMarketingTrajectoryViewModel(data = {}) {
         const selection = source.selection;
         const pv = source.pv_w;
         const loads = source.loads_w;
+        const provenance = source.provenance && typeof source.provenance === 'object' && !Array.isArray(source.provenance)
+            ? source.provenance
+            : null;
         if (typeof source.slot_id !== 'string' || source.slot_id === ''
             || !Number.isFinite(start) || !Number.isFinite(end) || end <= start
             || Math.abs((end - start) - slotDurationS * 1000) > 1
@@ -1385,6 +1439,44 @@ function directMarketingTrajectoryViewModel(data = {}) {
             || Math.abs(expectedResidualAfter + source.grid_w) > 0.01) {
             return evidenceLimit('DIRECT_MARKETING_TRAJECTORY_BALANCE_INVALID');
         }
+        if (!provenance) return evidenceLimit('DIRECT_MARKETING_TRAJECTORY_PROVENANCE_INVALID');
+        const socProjectionContract = String(provenance.soc_projection_contract || '');
+        const standardPassthrough = socProjectionContract === 'canonical_standard_soc_passthrough_v1';
+        const standardTransition = socProjectionContract === 'canonical_standard_transition_rebased_v1';
+        const currentTransition = start === validFromTs;
+        const expectedTransitionAnchorTs = currentTransition
+            ? Number(contract.generated_at_ts_ms)
+            : start;
+        const expectedTransitionDurationS = (end - expectedTransitionAnchorTs) / 1000;
+        const standardTransitionDurationValid =
+            provenance.integration_duration_contract === 'canonical_standard_transition_duration_v1'
+            && Number.isInteger(provenance.integration_anchor_ts_ms)
+            && Number.isInteger(expectedTransitionAnchorTs)
+            && provenance.integration_anchor_ts_ms === expectedTransitionAnchorTs
+            && start <= provenance.integration_anchor_ts_ms
+            && provenance.integration_anchor_ts_ms < end
+            && finite(provenance.integration_duration_s)
+            && provenance.integration_duration_s > 0
+            && provenance.integration_duration_s <= slotDurationS
+            && finite(expectedTransitionDurationS)
+            && Math.abs(provenance.integration_duration_s - expectedTransitionDurationS) <= 0.001;
+        const transitionKeys = ['soc_transition_contract', 'predecessor_slot_id', 'canonical_standard_start_soc_pct', 'rebased_start_soc_pct', 'standard_requested_battery_w', 'integration_duration_contract', 'integration_anchor_ts_ms', 'integration_duration_s'];
+        const transitionFieldPresent = transitionKeys.some(key => Object.prototype.hasOwnProperty.call(provenance, key));
+        const standardTransitionValid = standardTransition
+            && provenance.soc_transition_contract === 'canonical_standard_transition_rebased_v1'
+            && action === 'PASSIVE_NORMAL'
+            && provenance.predecessor_slot_id === previousSlotId
+            && finite(provenance.canonical_standard_start_soc_pct)
+            && finite(provenance.rebased_start_soc_pct)
+            && finite(provenance.standard_requested_battery_w)
+            && standardTransitionDurationValid
+            && Math.abs(provenance.rebased_start_soc_pct - source.soc_start_pct) <= 0.0015;
+        if ((standardTransition && !standardTransitionValid)
+            || (!standardTransition && transitionFieldPresent)
+            || (!standardPassthrough && !standardTransition
+                && socProjectionContract !== 'direct_marketing_energy_integrator_v1')) {
+            return evidenceLimit('DIRECT_MARKETING_TRAJECTORY_SOC_PROJECTION_CONTRACT_INVALID');
+        }
         const selectedRole = selection.selected === true
             && selection.executable === true
             && selection.commands_allowed === true
@@ -1402,14 +1494,159 @@ function directMarketingTrajectoryViewModel(data = {}) {
             && Number(delegation.valid_until_ts_ms) >= end
             && Number.isFinite(Number(delegation.max_curve_charge_w))
             && Number(delegation.max_curve_charge_w) > 0;
+        const projectionOnlyMarker = action === 'HEADROOM_EXPORT'
+            || Object.prototype.hasOwnProperty.call(source, 'action_role')
+            || Object.prototype.hasOwnProperty.call(source, 'projection_only')
+            || Object.prototype.hasOwnProperty.call(source, 'hardware_effect')
+            || Object.prototype.hasOwnProperty.call(source, 'headroom_projection')
+            || Object.prototype.hasOwnProperty.call(selection, 'projected_action')
+            || Object.prototype.hasOwnProperty.call(selection, 'projected_w')
+            || Object.prototype.hasOwnProperty.call(selection, 'projection_id');
+        let projectionRole = false;
+        let projectedW = null;
+        let projectionEffectiveStartTs = null;
+        let projectionEffectiveDurationS = null;
+        if (projectionOnlyMarker) {
+            const selectionKeys = Object.keys(selection).sort();
+            const expectedSelectionKeys = ['commands_allowed', 'executable', 'projected_action', 'projected_w', 'projection_id', 'selected'];
+            const binding = source.headroom_projection;
+            const bindingSlot = binding && typeof binding === 'object' && binding.slot && typeof binding.slot === 'object'
+                ? binding.slot
+                : null;
+            projectedW = selection.projected_w;
+            const projectionId = String(selection.projection_id || '');
+            const bindingKeys = binding && typeof binding === 'object' && !Array.isArray(binding)
+                ? Object.keys(binding).sort()
+                : [];
+            const bindingSlotKeys = bindingSlot && !Array.isArray(bindingSlot)
+                ? Object.keys(bindingSlot).sort()
+                : [];
+            const expectedBindingKeys = ['projection_only', 'projection_plan_revision', 'schema', 'slot'];
+            const expectedBindingSlotKeys = ['commands_allowed', 'duration_s', 'effective_duration_s', 'effective_start_ts', 'effective_window_duration_s', 'effective_window_end_ts', 'effective_window_start_ts', 'end_ts', 'energy_basis', 'executable', 'forecast_absorption_wh', 'hardware_effect', 'headroom_deficit_wh', 'headroom_export_budget_id', 'headroom_export_budget_wh', 'headroom_export_slot_energy_wh', 'headroom_export_slot_id', 'headroom_free_before_wh', 'headroom_required_wh', 'next_charge_end_ts', 'next_charge_start_ts', 'projected_action', 'projected_mode', 'projected_power_w', 'projected_source_action', 'projection_horizon_contract', 'projection_id', 'projection_only', 'protected_reserve_wh', 'reserve_floor_soc_pct', 'segment_id', 'sellable_wh', 'start_ts', 'target_soc_pct', 'window_end_ts', 'window_id', 'window_start_ts'];
+            const energyBinding = provenance.headroom_energy_binding;
+            const energyBindingKeys = energyBinding && typeof energyBinding === 'object' && !Array.isArray(energyBinding)
+                ? Object.keys(energyBinding).sort()
+                : [];
+            const expectedEnergyBindingKeys = ['applied_ac_discharge_w', 'applied_stored_delta_wh', 'axis_duration_s', 'bounded', 'bounding_status', 'desired_ac_discharge_w', 'discharge_efficiency', 'effective_duration_s', 'effective_start_ts', 'energy_basis', 'hardware_discharge_limit_w', 'limiting_factors', 'requested_stored_delta_wh', 'reserve_ac_discharge_limit_w', 'reserve_available_stored_wh', 'schema', 'slot_energy_ac_discharge_limit_w', 'stored_delta_rate_w'];
+            const provenanceKeys = Object.keys(provenance).sort();
+            const expectedProvenanceKeys = ['action_source', 'balance_source', 'candidate_effect', 'headroom_energy_binding', 'pv_axis_evidence_class', 'shadow_effect', 'soc_projection_contract'];
+            projectionEffectiveStartTs = bindingSlot ? bindingSlot.effective_start_ts : null;
+            projectionEffectiveDurationS = bindingSlot ? bindingSlot.effective_duration_s : null;
+            const effectiveEndTs = finite(projectionEffectiveStartTs) && finite(projectionEffectiveDurationS)
+                ? projectionEffectiveStartTs + projectionEffectiveDurationS * 1000
+                : null;
+            const energyNumericFields = ['stored_delta_rate_w', 'requested_stored_delta_wh', 'discharge_efficiency', 'desired_ac_discharge_w', 'hardware_discharge_limit_w', 'reserve_available_stored_wh', 'slot_energy_ac_discharge_limit_w', 'reserve_ac_discharge_limit_w', 'applied_ac_discharge_w', 'applied_stored_delta_wh'];
+            const limitingFactors = energyBinding && Array.isArray(energyBinding.limiting_factors)
+                ? energyBinding.limiting_factors
+                : null;
+            const allowedLimitingFactors = ['desired_ac_discharge_w', 'hardware_discharge_limit_w', 'slot_energy_ac_discharge_limit_w', 'reserve_ac_discharge_limit_w'];
+            const boundingStatusValid = energyBinding && (
+                energyBinding.bounding_status === 'UNBOUNDED' && energyBinding.bounded === false
+                    && Math.abs(energyBinding.applied_ac_discharge_w - energyBinding.desired_ac_discharge_w) <= 0.001
+                || energyBinding.bounding_status === 'BOUNDED' && energyBinding.bounded === true
+                    && energyBinding.applied_ac_discharge_w > 0.001
+                    && energyBinding.applied_ac_discharge_w + 0.001 < energyBinding.desired_ac_discharge_w
+                || energyBinding.bounding_status === 'ZERO_BOUNDED' && energyBinding.bounded === true
+                    && energyBinding.applied_ac_discharge_w <= 0.001
+                    && energyBinding.desired_ac_discharge_w > 0.001
+            );
+            const forbiddenTopLevelAuthority = ['requested_w', 'plan_action', 'gate', 'selected', 'executable', 'commands_allowed', 'runtime_effect_claim_allowed', 'action_id', 'window_id', 'segment_id', 'source_action', 'source_mode', 'headroom_export_gate']
+                .some(key => Object.prototype.hasOwnProperty.call(source, key));
+            const roleValid = action === 'HEADROOM_EXPORT'
+                && source.action_role === 'PROJECTION_ONLY'
+                && source.projection_only === true
+                && source.hardware_effect === false
+                && forbiddenTopLevelAuthority === false
+                && JSON.stringify(selectionKeys) === JSON.stringify(expectedSelectionKeys)
+                && selection.selected === false
+                && selection.executable === false
+                && selection.commands_allowed === false
+                && selection.projected_action === 'HEADROOM_EXPORT'
+                && finite(projectedW) && projectedW >= 0
+                && /^headroom-slot:[0-9a-f]{64}$/.test(projectionId)
+                && !headroomProjectionIds.has(projectionId)
+                && binding && typeof binding === 'object'
+                && JSON.stringify(bindingKeys) === JSON.stringify(expectedBindingKeys)
+                && binding.schema === 'direct_marketing_headroom_projection_binding_v1'
+                && binding.projection_only === true
+                && /^sha256:[0-9a-f]{64}$/.test(String(binding.projection_plan_revision || ''))
+                && bindingSlot
+                && JSON.stringify(bindingSlotKeys) === JSON.stringify(expectedBindingSlotKeys)
+                && bindingSlot.projection_id === projectionId
+                && bindingSlot.headroom_export_slot_id === projectionId
+                && Number(bindingSlot.start_ts) === start
+                && Number(bindingSlot.end_ts) === end
+                && bindingSlot.projected_action === 'HEADROOM_EXPORT'
+                && bindingSlot.projection_only === true
+                && bindingSlot.executable === false
+                && bindingSlot.commands_allowed === false
+                && bindingSlot.hardware_effect === false
+                && bindingSlot.energy_basis === 'stored_battery_energy_delta_before_discharge_loss_v1'
+                && bindingSlot.duration_s === slotDurationS
+                && finite(projectionEffectiveStartTs)
+                && projectionEffectiveStartTs >= start && projectionEffectiveStartTs < end
+                && finite(projectionEffectiveDurationS)
+                && projectionEffectiveDurationS > 0 && projectionEffectiveDurationS <= slotDurationS
+                && Math.abs(effectiveEndTs - end) <= 0.001
+                && finite(bindingSlot.effective_window_start_ts)
+                && finite(bindingSlot.effective_window_end_ts)
+                && finite(bindingSlot.effective_window_duration_s)
+                && bindingSlot.effective_window_start_ts <= projectionEffectiveStartTs
+                && bindingSlot.effective_window_end_ts >= end
+                && bindingSlot.effective_window_duration_s >= projectionEffectiveDurationS
+                && finite(bindingSlot.projected_power_w) && bindingSlot.projected_power_w > 0
+                && finite(bindingSlot.headroom_export_slot_energy_wh) && bindingSlot.headroom_export_slot_energy_wh > 0
+                && energyBinding && typeof energyBinding === 'object'
+                && JSON.stringify(energyBindingKeys) === JSON.stringify(expectedEnergyBindingKeys)
+                && JSON.stringify(provenanceKeys) === JSON.stringify(expectedProvenanceKeys)
+                && energyBinding.schema === 'direct_marketing_headroom_energy_binding_v1'
+                && energyBinding.energy_basis === bindingSlot.energy_basis
+                && energyBinding.axis_duration_s === slotDurationS
+                && energyBinding.effective_start_ts === projectionEffectiveStartTs
+                && energyBinding.effective_duration_s === projectionEffectiveDurationS
+                && energyBinding.stored_delta_rate_w === bindingSlot.projected_power_w
+                && energyBinding.requested_stored_delta_wh === bindingSlot.headroom_export_slot_energy_wh
+                && energyNumericFields.every(key => finite(energyBinding[key]) && energyBinding[key] >= 0)
+                && energyBinding.discharge_efficiency > 0 && energyBinding.discharge_efficiency <= 1
+                && energyBinding.applied_stored_delta_wh <= energyBinding.requested_stored_delta_wh + 0.001
+                && energyBinding.applied_ac_discharge_w <= energyBinding.hardware_discharge_limit_w + 0.001
+                && energyBinding.applied_ac_discharge_w <= energyBinding.slot_energy_ac_discharge_limit_w + 0.001
+                && energyBinding.applied_ac_discharge_w <= energyBinding.reserve_ac_discharge_limit_w + 0.001
+                && limitingFactors && limitingFactors.length > 0
+                && limitingFactors.every((factor, index) => allowedLimitingFactors.includes(factor)
+                    && limitingFactors.indexOf(factor) === index)
+                && boundingStatusValid
+                && Math.abs(energyBinding.applied_ac_discharge_w - projectedW) <= 0.001
+                && delegation === null
+                && source.passive_binding === null
+                && source.standard_projection_binding === null
+                && provenance.action_source === 'direct_marketing.headroom_projection_plan'
+                && provenance.candidate_effect === false
+                && provenance.shadow_effect === false
+                && source.battery_w <= 0
+                && Math.abs(Math.abs(source.battery_w) - projectedW) <= 0.001
+                && finite(source.hard_reserve_soc_pct)
+                && source.soc_end_pct + 0.002 >= source.hard_reserve_soc_pct;
+            if (!roleValid) return evidenceLimit('DIRECT_MARKETING_HEADROOM_PROJECTION_ROLE_INVALID');
+            headroomProjectionIds.add(projectionId);
+            projectionRole = true;
+        }
         const selectedAction = action === 'PV_STORE' || action === 'ECONOMIC_EXPORT' || action === 'CHARGE_BLOCK_WAIT' || action === 'DV_CURVE_CHARGE';
         const passiveBinding = source.passive_binding;
+        const passiveMetadataClear = ['action_id', 'window_id', 'segment_id', 'source_action', 'source_mode', 'pv_store_source_contract']
+            .every(key => Object.prototype.hasOwnProperty.call(selection, key) && selection[key] === null);
+        const passiveBindingValid = passiveBinding && typeof passiveBinding === 'object'
+            && passiveBinding.schema === 'direct_marketing_passive_normal_binding_v1';
+        const transitionWithoutPassiveBinding = hasHeadroomProjectionContract
+            && passiveBinding === null && (standardPassthrough || standardTransitionValid);
+        const passiveRole = action === 'PASSIVE_NORMAL'
+            && selection.selected === false && selection.executable === false && selection.commands_allowed === false
+            && finite(selection.requested_w) && selection.requested_w === 0
+            && passiveMetadataClear && delegation === null
+            && (passiveBindingValid || transitionWithoutPassiveBinding);
         if ((selection.selected === true && delegation !== null)
-            || (selectedAction && !selectedRole && !delegatedPvStore)
-            || (!selectedAction && action !== 'PASSIVE_NORMAL')
-            || (action === 'PASSIVE_NORMAL' && (selection.selected !== false || delegation !== null
-                || !passiveBinding || typeof passiveBinding !== 'object'
-                || passiveBinding.schema !== 'direct_marketing_passive_normal_binding_v1'))) {
+            || (!projectionRole && selectedAction && !selectedRole && !delegatedPvStore)
+            || (!projectionRole && !selectedAction && !passiveRole)) {
             return evidenceLimit('DIRECT_MARKETING_TRAJECTORY_ACTION_ROLE_INVALID');
         }
         if (action === 'PV_STORE' || action === 'DV_CURVE_CHARGE') {
@@ -1448,7 +1685,11 @@ function directMarketingTrajectoryViewModel(data = {}) {
             residualAfterStorageW: source.residual_after_storage_w,
             action,
             plannedAllowed: selectedRole || delegatedPvStore,
-            plannedRole: delegatedPvStore ? 'delegation' : (selectedRole ? 'selected' : 'passive'),
+            plannedRole: projectionRole ? 'projection' : (delegatedPvStore ? 'delegation' : (selectedRole ? 'selected' : 'passive')),
+            plannedW: projectionRole ? null : (selectedRole ? Number(selection.requested_w) : (delegatedPvStore ? Number(delegation.max_curve_charge_w) : null)),
+            projectedW: projectionRole ? projectedW : null,
+            projectionEffectiveStartTs: projectionRole ? projectionEffectiveStartTs : null,
+            projectionEffectiveDurationS: projectionRole ? projectionEffectiveDurationS : null,
             candidate: null,
             planned: {...selection},
             runtime: runtimeForSlot,
@@ -1456,10 +1697,11 @@ function directMarketingTrajectoryViewModel(data = {}) {
                 ? {hardwareEffect: runtimeForSlot.hardware_effect}
                 : null,
             reasonCode: source.reason_code || null,
-            provenance: source.provenance && typeof source.provenance === 'object' ? {...source.provenance} : null
+            provenance: {...provenance}
         });
         previousEnd = end;
         previousSocEnd = source.soc_end_pct;
+        previousSlotId = source.slot_id;
     }
     if (slots[0].startTs !== validFromTs || slots[slots.length - 1].endTs !== horizonEndTs) {
         return evidenceLimit('DIRECT_MARKETING_TRAJECTORY_HORIZON_MISMATCH');
@@ -1501,8 +1743,59 @@ function directMarketingTrajectoryViewModel(data = {}) {
             soc,
             pvStoreW: fallbackBound ? actionFallback.series.pvStoreW : slots.map(slot => slot.plannedAllowed && (slot.action === 'PV_STORE' || slot.action === 'DV_CURVE_CHARGE') ? Math.abs(slot.batteryW) : null),
             economicExportW: fallbackBound ? actionFallback.series.economicExportW : slots.map(slot => slot.plannedAllowed && slot.action === 'ECONOMIC_EXPORT' ? Math.abs(slot.batteryW) : null),
+            headroomProjectionW: slots.map(slot => slot.plannedRole === 'projection' && slot.action === 'HEADROOM_EXPORT' ? slot.projectedW : null),
             chargeBlock: fallbackBound ? actionFallback.series.chargeBlock : slots.map(slot => slot.plannedAllowed && slot.action === 'CHARGE_BLOCK_WAIT' ? 1 : null)
         }
+    };
+}
+
+function storageTrajectoryNumberOrNull(value) {
+    if (value === null || value === undefined || typeof value === 'boolean') return null;
+    if (typeof value === 'string' && value.trim() === '') return null;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+function storageBaseTrajectoryEvidence(rawBase, planId) {
+    const evidenceLimit = reasonCode => ({state: 'evidence_limit', reasonCode, soc: []});
+    if (!Array.isArray(rawBase) || rawBase.length === 0) {
+        return evidenceLimit('STORAGE_BASE_FORECAST_MISSING');
+    }
+    if (rawBase.length < 2) {
+        return evidenceLimit('STORAGE_BASE_FORECAST_TOO_SHORT');
+    }
+    if (rawBase.some(point => !point || typeof point !== 'object')) {
+        return evidenceLimit('STORAGE_BASE_POINT_INVALID');
+    }
+    if (rawBase.some(point => typeof point.plan_id !== 'string' || point.plan_id.trim() === '')) {
+        return evidenceLimit('STORAGE_BASE_PLAN_BINDING_MISSING');
+    }
+    if (rawBase.some(point => !/^sha256:[0-9a-f]{64}$/.test(point.plan_id))) {
+        return evidenceLimit('STORAGE_BASE_PLAN_BINDING_INVALID');
+    }
+    if (rawBase.some(point => point.plan_id !== planId)) {
+        return evidenceLimit('STORAGE_BASE_PLAN_MISMATCH');
+    }
+    if (rawBase.some(point => typeof point.slot_id !== 'string' || point.slot_id.trim() === '')) {
+        return evidenceLimit('STORAGE_BASE_SLOT_BINDING_MISSING');
+    }
+    if (rawBase.some(point => {
+        const ts = storageTrajectoryNumberOrNull(point.ts);
+        return ts === null || ts <= 0;
+    })) {
+        return evidenceLimit('STORAGE_BASE_TIMESTAMP_INVALID');
+    }
+    if (rawBase.some(point => storageTrajectoryNumberOrNull(point.soc) === null)) {
+        return evidenceLimit('STORAGE_BASE_SOC_INVALID');
+    }
+    return {
+        state: 'complete',
+        reasonCode: null,
+        soc: rawBase.map(point => ({
+            ts: storageTrajectoryNumberOrNull(point.ts),
+            soc: storageTrajectoryNumberOrNull(point.soc),
+            slotId: point.slot_id.trim()
+        })).sort((a, b) => a.ts - b.ts)
     };
 }
 
@@ -1512,19 +1805,9 @@ function storageTrajectoryViewModel(data = {}) {
         : {};
     const planId = typeof meta.plan_id === 'string' ? meta.plan_id : '';
     const rawBase = Array.isArray(data && data.storage_sim_curve) ? data.storage_sim_curve : [];
-    const baseValid = rawBase.length > 1 && rawBase.every(point => point && point.plan_id === planId
-        && typeof point.slot_id === 'string' && point.slot_id
-        && Number.isFinite(Number(point.ts)) && Number.isFinite(Number(point.soc)));
-    const base = baseValid
-        ? rawBase.map(point => ({ts: Number(point.ts), soc: Number(point.soc), slotId: point.slot_id}))
-            .sort((a, b) => a.ts - b.ts)
-        : [];
     return {
         planId,
-        base: {
-            state: /^sha256:[0-9a-f]{64}$/.test(planId) && base.length > 1 ? 'complete' : 'evidence_limit',
-            soc: base
-        },
+        base: storageBaseTrajectoryEvidence(rawBase, planId),
         directMarketing: directMarketingTrajectoryViewModel(data)
     };
 }
@@ -1533,7 +1816,7 @@ function directMarketingTrajectorySeriesForTimestamps(data, timestamps) {
     const view = directMarketingTrajectoryViewModel(data);
     const empty = () => Array.isArray(timestamps) ? timestamps.map(() => null) : [];
     if (!['complete', 'actions_only'].includes(view.state) || !Array.isArray(timestamps)) {
-        return {view, soc: empty(), pvStoreW: empty(), economicExportW: empty(), chargeBlock: empty()};
+        return {view, soc: empty(), pvStoreW: empty(), economicExportW: empty(), headroomProjectionW: empty(), chargeBlock: empty()};
     }
     const slotIndexAt = ts => view.slots.findIndex(slot => slot.startTs <= ts && ts < slot.endTs);
     const mapped = timestamps.map(rawTs => {
@@ -1547,6 +1830,13 @@ function directMarketingTrajectorySeriesForTimestamps(data, timestamps) {
             soc: view.state === 'complete' ? slot.socStartPct : null,
             pvStoreW: view.series.pvStoreW[slotIndex] ?? null,
             economicExportW: view.series.economicExportW[slotIndex] ?? null,
+            headroomProjectionW: slot.plannedRole === 'projection'
+                && Number.isFinite(slot.projectionEffectiveStartTs)
+                && Number.isFinite(slot.projectionEffectiveDurationS)
+                && ts >= slot.projectionEffectiveStartTs
+                && ts < slot.projectionEffectiveStartTs + slot.projectionEffectiveDurationS * 1000
+                    ? (view.series.headroomProjectionW[slotIndex] ?? null)
+                    : null,
             chargeBlock: view.series.chargeBlock[slotIndex] ?? null
         };
     });
@@ -1555,6 +1845,7 @@ function directMarketingTrajectorySeriesForTimestamps(data, timestamps) {
         soc: mapped.map(point => point ? point.soc : null),
         pvStoreW: mapped.map(point => point ? point.pvStoreW : null),
         economicExportW: mapped.map(point => point ? point.economicExportW : null),
+        headroomProjectionW: mapped.map(point => point ? point.headroomProjectionW : null),
         chargeBlock: mapped.map(point => point ? point.chargeBlock : null)
     };
 }
@@ -1635,6 +1926,9 @@ function cacheStorageCurveData(data) {
         ].forEach(key => {
             if (!Object.prototype.hasOwnProperty.call(data, key)) mergedData[key] = [];
         });
+        if (!Object.prototype.hasOwnProperty.call(data, 'effective_storage_plan')) {
+            mergedData.effective_storage_plan = null;
+        }
     }
 
     window._storageLiveData = mergedData;
@@ -1711,24 +2005,189 @@ function downsampleStorageSparkline(points, maxPoints = 48) {
 function storageSparklineSeries(data = {}) {
     const trajectory = storageTrajectoryViewModel(data);
     const planId = trajectory.planId;
-    if (!/^sha256:[0-9a-f]{64}$/.test(planId)) return {state: 'missing_plan', planId: '', forecast: [], target: []};
-    if (trajectory.base.state !== 'complete') return {state: 'plan_mismatch', planId, forecast: [], target: []};
+    if (!/^sha256:[0-9a-f]{64}$/.test(planId)) {
+        return {state: 'missing_plan', reasonCode: 'STORAGE_PLAN_ID_INVALID', planId: '', forecast: [], target: []};
+    }
+    const projectionDisplay = storageSparklineProjectionDisplay(data);
+    if (projectionDisplay) {
+        return {state: 'projection_hidden', reasonCode: projectionDisplay.reasonCode, planId, forecast: [], target: []};
+    }
+    if (trajectory.base.state !== 'complete') {
+        const stateByReason = {
+            STORAGE_BASE_FORECAST_MISSING: 'missing_forecast',
+            STORAGE_BASE_FORECAST_TOO_SHORT: 'forecast_too_short',
+            STORAGE_BASE_POINT_INVALID: 'invalid_point',
+            STORAGE_BASE_PLAN_BINDING_MISSING: 'missing_plan_binding',
+            STORAGE_BASE_PLAN_BINDING_INVALID: 'invalid_plan_binding',
+            STORAGE_BASE_PLAN_MISMATCH: 'plan_mismatch',
+            STORAGE_BASE_SLOT_BINDING_MISSING: 'missing_slot_id',
+            STORAGE_BASE_TIMESTAMP_INVALID: 'invalid_timestamp',
+            STORAGE_BASE_SOC_INVALID: 'invalid_soc'
+        };
+        return {
+            state: stateByReason[trajectory.base.reasonCode] || 'invalid_forecast',
+            reasonCode: trajectory.base.reasonCode || 'STORAGE_BASE_EVIDENCE_LIMIT',
+            planId,
+            forecast: [],
+            target: []
+        };
+    }
     const forecast = trajectory.base.soc
         .map(point => ({ts: point.ts, soc: Math.max(0, Math.min(100, point.soc))}));
-    if (forecast.length < 2) return {state: 'missing_forecast', planId, forecast: [], target: []};
+    if (forecast.length < 2) {
+        return {state: 'forecast_too_short', reasonCode: 'STORAGE_BASE_FORECAST_TOO_SHORT', planId, forecast: [], target: []};
+    }
     const target = (Array.isArray(data.storage_target_curve) ? data.storage_target_curve : [])
-        .filter(point => point && (point.soc !== null && point.soc !== undefined || point.target_soc !== null && point.target_soc !== undefined))
-        .map(point => ({ts: Number(point.ts), soc: Number(point.soc ?? point.target_soc)}))
-        .filter(point => Number.isFinite(point.ts) && Number.isFinite(point.soc))
+        .filter(point => point && storageTrajectoryNumberOrNull(point.ts) !== null
+            && storageTrajectoryNumberOrNull(point.soc ?? point.target_soc) !== null)
+        .map(point => ({
+            ts: storageTrajectoryNumberOrNull(point.ts),
+            soc: storageTrajectoryNumberOrNull(point.soc ?? point.target_soc)
+        }))
         .map(point => ({ts: point.ts, soc: Math.max(0, Math.min(100, point.soc))}))
         .sort((a, b) => a.ts - b.ts);
     return {
         state: 'bound',
+        reasonCode: null,
         planId,
         source: 'soc',
         forecast: downsampleStorageSparkline(forecast),
         target: downsampleStorageSparkline(target)
     };
+}
+
+function storageSparklineProjectionDisplay(data = {}) {
+    const meta = data.storage_plan_meta && typeof data.storage_plan_meta === 'object'
+        ? data.storage_plan_meta
+        : {};
+    const nestedEffectivePlan = meta.effective_storage_plan && typeof meta.effective_storage_plan === 'object'
+        ? meta.effective_storage_plan
+        : {};
+    const effectivePlan = data.effective_storage_plan && typeof data.effective_storage_plan === 'object'
+        ? data.effective_storage_plan
+        : nestedEffectivePlan;
+    const hidden = meta.clear_classical_curves === true || effectivePlan.clear_classical_curves === true;
+    if (!hidden) return null;
+
+    const planId = String(meta.plan_id || '').trim();
+    const binding = effectivePlan.binding && typeof effectivePlan.binding === 'object'
+        ? effectivePlan.binding
+        : {};
+    const action = String(effectivePlan.effective_action || '').trim().toUpperCase();
+    const bindingAction = String(binding.action || '').trim().toUpperCase();
+    const status = String(effectivePlan.status || '').trim().toUpperCase();
+    const lifecycle = effectivePlan.lifecycle && typeof effectivePlan.lifecycle === 'object'
+        ? effectivePlan.lifecycle
+        : {};
+    const lifecycleEffectConfirmed = lifecycle.effect_confirmed === true;
+    const expectedEffectiveStatus = action ? `DIRECT_MARKETING_${action}_EFFECTIVE` : '';
+    const expectedPendingStatus = action ? `DIRECT_MARKETING_${action}_PENDING` : '';
+    const expectedLifecycleStatus = lifecycleEffectConfirmed
+        ? expectedEffectiveStatus
+        : expectedPendingStatus;
+    const canonicalEffectivePlan = effectivePlan.schema_version === 'storage_effective_plan_v1'
+        && effectivePlan.consistent === true
+        && /^sha256:[0-9a-f]{64}$/.test(planId)
+        && binding.plan_id === planId
+        && action !== ''
+        && bindingAction === action
+        && expectedLifecycleStatus !== ''
+        && status === expectedLifecycleStatus;
+    if (!canonicalEffectivePlan) {
+        return {
+            curveState: 'hidden-dv-evidence-limit',
+            text: 'DV-Wirkung nicht belegt',
+            reasonCode: 'STORAGE_CLASSICAL_CURVE_HIDDEN_DV_EVIDENCE_LIMIT'
+        };
+    }
+    const effectConfirmed = lifecycleEffectConfirmed;
+    const requestObserved = lifecycle.requested === true
+        || lifecycle.issued === true
+        || lifecycle.retained === true
+        || lifecycle.retained_effect === true;
+    const projectionStage = effectConfirmed ? 'effective' : (requestObserved ? 'requested' : 'planned');
+    const stagedDisplay = (curveState, reasonCode, effectiveText, requestedText, plannedText) => ({
+        curveState: effectConfirmed ? curveState : `${curveState}-${projectionStage}`,
+        text: effectConfirmed ? effectiveText : (requestObserved ? requestedText : plannedText),
+        reasonCode: effectConfirmed ? reasonCode : `${reasonCode}_${projectionStage.toUpperCase()}`
+    });
+    const hasAction = value => action === value || status.includes(value);
+    if (hasAction('CHARGE_BLOCK_WAIT')) {
+        return stagedDisplay(
+            'hidden-dv-hold',
+            'STORAGE_CLASSICAL_CURVE_HIDDEN_DV_CHARGE_BLOCK',
+            'DV: Laden gesperrt / Halten',
+            'DV: Ladesperre angefordert',
+            'DV: Ladesperre geplant'
+        );
+    }
+    if (hasAction('ECONOMIC_EXPORT')) {
+        return stagedDisplay(
+            'hidden-dv-export',
+            'STORAGE_CLASSICAL_CURVE_HIDDEN_DV_EXPORT',
+            'DV-Export aktiv',
+            'DV-Export angefordert',
+            'DV-Export geplant'
+        );
+    }
+    if (hasAction('HEADROOM_EXPORT')) {
+        return stagedDisplay(
+            'hidden-dv-headroom',
+            'STORAGE_CLASSICAL_CURVE_HIDDEN_DV_HEADROOM',
+            'DV: Speicherplatz schaffen',
+            'DV: Speicherplatzfreigabe angefordert',
+            'DV: Speicherplatzfreigabe geplant'
+        );
+    }
+    if (hasAction('PV_STORE') || hasAction('DV_CURVE_CHARGE')) {
+        return stagedDisplay(
+            'hidden-dv-store',
+            'STORAGE_CLASSICAL_CURVE_HIDDEN_DV_STORE',
+            'DV: PV speichern',
+            'DV: PV-Speicherung angefordert',
+            'DV: PV-Speicherung geplant'
+        );
+    }
+    if (hasAction('GRID_CHARGE')) {
+        return stagedDisplay(
+            'hidden-dv-grid-charge',
+            'STORAGE_CLASSICAL_CURVE_HIDDEN_DV_GRID_CHARGE',
+            'DV: Netzladen',
+            'DV: Netzladen angefordert',
+            'DV: Netzladen geplant'
+        );
+    }
+    if (effectivePlan.direct_marketing_active === true || status.startsWith('DIRECT_MARKETING_')) {
+        return stagedDisplay(
+            'hidden-dv',
+            'STORAGE_CLASSICAL_CURVE_HIDDEN_DV',
+            'DV-Regelung aktiv',
+            'DV-Regelung angefordert',
+            'DV-Regelung geplant'
+        );
+    }
+    return {curveState: 'hidden', text: 'SoC-Prognose bewusst ausgeblendet', reasonCode: 'STORAGE_CLASSICAL_CURVE_HIDDEN'};
+}
+
+function storageSparklineUnavailableDisplay(data = {}, series = {}) {
+    if (series.state === 'projection_hidden') {
+        return storageSparklineProjectionDisplay(data)
+            || {curveState: 'hidden', text: 'SoC-Prognose bewusst ausgeblendet'};
+    }
+    const states = {
+        missing_plan: {curveState: 'missing', text: 'Kein Speicherplan'},
+        missing_forecast: {curveState: 'missing', text: 'Keine SoC-Prognose'},
+        forecast_too_short: {curveState: 'incomplete', text: 'SoC-Prognose noch unvollständig'},
+        invalid_point: {curveState: 'invalid', text: 'SoC-Prognose unvollständig'},
+        missing_plan_binding: {curveState: 'invalid', text: 'SoC-Prognose ohne Planbindung'},
+        invalid_plan_binding: {curveState: 'invalid', text: 'SoC-Prognose mit ungültiger Planbindung'},
+        plan_mismatch: {curveState: 'mismatch', text: 'Planrevision passt nicht'},
+        missing_slot_id: {curveState: 'invalid', text: 'SoC-Prognose ohne Slot-Bindung'},
+        invalid_timestamp: {curveState: 'invalid', text: 'SoC-Prognose mit ungültiger Zeit'},
+        invalid_soc: {curveState: 'invalid', text: 'SoC-Prognose mit ungültigem SoC'},
+        invalid_forecast: {curveState: 'invalid', text: 'SoC-Prognose ungültig'}
+    };
+    return states[series.state] || states.missing_forecast;
 }
 
 function storageSparklineSvgPoints(points, domain, width = 240, height = 44) {
@@ -1775,15 +2234,8 @@ function renderStorageCurveSparkline(data = {}) {
     }
     const series = storageSparklineSeries(data);
     if (series.state !== 'bound') {
-        const effectivePlan = data.effective_storage_plan && typeof data.effective_storage_plan === 'object'
-            ? data.effective_storage_plan
-            : {};
-        const isDvExport = effectivePlan.status === 'DIRECT_MARKETING_ECONOMIC_EXPORT_EFFECTIVE'
-            || effectivePlan.effective_action === 'ECONOMIC_EXPORT'
-            || effectivePlan.direct_marketing_active === true;
-        clear(series.state === 'plan_mismatch' ? 'mismatch' : 'missing', isDvExport
-            ? 'DV-Export aktiv'
-            : (series.state === 'plan_mismatch' ? 'Planrevision passt nicht' : 'Keine SoC-Prognose'));
+        const unavailable = storageSparklineUnavailableDisplay(data, series);
+        clear(unavailable.curveState, unavailable.text);
         return;
     }
     const domainPoints = series.forecast.concat(series.target);
@@ -2469,6 +2921,7 @@ function directMarketingActionLabel(action) {
         eco_plus_house_supply: 'Haus versorgen',
         eco_plus_negative_headroom_hold: 'Speicherplatz halten',
         eco_plus_store_pv_candidate: 'PV speichern',
+        eco_plus_curve_charge_candidate: 'Kurvenladung im E3DC-AUTO-Rahmen',
         eco_plus_export_candidate: 'Verkaufskandidat',
         arbitrage_keep_headroom: 'Speicherplatz freihalten',
         arbitrage_grid_charge_candidate: 'Netzladekandidat',
@@ -2752,9 +3205,14 @@ function directMarketingReasonLabel(reason) {
         profitable_high_price: 'Hochpreis',
         profitable_low_price: 'Billigpreis',
         high_price_house_supply: 'Hochpreis-Hausversorgung',
+        neutral_current_house_supply: 'aktueller E3DC-AUTO-Slot',
+        neutral_dv_slot: 'normaler E3DC-AUTO-Zeitraum',
         reserve_for_higher_profit: 'für höheres Verkaufsfenster reserviert',
         reserved_for_higher_profit: 'für höheres Verkaufsfenster reserviert',
-        higher_profit_reserved: 'für höheres Verkaufsfenster reserviert'
+        higher_profit_reserved: 'für höheres Verkaufsfenster reserviert',
+        policy_passive_house_supply: 'expliziter PASSIVE_NORMAL-Vertrag; E3DC-AUTO',
+        plan_projection_gap: 'EVIDENCE_LIMIT: keine eindeutige wirksame Slotprojektion',
+        plan_projection_overlap: 'EVIDENCE_LIMIT: überlappende wirksame Fenster'
     };
     return labels[normalized] || normalized.replace(/_/g, ' ');
 }
@@ -2767,8 +3225,11 @@ function directMarketingWindowVisual(action, executionContract = null) {
     if (normalized === 'negative_price_market_window') {
         return {label: 'Negativpreis-Marktfenster', icon: 'fa-chart-line', color: '#0ea5e9'};
     }
+    if (normalized === 'direct_marketing_plan_evidence_gap') {
+        return {label: 'Planlücke', icon: 'fa-triangle-exclamation', color: '#ef4444'};
+    }
     if (normalized === 'eco_plus_export_candidate' || normalized === 'arbitrage_export_candidate') {
-        return executionContract && executionContract.active
+        return executionContract && (executionContract.active || executionContract.planned)
             ? {label: 'Verkaufsfenster', icon: 'fa-arrow-up', color: '#22c55e'}
             : {label: 'Verkaufskandidat', icon: 'fa-search', color: '#94a3b8'};
     }
@@ -2778,10 +3239,22 @@ function directMarketingWindowVisual(action, executionContract = null) {
     if (normalized === 'eco_plus_store_pv_candidate') {
         return {label: 'PV speichern', icon: 'fa-battery-half', color: '#f59e0b'};
     }
+    if (normalized === 'eco_plus_curve_charge_candidate') {
+        return {label: 'Kurvenladung im E3DC-AUTO-Rahmen', icon: 'fa-chart-line', color: '#8b5cf6'};
+    }
     if (normalized === 'keep_headroom' || normalized === 'arbitrage_keep_headroom') {
         return {label: 'Speicherplatz freihalten', icon: 'fa-battery-half', color: '#f59e0b'};
     }
     if (directMarketingIsHoldAction(normalized)) {
+        if (
+            executionContract
+            && executionContract.planned
+            && !executionContract.holdActive
+            && executionContract.targetState === 'HEADROOM_EXPORT'
+            && executionContract.exportBudgetW > 0
+        ) {
+            return {label: 'Speicherplatz schaffen', icon: 'fa-arrow-up', color: '#22c55e'};
+        }
         return executionContract && executionContract.holdActive
             ? {label: 'Speicherplatz halten', icon: 'fa-lock', color: '#f59e0b'}
             : {label: 'Speicherplatzreserve', icon: 'fa-battery-empty', color: '#f59e0b'};
@@ -2830,6 +3303,9 @@ function directMarketingWindowExecutionContract(windowEntry, monitor, plan, phys
             targetState: 'MARKET_WINDOW_ONLY',
             exportBudgetW: 0,
             chargeBudgetW: 0,
+            planned: false,
+            passivePlanHint: false,
+            passivePlanEffective: false,
             active: false,
             executionBlocked: false,
             executorGateBound: false,
@@ -2850,15 +3326,40 @@ function directMarketingWindowExecutionContract(windowEntry, monitor, plan, phys
             ? leftStart < rightEnd && leftEnd > rightStart
             : true
     );
-    const decision = decisions.find(item => {
+    const policyRowsForWindow = Array.isArray(plan.policy_timeline)
+        ? plan.policy_timeline.filter(item => {
+            if (!item || typeof item !== 'object') return false;
+            const policyStart = parseFloat(item.start_ts || 0) || 0;
+            const policyEnd = parseFloat(item.end_ts || 0) || 0;
+            return policyStart > 0
+                && policyEnd > policyStart
+                && overlaps(start, end, policyStart, policyEnd);
+        })
+        : [];
+    const slotDuration = start < 100000000000 ? 900 : 900000;
+    const atomicPolicyAmbiguous = end > start
+        && end - start <= slotDuration + 0.000001
+        && policyRowsForWindow.length > 1;
+    const decision = !atomicPolicyAmbiguous ? decisions.find(item => {
         const selected = item.selected_window && typeof item.selected_window === 'object'
             ? item.selected_window
             : {};
         if (String(selected.action || '').toLowerCase() !== action) return false;
+        const policyStart = parseFloat(item.start_ts || 0) || 0;
+        const policyEnd = parseFloat(item.end_ts || 0) || 0;
+        if (
+            start > 0
+            && end > start
+            && policyStart > 0
+            && policyEnd > policyStart
+            && !overlaps(start, end, policyStart, policyEnd)
+        ) {
+            return false;
+        }
         const selectedStart = parseFloat(selected.start_ts || item.start_ts || 0) || 0;
         const selectedEnd = parseFloat(selected.end_ts || item.end_ts || 0) || 0;
         return overlaps(start, end, selectedStart, selectedEnd);
-    }) || null;
+    }) || null : null;
     const selectedWindow = decision && decision.selected_window && typeof decision.selected_window === 'object'
         ? decision.selected_window
         : {};
@@ -2876,6 +3377,7 @@ function directMarketingWindowExecutionContract(windowEntry, monitor, plan, phys
     const planCommandsAllowed = Boolean(decision && decision.commands_allowed === true);
     const isExport = action === 'eco_plus_export_candidate' || action === 'arbitrage_export_candidate';
     const isPvStore = action === 'eco_plus_store_pv_candidate';
+    const isCurveCharge = action === 'eco_plus_curve_charge_candidate';
     const isHeadroom = directMarketingIsHoldAction(action);
     const plannedHeadroomHold = selected && executable && planCommandsAllowed && isHeadroom && (
         (targetState === 'HEADROOM_EXPORT' && storageBudget.headroom_hold_active === true)
@@ -2942,7 +3444,8 @@ function directMarketingWindowExecutionContract(windowEntry, monitor, plan, phys
         )
     );
     const physicalActionBound = Boolean(
-        physicalAction
+        !isCurveCharge
+        && physicalAction
         && physicalAction.hardwareEffect === true
         && physicalWindowMatches
         && physicalActionMatches
@@ -2982,6 +3485,8 @@ function directMarketingWindowExecutionContract(windowEntry, monitor, plan, phys
                 && (
                     String(item.dv_target_state || '').toUpperCase() === 'FORCE_CHARGE_PV'
                     || String(selectedWindow.action || '').toLowerCase() === 'eco_plus_store_pv_candidate'
+                    || String(item.dv_target_state || '').toUpperCase() === 'DV_CURVE_CHARGE'
+                    || String(selectedWindow.action || '').toLowerCase() === 'eco_plus_curve_charge_candidate'
                 );
         })
         .map(item => {
@@ -3009,6 +3514,23 @@ function directMarketingWindowExecutionContract(windowEntry, monitor, plan, phys
         0,
         parseFloat(monitor.headroom_next_start_ts || 0) || firstSelectedPvStoreTs
     );
+    const planned = Boolean(
+        selected
+        && executable
+        && planCommandsAllowed
+        && (
+            (isExport && targetState === 'FORCE_EXPORT' && exportBudgetW > 0)
+            || (isPvStore && targetState === 'FORCE_CHARGE_PV' && chargeBudgetW > 0)
+            || (isCurveCharge && targetState === 'DV_CURVE_CHARGE' && chargeBudgetW > 0)
+            || (
+                isHeadroom
+                && (
+                    plannedHeadroomHold
+                    || (targetState === 'HEADROOM_EXPORT' && exportBudgetW > 0)
+                )
+            )
+        )
+    );
     const active = effectiveRuntimeHoldActive || (
         selected && executable && commandsAllowed && (
             (isExport && targetState === 'FORCE_EXPORT' && exportBudgetW > 0)
@@ -3016,9 +3538,32 @@ function directMarketingWindowExecutionContract(windowEntry, monitor, plan, phys
             || (isHeadroom && targetState === 'HEADROOM_EXPORT' && exportBudgetW > 0)
         )
     );
-    const executionBlocked = (isExport || isPvStore || isHeadroom) && !active;
-    const candidateOnly = (isExport || isPvStore || isHeadroom) && !active;
-    const executionBlockReason = !physicalActionBound
+    const passivePlanHint = isCurveCharge && planned;
+    const passivePlanEffective = Boolean(
+        isCurveCharge
+        && physicalAction
+        && physicalAction.hardwareEffect === true
+        && physicalWindowMatches
+        && physicalActionName === action
+        && String(physicalAction.rawAction || '').toUpperCase() === 'DV_CURVE_CHARGE'
+    );
+    const nowMs = Date.now();
+    const applicableNow = windowEntry.current === true || Boolean(
+        windowStart > 0
+        && windowEnd > windowStart
+        && windowStart <= nowMs
+        && nowMs < windowEnd
+    );
+    const planAction = isExport || isPvStore || isCurveCharge || isHeadroom;
+    const executionBlocked = !isCurveCharge
+        && planAction
+        && !active
+        && !passivePlanEffective
+        && (!planned || applicableNow);
+    const candidateOnly = planAction && !active && !passivePlanEffective && !planned;
+    const executionBlockReason = isCurveCharge && planned
+        ? ''
+        : !physicalActionBound
         ? 'kein gebundener Hardwareeffekt'
         : (!executorGateBound && !effectiveRuntimeHoldActive
             ? String(executorGate.reason || 'Executor-Freigabe nicht gebunden')
@@ -3037,6 +3582,9 @@ function directMarketingWindowExecutionContract(windowEntry, monitor, plan, phys
         targetState,
         exportBudgetW,
         chargeBudgetW,
+        planned,
+        passivePlanHint,
+        passivePlanEffective,
         active,
         executionBlocked,
         executorGateBound,
@@ -3058,14 +3606,18 @@ function directMarketingWindowCanonicalBinding(windowEntry, monitor = null, plan
     const entryEnd = parseFloat(windowEntry.end_ts || 0) || 0;
     const validBounds = (start, end) => Number.isFinite(start) && Number.isFinite(end) && start > 0 && end > start;
     const ownId = String(windowEntry.window_id || windowEntry.export_plateau_id || '');
+    const exportPlateauAction = [
+        'eco_plus_export_candidate',
+        'arbitrage_export_candidate'
+    ].includes(action);
     const ownStart = parseFloat(
         windowEntry.source_window_start_ts
-        || windowEntry.export_plateau_origin_start_ts
+        || (exportPlateauAction ? windowEntry.export_plateau_origin_start_ts : 0)
         || 0
     ) || 0;
     const ownEnd = parseFloat(
         windowEntry.source_window_end_ts
-        || windowEntry.export_plateau_end_ts
+        || (exportPlateauAction ? windowEntry.export_plateau_end_ts : 0)
         || 0
     ) || 0;
     if (ownId || validBounds(ownStart, ownEnd)) {
@@ -3084,16 +3636,20 @@ function directMarketingWindowCanonicalBinding(windowEntry, monitor = null, plan
     const gateExecution = gate.execution_window && typeof gate.execution_window === 'object' ? gate.execution_window : {};
     const gateSelected = gate.selected_window && typeof gate.selected_window === 'object' ? gate.selected_window : {};
     const gateAction = String(gateWindow.action || gateExecution.action || gateSelected.action || '').toLowerCase();
+    const gateExportPlateauAction = [
+        'eco_plus_export_candidate',
+        'arbitrage_export_candidate'
+    ].includes(gateAction);
     const gateStart = parseFloat(
         gateWindow.source_window_start_ts
         || gateExecution.plan_window_start_ts
-        || gateWindow.export_plateau_origin_start_ts
+        || (gateExportPlateauAction ? gateWindow.export_plateau_origin_start_ts : 0)
         || 0
     ) || 0;
     const gateEnd = parseFloat(
         gateWindow.source_window_end_ts
         || gateExecution.plan_window_end_ts
-        || gateWindow.export_plateau_end_ts
+        || (gateExportPlateauAction ? gateWindow.export_plateau_end_ts : 0)
         || 0
     ) || 0;
     const gateId = String(
@@ -3133,6 +3689,18 @@ function directMarketingWindowCanonicalBinding(windowEntry, monitor = null, plan
         };
     }
     return {id: '', sourceStart: entryStart, sourceEnd: entryEnd, contract: windowEntry};
+}
+
+function directMarketingWindowClock(value) {
+    const raw = parseFloat(value);
+    if (!Number.isFinite(raw) || raw <= 0) return '--:--';
+    const ms = raw > 100000000000 ? raw : raw * 1000;
+    return new Intl.DateTimeFormat('de-DE', {
+        timeZone: 'Europe/Berlin',
+        hour: '2-digit',
+        minute: '2-digit',
+        hourCycle: 'h23'
+    }).format(new Date(ms));
 }
 
 function directMarketingWindowContractKey(windowEntry, binding = null, monitor = null, plan = null) {
@@ -3203,21 +3771,18 @@ function collectDirectMarketingWindows(report, monitor, plan) {
         Object.entries(windowEntry).forEach(([field, value]) => {
             if (value !== undefined && value !== null && value !== '') current[field] = value;
         });
+        if (windowEntry.current === true && entryStart > 0 && entryEnd > entryStart) {
+            current._current_slice_start_ts = entryStart;
+            current._current_slice_end_ts = entryEnd;
+        }
         if (binding.id) current._canonical_window_id = binding.id;
         if (binding.sourceStart > 0 && binding.sourceEnd > binding.sourceStart) {
-            if (windowEntry.current === true && (entryStart !== binding.sourceStart || entryEnd !== binding.sourceEnd)) {
-                current._current_slice_start_ts = entryStart;
-                current._current_slice_end_ts = entryEnd;
-            }
             current.start_ts = binding.sourceStart;
             current.end_ts = binding.sourceEnd;
             current._source_window_start_ts = binding.sourceStart;
             current._source_window_end_ts = binding.sourceEnd;
-            const canonical = binding.contract && typeof binding.contract === 'object' ? binding.contract : {};
-            if (canonical.start_t) current.start_t = canonical.start_t;
-            if (canonical.end_t) current.end_t = canonical.end_t;
-            if (!current.start_t) current.start_t = mobileStorageTime(binding.sourceStart);
-            if (!current.end_t) current.end_t = mobileStorageTime(binding.sourceEnd);
+            current.start_t = directMarketingWindowClock(binding.sourceStart);
+            current.end_t = directMarketingWindowClock(binding.sourceEnd);
         }
         if (wasCurrent || windowEntry.current === true) current.current = true;
         if (!current._source) current._source = source;
@@ -3255,6 +3820,515 @@ function directMarketingWindowBounds(item) {
     return {start, end, valid: start > 0 && end > start};
 }
 
+function directMarketingExactDisplayValue(value) {
+    if (value === null) return ['null'];
+    if (value === undefined) return ['undefined'];
+    if (Array.isArray(value)) {
+        return ['array', value.map(item => directMarketingExactDisplayValue(item))];
+    }
+    const type = typeof value;
+    if (type === 'number') {
+        if (Number.isNaN(value)) return ['number', 'NaN'];
+        if (!Number.isFinite(value)) return ['number', value > 0 ? 'Infinity' : '-Infinity'];
+        if (Object.is(value, -0)) return ['number', '-0'];
+        return ['number', value];
+    }
+    if (type === 'object') {
+        return ['object', Object.keys(value).sort().map(key => [
+            key,
+            directMarketingExactDisplayValue(value[key])
+        ])];
+    }
+    return [type, value];
+}
+
+function directMarketingNeutralHouseSupplyDisplaySignature(item) {
+    const entry = item && item.windowEntry && typeof item.windowEntry === 'object'
+        ? item.windowEntry
+        : {};
+    const execution = item && item.execution && typeof item.execution === 'object'
+        ? item.execution
+        : {};
+    if (
+        String(entry.action || '').toLowerCase() !== 'eco_plus_house_supply'
+        || String(entry.reason || '').toLowerCase() !== 'neutral_dv_slot'
+        || entry.current === true
+    ) {
+        return '';
+    }
+    const bounds = directMarketingWindowBounds(item);
+    if (!bounds.valid) return '';
+    const effectContract = String(entry.effect_contract || '').toUpperCase();
+    if (effectContract && effectContract !== 'LEGACY_AUTO_FRAME_PASSTHROUGH') return '';
+    const nonPassiveEntry = [
+        'selected',
+        'executable',
+        'commands_allowed',
+        'active',
+        'hold_active',
+        'runtime_hold_active',
+        'candidate_only',
+        'market_window_only'
+    ].some(field => entry[field] === true);
+    const nonPassiveExecution = [
+        'selected',
+        'executable',
+        'commandsAllowed',
+        'planned',
+        'passivePlanHint',
+        'passivePlanEffective',
+        'active',
+        'executionBlocked',
+        'executorGateBound',
+        'physicalActionBound',
+        'holdActive',
+        'runtimeHoldActive',
+        'candidateOnly',
+        'marketOnly'
+    ].some(field => execution[field] === true);
+    const targetState = String(execution.targetState || '').toUpperCase();
+    const nonPassiveBudget = ['exportBudgetW', 'chargeBudgetW'].some(field => {
+        const value = parseFloat(execution[field]);
+        return Number.isFinite(value) && Math.abs(value) > 0.000001;
+    });
+    const nonPassivePower = ['max_power_w', 'theoretical_kwh', 'export_segment_selected_wh'].some(field => {
+        const value = parseFloat(entry[field]);
+        return Number.isFinite(value) && Math.abs(value) > 0.000001;
+    });
+    if (
+        nonPassiveEntry
+        || nonPassiveExecution
+        || nonPassiveBudget
+        || nonPassivePower
+        || (targetState && !['NORMAL', 'PASSIVE_NORMAL', 'HOUSE_SUPPLY'].includes(targetState))
+        || directMarketingWindowPriceSignature(item) !== '[null,null,null,null]'
+    ) {
+        return '';
+    }
+    const reservationFields = [
+        'window_id',
+        'market_window_id',
+        'export_plateau_id',
+        'export_segment_id',
+        'profit_contract_id',
+        'execution_contract_id',
+        'reservation_id',
+        'reservation_reason',
+        'reserved',
+        'export_segment_selected_wh',
+        'export_segment_budget_wh',
+        'export_budget_w',
+        'charge_budget_w'
+    ];
+    const hasReservation = reservationFields.some(field => {
+        if (!Object.prototype.hasOwnProperty.call(entry, field)) return false;
+        const value = entry[field];
+        if (typeof value === 'boolean') return value;
+        if (typeof value === 'number') return Number.isFinite(value) && Math.abs(value) > 0.000001;
+        if (typeof value === 'string') return value.trim() !== '';
+        if (Array.isArray(value)) return value.length > 0;
+        return value && typeof value === 'object' && Object.keys(value).length > 0;
+    });
+    if (hasReservation) return '';
+
+    const ignoredEntryFields = new Set([
+        'start_ts',
+        'end_ts',
+        'start_t',
+        'end_t',
+        '_source_window_start_ts',
+        '_source_window_end_ts',
+        '_source',
+        'current',
+        'slot_count',
+        '_compacted_slot_count',
+        '_display_compaction'
+    ]);
+    const semanticEntry = Object.fromEntries(
+        Object.entries(entry).filter(([field]) => !ignoredEntryFields.has(field))
+    );
+    return JSON.stringify(directMarketingExactDisplayValue({
+        windowEntry: semanticEntry,
+        execution
+    }));
+}
+
+function directMarketingCompactNeutralHouseSupplyWindows(items) {
+    return (Array.isArray(items) ? items : []).reduce((result, item) => {
+        const previous = result[result.length - 1];
+        const itemSignature = directMarketingNeutralHouseSupplyDisplaySignature(item);
+        const previousSignature = directMarketingNeutralHouseSupplyDisplaySignature(previous);
+        if (!previous || !itemSignature || itemSignature !== previousSignature) {
+            result.push(item);
+            return result;
+        }
+        const previousBounds = directMarketingWindowBounds(previous);
+        const itemBounds = directMarketingWindowBounds(item);
+        if (
+            !previousBounds.valid
+            || !itemBounds.valid
+            || Math.abs(itemBounds.start - previousBounds.end) > 0.000001
+        ) {
+            result.push(item);
+            return result;
+        }
+        const entry = {...previous.windowEntry};
+        entry.end_ts = itemBounds.end;
+        entry.end_t = mobileStorageTime(itemBounds.end);
+        entry._compacted_slot_count = Math.max(
+            1,
+            parseInt(previous.windowEntry._compacted_slot_count || 1, 10)
+        ) + Math.max(1, parseInt(item.windowEntry._compacted_slot_count || 1, 10));
+        entry.slot_count = entry._compacted_slot_count;
+        entry._display_compaction = 'neutral_house_supply';
+        result[result.length - 1] = {
+            windowEntry: entry,
+            execution: {...previous.execution}
+        };
+        return result;
+    }, []);
+}
+
+function directMarketingPolicyBounds(policy) {
+    policy = policy && typeof policy === 'object' ? policy : {};
+    const start = parseFloat(policy.start_ts || 0) || 0;
+    const end = parseFloat(policy.end_ts || 0) || 0;
+    return {start, end, valid: start > 0 && end > start};
+}
+
+function directMarketingPolicyEnvelopeValid(plan) {
+    plan = plan && typeof plan === 'object' ? plan : {};
+    const mode = String(plan.mode || '').trim().toLowerCase().replace(/\+/g, '_plus');
+    const flags = plan.flags && typeof plan.flags === 'object' ? plan.flags : {};
+    return mode === 'eco_plus'
+        && plan.active === true
+        && plan.shadow === false
+        && String(plan.controller_owner || '').toLowerCase() === 'storage_manager'
+        && String(plan.plan_owner || '').toLowerCase() === 'direct_marketing:eco_plus'
+        && Number.isInteger(plan.owner_contract_version)
+        && plan.owner_contract_version === 1
+        && flags.commands_allowed === true;
+}
+
+function directMarketingPassiveNormalPolicyForSegment(plan, start, end) {
+    if (!directMarketingPolicyEnvelopeValid(plan)) return null;
+    const policies = (Array.isArray(plan.policy_timeline) ? plan.policy_timeline : []).filter(policy => {
+        const bounds = directMarketingPolicyBounds(policy);
+        return bounds.valid && bounds.start <= start && end <= bounds.end;
+    });
+    if (policies.length !== 1) return null;
+    const policy = policies[0];
+    const selectedWindow = policy.selected_window && typeof policy.selected_window === 'object'
+        ? policy.selected_window
+        : null;
+    const budget = policy.storage_budget && typeof policy.storage_budget === 'object'
+        ? policy.storage_budget
+        : {};
+    const binding = policy.passive_normal_binding && typeof policy.passive_normal_binding === 'object'
+        ? policy.passive_normal_binding
+        : {};
+    const effectContract = String(policy.effect_contract || binding.effect_contract || '').toUpperCase();
+    const policyBounds = directMarketingPolicyBounds(policy);
+    const selectedStart = parseFloat(selectedWindow && selectedWindow.start_ts || 0) || 0;
+    const selectedEnd = parseFloat(selectedWindow && selectedWindow.end_ts || 0) || 0;
+    const selectedWindowId = String(selectedWindow && selectedWindow.window_id || 'passive_normal_window');
+    const policyActionId = String(policy.policy_action_id || '');
+    const policySlotId = String(policy.policy_slot_id || '');
+    const bindingKeys = Object.keys(binding).sort();
+    const expectedBindingKeys = [
+        'action',
+        'end_ts',
+        'policy_action_id',
+        'policy_slot_id',
+        'schema',
+        'selected_end_ts',
+        'selected_start_ts',
+        'start_ts',
+        'window_id'
+    ].sort();
+    const sha256Id = value => /^sha256:[0-9a-f]{64}$/.test(String(value || ''));
+    const strongBinding = binding.schema === 'direct_marketing_passive_normal_binding_v1'
+        && String(selectedWindow && selectedWindow.action || '').toLowerCase() === 'eco_plus_house_supply'
+        && sha256Id(policyActionId)
+        && sha256Id(policySlotId)
+        && policyActionId === 'sha256:b2744e2b4da4e6d15c4ae3bdf7146bce8de245dfaff1025b3cbcffb678f1820d'
+        && binding.policy_action_id === policyActionId
+        && binding.policy_slot_id === policySlotId
+        && binding.action === 'eco_plus_house_supply'
+        && policyBounds.valid
+        && selectedStart > 0
+        && selectedEnd > selectedStart
+        && selectedStart <= start
+        && end <= selectedEnd
+        && binding.start_ts === policyBounds.start
+        && binding.end_ts === policyBounds.end
+        && binding.selected_start_ts === selectedStart
+        && binding.selected_end_ts === selectedEnd
+        && binding.window_id === selectedWindowId
+        && JSON.stringify(bindingKeys) === JSON.stringify(expectedBindingKeys)
+        && Math.abs(parseFloat(budget.charge_budget_w || 0) || 0) <= 0.000001
+        && Math.abs(parseFloat(budget.export_budget_w || 0) || 0) <= 0.000001;
+    const commonContract = policy.schema === 'direct_marketing_policy_v1'
+        && policy.blocked === false
+        && policy.commands_allowed === false
+        && String(policy.dv_target_state || '').toUpperCase() === 'NORMAL'
+        && String(policy.source_action || '').toLowerCase() === 'eco_plus_house_supply'
+        && Object.prototype.hasOwnProperty.call(policy, 'executable_action')
+        && policy.executable_action === null;
+    return commonContract && strongBinding
+        ? {policy, effectContract: effectContract || 'LEGACY_AUTO_FRAME_PASSTHROUGH'}
+        : null;
+}
+
+function directMarketingTimelineSlotCount(start, end) {
+    const slotDuration = start < 100000000000 ? 900 : 900000;
+    return Math.max(1, Math.round((end - start) / slotDuration));
+}
+
+function directMarketingTimelineClip(item, start, end) {
+    const slotCount = directMarketingTimelineSlotCount(start, end);
+    const sourceEntry = item && item.windowEntry && typeof item.windowEntry === 'object'
+        ? item.windowEntry
+        : {};
+    const currentSliceStart = parseFloat(sourceEntry._current_slice_start_ts || 0) || 0;
+    const currentSliceEnd = parseFloat(sourceEntry._current_slice_end_ts || 0) || 0;
+    const current = sourceEntry.current === true && (
+        !(currentSliceStart > 0 && currentSliceEnd > currentSliceStart)
+        || (currentSliceStart < end && start < currentSliceEnd)
+    );
+    return {
+        windowEntry: {
+            ...sourceEntry,
+            start_ts: start,
+            end_ts: end,
+            start_t: mobileStorageTime(start),
+            end_t: mobileStorageTime(end),
+            current,
+            slot_count: slotCount,
+            _compacted_slot_count: slotCount
+        },
+        execution: {...(item.execution || {})}
+    };
+}
+
+function directMarketingTimelineMergeSignature(item) {
+    const entry = item && item.windowEntry && typeof item.windowEntry === 'object'
+        ? item.windowEntry
+        : {};
+    const ignored = new Set([
+        'start_ts',
+        'end_ts',
+        'start_t',
+        'end_t',
+        'slot_count',
+        '_compacted_slot_count',
+        '_display_compaction'
+    ]);
+    const semanticEntry = Object.fromEntries(
+        Object.entries(entry).filter(([field]) => !ignored.has(field))
+    );
+    return JSON.stringify(directMarketingExactDisplayValue({
+        windowEntry: semanticEntry,
+        execution: item && item.execution && typeof item.execution === 'object'
+            ? item.execution
+            : {}
+    }));
+}
+
+function directMarketingTimelineEvidence(start, end, overlap = false) {
+    const slotCount = directMarketingTimelineSlotCount(start, end);
+    const blockReason = overlap
+        ? 'EVIDENCE_LIMIT: überlappende wirksame Fenster'
+        : 'EVIDENCE_LIMIT: keine eindeutige wirksame Slotprojektion';
+    return {
+        windowEntry: {
+            action: 'direct_marketing_plan_evidence_gap',
+            reason: overlap ? 'plan_projection_overlap' : 'plan_projection_gap',
+            start_ts: start,
+            end_ts: end,
+            start_t: mobileStorageTime(start),
+            end_t: mobileStorageTime(end),
+            slot_count: slotCount,
+            _compacted_slot_count: slotCount,
+            effect_contract: 'EVIDENCE_LIMIT'
+        },
+        execution: {
+            action: 'direct_marketing_plan_evidence_gap',
+            selected: false,
+            executable: false,
+            commandsAllowed: false,
+            planned: false,
+            passivePlanHint: false,
+            passivePlanEffective: false,
+            active: false,
+            executionBlocked: true,
+            executorGateBound: false,
+            physicalActionBound: false,
+            holdActive: false,
+            runtimeHoldActive: false,
+            effectiveUntilTs: 0,
+            candidateOnly: false,
+            marketOnly: false,
+            blockReason
+        }
+    };
+}
+
+function directMarketingCompleteOperationalTimeline(
+    operational,
+    decorated,
+    monitor,
+    plan,
+    physicalAction = null
+) {
+    plan = plan && typeof plan === 'object' ? plan : {};
+    const base = (Array.isArray(operational) ? operational : [])
+        .map((item, index) => ({item, index, bounds: directMarketingWindowBounds(item)}))
+        .filter(record => record.bounds.valid);
+    const rawPlanBounds = (Array.isArray(plan.windows) ? plan.windows : [])
+        .map(windowEntry => directMarketingWindowBounds({windowEntry}))
+        .filter(bounds => bounds.valid);
+    const policyBounds = directMarketingPolicyEnvelopeValid(plan)
+        ? (Array.isArray(plan.policy_timeline) ? plan.policy_timeline : [])
+            .filter(policy => policy && policy.schema === 'direct_marketing_policy_v1')
+            .map(directMarketingPolicyBounds)
+            .filter(bounds => bounds.valid)
+        : [];
+    const horizonBounds = rawPlanBounds.concat(policyBounds);
+    if (!horizonBounds.length) {
+        return base
+            .sort((left, right) => left.bounds.start - right.bounds.start || left.bounds.end - right.bounds.end)
+            .map(record => record.item);
+    }
+    const horizonStart = Math.min(...horizonBounds.map(bounds => bounds.start));
+    const horizonEnd = Math.max(...horizonBounds.map(bounds => bounds.end));
+    if (!(horizonStart > 0 && horizonEnd > horizonStart)) return base.map(record => record.item);
+
+    const boundaries = new Set([horizonStart, horizonEnd]);
+    const addBounds = bounds => {
+        if (bounds.valid && bounds.end > horizonStart && bounds.start < horizonEnd) {
+            boundaries.add(Math.max(horizonStart, bounds.start));
+            boundaries.add(Math.min(horizonEnd, bounds.end));
+        }
+    };
+    base.forEach(record => addBounds(record.bounds));
+    base.forEach(record => {
+        const entry = record.item && record.item.windowEntry && typeof record.item.windowEntry === 'object'
+            ? record.item.windowEntry
+            : {};
+        addBounds({
+            start: parseFloat(entry._current_slice_start_ts || 0) || 0,
+            end: parseFloat(entry._current_slice_end_ts || 0) || 0,
+            valid: (parseFloat(entry._current_slice_start_ts || 0) || 0) > 0
+                && (parseFloat(entry._current_slice_end_ts || 0) || 0)
+                    > (parseFloat(entry._current_slice_start_ts || 0) || 0)
+        });
+    });
+    policyBounds.forEach(addBounds);
+    (Array.isArray(decorated) ? decorated : []).forEach(item => {
+        if (item && item.execution && item.execution.marketOnly !== true) {
+            addBounds(directMarketingWindowBounds(item));
+        }
+    });
+    const points = Array.from(boundaries).sort((left, right) => left - right);
+    const atomic = [];
+    for (let index = 1; index < points.length; index += 1) {
+        const start = points[index - 1];
+        const end = points[index];
+        if (!(end > start)) continue;
+        const rawCovering = base
+            .filter(record => record.bounds.start <= start && end <= record.bounds.end);
+        if (rawCovering.length > 1) {
+            atomic.push({
+                item: directMarketingTimelineEvidence(start, end, true),
+                mergeKey: 'evidence:OVERLAPPING_EFFECTIVE_WINDOWS'
+            });
+            continue;
+        }
+        const covering = rawCovering
+            .map(record => {
+                const clipped = directMarketingTimelineClip(record.item, start, end);
+                clipped.execution = directMarketingWindowExecutionContract(
+                    clipped.windowEntry,
+                    monitor,
+                    plan,
+                    physicalAction
+                );
+                return {record, clipped};
+            })
+            .filter(candidate => (
+                candidate.clipped.execution.marketOnly !== true
+                && (
+                    candidate.clipped.execution.candidateOnly !== true
+                    || candidate.clipped.execution.active === true
+                )
+            ));
+        if (covering.length === 1) {
+            atomic.push({
+                item: covering[0].clipped,
+                mergeKey: `operational:${covering[0].record.index}:${directMarketingTimelineMergeSignature(covering[0].clipped)}`
+            });
+            continue;
+        }
+        const passive = directMarketingPassiveNormalPolicyForSegment(plan, start, end);
+        if (passive) {
+            const slotCount = directMarketingTimelineSlotCount(start, end);
+            const windowEntry = {
+                action: 'eco_plus_house_supply',
+                reason: 'policy_passive_house_supply',
+                start_ts: start,
+                end_ts: end,
+                start_t: mobileStorageTime(start),
+                end_t: mobileStorageTime(end),
+                slot_count: slotCount,
+                _compacted_slot_count: slotCount,
+                effect_contract: passive.effectContract,
+                _display_compaction: 'policy_passive_house_supply'
+            };
+            atomic.push({
+                item: {
+                    windowEntry,
+                    execution: directMarketingWindowExecutionContract(
+                        windowEntry,
+                        monitor,
+                        plan,
+                        physicalAction
+                    )
+                },
+                mergeKey: `passive:${passive.effectContract}`
+            });
+            continue;
+        }
+        atomic.push({
+            item: directMarketingTimelineEvidence(start, end, false),
+            mergeKey: 'evidence:NO_EFFECTIVE_WINDOW_CONTRACT'
+        });
+    }
+
+    const compacted = atomic.reduce((result, segment) => {
+        const previous = result[result.length - 1];
+        const previousBounds = previous ? directMarketingWindowBounds(previous.item) : {valid: false};
+        const segmentBounds = directMarketingWindowBounds(segment.item);
+        if (
+            !previous
+            || previous.mergeKey !== segment.mergeKey
+            || !previousBounds.valid
+            || !segmentBounds.valid
+            || previousBounds.end !== segmentBounds.start
+        ) {
+            result.push(segment);
+            return result;
+        }
+        previous.item = directMarketingTimelineClip(
+            previous.item,
+            previousBounds.start,
+            segmentBounds.end
+        );
+        return result;
+    }, []);
+    return directMarketingCompactNeutralHouseSupplyWindows(compacted.map(segment => segment.item));
+}
+
 function directMarketingWindowPriceSignature(item) {
     const entry = item && item.windowEntry && typeof item.windowEntry === 'object'
         ? item.windowEntry
@@ -3282,7 +4356,52 @@ function directMarketingNeutralHoldProjection(item) {
             ['policy_charge_block_wait', 'direct_marketing_charge_block_wait', 'charge_block_wait'].includes(action)
             || reason === 'neutral dv wait slot'
             || reason === 'headroom reservation hold'
-        );
+    );
+}
+
+function directMarketingHoldCompactionSignature(item, includeSlotWindowId = true) {
+    const entry = item && item.windowEntry && typeof item.windowEntry === 'object'
+        ? item.windowEntry
+        : {};
+    const execution = item && item.execution && typeof item.execution === 'object'
+        ? item.execution
+        : {};
+    return JSON.stringify(directMarketingExactDisplayValue({
+        action: String(entry.action || '').toLowerCase(),
+        reason: String(entry.reason || '').toLowerCase(),
+        windowId: includeSlotWindowId ? String(entry.window_id || '') : '',
+        businessWindowId: String(entry.business_window_id || ''),
+        sourceWindowId: String(
+            entry.source_window_id
+            || entry.headroom_source_window_id
+            || ''
+        ),
+        marketWindowId: String(entry.market_window_id || ''),
+        exportPlateauId: String(entry.export_plateau_id || ''),
+        exportSegmentId: String(entry.export_segment_id || ''),
+        reservationId: String(entry.reservation_id || ''),
+        targetState: String(execution.targetState || '').toUpperCase(),
+        selected: execution.selected === true,
+        executable: execution.executable === true,
+        commandsAllowed: execution.commandsAllowed === true,
+        planned: execution.planned === true,
+        passivePlanHint: execution.passivePlanHint === true,
+        passivePlanEffective: execution.passivePlanEffective === true,
+        active: execution.active === true,
+        executionBlocked: execution.executionBlocked === true,
+        physicalActionBound: execution.physicalActionBound === true,
+        executorGateBound: execution.executorGateBound === true,
+        holdActive: execution.holdActive === true,
+        runtimeHoldActive: execution.runtimeHoldActive === true,
+        candidateOnly: execution.candidateOnly === true,
+        exportBudgetW: Number.isFinite(parseFloat(execution.exportBudgetW))
+            ? parseFloat(execution.exportBudgetW)
+            : null,
+        chargeBudgetW: Number.isFinite(parseFloat(execution.chargeBudgetW))
+            ? parseFloat(execution.chargeBudgetW)
+            : null,
+        blockReason: String(execution.blockReason || '')
+    }));
 }
 
 function directMarketingMergeHoldItems(left, right, keepPreferredBounds = false) {
@@ -3321,8 +4440,13 @@ function directMarketingMergeHoldItems(left, right, keepPreferredBounds = false)
         entry.end_t = preferred.windowEntry.end_t || mobileStorageTime(entry.end_ts);
     }
     entry.current = left.windowEntry.current === true || right.windowEntry.current === true;
-    entry._compacted_slot_count = Math.max(1, parseInt(left.windowEntry._compacted_slot_count || 1, 10))
-        + Math.max(1, parseInt(right.windowEntry._compacted_slot_count || 1, 10));
+    const mergedBounds = directMarketingWindowBounds({windowEntry: entry});
+    const slotDuration = mergedBounds.start < 100000000000 ? 900 : 900000;
+    entry._compacted_slot_count = mergedBounds.valid
+        ? Math.max(1, Math.round((mergedBounds.end - mergedBounds.start) / slotDuration))
+        : Math.max(1, parseInt(left.windowEntry._compacted_slot_count || 1, 10))
+            + Math.max(1, parseInt(right.windowEntry._compacted_slot_count || 1, 10));
+    entry.slot_count = entry._compacted_slot_count;
     const leftExecution = left.execution || {};
     const rightExecution = right.execution || {};
     const blockReasons = [leftExecution.blockReason, rightExecution.blockReason]
@@ -3337,6 +4461,9 @@ function directMarketingMergeHoldItems(left, right, keepPreferredBounds = false)
             selected: leftExecution.selected === true || rightExecution.selected === true,
             executable: leftExecution.executable === true || rightExecution.executable === true,
             commandsAllowed: leftExecution.commandsAllowed === true || rightExecution.commandsAllowed === true,
+            planned: leftExecution.planned === true || rightExecution.planned === true,
+            passivePlanHint: leftExecution.passivePlanHint === true || rightExecution.passivePlanHint === true,
+            passivePlanEffective: leftExecution.passivePlanEffective === true || rightExecution.passivePlanEffective === true,
             active: leftExecution.active === true || rightExecution.active === true,
             holdActive: leftExecution.holdActive === true || rightExecution.holdActive === true,
             runtimeHoldActive: leftExecution.runtimeHoldActive === true || rightExecution.runtimeHoldActive === true,
@@ -3365,6 +4492,9 @@ function directMarketingCompactHoldWindows(items) {
         const itemBounds = directMarketingWindowBounds(item);
         const matchIndex = deduplicated.findIndex(existing => {
             if (!directMarketingIsHoldAction(existing && existing.windowEntry && existing.windowEntry.action)) return false;
+            const itemAction = String(item && item.windowEntry && item.windowEntry.action || '').toLowerCase();
+            const existingAction = String(existing && existing.windowEntry && existing.windowEntry.action || '').toLowerCase();
+            if (!itemAction || itemAction !== existingAction) return false;
             const existingBounds = directMarketingWindowBounds(existing);
             if (!itemBounds.valid || !existingBounds.valid) return false;
             if (itemBounds.start >= existingBounds.end || existingBounds.start >= itemBounds.end) return false;
@@ -3374,9 +4504,13 @@ function directMarketingCompactHoldWindows(items) {
             const exact = itemBounds.start === existingBounds.start && itemBounds.end === existingBounds.end;
             const itemContained = itemBounds.start >= existingBounds.start && itemBounds.end <= existingBounds.end;
             const existingContained = existingBounds.start >= itemBounds.start && existingBounds.end <= itemBounds.end;
-            return (exact && samePrice)
+            const sameContract = directMarketingHoldCompactionSignature(item)
+                === directMarketingHoldCompactionSignature(existing);
+            return sameContract && (
+                (exact && samePrice)
                 || (directMarketingNeutralHoldProjection(item) && itemContained && (itemUnpriced || samePrice))
-                || (directMarketingNeutralHoldProjection(existing) && existingContained && (existingUnpriced || samePrice));
+                || (directMarketingNeutralHoldProjection(existing) && existingContained && (existingUnpriced || samePrice))
+            );
         });
         if (matchIndex < 0) {
             deduplicated.push(item);
@@ -3398,27 +4532,10 @@ function directMarketingCompactHoldWindows(items) {
         }
         const previousBounds = directMarketingWindowBounds(previous);
         const itemBounds = directMarketingWindowBounds(item);
-        const previousExecution = previous.execution || {};
-        const itemExecution = item.execution || {};
-        const sameContract = JSON.stringify([
-            directMarketingWindowPriceSignature(previous),
-            String(previous.windowEntry.reason || '').toLowerCase(),
-            previousExecution.active === true,
-            previousExecution.holdActive === true,
-            previousExecution.runtimeHoldActive === true,
-            previousExecution.candidateOnly === true,
-            previousExecution.commandsAllowed === true,
-            String(previousExecution.blockReason || '')
-        ]) === JSON.stringify([
-            directMarketingWindowPriceSignature(item),
-            String(item.windowEntry.reason || '').toLowerCase(),
-            itemExecution.active === true,
-            itemExecution.holdActive === true,
-            itemExecution.runtimeHoldActive === true,
-            itemExecution.candidateOnly === true,
-            itemExecution.commandsAllowed === true,
-            String(itemExecution.blockReason || '')
-        ]);
+        const sameContract = directMarketingWindowPriceSignature(previous)
+            === directMarketingWindowPriceSignature(item)
+            && directMarketingHoldCompactionSignature(previous, false)
+                === directMarketingHoldCompactionSignature(item, false);
         if (
             previousBounds.valid
             && itemBounds.valid
@@ -3799,6 +4916,13 @@ function directMarketingWindowRowHtml(windowEntry, economics, executionContract 
     const spread = directMarketingProfitText(directMarketingSpreadForAction(windowEntry.action, economics));
     const spreadLabel = directMarketingSpreadLabelForAction(windowEntry.action);
     const reason = directMarketingReasonLabel(windowEntry.reason);
+    const compactedSlotCount = Math.max(
+        1,
+        parseInt(windowEntry._compacted_slot_count || windowEntry.slot_count || 1, 10)
+    );
+    const compactedSlots = compactedSlotCount > 1
+        ? compactedSlotCount + ' zusammenhängende Viertelstunden'
+        : '';
     const budget = directMarketingSegmentBudgetText(windowEntry);
     const effectiveUntil = executionContract.holdActive && executionContract.effectiveUntilTs
         ? mobileStorageTime(executionContract.effectiveUntilTs)
@@ -3835,25 +4959,41 @@ function directMarketingWindowRowHtml(windowEntry, economics, executionContract 
             : '');
     const executionState = executionContract.marketOnly
         ? 'reines Marktfenster; PV_STORE und Exportfreigabe werden getrennt geplant'
+        : executionContract.executionBlocked
+        ? 'aktuell nicht ausgeführt: ' + (executionContract.blockReason || 'keine gebundene Runtime-Ausführung')
         : executionContract.holdActive
         ? (executionContract.runtimeHoldActive ? 'Regelwirkung aktiv' : 'zur Ausführung eingeplant')
         : executionContract.active
         ? 'zur Ausführung freigegeben'
-        : executionContract.executionBlocked
-        ? 'aktuell nicht ausgeführt: ' + (executionContract.blockReason || 'keine gebundene Runtime-Ausführung')
+        : executionContract.passivePlanEffective
+        ? 'Kurvenladung im E3DC-AUTO-Rahmen bestätigt'
+        : executionContract.passivePlanHint && executionContract.planned
+        ? 'Kurvenladung im E3DC-AUTO-Rahmen eingeplant'
+        : executionContract.planned
+        ? 'zur Ausführung eingeplant'
         : (executionContract.candidateOnly ? 'nicht freigegeben: ' + (executionContract.blockReason || 'keine ausführbare Planbindung') : '');
-    const detailParts = [holdEffect, planInterval, price, energy, marginSummary, spread ? spreadLabel + ' ' + spread : '', reason, exportConstraint, budget, executionState].filter(Boolean);
+    const detailParts = [holdEffect, planInterval, price, energy, marginSummary, spread ? spreadLabel + ' ' + spread : '', reason, compactedSlots, exportConstraint, budget, executionState].filter(Boolean);
     const priceBreakdown = directMarketingPriceBreakdownHtml(windowEntry, economics);
     const titleParts = [
         visual.label + ': ' + (start || '--') + ' bis ' + (end || '--'),
         actionDetail,
         ...detailParts
     ].filter(Boolean);
+    const passiveHouseSupply = String(windowEntry.action || '').toLowerCase()
+        === 'eco_plus_house_supply'
+        && executionContract.executionBlocked !== true
+        && executionContract.candidateOnly !== true;
     const currentBadge = windowEntry.current === true || executionContract.runtimeHoldActive
         ? (executionContract.runtimeHoldActive
             ? '<span class="badge bg-warning bg-opacity-10 text-warning border border-warning border-opacity-25">jetzt wirksam</span>'
+            : executionContract.passivePlanEffective
+            ? '<span class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25">AUTO-Rahmen bestätigt</span>'
+            : executionContract.passivePlanHint && executionContract.planned
+            ? '<span class="badge bg-info bg-opacity-10 text-info border border-info border-opacity-25">AUTO-Kurvenrahmen geplant</span>'
             : executionContract.active
             ? '<span class="badge bg-success bg-opacity-10 text-success border border-success border-opacity-25">aktuell und freigegeben</span>'
+            : passiveHouseSupply
+            ? '<span class="badge bg-info bg-opacity-10 text-info border border-info border-opacity-25">E3DC-AUTO aktiv</span>'
             : '<span class="badge bg-secondary bg-opacity-10 text-secondary border border-secondary border-opacity-25">aktuell nicht ausgeführt</span>')
         : '';
     const displayStart = executionContract.runtimeHoldActive ? 'jetzt' : start;
@@ -3993,8 +5133,17 @@ function renderDirectMarketingCurveSection(data = null) {
             execution: directMarketingWindowExecutionContract(windowEntry, monitor, plan, physicalAction)
         }));
         const marketWindows = decorated.filter(item => item.execution.marketOnly);
-        const operational = directMarketingCompactHoldWindows(
-            decorated.filter(item => !item.execution.marketOnly && (!item.execution.candidateOnly || item.execution.active))
+        const operationalBase = directMarketingCompactNeutralHouseSupplyWindows(
+            directMarketingCompactHoldWindows(
+                decorated.filter(item => !item.execution.marketOnly && (!item.execution.candidateOnly || item.execution.active))
+            )
+        );
+        const operational = directMarketingCompleteOperationalTimeline(
+            operationalBase,
+            decorated,
+            monitor,
+            plan,
+            physicalAction
         );
         const diagnostic = directMarketingPruneCoveredHoldDiagnostics(
             directMarketingCompactHoldWindows(
@@ -6989,7 +8138,18 @@ function livePvSourceInfo(data) {
     data = data || {};
     const monitor = getDirectMarketingMonitor(data) || {};
     const totalRaw = e3dcFiniteNumberOrNull(data.pv_total_w ?? data.pv);
-    const externalRaw = e3dcFiniteNumberOrNull(data.pv_external_w ?? monitor.pv_external_ac_w);
+    const hasExternalPayloadValue = Object.prototype.hasOwnProperty.call(data, 'pv_external_w')
+        && data.pv_external_w !== null
+        && data.pv_external_w !== '';
+    const externalPayloadRaw = hasExternalPayloadValue
+        ? e3dcFiniteNumberOrNull(data.pv_external_w)
+        : null;
+    const externalRaw = externalPayloadRaw !== null
+        ? externalPayloadRaw
+        : e3dcFiniteNumberOrNull(monitor.pv_external_ac_w);
+    const e3dcReportedRaw = Object.prototype.hasOwnProperty.call(data, 'pv_e3dc_w')
+        ? e3dcFiniteNumberOrNull(data.pv_e3dc_w)
+        : null;
     const hasMeasurementValidity = Object.prototype.hasOwnProperty.call(data, 'pv_external_power_valid');
     const measurementValid = data.pv_external_power_valid === true
         || (!hasMeasurementValidity && externalRaw !== null);
@@ -7000,6 +8160,19 @@ function livePvSourceInfo(data) {
     const external = measurementValid && externalRaw !== null
         ? Math.max(0, Math.min(externalRaw, total))
         : 0;
+    const legacyBalanceToleranceW = totalRaw !== null
+        ? Math.max(75, Math.abs(totalRaw) * 0.05)
+        : 75;
+    const legacyExternalEvidence = !hasMeasurementValidity
+        && hasExternalPayloadValue
+        && externalPayloadRaw !== null
+        && externalPayloadRaw > 20
+        && totalRaw !== null
+        && totalRaw >= 0
+        && e3dcReportedRaw !== null
+        && e3dcReportedRaw >= 0
+        && totalRaw - e3dcReportedRaw > 20
+        && Math.abs(totalRaw - (e3dcReportedRaw + externalPayloadRaw)) <= legacyBalanceToleranceW;
     // Eine Quelle, eine Bilanz: der E3/DC-Anteil ist stets der Rest zum bereits
     // einmal enthaltenen externen Anteil und wird nicht nochmals addiert.
     const e3dc = Math.max(0, total - external);
@@ -7015,6 +8188,7 @@ function livePvSourceInfo(data) {
         measurementValid,
         measurementValidityReported: hasMeasurementValidity,
         measurementSource,
+        legacyExternalEvidence,
         topologyPresent,
         topologyValid,
         topologySource: String(data.pv_external_topology_source || 'none'),
@@ -7053,18 +8227,20 @@ function externalPvTopologyVisual(data, nodeState = {}) {
     const pv = livePvSourceInfo(data);
     const configured = nodeState.configured === true;
     const controlAvailable = nodeState.controlAvailable === true;
-    const positiveLiveEvidence = pv.measurementValidityReported
+    const positiveLiveEvidence = (
+        pv.measurementValidityReported
         && pv.measurementValid
         && pv.external > 20
-        && pv.measurementSource === 'e3dc_add_power';
+        && pv.measurementSource === 'e3dc_add_power'
+    ) || pv.legacyExternalEvidence;
     return {
         visible: pv.topologyPresent || configured || positiveLiveEvidence,
         measurementValid: pv.measurementValid,
         valueText: pv.measurementValid ? flowPlainWatts(pv.external) : '--',
         controlAvailable,
         positiveLiveEvidence,
-        topologySource: pv.topologySource,
-        evidenceState: pv.topologyEvidenceState
+        topologySource: pv.legacyExternalEvidence ? 'legacy_power_balance' : pv.topologySource,
+        evidenceState: pv.legacyExternalEvidence ? 'compatible_payload' : pv.topologyEvidenceState
     };
 }
 
@@ -7225,6 +8401,7 @@ function updateEnergyFlowAuxInverterShellyBadge(data, container = document.getEl
     });
     const capable = visual.visible;
     node.hidden = !capable;
+    setEnergyFlowGenerationAggregateVisible(container, capable);
     container.querySelectorAll('#flow-line-external-pv, #flow-dot-external-pv').forEach(line => {
         line.style.display = capable ? '' : 'none';
     });
@@ -7659,9 +8836,29 @@ function renderDirectMarketingForecastChart(data = {}, options = {}) {
         }
         return view;
     }
-    const pointTimestamps = view.slots.map(slot => slot.startTs)
-        .concat([view.slots[view.slots.length - 1].endTs]);
-    const extend = values => values.concat([null]);
+    const pointTimestamps = Array.from(new Set(
+        view.slots.map(slot => slot.startTs)
+            .concat(view.slots
+                .filter(slot => slot.plannedRole === 'projection' && Number.isFinite(slot.projectionEffectiveStartTs))
+                .map(slot => slot.projectionEffectiveStartTs))
+            .concat([view.slots[view.slots.length - 1].endTs])
+    )).sort((left, right) => left - right);
+    const slotIndexForTimestamp = timestamp => view.slots.findIndex(slot => slot.startTs <= timestamp && timestamp < slot.endTs);
+    const seriesForPoints = (values, projectionOnly = false) => pointTimestamps.map(timestamp => {
+        const slotIndex = slotIndexForTimestamp(timestamp);
+        if (slotIndex < 0) return null;
+        const slot = view.slots[slotIndex];
+        if (projectionOnly && !(slot.plannedRole === 'projection'
+            && Number.isFinite(slot.projectionEffectiveStartTs)
+            && Number.isFinite(slot.projectionEffectiveDurationS)
+            && timestamp >= slot.projectionEffectiveStartTs
+            && timestamp < slot.projectionEffectiveStartTs + slot.projectionEffectiveDurationS * 1000)) return null;
+        return values[slotIndex] ?? null;
+    });
+    const socForPoints = pointTimestamps.map(timestamp => {
+        const slotIndex = slotIndexForTimestamp(timestamp);
+        return slotIndex >= 0 ? view.slots[slotIndex].socStartPct : view.slots[view.slots.length - 1].socEndPct;
+    });
     const isDark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
     const tickColor = isDark ? '#adb5bd' : '#6c757d';
     const gridColor = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.07)';
@@ -7677,11 +8874,12 @@ function renderDirectMarketingForecastChart(data = {}, options = {}) {
     _directMarketingForecastChartInstance = new Chart(canvas, {
         type: 'line',
         data: {labels: timeContext.labels, datasets: [
-            ...(view.state === 'complete' ? [{label: 'DV-SoC-Prognose', data: [view.slots[0].socStartPct].concat(view.slots.map(slot => slot.socEndPct)), borderColor: '#8b5cf6', backgroundColor: 'rgba(139,92,246,0.08)', borderWidth: 2.5, pointRadius: 0, tension: 0, stepped: 'after', yAxisID: 'ySoc', order: 1}] : []),
+            ...(view.state === 'complete' ? [{label: 'DV-SoC-Prognose', data: socForPoints, borderColor: '#8b5cf6', backgroundColor: 'rgba(139,92,246,0.08)', borderWidth: 2.5, pointRadius: 0, tension: 0, stepped: 'after', yAxisID: 'ySoc', order: 1}] : []),
             ...(currentSoc.index >= 0 ? [{label: 'Aktueller SoC (Messwert)', data: currentSoc.data, showLine: false, borderColor: '#22c55e', backgroundColor: '#22c55e', pointRadius: 6, pointHoverRadius: 8, pointStyle: 'circle', yAxisID: 'ySoc', order: 0}] : []),
-            {label: 'PV speichern (Plan)', data: extend(view.series.pvStoreW.map(value => value === null ? null : value / 1000)), type: 'bar', borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.38)', borderWidth: 1, borderSkipped: false, yAxisID: 'yPower', order: 3},
-            {label: 'Wirtschaftlicher Export (Plan)', data: extend(view.series.economicExportW.map(value => value === null ? null : value / 1000)), type: 'bar', borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.38)', borderWidth: 1, borderSkipped: false, yAxisID: 'yPower', order: 3},
-            {label: 'Laden gesperrt / Halten (Plan)', data: extend(view.series.chargeBlock), type: 'bar', borderColor: '#f59e0b', backgroundColor: 'rgba(245,158,11,0.16)', borderWidth: 0, borderSkipped: false, barPercentage: 1, categoryPercentage: 1, yAxisID: 'yState', order: 10}
+            {label: 'PV speichern (Plan)', data: seriesForPoints(view.series.pvStoreW).map(value => value === null ? null : value / 1000), type: 'bar', borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.38)', borderWidth: 1, borderSkipped: false, yAxisID: 'yPower', order: 3},
+            {label: 'Wirtschaftlicher Export (Plan)', data: seriesForPoints(view.series.economicExportW).map(value => value === null ? null : value / 1000), type: 'bar', borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.38)', borderWidth: 1, borderSkipped: false, yAxisID: 'yPower', order: 3},
+            {label: 'Headroom-Export (Prognose, keine Ausführung)', data: seriesForPoints(view.series.headroomProjectionW, true).map(value => value === null ? null : value / 1000), type: 'bar', borderColor: '#06b6d4', backgroundColor: 'rgba(6,182,212,0.28)', borderWidth: 1, borderDash: [4, 3], borderSkipped: false, yAxisID: 'yPower', order: 4},
+            {label: 'Laden gesperrt / Halten (Plan)', data: seriesForPoints(view.series.chargeBlock), type: 'bar', borderColor: '#f59e0b', backgroundColor: 'rgba(245,158,11,0.16)', borderWidth: 0, borderSkipped: false, barPercentage: 1, categoryPercentage: 1, yAxisID: 'yState', order: 10}
         ]},
         options: {
             responsive: true, maintainAspectRatio: false, animation: false,
@@ -11732,10 +12930,15 @@ function _renderStorageCurveChart(socPoints) {
             if (actionType === 'pv_store' && (slot.action === 'PV_STORE' || slot.action === 'DV_CURVE_CHARGE')) {
                 return slot.plannedW && slot.plannedW > 0 ? slot.plannedW / 1000 : null;
             }
-            if (actionType === 'export' && (slot.action === 'ECONOMIC_EXPORT' || slot.action === 'HEADROOM_EXPORT')) {
+            if (actionType === 'export' && slot.action === 'ECONOMIC_EXPORT') {
                 return slot.plannedW && slot.plannedW > 0 ? slot.plannedW / 1000 : null;
             }
             return null;
+        };
+        const interpHeadroomProjection = ts => {
+            const slot = dvSlots.find(s => ts >= s.startTs && ts < s.endTs);
+            if (!slot || slot.plannedRole !== 'projection' || slot.action !== 'HEADROOM_EXPORT') return null;
+            return Number.isFinite(slot.projectedW) && slot.projectedW >= 0 ? slot.projectedW / 1000 : null;
         };
         const interpDvHold = ts => {
             const slot = dvSlots.find(s => ts >= s.startTs && ts < s.endTs);
@@ -11745,6 +12948,7 @@ function _renderStorageCurveChart(socPoints) {
         };
         const dvPvStoreData = sortedTs.map(ts => interpDvKw('pv_store', ts));
         const dvExportData = sortedTs.map(ts => interpDvKw('export', ts));
+        const dvHeadroomProjectionData = sortedTs.map(ts => interpHeadroomProjection(ts));
         const dvHoldData = sortedTs.map(ts => interpDvHold(ts));
 
         // Jetzt-Linie: Index des ersten Timestamps >= nowMs
@@ -11879,6 +13083,18 @@ function _renderStorageCurveChart(socPoints) {
                             order: 7,
                         },
                         {
+                            label: 'DV: Headroom-Export (Prognose, keine Ausführung)',
+                            data: dvHeadroomProjectionData,
+                            type: 'bar',
+                            borderColor: '#06b6d4',
+                            backgroundColor: 'rgba(6,182,212,0.26)',
+                            borderWidth: 1,
+                            borderDash: [4, 3],
+                            borderSkipped: false,
+                            yAxisID: 'yPV',
+                            order: 8,
+                        },
+                        {
                             label: 'DV: Laden gesperrt / Halten',
                             data: dvHoldData,
                             type: 'bar',
@@ -11935,6 +13151,7 @@ function _renderStorageCurveChart(socPoints) {
                                 if (label === 'PV-Prognose (kW)') return 'PV:   ' + (ctx.raw !== null ? ctx.raw.toFixed(2) + ' kW' : '--');
                                 if (label === 'DV: PV speichern (Plan)') return 'DV PV speichern: ' + (ctx.raw !== null ? Number(ctx.raw).toFixed(2) + ' kW' : '--');
                                 if (label === 'DV: Wirtschaftl. Export (Plan)') return 'DV Export: ' + (ctx.raw !== null ? Number(ctx.raw).toFixed(2) + ' kW' : '--');
+                                if (label === 'DV: Headroom-Export (Prognose, keine Ausführung)') return 'DV Headroom-Prognose: ' + (ctx.raw !== null ? Number(ctx.raw).toFixed(2) + ' kW · keine Ausführung' : '--');
                                 if (label === 'DV: Laden gesperrt / Halten') return 'DV: Laden gesperrt / Halten';
                                 if (label === 'Zwischenziel') return 'Zwischenziel: ' + (ctx.raw !== null ? ctx.raw.toFixed(1) + '%' : '--');
                                 return '';
@@ -12074,10 +13291,15 @@ wrap.style.display = '';
     };
     const interpDvExport = ts => {
         const slot = rawSlots.find(s => ts >= s.startTs && ts < s.endTs);
-        if (slot && slot.plannedAllowed && (slot.action === 'ECONOMIC_EXPORT' || slot.action === 'HEADROOM_EXPORT')) {
+        if (slot && slot.plannedAllowed && slot.action === 'ECONOMIC_EXPORT') {
             return slot.plannedW && slot.plannedW > 0 ? slot.plannedW / 1000 : null;
         }
         return null;
+    };
+    const interpHeadroomProjection = ts => {
+        const slot = rawSlots.find(s => ts >= s.startTs && ts < s.endTs);
+        if (!slot || slot.plannedRole !== 'projection' || slot.action !== 'HEADROOM_EXPORT') return null;
+        return Number.isFinite(slot.projectedW) && slot.projectedW >= 0 ? slot.projectedW / 1000 : null;
     };
     const interpDvHold = ts => {
         const slot = rawSlots.find(s => ts >= s.startTs && ts < s.endTs);
@@ -12092,6 +13314,7 @@ wrap.style.display = '';
         : sortedTs.map(() => null);
     const pvStoreKw = sortedTs.map(ts => interpDvPvStore(ts));
     const exportKw = sortedTs.map(ts => interpDvExport(ts));
+    const headroomProjectionKw = sortedTs.map(ts => interpHeadroomProjection(ts));
     const chargeBlock = sortedTs.map(ts => interpDvHold(ts));
 
     // Jetzt-Linie: Index des ersten Timestamps >= nowMs
@@ -12161,6 +13384,18 @@ wrap.style.display = '';
                     borderSkipped: false,
                     yAxisID: 'yPower',
                     order: 3
+                },
+                {
+                    label: 'Headroom-Export (Prognose, keine Ausführung)',
+                    data: headroomProjectionKw,
+                    type: 'bar',
+                    borderColor: '#06b6d4',
+                    backgroundColor: 'rgba(6,182,212,0.28)',
+                    borderWidth: 1,
+                    borderDash: [4, 3],
+                    borderSkipped: false,
+                    yAxisID: 'yPower',
+                    order: 4
                 },
                 {
                     label: 'Laden gesperrt / Halten (Plan)',

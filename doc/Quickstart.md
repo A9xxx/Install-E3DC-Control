@@ -2,9 +2,19 @@
 
 Diese Anleitung fasst die schnellsten Schritte zusammen, um E3DC-Control auf einem frischen Raspberry Pi OS (oder ähnlichem Debian-System) zu installieren.
 
-Aktueller Stable-Stand: `v5.4.4e`.
+Aktueller Stable-Stand: `v5.4.4f`.
 
-5.4.4e führt das normale Bare-Metal-Update vollständig mit dem
+5.4.4f berücksichtigt in `PV-Kurve ruhig` belegten physischen PV-Überschuss
+bereits vor der sanften Anfahrrampe. Speicherbudget, physischer Überschuss,
+gemeinsames Wallboxbudget sowie Hausanschluss-, Fahrzeug- und Hardwaregrenzen
+bleiben wirksam. Die Gerätefamilie `Multi` erzeugt ohne positive Konfiguration
+oder frische Detaildaten keinen zweiten Ladepunkt; ein ausdrücklich
+konfiguriertes WB2-`Aus` gewinnt vor alten Detail-, Slot-, Typ- und
+Prioritätswerten. Die
+Speicheransicht benennt fehlende oder planfremde SoC-Prognosen und den
+Lebenszyklus einer ersetzenden Direktvermarktungsaktion eindeutig.
+
+5.4.4f führt das normale Bare-Metal-Update vollständig mit dem
 heruntergeladenen Ziel-Updater aus: Vollbackup bei laufenden Diensten, kurze
 ruhende Nachsicherung, Releaseprojektion, Reparatur bekannter Rechte und
 Dienstneustart. Das Nutzer-`.git`, lokale Produktänderungen und fehlende
@@ -20,7 +30,23 @@ Die exakt bestätigte RAM-Disk unter `/var/www/html/ramdisk` wird dabei als
 beabsichtigter Laufzeit-Mount behandelt. Eine ausdrücklich benannte Altdatei
 wird fd-gebunden innerhalb dieses eigenen Mounts entfernt. Nach einem fehlgeschlagenen
 Dateiaustausch werden die bekannten Webrechte vor dem Dienstneustart
-wiederhergestellt; eine zusätzliche feste HA-Wartefrist gibt es nicht.
+wiederhergestellt; eine zusätzliche feste HA-Wartefrist gibt es nicht. Eine
+beibehaltene `external_pv_topology.json` erhält den gemeinsamen Lesemodus
+`0664`, ohne die Rechte anderer Konfigurations- oder Geheimnisdateien zu
+lockern.
+
+Der private Release-Checkout bleibt `0700`/`0600`; nur der betriebene
+Produktbaum erhält definierte Live-Rechte. Vor dem Dienststart prüft der
+Updater den gebundenen Installationspfad real als `www-data`, ohne die private
+Service-Pythonumgebung zu öffnen. Unter einem privaten Home-Pfad bindet er
+owner-private, nicht-setgid Vorfahren eng an die Webgruppe und ergänzt nur
+deren Traversierrecht; eine vorhandene gezielte POSIX-ACL für `www-data` wird
+akzeptiert. Gemeinsam genutzte oder setgid Vorfahren werden ohne diese ACL vor
+der Produktmutation angehalten. Globales `Other-Execute`, Auflisten, Lesen und
+Schreiben bleiben gesperrt. Der Zielbestand beträgt maximal drei automatisch
+verwaltete System-Backup-Familien und separat maximal drei
+Web-Installer-Sicherungen. Schutzbindungen dürfen die Zielgrenzen vorübergehend
+überschreiten und werden niemals erzwungen gelöscht.
 
 5.4.4c korrigiert ausschließlich den Updateweg. Das Nutzer-`.git`, lokale
 Produktänderungen, fehlende Dateien und alte Rechte blockieren das Update nicht.
@@ -378,7 +404,7 @@ Ohne das Label bleibt auch ein versehentlich gestarteter Watchtower für den
 Hauptcontainer wirkungslos. Der oben gezeigte manuelle Host-Helfer bleibt der
 empfohlene Updateweg.
 
-**Docker-Rückfall von v5.4.4e auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.4.4f auf den veröffentlichten Docker-Rollback-Root:**
 ```bash
 (
   set -euo pipefail

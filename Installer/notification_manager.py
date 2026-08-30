@@ -184,8 +184,8 @@ def main():
         # 5. History Backup (Immer um Mitternacht)
         backup_id = f"{c_date}_00:00"
         if c_time == "00:00" and last_run.get('backup') != backup_id and not is_standby:
-            safe_execute(["/usr/bin/php", "/var/www/html/backup_history.php"])
-            last_run['backup'] = backup_id
+            if safe_execute(["/usr/bin/php", "/var/www/html/backup_history.php"]):
+                last_run['backup'] = backup_id
 
         # 6. SQLite Archiver (Immer um Minute 55, ersetzt Cron)
         archiver_id = f"{c_date}_{now.strftime('%H')}"

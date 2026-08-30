@@ -886,21 +886,127 @@ function applyForecastSocSmoothing(soc, startIndex = 0) {
     return smoothed.map(v => v !== null && v !== undefined ? Number(v.toFixed(2)) : v);
 }
 
+function vehicleSocAgeText(ageSeconds) {
+    const age = Number(ageSeconds);
+    if (!Number.isFinite(age) || age < 0) return '';
+    if (age < 90) return 'vor weniger als 1 Min.';
+    if (age < 3600) return `vor ${Math.floor(age / 60)} Min.`;
+    if (age < 48 * 3600) {
+        const hours = Math.floor(age / 3600);
+        const minutes = Math.floor((age % 3600) / 60);
+        return `vor ${hours} Std.${minutes > 0 ? ` ${minutes} Min.` : ''}`;
+    }
+    return `vor ${Math.floor(age / 86400)} Tagen`;
+}
+
+function bluelinkRefreshDisplayInfo(data = {}, vehicle = null) {
+    const refresh = data && data.bluelink_refresh && typeof data.bluelink_refresh === 'object'
+        ? data.bluelink_refresh
+        : null;
+    if (!refresh || refresh.schema !== 'bluelink_refresh_status_v1') {
+        return {available: false, warning: false, detail: '', shortText: ''};
+    }
+    const vehicleMeta = vehicle && vehicle.soc_meta && typeof vehicle.soc_meta === 'object'
+        ? vehicle.soc_meta
+        : null;
+    const sourceAge = vehicleMeta && Object.prototype.hasOwnProperty.call(vehicleMeta, 'age_s')
+        ? vehicleMeta.age_s
+        : refresh.source_age_s;
+    const sourceAgeText = vehicleSocAgeText(sourceAge);
+    const lastError = refresh.last_error_active === true
+        && refresh.last_error && typeof refresh.last_error === 'object'
+        ? refresh.last_error
+        : null;
+    const errorLabels = {
+        timeout: 'Zeitüberschreitung',
+        rate_limited: 'Cloud-Limit erreicht',
+        authentication_failed: 'Anmeldung abgewiesen',
+        vehicle_data_missing: 'Fahrzeugdaten fehlen',
+        api_error: 'Cloud-Fehler'
+    };
+    if (lastError) {
+        const modeLabel = lastError.mode === 'force' ? 'Fahrzeug-Aufwecken' : 'Cloud-Abruf';
+        const errorLabel = errorLabels[lastError.code] || 'fehlgeschlagen';
+        return {
+            available: true,
+            warning: true,
+            detail: `${modeLabel}: ${errorLabel}${sourceAgeText ? `; Fahrzeugstand ${sourceAgeText}` : ''}`,
+            shortText: errorLabel
+        };
+    }
+    if (refresh.status === 'failed') {
+        const errorLabel = errorLabels[refresh.error_code] || 'Cloud-Abruf fehlgeschlagen';
+        return {
+            available: true,
+            warning: true,
+            detail: `${errorLabel}${sourceAgeText ? `; Fahrzeugstand ${sourceAgeText}` : ''}`,
+            shortText: errorLabel
+        };
+    }
+    if (refresh.status === 'success_source_unchanged') {
+        return {
+            available: true,
+            warning: false,
+            detail: `Cloud-Abruf erfolgreich, Fahrzeugstand unverändert${sourceAgeText ? ` (${sourceAgeText})` : ''}`,
+            shortText: 'Fahrzeugstand unverändert'
+        };
+    }
+    if (refresh.status === 'success_source_partial') {
+        const missing = Number(refresh.response_missing_source_count || 0);
+        const missingText = missing > 0
+            ? `; bei ${missing} Fahrzeug${missing === 1 ? '' : 'en'} fehlt der Rohzeitpunkt`
+            : '; mindestens ein Fahrzeugzeitpunkt fehlt';
+        return {
+            available: true,
+            warning: true,
+            detail: `Cloud-Abruf nur teilweise belastbar${missingText}${sourceAgeText ? `; jüngster belegter Stand ${sourceAgeText}` : ''}`,
+            shortText: 'Fahrzeugzeitpunkt teilweise'
+        };
+    }
+    if (refresh.status === 'success_source_unknown') {
+        return {
+            available: true,
+            warning: true,
+            detail: 'Cloud-Abruf ohne belastbaren Fahrzeugzeitpunkt; der SoC bleibt nur als veralteter Anzeigewert erhalten',
+            shortText: 'Fahrzeugzeitpunkt fehlt'
+        };
+    }
+    return {
+        available: true,
+        warning: false,
+        detail: sourceAgeText ? `Fahrzeugstand ${sourceAgeText}` : 'Cloud-Abruf erfolgreich',
+        shortText: ''
+    };
+}
+
 function vehicleSocDisplayInfo(vehicle, decimals = 1) {
     const meta = vehicle && vehicle.soc_meta && typeof vehicle.soc_meta === 'object'
         ? vehicle.soc_meta
         : {};
     const rawValue = meta.value !== undefined && meta.value !== null ? meta.value : (vehicle ? vehicle.soc : null);
     const value = parseFloat(rawValue);
-    const displayUsable = meta.display_usable !== undefined ? meta.display_usable === true : Number.isFinite(value) && value > 0;
-    if (!displayUsable || !Number.isFinite(value) || value <= 0) {
+    const displayUsable = meta.display_usable !== undefined
+        ? meta.display_usable === true
+        : Number.isFinite(value) && value >= 0 && value <= 100;
+    if (!displayUsable || !Number.isFinite(value) || value < 0 || value > 100) {
         return {known: false, valueText: '--', qualifier: '', standText: '', fullText: '--', stale: true};
     }
 
     const sourceClass = String(meta.class || vehicle.soc_source_class || '').toLowerCase();
     const transportClass = String(meta.transport_class || '').toLowerCase();
     const stale = meta.stale === true || vehicle.soc_stale === true || transportClass === 'cached';
-    const sourceTs = parseInt(meta.source_ts || vehicle.soc_source_ts || vehicle.last_updated_at || 0, 10);
+    const metaHasSourceTs = Object.prototype.hasOwnProperty.call(meta, 'source_ts');
+    const vehicleHasSourceTs = !!vehicle && Object.prototype.hasOwnProperty.call(vehicle, 'soc_source_ts');
+    const sourceTsRaw = metaHasSourceTs
+        ? meta.source_ts
+        : (vehicleHasSourceTs ? vehicle.soc_source_ts : null);
+    const sourceTsParsed = Number(sourceTsRaw);
+    const sourceTs = Number.isFinite(sourceTsParsed) && sourceTsParsed > 0
+        ? Math.trunc(sourceTsParsed)
+        : 0;
+    const sourceAge = meta.age_s !== undefined && meta.age_s !== null
+        ? Number(meta.age_s)
+        : (sourceTs > 0 ? Math.max(0, Date.now() / 1000 - sourceTs) : null);
     const qualifier = sourceClass === 'estimated'
         ? 'geschätzt'
         : (sourceClass === 'manual' ? 'manuell' : (sourceClass === 'cloud' ? 'Cloud' : 'gemessen'));
@@ -912,8 +1018,25 @@ function vehicleSocDisplayInfo(vehicle, decimals = 1) {
         const pad = n => String(n).padStart(2, '0');
         standText = `Stand ${pad(d.getDate())}.${pad(d.getMonth() + 1)}. ${pad(d.getHours())}:${pad(d.getMinutes())}`;
     }
-    const fullText = `${valueText} ${qualifier}${standText ? `, ${standText}` : ''}`;
-    return {known: true, value, valueText, qualifier, standText, fullText, stale, sourceClass, transportClass};
+    const ageText = vehicleSocAgeText(sourceAge);
+    const fullText = `${valueText} ${qualifier}${standText ? `, ${standText}` : ''}${ageText ? ` (${ageText})` : ''}`;
+    return {known: true, value, valueText, qualifier, standText, ageText, fullText, stale, sourceClass, transportClass, sourceTs};
+}
+
+function vehicleSourceSyncDisplayInfo(socInfo, cloudRefresh = null) {
+    const info = socInfo && typeof socInfo === 'object' ? socInfo : {};
+    const refresh = cloudRefresh && typeof cloudRefresh === 'object' ? cloudRefresh : null;
+    if (Number.isFinite(Number(info.sourceTs)) && Number(info.sourceTs) > 0) {
+        const sourceDate = new Date(Number(info.sourceTs) * 1000);
+        return {
+            text: sourceDate.toLocaleString('de-DE') + (info.ageText ? ` (${info.ageText})` : ''),
+            title: refresh && refresh.detail ? refresh.detail : ''
+        };
+    }
+    return {
+        text: refresh && refresh.available ? 'Kein neuer Fahrzeugzeitpunkt' : '--',
+        title: refresh && refresh.detail ? refresh.detail : 'Fahrzeug-Quellzeitpunkt nicht verfügbar'
+    };
 }
 
 function vehicleSocKnown(vehicle) {
@@ -974,7 +1097,6 @@ function updateVehiclePage(data) {
     }
 
     const vehicles = data.vehicles || [];
-
     // Prüfe, ob die Struktur der Tabs neu gezeichnet werden muss (Anzahl, Namen oder Status geändert)
     let needsRedraw = (tabsEl.children.length !== vehicles.length);
     if (!needsRedraw) {
@@ -1056,14 +1178,21 @@ function updateVehiclePage(data) {
 
     vehicles.forEach((v, idx) => {
         const socInfo = vehicleSocDisplayInfo(v, 1);
+        const cloudRefresh = socInfo.sourceClass === 'cloud'
+            ? bluelinkRefreshDisplayInfo(data, v)
+            : null;
+        const socMetaParts = socInfo.known
+            ? [socInfo.qualifier, socInfo.standText, socInfo.ageText]
+            : [];
+        if (cloudRefresh && cloudRefresh.detail) socMetaParts.push(cloudRefresh.detail);
         const socEl = $(`#fz-soc-${idx}`);
         socEl.text(socInfo.valueText)
             .removeClass('text-success text-warning text-muted')
             .addClass(socInfo.known ? (socInfo.stale || socInfo.sourceClass === 'estimated' ? 'text-warning' : 'text-success') : 'text-muted');
         $(`#fz-soc-meta-${idx}`)
-            .text(socInfo.known ? `${socInfo.qualifier}${socInfo.standText ? `, ${socInfo.standText}` : ''}` : 'Quelle nicht verfügbar')
-            .toggleClass('text-warning', socInfo.known && (socInfo.stale || socInfo.sourceClass === 'estimated'))
-            .toggleClass('text-muted', !socInfo.known || (!socInfo.stale && socInfo.sourceClass !== 'estimated'));
+            .text(socInfo.known ? socMetaParts.filter(Boolean).join(' · ') : 'Quelle nicht verfügbar')
+            .toggleClass('text-warning', socInfo.known && (socInfo.stale || socInfo.sourceClass === 'estimated' || (cloudRefresh && cloudRefresh.warning)))
+            .toggleClass('text-muted', !socInfo.known || (!socInfo.stale && socInfo.sourceClass !== 'estimated' && !(cloudRefresh && cloudRefresh.warning)));
         let rangeText = v.range_km ? v.range_km + ' km' : '--';
         if (socInfo.known && socInfo.stale && v.range_km) rangeText = 'zuletzt ' + rangeText;
         $(`#fz-range-${idx}`).text(rangeText);
@@ -1088,10 +1217,10 @@ function updateVehiclePage(data) {
             $(`#fz-home-${idx}`).html(locHtml);
         }
 
-        if (v.last_updated_at) {
-            let d = new Date(v.last_updated_at * 1000);
-            $(`#fz-last-update-${idx}`).text(d.toLocaleString('de-DE'));
-        }
+        const sourceSync = vehicleSourceSyncDisplayInfo(socInfo, cloudRefresh);
+        $(`#fz-last-update-${idx}`)
+            .text(sourceSync.text)
+            .attr('title', sourceSync.title);
 
         if (v.doors_open === true) $(`#fz-doors-${idx}`).html('<i class="fas fa-door-open text-warning"></i> Offen');
         else if (v.doors_open === false) $(`#fz-doors-${idx}`).html('<i class="fas fa-door-closed text-success"></i> Zu');
@@ -1172,11 +1301,16 @@ function updateVehicleWidgets(data) {
             return raw;
         };
 
-        const updateBadges = (badges, activeV, isGuest, isWb1) => {
+        const updateBadges = (badges, activeV, isGuest) => {
             badges.forEach(el => {
                 if (!el.length) return;
 
-                if (data.car_force_running && isWb1) {
+                const activeSocInfo = activeV ? vehicleSocDisplayInfo(activeV, 0) : null;
+                const activeIsCloud = !!(activeSocInfo && activeSocInfo.sourceClass === 'cloud');
+                const activeBluelinkRefreshInfo = activeIsCloud
+                    ? bluelinkRefreshDisplayInfo(data, activeV)
+                    : null;
+                if (data.car_force_running && activeIsCloud) {
                     if (!el.html().includes('fa-spin')) el.html('<i class="fas fa-sync fa-spin"></i>').show();
                 } else if (isGuest && !activeV) {
                     el.html('(Gast)').css('cursor', 'default').attr('title', 'Gast-Fahrzeug lädt').show();
@@ -1192,8 +1326,21 @@ function updateVehicleWidgets(data) {
                     if (activeV.name) titleParts.push(String(activeV.name).trim());
                     titleParts.push(socKnown ? socInfo.fullText : 'Fahrzeug-SoC nicht verfügbar');
                     if (socKnown && activeV.range_km) titleParts.push(`${activeV.range_km} km`);
+                    if (activeBluelinkRefreshInfo && activeBluelinkRefreshInfo.detail) {
+                        titleParts.push(activeBluelinkRefreshInfo.detail);
+                    }
                     let txt = badgeParts.join(' | ');
-                    if (data.car_error && isWb1) txt += ` <i class="fas fa-exclamation-triangle text-warning ms-1" title="${escapeBadgeHtml(data.car_error)}"></i>`;
+                    const staleSocDetail = socInfo.stale
+                        ? `Fahrzeug-SoC veraltet${socInfo.ageText ? ` (${socInfo.ageText})` : '; Quellzeit fehlt'}`
+                        : '';
+                    const badgeWarningDetail = staleSocDetail
+                        || (activeBluelinkRefreshInfo && activeBluelinkRefreshInfo.warning
+                            ? activeBluelinkRefreshInfo.detail
+                            : '');
+                    if (badgeWarningDetail) {
+                        titleParts.push(badgeWarningDetail);
+                        txt += ` <i class="fas fa-exclamation-triangle text-warning ms-1" title="${escapeBadgeHtml(badgeWarningDetail)}"></i>`;
+                    }
                     el.html(txt).css('cursor', 'pointer').attr('title', titleParts.filter(Boolean).join(' | ') + '\nSoC vom Auto abrufen (Aufwecken)').show();
                 } else {
                     el.hide();
@@ -1201,8 +1348,8 @@ function updateVehicleWidgets(data) {
             });
         };
 
-        updateBadges(badgesWb1, activeV1, isGuest1, true);
-        updateBadges(badgesWb2, activeV2, isGuest2, false);
+        updateBadges(badgesWb1, activeV1, isGuest1);
+        updateBadges(badgesWb2, activeV2, isGuest2);
     } else {
         badgesWb1.forEach(el => {
             if (el.length) {
@@ -1483,8 +1630,29 @@ function directMarketingTrajectoryViewModel(data = {}) {
             && typeof selection.action_id === 'string' && /^sha256:[0-9a-f]{64}$/.test(selection.action_id)
             && typeof selection.window_id === 'string' && selection.window_id !== '';
         const delegation = source.delegation;
+        const standardProjectionBinding = source.standard_projection_binding;
+        const standardProjectionBindingKeys = standardProjectionBinding
+            && typeof standardProjectionBinding === 'object'
+            && !Array.isArray(standardProjectionBinding)
+            ? Object.keys(standardProjectionBinding).sort()
+            : [];
+        const standardProjectionBindingValid = standardProjectionBinding
+            && typeof standardProjectionBinding === 'object'
+            && !Array.isArray(standardProjectionBinding)
+            && JSON.stringify(standardProjectionBindingKeys) === JSON.stringify([
+                'commands_allowed', 'executable', 'hardware_effect',
+                'projection_only', 'schema', 'source_revision', 'source_schema'
+            ])
+            && standardProjectionBinding.schema === 'canonical_standard_projection_binding_v1'
+            && standardProjectionBinding.projection_only === true
+            && standardProjectionBinding.executable === false
+            && standardProjectionBinding.commands_allowed === false
+            && standardProjectionBinding.hardware_effect === false
+            && standardProjectionBinding.source_schema === 'direct_marketing_headroom_projection_plan_v1'
+            && /^sha256:[0-9a-f]{64}$/.test(String(standardProjectionBinding.source_revision || ''));
         const delegatedPvStore = action === 'PV_STORE'
             && delegation && typeof delegation === 'object'
+            && standardProjectionBinding === null
             && selection.selected === false
             && delegation.schema_version === 'direct_marketing_future_pv_store_delegation_v1'
             && delegation.active === true && delegation.commands_allowed === true
@@ -1636,8 +1804,9 @@ function directMarketingTrajectoryViewModel(data = {}) {
         const passiveMetadataClear = ['action_id', 'window_id', 'segment_id', 'source_action', 'source_mode', 'pv_store_source_contract']
             .every(key => Object.prototype.hasOwnProperty.call(selection, key) && selection[key] === null);
         const passiveBindingValid = passiveBinding && typeof passiveBinding === 'object'
-            && passiveBinding.schema === 'direct_marketing_passive_normal_binding_v1';
-        const transitionWithoutPassiveBinding = hasHeadroomProjectionContract
+            && passiveBinding.schema === 'direct_marketing_passive_normal_binding_v1'
+            && standardProjectionBinding === null;
+        const transitionWithoutPassiveBinding = standardProjectionBindingValid
             && passiveBinding === null && (standardPassthrough || standardTransitionValid);
         const passiveRole = action === 'PASSIVE_NORMAL'
             && selection.selected === false && selection.executable === false && selection.commands_allowed === false
@@ -1645,6 +1814,7 @@ function directMarketingTrajectoryViewModel(data = {}) {
             && passiveMetadataClear && delegation === null
             && (passiveBindingValid || transitionWithoutPassiveBinding);
         if ((selection.selected === true && delegation !== null)
+            || (selectedRole && standardProjectionBinding !== null)
             || (!projectionRole && selectedAction && !selectedRole && !delegatedPvStore)
             || (!projectionRole && !selectedAction && !passiveRole)) {
             return evidenceLimit('DIRECT_MARKETING_TRAJECTORY_ACTION_ROLE_INVALID');
@@ -6872,9 +7042,12 @@ function startInstallerUpdateRun(btn, origText) {
     const spinner = document.getElementById('update-spinner');
     const closeBtn = document.getElementById('update-close-btn');
     const finishBtn = document.getElementById('update-finish-btn');
+    const details = document.getElementById('update-details');
+    const updateStartedAt = Date.now();
 
     if (title) title.innerText = "System Update";
     if (log) log.innerText = "Starte System Update...\n";
+    if (details) details.open = false;
     if (spinner) spinner.className = "fas fa-sync fa-spin me-2";
     if (closeBtn) closeBtn.style.display = 'none';
     if (finishBtn) {
@@ -6882,6 +7055,7 @@ function startInstallerUpdateRun(btn, origText) {
         finishBtn.innerText = "Schließen";
         finishBtn.onclick = null;
     }
+    e3dcRenderInstallerUpdateStatus({logText: "", running: true}, updateStartedAt);
     if (modal) modal.show();
 
     e3dcPostAction('action=run_self_update&t=' + Date.now(), {
@@ -6891,7 +7065,7 @@ function startInstallerUpdateRun(btn, origText) {
     .then(data => {
         if (data && data.success) {
             if (log) log.innerText = (data.message || "Update gestartet.") + "\nWarte auf Log-Ausgabe...\n";
-            pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText);
+            pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText, updateStartedAt);
         } else {
             const msg = "Update konnte nicht gestartet werden:\n" + ((data && data.message) || "Unbekannter Fehler");
             if (log) log.innerText = msg;
@@ -6901,6 +7075,8 @@ function startInstallerUpdateRun(btn, origText) {
             }
             if (closeBtn) closeBtn.style.display = 'block';
             if (finishBtn) finishBtn.disabled = false;
+            e3dcRenderInstallerUpdateStatus({logText: msg, running: false, errorFound: true}, updateStartedAt);
+            if (details) details.open = true;
             if (!modal) alert(msg);
             if(btn) { btn.innerHTML = origText; btn.disabled = false; }
             checkInstallerUpdate(true);
@@ -6912,12 +7088,108 @@ function startInstallerUpdateRun(btn, origText) {
         if (log) log.innerText = msg;
         if (!modal) alert(msg);
         if (log) {
-            pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText);
+            pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText, updateStartedAt);
         } else if(btn) {
             btn.innerHTML = origText;
             btn.disabled = false;
         }
     });
+}
+
+function e3dcFormatInstallerUpdateElapsed(startedAt) {
+    const seconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+    const minutes = Math.floor(seconds / 60);
+    return minutes + " min " + String(seconds % 60).padStart(2, "0") + " s";
+}
+
+function e3dcRenderInstallerUpdateStatus(updateStatus, startedAt) {
+    const status = (updateStatus && typeof updateStatus === "object") ? updateStatus : {};
+    const logText = (typeof status.logText === "string") ? status.logText : "";
+    const summary = document.getElementById('update-status-summary');
+    const title = document.getElementById('update-status-title');
+    const detail = document.getElementById('update-status-detail');
+    const step = document.getElementById('update-status-step');
+    const elapsed = document.getElementById('update-status-elapsed');
+    const progress = document.getElementById('update-progress-bar');
+    const details = document.getElementById('update-details');
+    if (!summary || !title || !detail || !step || !elapsed || !progress) return;
+
+    let titleText = "Update wird vorbereitet";
+    let detailText = "Die Anlage arbeitet weiter.";
+    let stepText = "Start";
+    let progressWidth = 5;
+    let alertClass = "alert-info";
+    let badgeClass = "bg-info text-dark";
+    const servicesConfirmed = logText.includes("[STATUS] Regelung und Weboberfläche laufen wieder.");
+
+    if (logText.includes("[1/4]")) {
+        titleText = "Sicherung und Integritätsprüfung";
+        detailText = "Die Anlage arbeitet während dieser längsten Phase normal weiter.";
+        stepText = "Schritt 1 von 4";
+        progressWidth = 22;
+    }
+    if (logText.includes("[2/4]")) {
+        titleText = "Kurze Anlagenunterbrechung";
+        detailText = "Regelung und Weboberfläche sind für den kontrollierten Dateiaustausch angehalten.";
+        stepText = "Schritt 2 von 4";
+        progressWidth = 48;
+        alertClass = "alert-warning";
+        badgeClass = "bg-warning text-dark";
+    }
+    if (logText.includes("[3/4]")) {
+        titleText = "Produktdateien und Rechte werden aktualisiert";
+        detailText = "Die kurze kontrollierte Anlagenunterbrechung dauert noch an.";
+        stepText = "Schritt 3 von 4";
+        progressWidth = 70;
+        alertClass = "alert-warning";
+        badgeClass = "bg-warning text-dark";
+    }
+    if (logText.includes("[4/4]")) {
+        titleText = "Dienste werden gestartet und geprüft";
+        detailText = "Regelung und Weboberfläche kehren jetzt kontrolliert in Betrieb zurück.";
+        stepText = "Schritt 4 von 4";
+        progressWidth = 88;
+    }
+    if (servicesConfirmed) {
+        titleText = "Anlage läuft wieder";
+        detailText = "Nur Abschlussbereinigung und Backup-Limit werden noch geprüft.";
+        stepText = "Abschlussprüfung";
+        progressWidth = 96;
+        alertClass = "alert-info";
+        badgeClass = "bg-info text-dark";
+    }
+    if (status.successFound) {
+        titleText = "Update erfolgreich abgeschlossen";
+        detailText = "Regelung, Weboberfläche und Rückfallweg wurden bestätigt.";
+        stepText = "Fertig";
+        progressWidth = 100;
+        alertClass = "alert-success";
+        badgeClass = "bg-success";
+    } else if (status.abortedFound) {
+        titleText = "Update wurde beendet";
+        detailText = "Die technischen Details nennen den bestätigten Systemzustand und den nächsten Schritt.";
+        stepText = "Beendet";
+        progressWidth = 100;
+        alertClass = "alert-secondary";
+        badgeClass = "bg-secondary";
+        if (details) details.open = true;
+    } else if (status.errorFound || status.exitFailed || status.completionFailed) {
+        titleText = "Update benötigt Aufmerksamkeit";
+        detailText = "Die technischen Details nennen Ursache, Systemzustand und Lösung.";
+        stepText = "Fehler";
+        alertClass = "alert-danger";
+        badgeClass = "bg-danger";
+        if (details) details.open = true;
+    }
+
+    summary.className = "alert " + alertClass + " mb-2";
+    title.textContent = titleText;
+    detail.textContent = detailText;
+    step.className = "badge " + badgeClass + " text-nowrap";
+    step.textContent = stepText;
+    elapsed.textContent = "Laufzeit: " + e3dcFormatInstallerUpdateElapsed(startedAt);
+    progress.style.width = progressWidth + "%";
+    progress.classList.toggle("progress-bar-animated", !status.successFound && !status.errorFound && !status.exitFailed && !status.completionFailed && !status.abortedFound);
 }
 
 function e3dcClassifyInstallerUpdatePoll(data) {
@@ -6959,12 +7231,13 @@ function e3dcClassifyInstallerUpdatePoll(data) {
     };
 }
 
-function pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText) {
+function pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText, updateStartedAt = Date.now()) {
     let tick = 0;
     let stoppedPolls = 0;
     let transientPollErrors = 0;
+    let lastUpdateStatus = {logText: "", running: true};
     const maxStoppedGracePolls = 6;
-    const maxTransientPollErrors = 15;
+    const maxTransientPollErrors = 120;
     const maxPollTicks = 60 * 60;
     const interval = setInterval(() => {
         tick++;
@@ -6997,10 +7270,11 @@ function pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText) {
                     errorFound,
                     successFound,
                 } = updateStatus;
+                lastUpdateStatus = updateStatus;
+                e3dcRenderInstallerUpdateStatus(updateStatus, updateStartedAt);
                 if (log && logText) {
                     log.innerText = logText;
-                    const modalBody = log.parentElement;
-                    if (modalBody) modalBody.scrollTop = modalBody.scrollHeight;
+                    log.scrollTop = log.scrollHeight;
                 }
 
                 if (!running && !successFound && !exitKnown && !completionFailed && !abortedFound && !errorFound && tick < maxPollTicks) {
@@ -7026,10 +7300,8 @@ function pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText) {
                             spinner.classList.add(ok ? 'fa-check-circle' : 'fa-times-circle', ok ? 'text-success' : 'text-danger');
                         }
                     }
-                    if (log) {
-                        if (ok) {
-                            log.innerText += "\n\n[OK] System Update beendet. Bitte Seite neu laden.";
-                        } else if (abortedFound) {
+                    if (log && !ok) {
+                        if (abortedFound) {
                             log.innerText += "\n\n[INFO] System Update wurde abgebrochen.";
                         } else if (tick >= maxPollTicks) {
                             log.innerText += "\n\n[HINWEIS] Die Weboberfläche beendet das Polling nach 60 Minuten. "
@@ -7053,13 +7325,23 @@ function pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText) {
             .catch(err => {
                 transientPollErrors++;
                 if (transientPollErrors <= maxTransientPollErrors && tick < maxPollTicks) {
-                    if (log) {
+                    e3dcRenderInstallerUpdateStatus(lastUpdateStatus, updateStartedAt);
+                    const statusDetail = document.getElementById('update-status-detail');
+                    if (statusDetail) {
+                        statusDetail.textContent = "Die Weboberfläche wird gerade neu gestartet. "
+                            + "Der Updateauftrag läuft unabhängig weiter.";
+                    }
+                    if (log && (transientPollErrors === 1 || transientPollErrors % 15 === 0)) {
                         log.innerText += "\n\n[INFO] Update-Oberfläche kurz nicht erreichbar (" + transientPollErrors + "/" + maxTransientPollErrors + "): " + err.message + "\nPolling läuft weiter...";
                     }
                     return;
                 }
                 clearInterval(interval);
                 if (log) log.innerText += "\n\nPolling-Fehler: " + err;
+                e3dcRenderInstallerUpdateStatus(
+                    {...lastUpdateStatus, running: false, errorFound: true},
+                    updateStartedAt
+                );
                 if (spinner) {
                     spinner.classList.remove('fa-spin', 'fa-sync');
                     spinner.classList.add('fa-times-circle', 'text-danger');
@@ -7869,7 +8151,7 @@ function pushPredumpCandidateDataset(datasets, candidateW, segment = null) {
     datasets.push(dataset);
 }
 
-function updateForecastProjectionStatus(data) {
+function updateForecastProjectionStatus(data, directMarketingView = null) {
     const container = document.getElementById('liveChartContainer');
     if (!container) return;
     let status = container.querySelector('[data-forecast-projection-status]');
@@ -7879,17 +8161,46 @@ function updateForecastProjectionStatus(data) {
         status.style.cssText = 'position:absolute;left:10px;right:10px;bottom:6px;z-index:3;padding:4px 8px;border-radius:6px;font-size:.78rem;text-align:center;pointer-events:none;';
         container.appendChild(status);
     }
+    const standardForecastAvailable = data
+        && !data.error
+        && Array.isArray(data.labels)
+        && data.labels.length > 0;
+    if (!standardForecastAvailable) {
+        status.textContent = 'Ladekurve derzeit nicht verfügbar: Prognosedaten fehlen oder sind ungültig.';
+        status.style.background = 'rgba(220,53,69,.18)';
+        status.style.color = '#dc3545';
+        status.hidden = false;
+        return;
+    }
+    const dvView = directMarketingView && typeof directMarketingView === 'object'
+        ? directMarketingView
+        : null;
+    if (dvView && dvView.active === true && dvView.state === 'complete') {
+        status.hidden = true;
+        status.textContent = '';
+        return;
+    }
+    if (dvView && dvView.active === true && dvView.state !== 'complete') {
+        const dvReasons = {
+            HEADROOM_PROJECTION_POLICY_BINDING_INVALID: 'DV-Projektionsbindung ist nicht konsistent',
+            HEADROOM_PROJECTION_PLAN_INVALID: 'DV-Headroom-Projektion ist ungültig',
+            DIRECT_MARKETING_TRAJECTORY_INCOMPLETE: 'DV-Trajektorie ist unvollständig',
+            DIRECT_MARKETING_TRAJECTORY_MISSING: 'DV-Trajektorie fehlt'
+        };
+        const dvReason = dvReasons[dvView.reasonCode]
+            || String(dvView.reasonCode || 'DV-Trajektorie ist unvollständig');
+        status.textContent = dvView.state === 'actions_only'
+            ? `Standard-Prognose sichtbar; der DV-SoC-Verlauf ist unvollständig (${dvReason}). Ausgewählte DV-Aktionen ersetzen die Standardkurve nicht.`
+            : `Standard-Prognose sichtbar; der DV-Fahrplan ist unvollständig (${dvReason}).`;
+        status.style.background = 'rgba(245,158,11,.18)';
+        status.style.color = '#f59e0b';
+        status.hidden = false;
+        return;
+    }
     const contract = data && typeof data.storage_projection_status === 'object'
         ? data.storage_projection_status
         : null;
     if (!contract) {
-        if ((data && data.error) || !data || !Array.isArray(data.labels) || data.labels.length === 0) {
-            status.textContent = 'Ladekurve derzeit nicht verfügbar: Prognosedaten fehlen oder sind ungültig.';
-            status.style.background = 'rgba(220,53,69,.18)';
-            status.style.color = '#dc3545';
-            status.hidden = false;
-            return;
-        }
         status.hidden = true;
         status.textContent = '';
         return;
@@ -7919,6 +8230,16 @@ function updateForecastProjectionStatus(data) {
         status.style.color = '#dc3545';
     }
     status.hidden = false;
+}
+
+function clearForecastProjectionStatus() {
+    const container = document.getElementById('liveChartContainer');
+    const status = container
+        ? container.querySelector('[data-forecast-projection-status]')
+        : null;
+    if (!status) return;
+    status.hidden = true;
+    status.textContent = '';
 }
 
 function updatePvForecastDiagnostics(data) {
@@ -8680,6 +9001,36 @@ function currentSocMarkerForTimestamps(timestamps, maxDistanceMs = 30 * 60 * 100
     return {soc, data, index: nearestIndex};
 }
 
+function directMarketingSocProjectionForTimestamps(view, timestamps = []) {
+    if (!view || view.active !== true || view.state !== 'complete'
+        || !view.series || !Array.isArray(view.series.soc)
+        || !Array.isArray(timestamps) || timestamps.length === 0) {
+        return null;
+    }
+    const points = view.series.soc
+        .map(point => ({
+            x: chartTimestampMs(point && point.x),
+            y: Number(point && point.y),
+        }))
+        .filter(point => point.x !== null && Number.isFinite(point.y))
+        .sort((left, right) => left.x - right.x);
+    if (points.length < 2) return null;
+
+    let cursor = 0;
+    const projection = timestamps.map(value => {
+        const timestamp = chartTimestampMs(value);
+        if (timestamp === null || timestamp < points[0].x
+            || timestamp > points[points.length - 1].x) {
+            return null;
+        }
+        while (cursor + 1 < points.length && points[cursor + 1].x <= timestamp) {
+            cursor += 1;
+        }
+        return points[cursor].y;
+    });
+    return projection.some(Number.isFinite) ? projection : null;
+}
+
 function buildCompactChartTimeContext(timestamps, fallbackLabels, gridColor, textColor, isDarkMode, maxTicksLimit = 8) {
     const sourceTimestamps = Array.isArray(timestamps) ? timestamps : [];
     const sourceLabels = Array.isArray(fallbackLabels) ? fallbackLabels : [];
@@ -8803,14 +9154,15 @@ function buildCompactChartTimeContext(timestamps, fallbackLabels, gridColor, tex
 function renderDirectMarketingForecastChart(data = {}, options = {}) {
     const surface = document.getElementById('directMarketingForecastSurface');
     const primarySurface = document.getElementById('primaryChartSurface');
-    const forecastSummary = document.getElementById('forecast-kwh-summary');
     const canvas = document.getElementById('directMarketingForecastChart');
     const stateEl = document.getElementById('directMarketingForecastState');
     const view = directMarketingTrajectoryViewModel(data);
-    const exclusive = options && options.exclusive === true;
-    const showDirectMarketing = exclusive && view.active === true;
+    // Die physikalische Standard-Prognose bleibt immer die sichtbare Fläche.
+    // Eine vollständige DV-Trajektorie ersetzt dort ausschließlich die
+    // geplante SoC-Linie; diese alte Exklusivfläche bleibt daher verborgen.
+    const showDirectMarketing = false;
+    if (showDirectMarketing || view.active !== true) clearForecastProjectionStatus();
     if (primarySurface) primarySurface.style.display = showDirectMarketing ? 'none' : '';
-    if (forecastSummary && showDirectMarketing) forecastSummary.style.display = 'none';
     if (!surface || !canvas) return view;
     if (!showDirectMarketing) {
         surface.style.display = 'none';
@@ -9221,17 +9573,70 @@ function buildForecastChartTimeContext(data, gridColor, textColor, isDarkMode) {
     return buildCompactChartTimeContext(timestamps, sourceLabels, gridColor, textColor, isDarkMode, 8);
 }
 
+function renderForecastKwhSummary(data = {}) {
+    const forecastBar = document.getElementById('forecast-kwh-summary');
+    if (!forecastBar) return false;
+
+    // Jeder neue Forecast-Vertrag ersetzt den bisherigen DOM-Stand. Fehlt die
+    // Tagessumme, darf kein älterer Wert sichtbar bleiben.
+    forecastBar.innerHTML = '';
+    forecastBar.style.display = 'none';
+    const summary = data && typeof data.daily_summary === 'object'
+        ? data.daily_summary
+        : null;
+    if (!summary) return false;
+
+    const fmt = (value) => {
+        const number = parseFloat(value);
+        return Number.isFinite(number) ? number.toFixed(1) : '?';
+    };
+    const hasWpData = (summary.tomorrow && summary.tomorrow.wp_kwh > 0)
+        || (summary.day_after && summary.day_after.wp_kwh > 0);
+    const hasClimateData = (summary.tomorrow && summary.tomorrow.climate_kwh > 0)
+        || (summary.day_after && summary.day_after.climate_kwh > 0);
+    const summaryValue = (icon, title, value) =>
+        `<span class="forecast-summary-value" title="${title}">${icon} <b>${fmt(value)}</b> kWh</span>`;
+    const dayBlock = (key, label, day, consumptionLabel) => {
+        if (!day || typeof day !== 'object') return '';
+        const consumption = [summaryValue('🏠', consumptionLabel, day.home_kwh)];
+        if (day.wp_kwh > 0 || (hasWpData && document.getElementById('val-wp'))) {
+            consumption.push(summaryValue('🔥', `${label}: Wärmepumpe`, day.wp_kwh));
+        }
+        if (day.climate_kwh > 0 || hasClimateData) {
+            consumption.push(summaryValue('❄', `${label}: Klima`, day.climate_kwh));
+        }
+        return `<span class="forecast-summary-day forecast-summary-${key}">
+            <span class="forecast-summary-label text-secondary fw-normal">${label}</span>
+            <span class="forecast-summary-lines">
+                <span class="forecast-summary-line forecast-summary-yield">${summaryValue('☀', `${label}: PV-Ertrag`, day.pv_kwh)}</span>
+                <span class="forecast-summary-line forecast-summary-consumption">${consumption.join('')}</span>
+            </span>
+        </span>`;
+    };
+    const html = [
+        dayBlock('today', 'Heute', summary.today, 'Heute: Restprognose Verbrauch ab jetzt'),
+        dayBlock('tomorrow', 'Morgen', summary.tomorrow, 'Morgen: Verbrauch'),
+        dayBlock('day-after', 'Übermorgen', summary.day_after, 'Übermorgen: Verbrauch')
+    ].filter(Boolean).join('');
+    if (!html) return false;
+
+    forecastBar.innerHTML = html;
+    forecastBar.style.display = '';
+    return true;
+}
+
 function loadJsForecastChart(file = '') {
     const requestGeneration = beginJsChartRequest('forecast');
     const url = file ? 'get_forecast_data.php?file=' + encodeURIComponent(file) : 'get_forecast_data.php';
+    renderForecastKwhSummary({});
 
     fetch(url)
         .then(r => r.json())
         .then(data => {
             if (!isCurrentJsChartRequest('forecast', requestGeneration)) return;
+            renderForecastKwhSummary(data);
             const directMarketingView = renderDirectMarketingForecastChart(data, {exclusive: true});
-            if (directMarketingView && directMarketingView.active === true) return;
-            updateForecastProjectionStatus(data);
+            updateForecastProjectionStatus(data, directMarketingView);
             if (data.error || !data.labels || data.labels.length === 0) return;
 
 
@@ -9257,6 +9662,11 @@ function loadJsForecastChart(file = '') {
                 : [];
             const forecastSocCurrent = !data.storage_projection_status
                 || data.storage_projection_status.soc_curve_current !== false;
+            const directMarketingSoc = directMarketingSocProjectionForTimestamps(
+                directMarketingView,
+                data.timestamps || []
+            );
+            const useDirectMarketingSoc = Array.isArray(directMarketingSoc);
             const currentSoc = currentSocMarkerForTimestamps(data.timestamps || []);
             let datasets = [
                 { label: 'Sonne (PV)', data: data.pv, borderColor: getFlowColor('pv', '#ffc107'), backgroundColor: flowColorAlpha('pv', 0.15, '#ffc107'), fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y', order: 10 },
@@ -9267,18 +9677,22 @@ function loadJsForecastChart(file = '') {
             pushPredumpCandidateDataset(datasets, predumpCandidateW);
             pushPredumpHeadroomDataset(datasets, predumpHeadroomW);
             datasets.push({
-                label: forecastSocCurrent
-                    ? 'Standard-SoC-Prognose (%)'
-                    : 'SoC-Planung (nicht aktuell) (%)',
-                data: data.soc,
-                borderColor: '#20c997',
-                backgroundColor: 'rgba(32,201,151,0.08)',
-                tension: 0.45,
-                cubicInterpolationMode: 'monotone',
-                stepped: false,
+                label: useDirectMarketingSoc
+                    ? 'DV-SoC-Prognose (%)'
+                    : (forecastSocCurrent
+                        ? 'Standard-SoC-Prognose (%)'
+                        : 'SoC-Planung (nicht aktuell) (%)'),
+                data: useDirectMarketingSoc ? directMarketingSoc : data.soc,
+                borderColor: useDirectMarketingSoc ? '#8b5cf6' : '#20c997',
+                backgroundColor: useDirectMarketingSoc
+                    ? 'rgba(139,92,246,0.08)'
+                    : 'rgba(32,201,151,0.08)',
+                tension: useDirectMarketingSoc ? 0 : 0.45,
+                cubicInterpolationMode: useDirectMarketingSoc ? undefined : 'monotone',
+                stepped: useDirectMarketingSoc ? 'after' : false,
                 pointRadius: 0,
-                borderWidth: 2,
-                borderDash: forecastSocCurrent ? undefined : [5, 5],
+                borderWidth: useDirectMarketingSoc ? 2.5 : 2,
+                borderDash: useDirectMarketingSoc || forecastSocCurrent ? undefined : [5, 5],
                 yAxisID: 'y1',
                 order: 5
             });
@@ -9401,49 +9815,6 @@ function loadJsForecastChart(file = '') {
                 });
                 const canvas = document.getElementById('liveChartCanvas');
                 if (canvas) canvas.ondblclick = () => { if (liveLineChart) liveLineChart.resetZoom(); };
-            }
-            // --- Tagessummen in dediziertes Element schreiben (unabhängig von diagramDetails) ---
-            const forecastBar = document.getElementById('forecast-kwh-summary');
-            if (forecastBar && data.daily_summary) {
-                const s = data.daily_summary;
-                const fmt = (v) => {
-                    const n = parseFloat(v);
-                    return Number.isFinite(n) ? n.toFixed(1) : '?';
-                };
-
-                const hasWpData = (s.tomorrow && s.tomorrow.wp_kwh > 0) || (s.day_after && s.day_after.wp_kwh > 0);
-                const hasClimateData = (s.tomorrow && s.tomorrow.climate_kwh > 0) || (s.day_after && s.day_after.climate_kwh > 0);
-                const forecastSummaryValue = (icon, title, value) =>
-                    `<span class="forecast-summary-value" title="${title}">${icon} <b>${fmt(value)}</b> kWh</span>`;
-                const forecastSummaryDayBlock = (key, label, day, consumptionLabel) => {
-                    if (!day) return '';
-                    const consumption = [
-                        forecastSummaryValue('🏠', consumptionLabel, day.home_kwh)
-                    ];
-                    if (day.wp_kwh > 0 || (hasWpData && document.getElementById('val-wp'))) {
-                        consumption.push(forecastSummaryValue('🔥', `${label}: Wärmepumpe`, day.wp_kwh));
-                    }
-                    if (day.climate_kwh > 0 || hasClimateData) {
-                        consumption.push(forecastSummaryValue('❄', `${label}: Klima`, day.climate_kwh));
-                    }
-                    return `<span class="forecast-summary-day forecast-summary-${key}">
-                        <span class="forecast-summary-label text-secondary fw-normal">${label}</span>
-                        <span class="forecast-summary-lines">
-                            <span class="forecast-summary-line forecast-summary-yield">${forecastSummaryValue('☀', `${label}: PV-Ertrag`, day.pv_kwh)}</span>
-                            <span class="forecast-summary-line forecast-summary-consumption">${consumption.join('')}</span>
-                        </span>
-                    </span>`;
-                };
-                const html = [
-                    forecastSummaryDayBlock('today', 'Heute', s.today, 'Heute: Restprognose Verbrauch ab jetzt'),
-                    forecastSummaryDayBlock('tomorrow', 'Morgen', s.tomorrow, 'Morgen: Verbrauch'),
-                    forecastSummaryDayBlock('day-after', 'Übermorgen', s.day_after, 'Übermorgen: Verbrauch')
-                ].filter(Boolean).join('');
-
-                if (html) {
-                    forecastBar.innerHTML = html;
-                    forecastBar.style.display = '';
-                }
             }
         })
         .catch(err => {
@@ -10588,8 +10959,19 @@ function triggerWallboxForceStart(wbIdx) {
         body: formData
     })
         .then(res => {
-            if (!res.ok) throw new Error('Network error');
-            return res.json();
+            return res.text().then(text => {
+                let payload = null;
+                try {
+                    payload = JSON.parse(text);
+                } catch (_) {
+                    payload = null;
+                }
+                if (!res.ok || !payload || payload.ok !== true) {
+                    const detail = payload && (payload.message || payload.error || payload.code);
+                    throw new Error(detail ? String(detail) : `Wallbox-Sofortstart fehlgeschlagen (HTTP ${res.status}).`);
+                }
+                return payload;
+            });
         })
         .then(payload => {
             if (!payload || payload.ok !== true) {
@@ -12721,12 +13103,12 @@ function showStorageCurveModal() {
     const meta = window._storagePlanMeta || {};
     const curveMeta = meta.target_curve_meta || {};
     const currentSoc = currentLiveSocForChart();
-    const directMarketingView = directMarketingTrajectoryViewModel(window._storageLiveData || {});
-    const directMarketingActive = directMarketingView.active === true;
     const standardChartWrap = document.getElementById('sc-standard-chart-wrap');
     const directMarketingChartWrap = document.getElementById('sc-direct-marketing-chart-wrap');
-    if (standardChartWrap) standardChartWrap.style.display = directMarketingActive ? 'none' : '';
-    if (directMarketingChartWrap) directMarketingChartWrap.style.display = directMarketingActive ? '' : 'none';
+    // Auch bei vollständigem DV-Plan bleibt die Standard-Ladekurve mit ihrer
+    // PV-Ertragskurve sichtbar. Nur ihre geplante SoC-Linie wird ausgetauscht.
+    if (standardChartWrap) standardChartWrap.style.display = '';
+    if (directMarketingChartWrap) directMarketingChartWrap.style.display = 'none';
     $('#sc-current-soc').text(currentSoc !== null ? `${currentSoc.toFixed(1)}%` : '--%');
     $('#sc-modal-day').text(meta.display_day_label || 'Heute');
     if (curveMeta.wallbox_target_soc_active) {
@@ -12785,24 +13167,15 @@ function showStorageCurveModal() {
     const today0 = displayStart ? new Date(displayStart) : new Date();
     today0.setHours(0,0,0,0);
 
-    if (directMarketingActive) {
-        if (_storageCurveChartInstance) {
-            _storageCurveChartInstance.destroy();
-            _storageCurveChartInstance = null;
-        }
-    } else if (_directMarketingTrajectoryChartInstance) {
+    if (_directMarketingTrajectoryChartInstance) {
         _directMarketingTrajectoryChartInstance.destroy();
         _directMarketingTrajectoryChartInstance = null;
     }
 
-    const renderModalChart = directMarketingActive
-        ? () => _renderDirectMarketingTrajectoryChart()
-        : () => _renderStorageCurveChart([]);
+    const renderModalChart = () => _renderStorageCurveChart([]);
     $(el).one('shown.bs.modal', renderModalChart);
     renderModalChart();
     setTimeout(renderModalChart, 150);
-
-    if (directMarketingActive) return;
 
     // Historische IST-SoC-Linie für die Standard-Ladekurve nachladen
     const historyUrl = 'get_live_json.php?storage_curve_history=1&day_start_ms='
@@ -12950,6 +13323,8 @@ function _renderStorageCurveChart(socPoints) {
         const dvExportData = sortedTs.map(ts => interpDvKw('export', ts));
         const dvHeadroomProjectionData = sortedTs.map(ts => interpHeadroomProjection(ts));
         const dvHoldData = sortedTs.map(ts => interpDvHold(ts));
+        const directMarketingSoc = directMarketingSocProjectionForTimestamps(dvView, sortedTs);
+        const useDirectMarketingSoc = Array.isArray(directMarketingSoc);
 
         // Jetzt-Linie: Index des ersten Timestamps >= nowMs
         const nowIdx = (nowMs >= sortedTs[0] && nowMs <= sortedTs[sortedTs.length - 1])
@@ -13014,14 +13389,17 @@ function _renderStorageCurveChart(socPoints) {
                         yAxisID: 'ySoc',
                     },
                     {
-                        label: 'Standard-SoC-Prognose',
-                        data: simSocData,
-                        borderColor: '#a78bfa',
-                        backgroundColor: 'rgba(167,139,250,0.08)',
-                        borderWidth: 2,
-                        borderDash: [3, 3],
+                        label: useDirectMarketingSoc ? 'DV-SoC-Prognose' : 'Standard-SoC-Prognose',
+                        data: useDirectMarketingSoc ? directMarketingSoc : simSocData,
+                        borderColor: useDirectMarketingSoc ? '#8b5cf6' : '#a78bfa',
+                        backgroundColor: useDirectMarketingSoc
+                            ? 'rgba(139,92,246,0.08)'
+                            : 'rgba(167,139,250,0.08)',
+                        borderWidth: useDirectMarketingSoc ? 2.5 : 2,
+                        borderDash: useDirectMarketingSoc ? [] : [3, 3],
                         pointRadius: 0,
-                        tension: 0.25,
+                        tension: useDirectMarketingSoc ? 0 : 0.25,
+                        stepped: useDirectMarketingSoc ? 'after' : false,
                         fill: false,
                         hidden: false,
                         yAxisID: 'ySoc',
@@ -13146,6 +13524,7 @@ function _renderStorageCurveChart(socPoints) {
                                 if (label === 'Unterkante') return 'Unterkante: ' + (ctx.raw !== null ? ctx.raw.toFixed(1) + '%' : '--');
                                 if (label === 'Oberkante') return 'Oberkante: ' + (ctx.raw !== null ? ctx.raw.toFixed(1) + '%' : '--');
                                 if (label === 'Standard-SoC-Prognose') return label + ': ' + (ctx.raw !== null ? ctx.raw.toFixed(1) + '%' : '--');
+                                if (label === 'DV-SoC-Prognose') return 'DV-SoC: ' + (ctx.raw !== null ? ctx.raw.toFixed(1) + '%' : '--');
                                 if (label === 'Aktueller SoC (Messwert)') return 'Aktueller SoC: ' + (ctx.raw !== null ? ctx.raw.toFixed(1) + '%' : '--');
                                 if (label === 'IST-SoC') return 'IST:  ' + (ctx.raw !== null ? ctx.raw.toFixed(1) + '%' : '--');
                                 if (label === 'PV-Prognose (kW)') return 'PV:   ' + (ctx.raw !== null ? ctx.raw.toFixed(2) + ' kW' : '--');
@@ -13223,7 +13602,6 @@ function _renderStorageCurveChart(socPoints) {
         s.onload = function() {
             _storageCurveChartScriptLoading = false;
             doRender();
-            _renderDirectMarketingTrajectoryChart();
         };
         s.onerror = function() {
             _storageCurveChartScriptLoading = false;

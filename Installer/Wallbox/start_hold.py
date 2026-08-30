@@ -70,13 +70,14 @@ def _normalize_group_members(items):
         phases = _int(raw.get("target_phases"), 0)
         minimum_amp = _int(raw.get("minimum_amp"), 0)
         minimum_power_w = max(0, _int(raw.get("minimum_power_w"), 0))
+        nominal_minimum_power_w = minimum_amp * 230 * phases
         if (
             wb_id <= 0
             or wb_id in seen
             or not session_id
             or phases not in (1, 3)
             or minimum_amp != 6
-            or minimum_power_w < 6 * 230
+            or minimum_power_w < nominal_minimum_power_w
         ):
             return []
         seen.add(wb_id)
@@ -161,9 +162,9 @@ def begin_request(
         charger_id <= 0
         or not session_id
         or not str(request_cycle_token or "")
-        or phases != 1
+        or phases not in (1, 3)
         or amp != 6
-        or quantum_w < 6 * 230
+        or quantum_w < amp * 230 * phases
         or required_w < quantum_w
         or now_value <= 0.0
         or provided_group_members_invalid
@@ -184,8 +185,8 @@ def begin_request(
         "wb_id": charger_id,
         "plug_session_id": session_id,
         "request_cycle_token": str(request_cycle_token),
-        "target_phases": 1,
-        "minimum_amp": 6,
+        "target_phases": phases,
+        "minimum_amp": amp,
         "minimum_quantum_w": quantum_w,
         "group_minimum_w": required_w,
         "group_members": normalized_members,
@@ -355,9 +356,15 @@ def intent_contract(wb_intent, *, now_ts):
             blockers.append("identity_missing")
         if _int(item.get("wb_id"), 0) <= 0:
             blockers.append("wb_id_invalid")
-        if _int(item.get("target_phases"), 0) != 1 or _int(item.get("minimum_amp"), 0) != 6:
-            blockers.append("not_1p_6a")
-        if minimum_w < 6 * 230 or group_w < minimum_w:
+        target_phases = _int(item.get("target_phases"), 0)
+        minimum_amp = _int(item.get("minimum_amp"), 0)
+        if target_phases not in (1, 3) or minimum_amp != 6:
+            blockers.append("not_supported_phase_6a")
+        if (
+            target_phases not in (1, 3)
+            or minimum_w < minimum_amp * 230 * target_phases
+            or group_w < minimum_w
+        ):
             blockers.append("minimum_power_invalid")
         if (
             not isinstance(raw_group_members, list)
@@ -366,8 +373,10 @@ def intent_contract(wb_intent, *, now_ts):
             or not isinstance(selected_group_member, dict)
             or str(selected_group_member.get("plug_session_id") or "")
             != session_id
-            or _int(selected_group_member.get("target_phases"), 0) != 1
-            or _int(selected_group_member.get("minimum_amp"), 0) != 6
+            or _int(selected_group_member.get("target_phases"), 0)
+            != target_phases
+            or _int(selected_group_member.get("minimum_amp"), 0)
+            != minimum_amp
             or _int(selected_group_member.get("minimum_power_w"), 0)
             != minimum_w
             or sum(
@@ -917,7 +926,7 @@ def floor_override_contract(
     immediate_battery_stop_due=False,
     battery_cooldown_active=False,
 ):
-    """Begrenzt den wbminSoC-Startschutz auf exakt 1p/6 A.
+    """Begrenzt den wbminSoC-Startschutz auf exakt 6 A der Vertragsphasen.
 
     Ein gebundener Start darf ausschließlich lokale Batterie-Floor-Stopps
     kurz unterdrücken. Ein harter Netzstopp bleibt unverändert wirksam. Ohne
@@ -957,7 +966,7 @@ def floor_override_contract(
         "reason": (
             "hard_grid_stop"
             if hard_grid
-            else "storage_grant_exact_1p_6a"
+            else "storage_grant_exact_contract_phases_6a"
             if active
             else "no_exact_active_floor_grant"
         ),

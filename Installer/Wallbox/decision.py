@@ -3945,6 +3945,71 @@ def openwb_mode9_pv_phase_down_required(
     )
 
 
+def phase_3p_budget_support_contract(
+    *,
+    phase_budget_w: float,
+    authorized_budget_w: float,
+    phase_3p_min_w: float,
+    phase_up_buffer_w: float,
+    grid_power_w: float,
+    phase_up_grid_allow_w: float,
+    ordinary_override_allowed: bool,
+    openwb_pro: bool,
+    phase_target: int,
+    strong_export_threshold_w: float,
+    fresh_budget_authorized: bool,
+    strong_export_safety_clear: bool,
+) -> Dict[str, Any]:
+    """Trennt das physische 3p-Minimum vom 1→3-Hochwechselpuffer.
+
+    Der zusätzliche Up-Puffer bleibt dem gewöhnlichen 1→3-Wechsel
+    vorbehalten. Ein noch ungesetztes oder bereits bestätigtes 3p-Ziel darf
+    bei starkem Export schon mit dem frischen, autorisierten physischen
+    Mindestbudget als tragfähig gelten. Safety- und Freshness-Gates werden
+    dabei nicht ersetzt, sondern als explizite Voraussetzung gebunden.
+    """
+
+    budget_w = max(0.0, _safe_float(phase_budget_w, 0.0))
+    authorized_w = max(0.0, _safe_float(authorized_budget_w, 0.0))
+    minimum_w = max(0.0, _safe_float(phase_3p_min_w, 0.0))
+    buffer_w = max(0.0, _safe_float(phase_up_buffer_w, 0.0))
+    grid_w = _safe_float(grid_power_w, 0.0)
+    up_grid_allow_w = _safe_float(phase_up_grid_allow_w, 0.0)
+    export_threshold_w = max(
+        0.0,
+        _safe_float(strong_export_threshold_w, 0.0),
+    )
+    target = valid_phase_count(phase_target, 0)
+
+    ordinary_up_supported = bool(
+        budget_w >= minimum_w + buffer_w
+        and (grid_w < up_grid_allow_w or ordinary_override_allowed)
+    )
+    strong_export_supported = bool(
+        openwb_pro
+        and target in (0, 3)
+        and budget_w >= minimum_w
+        and authorized_w >= minimum_w
+        and grid_w <= -export_threshold_w
+        and fresh_budget_authorized
+        and strong_export_safety_clear
+    )
+    return {
+        "contract": "phase_3p_budget_support_v1",
+        "supported": bool(
+            ordinary_up_supported or strong_export_supported
+        ),
+        "ordinary_up_supported": ordinary_up_supported,
+        "strong_export_supported": strong_export_supported,
+        "phase_budget_w": budget_w,
+        "authorized_budget_w": authorized_w,
+        "minimum_3p_w": minimum_w,
+        "up_buffer_w": buffer_w,
+        "strong_export_threshold_w": export_threshold_w,
+        "phase_target": target,
+    }
+
+
 def phase_switch_recommendation(
     *,
     openwb_phase_capable: bool,
@@ -4084,22 +4149,38 @@ def phase_switch_recommendation(
             }
         return wait("WAIT", 0, "phase_change_hold", hold_s, last_age)
 
+    # Die persistierte openWB-Pro-Hardwarefrist sperrt jede neue Phasenkante
+    # symmetrisch. Sie darf den Strom am bereits bestätigten Phasenziel nicht
+    # sperren; deshalb bleibt die Phasenentscheidung neutral und die
+    # nachgelagerte Stromentscheidung kann weiter START/SET_CURRENT liefern.
+    if phase_block_active:
+        return {
+            "action": "KEEP_PHASES",
+            "target_phases": 0,
+            "reason": "phase_change_deadline_current_allowed",
+            "wait_s": 0,
+            "remaining_s": 0,
+        }
+
     if vehicle_1p_only and target == 3:
         return wait("SWITCH_1P", 1, "vehicle_1p_only", 0, 0)
 
     start_1p_needed = bool(
-        phase_start_1p_possible
-        or (
-            charger_connected
-            and not hw_charging
-            and public_mode > 0
-            and cap > 0
-            and cap_phases == 1
-            and phase_configured_3p
-            and target != 1
-            and not phase_forecast_hold_for_wb
-            and not phase_3p_supported
-            and not phase_3p_pending_hold_active
+        switch_phases != 3
+        and (
+            phase_start_1p_possible
+            or (
+                charger_connected
+                and not hw_charging
+                and public_mode > 0
+                and cap > 0
+                and cap_phases == 1
+                and phase_configured_3p
+                and target != 1
+                and not phase_forecast_hold_for_wb
+                and not phase_3p_supported
+                and not phase_3p_pending_hold_active
+            )
         )
     )
     if start_1p_needed:

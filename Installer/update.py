@@ -6258,6 +6258,7 @@ REQUIRED_WEB_FILES = (
     "index.html",
     "index.php",
     "helpers.php",
+    "retention.php",
     "get_shadow_snapshot.php",
     "solar.js",
     "solar.min.js",
@@ -17441,7 +17442,7 @@ def _web_program_contract_from_commit(
                 continue
             raise RuntimeError("Commitgebundene Webprojektion besitzt einen ungültigen Pfad")
         files.add(projected)
-    required = {"index.php", "helpers.php", "VERSION", "UPDATE_POLICY.json"}
+    required = {"index.php", "helpers.php", "retention.php", "VERSION", "UPDATE_POLICY.json"}
     if not required.issubset(files):
         raise RuntimeError("Commitgebundene Webprojektion ist unvollständig")
     directories = {
@@ -21768,7 +21769,7 @@ def _estimate_target_release_space(
         if projected in web_entries:
             raise RuntimeError("Webprojektion besitzt ein doppeltes Ziel")
         web_entries[projected] = entry
-    required_web = {"index.php", "helpers.php", "VERSION", "UPDATE_POLICY.json"}
+    required_web = {"index.php", "helpers.php", "retention.php", "VERSION", "UPDATE_POLICY.json"}
     if not required_web.issubset(web_entries):
         raise RuntimeError("Zielcommit besitzt keine vollständige Webprojektion")
 

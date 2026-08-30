@@ -1,6 +1,6 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.4f
+Dokumentation Stand: 5.4.4g
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
@@ -14,7 +14,7 @@ Dashboard, Konsole und Installer-Menü denselben Dispatcher. Die automatische
 Updateprüfung verwendet dieselbe Stable-Quelle, informiert aber nur über einen
 neuen Stand.
 
-Der Installer-Anteil von 5.4.4f lässt den heruntergeladenen Ziel-Updater
+Der Installer-Anteil von 5.4.4g lässt den heruntergeladenen Ziel-Updater
 Vollbackup, kurze ruhende Daten-Nachsicherung, Releaseprojektion, Reparatur
 bekannter Rechte und Dienstneustart durchführen. Das Nutzer-`.git`, lokale
 Produktänderungen, fehlende Produktdateien und historische Rechte sind keine
@@ -27,7 +27,7 @@ Webaktionen werten Anmeldung, CSRF, HTTP-Ergebnis, Antwortinhalt und Teilfehler
 aus, bevor sie Erfolg anzeigen. Für private Modus-5-Daten gilt `02770`; der
 ausdrücklich gewählte Kompatibilitätsmodus `02775` bleibt zulässig.
 
-Für eine beibehaltene `external_pv_topology.json` stellt 5.4.4f den
+Für eine beibehaltene `external_pv_topology.json` stellt 5.4.4g den
 Installationsnutzer, die Webgruppe und den gemeinsamen Lesemodus `0664`
 wieder her. Die übrigen Konfigurations- und Geheimnisdateien bleiben bei ihren
 strengeren Rechteverträgen.

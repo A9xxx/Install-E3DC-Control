@@ -346,20 +346,24 @@ function readWallboxManualSocValue($wbId) {
     ] as $path) {
         if ($path === '' || !is_file($path)) continue;
         $data = json_decode((string)@file_get_contents($path), true);
-        if (!is_array($data) || !isset($data['soc']) || !is_numeric($data['soc'])) continue;
-        return sanitizeWallboxPercentValue($data['soc'], 0);
+        if (!is_array($data) || !array_key_exists('soc', $data)) continue;
+        $soc = wallboxPageSocPercentValue($data['soc']);
+        if ($soc === null) continue;
+        return rtrim(rtrim(number_format($soc, 2, '.', ''), '0'), '.');
     }
     return '';
 }
 
 function buildWallboxManualSocSample($wbId, $socValue, $carId, $carName, $capacity, $source = 'manual_start_soc') {
     $wbId = max(1, min(2, (int)$wbId));
+    if (!is_int($socValue) && !is_float($socValue) && !is_string($socValue)) return false;
     $socText = trim((string)$socValue);
     if ($socText === '') return false;
-    $soc = (float)str_replace(',', '.', $socText);
-    if (!is_finite($soc)) return false;
-    $soc = max(0.0, min(100.0, $soc));
-    return [
+    $soc = wallboxPageSocPercentValue(str_replace(',', '.', $socText));
+    if ($soc === null) return false;
+    $source = strtolower(trim((string)$source));
+    $actionTs = time();
+    $sample = [
         'soc' => $soc,
         'car_id' => trim((string)$carId),
         'name' => trim((string)$carName),
@@ -367,8 +371,17 @@ function buildWallboxManualSocSample($wbId, $socValue, $carId, $carName, $capaci
         'wb' => $wbId,
         'source' => $source,
         'plugged' => true,
-        'ts' => time(),
+        'ts' => $actionTs,
     ];
+    if (in_array($source, ['manual_start_soc', 'openwb_profile_link'], true)) {
+        $sample['soc_source_ts'] = $actionTs;
+        $sample['raw_soc_ts'] = $actionTs;
+        $sample['soc_rule_confirmed'] = true;
+        $sample['soc_age_contract'] = 'vehicle_soc_source_age_v1';
+        $sample['soc_age_contract_source'] = $source;
+        $sample['soc_max_age_s'] = 36 * 3600;
+    }
+    return $sample;
 }
 
 function normalizeWallboxDepartureTime($value) {
@@ -709,12 +722,16 @@ function findSavedCarIndexForIdentifiers($cars, $identifiers, $name = '') {
         }
     }
     if (!empty($probes)) return null;
+    $nameMatches = [];
     foreach ($cars as $idx => $car) {
         if (!is_array($car)) continue;
         $savedName = normalizeVehicleNameWallbox($car['name'] ?? '');
-        if ($nameNorm !== '' && $savedName !== '' && $nameNorm === $savedName) return $idx;
+        if ($nameNorm !== '' && $savedName !== '' && $nameNorm === $savedName) {
+            $stableId = compactVehicleIdentifierWallbox($car['id'] ?? ($car['profile_id'] ?? ''));
+            if ($stableId !== '') $nameMatches[$stableId] = $idx;
+        }
     }
-    return null;
+    return count($nameMatches) === 1 ? (int)reset($nameMatches) : null;
 }
 
 function normalizeVehicleNameWallbox($value) {
@@ -740,28 +757,107 @@ function newSavedCarProfileIdWallbox($cars) {
     return $id;
 }
 
-function getLiveCloudVehiclesForWallbox() {
+function wallboxPageSocPercentValue($value) {
+    if (is_bool($value) || $value === null || $value === '' || !is_numeric($value)) return null;
+    $soc = (float)$value;
+    if (!is_finite($soc) || $soc < 0.0 || $soc > 100.0) return null;
+    return $soc;
+}
+
+function wallboxPageSocUsesOpenwbProAnchor($source) {
+    $contract = e3dcVehicleSocSourceContract($source);
+    return is_array($contract)
+        && in_array($contract['base_source'], ['openwb_pro_raw', 'openwb_pro_estimated'], true);
+}
+
+function wallboxPageSocSourceTrusted($source) {
+    return is_array(e3dcVehicleSocSourceContract($source));
+}
+
+function wallboxPageLiveVehicleSocUsable($vehicle, $config = [], $now = null) {
+    if (!is_array($vehicle)
+        || !empty($vehicle['soc_stale'])
+        || wallboxPageSocPercentValue($vehicle['soc'] ?? null) === null) return false;
+    $source = strtolower(trim((string)($vehicle['soc_source'] ?? ($vehicle['source'] ?? ''))));
+    if (!wallboxPageSocSourceTrusted($source)) return false;
+    $manualSource = in_array($source, ['manual_start_soc', 'manual_soc', 'manual', 'openwb_profile_link'], true);
+    $sourceTsRaw = array_key_exists('soc_source_ts', $vehicle)
+        ? $vehicle['soc_source_ts']
+        : ($manualSource ? ($vehicle['raw_soc_ts'] ?? ($vehicle['ts'] ?? null)) : null);
+    if ($sourceTsRaw === null || $sourceTsRaw === '') return false;
+    if (!wallboxPageSocRuleConfirmed(
+        $source,
+        $vehicle['soc_rule_confirmed'] ?? null,
+        $sourceTsRaw,
+        $config,
+        $now,
+        array_key_exists('soc_rule_confirmed', $vehicle),
+        $vehicle
+    )) return false;
+    if (is_numeric($sourceTsRaw)) {
+        $sourceTs = (float)$sourceTsRaw;
+        if ($sourceTs > 100000000000.0) $sourceTs /= 1000.0;
+    } else {
+        $sourceTs = strtotime(trim((string)$sourceTsRaw));
+        if ($sourceTs === false) return false;
+    }
+    $now = is_numeric($now) ? (float)$now : (float)time();
+    if ($sourceTs <= 0.0 || $sourceTs > $now + 300.0) return false;
+    $cloudFreshnessS = e3dcVehicleSocCloudFreshnessSeconds($config);
+    $maxAgeS = e3dcVehicleSocPayloadMaxAgeSeconds(
+        $vehicle,
+        $source,
+        $cloudFreshnessS
+    );
+    if ($maxAgeS === null) return false;
+    return ($now - $sourceTs) <= $maxAgeS;
+}
+
+function getLiveCloudVehiclesForWallbox($config = []) {
     $vehiclesData = readJsonArrayWallbox('/var/www/html/ramdisk/vehicles.json', []);
     $vehicles = $vehiclesData['vehicles'] ?? $vehiclesData;
-    return is_array($vehicles) ? $vehicles : [];
+    if (!is_array($vehicles)) return [];
+    foreach ($vehicles as &$vehicle) {
+        if (!is_array($vehicle) || wallboxPageLiveVehicleSocUsable($vehicle, $config)) continue;
+        $vehicle['soc'] = null;
+        $vehicle['range_km'] = null;
+    }
+    unset($vehicle);
+    return $vehicles;
 }
 
-function wallboxPageSocRuleConfirmed($source, $ruleConfirmed = null) {
-    if ($ruleConfirmed === true || $ruleConfirmed === 1 || $ruleConfirmed === '1' || $ruleConfirmed === 'true') return true;
+function wallboxPageSocRuleConfirmed($source, $ruleConfirmed = null, $sourceTs = null, $config = [], $now = null, $rulePresent = null, $agePayload = null) {
     $source = strtolower(trim((string)$source));
-    if ($source === '' || in_array($source, ['simple_view_start_soc', 'config_start_soc', 'configured_wallbox'], true)) return false;
-    if (strpos($source, 'wallbox_estimated_from_') === 0) {
-        return wallboxPageSocRuleConfirmed(substr($source, strlen('wallbox_estimated_from_')), null);
+    $contract = e3dcVehicleSocSourceContract($source);
+    if (!is_array($contract)) return false;
+    $rulePresent = is_bool($rulePresent) ? $rulePresent : $ruleConfirmed !== null;
+    $manualSource = !$contract['derived'] && $contract['kind'] === 'manual';
+    if ($manualSource) {
+        if ($rulePresent && $ruleConfirmed !== true) return false;
+    } elseif ($ruleConfirmed !== true) {
+        return false;
     }
-    if (strpos($source, 'wallbox_estimated') === 0) return false;
-    if (in_array($source, ['manual_start_soc', 'manual_soc', 'manual', 'openwb_profile_link', 'openwb_pro_raw', 'openwb_pro_estimated'], true)) return true;
-    foreach (['mqtt', 'bluelink', 'wallbox', 'openwb', 'vehicle', 'car_soc', 'hyundai', 'kia'] as $token) {
-        if (strpos($source, $token) !== false) return true;
+    if ($sourceTs === null || $sourceTs === '') return false;
+    if (is_numeric($sourceTs)) {
+        $sourceTs = (float)$sourceTs;
+        if ($sourceTs > 100000000000.0) $sourceTs /= 1000.0;
+    } else {
+        $sourceTs = strtotime(trim((string)$sourceTs));
+        if ($sourceTs === false) return false;
     }
-    return false;
+    $now = is_numeric($now) ? (float)$now : (float)time();
+    if ($sourceTs <= 0.0 || $sourceTs > $now + 300.0) return false;
+    $cloudFreshnessS = e3dcVehicleSocCloudFreshnessSeconds($config);
+    $maxAgeS = e3dcVehicleSocPayloadMaxAgeSeconds(
+        $agePayload,
+        $source,
+        $cloudFreshnessS
+    );
+    if ($maxAgeS === null) return false;
+    return ($now - $sourceTs) <= $maxAgeS;
 }
 
-function getDetectedOpenwbVehiclesForWallbox($savedCars) {
+function getDetectedOpenwbVehiclesForWallbox($savedCars, $config = []) {
     $detected = [];
     $files = [
         1 => '/var/www/html/ramdisk/openwb_data.json',
@@ -785,12 +881,27 @@ function getDetectedOpenwbVehiclesForWallbox($savedCars) {
         ], $name);
         if ($match !== null) continue;
         $socSource = (string)($data['car_soc_source'] ?? '');
-        $socConfirmed = wallboxPageSocRuleConfirmed($socSource, $data['car_soc_rule_confirmed'] ?? null);
+        $socValue = wallboxPageSocPercentValue($data['car_soc'] ?? null);
+        $socSourceLower = strtolower(trim($socSource));
+        $socSourceTs = $data['car_soc_source_ts'] ?? ($data['car_soc_raw_ts'] ?? null);
+        if (($socSourceTs === null || $socSourceTs === '')
+            && in_array($socSourceLower, ['manual_start_soc', 'manual_soc', 'manual', 'openwb_profile_link'], true)) {
+            $socSourceTs = $data['ts'] ?? null;
+        }
+        $socConfirmed = wallboxPageSocRuleConfirmed(
+            $socSource,
+            $data['car_soc_rule_confirmed'] ?? null,
+            $socSourceTs,
+            $config,
+            null,
+            array_key_exists('car_soc_rule_confirmed', $data),
+            $data
+        ) && $socValue !== null;
         $detected[] = [
             'wb' => $wb,
             'name' => $name ?: ($wb === 1 ? 'openWB Fahrzeug' : 'openWB Pro Fahrzeug'),
             'vehicle_id' => $vehicleId,
-            'soc' => $socConfirmed ? ($data['car_soc'] ?? null) : null,
+            'soc' => $socConfirmed ? $socValue : null,
             'range_km' => $socConfirmed ? ($data['car_range'] ?? null) : null,
             'power' => (int)($data['phases_in_use'] ?? 0) >= 3 ? 11.0 : (isset($data['charge_power']) ? (float)$data['charge_power'] : 11.0),
             'max_phases' => isset($data['max_phases']) && is_numeric($data['max_phases']) ? (int)$data['max_phases'] : ((int)($data['phases_in_use'] ?? 0) >= 3 ? 3 : null),
@@ -846,9 +957,9 @@ function addWallboxVehicleOption(&$options, $vehicle, $fallbackName = '') {
     foreach ($options as $existingId => $existing) {
         $existingAliases = $existing['aliases'] ?? [];
         if (!empty($aliases) && !empty(array_intersect($aliases, $existingAliases))) {
-            $soc = $vehicle['soc'] ?? null;
-            if ($soc !== null && $soc !== '' && is_numeric($soc) && isset($options[$existingId])) {
-                $socRounded = round((float)$soc);
+            $soc = wallboxPageSocPercentValue($vehicle['soc'] ?? null);
+            if ($soc !== null && isset($options[$existingId])) {
+                $socRounded = round($soc);
                 $existingName = trim((string)($options[$existingId]['name'] ?? $name));
                 if ($existingName === '') $existingName = $name ?: $id;
                 $options[$existingId]['soc'] = $socRounded;
@@ -868,9 +979,9 @@ function addWallboxVehicleOption(&$options, $vehicle, $fallbackName = '') {
         }
     }
     if (isset($options[$id])) {
-        $soc = $vehicle['soc'] ?? null;
-        if ($soc !== null && $soc !== '' && is_numeric($soc)) {
-            $socRounded = round((float)$soc);
+        $soc = wallboxPageSocPercentValue($vehicle['soc'] ?? null);
+        if ($soc !== null) {
+            $socRounded = round($soc);
             $existingName = trim((string)($options[$id]['name'] ?? $name));
             if ($existingName === '') $existingName = $name ?: $id;
             $options[$id]['soc'] = $socRounded;
@@ -888,16 +999,16 @@ function addWallboxVehicleOption(&$options, $vehicle, $fallbackName = '') {
         }
         return;
     }
-    $soc = $vehicle['soc'] ?? null;
+    $soc = wallboxPageSocPercentValue($vehicle['soc'] ?? null);
     $label = $name;
-    if ($soc !== null && $soc !== '' && is_numeric($soc)) {
-        $label .= ' (' . round((float)$soc) . '%)';
+    if ($soc !== null) {
+        $label .= ' (' . round($soc) . '%)';
     }
     $options[$id] = [
         'id' => $id,
         'label' => $label,
         'name' => $name,
-        'soc' => ($soc !== null && $soc !== '' && is_numeric($soc)) ? round((float)$soc) : '',
+        'soc' => $soc !== null ? round($soc) : '',
         'capacity' => $vehicle['capacity'] ?? $vehicle['capacity_kwh'] ?? '',
         'power' => $vehicle['power'] ?? $vehicle['charge_power'] ?? $vehicle['charge_power_kw'] ?? '',
         'max_phases' => wallboxVehicleMaxPhases($vehicle),
@@ -1059,11 +1170,13 @@ if (isset($_POST['trigger_wb_force_start_ajax'])) {
     $nativeUpdates = [
         "wb{$wbId}_manual_pause" => '0',
         "wb{$wbId}_mode" => '1',
-        'wb_sofort' => '1',
-        'wbhour' => '99',
     ];
     $tx = e3dcWallboxPlanTransaction($nativeUpdates, [
-        'operation' => 'plan',
+        // Der explizite Sofortstart ist ein sitzungsgebundener Managerauftrag
+        // und keine neue Tarif-/Zeitplanung. Bestehende Pläne bleiben deshalb
+        // byteidentisch; insbesondere darf WB2 keinen globalen Legacy-Plan
+        // für WB1 mit `wbhour=99` erzwingen.
+        'operation' => 'preserve',
         'abort_flag' => 'remove',
     ]);
     header('Content-Type: application/json; charset=utf-8');
@@ -1366,19 +1479,15 @@ if (isset($_POST['save_soc_settings'])) {
 
         // Neu: Wenn Ist-SoC mitgeliefert ("Gastfahrzeug"), dann auch ins RAM schreiben
         if (isset($_POST['manual_soc_wb1']) && trim($_POST['manual_soc_wb1']) !== '') {
-            $msoc = (float)str_replace(',', '.', $_POST['manual_soc_wb1']);
-            $msoc = max(0, min(100, $msoc));
-            $jd = [
-                'soc' => $msoc,
-                'name' => $updates['wb1_car_id'],
-                'car_id' => $updates['wb1_car_id'],
-                'capacity' => (float)$updates['wb1_capacity'],
-                'wb' => 1,
-                'source' => 'manual_start_soc',
-                'plugged' => true,
-                'ts' => time(),
-            ];
-            $manualSocCandidates[1] = $jd;
+            $sample = buildWallboxManualSocSample(
+                1,
+                $_POST['manual_soc_wb1'],
+                $updates['wb1_car_id'],
+                $updates['wb1_car_id'],
+                $updates['wb1_capacity'],
+                'manual_start_soc'
+            );
+            if (is_array($sample)) $manualSocCandidates[1] = $sample;
         }
     }
 
@@ -1394,19 +1503,15 @@ if (isset($_POST['save_soc_settings'])) {
         }
 
         if (isset($_POST['manual_soc_wb2']) && trim($_POST['manual_soc_wb2']) !== '') {
-            $msoc = (float)str_replace(',', '.', $_POST['manual_soc_wb2']);
-            $msoc = max(0, min(100, $msoc));
-            $jd = [
-                'soc' => $msoc,
-                'name' => $updates['wb2_car_id'],
-                'car_id' => $updates['wb2_car_id'],
-                'capacity' => (float)$updates['wb2_capacity'],
-                'wb' => 2,
-                'source' => 'manual_start_soc',
-                'plugged' => true,
-                'ts' => time(),
-            ];
-            $manualSocCandidates[2] = $jd;
+            $sample = buildWallboxManualSocSample(
+                2,
+                $_POST['manual_soc_wb2'],
+                $updates['wb2_car_id'],
+                $updates['wb2_car_id'],
+                $updates['wb2_capacity'],
+                'manual_start_soc'
+            );
+            if (is_array($sample)) $manualSocCandidates[2] = $sample;
         }
     }
 
@@ -1612,26 +1717,26 @@ if (isset($_POST['abort_all_charging'])) {
 
 if (isset($_POST['save_manual_soc'])) {
     $wbIdx = (int)($_POST['wb_index'] ?? 1);
-    $manualSoc = (float)str_replace(',', '.', $_POST['manual_soc_value'] ?? '0');
-    if ($manualSoc < 0) $manualSoc = 0;
-    if ($manualSoc > 100) $manualSoc = 100;
-
-    $data = [
-        'soc' => $manualSoc,
-        'car_id' => trim($_POST['manual_car_id'] ?? ''),
-        'name' => trim($_POST['manual_car_name'] ?? ''),
-        'capacity' => (float)str_replace(',', '.', $_POST['manual_car_capacity'] ?? '0'),
-        'wb' => $wbIdx,
-        'source' => 'manual_start_soc',
-        'plugged' => true,
-        'ts' => time()
-    ];
-
-    $tx = e3dcWallboxPlanTransaction([], [
-        'operation' => 'plan',
-        'abort_flag' => 'remove',
-        'manual_soc' => [$wbIdx => $data],
-    ]);
+    $data = buildWallboxManualSocSample(
+        $wbIdx,
+        $_POST['manual_soc_value'] ?? null,
+        $_POST['manual_car_id'] ?? '',
+        $_POST['manual_car_name'] ?? '',
+        $_POST['manual_car_capacity'] ?? '0',
+        'manual_start_soc'
+    );
+    $manualSoc = is_array($data) ? $data['soc'] : null;
+    $tx = is_array($data)
+        ? e3dcWallboxPlanTransaction([], [
+            'operation' => 'plan',
+            'abort_flag' => 'remove',
+            'manual_soc' => [$wbIdx => $data],
+        ])
+        : [
+            'success' => false,
+            'code' => 'invalid_soc',
+            'message' => 'Der manuelle Start-SoC muss eine Zahl zwischen 0 und 100 Prozent sein.',
+        ];
     if (!empty($tx['success'])) {
         // Abbruchflag IMMER löschen, wenn ein neuer SoC gesetzt wird
         $abort_flag = '/var/www/html/ramdisk/native_schedule_aborted.flag';
@@ -1725,17 +1830,18 @@ if (isset($_POST['save_custom_car'])) {
         $assignMessage = " und Wallbox {$assignWb} zugeordnet";
         $detectedSoc = trim($_POST['custom_car_current_soc'] ?? '');
         if ($detectedSoc !== '') {
-            $soc = max(0, min(100, (float)str_replace(',', '.', $detectedSoc)));
-            $manualSocCandidates[$assignWb] = [
-                    'soc' => $soc,
-                    'name' => $newCar['id'],
-                    'capacity' => (float)$newCar['capacity'],
-                    'vehicle_id' => $newCar['vehicle_id'],
-                    'car_id' => $newCar['id'],
-                    'wb' => $assignWb,
-                    'source' => 'openwb_profile_link',
-                    'ts' => time(),
-            ];
+            $sample = buildWallboxManualSocSample(
+                $assignWb,
+                $detectedSoc,
+                $newCar['id'],
+                $newCar['id'],
+                $newCar['capacity'],
+                'openwb_profile_link'
+            );
+            if (is_array($sample)) {
+                $sample['vehicle_id'] = $newCar['vehicle_id'];
+                $manualSocCandidates[$assignWb] = $sample;
+            }
         }
     }
     $txOptions = [
@@ -1830,8 +1936,8 @@ if (isset($_POST['save_cloud_integration'])) {
 
 $saved_cars = file_exists($saved_cars_file) ? json_decode(file_get_contents($saved_cars_file), true) : [];
 if (!is_array($saved_cars)) $saved_cars = [];
-$live_cloud_vehicles = getLiveCloudVehiclesForWallbox();
-$unknown_openwb_vehicles = getDetectedOpenwbVehiclesForWallbox($saved_cars);
+$live_cloud_vehicles = getLiveCloudVehiclesForWallbox($confData['config'] ?? []);
+$unknown_openwb_vehicles = getDetectedOpenwbVehiclesForWallbox($saved_cars, $confData['config'] ?? []);
 $observed_openwb_profiles = getObservedOpenwbChargeProfilesForWallbox();
 
 function applyAwattarPriceLogic($priceRaw, $awmwst, $awnebenkosten)
@@ -6235,7 +6341,6 @@ function toggleWbMode(wbIdx) {
     }
 
     wallboxPost(formData).then(res => wallboxRequireConfirmedText(res)).then(() => {
-        console.log(`WB${wbIdx} Mode/Lock saved.`);
         if (previousMode !== String(mode)) setWallboxPauseUi(wbIdx, false, false);
         modeSelect.dataset.savedMode = String(mode);
         if (observeSelect) observeSelect.dataset.savedPolicy = observePolicy;

@@ -154,8 +154,16 @@ def _selected_backup_profile(profile, install_path) -> BackupProfileOptions:
 
 
 def _warn_backup(message: str) -> None:
-    print(f"[WARNUNG] {message}")
+    """Gibt eine Warnung genau einmal über das zentrale Installationslog aus."""
+
     log_warning("backup", message)
+
+
+def _info_backup(message: str) -> None:
+    """Zeigt erwartbare Profilhinweise einmalig und ohne Warnstufe an."""
+
+    print(f"[INFO] {message}", flush=True)
+    backup_logger.info(message)
 
 
 def _prepare_private_ml_store_for_backup(
@@ -561,7 +569,7 @@ def _backup_current_version_v2(
         if options.include_optional_ml:
             _prepare_private_ml_store_for_backup(PRIVATE_ML_ROOT)
         elif os.path.lexists(str(PRIVATE_ML_ROOT)):
-            _warn_backup(
+            _info_backup(
                 "Der optionale ML-Store bleibt für das Core-Update unverändert "
                 "und wird nicht Bestandteil des Rückfallbackups."
             )
@@ -633,10 +641,20 @@ def _backup_current_version_v2(
             if isinstance(record, dict) and isinstance(item, dict)
         ]
         for source, item in skipped:
-            _warn_backup(
-                "Backupquelle wurde nofollow übersprungen: "
-                f"{source} / {item.get('path')} ({item.get('reason')})"
-            )
+            if (
+                source == str(SYSTEMD_ADMIN_UNIT_DIR / "e3dc.service")
+                and item.get("path") == "."
+                and item.get("reason") == "symlink"
+            ):
+                _info_backup(
+                    "Die alte e3dc.service-Verknüpfung wird bewusst nicht als Datei "
+                    "gesichert; der veröffentlichte Dienststand wird beim Update neu gesetzt."
+                )
+            else:
+                _warn_backup(
+                    "Backupquelle wurde nofollow übersprungen: "
+                    f"{source} / {item.get('path')} ({item.get('reason')})"
+                )
         if not mapped_entries:
             raise BackupIntegrityError("Es wurden keine wiederherstellbaren Dateien gesichert.")
         secure_backup_tree(backup_dir)
@@ -650,7 +668,6 @@ def _backup_current_version_v2(
                 systemd_mask_state if options.enforce_systemd_mask_contract else None
             ),
         )
-        manifest = verify_backup(backup_dir, expected_kind=SYSTEM_BACKUP_KIND)
         if verified_pre_chown_callback is not None:
             if not callable(verified_pre_chown_callback):
                 raise BackupIntegrityError("Backup-Receipt-Callback ist nicht aufrufbar")
@@ -685,12 +702,47 @@ def _backup_current_version_v2(
             if not retention.get("success"):
                 raise BackupIntegrityError("Backup-Retention ist fehlgeschlagen.")
             if not retention.get("limit_satisfied", True):
-                _warn_backup(
-                    "Das neue verifizierte Backup bleibt gültig; das Limit von "
-                    "maximal drei Backup-Familien konnte wegen einer laufenden "
-                    "Schutz- oder Recovery-Bindung noch nicht vollständig angewendet "
-                    "werden. Der nächste sichere Retention-Lauf wendet die Grenze nach "
-                    "Ende der Bindung erneut an."
+                update_retention = retention.get("update_backups")
+                web_retention = retention.get("web_installer_backups")
+                retention_payloads = [
+                    payload
+                    for payload in (update_retention, web_retention)
+                    if isinstance(payload, dict)
+                ]
+                unclassified_count = sum(
+                    len(payload.get("unclassified") or [])
+                    for payload in retention_payloads
+                )
+                verified_over_limit = any(
+                    isinstance(payload.get("verified_count_after"), int)
+                    and not isinstance(payload.get("verified_count_after"), bool)
+                    and isinstance(payload.get("keep_count"), int)
+                    and not isinstance(payload.get("keep_count"), bool)
+                    and payload["verified_count_after"] > payload["keep_count"]
+                    for payload in retention_payloads
+                )
+                if retention.get("blocked") or verified_over_limit:
+                    detail = (
+                        "Eine laufende Schutz- oder Recovery-Bindung hält den "
+                        "verifizierten Zielbestand vorübergehend über der Grenze. "
+                        "Der nächste sichere Retention-Lauf prüft ihn nach Ende der "
+                        "Bindung erneut."
+                    )
+                elif unclassified_count:
+                    detail = (
+                        f"{unclassified_count} nicht sicher klassifizierbare "
+                        "Altbestände bleiben unverändert außerhalb der "
+                        "verifizierten Rotation; sie zählen nicht als verifizierte "
+                        "Backup-Familien."
+                    )
+                else:
+                    detail = (
+                        "Die sichere Bereinigung ist noch nicht vollständig "
+                        "abgeschlossen und wird beim nächsten Retention-Lauf erneut "
+                        "geprüft."
+                    )
+                _info_backup(
+                    "Das neue verifizierte Backup bleibt gültig. " + detail
                 )
         except Exception as exc:
             if options.retention_failure_is_fatal:
@@ -776,7 +828,7 @@ def create_quiesced_overlay(
     *,
     transaction_id,
     parent_backup_dir,
-    parent_backup_id,
+    parent_backup_id=None,
     expected_install_root_identity=None,
 ):
     """Versiegelt mutable Nutzerdaten nach bestätigtem Dienststopp.
@@ -792,9 +844,10 @@ def create_quiesced_overlay(
         )
     install = _lexical_absolute(install_path or INSTALL_PATH)
     transaction = _normalized_transaction_id(transaction_id)
-    expected_parent_backup_id = _normalized_backup_id(
-        parent_backup_id,
-        label="Parent-Backup-ID",
+    expected_parent_backup_id = (
+        _normalized_backup_id(parent_backup_id, label="Parent-Backup-ID")
+        if parent_backup_id is not None
+        else None
     )
     target = _lexical_absolute(overlay_dir)
     parent_backup = _lexical_absolute(parent_backup_dir)
@@ -842,17 +895,22 @@ def create_quiesced_overlay(
             parent_backup,
             expected_kind=SYSTEM_BACKUP_KIND,
         )
+        verified_parent_backup_id = _normalized_backup_id(
+            parent_manifest.get("backup_id"),
+            label="Parent-Backup-ID",
+        )
         if (
-            str(parent_manifest.get("backup_id") or "")
-            != expected_parent_backup_id
-            or str(parent_manifest.get("install_root") or "") != str(install)
-        ):
+            expected_parent_backup_id is not None
+            and verified_parent_backup_id != expected_parent_backup_id
+        ) or str(parent_manifest.get("install_root") or "") != str(install):
             raise BackupIntegrityError(
                 "Parent-Backup stimmt nicht mit ID und Installationspfad überein"
             )
+        expected_parent_backup_id = verified_parent_backup_id
         parent_manifest_sha256 = verified_manifest_sha256(
             parent_backup,
             expected_kind=SYSTEM_BACKUP_KIND,
+            preverified_manifest=parent_manifest,
         )
         parent_after = os.stat(
             parent_backup.name,
@@ -907,7 +965,7 @@ def create_quiesced_overlay(
                 bound_source_root=source_binding,
             )
         secure_backup_tree(target)
-        finalize_backup(
+        manifest = finalize_backup(
             target,
             mapped_entries,
             source_records,
@@ -916,10 +974,10 @@ def create_quiesced_overlay(
             transaction_id=transaction,
             parent_backup_id=expected_parent_backup_id,
         )
-        manifest = verify_backup(target, expected_kind=QUIESCED_OVERLAY_KIND)
         manifest_sha256 = verified_manifest_sha256(
             target,
             expected_kind=QUIESCED_OVERLAY_KIND,
+            preverified_manifest=manifest,
         )
         os.fsync(target_descriptor)
         os.fsync(collection_descriptor)

@@ -6,6 +6,47 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.4g] – 2026-08-31
+
+### 💾 Schnellerer, verständlicherer und sicherer Updateweg
+
+- **Keine redundanten Vollprüfungen:** Das verifizierte Vollbackup und seine ruhende Daten-Nachsicherung werden weiterhin vollständig geprüft, aber nicht mehr unmittelbar mehrfach über denselben Datei- und SHA-256-Bestand gelesen. Manifest, Backup-ID, Installationspfad und Dateigeneration bleiben bis zum Dateiaustausch gebunden.
+- **Klare Betriebsphasen:** Weboberfläche und Protokoll unterscheiden Sicherung bei weiterlaufender Anlage, kurze kontrollierte Unterbrechung, Dateiaustausch/Rechte sowie Neustart/Funktionsprüfung. Gesamt- und Unterbrechungsdauer werden ausgewiesen; technische Details bleiben einsehbar, erscheinen aber nicht mehr als verwirrende doppelte Abschlussmeldungen.
+- **Robustes Browser-Polling:** Eine erwartbare Apache-Unterbrechung bis 120 Sekunden beendet die Updatebeobachtung nicht. Der Updateauftrag läuft unabhängig vom Browser weiter und die Oberfläche öffnet Rohdetails automatisch nur bei einem Fehler.
+- **Zielbestand drei plus drei:** Nach bestätigtem Wiederanlauf werden ungeschützte verifizierte Bestände auf höchstens drei System-Backup-Familien und drei Web-Sicherungen reduziert. Aktive Schutz- oder Recovery-Bindungen dürfen diese Zielgrenze vorübergehend überschreiten, ohne Updateabbruch oder erzwungene Löschung. Nicht verifizierbare oder unbekannte Bestände bleiben außerhalb der Rotation erhalten und werden eindeutig benannt.
+- **Keine rekursiven lokalen Arbeitskopien:** Eindeutig verborgene lokale Backup- und Staging-Arbeitsverzeichnisse direkt im Installationswurzelverzeichnis bleiben auf dem System erhalten, werden aber weder in jedes Vollbackup kopiert noch bei einem Restore entfernt. Reguläre Produkt-, Konfigurations- und Datenpfade sowie gleich benannte Unterverzeichnisse bleiben vollständig im Sicherungsvertrag.
+
+### 🗂️ Aufbewahrung von Konfiguration und Tageshistorie
+
+- **Automatische Config-Snapshots begrenzt:** Die neuesten 20 eindeutig automatisch erzeugten kleinen Konfigurationsstände bleiben erhalten. Über **„Dauerhaft lokal sichern“** markierte, Migrations-, unbekannte und nicht sicher gebundene Bestände bleiben außerhalb dieser Rotation erhalten; eine offene Bereinigung wird im Konfigurationseditor sichtbar gemeldet.
+- **30 Tage Detailhistorie mit Langzeit-Veto:** Minutengenaue Tagesdateien werden nur dann nach 30 Tagen entfernt, wenn genau dieses Datum bereits in der Langzeitdatenbank bestätigt ist. Fehlt dieser Nachweis, bleibt die Datei erhalten.
+- **Kein Überschreiben vollständiger Tagesarchive:** Ein vorhandenes Archiv wird unter Dateisperre nur um eine bytegenaue Fortsetzung ergänzt. Identische oder vollständigere Bestände bleiben unverändert; kürzere, abweichende oder konkurrierend ausgetauschte Dateien werden nie ersetzt.
+
+### 🚗 openWB Pro startet und wechselt Phasen wieder eindeutig
+
+- **Strom zuerst, Phase bestätigt danach:** Ein positives Ladeangebot wird in der gerätekonformen Reihenfolge materialisiert. Nach bestätigtem Phasenziel und kurzer Geräteunterbrechung darf der Mindeststrom wieder angeboten werden; die persistente 480-Sekunden-Frist sperrt ausschließlich einen weiteren Phasenwechsel.
+- **Wiederanlauf ohne alten Nullanker:** Ein manager-eigener temporärer 0-A-Anker, ein veralteter interner Stromshadow und eine nach Prozessneustart bereits bestätigte Phasengeneration können den nächsten sicheren 6-A-Start nicht mehr zirkulär blockieren. Stecksession, Zielphase, frischer Geräte-Readback, Budget und harte Schutzgrenzen müssen weiterhin zusammenpassen.
+- **Begrenztes Fahrzeug-Wake-up:** Ein startbereites, aber noch stromloses Fahrzeug erhält bei unverändertem Stromangebot nur die eng begrenzten CP-Wake-up-Versuche. Ein alter Energiezähler oder Lademarker gilt nicht als aktuelle Ladeannahme; erst frischer Ladestatus beziehungsweise reale Leistung bestätigt den Start.
+- **Manueller WB2-Start bleibt lokal:** Die Webaktion ändert nur Pause und Modus der gewählten Wallbox. Sie verlangt keinen leeren WB1-Plan mehr und zeigt typisierte Backendfehler statt der pauschalen Meldung „Network error“.
+- **Phasenwahrheiten bleiben getrennt:** Zielphase, unter Last tatsächlich genutzte Phasen, laufende Umschaltsequenz und Restschutzzeit werden nicht miteinander verwechselt. Ein bereits bestätigtes identisches Ziel ist ein No-op.
+- **Dreiphasiger PV-Start ohne falsches Zwischenziel:** Ein frisch und vollständig zentral finanziertes dreiphasiges PV-Budget darf unmittelbar das physische 3p-Mindestangebot tragen. Der normale Puffer für einen späteren Phasenwechsel erzeugt davor kein künstliches 1p-Ziel.
+- **PV-Angebot bleibt batterieneutral verfügbar:** Ein zentral belegter, batterieneutraler PV-Sink bleibt trotz Prognose-Akkuvorrang für das Fahrzeug nutzbar; daraus entsteht weder Netz- noch Akkuentladefreigabe. Der Start-Hold gilt nur für das vollständig finanzierte physische 6-A-Minimum bei 1p oder 3p und erzeugt kein Zusatzbudget.
+- **Einzelne Messwertstörung stoppt nicht hektisch:** Ein einzelner Grid-/PM-Glitch darf einen bereits bestätigten positiven Ausgang höchstens zehn Sekunden ohne neuen Hardwarebefehl halten. Eindeutiger Netzbezug, Schutz-Null oder eine anhaltende Störung gewinnen sofort beziehungsweise nach dem bestehenden Schutzvertrag.
+
+### 🔋 Quellengebundener Fahrzeug-SoC
+
+- **Messzeit statt Datei- oder Abrufzeit:** Bluelink, MQTT, Standard-openWB und openWB Pro transportieren den echten Fahrzeug-/Ereignisanker. Ein Timeout, Retain, Statusheartbeat oder erneutes Speichern verjüngt keinen alten SoC.
+- **Ein Vertrag in allen Verbrauchern:** Planner, SoC-Tracker, Wallbox-Manager, Wärmemanager und Weboberfläche lehnen abgelaufene, falsch gebundene, explizit gesperrte oder unbestätigte Maschinenwerte gemeinsam ab. Fahrzeug-, Wallbox-, Steck- und Profilbindung müssen eindeutig sein.
+- **Kompatibel ohne Truthiness-Fallen:** Ein echter Wert von 0 bis 100 Prozent bleibt gültig. Boolesche Werte, `NaN`, `Infinity`, Sentinelwerte und Werte außerhalb des Bereichs werden nicht als Prozentwert behandelt. Bekannte manuelle Altquellen bleiben nur mit expliziter Quelle, echtem Aktionszeitpunkt und ohne Veto kompatibel.
+- **Mehrfahrzeugbetrieb bleibt eindeutig:** Fallbacks über Namen oder alte Sessions greifen nur bei genau einer passenden Identität. Gleiche Namen und ungebundene Mehrfachprofile werden nicht geraten.
+
+### 📈 Standardprognose und Direktvermarktung bleiben gemeinsam lesbar
+
+- **Standardkurven verschwinden nicht:** Eine unvollständige, `actions_only`- oder fail-closed DV-Trajektorie blendet Standard-PV, Standard-SoC und die PV-kWh-Tagessummen weder im Hauptdiagramm noch im Ladekurvenfenster aus. Nur eine vollständige kanonische DV-Trajektorie darf die DV-SoC-Linie übernehmen.
+- **Kanonische Headroom-Bindung:** Speicherplatzfenster verwenden eine aus Aktion, Start, Ende und Grund gebildete Policyfenster-ID. Preisplateau- oder Marktfensterkennungen bleiben Provenienz und können die Regelbindung nicht ersetzen.
+- **Richtige Timeline-Struktur:** Forecast- und Tagesaggregation lesen Timeline und Planmetadaten aus ihren kanonischen Strukturen. Die DV-SoC-Anzeige bleibt eine reine Backend-Projektion ohne Browserentscheidung oder zusätzlichen Hardwarebefehl.
+- **E3/DC-DC bleibt getrennt von Zusatz-AC:** Ein E3DC-only-Ladeziel verwendet ohne eigene ausdrücklich freigegebene AC-Speicherroute keine Erzeugung eines Zusatzwechselrichters als internen DC-Laderahmen.
+
 ## [5.4.4f] – 2026-08-29
 
 ### 🚗 PV-Kurve startet mit belegtem Überschuss

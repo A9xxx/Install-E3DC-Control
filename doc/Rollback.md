@@ -12,9 +12,9 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
-## Backup und Rückweg in 5.4.4f
+## Backup und Rückweg in 5.4.4g
 
-5.4.4f lässt den heruntergeladenen Ziel-Updater das Vollbackup bei laufenden
+5.4.4g lässt den heruntergeladenen Ziel-Updater das Vollbackup bei laufenden
 Diensten erstellen. Erst für die ruhende Daten-Nachsicherung, Releaseprojektion
 und Rechte-Reparatur werden die betroffenen Dienste kurz gestoppt; danach
 startet der benötigte Dienstsatz neu. Das Nutzer-`.git` ist weder Update- noch
@@ -211,7 +211,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand ist `v5.4.4f`.
+Der aktuelle Stable-Stand ist `v5.4.4g`.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

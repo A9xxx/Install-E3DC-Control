@@ -1777,11 +1777,7 @@ function e3dc_config_backup_dir() {
 }
 
 function e3dc_prune_config_backups($limit = 20) {
-    $backup_dir = e3dc_config_backup_dir();
-    $baks = glob($backup_dir . 'e3dc_v4_*.json') ?: [];
-    if (count($baks) <= $limit) return;
-    usort($baks, function($a, $b) { return filemtime($a) - filemtime($b); });
-    foreach (array_slice($baks, 0, count($baks) - $limit) as $f) @unlink($f);
+    return e3dcPruneAutomaticConfigBackups(e3dc_config_backup_dir(), $limit);
 }
 
 function e3dc_backup_current_v4_json($file_path, $suffix = '', $options = []) {
@@ -1817,6 +1813,22 @@ function e3dc_config_backup_succeeded($backup_result, $source_path = null) {
         }
     }
     return true;
+}
+
+function e3dc_config_retention_warning($result) {
+    if (!is_array($result)) return '';
+    $warning = $result['backup_retention_warning']
+        ?? $result['retention_warning']
+        ?? '';
+    return is_string($warning) ? trim($warning) : '';
+}
+
+function e3dc_config_retention_warning_html($result) {
+    $warning = e3dc_config_retention_warning($result);
+    if ($warning === '') return '';
+    return '<div class="small mt-1"><strong>Hinweis zur Bereinigung:</strong> '
+        . htmlspecialchars($warning)
+        . '</div>';
 }
 
 function e3dc_config_import_local_keys() {
@@ -2368,6 +2380,7 @@ function e3dc_config_editor_extra_key_transaction(
             'message' => $operation === 'delete'
                 ? 'Zusätzlicher Parameter „' . $key . '“ wurde gelöscht.'
                 : 'Neue Variable „' . $key . '“ wurde hinzugefügt.',
+            'backup_retention_warning' => $backupResult['retention_warning'] ?? null,
         ];
     } finally {
         @flock($handle, LOCK_UN);
@@ -2764,6 +2777,23 @@ if ($configEditorRequestMethod === 'POST') {
         $token = $postedValues['entsoe_api_token'] ?? ($_POST['entsoe_api_token'] ?? '');
         echo json_encode(e3dc_entsoe_api_test($token), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         exit;
+    } elseif (($_POST['config_action'] ?? '') === 'create_manual_backup') {
+        $backup = e3dcCreateConfirmedV4Backup(
+            $v4_config_file_path,
+            'config_editor',
+            [
+                'backup_dir' => rtrim(e3dc_config_backup_dir(), '/'),
+                'retention_class' => 'manual',
+            ]
+        );
+        if (!empty($backup['success'])) {
+            $retentionWarning = e3dc_config_retention_warning_html($backup);
+            $messageClass = $retentionWarning === '' ? 'alert-success' : 'alert-warning';
+            $message = "<div class='alert $messageClass py-2 border-0 mb-3 mx-2 animate__animated animate__fadeIn'>✓ Dauerhafte lokale Konfigurationssicherung angelegt. Sie wird von der automatischen Bereinigung nicht gelöscht.$retentionWarning</div>";
+        } else {
+            $status = htmlspecialchars((string)($backup['status'] ?? 'unknown'));
+            $message = "<div class='alert alert-danger py-2 border-0 mb-3 mx-2 animate__animated animate__shakeX'>⚠ Die dauerhafte Konfigurationssicherung konnte nicht bestätigt werden ($status). Der aktuelle Stand wurde nicht verändert.</div>";
+        }
     } elseif (isset($_POST['test_telegram'])) {
         $postedValues = (isset($_POST['values']) && is_array($_POST['values'])) ? $_POST['values'] : [];
         $currentData = e3dc_read_existing_v4_json($v4_config_file_path);
@@ -2823,7 +2853,9 @@ if ($configEditorRequestMethod === 'POST') {
                 );
                 if (!empty($mutation['success'])) {
                     $count = count($import_data);
-                    $message = "<div class='alert alert-success py-2 border-0 mb-3 mx-2 animate__animated animate__fadeIn'>Konfiguration importiert ($count Werte). Lokale Installationspfade wurden beibehalten. Backup wurde bestätigt. Bitte IP-Adressen, HA-Rolle und aktive Dienste prüfen.</div>";
+                    $retentionWarning = e3dc_config_retention_warning_html($mutation);
+                    $messageClass = $retentionWarning === '' ? 'alert-success' : 'alert-warning';
+                    $message = "<div class='alert $messageClass py-2 border-0 mb-3 mx-2 animate__animated animate__fadeIn'>Konfiguration importiert ($count Werte). Lokale Installationspfade wurden beibehalten. Backup wurde bestätigt. Bitte IP-Adressen, HA-Rolle und aktive Dienste prüfen.$retentionWarning</div>";
                     $config = readConfig($v4_config_file_path);
                     unset($config['stop']);
                 } else {
@@ -2842,10 +2874,11 @@ if ($configEditorRequestMethod === 'POST') {
         $backupName = basename((string)($_POST['backup_file'] ?? ''));
         $backup_dir = e3dc_config_backup_dir();
         $backupPath = $backup_dir . $backupName;
-        if (!preg_match('/^e3dc_v4_\d{8}_\d{6}(?:_[A-Za-z0-9_-]+)?\.json$/', $backupName) || !is_file($backupPath)) {
+        if (!preg_match('/^e3dc_v4_(?:manual_)?\d{8}_\d{6}(?:_[A-Za-z0-9_-]+)?\.json$/', $backupName)
+            || !is_array(e3dcRetentionRegularFileSnapshot($backupPath))) {
             $message = "<div class='alert alert-danger py-2 border-0 mb-3 mx-2'>Fehler: Backup-Datei ist nicht gültig.</div>";
         } else {
-            $raw = (string)@file_get_contents($backupPath);
+            $raw = e3dcReadRegularFileBound($backupPath, 4 * 1024 * 1024);
             $decoded = @json_decode($raw, true);
             $backup_data = e3dc_config_extract_import_payload($decoded);
             if ($backup_data === null) {
@@ -2863,7 +2896,9 @@ if ($configEditorRequestMethod === 'POST') {
                     '/var/www/html/ramdisk/e3dc_config_cache.json'
                 );
                 if (!empty($mutation['success'])) {
-                    $message = "<div class='alert alert-success py-2 border-0 mb-3 mx-2 animate__animated animate__fadeIn'>Konfiguration aus Backup wiederhergestellt. Der vorherige Stand wurde bestätigt gesichert; lokale Installationspfade wurden beibehalten.</div>";
+                    $retentionWarning = e3dc_config_retention_warning_html($mutation);
+                    $messageClass = $retentionWarning === '' ? 'alert-success' : 'alert-warning';
+                    $message = "<div class='alert $messageClass py-2 border-0 mb-3 mx-2 animate__animated animate__fadeIn'>Konfiguration aus Backup wiederhergestellt. Der vorherige Stand wurde bestätigt gesichert; lokale Installationspfade wurden beibehalten.$retentionWarning</div>";
                     $config = readConfig($v4_config_file_path);
                     unset($config['stop']);
                 } else {
@@ -2902,12 +2937,15 @@ if ($configEditorRequestMethod === 'POST') {
         );
         $success = !empty($mutation['success']);
         $status = (string)($mutation['status'] ?? 'unknown');
+        $retentionWarning = e3dc_config_retention_warning($mutation);
         echo json_encode([
             'success' => $success,
             'key' => $quickKey,
             'value' => $v4_data[$quickKey],
             'message' => $success
-                ? 'Gespeichert'
+                ? ('Gespeichert' . ($retentionWarning !== ''
+                    ? '. Hinweis zur Bereinigung: ' . $retentionWarning
+                    : ''))
                 : (!empty($mutation['state_unknown'])
                     ? 'Konfiguration wurde veröffentlicht, der Cache-/Rückfallzustand ist unklar. Bitte Rechte prüfen und reparieren.'
                     : (!empty($mutation['rolled_back'])
@@ -3254,6 +3292,8 @@ if ($configEditorRequestMethod === 'POST') {
                 || str_contains($config_mutation_status, 'backup_');
             $config_cache_invalidation_failed = str_contains($config_mutation_status, 'cache_');
             $config_state_unknown = !empty($mutation['state_unknown']);
+            $retentionWarning = e3dc_config_retention_warning($mutation);
+            if ($retentionWarning !== '') $guard_warnings[] = $retentionWarning;
         }
 
         if ($success) {
@@ -3278,10 +3318,14 @@ if ($configEditorRequestMethod === 'POST') {
             if (!empty($guard_warnings)) {
                 $extra = '<div class="small mt-1">' . implode('<br>', array_map('htmlspecialchars', $guard_warnings)) . '</div>';
             }
-            $message_class = $auto_install_failed ? 'alert-warning' : 'alert-success';
+            $message_class = ($auto_install_failed || $retentionWarning !== '')
+                ? 'alert-warning'
+                : 'alert-success';
             $message_title = $auto_install_failed
                 ? '⚠ Konfiguration gespeichert, Dienste nicht vollständig aktualisiert.'
-                : '✓ Konfiguration erfolgreich gespeichert.';
+                : ($retentionWarning !== ''
+                    ? '⚠ Konfiguration gespeichert, automatische Altstände nicht vollständig bereinigt.'
+                    : '✓ Konfiguration erfolgreich gespeichert.');
             $message = "<div class='alert $message_class py-2 border-0 mb-3 mx-2 animate__animated animate__fadeIn'>$message_title$extra</div>";
             $config = readConfig($v4_config_file_path);
             unset($config['stop']);
@@ -3549,9 +3593,11 @@ if ($configEditorRequestMethod === 'POST' && (isset($_POST['delete_key']) || iss
         $configExtraKnownKeys
     );
     if (!empty($extraResult['success'])) {
-        $message = "<div class='alert alert-success py-2 border-0 mb-3 mx-2 animate__animated animate__fadeIn'>✓ "
+        $retentionWarning = e3dc_config_retention_warning_html($extraResult);
+        $messageClass = $retentionWarning === '' ? 'alert-success' : 'alert-warning';
+        $message = "<div class='alert $messageClass py-2 border-0 mb-3 mx-2 animate__animated animate__fadeIn'>✓ "
             . htmlspecialchars((string)$extraResult['message'])
-            . " Die übrigen Formularwerte wurden nicht gespeichert.</div>";
+            . " Die übrigen Formularwerte wurden nicht gespeichert.$retentionWarning</div>";
         $config = readConfig($v4_config_file_path);
         unset($config['stop']);
     } else {
@@ -11574,6 +11620,7 @@ async function readConfirmedConfigJson(response) {
 	                    Redigierte Downloads sind für Support geeignet. Roh-Downloads enthalten Zugangsdaten, Tokens und RSCP-Passwörter, sind nur mit gesetzter Web-PIN verfügbar und sollten nur privat gespeichert werden; Import und Rollback behalten lokale Installationspfade dieser Anlage bei.
 	                </div>
 	                <div class="d-flex flex-wrap gap-2">
+	                    <button type="submit" name="config_action" value="create_manual_backup" class="btn btn-outline-success rounded-pill px-3 shadow-sm" formnovalidate title="Legt einen lokalen, von der automatischen Bereinigung ausgenommenen Konfigurationsstand an."><i class="fas fa-shield-halved me-1"></i> Dauerhaft lokal sichern</button>
 	                    <a class="btn btn-outline-info rounded-pill px-3 shadow-sm" href="config_editor.php?config_action=download_redacted" title="Download ohne Passwörter, Tokens, Standort und RSCP-Zugangsdaten."><i class="fas fa-download me-1"></i> Redacted Download</a>
 	                    <?php if ($rawConfigDownloadAllowed): ?>
 	                    <a class="btn btn-outline-danger rounded-pill px-3 shadow-sm" href="config_editor.php?config_action=download&raw_confirm=1" onclick="return confirm('Raw-Config enthält Zugangsdaten, Tokens und RSCP-Passwörter. Nur privat speichern und nicht ins Forum oder in Diagnosen hochladen. Wirklich herunterladen?');" title="Raw-Config enthält Passwörter, Tokens und RSCP-Zugangsdaten."><i class="fas fa-file-shield me-1"></i> Raw Download</a>
@@ -11732,6 +11779,9 @@ async function readConfirmedConfigJson(response) {
                                 }
                                 if (strpos($label, '_preimport') !== false) {
                                     $label = str_replace('_preimport', ' (Vor Import)', $label);
+                                }
+                                if (strpos($label, 'manual_') === 0) {
+                                    $label = 'Dauerhaft gesichert: ' . substr($label, strlen('manual_'));
                                 }
                                 $display = $mtime . " - " . $label;
                             ?>
@@ -14993,7 +15043,7 @@ function initStorageCurveConfigPreview() {
             storageCurvePreviewData = data || {};
             renderStorageCurveConfigPreview();
         })
-        .catch(error => {
+        .catch(() => {
             document.querySelectorAll('[data-storage-curve-warning]').forEach(warning => {
                 warning.classList.add('is-risk');
                 warning.innerHTML = '<i class="fas fa-exclamation-triangle text-warning me-1"></i>Prognosedaten für die Vorschau konnten nicht geladen werden.';
@@ -15002,7 +15052,6 @@ function initStorageCurveConfigPreview() {
                 summary.classList.add('is-blocked');
                 summary.innerHTML = '<i class="fas fa-exclamation-triangle text-warning me-1"></i>Prognosedaten für die Direktvermarktungs-Vorschau konnten nicht geladen werden.';
             });
-            console.debug('storage curve preview failed', error);
         });
     [...new Set([...STORAGE_CURVE_PREVIEW_KEYS, ...DIRECT_MARKETING_PREVIEW_KEYS])].forEach(key => {
         const el = storageCurvePreviewInput(key);

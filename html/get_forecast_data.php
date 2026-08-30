@@ -1073,6 +1073,31 @@ function forecastTrajectoryValidationReason($plan, $source, $planCoherent) {
         }
         $selection = is_array($slot['selection'] ?? null) ? $slot['selection'] : [];
         $delegation = is_array($slot['delegation'] ?? null) ? $slot['delegation'] : null;
+        $standardProjectionBinding = is_array($slot['standard_projection_binding'] ?? null)
+            ? $slot['standard_projection_binding']
+            : null;
+        $standardProjectionBindingKeys = is_array($standardProjectionBinding)
+            ? array_keys($standardProjectionBinding)
+            : [];
+        sort($standardProjectionBindingKeys, SORT_STRING);
+        $standardProjectionBindingValid = is_array($standardProjectionBinding)
+            && $standardProjectionBindingKeys === [
+                'commands_allowed', 'executable', 'hardware_effect',
+                'projection_only', 'schema', 'source_revision', 'source_schema'
+            ]
+            && ($standardProjectionBinding['schema'] ?? null) === 'canonical_standard_projection_binding_v1'
+            && ($standardProjectionBinding['projection_only'] ?? null) === true
+            && ($standardProjectionBinding['executable'] ?? null) === false
+            && ($standardProjectionBinding['commands_allowed'] ?? null) === false
+            && ($standardProjectionBinding['hardware_effect'] ?? null) === false
+            && ($standardProjectionBinding['source_schema'] ?? null) === 'direct_marketing_headroom_projection_plan_v1'
+            && preg_match('/^sha256:[0-9a-f]{64}$/', (string)($standardProjectionBinding['source_revision'] ?? '')) === 1
+            && ($headroomEvidence['present'] ?? false) === true
+            && ($headroomEvidence['valid'] ?? false) === true
+            && hash_equals(
+                (string)($headroomEvidence['revision'] ?? ''),
+                (string)($standardProjectionBinding['source_revision'] ?? '')
+            );
         $headroomProjection = is_array($slot['headroom_projection'] ?? null) ? $slot['headroom_projection'] : null;
         $projectionOnlyMarker = $action === 'HEADROOM_EXPORT'
             || array_key_exists('action_role', $slot)
@@ -1201,6 +1226,7 @@ function forecastTrajectoryValidationReason($plan, $source, $planCoherent) {
         $selectedAction = in_array($action, ['PV_STORE', 'ECONOMIC_EXPORT', 'CHARGE_BLOCK_WAIT', 'DV_CURVE_CHARGE'], true);
         $delegatedPvStore = $action === 'PV_STORE'
             && is_array($delegation)
+            && $standardProjectionBinding === null
             && ($selection['selected'] ?? null) === false
             && ($delegation['schema_version'] ?? '') === 'direct_marketing_future_pv_store_delegation_v1'
             && ($delegation['active'] ?? null) === true
@@ -1220,6 +1246,7 @@ function forecastTrajectoryValidationReason($plan, $source, $planCoherent) {
             if (($selection['selected'] ?? null) !== true
                 || ($selection['executable'] ?? null) !== true
                 || ($selection['commands_allowed'] ?? null) !== true
+                || $standardProjectionBinding !== null
                 || preg_match('/^sha256:[0-9a-f]{64}$/', (string)($selection['action_id'] ?? '')) !== 1) {
                 return 'DIRECT_MARKETING_TRAJECTORY_ACTION_NOT_EXECUTABLE';
             }
@@ -1252,9 +1279,10 @@ function forecastTrajectoryValidationReason($plan, $source, $planCoherent) {
             }
             $passiveBindingValid = is_array($passiveBinding)
                 && ($passiveBinding['schema'] ?? null) === 'direct_marketing_passive_normal_binding_v1'
+                && $standardProjectionBinding === null
                 && forecastTrajectoryCanonicalJson($passiveBinding)
                     === forecastTrajectoryCanonicalJson($projection['direct_marketing_passive_normal_binding_v1'] ?? null);
-            $transitionWithoutPassiveBinding = count($headroomEvidence['slots_by_bounds'] ?? []) > 0
+            $transitionWithoutPassiveBinding = $standardProjectionBindingValid
                 && $passiveBinding === null
                 && ($standardPassthroughValid || $standardTransitionValid);
             if (($selection['selected'] ?? null) !== false
@@ -3769,9 +3797,11 @@ $midnightNextMs = $midnightMs + (24 * 3600 * 1000);
 $nowMs = (int)round(microtime(true) * 1000);
 $todayRestStartMs = max($midnightMs, $nowMs);
 
-$directMarketingActive = !empty($conf['direct_marketing_enabled'])
+$directMarketingActive = $forecastRequiresDirectMarketingPrice
     || !empty($liveData['direct_marketing_enabled'])
-    || (isset($storagePlanParsed['plan_meta']['direct_marketing_enabled']) && $storagePlanParsed['plan_meta']['direct_marketing_enabled'] === true);
+    || (($storagePlanMeta['direct_marketing_enabled'] ?? null) === true)
+    || (($storagePlanMeta['plan_meta']['direct_marketing_enabled'] ?? null) === true)
+    || (($storagePlanMeta['direct_marketing']['active'] ?? null) === true);
 
 if (!function_exists('sumStoragePlanWindowKwh')) {
     function sumStoragePlanWindowKwh($timeline, $startMs, $endMs, $dmActive = false) {
@@ -3899,12 +3929,18 @@ if (isset($pvForecastsParsed) && $pvForecastsParsed) {
 // Tagesaggregation oben bleibt für Morgen/Übermorgen erhalten, aber heute
 // darf spaet am Abend nicht mehr den bereits vergangenen Haus-/WP-Verbrauch
 // anzeigen.
-$todayRest = (isset($storagePlanParsed['timeline']) && is_array($storagePlanParsed['timeline']))
-    ? sumStoragePlanRestOfTodayKwh($storagePlanParsed['timeline'], $todayRestStartMs, $midnightNextMs, $directMarketingActive)
-    : null;
-$todayFullDay = (isset($storagePlanParsed['timeline']) && is_array($storagePlanParsed['timeline']))
-    ? sumStoragePlanWindowKwh($storagePlanParsed['timeline'], $midnightMs, $midnightNextMs, $directMarketingActive)
-    : null;
+$todayRest = sumStoragePlanRestOfTodayKwh(
+    $storagePlanParsed,
+    $todayRestStartMs,
+    $midnightNextMs,
+    $directMarketingActive
+);
+$todayFullDay = sumStoragePlanWindowKwh(
+    $storagePlanParsed,
+    $midnightMs,
+    $midnightNextMs,
+    $directMarketingActive
+);
 
 if ($todayRest !== null) {
     if (($todayRest['pv_kwh'] ?? 0.0) <= 0.0 && isset($forecastPvDaySums['today']) && $forecastPvDaySums['today'] > 0.0) {
@@ -3920,13 +3956,13 @@ if ($todayRest !== null) {
 
 
 // Für Morgen/Übermorgen bereinigte Werte aus der Speicherplanung nutzen
-if (isset($storagePlanParsed['timeline']) && is_array($storagePlanParsed['timeline'])) {
+if (!empty($storagePlanParsed)) {
     $planDayWindows = [
         'tomorrow' => $midnightNextMs,
         'day_after' => $midnightNextMs + (24 * 3600 * 1000),
     ];
     foreach ($planDayWindows as $key => $dayStartMs) {
-        $planDay = sumStoragePlanWindowKwh($storagePlanParsed['timeline'], $dayStartMs, $dayStartMs + (24 * 3600 * 1000), $directMarketingActive);
+        $planDay = sumStoragePlanWindowKwh($storagePlanParsed, $dayStartMs, $dayStartMs + (24 * 3600 * 1000), $directMarketingActive);
         if ($planDay === null) continue;
         if (!isset($dailySums[$key])) $dailySums[$key] = ['pv_kwh' => 0.0, 'home_kwh' => 0.0, 'wp_kwh' => 0.0, 'climate_kwh' => 0.0];
         $dailySums[$key]['home_kwh'] = $planDay['home_kwh'];

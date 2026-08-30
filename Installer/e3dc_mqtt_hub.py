@@ -6,8 +6,14 @@ import re
 import logging
 import math
 import socket
+from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
 import paho.mqtt.client as mqtt
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Nur nicht-POSIX Testumgebungen
+    fcntl = None
 
 try:
     from quiet_logging import install_quiet_info_filter
@@ -145,6 +151,26 @@ def write_json_atomic(path, payload, ensure_ascii=False):
             pass
 
 
+@contextmanager
+def _vehicle_store_lock():
+    """Teilt mit dem Bluelink-Client dieselbe RMW-Sperre."""
+    lock_path = f"{VEHICLES_JSON_FILE}.lock"
+    os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o664)
+    try:
+        try:
+            os.chmod(lock_path, 0o664)
+        except OSError:
+            pass
+        if fcntl is not None:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        if fcntl is not None:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 def _disabled_mqtt_config():
     return {
         "mqtt_hub_enable": "0",
@@ -198,6 +224,52 @@ def finite_float(value, default=None):
         return val if math.isfinite(val) else default
     except Exception:
         return default
+
+
+def _apply_vehicle_telemetry(
+    vehicle,
+    internal_attr,
+    value,
+    now_ts=None,
+    retained=False,
+):
+    """Bindet nur einen echten MQTT-SoC an den SoC-Quellzeitpunkt."""
+    if not isinstance(vehicle, dict):
+        return vehicle
+    now_ts = int(time.time()) if now_ts is None else int(now_ts)
+    if (internal_attr == "soc" and retained
+        and vehicle.get("soc_source") and vehicle.get("soc_source_ts")):
+        vehicle["mqtt_retained_received_at"] = now_ts
+        return vehicle
+    if internal_attr == "soc":
+        try:
+            if isinstance(value, bool):
+                raise TypeError("Bool ist kein Fahrzeug-SoC")
+            soc = float(value)
+            valid = math.isfinite(soc) and 0.0 <= soc <= 100.0
+        except (TypeError, ValueError):
+            soc = None
+            valid = False
+        vehicle[internal_attr] = soc if valid else None
+        if retained:
+            # Ein Broker-Retain belegt nur den Empfang, nicht das Alter der
+            # Fahrzeugmessung. Vorhandene frischere SoC-Wahrheit bleibt daher
+            # unangetastet; ein reiner Retain ist höchstens ein alter
+            # Anzeigewert und nie ein Regelanker.
+            source_ts = None
+            vehicle["soc_source"] = "mqtt_retained"
+        else:
+            source_ts = now_ts if valid else None
+            vehicle["soc_source"] = "mqtt"
+        vehicle["soc_source_ts"] = source_ts
+        vehicle["last_updated_at"] = source_ts
+        vehicle["soc_rule_confirmed"] = bool(valid and not retained)
+        vehicle["soc_stale"] = bool(not valid or retained)
+    else:
+        # Stecker, Reichweite, Ziel und Kapazität aktualisieren keinen SoC.
+        vehicle[internal_attr] = value
+        vehicle["telemetry_updated_at"] = now_ts
+    return vehicle
 
 def as_bool(value):
     if isinstance(value, bool):
@@ -837,35 +909,49 @@ def on_message(client, userdata, msg):
     if not internal_attr:
         return
 
-    old_data = {"ts": int(time.time()), "vehicles": []}
     try:
-        if os.path.exists(VEHICLES_JSON_FILE):
-            with open(VEHICLES_JSON_FILE, "r") as f:
-                old_data = json.load(f)
-    except: pass
+        with _vehicle_store_lock():
+            old_data = {"ts": int(time.time()), "vehicles": []}
+            try:
+                if os.path.exists(VEHICLES_JSON_FILE):
+                    with open(VEHICLES_JSON_FILE, "r") as f:
+                        loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        old_data = loaded
+            except Exception:
+                pass
 
-    vehicles = old_data.get("vehicles", [])
-    target_v = next((v for v in vehicles if v.get("id") == v_id), None)
+            vehicles = old_data.get("vehicles", [])
+            if not isinstance(vehicles, list):
+                vehicles = []
+            target_v = next(
+                (v for v in vehicles if isinstance(v, dict) and v.get("id") == v_id),
+                None,
+            )
+            if not target_v:
+                target_v = {
+                    "id": v_id,
+                    "name": v_id.capitalize(),
+                    "is_plugged_in": True,
+                }
+                vehicles.append(target_v)
 
-    if not target_v:
-        target_v = {"id": v_id, "name": v_id.capitalize(), "is_plugged_in": True, "soc": 0}
-        vehicles.append(target_v)
+            now_ts = int(time.time())
+            _apply_vehicle_telemetry(
+                target_v,
+                internal_attr,
+                val,
+                now_ts,
+                retained=bool(getattr(msg, "retain", False)),
+            )
 
-    target_v[internal_attr] = val
-    target_v["last_updated_at"] = int(time.time())
+            if internal_attr == "soc" and "name" not in target_v:
+                target_v["name"] = v_id.capitalize()
 
-    # Fallback Name setzen, falls noch nicht vorhanden
-    if internal_attr == "soc" and "name" not in target_v:
-        target_v["name"] = v_id.capitalize()
-
-    old_data["vehicles"] = vehicles
-    old_data["ts"] = int(time.time())
-    if "error" in old_data:
-        del old_data["error"]
-
-    try:
-        os.makedirs(RAMDISK_DIR, exist_ok=True)
-        write_json_atomic(VEHICLES_JSON_FILE, old_data)
+            old_data["vehicles"] = vehicles
+            old_data["ts"] = now_ts
+            os.makedirs(RAMDISK_DIR, exist_ok=True)
+            write_json_atomic(VEHICLES_JSON_FILE, old_data)
     except Exception as e:
         logger.error(f"Fehler beim Schreiben der vehicles.json: {e}")
 

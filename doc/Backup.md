@@ -32,13 +32,22 @@ Backup-Verzeichnisse erhalten Modus `0700`, Dateien `0600`.
 
 Vorhandene Quellen werden vollständig und ohne Dateiendungsfilter erfasst:
 
-- der gesamte Installationsbaum ohne Versionsmetadaten, lokale Entwicklungs-/
-  Koordinationsverzeichnisse und Backup-Bäume;
+- der gesamte Installationsbaum ohne Versionsmetadaten, ausdrücklich lokal
+  markierte Arbeitsverzeichnisse und Backup-Bäume;
 - V4- und Legacy-Konfiguration, Statistiken und Datenbanken;
 - Matter-Kopplungsdaten, Lernprofile, Manual-Locks und weitere Zustandsdaten;
 - Web-Programmdateien und Web-Daten;
 - `/var/lib/e3dc-control` und `/etc/e3dc-control`;
 - alle katalogisierten systemd-Units sowie Watchdog- und Boot-Notify-Skripte.
+
+Direkt im Installationswurzelverzeichnis werden verborgene lokale
+Arbeitsbereiche ausgelassen, deren Name auf `_local`, `_backup` oder
+`_backups` endet beziehungsweise `stage` oder `staging` als eigenes
+Namensegment trägt. Diese Bereiche bleiben auch bei einem Restore unangetastet.
+Die Regel gilt nicht rekursiv: gleich benannte Verzeichnisse innerhalb eines
+regulären Produkt- oder Datenpfads bleiben Teil des Backups. Dadurch werden
+lokale Arbeitskopien und temporäre Austauschbäume nicht bei jedem Update
+erneut vervielfacht, ohne den eigentlichen Systembestand zu verkleinern.
 
 Fehlende optionale Quellen werden im Manifest vermerkt. Ist eine vorhandene
 Quelle nur teilweise lesbar, gilt das gesamte Backup als fehlgeschlagen. Der
@@ -86,3 +95,35 @@ bash "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
 Wähle **`6) Backup erstellen / verwalten`**.
+
+## Konfigurationsstände und Tageshistorien
+
+Zusätzlich zu den vollständigen Update-Sicherungen führt das Webportal kleine
+Konfigurationsstände und detaillierte Tageshistorien. Für diese Daten gelten
+eigene Grenzen:
+
+- Die neuesten 20 eindeutig als automatisch erzeugt erkannten
+  Konfigurationsstände bleiben erhalten. Ältere automatische Stände werden
+  anhand des Datums im Dateinamen bereinigt; ein durch Update oder Restore
+  veränderter Datei-Zeitstempel beeinflusst die Reihenfolge nicht. Ist die
+  Bereinigung nach einer bestätigten Sicherung nur teilweise möglich, bleibt
+  die Sicherung gültig und das Webportal zeigt den offenen Altbestand als
+  Hinweis an.
+- Mit **„Dauerhaft lokal sichern“** angelegte Konfigurationsstände werden nicht
+  automatisch gelöscht. Dasselbe gilt für Migrationssicherungen, unbekannte
+  Altnamen, Links und nicht sicher gebundene Dateien. Redigierte und rohe
+  Downloads liegen außerhalb dieser lokalen Rotation.
+- Detaillierte Tagesdateien bleiben für 30 Kalendertage direkt auswählbar.
+  Ein neu angelegtes Tagesarchiv wird ohne Überschreiben veröffentlicht. Ist
+  der Tag bereits vorhanden, bleibt ein identischer oder vollständigerer
+  Bestand unverändert; nur eine bytegenaue Erweiterung wird unter Dateisperre
+  ergänzt. Abweichende, kürzere oder währenddessen ausgetauschte Bestände
+  werden niemals überschrieben.
+  Ein älterer Tag wird nur gelöscht, wenn sein Datum gültig aus dem Dateinamen
+  gelesen wurde und genau dieser Tag in `e3dc_stats.db` bestätigt vorhanden
+  ist. Fehlt die Datenbank, die Tabellenzeile oder eine sichere Dateibindung,
+  bleibt die Tagesdatei unverändert erhalten.
+
+Die Langzeitansicht verwendet weiterhin die kompakten Tageswerte aus
+`e3dc_stats.db`. Die minutengenaue Kurve eines einzelnen Tages ist nach Ablauf
+der 30 Tage dagegen bewusst nicht mehr Teil des direkt vorgehaltenen Bestands.

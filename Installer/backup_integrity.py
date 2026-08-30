@@ -283,9 +283,28 @@ def _is_within(path: Path, root: Path) -> bool:
 
 
 def _is_private_local_entry(name: str) -> bool:
-    """Keep every hidden local workspace directory outside backup/restore."""
+    """Hält verborgene lokale Arbeitsbereiche aus Backup/Restore heraus."""
 
-    return str(name).startswith(".") and str(name).endswith("_local")
+    value = str(name)
+    if not value.startswith("."):
+        return False
+    if value.endswith(("_local", "_backup", "_backups")):
+        return True
+    return (
+        re.fullmatch(
+            r"\.(?:[A-Za-z0-9][A-Za-z0-9._-]*[._-])?"
+            r"(?:stage|staging)(?:[._-][A-Za-z0-9-]+)*",
+            value,
+        )
+        is not None
+    )
+
+
+def _is_legacy_private_local_entry(name: str) -> bool:
+    """Spiegelt die ungebundene Root-Ausnahme älterer Backup-Manifeste."""
+
+    value = str(name)
+    return value.startswith(".") and value.endswith("_local")
 
 
 def _unlink_if_exists(path: Path) -> None:
@@ -1530,13 +1549,27 @@ def _persistent_entry_is_excluded(
     relative: Path,
     source: PersistentSource,
 ) -> bool:
-    """Gemeinsamer Ausschlussvertrag für Kopie und Größenabschätzung."""
+    """Statischer Ausschlussvertrag für Kopie und Größenabschätzung."""
 
-    if not relative.parts and _is_private_local_entry(name):
-        return True
     if name in source.exclude_anywhere:
         return True
     return not relative.parts and name in source.exclude_top_level
+
+
+def _is_private_install_workspace_directory(
+    name: str,
+    relative: Path,
+    source: PersistentSource,
+    metadata: os.stat_result,
+) -> bool:
+    """Erkennt nur verborgene Arbeitsverzeichnisse im Installationsroot."""
+
+    return (
+        source.category == "install-tree"
+        and not relative.parts
+        and stat.S_ISDIR(metadata.st_mode)
+        and _is_private_local_entry(name)
+    )
 
 
 def _sqlite_sidecar_is_excluded(directory_descriptor: int, name: str) -> bool:
@@ -1637,6 +1670,13 @@ def estimate_persistent_sources_size(
                 dir_fd=directory_descriptor,
                 follow_symlinks=False,
             )
+            if _is_private_install_workspace_directory(
+                name,
+                relative,
+                item,
+                metadata,
+            ):
+                continue
             child_relative = relative / name
             child_path = source_root / child_relative
             if stat.S_ISLNK(metadata.st_mode):
@@ -1978,6 +2018,21 @@ def copy_persistent_sources(
                     record_skipped_entry(record, child_relative, None, "live-drift")
                     continue
                 raise
+            if _is_private_install_workspace_directory(
+                name,
+                relative,
+                item,
+                metadata,
+            ):
+                exclusions = record.get("exclude_top_level")
+                if not isinstance(exclusions, list):  # pragma: no cover - interne Abwehr
+                    raise BackupIntegrityError(
+                        "Interner Backup-Ausschlussvertrag ist ungültig"
+                    )
+                if name not in exclusions:
+                    exclusions.append(name)
+                    exclusions.sort()
+                continue
             if stat.S_ISLNK(metadata.st_mode):
                 if may_skip_unsafe_entry(item):
                     record_skipped_entry(record, child_relative, metadata, "symlink")
@@ -2519,17 +2574,51 @@ def verified_manifest_sha256(
     backup_dir: PathValue,
     *,
     expected_kind: Optional[str] = None,
+    preverified_manifest: Optional[Dict[str, object]] = None,
 ) -> str:
-    """Liefert die SHA-256 nur für ein zweimal stabil verifiziertes Manifest."""
+    """Bindet die Manifest-SHA an eine vollständige oder unmittelbar vorige Prüfung.
+
+    Ohne ``preverified_manifest`` bleibt der eigenständige, vollständig
+    verifizierende Vertrag erhalten. Interne Aufrufer dürfen das Ergebnis einer
+    unmittelbar vorherigen ``verify_backup``-Prüfung übergeben; dann wird statt
+    eines zweiten kompletten Datei-Hashlaufs das unveränderte Manifest samt
+    Prüfsummendatei zweimal stabil gebunden.
+    """
 
     backup = _assert_no_symlink_components(backup_dir)
     first = _read_small_file_bytes(backup / MANIFEST_NAME, 16 * 1024 * 1024)
     digest = hashlib.sha256(first).hexdigest()
-    verify_backup(
-        backup,
-        expected_kind=expected_kind,
-        expected_manifest_sha256=digest,
-    )
+    if preverified_manifest is None:
+        verify_backup(
+            backup,
+            expected_kind=expected_kind,
+            expected_manifest_sha256=digest,
+        )
+    else:
+        try:
+            current_manifest = json.loads(first.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise BackupIntegrityError("Manifest ist nicht lesbar: {}".format(exc))
+        if current_manifest != preverified_manifest:
+            raise BackupIntegrityError(
+                "Backup-Manifest driftete nach der vollständigen Prüfung"
+            )
+        if expected_kind and current_manifest.get("kind") != expected_kind:
+            raise BackupIntegrityError(
+                "Backup-Art stimmt nicht: erwartet {}, ist {}".format(
+                    expected_kind,
+                    current_manifest.get("kind"),
+                )
+            )
+        digest_text = _read_small_file(
+            backup / MANIFEST_DIGEST_NAME,
+            4096,
+            "ascii",
+        ).strip().split()
+        if digest_text != [digest, MANIFEST_NAME]:
+            raise BackupIntegrityError(
+                "Manifest-Prüfsummendatei driftete nach der vollständigen Prüfung"
+            )
     second = _read_small_file_bytes(backup / MANIFEST_NAME, 16 * 1024 * 1024)
     if second != first:
         raise BackupIntegrityError(
@@ -2881,6 +2970,7 @@ def _exact_cleanup_candidates(
         exclude_anywhere: Set[str],
         original_dirs: Set[Path],
         skipped_paths: Set[str],
+        preserve_private_install_workspaces: bool,
     ) -> None:
         if not os.path.lexists(str(source)):
             return
@@ -2892,7 +2982,7 @@ def _exact_cleanup_candidates(
             relative = directory_path.relative_to(source)
             kept_dirs = []
             for name in dirnames:
-                if not relative.parts and _is_private_local_entry(name):
+                if not relative.parts and _is_legacy_private_local_entry(name):
                     continue
                 if name in exclude_anywhere or (not relative.parts and name in exclude_top):
                     continue
@@ -2901,6 +2991,13 @@ def _exact_cleanup_candidates(
                     continue
                 candidate = directory_path / name
                 metadata = os.lstat(str(candidate))
+                if (
+                    preserve_private_install_workspaces
+                    and not relative.parts
+                    and stat.S_ISDIR(metadata.st_mode)
+                    and _is_private_local_entry(name)
+                ):
+                    continue
                 if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
                     raise BackupIntegrityError("Unsicherer Eintrag in Restore-Flaeche: {}".format(candidate))
                 if candidate not in original_dirs:
@@ -2912,7 +3009,7 @@ def _exact_cleanup_candidates(
                 kept_dirs.append(name)
             dirnames[:] = kept_dirs
             for name in filenames:
-                if not relative.parts and _is_private_local_entry(name):
+                if not relative.parts and _is_legacy_private_local_entry(name):
                     continue
                 if name in exclude_anywhere or (not relative.parts and name in exclude_top):
                     continue
@@ -2935,6 +3032,7 @@ def _exact_cleanup_candidates(
         exclude_anywhere: Set[str],
         original_dirs: Set[Path],
         skipped_paths: Set[str],
+        preserve_private_install_workspaces: bool,
     ) -> None:
         """Scannt eine Installationsquelle ausschließlich unter dem Root-FD."""
 
@@ -2972,7 +3070,7 @@ def _exact_cleanup_candidates(
                         )
                     )
                 for name in sorted(os.listdir(directory_descriptor)):
-                    if not relative.parts and _is_private_local_entry(name):
+                    if not relative.parts and _is_legacy_private_local_entry(name):
                         continue
                     if name in exclude_anywhere or (
                         not relative.parts and name in exclude_top
@@ -2994,6 +3092,12 @@ def _exact_cleanup_candidates(
                             )
                         )
                     if stat.S_ISDIR(metadata.st_mode):
+                        if (
+                            preserve_private_install_workspaces
+                            and not relative.parts
+                            and _is_private_local_entry(name)
+                        ):
+                            continue
                         if candidate not in original_dirs:
                             cleanup_dirs[str(candidate)] = {
                                 "path": candidate,
@@ -3071,6 +3175,9 @@ def _exact_cleanup_candidates(
             relative_value = item.get("path") if isinstance(item, dict) else item
             original_dirs.add(source / _safe_relative_path(str(relative_value)))
         if source_type == "directory" and present:
+            preserve_private_install_workspaces = (
+                str(record.get("category") or "") == "install-tree"
+            )
             if _bound_install_relative(source, bound_install_root) is not None:
                 scan_bound_directory(
                     source,
@@ -3078,6 +3185,7 @@ def _exact_cleanup_candidates(
                     exclude_anywhere,
                     original_dirs,
                     skipped_paths,
+                    preserve_private_install_workspaces,
                 )
             else:
                 scan_directory(
@@ -3086,6 +3194,7 @@ def _exact_cleanup_candidates(
                     exclude_anywhere,
                     original_dirs,
                     skipped_paths,
+                    preserve_private_install_workspaces,
                 )
         elif source_type == "missing" and not present:
             relative_to_install = _bound_install_relative(

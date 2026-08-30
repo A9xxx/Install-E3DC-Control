@@ -1,13 +1,121 @@
-# E3DC-Control v5.4.4f
+# E3DC-Control v5.4.4g
 
-Release-Stand: 2026-08-29.
+Release-Stand: 2026-08-31.
 
-E3DC-Control 5.4.4f ist ein fokussiertes Wartungsrelease für den Start in
-`PV-Kurve ruhig`, eine eindeutige Wallbox-, Solar- und Speicheranzeige, einen
-Zielbestand von maximal drei automatisch verwalteten Backup-Generationen,
-einen aus dem privaten Downloadbereich sauber veröffentlichten
-Live-Produktbaum sowie einen sicheren Matter-Kopplungsreset. Die bestehenden Speicher-, Wallbox-,
-Hausanschluss-, Fahrzeug-, Geheimnis- und Hardwaregrenzen bleiben wirksam.
+E3DC-Control 5.4.4g ist ein Wartungsrelease für den Update- und Backupweg, den
+openWB-Pro-Start samt Phasenwechsel, eine quellengebundene Fahrzeug-SoC-Wahrheit
+und die gemeinsame Darstellung von Standard- und Direktvermarktungsprognose.
+Die bestehenden Nutzer-, Speicher-, Hausanschluss-, Fahrzeug-, Geheimnis- und
+Hardwaregrenzen bleiben wirksam.
+
+## Update verständlicher und mit weniger redundanter I/O
+
+- Das Vollbackup und die ruhende Daten-Nachsicherung bleiben verifiziert. Ein
+  unmittelbar wiederholter kompletter Datei- und SHA-256-Lauf über denselben
+  Bestand entfällt; Manifest, Prüfsummendatei, Backup-ID, Installationspfad und
+  Dateigeneration bleiben stattdessen bis zum Dateiaustausch gebunden.
+- Protokoll und Weboberfläche unterscheiden Sicherung bei weiterlaufender
+  Anlage, Beginn der kurzen kontrollierten Unterbrechung, Dateiaustausch und
+  Rechte sowie Neustart und Funktionsprüfung. Gesamt- und Unterbrechungsdauer
+  werden ausgewiesen.
+- Das Browser-Polling toleriert eine erwartbare Apache-Unterbrechung bis
+  120 Sekunden. Der Updateauftrag läuft unabhängig vom Browser weiter.
+  Technische Details bleiben vollständig verfügbar, erscheinen aber nicht
+  mehr als doppelte oder dreifache Abschlussmeldung.
+- Nach dem bestätigten Wiederanlauf ist der Zielbestand höchstens drei
+  verifizierte Systemfamilien und drei Web-Sicherungen. Aktive Schutz- oder
+  Recovery-Bindungen dürfen diese Grenze vorübergehend überschreiten, ohne
+  Updateabbruch oder erzwungene Löschung. Nicht verifizierbare oder unbekannte
+  Bestände bleiben außerhalb der Rotation erhalten und werden eindeutig
+  benannt.
+- Eindeutig verborgene lokale Backup- und Staging-Arbeitsverzeichnisse direkt
+  im Installationswurzelverzeichnis bleiben lokal erhalten, werden aber weder
+  in jedes Vollbackup kopiert noch bei einem Restore entfernt. Reguläre
+  Produkt-, Konfigurations- und Datenpfade bleiben vollständig erfasst.
+
+## Config-Snapshots und Tageshistorien sicher begrenzt
+
+- Die neuesten 20 eindeutig automatisch erzeugten kleinen Config-Snapshots
+  bleiben erhalten. Über „Dauerhaft lokal sichern“ markierte, Migrations-,
+  unbekannte und nicht sicher gebundene Bestände werden nicht automatisch
+  entfernt.
+- Eine unvollständige Config-Bereinigung macht die bestätigte neue Sicherung
+  nicht ungültig, wird aber im Konfigurationseditor sichtbar gemeldet.
+- Minutengenaue Tagesdateien bleiben 30 Kalendertage direkt verfügbar. Ein
+  älterer Tag wird nur entfernt, wenn genau dieses Datum bereits in der
+  Langzeitdatenbank bestätigt ist.
+- Ein vorhandenes Tagesarchiv wird unter Dateisperre nur um eine bytegenaue
+  Fortsetzung ergänzt. Ein identischer oder vollständigerer Bestand bleibt
+  unverändert. Kürzere, abweichende oder währenddessen ausgetauschte Dateien
+  werden niemals überschrieben.
+
+## openWB Pro: Start, Wake-up und Phasenwechsel
+
+- Zielphase, unter Last tatsächlich genutzte Phasen, laufende Umschaltsequenz
+  und Restzeit bis zum nächsten Phasenwechsel bleiben getrennte
+  Wahrheitsdimensionen. Ein bereits bestätigtes identisches Ziel ist ein
+  No-op.
+- Nach bestätigtem Ziel und der kurzen Geräteunterbrechung darf der
+  Mindeststrom wieder angeboten werden. Die persistente 480-Sekunden-Frist
+  sperrt ausschließlich einen weiteren Phasenwechsel, nicht den bestätigten
+  Wiederanlauf oder die laufende Stromregelung.
+- Ein manager-eigener temporärer 0-A-Anker, ein veralteter interner
+  Stromshadow und eine nach Prozessneustart bereits bestätigte
+  Phasengeneration dürfen den sicheren 6-A-Wiederanlauf nicht mehr zirkulär
+  blockieren. Stecksession, Ziel, frischer Geräte-Readback, Budget und harte
+  Schutzgrenzen müssen weiterhin zusammenpassen.
+- Ein startbereites, aber noch stromloses Fahrzeug erhält nur die begrenzten
+  CP-Wake-up-Versuche. Alte Energiezähler oder Lademarker gelten nicht als
+  aktuelle Ladeannahme; erst frischer Ladestatus beziehungsweise reale
+  Leistung bestätigt den Start.
+- Der manuelle WB2-Start ändert nur Pause und Modus der gewählten Wallbox. Er
+  verlangt keinen leeren WB1-Plan mehr. Die Oberfläche zeigt den typisierten
+  Backendfehler statt einer pauschalen Meldung „Network error“.
+- Ein frisch und vollständig zentral finanziertes dreiphasiges PV-Budget darf
+  unmittelbar das physische 3p-Mindestangebot tragen; der normale Puffer für
+  einen späteren Phasenwechsel erzeugt davor kein künstliches 1p-Ziel.
+- Ein belegter batterieneutraler PV-Sink bleibt trotz Prognose-Akkuvorrang für
+  das Fahrzeug nutzbar, ohne Netz- oder Akkuentladefreigabe zu erzeugen. Der
+  Start-Hold gilt nur für das vollständig finanzierte physische 6-A-Minimum
+  bei 1p oder 3p und erzeugt kein Zusatzbudget.
+- Ein einzelner Grid-/PM-Glitch darf einen bestätigten positiven Ausgang
+  höchstens zehn Sekunden ohne neuen Hardwarebefehl halten. Eindeutiger
+  Netzbezug, Schutz-Null oder eine anhaltende Störung gewinnen weiterhin.
+
+## Fahrzeug-SoC mit echter Quelle und echter Zeit
+
+- Bluelink trennt Abrufversuch, Abschluss und den echten Fahrzeugzeitpunkt.
+  MQTT, Standard-openWB und openWB Pro folgen demselben Grundsatz. Retain,
+  Statusheartbeat, Dateiänderung oder ein Timeout verjüngen keinen SoC.
+- Planner, SoC-Tracker, Wallbox-Manager, Wärmemanager und Weboberfläche
+  verwenden dieselben expliziten Stale-, Expired-, Treiber-, Profil-, Steck-,
+  Wallbox- und Fahrzeugbindungen. Ein alter Checkpoint darf eine frische,
+  gültige Quelle nicht dauerhaft vergiften.
+- Ein echter Wert von 0 bis 100 Prozent bleibt gültig. Boolesche Werte,
+  `NaN`, `Infinity`, Sentinelwerte und Werte außerhalb dieses Bereichs werden
+  nicht als Prozentwert übernommen.
+- Die bekannten manuellen Altquellen bleiben kompatibel, benötigen aber eine
+  explizite Quelle, einen echten Aktionszeitpunkt und eine eindeutige Bindung
+  ohne aktuelles Veto. Mehrdeutige Namen, Stecksessionen oder Mehrfachprofile
+  werden nicht geraten.
+
+## Standardprognose bleibt neben Direktvermarktung sichtbar
+
+- Eine unvollständige, `actions_only`- oder fail-closed DV-Trajektorie blendet
+  Standard-PV, Standard-SoC und die PV-kWh-Tagessummen weder im Hauptdiagramm
+  noch im Ladekurvenfenster aus. Nur eine vollständige kanonische Trajektorie
+  darf die DV-SoC-Linie übernehmen.
+- Speicherplatzfenster verwenden eine aus Aktion, Start, Ende und Grund
+  gebildete Policyfenster-ID. Eine Preisplateau- oder Marktfensterkennung
+  bleibt Provenienz und kann die Regelbindung nicht ersetzen.
+- Forecast- und Tagesaggregation lesen Timeline und Planmetadaten aus ihren
+  kanonischen Strukturen. Die zusätzliche DV-SoC-Linie bleibt eine reine
+  Backend-Projektion und erzeugt keinen Browserentscheid oder Hardwarebefehl.
+- Ein E3DC-only-Ladeziel verwendet ohne eine ausdrücklich freigegebene
+  separate AC-Speicherroute keine Erzeugung eines Zusatzwechselrichters als
+  internen DC-Laderahmen.
+
+## Enthaltener Stand aus 5.4.4f
 
 ## PV-Kurvenstart aus belegtem Überschuss
 
@@ -262,7 +370,8 @@ Hausanschluss-, Fahrzeug-, Geheimnis- und Hardwaregrenzen bleiben wirksam.
   Erfolg. Private Datenverzeichnisse verwenden den sicheren Modus `02770`,
   der ausdrücklich gewählte Kompatibilitätsmodus `02775` bleibt unterstützt.
 - Startet ein zuvor aktiver, an die Installation gebundener Zusatzdienst nach
-  dem bestätigten Wechsel nicht wieder, bleibt 5.4.4f installiert. Der Auftrag
+  dem bestätigten Wechsel nicht wieder, bleibt der zuvor installierte Stand
+  erhalten. Der Auftrag
   endet aber nicht grün, sondern nennt den Dienst und den passenden
   `journalctl`-Befehl.
 

@@ -841,6 +841,17 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
     curve_pv_allowed_w = max(
         0.0, _safe_float(getattr(ctx, "pv_only_allowed_w", 0.0), 0.0)
     )
+    openwb_pro_curve_direct_pv_authority_w = 0.0
+    if openwb_pro_curve_direct_active:
+        # Der Storage Manager bleibt auch bei real belegtem PV-Export der
+        # einzige Budgetgeber. Die batterieneutrale PV-Evidenz ist hier nur
+        # eine zusätzliche physische Obergrenze; sie darf einen kleineren oder
+        # auf 0 W gesetzten Storage-Vertrag niemals nachträglich vergrößern.
+        openwb_pro_curve_direct_pv_authority_w = min(
+            pre_auth_cap,
+            curve_pv_allowed_w,
+            max(0.0, float(openwb_pro_curve_direct_real_pv_w)),
+        )
     raw_predump_add = getattr(ctx, "predump_discharge_add_w", None)
     if raw_predump_add is None:
         predump_discharge_add_w = (
@@ -874,7 +885,12 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
             effective_auth_w = curve_pv_allowed_w
         final_allowed = min(pre_auth_cap, effective_auth_w)
 
-
+    elif openwb_pro_curve_direct_active:
+        effective_auth_w = min(
+            storage_auth_budget,
+            openwb_pro_curve_direct_pv_authority_w,
+        )
+        final_allowed = min(pre_auth_cap, effective_auth_w)
 
     elif mode == 2:
         effective_auth_w = max(storage_auth_budget, curve_pv_allowed_w)
@@ -902,6 +918,10 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
         "authorized_wallbox_budget_w": storage_auth_budget,
         "effective_authorized_wallbox_budget_w": effective_auth_w,
         "storage_authorized_wallbox_budget_w": storage_auth_budget,
+        "openwb_pro_curve_direct_pv_authority_w": max(
+            0.0,
+            float(openwb_pro_curve_direct_pv_authority_w),
+        ),
         "grid_funded_budget_authority_active": bool(
 
             grid_funded_budget_authority_active

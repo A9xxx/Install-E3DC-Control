@@ -1,6 +1,15 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.4f
+> **Stand:** v5.4.4g
+>
+> **Neu in 5.4.4g:** Fahrzeug-SoC wird in Planner, Tracker, Manager und
+> Weboberfläche an die echte Quelle, deren Ereigniszeit sowie Fahrzeug-,
+> Wallbox-, Steck- und Profilidentität gebunden. Eine unvollständige oder rein
+> beschreibende Direktvermarktungstrajektorie verdrängt die Standard-PV-,
+> Standard-SoC- und kWh-Prognose nicht. E3/DC-only verwendet Erzeugung eines
+> Zusatzwechselrichters ohne ausdrücklich freigegebene AC-Speicherroute nicht
+> als internen DC-Laderahmen. Diese Anzeige- und Bindungskorrekturen öffnen
+> keinen zusätzlichen Hardwarebefehl.
 >
 > **Neu in 5.4.4f:** Im Modus `PV-Kurve ruhig` wird belegter physischer
 > PV-Überschuss bereits vor der sanften Anfahrrampe berücksichtigt. Speicher-,

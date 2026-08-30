@@ -775,7 +775,7 @@ download_release_checkout() {
     case "$fetched_tag:$fetched_sha" in
         *[!0-9a-f:]*) fail "Geladene Release-Bindung ist nicht hexadezimal" ;;
     esac
-    isolated_git -C "$checkout_dir" checkout --detach "$fetched_sha" >/dev/null \
+    isolated_git -C "$checkout_dir" checkout --detach "$fetched_sha" >/dev/null 2>&1 \
         || fail_with_solution \
             "E3DC-UPD-GIT-007" \
             "Der verifizierte Zielcommit konnte nicht als privater Checkout bereitgestellt werden." \
@@ -796,7 +796,7 @@ run_bound_update() (
     echo "  Release      : $BOUND_TAG"
     echo "  Zielcommit   : $BOUND_SHA"
     echo "  Einstieg     : $BOUND_ENTRY_MODE"
-    echo "  Alt-Updater  : wird nicht ausgeführt"
+    echo "  Updateweg    : geprüfter Stable-Updater"
     set +e
     env -i \
         PATH=/usr/bin:/bin \

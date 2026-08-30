@@ -391,7 +391,7 @@ run_worker() {
         || fail "Release-Bindung besitzt überzählige Felder" 126
     printf '[OK] Release %s/%s mit einem privaten Fetch geladen.\n' \
         "$tag" "$target_sha"
-    printf '[OK] Lokaler Git-/Dirty-/Dateimodus-Stand ist keine Startautorität.\n'
+    printf '[DETAIL] Lokale Git-Änderungen oder frühere Dateirechte blockieren den sicheren Reparaturweg nicht.\n'
 
     set +e
     $ENV -i \
@@ -410,9 +410,7 @@ run_worker() {
         /bin/sh "$release_dir/e3dc-update-bootstrap" "$INSTALL_ROOT"
     result=$?
     set -e
-    if (( result == 0 )); then
-        printf '[OK] Update abgeschlossen.\n'
-    else
+    if (( result != 0 )); then
         printf '[!] Update fehlgeschlagen (Exit %d).\n' "$result"
     fi
     return "$result"

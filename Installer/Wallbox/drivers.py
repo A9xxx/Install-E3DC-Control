@@ -21,6 +21,7 @@ import requests as _requests
 
 from .config import logger, RAMDISK_DIR
 from . import command_gate
+from .soc_tracker import vehicle_soc_source_trusted
 
 # paho-mqtt ist nur noch für alte Installationen relevant.
 # Der openWB-2.x-Treiber nutzt bewusst ausschliesslich HTTP simpleAPI.
@@ -643,6 +644,8 @@ class OpenWBCharger(WallboxDriver):
             'rfid_tag':          None,
             'car_soc_source':    '',
             'car_soc_source_ts': None,
+            'car_soc_raw_ts':    None,
+            'car_soc_rule_confirmed': False,
             'car_capacity_kwh':  0.0,
             'car_consumption_kwh_100km': 0.0,
             'car_range':         0.0,
@@ -1175,17 +1178,58 @@ class OpenWBCharger(WallboxDriver):
             # --- Auto-SoC aus openWB (MQTT JSON) ---
             if topic == f"{self.native_prefix}/connected_vehicle/soc":
                 try:
-                    soc_data  = json.loads(payload_str)
-                    car_soc   = float(soc_data.get("soc", 0))
-                    if car_soc > 0:
+                    soc_data = json.loads(payload_str)
+                    if not isinstance(soc_data, dict):
+                        return
+                    car_soc = self._soc_percent_value(soc_data.get("soc"))
+                    if car_soc is not None:
                         observed_ts = time.time()
                         openwb_ts = soc_data.get("timestamp", None)
-                        soc_ts = self._float_value(openwb_ts, observed_ts)
-                        if soc_ts > 100000000000.0:
-                            soc_ts /= 1000.0
-                        soc_ts = int(soc_ts)
+                        explicit_soc_ts = self._soc_source_timestamp(
+                            openwb_ts,
+                            now_ts=observed_ts,
+                        )
+                        retained = bool(getattr(msg, "retain", False))
+                        previous_soc_ts = self._soc_source_timestamp(
+                            self.state.get("car_soc_source_ts"),
+                            now_ts=observed_ts,
+                        )
+                        previous_confirmed = bool(
+                            self.state.get("car_soc_rule_confirmed") is True
+                            and previous_soc_ts is not None
+                        )
+                        if (
+                            retained
+                            and previous_confirmed
+                        ):
+                            # Ein Retain ist kein neuer Fahrzeugmesswert. Eine
+                            # bereits bestätigte Live-Wahrheit bleibt erhalten.
+                            self.state["mqtt_retained_received_at"] = int(observed_ts)
+                            return
+                        soc_ts = (
+                            explicit_soc_ts
+                            if explicit_soc_ts is not None
+                            else (int(observed_ts) if not retained else None)
+                        )
+                        source = "openwb_mqtt_retained" if retained else "openwb_mqtt"
+                        rule_confirmed = bool(not retained and soc_ts is not None)
+                        if (
+                            rule_confirmed
+                            and previous_confirmed
+                            and soc_ts < previous_soc_ts
+                        ):
+                            # Ein später empfangenes, aber älter gemessenes
+                            # Ereignis darf den frischeren SoC nicht ersetzen.
+                            self.state["car_soc_unconfirmed_observed"] = car_soc
+                            self.state["car_soc_unconfirmed_source"] = source
+                            self.state["car_soc_unconfirmed_observed_ts"] = int(observed_ts)
+                            return
                         vehicle_key = self._current_range_vehicle_key()
                         self.state['car_soc'] = car_soc
+                        self.state['car_soc_source'] = source
+                        self.state['car_soc_source_ts'] = soc_ts
+                        self.state['car_soc_raw_ts'] = soc_ts
+                        self.state['car_soc_rule_confirmed'] = rule_confirmed
                         if "range_charged" in soc_data:
                             self._set_charged_range(
                                 soc_data.get("range_charged"),
@@ -1204,9 +1248,20 @@ class OpenWBCharger(WallboxDriver):
                                 vehicle_key=vehicle_key,
                             )
                         is_plugged = self.state.get('plug_state', False)
-                        soc_age_h  = (time.time() - soc_ts) / 3600.0
+                        soc_age_h = max(
+                            0.0,
+                            (observed_ts - float(soc_ts or observed_ts)) / 3600.0,
+                        )
 
-                        self._write_manual_soc(car_soc, is_plugged, soc_ts, source="openwb_mqtt")
+                        self._write_manual_soc(
+                            car_soc,
+                            is_plugged,
+                            soc_ts,
+                            source=source,
+                            soc_source_ts=soc_ts,
+                            raw_soc_ts=soc_ts,
+                            rule_confirmed=rule_confirmed,
+                        )
                         state_str = "eingesteckt" if is_plugged else f"nicht eingesteckt (letzter Wert vor {soc_age_h:.1f}h)"
                         last_soc = self.state.get('_last_logged_soc', -100)
                         if abs(car_soc - last_soc) >= 5.0:
@@ -2072,6 +2127,45 @@ class OpenWBCharger(WallboxDriver):
             return default
 
     @staticmethod
+    def _soc_percent_value(value):
+        """Normalisiert ausschließlich echte Prozentwerte; ``0`` ist gültig."""
+        if isinstance(value, bool) or value in (None, ""):
+            return None
+        try:
+            soc = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(soc) or soc < 0.0 or soc > 100.0:
+            return None
+        return soc
+
+    @staticmethod
+    def _soc_source_timestamp(value, now_ts=None):
+        """Liest vorhandene openWB-Zeitstempel in Sekunden, ohne sie zu erfinden."""
+        if isinstance(value, bool) or value in (None, "", "null"):
+            return None
+        try:
+            source_ts = float(value)
+            now_value = time.time() if now_ts is None else float(now_ts)
+        except (TypeError, ValueError):
+            return None
+        if source_ts > 100000000000.0:
+            source_ts /= 1000.0
+        if (
+            not math.isfinite(source_ts)
+            or not math.isfinite(now_value)
+            or source_ts <= 0.0
+            or now_value <= 0.0
+            or source_ts > now_value + 300.0
+        ):
+            return None
+        return int(source_ts)
+
+    @staticmethod
+    def _soc_source_rule_confirmed(source):
+        return vehicle_soc_source_trusted(source)
+
+    @staticmethod
     def _text_value(value, default=""):
         if value in (None, "null"):
             return default
@@ -2124,27 +2218,72 @@ class OpenWBCharger(WallboxDriver):
                 return False
         return True
 
-    def _write_manual_soc(self, car_soc, plugged, soc_ts=None, source="openwb_http"):
-        if car_soc <= 0:
-            return
-        soc_ts = int(soc_ts or time.time())
-        soc_age_h = max(0.0, (time.time() - soc_ts) / 3600.0)
+    def _write_manual_soc(
+        self,
+        car_soc,
+        plugged,
+        soc_ts=None,
+        source="openwb_http",
+        soc_source_ts=None,
+        raw_soc_ts=None,
+        rule_confirmed=False,
+    ):
+        car_soc = self._soc_percent_value(car_soc)
+        if car_soc is None:
+            return False
+        now_ts = time.time()
+        source_ts = self._soc_source_timestamp(
+            soc_source_ts if soc_source_ts is not None else soc_ts,
+            now_ts=now_ts,
+        )
+        raw_ts = self._soc_source_timestamp(
+            raw_soc_ts if raw_soc_ts is not None else source_ts,
+            now_ts=now_ts,
+        )
+        source = str(source or "").strip()
+        confirmed = bool(
+            rule_confirmed is True
+            and source_ts is not None
+            and raw_ts is not None
+            and self._soc_source_rule_confirmed(source)
+        )
+        file_ts = int(source_ts or now_ts)
+        soc_age_h = max(0.0, (now_ts - float(source_ts or now_ts)) / 3600.0)
         soc_file = os.path.join(RAMDISK_DIR, f"manual_soc_wb{self.wb_id}.json")
         payload_out = {
             "soc": car_soc,
-            "ts": soc_ts,
+            "ts": file_ts,
             "source": source,
+            "soc_source_ts": source_ts,
+            "raw_soc_ts": raw_ts,
+            "soc_rule_confirmed": confirmed,
             "plugged": bool(plugged),
             "age_h": round(soc_age_h, 1),
             "wb": self.wb_id,
+            "profile_id": self.state.get("profile_id"),
+            "car_id": self.state.get("car_id"),
+            "vehicle_id": self.state.get("vehicle_id"),
+            "rfid_tag": self.state.get("rfid_tag"),
         }
+        tmp = f"{soc_file}.tmp.{os.getpid()}.{time.monotonic_ns()}"
         try:
-            tmp = soc_file + ".tmp"
-            with open(tmp, "w") as sf:
-                json.dump(payload_out, sf)
+            os.makedirs(os.path.dirname(soc_file), exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as sf:
+                json.dump(payload_out, sf, ensure_ascii=False, separators=(",", ":"))
             os.replace(tmp, soc_file)
+            try:
+                os.chmod(soc_file, 0o664)
+            except OSError:
+                pass
+            return True
         except Exception as e:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
             logger.debug(f"[WB{self.wb_id}] Auto-SoC schreiben fehlgeschlagen: {e}")
+            return False
 
     def _update_from_simpleapi(self, payload):
         """Normalisiert get_chargepoint_all=<ID> auf das interne Statusformat."""
@@ -2318,22 +2457,64 @@ class OpenWBCharger(WallboxDriver):
         if start is not None and effective_plug_state:
             self.state["session_kwh"] = max(0.0, (daily_imported - start) / 1000.0)
 
-        car_soc = self._float_value(cp_data.get("soc", cp_data.get("pro_soc")), 0.0)
-        if car_soc > 0:
-            self.state["car_soc"] = car_soc
-            car_soc_source = self._text_value(
+        car_soc = self._soc_percent_value(cp_data.get("soc", cp_data.get("pro_soc")))
+        if car_soc is not None:
+            car_soc_upstream_source = self._text_value(
                 cp_data.get("car_soc_source", cp_data.get("soc_source")),
-                "openwb_http",
+                "",
             )
-            car_soc_source_ts = int(self._float_value(cp_data.get("soc_timestamp"), time.time()))
-            self.state["car_soc_source"] = car_soc_source
-            self.state["car_soc_source_ts"] = car_soc_source_ts
-            self._write_manual_soc(
-                car_soc,
-                effective_plug_state,
-                car_soc_source_ts,
-                source=car_soc_source,
+            # Der Transportweg ist die belegte Quelle. Ein frei gelieferter
+            # Gerätetext bleibt Diagnose und darf den Regelvertrag nicht
+            # erweitern.
+            car_soc_source = "openwb_http"
+            car_soc_source_ts = self._soc_source_timestamp(
+                cp_data.get("soc_timestamp"),
+                now_ts=time.time(),
             )
+            car_soc_rule_confirmed = bool(
+                car_soc_source_ts is not None
+                and self._soc_source_rule_confirmed(car_soc_source)
+            )
+            previous_soc_ts = self._soc_source_timestamp(
+                self.state.get("car_soc_source_ts"),
+                now_ts=time.time(),
+            )
+            previous_confirmed = bool(
+                self.state.get("car_soc_rule_confirmed") is True
+                and previous_soc_ts is not None
+            )
+            candidate_is_freshest = bool(
+                car_soc_rule_confirmed
+                and (
+                    not previous_confirmed
+                    or car_soc_source_ts >= previous_soc_ts
+                )
+            )
+            if (
+                candidate_is_freshest
+                or not previous_confirmed
+            ):
+                self.state["car_soc"] = car_soc
+                self.state["car_soc_source"] = car_soc_source
+                self.state["car_soc_upstream_source"] = car_soc_upstream_source
+                self.state["car_soc_source_ts"] = car_soc_source_ts
+                self.state["car_soc_raw_ts"] = car_soc_source_ts
+                self.state["car_soc_rule_confirmed"] = car_soc_rule_confirmed
+                self._write_manual_soc(
+                    car_soc,
+                    effective_plug_state,
+                    car_soc_source_ts,
+                    source=car_soc_source,
+                    soc_source_ts=car_soc_source_ts,
+                    raw_soc_ts=car_soc_source_ts,
+                    rule_confirmed=car_soc_rule_confirmed,
+                )
+            else:
+                # Eine unbestätigte HTTP-Projektion darf einen vorhandenen
+                # echten MQTT-/SimpleAPI-Anker nicht entwerten.
+                self.state["car_soc_unconfirmed_observed"] = car_soc
+                self.state["car_soc_unconfirmed_source"] = car_soc_source
+                self.state["car_soc_unconfirmed_observed_ts"] = int(time.time())
         range_observed_ts = time.time()
         range_source_ts = cp_data.get("soc_timestamp")
         if range_source_ts in (None, "", "null"):
@@ -2513,6 +2694,8 @@ class OpenWBCharger(WallboxDriver):
             'car_soc':           self.state.get('car_soc', 0),
             'car_soc_source':    self.state.get('car_soc_source', ''),
             'car_soc_source_ts': self.state.get('car_soc_source_ts'),
+            'car_soc_raw_ts':    self.state.get('car_soc_raw_ts'),
+            'car_soc_rule_confirmed': self.state.get('car_soc_rule_confirmed') is True,
             'car_range':         self.state.get('car_range', 0),
             'range_km':          self.state.get('car_range', 0),
             'car_range_source':  self.state.get('car_range_source', ''),
@@ -4617,7 +4800,9 @@ class OpenWBProCharger(WallboxDriver):
             "_session_start_wh": None,
             "car_soc": 0.0,
             "car_soc_source": "",
+            "car_soc_source_ts": None,
             "car_soc_raw_ts": None,
+            "car_soc_rule_confirmed": False,
             "car_range": 0.0,
             "car_range_source": "",
             "car_charged_range": 0.0,
@@ -4672,6 +4857,70 @@ class OpenWBProCharger(WallboxDriver):
             return float(value)
         except (TypeError, ValueError):
             return default
+
+    @staticmethod
+    def _soc_percent_value(value):
+        if isinstance(value, bool) or value in (None, ""):
+            return None
+        try:
+            soc = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(soc) or soc < 0.0 or soc > 100.0:
+            return None
+        return soc
+
+    @staticmethod
+    def _soc_source_timestamp(value, now_ts=None):
+        if isinstance(value, bool) or value in (None, "", "null"):
+            return None
+        try:
+            source_ts = float(value)
+            now_value = time.time() if now_ts is None else float(now_ts)
+        except (TypeError, ValueError):
+            return None
+        if source_ts > 100000000000.0:
+            source_ts /= 1000.0
+        if (
+            not math.isfinite(source_ts)
+            or not math.isfinite(now_value)
+            or source_ts <= 0.0
+            or now_value <= 0.0
+            or source_ts > now_value + 300.0
+        ):
+            return None
+        return int(source_ts)
+
+    @staticmethod
+    def _contract_flag_active(value):
+        if value is True:
+            return True
+        if isinstance(value, bool) or value is None:
+            return False
+        if isinstance(value, (int, float)):
+            try:
+                return math.isfinite(float(value)) and float(value) != 0.0
+            except (TypeError, ValueError):
+                return False
+        return str(value).strip().lower() in {
+            "1", "true", "yes", "ja", "on", "active", "aktiv",
+            "stale", "expired", "invalid",
+        }
+
+    @staticmethod
+    def _plugged_explicitly_false(value):
+        if value is False:
+            return True
+        if isinstance(value, bool) or value is None:
+            return False
+        if isinstance(value, (int, float)):
+            try:
+                return math.isfinite(float(value)) and float(value) == 0.0
+            except (TypeError, ValueError):
+                return False
+        return str(value).strip().lower() in {
+            "0", "false", "no", "nein", "off", "aus",
+        }
 
     @staticmethod
     def _boolish(value):
@@ -4770,33 +5019,64 @@ class OpenWBProCharger(WallboxDriver):
         return profile
 
     def _write_openwb_pro_manual_soc(self, source):
-        soc = self._float(self.state.get("car_soc"), -1.0)
-        if soc <= 0:
-            return
-        soc_ts = int(time.time())
+        soc = self._soc_percent_value(self.state.get("car_soc"))
+        if soc is None:
+            self.state["car_soc_rule_confirmed"] = False
+            return False
+        now_ts = time.time()
+        source = str(source or "").strip()
+        source_ts = self._soc_source_timestamp(
+            self.state.get("car_soc_source_ts"),
+            now_ts=now_ts,
+        )
+        raw_soc_ts = self._soc_source_timestamp(
+            self.state.get("car_soc_raw_ts"),
+            now_ts=now_ts,
+        )
+        confirmed = bool(
+            self.state.get("car_soc_rule_confirmed") is True
+            and source in {"openwb_pro_raw", "openwb_pro_estimated", "manual_start_soc"}
+            and source_ts is not None
+            and raw_soc_ts is not None
+        )
+        self.state["car_soc_rule_confirmed"] = confirmed
+        file_ts = int(now_ts)
         soc_file = os.path.join(RAMDISK_DIR, f"manual_soc_wb{self.wb_id}.json")
         payload = {
             "soc": round(soc, 1),
-            "ts": soc_ts,
+            "ts": file_ts,
             "source": source,
+            "soc_source_ts": source_ts,
+            "raw_soc_ts": raw_soc_ts,
+            "soc_rule_confirmed": confirmed,
             "plugged": bool(self.state.get("plug_state", False)),
-            "age_h": 0.0,
+            "age_h": round(max(0.0, (now_ts - float(source_ts or now_ts)) / 3600.0), 1),
             "wb": self.wb_id,
             "name": self.state.get("car_name"),
             "car_id": self.state.get("car_id"),
             "vehicle_id": self.state.get("vehicle_id") or self.state.get("rfid_tag"),
             "capacity": self.state.get("car_capacity_kwh", 0.0),
             "session_kwh": round(self.state.get("session_kwh", 0.0), 3),
-            "raw_soc_ts": self.state.get("car_soc_raw_ts"),
         }
+        tmp = f"{soc_file}.tmp.{os.getpid()}.{time.monotonic_ns()}"
         try:
             os.makedirs(os.path.dirname(soc_file), exist_ok=True)
-            tmp = soc_file + ".tmp"
             with open(tmp, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=False)
+                json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
             os.replace(tmp, soc_file)
+            try:
+                os.chmod(soc_file, 0o664)
+            except OSError:
+                pass
+            return True
         except Exception as e:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
             logger.debug(f"[WB{self.wb_id}] openWB Pro manual_soc schreiben fehlgeschlagen: {e}")
+            return False
 
     def _openwb_pro_manual_start_sample(self, active_id=None):
         soc_file = os.path.join(RAMDISK_DIR, f"manual_soc_wb{self.wb_id}.json")
@@ -4809,13 +5089,35 @@ class OpenWBProCharger(WallboxDriver):
             return None
         if str(data.get("source") or "").strip() != "manual_start_soc":
             return None
-        if data.get("plugged") is False:
+        if "plugged" in data and self._plugged_explicitly_false(data.get("plugged")):
             return None
-        ts = int(self._float(data.get("ts"), 0.0))
-        if ts > 0 and time.time() - ts > 12 * 3600:
+        if "soc_rule_confirmed" in data and data.get("soc_rule_confirmed") is not True:
             return None
-        soc = self._float(data.get("soc"), -1.0)
-        if soc <= 0:
+        if any(
+            self._contract_flag_active(data.get(key))
+            for key in (
+                "soc_stale", "estimate_expired", "soc_profile_binding_invalid",
+            )
+        ):
+            return None
+        now_ts = time.time()
+        source_ts = self._soc_source_timestamp(
+            data.get("soc_source_ts", data.get("raw_soc_ts", data.get("ts"))),
+            now_ts=now_ts,
+        )
+        raw_soc_ts = self._soc_source_timestamp(
+            data.get("raw_soc_ts", data.get("soc_source_ts", data.get("ts"))),
+            now_ts=now_ts,
+        )
+        if (
+            source_ts is None
+            or raw_soc_ts is None
+            or now_ts - source_ts > 12 * 3600
+            or now_ts - raw_soc_ts > 12 * 3600
+        ):
+            return None
+        soc = self._soc_percent_value(data.get("soc"))
+        if soc is None:
             return None
         manual_vehicle_id = str(data.get("vehicle_id") or "").strip()
         manual_car_id = str(data.get("car_id") or "").strip()
@@ -4823,8 +5125,11 @@ class OpenWBProCharger(WallboxDriver):
         if active_compact and manual_vehicle_id and self._compact_id(manual_vehicle_id) != active_compact:
             return None
         return {
-            "soc": self._clamp_percent(soc),
-            "ts": ts or int(time.time()),
+            "soc": soc,
+            "ts": source_ts,
+            "soc_source_ts": source_ts,
+            "raw_soc_ts": raw_soc_ts,
+            "soc_rule_confirmed": True,
             "car_id": manual_car_id,
             "vehicle_id": manual_vehicle_id,
             "name": str(data.get("name") or "").strip(),
@@ -4832,11 +5137,16 @@ class OpenWBProCharger(WallboxDriver):
         }
 
     def _openwb_pro_parse_session_ts(self, value):
-        if value is None:
+        if isinstance(value, bool) or value is None:
             return 0
-        numeric = int(self._float(value, 0.0))
-        if numeric > 0:
-            return numeric
+        try:
+            numeric_value = float(value)
+            if math.isfinite(numeric_value):
+                numeric = int(numeric_value)
+                if numeric > 0:
+                    return numeric
+        except (TypeError, ValueError, OverflowError):
+            pass
         text = str(value or "").strip()
         if not text:
             return 0
@@ -4852,11 +5162,22 @@ class OpenWBProCharger(WallboxDriver):
         best = {"kwh": 0.0, "start_ts": 0, "source": ""}
 
         def accept(kwh, start_ts=0, source=""):
-            kwh = self._float(kwh, 0.0)
-            if kwh <= 0.02:
+            if isinstance(kwh, bool):
+                return
+            try:
+                kwh = float(kwh)
+                start_ts = int(start_ts)
+            except (TypeError, ValueError, OverflowError):
+                return
+            if (
+                not math.isfinite(kwh)
+                or kwh <= 0.02
+                or start_ts <= 0
+                or start_ts > now_ts + 300.0
+            ):
                 return
             if kwh > self._float(best.get("kwh"), 0.0):
-                best.update({"kwh": kwh, "start_ts": int(start_ts or 0), "source": source})
+                best.update({"kwh": kwh, "start_ts": start_ts, "source": source})
 
         session_file = os.path.join(RAMDISK_DIR, f"wb{self.wb_id}_live_session.json")
         try:
@@ -4864,12 +5185,24 @@ class OpenWBProCharger(WallboxDriver):
                 data = json.load(handle)
         except Exception:
             data = None
-        if isinstance(data, dict) and data.get("is_locked") is not False:
+        if (
+            isinstance(data, dict)
+            and not (
+                "is_locked" in data
+                and self._plugged_explicitly_false(data.get("is_locked"))
+            )
+        ):
             last_ts = self._openwb_pro_parse_session_ts(data.get("last_ts") or data.get("ts"))
-            if not last_ts or now_ts - last_ts <= 24 * 3600 or last_ts > now_ts:
+            start_ts = self._openwb_pro_parse_session_ts(data.get("start_ts"))
+            if (
+                last_ts > 0
+                and start_ts > 0
+                and -300.0 <= now_ts - last_ts <= 24 * 3600
+                and start_ts <= last_ts + 300
+            ):
                 accept(
                     data.get("kwh", data.get("session_kwh", 0.0)),
-                    self._openwb_pro_parse_session_ts(data.get("start_ts")),
+                    start_ts,
                     "live_session",
                 )
 
@@ -4879,7 +5212,7 @@ class OpenWBProCharger(WallboxDriver):
                 data = json.load(handle)
         except Exception:
             data = None
-        if isinstance(data, dict) and data.get("plugged") is not False:
+        if isinstance(data, dict):
             source = str(data.get("source") or "").strip()
             # Derived openWB-Pro SoC estimates are display/cache values, not
             # authoritative session anchors. Feeding their session_kwh back
@@ -4887,16 +5220,42 @@ class OpenWBProCharger(WallboxDriver):
             # the raw vehicle SoC again and make the car SoC jump.
             if source != "manual_start_soc":
                 return best
-            ts = int(self._float(data.get("ts"), 0.0))
+            if "plugged" in data and self._plugged_explicitly_false(data.get("plugged")):
+                return best
+            if "soc_rule_confirmed" in data and data.get("soc_rule_confirmed") is not True:
+                return best
+            if any(
+                self._contract_flag_active(data.get(key))
+                for key in (
+                    "soc_stale", "estimate_expired", "soc_profile_binding_invalid",
+                )
+            ):
+                return best
+            if self._soc_percent_value(data.get("soc")) is None:
+                return best
+            source_ts = self._soc_source_timestamp(
+                data.get("soc_source_ts", data.get("raw_soc_ts", data.get("ts"))),
+                now_ts=now_ts,
+            )
+            raw_soc_ts = self._soc_source_timestamp(
+                data.get("raw_soc_ts", data.get("soc_source_ts", data.get("ts"))),
+                now_ts=now_ts,
+            )
+            if (
+                source_ts is None
+                or raw_soc_ts is None
+                or now_ts - source_ts > 12 * 3600
+                or now_ts - raw_soc_ts > 12 * 3600
+            ):
+                return best
             active_compact = self._compact_id(active_id)
             manual_vehicle_id = str(data.get("vehicle_id") or "").strip()
             if not active_compact or not manual_vehicle_id or self._compact_id(manual_vehicle_id) == active_compact:
-                if not ts or now_ts - ts <= 12 * 3600 or ts > now_ts:
-                    accept(
-                        data.get("session_kwh", 0.0),
-                        int(self._float(data.get("raw_soc_ts"), 0.0)) or ts,
-                        source or "manual_soc",
-                    )
+                accept(
+                    data.get("session_kwh", 0.0),
+                    raw_soc_ts,
+                    source,
+                )
         return best
 
     def _update_vehicle_soc_estimate(self, raw_soc, imported_wh, plug_state, charging, vehicle_id=None, rfid_tag=None, prev_plug=False, raw_soc_ts=None, restored_session_wh=0.0, restored_session_start_ts=0):
@@ -4930,8 +5289,13 @@ class OpenWBProCharger(WallboxDriver):
             if manual_sample.get("vehicle_id") and not self.state.get("vehicle_id"):
                 self.state["vehicle_id"] = manual_sample["vehicle_id"]
 
-        raw_valid = raw_soc is not None and raw_soc > 0
-        raw_ts = int(raw_soc_ts or 0)
+        normalized_raw_soc = self._soc_percent_value(raw_soc)
+        raw_valid = normalized_raw_soc is not None
+        if raw_valid:
+            raw_soc = normalized_raw_soc
+        raw_source_ts = self._soc_source_timestamp(raw_soc_ts, now_ts=now_ts)
+        raw_ts = int(raw_source_ts or 0)
+        raw_rule_confirmed = bool(raw_valid and raw_source_ts is not None)
         last_raw_ts = int(self.state.get("_soc_raw_timestamp") or 0)
         last_raw_soc = self._float(self.state.get("_soc_raw_value"), -1.0)
         new_raw_sample = False
@@ -4955,6 +5319,7 @@ class OpenWBProCharger(WallboxDriver):
                 self.state["car_soc"] = round(self._clamp_percent(raw_soc), 1)
                 self.state["car_soc_source"] = "openwb_pro_raw"
                 self.state["car_soc_source_ts"] = raw_ts or int(now_ts)
+                self.state["car_soc_rule_confirmed"] = raw_rule_confirmed
                 self._write_openwb_pro_manual_soc("openwb_pro_raw")
             self.state["_soc_anchor_soc"] = None
             self.state["_soc_anchor_imported_wh"] = None
@@ -5005,9 +5370,17 @@ class OpenWBProCharger(WallboxDriver):
             self.state["_soc_anchor_vehicle_id"] = ident_compact or self._compact_id(manual_sample.get("vehicle_id") or manual_sample.get("car_id")) or None
             self.state["_soc_anchor_source"] = "manual_start_soc"
             self.state["_soc_anchor_sample_ts"] = manual_ts or int(now_ts)
+            self.state["_soc_anchor_raw_ts"] = manual_sample.get("raw_soc_ts")
+            self.state["_soc_anchor_rule_confirmed"] = (
+                manual_sample.get("soc_rule_confirmed") is True
+            )
             self.state["car_soc"] = round(self.state["_soc_anchor_soc"], 1)
             self.state["car_soc_source"] = "manual_start_soc"
             self.state["car_soc_source_ts"] = manual_ts or int(now_ts)
+            self.state["car_soc_raw_ts"] = manual_sample.get("raw_soc_ts")
+            self.state["car_soc_rule_confirmed"] = (
+                manual_sample.get("soc_rule_confirmed") is True
+            )
             self.state["_soc_power_integrated_wh"] = 0.0
             self.state["_soc_delivered_wh"] = 0.0
             self.state["_soc_last_update_ts"] = now_ts
@@ -5021,12 +5394,15 @@ class OpenWBProCharger(WallboxDriver):
             self.state["_soc_anchor_vehicle_id"] = ident_compact or None
             self.state["_soc_anchor_source"] = "openwb_pro_raw"
             self.state["_soc_anchor_sample_ts"] = raw_ts or int(now_ts)
+            self.state["_soc_anchor_raw_ts"] = raw_ts or None
+            self.state["_soc_anchor_rule_confirmed"] = raw_rule_confirmed
             self.state["_soc_raw_timestamp"] = raw_ts or int(now_ts)
             self.state["_soc_raw_value"] = raw_soc
             self.state["car_soc_raw_ts"] = raw_ts or None
             self.state["car_soc"] = round(self.state["_soc_anchor_soc"], 1)
             self.state["car_soc_source"] = "openwb_pro_raw"
             self.state["car_soc_source_ts"] = raw_ts or int(now_ts)
+            self.state["car_soc_rule_confirmed"] = raw_rule_confirmed
             self.state["_soc_power_integrated_wh"] = 0.0
             self.state["_soc_delivered_wh"] = 0.0
             self.state["_soc_last_update_ts"] = now_ts
@@ -5056,6 +5432,10 @@ class OpenWBProCharger(WallboxDriver):
             self.state["car_soc_source_ts"] = int(
                 self._float(self.state.get("_soc_anchor_sample_ts"), now_ts)
             )
+            self.state["car_soc_raw_ts"] = self.state.get("_soc_anchor_raw_ts")
+            self.state["car_soc_rule_confirmed"] = (
+                self.state.get("_soc_anchor_rule_confirmed") is True
+            )
             if consumption > 0:
                 self.state["car_range"] = round((capacity * estimated_soc / 100.0) / consumption * 100.0, 0)
                 self.state["car_range_source"] = "openwb_pro_estimated"
@@ -5069,6 +5449,7 @@ class OpenWBProCharger(WallboxDriver):
             self.state["car_soc"] = round(self._clamp_percent(raw_soc), 1)
             self.state["car_soc_source"] = "openwb_pro_raw"
             self.state["car_soc_source_ts"] = raw_ts or int(now_ts)
+            self.state["car_soc_rule_confirmed"] = raw_rule_confirmed
             self._write_openwb_pro_manual_soc("openwb_pro_raw")
 
     def _get_json(self, url):
@@ -5150,6 +5531,7 @@ class OpenWBProCharger(WallboxDriver):
             "car_soc_source": self.state.get("car_soc_source", ""),
             "car_soc_source_ts": self.state.get("car_soc_source_ts"),
             "car_soc_raw_ts": self.state.get("car_soc_raw_ts"),
+            "car_soc_rule_confirmed": self.state.get("car_soc_rule_confirmed") is True,
             "car_range": self.state.get("car_range", 0),
             "range_km": self.state.get("car_range", 0),
             "car_range_source": self.state.get("car_range_source", ""),
@@ -5299,8 +5681,8 @@ class OpenWBProCharger(WallboxDriver):
                 self.state["_session_start_wh"] = max(0.0, imported_wh - restored_session_wh)
         session_wh_for_soc = max(0.0, self._float(self.state.get("session_kwh"), 0.0) * 1000.0, restored_session_wh)
 
-        soc = self._float(data.get("soc_value"), -1.0)
-        soc_ts = int(self._float(data.get("soc_timestamp"), 0.0)) or None
+        soc = data.get("soc_value")
+        soc_ts = data.get("soc_timestamp")
 
         has_current_vehicle = bool(effective_plug_state)
         vehicle_id = live_vehicle_id if has_current_vehicle else None
@@ -5439,8 +5821,8 @@ class OpenWBProCharger(WallboxDriver):
         if start is not None and plug_state:
             self.state["session_kwh"] = max(0.0, (daily_imported - start) / 1000.0)
 
-        car_soc = self._float(self._dig(port, "ci/ev/soc/actual"), -1.0)
-        car_soc_ts = int(self._float(self._dig(port, "ci/ev/soc/timestamp"), 0.0)) or None
+        car_soc = self._dig(port, "ci/ev/soc/actual")
+        car_soc_ts = self._dig(port, "ci/ev/soc/timestamp")
 
         visible_current = offered_current
         if visible_current <= 0 and (charging or power_w > 50.0):

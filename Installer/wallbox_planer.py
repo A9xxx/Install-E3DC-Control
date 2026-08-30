@@ -33,6 +33,11 @@ try:
         _configured_billing_price_now as configured_billing_price_for_timestamp,
     )
     from .config_secret_permissions import apply_config_secret_permissions
+    from .Wallbox.soc_tracker import (
+        CONFIRMED_MANUAL_SOC_SOURCES,
+        vehicle_soc_source_trusted,
+        vehicle_soc_max_age_s,
+    )
     from .tariff_schedule import (
         tariff_type as configured_tariff_type,
         uses_recurring_tariff_axis,
@@ -47,6 +52,11 @@ except ImportError:  # Aufruf als Script-Modul direkt aus dem Installer-Verzeich
         _configured_billing_price_now as configured_billing_price_for_timestamp,
     )
     from config_secret_permissions import apply_config_secret_permissions
+    from Wallbox.soc_tracker import (
+        CONFIRMED_MANUAL_SOC_SOURCES,
+        vehicle_soc_source_trusted,
+        vehicle_soc_max_age_s,
+    )
     from tariff_schedule import (
         tariff_type as configured_tariff_type,
         uses_recurring_tariff_axis,
@@ -120,6 +130,9 @@ def _wb2_configured_or_discovered(config):
     return _wb2_runtime_discovery_present(config)
 
 MISSING_SOC_WARNING_INTERVAL_S = 600
+MANUAL_SOC_UNCONFIRMED_SOURCES = frozenset({
+    "simple_view_start_soc", "config_start_soc",
+})
 _last_missing_soc_warning_ts = 0.0
 _CANDIDATE_MODE = False
 
@@ -156,6 +169,304 @@ def _warn_missing_vehicle_soc(now=None):
         "Bitte manuellen SoC in der UI eintragen!"
     )
     return True
+
+
+def _single_vehicle_fallback(vehicles):
+    """Kompatibilitätsfallback nur bei genau einem Fahrzeugdatensatz."""
+
+    if not isinstance(vehicles, list) or len(vehicles) != 1:
+        return None
+    return vehicles[0] if isinstance(vehicles[0], dict) else None
+
+
+def _compact_vehicle_id(value):
+    return "".join(
+        char for char in str(value or "").strip().lower()
+        if char.isalnum()
+    )
+
+
+def _vehicle_record_aliases(record):
+    item = record if isinstance(record, dict) else {}
+    return {
+        compact
+        for compact in (
+            _compact_vehicle_id(item.get(key))
+            for key in (
+                "id", "profile_id", "car_id", "vehicle_id",
+                "cloud_vehicle_id", "rfid_tag",
+            )
+        )
+        if compact
+    }
+
+
+def _configured_vehicle_binding_unique(config, wb_id, selected_id):
+    """Beweist einen slotlosen Legacy-Datensatz über genau ein WB-Profil."""
+
+    selected = _compact_vehicle_id(selected_id)
+    if not selected or selected in {"none", "__none", "novehicle", "keinfahrzeug"}:
+        return False
+    cfg = config if isinstance(config, dict) else {}
+    current = _compact_vehicle_id(cfg.get(f"wb{int(wb_id)}_car_id"))
+    if current != selected:
+        return False
+    assignments = [
+        _compact_vehicle_id(cfg.get(f"wb{slot}_car_id"))
+        for slot in (1, 2)
+    ]
+    return assignments.count(selected) == 1
+
+
+def _legacy_single_vehicle_binding_allowed(config, wb_id, vehicles):
+    """Erhält den alten Ein-Fahrzeug-/Ein-Wallbox-Fall ohne WB-Raten."""
+
+    return bool(
+        int(wb_id) == 1
+        and _single_vehicle_fallback(vehicles) is not None
+        and not _wb2_configured_or_discovered(config)
+        and not _compact_vehicle_id(
+            (config if isinstance(config, dict) else {}).get("wb2_car_id")
+        )
+    )
+
+
+def _planner_vehicle_binding_valid(
+    vehicle,
+    *,
+    config,
+    wb_id,
+    selected_id="",
+    vehicles=None,
+):
+    """Bindet einen shared vehicles.json-Datensatz exakt an Stecker und WB."""
+
+    if not isinstance(vehicle, dict):
+        return False
+    plugged = (
+        vehicle.get("is_plugged_in")
+        if "is_plugged_in" in vehicle
+        else vehicle.get("plugged")
+    )
+    if plugged is not True:
+        return False
+    selected = _compact_vehicle_id(selected_id)
+    aliases = _vehicle_record_aliases(vehicle)
+    if selected and selected not in aliases:
+        return False
+
+    slot_key = "wb_slot" if "wb_slot" in vehicle else "wb" if "wb" in vehicle else ""
+    raw_slot = vehicle.get(slot_key) if slot_key else None
+    if isinstance(raw_slot, bool):
+        return False
+    if raw_slot not in (None, ""):
+        try:
+            slot = int(raw_slot)
+        except (TypeError, ValueError):
+            return False
+        if slot > 0:
+            return slot == int(wb_id)
+        if slot < 0:
+            return False
+
+    if selected:
+        return _configured_vehicle_binding_unique(config, wb_id, selected_id)
+    return _legacy_single_vehicle_binding_allowed(config, wb_id, vehicles)
+
+
+def _soc_contract_flag_active(value):
+    if value is True:
+        return True
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        return math.isfinite(numeric) and numeric == 1.0
+    return str(value).strip().lower() in {
+        "1", "true", "yes", "ja", "on", "active", "stale",
+        "expired", "invalid", "degraded",
+    }
+
+
+def _soc_contract_field_true(value):
+    """Normalisiert ausschließlich dokumentierte True-Repräsentationen."""
+
+    if value is True:
+        return True
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        return math.isfinite(numeric) and numeric == 1.0
+    return str(value).strip().lower() in {
+        "1", "true", "yes", "ja", "on",
+    }
+
+
+def _soc_record_vetoed(record):
+    item = record if isinstance(record, dict) else {}
+    if any(
+        _soc_contract_flag_active(item.get(key))
+        for key in (
+            "soc_stale", "car_soc_stale", "stale",
+            "estimate_expired", "soc_expired", "car_soc_expired", "expired",
+            "soc_profile_binding_invalid", "car_soc_profile_binding_invalid",
+            "profile_binding_invalid", "driver_status_stale",
+            "driver_status_degraded",
+        )
+    ):
+        return True
+    return any(
+        key in item and not _soc_contract_field_true(item.get(key))
+        for key in (
+            "driver_status_valid", "soc_profile_bound", "car_soc_profile_bound",
+            "plug_state", "plugged", "is_plugged_in",
+        )
+    )
+
+
+def _vehicle_soc_rule_sample(
+    vehicle,
+    now=None,
+    max_age_s=None,
+    config=None,
+    *,
+    wb_id=None,
+    selected_id="",
+    vehicles=None,
+):
+    """Akzeptiert nur explizit bestätigten SoC mit eigenem Quellzeitpunkt."""
+    if (
+        not isinstance(vehicle, dict)
+        or vehicle.get("soc_rule_confirmed") is not True
+        or _soc_record_vetoed(vehicle)
+    ):
+        return None
+    if wb_id is not None and not _planner_vehicle_binding_valid(
+        vehicle,
+        config=config,
+        wb_id=wb_id,
+        selected_id=selected_id,
+        vehicles=vehicles,
+    ):
+        return None
+    raw_soc = vehicle.get("soc")
+    if isinstance(raw_soc, bool):
+        return None
+    source = str(vehicle.get("soc_source") or vehicle.get("source") or "").strip()
+    if (
+        not source
+        or not vehicle_soc_source_trusted(source)
+        or "soc_source_ts" not in vehicle
+    ):
+        return None
+    if max_age_s is None:
+        max_age_s = vehicle_soc_max_age_s(source, config)
+    if isinstance(vehicle.get("soc_source_ts"), bool):
+        return None
+    try:
+        soc = float(raw_soc)
+        source_ts = float(vehicle.get("soc_source_ts"))
+        max_age_s = float(max_age_s)
+    except (TypeError, ValueError):
+        return None
+    if source_ts > 100000000000.0:
+        source_ts /= 1000.0
+    now = time.time() if now is None else float(now)
+    age_s = now - source_ts
+    if (not math.isfinite(soc) or not math.isfinite(source_ts)
+        or not math.isfinite(age_s) or not math.isfinite(max_age_s)
+        or soc < 0.0 or soc > 100.0 or source_ts <= 0.0
+        or age_s < -300.0 or age_s > max(0.0, max_age_s)):
+        return None
+    return {"soc": soc, "source": source, "source_ts": source_ts, "age_s": age_s}
+
+
+def _manual_soc_rule_sample(
+    data,
+    now=None,
+    config=None,
+    *,
+    wb_id=None,
+    selected_id="",
+):
+    """Bindet den Planer an den SoC-Anker statt an den Datei-Heartbeat."""
+    if not isinstance(data, dict):
+        return None
+
+    if (
+        ("soc_rule_confirmed" in data
+         and data.get("soc_rule_confirmed") is not True)
+        or _soc_record_vetoed(data)
+    ):
+        return None
+    source = str(data.get("soc_source") or data.get("source") or "").strip()
+    source_text = source.lower()
+    if (
+        not source_text
+        or not vehicle_soc_source_trusted(source_text)
+    ):
+        return None
+    machine_contract_source = bool(
+        source_text.startswith("wallbox_estimated")
+        or source_text not in CONFIRMED_MANUAL_SOC_SOURCES
+    )
+    if machine_contract_source and data.get("soc_rule_confirmed") is not True:
+        return None
+    if wb_id is not None:
+        if data.get("plugged") is not True:
+            return None
+        if data.get("wb") not in (None, ""):
+            raw_wb = data.get("wb")
+            if isinstance(raw_wb, bool):
+                return None
+            try:
+                if int(raw_wb) != int(wb_id):
+                    return None
+            except (TypeError, ValueError):
+                return None
+    selected_compact = "".join(
+        char for char in str(selected_id or "").strip().lower()
+        if char.isalnum()
+    )
+    if selected_compact:
+        record_aliases = {
+            compact
+            for compact in (
+                "".join(
+                    char for char in str(data.get(key) or "").strip().lower()
+                    if char.isalnum()
+                )
+                for key in (
+                    "id", "profile_id", "car_id", "vehicle_id",
+                    "cloud_vehicle_id", "rfid_tag",
+                )
+            )
+            if compact
+        }
+        if selected_compact not in record_aliases:
+            return None
+
+    source_ts = None
+    if "soc_source_ts" in data:
+        source_ts = data.get("soc_source_ts")
+        if source_ts in (None, ""):
+            source_ts = data.get("raw_soc_ts")
+    elif "raw_soc_ts" in data:
+        source_ts = data.get("raw_soc_ts")
+    elif source_text in CONFIRMED_MANUAL_SOC_SOURCES:
+        # Nur die vier bekannten Nutzeraktionen dürfen ihren historischen
+        # Aktionszeitpunkt aus ``ts`` beziehen. Ein zyklischer Maschinen-
+        # Heartbeat ist niemals ein nachträglicher SoC-Quellanker.
+        source_ts = data.get("ts")
+
+    normalized = {
+        "soc": data.get("soc"),
+        "soc_source": source,
+        "soc_source_ts": source_ts,
+        "soc_rule_confirmed": True,
+    }
+    return _vehicle_soc_rule_sample(normalized, now=now, config=config)
 
 
 def _eco_slot_timestamp(entry):
@@ -573,29 +884,28 @@ def generate_native_charging_schedule(config, wb_id=None):
                     try:
                         with open(soc_file) as f:
                             soc_data = json.load(f)
-                        soc_val = float(soc_data.get("soc", 0))
-                        soc_ts  = float(soc_data.get("ts", 0))
-                        soc_age = time.time() - soc_ts
-                        # SoC-Werte bis zu 8h akzeptieren (Auto morgens abgesteckt)
-                        if soc_val > 0 and soc_age < 28800:
-                            current_soc = soc_val
+                        sample = _manual_soc_rule_sample(
+                            soc_data,
+                            config=config,
+                            wb_id=wb_id,
+                            selected_id=wb_car_id,
+                        )
+                        if sample is not None:
+                            current_soc = sample["soc"]
                             logger.debug(
                                 f"[Scheduler] SoC aus {os.path.basename(soc_file)}: "
-                                f"{current_soc:.1f}% (Alter: {soc_age / 3600:.1f}h)"
+                                f"{current_soc:.1f}% "
+                                f"({sample['source']}, "
+                                f"Alter: {sample['age_s'] / 3600:.1f}h)"
                             )
                             break
                     except Exception:
                         pass
 
-            # 2. SoC aus Config (manuell eingetragen in UI)
-            if current_soc is None and wb_car_id != "__none":
-                cfg_soc = config.get(f"wb{wb_id}_current_soc", config.get("car_current_soc", ""))
-                if cfg_soc and str(cfg_soc).strip():
-                    try:
-                        current_soc = float(str(cfg_soc).strip())
-                        logger.info(f"[Scheduler] SoC aus Config: {current_soc}%")
-                    except Exception:
-                        pass
+            # Persistente Konfigurationswerte besitzen weder eine SoC-Quelle
+            # noch einen Quellzeitpunkt und bleiben deshalb reine Anzeige-
+            # bzw. Eingabehistorie. Regelwirksam wird nur der transaktional
+            # erzeugte Manual-Datensatz aus der UI.
 
             # 3. Spezifisches Fahrzeug via wbX_car_id aus vehicles.json
             if current_soc is None:
@@ -607,20 +917,31 @@ def generate_native_charging_schedule(config, wb_id=None):
                                 v_data = json.load(f)
 
                             v_list = v_data.get('vehicles', []) if isinstance(v_data, dict) else v_data
-                            for v in v_list:
-                                if str(v.get("id")) == wb_car_id:
-                                    v_soc = float(v.get("soc", 0))
-                                    # Use the global TS if the vehicle has no individual TS
-                                    ts = float(v.get("ts", v_data.get("ts", 0)))
-                                    v_age = time.time() - ts
-                                    if v_soc > 0 and v_age < 28800: # bis zu 8h akzeptieren
-                                        current_soc = v_soc
-                                        logger.info(f"[Scheduler] WB{wb_id}: Spezifischer SoC fuer {v.get('name', wb_car_id)} aus vehicles.json: {current_soc}%")
-                                        break
+                            bound = [
+                                (v, _vehicle_soc_rule_sample(
+                                    v,
+                                    config=config,
+                                    wb_id=wb_id,
+                                    selected_id=wb_car_id,
+                                    vehicles=v_list,
+                                ))
+                                for v in v_list
+                                if isinstance(v, dict)
+                            ]
+                            bound = [(v, sample) for v, sample in bound if sample is not None]
+                            if len(bound) == 1:
+                                v, sample = bound[0]
+                                current_soc = sample["soc"]
+                                logger.info(
+                                    f"[Scheduler] WB{wb_id}: Spezifischer SoC für "
+                                    f"{v.get('name', wb_car_id)} aus vehicles.json: "
+                                    f"{current_soc}% ({sample['source']}, "
+                                    f"{sample['age_s'] / 3600:.1f}h)"
+                                )
                         except Exception:
                             pass
 
-            # 4. Bluelink / MQTT-SoC-Cache Fallback (max. 2h alt)
+            # 4. Verifizierter Bluelink-/MQTT-Cache-Fallback
             if current_soc is None and not wb_car_id:
                 for bl_file in [
                     os.path.join(RAMDISK_DIR, "bluelink_soc.json"),
@@ -630,12 +951,20 @@ def generate_native_charging_schedule(config, wb_id=None):
                         try:
                             with open(bl_file) as f:
                                 bl = json.load(f)
-                            bl_soc = float(bl.get("soc", bl.get("battery_soc", 0)))
-                            bl_age = time.time() - float(bl.get("ts", 0))
-                            if bl_soc > 0 and bl_age < 7200:
-                                current_soc = bl_soc
+                            if "soc" not in bl and "battery_soc" in bl:
+                                bl = dict(bl)
+                                bl["soc"] = bl.get("battery_soc")
+                            sample = _manual_soc_rule_sample(
+                                bl,
+                                config=config,
+                            )
+                            if sample is not None:
+                                current_soc = sample["soc"]
                                 logger.info(
-                                    f"[Scheduler] SoC aus Fallback Cache {os.path.basename(bl_file)}: {current_soc}%"
+                                    f"[Scheduler] SoC aus Fallback-Cache "
+                                    f"{os.path.basename(bl_file)}: {current_soc}% "
+                                    f"({sample['source']}, "
+                                    f"Alter: {sample['age_s'] / 3600:.1f}h)"
                                 )
                                 break
                         except Exception:
@@ -649,14 +978,21 @@ def generate_native_charging_schedule(config, wb_id=None):
                             with open(veh_file) as f:
                                 v_data = json.load(f)
                             v_list = v_data.get('vehicles', []) if isinstance(v_data, dict) else v_data
-                            if v_list:
-                                v = v_list[0]
-                                v_soc = float(v.get("soc", 0))
-                                ts = float(v.get("ts", v_data.get("ts", 0))) if isinstance(v_data, dict) else 0
-                                v_age = time.time() - ts
-                                if v_soc > 0 and v_age < 28800:
-                                    current_soc = v_soc
-                                    logger.info(f"[Scheduler] Fallback SoC aus vehicles.json (erstes Fahrzeug): {current_soc}%")
+                            v = _single_vehicle_fallback(v_list)
+                            if v is not None:
+                                sample = _vehicle_soc_rule_sample(
+                                    v,
+                                    config=config,
+                                    wb_id=wb_id,
+                                    vehicles=v_list,
+                                )
+                                if sample is not None:
+                                    current_soc = sample["soc"]
+                                    logger.info(
+                                        "[Scheduler] Fallback-SoC aus vehicles.json "
+                                        f"(einziges Fahrzeug): {current_soc}% "
+                                        f"({sample['source']}, {sample['age_s'] / 3600:.1f}h)"
+                                    )
                         except Exception:
                             pass
 

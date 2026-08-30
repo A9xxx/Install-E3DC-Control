@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.4f Stable</span>
+            <span class="badge bg-success text-light">v5.4.4g Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.4f</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.4g</code> in <code>.env</code> gesetzt.</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
 if [ -f ./docker_compose_update.py ]; then
   E3DC_DOCKER_HELPER=./docker_compose_update.py
@@ -212,6 +212,28 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                         <li>Nach der Freigabe im Account den RESTful API Security Token erzeugen.</li>
                         <li>Im Config-Editor unter <em>Tarif</em> den ENTSO-E-Token als Fallback-Token eintragen und mit <em>ENTSO-E testen</em> prüfen.</li>
                     </ol>
+                </div>
+            </div>
+        </div>
+
+        <h4 class="mb-4 text-accent"><i class="fas fa-shield-halved me-2"></i>Stable 5.4.4g: Update, Backup, openWB Pro und SoC-Wahrheit</h4>
+        <div class="col-12 faq-item" data-tags="5.4.4g stable update backup retention config historie openwb pro phasenwechsel fahrzeug soc bluelink mqtt prognose direktvermarktung">
+            <div class="card bg-card border-0 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <span class="tag">5.4.4g</span>
+                        Was korrigiert das Stable-Release 5.4.4g?
+                    </h5>
+                    <ul>
+                        <li><strong>Updateablauf:</strong> Vollbackup und ruhende Nachsicherung bleiben vollständig verifiziert, werden aber nicht unmittelbar mehrfach über denselben Datei- und Hashbestand gelesen. Die Oberfläche zeigt Sicherung bei laufender Anlage, kurze Unterbrechung, Dateiaustausch und Wiederanlauf getrennt, toleriert die erwartbare Webunterbrechung bis 120 Sekunden und gibt genau einen klaren Abschluss aus.</li>
+                        <li><strong>Backupgrenzen:</strong> Zielbestand sind drei verifizierte Systemfamilien und drei Web-Sicherungen. Aktive Schutz- oder Recovery-Bindungen dürfen diese Grenze vorübergehend überschreiten, ohne Updateabbruch oder erzwungene Löschung. Nicht verifizierbare oder unbekannte Bestände bleiben außerhalb der Rotation erhalten und werden eindeutig benannt.</li>
+                        <li><strong>Config und Tageshistorie:</strong> Die neuesten 20 eindeutig automatischen Config-Snapshots bleiben erhalten; über <em>Dauerhaft lokal sichern</em> markierte, Migrations- und unbekannte Stände sind geschützt. Detailhistorien werden erst nach 30 Tagen und nur mit bestätigtem Langzeit-Datensatz entfernt. Ein bestehendes Tagesarchiv wird nie durch einen kürzeren, abweichenden oder konkurrierend ausgetauschten Bestand ersetzt.</li>
+                        <li><strong>openWB Pro:</strong> Bestätigte Zielphase, tatsächlich genutzte Phasen, laufende Sequenz und 480-Sekunden-Schutzfrist bleiben getrennt. Nach der kurzen Geräteunterbrechung darf der Mindeststrom wieder angeboten werden; die lange Frist sperrt nur den nächsten Phasenwechsel. Temporäre Nullanker, veraltete Stromshadows und Prozessneustarts blockieren den sicheren Wiederanlauf nicht zirkulär. Ein vollständig finanziertes dreiphasiges PV-Minimum erzeugt kein falsches 1p-Zwischenziel.</li>
+                        <li><strong>PV-Budget und Messruhe:</strong> Ein belegter batterieneutraler PV-Sink bleibt ohne Netz- oder Akkuentladefreigabe verfügbar. Der 1p-/3p-Start-Hold erzeugt kein Zusatzbudget; ein einzelner Grid-/PM-Glitch darf einen bestätigten positiven Ausgang höchstens zehn Sekunden ohne neuen Hardwarebefehl halten.</li>
+                        <li><strong>Fahrzeugstart:</strong> Das begrenzte CP-Wake-up benötigt dieselbe Stecksession, positives Budget und alle Schutzfreigaben. Ein alter Energiezähler oder Lademarker beweist keine aktuelle Ladeannahme. Der manuelle WB2-Start verändert keinen WB1-Plan und zeigt verständliche Backendfehler statt der pauschalen Meldung „Network error“.</li>
+                        <li><strong>Fahrzeug-SoC:</strong> Bluelink, MQTT und openWB transportieren den echten Quellzeitpunkt. Retain, Statusheartbeat und Dateiänderung verjüngen keinen Wert. Planner, Tracker, Wallbox, Wärme und Frontend verwenden dieselben Alters-, Veto-, Steck-, Wallbox-, Fahrzeug- und Profilbindungen. 0 bis 100 Prozent bleiben gültig; Boolesche, nicht endliche und außerhalb liegende Werte werden abgewiesen.</li>
+                        <li><strong>Prognose und Direktvermarktung:</strong> Eine unvollständige oder reine Aktions-DV-Trajektorie blendet Standard-PV, Standard-SoC und PV-kWh nicht aus. Headroom-Fenster erhalten eine kanonische Policy-ID; die DV-SoC-Linie bleibt eine rein lesende Backend-Projektion.</li>
+                    </ul>
                 </div>
             </div>
         </div>

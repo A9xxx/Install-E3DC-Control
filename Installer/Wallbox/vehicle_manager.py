@@ -283,8 +283,15 @@ class VehicleManager:
             "raw_soc_ts",
             status.get("car_soc_raw_ts"),
         )
-        status["car_soc_rule_confirmed"] = bool(
-            soc_info.get("soc_rule_confirmed", False)
+        status["car_soc_source_ts"] = soc_info.get(
+            "soc_source_ts",
+            soc_info.get("raw_soc_ts", status.get("car_soc_source_ts")),
+        )
+        # Regelwahrheit ist ein strikt typisierter Vertrag.  Werte wie
+        # ``"false"`` oder ``1`` dürfen hier nicht durch Python-Truthiness zu
+        # einer Bestätigung werden.
+        status["car_soc_rule_confirmed"] = (
+            soc_info.get("soc_rule_confirmed") is True
         )
         # Profil-/Cloud-/SoC-Zuordnung bleibt ein eigener Diagnosebereich.
         # Sie darf die vom Treiber gelieferte aktuelle Stecksession-ID nicht
@@ -294,8 +301,8 @@ class VehicleManager:
             soc_info.get("car_id", ""),
         )
         status["car_soc_vehicle_id"] = soc_info.get("vehicle_id", "")
-        status["car_soc_profile_bound"] = bool(
-            soc_info.get("soc_profile_bound", False)
+        status["car_soc_profile_bound"] = (
+            soc_info.get("soc_profile_bound") is True
         )
         status["car_soc_identity_scope"] = str(
             soc_info.get("identity_scope", "soc_profile_only") or "soc_profile_only"

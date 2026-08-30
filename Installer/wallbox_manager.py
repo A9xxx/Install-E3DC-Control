@@ -90,6 +90,12 @@ except ModuleNotFoundError:
     from config_secret_permissions import config_secret_dir_mode  # type: ignore
 from Wallbox.scheduler import ScheduleService
 from Wallbox.vehicle_manager import VehicleManager
+from Wallbox.soc_tracker import (
+    CONFIRMED_MANUAL_SOC_SOURCES,
+    vehicle_soc_age_contract,
+    vehicle_soc_max_age_s,
+    vehicle_soc_source_trusted,
+)
 from Wallbox.controller import allocate_power
 from Wallbox import command_gate
 import consumer_priority
@@ -737,6 +743,310 @@ def _wallbox_transient_invalid_budget_hard_blocked(
             return False
         return True
     return False
+
+
+_TRANSIENT_GRID_PM_OUTPUT_ANCHOR_KEY = "_transient_grid_pm_output_anchor"
+_TRANSIENT_GRID_PM_OUTPUT_EPISODE_KEY = "_transient_grid_pm_output_episode"
+
+
+def _wallbox_transient_grid_pm_output_hold_contract(
+    c_data,
+    status,
+    live,
+    live_plausibility,
+    budget,
+    *,
+    now_ts,
+    budget_ok,
+    budget_timeout,
+    budget_identity_valid,
+    authorized_budget_w,
+    live_snapshot_fresh,
+    hard_blocked,
+    min_amp=6,
+    max_hold_s=10.0,
+    max_import_w=150.0,
+):
+    """Bindet einen kurzen reinen Ausgangshalt an genau einen PM-Glitch.
+
+    Der Vertrag autorisiert ausdrücklich keinen neuen Hardwarebefehl. Er darf
+    nur verhindern, dass ein bereits belegter positiver Wallboxausgang wegen
+    genau eines widersprüchlichen Grid-/PM-Bilds als 0-A-Stopp interpretiert
+    wird. Ein gültiger Nullvertrag, echte Netzaufnahme oder jede andere
+    Schutzkante bleibt damit unverändert vorrangig.
+    """
+
+    box = c_data if isinstance(c_data, dict) else {}
+    st = status if isinstance(status, dict) else {}
+    live_data = live if isinstance(live, dict) else {}
+    plausibility = (
+        live_plausibility if isinstance(live_plausibility, dict) else {}
+    )
+    budget_data = budget if isinstance(budget, dict) else {}
+    now_value = _cfg_float(now_ts, 0.0)
+    minimum_amp = max(6.0, _cfg_float(min_amp, 6.0))
+    hold_limit_s = min(10.0, max(0.0, _cfg_float(max_hold_s, 10.0)))
+    import_limit_w = max(0.0, _cfg_float(max_import_w, 150.0))
+    charger = box.get("charger")
+    charger_class = charger.__class__.__name__ if charger is not None else ""
+    openwb_pro = charger_class == "OpenWBProCharger"
+    family = "openwb_pro" if openwb_pro else "unsupported"
+    session_id = str(box.get("_openwb_pro_plug_session_id") or "")
+    status_fresh = _wallbox_start_hold_status_fresh(st)
+    connected = _wb_status_connected(st)
+    reported_amp = _fresh_wallbox_reported_current_amp(st)
+    reported_amp = 0.0 if reported_amp is None else float(reported_amp)
+    manager_amp = max(0.0, _cfg_float(box.get("current_set_amp"), 0.0))
+    observed_phases = max(
+        1,
+        _valid_phase_count(st.get("phases_in_use"), 0),
+        _valid_phase_count(st.get("phases_actual"), 0),
+        _valid_phase_count(st.get("phases_target"), 0),
+    )
+    held_amp = max(reported_amp, manager_amp)
+    revision = str(budget_data.get("budget_revision") or "")
+    identity = (
+        budget_data.get("producer_identity")
+        if isinstance(budget_data.get("producer_identity"), dict)
+        else {}
+    )
+    generation = str(identity.get("decision_generation") or "")
+    minimum_budget_w = minimum_amp * 230.0 * float(observed_phases)
+    positive_readback = bool(
+        held_amp >= minimum_amp
+        and (
+            openwb_pro and reported_amp >= minimum_amp
+        )
+    )
+
+    reasons = {
+        str(item)
+        for item in (plausibility.get("reasons") or [])
+        if str(item or "").strip()
+    }
+    exact_pm_glitch = reasons == {"grid_pm_delta_high"}
+    runtime_blockers = {
+        token.strip()
+        for token in str(
+            budget_data.get("runtime_block_reason") or ""
+        ).split(",")
+        if token.strip()
+    }
+    pm_runtime_blockers = {
+        "live_sample_invalid",
+        "grid_power_invalid",
+        "budget_data_invalid",
+    }
+    result = {
+        "contract": "wallbox_transient_grid_pm_output_hold_v1",
+        "active": False,
+        "output_hold_only": False,
+        "new_output_authorized": False,
+        "family": family,
+        "reason": "not_applicable",
+        "hold_amp": held_amp,
+        "session_id": session_id,
+        "max_hold_s": hold_limit_s,
+    }
+
+    # Nur ein vollständig gültiger positiver Zentralvertrag plus frischer
+    # Geräte-Readback darf den Anker eines späteren No-Write-Halts bilden.
+    if not exact_pm_glitch:
+        box.pop(_TRANSIENT_GRID_PM_OUTPUT_EPISODE_KEY, None)
+        anchor_allowed = bool(
+            family != "unsupported"
+            and math.isfinite(now_value)
+            and now_value > 0.0
+            and budget_ok
+            and not budget_timeout
+            and budget_identity_valid
+            and live_snapshot_fresh
+            and not hard_blocked
+            and status_fresh
+            and connected
+            and session_id
+            and positive_readback
+            and _cfg_float(authorized_budget_w, 0.0) + 0.001
+            >= minimum_budget_w
+            and revision.startswith("sha256:")
+            and len(revision) == 71
+            and generation.startswith("sha256:")
+        )
+        if anchor_allowed:
+            box[_TRANSIENT_GRID_PM_OUTPUT_ANCHOR_KEY] = {
+                "contract": "wallbox_transient_grid_pm_output_anchor_v1",
+                "ts": now_value,
+                "family": family,
+                "session_id": session_id,
+                "hold_amp": held_amp,
+                "observed_phases": observed_phases,
+                "budget_revision": revision,
+                "decision_generation": generation,
+                "source": "fresh_budget_and_device_readback",
+            }
+            result["reason"] = "fresh_anchor_bound"
+        else:
+            box.pop(_TRANSIENT_GRID_PM_OUTPUT_ANCHOR_KEY, None)
+        box["_transient_grid_pm_output_hold_contract"] = dict(result)
+        return result
+
+    anchor = box.get(_TRANSIENT_GRID_PM_OUTPUT_ANCHOR_KEY)
+    anchor = anchor if isinstance(anchor, dict) else {}
+
+    # Ein unmittelbar zuvor bestätigter positiver I/O-Beleg überbrückt auch
+    # die erste ungültige Live-Runde nach einem Start. Er ist kein neues
+    # Budget: Der Executor hatte den Befehl bereits durch alle Deckel geführt.
+    if not anchor:
+        receipt = box.get("_last_executed_command")
+        receipt = receipt if isinstance(receipt, dict) else {}
+        receipt_ts = _cfg_float(receipt.get("ts"), 0.0)
+        receipt_amp = _cfg_float(receipt.get("amp"), 0.0)
+        receipt_method = str(receipt.get("method") or "")
+        receipt_session_id = str(receipt.get("plug_session_id") or "")
+        start_current_session_id = str(
+            box.get("_openwb_pro_start_current_session_id") or ""
+        )
+        start_current_issued_ts = _cfg_float(
+            box.get("_openwb_pro_start_current_issued_ts"),
+            0.0,
+        )
+        receipt_age_s = now_value - receipt_ts
+        receipt_matches = bool(
+            family != "unsupported"
+            and session_id
+            and start_current_session_id == session_id
+            and start_current_issued_ts > 0.0
+            and start_current_issued_ts <= receipt_ts + 0.001
+            and (
+                not receipt_session_id
+                or receipt_session_id == session_id
+            )
+            and status_fresh
+            and connected
+            and positive_readback
+            and receipt_method in _EFFECTIVE_CURRENT_METHODS
+            and receipt_amp >= minimum_amp
+            and math.isfinite(receipt_age_s)
+            and 0.0 <= receipt_age_s <= hold_limit_s
+            and openwb_pro
+        )
+        if receipt_matches:
+            anchor = {
+                "contract": "wallbox_transient_grid_pm_output_anchor_v1",
+                "ts": receipt_ts,
+                "family": family,
+                "session_id": session_id,
+                "hold_amp": min(held_amp, receipt_amp),
+                "observed_phases": observed_phases,
+                "budget_revision": "receipt_bound",
+                "decision_generation": "receipt_bound",
+                "source": "recent_positive_wire_receipt_and_device_readback",
+            }
+            box[_TRANSIENT_GRID_PM_OUTPUT_ANCHOR_KEY] = dict(anchor)
+
+    grid_w = _cfg_float(
+        live_data.get("Grid_Power", live_data.get("Grid")),
+        float("nan"),
+    )
+    pm_w = _cfg_float(
+        live_data.get(
+            "grid_pm_sum_w",
+            (
+                live_data.get("Power_Plausibility", {}).get("grid_pm_sum_w")
+                if isinstance(live_data.get("Power_Plausibility"), dict)
+                else None
+            ),
+        ),
+        float("nan"),
+    )
+    anchor_ts = _cfg_float(anchor.get("ts"), 0.0)
+    anchor_age_s = now_value - anchor_ts
+    anchor_session = str(anchor.get("session_id") or "")
+    anchor_family = str(anchor.get("family") or "")
+    episode = box.get(_TRANSIENT_GRID_PM_OUTPUT_EPISODE_KEY)
+    episode = episode if isinstance(episode, dict) else {}
+    if (
+        str(episode.get("session_id") or "") != session_id
+        or _cfg_float(episode.get("anchor_ts"), 0.0) != anchor_ts
+    ):
+        episode = {
+            "contract": "wallbox_transient_grid_pm_output_episode_v1",
+            "started_ts": now_value,
+            "anchor_ts": anchor_ts,
+            "session_id": session_id,
+        }
+        box[_TRANSIENT_GRID_PM_OUTPUT_EPISODE_KEY] = dict(episode)
+    episode_age_s = now_value - _cfg_float(episode.get("started_ts"), 0.0)
+
+    blockers = []
+    if family == "unsupported":
+        blockers.append("unsupported_wallbox_family")
+    if not budget_ok or budget_timeout or not budget_identity_valid:
+        blockers.append("budget_not_fresh_and_bound")
+    if not live_snapshot_fresh:
+        blockers.append("live_snapshot_stale")
+    if hard_blocked:
+        blockers.append("hard_blocked")
+    if runtime_blockers and not runtime_blockers.issubset(
+        pm_runtime_blockers
+    ):
+        blockers.append("runtime_block_not_pm_scoped")
+    if not status_fresh:
+        blockers.append("device_status_not_fresh")
+    if not connected or not session_id:
+        blockers.append("plug_session_not_bound")
+    if not positive_readback:
+        blockers.append("positive_output_not_confirmed")
+    if not anchor or anchor_family != family or anchor_session != session_id:
+        blockers.append("positive_anchor_not_bound")
+    if (
+        not math.isfinite(anchor_age_s)
+        or anchor_age_s < 0.0
+        or anchor_age_s > hold_limit_s
+        or not math.isfinite(episode_age_s)
+        or episode_age_s < 0.0
+        or episode_age_s > hold_limit_s
+    ):
+        blockers.append("hold_window_expired")
+    if not bool(live_data.get("Grid_PM_Available", False)):
+        blockers.append("grid_pm_not_available")
+    if not math.isfinite(grid_w) or not math.isfinite(pm_w):
+        blockers.append("grid_signals_not_finite")
+    elif grid_w > import_limit_w or pm_w > import_limit_w:
+        blockers.append("grid_import_not_excluded")
+
+    if blockers:
+        result.update({
+            "reason": blockers[0],
+            "blockers": blockers,
+            "anchor_age_s": anchor_age_s,
+            "episode_age_s": episode_age_s,
+            "grid_w": grid_w if math.isfinite(grid_w) else None,
+            "grid_pm_w": pm_w if math.isfinite(pm_w) else None,
+        })
+        box["_transient_grid_pm_output_hold_contract"] = dict(result)
+        return result
+
+    result.update({
+        "active": True,
+        "output_hold_only": True,
+        "new_output_authorized": False,
+        "reason": "single_grid_pm_delta_high_no_write_hold",
+        "hold_amp": min(
+            held_amp,
+            max(0.0, _cfg_float(anchor.get("hold_amp"), 0.0)),
+        ),
+        "anchor_age_s": anchor_age_s,
+        "episode_age_s": episode_age_s,
+        "grid_w": grid_w,
+        "grid_pm_w": pm_w,
+        "budget_revision": str(anchor.get("budget_revision") or ""),
+        "decision_generation": str(
+            anchor.get("decision_generation") or ""
+        ),
+    })
+    box["_transient_grid_pm_output_hold_contract"] = dict(result)
+    return result
 
 
 def _fresh_storage_wallbox_budget_w(
@@ -2110,10 +2420,6 @@ WB_LIVE_SESSION_CHECKPOINT_FILE = os.path.join(
 WB_LIVE_SESSION_LEGACY_FILE = os.path.join(LOG_DIR, "wb_live_session.json")
 WB_LIVE_SESSION_CHECKPOINT_HEARTBEAT_S = 120.0
 
-CONFIRMED_CAR_SOC_MANUAL_SOURCES = {"manual_start_soc", "manual_soc", "manual", "openwb_profile_link"}
-CONFIRMED_CAR_SOC_DIRECT_SOURCES = {"openwb_pro_raw", "openwb_pro_estimated"}
-UNCONFIRMED_CAR_SOC_SOURCES = {"simple_view_start_soc", "config_start_soc"}
-CONFIRMED_CAR_SOC_KEYWORDS = ("mqtt", "bluelink", "wallbox", "openwb", "vehicle", "car_soc", "hyundai", "kia")
 WALLBOX_STATUS_STALE_DEFAULT_S = 45.0
 WALLBOX_STATUS_DIAG_KEYS = STATUS_DIAGNOSTIC_KEYS
 
@@ -2223,24 +2529,122 @@ def _persist_wb_session_checkpoint(
 
 
 def _car_soc_source_rule_confirmed(source):
+    return vehicle_soc_source_trusted(source)
+
+
+def _car_soc_uses_openwb_pro_anchor(source):
+    """Erkennt direkte und abgeleitete SoCs mit openWB-Pro-Rohanker."""
+
     text = str(source or "").strip().lower()
-    if not text or text in UNCONFIRMED_CAR_SOC_SOURCES:
-        return False
-    if text.startswith("wallbox_estimated_from_"):
-        return _car_soc_source_rule_confirmed(text[len("wallbox_estimated_from_"):])
-    if text.startswith("wallbox_estimated"):
-        return False
-    if text in CONFIRMED_CAR_SOC_MANUAL_SOURCES or text in CONFIRMED_CAR_SOC_DIRECT_SOURCES:
+    prefix = "wallbox_estimated_from_"
+    while text.startswith(prefix):
+        text = text[len(prefix):]
+    return text in ("openwb_pro_raw", "openwb_pro_estimated")
+
+
+def _car_soc_contract_veto_active(value):
+    """Werte explizite SoC-Vetos ohne Python-Truthiness aus."""
+
+    if value is True:
         return True
-    return any(token in text for token in CONFIRMED_CAR_SOC_KEYWORDS)
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        return math.isfinite(numeric) and numeric == 1.0
+    return str(value).strip().lower() in {
+        "1", "true", "yes", "ja", "on", "active", "stale",
+        "expired", "invalid", "degraded",
+    }
 
 
-def _car_soc_rule_confirmed(status):
+def _car_soc_contract_field_true(value):
+    """Normalisiert ausschließlich dokumentierte True-Repräsentationen."""
+
+    if value is True:
+        return True
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        return math.isfinite(numeric) and numeric == 1.0
+    return str(value).strip().lower() in {
+        "1", "true", "yes", "ja", "on",
+    }
+
+
+def _apply_car_soc_age_contract(status, config=None):
+    """Transportiert den kanonischen Python-Vertrag bis zur Webprojektion."""
+
+    if not isinstance(status, dict):
+        return None
+    contract = vehicle_soc_age_contract(status.get("car_soc_source"), config)
+    if contract is None:
+        status["car_soc_age_contract"] = None
+        status["car_soc_age_contract_source"] = None
+        status["car_soc_max_age_s"] = None
+        return None
+    status["car_soc_age_contract"] = contract["schema_version"]
+    status["car_soc_age_contract_source"] = contract["source"]
+    status["car_soc_max_age_s"] = contract["max_age_s"]
+    return contract
+
+
+def _car_soc_rule_confirmed(status, *, config=None, now_ts=None):
     if not isinstance(status, dict):
         return False
-    if bool(status.get("car_soc_rule_confirmed", False)):
-        return True
-    return _car_soc_source_rule_confirmed(status.get("car_soc_source"))
+    if isinstance(status.get("car_soc"), bool):
+        return False
+    try:
+        car_soc = float(status.get("car_soc"))
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(car_soc) or car_soc < 0.0 or car_soc > 100.0:
+        return False
+    source = str(status.get("car_soc_source") or "").strip().lower()
+    openwb_pro_source = _car_soc_uses_openwb_pro_anchor(source)
+    required_true_fields = [
+        "driver_status_valid", "soc_profile_bound",
+        "plug_state", "plugged", "is_plugged_in",
+    ]
+    if openwb_pro_source:
+        required_true_fields.append("car_soc_profile_bound")
+    if (status.get("car_soc_rule_confirmed") is not True
+        or not _car_soc_source_rule_confirmed(source)
+        or any(
+            _car_soc_contract_veto_active(status.get(key))
+            for key in (
+                "soc_stale", "car_soc_stale", "stale",
+                "estimate_expired", "soc_expired", "car_soc_expired", "expired",
+                "soc_profile_binding_invalid", "car_soc_profile_binding_invalid",
+                "profile_binding_invalid", "driver_status_stale",
+                "driver_status_degraded",
+            )
+        )
+        or any(
+            key in status
+            and not _car_soc_contract_field_true(status.get(key))
+            for key in required_true_fields
+        )):
+        return False
+
+    # Jede regelwirksame Fahrzeugquelle braucht ihren eigenen Messanker.
+    # Dateizeit, Statusheartbeat und Quellname allein sind keine Bestätigung.
+    now_value = time.time() if now_ts is None else _cfg_float(now_ts, 0.0)
+    source_ts = _cfg_float(status.get("car_soc_source_ts"), 0.0)
+    if source_ts <= 0.0:
+        source_ts = _cfg_float(status.get("car_soc_raw_ts"), 0.0)
+    if source_ts > 100_000_000_000.0:
+        source_ts /= 1000.0
+    max_age_s = vehicle_soc_max_age_s(source, config)
+    return bool(
+        math.isfinite(now_value)
+        and math.isfinite(source_ts)
+        and now_value > 0.0
+        and source_ts > 0.0
+        and source_ts <= now_value
+        and now_value - source_ts <= max_age_s
+    )
 
 
 def _openwb_primary_chargemode_key(value):
@@ -2708,13 +3112,13 @@ def _battery_departure_target_reached(config, charger_id, status):
     """Return whether Akku-bis-Abfahrt should be considered finished by SoC."""
     if not _wb_status_connected(status):
         return False, -1.0, 100.0
-    if not _car_soc_rule_confirmed(status):
+    if not _car_soc_rule_confirmed(status, config=config):
         return False, -1.0, 100.0
     try:
         car_soc = float((status or {}).get("car_soc"))
     except (TypeError, ValueError):
         return False, -1.0, 100.0
-    if car_soc < 0.0:
+    if not math.isfinite(car_soc) or car_soc < 0.0 or car_soc > 100.0:
         return False, car_soc, 100.0
 
     target_soc = 100.0
@@ -3644,6 +4048,72 @@ def _curve_forecast_wallbox_guard(plan, budget, config, now_ts=None, storage_for
         "release_hold_s": release_hold_s,
     }
 
+
+def _curve_forecast_priority_stop_contract(
+    *,
+    forecast_stop_active=False,
+    public_mode=MODE_OFF,
+    openwb_pro=False,
+    connected=False,
+    direct_candidate=False,
+    direct_active=False,
+    direct_w=0.0,
+    direct_real_pv_w=0.0,
+    minimum_w=6.0 * 230.0,
+    status_fresh=False,
+    budget_fresh=False,
+    safety_clear=False,
+):
+    """Trennt Prognose-Akkuvorrang von belegtem Pro-PV-Export.
+
+    Der Prognose-Stop bleibt fachlich aktiv und sperrt weiterhin jede Akku-
+    oder Netzunterstützung. Nur ein bereits durch die zentrale Energie-Policy
+    gebundener, batterieneutraler openWB-Pro-PV-Sink darf ihn überstimmen.
+    """
+
+    min_w = max(0.0, _cfg_float(minimum_w, 6.0 * 230.0))
+    checks = {
+        "forecast_stop_active": bool(forecast_stop_active),
+        "curve_mode": normalize_wb_mode(public_mode) == MODE_CURVE,
+        "openwb_pro": bool(openwb_pro),
+        "connected": bool(connected),
+        "direct_candidate": bool(direct_candidate),
+        "direct_policy_active": bool(direct_active),
+        "direct_budget_minimum": _cfg_float(direct_w, 0.0) >= min_w,
+        "battery_neutral_pv_minimum": (
+            _cfg_float(direct_real_pv_w, 0.0) >= min_w
+        ),
+        "status_fresh": bool(status_fresh),
+        "budget_fresh": bool(budget_fresh),
+        "safety_clear": bool(safety_clear),
+    }
+    direct_pv_exempt = bool(
+        checks["forecast_stop_active"]
+        and all(
+            passed
+            for name, passed in checks.items()
+            if name != "forecast_stop_active"
+        )
+    )
+    stop_required = bool(
+        checks["forecast_stop_active"]
+        and checks["curve_mode"]
+        and not direct_pv_exempt
+    )
+    return {
+        "contract": "curve_forecast_priority_stop_v1",
+        "stop_required": stop_required,
+        "direct_pv_exempt": direct_pv_exempt,
+        "checks": checks,
+        "minimum_w": min_w,
+        "direct_w": max(0.0, _cfg_float(direct_w, 0.0)),
+        "direct_real_pv_w": max(
+            0.0,
+            _cfg_float(direct_real_pv_w, 0.0),
+        ),
+    }
+
+
 def _normalize_current_step_amp(value, default=1.0):
     try:
         step = float(value or default)
@@ -3986,6 +4456,308 @@ def _openwb_pro_phase_start_stop_contract(
     }
 
 
+def _openwb_pro_committed_transition_waits_for_charge_contract(
+    c_data,
+    status,
+    *,
+    now_ts=None,
+):
+    """Belegt die enge Stromfreigabe nach einer bestätigten Phasenkante.
+
+    Die Phasenreservierung bleibt bis zur realen Stromaufnahme aktiv. Nach
+    einem späteren, rein temporären 0-A-Policy-Ausgang darf sie deshalb nicht
+    selbst den zum Bestätigen nötigen erneuten Stromstart verhindern. Diese
+    Ausnahme gilt nur für dieselbe persistierte Ausgangsgeneration und
+    Stecksession; sie autorisiert weder einen neuen Phasenwechsel noch CP-I/O.
+    """
+
+    data = c_data if isinstance(c_data, dict) else {}
+    st = status if isinstance(status, dict) else {}
+    now_value = time.time() if now_ts is None else float(now_ts)
+    reservation = data.get("_wallbox_phase_transition_reservation")
+    intent = data.get("_openwb_pro_phase_output_intent")
+    ack = data.get("_openwb_pro_phase_output_ack")
+    sequence = data.get("_openwb_pro_phase_sequence")
+    recovery = data.get("_openwb_pro_phase_recovery_hold")
+    reservation = reservation if isinstance(reservation, dict) else {}
+    intent = intent if isinstance(intent, dict) else {}
+    ack = ack if isinstance(ack, dict) else {}
+    sequence = sequence if isinstance(sequence, dict) else {}
+    recovery = recovery if isinstance(recovery, dict) else {}
+
+    reservation_id = str(
+        reservation.get("reservation_id")
+        or reservation.get("transition_id")
+        or ""
+    )
+    intent_id = str(intent.get("intent_id") or "")
+    target = _valid_phase_count(reservation.get("target_phases"), 0)
+    requested_w = int(_cfg_float(reservation.get("requested_w"), 0.0))
+    committed_w = int(_cfg_float(reservation.get("committed_w"), 0.0))
+    sequence_patch = intent.get("sequence_patch")
+    sequence_patch = (
+        sequence_patch if isinstance(sequence_patch, dict) else {}
+    )
+    intent_ts = _cfg_float(intent.get("wall_ts"), 0.0)
+    wire_ts = max(
+        _cfg_float(intent.get("wire_receipt_ts"), 0.0),
+        _cfg_float(sequence_patch.get("wire_receipt_ts"), 0.0),
+    )
+    ack_ts = _cfg_float(ack.get("wall_ts"), 0.0)
+    allowed_after = _cfg_float(
+        sequence_patch.get("current_allowed_after"),
+        0.0,
+    )
+    issued_ts = _cfg_float(
+        data.get("_openwb_pro_start_current_issued_ts"),
+        0.0,
+    )
+    issued_session_id = str(
+        data.get("_openwb_pro_start_current_session_id") or ""
+    )
+    plug_session_id = str(data.get("_openwb_pro_plug_session_id") or "")
+    readback_ts = _cfg_float(st.get("driver_status_last_ok_ts"), 0.0)
+    if readback_ts > 100_000_000_000.0:
+        readback_ts /= 1000.0
+    real_power_w = max(
+        _cfg_float(st.get("real_power_w"), 0.0),
+        _cfg_float(st.get("phase_power_sum_w"), 0.0),
+        _cfg_float(st.get("power_w"), 0.0),
+    )
+    status_fresh = bool(
+        st.get("driver_status_valid") is True
+        and st.get("driver_status_stale") is not True
+        and st.get("driver_status_degraded") is not True
+        and st.get("driver_status_glitch") is not True
+        and st.get("driver_status_plausible") is not False
+    )
+    checks = {
+        "reservation_active": reservation.get("active") is True,
+        "reservation_waits_for_physics": bool(
+            str(reservation.get("stage") or "") == "confirm_target"
+            and str(reservation.get("grant_state") or "") == "committed"
+            and requested_w > 0
+            and committed_w >= requested_w
+        ),
+        "reservation_identity_bound": bool(
+            reservation_id
+            and str(reservation.get("reservation_id") or reservation_id)
+            == reservation_id
+            and str(reservation.get("transition_id") or reservation_id)
+            == reservation_id
+        ),
+        "committed_intent_bound": bool(
+            str(reservation.get("commit_action") or "") == "send_phase"
+            and str(reservation.get("commit_intent_id") or "") == intent_id
+        ),
+        "phase_intent_bound": bool(
+            intent.get("schema") == "openwb_pro_phase_output_intent_v1"
+            and intent_id.startswith(reservation_id + ":send_phase:")
+            and str(intent.get("transition_id") or "") == reservation_id
+            and str(intent.get("action") or "") == "send_phase"
+            and str(intent.get("method") or "") == "set_phases"
+            and _valid_phase_count(intent.get("target"), 0) == target
+            and target in (1, 3)
+        ),
+        "positive_phase_ack_bound": bool(
+            ack.get("schema") == "openwb_pro_phase_output_ack_v1"
+            and ack.get("success") is True
+            and str(ack.get("intent_id") or "") == intent_id
+            and str(ack.get("reason") or "")
+            in ("confirmed", "recovered_from_fresh_unambiguous_readback")
+        ),
+        "timestamp_chain_bound": bool(
+            all(
+                math.isfinite(value) and value > 0.0
+                for value in (
+                    intent_ts,
+                    wire_ts,
+                    ack_ts,
+                    allowed_after,
+                    issued_ts,
+                    readback_ts,
+                    now_value,
+                )
+            )
+            and intent_ts <= wire_ts <= ack_ts
+            and allowed_after <= issued_ts <= readback_ts <= now_value + 1.0
+            and issued_ts >= ack_ts
+        ),
+        "plug_session_bound": bool(
+            plug_session_id
+            and issued_session_id == plug_session_id
+        ),
+        "phase_sequence_terminal": not bool(sequence),
+        "phase_recovery_clear": not bool(recovery.get("active", False)),
+        "fresh_connected_idle": bool(
+            status_fresh
+            and openwb_pro_session.status_connected(st)
+            and st.get("cp_interrupt_isactive") in (False, 0)
+            and not openwb_pro_session.start_offer_physics_confirmed(st)
+            and real_power_w <= 100.0
+        ),
+        "target_readback_confirmed": bool(
+            target in (1, 3)
+            and openwb_pro_session.phase_target_readback_confirmed(st, target)
+        ),
+    }
+    blockers = [name for name, passed in checks.items() if not passed]
+    return {
+        "contract": "openwb_pro_committed_transition_waits_for_charge_v1",
+        "authorized": not blockers,
+        "hardware_output": False,
+        "reservation_id": reservation_id,
+        "intent_id": intent_id,
+        "target": target,
+        "plug_session_id": plug_session_id,
+        "current_issued_ts": issued_ts,
+        "checks": checks,
+        "blockers": blockers,
+    }
+
+
+def _reconcile_openwb_pro_committed_idle_zero_current_shadow(
+    c_data,
+    status,
+    committed_transition,
+    *,
+    min_amp=6,
+):
+    """Gleicht ausschließlich einen belegten positiven Manager-Shadow auf 0 A ab.
+
+    Nach einem openWB-Pro-Neustart kann der frische Geräte-Readback bereits
+    wieder 0 A melden, während ``current_set_amp`` noch den alten positiven
+    Managerwert enthält. Diese rein interne Korrektur ist nur für dieselbe
+    vollständig bestätigte ``send_phase``-Generation und den exakt gebundenen
+    temporären ``hold_target_below_minimum``-Anker zulässig. Sie erzeugt weder
+    Hardware-I/O noch eine Phasen- oder CP-Kante und verändert die aktive
+    Phasenreservierung sowie deren 480-s-Cooldown nicht.
+    """
+
+    data = c_data if isinstance(c_data, dict) else {}
+    st = status if isinstance(status, dict) else {}
+    transition = (
+        committed_transition
+        if isinstance(committed_transition, dict)
+        else {}
+    )
+    anchor = data.get("_manager_zero_anchor_contract")
+    anchor = anchor if isinstance(anchor, dict) else {}
+    plug_session_id = str(data.get("_openwb_pro_plug_session_id") or "")
+    issued_session_id = str(
+        data.get("_openwb_pro_start_current_session_id") or ""
+    )
+    issued_ts = _cfg_float(
+        data.get("_openwb_pro_start_current_issued_ts"),
+        0.0,
+    )
+    target = _valid_phase_count(transition.get("target"), 0)
+    manager_amp = _cfg_float(data.get("current_set_amp"), 0.0)
+    minimum_amp = max(6.0, _cfg_float(min_amp, 6.0))
+    offered_keys = ("offered_current_raw", "evse_current", "amp")
+    power_keys = ("real_power_w", "phase_power_sum_w", "power_w")
+    hardware_fields_present = bool(
+        all(
+            key in st
+            and type(st.get(key)) in (int, float)
+            and math.isfinite(float(st.get(key)))
+            for key in offered_keys + power_keys
+        )
+    )
+    offered_values = tuple(
+        abs(float(st[key]))
+        for key in offered_keys
+    ) if hardware_fields_present else ()
+    power_values = tuple(
+        abs(float(st[key]))
+        for key in power_keys
+    ) if hardware_fields_present else ()
+    finite_hardware = bool(hardware_fields_present)
+    hardware_amp = max(offered_values) if finite_hardware else float("inf")
+    real_power_w = max(power_values) if finite_hardware else float("inf")
+    status_fresh = bool(
+        st.get("driver_status_valid") is True
+        and st.get("driver_status_stale") is not True
+        and st.get("driver_status_degraded") is not True
+        and st.get("driver_status_glitch") is not True
+        and st.get("driver_status_plausible") is not False
+    )
+    anchor_vehicle_key = str(anchor.get("session_vehicle_key") or "")
+    session_vehicle_key = str(data.get("_session_vehicle_key") or "")
+    exact_temporary_anchor = bool(
+        data.get("_manager_zero_anchor_active") is True
+        and anchor.get("contract") == "wallbox_manager_zero_anchor_v1"
+        and anchor.get("owner") == "wallbox_manager"
+        and anchor.get("class") == "temporary_policy_zero"
+        and anchor.get("reason_code") == "hold_target_below_minimum"
+        and _cfg_float(anchor.get("created_ts"), 0.0) > 0.0
+        and plug_session_id
+        and str(anchor.get("plug_session_id") or "") == plug_session_id
+        and (
+            not anchor_vehicle_key
+            or anchor_vehicle_key == session_vehicle_key
+        )
+    )
+    checks = {
+        "committed_generation_authorized": bool(
+            transition.get("contract")
+            == "openwb_pro_committed_transition_waits_for_charge_v1"
+            and transition.get("authorized") is True
+            and transition.get("hardware_output") is False
+        ),
+        "same_plug_session_and_current_receipt": bool(
+            plug_session_id
+            and issued_session_id == plug_session_id
+            and str(transition.get("plug_session_id") or "")
+            == plug_session_id
+            and math.isfinite(issued_ts)
+            and issued_ts > 0.0
+            and abs(
+                _cfg_float(transition.get("current_issued_ts"), 0.0)
+                - issued_ts
+            )
+            <= 0.001
+        ),
+        "fresh_connected_idle_hardware_zero": bool(
+            status_fresh
+            and hardware_fields_present
+            and openwb_pro_session.status_connected(st)
+            and st.get("cp_interrupt_isactive") in (False, 0)
+            and not openwb_pro_session.start_offer_physics_confirmed(st)
+            and hardware_amp <= 0.5
+            and real_power_w <= 100.0
+        ),
+        "same_phase_target_confirmed": bool(
+            target in (1, 3)
+            and openwb_pro_session.phase_target_readback_confirmed(st, target)
+        ),
+        "positive_manager_shadow": bool(
+            math.isfinite(manager_amp) and manager_amp >= minimum_amp
+        ),
+        "exact_manager_temporary_zero_anchor": exact_temporary_anchor,
+    }
+    blockers = [name for name, passed in checks.items() if not passed]
+    reconciled = not blockers
+    previous_amp = manager_amp
+    if reconciled:
+        # Nur der interne Stromshadow folgt dem frischen Geräte-Readback. Der
+        # nachgelagerte Nullanker-Vertrag entscheidet weiterhin über die
+        # eigentliche Freigabe; ein Hardwarebefehl entsteht hier nicht.
+        data["current_set_amp"] = 0.0
+    return {
+        "contract": "openwb_pro_committed_idle_zero_shadow_reconcile_v1",
+        "reconciled": bool(reconciled),
+        "hardware_output": False,
+        "previous_current_set_amp": float(previous_amp),
+        "current_set_amp": float(data.get("current_set_amp", 0.0) or 0.0),
+        "hardware_amp": float(hardware_amp),
+        "target": int(target),
+        "plug_session_id": plug_session_id,
+        "checks": checks,
+        "blockers": blockers,
+    }
+
+
 def _openwb_pro_planned_cold_start_command(
     c_data,
     status,
@@ -4025,12 +4797,23 @@ def _openwb_pro_planned_cold_start_command(
         _cfg_float(st.get("power_w"), 0.0),
     )
     transition = data.get("_wallbox_phase_transition_reservation")
+    committed_transition = (
+        _openwb_pro_committed_transition_waits_for_charge_contract(
+            data,
+            st,
+            now_ts=now_ts,
+        )
+    )
+    data[
+        "_openwb_pro_committed_transition_waits_for_charge_contract"
+    ] = committed_transition
     phase_restart = _openwb_pro_phase_restart_current_contract(data, st)
     data["_openwb_pro_phase_restart_current_contract"] = phase_restart
     transition_blocks_start = bool(
         isinstance(transition, dict)
         and transition.get("active")
         and not phase_restart.get("authorized", False)
+        and not committed_transition.get("authorized", False)
     )
     recovery = data.get("_openwb_pro_phase_recovery_hold")
     session_state = str(session.get("state") or data.get("_openwb_pro_session_state") or "")
@@ -4114,6 +4897,174 @@ def _openwb_pro_planned_cold_start_command(
     return command
 
 
+def _openwb_pro_start_wakeup_tick_command(
+    c_data,
+    status,
+    *,
+    phase_switch_action="KEEP_PHASES",
+    phase_wait_active=False,
+    physically_chargeable=False,
+    priority_forced_stop=False,
+    manual_pause=False,
+    locked=False,
+    emergency_stop=False,
+    charger_max_amp=32,
+    now_ts=None,
+):
+    """Materialisiert den fälligen CP-Wake-up auch bei unverändertem Sollstrom.
+
+    Das Wake-up-Orakel lief bisher nur als Nebenwirkung eines neuen
+    Strombefehls. Blieb ein bestätigtes 6-A-Angebot stehen, entstand aber kein
+    weiterer Strombefehl und damit auch nie der nachgelagerte, begrenzte
+    CP-Impuls. Dieser Vertrag erzeugt ausschließlich einen bereits vom
+    bestehenden Orakel als fällig bewerteten Probeauftrag; die eigentliche
+    Hardwarekante bleibt im zentralen Executor und dessen Output-Ledger.
+    """
+
+    data = c_data if isinstance(c_data, dict) else {}
+    st = status if isinstance(status, dict) else {}
+    now_value = time.time() if now_ts is None else float(now_ts)
+    planned = data.get("_driver_command")
+    payload = data.get("_decision_payload")
+    session = data.get("_openwb_pro_session")
+    planned = planned if isinstance(planned, dict) else {}
+    payload = payload if isinstance(payload, dict) else {}
+    session = session if isinstance(session, dict) else {}
+    mode = payload.get("mode") if isinstance(payload.get("mode"), dict) else {}
+    decisions = payload.get("decisions") if isinstance(payload.get("decisions"), dict) else {}
+    start_stop = decisions.get("start_stop") if isinstance(decisions.get("start_stop"), dict) else {}
+    planned_kind = str(planned.get("method") or planned.get("kind") or "")
+    planned_amp = _cfg_float(planned.get("amp"), 0.0)
+    offered_amp = max(
+        _cfg_float(st.get("offered_current_raw"), 0.0),
+        _cfg_float(st.get("evse_current"), 0.0),
+        _cfg_float(st.get("amp"), 0.0),
+    )
+    manager_amp = max(0.0, _cfg_float(data.get("current_set_amp"), 0.0))
+    real_power_w = max(
+        _cfg_float(st.get("real_power_w"), 0.0),
+        _cfg_float(st.get("phase_power_sum_w"), 0.0),
+        _cfg_float(st.get("power_w"), 0.0),
+    )
+    connected = openwb_pro_session.status_connected(st)
+    status_fresh = _wallbox_start_hold_status_fresh(st)
+    sequence = data.get("_openwb_pro_phase_sequence")
+    sequence = sequence if isinstance(sequence, dict) else {}
+    recovery = data.get("_openwb_pro_phase_recovery_hold")
+    recovery = recovery if isinstance(recovery, dict) else {}
+    reservation = data.get("_wallbox_phase_transition_reservation")
+    reservation = reservation if isinstance(reservation, dict) else {}
+    issued_session_id = str(
+        data.get("_openwb_pro_start_current_session_id") or ""
+    )
+    plug_session_id = str(data.get("_openwb_pro_plug_session_id") or "")
+    issued_ts = _cfg_float(
+        data.get("_openwb_pro_start_current_issued_ts"),
+        0.0,
+    )
+    committed_transition = (
+        _openwb_pro_committed_transition_waits_for_charge_contract(
+            data,
+            st,
+            now_ts=now_value,
+        )
+    )
+    data[
+        "_openwb_pro_committed_transition_waits_for_charge_contract"
+    ] = committed_transition
+    transition_waits_for_physics = bool(
+        committed_transition.get("authorized", False)
+    )
+    transition_safe = bool(
+        not reservation.get("active", False)
+        or transition_waits_for_physics
+    )
+    probe_amp = min(
+        float(charger_max_amp or 32),
+        planned_amp,
+        offered_amp,
+        manager_amp,
+    )
+    cfg = data.get("_openwb_pro_config")
+    cfg = cfg if isinstance(cfg, dict) else {}
+    probe = openwb_pro_session.start_wakeup_step_contract(
+        planned_kind,
+        probe_amp,
+        data,
+        st,
+        cfg,
+        now_ts=now_value,
+        cp_payload=_openwb_pro_cp_payload_from_config(cfg, st),
+    )
+    checks = {
+        "current_plan": bool(
+            planned_kind in _EFFECTIVE_CURRENT_METHODS
+            and str(planned.get("reason") or "")
+            == "phase_decision_apply_current"
+            and planned_amp >= 6.0
+        ),
+        "central_start_or_hold": bool(
+            str(start_stop.get("action") or "") in ("START", "SET_CURRENT")
+            and int(mode.get("public", 0) or 0) > 0
+            and physically_chargeable
+        ),
+        "standing_positive_offer": bool(
+            offered_amp >= 6.0
+            and manager_amp >= 6.0
+            and probe_amp >= 6.0
+            and not openwb_pro_session.start_offer_physics_confirmed(st)
+            and real_power_w <= 100.0
+        ),
+        "fresh_connected_status": bool(status_fresh and connected),
+        "same_plug_session": bool(
+            plug_session_id
+            and issued_session_id == plug_session_id
+            and issued_ts > 0.0
+        ),
+        "phase_stable": bool(
+            str(phase_switch_action or "") == "KEEP_PHASES"
+            and not phase_wait_active
+            and not sequence
+            and not recovery.get("active", False)
+            and transition_safe
+            and st.get("cp_interrupt_isactive") in (False, 0)
+        ),
+        "safety_clear": bool(
+            not priority_forced_stop
+            and not manual_pause
+            and not locked
+            and not emergency_stop
+            and not data.get("_bev_full_blocked", False)
+            and not data.get("_manager_zero_anchor_active", False)
+            and not session.get("start_blocked", False)
+            and session.get("state") not in ("stopping", "ended")
+        ),
+        "wakeup_due": str(probe.get("action") or "")
+        == "send_cp_interrupt",
+    }
+    blockers = [name for name, passed in checks.items() if not passed]
+    result = {
+        "contract": "openwb_pro_start_wakeup_tick_v1",
+        "due": not blockers,
+        "hardware_output": False,
+        "probe_amp": probe_amp,
+        "probe_action": str(probe.get("action") or ""),
+        "probe_reason": str(probe.get("reason") or ""),
+        "transition_waits_for_physics": transition_waits_for_physics,
+        "checks": checks,
+        "blockers": blockers,
+    }
+    data["_openwb_pro_start_wakeup_tick_contract"] = result
+    if blockers:
+        return {}
+    command = dict(planned)
+    command["amp"] = probe_amp
+    command["force_state"] = 2
+    command["reason"] = "openwb_pro_start_wakeup_tick"
+    command["_openwb_pro_start_wakeup_tick"] = True
+    return command
+
+
 def _openwb_pro_cold_start_3p_ready(
     *,
     cold_start_ready=False,
@@ -4155,16 +5106,21 @@ def _openwb_pro_cold_start_1p_needed(
     phase_block_active=False,
     phase_target=0,
 ):
-    """Verhindert einen Gegenwechsel während des 3p-Nachwechselguards."""
+    """Trennt den stromlosen 1p-Start vom späteren 1→3-Wechsel."""
 
     return bool(
         cold_start_ready
-        and str(phase_switch_action or "") != "SWITCH_1P"
+        # WAIT_1P ist bereits die zentrale 3→1-Down-Hysterese. Der
+        # Kaltstartpfad darf diese Beobachtungszeit nicht zu einem sofortigen
+        # Gegenwechsel verkürzen.
+        and str(phase_switch_action or "") not in ("WAIT_1P", "SWITCH_1P")
         and not cold_start_3p_ready
-        and not (
-            phase_block_active
-            and int(phase_target or 0) == 3
-        )
+        # Ein ungebundener 3p-Sollwert aus dem Leerlauf ist keine physische
+        # Starttopologie: Reicht das Budget nicht für 3p, darf der Kaltstart
+        # deshalb auf 1p vorbereitet werden. Der 480-s-Guard sperrt dagegen
+        # weiterhin genau diesen neuen Phasenwechsel; ein Wiederanlauf am
+        # bereits bestätigten Ziel wird vom getrennten 3p-Pfad behandelt.
+        and not phase_block_active
     )
 
 
@@ -4192,15 +5148,23 @@ def _openwb_pro_direct_3p_cold_start_contract(
     manual_pause=False,
     locked=False,
     emergency_stop=False,
+    current_first_contract=None,
 ):
-    """Bindet den unmittelbaren 3p-Kaltstart eines bekannten 3p-Fahrzeugs.
+    """Bindet den direkten 3p-Kaltstart nach dem Strom-zuerst-Beleg.
 
     Unbekannte oder 1p-Fahrzeuge bleiben im konservativen Strom-zuerst-Pfad.
-    Nutzer-Aus, Safety, stale Daten, laufende Übergänge und CP-Unterbrechung
-    bleiben harte Sperren.
+    Auch ein leerer oder initialer 6-A-Readback reicht ohne den frischen,
+    sitzungsgebundenen eigenen Strombeleg nicht aus. Nutzer-Aus, Safety,
+    stale Daten, laufende Übergänge und CP-Unterbrechung bleiben harte
+    Sperren.
     """
 
     st = status if isinstance(status, dict) else {}
+    current_first = (
+        current_first_contract
+        if isinstance(current_first_contract, dict)
+        else {}
+    )
     checks = {
         "openwb_pro": bool(openwb_pro),
         "connected": bool(
@@ -4219,10 +5183,11 @@ def _openwb_pro_direct_3p_cold_start_contract(
             not hw_charging
             and float(stable_hw_power_w or 0.0) <= 500.0
             # connect.php kann direkt nach dem Anstecken noch das initiale
-            # 6-A-Angebot ausweisen, obwohl real kein Strom fließt. Das ist
-            # für den bekannten 3p-Kaltstart zulässig, weil die Phasensequenz
-            # vor phasetarget selbst zuerst auf 0 A setzt. Ein höheres Angebot
-            # bleibt dagegen konservativ gesperrt.
+            # 6-A-Angebot ausweisen, obwohl real kein Strom fließt. Dieser
+            # Check beschreibt nur den ruhigen Hardwarezustand; die getrennte
+            # ``current_first_satisfied``-Prüfung muss den frischen eigenen
+            # Strombeleg trotzdem zwingend liefern. Ein höheres Angebot bleibt
+            # konservativ gesperrt.
             and (
                 _fresh_wallbox_reported_current_amp(st) is None
                 or _fresh_wallbox_reported_current_amp(st) <= 6.0
@@ -4233,6 +5198,11 @@ def _openwb_pro_direct_3p_cold_start_contract(
             phase_3p_supported and int(phase_cap_phases or 0) >= 3
         ),
         "positive_budget": float(cap_amp or 0.0) >= 6.0,
+        "current_first_satisfied": bool(
+            current_first.get("contract")
+            == "openwb_pro_current_first_satisfied_v1"
+            and current_first.get("satisfied") is True
+        ),
         "target_needs_3p": bool(
             int(phase_target or 0) != 3
             and int(phase_switch_phases or 0) in (0, 1)
@@ -4252,6 +5222,178 @@ def _openwb_pro_direct_3p_cold_start_contract(
         "contract": "openwb_pro_direct_3p_cold_start_v1",
         "allow": not blockers,
         "target_phases": 3,
+        "checks": checks,
+        "blockers": blockers,
+    }
+
+
+def _openwb_pro_current_first_satisfied_contract(
+    c_data,
+    status,
+    *,
+    now_ts=None,
+    openwb_pro=False,
+    charger_connected=False,
+    control_mode=0,
+    public_mode=0,
+    hw_charging=False,
+    stable_hw_power_w=0.0,
+    cap_amp=0,
+    minimum_amp=6,
+    vehicle_max_phases=0,
+    phase_3p_supported=False,
+    phase_cap_phases=0,
+    phase_3p_min_w=4140.0,
+    fresh_budget_authorized=False,
+    authorized_budget_w=0.0,
+    live_snapshot_fresh=False,
+    phase_target=0,
+    phase_switch_phases=0,
+    phase_wait_active=False,
+    phase_block_active=False,
+    transition_active=False,
+    recovery_active=False,
+    priority_forced_stop=False,
+    vehicle_finished=False,
+    manual_pause=False,
+    locked=False,
+    emergency_stop=False,
+    physical_output_blocked=False,
+):
+    """Belegt den erfüllten Strom-zuerst-Schritt ohne Hardwarefreigabe.
+
+    Ein positiver Sollstrom allein genügt nicht. Erst ein frischer Geräte-
+    Readback nach dem eigenen, sitzungsgebundenen Startbeleg erfüllt den
+    Strom-zuerst-Vertrag. Die normale 30-s-Up-Hysterese und der bestehende
+    Phasensequencer entscheiden danach weiterhin allein über den 3p-Wechsel.
+    """
+
+    data = c_data if isinstance(c_data, dict) else {}
+    st = status if isinstance(status, dict) else {}
+    now_value = time.time() if now_ts is None else _cfg_float(now_ts, 0.0)
+    minimum = max(6.0, _cfg_float(minimum_amp, 6.0))
+    minimum_3p_w = max(
+        minimum * 230.0 * 3.0,
+        _cfg_float(phase_3p_min_w, 0.0),
+    )
+
+    def _epoch_seconds(value):
+        timestamp = _cfg_float(value, 0.0)
+        if timestamp > 100_000_000_000.0:
+            timestamp /= 1000.0
+        return timestamp
+
+    plug_session_id = str(data.get("_openwb_pro_plug_session_id") or "")
+    issued_session_id = str(
+        data.get("_openwb_pro_start_current_session_id") or ""
+    )
+    issued_ts = _epoch_seconds(
+        data.get("_openwb_pro_start_current_issued_ts")
+    )
+    status_sample_ts = max(
+        _epoch_seconds(st.get("driver_status_last_sample_ts")),
+        _epoch_seconds(st.get("driver_status_last_ok_ts")),
+        _epoch_seconds(st.get("driver_status_last_good_ts")),
+    )
+    reported_amp = _fresh_wallbox_reported_current_amp(st)
+    manager_amp = max(
+        0.0,
+        _cfg_float(data.get("current_set_amp"), 0.0),
+    )
+    real_power_w = max(
+        _cfg_float(stable_hw_power_w, 0.0),
+        _cfg_float(st.get("real_power_w"), 0.0),
+        _cfg_float(st.get("phase_power_sum_w"), 0.0),
+        _cfg_float(st.get("power_w"), 0.0),
+    )
+    sequence = data.get("_openwb_pro_phase_sequence")
+    sequence_active = bool(
+        isinstance(sequence, dict)
+        and sequence
+        and str(sequence.get("stage") or "")
+        not in ("", "ready", "completed", "aborted", "idle")
+    )
+    status_timestamp_fresh = bool(
+        math.isfinite(now_value)
+        and math.isfinite(issued_ts)
+        and math.isfinite(status_sample_ts)
+        and now_value > 0.0
+        and issued_ts > 0.0
+        and issued_ts <= status_sample_ts + 0.001
+        and status_sample_ts <= now_value + 2.0
+        and now_value - status_sample_ts <= 30.0
+    )
+    checks = {
+        "openwb_pro": bool(openwb_pro),
+        "connected": bool(
+            charger_connected
+            and openwb_pro_session.status_connected(st)
+        ),
+        "fresh_status": bool(
+            _wallbox_start_hold_status_fresh(st)
+            and status_timestamp_fresh
+        ),
+        "cp_inactive": st.get("cp_interrupt_isactive") in (False, 0),
+        "mode_enabled": bool(
+            int(control_mode or 0) > 0 and int(public_mode or 0) > 0
+        ),
+        "same_plug_session": bool(
+            plug_session_id
+            and issued_session_id == plug_session_id
+        ),
+        "own_current_readback": bool(
+            reported_amp is not None
+            and float(reported_amp) + 0.001 >= minimum
+            and manager_amp + 0.001 >= minimum
+            and status_timestamp_fresh
+        ),
+        "idle_without_charge_physics": bool(
+            not hw_charging
+            and real_power_w <= 100.0
+            and not openwb_pro_session.start_offer_physics_confirmed(st)
+        ),
+        "known_3p_vehicle": int(vehicle_max_phases or 0) >= 3,
+        "fresh_3p_budget": bool(
+            phase_3p_supported
+            and int(phase_cap_phases or 0) >= 3
+            and float(cap_amp or 0.0) + 0.001 >= minimum
+            and fresh_budget_authorized
+            and live_snapshot_fresh
+            and _cfg_float(authorized_budget_w, 0.0) + 0.001
+            >= minimum_3p_w
+        ),
+        "target_needs_3p": bool(
+            int(phase_target or 0) in (0, 1)
+            and int(phase_switch_phases or 0) in (0, 1)
+        ),
+        "no_phase_wait": not bool(phase_wait_active),
+        "no_phase_block": not bool(phase_block_active),
+        "no_active_transition": bool(
+            not transition_active and not sequence_active
+        ),
+        "no_recovery": not bool(recovery_active),
+        "no_priority_stop": not bool(priority_forced_stop),
+        "vehicle_not_finished": not bool(vehicle_finished),
+        "no_manual_pause": not bool(manual_pause),
+        "not_locked": not bool(locked),
+        "no_emergency_stop": not bool(emergency_stop),
+        "physical_output_clear": not bool(physical_output_blocked),
+    }
+    blockers = [name for name, passed in checks.items() if not passed]
+    return {
+        "contract": "openwb_pro_current_first_satisfied_v1",
+        "satisfied": not blockers,
+        "hardware_output": False,
+        "target_phases": 3,
+        "plug_session_id": plug_session_id,
+        "issued_session_id": issued_session_id,
+        "issued_ts": issued_ts,
+        "status_sample_ts": status_sample_ts,
+        "reported_amp": (
+            None if reported_amp is None else float(reported_amp)
+        ),
+        "manager_amp": manager_amp,
+        "minimum_3p_w": minimum_3p_w,
         "checks": checks,
         "blockers": blockers,
     }
@@ -4588,11 +5730,20 @@ def _openwb_pro_phase_restart_current_contract(c_data, status, *, now_ts=None):
     )
     intent_id = str(intent.get("intent_id") or "")
     intent_transition_id = str(intent.get("transition_id") or "")
-    deadline = _cfg_float(reservation.get("stage_deadline_ts"), 0.0)
-    authorized_ts = _cfg_float(restart.get("authorized_ts"), 0.0)
-    restart_phase_ts = _cfg_float(restart.get("phase_sent_ts"), 0.0)
     sequence_patch = intent.get("sequence_patch")
     sequence_patch = sequence_patch if isinstance(sequence_patch, dict) else {}
+    # Der maßgebliche Wiederanlaufzeitpunkt gehört zur bestätigten
+    # ``send_phase``-Generation. Ältere Reservationen hatten noch kein
+    # eigenes ``stage_deadline_ts``; ihr persistierter Sequence-Patch ist
+    # deshalb der kompatible Fallback. Das entspricht openWBs
+    # WAIT_FOR_USING_PHASES: Strom wieder anbieten, die tatsächlich genutzten
+    # Phasen aber erst unter Last bestätigen.
+    deadline = max(
+        _cfg_float(reservation.get("stage_deadline_ts"), 0.0),
+        _cfg_float(sequence_patch.get("current_allowed_after"), 0.0),
+    )
+    authorized_ts = _cfg_float(restart.get("authorized_ts"), 0.0)
+    restart_phase_ts = _cfg_float(restart.get("phase_sent_ts"), 0.0)
     intent_phase_ts = _cfg_float(sequence_patch.get("phase_sent_ts"), 0.0)
     same_phase_generation = bool(
         restart_phase_ts > 0.0
@@ -4643,6 +5794,7 @@ def _openwb_pro_phase_restart_current_contract(c_data, status, *, now_ts=None):
         "same_phase_generation": same_phase_generation,
         "sequence_terminal": not bool(sequence),
         "recovery_clear": not bool(recovery.get("active", False)),
+        "connected": bool(openwb_pro_session.status_connected(st)),
         "cp_inactive": cp_inactive,
         "fresh_status": bool(
             st.get("driver_status_valid") is True
@@ -7087,6 +8239,35 @@ def _remember_phase_target(c_data, phases, now_ts=None, hold_s=900.0):
     c_data["_phase_target_cmd"] = int(phases)
     c_data["_phase_target_cmd_until"] = now_ts + max(30.0, float(hold_s or 0.0))
 
+
+def _openwb_pro_phase_change_veto_until(c_data):
+    """Liefert ausschließlich die Frist gegen eine neue Phasenkante.
+
+    Der elektromechanische openWB-Pro-Cooldown darf niemals einen positiven
+    Sollstrom am bereits bestätigten Phasenziel sperren. Die Policy muss ihn
+    aber aus denselben persistierten Belegen wie der Executor erkennen, damit
+    sie während der Schutzfrist keinen unerfüllbaren ``set_phases``-Plan vor
+    den Stromstart stellt.
+    """
+
+    data = c_data if isinstance(c_data, dict) else {}
+    reservation = data.get("_wallbox_phase_transition_reservation")
+    reservation_cooldown_until = 0.0
+    if isinstance(reservation, dict) and reservation.get("active") is True:
+        reservation_cooldown_until = _cfg_float(
+            reservation.get("cooldown_until_ts"),
+            0.0,
+        )
+    return max(
+        _cfg_float(data.get("_phase_3p_block_until"), 0.0),
+        _cfg_float(
+            data.get("_openwb_pro_phase_change_block_until"),
+            0.0,
+        ),
+        reservation_cooldown_until,
+    )
+
+
 def _effective_phase_target(status, c_data, now_ts=None):
     """Return the phase target that must be used for physical budget checks."""
     now_ts = time.time() if now_ts is None else float(now_ts)
@@ -7382,6 +8563,7 @@ def _wallbox_detail_status(
     vehicle_max_phases=0,
     openwb_phase_capable=False,
     battery_departure_state=None,
+    config=None,
 ):
     """Compact per-wallbox UI state with a reason, not just "Bereit"."""
     c_data = c_data or {}
@@ -7436,7 +8618,7 @@ def _wallbox_detail_status(
         battery_departure_state=battery_departure_state,
         primary_phase_warning=primary_phase_warning,
         under_acceptance_warning=under_acceptance_warning,
-        car_soc_rule_confirmed=_car_soc_rule_confirmed(status),
+        car_soc_rule_confirmed=_car_soc_rule_confirmed(status, config=config),
         connected=connected,
         real_charging=real_charging,
         real_power_w=real_power_w,
@@ -7667,6 +8849,7 @@ def _build_wallbox_detail_list(
             vehicle_max_phases=_vehicle_max_ac_phases(config, c_id, st),
             openwb_phase_capable=phase_policy_can_switch,
             battery_departure_state=departure_detail,
+            config=config,
         )
         manual_pause_active = bool(manual_pause.get(c_id, False) or c_data.get("_manual_pause_active", False))
         if manual_pause_active:
@@ -8002,7 +9185,9 @@ def _build_wallbox_detail_list(
                 "manual_lock", "min_current",
                 "pv_charging_min_current", "instant_charging_current",
                 "instant_charging_limit", "instant_charging_soc",
-                "car_soc", "car_soc_source", "car_soc_raw_ts", "car_soc_rule_confirmed",
+                "car_soc", "car_soc_source", "car_soc_raw_ts", "car_soc_source_ts",
+                "car_soc_rule_confirmed", "car_soc_age_contract",
+                "car_soc_age_contract_source", "car_soc_max_age_s",
                 "car_soc_profile_bound", "car_soc_identity_scope",
                 "car_name", "car_id", "vehicle_id",
                 "car_capacity_kwh",
@@ -8924,8 +10109,27 @@ def _phase_output_recovery_generation_bound(data, hold, intent, status=None):
         or (
             hold_reason == "process_restart_recovery_hold"
             and (
-                (action == "send_zero" and openwb_pro_session.phase_zero_readback_confirmed(status))
-                or (action == "send_phase" and openwb_pro_session.phase_target_readback_confirmed(status, target))
+                (
+                    str(hold.get("recovery_class") or "")
+                    == "output_ambiguous"
+                    and ack_bound
+                    and ack_success is False
+                    and negative_ack_reason
+                    and ack_reason == negative_ack_reason
+                )
+                or (
+                    action == "send_zero"
+                    and openwb_pro_session.phase_zero_readback_confirmed(
+                        status
+                    )
+                )
+                or (
+                    action == "send_phase"
+                    and openwb_pro_session.phase_target_readback_confirmed(
+                        status,
+                        target,
+                    )
+                )
             )
         )
     )
@@ -9165,6 +10369,306 @@ def _resolve_stranded_phase_zero_recovery(
     return False
 
 
+def _resolve_failed_openwb_pro_phase_target_recovery(
+    data,
+    status,
+    cfg,
+    *,
+    now_ts=None,
+):
+    """Beendet einen belegten negativen ``phasetarget``-ACK ohne Geräte-I/O.
+
+    Ein fehlgeschlagener POST darf weder als erfolgreicher Phasenwechsel noch
+    als Beginn des 480-s-Hardware-Cooldowns gelten. Bleibt die Pro danach aber
+    über zwei getrennte, frische GET-Frames verbunden und physisch ruhig auf
+    ihrem bisherigen Ziel, ist genau diese fehlgeschlagene Ausgangsgeneration
+    terminal. Der Ladestrom bleibt in diesem Zyklus bei 0 A; erst die normale
+    Policy des Folgezyklus darf auf der bestätigten Fallbackphase wieder Strom
+    anbieten.
+    """
+
+    box = data if isinstance(data, dict) else {}
+    st = status if isinstance(status, dict) else {}
+    config = cfg if isinstance(cfg, dict) else {}
+    now_value = time.time() if now_ts is None else _cfg_float(now_ts, 0.0)
+    hold = box.get("_openwb_pro_phase_recovery_hold")
+    hold = hold if isinstance(hold, dict) else {}
+    intent = box.get("_openwb_pro_phase_output_intent")
+    intent = intent if isinstance(intent, dict) else {}
+    ack = box.get("_openwb_pro_phase_output_ack")
+    ack = ack if isinstance(ack, dict) else {}
+    reservation = box.get("_wallbox_phase_transition_reservation")
+    reservation = reservation if isinstance(reservation, dict) else {}
+    sequence = box.get("_openwb_pro_phase_sequence")
+    sequence = sequence if isinstance(sequence, dict) else {}
+    sequence_patch = intent.get("sequence_patch")
+    sequence_patch = sequence_patch if isinstance(sequence_patch, dict) else {}
+
+    intent_id = str(intent.get("intent_id") or "")
+    requested_target = _valid_phase_count(intent.get("target"), 0)
+    fallback_target = _valid_phase_count(st.get("phases_target"), 0)
+    intent_ts = _cfg_float(intent.get("wall_ts"), 0.0)
+    ack_ts = _cfg_float(ack.get("wall_ts"), 0.0)
+    readback_ts = _cfg_float(st.get("driver_status_last_ok_ts"), 0.0)
+    for name, value in (
+        ("intent_ts", intent_ts),
+        ("ack_ts", ack_ts),
+        ("readback_ts", readback_ts),
+    ):
+        if value > 100_000_000_000.0:
+            value /= 1000.0
+        if name == "intent_ts":
+            intent_ts = value
+        elif name == "ack_ts":
+            ack_ts = value
+        else:
+            readback_ts = value
+
+    hold_reason = str(hold.get("reason") or "")
+    restart_reclassified_negative_ack = bool(
+        hold_reason == "process_restart_recovery_hold"
+        and str(hold.get("recovery_class") or "") == "output_ambiguous"
+        and str(reservation.get("stage") or "") == "recovery_hold"
+        and str(reservation.get("blocker") or "") in (
+            "process_restart_recovery_hold",
+            "phase_transition_timebase_unbound",
+        )
+        and str(reservation.get("reason") or "")
+        == "process_restart_recovery_hold"
+        and str(reservation.get("reason_code") or "")
+        == "process_restart_recovery_hold"
+    )
+
+    candidate_key = "_openwb_pro_failed_phase_target_candidate"
+    exact_generation = bool(
+        hold.get("active") is True
+        and _phase_output_recovery_generation_bound(
+            box,
+            hold,
+            intent,
+            status=st,
+        )
+        and str(intent.get("action") or "") == "send_phase"
+        and str(intent.get("method") or "") == "set_phases"
+        and requested_target in (1, 3)
+        and (
+            hold_reason == "phase_target_unconfirmed"
+            or restart_reclassified_negative_ack
+        )
+        and ack.get("schema") == "openwb_pro_phase_output_ack_v1"
+        and str(ack.get("intent_id") or "") == intent_id
+        and ack.get("success") is False
+        and str(ack.get("reason") or "") == "phase_target_unconfirmed"
+        and all(
+            math.isfinite(value) and value > 0.0
+            for value in (now_value, intent_ts, ack_ts, readback_ts)
+        )
+        and intent_ts <= ack_ts < readback_ts <= now_value + 1.0
+        and _cfg_float(intent.get("wire_receipt_ts"), 0.0) <= 0.0
+        and _cfg_float(sequence_patch.get("wire_receipt_ts"), 0.0) <= 0.0
+        and _cfg_float(sequence_patch.get("phase_sent_ts"), 0.0) <= 0.0
+        and _cfg_float(sequence.get("wire_receipt_ts"), 0.0) <= 0.0
+        and _cfg_float(sequence.get("phase_sent_ts"), 0.0) <= 0.0
+        and _cfg_float(ack.get("wire_receipt_ts"), 0.0) <= 0.0
+        and _cfg_float(
+            reservation.get("cooldown_wire_receipt_ts"),
+            0.0,
+        )
+        <= 0.0
+        and _cfg_float(reservation.get("cooldown_until_ts"), 0.0) <= 0.0
+        and not str(reservation.get("cooldown_source") or "")
+        and _cfg_float(box.get("current_set_amp"), 0.0) <= 0.5
+    )
+    quiet_fallback = bool(
+        exact_generation
+        and fallback_target in (1, 3)
+        and fallback_target != requested_target
+        and openwb_pro_session.phase_zero_readback_confirmed(st)
+        and openwb_pro_session.phase_target_readback_confirmed(
+            st,
+            fallback_target,
+        )
+        and openwb_pro_session.status_connected(st)
+        and st.get("cp_interrupt_isactive") in (False, 0)
+        and st.get("driver_status_plausible") is not False
+    )
+    if not quiet_fallback:
+        box.pop(candidate_key, None)
+        return False
+
+    transition_id = str(
+        reservation.get("transition_id")
+        or reservation.get("reservation_id")
+        or ""
+    )
+    candidate = box.get(candidate_key)
+    candidate = candidate if isinstance(candidate, dict) else {}
+    same_candidate = bool(
+        str(candidate.get("intent_id") or "") == intent_id
+        and str(candidate.get("transition_id") or "") == transition_id
+        and _valid_phase_count(candidate.get("requested_target"), 0)
+        == requested_target
+        and _valid_phase_count(candidate.get("fallback_target"), 0)
+        == fallback_target
+    )
+    previous_readback_ts = _cfg_float(
+        candidate.get("last_readback_ts"),
+        0.0,
+    )
+    if not same_candidate:
+        box[candidate_key] = {
+            "contract": "openwb_pro_failed_phase_target_candidate_v1",
+            "intent_id": intent_id,
+            "transition_id": transition_id,
+            "requested_target": requested_target,
+            "fallback_target": fallback_target,
+            "first_readback_ts": readback_ts,
+            "last_readback_ts": readback_ts,
+            "frames": 1,
+        }
+        return False
+    if readback_ts <= previous_readback_ts:
+        return False
+
+    frames = int(_cfg_float(candidate.get("frames"), 0.0)) + 1
+    if frames < 2:
+        candidate = dict(candidate)
+        candidate.update({
+            "last_readback_ts": readback_ts,
+            "frames": frames,
+        })
+        box[candidate_key] = candidate
+        return False
+
+    cleanup_keys = (
+        "_wallbox_phase_transition_reservation",
+        "_phase_transition_grant",
+        "_openwb_pro_phase_sequence",
+        "_openwb_pro_phase_sequence_contract",
+        "_openwb_pro_phase_sequence_last",
+        "_openwb_pro_phase_sequence_stage",
+        "_openwb_pro_phase_sequence_target",
+        "_openwb_pro_phase_sequence_current_allowed_after",
+        "_openwb_pro_phase_sequence_phase_sent_ts",
+        "_openwb_pro_phase_sequence_cp_sent_ts",
+        "_openwb_pro_phase_output_intent",
+        "_openwb_pro_phase_output_ack",
+        "_openwb_pro_phase_recovery_hold",
+        "_openwb_pro_phase_restart_authorized",
+        "_openwb_pro_phase_wait_target",
+        "_openwb_pro_phase_wait_until",
+        "_openwb_pro_phase_wait_min_until",
+        "_openwb_pro_phase_wait_amp",
+        "_openwb_pro_phase_wait_since",
+        candidate_key,
+    )
+    touched_keys = cleanup_keys + (
+        "_phase_3p_block_until",
+        "_openwb_pro_phase_retry_block_until",
+        "_phase_target_cmd",
+        "_phase_target_cmd_until",
+        "_openwb_pro_start_phase_target",
+        "_phase_up_budget_since",
+        "_phase_down_since",
+        "_openwb_pro_failed_phase_target_recovery",
+    )
+    phase_preimage = _snapshot_wallbox_state_file_preimage(
+        WB_PHASE_STATE_FILE
+    )
+    if phase_preimage.get("valid") is not True:
+        return False
+    previous = {
+        key: (key in box, deepcopy(box.get(key)))
+        for key in touched_keys
+    }
+    for key in cleanup_keys:
+        box.pop(key, None)
+
+    # Das gemeldete Fallbackziel ist kein erfolgreicher Wechsel dieses
+    # Versuchs. Es wird lediglich als kurzfristiger Policy-Anker verwendet,
+    # damit der Folgezyklus dort wieder Strom anbieten kann, ohne denselben
+    # fehlgeschlagenen 3p-Auftrag sofort erneut zu senden.
+    retry_backoff_s = max(
+        openwb_pro_session.phase_wait_s(config),
+        _cfg_float(config.get("wb_phase_retry_block_s"), 900.0),
+    )
+    # Der Fallback ist ein Geräte-Readback, kein von uns bestätigter
+    # Phasenbefehl. Ein möglicherweise älterer Command-Memory wird deshalb
+    # ausdrücklich verworfen, damit spätere frische Ziel-Readbacks sofort
+    # wieder autoritativ sind.
+    _remember_phase_target(box, 0)
+    box["_openwb_pro_start_phase_target"] = fallback_target
+    if requested_target == 3:
+        retry_block_until = now_value + retry_backoff_s
+        box["_phase_3p_block_until"] = max(
+            _cfg_float(box.get("_phase_3p_block_until"), 0.0),
+            retry_block_until,
+        )
+        box["_openwb_pro_phase_retry_block_until"] = max(
+            _cfg_float(
+                box.get("_openwb_pro_phase_retry_block_until"),
+                0.0,
+            ),
+            retry_block_until,
+        )
+        box["_phase_up_budget_since"] = now_value
+    else:
+        box["_phase_down_since"] = now_value
+    box["_openwb_pro_failed_phase_target_recovery"] = {
+        "contract": "openwb_pro_failed_phase_target_recovery_v1",
+        "intent_id": intent_id,
+        "transition_id": transition_id,
+        "requested_target": requested_target,
+        "fallback_target": fallback_target,
+        "first_readback_ts": _cfg_float(
+            candidate.get("first_readback_ts"),
+            readback_ts,
+        ),
+        "last_readback_ts": readback_ts,
+        "frames": frames,
+        "terminalized_ts": now_value,
+        "retry_backoff_until_ts": now_value + retry_backoff_s,
+        "hardware_write": False,
+        "wire_receipt_confirmed": False,
+        "hardware_cooldown_started": False,
+        "resume_current_next_cycle": True,
+        "reclassified_after_process_restart": (
+            restart_reclassified_negative_ack
+        ),
+    }
+    if _save_wallbox_phase_state([box]):
+        return True
+
+    disk_restored = _restore_wallbox_state_file_preimage(
+        WB_PHASE_STATE_FILE,
+        phase_preimage,
+    )
+    for key, (present, value) in previous.items():
+        if present:
+            box[key] = value
+        else:
+            box.pop(key, None)
+    if not disk_restored:
+        _apply_openwb_pro_persistence_recovery_hold(
+            box,
+            "failed_phase_target_terminal_rollback_failed",
+        )
+        persistence_hold = box.get(
+            "_openwb_pro_session_persistence_recovery_hold"
+        )
+        if isinstance(persistence_hold, dict):
+            persistence_hold["persistence_retry_attempted"] = True
+            persistence_hold["persistence_retry_succeeded"] = None
+        persistence_retry_succeeded = bool(
+            _save_wallbox_phase_state([box])
+        )
+        if isinstance(persistence_hold, dict):
+            persistence_hold["persistence_retry_succeeded"] = (
+                persistence_retry_succeeded
+            )
+    return False
+
+
 def _resolve_phase_output_recovery(data, status, cfg):
     hold = data.get("_openwb_pro_phase_recovery_hold")
     intent = data.get("_openwb_pro_phase_output_intent")
@@ -9178,6 +10682,13 @@ def _resolve_phase_output_recovery(data, status, cfg):
             intent,
             now_ts=time.time(),
         )
+    if _resolve_failed_openwb_pro_phase_target_recovery(
+        data,
+        status,
+        cfg,
+        now_ts=time.time(),
+    ):
+        return True
     action = str(intent.get("action") or "")
     target = _valid_phase_count(intent.get("target"), 0)
     confirmed = False
@@ -9226,18 +10737,68 @@ def _resolve_phase_output_recovery(data, status, cfg):
             wire_receipt_ts,
         ):
             return False
-        phase_settle_s = openwb_pro_session.phase_min_settle_s(cfg)
+        configured_phase_settle_s = openwb_pro_session.phase_min_settle_s(cfg)
+        persisted_phase_settle_s = _cfg_float(
+            sequence_patch.get("phase_settle_s"),
+            0.0,
+        )
+        persisted_current_allowed_after = _cfg_float(
+            sequence_patch.get("current_allowed_after"),
+            0.0,
+        )
+        # Ältere Versionen konnten den 480-s-Phasenwechsel-Cooldown als
+        # Wiederanlauf-Settle persistieren. Ein solcher Wert liegt außerhalb
+        # des dokumentierten, auf 30 s begrenzten Geräte-Settle-Vertrags. Er
+        # wird ausschließlich in die Sperre für den nächsten Phasenwechsel
+        # übernommen; ein frischer Ziel-Readback darf den Strom nach der
+        # kurzen Gerätewartezeit wieder freigeben.
+        legacy_phase_cooldown_conflated = bool(
+            math.isfinite(persisted_phase_settle_s)
+            and persisted_phase_settle_s > 30.0
+        )
+        phase_settle_s = (
+            configured_phase_settle_s
+            if legacy_phase_cooldown_conflated
+            else max(configured_phase_settle_s, persisted_phase_settle_s)
+        )
         restart_delay_s = openwb_pro_session.phase_restart_delay_s(cfg)
         phase_cooldown_s = openwb_pro_session.phase_wait_s(cfg)
-        current_allowed_after = (
+        canonical_current_allowed_after = (
             wire_receipt_ts + phase_settle_s + restart_delay_s
         )
+        current_allowed_after = (
+            canonical_current_allowed_after
+            if legacy_phase_cooldown_conflated
+            else max(
+                persisted_current_allowed_after,
+                canonical_current_allowed_after,
+            )
+        )
+        restart_current_ready = bool(
+            current_allowed_after > 0.0
+            and now_value >= current_allowed_after
+            and openwb_pro_session.status_connected(status)
+            and status.get("cp_interrupt_isactive") in (False, 0)
+        )
+        if not restart_current_ready:
+            # Die Recovery bleibt bis zum Ablauf der kurzen Gerätepause
+            # Besitzerin der alten Ausgangsgeneration. So wird weder ein
+            # Timer neu gestartet noch der Strompfad vorzeitig freigegeben.
+            return False
         phase_change_block_until = max(
             _cfg_float(
                 sequence_patch.get("phase_change_block_until"),
                 0.0,
             ),
             wire_receipt_ts + phase_cooldown_s,
+            (
+                max(
+                    persisted_current_allowed_after,
+                    wire_receipt_ts + persisted_phase_settle_s,
+                )
+                if legacy_phase_cooldown_conflated
+                else 0.0
+            ),
         )
         clock_sample = _openwb_pro_control_time_sample(
             wall_ts=now_value,
@@ -9269,6 +10830,15 @@ def _resolve_phase_output_recovery(data, status, cfg):
         intent["wire_receipt_ts"] = wire_receipt_ts
         intent["sequence_patch"] = dict(sequence_patch)
         data["_openwb_pro_phase_output_intent"] = intent
+        # Nach einem Managerneustart darf die bereits belegte
+        # ``phasetarget``-Kante nicht in einem Zirkelschluss hängen bleiben:
+        # 0 A verhindert reale Phasennutzung, während dieselbe reale Nutzung
+        # den Wiederanlauf freigeben soll. Ist die kurze Gerätepause bereits
+        # abgelaufen und liegt ein frischer, ruhiger Ziel-Readback vor, wird
+        # deshalb ausschließlich der Strom-Neustart autorisiert. Die aktive
+        # Phasenreservierung bleibt bis zur Bestätigung durch reale Leistung
+        # bestehen; der 480-s-Cooldown wird nicht verändert.
+        proposal["restart_current_ready"] = restart_current_ready
         confirmed = True
     if not confirmed:
         return False
@@ -9291,6 +10861,38 @@ def _resolve_phase_output_recovery(data, status, cfg):
             > 0.0
         ):
             return False
+        if proposal.get("restart_current_ready") is True:
+            data["_openwb_pro_phase_sequence_last"] = dict(
+                recovered_sequence
+            )
+            data["_openwb_pro_phase_sequence"] = {}
+            data["_openwb_pro_phase_sequence_stage"] = "ready"
+            data["_openwb_pro_phase_sequence_target"] = 0
+            data[
+                "_openwb_pro_phase_sequence_current_allowed_after"
+            ] = 0.0
+            openwb_pro_session.clear_phase_wait(data)
+            reservation = wallbox_phase_transition.mark_committed(
+                data,
+                stage="confirm_target",
+                now_ts=_cfg_float(intent.get("wall_ts"), now_value),
+            )
+            reservation = dict(reservation)
+            reservation.update({
+                "stage_deadline_ts": current_allowed_after,
+                "blocker": "",
+                "reason_code": "phase_restart_current_pending",
+                "reason": "phase_restart_current_pending",
+            })
+            data["_wallbox_phase_transition_reservation"] = reservation
+            data["_openwb_pro_phase_restart_authorized"] = {
+                "active": True,
+                "target": target,
+                "phase_sent_ts": wire_receipt_ts,
+                "authorized_ts": now_value,
+                "source": "phase_target_settle_readback_confirmed",
+                "recovered_after_process_restart": True,
+            }
     data.pop("_openwb_pro_phase_recovery_hold", None)
     return _persist_phase_output_ack(
         data,
@@ -12013,6 +13615,30 @@ def _execute_wallbox_driver_command(c_data, command, c_id=None, reason=""):
         "set_direct_current",
     ) and _cfg_float(cmd.get("amp"), 0.0) > 0.0
     if openwb_pro_session.is_openwb_pro_charger(charger):
+        same_cycle_recovery_terminal = bool(
+            str(box.get("_wallbox_cycle_token") or "")
+            and str(box.get("_phase_output_recovery_cycle_token") or "")
+            == str(box.get("_wallbox_cycle_token") or "")
+            and box.get("_phase_output_recovery_cycle_resolved") is True
+        )
+        if same_cycle_recovery_terminal and (
+            positive_current
+            or method in (
+                "set_phases",
+                "trigger_cp_interrupt",
+                "cp_interrupt",
+            )
+        ):
+            # Der Readback terminalisiert nur die alte Ausgangsgeneration.
+            # Ein neuer Strom-, Phasen- oder CP-Ausgang gehört frühestens in
+            # den nächsten vollständigen Managerzyklus; 0-A-Safety-Ausgänge
+            # bleiben davon unberührt.
+            box["_wallbox_driver_dispatch_contract"].update({
+                "blocked": True,
+                "blocker": "same_cycle_phase_recovery_terminal",
+                "wire_attempted": False,
+            })
+            return False
         cp_output_edge = method in ("trigger_cp_interrupt", "cp_interrupt")
         if cp_output_edge:
             _, connected_edge = _openwb_pro_fresh_connected_output_status(
@@ -12296,6 +13922,9 @@ def _execute_wallbox_driver_command(c_data, command, c_id=None, reason=""):
             ),
             "reason": command_reason,
             "cycle_token": c_data.get("_wallbox_cycle_token"),
+            "plug_session_id": str(
+                c_data.get("_openwb_pro_plug_session_id") or ""
+            ),
             "ts": executed_ts,
         }
         receipt.update(start_hold_binding)
@@ -13674,20 +15303,99 @@ def _apply_wallbox_force_start_request(c_data, chargers, c_id, now_ts=None):
         "WB%d Force-Start-Anforderung empfangen: hebe alle Lade- und Start-Latches auf.",
         c_id,
     )
-    _reset_wallbox_start_reject_episode(c_data)
-    c_data["_bev_full_blocked"] = False
-    c_data["_bev_full_block_reason"] = ""
-    c_data["_had_real_charge_in_session"] = False
-    c_data.pop("_charge_end_latched_plug_session_id", None)
-    c_data.pop("_start_rejected_generic_release_blocked", None)
-    c_data.pop("_last_start_rejected_hold", None)
-    c_data["_openwb_pro_start_wakeup_pending"] = False
-    c_data["_openwb_pro_start_wakeup_count"] = 0
-    c_data["_openwb_pro_unserved_since"] = 0.0
-    c_data["_openwb_pro_unserved_pause_since"] = 0.0
-    c_data["_openwb_pro_unserved_paused_s"] = 0.0
-    _save_wallbox_abort_state(chargers)
-    return True
+    openwb_pro = openwb_pro_session.is_openwb_pro_charger(
+        c_data.get("charger")
+    )
+    plug_session_id = str(
+        c_data.get("_openwb_pro_plug_session_id") or ""
+    )
+    anchor_state = (
+        _mode5_user_start_anchor_contract(c_data, plug_session_id)
+        if openwb_pro
+        else {"active": False, "exact": False, "blocker": ""}
+    )
+    if anchor_state.get("blocker"):
+        logger.warning(
+            "WB%d Force-Start blockiert: fremder oder geschützter 0-A-Anker bleibt aktiv.",
+            c_id,
+        )
+        return False
+
+    def apply_request():
+        _reset_wallbox_start_reject_episode(c_data)
+        c_data["_bev_full_blocked"] = False
+        c_data["_bev_full_block_reason"] = ""
+        c_data["_had_real_charge_in_session"] = False
+        c_data.pop("_charge_end_latched_plug_session_id", None)
+        c_data.pop("_start_rejected_generic_release_blocked", None)
+        c_data.pop("_last_start_rejected_hold", None)
+        c_data["_openwb_pro_start_wakeup_pending"] = False
+        c_data["_openwb_pro_start_wakeup_count"] = 0
+        c_data["_openwb_pro_unserved_since"] = 0.0
+        c_data["_openwb_pro_unserved_pause_since"] = 0.0
+        c_data["_openwb_pro_unserved_paused_s"] = 0.0
+        if openwb_pro and not _clear_exact_mode5_start_rejected_anchor(
+            c_data,
+            plug_session_id,
+        ):
+            raise RuntimeError("force_start_zero_anchor_generation_changed")
+        start_hold_rearmed = False
+        if openwb_pro and plug_session_id:
+            # Ein ausdrücklicher Benutzer-Start ist eine neue, eng begrenzte
+            # Startautorität innerhalb derselben physischen Stecksession. Er
+            # darf genau einen neuen 40-Wh-Start-Halteversuch eröffnen, ohne
+            # Nutzer-Aus, Floor-, Netz- oder Hardware-Sperren zu umgehen.
+            # Der nachgelagerte Request bindet sich erneut an den frischen
+            # Geräte-/Phasenvertrag; ein alter 1p-Grant wird nicht übernommen.
+            c_data.pop(wallbox_start_hold.STATE_KEY, None)
+            c_data.pop(wallbox_start_hold.GRANT_KEY, None)
+            c_data.pop(wallbox_start_hold.SESSION_KEY, None)
+            c_data.pop(wallbox_start_hold.CONSUMED_SESSION_KEY, None)
+            c_data[wallbox_start_hold.DISCONNECT_SEEN_KEY] = True
+            start_hold_rearmed = True
+        return {
+            "plug_session_id": plug_session_id,
+            "exact_start_rejected_anchor_cleared": bool(
+                anchor_state.get("exact")
+            ),
+            "start_hold_rearmed": start_hold_rearmed,
+            "hardware_write": False,
+        }
+
+    if openwb_pro:
+        persistence = _persist_openwb_pro_session_transaction(
+            c_data,
+            apply_request,
+            name="force_start_reset",
+        )
+        c_data["_wallbox_force_start_apply_contract"] = {
+            "contract": "wallbox_force_start_apply_v1",
+            "applied": persistence.get("committed") is True,
+            "persisted": persistence.get("committed") is True,
+            "plug_session_id": plug_session_id,
+            "exact_start_rejected_anchor_cleared": bool(
+                anchor_state.get("exact")
+                and persistence.get("committed") is True
+            ),
+            "start_hold_rearmed": bool(
+                persistence.get("committed") is True
+                and c_data.get(wallbox_start_hold.DISCONNECT_SEEN_KEY)
+                is True
+            ),
+            "hardware_write": False,
+            "reason": str(persistence.get("reason") or ""),
+        }
+        if persistence.get("committed") is not True:
+            logger.error(
+                "WB%d Force-Start konnte nicht atomar persistiert werden: %s",
+                c_id,
+                persistence.get("reason") or "unbekannt",
+            )
+            return False
+        return True
+
+    apply_request()
+    return bool(_save_wallbox_abort_state(chargers))
 
 
 def _apply_openwb_primary_curve_user_request(c_data, charger, charger_id):
@@ -16125,9 +17833,13 @@ def _wallbox_allocation_phase_count(
         and not _wb_status_real_charging(st)
         and openwb_pro_session.is_openwb_pro_charger(data.get("charger"))
     ):
-        # connect.php kann im Leerlauf noch das 3p-Ziel der vorherigen
-        # Sitzung melden. Die Pro kann vor dem Start sicher auf 1p wechseln;
-        # erst eine aktive Reservation bindet wieder ein höheres Ziel.
+        # Vor dem ersten Ladestrom gibt es keine belastbaren Istphasen. Das
+        # connect.php-Phasenziel kann aus einem früheren Ladevorgang stammen
+        # und darf das gemeinsame Wattbudget daher nicht auf das 3p-Minimum
+        # von 4.140 W verteuern. Für die reine Startzuteilung wird 1p
+        # projektiert; der physische Phasenvertrag bleibt separat konservativ
+        # und aktive Transitionen, Recovery sowie laufende Ladung wurden oben
+        # bereits hart gebunden.
         return 1
 
     if _is_e3dc_shared_rscp_charger(data.get("charger"), st):
@@ -16441,6 +18153,7 @@ def _reset_openwb_pro_vehicle_identity_session(c_data):
     for key, value in (
         ("_session_1p_only", False),
         ("_phase_3p_block_until", 0.0),
+        ("_openwb_pro_phase_retry_block_until", 0.0),
         ("_phase_3p_pending_since", 0.0),
         ("_phase_up_budget_since", 0.0),
         ("_phase_down_since", 0.0),
@@ -17827,7 +19540,7 @@ def _wallbox_start_hold_requests(
             and fresh_by_id.get(wb_id, False)
             and is_enabled
             and not is_blocked
-            and phases == 1
+            and phases in (1, 3)
             and (
                 abs(amp - float(minimum_amp)) <= 0.001
                 or (amp == 0.0 and not _wb_status_real_charging(status_by_id.get(wb_id)))
@@ -17847,9 +19560,11 @@ def _wallbox_start_hold_requests(
         group_members.append({
             "wb_id": wb_id,
             "plug_session_id": session_id,
-            "target_phases": 1,
+            "target_phases": phases,
             "minimum_amp": minimum_amp,
-            "minimum_power_w": int(round(minimum_amp * per_amp_w)),
+            "minimum_power_w": int(
+                round(minimum_amp * per_amp_w * phases)
+            ),
         })
     group_members.sort(key=lambda item: item["wb_id"])
     group_minimum_w = sum(
@@ -17868,20 +19583,51 @@ def _wallbox_start_hold_requests(
         consumed_session = str(
             box.get(wallbox_start_hold.CONSUMED_SESSION_KEY) or ""
         )
+        current_member = next(
+            (
+                item
+                for item in group_members
+                if int(item.get("wb_id", 0) or 0) == wb_id
+            ),
+            None,
+        )
+        request_member = next(
+            (
+                item
+                for item in (
+                    request.get("group_members")
+                    if isinstance(request, dict)
+                    and isinstance(request.get("group_members"), list)
+                    else []
+                )
+                if isinstance(item, dict)
+                and int(item.get("wb_id", 0) or 0) == wb_id
+            ),
+            None,
+        )
+        request_matches_allocation = bool(
+            not isinstance(request, dict)
+            or (
+                isinstance(current_member, dict)
+                and isinstance(request_member, dict)
+                and int(request.get("target_phases", 0) or 0)
+                == int(current_member.get("target_phases", 0) or 0)
+                == int(request_member.get("target_phases", 0) or 0)
+                and int(request.get("minimum_amp", 0) or 0)
+                == int(current_member.get("minimum_amp", 0) or 0)
+                == int(request_member.get("minimum_amp", 0) or 0)
+                and int(request.get("minimum_quantum_w", 0) or 0)
+                == int(current_member.get("minimum_power_w", 0) or 0)
+                == int(request_member.get("minimum_power_w", 0) or 0)
+            )
+        )
         if (
             allocation_ready
             and session_id
             and consumed_session != session_id
             and not isinstance(request, dict)
         ):
-            member = next(
-                (
-                    item
-                    for item in group_members
-                    if int(item.get("wb_id", 0) or 0) == wb_id
-                ),
-                None,
-            )
+            member = current_member
             if isinstance(member, dict):
                 request = wallbox_start_hold.begin_request(
                     box,
@@ -17898,7 +19644,7 @@ def _wallbox_start_hold_requests(
                         member.get("minimum_power_w", 0) or 0
                     ),
                     group_members=group_members,
-                    target_phases=1,
+                    target_phases=int(member.get("target_phases", 0) or 0),
                     minimum_amp=minimum_amp,
                     now_ts=now_value,
                 )
@@ -17912,7 +19658,11 @@ def _wallbox_start_hold_requests(
             connected=bool(connected_by_id.get(wb_id, False)),
             status_fresh=bool(fresh_by_id.get(wb_id, False)),
             enabled=is_enabled,
-            blocked=bool(is_blocked or not allocation_ready),
+            blocked=bool(
+                is_blocked
+                or not allocation_ready
+                or not request_matches_allocation
+            ),
         )
         if item:
             projected.append(item)
@@ -17940,17 +19690,40 @@ def _wallbox_materialized_start_hold_budget_contract(
     try:
         amp = float(allocated_amp or 0.0)
         phases = int(round(float(allocated_phases or 0)))
-        minimum_w = float(minimum_amp) * 230.0
         budget_w = max(0.0, float(base_budget_w or 0.0))
     except (TypeError, ValueError):
         amp = 0.0
         phases = 0
-        minimum_w = float(minimum_amp) * 230.0
         budget_w = 0.0
+    member = next(
+        (
+            item
+            for item in (bound.get("group_members") or [])
+            if isinstance(item, dict)
+            and int(_cfg_float(item.get("wb_id"), 0.0))
+            == int(_cfg_float(data.get("id"), 0.0))
+        ),
+        None,
+    )
+    expected_phases = int(
+        _cfg_float((member or {}).get("target_phases"), 0.0)
+    )
+    expected_amp = int(
+        _cfg_float((member or {}).get("minimum_amp"), 0.0)
+    )
+    minimum_w = max(
+        0.0,
+        _cfg_float((member or {}).get("minimum_power_w"), 0.0),
+    )
     materialized = bool(
         bound.get("bound") is True
-        and phases == 1
-        and abs(amp - float(minimum_amp)) <= 0.001
+        and isinstance(member, dict)
+        and expected_phases in (1, 3)
+        and phases == expected_phases
+        and expected_amp == int(_cfg_float(minimum_amp, 6.0)) == 6
+        and minimum_w + 0.001
+        >= float(expected_amp * 230 * expected_phases)
+        and abs(amp - float(expected_amp)) <= 0.001
         and budget_w + 0.001 >= minimum_w
     )
     return {
@@ -17959,6 +19732,9 @@ def _wallbox_materialized_start_hold_budget_contract(
         "materialized_in_central_budget": materialized,
         "allocated_amp": amp,
         "allocated_phases": phases,
+        "contract_phases": expected_phases,
+        "contract_minimum_amp": expected_amp,
+        "contract_minimum_power_w": minimum_w,
         "base_budget_w": budget_w,
         # Der Manager bestätigt hier nur die vorhandene Storage-Allokation.
         # Er erzeugt ausdrücklich kein zweites Leistungsbudget.
@@ -18049,14 +19825,20 @@ def _wallbox_start_hold_granted_allocation(
                 _cfg_float(allocation.get("target_power_w"), 0.0),
             )
             member_min_amp = int(_cfg_float(member.get("minimum_amp"), min_amp))
+            member_phases = int(
+                _cfg_float(member.get("target_phases"), 0.0)
+            )
             member_min_w = max(
                 0.0,
                 _cfg_float(member.get("minimum_power_w"), 0.0),
             )
             member_ok = bool(
                 member_id > 0
-                and target_phases == 1
+                and member_phases in (1, 3)
+                and target_phases == member_phases
                 and abs(target_amp - float(member_min_amp)) <= 0.001
+                and member_min_w + 0.001
+                >= float(member_min_amp * 230 * member_phases)
                 and target_power_w + 0.001 >= member_min_w
             )
             if not member_ok:
@@ -18126,9 +19908,22 @@ def _wallbox_start_hold_granted_allocation(
     }
 
 
-def _start_hold_member_materialization(box, status, *, minimum_amp=6):
+def _start_hold_member_materialization(
+    box,
+    status,
+    *,
+    minimum_amp=6,
+    grant_owner_box=None,
+    now_ts=None,
+):
     data = box if isinstance(box, dict) else {}
+    grant_owner = (
+        grant_owner_box
+        if isinstance(grant_owner_box, dict)
+        else data
+    )
     st = status if isinstance(status, dict) else {}
+    now_value = time.time() if now_ts is None else float(now_ts)
     blockers = []
     if not _wallbox_start_hold_status_fresh(st) or not _wb_status_real_charging(st):
         blockers.append("status_not_fresh")
@@ -18146,6 +19941,47 @@ def _start_hold_member_materialization(box, status, *, minimum_amp=6):
     cap = cap if isinstance(cap, dict) else {}
     cap_amp = _cfg_float(cap.get("cap_amp"), 0.0)
     cycle_token = str(data.get("_wallbox_cycle_token") or "")
+    bound = wallbox_start_hold.committed_grant_budget(
+        grant_owner,
+        base_budget_w=0,
+        now_ts=now_value,
+    )
+    member = next(
+        (
+            item
+            for item in (bound.get("group_members") or [])
+            if isinstance(item, dict)
+            and int(_cfg_float(item.get("wb_id"), 0.0))
+            == int(_cfg_float(data.get("id"), 0.0))
+        ),
+        None,
+    )
+    expected_phases = int(
+        _cfg_float((member or {}).get("target_phases"), 0.0)
+    )
+    expected_amp = int(
+        _cfg_float((member or {}).get("minimum_amp"), 0.0)
+    )
+    current_session_id = str(
+        data.get(wallbox_start_hold.SESSION_KEY)
+        or data.get("_openwb_pro_plug_session_id")
+        or ""
+    )
+    expected_session_id = str(
+        (member or {}).get("plug_session_id") or ""
+    )
+    if (
+        bound.get("bound") is not True
+        or not isinstance(member, dict)
+        or expected_phases not in (1, 3)
+        or expected_amp != int(_cfg_float(minimum_amp, 6.0))
+    ):
+        blockers.append("start_hold_member_not_bound")
+    if (
+        not current_session_id
+        or current_session_id != expected_session_id
+    ):
+        blockers.append("start_hold_member_session_mismatch")
     if (
         cap.get("active") is not True
         or not cycle_token
@@ -18153,13 +19989,17 @@ def _start_hold_member_materialization(box, status, *, minimum_amp=6):
         or abs(cap_amp - float(minimum_amp)) > 0.001
     ):
         blockers.append("six_amp_not_authorized")
-    if phases != 1 or abs(amp - float(minimum_amp)) > 0.001:
-        blockers.append("not_exact_1p_6a")
+    if (
+        phases != expected_phases
+        or abs(amp - float(expected_amp)) > 0.001
+    ):
+        blockers.append("not_exact_6a_contract_phases")
     return {
         "active": not blockers,
         "blockers": blockers,
         "amp": amp,
         "phases": phases,
+        "contract_phases": expected_phases,
         "cap_amp": cap_amp,
     }
 
@@ -18185,17 +20025,22 @@ def _suspend_min_current_import_integral_for_start_hold(
         data,
         status,
         minimum_amp=6,
+        now_ts=now_value,
     )
     blockers.extend(member.get("blockers") or [])
     if abs(float(current_amp or 0.0) - 6.0) > 0.001:
-        blockers.append("not_exact_1p_6a")
+        blockers.append("not_exact_6a_contract_phases")
     if data.get("_wb_stop_sent_active") is True:
         blockers.append("stop_sent_active")
     if isinstance(status, dict) and status.get("manager_stop_pending") is True:
         blockers.append("manager_stop_pending")
     materialized = _wallbox_materialized_start_hold_budget_contract(
         data,
-        base_budget_w=float(member.get("cap_amp", 0.0) or 0.0) * 230.0,
+        base_budget_w=(
+            float(member.get("cap_amp", 0.0) or 0.0)
+            * 230.0
+            * max(0, int(member.get("contract_phases", 0) or 0))
+        ),
         allocated_amp=member.get("cap_amp", 0.0),
         allocated_phases=member.get("phases", 0),
         minimum_amp=6,
@@ -18294,6 +20139,9 @@ def _suspend_group_min_current_import_integral_for_start_hold(
     )
     protected_ids = []
     if isinstance(selected, dict):
+        grant_owner_box = boxes.get(
+            int((selected or {}).get("wb_id", 0) or 0)
+        )
         for member in selected["grant"].get("group_members", []):
             member_id = int(_cfg_float(member.get("wb_id"), 0.0))
             box = boxes.get(member_id)
@@ -18302,6 +20150,8 @@ def _suspend_group_min_current_import_integral_for_start_hold(
                 box,
                 status,
                 minimum_amp=int(_cfg_float(member.get("minimum_amp"), 6.0)),
+                grant_owner_box=grant_owner_box,
+                now_ts=now_value,
             )
             session_id = str(
                 (box or {}).get(wallbox_start_hold.SESSION_KEY)
@@ -19073,6 +20923,9 @@ def _wallbox_phase_boot_id():
 def _phase_state_entry(c_data, now):
     entry = {
         "phase_3p_block_until": float(c_data.get("_phase_3p_block_until", 0.0) or 0.0),
+        "openwb_pro_phase_retry_block_until": float(
+            c_data.get("_openwb_pro_phase_retry_block_until", 0.0) or 0.0
+        ),
         "openwb_pro_phase_change_block_until": float(
             c_data.get("_openwb_pro_phase_change_block_until", 0.0) or 0.0
         ),
@@ -19133,6 +20986,7 @@ def _phase_state_entry(c_data, now):
             entry[target_key] = value
     active = bool(
         entry["phase_3p_block_until"] > now
+        or entry["openwb_pro_phase_retry_block_until"] > now
         or entry["openwb_pro_phase_change_block_until"] > now
         or entry["openwb_pro_phase_wait_until"] > now
         or bool(entry["openwb_pro_plug_session_id"])
@@ -19351,6 +21205,7 @@ def _phase_preoutput_process_restart_fields(raw, now):
         result = _phase_passive_reboot_fields(item, now)
         for key in (
             "_phase_3p_block_until",
+            "_openwb_pro_phase_retry_block_until",
             "_openwb_pro_phase_change_block_until",
         ):
             result.pop(key, None)
@@ -19362,7 +21217,11 @@ def _phase_preoutput_process_restart_fields(raw, now):
         })
         return result
     result = _phase_passive_reboot_fields(item, now)
-    for key in ("_phase_3p_block_until", "_openwb_pro_phase_change_block_until"):
+    for key in (
+        "_phase_3p_block_until",
+        "_openwb_pro_phase_retry_block_until",
+        "_openwb_pro_phase_change_block_until",
+    ):
         result.pop(key, None)
     reservation.update({
         "stage": "await_budget",
@@ -19429,14 +21288,56 @@ def _phase_entry_requires_output_recovery(raw):
     )
 
 
-def _phase_passive_reboot_fields(raw, now):
-    """Erhalte ausschließlich den Anti-Flatter-Cooldown ohne Output-Intent."""
+def _phase_passive_reboot_fields(
+    raw,
+    now,
+    *,
+    preserve_future_deadlines=False,
+):
+    """Erhalte Hardware-Cooldown und typisierten Retry ohne Output-Intent.
+
+    Nur bei einem belegten Prozesswechsel innerhalb desselben Boots dürfen
+    bereits in Wallclock gespeicherte, noch laufende Fristen unverändert
+    übernommen werden. Ein abgelaufener Timer wird dabei niemals ab dem
+    Prozessstart neu auf 480 Sekunden gesetzt. Für Host-Reboots oder eine
+    ungebundene Zeitbasis bleibt die konservative Neuanordnung unverändert.
+    """
 
     item = raw if isinstance(raw, dict) else {}
-    had_wait = float(item.get("openwb_pro_phase_wait_until", 0.0) or 0.0) > 0.0
-    had_block = bool(
-        float(item.get("phase_3p_block_until", 0.0) or 0.0) > 0.0
-        or float(item.get("openwb_pro_phase_change_block_until", 0.0) or 0.0) > 0.0
+    now_value = float(now)
+    phase_wait_until = float(
+        item.get("openwb_pro_phase_wait_until", 0.0) or 0.0
+    )
+    had_wait = bool(
+        phase_wait_until > (
+            now_value if preserve_future_deadlines else 0.0
+        )
+    )
+    phase_block_until = float(
+        item.get("phase_3p_block_until", 0.0) or 0.0
+    )
+    phase_change_block_until = float(
+        item.get("openwb_pro_phase_change_block_until", 0.0) or 0.0
+    )
+    retry_block_until = float(
+        item.get("openwb_pro_phase_retry_block_until", 0.0) or 0.0
+    )
+    typed_retry_block = bool(
+        retry_block_until > 0.0
+        and abs(phase_block_until - retry_block_until) <= 1e-6
+    )
+    active_deadline_floor = (
+        now_value if preserve_future_deadlines else 0.0
+    )
+    had_hardware_block = bool(
+        phase_change_block_until > active_deadline_floor
+        or (
+            phase_block_until > active_deadline_floor
+            and (
+                not typed_retry_block
+                or phase_block_until > retry_block_until + 1e-6
+            )
+        )
     )
     start_fields = {}
     plug_session_id = str(item.get("openwb_pro_plug_session_id") or "")
@@ -19482,16 +21383,48 @@ def _phase_passive_reboot_fields(raw, now):
             start_fields[
                 "_openwb_pro_session_persistence_recovery_hold"
             ] = dict(persisted_session_hold)
-    if not (had_wait or had_block):
+    retry_still_active = retry_block_until > now_value
+    if not (had_wait or had_hardware_block or retry_still_active):
         return start_fields
-    conservative_until = float(now) + 480.0
     result = dict(start_fields)
+    if retry_still_active:
+        # Ein fehlgeschlagener POST ohne Wire-Receipt ist nur eine Policy-
+        # Wiederholsperre. Sie darf bei einem Neustart niemals zum Beleg eines
+        # elektromechanischen Phasenwechsels oder zu dessen 480-s-Cooldown
+        # umgedeutet werden.
+        result["_openwb_pro_phase_retry_block_until"] = retry_block_until
+        result["_phase_3p_block_until"] = retry_block_until
+    if not (had_wait or had_hardware_block):
+        return result
+    if preserve_future_deadlines:
+        hardware_phase_block_until = (
+            phase_block_until
+            if (
+                phase_block_until > now_value
+                and not typed_retry_block
+            )
+            else 0.0
+        )
+        conservative_until = max(
+            phase_wait_until if phase_wait_until > now_value else 0.0,
+            (
+                phase_change_block_until
+                if phase_change_block_until > now_value
+                else 0.0
+            ),
+            hardware_phase_block_until,
+        )
+    else:
+        conservative_until = now_value + 480.0
     # Ein passiver Neustart kann den zuvor wirksamen Geräteausgang nicht
     # zweifelsfrei rekonstruieren. Er übernimmt daher weder Wartephase,
     # Zielphase noch Sollstrom. Das bloße Vorhandensein eines früheren
     # Phasen-Waits bleibt ausschließlich als konservative Sperre gegen den
     # nächsten Phasenwechsel erhalten.
-    result["_phase_3p_block_until"] = conservative_until
+    result["_phase_3p_block_until"] = max(
+        _cfg_float(result.get("_phase_3p_block_until"), 0.0),
+        conservative_until,
+    )
     result["_openwb_pro_phase_change_block_until"] = conservative_until
     return result
 
@@ -19514,6 +21447,7 @@ def _phase_terminal_restart_fields(
         "_openwb_pro_phase_wait_target",
         "_openwb_pro_phase_wait_amp",
         "_phase_3p_block_until",
+        "_openwb_pro_phase_retry_block_until",
         "_openwb_pro_phase_change_block_until",
     ):
         result.pop(key, None)
@@ -19925,6 +21859,16 @@ def _restored_phase_fields(phase_state, charger_id):
         current_monotonic_ts = time.monotonic()
         saved_process_epoch = str(phase_state.get("process_epoch") or "")
         current_process_epoch = str(control_time.process_epoch() or "")
+        wall_elapsed = now_value - saved_wall_ts
+        monotonic_elapsed = current_monotonic_ts - saved_monotonic_ts
+        same_boot_timebase_bound = bool(
+            saved_wall_ts > 0.0
+            and saved_monotonic_ts >= 0.0
+            and current_monotonic_ts >= 0.0
+            and wall_elapsed >= -1.0
+            and monotonic_elapsed >= -1.0
+            and abs(wall_elapsed - monotonic_elapsed) <= 60.0
+        )
         # Ein v3-Altstand ohne Prozessepoche stammt zwingend aus einem
         # früheren Managerstand. Er wird deshalb wie ein Prozesswechsel
         # behandelt und nicht als aktuelle In-Memory-Generation imputiert.
@@ -19957,9 +21901,11 @@ def _restored_phase_fields(phase_state, charger_id):
                     "process_restart_recovery_hold",
                     raw,
                 )
-            return _phase_passive_reboot_fields(raw, now_value)
-        wall_elapsed = now_value - saved_wall_ts
-        monotonic_elapsed = current_monotonic_ts - saved_monotonic_ts
+            return _phase_passive_reboot_fields(
+                raw,
+                now_value,
+                preserve_future_deadlines=same_boot_timebase_bound,
+            )
         if monotonic_elapsed < -1.0 or abs(wall_elapsed - monotonic_elapsed) > 60.0:
             if _phase_entry_requires_output_recovery(raw):
                 return _phase_recovery_fields("clock_jump_recovery_hold", raw)
@@ -19993,6 +21939,17 @@ def _restored_phase_fields(phase_state, charger_id):
         result = {}
         if block_until > now_value:
             result["_phase_3p_block_until"] = block_until
+        retry_block_until = float(
+            raw.get("openwb_pro_phase_retry_block_until", 0.0) or 0.0
+        )
+        if retry_block_until > now_value:
+            result["_openwb_pro_phase_retry_block_until"] = (
+                retry_block_until
+            )
+            result["_phase_3p_block_until"] = max(
+                _cfg_float(result.get("_phase_3p_block_until"), 0.0),
+                retry_block_until,
+            )
         phase_change_block_until = float(
             raw.get("openwb_pro_phase_change_block_until", 0.0) or 0.0
         )
@@ -20131,8 +22088,35 @@ def read_predump_allow(device, config=None):
 
 
 def _wb_status_connected(status):
-    """True nur bei echtem Fahrzeug-/Steckersignal, nicht bei Sollstrom."""
-    return wallbox_decision.status_connected(status)
+    """True nur bei physischer oder streng gebundener CP-Verbindung.
+
+    Während eines von diesem Manager selbst ausgelösten kurzen CP-Wake-ups
+    meldet die openWB Pro vorübergehend einen scheinbaren Unplug. Der
+    typisierte Receipt-Vertrag darf diesen Zustand für die Policy als weiter
+    verbunden halten; das rohe Steckerfeld bleibt unverändert und der
+    Hardware-Output-Gate verlangt weiterhin einen frischen echten
+    Anschlussbeleg.
+    """
+
+    if wallbox_decision.status_connected(status):
+        return True
+    st = status if isinstance(status, dict) else {}
+    contract = st.get("openwb_pro_manager_wakeup_disconnect_contract")
+    return bool(
+        isinstance(contract, dict)
+        and str(contract.get("contract") or "")
+        == "openwb_pro_manager_wakeup_disconnect_v1"
+        and contract.get("synthetic_disconnect") is True
+        and contract.get("receipt_bound") is True
+        and contract.get("session_bound") is True
+        and contract.get("current_receipt_bound") is True
+        and contract.get("timeline_valid") is True
+        and contract.get("count_valid") is True
+        and st.get("driver_status_valid") is True
+        and not bool(st.get("driver_status_stale", False))
+        and not bool(st.get("driver_status_degraded", False))
+        and not bool(st.get("driver_status_glitch", False))
+    )
 
 
 def _wallbox_price_mode_grid_allowed_for_charger(wb_charge_mode, c_id, mode5_grid_allowed=False):
@@ -20632,13 +22616,47 @@ def _reconcile_openwb_pro_manager_zero_anchor(
     )
     data["_openwb_pro_phase_restart_current_contract"] = phase_restart
     phase_restart_ready = bool(phase_restart.get("authorized", False))
+    committed_transition = (
+        _openwb_pro_committed_transition_waits_for_charge_contract(
+            data,
+            st,
+            now_ts=now_value,
+        )
+    )
+    data[
+        "_openwb_pro_committed_transition_waits_for_charge_contract"
+    ] = committed_transition
+    committed_transition_authorized = bool(
+        committed_transition.get("authorized", False)
+    )
+    shadow_reconcile = (
+        _reconcile_openwb_pro_committed_idle_zero_current_shadow(
+            data,
+            st,
+            committed_transition,
+            min_amp=min_amp,
+        )
+    )
+    data[
+        "_openwb_pro_committed_idle_zero_shadow_reconcile_contract"
+    ] = shadow_reconcile
+    committed_transition_ready = bool(
+        committed_transition_authorized
+        and (
+            shadow_reconcile.get("reconciled") is True
+            or _cfg_float(data.get("current_set_amp"), 0.0) < 0.5
+        )
+    )
+    phase_execution_ready = bool(
+        phase_restart_ready or committed_transition_ready
+    )
     phase_transition_active = bool(
         isinstance(reservation, dict) and reservation.get("active")
         and not preoutput_grant_ready
-        and not phase_restart_ready
+        and not phase_execution_ready
     )
     phase_recovery_ambiguous = bool(
-        not phase_restart_ready
+        not phase_execution_ready
         and (
             (
                 isinstance(data.get("_openwb_pro_phase_recovery_hold"), dict)
@@ -20709,6 +22727,25 @@ def _reconcile_openwb_pro_manager_zero_anchor(
         min_interval_s=60.0,
     )
     return contract
+
+
+def _openwb_pro_no_vehicle_stop_guard(c_data, status, *, now_ts=None):
+    """Erkennt ausschließlich den eigenen kurzen CP-Wake-up-Unplug."""
+
+    data = c_data if isinstance(c_data, dict) else {}
+    st = status if isinstance(status, dict) else {}
+    now_value = time.time() if now_ts is None else float(now_ts)
+    if not openwb_pro_session.is_openwb_pro_charger(data.get("charger")):
+        return False
+    contract = openwb_pro_session.manager_owned_wakeup_disconnect_contract(
+        st,
+        data,
+        now_ts=now_value,
+    )
+    data["_openwb_pro_manager_wakeup_disconnect_contract"] = contract
+    if isinstance(status, dict):
+        status["openwb_pro_manager_wakeup_disconnect_contract"] = contract
+    return bool(contract.get("synthetic_disconnect", False))
 
 
 def _release_openwb_pro_confirmed_charge_soft_stop(
@@ -22466,6 +24503,16 @@ def run():
                                 )
                             )
                             if openwb_pro_session.is_openwb_pro_charger(c):
+                                # Den eigenen kurzen CP-Wake-up bereits vor
+                                # Gruppenbudget, Speicherintent und
+                                # Direct-Regler typisieren. Sonst wird der
+                                # scheinbare Unplug dort zu 0 W und zieht das
+                                # gerade ausgegebene Ladeangebot zurück.
+                                _openwb_pro_no_vehicle_stop_guard(
+                                    c_data,
+                                    st,
+                                    now_ts=_status_now,
+                                )
                                 c_data[
                                     "_phase_output_recovery_cycle_resolved"
                                 ] = _resolve_phase_output_recovery_once_per_cycle(
@@ -22476,7 +24523,17 @@ def run():
                             _charge_contract = _wallbox_charge_observation_contract(st, c_data, now_ts=time.time())
                             _apply_charge_contract_to_status(st, _charge_contract)
                             _apply_wallbox_force_start_request(c_data, chargers, c_id, now_ts=_status_now)
-                            if _wb_status_real_charging(st) or float(st.get("power_w", 0.0) or 0.0) > 100.0 or float(st.get("real_power_w", 0.0) or 0.0) > 100.0 or float(st.get("session_kwh", 0.0) or 0.0) > 0.005:
+                            _current_charge_accepted = bool(
+                                openwb_pro_session.start_offer_physics_confirmed(st)
+                                if openwb_pro_session.is_openwb_pro_charger(c)
+                                else (
+                                    _wb_status_real_charging(st)
+                                    or float(st.get("power_w", 0.0) or 0.0) > 100.0
+                                    or float(st.get("real_power_w", 0.0) or 0.0) > 100.0
+                                    or float(st.get("session_kwh", 0.0) or 0.0) > 0.005
+                                )
+                            )
+                            if _current_charge_accepted:
                                 _clear_wallbox_start_reject_on_real_charge(c_data)
                                 c_data["_had_real_charge_in_session"] = True
                                 if str(c_data.get("_bev_full_block_reason") or "") in ("start_rejected", "start_rejected_soft", "vehicle_start_rejected_soft"):
@@ -22547,6 +24604,7 @@ def run():
                                 )
                             except Exception as _soc_e:
                                 logger.debug(f"[WB{c_id}] Fahrzeug-SoC-Tracker Fehler: {_soc_e}")
+                            _apply_car_soc_age_contract(st, config)
 
                         if st and c_data.get('is_charging', False):
                             # Hardware Glitch Protection: Wenn Python glaubt, wir laden gerade,
@@ -27167,6 +29225,36 @@ def run():
                                 c_data["current_set_amp"] = 0
                                 continue
                             if c_data["is_charging"]:
+                                charger_status = next(
+                                    (
+                                        item.get("status")
+                                        for item in valid_chargers_status
+                                        if int(item.get("id", 0) or 0)
+                                        == int(c_id or 0)
+                                    ),
+                                    c_data.get("last_valid"),
+                                )
+                                if _openwb_pro_no_vehicle_stop_guard(
+                                    c_data,
+                                    charger_status,
+                                    now_ts=time.time(),
+                                ):
+                                    _log_state_once(
+                                        c_data,
+                                        "openwb_pro_wakeup_synthetic_disconnect",
+                                        str(
+                                            c_data.get(
+                                                "_openwb_pro_plug_session_id"
+                                            )
+                                            or ""
+                                        ),
+                                        "WB%d openWB Pro CP-Wake-up: "
+                                        "kurzer synthetischer Unplug; "
+                                        "kein no_vehicle_connected-Stop."
+                                        % int(c_id or 0),
+                                        min_interval_s=30.0,
+                                    )
+                                    continue
                                 no_vehicle_stop_confirmed = _send_wallbox_stop_command(
                                     c_data,
                                     c_id=c_id,
@@ -27660,10 +29748,78 @@ def run():
                                     1.0,
                                 )
                             )
+                        _fast_status_fresh = bool(
+                            isinstance(_fast_status, dict)
+                            and _fast_status.get("driver_status_valid") is True
+                            and not _fast_status.get("driver_status_stale", False)
+                            and not _fast_status.get("driver_status_degraded", False)
+                            and not _fast_status.get("driver_status_glitch", False)
+                        )
+                        _fast_phase_reservation = c_data.get(
+                            "_wallbox_phase_transition_reservation"
+                        )
+                        _fast_curve_forecast_stop = (
+                            _curve_forecast_priority_stop_contract(
+                                forecast_stop_active=(
+                                    curve_forecast_wallbox_stop_active
+                                ),
+                                public_mode=_fast_public_mode,
+                                openwb_pro=(
+                                    charger_class_name == "OpenWBProCharger"
+                                ),
+                                connected=_wb_status_connected(_fast_status),
+                                direct_candidate=(
+                                    c_id in active_openwb_pro_curve_ids
+                                ),
+                                direct_active=openwb_pro_curve_direct_active,
+                                direct_w=_fast_openwb_direct_w,
+                                direct_real_pv_w=(
+                                    openwb_pro_curve_direct_real_pv_w
+                                ),
+                                minimum_w=openwb_pro_curve_direct_start_min_w,
+                                status_fresh=_fast_status_fresh,
+                                budget_fresh=bool(
+                                    _budget_ok
+                                    and not live_sample_invalid
+                                    and not _budget_live_sample_invalid
+                                ),
+                                safety_clear=bool(
+                                    not wb_locked.get(c_id, False)
+                                    and not wb_manual_pause.get(c_id, False)
+                                    and not c_data.get("_bev_full_blocked", False)
+                                    and not emergency_stop_active
+                                    and not c_data.get(
+                                        "_emergency_stop_active", False
+                                    )
+                                    and not c_data.get("_notaus_active", False)
+                                    and not c_data.get(
+                                        "_physical_output_blocked", False
+                                    )
+                                    and not (_fast_status or {}).get(
+                                        "cp_interrupt_isactive", False
+                                    )
+                                    and not c_data.get(
+                                        "_openwb_pro_phase_sequence"
+                                    )
+                                    and not (
+                                        isinstance(
+                                            _fast_phase_reservation, dict
+                                        )
+                                        and _fast_phase_reservation.get(
+                                            "active", False
+                                        )
+                                    )
+                                ),
+                            )
+                        )
+                        c_data[
+                            "_curve_forecast_priority_stop_contract_fast"
+                        ] = _fast_curve_forecast_stop
                         _fast_priority_forced_stop = bool(
                             (
-                                curve_forecast_wallbox_stop_active
-                                and _fast_public_mode == MODE_CURVE
+                                _fast_curve_forecast_stop.get(
+                                    "stop_required", False
+                                )
                             )
                             or (
                                 int(wb_dist_mode) in (1, 2)
@@ -27735,6 +29891,103 @@ def run():
                                     "_notaus_active",
                                     False,
                                 )
+                            )
+                        )
+                        _fast_transient_grid_pm_hold = (
+                            _wallbox_transient_grid_pm_output_hold_contract(
+                                c_data,
+                                _fast_status,
+                                live,
+                                live_plausibility,
+                                _budget,
+                                now_ts=now_ts,
+                                budget_ok=_budget_ok,
+                                budget_timeout=_budget_timeout,
+                                budget_identity_valid=(
+                                    _storage_wallbox_budget_identity_valid
+                                ),
+                                authorized_budget_w=(
+                                    _authorized_wallbox_budget_w
+                                ),
+                                live_snapshot_fresh=live_snapshot_fresh,
+                                hard_blocked=bool(
+                                    not wbminsoc_gate_open
+                                    or curve_wbminsoc_floor_guard_active
+                                    or controlled_wallbox_wbminsoc_pv_only_active
+                                    or emergency_stop_active
+                                    or house_fuse_limited
+                                    or _fast_priority_forced_stop
+                                    or _budget_timeout
+                                    or float(storage_charge_reserve_w or 0.0)
+                                    > 0.0
+                                    or bool(
+                                        (_fast_status or {}).get(
+                                            "cp_interrupt_isactive",
+                                            False,
+                                        )
+                                    )
+                                    or bool(
+                                        isinstance(
+                                            c_data.get(
+                                                "_wallbox_phase_transition_reservation"
+                                            ),
+                                            dict,
+                                        )
+                                        and c_data[
+                                            "_wallbox_phase_transition_reservation"
+                                        ].get("active", False)
+                                    )
+                                    or bool(
+                                        c_data.get(
+                                            "_openwb_pro_phase_sequence"
+                                        )
+                                    )
+                                    or bool(
+                                        isinstance(
+                                            c_data.get(
+                                                "_openwb_pro_phase_recovery_hold"
+                                            ),
+                                            dict,
+                                        )
+                                        and c_data[
+                                            "_openwb_pro_phase_recovery_hold"
+                                        ].get("active", False)
+                                    )
+                                    or bool(
+                                        c_data.get(
+                                            "_physical_output_blocked",
+                                            False,
+                                        )
+                                    )
+                                    or bool(
+                                        c_data.get("_bev_full_blocked", False)
+                                    )
+                                    or bool(
+                                        wb_manual_pause.get(c_id, False)
+                                    )
+                                    or bool(wb_locked.get(c_id, False))
+                                    or bool(
+                                        c_data.get(
+                                            "_emergency_stop_active",
+                                            False,
+                                        )
+                                        or c_data.get(
+                                            "_notaus_active",
+                                            False,
+                                        )
+                                    )
+                                    or bool(
+                                        _budget.get("force_wallbox_stop")
+                                        or _budget.get(
+                                            "predump_floor_hold"
+                                        )
+                                    )
+                                    or predump_wallbox_active
+                                    or storage_predump_active
+                                    or _fast_public_mode == MODE_OFF
+                                    or not live_snapshot_fresh
+                                ),
+                                min_amp=wb_min_amp_cfg,
                             )
                         )
                         _fast_ordinary_grid_import_sequence_active = (
@@ -27873,6 +30126,14 @@ def run():
                                     else 0.0
                                 ),
                             )
+                            if _fast_transient_grid_pm_hold.get("active"):
+                                # Reiner No-Write-Halt: Der bereits direkt
+                                # bestätigte Pro-Ausgang bleibt bestehen. Es
+                                # wird weder ein neuer positiver Befehl noch
+                                # ein 0-A-Stopp erzeugt.
+                                direct_target_amp = (
+                                    _fast_direct_effective_current_amp
+                                )
                             _fast_direct_shared_minimum_hold = (
                                 wallbox_decision.curve_direct_shared_minimum_hold_required(
                                     charging_running=_wb_status_real_charging(
@@ -27904,6 +30165,8 @@ def run():
                             direct_down_hold_s = 2.0
                             direct_since_key = "_openwb_pro_curve_direct_since"
                             direct_due = bool(
+                                not _fast_transient_grid_pm_hold.get("active")
+                                and
                                 not _fast_direct_shared_minimum_hold
                                 and direct_contract.get("changed")
                                 and direct_age_s >= FAST_GRID_SECS
@@ -28673,9 +30936,88 @@ def run():
                             # Wolkenhaltezeit des Ladepunkts auf Heizstab-Takte
                             # kuerzen.
                             pass
-                        priority_forced_stop = False
-                        if curve_forecast_wallbox_stop_active and c_public_mode == MODE_CURVE:
-                            priority_forced_stop = True
+                        _loop_status_fresh = bool(
+                            isinstance(_loop_charger_status, dict)
+                            and _loop_charger_status.get(
+                                "driver_status_valid"
+                            ) is True
+                            and not _loop_charger_status.get(
+                                "driver_status_stale", False
+                            )
+                            and not _loop_charger_status.get(
+                                "driver_status_degraded", False
+                            )
+                            and not _loop_charger_status.get(
+                                "driver_status_glitch", False
+                            )
+                        )
+                        _loop_phase_reservation = c_data.get(
+                            "_wallbox_phase_transition_reservation"
+                        )
+                        _curve_forecast_stop = (
+                            _curve_forecast_priority_stop_contract(
+                                forecast_stop_active=(
+                                    curve_forecast_wallbox_stop_active
+                                ),
+                                public_mode=c_public_mode,
+                                openwb_pro=(
+                                    charger_class_name == "OpenWBProCharger"
+                                ),
+                                connected=_wb_status_connected(
+                                    _loop_charger_status
+                                ),
+                                direct_candidate=(
+                                    c_id in active_openwb_pro_curve_ids
+                                ),
+                                direct_active=openwb_pro_curve_direct_active,
+                                direct_w=openwb_pro_curve_direct_w,
+                                direct_real_pv_w=(
+                                    openwb_pro_curve_direct_real_pv_w
+                                ),
+                                minimum_w=openwb_pro_curve_direct_start_min_w,
+                                status_fresh=_loop_status_fresh,
+                                budget_fresh=bool(
+                                    _budget_ok
+                                    and not live_sample_invalid
+                                    and not _budget_live_sample_invalid
+                                ),
+                                safety_clear=bool(
+                                    not wb_locked.get(c_id, False)
+                                    and not wb_manual_pause.get(c_id, False)
+                                    and not c_data.get("_bev_full_blocked", False)
+                                    and not emergency_stop_active
+                                    and not c_data.get(
+                                        "_emergency_stop_active", False
+                                    )
+                                    and not c_data.get("_notaus_active", False)
+                                    and not c_data.get(
+                                        "_physical_output_blocked", False
+                                    )
+                                    and not (_loop_charger_status or {}).get(
+                                        "cp_interrupt_isactive", False
+                                    )
+                                    and not c_data.get(
+                                        "_openwb_pro_phase_sequence"
+                                    )
+                                    and not (
+                                        isinstance(
+                                            _loop_phase_reservation, dict
+                                        )
+                                        and _loop_phase_reservation.get(
+                                            "active", False
+                                        )
+                                    )
+                                ),
+                            )
+                        )
+                        c_data[
+                            "_curve_forecast_priority_stop_contract"
+                        ] = _curve_forecast_stop
+                        priority_forced_stop = bool(
+                            _curve_forecast_stop.get(
+                                "stop_required", False
+                            )
+                        )
                         manual_pause_active = bool(wb_manual_pause.get(c_id, False))
                         c_data["_manual_pause_active"] = manual_pause_active
                         if manual_pause_active:
@@ -29256,12 +31598,60 @@ def run():
                             charger_status,
                         )
                         vehicle_max_phases = _vehicle_max_ac_phases(config, c_id, phase_identity_status)
+                        failed_phase_retry_until = float(
+                            c_data.get(
+                                "_openwb_pro_phase_retry_block_until",
+                                0.0,
+                            )
+                            or 0.0
+                        )
+                        if (
+                            failed_phase_retry_until > 0.0
+                            and now_ts >= failed_phase_retry_until
+                        ):
+                            retry_matches_phase_block = bool(
+                                abs(
+                                    float(
+                                        c_data.get(
+                                            "_phase_3p_block_until",
+                                            0.0,
+                                        )
+                                        or 0.0
+                                    )
+                                    - failed_phase_retry_until
+                                )
+                                <= 1e-6
+                            )
+                            c_data[
+                                "_openwb_pro_phase_retry_block_until"
+                            ] = 0.0
+                            if retry_matches_phase_block:
+                                c_data["_phase_3p_block_until"] = 0.0
+                            _save_wallbox_phase_state(chargers)
+                            failed_phase_retry_until = 0.0
+                        failed_phase_retry_active = bool(
+                            now_ts < failed_phase_retry_until
+                        )
                         if vehicle_max_phases >= 3 and (
                             c_data.get("_session_1p_only", False)
-                            or float(c_data.get("_phase_3p_block_until", 0.0) or 0.0) > 0.0
+                            or (
+                                float(
+                                    c_data.get(
+                                        "_phase_3p_block_until",
+                                        0.0,
+                                    )
+                                    or 0.0
+                                )
+                                > 0.0
+                                and not failed_phase_retry_active
+                            )
                         ):
                             c_data["_session_1p_only"] = False
-                            c_data["_phase_3p_block_until"] = 0.0
+                            if not failed_phase_retry_active:
+                                c_data["_phase_3p_block_until"] = 0.0
+                                c_data[
+                                    "_openwb_pro_phase_retry_block_until"
+                                ] = 0.0
                             c_data["_phase_3p_pending_since"] = 0.0
                             _save_wallbox_phase_state(chargers)
                         vehicle_1p_only = bool(
@@ -29562,14 +31952,89 @@ def run():
                             and not target_wbminsoc_phase_taper_for_wb
                             and not target_wbminsoc_low_power_for_wb
                         )
-                        phase_3p_supported = bool(
-                            phase_budget_w >= phase_3p_min_w + phase_up_buffer_w
-                            and (
-                                grid_power_budget_w < phase_up_grid_allow_w
-                                or local_grid_allowed
-                                or predump_wallbox_active
-                                or phase_battery_assist
+                        # Der Up-Puffer gehört ausschließlich zum gewöhnlichen
+                        # 1→3-Hochwechsel. Bei einem noch ungesetzten oder
+                        # bereits bestätigten 3p-Ziel reichen das frische,
+                        # autorisierte physische 3p-Minimum und ein starker
+                        # Exportbeleg. Dadurch kann die 4290-W-
+                        # Übergangsreservation (4140 W + 150 W) nicht nach
+                        # Ablauf des 480-s-Guards fälschlich auf 1p kippen.
+                        phase_3p_strong_export_safety_clear = bool(
+                            openwb_phase_capable
+                            and charger_connected
+                            and c_control_mode > 0
+                            and effective_wb_mode > 0
+                            and not live_sample_invalid
+                            and not _budget_live_sample_invalid
+                            and wbminsoc_gate_open
+                            and not vehicle_1p_only
+                            and not priority_forced_stop
+                            and bool(
+                                (charger_status or {}).get(
+                                    "driver_status_valid",
+                                    False,
+                                )
                             )
+                            and not bool(
+                                (charger_status or {}).get(
+                                    "driver_status_stale",
+                                    False,
+                                )
+                            )
+                            and not bool(
+                                (charger_status or {}).get(
+                                    "driver_status_degraded",
+                                    False,
+                                )
+                            )
+                            and not bool(
+                                (charger_status or {}).get(
+                                    "driver_status_glitch",
+                                    False,
+                                )
+                            )
+                            and (charger_status or {}).get(
+                                "cp_interrupt_isactive"
+                            ) in (False, 0)
+                            and not bool(wb_manual_pause.get(c_id, False))
+                            and not bool(wb_locked.get(c_id, False))
+                            and not bool(
+                                c_data.get("_emergency_stop_active", False)
+                                or c_data.get("_notaus_active", False)
+                                or c_data.get("_physical_output_blocked", False)
+                            )
+                        )
+                        phase_3p_budget_support = (
+                            wallbox_decision.phase_3p_budget_support_contract(
+                                phase_budget_w=phase_budget_w,
+                                authorized_budget_w=(
+                                    _authorized_wallbox_budget_w
+                                ),
+                                phase_3p_min_w=phase_3p_min_w,
+                                phase_up_buffer_w=phase_up_buffer_w,
+                                grid_power_w=grid_power_budget_w,
+                                phase_up_grid_allow_w=phase_up_grid_allow_w,
+                                ordinary_override_allowed=bool(
+                                    local_grid_allowed
+                                    or predump_wallbox_active
+                                    or phase_battery_assist
+                                ),
+                                openwb_pro=openwb_pro,
+                                phase_target=phase_target,
+                                strong_export_threshold_w=max(
+                                    6.0 * 230.0,
+                                    abs(phase_down_grid_w),
+                                ),
+                                fresh_budget_authorized=(
+                                    _fresh_wallbox_budget_authorized
+                                ),
+                                strong_export_safety_clear=(
+                                    phase_3p_strong_export_safety_clear
+                                ),
+                            )
+                        )
+                        phase_3p_supported = bool(
+                            phase_3p_budget_support.get("supported", False)
                         )
                         phase_3p_keep_supported = bool(
                             phase_3p_supported
@@ -29656,6 +32121,17 @@ def run():
                             and phase_budget_w < phase_3p_min_w + phase_up_buffer_w
                             and phase_one_phase_start_budget_w >= 6.0 * 230.0
                         )
+                        phase_change_veto_until = (
+                            _openwb_pro_phase_change_veto_until(c_data)
+                            if openwb_pro
+                            else float(
+                                c_data.get("_phase_3p_block_until", 0.0)
+                                or 0.0
+                            )
+                        )
+                        phase_change_veto_active = bool(
+                            now_ts < phase_change_veto_until
+                        )
                         phase_start_1p_possible = bool(
                             openwb_phase_capable
                             and charger_connected
@@ -29669,7 +32145,7 @@ def run():
                                 or phase_one_phase_start_budget_w >= 6.0 * 230.0
                             )
                             and not phase_3p_pending_hold_active
-                            and now_ts >= float(c_data.get("_phase_3p_block_until", 0.0) or 0.0)
+                            and not phase_change_veto_active
                             and now_ts - c_data.get("_last_phase_switch_ts", 0) >= phase_effective_hold_s
                         )
                         low_power_one_phase_required_for_wb = bool(
@@ -29753,7 +32229,7 @@ def run():
                                     or cap_amp
                                 ),
                             )
-                        phase_block_until = float(c_data.get("_phase_3p_block_until", 0.0) or 0.0)
+                        phase_block_until = phase_change_veto_until
                         keep_recent_1p_reup_block = bool(
                             openwb_phase_capable
                             and phase_target == 1
@@ -29762,11 +32238,12 @@ def run():
                         if phase_confirmed_3p and not keep_recent_1p_reup_block:
                             _had_phase_block = float(c_data.get("_phase_3p_block_until", 0.0) or 0.0) > 0.0
                             c_data["_phase_3p_block_until"] = 0.0
+                            c_data[
+                                "_openwb_pro_phase_retry_block_until"
+                            ] = 0.0
                             if _had_phase_block:
                                 _save_wallbox_phase_state(chargers)
-                        _phase_3p_block_active = bool(
-                            now_ts < float(c_data.get("_phase_3p_block_until", 0.0) or 0.0)
-                        )
+                        _phase_3p_block_active = phase_change_veto_active
                         if _phase_3p_block_active:
                             phase_3p_supported = False
                         phase_retry_block_s = max(
@@ -31685,6 +34162,90 @@ def run():
                         _active_phase_recovery = c_data.get(
                             "_openwb_pro_phase_recovery_hold"
                         )
+                        openwb_pro_current_first_satisfied = (
+                            _openwb_pro_current_first_satisfied_contract(
+                                c_data,
+                                charger_status,
+                                now_ts=now_ts,
+                                openwb_pro=openwb_pro,
+                                charger_connected=charger_connected,
+                                control_mode=c_control_mode,
+                                public_mode=effective_wb_mode,
+                                hw_charging=hw_charging,
+                                stable_hw_power_w=stable_hw_power_w,
+                                cap_amp=cap_amp,
+                                minimum_amp=wb_min_amp_cfg,
+                                vehicle_max_phases=vehicle_max_phases,
+                                phase_3p_supported=phase_3p_supported,
+                                phase_cap_phases=phase_cap_phases,
+                                phase_3p_min_w=phase_3p_min_w,
+                                fresh_budget_authorized=(
+                                    _fresh_wallbox_budget_authorized
+                                ),
+                                authorized_budget_w=(
+                                    _authorized_wallbox_budget_w
+                                ),
+                                live_snapshot_fresh=live_snapshot_fresh,
+                                phase_target=phase_target,
+                                phase_switch_phases=phase_switch_phases,
+                                phase_wait_active=(
+                                    openwb_pro_phase_wait_active
+                                ),
+                                phase_block_active=_phase_3p_block_active,
+                                transition_active=bool(
+                                    isinstance(
+                                        _active_phase_reservation,
+                                        dict,
+                                    )
+                                    and _active_phase_reservation.get(
+                                        "active",
+                                        False,
+                                    )
+                                ),
+                                recovery_active=bool(
+                                    isinstance(_active_phase_recovery, dict)
+                                    and _active_phase_recovery.get(
+                                        "active",
+                                        False,
+                                    )
+                                ),
+                                priority_forced_stop=priority_forced_stop,
+                                vehicle_finished=bool(
+                                    c_data.get("_bev_full_blocked", False)
+                                ),
+                                manual_pause=bool(
+                                    wb_manual_pause.get(c_id, False)
+                                    or c_data.get(
+                                        "_manual_pause_active",
+                                        False,
+                                    )
+                                ),
+                                locked=bool(wb_locked.get(c_id, False)),
+                                emergency_stop=bool(
+                                    emergency_stop_active
+                                    or c_data.get(
+                                        "_emergency_stop_active",
+                                        False,
+                                    )
+                                    or c_data.get("_notaus_active", False)
+                                ),
+                                physical_output_blocked=bool(
+                                    c_data.get(
+                                        "_physical_output_blocked",
+                                        False,
+                                    )
+                                ),
+                            )
+                        )
+                        c_data[
+                            "_openwb_pro_current_first_satisfied_contract"
+                        ] = openwb_pro_current_first_satisfied
+                        current_first_satisfied = bool(
+                            openwb_pro_current_first_satisfied.get(
+                                "satisfied",
+                                False,
+                            )
+                        )
                         openwb_pro_direct_3p_cold_start = (
                             _openwb_pro_direct_3p_cold_start_contract(
                                 charger_status,
@@ -31704,11 +34265,17 @@ def run():
                                 phase_block_active=_phase_3p_block_active,
                                 transition_active=bool(
                                     isinstance(_active_phase_reservation, dict)
-                                    and _active_phase_reservation.get("active", False)
+                                    and _active_phase_reservation.get(
+                                        "active",
+                                        False,
+                                    )
                                 ),
                                 recovery_active=bool(
                                     isinstance(_active_phase_recovery, dict)
-                                    and _active_phase_recovery.get("active", False)
+                                    and _active_phase_recovery.get(
+                                        "active",
+                                        False,
+                                    )
                                 ),
                                 priority_forced_stop=priority_forced_stop,
                                 vehicle_finished=bool(
@@ -31716,12 +34283,22 @@ def run():
                                 ),
                                 manual_pause=bool(
                                     wb_manual_pause.get(c_id, False)
-                                    or c_data.get("_manual_pause_active", False)
+                                    or c_data.get(
+                                        "_manual_pause_active",
+                                        False,
+                                    )
                                 ),
                                 locked=bool(wb_locked.get(c_id, False)),
                                 emergency_stop=bool(
-                                    c_data.get("_emergency_stop_active", False)
+                                    emergency_stop_active
+                                    or c_data.get(
+                                        "_emergency_stop_active",
+                                        False,
+                                    )
                                     or c_data.get("_notaus_active", False)
+                                ),
+                                current_first_contract=(
+                                    openwb_pro_current_first_satisfied
                                 ),
                             )
                             if openwb_pro
@@ -31735,11 +34312,15 @@ def run():
                             openwb_pro_direct_3p_cold_start
                         )
                         direct_3p_cold_start = bool(
-                            openwb_pro_direct_3p_cold_start.get("allow", False)
+                            openwb_pro_direct_3p_cold_start.get(
+                                "allow",
+                                False,
+                            )
                         )
                         openwb_pro_current_first_before_phase_up = bool(
                             openwb_pro
                             and not direct_3p_cold_start
+                            and not current_first_satisfied
                             and charger_connected
                             and not hw_charging
                             and stable_hw_power_w <= 500.0
@@ -31831,6 +34412,106 @@ def run():
                                     False,
                                 )
                                 or c_data.get("_notaus_active", False)
+                            )
+                        )
+                        _main_transient_grid_pm_hold = (
+                            _wallbox_transient_grid_pm_output_hold_contract(
+                                c_data,
+                                charger_status,
+                                live,
+                                live_plausibility,
+                                _budget,
+                                now_ts=now_ts,
+                                budget_ok=_budget_ok,
+                                budget_timeout=_budget_timeout,
+                                budget_identity_valid=(
+                                    _storage_wallbox_budget_identity_valid
+                                ),
+                                authorized_budget_w=(
+                                    _authorized_wallbox_budget_w
+                                ),
+                                live_snapshot_fresh=live_snapshot_fresh,
+                                hard_blocked=bool(
+                                    not wbminsoc_gate_open
+                                    or floor_pv_only_guard_for_wb
+                                    or controlled_floor_battery_guard_active
+                                    or _runtime_raise_for_wb
+                                    or house_fuse_limited
+                                    or priority_forced_stop
+                                    or _budget_timeout
+                                    or float(storage_charge_reserve_w or 0.0)
+                                    > 0.0
+                                    or bool(
+                                        (charger_status or {}).get(
+                                            "cp_interrupt_isactive",
+                                            False,
+                                        )
+                                    )
+                                    or bool(openwb_pro_phase_wait_active)
+                                    or bool(
+                                        isinstance(
+                                            _active_phase_reservation,
+                                            dict,
+                                        )
+                                        and _active_phase_reservation.get(
+                                            "active",
+                                            False,
+                                        )
+                                    )
+                                    or bool(
+                                        isinstance(
+                                            _active_phase_recovery,
+                                            dict,
+                                        )
+                                        and _active_phase_recovery.get(
+                                            "active",
+                                            False,
+                                        )
+                                    )
+                                    or bool(
+                                        c_data.get(
+                                            "_openwb_pro_phase_sequence"
+                                        )
+                                    )
+                                    or bool(
+                                        c_data.get(
+                                            "_physical_output_blocked",
+                                            False,
+                                        )
+                                    )
+                                    or bool(
+                                        c_data.get("_bev_full_blocked", False)
+                                    )
+                                    or bool(
+                                        wb_manual_pause.get(c_id, False)
+                                        or c_data.get(
+                                            "_manual_pause_active",
+                                            False,
+                                        )
+                                    )
+                                    or bool(wb_locked.get(c_id, False))
+                                    or bool(
+                                        c_data.get(
+                                            "_emergency_stop_active",
+                                            False,
+                                        )
+                                        or c_data.get(
+                                            "_notaus_active",
+                                            False,
+                                        )
+                                    )
+                                    or bool(
+                                        _budget.get("force_wallbox_stop")
+                                        or _budget.get(
+                                            "predump_floor_hold"
+                                        )
+                                    )
+                                    or predump_wallbox_active
+                                    or storage_predump_active
+                                    or c_public_mode == MODE_OFF
+                                    or not live_snapshot_fresh
+                                ),
+                                min_amp=wb_min_amp_cfg,
                             )
                         )
                         _ordinary_sequence_current_evidence_missing = not (
@@ -32387,6 +35068,75 @@ def run():
                             # Treiber blockierter Plan darf die nachgelagerte
                             # Retry-/Livenessauswertung nicht verschlucken.
                             if planned_start_sent or _cold_start_output_consumed:
+                                continue
+                        wakeup_tick_command = (
+                            _openwb_pro_start_wakeup_tick_command(
+                                c_data,
+                                charger_status,
+                                phase_switch_action=phase_switch_action,
+                                phase_wait_active=openwb_pro_phase_wait_active,
+                                physically_chargeable=bool(
+                                    _physical_budget.get(
+                                        "can_start_or_hold",
+                                        False,
+                                    )
+                                ),
+                                priority_forced_stop=priority_forced_stop,
+                                manual_pause=bool(
+                                    wb_manual_pause.get(c_id, False)
+                                    or c_data.get("_manual_pause_active", False)
+                                ),
+                                locked=bool(wb_locked.get(c_id, False)),
+                                emergency_stop=bool(
+                                    c_data.get("_emergency_stop_active", False)
+                                    or c_data.get("_notaus_active", False)
+                                ),
+                                charger_max_amp=charger_max_amp,
+                                now_ts=now_ts,
+                            )
+                            if openwb_pro
+                            else {}
+                        )
+                        if wakeup_tick_command:
+                            wakeup_tick_receipt = (
+                                _execute_wallbox_current_with_receipt(
+                                    c_data,
+                                    wakeup_tick_command,
+                                    c_id=c_id,
+                                )
+                            )
+                            wakeup_tick_ledger = c_data.get(
+                                "_wallbox_output_ledger"
+                            )
+                            wakeup_tick_output_consumed = bool(
+                                isinstance(wakeup_tick_ledger, dict)
+                                and (
+                                    wakeup_tick_ledger.get(
+                                        "normal_claimed",
+                                        False,
+                                    )
+                                    or wakeup_tick_ledger.get(
+                                        "emergency_claimed",
+                                        False,
+                                    )
+                                )
+                            )
+                            wakeup_tick_contract = c_data.get(
+                                "_openwb_pro_start_wakeup_tick_contract"
+                            )
+                            if isinstance(wakeup_tick_contract, dict):
+                                wakeup_tick_contract.update({
+                                    "hardware_output": bool(
+                                        wakeup_tick_output_consumed
+                                    ),
+                                    "current_receipt": bool(
+                                        wakeup_tick_receipt is not None
+                                    ),
+                                })
+                            if (
+                                wakeup_tick_receipt is not None
+                                or wakeup_tick_output_consumed
+                            ):
                                 continue
                         phase_start_1p_needed = bool(
                             phase_switch_action == "SWITCH_1P"
@@ -33190,6 +35940,30 @@ def run():
                                     else 0.0
                                 ),
                             )
+                            if _main_transient_grid_pm_hold.get("active"):
+                                direct_target_amp = (
+                                    _main_direct_effective_current_amp
+                                )
+                                _log_state_once(
+                                    c_data,
+                                    "transient_grid_pm_no_write_hold",
+                                    (
+                                        round(direct_target_amp, 2),
+                                        str(
+                                            _main_transient_grid_pm_hold.get(
+                                                "session_id"
+                                            )
+                                            or ""
+                                        ),
+                                    ),
+                                    "WB%d openWB Pro: bestätigtes %.1f-A-Angebot "
+                                    "bleibt bei einem einzelnen Grid-/PM-Widerspruch "
+                                    "höchstens 10s unverändert; kein 0-A-Befehl" % (
+                                        c_id,
+                                        direct_target_amp,
+                                    ),
+                                    min_interval_s=60.0,
+                                )
                             _main_direct_shared_minimum_hold = (
                                 wallbox_decision.curve_direct_shared_minimum_hold_required(
                                     charging_running=bool(
@@ -33229,6 +36003,8 @@ def run():
                             direct_age_s = max(0.0, now_ts - float(c_data.get("last_fast_ts", 0.0) or 0.0))
                             direct_down_hold_s = 2.0
                             direct_due = bool(
+                                not _main_transient_grid_pm_hold.get("active")
+                                and
                                 not _main_direct_shared_minimum_hold
                                 and direct_contract.get("changed")
                                 and now_ts - float(c_data.get("last_fast_ts", 0.0) or 0.0) >= FAST_GRID_SECS
@@ -34197,6 +36973,35 @@ def run():
                                     start_stop_effective.get("decision")
                                     or start_stop_decision
                                 )
+                                if (
+                                    _main_transient_grid_pm_hold.get(
+                                        "active"
+                                    )
+                                    and zero_budget_action == "STOP"
+                                ):
+                                    # Kein positiver Ersatzvertrag und kein
+                                    # Treiberaufruf: Nur der aus genau einem
+                                    # PM-Widerspruch abgeleitete 0-A-Stopp wird
+                                    # für das kurze, nicht gleitende Fenster
+                                    # unterdrückt.
+                                    zero_budget_action = (
+                                        "HOLD_TRANSIENT_GRID_PM_NO_WRITE"
+                                    )
+                                    start_stop_decision.update({
+                                        "action": zero_budget_action,
+                                        "target_amp": 0.0,
+                                        "hold_amp": float(
+                                            _main_transient_grid_pm_hold.get(
+                                                "hold_amp",
+                                                0.0,
+                                            )
+                                            or 0.0
+                                        ),
+                                        "reason": (
+                                            "single_grid_pm_delta_high_no_write_hold"
+                                        ),
+                                        "new_output_authorized": False,
+                                    })
                                 _hold_reported_amp = _fresh_wallbox_reported_current_amp(
                                     charger_status
                                 )
@@ -34395,6 +37200,37 @@ def run():
                                             int(current_amp or 0),
                                             c_control_mode,
                                         ),
+                                        min_interval_s=60.0,
+                                    )
+                                elif zero_budget_action == "HOLD_TRANSIENT_GRID_PM_NO_WRITE":
+                                    _project_wallbox_current_state(
+                                        c_data,
+                                        charger_status,
+                                    )
+                                    _log_state_once(
+                                        c_data,
+                                        "transient_grid_pm_no_write_hold",
+                                        (
+                                            round(
+                                                float(
+                                                    _main_transient_grid_pm_hold.get(
+                                                        "hold_amp",
+                                                        0.0,
+                                                    )
+                                                    or 0.0
+                                                ),
+                                                2,
+                                            ),
+                                            str(
+                                                _main_transient_grid_pm_hold.get(
+                                                    "session_id"
+                                                )
+                                                or ""
+                                            ),
+                                        ),
+                                        "WB%d openWB Pro: einzelner Grid-/PM-Widerspruch; "
+                                        "bestehendes Stromangebot bleibt höchstens 10s "
+                                        "unverändert (kein Treiberbefehl)" % c_id,
                                         min_interval_s=60.0,
                                     )
                                 elif zero_budget_action == "HOLD_MIN_CHARGE":
@@ -35876,6 +38712,7 @@ def run():
                                 physical_budget=c_data.get("_physical_budget"),
                                 vehicle_max_phases=_vehicle_max_ac_phases(config, c_id, st),
                                 openwb_phase_capable=bool((c_data.get("_openwb_phase_capability") or {}).get("can_switch", False)),
+                                config=config,
                             )
                             _detail_manual_pause_active = bool(
                                 wb_manual_pause.get(c_id, False)
@@ -36145,7 +38982,9 @@ def run():
                                 'manual_lock', 'min_current',
                                 'pv_charging_min_current', 'instant_charging_current',
                                 'instant_charging_limit', 'instant_charging_soc',
-                                'car_soc', 'car_soc_source', 'car_soc_raw_ts', 'car_soc_rule_confirmed',
+                                'car_soc', 'car_soc_source', 'car_soc_raw_ts', 'car_soc_source_ts',
+                                'car_soc_rule_confirmed', 'car_soc_age_contract',
+                                'car_soc_age_contract_source', 'car_soc_max_age_s',
                                 'car_soc_profile_bound', 'car_soc_identity_scope',
                                 'car_name', 'car_id', 'vehicle_id',
                                 'car_capacity_kwh',

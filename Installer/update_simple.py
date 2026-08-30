@@ -1187,7 +1187,10 @@ def _create_backup(
     target_root: Path,
     target_binding: DirectoryMetadataPrestate,
 ) -> Path:
-    print("[1/4] Erstelle verifiziertes Vollbackup …", flush=True)
+    print(
+        "[1/4] Sicherung und Integritätsprüfung (Anlage läuft weiter) …",
+        flush=True,
+    )
     try:
         from Installer.backup import REPAIR_UPDATE_BACKUP_PROFILE, backup_current_version
 
@@ -2065,7 +2068,11 @@ def _cutover_service_scope(extra_units: Iterable[str] = ()) -> tuple[str, ...]:
 
 
 def _stop_for_cutover(extra_units: Iterable[str] = ()) -> tuple[str, ...]:
-    print("[2/4] Stoppe E3DC-Control-Dienste einmalig für den kurzen Dateiaustausch …", flush=True)
+    print(
+        "[2/4] Kurze Anlagenunterbrechung beginnt: Dienste werden für den "
+        "Dateiaustausch kontrolliert gestoppt …",
+        flush=True,
+    )
     scope = _cutover_service_scope(extra_units)
     ordered = [unit for unit in STOP_PRIORITY if unit in scope]
     ordered.extend(
@@ -2186,9 +2193,6 @@ def _create_stopped_data_backup(
     """Sichert nach bestätigtem Stopp nur noch die zuletzt veränderbaren Daten."""
 
     from Installer.backup import create_quiesced_overlay
-    from Installer.backup_integrity import SYSTEM_BACKUP_KIND, verify_backup
-
-    manifest = verify_backup(backup_path, expected_kind=SYSTEM_BACKUP_KIND)
     transaction = hashlib.sha256(
         f"{target_root}\0{backup_path}\0{os.getpid()}\0{time.time_ns()}".encode("utf-8")
     ).hexdigest()
@@ -2201,7 +2205,6 @@ def _create_stopped_data_backup(
         install_path=target_root,
         transaction_id=transaction,
         parent_backup_dir=backup_path,
-        parent_backup_id=str(manifest.get("backup_id") or ""),
         expected_install_root_identity=(
             target_binding.parent_device,
             target_binding.parent_inode,
@@ -2270,17 +2273,99 @@ def _retry_backup_retention_after_confirmed_start(
             "Backup-Limit-Lauf meldete einen Bereinigungsfehler. Das aktuelle "
             "Vollbackup bleibt geschützt."
         )
-    if retention.get("limit_satisfied") is not True:
-        warnings.append(
-            "Die Grenze von maximal drei verifizierten System-Backup-Familien "
-            "und drei Web-Sicherungen ist noch offen; geschützte oder nicht "
-            "sicher klassifizierbare Sicherungen wurden nicht gelöscht."
-        )
-    if not warnings:
+    if retention.get("limit_satisfied") is True and not warnings:
         print(
             "[OK] Backup-Limit nach bestätigtem Dienststart angewendet.",
             flush=True,
         )
+        return warnings
+
+    update_result = retention.get("update_backups")
+    web_result = retention.get("web_installer_backups")
+    quiesced_result = retention.get("quiesced_overlays")
+
+    def verified_count_within_limit(payload: object) -> tuple[bool, int, int]:
+        if not isinstance(payload, dict):
+            return False, -1, -1
+        count = payload.get("verified_count_after")
+        keep = payload.get("keep_count")
+        if (
+            not isinstance(count, int)
+            or isinstance(count, bool)
+            or not isinstance(keep, int)
+            or isinstance(keep, bool)
+            or count < 0
+            or keep < 1
+        ):
+            return False, -1, -1
+        return count <= keep, count, keep
+
+    system_ok, system_count, system_limit = verified_count_within_limit(
+        update_result
+    )
+    web_ok, web_count, web_limit = verified_count_within_limit(web_result)
+    quiesced_clean = bool(
+        isinstance(quiesced_result, dict)
+        and quiesced_result.get("success") is True
+        and not quiesced_result.get("skipped")
+    )
+    unclassified_entries = [
+        entry
+        for payload in (update_result, web_result)
+        if isinstance(payload, dict)
+        for entry in (payload.get("unclassified") or [])
+        if isinstance(entry, dict)
+    ]
+    unclassified_count = len(unclassified_entries)
+    unverified_count = sum(
+        1
+        for entry in unclassified_entries
+        if str(entry.get("reason") or "") == "nicht verifiziert"
+    )
+    if (
+        not warnings
+        and system_ok
+        and web_ok
+        and quiesced_clean
+        and unclassified_count
+    ):
+        old_inventory_text = (
+            "1 nicht sicher klassifizierbarer Altbestand blieb unverändert "
+            "außerhalb der Rotation; dieser Bestand zählt nicht als "
+            "verifiziertes System- oder Web-Backup."
+            if unclassified_count == 1
+            else (
+                f"{unclassified_count} nicht sicher klassifizierbare "
+                "Altbestände blieben unverändert außerhalb der Rotation; "
+                "diese Bestände zählen nicht als verifizierte System- oder "
+                "Web-Backups."
+            )
+        )
+        unverified_text = ""
+        if unverified_count:
+            unverified_text = (
+                " Davon konnte 1 sicherungsähnlicher Bestand nicht "
+                "verifiziert werden."
+                if unverified_count == 1
+                else (
+                    f" Davon konnten {unverified_count} sicherungsähnliche "
+                    "Bestände nicht verifiziert werden."
+                )
+            )
+        print(
+            "[INFO] Die verifizierten Backup-Grenzen sind eingehalten "
+            f"(System {system_count}/{system_limit}, Web {web_count}/{web_limit}). "
+            f"{old_inventory_text}"
+            f"{unverified_text}",
+            flush=True,
+        )
+        return warnings
+
+    warnings.append(
+        "Die Grenze von maximal drei verifizierten System-Backup-Familien "
+        "und drei Web-Sicherungen ist noch offen; geschützte oder nicht "
+        "sicher klassifizierbare Sicherungen wurden nicht gelöscht."
+    )
     return warnings
 
 
@@ -4294,7 +4379,7 @@ def _release_web_program_contract(
                 )
 
     walk(source, ())
-    if not {"index.php", "helpers.php"}.issubset(files):
+    if not {"index.php", "helpers.php", "retention.php"}.issubset(files):
         raise RuntimeError("Release-Webquelle ist unvollständig")
     return tuple(sorted(files)), tuple(
         sorted(directories, key=lambda value: (value.count("/"), value))
@@ -5818,7 +5903,10 @@ def _start_services(
     enable_services: tuple[str, ...],
     masked_units: Iterable[str] = (),
 ) -> list[str]:
-    print("[4/4] Starte Dienste neu …", flush=True)
+    print(
+        "[4/4] Regelung und Weboberfläche werden neu gestartet und geprüft …",
+        flush=True,
+    )
     reload_result = _run(["/usr/bin/systemctl", "daemon-reload"], timeout=60)
     if reload_result.returncode != 0:
         _fail(
@@ -6608,6 +6696,9 @@ def perform_update(
     role: str,
     bound_peer_ip: str = "",
 ) -> int:
+    update_started_at = time.monotonic()
+    cutover_started_at: float | None = None
+    services_confirmed_at: float | None = None
     release_root = RELEASE_ROOT
     policy = _load_policy(release_root)
     _validate_inputs(target_root, release_root, install_user, tag)
@@ -6641,6 +6732,11 @@ def perform_update(
                 backup_path = _create_backup(target_root, target_prebinding)
             _assert_named_directory_binding(target_prebinding)
             print(f"[OK] Vollbackup: {backup_path}", flush=True)
+            print(
+                "[STATUS] Vollbackup bestätigt. Vorbereitungen laufen; die Anlage "
+                "arbeitet weiter.",
+                flush=True,
+            )
             role_service_intended = _role_service_intended(role)
             config = _bind_role_context(
                 role,
@@ -6692,6 +6788,7 @@ def perform_update(
             _assert_named_directory_binding(target_prebinding)
             active_before = service_prestate.active
             cutover_started = True
+            cutover_started_at = time.monotonic()
             _stop_for_cutover(service_prestate.cutover_scope)
             _assert_named_directory_binding(target_prebinding)
             quiesced_backup, quiesced_guard = _create_stopped_data_backup(
@@ -6705,7 +6802,11 @@ def perform_update(
             if quarantine is not None:
                 print(f"[OK] Alter Updatezustand archiviert: {quarantine}", flush=True)
             _confirm_cutover_quiet(service_prestate.cutover_scope)
-            print("[3/4] Ersetze Produktdateien und repariere Rechte …", flush=True)
+            print(
+                "[3/4] Produktdateien und Rechte werden aktualisiert; die Anlage "
+                "bleibt kurz unterbrochen …",
+                flush=True,
+            )
             product_mutated = True
             target_binding = _replace_product_tree(
                 target_root,
@@ -6804,6 +6905,12 @@ def perform_update(
                 )
             )
             replacement_confirmed = True
+            services_confirmed_at = time.monotonic()
+            print(
+                "[STATUS] Regelung und Weboberfläche laufen wieder. "
+                "Abschlussbereinigung läuft.",
+                flush=True,
+            )
             warnings.extend(
                 _postflight_python_programming_warnings(
                     (*services, *required),
@@ -6929,6 +7036,14 @@ def perform_update(
     print("\n[OK] Update abgeschlossen.")
     print(f"Version: {tag.removeprefix('v')}")
     print(f"Backup: {backup_path}")
+    total_seconds = max(0, round(time.monotonic() - update_started_at))
+    print(f"Gesamtdauer: {total_seconds // 60} min {total_seconds % 60} s")
+    if cutover_started_at is not None and services_confirmed_at is not None:
+        cutover_seconds = max(0, round(services_confirmed_at - cutover_started_at))
+        print(
+            "Kontrollierte Anlagenunterbrechung: "
+            f"{cutover_seconds // 60} min {cutover_seconds % 60} s"
+        )
     for warning in warnings:
         print(f"[WARNUNG] {warning}")
     return 0

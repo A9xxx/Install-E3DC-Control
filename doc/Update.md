@@ -5,11 +5,20 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.4.4f`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.4.4g`. Das Dashboard startet ausschließlich
 den argumentlosen, root-eigenen Systemjob. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
+
+5.4.4g reduziert redundante I/O im weiterhin vollständig verifizierten
+Backup- und Umschaltpfad. Die Oberfläche weist Sicherung, kurze kontrollierte
+Unterbrechung, Dateiaustausch/Rechte und Wiederanlauf getrennt aus, toleriert
+die erwartbare Apache-Unterbrechung beim Update und zeigt genau einen
+abschließenden Erfolgsstatus. Nach dem bestätigten Wiederanlauf werden die
+Grenzen von drei verifizierten System-Backup-Familien und drei Web-Sicherungen
+erneut angewendet; unbekannte oder nicht verifizierbare Bestände werden nicht
+gelöscht und eindeutig benannt.
 
 ## Normales Update
 

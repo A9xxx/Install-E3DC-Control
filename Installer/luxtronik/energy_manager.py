@@ -56,6 +56,12 @@ try:
         read_bound_json_value,
         read_runtime_live_snapshot,
     )
+    from Installer.Wallbox.soc_tracker import (
+        CONFIRMED_MANUAL_SOC_SOURCES,
+        vehicle_soc_age_contract,
+        vehicle_soc_max_age_s,
+        vehicle_soc_source_contract,
+    )
 except ModuleNotFoundError:
     _INSTALLER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _INSTALLER_DIR not in sys.path:
@@ -69,6 +75,12 @@ except ModuleNotFoundError:
     )
     from heat_actuator_safety import default_heat_actuator_gate
     from live_snapshot import read_bound_json_value, read_runtime_live_snapshot
+    from Wallbox.soc_tracker import (
+        CONFIRMED_MANUAL_SOC_SOURCES,
+        vehicle_soc_age_contract,
+        vehicle_soc_max_age_s,
+        vehicle_soc_source_contract,
+    )
 
 try:
     from tariff_schedule import (
@@ -1517,6 +1529,10 @@ VEHICLES_JSON_FILE = "/var/www/html/ramdisk/vehicles.json"
 WS_JSON_FILE = "/var/www/html/ramdisk/waermepumpe.json"
 FORCE_FLAG_FILE = "/var/www/html/ramdisk/force_bluelink.flag"
 V4_CONFIG_PATH = "/var/www/html/data/e3dc_v4.json"
+LEGACY_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "e3dc.config.txt",
+)
 STORAGE_PLAN_PATH = "/var/www/html/ramdisk/storage_plan.json"
 PRICE_BOOST_PLAN_PATH = "/var/www/html/ramdisk/price_boost_plan.json"
 PRICE_BOOST_PLAN_MAX_AGE_S = 45 * 60
@@ -1697,6 +1713,14 @@ def _safe_float(value, default=0.0):
 
 def _safe_int(value, default=0):
     return int(round(_safe_float(value, default)))
+
+
+def _single_vehicle_fallback(vehicles):
+    """Verhindert eine willkürliche vehicles[0]-Bindung bei mehreren Autos."""
+
+    if not isinstance(vehicles, list) or len(vehicles) != 1:
+        return None
+    return vehicles[0] if isinstance(vehicles[0], dict) else None
 
 
 def _strict_storage_budget_ts(value):
@@ -6852,6 +6876,7 @@ CAR_SESSION_SEMANTIC_KEYS = (
     "start_kwh",
     "last_car_ts",
     "last_manual_ts",
+    "soc_source_ts",
     "car_id",
     "car_capacity",
     "is_manual",
@@ -6957,6 +6982,33 @@ def load_car_session_state(wb_idx, paths=None, now_ts=None):
         except Exception:
             continue
     return {}, ""
+
+
+def discard_invalid_car_session_state(
+    paths,
+    *,
+    wb_idx=None,
+    checkpoint_runtime=None,
+    latest_sessions=None,
+):
+    """Entfernt einen ungültigen Altanker samt persistenten Wiederladepfaden."""
+
+    candidates = paths if isinstance(paths, dict) else {}
+    for path in {
+        str(candidates.get(key) or "")
+        for key in ("live", "checkpoint", "legacy")
+    }:
+        if not path:
+            continue
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+    if isinstance(checkpoint_runtime, dict):
+        checkpoint_runtime.clear()
+    if isinstance(latest_sessions, dict) and wb_idx is not None:
+        latest_sessions.pop(int(wb_idx), None)
 
 
 def persist_car_session_checkpoint(
@@ -9222,19 +9274,331 @@ def main():
                         all_vehicles = v_data.get('vehicles', [])
             except: pass
 
-            def soc_source_rule_confirmed(source, rule_confirmed=None):
-                if rule_confirmed is True or rule_confirmed == 1 or str(rule_confirmed).lower() == 'true':
+            _cloud_interval_bound = 'bluelink_interval' in current_config
+            _cloud_interval_raw = current_config.get('bluelink_interval', 15)
+            if (not _cloud_interval_bound
+                and isinstance(current_config.get('config'), dict)
+                and 'bluelink_interval' in current_config['config']):
+                _cloud_interval_raw = current_config['config']['bluelink_interval']
+                _cloud_interval_bound = True
+            if not _cloud_interval_bound and os.path.isfile(LEGACY_CONFIG_PATH):
+                try:
+                    with open(
+                        LEGACY_CONFIG_PATH,
+                        'r',
+                        encoding='utf-8',
+                        errors='ignore',
+                    ) as _legacy_config:
+                        for _legacy_line in _legacy_config:
+                            if '=' not in _legacy_line or _legacy_line.lstrip().startswith('#'):
+                                continue
+                            _legacy_key, _legacy_value = _legacy_line.split('=', 1)
+                            if _legacy_key.strip().lower() == 'bluelink_interval':
+                                _cloud_interval_raw = _legacy_value.strip()
+                                break
+                except OSError:
+                    pass
+            _soc_age_config = dict(current_config)
+            _soc_age_config['bluelink_interval'] = _cloud_interval_raw
+            cloud_soc_freshness_s = vehicle_soc_max_age_s(
+                'bluelink',
+                _soc_age_config,
+            )
+
+            def soc_timestamp(value):
+                if value in (None, ''):
+                    return 0.0
+                if isinstance(value, bool):
+                    return 0.0
+                try:
+                    parsed = float(value)
+                    if parsed > 100000000000.0:
+                        parsed /= 1000.0
+                    return parsed if math.isfinite(parsed) and parsed > 0.0 else 0.0
+                except (TypeError, ValueError):
+                    try:
+                        return datetime.fromisoformat(
+                            str(value).replace('Z', '+00:00')
+                        ).timestamp()
+                    except (TypeError, ValueError):
+                        return 0.0
+
+            def soc_source_uses_openwb_pro_anchor(source):
+                contract = vehicle_soc_source_contract(source)
+                return bool(
+                    contract
+                    and contract['base_source'] in (
+                        'openwb_pro_raw', 'openwb_pro_estimated',
+                    )
+                )
+
+            def soc_source_is_cloud(source):
+                contract = vehicle_soc_source_contract(source)
+                return bool(contract and contract['kind'] == 'cloud')
+
+            def soc_source_is_untrusted(source):
+                return vehicle_soc_source_contract(source) is None
+
+            def soc_source_is_mqtt(source):
+                contract = vehicle_soc_source_contract(source)
+                return bool(contract and contract['base_source'] in ('mqtt', 'openwb_mqtt'))
+
+            def soc_contract_flag_active(value):
+                if value is True:
                     return True
-                text = str(source or '').strip().lower()
-                if not text or text in ['simple_view_start_soc', 'config_start_soc', 'configured_wallbox']:
+                if isinstance(value, bool) or value is None:
                     return False
-                if text.startswith('wallbox_estimated_from_'):
-                    return soc_source_rule_confirmed(text[len('wallbox_estimated_from_'):], None)
-                if text.startswith('wallbox_estimated'):
+                if isinstance(value, (int, float)):
+                    numeric = float(value)
+                    return math.isfinite(numeric) and numeric == 1.0
+                return str(value).strip().lower() in (
+                    '1', 'true', 'yes', 'ja', 'on', 'active',
+                    'stale', 'expired', 'invalid', 'degraded',
+                )
+
+            def soc_percent_value(value):
+                if isinstance(value, bool) or value in (None, ''):
+                    return None
+                try:
+                    normalized = float(value)
+                except (TypeError, ValueError):
+                    return None
+                if (
+                    not math.isfinite(normalized)
+                    or normalized < 0.0
+                    or normalized > 100.0
+                ):
+                    return None
+                return normalized
+
+            def soc_record_source_ts(record):
+                item = record if isinstance(record, dict) else {}
+                source = str(
+                    item.get('soc_source', item.get('source', ''))
+                ).strip().lower()
+                if soc_source_is_untrusted(source):
+                    return 0.0
+                if 'soc_source_ts' in item:
+                    source_ts = soc_timestamp(item.get('soc_source_ts'))
+                    if source_ts > 0.0:
+                        return source_ts
+                    raw_ts = soc_timestamp(item.get('raw_soc_ts'))
+                    return raw_ts if raw_ts > 0.0 else 0.0
+                raw_ts = soc_timestamp(item.get('raw_soc_ts'))
+                if raw_ts > 0.0:
+                    return raw_ts
+                # Ausschließlich bekannte manuelle Nutzeraktionen dürfen den
+                # historischen Aktionszeitpunkt aus ``ts`` übernehmen. Ein
+                # Maschinen-Heartbeat ist kein SoC-Quellanker.
+                if source in CONFIRMED_MANUAL_SOC_SOURCES:
+                    return soc_timestamp(item.get('ts'))
+                return 0.0
+
+            def soc_source_rule_confirmed(
+                source,
+                rule_confirmed=None,
+                source_ts=None,
+                now_ts=None,
+                derived_context=False,
+            ):
+                contract = vehicle_soc_source_contract(source)
+                if contract is None:
                     return False
-                if text in ['manual_start_soc', 'manual_soc', 'manual', 'openwb_profile_link', 'openwb_pro_raw', 'openwb_pro_estimated']:
+                exact_true = rule_confirmed is True
+                explicit = None if rule_confirmed is None else exact_true
+                if explicit is False:
+                    return False
+                manual_direct = bool(
+                    not contract['derived']
+                    and contract['base_source'] in CONFIRMED_MANUAL_SOC_SOURCES
+                )
+                # Jede Maschinenquelle bleibt auch in einer abgeleiteten
+                # Session nur mit dem exakt typisierten Producer-Vertrag
+                # regelwirksam. ``"true"``, ``1`` oder ein fehlendes Feld
+                # dürfen dabei nie nachträglich aufgewertet werden.
+                if not manual_direct and not exact_true:
+                    return False
+                anchor_ts = soc_timestamp(source_ts)
+                now_value = time.time() if now_ts is None else float(now_ts)
+                max_age_s = vehicle_soc_max_age_s(source, _soc_age_config)
+                return bool(
+                    anchor_ts > 0.0
+                    and anchor_ts <= now_value + 300.0
+                    and max_age_s > 0.0
+                    and now_value - anchor_ts <= max_age_s
+                )
+
+            def soc_record_rule_contract(record, source):
+                item = record if isinstance(record, dict) else {}
+                source_text = str(source or '').strip().lower()
+                return bool(
+                    item.get('soc_rule_confirmed') is True
+                    or (
+                        source_text in CONFIRMED_MANUAL_SOC_SOURCES
+                        and 'soc_rule_confirmed' not in item
+                    )
+                )
+
+            def soc_record_vetoed(record):
+                item = record if isinstance(record, dict) else {}
+                if any(
+                    soc_contract_flag_active(item.get(key))
+                    for key in (
+                        'soc_stale', 'car_soc_stale', 'stale',
+                        'estimate_expired', 'soc_expired', 'car_soc_expired',
+                        'expired', 'soc_profile_binding_invalid',
+                        'car_soc_profile_binding_invalid',
+                        'profile_binding_invalid', 'driver_status_stale',
+                        'driver_status_degraded',
+                    )
+                ):
                     return True
-                return any(token in text for token in ['mqtt', 'bluelink', 'wallbox', 'openwb', 'vehicle', 'car_soc', 'hyundai', 'kia'])
+
+                def field_true(value):
+                    if value is True:
+                        return True
+                    if isinstance(value, bool) or value is None:
+                        return False
+                    if isinstance(value, (int, float)):
+                        numeric = float(value)
+                        return math.isfinite(numeric) and numeric == 1.0
+                    return str(value).strip().lower() in (
+                        '1', 'true', 'yes', 'ja', 'on',
+                    )
+
+                return any(
+                    key in item and not field_true(item.get(key))
+                    for key in (
+                        'driver_status_valid', 'soc_profile_bound',
+                        'car_soc_profile_bound', 'plug_state', 'plugged',
+                        'is_plugged_in',
+                    )
+                )
+
+            def soc_record_binding_valid(
+                record,
+                wb_idx=None,
+                car_id='',
+                require_plugged=False,
+                expected_vehicle=None,
+                allow_legacy_missing_slot=False,
+            ):
+                item = record if isinstance(record, dict) else {}
+                if not item:
+                    return False
+                if require_plugged:
+                    plugged = (
+                        item.get('is_plugged_in')
+                        if 'is_plugged_in' in item
+                        else item.get('plugged')
+                    )
+                    if plugged is not True:
+                        return False
+                if wb_idx is not None:
+                    slot_key = (
+                        'wb_slot' if 'wb_slot' in item
+                        else 'wb' if 'wb' in item
+                        else ''
+                    )
+                    if not slot_key or item.get(slot_key) in (None, ''):
+                        if not allow_legacy_missing_slot:
+                            return False
+                    else:
+                        raw_slot = item.get(slot_key)
+                        if isinstance(raw_slot, bool):
+                            return False
+                        try:
+                            slot = int(raw_slot)
+                            if slot <= 0:
+                                if not (allow_legacy_missing_slot and slot == 0):
+                                    return False
+                            elif slot != int(wb_idx):
+                                return False
+                        except (TypeError, ValueError):
+                            return False
+
+                def compact(value):
+                    return ''.join(
+                        char for char in str(value or '').strip().lower()
+                        if char.isalnum()
+                    )
+
+                expected_aliases = {compact(car_id)} if compact(car_id) else set()
+                if isinstance(expected_vehicle, dict):
+                    expected_aliases.update(
+                        compact(expected_vehicle.get(key))
+                        for key in (
+                            'id', 'profile_id', 'car_id', 'vehicle_id',
+                            'cloud_vehicle_id', 'rfid_tag',
+                        )
+                        if compact(expected_vehicle.get(key))
+                    )
+                if expected_aliases:
+                    record_aliases = {
+                        compact(item.get(key))
+                        for key in (
+                            'id', 'profile_id', 'car_id', 'vehicle_id',
+                            'cloud_vehicle_id', 'rfid_tag',
+                        )
+                        if compact(item.get(key))
+                    }
+                    if not record_aliases.intersection(expected_aliases):
+                        return False
+                return True
+
+            def soc_session_anchor(
+                record,
+                wb_idx=None,
+                car_id='',
+                allow_legacy_missing_slot=False,
+            ):
+                item = record if isinstance(record, dict) else {}
+                source = item.get('soc_source', '')
+                start_soc = soc_percent_value(item.get('start_soc'))
+                source_ts = soc_timestamp(item.get('soc_source_ts'))
+                if source_ts <= 0.0:
+                    source_ts = soc_timestamp(
+                        item.get('last_manual_ts')
+                        if item.get('is_manual')
+                        else item.get('last_car_ts')
+                    )
+                if (
+                    start_soc is None
+                    or soc_record_vetoed(item)
+                    or not soc_record_binding_valid(
+                        item,
+                        wb_idx,
+                        car_id,
+                        require_plugged=False,
+                        allow_legacy_missing_slot=allow_legacy_missing_slot,
+                    )
+                    or not soc_record_rule_contract(item, source)
+                    or not soc_source_rule_confirmed(
+                        source,
+                        item.get('soc_rule_confirmed'),
+                        source_ts,
+                        derived_context=True,
+                    )
+                ):
+                    return None
+                return start_soc, source_ts
+
+            def configured_vehicle_binding_unique(wb_idx, car_id):
+                def compact(value):
+                    return ''.join(
+                        char for char in str(value or '').strip().lower()
+                        if char.isalnum()
+                    )
+
+                selected = compact(car_id)
+                if not selected:
+                    return False
+                assignments = [compact(wb1_car_id), compact(wb2_car_id)]
+                try:
+                    current = assignments[int(wb_idx) - 1]
+                except (IndexError, TypeError, ValueError):
+                    return False
+                return current == selected and assignments.count(selected) == 1
 
             def process_car_session(wb_idx, car_id, session_kwh, is_locked, wb_power_w):
                 session_files = car_session_paths(wb_idx)
@@ -9257,22 +9621,36 @@ def main():
                 if not car_id or car_id == '': return None
 
                 target_v = next((v for v in all_vehicles if v.get('id') == car_id), None)
-                if not target_v and car_id == 'car1' and all_vehicles: target_v = all_vehicles[0]
-                soc_raw = target_v.get('soc', 0) if target_v else None
-                try:
-                    car_soc = float(soc_raw) if soc_raw not in [None, ''] else 0.0
-                except ValueError:
-                    car_soc = 0.0
+                if not target_v and car_id == 'car1':
+                    target_v = _single_vehicle_fallback(all_vehicles)
+                soc_raw = target_v.get('soc') if target_v else None
+                car_soc = soc_percent_value(soc_raw)
                 if not target_v:
                     car_soc = None
-                car_ts = target_v.get('last_updated_at', 0) if target_v else 0
+                car_ts = soc_timestamp(
+                    target_v.get('soc_source_ts')
+                    if isinstance(target_v, dict) else None
+                )
                 car_soc_confirmed = bool(
                     target_v
                     and car_soc is not None
-                    and car_soc > 0
+                    and target_v.get('soc_rule_confirmed') is True
+                    and 'soc_source_ts' in target_v
+                    and not soc_record_vetoed(target_v)
+                    and soc_record_binding_valid(
+                        target_v,
+                        wb_idx,
+                        car_id,
+                        require_plugged=True,
+                        expected_vehicle=target_v,
+                        allow_legacy_missing_slot=(
+                            configured_vehicle_binding_unique(wb_idx, car_id)
+                        ),
+                    )
                     and soc_source_rule_confirmed(
-                        target_v.get('soc_source', target_v.get('source', 'vehicle_soc')),
-                        target_v.get('soc_rule_confirmed')
+                        target_v.get('soc_source', target_v.get('source', '')),
+                        target_v.get('soc_rule_confirmed'),
+                        car_ts,
                     )
                 )
                 if not car_soc_confirmed:
@@ -9284,21 +9662,68 @@ def main():
                     try:
                         with open(manual_soc_file, "r") as f: manual_data = json.load(f)
                     except: pass
+                manual_source = str(
+                    (manual_data or {}).get('source', '')
+                ).strip()
+                manual_user_source = (
+                    manual_source.lower() in CONFIRMED_MANUAL_SOC_SOURCES
+                )
+                manual_soc_raw = (manual_data or {}).get('soc')
+                manual_soc = soc_percent_value(manual_soc_raw)
+                manual_source_ts = soc_record_source_ts(manual_data)
                 manual_soc_confirmed = bool(
                     manual_data
+                    and manual_soc is not None
+                    and soc_record_rule_contract(manual_data, manual_source)
+                    and not soc_record_vetoed(manual_data)
+                    and soc_record_binding_valid(
+                        manual_data,
+                        wb_idx,
+                        car_id,
+                        require_plugged=True,
+                        expected_vehicle=target_v,
+                        # manual_soc_wbX.json ist über den Dateipfad bereits
+                        # eindeutig an diese Wallbox gebunden.
+                        allow_legacy_missing_slot=True,
+                    )
                     and soc_source_rule_confirmed(
-                        manual_data.get('source', 'manual_start_soc'),
-                        manual_data.get('soc_rule_confirmed')
+                        manual_source,
+                        manual_data.get('soc_rule_confirmed'),
+                        manual_source_ts,
                     )
                 )
 
                 sess, _session_source = load_car_session_state(wb_idx, session_files)
                 if manual_data and not manual_soc_confirmed and sess.get('is_manual'):
-                    try:
-                        os.remove(session_file)
-                    except Exception:
-                        pass
-                    return None
+                    discard_invalid_car_session_state(
+                        session_files,
+                        wb_idx=wb_idx,
+                        checkpoint_runtime=(
+                            car_session_checkpoint_runtime.setdefault(
+                                int(wb_idx),
+                                {},
+                            )
+                        ),
+                        latest_sessions=latest_car_sessions,
+                    )
+                    sess = {}
+                    if not car_soc_confirmed:
+                        return None
+
+                if sess:
+                    stored_anchor = soc_session_anchor(
+                        sess,
+                        wb_idx=wb_idx,
+                        car_id=car_id,
+                        # Sessiondateien sind per WB getrennt. Ein vorhandenes
+                        # Feld muss dennoch exakt passen.
+                        allow_legacy_missing_slot=True,
+                    )
+                    if stored_anchor is not None:
+                        sess['start_soc'], sess['soc_source_ts'] = stored_anchor
+                        sess['soc_rule_confirmed'] = True
+                    else:
+                        sess = {}
 
                 try:
                     session_kwh = round(float(session_kwh), 2)
@@ -9313,17 +9738,20 @@ def main():
                 else:
                     sess['last_valid_session_kwh'] = session_kwh
 
-                manual_ts = manual_data.get('ts', 0) if manual_soc_confirmed else 0
+                manual_ts = manual_source_ts if manual_soc_confirmed else 0
                 if manual_ts > sess.get('last_manual_ts', 0):
                     sess = {
-                        'start_soc': manual_data.get('soc', 0),
+                        'wb': wb_idx,
+                        'car_id': car_id,
+                        'start_soc': manual_soc,
                         'start_kwh': session_kwh or 0,
                         'last_car_ts': car_ts,
                         'last_manual_ts': manual_ts,
                         'car_name': manual_data.get('name', ''),
                         'car_capacity': manual_data.get('capacity', 0.0),
                         'is_manual': True,
-                        'soc_source': manual_data.get('source', 'manual_start_soc'),
+                        'soc_source': manual_source,
+                        'soc_source_ts': manual_source_ts,
                         'soc_rule_confirmed': True,
                         'last_valid_session_kwh': session_kwh or 0
                     }
@@ -9336,12 +9764,25 @@ def main():
                     sess['start_kwh'] = session_kwh or 0
                     sess['last_car_ts'] = car_ts
                     sess['is_manual'] = False
-                    sess['soc_source'] = (target_v or {}).get('soc_source', (target_v or {}).get('source', 'vehicle_soc'))
+                    sess['soc_source'] = (target_v or {}).get(
+                        'soc_source',
+                        (target_v or {}).get('source', ''),
+                    )
+                    sess['soc_source_ts'] = car_ts
                     sess['soc_rule_confirmed'] = True
                     sess['last_valid_session_kwh'] = session_kwh or 0
 
                 added_kwh = max(0, (session_kwh or 0) - sess.get('start_kwh', 0))
                 net_added_kwh = added_kwh * 0.92
+
+                if net_added_kwh > 0.02:
+                    raw_session_source = str(sess.get('soc_source', '')).strip().lower()
+                    if not raw_session_source.startswith('wallbox_estimated_from_'):
+                        raw_contract = vehicle_soc_source_contract(raw_session_source)
+                        if raw_contract is not None:
+                            sess['soc_source'] = (
+                                'wallbox_estimated_from_' + raw_contract['base_source']
+                            )
 
                 conf_cap = get_cfg_value(current_config, f'wb{wb_idx}_capacity', CAR_CAPACITY)
                 if sess.get('car_capacity', 0) > 0: cap = sess['car_capacity']
@@ -9354,8 +9795,32 @@ def main():
                 if car_soc is not None and current_soc < car_soc and not sess.get('is_manual'): current_soc = car_soc
 
                 sess['current_virtual_soc'] = round(current_soc, 2)
+                sess['wb'] = wb_idx
                 sess['car_id'] = car_id
                 sess['car_capacity'] = cap
+                session_source_ts = soc_timestamp(sess.get('soc_source_ts'))
+                if session_source_ts <= 0.0:
+                    session_source_ts = soc_timestamp(
+                        sess.get('last_manual_ts')
+                        if sess.get('is_manual')
+                        else sess.get('last_car_ts')
+                    )
+                sess['soc_source_ts'] = session_source_ts or None
+                sess['soc_rule_confirmed'] = soc_source_rule_confirmed(
+                    sess.get('soc_source', ''),
+                    sess.get('soc_rule_confirmed'),
+                    session_source_ts,
+                    derived_context=True,
+                )
+                session_age_contract = vehicle_soc_age_contract(
+                    sess.get('soc_source', ''),
+                    _soc_age_config,
+                )
+                if session_age_contract is None:
+                    return None
+                sess['soc_age_contract'] = session_age_contract['schema_version']
+                sess['soc_age_contract_source'] = session_age_contract['source']
+                sess['soc_max_age_s'] = session_age_contract['max_age_s']
                 sess['ts'] = time.time()
 
                 target_soc = float(get_cfg_value(current_config, f'wb{wb_idx}_target_soc', CAR_TARGET_SOC))
@@ -9386,7 +9851,57 @@ def main():
             processed_wb2 = process_car_session(2, wb2_car_id, wb2_session_kwh, wb2_locked, abs(e3dc.get('wb2', 0)))
 
             primary_sess = processed_wb1 or processed_wb2
-            car_soc = primary_sess['current_virtual_soc'] if primary_sess else (all_vehicles[0].get('soc') if all_vehicles else None)
+            primary_sess_usable = bool(
+                primary_sess
+                and primary_sess.get('soc_rule_confirmed') is True
+            )
+            fallback_vehicle = _single_vehicle_fallback(all_vehicles)
+            fallback_wb_idx = (
+                1 if wb1_locked and not wb2_locked
+                else 2 if wb2_locked and not wb1_locked
+                else None
+            )
+            fallback_vehicle_ts = soc_timestamp(
+                fallback_vehicle.get('soc_source_ts')
+                if isinstance(fallback_vehicle, dict) else None
+            )
+            fallback_vehicle_soc = soc_percent_value(
+                fallback_vehicle.get('soc')
+                if isinstance(fallback_vehicle, dict) else None
+            )
+            fallback_vehicle_usable = bool(
+                fallback_vehicle
+                and fallback_vehicle_soc is not None
+                and fallback_vehicle.get('soc_rule_confirmed') is True
+                and 'soc_source_ts' in fallback_vehicle
+                and fallback_wb_idx is not None
+                and not soc_record_vetoed(fallback_vehicle)
+                and soc_record_binding_valid(
+                    fallback_vehicle,
+                    fallback_wb_idx,
+                    fallback_vehicle.get('id', ''),
+                    require_plugged=True,
+                    expected_vehicle=fallback_vehicle,
+                    # Genau ein Fahrzeug und genau eine verriegelte Wallbox
+                    # bilden den einzigen slotlosen Legacy-Fallback.
+                    allow_legacy_missing_slot=True,
+                )
+                and soc_source_rule_confirmed(
+                    fallback_vehicle.get(
+                        'soc_source',
+                        fallback_vehicle.get('source', ''),
+                    ),
+                    fallback_vehicle.get('soc_rule_confirmed'),
+                    fallback_vehicle_ts,
+                )
+            )
+            car_soc = (
+                primary_sess['current_virtual_soc']
+                if primary_sess_usable
+                else fallback_vehicle_soc
+                if fallback_vehicle_usable
+                else None
+            )
 
             car_needs_energy = True
             if car_soc is not None:
@@ -9503,8 +10018,15 @@ def main():
                         # Gast-Auto Erkennung (WB belegt aber Cloud meldet abgesteckt)
                         # Hinweis: Wir prüfen hier nur das primäre Fahrzeug (wb1) für die Einfachheit
                         if wb1_locked and all_vehicles:
-                            target_v = next((v for v in all_vehicles if v.get('id') == wb1_car_id), all_vehicles[0])
-                            if not target_v.get('is_plugged_in', True) and (time.time() - last_wakeup_trigger_time) > 60:
+                            target_v = next(
+                                (v for v in all_vehicles if v.get('id') == wb1_car_id),
+                                None,
+                            )
+                            if target_v is None and wb1_car_id == 'car1':
+                                target_v = _single_vehicle_fallback(all_vehicles)
+                            if (target_v is not None
+                                and not target_v.get('is_plugged_in', True)
+                                and (time.time() - last_wakeup_trigger_time) > 60):
                                 # Wenn nach Wakeup immer noch abgesteckt gemeldet wird -> Gast
                                 if not guest_car_active:
                                     logger.info("Gast-Auto an WB1 erkannt (Cloud meldet 'abgesteckt').")

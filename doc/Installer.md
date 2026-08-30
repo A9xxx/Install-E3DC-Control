@@ -1,12 +1,12 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.4.4f
+Dokumentation Stand: 5.4.4g
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
 Installationspfad und Python-Umgebung aus dem geprüften Installationskontext.
 
-Der Installer-Anteil von 5.4.4f führt Backup, kurze Umschaltphase,
+Der Installer-Anteil von 5.4.4g führt Backup, kurze Umschaltphase,
 Releaseprojektion, Reparatur bekannter Rechte und Dienstneustart vollständig im
 heruntergeladenen Ziel-Updater aus. Das Nutzer-`.git`, lokale
 Produktänderungen, fehlende Produktdateien und historische Rechte sind keine
@@ -24,13 +24,13 @@ Commit ab. Eine neue Ziel-Pythonumgebung sowie optionale Abhängigkeiten werden
 vor dem einmaligen Dienststopp vorbereitet; fremde System-Python-Pakete sind
 keine Updatebedingung.
 
-5.4.4f stellt nach der Releaseprojektion für eine beibehaltene
+5.4.4g stellt nach der Releaseprojektion für eine beibehaltene
 `external_pv_topology.json` den Installationsnutzer, die Webgruppe und den
 gemeinsamen Lesemodus `0664` wieder her. Die übrigen Konfigurations- und
 Geheimnisdateien behalten ihre strengeren Rechteverträge.
 
 Der private Downloadbereich bleibt root-eigen mit `0700`/`0600`. Beim
-Dateiaustausch veröffentlicht 5.4.4f den Live-Produktbaum dagegen mit einem
+Dateiaustausch veröffentlicht 5.4.4g den Live-Produktbaum dagegen mit einem
 expliziten Vertrag aus Installationsnutzer, Webgruppe, Verzeichnissen `0755`,
 normalen Dateien `0644` und Startskripten mit Interpreterzeile `0755`.
 Anschließend müssen die PHP-Pfadauflösung und die Installer-Importkette als `www-data` den exakt

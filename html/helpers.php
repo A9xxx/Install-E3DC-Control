@@ -8,6 +8,7 @@ if (PHP_SAPI !== 'cli' && session_status() === PHP_SESSION_NONE) {
 }
 
 date_default_timezone_set('Europe/Berlin');
+require_once __DIR__ . '/retention.php';
 
 if (!defined('WEB_AUTH_FAILURE_LIMIT')) {
     define('WEB_AUTH_FAILURE_LIMIT', 5);
@@ -89,6 +90,138 @@ function e3dcLiveMeasurementAgeSeconds($timestamp, $nowTs) {
  */
 function e3dcLiveMeasurementConfirmed($reportedValid, $online) {
     return $reportedValid === true && $online === true;
+}
+
+/** Löst ausschließlich bekannte Fahrzeug-SoC-Quellen exakt auf. */
+function e3dcVehicleSocSourceContract($source) {
+    $source = strtolower(trim((string)$source));
+    if ($source === ''
+        || in_array($source, [
+            'simple_view_start_soc', 'config_start_soc', 'configured_wallbox',
+        ], true)
+        || strpos($source, 'retained') !== false
+        || strpos($source, 'legacy') !== false
+        || strpos($source, 'unknown') !== false
+        || strpos($source, 'cached') !== false
+        || strpos($source, 'expired') !== false
+        || strpos($source, 'invalid') !== false) {
+        return null;
+    }
+
+    $derivedPrefix = 'wallbox_estimated_from_';
+    $derived = strpos($source, $derivedPrefix) === 0;
+    $baseSource = $derived ? substr($source, strlen($derivedPrefix)) : $source;
+    if ($baseSource === '' || strpos($baseSource, $derivedPrefix) === 0
+        || (strpos($source, 'wallbox_estimated') === 0 && !$derived)) {
+        return null;
+    }
+
+    $manual = [
+        'manual_start_soc', 'manual_soc', 'manual', 'openwb_profile_link',
+    ];
+    $cloud = ['bluelink', 'hyundai', 'kia', 'cloud', 'vehicle_cloud'];
+    $machine = [
+        'mqtt', 'openwb_mqtt', 'openwb_http',
+        'openwb_pro_raw', 'openwb_pro_estimated',
+    ];
+    if (!in_array($baseSource, array_merge($manual, $cloud, $machine), true)) {
+        return null;
+    }
+
+    $kind = $derived
+        ? 'estimated'
+        : (in_array($baseSource, $manual, true)
+            ? 'manual'
+            : (in_array($baseSource, $cloud, true)
+                ? 'cloud'
+                : (in_array($baseSource, ['mqtt', 'openwb_mqtt'], true)
+                    ? 'mqtt'
+                    : 'wallbox')));
+    return [
+        'source' => $source,
+        'base_source' => $baseSource,
+        'kind' => $kind,
+        'derived' => $derived,
+        'max_age_class' => $derived
+            ? 'machine'
+            : (in_array($baseSource, $manual, true)
+                ? 'manual'
+                : (in_array($baseSource, $cloud, true) ? 'cloud' : 'machine')),
+    ];
+}
+
+function e3dcVehicleSocCanonicalMaxAgeSeconds($source, $cloudFreshnessS = 900) {
+    $contract = e3dcVehicleSocSourceContract($source);
+    if (!is_array($contract)) return null;
+    if ($contract['max_age_class'] === 'manual') return 36 * 3600;
+    if ($contract['max_age_class'] !== 'cloud') return 8 * 3600;
+    $cloudFreshnessS = is_numeric($cloudFreshnessS)
+        ? (int)round((float)$cloudFreshnessS)
+        : 900;
+    return max(900, min(8 * 3600, $cloudFreshnessS));
+}
+
+function e3dcVehicleSocCloudFreshnessSeconds($config = []) {
+    $config = is_array($config) ? $config : [];
+    $intervalMin = $config['bluelink_interval'] ?? 15;
+    $intervalMin = is_numeric($intervalMin) ? max(5.0, (float)$intervalMin) : 15.0;
+    return (int)min(
+        8 * 3600,
+        max(15 * 60, round($intervalMin * 60.0) + 300)
+    );
+}
+
+function e3dcVehicleSocPayloadDeclaresAgeContract($payload) {
+    if (!is_array($payload)) return false;
+    foreach ([
+        'soc_age_contract', 'soc_age_contract_source', 'soc_max_age_s',
+        'car_soc_age_contract', 'car_soc_age_contract_source', 'car_soc_max_age_s',
+    ] as $key) {
+        if (array_key_exists($key, $payload)) return true;
+    }
+    return false;
+}
+
+/**
+ * Prüft den transportierten Altersvertrag gegen die kanonische Quellenklasse.
+ *
+ * Vollständig alte Datensätze ohne Vertragsfelder erhalten ausschließlich den
+ * lokal berechneten sicheren Deckel. Sobald ein Vertragsfeld vorhanden ist,
+ * müssen Schema, Quellenbindung und Wert vollständig und exakt passen.
+ */
+function e3dcVehicleSocPayloadMaxAgeSeconds($payload, $expectedSource, $cloudFreshnessS = 900) {
+    if (!is_array($payload)) return null;
+    $expected = strtolower(trim((string)$expectedSource));
+    $canonical = e3dcVehicleSocCanonicalMaxAgeSeconds($expected, $cloudFreshnessS);
+    if ($expected === '' || $canonical === null) return null;
+
+    if (!e3dcVehicleSocPayloadDeclaresAgeContract($payload)) {
+        return (float)$canonical;
+    }
+
+    $carFieldsPresent = array_key_exists('car_soc_age_contract', $payload)
+        || array_key_exists('car_soc_age_contract_source', $payload)
+        || array_key_exists('car_soc_max_age_s', $payload);
+    $prefix = $carFieldsPresent
+        ? 'car_soc'
+        : 'soc';
+    if (($payload[$prefix . '_age_contract'] ?? null) !== 'vehicle_soc_source_age_v1') {
+        return null;
+    }
+    $contractSource = strtolower(trim((string)(
+        $payload[$prefix . '_age_contract_source'] ?? ''
+    )));
+    if ($contractSource === '' || $contractSource !== $expected) return null;
+
+    $rawMaxAge = $payload[$prefix . '_max_age_s'] ?? null;
+    if ((!is_int($rawMaxAge) && !is_float($rawMaxAge)) || is_bool($rawMaxAge)) {
+        return null;
+    }
+    $maxAge = (float)$rawMaxAge;
+    if (!is_finite($maxAge) || $maxAge !== (float)$canonical) {
+        return null;
+    }
+    return $maxAge;
 }
 
 /**
@@ -3346,7 +3479,12 @@ function e3dcCreateConfirmedV4Backup($v4Path, $suffix = '', $options = []) {
     } catch (Throwable $error) {
         return ['success' => false, 'status' => 'backup_name_failed'];
     }
-    $name = 'e3dc_v4_' . date('Ymd_His')
+    $retentionClass = (($options['retention_class'] ?? 'automatic') === 'manual')
+        ? 'manual'
+        : 'automatic';
+    $name = 'e3dc_v4_'
+        . ($retentionClass === 'manual' ? 'manual_' : '')
+        . date('Ymd_His')
         . ($safeSuffix !== '' ? '_' . $safeSuffix : '')
         . '_' . $random . '.json';
     $target = rtrim($backupDir, '/') . '/' . $name;
@@ -3358,7 +3496,12 @@ function e3dcCreateConfirmedV4Backup($v4Path, $suffix = '', $options = []) {
     $publishOptions['target_must_be_absent'] = true;
     $publishOptions['require_json'] = true;
     $publishOptions['temporary_prefix'] = '.e3dc_backup.';
-    unset($publishOptions['cache_file'], $publishOptions['after_commit_hook']);
+    unset(
+        $publishOptions['cache_file'],
+        $publishOptions['after_commit_hook'],
+        $publishOptions['retention_class'],
+        $publishOptions['prune_limit']
+    );
     $published = e3dcPublishConfirmedAtomicFile($target, $preimage, $fileMode, $publishOptions);
     if (empty($published['success'])) {
         return [
@@ -3373,15 +3516,18 @@ function e3dcCreateConfirmedV4Backup($v4Path, $suffix = '', $options = []) {
     }
 
     $limit = max(1, (int)($options['prune_limit'] ?? 20));
-    $backups = glob(rtrim($backupDir, '/') . '/e3dc_v4_*.json') ?: [];
-    if (count($backups) > $limit) {
-        usort($backups, static fn($a, $b) => (@filemtime($a) ?: 0) <=> (@filemtime($b) ?: 0));
-        foreach (array_slice($backups, 0, count($backups) - $limit) as $old) @unlink($old);
+    $retention = e3dcPruneAutomaticConfigBackups($backupDir, $limit);
+    $retentionWarning = e3dcConfigRetentionWarning($retention);
+    if (is_string($retentionWarning) && $retentionWarning !== '') {
+        error_log('Backup-Hinweis: ' . $retentionWarning);
     }
     return [
         'success' => true,
         'status' => 'backup_confirmed',
         'path' => $target,
+        'retention_class' => $retentionClass,
+        'retention' => $retention,
+        'retention_warning' => $retentionWarning,
         'preimage_sha256' => hash('sha256', $preimage),
         'backup_sha256' => hash('sha256', $confirmed),
         'preimage' => $preimage,
@@ -3524,6 +3670,8 @@ function e3dcMutateV4ConfigDetailed(
         );
         $result = array_merge($mutation, $published, [
             'backup_path' => (string)$backup['path'],
+            'backup_retention' => $backup['retention'] ?? null,
+            'backup_retention_warning' => $backup['retention_warning'] ?? null,
         ]);
         unset($result['data']);
         if (!empty($result['success'])) e3dcInvalidateConfigRequestMemo();
@@ -5839,7 +5987,7 @@ function e3dcClassifySelfUpdateCompletion($running, $exitCode, $log) {
 
 function e3dcCommunityBootstrapReleaseTag() {
     // RELEASE_MARKER: Beim Versionssprung gemeinsam mit VERSION/Release Notes aktualisieren.
-    return 'v5.4.4f';
+    return 'v5.4.4g';
 }
 
 function e3dcCommunityBootstrapCommand() {
@@ -5928,18 +6076,6 @@ function handleRunSelfUpdate() {
         }
 
         $completion = e3dcClassifySelfUpdateCompletion($running, $exitCode, $log);
-        if ($completion === 'success' && $exitCode === null) {
-            // Kompatibilitätsbrücke für einen Lauf, den eine ältere Webdatei
-            // noch ohne Exitcode-Datei gestartet hat. Der zurückgegebene
-            // Marker wird auch von älteren bereits geladenen Browsern erkannt.
-            if (strpos($log, '[OK] Update abgeschlossen.') === false) {
-                $log .= "\n[OK] Update abgeschlossen.\n";
-                $installedVersion = readInstalledVersion();
-                if ($installedVersion !== '') {
-                    $log .= 'Version: ' . $installedVersion . "\n";
-                }
-            }
-        }
 
         $flags = 0;
         if (defined('JSON_INVALID_UTF8_SUBSTITUTE')) $flags |= JSON_INVALID_UTF8_SUBSTITUTE;
@@ -7405,7 +7541,23 @@ function renderUpdateModal($dialogClass = 'modal-lg modal-dialog-scrollable') {
                     <button type="button" class="btn-close e3dc-modal-close" data-bs-dismiss="modal" aria-label="Close" id="update-close-btn" style="display:none;"></button>
                 </div>
                 <div class="modal-body e3dc-log-body p-2">
-                    <pre id="update-log" class="e3dc-log-pre e3dc-log-terminal">Starte Update-Prozess...</pre>
+                    <div id="update-status-summary" class="alert alert-info mb-2" role="status" aria-live="polite">
+                        <div class="d-flex justify-content-between align-items-start gap-2">
+                            <div>
+                                <div id="update-status-title" class="fw-bold">Update wird vorbereitet</div>
+                                <div id="update-status-detail" class="small mt-1">Die Anlage arbeitet weiter.</div>
+                            </div>
+                            <span id="update-status-step" class="badge bg-info text-dark text-nowrap">Start</span>
+                        </div>
+                        <div class="progress mt-3" style="height: 8px;" aria-hidden="true">
+                            <div id="update-progress-bar" class="progress-bar progress-bar-striped progress-bar-animated" style="width: 5%;"></div>
+                        </div>
+                        <div id="update-status-elapsed" class="small text-body-secondary mt-2">Laufzeit: 0 min 00 s</div>
+                    </div>
+                    <details id="update-details" class="border border-secondary rounded p-2">
+                        <summary class="fw-semibold" style="cursor:pointer;">Technische Details</summary>
+                        <pre id="update-log" class="e3dc-log-pre e3dc-log-terminal mt-2 mb-0">Starte Update-Prozess...</pre>
+                    </details>
                 </div>
                 <div class="modal-footer border-secondary">
                     <button type="button" class="btn btn-secondary w-100" data-bs-dismiss="modal" id="update-finish-btn" disabled>Schließen</button>

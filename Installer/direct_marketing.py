@@ -3156,9 +3156,9 @@ def _policy_window_id(window):
         or window.get("window_id")
         or ""
     )
-    if explicit:
-        return explicit
     action = str(window.get("action") or "")
+    if explicit and action != "eco_plus_negative_headroom_hold":
+        return explicit
     start_ts = safe_int(window.get("start_ts"), 0)
     end_ts = safe_int(window.get("end_ts"), 0)
     if not action or start_ts <= 0 or end_ts <= start_ts:
@@ -9377,7 +9377,14 @@ def _group_windows(entries):
             / 1000.0,
             3,
         )
-        if not item.get("window_id"):
+        # Headroom ist ein Policyvertrag, kein Preisplateau. Seine
+        # `window_id` wird deshalb immer aus Aktion, Zeitgrenzen und Grund
+        # kanonisiert. `export_plateau_id` bleibt reine Marktprovenienz und
+        # darf die Policyidentität nicht ersetzen.
+        if (
+            item.get("action") == "eco_plus_negative_headroom_hold"
+            or not item.get("window_id")
+        ):
             item["window_id"] = _policy_window_id(item)
     return windows
 

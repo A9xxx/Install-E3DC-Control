@@ -4386,12 +4386,10 @@ def _headroom_projection_runtime_hold_contract(
 def _headroom_projection_policy_window_id(window: Dict[str, Any]) -> str:
     """Prüft die Producer-ID gegen das kanonische Headroom-Fenstermaterial."""
 
-    explicit = str(
-        window.get("export_plateau_id")
-        or window.get("market_window_id")
-        or window.get("window_id")
-        or ""
-    )
+    # Nur `window_id` ist die Policyidentität. Marktfenster- und
+    # Preisplateau-IDs bleiben Provenienz und werden hier absichtlich nicht
+    # als Legacy-Ersatz akzeptiert.
+    explicit = str(window.get("window_id") or "")
     action = str(window.get("action") or "")
     start_raw = window.get("start_ts")
     end_raw = window.get("end_ts")
@@ -5882,7 +5880,10 @@ def _materialize_direct_marketing_trajectory(
                 "plan_revision"
             ),
         }
-        if headroom_projection_bindings
+        if bool(
+            headroom_projection_state.get("present") is True
+            and headroom_projection_state.get("valid") is True
+        )
         else None
     )
     if not bool(
@@ -6351,6 +6352,7 @@ def _materialize_direct_marketing_trajectory(
                     if (
                         passive_binding is None
                         and not headroom_projection_bindings
+                        and standard_projection_binding_template is None
                     ):
                         base.update({
                             "complete": False,
@@ -7838,7 +7840,10 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                 "plan_revision"
             ),
         }
-        if headroom_projection_bindings
+        if bool(
+            headroom_projection_state.get("present") is True
+            and headroom_projection_state.get("valid") is True
+        )
         else None
     )
     if (

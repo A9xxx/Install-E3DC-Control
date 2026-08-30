@@ -33,6 +33,7 @@ STATE_STOPPING = "stopping"
 STATE_ENDED = "ended"
 
 CONTRACT_NAME = "openwb_pro_connect_php_level_state"
+MANAGER_WAKEUP_DISCONNECT_MAX_LAG_S = 30.0
 RELEASABLE_ZERO_ANCHOR_REASONS = frozenset({
     "openwb_pro_curve_direct_zero",
     "openwb_pro_curve_direct_main_zero",
@@ -1424,6 +1425,32 @@ def phase_target_readback_confirmed(
     return _phase_readback_confirmed(status, target)
 
 
+def start_offer_physics_confirmed(
+    status: Optional[Dict[str, Any]],
+) -> bool:
+    """Bestätigt nur die aktuelle Ladeannahme eines stehenden Stromangebots.
+
+    ``session_kwh`` und alte Manager-Marker sind innerhalb derselben
+    Stecksession kumulativ. Sie dürfen einen späteren, erneut stromlosen
+    Startversuch deshalb nicht als laufende Ladung ausgeben und damit das
+    begrenzte Wake-up-Orakel entwaffnen.
+    """
+
+    st = status if isinstance(status, dict) else {}
+    if not _fresh_valid_status(st):
+        return False
+    real_power_w = max(
+        _safe_float(st.get("real_power_w"), 0.0),
+        _safe_float(st.get("phase_power_sum_w"), 0.0),
+        _safe_float(st.get("power_w"), 0.0),
+    )
+    return bool(
+        st.get("charging")
+        or st.get("charge_state")
+        or real_power_w > 100.0
+    )
+
+
 def phase_sequence_step_contract(
     target_phases: Any,
     sequence: Optional[Dict[str, Any]] = None,
@@ -1978,12 +2005,7 @@ def start_wakeup_step_contract(
             "command_patch": command_patch,
             "state_patch": {"_openwb_pro_start_wakeup_pending": True},
         }
-    had_confirmed_charge = bool(
-        charging
-        or real_power_w > 100.0
-        or _safe_float(st.get("session_kwh"), 0.0) > 0.005
-        or bool(data.get("_charge_started", False))
-    )
+    had_confirmed_charge = start_offer_physics_confirmed(st)
     if had_confirmed_charge:
         return {
             **base,
@@ -2510,6 +2532,157 @@ def temporary_ems_stop_contract(
     }
 
 
+def manager_owned_wakeup_disconnect_contract(
+    status: Optional[Dict[str, Any]] = None,
+    state_data: Optional[Dict[str, Any]] = None,
+    *,
+    now_ts: Any = 0,
+) -> Dict[str, Any]:
+    """Bindet einen scheinbaren Unplug streng an den eigenen Start-Wake-up.
+
+    openWB Pro signalisiert während eines kurzen CP-Interrupts vorübergehend
+    keinen verbundenen Wagen. Das ist weder ein Nutzer-Unplug noch ein Grund,
+    das bereits freigegebene Stromangebot dauerhaft auf 0 A zu verankern. Die
+    Zuordnung gelingt ausschließlich über den persistierten CP-Receipt, den
+    zugehörigen positiven Strombeleg und dieselbe Stecksession.
+
+    ``synthetic_disconnect`` ist nur im kurzen Nachlauf des CP-Ausgangs wahr
+    und kann einen neuen ``no_vehicle_connected``-Stop verhindern.
+    ``anchor_releasable`` bleibt zeitlich unabhängig vom späteren Prüfmoment,
+    bindet aber den Erstellzeitpunkt des bereits gesetzten Ankers an genau
+    diesen kurzen Nachlauf. Alle Safety- und Budget-Gates werden weiterhin im
+    aufrufenden Release-Vertrag geprüft.
+    """
+
+    st = status if isinstance(status, dict) else {}
+    data = state_data if isinstance(state_data, dict) else {}
+    now_value = _safe_float(now_ts, 0.0)
+    plug_session_id = str(data.get("_openwb_pro_plug_session_id") or "")
+    issued_session_id = str(
+        data.get("_openwb_pro_start_current_session_id") or ""
+    )
+    issued_ts = _safe_float(
+        data.get("_openwb_pro_start_current_issued_ts"),
+        0.0,
+    )
+    receipt = data.get("_openwb_pro_start_wakeup_receipt")
+    receipt = receipt if isinstance(receipt, dict) else {}
+    receipt_session_id = str(receipt.get("plug_session_id") or "")
+    receipt_current_ts = _safe_float(receipt.get("current_issued_ts"), 0.0)
+    first_sent_ts = _safe_float(receipt.get("first_sent_ts"), 0.0)
+    last_sent_ts = _safe_float(receipt.get("last_sent_ts"), 0.0)
+    try:
+        raw_count = receipt.get("count", 0)
+        if isinstance(raw_count, bool):
+            raise ValueError("bool is not a retry count")
+        numeric_count = float(raw_count)
+        if not math.isfinite(numeric_count) or not numeric_count.is_integer():
+            raise ValueError("retry count is not an integer")
+        sent_count = int(numeric_count)
+    except (TypeError, ValueError, OverflowError):
+        sent_count = -1
+
+    session_bound = bool(
+        plug_session_id
+        and issued_session_id == plug_session_id
+        and receipt_session_id == plug_session_id
+    )
+    current_receipt_bound = bool(
+        math.isfinite(issued_ts)
+        and math.isfinite(receipt_current_ts)
+        and issued_ts > 0.0
+        and receipt_current_ts == issued_ts
+    )
+    timeline_valid = bool(
+        current_receipt_bound
+        and math.isfinite(first_sent_ts)
+        and math.isfinite(last_sent_ts)
+        and math.isfinite(now_value)
+        and first_sent_ts >= issued_ts
+        and last_sent_ts >= first_sent_ts
+        and now_value >= last_sent_ts
+    )
+    count_valid = bool(1 <= sent_count <= 3)
+    receipt_bound = bool(
+        str(receipt.get("schema") or "")
+        == "openwb_pro_start_wakeup_receipt_v1"
+        and session_bound
+        and timeline_valid
+        and count_valid
+    )
+    wakeup_age_s = (
+        max(0.0, now_value - last_sent_ts)
+        if receipt_bound
+        else 0.0
+    )
+    offered_amp = max(
+        _safe_float(st.get("offered_current_raw"), 0.0),
+        _safe_float(st.get("evse_current"), 0.0),
+        _safe_float(st.get("amp"), 0.0),
+        _safe_float(data.get("current_set_amp"), 0.0),
+    )
+    fresh_connection = _fresh_connection_state(st)
+    synthetic_disconnect = bool(
+        receipt_bound
+        and wakeup_age_s <= MANAGER_WAKEUP_DISCONNECT_MAX_LAG_S
+        and _fresh_valid_status(st)
+        and fresh_connection is False
+        and offered_amp >= 6.0
+        and not start_offer_physics_confirmed(st)
+    )
+
+    typed_anchor = (
+        data.get("_manager_zero_anchor_contract")
+        if isinstance(data.get("_manager_zero_anchor_contract"), dict)
+        else {}
+    )
+    anchor_created_ts = _safe_float(typed_anchor.get("created_ts"), 0.0)
+    anchor_lag_s = (
+        anchor_created_ts - last_sent_ts
+        if receipt_bound
+        and math.isfinite(anchor_created_ts)
+        and anchor_created_ts > 0.0
+        else -1.0
+    )
+    exact_anchor = bool(
+        data.get("_manager_zero_anchor_active", False)
+        and str(typed_anchor.get("contract") or "")
+        == "wallbox_manager_zero_anchor_v1"
+        and str(typed_anchor.get("owner") or "") == "wallbox_manager"
+        and str(typed_anchor.get("class") or "") == "hard_stop"
+        and str(typed_anchor.get("reason_code") or "")
+        == "no_vehicle_connected"
+        and str(typed_anchor.get("plug_session_id") or "")
+        == plug_session_id
+    )
+    anchor_releasable = bool(
+        receipt_bound
+        and exact_anchor
+        and anchor_created_ts <= now_value
+        and 0.0 <= anchor_lag_s <= MANAGER_WAKEUP_DISCONNECT_MAX_LAG_S
+    )
+    return {
+        "contract": "openwb_pro_manager_wakeup_disconnect_v1",
+        "synthetic_disconnect": synthetic_disconnect,
+        "anchor_releasable": anchor_releasable,
+        "receipt_bound": receipt_bound,
+        "session_bound": session_bound,
+        "current_receipt_bound": current_receipt_bound,
+        "timeline_valid": timeline_valid,
+        "count_valid": count_valid,
+        "sent_count": max(0, sent_count),
+        "plug_session_id": plug_session_id,
+        "receipt_plug_session_id": receipt_session_id,
+        "fresh_connection": fresh_connection,
+        "offered_amp": float(offered_amp),
+        "wakeup_age_s": float(wakeup_age_s),
+        "max_lag_s": float(MANAGER_WAKEUP_DISCONNECT_MAX_LAG_S),
+        "exact_anchor": exact_anchor,
+        "anchor_created_ts": float(anchor_created_ts),
+        "anchor_lag_s": float(anchor_lag_s),
+    }
+
+
 def manager_zero_anchor_release_contract(
     status: Optional[Dict[str, Any]] = None,
     state_data: Optional[Dict[str, Any]] = None,
@@ -2575,8 +2748,14 @@ def manager_zero_anchor_release_contract(
         or ""
     )
     plug_session_id = str(data.get("_openwb_pro_plug_session_id") or "")
+    wakeup_disconnect = manager_owned_wakeup_disconnect_contract(
+        st,
+        data,
+        now_ts=now_value,
+    )
     session_bound_reason = bool(
         anchor_reason in SESSION_BOUND_RELEASABLE_ZERO_ANCHOR_REASONS
+        or anchor_reason == "no_vehicle_connected"
     )
     plug_session_matches = bool(
         anchor_plug_session_id
@@ -2617,7 +2796,12 @@ def manager_zero_anchor_release_contract(
         and (not session_bound_reason or plug_session_matches)
     )
     anchor_releasable = bool(
-        typed_anchor_valid and (regular_anchor or soft_reject_due)
+        typed_anchor_valid
+        and (
+            regular_anchor
+            or soft_reject_due
+            or wakeup_disconnect.get("anchor_releasable", False)
+        )
     )
     status_valid = bool(
         st
@@ -2687,6 +2871,7 @@ def manager_zero_anchor_release_contract(
         "legacy_releasable_anchor": legacy_releasable_anchor,
         "legacy_floor_anchor": legacy_floor_anchor,
         "soft_reject_due": bool(soft_reject_due),
+        "manager_owned_wakeup_disconnect": wakeup_disconnect,
         "anchor_vehicle_key": anchor_vehicle_key,
         "session_vehicle_key": session_vehicle_key,
         "anchor_plug_session_id": anchor_plug_session_id,

@@ -1148,6 +1148,69 @@ function normalizeVehicleMergeKey($name) {
     return $name ?: '';
 }
 
+function vehicleRecordHasBoundDedupeIdentity($vehicle) {
+    if (!is_array($vehicle)) return false;
+    if (trim((string)($vehicle['profile_id'] ?? '')) !== '') return true;
+
+    $id = trim((string)($vehicle['id'] ?? ''));
+    if ($id === '' || in_array($id, ['openwb_native', 'openwb_pro_wb2'], true)) {
+        return false;
+    }
+    foreach (['vehicle_', 'openwb_observed_', 'manual_wb'] as $prefix) {
+        if (strpos($id, $prefix) === 0) return false;
+    }
+    return true;
+}
+
+function vehicleNameFallbackMergeIndex($nameKey, $vehicleIndexByName, $identityBoundByIndex, $currentIdentityBound) {
+    if ($nameKey === ''
+        || !array_key_exists($nameKey, $vehicleIndexByName)
+        || $vehicleIndexByName[$nameKey] === null) {
+        return null;
+    }
+
+    $candidateIndex = (int)$vehicleIndexByName[$nameKey];
+    $candidateIdentityBound = ($identityBoundByIndex[$candidateIndex] ?? false) === true;
+    // Ein Anzeigename ist keine Fahrzeugidentität. Der Legacy-Fallback ist nur
+    // zulässig, wenn genau eine Seite bereits an ein stabiles Profil gebunden
+    // ist. Zwei ungebundene Beobachtungen dürfen ebenso wenig geraten werden wie
+    // zwei verschiedene stabile Profile.
+    if ($currentIdentityBound === $candidateIdentityBound) return null;
+    return $candidateIndex;
+}
+
+function legacySessionSingleVehicleIndex($vehicles) {
+    if (!is_array($vehicles)) return -1;
+    $groups = [];
+    foreach ($vehicles as $index => $vehicle) {
+        if (!is_array($vehicle)) continue;
+        if (vehicleRecordHasBoundDedupeIdentity($vehicle)) {
+            $stableId = trim((string)($vehicle['profile_id'] ?? ($vehicle['id'] ?? '')));
+            if ($stableId === '') continue;
+            $groupKey = 'stable:' . compactVehicleIdentifier($stableId);
+        } else {
+            // Jede ungebundene Beobachtung ist eine eigene mögliche Identität.
+            $groupKey = 'unbound:' . (string)$index;
+        }
+        if (!isset($groups[$groupKey])) $groups[$groupKey] = (int)$index;
+    }
+    return count($groups) === 1 ? (int)reset($groups) : -1;
+}
+
+function registerVehicleNameMergeIndex($vehicleIndexByName, $nameKey, $mergeIndex) {
+    if ($nameKey === '') return $vehicleIndexByName;
+    $mergeIndex = (int)$mergeIndex;
+    if (!array_key_exists($nameKey, $vehicleIndexByName)) {
+        $vehicleIndexByName[$nameKey] = $mergeIndex;
+    } elseif ($vehicleIndexByName[$nameKey] !== null
+        && (int)$vehicleIndexByName[$nameKey] !== $mergeIndex) {
+        // Ab dem zweiten getrennten Datensatz ist der Name mehrdeutig und darf
+        // auch für spätere ungebundene Datensätze nicht mehr geraten werden.
+        $vehicleIndexByName[$nameKey] = null;
+    }
+    return $vehicleIndexByName;
+}
+
 function compactVehicleIdentifier($value) {
     return preg_replace('/[^a-z0-9]/', '', strtolower(trim((string)$value)));
 }
@@ -1217,39 +1280,249 @@ function e3dcHeatOwnerInfo($owner) {
     }
 }
 
-function vehicleSocSourcePriority($source, $isInterpolated = false, $lastUpdatedAt = null) {
+function vehicleSocTimestamp($value, $now = null) {
+    if ($value === null || $value === '') return null;
+    if (is_numeric($value)) {
+        $ts = (float)$value;
+        if ($ts > 100000000000.0) $ts /= 1000.0;
+    } elseif (is_string($value)) {
+        $parsed = strtotime(trim($value));
+        if ($parsed === false) return null;
+        $ts = (float)$parsed;
+    } else {
+        return null;
+    }
+    $now = is_numeric($now) ? (float)$now : (float)time();
+    if (!is_finite($ts) || $ts <= 0.0 || $ts > ($now + 300.0)) return null;
+    return (int)round($ts);
+}
+
+function vehicleSocRecordTimestamp($vehicle, $now = null) {
+    if (!is_array($vehicle)) return null;
+    // Der Quellzeitpunkt gehört zum Ist-SoC. Ein zyklisch neuer Datei- oder
+    // Mergezeitpunkt darf einen alten Rohanker niemals künstlich verjüngen.
+    if (array_key_exists('soc_source_ts', $vehicle)) {
+        $sourceTs = vehicleSocTimestamp($vehicle['soc_source_ts'], $now);
+        if ($sourceTs !== null) return $sourceTs;
+        if (array_key_exists('raw_soc_ts', $vehicle)) {
+            return vehicleSocTimestamp($vehicle['raw_soc_ts'], $now);
+        }
+        return null;
+    }
+    if (array_key_exists('raw_soc_ts', $vehicle)) {
+        return vehicleSocTimestamp($vehicle['raw_soc_ts'], $now);
+    }
+    $source = strtolower(trim((string)($vehicle['soc_source'] ?? ($vehicle['source'] ?? ''))));
+    $manualSource = in_array($source, ['manual_start_soc', 'manual_soc', 'manual', 'openwb_profile_link'], true);
+    // Nur bekannte manuelle Altverträge dürfen ihren damaligen Aktionszeitpunkt
+    // aus `ts` übernehmen. `last_updated_at` ist auch dort lediglich Datei- oder
+    // Mergezeit und darf weder Cloud- noch Maschinenwerte verjüngen.
+    return $manualSource && array_key_exists('ts', $vehicle)
+        ? vehicleSocTimestamp($vehicle['ts'], $now)
+        : null;
+}
+
+function vehicleSocCloudFreshnessSeconds($config = []) {
+    return e3dcVehicleSocCloudFreshnessSeconds($config);
+}
+
+function vehicleSocResolvedCloudFreshnessSeconds(
+    $config = [],
+    $v4Path = '/var/www/html/data/e3dc_v4.json',
+    $txtPath = null
+) {
+    $config = is_array($config) ? $config : [];
+    $topLevelBound = array_key_exists('bluelink_interval', $config);
+    $interval = $topLevelBound ? $config['bluelink_interval'] : '15';
+
+    if (!$topLevelBound) {
+        $v4Raw = e3dcReadRegularFileBound((string)$v4Path, 1048576);
+        $v4 = is_string($v4Raw) ? @json_decode($v4Raw, true) : null;
+        $nested = is_array($v4) && isset($v4['config']) && is_array($v4['config'])
+            ? $v4['config']
+            : [];
+        if (array_key_exists('bluelink_interval', $nested)) {
+            $value = $nested['bluelink_interval'];
+            if ((is_scalar($value) || $value === null) && trim((string)$value) !== '') {
+                $interval = (string)$value;
+            }
+        }
+    }
+
+    // Der Client behält für Bestandsinstallationen denselben TXT-Fallback:
+    // Ein expliziter Top-Level-V4-Wert bindet, sonst darf der Default 15 aus
+    // einer verschachtelten/fehlenden V4-Konfiguration überschrieben werden.
+    if (!$topLevelBound && trim((string)$interval) === '15'
+        && is_string($txtPath) && $txtPath !== '') {
+        $txtRaw = e3dcReadRegularFileBound($txtPath, 1048576);
+        if (is_string($txtRaw)) {
+            foreach (preg_split('/\R/', $txtRaw) ?: [] as $line) {
+                $trimmed = trim((string)$line);
+                if ($trimmed === '' || str_starts_with($trimmed, '#') || strpos($line, '=') === false) continue;
+                [$key, $value] = array_map('trim', explode('=', $line, 2));
+                if (strtolower($key) === 'bluelink_interval') {
+                    $interval = $value;
+                    break;
+                }
+            }
+        }
+    }
+
+    return vehicleSocCloudFreshnessSeconds(['bluelink_interval' => $interval]);
+}
+
+function vehicleBluelinkRefreshProjection($payload, $now = null) {
+    if (!is_array($payload)) return null;
+    $refresh = $payload['refresh'] ?? null;
+    if (!is_array($refresh)
+        || ($refresh['schema'] ?? null) !== 'bluelink_refresh_status_v1') {
+        return null;
+    }
+    $now = is_numeric($now) ? (int)$now : time();
+    $status = (string)($refresh['status'] ?? '');
+    $mode = (string)($refresh['mode'] ?? '');
+    if (!in_array($status, [
+        'failed', 'success_source_unknown',
+        'success_source_advanced', 'success_source_unchanged',
+        'success_source_partial',
+    ], true) || !in_array($mode, ['cached', 'force'], true)) {
+        return null;
+    }
+    $attemptTs = vehicleSocTimestamp($refresh['attempt_ts'] ?? null, $now);
+    $completedTs = vehicleSocTimestamp($refresh['completed_ts'] ?? null, $now);
+    $sourceTs = vehicleSocTimestamp($refresh['source_ts'] ?? null, $now);
+    $responseContractPresent = array_key_exists('response_source_complete', $refresh);
+    $responseSourceTs = vehicleSocTimestamp(
+        $responseContractPresent
+            ? ($refresh['response_source_ts'] ?? null)
+            : ($refresh['source_ts'] ?? null),
+        $now
+    );
+    $responseSourceComplete = $responseContractPresent
+        ? (($refresh['response_source_complete'] ?? null) === true)
+        : in_array($status, ['success_source_advanced', 'success_source_unchanged'], true);
+    $responseVehicleCount = max(0, (int)($refresh['response_vehicle_count'] ?? 0));
+    $responseMissingSourceCount = max(
+        0,
+        min(
+            $responseVehicleCount,
+            (int)($refresh['response_missing_source_count'] ?? 0)
+        )
+    );
+    $lastErrorRaw = is_array($refresh['last_error'] ?? null)
+        ? $refresh['last_error']
+        : null;
+    $lastError = null;
+    if ($lastErrorRaw !== null) {
+        $lastErrorTs = vehicleSocTimestamp($lastErrorRaw['ts'] ?? null, $now);
+        $lastErrorMode = (string)($lastErrorRaw['mode'] ?? '');
+        $lastErrorCode = (string)($lastErrorRaw['code'] ?? '');
+        if ($lastErrorTs !== null
+            && in_array($lastErrorMode, ['cached', 'force'], true)
+            && in_array($lastErrorCode, [
+                'timeout', 'rate_limited', 'authentication_failed', 'vehicle_data_missing', 'api_error',
+            ], true)) {
+            $lastError = [
+                'ts' => $lastErrorTs,
+                'age_s' => max(0, $now - $lastErrorTs),
+                'mode' => $lastErrorMode,
+                'code' => $lastErrorCode,
+                'message' => trim((string)($lastErrorRaw['message'] ?? '')),
+            ];
+        }
+    }
+    $lastErrorActive = $lastError !== null
+        && (!$responseSourceComplete
+            || $responseSourceTs === null
+            || $responseSourceTs <= (int)$lastError['ts']);
+
+    return [
+        'schema' => 'bluelink_refresh_status_v1',
+        'status' => $status,
+        'mode' => $mode,
+        'success' => ($refresh['success'] ?? null) === true,
+        'attempt_ts' => $attemptTs,
+        'attempt_age_s' => $attemptTs !== null ? max(0, $now - $attemptTs) : null,
+        'completed_ts' => $completedTs,
+        'completed_age_s' => $completedTs !== null ? max(0, $now - $completedTs) : null,
+        // Das Alter wird immer aus dem Fahrzeuganker neu berechnet. Die
+        // producerseitige Zahl und die Datei-Mtime sind keine Wahrheit.
+        'source_ts' => $sourceTs,
+        'source_age_s' => $sourceTs !== null ? max(0, $now - $sourceTs) : null,
+        'source_advanced' => ($refresh['source_advanced'] ?? null) === true,
+        'response_source_ts' => $responseSourceTs,
+        'response_source_complete' => $responseSourceComplete,
+        'response_vehicle_count' => $responseVehicleCount,
+        'response_missing_source_count' => $responseMissingSourceCount,
+        'error_code' => in_array((string)($refresh['error_code'] ?? ''), [
+            'timeout', 'rate_limited', 'authentication_failed', 'vehicle_data_missing', 'api_error',
+        ], true) ? (string)$refresh['error_code'] : null,
+        'message' => trim((string)($refresh['message'] ?? '')),
+        'last_error' => $lastError,
+        'last_error_active' => $lastErrorActive,
+    ];
+}
+
+function vehicleSocSourceNotOlderThan($vehicle, $incomingSourceTs, $slackS = 120) {
+    $incomingTs = vehicleSocTimestamp($incomingSourceTs);
+    if ($incomingTs === null) return false;
+    $existingTs = vehicleSocRecordTimestamp($vehicle);
+    $slackS = is_numeric($slackS) ? max(0, (int)$slackS) : 0;
+    return $existingTs === null || ($incomingTs + $slackS) >= $existingTs;
+}
+
+function vehicleSocSourcePriority($source, $isInterpolated = false, $lastUpdatedAt = null, $cloudFreshnessS = 900) {
     $source = strtolower(trim((string)$source));
-    $age = is_numeric($lastUpdatedAt) && (float)$lastUpdatedAt > 0 ? (time() - (float)$lastUpdatedAt) : 0;
+    $sourceTs = vehicleSocTimestamp($lastUpdatedAt);
+    $age = $sourceTs !== null ? max(0, time() - $sourceTs) : null;
     if (in_array($source, ['bluelink', 'hyundai', 'kia', 'cloud', 'vehicle_cloud'], true)) {
-        return ($age > 0 && $age > 900) ? 3 : 5;
+        $cloudFreshnessS = is_numeric($cloudFreshnessS) ? max(900, (int)$cloudFreshnessS) : 900;
+        return ($age === null || $age > $cloudFreshnessS) ? 3 : 5;
+    }
+    if ($source === 'mqtt') {
+        return ($age === null || $age > 8 * 3600) ? 1 : 4;
     }
     if (in_array($source, ['openwb_pro_raw', 'ccs_wallbox', 'ccs_wallbox_wb2', 'openwb_mqtt'], true)) return 4;
     if (in_array($source, ['openwb_pro_estimated', 'manual_soc', 'manual'], true)) return 3;
     // Eine frische, profilgebundene Interpolation aus einem bestätigten
     // Fahrzeuganker darf einen inzwischen alten Cloud-Anker fortschreiben.
     // Roh- und Eigenwerte der openWB Pro bleiben im Merge trotzdem vorrangig.
-    if (strpos($source, 'wallbox_estimated_from_') === 0 && wallboxSocRuleConfirmed($source, null)) return 3;
+    if (strpos($source, 'wallbox_estimated_from_') === 0 && wallboxSocSourceTrusted($source)) return 3;
     return !empty($isInterpolated) ? 2 : 1;
 }
 
-function wallboxSocRuleConfirmed($source, $ruleConfirmed = null) {
-    if ($ruleConfirmed === true || $ruleConfirmed === 1 || $ruleConfirmed === '1' || $ruleConfirmed === 'true') return true;
-    $source = strtolower(trim((string)$source));
-    if ($source === '' || in_array($source, ['simple_view_start_soc', 'config_start_soc', 'configured_wallbox'], true)) return false;
-    if (strpos($source, 'wallbox_estimated_from_') === 0) {
-        return wallboxSocRuleConfirmed(substr($source, strlen('wallbox_estimated_from_')), null);
-    }
-    if (strpos($source, 'wallbox_estimated') === 0) return false;
-    if (in_array($source, ['manual_start_soc', 'manual_soc', 'manual', 'openwb_profile_link', 'openwb_pro_raw', 'openwb_pro_estimated'], true)) return true;
-    foreach (['mqtt', 'bluelink', 'wallbox', 'openwb', 'vehicle', 'car_soc', 'hyundai', 'kia'] as $token) {
-        if (strpos($source, $token) !== false) return true;
-    }
-    return false;
+function wallboxSocSourceTrusted($source) {
+    return is_array(e3dcVehicleSocSourceContract($source));
 }
 
-function wallboxVehicleSocRuleUsable($vehicle) {
+function wallboxSocRuleConfirmed($source, $ruleConfirmed = null, $rulePresent = null) {
+    $contract = e3dcVehicleSocSourceContract($source);
+    if (!is_array($contract)) return false;
+    $rulePresent = is_bool($rulePresent) ? $rulePresent : $ruleConfirmed !== null;
+    $manualSource = !$contract['derived'] && $contract['kind'] === 'manual';
+    if ($manualSource) {
+        return !$rulePresent || $ruleConfirmed === true;
+    }
+    return $ruleConfirmed === true;
+}
+
+function wallboxVehicleSocRuleUsable($vehicle, $cloudFreshnessS = 900) {
     if (!is_array($vehicle)) return false;
-    return wallboxSocRuleConfirmed($vehicle['soc_source'] ?? ($vehicle['source'] ?? ''), $vehicle['soc_rule_confirmed'] ?? null);
+    $source = $vehicle['soc_source'] ?? ($vehicle['source'] ?? '');
+    if (!wallboxSocRuleConfirmed(
+        $source,
+        $vehicle['soc_rule_confirmed'] ?? null,
+        array_key_exists('soc_rule_confirmed', $vehicle)
+    )) return false;
+    $sourceTs = vehicleSocRecordTimestamp($vehicle);
+    $maxAgeS = e3dcVehicleSocPayloadMaxAgeSeconds(
+        $vehicle,
+        $source,
+        $cloudFreshnessS
+    );
+    return $sourceTs !== null
+        && $maxAgeS !== null
+        && (time() - $sourceTs) <= $maxAgeS;
 }
 
 // Kompatibilitätsname: "confirmed" bezeichnet historisch ausschließlich die
@@ -1259,21 +1532,135 @@ function wallboxVehicleSocConfirmed($vehicle) {
 }
 
 function vehicleSocSourceClass($source, $isInterpolated = false) {
-    $source = strtolower(trim((string)$source));
-    if (!empty($isInterpolated) || strpos($source, 'estimated') !== false || strpos($source, 'interpolat') !== false) {
-        return 'estimated';
-    }
-    foreach (['bluelink', 'hyundai', 'kia', 'cloud'] as $token) {
-        if (strpos($source, $token) !== false) return 'cloud';
-    }
-    foreach (['manual_start_soc', 'manual_soc', 'manual', 'openwb_profile_link'] as $token) {
-        if (strpos($source, $token) !== false) return 'manual';
-    }
+    $contract = e3dcVehicleSocSourceContract($source);
+    if (!empty($isInterpolated) || (is_array($contract) && $contract['derived'])) return 'estimated';
+    if (is_array($contract) && $contract['kind'] === 'cloud') return 'cloud';
+    if (is_array($contract) && $contract['kind'] === 'manual') return 'manual';
     return 'observed';
 }
 
+function vehicleSocUsesOpenwbProAnchor($source) {
+    $contract = e3dcVehicleSocSourceContract($source);
+    return is_array($contract)
+        && in_array($contract['base_source'], ['openwb_pro_raw', 'openwb_pro_estimated'], true);
+}
+
+function vehicleSocUsesMqttAnchor($source) {
+    $contract = e3dcVehicleSocSourceContract($source);
+    return is_array($contract)
+        && in_array($contract['base_source'], ['mqtt', 'openwb_mqtt'], true);
+}
+
+function wallboxSocSourceTimestamp($payload, $source, $now = null) {
+    $payload = is_array($payload) ? $payload : [];
+    if (array_key_exists('car_soc_source_ts', $payload)) {
+        $sourceTs = vehicleSocTimestamp(
+            $payload['car_soc_source_ts'],
+            $now
+        );
+        if ($sourceTs !== null) return $sourceTs;
+        if (array_key_exists('car_soc_raw_ts', $payload)) {
+            return vehicleSocTimestamp($payload['car_soc_raw_ts'], $now);
+        }
+        return null;
+    }
+    if (array_key_exists('car_soc_raw_ts', $payload)) {
+        return vehicleSocTimestamp($payload['car_soc_raw_ts'], $now);
+    }
+    // Der zyklische openWB-Statuszeitpunkt ist für keine SoC-Quelle ein
+    // Mess- oder Aktionszeitpunkt. Aktuelle Producer liefern source/raw explizit;
+    // manuelle Legacy-Anker werden separat aus manual_soc_wb*.json gelesen.
+    return null;
+}
+
+function wallboxSocTruthConfirmed($source, $ruleConfirmed, $sourceTs, $now = null, $rulePresent = null, $agePayload = null, $cloudFreshnessS = 900) {
+    if (!wallboxSocRuleConfirmed($source, $ruleConfirmed, $rulePresent)) return false;
+    // Jede regelwirksame Quelle braucht ihren eigenen Ereignisanker. Das gilt
+    // auch für sonstige Maschinenquellen; ein frischer Status-Heartbeat allein
+    // bestätigt weder Messwert noch manuelle Nutzeraktion.
+    $now = is_numeric($now) ? (int)$now : time();
+    $anchorTs = vehicleSocTimestamp($sourceTs, $now);
+    if ($anchorTs === null) return false;
+    $source = strtolower(trim((string)$source));
+    $maxAgeS = e3dcVehicleSocPayloadMaxAgeSeconds(
+        $agePayload,
+        $source,
+        $cloudFreshnessS
+    );
+    return $maxAgeS !== null && ($now - $anchorTs) <= $maxAgeS;
+}
+
+function vehicleSocPercentValue($value) {
+    if (is_bool($value) || $value === null || $value === '' || !is_numeric($value)) return null;
+    $soc = (float)$value;
+    if (!is_finite($soc) || $soc < 0.0 || $soc > 100.0) return null;
+    return $soc;
+}
+
+function vehicleSocContractFlagActive($value) {
+    if ($value === true) return true;
+    if (is_bool($value) || $value === null || $value === '') return false;
+    if (is_numeric($value)) return (float)$value != 0.0;
+    return in_array(strtolower(trim((string)$value)), [
+        '1', 'true', 'yes', 'ja', 'on', 'active', 'stale', 'expired', 'invalid',
+    ], true);
+}
+
+function vehicleSocContractFlagExplicitlyFalse($value) {
+    if ($value === false) return true;
+    if ($value === null || $value === '') return false;
+    if (is_numeric($value)) return (float)$value == 0.0;
+    return in_array(strtolower(trim((string)$value)), [
+        '0', 'false', 'no', 'nein', 'off', 'unplugged', 'disconnected',
+    ], true);
+}
+
+function vehicleSocExplicitVetoed($vehicle, $includePlugState = false) {
+    if (!is_array($vehicle)) return true;
+    if (array_key_exists('soc_rule_confirmed', $vehicle)
+        && $vehicle['soc_rule_confirmed'] !== true) return true;
+    foreach ([
+        'soc_stale', 'stale', 'estimate_expired', 'soc_expired', 'expired',
+        'soc_profile_binding_invalid', 'profile_binding_invalid', 'driver_status_stale',
+    ] as $key) {
+        if (vehicleSocContractFlagActive($vehicle[$key] ?? null)) return true;
+    }
+    foreach (['driver_status_valid', 'soc_profile_bound'] as $key) {
+        if (array_key_exists($key, $vehicle)
+            && vehicleSocContractFlagExplicitlyFalse($vehicle[$key])) return true;
+    }
+    if ($includePlugState) {
+        foreach (['plugged', 'is_plugged_in'] as $key) {
+            if (array_key_exists($key, $vehicle)
+                && vehicleSocContractFlagExplicitlyFalse($vehicle[$key])) return true;
+        }
+    }
+    return false;
+}
+
+function wallboxSocPayloadExplicitVetoed($payload) {
+    if (!is_array($payload)) return true;
+    foreach ([
+        'car_soc_stale', 'soc_stale', 'stale', 'estimate_expired',
+        'soc_expired', 'expired', 'car_soc_profile_binding_invalid',
+        'soc_profile_binding_invalid', 'profile_binding_invalid',
+        'driver_status_stale',
+    ] as $key) {
+        if (vehicleSocContractFlagActive($payload[$key] ?? null)) return true;
+    }
+    foreach (['driver_status_valid', 'car_soc_profile_bound', 'soc_profile_bound'] as $key) {
+        if (array_key_exists($key, $payload)
+            && vehicleSocContractFlagExplicitlyFalse($payload[$key])) return true;
+    }
+    foreach (['plug_state', 'plugged', 'is_plugged_in'] as $key) {
+        if (array_key_exists($key, $payload)
+            && vehicleSocContractFlagExplicitlyFalse($payload[$key])) return true;
+    }
+    return false;
+}
+
 function vehicleSocDisplayAllowed($vehicle) {
-    if (!is_array($vehicle) || !vehicleValuePresent($vehicle['soc'] ?? null)) return false;
+    if (!is_array($vehicle) || vehicleSocPercentValue($vehicle['soc'] ?? null) === null) return false;
     $effectiveSource = strtolower(trim((string)($vehicle['soc_source'] ?? ($vehicle['source'] ?? ''))));
     $originalSource = $effectiveSource === 'vehicle_cached_last_confirmed'
         ? strtolower(trim((string)($vehicle['soc_source_previous'] ?? '')))
@@ -1288,32 +1675,67 @@ function vehicleSocDisplayAllowed($vehicle) {
     return true;
 }
 
-function vehicleSocTruthMeta($vehicle, $now = null) {
+function vehicleSocTruthMeta($vehicle, $now = null, $cloudFreshnessS = 900) {
     $now = is_numeric($now) ? (int)$now : time();
-    $value = vehicleValuePresent($vehicle['soc'] ?? null) ? round((float)$vehicle['soc'], 2) : null;
+    $socValue = vehicleSocPercentValue($vehicle['soc'] ?? null);
+    $value = $socValue !== null ? round($socValue, 2) : null;
     $effectiveSource = trim((string)($vehicle['soc_source'] ?? ($vehicle['source'] ?? '')));
     $cached = strtolower($effectiveSource) === 'vehicle_cached_last_confirmed';
     $originalSource = $cached
         ? trim((string)($vehicle['soc_source_previous'] ?? ''))
         : $effectiveSource;
-    $sourceTs = (int)($vehicle['last_updated_at'] ?? ($vehicle['soc_source_ts'] ?? ($vehicle['soc_cache_ts'] ?? 0)));
-    $ageS = $sourceTs > 0 ? max(0, $now - $sourceTs) : null;
+    $sourceTs = vehicleSocRecordTimestamp($vehicle, $now);
+    $ageS = $sourceTs !== null ? max(0, $now - $sourceTs) : null;
     $sourceClass = vehicleSocSourceClass($originalSource, $vehicle['is_interpolated'] ?? false);
-    $stale = !empty($vehicle['soc_stale']) || $cached;
-    if ($ageS !== null && (($sourceClass === 'cloud' && $ageS > 900) || ($sourceClass === 'observed' && $ageS > 120))) {
+    $sourceVetoed = vehicleSocExplicitVetoed($vehicle);
+    $plugVetoed = !$sourceVetoed && vehicleSocExplicitVetoed($vehicle, true);
+    $cloudFreshnessS = is_numeric($cloudFreshnessS)
+        ? max(900, min(8 * 3600, (int)$cloudFreshnessS))
+        : 900;
+    $openwbProAnchored = vehicleSocUsesOpenwbProAnchor($originalSource);
+    $mqttAnchored = vehicleSocUsesMqttAnchor($originalSource);
+    $trustedSource = wallboxSocSourceTrusted($originalSource);
+    $stale = $cached || $sourceVetoed || !$trustedSource;
+    $producerAnchorExplicit = array_key_exists('soc_source_ts', $vehicle)
+        || array_key_exists('raw_soc_ts', $vehicle);
+    $payloadMaxAgeS = e3dcVehicleSocPayloadMaxAgeSeconds(
+        $vehicle,
+        $originalSource,
+        $cloudFreshnessS
+    );
+    $declaredContractInvalid = e3dcVehicleSocPayloadDeclaresAgeContract($vehicle)
+        && $payloadMaxAgeS === null;
+    if (($trustedSource && $ageS === null)
+        || $declaredContractInvalid
+        || ($payloadMaxAgeS !== null && $ageS !== null && $ageS > $payloadMaxAgeS)
+        || (($sourceClass === 'cloud' || $mqttAnchored) && !$producerAnchorExplicit)
+        || ($openwbProAnchored && $ageS > 8 * 3600)
+        || ($mqttAnchored && $ageS > 8 * 3600)
+        || ($ageS !== null && (($sourceClass === 'cloud' && $ageS > $cloudFreshnessS)
+            || ($sourceClass === 'observed' && !$mqttAnchored && $ageS > 120)))) {
         $stale = true;
     }
     $profileId = trim((string)($vehicle['profile_id'] ?? ''));
-    $displayUsable = $value !== null && vehicleSocDisplayAllowed($vehicle);
+    $profileBound = $profileId !== ''
+        && (!array_key_exists('soc_profile_bound', $vehicle)
+            || !vehicleSocContractFlagExplicitlyFalse($vehicle['soc_profile_bound']));
+    $displayUsable = $value !== null
+        && vehicleSocDisplayAllowed($vehicle)
+        && $trustedSource
+        && (!$cached || $sourceTs !== null);
+    $explicitProducerRule = ($vehicle['soc_rule_confirmed'] ?? null) === true;
     $ruleUsable = $displayUsable
         && !$stale
-        && $profileId !== ''
-        && wallboxVehicleSocRuleUsable($vehicle);
+        && !$plugVetoed
+        && $profileBound
+        && (!(($sourceClass === 'cloud') || $mqttAnchored)
+            || ($explicitProducerRule && $producerAnchorExplicit))
+        && wallboxVehicleSocRuleUsable($vehicle, $cloudFreshnessS);
 
     return [
         'value' => $displayUsable ? $value : null,
         'profile_id' => $profileId !== '' ? $profileId : null,
-        'profile_bound' => $profileId !== '',
+        'profile_bound' => $profileBound,
         'source' => $effectiveSource !== '' ? $effectiveSource : null,
         'original_source' => $originalSource !== '' ? $originalSource : null,
         'source_ts' => $sourceTs > 0 ? $sourceTs : null,
@@ -1367,7 +1789,8 @@ function loadVehicleSocDisplayCache($file) {
 
 function applyVehicleSocDisplayCache(&$vehicle, $cache, $maxAgeS = 604800) {
     if (!is_array($vehicle) || empty($cache)) return;
-    if (vehicleValuePresent($vehicle['soc'] ?? null) && wallboxVehicleSocRuleUsable($vehicle)) return;
+    if (vehicleSocPercentValue($vehicle['soc'] ?? null) !== null
+        && wallboxVehicleSocRuleUsable($vehicle)) return;
 
     $now = time();
     foreach (vehicleSocDisplayCacheKeys($vehicle) as $key) {
@@ -1375,9 +1798,10 @@ function applyVehicleSocDisplayCache(&$vehicle, $cache, $maxAgeS = 604800) {
         $entry = $cache[$key];
         $ts = (int)($entry['ts'] ?? 0);
         if ($ts <= 0 || ($now - $ts) > $maxAgeS) continue;
-        if (!vehicleValuePresent($entry['soc'] ?? null)) continue;
+        $cachedSoc = vehicleSocPercentValue($entry['soc'] ?? null);
+        if ($cachedSoc === null) continue;
 
-        $vehicle['soc'] = round((float)$entry['soc'], 2);
+        $vehicle['soc'] = round($cachedSoc, 2);
         if (vehicleValuePresent($entry['range_km'] ?? null)) {
             $vehicle['range_km'] = (int)round((float)$entry['range_km']);
         }
@@ -1388,7 +1812,10 @@ function applyVehicleSocDisplayCache(&$vehicle, $cache, $maxAgeS = 604800) {
         $vehicle['soc_rule_confirmed'] = false;
         $vehicle['soc_stale'] = true;
         $vehicle['soc_cache_ts'] = $ts;
-        $vehicle['last_updated_at'] = (int)($entry['source_ts'] ?? $ts);
+        $cacheSourceTs = vehicleSocTimestamp($entry['source_ts'] ?? null, $now);
+        $vehicle['soc_source_ts'] = $cacheSourceTs;
+        $vehicle['last_updated_at'] = $cacheSourceTs;
+        unset($vehicle['raw_soc_ts']);
         return;
     }
 }
@@ -1404,12 +1831,18 @@ function saveVehicleSocDisplayCache($file, $vehicles, $existingCache = [], $maxA
     if (is_array($vehicles)) {
         foreach ($vehicles as $vehicle) {
             if (!is_array($vehicle) || !empty($vehicle['soc_stale'])) continue;
-            if (!vehicleValuePresent($vehicle['soc'] ?? null) || !wallboxVehicleSocRuleUsable($vehicle)) continue;
+            $vehicleSoc = vehicleSocPercentValue($vehicle['soc'] ?? null);
+            if ($vehicleSoc === null || !wallboxVehicleSocRuleUsable($vehicle)) continue;
+            $sourceTs = vehicleSocRecordTimestamp($vehicle, $now);
+            // Ohne echten Quellanker darf selbst ein bestätigter Anzeigewert
+            // nicht unter dem aktuellen Cache-Schreibzeitpunkt gespeichert
+            // und dadurch scheinbar verjüngt werden.
+            if ($sourceTs === null) continue;
             $entry = [
-                'soc' => round((float)$vehicle['soc'], 2),
+                'soc' => round($vehicleSoc, 2),
                 'range_km' => vehicleValuePresent($vehicle['range_km'] ?? null) ? (int)round((float)$vehicle['range_km']) : null,
                 'source' => (string)($vehicle['soc_source'] ?? ''),
-                'source_ts' => (int)($vehicle['last_updated_at'] ?? $now),
+                'source_ts' => (int)$sourceTs,
                 'name' => (string)($vehicle['name'] ?? ''),
                 'id' => (string)($vehicle['id'] ?? ''),
                 'profile_id' => (string)($vehicle['profile_id'] ?? ''),
@@ -1428,9 +1861,9 @@ function saveVehicleSocDisplayCache($file, $vehicles, $existingCache = [], $maxA
     }
 }
 
-function sanitizeWallboxVehicleSoc(&$vehicle) {
+function sanitizeWallboxVehicleSoc(&$vehicle, $cloudFreshnessS = 900) {
     if (!is_array($vehicle)) return;
-    $meta = vehicleSocTruthMeta($vehicle);
+    $meta = vehicleSocTruthMeta($vehicle, null, $cloudFreshnessS);
     if (empty($meta['display_usable'])) {
         $vehicle['soc'] = null;
         unset($vehicle['range_km']);
@@ -1481,15 +1914,38 @@ function savedCarIdForVehicleIdentifiers($savedCars, $identifiers, $name = '') {
     }
     if (!empty($probes)) return null;
     if ($name !== '') {
+        $nameMatches = [];
         foreach ($savedCars as $car) {
             if (!is_array($car)) continue;
             $savedName = normalizeVehicleMergeKey($car['name'] ?? '');
             if ($savedName !== '' && $name === $savedName) {
-                return $car['id'] ?? null;
+                $savedId = trim((string)($car['id'] ?? ''));
+                if ($savedId !== '') $nameMatches[$savedId] = true;
             }
+        }
+        if (count($nameMatches) === 1) {
+            foreach ($nameMatches as $savedId => $_unused) return $savedId;
         }
     }
     return null;
+}
+
+function ambiguousSavedCarNameKeys($savedCars) {
+    if (!is_array($savedCars)) return [];
+    $idsByName = [];
+    foreach ($savedCars as $car) {
+        if (!is_array($car)) continue;
+        $nameKey = normalizeVehicleMergeKey($car['name'] ?? '');
+        $savedId = trim((string)($car['id'] ?? ''));
+        if ($nameKey === '' || $savedId === '') continue;
+        if (!isset($idsByName[$nameKey])) $idsByName[$nameKey] = [];
+        $idsByName[$nameKey][$savedId] = true;
+    }
+    $ambiguous = [];
+    foreach ($idsByName as $nameKey => $ids) {
+        if (count($ids) > 1) $ambiguous[] = $nameKey;
+    }
+    return $ambiguous;
 }
 
 function savedCarProfileIdForVehicleRecord($veh, $savedCars) {
@@ -1731,6 +2187,19 @@ function liveWallboxClosedSessionsTodayKwh($csvFile, $wallboxNo) {
     return round(max(0.0, (float)($today[$target] ?? 0.0)), 3);
 }
 
+function wallboxPayloadSlotMatches($payload, $expectedWallbox, $allowMissing = true) {
+    if (!is_array($payload)) return false;
+    $slotKey = array_key_exists('wb_slot', $payload)
+        ? 'wb_slot'
+        : (array_key_exists('wb', $payload) ? 'wb' : null);
+    if ($slotKey === null || $payload[$slotKey] === null || $payload[$slotKey] === '') {
+        return $allowMissing === true;
+    }
+    $rawSlot = $payload[$slotKey];
+    if (is_bool($rawSlot) || !is_numeric($rawSlot)) return false;
+    return (int)$rawSlot === (int)$expectedWallbox;
+}
+
 function liveCarChargeSessionSnapshot($wallboxNo) {
     static $requestMemo = [];
 
@@ -1766,7 +2235,8 @@ function liveCarChargeSessionSnapshot($wallboxNo) {
         if (!is_string($path)) continue;
         $raw = e3dcReadRegularFileBound($path, 1024 * 1024);
         $payload = is_string($raw) ? @json_decode($raw, true) : null;
-        if (is_array($payload)) {
+        if (is_array($payload)
+            && wallboxPayloadSlotMatches($payload, $wallbox, true)) {
             $requestMemo[$wallbox] = [
                 'data' => $payload,
                 'source' => $candidate['source'],
@@ -1838,7 +2308,7 @@ function explicitVehicleRangeContract($vehicle, $nowTs = null) {
     ];
 }
 
-function mergeVehicleRecords($base, $incoming) {
+function mergeVehicleRecords($base, $incoming, $cloudFreshnessS = 900) {
     $merged = is_array($base) ? $base : [];
     $incoming = is_array($incoming) ? $incoming : [];
     // SoC und Gesamtreichweite besitzen absichtlich getrennte Quellen.
@@ -1847,16 +2317,55 @@ function mergeVehicleRecords($base, $incoming) {
     $baseRange = explicitVehicleRangeContract($merged);
     $incomingRange = explicitVehicleRangeContract($incoming);
 
+    // Das Ladeziel ist ein eigener Vertrag: target_soc wird nur ergänzt und
+    // niemals zusammen mit einem gewinnenden oder verlierenden Ist-SoC bewegt.
     foreach (['capacity', 'capacity_kwh', 'power', 'charge_power', 'charge_power_kw', 'target_soc', 'max_soc', 'max_soc_si'] as $key) {
         if (!vehicleValuePresent($merged[$key] ?? null) && vehicleValuePresent($incoming[$key] ?? null)) {
             $merged[$key] = $incoming[$key];
         }
     }
 
-    $incomingPriority = vehicleSocSourcePriority($incoming['soc_source'] ?? '', $incoming['is_interpolated'] ?? false, $incoming['last_updated_at'] ?? null);
-    $basePriority = vehicleSocSourcePriority($merged['soc_source'] ?? '', $merged['is_interpolated'] ?? false, $merged['last_updated_at'] ?? null);
-    $incomingSocWins = vehicleValuePresent($incoming['soc'] ?? null)
-        && (!vehicleValuePresent($merged['soc'] ?? null) || $incomingPriority >= $basePriority);
+    $incomingPriority = vehicleSocSourcePriority(
+        $incoming['soc_source'] ?? '',
+        $incoming['is_interpolated'] ?? false,
+        vehicleSocRecordTimestamp($incoming),
+        $cloudFreshnessS
+    );
+    $basePriority = vehicleSocSourcePriority(
+        $merged['soc_source'] ?? '',
+        $merged['is_interpolated'] ?? false,
+        vehicleSocRecordTimestamp($merged),
+        $cloudFreshnessS
+    );
+    $incomingHasSoc = vehicleSocPercentValue($incoming['soc'] ?? null) !== null;
+    $baseHasSoc = vehicleSocPercentValue($merged['soc'] ?? null) !== null;
+    $incomingSocWins = $incomingHasSoc && !$baseHasSoc;
+    if ($incomingHasSoc && $baseHasSoc) {
+        $mergeTruthRank = static function ($vehicle) use ($cloudFreshnessS) {
+            $probe = is_array($vehicle) ? $vehicle : [];
+            if (trim((string)($probe['profile_id'] ?? '')) === '') {
+                $probe['profile_id'] = '__merge_identity__';
+            }
+            $meta = vehicleSocTruthMeta($probe, null, $cloudFreshnessS);
+            if (!empty($meta['rule_usable'])) return 2;
+            return !empty($meta['display_usable']) ? 1 : 0;
+        };
+        $incomingTruthRank = $mergeTruthRank($incoming);
+        $baseTruthRank = $mergeTruthRank($merged);
+        if ($incomingTruthRank !== $baseTruthRank) {
+            $incomingSocWins = $incomingTruthRank > $baseTruthRank;
+        } elseif ($incomingPriority > $basePriority) {
+            $incomingSocWins = true;
+        } elseif ($incomingPriority === $basePriority) {
+            // Bei gleicher fachlicher Quellenpriorität entscheidet ausschließlich
+            // der belastbare Quellzeitpunkt. Ohne neueren Beleg bleibt der bereits
+            // gebundene Ist-SoC erhalten; die Einmischreihenfolge ist keine Wahrheit.
+            $incomingTs = vehicleSocRecordTimestamp($incoming);
+            $baseTs = vehicleSocRecordTimestamp($merged);
+            $incomingSocWins = $incomingTs !== null
+                && ($baseTs === null || $incomingTs > $baseTs);
+        }
+    }
     $baseSocSource = strtolower(trim((string)($merged['soc_source'] ?? '')));
     $incomingSocSource = strtolower(trim((string)($incoming['soc_source'] ?? '')));
     if (in_array($baseSocSource, ['openwb_pro_raw', 'openwb_pro_estimated'], true)
@@ -1865,9 +2374,9 @@ function mergeVehicleRecords($base, $incoming) {
     }
     $baseIsProfileFallback = !empty($merged['soc_profile_bound'])
         || strpos($baseSocSource, 'wallbox_estimated') === 0;
-    if (!empty($incoming['soc_profile_binding_invalid'])) {
+    if (vehicleSocContractFlagActive($incoming['soc_profile_binding_invalid'] ?? null)) {
         $incomingSocWins = false;
-        if (!vehicleValuePresent($merged['soc'] ?? null) || $baseIsProfileFallback) {
+        if (vehicleSocPercentValue($merged['soc'] ?? null) === null || $baseIsProfileFallback) {
             $merged['soc'] = null;
             unset($merged['range_km']);
             $merged['soc_source'] = 'wallbox_estimated_profile_binding_invalid';
@@ -1876,14 +2385,23 @@ function mergeVehicleRecords($base, $incoming) {
         }
     }
     if ($incomingSocWins) {
-        foreach (['soc', 'range_km', 'soc_source', 'soc_source_previous', 'soc_rule_confirmed', 'soc_stale', 'soc_cache_ts', 'is_interpolated', 'last_updated_at'] as $key) {
+        foreach ([
+            'soc', 'range_km', 'soc_source', 'soc_source_previous',
+            'soc_rule_confirmed', 'soc_rule_usable', 'soc_stale', 'stale',
+            'estimate_expired', 'soc_expired', 'expired',
+            'soc_profile_binding_invalid', 'profile_binding_invalid',
+            'soc_cache_ts', 'soc_source_ts', 'raw_soc_ts', 'is_interpolated',
+            'soc_age_contract', 'soc_age_contract_source', 'soc_max_age_s',
+            'driver_status_stale', 'driver_status_valid', 'soc_profile_bound',
+            'last_updated_at',
+        ] as $key) {
             if (array_key_exists($key, $incoming)) {
                 $merged[$key] = $incoming[$key];
             } else {
                 unset($merged[$key]);
             }
         }
-        if (empty($incoming['soc_profile_binding_invalid'])) {
+        if (!vehicleSocContractFlagActive($incoming['soc_profile_binding_invalid'] ?? null)) {
             unset($merged['soc_profile_binding_invalid']);
         }
     }
@@ -2910,6 +3428,31 @@ function liveTrajectoryValidationReason($plan, $source, $canonicalPlan) {
         }
         $selection = is_array($slot['selection'] ?? null) ? $slot['selection'] : [];
         $delegation = is_array($slot['delegation'] ?? null) ? $slot['delegation'] : null;
+        $standardProjectionBinding = is_array($slot['standard_projection_binding'] ?? null)
+            ? $slot['standard_projection_binding']
+            : null;
+        $standardProjectionBindingKeys = is_array($standardProjectionBinding)
+            ? array_keys($standardProjectionBinding)
+            : [];
+        sort($standardProjectionBindingKeys, SORT_STRING);
+        $standardProjectionBindingValid = is_array($standardProjectionBinding)
+            && $standardProjectionBindingKeys === [
+                'commands_allowed', 'executable', 'hardware_effect',
+                'projection_only', 'schema', 'source_revision', 'source_schema'
+            ]
+            && ($standardProjectionBinding['schema'] ?? null) === 'canonical_standard_projection_binding_v1'
+            && ($standardProjectionBinding['projection_only'] ?? null) === true
+            && ($standardProjectionBinding['executable'] ?? null) === false
+            && ($standardProjectionBinding['commands_allowed'] ?? null) === false
+            && ($standardProjectionBinding['hardware_effect'] ?? null) === false
+            && ($standardProjectionBinding['source_schema'] ?? null) === 'direct_marketing_headroom_projection_plan_v1'
+            && preg_match('/^sha256:[0-9a-f]{64}$/', (string)($standardProjectionBinding['source_revision'] ?? '')) === 1
+            && ($headroomEvidence['present'] ?? false) === true
+            && ($headroomEvidence['valid'] ?? false) === true
+            && hash_equals(
+                (string)($headroomEvidence['revision'] ?? ''),
+                (string)($standardProjectionBinding['source_revision'] ?? '')
+            );
         $headroomProjection = is_array($slot['headroom_projection'] ?? null) ? $slot['headroom_projection'] : null;
         $projectionOnlyMarker = $action === 'HEADROOM_EXPORT'
             || array_key_exists('action_role', $slot)
@@ -3038,6 +3581,7 @@ function liveTrajectoryValidationReason($plan, $source, $canonicalPlan) {
         $selectedAction = in_array($action, ['PV_STORE', 'ECONOMIC_EXPORT', 'CHARGE_BLOCK_WAIT', 'DV_CURVE_CHARGE'], true);
         $delegatedPvStore = $action === 'PV_STORE'
             && is_array($delegation)
+            && $standardProjectionBinding === null
             && ($selection['selected'] ?? null) === false
             && ($delegation['schema_version'] ?? '') === 'direct_marketing_future_pv_store_delegation_v1'
             && ($delegation['active'] ?? null) === true
@@ -3057,6 +3601,7 @@ function liveTrajectoryValidationReason($plan, $source, $canonicalPlan) {
             if (($selection['selected'] ?? null) !== true
                 || ($selection['executable'] ?? null) !== true
                 || ($selection['commands_allowed'] ?? null) !== true
+                || $standardProjectionBinding !== null
                 || preg_match('/^sha256:[0-9a-f]{64}$/', (string)($selection['action_id'] ?? '')) !== 1) {
                 return 'DIRECT_MARKETING_TRAJECTORY_ACTION_NOT_EXECUTABLE';
             }
@@ -3089,9 +3634,10 @@ function liveTrajectoryValidationReason($plan, $source, $canonicalPlan) {
             }
             $passiveBindingValid = is_array($passiveBinding)
                 && ($passiveBinding['schema'] ?? null) === 'direct_marketing_passive_normal_binding_v1'
+                && $standardProjectionBinding === null
                 && liveTrajectoryCanonicalJson($passiveBinding)
                     === liveTrajectoryCanonicalJson($projection['direct_marketing_passive_normal_binding_v1'] ?? null);
-            $transitionWithoutPassiveBinding = count($headroomEvidence['slots_by_bounds'] ?? []) > 0
+            $transitionWithoutPassiveBinding = $standardProjectionBindingValid
                 && $passiveBinding === null
                 && ($standardPassthroughValid || $standardTransitionValid);
             if (($selection['selected'] ?? null) !== false
@@ -3178,6 +3724,20 @@ function liveDirectMarketingTrajectoryForDisplay($plan, $enabled, $canonicalPlan
         'meta' => is_array($source['meta'] ?? null) ? $source['meta'] : null,
         'slots' => [],
     ];
+}
+
+function liveDirectMarketingShouldHideClassicalCurves(
+    $activePlan,
+    $trajectory,
+    $effectivePlanBound,
+    $targetProjectionAuthorized
+) {
+    if ($activePlan !== true || !is_array($trajectory)) return false;
+    $completeTrajectory = ($trajectory['active'] ?? null) === true
+        && ($trajectory['complete'] ?? null) === true
+        && in_array((string)($trajectory['status'] ?? ''), ['COMPLETE', 'COMPLETE_BOUNDED'], true);
+    return $completeTrajectory
+        && ($effectivePlanBound !== true || $targetProjectionAuthorized !== true);
 }
 
 function liveDirectMarketingSelectedActionFallbackForDisplay($plan, $enabled, $canonicalPlan, $planRawJson = null, $artifactSnapshot = null) {
@@ -4065,14 +4625,30 @@ if (is_array($liveData) && isset($liveData['PV_Power'])) {
                 $data['wb_status_amp'] = (float)($openwbData['status_amp'] ?? $openwbData['amp'] ?? 0);
                 liveApplyWallboxFineAmpFields($data, 'wb', $openwbData, $data['wb_set_amp']);
                 $wbSocSource = (string)($openwbData['car_soc_source'] ?? '');
-                $wbSocConfirmed = wallboxSocRuleConfirmed($wbSocSource, $openwbData['car_soc_rule_confirmed'] ?? null);
-                $wbSocValue = (float)($openwbData['car_soc'] ?? 0);
+                $wbSocSourceTs = wallboxSocSourceTimestamp(
+                    $openwbData,
+                    $wbSocSource
+                );
+                $wbSocValue = vehicleSocPercentValue($openwbData['car_soc'] ?? null);
+                $wbSocConfirmed = $wbSocValue !== null
+                    && !wallboxSocPayloadExplicitVetoed($openwbData)
+                    && wallboxSocTruthConfirmed(
+                    $wbSocSource,
+                    $openwbData['car_soc_rule_confirmed'] ?? null,
+                    $wbSocSourceTs,
+                    null,
+                    array_key_exists('car_soc_rule_confirmed', $openwbData),
+                    $openwbData
+                );
 
 // Status-Felder für UI: SoC nur anzeigen, wenn die Quelle regelbestätigt ist.
-                $data['wb_soc']             = ($wbSocConfirmed && $wbSocValue > 0) ? $wbSocValue : 0.0;
+                $data['wb_soc']             = $wbSocConfirmed ? $wbSocValue : 0.0;
                 $data['wb_soc_source']      = $wbSocSource;
-                $data['wb_soc_source_ts']   = (int)($openwbData['car_soc_source_ts'] ?? ($openwbData['car_soc_raw_ts'] ?? ($openwbData['ts'] ?? 0)));
+                $data['wb_soc_source_ts']   = $wbSocSourceTs;
                 $data['wb_soc_rule_confirmed'] = $wbSocConfirmed;
+                $data['wb_soc_age_contract'] = $openwbData['car_soc_age_contract'] ?? null;
+                $data['wb_soc_age_contract_source'] = $openwbData['car_soc_age_contract_source'] ?? null;
+                $data['wb_soc_max_age_s'] = $openwbData['car_soc_max_age_s'] ?? null;
                 $wbRangeContract = openwbTotalRangeContract($openwbData);
                 $data['wb_range'] = is_array($wbRangeContract)
                     ? (float)$wbRangeContract['range_km']
@@ -4089,7 +4665,7 @@ if (is_array($liveData) && isset($liveData['PV_Power'])) {
                         ? $wbRangeContract[$contractKey]
                         : null;
                 }
-                $data['wb_charged_range']   = ($wbSocConfirmed && $wbSocValue > 0) ? (float)($openwbData['car_charged_range'] ?? $openwbData['range_charged'] ?? 0) : 0.0;
+                $data['wb_charged_range']   = $wbSocConfirmed ? (float)($openwbData['car_charged_range'] ?? $openwbData['range_charged'] ?? 0) : 0.0;
                 $data['wb_plug']            = liveBoolValue($openwbData['plug_state'] ?? false);
                 $data['wb_locked']          = liveBoolValue(
                     $openwbData['locked'] ?? $openwbData['lock_state'] ?? $openwbData['plug_locked'] ?? null,
@@ -4135,7 +4711,7 @@ if (is_array($liveData) && isset($liveData['PV_Power'])) {
                 $data['wb_evse_a']          = round((float)($openwbData['evse_current'] ?? 0), 1);
                 $data['wb_cp_id']           = (int)($openwbData['cp_id'] ?? 3);
                 $data['wb_native_ip']       = $confData['config']['wb_native_ip'] ?? '';
-                $data['wb_soc']             = ($wbSocConfirmed && $wbSocValue > 0) ? $wbSocValue : 0.0;
+                $data['wb_soc']             = $wbSocConfirmed ? $wbSocValue : 0.0;
                 $data['wb_soc_source']      = $wbSocSource;
                 $data['wb_soc_rule_confirmed'] = $wbSocConfirmed;
                 $data['wb_charging']        = (bool)($openwbData['charge_state'] ?? false) || $owbPower > 50;
@@ -5440,12 +6016,28 @@ if (($wb2NativeType === 'openwb' || $wb2NativeType === 'openwb_pro')
         $data['wb2_cp_id'] = $openwbData2['cp_id'] ?? 'pro';
         $data['wb2_native_ip'] = $confData['config']['wb_native_ip2'] ?? '';
         $wb2SocSource = (string)($openwbData2['car_soc_source'] ?? '');
-        $wb2SocConfirmed = wallboxSocRuleConfirmed($wb2SocSource, $openwbData2['car_soc_rule_confirmed'] ?? null);
-        $wb2SocValue = (float)($openwbData2['car_soc'] ?? 0);
-        $data['wb2_soc'] = ($wb2SocConfirmed && $wb2SocValue > 0) ? $wb2SocValue : 0.0;
+        $wb2SocSourceTs = wallboxSocSourceTimestamp(
+            $openwbData2,
+            $wb2SocSource
+        );
+        $wb2SocValue = vehicleSocPercentValue($openwbData2['car_soc'] ?? null);
+        $wb2SocConfirmed = $wb2SocValue !== null
+            && !wallboxSocPayloadExplicitVetoed($openwbData2)
+            && wallboxSocTruthConfirmed(
+            $wb2SocSource,
+            $openwbData2['car_soc_rule_confirmed'] ?? null,
+            $wb2SocSourceTs,
+            null,
+            array_key_exists('car_soc_rule_confirmed', $openwbData2),
+            $openwbData2
+        );
+        $data['wb2_soc'] = $wb2SocConfirmed ? $wb2SocValue : 0.0;
         $data['wb2_soc_source'] = $wb2SocSource;
-        $data['wb2_soc_source_ts'] = (int)($openwbData2['car_soc_source_ts'] ?? ($openwbData2['car_soc_raw_ts'] ?? ($openwbData2['ts'] ?? 0)));
+        $data['wb2_soc_source_ts'] = $wb2SocSourceTs;
         $data['wb2_soc_rule_confirmed'] = $wb2SocConfirmed;
+        $data['wb2_soc_age_contract'] = $openwbData2['car_soc_age_contract'] ?? null;
+        $data['wb2_soc_age_contract_source'] = $openwbData2['car_soc_age_contract_source'] ?? null;
+        $data['wb2_soc_max_age_s'] = $openwbData2['car_soc_max_age_s'] ?? null;
         $wb2RangeContract = openwbTotalRangeContract($openwbData2);
         $data['wb2_range'] = is_array($wb2RangeContract)
             ? (float)$wb2RangeContract['range_km']
@@ -6441,18 +7033,43 @@ if (is_readable($temp_file)) {
 $vehiclesFile = '/var/www/html/ramdisk/vehicles.json';
 if (file_exists($vehiclesFile)) {
     $vData = @json_decode(file_get_contents($vehiclesFile), true);
+    $bluelinkRefresh = vehicleBluelinkRefreshProjection($vData);
+    if ($bluelinkRefresh !== null) {
+        $data['bluelink_refresh'] = $bluelinkRefresh;
+        $data['bluelink_source_ts'] = $bluelinkRefresh['source_ts'];
+        $data['bluelink_source_age_s'] = $bluelinkRefresh['source_age_s'];
+    }
     if ($vData && isset($vData['vehicles'])) {
         $data['vehicles'] = $vData['vehicles'];
         foreach ($data['vehicles'] as &$cloudVeh) {
             if (is_array($cloudVeh)) {
-                if (empty($cloudVeh['soc_source'])) $cloudVeh['soc_source'] = 'bluelink';
-                if (empty($cloudVeh['cloud_vehicle_id']) && !empty($cloudVeh['id'])) $cloudVeh['cloud_vehicle_id'] = $cloudVeh['id'];
+                if (empty($cloudVeh['soc_source'])) {
+                    $cloudVeh['soc_source'] = 'legacy_vehicle_unknown';
+                    if (!array_key_exists('soc_source_ts', $cloudVeh)) {
+                        $cloudVeh['soc_source_ts'] = null;
+                        $cloudVeh['last_updated_at'] = null;
+                    }
+                    $cloudVeh['soc_rule_confirmed'] = false;
+                    $cloudVeh['soc_stale'] = true;
+                }
+                $vehicleSource = strtolower(trim((string)$cloudVeh['soc_source']));
+                if (in_array($vehicleSource, ['bluelink', 'hyundai', 'kia', 'cloud', 'vehicle_cloud'], true)
+                    && empty($cloudVeh['cloud_vehicle_id']) && !empty($cloudVeh['id'])) {
+                    $cloudVeh['cloud_vehicle_id'] = $cloudVeh['id'];
+                }
             }
         }
         unset($cloudVeh);
     }
     if ($vData && !empty($vData['error'])) {
         $data['car_error'] = $vData['error'];
+    } elseif ($bluelinkRefresh !== null
+        && !empty($bluelinkRefresh['last_error_active'])
+        && !empty($bluelinkRefresh['last_error']['message'])) {
+        // Ein späterer Cached-Abruf kann technisch erfolgreich sein und
+        // trotzdem denselben alten Fahrzeugstand liefern. In diesem Fall
+        // bleibt der erfolglose Wakeup sichtbar, bis der Quellanker fortschreitet.
+        $data['car_error'] = $bluelinkRefresh['last_error']['message'];
     }
 }
 
@@ -6464,7 +7081,9 @@ $owbCarId   = null;
 $owbVehicleId = null;
 $owbCapKwh  = 0.0;
 $owbConsumptionKwh100 = 0.0;
-$owbWbSoc   = isset($data['wb_soc']) ? (float)$data['wb_soc'] : 0.0;
+$owbWbSoc   = vehicleSocPercentValue($data['wb_soc'] ?? null);
+$owbWbSocConfirmed = $owbWbSoc !== null
+    && ($data['wb_soc_rule_confirmed'] ?? null) === true;
 $owbWbRange = isset($data['wb_range']) ? (float)$data['wb_range'] : 0.0;
 $owbWbPlug  = isset($data['wb_plug']) ? (bool)$data['wb_plug'] : false;
 $owbStableIdentityCurrent = !empty($data['wb_stable_vehicle_identity_current']);
@@ -6568,10 +7187,10 @@ injectConfiguredWallboxVehicle($data, $savedCars, $confData['config'] ?? [], 2);
 // zugeschrieben werden.
 $owbDisplayName = trim((string)($data['wb_display_car_name'] ?? ''));
 $owbActiveVehicle = wallboxSlotLooksConnected($data, 1);
-if ($owbActiveVehicle && ($owbWbSoc > 0 || $owbDisplayName !== '')) {
+if ($owbActiveVehicle && ($owbWbSocConfirmed || $owbDisplayName !== '')) {
     $displayName = $owbDisplayName !== '' ? $owbDisplayName : ($owbCarName ?: 'openWB');
     $vehicleId   = $owbMatchedSavedId ?: ($owbStableIdentityCurrent && $owbCarId ? $owbCarId : 'openwb_observed_wb1');
-    $displaySoc = $owbStableIdentityCurrent && $owbWbSoc > 0 ? $owbWbSoc : null;
+    $displaySoc = $owbStableIdentityCurrent && $owbWbSocConfirmed ? $owbWbSoc : null;
     array_unshift($data['vehicles'], [
         'id'              => $vehicleId,
         'profile_id'      => $owbMatchedSavedId,
@@ -6589,7 +7208,10 @@ if ($owbActiveVehicle && ($owbWbSoc > 0 || $owbDisplayName !== '')) {
         'is_plugged_in'   => $owbWbPlug,
         'is_charging'     => $owbWbPlug && (($data['wb'] ?? 0) > 50),
         'soc_source'      => !empty($data['wb_soc_source']) ? $data['wb_soc_source'] : 'ccs_wallbox',
-        'soc_rule_confirmed' => $displaySoc !== null && !empty($data['wb_soc_rule_confirmed']),
+        'soc_rule_confirmed' => $displaySoc !== null && ($data['wb_soc_rule_confirmed'] ?? null) === true,
+        'soc_age_contract' => $data['wb_soc_age_contract'] ?? null,
+        'soc_age_contract_source' => $data['wb_soc_age_contract_source'] ?? null,
+        'soc_max_age_s' => $data['wb_soc_max_age_s'] ?? null,
         'wb_slot'         => 1,
         'car_id'          => $owbStableIdentityCurrent ? ($data['wb_car_id'] ?? ($owbCarId ?? null)) : null,
         'rfid_tag'        => $owbStableIdentityCurrent ? ($data['wb_rfid_tag'] ?? null) : null,
@@ -6597,19 +7219,22 @@ if ($owbActiveVehicle && ($owbWbSoc > 0 || $owbDisplayName !== '')) {
         'stable_vehicle_identity_current' => $owbStableIdentityCurrent,
         'is_manual'       => false,
         'is_interpolated' => strpos((string)($data['wb_soc_source'] ?? ''), 'estimated') !== false,
-        'last_updated_at' => (int)($data['wb_soc_source_ts'] ?? time())
+        'soc_source_ts'   => vehicleSocTimestamp($data['wb_soc_source_ts'] ?? null),
+        'last_updated_at' => vehicleSocTimestamp($data['wb_soc_source_ts'] ?? null)
     ]);
     $owbVehicleInjected = true;
 }
 
 // openWB Pro / zweite openWB: Fahrzeugkennung, SoC und RFID für WB2 einmischen.
-$owb2WbSoc = isset($data['wb2_soc']) ? (float)$data['wb2_soc'] : 0.0;
+$owb2WbSoc = vehicleSocPercentValue($data['wb2_soc'] ?? null);
+$owb2WbSocConfirmed = $owb2WbSoc !== null
+    && ($data['wb2_soc_rule_confirmed'] ?? null) === true;
 $owb2MatchedSavedId = null;
 $owb2VehicleInjected = false;
 $owb2ActiveVehicle = !empty($data['wb2_plug']) || !empty($data['wb2_charging']) || abs((float)($data['wb2'] ?? 0)) > 50;
 $owb2StableIdentityCurrent = !empty($data['wb2_stable_vehicle_identity_current']);
 $owb2DisplayName = trim((string)($data['wb2_display_car_name'] ?? ''));
-if ($owb2ActiveVehicle && ($owb2WbSoc > 0 || $owb2DisplayName !== '' || !empty($data['wb2_car_name']))) {
+if ($owb2ActiveVehicle && ($owb2WbSocConfirmed || $owb2DisplayName !== '' || !empty($data['wb2_car_name']))) {
     $owb2CarName = trim((string)($data['wb2_car_name'] ?? ''));
     $owb2CarId = $data['wb2_car_id'] ?? ($data['wb2_vehicle_id'] ?? ($data['wb2_rfid_tag'] ?? 'openwb_pro_wb2'));
     $owb2CapKwh = 0.0;
@@ -6628,7 +7253,7 @@ if ($owb2ActiveVehicle && ($owb2WbSoc > 0 || $owb2DisplayName !== '' || !empty($
         $owb2ConsumptionKwh100 = (float)($owb2MatchedCar['consumption'] ?? $owb2MatchedCar['consumption_kwh_100km'] ?? $owb2MatchedCar['avg_consumption'] ?? 0);
         $owb2MatchedSavedId = $owb2MatchedCar['id'] ?? null;
     }
-    $wb2DisplaySoc = $owb2StableIdentityCurrent && $owb2WbSoc > 0 ? $owb2WbSoc : null;
+    $wb2DisplaySoc = $owb2StableIdentityCurrent && $owb2WbSocConfirmed ? $owb2WbSoc : null;
     $data['vehicles'][] = [
         'id'              => $owb2MatchedSavedId ?: ($owb2StableIdentityCurrent ? $owb2CarId : 'openwb_observed_wb2'),
         'profile_id'      => $owb2MatchedSavedId,
@@ -6646,7 +7271,10 @@ if ($owb2ActiveVehicle && ($owb2WbSoc > 0 || $owb2DisplayName !== '' || !empty($
         'is_plugged_in'   => !empty($data['wb2_plug']),
         'is_charging'     => !empty($data['wb2_charging']) || (($data['wb2'] ?? 0) > 50),
         'soc_source'      => !empty($data['wb2_soc_source']) ? $data['wb2_soc_source'] : 'ccs_wallbox_wb2',
-        'soc_rule_confirmed' => $wb2DisplaySoc !== null && !empty($data['wb2_soc_rule_confirmed']),
+        'soc_rule_confirmed' => $wb2DisplaySoc !== null && ($data['wb2_soc_rule_confirmed'] ?? null) === true,
+        'soc_age_contract' => $data['wb2_soc_age_contract'] ?? null,
+        'soc_age_contract_source' => $data['wb2_soc_age_contract_source'] ?? null,
+        'soc_max_age_s' => $data['wb2_soc_max_age_s'] ?? null,
         'wb_slot'         => 2,
         'car_id'          => $owb2StableIdentityCurrent ? ($data['wb2_car_id'] ?? ($owb2CarId ?? null)) : null,
         'rfid_tag'        => $owb2StableIdentityCurrent ? ($data['wb2_rfid_tag'] ?? null) : null,
@@ -6654,7 +7282,8 @@ if ($owb2ActiveVehicle && ($owb2WbSoc > 0 || $owb2DisplayName !== '' || !empty($
         'stable_vehicle_identity_current' => $owb2StableIdentityCurrent,
         'is_manual'       => false,
         'is_interpolated' => strpos((string)($data['wb2_soc_source'] ?? ''), 'estimated') !== false,
-        'last_updated_at' => (int)($data['wb2_soc_source_ts'] ?? time())
+        'soc_source_ts'   => vehicleSocTimestamp($data['wb2_soc_source_ts'] ?? null),
+        'last_updated_at' => vehicleSocTimestamp($data['wb2_soc_source_ts'] ?? null)
     ];
     $owb2VehicleInjected = true;
 }
@@ -6674,16 +7303,40 @@ if (!empty($savedCars)) {
             $manSoC = "/var/www/html/ramdisk/manual_soc_wb{$idx}.json";
             if (file_exists($manSoC)) {
                 $mD = @json_decode(file_get_contents($manSoC), true);
+                if (!is_array($mD)) $mD = null;
+                if ($mD && !wallboxPayloadSlotMatches($mD, $idx, true)) continue;
                 $manualCarId = $mD['car_id'] ?? '';
                 $manualProfileId = savedCarIdForVehicleIdentifiers($savedCars, [
                     'profile_id' => $mD['profile_id'] ?? $manualCarId,
                     'car_id' => $manualCarId,
                     'vehicle_id' => $mD['vehicle_id'] ?? '',
                 ], $mD['name'] ?? '');
-                $manualSlot = (int)($mD['wb'] ?? $idx);
-                $manualSocConfirmed = $mD && wallboxSocRuleConfirmed($mD['source'] ?? '', $mD['soc_rule_confirmed'] ?? null);
+                $manualSlot = $idx;
+                $manualSource = (string)($mD['source'] ?? 'manual_soc');
+                $manualSourceLower = strtolower(trim($manualSource));
+                $manualSourceTs = vehicleSocTimestamp(
+                    $mD['soc_source_ts'] ?? ($mD['raw_soc_ts'] ?? null)
+                );
+                $manualNeedsExplicitAnchor = vehicleSocUsesOpenwbProAnchor($manualSourceLower)
+                    || vehicleSocUsesMqttAnchor($manualSourceLower)
+                    || vehicleSocSourceClass($manualSourceLower) === 'cloud'
+                    || strpos($manualSourceLower, 'wallbox_estimated') === 0;
+                if ($manualSourceTs === null && !$manualNeedsExplicitAnchor) {
+                    $manualSourceTs = vehicleSocTimestamp($mD['ts'] ?? null);
+                }
+                $manualProbe = is_array($mD) ? $mD : [];
+                $manualProbe['soc_source'] = $manualSource;
+                $manualProbe['soc_source_ts'] = $manualSourceTs;
+                $manualProbe['profile_id'] = $manualProfileId;
+                $manualMeta = vehicleSocTruthMeta(
+                    $manualProbe,
+                    null,
+                    vehicleSocCloudFreshnessSeconds($confData['config'] ?? [])
+                );
+                $manualSocConfirmed = !vehicleSocExplicitVetoed($mD, true)
+                    && !empty($manualMeta['rule_usable']);
                 if ($mD
-                    && !empty($mD['soc_profile_binding_invalid'])
+                    && vehicleSocContractFlagActive($mD['soc_profile_binding_invalid'] ?? null)
                     && $manualProfileId !== null
                     && $manualProfileId === ($sc['id'] ?? '')
                     && wallboxSlotLooksConnected($data, $manualSlot)) {
@@ -6696,13 +7349,17 @@ if (!empty($savedCars)) {
                 }
                 if ($mD && $manualSocConfirmed && $manualProfileId !== null && $manualProfileId === ($sc['id'] ?? '') && wallboxSlotLooksConnected($data, $manualSlot)) {
                     $sc['soc'] = $mD['soc'];
-                    $sc['soc_source'] = $mD['source'] ?? 'manual_soc';
+                    $sc['soc_source'] = $manualSource;
                     $sc['soc_rule_confirmed'] = true;
+                    $sc['soc_age_contract'] = $mD['soc_age_contract'] ?? null;
+                    $sc['soc_age_contract_source'] = $mD['soc_age_contract_source'] ?? null;
+                    $sc['soc_max_age_s'] = $mD['soc_max_age_s'] ?? null;
                     $sc['soc_profile_bound'] = !empty($mD['soc_profile_bound']);
                     $sc['is_interpolated'] = !empty($mD['is_interpolated']) || strpos((string)($mD['source'] ?? ''), 'estimated') !== false;
                     if (!empty($mD['range_km'])) $sc['range_km'] = (float)$mD['range_km'];
                     if (!empty($mD['consumption_kwh_100km'])) $sc['consumption_kwh_100km'] = (float)$mD['consumption_kwh_100km'];
                     $sc['last_updated_at'] = (int)($mD['ts'] ?? time());
+                    $sc['soc_source_ts'] = $manualSourceTs;
                     $sc['wb_slot'] = $manualSlot;
                     $sc['is_plugged_in'] = true;
                     $sc['is_charging'] = !empty($mD['charging']);
@@ -6742,14 +7399,36 @@ $sessions = [
 
 foreach ($sessions as $sIndex => $sConf) {
     $sessData = is_array($sConf['data'] ?? null) ? $sConf['data'] : [];
+    if ($sessData && !wallboxPayloadSlotMatches($sessData, $sIndex + 1, true)) {
+        continue;
+    }
     if ($sessData) {
             $vSoc = $sessData['current_virtual_soc'] ?? null;
             $tTar = $sessData['time_to_target_mins'] ?? null;
             $carId = $sessData['car_id'] ?? null;
             $isManual = $sessData['is_manual'] ?? false;
             $sessionSocSource = (string)($sessData['soc_source'] ?? '');
-            $sessionSocConfirmed = wallboxSocRuleConfirmed($sessionSocSource, $sessData['soc_rule_confirmed'] ?? null);
             $sessionTs = (float)($sessData['ts'] ?? 0);
+            $sessionSourceTs = vehicleSocTimestamp($sessData['soc_source_ts'] ?? null);
+            if ($sessionSourceTs === null) {
+                $sessionSourceTs = vehicleSocTimestamp(
+                    !empty($sessData['is_manual'])
+                        ? ($sessData['last_manual_ts'] ?? null)
+                        : ($sessData['last_car_ts'] ?? null)
+                );
+            }
+            $vSoc = vehicleSocPercentValue($vSoc);
+            $sessionSocConfirmed = $vSoc !== null
+                && !vehicleSocExplicitVetoed($sessData, true)
+                && wallboxSocTruthConfirmed(
+                    $sessionSocSource,
+                    $sessData['soc_rule_confirmed'] ?? null,
+                    $sessionSourceTs,
+                    null,
+                    array_key_exists('soc_rule_confirmed', $sessData),
+                    $sessData,
+                    vehicleSocCloudFreshnessSeconds($confData['config'] ?? [])
+                );
             $customName = !empty($sessData['car_name']) ? $sessData['car_name'] : (($sIndex == 0) ? 'Gast (WB1)' : 'Gast (WB2)');
             $wbPrefix = ($sIndex == 0) ? 'wb' : 'wb2';
             $sessionWbConnected = !empty($data[$wbPrefix . '_plug'])
@@ -6776,9 +7455,10 @@ foreach ($sessions as $sIndex => $sConf) {
                     if ($sessionProfileId && (($v['id'] ?? null) == $sessionProfileId || ($v['profile_id'] ?? null) == $sessionProfileId)) { $vIdx = $i; break; }
                     if ($carId && ($v['id'] ?? null) == $carId) { $vIdx = $i; break; }
                 }
-                // Fallback für WB1 falls kein Match aber WB1 belegt
-                if ($vIdx == -1 && $sIndex == 0 && count($data['vehicles']) > 0 && (empty($carId) || $carId === 'car1')) {
-                    $vIdx = 0;
+                // Alter WB1-Sessionname car1/leer besitzt keine Identität. Er
+                // darf nur bei genau einer logischen Fahrzeugidentität binden.
+                if ($vIdx == -1 && $sIndex == 0 && (empty($carId) || $carId === 'car1')) {
+                    $vIdx = legacySessionSingleVehicleIndex($data['vehicles']);
                 }
             }
 
@@ -6798,11 +7478,16 @@ foreach ($sessions as $sIndex => $sConf) {
             if ($vIdx !== -1) {
                 $veh = &$data['vehicles'][$vIdx];
                 if ($sessionProfileId && empty($veh['profile_id'])) $veh['profile_id'] = $sessionProfileId;
-                $vehicleTs = (float)($veh['last_updated_at'] ?? 0);
-                $sessionFreshForVehicle = ($sessionTs <= 0 || $vehicleTs <= 0 || ($sessionTs + 120) >= $vehicleTs);
+                // Der zyklische Session-Zeitpunkt belegt nur eine frische
+                // Projektion. Ob ihr Ist-SoC einen vorhandenen Cloud-/CCS-Wert
+                // ersetzen darf, entscheidet ausschließlich der Rohanker.
+                $sessionFreshForVehicle = vehicleSocSourceNotOlderThan(
+                    $veh,
+                    $sessionSourceTs,
+                    120
+                );
                 // Interpolierten SoC NUR uebernehmen, wenn er nicht aelter als echte Cloud-/CCS-Daten ist.
-                if ($sessionFreshForVehicle && !$wbSlotHasCcs && $vSoc !== null && ($isManual || $vSoc > ($veh['soc'] ?? 0))) {
-                    $sessionSocConfirmed = $sessionSocConfirmed || wallboxVehicleSocConfirmed($veh);
+                if ($sessionFreshForVehicle && !$wbSlotHasCcs && $vSoc !== null) {
                     if ($sessionSocConfirmed) {
                         $veh['soc'] = $vSoc;
                         $veh['is_interpolated'] = true;
@@ -6810,6 +7495,11 @@ foreach ($sessions as $sIndex => $sConf) {
                             $veh['soc_source'] = $sessionSocSource;
                             $veh['soc_rule_confirmed'] = true;
                         }
+                        $veh['soc_source_ts'] = $sessionSourceTs;
+                        $veh['soc_age_contract'] = $sessData['soc_age_contract'] ?? null;
+                        $veh['soc_age_contract_source'] = $sessData['soc_age_contract_source'] ?? null;
+                        $veh['soc_max_age_s'] = $sessData['soc_max_age_s'] ?? null;
+                        if ($sessionTs > 0) $veh['last_updated_at'] = (int)$sessionTs;
                     }
                 }
                 if ($sessionFreshForVehicle && $tTar !== null) $veh['time_to_target_mins'] = $tTar;
@@ -6830,7 +7520,7 @@ foreach ($sessions as $sIndex => $sConf) {
                     $data['vehicles'][] = [
                         'id'                  => $sessionProfileId ?: ($carId ?: ('manual_wb' . ($sIndex + 1))),
                         'name'                => $customName,
-                        'soc'                 => $vSoc ?? 0,
+                        'soc'                 => $sessionSocConfirmed ? $vSoc : null,
                         'is_plugged_in'       => true,
                         'is_charging'         => ($data[$sConf['wb']] ?? 0) > 50,
                         'time_to_target_mins' => $tTar,
@@ -6839,7 +7529,11 @@ foreach ($sessions as $sIndex => $sConf) {
                         'is_manual'           => true,
                         'soc_source'          => $sessionSocSource,
                         'soc_rule_confirmed'  => $sessionSocConfirmed,
-                        'last_updated_at'     => time()
+                        'soc_source_ts'       => $sessionSourceTs,
+                        'soc_age_contract'    => $sessData['soc_age_contract'] ?? null,
+                        'soc_age_contract_source' => $sessData['soc_age_contract_source'] ?? null,
+                        'soc_max_age_s'       => $sessData['soc_max_age_s'] ?? null,
+                        'last_updated_at'     => $sessionTs > 0 ? (int)$sessionTs : null
                     ];
                 }
             }
@@ -6885,6 +7579,20 @@ if (isset($data['vehicles']) && is_array($data['vehicles'])) {
     $dedupedVehicles = [];
     $vehicleIndexById = [];
     $vehicleIndexByName = [];
+    $vehicleIdentityBoundByIndex = [];
+    foreach (ambiguousSavedCarNameKeys($savedCars ?? []) as $ambiguousNameKey) {
+        // Die bekannte Profilmehrdeutigkeit gilt bereits vor dem ersten
+        // Live-Datensatz. So kann dessen Reihenfolge kein Profil erraten.
+        $vehicleIndexByName[$ambiguousNameKey] = null;
+    }
+    $legacyConfigPath = !empty($paths['valid']) && !empty($paths['install_path'])
+        ? rtrim((string)$paths['install_path'], '/') . '/e3dc.config.txt'
+        : null;
+    $vehicleSocCloudFreshnessS = vehicleSocResolvedCloudFreshnessSeconds(
+        $wallboxConfig ?? [],
+        '/var/www/html/data/e3dc_v4.json',
+        $legacyConfigPath
+    );
     foreach ($data['vehicles'] as $veh) {
         if (!is_array($veh)) continue;
         $vehicleWbSlot = (int)($veh['wb_slot'] ?? 0);
@@ -6925,18 +7633,28 @@ if (isset($data['vehicles']) && is_array($data['vehicles'])) {
         }
         $nameKey = normalizeVehicleMergeKey($veh['name'] ?? '');
         $profileKey = !empty($veh['profile_id']) ? ('profile:' . $veh['profile_id']) : '';
+        $currentIdentityBound = vehicleRecordHasBoundDedupeIdentity($veh);
 
         $mergeIndex = null;
         if ($profileKey !== '' && isset($vehicleIndexById[$profileKey])) {
             $mergeIndex = $vehicleIndexById[$profileKey];
         } elseif ($id !== '' && isset($vehicleIndexById[$id])) {
             $mergeIndex = $vehicleIndexById[$id];
-        } elseif ($nameKey !== '' && isset($vehicleIndexByName[$nameKey])) {
-            $mergeIndex = $vehicleIndexByName[$nameKey];
+        } else {
+            $mergeIndex = vehicleNameFallbackMergeIndex(
+                $nameKey,
+                $vehicleIndexByName,
+                $vehicleIdentityBoundByIndex,
+                $currentIdentityBound
+            );
         }
 
         if ($mergeIndex !== null) {
-            $dedupedVehicles[$mergeIndex] = mergeVehicleRecords($dedupedVehicles[$mergeIndex], $veh);
+            $dedupedVehicles[$mergeIndex] = mergeVehicleRecords(
+                $dedupedVehicles[$mergeIndex],
+                $veh,
+                $vehicleSocCloudFreshnessS
+            );
         } else {
             $mergeIndex = count($dedupedVehicles);
             $dedupedVehicles[] = $veh;
@@ -6944,10 +7662,16 @@ if (isset($data['vehicles']) && is_array($data['vehicles'])) {
 
         if ($profileKey !== '') $vehicleIndexById[$profileKey] = $mergeIndex;
         if ($id !== '') $vehicleIndexById[$id] = $mergeIndex;
-        if ($nameKey !== '') $vehicleIndexByName[$nameKey] = $mergeIndex;
+        $vehicleIdentityBoundByIndex[$mergeIndex] = $currentIdentityBound
+            || (($vehicleIdentityBoundByIndex[$mergeIndex] ?? false) === true);
+        $vehicleIndexByName = registerVehicleNameMergeIndex(
+            $vehicleIndexByName,
+            $nameKey,
+            $mergeIndex
+        );
     }
     foreach ($dedupedVehicles as &$dedupedVehicle) {
-        sanitizeWallboxVehicleSoc($dedupedVehicle);
+        sanitizeWallboxVehicleSoc($dedupedVehicle, $vehicleSocCloudFreshnessS);
     }
     unset($dedupedVehicle);
     $data['vehicles'] = array_values($dedupedVehicles);
@@ -7661,17 +8385,21 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
         $activeDirectMarketingPlan = is_array($directMarketingForCurve)
             && ($directMarketingForCurve['active'] ?? null) === true
             && ($directMarketingForCurve['shadow'] ?? false) !== true;
-        $effectiveProjectionHidden = $activeDirectMarketingPlan
-            && (!$effectiveStoragePlanBound
-                || ($effectiveStoragePlan['target_projection_authorized'] ?? null) !== true);
-        if ($effectiveStoragePlanBound) {
-            $data['effective_storage_plan'] = $effectiveStoragePlan;
-        }
-        $data['direct_marketing_trajectory'] = liveDirectMarketingTrajectoryForDisplay(
+        $directMarketingTrajectoryForDisplay = liveDirectMarketingTrajectoryForDisplay(
             $storPlan,
             $directMarketingConfigured,
             $canonicalPlan
         );
+        $effectiveProjectionHidden = liveDirectMarketingShouldHideClassicalCurves(
+            $activeDirectMarketingPlan,
+            $directMarketingTrajectoryForDisplay,
+            $effectiveStoragePlanBound,
+            $effectiveStoragePlan['target_projection_authorized'] ?? null
+        );
+        if ($effectiveStoragePlanBound) {
+            $data['effective_storage_plan'] = $effectiveStoragePlan;
+        }
+        $data['direct_marketing_trajectory'] = $directMarketingTrajectoryForDisplay;
         $data['direct_marketing_selected_action_fallback'] = liveDirectMarketingSelectedActionFallbackForDisplay(
             $storPlan,
             $directMarketingConfigured,

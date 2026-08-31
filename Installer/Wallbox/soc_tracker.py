@@ -748,6 +748,117 @@ def _unique_saved_profile(selected_id):
     return dict(matches[0]) if len(matches) == 1 else None
 
 
+def _manual_profile_binding(record, selected_id):
+    """Typisiere einen Nutzeranker nur gegen genau ein gespeichertes Profil.
+
+    Die Wallbox muss dafür keine stabile Fahrzeug-ID liefern. Die Bindung gilt
+    ausschließlich für SoC, Anzeige und Planung; widersprüchliche zusätzliche
+    Kennungen oder explizite Vetos bleiben fail-closed.
+    """
+
+    if (
+        not isinstance(record, dict)
+        or _soc_record_vetoed(
+            record,
+            include_profile_binding=False,
+            include_plug_state=False,
+        )
+        or not _record_matches_selected_vehicle(record, selected_id)
+    ):
+        return None
+    profile = _unique_saved_profile(selected_id)
+    if not profile:
+        return None
+    profile_aliases = _compact_aliases(profile)
+    record_aliases = _compact_aliases(
+        record,
+        (
+            "id", "profile_id", "car_id", "vehicle_id",
+            "cloud_vehicle_id", "rfid_tag", "vehicle_key",
+        ),
+    )
+    canonical_profile_id = str(profile.get("id") or selected_id or "").strip()
+    if (
+        not canonical_profile_id
+        or not profile_aliases
+        or not record_aliases
+        or not record_aliases.issubset(profile_aliases)
+        or _compact_id(canonical_profile_id) not in profile_aliases
+    ):
+        return None
+    return {
+        "profile": profile,
+        "profile_id": canonical_profile_id,
+    }
+
+
+def _repair_confirmed_manual_profile_binding(state, selected_id, wb_id):
+    """Repariere ausschließlich den bekannten alten False-Producerzustand."""
+
+    if (
+        not isinstance(state, dict)
+        or state.get("soc_profile_bound") is not False
+        or state.get("soc_rule_confirmed") is not True
+        or str(state.get("anchor_source") or "").strip().lower()
+        not in CONFIRMED_MANUAL_SOC_SOURCES
+    ):
+        return False
+    projection = _read_manual_soc(wb_id, None)
+    projection_source = str((projection or {}).get("source") or "").strip().lower()
+    projection_raw_source = str(
+        (projection or {}).get("raw_source") or projection_source
+    ).strip().lower()
+    projection_anchor_ts = _timestamp(
+        (projection or {}).get(
+            "raw_soc_ts",
+            (projection or {}).get("soc_source_ts"),
+        ),
+        0.0,
+    )
+    state_anchor_ts = _timestamp(state.get("anchor_sample_ts"), 0.0)
+    projection_raw_soc = (projection or {}).get("raw_soc")
+    projection_raw_soc_value = (
+        _safe_float(projection_raw_soc, -1.0)
+        if not isinstance(projection_raw_soc, bool)
+        else -1.0
+    )
+    state_anchor_soc = _safe_float(state.get("anchor_soc"), -1.0)
+    state_binding = _manual_profile_binding(state, selected_id)
+    projection_binding = _manual_profile_binding(projection, selected_id)
+    if (
+        not isinstance(projection, dict)
+        or projection.get("soc_profile_bound") is not False
+        or projection.get("soc_rule_confirmed") is not True
+        or not _record_wallbox_binding_valid(
+            projection,
+            wb_id,
+            require_plugged=True,
+            allow_legacy_missing_slot=False,
+        )
+        or projection_source not in {
+            projection_raw_source,
+            f"{ESTIMATED_PREFIX}_from_{projection_raw_source}",
+        }
+        or projection_raw_source
+        != str(state.get("anchor_source") or "").strip().lower()
+        or projection_raw_source not in CONFIRMED_MANUAL_SOC_SOURCES
+        or projection_anchor_ts <= 0.0
+        or abs(projection_anchor_ts - state_anchor_ts) > 1.0
+        or not math.isfinite(projection_raw_soc_value)
+        or not math.isfinite(state_anchor_soc)
+        or projection_raw_soc_value < 0.0
+        or state_anchor_soc < 0.0
+        or abs(projection_raw_soc_value - state_anchor_soc) > 0.05
+        or not state_binding
+        or not projection_binding
+        or state_binding["profile_id"] != projection_binding["profile_id"]
+    ):
+        return False
+    state["profile_id"] = state_binding["profile_id"]
+    state["soc_profile_bound"] = True
+    return True
+
+
 def _truthy(value):
     if isinstance(value, bool):
         return value
@@ -1382,15 +1493,32 @@ class VehicleSocTracker:
             and not _record_matches_selected_vehicle(data, selected_id)
         ):
             return None
+        profile_binding = _manual_profile_binding(data, selected_id)
+        canonical_profile_id = (
+            profile_binding["profile_id"]
+            if profile_binding
+            else ""
+        )
+        bound_profile = profile_binding["profile"] if profile_binding else {}
         return {
             "soc": _clamp_percent(soc),
             "ts": sample_ts,
             "source": source,
             "soc_rule_confirmed": True,
-            "car_id": car_id or selected_id,
+            "car_id": canonical_profile_id or car_id or selected_id,
             "vehicle_id": vehicle_id,
-            "name": str(data.get("name") or "").strip(),
-            "capacity_kwh": _safe_float(data.get("capacity"), 0.0),
+            "name": str(
+                data.get("name") or bound_profile.get("name") or ""
+            ).strip(),
+            "capacity_kwh": _safe_float(
+                data.get("capacity"),
+                _safe_float(
+                    bound_profile.get("capacity", bound_profile.get("capacity_kwh")),
+                    0.0,
+                ),
+            ),
+            "profile_id": canonical_profile_id,
+            "soc_profile_bound": profile_binding is not None,
         }
 
     def _vehicle_sample(self, wb_id, selected_id, config=None):
@@ -1597,6 +1725,8 @@ class VehicleSocTracker:
             wb_id=wb_id,
             vehicle_key=vehicle_key,
         )
+        if state_anchor_valid and connected and not is_openwb_pro:
+            _repair_confirmed_manual_profile_binding(state, selected_id, wb_id)
         needs_anchor = (
             not state_anchor_valid
             or (is_openwb_pro and (state.get("soc_profile_bound") is not True or not state.get("plug_session_id")))

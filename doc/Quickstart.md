@@ -2,9 +2,20 @@
 
 Diese Anleitung fasst die schnellsten Schritte zusammen, um E3DC-Control auf einem frischen Raspberry Pi OS (oder ähnlichem Debian-System) zu installieren.
 
-Aktueller Stable-Stand: `v5.4.4h`.
+Aktueller Stable-Stand: `v5.4.4i`.
 
-5.4.4h bestätigt den Update-Systemjob über aktive systemd-Unit, MainPID,
+5.4.4i führt die steuernden Dateitypprüfungen von Web-Launcher,
+Community-Bootstrap und systemd-Worker in einer festen C-Locale aus.
+Lokalisierte `stat`-Ausgaben lehnen zulässige root-kontrollierte Pfade damit
+nicht mehr fälschlich ab; Eigentümer-, Modus-, Symlink- und Hardlinkschutz
+bleiben bestehen. Der manuell gespeicherte Fahrzeug-SoC bleibt an echten
+Aktionszeitpunkt, Profil, Wallbox und Steckkontext gebunden. Die
+Wallbox-Regelung hält in `PV-Kurve ruhig` den physischen Mindeststrom bis zum
+bestehenden Wh-Entscheid und lässt eine zentrale Prioritäts- oder Schutz-Null
+am endgültigen Ausgang gewinnen. EFY-Herstellerautonomie, direkt
+kommandierbare Phasen und elektrische Phasenreserve bleiben getrennt.
+
+Der enthaltene Stand aus 5.4.4h bestätigt den Update-Systemjob über aktive systemd-Unit, MainPID,
 Prozess und root-kontrollierten Status, bevor Ziel-Updater oder Produktpfad
 beginnen. Der eigenständige Community-Bootstrap darf das private Zielrelease
 vorher sicher binden, führt es aber noch nicht aus. Ein früher Startfehler nennt eine konkrete Ursache und den sicheren
@@ -419,7 +430,7 @@ Ohne das Label bleibt auch ein versehentlich gestarteter Watchtower für den
 Hauptcontainer wirkungslos. Der oben gezeigte manuelle Host-Helfer bleibt der
 empfohlene Updateweg.
 
-**Docker-Rückfall von v5.4.4h auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.4.4i auf den veröffentlichten Docker-Rollback-Root:**
 ```bash
 (
   set -euo pipefail

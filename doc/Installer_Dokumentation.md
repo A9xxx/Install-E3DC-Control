@@ -1,6 +1,6 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.4h
+Dokumentation Stand: 5.4.4i
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
@@ -14,7 +14,14 @@ Dashboard, Konsole und Installer-Menü denselben Dispatcher. Die automatische
 Updateprüfung verwendet dieselbe Stable-Quelle, informiert aber nur über einen
 neuen Stand.
 
-5.4.4h bestätigt den Hintergrundauftrag über dieselbe aktive systemd-Unit,
+5.4.4i bindet die steuernden Dateitypprüfungen von Web-Launcher und
+Community-Bootstrap an die C-Locale. Auch der über `systemd-run` gestartete
+Worker erhält `LANG=C` und `LC_ALL=C`. Eine lokalisierte `stat`-Ausgabe kann
+einen zulässigen root-kontrollierten Pfad dadurch nicht mehr fälschlich
+ablehnen; Eigentümer-, Modus-, Symlink-, Hardlink- und Pfadschutz bleiben
+erhalten.
+
+Der enthaltene Stand aus 5.4.4h bestätigt den Hintergrundauftrag über dieselbe aktive systemd-Unit,
 MainPID, Prozess und root-kontrollierten Status auf beiden Seiten. Vor dieser
 Bestätigung werden weder Ziel-Updater noch Produktpfad freigegeben. Der
 eigenständige Community-Bootstrap darf das private Zielrelease vorher sicher

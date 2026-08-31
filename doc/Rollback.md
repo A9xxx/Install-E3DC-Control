@@ -12,9 +12,15 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
-## Start- und Rückfallwahrheit in 5.4.4h
+## Start- und Rückfallwahrheit in 5.4.4i
 
-5.4.4h beginnt Ziel-Updater und Produktpfad erst nach der beidseitigen
+5.4.4i bindet alle steuernden Dateitypprüfungen von Web-Launcher und
+Community-Bootstrap an die C-Locale und übergibt dieselbe Umgebung ausdrücklich
+an den systemd-Worker. Lokalisierte `stat`-Ausgaben können zulässige
+root-kontrollierte Pfade damit nicht fälschlich ablehnen. Eigentümer-, Modus-,
+Symlink-, Hardlink- und Pfadschutz bleiben erhalten.
+
+Der enthaltene Stand aus 5.4.4h beginnt Ziel-Updater und Produktpfad erst nach der beidseitigen
 Bestätigung des laufenden Systemjobs. Der installierte Dispatcher löst auch
 Release und Download erst danach auf; der eigenständige Community-Bootstrap
 darf das private Zielrelease vorab binden, führt es aber noch nicht aus. Scheitert diese
@@ -223,7 +229,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand ist `v5.4.4h`.
+Der aktuelle Stable-Stand ist `v5.4.4i`.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

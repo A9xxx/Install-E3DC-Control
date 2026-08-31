@@ -1,12 +1,19 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.4.4h
+Dokumentation Stand: 5.4.4i
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
 Installationspfad und Python-Umgebung aus dem geprüften Installationskontext.
 
-5.4.4h bindet den gestarteten Hintergrundauftrag beidseitig an aktive
+5.4.4i setzt im installierten Web-Launcher und im eigenständigen
+Community-Bootstrap vor allen steuernden Dateitypprüfungen eine feste
+C-Locale. Der gestartete systemd-Worker erhält dieselbe Umgebung ausdrücklich
+mit. Lokalisierte `stat`-Ausgaben können zulässige root-kontrollierte Pfade
+damit nicht mehr fälschlich ablehnen. Eigentümer-, Modus-, Symlink-, Hardlink-
+und Pfadprüfungen bleiben unverändert wirksam.
+
+Der enthaltene Stand aus 5.4.4h bindet den gestarteten Hintergrundauftrag beidseitig an aktive
 systemd-Unit, MainPID, Prozess und root-kontrollierten Status. Ziel-Updater und
 Produktpfad beginnen erst nach dieser Bestätigung. Der eigenständige
 Community-Bootstrap darf das private Zielrelease vorher sicher binden, führt es

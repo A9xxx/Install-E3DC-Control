@@ -237,6 +237,7 @@ def commit_receipt(box, receipt, *, now_ts=0.0, hold_s=DEFAULT_HOLD_S):
             "set_current",
             "set_direct_current",
             "set_amp_sonnenmodus",
+            "set_amp_autonomous_solar",
         }
         or amp < 6.0
         or proof.get("forced_zero") is True
@@ -244,7 +245,10 @@ def commit_receipt(box, receipt, *, now_ts=0.0, hold_s=DEFAULT_HOLD_S):
         or receipt_ts > now_value + 1.0
     ):
         return {}
-    if method == "set_amp_sonnenmodus" and _int(proof.get("force_state"), 0) != 2:
+    if method in {
+        "set_amp_sonnenmodus",
+        "set_amp_autonomous_solar",
+    } and _int(proof.get("force_state"), 0) != 2:
         return {}
 
     committed = dict(request)
@@ -405,6 +409,7 @@ def intent_contract(wb_intent, *, now_ts):
                     "set_current",
                     "set_direct_current",
                     "set_amp_sonnenmodus",
+                    "set_amp_autonomous_solar",
                 }
                 or _float(item.get("receipt_amp"), 0.0) < 6.0
                 or _float(item.get("receipt_ts"), 0.0) != started_ts
@@ -412,7 +417,7 @@ def intent_contract(wb_intent, *, now_ts):
                 != str(item.get("request_cycle_token") or "")
                 or (
                     str(item.get("receipt_method") or "")
-                    == "set_amp_sonnenmodus"
+                    in {"set_amp_sonnenmodus", "set_amp_autonomous_solar"}
                     and _int(item.get("receipt_force_state"), 0) != 2
                 )
             ):

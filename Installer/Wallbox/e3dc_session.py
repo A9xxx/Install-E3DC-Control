@@ -18,7 +18,12 @@ STATE_STOPPING = "stopping"
 STATE_ENDED = "ended"
 STATE_RSCP_ERROR = "rscp_error"
 
-_EDGE_METHODS = {"set_amp_sonnenmodus", "set_amp_and_state", "set_current"}
+_EDGE_METHODS = {
+    "set_amp_sonnenmodus",
+    "set_amp_autonomous_solar",
+    "set_amp_and_state",
+    "set_current",
+}
 
 _STATE_LABELS = {
     STATE_IDLE: ("Idle", "secondary"),

@@ -2948,6 +2948,8 @@ class E3DCCharger(WallboxDriver):
         self._wbchar6_start_sent_key = None
         self._wbchar6_start_attempt_count = 0
         self._wbchar6_last_start_toggle_ts = 0.0
+        self._efy_autonomous_handoff_blocker = ""
+        self._efy_autonomous_handoff_ts = 0.0
         self.rscp_error_count = 0
         self.rscp_last_error = ""
         self.rscp_last_error_context = ""
@@ -2983,6 +2985,12 @@ class E3DCCharger(WallboxDriver):
             "e3dc_wbchar6_start_attempt_limit": E3DC_EASY_CONNECT_START_ATTEMPT_LIMIT,
             "e3dc_wbchar6_last_start_toggle_ts": float(self._wbchar6_last_start_toggle_ts or 0.0),
             "e3dc_wbchar6_bounded_retry_eligible": self.device_family == "easy_connect",
+            "e3dc_efy_autonomous_handoff_blocker": str(
+                self._efy_autonomous_handoff_blocker or ""
+            ),
+            "e3dc_efy_autonomous_handoff_ts": float(
+                self._efy_autonomous_handoff_ts or 0.0
+            ),
         }
 
     def _set_control_backend(self, *, status_valid, transition_capable=False, readback_ts=0.0):
@@ -3310,21 +3318,25 @@ class E3DCCharger(WallboxDriver):
         # E3DC requires a continuous heartbeat every <3 seconds to stay in external control mode
         while True:
             time.sleep(2.0)
-            # Read, Lease-Prüfung und Wire bleiben unter derselben reentranten
-            # Sperre wie STOP/Aus/Nullautorität. So kann kein zuvor gelesener
-            # positiver Sollstrom nach einer neueren Stop-Revozierung noch als
-            # verspäteter Heartbeat auf die Wallbox gelangen.
-            with self.lock:
-                if self.external_suspended or self.last_amp is None:
-                    continue
-                heartbeat_amp = self.last_amp
-                # Heartbeat MUSS force_state=None senden. Ein persistiertes
-                # Toggle würde die Wallbox im 2-s-Takt ein-/ausschalten.
-                self._send_command_internal(
-                    heartbeat_amp,
-                    None,
-                    is_heartbeat=True,
-                )
+            self._heartbeat_once()
+
+    def _heartbeat_preflight_locked(self):
+        return True
+
+    def _heartbeat_once(self):
+        # Read, Lease-Prüfung und Wire bleiben unter derselben reentranten
+        # Sperre wie STOP/Aus/Nullautorität.
+        with self.lock:
+            if self.external_suspended or self.last_amp is None:
+                return False
+            if not self._heartbeat_preflight_locked():
+                return False
+            heartbeat_amp = self.last_amp
+            return bool(self._send_command_internal(
+                heartbeat_amp,
+                None,
+                is_heartbeat=True,
+            ))
 
     def _ensure_connected(self):
         if not (
@@ -4191,6 +4203,93 @@ class E3DCMultiConnectCharger(E3DCCharger):
             self._last_auto_phase = active
         return ok
 
+    def _efy_autonomous_solar_handoff_contract(self):
+        """Prüft nur Identität, Protokollfähigkeit und ALG-Freshness.
+
+        Diese Freigabe erteilt ausdrücklich keine Berechtigung für direkte
+        Phasen-/Transition-Schreibzugriffe. Sie wählt nur den vorhandenen
+        WBchar6-Sonnenmodus, in dem die efy ihre herstellereigene 1p-/3p-
+        Automatik selbst ausführt.
+        """
+
+        max_age_s = 15.0
+        try:
+            max_age_s = max(
+                1.0,
+                float(
+                    self.config.get(
+                        "e3dc_wbchar6_status_max_age_s",
+                        15.0,
+                    )
+                ),
+            )
+        except (TypeError, ValueError):
+            pass
+        if not math.isfinite(max_age_s):
+            max_age_s = 15.0
+        now = time.time()
+        try:
+            readback_ts = float(self._wbchar6_readback_ts or 0.0)
+        except (TypeError, ValueError):
+            readback_ts = 0.0
+        readback_finite = math.isfinite(readback_ts)
+        age_s = (
+            max(0.0, now - readback_ts)
+            if readback_finite and readback_ts > 0.0
+            else None
+        )
+        blocker = ""
+        if self.device_family != "efy":
+            blocker = "device_family_not_efy"
+        elif self.device_family_source not in {"configured", "configured_type"}:
+            blocker = "device_family_not_explicitly_configured"
+        elif self.control_backend != E3DC_BACKEND_WBCHAR6:
+            blocker = "wbchar6_compat_not_bound"
+        elif not readback_finite:
+            blocker = "fresh_alg_status_invalid"
+        elif readback_ts <= 0.0:
+            blocker = "fresh_alg_status_missing"
+        elif age_s is None or age_s > max_age_s:
+            blocker = "fresh_alg_status_expired"
+        return {
+            "contract": "e3dc_efy_autonomous_solar_driver_v1",
+            "allowed": not blocker,
+            "blocker": blocker,
+            "family_source": str(self.device_family_source or ""),
+            "backend": str(self.control_backend or ""),
+            "readback_age_s": age_s,
+            "max_age_s": float(max_age_s),
+            "direct_phase_write_allowed": False,
+        }
+
+    def _efy_autonomous_solar_handoff_ready(self):
+        return bool(
+            self._efy_autonomous_solar_handoff_contract().get("allowed")
+        )
+
+    def _heartbeat_preflight_locked(self):
+        if not self.sonnenmodus:
+            return True
+        contract = self._efy_autonomous_solar_handoff_contract()
+        if contract.get("allowed") is True:
+            return True
+        blocker = str(
+            contract.get("blocker")
+            or "autonomous_heartbeat_contract_not_ready"
+        )
+        self.external_suspended = True
+        self.last_amp = None
+        self.last_force_state = None
+        self._control_generation += 1
+        self._efy_autonomous_handoff_blocker = "heartbeat_%s" % blocker
+        self._efy_autonomous_handoff_ts = time.time()
+        logger.warning(
+            "[WB%s] efy-Mode-1-Heartbeat ohne Ausgang entwaffnet: %s",
+            self.wb_id,
+            blocker,
+        )
+        return False
+
     def _ensure_control_defaults(self, force=False):
         # evcc-Referenz für Multi Connect: externe Regelung arbeitet nur
         # sauber, wenn Sonnenmodus und automatische Phasenumschaltung aus sind.
@@ -4667,6 +4766,72 @@ class E3DCMultiConnectCharger(E3DCCharger):
                 # darf dagegen keinen neuen Heartbeat-Sollwert vortäuschen.
                 self.last_amp = target_amp
                 self.last_force_state = force_state
+            return ok
+
+    def set_amp_autonomous_solar(self, target_amp, force_state=None):
+        """Übersetzt einen expliziten Managerauftrag atomar in WBchar6-Mode=1.
+
+        Wattbudget, Amperewert und Start-/Halteentscheidung kommen vollständig
+        aus dem Manager. Der Treiber prüft unter derselben Sperre unmittelbar
+        vor dem Ausgang ausschließlich, ob die explizite efy-Identität, der
+        WBchar6-Kompatibilitätspfad und ein frischer ALG-Status noch gelten.
+        Bei Verlust dieser Evidenz bleibt die Leitung unverändert; insbesondere
+        gibt es keinen stillen Rückfall auf Mode=2 oder einen Phasenbefehl.
+        """
+
+        request_generation = self._control_generation
+        if not command_gate.allow_command(
+            self,
+            action="e3dc_multi_set_amp_autonomous_solar",
+            payload={"target_amp": target_amp, "force_state": force_state},
+        ):
+            return False
+        with self.lock:
+            if request_generation != self._control_generation:
+                self._efy_autonomous_handoff_blocker = (
+                    "control_generation_changed"
+                )
+                self._efy_autonomous_handoff_ts = time.time()
+                return False
+            contract = self._efy_autonomous_solar_handoff_contract()
+            if contract.get("allowed") is not True:
+                blocker = str(
+                    contract.get("blocker")
+                    or "autonomous_solar_contract_not_ready"
+                )
+                self._efy_autonomous_handoff_blocker = blocker
+                self._efy_autonomous_handoff_ts = time.time()
+                logger.warning(
+                    "[WB%s] efy-Solarübergabe ohne Ausgang blockiert: %s",
+                    self.wb_id,
+                    blocker,
+                )
+                return False
+            self._efy_autonomous_handoff_blocker = ""
+            self._efy_autonomous_handoff_ts = time.time()
+            previous_sonnenmodus = self.sonnenmodus
+            self.external_suspended = False
+            self.sonnenmodus = True
+            ok = bool(
+                self._send_command_internal(
+                    target_amp,
+                    force_state,
+                    is_heartbeat=False,
+                )
+            )
+            if ok:
+                self.last_amp = target_amp
+                self.last_force_state = force_state
+            else:
+                self.sonnenmodus = previous_sonnenmodus
+                self.external_suspended = True
+                self.last_amp = None
+                self.last_force_state = None
+                self._control_generation += 1
+                self._efy_autonomous_handoff_blocker = (
+                    "wire_command_failed_fail_silent"
+                )
+                self._efy_autonomous_handoff_ts = time.time()
             return ok
 
     def take_control(self):

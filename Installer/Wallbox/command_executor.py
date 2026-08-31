@@ -16,6 +16,88 @@ def _amp_limit(value, maximum=32):
 class CommandExecutor:
     def __init__(self, logger):
         self.logger = logger
+        # Prozesslokales, nicht serialisierbares Siegel. Nur die letzte
+        # Manager-I/O-Kante darf damit einen genau einmal verwendbaren
+        # autonomen efy-Ausgang autorisieren.
+        self._autonomous_solar_dispatch_seal = object()
+
+    def seal_autonomous_solar_dispatch(
+        self,
+        charger,
+        output_contract,
+        *,
+        cycle_token,
+        amp,
+        force_state=None,
+    ):
+        contract = (
+            dict(output_contract)
+            if isinstance(output_contract, dict)
+            else {}
+        )
+        token = str(cycle_token or "")
+        try:
+            sealed_amp = float(amp)
+        except (TypeError, ValueError):
+            return {}
+        if not (
+            token
+            and contract.get("contract")
+            == "wallbox_autonomous_solar_output_v1"
+            and contract.get("active") is True
+            and str(contract.get("cycle_token") or "") == token
+            and str(contract.get("method") or "")
+            == "set_amp_autonomous_solar"
+            and str(contract.get("protocol_mode") or "")
+            == "wbchar6_solar_mode"
+            and str(contract.get("watt_budget_semantics") or "")
+            == "autonomous_pv_sink"
+            and contract.get("strict_watt_cap") is False
+        ):
+            return {}
+        return {
+            "contract": "wallbox_autonomous_solar_dispatch_authority_v1",
+            "method": "set_amp_autonomous_solar",
+            "cycle_token": token,
+            "amp": sealed_amp,
+            "force_state": force_state,
+            "charger_identity": id(charger),
+            "output_contract": contract,
+            "_executor_seal": self._autonomous_solar_dispatch_seal,
+            "_consumed": False,
+        }
+
+    def _consume_autonomous_solar_dispatch(self, charger, command):
+        cmd = command if isinstance(command, dict) else {}
+        authority = cmd.get("_autonomous_solar_dispatch_authority")
+        if not isinstance(authority, dict):
+            return False
+        try:
+            command_amp = float(cmd.get("amp", 0.0) or 0.0)
+            sealed_amp = float(authority.get("amp", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return False
+        output = authority.get("output_contract")
+        valid = bool(
+            authority.get("_executor_seal")
+            is self._autonomous_solar_dispatch_seal
+            and authority.get("_consumed") is False
+            and authority.get("contract")
+            == "wallbox_autonomous_solar_dispatch_authority_v1"
+            and authority.get("method") == "set_amp_autonomous_solar"
+            and int(authority.get("charger_identity", -1)) == id(charger)
+            and str(authority.get("cycle_token") or "")
+            and command_amp == sealed_amp
+            and authority.get("force_state") == cmd.get("force_state")
+            and isinstance(output, dict)
+            and output.get("active") is True
+            and output.get("method") == "set_amp_autonomous_solar"
+            and str(output.get("cycle_token") or "")
+            == str(authority.get("cycle_token") or "")
+        )
+        if valid:
+            authority["_consumed"] = True
+        return valid
 
     @staticmethod
     def stop_command(
@@ -71,6 +153,18 @@ class CommandExecutor:
                 return bool(charger.set_amp_and_state(cmd_amp(), force_state=cmd.get("force_state")))
             if method == "set_amp_sonnenmodus":
                 return bool(charger.set_amp_sonnenmodus(cmd_amp(), force_state=cmd.get("force_state")))
+            if method == "set_amp_autonomous_solar":
+                if not self._consume_autonomous_solar_dispatch(charger, cmd):
+                    self.logger.warning(
+                        "Autonomer efy-Solarbefehl ohne gültige "
+                        "Manager-Versiegelung blockiert (%s).",
+                        reason,
+                    )
+                    return False
+                return bool(charger.set_amp_autonomous_solar(
+                    cmd_amp(),
+                    force_state=cmd.get("force_state"),
+                ))
             if method == "set_direct_current":
                 return bool(charger.set_direct_current(cmd_amp()))
             if method == "set_pv_mode":

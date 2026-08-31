@@ -9,7 +9,9 @@
 set -eu
 umask 077
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
-export PATH
+LANG=C
+LC_ALL=C
+export PATH LANG LC_ALL
 
 REPOSITORY_URL="https://github.com/A9xxx/Install-E3DC-Control"
 GIT_URL="${REPOSITORY_URL}.git"
@@ -1033,6 +1035,8 @@ start_background_job() {
         --property=TimeoutStartSec=20s \
         --property="StandardOutput=append:${LOG_FILE}" \
         --property="StandardError=append:${LOG_FILE}" \
+        --setenv=LANG=C \
+        --setenv=LC_ALL=C \
         --setenv=E3DC_BOOTSTRAP_BACKGROUND_WORKER=1 \
         --setenv="E3DC_BOOTSTRAP_STAGE_DIR=$STAGE_DIR" \
         --setenv="E3DC_BOOTSTRAP_TAG=$BOUND_TAG" \

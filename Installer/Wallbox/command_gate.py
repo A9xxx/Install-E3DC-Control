@@ -216,17 +216,15 @@ def _storage_hard_block_allows_output(
         "e3dc_set_extern",
         "e3dc_set_extern_wire",
         "e3dc_multi_set_amp_sonnenmodus",
+        "e3dc_multi_set_amp_autonomous_solar",
         "e3dc_multi_set_amp_and_state",
         "e3dc_multi_send_command",
     }
     if name in e3dc_current_actions:
         if data.get("heartbeat") is True:
             return False
-        stop_requested = bool(
-            force_state == 1.0 or _number_is_zero(data.get("target_amp"))
-        )
         return bool(
-            stop_requested
+            force_state == 1.0
             and getattr(charger, "real_charging", None) is True
         )
 

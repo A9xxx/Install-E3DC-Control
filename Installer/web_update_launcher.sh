@@ -12,6 +12,8 @@
 
 set -euo pipefail
 umask 027
+export LANG=C
+export LC_ALL=C
 
 readonly INSTALL_ROOT=@E3DC_INSTALL_ROOT@
 readonly INSTALL_USER=@E3DC_INSTALL_USER@

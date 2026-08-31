@@ -90,7 +90,8 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                    max_amp_by_id=None, fairness_weight_by_id=None,
                    phase_count_by_id=None, watts_per_amp_by_id=None,
                    grid_phase_limit_vector=None, phase_rotation_by_id=None,
-                   unmanaged_phase_amps=None):
+                   unmanaged_phase_amps=None,
+                   electrical_reservation_phase_count_by_id=None):
     """
     Verteilt 'available_watts' auf alle verbundenen Wallboxen.
 
@@ -116,6 +117,13 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
     ``available_watts`` die einzige Leistungsautorität; Modus-, Preis- und
     Phaseninformationen dürfen kein eigenes Startbudget erzeugen.
 
+    ``electrical_reservation_phase_count_by_id`` trennt die energetische
+    Wattprojektion von der elektrischen Anschlussbelegung. Das ist für eine
+    autonom umschaltende efy nötig: Ihr Start darf energetisch als 1p gelten,
+    solange die Firmware aber auch 3p wählen kann, reserviert die Verteilung
+    denselben Strom auf L1/L2/L3. Ist die explizite Reservierungsmap
+    unvollständig oder ungültig, bleibt der betroffene Ladepunkt bei 0 A.
+
     ``grid_phase_limit_vector``: Optionaler Phasenvektor [L1, L2, L3] in Ampere
     (z. B. Hausabsicherung minus Reserve). Startzuteilung und Stromerhöhung
     werden gemeinsam gegen diesen Phasenvektor verteilt, ohne pauschale Halbierung.
@@ -124,7 +132,10 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
 
     Der Wattvertrag ergänzt je Ladepunkt ``target_power_w``,
     ``target_phases`` und ``target_amp_per_phase``; ``target_amp`` bleibt der
-    rückwärtskompatible Alias für den Strom je aktiver Phase.
+    rückwärtskompatible Alias für den Strom je aktiver Phase. Zusätzlich
+    beschreiben ``energy_projection_phases``,
+    ``electrical_reservation_phases`` und ``reserved_phase_vector_a`` den
+    getrennten Kapazitätsvertrag.
     """
     alloc = {}
     strict_watt_contract = bool(
@@ -141,6 +152,12 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
     per_charger_limits = max_amp_by_id if isinstance(max_amp_by_id, dict) else {}
     fairness_weights = fairness_weight_by_id if isinstance(fairness_weight_by_id, dict) else {}
     phase_counts = phase_count_by_id if isinstance(phase_count_by_id, dict) else None
+    electrical_phase_counts = (
+        electrical_reservation_phase_count_by_id
+        if isinstance(electrical_reservation_phase_count_by_id, dict)
+        else None
+    )
+    strict_electrical_reservation = electrical_phase_counts is not None
     rotations_by_id = phase_rotation_by_id if isinstance(phase_rotation_by_id, dict) else {}
     phase_limits = None
     phase_limits_valid = True
@@ -179,12 +196,50 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
             return 1
         return 0 if strict_watt_contract else 3
 
+    def _electrical_phase_count(status, c_id, energy_phases):
+        if electrical_phase_counts is not None:
+            try:
+                mapped = int(float(
+                    _mapped_value(electrical_phase_counts, c_id, 0) or 0
+                ))
+            except (TypeError, ValueError):
+                mapped = 0
+            return mapped if mapped in (1, 2, 3) else 0
+        return int(energy_phases or _phase_count(status, c_id) or 0)
+
     def _watts_per_amp(c_id, phases):
         nominal = 230.0 * float(phases)
         return nominal
 
-    def _allocation_result(target_amp, state, phases, w_per_amp):
+    def _reserved_phase_vector(target_amp, reservation_phases, rotation):
+        target = max(0.0, float(target_amp or 0.0))
+        phases = int(reservation_phases or 0)
+        if target <= 0.0 or phases <= 0:
+            return (0.0, 0.0, 0.0)
+        if phases >= 3:
+            return (target, target, target)
+        rot = normalize_rotation(rotation)
+        if rot is None:
+            # Ohne bestätigte PCC-Zuordnung darf keine Phase freigegeben werden.
+            return (target, target, target)
+        vector = [0.0, 0.0, 0.0]
+        for local_index in range(min(phases, 3)):
+            vector[rot[local_index]] = target
+        return tuple(vector)
+
+    def _allocation_result(
+        target_amp,
+        state,
+        phases,
+        w_per_amp,
+        *,
+        electrical_phases=None,
+        rotation=None,
+    ):
         target = max(0, int(target_amp or 0))
+        reservation_phases = int(
+            electrical_phases if electrical_phases is not None else phases or 0
+        )
         result = {
             'target_amp': target,
             'state': int(state),
@@ -194,6 +249,13 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                 'target_power_w': float(target) * max(0.0, float(w_per_amp or 0.0)),
                 'target_phases': int(phases or 0),
                 'target_amp_per_phase': target,
+                'energy_projection_phases': int(phases or 0),
+                'electrical_reservation_phases': reservation_phases,
+                'reserved_phase_vector_a': _reserved_phase_vector(
+                    target,
+                    reservation_phases,
+                    rotation,
+                ),
             })
         return result
 
@@ -207,7 +269,12 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
         # Reservierung gegen das verbleibende Phasenbudget.
         if c_mode == 0:
             if phase_limits is not None and phase_limits_valid:
-                c_phases = _phase_count(status, c_id)
+                c_energy_phases = _phase_count(status, c_id)
+                c_phases = _electrical_phase_count(
+                    status,
+                    c_id,
+                    c_energy_phases,
+                )
                 c_rot = normalize_rotation(_mapped_value(rotations_by_id, c_id))
 
                 # Evidenzreihenfolge:
@@ -335,9 +402,28 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
         else:
             behavior = _classify_mode(c_mode)
         phases = _phase_count(c['status'], c_id)
+        electrical_phases = _electrical_phase_count(
+            c['status'],
+            c_id,
+            phases,
+        )
         if strict_watt_contract and phases == 0:
             alloc[c_id] = _allocation_result(0, 1, 0, 0.0)
             logger.debug(f"WB{c_id} keine frische/plausible Phasenzahl: Zuteilung bleibt 0A")
+            continue
+        if strict_electrical_reservation and electrical_phases == 0:
+            alloc[c_id] = _allocation_result(
+                0,
+                1,
+                phases,
+                _watts_per_amp(c_id, phases),
+                electrical_phases=0,
+                rotation=_mapped_value(rotations_by_id, c_id),
+            )
+            logger.debug(
+                f"WB{c_id} ohne gültigen elektrischen Phasenvertrag: "
+                "Zuteilung bleibt 0A"
+            )
             continue
         w_per_amp = _watts_per_amp(c_id, phases)
         min_w = 6 * w_per_amp
@@ -363,6 +449,7 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                 'id': c_id,
                 'charger': c.get('charger'),
                 'phases': phases,
+                'electrical_phases': electrical_phases,
                 'rotation': rotation,
                 'w_per_amp': w_per_amp,
                 'min_w': min_w,
@@ -381,6 +468,7 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                 'id':            c_id,
                 'charger':       c.get('charger'),
                 'phases':        phases,
+                'electrical_phases': electrical_phases,
                 'rotation':      rotation,
                 'w_per_amp':     w_per_amp,
                 'min_w':         min_w,
@@ -399,6 +487,7 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                 'id':            c_id,
                 'charger':       c.get('charger'),
                 'phases':        phases,
+                'electrical_phases': electrical_phases,
                 'rotation':      rotation,
                 'w_per_amp':     w_per_amp,
                 'min_w':         min_w,
@@ -431,12 +520,16 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
             if not phase_limits_valid:
                 return False
             rot = c.get('rotation')
-            if c['phases'] >= 3:
+            if c['electrical_phases'] >= 3:
                 if any(allocated_pcc_phase_a[p] + delta_a > phase_limits[p] + 1e-9 for p in range(3)):
                     return False
-            elif c['phases'] == 1 and rot is not None:
-                idx = rot[0]
-                if allocated_pcc_phase_a[idx] + delta_a > phase_limits[idx] + 1e-9:
+            elif c['electrical_phases'] in (1, 2) and rot is not None:
+                phase_indexes = rot[:c['electrical_phases']]
+                if any(
+                    allocated_pcc_phase_a[idx] + delta_a
+                    > phase_limits[idx] + 1e-9
+                    for idx in phase_indexes
+                ):
                     return False
             else:
                 if any(allocated_pcc_phase_a[p] + delta_a > phase_limits[p] + 1e-9 for p in range(3)):
@@ -450,12 +543,12 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
             remaining_watts -= delta_a * c['w_per_amp']
         if phase_limits is not None:
             rot = c.get('rotation')
-            if c['phases'] >= 3:
+            if c['electrical_phases'] >= 3:
                 for p in range(3):
                     allocated_pcc_phase_a[p] += delta_a
-            elif c['phases'] == 1 and rot is not None:
-                idx = rot[0]
-                allocated_pcc_phase_a[idx] += delta_a
+            elif c['electrical_phases'] in (1, 2) and rot is not None:
+                for idx in rot[:c['electrical_phases']]:
+                    allocated_pcc_phase_a[idx] += delta_a
             else:
                 for p in range(3):
                     allocated_pcc_phase_a[p] += delta_a
@@ -589,6 +682,8 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
             c['state'],
             c['phases'],
             c['w_per_amp'],
+            electrical_phases=c['electrical_phases'],
+            rotation=c.get('rotation'),
         )
 
     return alloc

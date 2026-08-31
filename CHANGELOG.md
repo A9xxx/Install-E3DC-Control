@@ -6,6 +6,37 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.4i] – 2026-08-31
+
+### 🔄 Updateeinstieg bleibt auch unter lokalisierter Systemumgebung eindeutig
+
+- **Locale-feste Sicherheitsprüfung:** Web-Launcher und Community-Bootstrap setzen vor allen steuernden Dateitypprüfungen eine feste C-Locale. Der über `systemd-run` gestartete Worker erhält dieselbe Umgebung ausdrücklich mit. Deutsch oder anders lokalisierte Ausgaben von `stat` können zulässige root-kontrollierte Dateien und Verzeichnisse dadurch nicht mehr fälschlich ablehnen.
+- **Schutzgrenzen bleiben erhalten:** Eigentümer, Modus, Symlink-, Hardlink- und Pfadprüfungen werden nicht gelockert. Nicht reguläre, verknüpfte oder fremd kontrollierte Knoten bleiben vor dem Produktpfad gesperrt.
+- **README bleibt Einstieg statt Versionsarchiv:** Die Startseite zeigt nur noch den aktuellen Releaseüberblick und verweist für die vollständige Historie auf Release Notes und Changelog. Der kopierbare Rettungsbefehl startet den Bootstrap nur, wenn der neue Download erfolgreich war.
+
+### 🔋 Manuell erfasster Fahrzeug-SoC bleibt an Quelle und Profil gebunden
+
+- **Echte Quellzeit statt Warnzustand:** Ein manuell gespeicherter Fahrzeug-SoC transportiert seinen ursprünglichen Aktionszeitpunkt und die kanonische Profilbindung bis in Live-Daten und Webanzeige. Er wird nicht durch Datei-, Abruf- oder Anzeigezeit künstlich verjüngt.
+- **Eindeutigkeit vor Komfort:** Die Übernahme setzt genau ein passendes gespeichertes Profil sowie den aktuellen Wallbox- und Steckkontext voraus. Mehrdeutige, ungebundene, widersprüchliche oder nicht angeschlossene Zustände werden weiterhin nicht geraten. Eine eng gebundene Reparatur bekannter Altwerte erfindet weder Profil noch Zeit.
+- **Nur Anzeige und Planung:** Die SoC-Korrektur liefert Lesewahrheit für Oberfläche und Planung; sie erzeugt keinen Lade- oder sonstigen Hardwarebefehl.
+
+### 🚗 Wallbox-Ausgänge folgen wieder einem eindeutigen Vertrag
+
+- **PV-Kurve hält das physische Minimum:** Eine bereits laufende Ladung in `PV-Kurve ruhig` wird bei einem kleinen Leistungsdefizit nicht allein durch die Watt-Schwelle beendet. Sie bleibt am physischen Mindeststrom, bis der bestehende Energiezähler den konfigurierten Wh-Rahmen verbraucht. Eindeutiger Netzbezug und harte Schutzgrenzen bleiben vorrangig.
+- **Stopp ist am Ausgang endgültig:** Eine zentrale Prioritäts- oder Schutzentscheidung mit 0 A versiegelt Strom- und Phasenausgang für diesen Zyklus. Nachgelagerte Rampen, alte Phasenabsichten oder Treiberzustände können keinen positiven Restwert wiederherstellen.
+- **EFY-Übergabe ohne erfundene Phasenbestätigung:** Die autonome Herstellerregelung wird getrennt von einem direkt kommandierbaren Phasenwechsel behandelt. Leistungsbilanz und elektrische Phasenreserve bleiben auseinandergehalten; eine physisch bestätigte einphasige Umschaltung wird nicht behauptet.
+- **Ein Besitzer für die Stromstabilisierung:** Die zentrale Wallbox-Regelung führt den je Ladepunkt gebundenen Stromzustand. Nachgelagerte Legacy- oder Treiberrampen begrenzen ein bereits zentral entschiedenes Ziel nicht ein zweites Mal. Eine Erhöhung benötigt weiterhin frischen Gerätezustand, verfügbares Budget und alle Fahrzeug-, Netz- und Hardwaregrenzen.
+- **Veraltete openWB-Phasenfolgen starten nicht neu:** Wird ein älterer Phasenwunsch durch eine aktuelle Stopp- oder Schutzentscheidung überholt, endet seine Sequenz sicher, ohne den Ausgang erneut zu öffnen. Die 480-Sekunden-Frist schützt weiterhin ausschließlich vor einem weiteren Phasenwechsel.
+
+### ⚡ Flexible Verbraucher reservieren nur belegte Leistung
+
+- **Laufende Last und Startwunsch getrennt:** Physisch laufende Verbraucher, ein gebundener Startvorgang und ein bloßer Startwunsch werden nicht mehr als dieselbe Dauerlast verrechnet. Eine inaktive Wärmepumpe reserviert dadurch nicht unbegrenzt Wallboxbudget.
+- **Bestehender Schutz bleibt wirksam:** Reale Verbraucherleistung und ein aktuell gebundener Startvorgang bleiben geschützt. Speicher- und Wallboxpfad verwenden denselben zentralen Eigentümervertrag, statt dieselbe Leistung mehrfach zu reservieren oder freizugeben.
+- **Pumpenvorlauf korrekt bilanziert:** Eine real gemessene Vorlaufleistung der Wärmepumpe zählt als aktuelle, nicht kommandierbare Last. Sie wird genau einmal vom verfügbaren Rahmen abgezogen, ohne daraus eine neue Startfreigabe abzuleiten.
+- **Wärmepumpenstart nur vollständig finanziert:** Die zentrale positive Startfreigabe entsteht ausschließlich, wenn die gesamte erforderliche Startleistung zugewiesen ist. Signal- und Mindestlaufhaltezeiten bleiben davon getrennt im jeweiligen Wärmepumpenpfad erhalten.
+- **Bestätigtes Signal überlebt den Prozessneustart:** Ein frischer positiver Aktor-Readback stellt ausschließlich die bereits laufende lokale Signalhaltezeit wieder her. Er sendet keinen neuen Befehl, ersetzt kein Wattbudget und bleibt dem Safety-Veto untergeordnet.
+- **Wallbox-Unterdeckung bleibt steuerbar:** Reicht der gemeinsame Rahmen für eine laufende Wallbox zeitweise nicht aus, bleibt die Unterdeckung als eindeutiger Restbedarf sichtbar. Der Wallboxpfad kann dadurch weiterhin geordnet über Mindeststrom, Wh-Wächter, Phasenwechsel und erst zuletzt Stopp reagieren.
+
 ## [5.4.4h] – 2026-08-31
 
 ### 🔄 Update-Systemjob startet nachweisbar und meldet verständlich

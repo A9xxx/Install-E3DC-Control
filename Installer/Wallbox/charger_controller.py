@@ -24,6 +24,7 @@ class ChargerController:
         "take_control",
         "set_amp_and_state",
         "set_amp_sonnenmodus",
+        "set_amp_autonomous_solar",
         "set_direct_current",
         "set_current",
         "set_pv_mode",

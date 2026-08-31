@@ -7317,6 +7317,26 @@ if (!empty($savedCars)) {
                 $manualSourceTs = vehicleSocTimestamp(
                     $mD['soc_source_ts'] ?? ($mD['raw_soc_ts'] ?? null)
                 );
+                $manualProfileMarker = trim((string)(
+                    $mD['profile_id'] ?? ($mD['car_id'] ?? '')
+                ));
+                $manualProfileMarkerMatches = $manualProfileId !== null
+                    && compactVehicleIdentifier($manualProfileMarker) !== ''
+                    && compactVehicleIdentifier($manualProfileMarker)
+                        === compactVehicleIdentifier($manualProfileId);
+                // Der aktuelle manuelle POST kennt das gespeicherte Profil,
+                // bevor der Tracker sein explizites True zurückgeschrieben hat.
+                // Nur dieser vollständige Aktionsvertrag darf die kurze Lücke
+                // überbrücken; Alt-, Namens- und Schätzwerte bleiben gesperrt.
+                $manualProducerProfileBound = is_array($mD)
+                    && ((($mD['soc_profile_bound'] ?? null) === true)
+                        || (!array_key_exists('soc_profile_bound', $mD)
+                            && (($mD['soc_rule_confirmed'] ?? null) === true)
+                            && in_array($manualSourceLower, [
+                                'manual_start_soc', 'openwb_profile_link',
+                            ], true)
+                            && $manualSourceTs !== null
+                            && $manualProfileMarkerMatches));
                 $manualNeedsExplicitAnchor = vehicleSocUsesOpenwbProAnchor($manualSourceLower)
                     || vehicleSocUsesMqttAnchor($manualSourceLower)
                     || vehicleSocSourceClass($manualSourceLower) === 'cloud'
@@ -7354,7 +7374,8 @@ if (!empty($savedCars)) {
                     $sc['soc_age_contract'] = $mD['soc_age_contract'] ?? null;
                     $sc['soc_age_contract_source'] = $mD['soc_age_contract_source'] ?? null;
                     $sc['soc_max_age_s'] = $mD['soc_max_age_s'] ?? null;
-                    $sc['soc_profile_bound'] = !empty($mD['soc_profile_bound']);
+                    $sc['soc_profile_bound'] = $manualProducerProfileBound
+                        && !empty($manualMeta['profile_bound']);
                     $sc['is_interpolated'] = !empty($mD['is_interpolated']) || strpos((string)($mD['source'] ?? ''), 'estimated') !== false;
                     if (!empty($mD['range_km'])) $sc['range_km'] = (float)$mD['range_km'];
                     if (!empty($mD['consumption_kwh_100km'])) $sc['consumption_kwh_100km'] = (float)$mD['consumption_kwh_100km'];

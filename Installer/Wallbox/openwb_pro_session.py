@@ -48,6 +48,11 @@ RELEASABLE_ZERO_ANCHOR_REASONS = frozenset({
     # 0-A-Anker hinterlassen.
     "min_current_import_integral",
     "priority_secondary_waiting",
+    # Ein Prognose-/Prioritätsstopp ist ebenfalls nur eine vorübergehende
+    # zentrale Zuteilung. Sobald diese Autorität entfällt und ein frisches,
+    # ausführbares Budget derselben Stecksession vorliegt, darf der Nullanker
+    # einen Wiederanlauf nicht wie Nutzer-Aus oder einen Safety-Stopp sperren.
+    "priority_forced_stop",
     # Dieser Stop schützt ausschließlich den Hausakku unter wbminSoC. Sobald
     # dieselbe zentrale Policy wieder ein positives, ausführbares PV-Budget
     # für dieselbe Stecksession bindet, darf er den nächsten Start nicht als

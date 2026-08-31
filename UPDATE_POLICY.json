@@ -1,9 +1,9 @@
 {
-  "version": "5.4.4h",
+  "version": "5.4.4i",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.4h",
+  "stable_release": "v5.4.4i",
   "release_date": "2026-08-31",
-  "description": "v5.4.4h - beidseitig bestätigter Update-Systemjob, dauerhafte Startdiagnose und eindeutiger Zustand bei frühem Prozessverlust",
+  "description": "v5.4.4i - locale-fester Updateeinstieg, gebundener manueller Fahrzeug-SoC und eindeutige Wallbox-Ausgangsverträge",
   "update_strategy": "backup_replace_restart_v1",
   "installer_requires": "python3",
   "sanitized_republication": false,

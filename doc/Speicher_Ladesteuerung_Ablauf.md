@@ -1,6 +1,24 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.4h
+> **Stand:** v5.4.4i
+>
+> **Neu in 5.4.4i:** Ein manuell gespeicherter Fahrzeug-SoC bleibt an echten
+> Aktionszeitpunkt, genau ein Profil sowie aktuellen Wallbox- und Steckkontext
+> gebunden; die reine Lesekorrektur erzeugt keinen Hardwarebefehl. In
+> `PV-Kurve ruhig` hält eine laufende Ladung bei kleinem Leistungsdefizit den
+> physischen Mindeststrom, bis der bestehende Energiezähler den konfigurierten
+> Wh-Rahmen erreicht. Eindeutiger Netzbezug und harte Schutzgrenzen bleiben
+> vorrangig. Eine zentrale
+> Prioritäts- oder Schutz-Null versiegelt den Strom- und
+> Phasenausgang für den Zyklus. EFY-Herstellerautonomie, direkt
+> kommandierbare Phasen und elektrische Phasenreserve bleiben getrennt; eine
+> physisch bestätigte einphasige EFY-Umschaltung wird nicht behauptet.
+> Nachgelagerte Legacy- oder Treiberrampen begrenzen ein bereits zentral
+> entschiedenes Ziel nicht erneut. Eine Erhöhung bleibt an frischen
+> Gerätezustand, verfügbares Budget und Schutzgrenzen gebunden. Reale flexible
+> Verbraucherlast, gebundener Startvorgang und bloßer Startwunsch werden
+> getrennt bilanziert, damit eine inaktive Wärmepumpe nicht dauerhaft
+> Wallboxbudget reserviert.
 >
 > **Neu in 5.4.4g:** Fahrzeug-SoC wird in Planner, Tracker, Manager und
 > Weboberfläche an die echte Quelle, deren Ereigniszeit sowie Fahrzeug-,

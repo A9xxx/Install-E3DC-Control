@@ -42,6 +42,7 @@ CURRENT_OUTPUT_HOLD_ACTIONS = frozenset({
     "HOLD_NATIVE_START_CAP",
     "HOLD_WBMINSOC_FLOOR",
     "HOLD_OPENWB_FINISH_CONFIRM",
+    "HOLD_STOP_PV_HYBRID",
 })
 
 CURRENT_OUTPUT_EXACT_MINIMUM_HOLD_ACTIONS = frozenset({
@@ -51,6 +52,7 @@ CURRENT_OUTPUT_EXACT_MINIMUM_HOLD_ACTIONS = frozenset({
     "HOLD_NATIVE_START_GRACE",
     "HOLD_NATIVE_START_CAP",
     "HOLD_WBMINSOC_FLOOR",
+    "HOLD_STOP_PV_HYBRID",
 })
 
 CURRENT_OUTPUT_NO_INCREASE_HOLD_ACTIONS = frozenset({
@@ -79,6 +81,101 @@ def final_stop_authority_contract() -> Dict[str, Any]:
         "stop_type": "hard_stop",
         "native_abort_authorized": True,
         "requires_verified_active_charge": True,
+    }
+
+
+def final_output_authority_contract(
+    *,
+    cap_amp: Any,
+    allowed_w: Any,
+    priority_forced_stop: bool,
+) -> Dict[str, Any]:
+    """Versiegelt den finalen Leistungsdeckel vor allen Hardwarepfaden.
+
+    Ein bereits finalisierter Prioritätsstopp darf weder durch einen alten
+    Stromdeckel noch durch den Istzustand ``real_charging`` wieder geöffnet
+    werden. Gewöhnliche Defizit- und Wh-Haltepfade setzen dieses Signal nicht
+    und behalten deshalb ihren berechneten Deckel unverändert.
+    """
+
+    authorized_amp = max(0.0, _safe_float(cap_amp, 0.0))
+    authorized_w = max(0.0, _safe_float(allowed_w, 0.0))
+    forced_zero = bool(priority_forced_stop)
+    if forced_zero:
+        authorized_amp = 0.0
+        authorized_w = 0.0
+    return {
+        "schema_version": "wallbox_final_output_authority_v1",
+        "cap_amp": float(authorized_amp),
+        "allowed_w": float(authorized_w),
+        "forced_zero": forced_zero,
+        "reason": "priority_forced_stop" if forced_zero else "authorized",
+    }
+
+
+def priority_forced_stop_edge_contract(
+    *,
+    priority_forced_stop: bool,
+    charger_connected: bool,
+    hw_charging: bool,
+    hw_power_w: Any,
+    current_amp: Any,
+    current_set_amp: Any,
+    is_charging_memory: bool,
+    stop_already_sent: bool,
+    stop_retry_due: bool,
+    e3dc_native_toggle: bool,
+) -> Dict[str, Any]:
+    """Bindet den Prioritätsstopp vor Strom- und Phasen-Hardwarepfaden.
+
+    Ein nicht verbundenes oder bereits stromloses Gerät benötigt keine neue
+    Stopkante. Dadurch entsteht insbesondere bei einer openWB Pro kein
+    sessionloser temporärer Nullanker. Beim nativen E3DC-Toggle bleibt die
+    Kante zusätzlich strikt an frisch belegte reale Ladung beziehungsweise
+    einen ausdrücklich fälligen Retry gebunden.
+    """
+
+    active = bool(priority_forced_stop)
+    connected = bool(charger_connected)
+    real_charge = bool(
+        connected
+        and hw_charging
+        and max(0.0, _safe_float(hw_power_w, 0.0)) > 500.0
+    )
+    offered_or_running = bool(
+        connected
+        and (
+            real_charge
+            or is_charging_memory
+            or max(0.0, _safe_float(current_amp, 0.0)) > 0.5
+            or max(0.0, _safe_float(current_set_amp, 0.0)) > 0.5
+        )
+    )
+    if not active:
+        stop_edge_due = False
+    elif e3dc_native_toggle:
+        stop_edge_due = bool(
+            (real_charge and not stop_already_sent)
+            or stop_retry_due
+        )
+    else:
+        stop_edge_due = bool(
+            (offered_or_running and not stop_already_sent)
+            or stop_retry_due
+        )
+    return {
+        "schema_version": "wallbox_priority_forced_stop_edge_v1",
+        "active": active,
+        "stop_edge_due": bool(stop_edge_due),
+        "phase_outputs_allowed": not active,
+        "connected": connected,
+        "real_charge": real_charge,
+        "offered_or_running": offered_or_running,
+        "reason": (
+            "priority_forced_stop"
+            if active
+            else "priority_clear"
+        ),
     }
 
 
@@ -1763,9 +1860,13 @@ def wallbox_phase_switch_capability(
     """Liefert die Phasen-Befehlsfläche, ohne eine Policy-Freigabe zu erteilen.
 
     Eine normale openWB bleibt auf sekundäre Stromvorgaben beschränkt. E3DC
-    Multi Connect bleibt im reinen Beobachtungsmodus, bis ein kanonischer
-    Vertrag für CP-Unterbrechung und Rücklesung die 480-Sekunden-Sicherheitsfolge
-    durchgängig belegt.
+    Multi Connect bleibt für direkte Phasenbefehle im reinen Beobachtungsmodus,
+    bis ein kanonischer Vertrag für CP-Unterbrechung und Rücklesung die
+    480-Sekunden-Sicherheitsfolge durchgängig belegt. Die davon unabhängige,
+    herstellereigene efy-Automatik wird nur bei explizit gebundener Familie,
+    frischem ALG-/Treiberstatus und dem vorhandenen WBchar6-Sonnenmodus
+    getrennt ausgewiesen. Der optionale Auto-Phase-Mirror fehlt bei der efy
+    teilweise und ist deshalb Diagnose, aber keine Startvoraussetzung.
     """
 
     st = status or {}
@@ -1773,11 +1874,61 @@ def wallbox_phase_switch_capability(
         return openwb_phase_switch_capability(charger_class_name, st, config)
     driver_variant = str(st.get("driver_variant", "") or "")
     if charger_class_name == "E3DCMultiConnectCharger" or driver_variant in {"e3dc_multi_connect", "e3dc_rscp"}:
+        sample_ts = _safe_float(st.get("driver_status_last_sample_ts"), 0.0)
+        sample_ok_ts = _safe_float(st.get("driver_status_last_ok_ts"), 0.0)
+        sample_age_s = _safe_float(st.get("driver_status_age_s"), -1.0)
+        status_fresh = bool(
+            st.get("driver_status_valid") is True
+            and st.get("driver_status_stale") is False
+            and st.get("driver_status_degraded") is False
+            and st.get("driver_status_glitch") is False
+            and st.get("driver_status_plausible") is True
+            and st.get("driver_status_source") == "rscp_same_response"
+            and st.get("wb_status_source") == "rscp_wb_extern_data_alg"
+            and st.get("wb_status_valid") is True
+            and st.get("alg_seen") is True
+            and math.isfinite(sample_ts)
+            and math.isfinite(sample_ok_ts)
+            and math.isfinite(sample_age_s)
+            and sample_ts > 0.0
+            and sample_ok_ts == sample_ts
+            and 0.0 <= sample_age_s <= 15.0
+        )
+        autonomous_efy = bool(
+            str(st.get("e3dc_device_family", "") or "").strip().lower()
+            == "efy"
+            and str(st.get("e3dc_device_family_source", "") or "")
+            in {"configured", "configured_type"}
+            and str(st.get("e3dc_control_backend", "") or "")
+            == "wbchar6_compat"
+            and status_fresh
+        )
         return {
             "can_switch": False,
             "capability": "e3dc_multi_connect_cp_480_unverified",
             "source": "disabled_by_hardware_protection",
             "api_surface": "",
+            "autonomous_can_switch": autonomous_efy,
+            "autonomous_capability": (
+                "e3dc_efy_official_autonomous_solar"
+                if autonomous_efy
+                else "not_freshly_confirmed"
+            ),
+            "autonomous_source": (
+                "configured_family_plus_official_contract"
+                if autonomous_efy
+                else "fail_closed"
+            ),
+            "autonomous_handoff_method": (
+                "set_amp_autonomous_solar"
+                if autonomous_efy
+                else ""
+            ),
+            "autonomous_protocol_mode": (
+                "wbchar6_solar_mode"
+                if autonomous_efy
+                else ""
+            ),
         }
     return {
         "can_switch": False,
@@ -1876,13 +2027,24 @@ def phase_observation_contract(
 
     session_1p_only = bool(cd.get("_session_1p_only", False))
     can_switch = bool(cap.get("can_switch", False) or st.get("can_switch_phases", False))
+    autonomous_can_switch = bool(cap.get("autonomous_can_switch", False))
     if charger_class_name == "OpenWBCharger":
         can_switch = False
     normalized_driver = str(driver_variant or st.get("driver_variant", "") or "")
     if charger_class_name == "E3DCMultiConnectCharger" or normalized_driver in {"e3dc_multi_connect", "e3dc_rscp"}:
         can_switch = False
+        autonomous_can_switch = bool(
+            autonomous_can_switch
+            and str(st.get("e3dc_device_family", "") or "").strip().lower()
+            == "efy"
+            and str(st.get("e3dc_device_family_source", "") or "")
+            in {"configured", "configured_type"}
+            and str(st.get("e3dc_control_backend", "") or "")
+            == "wbchar6_compat"
+        )
     if charger_class_name == "E3DCCharger" and normalized_driver == "e3dc_native":
         can_switch = False
+        autonomous_can_switch = False
     evse_phase_switch_capable = bool(can_switch)
 
     phase_power_target_transition = bool(
@@ -1932,6 +2094,7 @@ def phase_observation_contract(
     native_fixed_three_phase = bool(
         (charger_class_name in ("E3DCCharger", "E3DCMultiConnectCharger") or normalized_driver in ("e3dc_native", "e3dc_multi_connect", "e3dc_rscp"))
         and not can_switch
+        and not autonomous_can_switch
         and not session_1p_only
         and cable_phases >= 3
         and wallbox_phases >= 3
@@ -2054,6 +2217,19 @@ def phase_observation_contract(
         ),
         "phase_power_verified": bool(st.get("phase_power_verified", False)),
         "can_switch_phases": bool(can_switch),
+        "autonomous_phase_switch_capable": bool(autonomous_can_switch),
+        "autonomous_phase_switch_capability": str(
+            cap.get("autonomous_capability", "") or ""
+        ),
+        "autonomous_phase_switch_source": str(
+            cap.get("autonomous_source", "") or ""
+        ),
+        "autonomous_phase_handoff_method": str(
+            cap.get("autonomous_handoff_method", "") or ""
+        ),
+        "autonomous_phase_protocol_mode": str(
+            cap.get("autonomous_protocol_mode", "") or ""
+        ),
         "phase_switch_capability": str(cap.get("capability", st.get("phase_switch_capability", "")) or ""),
         "phase_switch_source": str(cap.get("source", st.get("phase_switch_source", "")) or ""),
         "api_surface": str(cap.get("api_surface", st.get("api_surface", "")) or ""),
@@ -2148,6 +2324,7 @@ def wallbox_executable_budget(
     can_switch_to_1p: bool = False,
     require_one_phase: bool = False,
     grid_unlocked: bool = False,
+    autonomous_pv_only: bool = False,
     phase_capability: Optional[Dict[str, Any]] = None,
     vehicle_phase_capability: Optional[Dict[str, Any]] = None,
     charger_class_name: str = "",
@@ -2187,8 +2364,36 @@ def wallbox_executable_budget(
     )
     phases = max(1, min(3, int(phase_contract.get("effective_phases", detected) or detected)))
     basis = str(phase_contract.get("effective_source", "detected") or "detected")
-    min_power_w = float(min_amp_int * 230 * phases)
     one_phase_min_w = float(min_amp_int * 230)
+    nominal_min_power_w = float(min_amp_int * 230 * phases)
+    autonomous_1p_ready = bool(
+        phase_contract.get("autonomous_phase_switch_capable") is True
+        and autonomous_pv_only
+        and not grid_unlocked
+        and str(phase_contract.get("autonomous_phase_handoff_method") or "")
+        == "set_amp_autonomous_solar"
+        and str(phase_contract.get("autonomous_phase_protocol_mode") or "")
+        == "wbchar6_solar_mode"
+        and budget_w >= one_phase_min_w
+        and (
+            require_one_phase
+            or budget_w < nominal_min_power_w
+        )
+    )
+    if autonomous_1p_ready:
+        # Die efy erhält keinen Phasenbefehl. E3DC-Control übergibt ausschließlich
+        # den bereits kanonischen WBchar6-Sonnenmodus mit Stromdeckel; die im
+        # explizit konfigurierte efy wählt gemäß Herstellervertrag 1p/3p selbst;
+        # der frische ALG-Status bindet die konkrete Steck-/Ladesitzung.
+        # Für diesen eng gebundenen Übergabepfad darf die Watt-/Ampere-Projektion
+        # deshalb das 1p-Minimum verwenden.
+        phases = 1
+        basis = "e3dc_efy_autonomous_solar_handoff"
+    energy_projection_phases = int(phases)
+    electrical_reservation_phases = int(
+        3 if autonomous_1p_ready else energy_projection_phases
+    )
+    min_power_w = float(min_amp_int * 230 * phases)
     budget_ready = bool(grid_unlocked or budget_w >= min_power_w)
     switch_to_1p_ready = bool(
         openwb_phase_capable
@@ -2211,14 +2416,25 @@ def wallbox_executable_budget(
             and bool(phase_contract.get("can_switch_phases", False))
         )
         or switch_to_1p_ready
+        or autonomous_1p_ready
     )
-    can_start_or_hold = bool(real_charging or budget_ready or switch_to_1p_ready)
+    can_start_or_hold = bool(
+        real_charging
+        or budget_ready
+        or switch_to_1p_ready
+        or autonomous_1p_ready
+    )
 
     if grid_unlocked and budget_w < min_power_w:
         reason = "Netz-/Preisfenster gibt Laden frei; Mindestleistung %.0f W (%dp) ist erlaubt." % (
             min_power_w,
             phases,
         )
+    elif autonomous_1p_ready:
+        reason = (
+            "Budget %.0f W reicht für die efy-Übergabe an den autonomen "
+            "Solarmodus ab %.0f W (1p); E3DC-Control sendet keinen Phasenbefehl."
+        ) % (budget_w, one_phase_min_w)
     elif budget_ready:
         reason = "Budget %.0f W deckt Mindestleistung %.0f W (%dp)." % (budget_w, min_power_w, phases)
     elif switch_to_1p_ready:
@@ -2240,6 +2456,11 @@ def wallbox_executable_budget(
     return {
         "allowed_w": int(round(budget_w)),
         "phases": int(phases),
+        # ``phases`` bleibt der kompatible Alias für die energetische
+        # Wattprojektion. Eine autonome efy darf energetisch mit 1p starten,
+        # muss bis zur rückgelesenen Eigenwahl aber elektrisch 3p reservieren.
+        "energy_projection_phases": energy_projection_phases,
+        "electrical_reservation_phases": electrical_reservation_phases,
         "phase_basis": basis,
         "phase_contract": phase_contract,
         "min_amp": int(min_amp_int),
@@ -2247,6 +2468,27 @@ def wallbox_executable_budget(
         "one_phase_min_power_w": int(round(one_phase_min_w)),
         "budget_ready": bool(budget_ready),
         "switch_to_1p_ready": bool(switch_to_1p_ready),
+        "autonomous_1p_ready": bool(autonomous_1p_ready),
+        "autonomous_phase_handoff": bool(autonomous_1p_ready),
+        "autonomous_phase_handoff_method": (
+            "set_amp_autonomous_solar" if autonomous_1p_ready else ""
+        ),
+        "autonomous_phase_protocol_mode": (
+            "wbchar6_solar_mode" if autonomous_1p_ready else ""
+        ),
+        # Der Ampere-Deckel stammt aus der zentralen Wattentscheidung. Weil
+        # die efy ihre Phase in diesem Sonderpfad selbst wählt, ist daraus
+        # jedoch kein strikter Ladepunkt-Wattdeckel ableitbar: derselbe Strom
+        # kann ein- oder dreiphasig fließen. Der Handoff ist deshalb bewusst
+        # als PV-Senke und nicht als harte Wattzusage typisiert.
+        "watt_budget_semantics": (
+            "autonomous_pv_sink" if autonomous_1p_ready else "strict_phase_projection"
+        ),
+        "strict_watt_cap": not autonomous_1p_ready,
+        "worst_case_phase_multiplier": 3 if autonomous_1p_ready else 1,
+        "grid_import_protection": (
+            "wbchar6_solar_mode" if autonomous_1p_ready else "manager_budget"
+        ),
         "one_phase_required": bool(require_one_phase),
         "one_phase_ready": bool(one_phase_ready),
         "can_start_or_hold": bool(can_start_or_hold),
@@ -2378,12 +2620,121 @@ def physical_current_phase_count(
         valid_phase_count(detected_phases, 1),
     ) or 1
     allocation_phases = valid_phase_count(allocation_target_phases, 0)
+    if budget.get("autonomous_1p_ready") is True:
+        # Die Zuteilung kann aus dem konservativen gemeinsamen RSCP-Vertrag
+        # noch 3p tragen. Der versiegelte efy-Übergabevertrag ist enger: Er
+        # gilt nur bei expliziter efy-Konfiguration und frischem ALG-Status und
+        # lässt ausschließlich den herstellereigenen Sonnenmodus entscheiden.
+        return 1
     if (
         budget.get("switch_to_1p_ready") is True
         and allocation_phases == 1
     ):
         return 1
     return max(1, min(3, max(policy_phases, allocation_phases)))
+
+
+def wallbox_floor_phase_contract(
+    physical_budget: Optional[Dict[str, Any]],
+    *,
+    allocated_w: Any = 0.0,
+    real_surplus_w: Any = 0.0,
+    min_amp: Any = 6,
+    fallback_phases: Any = 3,
+) -> Dict[str, Any]:
+    """Bindet Floor-Mindestleistung und Cooldown an die ausführbare Physik.
+
+    Der Vertrag öffnet keine Akkuhilfe. Er darf ausschließlich einen alten
+    3p-Floor-Cooldown aufheben, wenn der bereits versiegelte autonome efy-
+    Sonnenmodus mindestens sein 1p-PV-Budget real zur Verfügung hat.
+    """
+
+    budget = physical_budget if isinstance(physical_budget, dict) else {}
+    phases = valid_phase_count(
+        budget.get("phases"),
+        valid_phase_count(fallback_phases, 3),
+    ) or 3
+    minimum_amp = max(1, _safe_int(min_amp, 6))
+    minimum_w = float(minimum_amp * 230 * phases)
+    threshold_w = max(750.0, minimum_w - 250.0)
+    allocated = max(0.0, _safe_float(allocated_w, 0.0))
+    surplus = max(0.0, _safe_float(real_surplus_w, 0.0))
+    autonomous_ready = bool(budget.get("autonomous_1p_ready") is True)
+    release_cooldown = bool(
+        autonomous_ready
+        and allocated >= threshold_w
+        and surplus >= threshold_w
+    )
+    return {
+        "contract": "wallbox_floor_phase_contract_v1",
+        "phases": int(phases),
+        "min_amp": int(minimum_amp),
+        "min_power_w": int(round(minimum_w)),
+        "threshold_w": int(round(threshold_w)),
+        "allocated_w": int(round(allocated)),
+        "real_surplus_w": int(round(surplus)),
+        "autonomous_1p_ready": autonomous_ready,
+        "release_battery_cooldown": release_cooldown,
+    }
+
+
+def autonomous_solar_output_contract(
+    physical_budget: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Bindet den expliziten efy-Solarauftrag an den Physical-Budget-Vertrag.
+
+    Die Policy hat Wattbudget, Mindeststrom und die zulässige autonome
+    Übergabe bereits entschieden. Dieser Vertrag wählt nur die dazugehörige
+    Treibermethode. Er fällt bei einem unvollständigen oder veränderten
+    Physical-Budget-Vertrag auf den normalen Sonnenmodus zurück und behauptet
+    ausdrücklich keinen strikten Ladepunkt-Wattdeckel.
+    """
+
+    budget = physical_budget if isinstance(physical_budget, dict) else {}
+    phase_contract = (
+        budget.get("phase_contract")
+        if isinstance(budget.get("phase_contract"), dict)
+        else {}
+    )
+    active = bool(
+        budget.get("autonomous_phase_handoff") is True
+        and budget.get("autonomous_1p_ready") is True
+        and budget.get("strict_watt_cap") is False
+        and str(budget.get("watt_budget_semantics") or "")
+        == "autonomous_pv_sink"
+        and str(budget.get("autonomous_phase_handoff_method") or "")
+        == "set_amp_autonomous_solar"
+        and str(budget.get("autonomous_phase_protocol_mode") or "")
+        == "wbchar6_solar_mode"
+        and phase_contract.get("autonomous_phase_switch_capable") is True
+        and str(phase_contract.get("autonomous_phase_switch_source") or "")
+        == "configured_family_plus_official_contract"
+        and str(phase_contract.get("autonomous_phase_handoff_method") or "")
+        == "set_amp_autonomous_solar"
+        and str(phase_contract.get("autonomous_phase_protocol_mode") or "")
+        == "wbchar6_solar_mode"
+    )
+    return {
+        "contract": "wallbox_autonomous_solar_output_v1",
+        "active": active,
+        "method": (
+            "set_amp_autonomous_solar" if active else "set_amp_sonnenmodus"
+        ),
+        "protocol_mode": "wbchar6_solar_mode" if active else "",
+        "watt_budget_semantics": (
+            "autonomous_pv_sink" if active else "strict_phase_projection"
+        ),
+        "strict_watt_cap": not active,
+        "worst_case_phase_multiplier": 3 if active else 1,
+        "grid_import_protection": (
+            "wbchar6_solar_mode" if active else "manager_budget"
+        ),
+        "reason": (
+            "explicit_efy_autonomous_solar_handoff"
+            if active
+            else "autonomous_handoff_not_bound"
+        ),
+    }
 
 
 def physical_start_diagnostic_projection(
@@ -2473,6 +2824,7 @@ def stable_wallbox_amp_contract(
     current_amp: Any,
     real_power_w: Any = 0.0,
     real_charging: bool = False,
+    status_fresh: bool = True,
     now_ts: Any = 0.0,
     charger_class_name: str = "",
     grid_power_w: Any = 0.0,
@@ -2490,8 +2842,8 @@ def stable_wallbox_amp_contract(
     fast_block_until: Any = 0.0,
     stable_budget_jump_ts: Any = 0.0,
     last_openwb_grid_window_amp_up_ts: Any = 0.0,
-    stable_follow_hold_s: Any = 25.0,
-    openwb_budget_jump_hold_s: Any = 15.0,
+    stable_follow_hold_s: Any = 4.0,
+    openwb_budget_jump_hold_s: Any = 4.0,
     stable_start_confirm_w: Any = 700.0,
     openwb_grid_window_ramp_a: Any = 5,
     openwb_grid_window_ramp_hold_s: Any = 15.0,
@@ -2500,7 +2852,7 @@ def stable_wallbox_amp_contract(
     storage_floor_amp_up_export_w: Any = 500.0,
     storage_floor_amp_up_hold_s: Any = 15.0,
     stable_budget_jump_deadband_a: Any = 3,
-    stable_budget_jump_hold_s: Any = 45.0,
+    stable_budget_jump_hold_s: Any = 6.0,
 ) -> Dict[str, Any]:
     """Dämpft Stromänderungen der Wallbox während eines aktiv geregelten Ladevorgangs."""
 
@@ -2516,11 +2868,17 @@ def stable_wallbox_amp_contract(
     grid_w = _safe_float(grid_power_w, 0.0)
     threshold_w = _safe_float(fast_grid_threshold_w, 150.0)
     openwb_like = charger_class_name in ("OpenWBCharger", "OpenWBProCharger")
-    follow_s = max(10.0, _safe_float(stable_follow_hold_s, 25.0))
+    follow_s = max(2.0, _safe_float(stable_follow_hold_s, 4.0))
     if openwb_like:
-        follow_s = min(follow_s, max(10.0, _safe_float(openwb_budget_jump_hold_s, 15.0)))
+        follow_s = min(
+            follow_s,
+            max(2.0, _safe_float(openwb_budget_jump_hold_s, 4.0)),
+        )
     confirm_w = max(400.0, _safe_float(stable_start_confirm_w, 700.0))
-    real_confirmed = bool(real_charging or _safe_float(real_power_w, 0.0) >= confirm_w)
+    real_confirmed = bool(
+        status_fresh
+        and (real_charging or _safe_float(real_power_w, 0.0) >= confirm_w)
+    )
     state_updates: Dict[str, Any] = {}
 
     def result(applied: int, reason: str) -> Dict[str, Any]:
@@ -2533,6 +2891,7 @@ def stable_wallbox_amp_contract(
             "direction": "up" if int(applied) > current_i else ("down" if int(applied) < current_i else "flat"),
             "reason": reason,
             "real_confirmed": bool(real_confirmed),
+            "status_fresh": bool(status_fresh),
             "openwb_like": bool(openwb_like),
             "follow_s": float(follow_s),
             "state_updates": dict(state_updates),
@@ -2673,8 +3032,10 @@ def pv_hybrid_energy_gate(
 
     Bei starkem Überschuss darf die Regelung schnell starten, ein nur knapp
     ausreichendes 6-A-Fenster muss jedoch zeitlich oder energetisch Bestand
-    haben. Stopps verhalten sich spiegelbildlich: Kurzzeitig negative Energie
-    wird überbrückt. Gewöhnlicher Netzbezug einer laufenden PV-Ladung wird vom
+    haben. Eine laufende Ladung wird dagegen am physikalischen Mindeststrom
+    überbrückt, bis das konfigurierte Energiedefizit wirklich verbraucht ist.
+    Die verstrichene Zeit ist dabei nur Diagnose und niemals eine eigenständige
+    Stopfreigabe. Gewöhnlicher Netzbezug einer laufenden PV-Ladung wird vom
     zentralen Mindeststrom-/Importintegral behandelt und darf dieses ältere
     Energiegate nicht als Sofort-Stopp umgehen. Das negative Integral nutzt die
     gemessene oder konservativ abgeleitete laufende Leistung. Deshalb verbraucht
@@ -2733,7 +3094,7 @@ def pv_hybrid_energy_gate(
     )
     stop_signal = bool(
         running
-        and (budget < max(0.0, min_power - 120.0) or hard_stop)
+        and (cap < minimum or budget < min_power or hard_stop)
     )
     strong_start = bool(start_signal and (budget >= min_power + strong_w or cap >= minimum + 2))
 
@@ -2775,6 +3136,7 @@ def pv_hybrid_energy_gate(
         or positive_age >= start_hold
         or positive_wh >= start_wh
     )
+    stop_energy_reached = bool(stop_wh <= 0.0 or negative_wh >= stop_wh)
     stop_allowed = bool(
         not enabled
         or not stop_signal
@@ -2782,8 +3144,7 @@ def pv_hybrid_energy_gate(
             not ordinary_grid_import_sequence_active
             and (
                 hard_stop
-                or negative_age >= stop_hold
-                or negative_wh >= stop_wh
+                or stop_energy_reached
             )
         )
     )
@@ -2824,6 +3185,9 @@ def pv_hybrid_energy_gate(
         "negative_wh": float(negative_wh),
         "positive_age_s": float(positive_age),
         "negative_age_s": float(negative_age),
+        "stop_hold_s": float(stop_hold),
+        "stop_energy_wh": float(stop_wh),
+        "stop_energy_reached": bool(stop_energy_reached),
         "start_allowed": bool(start_allowed),
         "stop_allowed": bool(stop_allowed),
         "hold_allowed": bool(stop_signal and not stop_allowed),
@@ -3194,28 +3558,48 @@ def start_stop_hold_action(
     # Schutz stehen vor sämtlichen Haltepfaden. Auch ein inkonsistenter positiver
     # Upstream-Cap darf diese Stop-Autorität nicht wieder öffnen.
     zero_budget_stop_requested = bool(
-        zero_budget_hard_stop
+        priority_forced_stop
+        or zero_budget_hard_stop
         or zero_budget_stop_allowed
         or native_battery_drain_zero_budget_active
     )
     if zero_budget_stop_requested:
         cap = 0.0
 
-        native_real_charge = bool(hw_charging and hw_power > 500.0)
-        if e3dc_native_toggle:
+        if priority_forced_stop:
+            priority_stop_edge = priority_forced_stop_edge_contract(
+                priority_forced_stop=True,
+                charger_connected=charger_connected,
+                hw_charging=hw_charging,
+                hw_power_w=hw_power,
+                current_amp=current,
+                current_set_amp=set_amp,
+                is_charging_memory=is_charging_memory,
+                stop_already_sent=stop_already_sent,
+                stop_retry_due=stop_retry_due,
+                e3dc_native_toggle=e3dc_native_toggle,
+            )
             stop_edge_due = bool(
-                (native_real_charge and not stop_already_sent)
-                or stop_retry_due
+                priority_stop_edge.get("stop_edge_due", False)
             )
         else:
-            stop_edge_due = bool(
-                is_charging_memory
-                or hw_charging
-                or hw_power > 500.0
-                or not stop_already_sent
-                or stop_retry_due
-            )
-        if zero_budget_hard_stop:
+            native_real_charge = bool(hw_charging and hw_power > 500.0)
+            if e3dc_native_toggle:
+                stop_edge_due = bool(
+                    (native_real_charge and not stop_already_sent)
+                    or stop_retry_due
+                )
+            else:
+                stop_edge_due = bool(
+                    is_charging_memory
+                    or hw_charging
+                    or hw_power > 500.0
+                    or not stop_already_sent
+                    or stop_retry_due
+                )
+        if priority_forced_stop:
+            stop_reason = "priority_forced_stop"
+        elif zero_budget_hard_stop:
             stop_reason = "zero_budget_hard_stop"
         elif native_battery_drain_zero_budget_active:
             stop_reason = "native_battery_drain_zero_budget"
@@ -4721,6 +5105,34 @@ def build_wallbox_decision_payload(
     current = _decision_map(current_decision)
     start_stop = _decision_map(start_stop_decision)
     phase = _decision_map(phase_recommendation)
+    if priority_forced_stop:
+        # Auch ein vorfinales Diagnose-/Phasen-Payload darf aus einem alten
+        # positiven Strom- oder Phasenwert keinen Hardwarewunsch erzeugen.
+        # Der Manager materialisiert die eigentliche typisierte Stopkante;
+        # ein bereits finales STOP-Payload wird hier unverändert erhalten.
+        current = dict(current)
+        current.update({
+            "target_amp": 0.0,
+            "physically_chargeable": False,
+            "limiting_reason": "priority_forced_stop",
+        })
+        start_stop = dict(start_stop)
+        if str(start_stop.get("action", "NOOP") or "NOOP") != "STOP":
+            start_stop.update({
+                "action": "NOOP",
+                "target_amp": 0.0,
+                "hold_amp": 0.0,
+                "is_new_start": False,
+                "reason": "priority_forced_stop",
+            })
+            start_stop.pop("stop_authority", None)
+        phase = {
+            "action": "KEEP_PHASES",
+            "target_phases": 0,
+            "wait_s": 0,
+            "remaining_s": 0,
+            "reason": "priority_forced_stop",
+        }
     start_action = str(start_stop.get("action", "NOOP") or "NOOP")
     phase_action = str(phase.get("action", "KEEP_PHASES") or "KEEP_PHASES")
     current_reason = str(current.get("limiting_reason", "") or "")
@@ -5008,13 +5420,22 @@ def _event_start_stop_action(event: Dict[str, Any]) -> str:
 
     if kind == "stop" or method == "emergency_stop":
         return "stop"
-    if method in ("set_amp_and_state", "set_amp_sonnenmodus") and (amp <= 0 or force_state == 1):
+    if method in (
+        "set_amp_and_state",
+        "set_amp_sonnenmodus",
+        "set_amp_autonomous_solar",
+    ) and (amp <= 0 or force_state == 1):
         return "stop"
     if method == "set_direct_current" and amp <= 0:
         return "stop"
     if kind in ("set_current", "hold_current") and amp >= 6:
         return "start"
-    if method in ("set_amp_and_state", "set_amp_sonnenmodus", "set_direct_current") and amp >= 6:
+    if method in (
+        "set_amp_and_state",
+        "set_amp_sonnenmodus",
+        "set_amp_autonomous_solar",
+        "set_direct_current",
+    ) and amp >= 6:
         return "start"
     return ""
 

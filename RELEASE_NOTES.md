@@ -1,14 +1,92 @@
-# E3DC-Control v5.4.4h
+# E3DC-Control v5.4.4i
 
 Release-Stand: 2026-08-31.
 
-E3DC-Control 5.4.4h ist ein enges Wartungsrelease für Startnachweis und
-Rückmeldung des System-Updates. EMS-, Speicher-, Wallbox-, Wärme- und
-Direktvermarktungsregelung bleiben gegenüber 5.4.4g unverändert. Die
-bestehenden Nutzer-, Hausanschluss-, Fahrzeug-, Geheimnis- und
-Hardwareschutzgrenzen bleiben vollständig wirksam.
+E3DC-Control 5.4.4i ist ein Wartungsrelease für den lokalisierungsunabhängigen
+Updateeinstieg, den manuell erfassten Fahrzeug-SoC und eindeutige
+Wallbox-Ausgangsverträge. Nutzer-`Aus`, Hausanschluss-, Fahrzeug-, Netz-,
+Geheimnis- und Hardwareschutzgrenzen bleiben wirksam.
 
-## Systemjob wird vor dem Produktpfad beidseitig bestätigt
+## Updateeinstieg ist von der Systemsprache unabhängig
+
+- Web-Launcher und Community-Bootstrap setzen vor allen steuernden
+  Dateitypprüfungen eine feste C-Locale. Der über `systemd-run` gestartete
+  Worker erhält `LANG=C` und `LC_ALL=C` ausdrücklich mit. Lokalisierte
+  `stat`-Ausgaben können ein zulässiges root-kontrolliertes Verzeichnis oder
+  eine reguläre Datei dadurch nicht mehr fälschlich ablehnen.
+- Die Härtung wird nicht gelockert: Eigentümer, Modus, Pfad, Symlink und
+  Hardlink werden weiterhin vor dem Produktpfad geprüft. Unsichere oder
+  während der Prüfung ausgetauschte Knoten bleiben gesperrt.
+- Die README bleibt auf aktuellen Einstieg und dauerhafte Funktionen begrenzt.
+  Die vollständige Versionsgeschichte steht im Changelog. Der Rettungsbefehl
+  führt die heruntergeladene Bootstrap-Datei nur nach erfolgreichem Download
+  aus.
+
+## Manueller Fahrzeug-SoC mit echter Quelle und Zeit
+
+- Ein manuell gespeicherter Fahrzeug-SoC führt seinen ursprünglichen
+  Aktionszeitpunkt und die kanonische Profilbindung bis in Live-Daten und
+  Webanzeige. Datei-, Abruf- oder Anzeigezeit verjüngen den Wert nicht.
+- Die Übernahme verlangt genau ein passendes gespeichertes Profil und den
+  aktuellen Wallbox- und Steckkontext. Mehrdeutige, ungebundene,
+  widersprüchliche oder nicht angeschlossene Zustände werden nicht geraten.
+  Eine eng gebundene Reparatur eines bekannten Altwerts erfindet weder Profil
+  noch Zeit.
+- Die Korrektur ist Lesewahrheit für Oberfläche und Planung. Sie erzeugt
+  keinen Lade- oder sonstigen Hardwarebefehl.
+
+## Wallbox-Regelung mit einem endgültigen Ausgang
+
+- Eine laufende Ladung in `PV-Kurve ruhig` bleibt bei einem kleinen
+  Leistungsdefizit am physischen Mindeststrom, bis der bestehende
+  Energiezähler den konfigurierten Wh-Rahmen verbraucht. Sie wird nicht allein
+  durch eine momentane Watt-Unterschreitung beendet. Eindeutiger Netzbezug und
+  harte Schutzgrenzen bleiben vorrangig.
+- Eine zentrale Prioritäts- oder Schutzentscheidung mit 0 A versiegelt Strom-
+  und Phasenausgang für diesen Zyklus. Nachgelagerte Rampen, alte
+  Phasenabsichten oder Treiberzustände können keinen positiven Restwert erneut
+  öffnen.
+- Die autonome EFY-Herstellerregelung wird getrennt von einem direkt
+  kommandierbaren Phasenwechsel behandelt. Leistungsbilanz und elektrische
+  Phasenreserve bleiben getrennt; dieses Release behauptet keine physisch
+  bestätigte einphasige EFY-Umschaltung.
+- Die zentrale Wallbox-Regelung besitzt den je Ladepunkt gebundenen
+  Stromzustand. Nachgelagerte Legacy- oder Treiberrampen begrenzen ein bereits
+  zentral entschiedenes Ziel nicht erneut. Eine Erhöhung verlangt weiterhin
+  frischen Gerätezustand, verfügbares Budget und alle Fahrzeug-, Netz- und
+  Hardwaregrenzen; eine vollständig direkte Hochregelung ist damit nicht
+  zugesagt.
+- Ein durch eine aktuelle Stopp- oder Schutzentscheidung überholter
+  openWB-Phasenwunsch endet sicher, ohne den Ausgang wieder zu öffnen. Die
+  480-Sekunden-Frist sperrt weiterhin ausschließlich einen weiteren
+  Phasenwechsel.
+
+## Flexible Verbraucher ohne dauerhafte Scheinreservierung
+
+- Physisch laufende Verbraucher, ein gebundener Startvorgang und ein bloßer
+  Startwunsch werden getrennt bilanziert. Eine inaktive Wärmepumpe reserviert
+  nicht unbegrenzt Wallboxbudget.
+- Reale Verbraucherleistung und ein aktuell gebundener Startvorgang bleiben
+  geschützt. Speicher- und Wallboxpfad verwenden denselben zentralen
+  Eigentümervertrag, statt dieselbe Leistung mehrfach zu reservieren oder
+  freizugeben.
+- Eine real gemessene Vorlaufleistung der Wärmepumpe wird als aktuelle, nicht
+  kommandierbare Last genau einmal vom verfügbaren Rahmen abgezogen. Sie
+  erzeugt allein keine neue positive Startfreigabe.
+- Eine positive zentrale Wärmepumpen-Startfreigabe entsteht nur, wenn die
+  gesamte erforderliche Startleistung zugewiesen ist. Signal- und
+  Mindestlaufhaltezeiten bleiben davon getrennt lokal erhalten.
+- Ein frischer positiver Aktor-Readback stellt nach einem Prozessneustart nur
+  die bereits laufende lokale Signalhaltezeit wieder her. Er sendet keinen
+  neuen Befehl, ersetzt kein Wattbudget und bleibt dem Safety-Veto
+  untergeordnet.
+- Eine Unterdeckung der laufenden Wallbox bleibt als eindeutiger Restbedarf
+  sichtbar. Damit kann der Wallboxpfad weiterhin geordnet über Mindeststrom,
+  Wh-Wächter, Phasenwechsel und erst zuletzt Stopp reagieren.
+
+## Enthaltener Stand aus 5.4.4h
+
+### Systemjob wird vor dem Produktpfad beidseitig bestätigt
 
 - Dispatcher und Worker prüfen dieselbe aktive systemd-Unit, dieselbe
   MainPID, den root-kontrollierten Laufzeitstatus und den lebenden Prozess.

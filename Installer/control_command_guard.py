@@ -150,7 +150,13 @@ def _wallbox_command_action(command: Dict[str, Any], actor_state: Dict[str, Any]
         if target_phases == 1:
             return "1P"
         return ""
-    if method in {"set_current", "set_amp_and_state", "set_amp_sonnenmodus", "set_direct_current"} or kind in {
+    if method in {
+        "set_current",
+        "set_amp_and_state",
+        "set_amp_sonnenmodus",
+        "set_amp_autonomous_solar",
+        "set_direct_current",
+    } or kind in {
         "set_current",
         "hold_current",
     }:

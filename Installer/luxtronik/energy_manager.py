@@ -2760,13 +2760,17 @@ def build_central_heatpump_start_budget_gate(
     if permission_contract_present:
         if not boost_permission_active:
             blockers.append("HEATPUMP_BOOST_PERMISSION_INACTIVE")
-    else:
-        # Rückwärtskompatibler Diagnosepfad für alte, noch rein wattgebundene
-        # Tests/Snapshots. Die laufende v2-Projektion liefert stets das Bool.
-        if not allocation_exact:
-            blockers.append("HEATPUMP_ALLOCATION_PROJECTION_MISMATCH")
-        if type(authorized_w) is not int or authorized_w < required_w:
-            blockers.append("HEATPUMP_AUTHORIZED_WATTS_INSUFFICIENT")
+    # Rückwärtskompatible alte Snapshots können das Bool noch nicht liefern;
+    # ihre Wattbindung bleibt trotzdem derselben Prüfung unterworfen.
+    # Das boolesche Signal ist ein Aktorvertrag, aber keine Energiequelle.
+    # Auch v2 darf eine positive Startkante nur öffnen, wenn derselbe frische
+    # Vertrag die vollständige Startleistung exakt an diesen Verbraucher
+    # projiziert. Ein alter oder fehlerhafter True-Wert kann damit weder einen
+    # 1-W- noch einen 0-W-Start autorisieren.
+    if not allocation_exact:
+        blockers.append("HEATPUMP_ALLOCATION_PROJECTION_MISMATCH")
+    if type(authorized_w) is not int or authorized_w < required_w:
+        blockers.append("HEATPUMP_AUTHORIZED_WATTS_INSUFFICIENT")
     blockers = list(dict.fromkeys(blockers))
     return {
         "schema_version": "central_heatpump_start_budget_gate_v1",
@@ -8569,6 +8573,13 @@ def main():
                     # Nur der frische non-normale Aktor-Readback macht aus der
                     # restaurierten Zeit-/Demand-Buchhaltung wieder eine
                     # laufende Signalhaltezeit. Es wird kein Write ausgelöst.
+                    # Die lokale Freigabelatch wird dabei aus genau diesem
+                    # Readback rehydriert. Die zentrale Startfreigabe bleibt
+                    # getrennt: Sie darf bei 0 W nicht als neue Startquelle
+                    # dienen, während der bestehende Aktorzustand nach einem
+                    # Prozessneustart weiterhin bis zum Safety-/Hold-Entscheid
+                    # beobachtet werden muss.
+                    heatpump_boost_permission_active = True
                     heatpump_positive_signal_restored_unconfirmed = False
                     heatpump_positive_signal_restart_budget_rearm_pending = (
                         False

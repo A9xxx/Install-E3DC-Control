@@ -19251,6 +19251,12 @@ def build_flexible_consumer_budget_contract(
             max(0, int(cap_w)),
         )
         prior_offered = prior.get("offered") is True
+        prior_start_transaction_suspended = bool(
+            consumer == "heatpump"
+            and prior.get("transaction_in_flight") is True
+            and prior.get("state") == "start_transaction_zero_budget"
+            and safe_int(prior.get("transaction_required_w"), 0) > 0
+        )
         prior_late_start_unresolved = bool(
             consumer == "heatpump"
             and prior.get("late_start_unresolved") is True
@@ -19260,7 +19266,9 @@ def build_flexible_consumer_budget_contract(
             and prior.get("timeout_released") is True
         )
         prior_outcome_pending = bool(
-            prior_offered or prior_late_start_unresolved
+            prior_offered
+            or prior_late_start_unresolved
+            or prior_start_transaction_suspended
         )
         prior_rearm_required = prior.get("rearm_required") is True
         prior_request_generation = str(
@@ -19291,6 +19299,16 @@ def build_flexible_consumer_budget_contract(
                 or heatpump_signal_active_confirmed
             )
         )
+        # Migration und laufender Vertrag verwenden dieselbe harte Re-Arm-
+        # Kante: Nach dem absoluten Ende der Vollreservierung darf aus einem
+        # dauerhaft hohen ``Heatpump_Start_Ready`` keine neue Reserve geprägt
+        # werden. Ein bestätigtes Aktorsignal hält den Aktorzustand und ein
+        # realer Pumpenvorlauf bleibt exakt im Accounting; beides ist aber
+        # keine Verdichterannahme und räumt deshalb das Ready-Latch nicht.
+        # Das gilt auch für ältere persistierte Timeout-Zustände, deren
+        # ``rearm_required`` noch False war.
+        if prior_timeout_released:
+            prior_rearm_required = True
 
         def heatpump_timeout_released_lease(
             guard: Optional[Dict[str, Any]],
@@ -19300,6 +19318,7 @@ def build_flexible_consumer_budget_contract(
                 if heatpump_pump_prerun
                 else 0
             )
+            timeout_rearm_required = True
             timeout_retry_not_before_s = retry_not_before_s
             if not prior_timeout_released:
                 timeout_retry_not_before_s = max(
@@ -19329,7 +19348,10 @@ def build_flexible_consumer_budget_contract(
                 "time_guard": copy.deepcopy(
                     guard if isinstance(guard, dict) else {}
                 ),
-                "rearm_required": False,
+                "rearm_required": timeout_rearm_required,
+                "rearm_reason": (
+                    "ready_low_required_after_unconfirmed_timeout"
+                ),
                 "ready_latched": bool(ready),
                 "withdrawal_watermark_s": prior_withdrawal_watermark_s,
                 "signal_active_seen": prior_signal_active_seen,
@@ -19461,11 +19483,12 @@ def build_flexible_consumer_budget_contract(
                 "late_start_unresolved": False,
                 "timebase_rearm_count": 0,
             }
-        if prior_timeout_released and (now_s < retry_not_before_s or not ready):
-            # Nach Ablauf der Startlease bleibt die Freigabe fachlich bestehen,
-            # bis die einmal gesetzte Retry-Sperre abgelaufen ist. Bei weiter
-            # bestätigter Startbereitschaft und ausreichendem Überschuss darf
-            # danach ein frisches Startangebot gebildet werden.
+        if prior_timeout_released and not readiness_low_confirmed:
+            # Die volle Startreserve bleibt nach dem absoluten Timeout bis zu
+            # einem frisch belegten Ready-Low verriegelt. Signalreadback und
+            # Pumpenvorlauf werden weiter diagnostisch beziehungsweise als
+            # reale Teillast geschützt, dürfen aber keine 3,5-kW-Re-Offerte
+            # aus einem dauerhaft hohen Ready-Signal prägen.
             return heatpump_timeout_released_lease(prior_guard)
         if prior_offered and consumer != "heatpump" and not command_eligible:
             return {
@@ -19567,7 +19590,7 @@ def build_flexible_consumer_budget_contract(
                 ),
                 "timebase_rearm_count": timebase_rearm_count,
             }
-        if prior_offered:
+        if prior_offered or prior_start_transaction_suspended:
             if not timebase_rearm_count_valid:
                 return timebase_evidence_limit_lease()
             guard_shape_valid = bool(
@@ -19785,6 +19808,12 @@ def build_flexible_consumer_budget_contract(
                     "ready_latched": False,
                     "withdrawal_watermark_s": 0.0,
                     "timebase_rearm_count": 0,
+                    "timeout_released": False,
+                    "post_timeout_accounting_w": (
+                        max(0, int(heatpump_observed_w))
+                        if consumer == "heatpump" and heatpump_pump_prerun
+                        else 0
+                    ),
                 }
             return {
                 "offered": False,
@@ -20000,10 +20029,18 @@ def build_flexible_consumer_budget_contract(
             0,
         ),
     )
+    heatpump_pump_prerun_accounting_w = (
+        max(0, int(heatpump_observed_w))
+        if heatpump_pump_prerun
+        else 0
+    )
     accounting_commitments_w = {
         consumer: max(
             running_commitments_w[consumer],
             heatpump_post_timeout_accounting_w
+            if consumer == "heatpump"
+            else 0,
+            heatpump_pump_prerun_accounting_w
             if consumer == "heatpump"
             else 0,
             safe_int(start_leases[consumer].get("request_w"), 0)
@@ -20012,9 +20049,147 @@ def build_flexible_consumer_budget_contract(
         )
         for consumer in ("heatpump", "wallbox", "heater")
     }
+    fresh_running_commitments_w = dict(measured_acceptance_w)
+    recovery_accounting_w = {
+        consumer: max(
+            0,
+            running_commitments_w[consumer]
+            - fresh_running_commitments_w[consumer],
+        )
+        for consumer in ("heatpump", "wallbox", "heater")
+    }
+    transaction_accounting_w = {
+        consumer: max(
+            0,
+            accounting_commitments_w[consumer]
+            - running_commitments_w[consumer],
+        )
+        for consumer in ("heatpump", "wallbox", "heater")
+    }
+    # Nur frische Annahme darf als Aktor-/Allokationslast erscheinen. Der kurze,
+    # monotone Drop-/Recovery-Guard sowie bereits physisch belegtes, aber nicht
+    # mehr kommandierbares Transaktions-Accounting werden weiter unten genau
+    # einmal als eigener Conservation-Bucket vom Rest abgezogen. Ein reguläres
+    # Startangebot bleibt dagegen über seine zeitlich gebundene Lease eine
+    # ausdrückliche Allokation.
+    allocation_commitments_w = dict(fresh_running_commitments_w)
+    recovery_accounting_reserve_requested_w = sum(
+        recovery_accounting_w.values()
+    )
+    transaction_accounting_reserve_requested_w = sum(
+        transaction_accounting_w.values()
+    )
+    noncommand_accounting_w = {
+        consumer: (
+            recovery_accounting_w[consumer]
+            + transaction_accounting_w[consumer]
+        )
+        for consumer in ("heatpump", "wallbox", "heater")
+    }
+    noncommand_accounting_reserve_requested_w = sum(
+        noncommand_accounting_w.values()
+    )
+    previous_command_allocations = (
+        previous_contract.get("command_allocations")
+        if isinstance(previous_contract.get("command_allocations"), dict)
+        else {}
+    )
+    previous_heatpump_start_lease = (
+        previous_leases.get("heatpump")
+        if isinstance(previous_leases.get("heatpump"), dict)
+        else {}
+    )
+    previous_heatpump_start_request_w = max(
+        0,
+        safe_int(previous_heatpump_start_lease.get("request_w"), 0),
+        safe_int(previous_heatpump_start_lease.get("pending_request_w"), 0),
+    )
+    previous_heatpump_transaction_required_w = max(
+        previous_heatpump_start_request_w,
+        safe_int(
+            previous_heatpump_start_lease.get("transaction_required_w"),
+            0,
+        ),
+        safe_int(
+            previous_contract.get("heatpump_start_transaction_required_w"),
+            0,
+        ),
+    )
+    previous_heatpump_funded_w = max(
+        0,
+        safe_int(previous_allocations.get("heatpump"), 0),
+        safe_int(previous_command_allocations.get("heatpump"), 0),
+    )
+    heatpump_prior_funded_start_transaction = bool(
+        start_leases["heatpump"].get("offered") is True
+        and safe_int(start_leases["heatpump"].get("request_w"), 0) > 0
+        and (
+            previous_contract.get("heatpump_start_transaction_in_flight")
+            is True
+            or previous_contract.get("heatpump_boost_permission_active")
+            is True
+            or (
+                previous_heatpump_start_lease.get("offered") is True
+                and previous_heatpump_start_request_w > 0
+                and previous_heatpump_funded_w
+                >= previous_heatpump_start_request_w
+            )
+        )
+    )
+    # Eine bloße Wärmepumpen-Startempfehlung ist noch keine physische Last.
+    # Wenn gleichzeitig ein frischer Wallbox-Start ansteht, darf diese
+    # Empfehlung deshalb nicht das mindestens 1-phasige Ladeangebot
+    # verdrängen. Eine im Vorzyklus bereits voll finanzierte und ausgespielte
+    # Starttransaktion ist dagegen bis Readback oder absolutem Lease-Timeout
+    # verbindlich. Reale Last, Pumpenvorlauf, Aktorsignal, Late-Start-Safety
+    # und Prioritäts-Nachlauf bleiben ebenfalls vollständig geschützt.
+    heatpump_start_protection_reasons = []
+    if heatpump_prior_funded_start_transaction:
+        heatpump_start_protection_reasons.append(
+            "funded_start_transaction_in_flight"
+        )
+    if heatpump_running:
+        heatpump_start_protection_reasons.append("running")
+    if heatpump_compressor_confirmed:
+        heatpump_start_protection_reasons.append("compressor_confirmed")
+    if heatpump_pump_prerun:
+        heatpump_start_protection_reasons.append("pump_prerun")
+    if heatpump_signal_active_confirmed:
+        heatpump_start_protection_reasons.append("signal_active_confirmed")
+    if allocation_commitments_w["heatpump"] > 0:
+        heatpump_start_protection_reasons.append("accounting_commitment")
+    if max(0, int(heatpump_commitment_w)) > 0:
+        heatpump_start_protection_reasons.append("external_commitment")
+    if start_leases["heatpump"].get("signal_active_seen") is True:
+        heatpump_start_protection_reasons.append("signal_active_seen")
+    if start_leases["heatpump"].get("late_start_guard") is True:
+        heatpump_start_protection_reasons.append("late_start_guard")
+    if start_leases["heatpump"].get("late_start_unresolved") is True:
+        heatpump_start_protection_reasons.append("late_start_unresolved")
+    if priority_runon.get("active") is True:
+        heatpump_start_protection_reasons.append("priority_runon_guard")
+
+    consumer_command_quarantine = set(
+        acceptance_evidence_limit_consumers
+        + acceptance_frame_provenance_unbound_consumers
+        + late_start_evidence_limit_consumers
+    )
+    wallbox_idle_heatpump_start_priority_active = bool(
+        not phase_transition_active
+        and wallbox_online
+        and evidence_valid
+        and wallbox_command_eligible
+        and "wallbox" not in consumer_command_quarantine
+        and start_leases["wallbox"].get("offered") is True
+        and safe_int(start_leases["wallbox"].get("request_w"), 0)
+        >= CONSUMER_MIN_W["wallbox"]
+        and start_leases["heatpump"].get("offered") is True
+        and safe_int(start_leases["heatpump"].get("request_w"), 0) > 0
+        and not heatpump_start_protection_reasons
+    )
     wallbox_running_hold_support_w = min(
         wallbox_running_hold_support_w,
-        max(0, int(accounting_commitments_w["wallbox"])),
+        max(0, int(allocation_commitments_w["wallbox"])),
     )
     ramp_tolerance_w = max(
         0,
@@ -20024,11 +20199,6 @@ def build_flexible_consumer_budget_contract(
     if wallbox_ramp_phases not in (1, 2, 3):
         wallbox_ramp_phases = 1
     wallbox_ramp_probe_step_w = 230 * wallbox_ramp_phases
-    consumer_command_quarantine = set(
-        acceptance_evidence_limit_consumers
-        + acceptance_frame_provenance_unbound_consumers
-        + late_start_evidence_limit_consumers
-    )
     command_eligible_map = {
         "heatpump": bool(
             heatpump_command_eligible
@@ -20057,7 +20227,7 @@ def build_flexible_consumer_budget_contract(
         ("heatpump", heatpump_cap_w),
         ("heater", heater_cap_w),
     ):
-        accepted_w = accounting_commitments_w[consumer]
+        accepted_w = allocation_commitments_w[consumer]
         measured_w = measured_acceptance_w[consumer]
         prior_offer_w = max(0, safe_int(previous_allocations.get(consumer), 0))
         if accepted_w > 0:
@@ -20117,7 +20287,7 @@ def build_flexible_consumer_budget_contract(
         and wallbox_has_charge_demand
         and wallbox_start_lease.get("offered") is True
         and wallbox_start_lease.get("persistent_minimum_only") is not True
-        and accounting_commitments_w["wallbox"] <= 0
+        and allocation_commitments_w["wallbox"] <= 0
         and (not phase_transition_active or phase_transition_preoutput_only)
         and wallbox_possible_w >= CONSUMER_MIN_W["wallbox"]
         and wallbox_cap_w >= CONSUMER_MIN_W["wallbox"]
@@ -20220,8 +20390,35 @@ def build_flexible_consumer_budget_contract(
             ("wallbox",)
             if wallbox_start_hold_w > 0
             or wallbox_exclusive_start_support_w > 0
+            or wallbox_idle_heatpump_start_priority_active
             else ()
         )
+
+    # Frisch gemessene, nicht wattgenau modulierbare Lasten sind bereits
+    # physisch vorhanden. Wenn der berechnete flexible Rahmen kleiner ist,
+    # wird nur der Accounting-Rahmen bis zu dieser Istlast angehoben; daraus
+    # entsteht kein Restbudget für neue Verbraucher. So kann ein realer
+    # Verdichter- oder Heizstabverbrauch nicht den ganzen Vertrag ungültig
+    # machen, während die Wallbox weiterhin ausschließlich den echten Rest
+    # erhält.
+    fixed_running_accounting_floor_w = sum(
+        fresh_running_commitments_w[consumer]
+        for consumer in ("heatpump", "heater")
+    )
+    fixed_running_outside_budget_w = max(
+        0,
+        fixed_running_accounting_floor_w - total_w,
+    )
+    if fixed_running_accounting_floor_w > total_w:
+        total_w = fixed_running_accounting_floor_w
+        for consumer in ("heatpump", "heater"):
+            requests_w[consumer] = max(
+                requests_w[consumer],
+                min(
+                    request_caps_w[consumer],
+                    fresh_running_commitments_w[consumer],
+                ),
+            )
 
     # Eine bereits real ladende Wallbox ist eine laufende Verpflichtung, kein
     # neuer Startwunsch. Ein kurzfristig kleinerer PV-/Restbudgetrahmen darf
@@ -20248,6 +20445,135 @@ def build_flexible_consumer_budget_contract(
             if consumer != "wallbox"
         )
 
+    # Reale, nicht wattgenau modulierbare Mitverbraucher sind bereits am
+    # Netzpunkt vorhanden. Sie werden deshalb vor jeder frei verteilbaren
+    # Wallbox-Rampe gebunden, unabhängig von der konfigurierten Startpriorität.
+    # Eine lediglich startbereite Wärmepumpe landet hier ausdrücklich nicht:
+    # Nur der oben aus frischer Annahme gebildete Accounting-Commitment zählt.
+    fixed_running_priority_front = tuple(
+        consumer
+        for consumer in ("heatpump", "heater")
+        if fresh_running_commitments_w[consumer] > 0
+    )
+    if fixed_running_priority_front:
+        priority_front = fixed_running_priority_front + tuple(
+            consumer
+            for consumer in priority_front
+            if consumer not in fixed_running_priority_front
+        )
+
+    # Der gemeinsame nicht kommandierbare Bucket schützt vor einer
+    # Doppelvergabe derselben physisch möglicherweise noch laufenden Leistung:
+    # Er enthält sowohl Recovery- als auch Transaktions-Accounting, jedoch jede
+    # Komponente genau einmal. Frische feste Lasten gewinnen zuerst; nur der
+    # verbleibende Bruttorahmen kann diesen Bucket tragen. Er ist weder
+    # active_map noch Reservation eines Aktors und kann deshalb niemals einen
+    # Wärmepumpen-/Heizstab- oder Wallboxbefehl erzeugen.
+    gross_total_budget_w = max(0, int(total_w))
+    noncommand_reserve_capacity_w = max(
+        0,
+        gross_total_budget_w - fixed_running_accounting_floor_w,
+    )
+    noncommand_accounting_reserve_total_w = min(
+        noncommand_accounting_reserve_requested_w,
+        noncommand_reserve_capacity_w,
+    )
+    noncommand_accounting_reserve_w = {
+        consumer: 0
+        for consumer in ("heatpump", "wallbox", "heater")
+    }
+    noncommand_reserve_remaining_w = (
+        noncommand_accounting_reserve_total_w
+    )
+    for consumer in ("heatpump", "heater", "wallbox"):
+        reserved_w = min(
+            noncommand_reserve_remaining_w,
+            noncommand_accounting_w[consumer],
+        )
+        noncommand_accounting_reserve_w[consumer] = reserved_w
+        noncommand_reserve_remaining_w -= reserved_w
+    recovery_accounting_reserve_w = {
+        consumer: min(
+            recovery_accounting_w[consumer],
+            noncommand_accounting_reserve_w[consumer],
+        )
+        for consumer in ("heatpump", "wallbox", "heater")
+    }
+    transaction_accounting_reserve_w = {
+        consumer: min(
+            transaction_accounting_w[consumer],
+            max(
+                0,
+                noncommand_accounting_reserve_w[consumer]
+                - recovery_accounting_reserve_w[consumer],
+            ),
+        )
+        for consumer in ("heatpump", "wallbox", "heater")
+    }
+    recovery_accounting_reserve_total_w = sum(
+        recovery_accounting_reserve_w.values()
+    )
+    transaction_accounting_reserve_total_w = sum(
+        transaction_accounting_reserve_w.values()
+    )
+    recovery_accounting_reserve_shortfall_w = {
+        consumer: max(
+            0,
+            recovery_accounting_w[consumer]
+            - recovery_accounting_reserve_w[consumer],
+        )
+        for consumer in ("heatpump", "wallbox", "heater")
+    }
+    transaction_accounting_reserve_shortfall_w = {
+        consumer: max(
+            0,
+            transaction_accounting_w[consumer]
+            - transaction_accounting_reserve_w[consumer],
+        )
+        for consumer in ("heatpump", "wallbox", "heater")
+    }
+    noncommand_accounting_reserve_shortfall_w = {
+        consumer: max(
+            0,
+            noncommand_accounting_w[consumer]
+            - noncommand_accounting_reserve_w[consumer],
+        )
+        for consumer in ("heatpump", "wallbox", "heater")
+    }
+    total_w = max(
+        0,
+        gross_total_budget_w - noncommand_accounting_reserve_total_w,
+    )
+
+    # Wurde das WP-Startsignal im Vorzyklus bereits mit der vollen
+    # Startanforderung finanziert, ist es eine ausgespielte Transaktion und
+    # keine erneut abwägbare Ready-Empfehlung. Fällt der aktuelle Rahmen vor
+    # dem Readback, bindet diese Transaktion den noch verfügbaren Rest bis zum
+    # absoluten Lease-Timeout. Sie prägt dabei keine zusätzliche Leistung.
+    heatpump_start_transaction_required_w = (
+        min(
+            previous_heatpump_transaction_required_w,
+            safe_int(start_leases["heatpump"].get("request_w"), 0),
+        )
+        if (
+            heatpump_prior_funded_start_transaction
+            and previous_contract.get("heatpump_start_transaction_in_flight")
+            is True
+        )
+        else min(
+            previous_heatpump_start_request_w,
+            previous_heatpump_funded_w,
+            safe_int(start_leases["heatpump"].get("request_w"), 0),
+        )
+        if heatpump_prior_funded_start_transaction
+        else 0
+    )
+    heatpump_start_transaction_bind_w = min(
+        max(0, int(heatpump_start_transaction_required_w)),
+        max(0, int(requests_w.get("heatpump", 0))),
+        max(0, int(total_w)),
+    )
+
     previous_active = previous_contract.get("active")
     if not isinstance(previous_active, dict):
         previous_active = {
@@ -20261,14 +20587,23 @@ def build_flexible_consumer_budget_contract(
     }
     minimums_for_contract = dict(CONSUMER_MIN_W)
     for consumer in ("heatpump", "wallbox", "heater"):
-        if accounting_commitments_w[consumer] > 0:
+        if allocation_commitments_w[consumer] > 0:
             # Geräteminima sind Startschwellen. Eine bereits physisch laufende
             # oder begrenzt Recovery-gehaltene Last bleibt mit ihrer exakten
             # Istleistung im Accounting, auch wenn sie darunter moduliert.
             minimums_for_contract[consumer] = min(
                 CONSUMER_MIN_W[consumer],
-                accounting_commitments_w[consumer],
+                allocation_commitments_w[consumer],
             )
+    if heatpump_start_transaction_bind_w > 0:
+        # Die physische Mindestleistung gilt für eine neue Startfreigabe.
+        # Hier wurde das Signal bereits im Vorzyklus voll finanziert und
+        # ausgespielt; der kleinere Wert ist nur die summenerhaltende
+        # Shortfall-Bindung des aktuell noch vorhandenen Rahmens.
+        minimums_for_contract["heatpump"] = min(
+            minimums_for_contract["heatpump"],
+            heatpump_start_transaction_bind_w,
+        )
     maximums_map = {
         "heatpump": heatpump_cap_w,
         "wallbox": wallbox_cap_w,
@@ -20277,9 +20612,9 @@ def build_flexible_consumer_budget_contract(
 
     def active_map() -> Dict[str, bool]:
         return {
-            "heatpump": accounting_commitments_w["heatpump"] > 0,
-            "wallbox": accounting_commitments_w["wallbox"] > 0,
-            "heater": accounting_commitments_w["heater"] > 0,
+            "heatpump": allocation_commitments_w["heatpump"] > 0,
+            "wallbox": allocation_commitments_w["wallbox"] > 0,
+            "heater": allocation_commitments_w["heater"] > 0,
         }
 
     def reservations_map() -> Dict[str, int]:
@@ -20287,7 +20622,7 @@ def build_flexible_consumer_budget_contract(
             "heatpump": min(
                 requests_w["heatpump"],
                 max(
-                    accounting_commitments_w["heatpump"]
+                    allocation_commitments_w["heatpump"]
                     if available_is_residual_after_running and not phase_transition_active
                     else 0,
                     safe_int(start_leases["heatpump"].get("request_w"), 0),
@@ -20299,7 +20634,7 @@ def build_flexible_consumer_budget_contract(
             "wallbox": min(
                 requests_w["wallbox"],
                 max(
-                    accounting_commitments_w["wallbox"]
+                    allocation_commitments_w["wallbox"]
                     if available_is_residual_after_running and not phase_transition_active
                     else 0,
                     safe_int(start_leases["wallbox"].get("request_w"), 0),
@@ -20310,7 +20645,7 @@ def build_flexible_consumer_budget_contract(
             "heater": min(
                 requests_w["heater"],
                 max(
-                    accounting_commitments_w["heater"]
+                    allocation_commitments_w["heater"]
                     if available_is_residual_after_running and not phase_transition_active
                     else 0,
                     safe_int(start_leases["heater"].get("request_w"), 0),
@@ -20348,22 +20683,73 @@ def build_flexible_consumer_budget_contract(
             for consumer in sorted(consumer_command_quarantine)
         ]
     running_commitment_unfunded = []
+    running_commitment_shortfall_w = {
+        consumer: 0
+        for consumer in ("heatpump", "wallbox", "heater")
+    }
+    hard_running_commitment_unfunded = []
+    modulatable_running_commitment_unfunded = []
+    nonfresh_accounting_commitment_unfunded = []
     if contract.get("valid") is True:
         initial_allocations = contract.get("allocations") or {}
+        running_commitment_shortfall_w = {
+            consumer: max(
+                0,
+                accounting_commitments_w[consumer]
+                - safe_int(initial_allocations.get(consumer), 0)
+                - noncommand_accounting_reserve_w[consumer],
+            )
+            for consumer in ("heatpump", "wallbox", "heater")
+        }
         running_commitment_unfunded = [
             consumer
             for consumer in ("heatpump", "wallbox", "heater")
-            if accounting_commitments_w[consumer] > 0
-            and safe_int(initial_allocations.get(consumer), 0)
-            < accounting_commitments_w[consumer]
+            if running_commitment_shortfall_w[consumer] > 0
         ]
-    if running_commitment_unfunded:
+        hard_running_commitment_unfunded = [
+            consumer
+            for consumer in running_commitment_unfunded
+            if consumer in ("heatpump", "heater")
+            and fresh_running_commitments_w[consumer]
+            > safe_int(initial_allocations.get(consumer), 0)
+        ]
+        modulatable_running_commitment_unfunded = [
+            consumer
+            for consumer in running_commitment_unfunded
+            if consumer == "wallbox"
+        ]
+        nonfresh_accounting_commitment_unfunded = [
+            consumer
+            for consumer in running_commitment_unfunded
+            if consumer not in modulatable_running_commitment_unfunded
+            and consumer not in hard_running_commitment_unfunded
+        ]
+    if hard_running_commitment_unfunded:
         contract = allocate_current_contract(forced_fail_closed=True)
         contract["reason_code"] = "consumer_running_commitment_unfunded"
         contract["blockers"] = [
             "consumer_running_commitment_unfunded:" + consumer
-            for consumer in running_commitment_unfunded
+            for consumer in hard_running_commitment_unfunded
         ]
+    elif (
+        modulatable_running_commitment_unfunded
+        or nonfresh_accounting_commitment_unfunded
+    ):
+        # Die Wallbox ist der wattgenau modulierbare Restverbraucher. Ein
+        # kleinerer aktueller Rahmen ist daher ein gültiges Abregelziel und
+        # kein Grund, auch die bereits laufende Wärmepumpe aus dem Vertrag zu
+        # löschen. Der Wallbox Manager übersetzt den verbleibenden Wattrahmen
+        # mit seiner Mindeststrom-/Wh-/Phasenlogik in einen sicheren Ausgang.
+        shortfall_blockers = set(contract.get("blockers") or [])
+        if modulatable_running_commitment_unfunded:
+            shortfall_blockers.add(
+                "wallbox_running_commitment_residual_shortfall"
+            )
+        shortfall_blockers.update(
+            "consumer_nonfresh_accounting_shortfall:" + consumer
+            for consumer in nonfresh_accounting_commitment_unfunded
+        )
+        contract["blockers"] = sorted(shortfall_blockers)
     for _ in range(len(start_leases)):
         if contract.get("valid") is not True:
             break
@@ -20429,6 +20815,104 @@ def build_flexible_consumer_budget_contract(
         # nachrangiger Verbraucher den frei werdenden Rahmen nicht übernehmen.
         consumer = unfunded[0]
         lease = start_leases[consumer]
+        consumer_allocation_w = max(
+            0,
+            safe_int(allocations.get(consumer), 0),
+        )
+        if (
+            consumer == "heatpump"
+            and heatpump_prior_funded_start_transaction
+            and heatpump_start_transaction_required_w > 0
+            and heatpump_start_transaction_bind_w == 0
+            and total_w == 0
+        ):
+            # Ein einzelner 0-W-Rahmen widerruft kein bereits finanziertes
+            # und ausgespieltes Startsignal. Die Transaktion bleibt mit ihrem
+            # ursprünglichen absoluten Guard erhalten, autorisiert in diesem
+            # Zyklus aber exakt 0 W. Ein später wieder positiver Rahmen kann
+            # deshalb nur dieselbe Transaktion fortsetzen, nie eine neue
+            # Reserve prägen.
+            full_transaction_w = max(
+                safe_int(lease.get("request_w"), 0),
+                safe_int(lease.get("pending_request_w"), 0),
+                heatpump_start_transaction_required_w,
+            )
+            start_leases[consumer] = {
+                **lease,
+                "offered": False,
+                "request_w": 0,
+                "pending_request_w": full_transaction_w,
+                "reason": "heatpump_start_transaction_zero_budget_suspended",
+                "state": "start_transaction_zero_budget",
+                "transaction_in_flight": True,
+                "transaction_required_w": full_transaction_w,
+                "transaction_funded_w": 0,
+                "transaction_shortfall_w": full_transaction_w,
+                "central_allocation_bound": True,
+            }
+            request_caps_w[consumer] = 0
+            requests_w[consumer] = 0
+            contract = allocate_current_contract()
+            continue
+        if (
+            consumer == "heatpump"
+            and heatpump_prior_funded_start_transaction
+            and heatpump_start_transaction_bind_w > 0
+            and consumer_allocation_w == heatpump_start_transaction_bind_w
+            and consumer_allocation_w == requests_w["heatpump"]
+        ):
+            full_transaction_w = max(
+                safe_int(lease.get("request_w"), 0),
+                safe_int(lease.get("pending_request_w"), 0),
+                heatpump_start_transaction_required_w,
+            )
+            start_leases[consumer] = {
+                **lease,
+                "request_w": consumer_allocation_w,
+                "pending_request_w": full_transaction_w,
+                "reason": "heatpump_start_transaction_shortfall_bound",
+                "transaction_in_flight": True,
+                "transaction_required_w": full_transaction_w,
+                "transaction_funded_w": consumer_allocation_w,
+                "transaction_shortfall_w": max(
+                    0,
+                    full_transaction_w - consumer_allocation_w,
+                ),
+                "central_allocation_bound": True,
+            }
+            request_caps_w[consumer] = consumer_allocation_w
+            requests_w[consumer] = consumer_allocation_w
+            contract = allocate_current_contract()
+            continue
+        protected_accounting_w = max(
+            0,
+            safe_int(allocation_commitments_w.get(consumer), 0),
+        )
+        if protected_accounting_w > 0:
+            # Eine zusätzliche Startanforderung darf eine bereits gemessene,
+            # entprellte oder anderweitig safety-gebundene Istlast nicht mit
+            # auf 0 W freigeben. Nur der nicht finanzierbare Startanteil
+            # entfällt; das zentrale Accounting bleibt exakt erhalten.
+            start_leases[consumer] = {
+                **lease,
+                "offered": False,
+                "request_w": 0,
+                "pending_request_w": 0,
+                "reason": "start_lease_superseded_by_accounting_commitment",
+                "state": "accounting_commitment",
+                "signal_is_acceptance": False,
+                "acceptance_required": False,
+                "remaining_s": 0.0,
+                "timebase_status": "accounting_only",
+                "time_guard": {},
+            }
+            requests_w[consumer] = min(
+                protected_accounting_w,
+                max(0, safe_int(request_caps_w.get(consumer), 0)),
+            )
+            request_caps_w[consumer] = requests_w[consumer]
+            contract = allocate_current_contract()
+            continue
         start_leases[consumer] = {
             **lease,
             "offered": False,
@@ -20476,6 +20960,16 @@ def build_flexible_consumer_budget_contract(
             remaining_w,
             max(0, int(wallbox_cap_w) - wallbox_allocated_w),
         )
+        if (
+            wallbox_allocated_w <= 0
+            and wallbox_residual_backfill_w
+            < minimums_for_contract["wallbox"]
+        ):
+            # Ein Rest unterhalb des physischen Mindeststroms ist kein
+            # ausführbares Wallboxziel. Er bleibt im Vertrag frei; der lokale
+            # Mindeststrom-/Wh-Wächter entscheidet über eine bereits laufende
+            # Ladung, statt hier einen unzulässigen Sub-6-A-Ausgang zu prägen.
+            wallbox_residual_backfill_w = 0
         if wallbox_residual_backfill_w > 0:
             wallbox_allocated_w += wallbox_residual_backfill_w
             allocations["wallbox"] = wallbox_allocated_w
@@ -20493,6 +20987,75 @@ def build_flexible_consumer_budget_contract(
                 + contract["remaining_w"]
                 == safe_int(contract.get("total_budget_w"), 0)
             )
+
+    # Lease-Neuberechnung und Wallbox-Restfüllung können den zunächst
+    # dekorierten Vertrag ersetzen. Die Accounting-Shortfalls werden deshalb
+    # am finalen Vertrag erneut aus Allokation plus nicht kommandierbarer
+    # Reserve bestimmt. Sonst kann ein laufender Wallbox-Shortfall wie ein
+    # nacktes 0-W-Ziel aussehen und den lokalen Mindeststrom-/Wh-Hold umgehen.
+    if contract.get("valid") is True:
+        final_allocations = contract.get("allocations") or {}
+        running_commitment_shortfall_w = {
+            consumer: max(
+                0,
+                accounting_commitments_w[consumer]
+                - safe_int(final_allocations.get(consumer), 0)
+                - noncommand_accounting_reserve_w[consumer],
+            )
+            for consumer in ("heatpump", "wallbox", "heater")
+        }
+        running_commitment_unfunded = [
+            consumer
+            for consumer in ("heatpump", "wallbox", "heater")
+            if running_commitment_shortfall_w[consumer] > 0
+        ]
+        hard_running_commitment_unfunded = [
+            consumer
+            for consumer in running_commitment_unfunded
+            if consumer in ("heatpump", "heater")
+            and fresh_running_commitments_w[consumer]
+            > safe_int(final_allocations.get(consumer), 0)
+        ]
+        modulatable_running_commitment_unfunded = [
+            consumer
+            for consumer in running_commitment_unfunded
+            if consumer == "wallbox"
+        ]
+        nonfresh_accounting_commitment_unfunded = [
+            consumer
+            for consumer in running_commitment_unfunded
+            if consumer not in modulatable_running_commitment_unfunded
+            and consumer not in hard_running_commitment_unfunded
+        ]
+        final_blockers = {
+            str(blocker)
+            for blocker in (contract.get("blockers") or [])
+            if str(blocker)
+            != "wallbox_running_commitment_residual_shortfall"
+            and not str(blocker).startswith(
+                "consumer_nonfresh_accounting_shortfall:"
+            )
+            and not str(blocker).startswith(
+                "consumer_running_commitment_unfunded:"
+            )
+        }
+        if hard_running_commitment_unfunded:
+            contract = allocate_current_contract(forced_fail_closed=True)
+            contract["reason_code"] = "consumer_running_commitment_unfunded"
+            final_blockers.update(
+                "consumer_running_commitment_unfunded:" + consumer
+                for consumer in hard_running_commitment_unfunded
+            )
+        else:
+            if modulatable_running_commitment_unfunded:
+                final_blockers.add(
+                    "wallbox_running_commitment_residual_shortfall"
+                )
+            final_blockers.update(
+                "consumer_nonfresh_accounting_shortfall:" + consumer
+                for consumer in nonfresh_accounting_commitment_unfunded
+            )
+        contract["blockers"] = sorted(final_blockers)
     contract["consumer_priority_key"] = configured_key
     contract["consumer_priority_changed_at_s"] = float(changed_at_s)
     contract["consumer_priority_runon_guard_active"] = bool(
@@ -20518,11 +21081,91 @@ def build_flexible_consumer_budget_contract(
     contract["signed_residual_w"] = int(signed_residual_w)
     contract["running_commitments_w"] = dict(running_commitments_w)
     contract["accounting_commitments_w"] = dict(accounting_commitments_w)
+    contract["allocation_commitments_w"] = dict(
+        allocation_commitments_w
+    )
+    contract["fresh_running_commitments_w"] = dict(
+        fresh_running_commitments_w
+    )
+    contract["recovery_accounting_w"] = dict(recovery_accounting_w)
+    contract["recovery_accounting_reserve_requested_w"] = int(
+        recovery_accounting_reserve_requested_w
+    )
+    contract["recovery_accounting_reserve_w"] = dict(
+        recovery_accounting_reserve_w
+    )
+    contract["recovery_accounting_reserve_total_w"] = int(
+        recovery_accounting_reserve_total_w
+    )
+    contract["recovery_accounting_reserve_shortfall_w"] = dict(
+        recovery_accounting_reserve_shortfall_w
+    )
+    contract["transaction_accounting_w"] = dict(
+        transaction_accounting_w
+    )
+    contract["transaction_accounting_reserve_requested_w"] = int(
+        transaction_accounting_reserve_requested_w
+    )
+    contract["transaction_accounting_reserve_w"] = dict(
+        transaction_accounting_reserve_w
+    )
+    contract["transaction_accounting_reserve_total_w"] = int(
+        transaction_accounting_reserve_total_w
+    )
+    contract["transaction_accounting_reserve_shortfall_w"] = dict(
+        transaction_accounting_reserve_shortfall_w
+    )
+    contract["noncommand_accounting_w"] = dict(
+        noncommand_accounting_w
+    )
+    contract["noncommand_accounting_reserve_requested_w"] = int(
+        noncommand_accounting_reserve_requested_w
+    )
+    contract["noncommand_accounting_reserve_w"] = dict(
+        noncommand_accounting_reserve_w
+    )
+    contract["noncommand_accounting_reserve_total_w"] = int(
+        noncommand_accounting_reserve_total_w
+    )
+    contract["noncommand_accounting_reserve_shortfall_w"] = dict(
+        noncommand_accounting_reserve_shortfall_w
+    )
     contract["heatpump_post_timeout_accounting_w"] = int(
         heatpump_post_timeout_accounting_w
     )
+    contract["heatpump_pump_prerun_accounting_w"] = int(
+        heatpump_pump_prerun_accounting_w
+    )
     contract["running_commitment_unfunded"] = list(
         running_commitment_unfunded
+    )
+    contract["running_commitment_shortfall_w"] = dict(
+        running_commitment_shortfall_w
+    )
+    contract["hard_running_commitment_unfunded"] = list(
+        hard_running_commitment_unfunded
+    )
+    contract["modulatable_running_commitment_unfunded"] = list(
+        modulatable_running_commitment_unfunded
+    )
+    contract["nonfresh_accounting_commitment_unfunded"] = list(
+        nonfresh_accounting_commitment_unfunded
+    )
+    contract["fixed_running_priority_front"] = list(
+        fixed_running_priority_front
+    )
+    contract["fixed_running_accounting_floor_w"] = int(
+        fixed_running_accounting_floor_w
+    )
+    contract["fixed_running_outside_budget_w"] = int(
+        fixed_running_outside_budget_w
+    )
+    contract["gross_total_budget_w"] = int(gross_total_budget_w)
+    contract["gross_invariant_conserved"] = bool(
+        safe_int(contract.get("allocation_sum_w"), 0)
+        + safe_int(contract.get("remaining_w"), 0)
+        + noncommand_accounting_reserve_total_w
+        == gross_total_budget_w
     )
     contract["wallbox_running_hold_support_w"] = int(
         wallbox_running_hold_support_w
@@ -20566,14 +21209,72 @@ def build_flexible_consumer_budget_contract(
         0,
         safe_int(start_leases["heatpump"].get("request_w"), 0),
     )
+    current_heatpump_transaction_required_w = max(
+        heatpump_start_lease_w,
+        max(0, safe_int(heatpump_start_request_w, 0)),
+        safe_int(
+            start_leases["heatpump"].get("transaction_required_w"),
+            0,
+        ),
+    )
     heatpump_first_permission_grant = bool(
         start_leases["heatpump"].get("offered") is True
-        and heatpump_start_lease_w > 0
-        and command_allocations["heatpump"] >= heatpump_start_lease_w
+        and current_heatpump_transaction_required_w > 0
+        and command_allocations["heatpump"]
+        >= current_heatpump_transaction_required_w
     )
-    heatpump_permission_continuation = bool(
-        previous_contract.get("heatpump_boost_permission_active") is True
-        or heatpump_signal_active_confirmed
+    heatpump_transaction_bookkeeping_active = bool(
+        start_leases["heatpump"].get("transaction_in_flight") is True
+        and current_heatpump_transaction_required_w > 0
+    )
+    heatpump_zero_budget_transaction_suspended = bool(
+        start_leases["heatpump"].get("transaction_in_flight") is True
+        and start_leases["heatpump"].get("state")
+        == "start_transaction_zero_budget"
+        and safe_int(
+            start_leases["heatpump"].get("transaction_required_w"),
+            0,
+        )
+        > 0
+        and command_allocations["heatpump"] == 0
+        and total_w == 0
+    )
+    heatpump_start_transaction_in_flight = bool(
+        heatpump_first_permission_grant
+        or heatpump_transaction_bookkeeping_active
+        or heatpump_zero_budget_transaction_suspended
+    )
+    contract["heatpump_start_transaction_in_flight"] = bool(
+        heatpump_start_transaction_in_flight
+    )
+    contract["heatpump_start_transaction_funded_w"] = int(
+        command_allocations["heatpump"]
+        if heatpump_start_transaction_in_flight
+        else 0
+    )
+    contract["heatpump_start_transaction_required_w"] = int(
+        current_heatpump_transaction_required_w
+        if heatpump_start_transaction_in_flight
+        else 0
+    )
+    contract["heatpump_start_transaction_shortfall_w"] = int(
+        max(
+            0,
+            current_heatpump_transaction_required_w
+            - command_allocations["heatpump"],
+        )
+        if heatpump_start_transaction_in_flight
+        else 0
+    )
+    contract["heatpump_start_transaction_state"] = (
+        "in_flight_zero_budget"
+        if heatpump_zero_budget_transaction_suspended
+        else "in_flight_shortfall"
+        if heatpump_start_transaction_in_flight
+        and contract["heatpump_start_transaction_shortfall_w"] > 0
+        else "in_flight_funded"
+        if heatpump_start_transaction_in_flight
+        else "inactive"
     )
     heatpump_boost_permission_active = bool(
         contract.get("valid") is True
@@ -20581,13 +21282,7 @@ def build_flexible_consumer_budget_contract(
         and heatpump_evidence_fresh
         and heatpump_demand_ready
         and heatpump_boost_demand
-        and (
-            heatpump_first_permission_grant
-            or (
-                heatpump_permission_continuation
-                and not heatpump_withdrawal_confirmed
-            )
-        )
+        and heatpump_first_permission_grant
     )
     contract["heatpump_boost_permission_active"] = (
         heatpump_boost_permission_active
@@ -20595,9 +21290,6 @@ def build_flexible_consumer_budget_contract(
     contract["heatpump_boost_permission_reason"] = (
         "fresh_funded_start"
         if heatpump_first_permission_grant
-        and heatpump_boost_permission_active
-        else "fresh_demand_permission_continues"
-        if heatpump_permission_continuation
         and heatpump_boost_permission_active
         else "no_boost_demand"
         if not heatpump_boost_demand
@@ -20753,6 +21445,22 @@ def build_flexible_consumer_budget_contract(
     )
     contract["wallbox_full_frame_request_active"] = bool(
         wallbox_full_frame_request_active
+    )
+    # Der frühe Wert beschreibt nur die Kandidatenpriorität vor Recovery-
+    # Reserve und finaler Lease-Finanzierung. Aktiv ist sie am Ausgang nur,
+    # wenn mindestens das physische Wallbox-Minimum im kommandierbaren
+    # Endrahmen verbleibt. Eine reine Recovery-Reserve bleibt dadurch
+    # Accounting und erzeugt keine scheinbare Wallbox-Priorität.
+    wallbox_idle_heatpump_start_priority_effective = bool(
+        wallbox_idle_heatpump_start_priority_active
+        and command_allocations["wallbox"]
+        >= CONSUMER_MIN_W["wallbox"]
+    )
+    contract["wallbox_idle_heatpump_start_priority_active"] = bool(
+        wallbox_idle_heatpump_start_priority_effective
+    )
+    contract["heatpump_start_protection_reasons"] = list(
+        heatpump_start_protection_reasons
     )
     contract["wallbox_exclusive_start_support_w"] = int(
         wallbox_exclusive_start_support_w

@@ -7173,6 +7173,13 @@ function e3dcRenderInstallerUpdateStatus(updateStatus, startedAt) {
         alertClass = "alert-secondary";
         badgeClass = "bg-secondary";
         if (details) details.open = true;
+    } else if (status.executionEndedUnexpectedly) {
+        titleText = "Update-Ausführung unerwartet beendet";
+        detailText = "Anlagen- und Updatezustand müssen anhand von Protokoll, Backup oder Rollback und Abschlussprüfung geklärt werden.";
+        stepText = "Prüfen";
+        alertClass = "alert-danger";
+        badgeClass = "bg-danger";
+        if (details) details.open = true;
     } else if (status.errorFound || status.exitFailed || status.completionFailed) {
         titleText = "Update benötigt Aufmerksamkeit";
         detailText = "Die technischen Details nennen Ursache, Systemzustand und Lösung.";
@@ -7196,20 +7203,43 @@ function e3dcClassifyInstallerUpdatePoll(data) {
     const payload = (data && typeof data === "object") ? data : {};
     const logText = (typeof payload.log === "string") ? payload.log : "";
     const running = payload.running === true;
+    const rawStatus = (typeof payload.raw === "string")
+        ? payload.raw
+        : ((typeof payload.raw_status === "string") ? payload.raw_status : "");
+    const normalizedRawStatus = rawStatus.trim().toLowerCase();
+    const phase = (typeof payload.phase === "string") ? payload.phase.toLowerCase() : "unknown";
+    const runtimeStatus = (typeof payload.status === "string") ? payload.status.toLowerCase() : "unknown";
+    const reason = (typeof payload.reason === "string") ? payload.reason : "";
+    const legacyExecutionLogEvidence = /(?:\[INFO\]\s+Update-Dispatcher-Vertrag:|E3DC-Control Update-Bootstrap|(?:^|\r?\n)\[[1-4]\/4\]\s)/i.test(logText);
+    const executionPhaseObserved = phase === "executing" ||
+                                   runtimeStatus === "executing" ||
+                                   normalizedRawStatus === "executing" ||
+                                   legacyExecutionLogEvidence;
     const releaseCompletionFound = /(?:^|\r?\n)\[OK\]\s+Update abgeschlossen\.\s*(?:\r?\n)+Version:\s*v?\d+\.\d+\.\d+[A-Za-z0-9._-]*/i.test(logText);
     const successMarkerFound = releaseCompletionFound ||
                                logText.includes("Update erfolgreich abgeschlossen") ||
                                logText.includes("Update abgeschlossen") ||
                                /\[OK\]\s+self-update auf [0-9a-f]{40} abgeschlossen\./i.test(logText) ||
                                logText.includes("Du bist auf dem neuesten Stand");
-    const exitCode = Number.isInteger(payload.exit_code) ? payload.exit_code : null;
+    const observedExitCode = Number.isInteger(payload.exit_code) ? payload.exit_code : null;
+    const exitCode = running ? null : observedExitCode;
     const exitKnown = exitCode !== null;
     const exitOk = exitKnown && exitCode === 0;
     const exitFailed = exitKnown && exitCode !== 0;
     const completionSucceeded = payload.completion === "success";
-    const completionFailed = payload.completion === "failed";
-    const abortedFound = logText.includes("Vorgang abgebrochen");
-    const errorFound = /(traceback|exception|critical|fatal|permission denied|REPAIR_REQUIRED|\[!\]\s+(?:self-update|web-update) fehlgeschlagen|self-update fehlgeschlagen:|web-update kann nicht starten|konnte update-prozess nicht starten)/i.test(logText);
+    const completionFailed = !running && payload.completion === "failed";
+    const startFailed = !running &&
+                        !executionPhaseObserved &&
+                        (phase === "start_failed" || runtimeStatus === "start_failed" || normalizedRawStatus.startsWith("start_failed:"));
+    const startConfirmationPending = !running &&
+                                     !exitKnown &&
+                                     !startFailed &&
+                                     !executionPhaseObserved &&
+                                     (phase === "launching" || runtimeStatus === "launching" || normalizedRawStatus === "launching" ||
+                                      phase === "running" || runtimeStatus === "running" || normalizedRawStatus === "running");
+    const launchPending = startConfirmationPending;
+    const abortedFound = !running && logText.includes("Vorgang abgebrochen");
+    const errorFound = !running && (startFailed || /(traceback|exception|critical|fatal|permission denied|REPAIR_REQUIRED|\[!\]\s+(?:self-update|web-update) fehlgeschlagen|self-update fehlgeschlagen:|web-update kann nicht starten|konnte update-prozess nicht starten)/i.test(logText));
     const successFound = !running &&
                          !exitFailed &&
                          !completionFailed &&
@@ -7217,26 +7247,137 @@ function e3dcClassifyInstallerUpdatePoll(data) {
                          (exitOk ||
                           (!running && completionSucceeded) ||
                           (!running && !exitKnown && successMarkerFound));
+    const executionConfirmationLost = !running &&
+                                      executionPhaseObserved &&
+                                      !exitKnown &&
+                                      !completionSucceeded &&
+                                      !completionFailed &&
+                                      !abortedFound &&
+                                      !errorFound &&
+                                      !successMarkerFound;
 
     return {
         logText,
         running,
+        rawStatus,
+        phase,
+        runtimeStatus,
+        reason,
+        legacyExecutionLogEvidence,
         exitCode,
         exitKnown,
         exitFailed,
         completionFailed,
+        startFailed,
+        startConfirmationPending,
+        launchPending,
+        executionPhaseObserved,
+        executionConfirmationLost,
+        executionEndedUnexpectedly: false,
         abortedFound,
         errorFound,
         successFound,
     };
 }
 
+function e3dcInstallerUpdateStartFailureMessage(updateStatus) {
+    const status = (updateStatus && typeof updateStatus === "object") ? updateStatus : {};
+    const reason = (typeof status.reason === "string") ? status.reason : "";
+    const reasonText = {
+        systemd_run_failed: "Der Systemdienst konnte den Updatejob nicht anlegen.",
+        worker_exit_before_ack: "Die Startbestätigung des Update-Workers ging verloren; es läuft kein bestätigter Updateprozess.",
+        worker_exec_failed: "Der Systemdienst konnte den Update-Worker nicht erfolgreich ausführen.",
+        worker_start_timeout: "Der Update-Worker hat seinen Start nicht innerhalb der Schutzzeit bestätigt.",
+        worker_pid_invalid: "Der Update-Worker hat keine gültige Prozesskennung bestätigt.",
+        worker_ack_write_failed: "Die bestätigte Prozesskennung konnte nicht sicher rückbestätigt werden.",
+        launcher_ack_timeout: "Der Update-Worker erhielt keine sichere Startfreigabe vom Dispatcher.",
+        worker_exit_before_execution: "Der Update-Worker endete, bevor er den Beginn der Update-Ausführung bestätigt hat.",
+        worker_execution_timeout: "Der Update-Worker hat den Beginn der Update-Ausführung nicht innerhalb der Schutzzeit bestätigt.",
+        worker_start_failed: "Der Update-Worker hat einen Startfehler gemeldet.",
+    }[reason] || "Der Update-Worker hat seinen Start nicht bestätigt.";
+    return "Systemjob nicht gestartet, Anlage unverändert. " + reasonText
+        + " Lade die Seite neu und starte das Update einmal erneut. "
+        + "Wenn der Start wieder scheitert, öffne die Installationszentrale, führe „Rechte prüfen“ aus "
+        + "und nutze den dort angezeigten Reparaturweg.";
+}
+
+function e3dcInstallerUpdateExecutionEndedMessage() {
+    return "Update-Ausführung unerwartet beendet. "
+        + "Prüfe den erreichten Anlagen- und Updatezustand anhand des Update-Protokolls, "
+        + "des Backups beziehungsweise Rollbacks und der Abschlussprüfung. "
+        + "Starte das Update nicht blind erneut.";
+}
+
+function e3dcAdvanceInstallerUpdateExecutionGrace(updateStatus, previousPolls, maxGracePolls) {
+    const status = (updateStatus && typeof updateStatus === "object") ? updateStatus : {};
+    const currentPolls = Number.isInteger(previousPolls) && previousPolls > 0 ? previousPolls : 0;
+    const graceLimit = Number.isInteger(maxGracePolls) && maxGracePolls > 0 ? maxGracePolls : 6;
+    if (!status.executionConfirmationLost) {
+        return {status, polls: 0, waiting: false};
+    }
+    const polls = currentPolls + 1;
+    if (polls <= graceLimit) {
+        return {status, polls, waiting: true};
+    }
+    return {
+        status: {
+            ...status,
+            completionFailed: true,
+            startFailed: false,
+            startConfirmationPending: false,
+            launchPending: false,
+            executionConfirmationLost: false,
+            executionEndedUnexpectedly: true,
+            errorFound: true,
+            successFound: false,
+        },
+        polls,
+        waiting: false,
+    };
+}
+
+function e3dcAdvanceInstallerUpdateLaunchGrace(updateStatus, previousPolls, maxGracePolls) {
+    const status = (updateStatus && typeof updateStatus === "object") ? updateStatus : {};
+    const currentPolls = Number.isInteger(previousPolls) && previousPolls > 0 ? previousPolls : 0;
+    const graceLimit = Number.isInteger(maxGracePolls) && maxGracePolls > 0 ? maxGracePolls : 15;
+    if (!status.startConfirmationPending && !status.launchPending) {
+        return {status, polls: 0, waiting: false};
+    }
+    const polls = currentPolls + 1;
+    if (polls <= graceLimit) {
+        return {status, polls, waiting: true};
+    }
+    const runningConfirmationLost = status.phase === "running" ||
+                                    status.runtimeStatus === "running" ||
+                                    status.rawStatus === "running";
+    return {
+        status: {
+            ...status,
+            phase: "start_failed",
+            runtimeStatus: "start_failed",
+            reason: status.reason || (runningConfirmationLost ? "worker_exit_before_ack" : "worker_start_timeout"),
+            completionFailed: true,
+            startFailed: true,
+            startConfirmationPending: false,
+            launchPending: false,
+            errorFound: true,
+            successFound: false,
+        },
+        polls,
+        waiting: false,
+    };
+}
+
 function pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText, updateStartedAt = Date.now()) {
     let tick = 0;
     let stoppedPolls = 0;
+    let launchingPolls = 0;
+    let executingStoppedPolls = 0;
     let transientPollErrors = 0;
     let lastUpdateStatus = {logText: "", running: true};
     const maxStoppedGracePolls = 6;
+    const maxLaunchingGracePolls = 15;
+    const maxExecutingStoppedGracePolls = 6;
     const maxTransientPollErrors = 120;
     const maxPollTicks = 60 * 60;
     const interval = setInterval(() => {
@@ -7258,7 +7399,50 @@ function pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText, u
             })
             .then(data => {
                 transientPollErrors = 0;
-                const updateStatus = e3dcClassifyInstallerUpdatePoll(data);
+                let updateStatus = e3dcClassifyInstallerUpdatePoll(data);
+                const launchGrace = e3dcAdvanceInstallerUpdateLaunchGrace(
+                    updateStatus,
+                    launchingPolls,
+                    maxLaunchingGracePolls
+                );
+                updateStatus = launchGrace.status;
+                launchingPolls = launchGrace.polls;
+                if (launchGrace.waiting) {
+                    lastUpdateStatus = updateStatus;
+                    e3dcRenderInstallerUpdateStatus(updateStatus, updateStartedAt);
+                    if (log && updateStatus.logText) {
+                        log.innerText = updateStatus.logText;
+                        if (launchingPolls === 1) {
+                            log.innerText += "\n\n[INFO] Systemjob wird gestartet; warte auf die Prozessbestätigung...";
+                        }
+                        log.scrollTop = log.scrollHeight;
+                    }
+                    stoppedPolls = 0;
+                    executingStoppedPolls = 0;
+                    return;
+                }
+                const executionGrace = e3dcAdvanceInstallerUpdateExecutionGrace(
+                    updateStatus,
+                    executingStoppedPolls,
+                    maxExecutingStoppedGracePolls
+                );
+                updateStatus = executionGrace.status;
+                executingStoppedPolls = executionGrace.polls;
+                if (executionGrace.waiting) {
+                    lastUpdateStatus = updateStatus;
+                    e3dcRenderInstallerUpdateStatus(updateStatus, updateStartedAt);
+                    if (log) {
+                        if (updateStatus.logText) {
+                            log.innerText = updateStatus.logText;
+                        }
+                        if (executingStoppedPolls === 1) {
+                            log.innerText += "\n\n[INFO] Update-Ausführung nicht mehr als laufender Prozess bestätigt; warte kurz auf Abschlussstatus und letzte Logzeilen...";
+                        }
+                        log.scrollTop = log.scrollHeight;
+                    }
+                    stoppedPolls = 0;
+                    return;
+                }
                 const {
                     logText,
                     running,
@@ -7266,6 +7450,8 @@ function pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText, u
                     exitKnown,
                     exitFailed,
                     completionFailed,
+                    startFailed,
+                    executionEndedUnexpectedly,
                     abortedFound,
                     errorFound,
                     successFound,
@@ -7301,7 +7487,17 @@ function pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText, u
                         }
                     }
                     if (log && !ok) {
-                        if (abortedFound) {
+                        if (executionEndedUnexpectedly) {
+                            const executionEndedMessage = e3dcInstallerUpdateExecutionEndedMessage();
+                            if (!log.innerText.includes(executionEndedMessage)) {
+                                log.innerText += "\n\n[FEHLER] " + executionEndedMessage;
+                            }
+                        } else if (startFailed) {
+                            const startFailureMessage = e3dcInstallerUpdateStartFailureMessage(updateStatus);
+                            if (!log.innerText.includes(startFailureMessage)) {
+                                log.innerText += "\n\n[FEHLER] " + startFailureMessage;
+                            }
+                        } else if (abortedFound) {
                             log.innerText += "\n\n[INFO] System Update wurde abgebrochen.";
                         } else if (tick >= maxPollTicks) {
                             log.innerText += "\n\n[HINWEIS] Die Weboberfläche beendet das Polling nach 60 Minuten. "

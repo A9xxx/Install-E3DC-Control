@@ -2,8 +2,13 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.4g`. Die Tags `latest`, `v5.4.4g` und
-`5.4.4g` bezeichnen denselben Stable-Stand.
+Der aktuelle Stable-Stand ist `v5.4.4h`. Die Tags `latest`, `v5.4.4h` und
+`5.4.4h` bezeichnen denselben Stable-Stand.
+
+5.4.4h korrigiert Startnachweis und Rückmeldung des Bare-Metal-Systemjobs.
+Das Image enthält die dazugehörige kompatible Statusanzeige; Container führen
+weiterhin keine Host-Updates oder Docker-Daemon-Aktionen aus. Die Regelungslogik
+entspricht 5.4.4g.
 
 5.4.4g enthält den verbesserten Update- und Backupweg, die korrigierten
 openWB-Pro-Abläufe, die quellengebundene Fahrzeug-SoC-Wahrheit sowie die
@@ -347,7 +352,7 @@ unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.4g` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.4h` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -374,7 +379,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.4g` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.4h` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash

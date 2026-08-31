@@ -5969,12 +5969,88 @@ function e3dcSelfUpdateLogHasTerminalFailure($log) {
     ) === 1;
 }
 
-function e3dcClassifySelfUpdateCompletion($running, $exitCode, $log) {
+function e3dcParseSelfUpdateRuntimeStatus($rawStatus) {
+    $raw = trim((string)$rawStatus);
+    $result = [
+        'raw' => $raw,
+        'phase' => 'unknown',
+        'status' => 'unknown',
+        'reason' => null,
+        'exit_code' => null,
+    ];
+    if ($raw === '') {
+        return $result;
+    }
+
+    if (preg_match('/^-?\d+$/', $raw)) {
+        $exitCode = (int)$raw;
+        $result['phase'] = 'finished';
+        $result['status'] = ($exitCode === 0) ? 'success' : 'failed';
+        $result['exit_code'] = $exitCode;
+        return $result;
+    }
+
+    if (preg_match('/^start_failed:(-?\d+):([A-Za-z0-9_.-]{1,80})$/', $raw, $matches)) {
+        $result['phase'] = 'start_failed';
+        $result['status'] = 'start_failed';
+        $result['reason'] = $matches[2];
+        $result['exit_code'] = (int)$matches[1];
+        return $result;
+    }
+
+    $structured = json_decode($raw, true);
+    if (is_array($structured)) {
+        foreach (['phase', 'status'] as $field) {
+            $value = strtolower(trim((string)($structured[$field] ?? '')));
+            if ($value !== '' && preg_match('/^[a-z0-9_.-]{1,80}$/', $value)) {
+                $result[$field] = $value;
+            }
+        }
+        $reason = trim((string)($structured['reason'] ?? ''));
+        if ($reason !== '') {
+            $result['reason'] = substr($reason, 0, 512);
+        }
+        $structuredExitCode = $structured['exit_code'] ?? null;
+        if (is_int($structuredExitCode)
+            || (is_string($structuredExitCode) && preg_match('/^-?\d+$/', $structuredExitCode))) {
+            $result['exit_code'] = (int)$structuredExitCode;
+        }
+        if (is_int($result['exit_code'])) {
+            $result['phase'] = 'finished';
+            $result['status'] = ($result['exit_code'] === 0) ? 'success' : 'failed';
+        } elseif ($result['phase'] === 'executing' || $result['status'] === 'executing') {
+            $result['phase'] = 'executing';
+            $result['status'] = 'executing';
+        } elseif ($result['phase'] === 'start_failed' || $result['status'] === 'start_failed') {
+            $result['phase'] = 'start_failed';
+            $result['status'] = 'start_failed';
+        }
+        return $result;
+    }
+
+    if ($raw === 'launching' || $raw === 'running' || $raw === 'executing') {
+        $result['phase'] = $raw;
+        $result['status'] = $raw;
+    } elseif ($raw === 'start_failed') {
+        $result['phase'] = 'start_failed';
+        $result['status'] = 'start_failed';
+        $result['reason'] = 'unknown';
+    }
+    return $result;
+}
+
+function e3dcClassifySelfUpdateCompletion($running, $exitCode, $log, $phase = 'unknown', $status = 'unknown') {
     if ($running === true) {
         return 'running';
     }
     if (is_int($exitCode)) {
         return ($exitCode === 0) ? 'success' : 'failed';
+    }
+    if ($phase === 'executing' || $status === 'executing') {
+        return 'executing';
+    }
+    if ($phase === 'start_failed' || $status === 'start_failed') {
+        return 'failed';
     }
     if (e3dcSelfUpdateLogHasTerminalFailure($log)) {
         return 'failed';
@@ -5982,12 +6058,15 @@ function e3dcClassifySelfUpdateCompletion($running, $exitCode, $log) {
     if (e3dcSelfUpdateLogHasCanonicalSuccess($log)) {
         return 'success';
     }
+    if ($phase === 'launching' || $status === 'launching') {
+        return 'launching';
+    }
     return 'unknown';
 }
 
 function e3dcCommunityBootstrapReleaseTag() {
     // RELEASE_MARKER: Beim Versionssprung gemeinsam mit VERSION/Release Notes aktualisieren.
-    return 'v5.4.4g';
+    return 'v5.4.4h';
 }
 
 function e3dcCommunityBootstrapCommand() {
@@ -6067,15 +6146,38 @@ function handleRunSelfUpdate() {
             }
         }
 
-        $exitCode = null;
+        $rawStatus = '';
+        $statusAgeSeconds = null;
         if (file_exists($statusFile)) {
-            $rawExitCode = trim((string)file_get_contents($statusFile));
-            if (preg_match('/^-?\d+$/', $rawExitCode)) {
-                $exitCode = (int)$rawExitCode;
+            $statusContent = file_get_contents($statusFile);
+            if ($statusContent !== false) {
+                $rawStatus = trim((string)$statusContent);
+            }
+            $statusMtime = @filemtime($statusFile);
+            if (is_int($statusMtime) && $statusMtime > 0) {
+                $statusAgeSeconds = max(0, time() - $statusMtime);
+            }
+        }
+        $runtimeStatus = e3dcParseSelfUpdateRuntimeStatus($rawStatus);
+        $exitCode = $runtimeStatus['exit_code'];
+
+        $systemdState = null;
+        if (!$running
+            && (in_array($runtimeStatus['phase'], ['launching', 'running', 'executing'], true)
+                || in_array($runtimeStatus['status'], ['launching', 'running', 'executing'], true))) {
+            $systemdState = e3dcSystemdServiceStatus('e3dc-web-update.service');
+            if (in_array($systemdState, ['active', 'activating', 'reloading'], true)) {
+                $running = true;
             }
         }
 
-        $completion = e3dcClassifySelfUpdateCompletion($running, $exitCode, $log);
+        $completion = e3dcClassifySelfUpdateCompletion(
+            $running,
+            $exitCode,
+            $log,
+            $runtimeStatus['phase'],
+            $runtimeStatus['status']
+        );
 
         $flags = 0;
         if (defined('JSON_INVALID_UTF8_SUBSTITUTE')) $flags |= JSON_INVALID_UTF8_SUBSTITUTE;
@@ -6086,6 +6188,13 @@ function handleRunSelfUpdate() {
             'log' => $log,
             'exit_code' => $exitCode,
             'completion' => $completion,
+            'raw' => $runtimeStatus['raw'],
+            'raw_status' => $runtimeStatus['raw'],
+            'phase' => $runtimeStatus['phase'],
+            'status' => $runtimeStatus['status'],
+            'reason' => $runtimeStatus['reason'],
+            'status_age_seconds' => $statusAgeSeconds,
+            'systemd_state' => $systemdState,
         ], $flags);
         exit;
     }

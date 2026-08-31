@@ -1,6 +1,6 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.4g
+Dokumentation Stand: 5.4.4h
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
@@ -14,7 +14,16 @@ Dashboard, Konsole und Installer-Menü denselben Dispatcher. Die automatische
 Updateprüfung verwendet dieselbe Stable-Quelle, informiert aber nur über einen
 neuen Stand.
 
-Der Installer-Anteil von 5.4.4g lässt den heruntergeladenen Ziel-Updater
+5.4.4h bestätigt den Hintergrundauftrag über dieselbe aktive systemd-Unit,
+MainPID, Prozess und root-kontrollierten Status auf beiden Seiten. Vor dieser
+Bestätigung werden weder Ziel-Updater noch Produktpfad freigegeben. Der
+eigenständige Community-Bootstrap darf das private Zielrelease vorher sicher
+binden, führt es aber noch nicht aus. Frühfehler
+bleiben im Dateiprotokoll erhalten. Geht der Prozess erst nach bestätigtem
+Ausführungsbeginn verloren, fordert die Oberfläche die Zustands- und
+Rückfallprüfung und behauptet keinen unveränderten Anlagenzustand.
+
+Der enthaltene Installer-Anteil von 5.4.4g lässt den heruntergeladenen Ziel-Updater
 Vollbackup, kurze ruhende Daten-Nachsicherung, Releaseprojektion, Reparatur
 bekannter Rechte und Dienstneustart durchführen. Das Nutzer-`.git`, lokale
 Produktänderungen, fehlende Produktdateien und historische Rechte sind keine

@@ -5,13 +5,23 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.4.4g`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.4.4h`. Das Dashboard startet ausschließlich
 den argumentlosen, root-eigenen Systemjob. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
 
-5.4.4g reduziert redundante I/O im weiterhin vollständig verifizierten
+5.4.4h bestätigt Dispatcher und Worker gegenseitig über aktive systemd-Unit,
+MainPID, Prozess und root-kontrollierten Laufzeitstatus. Erst danach beginnen
+Ziel-Updater und Produktpfad. Der installierte Dispatcher löst auch Release
+und Download erst danach auf; der eigenständige Community-Bootstrap darf das
+private Zielrelease vorab binden, führt es aber noch nicht aus. Bleibt die
+Startbestätigung aus, nennt die Oberfläche den konkreten Grund und den
+Reparaturweg. Nach bestätigtem Ausführungsbeginn wird ein harter Prozessverlust
+nicht als unveränderte Anlage gemeldet; Protokoll, Backup, Rücklauf und
+Abschlussstatus müssen dann vor einem erneuten Start geprüft werden.
+
+Der enthaltene Stand aus 5.4.4g reduziert redundante I/O im weiterhin vollständig verifizierten
 Backup- und Umschaltpfad. Die Oberfläche weist Sicherung, kurze kontrollierte
 Unterbrechung, Dateiaustausch/Rechte und Wiederanlauf getrennt aus, toleriert
 die erwartbare Apache-Unterbrechung beim Update und zeigt genau einen

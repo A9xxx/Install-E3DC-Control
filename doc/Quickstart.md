@@ -2,9 +2,16 @@
 
 Diese Anleitung fasst die schnellsten Schritte zusammen, um E3DC-Control auf einem frischen Raspberry Pi OS (oder ähnlichem Debian-System) zu installieren.
 
-Aktueller Stable-Stand: `v5.4.4g`.
+Aktueller Stable-Stand: `v5.4.4h`.
 
-5.4.4g verbessert den verifizierten Update- und Backupweg, begrenzt
+5.4.4h bestätigt den Update-Systemjob über aktive systemd-Unit, MainPID,
+Prozess und root-kontrollierten Status, bevor Ziel-Updater oder Produktpfad
+beginnen. Der eigenständige Community-Bootstrap darf das private Zielrelease
+vorher sicher binden, führt es aber noch nicht aus. Ein früher Startfehler nennt eine konkrete Ursache und den sicheren
+Reparaturweg. Nach bestätigtem Ausführungsbeginn fordert ein unerwarteter
+Prozessverlust die Prüfung von Protokoll, Backup, Rücklauf und Abschlussstatus.
+
+Der enthaltene Stand aus 5.4.4g verbessert den verifizierten Update- und Backupweg, begrenzt
 automatische Config-Snapshots auf 20 und detaillierte Tageshistorien nach
 bestätigter Langzeitübernahme auf 30 Tage. Vorhandene Tagesarchive werden
 nicht ersetzt oder gekürzt. Außerdem enthält der Stand die korrigierten
@@ -412,7 +419,7 @@ Ohne das Label bleibt auch ein versehentlich gestarteter Watchtower für den
 Hauptcontainer wirkungslos. Der oben gezeigte manuelle Host-Helfer bleibt der
 empfohlene Updateweg.
 
-**Docker-Rückfall von v5.4.4g auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.4.4h auf den veröffentlichten Docker-Rollback-Root:**
 ```bash
 (
   set -euo pipefail

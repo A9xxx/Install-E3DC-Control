@@ -1,12 +1,12 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.4g</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.4h</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.4.4g**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.4.4h**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
 
 ### Web-Update startet nicht? Einmaliger Rettungsweg
 
@@ -40,7 +40,9 @@ sondern eine eindeutige Auswahl verlangt.
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
 
-> **Neu in 5.4.4g Stable:** Der Updateweg vermeidet redundante Vollprüfungen, zeigt Sicherung, kurze Unterbrechung, Dateiaustausch und Wiederanlauf als verständliche Betriebsphasen und toleriert die erwartbare Webunterbrechung bis 120 Sekunden. Zielbestand sind drei verifizierte Systemfamilien und drei Web-Sicherungen; aktive Schutz- oder Recovery-Bindungen dürfen diese Grenze vorübergehend ohne Updateabbruch überschreiten. Daneben gelten getrennt 20 eindeutig automatische Config-Snapshots und 30 Tage Detailhistorie; über „Dauerhaft lokal sichern“ markierte, Migrations- und unbekannte Bestände bleiben erhalten. Tagesarchive werden no-clobber veröffentlicht und niemals durch einen kürzeren, abweichenden oder konkurrierend geänderten Bestand ersetzt. Offene beziehungsweise nicht verifizierbare Altbestände werden eindeutig benannt.
+> **Neu in 5.4.4h Stable:** Dispatcher und Update-Worker bestätigen gegenseitig den tatsächlich laufenden systemd-Systemjob, bevor Ziel-Updater oder Produktänderung beginnen. Der installierte Dispatcher löst auch Release und Download erst danach auf; der eigenständige Community-Bootstrap darf das private Zielrelease vorab sicher binden, führt es aber noch nicht aus. Ein nicht gestarteter Worker endet mit konkretem Grund und verständlichem Reparaturhinweis. Nach bestätigtem Ausführungsbeginn wird ein harter Prozessverlust nicht als „Anlage unverändert“ ausgegeben, sondern verlangt die Prüfung von Protokoll, Backup, Rücklauf und Abschlussstatus. Die Regelungslogik bleibt unverändert.
+
+> **Enthalten aus 5.4.4g:** Der Updateweg vermeidet redundante Vollprüfungen, zeigt Sicherung, kurze Unterbrechung, Dateiaustausch und Wiederanlauf als verständliche Betriebsphasen und toleriert die erwartbare Webunterbrechung bis 120 Sekunden. Zielbestand sind drei verifizierte Systemfamilien und drei Web-Sicherungen; aktive Schutz- oder Recovery-Bindungen dürfen diese Grenze vorübergehend ohne Updateabbruch überschreiten. Daneben gelten getrennt 20 eindeutig automatische Config-Snapshots und 30 Tage Detailhistorie; über „Dauerhaft lokal sichern“ markierte, Migrations- und unbekannte Bestände bleiben erhalten. Tagesarchive werden no-clobber veröffentlicht und niemals durch einen kürzeren, abweichenden oder konkurrierend geänderten Bestand ersetzt. Offene beziehungsweise nicht verifizierbare Altbestände werden eindeutig benannt.
 
 > **Wallbox, SoC und Prognose in 5.4.4g:** openWB Pro kann nach bestätigtem Phasenziel und kurzer Geräteunterbrechung wieder Strom anbieten; die 480-Sekunden-Frist sperrt nur einen weiteren Phasenwechsel. Temporäre Nullanker, veraltete Stromshadows und ein Prozessneustart dürfen einen sicheren Mindeststrom-Wiederanlauf nicht mehr zirkulär blockieren. Ein vollständig finanziertes dreiphasiges PV-Minimum erzeugt kein falsches 1p-Zwischenziel; ein belegter batterieneutraler PV-Sink bleibt ohne Netz- oder Akkuentladefreigabe verfügbar. Der 1p-/3p-Start-Hold erzeugt kein Zusatzbudget, und ein einzelner Grid-/PM-Glitch darf einen bestätigten Ausgang nur kurz ohne neuen Hardwarebefehl halten. Ein begrenztes CP-Wake-up bleibt an Stecksession, Budget und Schutzgrenzen gebunden. Bluelink, MQTT und openWB verwenden den echten SoC-Quellzeitpunkt; Retain, Statusheartbeat und Dateiänderung verjüngen keinen Wert. Planner, Wallbox, Wärme und Frontend folgen demselben Veto-, Alters- und Identitätsvertrag. Unvollständige DV-Daten blenden Standard-PV, Standard-SoC und PV-kWh nicht mehr aus; Headroom-Fenster verwenden eine kanonische Policy-ID und die DV-SoC-Linie bleibt rein lesend.
 
@@ -546,7 +548,7 @@ sudo docker compose logs --tail=80 e3dc-control
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin wird
-> `E3DC_IMAGE_TAG=v5.4.4g` in `.env` gesetzt. `config --images` zeigt vor dem
+> `E3DC_IMAGE_TAG=v5.4.4h` in `.env` gesetzt. `config --images` zeigt vor dem
 > Pull das tatsächlich gewählte Image.
 >
 > Vor dem `pull` prüft der Helfer mindestens 2 GiB freien Platz im

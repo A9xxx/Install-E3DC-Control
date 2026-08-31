@@ -1,12 +1,36 @@
-# E3DC-Control v5.4.4g
+# E3DC-Control v5.4.4h
 
 Release-Stand: 2026-08-31.
 
-E3DC-Control 5.4.4g ist ein Wartungsrelease für den Update- und Backupweg, den
-openWB-Pro-Start samt Phasenwechsel, eine quellengebundene Fahrzeug-SoC-Wahrheit
-und die gemeinsame Darstellung von Standard- und Direktvermarktungsprognose.
-Die bestehenden Nutzer-, Speicher-, Hausanschluss-, Fahrzeug-, Geheimnis- und
-Hardwaregrenzen bleiben wirksam.
+E3DC-Control 5.4.4h ist ein enges Wartungsrelease für Startnachweis und
+Rückmeldung des System-Updates. EMS-, Speicher-, Wallbox-, Wärme- und
+Direktvermarktungsregelung bleiben gegenüber 5.4.4g unverändert. Die
+bestehenden Nutzer-, Hausanschluss-, Fahrzeug-, Geheimnis- und
+Hardwareschutzgrenzen bleiben vollständig wirksam.
+
+## Systemjob wird vor dem Produktpfad beidseitig bestätigt
+
+- Dispatcher und Worker prüfen dieselbe aktive systemd-Unit, dieselbe
+  MainPID, den root-kontrollierten Laufzeitstatus und den lebenden Prozess.
+  Erst nach der gegenseitigen Bestätigung beginnt der Worker mit Ziel-Updater
+  und Produktpfad. Der installierte Dispatcher löst auch Release und Download
+  erst danach auf. Der eigenständige Community-Bootstrap darf das private
+  Zielrelease vorab binden, führt es vor der Bestätigung aber nicht aus.
+- `systemd-run` bestätigt jetzt die tatsächliche Ausführung des Workers und
+  nicht nur das Einreihen eines Auftrags. Ein nie angelaufener Job kann daher
+  nicht mehr als erfolgreich gestartet erscheinen.
+- Die frühe Standardausgabe und Fehlerausgabe werden ab Prozessstart in das
+  dauerhafte Updateprotokoll geschrieben. Startfehler liefern einen
+  strukturierten Grund und einen verständlichen Reparaturhinweis; bisherige
+  numerische Abschlusswerte bleiben lesbar.
+- Der Status unterscheidet Vorstart und laufende Ausführung. Vor der
+  beidseitigen Bestätigung ist ein Abbruch nachweislich ohne Produkt- oder
+  Dienständerung. Geht ein Worker nach Ausführungsbeginn durch Signal,
+  Prozessabbruch oder Stromverlust verloren, behauptet die Oberfläche keinen
+  unveränderten Zustand. Sie fordert stattdessen die Prüfung von Protokoll,
+  Backup, Rücklauf und Abschlussstatus, bevor erneut aktualisiert wird.
+
+## Enthaltener Stand aus 5.4.4g
 
 ## Update verständlicher und mit weniger redundanter I/O
 

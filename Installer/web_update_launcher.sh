@@ -25,6 +25,7 @@ readonly PID_FILE="${RUNTIME_DIR}/pid"
 readonly STATUS_FILE="${RUNTIME_DIR}/status"
 readonly LOCK_FILE="${RUNTIME_DIR}/lock"
 readonly START_LOCK_FILE="${RUNTIME_DIR}/start.lock"
+readonly START_ACK_FILE="${RUNTIME_DIR}/start.ack"
 readonly REPOSITORY_URL="https://github.com/A9xxx/Install-E3DC-Control"
 readonly GIT_URL="${REPOSITORY_URL}.git"
 readonly LATEST_URL="${REPOSITORY_URL}/releases/latest"
@@ -35,7 +36,21 @@ readonly CURL="/usr/bin/curl"
 readonly GIT="/usr/bin/git"
 readonly PYTHON="/usr/bin/python3"
 readonly ENV="/usr/bin/env"
+readonly SLEEP="/usr/bin/sleep"
+readonly WORKER_UNIT_IDENTITY_ATTEMPTS=50
+readonly START_ACK_ATTEMPTS=150
+readonly EXECUTION_ACK_ATTEMPTS=50
+readonly WORKER_ACK_ATTEMPTS=200
+readonly ACK_INTERVAL_SECONDS="0.1"
 DOWNLOAD_DIR=""
+UNIT_ACTIVE_STATE=""
+UNIT_SUB_STATE=""
+UNIT_RESULT=""
+UNIT_EXEC_MAIN_STATUS=""
+UNIT_MAIN_PID=""
+UNIT_LOAD_STATE=""
+CONFIRMED_WORKER_PID=""
+EXECUTION_PATH_MAY_HAVE_STARTED=0
 
 fail() {
     local message="$1"
@@ -65,7 +80,13 @@ fail() {
     fi
     printf '\n[ABBRUCH] E3DC-UPD-WEB-%s\n' "$exit_code" >&2
     printf 'Was ist passiert: %s\n' "$message" >&2
-    printf 'Systemzustand: E3DC-Produktdateien und laufende E3DC-Dienste wurden nicht verändert.\n' >&2
+    if (( EXECUTION_PATH_MAY_HAVE_STARTED == 1 )); then
+        printf '%s\n' \
+            'Systemzustand: Der Worker wurde zur Ausführung freigegeben. Der erreichte Anlagen- und Produktzustand muss anhand Updateprotokoll, Backup/Rollback und Abschlussprüfung bestimmt werden; ein erfolgreicher Abschluss wurde nicht bestätigt.' \
+            >&2
+    else
+        printf 'Systemzustand: E3DC-Produktdateien und laufende E3DC-Dienste wurden nicht verändert.\n' >&2
+    fi
     printf 'Lösung: %s\n' "$solution" >&2
     exit "$exit_code"
 }
@@ -165,6 +186,93 @@ write_runtime_value() {
         || return 1
 }
 
+read_runtime_value() {
+    local source="$1"
+    local value=""
+    [[ -f "$source" && ! -L "$source" ]] || return 1
+    IFS= read -r value < "$source" || [[ -n "$value" ]] || return 1
+    printf '%s\n' "$value"
+}
+
+load_update_unit_state() {
+    local snapshot key value
+    UNIT_ACTIVE_STATE=""
+    UNIT_SUB_STATE=""
+    UNIT_RESULT=""
+    UNIT_EXEC_MAIN_STATUS=""
+    UNIT_MAIN_PID=""
+    UNIT_LOAD_STATE=""
+    snapshot="$($SYSTEMCTL show "$UNIT" \
+        --property=LoadState \
+        --property=ActiveState \
+        --property=SubState \
+        --property=Result \
+        --property=ExecMainStatus \
+        --property=MainPID 2>/dev/null || true)"
+    while IFS='=' read -r key value; do
+        case "$key" in
+            LoadState) UNIT_LOAD_STATE="$value" ;;
+            ActiveState) UNIT_ACTIVE_STATE="$value" ;;
+            SubState) UNIT_SUB_STATE="$value" ;;
+            Result) UNIT_RESULT="$value" ;;
+            ExecMainStatus) UNIT_EXEC_MAIN_STATUS="$value" ;;
+            MainPID) UNIT_MAIN_PID="$value" ;;
+        esac
+    done <<< "$snapshot"
+}
+
+normalize_start_failure_exit() {
+    local value="$1"
+    if [[ "$value" =~ ^[1-9][0-9]*$ ]] \
+        && (( 10#$value >= 1 && 10#$value <= 255 )); then
+        printf '%d\n' "$((10#$value))"
+    else
+        printf '%d\n' 1
+    fi
+}
+
+record_start_failure() {
+    local exit_code reason detail
+    exit_code="$(normalize_start_failure_exit "$1")"
+    reason="$2"
+    detail="$3"
+    [[ "$reason" =~ ^[a-z0-9_]+$ ]] || reason="unknown_start_failure"
+    printf '[FEHLER] Update-Worker nicht gestartet: %s (Exit %d, Grund %s).\n' \
+        "$detail" "$exit_code" "$reason" >> "$LOG_FILE"
+    printf '%s\n' \
+        '[FEHLER] Anlage/Produktdateien unverändert: Der Worker erhielt vor Releaseauflösung, Download und Bootstrap keine gültige Startfreigabe.' \
+        >> "$LOG_FILE"
+    write_runtime_value "$STATUS_FILE" "start_failed:${exit_code}:${reason}" \
+        || true
+}
+
+worker_phase_identity_confirmed() {
+    local expected_status="$1"
+    local raw_status worker_pid
+    CONFIRMED_WORKER_PID=""
+    raw_status="$(read_runtime_value "$STATUS_FILE" 2>/dev/null || true)"
+    worker_pid="$(read_runtime_value "$PID_FILE" 2>/dev/null || true)"
+    load_update_unit_state
+    [[ "$raw_status" == "$expected_status" ]] || return 1
+    [[ "$worker_pid" =~ ^[1-9][0-9]*$ && -d "/proc/${worker_pid}" ]] \
+        || return 1
+    [[ "$UNIT_MAIN_PID" == "$worker_pid" ]] || return 1
+    case "$UNIT_ACTIVE_STATE" in
+        active|activating|reloading) ;;
+        *) return 1 ;;
+    esac
+    CONFIRMED_WORKER_PID="$worker_pid"
+    return 0
+}
+
+worker_start_identity_confirmed() {
+    worker_phase_identity_confirmed "running"
+}
+
+worker_execution_identity_confirmed() {
+    worker_phase_identity_confirmed "executing"
+}
+
 prepare_log() {
     local metadata
     if [[ -e "$LOG_FILE" || -L "$LOG_FILE" ]]; then
@@ -191,7 +299,10 @@ prepare_log() {
 
 validate_launcher_contract() {
     local metadata parent_mode launcher_owner launcher_mode launcher_kind launcher_links
-    for binary in "$SYSTEMCTL" "$SYSTEMD_RUN" "$FLOCK" "$CURL" "$GIT" "$PYTHON" "$ENV"; do
+    for binary in \
+        "$SYSTEMCTL" "$SYSTEMD_RUN" "$FLOCK" "$CURL" "$GIT" \
+        "$PYTHON" "$ENV" "$SLEEP"
+    do
         [[ -x "$binary" ]] || fail "Fest gebundenes Systemprogramm fehlt: ${binary}" 126
     done
     for parent in /usr/local /usr/local/sbin; do
@@ -340,33 +451,114 @@ download_release_checkout() {
 
 run_worker() {
     local result=1 release_binding tab tag tag_object target_sha release_dir
-    [[ "${E3DC_WEB_UPDATE_WORKER:-}" == "1" && -n "${INVOCATION_ID:-}" ]] \
-        || fail "Worker besitzt keinen systemd-Ausführungsvertrag" 126
-    [[ -z "${SUDO_USER:-}" ]] || fail "Worker übernimmt keinen sudo-Aufrufer" 126
-
-    prepare_runtime_paths
-    prepare_lock_file "$LOCK_FILE"
-    exec 9>"$LOCK_FILE"
-    $FLOCK -n 9 || fail "Ein Update läuft bereits" 75
+    local attempt ack_value current_status unit_identity_confirmed=0 worker_acknowledged=0
+    local worker_cleanup_started=0
+    worker_signal_exit() {
+        local signal_name="$1"
+        local signal_exit="$2"
+        trap '' HUP INT TERM
+        if (( worker_acknowledged == 1 )); then
+            printf '[FEHLER] Update-Worker erhielt Signal %s nach bestätigtem Start (Exit %d). Der erreichte Updatezustand muss anhand Dateilog, Backup-/Rollback- und Abschlussprüfung bestimmt werden.\n' \
+                "$signal_name" "$signal_exit" >&2
+        else
+            printf '[FEHLER] Update-Worker erhielt Signal %s vor der Startfreigabe (Exit %d). Anlage/Produktdateien unverändert; Releaseauflösung, Download und Bootstrap wurden nicht freigegeben.\n' \
+                "$signal_name" "$signal_exit" >&2
+        fi
+        exit "$signal_exit"
+    }
     cleanup() {
-        local exit_code=$?
+        local exit_code=$? status_before=""
+        trap - EXIT
+        trap '' HUP INT TERM
+        if (( worker_cleanup_started == 1 )); then
+            exit "$exit_code"
+        fi
+        worker_cleanup_started=1
         set +e
+        status_before="$(read_runtime_value "$STATUS_FILE" 2>/dev/null || true)"
+        /usr/bin/unlink "$START_ACK_FILE" 2>/dev/null || true
+        /usr/bin/unlink "$PID_FILE" 2>/dev/null || true
         if [[ -n "${DOWNLOAD_DIR:-}" && -d "$DOWNLOAD_DIR" \
             && "$DOWNLOAD_DIR" == /run/e3dc-update-download.* ]]; then
             /usr/bin/find "$DOWNLOAD_DIR" -depth -delete
         fi
-        write_runtime_value "$STATUS_FILE" "$exit_code" || true
-        /usr/bin/unlink "$PID_FILE" 2>/dev/null || true
-        return "$exit_code"
+        if (( worker_acknowledged == 1 )) \
+            || [[ "$status_before" != start_failed:* ]]; then
+            write_runtime_value "$STATUS_FILE" "$exit_code" || true
+        fi
+        exit "$exit_code"
     }
     trap cleanup EXIT
+    trap 'worker_signal_exit HUP 129' HUP
+    trap 'worker_signal_exit INT 130' INT
+    trap 'worker_signal_exit TERM 143' TERM
+
+    prepare_runtime_paths
+    [[ -f "$LOG_FILE" && ! -L "$LOG_FILE" ]] \
+        || fail "Sicheres Updateprotokoll fehlt vor dem Worker-Start" 126
     exec >> "$LOG_FILE" 2>&1
+    prepare_lock_file "$LOCK_FILE"
+    exec 9>"$LOCK_FILE"
+    $FLOCK -n 9 || fail "Ein Update läuft bereits" 75
+    [[ "${E3DC_WEB_UPDATE_WORKER:-}" == "1" ]] \
+        || fail "Worker besitzt keinen expliziten Dispatcher-Auftrag" 126
+    [[ -z "${SUDO_USER:-}" ]] || fail "Worker übernimmt keinen sudo-Aufrufer" 126
+
+    # INVOCATION_ID bleibt nur ein optionaler systemd-Hinweis. Die tatsächliche
+    # Bindung ist stärker: Diese Shell muss der MainPID genau dieser aktiven
+    # transienten Unit entsprechen. Noch vor PID-/Running-Marker und
+    # Produktzugriff wird das begrenzt geprüft.
+    for ((attempt = 0; attempt < WORKER_UNIT_IDENTITY_ATTEMPTS; attempt++)); do
+        load_update_unit_state
+        if [[ "$UNIT_MAIN_PID" == "$$" ]]; then
+            case "$UNIT_ACTIVE_STATE" in
+                active|activating|reloading)
+                    unit_identity_confirmed=1
+                    break
+                    ;;
+            esac
+        fi
+        if [[ -n "$UNIT_RESULT" && "$UNIT_RESULT" != "success" ]]; then
+            break
+        fi
+        $SLEEP "$ACK_INTERVAL_SECONDS"
+    done
+    (( unit_identity_confirmed == 1 )) \
+        || fail "Worker konnte nicht eindeutig an ${UNIT} gebunden werden" 126
+
     write_runtime_value "$PID_FILE" "$$" \
         || fail "PID-Datei des Updatejobs konnte nicht geschrieben werden" 1 \
             "Prüfe den freien Speicher mit: df -h /run ; starte danach erneut: sudo ${LAUNCHER}"
     write_runtime_value "$STATUS_FILE" "running" \
         || fail "Statusdatei des Updatejobs konnte nicht geschrieben werden" 1 \
             "Prüfe den freien Speicher mit: df -h /run ; starte danach erneut: sudo ${LAUNCHER}"
+
+    # Der Worker darf Releaseauflösung, Download und Bootstrap erst nach dem
+    # Rück-Ack des Elternprozesses beginnen. So bleibt ein nicht bestätigter
+    # Start nachweislich ohne Produkt- oder Dienstmutation.
+    for ((attempt = 0; attempt < WORKER_ACK_ATTEMPTS; attempt++)); do
+        ack_value="$(read_runtime_value "$START_ACK_FILE" 2>/dev/null || true)"
+        if [[ "$ack_value" == "$$" ]]; then
+            worker_acknowledged=1
+            EXECUTION_PATH_MAY_HAVE_STARTED=1
+            write_runtime_value "$STATUS_FILE" "executing" \
+                || fail "Ausführungsphase des Updatejobs konnte nicht veröffentlicht werden" 1 \
+                    "Prüfe den freien Speicher mit: df -h /run ; prüfe danach Protokoll und Updatezustand vor einem erneuten Start."
+            /usr/bin/unlink "$START_ACK_FILE" 2>/dev/null || true
+            break
+        fi
+        current_status="$(read_runtime_value "$STATUS_FILE" 2>/dev/null || true)"
+        if [[ "$current_status" == start_failed:* ]]; then
+            fail "Dispatcher hat die Worker-Startphase abgebrochen (${current_status})" 70
+        fi
+        $SLEEP "$ACK_INTERVAL_SECONDS"
+    done
+    if (( worker_acknowledged != 1 )); then
+        record_start_failure 70 "launcher_ack_timeout" \
+            "Rückbestätigung des gebundenen Workers blieb 20 Sekunden aus"
+        fail "Rückbestätigung des gebundenen Workers blieb aus" 70
+    fi
+
     printf '%s\n' "[INFO] Update-Dispatcher-Vertrag: ${DISPATCHER_CONTRACT}"
     validate_launcher_contract
 
@@ -417,16 +609,22 @@ run_worker() {
 }
 
 update_job_running() {
-    local active_state
-    active_state="$($SYSTEMCTL show "$UNIT" --property=ActiveState --value 2>/dev/null || true)"
-    case "$active_state" in
-        active|activating|reloading) return 0 ;;
+    load_update_unit_state
+    # Eine geladene Transient-Unit gehört noch dem vorherigen Auftrag, auch
+    # wenn sie bereits inactive/failed ist und --collect sie gerade entfernt.
+    # Log und Runtime-Evidenz dürfen in diesem kurzen Fenster nicht
+    # überschrieben werden.
+    [[ "$UNIT_LOAD_STATE" == "loaded" ]] && return 0
+    case "$UNIT_ACTIVE_STATE" in
+        active|activating|reloading|deactivating) return 0 ;;
     esac
     $SYSTEMCTL --quiet is-active "$UNIT"
 }
 
 start_worker() {
-    local launch_output launch_status
+    local launch_output launch_status launch_failure_exit=1
+    local launch_failure_reason="" launch_failure_detail=""
+    local raw_status worker_pid attempt start_acknowledged=0 execution_acknowledged=0
     (( $# == 0 )) || fail "Der Update-Dispatcher akzeptiert keine Argumente" 64
     validate_launcher_contract
     prepare_runtime_paths
@@ -434,28 +632,61 @@ start_worker() {
     exec 8>"$START_LOCK_FILE"
     $FLOCK 8
     if update_job_running; then
-        printf 'Update läuft bereits: %s\n' "$UNIT"
-        printf 'Status: systemctl status --no-pager %s\n' "$UNIT"
-        printf 'Protokoll: journalctl -fu %s\n' "$UNIT"
-        return 0
+        # Ein bereits aktiver Job kann aus einem älteren Launcher stammen oder
+        # sich zwischen Statusphasen befinden. Ab hier ist der Gesamtzustand
+        # deshalb konservativ nicht mehr als unverändert beweisbar.
+        EXECUTION_PATH_MAY_HAVE_STARTED=1
+        if worker_execution_identity_confirmed; then
+            printf 'Update läuft bereits in bestätigter Ausführungsphase: %s\n' "$UNIT"
+            printf 'Status: systemctl status --no-pager %s\n' "$UNIT"
+            printf 'Protokoll: journalctl -fu %s\n' "$UNIT"
+            return 0
+        fi
+        worker_start_identity_confirmed \
+            || fail "Aktive Update-Unit ist weder als Start- noch als Ausführungsphase eindeutig durch Status, PID und systemd-MainPID bestätigt" 75 \
+                "Prüfe zuerst: systemctl status --no-pager ${UNIT} ; starte erst nach geklärtem Zustand erneut."
+        write_runtime_value "$START_ACK_FILE" "$CONFIRMED_WORKER_PID" \
+            || fail "Startbestätigung des bereits laufenden Updatejobs konnte nicht geschrieben werden" 1
+        EXECUTION_PATH_MAY_HAVE_STARTED=1
+        for ((attempt = 0; attempt < EXECUTION_ACK_ATTEMPTS; attempt++)); do
+            if worker_execution_identity_confirmed; then
+                printf 'Update läuft bereits und hat die Ausführungsphase bestätigt: %s\n' "$UNIT"
+                printf 'Status: systemctl status --no-pager %s\n' "$UNIT"
+                printf 'Protokoll: journalctl -fu %s\n' "$UNIT"
+                return 0
+            fi
+            raw_status="$(read_runtime_value "$STATUS_FILE" 2>/dev/null || true)"
+            if [[ "$raw_status" =~ ^-?[0-9]+$ ]]; then
+                if [[ "$raw_status" == "0" ]]; then
+                    printf 'Update wurde nach bestätigter Startfreigabe bereits abgeschlossen: %s\n' "$UNIT"
+                    return 0
+                fi
+                fail "Bereits laufender Update-Worker endete nach Startfreigabe mit Exit ${raw_status}; erreichten Zustand prüfen und nicht blind erneut starten" \
+                    "$(normalize_start_failure_exit "$raw_status")"
+            fi
+            $SLEEP "$ACK_INTERVAL_SECONDS"
+        done
+        fail "Bereits laufender Worker bestätigte die Ausführungsphase nach Startfreigabe nicht; Zustand prüfen und nicht blind erneut starten" 75
     fi
     prepare_log
     write_runtime_value "$STATUS_FILE" "launching" \
         || fail "Startstatus des Updatejobs konnte nicht geschrieben werden" 1 \
             "Prüfe den freien Speicher mit: df -h /run ; starte danach erneut: sudo ${LAUNCHER}"
     /usr/bin/unlink "$PID_FILE" 2>/dev/null || true
+    /usr/bin/unlink "$START_ACK_FILE" 2>/dev/null || true
     $SYSTEMCTL reset-failed "$UNIT" 2>/dev/null || true
     set +e
     launch_output="$($SYSTEMD_RUN \
         --unit="${UNIT%.service}" \
         --collect \
-        --no-block \
         --property=Type=exec \
         --property=User=root \
         --property=Group=root \
         --property=WorkingDirectory=/ \
         --property=UMask=0027 \
-        --property=TimeoutStartSec=infinity \
+        --property=TimeoutStartSec=20s \
+        --property="StandardOutput=append:${LOG_FILE}" \
+        --property="StandardError=append:${LOG_FILE}" \
         --setenv=E3DC_WEB_UPDATE_WORKER=1 \
         --setenv=SUDO_USER= \
         "$LAUNCHER" --worker 2>&1)"
@@ -464,11 +695,107 @@ start_worker() {
     if (( launch_status != 0 )); then
         printf '[!] Update-Systemjob konnte nicht gestartet werden (Exit %d).\n%s\n' \
             "$launch_status" "$launch_output" >> "$LOG_FILE"
-        write_runtime_value "$STATUS_FILE" "$launch_status" || true
-        fail "Update-Systemjob konnte nicht gestartet werden" "$launch_status"
+        launch_failure_exit="$(normalize_start_failure_exit "$launch_status")"
+        record_start_failure "$launch_failure_exit" "systemd_run_failed" \
+            "systemd-run bestätigte den Type=exec-Start nicht"
+        $SYSTEMCTL stop "$UNIT" >> "$LOG_FILE" 2>&1 || true
+        write_runtime_value "$STATUS_FILE" \
+            "start_failed:${launch_failure_exit}:systemd_run_failed" || true
+        fail "Update-Systemjob konnte nicht gestartet werden (systemd_run_failed); Anlage/Produktdateien unverändert" \
+            "$launch_failure_exit"
+    fi
+
+    for ((attempt = 0; attempt < START_ACK_ATTEMPTS; attempt++)); do
+        if worker_start_identity_confirmed; then
+            if write_runtime_value "$START_ACK_FILE" "$CONFIRMED_WORKER_PID"; then
+                start_acknowledged=1
+                EXECUTION_PATH_MAY_HAVE_STARTED=1
+                break
+            fi
+            launch_failure_reason="worker_ack_write_failed"
+            launch_failure_detail="Bestätigte Worker-PID konnte nicht atomar rückbestätigt werden"
+            break
+        fi
+
+        raw_status="$(read_runtime_value "$STATUS_FILE" 2>/dev/null || true)"
+        worker_pid="$(read_runtime_value "$PID_FILE" 2>/dev/null || true)"
+        if [[ "$raw_status" == start_failed:* ]]; then
+            IFS=':' read -r _ launch_failure_exit launch_failure_reason <<< "$raw_status"
+            launch_failure_exit="$(normalize_start_failure_exit "$launch_failure_exit")"
+            [[ "$launch_failure_reason" =~ ^[a-z0-9_]+$ ]] \
+                || launch_failure_reason="worker_start_failed"
+            launch_failure_detail="Worker meldete bereits ${raw_status}"
+            break
+        fi
+        if [[ "$raw_status" =~ ^-?[0-9]+$ ]]; then
+            launch_failure_exit="$(normalize_start_failure_exit "$raw_status")"
+            launch_failure_reason="worker_exit_before_ack"
+            launch_failure_detail="Worker endete vor der gebundenen Startbestätigung mit Exit ${raw_status}"
+            break
+        fi
+        if [[ "$UNIT_ACTIVE_STATE" == "failed" \
+            || ( -n "$UNIT_RESULT" && "$UNIT_RESULT" != "success" ) ]]; then
+            launch_failure_exit="$(normalize_start_failure_exit "$UNIT_EXEC_MAIN_STATUS")"
+            launch_failure_reason="worker_exec_failed"
+            launch_failure_detail="systemd meldete ActiveState=${UNIT_ACTIVE_STATE:-unbekannt}, Result=${UNIT_RESULT:-unbekannt}, ExecMainStatus=${UNIT_EXEC_MAIN_STATUS:-unbekannt}"
+            break
+        fi
+        $SLEEP "$ACK_INTERVAL_SECONDS"
+    done
+
+    if (( start_acknowledged != 1 )); then
+        raw_status="$(read_runtime_value "$STATUS_FILE" 2>/dev/null || true)"
+        worker_pid="$(read_runtime_value "$PID_FILE" 2>/dev/null || true)"
+        if [[ -z "$launch_failure_reason" ]]; then
+            launch_failure_exit=1
+            if [[ "$raw_status" == "running" ]]; then
+                launch_failure_reason="worker_pid_invalid"
+                launch_failure_detail="Status war running, aber PID ${worker_pid:-fehlt} passte nicht zur aktiven systemd-MainPID ${UNIT_MAIN_PID:-fehlt}"
+            else
+                launch_failure_reason="worker_start_timeout"
+                launch_failure_detail="Nach 15 Sekunden fehlten frische PID, running-Status und passende systemd-MainPID"
+            fi
+        fi
+        record_start_failure "$launch_failure_exit" "$launch_failure_reason" \
+            "$launch_failure_detail"
+        $SYSTEMCTL stop "$UNIT" >> "$LOG_FILE" 2>&1 || true
+        write_runtime_value "$STATUS_FILE" \
+            "start_failed:$(normalize_start_failure_exit "$launch_failure_exit"):${launch_failure_reason}" \
+            || true
+        fail "Update-Worker wurde nicht bestätigt (${launch_failure_reason}); Anlage/Produktdateien unverändert" \
+            "$(normalize_start_failure_exit "$launch_failure_exit")"
+    fi
+
+    # Der Rück-ACK allein öffnet den Produktpfad noch nicht. Erst der vom
+    # gebundenen Worker atomar veröffentlichte executing-Status beweist, dass
+    # er die Freigabe übernommen hat. Ab hier darf kein Fehler mehr pauschal
+    # behaupten, Anlage oder Produktdateien seien unverändert.
+    for ((attempt = 0; attempt < EXECUTION_ACK_ATTEMPTS; attempt++)); do
+        if worker_execution_identity_confirmed; then
+            execution_acknowledged=1
+            break
+        fi
+        raw_status="$(read_runtime_value "$STATUS_FILE" 2>/dev/null || true)"
+        if [[ "$raw_status" =~ ^-?[0-9]+$ ]]; then
+            if [[ "$raw_status" == "0" ]]; then
+                printf '%s\n' "$launch_output"
+                printf 'Update wurde nach bestätigter Startfreigabe bereits abgeschlossen: %s\n' "$UNIT"
+                return 0
+            fi
+            fail "Update-Worker endete nach bestätigter Startfreigabe mit Exit ${raw_status}; erreichten Anlagen-/Produktzustand anhand Protokoll, Backup/Rollback und Abschlussprüfung bestimmen und nicht blind erneut starten" \
+                "$(normalize_start_failure_exit "$raw_status")"
+        fi
+        if [[ "$raw_status" == start_failed:* ]]; then
+            fail "Update-Worker meldete nach bestätigter Startfreigabe ${raw_status}; erreichten Anlagen-/Produktzustand prüfen und nicht blind erneut starten" 75
+        fi
+        $SLEEP "$ACK_INTERVAL_SECONDS"
+    done
+    if (( execution_acknowledged != 1 )); then
+        raw_status="$(read_runtime_value "$STATUS_FILE" 2>/dev/null || true)"
+        fail "Ausführungsphase wurde nach bestätigter Startfreigabe nicht eindeutig gebunden (Status ${raw_status:-fehlt}); Zustand anhand Protokoll und systemd prüfen und nicht blind erneut starten" 75
     fi
     [[ -z "$launch_output" ]] || printf '%s\n' "$launch_output"
-    printf 'Update gestartet: %s\n' "$UNIT"
+    printf 'Update gestartet und durch PID/status/systemd sowie Ausführungsphase bestätigt: %s\n' "$UNIT"
     printf 'Status: systemctl status --no-pager %s\n' "$UNIT"
     printf 'Protokoll: journalctl -fu %s\n' "$UNIT"
     printf 'Dateilog: tail -f %s\n' "$LOG_FILE"

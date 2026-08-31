@@ -1,12 +1,21 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.4.4g
+Dokumentation Stand: 5.4.4h
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
 Installationspfad und Python-Umgebung aus dem geprüften Installationskontext.
 
-Der Installer-Anteil von 5.4.4g führt Backup, kurze Umschaltphase,
+5.4.4h bindet den gestarteten Hintergrundauftrag beidseitig an aktive
+systemd-Unit, MainPID, Prozess und root-kontrollierten Status. Ziel-Updater und
+Produktpfad beginnen erst nach dieser Bestätigung. Der eigenständige
+Community-Bootstrap darf das private Zielrelease vorher sicher binden, führt es
+aber noch nicht aus. Ein früher Startfehler wird
+mit konkretem Grund protokolliert; nach bestätigtem Ausführungsbeginn verlangt
+ein unerwarteter Prozessverlust eine Zustands- und Rückfallprüfung statt einer
+pauschalen Unverändert-Aussage.
+
+Der enthaltene Installer-Anteil von 5.4.4g führt Backup, kurze Umschaltphase,
 Releaseprojektion, Reparatur bekannter Rechte und Dienstneustart vollständig im
 heruntergeladenen Ziel-Updater aus. Das Nutzer-`.git`, lokale
 Produktänderungen, fehlende Produktdateien und historische Rechte sind keine

@@ -1,9 +1,9 @@
 {
-  "version": "5.4.4g",
+  "version": "5.4.4h",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.4g",
+  "stable_release": "v5.4.4h",
   "release_date": "2026-08-31",
-  "description": "v5.4.4g - schnellerer und verständlicherer Updateweg, sichere Backup-Aufbewahrung, robuste openWB-Pro-Ladung sowie quellengebundene Fahrzeug- und Prognosewerte",
+  "description": "v5.4.4h - beidseitig bestätigter Update-Systemjob, dauerhafte Startdiagnose und eindeutiger Zustand bei frühem Prozessverlust",
   "update_strategy": "backup_replace_restart_v1",
   "installer_requires": "python3",
   "sanitized_republication": false,

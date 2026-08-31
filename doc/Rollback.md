@@ -12,7 +12,19 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
-## Backup und Rückweg in 5.4.4g
+## Start- und Rückfallwahrheit in 5.4.4h
+
+5.4.4h beginnt Ziel-Updater und Produktpfad erst nach der beidseitigen
+Bestätigung des laufenden Systemjobs. Der installierte Dispatcher löst auch
+Release und Download erst danach auf; der eigenständige Community-Bootstrap
+darf das private Zielrelease vorab binden, führt es aber noch nicht aus. Scheitert diese
+Bestätigung, bleibt der Produktzustand nachweislich unverändert. Geht der
+Prozess erst nach bestätigtem Ausführungsbeginn verloren, ist der erreichte
+Zustand nicht allein aus dem Laufzeitmarker ableitbar: Protokoll, verifiziertes
+Backup, möglicher Rücklauf und Abschlussstatus sind vor einem erneuten Start zu
+prüfen.
+
+## Backup und Rückweg seit 5.4.4g
 
 5.4.4g lässt den heruntergeladenen Ziel-Updater das Vollbackup bei laufenden
 Diensten erstellen. Erst für die ruhende Daten-Nachsicherung, Releaseprojektion
@@ -211,7 +223,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand ist `v5.4.4g`.
+Der aktuelle Stable-Stand ist `v5.4.4h`.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

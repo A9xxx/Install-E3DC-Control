@@ -1,6 +1,6 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.4g
+> **Stand:** v5.4.4h
 >
 > **Neu in 5.4.4g:** Fahrzeug-SoC wird in Planner, Tracker, Manager und
 > Weboberfläche an die echte Quelle, deren Ereigniszeit sowie Fahrzeug-,

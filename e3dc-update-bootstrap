@@ -23,6 +23,12 @@ PID_FILE="${RUNTIME_DIR}/pid"
 STATUS_FILE="${RUNTIME_DIR}/status"
 LOCK_FILE="${RUNTIME_DIR}/lock"
 START_LOCK_FILE="${RUNTIME_DIR}/start.lock"
+START_ACK_FILE="${RUNTIME_DIR}/start.ack"
+WORKER_UNIT_IDENTITY_ATTEMPTS=50
+START_ACK_ATTEMPTS=150
+EXECUTION_ACK_ATTEMPTS=50
+WORKER_ACK_ATTEMPTS=200
+ACK_INTERVAL_SECONDS="0.1"
 DISCOVERY_RELATIVE="Installer/update_bootstrap_discovery.py"
 LEGACY_REGULAR_PARENT=""
 PREVALIDATED_REGULAR_RELEASE=0
@@ -69,7 +75,7 @@ dependency_package() {
         getent) printf '%s\n' libc-bin ;;
         git) printf '%s\n' git ;;
         journalctl|systemctl|systemd-run) printf '%s\n' systemd ;;
-        basename|cat|chmod|chown|date|dirname|env|id|install|mkdir|mktemp|mv|rm|stat|unlink)
+        basename|cat|chmod|chown|date|dirname|env|id|install|mkdir|mktemp|mv|rm|sleep|stat|unlink)
             printf '%s\n' coreutils
             ;;
         python3) printf '%s\n' python3 ;;
@@ -80,7 +86,7 @@ dependency_package() {
 require_commands() {
     for command in \
         awk curl basename cat chmod chown date dirname env find flock getent git id \
-        install journalctl mkdir mktemp mv python3 rm stat systemctl systemd-run unlink
+        install journalctl mkdir mktemp mv python3 rm sleep stat systemctl systemd-run unlink
     do
         if ! command -v "$command" >/dev/null 2>&1; then
             package=$(dependency_package "$command")
@@ -133,6 +139,102 @@ write_runtime_value() {
             "Die bisherige Zieldatei blieb maßgeblich." \
             "$target" \
             "sudo stat -c '%U %G %a %F %n' $target $RUNTIME_DIR"
+}
+
+read_runtime_value() {
+    source_file=$1
+    [ -f "$source_file" ] && [ ! -L "$source_file" ] || return 1
+    IFS= read -r runtime_value <"$source_file" || [ -n "${runtime_value:-}" ] || return 1
+    printf '%s\n' "$runtime_value"
+}
+
+load_update_unit_state() {
+    unit_state_line=$(systemctl show "$UNIT" \
+        --property=LoadState \
+        --property=ActiveState \
+        --property=SubState \
+        --property=Result \
+        --property=ExecMainStatus \
+        --property=MainPID 2>/dev/null \
+        | awk -F= '
+            $1 == "LoadState" { load = $2 }
+            $1 == "ActiveState" { active = $2 }
+            $1 == "SubState" { substate = $2 }
+            $1 == "Result" { result = $2 }
+            $1 == "ExecMainStatus" { status = $2 }
+            $1 == "MainPID" { pid = $2 }
+            END { printf "%s|%s|%s|%s|%s|%s\n", load, active, substate, result, status, pid }
+        ' || true)
+    UNIT_LOAD_STATE=""
+    UNIT_ACTIVE_STATE=""
+    UNIT_SUB_STATE=""
+    UNIT_RESULT=""
+    UNIT_EXEC_MAIN_STATUS=""
+    UNIT_MAIN_PID=""
+    IFS='|' read -r \
+        UNIT_LOAD_STATE UNIT_ACTIVE_STATE UNIT_SUB_STATE UNIT_RESULT UNIT_EXEC_MAIN_STATUS UNIT_MAIN_PID <<EOF
+$unit_state_line
+EOF
+}
+
+normalize_start_failure_exit() {
+    normalized_exit=$1
+    case "$normalized_exit" in
+        ''|*[!0-9]*) printf '%s\n' 1 ;;
+        *)
+            if [ "$normalized_exit" -ge 1 ] 2>/dev/null \
+                && [ "$normalized_exit" -le 255 ] 2>/dev/null; then
+                printf '%s\n' "$normalized_exit"
+            else
+                printf '%s\n' 1
+            fi
+            ;;
+    esac
+}
+
+record_start_failure() {
+    failure_exit=$(normalize_start_failure_exit "$1")
+    failure_reason=$2
+    failure_detail=$3
+    case "$failure_reason" in
+        ''|*[!a-z0-9_]*) failure_reason=unknown_start_failure ;;
+    esac
+    printf '[FEHLER] Update-Worker nicht gestartet: %s (Exit %s, Grund %s).\n' \
+        "$failure_detail" "$failure_exit" "$failure_reason" >>"$LOG_FILE"
+    printf '%s\n' \
+        '[FEHLER] Anlage/Produktdateien unverändert: Der Worker erhielt vor Ziel-Updater und Produktpfad keine gültige Startfreigabe.' \
+        >>"$LOG_FILE"
+    write_runtime_value "$STATUS_FILE" \
+        "start_failed:${failure_exit}:${failure_reason}"
+}
+
+worker_phase_identity_confirmed() {
+    expected_identity_status=$1
+    CONFIRMED_WORKER_PID=""
+    identity_status=$(read_runtime_value "$STATUS_FILE" 2>/dev/null || true)
+    identity_pid=$(read_runtime_value "$PID_FILE" 2>/dev/null || true)
+    load_update_unit_state
+    [ "$identity_status" = "$expected_identity_status" ] || return 1
+    case "$identity_pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$identity_pid" -gt 0 ] 2>/dev/null && [ -d "/proc/$identity_pid" ] \
+        || return 1
+    [ "$UNIT_MAIN_PID" = "$identity_pid" ] || return 1
+    case "$UNIT_ACTIVE_STATE" in
+        active|activating|reloading) ;;
+        *) return 1 ;;
+    esac
+    CONFIRMED_WORKER_PID=$identity_pid
+    return 0
+}
+
+worker_start_identity_confirmed() {
+    worker_phase_identity_confirmed running
+}
+
+worker_execution_identity_confirmed() {
+    worker_phase_identity_confirmed executing
 }
 
 prepare_job_paths() {
@@ -821,9 +923,13 @@ print_job_commands() {
 }
 
 update_job_running() {
-    active_state=$(systemctl show "$UNIT" --property=ActiveState --value 2>/dev/null || true)
-    case "$active_state" in
-        active|activating|reloading) return 0 ;;
+    load_update_unit_state
+    # Eine geladene Transient-Unit gehört bis zu ihrer --collect-Entfernung
+    # noch dem vorherigen Auftrag. Ihre Log- und Runtime-Evidenz bleibt damit
+    # vor einem zu frühen zweiten Start geschützt.
+    [ "$UNIT_LOAD_STATE" = "loaded" ] && return 0
+    case "$UNIT_ACTIVE_STATE" in
+        active|activating|reloading|deactivating) return 0 ;;
     esac
     systemctl --quiet is-active "$UNIT"
 }
@@ -850,32 +956,83 @@ start_background_job() {
             "$START_LOCK_FILE" \
             "sudo systemctl status --no-pager $UNIT"
     if update_job_running; then
-        printf '\n[HINWEIS] E3DC-UPD-BUSY-001\n'
-        printf 'Was ist passiert: Ein Update-Systemjob läuft bereits; es wird kein zweiter gestartet.\n'
-        printf 'Systemzustand: Der vorhandene Updatejob arbeitet unverändert weiter.\n'
-        printf 'Ziel: %s\n' "$UNIT"
-        printf 'Lösung: Führe genau diesen sicheren Befehl aus:\n  sudo systemctl status --no-pager %s\n' "$UNIT"
-        return 0
+        if worker_execution_identity_confirmed; then
+            printf '\n[HINWEIS] E3DC-UPD-BUSY-001\n'
+            printf 'Was ist passiert: Ein Update-Systemjob läuft bereits in bestätigter Ausführungsphase; es wird kein zweiter gestartet.\n'
+            printf 'Systemzustand: Der vorhandene Updatejob arbeitet unverändert weiter.\n'
+            printf 'Ziel: %s\n' "$UNIT"
+            printf 'Lösung: Führe genau diesen sicheren Befehl aus:\n  sudo systemctl status --no-pager %s\n' "$UNIT"
+            return 0
+        fi
+        if ! worker_start_identity_confirmed; then
+            fail_with_solution \
+                "E3DC-UPD-BUSY-005" \
+                "Die aktive Update-Unit ist weder als Start- noch als Ausführungsphase eindeutig durch Status, PID und systemd-MainPID bestätigt." \
+                "Es wurde kein zweiter Auftrag gestartet; der aktive Zustand wurde nicht verändert." \
+                "$UNIT" \
+                "sudo systemctl status --no-pager $UNIT" \
+                75
+        fi
+        write_runtime_value "$START_ACK_FILE" "$CONFIRMED_WORKER_PID"
+        attempt=0
+        while [ "$attempt" -lt "$EXECUTION_ACK_ATTEMPTS" ]; do
+            if worker_execution_identity_confirmed; then
+                printf '\n[HINWEIS] E3DC-UPD-BUSY-001\n'
+                printf 'Was ist passiert: Ein eindeutig bestätigter Update-Systemjob läuft bereits; es wird kein zweiter gestartet.\n'
+                printf 'Systemzustand: Der vorhandene Updatejob hat die Ausführungsphase bestätigt und arbeitet weiter.\n'
+                printf 'Ziel: %s\n' "$UNIT"
+                printf 'Lösung: Führe genau diesen sicheren Befehl aus:\n  sudo systemctl status --no-pager %s\n' "$UNIT"
+                return 0
+            fi
+            raw_status=$(read_runtime_value "$STATUS_FILE" 2>/dev/null || true)
+            case "$raw_status" in
+                0)
+                    printf 'Rettungsupdate wurde nach bestätigter Startfreigabe bereits abgeschlossen: %s\n' "$UNIT"
+                    return 0
+                    ;;
+                ''|*[!0-9]*) ;;
+                *)
+                    post_ack_exit=$(normalize_start_failure_exit "$raw_status")
+                    fail_with_solution \
+                        "E3DC-UPD-BUSY-006" \
+                        "Der bereits laufende Worker endete nach Startfreigabe mit Exit $raw_status." \
+                        "Erreichten Zustand anhand Protokoll, Backup/Rollback und Abschlussprüfung bestimmen und nicht blind erneut starten." \
+                        "$UNIT" \
+                        "sudo journalctl -u $UNIT --no-pager -n 120" \
+                        "$post_ack_exit"
+                    ;;
+            esac
+            attempt=$((attempt + 1))
+            sleep "$ACK_INTERVAL_SECONDS"
+        done
+        fail_with_solution \
+            "E3DC-UPD-BUSY-007" \
+            "Der bereits laufende Worker bestätigte die Ausführungsphase nach Startfreigabe nicht." \
+            "Zustand anhand Protokoll und systemd prüfen und nicht blind erneut starten." \
+            "$UNIT" \
+            "sudo journalctl -u $UNIT --no-pager -n 120" \
+            75
     fi
     SYNCHRONOUS_STAGE_OWNED=0
     prepare_release_and_binding \
         "$explicit_root" "" "${SUDO_USER:-}" "$requested_role"
     prepare_log
     write_runtime_value "$STATUS_FILE" "launching"
-    rm -f "$PID_FILE"
+    rm -f "$PID_FILE" "$START_ACK_FILE"
     systemctl reset-failed "$UNIT" 2>/dev/null || true
     launch_output=""
     set +e
     launch_output=$(systemd-run \
         --unit="${UNIT%.service}" \
         --collect \
-        --no-block \
         --property=Type=exec \
         --property=User=root \
         --property=Group=root \
         --property=WorkingDirectory=/ \
         --property=UMask=0077 \
-        --property=TimeoutStartSec=infinity \
+        --property=TimeoutStartSec=20s \
+        --property="StandardOutput=append:${LOG_FILE}" \
+        --property="StandardError=append:${LOG_FILE}" \
         --setenv=E3DC_BOOTSTRAP_BACKGROUND_WORKER=1 \
         --setenv="E3DC_BOOTSTRAP_STAGE_DIR=$STAGE_DIR" \
         --setenv="E3DC_BOOTSTRAP_TAG=$BOUND_TAG" \
@@ -891,27 +1048,169 @@ start_background_job() {
     set -e
     if [ "$launch_status" -ne 0 ]; then
         find "$STAGE_DIR" -depth -delete 2>/dev/null || true
-        write_runtime_value "$STATUS_FILE" "$launch_status"
         printf '[!] Rettungsupdate-Systemjob konnte nicht gestartet werden (Exit %s).\n%s\n' \
             "$launch_status" "$launch_output" >>"$LOG_FILE"
+        launch_failure_exit=$(normalize_start_failure_exit "$launch_status")
+        record_start_failure \
+            "$launch_failure_exit" systemd_run_failed \
+            "systemd-run bestätigte den Type=exec-Start nicht"
+        systemctl stop "$UNIT" >>"$LOG_FILE" 2>&1 || true
+        write_runtime_value "$STATUS_FILE" \
+            "start_failed:${launch_failure_exit}:systemd_run_failed"
         fail_with_solution \
             "E3DC-UPD-SYSTEMD-001" \
             "Der vorbereitete Update-Systemjob konnte nicht gestartet werden (Exit $launch_status)." \
             "Der eigentliche Ziel-Updater lief nicht an; Installation und Dienste wurden durch diesen Auftrag nicht verändert." \
             "$UNIT" \
-            "sudo journalctl -u $UNIT --no-pager -n 120"
+            "sudo journalctl -u $UNIT --no-pager -n 120" \
+            "$launch_failure_exit"
+    fi
+
+    start_acknowledged=0
+    launch_failure_exit=1
+    launch_failure_reason=""
+    launch_failure_detail=""
+    attempt=0
+    while [ "$attempt" -lt "$START_ACK_ATTEMPTS" ]; do
+        if worker_start_identity_confirmed; then
+            if write_runtime_value "$START_ACK_FILE" "$CONFIRMED_WORKER_PID"; then
+                start_acknowledged=1
+                break
+            fi
+            launch_failure_reason=worker_ack_write_failed
+            launch_failure_detail="Bestätigte Worker-PID konnte nicht atomar rückbestätigt werden"
+            break
+        fi
+        raw_status=$(read_runtime_value "$STATUS_FILE" 2>/dev/null || true)
+        worker_pid=$(read_runtime_value "$PID_FILE" 2>/dev/null || true)
+        case "$raw_status" in
+            start_failed:*)
+                status_fields=${raw_status#start_failed:}
+                launch_failure_exit=${status_fields%%:*}
+                launch_failure_reason=${status_fields#*:}
+                launch_failure_exit=$(normalize_start_failure_exit "$launch_failure_exit")
+                case "$launch_failure_reason" in
+                    ''|*[!a-z0-9_]*) launch_failure_reason=worker_start_failed ;;
+                esac
+                launch_failure_detail="Worker meldete bereits $raw_status"
+                break
+                ;;
+            ''|*[!0-9]*) ;;
+            *)
+                launch_failure_exit=$(normalize_start_failure_exit "$raw_status")
+                launch_failure_reason=worker_exit_before_ack
+                launch_failure_detail="Worker endete vor der gebundenen Startbestätigung mit Exit $raw_status"
+                break
+                ;;
+        esac
+        if [ "$UNIT_ACTIVE_STATE" = "failed" ] \
+            || { [ -n "$UNIT_RESULT" ] && [ "$UNIT_RESULT" != "success" ]; }; then
+            launch_failure_exit=$(normalize_start_failure_exit "$UNIT_EXEC_MAIN_STATUS")
+            launch_failure_reason=worker_exec_failed
+            launch_failure_detail="systemd meldete ActiveState=${UNIT_ACTIVE_STATE:-unbekannt}, Result=${UNIT_RESULT:-unbekannt}, ExecMainStatus=${UNIT_EXEC_MAIN_STATUS:-unbekannt}"
+            break
+        fi
+        attempt=$((attempt + 1))
+        sleep "$ACK_INTERVAL_SECONDS"
+    done
+
+    if [ "$start_acknowledged" -ne 1 ]; then
+        raw_status=$(read_runtime_value "$STATUS_FILE" 2>/dev/null || true)
+        worker_pid=$(read_runtime_value "$PID_FILE" 2>/dev/null || true)
+        if [ -z "$launch_failure_reason" ]; then
+            launch_failure_exit=1
+            if [ "$raw_status" = "running" ]; then
+                launch_failure_reason=worker_pid_invalid
+                launch_failure_detail="Status war running, aber PID ${worker_pid:-fehlt} passte nicht zur aktiven systemd-MainPID ${UNIT_MAIN_PID:-fehlt}"
+            else
+                launch_failure_reason=worker_start_timeout
+                launch_failure_detail="Nach 15 Sekunden fehlten frische PID, running-Status und passende systemd-MainPID"
+            fi
+        fi
+        record_start_failure \
+            "$launch_failure_exit" "$launch_failure_reason" "$launch_failure_detail"
+        systemctl stop "$UNIT" >>"$LOG_FILE" 2>&1 || true
+        case "${STAGE_DIR:-}" in
+            /run/e3dc-update-bootstrap.*)
+                find "$STAGE_DIR" -depth -delete 2>/dev/null || true
+                ;;
+        esac
+        launch_failure_exit=$(normalize_start_failure_exit "$launch_failure_exit")
+        write_runtime_value "$STATUS_FILE" \
+            "start_failed:${launch_failure_exit}:${launch_failure_reason}"
+        fail_with_solution \
+            "E3DC-UPD-SYSTEMD-002" \
+            "Der Update-Worker wurde nicht eindeutig gestartet ($launch_failure_reason)." \
+            "Anlage und Produktdateien blieben unverändert; der Ziel-Updater erhielt keine Startfreigabe." \
+            "$UNIT" \
+            "sudo journalctl -u $UNIT --no-pager -n 120" \
+            "$launch_failure_exit"
+    fi
+
+    # Der Rück-ACK allein öffnet den Ziel-Updater noch nicht. Erst der vom
+    # gebundenen Worker atomar veröffentlichte executing-Status bestätigt die
+    # übernommene Startfreigabe. Danach ist eine pauschale Unverändert-Aussage
+    # nicht mehr zulässig.
+    execution_acknowledged=0
+    attempt=0
+    while [ "$attempt" -lt "$EXECUTION_ACK_ATTEMPTS" ]; do
+        if worker_execution_identity_confirmed; then
+            execution_acknowledged=1
+            break
+        fi
+        raw_status=$(read_runtime_value "$STATUS_FILE" 2>/dev/null || true)
+        case "$raw_status" in
+            ''|*[!0-9]*) ;;
+            0)
+                [ -z "$launch_output" ] || printf '%s\n' "$launch_output"
+                printf 'Rettungsupdate wurde nach bestätigter Startfreigabe bereits abgeschlossen: %s\n' "$UNIT"
+                return 0
+                ;;
+            *)
+                post_ack_exit=$(normalize_start_failure_exit "$raw_status")
+                fail_with_solution \
+                    "E3DC-UPD-SYSTEMD-004" \
+                    "Der Rettungsupdate-Worker endete nach bestätigter Startfreigabe mit Exit $raw_status." \
+                    "Der erreichte Anlagen-/Produktzustand muss anhand Protokoll, Backup/Rollback und Abschlussprüfung bestimmt werden; nicht blind erneut starten." \
+                    "$UNIT" \
+                    "sudo journalctl -u $UNIT --no-pager -n 120" \
+                    "$post_ack_exit"
+                ;;
+        esac
+        case "$raw_status" in
+            start_failed:*)
+                fail_with_solution \
+                    "E3DC-UPD-SYSTEMD-005" \
+                    "Der Worker meldete nach bestätigter Startfreigabe $raw_status." \
+                    "Der erreichte Anlagen-/Produktzustand muss geprüft werden; nicht blind erneut starten." \
+                    "$UNIT" \
+                    "sudo journalctl -u $UNIT --no-pager -n 120" \
+                    75
+                ;;
+        esac
+        attempt=$((attempt + 1))
+        sleep "$ACK_INTERVAL_SECONDS"
+    done
+    if [ "$execution_acknowledged" -ne 1 ]; then
+        raw_status=$(read_runtime_value "$STATUS_FILE" 2>/dev/null || true)
+        fail_with_solution \
+            "E3DC-UPD-SYSTEMD-006" \
+            "Die Ausführungsphase wurde nach bestätigter Startfreigabe nicht eindeutig gebunden (Status ${raw_status:-fehlt})." \
+            "Zustand anhand Protokoll und systemd prüfen und nicht blind erneut starten." \
+            "$UNIT" \
+            "sudo journalctl -u $UNIT --no-pager -n 120" \
+            75
     fi
     [ -z "$launch_output" ] || printf '%s\n' "$launch_output"
     printf 'Installation: %s (Benutzer %s, Rolle %s)\n' \
         "$BOUND_ROOT" "$BOUND_USER" "$BOUND_ROLE"
-    printf 'Update gestartet: %s\n' "$UNIT"
+    printf 'Update gestartet und durch PID/status/systemd sowie Ausführungsphase bestätigt: %s\n' "$UNIT"
     print_job_commands
 }
 
 validate_worker_environment() {
     [ "${E3DC_BOOTSTRAP_BACKGROUND_WORKER:-}" = "1" ] \
-        && [ -n "${INVOCATION_ID:-}" ] \
-        || fail "Hintergrund-Worker besitzt keinen systemd-Ausführungsvertrag"
+        || fail "Hintergrund-Worker besitzt keinen expliziten Dispatcher-Auftrag"
     [ -z "${SUDO_USER:-}" ] || fail "Hintergrund-Worker übernimmt keinen sudo-Aufrufer"
     STAGE_DIR=${E3DC_BOOTSTRAP_STAGE_DIR:-}
     case "$STAGE_DIR" in
@@ -935,18 +1234,117 @@ validate_worker_environment() {
     case "$BOUND_TAG_OBJECT:$BOUND_SHA" in
         *[!0-9a-f:]*) fail "Hintergrund-Worker besitzt ungültige Release-SHAs" ;;
     esac
-    validate_release_checkout \
-        "$RELEASE_DIR" "$BOUND_TAG" "$BOUND_TAG_OBJECT" "$BOUND_SHA"
     case "$BOUND_ROLE" in
         off|master|slave|shadow) ;;
         *) fail "Hintergrund-Worker besitzt keine gültige Rollenbindung" ;;
     esac
 }
 
+validate_background_worker_unit_identity() {
+    worker_identity_attempt=0
+    while [ "$worker_identity_attempt" -lt "$WORKER_UNIT_IDENTITY_ATTEMPTS" ]; do
+        load_update_unit_state
+        if [ "$UNIT_MAIN_PID" = "$$" ]; then
+            case "$UNIT_ACTIVE_STATE" in
+                active|activating|reloading) return 0 ;;
+            esac
+        fi
+        if [ -n "$UNIT_RESULT" ] && [ "$UNIT_RESULT" != "success" ]; then
+            break
+        fi
+        worker_identity_attempt=$((worker_identity_attempt + 1))
+        sleep "$ACK_INTERVAL_SECONDS"
+    done
+    fail "Hintergrund-Worker konnte nicht eindeutig an $UNIT gebunden werden"
+}
+
+wait_for_background_start_ack() {
+    worker_ack_attempt=0
+    while [ "$worker_ack_attempt" -lt "$WORKER_ACK_ATTEMPTS" ]; do
+        worker_ack=$(read_runtime_value "$START_ACK_FILE" 2>/dev/null || true)
+        if [ "$worker_ack" = "$$" ]; then
+            WORKER_START_ACKNOWLEDGED=1
+            write_runtime_value "$STATUS_FILE" executing
+            rm -f "$START_ACK_FILE"
+            return 0
+        fi
+        worker_status=$(read_runtime_value "$STATUS_FILE" 2>/dev/null || true)
+        case "$worker_status" in
+            start_failed:*)
+                fail "Dispatcher hat die Worker-Startphase abgebrochen ($worker_status)"
+                ;;
+        esac
+        worker_ack_attempt=$((worker_ack_attempt + 1))
+        sleep "$ACK_INTERVAL_SECONDS"
+    done
+    record_start_failure \
+        70 launcher_ack_timeout \
+        "Rückbestätigung des gebundenen Workers blieb 20 Sekunden aus"
+    fail_with_solution \
+        "E3DC-UPD-SYSTEMD-003" \
+        "Die Rückbestätigung des gebundenen Hintergrund-Workers blieb aus." \
+        "Anlage und Produktdateien blieben unverändert; der Ziel-Updater wurde nicht ausgeführt." \
+        "$UNIT" \
+        "sudo journalctl -u $UNIT --no-pager -n 120" \
+        70
+}
+
 run_background_worker() {
     BOUND_ENTRY_MODE=rescue
-    validate_worker_environment
+    STAGE_DIR=${E3DC_BOOTSTRAP_STAGE_DIR:-}
+    WORKER_START_ACKNOWLEDGED=0
+    WORKER_CLEANUP_STARTED=0
+    worker_signal_exit() {
+        signal_name=$1
+        signal_exit=$2
+        trap '' HUP INT TERM
+        if [ "$WORKER_START_ACKNOWLEDGED" -eq 1 ]; then
+            printf '[FEHLER] Rettungsupdate-Worker erhielt Signal %s nach bestätigtem Start (Exit %s). Der erreichte Updatezustand muss anhand Dateilog, Backup-/Rollback- und Abschlussprüfung bestimmt werden.\n' \
+                "$signal_name" "$signal_exit" >&2
+        else
+            printf '[FEHLER] Rettungsupdate-Worker erhielt Signal %s vor der Startfreigabe (Exit %s). Anlage und Produktdateien unverändert; der Ziel-Updater wurde nicht freigegeben.\n' \
+                "$signal_name" "$signal_exit" >&2
+        fi
+        exit "$signal_exit"
+    }
+    cleanup_worker() {
+        exit_code=$?
+        status_before=""
+        trap - EXIT
+        trap '' HUP INT TERM
+        if [ "$WORKER_CLEANUP_STARTED" -eq 1 ]; then
+            exit "$exit_code"
+        fi
+        WORKER_CLEANUP_STARTED=1
+        set +e
+        status_before=$(read_runtime_value "$STATUS_FILE" 2>/dev/null || true)
+        rm -f "$START_ACK_FILE" "$PID_FILE"
+        case "${STAGE_DIR:-}" in
+            /run/e3dc-update-bootstrap.*)
+                find "$STAGE_DIR" -depth -delete 2>/dev/null || true
+                ;;
+        esac
+        if [ "$WORKER_START_ACKNOWLEDGED" -eq 1 ]; then
+            write_runtime_value "$STATUS_FILE" "$exit_code"
+        else
+            case "$status_before" in
+                start_failed:*) ;;
+                *) write_runtime_value "$STATUS_FILE" "$exit_code" ;;
+            esac
+        fi
+        exit "$exit_code"
+    }
+    trap cleanup_worker EXIT
+    trap 'worker_signal_exit HUP 129' HUP
+    trap 'worker_signal_exit INT 130' INT
+    trap 'worker_signal_exit TERM 143' TERM
+    command -v id >/dev/null 2>&1 \
+        || fail "Hintergrund-Worker kann die root-Identität nicht prüfen"
+    [ "$(id -u)" -eq 0 ] \
+        || fail "Hintergrund-Worker besitzt keine root-Ausführungsidentität"
+    require_commands
     prepare_job_paths
+    exec >>"$LOG_FILE" 2>&1
     prepare_lock_file "$LOCK_FILE"
     exec 9>"$LOCK_FILE"
     flock -n 9 \
@@ -957,19 +1355,16 @@ run_background_worker() {
             "$LOCK_FILE" \
             "sudo systemctl status --no-pager $UNIT" \
             75
-    cleanup_worker() {
-        exit_code=$?
-        trap - EXIT
-        set +e
-        rm -f "$PID_FILE"
-        find "$STAGE_DIR" -depth -delete 2>/dev/null || true
-        write_runtime_value "$STATUS_FILE" "$exit_code"
-        exit "$exit_code"
-    }
-    trap cleanup_worker EXIT
-    exec >>"$LOG_FILE" 2>&1
+    validate_worker_environment
+    validate_background_worker_unit_identity
     write_runtime_value "$PID_FILE" "$$"
     write_runtime_value "$STATUS_FILE" "running"
+    wait_for_background_start_ack
+
+    # Erst nach dem beidseitig bestätigten Start wird der private Release erneut
+    # validiert und an den eigentlichen Ziel-Updater übergeben.
+    validate_release_checkout \
+        "$RELEASE_DIR" "$BOUND_TAG" "$BOUND_TAG_OBJECT" "$BOUND_SHA"
     printf '[OK] Installation, Benutzer und Rolle sind zentral gebunden.\n'
     set +e
     run_bound_update
@@ -1044,16 +1439,6 @@ run_synchronous_update() {
     return "$result"
 }
 
-command -v id >/dev/null 2>&1 \
-    || fail_with_solution \
-        "E3DC-UPD-DEP-001" \
-        "Das benötigte Programm 'id' fehlt." \
-        "Das Update wurde vor Download, Backup und Dienständerungen beendet." \
-        "Systempaket coreutils" \
-        "sudo apt-get install -y coreutils"
-[ "$(id -u)" -eq 0 ] || fail "Rettungsupdate bitte mit sudo starten"
-require_commands
-
 if [ "${1:-}" = "--systemd-worker" ]; then
     shift
     [ "$#" -eq 0 ] || fail_with_solution \
@@ -1064,9 +1449,20 @@ if [ "${1:-}" = "--systemd-worker" ]; then
         "sudo journalctl -u $UNIT --no-pager -n 120" \
         64
     run_background_worker
-elif [ "${E3DC_BOOTSTRAP_ENTRY_MODE:-}" != "regular" ] \
-    && [ "${E3DC_BOOTSTRAP_INLINE_WORKER:-}" != "1" ]; then
-    start_background_job "$@"
 else
-    run_synchronous_update "$@"
+    command -v id >/dev/null 2>&1 \
+        || fail_with_solution \
+            "E3DC-UPD-DEP-001" \
+            "Das benötigte Programm 'id' fehlt." \
+            "Das Update wurde vor Download, Backup und Dienständerungen beendet." \
+            "Systempaket coreutils" \
+            "sudo apt-get install -y coreutils"
+    [ "$(id -u)" -eq 0 ] || fail "Rettungsupdate bitte mit sudo starten"
+    require_commands
+    if [ "${E3DC_BOOTSTRAP_ENTRY_MODE:-}" != "regular" ] \
+        && [ "${E3DC_BOOTSTRAP_INLINE_WORKER:-}" != "1" ]; then
+        start_background_job "$@"
+    else
+        run_synchronous_update "$@"
+    fi
 fi

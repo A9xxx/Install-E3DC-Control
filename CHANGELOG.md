@@ -6,6 +6,16 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.4h] – 2026-08-31
+
+### 🔄 Update-Systemjob startet nachweisbar und meldet verständlich
+
+- **Beidseitige Startbestätigung:** Dispatcher und Worker binden den Auftrag an dieselbe aktive systemd-Unit und MainPID. Ziel-Updater und Produktpfad beginnen erst, wenn beide Seiten den laufenden Job bestätigt haben. Der installierte Dispatcher löst auch Release und Download erst danach auf; der eigenständige Community-Bootstrap darf das private Zielrelease bereits vorher binden, führt es aber noch nicht aus.
+- **Kein scheinbarer Erfolg nach bloßem Einreihen:** Der Aufruf wartet auf die tatsächliche Ausführung des Workers. Ein fehlgeschlagener oder nie angelaufener Systemjob wird mit konkretem Grund beendet, statt später pauschal „ohne eindeutige Erfolgsmeldung“ zu erscheinen.
+- **Dauerhafte Frühfehler:** Ausgaben aus der frühen Worker-Phase landen von Prozessbeginn an im Updateprotokoll. Strukturierte Statuswerte bleiben mit den bisherigen numerischen Abschlusswerten kompatibel.
+- **Start und Ausführung sauber getrennt:** Vor der beidseitigen Bestätigung gilt ein Abbruch nachweislich als unveränderter Startfehler. Nach Beginn der Ausführung behauptet die Oberfläche bei Signal, Prozessverlust oder unvollständigem Abschluss keinen unveränderten Zustand, sondern fordert ausdrücklich die Prüfung von Protokoll, Backup, Rücklauf und Abschlussstatus.
+- **Regelung unverändert:** EMS-, Speicher-, Wallbox-, Wärme- und Direktvermarktungslogik erhalten durch dieses Wartungsrelease keine neue Entscheidung oder Hardwarewirkung.
+
 ## [5.4.4g] – 2026-08-31
 
 ### 💾 Schnellerer, verständlicherer und sicherer Updateweg

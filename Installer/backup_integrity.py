@@ -59,6 +59,9 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 PRIVATE_ML_ROOT = Path("/var/lib/e3dc-control/ml")
+VOLATILE_EMERGENCY_LATCH_PATH = Path(
+    "/var/lib/e3dc-control/emergency-quiesce/active-incident.json"
+)
 LEGACY_ML_MODEL = Path("/var/www/html/data/ml_model.pkl")
 QUIESCED_WEB_ROOT = Path("/var/www/html")
 QUIESCED_WEB_PERSISTENT_FILES = frozenset({
@@ -1551,9 +1554,27 @@ def _persistent_entry_is_excluded(
 ) -> bool:
     """Statischer Ausschlussvertrag für Kopie und Größenabschätzung."""
 
+    candidate = _lexical_absolute(source.source) / relative / name
+    if candidate == VOLATILE_EMERGENCY_LATCH_PATH:
+        # Der Incident ist aktueller Safety-State und darf weder in einem
+        # Vollbackup noch in einem ruhenden Overlay historisiert werden.
+        return True
     if name in source.exclude_anywhere:
         return True
     return not relative.parts and name in source.exclude_top_level
+
+
+def _is_below_volatile_emergency_latch(path: PathValue) -> bool:
+    candidate = _lexical_absolute(path)
+    return _is_within(candidate, VOLATILE_EMERGENCY_LATCH_PATH)
+
+
+def _is_volatile_emergency_latch_ancestor(path: PathValue) -> bool:
+    candidate = _lexical_absolute(path)
+    return (
+        candidate != VOLATILE_EMERGENCY_LATCH_PATH
+        and _is_within(VOLATILE_EMERGENCY_LATCH_PATH, candidate)
+    )
 
 
 def _is_private_install_workspace_directory(
@@ -2959,7 +2980,13 @@ def _exact_cleanup_candidates(
     expected_paths = {
         _lexical_absolute(str(entry["restore_path"]))
         for entry in manifest.get("files", [])  # type: ignore[union-attr]
-        if isinstance(entry, dict) and entry.get("restore_path")
+        if (
+            isinstance(entry, dict)
+            and entry.get("restore_path")
+            and not _is_below_volatile_emergency_latch(
+                str(entry["restore_path"])
+            )
+        )
     }
     cleanup_files: Dict[str, Dict[str, object]] = {}
     cleanup_dirs: Dict[str, Dict[str, object]] = {}
@@ -2990,6 +3017,10 @@ def _exact_cleanup_candidates(
                 if candidate_relative in skipped_paths:
                     continue
                 candidate = directory_path / name
+                if _is_below_volatile_emergency_latch(candidate):
+                    # Den aktuellen Incident-Knoten niemals betreten oder
+                    # historisch bereinigen, unabhängig von seinem Knotentyp.
+                    continue
                 metadata = os.lstat(str(candidate))
                 if (
                     preserve_private_install_workspaces
@@ -3000,7 +3031,10 @@ def _exact_cleanup_candidates(
                     continue
                 if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
                     raise BackupIntegrityError("Unsicherer Eintrag in Restore-Flaeche: {}".format(candidate))
-                if candidate not in original_dirs:
+                if (
+                    candidate not in original_dirs
+                    and not _is_volatile_emergency_latch_ancestor(candidate)
+                ):
                     cleanup_dirs[str(candidate)] = {
                         "path": candidate, "dev": metadata.st_dev, "ino": metadata.st_ino,
                         "mode": stat.S_IMODE(metadata.st_mode), "uid": metadata.st_uid, "gid": metadata.st_gid,
@@ -3017,6 +3051,8 @@ def _exact_cleanup_candidates(
                 if candidate_relative in skipped_paths:
                     continue
                 candidate = directory_path / name
+                if _is_below_volatile_emergency_latch(candidate):
+                    continue
                 metadata = os.lstat(str(candidate))
                 if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
                     raise BackupIntegrityError("Unsicherer Eintrag in Restore-Flaeche: {}".format(candidate))
@@ -3080,6 +3116,8 @@ def _exact_cleanup_candidates(
                     if candidate_relative.as_posix() in skipped_paths:
                         continue
                     candidate = source / candidate_relative
+                    if _is_below_volatile_emergency_latch(candidate):
+                        continue
                     metadata = os.stat(
                         name,
                         dir_fd=directory_descriptor,
@@ -3098,7 +3136,12 @@ def _exact_cleanup_candidates(
                             and _is_private_local_entry(name)
                         ):
                             continue
-                        if candidate not in original_dirs:
+                        if (
+                            candidate not in original_dirs
+                            and not _is_volatile_emergency_latch_ancestor(
+                                candidate
+                            )
+                        ):
                             cleanup_dirs[str(candidate)] = {
                                 "path": candidate,
                                 "dev": metadata.st_dev,
@@ -3158,6 +3201,10 @@ def _exact_cleanup_candidates(
         source = _lexical_absolute(str(record.get("source") or ""))
         if not _restore_target_allowed(source, roots, files):
             raise BackupIntegrityError("Source-Flaeche liegt ausserhalb der Restore-Positivliste: {}".format(source))
+        if _is_below_volatile_emergency_latch(source):
+            # Auch alte Manifeste dürfen einen historischen Latch nicht als
+            # eigenständige Restore- oder Cleanup-Quelle reaktivieren.
+            continue
         exclude_top = {str(name) for name in record.get("exclude_top_level", [])}
         exclude_anywhere = {str(name) for name in record.get("exclude_anywhere", [])}
         for name in exclude_top | exclude_anywhere:
@@ -3235,6 +3282,23 @@ def _exact_cleanup_candidates(
                     "path": source, "dev": metadata.st_dev, "ino": metadata.st_ino,
                     "mode": stat.S_IMODE(metadata.st_mode), "uid": metadata.st_uid, "gid": metadata.st_gid,
                 }
+            elif (
+                stat.S_ISDIR(metadata.st_mode)
+                and not stat.S_ISLNK(metadata.st_mode)
+                and _is_volatile_emergency_latch_ancestor(source)
+            ):
+                # Eine komplett nach dem Backup entstandene System-State-Wurzel
+                # wird selektiv bereinigt. Der feste Trägerpfad des aktuellen
+                # Incident-Latch bleibt dabei erhalten, alle anderen Einträge
+                # folgen weiterhin dem exakten Restorevertrag.
+                scan_directory(
+                    source,
+                    exclude_top,
+                    exclude_anywhere,
+                    set(),
+                    skipped_paths,
+                    False,
+                )
             elif stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
                 cleanup_dirs[str(source)] = {
                     "path": source, "dev": metadata.st_dev, "ino": metadata.st_ino,
@@ -3550,6 +3614,11 @@ def _manifest_directory_entries(
             })
         for entry in entries:
             path = _lexical_absolute(entry["path"])
+            if _is_below_volatile_emergency_latch(path):
+                # Altbackups können den heutigen volatilen Latch noch als
+                # Datei oder Verzeichnis enthalten. Dessen Metadaten und Inhalt
+                # gehören nie zur historischen Restore-Semantik.
+                continue
             if not _restore_target_allowed(path, roots, files):
                 raise BackupIntegrityError("Restore-Verzeichnis liegt ausserhalb der Positivliste: {}".format(path))
             if str(path) in result:
@@ -4049,7 +4118,13 @@ def restore_persistent_payload(
     restorable_files = sum(
         1
         for entry in manifest.get("files", [])  # type: ignore[union-attr]
-        if isinstance(entry, dict) and entry.get("restore_path")
+        if (
+            isinstance(entry, dict)
+            and entry.get("restore_path")
+            and not _is_below_volatile_emergency_latch(
+                str(entry["restore_path"])
+            )
+        )
     )
     persistent_descriptors = (
         2 * len(directory_entries)
@@ -4099,6 +4174,10 @@ def restore_persistent_payload(
             if not restore_path:
                 continue
             destination = _lexical_absolute(str(restore_path))
+            if _is_below_volatile_emergency_latch(destination):
+                # Abwärtskompatibilität: Ein alter verifizierter Backup-Latch
+                # wird geprüft, aber weder bereitgestellt noch restauriert.
+                continue
             if not _restore_target_allowed(destination, roots, files):
                 raise BackupIntegrityError("Restore-Ziel liegt ausserhalb der Positivliste: {}".format(destination))
             parent_descriptor, destination_name, _is_bound = (

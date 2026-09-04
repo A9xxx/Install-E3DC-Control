@@ -797,9 +797,25 @@ function e3dcWbTxModeRequestBytes(array $snapshot, $wbId, $newMode, $oldMode, $k
     }
     $key = (string)max(1, min(2, (int)$wbId));
     if ($kind === 'default') {
+        $requestId = strtolower(trim((string)($meta['request_id'] ?? '')));
+        $candidateSha = strtolower(trim((string)($meta['candidate_config_sha256'] ?? '')));
+        $previousMode = trim((string)$oldMode);
+        if (!preg_match('/^[a-f0-9]{32}$/', $requestId)
+            || !preg_match('/^[a-f0-9]{64}$/', $candidateSha)
+            || (string)$newMode !== '0'
+            || !in_array($previousMode, ['0', '2', '3', '4', '5', '12'], true)) {
+            throw new InvalidArgumentException('Mode-0-Übergabe ist nicht vollständig gebunden.');
+        }
         $data[$key] = [
-            'ts' => time(), 'source' => 'Wallbox.php', 'reason' => 'mode0_user_switch',
-            'previous_mode' => (string)$oldMode,
+            'schema' => 'wallbox_mode0_default_release_request_v2',
+            'request_id' => $requestId,
+            'candidate_config_sha256' => $candidateSha,
+            'wb' => (int)$key,
+            'target_mode' => '0',
+            'previous_mode' => $previousMode,
+            'ts' => time(),
+            'source' => 'Wallbox.php',
+            'reason' => 'mode0_user_switch',
         ];
     } elseif ($kind === 'user') {
         $data[$key] = [
@@ -1002,7 +1018,7 @@ function e3dcWallboxPlanTransaction(array $updates, array $options = []) {
     $txId = '';
     $jobDir = '';
     $lock = null;
-    $requestLock = null;
+    $requestLocks = [];
     $mode5SessionBinding = [];
     $mode5LatchGeneration = [];
     $mutated = [];
@@ -1130,6 +1146,21 @@ function e3dcWallboxPlanTransaction(array $updates, array $options = []) {
         $requestTarget = null;
         $requestKind = null;
         if ($modeTransition) {
+            // Jeder Moduswechsel teilt sich dieselbe kurze Sperre mit dem
+            // openWB-Pro-Handoff. So kann ein Wechsel zurück in einen aktiven
+            // Modus nicht zwischen dessen Config-Bindung und genau einem
+            // sicheren 0-A-/Heartbeat-Ausgang committen.
+            $defaultReleaseLockPath = $ramdisk . '/wallbox_default_release_request.json.lock';
+            $defaultReleaseLock = e3dcWbTxAcquireSharedRequestLock(
+                $defaultReleaseLockPath,
+                (float)($options['lock_timeout'] ?? 2.0),
+                0664
+            );
+            if ($defaultReleaseLock === false) {
+                throw new RuntimeException('Gemeinsame Wallbox-Übergabesperre ist belegt oder unsicher.');
+            }
+            $requestLocks[$defaultReleaseLockPath] = $defaultReleaseLock;
+
             $newMode = (string)($modeTransition['new_mode'] ?? '');
             $oldMode = (string)($modeTransition['old_mode'] ?? '');
             if ($newMode === '0' && $oldMode !== '0') {
@@ -1161,20 +1192,24 @@ function e3dcWallboxPlanTransaction(array $updates, array $options = []) {
                         throw new RuntimeException('Persistente Sofortlade-Anforderungsfläche ist nicht vertrauenswürdig.');
                     }
                 }
-                if (in_array($requestKind, ['user', 'mode5_start'], true)) {
+                if (in_array($requestKind, ['default', 'user', 'mode5_start'], true)) {
                     $mode5LockOwners = null;
                     if ($requestKind === 'mode5_start') {
                         $mode5LockOwners = e3dcWbTxMode5AllowedLockUids();
                     }
-                    $requestLock = e3dcWbTxAcquireSharedRequestLock(
-                        $requestTarget . '.lock',
-                        (float)($options['lock_timeout'] ?? 2.0),
-                        $requestKind === 'mode5_start' ? 0660 : 0664,
-                        $requestKind === 'mode5_start' ? (int)$mode5Surface['gid'] : null,
-                        $mode5LockOwners
-                    );
-                    if ($requestLock === false) {
-                        throw new RuntimeException('Gemeinsame Wallbox-Anforderungssperre ist belegt oder unsicher.');
+                    $requestLockPath = $requestTarget . '.lock';
+                    if (!isset($requestLocks[$requestLockPath])) {
+                        $requestLock = e3dcWbTxAcquireSharedRequestLock(
+                            $requestLockPath,
+                            (float)($options['lock_timeout'] ?? 2.0),
+                            $requestKind === 'mode5_start' ? 0660 : 0664,
+                            $requestKind === 'mode5_start' ? (int)$mode5Surface['gid'] : null,
+                            $mode5LockOwners
+                        );
+                        if ($requestLock === false) {
+                            throw new RuntimeException('Gemeinsame Wallbox-Anforderungssperre ist belegt oder unsicher.');
+                        }
+                        $requestLocks[$requestLockPath] = $requestLock;
                     }
                 }
                 $targets[] = $requestTarget;
@@ -1523,7 +1558,8 @@ function e3dcWallboxPlanTransaction(array $updates, array $options = []) {
             ]);
     } finally {
         if ($jobDir !== '') e3dcWbTxCleanupJob($jobDir);
-        if (is_resource($requestLock)) {
+        foreach (array_reverse($requestLocks, true) as $requestLock) {
+            if (!is_resource($requestLock)) continue;
             @flock($requestLock, LOCK_UN);
             @fclose($requestLock);
         }

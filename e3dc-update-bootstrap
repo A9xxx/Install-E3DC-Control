@@ -26,6 +26,8 @@ STATUS_FILE="${RUNTIME_DIR}/status"
 LOCK_FILE="${RUNTIME_DIR}/lock"
 START_LOCK_FILE="${RUNTIME_DIR}/start.lock"
 START_ACK_FILE="${RUNTIME_DIR}/start.ack"
+CREDENTIAL_DIR="/run/e3dc-update-credentials"
+DRIFT_CONFIRM_FILE="${CREDENTIAL_DIR}/local-drift.token"
 WORKER_UNIT_IDENTITY_ATTEMPTS=50
 START_ACK_ATTEMPTS=150
 EXECUTION_ACK_ATTEMPTS=50
@@ -34,6 +36,8 @@ ACK_INTERVAL_SECONDS="0.1"
 DISCOVERY_RELATIVE="Installer/update_bootstrap_discovery.py"
 LEGACY_REGULAR_PARENT=""
 PREVALIDATED_REGULAR_RELEASE=0
+DRIFT_STDIN_TOKEN=""
+DRIFT_CREDENTIAL_OWNED=0
 
 fail_with_solution() {
     code=$1
@@ -141,6 +145,85 @@ write_runtime_value() {
             "Die bisherige Zieldatei blieb maßgeblich." \
             "$target" \
             "sudo stat -c '%U %G %a %F %n' $target $RUNTIME_DIR"
+}
+
+remove_drift_confirmation_credential_safely() {
+    if [ -e "$DRIFT_CONFIRM_FILE" ] || [ -L "$DRIFT_CONFIRM_FILE" ]; then
+        [ -f "$DRIFT_CONFIRM_FILE" ] && [ ! -L "$DRIFT_CONFIRM_FILE" ] \
+            || return 1
+        metadata=$(stat -c '%u %g %a %F %h' "$DRIFT_CONFIRM_FILE") \
+            || return 1
+        [ "$metadata" = "0 0 600 regular file 1" ] \
+            || return 1
+        unlink "$DRIFT_CONFIRM_FILE" \
+            || return 1
+    fi
+    return 0
+}
+
+clear_drift_confirmation_credential() {
+    remove_drift_confirmation_credential_safely \
+        || fail "Driftfreigabe konnte nicht sicher verworfen werden"
+}
+
+cleanup_owned_drift_credential() {
+    cleanup_status=$?
+    trap - EXIT HUP INT TERM
+    set +e
+    if [ "${DRIFT_CREDENTIAL_OWNED:-0}" = "1" ] \
+        && ! remove_drift_confirmation_credential_safely; then
+        printf '[FEHLER] Private Driftfreigabe konnte beim Abbruch nicht sicher gelöscht werden.\n' >&2
+        [ "$cleanup_status" -ne 0 ] || cleanup_status=126
+    fi
+    exit "$cleanup_status"
+}
+
+store_drift_confirmation_credential() {
+    token=$1
+    case "$token" in
+        *[!0-9a-f]*) fail "Dateilistenbindung der Driftfreigabe ist ungültig" ;;
+    esac
+    [ "${#token}" -eq 64 ] \
+        || fail "Dateilistenbindung der Driftfreigabe ist ungültig"
+    clear_drift_confirmation_credential
+    temporary=$(mktemp "${CREDENTIAL_DIR}/.local-drift.XXXXXX") \
+        || fail "Private Driftfreigabe konnte nicht angelegt werden"
+    if ! printf '%s\n' "$token" >"$temporary" \
+        || ! chown root:root "$temporary" \
+        || ! chmod 0600 "$temporary" \
+        || ! mv -fT "$temporary" "$DRIFT_CONFIRM_FILE"; then
+        unlink "$temporary" 2>/dev/null || true
+        fail "Private Driftfreigabe konnte nicht sicher gebunden werden"
+    fi
+    metadata=$(stat -c '%u %g %a %F %h %s' "$DRIFT_CONFIRM_FILE") \
+        || fail "Private Driftfreigabe ist nicht prüfbar"
+    [ "$metadata" = "0 0 600 regular file 1 65" ] \
+        || fail "Private Driftfreigabe blieb nach dem Schreiben unsicher"
+}
+
+bind_drift_confirmation_credential() {
+    if [ "${E3DC_UPDATE_CONFIRM_LOCAL_DRIFT:-0}" = "1" ]; then
+        # Bis zur nachweislichen Übergabe an einen Worker oder bis der
+        # synchrone Ziel-Updater die Einmal-Credential verbraucht, besitzt
+        # dieser Prozess die Löschverantwortung auf jedem Fehlerpfad.
+        DRIFT_CREDENTIAL_OWNED=1
+        trap cleanup_owned_drift_credential EXIT
+        trap 'exit 129' HUP
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        if [ -n "$DRIFT_STDIN_TOKEN" ]; then
+            store_drift_confirmation_credential "$DRIFT_STDIN_TOKEN"
+        else
+            [ -f "$DRIFT_CONFIRM_FILE" ] && [ ! -L "$DRIFT_CONFIRM_FILE" ] \
+                || fail "Die private Dateilistenbindung der Driftfreigabe fehlt"
+            metadata=$(stat -c '%u %g %a %F %h %s' "$DRIFT_CONFIRM_FILE") \
+                || fail "Private Driftfreigabe ist nicht prüfbar"
+            [ "$metadata" = "0 0 600 regular file 1 65" ] \
+                || fail "Private Driftfreigabe besitzt unsichere Metadaten"
+        fi
+    else
+        clear_drift_confirmation_credential
+    fi
 }
 
 read_runtime_value() {
@@ -254,7 +337,7 @@ prepare_job_paths() {
         [ "$metadata" = "0 directory" ] \
             || fail "System-Elternpfad ist nicht root-kontrolliert: $parent"
     done
-    for path in "$RUNTIME_DIR" "$LOG_DIR"; do
+    for path in "$RUNTIME_DIR" "$CREDENTIAL_DIR" "$LOG_DIR"; do
         [ ! -L "$path" ] || fail "Runtime- oder Logpfad ist ein Symlink: $path"
         if [ -e "$path" ] && [ ! -d "$path" ]; then
             fail "Runtime- oder Logpfad ist kein Verzeichnis: $path"
@@ -266,6 +349,13 @@ prepare_job_paths() {
             "Das private Laufzeitverzeichnis konnte nicht angelegt oder bestätigt werden." \
             "Der Ziel-Updater wurde nicht gestartet; Installation und Dienste wurden durch diesen Schritt nicht verändert." \
             "$RUNTIME_DIR" \
+            "sudo stat -c '%U %G %a %F %n' /run"
+    install -d -o root -g root -m 0700 "$CREDENTIAL_DIR" \
+        || fail_with_solution \
+            "E3DC-UPD-RUN-004" \
+            "Das private Update-Credential-Verzeichnis konnte nicht angelegt werden." \
+            "Der Ziel-Updater wurde nicht gestartet." \
+            "$CREDENTIAL_DIR" \
             "sudo stat -c '%U %G %a %F %n' /run"
     install -d -o root -g root -m 0755 "$LOG_DIR" \
         || fail_with_solution \
@@ -507,13 +597,22 @@ stage_release_contract() {
 
 cleanup_synchronous_stage() {
     cleanup_status=$?
-    trap - EXIT
+    credential_cleanup_failed=0
+    trap - EXIT HUP INT TERM
     set +e
+    if [ "${DRIFT_CREDENTIAL_OWNED:-0}" = "1" ] \
+        && ! remove_drift_confirmation_credential_safely; then
+        printf '[FEHLER] Private Driftfreigabe konnte beim Bootstrap-Abschluss nicht sicher gelöscht werden.\n' >&2
+        credential_cleanup_failed=1
+    fi
     case "${STAGE_DIR:-}" in
         /run/e3dc-update-bootstrap.*)
             [ ! -d "$STAGE_DIR" ] || find "$STAGE_DIR" -depth -delete 2>/dev/null
             ;;
     esac
+    if [ "$credential_cleanup_failed" -eq 1 ] && [ "$cleanup_status" -eq 0 ]; then
+        cleanup_status=126
+    fi
     exit "$cleanup_status"
 }
 
@@ -781,7 +880,7 @@ validate_release_checkout() {
         || fail "Privater Release-Checkout ist nicht ausschließlich root-zugänglich"
     for required in \
         VERSION e3dc-bootstrap e3dc-update-bootstrap \
-        "$DISCOVERY_RELATIVE" Installer/update_simple.py
+        "$DISCOVERY_RELATIVE" Installer/update_simple.py Installer/update_drift.py
     do
         [ -f "$checkout_dir/$required" ] && [ ! -L "$checkout_dir/$required" ] \
             || fail "Release-Datei fehlt oder ist kein regulärer Pfad: $required"
@@ -910,6 +1009,7 @@ run_bound_update() (
         E3DC_BOOTSTRAP_USER="$BOUND_USER" \
         E3DC_BOOTSTRAP_BOUND_PEER_IP="$BOUND_PEER_IP" \
         E3DC_BOOTSTRAP_ENTRY_MODE="$BOUND_ENTRY_MODE" \
+        E3DC_UPDATE_CONFIRM_LOCAL_DRIFT="${E3DC_UPDATE_CONFIRM_LOCAL_DRIFT:-0}" \
         E3DC_RELEASE_CHECKOUT_VERIFIED=1 \
         /bin/sh "$checkout/e3dc-bootstrap" \
         "$BOUND_ROOT" "$BOUND_TAG" "$BOUND_SHA" "$BOUND_ROLE"
@@ -1015,6 +1115,7 @@ start_background_job() {
             "sudo journalctl -u $UNIT --no-pager -n 120" \
             75
     fi
+    bind_drift_confirmation_credential
     SYNCHRONOUS_STAGE_OWNED=0
     prepare_release_and_binding \
         "$explicit_root" "" "${SUDO_USER:-}" "$requested_role"
@@ -1046,6 +1147,7 @@ start_background_job() {
         --setenv="E3DC_BOOTSTRAP_USER=$BOUND_USER" \
         --setenv="E3DC_BOOTSTRAP_BOUND_ROLE=$BOUND_ROLE" \
         --setenv="E3DC_BOOTSTRAP_BOUND_PEER_IP=$BOUND_PEER_IP" \
+        --setenv="E3DC_UPDATE_CONFIRM_LOCAL_DRIFT=${E3DC_UPDATE_CONFIRM_LOCAL_DRIFT:-0}" \
         --setenv=SUDO_USER= \
         /bin/sh "$STAGE_DIR/release/e3dc-update-bootstrap" --systemd-worker 2>&1)
     launch_status=$?
@@ -1149,6 +1251,14 @@ start_background_job() {
             "$UNIT" \
             "sudo journalctl -u $UNIT --no-pager -n 120" \
             "$launch_failure_exit"
+    fi
+
+    if [ "${DRIFT_CREDENTIAL_OWNED:-0}" = "1" ]; then
+        # running ist erst sichtbar, nachdem der Worker seinen eigenen
+        # EXIT-/Signal-Cleanup installiert hat. Ab jetzt trägt er die
+        # Löschverantwortung für die Einmal-Credential.
+        DRIFT_CREDENTIAL_OWNED=0
+        trap - EXIT HUP INT TERM
     fi
 
     # Der Rück-ACK allein öffnet den Ziel-Updater noch nicht. Erst der vom
@@ -1323,11 +1433,19 @@ run_background_worker() {
         set +e
         status_before=$(read_runtime_value "$STATUS_FILE" 2>/dev/null || true)
         rm -f "$START_ACK_FILE" "$PID_FILE"
+        credential_cleanup_failed=0
+        if ! remove_drift_confirmation_credential_safely; then
+            printf '[FEHLER] Private Driftfreigabe konnte beim Worker-Abschluss nicht sicher gelöscht werden.\n' >&2
+            credential_cleanup_failed=1
+        fi
         case "${STAGE_DIR:-}" in
             /run/e3dc-update-bootstrap.*)
                 find "$STAGE_DIR" -depth -delete 2>/dev/null || true
                 ;;
         esac
+        if [ "$credential_cleanup_failed" -eq 1 ] && [ "$exit_code" -eq 0 ]; then
+            exit_code=126
+        fi
         if [ "$WORKER_START_ACKNOWLEDGED" -eq 1 ]; then
             write_runtime_value "$STATUS_FILE" "$exit_code"
         else
@@ -1431,11 +1549,54 @@ run_synchronous_update() {
                 "$START_LOCK_FILE" \
                 "sudo systemctl status --no-pager $UNIT"
     fi
+    bind_drift_confirmation_credential
     SYNCHRONOUS_STAGE_OWNED=1
     prepare_release_and_binding \
         "$explicit_root" "${E3DC_BOOTSTRAP_USER:-}" "${SUDO_USER:-}" "$requested_role"
     set +e
     run_bound_update
+    result=$?
+    set -e
+    credential_cleanup_failed=0
+    if [ "${DRIFT_CREDENTIAL_OWNED:-0}" = "1" ] \
+        && ! remove_drift_confirmation_credential_safely; then
+        printf '[FEHLER] Private Driftfreigabe konnte beim Bootstrap-Abschluss nicht sicher gelöscht werden.\n' >&2
+        credential_cleanup_failed=1
+    fi
+    find "$STAGE_DIR" -depth -delete 2>/dev/null || true
+    DRIFT_CREDENTIAL_OWNED=0
+    trap - EXIT HUP INT TERM
+    if [ "$credential_cleanup_failed" -eq 1 ] && [ "$result" -eq 0 ]; then
+        result=126
+    fi
+    return "$result"
+}
+
+run_readonly_drift_check() {
+    explicit_root=${1:-}
+    requested_role=${2:-auto}
+    [ "$#" -le 2 ] || fail "Driftprüfung akzeptiert nur Installationspfad und optionale Rolle"
+    update_job_running && fail_with_solution \
+        "E3DC-UPD-BUSY-001" \
+        "Ein Update-Systemjob läuft bereits." \
+        "Die Nur-Lese-Prüfung wurde nicht parallel gestartet; der vorhandene Updatejob arbeitet unverändert weiter." \
+        "$UNIT" \
+        "sudo systemctl status --no-pager $UNIT" \
+        75
+    BOUND_ENTRY_MODE=rescue
+    SYNCHRONOUS_STAGE_OWNED=1
+    prepare_release_and_binding \
+        "$explicit_root" "" "${SUDO_USER:-}" "$requested_role"
+    set +e
+    env -i \
+        PATH=/usr/bin:/bin \
+        HOME=/root \
+        LANG=C.UTF-8 \
+        LC_ALL=C.UTF-8 \
+        python3 -I -B "$RELEASE_DIR/Installer/update_drift.py" \
+        --target "$BOUND_ROOT" \
+        --release-root "$RELEASE_DIR" \
+        --json
     result=$?
     set -e
     find "$STAGE_DIR" -depth -delete 2>/dev/null || true
@@ -1454,6 +1615,18 @@ if [ "${1:-}" = "--systemd-worker" ]; then
         64
     run_background_worker
 else
+    drift_cli_mode=update
+    case "${1:-}" in
+        --check-local-drift-json)
+            drift_cli_mode=check
+            shift
+            ;;
+        --confirm-local-drift)
+            E3DC_UPDATE_CONFIRM_LOCAL_DRIFT=1
+            export E3DC_UPDATE_CONFIRM_LOCAL_DRIFT
+            shift
+            ;;
+    esac
     command -v id >/dev/null 2>&1 \
         || fail_with_solution \
             "E3DC-UPD-DEP-001" \
@@ -1462,8 +1635,27 @@ else
             "Systempaket coreutils" \
             "sudo apt-get install -y coreutils"
     [ "$(id -u)" -eq 0 ] || fail "Rettungsupdate bitte mit sudo starten"
+    case "${E3DC_UPDATE_CONFIRM_LOCAL_DRIFT:-0}" in
+        0|1) ;;
+        *) fail "Freigabe lokaler Inhaltsabweichungen besitzt einen ungültigen Wert" ;;
+    esac
+    if [ "${E3DC_UPDATE_CONFIRM_LOCAL_DRIFT:-0}" = "1" ] \
+        && [ "${E3DC_BOOTSTRAP_INLINE_WORKER:-0}" != "1" ]; then
+        IFS= read -r DRIFT_STDIN_TOKEN \
+            || fail "Dateilistenbindung der Driftfreigabe fehlt auf der Standardeingabe"
+        case "$DRIFT_STDIN_TOKEN" in
+            *[!0-9a-f]*) fail "Dateilistenbindung der Driftfreigabe ist ungültig" ;;
+        esac
+        [ "${#DRIFT_STDIN_TOKEN}" -eq 64 ] \
+            || fail "Dateilistenbindung der Driftfreigabe ist ungültig"
+        if IFS= read -r unexpected_drift_input; then
+            fail "Driftfreigabe enthält unerwartete zusätzliche Eingabe"
+        fi
+    fi
     require_commands
-    if [ "${E3DC_BOOTSTRAP_ENTRY_MODE:-}" != "regular" ] \
+    if [ "$drift_cli_mode" = "check" ]; then
+        run_readonly_drift_check "$@"
+    elif [ "${E3DC_BOOTSTRAP_ENTRY_MODE:-}" != "regular" ] \
         && [ "${E3DC_BOOTSTRAP_INLINE_WORKER:-}" != "1" ]; then
         start_background_job "$@"
     else

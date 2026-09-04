@@ -1,6 +1,6 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.4i
+Dokumentation Stand: 5.4.5
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
@@ -13,6 +13,21 @@ gemeinsamen systemd-Hintergrundauftrag. Nach diesem einmaligen Übergang starten
 Dashboard, Konsole und Installer-Menü denselben Dispatcher. Die automatische
 Updateprüfung verwendet dieselbe Stable-Quelle, informiert aber nur über einen
 neuen Stand.
+
+5.4.5 beendet die reguläre Worker-Bereinigung innerhalb des noch gültigen
+Funktionskontexts. Ein erfolgreiches Update wird daher nicht mehr von
+`worker_cleanup_started: unbound variable` überschrieben. Der bestehende
+EXIT-Trap bleibt für frühere Fehler und Signale zuständig. Das zusätzliche,
+rein lesende Frontendmodul der PV-Prognosediagnose gehört zum geprüften Web-
+und Rechteumfang des Ziel-Updaters.
+
+Die reine Rechtereparatur läuft in 5.4.5 getrennt vom Stable-Update: kein
+Vollbackup, kein Inhaltsaustausch und kein Neustart der Regelungsdienste.
+Inhaltlich lokal geänderte Produktdateien werden vor der Metadatenkorrektur
+einzeln zur Bestätigung angezeigt. Das Stable-Update vergleicht nur seine
+exakte Ziel- und Löschprojektion mit einem belegten veröffentlichten
+Ausgangsstand und wiederholt den fingerprintgebundenen Vergleich nach
+Writer-Ruhe unmittelbar vor dem Dateiaustausch.
 
 5.4.4i bindet die steuernden Dateitypprüfungen von Web-Launcher und
 Community-Bootstrap an die C-Locale. Auch der über `systemd-run` gestartete

@@ -1,11 +1,250 @@
-# E3DC-Control v5.4.4i
+# E3DC-Control v5.4.5
 
-Release-Stand: 2026-08-31.
+Release-Stand: 2026-09-04.
 
-E3DC-Control 5.4.4i ist ein Wartungsrelease für den lokalisierungsunabhängigen
-Updateeinstieg, den manuell erfassten Fahrzeug-SoC und eindeutige
-Wallbox-Ausgangsverträge. Nutzer-`Aus`, Hausanschluss-, Fahrzeug-, Netz-,
+E3DC-Control 5.4.5 bündelt die bereinigte zentrale Wallbox-Regelung, eine
+quellengebundene Leistungs- und Defizitführung, ehrliche Wallbox-Livewerte,
+die sichtbare rein lesende PV-Prognosediagnose und den korrigierten regulären
+Updateabschluss. Nutzer-`Aus`, Hausanschluss-, Fahrzeug-, Netz-, Speicher-,
 Geheimnis- und Hardwareschutzgrenzen bleiben wirksam.
+
+## Wallbox-Regelung mit einem Entscheider und einem Ausgang
+
+- Pro Ladepunkt bindet ein zentraler Vertrag die verfügbare Leistung an ihre
+  Quelle, den physischen Stromschritt, die belegten Fahrzeug- und
+  Infrastrukturgrenzen und den endgültigen Aktorauftrag. Treiber übersetzen
+  diesen Auftrag in RSCP, HTTP oder das jeweilige Geräteprotokoll; sie treffen
+  keine eigene Budget-, Preis- oder Ladeentscheidung.
+- Ein vollständig finanziertes höheres Stromziel wird nicht durch eine zweite
+  nachgelagerte 1-A-Rampe verzögert. Bei Unterdeckung bleibt die physische
+  Kaskade erhalten: zunächst Strom reduzieren, bei einer nachweislich
+  umschaltbaren Wallbox gegebenenfalls von drei auf eine Phase wechseln und
+  erst am einphasigen Mindeststrom stoppen.
+- Direkt kommandierbare Phasen, autonome Herstellerumschaltung, feste oder
+  unbekannte Topologie, Stromgrenzen und tatsächlicher Geräte-Readback bleiben
+  getrennte Belege. Aus einem unbekannten Wert entsteht weder eine erfundene
+  Fähigkeit noch zusätzliche Ladeleistung.
+- Die openWB-Pro-Phasensequenz bindet `0 A`, frischen Ruhenachweis,
+  Phasenziel, kurze Ziel-/Wiederanlaufwartezeit und erst danach erneute
+  Stromfreigabe an eine persistente Operation. Das Phasenziel übernimmt die
+  fahrzeugseitige Pause. CP-Wake-up bleibt ein getrenntes,
+  fahrzeugprofilgebundenes Startverfahren und ist standardmäßig aus. Die
+  480-Sekunden-Frist sperrt ausschließlich einen weiteren Phasenwechsel und
+  nicht die bestätigte laufende Ladung.
+- Frische native E3/DC-Wallboxwerte werden ausschließlich über im RSCP-Client
+  definierte Tags gelesen. Sie belegen Stecker und Status, die aktuelle
+  Phasenkonfiguration, typbestätigte Leistung sowie rohe Diagnosefelder. Aus
+  `NUMBER_PHASES` oder `PARAM_1` werden weder Umschaltfähigkeit noch
+  bestätigter Ladestrom erfunden. Diagnose- und Altpfade erhalten daraus keine
+  konkurrierende Schreibautorität.
+
+## Gemeinsamer Netz-Wh-Wächter und getrennte Energiequellen
+
+- Ein frischer Netzpunkt-Snapshot wird für alle Wallboxen genau einmal in das
+  gemeinsame Defizitkonto integriert. Echter Netzbezug hat Vorrang. Eine
+  gleichzeitig sichtbare Überschreitung des autorisierten Wallboxbudgets
+  bleibt dann Diagnose und wird nicht doppelt aufaddiert.
+- Ohne Netzbezug kann nur eine frische, zur aktuellen Wallboxsitzung gebundene
+  Budgetüberziehung zählen. Unvollständige oder veraltete Messwerte erzeugen
+  weder ein Defizit noch eine neue Aktorfreigabe.
+- `PV-Kurve ruhig` und `PV + Akku bis Untergrenze` behalten getrennte
+  Quellenrahmen. Batterieneutrale PV-Leistung darf keine Akkuentladung
+  freigeben; eine ausdrücklich erlaubte Akkuunterstützung endet an der
+  konfigurierten SoC- und den bestehenden Hardwaregrenzen.
+- Liegt der aktuelle Speicher-SoC unter dem wirksamen Kurvenziel, übernimmt
+  die normale Kurvenladung den Speicher wieder vom Pre-Dump. Eine bereits
+  abgelaufene Entladephase darf den folgenden PV-Ertrag nicht weiter für die
+  Akkuladung sperren.
+- Ist die zusätzliche Pre-Dump-Batterieunterstützung geschlossen oder
+  vorübergehend pausiert, bleibt frisch belegte batterieneutrale PV-Leistung
+  für die Wallbox verfügbar. Aus diesem PV-Anteil entsteht weder eine
+  Netzfreigabe noch eine Batterieentladefreigabe.
+- Physisch laufende flexible Verbraucher und ein real gebundener Startvorgang
+  bleiben geschützt. Ein bloßer Wärmepumpen-Startwunsch reserviert dagegen
+  keine dauerhafte Leistung. Hausverbrauch bleibt nicht verhandelbar.
+- Eine ausschließlich der Fahrzeugladung zugeordnete Batteriequelle kann
+  keinen neuen Wärmepumpen- oder Heizstabstart finanzieren. Bereits laufende
+  Lasten und ein zuvor vollständig gebundener Wärmepumpenstart werden dagegen
+  vor einer neuen Wallboxzuteilung innerhalb ihres belegten Rahmens erhalten.
+- JSON-Snapshots werden nach dem Lesen gegen dieselbe Dateigeneration
+  bestätigt. Ein Dateiaustausch während des Lesens oder ein Last-Good-Wert
+  kann nicht als neue Reglergeneration ausgegeben werden.
+
+## E3/DC-DC-Leistung kann eine alte Ladebegrenzung kontrolliert lösen
+
+- Bei offener Hausversorgung darf eine zuvor bestätigte niedrige
+  POWER_SETTINGS-Ladegrenze bis zur frisch belegten internen E3/DC-DC-Leistung
+  gelöst werden. Ein zusätzlicher AC-Wechselrichter erhöht diesen DC-first-
+  Rahmen nicht.
+- Die Freigabe benötigt gültige, frische Livewerte und einen kohärenten
+  Geräte-Readback. Netzbezug, stale Daten, widersprüchliche Rückmeldungen und
+  harte Speichergrenzen bleiben Sperren. Preis-, Direktvermarktungs- und
+  ausdrücklich freigegebene Netzladepfade bleiben getrennte Verträge.
+
+## Live-Anzeige folgt der Messung statt einem alten Leistungs-Hold
+
+- Eine positive Wallboxleistung stammt nur noch aus der frischen kanonischen
+  Messquelle. Stecker, Verriegelung, Sollstrom, einzelne Phasenwerte oder ein
+  alter Cache halten nach einem bestätigten Stopp keine frühere kW-Leistung
+  mehr sichtbar.
+- Stecker-, Lade-, Phasen-, Sollwert- und Leistungsaussagen bleiben getrennt.
+  Ein gültiger 0-W-Readback ist ein echter Messwert; ein fehlender oder
+  veralteter Wert bleibt als solcher erkennbar und wird nicht aus einem alten
+  Wert nachgebildet.
+- Nach dem Abstecken wird eine alte Start- oder Budgetprojektion nicht mehr als
+  aktuelle Ladefreigabe angezeigt. Steckzustand, tatsächlicher Aktorausgang und
+  reale Leistung haben Vorrang vor einem veralteten Sollwert.
+- WB1 und WB2 führen getrennte Sitzungs- und Tageszähler. Die Tagesstatistik
+  summiert beide Ladepunkte und bindet Mitternacht, Abstecken sowie einen
+  Zählerreset pro Wallbox, ohne eine laufende Sitzung doppelt anzurechnen.
+
+## PV-Prognosediagnose wird überall lesbar
+
+- Installationszentrale, Desktop- und Mobilansicht verwenden denselben
+  rein lesenden Renderer für die PV-Prognosediagnose. Verfügbar, deaktiviert
+  und noch ohne abgeschlossene Evidenz werden eindeutig unterschieden.
+- Die Diagnose vergleicht Prognose und abgeschlossene Historienbelege. Sie
+  verändert weder das Prognosemodell noch Speicher-, Wallbox- oder
+  Direktvermarktungsentscheidungen.
+- Quell- und minifizierte JavaScript-Datei sind Teil desselben geprüften
+  Update-, Rechte- und Cachevertrags.
+
+## SoC-Projektion bleibt an genau einen Speicherplan gebunden
+
+- Die Standard-SoC-Prognose verwendet ausschließlich die
+  `projection.soc_pct`-Werte des aktuellen kanonischen Plans und seiner
+  eindeutigen Slotachse. Ziel-, Unter-/Oberkurve und Zwischenanker werden
+  nicht als prognostizierter SoC ausgegeben.
+- Fehlen beim selben Plan SoC-Projektionswerte, bleiben die weiterhin
+  gültigen Zielhilfen sichtbar und nur die Prognoselinie wird als fehlend
+  gekennzeichnet. Bei einer neuen Planrevision wechselt das Frontend das
+  komplette Kurvenbündel atomar, ohne alte und neue Slots zu mischen.
+- Ein alter, vollständig plan- und slotgebundener Backendstand bleibt beim
+  Update oder Rückfall lesbar. Leere, boolesche, planfremde oder ungebundene
+  Werte werden dabei nicht als 0-Prozent-Prognose interpretiert.
+- Eine vom Simulator ausdrücklich gelieferte, von Mitternacht abweichende
+  Tagesgrenze behält ihr vollständiges folgendes lokales 24-Stunden-Fenster.
+  Dadurch verschwinden SoC- und Ertragswerte nicht mehr an einer verkürzten
+  Anzeigeachse.
+
+## Regelruhe und Messwertqualität werden getrennt bewertet
+
+- Ein Wechsel des internen Entscheidungswegs ist allein noch kein Takten.
+  Auch ein unterdrückter fachlicher Sollwertwechsel ist kein Geräteausgang.
+- Ein Speicherausgang zählt nur bei einem kohärenten bestätigten RSCP-Write
+  samt frischem POWER_SETTINGS-Readback oder bei einem eindeutig beibehaltenen
+  kanonischen Readback. Abweichende Soll-/Istwerte, unbestätigte oder partielle
+  Writes und alte History-Records bleiben `EVIDENCE_LIMIT`.
+- Eine Regelauffälligkeit setzt damit einen belegten Geräteausgangswechsel oder
+  einen Veto-/Pfadkonflikt voraus.
+- Ein einzelner kurzer Plausibilitäts-Guard wird als Datenqualitätshinweis
+  gezeigt. Erst wiederholte oder wirklich zusammenhängende Guards ergeben
+  einen Datenqualitätsbefund.
+- Fehlt in alten oder unvollständigen Records die typisierte Live- oder
+  Ausgangsevidenz, meldet die Diagnose `EVIDENCE_LIMIT` statt eines
+  unbelegten grünen Ergebnisses.
+- Der fachliche Wechsel einer Speicher-Ausführungsklasse wird sofort
+  protokolliert. Reine Sollwertänderungen innerhalb der vorhandenen
+  500-W-Deadband umgehen diese Schreibbegrenzung nicht; bestätigte reale
+  Ausgangswechsel bleiben davon unabhängig sichtbar.
+
+## Luxtronik zeigt Warmwasseranforderung und reale Laufstufen getrennt
+
+- Die rein lesende Betriebsprojektion unterscheidet Warmwasser angefordert,
+  bestätigte WW-Hydraulik, Verdichter gestartet, die tatsächlich gemessene
+  40-Hz-Zwischenstufe und das Erreichen der angeforderten Verdichter-Ziellast.
+- BUP oder eine nur im WW-Kontext gebundene ZUP belegen die Hydraulik, aber
+  niemals allein den Verdichter oder volle Leistung. Fehlende, veraltete oder
+  widersprüchliche Messwerte bleiben unbekannt.
+- Diese Anzeige ändert keine Luxtronik-Sollwerte, Wärmebudgets, Haltezeiten oder
+  sonstigen Hardwarebefehle.
+
+## Update-Worker räumt den regulären Abschluss im gültigen Scope auf
+
+- Der normale Erfolg- oder Fehlerabschluss ruft die Bereinigung auf, solange
+  die lokalen Worker-Variablen noch gebunden sind. Unter `set -u` folgt auf
+  ein erfolgreiches Update daher nicht mehr
+  `worker_cleanup_started: unbound variable`.
+- Frühere Fehler und Signale bleiben weiterhin dem bestehenden EXIT-Trap
+  zugeordnet. Backup, kontrollierte Unterbrechung, Rechte, Rückfall und
+  Wiederanlauf werden nicht gelockert.
+
+## Konfiguration und Systemreparatur bleiben verständlich und wiederholbar
+
+- Stable-Updater, Rechteprojektion und Web-Publisher binden den festen
+  Konfigurations-Lock gemeinsam an `www-data:www-data` und den Modus `0660`.
+  Der Lock bleibt dieselbe reguläre Einzeldatei; er wird für die Reparatur
+  weder gelöscht noch durch einen unsicheren Nebenpfad ersetzt.
+- Ein erster erfolgreicher Web-Speichervorgang ändert den Config-Owner nicht
+  mehr in eine Kombination, die den nächsten identischen Speichervorgang mit
+  `lock_metadata_invalid` blockiert. Das gilt unter anderem für Ankerkurve und
+  Heizstab-Automatik.
+- „Nur Rechte prüfen (keine Änderung)“ ist eindeutig read-only.
+  „System reparieren“ kündigt dagegen vorab an, dass der kanonische Systemjob
+  ein verifiziertes Backup erstellt, den vollständigen Stable-Stand abgleicht,
+  Rechte projiziert und Dienste neu startet. Deshalb kann auch dieselbe Version
+  erneut installiert werden.
+- Eine Abweichung der Wrapper-Quelldateien vom lokalen Checkout-HEAD bleibt in
+  der Konsolen-Rechteprüfung eine reine Diagnose. Lokales Git ist keine
+  Autorität für root-eigene Launcher oder `sudoers`. Diese privilegierten
+  Dateien werden nur in einer commitgebundenen Release-Transaktion ersetzt;
+  andernfalls nennt die Ausgabe Stable-Systemreparatur oder Bootstrap als
+  getrennten sicheren nächsten Schritt.
+- Während Apache für den kontrollierten Dateiaustausch neu startet, erscheint
+  einmalig ein verständlicher Betriebsstatus statt einer Reihe von
+  HTTP-502-Zählern. Nach zwei Minuten ohne erneute Verbindung bleibt der
+  Systemjob ausdrücklich unabhängig; die Anzeige behauptet weder Erfolg noch
+  Fehlschlag.
+- Für jeden neuen Systemjob veröffentlicht der root-eigene Dispatcher erst
+  nach vorbereitetem Protokoll und eindeutigem Startstatus eine zufällige
+  Laufkennung. Dashboard und Installationszentrale übernehmen einen
+  terminalen Erfolg oder Fehler nur für genau diesen gebundenen Lauf. Ein
+  Abschlussrest des vorherigen Updates kann damit nicht dem neuen Klick
+  zugerechnet werden. Wechselt die Kennung während einer Statusabfrage, wird
+  dieser gemischte Zwischenstand verworfen. Auch der erste Lauf ohne
+  vorhandene Ausgangskennung bleibt eindeutig zuordenbar. Jede Poll-Anfrage
+  besitzt außerdem ein festes Zeitlimit.
+- Die normale Rechteprüfung vergleicht den installierten Service-Launcher
+  nicht mit einer nutzerbeschreibbaren lokalen Quelldatei. Sie prüft rein
+  lesend dessen root-eigene Metadaten sowie die feste Aktions- und Dienstliste;
+  der bytegenaue Sollstand bleibt ausschließlich der commitgebundenen
+  Release-Transaktion vorbehalten.
+- Ein vor dem Schreiben abgebrochener Config- oder Heizstab-Speichervorgang
+  benennt den Fehlercode und bestätigt den unveränderten Bestand. Ein bereits
+  veröffentlichter, aber nicht vollständig rückbestätigter Zustand bleibt davon
+  weiterhin getrennt.
+- Heizstab-Manager, Heizstabseite und Konfigurationseditor werten
+  `hs_auto_mode` über denselben robusten Wahrheitswertvertrag aus. Damit
+  bleiben `1`, echte JSON-Wahrheitswerte und die unterstützten textuellen
+  Ein-/Aus-Formen kompatibel; ein ausdrücklich gespeichertes `false` bleibt
+  zuverlässig Nutzer-`Aus`.
+
+## Rechtereparatur, Inhaltsdrift und Notfall-Latch
+
+- Die Installationszentrale bietet wieder eine reine Rechtereparatur an. Sie
+  korrigiert ausschließlich Besitzer, Gruppe und Modus der im root-eigenen
+  Releasevertrag bekannten Pfade, erstellt kein Vollbackup, ersetzt keine
+  Inhalte und startet keine Dienste neu. Releasegleiche Einträge werden beim
+  ersten Auftrag sofort korrigiert; lokale Inhaltsabweichungen bleiben bis zur
+  Bestätigung unangetastet. Unbekannte Dateien bleiben unberührt.
+- Lokal veränderte veröffentlichte Dateien sowie kollidierende oder zur
+  Löschung freigegebene Altpfade werden verständlich und vollständig
+  aufgelistet. Die reine Rechtereparatur verwendet dafür ein fünf Minuten
+  gültiges, einmaliges stdin-Token mit Rechtevertrags-, Pfadlisten- und
+  Fingerprintbindung. Die Stable-Systemreparatur bindet unabhängig davon das
+  genaue Zielrelease, die genaue Pfadliste und deren Inhaltsfingerprints und
+  prüft denselben Bestand nach Writer-Ruhe unmittelbar vor dem Dateiaustausch
+  erneut. Jede Abweichung verlangt eine neue Freigabe.
+- Ein aktiver Storage-Emergency-Latch bleibt über Zielstart, fehlgeschlagenes
+  Update, automatischen Rückfall auf eine ältere Unit und Neustart wirksam.
+  Ein versionsunabhängiger root-eigener systemd-Startschutz verhindert den
+  Wiederanlauf des Storage Writers, bis der konkrete Incident kontrolliert
+  zurückgesetzt wurde. Ohne Latch startet der normale Dienstsatz unverändert.
+
+## Enthaltener Stand aus 5.4.4i und früher
+
+Die folgenden Korrekturen der vorherigen Stable-Stände bleiben vollständig
+enthalten.
 
 ## Updateeinstieg ist von der Systemsprache unabhängig
 

@@ -489,17 +489,11 @@ def predump_wallbox_floor_hold_decision(
     if not (canonical_wallbox_bound or previous_wallbox_bound):
         return None
 
-    request = str(wb_intent.get("battery_request", "") or "").strip().lower()
-    intent_reason = str(wb_intent.get("reason") or "").strip()
-    protected_wallbox_grid_charge = bool(
-        intent_fresh
-        and request == "hold_discharge"
-        and (
-            wb_intent.get("scheduled_slot_active")
-            or wb_intent.get("price_plan_storage_protect")
-            or intent_reason in ("slot_grid_storage_protection", "price_plan_storage_protection")
-        )
-    )
+    # Der strikte Modus-5-Vertrag wurde unmittelbar zuvor geprüft und hätte
+    # bereits einen eigenen no-stop-Speicherschutz zurückgegeben. Einzelne
+    # alte Flags oder ein Intent ohne gebundenen Zeitstempel dürfen diesen
+    # Schutzvertrag nicht synthetisch nachbauen.
+    protected_wallbox_grid_charge = False
     auto_limit: Dict[str, Any]
     house_wp_cap_w: Optional[int] = None
     reason = (

@@ -27,6 +27,10 @@ APACHE_SECURITY_REMOVED = "removed"
 APACHE_SECURITY_ABSENT = "absent"
 APACHE_SECURITY_RETAINED = "retained"
 APACHE_SECURITY_FAILED = "failed"
+EMERGENCY_START_VETO_REMOVED = "removed"
+EMERGENCY_START_VETO_ABSENT = "absent"
+EMERGENCY_START_VETO_RETAINED = "retained"
+EMERGENCY_START_VETO_FAILED = "failed"
 APACHE_PROTECTED_WEBROOT_PATHS = (
     "/var/www/html/data",
     "/var/www/html/logs",
@@ -371,6 +375,240 @@ def remove_manager_lock_boot_contract():
     return True
 
 
+def _managed_emergency_start_veto_file(
+    path,
+    expected_content,
+    expected_mode,
+    *,
+    expected_uid=0,
+    expected_gid=0,
+):
+    """Öffnet Parent und Artefakt nofollow bis zum gebundenen Unlink."""
+
+    parent_descriptor = None
+    descriptor = None
+    try:
+        parent_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        parent_descriptor = os.open(os.fspath(path.parent), parent_flags)
+        parent = os.fstat(parent_descriptor)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != expected_uid
+            or parent.st_gid != expected_gid
+            or parent.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise RuntimeError("Emergency-Artefakt-Parent ist nicht sicher gebunden")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+        except FileNotFoundError:
+            os.close(parent_descriptor)
+            return None
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != expected_uid
+            or before.st_gid != expected_gid
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != expected_mode
+            or before.st_size != len(expected_content)
+        ):
+            raise RuntimeError("Emergency-Artefakt besitzt unerwartete Metadaten")
+        content = os.read(descriptor, len(expected_content) + 1)
+        after = os.fstat(descriptor)
+        named_after = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if not (
+            content == expected_content
+            and (after.st_dev, after.st_ino)
+            == (named_after.st_dev, named_after.st_ino)
+            and (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_size,
+                before.st_mtime_ns,
+            )
+            == (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_size,
+                after.st_mtime_ns,
+            )
+        ):
+            raise RuntimeError("Emergency-Artefakt driftete beim Binden")
+        return {
+            "path": path,
+            "parent_descriptor": parent_descriptor,
+            "name": path.name,
+            "device": before.st_dev,
+            "inode": before.st_ino,
+        }
+    except Exception:
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+        raise
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def remove_inactive_emergency_start_veto(*, expected_uid=0, expected_gid=0):
+    """Entfernt den root-eigenen Startschutz nur ohne aktiven Incident.
+
+    Ein vorhandener Latch ist langlebiger Sicherheitszustand und bleibt samt
+    Generator und statischem Drop-in ausdrücklich bestehen. Ohne Latch darf
+    nach der Deinstallation dagegen kein privilegierter Produktaktor verwaisen.
+    """
+
+    from .emergency_release import (
+        PERSISTENT_EMERGENCY_DROPIN_PATH,
+        PERSISTENT_EMERGENCY_GENERATOR_PATH,
+        emergency_latch_present,
+        ensure_persistent_emergency_start_veto,
+        render_persistent_emergency_generator,
+        render_persistent_emergency_start_veto,
+    )
+
+    artifacts = (
+        (
+            PERSISTENT_EMERGENCY_DROPIN_PATH,
+            render_persistent_emergency_start_veto(),
+            0o644,
+        ),
+        (
+            PERSISTENT_EMERGENCY_GENERATOR_PATH,
+            render_persistent_emergency_generator(),
+            0o755,
+        ),
+    )
+
+    if emergency_latch_present():
+        try:
+            ensure_persistent_emergency_start_veto()
+        except Exception as exc:
+            log_warning(
+                "uninstall",
+                "Aktiver Emergency-Latch konnte nicht an seinen persistenten "
+                f"Startschutz gebunden werden: {exc}",
+            )
+            return EMERGENCY_START_VETO_FAILED
+        reloaded = run_command("sudo systemctl daemon-reload", timeout=30)
+        if not isinstance(reloaded, dict) or not reloaded.get("success"):
+            log_warning(
+                "uninstall",
+                "systemd konnte den beibehaltenen Emergency-Startschutz nicht neu laden.",
+            )
+            return EMERGENCY_START_VETO_FAILED
+        print(
+            "  ℹ Emergency-Latch ist aktiv: root-eigener Startschutz und "
+            "Generator bleiben absichtlich erhalten"
+        )
+        return EMERGENCY_START_VETO_RETAINED
+
+    bindings = []
+    try:
+        for path, expected_content, expected_mode in artifacts:
+            try:
+                binding = _managed_emergency_start_veto_file(
+                    path,
+                    expected_content,
+                    expected_mode,
+                    expected_uid=expected_uid,
+                    expected_gid=expected_gid,
+                )
+            except FileNotFoundError:
+                binding = None
+            if binding is not None:
+                bindings.append(binding)
+
+        if not bindings:
+            return EMERGENCY_START_VETO_ABSENT
+
+        # Unmittelbar vor dem gebundenen Unlink gewinnt ein neuer Incident.
+        if emergency_latch_present():
+            ensure_persistent_emergency_start_veto()
+            reloaded = run_command("sudo systemctl daemon-reload", timeout=30)
+            if not isinstance(reloaded, dict) or not reloaded.get("success"):
+                return EMERGENCY_START_VETO_FAILED
+            print(
+                "  ℹ Emergency-Latch entstand während der Vorprüfung; "
+                "Startschutz bleibt absichtlich erhalten"
+            )
+            return EMERGENCY_START_VETO_RETAINED
+
+        for binding in bindings:
+            current = os.stat(
+                binding["name"],
+                dir_fd=binding["parent_descriptor"],
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or current.st_nlink != 1
+                or (current.st_dev, current.st_ino)
+                != (binding["device"], binding["inode"])
+            ):
+                raise RuntimeError(
+                    f"Emergency-Artefakt driftete vor dem Entfernen: {binding['path']}"
+                )
+            os.unlink(
+                binding["name"],
+                dir_fd=binding["parent_descriptor"],
+            )
+
+        try:
+            PERSISTENT_EMERGENCY_DROPIN_PATH.parent.rmdir()
+        except OSError:
+            # Andere, separat verwaltete Drop-ins bleiben unangetastet.
+            pass
+
+        # Ein gleichzeitig neu entstandener Incident gewinnt immer: In diesem
+        # Fall werden beide Artefakte vor dem systemd-Reload wiederhergestellt.
+        if emergency_latch_present():
+            ensure_persistent_emergency_start_veto()
+            outcome = EMERGENCY_START_VETO_RETAINED
+        else:
+            outcome = EMERGENCY_START_VETO_REMOVED
+
+        reloaded = run_command("sudo systemctl daemon-reload", timeout=30)
+        if not isinstance(reloaded, dict) or not reloaded.get("success"):
+            raise RuntimeError(
+                "systemd-Reload nach der Emergency-Startschutz-Bereinigung fehlgeschlagen"
+            )
+        if outcome == EMERGENCY_START_VETO_REMOVED:
+            for path, _content, _mode in artifacts:
+                try:
+                    os.lstat(path)
+                except FileNotFoundError:
+                    continue
+                raise RuntimeError(f"Emergency-Artefakt blieb erhalten: {path}")
+            print("  ✓ Root-eigener Emergency-Startschutz entfernt")
+        else:
+            print(
+                "  ℹ Emergency-Latch entstand während der Deinstallation; "
+                "Startschutz bleibt absichtlich erhalten"
+            )
+        return outcome
+    except Exception as exc:
+        log_warning(
+            "uninstall",
+            f"Emergency-Startschutz konnte nicht sicher bereinigt werden: {exc}",
+        )
+        return EMERGENCY_START_VETO_FAILED
+    finally:
+        for binding in bindings:
+            os.close(binding["parent_descriptor"])
+
+
 def uninstall_watchdog():
     """Entfernt Watchdog (Service, Skripte, Cron)."""
     print("\n→ Entferne Watchdog (Piguard)…")
@@ -481,6 +719,8 @@ def uninstall_diagramm():
         ("/etc/sudoers.d/020_e3dc_services", "Sudoers (Service-Launcher)"),
         ("/usr/local/sbin/e3dc-service-control", "root-eigener Service-Launcher"),
         ("/usr/local/sbin/e3dc-web-update-launcher", "root-eigener Web-Update-Launcher"),
+        ("/usr/local/sbin/e3dc-runtime-permissions-repair", "root-eigener Rechte-Launcher"),
+        ("/etc/e3dc-control/runtime_permissions_contract.json", "root-eigener Rechtevertrag"),
     ]
     for path, label in managed_privilege_files:
         if os.path.lexists(path):
@@ -589,6 +829,9 @@ def uninstall_service():
     if not isinstance(reload_result, dict) or not reload_result.get("success"):
         log_warning("uninstall", "systemd-Reload nach Unit-Entfernung fehlgeschlagen.")
         return False
+    emergency_cleanup = remove_inactive_emergency_start_veto()
+    if emergency_cleanup == EMERGENCY_START_VETO_FAILED:
+        return False
     manager_lock_cleanup_ok = remove_manager_lock_boot_contract()
     if not manager_lock_cleanup_ok:
         return False
@@ -606,7 +849,10 @@ def uninstall_service():
     if remove_cron_pattern("E3DC.sh"):
         print("  ✓ Legacy Cronjob entfernt")
 
-    cleanup_ok = bool(manager_lock_cleanup_ok)
+    cleanup_ok = bool(
+        manager_lock_cleanup_ok
+        and emergency_cleanup != EMERGENCY_START_VETO_FAILED
+    )
     if cleanup_ok:
         uninstall_logger.info("E3DC und Zusatz-Services deinstalliert.")
         log_task_completed("Deinstallation (Services)")

@@ -26,7 +26,9 @@ $luxtronikEnabled = false; // Default aus
 $luxtronikIp = '0.0.0.0'; // Nicht konfiguriert; eine echte Adresse muss aus der Konfiguration kommen
 $wpEnabled = false; // Standardmaessig aus, analog zum C++ Kern
 $wpType = 0; // 0=Luxtronik, 1=IDM, 2=Shelly/Other
-$wbEnabled = true; // Standardmaessig an, falls nicht in config
+$wb1Enabled = true; // Kompatibilitätsfallback, bis die Konfiguration geladen ist
+$wb2Enabled = false;
+$wbEnabled = true; // Mindestens eine Wallbox vorhanden
 $hsEnabled = false; // Standardmaessig aus, bis IP gefunden wird
 $showPriceTrend = false; // Standardmaessig aus
 
@@ -74,8 +76,11 @@ if (!$showPriceTrend) {
     }
 }
 
-// Wallbox-Aktivierung aus V4 Config. Ein explizites "none" blendet die UI-Kacheln aus.
-$wbEnabled = hasAnyWallboxConfig($_c);
+// Wallbox-Aktivierung aus V4 Config. Die getrennten Flags verhindern, dass
+// Tageswerte beider Ladepunkte unter einer gemeinsamen Zeile verschwinden.
+$wb1Enabled = hasWallbox1Config($_c);
+$wb2Enabled = hasWallbox2Config($_c);
+$wbEnabled = $wb1Enabled || $wb2Enabled;
 
 if ($wpType === 2) {
     $hsEnabled = true;

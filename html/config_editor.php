@@ -1062,8 +1062,12 @@ function readConfig($file_path) {
                 if (is_array($val) || is_object($val)) {
                     continue;
                 }
-                // V4 Werte sind der Einfachheit halber nie auskommentiert
-                $config[strtolower($key)] = ['value' => (string)$val, 'commented' => false];
+                // V4 Werte sind der Einfachheit halber nie auskommentiert.
+                // Echte JSON-Booleans müssen als 1/0 erhalten bleiben: PHP
+                // wandelt false bei einem direkten String-Cast sonst in einen
+                // Leerwert und die Oberfläche würde fälschlich den Default zeigen.
+                $value = is_bool($val) ? ($val ? '1' : '0') : (string)$val;
+                $config[strtolower($key)] = ['value' => $value, 'commented' => false];
             }
             return $config;
         }
@@ -3339,6 +3343,14 @@ if ($configEditorRequestMethod === 'POST') {
             ) ?: '{}';
         } else {
             $failure_details = [];
+            $config_prewrite_failed = in_array($config_mutation_status, [
+                'identity_unavailable',
+                'lock_directory_invalid',
+                'lock_invalid',
+                'lock_open_failed',
+                'lock_metadata_invalid',
+                'lock_failed',
+            ], true);
             if ($config_load_failed) {
                 $failure_details[] = 'Die vorhandene e3dc_v4.json ist nicht lesbar oder enthält kein gültiges JSON.';
             }
@@ -3346,7 +3358,7 @@ if ($configEditorRequestMethod === 'POST') {
                 $failure_details = array_merge($failure_details, $guard_warnings);
             }
             if ($config_backup_failed) {
-                $failure_details[] = 'Die aktuelle Konfiguration konnte vor dem Speichern nicht gesichert werden. Bitte im Installationscenter „Rechte prüfen und reparieren“ ausführen.';
+                $failure_details[] = 'Die aktuelle Konfiguration konnte vor dem Speichern nicht gesichert werden. Bitte im Installationscenter zuerst „Nur Rechte prüfen“ und bei einem bestätigten Befund anschließend „System reparieren“ ausführen.';
             }
             if ($config_cache_invalidation_failed) {
                 $failure_details[] = !empty($mutation['rolled_back'])
@@ -3355,10 +3367,14 @@ if ($configEditorRequestMethod === 'POST') {
                         ? 'Die Konfiguration wurde veröffentlicht, ihr Cache-/Rückfallzustand konnte jedoch nicht sicher bestätigt werden.'
                         : 'Der Laufzeitcache konnte vor dem Speichern nicht sicher entfernt werden.');
             }
+            if ($config_prewrite_failed) {
+                $failure_details[] = 'Der Speichervorgang wurde vor dem Schreiben abgebrochen. Die bestehende Konfiguration blieb unverändert.';
+            }
             if (!$config_load_failed
                 && !$config_validation_failed
                 && !$config_backup_failed
-                && !$config_cache_invalidation_failed) {
+                && !$config_cache_invalidation_failed
+                && !$config_prewrite_failed) {
                 clearstatcache(true, $v4_config_file_path);
                 if (!is_writable($v4_config_file_path)) {
                     $perms = @file_exists($v4_config_file_path)
@@ -3371,7 +3387,7 @@ if ($configEditorRequestMethod === 'POST') {
             }
             $failure_details = array_values(array_unique(array_filter(array_map('strval', $failure_details))));
             if (!$config_load_failed && !$config_validation_failed && $config_mutation_status !== 'not_started') {
-                $failure_details[] = 'Fehlercode: ' . $config_mutation_status . '. Bitte im Installationscenter „Rechte prüfen und reparieren“ ausführen.';
+                $failure_details[] = 'Fehlercode: ' . $config_mutation_status . '. Bitte im Installationscenter zuerst „Nur Rechte prüfen“ und bei einem bestätigten Rechtefehler „System reparieren“ ausführen.';
             }
             $failure_details = array_values(array_unique(array_filter(array_map('strval', $failure_details))));
             $failure_html = $failure_details
@@ -5122,7 +5138,7 @@ async function readConfirmedConfigJson(response) {
             if ($title === "V4 Smart Home (Regelung & KI)"):
                 $isTrue = function($k) use ($config, $defaults) {
                     $v = $config[$k]['value'] ?? ($defaults[$k] ?? '0');
-                    return ($v === '1' || strtolower($v) === 'true');
+                    return cfgBool($v, false);
                 };
                 $val = function($k) use ($config, $defaults) {
                     // Gespeicherten Wert anzeigen, andernfalls den Standardwert, damit die Eingabe nie leer ist.
@@ -5543,8 +5559,8 @@ async function readConfirmedConfigJson(response) {
                                 <div class="col-6 col-md-4">
                                     <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['hs_auto_mode'] ?? '') ?>">PV-Auto-Modus</label>
                                     <select class="form-select config-input" name="values[hs_auto_mode]">
-                                        <option value="1" <?= ($val('hs_auto_mode') === '1' || $val('hs_auto_mode') === '') ? 'selected' : '' ?>>Aktiviert</option>
-                                        <option value="0" <?= ($val('hs_auto_mode') === '0') ? 'selected' : '' ?>>Manuell</option>
+                                        <option value="1" <?= $isTrue('hs_auto_mode') ? 'selected' : '' ?>>Aktiviert</option>
+                                        <option value="0" <?= !$isTrue('hs_auto_mode') ? 'selected' : '' ?>>Manuell</option>
                                     </select>
                                 </div>
                             <?php elseif ($wp_type_val === '3'): ?>
@@ -5680,8 +5696,8 @@ async function readConfirmedConfigJson(response) {
                                     <div class="col-6 col-md-2">
                                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['hs_auto_mode'] ?? '') ?>">PV-Auto</label>
                                         <select class="form-select config-input" name="values[hs_auto_mode]">
-                                            <option value="1" <?= ($val('hs_auto_mode') === '1' || $val('hs_auto_mode') === '') ? 'selected' : '' ?>>Aktiv</option>
-                                            <option value="0" <?= ($val('hs_auto_mode') === '0') ? 'selected' : '' ?>>Manuell</option>
+                                            <option value="1" <?= $isTrue('hs_auto_mode') ? 'selected' : '' ?>>Aktiv</option>
+                                            <option value="0" <?= !$isTrue('hs_auto_mode') ? 'selected' : '' ?>>Manuell</option>
                                         </select>
                                     </div>
                                 </div>

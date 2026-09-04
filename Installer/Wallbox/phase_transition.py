@@ -242,6 +242,23 @@ def begin_reservation(
     return deepcopy(reservation)
 
 
+_GRANT_RECOVERY_BLOCKERS = frozenset({
+    "lease_elapsed_output_bound",
+    "phase_transition_timebase_unbound",
+    "phase_transition_timebase_unbound_preoutput",
+})
+
+
+def grant_recovery_blocked(reservation):
+    """Ein alter Grant darf eine gebundene Recovery-Generation nie öffnen."""
+
+    item = reservation if isinstance(reservation, dict) else {}
+    return bool(
+        str(item.get("stage") or "") == "recovery_hold"
+        or str(item.get("blocker") or "") in _GRANT_RECOVERY_BLOCKERS
+    )
+
+
 def apply_grant(state, grant, *, now_ts=0.0, clock_sample=None):
     data = state if isinstance(state, dict) else {}
     current = data.get(STATE_KEY)
@@ -250,6 +267,12 @@ def apply_grant(state, grant, *, now_ts=0.0, clock_sample=None):
     if not reservation:
         return {}
     if str(answer.get("reservation_id") or "") != str(reservation.get("reservation_id") or ""):
+        return deepcopy(reservation)
+    if grant_recovery_blocked(reservation):
+        # Auch ein noch einmal projizierter, formal passender committed Grant
+        # gehört zur alten Generation. Nur der Recovery-Readback darf sie
+        # terminalisieren; ein Storage-Grant ist dafür keine Evidenz.
+        data[STATE_KEY] = reservation
         return deepcopy(reservation)
     requested = max(0, _int(reservation.get("requested_w"), 0))
     granted = max(0, _int(answer.get("granted_w"), 0))
@@ -326,6 +349,11 @@ def grant_is_sufficient(reservation):
     item = reservation if isinstance(reservation, dict) else {}
     return bool(
         item.get("active")
+        # Ein gebundener, aber zeitlich nicht mehr vertrauenswürdiger
+        # Hardwarevertrag darf seinen alten Watt-Grant nie erneut als
+        # Ausgangsfreigabe verwenden. Recovery besitzt die Generation, bis
+        # sie durch frischen Readback terminalisiert wurde.
+        and not grant_recovery_blocked(item)
         and max(0, _int(item.get("granted_w"), 0)) >= max(1, _int(item.get("requested_w"), 0))
         and str(item.get("grant_state") or "") in ("granted", "committed")
     )
@@ -661,14 +689,27 @@ def update_reservation(
         reservation["stable_since_ts"] = 0.0
         reservation.pop(STABLE_TIMEBASE_KEY, None)
 
-    if timebase_uncertain and output_bound:
-        reservation.update({
-            "active": True,
-            "stage": "recovery_hold",
-            "blocker": "phase_transition_timebase_unbound",
-        })
-        if _int(reservation.get("committed_w"), 0) > 0:
-            reservation["grant_state"] = "committed"
+    if timebase_uncertain:
+        if output_bound:
+            reservation.update({
+                "active": True,
+                "stage": "recovery_hold",
+                "blocker": "phase_transition_timebase_unbound",
+            })
+            if _int(reservation.get("committed_w"), 0) > 0:
+                reservation["grant_state"] = "committed"
+        else:
+            # Vor dem ersten Wire-Ausgang gibt es nichts physisch zu
+            # rekonstruieren. Der zeitlich ungebundene alte Grant wird deshalb
+            # ohne I/O terminalisiert; eine neue Generation braucht einen
+            # neuen Zyklus und einen neuen Grant.
+            reservation.update({
+                "active": False,
+                "stage": "expired",
+                "grant_state": "expired",
+                "granted_w": 0,
+                "blocker": "phase_transition_timebase_unbound_preoutput",
+            })
         data[STATE_KEY] = reservation
         return public_reservation(reservation, now)
     if lease_elapsed:
@@ -685,6 +726,7 @@ def update_reservation(
                 "active": False,
                 "stage": "expired",
                 "grant_state": "expired",
+                "granted_w": 0,
                 "blocker": "lease_expired",
             })
         data[STATE_KEY] = reservation
@@ -1342,7 +1384,7 @@ __all__ = [
     "ACTIVE_STAGES", "TERMINAL_STAGES", "STATE_KEY", "LEASE_TIMEBASE_KEY",
     "DISCONNECT_TIMEBASE_KEY", "STABLE_TIMEBASE_KEY", "aggregate_reservations",
     "apply_grant", "arbitrate_grants", "begin_reservation", "bind_wire_cooldown",
-    "grant_is_sufficient",
+    "grant_is_sufficient", "grant_recovery_blocked",
     "expiration_resolution_contract", "mark_committed", "planned_reservation_power_w", "public_reservation",
     "preoutput_supersession_evidence_contract", "preoutput_supersession_evidence_is_bound",
     "rehydrate_reservation", "reservation_lease_contract", "set_stage", "status_dimensions", "update_reservation",

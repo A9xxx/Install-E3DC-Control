@@ -229,7 +229,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand ist `v5.4.4i`.
+Der aktuelle Stable-Stand ist `v5.4.5`.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

@@ -190,6 +190,16 @@ APACHE_SECURITY_CONF_ENABLED = (
 ROOT_RECOVERY_FILE_CONTRACTS = (
     ("/usr/local/sbin/e3dc-service-control", 0o755, 64 * 1024),
     ("/usr/local/sbin/e3dc-web-update-launcher", 0o755, 64 * 1024),
+    (
+        "/usr/local/sbin/e3dc-runtime-permissions-repair",
+        0o755,
+        512 * 1024,
+    ),
+    (
+        "/etc/e3dc-control/runtime_permissions_contract.json",
+        0o644,
+        1024 * 1024,
+    ),
     ("/etc/sudoers.d/020_e3dc_services", 0o440, 256 * 1024),
     ("/etc/apache2/sites-available/000-default.conf", 0o644, 256 * 1024),
     (
@@ -6260,6 +6270,8 @@ REQUIRED_WEB_FILES = (
     "helpers.php",
     "retention.php",
     "get_shadow_snapshot.php",
+    "pv_forecast_diagnostics.js",
+    "pv_forecast_diagnostics.min.js",
     "solar.js",
     "solar.min.js",
 )

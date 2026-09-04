@@ -5,6 +5,7 @@ hardware APIs.  This module owns the shared charging policy: mode profile,
 grid permission, battery support and the allowed wallbox power budget.
 """
 
+import math
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
@@ -247,6 +248,8 @@ class EnergyPolicyInput:
     grid_import_w: float
     native_sun_capable: bool
     authorized_wallbox_budget_w: float = 32.0 * 230.0 * 3.0
+    consumer_budget_contract: Optional[Dict[str, Any]] = None
+    consumer_budget_identity_valid: bool = False
     direct_marketing_active: bool = False
     direct_marketing_policy_target_state: Optional[str] = None
     openwb_pro_curve_direct_start_min_w: float = 6.0 * 230.0
@@ -257,6 +260,125 @@ class EnergyPolicyInput:
     predump_discharge_add_w: Optional[float] = None
     predump_discharge_contract_valid: bool = True
     grid_funded_wallbox_authorized: bool = False
+
+
+def _identity_bound_wallbox_source_budget(
+    ctx: EnergyPolicyInput,
+    total_authorized_w: float,
+) -> Dict[str, Any]:
+    """Projiziert normale und Pre-Dump-Quelle aus einem Budget-Snapshot.
+
+    ``authorized_wallbox_budget_w`` ist bereits der absolute Commandrahmen und
+    enthält gegebenenfalls auch den Pre-Dump-Anteil. Deshalb darf der
+    Pre-Dump-Zusatz niemals erneut auf diesen Gesamtwert addiert werden. Nur der
+    identity-validierte, verschachtelte Consumervertrag darf die zwei
+    Quellenkomponenten belegen.
+    """
+
+    result = {
+        "valid": False,
+        "normal_support_w": 0.0,
+        "predump_add_w": 0.0,
+        "predump_contract_valid": False,
+        "reason": "consumer_budget_identity_invalid",
+    }
+    if getattr(ctx, "consumer_budget_identity_valid", False) is not True:
+        return result
+
+    contract = getattr(ctx, "consumer_budget_contract", None)
+    if not isinstance(contract, dict):
+        result["reason"] = "consumer_budget_contract_missing"
+        return result
+    if contract.get("schema_version") != "flexible_consumer_budget_contract_v1":
+        result["reason"] = "consumer_budget_contract_schema_invalid"
+        return result
+
+    command_allocations = contract.get("command_allocations")
+    command_wallbox_w = (
+        command_allocations.get("wallbox")
+        if isinstance(command_allocations, dict)
+        else None
+    )
+    if (
+        isinstance(command_wallbox_w, bool)
+        or not isinstance(command_wallbox_w, int)
+        or command_wallbox_w < 0
+        or abs(float(command_wallbox_w) - float(total_authorized_w)) > 0.001
+    ):
+        result["reason"] = "consumer_budget_wallbox_projection_mismatch"
+        return result
+
+    normal_values = []
+    for key in (
+        "wallbox_exclusive_start_support_w",
+        "wallbox_running_hold_support_w",
+    ):
+        value = contract.get(key, 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            result["reason"] = key + "_invalid"
+            return result
+        normal_values.append(value)
+
+    total_w = max(0.0, float(total_authorized_w))
+    result.update({
+        "valid": True,
+        "normal_support_w": min(total_w, float(max(normal_values))),
+        "reason": "consumer_budget_sources_valid",
+    })
+
+    predump = contract.get("predump_discharge_add_contract")
+    if not isinstance(predump, dict) or predump.get("valid") is not True:
+        return result
+    allocations = predump.get("allocations_w")
+    requests = predump.get("requests_w")
+    eligible = predump.get("eligible")
+    if not all(isinstance(value, dict) for value in (allocations, requests, eligible)):
+        result["reason"] = "predump_source_maps_invalid"
+        return result
+    consumers = ("heatpump", "wallbox", "heater")
+    allocation_values = []
+    for consumer in consumers:
+        allocation = allocations.get(consumer)
+        request = requests.get(consumer)
+        if (
+            isinstance(allocation, bool)
+            or not isinstance(allocation, int)
+            or allocation < 0
+            or isinstance(request, bool)
+            or not isinstance(request, int)
+            or request < allocation
+            or not isinstance(eligible.get(consumer), bool)
+            or (allocation > 0 and eligible.get(consumer) is not True)
+        ):
+            result["reason"] = "predump_source_allocation_invalid"
+            return result
+        allocation_values.append(allocation)
+
+    allocation_sum = sum(allocation_values)
+    pool_w = predump.get("available_discharge_pool_w")
+    if (
+        predump.get("schema_version") != "predump_discharge_add_contract_v1"
+        or predump.get("owner") != "storage_manager"
+        or predump.get("effect") != "additional_battery_discharge_only"
+        or predump.get("authorization_status") != "authorized"
+        or predump.get("no_grid") is not True
+        or predump.get("grid_fallback") is not False
+        or predump.get("invariant_conserved") is not True
+        or isinstance(pool_w, bool)
+        or not isinstance(pool_w, int)
+        or pool_w < allocation_sum
+        or predump.get("allocation_sum_w") != allocation_sum
+        or allocations.get("wallbox", 0) > command_wallbox_w
+    ):
+        result["reason"] = "predump_source_contract_invalid"
+        return result
+
+    result.update({
+        "predump_add_w": float(allocations.get("wallbox", 0)),
+        "predump_contract_valid": True,
+        "reason": "consumer_budget_sources_valid",
+    })
+    return result
 
 
 
@@ -297,6 +419,134 @@ def peak_shaving_wallbox_power_cap(
     return result
 
 
+def build_group_source_envelope(
+    *,
+    pv_only_cap_w: Any,
+    storage_cap_w: Optional[Any] = None,
+    allowed_w: Optional[Any] = None,
+    data_fresh: bool,
+    safety_binding_valid: bool,
+    binding_key: Any,
+    grid_cap_w: Optional[Any] = None,
+    grid_authorized: bool = False,
+) -> Dict[str, Any]:
+    """Versiegelt bereits berechnete Gruppen-Quellendeckel fail-closed.
+
+    Die Funktion bewertet keine PV-, Speicher- oder Netzleistung neu. Sie
+    nimmt ausschließlich zuvor berechnete und bereits sicherheitsbegrenzte
+    Kandidaten entgegen. ``storage_cap_w`` und ``allowed_w`` sind zwei Namen
+    für die inklusive Speicherhülle; wenn beide belegt sind, gilt der kleinere
+    Wert. Eine Netzstufe kann diesen Deckel nur mit einer expliziten
+    Autorisierung *und* einem eigenen, bereits sicherheitsbegrenzten Deckel
+    erweitern.
+
+    Die drei Ausgänge sind inklusive Hüllen und deshalb immer monoton:
+    ``PV <= Speicher <= Netz``. Widersprüchliche Eingänge werden nur nach
+    unten geschnitten; die Funktion erhöht keinen der gelieferten Kandidaten.
+    Fehlende Frische, Safety-Bindung oder numerische Evidenz setzt alle
+    Ausgänge auf 0 W.
+    """
+
+    binding = str(binding_key or "").strip()
+    grid_permission = grid_authorized is True
+    result: Dict[str, Any] = {
+        "contract": "wallbox_group_source_envelope_v1",
+        "valid": False,
+        "reason": "unbound",
+        "binding_key": binding,
+        "data_fresh": data_fresh is True,
+        "safety_binding_valid": safety_binding_valid is True,
+        "grid_authorized": grid_permission,
+        "pv_total_cap_w": 0.0,
+        "storage_total_cap_w": 0.0,
+        "grid_total_cap_w": 0.0,
+        "storage_increment_cap_w": 0.0,
+        "grid_increment_cap_w": 0.0,
+        "storage_input_cap_w": 0.0,
+    }
+
+    if data_fresh is not True:
+        result["reason"] = "stale_source_caps"
+        return result
+    if safety_binding_valid is not True:
+        result["reason"] = "invalid_safety_binding"
+        return result
+    if not binding or len(binding) > 256:
+        result["reason"] = "missing_or_invalid_binding_key"
+        return result
+
+    def _strict_cap(value: Any) -> Optional[float]:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            cap = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(cap) or cap < 0.0:
+            return None
+        return cap
+
+    pv_candidate = _strict_cap(pv_only_cap_w)
+    storage_candidates = []
+    if storage_cap_w is not None:
+        parsed_storage_cap = _strict_cap(storage_cap_w)
+        if parsed_storage_cap is None:
+            result["reason"] = "invalid_cap_value"
+            return result
+        storage_candidates.append(parsed_storage_cap)
+    if allowed_w is not None:
+        parsed_allowed_w = _strict_cap(allowed_w)
+        if parsed_allowed_w is None:
+            result["reason"] = "invalid_cap_value"
+            return result
+        storage_candidates.append(parsed_allowed_w)
+    if not storage_candidates:
+        result["reason"] = "storage_cap_missing"
+        return result
+    storage_candidate = min(storage_candidates)
+    grid_candidate = (
+        _strict_cap(grid_cap_w) if grid_cap_w is not None else None
+    )
+    if (
+        pv_candidate is None
+        or (grid_cap_w is not None and grid_candidate is None)
+    ):
+        result["reason"] = "invalid_cap_value"
+        return result
+    if grid_permission and grid_candidate is None:
+        result["reason"] = "authorized_grid_cap_missing"
+        return result
+
+    # Ohne explizite Netzfreigabe endet die oberste Hülle exakt an der
+    # Speicherhülle. Ein eventuell mitgelieferter Netzdeckel bleibt rein
+    # diagnostisch und kann keine Leistung freigeben.
+    if grid_permission:
+        grid_total = grid_candidate
+        storage_total = min(storage_candidate, grid_total)
+        reason = "bound_grid_envelope"
+    else:
+        storage_total = storage_candidate
+        grid_total = storage_total
+        reason = (
+            "grid_cap_ignored_without_authority"
+            if grid_cap_w is not None
+            else "bound_storage_envelope_only"
+        )
+    pv_total = min(pv_candidate, storage_total)
+
+    result.update({
+        "valid": True,
+        "reason": reason,
+        "pv_total_cap_w": float(pv_total),
+        "storage_total_cap_w": float(storage_total),
+        "grid_total_cap_w": float(grid_total),
+        "storage_increment_cap_w": float(storage_total - pv_total),
+        "grid_increment_cap_w": float(grid_total - storage_total),
+        "storage_input_cap_w": float(storage_candidate),
+    })
+    return result
+
+
 def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
     """Compute the shared wallbox power decision before driver execution."""
 
@@ -323,6 +573,18 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
             getattr(ctx, "authorized_wallbox_budget_w", 32.0 * 230.0 * 3.0),
             32.0 * 230.0 * 3.0,
         ),
+    )
+    source_budget_contract = _identity_bound_wallbox_source_budget(
+        ctx,
+        storage_auth_budget,
+    )
+    normal_wallbox_support_w = max(
+        0.0,
+        _safe_float(source_budget_contract.get("normal_support_w"), 0.0),
+    )
+    predump_discharge_add_w = max(
+        0.0,
+        _safe_float(source_budget_contract.get("predump_add_w"), 0.0),
     )
     display_wb_budget_curve_w = max(0.0, free_w * fz)
 
@@ -459,23 +721,23 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
             allowed_w = max(0.0, phys_surplus + wb_actual)
 
 
+    # Pre-Dump ist eine additive Quelle. Wenn sein eigener Floor oder Gate die
+    # Zusatzentladung schließt, darf das weder ein unabhängig freigegebenes
+    # PV-/wbminSoC-Budget verkleinern noch eine laufende Ladung stoppen.
     if mode != 0 and ctx.predump_wallbox_active:
         pv_only_w = max(0.0, _safe_float(ctx.pv_only_allowed_w, 0.0))
-        raw_predump_add = getattr(ctx, "predump_discharge_add_w", None)
-        if raw_predump_add is None:
-            predump_add_w = (
-                min(free_w, storage_auth_budget) if free_w > 0.0 else 0.0
+        if (
+            ctx.predump_wallbox_gate_open
+            and source_budget_contract.get("predump_contract_valid") is True
+            and predump_discharge_add_w > 0.0
+        ):
+            allowed_w = max(
+                allowed_w,
+                min(
+                    storage_auth_budget,
+                    pv_only_w + predump_discharge_add_w,
+                ),
             )
-        else:
-            predump_add_w = max(0.0, _safe_float(raw_predump_add, 0.0))
-        if ctx.predump_wallbox_gate_open and predump_add_w > 0.0:
-            allowed_w = max(allowed_w, max(pv_only_w, wb_actual) + predump_add_w)
-        elif pv_only_w > 0.0:
-            allowed_w = max(allowed_w, pv_only_w)
-        elif not ctx.predump_wallbox_gate_open:
-            allowed_w = pv_only_w
-        elif raw_predump_add is not None and predump_add_w == 0.0 and pv_only_w == 0.0:
-            allowed_w = 0.0
 
 
 
@@ -792,18 +1054,6 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
             ),
         )
 
-    if (
-        ctx.predump_wallbox_floor_block
-        and not (
-            ctx.price_boost_wallbox_active
-            or ctx.price_optimizing_active
-            or ctx.effective_allow_grid
-        )
-    ):
-        allowed_w = min(allowed_w, max(0.0, _safe_float(ctx.pv_surplus_ex_wb_w, 0.0)))
-        if allowed_w < 6.0 * 230.0 * phases:
-            allowed_w = 0.0
-
     # Nutzer-Aus ist unabhängig von Preis-, Plan- oder Flexbudgetsignalen eine
     # harte Endentscheidung und wird vor allen Ausgangsdeckeln erneut gebunden.
     if mode == MODE_OFF or ctx.effective_public_wb_mode == MODE_OFF:
@@ -852,21 +1102,13 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
             curve_pv_allowed_w,
             max(0.0, float(openwb_pro_curve_direct_real_pv_w)),
         )
-    raw_predump_add = getattr(ctx, "predump_discharge_add_w", None)
-    if raw_predump_add is None:
-        predump_discharge_add_w = (
-            min(free_w, storage_auth_budget) if free_w > 0.0 else 0.0
-        )
-    else:
-        predump_discharge_add_w = max(0.0, _safe_float(raw_predump_add, 0.0))
-
     predump_active = bool(getattr(ctx, "predump_wallbox_active", False))
     predump_gate_open = bool(getattr(ctx, "predump_wallbox_gate_open", False))
     predump_contract_valid = bool(
         predump_active
         and predump_gate_open
         and predump_discharge_add_w > 0.0
-        and getattr(ctx, "predump_discharge_contract_valid", True)
+        and source_budget_contract.get("predump_contract_valid") is True
     )
 
     if mode == MODE_OFF or ctx.effective_public_wb_mode == MODE_OFF:
@@ -877,12 +1119,25 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
         final_allowed = pre_auth_cap
 
     elif predump_active:
+        # Der normale, vom Storage Manager versiegelte Wallboxrahmen bleibt
+        # auch während eines Pre-Dump-Kandidaten gültig. Der typisierte
+        # Pre-Dump-Vertrag darf ausschließlich zusätzliche Batterieentladung
+        # autorisieren; ein geschlossenes/abgelaufenes Gate kann deshalb nie
+        # PV-, wbminSoC- oder Startbudget auf einen kleineren Wert schneiden.
+        predump_base_auth_w = min(
+            storage_auth_budget,
+            max(curve_pv_allowed_w, normal_wallbox_support_w),
+        )
         if predump_contract_valid:
-            effective_auth_w = max(curve_pv_allowed_w, wb_actual) + predump_discharge_add_w
-        elif predump_gate_open and raw_predump_add is None and storage_auth_budget > curve_pv_allowed_w:
-            effective_auth_w = max(curve_pv_allowed_w, storage_auth_budget)
+            effective_auth_w = min(
+                storage_auth_budget,
+                max(
+                    predump_base_auth_w,
+                    curve_pv_allowed_w + predump_discharge_add_w,
+                ),
+            )
         else:
-            effective_auth_w = curve_pv_allowed_w
+            effective_auth_w = predump_base_auth_w
         final_allowed = min(pre_auth_cap, effective_auth_w)
 
     elif openwb_pro_curve_direct_active:
@@ -918,6 +1173,12 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
         "authorized_wallbox_budget_w": storage_auth_budget,
         "effective_authorized_wallbox_budget_w": effective_auth_w,
         "storage_authorized_wallbox_budget_w": storage_auth_budget,
+        "normal_wallbox_support_w": normal_wallbox_support_w,
+        "predump_discharge_add_w": predump_discharge_add_w,
+        "predump_discharge_contract_valid": bool(predump_contract_valid),
+        "wallbox_source_budget_contract_reason": str(
+            source_budget_contract.get("reason") or ""
+        ),
         "openwb_pro_curve_direct_pv_authority_w": max(
             0.0,
             float(openwb_pro_curve_direct_pv_authority_w),

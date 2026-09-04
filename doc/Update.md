@@ -5,11 +5,17 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.4.4i`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.4.5`. Das Dashboard startet ausschließlich
 den argumentlosen, root-eigenen Systemjob. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
+
+5.4.5 führt die reguläre Worker-Bereinigung noch innerhalb des aktiven
+Funktionskontexts aus. Dadurch bleibt der erfolgreiche Abschluss unter
+`set -u` frei von der nachgelagerten Meldung
+`worker_cleanup_started: unbound variable`; frühe Fehler und Signale werden
+weiterhin vom bestehenden EXIT-Trap behandelt.
 
 5.4.4i setzt im Web-Launcher und im Community-Bootstrap vor allen steuernden
 Dateitypprüfungen eine feste C-Locale. Der über `systemd-run` gestartete Worker
@@ -40,12 +46,19 @@ gelöscht und eindeutig benannt.
 
 Der bevorzugte Weg ist der Update-Button der Weboberfläche. Weboberfläche,
 Installer-Menü und Konsole starten denselben root-eigenen Hintergrundauftrag.
-Der lokale Git-, Rechte- oder Änderungszustand entscheidet nicht darüber, ob
-dieser Auftrag angenommen wird. Der Ziel-Updater erstellt das Vollbackup,
-sichert nach dem kurzen Dienststopp die nun ruhenden veränderlichen Daten nach,
-tauscht Dateien, Rechte, Core-Units und Launcher aus und startet die benötigten
-Dienste neu. Die unterschiedlichen Web-Launcher aus 5.4.4a, 5.4.4b und 5.4.4c
-werden direkt unterstützt: Fehlen spätere Übergabeparameter, lädt der
+Der lokale Git-Stand ist keine Updateautorität. Vor Backup oder Dienststopp
+vergleicht der Updater jedoch die tatsächlich betriebenen Produktdateien mit
+einem belegten veröffentlichten Ausgangsstand und dem Zielrelease. Bereits
+zielgleiche oder unveränderte Dateien laufen ohne Rückfrage weiter. Nur die
+exakt benannten inhaltlichen Abweichungen benötigen eine bewusste Bestätigung;
+ist kein verlässlicher Ausgangsstand belegbar, wird das ebenso klar benannt.
+Unmittelbar vor dem Dateiaustausch erfolgt nach Writer-Ruhe derselbe Vergleich
+erneut. Eine zwischenzeitlich veränderte Datei stoppt, statt still überschrieben
+zu werden. Erst danach erstellt beziehungsweise verwendet der Ziel-Updater das
+Vollbackup, sichert nach dem kurzen Dienststopp die nun ruhenden veränderlichen
+Daten nach, tauscht Dateien, Rechte, Core-Units und Launcher aus und startet die
+benötigten Dienste neu. Die unterschiedlichen Web-Launcher aus 5.4.4a, 5.4.4b
+und 5.4.4c werden direkt unterstützt: Fehlen spätere Übergabeparameter, lädt der
 commitgebundene Ziel-Bootstrap den vollständigen Releasebaum selbst und prüft
 Tag und Commit erneut.
 
@@ -109,6 +122,23 @@ Updateautorität und muss sie für den Releasewechsel nicht neu aufbauen.
 Gesichert werden die tatsächlich betriebenen Produkt-, Konfigurations- und
 Betriebsdateien, nicht ein möglicherweise beschädigter Git-Zwischenspeicher.
 
+Die Driftprüfung umfasst exakt die im Zielrelease ersetzten Produktdateien und
+die veröffentlichte Löschliste. Eine bereits fehlende Altdatei ist kein Drift;
+unbekannte Dateien außerhalb dieser Projektion bleiben unangetastet. Die
+Bestätigung ist an Zielrelease, Ausgangsstand, konkrete Dateiliste und deren
+Fingerabdrücke gebunden. Sie wird dem root-eigenen Auftrag einmalig über eine
+geschützte Laufzeitdatei übergeben, nicht über Argumente, Umgebung oder Log.
+Nach Writer-Ruhe wird die Liste unmittelbar vor dem Austausch nochmals
+inhaltlich geprüft. Neue oder geänderte Abweichungen erfordern eine neue
+Bestätigung.
+
+`UPDATE_POLICY.json` behält für ältere Leser die Strategie
+`local_product_changes: replace_after_backup`. Die ergänzenden Felder
+`local_product_change_preflight` und `local_product_change_confirmation`
+beschreiben den davor liegenden, rein lesenden und tokengebundenen
+Driftvertrag ausdrücklich. Ohne dessen grünes Ergebnis beginnt weder das
+Vollbackup noch der Dateiaustausch.
+
 Der Ziel-Updater erstellt zuerst das Vollbackup bei laufenden Diensten. Danach
 stoppt er die betroffenen Dienste genau einmal kurz, sichert die ruhenden
 veränderlichen Daten nach, projiziert Release-Dateien, Rechte, Core-Units und
@@ -117,6 +147,32 @@ Produktdateien sind zu reparierender Altbestand und kein eigener Abbruchgrund.
 Eine mehrdeutige laufende Installation, ein fehlgeschlagenes Backup, ein nicht
 verfügbarer Release, fehlende Root- oder Schreibrechte und ein nicht startender
 Pflichtdienst bleiben klare Stopps mit konkreter Lösungsausgabe.
+
+### Reine Rechtereparatur ohne Releasewechsel
+
+„Rechte prüfen und reparieren“ ist ein eigener, eng begrenzter Auftrag. Er
+erstellt kein Vollbackup, installiert kein Release und startet keine
+Regelungsdienste neu. Unveränderte veröffentlichte Produktdateien werden sofort
+auf ihren vorgesehenen Besitzer und Modus gebracht. Lokal inhaltlich geänderte
+Produktdateien bleiben im ersten Lauf unangetastet und werden vollständig
+aufgelistet. Die Bestätigung ist fünf Minuten gültig, einmalig und an den
+root-eigenen Rechtevertrag, die exakte Pfadliste sowie alle relevanten
+Datei-Fingerprints gebunden. Das Token wird ausschließlich über stdin an den
+festen Bestätigungsmodus übergeben. Erst danach werden ausschließlich die
+Metadaten dieser bestätigten Dateien repariert; ihr Inhalt bleibt unverändert.
+Laufzeit-, Daten- und Ramdisk-Pfade folgen weiterhin ihren eigenen
+Rechteverträgen.
+
+### Aktiver Storage-Notfall-Latch
+
+Ein aktiver Storage-Notfall-Latch ist monoton: Update, Rückfall und
+Deinstallation dürfen den gestoppten Speicher-Writer nicht versehentlich wieder
+starten. Ein root-eigener systemd-Startschutz außerhalb des Releasebaums bindet
+dieses Veto auch für einen älteren Rückfallstand. Der Ziel- beziehungsweise
+Rückfalldienstsatz wird unter aktivem Latch ohne Storage Manager geprüft; alle
+anderen Pflichtdienste bleiben erforderlich. Die Schutzartefakte werden erst
+nach einem bewusst bestätigten Latch-Reset und einem erneuten kontrollierten
+Bereinigungslauf entfernt.
 
 Ein vorhandener Altregler wird vor dem Dateiaustausch nur gestoppt. Erst nach
 dem bestätigten Start des neuen, zur Anlagenrolle passenden Dienstsatzes wird

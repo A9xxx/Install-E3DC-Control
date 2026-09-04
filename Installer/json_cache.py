@@ -49,7 +49,10 @@ def read_json_cached(
                 loaded = json.load(handle)
             if not isinstance(loaded, dict):
                 raise ValueError("JSON-Wurzel ist kein Objekt")
-            source_mtime = os.path.getmtime(path)
+            confirmed_signature = file_signature(path)
+            if confirmed_signature != signature:
+                raise RuntimeError("Datei wurde während des Lesens ersetzt")
+            source_mtime = float(signature[0]) / 1_000_000_000.0
             data = loaded
             valid = True
             last_good = False
@@ -83,6 +86,32 @@ def read_json_cached(
         "from_cache": from_cache,
         "source_ts": source_mtime or None,
         "source_age_s": round(age_s, 3) if age_s is not None else None,
+        # Die Signatur gehört exakt zu den erfolgreich gelesenen Bytes. Bei
+        # Last-Good oder einem Austausch während des Lesens bleibt sie leer;
+        # ein Regler darf dann keine Snapshotgeneration daraus ableiten.
+        "source_signature": (
+            tuple(int(value) for value in signature)
+            if valid and not last_good and signature is not None
+            else None
+        ),
+        "source_file_revision_ns": (
+            int(signature[0])
+            if valid and not last_good and signature is not None
+            else None
+        ),
+        "source_file_size": (
+            int(signature[1])
+            if valid and not last_good and signature is not None
+            else None
+        ),
+        "source_file_inode": (
+            int(signature[2])
+            if valid and not last_good and signature is not None
+            else None
+        ),
+        "source_signature_confirmed": bool(
+            valid and not last_good and signature is not None
+        ),
         "error": error,
     }
     if with_meta:

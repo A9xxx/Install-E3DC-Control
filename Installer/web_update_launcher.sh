@@ -18,6 +18,7 @@ export LC_ALL=C
 readonly INSTALL_ROOT=@E3DC_INSTALL_ROOT@
 readonly INSTALL_USER=@E3DC_INSTALL_USER@
 readonly DISPATCHER_CONTRACT="e3dc-download-bootstrap-v2"
+readonly UPDATE_DRIFT_FEATURE="e3dc-update-drift-confirm-v1"
 readonly LAUNCHER="/usr/local/sbin/e3dc-web-update-launcher"
 readonly UNIT="e3dc-web-update.service"
 readonly RUNTIME_DIR="/run/e3dc-web-update"
@@ -25,9 +26,12 @@ readonly LOG_DIR="/var/log/e3dc-control"
 readonly LOG_FILE="${LOG_DIR}/web-update.log"
 readonly PID_FILE="${RUNTIME_DIR}/pid"
 readonly STATUS_FILE="${RUNTIME_DIR}/status"
+readonly RUN_ID_FILE="${RUNTIME_DIR}/run.id"
 readonly LOCK_FILE="${RUNTIME_DIR}/lock"
 readonly START_LOCK_FILE="${RUNTIME_DIR}/start.lock"
 readonly START_ACK_FILE="${RUNTIME_DIR}/start.ack"
+readonly CREDENTIAL_DIR="/run/e3dc-update-credentials"
+readonly DRIFT_CONFIRM_FILE="${CREDENTIAL_DIR}/local-drift.token"
 readonly REPOSITORY_URL="https://github.com/A9xxx/Install-E3DC-Control"
 readonly GIT_URL="${REPOSITORY_URL}.git"
 readonly LATEST_URL="${REPOSITORY_URL}/releases/latest"
@@ -124,17 +128,20 @@ prepare_runtime_paths() {
         || fail "www-data-Gruppe konnte nicht gelesen werden" 1 \
             "Prüfe die Gruppe mit: getent group www-data ; starte danach erneut: sudo ${LAUNCHER}"
     [[ "$www_data_gid" =~ ^[0-9]+$ ]] || fail "www-data-Gruppe fehlt" 126
-    [[ ! -L "$RUNTIME_DIR" && ! -L "$LOG_DIR" ]] \
-        || fail "Runtime- oder Logpfad ist ein Symlink" 126
+    [[ ! -L "$RUNTIME_DIR" && ! -L "$CREDENTIAL_DIR" && ! -L "$LOG_DIR" ]] \
+        || fail "Runtime-, Credential- oder Logpfad ist ein Symlink" 126
     require_secure_root_directory /run
     require_secure_root_directory /var/log
     /usr/bin/install -d -o root -g www-data -m 0750 -- "$RUNTIME_DIR" \
         || fail "Runtime-Verzeichnis konnte nicht angelegt oder repariert werden" 1 \
             "Führe sudo /usr/bin/install -d -o root -g www-data -m 0750 ${RUNTIME_DIR} aus und starte danach erneut: sudo ${LAUNCHER}"
+    /usr/bin/install -d -o root -g root -m 0700 -- "$CREDENTIAL_DIR" \
+        || fail "Privates Update-Credential-Verzeichnis konnte nicht angelegt werden" 1
     /usr/bin/install -d -o root -g root -m 0755 -- "$LOG_DIR" \
         || fail "Log-Verzeichnis konnte nicht angelegt oder repariert werden" 1 \
             "Führe sudo /usr/bin/install -d -o root -g root -m 0755 ${LOG_DIR} aus und starte danach erneut: sudo ${LAUNCHER}"
     require_root_path "$RUNTIME_DIR" 750 "$www_data_gid"
+    require_root_path "$CREDENTIAL_DIR" 700 0
     require_root_path "$LOG_DIR" 755 0
 }
 
@@ -188,12 +195,63 @@ write_runtime_value() {
         || return 1
 }
 
+publish_new_run_id() {
+    local run_id=""
+    IFS= read -r run_id < /proc/sys/kernel/random/uuid \
+        || fail "Neue Laufkennung des Updatejobs konnte nicht erzeugt werden" 1
+    [[ "$run_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] \
+        || fail "Neue Laufkennung des Updatejobs ist ungültig" 126
+    write_runtime_value "$RUN_ID_FILE" "$run_id" \
+        || fail "Laufkennung des Updatejobs konnte nicht sicher veröffentlicht werden" 1 \
+            "Prüfe den freien Speicher mit: df -h /run ; starte danach erneut: sudo ${LAUNCHER}"
+}
+
 read_runtime_value() {
     local source="$1"
     local value=""
     [[ -f "$source" && ! -L "$source" ]] || return 1
     IFS= read -r value < "$source" || [[ -n "$value" ]] || return 1
     printf '%s\n' "$value"
+}
+
+remove_drift_confirmation_credential_safely() {
+    if [[ -e "$DRIFT_CONFIRM_FILE" || -L "$DRIFT_CONFIRM_FILE" ]]; then
+        [[ -f "$DRIFT_CONFIRM_FILE" && ! -L "$DRIFT_CONFIRM_FILE" ]] \
+            || return 1
+        local metadata
+        metadata="$(/usr/bin/stat -c '%u %g %a %F %h' -- "$DRIFT_CONFIRM_FILE")" \
+            || return 1
+        [[ "$metadata" == "0 0 600 regular file 1" ]] \
+            || return 1
+        /usr/bin/unlink -- "$DRIFT_CONFIRM_FILE" \
+            || return 1
+    fi
+    return 0
+}
+
+clear_drift_confirmation_credential() {
+    remove_drift_confirmation_credential_safely \
+        || fail "Driftfreigabe konnte nicht sicher verworfen werden" 126
+}
+
+store_drift_confirmation_credential() {
+    local token="$1"
+    local temporary
+    [[ "$token" =~ ^[0-9a-f]{64}$ ]] \
+        || fail "Die Dateilistenbindung der Driftfreigabe ist ungültig" 64
+    clear_drift_confirmation_credential
+    temporary="$(/usr/bin/mktemp "${CREDENTIAL_DIR}/.local-drift.XXXXXX")" \
+        || fail "Private Driftfreigabe konnte nicht angelegt werden" 1
+    if ! printf '%s\n' "$token" > "$temporary" \
+        || ! /usr/bin/chown root:root -- "$temporary" \
+        || ! /usr/bin/chmod 0600 -- "$temporary" \
+        || ! /usr/bin/mv -fT -- "$temporary" "$DRIFT_CONFIRM_FILE"; then
+        /usr/bin/unlink -- "$temporary" 2>/dev/null || true
+        fail "Private Driftfreigabe konnte nicht sicher gebunden werden" 1
+    fi
+    [[ "$(/usr/bin/stat -c '%u %g %a %F %h %s' -- "$DRIFT_CONFIRM_FILE")" \
+        == "0 0 600 regular file 1 65" ]] \
+        || fail "Private Driftfreigabe blieb nach dem Schreiben unsicher" 126
 }
 
 load_update_unit_state() {
@@ -350,6 +408,35 @@ validate_launcher_contract() {
 
 }
 
+inspect_launcher_contract_readonly() {
+    local metadata launcher_mode launcher_kind launcher_links
+    for binary in "$CURL" "$GIT" "$PYTHON" "$ENV"; do
+        [[ -x "$binary" ]] || fail "Fest gebundenes Systemprogramm fehlt: ${binary}" 126
+    done
+    for parent in /usr/local /usr/local/sbin; do
+        [[ ! -L "$parent" ]] \
+            || fail "Launcher-Elternpfad ist ein Symlink: ${parent}" 126
+        metadata="$(/usr/bin/stat -c '%u %g %a %F' -- "$parent")" \
+            || fail "Launcher-Elternpfad ist nicht prüfbar: ${parent}" 126
+        [[ "$metadata" =~ ^0\ [0-9]+\ [0-7]+\ directory$ ]] \
+            || fail "Launcher-Elternpfad ist nicht root-kontrolliert: ${parent}" 126
+        launcher_mode="$(/usr/bin/stat -c '%a' -- "$parent")"
+        [[ $((8#$launcher_mode & 8#022)) -eq 0 ]] \
+            || fail "Launcher-Elternpfad ist für Gruppe oder Andere schreibbar: ${parent}" 126
+    done
+    [[ ! -L "$LAUNCHER" ]] \
+        || fail "Installierter Update-Dispatcher ist ein Symlink" 126
+    metadata="$(/usr/bin/stat -c '%u,%g,%a,%F,%h' -- "$LAUNCHER")" \
+        || fail "Installierter Update-Dispatcher fehlt" 126
+    IFS=, read -r _owner _group launcher_mode launcher_kind launcher_links <<< "$metadata"
+    [[ "$_owner" == "0" && "$launcher_links" == "1" \
+        && ( "$launcher_kind" == "regular file" || "$launcher_kind" == "regular empty file" ) ]] \
+        || fail "Installierter Update-Dispatcher ist nicht sicher gebunden" 126
+    [[ $((8#$launcher_mode & 8#022)) -eq 0 \
+        && $((8#$launcher_mode & 8#500)) -eq $((8#500)) ]] \
+        || fail "Installierter Update-Dispatcher ist nicht sicher root-lesbar/ausführbar" 126
+}
+
 isolated_git() {
     $ENV -i \
         PATH=/usr/bin:/bin \
@@ -440,7 +527,8 @@ download_release_checkout() {
         || fail "Privater Release-Checkout ist nicht ausschließlich root-zugänglich" 126
     for required in \
         VERSION e3dc-bootstrap e3dc-update-bootstrap \
-        Installer/update_bootstrap_discovery.py Installer/update_simple.py
+        Installer/update_bootstrap_discovery.py Installer/update_simple.py \
+        Installer/update_drift.py
     do
         [[ -f "$checkout/$required" && ! -L "$checkout/$required" ]] \
             || fail "Release-Datei fehlt oder ist kein regulärer Pfad: ${required}" 126
@@ -451,10 +539,48 @@ download_release_checkout() {
     printf '%s\t%s\n' "$fetched_tag" "$fetched_sha"
 }
 
+check_local_drift_json() (
+    local release_binding tag release_dir result=1
+    (( $# == 0 )) || fail "Driftprüfung akzeptiert keine weiteren Argumente" 64
+    inspect_launcher_contract_readonly
+    update_job_running && fail "Ein Update läuft bereits" 75
+    tag="$(resolve_release_tag)"
+    DOWNLOAD_DIR="$(/usr/bin/mktemp -d /run/e3dc-update-download.XXXXXX)" \
+        || fail "Privates Download-Verzeichnis konnte nicht angelegt werden" 1
+    trap 'set +e; [[ -z "${DOWNLOAD_DIR:-}" || ! -d "$DOWNLOAD_DIR" ]] || /usr/bin/find "$DOWNLOAD_DIR" -depth -delete' EXIT
+    /usr/bin/chown root:root -- "$DOWNLOAD_DIR" \
+        || fail "Privates Download-Verzeichnis konnte nicht root übergeben werden" 1
+    /usr/bin/chmod 0700 -- "$DOWNLOAD_DIR" \
+        || fail "Privates Download-Verzeichnis konnte nicht sicher gesetzt werden" 1
+    release_dir="${DOWNLOAD_DIR}/release"
+    release_binding="$(download_release_checkout "$release_dir" "$tag")"
+    [[ "$release_binding" == *$'\t'* ]] \
+        || fail "Release-Bindung ist unvollständig" 126
+    set +e
+    $ENV -i \
+        PATH=/usr/bin:/bin \
+        HOME=/root \
+        LANG=C.UTF-8 \
+        LC_ALL=C.UTF-8 \
+        $PYTHON -I -B "$release_dir/Installer/update_drift.py" \
+        --target "$INSTALL_ROOT" \
+        --release-root "$release_dir" \
+        --json
+    result=$?
+    set -e
+    return "$result"
+)
+
 run_worker() {
     local result=1 release_binding tab tag tag_object target_sha release_dir
     local attempt ack_value current_status unit_identity_confirmed=0 worker_acknowledged=0
     local worker_cleanup_started=0
+    local confirm_local_drift=0
+    if (( $# == 1 )) && [[ "$1" == "--confirm-local-drift" ]]; then
+        confirm_local_drift=1
+    elif (( $# != 0 )); then
+        fail "Worker akzeptiert nur die gebundene Driftfreigabe" 64
+    fi
     worker_signal_exit() {
         local signal_name="$1"
         local signal_exit="$2"
@@ -469,7 +595,8 @@ run_worker() {
         exit "$signal_exit"
     }
     cleanup() {
-        local exit_code=$? status_before=""
+        local trapped_exit_code=$?
+        local exit_code="${1:-$trapped_exit_code}" status_before=""
         trap - EXIT
         trap '' HUP INT TERM
         if (( worker_cleanup_started == 1 )); then
@@ -480,6 +607,10 @@ run_worker() {
         status_before="$(read_runtime_value "$STATUS_FILE" 2>/dev/null || true)"
         /usr/bin/unlink "$START_ACK_FILE" 2>/dev/null || true
         /usr/bin/unlink "$PID_FILE" 2>/dev/null || true
+        if ! remove_drift_confirmation_credential_safely; then
+            printf '[FEHLER] Private Driftfreigabe konnte beim Worker-Abschluss nicht sicher gelöscht werden.\n' >&2
+            (( exit_code != 0 )) || exit_code=126
+        fi
         if [[ -n "${DOWNLOAD_DIR:-}" && -d "$DOWNLOAD_DIR" \
             && "$DOWNLOAD_DIR" == /run/e3dc-update-download.* ]]; then
             /usr/bin/find "$DOWNLOAD_DIR" -depth -delete
@@ -601,13 +732,19 @@ run_worker() {
         E3DC_BOOTSTRAP_USER="$INSTALL_USER" \
         E3DC_BOOTSTRAP_INLINE_WORKER=1 \
         E3DC_BOOTSTRAP_LOCK_HELD=1 \
+        E3DC_UPDATE_CONFIRM_LOCAL_DRIFT="$confirm_local_drift" \
         /bin/sh "$release_dir/e3dc-update-bootstrap" "$INSTALL_ROOT"
     result=$?
     set -e
     if (( result != 0 )); then
         printf '[!] Update fehlgeschlagen (Exit %d).\n' "$result"
     fi
-    return "$result"
+    # Beim regulären Funktionsende würde der EXIT-Trap erst nach dem Ende von
+    # run_worker ausgeführt. Seine lokalen Zustandsvariablen wären unter
+    # `set -u` dann nicht mehr gebunden. Der normale Erfolg-/Fehlerabschluss
+    # räumt deshalb explizit auf, solange der Worker-Scope noch aktiv ist. Der
+    # EXIT-Trap bleibt für frühere Fehler und Signale zuständig.
+    cleanup "$result"
 }
 
 update_job_running() {
@@ -627,7 +764,33 @@ start_worker() {
     local launch_output launch_status launch_failure_exit=1
     local launch_failure_reason="" launch_failure_detail=""
     local raw_status worker_pid attempt start_acknowledged=0 execution_acknowledged=0
-    (( $# == 0 )) || fail "Der Update-Dispatcher akzeptiert keine Argumente" 64
+    local confirm_local_drift=0 confirmation_token="" unexpected_input=""
+    local drift_credential_owned=0
+    cleanup_owned_drift_credential() {
+        local exit_code=$?
+        trap - EXIT HUP INT TERM
+        set +e
+        if (( drift_credential_owned == 1 )) \
+            && ! remove_drift_confirmation_credential_safely; then
+            printf '[FEHLER] Private Driftfreigabe konnte beim Abbruch nicht sicher gelöscht werden.\n' >&2
+            (( exit_code != 0 )) || exit_code=126
+        fi
+        exit "$exit_code"
+    }
+    local -a worker_command=("$LAUNCHER" "--worker")
+    if (( $# == 1 )) && [[ "$1" == "--confirm-local-drift" ]]; then
+        confirm_local_drift=1
+        worker_command+=("--confirm-local-drift")
+        IFS= read -r confirmation_token \
+            || fail "Die gebundene Driftfreigabe fehlt auf der Standardeingabe" 64
+        [[ "$confirmation_token" =~ ^[0-9a-f]{64}$ ]] \
+            || fail "Die Dateilistenbindung der Driftfreigabe ist ungültig" 64
+        if IFS= read -r unexpected_input; then
+            fail "Die Driftfreigabe enthält unerwartete zusätzliche Eingabe" 64
+        fi
+    elif (( $# != 0 )); then
+        fail "Der Update-Dispatcher akzeptiert nur die bewusste Driftfreigabe" 64
+    fi
     validate_launcher_contract
     prepare_runtime_paths
     prepare_lock_file "$START_LOCK_FILE"
@@ -671,9 +834,25 @@ start_worker() {
         fail "Bereits laufender Worker bestätigte die Ausführungsphase nach Startfreigabe nicht; Zustand prüfen und nicht blind erneut starten" 75
     fi
     prepare_log
+    if (( confirm_local_drift == 1 )); then
+        # Bis der bereits mit eigenem Cleanup-Trap laufende Worker seinen
+        # running-Status bestätigt, bleibt der Dispatcher alleiniger Besitzer.
+        drift_credential_owned=1
+        trap cleanup_owned_drift_credential EXIT
+        trap 'exit 129' HUP
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        store_drift_confirmation_credential "$confirmation_token"
+    else
+        clear_drift_confirmation_credential
+    fi
     write_runtime_value "$STATUS_FILE" "launching" \
         || fail "Startstatus des Updatejobs konnte nicht geschrieben werden" 1 \
             "Prüfe den freien Speicher mit: df -h /run ; starte danach erneut: sudo ${LAUNCHER}"
+    # Die neue Laufkennung wird erst sichtbar, wenn Log und Startstatus sicher
+    # zum neuen Lauf gehören. Andernfalls könnte ein altes numerisches Ergebnis
+    # bei verlorener HTTP-Antwort fälschlich dem neuen Klick zugeordnet werden.
+    publish_new_run_id
     /usr/bin/unlink "$PID_FILE" 2>/dev/null || true
     /usr/bin/unlink "$START_ACK_FILE" 2>/dev/null || true
     $SYSTEMCTL reset-failed "$UNIT" 2>/dev/null || true
@@ -691,7 +870,7 @@ start_worker() {
         --property="StandardError=append:${LOG_FILE}" \
         --setenv=E3DC_WEB_UPDATE_WORKER=1 \
         --setenv=SUDO_USER= \
-        "$LAUNCHER" --worker 2>&1)"
+        "${worker_command[@]}" 2>&1)"
     launch_status=$?
     set -e
     if (( launch_status != 0 )); then
@@ -768,6 +947,14 @@ start_worker() {
             "$(normalize_start_failure_exit "$launch_failure_exit")"
     fi
 
+    if (( drift_credential_owned == 1 )); then
+        # running wurde erst veröffentlicht, nachdem der Worker seinen eigenen
+        # EXIT-/Signal-Cleanup installiert hat. Die Credential-Verantwortung
+        # kann daher jetzt ohne Löschlücke übertragen werden.
+        drift_credential_owned=0
+        trap - EXIT HUP INT TERM
+    fi
+
     # Der Rück-ACK allein öffnet den Produktpfad noch nicht. Erst der vom
     # gebundenen Worker atomar veröffentlichte executing-Status beweist, dass
     # er die Freigabe übernommen hat. Ab hier darf kein Fehler mehr pauschal
@@ -808,8 +995,11 @@ if (( EUID != 0 )); then
 fi
 
 if [[ "${1:-}" == "--worker" ]]; then
-    (( $# == 1 )) || fail "Worker akzeptiert keine weiteren Argumente" 64
-    run_worker
+    shift
+    run_worker "$@"
+elif [[ "${1:-}" == "--check-local-drift-json" ]]; then
+    shift
+    check_local_drift_json "$@"
 else
     start_worker "$@"
 fi

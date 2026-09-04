@@ -2,7 +2,29 @@
 
 Diese Anleitung fasst die schnellsten Schritte zusammen, um E3DC-Control auf einem frischen Raspberry Pi OS (oder ähnlichem Debian-System) zu installieren.
 
-Aktueller Stable-Stand: `v5.4.4i`.
+Aktueller Stable-Stand: `v5.4.5`.
+
+5.4.5 führt die Wallboxen über einen zentralen Watt- und Aktorvertrag. Der
+Manager verteilt das belegte Budget je Ladepunkt, der jeweilige Treiber
+übersetzt ausschließlich den finalen Strom-, Phasen- oder Stoppauftrag. Echter
+Netzbezug wird gruppenweit genau einmal in den Wh-Wächter übernommen;
+quellengebundene PV- und Akkuanteile bleiben getrennt. Eine Erhöhung erfolgt
+ohne zweite künstliche Treiberrampe, eine Verringerung folgt weiterhin der
+physischen Kaskade aus Strom, gegebenenfalls Phasenwechsel und erst zuletzt
+Stopp. Die Dashboardleistung stammt aus der frischen kanonischen Messquelle
+und wird nach einem bestätigten Stopp nicht mehr künstlich gehalten.
+
+Die rein lesende PV-Prognosediagnose ist in Installationszentrale, Desktop-
+und Mobilansicht sichtbar. Sie verändert weder Prognosemodell noch
+Speicherentscheidung. Der Update-Worker beendet in 5.4.5 außerdem seine
+reguläre Bereinigung innerhalb des gültigen Funktionskontexts, sodass nach
+einem erfolgreichen Update kein `set -u`-Nachfehler mehr erscheint.
+
+„Rechte prüfen und reparieren“ ist ein eigener Auftrag ohne Vollbackup,
+Releasewechsel oder Neustart der Regelungsdienste. Das Stable-Update benennt
+lokale Inhaltsabweichungen nur im exakten Ziel- und Löschumfang und verlangt
+vor dem Überschreiben eine daran gebundene Bestätigung; unbekannte Dateien
+außerhalb des Releaseumfangs bleiben unberührt.
 
 5.4.4i führt die steuernden Dateitypprüfungen von Web-Launcher,
 Community-Bootstrap und systemd-Worker in einer festen C-Locale aus.
@@ -430,7 +452,7 @@ Ohne das Label bleibt auch ein versehentlich gestarteter Watchtower für den
 Hauptcontainer wirkungslos. Der oben gezeigte manuelle Host-Helfer bleibt der
 empfohlene Updateweg.
 
-**Docker-Rückfall von v5.4.4i auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.4.5 auf den veröffentlichten Docker-Rollback-Root:**
 ```bash
 (
   set -euo pipefail

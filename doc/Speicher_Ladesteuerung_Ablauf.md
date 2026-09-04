@@ -1,6 +1,16 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.4i
+> **Stand:** v5.4.5
+>
+> **Neu in 5.4.5:** Ein zentraler Wattvertrag bindet die je Wallbox
+> finanzierte Quelle, das physische Stromquant und den finalen Aktorauftrag.
+> Echter Netzbezug wird pro frischem Netzpunkt-Snapshot gruppenweit genau
+> einmal in den Wh-Wächter übernommen; ohne Netzbezug kann nur eine frisch
+> belegte Überschreitung des autorisierten Wallboxbudgets zählen. Die
+> Abregelung folgt Stromstärke, gegebenenfalls Phasenwechsel und erst zuletzt
+> Stopp. Treiber übersetzen den finalen Auftrag, treffen aber keine eigene
+> Lade- oder Speicherentscheidung. Eine fehlende oder veraltete Messung
+> erzeugt weder Zusatzbudget noch eine erfundene Leistung.
 >
 > **Neu in 5.4.4i:** Ein manuell gespeicherter Fahrzeug-SoC bleibt an echten
 > Aktionszeitpunkt, genau ein Profil sowie aktuellen Wallbox- und Steckkontext

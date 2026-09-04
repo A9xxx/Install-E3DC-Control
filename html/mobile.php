@@ -1082,8 +1082,11 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
 	                    <div class="small text-muted fw-bold mt-1">Verwendung</div>
 	                    <div class="d-flex justify-content-between small text-muted"><span>Haus:</span> <span id="m-stat-pv-home" class="fw-bold text-body">-- kWh (--%)</span></div>
                     <div class="d-flex justify-content-between small text-muted"><span>Batterie:</span> <span id="m-stat-pv-bat" class="fw-bold text-body">-- kWh (--%)</span></div>
-                    <?php if ($wbEnabled): ?>
-                    <div class="d-flex justify-content-between small text-muted"><span>Wallbox:</span> <span id="m-stat-pv-wb" class="fw-bold text-body">-- kWh (--%)</span></div>
+                    <?php if ($wb1Enabled): ?>
+                    <div class="d-flex justify-content-between small text-muted"><span><?= $wb2Enabled ? 'Wallbox 1:' : 'Wallbox:' ?></span> <span id="m-stat-pv-wb" class="fw-bold text-body">-- kWh (--%)</span></div>
+                    <?php endif; ?>
+                    <?php if ($wb2Enabled): ?>
+                    <div class="d-flex justify-content-between small text-muted"><span>Wallbox 2:</span> <span id="m-stat-pv-wb2" class="fw-bold text-body">-- kWh (--%)</span></div>
                     <?php endif; ?>
                     <?php if ($wpEnabled): ?>
                     <div class="d-flex justify-content-between small text-muted"><span>WP:</span> <span id="m-stat-pv-wp" class="fw-bold text-body">-- kWh (--%)</span></div>
@@ -1096,8 +1099,11 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
                         <span id="m-stat-bat-total" class="badge bg-success">-- kWh</span>
                     </div>
                     <div class="d-flex justify-content-between small text-muted"><span>Haus:</span> <span id="m-stat-bat-home" class="fw-bold text-body">-- kWh (--%)</span></div>
-                    <?php if ($wbEnabled): ?>
-                    <div class="d-flex justify-content-between small text-muted"><span>Wallbox:</span> <span id="m-stat-bat-wb" class="fw-bold text-body">-- kWh (--%)</span></div>
+                    <?php if ($wb1Enabled): ?>
+                    <div class="d-flex justify-content-between small text-muted"><span><?= $wb2Enabled ? 'Wallbox 1:' : 'Wallbox:' ?></span> <span id="m-stat-bat-wb" class="fw-bold text-body">-- kWh (--%)</span></div>
+                    <?php endif; ?>
+                    <?php if ($wb2Enabled): ?>
+                    <div class="d-flex justify-content-between small text-muted"><span>Wallbox 2:</span> <span id="m-stat-bat-wb2" class="fw-bold text-body">-- kWh (--%)</span></div>
                     <?php endif; ?>
 	                    <?php if ($wpEnabled): ?>
 	                    <div class="d-flex justify-content-between small text-muted"><span>WP:</span> <span id="m-stat-bat-wp" class="fw-bold text-body">-- kWh (--%)</span></div>
@@ -1111,8 +1117,11 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
                     </div>
                     <div class="d-flex justify-content-between small text-muted"><span>Haus:</span> <span id="m-stat-grid-home" class="fw-bold text-body">-- kWh (--%)</span></div>
                     <div class="d-flex justify-content-between small text-muted"><span>Batterie:</span> <span id="m-stat-grid-bat" class="fw-bold text-body">-- kWh (--%)</span></div>
-                    <?php if ($wbEnabled): ?>
-                    <div class="d-flex justify-content-between small text-muted"><span>Wallbox:</span> <span id="m-stat-grid-wb" class="fw-bold text-body">-- kWh (--%)</span></div>
+                    <?php if ($wb1Enabled): ?>
+                    <div class="d-flex justify-content-between small text-muted"><span><?= $wb2Enabled ? 'Wallbox 1:' : 'Wallbox:' ?></span> <span id="m-stat-grid-wb" class="fw-bold text-body">-- kWh (--%)</span></div>
+                    <?php endif; ?>
+                    <?php if ($wb2Enabled): ?>
+                    <div class="d-flex justify-content-between small text-muted"><span>Wallbox 2:</span> <span id="m-stat-grid-wb2" class="fw-bold text-body">-- kWh (--%)</span></div>
                     <?php endif; ?>
                     <?php if ($wpEnabled): ?>
                     <div class="d-flex justify-content-between small text-muted"><span>WP:</span> <span id="m-stat-grid-wp" class="fw-bold text-body">-- kWh (--%)</span></div>
@@ -1138,11 +1147,19 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
                                 <div class="small fw-bold"><span id="m-stat-cost-home">0.00</span> / <span id="m-stat-save-home" class="text-info">0.00</span> <span style="font-size: 0.6rem;">€</span></div>
                             </div>
                         </div>
-                        <?php if ($wbEnabled): ?>
+                        <?php if ($wb1Enabled): ?>
                         <div class="col-6">
                             <div class="p-2 rounded bg-body-tertiary border border-secondary border-opacity-10">
-                                <div class="label m-0 opacity-75" style="font-size: 0.6rem;">WB (K/E)</div>
+                                <div class="label m-0 opacity-75" style="font-size: 0.6rem;"><?= $wb2Enabled ? 'WB1 (K/E)' : 'WB (K/E)' ?></div>
                                 <div class="small fw-bold"><span id="m-stat-cost-wb">0.00</span> / <span id="m-stat-save-wb" class="text-info">0.00</span> <span style="font-size: 0.6rem;">€</span></div>
+                            </div>
+                        </div>
+                        <?php endif; ?>
+                        <?php if ($wb2Enabled): ?>
+                        <div class="col-6">
+                            <div class="p-2 rounded bg-body-tertiary border border-secondary border-opacity-10">
+                                <div class="label m-0 opacity-75" style="font-size: 0.6rem;">WB2 (K/E)</div>
+                                <div class="small fw-bold"><span id="m-stat-cost-wb2">0.00</span> / <span id="m-stat-save-wb2" class="text-info">0.00</span> <span style="font-size: 0.6rem;">€</span></div>
                             </div>
                         </div>
                         <?php endif; ?>
@@ -1484,6 +1501,7 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
 
 <script src="assets/vendor/jquery/jquery-3.6.0.min.js"></script>
 <script src="assets/vendor/bootstrap/js/bootstrap.bundle.min.js"></script>
+    <script src="<?= getAssetUrl('pv_forecast_diagnostics.js') ?>" defer></script>
     <script src="<?= getAssetUrl('solar.js') ?>" defer></script>
 <script>
 const PV_MAX = <?= $pvMax ?>; const WP_MAX = <?= $wpMax ?>; const BAT_MAX = <?= $maxBatPower ?>; const BAT_CAPACITY = <?= $batteryCapacity ?>; const AVGS = <?= json_encode($avgs) ?>;

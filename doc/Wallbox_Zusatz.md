@@ -11,8 +11,9 @@ MQTT-/Shelly-Messpunkte.
 * **Regelung:** Der Wallbox-Manager verteilt das verfügbare Budget pro
   Ladepunkt und beachtet pro Wallbox Modus, Maximalstrom, Phasenlogik,
   Fahrzeugzuordnung und Hysterese.
-* **Statistik:** Verbrauch von WB1 und WB2 wird getrennt erfasst und in der
-  Langzeitstatistik ausgewiesen.
+* **Statistik:** Verbrauch von WB1 und WB2 wird getrennt erfasst. Tageswerte
+  führen beide Ladepunkte zusammen und weisen deren Einzelanteile aus; die
+  Langzeitstatistik übernimmt dieselbe bestätigte Summe ohne Doppelzählung.
 * **Hausverbrauch:** Externe Wallboxleistung wird vom reinen Hausverbrauch
   abgezogen, damit keine Doppelzählung entsteht.
 

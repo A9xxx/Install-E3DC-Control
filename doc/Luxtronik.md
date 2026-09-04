@@ -103,6 +103,15 @@ Die PHP-Datei visualisiert die Daten:
 *   **Status:** Zeigt an, ob Verdichter, Heizstab oder Pumpen laufen.
 *   **Steuerung:** Ermöglicht das manuelle Starten eines "Notfall-Boosts" (z.B. um die Batterie vor dem Abend schnell zu leeren).
 
+Zusätzlich zeigt die Oberfläche den rein lesenden Warmwasser-Betriebsfortschritt
+in fünf belegten Stufen: **WW angefordert**, **WW-Hydraulik aktiv**, **Verdichter
+gestartet**, **40-Hz-Zwischenstufe** und **WW-Ziellast erreicht**. BUP oder ZUP
+belegen nur im separat bestätigten Warmwasserbetrieb die Hydraulik; sie beweisen
+keinen Verdichterlauf. Die 40-Hz-Stufe benötigt eine gemessene Frequenz von
+35 bis 45 Hz, die Ziellast eine darüberliegende und zur Anforderung passende
+Frequenz. Fehlende oder veraltete Telemetrie bleibt `EVIDENCE_LIMIT`. Diese
+Anzeige schätzt keine Leistung und verändert weder Budget noch Regelung.
+
 ### Quell-Erholung
 Der Pausenmodus wird fachlich als **Quell-Erholung** geführt. Eine Pause soll
 die Wärmepumpe nicht beliebig abschalten, sondern Quelle, Gebäude und

@@ -21,6 +21,7 @@ from .secure_file_transaction import (
     snapshot_bound_file,
     snapshots_match,
 )
+from .emergency_release import PERSISTENT_EMERGENCY_LATCH_PATH
 
 # ---------------------------------------------------------------------------
 # Zentrale Pfad-Aufloesung (V4) — NIEMALS Pfade hartcodieren!
@@ -1611,6 +1612,7 @@ def _render_managed_service_unit(
     documentation="",
     syslog_identifier="",
     manager_lock_prestart="",
+    emergency_quiesce_gate=False,
     environment=(),
 ):
     """Rendert den einzigen freigegebenen Unitvertrag des Core-Helpers."""
@@ -1632,6 +1634,12 @@ def _render_managed_service_unit(
         else ""
     )
     wants_line = f"Wants={' '.join(wants_units)}\n" if wants_units else ""
+    condition_line = (
+        f"ConditionPathExists=!{PERSISTENT_EMERGENCY_LATCH_PATH}\n"
+        f"ConditionPathIsSymbolicLink=!{PERSISTENT_EMERGENCY_LATCH_PATH}\n"
+        if emergency_quiesce_gate
+        else ""
+    )
     syslog_line = (
         f"SyslogIdentifier={str(syslog_identifier).strip()}\n"
         if str(syslog_identifier or "").strip()
@@ -1675,7 +1683,7 @@ def _render_managed_service_unit(
     return f"""[Unit]
 Description={description}
 {documentation_line}{wants_line}After={' '.join(after_units)}
-{start_limit_tuning}
+{condition_line}{start_limit_tuning}
 
 [Service]
 Type=simple
@@ -1723,6 +1731,7 @@ def _approved_storage_manager_unit_payloads() -> tuple[bytes, ...]:
             "ExecStartPre=+/usr/bin/systemd-tmpfiles --create "
             f"{MANAGER_LOCK_TMPFILES_CONFIG}\n"
         ),
+        emergency_quiesce_gate=True,
     )
     legacy_executors = [runtime["python"]]
     legacy_python = os.path.join(bound_venv_path, "bin", "python")
@@ -1963,6 +1972,7 @@ def _create_service_file(
     else:
         exec_argv.append(str(script_abs_path))
         exec_argv.extend(str(argument) for argument in (script_args or ()))
+    unit_name = _bundle_unit_name(service_name)
     service_content = _render_managed_service_unit(
         description=description,
         runtime_user=runtime_user,
@@ -1980,6 +1990,7 @@ def _create_service_file(
         documentation=documentation,
         syslog_identifier=syslog_identifier,
         manager_lock_prestart=manager_lock_prestart,
+        emergency_quiesce_gate=(unit_name == "e3dc-storage-manager.service"),
         environment=service_environment,
     )
     tmp_path = None
@@ -1987,7 +1998,6 @@ def _create_service_file(
     staged_service_created = False
     service_unit_mutated = False
     outer_bundle_recorded = False
-    unit_name = _bundle_unit_name(service_name)
     if bundle_snapshot is not None:
         if unit_name not in bundle_snapshot:
             print(f"✗ Äußerer Bundle-Snapshot enthält {unit_name} nicht.")

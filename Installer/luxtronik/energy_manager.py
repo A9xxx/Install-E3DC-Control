@@ -1715,6 +1715,18 @@ def _safe_int(value, default=0):
     return int(round(_safe_float(value, default)))
 
 
+def _optional_finite_float(value):
+    """Liest einen optionalen Messwert, ohne fehlende Evidenz als 0 zu deuten."""
+
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        result = float(str(value).strip().replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
 def _single_vehicle_fallback(vehicles):
     """Verhindert eine willkürliche vehicles[0]-Bindung bei mehreren Autos."""
 
@@ -5765,6 +5777,225 @@ def luxtronik_ww_runtime_state(wp_status=None, wp_data=None):
     }
 
 
+def luxtronik_operating_stage(
+    wp_status=None,
+    wp_data=None,
+    *,
+    compressor_observation_valid=False,
+):
+    """Projiziert den belegten Luxtronik-Warmwasserablauf für die Anzeige.
+
+    SHI-WW ist nur eine bestätigte Anforderung. BUP beziehungsweise eine an
+    den WW-Betriebszustand gebundene ZUP beweisen die Hydraulik, aber niemals
+    den Verdichter. Ein Verdichterstart benötigt eine eigene, frische
+    Beobachtung. Die 40-Hz-Zwischenstufe wird nur aus der Istfrequenz gezeigt.
+    Das Erreichen eines vorhandenen, höheren Frequenzsolls ist eine Ziellast;
+    ohne separates Geräte-Maximum wird daraus keine Volllast erfunden.
+    """
+
+    status = wp_status if isinstance(wp_status, dict) else {}
+    data = wp_data if isinstance(wp_data, dict) else {}
+    web_fresh = status.get("source_fresh") is True
+    physical_fresh = status.get("physical_valid") is True
+    any_fresh = bool(web_fresh or physical_fresh)
+
+    result = {
+        "schema_version": "luxtronik_operating_stage_v1",
+        "status": "EVIDENCE_LIMIT",
+        "stage": "unknown",
+        "label": "Luxtronik-Status nicht belegt",
+        "reason_code": "LUXTRONIK_LIVE_EVIDENCE_MISSING",
+        "domain": "unknown",
+        "ww_requested": None,
+        "hydraulics_active": None,
+        "compressor_running": None,
+        "frequency_hz": None,
+        "frequency_target_hz": None,
+        "target_load_confirmed": False,
+        "full_load_confirmed": False,
+        "evidence": [],
+    }
+    if not any_fresh:
+        return result
+
+    evidence = []
+    operating_raw = data.get("Betriebsart", status.get("Betriebsart"))
+    operating_mode = normalize_luxtronik_operating_mode(operating_raw)
+    ww_status = None
+    if physical_fresh:
+        ww_status = _optional_finite_float(
+            data.get("Status_Warmwasser", status.get("Status_Warmwasser"))
+        )
+        if ww_status is not None:
+            ww_status = int(round(ww_status))
+
+    shi_ww_mode = None
+    if web_fresh:
+        shi_ww_mode = normalize_luxtronik_shi_mode(
+            status.get(
+                "SHI_WW_Mode",
+                status.get("WW_Mode", data.get("WW_Mode")),
+            )
+        )
+
+    bup = _optional_finite_float(data.get("BUP")) if web_fresh else None
+    zup = _optional_finite_float(data.get("ZUP")) if web_fresh else None
+    bup_active = bup is not None and bup > 0.0
+    operating_ww = operating_mode == 1
+    status_ww_requested = ww_status in (2, 3)
+    status_ww_active = ww_status == 3
+    ww_domain = bool(operating_ww or status_ww_requested or bup_active)
+    ww_requested = bool(
+        status_ww_requested
+        or (shi_ww_mode is not None and shi_ww_mode > 0)
+    )
+
+    if status_ww_requested:
+        evidence.append(
+            "warmwater_status_active"
+            if status_ww_active
+            else "warmwater_status_requested"
+        )
+    if shi_ww_mode is not None and shi_ww_mode > 0:
+        evidence.append("shi_warmwater_request_readback")
+    if operating_ww:
+        evidence.append("operating_mode_warmwater")
+    if bup_active:
+        evidence.append("bup_active")
+
+    # ZUP ist auch in anderen Betriebsarten aktiv. Sie wird deshalb nur bei
+    # unabhängig gebundener WW-Domäne als WW-Hydraulikevidenz verwendet.
+    zup_active_for_ww = bool(zup is not None and zup > 0.0 and ww_domain)
+    if zup_active_for_ww:
+        evidence.append("zup_active_in_warmwater_domain")
+    hydraulics_active = bool(status_ww_active or bup_active or zup_active_for_ww)
+
+    compressor_known = bool(compressor_observation_valid and any_fresh)
+    compressor_running = (
+        heatpump_compressor_running(data, status)
+        if compressor_known
+        else None
+    )
+    if compressor_running is True:
+        evidence.append("compressor_running_confirmed")
+    elif compressor_running is False:
+        evidence.append("compressor_off_confirmed")
+
+    frequency_hz = _optional_finite_float(data.get("Freq_Ist")) if web_fresh else None
+    frequency_target_hz = (
+        _optional_finite_float(data.get("Freq_Soll")) if web_fresh else None
+    )
+    if frequency_hz is not None and frequency_hz <= 0.0:
+        frequency_hz = None
+    if frequency_target_hz is not None and frequency_target_hz <= 0.0:
+        frequency_target_hz = None
+
+    result.update({
+        "status": "OK",
+        "reason_code": "LUXTRONIK_STANDBY_CONFIRMED",
+        "domain": "warmwater" if ww_domain else (
+            "other" if operating_mode is not None else "unknown"
+        ),
+        "ww_requested": ww_requested,
+        "hydraulics_active": hydraulics_active,
+        "compressor_running": compressor_running,
+        "frequency_hz": round(frequency_hz, 1) if frequency_hz is not None else None,
+        "frequency_target_hz": (
+            round(frequency_target_hz, 1)
+            if frequency_target_hz is not None
+            else None
+        ),
+        "evidence": evidence,
+    })
+
+    if compressor_running is True and not ww_domain:
+        result.update({
+            "stage": "compressor_other_domain",
+            "label": (
+                "Verdichter läuft (Heizen)"
+                if operating_mode == 0
+                else "Verdichter läuft (WW nicht belegt)"
+            ),
+            "reason_code": (
+                "COMPRESSOR_HEATING_DOMAIN_CONFIRMED"
+                if operating_mode == 0
+                else "COMPRESSOR_DOMAIN_EVIDENCE_LIMIT"
+            ),
+        })
+        if operating_mode != 0:
+            result["status"] = "EVIDENCE_LIMIT"
+        return result
+
+    if compressor_running is True and ww_domain:
+        target_load_tolerance_hz = (
+            max(2.0, frequency_target_hz * 0.03)
+            if frequency_target_hz is not None
+            else None
+        )
+        target_load_confirmed = bool(
+            frequency_hz is not None
+            and frequency_target_hz is not None
+            and frequency_target_hz > 45.0
+            and frequency_hz >= frequency_target_hz - target_load_tolerance_hz
+        )
+        if target_load_confirmed:
+            result.update({
+                "stage": "ww_target_load",
+                "label": "WW-Ziellast erreicht",
+                "reason_code": "WW_FREQUENCY_TARGET_REACHED",
+                "target_load_confirmed": True,
+            })
+            result["evidence"].append("frequency_target_reached")
+        elif (
+            frequency_hz is not None
+            and 35.0 <= frequency_hz <= 45.0
+        ):
+            result.update({
+                "stage": "ww_40hz_stage",
+                "label": "WW-Verdichter bei 40 Hz",
+                "reason_code": "WW_40HZ_STAGE_OBSERVED",
+            })
+            result["evidence"].append("frequency_40hz_observed")
+        else:
+            result.update({
+                "stage": "ww_compressor_started",
+                "label": "WW-Verdichter gestartet",
+                "reason_code": "WW_COMPRESSOR_CONFIRMED",
+            })
+        return result
+
+    if hydraulics_active:
+        result.update({
+            "stage": "ww_hydraulics_active",
+            "label": "WW-Hydraulik aktiv",
+            "reason_code": "WW_HYDRAULICS_WITHOUT_COMPRESSOR",
+        })
+        return result
+
+    if ww_requested:
+        result.update({
+            "stage": "ww_requested",
+            "label": "Warmwasser angefordert",
+            "reason_code": "WW_REQUEST_READBACK_CONFIRMED",
+        })
+        return result
+
+    if compressor_running is None:
+        result.update({
+            "status": "EVIDENCE_LIMIT",
+            "stage": "unknown",
+            "label": "Verdichterstatus nicht belegt",
+            "reason_code": "COMPRESSOR_OBSERVATION_MISSING",
+        })
+        return result
+
+    result.update({
+        "stage": "standby",
+        "label": "Standby",
+    })
+    return result
+
+
 def heatpump_ww_cycle_running(wp_status=None, wp_data=None, ww_requested=False):
     """Kompatibler herstellerübergreifender WW-Laufvertrag.
 
@@ -8400,6 +8631,22 @@ def main():
                 "compressor_running": False,
                 "reason": "runtime_not_sampled",
             }
+            luxtronik_operating_stage_contract = {
+                "schema_version": "luxtronik_operating_stage_v1",
+                "status": "EVIDENCE_LIMIT",
+                "stage": "unknown",
+                "label": "Luxtronik-Status nicht belegt",
+                "reason_code": "LUXTRONIK_RUNTIME_NOT_SAMPLED",
+                "domain": "unknown",
+                "ww_requested": None,
+                "hydraulics_active": None,
+                "compressor_running": None,
+                "frequency_hz": None,
+                "frequency_target_hz": None,
+                "target_load_confirmed": False,
+                "full_load_confirmed": False,
+                "evidence": [],
+            }
             luxtronik_ww_budget_loss_effective_block = False
             wp_live_ts = None
             wp_live_age_s = None
@@ -9245,13 +9492,14 @@ def main():
             wb1_locked = bool(e3dc.get('wb_locked', False))
             wb2_locked = bool(e3dc.get('wb2_locked', False))
 
-            # RSCP-Glitch-Schutz: Bei nativer E3DC Wallbox (wb_native_type=e3dc) lese session_kwh und
-            # wb_locked DIREKT aus wb_live_session.json (vom wallbox_manager per RSCP befuellt).
-            # So wird den C++ Polling-Glitches (session_kwh springt auf 0) aus dem Weg gegangen.
+            # Bei nativer E3DC-Wallbox stammen Session und Steckstatus aus dem
+            # exklusiven RSCP-Vertrag des Wallbox-Managers. Die alten
+            # Mischpfade bleiben nur als source=rscp-Lesefallback erhalten.
             wb_native_type = get_cfg_value(current_config, 'wb_native_type', '').strip().lower()
             wb_native_enable = str(get_cfg_value(current_config, 'wb_native_enable', '0')).strip().lower()
             if wb_native_enable in ('1', 'true') and wb_native_type in ('e3dc', 'native'):
                 for wb_live_session_path in (
+                    '/var/www/html/ramdisk/wb_native_rscp_session.json',
                     '/var/www/html/ramdisk/wb_live_session.json',
                     '/var/www/html/logs/wb_live_session.json',
                 ):
@@ -9268,8 +9516,12 @@ def main():
                         _rscp_kwh = _wls.get('session_kwh')
                         if _rscp_kwh is not None and _rscp_kwh >= 0:
                             wb1_session_kwh = _rscp_kwh
-                        # car_connected aus RSCP ist zuverlaessiger als wb_locked aus C++ Polling
-                        wb1_locked = bool(_wls.get('car_connected', wb1_locked))
+                        # Tri-State strikt erhalten: None ist keine bestätigte
+                        # Trennung und darf die aktuelle Wahrheit nicht in
+                        # bool(None)=False umwandeln.
+                        _rscp_connected = _wls.get('car_connected')
+                        if type(_rscp_connected) is bool:
+                            wb1_locked = _rscp_connected
                         break
                     except Exception:
                         continue  # Nächster Read-Fallback, danach C++-Wert
@@ -11226,6 +11478,17 @@ def main():
                     luxtronik_ww_runtime_contract = (
                         luxtronik_ww_runtime_state(wp_status, wp_data)
                     )
+                    luxtronik_operating_stage_contract = (
+                        luxtronik_operating_stage(
+                            wp_status,
+                            wp_data,
+                            compressor_observation_valid=(
+                                wp_compressor_observation_valid
+                            ),
+                        )
+                        if wp_type == 0
+                        else luxtronik_operating_stage_contract
+                    )
                     luxtronik_ww_budget_demand_active = bool(
                         wp_type == 0
                         and at_mittel > HEIZGRENZE_TEMP
@@ -12762,6 +13025,9 @@ def main():
                 "wp_last_pv_boost_stop_ts": wp_last_pv_boost_stop_ts,
                 "luxtronik_ww_runtime": dict(
                     luxtronik_ww_runtime_contract
+                ),
+                "luxtronik_operating_stage": dict(
+                    luxtronik_operating_stage_contract
                 ),
                 "luxtronik_ww_budget_loss_guard_state": copy.deepcopy(
                     luxtronik_ww_budget_loss_guard_state

@@ -113,6 +113,28 @@ HISTORY_DIR = "/var/www/html/data/history_backups"
 EMERGENCY_CURVE_FILE = os.path.join(RAMDISK_DIR, "storage_emergency_curve.json")
 
 
+def _predump_deadline_ts(
+    day_ms,
+    pv_start_ts,
+    *,
+    battery_full_ts=None,
+    morning_soc=0.0,
+    morning_hour=0.0,
+):
+    """Begrenzt jeden Pre-Dump auf den frühesten Kurvenstartanker."""
+
+    candidates = [float(pv_start_ts)]
+    if battery_full_ts is not None and float(battery_full_ts) > 0.0:
+        candidates.append(float(battery_full_ts))
+    if float(morning_soc or 0.0) > 0.0:
+        morning_ts = float(day_ms) + max(
+            0.0,
+            min(23.75, float(morning_hour or 0.0)),
+        ) * 3600000.0
+        candidates.append(morning_ts)
+    return min(candidates)
+
+
 def _stable_json_object(path, max_bytes=2 * 1024 * 1024):
     """Liest genau eine reguläre, unveränderte JSON-Dateigeneration."""
 
@@ -5647,7 +5669,12 @@ class StorageSimulator:
             if _hard_predump_requested:
                 day_label = _curve_day_label(day_ms)
                 now_ms = time.time() * 1000
-                hard_deadline_ts = day_ms + max(0.0, min(23.75, float(self.morning_hour))) * 3600000 if self.morning_soc > 0 else pv_start_ts
+                hard_deadline_ts = _predump_deadline_ts(
+                    day_ms,
+                    pv_start_ts,
+                    morning_soc=self.morning_soc,
+                    morning_hour=self.morning_hour,
+                )
                 hard_dump_wh_target = self.capacity_wh * max(0.0, float(start_soc_day) - hard_predump_target_soc) / 100.0
                 if hard_dump_wh_target < 200.0:
                     logger.info(
@@ -5823,14 +5850,13 @@ class StorageSimulator:
             now_ms      = time.time() * 1000
             # Aktiver Pre-Dump ist ein Vorab-Pfad und endet am Kurvenstart.
             # Nach Kurvenstart darf nur noch die Ladekurve Speicherplatz halten.
-            predump_deadline_ts = battery_full_ts
-            if self.morning_soc > 0:
-                predump_deadline_ts = min(
-                    predump_deadline_ts,
-                    day_ms + max(0.0, min(23.75, float(self.morning_hour))) * 3600000,
-                )
-            else:
-                predump_deadline_ts = min(predump_deadline_ts, pv_start_ts)
+            predump_deadline_ts = _predump_deadline_ts(
+                day_ms,
+                pv_start_ts,
+                battery_full_ts=battery_full_ts,
+                morning_soc=self.morning_soc,
+                morning_hour=self.morning_hour,
+            )
 
             predump_window_h_raw = self._safe_float(self.v4_config.get("pd_max_hours", 5.0), 5.0)
             predump_window_h = predump_window_h_raw if predump_window_h_raw > 0 else 5.0

@@ -5,8 +5,6 @@ let flowAnimationCache = {};
 let priceTendencyHtml = '';
 let statsViewActive = false;
 let currentStatsDate = 'today';
-const WALLBOX_DISPLAY_HOLD_MS = 45000;
-let wallboxDisplayCache = {};
 const FLOW_COLOR_DEFAULTS = {
     pv: '#ffc107',
     external_pv: '#22c55e',
@@ -704,90 +702,6 @@ window.addEventListener('blur', () => clearEnergyFlowDrag(null, {force: true}));
 document.addEventListener('visibilitychange', () => {
     if (document.hidden) clearEnergyFlowDrag(null, {force: true});
 });
-
-function wallboxDisplayLooksActive(data, key) {
-    if (!data) return false;
-    const suffix = key === 'wb2' ? '2' : '';
-    const power = Math.abs(parseFloat(data[key] || 0));
-    const phasePower = Math.abs(parseFloat(data[`${key}_p1`] || 0)) +
-        Math.abs(parseFloat(data[`${key}_p2`] || 0)) +
-        Math.abs(parseFloat(data[`${key}_p3`] || 0));
-    const status = key === 'wb' ? String(data.wb_status || '').toLowerCase() : '';
-    const chargingLike =
-        data[`wb${suffix}_charging`] === true ||
-        (key === 'wb' && data.charging_active === true) ||
-        status.includes('lad') ||
-        status.includes('läd');
-
-    return phasePower > 50 || (power > 50 && chargingLike) || chargingLike;
-}
-
-function smoothWallboxDisplayValue(data, key) {
-    if (!data || data[key] === undefined) return;
-
-    const now = Date.now();
-    const suffix = key === 'wb2' ? '2' : '';
-    const kvaKey = `${key}_kva`;
-    const pfKey = `${key}_power_factor`;
-    const phaseKeys = [`${key}_p1`, `${key}_p2`, `${key}_p3`];
-    const phaseSum = phaseKeys.reduce((sum, phaseKey) => sum + Math.abs(parseFloat(data[phaseKey] || 0)), 0);
-    let currentPower = Math.abs(parseFloat(data[key] || 0));
-    const active = wallboxDisplayLooksActive(data, key);
-    const prev = wallboxDisplayCache[key];
-
-    if (!active && currentPower > 50) {
-        data[key] = 0;
-        currentPower = 0;
-        delete wallboxDisplayCache[key];
-    }
-
-    if (phaseSum > 50 && currentPower <= 50) {
-        data[key] = phaseSum;
-        currentPower = phaseSum;
-        data[`wb${suffix}_display_held`] = true;
-    }
-
-    if (key === 'wb') {
-        const ampLimit = Math.max(parseFloat(data.set_amp || 0), parseFloat(data.cap_amp || 0));
-        const phases = Math.max(1, parseInt(data.wb_phases || data.detected_phases || 0, 10) || 1);
-        const expectedPower = ampLimit * 230 * phases;
-        const implausibleMax = currentPower > 1000 &&
-            ((expectedPower > 0 && currentPower > expectedPower * 1.45) || (expectedPower <= 0 && currentPower > 18000));
-        if (implausibleMax && prev && now - prev.ts < WALLBOX_DISPLAY_HOLD_MS) {
-            data[key] = prev.power;
-            currentPower = prev.power;
-            data[`wb${suffix}_display_held`] = true;
-        }
-    }
-
-    if (active && currentPower > 50) {
-        wallboxDisplayCache[key] = {
-            power: currentPower,
-            kva: parseFloat(data[kvaKey] || 0),
-            powerFactor: parseFloat(data[pfKey] || 0),
-            ts: now,
-            locked: data[`${key}_locked`] === true,
-            plug: data[`${key}_plug`] === true
-        };
-        return;
-    }
-
-    if (active && prev && now - prev.ts < WALLBOX_DISPLAY_HOLD_MS) {
-        data[key] = prev.power;
-        data[`wb${suffix}_display_held`] = true;
-        if (prev.kva > 0 && !(parseFloat(data[kvaKey] || 0) > 0)) data[kvaKey] = prev.kva;
-        if (prev.powerFactor > 0 && !(parseFloat(data[pfKey] || 0) > 0)) data[pfKey] = prev.powerFactor;
-        if (prev.locked || prev.plug) {
-            data[`${key}_locked`] = true;
-            data[`${key}_plug`] = true;
-        }
-    }
-}
-
-function smoothWallboxDisplayValues(data) {
-    smoothWallboxDisplayValue(data, 'wb');
-    smoothWallboxDisplayValue(data, 'wb2');
-}
 
 /**
  * Helper function for dynamic battery colors and icons
@@ -1926,8 +1840,60 @@ function storageTrajectoryNumberOrNull(value) {
     return Number.isFinite(parsed) ? parsed : null;
 }
 
-function storageBaseTrajectoryEvidence(rawBase, planId) {
+function storageSimCurveStatusReason(status, planId, pointCount) {
+    if (!status || typeof status !== 'object' || Array.isArray(status)) return null;
+    if (status.schema_version !== 'storage_sim_curve_status_v1') {
+        return 'STORAGE_SIM_CURVE_STATUS_INVALID';
+    }
+    const state = String(status.status || '').trim().toUpperCase();
+    const reasonCode = String(status.reason_code || '').trim().toUpperCase();
+    const statusPlanId = String(status.plan_id || '');
+    if (!/^sha256:[0-9a-f]{64}$/.test(statusPlanId)) {
+        if (['STORAGE_PLAN_MISSING', 'STORAGE_PLAN_STALE', 'CANONICAL_PLAN_INVALID'].includes(reasonCode)) {
+            return reasonCode;
+        }
+        return 'STORAGE_SIM_CURVE_STATUS_PLAN_MISMATCH';
+    }
+    if (statusPlanId !== planId) {
+        return 'STORAGE_SIM_CURVE_STATUS_PLAN_MISMATCH';
+    }
+    const slotCount = Number(status.slot_count);
+    const validSocCount = Number(status.valid_soc_count);
+    const displayDayStart = Number(status.display_day_start_ts_ms);
+    if (!Number.isInteger(slotCount) || slotCount < 0
+        || !Number.isInteger(validSocCount) || validSocCount < 0) {
+        return 'STORAGE_SIM_CURVE_STATUS_INVALID';
+    }
+    if (state === 'READY') {
+        const slotIds = Array.isArray(status.slot_ids) ? status.slot_ids : [];
+        const slotStarts = Array.isArray(status.slot_start_ts_ms) ? status.slot_start_ts_ms : [];
+        const slotAxisValid = slotIds.length === slotCount
+            && slotStarts.length === slotCount
+            && slotIds.every(slotId => /^sha256:[0-9a-f]{64}$/.test(String(slotId || '')))
+            && new Set(slotIds).size === slotIds.length
+            && slotStarts.every((ts, index) => Number.isFinite(Number(ts))
+                && Number(ts) > 0
+                && (index === 0 || Number(ts) > Number(slotStarts[index - 1])))
+            && new Set(slotStarts.map(Number)).size === slotStarts.length;
+        if (!Number.isFinite(displayDayStart) || displayDayStart <= 0
+            || !slotAxisValid
+            || validSocCount < 2 || pointCount !== validSocCount) {
+            return 'STORAGE_SIM_CURVE_STATUS_COUNT_MISMATCH';
+        }
+        return null;
+    }
+    if (state === 'HIDDEN') return reasonCode || 'PROJECTION_HIDDEN_BY_EFFECTIVE_PLAN';
+    return reasonCode || 'STORAGE_SIM_CURVE_UNAVAILABLE';
+}
+
+function storageBaseTrajectoryEvidence(rawBase, planId, status = null) {
     const evidenceLimit = reasonCode => ({state: 'evidence_limit', reasonCode, soc: []});
+    const statusReason = storageSimCurveStatusReason(
+        status,
+        planId,
+        Array.isArray(rawBase) ? rawBase.length : 0
+    );
+    if (statusReason) return evidenceLimit(statusReason);
     if (!Array.isArray(rawBase) || rawBase.length === 0) {
         return evidenceLimit('STORAGE_BASE_FORECAST_MISSING');
     }
@@ -1949,23 +1915,51 @@ function storageBaseTrajectoryEvidence(rawBase, planId) {
     if (rawBase.some(point => typeof point.slot_id !== 'string' || point.slot_id.trim() === '')) {
         return evidenceLimit('STORAGE_BASE_SLOT_BINDING_MISSING');
     }
+    if (rawBase.some(point => !/^sha256:[0-9a-f]{64}$/.test(point.slot_id))) {
+        return evidenceLimit('STORAGE_BASE_SLOT_BINDING_INVALID');
+    }
+    if (status && rawBase.some(point => !['canonical_projection', 'legacy_plan_bound'].includes(point.projection_source))) {
+        return evidenceLimit('STORAGE_BASE_SOURCE_BINDING_INVALID');
+    }
     if (rawBase.some(point => {
         const ts = storageTrajectoryNumberOrNull(point.ts);
         return ts === null || ts <= 0;
     })) {
         return evidenceLimit('STORAGE_BASE_TIMESTAMP_INVALID');
     }
-    if (rawBase.some(point => storageTrajectoryNumberOrNull(point.soc) === null)) {
+    if (rawBase.some(point => {
+        const soc = storageTrajectoryNumberOrNull(point.soc);
+        return soc === null || soc < 0 || soc > 100;
+    })) {
         return evidenceLimit('STORAGE_BASE_SOC_INVALID');
+    }
+    const sourceTimestamps = rawBase.map(point => storageTrajectoryNumberOrNull(point.ts));
+    if (sourceTimestamps.some((ts, index) => index > 0 && ts <= sourceTimestamps[index - 1])) {
+        return evidenceLimit('STORAGE_BASE_SLOT_BINDING_INVALID');
+    }
+    if (status) {
+        const slotAxis = new Map(status.slot_ids.map((slotId, index) => [
+            slotId,
+            Number(status.slot_start_ts_ms[index])
+        ]));
+        if (rawBase.some(point => !slotAxis.has(point.slot_id)
+            || Number(point.ts) !== slotAxis.get(point.slot_id))) {
+            return evidenceLimit('STORAGE_BASE_SLOT_BINDING_INVALID');
+        }
+    }
+    const normalized = rawBase.map(point => ({
+        ts: storageTrajectoryNumberOrNull(point.ts),
+        soc: storageTrajectoryNumberOrNull(point.soc),
+        slotId: point.slot_id.trim()
+    })).sort((a, b) => a.ts - b.ts);
+    if (new Set(normalized.map(point => point.slotId)).size !== normalized.length
+        || new Set(normalized.map(point => point.ts)).size !== normalized.length) {
+        return evidenceLimit('STORAGE_BASE_SLOT_BINDING_INVALID');
     }
     return {
         state: 'complete',
         reasonCode: null,
-        soc: rawBase.map(point => ({
-            ts: storageTrajectoryNumberOrNull(point.ts),
-            soc: storageTrajectoryNumberOrNull(point.soc),
-            slotId: point.slot_id.trim()
-        })).sort((a, b) => a.ts - b.ts)
+        soc: normalized
     };
 }
 
@@ -1975,9 +1969,14 @@ function storageTrajectoryViewModel(data = {}) {
         : {};
     const planId = typeof meta.plan_id === 'string' ? meta.plan_id : '';
     const rawBase = Array.isArray(data && data.storage_sim_curve) ? data.storage_sim_curve : [];
+    const status = data && data.storage_sim_curve_status && typeof data.storage_sim_curve_status === 'object'
+        ? data.storage_sim_curve_status
+        : (meta.storage_sim_curve_status && typeof meta.storage_sim_curve_status === 'object'
+            ? meta.storage_sim_curve_status
+            : null);
     return {
         planId,
-        base: storageBaseTrajectoryEvidence(rawBase, planId),
+        base: storageBaseTrajectoryEvidence(rawBase, planId, status),
         directMarketing: directMarketingTrajectoryViewModel(data)
     };
 }
@@ -2058,6 +2057,82 @@ function storageTargetCurveForDisplay(targetCurve, curveAnchors) {
     };
 }
 
+function storageCurveBundleAssessment(data, planId) {
+    const status = data && data.storage_sim_curve_status && typeof data.storage_sim_curve_status === 'object'
+        ? data.storage_sim_curve_status
+        : (data && data.storage_plan_meta?.storage_sim_curve_status
+            && typeof data.storage_plan_meta.storage_sim_curve_status === 'object'
+            ? data.storage_plan_meta.storage_sim_curve_status
+            : null);
+    const hidden = data && data.storage_plan_meta?.clear_classical_curves === true;
+    if (hidden && status && status.plan_id === planId
+        && String(status.status || '').toUpperCase() === 'HIDDEN') {
+        return {complete: true, hidden: true, status};
+    }
+    const curve = Array.isArray(data && data.storage_sim_curve)
+        ? data.storage_sim_curve
+        : [];
+    // Übergangskompatibilität: Ein Browser kann nach Update oder Rollback
+    // kurz neues JavaScript mit einer älteren, aber vollständig plan- und
+    // slotgebundenen Antwort kombinieren. Ohne den neuen Statusvertrag darf
+    // diese belegte Alt-Kurve weiter angezeigt werden; Zielkurven werden
+    // dabei weder ergänzt noch als SoC-Prognose umgedeutet.
+    if (!status) {
+        const legacySlotIds = curve.map(point => point && point.slot_id);
+        const legacyTimestamps = curve.map(point => storageTrajectoryNumberOrNull(point && point.ts));
+        const legacyComplete = /^sha256:[0-9a-f]{64}$/.test(planId)
+            && curve.length >= 2
+            && new Set(legacySlotIds).size === curve.length
+            && new Set(legacyTimestamps).size === curve.length
+            && legacyTimestamps.every((ts, index) => Number.isFinite(ts)
+                && ts > 0
+                && (index === 0 || ts > legacyTimestamps[index - 1]))
+            && curve.every(point => {
+                if (!point || typeof point !== 'object'
+                    || point.plan_id !== planId
+                    || !/^sha256:[0-9a-f]{64}$/.test(String(point.slot_id || ''))) {
+                    return false;
+                }
+                const soc = storageTrajectoryNumberOrNull(point.soc);
+                return soc !== null && soc >= 0 && soc <= 100;
+            });
+        return {
+            complete: legacyComplete,
+            hidden: false,
+            status: null,
+            reasonCode: legacyComplete ? null : 'PENDING_PLAN_SYNC'
+        };
+    }
+    const statusReason = storageSimCurveStatusReason(status, planId, curve.length);
+    const slotAxis = status && Array.isArray(status.slot_ids) && Array.isArray(status.slot_start_ts_ms)
+        ? new Map(status.slot_ids.map((slotId, index) => [slotId, Number(status.slot_start_ts_ms[index])]))
+        : new Map();
+    const slotIds = curve.map(point => point && point.slot_id);
+    const timestamps = curve.map(point => storageTrajectoryNumberOrNull(point && point.ts));
+    const pointsBound = curve.length >= 2
+        && new Set(slotIds).size === curve.length
+        && new Set(timestamps).size === curve.length
+        && timestamps.every((ts, index) => index === 0 || ts > timestamps[index - 1])
+        && curve.every(point => (
+        point && typeof point === 'object'
+        && point.plan_id === planId
+        && /^sha256:[0-9a-f]{64}$/.test(String(point.slot_id || ''))
+        && storageTrajectoryNumberOrNull(point.ts) !== null
+        && storageTrajectoryNumberOrNull(point.soc) !== null
+        && storageTrajectoryNumberOrNull(point.soc) >= 0
+        && storageTrajectoryNumberOrNull(point.soc) <= 100
+        && slotAxis.has(point.slot_id)
+        && Number(point.ts) === slotAxis.get(point.slot_id)
+        && ['canonical_projection', 'legacy_plan_bound'].includes(point.projection_source)
+    ));
+    return {
+        complete: statusReason === null && pointsBound,
+        hidden: false,
+        status,
+        reasonCode: statusReason || 'PENDING_PLAN_SYNC'
+    };
+}
+
 function cacheStorageCurveData(data) {
     if (!data || typeof data !== 'object') return;
     const previousData = window._storageLiveData && typeof window._storageLiveData === 'object'
@@ -2071,6 +2146,15 @@ function cacheStorageCurveData(data) {
         : '';
     const planChanged = Boolean(previousPlanId && incomingPlanId && previousPlanId !== incomingPlanId);
     const mergedData = {...previousData, ...data};
+    const incomingHasBundleFields = Object.prototype.hasOwnProperty.call(data, 'storage_sim_curve')
+        || Object.prototype.hasOwnProperty.call(data, 'storage_sim_curve_status')
+        || (data.storage_plan_meta && Object.prototype.hasOwnProperty.call(
+            data.storage_plan_meta,
+            'storage_sim_curve_status'
+        ));
+    const incomingAssessment = incomingPlanId
+        ? storageCurveBundleAssessment(data, incomingPlanId)
+        : null;
     const clearClassicalCurves = data.storage_plan_meta
         && data.storage_plan_meta.clear_classical_curves === true;
 
@@ -2085,7 +2169,20 @@ function cacheStorageCurveData(data) {
     // Planwechsel werden dagegen alte Kurven verworfen, bis die neuen,
     // planidentisch gebundenen Daten eintreffen.
     if (planChanged) {
-        [
+        const planScopedKeys = [
+            'storage_target_curve',
+            'storage_soc_min_curve',
+            'storage_soc_ceiling_curve',
+            'storage_sim_curve',
+            'storage_sim_curve_status',
+            'storage_curve_anchors',
+            'ladekurve',
+            'storage_dispatch_runtime',
+            'effective_storage_plan',
+            'direct_marketing_trajectory',
+            'direct_marketing_selected_action_fallback'
+        ];
+        const arrayKeys = new Set([
             'storage_target_curve',
             'storage_soc_min_curve',
             'storage_soc_ceiling_curve',
@@ -2093,11 +2190,67 @@ function cacheStorageCurveData(data) {
             'storage_curve_anchors',
             'direct_marketing_trajectory',
             'direct_marketing_selected_action_fallback'
-        ].forEach(key => {
-            if (!Object.prototype.hasOwnProperty.call(data, key)) mergedData[key] = [];
+        ]);
+        planScopedKeys.forEach(key => {
+            if (!Object.prototype.hasOwnProperty.call(data, key)) {
+                mergedData[key] = arrayKeys.has(key) ? [] : null;
+            }
         });
-        if (!Object.prototype.hasOwnProperty.call(data, 'effective_storage_plan')) {
-            mergedData.effective_storage_plan = null;
+    }
+
+    const explicitPendingBundle = incomingPlanId
+        && incomingHasBundleFields
+        && !(incomingAssessment && incomingAssessment.complete);
+    if ((planChanged && !(incomingAssessment && incomingAssessment.complete))
+        || explicitPendingBundle) {
+        const curvesToClear = planChanged
+            ? [
+                'storage_target_curve',
+                'storage_soc_min_curve',
+                'storage_soc_ceiling_curve',
+                'storage_sim_curve',
+                'storage_curve_anchors'
+            ]
+            : ['storage_sim_curve'];
+        curvesToClear.forEach(key => { mergedData[key] = []; });
+        const incomingStatus = incomingAssessment && incomingAssessment.status
+            && incomingAssessment.status.plan_id === incomingPlanId
+            ? incomingAssessment.status
+            : null;
+        const pendingStatus = {
+            schema_version: 'storage_sim_curve_status_v1',
+            status: incomingStatus
+                && ['PENDING', 'UNAVAILABLE', 'INVALID'].includes(String(incomingStatus.status || '').toUpperCase())
+                ? String(incomingStatus.status).toUpperCase()
+                : 'PENDING',
+            reason_code: incomingAssessment?.reasonCode || 'PENDING_PLAN_SYNC',
+            plan_id: incomingPlanId,
+            display_day: incomingStatus?.display_day ?? data.storage_plan_meta?.display_day ?? null,
+            display_day_start_ts_ms: Number(
+                incomingStatus?.display_day_start_ts_ms
+                ?? data.storage_plan_meta?.display_day_start
+                ?? Date.now()
+            ),
+            slot_count: Number.isInteger(Number(incomingStatus?.slot_count))
+                ? Number(incomingStatus.slot_count)
+                : 0,
+            valid_soc_count: Number.isInteger(Number(incomingStatus?.valid_soc_count))
+                ? Number(incomingStatus.valid_soc_count)
+                : 0,
+            slot_ids: Array.isArray(incomingStatus?.slot_ids)
+                ? incomingStatus.slot_ids.slice()
+                : [],
+            slot_start_ts_ms: Array.isArray(incomingStatus?.slot_start_ts_ms)
+                ? incomingStatus.slot_start_ts_ms.slice()
+                : [],
+            source: incomingStatus?.source ?? null
+        };
+        mergedData.storage_sim_curve_status = pendingStatus;
+        if (mergedData.storage_plan_meta && typeof mergedData.storage_plan_meta === 'object') {
+            mergedData.storage_plan_meta = {
+                ...mergedData.storage_plan_meta,
+                storage_sim_curve_status: pendingStatus
+            };
         }
     }
 
@@ -2116,6 +2269,10 @@ function cacheStorageCurveData(data) {
     else if (!Array.isArray(window._storageSocCeilingCurve)) window._storageSocCeilingCurve = [];
     if (Array.isArray(mergedData.storage_sim_curve)) window._storageSimCurve = mergedData.storage_sim_curve;
     else if (!Array.isArray(window._storageSimCurve)) window._storageSimCurve = [];
+    window._storageSimCurveStatus = mergedData.storage_sim_curve_status
+        && typeof mergedData.storage_sim_curve_status === 'object'
+        ? mergedData.storage_sim_curve_status
+        : null;
     window._storageDispatchRuntime = storageDispatchRuntimeForDisplay(mergedData);
     window._storageDispatchRuntimeBinding = mergedData.storage_dispatch_runtime && typeof mergedData.storage_dispatch_runtime === 'object'
         ? (window._storageDispatchRuntime ? 'bound' : 'mismatch')
@@ -2176,7 +2333,16 @@ function storageSparklineSeries(data = {}) {
     const trajectory = storageTrajectoryViewModel(data);
     const planId = trajectory.planId;
     if (!/^sha256:[0-9a-f]{64}$/.test(planId)) {
-        return {state: 'missing_plan', reasonCode: 'STORAGE_PLAN_ID_INVALID', planId: '', forecast: [], target: []};
+        const unboundReason = String(data.storage_sim_curve_status?.reason_code || '').trim().toUpperCase();
+        return {
+            state: unboundReason === 'STORAGE_PLAN_STALE' ? 'stale_plan' : 'missing_plan',
+            reasonCode: ['STORAGE_PLAN_MISSING', 'STORAGE_PLAN_STALE'].includes(unboundReason)
+                ? unboundReason
+                : 'STORAGE_PLAN_ID_INVALID',
+            planId: '',
+            forecast: [],
+            target: []
+        };
     }
     const projectionDisplay = storageSparklineProjectionDisplay(data);
     if (projectionDisplay) {
@@ -2191,8 +2357,21 @@ function storageSparklineSeries(data = {}) {
             STORAGE_BASE_PLAN_BINDING_INVALID: 'invalid_plan_binding',
             STORAGE_BASE_PLAN_MISMATCH: 'plan_mismatch',
             STORAGE_BASE_SLOT_BINDING_MISSING: 'missing_slot_id',
+            STORAGE_BASE_SLOT_BINDING_INVALID: 'invalid_slot_id',
             STORAGE_BASE_TIMESTAMP_INVALID: 'invalid_timestamp',
-            STORAGE_BASE_SOC_INVALID: 'invalid_soc'
+            STORAGE_BASE_SOC_INVALID: 'invalid_soc',
+            STORAGE_BASE_SOURCE_BINDING_INVALID: 'invalid_source_binding',
+            STORAGE_SIM_CURVE_STATUS_PLAN_MISMATCH: 'plan_mismatch',
+            STORAGE_SIM_CURVE_STATUS_COUNT_MISMATCH: 'status_count_mismatch',
+            STORAGE_SIM_CURVE_STATUS_INVALID: 'invalid_status',
+            PLAN_STATE_MISMATCH: 'plan_state_mismatch',
+            PENDING_PLAN_SYNC: 'pending_plan_sync',
+            PROJECTION_SOC_MISSING: 'projection_soc_missing',
+            PROJECTION_SOC_TOO_SHORT: 'projection_soc_too_short',
+            DISPLAY_DAY_WITHOUT_SLOTS: 'display_day_without_slots',
+            CANONICAL_PLAN_INVALID: 'invalid_plan',
+            CANONICAL_SLOT_AXIS_INVALID: 'invalid_slot_axis',
+            STORAGE_PLAN_STALE: 'stale_plan'
         };
         return {
             state: stateByReason[trajectory.base.reasonCode] || 'invalid_forecast',
@@ -2344,6 +2523,22 @@ function storageSparklineUnavailableDisplay(data = {}, series = {}) {
         return storageSparklineProjectionDisplay(data)
             || {curveState: 'hidden', text: 'SoC-Prognose bewusst ausgeblendet'};
     }
+    const reasons = {
+        PLAN_STATE_MISMATCH: {curveState: 'mismatch', text: 'Speicherplan und Managerstand passen noch nicht zusammen'},
+        PENDING_PLAN_SYNC: {curveState: 'pending', text: 'Neue Speicherplan-Prognose wird synchronisiert'},
+        PROJECTION_SOC_MISSING: {curveState: 'missing', text: 'Speicherplan enthält keine SoC-Projektionswerte'},
+        PROJECTION_SOC_TOO_SHORT: {curveState: 'incomplete', text: 'SoC-Projektion hat weniger als zwei gültige Punkte'},
+        DISPLAY_DAY_WITHOUT_SLOTS: {curveState: 'missing', text: 'Für den Anzeigetag fehlen Speicherplan-Slots'},
+        CANONICAL_PLAN_INVALID: {curveState: 'invalid', text: 'Speicherplan ist nicht kanonisch gebunden'},
+        CANONICAL_SLOT_AXIS_INVALID: {curveState: 'invalid', text: 'Speicherplan enthält eine ungültige Slotachse'},
+        STORAGE_PLAN_MISSING: {curveState: 'missing', text: 'Kein aktueller Speicherplan'},
+        STORAGE_PLAN_STALE: {curveState: 'stale', text: 'Speicherplan ist veraltet'},
+        STORAGE_SIM_CURVE_STATUS_PLAN_MISMATCH: {curveState: 'mismatch', text: 'SoC-Projektion gehört zu einer anderen Planrevision'},
+        STORAGE_SIM_CURVE_STATUS_COUNT_MISMATCH: {curveState: 'incomplete', text: 'SoC-Projektion ist noch nicht vollständig übertragen'},
+        STORAGE_SIM_CURVE_STATUS_INVALID: {curveState: 'invalid', text: 'SoC-Projektionsstatus ist ungültig'}
+    };
+    const reasonCode = String(series.reasonCode || '').trim().toUpperCase();
+    if (reasons[reasonCode]) return reasons[reasonCode];
     const states = {
         missing_plan: {curveState: 'missing', text: 'Kein Speicherplan'},
         missing_forecast: {curveState: 'missing', text: 'Keine SoC-Prognose'},
@@ -2353,6 +2548,7 @@ function storageSparklineUnavailableDisplay(data = {}, series = {}) {
         invalid_plan_binding: {curveState: 'invalid', text: 'SoC-Prognose mit ungültiger Planbindung'},
         plan_mismatch: {curveState: 'mismatch', text: 'Planrevision passt nicht'},
         missing_slot_id: {curveState: 'invalid', text: 'SoC-Prognose ohne Slot-Bindung'},
+        invalid_slot_id: {curveState: 'invalid', text: 'SoC-Prognose mit ungültiger Slot-Bindung'},
         invalid_timestamp: {curveState: 'invalid', text: 'SoC-Prognose mit ungültiger Zeit'},
         invalid_soc: {curveState: 'invalid', text: 'SoC-Prognose mit ungültigem SoC'},
         invalid_forecast: {curveState: 'invalid', text: 'SoC-Prognose ungültig'}
@@ -6441,9 +6637,6 @@ function updateStatsUI(data, mode) {
         const elGridTotal = document.getElementById(prefix + 'stat-grid-total');
         if (elGridTotal) elGridTotal.innerText = `${(stats.total_grid_in_kwh||0).toFixed(2)} kWh`;
 
-        const pvWb = sumKwh(stats, ['pv_wb_kwh', 'pv_wb2_kwh']);
-        const batWb = sumKwh(stats, ['bat_wb_kwh', 'bat_wb2_kwh']);
-        const gridWb = sumKwh(stats, ['grid_wb_kwh', 'grid_wb2_kwh']);
         const climateTotalRaw = parseFloat(stats.total_climate_kwh);
         const climateTotal = Number.isFinite(climateTotalRaw) ? climateTotalRaw : sumKwh(stats, ['pv_climate_kwh', 'grid_climate_kwh', 'bat_climate_kwh']);
 
@@ -6455,15 +6648,21 @@ function updateStatsUI(data, mode) {
         }
         setStatVisible('stat-pv-source-rest', 'stat-pv-source-rest-row', stats.pv_source_rest_kwh, stats.pv_source_rest_pct);
         setStat('stat-pv-home', stats.pv_home_kwh, stats.pv_home_pct); setStat('stat-pv-bat', stats.pv_bat_kwh, stats.pv_bat_pct);
-        setStat('stat-pv-wb', pvWb, pctOf(pvWb, stats.total_pv_kwh)); setStat('stat-pv-wp', stats.pv_wp_kwh, stats.pv_wp_pct);
+        setStat('stat-pv-wb', stats.pv_wb_kwh, pctOf(stats.pv_wb_kwh, stats.total_pv_kwh));
+        setStat('stat-pv-wb2', stats.pv_wb2_kwh, pctOf(stats.pv_wb2_kwh, stats.total_pv_kwh));
+        setStat('stat-pv-wp', stats.pv_wp_kwh, stats.pv_wp_pct);
         setStat('stat-pv-climate', stats.pv_climate_kwh, pctOf(stats.pv_climate_kwh, stats.total_pv_kwh));
         setStat('stat-pv-grid', stats.pv_grid_kwh, stats.pv_grid_pct);
-        setStat('stat-bat-home', stats.bat_home_kwh, stats.bat_home_pct); setStat('stat-bat-wb', batWb, pctOf(batWb, stats.total_bat_out_kwh));
+        setStat('stat-bat-home', stats.bat_home_kwh, stats.bat_home_pct);
+        setStat('stat-bat-wb', stats.bat_wb_kwh, pctOf(stats.bat_wb_kwh, stats.total_bat_out_kwh));
+        setStat('stat-bat-wb2', stats.bat_wb2_kwh, pctOf(stats.bat_wb2_kwh, stats.total_bat_out_kwh));
         setStat('stat-bat-wp', stats.bat_wp_kwh, stats.bat_wp_pct);
         setStat('stat-bat-climate', stats.bat_climate_kwh, pctOf(stats.bat_climate_kwh, stats.total_bat_out_kwh));
         setStat('stat-bat-grid', stats.bat_grid_kwh, stats.bat_grid_pct);
         setStat('stat-grid-home', stats.grid_home_kwh, stats.grid_home_pct); setStat('stat-grid-bat', stats.grid_bat_kwh, stats.grid_bat_pct);
-        setStat('stat-grid-wb', gridWb, pctOf(gridWb, stats.total_grid_in_kwh)); setStat('stat-grid-wp', stats.grid_wp_kwh, stats.grid_wp_pct);
+        setStat('stat-grid-wb', stats.grid_wb_kwh, pctOf(stats.grid_wb_kwh, stats.total_grid_in_kwh));
+        setStat('stat-grid-wb2', stats.grid_wb2_kwh, pctOf(stats.grid_wb2_kwh, stats.total_grid_in_kwh));
+        setStat('stat-grid-wp', stats.grid_wp_kwh, stats.grid_wp_pct);
         setStat('stat-grid-climate', stats.grid_climate_kwh, pctOf(stats.grid_climate_kwh, stats.total_grid_in_kwh));
 
         // Zusatzwerte für Mix-Center (Einspeisung, Bat-Laden)
@@ -6519,13 +6718,15 @@ function updateStatsUI(data, mode) {
 
         setCost('stat-cost-total', netCostTotal);
         setCost('stat-cost-home', data.costs.home);
-        setCost('stat-cost-wb', (data.costs.wb || 0) + (data.costs.wb2 || 0));
+        setCost('stat-cost-wb', data.costs.wb);
+        setCost('stat-cost-wb2', data.costs.wb2);
         setCost('stat-cost-wp', data.costs.wp);
         setCost('stat-cost-climate', data.costs.climate);
 
         setCost('stat-save-total', saveTotal);
         setCost('stat-save-home', data.costs.save_home);
-        setCost('stat-save-wb', (data.costs.save_wb || 0) + (data.costs.save_wb2 || 0));
+        setCost('stat-save-wb', data.costs.save_wb);
+        setCost('stat-save-wb2', data.costs.save_wb2);
         setCost('stat-save-wp', data.costs.save_wp);
         setCost('stat-save-climate', data.costs.save_climate);
 
@@ -6693,7 +6894,7 @@ function fixPermissions(btnId = 'btn-repair-permissions') {
     // Rechteprojektion, Backup, Releaseabgleich und Dienstneustart gehören
     // demselben root-eigenen, argumentlosen Systemjob. Es gibt absichtlich
     // keinen zweiten privilegierten Webpfad für nutzerbeschreibbaren Code.
-    return startInstallerUpdate(btnId);
+    return startInstallerUpdate(btnId, 'permissions_repair');
 }
 
 function showWatchdogLog() {
@@ -6843,7 +7044,7 @@ function e3dcActionUrl(query) {
     return e3dcActionEndpoint() + (q ? '?' + q : '');
 }
 
-function e3dcPostAction(query, values = {}) {
+function e3dcPostAction(query, values = {}, options = {}) {
     const body = new URLSearchParams();
     Object.entries(values || {}).forEach(([key, value]) => {
         body.set(key, String(value));
@@ -6857,6 +7058,7 @@ function e3dcPostAction(query, values = {}) {
             'X-Requested-With': 'XMLHttpRequest',
             'X-CSRF-Token': String(window.E3DC_CSRF_TOKEN || '')
         },
+        signal: options && options.signal ? options.signal : undefined,
         body
     });
 }
@@ -6971,6 +7173,124 @@ async function e3dcParseJsonResponse(response, context = 'Anfrage') {
     }
 }
 
+const E3DC_INSTALLER_UPDATE_POLL_TIMEOUT_MS = 10000;
+const E3DC_INSTALLER_UPDATE_START_TIMEOUT_MS = 30000;
+
+function e3dcNormalizeSelfUpdateRunId(value) {
+    const normalized = (typeof value === 'string') ? value.trim().toLowerCase() : '';
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(normalized)
+        ? normalized
+        : null;
+}
+
+function e3dcFetchUpdateJsonWithTimeout(url, timeoutMs = E3DC_INSTALLER_UPDATE_POLL_TIMEOUT_MS) {
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    let timeoutId = null;
+    const timeoutPromise = new Promise((_resolve, reject) => {
+        timeoutId = window.setTimeout(() => {
+            if (controller) controller.abort();
+            const error = new Error('Statusabfrage überschritt das Zeitlimit');
+            error.name = 'AbortError';
+            reject(error);
+        }, timeoutMs);
+    });
+    const requestPromise = fetch(url, {
+        cache: 'no-store',
+        credentials: 'same-origin',
+        signal: controller ? controller.signal : undefined
+    }).then(response => e3dcParseJsonResponse(response, 'Update-Status'));
+    return Promise.race([requestPromise, timeoutPromise])
+        .finally(() => {
+            if (timeoutId !== null) window.clearTimeout(timeoutId);
+        });
+}
+
+function e3dcPostUpdateActionWithTimeout(query, values = {}, timeoutMs = E3DC_INSTALLER_UPDATE_START_TIMEOUT_MS) {
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    let timeoutId = null;
+    const timeoutPromise = new Promise((_resolve, reject) => {
+        timeoutId = window.setTimeout(() => {
+            if (controller) controller.abort();
+            const error = new Error('Startantwort überschritt das Zeitlimit');
+            error.name = 'AbortError';
+            reject(error);
+        }, timeoutMs);
+    });
+    const requestPromise = e3dcPostAction(
+        query,
+        values,
+        controller ? {signal: controller.signal} : {}
+    );
+    return Promise.race([requestPromise, timeoutPromise])
+        .finally(() => {
+            if (timeoutId !== null) window.clearTimeout(timeoutId);
+        });
+}
+
+async function e3dcReadInstallerUpdateBaseline() {
+    try {
+        const data = await e3dcFetchUpdateJsonWithTimeout(
+            e3dcActionUrl('action=poll_self_update&t=' + Date.now())
+        );
+        return {
+            available: true,
+            runId: e3dcNormalizeSelfUpdateRunId(data && data.run_id),
+            running: Boolean(data && data.running === true),
+        };
+    } catch (_error) {
+        return {available: false, runId: null, running: false};
+    }
+}
+
+function e3dcCreateInstallerUpdateRunBinding(baseline, expectedRunId = null) {
+    const state = (baseline && typeof baseline === 'object') ? baseline : {};
+    const baselineRunId = e3dcNormalizeSelfUpdateRunId(state.runId);
+    const expected = e3dcNormalizeSelfUpdateRunId(expectedRunId);
+    return {
+        baselineAvailable: state.available === true,
+        baselineRunId,
+        baselineWasRunning: state.running === true,
+        expectedRunId: expected,
+        boundRunId: null,
+    };
+}
+
+function e3dcBindInstallerUpdatePoll(data, binding) {
+    const state = (binding && typeof binding === 'object') ? binding : {};
+    const currentRunId = e3dcNormalizeSelfUpdateRunId(data && data.run_id);
+    if (state.boundRunId) {
+        return {
+            bound: currentRunId === state.boundRunId,
+            replaced: Boolean(currentRunId && currentRunId !== state.boundRunId),
+            currentRunId,
+        };
+    }
+    if (state.expectedRunId) {
+        if (currentRunId === state.expectedRunId) {
+            state.boundRunId = currentRunId;
+        }
+    } else if (state.baselineWasRunning && currentRunId === state.baselineRunId
+        && data && data.running === true) {
+        state.boundRunId = currentRunId;
+    } else if (state.baselineRunId && currentRunId && currentRunId !== state.baselineRunId) {
+        state.boundRunId = currentRunId;
+    } else if (state.baselineAvailable && !state.baselineRunId && currentRunId
+        && data && data.running === true) {
+        // Beim ersten Lauf nach Einführung der Laufkennung existiert noch keine
+        // Baseline-ID. Die danach atomar veröffentlichte ID ist trotzdem ein
+        // eindeutiger Zustandswechsel. Ohne explizite Startantwort wird er erst
+        // gebunden, wenn derselbe Folgepoll den Lauf auch aktiv beobachtet.
+        state.boundRunId = currentRunId;
+    } else if (!state.baselineAvailable && currentRunId && data && data.running === true) {
+        state.boundRunId = currentRunId;
+    }
+    return {
+        bound: Boolean(state.boundRunId && currentRunId === state.boundRunId),
+        replaced: false,
+        currentRunId,
+    };
+}
+
 // Installer / Diagramm Update Logik
 function resetInstallerUpdateBadge() {
     const badge = document.getElementById('update-badge-installer');
@@ -7012,7 +7332,8 @@ function checkInstallerUpdate(force = false) {
 // Netzwerkcheck noch von einem Versionsvergleich abhängig.
 document.addEventListener('DOMContentLoaded', () => checkInstallerUpdate(false));
 
-function startInstallerUpdate(btnId = 'btn-update-installer') {
+async function startInstallerUpdate(btnId = 'btn-update-installer', purpose = 'update') {
+    const normalizedPurpose = purpose === 'permissions_repair' ? 'permissions_repair' : 'update';
     const btn = document.getElementById(btnId);
     let origText = '';
     if(btn) {
@@ -7020,15 +7341,77 @@ function startInstallerUpdate(btnId = 'btn-update-installer') {
         btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Starte...';
         btn.disabled = true;
     }
-    const question = "Möchtest Du E3DC-Control auf den veröffentlichten Stable-Stand aktualisieren oder die installierte Version reparieren?\n\nDer Updater erstellt zuerst ein Backup und startet die Dienste nach dem kurzen Dateiaustausch neu.";
+    const question = normalizedPurpose === 'permissions_repair'
+        ? "Möchtest Du die vollständige Systemreparatur starten?\n\nDies ist kein reiner Rechtecheck: Der Systemjob erstellt ein verifiziertes Backup, gleicht alle Produktdateien mit dem veröffentlichten Stable-Stand ab, setzt die Rechte neu und startet die Dienste nach dem kurzen Dateiaustausch wieder. Dabei kann dieselbe Version erneut installiert werden."
+        : "Möchtest Du E3DC-Control auf den veröffentlichten Stable-Stand aktualisieren oder die installierte Version reparieren?\n\nDer Updater erstellt zuerst ein Backup und startet die Dienste nach dem kurzen Dateiaustausch neu.";
     if (!confirm(question)) {
         if (btn) { btn.innerHTML = origText; btn.disabled = false; }
         return;
     }
-    startInstallerUpdateRun(btn, origText);
+    let confirmLocalDrift = false;
+    let confirmationToken = '';
+    try {
+        const response = await e3dcPostUpdateActionWithTimeout(
+            'action=check_self_update_drift&t=' + Date.now(),
+            {}
+        );
+        const preflight = await e3dcParseJsonResponse(response, 'Update-Inhaltsprüfung');
+        if (!preflight || preflight.success !== true) {
+            throw new Error((preflight && preflight.message) || 'Lokale Inhalte konnten nicht geprüft werden.');
+        }
+        const driftItems = Array.isArray(preflight.content_drift) ? preflight.content_drift : [];
+        const driftCount = Number(preflight.content_drift_count || 0);
+        if (driftCount !== driftItems.length) {
+            throw new Error('Die Inhaltsprüfung lieferte keine vollständige Dateiliste.');
+        }
+        if (preflight.requires_confirmation === true || driftCount > 0) {
+            const paths = driftItems.map(item => {
+                const path = String(item && item.path || '');
+                const status = String(item && item.status || '');
+                if (!path) return '';
+                return status === 'unknown_retired_file' || status === 'local_retired_content_changed'
+                    ? `${path} (freigegebener Altpfad würde gelöscht)`
+                    : path;
+            }).filter(Boolean);
+            const token = String(preflight.confirmation_token || '').trim().toLowerCase();
+            if (!/^[0-9a-f]{64}$/.test(token)) {
+                throw new Error('Die Inhaltsprüfung lieferte keine gültige Dateilistenbindung.');
+            }
+            const driftQuestion = driftCount > 0
+                ? `${driftCount} lokal geänderte oder kollidierende Produktdatei(en) würden durch den veröffentlichten Stable-Stand ersetzt oder als freigegebener Altpfad gelöscht:\n\n${paths.join('\n')}\n\nUnbekannte Dateien außerhalb dieses Zielumfangs bleiben unberührt. Soll das Update diese exakt genannten Eingriffe trotzdem ausführen?`
+                : 'Die veröffentlichte Altversion dieser Installation konnte nicht sicher als Inhaltsbaseline gebunden werden. Der Updater kann deshalb lokale Änderungen in den bekannten Produktpfaden nicht einzeln abgrenzen.\n\nDas verifizierte Vollbackup bleibt bestehen und unbekannte Dateien außerhalb der Zielprojektion bleiben unberührt. Soll der veröffentlichte Stable-Stand die bekannten Produktpfade trotzdem ersetzen?';
+            if (!confirm(driftQuestion)) {
+                if (btn) { btn.innerHTML = origText; btn.disabled = false; }
+                return;
+            }
+            confirmLocalDrift = true;
+            confirmationToken = token;
+        }
+    } catch (error) {
+        const message = 'Update wurde vor Backup und Dienständerung sicher abgebrochen:\n'
+            + (error && error.message ? error.message : String(error));
+        if (btn) { btn.innerHTML = origText; btn.disabled = false; }
+        alert(message);
+        return;
+    }
+    startInstallerUpdateRun(
+        btn,
+        origText,
+        normalizedPurpose,
+        confirmLocalDrift,
+        confirmationToken
+    );
 }
 
-function startInstallerUpdateRun(btn, origText) {
+async function startInstallerUpdateRun(
+    btn,
+    origText,
+    purpose = 'update',
+    confirmLocalDrift = false,
+    confirmationToken = ''
+) {
+    const isRepair = purpose === 'permissions_repair';
+    const operationName = isRepair ? 'Systemreparatur' : 'System Update';
     if(btn) {
         btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Starte...';
         btn.disabled = true;
@@ -7045,8 +7428,8 @@ function startInstallerUpdateRun(btn, origText) {
     const details = document.getElementById('update-details');
     const updateStartedAt = Date.now();
 
-    if (title) title.innerText = "System Update";
-    if (log) log.innerText = "Starte System Update...\n";
+    if (title) title.innerText = operationName;
+    if (log) log.innerText = "Starte " + operationName + "...\n";
     if (details) details.open = false;
     if (spinner) spinner.className = "fas fa-sync fa-spin me-2";
     if (closeBtn) closeBtn.style.display = 'none';
@@ -7055,17 +7438,22 @@ function startInstallerUpdateRun(btn, origText) {
         finishBtn.innerText = "Schließen";
         finishBtn.onclick = null;
     }
-    e3dcRenderInstallerUpdateStatus({logText: "", running: true}, updateStartedAt);
+    e3dcRenderInstallerUpdateStatus({logText: "", running: true, purpose}, updateStartedAt);
     if (modal) modal.show();
 
-    e3dcPostAction('action=run_self_update&t=' + Date.now(), {
-        reinstall: '0'
-    })
-    .then(r => e3dcParseJsonResponse(r, 'System-Update-Start'))
-    .then(data => {
+    const action = isRepair ? 'fix_permissions' : 'run_self_update';
+    const baseline = await e3dcReadInstallerUpdateBaseline();
+    try {
+        const response = await e3dcPostUpdateActionWithTimeout('action=' + action + '&t=' + Date.now(), {
+            reinstall: '0',
+            confirm_local_drift: confirmLocalDrift ? '1' : '0',
+            confirmation_token: confirmLocalDrift ? confirmationToken : ''
+        });
+        const data = await e3dcParseJsonResponse(response, operationName + '-Start');
         if (data && data.success) {
             if (log) log.innerText = (data.message || "Update gestartet.") + "\nWarte auf Log-Ausgabe...\n";
-            pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText, updateStartedAt);
+            const runBinding = e3dcCreateInstallerUpdateRunBinding(baseline, data.run_id);
+            pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText, updateStartedAt, purpose, runBinding);
         } else {
             const msg = "Update konnte nicht gestartet werden:\n" + ((data && data.message) || "Unbekannter Fehler");
             if (log) log.innerText = msg;
@@ -7081,19 +7469,19 @@ function startInstallerUpdateRun(btn, origText) {
             if(btn) { btn.innerHTML = origText; btn.disabled = false; }
             checkInstallerUpdate(true);
         }
-    })
-    .catch(err => {
+    } catch (err) {
         const msg = "Update-Start konnte keine gültige JSON-Antwort lesen:\n" + err.message
                   + "\n\nPrüfe das Update-Protokoll weiter; während des Webdatei-Tauschs kann die Oberfläche kurz HTML liefern.";
         if (log) log.innerText = msg;
         if (!modal) alert(msg);
         if (log) {
-            pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText, updateStartedAt);
+            const runBinding = e3dcCreateInstallerUpdateRunBinding(baseline);
+            pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText, updateStartedAt, purpose, runBinding);
         } else if(btn) {
             btn.innerHTML = origText;
             btn.disabled = false;
         }
-    });
+    }
 }
 
 function e3dcFormatInstallerUpdateElapsed(startedAt) {
@@ -7113,8 +7501,9 @@ function e3dcRenderInstallerUpdateStatus(updateStatus, startedAt) {
     const progress = document.getElementById('update-progress-bar');
     const details = document.getElementById('update-details');
     if (!summary || !title || !detail || !step || !elapsed || !progress) return;
+    const operationName = status.purpose === 'permissions_repair' ? 'Systemreparatur' : 'Update';
 
-    let titleText = "Update wird vorbereitet";
+    let titleText = operationName + " wird vorbereitet";
     let detailText = "Die Anlage arbeitet weiter.";
     let stepText = "Start";
     let progressWidth = 5;
@@ -7159,14 +7548,14 @@ function e3dcRenderInstallerUpdateStatus(updateStatus, startedAt) {
         badgeClass = "bg-info text-dark";
     }
     if (status.successFound) {
-        titleText = "Update erfolgreich abgeschlossen";
+        titleText = operationName + " erfolgreich abgeschlossen";
         detailText = "Regelung, Weboberfläche und Rückfallweg wurden bestätigt.";
         stepText = "Fertig";
         progressWidth = 100;
         alertClass = "alert-success";
         badgeClass = "bg-success";
     } else if (status.abortedFound) {
-        titleText = "Update wurde beendet";
+        titleText = operationName + " wurde beendet";
         detailText = "Die technischen Details nennen den bestätigten Systemzustand und den nächsten Schritt.";
         stepText = "Beendet";
         progressWidth = 100;
@@ -7174,14 +7563,14 @@ function e3dcRenderInstallerUpdateStatus(updateStatus, startedAt) {
         badgeClass = "bg-secondary";
         if (details) details.open = true;
     } else if (status.executionEndedUnexpectedly) {
-        titleText = "Update-Ausführung unerwartet beendet";
+        titleText = operationName + " unerwartet beendet";
         detailText = "Anlagen- und Updatezustand müssen anhand von Protokoll, Backup oder Rollback und Abschlussprüfung geklärt werden.";
         stepText = "Prüfen";
         alertClass = "alert-danger";
         badgeClass = "bg-danger";
         if (details) details.open = true;
     } else if (status.errorFound || status.exitFailed || status.completionFailed) {
-        titleText = "Update benötigt Aufmerksamkeit";
+        titleText = operationName + " benötigt Aufmerksamkeit";
         detailText = "Die technischen Details nennen Ursache, Systemzustand und Lösung.";
         stepText = "Fehler";
         alertClass = "alert-danger";
@@ -7368,38 +7757,77 @@ function e3dcAdvanceInstallerUpdateLaunchGrace(updateStatus, previousPolls, maxG
     };
 }
 
-function pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText, updateStartedAt = Date.now()) {
+function pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText, updateStartedAt = Date.now(), purpose = 'update', runBinding = null) {
     let tick = 0;
     let stoppedPolls = 0;
     let launchingPolls = 0;
     let executingStoppedPolls = 0;
     let transientPollErrors = 0;
-    let lastUpdateStatus = {logText: "", running: true};
+    let lastUpdateStatus = {logText: "", running: true, purpose};
+    let pollInFlight = false;
     const maxStoppedGracePolls = 6;
     const maxLaunchingGracePolls = 15;
     const maxExecutingStoppedGracePolls = 6;
     const maxTransientPollErrors = 120;
     const maxPollTicks = 60 * 60;
+    const pollStartedAt = Date.now();
+    const maxTransientPollDurationMs = 2 * 60 * 1000;
+    const maxPollDurationMs = 60 * 60 * 1000;
+    const binding = runBinding || e3dcCreateInstallerUpdateRunBinding({available: false});
     const interval = setInterval(() => {
+        if (pollInFlight) return;
+        pollInFlight = true;
         tick++;
-        fetch(e3dcActionUrl('action=poll_self_update&t=' + Date.now()))
-            .then(async r => {
-                const text = await r.text();
-                if (!r.ok) {
-                    throw new Error('HTTP ' + r.status);
-                }
-                if (!text.trim()) {
-                    throw new Error('Leere Update-Antwort');
-                }
-                try {
-                    return JSON.parse(text);
-                } catch (parseErr) {
-                    throw new Error('Ungültige Update-Antwort: ' + parseErr.message);
-                }
-            })
+        e3dcFetchUpdateJsonWithTimeout(e3dcActionUrl('action=poll_self_update&t=' + Date.now()))
             .then(data => {
                 transientPollErrors = 0;
+                const runState = e3dcBindInstallerUpdatePoll(data, binding);
+                if (runState.replaced) {
+                    clearInterval(interval);
+                    const message = "Der Status gehört inzwischen zu einem anderen Systemjob. "
+                        + "Der Abschluss des gestarteten Auftrags wird deshalb nicht aus fremden Daten abgeleitet. "
+                        + "Lade die Seite neu und prüfe das Update-Protokoll.";
+                    if (log) log.innerText += "\n\n[HINWEIS] " + message;
+                    if (spinner) {
+                        spinner.classList.remove('fa-spin', 'fa-sync');
+                        spinner.classList.add('fa-info-circle', 'text-warning');
+                    }
+                    if (closeBtn) closeBtn.style.display = 'block';
+                    if (finishBtn) finishBtn.disabled = false;
+                    if (btn) { btn.innerHTML = origText; btn.disabled = false; }
+                    return;
+                }
+                if (!runState.bound) {
+                    launchingPolls = 0;
+                    stoppedPolls = 0;
+                    executingStoppedPolls = 0;
+                    lastUpdateStatus = {
+                        logText: "Warte auf die eindeutige Laufkennung des neu gestarteten Systemjobs...\n"
+                            + "Ein alter Abschlussstatus wird nicht als Ergebnis dieses Auftrags übernommen.",
+                        running: true,
+                        purpose,
+                        runBindingPending: true,
+                    };
+                    e3dcRenderInstallerUpdateStatus(lastUpdateStatus, updateStartedAt);
+                    if (log) log.innerText = lastUpdateStatus.logText;
+                    if (tick >= maxPollTicks || (Date.now() - pollStartedAt) >= maxPollDurationMs) {
+                        clearInterval(interval);
+                        if (log) {
+                            log.innerText += "\n\n[HINWEIS] Kein eindeutig zugeordneter Abschlussstatus. "
+                                + "Der Systemjob wird dadurch nicht beendet; lade die Seite neu und prüfe das Protokoll.";
+                        }
+                        if (spinner) {
+                            spinner.classList.remove('fa-spin', 'fa-sync');
+                            spinner.classList.add('fa-info-circle', 'text-warning');
+                        }
+                        if (closeBtn) closeBtn.style.display = 'block';
+                        if (finishBtn) finishBtn.disabled = false;
+                        if (btn) { btn.innerHTML = origText; btn.disabled = false; }
+                    }
+                    return;
+                }
                 let updateStatus = e3dcClassifyInstallerUpdatePoll(data);
+                updateStatus.purpose = purpose;
                 const launchGrace = e3dcAdvanceInstallerUpdateLaunchGrace(
                     updateStatus,
                     launchingPolls,
@@ -7520,31 +7948,39 @@ function pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText, u
             })
             .catch(err => {
                 transientPollErrors++;
-                if (transientPollErrors <= maxTransientPollErrors && tick < maxPollTicks) {
+                if (transientPollErrors <= maxTransientPollErrors
+                    && (Date.now() - pollStartedAt) < maxTransientPollDurationMs
+                    && (Date.now() - pollStartedAt) < maxPollDurationMs) {
                     e3dcRenderInstallerUpdateStatus(lastUpdateStatus, updateStartedAt);
                     const statusDetail = document.getElementById('update-status-detail');
                     if (statusDetail) {
                         statusDetail.textContent = "Die Weboberfläche wird gerade neu gestartet. "
                             + "Der Updateauftrag läuft unabhängig weiter.";
                     }
-                    if (log && (transientPollErrors === 1 || transientPollErrors % 15 === 0)) {
-                        log.innerText += "\n\n[INFO] Update-Oberfläche kurz nicht erreichbar (" + transientPollErrors + "/" + maxTransientPollErrors + "): " + err.message + "\nPolling läuft weiter...";
+                    if (log && transientPollErrors === 1) {
+                        log.innerText += "\n\n[STATUS] Die Weboberfläche wird für den kontrollierten Dateiaustausch neu gestartet. Der Systemjob läuft unabhängig weiter; die Verbindung wird automatisch erneut geprüft.";
                     }
                     return;
                 }
                 clearInterval(interval);
-                if (log) log.innerText += "\n\nPolling-Fehler: " + err;
-                e3dcRenderInstallerUpdateStatus(
-                    {...lastUpdateStatus, running: false, errorFound: true},
-                    updateStartedAt
-                );
+                if (log) {
+                    log.innerText += "\n\n[HINWEIS] Die Weboberfläche konnte nach zwei Minuten noch nicht wieder erreicht werden. Der Systemjob wurde dadurch nicht beendet. Lade die Seite neu, um den aktuellen Abschlussstatus zu lesen.";
+                }
+                e3dcRenderInstallerUpdateStatus({...lastUpdateStatus, running: false}, updateStartedAt);
+                const statusTitle = document.getElementById('update-status-title');
+                const statusDetail = document.getElementById('update-status-detail');
+                if (statusTitle) statusTitle.textContent = "Verbindung noch nicht wiederhergestellt";
+                if (statusDetail) statusDetail.textContent = "Der Systemjob läuft unabhängig von dieser Anzeige weiter. Lade die Seite neu, um den aktuellen Status zu lesen.";
                 if (spinner) {
                     spinner.classList.remove('fa-spin', 'fa-sync');
-                    spinner.classList.add('fa-times-circle', 'text-danger');
+                    spinner.classList.add('fa-info-circle', 'text-warning');
                 }
                 if (closeBtn) closeBtn.style.display = 'block';
                 if (finishBtn) finishBtn.disabled = false;
                 if(btn) { btn.innerHTML = origText; btn.disabled = false; }
+            })
+            .finally(() => {
+                pollInFlight = false;
             });
     }, 1000);
 }
@@ -7558,25 +7994,16 @@ function pollUpdate(log, spinner, closeBtn, finishBtn) {
     let tick = 0;
     let stoppedPolls = 0;
     let transientPollErrors = 0;
+    let pollInFlight = false;
     const maxStoppedGracePolls = 6;
-    const maxTransientPollErrors = 8;
+    const maxTransientPollErrors = 120;
+    const pollStartedAt = Date.now();
+    const maxTransientPollDurationMs = 2 * 60 * 1000;
     const interval = setInterval(() => {
+        if (pollInFlight) return;
+        pollInFlight = true;
         tick++;
-        fetch(e3dcActionUrl('action=run_update&mode=poll&t=' + Date.now()))
-            .then(async r => {
-                const text = await r.text();
-                if (!r.ok) {
-                    throw new Error('HTTP ' + r.status);
-                }
-                if (!text.trim()) {
-                    throw new Error('Leere Update-Antwort');
-                }
-                try {
-                    return JSON.parse(text);
-                } catch (parseErr) {
-                    throw new Error('Ungültige Update-Antwort: ' + parseErr.message);
-                }
-            })
+        e3dcFetchUpdateJsonWithTimeout(e3dcActionUrl('action=run_update&mode=poll&t=' + Date.now()))
             .then(data => {
                 transientPollErrors = 0;
                 if (typeof data.log === 'string') log.innerText = data.log;
@@ -7637,21 +8064,27 @@ function pollUpdate(log, spinner, closeBtn, finishBtn) {
             })
             .catch(err => {
                 transientPollErrors++;
-                if (transientPollErrors <= maxTransientPollErrors && tick < 120) {
+                if (transientPollErrors <= maxTransientPollErrors
+                    && (Date.now() - pollStartedAt) < maxTransientPollDurationMs) {
                     console.info("Update poll transient:", err);
                     if (log && transientPollErrors === 1) {
-                        log.innerText += "\n\n[INFO] Update-Oberfläche kurz nicht erreichbar: " + err.message + "\nPolling läuft weiter...";
+                        log.innerText += "\n\n[STATUS] Die Weboberfläche wird für den kontrollierten Dateiaustausch neu gestartet. Der Systemjob läuft unabhängig weiter; die Verbindung wird automatisch erneut geprüft.";
                     }
                     return;
                 }
                 clearInterval(interval);
-                if (log) log.innerText += "\n\nPolling-Fehler: " + err.message;
+                if (log) {
+                    log.innerText += "\n\n[HINWEIS] Die Weboberfläche konnte nach zwei Minuten noch nicht wieder erreicht werden. Der Systemjob wurde dadurch nicht beendet. Lade die Seite neu, um den aktuellen Abschlussstatus zu lesen.";
+                }
                 if (spinner) {
                     spinner.classList.remove('fa-spin', 'fa-sync');
-                    spinner.classList.add('fa-times-circle', 'text-danger');
+                    spinner.classList.add('fa-info-circle', 'text-warning');
                 }
                 closeBtn.style.display = 'block';
                 finishBtn.disabled = false;
+            })
+            .finally(() => {
+                pollInFlight = false;
             });
     }, 1000);
 }
@@ -8436,169 +8869,6 @@ function clearForecastProjectionStatus() {
     if (!status) return;
     status.hidden = true;
     status.textContent = '';
-}
-
-function updatePvForecastDiagnostics(data) {
-    const card = document.getElementById('pv-forecast-diagnostic-card');
-    const box = document.getElementById('pvForecastDiagnosticBox');
-    if (!card && !box) return;
-
-    const diagnostic = data && typeof data.pv_forecast_diagnostics === 'object' && data.pv_forecast_diagnostics !== null
-        ? data.pv_forecast_diagnostics
-        : (data && typeof data.metrics === 'object' ? data : null);
-    const status = diagnostic ? String(diagnostic.status || '') : '';
-    if (!diagnostic || status === 'aus') {
-        if (card) card.hidden = true;
-        if (box) box.hidden = true;
-        return;
-    }
-
-    if (box) box.hidden = false;
-    if (card) card.hidden = false;
-    const available = diagnostic.available === true || ['diagnostisch', 'vorläufig', 'belastbar'].includes(status.toLowerCase());
-    const provisional = diagnostic.provisional === true || status.toLowerCase() === 'vorläufig';
-    const statusElement = document.getElementById('pv-forecast-diagnostic-status');
-    if (statusElement) {
-        statusElement.textContent = available
-            ? (provisional ? 'Lernphase' : 'Diagnostisch')
-            : 'Noch keine Auswertung';
-        statusElement.className = available
-            ? `badge ${provisional ? 'text-bg-warning' : 'text-bg-success'}`
-            : 'badge text-bg-secondary';
-    }
-
-    const metrics = diagnostic.metrics && typeof diagnostic.metrics === 'object'
-        ? diagnostic.metrics
-        : {};
-    const finiteMetric = key => {
-        if (metrics[key] === null || metrics[key] === undefined || metrics[key] === '') {
-            return null;
-        }
-        const value = Number(metrics[key]);
-        return Number.isFinite(value) ? value : null;
-    };
-    const setMetric = (id, value, unit, signed = false) => {
-        const element = document.getElementById(id);
-        if (!element) return;
-        if (value === null) {
-            element.textContent = '–';
-            return;
-        }
-        const prefix = signed && value > 0 ? '+' : '';
-        element.textContent = `${prefix}${value.toLocaleString('de-DE', {
-            minimumFractionDigits: 1,
-            maximumFractionDigits: 1
-        })}${unit}`;
-    };
-    setMetric(
-        'pv-forecast-diagnostic-hit',
-        finiteMetric('trefferabweichung_wh'),
-        ' Wh/15 min'
-    );
-    setMetric(
-        'pv-forecast-diagnostic-direction',
-        finiteMetric('richtungsversatz_wh'),
-        ' Wh/15 min',
-        true
-    );
-    setMetric(
-        'pv-forecast-diagnostic-energy',
-        finiteMetric('energiegewichtete_gesamtabweichung_pct'),
-        ' %'
-    );
-    setMetric(
-        'pv-forecast-diagnostic-coverage',
-        finiteMetric('vergleichsabdeckung_pct'),
-        ' %'
-    );
-
-    const comparedSlots = Math.max(0, Number(diagnostic.compared_slots) || 0);
-    const relevantDays = Math.max(0, Number(diagnostic.yield_relevant_days) || 0);
-    const sampleElement = document.getElementById('pv-forecast-diagnostic-sample');
-    if (sampleElement) {
-        sampleElement.textContent = comparedSlots > 0
-            ? `${comparedSlots.toLocaleString('de-DE')} verglichene 15-Minuten-Fenster · ${relevantDays.toLocaleString('de-DE')} Ertragstage`
-            : 'Noch keine vergleichbaren Fenster';
-    }
-
-    const valueContract = diagnostic.forecast_value_contract
-        && typeof diagnostic.forecast_value_contract === 'object'
-        ? diagnostic.forecast_value_contract
-        : {};
-    const sourceDiagnostics = Array.isArray(diagnostic.source_diagnostics)
-        ? diagnostic.source_diagnostics
-        : [];
-    const externalAcEvidence = sourceDiagnostics.find(item =>
-        item && item.signal === 'pv_external_ac'
-    );
-    const observationQuality = diagnostic.observation_quality
-        && typeof diagnostic.observation_quality === 'object'
-        ? diagnostic.observation_quality
-        : {};
-    const contractElement = document.getElementById('pv-forecast-diagnostic-contract');
-    if (contractElement) {
-        const isPointForecast = valueContract.distribution_type === 'deterministic_point';
-        const p50Proven = valueContract.p50_claim === 'proven';
-        const externalAcMissing = externalAcEvidence
-            && externalAcEvidence.status === 'EVIDENCE_LIMIT';
-        const parts = [
-            isPointForecast ? 'Punktprognose' : 'Prognosevertrag nicht belegt',
-            p50Proven ? 'P50 bestätigt' : 'kein belegtes P50'
-        ];
-        if (externalAcMissing) {
-            parts.push('Zusatz-WR ohne getrennte Ist-Kalibrierung');
-        }
-        if (
-            observationQuality.curtailment_exclusion_status === 'EVIDENCE_LIMIT'
-            || observationQuality.inverter_clipping_exclusion_status === 'EVIDENCE_LIMIT'
-        ) {
-            parts.push('Abregel-/Clippingzeiten noch nicht ausfilterbar');
-        }
-        contractElement.textContent = parts.join(' · ') + '.';
-    }
-
-    const horizonElement = document.getElementById('pv-forecast-diagnostic-horizons');
-    if (horizonElement) {
-        const buckets = Array.isArray(diagnostic.lead_time_buckets)
-            ? diagnostic.lead_time_buckets
-            : [];
-        const comparedBuckets = buckets.filter(bucket =>
-            bucket && Number(bucket.compared_slots) > 0
-        );
-        if (comparedBuckets.length === 0) {
-            horizonElement.textContent = 'Erfassungs-Vorlauf: noch keine revisionsgebundenen Stichproben.';
-        } else {
-            const horizonParts = comparedBuckets.map(bucket => {
-                const bucketMetrics = bucket.metrics && typeof bucket.metrics === 'object'
-                    ? bucket.metrics
-                    : {};
-                const bucketNumber = key => {
-                    const raw = bucketMetrics[key];
-                    if (raw === null || raw === undefined || raw === '') return null;
-                    const parsed = Number(raw);
-                    return Number.isFinite(parsed) ? parsed : null;
-                };
-                const wape = bucketNumber('energiegewichtete_gesamtabweichung_pct');
-                const bias = bucketNumber('richtungsversatz_wh');
-                const count = Math.max(0, Number(bucket.compared_slots) || 0);
-                const values = [
-                    `${String(bucket.label || bucket.bucket_id || 'Vorlauf')}: ${count.toLocaleString('de-DE')} Fenster`
-                ];
-                if (wape !== null) {
-                    values.push(`WAPE ${wape.toLocaleString('de-DE', { maximumFractionDigits: 1 })} %`);
-                }
-                if (bias !== null) {
-                    const prefix = bias > 0 ? '+' : '';
-                    values.push(`Bias ${prefix}${bias.toLocaleString('de-DE', { maximumFractionDigits: 1 })} Wh`);
-                }
-                if (bucket.provisional === true) {
-                    values.push('vorläufig');
-                }
-                return values.join(', ');
-            });
-            horizonElement.textContent = `Erfassungs-Vorlauf: ${horizonParts.join(' · ')}`;
-        }
-    }
 }
 
 function normalizeElectricityPriceSeries(price) {
@@ -11198,7 +11468,6 @@ function processLiveData(data) {
     const wb2Configured = wallboxConfiguredFlag(data, 2);
     cacheStorageCurveData(data);
     renderDirectMarketingDashboardStatus(data);
-    smoothWallboxDisplayValues(data);
     publishE3dcLiveData(data);
 
     if (data.forecast && data.forecast.length > 0) {
@@ -11746,15 +12015,41 @@ function processLiveData(data) {
         if (data.wp_mode !== undefined && data.wp_mode !== null) {
             wpStatusBadge.show();
             wpStatusBadge.removeClass('bg-secondary bg-warning bg-danger bg-primary bg-info text-dark text-white pulsating blink').css('animation', 'none');
-            switch(parseInt(data.wp_mode)) {
-                case 99: wpStatusBadge.addClass('bg-danger text-white').html('<i class="fas fa-fire-alt"></i> Läuft'); break;
-                case 0: wpStatusBadge.addClass('bg-warning text-dark').html('<i class="fas fa-fire"></i> Heizen'); break;
-                case 1: wpStatusBadge.addClass('bg-danger text-white').html('<i class="fas fa-hot-tub"></i> WW'); break;
-                case 2: wpStatusBadge.addClass('bg-primary text-white').html('<i class="fas fa-wind"></i> Kühlen'); break;
-                case 3: wpStatusBadge.addClass('bg-primary text-white').text('EVU'); break;
-                case 4: wpStatusBadge.addClass('bg-info text-dark').html('<i class="fas fa-snowflake"></i> Abtauen'); break;
-                case 5: wpStatusBadge.addClass('bg-secondary text-white').text('Standby'); break;
-                default: wpStatusBadge.hide();
+            const luxStage = data.wp_operating_stage_status === 'OK'
+                ? String(data.wp_operating_stage_stage || '')
+                : '';
+            const luxStageLabel = String(data.wp_operating_stage_label || '');
+            if (luxStage === 'ww_requested') {
+                wpStatusBadge.addClass('bg-info text-dark').empty()
+                    .append($('<i>', {class: 'fas fa-clock me-1'}))
+                    .append(document.createTextNode(luxStageLabel || 'Warmwasser angefordert'));
+            } else if (luxStage === 'ww_hydraulics_active') {
+                wpStatusBadge.addClass('bg-primary text-white').empty()
+                    .append($('<i>', {class: 'fas fa-water me-1'}))
+                    .append(document.createTextNode(luxStageLabel || 'WW-Hydraulik aktiv'));
+            } else if (luxStage === 'ww_compressor_started') {
+                wpStatusBadge.addClass('bg-warning text-dark').empty()
+                    .append($('<i>', {class: 'fas fa-sync fa-spin me-1'}))
+                    .append(document.createTextNode(luxStageLabel || 'WW-Verdichter gestartet'));
+            } else if (luxStage === 'ww_40hz_stage') {
+                wpStatusBadge.addClass('bg-warning text-dark').empty()
+                    .append($('<i>', {class: 'fas fa-gauge-high me-1'}))
+                    .append(document.createTextNode(luxStageLabel || 'WW-Verdichter bei 40 Hz'));
+            } else if (luxStage === 'ww_target_load') {
+                wpStatusBadge.addClass('bg-danger text-white').empty()
+                    .append($('<i>', {class: 'fas fa-fire-flame-curved me-1'}))
+                    .append(document.createTextNode(luxStageLabel || 'WW-Ziellast erreicht'));
+            } else {
+                switch(parseInt(data.wp_mode)) {
+                    case 99: wpStatusBadge.addClass('bg-danger text-white').html('<i class="fas fa-fire-alt"></i> Läuft'); break;
+                    case 0: wpStatusBadge.addClass('bg-warning text-dark').html('<i class="fas fa-fire"></i> Heizen'); break;
+                    case 1: wpStatusBadge.addClass('bg-danger text-white').html('<i class="fas fa-hot-tub"></i> WW'); break;
+                    case 2: wpStatusBadge.addClass('bg-primary text-white').html('<i class="fas fa-wind"></i> Kühlen'); break;
+                    case 3: wpStatusBadge.addClass('bg-primary text-white').text('EVU'); break;
+                    case 4: wpStatusBadge.addClass('bg-info text-dark').html('<i class="fas fa-snowflake"></i> Abtauen'); break;
+                    case 5: wpStatusBadge.addClass('bg-secondary text-white').text('Standby'); break;
+                    default: wpStatusBadge.hide();
+                }
             }
         }
         // Wir verstecken das Badge NUR, wenn wirklich gar kein Mode-Info vorliegt (Standby/Fehler)
@@ -12142,7 +12437,6 @@ function processMobileData(data) {
         if (!data) return;
         const wb1Configured = wallboxConfiguredFlag(data, 1);
         const wb2Configured = wallboxConfiguredFlag(data, 2);
-        smoothWallboxDisplayValues(data);
         publishE3dcLiveData(data);
         const timeElem = document.getElementById('live-time');
         if (timeElem) timeElem.innerText = data.time;

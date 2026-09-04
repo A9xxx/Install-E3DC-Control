@@ -141,6 +141,47 @@ $data = $json['data'] ?? $json;
 $status = $json['status'] ?? [];
 $success = $json['success'] ?? false;
 $error = $json['error'] ?? ($json['error'] ?? '');
+$luxOperatingStage = (
+    $wpType === 0
+    && isset($json['luxtronik_operating_stage'])
+    && is_array($json['luxtronik_operating_stage'])
+)
+    ? $json['luxtronik_operating_stage']
+    : null;
+$luxStagePresentations = [
+    'standby' => ['bg-secondary text-white', 'fa-pause', 'Standby'],
+    'ww_requested' => ['bg-info text-dark', 'fa-clock', 'Warmwasser angefordert'],
+    'ww_hydraulics_active' => ['bg-primary text-white', 'fa-water', 'WW-Hydraulik aktiv'],
+    'ww_compressor_started' => ['bg-warning text-dark', 'fa-sync fa-spin', 'WW-Verdichter gestartet'],
+    'ww_40hz_stage' => ['bg-warning text-dark', 'fa-gauge-high', 'WW-Verdichter bei 40 Hz'],
+    'ww_target_load' => ['bg-danger text-white', 'fa-fire-flame-curved', 'WW-Ziellast erreicht'],
+    'compressor_other_domain' => ['bg-warning text-dark', 'fa-sync fa-spin', 'Verdichter läuft'],
+];
+$luxStageStatus = is_array($luxOperatingStage)
+    ? (string)($luxOperatingStage['status'] ?? 'EVIDENCE_LIMIT')
+    : '';
+$luxStageName = is_array($luxOperatingStage)
+    ? (string)($luxOperatingStage['stage'] ?? 'unknown')
+    : '';
+$luxStagePresentation = $luxStagePresentations[$luxStageName]
+    ?? ['bg-secondary text-white', 'fa-circle-question', 'Luxtronik-Status nicht belegt'];
+$luxStageLabel = is_array($luxOperatingStage)
+    ? trim((string)($luxOperatingStage['label'] ?? ''))
+    : '';
+if ($luxStageLabel === '') $luxStageLabel = $luxStagePresentation[2];
+$luxStageTitleParts = [];
+if (is_array($luxOperatingStage)) {
+    if (!empty($luxOperatingStage['reason_code'])) {
+        $luxStageTitleParts[] = (string)$luxOperatingStage['reason_code'];
+    }
+    if (is_numeric($luxOperatingStage['frequency_hz'] ?? null)) {
+        $luxStageTitleParts[] = number_format((float)$luxOperatingStage['frequency_hz'], 1, ',', '.') . ' Hz Ist';
+    }
+    if (is_numeric($luxOperatingStage['frequency_target_hz'] ?? null)) {
+        $luxStageTitleParts[] = number_format((float)$luxOperatingStage['frequency_target_hz'], 1, ',', '.') . ' Hz Soll';
+    }
+}
+$luxStageTitle = implode(' · ', $luxStageTitleParts);
 
 // Neustart auslösen (Absturzsicher)
 if (isset($_POST['restart_manager'])) {
@@ -641,11 +682,24 @@ if (isset($_POST['toggle_hs_auto'])) {
     e3dcRequireCsrfToken(false);
     $new_mode = (int)$_POST['toggle_hs_auto'];
     if (!saveE3dcConfigValue('hs_auto_mode', (string)$new_mode)) {
+        $saveResult = e3dcLastConfigSaveResult();
+        $saveStatus = (string)($saveResult['status'] ?? 'unknown');
+        $prewriteFailed = in_array($saveStatus, [
+            'identity_unavailable',
+            'lock_directory_invalid',
+            'lock_invalid',
+            'lock_open_failed',
+            'lock_metadata_invalid',
+            'lock_failed',
+        ], true);
         http_response_code(500);
         echo errorMessage(
             'Heizstab-Automatik nicht gespeichert',
-            'Die bestehende Konfiguration blieb unverändert. '
-            . 'Bitte führe im Installationscenter einmal „Rechte reparieren“ aus und versuche es erneut.'
+            ($prewriteFailed
+                ? 'Der Speichervorgang wurde vor dem Schreiben abgebrochen; die bestehende Konfiguration blieb unverändert. '
+                : 'Die Konfigurationsänderung konnte nicht sicher bestätigt werden. ')
+            . 'Fehlercode: ' . $saveStatus . '. '
+            . 'Bitte führe im Installationscenter zuerst „Nur Rechte prüfen“ und bei einem bestätigten Rechtefehler „System reparieren“ aus.'
         );
         exit;
     }
@@ -779,7 +833,9 @@ if ($isChargingOnly) {
             $hsSurplus   = (int)($hsData['surplus_w'] ?? 0);
             $hsSoc       = (float)($hsData['soc'] ?? 0);
             $hsAutoOn    = ($hsMode === 'pv_auto');
-            $hsAutoConf  = (int)($conf['hs_auto_mode'] ?? 1);
+            $hsAutoConf  = array_key_exists('hs_auto_mode', $conf)
+                ? cfgBool($conf['hs_auto_mode'], false)
+                : true;
             $isElwa      = (strtolower($conf['heizstab_type'] ?? 'generic') === 'mypv_elwa');
             $hsMaxW      = (int)($conf['heizstab_max_w'] ?? 3000);
             $powerPct    = $hsMaxW > 0 ? min(100, round($hsPowerW / $hsMaxW * 100)) : 0;
@@ -969,7 +1025,7 @@ if ($isChargingOnly) {
                 <div class="d-flex gap-2 mb-2">
                     <form method="post" class="flex-grow-1">
                         <?= e3dcCsrfInput() ?>
-                        <?php if ($hsAutoConf == 1): ?>
+                        <?php if ($hsAutoConf): ?>
                             <button type="submit" name="toggle_hs_auto" value="0" class="btn btn-outline-success btn-sm w-100 fw-bold">
                                 <i class="fas fa-check-circle me-1"></i> PV-AUTO AN
                             </button>
@@ -1188,7 +1244,17 @@ if ($isChargingOnly) {
                     <div class="col-12 col-xl-7">
                         <h6 class="text-muted text-uppercase small fw-bold mb-2">Aktueller Status</h6>
                         <div class="p-2 bg-body-tertiary rounded border d-flex flex-wrap align-items-center gap-2" style="min-height: 46px;">
-                            <?php if(!empty($data['stiebel_passive_cooling_active']) || !empty($data['Passive_Kuehlung_Aktiv']) || !empty($data['Passive_Kühlung_Aktiv'])): ?>
+                            <?php if ($wpType === 0 && is_array($luxOperatingStage)): ?>
+                                <?php if ($luxStageStatus === 'OK'): ?>
+                                    <span class="badge <?= htmlspecialchars($luxStagePresentation[0]) ?>" title="<?= htmlspecialchars($luxStageTitle) ?>">
+                                        <i class="fas <?= htmlspecialchars($luxStagePresentation[1]) ?> me-1"></i><?= htmlspecialchars($luxStageLabel) ?>
+                                    </span>
+                                <?php else: ?>
+                                    <span class="badge bg-secondary text-white" title="<?= htmlspecialchars($luxStageTitle ?: 'Frische typisierte Live-Evidenz fehlt') ?>">
+                                        <i class="fas fa-circle-question me-1"></i>Status nicht belegt
+                                    </span>
+                                <?php endif; ?>
+                            <?php elseif(!empty($data['stiebel_passive_cooling_active']) || !empty($data['Passive_Kuehlung_Aktiv']) || !empty($data['Passive_Kühlung_Aktiv'])): ?>
                                 <span class="badge bg-primary" title="Passive Kühlung ohne Verdichter">
                                     <i class="fas fa-snowflake me-1"></i> Passive Kühlung
                                 </span>

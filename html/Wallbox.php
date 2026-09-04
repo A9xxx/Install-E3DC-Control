@@ -223,8 +223,11 @@ function readE3dcWallboxDischargeFloorSoc() {
         '/var/www/html/ramdisk/wallbox_native.json',
     ] as $path) {
         if (!is_file($path)) continue;
+        $mtime = @filemtime($path);
+        if ($mtime === false || time() - $mtime > 90) continue;
         $data = json_decode((string)@file_get_contents($path), true);
         if (!is_array($data)) continue;
+        if (($data['e3dc_wb_discharge_bat_until_soc_valid'] ?? false) !== true) continue;
         $raw = $data['e3dc_wb_discharge_bat_until_soc'] ?? null;
         if ($raw === null || $raw === '' || !is_numeric($raw)) continue;
         $floor = (float)$raw;
@@ -236,12 +239,7 @@ function readE3dcWallboxDischargeFloorSoc() {
 }
 
 function sanitizeWallboxHouseReserveValue($value, $default = 70) {
-    $reserve = (int)sanitizeWallboxPercentValue($value, $default);
-    $e3dcFloor = readE3dcWallboxDischargeFloorSoc();
-    if ($e3dcFloor !== null && $e3dcFloor > $reserve) {
-        $reserve = (int)ceil($e3dcFloor);
-    }
-    return (string)max(0, min(100, $reserve));
+    return sanitizeWallboxPercentValue($value, $default);
 }
 
 function wallboxHouseReserveFloorNotice($configuredValue) {
@@ -251,9 +249,9 @@ function wallboxHouseReserveFloorNotice($configuredValue) {
         return '';
     }
     return sprintf(
-        'E3DC-Untergrenze %.1f%% hebt die gespeicherte Hausakku-Reserve %.0f%% auf %.0f%% an.',
-        $e3dcFloor,
+        'Gespeichert bleiben %.0f%%. Die frische E3DC-Untergrenze %.1f%% begrenzt die Akkuunterstützung derzeit wirksam auf %.0f%%.',
         $configured,
+        $e3dcFloor,
         ceil($e3dcFloor)
     );
 }
@@ -1788,6 +1786,19 @@ if (isset($_POST['save_custom_car'])) {
     }
     $existingCar = ($targetIndex !== null && isset($cars[$targetIndex]) && is_array($cars[$targetIndex])) ? $cars[$targetIndex] : [];
     $carName = trim($_POST['custom_car_name'] ?? '');
+    $cpMode = strtolower(trim((string)($_POST['custom_car_control_pilot_interruption_mode'] ?? '')));
+    if ($cpMode === 'required') {
+        $cpRequired = true;
+    } elseif ($cpMode === 'not_required') {
+        $cpRequired = false;
+    } elseif ($cpMode === 'inherit') {
+        // Beim Verknüpfen bleibt der bestehende Profilvertrag erhalten. Eine
+        // neue Vorlage erhält den kompatiblen Standard "nicht erforderlich".
+        $cpRequired = !empty($existingCar['control_pilot_interruption']);
+    } else {
+        // Kompatibler Pfad für das einfache Neuanlage-Formular und alte POSTs.
+        $cpRequired = ((string)($_POST['custom_car_control_pilot_interruption'] ?? '0') === '1');
+    }
     $newCar = [
         'id' => ($targetIndex !== null && !empty($existingCar['id'])) ? $existingCar['id'] : newSavedCarProfileIdWallbox($cars),
         'name' => $carName !== '' ? $carName : ($existingCar['name'] ?? 'Unbenannt'),
@@ -1799,6 +1810,7 @@ if (isset($_POST['save_custom_car'])) {
         'max_phases' => max(1, min(3, (int)($_POST['custom_car_max_phases'] ?? wallboxVehicleMaxPhases([
             'power' => (float)str_replace(',', '.', $_POST['custom_car_power'] ?? '11.0')
         ])))),
+        'control_pilot_interruption' => $cpRequired,
         'efficiency' => (float)str_replace(',', '.', $_POST['custom_car_efficiency'] ?? '90'),
         'consumption' => (float)str_replace(',', '.', $_POST['custom_car_consumption'] ?? '18'),
         'target_soc' => (int)($_POST['custom_car_target'] ?? 80),
@@ -1859,6 +1871,40 @@ if (isset($_POST['save_custom_car'])) {
         $message = successMessage("✓ Fahrzeugprofil '{$newCar['name']}' gespeichert{$assignMessage}.{$legacyHint}");
     } else {
         $message = errorMessage('Fahrzeugprofil nicht übernommen', (string)($tx['message'] ?? 'Der kanonische Profil-Commit ist fehlgeschlagen.'));
+    }
+}
+if (isset($_POST['update_custom_car_cp'])) {
+    $cars = $savedCarsRaw === false ? [] : json_decode($savedCarsRaw, true);
+    if (!is_array($cars)) $cars = [];
+    $profileId = trim((string)($_POST['update_custom_car_cp'] ?? ''));
+    $cpMode = strtolower(trim((string)($_POST['custom_car_control_pilot_interruption_mode'] ?? '')));
+    $targetIndex = null;
+    foreach ($cars as $idx => $car) {
+        if (is_array($car) && (string)($car['id'] ?? '') === $profileId) {
+            $targetIndex = $idx;
+            break;
+        }
+    }
+    if ($targetIndex === null) {
+        $message = errorMessage('CP-Wakeup nicht gespeichert', 'Das ausgewählte Fahrzeugprofil wurde nicht gefunden.');
+    } elseif (!in_array($cpMode, ['required', 'not_required'], true)) {
+        $message = errorMessage('CP-Wakeup nicht gespeichert', 'Bitte wähle erforderlich oder nicht erforderlich.');
+    } else {
+        // Nur den CP-Vertrag ändern; alle anderen Profilwerte bleiben exakt
+        // erhalten. Der kanonische Transaktionspfad prüft die Ausgangsrevision.
+        $cars[$targetIndex]['control_pilot_interruption'] = ($cpMode === 'required');
+        $tx = e3dcWallboxPlanTransaction([], [
+            'operation' => 'plan',
+            'saved_cars' => $cars,
+            'expected_saved_cars_sha256' => $savedCarsExpectedRevision,
+        ]);
+        if (!empty($tx['success']) && !empty($tx['canonical_committed'])) {
+            $profileName = (string)($cars[$targetIndex]['name'] ?? 'Fahrzeug');
+            $cpLabel = $cpMode === 'required' ? 'erforderlich' : 'nicht erforderlich';
+            $message = successMessage("✓ CP-Wakeup für '{$profileName}' als {$cpLabel} gespeichert.");
+        } else {
+            $message = errorMessage('CP-Wakeup nicht gespeichert', (string)($tx['message'] ?? 'Der kanonische Profil-Commit ist fehlgeschlagen.'));
+        }
     }
 }
 if (isset($_POST['delete_custom_car'])) {
@@ -2897,15 +2943,23 @@ if (file_exists($dbPath)) {
         }
     } catch (Exception $e) {}
 }
-// Laufzeitstatus kommt aus tmpfs. Eine alte persistente Datei darf nur als
-// frischer Legacy-Rückfall dienen und den aktuellen RAM-Status nie übersteuern.
-$wb_live_session = e3dcFirstFreshRegularFile([
+// Der neue RSCP-Pfad hat Vorrang. Alte Mischdateien bleiben ausschließlich
+// read-only und sind nur mit dem eindeutigen Python-Marker source=rscp gültig.
+$wb_live_session = null;
+$wb_live_data = null;
+foreach ([
+    '/var/www/html/ramdisk/wb_native_rscp_session.json',
     '/var/www/html/ramdisk/wb_live_session.json',
     '/var/www/html/logs/wb_live_session.json',
-], 15.0);
-$wb_live_data = null;
-if (is_string($wb_live_session)) {
-    $wb_live_data = json_decode((string)@file_get_contents($wb_live_session), true);
+] as $wb_live_candidate) {
+    $wb_live_fresh = e3dcFirstFreshRegularFile([$wb_live_candidate], 15.0);
+    if (!is_string($wb_live_fresh)) continue;
+    $wb_live_candidate_data = json_decode((string)@file_get_contents($wb_live_fresh), true);
+    if (is_array($wb_live_candidate_data) && ($wb_live_candidate_data['source'] ?? '') === 'rscp') {
+        $wb_live_session = $wb_live_fresh;
+        $wb_live_data = $wb_live_candidate_data;
+        break;
+    }
 }
 
 // Wallbox-Manager-Protokolle lesen
@@ -4891,6 +4945,14 @@ if ($hasWb2) {
                             <label class="form-label text-muted small fw-bold mb-1">kWh/100 km</label>
                             <input type="number" step="0.1" name="custom_car_consumption" class="form-control form-control-sm rounded-pill" value="18">
                         </div>
+                        <div class="col-12 col-md-4">
+                            <label class="form-label text-muted small fw-bold mb-1" for="detectedCarCpWakeup<?= $detWb ?>">CP-Wakeup beim Ladestart</label>
+                            <select class="form-select form-select-sm rounded-pill" name="custom_car_control_pilot_interruption_mode" id="detectedCarCpWakeup<?= $detWb ?>">
+                                <option value="inherit" selected>Profilwert übernehmen (neu: nein)</option>
+                                <option value="required">erforderlich</option>
+                                <option value="not_required">nicht erforderlich</option>
+                            </select>
+                        </div>
                         <div class="col-12 col-md-4 d-flex align-items-end">
                             <button type="submit" class="btn btn-warning btn-sm rounded-pill fw-bold w-100">
                                 <i class="fas fa-link me-1"></i> Fahrzeug übernehmen
@@ -4974,6 +5036,16 @@ if ($hasWb2) {
                                 <label class="form-label text-muted small fw-bold mb-1">Verbrauch (kWh/100 km)</label>
                                 <input type="number" step="0.1" min="1" name="custom_car_consumption" class="form-control form-control-sm rounded-pill" value="18">
                             </div>
+                            <div class="col-12 col-md-6 d-flex align-items-end">
+                                <input type="hidden" name="custom_car_control_pilot_interruption" value="0">
+                                <div class="form-check mb-1">
+                                    <input class="form-check-input" type="checkbox" name="custom_car_control_pilot_interruption" value="1" id="customCarCpWakeup">
+                                    <label class="form-check-label small" for="customCarCpWakeup">
+                                        CP-Unterbrechung beim Ladestart erforderlich
+                                    </label>
+                                    <div class="form-text small text-muted">Nur aktivieren, wenn das Fahrzeugprofil für einen zuverlässigen Start einen kurzen CP-Impuls vorsieht.</div>
+                                </div>
+                            </div>
                         </div>
                         <button type="submit" name="save_custom_car" value="1" class="btn btn-outline-success btn-sm w-100 rounded-pill fw-bold border-2">
                             <i class="fas fa-plus"></i> Als Vorlage speichern
@@ -4989,6 +5061,7 @@ if ($hasWb2) {
                                     <th class="border-secondary-subtle">Akku</th>
                                     <th class="border-secondary-subtle">Leistung</th>
                                     <th class="border-secondary-subtle">Phasen</th>
+                                    <th class="border-secondary-subtle">CP-Wakeup</th>
                                     <th class="border-secondary-subtle">ID / MAC</th>
                                     <th class="text-end pe-3 border-secondary-subtle">Aktion</th>
                                 </tr>
@@ -5000,6 +5073,17 @@ if ($hasWb2) {
                                     <td class="border-secondary-subtle"><?= number_format((float)($car['capacity'] ?? 0), 1, ',', '.') ?> kWh</td>
                                     <td class="border-secondary-subtle"><?= number_format((float)($car['power'] ?? 0), 1, ',', '.') ?> kW</td>
                                     <td class="border-secondary-subtle"><?= htmlspecialchars((string)(wallboxVehicleMaxPhases($car) ?: '--')) ?>p</td>
+                                    <td class="border-secondary-subtle">
+                                        <form action="<?= htmlspecialchars($formAction) ?>" method="post" class="d-flex align-items-center gap-1">
+                                            <?= e3dcCsrfInput() ?>
+                                            <input type="hidden" name="update_custom_car_cp" value="<?= htmlspecialchars($car['id'] ?? '') ?>">
+                                            <select name="custom_car_control_pilot_interruption_mode" class="form-select form-select-sm" aria-label="CP-Wakeup für <?= htmlspecialchars($car['name'] ?? 'Fahrzeug') ?>">
+                                                <option value="not_required" <?= empty($car['control_pilot_interruption']) ? 'selected' : '' ?>>nein</option>
+                                                <option value="required" <?= !empty($car['control_pilot_interruption']) ? 'selected' : '' ?>>ja</option>
+                                            </select>
+                                            <button type="submit" class="btn btn-outline-success btn-sm" title="CP-Wakeup speichern" aria-label="CP-Wakeup speichern"><i class="fas fa-save"></i></button>
+                                        </form>
+                                    </td>
                                     <td class="border-secondary-subtle"><code class="small"><?= htmlspecialchars($car['vehicle_id'] ?? '') ?></code></td>
                                     <td class="text-end pe-3 border-secondary-subtle">
                                         <form action="<?= htmlspecialchars($formAction) ?>" method="post" style="display:inline;">
@@ -5288,18 +5372,14 @@ function initSimpleWallboxTargetControls() {
         return form.querySelector('[name="simple_charge_intent"]:checked')?.value || 'surplus';
     }
 
-    function clampHouseReserveValue(value, floorSource = null, applyFloor = true) {
+    function clampHouseReserveValue(value) {
         const raw = Number(String(value ?? '').replace(',', '.'));
-        let next = Number.isFinite(raw) ? Math.max(0, Math.min(100, raw)) : 0;
-        const floorRaw = Number(String(floorSource?.dataset?.e3dcFloor || globalReserve?.dataset?.e3dcFloor || '').replace(',', '.'));
-        if (applyFloor && Number.isFinite(floorRaw) && floorRaw > 0 && floorRaw <= 100 && next < floorRaw) {
-            next = Math.ceil(floorRaw);
-        }
+        const next = Number.isFinite(raw) ? Math.max(0, Math.min(100, raw)) : 0;
         return String(Math.max(0, Math.min(100, Math.round(next))));
     }
 
     function globalReserveValue(commit = true) {
-        const value = clampHouseReserveValue(globalReserve?.value, globalReserve, commit);
+        const value = clampHouseReserveValue(globalReserve?.value);
         if (commit) {
             if (globalReserve && globalReserve.value !== value) globalReserve.value = value;
             const reserveInput = document.querySelector('#vehicleAssignmentForm input[name="wbminsoc"]');
@@ -5590,7 +5670,7 @@ function initSimpleWallboxTargetControls() {
             if (globalReserve) globalReserve.value = value;
             if (reserveInput) reserveInput.value = value;
         }
-        const next = clampHouseReserveValue(globalReserve?.value ?? reserveInput?.value, source || globalReserve || reserveInput, true);
+        const next = clampHouseReserveValue(globalReserve?.value ?? reserveInput?.value);
         if (globalReserve) globalReserve.value = next;
         if (reserveInput) reserveInput.value = next;
         syncSimpleGlobalSubmitFields();

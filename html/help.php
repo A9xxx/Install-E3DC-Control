@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.4i Stable</span>
+            <span class="badge bg-success text-light">v5.4.5 Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.4i</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.5</code> in <code>.env</code> gesetzt.</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
 if [ -f ./docker_compose_update.py ]; then
   E3DC_DOCKER_HELPER=./docker_compose_update.py
@@ -212,6 +212,32 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                         <li>Nach der Freigabe im Account den RESTful API Security Token erzeugen.</li>
                         <li>Im Config-Editor unter <em>Tarif</em> den ENTSO-E-Token als Fallback-Token eintragen und mit <em>ENTSO-E testen</em> prüfen.</li>
                     </ol>
+                </div>
+            </div>
+        </div>
+
+        <h4 class="mb-4 text-accent"><i class="fas fa-shield-halved me-2"></i>Stable 5.4.5: zentrale Wallbox-Regelung und ehrliche Diagnose</h4>
+        <div class="col-12 faq-item" data-tags="5.4.5 stable wallbox watt quellen netz wh phase openwb efy prognose diagnose update worker live anzeige luxtronik rechte drift notfall">
+            <div class="card bg-card border-0 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <span class="tag">5.4.5</span>
+                        Was ändert das Stable-Release 5.4.5?
+                    </h5>
+                    <ul>
+                        <li><strong>Ein zentraler Ausgang:</strong> Die Wallbox-Regelung bindet Quelle, Wattbudget, Stromschritt und Hardwaregrenzen je Ladepunkt. Der Treiber übersetzt nur noch den finalen Auftrag in das Geräteprotokoll und trifft keine zweite Ladeentscheidung.</li>
+                        <li><strong>Schnell hoch, kontrolliert herunter:</strong> Ein vollständig finanziertes höheres Stromziel wird nicht durch eine zweite Treiberrampe verzögert. Bei Unterdeckung gilt weiterhin die physische Reihenfolge Strom reduzieren, gegebenenfalls Phase wechseln und erst am einphasigen Mindeststrom stoppen.</li>
+                        <li><strong>Netz-Wh-Wächter ohne Doppelzählung:</strong> Derselbe frische Netzpunkt-Snapshot zählt gruppenweit genau einmal. Echter Netzbezug hat Vorrang; eine gleichzeitige Budgetüberziehung beschleunigt den Zähler nicht zusätzlich. PV-Kurve und PV + Akku behalten getrennte Quellenrahmen.</li>
+                        <li><strong>Ehrliche Live-Leistung:</strong> Nach einem bestätigten Stopp hält weder Verriegelung noch Sollstrom noch ein alter Anzeigecache die letzte Wallboxleistung künstlich fest. Fehlende Messwerte werden nicht als alte kW-Leistung fortgeschrieben.</li>
+                        <li><strong>E3/DC-DC-first:</strong> Eine alte niedrige Speicher-Ladegrenze darf bei offener Hausversorgung kontrolliert bis zur frisch belegten internen E3/DC-DC-Leistung gelöst werden. Ein Zusatzwechselrichter wird dabei nicht als DC-Leistung umgedeutet; Netzbezug, stale Daten und widersprüchliche Rückmeldungen bleiben Sperren.</li>
+                        <li><strong>WB1 und WB2 in der Tagesstatistik:</strong> Beide Ladepunkte führen getrennte Sitzungs- und Tageswerte. Die Tagesansicht summiert sie ohne Doppelzählung und weist die Einzelanteile aus.</li>
+                        <li><strong>PV-Prognosediagnose:</strong> Installationszentrale, Desktop und Mobilansicht zeigen denselben rein lesenden Diagnosestand. Er verändert weder Prognosemodell noch Speicher- oder Wallboxentscheidung.</li>
+                        <li><strong>Luxtronik-Ablauf lesbar:</strong> Warmwasseranforderung, bestätigte Hydraulik, Verdichterstart, gemessene 40-Hz-Zwischenstufe und erreichte Ziellast werden getrennt angezeigt. Pumpensignale allein werden nicht als Verdichterleistung ausgegeben.</li>
+                        <li><strong>Rechtereparatur ohne Update:</strong> Der eigene Rechteauftrag erstellt kein Vollbackup, ersetzt keine Inhalte und startet keine Regelungsdienste neu. Releasegleiche Einträge werden sofort korrigiert; inhaltlich geänderte Produktdateien bleiben unangetastet und werden vollständig über einen kurzlebigen Einmalvertrag zur Bestätigung aufgelistet.</li>
+                        <li><strong>Driftwarnung vor dem Stable-Abgleich:</strong> Der Updater vergleicht nur die Zielprojektion und veröffentlichte Löschliste mit einem belegten Ausgangsstand. Eine Bestätigung bindet die konkrete Dateiliste samt Fingerprints und wird nach Writer-Ruhe unmittelbar vor dem Austausch erneut geprüft; unbekannte Dateien außerhalb der Projektion bleiben unberührt.</li>
+                        <li><strong>Monotones Storage-Notfallveto:</strong> Ein aktiver Notfall-Latch hält den Storage Writer auch über Update, Rückfall und Neustart gesperrt. Andere Pflichtdienste werden weiterhin geprüft.</li>
+                        <li><strong>Sauberer Updateabschluss:</strong> Der reguläre Worker-Abschluss räumt innerhalb seines gültigen Funktionskontexts auf; die nachgelagerte Meldung <code>worker_cleanup_started: unbound variable</code> entfällt.</li>
+                    </ul>
                 </div>
             </div>
         </div>
@@ -330,7 +356,7 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                     <ul>
                         <li><strong>Ein vollständiger Ziel-Updater:</strong> Der heruntergeladene Release-Updater erstellt das Vollbackup, hält die Dienste nur für ruhende Nachsicherung und Projektion kurz an, repariert bekannte Rechte und startet die benötigten Dienste neu. Nutzer-<code>.git</code>, lokale Produktänderungen und fehlende Release-Dateien blockieren nicht.</li>
                         <li><strong>Abbruch mit Lösung:</strong> Bei <code>ENOSPC</code>, <code>EROFS</code>, <code>EACCES</code> oder mehreren gleichrangigen Installationen zeigt die Ausgabe den betroffenen Pfad beziehungsweise die Kandidaten und einen konkret ausführbaren nächsten Befehl.</li>
-                        <li><strong>Alle sichtbaren zustandsändernden Aktionen:</strong> Die WebUI-Buttons verlangen Anmeldung und CSRF-Schutz und melden Erfolg erst nach Prüfung von HTTP-Status, Antwort und Teilfehlern. Der Rechte-Button verwendet den root-eigenen Backup-/Updateauftrag. Damit ist der Softwarevertrag geprüft; nicht jeder physische Aktor wurde dafür im Feld betätigt.</li>
+                        <li><strong>Alle sichtbaren zustandsändernden Aktionen:</strong> Die WebUI-Buttons verlangen Anmeldung und CSRF-Schutz und melden Erfolg erst nach Prüfung von HTTP-Status, Antwort und Teilfehlern. Ab 5.4.5 verwendet der Rechte-Button einen eigenen root-eigenen Rechteauftrag ohne Vollbackup, Releasewechsel oder Dienstneustart. Damit ist der Softwarevertrag geprüft; nicht jeder physische Aktor wurde dafür im Feld betätigt.</li>
                         <li><strong>Modus 5, HA und Bluelink:</strong> Private Datenverzeichnisse verwenden <code>02770</code>, der gewählte Kompatibilitätsmodus <code>02775</code> bleibt möglich. Eine HA-Lease wird nur bei exakt passender Rolle und Peer-Bindung übernommen. Ein bewusst leerer aktueller Bluelink-Token wird nicht durch ältere Fallbacks ersetzt.</li>
                         <li><strong>Wallbox-Hausgrenze:</strong> Hausabsicherung und Wallbox-Reserve begrenzen das gemeinsame Ladeziel in allen von E3DC-Control geführten Modi phasenbezogen. In <em>Aus / autonom</em> muss dieselbe Grenze in der Wallbox beziehungsweise im Ladeprofil abgesichert sein, weil E3DC-Control dort keine Strombefehle mehr sendet. Mangels echter PCC-Phasen-RMS-Messung bleibt <code>P/230</code> reine Diagnose; eine dynamische Subtraktion tatsächlicher Hausverbraucher wird nicht behauptet.</li>
                         <li><strong>35-A-Standard und faire Verteilung:</strong> Fehlt die Hausabsicherung oder ist der Eintrag leer, gelten 35 A je Phase. Mehrere Ladepunkte teilen den verfügbaren Phasenrahmen ohne pauschale Halbierung; ausdrücklich ungültige Grenzwerte sperren mit Korrekturanweisung.</li>
@@ -1488,7 +1514,8 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                         <li>Über das Dashboard (Kachel Konfiguration -> "Update suchen").</li>
                         <li>Bei aktuellen Ständen direkt über den Menüpunkt <em>Update</em> im Installer.</li>
                     </ol>
-                    <p>Weboberfläche, Konsole und Installer-Menü starten denselben root-eigenen Hintergrundauftrag und verwenden gemeinsam <code>/run/lock/e3dc-control/update.lock</code>. Sichere root-eigene Altmodi <code>0755</code>/<code>0644</code> werden vor jeder Mutation auf <code>0700</code>/<code>0600</code> normalisiert. Ein unsicherer Lockknoten bricht vor Produkt- oder Dienständerungen kontrolliert ab; bei einem belegten Lock muss der laufende Update- oder Backupauftrag zuerst beendet werden. Die automatische Updateprüfung verwendet dieselbe Stable-Quelle und informiert nur über einen neuen Stand. Der lokale Git-, Rechte- oder Änderungszustand ist keine vorgelagerte Startautorität. Der heruntergeladene Ziel-Updater erstellt das Vollbackup, stoppt die betroffenen Dienste einmal kurz, ersetzt Dateien und Rechte und bestätigt danach den Wiederanlauf.</p>
+                    <p>Weboberfläche, Konsole und Installer-Menü starten denselben root-eigenen Hintergrundauftrag und verwenden gemeinsam <code>/run/lock/e3dc-control/update.lock</code>. Sichere root-eigene Altmodi <code>0755</code>/<code>0644</code> werden vor jeder Mutation auf <code>0700</code>/<code>0600</code> normalisiert. Ein unsicherer Lockknoten bricht vor Produkt- oder Dienständerungen kontrolliert ab; bei einem belegten Lock muss der laufende Update- oder Backupauftrag zuerst beendet werden. Die automatische Updateprüfung verwendet dieselbe Stable-Quelle und informiert nur über einen neuen Stand. Der lokale Git-Stand ist keine Updateautorität. Vor Backup und nach Writer-Ruhe vergleicht der Ziel-Updater jedoch die exakt betroffenen Produkt- und Löschpfade inhaltlich mit einem belegten veröffentlichten Ausgangsstand. Unveränderte Dateien laufen ohne Rückfrage weiter; lokale Abweichungen werden einzeln genannt und benötigen eine an Ziel, Dateiliste und Fingerprints gebundene Bestätigung. Unbekannte Dateien außerhalb der Zielprojektion bleiben unangetastet. Erst danach erstellt der Ziel-Updater das Vollbackup, stoppt die betroffenen Dienste einmal kurz, ersetzt Dateien und Rechte und bestätigt den Wiederanlauf.</p>
+                    <p><strong>Rechte ohne Releasewechsel reparieren:</strong> Die eigenständige Rechtereparatur prüft und korrigiert nur Besitzer, Gruppe und Modus bekannter Produkt- und Laufzeitpfade. Sie erstellt kein Vollbackup, ersetzt keinen Dateiinhalt und startet keine Regelungsdienste neu. Releasegleiche Einträge werden im ersten Auftrag sofort korrigiert. Inhaltlich lokal geänderte Produktdateien bleiben unangetastet und werden vollständig angezeigt; eine fünf Minuten gültige Einmalfreigabe bindet Rechtevertrag, exakte Pfadliste und Datei-Fingerprints, bevor ausschließlich deren Metadaten repariert werden.</p>
                     <p><strong>Private Vorbereitung, lesbarer Betrieb:</strong> Der private Downloadbereich bleibt root-eigen mit <code>0700</code>/<code>0600</code>. Beim Dateiaustausch erhält nur der betriebene Produktbaum definierte Live-Rechte. Konfigurationen, Zugangsdaten und Laufzeitdaten behalten ihre strengeren Regeln. Vor dem Dienststart müssen PHP-Pfadauflösung und Installer-Importkette den gebundenen Pfad in einer bereinigten Umgebung als <code>www-data</code> lesen können; die private Service-Pythonumgebung wird dafür nicht geöffnet. Unter einem privaten Home-Pfad ergänzt der Updater auf echten benötigten Vorfahren nur das Traversierrecht; Auflisten, Lesen und Schreiben bleiben gesperrt.</p>
                     <p>Für eine heterogene Altinstallation genügt genau eine auf den Raspberry Pi kopierte Datei. Im Ablageverzeichnis wird sie ohne Pfad- oder Rollenargument gestartet:</p>
                     <pre>sudo /bin/sh ./e3dc-update-bootstrap</pre>

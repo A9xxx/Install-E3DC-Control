@@ -2,8 +2,16 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.4i`. Die Tags `latest`, `v5.4.4i` und
-`5.4.4i` bezeichnen denselben Stable-Stand.
+Der aktuelle Stable-Stand ist `v5.4.5`. Die Tags `latest`, `v5.4.5` und
+`5.4.5` bezeichnen denselben Stable-Stand.
+
+5.4.5 enthält die zentralen Wallbox-Watt-, Quellen- und Aktorverträge, den
+gruppenweiten Netz-Wh-Wächter sowie die kanonische Wallbox-Liveanzeige ohne
+künstlichen Leistungs-Hold. Die rein lesende PV-Prognosediagnose wird in
+Installationszentrale, Desktop- und Mobilansicht gemeinsam dargestellt. Der
+Container trifft weiterhin keine Host-Update- oder Docker-Daemon-
+Entscheidung; der korrigierte Worker-Abschluss betrifft den Bare-Metal-
+Updatepfad.
 
 5.4.4i enthält den gebundenen manuellen Fahrzeug-SoC und die korrigierten
 Wallbox-Ausgangsverträge. Eine laufende Ladung in `PV-Kurve ruhig` bleibt bis
@@ -361,7 +369,7 @@ unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.4i` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.5` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -388,7 +396,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.4i` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.5` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash

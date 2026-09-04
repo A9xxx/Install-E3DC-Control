@@ -1,10 +1,28 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.4.4i
+Dokumentation Stand: 5.4.5
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
 Installationspfad und Python-Umgebung aus dem geprüften Installationskontext.
+
+5.4.5 führt die reguläre Worker-Bereinigung noch innerhalb des aktiven
+Funktionskontexts aus. Der erfolgreiche Abschluss erzeugt dadurch unter
+`set -u` keinen nachgelagerten Fehler wegen einer bereits nicht mehr gebundenen
+lokalen Variable. Frühfehler und Signale bleiben durch den bestehenden
+EXIT-Trap abgedeckt. Die neue PV-Prognosediagnose wird als statisches Webasset
+mit dem regulären Update- und Rechtevertrag ausgeliefert.
+
+Die Rechtereparatur ist in 5.4.5 ein eigener root-eigener Auftrag ohne
+Vollbackup, Releasewechsel oder Dienstneustart. Unveränderte bekannte Pfade
+werden beim ersten Auftrag direkt normalisiert. Inhaltlich lokal geänderte
+Produktdateien bleiben dabei unangetastet und werden vollständig zur
+Bestätigung angezeigt. Ein root-eigener Fünf-Minuten-Einmalvertrag bindet
+Vertrags-Digest, exakte Pfadliste und Datei-Fingerprints; erst danach werden
+nur deren Metadaten korrigiert. Das
+Stable-Update prüft unabhängig davon seine exakte Ziel- und Löschprojektion
+gegen einen belegten veröffentlichten Ausgangsstand und wiederholt den
+fingerprintgebundenen Vergleich nach Writer-Ruhe unmittelbar vor dem Ersatz.
 
 5.4.4i setzt im installierten Web-Launcher und im eigenständigen
 Community-Bootstrap vor allen steuernden Dateitypprüfungen eine feste
@@ -24,11 +42,12 @@ pauschalen Unverändert-Aussage.
 
 Der enthaltene Installer-Anteil von 5.4.4g führt Backup, kurze Umschaltphase,
 Releaseprojektion, Reparatur bekannter Rechte und Dienstneustart vollständig im
-heruntergeladenen Ziel-Updater aus. Das Nutzer-`.git`, lokale
-Produktänderungen, fehlende Produktdateien und historische Rechte sind keine
-Startbedingungen. `ENOSPC`, `EROFS`, `EACCES` oder mehrere gleichrangige
+heruntergeladenen Ziel-Updater aus. Das Nutzer-`.git` ist keine
+Updateautorität; 5.4.5 benennt lokale Inhaltsabweichungen im exakten
+Zielumfang jedoch vor dem Überschreiben und verlangt dafür eine gebundene
+Bestätigung. `ENOSPC`, `EROFS`, `EACCES` oder mehrere gleichrangige
 Installationen enden mit einer konkreten Prüf- und Fortsetzungsanweisung. Die
-Web-Rechte-Reparatur verwendet denselben root-eigenen Backup-/Updateauftrag;
+Web-Rechtereparatur verwendet ab 5.4.5 den getrennten reinen Rechteauftrag;
 alle sichtbaren zustandsändernden Webaktionen prüfen Anmeldung,
 CSRF, HTTP-Ergebnis, Antwortinhalt und Teilfehler, bevor sie Erfolg melden.
 Private Modus-5-Datenverzeichnisse werden als `02770`, im ausdrücklich
@@ -377,7 +396,7 @@ verwendet den alten `installer_main.py`-Updatepfad nicht. Details stehen in
 | :--- | :--- |
 | `1) Installation / Update` | Installation oder Update mit Paketen, Webdateien, Rechten und Diensten. |
 | `2) Systemstatus anzeigen` | Read-only Übersicht für Dienste, Pfade und Konfiguration. |
-| `3) Rechte prüfen & korrigieren` | Startet den root-eigenen Backup-/Updateauftrag und repariert Besitzer, Gruppen, sudoers, Webrechte und Ramdisk. |
+| `3) Rechte prüfen & korrigieren` | Prüft und repariert ausschließlich den Rechtevertrag; kein Vollbackup, kein Releasewechsel und kein Neustart der Regelungsdienste. Inhaltlich lokal geänderte Produktdateien werden vor der Metadatenkorrektur einzeln zur Bestätigung angezeigt. |
 | `4) Notfallmodus / System reparieren` | Gebündelte Reparatur einer beschädigten Installation. |
 | `5) Policygebundener Programm-Rückfall` | Rückfall auf einen ausdrücklich für Bare Metal freigegebenen Stable-Stand; `v5.3.2b` ist dafür nicht freigegeben. |
 | `6) Backup erstellen / verwalten` | Verifizierte Sicherungen erstellen, prüfen oder wiederherstellen. |

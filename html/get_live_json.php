@@ -69,6 +69,43 @@ function liveJsonWriteRuntimeFileAtomic($path, $body) {
     return $ok;
 }
 
+function liveJsonReadNativeRscpSession($maxAgeS = 15.0) {
+    // Der neue RSCP-Pfad hat Vorrang. Die alten Mischpfade bleiben für
+    // bestehende Installationen ausschließlich read-only und dürfen nur mit
+    // dem eindeutigen Python-Writer-Marker source=rscp verwendet werden.
+    $candidates = [
+        '/var/www/html/ramdisk/wb_native_rscp_session.json',
+        '/var/www/html/ramdisk/wb_live_session.json',
+        '/var/www/html/logs/wb_live_session.json',
+    ];
+    foreach ($candidates as $candidate) {
+        $freshFile = e3dcFirstFreshRegularFile([$candidate], (float)$maxAgeS);
+        if (!is_string($freshFile)) continue;
+        $payload = @json_decode((string)@file_get_contents($freshFile), true);
+        if (is_array($payload) && ($payload['source'] ?? '') === 'rscp') {
+            return $payload;
+        }
+    }
+    return null;
+}
+
+function liveJsonReadLegacyPhpWallboxTracker($path) {
+    if (!is_string($path) || !is_file($path) || is_link($path)) return null;
+    $payload = @json_decode((string)@file_get_contents($path), true);
+    if (!is_array($payload)) return null;
+    $source = strtolower(trim((string)($payload['source'] ?? '')));
+    if ($source === 'rscp') return null;
+    if ($source !== '' && $source !== 'php_integrator') return null;
+    // Das alte PHP-Schema ist an diesen Integratorfeldern eindeutig. Eine
+    // beliebige JSON-Datei oder der frühere RSCP-Vertrag wird nie migriert.
+    foreach (['is_locked', 'start_ts', 'last_ts', 'kwh'] as $requiredKey) {
+        if (!array_key_exists($requiredKey, $payload)) return null;
+    }
+    if (!is_numeric($payload['last_ts']) || !is_numeric($payload['kwh'])) return null;
+    if (!is_bool($payload['is_locked']) && !in_array($payload['is_locked'], [0, 1, '0', '1'], true)) return null;
+    return $payload;
+}
+
 function liveJsonOpenBoundLockFile($path) {
     if (is_link($path)) return false;
     $handle = @fopen($path, 'c');
@@ -1084,13 +1121,23 @@ function openwbDailyHangoverSeen($wallboxNo, $rawKwh) {
     return ($samples >= 2 && $sameIdle >= 2 && $activePower == 0);
 }
 
-function normalizeOpenwbDailyKwh($wallboxNo, $rawWh, $powerW = 0.0, $charging = false, $sessionKwh = 0.0) {
+function normalizeOpenwbDailyKwh($wallboxNo, $rawWh, $powerW = 0.0, $charging = false, $sessionKwh = 0.0, $plugged = false, $sessionStartTs = null) {
     $rawWh = max(0.0, (float)$rawWh);
     $rawKwh = $rawWh / 1000.0;
     $powerW = abs((float)$powerW);
     $sessionWh = max(0.0, (float)$sessionKwh * 1000.0);
-    $active = $charging || $powerW > 100.0 || $sessionWh > 50.0;
+    // Ein reiner Steckzustand ist keine frische Energieevidenz: Ein Fahrzeug
+    // kann fertig geladen noch über Mitternacht angeschlossen bleiben.
+    $activeEnergy = (bool)$charging || $powerW > 100.0;
     $today = date('Y-m-d');
+    $sessionStart = null;
+    if (is_numeric($sessionStartTs)) {
+        $candidate = (float)$sessionStartTs;
+        if ($candidate > 20000000000.0) $candidate /= 1000.0;
+        if ($candidate > 0.0 && $candidate <= time() + 300) {
+            $sessionStart = (int)$candidate;
+        }
+    }
     $key = ((int)$wallboxNo === 2) ? 'wb2' : 'wb1';
     $stateFile = '/var/www/html/ramdisk/openwb_daily_baseline.json';
     $state = [];
@@ -1102,10 +1149,41 @@ function normalizeOpenwbDailyKwh($wallboxNo, $rawWh, $powerW = 0.0, $charging = 
 
     $entry = isset($state[$key]) && is_array($state[$key]) ? $state[$key] : null;
     $newDay = !$entry || (($entry['date'] ?? '') !== $today);
+    $carryWh = $newDay ? 0.0 : max(0.0, (float)($entry['carry_wh'] ?? 0.0));
+    if ($sessionStart === null
+        && !$newDay
+        && is_numeric($entry['session_start_ts'] ?? null)) {
+        $storedStart = (int)$entry['session_start_ts'];
+        if ($storedStart > 0 && $storedStart <= time() + 300) {
+            $sessionStart = $storedStart;
+        }
+    }
+    $sessionStartedToday = $sessionStart !== null
+        && date('Y-m-d', $sessionStart) === $today;
     if ($newDay) {
-        // At a real day change the current openWB counter is the baseline.
-        // If WebUI is first started mid-session, use the session anchor.
-        $baselineWh = $active ? max(0.0, $rawWh - $sessionWh) : $rawWh;
+        // Eine heute begonnene, vom Treiber zeitlich gebundene Sitzung darf
+        // beim ersten Web-Aufruf vollständig übernommen werden. Eine alte oder
+        // zeitlich unbekannte Sitzung wird dagegen nie als heutige Energie
+        // ausgegeben. Bei einem laufenden Übergang über Mitternacht übernimmt
+        // ein höchstens 30 Minuten alter Vorwert annähernd die Tagesgrenze.
+        if ($sessionStartedToday) {
+            $baselineWh = max(0.0, $rawWh - $sessionWh);
+        } else {
+            $previousRawWh = is_array($entry) ? (float)($entry['last_raw_wh'] ?? -1.0) : -1.0;
+            $previousTs = is_array($entry) ? (int)($entry['ts'] ?? 0) : 0;
+            $hasRecentPreviousSample = $previousRawWh >= 0.0
+                && $previousTs > 0
+                && time() - $previousTs <= 1800;
+            if ($hasRecentPreviousSample) {
+                // Monotone Gesamtzähler werden am letzten Vorwert getrennt;
+                // ein echter Tageszähler-Reset beginnt dagegen bei null.
+                $baselineWh = $rawWh + 20.0 >= $previousRawWh
+                    ? $previousRawWh
+                    : 0.0;
+            } else {
+                $baselineWh = $rawWh;
+            }
+        }
     } else {
         $baselineWh = max(0.0, (float)($entry['baseline_wh'] ?? 0.0));
     }
@@ -1113,21 +1191,31 @@ function normalizeOpenwbDailyKwh($wallboxNo, $rawWh, $powerW = 0.0, $charging = 
     // Some openWB/openWB-Pro counters behave like "since plug-in" counters.
     // If the UI was updated after midnight and history already shows the same
     // idle value from 00:00 onward, treat it as yesterday's carry-over.
-    if (!$entry && !$active && openwbDailyHangoverSeen($wallboxNo, $rawKwh)) {
+    if (!$activeEnergy
+        && $newDay
+        && !$sessionStartedToday
+        && openwbDailyHangoverSeen($wallboxNo, $rawKwh)) {
         $baselineWh = $rawWh;
+        $carryWh = 0.0;
     }
 
-    // True daily counters may reset to zero. Drop the baseline then.
-    if ($rawWh + 500.0 < $baselineWh) {
+    // Ein Counter kann auch innerhalb des Tages durch Geräte-/Dienstneustart
+    // zurückspringen. Bereits gezählte Tagesenergie bleibt als Übertrag
+    // erhalten; nur das neue Rohsegment beginnt wieder bei null.
+    $lastRawWh = !$newDay ? max(0.0, (float)($entry['last_raw_wh'] ?? 0.0)) : 0.0;
+    if (!$newDay && $rawWh + 20.0 < $lastRawWh) {
+        $carryWh = max($carryWh, (float)($entry['last_daily_wh'] ?? 0.0));
         $baselineWh = 0.0;
     }
 
-    $dailyWh = max(0.0, $rawWh - $baselineWh);
+    $dailyWh = $carryWh + max(0.0, $rawWh - $baselineWh);
     $state[$key] = [
         'date' => $today,
         'baseline_wh' => round($baselineWh, 1),
+        'carry_wh' => round($carryWh, 1),
         'last_raw_wh' => round($rawWh, 1),
         'last_daily_wh' => round($dailyWh, 1),
+        'session_start_ts' => $sessionStart,
         'ts' => time(),
     ];
     @file_put_contents($stateFile, json_encode($state), LOCK_EX);
@@ -1137,7 +1225,9 @@ function normalizeOpenwbDailyKwh($wallboxNo, $rawWh, $powerW = 0.0, $charging = 
         'kwh' => round($dailyWh / 1000.0, 3),
         'raw_kwh' => round($rawKwh, 3),
         'baseline_kwh' => round($baselineWh / 1000.0, 3),
-        'source' => $baselineWh > 0.0 ? 'openwb_daily_imported_delta' : 'openwb_daily_imported',
+        'source' => ($baselineWh > 0.0 || $carryWh > 0.0)
+            ? 'openwb_daily_imported_delta'
+            : 'openwb_daily_imported',
     ];
 }
 
@@ -2009,7 +2099,18 @@ function wallboxSlotLooksConnected($data, $slot) {
 
 function wallboxSlotHasOwnVehicleIdentity($data, $slot) {
     foreach (wallboxSlotIdentityPrefixes($slot) as $prefix) {
-        foreach (["{$prefix}_car_name", "{$prefix}_car_id", "{$prefix}_vehicle_id", "{$prefix}_rfid_tag"] as $key) {
+        $stableKey = "{$prefix}_stable_vehicle_identity_current";
+        $currentKey = "{$prefix}_vehicle_identity_current";
+        $identityStateDeclared = array_key_exists($stableKey, $data)
+            || array_key_exists($currentKey, $data);
+        $identityCurrent = (($data[$stableKey] ?? null) === true)
+            || (($data[$currentKey] ?? null) === true);
+        if ($identityStateDeclared && !$identityCurrent) continue;
+
+        // Anzeigenamen wie "openWB Pro" beschreiben nur den Treiber. Ohne
+        // aktuell bestätigte Fahrzeug-ID dürfen sie die eindeutige, explizit
+        // konfigurierte Profilbindung des angeschlossenen Slots nicht sperren.
+        foreach (["{$prefix}_car_id", "{$prefix}_vehicle_id", "{$prefix}_rfid_tag"] as $key) {
             if (!empty($data[$key])) return true;
         }
     }
@@ -2688,6 +2789,353 @@ function livePlanCanonicalJsonPreservingObjects($value) {
         livePlanCanonicalizePreservingObjects($value),
         JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION
     );
+}
+
+function liveStorageSha256Identity($value) {
+    return is_string($value)
+        && preg_match('/^sha256:[0-9a-f]{64}$/', $value) === 1;
+}
+
+function liveStorageFiniteNumber($value) {
+    if (is_bool($value) || $value === null) return null;
+    if (is_string($value) && trim($value) === '') return null;
+    if (!is_numeric($value)) return null;
+    $number = (float)$value;
+    return is_finite($number) ? $number : null;
+}
+
+function liveStorageProjectedEndSoc($plan, $lastProjectedSoc) {
+    $fallback = liveStorageFiniteNumber($lastProjectedSoc);
+    if ($fallback === null || $fallback < 0 || $fallback > 100) {
+        $fallback = 0.0;
+    }
+    $candidate = is_array($plan)
+        ? liveStorageFiniteNumber($plan['ladeende_soc'] ?? null)
+        : null;
+    return $candidate !== null && $candidate >= 0 && $candidate <= 100
+        ? $candidate
+        : $fallback;
+}
+
+function liveStorageCanonicalDisplayDay($plan, $timezoneName = 'Europe/Berlin', $nowTsMs = null) {
+    $invalid = [
+        'status' => 'INVALID',
+        'reason_code' => 'CANONICAL_PLAN_INVALID',
+        'plan_id' => is_array($plan) ? ($plan['plan_id'] ?? null) : null,
+        'display_day' => null,
+        'display_day_label' => null,
+        'day_offset' => null,
+        'display_day_start_ts_ms' => null,
+        'display_day_end_ts_ms' => null,
+        'slot_count' => 0,
+        'slot_ids' => [],
+        'slot_start_ts_ms' => [],
+    ];
+    if (!is_array($plan)
+        || ($plan['schema_version'] ?? '') !== 'storage_dispatch_plan_v1'
+        || !liveStorageSha256Identity($plan['plan_id'] ?? null)
+        || !isset($plan['slots'])
+        || !is_array($plan['slots'])) {
+        return $invalid;
+    }
+    try {
+        $timezone = new DateTimeZone((string)$timezoneName);
+    } catch (Exception $e) {
+        $timezone = new DateTimeZone('Europe/Berlin');
+    }
+    $slotDays = [];
+    $seenSlotIds = [];
+    $seenSlotStarts = [];
+    $previousStartTsMs = null;
+    $previousEndTsMs = null;
+    $slotDurationS = liveStorageFiniteNumber($plan['slot_duration_s'] ?? null);
+    $axisInvalid = false;
+    foreach ($plan['slots'] as $slot) {
+        if (!is_array($slot)) {
+            $axisInvalid = true;
+            continue;
+        }
+        $startTsMs = liveStorageFiniteNumber($slot['start_ts_ms'] ?? null);
+        $endTsMs = liveStorageFiniteNumber($slot['end_ts_ms'] ?? null);
+        $slotId = $slot['slot_id'] ?? null;
+        if ($startTsMs === null
+            || $startTsMs <= 0
+            || $endTsMs === null
+            || $endTsMs <= $startTsMs
+            || !liveStorageSha256Identity($slotId)
+            || isset($seenSlotIds[$slotId])
+            || isset($seenSlotStarts[(string)$startTsMs])
+            || ($previousStartTsMs !== null && $startTsMs <= $previousStartTsMs)
+            || ($previousEndTsMs !== null && $startTsMs < $previousEndTsMs)
+            || ($slotDurationS !== null
+                && $slotDurationS > 0
+                && abs(($endTsMs - $startTsMs) - ($slotDurationS * 1000.0)) > 1.0)) {
+            $axisInvalid = true;
+            continue;
+        }
+        $seenSlotIds[$slotId] = true;
+        $seenSlotStarts[(string)$startTsMs] = true;
+        $previousStartTsMs = $startTsMs;
+        $previousEndTsMs = $endTsMs;
+        $local = (new DateTimeImmutable('now', $timezone))
+            ->setTimestamp((int)floor($startTsMs / 1000));
+        $date = $local->format('Y-m-d');
+        if (!isset($slotDays[$date])) {
+            $dayStart = new DateTimeImmutable($date . ' 00:00:00', $timezone);
+            $dayEnd = $dayStart->modify('+1 day');
+            $slotDays[$date] = [
+                'display_day' => $date,
+                'display_day_start_ts_ms' => $dayStart->getTimestamp() * 1000,
+                'display_day_end_ts_ms' => $dayEnd->getTimestamp() * 1000,
+                'slot_count' => 0,
+                'slot_ids' => [],
+                'slot_start_ts_ms' => [],
+            ];
+        }
+        $slotDays[$date]['slot_count']++;
+        $slotDays[$date]['slot_ids'][] = $slotId;
+        $slotDays[$date]['slot_start_ts_ms'][] = (int)round($startTsMs);
+    }
+    if ($axisInvalid) {
+        $invalid['reason_code'] = 'CANONICAL_SLOT_AXIS_INVALID';
+        return $invalid;
+    }
+    if (empty($slotDays)) {
+        $invalid['status'] = 'UNAVAILABLE';
+        $invalid['reason_code'] = 'DISPLAY_DAY_WITHOUT_SLOTS';
+        return $invalid;
+    }
+
+    $selectedDate = null;
+    $meta = is_array($plan['target_curve_meta'] ?? null)
+        ? $plan['target_curve_meta']
+        : [];
+    $metaStart = liveStorageFiniteNumber($meta['curve_day_start_ts'] ?? null);
+    if ($metaStart !== null && $metaStart > 0) {
+        $metaStartMs = $metaStart < 100000000000.0 ? $metaStart * 1000.0 : $metaStart;
+        $metaDate = (new DateTimeImmutable('now', $timezone))
+            ->setTimestamp((int)floor($metaStartMs / 1000))
+            ->format('Y-m-d');
+        if (isset($slotDays[$metaDate])) $selectedDate = $metaDate;
+    }
+    if ($selectedDate === null) {
+        ksort($slotDays, SORT_STRING);
+        foreach ($slotDays as $date => $day) {
+            if ($selectedDate === null
+                || (int)$day['slot_count'] > (int)$slotDays[$selectedDate]['slot_count']) {
+                $selectedDate = $date;
+            }
+        }
+    }
+
+    $selected = $slotDays[$selectedDate];
+    $nowNumber = liveStorageFiniteNumber($nowTsMs);
+    if ($nowNumber === null) $nowNumber = microtime(true) * 1000.0;
+    $today = (new DateTimeImmutable('now', $timezone))
+        ->setTimestamp((int)floor($nowNumber / 1000))
+        ->format('Y-m-d');
+    $tomorrow = (new DateTimeImmutable($today . ' 00:00:00', $timezone))
+        ->modify('+1 day')
+        ->format('Y-m-d');
+    $selected['day_offset'] = (int)(new DateTimeImmutable($today . ' 00:00:00', $timezone))
+        ->diff(new DateTimeImmutable($selectedDate . ' 00:00:00', $timezone))
+        ->format('%r%a');
+    $selected['status'] = 'READY';
+    $selected['reason_code'] = 'OK';
+    $selected['plan_id'] = $plan['plan_id'];
+    $selected['display_day_label'] = $selectedDate === $today
+        ? 'Heute'
+        : ($selectedDate === $tomorrow ? 'Morgen' : $selectedDate);
+    return $selected;
+}
+
+function liveStorageStateCurveBinding($plan, $state, $displayDay) {
+    $pending = [
+        'status' => 'PENDING',
+        'reason_code' => 'PENDING_PLAN_SYNC',
+        'legacy_bound' => false,
+    ];
+    if (!is_array($plan)
+        || !liveStorageSha256Identity($plan['plan_id'] ?? null)
+        || !is_array($state)
+        || !is_array($displayDay)
+        || ($displayDay['status'] ?? '') !== 'READY') {
+        return $pending;
+    }
+    $planId = $plan['plan_id'];
+    $curve = is_array($state['ladekurve'] ?? null) ? $state['ladekurve'] : [];
+    $statePlanId = $state['storage_plan_id'] ?? null;
+    $curvePlanId = $curve['plan_id'] ?? null;
+    foreach ([$statePlanId, $curvePlanId] as $candidate) {
+        if (liveStorageSha256Identity($candidate) && $candidate !== $planId) {
+            return [
+                'status' => 'MISMATCH',
+                'reason_code' => 'PLAN_STATE_MISMATCH',
+                'legacy_bound' => false,
+            ];
+        }
+    }
+    $topLevelBound = $statePlanId === $planId;
+    $curveBound = $curvePlanId === $planId;
+    if ($topLevelBound && empty($curve)) {
+        return [
+            'status' => 'PLAN_BOUND_NO_CURVE',
+            'reason_code' => 'PROJECTION_SOC_MISSING',
+            'legacy_bound' => false,
+        ];
+    }
+    if (!$curveBound || (!$topLevelBound && $statePlanId !== null && $statePlanId !== '')) {
+        return $pending;
+    }
+    $curveDayStart = liveStorageFiniteNumber($curve['day_start_ts'] ?? null);
+    $expectedDayStart = liveStorageFiniteNumber($displayDay['display_day_start_ts_ms'] ?? null);
+    if ($curveDayStart === null || $expectedDayStart === null
+        || abs($curveDayStart - $expectedDayStart) > 1.0) {
+        return $pending;
+    }
+    $expectedSlotIds = array_values(array_filter(
+        $displayDay['slot_ids'] ?? [],
+        'liveStorageSha256Identity'
+    ));
+    $curveSlotIds = is_array($curve['slot_ids'] ?? null)
+        ? array_values($curve['slot_ids'])
+        : [];
+    if (count($expectedSlotIds) < 2
+        || $curveSlotIds !== $expectedSlotIds
+        || (int)($curve['slot_count'] ?? -1) !== count($expectedSlotIds)) {
+        return $pending;
+    }
+    return [
+        'status' => 'BOUND',
+        'reason_code' => 'OK',
+        'legacy_bound' => !$topLevelBound,
+    ];
+}
+
+function liveStorageSimCurveContract($plan, $displayDay, $stateBinding) {
+    $planId = is_array($plan) ? ($plan['plan_id'] ?? null) : null;
+    $status = [
+        'schema_version' => 'storage_sim_curve_status_v1',
+        'status' => 'INVALID',
+        'reason_code' => 'CANONICAL_PLAN_INVALID',
+        'plan_id' => $planId,
+        'display_day' => is_array($displayDay) ? ($displayDay['display_day'] ?? null) : null,
+        'display_day_start_ts_ms' => is_array($displayDay) ? ($displayDay['display_day_start_ts_ms'] ?? null) : null,
+        'slot_count' => is_array($displayDay) ? (int)($displayDay['slot_count'] ?? 0) : 0,
+        'valid_soc_count' => 0,
+        'slot_ids' => is_array($displayDay) ? array_values($displayDay['slot_ids'] ?? []) : [],
+        'slot_start_ts_ms' => is_array($displayDay) ? array_values($displayDay['slot_start_ts_ms'] ?? []) : [],
+        'source' => null,
+        'points_by_slot' => [],
+    ];
+    if (!is_array($plan)
+        || ($plan['schema_version'] ?? '') !== 'storage_dispatch_plan_v1'
+        || !liveStorageSha256Identity($planId)
+        || !is_array($plan['slots'] ?? null)) {
+        return $status;
+    }
+    if (!is_array($displayDay) || ($displayDay['status'] ?? '') !== 'READY') {
+        $status['status'] = 'UNAVAILABLE';
+        $status['reason_code'] = $displayDay['reason_code'] ?? 'DISPLAY_DAY_WITHOUT_SLOTS';
+        return $status;
+    }
+    $dayStartMs = (float)$displayDay['display_day_start_ts_ms'];
+    $dayEndMs = (float)$displayDay['display_day_end_ts_ms'];
+    $canonicalSlots = [];
+    $canonicalStarts = [];
+    $canonicalPoints = [];
+    foreach ($plan['slots'] as $slot) {
+        if (!is_array($slot)) continue;
+        $startTsMs = liveStorageFiniteNumber($slot['start_ts_ms'] ?? null);
+        if ($startTsMs === null || $startTsMs < $dayStartMs || $startTsMs >= $dayEndMs) continue;
+        $endTsMs = liveStorageFiniteNumber($slot['end_ts_ms'] ?? null);
+        $slotId = $slot['slot_id'] ?? null;
+        if (!liveStorageSha256Identity($slotId)
+            || $endTsMs === null
+            || $endTsMs <= $startTsMs
+            || isset($canonicalSlots[$slotId])
+            || isset($canonicalStarts[(string)$startTsMs])) {
+            continue;
+        }
+        $canonicalStarts[(string)$startTsMs] = $slotId;
+        $canonicalSlots[$slotId] = [
+            'start_ts_ms' => $startTsMs,
+            'end_ts_ms' => $endTsMs,
+        ];
+        $projection = is_array($slot['projection'] ?? null) ? $slot['projection'] : [];
+        $soc = liveStorageFiniteNumber($projection['soc_pct'] ?? null);
+        if ($soc === null || $soc < 0.0 || $soc > 100.0) continue;
+        $canonicalPoints[$slotId] = [
+            'soc' => $soc,
+            'source' => 'canonical_projection',
+        ];
+    }
+    if (count($canonicalPoints) >= 2) {
+        $status['status'] = 'READY';
+        $status['reason_code'] = count($canonicalPoints) === (int)$status['slot_count']
+            ? 'OK'
+            : 'PROJECTION_SOC_PARTIAL';
+        $status['valid_soc_count'] = count($canonicalPoints);
+        $status['source'] = 'projection.soc_pct';
+        $status['points_by_slot'] = $canonicalPoints;
+        return $status;
+    }
+
+    // Kompatibilitätsweg nur für eine explizit identische Planrevision und
+    // eine vollständige 1:1-Zuordnung auf die kanonische Slotachse. Eine
+    // Zielkurve ist ausdrücklich keine Ist-/SoC-Prognose.
+    $legacyPoints = [];
+    $legacyRejected = false;
+    $legacyTimeline = is_array($plan['timeline'] ?? null) ? $plan['timeline'] : [];
+    foreach ($legacyTimeline as $point) {
+        if (!is_array($point)) continue;
+        $tsMs = liveStorageFiniteNumber($point['ts'] ?? null);
+        if ($tsMs === null || $tsMs < $dayStartMs || $tsMs >= $dayEndMs) continue;
+        $slotId = $point['slot_id'] ?? null;
+        $soc = liveStorageFiniteNumber($point['soc'] ?? null);
+        if (($point['plan_id'] ?? null) !== $planId
+            || !liveStorageSha256Identity($slotId)
+            || !isset($canonicalSlots[$slotId])
+            || abs($canonicalSlots[$slotId]['start_ts_ms'] - $tsMs) > 1.0
+            || $soc === null
+            || $soc < 0.0
+            || $soc > 100.0
+            || isset($legacyPoints[$slotId])) {
+            $legacyRejected = true;
+            continue;
+        }
+        $legacyPoints[$slotId] = [
+            'soc' => $soc,
+            'source' => 'legacy_plan_bound',
+        ];
+    }
+    if (!$legacyRejected
+        && count($legacyPoints) >= 2
+        && count($legacyPoints) === count($canonicalSlots)) {
+        $status['status'] = 'READY';
+        $status['reason_code'] = 'LEGACY_PLAN_BOUND';
+        $status['valid_soc_count'] = count($legacyPoints);
+        $status['source'] = 'legacy.timeline.soc';
+        $status['points_by_slot'] = $legacyPoints;
+        return $status;
+    }
+
+    $bindingReason = is_array($stateBinding) ? ($stateBinding['reason_code'] ?? '') : '';
+    if (in_array($bindingReason, ['PLAN_STATE_MISMATCH', 'PENDING_PLAN_SYNC'], true)) {
+        $status['status'] = 'PENDING';
+        $status['reason_code'] = $bindingReason;
+    } elseif ((int)$status['slot_count'] <= 0) {
+        $status['status'] = 'UNAVAILABLE';
+        $status['reason_code'] = 'DISPLAY_DAY_WITHOUT_SLOTS';
+    } elseif (count($canonicalPoints) === 0) {
+        $status['status'] = 'UNAVAILABLE';
+        $status['reason_code'] = 'PROJECTION_SOC_MISSING';
+    } else {
+        $status['status'] = 'PENDING';
+        $status['reason_code'] = 'PROJECTION_SOC_TOO_SHORT';
+    }
+    $status['valid_soc_count'] = count($canonicalPoints);
+    return $status;
 }
 
 function liveReadStoragePlanActionProjectionArtifact($path, $maxBytes = 524288) {
@@ -4676,8 +5124,10 @@ if (is_array($liveData) && isset($liveData['PV_Power'])) {
                     1,
                     (float)($openwbData['daily_imported_wh'] ?? 0),
                     $owbPower,
-                    (bool)($openwbData['charge_state'] ?? false),
-                    $data['wb_session_kwh']
+                    liveBoolValue($openwbData['charge_state'] ?? false),
+                    $data['wb_session_kwh'],
+                    $data['wb_plug'],
+                    $openwbData['session_start_ts'] ?? null
                 );
                 $data['wb_daily_kwh']       = round((float)$wbDaily['kwh'], 2);
                 $data['wb_daily_raw_kwh']   = $wbDaily['raw_kwh'];
@@ -4764,65 +5214,44 @@ if (is_array($liveData) && isset($liveData['PV_Power'])) {
             }
         }
 
-        // --- Native Wallbox Fallback (E3DC Native etc.): Status aus wb_live_session.json (geschrieben vom wallbox_manager per RSCP) ---
+        // --- Native Wallbox Fallback: eigener RSCP-Lesevertrag des Wallbox-Managers ---
         $wbNativeEnable = in_array(strtolower(trim($confData['config']['wb_native_enable'] ?? '0')), ['1', 'true']);
-        $wbLiveSessionFile = e3dcFirstFreshRegularFile([
-            '/var/www/html/ramdisk/wb_live_session.json',
-            '/var/www/html/logs/wb_live_session.json',
-        ], 15.0);
-        if ($wbConfigured && $wbNativeType !== 'openwb' && $wbNativeType !== 'openwb_pro' && $wbNativeEnable && is_string($wbLiveSessionFile)) {
-            $wbLiveSession = @json_decode(file_get_contents($wbLiveSessionFile), true);
+        $wbLiveSession = liveJsonReadNativeRscpSession(15.0);
+        if ($wbConfigured && $wbNativeType !== 'openwb' && $wbNativeType !== 'openwb_pro' && $wbNativeEnable && is_array($wbLiveSession)) {
             if (is_array($wbLiveSession)) {
-                $carConnected = (bool)($wbLiveSession['car_connected'] ?? false);
+                $carConnectedRaw = $wbLiveSession['car_connected'] ?? null;
+                $carConnected = $carConnectedRaw === true;
+                if (is_bool($carConnectedRaw)) {
+                    $data['wb_plug'] = $carConnectedRaw;
+                    $data['wb_locked'] = $carConnectedRaw;
+                }
                 if (isset($wbLiveSession['power_w'])) {
                     $nativePwr = abs((float)$wbLiveSession['power_w']);
                     $nativePowerSource = strtolower((string)($wbLiveSession['power_source'] ?? ''));
-                    $nativeLastPowerTs = (int)($wbLiveSession['last_power_ts'] ?? 0);
+                    $nativeLastPowerTs = (int)($wbLiveSession['power_measurement_ts'] ?? $wbLiveSession['last_power_ts'] ?? 0);
                     $nativePowerAge = $nativeLastPowerTs > 0 ? (time() - $nativeLastPowerTs) : 9999;
-                    $nativePowerAccepted = (
-                        $nativePwr > 50
-                        && (
-                            ($nativePowerSource === 'rscp_real' && $nativePowerAge <= 20)
-                            || ($nativePowerSource === 'glitch_hold' && $nativePowerAge <= 8)
-                        )
+                    $nativePowerFreshReal = (
+                        $nativePowerSource === 'rscp_real'
+                        && $nativePowerAge <= 20
                     );
                     $data['wb_live_session_power_source'] = $nativePowerSource;
+                    $data['wb_live_session_power_valid'] = $nativePowerFreshReal;
 
-                    // Leistungs-Hold: Kurze 0W-Aussetzer (RSCP-Glitch) nicht ans UI weitergeben
-                    // Letzten gueltigen Wert aus der Session-State-Datei lesen
-                    $wbPwrCacheFile = '/var/www/html/ramdisk/wb_native_pwr_cache.json';
-                    $pwrCache = [];
-                    if (file_exists($wbPwrCacheFile)) {
-                        $pwrCache = @json_decode(file_get_contents($wbPwrCacheFile), true) ?: [];
-                    }
-                    if ($nativePowerAccepted) {
-                        // Gueltiger Wert: Im Cache speichern
-                        $pwrCache = ['power_w' => $nativePwr, 'ts' => time()];
-                        @file_put_contents($wbPwrCacheFile, json_encode($pwrCache));
-                    } elseif (
-                        $carConnected
-                        && $nativePowerSource === 'glitch_hold'
-                        && $nativePowerAge <= 8
-                        && !empty($pwrCache['power_w'])
-                        && (time() - ($pwrCache['ts'] ?? 0)) < 12
-                    ) {
-// 0W-Aussetzer während aktivem Ladebit: Letzten Wert kurz einfrieren.
-                        $nativePwr = (float)$pwrCache['power_w'];
-                    } else {
-                        @file_put_contents($wbPwrCacheFile, json_encode(['power_w' => 0, 'ts' => time()]));
+                    // Nur eine frische reale RSCP-Messung darf eine positive
+                    // kanonische Leistung liefern. Bestätigtes idle bleibt
+                    // dagegen sofort 0 W; Diagnose-Letzwerte werden nie
+                    // zurückprojiziert.
+                    if (!$nativePowerFreshReal) {
                         $nativePwr = 0.0;
                     }
 
-                    if ($nativePwr > 0 || $carConnected) {
-                        $data['wb'] = $nativePwr;
-                    }
+                    $data['wb'] = $nativePwr;
                 }
                 // RSCP Session-kWh direkt ans Frontend weitergeben (verhindert Integrations-Fehler)
                 if (($wbLiveSession['source'] ?? '') === 'rscp' && $carConnected) {
                     $rscp_session_kwh = (float)($wbLiveSession['session_kwh'] ?? 0);
                     if ($rscp_session_kwh >= 0) {
                         $data['python_wb1_session_kwh'] = round($rscp_session_kwh, 3);
-                        $data['wb_plug'] = true;  // Auto ist per RSCP bestätigt angesteckt
                     }
                 }
             }
@@ -5510,6 +5939,46 @@ if ($wpSourceIsFresh) {
 }
 
 if (is_array($heatManagerSource)) {
+    if ($wpTypeCfg === 0 && isset($heatManagerSource['luxtronik_operating_stage']) && is_array($heatManagerSource['luxtronik_operating_stage'])) {
+        $luxStage = $heatManagerSource['luxtronik_operating_stage'];
+        $stageFields = [
+            'status', 'stage', 'label', 'reason_code', 'domain',
+            'ww_requested', 'hydraulics_active', 'compressor_running',
+            'frequency_hz', 'frequency_target_hz', 'target_load_confirmed',
+            'full_load_confirmed',
+            'evidence',
+        ];
+        foreach ($stageFields as $stageField) {
+            if (array_key_exists($stageField, $luxStage)) {
+                $data['wp_operating_stage_' . $stageField] = $luxStage[$stageField];
+            }
+        }
+
+        // Nur ein frischer, vom Producer typisierter Vertrag darf die alte
+        // leistungsabhängige Standby-Anzeige überstimmen. Eine WW-Anforderung
+        // oder BUP/ZUP-Hydraulik ist sichtbar, bleibt aber ausdrücklich noch
+        // kein Verdichterlauf.
+        if (($luxStage['status'] ?? '') === 'OK') {
+            $stageName = (string)($luxStage['stage'] ?? '');
+            if (in_array($stageName, [
+                'ww_requested',
+                'ww_hydraulics_active',
+                'ww_compressor_started',
+                'ww_40hz_stage',
+                'ww_target_load',
+            ], true)) {
+                $data['wp_mode'] = 1;
+                $data['wp_mode_text'] = (string)($luxStage['label'] ?? 'Warmwasser');
+            } elseif ($stageName === 'compressor_other_domain' && ($luxStage['domain'] ?? '') === 'other') {
+                $data['wp_mode'] = 0;
+                $data['wp_mode_text'] = (string)($luxStage['label'] ?? 'Heizen');
+            } elseif ($stageName === 'standby') {
+                $data['wp_mode'] = 5;
+                $data['wp_mode_text'] = 'Standby';
+            }
+        }
+    }
+
     // Die alle zwei Sekunden neu geschriebene Managerdatei beweist allein
     // keinen aktuellen Aktorzustand. Sichtbar wird nur ein explizit
     // zeitgestempelter, bestätigter Relais-/Register-Readback.
@@ -5772,10 +6241,90 @@ if ($wbNativeEnable && ($wbConfigured || $wb2Configured) && file_exists($wbNativ
             );
             $data['wb_budget_display_contract'] = $nativeBudgetDisplayContract;
         }
+        unset($data['wb_deficit_counter']);
+        if (array_key_exists('wb_deficit_counter', $nativeWb)) {
+            $rawCounter = is_array($nativeWb['wb_deficit_counter'])
+                ? $nativeWb['wb_deficit_counter']
+                : [];
+            $component = (string)($rawCounter['component'] ?? 'none');
+            $numericKeys = [
+                'used_wh', 'threshold_wh', 'remaining_wh', 'deficit_w',
+                'sample_ts',
+            ];
+            $numbers = [];
+            $numbersValid = true;
+            foreach ($numericKeys as $counterKey) {
+                $rawValue = $rawCounter[$counterKey] ?? null;
+                if (!is_numeric($rawValue) || !is_finite((float)$rawValue)) {
+                    $numbersValid = false;
+                    break;
+                }
+                $numbers[$counterKey] = (float)$rawValue;
+            }
+            $counterAgeSeconds = $numbersValid
+                ? time() - $numbers['sample_ts']
+                : PHP_FLOAT_MAX;
+            $counterValid = (
+                ($rawCounter['schema_version'] ?? '') === 'wallbox_deficit_counter_display_v1'
+                && ($rawCounter['valid'] ?? false) === true
+                && in_array($component, ['none', 'grid', 'authorized_budget'], true)
+                && $numbersValid
+                && $numbers['used_wh'] >= 0.0
+                && $numbers['threshold_wh'] >= 5.0
+                && $numbers['remaining_wh'] >= 0.0
+                && abs(
+                    $numbers['remaining_wh']
+                    - max(0.0, $numbers['threshold_wh'] - $numbers['used_wh'])
+                ) <= 0.15
+                && $numbers['deficit_w'] >= 0.0
+                && $numbers['sample_ts'] > 0.0
+                && $counterAgeSeconds >= -5.0
+                && $counterAgeSeconds <= 30.0
+            );
+            $counterAccumulating = $counterValid
+                && (($rawCounter['accumulating'] ?? false) === true);
+            $counterActive = (
+                $counterAccumulating
+                && (($rawCounter['active'] ?? false) === true)
+                && in_array($component, ['grid', 'authorized_budget'], true)
+                && $numbers['deficit_w'] > 0.0
+                && $numbers['remaining_wh'] > 0.0
+                && (int)($rawCounter['owner_wb_id'] ?? 0) > 0
+                && (string)($rawCounter['action'] ?? '') === 'hold'
+                && !in_array(
+                    (string)($rawCounter['stage'] ?? ''),
+                    ['phase_down_pending', 'stop_pending'],
+                    true
+                )
+            );
+            $data['wb_deficit_counter'] = $counterValid
+                ? [
+                    'schema_version' => 'wallbox_deficit_counter_display_v1',
+                    'valid' => true,
+                    'active' => $counterActive,
+                    'component' => $component,
+                    'used_wh' => round($numbers['used_wh'], 2),
+                    'threshold_wh' => round($numbers['threshold_wh'], 2),
+                    'remaining_wh' => round($numbers['remaining_wh'], 2),
+                    'deficit_w' => round($numbers['deficit_w'], 1),
+                    'accumulating' => $counterAccumulating,
+                    'owner_wb_id' => max(0, (int)($rawCounter['owner_wb_id'] ?? 0)),
+                    'stage' => preg_replace('/[^a-z0-9_\-]/i', '', (string)($rawCounter['stage'] ?? '')),
+                    'action' => preg_replace('/[^a-z0-9_\-]/i', '', (string)($rawCounter['action'] ?? 'hold')),
+                    'sample_ts' => $numbers['sample_ts'],
+                ]
+                : [
+                    'schema_version' => 'wallbox_deficit_counter_display_v1',
+                    'valid' => false,
+                    'active' => false,
+                    'component' => 'none',
+                ];
+        }
         foreach ([
             'battery_request', 'wbminsoc_gate_open', 'price_opt_active', 'price_boost_active',
             'dynamic_min_soc', 'bat_floor_soc', 'e3dc_wb_discharge_bat_until_soc',
             'wbminsoc_configured_soc', 'wbminsoc_effective_soc', 'wbminsoc_floor_source',
+            'wbminsoc_native_soc', 'wbminsoc_emergency_soc',
             'wbminsoc_floor_note', 'manual_pause'
         ] as $wbKey) {
             if (array_key_exists($wbKey, $nativeWb)) {
@@ -5979,8 +6528,10 @@ if (($wb2NativeType === 'openwb' || $wb2NativeType === 'openwb_pro')
             2,
             (float)($openwbData2['daily_imported_wh'] ?? 0),
             $owb2Power,
-            (bool)($openwbData2['charge_state'] ?? false),
-            $data['wb2_session_kwh']
+            liveBoolValue($openwbData2['charge_state'] ?? false),
+            $data['wb2_session_kwh'],
+            $data['wb2_plug'],
+            $openwbData2['session_start_ts'] ?? null
         );
         $data['wb2_daily_kwh'] = round((float)$wb2Daily['kwh'], 2);
         $data['wb2_daily_raw_kwh'] = $wb2Daily['raw_kwh'];
@@ -6128,138 +6679,11 @@ if ($wb2Configured && !empty($shellyWb2Ip) && $shellyWb2Ip !== '0.0.0.0') {
 
 $wb1UsesExternalStatus = !empty($data['is_external_wb']);
 
-// WB2-Anzeige-Hysterese: openWB/openWB Pro liefert gelegentlich kurze 0W- oder
-// stale-Luecken. Ohne Hold springt der bereinigte Hausverbrauch um die WB-Leistung.
-if ($wb2Configured) {
-$wb2DisplayCacheFile = '/var/www/html/ramdisk/wb2_display_power_cache.json';
-$wb2DisplayCache = file_exists($wb2DisplayCacheFile)
-    ? (@json_decode(file_get_contents($wb2DisplayCacheFile), true) ?: [])
-    : [];
-$wb2DisplayNow = abs((float)($data['wb2'] ?? 0));
-$wb2PhaseDisplaySum = abs((float)($data['wb2_p1'] ?? 0)) + abs((float)($data['wb2_p2'] ?? 0)) + abs((float)($data['wb2_p3'] ?? 0));
-$wb2FreshZeroStopped = !empty($data['wb2_status_fresh'])
-    && empty($data['wb2_charging'])
-    && (($data['wb2_evse_a'] ?? 0) < 5.5)
-    && $wb2DisplayNow <= 50
-    && $wb2PhaseDisplaySum <= 50;
-$wb2LooksActive = !$wb2FreshZeroStopped && (
-    !empty($data['wb2_locked'])
-    || !empty($data['wb2_plug'])
-    || !empty($data['wb2_charging'])
-    || (($data['wb2_evse_a'] ?? 0) >= 5.5)
-    || ($wb2PhaseDisplaySum > 50)
-    || (!empty($wb2DisplayCache['active']) && (time() - ($wb2DisplayCache['ts'] ?? 0)) < 45)
-);
-if ($wb2DisplayNow <= 50 && $wb2PhaseDisplaySum > 50) {
-    $data['wb2'] = $wb2PhaseDisplaySum;
-    $data['wb2_display_held'] = true;
-    $data['is_external_wb2'] = true;
-    $wb2DisplayNow = $wb2PhaseDisplaySum;
-}
-if ($wb2DisplayNow > 50) {
-    $wb2DisplayCache = [
-        'power_w' => $wb2DisplayNow,
-        'ts' => time(),
-        'active' => $wb2LooksActive,
-        'locked' => !empty($data['wb2_locked']),
-        'plug' => !empty($data['wb2_plug']),
-        'external' => !empty($data['is_external_wb2']),
-    ];
-    @file_put_contents($wb2DisplayCacheFile, json_encode($wb2DisplayCache), LOCK_EX);
-    @chmod($wb2DisplayCacheFile, 0664);
-} elseif ($wb2FreshZeroStopped) {
-    if (!empty($wb2DisplayCache['power_w'])) {
-        @unlink($wb2DisplayCacheFile);
-    }
-} elseif ($wb2LooksActive
-    && !empty($wb2DisplayCache['power_w'])
-    && (time() - ($wb2DisplayCache['ts'] ?? 0)) < 45) {
-    $data['wb2'] = (float)$wb2DisplayCache['power_w'];
-    $data['wb2_display_held'] = true;
-    if (!empty($wb2DisplayCache['external'])) {
-        $data['is_external_wb2'] = true;
-    }
-    if (!empty($wb2DisplayCache['locked']) || !empty($wb2DisplayCache['plug'])) {
-        $data['wb2_locked'] = true;
-        $data['wb2_plug'] = true;
-    }
-}
-}
-
-// Anzeige-Hysterese für alle WB-Quellen: Beim Ampere-Setzen liefern E3DC/openWB
-// kurz 0W oder gar keinen Messwert. Wichtig: Dieser Hold muss NACH allen WB-Quellen
-// sitzen, sonst kann wallbox_native.json den gehaltenen Wert wieder mit 0W ueberschreiben.
-if ($wbConfigured) {
-$wbDisplayCacheFile = '/var/www/html/ramdisk/wb_display_power_cache.json';
-$wbDisplayCache = file_exists($wbDisplayCacheFile)
-    ? (@json_decode(file_get_contents($wbDisplayCacheFile), true) ?: [])
-    : [];
-$wbDisplayNow = abs((float)($data['wb'] ?? 0));
+// Wallbox-Leistung bleibt ausschließlich die kanonische Quellenmessung.
+// Verriegelung, Stecker, Sollstrom, ältere Messwerte und einzelne Phasenwerte
+// dürfen weder Ladeleistung noch Sitzungsenergie fortschreiben. Die
+// Phasenwerte werden danach nur zur Zustandsdiagnose verwendet.
 $wbPhaseDisplaySum = abs((float)($data['wb_p1'] ?? 0)) + abs((float)($data['wb_p2'] ?? 0)) + abs((float)($data['wb_p3'] ?? 0));
-$wbFreshZeroStopped = !empty($data['wb_status_fresh'])
-    && empty($data['wb_charging'])
-    && (($data['wb_evse_a'] ?? 0) < 5.5)
-    && $wbDisplayNow <= 50
-    && $wbPhaseDisplaySum <= 50;
-$wbLooksActive = !$wbFreshZeroStopped && (!empty($data['wb_locked'])
-    || !empty($data['wb_plug'])
-    || !empty($data['wb_charging'])
-    || (($data['wb_evse_a'] ?? 0) >= 5.5)
-    || ($wbPhaseDisplaySum > 50)
-    || ($wbDisplayNow > 50)
-    || (!empty($data['is_external_wb']) && !empty($wbDisplayCache['active']) && (time() - ($wbDisplayCache['ts'] ?? 0)) < 45));
-$wbAmpLimit = max((float)($data['set_amp'] ?? 0), (float)($data['cap_amp'] ?? 0));
-$wbPhaseLimit = max(1, (int)($data['wb_phases'] ?? ($data['detected_phases'] ?? 1)));
-$wbExpectedW = $wbAmpLimit * 230.0 * $wbPhaseLimit;
-if ($wbDisplayNow <= 50 && $wbPhaseDisplaySum > 50) {
-    $data['wb'] = $wbPhaseDisplaySum;
-    $data['wb_display_held'] = true;
-    $wbDisplayNow = $wbPhaseDisplaySum;
-}
-$wbImplausibleMax = $wbDisplayNow > 1000
-    && (($wbExpectedW > 0 && $wbDisplayNow > $wbExpectedW * 1.45) || ($wbExpectedW <= 0 && $wbDisplayNow > 18000));
-if ($wbImplausibleMax
-    && !empty($wbDisplayCache['power_w'])
-    && (time() - ($wbDisplayCache['ts'] ?? 0)) < 45) {
-    $data['wb'] = (float)$wbDisplayCache['power_w'];
-    $data['wb_display_held'] = true;
-    if (!empty($wbDisplayCache['locked']) || !empty($wbDisplayCache['plug'])) {
-        $data['wb_locked'] = true;
-        $data['wb_plug'] = true;
-    }
-    $wbDisplayNow = abs((float)$data['wb']);
-}
-if ($wbDisplayNow > 50) {
-    $wbDisplayCache = [
-        'power_w' => $wbDisplayNow,
-        'ts' => time(),
-        'active' => $wbLooksActive,
-        'locked' => !empty($data['wb_locked']),
-        'plug' => !empty($data['wb_plug']),
-        'external' => !empty($data['is_external_wb']),
-        'source' => $data['wb_source'] ?? '',
-    ];
-    @file_put_contents($wbDisplayCacheFile, json_encode($wbDisplayCache), LOCK_EX);
-    @chmod($wbDisplayCacheFile, 0664);
-} elseif ($wbFreshZeroStopped) {
-    if (!empty($wbDisplayCache['power_w'])) {
-        @unlink($wbDisplayCacheFile);
-    }
-} elseif ($wbLooksActive
-    && !empty($wbDisplayCache['power_w'])
-    && (time() - ($wbDisplayCache['ts'] ?? 0)) < 45) {
-    $data['wb'] = (float)$wbDisplayCache['power_w'];
-    $data['wb_display_held'] = true;
-    if (!empty($wbDisplayCache['locked']) || !empty($wbDisplayCache['plug'])) {
-        $data['wb_locked'] = true;
-        $data['wb_plug'] = true;
-    }
-    if (!empty($wbDisplayCache['external'])) {
-        $data['is_external_wb'] = true;
-        if (empty($data['wb_source'])) $data['wb_source'] = $wbDisplayCache['source'] ?? 'external_mqtt';
-    }
-}
-}
 
 e3dcApplyWallboxPresenceProjection($data, $wbConfigured, $wb2Configured, $wb2ExplicitlyDisabled);
 
@@ -6431,7 +6855,8 @@ if (file_exists($haFile)) {
 }
 
 // --- NEU: Sekundengenaues Wallbox Session Tracking (Echtzeit-Integrator) ---
-$wbStateFile = '/var/www/html/ramdisk/wb_live_session.json';
+$wbStateFile = '/var/www/html/ramdisk/wb_session_tracker.json';
+$wbLegacyPhpStateFile = '/var/www/html/ramdisk/wb_live_session.json';
 $wb2StateFile = '/var/www/html/ramdisk/wb2_live_session.json';
 $wbCsvFile = '/var/www/html/data/wb_sessions.csv';
 $wbSessionKwh = 0;
@@ -6476,7 +6901,18 @@ if ($validData && !$isStandby) {
                 $hadDailyKwh = array_key_exists('daily_kwh', $parsedState);
                 $wbState = array_merge($wbState, $parsedState);
             }
+        } else {
+            // Einmalige, sichere Migration nur aus dem alten PHP-Integrator-
+            // Schema. source=rscp wird vom Helper ausdrücklich abgewiesen.
+            $legacyPhpState = liveJsonReadLegacyPhpWallboxTracker($wbLegacyPhpStateFile);
+            if (is_array($legacyPhpState)) {
+                $hadDailyKwh = array_key_exists('daily_kwh', $legacyPhpState);
+                $wbState = array_merge($wbState, $legacyPhpState);
+                $wbState['migrated_from'] = 'wb_live_session_php_legacy';
+            }
         }
+        $wbState['schema_version'] = 'wb_session_tracker_v1';
+        $wbState['source'] = 'php_integrator';
         if (($wbState['daily_date'] ?? '') !== $todayKey) {
             $wbState['daily_date'] = $todayKey;
             $wbState['daily_kwh'] = 0.0;
@@ -6538,8 +6974,10 @@ if ($validData && !$isStandby) {
             }
         }
         $wbSessionKwh = $wbState['kwh'];
-        @file_put_contents($wbStateFile, json_encode($wbState));
-        @chmod($wbStateFile, 0664);
+        liveJsonWriteRuntimeFileAtomic(
+            $wbStateFile,
+            json_encode($wbState, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)
+        );
         @flock($wbFp, LOCK_UN); @fclose($wbFp);
     } else {
         if ($wbFp) @fclose($wbFp);
@@ -7839,6 +8277,7 @@ $storageDisplayDayStart = null;
 $storageDisplayDayEnd = null;
 $storageDisplayDayLabel = 'Heute';
 $storageAuthoritativeSnapshotLoaded = false;
+$storState = null;
 $storStateFile = $isShadowMode
     ? '/var/www/html/ramdisk/shadow_master_storage_manager_state.json'
     : '/var/www/html/ramdisk/storage_manager_state.json';
@@ -7850,17 +8289,6 @@ if (
     $storState = @json_decode(file_get_contents($storStateFile), true);
     if ($storState) {
         $storageAuthoritativeSnapshotLoaded = !empty($storState['state']);
-        // Ladekurve-Meilensteine (von Python SOC-Trajektorie berechnet)
-        if (!empty($storState['ladekurve'])) {
-            $data['ladekurve'] = $storState['ladekurve'];
-            if (!empty($storState['ladekurve']['day_start_ts'])) {
-                $storageDisplayDayStart = (int)($storState['ladekurve']['day_start_ts'] / 1000);
-                $storageDisplayDayEnd = $storageDisplayDayStart + 86400;
-            }
-            if (!empty($storState['ladekurve']['day_label'])) {
-                $storageDisplayDayLabel = $storState['ladekurve']['day_label'];
-            }
-        }
         // Betriebsphase des Speicher-Managers ("Freilauf", "Sanftes Laden", ...)
         if (!empty($storState['phase'])) {
             $data['storage_phase'] = $storState['phase'];
@@ -8218,7 +8646,23 @@ if (
 // PHP projiziert den kanonischen Slotvertrag und simuliert keine zweite
 // Batterie-, SoC-, Direktvermarktungs- oder Marktentscheidung.
 $storagePlanFile = '/var/www/html/ramdisk/storage_plan.json';
-if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900)) {
+$storagePlanExists = file_exists($storagePlanFile);
+$storagePlanFresh = $storagePlanExists
+    && (time() - filemtime($storagePlanFile) < 900);
+$data['storage_sim_curve_status'] = [
+    'schema_version' => 'storage_sim_curve_status_v1',
+    'status' => 'UNAVAILABLE',
+    'reason_code' => $storagePlanExists ? 'STORAGE_PLAN_STALE' : 'STORAGE_PLAN_MISSING',
+    'plan_id' => null,
+    'display_day' => null,
+    'display_day_start_ts_ms' => null,
+    'slot_count' => 0,
+    'valid_soc_count' => 0,
+    'slot_ids' => [],
+    'slot_start_ts_ms' => [],
+    'source' => null,
+];
+if ($storagePlanFresh) {
     $storPlanRawJson = @file_get_contents($storagePlanFile);
     $storPlan = is_string($storPlanRawJson) ? @json_decode($storPlanRawJson, true) : null;
     if ($storPlan) {
@@ -8244,22 +8688,42 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
         $targetCurveMeta = (isset($storPlan['target_curve_meta']) && is_array($storPlan['target_curve_meta']))
             ? $storPlan['target_curve_meta']
             : [];
-        // Nach PV-Ende plant der Simulator bereits den naechsten Tag. Die
-        // Dashboard-Kurve muss diesem Plan-Tag folgen, sonst filtert sie
-        // faelschlich "Heute" und die Ladekurve verschwindet im Frontend.
-        if (!empty($targetCurveMeta['curve_day_start_ts'])) {
-            $storageDisplayDayStart = (int)((float)$targetCurveMeta['curve_day_start_ts'] / 1000);
-            $storageDisplayDayEnd = $storageDisplayDayStart + 86400;
-            if (!empty($targetCurveMeta['curve_day_label'])) {
-                $storageDisplayDayLabel = (string)$targetCurveMeta['curve_day_label'];
-            }
-        } elseif (!empty($storPlan['target_timeline'][0]['ts'])) {
-            $firstCurveTs = (int)((float)$storPlan['target_timeline'][0]['ts'] / 1000);
-            $storageDisplayDayStart = strtotime(date('Y-m-d', $firstCurveTs) . ' 00:00:00');
-            $storageDisplayDayEnd = $storageDisplayDayStart + 86400;
+        $canonicalPlan = (($storPlan['schema_version'] ?? '') === 'storage_dispatch_plan_v1')
+            && liveStorageSha256Identity($storPlan['plan_id'] ?? null)
+            && isset($storPlan['slots'])
+            && is_array($storPlan['slots']);
+        $storageTimezoneName = (string)($storPlan['timezone']
+            ?? ($confData['config']['timezone'] ?? 'Europe/Berlin'));
+        $storageDisplayDay = liveStorageCanonicalDisplayDay(
+            $storPlan,
+            $storageTimezoneName
+        );
+        if (($storageDisplayDay['status'] ?? '') === 'READY') {
+            $storageDisplayDayStart = (int)round(
+                ((float)$storageDisplayDay['display_day_start_ts_ms']) / 1000
+            );
+            $storageDisplayDayEnd = (int)round(
+                ((float)$storageDisplayDay['display_day_end_ts_ms']) / 1000
+            );
+            $storageDisplayDayLabel = (string)$storageDisplayDay['display_day_label'];
         }
         $today0 = $storageDisplayDayStart ?: mktime(0, 0, 0);
         $today1 = $storageDisplayDayEnd ?: ($today0 + 86400);
+        $storageStateBinding = liveStorageStateCurveBinding(
+            $storPlan,
+            $storState,
+            $storageDisplayDay
+        );
+        if (($storageStateBinding['status'] ?? '') === 'BOUND'
+            && is_array($storState['ladekurve'] ?? null)) {
+            $boundLadekurve = $storState['ladekurve'];
+            $boundLadekurve['plan_id'] = $storPlan['plan_id'];
+            $boundLadekurve['day_label'] = $storageDisplayDayLabel;
+            $boundLadekurve['day_start_ts'] = $storageDisplayDay['display_day_start_ts_ms'];
+            $boundLadekurve['date'] = $storageDisplayDay['display_day'];
+            $boundLadekurve['day_offset'] = (int)($storageDisplayDay['day_offset'] ?? 0);
+            $data['ladekurve'] = $boundLadekurve;
+        }
         $targetCurve = [];
         $socMinCurve = [];
         $socCeilingCurve = [];
@@ -8268,10 +8732,6 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
         $directMarketingForCurve = (isset($storPlan['direct_marketing']) && is_array($storPlan['direct_marketing']))
             ? $storPlan['direct_marketing']
             : null;
-        $canonicalPlan = (($storPlan['schema_version'] ?? '') === 'storage_dispatch_plan_v1')
-            && preg_match('/^sha256:[0-9a-f]{64}$/', (string)($storPlan['plan_id'] ?? '')) === 1
-            && isset($storPlan['slots'])
-            && is_array($storPlan['slots']);
         $runtime = $data['storage_dispatch_runtime'];
         $effectiveStoragePlan = is_array($runtime['effective_storage_plan'] ?? null)
             ? $runtime['effective_storage_plan']
@@ -8474,28 +8934,37 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
             'candidate' => $canonicalPlan ? ($storPlan['heat_intent_candidate'] ?? null) : null,
             'slots' => $heatPriceBoostSlots,
         ];
-        $dispatchSlots = $canonicalPlan ? $storPlan['slots'] : ($storPlan['timeline'] ?? []);
+        $simCurveContract = liveStorageSimCurveContract(
+            $storPlan,
+            $storageDisplayDay,
+            $storageStateBinding
+        );
+        $simCurvePointsBySlot = is_array($simCurveContract['points_by_slot'] ?? null)
+            ? $simCurveContract['points_by_slot']
+            : [];
+        unset($simCurveContract['points_by_slot']);
+        if ($effectiveProjectionHidden) {
+            $simCurveContract['status'] = 'HIDDEN';
+            $simCurveContract['reason_code'] = 'PROJECTION_HIDDEN_BY_EFFECTIVE_PLAN';
+        }
+        $data['storage_sim_curve_status'] = $simCurveContract;
+        $dispatchSlots = $canonicalPlan ? $storPlan['slots'] : [];
         foreach ($dispatchSlots as $slot) {
             if (!is_array($slot)) continue;
-            $tsMs = $canonicalPlan
-                ? (int)($slot['start_ts_ms'] ?? 0)
-                : (int)($slot['ts'] ?? 0);
+            $tsMs = (int)($slot['start_ts_ms'] ?? 0);
             $ts = (int)floor($tsMs / 1000);
             if ($ts < $today0 || $ts >= $today1) continue;
-            $projection = $canonicalPlan && is_array($slot['projection'] ?? null)
+            $projection = is_array($slot['projection'] ?? null)
                 ? $slot['projection']
-                : [
-                    'soc_pct' => $slot['soc'] ?? null,
-                    'target_soc_pct' => null,
-                    'pv_w' => $slot['pv_w'] ?? 0,
-                    'direct_marketing_export_w' => 0,
-                    'direct_marketing_planned_w' => 0,
-                    'direct_marketing_charge_w' => 0,
-                    'direct_marketing_soc_pct' => null,
-                    'direct_marketing_action' => null,
-                ];
-            $soc = isset($projection['soc_pct']) && is_numeric($projection['soc_pct'])
-                ? (float)$projection['soc_pct']
+                : [];
+            $slotId = $slot['slot_id'] ?? null;
+            $boundSimPoint = is_string($slotId)
+                && isset($simCurvePointsBySlot[$slotId])
+                && is_array($simCurvePointsBySlot[$slotId])
+                ? $simCurvePointsBySlot[$slotId]
+                : null;
+            $soc = $boundSimPoint !== null
+                ? liveStorageFiniteNumber($boundSimPoint['soc'] ?? null)
                 : null;
             if ($effectiveProjectionHidden) {
                 $soc = null;
@@ -8503,10 +8972,10 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
             $targetSoc = isset($projection['target_soc_pct']) && is_numeric($projection['target_soc_pct'])
                 ? (float)$projection['target_soc_pct']
                 : null;
-            $reserveFloor = $canonicalPlan && isset($slot['soc_pct']['reserve_floor']) && is_numeric($slot['soc_pct']['reserve_floor'])
+            $reserveFloor = isset($slot['soc_pct']['reserve_floor']) && is_numeric($slot['soc_pct']['reserve_floor'])
                 ? (float)$slot['soc_pct']['reserve_floor']
                 : null;
-            $ceiling = $canonicalPlan && isset($slot['soc_pct']['ceiling']) && is_numeric($slot['soc_pct']['ceiling'])
+            $ceiling = isset($slot['soc_pct']['ceiling']) && is_numeric($slot['soc_pct']['ceiling'])
                 ? (float)$slot['soc_pct']['ceiling']
                 : null;
             if (!$effectiveProjectionHidden && $targetSoc !== null) {
@@ -8523,19 +8992,20 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
                 && $projectionPlanAction === 'PV_STORE';
             $projectionEconomicExportSelected = $projectionPlanSelected
                 && $projectionPlanAction === 'ECONOMIC_EXPORT';
+            if ($boundSimPoint === null) continue;
             $simCurve[] = [
                 'ts' => $tsMs,
-                'plan_id' => $canonicalPlan ? ($storPlan['plan_id'] ?? null) : null,
-                'slot_id' => $canonicalPlan ? ($slot['slot_id'] ?? null) : null,
+                'end_ts' => (int)($slot['end_ts_ms'] ?? 0),
+                'plan_id' => $storPlan['plan_id'],
+                'slot_id' => $slotId,
                 'soc' => $soc !== null ? round($soc, 1) : null,
+                'projection_source' => $boundSimPoint['source'] ?? null,
                 'pv_w' => (int)round((float)($projection['pv_w'] ?? 0)),
-                'direct_marketing_slot_projection_w' => $canonicalPlan
-                    && isset($projection['battery_w'])
+                'direct_marketing_slot_projection_w' => isset($projection['battery_w'])
                     && is_numeric($projection['battery_w'])
                     ? (int)round((float)$projection['battery_w'])
                     : null,
-                'direct_marketing_slot_projection_wh' => $canonicalPlan
-                    && isset($slot['planned_wh']['charge'])
+                'direct_marketing_slot_projection_wh' => isset($slot['planned_wh']['charge'])
                     && is_numeric($slot['planned_wh']['charge'])
                     ? round((float)$slot['planned_wh']['charge'], 3)
                     : null,
@@ -8568,26 +9038,6 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
                     : null,
             ];
         }
-        if (!$canonicalPlan) {
-            foreach (($storPlan['target_timeline'] ?? []) as $slot) {
-                $ts = (int)(($slot['ts'] ?? 0) / 1000);
-                if ($ts >= $today0 && $ts < $today1) {
-                    $targetCurve[] = ['ts' => $ts * 1000, 'soc' => round((float)$slot['soc'], 1)];
-                }
-            }
-            foreach (($storPlan['soc_min_curve'] ?? []) as $slot) {
-                $ts = (int)(($slot['ts'] ?? 0) / 1000);
-                if ($ts >= $today0 && $ts < $today1) {
-                    $socMinCurve[] = ['ts' => $ts * 1000, 'soc' => round((float)$slot['soc'], 1)];
-                }
-            }
-            foreach (($storPlan['soc_ceiling_curve'] ?? []) as $slot) {
-                $ts = (int)(($slot['ts'] ?? 0) / 1000);
-                if ($ts >= $today0 && $ts < $today1) {
-                    $socCeilingCurve[] = ['ts' => $ts * 1000, 'soc' => round((float)$slot['soc'], 1)];
-                }
-            }
-        }
         $simMaxSoc = null;
         foreach ($simCurve as $slot) {
             $simMaxSoc = max($simMaxSoc ?? 0, (float)($slot['soc'] ?? 0));
@@ -8608,7 +9058,7 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
             // Bei aktiver DV bleibt die physikalische Standard-Ladekurve als Referenz
             // für das Ladekurven-Modal und die Dashboard-Kachel erhalten.
         }
-        if (empty($data['ladekurve']) && (!empty($targetCurve) || !empty($simCurve))) {
+        if (empty($data['ladekurve']) && !$effectiveProjectionHidden && count($simCurve) >= 2) {
             $tzName = $confData['config']['timezone'] ?? 'Europe/Berlin';
             try {
                 $storageTz = new DateTimeZone((string)$tzName);
@@ -8621,13 +9071,13 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
                 $dt->setTimezone($storageTz);
                 return $dt->format('H:i');
             };
-            $socNear = function ($tsMs, $fallback) use ($targetCurve) {
-                if (empty($targetCurve)) {
+            $socNear = function ($tsMs, $fallback) use ($simCurve) {
+                if (empty($simCurve)) {
                     return $fallback;
                 }
                 $best = null;
                 $bestDelta = PHP_INT_MAX;
-                foreach ($targetCurve as $point) {
+                foreach ($simCurve as $point) {
                     $delta = abs((float)($point['ts'] ?? 0) - (float)$tsMs);
                     if ($delta < $bestDelta) {
                         $bestDelta = $delta;
@@ -8637,8 +9087,8 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
                 return $best !== null ? (float)($best['soc'] ?? $fallback) : $fallback;
             };
 
-            $firstPoint = !empty($targetCurve) ? $targetCurve[0] : $simCurve[0];
-            $lastPoint = !empty($targetCurve) ? $targetCurve[count($targetCurve) - 1] : $simCurve[count($simCurve) - 1];
+            $firstPoint = $simCurve[0];
+            $lastPoint = $simCurve[count($simCurve) - 1];
             $firstTs = (float)($firstPoint['ts'] ?? 0);
             $firstSoc = (float)($firstPoint['soc'] ?? 0);
             $lastTs = (float)($lastPoint['ts'] ?? $firstTs);
@@ -8668,7 +9118,7 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
                 $nearest = $firstPoint;
                 $nearestDelta = PHP_INT_MAX;
                 $nowMs = time() * 1000;
-                foreach ($targetCurve ?: [$firstPoint] as $point) {
+                foreach ($simCurve as $point) {
                     $delta = abs((float)($point['ts'] ?? 0) - $nowMs);
                     if ($delta < $nearestDelta) {
                         $nearestDelta = $delta;
@@ -8680,7 +9130,7 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
                     't' => $fmtCurveTime($peakTs),
                     'soc' => round((float)($nearest['soc'] ?? $firstSoc), 1),
                     'past' => $peakTs < $nowMs,
-                    'source' => 'target_timeline',
+                    'source' => 'storage_plan_projection',
                 ];
             }
 
@@ -8688,13 +9138,20 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
             if (!($freilaufTs >= ($today0 * 1000) && $freilaufTs < ($today1 * 1000))) {
                 $freilaufTs = $lastTs;
             }
-            $freilaufSoc = (float)($storPlan['ladeende_soc'] ?? ($storPlan['effective_target_soc'] ?? ($storPlan['target_soc'] ?? $lastSoc)));
-            $todayLocal0 = strtotime(date('Y-m-d') . ' 00:00:00') ?: $today0;
+            // Der Freilauf ist eine Projektion. Ein Sollwert darf bei
+            // fehlendem ladeende_soc nicht als prognostizierter SoC
+            // erscheinen; dann gilt ausschließlich der letzte belegte
+            // Projektionspunkt.
+            $freilaufSoc = liveStorageProjectedEndSoc($storPlan, $lastSoc);
             $data['ladekurve'] = [
+                'schema_version' => 'storage_ladekurve_meta_v1',
+                'plan_id' => $storPlan['plan_id'],
+                'slot_ids' => array_values($storageDisplayDay['slot_ids'] ?? []),
+                'slot_count' => count($storageDisplayDay['slot_ids'] ?? []),
                 'day_label' => $storageDisplayDayLabel,
-                'day_offset' => (int)round(($today0 - $todayLocal0) / 86400),
+                'day_offset' => (int)($storageDisplayDay['day_offset'] ?? 0),
                 'day_start_ts' => $today0 * 1000,
-                'date' => date('Y-m-d', $today0),
+                'date' => $storageDisplayDay['display_day'] ?? null,
                 'has_target_curve' => !empty($targetCurve),
                 'ladestart' => [
                     't' => $fmtCurveTime($firstTs),
@@ -8965,9 +9422,12 @@ if (file_exists($storagePlanFile) && (time() - filemtime($storagePlanFile) < 900
             'q_ratio'         => $effectiveProjectionHidden ? null : ($storPlan['q_ratio'] ?? null),
             'bat_cap_kwh'     => $storPlan['bat_cap_kwh']     ?? null,
             'target_curve_meta'=> $effectiveProjectionHidden ? [] : $targetCurveMeta,
+            'storage_sim_curve_status'=> $data['storage_sim_curve_status'],
+            'ladekurve_plan_binding'=> $storageStateBinding,
+            'display_day'      => $storageDisplayDay['display_day'] ?? null,
             'display_day_label'=> $storageDisplayDayLabel,
-            'display_day_start'=> $today0 * 1000,
-            'display_day_end'  => $today1 * 1000,
+            'display_day_start'=> $storageDisplayDay['display_day_start_ts_ms'] ?? ($today0 * 1000),
+            'display_day_end'  => $storageDisplayDay['display_day_end_ts_ms'] ?? ($today1 * 1000),
             'has_target_curve' => !empty($targetCurve),
             'cheap_grid_charge'=> $cheapGridCharge,
             'market_plan'      => $marketPlan,

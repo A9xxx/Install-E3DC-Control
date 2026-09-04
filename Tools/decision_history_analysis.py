@@ -75,6 +75,8 @@ EMS_DECISIONS = {
     "vehicle_finished",
 }
 OWNER_MIN_GAP_S = 600
+LIVE_PLAUSIBILITY_REPEAT_COUNT = 3
+LIVE_PLAUSIBILITY_PERSISTENT_S = 60
 STORAGE_OWNER_CHATTER_ACTIONS = ("WALLBOX",)
 STORAGE_STATE_CHATTER_ACTIONS = (
     "PARALLEL_WB_AUTO",
@@ -97,14 +99,13 @@ STORAGE_DECISION_PATH_CHATTER_ACTIONS = (
     "MANUAL",
 )
 STORAGE_DECISION_PATH_PROTECTION_MARKERS = (
+    "live_plausibility",
     "emergency",
     "not_aus",
     "not-aus",
     "manual",
     "user",
     "hard",
-    "protection",
-    "schutz",
     "house_fuse",
     "budget_timeout",
     "stale",
@@ -429,6 +430,19 @@ def _append_transition(
     events.append(event)
 
 
+def _ordered_history_records(records: Iterable[Dict[str, Any]]) -> List[Tuple[Dict[str, Any], float]]:
+    """Sortiert überlappende History-Dateien, bevor Übergänge entdoppelt werden."""
+
+    ordered: List[Tuple[float, int, Dict[str, Any]]] = []
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            continue
+        ts = _parse_ts_s(record.get("ts", record.get("time")), 1_800_000_000.0 + index * 10.0)
+        ordered.append((float(ts), index, record))
+    ordered.sort(key=lambda item: (item[0], item[1]))
+    return [(record, ts) for ts, _index, record in ordered]
+
+
 def _wallbox_driver_command(wb: Dict[str, Any]) -> Dict[str, Any]:
     command = wb.get("driver_command")
     if isinstance(command, dict):
@@ -565,31 +579,49 @@ def _storage_mode_name(decision: Dict[str, Any]) -> str:
 
 def storage_records_to_events(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     events: List[Dict[str, Any]] = []
-    last: Dict[str, str] = {}
-    for index, record in enumerate(records):
+    seen: set[Tuple[float, str]] = set()
+    previous_output_key = ""
+    for record, ts in _ordered_history_records(records):
         decision = _decision(record)
-        ts = _parse_ts_s(record.get("ts", record.get("time")), 1_800_000_000.0 + index * 10.0)
+        output = _storage_execution_output_info(record, decision)
+        output_key = str(output.get("output_key") or "")
+        if not output_key:
+            continue
+        exact_key = (float(ts), output_key)
+        if exact_key in seen or (output_key and output_key == previous_output_key):
+            continue
+        seen.add(exact_key)
+        previous_output_key = output_key
         reason = _reason_text(
             decision.get("reason"),
             decision.get("state"),
             decision.get("priority"),
             decision.get("protected") and "protection",
         )
-        _append_transition(
-            events,
-            last,
-            actor="storage",
-            ts=ts,
-            action=_storage_mode_name(decision),
-            reason=reason,
-            source="storage_decision_history",
-        )
+        events.append({
+            "actor": "storage",
+            "ts": float(ts),
+            "action": str(output.get("execution_class") or "UNKNOWN"),
+            "reason": reason,
+            "source": "storage_rscp_execution_history",
+            "target_reachable": True,
+            **output,
+        })
     return events
 
 
 def _record_r5(record: Dict[str, Any]) -> Dict[str, Any]:
     value = record.get("r5")
     return value if isinstance(value, dict) else {}
+
+
+def _storage_target_history(record: Dict[str, Any]) -> Dict[str, Any]:
+    value = record.get("storage_target")
+    if not isinstance(value, dict):
+        return {}
+    if value.get("schema_version") != "storage_target_history_v1":
+        return {}
+    return value
 
 
 def _storage_auto_limit(record: Dict[str, Any], decision: Dict[str, Any]) -> Dict[str, Any]:
@@ -649,6 +681,11 @@ def _storage_contract_owner(record: Dict[str, Any], decision: Dict[str, Any]) ->
 
 
 def _storage_execution_class(record: Dict[str, Any], decision: Dict[str, Any]) -> str:
+    target_execution = str(
+        _storage_target_history(record).get("execution_class") or ""
+    ).strip().upper()
+    if target_execution:
+        return target_execution
     r5_execution = str(_record_r5(record).get("execution_class") or "").strip().upper()
     if r5_execution:
         return r5_execution
@@ -674,6 +711,11 @@ def _storage_state_reason(record: Dict[str, Any], decision: Dict[str, Any]) -> s
 
 
 def _storage_value_signature(record: Dict[str, Any], decision: Dict[str, Any]) -> str:
+    target_signature = str(
+        _storage_target_history(record).get("value_signature") or ""
+    ).strip()
+    if target_signature:
+        return target_signature
     r5_signature = str(_record_r5(record).get("value_signature") or "").strip()
     if r5_signature:
         return r5_signature
@@ -686,8 +728,259 @@ def _storage_value_signature(record: Dict[str, Any], decision: Dict[str, Any]) -
         discharge_start_w = _safe_int(auto_limit.get("discharge_start_w"), 0)
         return f"auto_limit:{enabled}:{release}:{max_charge_w}:{max_discharge_w}:{discharge_start_w}"
     mode_name = _storage_mode_name(decision)
-    value_w = _safe_int(decision.get("val", decision.get("value", record.get("val", 0))), 0)
+    value_w = _safe_int(
+        decision.get("val", decision.get("val_w", decision.get("value", record.get("val", 0)))),
+        0,
+    )
     return f"mode:{mode_name}:{value_w}"
+
+
+def _storage_execution_output_info(record: Dict[str, Any], decision: Dict[str, Any]) -> Dict[str, Any]:
+    del decision  # Der fachliche Sollwert ist ausdrücklich keine Ausgangsevidenz.
+    contract = (
+        record.get("rscp_execution")
+        if isinstance(record.get("rscp_execution"), dict)
+        else {}
+    )
+    schema_valid = bool(
+        contract.get("schema_version") == "storage_rscp_execution_history_v1"
+        and _safe_int(contract.get("contract_version"), 0) == 1
+    )
+    execution_class = str(contract.get("execution_class") or "").strip().upper()
+    output_signature = str(contract.get("value_signature") or "").strip()
+    output_key = str(contract.get("output_key") or "").strip()
+    readback = contract.get("readback") if isinstance(contract.get("readback"), dict) else {}
+    typed_readback = bool(
+        isinstance(readback.get("limits_used"), bool)
+        and all(
+            isinstance(readback.get(key), int)
+            and not isinstance(readback.get(key), bool)
+            and readback.get(key) >= 0
+            for key in ("max_charge_w", "max_discharge_w", "discharge_start_w")
+        )
+    )
+    derived_execution_class = (
+        "AUTO_LIMITED" if readback.get("limits_used") else "AUTO_FREE"
+    ) if typed_readback else ""
+    derived_output_signature = (
+        "power_settings:%d:%d:%d:%d"
+        % (
+            1 if readback["limits_used"] else 0,
+            readback["max_charge_w"],
+            readback["max_discharge_w"],
+            readback["discharge_start_w"],
+        )
+        if typed_readback
+        else ""
+    )
+    readback_contract_consistent = bool(
+        typed_readback
+        and execution_class == derived_execution_class
+        and output_signature == derived_output_signature
+    )
+    expected_key = (
+        f"{execution_class}|{output_signature}"
+        if execution_class and output_signature
+        else ""
+    )
+    proof = str(contract.get("evidence") or "").strip()
+    proof_valid = proof in ("confirmed_new_output", "retained_readback")
+    direct_confirmed_status = contract.get("readback_status") in {
+        "confirmed",
+        "confirmed_bounded_zero",
+        "confirmed_nonoptimal",
+        "confirmed_from_get_ack_unknown",
+    }
+    transaction_delta = contract.get("transaction_set_request_delta")
+    transaction_delta_valid = bool(
+        isinstance(transaction_delta, int)
+        and not isinstance(transaction_delta, bool)
+        and transaction_delta >= 0
+    )
+    retained_transaction_proof = bool(
+        contract.get("retained_transaction_coherent") is True
+        and contract.get("retained_transaction") is True
+        and contract.get("requested_present") is True
+        and contract.get("requested_matches_readback") is True
+        and contract.get("transaction_send_called") is True
+        and contract.get("transaction_confirmed") is True
+        and contract.get("transaction_retained") is True
+        and contract.get("output_complete") is True
+        and contract.get("wire_write_confirmed") is True
+        and contract.get("wire_write_retained") is True
+        and contract.get("readback_status") == "confirmed_unchanged"
+        and contract.get("readback_source") == "canonical_live"
+    )
+    retained_canonical_proof = bool(
+        contract.get("retained_canonical_readback_coherent") is True
+        and contract.get("retained_canonical_readback") is True
+        and contract.get("readback_status") == "confirmed_from_live_readback"
+        and contract.get("readback_source") == "canonical_live"
+        and contract.get("canonical_requested_coherent") is True
+        and (
+            contract.get("requested_present") is False
+            or contract.get("requested_matches_readback") is True
+        )
+    )
+    proof_fields_valid = bool(
+        (
+            proof == "confirmed_new_output"
+            and contract.get("confirmed_new_output") is True
+            and direct_confirmed_status
+            and contract.get("wire_write_attempted") is True
+            and contract.get("wire_write_issued") is True
+            and contract.get("wire_write_confirmed") is True
+            and contract.get("wire_write_retained") is False
+            and contract.get("output_complete") is True
+            and contract.get("requested_matches_readback") is True
+            and contract.get("transaction_coherent_new") is True
+            and contract.get("transaction_send_called") is True
+            and transaction_delta_valid
+            and transaction_delta > 0
+            and contract.get("transaction_wire_write_attempted") is True
+            and contract.get("transaction_attempted") is True
+            and contract.get("transaction_issued") is True
+            and contract.get("transaction_confirmed") is True
+            and contract.get("transaction_retained") is False
+            and contract.get("transaction_partial") is False
+        )
+        or (
+            proof == "retained_readback"
+            and contract.get("retained_output") is True
+            and contract.get("wire_write_attempted") is False
+            and (retained_transaction_proof or retained_canonical_proof)
+            and contract.get("transaction_wire_write_attempted") is False
+            and transaction_delta_valid
+            and transaction_delta == 0
+            and contract.get("transaction_attempted") is False
+            and contract.get("transaction_issued") is False
+            and contract.get("transaction_partial") is False
+        )
+    )
+    evidence_valid = bool(
+        schema_valid
+        and contract.get("evidence_valid") is True
+        and proof_valid
+        and proof_fields_valid
+        and readback_contract_consistent
+        and contract.get("unconfirmed_other_write") is False
+        and contract.get("incoherent_other_step") is False
+        and expected_key
+        and output_key == expected_key
+        and contract.get("readback_confirmed") is True
+        and contract.get("readback_fresh") is True
+    )
+    if evidence_valid:
+        evidence = "typed"
+    elif contract:
+        evidence = "invalid"
+        output_key = ""
+    else:
+        # Alte History-Records enthalten nur den Sollvertrag in ``r5``. Sie
+        # bleiben auswertbar, dürfen aber keinen Hardwareausgang vortäuschen.
+        evidence = "missing"
+        output_key = ""
+    return {
+        "execution_class": execution_class if evidence_valid else "",
+        "output_signature": output_signature if evidence_valid else "",
+        "output_key": output_key,
+        "output_evidence": evidence,
+        "output_proof": proof or None,
+    }
+
+
+def _storage_window_has_output_change(events: Sequence[Dict[str, Any]]) -> bool:
+    if len(events) != 3:
+        return False
+    output_keys = [str(event.get("output_key") or "") for event in events]
+    return bool(
+        all(output_keys)
+        and output_keys[0] == output_keys[2]
+        and output_keys[0] != output_keys[1]
+    )
+
+
+def detect_storage_transition_chatter(
+    events: Iterable[Dict[str, Any]],
+    *,
+    min_gap_s: int,
+    required_actions_any: Sequence[str],
+) -> Dict[str, Any]:
+    """Hält Owner-/State-Wechsel informativ, solange der Ausgang unverändert blieb."""
+
+    timeline = [event for event in events if isinstance(event, dict)]
+    chatter = control_safety.detect_state_chatter(
+        timeline,
+        min_gap_s=min_gap_s,
+        required_actions_any=required_actions_any,
+        reason_keys=("protection_reason", "reason"),
+        protection_reason_markers=STORAGE_DECISION_PATH_PROTECTION_MARKERS,
+    )
+    raw = chatter.get("violations") if isinstance(chatter.get("violations"), list) else []
+    violations = [
+        violation
+        for violation in raw
+        if _storage_window_has_output_change(
+            violation.get("events") if isinstance(violation.get("events"), list) else []
+        )
+    ]
+    counts: Dict[str, int] = {"records": len(timeline)}
+    for violation in violations:
+        name = str(violation.get("type") or "storage_transition_pingpong")
+        counts[name] = counts.get(name, 0) + 1
+    decision_only_count = len(raw) - len(violations)
+    if decision_only_count:
+        counts["decision_only_aba"] = decision_only_count
+    return {"ok": not violations, "violations": violations, "counts": counts}
+
+
+def detect_storage_execution_chatter(
+    events: Iterable[Dict[str, Any]],
+    *,
+    min_gap_s: int,
+) -> Dict[str, Any]:
+    """Bewertet nur belegtes A-B-A der tatsächlichen Execution-/Ausgangssignatur."""
+
+    timeline = sorted(
+        [event for event in events if isinstance(event, dict)],
+        key=_event_ts_for_history_analysis,
+    )
+    recent: List[Dict[str, Any]] = []
+    counts: Dict[str, int] = {"records": len(timeline)}
+    violations: List[Dict[str, Any]] = []
+    evidence_limit = 0
+    for event in timeline:
+        if str(event.get("output_evidence") or "") == "missing":
+            evidence_limit += 1
+        recent.append(event)
+        del recent[:-3]
+        if len(recent) != 3:
+            continue
+        first_key = str(recent[0].get("output_key") or "")
+        middle_key = str(recent[1].get("output_key") or "")
+        last_key = str(recent[2].get("output_key") or "")
+        if (
+            not all((first_key, middle_key, last_key))
+            or not (first_key == last_key and first_key != middle_key)
+        ):
+            continue
+        age_s = _event_ts_for_history_analysis(recent[-1]) - _event_ts_for_history_analysis(recent[0])
+        if age_s >= min_gap_s:
+            continue
+        actions = [str(item.get("action") or "UNKNOWN").upper() for item in recent]
+        executions = [str(item.get("execution_class") or "UNKNOWN").upper() for item in recent]
+        pattern = executions if len(set(actions)) == 1 else actions
+        name = "_".join(pattern).lower()
+        counts[name] = counts.get(name, 0) + 1
+        violations.append({
+            "type": name,
+            "actor": "storage",
+            "age_s": int(round(age_s)),
+            "events": list(recent),
+        })
+    if evidence_limit:
+        counts["execution_evidence_limit"] = evidence_limit
+    return {"ok": not violations, "violations": violations, "counts": counts}
 
 
 def _storage_budget_record(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -931,20 +1224,23 @@ def storage_records_to_contract_events(records: Iterable[Dict[str, Any]]) -> Dic
     state_reason_events: List[Dict[str, Any]] = []
     value_events: List[Dict[str, Any]] = []
     last_contract: Dict[str, str] = {}
-    last_execution: Dict[str, str] = {}
     last_state_reason: Dict[str, str] = {}
+    seen_execution_classes: set[Tuple[float, str]] = set()
     previous_signature = ""
     previous_contract = ""
     previous_execution = ""
+    previous_output_key = ""
     previous_state_reason = ""
 
-    for index, record in enumerate(records):
+    for record, ts in _ordered_history_records(records):
         decision = _decision(record)
-        ts = _parse_ts_s(record.get("ts", record.get("time")), 1_800_000_000.0 + index * 10.0)
         contract = _storage_contract_owner(record, decision)
         execution = _storage_execution_class(record, decision)
         state_reason = _storage_state_reason(record, decision)
         signature = _storage_value_signature(record, decision)
+        output = _storage_execution_output_info(record, decision)
+        protection_class = _storage_protection_path_class(record)
+        protection_reason = "live_plausibility" if protection_class == "live_plausibility" else ""
         reason = _reason_text(
             decision.get("reason"),
             decision.get("state_label"),
@@ -961,16 +1257,29 @@ def storage_records_to_contract_events(records: Iterable[Dict[str, Any]]) -> Dic
             action=contract,
             reason=reason,
             source="storage_contract_history",
+            protection_path_class=protection_class,
+            protection_reason=protection_reason,
+            **output,
         )
-        _append_transition(
-            execution_events,
-            last_execution,
-            actor="storage_execution_class",
-            ts=ts,
-            action=execution,
-            reason=reason,
-            source="storage_contract_history",
-        )
+        output_key = str(output.get("output_key") or "")
+        exact_execution_key = (float(ts), output_key)
+        if (
+            output_key
+            and exact_execution_key not in seen_execution_classes
+            and output_key != previous_output_key
+        ):
+            seen_execution_classes.add(exact_execution_key)
+            execution_events.append({
+                "actor": "storage_execution_class",
+                "ts": float(ts),
+                "action": str(output.get("execution_class") or "UNKNOWN"),
+                "reason": reason,
+                "source": "storage_rscp_execution_history",
+                "target_reachable": True,
+                "protection_path_class": protection_class,
+                "protection_reason": protection_reason,
+                **output,
+            })
         _append_transition(
             state_reason_events,
             last_state_reason,
@@ -979,6 +1288,9 @@ def storage_records_to_contract_events(records: Iterable[Dict[str, Any]]) -> Dic
             action=state_reason,
             reason=reason,
             source="storage_contract_history",
+            protection_path_class=protection_class,
+            protection_reason=protection_reason,
+            **output,
         )
 
         if (
@@ -1004,6 +1316,8 @@ def storage_records_to_contract_events(records: Iterable[Dict[str, Any]]) -> Dic
         previous_signature = signature
         previous_contract = contract
         previous_execution = execution
+        if output_key:
+            previous_output_key = output_key
         previous_state_reason = state_reason
 
     return {
@@ -1017,6 +1331,18 @@ def storage_records_to_contract_events(records: Iterable[Dict[str, Any]]) -> Dic
 def _record_path(record: Dict[str, Any]) -> Dict[str, Any]:
     value = record.get("path")
     return value if isinstance(value, dict) else {}
+
+
+def _storage_protection_path_class(record: Dict[str, Any]) -> str:
+    r5 = _record_r5(record)
+    path = _record_path(record)
+    subcontracts = path.get("subcontracts") if isinstance(path.get("subcontracts"), dict) else {}
+    protection = subcontracts.get("protection") if isinstance(subcontracts.get("protection"), dict) else {}
+    value = _first_non_empty(
+        r5.get("protection_path_class"),
+        protection.get("protection_class"),
+    )
+    return str(value or "").strip().lower()
 
 
 def _storage_decision_path_info(record: Dict[str, Any], decision: Dict[str, Any]) -> Dict[str, Any]:
@@ -1051,15 +1377,16 @@ def _storage_decision_path_info(record: Dict[str, Any], decision: Dict[str, Any]
 
 
 def storage_decision_path_events(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    events: List[Dict[str, Any]] = []
-    for index, record in enumerate(records):
+    raw_events: List[Dict[str, Any]] = []
+    for record, ts in _ordered_history_records(records):
         decision = _decision(record)
         info = _storage_decision_path_info(record, decision)
         primary_path = str(info.get("primary_path") or "").strip()
         veto_reasons = info.get("veto_reasons") if isinstance(info.get("veto_reasons"), list) else []
         if not primary_path and not veto_reasons:
             continue
-        ts = _parse_ts_s(record.get("ts", record.get("time")), 1_800_000_000.0 + index * 10.0)
+        output = _storage_execution_output_info(record, decision)
+        protection_class = _storage_protection_path_class(record)
         reason = _reason_text(
             ",".join(str(reason) for reason in veto_reasons),
             decision.get("reason"),
@@ -1067,7 +1394,7 @@ def storage_decision_path_events(records: Iterable[Dict[str, Any]]) -> List[Dict
             decision.get("priority"),
             decision.get("protected") and "protection",
         )
-        events.append({
+        raw_events.append({
             "actor": "storage_decision_path",
             "ts": float(ts),
             "action": primary_path.upper() if primary_path else "UNKNOWN_PATH",
@@ -1081,7 +1408,27 @@ def storage_decision_path_events(records: Iterable[Dict[str, Any]]) -> List[Dict
             "veto_reasons": veto_reasons,
             "contract_version": info.get("contract_version"),
             "target_reachable": True,
+            "protection_path_class": protection_class,
+            "protection_reason": "live_plausibility" if protection_class == "live_plausibility" else "",
+            **output,
         })
+    events: List[Dict[str, Any]] = []
+    seen_exact: set[Tuple[Any, ...]] = set()
+    previous_fingerprint: Optional[Tuple[Any, ...]] = None
+    for event in sorted(raw_events, key=_event_ts_for_history_analysis):
+        veto_reasons = tuple(str(item) for item in event.get("veto_reasons", []) if item)
+        fingerprint = (
+            event.get("action"),
+            bool(event.get("path_conflict")),
+            bool(event.get("veto_required")),
+            veto_reasons,
+        )
+        exact = (event.get("ts"),) + fingerprint
+        if exact in seen_exact or fingerprint == previous_fingerprint:
+            continue
+        seen_exact.add(exact)
+        previous_fingerprint = fingerprint
+        events.append(event)
     return events
 
 
@@ -1098,24 +1445,45 @@ def detect_storage_decision_path_conflicts(
         timeline,
         min_gap_s=min_gap_s,
         required_actions_any=STORAGE_DECISION_PATH_CHATTER_ACTIONS,
+        reason_keys=("protection_reason", "reason"),
         protection_reason_markers=STORAGE_DECISION_PATH_PROTECTION_MARKERS,
     )
-    counts: Dict[str, int] = dict(chatter.get("counts") if isinstance(chatter.get("counts"), dict) else {})
+    chatter_violations = chatter.get("violations") if isinstance(chatter.get("violations"), list) else []
+    retained_chatter = [
+        violation
+        for violation in chatter_violations
+        if _storage_window_has_output_change(
+            violation.get("events") if isinstance(violation.get("events"), list) else []
+        )
+    ]
+    counts: Dict[str, int] = {}
+    for violation in retained_chatter:
+        name = str(violation.get("type") or "storage_path_pingpong")
+        counts[name] = counts.get(name, 0) + 1
+    decision_only_count = len(chatter_violations) - len(retained_chatter)
+    if decision_only_count:
+        counts["decision_only_aba"] = decision_only_count
     counts["records"] = len(timeline)
-    violations = list(chatter.get("violations") if isinstance(chatter.get("violations"), list) else [])
+    violations = list(retained_chatter)
     for event in timeline:
-        if not bool(event.get("veto_required")):
+        veto_required = bool(event.get("veto_required"))
+        path_conflict = bool(event.get("path_conflict"))
+        if not (veto_required or path_conflict):
             continue
-        counts["veto_required"] = counts.get("veto_required", 0) + 1
+        if veto_required:
+            counts["veto_required"] = counts.get("veto_required", 0) + 1
+        if path_conflict:
+            counts["path_conflict"] = counts.get("path_conflict", 0) + 1
         for reason in event.get("veto_reasons") if isinstance(event.get("veto_reasons"), list) else []:
             key = "veto:%s" % str(reason).strip().lower()
             counts[key] = counts.get(key, 0) + 1
         violations.append({
-            "type": "storage_path_veto_required",
+            "type": "storage_path_veto_required" if veto_required else "storage_path_conflict",
             "actor": event.get("actor", "storage_decision_path"),
             "ts": event.get("ts"),
             "path": event.get("primary_path"),
             "veto_reasons": event.get("veto_reasons") if isinstance(event.get("veto_reasons"), list) else [],
+            "events": [event],
             "event": event,
         })
     return {"ok": not violations, "violations": violations, "counts": counts}
@@ -1146,6 +1514,15 @@ def _storage_live_plausibility_reasons(record: Dict[str, Any], decision: Dict[st
     if power_invalid:
         reasons.append(str(power.get("status") or "power_decision_invalid_sample"))
 
+    path = _record_path(record)
+    subcontracts = path.get("subcontracts") if isinstance(path.get("subcontracts"), dict) else {}
+    protection = subcontracts.get("protection") if isinstance(subcontracts.get("protection"), dict) else {}
+    if _storage_protection_path_class(record) == "live_plausibility":
+        protection_reason = str(protection.get("reason") or "").lower()
+        for token in re.findall(r"[a-z][a-z0-9_]{2,80}", protection_reason):
+            if "_" in token:
+                reasons.append(token)
+
     seen: Dict[str, bool] = {}
     compact: List[str] = []
     for reason in reasons:
@@ -1156,7 +1533,78 @@ def _storage_live_plausibility_reasons(record: Dict[str, Any], decision: Dict[st
     return compact
 
 
-def _storage_live_plausibility_action(decision: Dict[str, Any]) -> str:
+def _storage_critical_live_events(decision: Dict[str, Any]) -> List[Dict[str, Any]]:
+    events = decision.get("critical_events") if isinstance(decision.get("critical_events"), list) else []
+    return [
+        event
+        for event in events
+        if isinstance(event, dict) and str(event.get("scope") or "").strip().lower() == "live_data"
+    ]
+
+
+def _storage_live_data_info(record: Dict[str, Any], decision: Dict[str, Any]) -> Dict[str, Any]:
+    inputs = _inputs(record)
+    critical_events = _storage_critical_live_events(decision)
+    sample_values: List[bool] = []
+    stale_values: List[bool] = []
+
+    if "live_sample_valid" in inputs:
+        sample_values.append(_contract_bool(inputs.get("live_sample_valid"), True))
+    if "live_stale" in inputs:
+        stale_values.append(_contract_bool(inputs.get("live_stale"), False))
+    for event in critical_events:
+        if "sample_valid" in event:
+            sample_values.append(_contract_bool(event.get("sample_valid"), True))
+        if "stale" in event:
+            stale_values.append(_contract_bool(event.get("stale"), False))
+
+    # Legacy-Diagnosepakete vor dem typisierten History-Vertrag bleiben auswertbar.
+    if "live_sample_valid" in decision:
+        sample_values.append(_contract_bool(decision.get("live_sample_valid"), True))
+    if decision.get("live_sample_invalid") is not None:
+        sample_values.append(not _contract_bool(decision.get("live_sample_invalid"), False))
+
+    diagnostics = record.get("diagnostics") if isinstance(record.get("diagnostics"), dict) else {}
+    power = diagnostics.get("power_decision_stability") if isinstance(diagnostics.get("power_decision_stability"), dict) else {}
+    if "sample_valid" in power:
+        sample_values.append(_contract_bool(power.get("sample_valid"), True))
+    if "usable_for_budget" in power:
+        sample_values.append(_contract_bool(power.get("usable_for_budget"), True))
+
+    live_sample_valid: Optional[bool] = all(sample_values) if sample_values else None
+    live_stale: Optional[bool] = any(stale_values) if stale_values else None
+    home_power_valid = (
+        _contract_bool(inputs.get("home_power_valid"), True)
+        if "home_power_valid" in inputs
+        else None
+    )
+    grid_power_valid = (
+        _contract_bool(inputs.get("grid_power_valid"), True)
+        if "grid_power_valid" in inputs
+        else None
+    )
+    invalid = bool(
+        live_sample_valid is False
+        or live_stale is True
+        or home_power_valid is False
+        or grid_power_valid is False
+    )
+    return {
+        "live_sample_valid": live_sample_valid,
+        "live_stale": live_stale,
+        "home_power_valid": home_power_valid,
+        "grid_power_valid": grid_power_valid,
+        "typed_live_evidence": bool(
+            sample_values
+            or stale_values
+            or "home_power_valid" in inputs
+            or "grid_power_valid" in inputs
+        ),
+        "invalid": invalid,
+    }
+
+
+def _storage_live_plausibility_action(decision: Dict[str, Any], protection_class: str = "") -> str:
     state = str(decision.get("state", "") or "").strip()
     if bool(decision.get("live_plausibility_preserved_discharge_owner")):
         return "DISCHARGE_OWNER_HOLD"
@@ -1168,29 +1616,50 @@ def _storage_live_plausibility_action(decision: Dict[str, Any]) -> str:
         return "AUTO_LIMIT_HOLD"
     if bool(decision.get("live_plausibility_manual_override_kept")):
         return "MANUAL_OVERRIDE_HOLD"
-    if state == "live_plausibility_auto":
+    if state == "live_plausibility_auto" or protection_class == "live_plausibility":
         return "AUTO_GUARD"
     return "INVALID_SAMPLE"
 
 
 def storage_live_plausibility_events(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    events: List[Dict[str, Any]] = []
-    for index, record in enumerate(records):
+    raw_events: List[Dict[str, Any]] = []
+    guard_run_id = 0
+    in_guard_run = False
+    for record, ts in _ordered_history_records(records):
         decision = _decision(record)
         state = str(decision.get("state", record.get("state", "")) or "").strip()
-        live_sample_invalid = bool(decision.get("live_sample_invalid")) or decision.get("live_sample_valid") is False
+        live_info = _storage_live_data_info(record, decision)
+        protection_class = _storage_protection_path_class(record)
+        live_sample_invalid = bool(live_info.get("invalid"))
         preserved = any(bool(decision.get(key)) for key in LIVE_PLAUSIBILITY_REASON_KEYS)
         reasons = _storage_live_plausibility_reasons(record, decision)
-        if not (live_sample_invalid or preserved or state == "live_plausibility_auto" or reasons):
+        if live_info.get("live_sample_valid") is False and "live_sample_invalid" not in reasons:
+            reasons.append("live_sample_invalid")
+        if live_info.get("live_stale") is True and "live_stale" not in reasons:
+            reasons.append("live_stale")
+        if live_info.get("home_power_valid") is False and "home_power_invalid" not in reasons:
+            reasons.append("home_power_invalid")
+        if live_info.get("grid_power_valid") is False and "grid_power_invalid" not in reasons:
+            reasons.append("grid_power_invalid")
+        if not (
+            live_sample_invalid
+            or preserved
+            or state == "live_plausibility_auto"
+            or protection_class == "live_plausibility"
+            or reasons
+        ):
+            if in_guard_run:
+                guard_run_id += 1
+                in_guard_run = False
             continue
-        ts = _parse_ts_s(record.get("ts", record.get("time")), 1_800_000_000.0 + index * 10.0)
-        action = _storage_live_plausibility_action(decision)
+        in_guard_run = True
+        action = _storage_live_plausibility_action(decision, protection_class)
         reason = _reason_text(
             ",".join(reasons),
             decision.get("reason"),
             state,
         )
-        events.append({
+        raw_events.append({
             "actor": "storage_live_plausibility",
             "ts": float(ts),
             "action": action,
@@ -1199,7 +1668,29 @@ def storage_live_plausibility_events(records: Iterable[Dict[str, Any]]) -> List[
             "source": "storage_decision_history",
             "target_reachable": True,
             "state": state,
+            "protection_path_class": protection_class,
+            "guard_run_id": guard_run_id,
+            "evidence_limited": not bool(live_info.get("typed_live_evidence")),
+            **{key: value for key, value in live_info.items() if key != "invalid"},
         })
+    events: List[Dict[str, Any]] = []
+    seen: set[Tuple[Any, ...]] = set()
+    for event in sorted(raw_events, key=_event_ts_for_history_analysis):
+        fingerprint = (
+            event.get("ts"),
+            event.get("action"),
+            tuple(event.get("reasons", [])),
+            event.get("live_sample_valid"),
+            event.get("live_stale"),
+            event.get("home_power_valid"),
+            event.get("grid_power_valid"),
+            event.get("protection_path_class"),
+            event.get("guard_run_id"),
+        )
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        events.append(event)
     return events
 
 
@@ -1224,7 +1715,7 @@ def detect_storage_live_plausibility_impact(events: Iterable[Dict[str, Any]]) ->
         counts[f"reason:{reason}"] = count
 
     if not timeline:
-        return {"ok": True, "violations": [], "counts": counts}
+        return {"ok": True, "violations": [], "hints": [], "counts": counts}
 
     first_ts = _event_ts_for_history_analysis(timeline[0])
     last_ts = _event_ts_for_history_analysis(timeline[-1])
@@ -1233,18 +1724,76 @@ def detect_storage_live_plausibility_impact(events: Iterable[Dict[str, Any]]) ->
         samples = timeline[:3] + timeline[-3:]
     else:
         samples = timeline
+    guard_runs: Dict[int, List[Dict[str, Any]]] = {}
+    for event in timeline:
+        run_id = _safe_int(event.get("guard_run_id"), -1)
+        guard_runs.setdefault(run_id, []).append(event)
+    persistent_run = any(
+        len(run) >= 2
+        and _event_ts_for_history_analysis(run[-1]) - _event_ts_for_history_analysis(run[0])
+        >= LIVE_PLAUSIBILITY_PERSISTENT_S
+        for run in guard_runs.values()
+    )
+    repeated_or_persistent = bool(
+        len(timeline) >= LIVE_PLAUSIBILITY_REPEAT_COUNT or persistent_run
+    )
+    counts["persistent_guard"] = 1 if repeated_or_persistent else 0
+    counts["short_guard_hint"] = 0 if repeated_or_persistent else 1
+    if any(bool(event.get("evidence_limited")) for event in timeline):
+        counts["evidence_limit"] = sum(bool(event.get("evidence_limited")) for event in timeline)
+    finding = {
+        "type": "live_plausibility_guard",
+        "actor": "storage",
+        "severity": "warning" if repeated_or_persistent else "info",
+        "age_s": int(round(max(0.0, last_ts - first_ts))),
+        "count": len(timeline),
+        "first_ts": first_ts,
+        "last_ts": last_ts,
+        "events": samples,
+    }
     return {
-        "ok": False,
-        "violations": [{
-            "type": "live_plausibility_guard",
-            "actor": "storage",
-            "age_s": int(round(max(0.0, last_ts - first_ts))),
-            "count": len(timeline),
-            "first_ts": first_ts,
-            "last_ts": last_ts,
-            "events": samples,
-        }],
+        "ok": not repeated_or_persistent,
+        "violations": [finding] if repeated_or_persistent else [],
+        "hints": [] if repeated_or_persistent else [finding],
         "counts": counts,
+    }
+
+
+def _storage_evidence_contract(records: Iterable[Dict[str, Any]]) -> Dict[str, int]:
+    """Zählt fehlende typisierte Evidenz ohne überlappende History-Records doppelt zu werten."""
+
+    seen: set[Tuple[Any, ...]] = set()
+    total = 0
+    live_typed_missing = 0
+    output_typed_missing = 0
+    for record, ts in _ordered_history_records(records):
+        decision = _decision(record)
+        inputs = _inputs(record)
+        target = _storage_target_history(record)
+        output = _storage_execution_output_info(record, decision)
+        fingerprint = (
+            float(ts),
+            inputs.get("live_sample_valid"),
+            inputs.get("live_stale"),
+            inputs.get("home_power_valid"),
+            inputs.get("grid_power_valid"),
+            target.get("execution_class"),
+            target.get("value_signature"),
+            output.get("output_key"),
+            output.get("output_evidence"),
+        )
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        total += 1
+        if not bool(_storage_live_data_info(record, decision).get("typed_live_evidence")):
+            live_typed_missing += 1
+        if output.get("output_evidence") != "typed":
+            output_typed_missing += 1
+    return {
+        "records": total,
+        "storage_live_typed_missing": live_typed_missing,
+        "storage_output_typed_missing": output_typed_missing,
     }
 
 
@@ -1316,11 +1865,13 @@ def storage_records_to_owner_state_events(records: Iterable[Dict[str, Any]]) -> 
     state_events: List[Dict[str, Any]] = []
     last_owner: Dict[str, str] = {}
     last_state: Dict[str, str] = {}
-    for index, record in enumerate(records):
+    for record, ts in _ordered_history_records(records):
         decision = _decision(record)
-        ts = _parse_ts_s(record.get("ts", record.get("time")), 1_800_000_000.0 + index * 10.0)
         state = _normalize_storage_state(record, decision)
         owner = _normalize_storage_owner(record, decision)
+        output = _storage_execution_output_info(record, decision)
+        protection_class = _storage_protection_path_class(record)
+        protection_reason = "live_plausibility" if protection_class == "live_plausibility" else ""
         reason = _reason_text(
             decision.get("reason"),
             decision.get("state_label"),
@@ -1338,6 +1889,9 @@ def storage_records_to_owner_state_events(records: Iterable[Dict[str, Any]]) -> 
                 action=owner,
                 reason=reason,
                 source="storage_owner_history",
+                protection_path_class=protection_class,
+                protection_reason=protection_reason,
+                **output,
             )
         if state:
             _append_transition(
@@ -1349,6 +1903,9 @@ def storage_records_to_owner_state_events(records: Iterable[Dict[str, Any]]) -> 
                 reason=reason,
                 source="storage_state_history",
                 raw_action=state,
+                protection_path_class=protection_class,
+                protection_reason=protection_reason,
+                **output,
             )
     return owner_events, state_events
 
@@ -1521,6 +2078,7 @@ def analyze_decision_history(
     events: Dict[str, List[Dict[str, Any]]] = {}
     checks: Dict[str, Dict[str, Any]] = {}
     effective_min_gap_s: Dict[str, int] = {}
+    evidence_limits: Dict[str, int] = {}
 
     if "wallbox" in analyzed_services:
         start_events, phase_events = wallbox_records_to_events(records.get("wallbox", []))
@@ -1539,12 +2097,16 @@ def analyze_decision_history(
             min_gap_s=min_gap_s,
         )
     if "storage" in analyzed_services:
-        storage_events = storage_records_to_events(records.get("storage", []))
-        storage_owner_events, storage_state_events = storage_records_to_owner_state_events(records.get("storage", []))
-        storage_contract_events = storage_records_to_contract_events(records.get("storage", []))
-        storage_path_events = storage_decision_path_events(records.get("storage", []))
-        storage_live_events = storage_live_plausibility_events(records.get("storage", []))
-        storage_budget_executor_events = storage_budget_executor_shadow_events(records.get("storage", []))
+        storage_records = records.get("storage", [])
+        storage_evidence = _storage_evidence_contract(storage_records)
+        evidence_limits["storage_live_typed_missing"] = storage_evidence["storage_live_typed_missing"]
+        evidence_limits["storage_output_typed_missing"] = storage_evidence["storage_output_typed_missing"]
+        storage_events = storage_records_to_events(storage_records)
+        storage_owner_events, storage_state_events = storage_records_to_owner_state_events(storage_records)
+        storage_contract_events = storage_records_to_contract_events(storage_records)
+        storage_path_events = storage_decision_path_events(storage_records)
+        storage_live_events = storage_live_plausibility_events(storage_records)
+        storage_budget_executor_events = storage_budget_executor_shadow_events(storage_records)
         events["storage"] = storage_events
         events["storage_owner"] = storage_owner_events
         events["storage_state"] = storage_state_events
@@ -1560,22 +2122,23 @@ def analyze_decision_history(
         effective_min_gap_s["storage_contract_owner"] = int(owner_gap_s)
         effective_min_gap_s["storage_live_plausibility"] = int(min_gap_s)
         effective_min_gap_s["storage_budget_executor_shadow"] = int(min_gap_s)
-        checks["storage"] = control_safety.detect_command_chatter(
+        checks["storage"] = detect_storage_execution_chatter(
             storage_events,
-            unsafe_patterns=STORAGE_PATTERNS,
             min_gap_s=min_gap_s,
         )
-        checks["storage_owner"] = control_safety.detect_state_chatter(
+        if storage_evidence["storage_output_typed_missing"]:
+            checks["storage"]["counts"]["typed_output_evidence_limit"] = storage_evidence["storage_output_typed_missing"]
+        checks["storage_owner"] = detect_storage_transition_chatter(
             storage_owner_events,
             min_gap_s=owner_gap_s,
             required_actions_any=STORAGE_OWNER_CHATTER_ACTIONS,
         )
-        checks["storage_state"] = control_safety.detect_state_chatter(
+        checks["storage_state"] = detect_storage_transition_chatter(
             storage_state_events,
             min_gap_s=owner_gap_s,
             required_actions_any=STORAGE_STATE_CHATTER_ACTIONS,
         )
-        checks["storage_contract_owner"] = control_safety.detect_state_chatter(
+        checks["storage_contract_owner"] = detect_storage_transition_chatter(
             storage_contract_events["storage_contract_owner"],
             min_gap_s=owner_gap_s,
             required_actions_any=STORAGE_CONTRACT_CHATTER_ACTIONS,
@@ -1585,6 +2148,8 @@ def analyze_decision_history(
             min_gap_s=owner_gap_s,
         )
         checks["storage_live_plausibility"] = detect_storage_live_plausibility_impact(storage_live_events)
+        if storage_evidence["storage_live_typed_missing"]:
+            checks["storage_live_plausibility"]["counts"]["typed_live_evidence_limit"] = storage_evidence["storage_live_typed_missing"]
         checks["storage_budget_executor_shadow"] = detect_storage_budget_executor_shadow(storage_budget_executor_events)
     if "heatpump" in analyzed_services:
         heatpump_events = heatpump_records_to_events(records.get("heatpump", []))
@@ -1601,9 +2166,33 @@ def analyze_decision_history(
         effective_min_gap_s["ems_decision"] = int(min_gap_s)
         checks["ems_decision"] = validate_ems_decision_records(records.get("ems", []))
 
-    status = "PASS" if all(check.get("ok", True) for check in checks.values()) else "FAIL"
+    data_quality_check = checks.get("storage_live_plausibility")
+    control_checks = {
+        name: check
+        for name, check in checks.items()
+        if name != "storage_live_plausibility"
+    }
+    if not all(check.get("ok", True) for check in control_checks.values()):
+        control_status = "FAIL"
+    elif evidence_limits.get("storage_output_typed_missing", 0) > 0:
+        control_status = "EVIDENCE_LIMIT"
+    else:
+        control_status = "PASS"
+    if not isinstance(data_quality_check, dict):
+        data_quality_status = "NOT_ANALYZED"
+    elif data_quality_check.get("ok") is not True:
+        data_quality_status = "FAIL"
+    elif evidence_limits.get("storage_live_typed_missing", 0) > 0:
+        data_quality_status = "EVIDENCE_LIMIT"
+    elif data_quality_check.get("hints"):
+        data_quality_status = "HINT"
+    else:
+        data_quality_status = "PASS"
+    status = "FAIL" if "FAIL" in {control_status, data_quality_status} or "EVIDENCE_LIMIT" in {control_status, data_quality_status} else "PASS"
     return {
         "status": status,
+        "control_status": control_status,
+        "data_quality_status": data_quality_status,
         "completeness": "PARTIAL" if missing_services else "COMPLETE",
         "services": list(selected),
         "analyzed_services": analyzed_services,
@@ -1613,6 +2202,7 @@ def analyze_decision_history(
         "checks": checks,
         "event_samples": {name: value[:12] for name, value in events.items()},
         "effective_min_gap_s": effective_min_gap_s,
+        "evidence_limits": evidence_limits,
     }
 
 
@@ -1629,7 +2219,14 @@ def _print_summary(summary: Dict[str, Any]) -> None:
 CLI_SCHEMA = "e3dc_decision_history_analysis_cli_v1"
 _PUBLIC_ACTIONS = {
     "START", "STOP", "ON", "OFF", "PAUSE", "RESUME", "IDLE", "HOLD",
-    "RELEASE", "VALUE_UPDATE", "UNKNOWN", "UNKNOWN_PATH", "1P", "2P", "3P",
+    "RELEASE", "VALUE_UPDATE", "UNKNOWN", "UNKNOWN_PATH",
+    "CURVE", "DIRECT_MARKETING", "MARKET_DIRECT", "MARKET_PRICE", "PREDUMP",
+    "PROTECTION", "WALLBOX_SUPPORT", "MANUAL", "STORAGE_ACTIVE",
+    "E3DC_AUTO", "E3DC_AUTONOM", "E3DC", "WALLBOX", "STORAGE", "MARKET",
+    "AUTO", "AUTO_FREE", "AUTO_LIMITED", "AUTO_RELEASE", "CHRG", "DISCH", "GRID",
+    "AUTO_GUARD", "INVALID_SAMPLE", "DISCHARGE_OWNER_HOLD", "CHARGE_OWNER_HOLD",
+    "WB_MINSOC_HOLD", "AUTO_LIMIT_HOLD", "MANUAL_OVERRIDE_HOLD", "EVIDENCE_LIMIT",
+    "PARALLEL_WB_AUTO", "1P", "2P", "3P",
 }
 
 
@@ -1642,7 +2239,17 @@ def _public_hash(value: Any, prefix: str) -> str:
 
 def _public_action(value: Any) -> str:
     text = str(value or "").strip().upper()
-    return text if text in _PUBLIC_ACTIONS else _public_hash(text, "state")
+    if text in _PUBLIC_ACTIONS or re.fullmatch(r"STATE-[0-9A-F]{10}", text):
+        return text
+    hashed = _public_hash(text, "state")
+    return hashed.upper() if hashed else ""
+
+
+def _public_actor(value: Any) -> str:
+    text = str(value or "").strip()
+    if text == "storage_decision_path" or re.fullmatch(r"actor-[0-9a-f]{10}", text):
+        return text
+    return _public_hash(text, "actor")
 
 
 def _public_pattern(value: Any) -> str:
@@ -1664,7 +2271,7 @@ def _public_event(event: Any) -> Dict[str, Any]:
     if not isinstance(event, dict):
         return {}
     result: Dict[str, Any] = {
-        "actor": _public_hash(event.get("actor"), "actor"),
+        "actor": _public_actor(event.get("actor")),
         "action": _public_action(event.get("action")),
     }
     ts = _public_number(event.get("ts", event.get("time")))
@@ -1680,9 +2287,12 @@ def _public_violation(violation: Any) -> Dict[str, Any]:
         return {}
     result: Dict[str, Any] = {
         "type": _public_pattern(violation.get("type") or "pattern"),
-        "actor": _public_hash(violation.get("actor"), "actor"),
+        "actor": _public_actor(violation.get("actor")),
         "events": [item for item in (_public_event(event) for event in violation.get("events", [])) if item][:6],
     }
+    severity = str(violation.get("severity") or "").strip().lower()
+    if severity in {"info", "warning"}:
+        result["severity"] = severity
     for key in ("age_s", "count", "first_ts", "last_ts"):
         value = _public_number(violation.get(key))
         if value is not None:
@@ -1701,6 +2311,15 @@ def public_cli_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
         public["error_code"] = str(summary.get("error_code") or "unsafe_or_unreadable_input")
         public["error"] = str(summary.get("error") or "Die lokale Analyse konnte nicht sicher ausgeführt werden.")
         return public
+
+    control_status = str(summary.get("control_status") or public["status"]).upper()
+    data_quality_status = str(summary.get("data_quality_status") or "NOT_ANALYZED").upper()
+    public["control_status"] = control_status if control_status in {"PASS", "FAIL", "EVIDENCE_LIMIT"} else "EVIDENCE_LIMIT"
+    public["data_quality_status"] = (
+        data_quality_status
+        if data_quality_status in {"PASS", "HINT", "FAIL", "EVIDENCE_LIMIT", "NOT_ANALYZED"}
+        else "EVIDENCE_LIMIT"
+    )
 
     services = [str(item) for item in summary.get("services", []) if str(item) in SERVICE_ALIASES.values()]
     public["services"] = list(dict.fromkeys(services))
@@ -1743,6 +2362,11 @@ def public_cli_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
                 for item in (_public_violation(value) for value in check.get("violations", []))
                 if item
             ][:30],
+            "hints": [
+                item
+                for item in (_public_violation(value) for value in check.get("hints", []))
+                if item
+            ][:30],
         }
     public["checks"] = checks
     public["event_samples"] = {
@@ -1753,6 +2377,11 @@ def public_cli_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
     public["effective_min_gap_s"] = {
         _public_pattern(name): int(value)
         for name, value in summary.get("effective_min_gap_s", {}).items()
+        if isinstance(value, (int, float))
+    }
+    public["evidence_limits"] = {
+        _public_pattern(name): int(value)
+        for name, value in summary.get("evidence_limits", {}).items()
         if isinstance(value, (int, float))
     }
     return public

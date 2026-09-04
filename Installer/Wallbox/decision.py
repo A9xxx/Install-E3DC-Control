@@ -21,6 +21,13 @@ except ImportError:  # pragma: no cover - fallback for direct Installer-path imp
     from Wallbox.ramps import running_charge_ramp_contract
 
 
+EFY_AUTONOMOUS_PRODUCT_CAPABILITY = "e3dc_efy_autonomous_solar_product"
+EFY_WBCHAR6_AUTONOMOUS_SOURCE = (
+    "configured_family_plus_field_verified_wbchar6"
+)
+EFY_WBCHAR6_PROVENANCE = "field_verified_legacy"
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         text = str(value).strip() if value is not None else ""
@@ -887,6 +894,55 @@ def _vehicle_profile_for_identity(
     return matches[0] if len(matches) == 1 else None
 
 
+def _vehicle_profile_phase_switch_policy(profile: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Liefert nur ein ausdrücklich konfiguriertes Fahrzeug-Veto.
+
+    openWB behandelt ein Fahrzeugprofil mit ``prevent_phase_switch`` als
+    Hardware-Schutz. Ältere E3DC-Control-Profile besitzen dieses optionale
+    Feld noch nicht; fehlende Angaben werden deshalb nicht als Freigabe und
+    auch nicht als Verbot erfunden.
+    """
+
+    data = profile if isinstance(profile, dict) else {}
+
+    def _bool_value(value: Any) -> Optional[bool]:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value or "").strip().lower()
+        if text in {"1", "true", "yes", "on", "ja"}:
+            return True
+        if text in {"0", "false", "no", "off", "nein"}:
+            return False
+        return None
+
+    if "prevent_phase_switch" in data:
+        prevented = _bool_value(data.get("prevent_phase_switch"))
+        if prevented is not None:
+            return {
+                "phase_switch_allowed": not prevented,
+                "phase_switch_policy_source": "vehicle_profile_prevent_phase_switch",
+            }
+    for key in (
+        "phase_switch_allowed",
+        "allow_phase_switch",
+        "phase_switch_after_start_allowed",
+    ):
+        if key not in data:
+            continue
+        allowed = _bool_value(data.get(key))
+        if allowed is not None:
+            return {
+                "phase_switch_allowed": allowed,
+                "phase_switch_policy_source": f"vehicle_profile_{key}",
+            }
+    return {
+        "phase_switch_allowed": None,
+        "phase_switch_policy_source": "vehicle_profile_policy_missing",
+    }
+
+
 def vehicle_phase_capability_from_profiles(
     profiles: Optional[Iterable[Dict[str, Any]]],
     status: Optional[Dict[str, Any]] = None,
@@ -912,6 +968,8 @@ def vehicle_phase_capability_from_profiles(
         "profile_match": False,
         "phase_count": 0,
         "phase_source": "none",
+        "phase_switch_allowed": None,
+        "phase_switch_policy_source": "vehicle_profile_unbound",
         "reason": "vehicle_identity_unconfirmed",
     }
 
@@ -920,6 +978,7 @@ def vehicle_phase_capability_from_profiles(
         profile = _vehicle_profile_for_identity(profiles, identity.get("key"))
         if profile:
             result["profile_match"] = True
+            result.update(_vehicle_profile_phase_switch_policy(profile))
             for key in (
                 "max_phases",
                 "obc_max_phases",
@@ -964,6 +1023,7 @@ def vehicle_phase_capability_from_profiles(
             result["profile_match"] = True
             result["identity_confirmed"] = False
             result["identity_source"] = "configured_selected_vehicle_profile"
+            result.update(_vehicle_profile_phase_switch_policy(profile))
             for key in (
                 "max_phases",
                 "obc_max_phases",
@@ -997,6 +1057,138 @@ def vehicle_phase_capability_from_profiles(
             })
             return result
 
+    return result
+
+
+def vehicle_control_pilot_interruption_capability_from_profiles(
+    profiles: Optional[Iterable[Dict[str, Any]]],
+    status: Optional[Dict[str, Any]] = None,
+    config: Optional[Dict[str, Any]] = None,
+    charger_id: int = 1,
+) -> Dict[str, Any]:
+    """Binde automatisches CP-Wakeup an das wirksame Fahrzeugprofil.
+
+    Die openWB-Pro-Hardwarefläche und die Fahrzeuganforderung sind getrennte
+    Verträge. Eine bestätigte Live-ID hat Vorrang. Fehlt die optionale
+    Fahrzeugerkennung, darf wie im openWB-Core das eindeutig dem Ladepunkt
+    zugeordnete Profil gelten, jedoch nur bei frischem Steckstatus und ohne
+    widersprechende Live-ID.
+    """
+
+    st = status if isinstance(status, dict) else {}
+    cfg = config if isinstance(config, dict) else {}
+    try:
+        cid = int(charger_id or 1)
+    except (TypeError, ValueError):
+        cid = 1
+    identity = confirmed_session_vehicle_identity(st)
+    result = {
+        "contract": "vehicle_control_pilot_interruption_capability_v1",
+        "active": False,
+        "identity_confirmed": bool(identity.get("confirmed", False)),
+        "identity_source": str(identity.get("source") or ""),
+        "session_bound": bool(identity.get("session_bound", False)),
+        "profile_match": False,
+        "assignment_bound": False,
+        "plug_bound": False,
+        "source": "vehicle_profile_unbound",
+        "reason": "vehicle_identity_unconfirmed",
+    }
+    profile = None
+    if (
+        identity.get("confirmed") is True
+        and identity.get("session_bound") is True
+    ):
+        profile = _vehicle_profile_for_identity(profiles, identity.get("key"))
+        if not profile:
+            result["reason"] = "confirmed_vehicle_profile_not_unique"
+            return result
+        result["source"] = "confirmed_session_vehicle_profile"
+    else:
+        connected = bool(
+            st.get("plug_state")
+            or st.get("plug")
+            or st.get("connected")
+            or st.get("car") == 2
+        )
+        fresh = bool(
+            st.get("driver_status_valid") is True
+            and st.get("driver_status_stale") is False
+            and st.get("driver_status_degraded") is not True
+            and st.get("driver_status_glitch") is not True
+        )
+        if not connected or not fresh:
+            result["reason"] = (
+                "configured_vehicle_requires_fresh_plug_status"
+            )
+            return result
+        configured_key = (
+            cfg.get(f"wb{cid}_car_id")
+            or cfg.get(f"wb{cid}_vehicle_id")
+            or cfg.get(f"wb{cid}_selected_car_id")
+            or cfg.get(f"wb{cid}_car_profile")
+            or ""
+        )
+        if not str(configured_key).strip():
+            result["reason"] = "configured_vehicle_profile_missing"
+            return result
+        profile = _vehicle_profile_for_identity(profiles, configured_key)
+        if not profile and isinstance(profiles, (list, tuple)):
+            normalized_key = str(configured_key).strip().lower()
+            matches = [
+                candidate
+                for candidate in profiles
+                if isinstance(candidate, dict)
+                and normalized_key
+                in {
+                    str(candidate.get("id") or "").strip().lower(),
+                    str(candidate.get("name") or "").strip().lower(),
+                }
+            ]
+            profile = matches[0] if len(matches) == 1 else None
+        if not profile:
+            result["reason"] = "configured_vehicle_profile_not_unique"
+            return result
+        live_key = compact_vehicle_identifier(
+            st.get("vehicle_id") or st.get("rfid_tag") or st.get("car_id")
+        )
+        profile_aliases = {
+            compact_vehicle_identifier(profile.get(key))
+            for key in VEHICLE_PROFILE_ID_KEYS
+            if str(profile.get(key) or "").strip()
+        }
+        if live_key and live_key not in profile_aliases:
+            result["reason"] = "configured_vehicle_conflicts_with_live_identity"
+            return result
+        result.update({
+            "identity_source": "configured_selected_vehicle_profile",
+            "assignment_bound": True,
+            "plug_bound": True,
+            "source": "configured_wallbox_vehicle_profile",
+        })
+    result["profile_match"] = True
+    raw = profile.get("control_pilot_interruption")
+    if isinstance(raw, bool):
+        enabled = raw
+    elif isinstance(raw, (int, float)):
+        enabled = bool(raw)
+    else:
+        text = str(raw or "").strip().lower()
+        if text in {"1", "true", "yes", "on", "ja"}:
+            enabled = True
+        elif text in {"0", "false", "no", "off", "nein"}:
+            enabled = False
+        else:
+            result["reason"] = "vehicle_profile_cp_requirement_missing"
+            return result
+    result.update({
+        "active": bool(enabled),
+        "reason": (
+            "vehicle_profile_requires_cp_interruption"
+            if enabled
+            else "vehicle_profile_does_not_require_cp_interruption"
+        ),
+    })
     return result
 
 
@@ -1831,11 +2023,65 @@ def openwb_phase_switch_capability(
     _ = config
     st = status or {}
     if charger_class_name == "OpenWBProCharger":
+        status_fresh = bool(
+            st.get("driver_status_valid") is True
+            and st.get("driver_status_stale") is not True
+            and st.get("driver_status_degraded") is not True
+            and st.get("driver_status_glitch") is not True
+        )
+        official_surface = bool(
+            str(st.get("api_surface") or "").strip().lower()
+            in ("openwb_pro_connect_php", "official_connect_php")
+            and str(st.get("phase_switch_capability") or "")
+            == "official_connect_php"
+            and str(st.get("phase_switch_source") or "")
+            == "openwb_pro_connect_php"
+        )
+        signaling = " ".join(
+            str(st.get("evse_signaling") or "").strip().lower().split()
+        )
+        # Die offizielle openWB-Pro-Dokumentation nennt ``basic iec61851``;
+        # aktuelle connect.php-Versionen liefern für denselben reinen
+        # IEC-61851-PWM-Pfad auch den Kurzwert ``basic``. Nur diese beiden
+        # exakten Werte öffnen die Phasenumschaltung. HLC-, ISO-15118- und
+        # kombinierte Diagnosewerte bleiben weiterhin fail-closed.
+        signaling_basic = signaling in ("basic", "basic iec61851")
+        signaling_hlc = bool("hlc" in signaling or "iso15118" in signaling)
+        can_switch = bool(
+            status_fresh
+            and official_surface
+            and signaling_basic
+            and not signaling_hlc
+            and st.get("can_switch_phases") is True
+        )
+        if signaling_hlc:
+            blocker = "hlc_iso15118_phase_switch_blocked"
+        elif not signaling_basic:
+            blocker = "evse_signaling_unknown"
+        elif not status_fresh:
+            blocker = "driver_status_not_fresh"
+        elif not official_surface:
+            blocker = "official_connect_php_not_confirmed"
+        elif st.get("can_switch_phases") is not True:
+            blocker = "driver_phase_capability_missing"
+        else:
+            blocker = ""
         return {
-            "can_switch": True,
-            "capability": "official_connect_php",
-            "source": "openwb_pro_connect_php",
-            "api_surface": "openwb_pro_connect_php",
+            "can_switch": can_switch,
+            "capability": (
+                "official_connect_php"
+                if can_switch
+                else "unknown_or_stale_connect_php"
+            ),
+            "source": (
+                "openwb_pro_connect_php"
+                if can_switch
+                else "fail_closed"
+            ),
+            "api_surface": str(st.get("api_surface") or ""),
+            "status_fresh": status_fresh,
+            "evse_signaling": signaling,
+            "blocker": blocker,
         }
     if charger_class_name != "OpenWBCharger":
         return {
@@ -1901,6 +2147,11 @@ def wallbox_phase_switch_capability(
             in {"configured", "configured_type"}
             and str(st.get("e3dc_control_backend", "") or "")
             == "wbchar6_compat"
+            and st.get("e3dc_efy_autonomous_wbchar6_verified") is True
+            and str(
+                st.get("e3dc_efy_autonomous_wbchar6_provenance") or ""
+            )
+            == EFY_WBCHAR6_PROVENANCE
             and status_fresh
         )
         return {
@@ -1910,14 +2161,19 @@ def wallbox_phase_switch_capability(
             "api_surface": "",
             "autonomous_can_switch": autonomous_efy,
             "autonomous_capability": (
-                "e3dc_efy_official_autonomous_solar"
+                EFY_AUTONOMOUS_PRODUCT_CAPABILITY
                 if autonomous_efy
                 else "not_freshly_confirmed"
             ),
             "autonomous_source": (
-                "configured_family_plus_official_contract"
+                EFY_WBCHAR6_AUTONOMOUS_SOURCE
                 if autonomous_efy
                 else "fail_closed"
+            ),
+            "autonomous_provenance": (
+                EFY_WBCHAR6_PROVENANCE
+                if autonomous_efy
+                else "unknown"
             ),
             "autonomous_handoff_method": (
                 "set_amp_autonomous_solar"
@@ -2041,6 +2297,11 @@ def phase_observation_contract(
             in {"configured", "configured_type"}
             and str(st.get("e3dc_control_backend", "") or "")
             == "wbchar6_compat"
+            and st.get("e3dc_efy_autonomous_wbchar6_verified") is True
+            and str(
+                st.get("e3dc_efy_autonomous_wbchar6_provenance") or ""
+            )
+            == EFY_WBCHAR6_PROVENANCE
         )
     if charger_class_name == "E3DCCharger" and normalized_driver == "e3dc_native":
         can_switch = False
@@ -2224,6 +2485,9 @@ def phase_observation_contract(
         "autonomous_phase_switch_source": str(
             cap.get("autonomous_source", "") or ""
         ),
+        "autonomous_phase_switch_provenance": str(
+            cap.get("autonomous_provenance", "") or ""
+        ),
         "autonomous_phase_handoff_method": str(
             cap.get("autonomous_handoff_method", "") or ""
         ),
@@ -2383,8 +2647,10 @@ def wallbox_executable_budget(
     if autonomous_1p_ready:
         # Die efy erhält keinen Phasenbefehl. E3DC-Control übergibt ausschließlich
         # den bereits kanonischen WBchar6-Sonnenmodus mit Stromdeckel; die im
-        # explizit konfigurierte efy wählt gemäß Herstellervertrag 1p/3p selbst;
-        # der frische ALG-Status bindet die konkrete Steck-/Ladesitzung.
+        # explizit konfigurierte efy besitzt die herstellereigene 1p-/3p-
+        # Produktfähigkeit. Ihre Aktivierung über WBchar6 bleibt dagegen ein
+        # feldverifizierter Legacy-Vertrag; der frische ALG-Status bindet die
+        # konkrete Steck-/Ladesitzung.
         # Für diesen eng gebundenen Übergabepfad darf die Watt-/Ampere-Projektion
         # deshalb das 1p-Minimum verwenden.
         phases = 1
@@ -2487,7 +2753,9 @@ def wallbox_executable_budget(
         "strict_watt_cap": not autonomous_1p_ready,
         "worst_case_phase_multiplier": 3 if autonomous_1p_ready else 1,
         "grid_import_protection": (
-            "wbchar6_solar_mode" if autonomous_1p_ready else "manager_budget"
+            "manager_pcc_energy_guard_plus_wbchar6_envelope"
+            if autonomous_1p_ready
+            else "manager_budget"
         ),
         "one_phase_required": bool(require_one_phase),
         "one_phase_ready": bool(one_phase_ready),
@@ -2708,7 +2976,11 @@ def autonomous_solar_output_contract(
         == "wbchar6_solar_mode"
         and phase_contract.get("autonomous_phase_switch_capable") is True
         and str(phase_contract.get("autonomous_phase_switch_source") or "")
-        == "configured_family_plus_official_contract"
+        == EFY_WBCHAR6_AUTONOMOUS_SOURCE
+        and str(
+            phase_contract.get("autonomous_phase_switch_provenance") or ""
+        )
+        == EFY_WBCHAR6_PROVENANCE
         and str(phase_contract.get("autonomous_phase_handoff_method") or "")
         == "set_amp_autonomous_solar"
         and str(phase_contract.get("autonomous_phase_protocol_mode") or "")
@@ -2727,7 +2999,9 @@ def autonomous_solar_output_contract(
         "strict_watt_cap": not active,
         "worst_case_phase_multiplier": 3 if active else 1,
         "grid_import_protection": (
-            "wbchar6_solar_mode" if active else "manager_budget"
+            "manager_pcc_energy_guard_plus_wbchar6_envelope"
+            if active
+            else "manager_budget"
         ),
         "reason": (
             "explicit_efy_autonomous_solar_handoff"
@@ -2900,6 +3174,18 @@ def stable_wallbox_amp_contract(
     if proposed_i <= 0:
         state_updates["_wb_stable_budget_jump_done"] = False
         return result(proposed_i, "target_zero")
+
+    if current_i > 0 and real_confirmed and proposed_i > current_i:
+        # Der sichere Startdeckel bleibt bis zum frischen Lade-/Leistungsbeleg
+        # bestehen. Danach ist der vorgeschlagene Wert bereits der final
+        # autorisierte Sollstrom. Eine zweite +1-A-/+5-A-Rampe erzeugt keinen
+        # Hardwareschutz, sondern lässt nutzbare Leistung liegen.
+        state_updates["_wb_stable_budget_jump_done"] = True
+        state_updates["_wb_stable_budget_jump_ts"] = now
+        state_updates["last_storage_guided_amp_up_ts"] = now
+        if openwb_like:
+            state_updates["_last_openwb_grid_window_amp_up_ts"] = now
+        return result(proposed_i, "confirmed_direct_up")
 
     grid_window_active = bool(grid_allowed or price_active or price_boost_active)
     if grid_window_active:
@@ -3472,6 +3758,7 @@ def start_stop_hold_action(
     native_verified_pv_sink_hold_active: bool = False,
     openwb_floor_zero_budget_stop_active: bool = False,
     zero_budget_contract: Optional[Dict[str, Any]] = None,
+    non_native_idle_zero_confirmed: bool = False,
 ) -> Dict[str, Any]:
     """Wählt die übergeordnete Wallbox-Aktion vor jedem Treiberbefehl.
 
@@ -3553,6 +3840,28 @@ def start_stop_hold_action(
     timed_zero_budget_hold_allowed = bool(
         not zero_budget_active or zero_budget_hold_allowed
     )
+    non_native_output_active_or_offered = bool(
+        hw_charging
+        or hw_power > 500.0
+        or (
+            charger_connected
+            and (
+                is_charging_memory
+                or current > 0.5
+                or set_amp > 0.5
+            )
+        )
+    )
+    non_native_stop_edge_due = bool(
+        stop_retry_due
+        or (
+            not stop_already_sent
+            and (
+                non_native_output_active_or_offered
+                or not bool(non_native_idle_zero_confirmed)
+            )
+        )
+    )
 
     # Ein freigegebener gemeinsamer Gate-Stopp und der native Akkuentladungs-
     # Schutz stehen vor sämtlichen Haltepfaden. Auch ein inkonsistenter positiver
@@ -3590,13 +3899,7 @@ def start_stop_hold_action(
                     or stop_retry_due
                 )
             else:
-                stop_edge_due = bool(
-                    is_charging_memory
-                    or hw_charging
-                    or hw_power > 500.0
-                    or not stop_already_sent
-                    or stop_retry_due
-                )
+                stop_edge_due = non_native_stop_edge_due
         if priority_forced_stop:
             stop_reason = "priority_forced_stop"
         elif zero_budget_hard_stop:
@@ -4037,13 +4340,7 @@ def start_stop_hold_action(
             or stop_retry_due
         )
     else:
-        need_stop_toggle = bool(
-            is_charging_memory
-            or hw_charging
-            or hw_power > 500.0
-            or not stop_already_sent
-            or stop_retry_due
-        )
+        need_stop_toggle = non_native_stop_edge_due
     if native_running_charge_hold or native_current_down_hold:
         need_stop_toggle = False
 
@@ -4254,7 +4551,8 @@ def ordinary_grid_import_sequence_required(
     Die Funktion gibt keine Hardwareaktion frei. Sie verhindert lediglich,
     dass ältere Phasen- oder PV-Hybrid-Pfade den zentralen Ablauf zwischen zwei
     Fast-Grid-Takten überholen. Explizite Netzlade- und Schutzmodi bleiben
-    außerhalb dieses Vertrags.
+    außerhalb dieses Vertrags. Pre-Dump ist bewusst keine Ausnahme: realer
+    Netzbezug wird immer zuerst über den gemeinsamen Netz-Wh-Wächter abgebaut.
     """
 
     return bool(
@@ -4274,7 +4572,6 @@ def ordinary_grid_import_sequence_required(
             grid_allowed
             or price_optimizing_active
             or price_boost_active
-            or predump_active
             or scheduled_slot_active
         )
     )
@@ -4391,6 +4688,89 @@ def phase_3p_budget_support_contract(
         "up_buffer_w": buffer_w,
         "strong_export_threshold_w": export_threshold_w,
         "phase_target": target,
+    }
+
+
+def phase_up_counterfactual_contract(
+    *,
+    authorized_budget_w: Any,
+    current_1p_amp: Any,
+    effective_1p_max_amp: Any,
+    current_step_amp: Any = 1.0,
+    voltage_v: Any = 230.0,
+    min_current_amp: Any = 6.0,
+    measurement_noise_w: Any = 100.0,
+    fresh_budget_authorized: bool = False,
+    driver_phase_switch_allowed: bool = False,
+    vehicle_phase_switch_allowed: bool = True,
+    phase_change_blocked: bool = False,
+    current_phases: Any = 1,
+) -> Dict[str, Any]:
+    """Bewertet 1p→3p gegen die Leistung nach dem Schaltvorgang.
+
+    Gemessener Export allein ist keine Freigabe: Nach 3p→1p entsteht durch
+    den eigenen Schaltvorgang ein Scheinüberschuss. Der Hochwechsel verwendet
+    deshalb das frische autorisierte Budget und verlangt zusätzlich, dass der
+    einphasige Pfad seine belegte wirksame Grenze erreicht hat.
+    """
+
+    budget_w = max(0.0, _safe_float(authorized_budget_w, 0.0))
+    voltage = max(200.0, min(260.0, _safe_float(voltage_v, 230.0)))
+    minimum_a = max(6.0, _safe_float(min_current_amp, 6.0))
+    step_a = max(0.1, min(16.0, _safe_float(current_step_amp, 1.0)))
+    one_phase_max_a = max(minimum_a, _safe_float(effective_1p_max_amp, 0.0))
+    one_phase_current_a = max(0.0, _safe_float(current_1p_amp, 0.0))
+    phases = valid_phase_count(current_phases, 0)
+    noise_w = max(0.0, _safe_float(measurement_noise_w, 0.0))
+
+    one_phase_min_w = minimum_a * voltage
+    one_phase_max_w = one_phase_max_a * voltage
+    three_phase_min_w = 3.0 * minimum_a * voltage
+    current_quantum_w = step_a * voltage
+    # Die Ein-/Aus-Hysterese muss größer als die kleinste physische
+    # einphasige Ladeleistung sein. Ein zusätzliches Stromquantum macht die
+    # strikte Ungleichung auch bei gerundetem 230-V-Modell eindeutig.
+    hysteresis_w = max(
+        one_phase_min_w + current_quantum_w,
+        2.0 * noise_w + current_quantum_w,
+    )
+    required_budget_w = max(three_phase_min_w, one_phase_max_w) + hysteresis_w
+    one_phase_saturated = bool(
+        phases == 1
+        and one_phase_current_a + step_a >= one_phase_max_a - 1e-9
+    )
+
+    blockers = []
+    if phases != 1:
+        blockers.append("current_phase_not_one")
+    if not one_phase_saturated:
+        blockers.append("one_phase_not_saturated")
+    if not fresh_budget_authorized:
+        blockers.append("authorized_budget_not_fresh")
+    if budget_w + 1e-9 < required_budget_w:
+        blockers.append("counterfactual_budget_insufficient")
+    if not driver_phase_switch_allowed:
+        blockers.append("driver_phase_switch_not_allowed")
+    if not vehicle_phase_switch_allowed:
+        blockers.append("vehicle_phase_switch_veto")
+    if phase_change_blocked:
+        blockers.append("phase_change_cooldown")
+
+    return {
+        "contract": "phase_up_counterfactual_v1",
+        "supported": not blockers,
+        "blockers": blockers,
+        "authorized_budget_w": round(budget_w, 3),
+        "required_budget_w": round(required_budget_w, 3),
+        "one_phase_saturated": one_phase_saturated,
+        "one_phase_current_a": round(one_phase_current_a, 3),
+        "effective_1p_max_amp": round(one_phase_max_a, 3),
+        "one_phase_max_w": round(one_phase_max_w, 3),
+        "three_phase_min_w": round(three_phase_min_w, 3),
+        "hysteresis_w": round(hysteresis_w, 3),
+        "current_quantum_w": round(current_quantum_w, 3),
+        "measurement_noise_w": round(noise_w, 3),
+        "phase_change_blocked": bool(phase_change_blocked),
     }
 
 
@@ -4929,6 +5309,52 @@ def _grid_allowed_for_id(grid_allowed_charger_ids: Any, wb_id: int) -> bool:
     if isinstance(grid_allowed_charger_ids, (set, list, tuple)):
         return wb_id in grid_allowed_charger_ids or str(wb_id) in grid_allowed_charger_ids
     return False
+
+
+def vehicle_phase_switch_veto_contract(
+    vehicle_capability: Optional[Dict[str, Any]],
+    status: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Wende die openWB-Semantik für Fahrzeug-Phasenverbote an.
+
+    ``prevent_phase_switch`` erlaubt vor dem ersten Laden genau die notwendige
+    Initialwahl. Explizite lokale ``phase_switch_allowed=false``-Felder
+    bleiben dagegen absolute Vetos.
+    """
+
+    capability = (
+        vehicle_capability if isinstance(vehicle_capability, dict) else {}
+    )
+    st = status if isinstance(status, dict) else {}
+    source = str(capability.get("phase_switch_policy_source") or "")
+    requested_veto = capability.get("phase_switch_allowed") is False
+    session_kwh = max(0.0, _safe_float(st.get("session_kwh"), 0.0))
+    session_started = bool(session_kwh > 0.0 or status_real_charging(st))
+    prevent_profile = source == "vehicle_profile_prevent_phase_switch"
+    active = bool(
+        requested_veto
+        and (
+            not prevent_profile
+            or session_started
+        )
+    )
+    if not requested_veto:
+        reason = "no_vehicle_phase_veto"
+    elif prevent_profile and not session_started:
+        reason = "initial_phase_selection_allowed_before_charge"
+    elif prevent_profile:
+        reason = "prevent_phase_switch_after_charge_start"
+    else:
+        reason = "absolute_vehicle_phase_switch_veto"
+    return {
+        "contract": "vehicle_phase_switch_veto_v1",
+        "active": active,
+        "requested_veto": requested_veto,
+        "policy_source": source,
+        "session_started": session_started,
+        "session_kwh": session_kwh,
+        "reason": reason,
+    }
 
 
 def _status_running_for_allocation(status: Optional[Dict[str, Any]]) -> bool:

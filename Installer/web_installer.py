@@ -81,6 +81,7 @@ try:
         run_isolated_git,
     )
     from .utils import MANAGER_LOCK_TMPFILES_CONFIG, ensure_manager_lock_namespace
+    from .emergency_release import PERSISTENT_EMERGENCY_LATCH_PATH
 except ImportError:  # pragma: no cover - direct script execution fallback
     from backup_retention import (
         WEB_INSTALLER_BACKUP_KEEP_COUNT,
@@ -117,6 +118,7 @@ except ImportError:  # pragma: no cover - direct script execution fallback
         run_isolated_git,
     )
     from Installer.utils import MANAGER_LOCK_TMPFILES_CONFIG, ensure_manager_lock_namespace
+    from Installer.emergency_release import PERSISTENT_EMERGENCY_LATCH_PATH
 
 
 RAMDISK_DIR = Path("/var/www/html/ramdisk")
@@ -298,7 +300,17 @@ SERVICE_WRAPPER_SOURCE = INSTALLER_DIR / "service_wrapper.sh"
 SERVICE_WRAPPER = Path("/usr/local/sbin/e3dc-service-control")
 WEB_UPDATE_LAUNCHER_SOURCE = INSTALLER_DIR / "web_update_launcher.sh"
 WEB_UPDATE_LAUNCHER = Path("/usr/local/sbin/e3dc-web-update-launcher")
+RUNTIME_PERMISSIONS_LAUNCHER_SOURCE = (
+    INSTALLER_DIR / "runtime_permissions_repair.py"
+)
+RUNTIME_PERMISSIONS_LAUNCHER = Path(
+    "/usr/local/sbin/e3dc-runtime-permissions-repair"
+)
+RUNTIME_PERMISSIONS_CONTRACT = Path(
+    "/etc/e3dc-control/runtime_permissions_contract.json"
+)
 WEB_UPDATE_DISPATCHER_CONTRACT = b'e3dc-download-bootstrap-v2'
+WEB_UPDATE_DRIFT_FEATURE = b'e3dc-update-drift-confirm-v1'
 SERVICE_WRAPPER_ACTIONS = (
     "start",
     "stop",
@@ -338,6 +350,7 @@ WRAPPER_RELATIVE_PATHS = (
     "Installer/service_wrapper.sh",
     "Installer/installer_wrapper.sh",
     "Installer/web_update_launcher.sh",
+    "Installer/runtime_permissions_repair.py",
 )
 SUDOERS_FILE = Path("/etc/sudoers.d/020_e3dc_services")
 SUDOERS_DIR = Path("/etc/sudoers.d")
@@ -358,6 +371,54 @@ def _validate_service_wrapper_embedded_python(payload: bytes) -> None:
         compile(source.decode("utf-8", errors="strict"), "<matter-reset>", "exec")
     except (SyntaxError, UnicodeError) as exc:
         raise RuntimeError("Matter-Reset-Pythonblock im Service-Launcher ist ungültig") from exc
+
+
+def _service_launcher_root_contract_payload_valid(payload: bytes) -> bool:
+    """Prüft die enge Aktions- und Dienststruktur des Root-Launchers."""
+
+    try:
+        text = payload.decode("utf-8", errors="strict")
+    except UnicodeError:
+        return False
+    allowlist_matches = re.findall(
+        r"^readonly -a ALLOWED_SERVICES=\(\n(?P<body>.*?)^\)\n",
+        text,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    allowed_services: tuple[str, ...] = ()
+    allowlist_shape_ok = False
+    if len(allowlist_matches) == 1:
+        body_lines = [
+            line.strip()
+            for line in allowlist_matches[0].splitlines()
+            if line.strip()
+        ]
+        allowlist_shape_ok = all(
+            re.fullmatch(r'"[A-Za-z0-9_.@-]+\.service"', line)
+            for line in body_lines
+        )
+        if allowlist_shape_ok:
+            allowed_services = tuple(line[1:-1] for line in body_lines)
+    action_contract = "    start|stop|restart|status|enable|disable)"
+    content_ok = (
+        payload.startswith(b"#!/bin/bash\n# E3DC-Control V4 Service Launcher\n")
+        and b"\r" not in payload
+        and text.count('readonly ENV="/usr/bin/env" SYSTEMCTL="/usr/bin/systemctl"') == 1
+        and text.count('case "$ACTION" in') == 1
+        and text.count(action_contract) == 1
+        and allowlist_shape_ok
+        and allowed_services == SERVICE_WRAPPER_UNITS
+        and text.count('"$SYSTEMCTL" "$ACTION" -- "$SERVICE"') == 1
+        and text.count("# E3DC_MATTER_RESET_PYTHON_BEGIN\n") == 1
+        and text.count("# E3DC_MATTER_RESET_PYTHON_END\n") == 1
+    )
+    if not content_ok:
+        return False
+    try:
+        _validate_service_wrapper_embedded_python(payload)
+    except RuntimeError:
+        return False
+    return True
 
 
 def _git_head_wrapper_bytes(repo_root: Path) -> tuple[str, dict[str, bytes]]:
@@ -403,7 +464,29 @@ def _git_head_wrapper_bytes(repo_root: Path) -> tuple[str, dict[str, bytes]]:
     canonical: dict[str, bytes] = {}
     for relative_path in WRAPPER_RELATIVE_PATHS:
         payload, sealed_mode = entries[relative_path]
-        if sealed_mode != 0o555 or not payload.startswith(b"#!/bin/bash\n") or b"\r" in payload:
+        allowed_modes = (
+            {0o444, 0o555}
+            if relative_path == "Installer/runtime_permissions_repair.py"
+            else {0o555}
+        )
+        if sealed_mode not in allowed_modes or b"\r" in payload:
+            raise RuntimeError(f"HEAD-Blob besitzt keinen versiegelten LF-Vertrag: {relative_path}")
+        if relative_path == "Installer/runtime_permissions_repair.py":
+            if (
+                not payload.startswith(b"#!/usr/bin/python3\n")
+                or payload.count(b"e3dc_runtime_permissions_v1") != 1
+                or payload.count(b"e3dc_runtime_permissions_cli_v3") != 1
+            ):
+                raise RuntimeError("HEAD-Rechte-Launcher besitzt keinen eindeutigen Vertrag")
+            try:
+                compile(
+                    payload.decode("utf-8", errors="strict"),
+                    relative_path,
+                    "exec",
+                )
+            except (SyntaxError, UnicodeError) as exc:
+                raise RuntimeError("HEAD-Rechte-Launcher besitzt ungültigen Python-Code") from exc
+        elif not payload.startswith(b"#!/bin/bash\n"):
             raise RuntimeError(f"HEAD-Blob ist kein LF-kodierter Bash-Wrapper: {relative_path}")
         if relative_path == "Installer/service_wrapper.sh":
             _validate_service_wrapper_embedded_python(payload)
@@ -990,6 +1073,7 @@ def web_update_launcher_integrity_preview(
                 and payload.startswith(b"#!/bin/bash\n")
                 and b"\r" not in payload
                 and payload.count(WEB_UPDATE_DISPATCHER_CONTRACT) == 1
+                and payload.count(WEB_UPDATE_DRIFT_FEATURE) == 1
                 and b"@E3DC_INSTALL_ROOT@" not in payload
                 and b"@E3DC_INSTALL_USER@" not in payload
                 and (expected_payload is None or payload == expected_payload)
@@ -1197,6 +1281,123 @@ def _local_service_launcher_integrity_preview() -> dict[str, Any]:
     }
 
 
+def root_service_launcher_integrity_preview() -> dict[str, Any]:
+    """Prüft nur den bereits root-eigenen Launcher, nie den lokalen Checkout.
+
+    Außerhalb einer commitgebundenen Release-Transaktion darf eine vom
+    Installationsnutzer veränderbare Quelldatei weder Sollstand noch
+    Reparaturautorität für einen privilegierten Launcher sein. Dieser Vertrag
+    bindet deshalb ausschließlich das installierte Root-Objekt und dessen eng
+    begrenzte Aktions-/Dienststruktur. Der bytegenaue Vergleich bleibt dem
+    Release-Vertrag in :func:`service_launcher_integrity_preview` vorbehalten.
+    """
+
+    item: dict[str, Any] = {
+        "path": str(SERVICE_WRAPPER),
+        "status": "unknown",
+        "needs_repair": True,
+    }
+    payload = b""
+    try:
+        metadata = os.lstat(SERVICE_WRAPPER)
+        item.update({
+            "uid": int(metadata.st_uid),
+            "gid": int(metadata.st_gid),
+            "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+            "nlink": int(metadata.st_nlink),
+            "size": int(metadata.st_size),
+        })
+        if stat.S_ISLNK(metadata.st_mode):
+            item["status"] = "symlink"
+        elif not stat.S_ISREG(metadata.st_mode):
+            item["status"] = "not_regular"
+        elif metadata.st_nlink != 1:
+            item["status"] = "hardlink"
+        elif (
+            metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+            or stat.S_IMODE(metadata.st_mode) & 0o500 != 0o500
+        ):
+            item["status"] = "unsafe_permissions"
+        elif metadata.st_size < 512 or metadata.st_size > 64 * 1024:
+            item["status"] = "size_invalid"
+        else:
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+            )
+            descriptor = os.open(SERVICE_WRAPPER, flags)
+            try:
+                bound = os.fstat(descriptor)
+                while len(payload) <= 64 * 1024:
+                    chunk = os.read(descriptor, 64 * 1024 + 1 - len(payload))
+                    if not chunk:
+                        break
+                    payload += chunk
+                rebound = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+            named_rebound = os.stat(SERVICE_WRAPPER, follow_symlinks=False)
+            stable = (
+                bound.st_dev == metadata.st_dev
+                and bound.st_ino == metadata.st_ino
+                and bound.st_size == metadata.st_size
+                and bound.st_mtime_ns == metadata.st_mtime_ns
+                and rebound.st_dev == bound.st_dev
+                and rebound.st_ino == bound.st_ino
+                and rebound.st_size == bound.st_size
+                and rebound.st_mtime_ns == bound.st_mtime_ns
+                and named_rebound.st_dev == rebound.st_dev
+                and named_rebound.st_ino == rebound.st_ino
+                and named_rebound.st_size == rebound.st_size
+                and named_rebound.st_mtime_ns == rebound.st_mtime_ns
+            )
+            content_ok = (
+                stable
+                and _service_launcher_root_contract_payload_valid(payload)
+            )
+            item["sha256"] = hashlib.sha256(payload).hexdigest()
+            item["status"] = "ok" if content_ok else "content_invalid"
+            item["needs_repair"] = not content_ok
+    except FileNotFoundError:
+        item["status"] = "missing"
+    except Exception as exc:
+        item.update({"status": "read_error", "error": str(exc)})
+
+    parent_checks = []
+    for parent in (SERVICE_WRAPPER.parent.parent, SERVICE_WRAPPER.parent):
+        try:
+            parent_meta = os.lstat(parent)
+            ok = (
+                stat.S_ISDIR(parent_meta.st_mode)
+                and not stat.S_ISLNK(parent_meta.st_mode)
+                and parent_meta.st_uid == 0
+                and parent_meta.st_gid == 0
+                and not parent_meta.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            )
+        except OSError:
+            ok = False
+        parent_checks.append({"path": str(parent), "ok": ok})
+    success = bool(
+        item.get("uid") == 0
+        and item.get("gid") == 0
+        and item.get("nlink") == 1
+        and item.get("status") == "ok"
+        and all(check["ok"] for check in parent_checks)
+    )
+    return {
+        "success": success,
+        "path": str(SERVICE_WRAPPER),
+        "status": "ok" if success else item.get("status", "invalid"),
+        "commit_proven": False,
+        "verification_scope": "installed_root_contract",
+        "item": item,
+        "parent_checks": parent_checks,
+    }
+
+
 def service_launcher_integrity_preview() -> dict[str, Any]:
     """Prüft administrativ Git-exakt, im Webkontext den lokalen Root-Vertrag."""
 
@@ -1205,7 +1406,7 @@ def service_launcher_integrity_preview() -> dict[str, Any]:
         payload = canonical["Installer/service_wrapper.sh"]
     except Exception as exc:
         if not _caller_can_verify_release_git():
-            fallback = _local_service_launcher_integrity_preview()
+            fallback = root_service_launcher_integrity_preview()
             fallback["git_status"] = "administrative_only"
             fallback["git_error"] = str(exc)
             return fallback
@@ -1705,6 +1906,13 @@ def desired_www_data_sudoers_lines() -> list[str]:
         for action in SERVICE_WRAPPER_ACTIONS
         for unit in SERVICE_WRAPPER_UNITS
     ]
+    runtime_permissions_lines = []
+    if runtime_permissions_repair_integrity_preview().get("success"):
+        runtime_permissions_lines = [
+            f'www-data ALL=(root) NOPASSWD: {RUNTIME_PERMISSIONS_LAUNCHER} --check-json',
+            f'www-data ALL=(root) NOPASSWD: {RUNTIME_PERMISSIONS_LAUNCHER} ""',
+            f'www-data ALL=(root) NOPASSWD: {RUNTIME_PERMISSIONS_LAUNCHER} --confirm-content-drift',
+        ]
     return [
         *service_lines,
         (
@@ -1712,6 +1920,9 @@ def desired_www_data_sudoers_lines() -> list[str]:
             f"{SERVICE_WRAPPER} {MATTER_RESET_ACTION} {MATTER_RESET_UNIT}"
         ),
         f'www-data ALL=(root) NOPASSWD: {WEB_UPDATE_LAUNCHER} ""',
+        f'www-data ALL=(root) NOPASSWD: {WEB_UPDATE_LAUNCHER} --check-local-drift-json',
+        f'www-data ALL=(root) NOPASSWD: {WEB_UPDATE_LAUNCHER} --confirm-local-drift',
+        *runtime_permissions_lines,
     ]
 
 
@@ -3067,6 +3278,8 @@ def backup_plan(module_key: str | None = None) -> dict[str, Any]:
         SUDOERS_FILE,
         SERVICE_WRAPPER,
         WEB_UPDATE_LAUNCHER,
+        RUNTIME_PERMISSIONS_LAUNCHER,
+        RUNTIME_PERMISSIONS_CONTRACT,
         INSTALLER_WRAPPER,
     ]
     sudoers_findings = sudoers_file_findings()
@@ -3853,6 +4066,12 @@ def render_systemd_unit(module: Any, script_path: Path) -> str:
         if str(getattr(module, "key", "")) in {"heatpump", "heizstab"}
         else ""
     )
+    condition_line = (
+        f"ConditionPathExists=!{PERSISTENT_EMERGENCY_LATCH_PATH}\n"
+        f"ConditionPathIsSymbolicLink=!{PERSISTENT_EMERGENCY_LATCH_PATH}\n"
+        if str(getattr(module, "key", "")) == "storage_manager"
+        else ""
+    )
     if module_runner_label(module) == "npm":
         return f"""[Unit]
 Description=E3DC-Control {module.display_name}
@@ -3878,6 +4097,7 @@ WantedBy=multi-user.target
 Description=E3DC-Control {module.display_name}
 After=network-online.target
 Wants=network-online.target
+{condition_line}
 
 [Service]
 Type=simple
@@ -4385,8 +4605,9 @@ def check_path(
     expected_group: str | None = "www-data",
     expected_mode: int | None = None,
     should_write: bool = False,
+    expected_regular_file: bool = False,
 ) -> dict[str, Any]:
-    exists = path.exists()
+    exists = os.path.lexists(path)
     meta = owner_group(path) if exists else {"owner": None, "group": None, "mode": None}
     writable = os.access(path, os.W_OK) if exists else False
     problems: list[str] = []
@@ -4395,6 +4616,16 @@ def check_path(
     elif path.is_symlink():
         problems.append("ist ein symbolischer Link")
     else:
+        try:
+            metadata = os.lstat(path)
+        except OSError as exc:
+            problems.append(f"Metadaten nicht lesbar: {exc}")
+            metadata = None
+        if expected_regular_file and metadata is not None:
+            if not stat.S_ISREG(metadata.st_mode):
+                problems.append("ist keine reguläre Datei")
+            elif metadata.st_nlink != 1:
+                problems.append("ist keine Einzeldatei")
         allowed_owners = (
             tuple(str(owner) for owner in expected_owner)
             if isinstance(expected_owner, tuple)
@@ -4422,6 +4653,135 @@ def check_path(
         "writable": writable,
         "ok": issue is None,
         "issue": issue,
+    }
+
+
+def runtime_permissions_repair_integrity_preview() -> dict[str, Any]:
+    """Prüft den bereits root-eigenen Rechte-Launcher und seinen Vertrag."""
+
+    items: list[dict[str, Any]] = []
+    launcher_payload = b""
+    contract_payload = b""
+    for path, expected_mode, maximum_bytes, label in (
+        (
+            RUNTIME_PERMISSIONS_LAUNCHER,
+            0o755,
+            512 * 1024,
+            "Root-eigener Rechte-Launcher",
+        ),
+        (
+            RUNTIME_PERMISSIONS_CONTRACT,
+            0o644,
+            1024 * 1024,
+            "Root-eigener Rechtevertrag",
+        ),
+    ):
+        item: dict[str, Any] = {"path": str(path), "label": label, "ok": False}
+        try:
+            metadata = os.lstat(path)
+            item.update(
+                {
+                    "uid": int(metadata.st_uid),
+                    "gid": int(metadata.st_gid),
+                    "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+                    "nlink": int(metadata.st_nlink),
+                    "size": int(metadata.st_size),
+                }
+            )
+            safe = (
+                stat.S_ISREG(metadata.st_mode)
+                and not stat.S_ISLNK(metadata.st_mode)
+                and metadata.st_nlink == 1
+                and metadata.st_uid == 0
+                and metadata.st_gid == 0
+                and stat.S_IMODE(metadata.st_mode) == expected_mode
+                and 0 < metadata.st_size <= maximum_bytes
+            )
+            if safe:
+                payload = path.read_bytes()
+                rebound = os.lstat(path)
+                safe = (
+                    len(payload) <= maximum_bytes
+                    and (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
+                    == (rebound.st_dev, rebound.st_ino, rebound.st_size, rebound.st_mtime_ns)
+                )
+                if path == RUNTIME_PERMISSIONS_LAUNCHER:
+                    launcher_payload = payload
+                else:
+                    contract_payload = payload
+            item["ok"] = bool(safe)
+            item["status"] = "ok" if safe else "unsafe"
+        except FileNotFoundError:
+            item["status"] = "missing"
+        except OSError as exc:
+            item.update({"status": "read_error", "error": str(exc)})
+        items.append(item)
+
+    launcher_content_ok = False
+    if launcher_payload:
+        try:
+            text = launcher_payload.decode("utf-8", errors="strict")
+            compile(text, str(RUNTIME_PERMISSIONS_LAUNCHER), "exec")
+            launcher_content_ok = (
+                launcher_payload.startswith(b"#!/usr/bin/python3\n")
+                and launcher_payload.count(b"e3dc_runtime_permissions_v1") == 1
+                and launcher_payload.count(b"e3dc_runtime_permissions_cli_v3") == 1
+                and "subprocess" not in text
+                and "systemctl" not in text
+                and "git " not in text.lower()
+            )
+        except (SyntaxError, UnicodeError):
+            launcher_content_ok = False
+
+    contract_content_ok = False
+    contract: dict[str, Any] = {}
+    if contract_payload:
+        try:
+            decoded = json.loads(contract_payload.decode("utf-8"))
+            contract = decoded if isinstance(decoded, dict) else {}
+            contract_content_ok = (
+                contract.get("schema") == "e3dc_runtime_permissions_v1"
+                and contract.get("launcher_feature") == "e3dc_runtime_permissions_cli_v3"
+                and os.path.normpath(str(contract.get("install_root") or ""))
+                == os.path.normpath(str(INSTALL_ROOT))
+                and str(contract.get("install_user") or "") == install_user()
+                and isinstance(contract.get("roots"), list)
+            )
+        except (UnicodeError, json.JSONDecodeError):
+            contract_content_ok = False
+
+    parent_checks = []
+    for parent in {
+        RUNTIME_PERMISSIONS_LAUNCHER.parent,
+        RUNTIME_PERMISSIONS_CONTRACT.parent,
+    }:
+        try:
+            metadata = os.lstat(parent)
+            ok = (
+                stat.S_ISDIR(metadata.st_mode)
+                and not stat.S_ISLNK(metadata.st_mode)
+                and metadata.st_uid == 0
+                and metadata.st_gid == 0
+                and not metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            )
+        except OSError:
+            ok = False
+        parent_checks.append({"path": str(parent), "ok": ok})
+
+    success = bool(
+        all(item.get("ok") for item in items)
+        and launcher_content_ok
+        and contract_content_ok
+        and all(item.get("ok") for item in parent_checks)
+    )
+    return {
+        "success": success,
+        "status": "ok" if success else "missing_or_unsafe",
+        "launcher_content_ok": launcher_content_ok,
+        "contract_content_ok": contract_content_ok,
+        "items": items,
+        "parents": parent_checks,
+        "contract_schema": contract.get("schema"),
     }
 
 
@@ -4453,16 +4813,22 @@ def permissions_check() -> dict[str, Any]:
         (INSTALLER_DIR / "web_update_launcher.sh", user, "www-data", 0o755, False),
         (CONFIG_FILE, config_owners, "www-data", config_mode, True),
     ]
-    checks = [
-        check_path(
-            path,
-            expected_owner=owner,
-            expected_group=group,
-            expected_mode=mode,
-            should_write=write,
+    config_lock = DATA_DIR / ".e3dc_v4.transaction.lock"
+    if os.path.lexists(config_lock):
+        paths.append((config_lock, "www-data", "www-data", 0o660, True, True))
+    checks = []
+    for item in paths:
+        path, owner, group, mode, write = item[:5]
+        checks.append(
+            check_path(
+                path,
+                expected_owner=owner,
+                expected_group=group,
+                expected_mode=mode,
+                should_write=write,
+                expected_regular_file=(len(item) > 5 and bool(item[5])),
+            )
         )
-        for path, owner, group, mode, write in paths
-    ]
     for session_file in SESSION_FILES:
         if session_file.exists():
             checks.append(
@@ -4475,8 +4841,41 @@ def permissions_check() -> dict[str, Any]:
                 )
             )
     issues = [item for item in checks if not item["ok"]]
-    launcher_state = web_update_launcher_integrity_preview()
-    repair_command = "/usr/bin/sudo -n -- /usr/local/sbin/e3dc-web-update-launcher"
+    runtime_launcher_state = runtime_permissions_repair_integrity_preview()
+    for item in issues:
+        issue_text = str(item.get("issue") or "")
+        structural = (
+            not item.get("exists")
+            or "symbolischer Link" in issue_text
+            or "keine reguläre Datei" in issue_text
+            or "keine Einzeldatei" in issue_text
+        )
+        item["repair_class"] = (
+            "system_repair_required" if structural else "runtime_repairable"
+        )
+    runtime_repairable_count = sum(
+        1 for item in issues if item.get("repair_class") == "runtime_repairable"
+    )
+    system_repair_required_count = sum(
+        1
+        for item in issues
+        if item.get("repair_class") == "system_repair_required"
+    )
+    runtime_repair_command = (
+        "/usr/bin/sudo -n -- /usr/local/sbin/"
+        "e3dc-runtime-permissions-repair --check-json\n"
+        "# Repariert releasegleiche Einträge sofort und gibt bei lokalen "
+        "Abweichungen eine vollständige Liste plus Einmal-Token aus:\n"
+        "/usr/bin/sudo -n -- /usr/local/sbin/"
+        "e3dc-runtime-permissions-repair\n"
+        "# Nur nach bewusster Bestätigung genau dieser vollständigen Liste:\n"
+        "printf '%s\\n' '<confirmation_token>' | /usr/bin/sudo -n -- "
+        "/usr/local/sbin/e3dc-runtime-permissions-repair "
+        "--confirm-content-drift"
+    )
+    system_repair_command = (
+        "/usr/bin/sudo -n -- /usr/local/sbin/e3dc-web-update-launcher"
+    )
     return {
         "success": True,
         "write_actions_enabled": WRITE_ACTIONS_ENABLED,
@@ -4484,22 +4883,31 @@ def permissions_check() -> dict[str, Any]:
         "checks": checks,
         "issue_count": len(issues),
         "issues": issues,
-        "repair_available": bool(launcher_state.get("success")),
-        "privileged_web_repair_enabled": False,
-        "repair_via": "canonical_web_update_launcher",
-        "repair_launcher_status": launcher_state.get("status", "unbekannt"),
+        "repair_available": bool(runtime_launcher_state.get("success")),
+        "privileged_web_repair_enabled": bool(runtime_launcher_state.get("success")),
+        "repair_via": "root_owned_runtime_permissions_launcher",
+        "repair_launcher_status": runtime_launcher_state.get("status", "unbekannt"),
+        "repair_launcher": runtime_launcher_state,
+        "runtime_repairable_issue_count": runtime_repairable_count,
+        "system_repair_required_count": system_repair_required_count,
         "repair_message": (
-            "Die direkte Web-Installer-Reparatur bleibt gesperrt. Backup, "
-            "Rechteprojektion, Releaseabgleich und Dienstneustart laufen über "
-            "den root-eigenen argumentlosen Web-Update-Launcher."
+            "Die enge Rechtereparatur verändert ausschließlich Metadaten "
+            "bekannter Pfade. Sie erstellt kein Backup, führt kein Update aus "
+            "und startet keine Dienste neu."
         ),
         "detected_install_path": str(INSTALL_ROOT),
-        "repair_command": repair_command,
+        "repair_command": runtime_repair_command,
+        "system_repair_command": system_repair_command,
         "repair_instruction": (
             "Per SSH am E3DC-Control-System anmelden und den folgenden Befehl "
-            "ausführen. Fehlt der root-eigene Launcher, zuerst das für die "
-            "installierte Version veröffentlichte Community-Bootstrap verwenden; "
-            "dieses installiert den Launcher gebunden und startet danach das Update."
+            "optional mit --check-json rein lesend ausführen. Der Aufruf ohne "
+            "Argument repariert releasegleiche Einträge sofort. Bei lokalen "
+            "Änderungen gibt er die vollständige Pfadliste und ein kurzlebiges "
+            "Einmal-Token aus; nur dieses Token darf nach bewusster Prüfung über "
+            "stdin an den festen Bestätigungsaufruf übergeben werden. Inhalte "
+            "bleiben unverändert. "
+            "Fehlt der root-eigene "
+            "Rechte-Launcher, ist der vollständige Systemabgleich erforderlich."
         ),
     }
 
@@ -4534,6 +4942,36 @@ def repair_permissions(
         return {
             "success": False,
             "message": "Rechte-Reparatur abgebrochen: Docker-Systeme nutzen keinen systemd/sudoers-Bare-Metal-Pfad.",
+            "readiness": readiness,
+        }
+    expected_release_commit = str(
+        os.environ.get(EXPECTED_RELEASE_COMMIT_ENV) or ""
+    ).strip().lower()
+    release_authority_bound = bool(
+        bound_privileged_preimages is not None
+        and re.fullmatch(r"[0-9a-f]{40}", expected_release_commit)
+    )
+    if not release_authority_bound:
+        stable_launcher = web_update_launcher_integrity_preview()
+        reason_code = (
+            "stable_repair_required"
+            if stable_launcher.get("success")
+            else "bootstrap_required"
+        )
+        return {
+            "success": False,
+            "reason_code": reason_code,
+            "message": (
+                "Privilegierte Launcher und sudoers bleiben unverändert: "
+                "Lokales Git ist keine Stable-Autorität. Starte die vollständige "
+                "Systemreparatur über den verifizierten Stable-Updater."
+                if reason_code == "stable_repair_required"
+                else
+                "Privilegierte Launcher und sudoers bleiben unverändert: Der "
+                "root-eigene Stable-Updater ist nicht sicher nutzbar. Installiere "
+                "zuerst den veröffentlichten Ein-Datei-Bootstrap."
+            ),
+            "stable_launcher": stable_launcher,
             "readiness": readiness,
         }
 

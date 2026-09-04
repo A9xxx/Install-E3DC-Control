@@ -1753,7 +1753,7 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
     Gibt ein Status-Dict zurueck das in heizstab_data.json landet.
     """
     global_auto   = str(cfg.get("auto_mode", "1")).lower() in ("1", "true", "yes")
-    local_auto    = str(cfg.get("hs_auto_mode", "1")) == "1"
+    local_auto    = cfg_bool(cfg, "hs_auto_mode", True)
     auto_mode     = global_auto and local_auto
     heat_policy_runtime_enabled = cfg_bool(cfg, "heat_policy_runtime_enable", False)
     min_surplus_w = cfg_float(cfg, "hs_min_surplus_w", 500, min_value=0)
@@ -2797,7 +2797,7 @@ def main():
     print(f"  WP-Typ: {wp_type} | Heizstab/BWWP-Zusatz: {'an' if has_aux_heater else 'aus'}")
     print(f"  Heizstab Modbus: {hs_ip}:{cfg.get('heizstab_port','502')} | "
           f"Shelly: {sh_ip} | "
-          f"Auto-Modus: {'an' if cfg.get('hs_auto_mode','1')=='1' else 'aus'}")
+          f"Auto-Modus: {'an' if cfg_bool(cfg, 'hs_auto_mode', True) else 'aus'}")
 
     # SIGTERM-Handler: Heizstab und Shelly beim Dienst-Stop auf 0/AUS setzen.
     # WICHTIG fuer Generic-Heizstab (Register 1000): hat keinen Modbus-Timeout!

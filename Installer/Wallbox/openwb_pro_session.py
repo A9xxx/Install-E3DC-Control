@@ -238,7 +238,7 @@ def mark_start_offer(
     *,
     now_ts: Any = None,
     config: Optional[Dict[str, Any]] = None,
-    charger_max_amp: Any = 32,
+    charger_max_amp: Any = 16,
     refresh: bool = False,
 ) -> None:
     """Remember that an openWB Pro start offer is standing."""
@@ -250,7 +250,7 @@ def mark_start_offer(
         import time
 
         now_value = time.time()
-    max_amp = max(6.0, _safe_float(charger_max_amp, 32.0))
+    max_amp = max(6.0, _safe_float(charger_max_amp, 16.0))
     amp_value = round(max(0.0, min(max_amp, _safe_float(amp, 0.0))), 1)
     if amp_value < 6:
         return
@@ -1113,12 +1113,12 @@ def automatic_start_cp_contract(
 ) -> Dict[str, Any]:
     """Bindet die dreistufige Freigabe für den kurzen Pro-Startimpuls.
 
-    ``false`` ist ein harter Nutzer-Stopp. ``true`` ist die ausdrückliche
-    Freigabe für einen bereits als openWB Pro gebundenen Treiber. Fehlend oder
-    ``auto`` benötigt zusätzlich einen frischen connect.php-Status und die von
-    openWB/evcc verwendete Wake-up-Fähigkeit ab API-Version 9. Unbekannte oder
-    ältere Versionen blockieren nur den optionalen CP-Impuls, nie die normale
-    Stromfreigabe.
+    Die offizielle ``connect.php``-Schnittstelle belegt den CP-Befehl, aber
+    keine automatische Freigabe allein aus einer API-Versionsnummer. ``on``
+    bleibt deshalb eine ausdrückliche Anlagenfreigabe auf einer frischen,
+    offiziell gebundenen Schnittstelle. ``auto`` benötigt zusätzlich eine
+    explizite Fahrzeug-/Herstellerfähigkeit aus dem Treiberprofil. Unbekannt
+    blockiert nur den optionalen CP-Impuls, nie die normale Stromfreigabe.
     """
 
     cfg = config if isinstance(config, dict) else {}
@@ -1139,30 +1139,38 @@ def automatic_start_cp_contract(
         "official_connect_php",
     )
     api_version = _openwb_pro_api_version(st)
-    capability = bool(
+    cp_wire_capability = bool(
+        fresh
+        and official_surface
+        and st.get("cp_interrupt_supported") is True
+    )
+    automatic_profile_capability = bool(
         st.get("automatic_start_cp_supported") is True
-        or (official_surface and api_version >= 9)
     )
     enabled = bool(
         is_openwb_pro
         and mode != "off"
         and (
-            mode == "on"
-            or (mode == "auto" and fresh and capability)
+            (mode == "on" and cp_wire_capability)
+            or (
+                mode == "auto"
+                and cp_wire_capability
+                and automatic_profile_capability
+            )
         )
     )
     if not is_openwb_pro:
         reason = "not_openwb_pro"
     elif mode == "off":
         reason = "explicitly_disabled"
+    elif not cp_wire_capability:
+        reason = "requires_fresh_official_cp_surface"
     elif mode == "on":
         reason = "explicitly_enabled"
-    elif not fresh:
-        reason = "auto_requires_fresh_status"
-    elif not capability:
-        reason = "auto_requires_supported_connect_php_api"
+    elif not automatic_profile_capability:
+        reason = "auto_requires_explicit_vehicle_profile"
     else:
-        reason = "auto_supported_connect_php_api"
+        reason = "auto_explicit_vehicle_profile"
     return {
         "contract": "openwb_pro_automatic_start_cp_v2",
         "mode": mode,
@@ -1172,7 +1180,11 @@ def automatic_start_cp_contract(
         "status_fresh": bool(fresh),
         "api_surface": surface,
         "api_version": int(api_version),
-        "capability": bool(capability),
+        "cp_wire_capability": bool(cp_wire_capability),
+        "automatic_profile_capability": bool(automatic_profile_capability),
+        "capability": bool(
+            cp_wire_capability and automatic_profile_capability
+        ),
     }
 
 
@@ -1879,11 +1891,12 @@ def start_wakeup_step_contract(
 ) -> Dict[str, Any]:
     """Liefert die begrenzten Wake-up-Schritte je Stecksession.
 
-    Der erste positive Sollstrom wird immer ohne CP gesendet. Erst wenn dieser
-    frische, erfolgreiche Stromauftrag nach der Retry-Zeit keine Ladeannahme
-    erzeugt hat, dürfen höchstens drei kurze ``cp_interrupt=true`` im
-    konfigurierten Mindestabstand folgen. Ein persistierter Receipt verhindert
-    einen Neustart des Zählers nach Manager-Neustarts.
+    Der erste positive Sollstrom wird immer zuerst gesendet. Benötigt das
+    wirksame Fahrzeugprofil eine CP-Unterbrechung, folgt der erste kurze
+    ``cp_interrupt=true`` im unmittelbar nächsten freien Ausgangszyklus. Nur
+    weitere erfolglose Wiederholungen warten den konfigurierten Retry-Abstand.
+    Ein persistierter Receipt verhindert einen Neustart des Zählers nach
+    Manager-Neustarts.
     """
 
     data = state_data if isinstance(state_data, dict) else {}
@@ -2074,15 +2087,6 @@ def start_wakeup_step_contract(
             "command_patch": command_patch,
         }
 
-    issue_age_s = max(0.0, now_value - issued_ts)
-    if issue_age_s < retry_s:
-        return {
-            **base,
-            "action": "allow_current_retry_window",
-            "reason": "await_charge_acceptance",
-            "command_patch": command_patch,
-        }
-
     if sent_count >= max_retries:
         return {
             **base,
@@ -2092,21 +2096,32 @@ def start_wakeup_step_contract(
             "state_patch": {"_openwb_pro_start_wakeup_pending": False},
         }
 
-    last_cp_ts = _safe_float(receipt.get("last_sent_ts"), 0.0) if receipt_matches else 0.0
-    if last_cp_ts > 0.0 and now_value - last_cp_ts < retry_s:
-        return {
-            **base,
-            "action": "allow_between_bounded_cp",
-            "reason": "bounded_cp_retry_interval",
-            "command_patch": {**command_patch, "_guard_allow_restart_after_stop": True},
-        }
-
     if not cp_capability.get("enabled", False):
         return {
             **base,
             "action": "allow_without_cp",
             "reason": str(cp_capability.get("reason") or "automatic_cp_disabled"),
             "command_patch": command_patch,
+        }
+
+    last_cp_ts = (
+        _safe_float(receipt.get("last_sent_ts"), 0.0)
+        if receipt_matches
+        else 0.0
+    )
+    if sent_count > 0 and last_cp_ts <= 0.0:
+        return {
+            **base,
+            "action": "allow_without_cp",
+            "reason": "cp_receipt_timestamp_missing",
+            "command_patch": {**command_patch, "_guard_allow_restart_after_stop": True},
+        }
+    if sent_count > 0 and now_value - last_cp_ts < retry_s:
+        return {
+            **base,
+            "action": "allow_between_bounded_cp",
+            "reason": "bounded_cp_retry_interval",
+            "command_patch": {**command_patch, "_guard_allow_restart_after_stop": True},
         }
 
     cp_state = st.get("cp_interrupt_isactive")
@@ -3554,7 +3569,7 @@ def mark_phase_wait(
     current_amp: Any = 0,
     now_ts: Any = None,
     config: Optional[Dict[str, Any]] = None,
-    charger_max_amp: Any = 32,
+    charger_max_amp: Any = 16,
 ) -> None:
     """Remember that openWB Pro is settling after a phasetarget command."""
 
@@ -3568,7 +3583,7 @@ def mark_phase_wait(
         import time
 
         now_value = time.time()
-    max_amp = max(6.0, _safe_float(charger_max_amp, 32.0))
+    max_amp = max(6.0, _safe_float(charger_max_amp, 16.0))
     amp_value = _safe_float(current_amp, 0.0)
     if amp_value >= 6.0:
         amp_value = round(max(6.0, min(max_amp, amp_value)), 1)

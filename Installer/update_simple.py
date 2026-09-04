@@ -100,6 +100,17 @@ PREJOURNAL_CONSTRUCTION_PATH = Path(
 )
 SERVICE_WRAPPER = Path("/usr/local/sbin/e3dc-service-control")
 WEB_UPDATE_LAUNCHER = Path("/usr/local/sbin/e3dc-web-update-launcher")
+RUNTIME_PERMISSIONS_LAUNCHER = Path(
+    "/usr/local/sbin/e3dc-runtime-permissions-repair"
+)
+RUNTIME_PERMISSIONS_CONTRACT = Path(
+    "/etc/e3dc-control/runtime_permissions_contract.json"
+)
+UPDATE_DRIFT_CONFIRM_ENV = "E3DC_UPDATE_CONFIRM_LOCAL_DRIFT"
+UPDATE_DRIFT_CONFIRM_FILE = Path(
+    "/run/e3dc-update-credentials/local-drift.token"
+)
+_UPDATE_DRIFT_CONFIRM_TOKEN: str | None = None
 SUDOERS_FILE = Path("/etc/sudoers.d/020_e3dc_services")
 ROLE_ANCHOR_FILE = Path("/etc/e3dc-control/instance_role.json")
 RAMDISK_PATH = Path("/var/www/html/ramdisk")
@@ -1126,18 +1137,22 @@ def _bind_role_context(
     return result
 
 
-def _validate_inputs(
-    target_root: Path,
-    release_root: Path,
-    install_user: str,
-    tag: str,
-) -> None:
+def _assert_root_update_authority() -> None:
     if os.geteuid() != 0:
         _fail(
             "E3DC-UPD-PRIV-001",
             "Der Updater läuft nicht mit Root-Rechten.",
             "Starte: sudo /bin/sh ./e3dc-update-bootstrap",
         )
+
+
+def _validate_inputs(
+    target_root: Path,
+    release_root: Path,
+    install_user: str,
+    tag: str,
+) -> None:
+    _assert_root_update_authority()
     if target_root in {Path("/"), Path("/home"), Path("/usr"), Path("/var")}:
         _fail(
             "E3DC-UPD-PATH-001",
@@ -3737,6 +3752,7 @@ def _render_service_unit(
     service_group: str = "www-data",
     start_condition: tuple[str, ...] = (),
     environment: tuple[str, ...] = (),
+    emergency_quiesce_gate: bool = False,
 ) -> bytes:
     """Rendert die wenigen Pflicht-Units ohne Prüfung des Altzustands."""
 
@@ -3755,6 +3771,15 @@ def _render_service_unit(
     if wants:
         unit_lines.append("Wants=" + " ".join(wants))
     unit_lines.append("After=" + " ".join(after_units))
+    if emergency_quiesce_gate:
+        from Installer.emergency_release import PERSISTENT_EMERGENCY_LATCH_PATH
+
+        unit_lines.append(
+            f"ConditionPathExists=!{PERSISTENT_EMERGENCY_LATCH_PATH}"
+        )
+        unit_lines.append(
+            f"ConditionPathIsSymbolicLink=!{PERSISTENT_EMERGENCY_LATCH_PATH}"
+        )
     if start_limit:
         unit_lines.extend(("StartLimitIntervalSec=300", "StartLimitBurst=3"))
 
@@ -3806,18 +3831,24 @@ def _replace_core_dropins(unit: str, payload: bytes | None) -> None:
             shutil.rmtree(directory)
         else:
             directory.unlink()
-    if payload is None:
-        return
-    directory.mkdir(parents=True, mode=0o755)
-    os.chown(directory, 0, 0)
-    os.chmod(directory, 0o755)
-    _atomic_write_file(
-        directory / "20-e3dc-ramdisk-tmpfs.conf",
-        payload,
-        uid=0,
-        gid=0,
-        mode=0o644,
-    )
+    if payload is not None:
+        directory.mkdir(parents=True, mode=0o755)
+        os.chown(directory, 0, 0)
+        os.chmod(directory, 0o755)
+        _atomic_write_file(
+            directory / "20-e3dc-ramdisk-tmpfs.conf",
+            payload,
+            uid=0,
+            gid=0,
+            mode=0o644,
+        )
+    if unit == "e3dc-storage-manager.service":
+        from Installer.emergency_release import ensure_persistent_emergency_start_veto
+
+        # Dieser root-eigene Drop-in liegt bewusst außerhalb des Releasebaums.
+        # Er wird nach jeder Drop-in-Projektion neu gebunden, damit selbst ein
+        # späterer Rücklauf auf eine alte ungated Unit den Latch nicht umgeht.
+        ensure_persistent_emergency_start_veto()
 
 
 def _probe_ramdisk_tmpfs() -> bool:
@@ -3937,6 +3968,7 @@ def _ensure_core_services(
             "after": ("e3dc-live.service",),
             "start_limit": True,
             "manager_lock": True,
+            "emergency_quiesce_gate": True,
         },
         {
             "unit": "e3dc-websocket.service",
@@ -4017,6 +4049,7 @@ def _ensure_core_services(
             documentation=str(spec.get("documentation") or ""),
             syslog_identifier=str(spec.get("syslog") or ""),
             start_condition=start_condition,
+            emergency_quiesce_gate=bool(spec.get("emergency_quiesce_gate")),
         )
         _atomic_write_file(
             Path("/etc/systemd/system") / str(spec["unit"]),
@@ -4483,6 +4516,8 @@ def _permission_contract_for_preserved_entry(
             return www_uid, www_gid, 0o700, 0o600
         if relative[:2] == ("config_backups", "aux_inverter_migration"):
             return install_uid, www_gid, 0o700, 0o600
+        if relative == (".e3dc_v4.transaction.lock",):
+            return www_uid, www_gid, data_dir_mode, 0o660
         if relative in {
             ("wallbox_mode5_user_start_request.json",),
             ("wallbox_mode5_user_start_request.json.lock",),
@@ -4656,6 +4691,17 @@ def _normalize_preserved_web_permissions(
                     continue
                 child = os.stat(child_name, dir_fd=descriptor, follow_symlinks=False)
                 child_relative = (*relative, child_name)
+                if (
+                    top_name == "data"
+                    and child_relative == (".e3dc_v4.transaction.lock",)
+                    and (
+                        not stat.S_ISREG(child.st_mode)
+                        or child.st_nlink != 1
+                    )
+                ):
+                    raise RuntimeError(
+                        "Config-Transaktionslock ist keine reguläre Einzeldatei"
+                    )
                 uid, gid, dir_mode, file_mode = _permission_contract_for_preserved_entry(
                     top_name,
                     child_relative,
@@ -5394,6 +5440,296 @@ def _release_script(path: Path, *, label: str) -> bytes:
     return payload
 
 
+def _release_python_script(path: Path, *, label: str) -> bytes:
+    payload = path.read_bytes()
+    if (
+        not payload.startswith(b"#!/usr/bin/python3\n")
+        or b"\r" in payload
+        or len(payload) > 512 * 1024
+    ):
+        raise RuntimeError(f"{label}-Vorlage im Ziel-Release ist ungültig")
+    try:
+        compile(payload.decode("utf-8", errors="strict"), str(path), "exec")
+    except (SyntaxError, UnicodeError) as exc:
+        raise RuntimeError(f"{label}-Vorlage besitzt ungültigen Python-Code") from exc
+    if (
+        payload.count(b'e3dc_runtime_permissions_v1') != 1
+        or payload.count(b'e3dc_runtime_permissions_cli_v3') != 1
+    ):
+        raise RuntimeError(f"{label}-Vorlage besitzt keinen eindeutigen Vertragsmarker")
+    return payload
+
+
+def _stable_file_evidence(path: Path) -> tuple[str, int]:
+    before = path.stat(follow_symlinks=False)
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    after = path.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    ):
+        raise RuntimeError(f"Release-Datei driftete bei der Rechteinventur: {path}")
+    return digest.hexdigest(), int(after.st_size)
+
+
+def _runtime_permissions_contract_payload(
+    release_root: Path,
+    target_root: Path,
+    install_user: str,
+    config: dict,
+    *,
+    web_program_files: tuple[str, ...],
+    web_program_directories: tuple[str, ...],
+) -> bytes:
+    """Versiegelt ausschließlich bekannte Produkt- und feste Runtime-Pfade."""
+
+    from Installer.config_secret_permissions import (
+        config_secret_dir_mode,
+        config_secret_file_mode,
+    )
+
+    release_root = release_root.resolve(strict=True)
+    install_entries: list[dict[str, object]] = []
+    generated_directory_names = frozenset(
+        {"__pycache__", ".pytest_cache", ".venv", "node_modules"}
+    )
+
+    def walk_release(directory: Path, relative: tuple[str, ...]) -> None:
+        for entry in sorted(os.scandir(directory), key=lambda item: item.name):
+            if not relative and entry.name == ".git":
+                continue
+            if entry.name in generated_directory_names:
+                continue
+            if entry.name.endswith((".pyc", ".pyo")):
+                continue
+            metadata = entry.stat(follow_symlinks=False)
+            child = (*relative, entry.name)
+            projected = "/".join(child)
+            source = directory / entry.name
+            if stat.S_ISDIR(metadata.st_mode):
+                install_entries.append(
+                    {
+                        "path": projected,
+                        "kind": "directory",
+                        "owner": "install",
+                        "group": "www-data",
+                        "mode": 0o755,
+                    }
+                )
+                walk_release(source, child)
+            elif stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1:
+                with source.open("rb") as handle:
+                    executable = handle.read(2) == b"#!"
+                source_sha256, source_size = _stable_file_evidence(source)
+                install_entries.append(
+                    {
+                        "path": projected,
+                        "kind": "file",
+                        "owner": "install",
+                        "group": "www-data",
+                        "mode": 0o755 if executable else 0o644,
+                        "sha256": source_sha256,
+                        "size": source_size,
+                    }
+                )
+            elif stat.S_ISLNK(metadata.st_mode):
+                # Release-Symlinks bleiben bewusst außerhalb des schreibenden
+                # Metadatenpfads; der Voll-Updater bindet sie separat.
+                continue
+            else:
+                raise RuntimeError(
+                    f"Ziel-Release enthält einen unsicheren Inventarpfad: {source}"
+                )
+
+    walk_release(release_root, ())
+
+    web_entries: list[dict[str, object]] = []
+    for relative in web_program_directories:
+        web_entries.append(
+            {
+                "path": relative,
+                "kind": "directory",
+                "owner": "install",
+                "group": "www-data",
+                "mode": 0o755,
+            }
+        )
+    for relative in web_program_files:
+        source = (
+            release_root / relative
+            if relative in {"VERSION", "CHANGELOG.md", "UPDATE_POLICY.json"}
+            else release_root / "html" / relative
+        )
+        source_sha256, source_size = _stable_file_evidence(source)
+        web_entries.append(
+            {
+                "path": relative,
+                "kind": "file",
+                "owner": "install",
+                "group": "www-data",
+                "mode": 0o644,
+                "sha256": source_sha256,
+                "size": source_size,
+            }
+        )
+
+    secret_dir_mode = int(config_secret_dir_mode(config))
+    secret_file_mode = int(config_secret_file_mode(config))
+    contract = {
+        "schema": "e3dc_runtime_permissions_v1",
+        "launcher_feature": "e3dc_runtime_permissions_cli_v3",
+        "install_user": install_user,
+        "install_root": str(target_root),
+        "roots": [
+            {
+                "path": str(target_root),
+                "owner": "install",
+                "group": "www-data",
+                "mode": 0o755,
+                "entries": install_entries,
+            },
+            {
+                "path": "/var/www/html",
+                "owner": "root",
+                "group": "www-data",
+                "mode": 0o755,
+                "entries": web_entries,
+            },
+            {
+                "path": "/var/www/html/data",
+                "owner": "install",
+                "group": "www-data",
+                "mode": secret_dir_mode,
+                "entries": [
+                    {
+                        "path": "e3dc_v4.json",
+                        "kind": "file",
+                        "owner": "install",
+                        "group": "www-data",
+                        "mode": secret_file_mode,
+                        "optional": True,
+                    },
+                    {
+                        "path": ".e3dc_v4.transaction.lock",
+                        "kind": "file",
+                        "owner": "www-data",
+                        "group": "www-data",
+                        "mode": 0o660,
+                        "optional": True,
+                    },
+                    {
+                        "path": "wallbox_mode5_user_start_request.json",
+                        "kind": "file",
+                        "owner": "www-data",
+                        "group": "www-data",
+                        "mode": 0o660,
+                        "optional": True,
+                    },
+                    {
+                        "path": "wallbox_mode5_user_start_request.json.lock",
+                        "kind": "file",
+                        "owner": "www-data",
+                        "group": "www-data",
+                        "mode": 0o660,
+                        "optional": True,
+                    },
+                    {
+                        "path": "external_pv_topology.json",
+                        "kind": "file",
+                        "owner": "install",
+                        "group": "www-data",
+                        "mode": 0o664,
+                        "optional": True,
+                    },
+                ],
+            },
+            {
+                "path": "/var/www/html/logs",
+                "owner": "install",
+                "group": "www-data",
+                "mode": 0o2775,
+                "entries": [],
+            },
+            {
+                "path": "/var/www/html/ramdisk",
+                "owner": "install",
+                "group": "www-data",
+                "mode": 0o2775,
+                "entries": [
+                    {
+                        "path": "manual_soc_wb1.json",
+                        "kind": "file",
+                        "owner": "install",
+                        "group": "www-data",
+                        "mode": 0o664,
+                        "optional": True,
+                    },
+                    {
+                        "path": "manual_soc_wb2.json",
+                        "kind": "file",
+                        "owner": "install",
+                        "group": "www-data",
+                        "mode": 0o664,
+                        "optional": True,
+                    },
+                ],
+            },
+            {
+                "path": "/var/www/html/tmp",
+                "owner": "install",
+                "group": "www-data",
+                "mode": 0o2775,
+                "entries": [
+                    {
+                        "path": "car_charge_session.json",
+                        "kind": "file",
+                        "owner": "install",
+                        "group": "www-data",
+                        "mode": 0o664,
+                        "optional": True,
+                    },
+                    {
+                        "path": "car_charge_session_wb2.json",
+                        "kind": "file",
+                        "owner": "install",
+                        "group": "www-data",
+                        "mode": 0o664,
+                        "optional": True,
+                    },
+                    {
+                        "path": "vital_stats.lock",
+                        "kind": "file",
+                        "owner": "install",
+                        "group": "www-data",
+                        "mode": 0o664,
+                        "optional": True,
+                    },
+                ],
+            },
+        ],
+    }
+    roots = contract["roots"]
+    entry_count = sum(len(root.get("entries", ())) for root in roots)
+    if len(roots) > 8 or entry_count > 5000:
+        raise RuntimeError(
+            "Rechtevertrag überschreitet die feste Wurzel- oder Positivlistengrenze"
+        )
+    payload = (json.dumps(contract, ensure_ascii=False, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    if len(payload) > 1024 * 1024:
+        raise RuntimeError("Rechtevertrag überschreitet die sichere Größenbegrenzung")
+    return payload
+
+
 def _validate_service_wrapper_embedded_python(payload: bytes) -> None:
     """Kompiliert den privilegierten Inline-Pythonblock zusätzlich zu bash -n."""
 
@@ -5418,6 +5754,10 @@ def _install_privileged_entrypoints(
     release_root: Path,
     target_root: Path,
     install_user: str,
+    config: dict,
+    *,
+    web_program_files: tuple[str, ...],
+    web_program_directories: tuple[str, ...],
 ) -> list[str]:
     """Installiert Launcher und sudoers direkt aus dem Ziel-Release, nie aus Nutzer-Git."""
 
@@ -5429,6 +5769,9 @@ def _install_privileged_entrypoints(
                 SERVICE_WRAPPER.parent,
                 WEB_UPDATE_LAUNCHER.parent.parent,
                 WEB_UPDATE_LAUNCHER.parent,
+                RUNTIME_PERMISSIONS_LAUNCHER.parent.parent,
+                RUNTIME_PERMISSIONS_LAUNCHER.parent,
+                RUNTIME_PERMISSIONS_CONTRACT.parent,
             },
             key=lambda path: len(path.parts),
         )
@@ -5463,6 +5806,18 @@ def _install_privileged_entrypoints(
         user_marker,
         _canonical_shell_literal(install_user),
     )
+    permissions_payload = _release_python_script(
+        release_root / "Installer/runtime_permissions_repair.py",
+        label="Rechte-Launcher",
+    )
+    permissions_contract_payload = _runtime_permissions_contract_payload(
+        release_root,
+        target_root,
+        install_user,
+        config,
+        web_program_files=web_program_files,
+        web_program_directories=web_program_directories,
+    )
 
     for path, payload, label in (
         (SERVICE_WRAPPER, service_payload, "Service-Launcher"),
@@ -5481,6 +5836,34 @@ def _install_privileged_entrypoints(
             or stat.S_IMODE(metadata.st_mode) != 0o755
         ):
             raise RuntimeError(f"{label} blieb nach der automatischen Rechtereparatur unsicher")
+
+    _atomic_write_file(
+        RUNTIME_PERMISSIONS_LAUNCHER,
+        permissions_payload,
+        uid=0,
+        gid=0,
+        mode=0o755,
+    )
+    _atomic_write_file(
+        RUNTIME_PERMISSIONS_CONTRACT,
+        permissions_contract_payload,
+        uid=0,
+        gid=0,
+        mode=0o644,
+    )
+    for path, mode, label in (
+        (RUNTIME_PERMISSIONS_LAUNCHER, 0o755, "Rechte-Launcher"),
+        (RUNTIME_PERMISSIONS_CONTRACT, 0o644, "Rechtevertrag"),
+    ):
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) != mode
+        ):
+            raise RuntimeError(f"{label} blieb nach der Installation unsicher")
 
     from Installer.service_catalog import allowed_services
 
@@ -5510,6 +5893,11 @@ def _install_privileged_entrypoints(
     sudoers_lines.extend(
         (
             f'www-data ALL=(root) NOPASSWD: {WEB_UPDATE_LAUNCHER} ""',
+            f'www-data ALL=(root) NOPASSWD: {WEB_UPDATE_LAUNCHER} --check-local-drift-json',
+            f'www-data ALL=(root) NOPASSWD: {WEB_UPDATE_LAUNCHER} --confirm-local-drift',
+            f'www-data ALL=(root) NOPASSWD: {RUNTIME_PERMISSIONS_LAUNCHER} --check-json',
+            f'www-data ALL=(root) NOPASSWD: {RUNTIME_PERMISSIONS_LAUNCHER} ""',
+            f'www-data ALL=(root) NOPASSWD: {RUNTIME_PERMISSIONS_LAUNCHER} --confirm-content-drift',
             f'{install_user} ALL=(root) NOPASSWD: {WEB_UPDATE_LAUNCHER} ""',
             "",
         )
@@ -5635,7 +6023,16 @@ def _repair_units_and_permissions(
         )
     _validate_live_install_context(target_root)
     _assert_named_directory_binding(target_binding)
-    warnings.extend(_install_privileged_entrypoints(release_root, target_root, install_user))
+    warnings.extend(
+        _install_privileged_entrypoints(
+            release_root,
+            target_root,
+            install_user,
+            config,
+            web_program_files=tuple(web_program_files or ()),
+            web_program_directories=tuple(web_program_directories or ()),
+        )
+    )
 
     apache_source = release_root / "Installer/apache/e3dc-control-security.conf"
     apache_target = Path("/etc/apache2/conf-available/e3dc-control-security.conf")
@@ -5896,6 +6293,235 @@ def _services_to_disable_after_success(
     return tuple(sorted(units))
 
 
+def _emergency_storage_latch_present() -> bool:
+    from Installer.emergency_release import emergency_latch_present
+
+    return emergency_latch_present()
+
+
+def _required_services_with_emergency_veto(
+    required: Iterable[str],
+) -> tuple[set[str], bool]:
+    effective = {_normalize_unit(unit) for unit in required}
+    latched = _emergency_storage_latch_present()
+    if latched:
+        effective.discard("e3dc-storage-manager.service")
+    return effective, latched
+
+
+def _probe_emergency_storage_writer_state() -> tuple[str, str]:
+    """Beweist den Storage-Stillstand ohne die globale Aktivsemantik zu ändern."""
+
+    unit = "e3dc-storage-manager.service"
+    try:
+        result = _run(
+            [
+                "/usr/bin/systemctl",
+                "show",
+                "--no-pager",
+                "--property=ActiveState",
+                "--property=SubState",
+                "--property=MainPID",
+                "--property=ControlPID",
+                unit,
+            ],
+            timeout=20,
+        )
+    except Exception as exc:
+        return "unknown", str(exc).strip() or exc.__class__.__name__
+    detail = (result.stderr or result.stdout or f"Exit {result.returncode}").strip()
+    if result.returncode != 0:
+        return "unknown", detail
+
+    values: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key in {
+            "ActiveState",
+            "SubState",
+            "MainPID",
+            "ControlPID",
+        }:
+            values[key] = value.strip()
+    if set(values) != {"ActiveState", "SubState", "MainPID", "ControlPID"}:
+        return "unknown", "systemctl show lieferte keinen vollständigen Zustandsvertrag"
+    try:
+        main_pid = int(values["MainPID"])
+        control_pid = int(values["ControlPID"])
+    except (TypeError, ValueError):
+        return "unknown", "systemctl show lieferte keine gültigen Prozess-IDs"
+    if main_pid < 0 or control_pid < 0:
+        return "unknown", "systemctl show lieferte negative Prozess-IDs"
+
+    active = values["ActiveState"].lower()
+    sub = values["SubState"].lower()
+    state_detail = (
+        f"{active}/{sub}, MainPID={main_pid}, ControlPID={control_pid}"
+    )
+    if (
+        active == "inactive"
+        and sub in {"dead", "exited"}
+        and main_pid == 0
+        and control_pid == 0
+    ):
+        return "inactive", state_detail
+    if active in {
+        "active",
+        "activating",
+        "deactivating",
+        "failed",
+        "reloading",
+        "maintenance",
+        "inactive",
+    } or main_pid > 0 or control_pid > 0:
+        return "not-inactive", state_detail
+    return "unknown", state_detail
+
+
+def _require_emergency_storage_writer_inactive(
+    *,
+    code: str,
+    phase: str,
+) -> None:
+    """Akzeptiert bei aktivem Incident ausschließlich belegten Writer-Stillstand."""
+
+    writer_state, writer_detail = _probe_emergency_storage_writer_state()
+    if writer_state == "inactive":
+        return
+    if writer_state == "unknown":
+        happened = (
+            f"Der Emergency-Latch ist aktiv, aber der Storage-Writer ist {phase} "
+            f"nicht sicher lesbar: {writer_detail}"
+        )
+    else:
+        happened = (
+            f"Der Storage-Writer ist trotz aktivem Emergency-Latch {phase} "
+            f"nicht nachweislich stillgesetzt: {writer_detail}"
+        )
+    _fail(
+        code,
+        happened,
+        "Der Incident bleibt verriegelt. Prüfe systemctl show "
+        "e3dc-storage-manager.service sowie die lokale systemd-/DBus-Verbindung; "
+        "führe keinen manuellen Hardwarebefehl aus.",
+        system_state=(
+            "Der persistente Incident-Latch bleibt aktiv; der Storage-Writer-"
+            "Stillstand ist jedoch unbestätigt und der Updatepfad wurde "
+            "fail-closed angehalten."
+        ),
+    )
+
+
+def _prepare_active_emergency_veto_before_update() -> bool:
+    """Bindet einen vorhandenen Incident vor Backup und Versionswechsel."""
+
+    if not _emergency_storage_latch_present():
+        return False
+    from Installer.emergency_release import ensure_persistent_emergency_start_veto
+
+    try:
+        ensure_persistent_emergency_start_veto()
+    except Exception as exc:
+        _fail(
+            "E3DC-UPD-EMERGENCY-000",
+            f"Der aktive Emergency-Latch konnte nicht an seinen root-eigenen Startschutz gebunden werden: {exc}",
+            "Prüfe Eigentümer, Modus und Inhalt von /etc/systemd/system-generators/e3dc-emergency-quiesce-generator sowie dem Storage-Drop-in; der Incident-Latch darf nicht entfernt werden.",
+            system_state=(
+                "Der Incident-Latch ist aktiv. Seine rebootfeste systemd-Sperre "
+                "und der Stillstand des Storage-Writers sind noch nicht bestätigt; "
+                "Produktdateien wurden nicht verändert."
+            ),
+        )
+    reloaded = _run(["/usr/bin/systemctl", "daemon-reload"], timeout=60)
+    if reloaded.returncode != 0:
+        _fail(
+            "E3DC-UPD-EMERGENCY-001",
+            "Der persistente Emergency-Startschutz konnte nicht in systemd geladen werden.",
+            "Prüfe systemctl daemon-reload und den root-eigenen Drop-in von e3dc-storage-manager.service; der Incident-Latch bleibt aktiv.",
+            system_state=(
+                "Der Incident-Latch ist aktiv und der Startschutz wurde auf Platte "
+                "projiziert, seine systemd-Wirksamkeit sowie der Writer-Stillstand "
+                "sind jedoch unbestätigt; Produktdateien wurden nicht verändert."
+            ),
+        )
+    writer_state, writer_detail = _probe_emergency_storage_writer_state()
+    if writer_state == "unknown":
+        _fail(
+            "E3DC-UPD-EMERGENCY-003",
+            "Der Emergency-Latch ist aktiv, aber der Zustand des Storage-Writers "
+            f"konnte nicht sicher gelesen werden: {writer_detail}",
+            "Der Incident bleibt verriegelt. Prüfe systemctl show "
+            "e3dc-storage-manager.service und die lokale systemd-/DBus-Verbindung; "
+            "führe keinen manuellen Hardwarebefehl aus.",
+            system_state=(
+                "Der Incident-Latch und sein systemd-Startschutz sind aktiv, "
+                "der Stillstand des Storage-Writers ist jedoch unbestätigt; "
+                "Produktdateien wurden nicht verändert."
+            ),
+        )
+    if writer_state != "inactive":
+        stopped = _run(
+            ["/usr/bin/systemctl", "stop", "e3dc-storage-manager.service"],
+            timeout=90,
+        )
+        writer_state, writer_detail = _probe_emergency_storage_writer_state()
+        if stopped.returncode != 0 or writer_state != "inactive":
+            stop_detail = (
+                stopped.stderr or stopped.stdout or f"Exit {stopped.returncode}"
+            ).strip()
+            _fail(
+                "E3DC-UPD-EMERGENCY-002",
+                "Der Emergency-Latch ist aktiv, aber der Storage-Writer ließ sich "
+                f"nicht nachweislich stillsetzen ({writer_detail}; {stop_detail}).",
+                "Der Incident bleibt verriegelt. Prüfe sudo systemctl status e3dc-storage-manager.service und führe keinen manuellen Hardwarebefehl aus.",
+                system_state=(
+                    "Der Incident-Latch und sein systemd-Startschutz sind aktiv, "
+                    "der Storage-Writer kann aber weiterhin laufen; Produktdateien "
+                    "wurden nicht verändert."
+                ),
+            )
+    print(
+        "[INFO] Emergency-Quiesce ist aktiv: Der Storage-Writer bleibt beim "
+        "Update und bei einem Rücklauf absichtlich gesperrt.",
+        flush=True,
+    )
+    return True
+
+
+def _rebind_active_emergency_veto_for_recovery() -> tuple[bool, str]:
+    """Hält den Incident auch bei unvollständigem Versionsrücklauf monoton."""
+
+    if not _emergency_storage_latch_present():
+        return True, ""
+    try:
+        from Installer.emergency_release import ensure_persistent_emergency_start_veto
+
+        ensure_persistent_emergency_start_veto()
+        reloaded = _run(["/usr/bin/systemctl", "daemon-reload"], timeout=60)
+        if reloaded.returncode != 0:
+            raise RuntimeError("systemd daemon-reload fehlgeschlagen")
+        writer_state, writer_detail = _probe_emergency_storage_writer_state()
+        if writer_state == "unknown":
+            raise RuntimeError(
+                "Storage-Writer-Zustand blieb trotz Incident unbestätigt: "
+                + writer_detail
+            )
+        if writer_state != "inactive":
+            stopped = _run(
+                ["/usr/bin/systemctl", "stop", "e3dc-storage-manager.service"],
+                timeout=90,
+            )
+            writer_state, writer_detail = _probe_emergency_storage_writer_state()
+            if stopped.returncode != 0 or writer_state != "inactive":
+                raise RuntimeError(
+                    "Storage-Writer blieb trotz Incident unbestätigt: "
+                    + writer_detail
+                )
+    except Exception as exc:
+        return False, str(exc).strip() or exc.__class__.__name__
+    return True, ""
+
+
 def _start_services(
     services: tuple[str, ...],
     *,
@@ -5918,8 +6544,18 @@ def _start_services(
     masked = {_normalize_unit(unit) for unit in masked_units}
     required_set = (set(required) | {"apache2.service"}) - masked
     enable_set = set(enable_services) - masked
+    storage_unit = "e3dc-storage-manager.service"
     for unit in services:
         if unit in masked:
+            continue
+        if unit == storage_unit and _emergency_storage_latch_present():
+            # Unmittelbar vor dem Zielstart zählt der persistente Incident als
+            # absichtliche Writersperre, nicht als fehlgeschlagener Pflichtstart.
+            required_set.discard(storage_unit)
+            _require_emergency_storage_writer_inactive(
+                code="E3DC-UPD-EMERGENCY-005",
+                phase="unmittelbar vor dem Zielstart",
+            )
             continue
         if not _service_exists(unit):
             if unit in required_set:
@@ -5991,12 +6627,22 @@ def _final_confirmation(
 
     masked = {_normalize_unit(unit) for unit in masked_units}
     required = (set(required_services) | {"apache2.service"}) - masked
+    storage_unit = "e3dc-storage-manager.service"
     forbidden = {_normalize_unit(unit) for unit in forbidden_services}
     pending = set(required)
+    effective_required = set(required)
     deadline = time.monotonic() + 30.0
     green_since: float | None = None
     stable = False
     while time.monotonic() < deadline:
+        effective_required, emergency_latched = _required_services_with_emergency_veto(
+            required
+        )
+        if emergency_latched:
+            _require_emergency_storage_writer_inactive(
+                code="E3DC-UPD-EMERGENCY-004",
+                phase="während der Abschlussprüfung",
+            )
         competing = {unit for unit in forbidden if _service_active(unit)}
         if competing:
             unit = sorted(competing)[0]
@@ -6006,8 +6652,18 @@ def _final_confirmation(
                 + ", ".join(sorted(competing)),
                 f"Stoppe und deaktiviere ihn mit: sudo systemctl disable --now {unit}",
             )
-        pending = {unit for unit in required if not _service_active(unit)}
-        if required_writer_admission_mode:
+        pending = {
+            unit for unit in effective_required if not _service_active(unit)
+        }
+        role_service = ROLE_SERVICE_BY_MODE.get(required_writer_admission_mode)
+        writer_admission_required = bool(
+            required_writer_admission_mode
+            and any(
+                unit not in {role_service, "apache2.service"}
+                for unit in effective_required
+            )
+        )
+        if writer_admission_required:
             try:
                 from Installer.ha_writer_admission import evaluate_writer_admission
 
@@ -6028,7 +6684,7 @@ def _final_confirmation(
             break
         time.sleep(1.0)
     if not stable:
-        unstable = sorted(pending or required)
+        unstable = sorted(pending or effective_required)
         unit = (
             "e3dc-ha.service"
             if "HA-Schreiberfreigabe" in unstable
@@ -6198,6 +6854,14 @@ def _start_previous_services_best_effort(
 ) -> tuple[str, ...]:
     from Installer.service_catalog import allowed_services
 
+    storage_unit = "e3dc-storage-manager.service"
+    if _emergency_storage_latch_present():
+        from Installer.emergency_release import ensure_persistent_emergency_start_veto
+
+        # Ein Backup kann eine alte Storage-Unit samt altem Drop-in-Verzeichnis
+        # restaurieren. Vor daemon-reload wird das versionsunabhängige Veto
+        # deshalb erneut projiziert.
+        ensure_persistent_emergency_start_veto()
     restartable = {_normalize_unit(item) for item in allowed_services()}
     catalog = set(restartable)
     restartable.update(EXPLICIT_CUTOVER_SERVICES)
@@ -6226,6 +6890,8 @@ def _start_previous_services_best_effort(
         and _service_exists(unit)
     }
     for unit in ordered:
+        if unit == storage_unit and _emergency_storage_latch_present():
+            continue
         if unit in restartable and _service_exists(unit):
             # Ein fehlgeschlagener Zielstart darf den bestätigten Altstand
             # nicht anschließend über systemds StartLimit blockieren.
@@ -6233,6 +6899,19 @@ def _start_previous_services_best_effort(
     for unit in ordered:
         if unit not in restartable:
             continue
+        if unit == storage_unit and _emergency_storage_latch_present():
+            # Live-Recheck unmittelbar vor dem Rücklaufstart: Der frühere
+            # Aktivzustand wird bei aktivem Incident bewusst nicht restauriert.
+            # Falls der Latch erst nach Eintritt in diese Funktion entstand,
+            # muss auch das versionsunabhängige Reboot-Veto jetzt noch gebunden
+            # werden; ein bloßes Überspringen dieses einen Starts wäre nicht
+            # rollbackfest.
+            veto_ok, _veto_detail = _rebind_active_emergency_veto_for_recovery()
+            if not veto_ok:
+                failed.append(unit)
+                continue
+            if _emergency_storage_latch_present():
+                continue
         if not exact_prestate and role and unit in role_units and unit != selected_role_service:
             continue
         if not exact_prestate and role in {"master", "slave", "shadow"}:
@@ -6480,6 +7159,7 @@ def _restore_preupdate_state(
             assert_product_identity()
     except Exception as exc:
         detail = str(exc).strip() or exc.__class__.__name__
+        veto_ok, veto_detail = _rebind_active_emergency_veto_for_recovery()
         traversal_detail = (
             "; frühere Pfad-Traversierrechte blieben ebenfalls abweichend: "
             + traversal_restore_error
@@ -6492,7 +7172,22 @@ def _restore_preupdate_state(
             f"Daten-Nachsicherung blieb unvollständig ({detail}). Die E3DC-Control-"
             "Dienste bleiben gestoppt"
             + traversal_detail
+            + (
+                "; der persistente Emergency-Startschutz blieb ebenfalls unbestätigt: "
+                + veto_detail
+                if not veto_ok
+                else ""
+            )
             + ".",
+        )
+
+    veto_ok, veto_detail = _rebind_active_emergency_veto_for_recovery()
+    if not veto_ok:
+        return (
+            False,
+            "Der gesicherte Datei- und Webstand wurde wiederhergestellt, aber der "
+            "persistente Emergency-Startschutz konnte vor keinem weiteren "
+            f"Dienststart bestätigt werden ({veto_detail}). Die Dienste bleiben gestoppt.",
         )
 
     if traversal_restore_error:
@@ -6576,10 +7271,17 @@ def _restore_preupdate_state(
             "wiederhergestellt; folgende zuvor aktive Dienste starteten jedoch nicht: "
             + ", ".join(start_failed),
         )
+    emergency_detail = (
+        " Der Storage-Writer blieb wegen des weiterhin aktiven Emergency-Latch "
+        "absichtlich gesperrt."
+        if _emergency_storage_latch_present()
+        else ""
+    )
     return (
         True,
         "Der gesicherte Produktstand einschließlich der ruhenden Nutzerdaten und "
-        "der zuvor aktive rollenrichtige Dienstsatz wurden wiederhergestellt.",
+        "der zuvor aktive rollenrichtige Dienstsatz wurden wiederhergestellt."
+        + emergency_detail,
     )
 
 
@@ -6679,13 +7381,216 @@ def _safe_recover_failed_cutover(**kwargs: object) -> tuple[str, str | None]:
         return _recover_failed_cutover(**kwargs)  # type: ignore[arg-type]
     except Exception as exc:
         detail = str(exc).strip() or exc.__class__.__name__
+        veto_ok, veto_detail = _rebind_active_emergency_veto_for_recovery()
         return (
             "Der automatische Rücklauf konnte nicht vollständig ausgeführt werden "
             f"({detail}). E3DC-Control-Dienste können gestoppt sein. Vollbackup: "
             f"{kwargs.get('backup_path') or 'nicht verfügbar'}; ruhende "
-            f"Daten-Nachsicherung: {kwargs.get('quiesced_backup') or 'nicht verfügbar'}",
+            f"Daten-Nachsicherung: {kwargs.get('quiesced_backup') or 'nicht verfügbar'}"
+            + (
+                "; der persistente Emergency-Startschutz blieb unbestätigt: "
+                + veto_detail
+                if not veto_ok
+                else ""
+            ),
             "Starte denselben Ein-Datei-Updater erneut; er repariert den Zielstand aus dem veröffentlichten Release.",
         )
+
+
+def _consume_update_drift_confirmation_token(confirmation: str) -> str:
+    """Liest die root-eigene Einmal-Credential ohne argv-/Log-Offenlegung."""
+
+    global _UPDATE_DRIFT_CONFIRM_TOKEN
+    if _UPDATE_DRIFT_CONFIRM_TOKEN is not None:
+        return _UPDATE_DRIFT_CONFIRM_TOKEN
+    if confirmation != "1":
+        _UPDATE_DRIFT_CONFIRM_TOKEN = ""
+        return ""
+    parent = UPDATE_DRIFT_CONFIRM_FILE.parent
+    try:
+        runtime_parent_metadata = os.lstat(parent.parent)
+        parent_metadata = os.lstat(parent)
+        metadata = os.lstat(UPDATE_DRIFT_CONFIRM_FILE)
+    except OSError:
+        _fail(
+            "E3DC-UPD-DRIFT-002",
+            "Die private Dateilistenbindung der Driftfreigabe fehlt.",
+            "Starte die Nur-Lese-Prüfung erneut und übergib deren Token per "
+            "Standardeingabe an den veröffentlichten Launcher.",
+        )
+    if (
+        not stat.S_ISDIR(runtime_parent_metadata.st_mode)
+        or stat.S_ISLNK(runtime_parent_metadata.st_mode)
+        or runtime_parent_metadata.st_uid != 0
+        or runtime_parent_metadata.st_gid != 0
+        or stat.S_IMODE(runtime_parent_metadata.st_mode) & 0o022
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or stat.S_ISLNK(parent_metadata.st_mode)
+        or parent_metadata.st_uid != 0
+        or parent_metadata.st_gid != 0
+        or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+        or not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_size != 65
+    ):
+        _fail(
+            "E3DC-UPD-DRIFT-002",
+            "Die private Dateilistenbindung besitzt unsichere Metadaten.",
+            "Verwirf den fehlerhaften Updateauftrag und starte die Nur-Lese-Prüfung erneut.",
+        )
+    descriptor = os.open(
+        UPDATE_DRIFT_CONFIRM_FILE,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        payload = os.read(descriptor, 66)
+        rebound = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    named = os.stat(UPDATE_DRIFT_CONFIRM_FILE, follow_symlinks=False)
+    if (
+        (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+        != (rebound.st_dev, rebound.st_ino, rebound.st_size, rebound.st_mtime_ns)
+        or (rebound.st_dev, rebound.st_ino) != (named.st_dev, named.st_ino)
+    ):
+        _fail(
+            "E3DC-UPD-DRIFT-002",
+            "Die private Dateilistenbindung driftete beim Lesen.",
+            "Starte die Nur-Lese-Prüfung erneut.",
+        )
+    try:
+        UPDATE_DRIFT_CONFIRM_FILE.unlink()
+    except OSError:
+        _fail(
+            "E3DC-UPD-DRIFT-002",
+            "Die Einmal-Credential konnte nach dem Lesen nicht verworfen werden.",
+            "Prüfe /run/e3dc-update-credentials und starte danach erneut.",
+        )
+    try:
+        token = payload.decode("ascii", errors="strict").removesuffix("\n")
+    except UnicodeError:
+        token = ""
+    if (
+        len(payload) != 65
+        or not payload.endswith(b"\n")
+        or len(token) != 64
+        or any(character not in "0123456789abcdef" for character in token)
+    ):
+        _fail(
+            "E3DC-UPD-DRIFT-002",
+            "Die Dateilistenbindung der Driftfreigabe ist ungültig.",
+            "Starte die Nur-Lese-Prüfung erneut und bestätige genau deren aktuelle Dateiliste.",
+        )
+    _UPDATE_DRIFT_CONFIRM_TOKEN = token
+    return token
+
+
+def _verify_update_drift_authority(
+    target_root: Path,
+    release_root: Path,
+    *,
+    phase: str,
+    emit_details: bool,
+) -> dict:
+    """Bindet die Überschreibfreigabe exakt an Release, Liste und Fingerprints."""
+
+    from Installer.update_drift import inspect_update_drift
+
+    confirmation = str(os.environ.get(UPDATE_DRIFT_CONFIRM_ENV) or "0")
+    if confirmation not in {"0", "1"}:
+        _fail(
+            "E3DC-UPD-DRIFT-002",
+            "Die Freigabe lokaler Inhaltsabweichungen besitzt einen ungültigen Wert.",
+            "Starte den veröffentlichten Updater ohne fremde Umgebungsvariablen erneut.",
+        )
+    confirmation_token = _consume_update_drift_confirmation_token(confirmation)
+
+    drift_result = inspect_update_drift(
+        target_root=target_root,
+        release_root=release_root,
+    )
+    baseline_complete = bool(drift_result.get("baseline_complete"))
+    missing_files = list(drift_result.get("missing_product_files") or ())
+    content_drift = list(drift_result.get("content_drift") or ())
+    requires_confirmation = bool(drift_result.get("requires_confirmation"))
+    expected_confirmation_token = str(
+        drift_result.get("confirmation_token") or ""
+    )
+
+    if emit_details and missing_files:
+        print(
+            f"[INFO] {len(missing_files)} veröffentlichte Produktdatei(en) "
+            "fehlen und werden aus dem Zielrelease wiederhergestellt:",
+            flush=True,
+        )
+        for item in missing_files:
+            print(f"  - {item.get('path', '')}", flush=True)
+    if emit_details and content_drift:
+        print(
+            f"[WARNUNG] {len(content_drift)} lokal veränderte oder "
+            "kollidierende Produktdatei(en) würden durch das Zielrelease "
+            "ersetzt oder als ausdrücklich freigegebener Altpfad gelöscht:",
+            flush=True,
+        )
+        for item in content_drift:
+            print(
+                f"  - {item.get('path', '')} ({item.get('status', 'abweichend')})",
+                flush=True,
+            )
+    if emit_details and not baseline_complete:
+        print(
+            "[WARNUNG] Für diesen Altbestand konnte weder ein sicherer "
+            "root-eigener Inhaltsvertrag noch der veröffentlichte Tag der "
+            "installierten Version als Altbaseline gebunden werden. Eine "
+            "bewusste generische Freigabe ist erforderlich; unbekannte Dateien "
+            "außerhalb der Zielprojektion bleiben unberührt.",
+            flush=True,
+        )
+
+    authority_matches = (
+        confirmation == "1"
+        and bool(expected_confirmation_token)
+        and confirmation_token == expected_confirmation_token
+    )
+    # Auch eine inzwischen verschwundene oder sonst veränderte Liste macht eine
+    # bereits erteilte Freigabe ungültig. Sie wird niemals auf einen neuen
+    # Zielzustand übertragen.
+    stale_authority = confirmation == "1" and (
+        not requires_confirmation or not authority_matches
+    )
+    if (requires_confirmation and not authority_matches) or stale_authority:
+        reason = (
+            "Lokal geänderte Produktinhalte wurden erkannt."
+            if content_drift
+            else (
+                "Die veröffentlichte Altbaseline konnte nicht sicher gebunden werden."
+                if not baseline_complete
+                else "Die zuvor bestätigte Inhaltsliste hat sich geändert."
+            )
+        )
+        _fail(
+            "E3DC-UPD-DRIFT-001",
+            f"{reason} Die bestätigte Liste samt Fingerprints passt in der "
+            f"Prüfphase {phase} nicht exakt zum aktuellen Stand; ohne neue "
+            "Freigabe werden keine Produktdateien überschrieben.",
+            "Starte die Nur-Lese-Prüfung erneut. An der Konsole liefert "
+            "sudo /usr/local/sbin/e3dc-web-update-launcher "
+            "--check-local-drift-json den gebundenen confirmation_token; "
+            "übergib ausschließlich diesen Token per Standardeingabe an "
+            "denselben Launcher mit --confirm-local-drift.",
+        )
+    if requires_confirmation:
+        print(
+            "[BESTÄTIGT] Die Überschreibfreigabe stimmt in der Prüfphase "
+            f"{phase} exakt mit Zielrelease, Liste und Inhaltsfingerprints überein.",
+            flush=True,
+        )
+    return drift_result
 
 
 def perform_update(
@@ -6699,11 +7604,26 @@ def perform_update(
     update_started_at = time.monotonic()
     cutover_started_at: float | None = None
     services_confirmed_at: float | None = None
+    _assert_root_update_authority()
+    emergency_enforced = _prepare_active_emergency_veto_before_update()
     release_root = RELEASE_ROOT
-    policy = _load_policy(release_root)
-    _validate_inputs(target_root, release_root, install_user, tag)
-
-    lock_descriptor = _acquire_update_lock()
+    try:
+        policy = _load_policy(release_root)
+        _validate_inputs(target_root, release_root, install_user, tag)
+        lock_descriptor = _acquire_update_lock()
+    except UpdateFailure as exc:
+        if emergency_enforced:
+            raise UpdateFailure(
+                code=exc.code,
+                happened=exc.happened,
+                solution=exc.solution,
+                system_state=(
+                    "Der Incident-Latch ist aktiv und der Storage-Writer wurde vor "
+                    "dem Update-Preflight absichtlich gestoppt. Produktdateien "
+                    "wurden nicht verändert."
+                ),
+            ) from exc
+        raise
     try:
         target_prebinding = _read_bound_directory_prestate(target_root)
         _preflight_web_home_traversal(install_user, target_root)
@@ -6728,6 +7648,12 @@ def perform_update(
         try:
             _assert_no_prejournal_construction_state()
             _assert_named_directory_binding(target_prebinding)
+            _verify_update_drift_authority(
+                target_root,
+                release_root,
+                phase="vor dem Vollbackup",
+                emit_details=True,
+            )
             with _bound_update_lock_environment(lock_descriptor):
                 backup_path = _create_backup(target_root, target_prebinding)
             _assert_named_directory_binding(target_prebinding)
@@ -6802,6 +7728,12 @@ def perform_update(
             if quarantine is not None:
                 print(f"[OK] Alter Updatezustand archiviert: {quarantine}", flush=True)
             _confirm_cutover_quiet(service_prestate.cutover_scope)
+            _verify_update_drift_authority(
+                target_root,
+                release_root,
+                phase="nach Writer-Ruhe unmittelbar vor dem Dateiaustausch",
+                emit_details=False,
+            )
             print(
                 "[3/4] Produktdateien und Rechte werden aktualisiert; die Anlage "
                 "bleibt kurz unterbrochen …",

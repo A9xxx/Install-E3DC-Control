@@ -6,11 +6,37 @@ Treiberoperation aus.
 """
 
 
-def _amp_limit(value, maximum=32):
+def _amp_limit(value, maximum=16):
     try:
         return max(0, min(int(maximum), int(round(float(value or 0)))))
     except (TypeError, ValueError):
         return 0
+
+
+def _driver_max_amp(charger):
+    """Liefere die am Treiber gebundene Infrastrukturgrenze.
+
+    Ein fehlender Beleg bleibt konservativ bei 16 A. 32 A entstehen nur aus
+    einer beim Erzeugen des Treibers ausdrücklich gebundenen Konfiguration.
+    """
+
+    try:
+        maximum = float(getattr(charger, "max_amp", 16.0) or 16.0)
+    except (TypeError, ValueError):
+        maximum = 16.0
+    if maximum != maximum or maximum in (float("inf"), float("-inf")):
+        maximum = 16.0
+    return max(6.0, min(32.0, maximum))
+
+
+def _driver_current_amp(charger, value):
+    try:
+        amp = float(value or 0.0)
+    except (TypeError, ValueError):
+        amp = 0.0
+    if amp < 0.5:
+        return 0.0
+    return max(6.0, min(_driver_max_amp(charger), amp))
 
 
 class CommandExecutor:
@@ -146,13 +172,16 @@ class CommandExecutor:
             except (TypeError, ValueError):
                 return float(default)
 
+        def driver_amp(name="amp", default=0.0):
+            return _driver_current_amp(charger, cmd_amp(name, default))
+
         try:
             if method == "take_control":
                 return bool(charger.take_control())
             if method == "set_amp_and_state":
-                return bool(charger.set_amp_and_state(cmd_amp(), force_state=cmd.get("force_state")))
+                return bool(charger.set_amp_and_state(driver_amp(), force_state=cmd.get("force_state")))
             if method == "set_amp_sonnenmodus":
-                return bool(charger.set_amp_sonnenmodus(cmd_amp(), force_state=cmd.get("force_state")))
+                return bool(charger.set_amp_sonnenmodus(driver_amp(), force_state=cmd.get("force_state")))
             if method == "set_amp_autonomous_solar":
                 if not self._consume_autonomous_solar_dispatch(charger, cmd):
                     self.logger.warning(
@@ -162,11 +191,11 @@ class CommandExecutor:
                     )
                     return False
                 return bool(charger.set_amp_autonomous_solar(
-                    cmd_amp(),
+                    driver_amp(),
                     force_state=cmd.get("force_state"),
                 ))
             if method == "set_direct_current":
-                return bool(charger.set_direct_current(cmd_amp()))
+                return bool(charger.set_direct_current(driver_amp()))
             if method == "set_pv_mode":
                 return bool(charger.set_pv_mode())
             if method == "set_phases":
@@ -178,6 +207,8 @@ class CommandExecutor:
                     # Phasenbefehl nach bereits erfolgtem POST doppelt senden.
                     return bool(charger.set_phases(phases, require_wire_receipt=True))
                 return bool(charger.set_phases(phases))
+            if method == "set_heartbeat":
+                return bool(charger.set_heartbeat(enabled=bool(cmd.get("enabled", False))))
             if method == "emergency_stop":
                 return bool(charger.emergency_stop())
             if method == "trigger_cp_interrupt":
@@ -190,11 +221,17 @@ class CommandExecutor:
                 except TypeError:
                     return bool(charger.trigger_cp_interrupt())
             if method == "release_to_e3dc":
-                return bool(charger.release_to_e3dc(max_amp=_amp_limit(cmd.get("max_amp", cmd.get("amp", 6)), 32)))
+                return bool(charger.release_to_e3dc(max_amp=_amp_limit(
+                    cmd.get("max_amp", cmd.get("amp", 6)),
+                    int(_driver_max_amp(charger)),
+                )))
             if method == "release_to_default":
-                return bool(charger.release_to_default(max_amp=_amp_limit(cmd.get("max_amp", cmd.get("amp", 32)), 32)))
+                return bool(charger.release_to_default(max_amp=_amp_limit(
+                    cmd.get("max_amp", cmd.get("amp", 16)),
+                    int(_driver_max_amp(charger)),
+                )))
             if method == "set_current":
-                amp = cmd_amp()
+                amp = driver_amp()
                 if hasattr(charger, "set_amp_sonnenmodus"):
                     return bool(charger.set_amp_sonnenmodus(amp, force_state=cmd.get("force_state")))
                 if hasattr(charger, "set_direct_current"):
@@ -202,7 +239,10 @@ class CommandExecutor:
                 if hasattr(charger, "set_amp_and_state"):
                     return bool(charger.set_amp_and_state(amp, force_state=cmd.get("force_state")))
                 if hasattr(charger, "release_to_e3dc"):
-                    return bool(charger.release_to_e3dc(max_amp=_amp_limit(amp, 32)))
+                    return bool(charger.release_to_e3dc(max_amp=_amp_limit(
+                        amp,
+                        int(_driver_max_amp(charger)),
+                    )))
         except Exception as exc:
             if c_id is not None:
                 self.logger.warning(

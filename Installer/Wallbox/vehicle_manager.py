@@ -156,6 +156,23 @@ def vehicle_phase_capability(status=None, profiles=None, config=None, charger_id
     )
 
 
+def vehicle_control_pilot_interruption_capability(
+    status=None,
+    profiles=None,
+    config=None,
+    charger_id=1,
+):
+    """Liefere die live- oder Ladepunktprofil-gebundene CP-Anforderung."""
+
+    profile_list = load_saved_car_profiles() if profiles is None else profiles
+    return wallbox_decision.vehicle_control_pilot_interruption_capability_from_profiles(
+        profile_list,
+        status,
+        config=config,
+        charger_id=charger_id,
+    )
+
+
 def vehicle_max_ac_power_kw(config, charger_id, status=None, profiles=None):
     """Liefere nur eine profil- oder OBC-gebundene AC-Leistungsgrenze."""
 
@@ -446,6 +463,20 @@ class VehicleManager:
     @staticmethod
     def vehicle_phase_capability(status=None, profiles=None, config=None, charger_id=1):
         return vehicle_phase_capability(
+            status=status,
+            profiles=profiles,
+            config=config,
+            charger_id=charger_id,
+        )
+
+    @staticmethod
+    def vehicle_control_pilot_interruption_capability(
+        status=None,
+        profiles=None,
+        config=None,
+        charger_id=1,
+    ):
+        return vehicle_control_pilot_interruption_capability(
             status=status,
             profiles=profiles,
             config=config,

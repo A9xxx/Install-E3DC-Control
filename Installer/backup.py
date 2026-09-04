@@ -431,6 +431,12 @@ def _persistent_sources(
             allow_live_drift=options.tolerate_replaceable_entries,
         ),
         PersistentSource(
+            "runtime-permissions-launcher",
+            Path("/usr/local/sbin/e3dc-runtime-permissions-repair"),
+            unsafe_entry_policy=replaceable_policy,
+            allow_live_drift=options.tolerate_replaceable_entries,
+        ),
+        PersistentSource(
             "ha-root-runtime",
             HA_ROOT_RUNTIME_BASE,
             unsafe_entry_policy=replaceable_policy,
@@ -544,6 +550,7 @@ def _restore_allowlist(install_path=None):
             Path("/usr/local/bin/pi_guard.sh"),
             Path("/usr/local/sbin/e3dc-service-control"),
             Path("/usr/local/sbin/e3dc-web-update-launcher"),
+            Path("/usr/local/sbin/e3dc-runtime-permissions-repair"),
             Path("/etc/sudoers.d/020_e3dc_services"),
             APACHE_SECURITY_CONFIG,
             MANAGER_LOCK_TMPFILES_CONFIG,

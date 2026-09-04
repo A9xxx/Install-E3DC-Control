@@ -344,7 +344,9 @@ def create_e3dc_config(headless=False, *, install_path=None, install_user=None):
         cfg["wbmode"] = ask("WB Modus", "4", headless)
         cfg["wbminlade"] = ask("WB Mindestladeleistung (W)", "1200", headless)
         cfg["wbminSoC"] = ask("WB Mindest-SoC (%)", "85", headless)
-        cfg["wbmaxladestrom"] = ask("WB Maximalstrom (A)", "32", headless)
+        # 32 A nur nach bewusster Auswahl; unbeaufsichtigte/Enter-Installationen
+        # bleiben auf dem verbreiteten und konservativen 16-A-Vertrag.
+        cfg["wbmaxladestrom"] = ask("WB Maximalstrom (A)", "16", headless)
         cfg["wbminladestrom"] = ask("WB Mindeststrom (A)", "6", headless)
         cfg["wbhour"] = ask("WB hour-Modus", "0", headless)
         cfg["Wbvon"] = ask("WB hour Startzeit", "22", headless)

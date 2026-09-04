@@ -1,12 +1,12 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.4i</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.5</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.4.4i**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.4.5**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
 
 ### Web-Update startet nicht? Einmaliger Rettungsweg
 
@@ -40,7 +40,7 @@ sondern eine eindeutige Auswahl verlangt.
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
 
-> **Neu in 5.4.4i:** Der Updater arbeitet unabhängig von der Systemsprache. Manuelle Fahrzeug-SoC-Werte erhalten eine eindeutige Quelle und Zeit. Wallbox- und Wärmepumpenbudget werden wieder strikt nach realer Last, zentraler Freigabe und bestehenden Schutzgrenzen bilanziert; eine Schutzentscheidung mit 0 A bleibt endgültig. Alle Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
+> **Neu in 5.4.5:** Die zentrale Wallbox-Regelung verteilt belegte Wattbudgets je Ladepunkt, führt Netzdefizit gruppenweit genau einmal und lässt Treiber nur noch den finalen Auftrag in das jeweilige Geräteprotokoll übersetzen. Schnelles Hochregeln, kontrolliertes Herunterregeln, Phasenwechsel und Stopp bleiben an frische Messwerte und die physische Kaskade gebunden. Das Dashboard zeigt keine alte Wallboxleistung künstlich weiter; WB1 und WB2 fließen getrennt in die Tagesstatistik ein. PV-Prognose, Speicher-SoC und die rein lesenden Luxtronik-Warmwasserstufen bleiben sichtbar. Eine reine Rechtereparatur arbeitet ohne Backup oder Dienstneustart, während Stable-Reparaturen lokale Inhaltsabweichungen vor dem Überschreiben genau benennen. Alle Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
 
 ### 📊 Modernes Live-Dashboard & Statistik
 * **Echtzeit-Energiefluss:** Animierte Darstellung aller Energieflüsse (Haus, PV, Netz, Batterie, Wallbox, Wärmepumpe). Nodes können je Ansicht verschoben, farblich angepasst und per Standardlayout zurückgesetzt werden.
@@ -89,10 +89,10 @@ sondern eine eindeutige Auswahl verlangt.
 * **Systemd-Dienste:** Alle Kernmodule (`e3dc-live`, Storage Manager, Storage Simulator, Wallbox Manager, MQTT-Hub und optionale Verbraucher) laufen als robuste Hintergrunddienste mit Auto-Restart-Fähigkeit.
 * **Piguard Watchdog:** Überwacht das Netzwerk, den SD-Karten-Speicher und Dateihänger. Startet bei Bedarf einzelne Dienste (oder den Raspberry Pi) intelligent neu.
 * **Telegram-Benachrichtigungen:** Erhalte tägliche Statusberichte (Uptime, Temperatur), Tagesstatistiken zur Energieverteilung sowie einen detaillierten Wochenrückblick direkt auf dein Smartphone. Komfortabel über das Web-UI ohne lästige Cronjobs konfigurierbar.
-* **Betriebswartung:** Log-Rotation sowie ein Zielbestand von maximal drei verifizierten Update-Backup-Familien und separat maximal drei Web-Installer-Sicherungen reduzieren den Speicherbedarf. Aktive Schutzbindungen können den Zielbestand vorübergehend überschreiten. Die Rechteprüfung kann bekannte Abweichungen korrigieren; Systemzustand und freier Speicher bleiben zu überwachen.
+* **Betriebswartung:** Log-Rotation sowie ein Zielbestand von maximal drei verifizierten Update-Backup-Familien und separat maximal drei Web-Installer-Sicherungen reduzieren den Speicherbedarf. Aktive Schutzbindungen können den Zielbestand vorübergehend überschreiten. Die reine Rechtereparatur korrigiert nur Besitzer, Gruppe und Modus bekannter Pfade; sie erstellt kein Backup, ersetzt keine Inhalte und startet keine Dienste. Systemzustand und freier Speicher bleiben zu überwachen.
 
 ### 🔄 Auto-Update & Rollback
-* **Ein gemeinsamer Updateauftrag:** Web-Dashboard, Konsole und Installer-Menü starten denselben root-eigenen Hintergrundjob. Direkter Ziel-Updater und Installationszentrale verwenden `/run/lock/e3dc-control/update.lock`; sichere root-eigene Altmodi `0755`/`0644` werden vor jeder Mutation auf `0700`/`0600` normalisiert. Ein unsicherer Knoten bricht vor Produkt- und Dienständerungen kontrolliert ab, ein belegter Lock fordert zum Warten auf. Die automatische Prüfung verwendet dieselbe Stable-Quelle und informiert über einen neuen Stand, startet ihn aber nicht ungefragt. Lokale Git-Änderungen, historische Dateirechte oder ein abweichender Installationsordner blockieren die Jobannahme nicht; der Ziel-Updater erstellt das Backup, ersetzt den Programmstand und prüft den Wiederanlauf.
+* **Ein gemeinsamer Updateauftrag:** Web-Dashboard, Konsole und Installer-Menü starten denselben root-eigenen Hintergrundjob. Direkter Ziel-Updater und Installationszentrale verwenden `/run/lock/e3dc-control/update.lock`; sichere root-eigene Altmodi `0755`/`0644` werden vor jeder Mutation auf `0700`/`0600` normalisiert. Ein unsicherer Knoten bricht vor Produkt- und Dienständerungen kontrolliert ab, ein belegter Lock fordert zum Warten auf. Die automatische Prüfung verwendet dieselbe Stable-Quelle und informiert über einen neuen Stand, startet ihn aber nicht ungefragt. Lokales Git ist keine Updateautorität; der Ziel-Updater vergleicht die tatsächlich betriebenen Produktinhalte jedoch rein lesend mit dem veröffentlichten Altstand. Würden lokale Änderungen überschrieben oder freigegebene Altdateien gelöscht, nennt er die genaue Liste und verlangt eine daran gebundene Bestätigung. Danach erstellt er das Backup, ersetzt den Programmstand und prüft den Wiederanlauf.
 * **Ein-Datei-Bootstrap für Altinstallationen:** `e3dc-update-bootstrap` wird an einen beliebigen Ort auf den Raspberry Pi kopiert und mit `sudo /bin/sh ./e3dc-update-bootstrap` gestartet. Der veröffentlichte Updatepfad ermittelt Installationsordner, Installationsbenutzer und Rolle selbst, arbeitet als systemd-Auftrag im Hintergrund und führt den vorhandenen Alt-Updater nicht aus. Der genaue Ablauf und die verbleibenden echten Stop-Gründe stehen in [doc/Update.md](doc/Update.md).
 * **Optionale Updateprüfung:** Das System kann nachts nach einem freigegebenen Stable-Stand suchen und ihn im Dashboard anzeigen.
 * **Umgebungsgebundener Rückfall:** Docker kann auf das in `UPDATE_POLICY.json` exakt gebundene Image `v5.3.2b` zurückgesetzt werden. Bare-Metal-Installationen bieten für diesen Altstand keinen Programm-Rückfall an; verifizierte Datei-Backups bleiben wiederherstellbar.
@@ -473,7 +473,7 @@ sudo docker compose logs --tail=80 e3dc-control
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin wird
-> `E3DC_IMAGE_TAG=v5.4.4i` in `.env` gesetzt. `config --images` zeigt vor dem
+> `E3DC_IMAGE_TAG=v5.4.5` in `.env` gesetzt. `config --images` zeigt vor dem
 > Pull das tatsächlich gewählte Image.
 >
 > Vor dem `pull` prüft der Helfer mindestens 2 GiB freien Platz im

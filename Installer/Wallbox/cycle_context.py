@@ -4,6 +4,8 @@ from dataclasses import dataclass, field, fields
 from types import MappingProxyType
 from typing import Any, Dict, Mapping, Tuple
 
+from .actuator_contracts import WallboxCapability
+
 
 def _freeze(value):
     if isinstance(value, Mapping):
@@ -45,17 +47,34 @@ class ChargerCycleContext:
     observe_only: bool = False
     priority_forced_stop: bool = False
     budget_timeout: bool = False
+    cycle_token: str = ""
+    capability: WallboxCapability = field(default_factory=WallboxCapability)
     current_decision: Mapping[str, Any] = field(default_factory=dict)
     start_stop_decision: Mapping[str, Any] = field(default_factory=dict)
     phase_recommendation: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
+        if not isinstance(self.capability, WallboxCapability):
+            object.__setattr__(
+                self,
+                "capability",
+                WallboxCapability.from_mapping(self.capability),
+            )
+        object.__setattr__(self, "cycle_token", str(self.cycle_token or ""))
         object.__setattr__(self, "current_decision", _freeze(self.current_decision))
         object.__setattr__(self, "start_stop_decision", _freeze(self.start_stop_decision))
         object.__setattr__(self, "phase_recommendation", _freeze(self.phase_recommendation))
 
     def as_dict(self) -> Dict[str, Any]:
-        return {item.name: _thaw(getattr(self, item.name)) for item in fields(self)}
+        result = {}
+        for item in fields(self):
+            value = getattr(self, item.name)
+            result[item.name] = (
+                value.as_dict()
+                if isinstance(value, WallboxCapability)
+                else _thaw(value)
+            )
+        return result
 
 
 @dataclass(frozen=True)

@@ -1453,6 +1453,8 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                             <span id="wb-native-kva-badge" style="display:none; color:#22d3ee; font-weight:600;" title="Scheinleistung: Spannung x Strom je Phase. Die Regelung nutzt weiterhin Wirkleistung in W.">-- kVA</span>
                         </div>
                     </div>
+                    <div id="wb-deficit-counter" class="mt-1" style="display:none; font-size:0.65rem;"></div>
+                    <div id="wb-floor-effective-note" class="mt-1 text-warning" style="display:none; font-size:0.65rem;"></div>
                 </div>
 
                 <!-- === Spalte 4: Verbindungsstatus + WB-Name + WB-Details (rechts) === -->
@@ -1807,8 +1809,11 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
 	                                        <div class="text-muted small mb-1 fw-bold">Verwendung</div>
 	                                        <div class="d-flex justify-content-between small mb-2"><span>In Haus:</span> <span id="stat-pv-home" class="fw-bold">-- kWh (--%)</span></div>
 	                                        <div class="d-flex justify-content-between small mb-2"><span>In Batterie:</span> <span id="stat-pv-bat" class="fw-bold">-- kWh (--%)</span></div>
-                                        <?php if($wbEnabled): ?>
-                                        <div class="d-flex justify-content-between small mb-2"><span>In Wallbox:</span> <span id="stat-pv-wb" class="fw-bold">-- kWh (--%)</span></div>
+                                        <?php if($wb1Enabled): ?>
+                                        <div class="d-flex justify-content-between small mb-2"><span><?= $wb2Enabled ? 'In Wallbox 1:' : 'In Wallbox:' ?></span> <span id="stat-pv-wb" class="fw-bold">-- kWh (--%)</span></div>
+                                        <?php endif; ?>
+                                        <?php if($wb2Enabled): ?>
+                                        <div class="d-flex justify-content-between small mb-2"><span>In Wallbox 2:</span> <span id="stat-pv-wb2" class="fw-bold">-- kWh (--%)</span></div>
                                         <?php endif; ?>
                                         <?php if($wpEnabled): ?>
                                         <div class="d-flex justify-content-between small mb-2"><span>In Wärmepumpe:</span> <span id="stat-pv-wp" class="fw-bold">-- kWh (--%)</span></div>
@@ -1829,8 +1834,11 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                             <span id="stat-bat-total" class="badge bg-success text-body fs-6">-- kWh</span>
                                         </h6>
                                         <div class="d-flex justify-content-between small mb-2"><span>In Haus:</span> <span id="stat-bat-home" class="fw-bold">-- kWh (--%)</span></div>
-                                        <?php if($wbEnabled): ?>
-                                        <div class="d-flex justify-content-between small mb-2"><span>In Wallbox:</span> <span id="stat-bat-wb" class="fw-bold">-- kWh (--%)</span></div>
+                                        <?php if($wb1Enabled): ?>
+                                        <div class="d-flex justify-content-between small mb-2"><span><?= $wb2Enabled ? 'In Wallbox 1:' : 'In Wallbox:' ?></span> <span id="stat-bat-wb" class="fw-bold">-- kWh (--%)</span></div>
+                                        <?php endif; ?>
+                                        <?php if($wb2Enabled): ?>
+                                        <div class="d-flex justify-content-between small mb-2"><span>In Wallbox 2:</span> <span id="stat-bat-wb2" class="fw-bold">-- kWh (--%)</span></div>
                                         <?php endif; ?>
                                         <?php if($wpEnabled): ?>
                                         <div class="d-flex justify-content-between small mb-2"><span>In Wärmepumpe:</span> <span id="stat-bat-wp" class="fw-bold">-- kWh (--%)</span></div>
@@ -1852,8 +1860,11 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                         </h6>
                                         <div class="d-flex justify-content-between small mb-2"><span>In Haus:</span> <span id="stat-grid-home" class="fw-bold">-- kWh (--%)</span></div>
                                         <div class="d-flex justify-content-between small mb-2"><span>In Batterie:</span> <span id="stat-grid-bat" class="fw-bold">-- kWh (--%)</span></div>
-                                        <?php if($wbEnabled): ?>
-                                        <div class="d-flex justify-content-between small mb-2"><span>In Wallbox:</span> <span id="stat-grid-wb" class="fw-bold">-- kWh (--%)</span></div>
+                                        <?php if($wb1Enabled): ?>
+                                        <div class="d-flex justify-content-between small mb-2"><span><?= $wb2Enabled ? 'In Wallbox 1:' : 'In Wallbox:' ?></span> <span id="stat-grid-wb" class="fw-bold">-- kWh (--%)</span></div>
+                                        <?php endif; ?>
+                                        <?php if($wb2Enabled): ?>
+                                        <div class="d-flex justify-content-between small mb-2"><span>In Wallbox 2:</span> <span id="stat-grid-wb2" class="fw-bold">-- kWh (--%)</span></div>
                                         <?php endif; ?>
                                         <?php if($wpEnabled): ?>
                                         <div class="d-flex justify-content-between small mb-2"><span>In Wärmepumpe:</span> <span id="stat-grid-wp" class="fw-bold">-- kWh (--%)</span></div>
@@ -1897,8 +1908,11 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                         <hr class="my-2 border-secondary opacity-25">
                                         <div class="small fw-bold text-muted mb-2 text-uppercase" style="font-size: 0.7rem;">Aufschlüsselung (Kosten / Ersparnis)</div>
                                         <div class="d-flex justify-content-between small mb-2"><span>🏠 Haus:</span> <span><span id="stat-cost-home" class="fw-bold">0.00 €</span> / <span id="stat-save-home" class="text-info fw-bold">0.00 €</span></span></div>
-                                        <?php if($wbEnabled): ?>
-                                        <div class="d-flex justify-content-between small mb-2"><span>🔌 Wallbox:</span> <span><span id="stat-cost-wb" class="fw-bold">0.00 €</span> / <span id="stat-save-wb" class="text-info fw-bold">0.00 €</span></span></div>
+                                        <?php if($wb1Enabled): ?>
+                                        <div class="d-flex justify-content-between small mb-2"><span>🔌 <?= $wb2Enabled ? 'Wallbox 1:' : 'Wallbox:' ?></span> <span><span id="stat-cost-wb" class="fw-bold">0.00 €</span> / <span id="stat-save-wb" class="text-info fw-bold">0.00 €</span></span></div>
+                                        <?php endif; ?>
+                                        <?php if($wb2Enabled): ?>
+                                        <div class="d-flex justify-content-between small mb-2"><span>🔌 Wallbox 2:</span> <span><span id="stat-cost-wb2" class="fw-bold">0.00 €</span> / <span id="stat-save-wb2" class="text-info fw-bold">0.00 €</span></span></div>
                                         <?php endif; ?>
                                         <?php if($wpEnabled): ?>
                                         <div class="d-flex justify-content-between small mb-2"><span>🔥 Wärmepumpe:</span> <span><span id="stat-cost-wp" class="fw-bold">0.00 €</span> / <span id="stat-save-wp" class="text-info fw-bold">0.00 €</span></span></div>
@@ -2385,7 +2399,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                 <i class="fab fa-docker me-2"></i>Docker Versionen
                             </button>
                             <?php endif; ?>
-                            <button id="btn-repair-permissions" class="btn btn-outline-warning btn-sm me-2" onclick="fixPermissions('btn-repair-permissions')" title="Startet Backup, Rechteprojektion und Systemaktualisierung über den root-eigenen Update-Launcher"><i class="fas fa-tools me-2"></i>Rechte reparieren</button>
+                            <button id="btn-repair-permissions" class="btn btn-outline-warning btn-sm me-2" onclick="fixPermissions('btn-repair-permissions')" title="Startet eine vollständige Systemreparatur mit Backup, Stable-Abgleich, Rechteprojektion und Dienstneustart"><i class="fas fa-tools me-2"></i>System reparieren</button>
                             <button class="btn btn-danger btn-sm" onclick="restartService()" title="Setzt alle Dienste sanft zurück und entfernt temporäre Boosts"><i class="fas fa-power-off me-2"></i>Notfall-Neustart (Reset)</button>
                         </div>
                     </div>
@@ -2481,6 +2495,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
 
     <script src="assets/vendor/jquery/jquery-3.6.0.min.js"></script>
     <script src="assets/vendor/bootstrap/js/bootstrap.bundle.min.js"></script>
+    <script src="<?= getAssetUrl('pv_forecast_diagnostics.js') ?>" defer></script>
     <script src="<?= getAssetUrl('solar.js') ?>" defer></script>
     <script>
         function updateTime() {
@@ -4592,8 +4607,15 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                         const controlHtml = controlInfo.label
                             ? ' · <span class="' + controlInfo.className + '">' + escapeHtmlText(controlInfo.label) + '</span>'
                             : '';
+                        const floorStatusLabels = {
+                            e3dc_wallbox: 'E3DC-Untergrenze aktiv',
+                            emergency_reserve: 'Notstromreserve aktiv',
+                            multiple_hard_floors: 'Schutzgrenze aktiv'
+                        };
                         const floorHtml = wbFloorNote
-                            ? ' &middot; <span class="text-warning">E3DC-Untergrenze aktiv</span>'
+                            ? ' &middot; <span class="text-warning">'
+                                + escapeHtmlText(floorStatusLabels[String(data.wbminsoc_floor_source || '')] || 'Schutzgrenze aktiv')
+                                + '</span>'
                             : '';
                         const rscpHtml = rscpInfo.label
                             ? ' | <span class="' + rscpInfo.className + '">' + escapeHtmlText(rscpInfo.label) + '</span>'
@@ -4646,9 +4668,9 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     };
                     const isBatteryReserveMode = (modeNum === 4 || modeNum === 9 || modeNum === 10);
                     const reserveSocCandidates = [
-                        data.wbminsoc_effective_soc,
                         data.wbminsoc_configured_soc,
                         data.wbminsoc,
+                        data.wbminsoc_effective_soc,
                         data.dynamic_min_soc,
                         data.bat_floor_soc
                     ];
@@ -4671,6 +4693,80 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     // Farbe nach Modus
                     const modeColors = {0:'secondary',1:'success',2:'info',3:'info',4:'primary',5:'warning',6:'warning',7:'info',8:'info',9:'success',10:'success',11:'danger'};
                     wbModeBadge.className = 'badge rounded-pill bg-' + (modeColors[modeNum]||'secondary') + ' bg-opacity-25 text-' + (modeColors[modeNum]||'secondary');
+                }
+                const wbFloorEffectiveEl = document.getElementById('wb-floor-effective-note');
+                if (wbFloorEffectiveEl) {
+                    const configuredFloor = Number.parseFloat(data.wbminsoc_configured_soc);
+                    const effectiveFloor = Number.parseFloat(data.wbminsoc_effective_soc);
+                    const floorSource = String(data.wbminsoc_floor_source || '');
+                    const floorSourceLabels = {
+                        e3dc_wallbox: 'E3DC-Untergrenze',
+                        emergency_reserve: 'Notstromreserve',
+                        multiple_hard_floors: 'Schutzgrenze'
+                    };
+                    if (
+                        Number.isFinite(configuredFloor)
+                        && Number.isFinite(effectiveFloor)
+                        && effectiveFloor > configuredFloor + 0.05
+                    ) {
+                        const effectiveLabel = effectiveFloor.toLocaleString('de-DE', {
+                            maximumFractionDigits: effectiveFloor % 1 === 0 ? 0 : 1
+                        });
+                        wbFloorEffectiveEl.textContent = 'Wirksam: ' + effectiveLabel + '% · '
+                            + (floorSourceLabels[floorSource] || 'Schutzgrenze');
+                        wbFloorEffectiveEl.title = String(data.wbminsoc_floor_note || '');
+                        wbFloorEffectiveEl.style.display = 'block';
+                    } else {
+                        wbFloorEffectiveEl.textContent = '';
+                        wbFloorEffectiveEl.title = '';
+                        wbFloorEffectiveEl.style.display = 'none';
+                    }
+                }
+                const wbDeficitCounterEl = document.getElementById('wb-deficit-counter');
+                if (wbDeficitCounterEl) {
+                    const counter = data.wb_deficit_counter && typeof data.wb_deficit_counter === 'object'
+                        ? data.wb_deficit_counter
+                        : null;
+                    const usedWh = Number(counter && counter.used_wh);
+                    const thresholdWh = Number(counter && counter.threshold_wh);
+                    const remainingWh = Number(counter && counter.remaining_wh);
+                    const deficitW = Number(counter && counter.deficit_w);
+                    const component = String(counter && counter.component || 'none');
+                    const visible = !!(
+                        counter
+                        && counter.schema_version === 'wallbox_deficit_counter_display_v1'
+                        && counter.valid === true
+                        && counter.active === true
+                        && counter.accumulating === true
+                        && ['grid', 'authorized_budget'].includes(component)
+                        && Number.isFinite(usedWh)
+                        && Number.isFinite(thresholdWh)
+                        && Number.isFinite(remainingWh)
+                        && usedWh > 0
+                        && thresholdWh >= 5
+                        && remainingWh > 0
+                    );
+                    if (visible) {
+                        const label = component === 'grid' ? 'Netz-Puffer' : 'Budget-Puffer';
+                        const remainingLabel = remainingWh.toLocaleString('de-DE', {
+                            minimumFractionDigits: remainingWh < 10 ? 1 : 0,
+                            maximumFractionDigits: 1
+                        });
+                        wbDeficitCounterEl.textContent = label + ': ' + remainingLabel + ' Wh übrig';
+                        wbDeficitCounterEl.className = component === 'grid'
+                            ? 'mt-1 text-warning fw-semibold'
+                            : 'mt-1 text-info fw-semibold';
+                        wbDeficitCounterEl.title = usedWh.toLocaleString('de-DE', { maximumFractionDigits: 1 })
+                            + ' / ' + thresholdWh.toLocaleString('de-DE', { maximumFractionDigits: 1 })
+                            + ' Wh'
+                            + (Number.isFinite(deficitW) ? ' · ' + Math.round(deficitW).toLocaleString('de-DE') + ' W Defizit' : '')
+                            + ' · bis zur nächsten Abregelstufe';
+                        wbDeficitCounterEl.style.display = 'block';
+                    } else {
+                        wbDeficitCounterEl.textContent = '';
+                        wbDeficitCounterEl.title = '';
+                        wbDeficitCounterEl.style.display = 'none';
+                    }
                 }
                 // Batterie-Sperre
                 const batEl = document.getElementById('wb-native-batstate');

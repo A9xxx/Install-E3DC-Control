@@ -26,9 +26,12 @@ def surplus_control_step(
     """Liefert einen deterministischen Regelschritt und ein Zustandsdelta.
 
     Positive Netzwerte bedeuten Bezug, negative Werte Einspeisung. Eine
-    Erhöhung ist nach zwei kohärenten Frames mit höchstens einem Ampere pro
-    aktivem Zyklus erlaubt; die Bezugskorrektur ist asymmetrisch und darf den
-    vollständig erforderlichen Abwärtsschritt verwenden.
+    Erhöhung wird erst nach zwei zeitlich verschiedenen kohärenten Samples
+    freigegeben und springt dann direkt auf den durch Budget und Gerätegrenzen
+    gebundenen Zielwert. Mehrere Auswertungen desselben positiven ``now_ts``
+    berechnen den Zielwert neu, schreiben die Sample-Evidenz aber nur einmal
+    fort. Die Bezugskorrektur darf den vollständig erforderlichen
+    Abwärtsschritt verwenden.
     """
 
     state = dict(previous_state) if isinstance(previous_state, dict) else {}
@@ -49,7 +52,11 @@ def surplus_control_step(
     upper = target_grid + corridor_w * 0.5
     grid = _float(grid_w, 0.0)
     coherent_frames = int(state.get("coherent_frames", 0) or 0)
-    coherent_frames = coherent_frames + 1 if data_valid and coherent else 0
+    sample_ts = _float(now_ts, 0.0)
+    previous_sample_ts = _float(state.get("last_sample_ts"), -1.0)
+    sample_advanced = bool(sample_ts <= 0.0 or sample_ts != previous_sample_ts)
+    if sample_advanced:
+        coherent_frames = coherent_frames + 1 if data_valid and coherent else 0
     blocked_up = bool(
         not data_valid or coherent_frames < 2 or not command_confirmed
         or transition_active or cp_active or heatpump_starting or not marginal_actor
@@ -87,13 +94,13 @@ def surplus_control_step(
             direction = "hold"
             reason = "non_marginal_actor_hold" if not marginal_actor else "up_frozen"
         else:
-            if current < minimum and grant_target >= minimum:
-                up_limit = max(minimum, grant_target)
-            else:
-                up_limit = max(step, _float(max_up_step_a, 1.0))
-            send_amp = _quantize_down(min(raw_target, current + up_limit), step)
+            # Nach kohärentem Messbild und bestätigtem Vorgängerbefehl ist
+            # ``raw_target`` bereits der durch Wattbudget und Gerätegrenzen
+            # gebundene Sollwert. Das Fahrzeug darf seine eigene OBC-Rampe
+            # fahren; der EMS-Regler setzt keine zusätzliche +1-A-Treppe.
+            send_amp = _quantize_down(raw_target, step)
             direction = "up" if send_amp > current + step * 0.5 else "hold"
-            reason = "surplus_coarse_up" if raw_target - current > 2.0 * step else "surplus_fine_trim"
+            reason = "surplus_direct_up" if direction == "up" else "surplus_fine_trim"
     elif not data_valid:
         reason = "invalid_data_hold"
     elif not marginal_actor:
@@ -102,6 +109,7 @@ def surplus_control_step(
     changed = abs(send_amp - current) >= step * 0.5
     patch = {
         "coherent_frames": coherent_frames,
+        "last_sample_ts": sample_ts,
         "last_direction": direction,
         "last_reason": reason,
         "last_target_amp": round(send_amp, 3),
@@ -121,6 +129,7 @@ def surplus_control_step(
         "direction": direction,
         "reason_code": reason,
         "changed": changed,
+        "sample_advanced": sample_advanced,
         "next_eligible_ts": next_ts,
         "state_patch": patch,
     }

@@ -90,11 +90,11 @@ def claim(
     elif bool(ledger.get("normal_locked")) or bool(ledger.get("emergency_claimed")):
         blocker = "normal_blocked_after_emergency"
     elif bool(ledger.get("normal_claimed")):
-        if method == "set_phases" or "phase" in str(reason_text).lower():
-            allowed = True
-            ledger["normal_claimed"] = True
-        else:
-            blocker = "normal_already_claimed"
+        # Ein Phasenbefehl ist ebenfalls ein normaler logischer
+        # Hardwareausgang. Methodennamen oder Freitext-Gründe dürfen die
+        # Ein-Ausgang-Regel nicht umgehen; eine NOT-AUS-Präemption bleibt die
+        # einzige typisierte Ausnahme.
+        blocker = "normal_already_claimed"
     else:
         allowed = True
         ledger["normal_claimed"] = True

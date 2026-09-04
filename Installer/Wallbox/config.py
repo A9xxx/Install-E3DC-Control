@@ -208,13 +208,24 @@ def _load_config_uncached():
                         if '#' in s: s = s.split('#')[0]
                         return s.strip()
 
-                    # PHP Speichert manchmal keys verschachtelt unter {"config": {"key": "val"}}
+                    def _is_scalar(val):
+                        return val is None or isinstance(val, (str, int, float, bool))
+
+                    # Ältere PHP-Stände speicherten Werte teilweise unter
+                    # {"config": {"key": "val"}}. Diese Kompatibilität bleibt
+                    # erhalten, aber kanonische Top-Level-Werte müssen gewinnen.
+                    # Andere Objekte (z. B. UI-Zustände) sind keine Konfiguration
+                    # und dürfen nicht pauschal in den Wallbox-Namensraum gelangen.
+                    legacy_config = v4_data.get("config")
+                    if isinstance(legacy_config, dict):
+                        for sub_k, sub_v in legacy_config.items():
+                            if _is_scalar(sub_v):
+                                conf[str(sub_k).lower()] = _clean(sub_v)
+
                     for k, v in v4_data.items():
-                        if isinstance(v, dict):
-                            for sub_k, sub_v in v.items():
-                                conf[sub_k.lower()] = _clean(sub_v)
-                        else:
-                            conf[k.lower()] = _clean(v)
+                        if k == "config" or not _is_scalar(v):
+                            continue
+                        conf[str(k).lower()] = _clean(v)
             except Exception as e:
                 logger.error(f"Fehler beim Lesen der v4 JSON ({cand}): {e}")
             break
@@ -263,25 +274,38 @@ def live_data_age_s(data=None):
     return 999999.0
 
 
-def read_live_data(max_age_s=None):
-    """Liest live_data_py.json und normalisiert Feldnamen fuer Rueckwaertskompatibilitaet."""
+def read_live_data(max_age_s=None, *, with_meta=False):
+    """Liest Live-Daten samt optionaler, bytesgleicher Dateisignatur.
+
+    ``with_meta`` erweitert nur den Rückgabevertrag. Bestehende Aufrufer
+    erhalten weiterhin ausschließlich das normalisierte Datenobjekt.
+    """
     data = None
+    read_meta = {
+        "valid": False,
+        "source_signature_confirmed": False,
+        "source_signature": None,
+        "source_file_revision_ns": None,
+    }
 
     if os.path.exists(LIVE_DATA_FILE_PY):
         loaded, meta = read_json_cached(LIVE_DATA_FILE_PY, with_meta=True)
         if meta.get("valid") and isinstance(loaded, dict):
             data = loaded
+            read_meta = dict(meta)
 
     if data and max_age_s is not None:
         age_s = live_data_age_s(data)
         if age_s > float(max_age_s):
-            return None
+            read_meta["stale"] = True
+            read_meta["usable"] = False
+            return (None, read_meta) if with_meta else None
         data["_live_age_s"] = round(age_s, 1)
 
     if data:
         data = normalize_live_data_dict(data)
 
-    return data
+    return (data, read_meta) if with_meta else data
 
 
 # ---------------------------------------------------------------------------

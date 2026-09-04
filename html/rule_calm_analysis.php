@@ -706,7 +706,7 @@ function ruleCalmPublicCheckName($value) {
 
 function ruleCalmPublicActor($value) {
     $text = trim((string)$value);
-    if ($text === 'storage_decision_path') {
+    if ($text === 'storage_decision_path' || preg_match('/^actor-[0-9a-f]{10}$/', $text)) {
         return $text;
     }
     return $text === '' ? '' : 'actor-' . substr(hash('sha256', $text), 0, 10);
@@ -717,10 +717,25 @@ function ruleCalmPublicAction($value) {
     if ($text === '') {
         return '';
     }
-    if (preg_match('/^(START|STOP|ON|OFF|PAUSE|RESUME|IDLE|HOLD|RELEASE|VALUE_UPDATE|UNKNOWN|UNKNOWN_PATH|CURVE|DIRECT_MARKETING|MARKET_DIRECT|MARKET_PRICE|PREDUMP|PROTECTION|WALLBOX_SUPPORT|MANUAL|STORAGE_ACTIVE|E3DC_AUTONOM|WALLBOX|PARALLEL_WB_AUTO|[123]P)$/', $text)) {
+    if (preg_match('/^(START|STOP|ON|OFF|PAUSE|RESUME|IDLE|HOLD|RELEASE|VALUE_UPDATE|UNKNOWN|UNKNOWN_PATH|CURVE|DIRECT_MARKETING|MARKET_DIRECT|MARKET_PRICE|PREDUMP|PROTECTION|WALLBOX_SUPPORT|MANUAL|STORAGE_ACTIVE|E3DC_AUTO|E3DC_AUTONOM|E3DC|WALLBOX|STORAGE|MARKET|AUTO|AUTO_FREE|AUTO_LIMITED|AUTO_RELEASE|CHRG|DISCH|GRID|AUTO_GUARD|INVALID_SAMPLE|DISCHARGE_OWNER_HOLD|CHARGE_OWNER_HOLD|WB_MINSOC_HOLD|AUTO_LIMIT_HOLD|MANUAL_OVERRIDE_HOLD|EVIDENCE_LIMIT|PARALLEL_WB_AUTO|[123]P)$/', $text)
+        || preg_match('/^STATE-[0-9A-F]{10}$/', $text)) {
         return $text;
     }
     return 'STATE-' . substr(hash('sha256', $text), 0, 10);
+}
+
+function ruleCalmLaneGroup($check) {
+    $check = ruleCalmPublicCheckName($check);
+    if ($check === 'storage_live_plausibility') {
+        return 'data_quality';
+    }
+    if (in_array($check, [
+        'storage_owner', 'storage_contract_owner', 'storage_state',
+        'storage_state_reason', 'storage_decision_path',
+    ], true)) {
+        return 'decision_path';
+    }
+    return 'execution';
 }
 
 function ruleCalmPublicPattern($value) {
@@ -748,6 +763,7 @@ function ruleCalmForumActionLabel($value) {
         'WALLBOX_SUPPORT' => 'Wallbox-Unterstützung',
         'MANUAL' => 'Manuell',
         'STORAGE_ACTIVE' => 'Speicher aktiv',
+        'E3DC_AUTO' => 'E3DC Auto',
         'E3DC_AUTONOM' => 'E3DC autonom',
     ];
     return $labels[$value] ?? $value;
@@ -785,6 +801,17 @@ function ruleCalmPublicNumericMap($values) {
         $key = ruleCalmPublicCheckName($name);
         if ($key !== 'other') {
             $public[$key] = (float)$value;
+        }
+    }
+    return $public;
+}
+
+function ruleCalmPublicEvidenceLimits($values) {
+    $public = [];
+    $allowed = ['storage_live_typed_missing', 'storage_output_typed_missing'];
+    foreach (is_array($values) ? $values : [] as $name => $value) {
+        if (in_array($name, $allowed, true) && is_numeric($value)) {
+            $public[$name] = max(0, (int)$value);
         }
     }
     return $public;
@@ -882,16 +909,28 @@ function ruleCalmCompactViolations($summary) {
     $violations = [];
     $checks = is_array($summary['checks'] ?? null) ? $summary['checks'] : [];
     foreach ($checks as $name => $check) {
-        foreach (($check['violations'] ?? []) as $violation) {
+        if (!is_array($check)) {
+            continue;
+        }
+        $raw_findings = array_merge(
+            is_array($check['violations'] ?? null) ? $check['violations'] : [],
+            is_array($check['hints'] ?? null) ? $check['hints'] : []
+        );
+        foreach ($raw_findings as $violation) {
             if (!is_array($violation)) {
                 continue;
             }
+            $severity = strtolower(trim((string)($violation['severity'] ?? '')));
+            if (!in_array($severity, ['info', 'warning'], true)) {
+                $severity = (($check['ok'] ?? false) === true) ? 'info' : 'warning';
+            }
+            $alert = $severity !== 'info' && (($check['ok'] ?? false) !== true || $severity === 'warning');
             $events = [];
             foreach (($violation['events'] ?? []) as $event) {
                 $normalized = ruleCalmNormalizeEvent(
                     $event,
                     $name,
-                    true,
+                    $alert,
                     (string)($violation['type'] ?? 'pattern'),
                     isset($violation['age_s']) ? (float)$violation['age_s'] : null
                 );
@@ -908,8 +947,11 @@ function ruleCalmCompactViolations($summary) {
             $last_ts = $times ? max($times) : ruleCalmTs($violation['last_ts'] ?? null);
             $violations[] = [
                 'check' => ruleCalmPublicCheckName($name),
+                'lane_group' => ruleCalmLaneGroup($name),
                 'type' => ruleCalmPublicPattern($violation['type'] ?? 'pattern'),
                 'actor' => ruleCalmPublicActor($violation['actor'] ?? ''),
+                'severity' => $severity,
+                'alert' => $alert,
                 'age_s' => isset($violation['age_s']) ? (float)$violation['age_s'] : null,
                 'count' => isset($violation['count']) ? (int)$violation['count'] : null,
                 'first_ts' => $first_ts,
@@ -920,6 +962,18 @@ function ruleCalmCompactViolations($summary) {
             ];
         }
     }
+    usort($violations, function($a, $b) {
+        $priority = ['data_quality' => 0, 'decision_path' => 1, 'execution' => 2];
+        $pa = $priority[$a['lane_group'] ?? 'execution'] ?? 3;
+        $pb = $priority[$b['lane_group'] ?? 'execution'] ?? 3;
+        if ($pa !== $pb) {
+            return $pa <=> $pb;
+        }
+        if (!empty($a['alert']) !== !empty($b['alert'])) {
+            return !empty($a['alert']) ? -1 : 1;
+        }
+        return (float)($a['first_ts'] ?? 0) <=> (float)($b['first_ts'] ?? 0);
+    });
     return array_slice($violations, 0, 30);
 }
 
@@ -969,6 +1023,8 @@ function ruleCalmTimelineSummary($timeline) {
 
 function ruleCalmBuildForumSummary($summary, $violations, $context) {
     $status = (string)($summary['status'] ?? 'UNKNOWN');
+    $control_status = strtoupper((string)($summary['control_status'] ?? $status));
+    $data_quality_status = strtoupper((string)($summary['data_quality_status'] ?? 'NOT_ANALYZED'));
     $completeness = (string)($summary['completeness'] ?? 'LEGACY');
     $records = is_array($summary['records'] ?? null) ? $summary['records'] : [];
     $events = is_array($summary['events'] ?? null) ? $summary['events'] : [];
@@ -986,10 +1042,20 @@ function ruleCalmBuildForumSummary($summary, $violations, $context) {
     if ($owner_gaps) {
         $window_parts[] = 'Contract/Owner/State-Fenster: ' . max($owner_gaps) . 's';
     }
+    $control_label = $control_status === 'PASS'
+        ? 'OK'
+        : ($control_status === 'FAIL' ? 'auffällig' : ($control_status === 'EVIDENCE_LIMIT' ? 'EVIDENCE_LIMIT' : $control_status));
+    $data_quality_labels = [
+        'PASS' => 'OK',
+        'HINT' => 'Hinweis',
+        'FAIL' => 'auffällig',
+        'EVIDENCE_LIMIT' => 'EVIDENCE_LIMIT',
+        'NOT_ANALYZED' => 'nicht ausgewertet',
+    ];
+    $data_quality_label = $data_quality_labels[$data_quality_status] ?? 'nicht ausgewertet';
     $lines = [];
-    $lines[] = 'Regelruhe-Analyse: ' . ($completeness === 'PARTIAL'
-        ? 'TEILWEISE / EVIDENCE_LIMIT' . ($status === 'FAIL' ? ' · Auffällig in ausgewerteten Diensten' : '')
-        : ($status === 'PASS' ? 'OK' : ($status === 'FAIL' ? 'Auffällig' : $status)));
+    $lines[] = 'Regelruhe: ' . $control_label . ' · Datenqualität: ' . $data_quality_label
+        . ($completeness === 'PARTIAL' ? ' · TEILWEISE / EVIDENCE_LIMIT' : '');
     $scope_context = is_array($context['scope_context'] ?? null) ? $context['scope_context'] : [];
     $scope_label = (string)($context['scope_label'] ?? $scope_context['scope_label'] ?? '');
     $source_line = 'Quelle: ' . (string)($context['source_label'] ?? 'Entscheidungsverlauf');
@@ -1037,13 +1103,19 @@ function ruleCalmBuildForumSummary($summary, $violations, $context) {
         . ', WB Phasen ' . (int)($events['wallbox_phase'] ?? 0)
         . ', WP ' . (int)($events['heatpump'] ?? 0)
         . ', EMS ' . (int)($events['ems_decision'] ?? 0);
-    if ($violations) {
-        $lines[] = 'Auffälligkeiten:';
-        foreach (array_slice($violations, 0, 6) as $violation) {
+    $data_quality_findings = array_values(array_filter($violations, function($violation) {
+        return ($violation['lane_group'] ?? '') === 'data_quality';
+    }));
+    $control_findings = array_values(array_filter($violations, function($violation) {
+        return ($violation['lane_group'] ?? '') !== 'data_quality' && !empty($violation['alert']);
+    }));
+    $format_findings = function($findings, $limit) use ($effective_gaps, $default_gap_s) {
+        $result = [];
+        foreach (array_slice($findings, 0, $limit) as $violation) {
             $sample = '';
             $event_texts = [];
             foreach (array_slice($violation['events'] ?? [], 0, 3) as $event) {
-                $event_texts[] = trim(($event['time'] ? $event['time'] . ' ' : '') . ruleCalmForumActionLabel($event['action'] ?? ''));
+                $event_texts[] = trim((!empty($event['time']) ? $event['time'] . ' ' : '') . ruleCalmForumActionLabel($event['action'] ?? ''));
             }
             if ($event_texts) {
                 $sample = ' (' . implode(' -> ', $event_texts) . ')';
@@ -1057,14 +1129,25 @@ function ruleCalmBuildForumSummary($summary, $violations, $context) {
                     $age_text .= ' (Fenster ' . $check_gap_s . 's)';
                 }
             }
-            $lines[] = '- ' . ruleCalmServiceLabel($violation['check'])
+            $result[] = '- ' . ruleCalmServiceLabel($violation['check'])
                 . ': ' . ruleCalmForumPatternLabel($violation['type'])
                 . ($violation['actor'] !== '' ? ' bei ' . ruleCalmForumActorLabel($violation['actor']) : '')
                 . $age_text
                 . $sample;
         }
+        return $result;
+    };
+    if ($data_quality_findings) {
+        $lines[] = $data_quality_status === 'HINT' ? 'Datenqualitätshinweis:' : 'Datenqualitätsbefunde:';
+        $lines = array_merge($lines, $format_findings($data_quality_findings, 4));
     } else {
-        $lines[] = 'Keine Ping-Pong-Muster im gewählten Fenster erkannt.';
+        $lines[] = 'Datenqualität: kein Messwertbefund im ausgewerteten Speicherverlauf.';
+    }
+    if ($control_findings) {
+        $lines[] = 'Regelauffälligkeiten:';
+        $lines = array_merge($lines, $format_findings($control_findings, 6));
+    } else {
+        $lines[] = 'Regelauffälligkeiten: kein belegtes Execution-/Ausgangs-Ping-Pong im gewählten Fenster.';
     }
     return implode("\n", $lines);
 }
@@ -1152,8 +1235,17 @@ function ruleCalmRun($input_path, $source_label, $input_kind, $services = null, 
         ]);
     }
     $status = strtoupper((string)($summary['status'] ?? 'UNKNOWN'));
+    $control_status = strtoupper((string)($summary['control_status'] ?? 'UNKNOWN'));
+    $data_quality_status = strtoupper((string)($summary['data_quality_status'] ?? 'UNKNOWN'));
     $valid_exit = ($status === 'PASS' && $exit_code === 0) || ($status === 'FAIL' && $exit_code === 1);
-    if (!$valid_exit) {
+    $expected_status = in_array('FAIL', [$control_status, $data_quality_status], true)
+        || in_array('EVIDENCE_LIMIT', [$control_status, $data_quality_status], true)
+        ? 'FAIL'
+        : 'PASS';
+    if (!$valid_exit
+        || !in_array($control_status, ['PASS', 'FAIL', 'EVIDENCE_LIMIT'], true)
+        || !in_array($data_quality_status, ['PASS', 'HINT', 'FAIL', 'EVIDENCE_LIMIT', 'NOT_ANALYZED'], true)
+        || $status !== $expected_status) {
         ruleCalmError('Regelruhe-Analyse wurde nicht erfolgreich und vollständig ausgewertet', [
             'exit_code' => $exit_code,
             'status' => in_array($status, ['PASS', 'FAIL', 'ERROR'], true) ? $status : 'UNKNOWN',
@@ -1187,8 +1279,14 @@ function ruleCalmRun($input_path, $source_label, $input_kind, $services = null, 
         }
     }
 
-    $violations = ruleCalmCompactViolations($summary);
-    $timeline = ruleCalmBuildTimeline($summary, $violations);
+    $findings = ruleCalmCompactViolations($summary);
+    $violations = array_values(array_filter($findings, function($finding) {
+        return !empty($finding['alert']) && ($finding['lane_group'] ?? '') !== 'data_quality';
+    }));
+    $data_quality_findings = array_values(array_filter($findings, function($finding) {
+        return ($finding['lane_group'] ?? '') === 'data_quality';
+    }));
+    $timeline = ruleCalmBuildTimeline($summary, $findings);
     $public_scope_context = ruleCalmPublicScopeContext($scope_context);
     $context = [
         'source_label' => $source_label,
@@ -1222,14 +1320,19 @@ function ruleCalmRun($input_path, $source_label, $input_kind, $services = null, 
         'missing_services' => $missing_services,
         'completeness' => $completeness,
         'status' => $status,
+        'control_status' => $control_status,
+        'data_quality_status' => $data_quality_status,
         'records' => ruleCalmPublicNumericMap($summary['records'] ?? []),
         'events' => ruleCalmPublicNumericMap($summary['events'] ?? []),
         'checks' => ruleCalmCompactChecks($summary),
         'effective_min_gap_s' => ruleCalmPublicNumericMap($summary['effective_min_gap_s'] ?? []),
+        'evidence_limits' => ruleCalmPublicEvidenceLimits($summary['evidence_limits'] ?? []),
         'violations' => $violations,
+        'data_quality_findings' => $data_quality_findings,
+        'findings' => $findings,
         'timeline' => $timeline,
         'timeline_summary' => ruleCalmTimelineSummary($timeline),
-        'forum_summary' => ruleCalmBuildForumSummary($summary, $violations, $context),
+        'forum_summary' => ruleCalmBuildForumSummary($summary, $findings, $context),
         'exit_code' => $exit_code,
     ];
 

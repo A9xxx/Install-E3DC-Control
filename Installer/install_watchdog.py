@@ -377,7 +377,7 @@ restart_core_service() {{
 }}
 
 emergency_latch_active() {{
-    [ -f "$EMERGENCY_LATCH" ]
+    [ -e "$EMERGENCY_LATCH" ] || [ -L "$EMERGENCY_LATCH" ]
 }}
 
 new_storage_incident_id() {{

@@ -1926,6 +1926,8 @@ WEB_PROGRAM_FALLBACK_FILES = (
     "send_status_telegram.php",
     "send_weekly_telegram.php",
     "service_control.php",
+    "pv_forecast_diagnostics.js",
+    "pv_forecast_diagnostics.min.js",
     "solar.js",
     "solar.min.js",
     "style.css",
@@ -1967,6 +1969,7 @@ FILE_DEFINITIONS = [
     # [LEGACY C++] e3dc.wallbox.txt: NUR im Legacy-Modus (wb_native_enable=0). In V4 Native: DARF nicht beschrieben werden!
     {"path": f"{INSTALL_PATH}/e3dc.wallbox.txt", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/data/e3dc_v4.json", "mode": CONFIG_SECRET_FILE_MODE, "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    {"path": "/var/www/html/data/.e3dc_v4.transaction.lock", "mode": "660", "owner": "www-data", "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/data/wallbox_phase_transition_state.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": f"{INSTALL_PATH}/data/e3dc_v4.json", "mode": CONFIG_SECRET_FILE_MODE, "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     # [LEGACY C++] e3dc.strompreise.txt: optionaler, vom PHP-Frontend gelesener Preis-Fallback.
@@ -1996,6 +1999,8 @@ FILE_DEFINITIONS = [
     {"path": "/var/www/html/helpers.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
     {"path": "/var/www/html/retention.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
     {"path": "/var/www/html/logic.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
+    {"path": "/var/www/html/pv_forecast_diagnostics.js", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
+    {"path": "/var/www/html/pv_forecast_diagnostics.min.js", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
     {"path": "/var/www/html/solar.js", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
     {"path": "/var/www/html/solar.min.js", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
     {"path": "/var/www/html/minify_solar.py", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
@@ -2595,10 +2600,14 @@ def _web_runtime_permission_contract(top_name, install_uid, www_uid, www_gid, co
                 ("e3dc_v4.json",),
             }:
                 return desired(
-                    www_uid,
+                    install_uid,
                     www_gid,
                     data_dir_mode if is_directory else data_file_mode,
                 )
+            if relative == (".e3dc_v4.transaction.lock",):
+                # Der feste Config-Lock wird vom Web-Publisher geöffnet und muss
+                # dessen deterministischen Eigentümervertrag behalten.
+                return desired(www_uid, www_gid, 0o770 if is_directory else 0o660)
             if relative in {
                 ("wallbox_mode5_user_start_request.json",),
                 ("wallbox_mode5_user_start_request.json.lock",),
@@ -2672,6 +2681,22 @@ def _normalize_web_runtime_permissions(web_root="/var/www/html", config=None):
                     raise RuntimeError(
                         f"Web-Laufzeitfläche driftete beim Öffnen: {target}"
                     )
+                if top_name == "data":
+                    try:
+                        config_lock = os.stat(
+                            ".e3dc_v4.transaction.lock",
+                            dir_fd=child_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        config_lock = None
+                    if config_lock is not None and (
+                        not stat.S_ISREG(config_lock.st_mode)
+                        or config_lock.st_nlink != 1
+                    ):
+                        raise RuntimeError(
+                            "Config-Transaktionslock ist keine reguläre Einzeldatei"
+                        )
                 child_mount_id = _permission_mount_id(child_fd)
             finally:
                 os.close(child_fd)
@@ -4053,28 +4078,42 @@ def cleanup_legacy_cronjobs():
     return True
 
 
-def check_wrapper_integrity():
-    """Bindet Quellen und root-eigene Launcher read-only an Git-HEAD."""
-    print("\n=== Wrapper-Integritätsprüfung (lokaler Git-HEAD) ===\n")
+def check_wrapper_integrity(*, release_authority_bound=False):
+    """Trennt Checkout-Diagnose von der privilegierten Release-Autorität."""
+    print("\n=== Wrapper-Integritätsprüfung ===\n")
     try:
         if __package__ in (None, ""):
             from Installer import web_installer
         else:
             from . import web_installer
-        result = web_installer.wrapper_integrity_preview(INSTALL_ROOT)
-        root_launchers = (
-            (
-                "Root-eigener Service-Launcher",
-                web_installer.service_launcher_integrity_preview(),
-            ),
-            (
-                "Root-eigener Web-Update-Launcher",
-                web_installer.web_update_launcher_integrity_preview(),
-            ),
-        )
     except Exception as exc:
-        print(f"{RED}✗{RESET} Wrapper-Integrität konnte nicht geprüft werden: {exc}")
-        return [{"wrapper_integrity": True, "status": "check_error", "error": str(exc)}]
+        print(f"{RED}✗{RESET} Root-Launcher-Prüfung ist nicht verfügbar: {exc}")
+        return [{"root_launcher_integrity": True, "status": "check_error", "error": str(exc)}]
+
+    try:
+        result = web_installer.wrapper_integrity_preview(INSTALL_ROOT)
+    except Exception as exc:
+        result = {
+            "success": False,
+            "repair_needed": False,
+            "items": [],
+            "hard_blockers": [{"status": "head_error", "error": str(exc)}],
+        }
+    service_launcher_preview = (
+        web_installer.service_launcher_integrity_preview()
+        if release_authority_bound
+        else web_installer.root_service_launcher_integrity_preview()
+    )
+    root_launchers = (
+        (
+            "Root-eigener Service-Launcher",
+            service_launcher_preview,
+        ),
+        (
+            "Root-eigener Web-Update-Launcher",
+            web_installer.web_update_launcher_integrity_preview(),
+        ),
+    )
 
     sources_ok = bool(result.get("success")) and not result.get("repair_needed")
     root_launchers_ok = all(
@@ -4082,8 +4121,8 @@ def check_wrapper_integrity():
     )
     if sources_ok and root_launchers_ok:
         print(
-            f"{GREEN}✓{RESET} Wrapperquellen und root-eigene Launcher stimmen "
-            f"bytegenau mit Git-HEAD {result.get('head', '')[:12]} überein."
+            f"{GREEN}✓{RESET} Wrapperquellen und root-eigene Launcher bestehen "
+            f"ihren {'Release-' if release_authority_bound else 'lokalen Root-'}Vertrag."
         )
         return []
 
@@ -4104,31 +4143,48 @@ def check_wrapper_integrity():
             if status == "ok":
                 continue
             detail = labels.get(status, f"hat den unbekannten Zustand {status}")
-            print(f"{RED}✗{RESET} {item.get('path')}: {detail}.")
+            marker = RED + "✗" + RESET if release_authority_bound else YELLOW + "[i]" + RESET
+            suffix = (
+                ""
+                if release_authority_bound
+                else " Nur gelesen; lokales Git ist keine Stable-Autorität."
+            )
+            print(f"{marker} {item.get('path')}: {detail}.{suffix}")
         for blocker in result.get("hard_blockers", []):
             if blocker.get("status") == "head_error":
-                print(f"{RED}✗{RESET} Git-HEAD-Bindung fehlgeschlagen: {blocker.get('error', 'unbekannt')}")
-        issues.append({
-            "wrapper_integrity": True,
-            "file": INSTALLER_DIR,
-            "head": result.get("head"),
-            "repairable": bool(result.get("success")),
-            "result": result,
-        })
+                marker = RED + "✗" + RESET if release_authority_bound else YELLOW + "[i]" + RESET
+                print(f"{marker} Git-HEAD-Bindung fehlgeschlagen: {blocker.get('error', 'unbekannt')}")
+        if release_authority_bound:
+            issues.append({
+                "wrapper_integrity": True,
+                "file": INSTALLER_DIR,
+                "head": result.get("head"),
+                "repairable": bool(result.get("success")),
+                "result": result,
+            })
+        else:
+            print(
+                f"  {YELLOW}[i]{RESET} Die Rechteprüfung verändert weder "
+                "Wrapper-Inhalte noch privilegierte Launcher. Für einen "
+                "Stable-Abgleich die vollständige Systemreparatur verwenden."
+            )
 
     for label, preview in root_launchers:
         if preview.get("success"):
             continue
         status = str(preview.get("status") or "unknown")
-        print(
-            f"{RED}✗{RESET} {label} {preview.get('path')}: "
-            f"stimmt nicht mit dem gebundenen Git-HEAD überein ({status})."
+        comparison = (
+            "stimmt nicht mit dem gebundenen Release-Commit überein"
+            if release_authority_bound
+            else "besteht den lokalen root-eigenen Sicherheitsvertrag nicht"
         )
+        print(f"{RED}✗{RESET} {label} {preview.get('path')}: {comparison} ({status}).")
         issues.append({
             "root_launcher_integrity": True,
             "file": preview.get("path"),
             "head": preview.get("head") or result.get("head"),
             "status": status,
+            "stable_repair_required": not release_authority_bound,
             "result": preview,
         })
     return issues
@@ -4367,6 +4423,15 @@ def fix_sudoers_permissions(issues, *, bound_privileged_preimages=None):
                 )
                 perm_logger.info("Sudoers ueber Web-Installer-Reparatur bereinigt.")
                 return True
+            reason_code = str(result.get("reason_code") or "")
+            if reason_code in {"stable_repair_required", "bootstrap_required"}:
+                print(f"{YELLOW}[i]{RESET} {result.get('message', 'Separater Stable-Reparaturweg erforderlich')}")
+                perm_logger.warning(
+                    "Privilegierte Installer-Dateien blieben unverändert (%s): %s",
+                    reason_code,
+                    result.get("message", ""),
+                )
+                return False
             _print_update_readiness_blockers(result.get("readiness"))
             print(f"{RED}FEHLER{RESET} Web-Installer-Reparatur meldet Fehler: {result.get('message', 'unbekannt')}")
             perm_logger.error("Web-Installer-Reparatur fehlgeschlagen: %s", result)
@@ -5350,7 +5415,17 @@ def run_permissions_wizard(
             )
             return False
     file_issues = check_file_permissions()
-    sudo_issues = check_wrapper_integrity() + check_sudoers_permissions()
+    expected_release_commit = str(
+        os.environ.get("E3DC_RELEASE_EXPECTED_COMMIT") or ""
+    ).strip().lower()
+    release_authority_bound = bool(
+        release_quiesced
+        and bound_privileged_preimages is not None
+        and re.fullmatch(r"[0-9a-f]{40}", expected_release_commit)
+    )
+    sudo_issues = check_wrapper_integrity(
+        release_authority_bound=release_authority_bound
+    ) + check_sudoers_permissions()
     service_issues = [] if release_quiesced else check_services()
     legacy_issues = [] if release_quiesced else check_legacy_autostart()
     watchdog_installed = os.path.exists(PI_GUARD_PATH) or os.path.exists(PIGUARD_SERVICE)
@@ -5417,9 +5492,9 @@ def run_permissions_wizard(
         log_task_completed("Rechte prüfen & korrigieren", details="Alle Probleme behoben")
         return True
     else:
-        print("\n⚠ Einige Probleme konnten nicht korrigiert werden.\n")
-        perm_logger.error("⚠ Einige Probleme konnten nicht automatisch korrigiert werden - manuelle Intervention notwendig.")
-        log_error("permissions", "Einige Probleme konnten nicht automatisch korrigiert werden")
+        print("\n⚠ Einige Befunde benötigen den direkt darüber genannten sicheren Reparaturweg.\n")
+        perm_logger.error("⚠ Einige Befunde benötigen einen separaten sicheren Reparaturweg.")
+        log_error("permissions", "Einige Befunde benötigen einen separaten sicheren Reparaturweg")
         return False
 
 

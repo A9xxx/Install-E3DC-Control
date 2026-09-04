@@ -90,11 +90,15 @@ def running_charge_ramp_contract(
         limited = True
     elif raw_target > current:
         direction = "up"
-        applied = quantize_down(min(raw_target, current + up_step))
-        limited = applied != raw_target
+        # Nach bestätigter realer Ladung ist ``raw_target`` bereits durch
+        # Budget, Fahrzeug-, Treiber- und Infrastrukturgrenzen autorisiert.
+        # Eine zusätzliche globale +1-A-Rampe würde nur PV exportieren und
+        # konkurriert mit der physischen OBC-Rampe des Fahrzeugs.
+        applied = raw_target
+        limited = False
         changed = applied != current
         next_ramp_ts = now if changed else last
-        reason = "amp_up_step" if limited else "target_reached"
+        reason = "target_reached_direct_up"
     else:
         direction = "down"
         floor = 0 if hard_stop else minimum

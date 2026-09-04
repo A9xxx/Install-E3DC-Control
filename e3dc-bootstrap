@@ -14,12 +14,16 @@ EXPECTED_SHA=$3
 EXPECTED_ROLE=$4
 BOUND_PEER_IP=${E3DC_BOOTSTRAP_BOUND_PEER_IP:-}
 ENTRY_MODE=${E3DC_BOOTSTRAP_ENTRY_MODE:-rescue}
+CONFIRM_LOCAL_DRIFT=${E3DC_UPDATE_CONFIRM_LOCAL_DRIFT:-0}
 
 case "$ENTRY_MODE" in
     regular|rescue) ;;
     *) echo "Interner Update-Einstiegsmodus ist ungültig." >&2; exit 2 ;;
 esac
-
+case "$CONFIRM_LOCAL_DRIFT" in
+    0|1) ;;
+    *) echo "Interne Freigabe lokaler Inhaltsabweichungen ist ungültig." >&2; exit 2 ;;
+esac
 case "$TARGET" in
     /*) ;;
     *) echo "Installationspfad muss absolut sein." >&2; exit 2 ;;
@@ -109,6 +113,7 @@ if [ "$(id -u)" -eq 0 ]; then
         E3DC_BOOTSTRAP_RUNNER_ROOT="$SCRIPT_DIR" \
         E3DC_BOOTSTRAP_USER="$INSTALL_USER" \
         E3DC_BOOTSTRAP_ENTRY_MODE="$ENTRY_MODE" \
+        E3DC_UPDATE_CONFIRM_LOCAL_DRIFT="$CONFIRM_LOCAL_DRIFT" \
         "$PYTHON" -I -B "$SCRIPT_DIR/Installer/update_simple.py" \
         --target "$TARGET" \
         --install-user "$INSTALL_USER" \
@@ -122,6 +127,7 @@ exec sudo -- env \
     E3DC_BOOTSTRAP_RUNNER_ROOT="$SCRIPT_DIR" \
     E3DC_BOOTSTRAP_USER="$INSTALL_USER" \
     E3DC_BOOTSTRAP_ENTRY_MODE="$ENTRY_MODE" \
+    E3DC_UPDATE_CONFIRM_LOCAL_DRIFT="$CONFIRM_LOCAL_DRIFT" \
     "$PYTHON" -I -B "$SCRIPT_DIR/Installer/update_simple.py" \
     --target "$TARGET" \
     --install-user "$INSTALL_USER" \

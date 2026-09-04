@@ -5,8 +5,10 @@
 from __future__ import annotations
 
 import datetime
+import re
 import time
 from typing import Any, Dict, Optional, Tuple
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:
     from Installer.Storage.common import safe_float, safe_int
@@ -697,15 +699,52 @@ def build_ladekurve_meta(plan: Dict[str, Any]) -> Dict[str, Any]:
         target_tl = []
     if not isinstance(sim_tl, list):
         sim_tl = []
+    canonical_plan = bool(
+        plan.get("schema_version") == "storage_dispatch_plan_v1"
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", str(plan.get("plan_id") or ""))
+        and isinstance(plan.get("slots"), list)
+    )
+    if canonical_plan:
+        canonical_sim_tl = []
+        for slot in plan.get("slots") or []:
+            if not isinstance(slot, dict):
+                continue
+            projection = (
+                slot.get("projection")
+                if isinstance(slot.get("projection"), dict)
+                else {}
+            )
+            soc = safe_float(projection.get("soc_pct"), -1.0)
+            start_ts_ms = safe_float(slot.get("start_ts_ms"), 0.0)
+            if not (0.0 <= soc <= 100.0 and start_ts_ms > 0.0):
+                continue
+            canonical_sim_tl.append({
+                "ts": start_ts_ms,
+                "soc": soc,
+                "pv_w": safe_float(projection.get("pv_w"), 0.0),
+            })
+        if len(canonical_sim_tl) < 2:
+            return {}
+        sim_tl = canonical_sim_tl
     if not target_tl and not sim_tl:
         return {}
 
-    day_ms = 86400000.0
-    today0_dt = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    timezone_name = str(plan.get("timezone") or "Europe/Berlin")
+    try:
+        storage_tz = ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        storage_tz = ZoneInfo("Europe/Berlin")
+    today0_dt = datetime.datetime.now(storage_tz).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
     today0_ms = today0_dt.timestamp() * 1000.0
     meta = plan.get("target_curve_meta") if isinstance(plan.get("target_curve_meta"), dict) else {}
 
     display_start_ms: Optional[float] = None
+    display_start_from_simulator_meta = False
     display_label = "Heute"
     if meta.get("curve_day_start_ts"):
         try:
@@ -714,6 +753,7 @@ def build_ladekurve_meta(plan: Dict[str, Any]) -> Dict[str, Any]:
             # boundary. Re-normalizing it to the host timezone can move the
             # window back by a day on UTC bare-metal systems.
             display_start_ms = raw_start_ms
+            display_start_from_simulator_meta = True
             display_label = str(meta.get("curve_day_label") or display_label)
         except Exception:
             display_start_ms = None
@@ -722,8 +762,18 @@ def build_ladekurve_meta(plan: Dict[str, Any]) -> Dict[str, Any]:
         days = []
         all_points = sim_tl or target_tl
         for offset in (0, 1):
-            start = today0_ms + offset * day_ms
-            end = start + day_ms
+            day_date = today0_dt.date() + datetime.timedelta(days=offset)
+            next_date = day_date + datetime.timedelta(days=1)
+            start = datetime.datetime.combine(
+                day_date,
+                datetime.time.min,
+                tzinfo=storage_tz,
+            ).timestamp() * 1000.0
+            end = datetime.datetime.combine(
+                next_date,
+                datetime.time.min,
+                tzinfo=storage_tz,
+            ).timestamp() * 1000.0
             slots = []
             for point in all_points:
                 try:
@@ -760,16 +810,52 @@ def build_ladekurve_meta(plan: Dict[str, Any]) -> Dict[str, Any]:
 
     if display_start_ms is None and target_tl:
         first_ts = safe_float(target_tl[0].get("ts"), 0.0)
-        display_start_ms = datetime.datetime.fromtimestamp(first_ts / 1000.0).replace(
+        display_start_ms = datetime.datetime.fromtimestamp(first_ts / 1000.0, storage_tz).replace(
             hour=0, minute=0, second=0, microsecond=0
         ).timestamp() * 1000.0
         display_label = "Morgen" if display_start_ms > today0_ms + 3600000.0 else "Heute"
     if display_start_ms is None:
         return {}
 
-    display_end_ms = display_start_ms + day_ms
-    display_date = datetime.datetime.fromtimestamp(display_start_ms / 1000.0).date()
-    day_offset = round((display_start_ms - today0_ms) / day_ms)
+    display_date = datetime.datetime.fromtimestamp(
+        display_start_ms / 1000.0,
+        storage_tz,
+    ).date()
+    if display_start_from_simulator_meta:
+        # Eine explizite Simulatorgrenze kann absichtlich von Mitternacht
+        # abweichen. Das Ende muss relativ zu genau derselben lokalen Grenze
+        # am Folgetag gebildet werden; sonst schrumpft z. B. ein um 22 Uhr
+        # beginnender Anzeigetag auf zwei Stunden. Die lokale Tagesaddition
+        # bewahrt dabei auch über eine Sommerzeitgrenze dieselbe Wanduhrzeit.
+        display_start_dt = datetime.datetime.fromtimestamp(
+            display_start_ms / 1000.0,
+            storage_tz,
+        )
+        display_end_ms = (
+            display_start_dt + datetime.timedelta(days=1)
+        ).timestamp() * 1000.0
+    else:
+        display_end_ms = datetime.datetime.combine(
+            display_date + datetime.timedelta(days=1),
+            datetime.time.min,
+            tzinfo=storage_tz,
+        ).timestamp() * 1000.0
+    day_offset = (display_date - today0_dt.date()).days
+
+    canonical_slot_ids = []
+    for slot in plan.get("slots") or []:
+        if not isinstance(slot, dict):
+            continue
+        slot_id = str(slot.get("slot_id") or "")
+        start_ts_ms = safe_float(slot.get("start_ts_ms"), 0.0)
+        end_ts_ms = safe_float(slot.get("end_ts_ms"), 0.0)
+        if not (
+            re.fullmatch(r"sha256:[0-9a-f]{64}", slot_id)
+            and display_start_ms <= start_ts_ms < display_end_ms
+            and end_ts_ms > start_ts_ms
+        ):
+            continue
+        canonical_slot_ids.append(slot_id)
 
     target_points = []
     for point in target_tl:
@@ -785,19 +871,34 @@ def build_ladekurve_meta(plan: Dict[str, Any]) -> Dict[str, Any]:
             sim_points.append(point)
     sim_points.sort(key=lambda item: safe_float(item.get("ts"), 0.0))
 
+    if canonical_plan and len(sim_points) < 2:
+        return {}
+    if not canonical_plan and not sim_points and target_points:
+        # Alte, nicht kanonische Pläne hatten teilweise nur eine
+        # target_timeline. Dieser reine Kompatibilitätspfad bewahrt deren
+        # bisherige Metadatenanzeige; für storage_dispatch_plan_v1 bleibt die
+        # Trennung zwischen Sollkurve und belegter SoC-Projektion strikt.
+        sim_points = [
+            {"ts": ts, "soc": soc, "pv_w": 0.0}
+            for ts, soc in target_points
+        ]
     if not target_points and not sim_points:
         return {}
 
     def soc_near(ts: float, fallback: float) -> float:
-        if not target_points:
+        if not sim_points:
             return fallback
-        return min(target_points, key=lambda item: abs(item[0] - ts))[1]
+        nearest = min(
+            sim_points,
+            key=lambda item: abs(safe_float(item.get("ts"), 0.0) - ts),
+        )
+        return safe_float(nearest.get("soc"), fallback)
 
-    first_ts, first_soc = target_points[0] if target_points else (
+    first_ts, first_soc = (
         safe_float(sim_points[0].get("ts"), 0.0),
         safe_float(sim_points[0].get("soc"), 0.0),
     )
-    last_ts, last_soc = target_points[-1] if target_points else (
+    last_ts, last_soc = (
         safe_float(sim_points[-1].get("ts"), 0.0),
         safe_float(sim_points[-1].get("soc"), 0.0),
     )
@@ -808,40 +909,49 @@ def build_ladekurve_meta(plan: Dict[str, Any]) -> Dict[str, Any]:
         peak_pv_w = safe_float(peak_slot.get("pv_w"), 0.0)
         if peak_pv_w > 500.0:
             peak = {
-                "t": datetime.datetime.fromtimestamp(peak_ts / 1000.0).strftime("%H:%M"),
+                "t": datetime.datetime.fromtimestamp(peak_ts / 1000.0, storage_tz).strftime("%H:%M"),
                 "soc": round(soc_near(peak_ts, safe_float(peak_slot.get("soc"), first_soc)), 1),
                 "pv_kw": round(peak_pv_w / 1000.0, 1),
                 "past": peak_ts < now_ms,
                 "source": "storage_plan",
             }
     if peak is None:
-        nearest_ts, nearest_soc = min(target_points or [(first_ts, first_soc)], key=lambda item: abs(item[0] - now_ms))
+        nearest_point = min(
+            sim_points,
+            key=lambda item: abs(safe_float(item.get("ts"), 0.0) - now_ms),
+        )
+        nearest_ts = safe_float(nearest_point.get("ts"), first_ts)
+        nearest_soc = safe_float(nearest_point.get("soc"), first_soc)
         peak = {
-            "t": datetime.datetime.fromtimestamp(nearest_ts / 1000.0).strftime("%H:%M"),
+            "t": datetime.datetime.fromtimestamp(nearest_ts / 1000.0, storage_tz).strftime("%H:%M"),
             "soc": round(nearest_soc, 1),
             "past": nearest_ts < now_ms,
-            "source": "target_timeline",
+            "source": "storage_plan_projection",
         }
 
     freilauf_ts = safe_float(plan.get("ladeende_ts"), 0.0) or safe_float(meta.get("curve_end_ts"), 0.0) or last_ts
     if not (display_start_ms <= freilauf_ts < display_end_ms):
         freilauf_ts = last_ts
-    freilauf_soc = safe_float(plan.get("ladeende_soc"), safe_float(plan.get("effective_target_soc"), safe_float(plan.get("target_soc"), last_soc)))
+    freilauf_soc = safe_float(plan.get("ladeende_soc"), last_soc)
     return {
+        "schema_version": "storage_ladekurve_meta_v1",
+        "plan_id": plan.get("plan_id"),
+        "slot_ids": canonical_slot_ids,
+        "slot_count": len(canonical_slot_ids),
         "day_label": display_label,
         "day_offset": int(day_offset),
         "day_start_ts": int(display_start_ms),
         "date": display_date.isoformat(),
         "has_target_curve": bool(target_points),
         "ladestart": {
-            "t": datetime.datetime.fromtimestamp(first_ts / 1000.0).strftime("%H:%M"),
+            "t": datetime.datetime.fromtimestamp(first_ts / 1000.0, storage_tz).strftime("%H:%M"),
             "soc": round(first_soc, 1),
             "past": first_ts < now_ms,
             "forecast": display_start_ms > today0_ms,
         },
         "peak": peak,
         "freilauf": {
-            "t": datetime.datetime.fromtimestamp(freilauf_ts / 1000.0).strftime("%H:%M"),
+            "t": datetime.datetime.fromtimestamp(freilauf_ts / 1000.0, storage_tz).strftime("%H:%M"),
             "soc": round(freilauf_soc, 1),
             "past": freilauf_ts < now_ms,
         },

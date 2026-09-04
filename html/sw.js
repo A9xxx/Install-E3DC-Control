@@ -1,4 +1,4 @@
-const CACHE_NAME = 'e3dc-control-v5-4-4i-static';
+const CACHE_NAME = 'e3dc-control-v5-4-5-static';
 const ASSETS = [
   'assets/vendor/bootstrap/css/bootstrap.min.css',
   'assets/vendor/fontawesome/css/all.min.css',

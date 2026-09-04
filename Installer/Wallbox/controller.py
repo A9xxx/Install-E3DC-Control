@@ -16,6 +16,8 @@ import math
 from .modes import (
     MODE_BASE,
     MODE_OFF,
+    MODE_PRICE,
+    STORAGE_FLOOR_MODES,
     normalize_wb_mode,
 )
 from .decision import status_connected
@@ -91,7 +93,8 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                    phase_count_by_id=None, watts_per_amp_by_id=None,
                    grid_phase_limit_vector=None, phase_rotation_by_id=None,
                    unmanaged_phase_amps=None,
-                   electrical_reservation_phase_count_by_id=None):
+                   electrical_reservation_phase_count_by_id=None,
+                   pv_total_cap_w=None, storage_total_cap_w=None):
     """
     Verteilt 'available_watts' auf alle verbundenen Wallboxen.
 
@@ -130,6 +133,26 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
     Autonome oder unmanaged Verbraucher werden konservativ gegen den verfügbaren
     Rest reserviert und erhalten keine Stromkommandos.
 
+    ``pv_total_cap_w`` und ``storage_total_cap_w`` aktivieren gemeinsam einen
+    verschachtelten Gruppenvertrag. Beide Werte sind kumulative Gesamtdeckel:
+
+    * PV-only-Modi dürfen zusammen höchstens ``pv_total_cap_w`` erhalten.
+    * Speicherberechtigte Modi dürfen aus dem verbleibenden gemeinsamen
+      Gesamtdeckel bis ``storage_total_cap_w`` versorgt werden.
+
+    Die PV- und Speicherleistung werden dabei nicht als physikalische Quellen
+    geraten oder in zwei unabhängigen Läufen verteilt. Stattdessen werden der
+    PV-only-Subsetdeckel und der Gesamtdeckel in demselben Mindeststrom-,
+    Fairness- und Phasenakkumulator geprüft. Das erhält auch bei gemischten
+    1p-/3p-Minima jede innerhalb beider Deckel ausführbare Kombination. Der
+    Speicherdeckel muss mindestens so groß wie der PV-Deckel sein. Ein
+    fehlender, negativer, nicht endlicher oder nicht monotoner Vertrag bleibt
+    fail-closed bei 0 W.
+    MODE_PRICE erhält dadurch keine neue Netzfreigabe: Seine bestehende
+    Sofort-Priorität gilt weiterhin ausschließlich bei einer expliziten
+    ``price_optimizing_active``-Freigabe; ein Netzbudget ist nicht Bestandteil
+    dieses Vertrags.
+
     Der Wattvertrag ergänzt je Ladepunkt ``target_power_w``,
     ``target_phases`` und ``target_amp_per_phase``; ``target_amp`` bleibt der
     rückwärtskompatible Alias für den Strom je aktiver Phase. Zusätzlich
@@ -138,16 +161,58 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
     getrennten Kapazitätsvertrag.
     """
     alloc = {}
+    source_budget_contract_active = bool(
+        pv_total_cap_w is not None or storage_total_cap_w is not None
+    )
     strict_watt_contract = bool(
-        isinstance(phase_count_by_id, dict)
+        source_budget_contract_active
+        or isinstance(phase_count_by_id, dict)
         or isinstance(watts_per_amp_by_id, dict)
     )
     try:
         remaining_watts = max(0.0, float(available_watts or 0.0))
     except (TypeError, ValueError):
         remaining_watts = 0.0
-    if strict_watt_contract and not math.isfinite(remaining_watts):
+    if (
+        strict_watt_contract or source_budget_contract_active
+    ) and not math.isfinite(remaining_watts):
         remaining_watts = 0.0
+
+    source_budget_contract_valid = not source_budget_contract_active
+    effective_pv_total_cap_w = remaining_watts
+    effective_storage_total_cap_w = remaining_watts
+    if source_budget_contract_active:
+        try:
+            raw_pv_total_cap_w = float(pv_total_cap_w)
+            raw_storage_total_cap_w = float(storage_total_cap_w)
+            source_budget_contract_valid = bool(
+                math.isfinite(raw_pv_total_cap_w)
+                and math.isfinite(raw_storage_total_cap_w)
+                and raw_pv_total_cap_w >= 0.0
+                and raw_storage_total_cap_w >= 0.0
+                and raw_storage_total_cap_w + 1e-9 >= raw_pv_total_cap_w
+            )
+        except (TypeError, ValueError):
+            raw_pv_total_cap_w = 0.0
+            raw_storage_total_cap_w = 0.0
+            source_budget_contract_valid = False
+
+        if source_budget_contract_valid:
+            effective_storage_total_cap_w = min(
+                remaining_watts,
+                raw_storage_total_cap_w,
+            )
+            effective_pv_total_cap_w = min(
+                effective_storage_total_cap_w,
+                raw_pv_total_cap_w,
+            )
+            remaining_watts = effective_storage_total_cap_w
+        else:
+            effective_pv_total_cap_w = 0.0
+            effective_storage_total_cap_w = 0.0
+            remaining_watts = 0.0
+
+    pv_only_allocated_w = 0.0
     active_chargers = []
     per_charger_limits = max_amp_by_id if isinstance(max_amp_by_id, dict) else {}
     fairness_weights = fairness_weight_by_id if isinstance(fairness_weight_by_id, dict) else {}
@@ -235,6 +300,7 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
         *,
         electrical_phases=None,
         rotation=None,
+        source_mode=None,
     ):
         target = max(0, int(target_amp or 0))
         reservation_phases = int(
@@ -255,6 +321,30 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                     target,
                     reservation_phases,
                     rotation,
+                ),
+            })
+        if source_budget_contract_active:
+            normalized_source_mode = normalize_wb_mode(source_mode)
+            storage_tier_eligible = bool(
+                normalized_source_mode in STORAGE_FLOOR_MODES
+            )
+            result.update({
+                'source_budget_contract_valid': bool(
+                    source_budget_contract_valid
+                ),
+                'eligible_budget_tiers': (
+                    ('pv', 'storage')
+                    if storage_tier_eligible
+                    else ('pv',)
+                ),
+                'source_ceiling_w': float(
+                    effective_storage_total_cap_w
+                    if storage_tier_eligible
+                    else effective_pv_total_cap_w
+                ),
+                'group_pv_total_cap_w': float(effective_pv_total_cap_w),
+                'group_storage_total_cap_w': float(
+                    effective_storage_total_cap_w
                 ),
             })
         return result
@@ -289,9 +379,9 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                 try:
                     fallback_max = float(max_amp)
                 except (TypeError, ValueError):
-                    fallback_max = 32.0
+                    fallback_max = 16.0
                 if not math.isfinite(fallback_max) or fallback_max <= 0.0:
-                    fallback_max = 32.0
+                    fallback_max = 16.0
                 try:
                     hw_max = float(
                         per_charger_limits.get(c_id, fallback_max)
@@ -394,13 +484,14 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
 
         local_price_optimizing_active = (
             _price_active_for(price_optimizing_active, c_id)
-            and c_mode == 5
+            and c_mode == MODE_PRICE
         )
 
         if local_price_optimizing_active:
             behavior = 'instant'
         else:
             behavior = _classify_mode(c_mode)
+        storage_tier_eligible = bool(c_mode in STORAGE_FLOOR_MODES)
         phases = _phase_count(c['status'], c_id)
         electrical_phases = _electrical_phase_count(
             c['status'],
@@ -408,7 +499,13 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
             phases,
         )
         if strict_watt_contract and phases == 0:
-            alloc[c_id] = _allocation_result(0, 1, 0, 0.0)
+            alloc[c_id] = _allocation_result(
+                0,
+                1,
+                0,
+                0.0,
+                source_mode=c_mode,
+            )
             logger.debug(f"WB{c_id} keine frische/plausible Phasenzahl: Zuteilung bleibt 0A")
             continue
         if strict_electrical_reservation and electrical_phases == 0:
@@ -419,6 +516,7 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                 _watts_per_amp(c_id, phases),
                 electrical_phases=0,
                 rotation=_mapped_value(rotations_by_id, c_id),
+                source_mode=c_mode,
             )
             logger.debug(
                 f"WB{c_id} ohne gültigen elektrischen Phasenvertrag: "
@@ -433,7 +531,13 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
             charger_max_amp = int(max_amp)
         charger_max_amp = max(0, min(int(max_amp), charger_max_amp))
         if strict_watt_contract and charger_max_amp < 6:
-            alloc[c_id] = _allocation_result(0, 1, phases, w_per_amp)
+            alloc[c_id] = _allocation_result(
+                0,
+                1,
+                phases,
+                w_per_amp,
+                source_mode=c_mode,
+            )
             logger.debug(f"WB{c_id} Stromlimit unter 6A: Zuteilung bleibt 0A")
             continue
         max_w = charger_max_amp * w_per_amp
@@ -458,6 +562,7 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                 'fairness_weight': fairness_weight,
                 'mode': c_mode,
                 'behavior': behavior,
+                'storage_tier_eligible': storage_tier_eligible,
                 'allocated_amp': 0,
                 'state': 1,
                 'running': _status_running(c['status']),
@@ -477,6 +582,7 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                 'fairness_weight': fairness_weight,
                 'mode':          c_mode,
                 'behavior':      behavior,
+                'storage_tier_eligible': storage_tier_eligible,
                 'allocated_amp': 0,
                 'state':         1,
                 'running':       _status_running(c['status']),
@@ -496,6 +602,7 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                 'fairness_weight': fairness_weight,
                 'mode':          c_mode,
                 'behavior':      behavior,
+                'storage_tier_eligible': storage_tier_eligible,
                 'allocated_amp': 0,
                 'state':         1,
                 'running':       _status_running(c['status']),
@@ -516,6 +623,13 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
         if math.isfinite(remaining_watts):
             if remaining_watts + 1e-9 < delta_a * c['w_per_amp']:
                 return False
+        if (
+            source_budget_contract_active
+            and not c.get('storage_tier_eligible', False)
+            and pv_only_allocated_w + delta_a * c['w_per_amp']
+            > effective_pv_total_cap_w + 1e-9
+        ):
+            return False
         if phase_limits is not None:
             if not phase_limits_valid:
                 return False
@@ -537,10 +651,15 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
         return True
 
     def _apply_delta(c, delta_a):
-        nonlocal remaining_watts
+        nonlocal remaining_watts, pv_only_allocated_w
         c['allocated_amp'] += delta_a
         if math.isfinite(remaining_watts):
             remaining_watts -= delta_a * c['w_per_amp']
+        if (
+            source_budget_contract_active
+            and not c.get('storage_tier_eligible', False)
+        ):
+            pv_only_allocated_w += delta_a * c['w_per_amp']
         if phase_limits is not None:
             rot = c.get('rotation')
             if c['electrical_phases'] >= 3:
@@ -684,6 +803,7 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
             c['w_per_amp'],
             electrical_phases=c['electrical_phases'],
             rotation=c.get('rotation'),
+            source_mode=c.get('mode'),
         )
 
     return alloc

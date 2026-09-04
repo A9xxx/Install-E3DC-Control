@@ -64,19 +64,23 @@
 !/Installer/Storage/process_singleton.py
 !/Installer/Storage/rscp_commands.py
 !/Installer/Wallbox/__init__.py
+!/Installer/Wallbox/actuator_contracts.py
 !/Installer/Wallbox/charger_controller.py
 !/Installer/Wallbox/command_executor.py
 !/Installer/Wallbox/command_gate.py
 !/Installer/Wallbox/config.py
 !/Installer/Wallbox/controller.py
 !/Installer/Wallbox/cycle_context.py
+!/Installer/Wallbox/deficit_control.py
 !/Installer/Wallbox/decision.py
+!/Installer/Wallbox/demand_contract.py
 !/Installer/Wallbox/diagnostics.py
 !/Installer/Wallbox/drivers.py
 !/Installer/Wallbox/e3dc_session.py
 !/Installer/Wallbox/goe_session.py
 !/Installer/Wallbox/modes.py
 !/Installer/Wallbox/openwb_pro_session.py
+!/Installer/Wallbox/openwb_pro_control_lease.py
 !/Installer/Wallbox/openwb_session.py
 !/Installer/Wallbox/output_ledger.py
 !/Installer/Wallbox/phase_balancing.py
@@ -89,6 +93,7 @@
 !/Installer/Wallbox/runtime_state.py
 !/Installer/Wallbox/scheduler.py
 !/Installer/Wallbox/soc_tracker.py
+!/Installer/Wallbox/source_watt_cap.py
 !/Installer/Wallbox/status_service.py
 !/Installer/Wallbox/storage_intent.py
 !/Installer/Wallbox/surplus_control.py
@@ -195,6 +200,7 @@
 !/Installer/rollback.py
 !/Installer/rscp_acquisition.py
 !/Installer/rscp_client.py
+!/Installer/runtime_permissions_repair.py
 !/Installer/runtime_logging.py
 !/Installer/self_update.py
 !/Installer/send_push.py
@@ -228,6 +234,7 @@
 !/Installer/update.py
 !/Installer/release_version.py
 !/Installer/update_simple.py
+!/Installer/update_drift.py
 !/Installer/update_legacy_forward.py
 !/Installer/update_offline_preflight.py
 !/Installer/update_prejournal_construction.py
@@ -358,6 +365,8 @@
 !/html/matter.php
 !/html/mobile.php
 !/html/openwb_cmd.php
+!/html/pv_forecast_diagnostics.js
+!/html/pv_forecast_diagnostics.min.js
 !/html/repair_wb_history.php
 !/html/rule_calm_analysis.php
 !/html/send_daily_telegram.php

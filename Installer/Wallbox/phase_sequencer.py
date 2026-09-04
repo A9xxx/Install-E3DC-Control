@@ -100,7 +100,7 @@ def begin_phase_transition_reservation(
     started_ts: Any = None,
     zero_settle_s: Any = 0,
     restart_delay_s: Any = 0,
-    charger_max_amp: Any = 32,
+    charger_max_amp: Any = 16,
     source: str = "manager_phase_command",
     reason: str = "phase_transition",
     wb_id: Any = None,
@@ -151,7 +151,7 @@ def begin_phase_transition_reservation(
     # Eine Umrechnung mit dem Verhältnis alter/neuer Phasen würde deshalb bei
     # 1p->3p weniger Leistung reservieren, als der bestätigte Wiederanlauf
     # tatsächlich ausgibt. Die Phasenzahl gehört ausschließlich in W/A.
-    current = min(max(float(_MIN_CHARGE_CURRENT_A), current), max(float(_MIN_CHARGE_CURRENT_A), _safe_float(charger_max_amp, 32.0)))
+    current = min(max(float(_MIN_CHARGE_CURRENT_A), current), max(float(_MIN_CHARGE_CURRENT_A), _safe_float(charger_max_amp, 16.0)))
     step = (
         _safe_float(current_step_amp, 0.0)
         or _safe_float(st.get("current_step_amp"), 0.0)
@@ -180,7 +180,7 @@ def begin_phase_transition_reservation(
         owner="wallbox_manager",
         source=source,
         reason_code=reason,
-        max_power_w=max(float(_MIN_CHARGE_CURRENT_A), _safe_float(charger_max_amp, 32.0)) * w_per_amp,
+        max_power_w=max(float(_MIN_CHARGE_CURRENT_A), _safe_float(charger_max_amp, 16.0)) * w_per_amp,
         transition_id=transition_id,
         clock_sample=clock_sample,
     )
@@ -218,7 +218,7 @@ class PhaseSwitchSequencer:
         self._state = state if isinstance(state, dict) else {}
         self._pending: Optional[Dict[str, Any]] = None
         self._pending_config: Dict[str, Any] = {}
-        self._pending_charger_max_amp: Any = 32
+        self._pending_charger_max_amp: Any = 16
         self._pending_status: Dict[str, Any] = {}
         self._pending_restart_delay_s: float = 0.0
         self._pending_clock_sample: Optional[Dict[str, Any]] = None
@@ -235,7 +235,7 @@ class PhaseSwitchSequencer:
         cp_payload: Optional[Dict[str, Any]] = None,
         hold_s: Any = None,
         restart_delay_s: Any = None,
-        charger_max_amp: Any = 32,
+        charger_max_amp: Any = 16,
         clock_sample: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Schlage den nächsten Schritt ohne Treiber-I/O vor.
@@ -388,7 +388,7 @@ class PhaseSwitchSequencer:
             if wire_receipt_ts <= 0.0 or phase_sent_ts != wire_receipt_ts:
                 self._pending = None
                 self._pending_config = {}
-                self._pending_charger_max_amp = 32
+                self._pending_charger_max_amp = 16
                 self._pending_status = {}
                 self._pending_restart_delay_s = 0.0
                 self._pending_clock_sample = None
@@ -534,7 +534,7 @@ class PhaseSwitchSequencer:
 
         self._pending = None
         self._pending_config = {}
-        self._pending_charger_max_amp = 32
+        self._pending_charger_max_amp = 16
         self._pending_status = {}
         self._pending_restart_delay_s = 0.0
         self._pending_clock_sample = None
@@ -588,7 +588,7 @@ class PhaseSwitchSequencer:
             openwb_pro_session.clear_phase_wait(self._state)
         self._pending = None
         self._pending_config = {}
-        self._pending_charger_max_amp = 32
+        self._pending_charger_max_amp = 16
         self._pending_status = {}
         self._pending_restart_delay_s = 0.0
         self._pending_clock_sample = None

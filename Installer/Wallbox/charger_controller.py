@@ -1,8 +1,9 @@
 """Autoritativer, nebenwirkungsfreier Befehlsplaner für einen Wallboxzyklus."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict
 
+from .actuator_contracts import ActuatorIntent, WallboxCapability
 from .cycle_context import ChargerCycleContext, CycleContext
 from . import decision
 
@@ -15,6 +16,7 @@ class ControllerResult:
     payload: Dict[str, Any]
     reason: str
     error: str = ""
+    actuator_intent: Dict[str, Any] = field(default_factory=dict)
 
 
 class ChargerController:
@@ -29,6 +31,7 @@ class ChargerController:
         "set_current",
         "set_pv_mode",
         "set_phases",
+        "set_heartbeat",
         "stop",
         "emergency_stop",
         "trigger_cp_interrupt",
@@ -47,6 +50,12 @@ class ChargerController:
         driver = data.get("driver") if isinstance(data.get("driver"), dict) else {}
         decisions = data.get("decisions") if isinstance(data.get("decisions"), dict) else {}
         inputs = data.get("inputs") if isinstance(data.get("inputs"), dict) else {}
+        capability_data = data.get("capability") if isinstance(data.get("capability"), dict) else {}
+        capability = (
+            WallboxCapability.from_mapping(capability_data)
+            if capability_data
+            else WallboxCapability.from_runtime(driver=driver, inputs=inputs)
+        )
         return ChargerCycleContext(
             wb_id=int(data.get("wb_id", 0) or 0),
             public_mode=int(mode.get("public", 0) or 0),
@@ -70,6 +79,8 @@ class ChargerController:
             observe_only=bool(driver.get("observe_only", False)),
             priority_forced_stop=bool(inputs.get("priority_forced_stop", False)),
             budget_timeout=bool(inputs.get("budget_timeout", False)),
+            cycle_token=str(data.get("cycle_token") or ""),
+            capability=capability,
             current_decision=decisions.get("current") or {},
             start_stop_decision=decisions.get("start_stop") or {},
             phase_recommendation=decisions.get("phase") or {},
@@ -77,7 +88,7 @@ class ChargerController:
 
     @staticmethod
     def build_payload(context: ChargerCycleContext):
-        return decision.build_wallbox_decision_payload(
+        payload = decision.build_wallbox_decision_payload(
             wb_id=context.wb_id, public_mode=context.public_mode, control_mode=context.control_mode,
             current_decision=dict(context.current_decision),
             start_stop_decision=dict(context.start_stop_decision),
@@ -92,6 +103,9 @@ class ChargerController:
             e3dc_native_toggle=context.e3dc_native_toggle, observe_only=context.observe_only,
             priority_forced_stop=context.priority_forced_stop, budget_timeout=context.budget_timeout,
         )
+        payload["cycle_token"] = str(context.cycle_token or "")
+        payload["capability"] = context.capability.as_dict()
+        return payload
 
     def plan(self, cycle: CycleContext):
         if not isinstance(cycle, CycleContext) or len(cycle.chargers) != 1:
@@ -99,12 +113,23 @@ class ChargerController:
         context = cycle.chargers[0]
         payload = self.build_payload(context)
         command = decision.driver_command_from_decision_payload(payload)
+        planned_intent = ActuatorIntent.from_command(
+            command,
+            wb_id=context.wb_id,
+            cycle_token=context.cycle_token,
+            decision_allowed_w=context.allowed_w,
+            capability=context.capability,
+            source="charger_controller",
+            stage="planned",
+        ).as_dict()
+        payload["planned_actuator_intent"] = planned_intent
         return ControllerResult(
             authoritative=True,
             valid=True,
             command=command,
             payload=payload,
             reason="planned",
+            actuator_intent=planned_intent,
         )
 
     def plan_payload(self, payload, *, now_ts=0.0):
@@ -114,20 +139,27 @@ class ChargerController:
             cycle = CycleContext(now_ts=float(now_ts or 0.0), chargers=(context,))
             return self.plan(cycle)
         except Exception as exc:
+            command = {
+                "schema_version": "wallbox_driver_command_v1",
+                "kind": "noop",
+                "amp": 0,
+                "target_phases": 0,
+                "reason": "controller_error",
+                "source": "charger_controller",
+            }
+            planned_intent = ActuatorIntent.from_command(
+                command,
+                source="charger_controller_error",
+                stage="planned",
+            ).as_dict()
             return ControllerResult(
                 authoritative=True,
                 valid=False,
-                command={
-                    "schema_version": "wallbox_driver_command_v1",
-                    "kind": "noop",
-                    "amp": 0,
-                    "target_phases": 0,
-                    "reason": "controller_error",
-                    "source": "charger_controller",
-                },
+                command=command,
                 payload=dict(payload) if isinstance(payload, dict) else {},
                 reason="controller_error",
                 error=str(exc),
+                actuator_intent=planned_intent,
             )
 
     def authorize_driver_command(self, command):
@@ -135,25 +167,37 @@ class ChargerController:
         cmd = dict(command) if isinstance(command, dict) else {}
         method = str(cmd.get("method") or cmd.get("kind") or "").strip()
         if method in self.DRIVER_METHODS:
+            planned_intent = ActuatorIntent.from_command(
+                cmd,
+                source="charger_controller_output_admission",
+                stage="admission_candidate",
+            ).as_dict()
             return ControllerResult(
                 authoritative=True,
                 valid=True,
                 command=cmd,
                 payload={},
                 reason="driver_command_approved",
+                actuator_intent=planned_intent,
             )
+        command = {
+            "schema_version": "wallbox_driver_command_v1",
+            "kind": "noop",
+            "amp": 0,
+            "target_phases": 0,
+            "reason": "unsupported_driver_command",
+            "source": "charger_controller",
+        }
         return ControllerResult(
             authoritative=True,
             valid=False,
-            command={
-                "schema_version": "wallbox_driver_command_v1",
-                "kind": "noop",
-                "amp": 0,
-                "target_phases": 0,
-                "reason": "unsupported_driver_command",
-                "source": "charger_controller",
-            },
+            command=command,
             payload={},
             reason="unsupported_driver_command",
             error=method or "missing_driver_method",
+            actuator_intent=ActuatorIntent.from_command(
+                command,
+                source="charger_controller_output_admission",
+                stage="rejected",
+            ).as_dict(),
         )

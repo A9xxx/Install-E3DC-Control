@@ -33,6 +33,8 @@ class WallboxRuntimeState:
     min_current_import_wh: Dict[int, float] = field(default_factory=dict)
     min_current_import_since: Dict[int, float] = field(default_factory=dict)
     min_current_import_last_ts: Dict[int, float] = field(default_factory=dict)
+    group_deficit_state: Dict[str, Any] = field(default_factory=dict)
+    group_deficit_binding: Dict[str, Any] = field(default_factory=dict)
 
     predump_wb_gate_open: bool = False
     predump_wb_gate_start_ts: float = 0.0

@@ -184,6 +184,111 @@ function runInstallerWriteJob($action, $module = null) {
     ];
 }
 
+function inspectRuntimePermissionsLauncher() {
+    $specs = [
+        ['/usr/local/sbin/e3dc-runtime-permissions-repair', 0755, 524288],
+        ['/etc/e3dc-control/runtime_permissions_contract.json', 0644, 1048576],
+    ];
+    foreach ($specs as [$path, $expectedMode, $maximumBytes]) {
+        clearstatcache(true, $path);
+        $meta = @lstat($path);
+        if (!is_array($meta)
+            || (($meta['mode'] ?? 0) & 0170000) !== 0100000
+            || (int)($meta['nlink'] ?? 0) !== 1
+            || (int)($meta['uid'] ?? -1) !== 0
+            || (int)($meta['gid'] ?? -1) !== 0
+            || (int)($meta['size'] ?? 0) <= 0
+            || (int)($meta['size'] ?? 0) > $maximumBytes
+            || (((int)($meta['mode'] ?? 0)) & 07777) !== $expectedMode) {
+            return [
+                'ok' => false,
+                'path' => $path,
+                'status' => 'missing_or_unsafe',
+            ];
+        }
+    }
+    $launcher = @file_get_contents('/usr/local/sbin/e3dc-runtime-permissions-repair');
+    $contractRaw = @file_get_contents('/etc/e3dc-control/runtime_permissions_contract.json');
+    $contract = is_string($contractRaw) ? json_decode($contractRaw, true) : null;
+    if (!is_string($launcher)
+        || strlen($launcher) < 1024
+        || strlen($launcher) > 524288
+        || !str_starts_with($launcher, "#!/usr/bin/python3\n")
+        || substr_count($launcher, 'e3dc_runtime_permissions_v1') !== 1
+        || substr_count($launcher, 'e3dc_runtime_permissions_cli_v3') !== 1
+        || !is_string($contractRaw)
+        || strlen($contractRaw) < 2
+        || strlen($contractRaw) > 1048576
+        || !is_array($contract)
+        || ($contract['schema'] ?? '') !== 'e3dc_runtime_permissions_v1'
+        || ($contract['launcher_feature'] ?? '') !== 'e3dc_runtime_permissions_cli_v3') {
+        return ['ok' => false, 'status' => 'content_invalid'];
+    }
+    return ['ok' => true, 'status' => 'ok'];
+}
+
+function runRuntimePermissionsRepair($checkOnly = false, $confirmationToken = '') {
+    $inspection = inspectRuntimePermissionsLauncher();
+    if (empty($inspection['ok'])) {
+        return [
+            'success' => false,
+            'error_code' => 'launcher_missing_or_unsafe',
+            'message' => 'Der root-eigene Rechte-Launcher oder sein Vertrag fehlt oder ist unsicher. Bitte den vollständigen Systemabgleich verwenden.',
+            'inspection' => $inspection,
+        ];
+    }
+    $confirmationToken = strtolower(trim((string)$confirmationToken));
+    if ($checkOnly && $confirmationToken !== '') {
+        return [
+            'success' => false,
+            'error_code' => 'confirmation_mode_invalid',
+            'message' => 'Nur-Lese-Prüfung und Dateilistenbestätigung dürfen nicht kombiniert werden.',
+        ];
+    }
+    if ($confirmationToken !== ''
+        && preg_match('/^[0-9a-f]{64}$/D', $confirmationToken) !== 1) {
+        return [
+            'success' => false,
+            'error_code' => 'confirmation_token_invalid',
+            'message' => 'Die Dateilistenfreigabe ist ungültig. Bitte starte die Rechtereparatur erneut.',
+        ];
+    }
+    $argv = [
+        '/usr/bin/sudo',
+        '-n',
+        '--',
+        '/usr/local/sbin/e3dc-runtime-permissions-repair',
+    ];
+    if ($checkOnly) {
+        $argv[] = '--check-json';
+    } elseif ($confirmationToken !== '') {
+        $argv[] = '--confirm-content-drift';
+    }
+    $options = ['max_output_bytes' => 4 * 1024 * 1024];
+    if ($confirmationToken !== '') {
+        // Das kurzlebige Secret bleibt aus argv, Umgebung, Prozessliste und
+        // Protokoll. Nur der feste sudoers-Modus erhält es über stdin.
+        $options['stdin'] = $confirmationToken . "\n";
+    }
+    $process = e3dcRunArgvProcess($argv, 180.0, $options);
+    $exitCode = (int)($process['exit_code'] ?? 1);
+    $decoded = json_decode(trim((string)($process['stdout'] ?? '')), true);
+    if (!is_array($decoded)) {
+        return [
+            'success' => false,
+            'error_code' => 'launcher_response_invalid',
+            'message' => 'Der Rechte-Launcher lieferte keine gültige Abschlussbestätigung.',
+            'exit_code' => $exitCode,
+            'process_error' => trim((string)($process['error'] ?? '')),
+        ];
+    }
+    $decoded['exit_code'] = $exitCode;
+    if ($exitCode !== 0) {
+        $decoded['success'] = false;
+    }
+    return $decoded;
+}
+
 function installCenterConfigField($key, $label, $type = 'text', $options = [], $help = '', $secret = false, $placeholder = '') {
     return [
         'key' => $key,
@@ -3561,6 +3666,57 @@ if (isset($_GET['action']) && $_GET['action'] === 'repair_permissions_dry_run') 
     echo json_encode(runInstallerAction('repair_permissions_dry_run'), JSON_UNESCAPED_UNICODE);
     exit;
 }
+
+if (isset($_GET['action']) && $_GET['action'] === 'repair_runtime_permissions') {
+    requireWebAuth(true);
+    header('Content-Type: application/json; charset=utf-8');
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        http_response_code(405);
+        echo json_encode(['success' => false, 'error' => 'Rechtereparatur nur per POST erlaubt'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    if (!validateInstallCenterCsrf()) {
+        http_response_code(403);
+        echo json_encode(['success' => false, 'error' => 'Sicherheits-Token ungültig. Bitte Seite neu laden.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $confirmContentDrift = isset($_POST['confirm_content_drift'])
+        && (string)$_POST['confirm_content_drift'] === '1';
+    $confirmationToken = $confirmContentDrift
+        ? (string)($_POST['confirmation_token'] ?? '')
+        : '';
+    if (!$confirmContentDrift && isset($_POST['confirmation_token'])) {
+        http_response_code(400);
+        echo json_encode([
+            'success' => false,
+            'error_code' => 'confirmation_mode_invalid',
+            'message' => 'Eine Dateilistenfreigabe wurde ohne bewusste Bestätigung übergeben.',
+        ], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    echo json_encode(
+        runRuntimePermissionsRepair(false, $confirmationToken),
+        JSON_UNESCAPED_UNICODE
+    );
+    exit;
+}
+
+if (isset($_GET['action']) && $_GET['action'] === 'check_runtime_permissions_repair') {
+    requireWebAuth(true);
+    header('Content-Type: application/json; charset=utf-8');
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        http_response_code(405);
+        echo json_encode(['success' => false, 'error' => 'Rechte-Preflight nur per POST erlaubt'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    if (!validateInstallCenterCsrf()) {
+        http_response_code(403);
+        echo json_encode(['success' => false, 'error' => 'Sicherheits-Token ungültig. Bitte Seite neu laden.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    echo json_encode(runRuntimePermissionsRepair(true), JSON_UNESCAPED_UNICODE);
+    exit;
+}
 ?>
 <!DOCTYPE html>
 <html lang="de" data-bs-theme="dark">
@@ -3724,17 +3880,18 @@ if (isset($_GET['action']) && $_GET['action'] === 'repair_permissions_dry_run') 
     <div class="alert alert-warning border-warning bg-warning bg-opacity-10 text-warning small">
         <i class="fas fa-triangle-exclamation me-1"></i>
         Sicherer Installationsmodus: Dienst-Start/Stop läuft nur für erlaubte Dienste.
-        Die Rechteprüfung ist read-only. Eine Reparatur startet den vorhandenen root-eigenen Systemjob mit Backup,
-        Rechteprojektion, Releaseabgleich und Dienstneustart; nutzerbeschreibbarer Installer-Code erhält keine sudo-Freigabe.
+        „Nur Rechte prüfen“ ist read-only. „Rechte reparieren“ korrigiert nur die Metadaten bekannter Pfade – ohne Backup,
+        Update oder Dienstneustart. „System reparieren“ bleibt getrennt und startet den vollständigen Stable-Abgleich.
+        Nutzerbeschreibbarer Installer-Code erhält keine sudo-Freigabe.
         Core-Dienste bleiben gegen Deinstallation geschützt.
     </div>
 
     <div class="utility-bar">
         <button class="btn btn-outline-info rounded-pill" onclick="runGlobalAction('permissions_check')">
-            <i class="fas fa-shield-halved me-1"></i> Rechte prüfen
+            <i class="fas fa-shield-halved me-1"></i> Nur Rechte prüfen (keine Änderung)
         </button>
         <button class="btn btn-outline-warning rounded-pill" onclick="runPermissionRepairUpdate()">
-            <i class="fas fa-tools me-1"></i> Rechte reparieren &amp; System abgleichen
+            <i class="fas fa-tools me-1"></i> System reparieren (Backup + Stable-Abgleich)
         </button>
         <button class="btn btn-outline-secondary rounded-pill" onclick="runGlobalAction('write_readiness')">
             <i class="fas fa-user-shield me-1"></i> Freigabe prüfen
@@ -3766,7 +3923,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'repair_permissions_dry_run') 
         <button class="btn btn-outline-primary rounded-pill" onclick="runGlobalAction('job_status')">
             <i class="fas fa-clipboard-list me-1"></i> Job-Status
         </button>
-        <span class="text-secondary small">Prüfaktionen lesen nur. Rechte-Reparatur und Update laufen über den root-eigenen Systemjob; Modulinstallation und Rückfall bleiben der administrativen Konsole vorbehalten.</span>
+        <span class="text-secondary small">Prüfaktionen lesen nur. Die enge Rechtereparatur ändert ausschließlich Besitzer, Gruppe und Modus bekannter Pfade. Systemreparatur und Update bleiben getrennte Systemjobs.</span>
     </div>
 
     <div id="installerStatus" class="installer-status skeleton">
@@ -3929,6 +4086,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'repair_permissions_dry_run') 
     </div>
 </div>
 
+<script src="<?= getAssetUrl('pv_forecast_diagnostics.js') ?>" defer></script>
 <script>
 const installCenterCsrfToken = <?= json_encode(installCenterCsrfToken(), JSON_UNESCAPED_UNICODE) ?>;
 const serviceControlCsrfToken = <?= json_encode(e3dcCsrfToken(), JSON_UNESCAPED_UNICODE) ?>;
@@ -4633,6 +4791,15 @@ function ruleCalmStatusBadge(status) {
     return `<span class="badge text-bg-secondary">${esc(normalized || 'unbekannt')}</span>`;
 }
 
+function ruleCalmDataQualityBadge(status) {
+    const normalized = String(status || 'NOT_ANALYZED').toUpperCase();
+    if (normalized === 'PASS') return '<span class="badge text-bg-success">unauffällig</span>';
+    if (normalized === 'HINT') return '<span class="badge text-bg-info">Hinweis</span>';
+    if (normalized === 'FAIL') return '<span class="badge text-bg-warning">auffällig</span>';
+    if (normalized === 'EVIDENCE_LIMIT') return '<span class="badge text-bg-secondary">EVIDENCE_LIMIT</span>';
+    return '<span class="badge text-bg-secondary">nicht ausgewertet</span>';
+}
+
 function ruleCalmServiceLabel(name) {
     const labels = {storage: 'Speicher', wallbox: 'Wallbox', heatpump: 'Wärmepumpe', ems: 'EMS'};
     return labels[name] || name;
@@ -4679,6 +4846,7 @@ function ruleCalmActionLabel(name) {
         WALLBOX_SUPPORT: 'Wallbox-Unterstützung',
         MANUAL: 'Manuell',
         STORAGE_ACTIVE: 'Speicher aktiv',
+        E3DC_AUTO: 'E3DC Auto',
         E3DC_AUTONOM: 'E3DC autonom',
         PARALLEL_WB_AUTO: 'Wallbox-Automatik'
     };
@@ -4752,15 +4920,16 @@ function renderRuleCalmTimeline(data) {
                     ${item.actor ? `<span class="small-code">${esc(ruleCalmActorLabel(item.actor))}</span>` : ''}
                     ${pattern ? `<div class="text-secondary mt-1">${esc(ruleCalmPatternLabel(pattern))}</div>` : ''}
                     ${item.alert ? '<span class="badge text-bg-warning mt-1">Muster</span>' : ''}
+                    ${!item.alert && item.lane === 'storage_live_plausibility' && pattern ? '<span class="badge text-bg-info mt-1">Datenhinweis</span>' : ''}
                 </div>
             </div>`;
     }).join('');
     return `<div class="text-secondary small mt-1">Die Zeitachse zeigt echte Wechsel und Schutzereignisse, nicht jeden Record.</div><div class="rule-calm-timeline">${rows}</div>`;
 }
 
-function renderRuleCalmViolations(violations) {
+function renderRuleCalmViolations(violations, emptyText = 'Keine auffälligen Muster erkannt.') {
     if (!violations.length) {
-        return '<div class="result-tile"><span class="ok">Keine auffälligen Muster erkannt.</span><div class="text-secondary mt-1">Wertnachführung im selben Contract zählt nicht als Besitzerwechsel.</div></div>';
+        return `<div class="result-tile"><span class="ok">${esc(emptyText)}</span></div>`;
     }
     const rows = violations.map(item => {
         const samples = Array.isArray(item.events)
@@ -4791,34 +4960,53 @@ function renderRuleCalmAnalysis(data) {
     const events = data.events || {};
     const checks = data.checks || {};
     const violations = Array.isArray(data.violations) ? data.violations : [];
+    const dataQualityFindings = Array.isArray(data.data_quality_findings) ? data.data_quality_findings : [];
+    const controlStatus = String(data.control_status || data.status || 'UNKNOWN').toUpperCase();
+    const dataQualityStatus = String(data.data_quality_status || 'NOT_ANALYZED').toUpperCase();
     const completeness = String(data.completeness || 'LEGACY').toUpperCase();
     const partial = completeness === 'PARTIAL';
     const legacy = completeness === 'LEGACY';
-    const evidenceLimit = partial || legacy;
+    const typedEvidenceLimit = controlStatus === 'EVIDENCE_LIMIT' || dataQualityStatus === 'EVIDENCE_LIMIT';
+    const evidenceLimit = partial || legacy || typedEvidenceLimit;
     const missingServices = Array.isArray(data.missing_services) ? data.missing_services : [];
     const analyzedServices = Array.isArray(data.analyzed_services) ? data.analyzed_services : [];
     const recordRange = ruleCalmRecordRange(data);
     const scopeDetail = ruleCalmScopeDetail(data);
-    const checkRows = Object.entries(checks).map(([name, check]) => {
+    const renderCheckRow = ([name, check]) => {
         const ok = check && check.ok !== false;
         const counts = check && check.counts
             ? Object.entries(check.counts).filter(([, value]) => Number(value || 0) > 0)
             : [];
         const countText = counts.length ? counts.map(([key, value]) => `${ruleCalmPatternLabel(key)}: ${value}`).join(', ') : 'keine Muster';
         return `<li>${boolBadge(ok, 'OK', 'auffällig', true)} <strong>${esc(ruleCalmCheckLabel(name))}</strong><div class="text-secondary small">${esc(countText)}</div></li>`;
-    }).join('');
+    };
+    const checkRows = Object.entries(checks)
+        .filter(([name]) => name !== 'storage_live_plausibility')
+        .map(renderCheckRow)
+        .join('');
+    const dataQualityCheckRow = checks.storage_live_plausibility
+        ? renderCheckRow(['storage_live_plausibility', checks.storage_live_plausibility])
+        : '<li>Keine Speicher-Datenqualität ausgewertet.</li>';
     const historical = data.scope === 'latest';
+    const laneMeaning = controlStatus === 'FAIL'
+        ? 'Im Entscheidungs-/Ausgangspfad wurde ein belegtes Ping-Pong, Veto oder ein Pfadkonflikt erkannt.'
+        : controlStatus === 'EVIDENCE_LIMIT'
+        ? 'Für eine belastbare Regelruhe-Aussage fehlt in mindestens einem Speicher-Record die typisierte Execution-/Ausgangssignatur.'
+        : 'Entscheidungsweg und tatsächlicher Aktor-/Ausgang blieben ohne belegtes Ping-Pong.';
+    const dataQualityMeaning = dataQualityStatus === 'FAIL'
+        ? 'Wiederholte oder anhaltende Messwertschutz-Guards machen die Datenqualität auffällig.'
+        : dataQualityStatus === 'HINT'
+        ? 'Ein einzelner oder kurzer Messwertschutz-Guard ist als Datenqualitätshinweis eingeordnet.'
+        : dataQualityStatus === 'PASS'
+        ? 'Im ausgewerteten Speicherverlauf liegt kein Messwertqualitätsbefund vor.'
+        : dataQualityStatus === 'EVIDENCE_LIMIT'
+        ? 'Für eine belastbare Datenqualitätsaussage fehlt in mindestens einem Speicher-Record die typisierte Live-Evidenz.'
+        : 'Die Speicher-Datenqualität wurde nicht separat ausgewertet.';
     const meaning = legacy
         ? 'Diese gespeicherte Auswertung stammt aus dem alten Public-v2-Vertrag. Ihr damaliger PASS-/FAIL-Status enthält keine belastbare Domänen-Vollständigkeit und wird deshalb nur als EVIDENCE_LIMIT angezeigt.'
         : partial
-        ? `Die Auswertung ist unvollständig: ${missingServices.map(ruleCalmServiceLabel).join(', ')} hatte keine auswertbaren Records. Das Ergebnis ${data.status === 'FAIL' ? '„auffällig“' : '„ohne Auffälligkeit“'} gilt nur für ${analyzedServices.map(ruleCalmServiceLabel).join(', ')}.`
-        : data.status === 'PASS'
-        ? (historical
-            ? 'In diesem historischen Record-Ausschnitt wurde kein auffälliges Muster gefunden.'
-            : 'Seit der aktuellen Prozessgrenze wurde kein auffälliges Ping-Pong- oder Messwertschutzmuster gefunden.')
-        : (historical
-            ? 'Historischer Befund: Mindestens ein Muster ist im angegebenen Record-Zeitraum auffällig. Das ist kein Beleg für einen Fehler des aktuellen Prozesses.'
-            : 'Seit der aktuellen Prozessgrenze ist mindestens ein Besitzer-/Contract-/Command-Muster oder ein regelwirksamer Messwertschutz-Hold auffällig.');
+        ? `Die Auswertung ist unvollständig: ${missingServices.map(ruleCalmServiceLabel).join(', ')} hatte keine auswertbaren Records. Die getrennten Befunde gelten nur für ${analyzedServices.map(ruleCalmServiceLabel).join(', ')}. ${laneMeaning} ${dataQualityMeaning}`
+        : `${historical ? 'Historischer Befund: ' : ''}${laneMeaning} ${dataQualityMeaning}${historical ? ' Das ist kein Beleg für einen Fehler des aktuellen Prozesses.' : ''}`;
     const effectiveGaps = data.effective_min_gap_s || {};
     const ownerGap = Math.max(
         Number(effectiveGaps.storage_contract_owner || 0),
@@ -4828,7 +5016,7 @@ function renderRuleCalmAnalysis(data) {
     const gapText = `Musterabstand ${data.min_gap_s || 180}s${ownerGap > Number(data.min_gap_s || 180) ? ` · Contract/Owner/State ${ownerGap}s` : ''}`;
     const title = historical ? 'Historische Regelruhe-Diagnose' : 'Aktuelle Regelruhe-Diagnose';
     return `
-        <div class="result-title"><i class="fas fa-wave-square ${data.status === 'PASS' && !evidenceLimit ? 'ok' : 'warn'}"></i>${esc(title)} ${legacy ? '<span class="badge text-bg-warning">LEGACY / EVIDENCE_LIMIT</span>' : (partial ? '<span class="badge text-bg-warning">TEILWEISE / EVIDENCE_LIMIT</span>' : ruleCalmStatusBadge(data.status))}${data.status === 'FAIL' && evidenceLimit ? ' <span class="badge text-bg-warning">auffällig</span>' : ''}${historical ? ' <span class="badge text-bg-secondary">historisch</span>' : ''}</div>
+        <div class="result-title"><i class="fas fa-wave-square ${controlStatus === 'PASS' ? 'ok' : 'warn'}"></i>${esc(title)} <span>Regelruhe ${ruleCalmStatusBadge(controlStatus)}</span> <span>Datenqualität ${ruleCalmDataQualityBadge(dataQualityStatus)}</span>${legacy ? ' <span class="badge text-bg-warning">LEGACY / EVIDENCE_LIMIT</span>' : (partial ? ' <span class="badge text-bg-warning">TEILWEISE / EVIDENCE_LIMIT</span>' : '')}${historical ? ' <span class="badge text-bg-secondary">historisch</span>' : ''}</div>
         <div class="text-secondary small">${esc(data.source_label || 'Entscheidungsverlauf')} · ${scopeDetail ? esc(scopeDetail) + ' · ' : ''}Geprüfte Records ${esc(recordRange)} · ${esc(gapText)}</div>
         <div class="result-grid">
             <div class="result-tile"><strong>Speicher</strong>${esc(records.storage ?? 0)} Records<div class="text-secondary mt-1">${esc(events.storage_contract_owner ?? 0)} Contract · ${esc(events.storage_owner ?? 0)} Owner · ${esc(events.storage_execution_class ?? 0)} Ausführung · ${esc(events.storage_state ?? 0)} State</div><div class="text-secondary mt-1">${esc(events.storage_value_update ?? 0)} Werte · ${esc(events.storage ?? 0)} RSCP-Commands · ${esc(events.storage_live_plausibility ?? 0)} Messwertschutz</div></div>
@@ -4837,12 +5025,15 @@ function renderRuleCalmAnalysis(data) {
             <div class="result-tile"><strong>EMS</strong>${esc(records.ems ?? 0)} Records<div class="text-secondary mt-1">${esc(events.ems_decision ?? 0)} kanonische Entscheidungen</div></div>
             <div class="result-tile"><strong>Prüfzeitraum</strong>${esc(recordRange)}<div class="text-secondary mt-1">aus den geprüften Records</div></div>
             <div class="result-tile"><strong>Prozessgrenze</strong>${historical ? 'prozessübergreifende Historie' : esc((data.scope_context || {}).cutoff_time || 'nicht ermittelbar')}<div class="text-secondary mt-1">${historical ? 'kein Beleg für den aktuellen Prozess' : 'ältere Records ausgeschlossen'}</div></div>
-            <div class="result-tile"><strong>Auffälligkeiten</strong>${violations.length ? `<span class="warn">${esc(violations.length)} Muster</span>` : '<span class="ok">keine</span>'}</div>
+            <div class="result-tile"><strong>Regelruhe</strong>${ruleCalmStatusBadge(controlStatus)}<div class="text-secondary mt-1">${violations.length ? `${esc(violations.length)} belegte Regelmuster` : 'kein belegtes Execution-/Ausgangs-Ping-Pong'}</div></div>
+            <div class="result-tile"><strong>Datenqualität</strong>${ruleCalmDataQualityBadge(dataQualityStatus)}<div class="text-secondary mt-1">${dataQualityFindings.length ? `${esc(dataQualityFindings.length)} Befund` : 'kein separater Befund'}</div></div>
         </div>
         <div class="result-tile mt-2"><strong>Einordnung</strong>${esc(meaning)}<div class="text-secondary mt-1">${esc(data.privacy_note || 'Read-only Diagnose ohne Hardwarezugriff.')}</div></div>
-        ${evidenceLimit ? `<div class="result-tile warn mt-2"><strong>${legacy ? 'Historischer Schema-Vertrag' : 'Fehlende Domänen'}</strong>${legacy ? 'Public v2 ohne Vollständigkeitsnachweis' : esc(missingServices.map(ruleCalmServiceLabel).join(', '))}<div class="text-secondary mt-1">Diese Auswertung erlaubt keine vollständige Grün-Aussage (z. B. wenn für einen Dienst im geprüften Zeitfenster seit dem Neustart noch keine Befehls- oder Entscheidungsänderung vorlag).</div></div>` : ''}
-        <div class="mt-2"><strong>Prüfbereiche</strong><ul class="result-list">${checkRows || '<li>Keine Prüfbereiche gefunden.</li>'}</ul></div>
-        <div class="mt-2"><strong>Auffälligkeiten mit Zeitpunkt</strong>${renderRuleCalmViolations(violations)}</div>
+        ${evidenceLimit ? `<div class="result-tile warn mt-2"><strong>EVIDENCE_LIMIT</strong>${legacy ? 'Historischer Public-Vertrag ohne Evidenz-Lanes' : (partial ? `Fehlende Domänen: ${esc(missingServices.map(ruleCalmServiceLabel).join(', '))}` : 'Fehlende typisierte Live- oder Execution-/Ausgangsevidenz')}<div class="text-secondary mt-1">Diese Auswertung erlaubt keine vollständige Grün-Aussage; echte Veto-/Pfadkonflikte und belegte Ausgangswechsel bleiben davon unabhängig sichtbar.</div></div>` : ''}
+        <div class="mt-2"><strong>Regelpfade und Ausgänge</strong><ul class="result-list">${checkRows || '<li>Keine Prüfbereiche gefunden.</li>'}</ul></div>
+        <div class="mt-2"><strong>Datenqualität</strong><ul class="result-list">${dataQualityCheckRow}</ul></div>
+        <div class="mt-2"><strong>Datenqualitätsbefunde</strong>${renderRuleCalmViolations(dataQualityFindings, 'Kein Messwertqualitätsbefund erkannt.')}</div>
+        <div class="mt-2"><strong>Regelauffälligkeiten mit Zeitpunkt</strong>${renderRuleCalmViolations(violations, 'Keine belegten Regelmuster erkannt.')}</div>
         <div class="mt-2"><strong>Zeitachse</strong>${renderRuleCalmTimeline(data)}</div>
         <details class="mt-2">
             <summary class="text-secondary small">Forum-Zusammenfassung anzeigen</summary>
@@ -5151,9 +5342,9 @@ function actionLabel(action) {
         dry_run: 'Modul-Dry-Run',
         run_diagnosis: 'Diagnose',
         diagnosis: 'Diagnose',
-        permissions_check: 'Rechteprüfung',
+        permissions_check: 'Nur Rechte prüfen',
         repair_permissions_dry_run: 'Reparatur-Dry-Run',
-        repair_permissions: 'Rechte-Reparatur',
+        repair_permissions: 'Systemreparatur',
         install_module: 'Modulinstallation',
         remove_module: 'Modul-Rückbau',
         write_readiness: 'Freigabe-Check',
@@ -5395,25 +5586,45 @@ function renderPermissionsResult(data, action) {
     const checks = data.checks || (data.permissions && data.permissions.checks) || [];
     const issueCount = data.issue_count ?? (data.permissions && data.permissions.issue_count) ?? 0;
     const ok = issueCount === 0;
-    const title = action === 'repair_permissions_dry_run' ? 'Reparatur Dry-Run' : 'Rechteprüfung';
+    const title = action === 'repair_permissions_dry_run' ? 'Reparatur Dry-Run' : 'Nur Rechte prüfen (read-only)';
     const steps = data.planned_steps || [];
+    const repairableCount = Number(data.runtime_repairable_issue_count || 0);
+    const systemRepairCount = Number(data.system_repair_required_count || 0);
+    const repairAvailable = Boolean(data.repair_available);
     const rows = checks.map(item => {
         const isOk = item.ok;
-        return `<li>${boolBadge(isOk, 'OK', 'Prüfen', true)} <span class="small-code">${esc(item.path)}</span>${item.issue ? ` <span class="text-secondary">- ${esc(item.issue)}</span>` : ''}</li>`;
+        const repairClass = item.repair_class || '';
+        const classBadge = isOk
+            ? ''
+            : repairClass === 'runtime_repairable'
+                ? ' <span class="badge text-bg-info">Reparierbar</span>'
+                : repairClass === 'system_repair_required'
+                    ? ' <span class="badge text-bg-warning">Systemabgleich</span>'
+                    : ' <span class="badge text-bg-secondary">Nur melden</span>';
+        return `<li>${boolBadge(isOk, 'OK', 'Prüfen', true)}${classBadge} <span class="small-code">${esc(item.path)}</span>${item.issue ? ` <span class="text-secondary">- ${esc(item.issue)}</span>` : ''}</li>`;
     }).join('');
     const stepItems = steps.map(step => `<li>${esc(step)}</li>`).join('');
     const installPath = data.detected_install_path || '';
     const repairCommand = data.repair_command || '';
+    const systemRepairCommand = data.system_repair_command || '';
     const instruction = data.repair_instruction || data.repair_message || '';
+    const repairButton = repairableCount > 0 && repairAvailable
+        ? `<div class="mt-3"><button class="btn btn-warning rounded-pill" type="button" onclick="runRuntimePermissionsRepair()"><i class="fas fa-screwdriver-wrench me-1"></i> Rechte reparieren</button><div class="text-secondary small mt-2">Releasegleiche Einträge werden sofort repariert. Lokal geänderte Dateien werden vollständig angezeigt und erst nach Deiner exakten Bestätigung berücksichtigt; ihr Inhalt bleibt unverändert.</div></div>`
+        : repairableCount > 0
+            ? `<div class="warn mt-3">Der enge Rechte-Launcher ist noch nicht sicher installiert. Bis dahin bleibt der Konsolen- oder vollständige Systemweg erforderlich.</div>`
+            : '';
     return `
         <div class="result-title"><i class="fas ${ok ? 'fa-circle-check ok' : 'fa-triangle-exclamation warn'}"></i>${esc(title)}</div>
         <div class="text-secondary small">${esc(data.summary || 'Prüfung abgeschlossen.')}</div>
         <div class="result-grid">
             <div class="result-tile"><strong>Ergebnis</strong>${boolBadge(ok, 'alles OK', issueCount + ' Hinweis(e)', true)}</div>
-            <div class="result-tile"><strong>Reparaturweg</strong>${boolBadge(Boolean(data.repair_available), 'Systemjob verfügbar', 'Konsole nötig', true)}<div class="text-secondary mt-1">Root-eigener argumentloser Launcher</div></div>
+            <div class="result-tile"><strong>Reine Rechtereparatur</strong>${boolBadge(repairAvailable, 'verfügbar', 'nicht verfügbar', true)}<div class="text-secondary mt-1">${esc(repairableCount + ' reparierbare Befund(e)')}</div></div>
+            <div class="result-tile"><strong>Vollständiger Systemabgleich</strong>${boolBadge(systemRepairCount === 0, 'nicht nötig', systemRepairCount + ' Befund(e)', true)}<div class="text-secondary mt-1">Bleibt als getrennte Aktion erhalten</div></div>
             <div class="result-tile"><strong>Installationspfad</strong><div class="text-secondary mt-1 small-code">${esc(installPath || 'nicht erkannt')}</div></div>
         </div>
-        ${repairCommand ? `<details class="mt-3"><summary><strong>Konsolen-Rückfallweg</strong></summary><div class="text-secondary small mt-1">${esc(instruction)}</div><pre class="raw-json mt-2">${esc(repairCommand)}</pre></details>` : ''}
+        ${repairButton}
+        ${repairCommand ? `<details class="mt-3"><summary><strong>Konsolen-Rückfallweg für reine Rechte</strong></summary><div class="text-secondary small mt-1">${esc(instruction)}</div><pre class="raw-json mt-2">${esc(repairCommand)}</pre></details>` : ''}
+        ${systemRepairCommand ? `<details class="mt-2"><summary><strong>Vollständiger Systemabgleich</strong></summary><div class="text-secondary small mt-1">Nur für fehlende oder unsichere Dateien beziehungsweise einen gewünschten Stable-Abgleich; mit Backup und Dienstneustart.</div><pre class="raw-json mt-2">${esc(systemRepairCommand)}</pre></details>` : ''}
         ${stepItems ? `<div><strong>Geplanter Ablauf</strong><ul class="result-list">${stepItems}</ul></div>` : ''}
         ${rows ? `<div class="mt-2"><strong>Geprüfte Pfade</strong><ul class="result-list">${rows}</ul></div>` : ''}
         ${renderRawDetails(data)}
@@ -5775,17 +5986,193 @@ async function runModuleAction(moduleKey, action) {
     }
 }
 
-function pollPermissionRepairUpdate() {
+const INSTALL_CENTER_UPDATE_POLL_TIMEOUT_MS = 10000;
+const INSTALL_CENTER_UPDATE_START_TIMEOUT_MS = 30000;
+
+function normalizePermissionRepairRunId(value) {
+    const normalized = (typeof value === 'string') ? value.trim().toLowerCase() : '';
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(normalized)
+        ? normalized
+        : null;
+}
+
+async function loadUpdateJsonWithTimeout(url, timeoutMs = INSTALL_CENTER_UPDATE_POLL_TIMEOUT_MS) {
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    let timeoutId = null;
+    const timeoutPromise = new Promise((_resolve, reject) => {
+        timeoutId = window.setTimeout(() => {
+            if (controller) controller.abort();
+            const error = new Error('Statusabfrage überschritt das Zeitlimit');
+            error.name = 'AbortError';
+            reject(error);
+        }, timeoutMs);
+    });
+    const requestPromise = fetch(url, {
+        cache: 'no-store',
+        credentials: 'same-origin',
+        signal: controller ? controller.signal : undefined
+    }).then(async response => {
+        if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+        return await response.json();
+    });
+    return await Promise.race([requestPromise, timeoutPromise])
+        .finally(() => {
+            if (timeoutId !== null) window.clearTimeout(timeoutId);
+        });
+}
+
+async function postPermissionRepairWithTimeout(body, timeoutMs = INSTALL_CENTER_UPDATE_START_TIMEOUT_MS) {
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    let timeoutId = null;
+    const timeoutPromise = new Promise((_resolve, reject) => {
+        timeoutId = window.setTimeout(() => {
+            if (controller) controller.abort();
+            const error = new Error('Startantwort überschritt das Zeitlimit');
+            error.name = 'AbortError';
+            reject(error);
+        }, timeoutMs);
+    });
+    const requestPromise = fetch('index.php?action=fix_permissions', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+            'X-Requested-With': 'XMLHttpRequest',
+            'X-CSRF-Token': installCenterCsrfToken
+        },
+        signal: controller ? controller.signal : undefined,
+        body
+    });
+    return await Promise.race([requestPromise, timeoutPromise])
+        .finally(() => {
+            if (timeoutId !== null) window.clearTimeout(timeoutId);
+        });
+}
+
+async function readPermissionRepairDriftPreflight() {
+    const body = new FormData();
+    body.append('csrf_token', installCenterCsrfToken);
+    const response = await fetch(`index.php?action=check_self_update_drift&t=${Date.now()}`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+            'X-Requested-With': 'XMLHttpRequest',
+            'X-CSRF-Token': installCenterCsrfToken
+        },
+        cache: 'no-store',
+        body
+    });
+    const text = await response.text();
+    let data = null;
+    try { data = JSON.parse(text); } catch (_error) {}
+    if (!response.ok || !data || data.success !== true) {
+        throw new Error((data && data.message) || text || `HTTP ${response.status}`);
+    }
+    return data;
+}
+
+async function readPermissionRepairBaseline() {
+    try {
+        const data = await loadUpdateJsonWithTimeout(`index.php?action=poll_self_update&t=${Date.now()}`);
+        return {
+            available: true,
+            runId: normalizePermissionRepairRunId(data && data.run_id),
+            running: Boolean(data && data.running === true),
+        };
+    } catch (_error) {
+        return {available: false, runId: null, running: false};
+    }
+}
+
+function createPermissionRepairRunBinding(baseline, expectedRunId = null) {
+    const state = (baseline && typeof baseline === 'object') ? baseline : {};
+    const baselineRunId = normalizePermissionRepairRunId(state.runId);
+    const expected = normalizePermissionRepairRunId(expectedRunId);
+    return {
+        baselineAvailable: state.available === true,
+        baselineRunId,
+        baselineWasRunning: state.running === true,
+        expectedRunId: expected,
+        boundRunId: null,
+    };
+}
+
+function bindPermissionRepairPoll(data, binding) {
+    const state = (binding && typeof binding === 'object') ? binding : {};
+    const currentRunId = normalizePermissionRepairRunId(data && data.run_id);
+    if (state.boundRunId) {
+        return {
+            bound: currentRunId === state.boundRunId,
+            replaced: Boolean(currentRunId && currentRunId !== state.boundRunId),
+        };
+    }
+    if (state.expectedRunId) {
+        if (currentRunId === state.expectedRunId) {
+            state.boundRunId = currentRunId;
+        }
+    } else if (state.baselineWasRunning && currentRunId === state.baselineRunId
+        && data && data.running === true) {
+        state.boundRunId = currentRunId;
+    } else if (state.baselineRunId && currentRunId && currentRunId !== state.baselineRunId) {
+        state.boundRunId = currentRunId;
+    } else if (state.baselineAvailable && !state.baselineRunId && currentRunId
+        && data && data.running === true) {
+        // Beim ersten Lauf nach Einführung der Laufkennung existiert noch keine
+        // Baseline-ID. Die danach atomar veröffentlichte ID gehört eindeutig zum
+        // neuen Systemjob. Ohne explizite Startantwort wird er erst gebunden,
+        // wenn derselbe Folgepoll den Lauf auch aktiv beobachtet.
+        state.boundRunId = currentRunId;
+    } else if (!state.baselineAvailable && currentRunId && data && data.running === true) {
+        state.boundRunId = currentRunId;
+    }
+    return {
+        bound: Boolean(state.boundRunId && currentRunId === state.boundRunId),
+        replaced: false,
+    };
+}
+
+function pollPermissionRepairUpdate(runBinding = null) {
     const log = document.getElementById('actionLog');
     const modalBody = document.getElementById('jobModalBody');
     let ticks = 0;
     let transientErrors = 0;
+    let lastOutput = '';
+    let pollInFlight = false;
+    const maxTransientErrors = 120;
+    const binding = runBinding || createPermissionRepairRunBinding({available: false});
+    const pollStartedAt = Date.now();
+    const maxTransientDurationMs = 2 * 60 * 1000;
+    const maxPollDurationMs = 30 * 60 * 1000;
     const timer = window.setInterval(async () => {
+        if (pollInFlight) return;
+        pollInFlight = true;
         ticks += 1;
         try {
-            const data = await loadJson(`index.php?action=poll_self_update&t=${Date.now()}`);
+            const data = await loadUpdateJsonWithTimeout(`index.php?action=poll_self_update&t=${Date.now()}`);
             transientErrors = 0;
+            const runState = bindPermissionRepairPoll(data, binding);
+            if (runState.replaced) {
+                window.clearInterval(timer);
+                const html = `<div class="warn">Der Status gehört inzwischen zu einem anderen Systemjob. Der Abschluss des gestarteten Reparaturlaufs wird deshalb nicht aus fremden Daten abgeleitet. Lade die Seite neu und prüfe das Update-Protokoll.</div>`;
+                log.innerHTML = html;
+                if (modalBody) modalBody.innerHTML = html;
+                return;
+            }
+            if (!runState.bound) {
+                const html = `
+                    <div class="result-title"><i class="fas fa-spinner fa-spin warn"></i>Warte auf eindeutige Laufkennung</div>
+                    <div class="text-secondary small mt-2">Ein alter Abschlussstatus wird nicht als Ergebnis dieses Reparaturauftrags übernommen.</div>`;
+                log.innerHTML = html;
+                if (modalBody) modalBody.innerHTML = html;
+                if (ticks >= 1800 || (Date.now() - pollStartedAt) >= maxPollDurationMs) {
+                    window.clearInterval(timer);
+                    const timeoutHtml = `<div class="warn">Kein eindeutig zugeordneter Abschlussstatus. Der Systemjob wurde dadurch nicht beendet. Lade die Seite neu und prüfe das Update-Protokoll.</div>`;
+                    log.innerHTML = timeoutHtml;
+                    if (modalBody) modalBody.innerHTML = timeoutHtml;
+                }
+                return;
+            }
             const output = typeof data.log === 'string' ? data.log : '';
+            lastOutput = output || lastOutput;
             const state = data.completion || (data.running ? 'running' : 'unknown');
             const finished = state === 'success' || state === 'failed';
             const ok = state === 'success';
@@ -5794,59 +6181,218 @@ function pollPermissionRepairUpdate() {
                 <pre class="raw-json mt-2">${esc(output || 'Warte auf Protokoll...')}</pre>`;
             log.innerHTML = html;
             if (modalBody) modalBody.innerHTML = html;
-            if (finished || ticks >= 1800) {
+            if (finished || ticks >= 1800 || (Date.now() - pollStartedAt) >= maxPollDurationMs) {
                 window.clearInterval(timer);
                 await loadInstallCenter();
             }
         } catch (err) {
             transientErrors += 1;
-            if (transientErrors > 8) {
+            if (transientErrors <= maxTransientErrors
+                && (Date.now() - pollStartedAt) < maxTransientDurationMs) {
+                const html = `
+                    <div class="result-title"><i class="fas fa-spinner fa-spin warn"></i>Weboberfläche wird kontrolliert neu gestartet</div>
+                    <div class="text-secondary small mt-2">Der root-eigene Systemjob läuft unabhängig weiter. Die Verbindung wird automatisch erneut geprüft.</div>
+                    ${lastOutput ? `<pre class="raw-json mt-2">${esc(lastOutput)}</pre>` : ''}`;
+                log.innerHTML = html;
+                if (modalBody) modalBody.innerHTML = html;
+            } else {
                 window.clearInterval(timer);
-                const html = `<div class="bad">Status konnte nicht weiter gelesen werden: ${esc(err.message || err)}. Der root-eigene Systemjob kann im Hintergrund weiterlaufen.</div>`;
+                const html = `<div class="warn">Die Weboberfläche konnte nach zwei Minuten noch nicht wieder erreicht werden. Der Systemjob wurde dadurch nicht beendet. Lade die Seite neu, um den aktuellen Abschlussstatus zu lesen.</div>`;
                 log.innerHTML = html;
                 if (modalBody) modalBody.innerHTML = html;
             }
+        } finally {
+            pollInFlight = false;
         }
     }, 1000);
 }
 
-async function runPermissionRepairUpdate() {
-    if (!confirm('Rechte jetzt reparieren?\n\nDer kanonische Systemjob erstellt zuerst ein Backup, projiziert die Rechte, gleicht den veröffentlichten Release-Stand ab und startet die Dienste neu.')) return;
+async function callRuntimePermissionsLauncher(action, confirmationToken = '') {
+    const body = new FormData();
+    body.append('csrf_token', installCenterCsrfToken);
+    const normalizedToken = String(confirmationToken || '').trim().toLowerCase();
+    if (normalizedToken) {
+        body.append('confirm_content_drift', '1');
+        body.append('confirmation_token', normalizedToken);
+    }
+    const response = await fetch(`install_center.php?action=${encodeURIComponent(action)}`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {'X-Requested-With': 'XMLHttpRequest'},
+        cache: 'no-store',
+        body
+    });
+    const text = await response.text();
+    let data = null;
+    try { data = JSON.parse(text); } catch (_error) {}
+    if (!response.ok || !data) {
+        throw new Error((data && (data.message || data.error)) || text || `HTTP ${response.status}`);
+    }
+    return data;
+}
+
+async function runRuntimePermissionsRepair() {
     const log = document.getElementById('actionLog');
     showJobModal(
-        '<i class="fas fa-tools text-warning me-2"></i>Rechte reparieren & System abgleichen',
-        'Root-eigener argumentloser Update-Launcher',
-        '<div class="job-progress-box"><i class="fas fa-spinner fa-spin warn me-1"></i>Systemjob wird gestartet...</div>',
+        '<i class="fas fa-screwdriver-wrench text-warning me-2"></i>Rechte reparieren',
+        'Nur Metadaten bekannter Pfade – kein Backup, kein Update, kein Dienstneustart',
+        '<div class="job-progress-box"><i class="fas fa-spinner fa-spin warn me-1"></i>Releasegleiche Rechte werden repariert; lokale Inhaltsabweichungen werden exakt gebunden...</div>',
+        true
+    );
+    const modalBody = document.getElementById('jobModalBody');
+    try {
+        let result = await callRuntimePermissionsLauncher('repair_runtime_permissions');
+        if (!result.success) {
+            throw new Error(result.message || 'Die Rechtereparatur wurde abgebrochen.');
+        }
+        const driftCount = Number(result.content_drift_count || 0);
+        const driftFiles = Array.isArray(result.content_drift)
+            ? result.content_drift.map(path => String(path || ''))
+            : [];
+        if (driftCount !== driftFiles.length
+            || driftFiles.some(path => !path)
+            || new Set(driftFiles).size !== driftFiles.length) {
+            throw new Error('Die Rechtereparatur lieferte keine vollständige eindeutige Dateiliste.');
+        }
+        if (result.confirmation_required === true || driftCount > 0) {
+            const token = String(result.confirmation_token || '').trim().toLowerCase();
+            if (result.confirmation_required !== true
+                || driftCount < 1
+                || !/^[0-9a-f]{64}$/.test(token)) {
+                throw new Error('Die lokale Dateilistenbindung ist unvollständig. Bitte starte die Rechtereparatur erneut.');
+            }
+            const alreadyChanged = Number(result.changed || 0);
+            const question = `${driftCount} bekannte Datei(en) wurden lokal geändert und stimmen nicht mit dem veröffentlichten Release überein.\n\nReleasegleiche Einträge wurden bereits repariert (${alreadyChanged} Metadatenänderung(en)). Die folgenden lokalen Inhalte blieben unangetastet:\n\n${driftFiles.join('\n')}\n\nSoll die Rechtereparatur ausschließlich Besitzer, Gruppe und Modus genau dieser vollständig aufgelisteten Dateien setzen? Ihre Inhalte bleiben unverändert.`;
+            if (!confirm(question)) {
+                const html = `
+                    <div class="warn">Lokale Inhaltsabweichungen wurden nicht bestätigt und blieben vollständig unverändert.</div>
+                    <div class="text-secondary small mt-2">Releasegleiche bekannte Einträge wurden bereits repariert: ${esc(alreadyChanged)} Metadatenänderung(en). Für einen späteren Versuch bitte die Rechtereparatur neu starten.</div>
+                    <div class="mt-2"><strong>Unveränderte lokale Dateien</strong><ul class="result-list">${driftFiles.map(path => `<li><span class="small-code">${esc(path)}</span></li>`).join('')}</ul></div>`;
+                log.innerHTML = html;
+                if (modalBody) modalBody.innerHTML = html;
+                return;
+            }
+            const progress = '<div class="job-progress-box"><i class="fas fa-spinner fa-spin warn me-1"></i>Die exakt bestätigten Driftdateien werden erneut gebunden und nur ihre Metadaten repariert...</div>';
+            log.innerHTML = progress;
+            if (modalBody) modalBody.innerHTML = progress;
+            result = await callRuntimePermissionsLauncher(
+                'repair_runtime_permissions',
+                token
+            );
+            if (!result.success) {
+                throw new Error(result.message || 'Die bestätigte Rechtereparatur wurde sicher abgebrochen.');
+            }
+        }
+        const postcheck = await loadJson(`install_center.php?action=permissions_check&t=${Date.now()}`);
+        const remaining = Number(postcheck.issue_count || 0);
+        const totalChanged = Number(result.changed || 0) + Number(result.initial_changed || 0);
+        const resultHtml = `
+            <div class="result-title"><i class="fas fa-circle-check ok"></i>Rechtereparatur abgeschlossen</div>
+            <div class="text-secondary small">${esc(result.message || 'Metadaten wurden geprüft und repariert.')}</div>
+            <div class="result-grid mt-2">
+                <div class="result-tile"><strong>Geprüft</strong><span>${esc(result.checked || 0)}</span></div>
+                <div class="result-tile"><strong>Geändert</strong><span>${esc(totalChanged)}</span></div>
+                <div class="result-tile"><strong>Lokale Inhalte</strong><span>${esc(result.content_drift_count || 0)} abweichend, unverändert</span></div>
+                <div class="result-tile"><strong>Nachprüfung</strong>${boolBadge(remaining === 0, 'alles OK', remaining + ' Hinweis(e)', true)}</div>
+            </div>
+            ${renderPermissionsResult(postcheck, 'permissions_check')}`;
+        log.innerHTML = resultHtml;
+        if (modalBody) modalBody.innerHTML = resultHtml;
+        await loadInstallCenter();
+    } catch (err) {
+        const html = `<div class="bad">Rechtereparatur sicher abgebrochen: ${esc(err.message || err)}</div>`;
+        log.innerHTML = html;
+        if (modalBody) modalBody.innerHTML = html;
+    }
+}
+
+async function runPermissionRepairUpdate() {
+    if (!confirm('Vollständige Systemreparatur starten?\n\nDies ist kein reiner Rechtecheck: Der Systemjob erstellt ein verifiziertes Backup, gleicht alle Produktdateien mit dem veröffentlichten Stable-Stand ab, setzt die Rechte neu und startet die Dienste neu. Dabei kann dieselbe Version erneut installiert werden.')) return;
+    const log = document.getElementById('actionLog');
+    showJobModal(
+        '<i class="fas fa-tools text-warning me-2"></i>System reparieren',
+        'Backup + vollständiger Stable-Abgleich + Rechteprojektion + Dienstneustart',
+        '<div class="job-progress-box"><i class="fas fa-spinner fa-spin warn me-1"></i>Lokale Inhalte werden vor dem Start rein lesend geprüft...</div>',
         true
     );
     const body = new FormData();
     body.append('csrf_token', installCenterCsrfToken);
+    let baseline = {available: false, runId: null, running: false};
     try {
-        const response = await fetch('index.php?action=fix_permissions', {
-            method: 'POST',
-            credentials: 'same-origin',
-            headers: {
-                'X-Requested-With': 'XMLHttpRequest',
-                'X-CSRF-Token': installCenterCsrfToken
-            },
-            body
-        });
+        const drift = await readPermissionRepairDriftPreflight();
+        const driftItems = Array.isArray(drift.content_drift) ? drift.content_drift : [];
+        const driftCount = Number(drift.content_drift_count || 0);
+        if (driftCount !== driftItems.length) {
+            throw new Error('Die Inhaltsprüfung lieferte keine vollständige Dateiliste.');
+        }
+        if (drift.requires_confirmation === true || driftCount > 0) {
+            const paths = driftItems.map(item => {
+                const path = String(item && item.path || '');
+                const status = String(item && item.status || '');
+                if (!path) return '';
+                return status === 'unknown_retired_file' || status === 'local_retired_content_changed'
+                    ? `${path} (freigegebener Altpfad würde gelöscht)`
+                    : path;
+            }).filter(Boolean);
+            const token = String(drift.confirmation_token || '').trim().toLowerCase();
+            if (!/^[0-9a-f]{64}$/.test(token)) {
+                throw new Error('Die Inhaltsprüfung lieferte keine gültige Dateilistenbindung.');
+            }
+            const question = driftCount > 0
+                ? `${driftCount} lokal geänderte oder kollidierende Produktdatei(en) würden durch den veröffentlichten Stable-Stand ersetzt oder als freigegebener Altpfad gelöscht:\n\n${paths.join('\n')}\n\nUnbekannte Dateien außerhalb dieses Zielumfangs bleiben unberührt. Soll die Systemreparatur diese exakt genannten Eingriffe trotzdem ausführen?`
+                : 'Die veröffentlichte Altversion dieser Installation konnte nicht sicher als Inhaltsbaseline gebunden werden. Lokale Änderungen in bekannten Produktpfaden lassen sich deshalb nicht einzeln abgrenzen.\n\nDas verifizierte Vollbackup bleibt bestehen und unbekannte Dateien außerhalb der Zielprojektion bleiben unberührt. Soll die Systemreparatur den veröffentlichten Stable-Stand trotzdem auf die bekannten Produktpfade projizieren?';
+            if (!confirm(question)) {
+                const html = '<div class="text-secondary">Systemreparatur nach dem Nur-Lese-Preflight abgebrochen. Es wurde nichts geändert.</div>';
+                log.innerHTML = html;
+                const modalBody = document.getElementById('jobModalBody');
+                if (modalBody) modalBody.innerHTML = html;
+                return;
+            }
+            body.append('confirm_local_drift', '1');
+            body.append('confirmation_token', token);
+        } else {
+            body.append('confirm_local_drift', '0');
+            body.append('confirmation_token', '');
+        }
+    } catch (err) {
+        const html = `<div class="bad">Systemreparatur wurde vor Backup und Dienständerung sicher abgebrochen: ${esc(err.message || err)}</div>`;
+        log.innerHTML = html;
+        const modalBody = document.getElementById('jobModalBody');
+        if (modalBody) modalBody.innerHTML = html;
+        return;
+    }
+    baseline = await readPermissionRepairBaseline();
+    try {
+        const response = await postPermissionRepairWithTimeout(body);
         const text = await response.text();
         let data = null;
         try { data = JSON.parse(text); } catch (_error) {}
-        if (!response.ok || !data || !data.success) {
-            throw new Error((data && data.message) || text || `HTTP ${response.status}`);
+        if (data && !data.success) {
+            const html = `<div class="bad">Systemreparatur wurde nicht gestartet: ${esc(data.message || text || `HTTP ${response.status}`)}</div>`;
+            log.innerHTML = html;
+            const modalBody = document.getElementById('jobModalBody');
+            if (modalBody) modalBody.innerHTML = html;
+            return;
+        }
+        if (!response.ok || !data) {
+            const html = `<div class="result-title"><i class="fas fa-spinner fa-spin warn"></i>Startantwort nicht lesbar; Status wird geprüft</div><div class="text-secondary small mt-2">Der Systemjob kann die Weboberfläche bereits für den Dateiaustausch neu starten. Sein kanonischer Abschlussstatus wird unabhängig von dieser Antwort weiter abgefragt.</div>`;
+            log.innerHTML = html;
+            const modalBody = document.getElementById('jobModalBody');
+            if (modalBody) modalBody.innerHTML = html;
+            pollPermissionRepairUpdate(createPermissionRepairRunBinding(baseline));
+            return;
         }
         const html = `<div class="result-title"><i class="fas fa-spinner fa-spin warn"></i>Systemjob gestartet</div><div class="text-secondary small mt-2">${esc(data.message || 'Backup, Rechteprojektion und Systemabgleich laufen im Hintergrund.')}</div>`;
         log.innerHTML = html;
         const modalBody = document.getElementById('jobModalBody');
         if (modalBody) modalBody.innerHTML = html;
-        pollPermissionRepairUpdate();
+        pollPermissionRepairUpdate(createPermissionRepairRunBinding(baseline, data.run_id));
     } catch (err) {
-        const html = `<div class="bad">Rechte-Reparatur konnte nicht gestartet werden: ${esc(err.message || err)}</div>`;
+        const html = `<div class="result-title"><i class="fas fa-spinner fa-spin warn"></i>Startantwort nicht lesbar; Status wird geprüft</div><div class="text-secondary small mt-2">Es liegt noch kein bestätigter Fehler des Systemjobs vor. Der kanonische Abschlussstatus wird weiter abgefragt.</div>`;
         log.innerHTML = html;
         const modalBody = document.getElementById('jobModalBody');
         if (modalBody) modalBody.innerHTML = html;
+        pollPermissionRepairUpdate(createPermissionRepairRunBinding(baseline));
     }
 }
 

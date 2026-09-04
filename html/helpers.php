@@ -2358,7 +2358,14 @@ function e3dcRunArgvProcess(array $argv, $timeoutSeconds = 20.0, array $options 
         return $result;
     }
     $timeoutSeconds = max(0.1, min(600.0, (float)$timeoutSeconds));
-    $maxOutput = max(1024, min(1024 * 1024, (int)($options['max_output_bytes'] ?? 65536)));
+    $maxOutput = max(1024, min(4 * 1024 * 1024, (int)($options['max_output_bytes'] ?? 65536)));
+    $stdinPayload = $options['stdin'] ?? '';
+    if (!is_string($stdinPayload)
+        || strlen($stdinPayload) > 4096
+        || strpos($stdinPayload, "\0") !== false) {
+        $result['error'] = 'Ungültige oder zu große Prozesseingabe.';
+        return $result;
+    }
     $cwd = isset($options['cwd']) && is_string($options['cwd']) && is_dir($options['cwd'])
         ? $options['cwd']
         : null;
@@ -2386,6 +2393,22 @@ function e3dcRunArgvProcess(array $argv, $timeoutSeconds = 20.0, array $options 
         $result['error'] = 'Prozess konnte nicht gestartet werden.';
         $result['duration_ms'] = (int)round((microtime(true) - $start) * 1000);
         return $result;
+    }
+    if ($stdinPayload !== '') {
+        $offset = 0;
+        $length = strlen($stdinPayload);
+        while ($offset < $length) {
+            $written = @fwrite($pipes[0], substr($stdinPayload, $offset));
+            if (!is_int($written) || $written <= 0) {
+                @fclose($pipes[0]);
+                @proc_terminate($process, 15);
+                @proc_close($process);
+                $result['error'] = 'Prozesseingabe konnte nicht vollständig übergeben werden.';
+                $result['duration_ms'] = (int)round((microtime(true) - $start) * 1000);
+                return $result;
+            }
+            $offset += $written;
+        }
     }
     @fclose($pipes[0]);
     @stream_set_blocking($pipes[1], false);
@@ -4113,10 +4136,11 @@ function handleEnergyFlowLayout() {
 }
 
 function cfgBool($value, $default = false) {
+    if (is_bool($value)) return $value;
     if ($value === null || $value === '') return $default;
     $v = strtolower(trim((string)$value));
-    if (in_array($v, ['1', 'true', 'yes', 'on'], true)) return true;
-    if (in_array($v, ['0', 'false', 'no', 'off'], true)) return false;
+    if (in_array($v, ['1', 'true', 'yes', 'on', 'ja', 'ein'], true)) return true;
+    if (in_array($v, ['0', 'false', 'no', 'off', 'nein', 'aus'], true)) return false;
     return $default;
 }
 
@@ -5569,6 +5593,7 @@ function e3dcInspectServiceWrapper($wrapper) {
 function e3dcInspectWebUpdateLauncher() {
     $launcher = '/usr/local/sbin/e3dc-web-update-launcher';
     $requiredContract = 'e3dc-download-bootstrap-v2';
+    $requiredDriftFeature = 'e3dc-update-drift-confirm-v1';
     $result = ['ok' => false, 'path' => $launcher, 'status' => 'missing'];
     if (realpath($launcher) !== $launcher || is_link($launcher)) {
         $result['status'] = 'unbound_path';
@@ -5628,7 +5653,8 @@ function e3dcInspectWebUpdateLauncher() {
     }
     if (!is_string($actual)
         || substr($actual, 0, 12) !== "#!/bin/bash\n"
-        || substr_count($actual, $requiredContract) !== 1) {
+        || substr_count($actual, $requiredContract) !== 1
+        || substr_count($actual, $requiredDriftFeature) !== 1) {
         $result['status'] = 'outdated_contract';
         return $result;
     }
@@ -6066,7 +6092,7 @@ function e3dcClassifySelfUpdateCompletion($running, $exitCode, $log, $phase = 'u
 
 function e3dcCommunityBootstrapReleaseTag() {
     // RELEASE_MARKER: Beim Versionssprung gemeinsam mit VERSION/Release Notes aktualisieren.
-    return 'v5.4.4i';
+    return 'v5.4.5';
 }
 
 function e3dcCommunityBootstrapCommand() {
@@ -6081,7 +6107,118 @@ function e3dcCommunityBootstrapCommand() {
         . 'rm -f -- "$bootstrap_file"; exit $rc';
 }
 
-function e3dcStartCanonicalWebUpdateJob($purpose = 'update') {
+function e3dcCommunityDriftBootstrapFallback() {
+    $bootstrapReleaseTag = e3dcCommunityBootstrapReleaseTag();
+    $download = 'bootstrap_file="$(mktemp)" && '
+        . "curl -q -fsS --proto '=https' --tlsv1.2 "
+        . '-o "$bootstrap_file" '
+        . 'https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control/'
+        . $bootstrapReleaseTag
+        . '/e3dc-update-bootstrap';
+    return "Aktuellen Community-Bootstrap laden:\n"
+        . $download
+        . "\n\nNur prüfen (kein Backup, kein Update):\n"
+        . 'sudo /bin/sh "$bootstrap_file" --check-local-drift-json'
+        . "\n\nNur nach Prüfung und bewusster Bestätigung der exakt ausgegebenen Liste:\n"
+        . "printf '%s\\n' '<confirmation_token>' | sudo /bin/sh \"\$bootstrap_file\" --confirm-local-drift"
+        . "\n\nDanach die lokale Download-Datei entfernen:\n"
+        . 'rm -f -- "$bootstrap_file"';
+}
+
+/**
+ * Liest die vom root-eigenen Dispatcher atomar veröffentlichte Laufkennung.
+ * Ein alter globaler Abschlussstatus darf dadurch nie als Ergebnis eines neu
+ * gestarteten Webauftrags erscheinen.
+ */
+function e3dcReadSelfUpdateRunId() {
+    $path = '/run/e3dc-web-update/run.id';
+    clearstatcache(true, $path);
+    $before = @lstat($path);
+    if (!is_array($before)
+        || (($before['mode'] ?? 0) & 0170000) !== 0100000
+        || (int)($before['nlink'] ?? 0) !== 1
+        || (int)($before['uid'] ?? -1) !== 0
+        || (((int)($before['mode'] ?? 0)) & 0022) !== 0
+        || (int)($before['size'] ?? 0) < 1
+        || (int)($before['size'] ?? 0) > 64) {
+        return null;
+    }
+    $content = @file_get_contents($path);
+    clearstatcache(true, $path);
+    $after = @lstat($path);
+    if (!is_string($content) || !is_array($after)) {
+        return null;
+    }
+    foreach (['dev', 'ino', 'mode', 'nlink', 'uid', 'gid', 'size', 'mtime', 'ctime'] as $key) {
+        if (($before[$key] ?? null) !== ($after[$key] ?? null)) {
+            return null;
+        }
+    }
+    $runId = strtolower(trim($content));
+    return preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/D', $runId)
+        ? $runId
+        : null;
+}
+
+function e3dcCheckCanonicalWebUpdateDrift() {
+    if (e3dcIsDockerEnvironment()) {
+        return [
+            'success' => true,
+            'schema' => 'e3dc_update_drift_v1',
+            'baseline_complete' => false,
+            'requires_confirmation' => false,
+            'content_drift_count' => 0,
+            'content_drift' => [],
+            'missing_product_count' => 0,
+            'missing_product_files' => [],
+            'docker' => true,
+        ];
+    }
+    $launcherInspection = e3dcInspectWebUpdateLauncher();
+    if (empty($launcherInspection['ok'])) {
+        $fallback = e3dcCommunityDriftBootstrapFallback();
+        return [
+            'success' => false,
+            'message' => 'Der root-eigene Web-Update-Launcher unterstützt die sichere Driftprüfung nicht ('
+                . (string)($launcherInspection['status'] ?? 'unbekannt')
+                . "). Der alte Launcher startet deshalb kein Update.\n\n"
+                . $fallback,
+            'commands' => $fallback,
+        ];
+    }
+    $process = e3dcRunArgvProcess(
+        [
+            '/usr/bin/sudo',
+            '-n',
+            '--',
+            '/usr/local/sbin/e3dc-web-update-launcher',
+            '--check-local-drift-json',
+        ],
+        180.0,
+        ['max_output_bytes' => 1024 * 1024]
+    );
+    $decoded = json_decode(trim((string)($process['stdout'] ?? '')), true);
+    if (empty($process['success'])
+        || (int)($process['exit_code'] ?? 1) !== 0
+        || !is_array($decoded)
+        || ($decoded['schema'] ?? null) !== 'e3dc_update_drift_v1'
+        || ($decoded['success'] ?? null) !== true) {
+        $detail = trim((string)($process['stderr'] ?? ''));
+        if ($detail === '') $detail = trim((string)($process['stdout'] ?? ''));
+        return [
+            'success' => false,
+            'message' => 'Lokale Inhalte konnten nicht rein lesend geprüft werden'
+                . ($detail !== '' ? ': ' . $detail : '.'),
+        ];
+    }
+    return $decoded;
+}
+
+function e3dcStartCanonicalWebUpdateJob(
+    $purpose = 'update',
+    $confirmLocalDrift = false,
+    $confirmationToken = ''
+) {
     $purpose = in_array((string)$purpose, ['update', 'permissions_repair'], true)
         ? (string)$purpose
         : 'update';
@@ -6104,31 +6241,74 @@ function e3dcStartCanonicalWebUpdateJob($purpose = 'update') {
         ];
     }
 
-    $output = [];
-    $exitCode = 1;
-    exec('/usr/bin/sudo -n -- /usr/local/sbin/e3dc-web-update-launcher 2>&1', $output, $exitCode);
+    $previousRunId = e3dcReadSelfUpdateRunId();
+    $confirmationToken = strtolower(trim((string)$confirmationToken));
+    if ($confirmLocalDrift === true) {
+        if (!preg_match('/^[0-9a-f]{64}$/D', $confirmationToken)) {
+            return [
+                'success' => false,
+                'message' => 'Die gebundene Dateilistenfreigabe ist ungültig. Bitte führe die Nur-Lese-Prüfung erneut aus.',
+            ];
+        }
+    } elseif ($confirmationToken !== '') {
+        return [
+            'success' => false,
+            'message' => 'Eine Dateilistenfreigabe wurde ohne bewusste Bestätigung übergeben.',
+        ];
+    }
+    $argv = [
+        '/usr/bin/sudo',
+        '-n',
+        '--',
+        '/usr/local/sbin/e3dc-web-update-launcher',
+    ];
+    if ($confirmLocalDrift === true) {
+        $argv[] = '--confirm-local-drift';
+    }
+    $processOptions = ['max_output_bytes' => 128 * 1024];
+    if ($confirmLocalDrift === true) {
+        // Das Secret bindet nur die bestätigte Liste. Es bleibt aus argv,
+        // Prozesslisten und Updateprotokoll heraus und läuft über die feste Pipe.
+        $processOptions['stdin'] = $confirmationToken . "\n";
+    }
+    $process = e3dcRunArgvProcess($argv, 30.0, $processOptions);
+    $outputText = trim((string)($process['stdout'] ?? ''));
+    $errorText = trim((string)($process['stderr'] ?? ''));
+    $exitCode = (int)($process['exit_code'] ?? 1);
+    $runId = e3dcReadSelfUpdateRunId();
     $startedMessage = $purpose === 'permissions_repair'
-        ? 'Rechteprüfung und Reparatur wurden über den kanonischen Backup-/Update-Systemjob gestartet.'
+        ? 'Die vollständige Systemreparatur mit Backup, Stable-Abgleich, Rechteprojektion und Dienstneustart wurde gestartet.'
         : 'Update als root-kontrollierter Systemjob gestartet.';
     return [
-        'success' => $exitCode === 0,
-        'running' => $exitCode === 0,
+        'success' => !empty($process['success']) && $exitCode === 0,
+        'running' => !empty($process['success']) && $exitCode === 0,
         'purpose' => $purpose,
-        'message' => $exitCode === 0
-            ? (trim(implode("\n", $output)) ?: $startedMessage)
+        'previous_run_id' => $previousRunId,
+        'run_id' => $runId,
+        'message' => (!empty($process['success']) && $exitCode === 0)
+            ? ($outputText ?: $startedMessage)
             : 'Der enge Web-Update-Launcher konnte nicht gestartet werden: '
-                . (trim(implode("\n", $output)) ?: 'keine Detailausgabe')
+                . (($errorText ?: $outputText) ?: 'keine Detailausgabe')
                 . "\n\nLösung: Führe einmalig diesen Befehl aus:\n"
                 . e3dcCommunityBootstrapCommand(),
     ];
 }
 
 function handleRunSelfUpdate() {
+    if (isset($_GET['action']) && $_GET['action'] === 'check_self_update_drift') {
+        e3dcRequirePostMutation(true);
+        header('Cache-Control: no-cache, no-store, must-revalidate');
+        header('Content-Type: application/json');
+        echo json_encode(e3dcCheckCanonicalWebUpdateDrift());
+        exit;
+    }
+
     if (isset($_GET['action']) && $_GET['action'] === 'poll_self_update') {
         requireWebAuth(true);
         header('Cache-Control: no-cache, no-store, must-revalidate');
         header('Content-Type: application/json');
 
+        $runIdBefore = e3dcReadSelfUpdateRunId();
         $logFile = '/var/log/e3dc-control/web-update.log';
         $pidFile = '/run/e3dc-web-update/pid';
         $statusFile = '/run/e3dc-web-update/status';
@@ -6178,6 +6358,20 @@ function handleRunSelfUpdate() {
             $runtimeStatus['phase'],
             $runtimeStatus['status']
         );
+        $runIdAfter = e3dcReadSelfUpdateRunId();
+        $snapshotConsistent = ($runIdBefore === $runIdAfter);
+        if (!$snapshotConsistent) {
+            // Ein neuer Lauf wurde während dieses Lesevorgangs veröffentlicht.
+            // Status, PID und Log können dann noch zum vorherigen Lauf gehören
+            // und dürfen nicht mit der neuen Kennung als Abschluss erscheinen.
+            $log = 'Der Systemjob wechselte während der Statusabfrage. Der konsistente Stand wird im nächsten Intervall gelesen.';
+            $running = false;
+            $exitCode = null;
+            $completion = 'unknown';
+            $runtimeStatus = e3dcParseSelfUpdateRuntimeStatus('');
+            $statusAgeSeconds = null;
+            $systemdState = null;
+        }
 
         $flags = 0;
         if (defined('JSON_INVALID_UTF8_SUBSTITUTE')) $flags |= JSON_INVALID_UTF8_SUBSTITUTE;
@@ -6193,6 +6387,8 @@ function handleRunSelfUpdate() {
             'phase' => $runtimeStatus['phase'],
             'status' => $runtimeStatus['status'],
             'reason' => $runtimeStatus['reason'],
+            'run_id' => $runIdAfter,
+            'snapshot_consistent' => $snapshotConsistent,
             'status_age_seconds' => $statusAgeSeconds,
             'systemd_state' => $systemdState,
         ], $flags);
@@ -6204,6 +6400,12 @@ function handleRunSelfUpdate() {
         header('Content-Type: application/json');
 
         $reinstallRaw = isset($_POST['reinstall']) ? (string)$_POST['reinstall'] : '0';
+        $confirmDriftRaw = isset($_POST['confirm_local_drift'])
+            ? (string)$_POST['confirm_local_drift']
+            : '0';
+        $confirmationToken = isset($_POST['confirmation_token'])
+            ? (string)$_POST['confirmation_token']
+            : '';
         if ($reinstallRaw !== '0') {
             echo json_encode([
                 'success' => false,
@@ -6211,7 +6413,18 @@ function handleRunSelfUpdate() {
             ]);
             exit;
         }
-        echo json_encode(e3dcStartCanonicalWebUpdateJob('update'));
+        if (!in_array($confirmDriftRaw, ['0', '1'], true)) {
+            echo json_encode([
+                'success' => false,
+                'message' => 'Die Freigabe lokaler Inhaltsabweichungen ist ungültig.',
+            ]);
+            exit;
+        }
+        echo json_encode(e3dcStartCanonicalWebUpdateJob(
+            'update',
+            $confirmDriftRaw === '1',
+            $confirmationToken
+        ));
         exit;
     }
 }
@@ -7382,7 +7595,24 @@ function handleFixPermissions() {
     if (isset($_GET['action']) && $_GET['action'] === 'fix_permissions') {
         e3dcRequirePostMutation(true);
         header('Content-Type: application/json');
-        echo json_encode(e3dcStartCanonicalWebUpdateJob('permissions_repair'));
+        $confirmDriftRaw = isset($_POST['confirm_local_drift'])
+            ? (string)$_POST['confirm_local_drift']
+            : '0';
+        $confirmationToken = isset($_POST['confirmation_token'])
+            ? (string)$_POST['confirmation_token']
+            : '';
+        if (!in_array($confirmDriftRaw, ['0', '1'], true)) {
+            echo json_encode([
+                'success' => false,
+                'message' => 'Die Freigabe lokaler Inhaltsabweichungen ist ungültig.',
+            ]);
+            exit;
+        }
+        echo json_encode(e3dcStartCanonicalWebUpdateJob(
+            'permissions_repair',
+            $confirmDriftRaw === '1',
+            $confirmationToken
+        ));
         exit;
     }
 }
@@ -8163,8 +8393,10 @@ function handleRunUpdate() {
                 'running' => !empty($started['running']),
                 'message' => (string)($started['message'] ?? ''),
                 'commands' => $started['commands'] ?? null,
+                'run_id' => $started['run_id'] ?? null,
             ]);
         } elseif ($mode === 'poll') {
+            $runIdBefore = e3dcReadSelfUpdateRunId();
             clearstatcache(true, $logFile);
             $log = '';
             $debugInfo = "";
@@ -8195,6 +8427,13 @@ function handleRunUpdate() {
                     $exitCode = (int)$rawStatus;
                 }
             }
+            $runIdAfter = e3dcReadSelfUpdateRunId();
+            $snapshotConsistent = ($runIdBefore === $runIdAfter);
+            if (!$snapshotConsistent) {
+                $log = 'Der Systemjob wechselte während der Statusabfrage. Der konsistente Stand wird im nächsten Intervall gelesen.';
+                $running = false;
+                $exitCode = null;
+            }
 
             // JSON Flags für Robustheit (verhindert Absturz bei Emojis/Sonderzeichen)
             $flags = 0;
@@ -8207,6 +8446,8 @@ function handleRunUpdate() {
                 'exit_code' => $exitCode,
                 'completed' => !$running && $exitCode !== null,
                 'success' => !$running && $exitCode === 0,
+                'run_id' => $runIdAfter,
+                'snapshot_consistent' => $snapshotConsistent,
             ], $flags);
 
             if ($json === false) {

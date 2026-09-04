@@ -17,8 +17,10 @@ Hysterese- und Schutzlogik, nutzt aber je Wallbox den passenden Treiber.
   der manuelle Start-SoC wird über **SoC setzen** geschrieben.
 * **Bestätigter Fahrzeug-SoC:** Ziel-SoC, Restladezeit und `Auto voll` nutzen
   nur SoC-Werte aus Wallbox/openWB, Bluelink/MQTT oder bewusster manueller
-  Eingabe. Unbestätigte Profil- oder Altwerte erscheinen als `-- SoC` und
-  sperren normales PV-/Budgetladen nicht.
+  Eingabe. Ein frisch beobachteter openWB-Wert kann ab 5.4.5a mit Quelle und
+  Alter rein lesend erscheinen, bestätigt aber für sich allein keinen
+  Regel-SoC. Andere unbestätigte Profil- oder Altwerte erscheinen als `-- SoC`;
+  normales PV-/Budgetladen bleibt davon unberührt.
 * **Phasen- und Mindestleistung:** openWB Pro, normale openWB, go-e und E3DC
   werden unterschiedlich angesprochen, aber mit derselben Schutzlogik geregelt.
 * **openWB-Autoerkennung:** E3DC-Control liest openWB Software 2.x read-only
@@ -97,11 +99,13 @@ zur Regelbasis, wenn er frisch bestätigt ist:
 * der Nutzer trägt den aktuellen Wert ein und klickt **SoC setzen**.
 
 Alte Startwerte, einfache Profilwerte und Werte aus einer beendeten Session
-werden nicht fortgeschrieben. Nach Abstecken wird die SoC-Session geschlossen;
-nach erneutem Anstecken zeigt die WebUI `-- SoC`, bis wieder eine bestätigte
-Quelle vorhanden ist. Laden nach PV, Mindestleistung, Preisfenster oder kWh-Ziel
-bleibt möglich. Nur SoC-basierte Zielentscheidungen und `Auto voll` benötigen
-den bestätigten Wert.
+werden nicht als Regelwert fortgeschrieben. Ein frisch beobachteter openWB-SoC
+kann mit Quelle und Alter rein lesend angezeigt werden, wenn aktuelle
+Stecksession oder Fahrzeugprofil eindeutig passen. Dieser Anzeigeweg bleibt
+von Ziel-SoC, `Auto voll`, Planung und Hardwareausgang getrennt. Nach Abstecken
+wird die SoC-Regelsession geschlossen; nach erneutem Anstecken bleibt sie ohne
+neue Bestätigung gesperrt. Laden nach PV, Mindestleistung, Preisfenster oder
+kWh-Ziel bleibt möglich.
 
 
 ## Zustandsmaschine und Ladeende
@@ -197,6 +201,13 @@ behandelt der Treiber diese Wallbox als openWB-Primary und nutzt den
 Primary-simpleAPI-Pfad. Ist in E3DC-Control ausdrücklich Modbus Secondary oder
 Primary konfiguriert, bleibt diese Betreiberentscheidung sichtbar und wird nur
 mit der erkannten openWB-Rolle abgeglichen.
+
+Ab 5.4.5a ergänzt ein strikt lesender SoC-Abonnent den bisherigen openWB-
+Statuspfad. Er zeigt einen frischen Beobachtungswert nur mit passender Session-
+oder Fahrzeugbindung und, soweit vorhanden, mit echtem Quellalter. Der
+Abonnent veröffentlicht keine MQTT-Befehle und übernimmt keine Leistung,
+Steckzustände oder Schaltzustände. Auch ein sichtbarer Wert erteilt keine
+Regelautorität; dafür gilt weiterhin der getrennte bestätigte SoC-Vertrag.
 
 Bei einer openWB-Software mit zwei Ladepunkten kann die Erkennung WB2 zur
 Laufzeit ergänzen, wenn WB1 als openWB Controller konfiguriert ist, dieselbe

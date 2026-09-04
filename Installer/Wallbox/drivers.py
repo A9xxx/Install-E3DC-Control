@@ -23,8 +23,8 @@ from .config import logger, RAMDISK_DIR
 from . import command_gate
 from .soc_tracker import vehicle_soc_source_trusted
 
-# paho-mqtt ist nur noch für alte Installationen relevant.
-# Der openWB-2.x-Treiber nutzt bewusst ausschliesslich HTTP simpleAPI.
+# paho-mqtt ergänzt bei openWB den strikt lesenden Fahrzeug-SoC-Pfad.
+# Leistung, Steckzustand und Steuerung bleiben standardmäßig beim HTTP-Pfad.
 _MQTT_LAZY = object()
 mqtt = _MQTT_LAZY
 
@@ -613,7 +613,8 @@ class OpenWBCharger(WallboxDriver):
     Stromvorgaben sind dabei ein Primary-Direktpfad über openWB-Sofortladen
     (chargecurrent); openWB-SoC- und Energiemengenlimits bleiben wirksam.
 
-    Status lesen: GET  simpleapi.php?get_chargepoint_all=<ID>
+    Status lesen: GET  simpleapi.php?get_chargepoint_all=<ID>; Fahrzeug-SoC
+                  zusätzlich über einen strikt lesenden MQTT-Abonnenten.
     Steuern:      HTTP-V1-Secondary-Topics; optional Modbus Secondary als
                   Rückfall, wenn der HTTP-Pfad nicht erreichbar ist.
     """
@@ -622,6 +623,9 @@ class OpenWBCharger(WallboxDriver):
         super().__init__(ip, wb_id)
         config = config or {}
         self.config = config
+        observed_profile_id = str(config.get(f"wb{wb_id}_car_id", "") or "").strip()
+        if observed_profile_id.lower() in ("__none", "none", "no_vehicle", "kein_fahrzeug", "0", "false"):
+            observed_profile_id = ""
         self.current_step_amp = _current_step_from_config(config, wb_id, default=1.0)
         self.state = {
             'car':               1,
@@ -708,6 +712,22 @@ class OpenWBCharger(WallboxDriver):
             'car_soc_source_ts': None,
             'car_soc_raw_ts':    None,
             'car_soc_rule_confirmed': False,
+            # Reine Anzeige-Beobachtung. Diese Felder sind bewusst vom
+            # Regelvertrag getrennt: Retains und HTTP-Werte ohne echten
+            # Produzentenzeitpunkt dürfen sichtbar sein, aber keine
+            # Ladeentscheidung bestätigen.
+            'car_soc_observed': None,
+            'car_soc_observed_source': '',
+            'car_soc_observed_source_ts': None,
+            'car_soc_observed_received_ts': 0,
+            'car_soc_observed_retained': False,
+            'car_soc_display_usable': False,
+            'car_soc_observed_session_start_ts': None,
+            'car_soc_observed_vehicle_id': '',
+            # Reine Konfigurationszuordnung für die Beschriftung. Sie ist
+            # weder Live-Fahrzeugidentität noch Regelautorität.
+            'car_soc_observed_profile_id': observed_profile_id,
+            '_simpleapi_soc_pending': {},
             'car_capacity_kwh':  0.0,
             'car_consumption_kwh_100km': 0.0,
             'car_range':         0.0,
@@ -917,10 +937,15 @@ class OpenWBCharger(WallboxDriver):
             f"{control_path}"
         )
         self.mqtt_client = None
+        self._mqtt_subscribed_topics = set()
         legacy_mqtt = str(
             self.config.get("openwb_mqtt_legacy_enable", self.config.get("wb_openwb_mqtt_legacy_enable", "0"))
         ).strip().lower() in ("1", "true", "yes", "on")
-        mqtt_module = _get_mqtt_module() if legacy_mqtt else None
+        self._mqtt_legacy_enabled = legacy_mqtt
+        # Der Standardpfad ist ein strikt lesender SoC-Abonnent. Retained
+        # Leistung, Plug- und Schaltzustände bleiben hinter dem ausdrücklichen
+        # Legacy-Schalter, damit sie die HTTP-Wahrheit nicht überlagern.
+        mqtt_module = _get_mqtt_module()
         if mqtt_module is not None:
             try:
                 self.mqtt_client = mqtt_module.Client()
@@ -968,12 +993,32 @@ class OpenWBCharger(WallboxDriver):
         self.simpleapi_prefix = f"openWB/simpleAPI/chargepoint{self.cp_suffix}"
         if not getattr(self, "_modbus_connector_configured", False):
             self.modbus_connector = cp_int
+        # Ein SoC-Halbpaar oder eine Beobachtung aus dem bisherigen
+        # Ladepunkt-Namespace darf nicht unter der neu gebundenen CP-ID
+        # weiterleben. Der aktuelle HTTP-Snapshot wird anschließend normal
+        # unter der erkannten ID neu ausgewertet.
+        self.state.update({
+            "_simpleapi_soc_pending": {},
+            "car_soc_observed": None,
+            "car_soc_observed_source": "",
+            "car_soc_observed_source_ts": None,
+            "car_soc_observed_received_ts": 0,
+            "car_soc_observed_retained": False,
+            "car_soc_display_usable": False,
+            "car_soc_observed_session_start_ts": None,
+            "car_soc_observed_vehicle_id": "",
+        })
         self.state["cp_id"] = self.cp_id
         self.state["chargepoint_detection_source"] = str(source or "simpleapi_auto")
         logger.info(
             f"[WB{self.wb_id}] openWB Auto-Ladepunkt übernommen: "
             f"CP={self.cp_id} (vorher {old_cp if old_cp != '' else 'AUTO'})"
         )
+        if (
+            self.mqtt_client is not None
+            and self.state.get("mqtt_connected") is True
+        ):
+            self._sync_mqtt_subscriptions(self.mqtt_client)
         return True
 
     @staticmethod
@@ -1187,14 +1232,14 @@ class OpenWBCharger(WallboxDriver):
         value = cls._float_value(payload.get("range"), 0.0)
         return value, True
 
-    def on_connect(self, client, userdata, flags, reason_code, properties=None):
-        rc = reason_code if isinstance(reason_code, int) else (0 if str(reason_code) == 'Success' else 1)
-        if rc == 0:
-            self.state["mqtt_reconnect_backoff_s"] = 0
-            self.state["mqtt_reconnect_backoff_max_s"] = 60
-            self.state["mqtt_connected"] = True
-            logger.info(f"[WB{self.wb_id}] MQTT: Verbunden mit openWB ({self.ip}), CP={self.cp_id}")
-            topics = [
+    def _mqtt_subscription_topics(self):
+        topics = [
+            f"{self.native_prefix}/connected_vehicle/soc",
+            f"{self.simpleapi_prefix}/soc/soc",
+            f"{self.simpleapi_prefix}/soc/timestamp",
+        ]
+        if bool(getattr(self, "_mqtt_legacy_enabled", False)):
+            topics.extend([
                 f"{self.native_prefix}/plug_state",
                 f"{self.native_prefix}/charge_state",
                 f"{self.native_prefix}/power",
@@ -1205,16 +1250,50 @@ class OpenWBCharger(WallboxDriver):
                 f"{self.native_prefix}/imported",
                 f"{self.native_prefix}/fault_str",
                 f"{self.native_prefix}/state_str",
-                f"{self.native_prefix}/connected_vehicle/soc",   # Auto-SoC
-                f"{self.native_prefix}/connected_vehicle/range",  # Auto-Reichweite
-                f"{self.native_prefix}/connected_vehicle/info",   # Auto-Name, ID, Kapazitaet
+                f"{self.native_prefix}/connected_vehicle/range",
+                f"{self.native_prefix}/connected_vehicle/info",
                 f"{self.simpleapi_prefix}/soc/range",
                 f"{self.simpleapi_prefix}/chargemode",
                 f"openWB/chargepoint{self.cp_suffix}/config",
-            ]
-            for t in topics:
-                client.subscribe(t)
-            logger.info(f"[WB{self.wb_id}] MQTT: {len(topics)} Topics abonniert (incl. Auto-SoC)")
+            ])
+        return topics
+
+    def _sync_mqtt_subscriptions(self, client, *, reconnect=False):
+        """Bindet den reinen Lesepfad an die aktuell erkannte Ladepunkt-ID."""
+
+        desired = set(self._mqtt_subscription_topics())
+        previous = set() if reconnect else set(self._mqtt_subscribed_topics)
+        if not reconnect and hasattr(client, "unsubscribe"):
+            for topic in sorted(previous - desired):
+                try:
+                    client.unsubscribe(topic)
+                except Exception as exc:
+                    logger.debug(
+                        f"[WB{self.wb_id}] MQTT-Leseabonnement konnte nicht "
+                        f"abgemeldet werden ({topic}): {exc}"
+                    )
+        subscribed = set(previous & desired)
+        for topic in sorted(desired - subscribed):
+            try:
+                client.subscribe(topic)
+                subscribed.add(topic)
+            except Exception as exc:
+                logger.warning(
+                    f"[WB{self.wb_id}] MQTT-Leseabonnement konnte nicht "
+                    f"gebunden werden ({topic}): {exc}"
+                )
+        self._mqtt_subscribed_topics = subscribed
+        return len(subscribed)
+
+    def on_connect(self, client, userdata, flags, reason_code, properties=None):
+        rc = reason_code if isinstance(reason_code, int) else (0 if str(reason_code) == 'Success' else 1)
+        if rc == 0:
+            self.state["mqtt_reconnect_backoff_s"] = 0
+            self.state["mqtt_reconnect_backoff_max_s"] = 60
+            self.state["mqtt_connected"] = True
+            logger.info(f"[WB{self.wb_id}] MQTT: Verbunden mit openWB ({self.ip}), CP={self.cp_id}")
+            topic_count = self._sync_mqtt_subscriptions(client, reconnect=True)
+            logger.info(f"[WB{self.wb_id}] MQTT: {topic_count} Topics abonniert (incl. Auto-SoC)")
         else:
             self.state["mqtt_connected"] = False
             logger.error(f"[WB{self.wb_id}] MQTT: Connection failed (rc={rc})")
@@ -1235,6 +1314,38 @@ class OpenWBCharger(WallboxDriver):
             topic       = msg.topic
             payload_str = msg.payload.decode('utf-8').strip()
             if not payload_str:
+                return
+
+            # --- Skalare SoC-Projektion der openWB simpleAPI ---
+            # openWB liefert Wert und echten Produzentenzeitpunkt in zwei
+            # Topics. Sie werden nur innerhalb eines engen Empfangsfensters
+            # gepaart. Der Lesepfad publiziert selbst keinerlei MQTT-Befehle.
+            if topic in (
+                f"{self.simpleapi_prefix}/soc/soc",
+                f"{self.simpleapi_prefix}/soc/timestamp",
+            ):
+                observed_ts = time.time()
+                pending = self.state.setdefault('_simpleapi_soc_pending', {})
+                if topic == f"{self.simpleapi_prefix}/soc/soc":
+                    car_soc = self._soc_percent_value(payload_str.strip('"'))
+                    if car_soc is None:
+                        return
+                    pending.update({
+                        "value": car_soc,
+                        "value_received_ts": observed_ts,
+                    })
+                else:
+                    source_ts = self._soc_source_timestamp(
+                        payload_str.strip('"'),
+                        now_ts=observed_ts,
+                    )
+                    if source_ts is None:
+                        return
+                    pending.update({
+                        "source_ts": source_ts,
+                        "timestamp_received_ts": observed_ts,
+                    })
+                self._apply_simpleapi_soc_pair(observed_ts=observed_ts)
                 return
 
             # --- Auto-SoC aus openWB (MQTT JSON) ---
@@ -1260,6 +1371,27 @@ class OpenWBCharger(WallboxDriver):
                             self.state.get("car_soc_rule_confirmed") is True
                             and previous_soc_ts is not None
                         )
+                        soc_ts = (
+                            explicit_soc_ts
+                            if explicit_soc_ts is not None
+                            else (int(observed_ts) if not retained else None)
+                        )
+                        source = "openwb_mqtt_retained" if retained else "openwb_mqtt"
+                        self._record_soc_observation(
+                            car_soc,
+                            source="openwb_mqtt",
+                            observed_ts=observed_ts,
+                            # Für die reine Anzeige niemals Empfangszeit als
+                            # Produzentenzeit ausgeben. Der Legacy-Regelpfad
+                            # darf sein bisheriges Verhalten separat behalten.
+                            source_ts=explicit_soc_ts,
+                            retained=retained,
+                        )
+                        if not bool(getattr(self, "_mqtt_legacy_enabled", False)):
+                            # Der neue Standard-Abonnent ist reine Anzeige.
+                            # Nur der explizit aktivierte alte MQTT-Pfad darf
+                            # seinen bisherigen Regelvertrag weiterführen.
+                            return
                         if (
                             retained
                             and previous_confirmed
@@ -1268,12 +1400,6 @@ class OpenWBCharger(WallboxDriver):
                             # bereits bestätigte Live-Wahrheit bleibt erhalten.
                             self.state["mqtt_retained_received_at"] = int(observed_ts)
                             return
-                        soc_ts = (
-                            explicit_soc_ts
-                            if explicit_soc_ts is not None
-                            else (int(observed_ts) if not retained else None)
-                        )
-                        source = "openwb_mqtt_retained" if retained else "openwb_mqtt"
                         rule_confirmed = bool(not retained and soc_ts is not None)
                         if (
                             rule_confirmed
@@ -2252,6 +2378,99 @@ class OpenWBCharger(WallboxDriver):
     def _soc_source_rule_confirmed(source):
         return vehicle_soc_source_trusted(source)
 
+    def _record_soc_observation(
+        self,
+        value,
+        *,
+        source,
+        observed_ts=None,
+        source_ts=None,
+        retained=False,
+        vehicle_key=None,
+    ):
+        """Merkt den besten sichtbaren SoC getrennt vom Regelvertrag."""
+        car_soc = self._soc_percent_value(value)
+        if car_soc is None:
+            return False
+        now_ts = time.time() if observed_ts is None else float(observed_ts)
+        candidate_source_ts = self._soc_source_timestamp(source_ts, now_ts=now_ts)
+        previous_source_ts = self._soc_source_timestamp(
+            self.state.get("car_soc_observed_source_ts"),
+            now_ts=now_ts,
+        )
+        previous_soc = self._soc_percent_value(self.state.get("car_soc_observed"))
+        previous_retained = bool(self.state.get("car_soc_observed_retained", False))
+
+        if previous_source_ts is not None:
+            # Derselbe SoC darf seinen echten MQTT-Zeitanker nicht durch einen
+            # zeitlosen HTTP-Poll verlieren. Ein abweichender HTTP-Wert bleibt
+            # dagegen als neue, ausdrücklich zeitlose Beobachtung sichtbar.
+            if candidate_source_ts is None and previous_soc == car_soc:
+                if vehicle_key:
+                    self.state["car_soc_observed_vehicle_id"] = str(vehicle_key).strip()
+                return False
+            if candidate_source_ts is not None and candidate_source_ts < previous_source_ts:
+                return False
+            if (
+                candidate_source_ts == previous_source_ts
+                and retained
+                and not previous_retained
+            ):
+                return False
+
+        self.state.update({
+            "car_soc_observed": car_soc,
+            "car_soc_observed_source": str(source or "").strip(),
+            "car_soc_observed_source_ts": candidate_source_ts,
+            "car_soc_observed_received_ts": int(now_ts),
+            "car_soc_observed_retained": bool(retained),
+            "car_soc_display_usable": True,
+            "car_soc_observed_session_start_ts": (
+                self.state.get("_session_start_ts")
+                if not retained else None
+            ),
+            "car_soc_observed_vehicle_id": str(
+                self._current_range_vehicle_key()
+                if vehicle_key is None else vehicle_key
+            ).strip(),
+        })
+        return True
+
+    def _apply_simpleapi_soc_pair(self, *, observed_ts=None):
+        """Paart skalaren simpleAPI-SoC und dessen Produzentenzeitpunkt."""
+        now_ts = time.time() if observed_ts is None else float(observed_ts)
+        pending = self.state.get("_simpleapi_soc_pending", {})
+        car_soc = self._soc_percent_value(pending.get("value"))
+        source_ts = self._soc_source_timestamp(pending.get("source_ts"), now_ts=now_ts)
+        value_received_ts = self._float_value(pending.get("value_received_ts"), 0.0)
+        timestamp_received_ts = self._float_value(pending.get("timestamp_received_ts"), 0.0)
+        if (
+            car_soc is None
+            or source_ts is None
+            or value_received_ts <= 0.0
+            or timestamp_received_ts <= 0.0
+            or abs(value_received_ts - timestamp_received_ts) > 10.0
+        ):
+            return False
+
+        self._record_soc_observation(
+            car_soc,
+            source="openwb_mqtt",
+            observed_ts=now_ts,
+            source_ts=source_ts,
+            retained=True,
+        )
+        # Das Paar ist verbraucht. So kann ein unmittelbar folgender neuer
+        # SoC nicht versehentlich mit dem Timestamp des vorigen Werts gepaart
+        # werden, selbst wenn openWB beide Änderungen sehr schnell sendet.
+        pending.pop("value_received_ts", None)
+        pending.pop("timestamp_received_ts", None)
+
+        # Die openWB simpleAPI publiziert diese Projektion retained und nur
+        # bei Wertänderung. Selbst ein synthetisch non-retained zugestelltes
+        # Scalar-Paar bleibt daher ausschließlich Anzeige-Beobachtung.
+        return True
+
     @staticmethod
     def _text_value(value, default=""):
         if value in (None, "null"):
@@ -2550,6 +2769,7 @@ class OpenWBCharger(WallboxDriver):
 
         car_soc = self._soc_percent_value(cp_data.get("soc", cp_data.get("pro_soc")))
         if car_soc is not None:
+            observed_ts = time.time()
             car_soc_upstream_source = self._text_value(
                 cp_data.get("car_soc_source", cp_data.get("soc_source")),
                 "",
@@ -2560,7 +2780,15 @@ class OpenWBCharger(WallboxDriver):
             car_soc_source = "openwb_http"
             car_soc_source_ts = self._soc_source_timestamp(
                 cp_data.get("soc_timestamp"),
-                now_ts=time.time(),
+                now_ts=observed_ts,
+            )
+            self._record_soc_observation(
+                car_soc,
+                source=car_soc_source,
+                observed_ts=observed_ts,
+                source_ts=car_soc_source_ts,
+                retained=False,
+                vehicle_key=str(live_vehicle_id or live_rfid_tag or "").strip(),
             )
             car_soc_rule_confirmed = bool(
                 car_soc_source_ts is not None
@@ -2568,7 +2796,7 @@ class OpenWBCharger(WallboxDriver):
             )
             previous_soc_ts = self._soc_source_timestamp(
                 self.state.get("car_soc_source_ts"),
-                now_ts=time.time(),
+                now_ts=observed_ts,
             )
             previous_confirmed = bool(
                 self.state.get("car_soc_rule_confirmed") is True
@@ -2583,7 +2811,13 @@ class OpenWBCharger(WallboxDriver):
             )
             if (
                 candidate_is_freshest
-                or not previous_confirmed
+                or (
+                    not previous_confirmed
+                    and (
+                        previous_soc_ts is None
+                        or car_soc_source_ts is not None
+                    )
+                )
             ):
                 self.state["car_soc"] = car_soc
                 self.state["car_soc_source"] = car_soc_source
@@ -2605,7 +2839,7 @@ class OpenWBCharger(WallboxDriver):
                 # echten MQTT-/SimpleAPI-Anker nicht entwerten.
                 self.state["car_soc_unconfirmed_observed"] = car_soc
                 self.state["car_soc_unconfirmed_source"] = car_soc_source
-                self.state["car_soc_unconfirmed_observed_ts"] = int(time.time())
+                self.state["car_soc_unconfirmed_observed_ts"] = int(observed_ts)
         range_observed_ts = time.time()
         range_source_ts = cp_data.get("soc_timestamp")
         if range_source_ts in (None, "", "null"):
@@ -2788,6 +3022,15 @@ class OpenWBCharger(WallboxDriver):
             'car_soc_source_ts': self.state.get('car_soc_source_ts'),
             'car_soc_raw_ts':    self.state.get('car_soc_raw_ts'),
             'car_soc_rule_confirmed': self.state.get('car_soc_rule_confirmed') is True,
+            'car_soc_observed': self.state.get('car_soc_observed'),
+            'car_soc_observed_source': self.state.get('car_soc_observed_source', ''),
+            'car_soc_observed_source_ts': self.state.get('car_soc_observed_source_ts'),
+            'car_soc_observed_received_ts': self.state.get('car_soc_observed_received_ts', 0),
+            'car_soc_observed_retained': bool(self.state.get('car_soc_observed_retained', False)),
+            'car_soc_display_usable': bool(self.state.get('car_soc_display_usable', False)),
+            'car_soc_observed_session_start_ts': self.state.get('car_soc_observed_session_start_ts'),
+            'car_soc_observed_vehicle_id': self.state.get('car_soc_observed_vehicle_id', ''),
+            'car_soc_observed_profile_id': self.state.get('car_soc_observed_profile_id', ''),
             'car_range':         self.state.get('car_range', 0),
             'range_km':          self.state.get('car_range', 0),
             'car_range_source':  self.state.get('car_range_source', ''),

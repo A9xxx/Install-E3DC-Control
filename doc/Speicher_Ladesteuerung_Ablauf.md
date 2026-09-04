@@ -1,6 +1,13 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.5
+> **Stand:** v5.4.5a
+>
+> **Neu in 5.4.5a:** Ein frisch beobachteter openWB-Fahrzeug-SoC kann mit
+> Quelle und Alter rein lesend erscheinen, wenn er zur aktuellen Stecksession
+> oder zu einem eindeutig passenden Fahrzeugprofil gehört. Die Beobachtung
+> bestätigt keinen Regel-SoC und öffnet weder Ziel-SoC, `Auto voll`, Planung
+> noch Hardwareausgang. Dafür gelten weiterhin die getrennten bestätigten
+> Session- und Fahrzeugverträge.
 >
 > **Neu in 5.4.5:** Ein zentraler Wattvertrag bindet die je Wallbox
 > finanzierte Quelle, das physische Stromquant und den finalen Aktorauftrag.

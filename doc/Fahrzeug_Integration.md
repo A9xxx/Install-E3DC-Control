@@ -15,11 +15,19 @@ erst dann, wenn er aus einer bestätigten Quelle kommt:
 - der Nutzer setzt den aktuellen SoC bewusst über **SoC setzen**.
 
 Unbestätigte Werte aus alten Sessions, gespeicherten Profilen oder der
-Einfachansicht werden nicht als Regelbasis übernommen und im Dashboard als
-`-- SoC` angezeigt. Nach Abstecken und erneutem Anstecken braucht die Session
-wieder einen frischen bestätigten SoC oder eine neue manuelle Eingabe. Die
-Wallbox darf trotzdem nach PV, Budget, Preisfenster oder kWh-Ziel laden; nur
-SoC-basierte Abschlüsse und Zielladungen bleiben ohne gesicherten Wert aus.
+Einfachansicht werden nicht als Regelbasis übernommen und normalerweise als
+`-- SoC` angezeigt. Ab 5.4.5a darf ein frisch beobachteter openWB-SoC mit
+Quelle und Alter als ausdrücklich rein lesender Wert erscheinen, wenn er zur
+aktuellen Stecksession oder zu einem eindeutig passenden Fahrzeugprofil
+gehört. Diese Beobachtung bestätigt keinen Regel-SoC: Ziel-SoC, `Auto voll`,
+Planung und Hardwarebefehle bleiben am getrennten bestätigten Session- und
+Fahrzeugvertrag geschlossen.
+
+Nach Abstecken und erneutem Anstecken braucht die Session für SoC-basierte
+Entscheidungen wieder einen frischen bestätigten SoC oder eine neue manuelle
+Eingabe. Die Wallbox darf trotzdem nach PV, Budget, Preisfenster oder kWh-Ziel
+laden; nur SoC-basierte Abschlüsse und Zielladungen bleiben ohne gesicherten
+Wert aus.
 
 ---
 

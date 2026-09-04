@@ -95,9 +95,6 @@ MATTER_RESET_PROTECTED_DATA_NAMES = frozenset(
 MATTER_RESET_PROTECTED_DATA_PREFIXES = (MATTER_RESET_STAGE_PREFIX,)
 ROOT_UPDATE_LOCK = Path("/run/lock/e3dc-control/update.lock")
 UPDATE_LOCK_ENV = "E3DC_UPDATE_LOCK_FD"
-PREJOURNAL_CONSTRUCTION_PATH = Path(
-    "/var/lib/e3dc-update-safety/prejournal-construction.json"
-)
 SERVICE_WRAPPER = Path("/usr/local/sbin/e3dc-service-control")
 WEB_UPDATE_LAUNCHER = Path("/usr/local/sbin/e3dc-web-update-launcher")
 RUNTIME_PERMISSIONS_LAUNCHER = Path(
@@ -986,7 +983,7 @@ def _acquire_update_lock() -> int:
 
 @contextmanager
 def _bound_update_lock_environment(descriptor: int):
-    """Reicht den gehaltenen Lock nur an synchrone Backup-Primitiven weiter."""
+    """Reicht den Lock an synchrone Recovery- und Backup-Primitiven weiter."""
 
     previous = os.environ.get(UPDATE_LOCK_ENV)
     os.environ[UPDATE_LOCK_ENV] = str(int(descriptor))
@@ -1979,18 +1976,82 @@ def _clear_legacy_update_blockers(backup_path: Path) -> Path | None:
     return quarantine if archived else None
 
 
-def _assert_no_prejournal_construction_state() -> None:
-    """Vermischt den Simple-Updater nie mit einem laufenden Full-Updater-Präfix."""
+def _prepare_full_update_recovery_entry(
+    target_root: Path,
+    lock_descriptor: int,
+) -> None:
+    """Nutzt vor jeder Simple-Transaktion den vollständigen Recovery-Vertrag."""
 
-    if not os.path.lexists(PREJOURNAL_CONSTRUCTION_PATH):
-        return
-    _fail(
-        "E3DC-UPD-PREJOURNAL-001",
-        "Ein unterbrochener Aufbau des regulären Update-Recovery-Journals ist noch offen.",
-        "Lösche keine Recovery-Datei und kein Backup manuell. Starte den regulären "
-        "E3DC-Control-Updater für dieselbe Installation erneut; nur dieser kann den "
-        "gebundenen Vorbereitungszustand sicher fortsetzen oder bereinigen.",
-    )
+    try:
+        from Installer import update as full_update
+
+        with _bound_update_lock_environment(lock_descriptor):
+            full_update.prepare_recovery_namespace_for_bound_updater(
+                str(target_root),
+            )
+    except Exception as exc:
+        raw_detail = str(getattr(exc, "detail", "") or exc).strip()
+        raw_detail = raw_detail or exc.__class__.__name__
+        code = str(getattr(exc, "code", "") or "").strip()
+        embedded = re.match(
+            r"^\[(E3DC-UPD-[A-Z0-9-]{1,96})\]\s*(.*)$",
+            raw_detail,
+            flags=re.DOTALL,
+        )
+        if embedded is not None:
+            if not code:
+                code = embedded.group(1)
+            raw_detail = embedded.group(2).strip()
+        if re.fullmatch(r"E3DC-UPD-[A-Z0-9-]{1,96}", code) is None:
+            code = "E3DC-UPD-RECOVERY-001"
+        detail = raw_detail.partition("Lösung:")[0].strip() or raw_detail
+        structured_solution = str(getattr(exc, "solution", "") or "").strip()
+        solution = structured_solution or (
+            "Lösche keine Recovery-Datei, keinen systemd-Drop-in und kein Backup "
+            "manuell. Sichere die vollständige Ausgabe und prüfe den gebundenen "
+            "Systemjob mit sudo journalctl -u e3dc-web-update.service "
+            "--no-pager -n 200; behebe ausschließlich die dort genannte Ursache."
+        )
+        structured_state = str(
+            getattr(exc, "system_state", "") or ""
+        ).strip()
+        _fail(
+            code,
+            "Eine offene Update-Transaktion konnte vor dem neuen "
+            f"Releasewechsel nicht sicher abgeschlossen werden. Ursache: {detail}",
+            solution,
+            system_state=structured_state or (
+                "Der aktuelle Simple-Releasewechsel hat noch kein neues Vollbackup "
+                "und keinen neuen Dateiaustausch begonnen. Der Zustand der vorherigen "
+                "Transaktion bleibt fail-closed und muss anhand ihres Recovery-"
+                "Vertrags bestimmt werden."
+            ),
+        )
+
+
+def _rebind_emergency_veto_after_recovery(was_active: bool) -> bool:
+    """Bindet den Incident erneut und bestätigt den Writer nach Recovery."""
+
+    active_now = _prepare_active_emergency_veto_before_update()
+    if was_active and not active_now:
+        _fail(
+            "E3DC-UPD-EMERGENCY-004",
+            "Der vor dem Recovery-Lauf gebundene Incident-Latch war bei der "
+            "anschließenden Writer-Prüfung nicht mehr vorhanden.",
+            "Starte keinen manuellen Speicherbefehl. Prüfe den Incident-Latch, "
+            "seinen systemd-Generator und e3dc-storage-manager.service; der "
+            "Releasewechsel bleibt bis zur eindeutigen Klärung gesperrt.",
+            system_state=(
+                "Die vorherige Update-Recovery wurde betreten, aber der zuvor "
+                "aktive Notfallvertrag kann nicht mehr eindeutig gebunden "
+                "werden. Der neue Dateiaustausch wurde nicht begonnen."
+            ),
+        )
+    # ``_prepare_active_emergency_veto_before_update`` kehrt bei aktivem
+    # Incident ausschließlich mit nachweislich inaktivem Storage-Writer zurück.
+    # Dadurch wird auch ein erst während der Recovery erschienener Latch vor
+    # jeder neuen Target-/Config-Bindung wirksam.
+    return active_now
 
 
 def _disable_competing_controllers(
@@ -7625,6 +7686,12 @@ def perform_update(
             ) from exc
         raise
     try:
+        try:
+            _prepare_full_update_recovery_entry(target_root, lock_descriptor)
+        finally:
+            emergency_enforced = _rebind_emergency_veto_after_recovery(
+                emergency_enforced
+            )
         target_prebinding = _read_bound_directory_prestate(target_root)
         _preflight_web_home_traversal(install_user, target_root)
         _assert_named_directory_binding(target_prebinding)
@@ -7646,7 +7713,6 @@ def perform_update(
         home_traversal_transition: tuple[DirectoryMetadataTransition, ...] | None = None
         warnings: list[str] = []
         try:
-            _assert_no_prejournal_construction_state()
             _assert_named_directory_binding(target_prebinding)
             _verify_update_drift_authority(
                 target_root,

@@ -12,6 +12,21 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
+## Gebundene Recovery in 5.4.5a
+
+Der Simple-Stable-Updater verwendet vor einem neuen Backup oder Dateiaustausch
+unter demselben systemweiten Update-Lock den vollständigen Recovery-Resolver
+des regulären Updaters. Nur eine vollständig an Installation, Vorbereitung,
+Backup und Updatejournal gebundene frühe Unterbrechung darf abgeschlossen oder
+bereinigt werden. Unklare, fremde, widersprüchliche oder bereits weiter
+fortgeschrittene Zustände bleiben fail-closed; die neue Release-Transaktion
+beginnt dann nicht.
+
+Recovery-Dateien, Backups und Startschutz-Einträge niemals einzeln löschen oder
+verschieben. Starte stattdessen den offiziellen Stable-Updater erneut und
+behebe ausschließlich die dort konkret genannte Ursache. Ein bloß vorhandener
+Rest ist weder ein Rückfallbeleg noch eine Löschfreigabe.
+
 ## Start- und Rückfallwahrheit in 5.4.4i
 
 5.4.4i bindet alle steuernden Dateitypprüfungen von Web-Launcher und
@@ -229,7 +244,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand ist `v5.4.5`.
+Der aktuelle Stable-Stand ist `v5.4.5a`.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

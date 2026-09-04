@@ -25013,20 +25013,47 @@ def _resume_or_cleanup_recovery_namespace(
     return True
 
 
+def prepare_recovery_namespace_for_bound_updater(
+    requested_install_root: str,
+) -> bool:
+    """Vollendet eine gebundene Alttransaktion vor einem neuen Updaterlauf.
+
+    Dieser kleine öffentliche Einstieg ist absichtlich der einzige Weg, über
+    den auch der veröffentlichte Simple-Updater den vollständigen
+    Recovery-Resolver verwendet. Er verlangt den bereits gehaltenen
+    systemweiten Update-Lock und erteilt weder anhand eines Dateinamens noch
+    anhand eines bloßen Vorhandenseins Löschautorität. Construction-Receipt,
+    Installationsroot, Backupmanifest, Parent-Belege und ein gegebenenfalls
+    vorhandenes Master-Journal werden weiterhin durch denselben Full-Updater-
+    Vertrag gebunden und geprüft.
+    """
+
+    _required_update_lock_fd()
+    requested = os.path.realpath(os.path.abspath(str(requested_install_root)))
+    bound_install_root = os.path.realpath(os.path.abspath(str(INSTALL_PATH)))
+    if requested != bound_install_root:
+        raise RuntimeError(
+            "[E3DC-UPD-RECOVERY-INSTANCE-001] Der Recovery-Einstieg ist an "
+            f"{bound_install_root} gebunden, der aufrufende Updater nannte "
+            f"{requested}."
+        )
+    # Alte Installationen kennen diesen ausschließlich internen
+    # Sicherheitsnamensraum noch nicht. Sein Fehlen ist kein Nutzerfehler:
+    # Der aktuelle Root-Updater legt ihn nofollow, root:root und 0700 an,
+    # bevor irgendein Receipt gelesen wird. Ein vorhandener unsicherer Pfad
+    # bleibt dagegen fail-closed und wird niemals automatisch umgedeutet.
+    state_descriptor = _open_recovery_bootblock_state_directory()
+    os.close(state_descriptor)
+    return _resume_or_cleanup_recovery_namespace(
+        requested_install_root=requested,
+    )
+
+
 def _prepare_true_update_entry(requested_install_root: str) -> bool:
     """Vollendet Alttransaktionen vor Git-, Policy- und Versionsprüfungen."""
 
     try:
-        # Alte Installationen kennen diesen ausschließlich internen
-        # Sicherheitsnamensraum noch nicht. Sein Fehlen ist kein Nutzerfehler:
-        # Der aktuelle Root-Updater legt ihn nofollow, root:root und 0700 an,
-        # bevor irgendein Receipt gelesen wird. Ein vorhandener unsicherer Pfad
-        # bleibt dagegen fail-closed und wird niemals automatisch umgedeutet.
-        state_descriptor = _open_recovery_bootblock_state_directory()
-        os.close(state_descriptor)
-        _resume_or_cleanup_recovery_namespace(
-            requested_install_root=requested_install_root,
-        )
+        prepare_recovery_namespace_for_bound_updater(requested_install_root)
     except ActionableUpdateAbort as exc:
         _print_actionable_update_abort(exc)
         update_logger.critical(

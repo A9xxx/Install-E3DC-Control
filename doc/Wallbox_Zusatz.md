@@ -131,12 +131,14 @@ Auf der Wallbox-Seite wird pro Wallbox das Fahrzeug ausgewählt. Die Auswahl wir
 automatisch gespeichert. Der Button **SoC setzen** schreibt nur den manuellen
 Start-SoC für das aktuell gewählte Fahrzeug.
 
-Die Auswahl eines Fahrzeugs bestätigt keinen SoC. Für Anzeige, Ziel-SoC und
-`Auto voll` zählen nur frische SoC-Werte aus Wallbox/openWB, Bluelink/MQTT oder
-eine bewusste manuelle Eingabe. Fehlt diese Bestätigung, zeigt die WebUI
-`-- SoC`; nach Abstecken wird die Session geschlossen und nach erneutem
-Anstecken muss der Wert wieder gelesen oder gesetzt werden. PV-/Budgetladen
-wird dadurch nicht gesperrt.
+Die Auswahl eines Fahrzeugs bestätigt keinen SoC. Für Ziel-SoC und `Auto voll`
+zählen nur frische, regelbestätigte SoC-Werte aus Wallbox/openWB,
+Bluelink/MQTT oder eine bewusste manuelle Eingabe. Ab 5.4.5a kann ein frisch
+beobachteter openWB-SoC mit Quelle und Alter rein lesend erscheinen, wenn
+Stecksession oder Fahrzeugprofil eindeutig passen. Diese Anzeige erteilt keine
+Regel- oder Schreibautorität. Ohne Bestätigung bleibt die SoC-basierte
+Entscheidung geschlossen; nach erneutem Anstecken muss der Regelwert wieder
+gelesen oder gesetzt werden. PV-/Budgetladen wird dadurch nicht gesperrt.
 
 ## Häufige Fragen
 

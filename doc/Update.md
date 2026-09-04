@@ -5,11 +5,26 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.4.5`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.4.5a`. Das Dashboard startet ausschließlich
 den argumentlosen, root-eigenen Systemjob. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
+
+5.4.5a lässt den Simple-Stable-Updater vor einem neuen Backup oder
+Dateiaustausch unter dem bereits gehaltenen systemweiten Update-Lock den
+vollständigen, an die konkrete Installation gebundenen Recovery-Resolver
+verwenden. Eine vollständig belegte Unterbrechung während der Vorbereitung vor
+dem eigentlichen Updatejournal kann dadurch sicher abgeschlossen oder bereinigt
+werden. Aus einem Dateinamen oder dem bloßen Vorhandensein eines Restes entsteht
+keine Fortsetzungs- oder Löschautorität.
+
+Ist der Zustand fremd, widersprüchlich, unvollständig oder bereits weiter
+fortgeschritten, endet der neue Releasewechsel fail-closed vor seinem eigenen
+Vollbackup und Dateiaustausch. Recovery-Dateien, Backups und
+Startschutz-Einträge dürfen nicht manuell gelöscht werden. Starte den
+offiziellen Stable-Updater erneut; bleibt er gesperrt, sichere die vollständige
+Ausgabe und behebe ausschließlich die dort konkret genannte Ursache.
 
 5.4.5 führt die reguläre Worker-Bereinigung noch innerhalb des aktiven
 Funktionskontexts aus. Dadurch bleibt der erfolgreiche Abschluss unter
@@ -966,6 +981,14 @@ Wiederherstellung eines verifizierten Datei-Backups der sichere Rückweg.
   sudo docker compose logs --tail=80 e3dc-control
 )
 ```
+
+Der Image-Pull erhält auf langsamen Hosts standardmäßig mindestens 900
+Sekunden; die getrennte Health-Wartezeit bleibt bei 300 Sekunden.
+`--wait-timeout 1800` kann Pull und Kandidatenstart bewusst weiter verlängern,
+verändert aber nicht die festen kurzen Docker-Informationsprüfungen. Bei
+Zeitlimit oder Abbruch beendet der Helfer ausschließlich die eigene gebundene
+Docker-/Compose-Clientprozessgruppe vollständig. Fremde Aufrufe und der
+Docker-Daemon bleiben unangetastet.
 
 Der Web-Updater erkennt den Containerkontext auch über den Marker des
 offiziellen Images und zeigt diese Befehle an. Er benötigt keinen Zugriff auf

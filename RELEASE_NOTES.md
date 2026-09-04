@@ -1,12 +1,75 @@
-# E3DC-Control v5.4.5
+# E3DC-Control v5.4.5a
 
 Release-Stand: 2026-09-04.
 
-E3DC-Control 5.4.5 bündelt die bereinigte zentrale Wallbox-Regelung, eine
-quellengebundene Leistungs- und Defizitführung, ehrliche Wallbox-Livewerte,
-die sichtbare rein lesende PV-Prognosediagnose und den korrigierten regulären
-Updateabschluss. Nutzer-`Aus`, Hausanschluss-, Fahrzeug-, Netz-, Speicher-,
-Geheimnis- und Hardwareschutzgrenzen bleiben wirksam.
+E3DC-Control 5.4.5a korrigiert drei eng begrenzte Kanten: openWB kann einen
+frisch beobachteten Fahrzeug-SoC mit Quelle und Alter rein lesend anzeigen,
+ohne daraus Regelautorität abzuleiten. Der Simple-Stable-Updater verwendet für
+eine unterbrochene Vorbereitung vor dem eigentlichen Updatejournal jetzt den
+vollständigen gebundenen Recovery-Resolver. Der Docker-Host-Helfer gibt
+langsamen Image-Pulls mehr Zeit und beendet seine eigene Client-Prozessgruppe
+bei Zeitlimit oder Abbruch vollständig. Nutzer-`Aus`, Hausanschluss-,
+Fahrzeug-, Netz-, Speicher-, Geheimnis- und Hardwareschutzgrenzen bleiben
+wirksam.
+
+## Frischer openWB-Fahrzeug-SoC wird ehrlich angezeigt
+
+- Ein frisch von openWB beobachteter Fahrzeug-SoC kann mit Quelle und echtem
+  Quellalter im Dashboard erscheinen. Fehlt ein belastbarer Quellzeitpunkt,
+  bleibt nur ein kurzes, ausdrücklich begrenztes Anzeigefenster.
+- Die Beobachtung muss zur aktuellen Stecksession oder zu einem eindeutig
+  passenden Fahrzeugprofil gehören. Veraltete, widersprüchliche oder nicht
+  zuordenbare Werte werden nicht eingeblendet.
+- Dieser Pfad ist ausdrücklich reine Anzeige. Er bestätigt weder Ziel-SoC noch
+  `Auto voll`, öffnet keine SoC-basierte Planung und sendet keinen
+  Hardwarebefehl. Die bisherige bestätigte Session- und Fahrzeugbindung bleibt
+  der getrennte Regelvertrag.
+- Der ergänzende openWB-Lesepfad veröffentlicht keine MQTT-Befehle. Leistung,
+  Steckzustand und Steuerung folgen weiterhin dem bisherigen Gerätevertrag.
+- Wird die Ladepunktnummer erst durch die SimpleAPI erkannt, werden die
+  rein lesenden MQTT-Abonnements auf diese Nummer nachgebunden. Unvollständige
+  SoC-Paare und Anzeigen aus dem vorherigen Namespace werden dabei verworfen.
+
+## Simple-Stable-Updater nutzt dieselbe gebundene Recovery
+
+- Vor einem neuen Backup oder Dateiaustausch ruft der Simple-Stable-Updater
+  unter dem bereits gehaltenen systemweiten Update-Lock den vollständigen
+  Recovery-Resolver des regulären Updaters auf. Beide Wege prüfen damit
+  denselben Installations-, Vorbereitungs-, Backup- und Updatejournalvertrag.
+- Eine vollständig belegte Unterbrechung während der Vorbereitung vor dem
+  eigentlichen Updatejournal kann sicher abgeschlossen oder bereinigt werden.
+  Aus einem Dateinamen oder dem bloßen Vorhandensein eines Restes entsteht
+  keine Lösch- oder Fortsetzungsautorität.
+- Unklare, fremde, widersprüchliche oder bereits weiter fortgeschrittene
+  Zustände bleiben fail-closed. Der neue Releasewechsel beginnt dann weder ein
+  neues Vollbackup noch einen neuen Dateiaustausch.
+- Recovery-Dateien, Backups und Startschutz-Einträge dürfen nicht manuell
+  gelöscht werden. Der offizielle Stable-Updater wird erneut gestartet; bleibt
+  er gesperrt, ist ausschließlich die konkret ausgegebene Ursache zu prüfen und
+  zu beheben.
+
+## Docker-Update auf langsameren Hosts
+
+- Der Image-Pull erhält standardmäßig mindestens 900 Sekunden. Die davon
+  getrennte Health-Wartezeit bleibt bei 300 Sekunden. `--wait-timeout` kann
+  Pull und Kandidatenstart weiterhin bewusst verlängern.
+- Jeder vom Helfer gestartete Docker-/Compose-Aufruf läuft in einer eigenen
+  Prozessgruppe. Bei Zeitlimit, `SIGINT` oder `SIGTERM` wird ausschließlich
+  diese Gruppe mit `TERM` und erforderlichenfalls `KILL` beendet und das
+  direkte Kind eingesammelt, bevor der Helfer endet.
+- Fremde Docker-/Compose-Aufrufe und der Docker-Daemon werden nicht über eine
+  Prozessnamensuche beendet. Der Nachweis bezieht sich bewusst auf die
+  gebundene Client-Prozessgruppe; interne Daemon-Arbeiten werden daraus nicht
+  abgeleitet.
+- Der dokumentierte administrative Aufruf bleibt
+  `sudo python3 ./Installer/docker_compose_update.py --compose-dir . --sudo`.
+  Ein erst innerhalb des Helfers verschachteltes `sudo` wird nicht verwendet,
+  weil dessen Prozessgruppe je nach Hostkonfiguration nicht sicher bindbar ist.
+
+## Enthaltener Stand aus 5.4.5
+
+Die folgenden Funktionen und Schutzverträge aus 5.4.5 bleiben vollständig
+enthalten.
 
 ## Wallbox-Regelung mit einem Entscheider und einem Ausgang
 

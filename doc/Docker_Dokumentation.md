@@ -2,8 +2,20 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.5`. Die Tags `latest`, `v5.4.5` und
-`5.4.5` bezeichnen denselben Stable-Stand.
+Der aktuelle Stable-Stand ist `v5.4.5a`. Die Tags `latest`, `v5.4.5a` und
+`5.4.5a` bezeichnen denselben Stable-Stand.
+
+5.4.5a ergänzt die rein lesende Anzeige eines frisch beobachteten
+openWB-Fahrzeug-SoC samt Quelle und Alter. Ohne eindeutige Zuordnung zur
+aktuellen Stecksession oder zum passenden Fahrzeugprofil entsteht daraus keine
+Regelautorität; auch eine sichtbare Beobachtung sendet keinen Hardwarebefehl.
+Die gebundene Recovery des Simple-Stable-Updaters betrifft ausschließlich den
+Bare-Metal-Hostpfad. Der Container führt weiterhin weder Host-Updates noch
+Docker-Daemon-Aktionen aus. Der Docker-Host-Helfer gibt einem Image-Pull
+standardmäßig mindestens 900 Sekunden; die getrennte Health-Wartezeit bleibt
+bei 300 Sekunden. Bei Zeitlimit oder Abbruch beendet er ausschließlich die
+eigene gebundene Docker-/Compose-Clientprozessgruppe vollständig. Fremde
+Aufrufe und der Docker-Daemon bleiben unangetastet.
 
 5.4.5 enthält die zentralen Wallbox-Watt-, Quellen- und Aktorverträge, den
 gruppenweiten Netz-Wh-Wächter sowie die kanonische Wallbox-Liveanzeige ohne
@@ -354,6 +366,16 @@ sha256-ID und OCI-Version vor dem Start und vergleicht damit die laufende
 `VERSION`. Start-, Warte-, Health-, Snapshot- oder Versionsfehler führen immer
 zu einem bestätigten Stopp des Kandidaten.
 
+Der Image-Pull darf auf langsameren Raspberry-Pi-/SD-Systemen bis zu 900
+Sekunden dauern. `--wait-timeout` kann Pull und Kandidatenstart weiter
+verlängern, zum Beispiel mit `--wait-timeout 1800`; feste kurze
+Docker-Informationsprüfungen behalten ihr eigenes Zeitlimit. Jeder gestartete
+Docker-/Compose-Client läuft in einer eigenen Prozessgruppe. Bei Zeitlimit,
+`SIGINT` oder `SIGTERM` beendet der Helfer ausschließlich diese Gruppe zuerst
+mit `TERM`, nötigenfalls mit `KILL`, und sammelt das direkte Kind ein. Es gibt
+keine pauschale Prozessnamensuche und keine Zusage über interne Arbeiten des
+Docker-Daemons.
+
 Fehlt `docker_compose_update.py` in einer älteren Docker-Installation, verwende
 einen separaten frischen Checkout des veröffentlichten `main` als
 Verwaltungsbaum. Starte daraus `Installer/docker_compose_update.py` und übergib
@@ -369,7 +391,7 @@ unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.5` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.5a` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -396,7 +418,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.5` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.5a` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash

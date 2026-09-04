@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.5 Stable</span>
+            <span class="badge bg-success text-light">v5.4.5a Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.5</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.5a</code> in <code>.env</code> gesetzt.</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
 if [ -f ./docker_compose_update.py ]; then
   E3DC_DOCKER_HELPER=./docker_compose_update.py
@@ -212,6 +212,26 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                         <li>Nach der Freigabe im Account den RESTful API Security Token erzeugen.</li>
                         <li>Im Config-Editor unter <em>Tarif</em> den ENTSO-E-Token als Fallback-Token eintragen und mit <em>ENTSO-E testen</em> prüfen.</li>
                     </ol>
+                </div>
+            </div>
+        </div>
+
+        <h4 class="mb-4 text-accent"><i class="fas fa-shield-halved me-2"></i>Stable 5.4.5a: SoC-Anzeige sowie sichere Bare-Metal- und Docker-Updates</h4>
+        <div class="col-12 faq-item" data-tags="5.4.5a stable openwb fahrzeug soc quelle alter anzeige update recovery unterbrechung docker compose timeout prozessgruppe fail closed">
+            <div class="card bg-card border-0 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <span class="tag">5.4.5a</span>
+                        Was korrigiert das Stable-Release 5.4.5a?
+                    </h5>
+                    <ul>
+                        <li><strong>openWB-SoC als ehrliche Anzeige:</strong> Ein frisch beobachteter Fahrzeug-SoC kann mit Quelle und Alter erscheinen. Die Beobachtung muss zur aktuellen Stecksession oder zu einem eindeutig passenden Fahrzeugprofil gehören. Sie bestätigt für sich allein weder Ziel-SoC noch <code>Auto voll</code>, öffnet keine SoC-basierte Planung und sendet keinen Hardwarebefehl.</li>
+                        <li><strong>Lesepfad bleibt lesend:</strong> Der ergänzende openWB-SoC-Pfad veröffentlicht keine MQTT-Befehle. Leistung, Steckzustand und Steuerung folgen weiterhin dem bisherigen Gerätevertrag. Veraltete, widersprüchliche oder nicht eindeutig zuordenbare Werte bleiben geschlossen.</li>
+                        <li><strong>Gebundene Update-Recovery:</strong> Der Simple-Stable-Updater verwendet vor einem neuen Backup oder Dateiaustausch unter demselben systemweiten Update-Lock den vollständigen Recovery-Resolver. Nur eine vollständig belegte Unterbrechung der frühen Vorbereitung darf sicher abgeschlossen oder bereinigt werden.</li>
+                        <li><strong>Unklar bleibt gesperrt:</strong> Fremde, widersprüchliche oder bereits weiter fortgeschrittene Zustände stoppen vor der neuen Release-Transaktion. Recovery-Dateien, Backups und Startschutz-Einträge nicht manuell löschen; stattdessen den offiziellen Stable-Updater erneut starten und ausschließlich die konkret ausgegebene Ursache beheben.</li>
+                        <li><strong>Langsame Docker-Pulls erhalten Zeit:</strong> Der Docker-Host-Helfer wartet beim Image-Pull standardmäßig mindestens 900 Sekunden; die getrennte Health-Wartezeit bleibt bei 300 Sekunden.</li>
+                        <li><strong>Kein verwaister Compose-Client:</strong> Bei Zeitlimit oder Abbruch beendet der Helfer ausschließlich seine gebundene Docker-/Compose-Clientprozessgruppe vollständig. Fremde Aufrufe und der Docker-Daemon bleiben unangetastet.</li>
+                    </ul>
                 </div>
             </div>
         </div>

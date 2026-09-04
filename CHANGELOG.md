@@ -6,6 +6,27 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.5a] – 2026-09-04
+
+### 🚗 Frischer openWB-Fahrzeug-SoC bleibt reine Anzeige
+
+- **Quelle und Alter sichtbar:** Ein frisch beobachteter Fahrzeug-SoC aus openWB kann im Dashboard mit seiner Quelle und seinem tatsächlichen Alter erscheinen. Ein Wert ohne belastbaren Quellzeitpunkt wird nur innerhalb seines kurzen, ausdrücklich begrenzten Anzeigefensters verwendet.
+- **Bindung vor Regelautorität:** Die Anzeige wird an die aktuelle Stecksession oder ein eindeutig passendes Fahrzeugprofil gebunden. Sie bestätigt für sich allein weder Ziel-SoC noch `Auto voll` und erteilt keine Lade-, Planungs- oder Hardwarefreigabe; dafür gelten weiterhin die getrennten bestätigten SoC-Verträge.
+- **Lesepfad bleibt lesend:** Der ergänzende openWB-SoC-Pfad sendet keine MQTT-Befehle. Leistung, Steckzustand und Steuerung bleiben beim bisherigen Gerätevertrag; veraltete, widersprüchliche oder nicht eindeutig zuordenbare Beobachtungen bleiben geschlossen.
+- **Autoerkannter Ladepunkt wird nachgebunden:** Erkennt die SimpleAPI die Ladepunktnummer erst im laufenden Betrieb, wechseln auch die rein lesenden MQTT-Abonnements auf genau diese Nummer. Angefangene SoC-Paare und Anzeigen aus dem vorherigen Namespace werden verworfen, statt unter der neuen Ladepunkt-ID weiterzulaufen.
+
+### 🔄 Unterbrochene Update-Vorbereitung wird sicher aufgelöst
+
+- **Ein vollständiger Recovery-Vertrag:** Der Simple-Stable-Updater verwendet vor einem neuen Backup oder Dateiaustausch unter demselben systemweiten Update-Lock den vollständigen, an die konkrete Installation gebundenen Recovery-Resolver.
+- **Nur eindeutige Altzustände werden fortgesetzt:** Eine vollständig belegte Unterbrechung während der Vorbereitung vor dem eigentlichen Updatejournal darf sicher abgeschlossen oder bereinigt werden. Unklare, fremde, widersprüchliche oder bereits weiter fortgeschrittene Zustände stoppen weiterhin fail-closed, bevor eine neue Release-Transaktion beginnt.
+- **Nichts manuell löschen:** Recovery-Dateien, Backups oder Startschutz-Einträge dürfen nicht einzeln entfernt werden. Der offizielle Stable-Updater wird erneut gestartet; bleibt der Zustand gesperrt, ist ausschließlich die konkret ausgegebene Ursache zu prüfen und zu beheben.
+
+### 🐳 Docker-Update bleibt auch auf langsamen Systemen eindeutig
+
+- **Mehr Zeit für den Image-Pull:** Der Host-Helfer gewährt dem Image-Download standardmäßig mindestens 900 Sekunden. Die getrennte Health-Wartezeit bleibt bei 300 Sekunden; `--wait-timeout` kann beide langen Phasen weiterhin bewusst verlängern.
+- **Keine verwaisten Compose-Clients:** Jeder Docker-/Compose-Aufruf erhält eine eigene Prozessgruppe. Bei Zeitlimit oder Abbruch wird ausschließlich diese gebundene Gruppe zuerst mit `TERM` und nötigenfalls mit `KILL` beendet und vollständig eingesammelt, bevor der Helfer zurückkehrt.
+- **Keine pauschale Prozesssuche:** Fremde Docker-/Compose-Aufrufe und der Docker-Daemon bleiben unangetastet. Der sichere Gruppenstopp gilt für die vom Helfer gestartete Client-Prozessgruppe und behauptet keine Kontrolle über interne Arbeiten des Daemons.
+
 ## [5.4.5] – 2026-09-04
 
 ### 🚗 Ein zentraler Wallbox-Entscheid bis zum Geräteausgang

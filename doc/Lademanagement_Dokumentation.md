@@ -143,10 +143,13 @@ Ladefenster und Pre-Dump-Freigaben für dieses Fahrzeug ausgesetzt, um es nicht
 unnötig mit Strom zu beladen.
 
 Wichtig: Ein gespeichertes Fahrzeugprofil ist nur die Identität des Fahrzeugs,
-kein bestätigter Ladestand. Ohne Wallbox-/Cloud-/MQTT-SoC oder manuell gesetzten
-SoC zeigt das Dashboard `-- SoC` und trifft keine SoC-basierte Abschaltentscheidung.
-Normales Laden nach PV, Preisfenster, Budget oder kWh-Ziel bleibt weiterhin
-möglich.
+kein bestätigter Ladestand. Ohne regelbestätigten Wallbox-/Cloud-/MQTT-SoC oder
+manuell gesetzten SoC trifft das System keine SoC-basierte Abschaltentscheidung.
+Ab 5.4.5a kann ein frisch beobachteter openWB-SoC mit Quelle und Alter rein
+lesend im Dashboard erscheinen, wenn Stecksession oder Fahrzeugprofil eindeutig
+passen. Diese Anzeige erzeugt weder Planung noch Hardwarefreigabe; andere
+unbestätigte Werte bleiben `-- SoC`. Normales Laden nach PV, Preisfenster,
+Budget oder kWh-Ziel bleibt weiterhin möglich.
 
 ### Multi-EV & Multi-Wallbox Support (Flotten-Management)
 Das System ist vollständig "Flotten-tauglich" und unterstützt ab Version 3.8.7.2 den parallelen Betrieb von mehreren Fahrzeugen und Ladestellen:

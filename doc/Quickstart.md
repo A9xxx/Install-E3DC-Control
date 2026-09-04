@@ -2,7 +2,21 @@
 
 Diese Anleitung fasst die schnellsten Schritte zusammen, um E3DC-Control auf einem frischen Raspberry Pi OS (oder ähnlichem Debian-System) zu installieren.
 
-Aktueller Stable-Stand: `v5.4.5`.
+Aktueller Stable-Stand: `v5.4.5a`.
+
+5.4.5a zeigt einen frisch beobachteten openWB-Fahrzeug-SoC mit Quelle und
+Alter rein lesend an, sobald er zur aktuellen Stecksession oder zu einem
+eindeutig passenden Fahrzeugprofil gehört. Diese Anzeige bestätigt keinen
+Regel-SoC und erzeugt weder Planung noch Hardwarebefehl. Bei Bare-Metal-Updates
+verwendet auch der Simple-Stable-Updater unter demselben Update-Lock den
+vollständigen gebundenen Recovery-Resolver. Nur eindeutig belegte
+Unterbrechungen der frühen Vorbereitung werden fortgesetzt oder bereinigt;
+unklare, fremde oder weiter fortgeschrittene Zustände bleiben gesperrt.
+Recovery-Dateien, Backups und Startschutz-Einträge nicht manuell löschen.
+Der Docker-Host-Helfer gibt langsamen Image-Pulls standardmäßig mindestens
+900 Sekunden und beendet bei Zeitlimit oder Abbruch ausschließlich seine
+gebundene Docker-/Compose-Clientprozessgruppe vollständig. Fremde Aufrufe und
+der Docker-Daemon bleiben unangetastet.
 
 5.4.5 führt die Wallboxen über einen zentralen Watt- und Aktorvertrag. Der
 Manager verteilt das belegte Budget je Ladepunkt, der jeweilige Treiber
@@ -452,7 +466,7 @@ Ohne das Label bleibt auch ein versehentlich gestarteter Watchtower für den
 Hauptcontainer wirkungslos. Der oben gezeigte manuelle Host-Helfer bleibt der
 empfohlene Updateweg.
 
-**Docker-Rückfall von v5.4.5 auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.4.5a auf den veröffentlichten Docker-Rollback-Root:**
 ```bash
 (
   set -euo pipefail

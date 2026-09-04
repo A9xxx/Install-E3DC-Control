@@ -74,8 +74,11 @@ Die einfache Wallbox-Ansicht reduziert die Bedienung auf drei Entscheidungen:
 - **Ziel**
   Ziel-SoC oder direkte Lademenge in kWh. Nutzer ohne Fahrzeug-SoC-Auslesung
   können einen manuell bestätigten Start-SoC setzen oder ein kWh-Ziel verwenden.
-  Ohne bestätigten SoC zeigt die Wallbox `-- SoC` und nutzt keine
-  SoC-basierte Abschaltung.
+  Ohne bestätigten Regel-SoC nutzt die Wallbox keine SoC-basierte Abschaltung.
+  Ein frisch beobachteter openWB-Wert kann ab 5.4.5a mit Quelle und Alter als
+  reine Anzeige erscheinen, wenn aktuelle Stecksession oder Fahrzeugprofil
+  eindeutig passen. Er öffnet weder Planung noch Hardwarebefehl; andere
+  unbestätigte Werte bleiben als `-- SoC` sichtbar.
 
 Die Bedeutungen sind:
 

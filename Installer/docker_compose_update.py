@@ -16,9 +16,11 @@ import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 
@@ -33,8 +35,14 @@ CONTAINER_HEALTHCHECK_COMMAND = (
     "/usr/local/bin/e3dc-docker-healthcheck",
 )
 DEFAULT_WAIT_TIMEOUT_S = 300
+DEFAULT_PULL_TIMEOUT_S = 900
 COMMAND_TIMEOUT_S = 30
 START_TIMEOUT_GRACE_S = 60
+PROCESS_GROUP_TERM_GRACE_S = 5.0
+PROCESS_GROUP_KILL_GRACE_S = 5.0
+PROCESS_GROUP_POLL_S = 0.1
+PROCESS_SIGNAL_POLL_S = 0.5
+TIMEOUT_OUTPUT_MAX_CHARS = 4000
 COMPOSE_FILENAME = "docker-compose.yml"
 MAX_COMPOSE_BYTES = 512 * 1024
 MAX_ENV_BYTES = 128 * 1024
@@ -209,6 +217,308 @@ class DockerStorageFullError(DockerUpdateError):
     """Der Docker-Datenträger besitzt nicht genug nachgewiesenen Freiraum."""
 
 
+class _DeferredDockerSignal(BaseException):
+    """Verschiebt einen Terminalabbruch bis nach dem sicheren Prozessgruppenstopp."""
+
+    def __init__(self, signum: int):
+        self.signum = int(signum)
+        super().__init__(f"Elternprozess erhielt Signal {self.signum}")
+
+
+class _DockerSignalGuard:
+    """Bindet SIGINT/SIGTERM, solange genau ein Docker-Aufruf läuft."""
+
+    def __init__(self) -> None:
+        self.requested_signum: int | None = None
+        self._previous_handlers: dict[int, object] = {}
+        self._previous_mask = None
+        self._installed = False
+        self._armed = False
+
+    def install(self) -> None:
+        if (
+            os.name != "posix"
+            or threading.current_thread() is not threading.main_thread()
+        ):
+            return
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            self._previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, self._handle)
+        self._installed = True
+
+    def _handle(self, signum, _frame) -> None:
+        if self.requested_signum is not None:
+            return
+        self.requested_signum = int(signum)
+        if self._armed and hasattr(signal, "pthread_sigmask"):
+            self._previous_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK,
+                {signal.SIGINT, signal.SIGTERM},
+            )
+
+    def arm(self) -> None:
+        self._armed = True
+        if (
+            self.requested_signum is not None
+            and self._previous_mask is None
+            and hasattr(signal, "pthread_sigmask")
+        ):
+            self._previous_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK,
+                {signal.SIGINT, signal.SIGTERM},
+            )
+        self.raise_if_requested()
+
+    def raise_if_requested(self) -> None:
+        if self.requested_signum is not None:
+            raise _DeferredDockerSignal(self.requested_signum)
+
+    def restore(self) -> None:
+        if not self._installed:
+            return
+        self._installed = False
+        for signum, previous in self._previous_handlers.items():
+            signal.signal(signum, previous)
+        if self._previous_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, self._previous_mask)
+
+
+def _process_group_has_live_members(process_group: int) -> bool:
+    """Behandelt beendete, noch nicht von PID 1 geerntete Zombies als inaktiv."""
+
+    proc_root = Path("/proc")
+    if os.name == "posix" and proc_root.is_dir():
+        for entry in proc_root.iterdir():
+            if not entry.name.isdecimal():
+                continue
+            try:
+                value = (entry / "stat").read_text(encoding="ascii")
+                closing = value.rfind(")")
+                fields = value[closing + 2 :].split()
+                state = fields[0]
+                group = int(fields[2])
+            except (IndexError, OSError, UnicodeError, ValueError):
+                continue
+            if group == process_group and state != "Z":
+                return True
+        return False
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _signal_bound_process_group(
+    process: subprocess.Popen[str],
+    process_group: int,
+    signum: int,
+) -> None:
+    """Sendet ein Signal ausschließlich an die für diesen Aufruf erzeugte Gruppe."""
+
+    try:
+        os.killpg(process_group, signum)
+    except ProcessLookupError:
+        return
+    except PermissionError as exc:
+        # Der dokumentierte sudo-Aufruf startet den gesamten Updater als Root.
+        # Ein erst hier verschachteltes sudo kann wegen sudo-use_pty eine andere
+        # Prozessgruppe erzeugen und ist deshalb bereits im Konstruktor gesperrt.
+        if process.poll() is not None:
+            return
+        raise DockerUpdateError(
+            "Die gebundene Docker-Prozessgruppe konnte nicht signalisiert werden."
+        ) from exc
+    except OSError:
+        if process.poll() is not None:
+            return
+        try:
+            process.kill() if signum == signal.SIGKILL else process.terminate()
+        except ProcessLookupError:
+            pass
+
+
+def _communicate_until(
+    process: subprocess.Popen[str],
+    *,
+    timeout: float,
+    signal_guard: _DockerSignalGuard,
+) -> tuple[str | None, str | None]:
+    """Pollt blockierend, damit Terminalsignale nur außerhalb des Handlers wirken."""
+
+    started = time.monotonic()
+    last_stdout = None
+    last_stderr = None
+    while True:
+        signal_guard.raise_if_requested()
+        remaining = float(timeout) - (time.monotonic() - started)
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(
+                process.args,
+                timeout,
+                output=last_stdout,
+                stderr=last_stderr,
+            )
+        try:
+            result = process.communicate(timeout=min(PROCESS_SIGNAL_POLL_S, remaining))
+            signal_guard.raise_if_requested()
+            return result
+        except subprocess.TimeoutExpired as exc:
+            if exc.output is not None:
+                last_stdout = exc.output
+            if exc.stderr is not None:
+                last_stderr = exc.stderr
+
+
+def _wait_for_bound_group_stop(
+    process: subprocess.Popen[str],
+    process_group: int,
+    *,
+    timeout: float,
+) -> tuple[str | None, str | None, bool]:
+    """Erntet das direkte Kind und bestätigt, dass kein lebendes Gruppenmitglied bleibt."""
+
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    stdout = None
+    stderr = None
+    communication_done = False
+    while True:
+        remaining = deadline - time.monotonic()
+        if not communication_done:
+            try:
+                stdout, stderr = process.communicate(
+                    timeout=max(0.01, min(PROCESS_GROUP_POLL_S, remaining))
+                )
+                communication_done = True
+            except subprocess.TimeoutExpired:
+                pass
+        else:
+            process.poll()
+        group_live = _process_group_has_live_members(process_group)
+        if communication_done and not group_live:
+            return stdout, stderr, True
+        if remaining <= 0:
+            return stdout, stderr, False
+        if communication_done:
+            time.sleep(min(PROCESS_GROUP_POLL_S, remaining))
+
+
+def _terminate_bound_process_group(
+    process: subprocess.Popen[str],
+    process_group: int,
+) -> tuple[str | None, str | None]:
+    """TERM, kurze Bestätigung, dann KILL und vollständiges Reaping."""
+
+    _signal_bound_process_group(
+        process,
+        process_group,
+        signal.SIGTERM,
+    )
+    stdout, stderr, stopped = _wait_for_bound_group_stop(
+        process,
+        process_group,
+        timeout=PROCESS_GROUP_TERM_GRACE_S,
+    )
+    if not stopped:
+        _signal_bound_process_group(
+            process,
+            process_group,
+            signal.SIGKILL,
+        )
+        stdout, stderr, stopped = _wait_for_bound_group_stop(
+            process,
+            process_group,
+            timeout=PROCESS_GROUP_KILL_GRACE_S,
+        )
+    if not stopped:
+        raise DockerUpdateError(
+            "Die ausschließlich diesem Docker-Aufruf zugeordnete Prozessgruppe "
+            "konnte nach TERM und KILL nicht vollständig beendet werden."
+        )
+    return stdout, stderr
+
+
+def _raise_deferred_docker_signal(signum: int) -> None:
+    if signum == signal.SIGINT:
+        raise KeyboardInterrupt
+    raise SystemExit(128 + int(signum))
+
+
+def _run_bound_process_group(
+    command: list[str],
+    *,
+    cwd: str,
+    environment: dict[str, str],
+    timeout: float,
+    capture: bool,
+) -> subprocess.CompletedProcess[str]:
+    """Führt genau einen Befehl in einer eigenen, sicher stoppbaren Gruppe aus."""
+
+    signal_guard = _DockerSignalGuard()
+    signal_guard.install()
+    process: subprocess.Popen[str] | None = None
+    deferred_signum: int | None = None
+    pending_exception: BaseException | None = None
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=environment,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.PIPE if capture else None,
+            text=True,
+            start_new_session=os.name == "posix",
+        )
+        process_group = process.pid
+        try:
+            signal_guard.arm()
+            stdout, stderr = _communicate_until(
+                process,
+                timeout=timeout,
+                signal_guard=signal_guard,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout, stderr = _terminate_bound_process_group(
+                process,
+                process_group,
+            )
+            exc.output = stdout if stdout is not None else exc.output
+            exc.stderr = stderr if stderr is not None else exc.stderr
+            exc.e3dc_process_group_stopped = True
+            pending_exception = exc
+        except _DeferredDockerSignal as exc:
+            _terminate_bound_process_group(
+                process,
+                process_group,
+            )
+            deferred_signum = exc.signum
+            stdout = stderr = None
+        except BaseException as exc:
+            _terminate_bound_process_group(
+                process,
+                process_group,
+            )
+            pending_exception = exc
+    finally:
+        signal_guard.restore()
+    if signal_guard.requested_signum is not None:
+        deferred_signum = signal_guard.requested_signum
+    if deferred_signum is not None:
+        _raise_deferred_docker_signal(deferred_signum)
+    if pending_exception is not None:
+        raise pending_exception
+    if process is None:
+        raise DockerUpdateError("Docker-Prozess konnte nicht eindeutig gestartet werden.")
+    return subprocess.CompletedProcess(
+        process.args,
+        int(process.returncode),
+        stdout,
+        stderr,
+    )
+
+
 def _normalise_version(value: Any) -> str:
     return str(value or "").strip().lstrip("vV")
 
@@ -241,7 +551,13 @@ class DockerCli:
     def __init__(self, compose_dir: Path, *, use_sudo: bool, environment: dict[str, str]):
         self.compose_dir = compose_dir
         self.compose_file = compose_dir / COMPOSE_FILENAME
-        self.prefix = ["sudo"] if use_sudo and os.geteuid() != 0 else []
+        if use_sudo and os.geteuid() != 0:
+            raise DockerUpdateError(
+                "Für einen sicher gebundenen Docker-Prozessstopp muss der gesamte "
+                "Updater mit sudo gestartet werden, zum Beispiel: sudo python3 "
+                "./Installer/docker_compose_update.py --compose-dir . --sudo"
+            )
+        self.prefix: list[str] = []
         self.environment = environment
 
     def run(
@@ -251,14 +567,12 @@ class DockerCli:
         timeout: int = COMMAND_TIMEOUT_S,
         capture: bool = True,
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+        return _run_bound_process_group(
             [*self.prefix, "docker", *arguments],
             cwd=str(self.compose_dir),
-            env=self.environment,
-            capture_output=capture,
-            text=True,
+            environment=self.environment,
             timeout=timeout,
-            check=False,
+            capture=capture,
         )
 
     def compose(
@@ -2432,7 +2746,7 @@ def update_container(args: argparse.Namespace) -> dict[str, Any]:
             _require_success(
                 cli.compose(
                     ["pull", SERVICE_NAME],
-                    timeout=max(args.wait_timeout, 300),
+                    timeout=max(args.wait_timeout, DEFAULT_PULL_TIMEOUT_S),
                     capture=True,
                 ),
                 "Docker-Image-Pull",
@@ -2553,7 +2867,14 @@ def _parser() -> argparse.ArgumentParser:
         description="E3DC-Control-Compose-Image sicher ziehen, starten und verifizieren"
     )
     parser.add_argument("--compose-dir", default=".", help="Verzeichnis der docker-compose.yml")
-    parser.add_argument("--sudo", action="store_true", help="Docker über sudo aufrufen")
+    parser.add_argument(
+        "--sudo",
+        action="store_true",
+        help=(
+            "Bestätigt den dokumentierten Root-Aufruf `sudo python3 ... --sudo`; "
+            "verschachteltes sudo wird nicht verwendet"
+        ),
+    )
     parser.add_argument("--image-tag", default="", help="Expliziter offizieller Release-Tag")
     parser.add_argument(
         "--recreate-current",
@@ -2569,7 +2890,10 @@ def _parser() -> argparse.ArgumentParser:
         "--wait-timeout",
         type=int,
         default=DEFAULT_WAIT_TIMEOUT_S,
-        help="Compose-Health-Wartezeit in Sekunden",
+        help=(
+            "Compose-Health-Wartezeit in Sekunden; der Image-Pull erhält "
+            f"mindestens {DEFAULT_PULL_TIMEOUT_S} Sekunden"
+        ),
     )
     return parser
 
@@ -2587,6 +2911,43 @@ def main() -> int:
     except CandidateStopError as exc:
         print(f"SICHERHEITSSTOPP: {exc}", file=sys.stderr)
         return 70
+    except subprocess.TimeoutExpired as exc:
+        if not getattr(exc, "e3dc_process_group_stopped", False):
+            print(f"Docker-Update fehlgeschlagen: {exc}", file=sys.stderr)
+            return 1
+        detail = exc.stderr or exc.output or ""
+        if isinstance(detail, bytes):
+            detail = detail.decode("utf-8", errors="replace")
+        detail = str(detail).strip()[-TIMEOUT_OUTPUT_MAX_CHARS:]
+        detail_suffix = f"\nLetzte Docker-Ausgabe:\n{detail}" if detail else ""
+        command_value = exc.cmd or ()
+        command = (
+            [command_value]
+            if isinstance(command_value, str)
+            else [str(item) for item in command_value]
+        )
+        long_wait_relevant = "compose" in command and bool(
+            {"pull", "up"} & set(command)
+        )
+        retry_hint = (
+            " Wenn der Timeout beim Pull oder Kandidatenstart auftrat, kann "
+            "--wait-timeout bis 1800 erhöht werden."
+            if long_wait_relevant
+            else (
+                " Dieser Docker-Kurzcheck verwendet ein festes Zeitlimit; "
+                "--wait-timeout verändert ihn nicht."
+            )
+        )
+        print(
+            "Docker-Update fehlgeschlagen: Docker/Compose hat das Zeitlimit von "
+            f"{exc.timeout:g} Sekunden überschritten. Die nur diesem Aufruf "
+            "zugeordnete Prozessgruppe wurde beendet; die daran gebundene "
+            "Docker-/Compose-Instanz läuft nicht im Hintergrund weiter."
+            + retry_hint
+            + detail_suffix,
+            file=sys.stderr,
+        )
+        return 1
     except (DockerUpdateError, OSError, subprocess.SubprocessError) as exc:
         print(f"Docker-Update fehlgeschlagen: {exc}", file=sys.stderr)
         return 1

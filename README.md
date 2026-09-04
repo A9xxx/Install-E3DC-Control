@@ -1,12 +1,12 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.5</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.5a</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.4.5**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.4.5a**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
 
 ### Web-Update startet nicht? Einmaliger Rettungsweg
 
@@ -39,6 +39,8 @@ sondern eine eindeutige Auswahl verlangt.
 > **Config-Schutz:** Standardinstallationen speichern `data/e3dc_v4.json` und lokale Config-Backups mit `660` für Install-User und `www-data`, damit WebUI und Dienste weiter automatisch starten, die Datei aber nicht mehr weltlesbar ist. Der normale Config-Download ist redigiert; der Raw-Download enthält Zugangsdaten und wird nur angeboten, wenn eine Web-PIN gesetzt ist. Der Kompatibilitätsmodus (`664`) ist nur für eigene externe Leser gedacht.
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
+
+> **Neu in 5.4.5a:** Ein frisch beobachteter openWB-Fahrzeug-SoC kann mit Quelle und Alter rein lesend im Dashboard erscheinen. Die Anzeige bleibt von Ziel-SoC, `Auto voll`, Planung und Hardwarebefehlen getrennt; dafür gelten weiterhin die bestätigten Session- und Fahrzeugverträge. Bei Bare-Metal-Updates verwendet auch der Simple-Stable-Updater unter demselben Update-Lock den vollständigen gebundenen Recovery-Resolver. Nur eindeutig belegte Unterbrechungen der frühen Vorbereitung werden fortgesetzt oder bereinigt. Unklare, fremde oder weiter fortgeschrittene Zustände bleiben gesperrt. Recovery-Dateien, Backups oder Startschutz-Einträge dürfen nicht manuell gelöscht werden. Der Docker-Host-Helfer gewährt langsamen Image-Pulls mindestens 900 Sekunden und beendet bei Zeitlimit oder Abbruch ausschließlich seine vollständig gebundene Docker-/Compose-Clientprozessgruppe.
 
 > **Neu in 5.4.5:** Die zentrale Wallbox-Regelung verteilt belegte Wattbudgets je Ladepunkt, führt Netzdefizit gruppenweit genau einmal und lässt Treiber nur noch den finalen Auftrag in das jeweilige Geräteprotokoll übersetzen. Schnelles Hochregeln, kontrolliertes Herunterregeln, Phasenwechsel und Stopp bleiben an frische Messwerte und die physische Kaskade gebunden. Das Dashboard zeigt keine alte Wallboxleistung künstlich weiter; WB1 und WB2 fließen getrennt in die Tagesstatistik ein. PV-Prognose, Speicher-SoC und die rein lesenden Luxtronik-Warmwasserstufen bleiben sichtbar. Eine reine Rechtereparatur arbeitet ohne Backup oder Dienstneustart, während Stable-Reparaturen lokale Inhaltsabweichungen vor dem Überschreiben genau benennen. Alle Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
 
@@ -473,7 +475,7 @@ sudo docker compose logs --tail=80 e3dc-control
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin wird
-> `E3DC_IMAGE_TAG=v5.4.5` in `.env` gesetzt. `config --images` zeigt vor dem
+> `E3DC_IMAGE_TAG=v5.4.5a` in `.env` gesetzt. `config --images` zeigt vor dem
 > Pull das tatsächlich gewählte Image.
 >
 > Vor dem `pull` prüft der Helfer mindestens 2 GiB freien Platz im

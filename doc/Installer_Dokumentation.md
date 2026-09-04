@@ -1,6 +1,6 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.5
+Dokumentation Stand: 5.4.5a
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
@@ -13,6 +13,17 @@ gemeinsamen systemd-Hintergrundauftrag. Nach diesem einmaligen Übergang starten
 Dashboard, Konsole und Installer-Menü denselben Dispatcher. Die automatische
 Updateprüfung verwendet dieselbe Stable-Quelle, informiert aber nur über einen
 neuen Stand.
+
+5.4.5a führt vor jeder neuen Simple-Stable-Transaktion unter dem bereits
+gehaltenen systemweiten Update-Lock den vollständigen gebundenen
+Recovery-Resolver des regulären Updaters aus. Nur eine eindeutig belegte
+Unterbrechung der Vorbereitung vor dem eigentlichen Updatejournal darf sicher
+abgeschlossen oder bereinigt werden. Fremde, widersprüchliche, unvollständige
+oder bereits weiter fortgeschrittene Zustände bleiben fail-closed und sperren
+den neuen Releasewechsel vor Vollbackup und Dateiaustausch. Recovery-Dateien,
+Backups und Startschutz-Einträge nicht manuell löschen; stattdessen den
+offiziellen Stable-Updater erneut starten und ausschließlich die konkret
+ausgegebene Ursache beheben.
 
 5.4.5 beendet die reguläre Worker-Bereinigung innerhalb des noch gültigen
 Funktionskontexts. Ein erfolgreiches Update wird daher nicht mehr von

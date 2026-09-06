@@ -2282,7 +2282,7 @@ def phase_observation_contract(
         actual_source = "phases_actual"
 
     session_1p_only = bool(cd.get("_session_1p_only", False))
-    can_switch = bool(cap.get("can_switch", False) or st.get("can_switch_phases", False))
+    can_switch = bool(cap.get("can_switch", st.get("can_switch_phases", False)))
     autonomous_can_switch = bool(cap.get("autonomous_can_switch", False))
     if charger_class_name == "OpenWBCharger":
         can_switch = False
@@ -2500,6 +2500,27 @@ def phase_observation_contract(
         "charger_class": str(charger_class_name or ""),
         "driver_variant": normalized_driver,
     }
+
+
+def idle_start_phase_budget_count(phase_contract: Optional[Dict[str, Any]]) -> int:
+    """Trennt eine mögliche 1p-Startzuteilung von der physischen Topologie.
+
+    Nur eine bestätigt umschaltbare EVSE darf ohne Fahrzeug-/Istphasenbeleg
+    zunächst für einen späteren 1p-Start budgetiert werden. Fehlende
+    Umschaltfähigkeit und ein neutraler KEEP_PHASES-Auftrag sind kein
+    einphasiger Lastbeleg. Der separate Ausgangsvertrag prüft weiterhin die
+    tatsächliche Phasenlage vor jedem Stromangebot.
+    """
+
+    contract = phase_contract if isinstance(phase_contract, dict) else {}
+    phases = valid_phase_count(contract.get("effective_phases"), 3) or 3
+    if (
+        contract.get("evse_phase_switch_capable") is True
+        and not valid_phase_count(contract.get("actual_phases"), 0)
+        and contract.get("vehicle_profile_phase_bound") is not True
+    ):
+        return 1
+    return phases
 
 
 def vehicle_max_ac_phases_from_profiles(

@@ -1,6 +1,6 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.5a
+Dokumentation Stand: 5.4.5b
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
@@ -14,9 +14,14 @@ Dashboard, Konsole und Installer-Menü denselben Dispatcher. Die automatische
 Updateprüfung verwendet dieselbe Stable-Quelle, informiert aber nur über einen
 neuen Stand.
 
-5.4.5a führt vor jeder neuen Simple-Stable-Transaktion unter dem bereits
-gehaltenen systemweiten Update-Lock den vollständigen gebundenen
-Recovery-Resolver des regulären Updaters aus. Nur eine eindeutig belegte
+5.4.5b aktualisiert Wallbox-, Fahrzeug-SoC-, Prognose- und Diagnosefunktionen.
+Der Installer verwendet dafür weiterhin denselben Backup-, Rechte- und
+Dienstumfang. Die reine Rechtereparatur bleibt vom Update getrennt.
+Die Nutzeränderungen stehen in den [Release Notes](../RELEASE_NOTES.md).
+
+Seit 5.4.5a wird vor jeder neuen Simple-Stable-Transaktion unter dem bereits
+gehaltenen systemweiten Update-Lock der vollständige gebundene
+Recovery-Resolver des regulären Updaters ausgeführt. Nur eine eindeutig belegte
 Unterbrechung der Vorbereitung vor dem eigentlichen Updatejournal darf sicher
 abgeschlossen oder bereinigt werden. Fremde, widersprüchliche, unvollständige
 oder bereits weiter fortgeschrittene Zustände bleiben fail-closed und sperren

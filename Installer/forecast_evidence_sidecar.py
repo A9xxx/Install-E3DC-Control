@@ -20,16 +20,19 @@ try:
         EvidenceLimitError,
         append_summary_if_due,
         archive_forecast_snapshot,
+        database,
         enforce_retention,
         extract_forecast_issue_contract,
         initialize_database,
         publish_summary_json,
         single_writer_lock,
+        store_external,
         store_history_observations,
         unavailable_summary,
         unavailable_summary_with_retained_continuity,
     )
     from e3dc_history_slots import HISTORY_DEFAULT_SLOT_COUNT, read_recent_closed_slots
+    from Forecast.pv_forecast_diagnostic_details import ExternalEnergyAccumulator
     from rscp_client import RscpConnection
 except ImportError:  # pragma: no cover - Paketimport
     from Installer.Forecast.pv_forecast_evidence import (
@@ -39,11 +42,13 @@ except ImportError:  # pragma: no cover - Paketimport
         EvidenceLimitError,
         append_summary_if_due,
         archive_forecast_snapshot,
+        database,
         enforce_retention,
         extract_forecast_issue_contract,
         initialize_database,
         publish_summary_json,
         single_writer_lock,
+        store_external,
         store_history_observations,
         unavailable_summary,
         unavailable_summary_with_retained_continuity,
@@ -53,6 +58,7 @@ except ImportError:  # pragma: no cover - Paketimport
         read_recent_closed_slots,
     )
     from Installer.rscp_client import RscpConnection
+    from Installer.Forecast.pv_forecast_diagnostic_details import ExternalEnergyAccumulator
 
 
 CONFIG_PATH = "/var/www/html/data/e3dc_v4.json"
@@ -61,6 +67,8 @@ MAX_CONFIG_BYTES = 2 * 1024 * 1024
 MAX_FORECAST_BYTES = 8 * 1024 * 1024
 MAX_FORECAST_AGE_S = 6 * 60 * 60
 CYCLE_INTERVAL_S = 15 * 60
+LOCAL_SAMPLE_INTERVAL_S = 15
+LIVE_PATH = "/var/www/html/ramdisk/live_data_py.json"
 
 logger = logging.getLogger("E3DCForecastEvidence")
 logging.basicConfig(
@@ -189,6 +197,7 @@ def run_cycle(
     lock_path: str = EVIDENCE_LOCK_PATH,
     summary_path: str = SUMMARY_JSON_PATH,
     now_utc_s: int | None = None,
+    external_observations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     now_s = int(time.time() if now_utc_s is None else now_utc_s)
     try:
@@ -239,6 +248,8 @@ def run_cycle(
                 captured_at_utc_s=now_s,
                 database_path=database_path,
             )
+            with database(database_path, write=True) as connection:
+                external_inserted = store_external(connection, external_observations or [])
             try:
                 history_slots = read_history(config, now_utc_s=now_s)
                 history_result = store_history_observations(
@@ -273,6 +284,7 @@ def run_cycle(
         "history_status": history_status,
         "archive": archive_result,
         "history": history_result,
+        "external_observations_inserted": external_inserted,
         "topology_revision": revision,
         "control_effect": False,
     }
@@ -286,10 +298,49 @@ def main() -> int:
     parser.add_argument("--interval", type=int, default=CYCLE_INTERVAL_S)
     args = parser.parse_args()
     interval_s = max(CYCLE_INTERVAL_S, int(args.interval))
+    accumulator = ExternalEnergyAccumulator()
+    pending_external: list[dict[str, Any]] = []
+    next_cycle = 0.0
+    forecast_identity = None
+    current_revision = None
 
     while True:
         try:
-            result = run_cycle()
+            now_s = time.time()
+            if not args.once:
+                config = load_runtime_config()
+                if not diagnostics_enabled(config):
+                    logger.info("PV-Prognosediagnose ist ausgeschaltet.")
+                    return 0
+                try:
+                    identity = os.stat(FORECAST_PATH, follow_symlinks=False)
+                    identity = (identity.st_ino, identity.st_mtime_ns, identity.st_size)
+                    if identity != forecast_identity:
+                        _slots, current_revision, _published, _contract = load_current_forecast(now_utc_s=int(now_s))
+                        forecast_identity = identity
+                    live, _stat = _bounded_json_file(LIVE_PATH, max_bytes=MAX_CONFIG_BYTES)
+                    accumulator.observe(live, current_revision, now_s)
+                except Exception:
+                    # Eine fehlende, veraltete oder ungültige Probe öffnet eine Lücke.
+                    accumulator.observe({}, None, now_s)
+                pending_external.extend(accumulator.closed(now_s))
+                # Bei längerem Ausfall keine unbegrenzte RAM-Warteschlange aufbauen.
+                if len(pending_external) > 192:
+                    logger.warning(
+                        "Externe Messhistorie unvollständig: %d alte RAM-Slots konnten nicht archiviert werden.",
+                        len(pending_external) - 192,
+                    )
+                    pending_external = pending_external[-192:]
+            if not args.once and time.monotonic() < next_cycle:
+                time.sleep(LOCAL_SAMPLE_INTERVAL_S)
+                continue
+            try:
+                result = run_cycle(external_observations=pending_external)
+            finally:
+                # Auch unerwartete Fehler dürfen keine schnellen RSCP-/Disk-Retries auslösen.
+                next_cycle = time.monotonic() + interval_s
+            if result.get("status") == "ok":
+                pending_external.clear()
             status = str(result.get("status") or "unknown")
             if status == "disabled":
                 logger.info("PV-Prognosediagnose ist ausgeschaltet.")
@@ -310,7 +361,7 @@ def main() -> int:
             logger.error("Diagnosezyklus fehlgeschlagen: %s", exc)
         if args.once:
             return 0
-        time.sleep(interval_s)
+        time.sleep(LOCAL_SAMPLE_INTERVAL_S if not args.once else interval_s)
 
 
 if __name__ == "__main__":

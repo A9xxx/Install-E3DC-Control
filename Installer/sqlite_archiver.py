@@ -9,6 +9,11 @@ import datetime
 import sys
 from pathlib import Path
 
+try:
+    from .config_secret_permissions import config_secret_dir_mode
+except ImportError:  # Direkter Aufruf durch Scheduler oder Konsole.
+    from config_secret_permissions import config_secret_dir_mode
+
 # Standard-Ausgabe auf UTF-8 erzwingen (verhindert UnicodeEncodeError z.B. bei cron oder SSH ohne Locale)
 try:
     if not sys.stdout.isatty():
@@ -316,7 +321,7 @@ def archive_today(conn=None):
 
     # Rechte für PHP/Webserver, aber ohne stündlich identische chmod-Aufrufe.
     _ensure_mode_if_needed(DB_PATH, 0o664)
-    _ensure_mode_if_needed(DB_DIR, 0o775)
+    _ensure_mode_if_needed(DB_DIR, config_secret_dir_mode())
     return int(changed)
 
 def _float_value(value, default=0.0):

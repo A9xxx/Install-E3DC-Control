@@ -1,20 +1,127 @@
-"""Konservative Fassade fuer die bestehenden Fahrzeug-Vertraege.
+"""Fassade für Fahrzeugprofile, SoC und Statusanreicherung.
 
-``VehicleSocTracker`` bleibt alleiniger Besitzer der generischen SoC-Schaetzung
-und ihrer Persistenz. Die openWB-Pro-Schaetzung verbleibt im Treiber. Dieses
-Modul buendelt nur die bisherige Profil-, Identitaets- und Statusanreicherung,
-ohne neue Fahrzeug- oder Regelungslogik einzufuehren.
+``VehicleSocTracker`` besitzt die profilgebundene SoC-Schätzung und Persistenz;
+die direkte openWB-Pro-Schätzung verbleibt im Treiber. Fehlt ein brauchbarer
+SoC beim Anstecken, kann dieses Modul den vorhandenen Cloud-Dienst einmalig
+beauftragen. Ladefreigabe, Phasen- und Stromregelung bleiben davon unberührt.
 """
 
 import json
 import os
+import tempfile
 import time
 
 from . import decision as wallbox_decision
 from . import soc_tracker as wallbox_soc_tracker
+from .modes import MODE_OFF, normalize_wb_mode
 
 
 VehicleSocTracker = wallbox_soc_tracker.VehicleSocTracker
+
+
+def request_missing_openwb_cloud_soc(wb_id, config, status, soc_info=None, now=None):
+    """Fordere fehlenden SoC einmal pro Stecksession beim Cloud-Dienst an.
+
+    Hier findet weder ein Cloud-Aufruf noch ein Fahrzeug-/Wallbox-Befehl statt.
+    Die vorhandene Force-Datei bleibt alleiniger Auftrag an den Bluelink-Dienst.
+    """
+    now = time.time() if now is None else float(now)
+    config, status = config or {}, status or {}
+    if str(config.get("wb_native_enable", "0")).lower() not in ("1", "true"):
+        return False
+    legacy_mode = wallbox_soc_tracker._safe_float(config.get("wb_native_mode"), 0)
+    configured_mode = config.get(f"wb{wb_id}_mode")
+    if configured_mode in (None, ""):
+        configured_mode = legacy_mode if legacy_mode > 2 else MODE_OFF
+    if (
+        normalize_wb_mode(configured_mode) == MODE_OFF
+        or wallbox_soc_tracker._contract_flag_active(config.get(f"wb{wb_id}_locked"))
+        or wallbox_soc_tracker._contract_flag_active(config.get(f"wb{wb_id}_manual_pause"))
+        or not str(config.get("bluelink_refresh_token") or "").strip()
+        or status.get("driver_status_valid") is not True
+        or status.get("plug_state") is not True
+        or wallbox_soc_tracker._soc_record_vetoed(status)
+        or not wallbox_soc_tracker._fresh_timestamp(
+            status.get("driver_status_last_sample_ts"), now,
+            wallbox_soc_tracker.OPENWB_PRO_STATUS_MAX_AGE_S,
+        )
+        or wallbox_soc_tracker._openwb_pro_direct_soc_fresh(status, now=now)
+        or (isinstance(soc_info, dict) and soc_info.get("soc_rule_confirmed") is True)
+    ):
+        return False
+    session_id = str(status.get("plug_session_id") or "").strip()
+    if not wallbox_soc_tracker._plug_session_started_ts(session_id, now):
+        return False
+    driver_session_start = wallbox_soc_tracker._timestamp(status.get("_session_start_ts"), 0)
+    if driver_session_start <= 0 or driver_session_start > now + 300:
+        return False
+    selected_id = str(config.get(f"wb{wb_id}_car_id") or "").strip()
+    profile = wallbox_soc_tracker._unique_saved_profile(selected_id)
+    if (
+        not profile or not str(profile.get("cloud_vehicle_id") or "").strip()
+        or not wallbox_soc_tracker._configured_vehicle_binding_unique(config, wb_id, selected_id)
+    ):
+        return False
+    aliases = wallbox_soc_tracker._compact_aliases(profile)
+    if any(
+        wallbox_soc_tracker._compact_id(status.get(key))
+        and wallbox_soc_tracker._compact_id(status.get(key)) not in aliases
+        for key in wallbox_soc_tracker.LIVE_STATUS_ID_KEYS
+    ):
+        return False
+    base = wallbox_soc_tracker.RAMDISK_DIR
+    state_path = os.path.join(base, "vehicle_soc_cloud_refresh.json")
+    state = wallbox_soc_tracker._read_json(state_path, {})
+    state = state if isinstance(state, dict) else {}
+    sessions = state.get("sessions") if isinstance(state.get("sessions"), dict) else {}
+    if sessions.get(str(wb_id)) == session_id:
+        return False
+    cloud = wallbox_soc_tracker._read_json(os.path.join(base, "vehicles.json"), {})
+    refresh = cloud.get("refresh", {}) if isinstance(cloud, dict) else {}
+    refresh = refresh if isinstance(refresh, dict) else {}
+    last_force = wallbox_soc_tracker._timestamp(refresh.get("attempt_ts"), 0) if refresh.get("mode") == "force" else 0
+    last_request = max(wallbox_soc_tracker._timestamp(state.get("last_request_ts"), 0), last_force)
+    interval_s = max(5.0, wallbox_soc_tracker._safe_float(config.get("bluelink_interval"), 15)) * 60
+    if last_request > 0 and now - last_request < interval_s:
+        return False
+    flag_path = os.path.join(base, "force_bluelink.flag")
+    temporary = None
+    try:
+        # Vollständig veröffentlichen, ohne einen parallelen manuellen
+        # Auftrag zu überschreiben oder einen vorhandenen Symlink zu öffnen.
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=base,
+                                         prefix=".force_bluelink.", delete=False) as handle:
+            temporary = handle.name
+            os.fchmod(handle.fileno(), 0o664)
+            json.dump({
+                "schema": "vehicle_soc_refresh_request_v1",
+                "source": "openwb_plug",
+                "vehicle_id": str(profile["cloud_vehicle_id"]).strip(),
+                "wb": int(wb_id), "plug_session_id": session_id,
+                "driver_session_start_ts": driver_session_start,
+                "requested_at": int(now),
+            }, handle, separators=(",", ":"))
+            handle.flush()
+            try:
+                os.link(temporary, flag_path)
+            except FileExistsError:
+                # Der bestehende Auftrag kann zu einer anderen Wallbox
+                # gehören. Unsere Session ist dann noch nicht beauftragt.
+                return False
+        sessions[str(wb_id)] = session_id
+        wallbox_soc_tracker._write_json_atomic(state_path, {
+            "sessions": sessions, "last_request_ts": now,
+        })
+        return True
+    except OSError as error:
+        wallbox_soc_tracker.logger.debug("Cloud-SoC-Anforderung nicht möglich: %s", error)
+        return False
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
 
 
 def compact_vehicle_identifier(value):
@@ -284,6 +391,8 @@ class VehicleManager:
             status,
             charger_class=charger_class,
         )
+        if str(charger_class or "") == "OpenWBProCharger":
+            request_missing_openwb_cloud_soc(wb_id, config, status, soc_info=soc_info)
         if not soc_info:
             if (invalid_total_range or invalid_charged_range) and write_status is not None:
                 try:
@@ -310,6 +419,12 @@ class VehicleManager:
         status["car_soc_rule_confirmed"] = (
             soc_info.get("soc_rule_confirmed") is True
         )
+        age_contract = wallbox_soc_tracker.vehicle_soc_age_contract(
+            status.get("car_soc_source"), config,
+        ) or {}
+        status["car_soc_age_contract"] = age_contract.get("schema_version")
+        status["car_soc_age_contract_source"] = age_contract.get("source")
+        status["car_soc_max_age_s"] = age_contract.get("max_age_s")
         # Profil-/Cloud-/SoC-Zuordnung bleibt ein eigener Diagnosebereich.
         # Sie darf die vom Treiber gelieferte aktuelle Stecksession-ID nicht
         # ersetzen und damit keinen OBC-Hardcap aktivieren.

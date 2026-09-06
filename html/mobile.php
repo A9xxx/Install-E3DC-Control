@@ -1260,7 +1260,7 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
                 <span id="pv-forecast-diagnostic-status" class="badge text-bg-secondary">Noch keine Auswertung</span>
             </div>
             <div class="d-grid gap-1 mt-2 text-body">
-                <span title="Typischer absoluter Unterschied je verglichenem 15-Minuten-Fenster">Trefferabweichung: <strong id="pv-forecast-diagnostic-hit">–</strong></span>
+                <span title="Mittlerer absoluter Fehler je Ertragsfenster: Ist oder Prognose mindestens 25 Wh">Trefferabweichung: <strong id="pv-forecast-diagnostic-hit">–</strong></span>
                 <span title="Positiv bedeutet im Mittel mehr, negativ weniger Ertrag als vorhergesagt">Richtungsversatz: <strong id="pv-forecast-diagnostic-direction">–</strong></span>
                 <span title="Quadratische Fehlerwurzel; gewichtet größere Prognosefehler stärker">RMSE: <strong id="pv-forecast-diagnostic-rmse">–</strong></span>
                 <span title="Positiv ist besser als der zuletzt vor Ausgabe bekannte Ertrag desselben UTC-Zeitfensters am Vortag">Skill gegen Tagespersistenz: <strong id="pv-forecast-diagnostic-skill">–</strong></span>

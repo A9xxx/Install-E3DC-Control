@@ -1672,8 +1672,10 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                             <span id="pv-forecast-diagnostic-status" class="badge text-bg-secondary">Noch keine Auswertung</span>
                         </div>
                         <div class="d-flex flex-wrap gap-2 gap-lg-3 mt-1 text-body">
-                            <span title="Typischer absoluter Unterschied je verglichenem 15-Minuten-Fenster">Trefferabweichung: <strong id="pv-forecast-diagnostic-hit">–</strong></span>
+                            <span title="Mittlerer absoluter Fehler je Ertragsfenster: Ist oder Prognose mindestens 25 Wh">Trefferabweichung: <strong id="pv-forecast-diagnostic-hit">–</strong></span>
                             <span title="Positiv bedeutet im Mittel mehr, negativ weniger Ertrag als vorhergesagt">Richtungsversatz: <strong id="pv-forecast-diagnostic-direction">–</strong></span>
+                            <span title="Quadratische Fehlerwurzel; gewichtet größere Fehler stärker">RMSE: <strong id="pv-forecast-diagnostic-rmse">–</strong></span>
+                            <span title="Positiv bedeutet besser als die vor Ausgabe bekannte Tagespersistenz">Skill gegen Tagespersistenz: <strong id="pv-forecast-diagnostic-skill">–</strong></span>
                             <span title="Gesamtabweichung, gewichtet nach der tatsächlich erzeugten Energie">Energieabweichung: <strong id="pv-forecast-diagnostic-energy">–</strong></span>
                             <span title="Anteil der archivierten Prognosefenster mit gültigem Messwert">Abdeckung: <strong id="pv-forecast-diagnostic-coverage">–</strong></span>
                         </div>

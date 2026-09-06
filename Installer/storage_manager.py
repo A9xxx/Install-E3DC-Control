@@ -6490,30 +6490,51 @@ def _storage_rscp_execution_history_contract(
 
     typed_output = typed_readback(readback)
     typed_requested = typed_readback(requested)
-    bounded_zero_w = max(0, safe_int(diagnostics.get("bounded_zero_w"), 0))
+    bounded_zero_raw = diagnostics.get("bounded_zero_w")
+    bounded_zero_w = (
+        bounded_zero_raw
+        if isinstance(bounded_zero_raw, int)
+        and not isinstance(bounded_zero_raw, bool)
+        and bounded_zero_raw >= 0
+        else 0
+    )
+    status = str(diagnostics.get("status") or "").strip()
+    # Die Historie nutzt denselben reinen Vergleich wie der RSCP-Vertrag.
+    # Ein GET ohne verwertbares SET-Ack bleibt wie im Treiber exakt gebunden.
+    readback_match = (
+        BattCtrl._power_settings_readback_matches_exact
+        if status == "confirmed_from_get_ack_unknown"
+        else BattCtrl._power_settings_readback_matches
+    )
     requested_matches_readback = bool(
         typed_requested is not None
         and typed_output is not None
-        and typed_requested["limits_used"] is typed_output["limits_used"]
+        and readback_match(
+            typed_output,
+            typed_requested["max_charge_w"],
+            typed_requested["max_discharge_w"],
+            typed_requested["discharge_start_w"],
+            typed_requested["limits_used"],
+            bounded_zero_w,
+        )
         and (
             typed_requested["limits_used"] is False
-            or (
+            # Explizite Nullgrenzen werden diagnostisch nicht um die allgemeine
+            # Toleranz erweitert. Nur die bereits gebundene Lade-Nullgrenze
+            # darf ihren eigenen bounded_zero-Wert verwenden.
+            or all(
                 (
-                    typed_requested["max_charge_w"]
-                    == typed_output["max_charge_w"]
+                    typed_requested[key] != 0
+                    or typed_output[key] == 0
                     or (
-                        typed_requested["max_charge_w"] == 0
-                        and 0 <= typed_output["max_charge_w"] <= bounded_zero_w
+                        key == "max_charge_w"
+                        and 0 <= typed_output[key] <= bounded_zero_w
                     )
                 )
-                and typed_requested["max_discharge_w"]
-                == typed_output["max_discharge_w"]
-                and typed_requested["discharge_start_w"]
-                == typed_output["discharge_start_w"]
+                for key in ("max_charge_w", "max_discharge_w", "discharge_start_w")
             )
         )
     )
-    status = str(diagnostics.get("status") or "").strip()
     direct_confirmed_statuses = {
         "confirmed",
         "confirmed_bounded_zero",
@@ -6545,6 +6566,9 @@ def _storage_rscp_execution_history_contract(
         and safe_int(diagnostics.get("contract_version"), 0)
         == RSCP_POWER_SETTINGS_CONTRACT_VERSION
         and diagnostics.get("confirmed") is True
+        # Ein explizit negatives Ack widerspricht jeder Bestätigungsklasse.
+        # Fehlend/None bleibt über Status, GET und Transaktionsbelege prüfbar.
+        and diagnostics.get("acknowledged") is not False
         and status in allowed_statuses
         and typed_output is not None
         and fresh
@@ -8265,37 +8289,161 @@ def enforce_hard_mode_guard(
     return guarded if isinstance(guarded, dict) else decision
 
 
+def carry_ep_reserve_recovery(previous_state: Any) -> Optional[Dict[str, Any]]:
+    """Erhält nur die Sperre; unbeobachtete Neustartzeit zählt nicht als Erholung."""
+    previous = previous_state if isinstance(previous_state, dict) else {}
+    recovery = previous.get("ep_reserve_recovery")
+    if isinstance(recovery, dict) and recovery.get("schema") == "storage_ep_reserve_recovery_v1":
+        if recovery.get("active") is not True:
+            return None
+        carried = copy.deepcopy(recovery)
+    elif str(previous.get("state") or "") == "ep_reserve_discharge_hold":
+        carried = {"schema": "storage_ep_reserve_recovery_v1", "active": True}
+    else:
+        return None
+    carried.update(stable_s=0.0, samples=0, last_sample_ts=None,
+                   time_sample=None, reason_code="recovery_observation_restart")
+    return carried
+
+
+def terminal_ep_reserve_recovery(previous_state: Any, persisted_state: Any) -> Optional[Dict[str, Any]]:
+    """Ein aktuelles Freigabeergebnis schlägt eine ältere persistierte Sperre."""
+    previous = previous_state if isinstance(previous_state, dict) else {}
+    source = previous if "ep_reserve_recovery" in previous else persisted_state
+    return carry_ep_reserve_recovery(source)
+
+
+def ep_reserve_recovery_context(
+    cfg: Dict[str, Any],
+    live: Dict[str, Any],
+    previous_state: Optional[Dict[str, Any]],
+    now_s: float,
+    *,
+    sample_valid: bool = True,
+    time_sample: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Asymmetrischer Reserveschutz: sofort sperren, stabil beobachtet freigeben.
+
+    1,5 Prozentpunkte und 30 Sekunden sind konservative Reglerwerte, keine
+    Hersteller-Zeitvorgabe. Der Abstand übersteigt eine 1-%-Quantisierungsstufe.
+    Der vorhandene monotone Zeitvertrag verhindert Freigaben durch Uhrsprünge
+    oder Prozesspausen; es entstehen weder neue Aktor- noch Dateischreibpfade.
+    """
+    previous_state = previous_state or {}
+    prior = previous_state.get("ep_reserve_recovery")
+    prior = prior if isinstance(prior, dict) else {}
+    prior_valid = prior.get("schema") == "storage_ep_reserve_recovery_v1"
+    active = bool(prior.get("active") is True) if prior_valid else (
+        str(previous_state.get("state") or "") == "ep_reserve_discharge_hold"
+    )
+    reserve = ep_reserve_soc(cfg, live)
+    hysteresis = max(1.1, safe_float(cfg.get("storage_ep_reserve_hold_hysteresis_pct"), 1.5))
+    release_soc = min(100.0, reserve + hysteresis)
+    required_s = 30.0
+    current_time = time_sample if isinstance(time_sample, dict) else control_time.sample(wall_ts=now_s)
+    soc = safe_float(live.get("SOC"), float("nan"))
+    numeric_soc = math.isfinite(soc) and 0.0 <= soc <= 100.0
+    source_ts = safe_float(live.get("_ts"), 0.0)
+    max_age_s = max(2.0, min(30.0, safe_float(cfg.get("storage_live_stale_guard_s"), 10.0)))
+    fresh = bool(
+        sample_valid and numeric_soc and source_ts > 0.0
+        and 0.0 <= now_s - source_ts <= max_age_s
+        and live.get("RSCP_Sample_Valid") is not False
+        and live.get("Power_Decision_Usable") is not False
+    )
+    context = {
+        "schema": "storage_ep_reserve_recovery_v1", "active": active,
+        "reserve_soc": reserve, "release_soc": release_soc,
+        "hysteresis_pct": hysteresis, "required_stable_s": required_s,
+        "stable_s": 0.0, "samples": 0, "last_sample_ts": source_ts if fresh else None,
+        "time_sample": current_time, "sample_fresh": fresh,
+        "reason_code": "reserve_not_latched",
+    }
+    if reserve <= 0.0:
+        context.update(active=False, reason_code="reserve_disabled")
+        return context
+    if sample_valid and numeric_soc and soc <= reserve:
+        context.update(active=True, reason_code="reserve_reached")
+        return context
+    if not active:
+        return context
+    if not fresh:
+        context["reason_code"] = "recovery_fresh_sample_required"
+        return context
+    if soc < release_soc:
+        context["reason_code"] = "recovery_soc_below_release"
+        return context
+
+    last_ts = safe_float(prior.get("last_sample_ts"), 0.0)
+    elapsed = control_time.elapsed_contract(prior.get("time_sample"), current_time, max_step_s=30.0)
+    same_policy = bool(
+        prior_valid and prior.get("reserve_soc") == reserve
+        and prior.get("release_soc") == release_soc
+    )
+    clock_consistent = bool(
+        elapsed.get("known") and abs(safe_float(elapsed.get("wallclock_jump_s"), 0.0)) <= 2.0
+    )
+    samples = max(0, safe_int(prior.get("samples"), 0))
+    contiguous = bool(
+        same_policy and clock_consistent and samples > 0
+        and last_ts > 0.0 and 0.0 <= source_ts - last_ts <= max_age_s
+    )
+    if contiguous and source_ts == last_ts:
+        # Dieselbe Messung darf die Wartezeit nicht selbst erfüllen.
+        context.update(stable_s=max(0.0, safe_float(prior.get("stable_s"), 0.0)),
+                       samples=samples, last_sample_ts=last_ts,
+                       time_sample=copy.deepcopy(prior.get("time_sample")),
+                       reason_code="recovery_waiting_new_sample")
+        return context
+    stable_s = (
+        max(0.0, safe_float(prior.get("stable_s"), 0.0))
+        + min(safe_float(elapsed.get("elapsed_s"), 0.0), source_ts - last_ts)
+        if contiguous else 0.0
+    )
+    samples = samples + 1 if contiguous else 1
+    recovered = stable_s >= required_s and samples >= 3
+    context.update(active=not recovered, stable_s=round(stable_s, 3), samples=samples,
+                   reason_code="reserve_recovered" if recovered else "recovery_stability_wait")
+    return context
+
+
 def ep_reserve_floor_decision(
     cfg: Dict[str, Any],
     live: Dict[str, Any],
     max_charge_w: int,
     previous_state: Optional[Dict[str, Any]] = None,
+    *,
+    now_s: Optional[float] = None,
+    recovery_context: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     reserve_soc = ep_reserve_soc(cfg, live)
     if reserve_soc <= 0.0:
         return None
 
     soc = safe_float(live.get("SOC"), 0.0)
-    previous_state = previous_state or {}
-    previous_hold = str(previous_state.get("state") or "") == "ep_reserve_discharge_hold"
-    hysteresis_pct = max(0.2, safe_float(cfg.get("storage_ep_reserve_hold_hysteresis_pct"), 0.7))
-    hold_active = bool(
-        soc <= reserve_soc
-        or (previous_hold and soc < reserve_soc + hysteresis_pct)
+    recovery = recovery_context if isinstance(recovery_context, dict) else ep_reserve_recovery_context(
+        cfg, live, previous_state, time.time() if now_s is None else now_s
     )
-    if not hold_active:
+    if soc <= reserve_soc:
+        # Auch ein zuvor freigegebener Kontext darf das lokale harte Veto
+        # am aktuellen Roh-SoC niemals überstimmen.
+        recovery = ep_reserve_recovery_context(
+            cfg, live, previous_state, time.time() if now_s is None else now_s
+        )
+    if recovery.get("active") is not True:
         return None
+    hysteresis_pct = recovery["hysteresis_pct"]
 
     relation = "unterschritten" if soc < reserve_soc - 0.05 else "erreicht"
     reason = (
         EP_RESERVE_VETO_SIGNATURE + ": Notstromreserve %.1f%% %s (SoC %.1f%%): "
         "Entladung hart per EMS-Grenze 0W gesperrt; Inselbetrieb bleibt E3DC-autonom"
     ) % (reserve_soc, relation, soc)
-    if previous_hold and soc > reserve_soc:
+    if soc > reserve_soc:
         reason = (
-            EP_RESERVE_VETO_SIGNATURE + ": Notstromreserve %.1f%% in Hysterese gehalten (SoC %.1f%%, Freigabe ab %.1f%%): "
+            EP_RESERVE_VETO_SIGNATURE + ": Notstromreserve %.1f%% in Hysterese gehalten (SoC %.1f%%, Freigabe ab %.1f%% nach %.0fs frischen Messungen): "
             "Entladung bleibt per EMS-Grenze 0W gesperrt"
-        ) % (reserve_soc, soc, reserve_soc + hysteresis_pct)
+        ) % (reserve_soc, soc, recovery["release_soc"], recovery["required_stable_s"])
 
     return {
         "state": "ep_reserve_discharge_hold",
@@ -8314,6 +8462,7 @@ def ep_reserve_floor_decision(
         "ep_reserve_floor_hold": True,
         "ep_reserve_pct": reserve_soc,
         "ep_reserve_hysteresis_pct": hysteresis_pct,
+        "ep_reserve_recovery": recovery,
         "auto_limit": discharge_block_auto_limit(cfg, max(300, int(max_charge_w or 0)), reason),
     }
 
@@ -20447,6 +20596,21 @@ def build_flexible_consumer_budget_contract(
                 rearm_count=drop_rearm_count,
                 guard_kind="acceptance_drop",
             )
+            if consumer == "wallbox":
+                # Die Reserve bleibt an die beim Lastabfall bereits belegte
+                # Stecksessionmenge gebunden. Eine neue Lease darf sie auch
+                # im zweiten Folgezyklus nicht auf ein anderes Fahrzeug ziehen.
+                prior_drop_guard = prior.get("drop_guard")
+                prior_drop_guard = prior_drop_guard if isinstance(prior_drop_guard, dict) else {}
+                prior_start_leases = previous_contract.get("start_leases")
+                prior_start_leases = prior_start_leases if isinstance(prior_start_leases, dict) else {}
+                prior_wallbox_lease = prior_start_leases.get("wallbox")
+                prior_wallbox_lease = prior_wallbox_lease if isinstance(prior_wallbox_lease, dict) else {}
+                drop_guard["wallbox_start_generation"] = (
+                    str(prior_drop_guard.get("wallbox_start_generation") or "")
+                    if prior_drop_guard
+                    else str(prior_wallbox_lease.get("request_generation") or "")
+                ) if guard_usable and drop_guard.get("rearmed") is not True else ""
             if not guard_usable:
                 effective_w = prior_w
                 evidence_limit = True
@@ -21691,6 +21855,44 @@ def build_flexible_consumer_budget_contract(
             wallbox_phase_reservation_rebound_w,
         )
 
+    # Eine bestätigte Null beendet nicht automatisch das weiterhin gültige
+    # Ladeangebot derselben Stecksessionmenge. Dessen aktuelle Grenze wird vor
+    # der Allokation gesichert; nur die eigene finanzierte Drop-Reserve darf
+    # später dorthin zurückgebucht werden, niemals eine fremde Reserve.
+    wallbox_zero_reuse_lease = copy.deepcopy(start_leases["wallbox"])
+    wallbox_zero_acceptance = acceptance_state["wallbox"]
+    wallbox_zero_drop_guard = wallbox_zero_acceptance.get("drop_guard") or {}
+    wallbox_zero_reuse_limit_w = 0
+    if (
+        command_eligible_map["wallbox"]
+        and wallbox_online
+        and evidence_valid
+        and wallbox_power_evidence_fresh
+        and not protected
+        and not phase_transition_active
+        and wallbox_has_charge_demand
+        and wallbox_zero_reuse_lease.get("offered") is True
+        and wallbox_zero_acceptance.get("measured_w") == 0
+        and wallbox_zero_acceptance.get("hold_reason") == "confirmed_zero_drop_debounce"
+        and wallbox_zero_acceptance.get("evidence_limit") is False
+        and wallbox_zero_drop_guard.get("valid") is True
+        and wallbox_zero_drop_guard.get("active") is True
+        and wallbox_zero_drop_guard.get("fail_closed") is not True
+        and wallbox_zero_drop_guard.get("rearmed") is not True
+        and previous_contract.get("valid") is True
+        and wallbox_start_generation
+        and wallbox_start_generation
+        == wallbox_zero_drop_guard.get("wallbox_start_generation")
+    ):
+        wallbox_zero_reuse_limit_w = min(
+            max(0, int(wallbox_possible_w)),
+            wallbox_cap_w,
+            request_caps_w["wallbox"],
+        )
+        # Das Accounting-Maximum enthält die frühere Annahme. Diese ist kein
+        # Ersatz für eine inzwischen reduzierte aktuelle Kommandogrenze.
+        request_caps_w["wallbox"] = wallbox_zero_reuse_limit_w
+
     if phase_transition_active:
         total_w = max(0, int(wallbox_reserved_w))
         if heatpump_running:
@@ -21828,8 +22030,9 @@ def build_flexible_consumer_budget_contract(
     # Er enthält sowohl Recovery- als auch Transaktions-Accounting, jedoch jede
     # Komponente genau einmal. Frische feste Lasten gewinnen zuerst; nur der
     # verbleibende Bruttorahmen kann diesen Bucket tragen. Er ist weder
-    # active_map noch Reservation eines Aktors und kann deshalb niemals einen
-    # Wärmepumpen-/Heizstab- oder Wallboxbefehl erzeugen.
+    # active_map noch Reservation eines Aktors und erzeugt selbst keine
+    # Kommandofreigabe. Nur die weiter unten ausdrücklich gebundene Umbuchung
+    # der eigenen WB-Drop-Reserve kann ein weiterhin gültiges Angebot finanzieren.
     gross_total_budget_w = max(0, int(total_w))
     noncommand_reserve_capacity_w = max(
         0,
@@ -22451,6 +22654,61 @@ def build_flexible_consumer_budget_contract(
                 for item in sorted(consumer_command_quarantine)
             ]
 
+    # Erst nach der normalen Prioritätsverteilung darf die weiterhin gültige
+    # WB-Anforderung ihre eigene finanzierte Drop-Reserve wiederverwenden.
+    # Andere Allokationen bleiben unverändert; der Bruttorahmen wächst nicht.
+    # Messwert, Annahmeentprellung und deren absoluter Guard bleiben erhalten.
+    wallbox_confirmed_zero_reused_w = 0
+    if contract.get("valid") is True and wallbox_zero_reuse_limit_w > 0:
+        allocations = dict(contract.get("allocations") or {})
+        wallbox_allocated_w = max(0, safe_int(allocations.get("wallbox"), 0))
+        reusable_w = min(
+            recovery_accounting_reserve_w["wallbox"],
+            max(0, wallbox_zero_reuse_limit_w - wallbox_allocated_w),
+        )
+        if (
+            reusable_w > 0
+            and wallbox_allocated_w + reusable_w >= CONSUMER_MIN_W["wallbox"]
+        ):
+            wallbox_confirmed_zero_reused_w = reusable_w
+            recovery_accounting_reserve_w["wallbox"] -= reusable_w
+            recovery_accounting_reserve_total_w -= reusable_w
+            noncommand_accounting_reserve_w["wallbox"] -= reusable_w
+            noncommand_accounting_reserve_total_w -= reusable_w
+            total_w += reusable_w
+            allocations["wallbox"] = wallbox_allocated_w + reusable_w
+            contract["allocations"] = allocations
+            contract["allocation_sum_w"] = sum(allocations.values())
+            contract["total_budget_w"] = total_w
+            contract["requested_total_budget_w"] = total_w
+            contract["enabled"]["wallbox"] = True
+            contract["requests_w"]["wallbox"] = allocations["wallbox"]
+            contract["reservations_w"]["wallbox"] = allocations["wallbox"]
+            requests_w["wallbox"] = allocations["wallbox"]
+            request_caps_w["wallbox"] = wallbox_zero_reuse_limit_w
+            start_leases["wallbox"] = {
+                **wallbox_zero_reuse_lease,
+                "request_w": allocations["wallbox"],
+                "pending_request_w": allocations["wallbox"],
+                "reason": "wallbox_confirmed_zero_own_reserve_reused",
+                "central_allocation_bound": True,
+            }
+            shared_noncommand_reserve_w = min(
+                shared_source_total_w,
+                fixed_noncommand_reserve_w
+                + max(
+                    0,
+                    noncommand_accounting_reserve_w["wallbox"]
+                    - wallbox_exclusive_source_w,
+                ),
+            )
+            shared_command_source_w = max(
+                0, shared_source_total_w - shared_noncommand_reserve_w,
+            )
+            contract["invariant_conserved"] = bool(
+                contract["allocation_sum_w"] + contract["remaining_w"] == total_w
+            )
+
     # Die erste Allokation finanziert gemessene/geleaste Mitverbraucher und
     # nur einen 1-A-Probeschritt der modulierenden Wallbox. Verbleibt danach
     # Leistung im selben Gesamtvertrag, darf sie an die weiterhin bereite
@@ -22460,7 +22718,10 @@ def build_flexible_consumer_budget_contract(
     if (
         contract.get("valid") is True
         and wallbox_command_eligible
-        and measured_acceptance_w["wallbox"] > 0
+        and (
+            measured_acceptance_w["wallbox"] > 0
+            or wallbox_confirmed_zero_reused_w > 0
+        )
     ):
         allocations = dict(contract.get("allocations") or {})
         wallbox_allocated_w = max(
@@ -22470,7 +22731,11 @@ def build_flexible_consumer_budget_contract(
         remaining_w = max(0, safe_int(contract.get("remaining_w"), 0))
         wallbox_residual_backfill_w = min(
             remaining_w,
-            max(0, int(wallbox_cap_w) - wallbox_allocated_w),
+            max(
+                0,
+                (wallbox_zero_reuse_limit_w if wallbox_confirmed_zero_reused_w > 0
+                 else int(wallbox_cap_w)) - wallbox_allocated_w,
+            ),
         )
         if (
             wallbox_allocated_w <= 0
@@ -22602,6 +22867,9 @@ def build_flexible_consumer_budget_contract(
     contract["recovery_accounting_w"] = dict(recovery_accounting_w)
     contract["recovery_accounting_reserve_requested_w"] = int(
         recovery_accounting_reserve_requested_w
+    )
+    contract["wallbox_confirmed_zero_reused_w"] = int(
+        wallbox_confirmed_zero_reused_w
     )
     contract["recovery_accounting_reserve_w"] = dict(
         recovery_accounting_reserve_w
@@ -24591,6 +24859,7 @@ def protected_decision(
     now_s: float,
     previous_state: Optional[Dict[str, Any]] = None,
     peak_shaving_evaluation: Optional[Dict[str, Any]] = None,
+    reserve_recovery: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     live = live_with_wallbox_native_balance(live, wb_native)
     max_charge_w = configured_charge_limit_w(cfg, live)
@@ -24609,7 +24878,10 @@ def protected_decision(
             "budget_w": 0,
         }
 
-    reserve_hold = ep_reserve_floor_decision(cfg, live, max_charge_w, previous_state)
+    reserve_hold = ep_reserve_floor_decision(
+        cfg, live, max_charge_w, previous_state,
+        now_s=now_s, recovery_context=reserve_recovery,
+    )
     if reserve_hold is not None:
         peak_owner = (
             peak_shaving_evaluation.get("decision")
@@ -24625,6 +24897,7 @@ def protected_decision(
             peak_owner = dict(peak_owner)
             peak_owner["reserve_floor_charge_override"] = True
             peak_owner["reserve_floor_charge_reason"] = reserve_hold.get("reason")
+            peak_owner["ep_reserve_recovery"] = copy.deepcopy(reserve_hold.get("ep_reserve_recovery"))
             return peak_owner
         market_owner = market_economics_decision(
             cfg,
@@ -24642,6 +24915,7 @@ def protected_decision(
         ):
             market_owner["reserve_floor_charge_override"] = True
             market_owner["reserve_floor_charge_reason"] = reserve_hold.get("reason")
+            market_owner["ep_reserve_recovery"] = copy.deepcopy(reserve_hold.get("ep_reserve_recovery"))
             return market_owner
         return reserve_hold
 
@@ -25838,6 +26112,10 @@ def decide_next_cycle(
             "decision": None,
         }
 
+    reserve_recovery = ep_reserve_recovery_context(
+        cfg, live_with_wallbox, previous_state, now_s,
+        sample_valid=not (live_stale or live_sample_invalid or soc_unrealistic),
+    )
     protected = None if (live_stale or live_sample_invalid or soc_unrealistic) else protected_decision(
         cfg,
         live_with_wallbox,
@@ -25848,6 +26126,7 @@ def decide_next_cycle(
         now_s,
         previous_state,
         peak_shaving_evaluation,
+        reserve_recovery,
     )
     manual_invalid_sample_decision = None
     manual_override_mode = str(manual_override.get("mode", "") or "").lower()
@@ -25857,7 +26136,9 @@ def decide_next_cycle(
         and not soc_unrealistic
         and manual_override_mode in ("charge", "discharge")
     ):
-        # A power-balance glitch must remain diagnostic-only for an explicit manual battery command.
+        # Ein Leistungsglitch allein hebt den manuellen Auftrag nicht auf.
+        # Die harte beziehungsweise noch gehaltene Notstromreserve bleibt
+        # jedoch auch in diesem Sonderpfad vor Entladung und AUTO-Freigabe.
         manual_invalid_sample_decision = manual_override_storage_decision(
             cfg,
             live_with_wallbox,
@@ -25869,6 +26150,14 @@ def decide_next_cycle(
         if manual_invalid_sample_decision is not None:
             manual_invalid_sample_decision = dict(manual_invalid_sample_decision)
             manual_invalid_sample_decision["live_plausibility_manual_override_kept"] = True
+            if manual_invalid_sample_decision.get("mode") != MODE_CHRG:
+                manual_reserve_veto = ep_reserve_floor_decision(
+                    cfg, live_with_wallbox, max_charge_w, previous_state,
+                    now_s=now_s, recovery_context=reserve_recovery,
+                )
+                if manual_reserve_veto is not None:
+                    reserve_recovery = manual_reserve_veto["ep_reserve_recovery"]
+                    manual_invalid_sample_decision = manual_reserve_veto
     decision = None
     stale_guard = storage_live_stale_decision(
         cfg=cfg,
@@ -25924,6 +26213,27 @@ def decide_next_cycle(
         else:
             curve_soc, target_soc, target_ts = current_curve(plan, now_s)
             # Normal regulation continues below.
+    if (
+        decision is not None
+        and reserve_recovery.get("active") is True
+        and str(decision.get("state") or "") in (
+            "live_stale_auto", "live_plausibility_auto", "live_soc_unrealistic_auto",
+        )
+        and safe_int(live_with_wallbox.get("Notstrom_Status", live_with_wallbox.get("ems_emergency_power_status")), 0) not in (1, 4)
+    ):
+        # Datenverlust bestätigt keine Reserve-Erholung. Ein zwischenzeitlicher
+        # Ladeowner muss keine auto_limit tragen; deshalb die bestehende Sperre
+        # aus ihrem eigenen Kontext halten statt aus dessen Ausgang zu erraten.
+        held_charge_w = max_charge_w
+        previous_limit = decision.get("auto_limit")
+        if isinstance(previous_limit, dict) and previous_limit.get("enabled") and not previous_limit.get("release"):
+            held_charge_w = min(max_charge_w, max(0, safe_int(previous_limit.get("max_charge_w"), max_charge_w)))
+        reserve_reason = "Live-Daten nicht freigegeben; bestehende Notstrom-Entladesperre bleibt bis zur bestätigten Erholung erhalten"
+        decision.update(
+            reason=reserve_reason, protected=True, discharge_allowed=False,
+            export_allowed=False, budget_w=0, ep_reserve_floor_hold=True,
+            auto_limit=discharge_block_auto_limit(cfg, held_charge_w, reserve_reason),
+        )
     if decision is None:
         pv_curve_before_start = bool(pv_w > 250)
         curve_lookahead_h = max(0.25, safe_float(cfg.get("tl_lookahead_h"), 1.0))
@@ -26029,10 +26339,15 @@ def decide_next_cycle(
             )
         else:
             shortfall_late_enter_w = shortfall_catchup_enter_w
+        # Einspeisung aus laufender Batterieentladung ist keine neue PV-Energie
+        # zum Nachladen. Den Haus-/Wallbox-Anteil hat der zentrale Budgetkontext
+        # bereits topologierichtig verrechnet; nicht nochmals abziehen.
+        shortfall_battery_discharge_w = max(0, -bat_w)
+        shortfall_pv_export_w = max(0, -grid_w - shortfall_battery_discharge_w)
         shortfall_real_surplus_w = max(
             0,
-            -grid_w,
-            pv_w - home_w - wp_w - max(0, safe_int(live_with_wallbox.get("Wallbox_Power"), 0)),
+            shortfall_pv_export_w,
+            pv_after_fixed_signed_w,
         )
         shortfall_target_gap_pct = max(0.0, effective_target_soc - curve_control_soc)
         evening_release_margin_pct = max(
@@ -26490,6 +26805,8 @@ def decide_next_cycle(
             "shortfall_target_soc": round(effective_target_soc, 2) if effective_target_soc > 0 else None,
             "shortfall_target_gap_pct": round(shortfall_target_gap_pct, 2),
             "shortfall_real_surplus_w": int(shortfall_real_surplus_w),
+            "shortfall_battery_discharge_w": int(shortfall_battery_discharge_w),
+            "shortfall_pv_export_w": int(shortfall_pv_export_w),
             "shortfall_catchup_enter_w": int(shortfall_catchup_enter_w),
             "shortfall_catchup_nominal_enter_w": int(shortfall_catchup_nominal_enter_w),
             "shortfall_late_catchup_enter_w": int(shortfall_late_enter_w),
@@ -29867,6 +30184,9 @@ def decide_next_cycle(
         "discharge_allowed": decision.get("discharge_allowed"),
         "export_allowed": decision.get("export_allowed"),
         "ep_reserve_floor_hold": bool(decision.get("ep_reserve_floor_hold")),
+        # Die Reservebindung überlebt auch erlaubtes Netzladen oder einen
+        # anderen Schutzpfad; unbeobachtete Erholungszeit zählt dabei nicht.
+        "ep_reserve_recovery": reserve_recovery,
         "soc": soc,
         "curve_control_soc": curve_control_soc,
         "curve_control_raw_soc": soc,
@@ -32223,6 +32543,7 @@ def write_state(payload: Dict[str, Any], plan: Dict[str, Any]) -> None:
         "mode_name": payload.get("mode_name"),
         "val": payload["val"],
         "soc": payload["soc"],
+        "ep_reserve_recovery": copy.deepcopy(payload.get("ep_reserve_recovery")),
         "curve_control_soc": payload.get("curve_control_soc"),
         "curve_control_raw_soc": payload.get("curve_control_raw_soc"),
         "curve_control_soc_ts": payload.get("curve_control_soc_ts"),
@@ -33294,6 +33615,7 @@ def write_safe_start_state(
         "storage_curve_cap_handover": carry_storage_curve_cap_handover_state(
             prior_state
         ),
+        "ep_reserve_recovery": carry_ep_reserve_recovery(prior_state),
         "ts": state_ts,
         "service": "storage_manager",
         "safe_start": True,
@@ -39353,6 +39675,7 @@ def apply_storage_dispatch_phase5(
             "protected": False,
             "suppress_rscp_output": True,
             "storage_dispatch_phase5": diagnostic,
+            "ep_reserve_recovery": copy.deepcopy(baseline.get("ep_reserve_recovery")),
             "reason": (
                 "Direktvermarktung: laufender PV-Speicherrahmen bleibt während "
                 "der kurzen 15-Minuten-Slotprojektion unverändert."
@@ -41619,6 +41942,9 @@ def main() -> None:
         max_age_s=wallbox_start_hold_policy.DEFAULT_HOLD_S + 60.0,
     )
     previous_state: Dict[str, Any] = {}
+    reserve_recovery = carry_ep_reserve_recovery(persisted_consumer_budget_state)
+    if reserve_recovery:
+        previous_state["ep_reserve_recovery"] = reserve_recovery
     if isinstance(persisted_peak_shaving, dict):
         previous_state["peak_shaving"] = persisted_peak_shaving
     restored_consumer_budget = restore_consumer_budget_runtime_previous_state(
@@ -42028,6 +42354,9 @@ def main() -> None:
             "storage_manager_ownership": ownership.diagnostic(),
             "consumer_budget_runtime_state": stopped_consumer_budget_state,
             "storage_curve_cap_handover": stopped_curve_cap_handover,
+            "ep_reserve_recovery": terminal_ep_reserve_recovery(
+                previous_state, persisted_terminal_state
+            ),
             "ts": stop_ts,
         },
         indent=2,

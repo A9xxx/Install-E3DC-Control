@@ -230,6 +230,36 @@ def compact_history_record(
                 "consumer_shortfall_w", "grid_export_w", "grid_import_w", "storage_reserved_w",
             ),
         )
+        # Bestätigungs- und Haltebelege nicht aus den r5-Summen rekonstruieren.
+        # Nur vorhandene, begrenzte Vertragsfelder erhalten; keine Folgezustände.
+        output_flags = (
+            "shadow_only", "would_write_consumer_allocations", "would_send_rscp",
+            "would_command_wallbox", "would_command_heatpump",
+        )
+        executor_fields = {
+            "executor_gate": (
+                "contract_version", "gate_class", "gate_open_shadow", "data_valid",
+                "target_sink", "target_w",
+            ),
+            "executor_latch": (
+                "contract_version", "latch_class", "accepted_active_shadow",
+                "accepted_sink", "accepted_target_w", "accepted_age_s", "min_runtime_s",
+                "hold_remaining_s", "release_allowed_shadow", "hold_previous_output_shadow",
+                "safety_release",
+            ),
+            "executor_ack": (
+                "contract_version", "ack_class", "ack_required_shadow", "ack_valid_shadow",
+                "ack_source", "expected_ack_source", "ack_source_allowed", "ack_sink",
+                "ack_target_w", "ack_age_s", "ack_timeout_s", "sink_matches",
+                "target_matches", "signature_matches", "productive_allowed_shadow",
+                "release_latch_shadow", "fallback_action",
+            ),
+            "runtime": ("enabled", "active", "runtime_class", "safe_fallback"),
+        }
+        for contract_name, fields in executor_fields.items():
+            evidence = _mapping_subset(budget.get(contract_name), fields + output_flags)
+            if evidence:
+                compact["storage_budget"][contract_name] = evidence
         path = compact.get("path") if isinstance(compact.get("path"), dict) else {}
         compact["path"] = _mapping_subset(
             path,

@@ -57,6 +57,26 @@ dieselbe Datei appendieren.
 
 ## Diagnosepaket
 
+### Regelruhe und Datenqualität
+
+Die Regelruhe-Diagnose trennt Entscheidungen, bestätigte Ausgangsbeobachtungen,
+Änderungen dieser Ausgänge und bestätigte neue Ausgabetransaktionen.
+Ein erneut gelesener unveränderter Ausgang ist kein neuer Schreibbefehl.
+Wärmepumpen-Entscheidungszustände sind keine gezählten Verdichterstarts.
+
+Kontextzeilen beschreiben einen Verlauf, sind aber keine Regelzyklen. Sie
+werden separat gezählt und erzeugen allein keine fehlenden Live-Nachweise.
+`EVIDENCE_LIMIT` nennt konkrete verbleibende Grenzen, etwa ein älteres
+Datenformat, veraltete oder unbestätigte Rücklesungen, eine ungültige
+Transaktionsbindung, beschädigte Zeilen oder zusammengefasste Zeiträume.
+
+Zusammenfassungen mit null gemeldeten Zwischenänderungen ersetzen keine
+lückenlose Folge einzelner Beobachtungen. Alte Daten werden nicht nachträglich
+als bestätigte Hardwareausführung ausgegeben. Belegte Pfadkonflikte und echte
+Ausgangswechsel bleiben auch bei eingeschränkter Datenqualität sichtbar.
+
+### Paket für Supportfälle
+
 Das Diagnosepaket wird lokal erzeugt und enthält nur technische Hilfsdaten:
 
 - maskierte Konfiguration ohne Passwörter, Tokens, E-Mail-Adressen und

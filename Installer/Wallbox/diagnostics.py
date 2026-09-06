@@ -5,6 +5,7 @@ Regelentscheidung und kommuniziert nie mit einem Wallboxtreiber.
 """
 
 import json
+import math
 import os
 import time
 
@@ -22,6 +23,102 @@ def _safe_float(value, default=0.0):
 def _mapping_subset(value, keys):
     source = value if isinstance(value, dict) else {}
     return {key: source.get(key) for key in keys if key in source}
+
+
+def _finite_diagnostic_number(value):
+    """Erhält den Quellwert; fehlende oder unendliche Werte sind keine Null."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return value if math.isfinite(float(value)) else None
+    except (ValueError, OverflowError):
+        return None
+
+
+def _budget_balance_diagnostic(value):
+    """Begrenzte Quellenbeschreibung ohne neue Budget- oder Freigabeautorität."""
+    if not isinstance(value, dict):
+        return None
+    sources = ("existing_filtered_balance", "raw_ems_after_confirmed_idle")
+    reasons = (
+        "idle_frame_coherent", "charging_or_status_unknown",
+        "live_sample_invalid", "live_sample_stale", "live_before_wallbox_sample",
+        "producer_budget_not_authorized", "grid_import_present", "non_finite_input",
+    )
+    result = {
+        "source": value.get("source") if value.get("source") in sources else None,
+        "reason": value.get("reason") if value.get("reason") in reasons else None,
+    }
+    for key in (
+        "live_sample_ts", "wallbox_sample_ts", "grid_raw_w", "grid_filtered_w",
+        "wallbox_power_w", "coherent_available_w",
+    ):
+        result[key] = _finite_diagnostic_number(value.get(key))
+    return result
+
+
+def transient_grid_pm_hold_diagnostic(value):
+    """Begrenzt die letzte PM-Halteprüfung ohne IDs oder neue Regelautorität."""
+    source = value if isinstance(value, dict) else {}
+    if source.get("contract") != "wallbox_transient_grid_pm_output_hold_v1":
+        return None
+
+    def token(item):
+        if (
+            isinstance(item, str)
+            and 0 < len(item) <= 64
+            and item.isascii()
+            and all(char.islower() or char.isdigit() or char == "_" for char in item)
+        ):
+            return item
+        return None
+
+    result = {
+        "contract": "wallbox_transient_grid_pm_output_hold_v1",
+        "observation_scope": "last_evaluation",
+    }
+    for key in ("active", "output_hold_only", "new_output_authorized"):
+        result[key] = source.get(key) is True
+    for key in ("family", "reason"):
+        result[key] = token(source.get(key))
+    for key in (
+        "observed_ts", "hold_amp", "max_hold_s", "anchor_age_s",
+        "episode_age_s", "grid_w", "grid_pm_w",
+    ):
+        raw = source.get(key)
+        try:
+            number = float(raw) if isinstance(raw, (int, float)) and not isinstance(raw, bool) else None
+        except (TypeError, ValueError, OverflowError):
+            number = None
+        result[key] = round(number, 3) if number is not None and math.isfinite(number) else None
+    blockers = source.get("blockers")
+    blockers = blockers if isinstance(blockers, list) else []
+    result["blockers"] = [entry for entry in (token(item) for item in blockers[:8]) if entry]
+    result["blocker_count"] = len(blockers)
+    result["blockers_truncated"] = len(blockers) > 8
+    return result
+
+
+def _wallboxes_with_pm_hold_diagnostics(wallboxes, context):
+    """Kopiert nur die Diagnoseansicht; der Befehlsplan bleibt unangetastet."""
+    holds = context.get("transient_grid_pm_output_hold_by_id")
+    holds = holds if isinstance(holds, dict) else {}
+    result = []
+    for item in wallboxes if isinstance(wallboxes, list) else []:
+        if not isinstance(item, dict):
+            continue
+        detail = dict(item)
+        diagnostic = transient_grid_pm_hold_diagnostic(holds.get(str(item.get("id"))))
+        if diagnostic is not None:
+            original_payload = item.get("decision_payload")
+            payload = dict(original_payload) if isinstance(original_payload, dict) else {}
+            original_diagnostics = payload.get("diagnostics")
+            diagnostics = dict(original_diagnostics) if isinstance(original_diagnostics, dict) else {}
+            diagnostics["transient_grid_pm_output_hold"] = diagnostic
+            payload["diagnostics"] = diagnostics
+            detail["decision_payload"] = payload
+        result.append(detail)
+    return result
 
 
 def _blocked_gate_event(name, value):
@@ -248,6 +345,8 @@ class WallboxDiagnostics:
                     "inputs.bat_w",
                     "inputs.budget_raw_w",
                     "inputs.effective_budget_w",
+                    "inputs.producer_budget_w",
+                    "inputs.budget_effective_w",
                     "inputs.allowed_w",
                     "inputs.cap_amp",
                     "inputs.set_amp",
@@ -267,7 +366,9 @@ class WallboxDiagnostics:
         context = context if isinstance(context, dict) else {}
         budget_stale = bool(context.get("budget_stale", False))
         budget_timeout = bool(context.get("budget_timeout", False))
-        wallboxes = state.get("wb_details", [])
+        wallboxes = _wallboxes_with_pm_hold_diagnostics(
+            state.get("wb_details", []), context,
+        )
         record = {
             "ts": int(time.time()),
             "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -294,6 +395,11 @@ class WallboxDiagnostics:
                 "bat_w": int(round(_safe_float(state.get("bat_w_raw"), 0.0))),
                 "budget_raw_w": int(round(_safe_float(state.get("wb_budget_raw_w"), 0.0))),
                 "effective_budget_w": int(round(_safe_float(state.get("wb_effective_budget_w"), 0.0))),
+                # Legacy-Rohbudget ist bereits im Empfänger bearbeitet. Die
+                # Originalzuteilung wird separat und ohne Ersatzwert erhalten.
+                "producer_budget_w": _finite_diagnostic_number(context.get("producer_budget_w")),
+                "budget_effective_w": _finite_diagnostic_number(state.get("wb_effective_budget_w")),
+                "budget_balance": _budget_balance_diagnostic(context.get("budget_balance_diagnostic")),
                 "allowed_w": int(round(_safe_float(state.get("avail_wb_w"), 0.0))),
                 "cap_amp": round(_safe_float(state.get("cap_amp"), 0.0), 3),
                 "set_amp": round(_safe_float(state.get("set_amp"), 0.0), 3),

@@ -131,11 +131,11 @@ function ruleCalmServiceLabel($service) {
         'wallbox_phase' => 'Wallbox Phasen',
         'storage_owner' => 'Speicher-Owner',
         'storage_contract_owner' => 'Speicher-Contract',
-        'storage_execution_class' => 'Speicher-Ausführung',
+        'storage_execution_class' => 'Speicher-Ausgangsbeobachtungen',
         'storage_state' => 'Speicher-State',
         'storage_state_reason' => 'Speicher-Grund',
-        'storage_value_update' => 'Speicher-Wertupdate',
-        'storage_live_plausibility' => 'Speicher-Messwerte',
+        'storage_value_update' => 'Speicher-Sollwertupdate',
+        'storage_live_plausibility' => 'Speicher-Messwertschutz',
     ];
     return $labels[$service] ?? $service;
 }
@@ -337,12 +337,12 @@ function ruleCalmReadCurrentTail($source, $limit, $since_ts = null) {
         if ($handle) {
             while (!gzeof($handle)) {
                 $line = trim((string)gzgets($handle));
-                if ($line === '' || $line[0] !== '{') {
+                if ($line === '') {
                     continue;
                 }
                 $total++;
                 $line_ts = ruleCalmLineTs($line);
-                if ($since_ts !== null && ($line_ts === null || $line_ts < $since_ts)) {
+                if ($since_ts !== null && $line_ts !== null && $line_ts < $since_ts) {
                     continue;
                 }
                 $filtered_total++;
@@ -358,12 +358,12 @@ function ruleCalmReadCurrentTail($source, $limit, $since_ts = null) {
         if ($handle) {
             while (($line = fgets($handle)) !== false) {
                 $line = trim((string)$line);
-                if ($line === '' || $line[0] !== '{') {
+                if ($line === '') {
                     continue;
                 }
                 $total++;
                 $line_ts = ruleCalmLineTs($line);
-                if ($since_ts !== null && ($line_ts === null || $line_ts < $since_ts)) {
+                if ($since_ts !== null && $line_ts !== null && $line_ts < $since_ts) {
                     continue;
                 }
                 $filtered_total++;
@@ -421,7 +421,7 @@ function ruleCalmStageCurrentDecisionFile($source, $target_dir, $limit, $since_t
         if ($since_ts !== null) {
             $line = @file_get_contents($source);
             $line_ts = $line !== false ? ruleCalmLineTs($line) : null;
-            if ($line_ts === null || $line_ts < (float)$since_ts) {
+            if ($line_ts !== null && $line_ts < (float)$since_ts) {
                 return ruleCalmStageEmptyDecisionFile($source, $target_dir, $since_ts, $line !== false ? 1 : 0, 0);
             }
         }
@@ -717,6 +717,9 @@ function ruleCalmPublicAction($value) {
     if ($text === '') {
         return '';
     }
+    if (in_array($text, ['BOOST', 'RUN', 'OBS_RUN', 'OBS_OFF'], true)) {
+        return $text;
+    }
     if (preg_match('/^(START|STOP|ON|OFF|PAUSE|RESUME|IDLE|HOLD|RELEASE|VALUE_UPDATE|UNKNOWN|UNKNOWN_PATH|CURVE|DIRECT_MARKETING|MARKET_DIRECT|MARKET_PRICE|PREDUMP|PROTECTION|WALLBOX_SUPPORT|MANUAL|STORAGE_ACTIVE|E3DC_AUTO|E3DC_AUTONOM|E3DC|WALLBOX|STORAGE|MARKET|AUTO|AUTO_FREE|AUTO_LIMITED|AUTO_RELEASE|CHRG|DISCH|GRID|AUTO_GUARD|INVALID_SAMPLE|DISCHARGE_OWNER_HOLD|CHARGE_OWNER_HOLD|WB_MINSOC_HOLD|AUTO_LIMIT_HOLD|MANUAL_OVERRIDE_HOLD|EVIDENCE_LIMIT|PARALLEL_WB_AUTO|[123]P)$/', $text)
         || preg_match('/^STATE-[0-9A-F]{10}$/', $text)) {
         return $text;
@@ -731,7 +734,7 @@ function ruleCalmLaneGroup($check) {
     }
     if (in_array($check, [
         'storage_owner', 'storage_contract_owner', 'storage_state',
-        'storage_state_reason', 'storage_decision_path',
+        'storage_state_reason', 'storage_decision_path', 'storage_value_update', 'heatpump',
     ], true)) {
         return 'decision_path';
     }
@@ -779,11 +782,26 @@ function ruleCalmForumPatternLabel($value) {
 
 function ruleCalmPublicCounts($counts) {
     $public = [];
+    // Nur diese festen Bezeichnungen passieren die Freitext-Anonymisierung.
+    $executorLabels = [
+        'Datensätze', 'Unvollständige Bestätigungsbelege',
+        'Freigabe: Netzbezugsschutz', 'Freigabe: Messwertschutz', 'Freigabe: Stabilisierung',
+        'Freigabe: kein Verbraucher', 'Freigabe: Export nur beobachtet', 'Freigabe: Speicher reserviert',
+        'Freigabe: kein Budget', 'Freigabe: Mindestleistung fehlt', 'Freigabe: Wallbox bereit',
+        'Freigabe: Wärmepumpe bereit', 'Freigabe: unbekannter Verbraucher',
+        'Budgethaltung: Schutzfreigabe', 'Budgethaltung: neu angenommen', 'Budgethaltung: nicht steuerbar',
+        'Budgethaltung: inaktiv', 'Budgethaltung: Mindestlaufzeit', 'Budgethaltung: Laufzeit erfüllt',
+        'Budgethaltung: Wechsel zurückgestellt', 'Budgethaltung: Wechsel angenommen',
+        'Budgethaltung: Freigabe zurückgestellt', 'Budgethaltung: nach Laufzeit freigegeben',
+        'Bestätigung: nicht erforderlich', 'Bestätigung: Zeitüberschreitung', 'Bestätigung: ausstehend',
+        'Bestätigung: falsche Quelle', 'Bestätigung: nicht angenommen', 'Bestätigung: veraltet',
+        'Bestätigung: abweichender Auftrag', 'Bestätigung: gültig',
+    ];
     foreach (is_array($counts) ? $counts : [] as $name => $value) {
         if (!is_numeric($value)) {
             continue;
         }
-        $key = ruleCalmPublicAction($name);
+        $key = in_array($name, $executorLabels, true) ? $name : ruleCalmPublicAction($name);
         if ($key === '') {
             continue;
         }
@@ -808,10 +826,65 @@ function ruleCalmPublicNumericMap($values) {
 
 function ruleCalmPublicEvidenceLimits($values) {
     $public = [];
-    $allowed = ['storage_live_typed_missing', 'storage_output_typed_missing'];
+    $allowed = ['storage_live_typed_missing', 'storage_output_typed_missing', 'storage_budget_executor_missing'];
     foreach (is_array($values) ? $values : [] as $name => $value) {
         if (in_array($name, $allowed, true) && is_numeric($value)) {
             $public[$name] = max(0, (int)$value);
+        }
+    }
+    return $public;
+}
+
+function ruleCalmEvidenceReasonLabels() {
+    return [
+        'malformed_record' => 'Beschädigte oder unlesbare Historienzeile',
+        'invalid_timestamp' => 'Fehlender oder ungültiger Zeitstempel',
+        'invalid_history_metadata' => 'Unbekannte oder widersprüchliche Archivmetadaten',
+        'unknown_record_format' => 'Kein auswertbarer Entscheidungsdatensatz',
+        'aggregated_interval' => 'Zusammengefasster Zeitraum ohne vollständige Zwischenfolge',
+        'archive_gap' => 'Vom Archiv gemeldete Nachweislücke',
+        'record_limit_reached' => 'Weitere Entscheidungen außerhalb des Auswertungslimits',
+        'legacy_output_contract_missing' => 'Älteres Datenformat ohne typisierten RSCP-Ausgang',
+        'output_contract_invalid' => 'Unvollständiger oder ungültiger RSCP-Ausgangsvertrag',
+        'readback_stale' => 'Veraltete RSCP-Rücklesung',
+        'output_unconfirmed' => 'RSCP-Ausgang noch nicht vollständig bestätigt',
+        'transaction_binding_invalid' => 'Rücklesung ohne gültige Transaktionsbindung',
+        'live_contract_missing' => 'Live-Gültigkeitsnachweise fehlen',
+        'live_contract_invalid' => 'Live-Gültigkeitsnachweise besitzen ungültige Datentypen',
+        'heatpump_observation_missing' => 'Wärmepumpenzustand ohne belastbare Beobachtung',
+        'executor_binding_evidence_missing' => 'Budgetbestätigung oder Mindesthaltezeit nicht vollständig belegt',
+    ];
+}
+
+function ruleCalmPublicHistoryCoverage($values) {
+    $public = [];
+    $counts = ['context_records', 'decision_records', 'invalid_records', 'aggregated_records',
+        'aggregated_samples', 'aggregated_transitions', 'archive_gap_records'];
+    $labels = ruleCalmEvidenceReasonLabels();
+    foreach (is_array($values) ? $values : [] as $service => $coverage) {
+        if (!in_array($service, ['storage', 'wallbox', 'heatpump', 'ems'], true) || !is_array($coverage)) {
+            continue;
+        }
+        $entry = ['reasons' => []];
+        foreach ($counts as $key) {
+            $entry[$key] = is_numeric($coverage[$key] ?? null) ? max(0, (int)$coverage[$key]) : 0;
+        }
+        foreach (is_array($coverage['reasons'] ?? null) ? $coverage['reasons'] : [] as $reason => $count) {
+            if (isset($labels[$reason]) && is_numeric($count) && (int)$count > 0) {
+                $entry['reasons'][$reason] = (int)$count;
+            }
+        }
+        $public[$service] = $entry;
+    }
+    return $public;
+}
+
+function ruleCalmPublicOutputCounts($values) {
+    $public = [];
+    $values = is_array($values) ? $values : [];
+    foreach (['confirmed_observations', 'confirmed_output_changes', 'confirmed_new_output_records', 'retained_readback_records'] as $key) {
+        if (is_numeric($values[$key] ?? null)) {
+            $public[$key] = max(0, (int)$values[$key]);
         }
     }
     return $public;
@@ -1088,21 +1161,39 @@ function ruleCalmBuildForumSummary($summary, $violations, $context) {
         $analyzed = array_map('ruleCalmServiceLabel', $summary['analyzed_services'] ?? []);
         $lines[] = 'Ausgewertet: ' . implode(', ', $analyzed) . ' · Ohne Records: ' . implode(', ', $missing);
     }
-    $lines[] = 'Records: Speicher ' . (int)($records['storage'] ?? 0)
+    $lines[] = 'Entscheidungsdatensätze: Speicher ' . (int)($records['storage'] ?? 0)
         . ', Wallbox ' . (int)($records['wallbox'] ?? 0)
         . ', Wärmepumpe ' . (int)($records['heatpump'] ?? 0)
         . ', EMS ' . (int)($records['ems'] ?? 0);
-    $lines[] = 'Zustandswechsel: Storage ' . (int)($events['storage'] ?? 0)
+    $output_counts = ruleCalmPublicOutputCounts($summary['storage_output_counts'] ?? []);
+    $lines[] = 'Speicher: bestätigte Ausgangsbeobachtungen ' . ($output_counts['confirmed_observations'] ?? 'nicht erhoben')
+        . ', beobachtete Ausgangswechsel ' . ($output_counts['confirmed_output_changes'] ?? 'nicht erhoben')
+        . ', bestätigte neue Ausgabetransaktionen ' . ($output_counts['confirmed_new_output_records'] ?? 'nicht erhoben')
+        . ', beibehaltene Rücklesungen ' . ($output_counts['retained_readback_records'] ?? 'nicht erhoben');
+    $lines[] = 'Entscheidungen und Beobachtungen: Storage-Ausgangszustände ' . (int)($events['storage'] ?? 0)
         . ', Storage-Contract ' . (int)($events['storage_contract_owner'] ?? 0)
-        . ', Storage-Ausführung ' . (int)($events['storage_execution_class'] ?? 0)
         . ', Storage-Owner ' . (int)($events['storage_owner'] ?? 0)
         . ', Storage-State ' . (int)($events['storage_state'] ?? 0)
-        . ', Storage-Werte ' . (int)($events['storage_value_update'] ?? 0)
-        . ', Storage-Messwerte ' . (int)($events['storage_live_plausibility'] ?? 0)
+        . ', Storage-Sollwertupdates ' . (int)($events['storage_value_update'] ?? 0)
+        . ', Storage-Messwertschutz ' . (int)($events['storage_live_plausibility'] ?? 0)
         . ', WB Start/Stop ' . (int)($events['wallbox_start_stop'] ?? 0)
         . ', WB Phasen ' . (int)($events['wallbox_phase'] ?? 0)
-        . ', WP ' . (int)($events['heatpump'] ?? 0)
+        . ', WP-Entscheidungs-/Beobachtungszustände ' . (int)($events['heatpump'] ?? 0)
         . ', EMS ' . (int)($events['ems_decision'] ?? 0);
+    $lines[] = 'WP-Zustände sind keine Verdichterstarts. Sollwertupdates und Messwertschutz zählen keine Leistungsänderungen.';
+    $reason_labels = ruleCalmEvidenceReasonLabels();
+    foreach (ruleCalmPublicHistoryCoverage($summary['history_coverage'] ?? []) as $service => $coverage) {
+        $lines[] = ruleCalmServiceLabel($service) . ': ' . $coverage['decision_records'] . ' Entscheidungen, '
+            . $coverage['context_records'] . ' Kontextzeilen separat, '
+            . $coverage['aggregated_records'] . ' zusammengefasste Zeiträume';
+        if ($coverage['aggregated_samples'] > 0) {
+            $lines[] = 'Darin ' . $coverage['aggregated_samples'] . ' zusammengefasste Beobachtungen und '
+                . $coverage['aggregated_transitions'] . ' gemeldete Entscheidungsänderungen; keine vollständige Zwischenfolge.';
+        }
+        foreach ($coverage['reasons'] as $reason => $count) {
+            $lines[] = '- ' . ruleCalmServiceLabel($service) . ': ' . $reason_labels[$reason] . ' (' . $count . ')';
+        }
+    }
     $data_quality_findings = array_values(array_filter($violations, function($violation) {
         return ($violation['lane_group'] ?? '') === 'data_quality';
     }));
@@ -1265,7 +1356,8 @@ function ruleCalmRun($input_path, $source_label, $input_kind, $services = null, 
         || !is_array($summary['events'] ?? null)
         || !is_array($summary['checks'] ?? null)
         || $analyzed_services === null || $missing_services === null || $reported_services === null
-        || !$analyzed_services || $partition !== $expected_services || $reported_sorted !== $expected_services
+        || (!$analyzed_services && ($control_status !== 'EVIDENCE_LIMIT' || !is_array($summary['history_coverage'] ?? null)))
+        || $partition !== $expected_services || $reported_sorted !== $expected_services
         || !in_array($completeness, ['COMPLETE', 'PARTIAL'], true)
         || ($completeness === 'COMPLETE' && $missing_services)
         || ($completeness === 'PARTIAL' && !$missing_services)) {
@@ -1327,6 +1419,8 @@ function ruleCalmRun($input_path, $source_label, $input_kind, $services = null, 
         'checks' => ruleCalmCompactChecks($summary),
         'effective_min_gap_s' => ruleCalmPublicNumericMap($summary['effective_min_gap_s'] ?? []),
         'evidence_limits' => ruleCalmPublicEvidenceLimits($summary['evidence_limits'] ?? []),
+        'history_coverage' => ruleCalmPublicHistoryCoverage($summary['history_coverage'] ?? []),
+        'storage_output_counts' => ruleCalmPublicOutputCounts($summary['storage_output_counts'] ?? []),
         'violations' => $violations,
         'data_quality_findings' => $data_quality_findings,
         'findings' => $findings,

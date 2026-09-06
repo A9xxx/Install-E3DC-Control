@@ -5,6 +5,7 @@ import os
 import json
 import math
 import logging
+import re
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -49,6 +50,131 @@ class BluelinkVehicleDataMissing(RuntimeError):
     """Die Cloudantwort enthält kein zum konfigurierten Fahrzeug nutzbares Ergebnis."""
 
     refresh_error_code = "vehicle_data_missing"
+
+
+def _read_force_refresh_request(path=None):
+    """Erhält alte manuelle Flags und trennt typisierte Steckaufträge davon."""
+    with open(path or FORCE_FLAG_FILE, "r", encoding="utf-8") as handle:
+        raw = handle.read(4096).strip()
+    # Der bestehende Webweg schreibt einen Zeitstempel; ältere Clients
+    # verwendeten eine leere Datei. Beide bleiben manuelle Gesamtanfragen.
+    if not raw or raw.isdigit():
+        return None
+    try:
+        request = json.loads(raw)
+    except (ValueError, TypeError) as error:
+        raise BluelinkVehicleDataMissing("Ungültige Fahrzeug-Anforderung") from error
+    if (
+        not isinstance(request, dict)
+        or request.get("schema") != "vehicle_soc_refresh_request_v1"
+        or request.get("source") != "openwb_plug"
+        or not str(request.get("vehicle_id") or "").strip()
+        or not str(request.get("plug_session_id") or "").strip()
+        or type(request.get("wb")) is not int or request["wb"] not in (1, 2)
+    ):
+        raise BluelinkVehicleDataMissing("Ungültige automatische Fahrzeug-Anforderung")
+    requested_at = _safe_timestamp(request.get("requested_at"))
+    now = time.time()
+    if (isinstance(request.get("requested_at"), bool) or requested_at is None
+            or requested_at > now + 300 or now - requested_at > 300):
+        # Dieselben fünf Minuten wie bei der bestehenden Web-Flag-Bereinigung;
+        # ein abgeschlossener Steckvorgang darf später kein Fahrzeug wecken.
+        raise BluelinkVehicleDataMissing("Die automatische Fahrzeug-Anforderung ist abgelaufen")
+    return request
+
+
+def _apply_force_refresh_request(manager, request, vin=None):
+    """Automatische Aufträge wecken ausschließlich das gebundene Fahrzeug."""
+    if request is None:
+        manager.force_refresh_all_vehicles_states()
+        return None
+    vehicle_id = str(request.get("vehicle_id") or "").strip()
+    vehicles = getattr(manager, "vehicles", {})
+    vehicle = vehicles.get(vehicle_id) if isinstance(vehicles, dict) else None
+    refresh_one = getattr(manager, "force_refresh_vehicle_state", None)
+    if vehicle is None or (vin and getattr(vehicle, "vin", None) != vin):
+        raise BluelinkVehicleDataMissing("Das angeforderte Fahrzeug ist nicht im freigegebenen Konto verfügbar")
+    if not callable(refresh_one):
+        raise BluelinkVehicleDataMissing("Diese Cloud-API unterstützt keinen einzelnen Fahrzeugabruf")
+    _validate_automatic_refresh_context(request)
+    # Öffentliche SDK-Methode; kein Ersatz durch einen Konto-Gesamtabruf.
+    refresh_one(vehicle_id)
+    return vehicle_id
+
+
+def _validate_automatic_refresh_context(request):
+    """Prüfe unmittelbar vor dem Wakeup die weiterhin gültige Steckfreigabe."""
+    try:
+        from Wallbox.modes import MODE_OFF, normalize_wb_mode
+    except ModuleNotFoundError:
+        from Installer.Wallbox.modes import MODE_OFF, normalize_wb_mode
+
+    def read(path):
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def compact(value):
+        return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+    def active(value):
+        return str(value or "").strip().lower() in ("1", "true", "yes", "ja", "on", "active")
+
+    try:
+        wb = request["wb"]
+        if type(wb) is not int or wb not in (1, 2):
+            raise ValueError("Wallbox fehlt")
+        v4 = read(V4_CONFIG_FILE)
+        if not isinstance(v4, dict):
+            raise ValueError("Konfiguration fehlt")
+        cfg = dict(v4.get("config") or {})
+        cfg.update(v4)  # Wie im bestehenden V4-Leser gewinnt die Wurzelebene.
+        mode = cfg.get(f"wb{wb}_mode")
+        if mode in (None, ""):
+            legacy_mode = float(cfg.get("wb_native_mode") or 0)
+            mode = legacy_mode if legacy_mode > 2 else MODE_OFF
+        if (not active(cfg.get("wb_native_enable"))
+                or normalize_wb_mode(mode) == MODE_OFF
+                or active(cfg.get(f"wb{wb}_locked"))
+                or active(cfg.get(f"wb{wb}_manual_pause"))):
+            raise ValueError("Wallbox ist aus oder gesperrt")
+
+        data_dir = os.path.dirname(V4_CONFIG_FILE)
+        profiles = read(os.path.join(data_dir, "saved_cars.json"))
+        profiles = list(profiles.values()) if isinstance(profiles, dict) else profiles
+        selected = compact(cfg.get(f"wb{wb}_car_id"))
+        alias_keys = ("id", "profile_id", "cloud_vehicle_id", "vehicle_id",
+                      "vehicle_mac", "mac", "rfid", "rfid_tag")
+        matches = [profile for profile in profiles if isinstance(profile, dict)
+                   and selected and selected in {compact(profile.get(key)) for key in alias_keys}]
+        if (len(matches) != 1
+                or str(matches[0].get("cloud_vehicle_id") or "").strip() != request["vehicle_id"]
+                or sum(compact(cfg.get(f"wb{slot}_car_id")) == selected for slot in (1, 2)) != 1):
+            raise ValueError("Fahrzeugzuordnung wurde geändert oder ist nicht eindeutig")
+
+        # Der Pro-Treiber schreibt diesen Status vor der SoC-Anforderung.
+        # Nicht auf erst später publizierte Manager-/Phasenpersistenz warten.
+        status = read(os.path.join(os.path.dirname(FORCE_FLAG_FILE), f"openwb_data_wb{wb}.json"))
+        now = time.time()
+        sample_ts = _safe_timestamp(status.get("offered_current_readback_ts"))
+        requested_at = _safe_timestamp(request.get("requested_at"))
+        session_start = _safe_timestamp(status.get("session_start_ts"))
+        requested_session_start = _safe_timestamp(request.get("driver_session_start_ts"))
+        if (status.get("source") != "openwb_pro" or status.get("wb_id") != wb
+                or status.get("plug_state_raw") is not True
+                or status.get("connect_php_payload_valid") is not True
+                or session_start is None or requested_session_start is None
+                or session_start != requested_session_start
+                or sample_ts is None or sample_ts > now + 300 or now - sample_ts > 60
+                or requested_at is None or requested_at > now + 300 or now - requested_at > 300):
+            raise ValueError("Keine aktuelle Steckbestätigung für den SoC-Auftrag")
+        aliases = {compact(matches[0].get(key)) for key in alias_keys}
+        if any(compact(status.get(key)) and compact(status.get(key)) not in aliases
+               for key in ("car_id", "vehicle_id", "rfid_tag")):
+            raise ValueError("Das aktuell erkannte Fahrzeug widerspricht dem Auftrag")
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError) as error:
+        # Nur der automatische Cloud-Auftrag entfällt; kein Eingriff in Laden,
+        # Strom-/Phasenregelung und kein Ersatz durch einen Konto-Gesamtabruf.
+        raise BluelinkVehicleDataMissing("Automatischer SoC-Abruf nicht mehr freigegeben: " + str(error)) from error
 
 
 def _safe_timestamp(value):
@@ -604,13 +730,19 @@ def main():
             # anlaufen und API-Limit sowie Fahrzeugbatterie belasten.
             last_update = float(attempt_ts)
             try:
+                force_request = _read_force_refresh_request() if force_requested else None
+                requested_vehicle_id = None
                 # Region 1 = Europa, Brand 2 = Hyundai (1 = Kia)
                 vm = VehicleManager(region=1, brand=2, username="token-login@example.invalid", password=refresh_token, pin="")
                 vm.check_and_refresh_token()
                 
                 if force_requested:
-                    logger.info("Manueller Force-Refresh angefordert. Wecke Fahrzeug auf...")
-                    vm.force_refresh_all_vehicles_states()
+                    logger.info(
+                        "Automatischer SoC-Abruf für das angesteckte Fahrzeug angefordert."
+                        if force_request is not None
+                        else "Manueller Force-Refresh angefordert. Wecke Fahrzeug auf..."
+                    )
+                    requested_vehicle_id = _apply_force_refresh_request(vm, force_request, vin=vin)
                     try: os.remove(FORCE_FLAG_FILE)
                     except: pass
                 else:
@@ -621,6 +753,8 @@ def main():
                 else:
                     vehicles_out = []
                     for v_id, target_vehicle in vm.vehicles.items():
+                        if requested_vehicle_id is not None and str(v_id) != requested_vehicle_id:
+                            continue
                         if vin and target_vehicle.vin != vin:
                             continue
                             
@@ -765,7 +899,7 @@ def main():
                         refresh_mode,
                         attempt_ts,
                         completed_ts,
-                        preserve_missing_cloud=not bool(vin),
+                        preserve_missing_cloud=requested_vehicle_id is not None or not bool(vin),
                     )
                     logger.info(f"{len(data['vehicles'])} Fahrzeuge erfolgreich aktualisiert (Force={force_requested}).")
                     

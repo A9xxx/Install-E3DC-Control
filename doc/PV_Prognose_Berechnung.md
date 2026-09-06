@@ -93,10 +93,51 @@ Die Diagnose verwendet bewusst verständliche, projekteigene Bezeichnungen:
 - **Vergleichsabdeckung**: Anteil der auswertbaren Prognoseslots mit
   gültigem E3/DC-Historienwert.
 
+Die Anzeige nennt zusätzlich den Zeitraum, die tatsächlich ertragsrelevanten
+Fenster, Ausschlussgründe, die quadratische Fehlergröße (RMSE) und den
+Vergleich mit einer einfachen Referenz einschließlich der jeweiligen Fallzahl.
+Ein Vergleichstag kann auch nur teilweise beobachtet sein. Eine hohe
+Vergleichsabdeckung beweist deshalb noch keinen vollständig erfassten
+Tageslichtzeitraum; fehlende Prognose- und Messabschnitte werden getrennt
+ausgewiesen.
+
 Bis mindestens 96 ertragsrelevante Slots aus mindestens sieben
 Vergleichstagen vorliegen, kennzeichnet das System die Werte als
-**vorläufig**. Auch danach bleiben sie Diagnosewerte. Es gibt keine
-automatische Modellauswahl und keine Rückwirkung auf die Regelung.
+**vorläufig**. Unvollständige Vergleichsabdeckung bleibt ebenfalls vorläufig.
+Die Bezeichnung **Evidenzsammlung** bedeutet Datensammlung, nicht automatisch
+ein lernendes Modell. Auch danach bleiben die Werte Diagnosewerte. Es gibt
+keine automatische Modellauswahl und keine Rückwirkung auf die Regelung.
+
+### Getrennte Prognosestufen und Tagesenergie
+
+Neu erfasste Ausgaben halten Rohmodelle, die Prognose vor der bestehenden
+Bias-Korrektur, den korrigierten Wert und die endgültige Anzeige getrennt fest.
+Ausgabezeit, Parameterstand und Zielgröße werden unveränderlich gebunden.
+Eine spätere Korrektur überschreibt keine frühere Prognose. Alte Archive ohne
+diese Stufen werden nicht nachträglich mit vermeintlich damaligen Werten gefüllt.
+Die bereits vorhandene Bias-Korrektur des Prognoseproduzenten bleibt unverändert;
+die Diagnose ergänzt keinen zweiten Regelkreis.
+
+Der Tagesenergievergleich verwendet ausschließlich eine bereits vor Beginn des
+UTC-Tages erzeugte und erfasste, vollständige Tagesprognose. Er setzt außerdem
+vollständige Istwerte voraus. Nachträglich zusammengesetzte Viertelstunden aus
+verschiedenen Prognoseausgaben gelten nicht als solche Tagesprognose.
+
+### Zusatzwechselrichter und Messqualität
+
+Der AC-Anteil bleibt vom E3/DC-DC-Vergleich getrennt. Bei passend gebundener
+externer Livequelle werden vorhandene Leistungsmessungen zeitgewichtet im RAM
+zu Viertelstundenenergie integriert. Es entstehen keine zusätzlichen
+Geräteabfragen. Abgeschlossene Werte werden gesammelt mit dem regulären
+Diagnosezyklus archiviert, nicht bei jeder Liveprobe auf den Datenträger
+geschrieben. Fehlende oder zu weit auseinanderliegende Proben bleiben Lücken.
+
+Die externe E3/DC-Leistungsmeldung ist keine unabhängig bestätigte
+Bruttoerzeugungsmessung des Zusatzwechselrichters. Ohne entsprechende Nachweise
+bleiben Abregelung, Clipping und Abschaltung unbekannt. Deskriptive Vergleiche
+der tatsächlich gemessenen Energie sind trotzdem sichtbar; daraus folgt keine
+Freigabe zur automatischen Kalibrierung. Eine Punktprognose wird dadurch auch
+nicht zu einer belegten P50-Prognose.
 
 ## Konfiguration prüfen
 

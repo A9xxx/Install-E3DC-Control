@@ -6,6 +6,31 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.5b] – 2026-09-06
+
+### 🚗 Wallbox-Budget und Fahrzeug-Ladestand
+
+- **Zeitlich passende Leistungsbilanz:** Nach einer frisch bestätigten Wallboxleistung von 0 W darf ein nachlaufender Netzfilter die weiterhin zentral freigegebene PV-Leistung nicht künstlich verdecken. Die Korrektur verwendet Netzpunkt und Batterie aus demselben frischen Messrahmen; Batterieentladung wird nicht als PV-Überschuss angerechnet. Laufende oder unbekannte Wallboxzustände behalten die bisherige Bilanz.
+- **Keine doppelte Reservierung:** Ein bereits finanzierter, kurzfristig zurückgehaltener Wallboxanteil kann für dieselbe weiterhin freigegebene Stecksession wieder zum eigenen Ladeangebot werden. Dieser Anteil entfällt gleichzeitig aus der nicht nutzbaren Reserve. Andere Verbraucher erhalten dadurch weder weniger bereits zugeteilte Leistung noch eine zusätzliche Batteriequelle.
+- **Phasen nicht aus einer Sperre ableiten:** Eine fehlende Umschaltfreigabe, etwa während zusätzlicher Fahrzeugkommunikation der openWB Pro, ist kein Nachweis für einphasiges Laden. Mindestleistung und Stromberechnung berücksichtigen die belegte Phasenzahl. Das unveränderte Phasenziel löst keine neue Umschaltung aus.
+- **SoC während der Ladung fortschreiben:** Ein bestätigter und eindeutig zugeordneter Cloud-Ladestand kann eine openWB-Pro-Stecksession verankern. Die anschließende Hochrechnung nutzt gemessene Ladeenergie, Fahrzeugkapazität und Wirkungsgrad innerhalb der bestehenden Acht-Stunden-Grenze. Quelle und ursprünglicher Quellzeitpunkt bleiben erhalten; die Hochrechnung ist keine neue Fahrzeugmessung.
+- **Gezielter Cloudabruf beim Anstecken:** Fehlt ein brauchbarer Pro-SoC und ist die Bluelink-Zuordnung eingerichtet, kann die aktiv geregelte Wallbox einmal je Stecksession genau das zugeordnete Cloudfahrzeug abfragen. Cloudintervall, Nutzer-`Aus`, manuelle Pause, Abstecken und Fahrzeugwechsel bleiben wirksam. Es gibt keine Wiederholungsschleife und keinen kontoweiten Ersatzabruf.
+
+### 🔋 Speicherplanung und Direktvermarktungsanzeige
+
+- **Ruhigere Freigabe oberhalb der Notstromreserve:** Die Entladesperre greift weiterhin sofort an der Reserve. Die Wiederfreigabe benötigt einen ausreichenden SoC-Abstand und eine bestätigte Erholungszeit mit frischen Messungen. Messlücken und einzelne SoC-Sprünge heben die Sperre nicht auf; die harte Reserve bleibt unverändert.
+- **Basisplan statt Kandidatenlücke:** Wird ein Verkaufskandidat verworfen, bleibt die normale Hausversorgung als eigene Planaktion erhalten. Kandidat und Ablehnungsgrund werden getrennt angezeigt. Ein geplanter AUTO-Zeitraum behauptet keine bereits bestätigte Hardwareausführung.
+- **Zeitlich konsistente Speicheraufnahme:** Hausbedarf, ausgewählte Nachladung und tatsächlich ausgewählte Verkaufsfenster werden in zeitlicher Reihenfolge bilanziert. Günstige spätere Ladefenster behalten ihren vorgesehenen Speicherplatz. Ein abgelehnter oder erst später liegender Verkauf schafft keinen vorzeitig nutzbaren Platz; Preisprofile und Schutzgrenzen bleiben erhalten.
+- **PV-Potenzial und nutzbare PV getrennt:** Wetterprognose und betriebliche PV-Annahme sind in der DV-Vorschau getrennt. Bekannte feste Abschaltregeln können als Planannahme eingehen; unbekannte zukünftige Preise oder Abregelvorgaben bleiben gekennzeichnet. Eine Einspeisegrenze von 0 W bedeutet nicht, dass die E3/DC-DC-Erzeugung für Haus und Akku ebenfalls 0 W beträgt.
+- **Nur verbleibende Slotenergie:** Im bereits begonnenen Viertelstundenslot werden SoC und Reserve-Leistungsdeckel aus derselben Restdauer berechnet. Die gemeinsame Projektion hält gewählte Aktion, Quellenaufteilung und angezeigten Speicherverlauf zusammen. Die Prognose erteilt keine zusätzliche Lade- oder Verkaufsfreigabe und führt keine neuen E3/DC-Befehle ein.
+
+### 📊 Aussagekräftigere Diagnose ohne zusätzlichen Regler
+
+- **Regelruhe trennt Entscheidung und Wirkung:** Bestätigte Ausgänge, echte Ausgangswechsel, neue Ausgabetransaktionen und unveränderte Rücklesungen werden getrennt gezählt. Zusammengefasste oder unvollständige Historien bleiben als solche erkennbar; ihre Lücken werden nicht nachträglich als bestätigte Ausführung aufgefüllt.
+- **Wallboxbudget nachvollziehbar:** Die vorhandene Entscheidungsdiagnose zeigt ursprüngliches und wirksames Budget sowie Quelle und Messzeiten einer Bilanzkorrektur. Sie ergänzt keinen Hardwareausgang und keine zusätzliche Protokollierungsfrequenz.
+- **PV-Vergleich mit klaren Grenzen:** Zeitraum, Fallzahl, Vergleichsabdeckung, Ausschlussgründe und Prognosestufen werden differenzierter dargestellt. Vollständige Tagesvergleiche verwenden eine bereits vor Tagesbeginn vorliegende Prognose. Externe PV-Messungen bleiben vom E3/DC-Vergleich getrennt; nicht belegte Abregelung und fehlende Messabschnitte werden nicht als bestätigter Wetterfehler ausgegeben. Die Diagnose wählt kein Modell und ändert die Regelung nicht.
+- **Gemeinsame Datenrechte erhalten:** Die Statistikarchivierung erhält den vorgesehenen Gruppen- und Verzeichnismodus des gemeinsamen Datenverzeichnisses, statt ihn später wieder auf einen abweichenden Modus zurückzusetzen.
+
 ## [5.4.5a] – 2026-09-04
 
 ### 🚗 Frischer openWB-Fahrzeug-SoC bleibt reine Anzeige

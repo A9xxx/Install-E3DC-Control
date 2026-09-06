@@ -40,6 +40,29 @@ Hysterese- und Schutzlogik, nutzt aber je Wallbox den passenden Treiber.
 | `PV + Akku bis Untergrenze` | Erlaubt dem Auto PV plus Hausspeicher nur oberhalb der Hausakku-Untergrenze; Netz bleibt außen vor. |
 | `Sofort bis Preislimit` | Netzladen nur, wenn der aktuelle Preis unter dem Wallbox-Preislimit liegt. |
 
+## Budget beim Ende der tatsächlichen Ladung
+
+Eine bestätigte Wallboxleistung von 0 W bleibt auch in der Bilanz eine echte
+Null. Liegt danach frische Einspeisung vor, kann die Regelung das weiterhin
+zentral erlaubte Ladeangebot erhalten, ohne auf einen nachlaufenden Netzfilter
+zu warten. Dafür verwendet sie ausschließlich den Rest aus Netzpunkt und
+Batterie desselben frischen Messrahmens; Batterieentladung zählt nicht als
+PV-Überschuss. Bei einer laufenden oder nicht eindeutig lesbaren Wallbox bleibt
+die bisherige Bilanz unverändert. Die zentralen Leistungsgrenzen, Netz- und
+Akku-Wh-Wächter sowie Start-, Stopp- und Phasenschutzzeiten gelten weiter.
+
+Die kurze zentrale Reservierung nach einem Lastabfall verhindert weiterhin
+Doppelvergaben. Bestätigt die Wallbox frische 0 W und bleibt ihre bisherige
+Stecksessiongruppe zum Laden freigegeben, kann deren bereits finanzierter
+Reserveanteil wieder in das eigene Ladeangebot eingehen. Dieser Anteil wird
+gleichzeitig aus der nicht nutzbaren Reserve entfernt. Ein Fahrzeugwechsel,
+fehlende Messwerte, `Aus` oder eine neue Schutzgrenze erlauben diese Umbuchung
+nicht. Eine laufende Wärmepumpe verliert dadurch kein bereits gebundenes Budget.
+
+Die Entscheidungsdiagnose trennt das ursprünglich vom Storage Manager gelesene
+Budget vom wirksamen Wallboxbudget. Sie zeigt außerdem die verwendete
+Bilanzquelle und deren Messzeiten. Diese Angaben erteilen keine Ladefreigabe.
+
 ## Konfiguration
 
 Neue Systeme werden im Config-Editor in `data/e3dc_v4.json` konfiguriert.
@@ -267,10 +290,14 @@ Pfad bewährt:
   eines frischen, zeitlich nachfolgenden 0-A-/0-W-Gerätereadbacks geschlossen
   werden. Dieser Recoverypfad sendet keinen neuen Hardwarebefehl. Mehrdeutige
   oder fremde Generationen bleiben gesperrt.
-* **1-Phasen-Fallback:** Wenn die Pro oder das Fahrzeug nach einem
-  3-phasigen Ziel nicht plausibel auf 3-phasig wechselt, behandelt das System
-  die Session als 1-phasig. Das verhindert Endlosschleifen bei Fahrzeugen mit
-  reinem 1-Phasen-Lader.
+* **Phasen für das Budget:** Eine fehlende oder gesperrte Umschaltfreigabe
+  bedeutet nicht, dass einphasig geladen wird. Strom und Mindestleistung
+  werden mit der belegten Phasenzahl berechnet; ohne passende Evidenz bleibt
+  die Berechnung konservativ. Drei Phasen benötigen bei 6 A und nominell
+  230 V etwa 4,14 kW, nicht 1,38 kW. Ein bekannter einphasiger Fahrzeuglader
+  oder eine bestätigte einphasige Last wird weiterhin einphasig behandelt.
+  Zwei tatsächlich genutzte Phasen werden nicht auf eine Phase reduziert.
+  Ein Auftrag, die Phasen unverändert zu lassen, löst keine Umschaltung aus.
 * **CP-Interrupt nur als Weckruf:** `cp_interrupt=true` wird nicht für den
   normalen Phasenwechsel genutzt. Er ist ein gezielter Wakeup, wenn ein
   angestecktes Fahrzeug trotz freigegebener Leistung eingeschlafen ist.

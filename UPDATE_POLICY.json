@@ -1,9 +1,9 @@
 {
-  "version": "5.4.5a",
+  "version": "5.4.5b",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.5a",
-  "release_date": "2026-09-04",
-  "description": "v5.4.5a - frische openWB-SoC-Anzeige, gebundene Update-Recovery und sicher beendete Docker-Clientprozesse",
+  "stable_release": "v5.4.5b",
+  "release_date": "2026-09-06",
+  "description": "v5.4.5b - Wallbox-Budget, Fahrzeug-SoC und konsistente Speicher- und PV-Prognosen",
   "update_strategy": "backup_replace_restart_v1",
   "installer_requires": "python3",
   "sanitized_republication": false,

@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.5a Stable</span>
+            <span class="badge bg-success text-light">v5.4.5b Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.5a</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.5b</code> in <code>.env</code> gesetzt.</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
 if [ -f ./docker_compose_update.py ]; then
   E3DC_DOCKER_HELPER=./docker_compose_update.py
@@ -212,6 +212,26 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                         <li>Nach der Freigabe im Account den RESTful API Security Token erzeugen.</li>
                         <li>Im Config-Editor unter <em>Tarif</em> den ENTSO-E-Token als Fallback-Token eintragen und mit <em>ENTSO-E testen</em> prüfen.</li>
                     </ol>
+                </div>
+            </div>
+        </div>
+
+        <h4 class="mb-4 text-accent"><i class="fas fa-screwdriver-wrench me-2"></i>Stable 5.4.5b: Wallbox-Budget, Fahrzeug-SoC und Prognosen</h4>
+        <div class="col-12 faq-item" data-tags="5.4.5b stable wallbox budget phasen openwb pro soc cloud bluelink prognose direktvermarktung reserve regelruhe rechte">
+            <div class="card bg-card border-0 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <span class="tag">5.4.5b</span>
+                        Was verbessert das Wartungsrelease 5.4.5b?
+                    </h5>
+                    <ul>
+                        <li><strong>Wallboxbudget:</strong> Nach frisch bestätigten 0 W verwendet die begrenzte Bilanzkorrektur zeitlich passende Netz- und Batteriewerte. Ein bereits finanzierter Reserveanteil kann zur selben weiterhin freigegebenen Stecksession zurückkehren, ohne andere Verbraucher doppelt zu belasten. Die Netz- und Akku-Wh-Wächter bleiben wirksam.</li>
+                        <li><strong>Phasen und Fahrzeugkommunikation:</strong> Eine gesperrte Umschaltung ist kein Nachweis für einphasiges Laden. Mindestleistung und Strom folgen der belegten Phasenzahl. E3DC-Control stellt die Pro-Fahrzeugkommunikation nicht automatisch um.</li>
+                        <li><strong>Fahrzeug-SoC:</strong> Ein passend zugeordneter bestätigter Cloudwert kann die Pro-Stecksession verankern; geladene Energie schreibt ihn als Schätzung weiter. Quelle und Quellalter bleiben sichtbar. Ein automatischer Abruf bei fehlendem SoC betrifft nur das eingerichtete Fahrzeug und respektiert <code>Aus</code>, Pause und Cloudintervall.</li>
+                        <li><strong>DV-Vorschau:</strong> Abgelehnte Verkaufskandidaten lassen die normale Hausversorgung als Basisplan bestehen. Gewählte Fenster, Speicherplatz und Restslotenergie werden zusammenhängend berechnet. Wetterpotenzial und betriebliche PV-Annahme bleiben getrennt; eine Vorschau ist kein Nachweis einer bereits ausgeführten Lade- oder Verkaufsaktion.</li>
+                        <li><strong>Reserve und Diagnose:</strong> Die Notstromreserve bleibt hart geschützt; ihre Wiederfreigabe benötigt bestätigte Erholung. PV- und Regelruhe-Diagnose nennen Messlücken und Modellgrenzen genauer und verändern nicht selbstständig die Regelung. Die Statistikarchivierung erhält die gemeinsamen Datenrechte.</li>
+                    </ul>
+                    <p>Der bisherige Web- und Docker-Updateweg bleibt erhalten. Nach erfolgreichem Update bitte die Seite neu laden. Unbekannte zukünftige Abregelvorgaben bleiben offen; dieses Release führt keine vollständige Luox-Gesamtsteuerung ein.</p>
                 </div>
             </div>
         </div>

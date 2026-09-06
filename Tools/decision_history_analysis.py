@@ -141,6 +141,133 @@ MAX_ARCHIVE_MEMBER_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_COMPRESSION_RATIO = 100
 MAX_DECODED_RECORD_BYTES = 64 * 1024 * 1024
 
+HISTORY_COVERAGE_COUNTS = (
+    "context_records", "decision_records", "invalid_records", "aggregated_records",
+    "aggregated_samples", "aggregated_transitions", "archive_gap_records",
+)
+EVIDENCE_REASON_CODES = (
+    "malformed_record", "invalid_timestamp", "invalid_history_metadata",
+    "unknown_record_format", "aggregated_interval", "archive_gap", "record_limit_reached",
+    "legacy_output_contract_missing", "output_contract_invalid", "readback_stale",
+    "output_unconfirmed", "transaction_binding_invalid", "live_contract_missing",
+    "live_contract_invalid", "heatpump_observation_missing", "executor_binding_evidence_missing",
+)
+STORAGE_OUTPUT_COUNTS = (
+    "confirmed_observations", "confirmed_output_changes", "confirmed_new_output_records",
+    "retained_readback_records",
+)
+
+
+def _coverage_record() -> Dict[str, Any]:
+    return {**{key: 0 for key in HISTORY_COVERAGE_COUNTS}, "reasons": {}}
+
+
+def _coverage_reason(coverage: Dict[str, Any], reason: str) -> None:
+    reasons = coverage.setdefault("reasons", {})
+    reasons[reason] = reasons.get(reason, 0) + 1
+
+
+def _is_history_context(record: Dict[str, Any]) -> bool:
+    metadata = record.get("_history") if isinstance(record.get("_history"), dict) else {}
+    context = record.get("context")
+    return bool(
+        metadata.get("schema_version") == "decision_history_v2"
+        and metadata.get("record_type") == "context"
+        and isinstance(metadata.get("context_id"), str) and metadata["context_id"].strip()
+        and set(metadata) <= {"schema_version", "record_type", "context_id"}
+        and isinstance(context, dict)
+        and record.get("service") in ("storage_manager", "wallbox_manager", "energy_manager")
+        and context.get("service") == record.get("service")
+        and not any(key in record for key in ("decision", "inputs", "rscp_execution", "wallboxes", "heatpump"))
+    )
+
+
+def _history_observation(record: Dict[str, Any], service: str, coverage: Dict[str, Any]) -> bool:
+    """Trennt Archivmetadaten von beobachteten Entscheidungen, ohne Lücken zu verdecken."""
+    if record.get("_analysis_input_error") is True:
+        coverage["invalid_records"] += 1
+        _coverage_reason(coverage, "malformed_record")
+        return False
+    history = record.get("_history")
+    metadata = history if isinstance(history, dict) else {}
+    record_type = metadata.get("record_type")
+    timestamp = _parse_ts_s(record.get("ts", record.get("time")), float("nan"))
+    if isinstance(record.get("ts"), bool) or not math.isfinite(timestamp) or timestamp <= 0:
+        coverage["invalid_records"] += 1
+        _coverage_reason(coverage, "invalid_timestamp")
+        # Zeitlose EMS-Datensätze können einen fachlichen Widerspruch belegen,
+        # erhalten aber keinen erfundenen Zeitpunkt auf der Ereignisachse.
+        return service == "ems" and record.get("schema") == "ems_decision_v1"
+    expected_service = {"storage": "storage_manager", "wallbox": "wallbox_manager", "heatpump": "energy_manager"}.get(service)
+    metadata_valid = bool(
+        metadata.get("schema_version") == "decision_history_v2"
+        and isinstance(record_type, str)
+        and record_type in {"context", "transition", "sample", "summary"}
+        and isinstance(metadata.get("context_id"), str)
+        and metadata["context_id"].strip()
+    )
+    if _is_history_context(record) and record.get("service") == expected_service:
+        coverage["context_records"] += 1
+        return False
+    invalid_metadata = history is not None and (not metadata_valid or record_type == "context")
+    if invalid_metadata:
+        coverage["invalid_records"] += 1
+        _coverage_reason(coverage, "invalid_history_metadata")
+    if record.get("service") not in (None, expected_service) and service != "ems":
+        if not invalid_metadata:
+            coverage["invalid_records"] += 1
+        _coverage_reason(coverage, "unknown_record_format")
+        return False
+    observation = (
+        isinstance(record.get("decision"), dict) and bool(record["decision"])
+        or service == "wallbox" and isinstance(record.get("wallboxes"), list)
+        or service == "heatpump" and isinstance(record.get("heatpump"), dict) and bool(record["heatpump"])
+        or service == "ems" and record.get("schema") == "ems_decision_v1"
+    )
+    if not observation:
+        if not invalid_metadata:
+            coverage["invalid_records"] += 1
+        _coverage_reason(coverage, "unknown_record_format")
+        return False
+    runtime = record.get("_history_runtime") if isinstance(record.get("_history_runtime"), dict) else {}
+    markers = [source["evidence_limit"] for source in (metadata, runtime)
+               if source.get("evidence_limit") is not None and source.get("evidence_limit") is not False]
+    valid_gap = any(
+        isinstance(marker, dict) and marker.get("schema_version") == "history_evidence_limit_v1"
+        and marker.get("status") == "EVIDENCE_LIMIT" for marker in markers
+    )
+    if any(
+        not isinstance(marker, dict) or marker.get("schema_version") != "history_evidence_limit_v1"
+        or marker.get("status") != "EVIDENCE_LIMIT" for marker in markers
+    ):
+        if not invalid_metadata:
+            coverage["invalid_records"] += 1
+            _coverage_reason(coverage, "invalid_history_metadata")
+            invalid_metadata = True
+    if valid_gap:
+        coverage["archive_gap_records"] += 1
+        _coverage_reason(coverage, "archive_gap")
+    if "coalesced" in metadata or record_type == "summary":
+        summary = metadata.get("coalesced") if isinstance(metadata.get("coalesced"), dict) else {}
+        coverage["aggregated_records"] += 1
+        _coverage_reason(coverage, "aggregated_interval")
+        # Min/Max und eine Übergangszahl ergeben keine zeitliche Befehlsfolge.
+        summary_valid = bool(
+            summary.get("schema_version") == "history_coalesced_summary_v1"
+            and all(isinstance(summary.get(key), int) and not isinstance(summary.get(key), bool)
+                    and summary[key] >= 0 for key in ("count", "transition_count", "first_ts", "last_ts"))
+            and summary.get("count", 0) > 0
+            and summary.get("transition_count", 0) <= summary.get("count", 0)
+            and summary.get("first_ts", 0) <= summary.get("last_ts", 0)
+        )
+        if summary_valid:
+            coverage["aggregated_samples"] += summary["count"]
+            coverage["aggregated_transitions"] += summary["transition_count"]
+        elif not invalid_metadata:
+            coverage["invalid_records"] += 1
+            _coverage_reason(coverage, "invalid_history_metadata")
+    return True
+
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -201,14 +328,17 @@ def _decode_jsonl_bytes(data: bytes) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
     for line in text.splitlines():
         line = line.strip()
-        if not line or not line.startswith("{"):
+        if not line:
             continue
         try:
             value = json.loads(line)
         except Exception:
+            records.append({"_analysis_input_error": True})
             continue
         if isinstance(value, dict):
             records.append(value)
+        else:
+            records.append({"_analysis_input_error": True})
     return records
 
 
@@ -217,27 +347,24 @@ def _json_records_from_value(value: Any, service: Optional[str]) -> List[Dict[st
         if isinstance(value, dict):
             if value.get("schema") == "ems_decision_surface_v1":
                 actors = value.get("actors") if isinstance(value.get("actors"), dict) else {}
-                return [record for _, record in sorted(actors.items()) if isinstance(record, dict)]
+                return [record if isinstance(record, dict) else {"_analysis_input_error": True}
+                        for _, record in sorted(actors.items())]
             if value.get("schema") == "ems_decision_v1":
                 return [value]
             records = value.get("records") if isinstance(value.get("records"), list) else value.get("items")
             if isinstance(records, list):
-                return [
-                    record for record in records
-                    if isinstance(record, dict) and record.get("schema") == "ems_decision_v1"
-                ]
-            return []
+                return [record if isinstance(record, dict) else {"_analysis_input_error": True}
+                        for record in records]
+            return [{"_analysis_input_error": True}]
         if isinstance(value, list):
-            return [
-                record for record in value
-                if isinstance(record, dict) and record.get("schema") == "ems_decision_v1"
-            ]
-        return []
+            return [record if isinstance(record, dict) else {"_analysis_input_error": True}
+                    for record in value]
+        return [{"_analysis_input_error": True}]
     if isinstance(value, dict):
         return [value]
     if isinstance(value, list):
-        return [item for item in value if isinstance(item, dict)]
-    return []
+        return [item if isinstance(item, dict) else {"_analysis_input_error": True} for item in value]
+    return [{"_analysis_input_error": True}]
 
 
 def _read_records_from_bytes(name: str, data: bytes, service: Optional[str]) -> List[Dict[str, Any]]:
@@ -245,7 +372,7 @@ def _read_records_from_bytes(name: str, data: bytes, service: Optional[str]) -> 
         try:
             value = json.loads(data.decode("utf-8", "replace"))
         except Exception:
-            return []
+            return [{"_analysis_input_error": True}]
         return _json_records_from_value(value, service)
     return _decode_jsonl_bytes(data)
 
@@ -331,21 +458,29 @@ def load_diagnose_records(
     *,
     services: Optional[Iterable[str]] = None,
     limit_per_service: Optional[int] = None,
+    history_coverage: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Lädt Entscheidungsverläufe aus Diagnose-ZIP, Verzeichnis oder Einzeldatei."""
 
     selected = set(_normalize_services(services))
     path = Path(input_path)
     records: Dict[str, List[Dict[str, Any]]] = {service: [] for service in selected}
+    coverage = history_coverage if history_coverage is not None else {}
+    for service in selected:
+        coverage[service] = _coverage_record()
 
     def add(service: Optional[str], source_records: Sequence[Dict[str, Any]]) -> None:
         if not service or service not in selected:
             return
         bucket = records.setdefault(service, [])
         for record in source_records:
+            if not _history_observation(record, service, coverage[service]):
+                continue
             if limit_per_service is not None and len(bucket) >= int(limit_per_service):
-                break
+                _coverage_reason(coverage[service], "record_limit_reached")
+                continue
             bucket.append(record)
+            coverage[service]["decision_records"] += 1
 
     if path.is_file() and path.stat().st_size > MAX_ARCHIVE_BYTES:
         raise ValueError("diagnose archive exceeds the upload size limit")
@@ -436,6 +571,8 @@ def _ordered_history_records(records: Iterable[Dict[str, Any]]) -> List[Tuple[Di
     ordered: List[Tuple[float, int, Dict[str, Any]]] = []
     for index, record in enumerate(records):
         if not isinstance(record, dict):
+            continue
+        if _is_history_context(record):
             continue
         ts = _parse_ts_s(record.get("ts", record.get("time")), 1_800_000_000.0 + index * 10.0)
         ordered.append((float(ts), index, record))
@@ -785,12 +922,12 @@ def _storage_execution_output_info(record: Dict[str, Any], decision: Dict[str, A
     )
     proof = str(contract.get("evidence") or "").strip()
     proof_valid = proof in ("confirmed_new_output", "retained_readback")
-    direct_confirmed_status = contract.get("readback_status") in {
+    direct_confirmed_status = contract.get("readback_status") in (
         "confirmed",
         "confirmed_bounded_zero",
         "confirmed_nonoptimal",
         "confirmed_from_get_ack_unknown",
-    }
+    )
     transaction_delta = contract.get("transaction_set_request_delta")
     transaction_delta_valid = bool(
         isinstance(transaction_delta, int)
@@ -880,12 +1017,27 @@ def _storage_execution_output_info(record: Dict[str, Any], decision: Dict[str, A
         # bleiben auswertbar, dürfen aber keinen Hardwareausgang vortäuschen.
         evidence = "missing"
         output_key = ""
+    reason = None
+    if not evidence_valid:
+        if "rscp_execution" not in record:
+            reason = "legacy_output_contract_missing"
+        elif not schema_valid or not typed_readback:
+            reason = "output_contract_invalid"
+        elif contract.get("readback_fresh") is False:
+            reason = "readback_stale"
+        elif proof == "issued_unconfirmed" or contract.get("unconfirmed_other_write") is True:
+            reason = "output_unconfirmed"
+        elif contract.get("readback_confirmed") is not True:
+            reason = "output_unconfirmed"
+        else:
+            reason = "transaction_binding_invalid"
     return {
         "execution_class": execution_class if evidence_valid else "",
         "output_signature": output_signature if evidence_valid else "",
         "output_key": output_key,
         "output_evidence": evidence,
         "output_proof": proof or None,
+        "output_evidence_reason": reason,
     }
 
 
@@ -1010,6 +1162,17 @@ def _contract_bool(value: Any, default: bool = False) -> bool:
     return _truthy(value)
 
 
+def _typed_contract_bool(value: Any) -> Optional[bool]:
+    """Fehlende oder anders typisierte Belege sind weder wahr noch falsch."""
+    return value if isinstance(value, bool) else None
+
+
+def _typed_contract_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(float(value)) else None
+
+
 def _budget_executor_output_flags(gate: Dict[str, Any], latch: Dict[str, Any], ack: Dict[str, Any]) -> Dict[str, bool]:
     return {
         "would_write_consumer_allocations": any(
@@ -1046,7 +1209,7 @@ def _storage_budget_executor_shadow_info(record: Dict[str, Any]) -> Dict[str, An
         _first_non_empty(r5.get("budget_executor_ack_expected_source"), ack.get("expected_ack_source"))
         or "storage_budget_executor"
     ).strip()
-    source_allowed = _contract_bool(
+    source_allowed = ack_source in BUDGET_EXECUTOR_ACK_SOURCES and _contract_bool(
         _first_non_empty(ack.get("ack_source_allowed"), ack_source in BUDGET_EXECUTOR_ACK_SOURCES),
         ack_source in BUDGET_EXECUTOR_ACK_SOURCES,
     )
@@ -1069,6 +1232,7 @@ def _storage_budget_executor_shadow_info(record: Dict[str, Any]) -> Dict[str, An
     return {
         "present": True,
         "gate_class": gate_class,
+        "gate_data_valid": _typed_contract_bool(gate.get("data_valid")),
         "gate_open_shadow": _contract_bool(
             _first_non_empty(r5.get("budget_executor_gate_open_shadow"), gate.get("gate_open_shadow"))
         ),
@@ -1080,6 +1244,12 @@ def _storage_budget_executor_shadow_info(record: Dict[str, Any]) -> Dict[str, An
         ),
         "latch_sink": latch_sink,
         "latch_target_w": latch_target_w,
+        "latch_hold_previous": _typed_contract_bool(latch.get("hold_previous_output_shadow")),
+        "latch_release_allowed": _typed_contract_bool(latch.get("release_allowed_shadow")),
+        "latch_safety_release": _typed_contract_bool(latch.get("safety_release")),
+        "latch_hold_remaining_s": _typed_contract_number(latch.get("hold_remaining_s")),
+        "latch_age_s": _typed_contract_number(latch.get("accepted_age_s")),
+        "latch_min_runtime_s": _typed_contract_number(latch.get("min_runtime_s")),
         "ack_class": ack_class,
         "ack_required_shadow": _contract_bool(
             _first_non_empty(r5.get("budget_executor_ack_required_shadow"), ack.get("ack_required_shadow"))
@@ -1092,9 +1262,11 @@ def _storage_budget_executor_shadow_info(record: Dict[str, Any]) -> Dict[str, An
         "ack_source_allowed": bool(source_allowed),
         "ack_sink": str(ack.get("ack_sink") or "none"),
         "ack_target_w": ack_target_w,
-        "sink_matches": _contract_bool(ack.get("sink_matches"), ack_class != "ack_confirmed_shadow"),
-        "target_matches": _contract_bool(ack.get("target_matches"), ack_class != "ack_confirmed_shadow"),
-        "signature_matches": _contract_bool(ack.get("signature_matches"), ack_class != "ack_confirmed_shadow"),
+        "sink_matches": _typed_contract_bool(ack.get("sink_matches")),
+        "target_matches": _typed_contract_bool(ack.get("target_matches")),
+        "signature_matches": _typed_contract_bool(ack.get("signature_matches")),
+        "ack_age_s": _typed_contract_number(ack.get("ack_age_s")),
+        "ack_timeout_s": _typed_contract_number(ack.get("ack_timeout_s")),
         "productive_allowed_shadow": _contract_bool(
             _first_non_empty(
                 r5.get("budget_executor_ack_productive_allowed_shadow"),
@@ -1156,6 +1328,35 @@ def storage_budget_executor_shadow_events(records: Iterable[Dict[str, Any]]) -> 
     return events
 
 
+def _budget_executor_hold_evidence(event: Dict[str, Any]) -> Optional[bool]:
+    """Ein geschlossenes Gate erlaubt nur den belegten, zeitbegrenzten Alt-Halt."""
+    if event.get("latch_class") not in {"release_blocked_min_runtime", "switch_blocked_min_runtime"}:
+        return False
+    if event.get("gate_class") in {"blocked_import_guard", "blocked_data_quality"}:
+        return False
+    required_bools = {
+        "gate_data_valid": True, "latch_hold_previous": True,
+        "latch_release_allowed": False, "latch_safety_release": False,
+    }
+    if any(event.get(key) is not None and event.get(key) is not expected for key, expected in required_bools.items()):
+        return False
+    remaining = event.get("latch_hold_remaining_s")
+    age = event.get("latch_age_s")
+    minimum = event.get("latch_min_runtime_s")
+    if remaining is not None and remaining <= 0:
+        return False
+    if age is not None and age < 0:
+        return False
+    if minimum is not None and minimum <= 0:
+        return False
+    if all(value is not None for value in (remaining, age, minimum)):
+        if age >= minimum or abs(age + remaining - minimum) > 0.2:
+            return False
+    if any(event.get(key) is None for key in required_bools) or any(value is None for value in (remaining, age, minimum)):
+        return None
+    return bool(event.get("latch_sink") in {"wallbox", "heatpump"} and event.get("latch_target_w", 0) > 0)
+
+
 def detect_storage_budget_executor_shadow(events: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     timeline = sorted(
         [event for event in events if isinstance(event, dict)],
@@ -1164,6 +1365,7 @@ def detect_storage_budget_executor_shadow(events: Iterable[Dict[str, Any]]) -> D
     counts: Dict[str, int] = {"records": len(timeline)}
     violations: List[Dict[str, Any]] = []
     for event in timeline:
+        evidence_missing = False
         gate_class = str(event.get("gate_class") or "none")
         latch_class = str(event.get("latch_class") or "none")
         ack_class = str(event.get("ack_class") or "none")
@@ -1199,22 +1401,32 @@ def detect_storage_budget_executor_shadow(events: Iterable[Dict[str, Any]]) -> D
             })
         if ack_valid and not ack_source_allowed:
             violations.append({"type": "budget_executor_ack_valid_from_invalid_source", "event": event})
-        if ack_valid and not (
-            bool(event.get("sink_matches"))
-            and bool(event.get("target_matches"))
-            and bool(event.get("signature_matches"))
-        ):
-            violations.append({"type": "budget_executor_ack_valid_without_exact_match", "event": event})
-        if productive_allowed and not (gate_open and latch_active and ack_valid and ack_source_allowed):
+        matches = [event.get(key) for key in ("sink_matches", "target_matches", "signature_matches")]
+        if ack_valid:
+            if any(value is False for value in matches):
+                violations.append({"type": "budget_executor_ack_valid_without_exact_match", "event": event})
+            if any(value is None for value in matches):
+                evidence_missing = True
+            age, timeout = event.get("ack_age_s"), event.get("ack_timeout_s")
+            if age is None or timeout is None:
+                evidence_missing = True
+            elif age < 0 or timeout <= 0 or age > timeout:
+                violations.append({"type": "budget_executor_ack_valid_but_stale", "event": event})
+        gate_or_hold = True if gate_open else _budget_executor_hold_evidence(event)
+        if (productive_allowed or runtime_active) and gate_or_hold is None:
+            evidence_missing = True
+        if productive_allowed and (not (latch_active and ack_valid and ack_source_allowed) or gate_or_hold is False):
             violations.append({"type": "budget_executor_productive_without_valid_ack", "event": event})
         if productive_allowed and ack_class != "ack_confirmed_shadow":
             violations.append({"type": "budget_executor_productive_without_confirmed_class", "event": event})
         if runtime_active and not runtime_enabled:
             violations.append({"type": "ems_budget_runtime_active_while_disabled", "event": event})
-        if runtime_active and not (gate_open and latch_active and ack_valid and ack_source_allowed and productive_allowed):
+        if runtime_active and (not (latch_active and ack_valid and ack_source_allowed and productive_allowed) or gate_or_hold is False):
             violations.append({"type": "ems_budget_runtime_active_without_confirmed_executor", "event": event})
         if runtime_safe_fallback and runtime_active:
             violations.append({"type": "ems_budget_runtime_active_during_safe_fallback", "event": event})
+        if evidence_missing:
+            counts["executor_evidence_limit"] = counts.get("executor_evidence_limit", 0) + 1
     return {"ok": not violations, "violations": violations, "counts": counts}
 
 
@@ -1571,6 +1783,19 @@ def _storage_live_data_info(record: Dict[str, Any], decision: Dict[str, Any]) ->
     if "usable_for_budget" in power:
         sample_values.append(_contract_bool(power.get("usable_for_budget"), True))
 
+    evidence_values = [
+        value
+        for source, keys in (
+            (inputs, ("live_sample_valid", "live_stale", "home_power_valid", "grid_power_valid")),
+            (decision, ("live_sample_valid", "live_sample_invalid")),
+            (power, ("sample_valid", "usable_for_budget")),
+            *((event, ("sample_valid", "stale")) for event in critical_events),
+        )
+        for key in keys if key in source
+        for value in (source[key],)
+    ]
+    typed_live_evidence = bool(evidence_values) and all(isinstance(value, bool) for value in evidence_values)
+
     live_sample_valid: Optional[bool] = all(sample_values) if sample_values else None
     live_stale: Optional[bool] = any(stale_values) if stale_values else None
     home_power_valid = (
@@ -1594,11 +1819,9 @@ def _storage_live_data_info(record: Dict[str, Any], decision: Dict[str, Any]) ->
         "live_stale": live_stale,
         "home_power_valid": home_power_valid,
         "grid_power_valid": grid_power_valid,
-        "typed_live_evidence": bool(
-            sample_values
-            or stale_values
-            or "home_power_valid" in inputs
-            or "grid_power_valid" in inputs
+        "typed_live_evidence": typed_live_evidence,
+        "live_evidence_reason": (
+            None if typed_live_evidence else "live_contract_invalid" if evidence_values else "live_contract_missing"
         ),
         "invalid": invalid,
     }
@@ -1759,19 +1982,23 @@ def detect_storage_live_plausibility_impact(events: Iterable[Dict[str, Any]]) ->
     }
 
 
-def _storage_evidence_contract(records: Iterable[Dict[str, Any]]) -> Dict[str, int]:
+def _storage_evidence_contract(records: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     """Zählt fehlende typisierte Evidenz ohne überlappende History-Records doppelt zu werten."""
 
-    seen: set[Tuple[Any, ...]] = set()
+    seen: set[str] = set()
     total = 0
     live_typed_missing = 0
     output_typed_missing = 0
+    reasons: Dict[str, int] = {}
+    output_counts = {key: 0 for key in STORAGE_OUTPUT_COUNTS}
+    previous_output_key = ""
     for record, ts in _ordered_history_records(records):
         decision = _decision(record)
         inputs = _inputs(record)
         target = _storage_target_history(record)
         output = _storage_execution_output_info(record, decision)
-        fingerprint = (
+        live_info = _storage_live_data_info(record, decision)
+        fingerprint = json.dumps((
             float(ts),
             inputs.get("live_sample_valid"),
             inputs.get("live_stale"),
@@ -1781,19 +2008,37 @@ def _storage_evidence_contract(records: Iterable[Dict[str, Any]]) -> Dict[str, i
             target.get("value_signature"),
             output.get("output_key"),
             output.get("output_evidence"),
-        )
+            output.get("output_evidence_reason"),
+            live_info.get("live_evidence_reason"),
+        ), sort_keys=True, separators=(",", ":"))
         if fingerprint in seen:
             continue
         seen.add(fingerprint)
         total += 1
-        if not bool(_storage_live_data_info(record, decision).get("typed_live_evidence")):
+        if not live_info.get("typed_live_evidence"):
             live_typed_missing += 1
         if output.get("output_evidence") != "typed":
             output_typed_missing += 1
+        for reason in (live_info.get("live_evidence_reason"), output.get("output_evidence_reason")):
+            if reason:
+                reasons[reason] = reasons.get(reason, 0) + 1
+        if output.get("output_evidence") == "typed":
+            output_counts["confirmed_observations"] += 1
+            proof = output.get("output_proof")
+            if proof == "confirmed_new_output":
+                output_counts["confirmed_new_output_records"] += 1
+            elif proof == "retained_readback":
+                output_counts["retained_readback_records"] += 1
+            output_key = str(output.get("output_key") or "")
+            if previous_output_key and output_key != previous_output_key:
+                output_counts["confirmed_output_changes"] += 1
+            previous_output_key = output_key
     return {
         "records": total,
         "storage_live_typed_missing": live_typed_missing,
         "storage_output_typed_missing": output_typed_missing,
+        "reasons": reasons,
+        "output_counts": output_counts,
     }
 
 
@@ -1924,6 +2169,8 @@ def _heatpump_action(record: Dict[str, Any]) -> str:
         return "BOOST"
     if bool(decision.get("pv_pause_active")) or bool(decision.get("pre_pause_active")) or bool(heatpump.get("protect_block")):
         return "OFF"
+    if any(heatpump.get(key) is False for key in ("power_known", "source_fresh", "status_valid")):
+        return ""
     observed_running = bool(
         _safe_float(heatpump.get("wp_power_w"), 0.0) > 300.0
         or bool(heatpump.get("accepting_power"))
@@ -1932,18 +2179,26 @@ def _heatpump_action(record: Dict[str, Any]) -> str:
         return "RUN"
     if observed_running:
         return "OBS_RUN"
-    return "OBS_OFF"
+    power = heatpump.get("wp_power_w")
+    if (
+        isinstance(power, (int, float)) and not isinstance(power, bool)
+        and math.isfinite(float(power)) and power >= 0
+        and heatpump.get("power_known") is not False
+        and heatpump.get("source_fresh") is not False
+        and heatpump.get("status_valid") is not False
+    ):
+        return "OBS_OFF"
+    return ""
 
 
 def heatpump_records_to_events(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     events: List[Dict[str, Any]] = []
     last: Dict[str, str] = {}
-    for index, record in enumerate(records):
+    for record, ts in _ordered_history_records(records):
         decision = _decision(record)
         inputs = _inputs(record)
         heatpump = record.get("heatpump") if isinstance(record.get("heatpump"), dict) else {}
         pause_request = inputs.get("heatpump_pause_request") if isinstance(inputs.get("heatpump_pause_request"), dict) else {}
-        ts = _parse_ts_s(record.get("ts", record.get("time")), 1_800_000_000.0 + index * 10.0)
         reason = _reason_text(
             decision.get("reason"),
             decision.get("state"),
@@ -1975,7 +2230,9 @@ def ems_decision_records_to_events(records: Iterable[Dict[str, Any]]) -> List[Di
             continue
         actor = str(record.get("actor") or f"ems:{index}").strip() or f"ems:{index}"
         decision = str(record.get("decision") or "observe").strip().lower()
-        ts = _parse_ts_s(record.get("ts", record.get("time")), 1_800_000_000.0 + index * 10.0)
+        ts = _parse_ts_s(record.get("ts", record.get("time")), float("nan"))
+        if isinstance(record.get("ts"), bool) or not math.isfinite(ts) or ts <= 0:
+            continue
         reason = _reason_text(
             record.get("user_text"),
             ",".join(str(item) for item in record.get("blockers", []) if item) if isinstance(record.get("blockers"), list) else "",
@@ -2070,15 +2327,24 @@ def analyze_decision_history(
     limit_per_service: Optional[int] = None,
 ) -> Dict[str, Any]:
     selected = _normalize_services(services)
-    records = load_diagnose_records(input_path, services=selected, limit_per_service=limit_per_service)
+    history_coverage: Dict[str, Any] = {}
+    records = load_diagnose_records(
+        input_path, services=selected, limit_per_service=limit_per_service,
+        history_coverage=history_coverage,
+    )
+    for service in selected:
+        history_coverage.setdefault(service, _coverage_record())["decision_records"] = len(records.get(service, []))
     missing_services = [service for service in selected if len(records.get(service, [])) <= 0]
     analyzed_services = [service for service in selected if service not in missing_services]
-    if not analyzed_services:
+    if not analyzed_services and not any(
+        item.get("context_records") or item.get("invalid_records") for item in history_coverage.values()
+    ):
         raise ValueError("missing supported decision records for requested services")
     events: Dict[str, List[Dict[str, Any]]] = {}
     checks: Dict[str, Dict[str, Any]] = {}
     effective_min_gap_s: Dict[str, int] = {}
     evidence_limits: Dict[str, int] = {}
+    storage_output_counts: Dict[str, int] = {}
 
     if "wallbox" in analyzed_services:
         start_events, phase_events = wallbox_records_to_events(records.get("wallbox", []))
@@ -2099,6 +2365,8 @@ def analyze_decision_history(
     if "storage" in analyzed_services:
         storage_records = records.get("storage", [])
         storage_evidence = _storage_evidence_contract(storage_records)
+        history_coverage["storage"]["reasons"].update(storage_evidence["reasons"])
+        storage_output_counts = storage_evidence["output_counts"]
         evidence_limits["storage_live_typed_missing"] = storage_evidence["storage_live_typed_missing"]
         evidence_limits["storage_output_typed_missing"] = storage_evidence["storage_output_typed_missing"]
         storage_events = storage_records_to_events(storage_records)
@@ -2151,6 +2419,10 @@ def analyze_decision_history(
         if storage_evidence["storage_live_typed_missing"]:
             checks["storage_live_plausibility"]["counts"]["typed_live_evidence_limit"] = storage_evidence["storage_live_typed_missing"]
         checks["storage_budget_executor_shadow"] = detect_storage_budget_executor_shadow(storage_budget_executor_events)
+        executor_missing = checks["storage_budget_executor_shadow"]["counts"].get("executor_evidence_limit", 0)
+        if executor_missing:
+            evidence_limits["storage_budget_executor_missing"] = executor_missing
+            history_coverage["storage"]["reasons"]["executor_binding_evidence_missing"] = executor_missing
     if "heatpump" in analyzed_services:
         heatpump_events = heatpump_records_to_events(records.get("heatpump", []))
         events["heatpump"] = heatpump_events
@@ -2166,6 +2438,19 @@ def analyze_decision_history(
         effective_min_gap_s["ems_decision"] = int(min_gap_s)
         checks["ems_decision"] = validate_ems_decision_records(records.get("ems", []))
 
+    for record in records.get("heatpump", []):
+        if not _heatpump_action(record):
+            _coverage_reason(history_coverage["heatpump"], "heatpump_observation_missing")
+    limited_history = any(
+        any(reason not in {"legacy_output_contract_missing", "output_contract_invalid", "readback_stale", "output_unconfirmed", "transaction_binding_invalid", "live_contract_missing", "live_contract_invalid"} for reason in item["reasons"])
+        for item in history_coverage.values()
+    )
+    storage_history_limited = bool(
+        "storage" in history_coverage and any(
+            reason in {"malformed_record", "invalid_timestamp", "invalid_history_metadata", "unknown_record_format", "aggregated_interval", "archive_gap", "record_limit_reached"}
+            for reason in history_coverage["storage"]["reasons"]
+        )
+    )
     data_quality_check = checks.get("storage_live_plausibility")
     control_checks = {
         name: check
@@ -2174,7 +2459,7 @@ def analyze_decision_history(
     }
     if not all(check.get("ok", True) for check in control_checks.values()):
         control_status = "FAIL"
-    elif evidence_limits.get("storage_output_typed_missing", 0) > 0:
+    elif evidence_limits.get("storage_output_typed_missing", 0) > 0 or limited_history or not analyzed_services:
         control_status = "EVIDENCE_LIMIT"
     else:
         control_status = "PASS"
@@ -2182,7 +2467,7 @@ def analyze_decision_history(
         data_quality_status = "NOT_ANALYZED"
     elif data_quality_check.get("ok") is not True:
         data_quality_status = "FAIL"
-    elif evidence_limits.get("storage_live_typed_missing", 0) > 0:
+    elif evidence_limits.get("storage_live_typed_missing", 0) > 0 or storage_history_limited:
         data_quality_status = "EVIDENCE_LIMIT"
     elif data_quality_check.get("hints"):
         data_quality_status = "HINT"
@@ -2203,6 +2488,8 @@ def analyze_decision_history(
         "event_samples": {name: value[:12] for name, value in events.items()},
         "effective_min_gap_s": effective_min_gap_s,
         "evidence_limits": evidence_limits,
+        "history_coverage": history_coverage,
+        "storage_output_counts": storage_output_counts,
     }
 
 
@@ -2227,7 +2514,52 @@ _PUBLIC_ACTIONS = {
     "AUTO_GUARD", "INVALID_SAMPLE", "DISCHARGE_OWNER_HOLD", "CHARGE_OWNER_HOLD",
     "WB_MINSOC_HOLD", "AUTO_LIMIT_HOLD", "MANUAL_OVERRIDE_HOLD", "EVIDENCE_LIMIT",
     "PARALLEL_WB_AUTO", "1P", "2P", "3P",
+    "BOOST", "RUN", "OBS_RUN", "OBS_OFF",
 }
+
+# Feste Zählerbezeichnungen; unbekannte Zustands- und Freitexte bleiben gehasht.
+_PUBLIC_EXECUTOR_COUNT_LABELS = {
+    "records": "Datensätze",
+    "executor_evidence_limit": "Unvollständige Bestätigungsbelege",
+    "gate:blocked_import_guard": "Freigabe: Netzbezugsschutz",
+    "gate:blocked_data_quality": "Freigabe: Messwertschutz",
+    "gate:blocked_stability_hold": "Freigabe: Stabilisierung",
+    "gate:blocked_no_sink": "Freigabe: kein Verbraucher",
+    "gate:export_observe_only": "Freigabe: Export nur beobachtet",
+    "gate:storage_reserved_observe_only": "Freigabe: Speicher reserviert",
+    "gate:blocked_no_budget": "Freigabe: kein Budget",
+    "gate:blocked_minimum": "Freigabe: Mindestleistung fehlt",
+    "gate:shadow_ready_wallbox": "Freigabe: Wallbox bereit",
+    "gate:shadow_ready_heatpump": "Freigabe: Wärmepumpe bereit",
+    "gate:blocked_unknown_sink": "Freigabe: unbekannter Verbraucher",
+    "latch:safety_release": "Budgethaltung: Schutzfreigabe",
+    "latch:accepted_new": "Budgethaltung: neu angenommen",
+    "latch:blocked_not_controllable": "Budgethaltung: nicht steuerbar",
+    "latch:idle_closed": "Budgethaltung: inaktiv",
+    "latch:accepted_min_runtime": "Budgethaltung: Mindestlaufzeit",
+    "latch:accepted_runtime_satisfied": "Budgethaltung: Laufzeit erfüllt",
+    "latch:switch_blocked_min_runtime": "Budgethaltung: Wechsel zurückgestellt",
+    "latch:accepted_switch": "Budgethaltung: Wechsel angenommen",
+    "latch:release_blocked_min_runtime": "Budgethaltung: Freigabe zurückgestellt",
+    "latch:release_after_min_runtime": "Budgethaltung: nach Laufzeit freigegeben",
+    "ack:ack_not_required": "Bestätigung: nicht erforderlich",
+    "ack:ack_missing_timeout": "Bestätigung: Zeitüberschreitung",
+    "ack:ack_pending": "Bestätigung: ausstehend",
+    "ack:ack_rejected_source": "Bestätigung: falsche Quelle",
+    "ack:ack_rejected_not_accepted": "Bestätigung: nicht angenommen",
+    "ack:ack_stale": "Bestätigung: veraltet",
+    "ack:ack_rejected_mismatch": "Bestätigung: abweichender Auftrag",
+    "ack:ack_confirmed_shadow": "Bestätigung: gültig",
+}
+
+
+def _public_count_name(value: Any) -> str:
+    text = str(value or "").strip()
+    if text in _PUBLIC_EXECUTOR_COUNT_LABELS:
+        return _PUBLIC_EXECUTOR_COUNT_LABELS[text]
+    if text in _PUBLIC_EXECUTOR_COUNT_LABELS.values():
+        return text
+    return _public_action(text)
 
 
 def _public_hash(value: Any, prefix: str) -> str:
@@ -2350,9 +2682,9 @@ def public_cli_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(check, dict):
             continue
         counts = {
-            _public_action(key): int(value)
+            _public_count_name(key): int(value)
             for key, value in check.get("counts", {}).items()
-            if isinstance(value, (int, float)) and _public_action(key)
+            if isinstance(value, (int, float)) and _public_count_name(key)
         }
         checks[_public_pattern(name)] = {
             "ok": check.get("ok") is True,
@@ -2383,6 +2715,24 @@ def public_cli_summary(summary: Dict[str, Any]) -> Dict[str, Any]:
         _public_pattern(name): int(value)
         for name, value in summary.get("evidence_limits", {}).items()
         if isinstance(value, (int, float))
+    }
+    public["history_coverage"] = {}
+    for service, coverage in summary.get("history_coverage", {}).items():
+        if service not in public["services"] or not isinstance(coverage, dict):
+            continue
+        public["history_coverage"][service] = {
+            key: max(0, int(coverage.get(key, 0)))
+            for key in HISTORY_COVERAGE_COUNTS
+            if isinstance(coverage.get(key, 0), int) and not isinstance(coverage.get(key, 0), bool)
+        }
+        public["history_coverage"][service]["reasons"] = {
+            reason: count for reason, count in coverage.get("reasons", {}).items()
+            if reason in EVIDENCE_REASON_CODES and isinstance(count, int)
+            and not isinstance(count, bool) and count > 0
+        }
+    public["storage_output_counts"] = {
+        key: value for key, value in summary.get("storage_output_counts", {}).items()
+        if key in STORAGE_OUTPUT_COUNTS and isinstance(value, int) and not isinstance(value, bool) and value >= 0
     }
     return public
 

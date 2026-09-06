@@ -1,6 +1,6 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.5a
+> **Stand:** v5.4.5b
 >
 > **Neu in 5.4.5a:** Ein frisch beobachteter openWB-Fahrzeug-SoC kann mit
 > Quelle und Alter rein lesend erscheinen, wenn er zur aktuellen Stecksession
@@ -240,6 +240,26 @@ Storage-Owner:
 Vor jedem Hardwareausgang werden Owner, Plan, Slot, Quellenfrische,
 Notstromreserve und aktueller `POWER_SETTINGS`-Vertrag erneut geprüft.
 
+### Wiederfreigabe nach Erreichen der Notstromreserve
+
+An der Notstromreserve wird die Entladung weiterhin sofort gesperrt. Die
+Wiederfreigabe erfolgt asymmetrisch: Standardmäßig muss der SoC mindestens
+1,5 Prozentpunkte über der Reserve liegen und dort für 30 Sekunden mit
+frischen, fortschreitenden Messungen bestätigt bleiben. Ein einzelner
+SoC-Sprung genügt nicht. Eine vorhandene kleinere Hysterese wird auf mindestens
+1,1 Prozentpunkte angehoben; die harte Reserve selbst wird nicht verändert.
+
+Diese Werte sind konservative Reglereinstellungen, keine Herstellervorgabe.
+Sie verhindern, dass eine in ganzen Prozentpunkten gelieferte SoC-Anzeige die
+Entladesperre ständig löst und kurz darauf erneut setzt. Messlücken,
+veraltete Daten und Uhrsprünge zählen nicht als bestätigte Erholung.
+
+Ein Manager-Neustart übernimmt eine im vorhandenen Ramdisk-Zustand gespeicherte
+Sperre, beginnt die Beobachtungszeit aber neu. Nach einem vollständigen Verlust
+dieses Zustands kann eine frühere Sperre nicht rekonstruiert werden; der
+aktuelle harte Reserveschutz bleibt davon unabhängig aktiv. Im Inselbetrieb
+bleibt die bestehende E3DC-autonome Behandlung unverändert.
+
 Im normalen PV-Betrieb bleibt der E3DC möglichst in `AUTO`. E3DC-Control setzt
 dann nur EMS-Power-Settings:
 
@@ -299,8 +319,11 @@ gesamter PV und zusätzlicher AC-PV ermittelt. Ein externer AC-Wechselrichter
 erhöht diesen Laderahmen nicht. Fehlt der frische Split, bleiben diese
 PV-basierten Ladepfade mit 0 W fail-closed.
 
-Der Manager setzt dafür ausschließlich einen flüchtigen `MAX_CHARGE_POWER`-
-Rahmen. E3/DC bleibt in AUTO und die Entladung für wechselnden Hausverbrauch
+Der Manager setzt dafür einen `MAX_CHARGE_POWER`-Rahmen über
+`EMS_REQ_SET_POWER_SETTINGS`. Für diese Einstellungs-Schnittstelle liegt kein
+belastbarer Nachweis einer ausschließlich flüchtigen Speicherung vor. Sie ist
+nicht mit der temporären Leistungsvorgabe `EMS_REQ_SET_POWER` gleichzusetzen.
+E3/DC bleibt in AUTO und die Entladung für wechselnden Hausverbrauch
 bleibt offen. Die Funktion ist deshalb DC-first, aber keine physikalische
 Garantie für einen ausschließlich internen DC/DC-Energiepfad. Preis- und
 ausdrücklich freigegebenes Netzladen besitzen eigenständige Verträge.
@@ -308,7 +331,7 @@ ausdrücklich freigegebenes Netzladen besitzen eigenständige Verträge.
 ### 3.2 Ladefreigabe bei Kurvenrückstand
 
 Seit 5.4.2a gilt ein `EMS_USER_CHARGE_LIMIT`-Readback aus frischen, validen
-`POWER_SETTINGS` nur dann als reflektierter flüchtiger Laderahmen, wenn
+`POWER_SETTINGS` nur dann als reflektierter Laderahmen, wenn
 `maximumladeleistung` ausdrücklich konfiguriert ist und
 `EMS_USER_CHARGE_LIMIT` sowie `EMS_MAX_CHARGE_POWER` strikt weniger als 50 W
 voneinander abweichen. Fehlt eine dieser Bedingungen oder ist ein Wert
@@ -425,8 +448,9 @@ Zähler-Viertelstunden. Der reine Policy-Baustein integriert nur frische,
 lückenlose Netzpunktmessungen und liefert einen Kandidaten an den zentralen
 Storage Manager.
 
-- Beim Begrenzen und Halten bleibt E3/DC in AUTO; die Regelung setzt nur einen
-  flüchtigen Lade- oder Entladerahmen und fordert keine Netzeinspeisung an.
+- Beim Begrenzen und Halten bleibt E3/DC in AUTO; die Regelung setzt einen
+  Lade- oder Entladerahmen und fordert keine Netzeinspeisung an. Für dessen
+  Speicherung über `POWER_SETTINGS` gilt die Einschränkung aus Abschnitt 3.1.
 - Sicherheitsabstand, Leistungshysterese, SoC-Hysterese und
   Freigabe-Entprellung verhindern Flattern.
 - Der Lastspitzenpuffer liegt oberhalb der physischen Notstromreserve.

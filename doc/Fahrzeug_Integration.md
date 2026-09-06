@@ -29,6 +29,50 @@ Eingabe. Die Wallbox darf trotzdem nach PV, Budget, Preisfenster oder kWh-Ziel
 laden; nur SoC-basierte Abschlüsse und Zielladungen bleiben ohne gesicherten
 Wert aus.
 
+## openWB Pro ohne eigenen Fahrzeug-SoC
+
+Die reine Einstellung **PWM** auf der Maintenance-Seite der Pro bietet keine
+SoC-Abfrage über das Ladekabel. Dafür ist bei einem kompatiblen Fahrzeug
+**PWM mit Fahrzeugerkennung und SoC Auslesung** vorgesehen. Die Hersteller-
+Einstellung muss gespeichert werden und startet die Pro neu. Manche Fahrzeuge
+nehmen nach dieser zusätzlichen Kommunikation vorübergehend keine AC-Ladung
+an; deshalb nicht während einer laufenden Ladung ungeprüft umstellen.
+E3DC-Control ändert diese Geräteinstellung nicht automatisch.
+Die Kabelabfrage erfolgt üblicherweise zum Ladestart, danach wird auch bei
+openWB anhand der geladenen Energie weitergerechnet. Details und Hinweise zur
+Kompatibilität stehen in der [openWB-Herstelleranleitung](https://wiki.openwb.de/doku.php?id=openwb:vc:2.2.0:software:fahrzeug-infos:pro-proplus).
+
+Nicht jeder Ladevorgang liefert über die openWB Pro einen Fahrzeug-SoC.
+Fehlt dieser Wert, kann ein eindeutig zugeordnetes Fahrzeugprofil mit
+bestätigtem Cloud-SoC die laufende Stecksession verankern. Aus der anschließend
+gemessenen Ladeenergie, der eingestellten Akkukapazität und dem Lade-Wirkungsgrad
+wird der SoC weitergerechnet. Das bleibt ein Schätzwert, keine neue Messung
+des Fahrzeugs; der ursprüngliche Quellzeitpunkt wird nicht verjüngt.
+
+Ein fahrzeugseitiges AC-Ladelimit bleibt unabhängig vom Ziel in E3DC-Control
+wirksam. Das Auto kann deshalb bei seinem eigenen Limit aufhören, obwohl
+unsere Hochrechnung noch etwas darunter liegt. Ein Stromangebot allein ist
+kein Beleg einer laufenden Ladung; maßgeblich sind die tatsächlichen
+Phasenströme und die gemessene Ladeleistung. Aus 0 W allein lässt sich weder
+ein erreichtes Fahrzeugziel noch ein Fehler sicher ableiten.
+
+Ein gültiger Anker darf innerhalb derselben Sitzung bis zur bestehenden
+Acht-Stunden-Grenze fortgeführt werden, auch wenn der Roh-Cloudwert für eine
+neue Verankerung inzwischen zu alt wäre. Abstecken, ein zurückgesetzter
+Ladezähler oder eine widersprüchliche Fahrzeugzuordnung erlauben keine
+unveränderte Übernahme in eine neue Sitzung. Liefert die openWB Pro einen
+frischen, bestätigten Geräte-SoC, verwendet die Wallboxregelung diesen direkt
+und baut keinen zusätzlichen Cloud-Schätzanker auf.
+
+Bei aktiv geregelter openWB Pro und eingerichteter Bluelink-Zuordnung kann
+ein fehlender brauchbarer SoC beim Anstecken einen automatischen Abruf für
+genau das zugeordnete Cloudfahrzeug auslösen. Pro Stecksession wird höchstens
+ein Auftrag gestellt; schnelle erneute Steckvorgänge respektieren zusätzlich
+das eingestellte Cloudintervall. Ein vorhandener manueller Abruf wird nicht
+überschrieben. Ausgeschaltete oder manuell pausierte Ladepunkte lösen keinen
+automatischen Abruf aus. Ein Cloudfehler startet keine Wiederholungsschleife
+und verändert weder Ladefreigabe noch Phasen- oder Stromregelung.
+
 ---
 
 ## Weg 1: Der autarke Bluelink-Client (Hyundai & Kia)

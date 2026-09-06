@@ -350,6 +350,7 @@ def _tracker_anchor_state_valid(
     config=None,
     wb_id=None,
     vehicle_key=None,
+    meter_estimation=False,
 ):
     """Prüft einen gespeicherten Trackeranker ohne Zeit-/Wertimputation."""
 
@@ -366,7 +367,12 @@ def _tracker_anchor_state_valid(
     max_age_s = (
         float(CONFIRMED_MANUAL_SOC_MAX_AGE_S)
         if source_text in CONFIRMED_MANUAL_SOC_SOURCES
-        else vehicle_soc_max_age_s(source, config)
+        else vehicle_soc_max_age_s(
+            f"{VEHICLE_ESTIMATED_SOURCE_PREFIX}{source}"
+            if meter_estimation and source_text in VEHICLE_CLOUD_SOC_SOURCES
+            else source,
+            config,
+        )
     )
     if wb_id is not None and state.get("wb") not in (None, ""):
         try:
@@ -1014,7 +1020,51 @@ def _openwb_pro_same_session_sample(
     }
 
 
-def _openwb_pro_profile_binding(config, wb_id, status, selected_id, now=None):
+def _openwb_pro_tracker_session_sample(state, wb_id, profile, profile_aliases,
+                                     plug_session_id, meter_wh, now, config):
+    """Setze nur einen bereits bestätigten Cloud-Zähleranker derselben Session fort."""
+    if not isinstance(state, dict):
+        return None
+    if (
+        state.get("anchor_source") not in VEHICLE_CLOUD_SOC_SOURCES
+        or state.get("soc_profile_bound") is not True
+        or state.get("connected") is not True
+        or state.get("meter_source") != "session_kwh"
+        or state.get("plug_session_id") != plug_session_id
+        or _compact_id(state.get("profile_id")) != _compact_id(profile.get("id"))
+        or not _tracker_anchor_state_valid(
+            state, now=now, config=config, wb_id=wb_id,
+            vehicle_key=profile.get("id"), meter_estimation=True,
+        )
+    ):
+        return None
+    aliases = _compact_aliases(state, ("car_id", "vehicle_id", "profile_id"))
+    anchor_wh = _safe_float(state.get("anchor_meter_wh"), -1.0)
+    last_wh = _safe_float(state.get("last_meter_wh"), -1.0)
+    if (
+        not aliases or not aliases.issubset(profile_aliases)
+        or not math.isfinite(anchor_wh) or anchor_wh < 0.0
+        or not math.isfinite(last_wh) or last_wh < anchor_wh
+        or meter_wh + 0.1 < last_wh
+    ):
+        return None
+    return {
+        "soc": state["anchor_soc"],
+        "ts": state["anchor_sample_ts"],
+        "source": state["anchor_source"],
+        "car_id": profile.get("id") or "",
+        "vehicle_id": state.get("vehicle_id") or "",
+        "name": profile.get("name") or "",
+        "capacity_kwh": profile.get("capacity_kwh"),
+        "profile_id": profile.get("id") or "",
+        "soc_profile_bound": True,
+        "soc_rule_confirmed": True,
+        "anchor_meter_wh": anchor_wh,
+    }
+
+
+def _openwb_pro_profile_binding(config, wb_id, status, selected_id, now=None,
+                               tracker_state=None):
     """Liefere eine fail-closed Profil-/Live-SoC-Bindung für openWB Pro.
 
     Die openWB Pro liefert nicht auf jeder Anlage eine nutzbare Fahrzeug-ID.
@@ -1128,6 +1178,20 @@ def _openwb_pro_profile_binding(config, wb_id, status, selected_id, now=None):
             truth_sample["source_ts"],
         ))
 
+    if not candidates:
+        # Ein beim Empfang frischer Cloud-Anker bleibt über den gemessenen
+        # Energiezuwachs nutzbar. Seine Quellzeit wird dabei nie verjüngt;
+        # neue oder rückgesetzte Sessions dürfen ihn nicht übernehmen.
+        retained_sample = _openwb_pro_tracker_session_sample(
+            tracker_state, wb_id, profile, profile_aliases,
+            plug_session_id, meter_wh, now, config,
+        )
+        if retained_sample:
+            return {
+                "sample": retained_sample, "profile": profile,
+                "plug_session_id": plug_session_id,
+                "meter_wh": meter_wh, "meter_source": "session_kwh",
+            }
     if len(candidates) != 1:
         return None
 
@@ -1153,6 +1217,7 @@ def _openwb_pro_profile_binding(config, wb_id, status, selected_id, now=None):
         # Ein Cloud-SoC ist eine aktuelle Verankerung. Frühere Energie aus
         # derselben Stecksession darf nicht nachträglich addiert werden.
         "anchor_meter_wh": meter_wh,
+        "soc_rule_confirmed": True,
     }
     return {
         "sample": sample,
@@ -1653,6 +1718,7 @@ class VehicleSocTracker:
                 status,
                 selected_id,
                 now=now,
+                tracker_state=self._load_state(wb_id),
             )
             if is_openwb_pro
             else None
@@ -1724,6 +1790,7 @@ class VehicleSocTracker:
             config=config,
             wb_id=wb_id,
             vehicle_key=vehicle_key,
+            meter_estimation=is_openwb_pro and profile_binding is not None,
         )
         if state_anchor_valid and connected and not is_openwb_pro:
             _repair_confirmed_manual_profile_binding(state, selected_id, wb_id)
@@ -1792,6 +1859,7 @@ class VehicleSocTracker:
             config=config,
             wb_id=wb_id,
             vehicle_key=vehicle_key,
+            meter_estimation=is_openwb_pro and profile_binding is not None,
         ):
             return None
 

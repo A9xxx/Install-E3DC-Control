@@ -50,6 +50,7 @@
 !/Installer/apache/e3dc-control-security.conf
 !/Installer/apache_security.py
 !/Installer/Forecast/pv_forecast_evidence.py
+!/Installer/Forecast/pv_forecast_diagnostic_details.py
 !/Installer/Forecast/pv_forecast_service.py
 !/Installer/Heat/__init__.py
 !/Installer/Heat/forecast.py

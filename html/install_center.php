@@ -3938,8 +3938,10 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_runtime_permissions_rep
         </div>
         <div id="pv-forecast-diagnostic-card" class="rounded border border-secondary-subtle bg-body-tertiary px-3 py-2 small">
             <div class="d-flex flex-wrap gap-2 gap-lg-3 text-body">
-                <span title="Typischer absoluter Unterschied je verglichenem 15-Minuten-Fenster">Trefferabweichung: <strong id="pv-forecast-diagnostic-hit">–</strong></span>
+                <span title="Mittlerer absoluter Fehler je Ertragsfenster: Ist oder Prognose mindestens 25 Wh">Trefferabweichung: <strong id="pv-forecast-diagnostic-hit">–</strong></span>
                 <span title="Positiv bedeutet im Mittel mehr, negativ weniger Ertrag als vorhergesagt">Richtungsversatz: <strong id="pv-forecast-diagnostic-direction">–</strong></span>
+                <span title="Quadratische Fehlerwurzel; gewichtet größere Fehler stärker">RMSE: <strong id="pv-forecast-diagnostic-rmse">–</strong></span>
+                <span title="Positiv bedeutet besser als die vor Ausgabe bekannte Tagespersistenz">Skill gegen Tagespersistenz: <strong id="pv-forecast-diagnostic-skill">–</strong></span>
                 <span title="Gesamtabweichung, gewichtet nach der tatsächlich erzeugten Energie">Energieabweichung: <strong id="pv-forecast-diagnostic-energy">–</strong></span>
                 <span title="Anteil der archivierten Prognosefenster mit gültigem Messwert">Abdeckung: <strong id="pv-forecast-diagnostic-coverage">–</strong></span>
             </div>
@@ -4809,16 +4811,16 @@ function ruleCalmCheckLabel(name) {
     const labels = {
         wallbox_start_stop: 'Wallbox Start/Stop',
         wallbox_phase: 'Wallbox Phasen',
-        storage: 'Speicher-Commands',
+        storage: 'Speicher-Ausgangszustände',
         storage_owner: 'Speicher-Owner',
         storage_contract_owner: 'Speicher-Contract',
-        storage_execution_class: 'Speicher-Ausführung',
+        storage_execution_class: 'Speicher-Ausgangsbeobachtungen',
         storage_state: 'Speicher-State',
         storage_state_reason: 'Speicher-Grund',
-        storage_value_update: 'Speicher-Wertupdate',
+        storage_value_update: 'Speicher-Sollwertupdate',
         storage_decision_path: 'Speicher-Entscheidungspfad',
         storage_budget_executor_shadow: 'Speicher-Executor',
-        storage_live_plausibility: 'Speicher-Messwerte',
+        storage_live_plausibility: 'Speicher-Messwertschutz',
         heatpump: 'Wärmepumpe',
         ems: 'EMS',
         ems_decision: 'EMS-Entscheidungen',
@@ -4848,7 +4850,11 @@ function ruleCalmActionLabel(name) {
         STORAGE_ACTIVE: 'Speicher aktiv',
         E3DC_AUTO: 'E3DC Auto',
         E3DC_AUTONOM: 'E3DC autonom',
-        PARALLEL_WB_AUTO: 'Wallbox-Automatik'
+        PARALLEL_WB_AUTO: 'Wallbox-Automatik',
+        BOOST: 'Boost-Entscheidung',
+        RUN: 'Leistungsaufnahme mit Budget',
+        OBS_RUN: 'Leistungsaufnahme beobachtet',
+        OBS_OFF: 'Keine Leistungsaufnahme beobachtet'
     };
     return labels[name] || name;
 }
@@ -4952,6 +4958,33 @@ function renderRuleCalmViolations(violations, emptyText = 'Keine auffälligen Mu
     </table></div>`;
 }
 
+function renderRuleCalmEvidence(coverage) {
+    const labels = {
+        malformed_record: 'Beschädigte oder unlesbare Historienzeile',
+        invalid_timestamp: 'Fehlender oder ungültiger Zeitstempel',
+        invalid_history_metadata: 'Unbekannte oder widersprüchliche Archivmetadaten',
+        unknown_record_format: 'Kein auswertbarer Entscheidungsdatensatz',
+        aggregated_interval: 'Zusammengefasster Zeitraum ohne vollständige Zwischenfolge',
+        archive_gap: 'Vom Archiv gemeldete Nachweislücke',
+        record_limit_reached: 'Weitere Entscheidungen außerhalb des Auswertungslimits',
+        legacy_output_contract_missing: 'Älteres Datenformat ohne typisierten RSCP-Ausgang',
+        output_contract_invalid: 'Unvollständiger oder ungültiger RSCP-Ausgangsvertrag',
+        readback_stale: 'Veraltete RSCP-Rücklesung',
+        output_unconfirmed: 'RSCP-Ausgang noch nicht vollständig bestätigt',
+        transaction_binding_invalid: 'Rücklesung ohne gültige Transaktionsbindung',
+        live_contract_missing: 'Live-Gültigkeitsnachweise fehlen',
+        live_contract_invalid: 'Live-Gültigkeitsnachweise besitzen ungültige Datentypen',
+        heatpump_observation_missing: 'Wärmepumpenzustand ohne belastbare Beobachtung'
+    };
+    const rows = ['storage', 'wallbox', 'heatpump', 'ems'].flatMap(service => {
+        const item = coverage && coverage[service];
+        if (!item || typeof item !== 'object') return [];
+        const reasons = Object.entries(item.reasons || {}).filter(([key, count]) => labels[key] && Number(count) > 0);
+        return [`<div class="result-tile mt-2"><strong>${esc(ruleCalmServiceLabel(service))}: Datenbasis</strong>${esc(item.decision_records ?? 0)} Entscheidungsdatensätze · ${esc(item.context_records ?? 0)} Kontextzeilen separat · ${esc(item.aggregated_records ?? 0)} zusammengefasste Zeiträume${Number(item.aggregated_samples || 0) > 0 ? `<div class="text-secondary mt-1">Darin ${esc(item.aggregated_samples)} zusammengefasste Beobachtungen; ${esc(item.aggregated_transitions ?? 0)} gemeldete Entscheidungsänderungen ohne vollständige Zeitfolge.</div>` : ''}${reasons.length ? `<ul class="result-list mt-1">${reasons.map(([key, count]) => `<li>${esc(labels[key])}: ${esc(count)}</li>`).join('')}</ul>` : ''}</div>`];
+    });
+    return rows.join('');
+}
+
 function renderRuleCalmAnalysis(data) {
     if (!data || data.success === false) {
         return `<div class="bad"><strong>Keine belastbare Regelruhe-Aussage.</strong><div class="mt-1">${esc(data && (data.error || data.message) || 'Keine Antwort erhalten.')}</div></div>`;
@@ -4959,6 +4992,7 @@ function renderRuleCalmAnalysis(data) {
     const records = data.records || {};
     const events = data.events || {};
     const checks = data.checks || {};
+    const outputCounts = data.storage_output_counts || {};
     const violations = Array.isArray(data.violations) ? data.violations : [];
     const dataQualityFindings = Array.isArray(data.data_quality_findings) ? data.data_quality_findings : [];
     const controlStatus = String(data.control_status || data.status || 'UNKNOWN').toUpperCase();
@@ -4991,8 +5025,8 @@ function renderRuleCalmAnalysis(data) {
     const laneMeaning = controlStatus === 'FAIL'
         ? 'Im Entscheidungs-/Ausgangspfad wurde ein belegtes Ping-Pong, Veto oder ein Pfadkonflikt erkannt.'
         : controlStatus === 'EVIDENCE_LIMIT'
-        ? 'Für eine belastbare Regelruhe-Aussage fehlt in mindestens einem Speicher-Record die typisierte Execution-/Ausgangssignatur.'
-        : 'Entscheidungsweg und tatsächlicher Aktor-/Ausgang blieben ohne belegtes Ping-Pong.';
+        ? 'Fehlende, beschädigte oder zusammengefasste Nachweise begrenzen die Aussage über den gewählten Zeitraum.'
+        : 'In den auswertbaren Entscheidungs- und Ausgangsbeobachtungen wurde kein Ping-Pong erkannt.';
     const dataQualityMeaning = dataQualityStatus === 'FAIL'
         ? 'Wiederholte oder anhaltende Messwertschutz-Guards machen die Datenqualität auffällig.'
         : dataQualityStatus === 'HINT'
@@ -5000,7 +5034,7 @@ function renderRuleCalmAnalysis(data) {
         : dataQualityStatus === 'PASS'
         ? 'Im ausgewerteten Speicherverlauf liegt kein Messwertqualitätsbefund vor.'
         : dataQualityStatus === 'EVIDENCE_LIMIT'
-        ? 'Für eine belastbare Datenqualitätsaussage fehlt in mindestens einem Speicher-Record die typisierte Live-Evidenz.'
+        ? 'Live-Nachweise oder die vollständige zeitliche Messwertfolge sind nicht durchgehend verfügbar.'
         : 'Die Speicher-Datenqualität wurde nicht separat ausgewertet.';
     const meaning = legacy
         ? 'Diese gespeicherte Auswertung stammt aus dem alten Public-v2-Vertrag. Ihr damaliger PASS-/FAIL-Status enthält keine belastbare Domänen-Vollständigkeit und wird deshalb nur als EVIDENCE_LIMIT angezeigt.'
@@ -5019,9 +5053,10 @@ function renderRuleCalmAnalysis(data) {
         <div class="result-title"><i class="fas fa-wave-square ${controlStatus === 'PASS' ? 'ok' : 'warn'}"></i>${esc(title)} <span>Regelruhe ${ruleCalmStatusBadge(controlStatus)}</span> <span>Datenqualität ${ruleCalmDataQualityBadge(dataQualityStatus)}</span>${legacy ? ' <span class="badge text-bg-warning">LEGACY / EVIDENCE_LIMIT</span>' : (partial ? ' <span class="badge text-bg-warning">TEILWEISE / EVIDENCE_LIMIT</span>' : '')}${historical ? ' <span class="badge text-bg-secondary">historisch</span>' : ''}</div>
         <div class="text-secondary small">${esc(data.source_label || 'Entscheidungsverlauf')} · ${scopeDetail ? esc(scopeDetail) + ' · ' : ''}Geprüfte Records ${esc(recordRange)} · ${esc(gapText)}</div>
         <div class="result-grid">
-            <div class="result-tile"><strong>Speicher</strong>${esc(records.storage ?? 0)} Records<div class="text-secondary mt-1">${esc(events.storage_contract_owner ?? 0)} Contract · ${esc(events.storage_owner ?? 0)} Owner · ${esc(events.storage_execution_class ?? 0)} Ausführung · ${esc(events.storage_state ?? 0)} State</div><div class="text-secondary mt-1">${esc(events.storage_value_update ?? 0)} Werte · ${esc(events.storage ?? 0)} RSCP-Commands · ${esc(events.storage_live_plausibility ?? 0)} Messwertschutz</div></div>
+            <div class="result-tile"><strong>Speicher</strong>${esc(records.storage ?? 0)} Entscheidungsdatensätze<div class="text-secondary mt-1">${esc(events.storage_contract_owner ?? 0)} Contract-Zustände · ${esc(events.storage_owner ?? 0)} Owner-Zustände · ${esc(events.storage_state ?? 0)} Entscheidungszustände</div><div class="text-secondary mt-1">${esc(events.storage_value_update ?? 0)} Sollwertupdates bei gleichem Zustand · ${esc(events.storage_live_plausibility ?? 0)} Messwertschutzfälle</div></div>
+            <div class="result-tile"><strong>Bestätigter Speicher-Ausgang</strong>${esc(outputCounts.confirmed_output_changes ?? 'nicht erhoben')} beobachtete Ausgangswechsel<div class="text-secondary mt-1">${esc(outputCounts.confirmed_observations ?? 'nicht erhoben')} bestätigte Beobachtungen · ${esc(outputCounts.confirmed_new_output_records ?? 'nicht erhoben')} bestätigte neue Ausgabetransaktionen · ${esc(outputCounts.retained_readback_records ?? 'nicht erhoben')} beibehaltene Rücklesungen</div></div>
             <div class="result-tile"><strong>Wallbox</strong>${esc(records.wallbox ?? 0)} Records<div class="text-secondary mt-1">${esc(events.wallbox_start_stop ?? 0)} Start/Stop · ${esc(events.wallbox_phase ?? 0)} Phasen-Commands</div></div>
-            <div class="result-tile"><strong>Wärmepumpe</strong>${esc(records.heatpump ?? 0)} Records<div class="text-secondary mt-1">${esc(events.heatpump ?? 0)} Entscheidungswechsel; OBS_* bleibt beobachtet</div></div>
+            <div class="result-tile"><strong>Wärmepumpe</strong>${esc(records.heatpump ?? 0)} Entscheidungsdatensätze<div class="text-secondary mt-1">${esc(events.heatpump ?? 0)} Entscheidungs-/Beobachtungszustände einschließlich Anfangszustand. Daraus sind keine Verdichterstarts ableitbar.</div></div>
             <div class="result-tile"><strong>EMS</strong>${esc(records.ems ?? 0)} Records<div class="text-secondary mt-1">${esc(events.ems_decision ?? 0)} kanonische Entscheidungen</div></div>
             <div class="result-tile"><strong>Prüfzeitraum</strong>${esc(recordRange)}<div class="text-secondary mt-1">aus den geprüften Records</div></div>
             <div class="result-tile"><strong>Prozessgrenze</strong>${historical ? 'prozessübergreifende Historie' : esc((data.scope_context || {}).cutoff_time || 'nicht ermittelbar')}<div class="text-secondary mt-1">${historical ? 'kein Beleg für den aktuellen Prozess' : 'ältere Records ausgeschlossen'}</div></div>
@@ -5029,7 +5064,9 @@ function renderRuleCalmAnalysis(data) {
             <div class="result-tile"><strong>Datenqualität</strong>${ruleCalmDataQualityBadge(dataQualityStatus)}<div class="text-secondary mt-1">${dataQualityFindings.length ? `${esc(dataQualityFindings.length)} Befund` : 'kein separater Befund'}</div></div>
         </div>
         <div class="result-tile mt-2"><strong>Einordnung</strong>${esc(meaning)}<div class="text-secondary mt-1">${esc(data.privacy_note || 'Read-only Diagnose ohne Hardwarezugriff.')}</div></div>
-        ${evidenceLimit ? `<div class="result-tile warn mt-2"><strong>EVIDENCE_LIMIT</strong>${legacy ? 'Historischer Public-Vertrag ohne Evidenz-Lanes' : (partial ? `Fehlende Domänen: ${esc(missingServices.map(ruleCalmServiceLabel).join(', '))}` : 'Fehlende typisierte Live- oder Execution-/Ausgangsevidenz')}<div class="text-secondary mt-1">Diese Auswertung erlaubt keine vollständige Grün-Aussage; echte Veto-/Pfadkonflikte und belegte Ausgangswechsel bleiben davon unabhängig sichtbar.</div></div>` : ''}
+        ${evidenceLimit ? `<div class="result-tile warn mt-2"><strong>EVIDENCE_LIMIT</strong>${legacy ? 'Historischer Public-Vertrag ohne Evidenz-Lanes' : (partial ? `Ohne auswertbare Entscheidungen: ${esc(missingServices.map(ruleCalmServiceLabel).join(', '))}` : 'Die Nachweisgrenzen sind nach Bereich und Ursache aufgeschlüsselt.')}<div class="text-secondary mt-1">Diese Auswertung erlaubt keine vollständige Grün-Aussage; echte Veto-/Pfadkonflikte und belegte Ausgangswechsel bleiben davon unabhängig sichtbar.</div></div>` : ''}
+        ${renderRuleCalmEvidence(data.history_coverage)}
+        <div class="text-secondary small mt-2">Sollwertupdates und Messwertschutz zählen keine Leistungsänderungen. Eine bestätigte Ausgabetransaktion kann mehrere Protokollbefehle enthalten; ein beibehaltener Readback ist kein neuer Schreibbefehl.</div>
         <div class="mt-2"><strong>Regelpfade und Ausgänge</strong><ul class="result-list">${checkRows || '<li>Keine Prüfbereiche gefunden.</li>'}</ul></div>
         <div class="mt-2"><strong>Datenqualität</strong><ul class="result-list">${dataQualityCheckRow}</ul></div>
         <div class="mt-2"><strong>Datenqualitätsbefunde</strong>${renderRuleCalmViolations(dataQualityFindings, 'Kein Messwertqualitätsbefund erkannt.')}</div>

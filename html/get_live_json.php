@@ -1663,6 +1663,28 @@ function wallboxSocSourceTimestamp($payload, $source, $now = null) {
     return null;
 }
 
+function wallboxSocAgeProjection($payload, $source) {
+    $payload = is_array($payload) ? $payload : [];
+    $projection = [
+        'age_contract' => $payload['car_soc_age_contract'] ?? null,
+        'age_contract_source' => $payload['car_soc_age_contract_source'] ?? null,
+        'max_age_s' => $payload['car_soc_max_age_s'] ?? null,
+    ];
+    // Nur vollständig feldlose Legacy-Payloads erhalten den bereits geltenden
+    // kanonischen Deckel. Explizite Teil-/Nullverträge bleiben unverändert.
+    if (!e3dcVehicleSocPayloadDeclaresAgeContract($payload)) {
+        $maxAgeS = e3dcVehicleSocPayloadMaxAgeSeconds($payload, $source);
+        if ($maxAgeS !== null) {
+            $projection = [
+                'age_contract' => 'vehicle_soc_source_age_v1',
+                'age_contract_source' => strtolower(trim((string)$source)),
+                'max_age_s' => $maxAgeS,
+            ];
+        }
+    }
+    return $projection;
+}
+
 function wallboxSocTruthConfirmed($source, $ruleConfirmed, $sourceTs, $now = null, $rulePresent = null, $agePayload = null, $cloudFreshnessS = 900) {
     if (!wallboxSocRuleConfirmed($source, $ruleConfirmed, $rulePresent)) return false;
     // Jede regelwirksame Quelle braucht ihren eigenen Ereignisanker. Das gilt
@@ -2653,26 +2675,60 @@ function mergeVehicleRecords($base, $incoming, $cloudFreshnessS = 900) {
         };
         $incomingTruthRank = $mergeTruthRank($incoming);
         $baseTruthRank = $mergeTruthRank($merged);
+        $incomingTs = vehicleSocRecordTimestamp($incoming);
+        $baseTs = vehicleSocRecordTimestamp($merged);
+        $incomingContract = e3dcVehicleSocSourceContract($incoming['soc_source'] ?? '');
+        $baseContract = e3dcVehicleSocSourceContract($merged['soc_source'] ?? '');
+        $sameConfirmedProfile = $incomingTruthRank === 2 && $baseTruthRank === 2
+            && $incomingTs !== null && $baseTs !== null
+            && trim((string)($incoming['profile_id'] ?? '')) !== ''
+            && ($incoming['profile_id'] ?? '') === ($merged['profile_id'] ?? '');
+        // Ein gültiger direkter Pro-Messwert desselben Fahrzeugs geht vor
+        // Cloud und deren Fortschreibung. Die Gerätequelle allein genügt
+        // nicht: Frische, Regelbestätigung und Profilbindung müssen gelten.
+        $incomingCloudBase = e3dcVehicleSocSourceContract($incomingContract['base_source'] ?? '');
+        $baseCloudBase = e3dcVehicleSocSourceContract($baseContract['base_source'] ?? '');
+        $incomingDirectPro = $sameConfirmedProfile
+            && ($incomingContract['source'] ?? '') === 'openwb_pro_raw'
+            && ($incoming['is_interpolated'] ?? false) === false
+            && ($baseCloudBase['kind'] ?? '') === 'cloud';
+        $baseDirectPro = $sameConfirmedProfile
+            && ($baseContract['source'] ?? '') === 'openwb_pro_raw'
+            && ($merged['is_interpolated'] ?? false) === false
+            && ($incomingCloudBase['kind'] ?? '') === 'cloud';
+        // Ein frischer Cloudanker enthält die danach gemessene Ladeenergie
+        // noch nicht. Eine bestätigte Fortschreibung derselben Quelle mit
+        // gleichem oder neuerem Anker gewinnt bei derselben Profilbindung.
+        // Ein neuer echter Cloudanker behält die normale Quellenpriorität.
+        $incomingContinuesCloud = $sameConfirmedProfile && $incomingTs >= $baseTs
+            && ($incomingContract['derived'] ?? false) === true
+            && ($baseContract['kind'] ?? '') === 'cloud'
+            && ($incomingContract['base_source'] ?? '') === ($baseContract['source'] ?? '')
+            && ($incoming['soc_profile_bound'] ?? null) === true
+            && ($incoming['is_interpolated'] ?? null) === true;
+        $baseContinuesCloud = $sameConfirmedProfile && $baseTs >= $incomingTs
+            && ($baseContract['derived'] ?? false) === true
+            && ($incomingContract['kind'] ?? '') === 'cloud'
+            && ($baseContract['base_source'] ?? '') === ($incomingContract['source'] ?? '')
+            && ($merged['soc_profile_bound'] ?? null) === true
+            && ($merged['is_interpolated'] ?? null) === true;
         if ($incomingTruthRank !== $baseTruthRank) {
             $incomingSocWins = $incomingTruthRank > $baseTruthRank;
+        } elseif ($incomingDirectPro || $baseDirectPro) {
+            $incomingSocWins = $incomingDirectPro;
+        } elseif ($incomingContinuesCloud || $baseContinuesCloud) {
+            $incomingSocWins = $incomingContinuesCloud;
         } elseif ($incomingPriority > $basePriority) {
             $incomingSocWins = true;
         } elseif ($incomingPriority === $basePriority) {
             // Bei gleicher fachlicher Quellenpriorität entscheidet ausschließlich
             // der belastbare Quellzeitpunkt. Ohne neueren Beleg bleibt der bereits
             // gebundene Ist-SoC erhalten; die Einmischreihenfolge ist keine Wahrheit.
-            $incomingTs = vehicleSocRecordTimestamp($incoming);
-            $baseTs = vehicleSocRecordTimestamp($merged);
             $incomingSocWins = $incomingTs !== null
                 && ($baseTs === null || $incomingTs > $baseTs);
         }
     }
     $baseSocSource = strtolower(trim((string)($merged['soc_source'] ?? '')));
-    $incomingSocSource = strtolower(trim((string)($incoming['soc_source'] ?? '')));
-    if (in_array($baseSocSource, ['openwb_pro_raw', 'openwb_pro_estimated'], true)
-        && strpos($incomingSocSource, 'wallbox_estimated_from_') === 0) {
-        $incomingSocWins = false;
-    }
     $baseIsProfileFallback = !empty($merged['soc_profile_bound'])
         || strpos($baseSocSource, 'wallbox_estimated') === 0;
     if (vehicleSocContractFlagActive($incoming['soc_profile_binding_invalid'] ?? null)) {
@@ -3911,13 +3967,136 @@ function liveHeadroomEnergyBindingValid($binding, $sidecarSlot, $projectedW, $ba
         && $statusValid;
 }
 
+function liveOperatingPvProjection($direct, $slot) {
+    // Ausschließlich Projektion einer konfigurierten Regel, kein Hardwarestatus.
+    $number = static function($value) {
+        return (is_int($value) || is_float($value)) && is_finite((float)$value) ? (float)$value : null;
+    };
+    $projection = is_array($slot['projection'] ?? null) ? $slot['projection'] : [];
+    $forecast = is_array($slot['forecast_w'] ?? null) ? $slot['forecast_w'] : [];
+    $prices = is_array($slot['prices_ct_kwh'] ?? null) ? $slot['prices_ct_kwh'] : [];
+    $rules = is_array($direct['pv_operating_rules'] ?? null) ? $direct['pv_operating_rules'] : [];
+    $shutdown = ($rules['schema_version'] ?? null) === 'direct_marketing_pv_operating_rules_v1'
+        && is_array($rules['external_ac_negative_price_shutdown'] ?? null)
+        ? $rules['external_ac_negative_price_shutdown'] : [];
+    $total = $number($projection['pv_w'] ?? null);
+    $dc = $number($forecast['e3dc_dc_pv']['point'] ?? null);
+    $external = $number($forecast['external_ac_pv']['point'] ?? null);
+    $total = $total === null ? null : round($total, 3);
+    $dc = $dc === null ? null : round($dc, 3);
+    $external = $external === null ? null : round($external, 3);
+    $price = $number($prices['gross_sell'] ?? null);
+    $threshold = $number($shutdown['threshold_ct'] ?? null);
+    $configuredShutdown = ($shutdown['configured'] ?? null) === true
+        && is_string($shutdown['source'] ?? null) && $shutdown['source'] !== '' && $threshold !== null;
+    $futurePriceUnknown = $configuredShutdown && ($price === null || ($prices['fresh'] ?? null) === false);
+    $splitValid = $total !== null && $dc !== null && $external !== null
+        && min($total, $dc, $external) >= 0.0 && abs($total - $dc - $external) <= 0.01;
+    $shutdownRequested = $configuredShutdown
+        && $price !== null && ($prices['fresh'] ?? null) !== false
+        && $price < $threshold;
+    $externalOff = $shutdownRequested && $splitValid;
+    $operatingComplete = !$futurePriceUnknown && (!$shutdownRequested || $splitValid);
+    $weather = ['total' => $total, 'e3dc_dc' => $dc, 'external_ac' => $external];
+    $operating = ['total' => $operatingComplete ? ($externalOff ? $dc : $total) : null, 'e3dc_dc' => $dc, 'external_ac' => $externalOff ? 0.0 : $external];
+    return [
+        'schema_version' => 'direct_marketing_operating_pv_projection_v1',
+        'complete' => $operatingComplete,
+        'weather_potential_w' => $weather,
+        'operating_available_w' => $operating,
+        'energy_projection_w' => $futurePriceUnknown ? $weather : $operating,
+        'soc_projection_basis' => $futurePriceUnknown ? 'conditional_weather_auto' : 'operating_pv',
+        'external_ac_off' => $externalOff,
+        'external_ac_off_basis' => $externalOff ? 'configured_negative_price_shutdown'
+            : ($shutdownRequested ? 'source_split_missing' : ($futurePriceUnknown ? 'future_price_unconfirmed' : 'no_applicable_shutdown_rule')),
+        'market_price_ct' => $price,
+        'shutdown_threshold_ct' => $threshold,
+        'e3dc_export_limit_w' => null,
+        'e3dc_export_limit_basis' => 'future_limit_unconfirmed',
+        'weather_learning_allowed' => false,
+        'hardware_effect_claim_allowed' => false,
+    ];
+}
+
+
+function liveRouteEnergyConversion($direct, $slot, $legacy, $canonicalPassthrough = false) {
+    // Nur vollständig fehlende Routenangaben sind ein Altvertrag.
+    $flags = is_array($direct['flags'] ?? null) ? $direct['flags'] : [];
+    $keys = ['pv_store_dc_charge_efficiency_pct', 'pv_store_aux_ac_charge_efficiency_pct', 'pv_store_discharge_efficiency_pct'];
+    $declared = 0;
+    foreach ($keys as $key) if (array_key_exists($key, $flags)) $declared++;
+    $number = static function($value) {
+        return (is_int($value) || is_float($value)) && is_finite((float)$value) ? (float)$value : null;
+    };
+    if ($declared === 0) {
+        $dcCharge = $number($legacy['charge'] ?? null);
+        $auxCharge = $dcCharge;
+        $discharge = $number($legacy['discharge'] ?? null);
+        if ($dcCharge === null || $dcCharge <= 0.0 || $dcCharge > 1.0
+            || $discharge === null || $discharge <= 0.0 || $discharge > 1.0) return null;
+        $source = 'legacy_roundtrip';
+        $basis = 'legacy_unspecified_input';
+    } else {
+        if ($declared !== count($keys)) return null;
+        $values = [];
+        foreach ($keys as $key) {
+            $value = $number($flags[$key]);
+            if ($value === null || $value <= 0.0 || $value > 100.0) return null;
+            $values[] = round($value / 100.0, 6);
+        }
+        [$dcCharge, $auxCharge, $discharge] = $values;
+        if (min($dcCharge, $auxCharge, $discharge) <= 0.0) return null;
+        $source = 'direct_marketing.flags';
+        $action = (string)($slot['action'] ?? '');
+        $selection = is_array($slot['selection'] ?? null) ? $slot['selection'] : [];
+        $delegation = is_array($slot['delegation'] ?? null) ? $slot['delegation'] : [];
+        $sourceContract = ($selection['selected'] ?? null) === true
+            ? ($selection['pv_store_source_contract'] ?? null)
+            : ($delegation['pv_store_source_contract'] ?? null);
+        if (in_array($action, ['PV_STORE', 'DV_CURVE_CHARGE'], true)) {
+            if ($sourceContract === 'E3DC_DC') $basis = 'dc_input';
+            elseif ($sourceContract === 'E3DC_DC_PLUS_AUX_AC_PV') $basis = 'dc_first_aux_ac_input';
+            elseif ($action === 'DV_CURVE_CHARGE' && ($flags['pv_store_dc_only_enable'] ?? null) === true) $basis = 'dc_input';
+            else return null;
+        } elseif ($action === 'PASSIVE_NORMAL') {
+            $basis = 'dc_first_aux_ac_input';
+        } else {
+            $basis = 'no_charge';
+        }
+    }
+    $batteryW = $number($slot['battery_w'] ?? null);
+    if ($batteryW === null) return null;
+    $chargeW = max(0.0, $batteryW);
+    $dcW = $chargeW;
+    if ($basis === 'dc_first_aux_ac_input' && $chargeW > 0.0 && !$canonicalPassthrough) {
+        $dcAvailable = $number($slot['pv_w']['e3dc_dc'] ?? null);
+        $residual = $number($slot['residual_before_storage_w'] ?? null);
+        if ($dcAvailable === null || $dcAvailable < 0.0 || $residual === null) return null;
+        $dcW = min($chargeW, $dcAvailable, max(0.0, $residual));
+    }
+    $auxW = max(0.0, $chargeW - $dcW);
+    if ($canonicalPassthrough) {
+        return ['source' => 'canonical_standard_passthrough', 'charge_input_basis' => 'canonical_standard_soc',
+            'dc_charge' => null, 'aux_ac_charge' => null, 'discharge' => null,
+            'charge' => null, 'dc_input_w' => null, 'aux_ac_input_w' => null];
+    }
+    $charge = $chargeW > 0.0 ? ($dcW * $dcCharge + $auxW * $auxCharge) / $chargeW : $dcCharge;
+    return ['source' => $source, 'charge_input_basis' => $basis,
+        'dc_charge' => $dcCharge, 'aux_ac_charge' => $auxCharge, 'discharge' => $discharge,
+        'charge' => round($charge, 6),
+        'dc_input_w' => $basis === 'legacy_unspecified_input' ? null : round($dcW, 3),
+        'aux_ac_input_w' => $basis === 'legacy_unspecified_input' ? null : round($auxW, 3)];
+}
+
+
 function liveTrajectoryValidationReason($plan, $source, $canonicalPlan) {
     $planId = is_array($plan) ? (string)($plan['plan_id'] ?? '') : '';
     if (!$canonicalPlan || preg_match('/^sha256:[0-9a-f]{64}$/', $planId) !== 1) {
         return 'DIRECT_MARKETING_CANONICAL_PLAN_INVALID';
     }
+    $operatingProjection = ($source['meta']['pv_aggregation_contract'] ?? null) === 'selected_actions_operating_pv_v1';
     $headroomEvidence = liveHeadroomProjectionEvidence($plan);
-    if (($headroomEvidence['present'] ?? false) === true && ($headroomEvidence['valid'] ?? false) !== true) {
+    if (!$operatingProjection && ($headroomEvidence['present'] ?? false) === true && ($headroomEvidence['valid'] ?? false) !== true) {
         return (string)($headroomEvidence['reason'] ?? 'DIRECT_MARKETING_HEADROOM_PROJECTION_PLAN_INVALID');
     }
     if (!is_array($source)) return 'DIRECT_MARKETING_TRAJECTORY_MISSING';
@@ -3992,6 +4171,15 @@ function liveTrajectoryValidationReason($plan, $source, $canonicalPlan) {
             return 'DIRECT_MARKETING_TRAJECTORY_SOC_CONTINUITY_INVALID';
         }
         $pv = is_array($slot['pv_w'] ?? null) ? $slot['pv_w'] : [];
+        if ($operatingProjection) {
+            $expectedOperating = liveOperatingPvProjection($plan['direct_marketing'] ?? [], $planSlot);
+            if (liveTrajectoryCanonicalJson($slot['pv_operating_projection'] ?? null)
+                !== liveTrajectoryCanonicalJson($expectedOperating)
+                || liveTrajectoryCanonicalJson($pv)
+                    !== liveTrajectoryCanonicalJson($expectedOperating['energy_projection_w'])) {
+                return 'DIRECT_MARKETING_OPERATING_PV_BINDING_MISMATCH';
+            }
+        }
         $loads = is_array($slot['loads_w'] ?? null) ? $slot['loads_w'] : [];
         foreach (['total'] as $key) if (!isset($pv[$key]) || !is_numeric($pv[$key])) return 'DIRECT_MARKETING_TRAJECTORY_BALANCE_INPUT_INVALID';
         foreach (['house', 'heat', 'wallbox', 'total'] as $key) if (!isset($loads[$key]) || !is_numeric($loads[$key])) return 'DIRECT_MARKETING_TRAJECTORY_BALANCE_INPUT_INVALID';
@@ -4095,13 +4283,17 @@ function liveTrajectoryValidationReason($plan, $source, $canonicalPlan) {
             && ($standardProjectionBinding['executable'] ?? null) === false
             && ($standardProjectionBinding['commands_allowed'] ?? null) === false
             && ($standardProjectionBinding['hardware_effect'] ?? null) === false
-            && ($standardProjectionBinding['source_schema'] ?? null) === 'direct_marketing_headroom_projection_plan_v1'
             && preg_match('/^sha256:[0-9a-f]{64}$/', (string)($standardProjectionBinding['source_revision'] ?? '')) === 1
-            && ($headroomEvidence['present'] ?? false) === true
-            && ($headroomEvidence['valid'] ?? false) === true
-            && hash_equals(
-                (string)($headroomEvidence['revision'] ?? ''),
-                (string)($standardProjectionBinding['source_revision'] ?? '')
+            && (
+                $operatingProjection
+                ? (($standardProjectionBinding['source_schema'] ?? null) === 'canonical_dispatch_input_revisions_v1'
+                    && hash_equals('sha256:' . hash('sha256', liveTrajectoryCanonicalJson($plan['input_revisions'] ?? [])),
+                        (string)($standardProjectionBinding['source_revision'] ?? '')))
+                : (($standardProjectionBinding['source_schema'] ?? null) === 'direct_marketing_headroom_projection_plan_v1'
+                    && ($headroomEvidence['present'] ?? false) === true
+                    && ($headroomEvidence['valid'] ?? false) === true
+                    && hash_equals((string)($headroomEvidence['revision'] ?? ''),
+                        (string)($standardProjectionBinding['source_revision'] ?? '')))
             );
         $headroomProjection = is_array($slot['headroom_projection'] ?? null) ? $slot['headroom_projection'] : null;
         $projectionOnlyMarker = $action === 'HEADROOM_EXPORT'
@@ -4113,6 +4305,7 @@ function liveTrajectoryValidationReason($plan, $source, $canonicalPlan) {
             || array_key_exists('projected_w', $selection)
             || array_key_exists('projection_id', $selection);
         $projectionRole = false;
+        if ($operatingProjection && $projectionOnlyMarker) return 'DIRECT_MARKETING_OPERATING_TRAJECTORY_CANDIDATE_EFFECT';
         if ($projectionOnlyMarker) {
             $selectionKeys = array_keys($selection);
             sort($selectionKeys, SORT_STRING);
@@ -4208,19 +4401,41 @@ function liveTrajectoryValidationReason($plan, $source, $canonicalPlan) {
             ? (float)($headroomSource['effective_duration_s'] ?? 0.0)
             : ($standardTransitionValid
                 ? (float)$transitionDurationS
-                : $durationMs / 1000.0);
+                : ($operatingProjection
+                    ? ($end - max($start, (int)($plan['generated_at_ts_ms'] ?? $start))) / 1000.0
+                    : $durationMs / 1000.0));
         if (!is_finite($integrationDurationS) || $integrationDurationS <= 0.0
             || $integrationDurationS > $durationMs / 1000.0 + 0.001) {
             return 'DIRECT_MARKETING_TRAJECTORY_SOC_PHYSICS_INVALID';
+        }
+        $slotChargeEfficiency = $chargeEfficiency;
+        $slotDischargeEfficiency = $dischargeEfficiency;
+        $routeEnergy = array_key_exists('energy_conversion_contract', $source['meta']);
+        if ($routeEnergy) {
+            if ($source['meta']['energy_conversion_contract'] !== 'direct_marketing_route_energy_v1') {
+                return 'DIRECT_MARKETING_ROUTE_ENERGY_BINDING_INVALID';
+            }
+            $expectedConversion = liveRouteEnergyConversion($plan['direct_marketing'] ?? [], $slot, $source['meta']['efficiencies'], $standardPassthroughValid);
+            if ($expectedConversion === null
+                || liveTrajectoryCanonicalJson($slot['energy_conversion'] ?? null)
+                    !== liveTrajectoryCanonicalJson($expectedConversion)) {
+                return 'DIRECT_MARKETING_ROUTE_ENERGY_BINDING_INVALID';
+            }
+            if (!$standardPassthroughValid) {
+                $slotChargeEfficiency = $expectedConversion['charge'];
+                $slotDischargeEfficiency = $expectedConversion['discharge'];
+            }
+        } elseif (array_key_exists('energy_conversion', $slot)) {
+            return 'DIRECT_MARKETING_ROUTE_ENERGY_BINDING_INVALID';
         }
         if (!$standardPassthroughValid) {
             $expectedSocEnd = (float)$slot['soc_start_pct'];
             if ($batteryW >= 0.0) {
                 $expectedSocEnd += $batteryW * ($integrationDurationS / 3600.0)
-                    * $chargeEfficiency / $capacityWh * 100.0;
+                    * $slotChargeEfficiency / $capacityWh * 100.0;
             } else {
                 $expectedSocEnd -= abs($batteryW) * ($integrationDurationS / 3600.0)
-                    / $dischargeEfficiency / $capacityWh * 100.0;
+                    / $slotDischargeEfficiency / $capacityWh * 100.0;
             }
             $expectedSocEnd = max(0.0, min(100.0, $expectedSocEnd));
             if (!is_finite($expectedSocEnd)
@@ -4329,7 +4544,7 @@ function liveTrajectoryValidationReason($plan, $source, $canonicalPlan) {
         $previousSlotId = $slot['slot_id'];
     }
     if ($previousEnd !== $horizonEndMs) return 'DIRECT_MARKETING_TRAJECTORY_HORIZON_MISMATCH';
-    if (count($headroomProjectionIds) !== count($headroomEvidence['slots_by_bounds'] ?? [])) {
+    if (count($headroomProjectionIds) !== ($operatingProjection ? 0 : count($headroomEvidence['slots_by_bounds'] ?? []))) {
         return 'DIRECT_MARKETING_HEADROOM_PROJECTION_COVERAGE_INVALID';
     }
     return null;
@@ -5296,9 +5511,9 @@ if (is_array($liveData) && isset($liveData['PV_Power'])) {
                 $data['wb_soc_source']      = $wbSocSource;
                 $data['wb_soc_source_ts']   = $wbSocSourceTs;
                 $data['wb_soc_rule_confirmed'] = $wbSocConfirmed;
-                $data['wb_soc_age_contract'] = $openwbData['car_soc_age_contract'] ?? null;
-                $data['wb_soc_age_contract_source'] = $openwbData['car_soc_age_contract_source'] ?? null;
-                $data['wb_soc_max_age_s'] = $openwbData['car_soc_max_age_s'] ?? null;
+                foreach (wallboxSocAgeProjection($openwbData, $wbSocSource) as $key => $value) {
+                    $data['wb_soc_' . $key] = $value;
+                }
                 $wbRangeContract = openwbTotalRangeContract($openwbData);
                 $data['wb_range'] = is_array($wbRangeContract)
                     ? (float)$wbRangeContract['range_km']
@@ -6793,9 +7008,9 @@ if (($wb2NativeType === 'openwb' || $wb2NativeType === 'openwb_pro')
         $data['wb2_soc_source'] = $wb2SocSource;
         $data['wb2_soc_source_ts'] = $wb2SocSourceTs;
         $data['wb2_soc_rule_confirmed'] = $wb2SocConfirmed;
-        $data['wb2_soc_age_contract'] = $openwbData2['car_soc_age_contract'] ?? null;
-        $data['wb2_soc_age_contract_source'] = $openwbData2['car_soc_age_contract_source'] ?? null;
-        $data['wb2_soc_max_age_s'] = $openwbData2['car_soc_max_age_s'] ?? null;
+        foreach (wallboxSocAgeProjection($openwbData2, $wb2SocSource) as $key => $value) {
+            $data['wb2_soc_' . $key] = $value;
+        }
         $wb2RangeContract = openwbTotalRangeContract($openwbData2);
         $data['wb2_range'] = is_array($wb2RangeContract)
             ? (float)$wb2RangeContract['range_km']
@@ -9087,6 +9302,11 @@ if ($storagePlanFresh) {
             $directMarketingConfigured,
             $canonicalPlan
         );
+        // Die gültige Zukunftsprognose hängt nicht vom Hardwareeffekt des
+        // aktuellen Slots ab. Diese Metadaten geben keinerlei Befehle frei.
+        $directMarketingSocPlanAvailable = ($directMarketingTrajectoryForDisplay['active'] ?? null) === true
+            && ($directMarketingTrajectoryForDisplay['complete'] ?? null) === true
+            && ($directMarketingTrajectoryForDisplay['plan_id'] ?? null) === ($storPlan['plan_id'] ?? null);
         $effectiveProjectionHidden = liveDirectMarketingShouldHideClassicalCurves(
             $activeDirectMarketingPlan,
             $directMarketingTrajectoryForDisplay,
@@ -9485,7 +9705,9 @@ if ($storagePlanFresh) {
         );
         if ($targetReachReason === null || $targetReachReason === '') {
             $targetReachReason = $activeDirectMarketingPlan
-                ? 'DV-Auswahl oder Hardwarewirkung ist noch nicht vollständig gebunden; Ziel und Leistung bleiben unbekannt.'
+                ? ($directMarketingSocPlanAvailable
+                    ? 'Der geplante DV-SoC-Verlauf ist verfügbar. Aktuelle Freigabe und Hardwarewirkung werden davon getrennt bewertet.'
+                    : 'Die DV-SoC-Prognose ist noch nicht vollständig gebunden. Die aktuelle Ausführung wird davon getrennt bewertet.')
                 : ($displayCanReachTarget
                 ? 'Tagesziel erreichbar: Zielkurve aktiv. Die Prognose wird bei jedem Planlauf neu geprüft.'
                 : 'Tagesziel aktuell nicht erreichbar: E3DC AUTO. Der E3DC nutzt realen PV-Überschuss autonom; Entladung bleibt geschützt. Die Prognose wird bei jedem Planlauf neu geprüft.');
@@ -9520,6 +9742,9 @@ if ($storagePlanFresh) {
             'effective_target_soc'=> $effectiveValue('effective_target_soc', $storPlan['effective_target_soc'] ?? null),
             'effective_storage_plan'=> $effectiveStoragePlanBound ? $effectiveStoragePlan : null,
             'effective_projection_status'=> $effectiveStoragePlanBound ? $effectiveStatus : 'EVIDENCE_LIMIT',
+            'soc_projection_source'=> $directMarketingSocPlanAvailable ? 'canonical_direct_marketing_trajectory' : null,
+            'soc_projection_stage'=> $directMarketingSocPlanAvailable ? 'planned' : null,
+            'soc_projection_requires_current_effect'=> false,
             'target_projection_authorized'=> $effectiveStoragePlanBound
                 ? ($effectiveStoragePlan['target_projection_authorized'] ?? null)
                 : ($activeDirectMarketingPlan ? null : true),

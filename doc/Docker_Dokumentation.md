@@ -2,10 +2,15 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.5a`. Die Tags `latest`, `v5.4.5a` und
-`5.4.5a` bezeichnen denselben Stable-Stand.
+Der aktuelle Stable-Stand ist `v5.4.5b`. Die Tags `latest`, `v5.4.5b` und
+`5.4.5b` bezeichnen denselben Stable-Stand.
 
-5.4.5a ergänzt die rein lesende Anzeige eines frisch beobachteten
+5.4.5b enthält Wartungskorrekturen für Wallbox-Budget, Fahrzeug-SoC,
+Speicher- und PV-Vorschau sowie Diagnose. Image-Pull, isolierte Volumes,
+Ramdisk und Health-Prüfung behalten ihren bisherigen Ablauf. Die
+[Release Notes](../RELEASE_NOTES.md) beschreiben die Produktänderungen.
+
+Seit 5.4.5a gibt es zusätzlich die rein lesende Anzeige eines frisch beobachteten
 openWB-Fahrzeug-SoC samt Quelle und Alter. Ohne eindeutige Zuordnung zur
 aktuellen Stecksession oder zum passenden Fahrzeugprofil entsteht daraus keine
 Regelautorität; auch eine sichtbare Beobachtung sendet keinen Hardwarebefehl.
@@ -391,7 +396,7 @@ unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.5a` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.5b` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -418,7 +423,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.5a` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.5b` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash

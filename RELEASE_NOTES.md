@@ -1,4 +1,98 @@
-# E3DC-Control v5.4.5a
+# E3DC-Control v5.4.5b
+
+Release-Stand: 2026-09-06.
+
+E3DC-Control 5.4.5b ist ein Wartungsupdate für Wallbox-Budget,
+Fahrzeug-Ladestand, Speicherprognose und Diagnose. Nutzer-`Aus`, manuelle
+Pausen, Netz- und Akku-Wh-Wächter, Notstromreserve und Hardwaregrenzen bleiben
+wirksam. Der gewohnte Update- und Rückfallweg bleibt erhalten.
+
+## Wallbox-Budget bleibt nachvollziehbar
+
+- Nach einer frisch bestätigten Wallboxleistung von 0 W kann weiterhin
+  freigegebene PV-Leistung aus einem zeitlich passenden Netz-/Batterierahmen
+  ermittelt werden. Ein nachlaufender Netzfilter verdeckt diesen Anteil nicht
+  länger künstlich. Batterieentladung wird dabei nicht als PV-Überschuss
+  gezählt; bei laufender oder unklarer Ladung bleibt die bisherige Bilanz.
+- Ein bereits finanzierter kurzfristiger Reserveanteil kann innerhalb
+  derselben weiterhin freigegebenen Stecksession wieder in das eigene
+  Wallboxangebot eingehen. Er wird gleichzeitig aus der nicht nutzbaren
+  Reserve entfernt. Bereits zugeteilte Budgets anderer Verbraucher bleiben
+  erhalten.
+- Eine gesperrte Phasenumschaltung ist kein Beleg für einphasiges Laden.
+  Mindestleistung und Stromberechnung verwenden die belegte Phasenzahl,
+  auch bei zusätzlicher Fahrzeugkommunikation der openWB Pro. Ein Auftrag,
+  die Phasen beizubehalten, erzeugt keine Umschaltung.
+
+## Fahrzeug-SoC aus passender Quelle
+
+- Fehlt der openWB Pro ein eigener SoC, kann ein bestätigter Cloudwert des
+  eindeutig zugeordneten Fahrzeugs die aktuelle Stecksession verankern.
+  Gemessene Ladeenergie, Fahrzeugkapazität und Wirkungsgrad schreiben den
+  Ladestand innerhalb der bestehenden Acht-Stunden-Grenze weiter.
+- Die Hochrechnung ist als Schätzung erkennbar. Der ursprüngliche
+  Quellzeitpunkt wird nicht verjüngt; eine neue Stecksession übernimmt keinen
+  ungeprüften alten Anker. Ein frischer bestätigter Pro-SoC bleibt vorrangig.
+- Bei eingerichteter Bluelink-Zuordnung kann ein fehlender brauchbarer SoC
+  beim Anstecken genau einen automatischen Abruf für dieses Fahrzeug
+  auslösen. Cloudintervall, `Aus`, manuelle Pause, Abstecken und Profilwechsel
+  werden berücksichtigt. Ein vorhandener manueller Auftrag wird nicht
+  überschrieben; bei Fehlern entsteht weder eine Abrufschleife noch ein
+  kontoweites Aufwecken anderer Fahrzeuge.
+- E3DC-Control stellt die Fahrzeugkommunikation der Pro nicht automatisch um.
+  Die reine PWM-Einstellung liefert keinen SoC über das Ladekabel. Hinweise
+  zur passenden Geräteeinstellung und Fahrzeugkompatibilität stehen in der
+  [Fahrzeugintegration](doc/Fahrzeug_Integration.md).
+
+## Konsistente Speicher- und PV-Vorschau
+
+- Abgelehnte Verkaufskandidaten lassen die normale Hausversorgung als
+  eigene Planaktion bestehen. Geplant, angefordert und tatsächlich bestätigt
+  bleiben verschiedene Zustände.
+- Die PV-Aufnahmeplanung bilanziert Hausbedarf und bereits gewählte Lade-
+  und Verkaufsfenster zeitlich. Ein tatsächlich ausgewählter Verkauf kann
+  Platz für nachfolgende zulässige Ladung schaffen; ein bloßer Kandidat
+  oder ein späterer Verkauf wird nicht vorzeitig angerechnet. Günstigere
+  spätere Ladefenster behalten ihren vorgesehenen Speicherplatz.
+- Wetterbedingtes PV-Potenzial und betriebsbedingt nutzbare PV werden
+  getrennt dargestellt. Bekannte feste Abschaltregeln sind gekennzeichnete
+  Planannahmen. Unbekannte Preise oder zukünftige Abregelvorgaben werden
+  nicht als sichere Abschaltung oder sichere Verfügbarkeit ausgegeben.
+- Eine Einspeisegrenze von 0 W setzt die E3/DC-DC-Erzeugung für Haus und
+  Speicher nicht automatisch auf 0 W. Die Erweiterung ist keine vollständige
+  gemeinsame Optimierung von Wechselrichtern, Lade- und Verkaufsfenstern;
+  insbesondere wird kein zukünftiger Luox-Fahrplan erfunden.
+- Der aktuelle Viertelstundenslot zählt nur mit seiner Restdauer. Die
+  gemeinsame Vorschau hält gewählte Aktion, Quellenaufteilung, Reserve und
+  SoC-Verlauf zusammen. Eco, Eco+ und Profitprofile bleiben erhalten; daraus
+  entstehen keine zusätzlichen E3/DC-Steuerbefehle oder Hardwarefreigaben.
+
+## Ruhigere Reservefreigabe und bessere Diagnose
+
+- An der Notstromreserve bleibt Entladen sofort gesperrt. Die Freigabe
+  oberhalb der Reserve benötigt einen ausreichenden Abstand und bestätigte
+  frische Messungen über die Erholungszeit. Ein einzelner SoC-Sprung oder
+  eine Messlücke genügt nicht; die harte Reserve wird nicht abgesenkt.
+- Regelruhe unterscheidet Entscheidungen, bestätigte Ausgänge, tatsächliche
+  Ausgangswechsel und neue Ausgabetransaktionen. Alte oder zusammengefasste
+  Historien werden nicht als lückenlos bestätigte Hardwarewirkung dargestellt.
+- Die Wallboxdiagnose zeigt ursprüngliches und wirksames Budget sowie die
+  Quelle und Zeitbasis einer Bilanzkorrektur, ohne zusätzliche Logfrequenz.
+- Die PV-Prognosediagnose zeigt Zeitraum, Fallzahl, Abdeckung, Ausschlüsse
+  und getrennte Prognosestufen. Fehlende Messabschnitte sowie unbestätigte
+  Abregelung oder Clipping bleiben Grenzen der Auswertung. Diagnosewerte
+  wählen kein Modell und verändern nicht selbstständig die Regelung.
+- Die Statistikarchivierung erhält die vorgesehenen gemeinsamen Datenrechte.
+
+## Update
+
+Das Web-Update und der dokumentierte Docker-Host-Helfer bleiben die
+vorgesehenen Updatewege. Nach einem erfolgreichen Update bitte die Seite
+neu laden. Der neue Service-Worker-Cache trennt die aktualisierten Webdateien
+vom vorherigen Stand. Bestehende Konfiguration, Schutzgrenzen und die
+Reparaturen aus 5.4.5a bleiben enthalten.
+
+## Enthaltener Stand aus 5.4.5a
 
 Release-Stand: 2026-09-04.
 

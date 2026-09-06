@@ -5,16 +5,22 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.4.5a`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.4.5b`. Das Dashboard startet ausschließlich
 den argumentlosen, root-eigenen Systemjob. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
 
-5.4.5a lässt den Simple-Stable-Updater vor einem neuen Backup oder
+5.4.5b ist ein Wartungsupdate für Wallbox-Budget, Fahrzeug-SoC, Speicher- und
+PV-Vorschau sowie Diagnose. Der vorhandene Updateablauf wird dafür nicht
+ersetzt. Nach dem erfolgreichen Abschluss bitte die Seite neu laden; der
+Service-Worker verwendet eine neue Cachekennung. Die vollständigen
+Änderungen stehen in den [Release Notes](../RELEASE_NOTES.md).
+
+Seit 5.4.5a verwendet der Simple-Stable-Updater vor einem neuen Backup oder
 Dateiaustausch unter dem bereits gehaltenen systemweiten Update-Lock den
-vollständigen, an die konkrete Installation gebundenen Recovery-Resolver
-verwenden. Eine vollständig belegte Unterbrechung während der Vorbereitung vor
+vollständigen, an die konkrete Installation gebundenen Recovery-Resolver.
+Eine vollständig belegte Unterbrechung während der Vorbereitung vor
 dem eigentlichen Updatejournal kann dadurch sicher abgeschlossen oder bereinigt
 werden. Aus einem Dateinamen oder dem bloßen Vorhandensein eines Restes entsteht
 keine Fortsetzungs- oder Löschautorität.

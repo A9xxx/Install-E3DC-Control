@@ -21,6 +21,17 @@ from contextlib import contextmanager
 from typing import Any, Callable, Iterable
 from urllib.parse import quote
 
+try:
+    from .pv_forecast_diagnostic_details import (
+        archive_details, calculate_details, initialize_tables, sanitize_details,
+        store_external, tables_ready,
+    )
+except ImportError:  # Direkter Modulstart ohne Paketkontext.
+    from pv_forecast_diagnostic_details import (
+        archive_details, calculate_details, initialize_tables, sanitize_details,
+        store_external, tables_ready,
+    )
+
 
 EVIDENCE_STATE_DIR = "/var/lib/e3dc-control/forecast-evidence"
 EVIDENCE_DB_PATH = os.path.join(EVIDENCE_STATE_DIR, "pv_forecast_evidence.db")
@@ -613,6 +624,7 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
         BEGIN SELECT RAISE(ABORT, 'diagnostic_summaries are immutable'); END;
         """
     )
+    initialize_tables(connection)
     schema_row = connection.execute(
         "SELECT value FROM evidence_meta WHERE key = 'schema_version'"
     ).fetchone()
@@ -688,7 +700,7 @@ def _schema_is_ready(connection: sqlite3.Connection) -> bool:
             """
         ).fetchall()
     }
-    return required_objects == present
+    return required_objects == present and tables_ready(connection)
 
 
 def _database_is_busy(exc: BaseException) -> bool:
@@ -1096,6 +1108,7 @@ def archive_forecast_snapshot(
                 """,
                 [{"issue_id": issue_id, **item} for item in normalized],
             )
+            archive_details(connection, issue_id, slot_list)
     return {
         "archived": True,
         "inserted": bool(cursor.rowcount),
@@ -1212,6 +1225,10 @@ def enforce_retention(
     cutoff = now_s - RAW_RETENTION_S
     deleted = {"observations": 0, "forecasts": 0, "summaries": 0}
     with database(database_path, write=True) as connection:
+        connection.execute(
+            "DELETE FROM forecast_external_observations WHERE slot_start_utc_s + 900 < ?",
+            (cutoff,),
+        )
         cursor = connection.execute(
             "DELETE FROM observed_slots WHERE slot_end_utc_s < ?",
             (cutoff,),
@@ -1231,6 +1248,15 @@ def enforce_retention(
             (cutoff,),
         )
         deleted["forecasts"] = max(0, int(cursor.rowcount))
+        connection.execute("""
+            DELETE FROM forecast_diagnostic_parameters
+            WHERE parameter_revision NOT IN (
+                SELECT parameter_revision
+                FROM forecast_diagnostic_slots
+                WHERE stages_json IS NOT NULL
+                  AND parameter_revision IS NOT NULL
+            )
+        """)
         cursor = connection.execute(
             "DELETE FROM diagnostic_summaries WHERE calculated_at_utc_s < ?",
             (cutoff,),
@@ -2300,6 +2326,9 @@ def calculate_diagnostic_summary(
         "probabilistic_evidence": _probabilistic_evidence_contract(),
         "observation_quality": _observation_quality_contract(),
         "source_diagnostics": _source_diagnostics(compared),
+        "diagnostic_details": calculate_details(
+            connection, revision, current_method_revision, now_s
+        ),
         "metrics": {
             "trefferabweichung_wh": rounded("trefferabweichung_wh"),
             "richtungsversatz_wh": rounded("richtungsversatz_wh"),
@@ -2346,6 +2375,7 @@ def append_summary_if_due(
             if (
                 isinstance(latest_payload, dict)
                 and latest_payload.get("schema_version") == SUMMARY_SCHEMA
+                and isinstance(latest_payload.get("diagnostic_details"), dict)
                 and isinstance(latest_payload.get("forecast_issue_contract"), dict)
                 and latest_payload["forecast_issue_contract"].get("issue_id")
                     == current_issue_id
@@ -2627,6 +2657,7 @@ def _sanitized_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "probabilistic_evidence": _probabilistic_evidence_contract(),
         "observation_quality": _observation_quality_contract(),
         "source_diagnostics": _source_diagnostics(compared_slots),
+        "diagnostic_details": sanitize_details(payload.get("diagnostic_details")),
         "metrics": sanitized_metrics,
         "labels": dict(DIAGNOSTIC_LABELS),
     }

@@ -24,6 +24,8 @@ if REPO_ROOT not in sys.path:
 if INSTALLER_DIR not in sys.path:
     sys.path.insert(0, INSTALLER_DIR)
 
+from Forecast.pv_forecast_diagnostic_details import build_stage_metadata, provider_resource_samples
+
 from pv_forecast_topology import (
     RESOURCE_PROJECTION_ABS_TOLERANCE_W,
     RESOURCE_PROJECTION_REL_TOLERANCE,
@@ -2787,6 +2789,7 @@ class EnsemblePVForecaster:
                 "resource_kwh": resource_kwh,
                 "resource_projection_state": resource_projection_state,
                 "split_freshness": split_freshness,
+                "diagnostic_weights": {"m1": norm_w1, "m2": norm_w2, "m3": norm_w3},
             })
 
         # Weiche Interpolation auf 15-Minuten Blöcke
@@ -2872,6 +2875,13 @@ class EnsemblePVForecaster:
                         }
 
                 start_ms = start_s * 1000
+                try:
+                    diagnostic_provider_resources = provider_resource_samples(
+                        resource_models, resource_keys, hr["ts"], adjacent_hr["ts"],
+                        .25 if q in (0, 3) else .10,
+                    )
+                except Exception:
+                    diagnostic_provider_resources = {}
                 ensemble_forecast.append({
                     "start_timestamp": start_ms,
                     "end_timestamp": start_ms + (900 * 1000),
@@ -2879,6 +2889,22 @@ class EnsemblePVForecaster:
                     "m1_raw": hr.get("m1"),
                     "m2_raw": hr.get("m2"),
                     "m3_raw": hr.get("m3"),
+                    "pv_diagnostic_daylight_expected": (
+                        daylight_factor > 0 if getattr(self, "_solar_location_valid", False) else None
+                    ),
+                    "pv_diagnostic_provider_resources": diagnostic_provider_resources,
+                    "pv_diagnostic_parameters": {
+                        "method_revision": FORECAST_METHOD_REVISION,
+                        "current_weights": hr["diagnostic_weights"],
+                        "adjacent_weights": adjacent_hr["diagnostic_weights"],
+                        "interpolation_adjacent_weight": .25 if q in (0, 3) else .10,
+                        "solar_cap_factor": daylight_factor,
+                        "installed_kwp": self.total_kwp,
+                        "provider_freshness": {
+                            key: isinstance(value, dict) and value.get("fresh") is True
+                            for key, value in model_freshness.items()
+                        },
+                    },
                     "pv_resource_raw_w": slotted_resources_w,
                     "pv_resource_reference_w": max(0.0, slotted_kw * 1000.0),
                     "pv_resource_projection_status": slot_projection_state["status"],
@@ -2931,6 +2957,9 @@ class EnsemblePVForecaster:
             slot = dict(slot)
             slot_total_w = _slot_kw(slot, "predicted_kwh") * 1000.0
             resource_raw_w = slot.pop("pv_resource_raw_w", {})
+            diagnostic_raw_resources = dict(resource_raw_w)
+            diagnostic_provider_resources = slot.pop("pv_diagnostic_provider_resources", {})
+            diagnostic_parameters = slot.pop("pv_diagnostic_parameters", {})
             projection_status = slot.pop("pv_resource_projection_status", "unbound")
             projection_reason = slot.pop(
                 "pv_resource_projection_reason",
@@ -2992,6 +3021,14 @@ class EnsemblePVForecaster:
                 if topology_slot.get("status") == "bound"
                 else "missing_or_incoherent_resource_projection"
             )
+            try:
+                slot["pv_diagnostic_stages"] = build_stage_metadata(
+                    slot, pv_topology_contract, diagnostic_raw_resources,
+                    diagnostic_provider_resources, diagnostic_parameters,
+                )
+            except Exception:
+                slot["pv_diagnostic_stages"] = None
+                slot["pv_diagnostic_stage_status"] = "EVIDENCE_LIMIT"
             night_zero_evidence = self._pv_night_zero_evidence(
                 slot,
                 topology_slot,

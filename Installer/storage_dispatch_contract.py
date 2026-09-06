@@ -59,6 +59,8 @@ SHADOW_INPUT_BINDING_SCHEMA = "storage_dispatch_shadow_input_binding_v2"
 PRICE_HORIZON_SCHEMA = "storage_dispatch_price_horizon_v2"
 DIRECT_MARKETING_PLAN_PROJECTION_SCHEMA = "direct_marketing_plan_projection_v1"
 DIRECT_MARKETING_TRAJECTORY_SCHEMA = "direct_marketing_trajectory_v1"
+DIRECT_MARKETING_OPERATING_PV_CONTRACT = "selected_actions_operating_pv_v1"
+DIRECT_MARKETING_ROUTE_ENERGY_CONTRACT = "direct_marketing_route_energy_v1"
 DIRECT_MARKETING_SOC_INTEGRATOR_CONTRACT = (
     "direct_marketing_energy_integrator_v1"
 )
@@ -3008,6 +3010,11 @@ def _direct_marketing_trajectory_shape_valid(
         "load_aggregation_contract",
         "pv_aggregation_contract",
     }
+    route_energy = "energy_conversion_contract" in meta
+    if route_energy:
+        if meta["energy_conversion_contract"] != DIRECT_MARKETING_ROUTE_ENERGY_CONTRACT:
+            return False
+        expanded_meta_keys.add("energy_conversion_contract")
     meta_keyset = frozenset(meta)
     if meta_keyset not in {
         frozenset(base_meta_keys),
@@ -3058,6 +3065,12 @@ def _direct_marketing_trajectory_shape_valid(
         "hardware_effect",
         "headroom_projection",
     }
+    if meta.get("pv_aggregation_contract") == DIRECT_MARKETING_OPERATING_PV_CONTRACT:
+        regular_slot_keys.add("pv_operating_projection")
+        projection_slot_keys.add("pv_operating_projection")
+    if route_energy:
+        regular_slot_keys.add("energy_conversion")
+        projection_slot_keys.add("energy_conversion")
     regular_selection_keys = {
         "selected",
         "executable",
@@ -5773,6 +5786,176 @@ def _canonical_pre_valid_from_soc_chain_valid(
     )
 
 
+def _direct_marketing_operating_pv_projection(
+    direct: Dict[str, Any],
+    slot: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Trennt Wetterpotential und nutzbare PV ohne Aktor- oder Lernwirkung.
+
+    Nur eine explizit konfigurierte Abschaltregel mit belegtem Slotpreis
+    verändert die AC-Prognose. Ein fehlendes zukünftiges Exportlimit bleibt
+    unbekannt; insbesondere bedeutet ein AC-Exportlimit niemals DC-PV = 0.
+    """
+
+    projection = slot.get("projection") if isinstance(slot.get("projection"), dict) else {}
+    forecast = slot.get("forecast_w") if isinstance(slot.get("forecast_w"), dict) else {}
+    prices = slot.get("prices_ct_kwh") if isinstance(slot.get("prices_ct_kwh"), dict) else {}
+    rules = direct.get("pv_operating_rules") if isinstance(direct.get("pv_operating_rules"), dict) else {}
+    rules_valid = rules.get("schema_version") == "direct_marketing_pv_operating_rules_v1"
+    shutdown = rules.get("external_ac_negative_price_shutdown") if rules_valid and isinstance(rules.get("external_ac_negative_price_shutdown"), dict) else {}
+    total = _canonical_trajectory_finite_number(projection.get("pv_w"))
+    dc_axis = forecast.get("e3dc_dc_pv") if isinstance(forecast.get("e3dc_dc_pv"), dict) else {}
+    external_axis = forecast.get("external_ac_pv") if isinstance(forecast.get("external_ac_pv"), dict) else {}
+    dc = _canonical_trajectory_finite_number(dc_axis.get("point"))
+    external = _canonical_trajectory_finite_number(external_axis.get("point"))
+    total, dc, external = (round(value, 3) if value is not None else None for value in (total, dc, external))
+    price = _canonical_trajectory_finite_number(prices.get("gross_sell"))
+    threshold = _canonical_trajectory_finite_number(shutdown.get("threshold_ct"))
+    configured_shutdown = bool(
+        shutdown.get("configured") is True
+        and isinstance(shutdown.get("source"), str) and shutdown.get("source")
+        and threshold is not None
+    )
+    future_price_unknown = configured_shutdown and (price is None or prices.get("fresh") is False)
+    split_valid = bool(
+        total is not None and dc is not None and external is not None
+        and min(total, dc, external) >= 0.0
+        and abs(total - dc - external) <= 0.01
+    )
+    shutdown_requested = bool(
+        configured_shutdown and price is not None
+        and prices.get("fresh") is not False
+        and price < threshold
+    )
+    external_off = shutdown_requested and split_valid
+    operating_complete = not future_price_unknown and (not shutdown_requested or split_valid)
+    weather = {"total": total, "e3dc_dc": dc, "external_ac": external}
+    operating = {
+        "total": (dc if external_off else total) if operating_complete else None,
+        "e3dc_dc": dc,
+        "external_ac": 0.0 if external_off else external,
+    }
+    energy_projection = dict(weather) if future_price_unknown else dict(operating)
+    return {
+        "schema_version": "direct_marketing_operating_pv_projection_v1",
+        "complete": operating_complete,
+        "weather_potential_w": weather,
+        "operating_available_w": operating,
+        "energy_projection_w": energy_projection,
+        "soc_projection_basis": "conditional_weather_auto" if future_price_unknown else "operating_pv",
+        "external_ac_off": external_off,
+        "external_ac_off_basis": (
+            "configured_negative_price_shutdown" if external_off
+            else "source_split_missing" if shutdown_requested
+            else "future_price_unconfirmed" if future_price_unknown
+            else "no_applicable_shutdown_rule"
+        ),
+        "market_price_ct": price,
+        "shutdown_threshold_ct": threshold,
+        "e3dc_export_limit_w": None,
+        "e3dc_export_limit_basis": "future_limit_unconfirmed",
+        "weather_learning_allowed": False,
+        "hardware_effect_claim_allowed": False,
+    }
+
+
+def _direct_marketing_operating_baseline_binding(canonical: Dict[str, Any]) -> Dict[str, Any]:
+    """Bindet die read-only AUTO-Baseline an Planeingaben, nicht an Kandidaten."""
+    return {
+        "schema": DIRECT_MARKETING_STANDARD_PROJECTION_BINDING_SCHEMA,
+        "projection_only": True,
+        "executable": False,
+        "commands_allowed": False,
+        "hardware_effect": False,
+        "source_schema": "canonical_dispatch_input_revisions_v1",
+        "source_revision": revision_hash(canonical.get("input_revisions") or {}),
+    }
+
+
+def _direct_marketing_route_energy_parameters(direct, action, source_contract, dc_available_w, legacy):
+    """Bindet Umrechnung an die vorhandenen Planfaktoren, nie an Rohkonfiguration.
+
+    Vollständig feldlose Altpläne behalten ihre Roundtrip-Näherung. Eine
+    teilweise oder ungültige Routenangabe ist dagegen kein Altvertrag.
+    DC-/AC-Eingangsleistung wird genau einmal in Batterieenergie umgerechnet;
+    selected_stored_wh ist bereits Batterieenergie und kein neuer Eingang.
+    """
+    flags = direct.get("flags") if isinstance(direct.get("flags"), dict) else {}
+    keys = (
+        "pv_store_dc_charge_efficiency_pct",
+        "pv_store_aux_ac_charge_efficiency_pct",
+        "pv_store_discharge_efficiency_pct",
+    )
+    declared = [key in flags for key in keys]
+    if not any(declared):
+        charge = _canonical_trajectory_finite_number(legacy.get("charge"))
+        discharge = _canonical_trajectory_finite_number(legacy.get("discharge"))
+        if not all(value is not None and 0.0 < value <= 1.0 for value in (charge, discharge)):
+            return None
+        return {"source": "legacy_roundtrip", "charge_input_basis": "legacy_unspecified_input",
+                "dc_charge": charge, "aux_ac_charge": charge, "discharge": discharge,
+                "dc_available_w": 0.0}
+    values = [_canonical_trajectory_finite_number(flags.get(key)) for key in keys]
+    if not all(declared) or not all(value is not None and 0.0 < value <= 100.0 for value in values):
+        return None
+    dc_charge, aux_charge, discharge = (round(value / 100.0, 6) for value in values)
+    if min(dc_charge, aux_charge, discharge) <= 0.0:
+        return None
+    if action in {"PV_STORE", "DV_CURVE_CHARGE"}:
+        if source_contract == "E3DC_DC":
+            basis = "dc_input"
+        elif source_contract == "E3DC_DC_PLUS_AUX_AC_PV":
+            basis = "dc_first_aux_ac_input"
+        elif action == "DV_CURVE_CHARGE" and flags.get("pv_store_dc_only_enable") is True:
+            basis = "dc_input"
+        else:
+            return None
+    elif action == "PASSIVE_NORMAL":
+        basis = "dc_first_aux_ac_input"
+    else:
+        basis = "no_charge"
+    dc_available = _canonical_trajectory_finite_number(dc_available_w)
+    if dc_available is not None and dc_available < 0.0:
+        return None
+    return {"source": "direct_marketing.flags", "charge_input_basis": basis,
+            "dc_charge": dc_charge, "aux_ac_charge": aux_charge, "discharge": discharge,
+            "dc_available_w": dc_available}
+
+
+def _direct_marketing_route_charge_limit(room_wh, duration_h, parameters):
+    """Batterieseitigen Raum stückweise in Eingangsleistung zurückrechnen."""
+    stored_w = max(0.0, room_wh) / duration_h
+    if parameters["charge_input_basis"] == "dc_first_aux_ac_input":
+        if parameters["dc_available_w"] is None:
+            return 0.0
+        dc_w = min(parameters["dc_available_w"], stored_w / parameters["dc_charge"])
+        return dc_w + max(0.0, stored_w - dc_w * parameters["dc_charge"]) / parameters["aux_ac_charge"]
+    return stored_w / parameters["dc_charge"]
+
+
+def _direct_marketing_route_energy_conversion(parameters, battery_w, *, canonical_passthrough=False):
+    """Veröffentlicht die tatsächliche Eingangsaufteilung, nicht Brutto-Wh erneut."""
+    if canonical_passthrough:
+        # Der bestehende Standard-SoC wird übernommen, nicht mit den neuen
+        # Routenfaktoren nachgerechnet. Dafür keinen angewendeten Faktor erfinden.
+        return {"source": "canonical_standard_passthrough", "charge_input_basis": "canonical_standard_soc",
+                "dc_charge": None, "aux_ac_charge": None, "discharge": None,
+                "charge": None, "dc_input_w": None, "aux_ac_input_w": None}
+    charge_w = max(0.0, battery_w)
+    basis = parameters["charge_input_basis"]
+    if basis == "dc_first_aux_ac_input" and charge_w > 0.0 and parameters["dc_available_w"] is None:
+        return None
+    dc_w = min(charge_w, parameters["dc_available_w"] or 0.0) if basis == "dc_first_aux_ac_input" else charge_w
+    aux_w = max(0.0, charge_w - dc_w)
+    effective_charge = ((dc_w * parameters["dc_charge"] + aux_w * parameters["aux_ac_charge"]) / charge_w
+                        if charge_w > 0.0 else parameters["dc_charge"])
+    return {"source": parameters["source"], "charge_input_basis": basis,
+            "dc_charge": parameters["dc_charge"], "aux_ac_charge": parameters["aux_ac_charge"],
+            "discharge": parameters["discharge"], "charge": round(effective_charge, 6),
+            "dc_input_w": None if basis == "legacy_unspecified_input" else round(dc_w, 3),
+            "aux_ac_input_w": None if basis == "legacy_unspecified_input" else round(aux_w, 3)}
+
+
 def _materialize_direct_marketing_trajectory(
     source: Dict[str, Any],
     canonical: Dict[str, Any],
@@ -5837,65 +6020,11 @@ def _materialize_direct_marketing_trajectory(
         )
     )
     capacity_wh = _battery_capacity_wh(source)
-    headroom_projection_state = (
-        _direct_marketing_headroom_projection_state(
-            direct,
-            canonical,
-            valid_from_ms,
-            _safe_int(canonical.get("horizon_end_ts_ms"), 0),
-            capacity_wh,
-        )
-    )
-    if (
-        headroom_projection_state.get("present") is True
-        and headroom_projection_state.get("valid") is not True
-    ):
-        base.update({
-            "active": True,
-            "complete": False,
-            "status": "HEADROOM_PROJECTION_PLAN_INVALID",
-            "reason_code": headroom_projection_state.get("reason_code"),
-            "slots": [],
-        })
-        return base
-    headroom_projection_bindings = (
-        headroom_projection_state.get("bindings_by_slot")
-        if isinstance(
-            headroom_projection_state.get("bindings_by_slot"),
-            dict,
-        )
-        else {}
-    )
-    standard_projection_binding_template = (
-        {
-            "schema": DIRECT_MARKETING_STANDARD_PROJECTION_BINDING_SCHEMA,
-            "projection_only": True,
-            "executable": False,
-            "commands_allowed": False,
-            "hardware_effect": False,
-            "source_schema": (
-                DIRECT_MARKETING_HEADROOM_PROJECTION_PLAN_SCHEMA
-            ),
-            "source_revision": headroom_projection_state.get(
-                "plan_revision"
-            ),
-        }
-        if bool(
-            headroom_projection_state.get("present") is True
-            and headroom_projection_state.get("valid") is True
-        )
-        else None
-    )
-    if not bool(
-        _direct_marketing_execution_enabled(direct)
-        or headroom_projection_bindings
-    ):
-        base.update({
-            "active": True,
-            "complete": False,
-            "status": "DIRECT_MARKETING_POLICY_NOT_EXECUTION_READY",
-        })
-        return base
+    # Die Qualität eines unbenutzten Verkaufskandidaten ist keine Autorität
+    # über die vollständige AUTO-/Aktionsprognose. Legacy-Kandidaten werden
+    # weiterhin getrennt validiert, aber nicht in diesen Energiehaushalt gemischt.
+    headroom_projection_bindings = {}
+    standard_projection_binding_template = _direct_marketing_operating_baseline_binding(canonical)
     first_soc_contract = (
         slots[0].get("soc_pct")
         if slots and isinstance(slots[0].get("soc_pct"), dict)
@@ -5990,9 +6119,8 @@ def _materialize_direct_marketing_trajectory(
                 "wp_and_climate_are_diagnostics_within_heat;"
                 "planned_load_is_already_within_wallbox"
             ),
-            "pv_aggregation_contract": (
-                "canonical_projection_pv_total_no_external_ac_readdition"
-            ),
+            "pv_aggregation_contract": DIRECT_MARKETING_OPERATING_PV_CONTRACT,
+            "energy_conversion_contract": DIRECT_MARKETING_ROUTE_ENERGY_CONTRACT,
         },
     })
     if not bool(
@@ -6018,14 +6146,20 @@ def _materialize_direct_marketing_trajectory(
     for slot in slots:
         start_ms = _safe_int(slot.get("start_ts_ms"), 0)
         end_ms = _safe_int(slot.get("end_ts_ms"), 0)
+        integration_start_ms = max(start_ms, _safe_int(canonical.get("generated_at_ts_ms"), start_ms))
+        slot_hours = (end_ms - integration_start_ms) / 3600000.0
+        if not 0.0 < slot_hours <= SLOT_DURATION_S / 3600.0:
+            base.update({"complete": False, "status": "TRAJECTORY_TIME_AXIS_INVALID", "slots": []})
+            return base
         projection = (
             slot.get("projection")
             if isinstance(slot.get("projection"), dict)
             else {}
         )
-        headroom_projection_binding = headroom_projection_bindings.get(
-            (start_ms, end_ms)
-        )
+        # Unfreigegebene Entladekandidaten bleiben im separaten Planmaterial.
+        # Sie erzeugen weder SoC-Absenkung noch freien Raum in der wirksamen
+        # Prognose. Nur ausgewählte Verträge und die AUTO-Baseline wirken.
+        headroom_projection_binding = None
         soc_contract = (
             slot.get("soc_pct")
             if isinstance(slot.get("soc_pct"), dict)
@@ -6097,7 +6231,16 @@ def _materialize_direct_marketing_trajectory(
                 "slots": [],
             })
             return base
-        pv_total_w = axis_values["pv_w"] or 0.0
+        pv_operating_projection = _direct_marketing_operating_pv_projection(direct, slot)
+        operating_pv = pv_operating_projection["energy_projection_w"]
+        if pv_operating_projection["complete"] is not True and pv_operating_projection["external_ac_off_basis"] != "future_price_unconfirmed":
+            base.update({
+                "complete": False,
+                "status": "OPERATING_PV_SOURCE_SPLIT_MISSING",
+                "slots": [],
+            })
+            return base
+        pv_total_w = operating_pv["total"] or 0.0
         home_w = axis_values["home_w"] or 0.0
         heat_w = axis_values["heat_w"] or 0.0
         wallbox_w = axis_values["wallbox_w"] or 0.0
@@ -6113,6 +6256,8 @@ def _materialize_direct_marketing_trajectory(
             if isinstance(forecast.get("external_ac_pv"), dict)
             else {}
         )
+        e3dc_dc = {**e3dc_dc, "point": operating_pv["e3dc_dc"]}
+        external_ac = {**external_ac, "point": operating_pv["external_ac"]}
         hard_floor_values = [_safe_float(soc_contract.get("notstrom_floor"), None)]
         if str(soc_contract.get("reserve_floor_hardness") or "") == "hard":
             hard_floor_values.append(
@@ -6232,6 +6377,16 @@ def _materialize_direct_marketing_trajectory(
                 _safe_float(contract.get("planned_w"), 0.0) or 0.0,
             )
             bounded_reference_w = requested_w
+        energy_parameters = _direct_marketing_route_energy_parameters(
+            direct, action, (contract or {}).get("pv_store_source_contract"),
+            min(max(0.0, residual_before_w), e3dc_dc["point"])
+            if e3dc_dc.get("point") is not None else None,
+            base["meta"]["efficiencies"],
+        )
+        if energy_parameters is None:
+            base.update({"complete": False, "status": "ROUTE_ENERGY_CONTRACT_INVALID", "slots": []})
+            return base
+        discharge_efficiency = energy_parameters["discharge"]
         if projection_only:
             headroom_slot_contract = headroom_projection_binding["slot"]
             action = "HEADROOM_EXPORT"
@@ -6267,6 +6422,9 @@ def _materialize_direct_marketing_trajectory(
             ] = copy.deepcopy(headroom_projection_binding)
             slot["projection"] = projection
         elif selected and action in {"PV_STORE", "DV_CURVE_CHARGE"}:
+            if energy_parameters["charge_input_basis"] == "dc_first_aux_ac_input" and energy_parameters["dc_available_w"] is None:
+                base.update({"complete": False, "status": "ROUTE_ENERGY_CONTRACT_INVALID", "slots": []})
+                return base
             reason_code = (
                 "DIRECT_MARKETING_SELECTED_DV_CURVE_CHARGE"
                 if action == "DV_CURVE_CHARGE"
@@ -6277,7 +6435,7 @@ def _materialize_direct_marketing_trajectory(
             pv_store_source_contract = str(
                 contract.get("pv_store_source_contract") or ""
             )
-            if pv_store_source_contract == "E3DC_DC":
+            if pv_store_source_contract == "E3DC_DC" or energy_parameters["charge_input_basis"] == "dc_input":
                 e3dc_dc_w = _safe_float(e3dc_dc.get("point"), None)
                 if e3dc_dc_w is None or not math.isfinite(e3dc_dc_w):
                     # Der v2-Livevertrag darf den E3/DC zur Laufzeit freigeben,
@@ -6315,14 +6473,14 @@ def _materialize_direct_marketing_trajectory(
                         requested_w,
                         max_charge_w if max_charge_w > 0.0 else requested_w,
                         pv_charge_available_w,
-                        room_wh / charge_efficiency / slot_hours,
+                        _direct_marketing_route_charge_limit(room_wh, slot_hours, energy_parameters),
                     )
             else:
                 battery_w = min(
                     requested_w,
                     max_charge_w if max_charge_w > 0.0 else requested_w,
                     pv_charge_available_w,
-                    room_wh / charge_efficiency / slot_hours,
+                    _direct_marketing_route_charge_limit(room_wh, slot_hours, energy_parameters),
                 )
         elif selected and action == "ECONOMIC_EXPORT":
             reason_code = "DIRECT_MARKETING_SELECTED_ECONOMIC_EXPORT"
@@ -6362,6 +6520,13 @@ def _materialize_direct_marketing_trajectory(
                         return base
             if delegation is not None:
                 action = "PV_STORE"
+                energy_parameters = _direct_marketing_route_energy_parameters(
+                    direct, action, delegation.get("pv_store_source_contract"),
+                    e3dc_dc.get("point"), base["meta"]["efficiencies"],
+                )
+                if energy_parameters is None:
+                    base.update({"complete": False, "status": "ROUTE_ENERGY_CONTRACT_INVALID", "slots": []})
+                    return base
                 reason_code = str(delegation.get("reason") or "")
                 delegated_ceiling_wh = min(
                     ceiling_wh,
@@ -6389,7 +6554,7 @@ def _materialize_direct_marketing_trajectory(
                         max_charge_w if max_charge_w > 0.0 else requested_w,
                         max(0.0, residual_before_w),
                         max(0.0, e3dc_dc_w),
-                        room_wh / charge_efficiency / slot_hours,
+                        _direct_marketing_route_charge_limit(room_wh, slot_hours, energy_parameters),
                     )
             elif not selected and bool(
                 passive_binding is not None
@@ -6421,14 +6586,16 @@ def _materialize_direct_marketing_trajectory(
                     # Der aktuelle Slot bleibt exakt die bereits kanonische
                     # Standardprojektion. Die read-only DV-Projektion darf ihn
                     # weder neu integrieren noch auf einen Reserveboden heben.
-                    if _optional_numeric_equal(
+                    if not pv_operating_projection["external_ac_off"] and _optional_numeric_equal(
                         soc_start_axis,
                         planned_soc,
                         tolerance=0.0015,
                     ):
                         standard_passthrough = True
                         battery_w = standard_requested_battery_w
-                    elif pre_valid_from_soc_chain_valid:
+                    elif pre_valid_from_soc_chain_valid or _optional_numeric_equal(
+                        soc_start_axis, planned_soc, tolerance=0.0015,
+                    ):
                         # Der Live-SoC gehört zum Erzeugungszeitpunkt im
                         # laufenden Slot. Eine lückenlose kanonische
                         # Vorslotkette belegt die abweichende Slotachse; der
@@ -6504,6 +6671,9 @@ def _materialize_direct_marketing_trajectory(
                         standard_requested_battery_w
                     )
                     if standard_requested_battery_w > 0.0:
+                        if energy_parameters["charge_input_basis"] == "dc_first_aux_ac_input" and energy_parameters["dc_available_w"] is None:
+                            base.update({"complete": False, "status": "ROUTE_ENERGY_CONTRACT_INVALID", "slots": []})
+                            return base
                         room_wh = max(
                             0.0,
                             rebased_ceiling_wh - rebased_energy_start_wh,
@@ -6512,9 +6682,7 @@ def _materialize_direct_marketing_trajectory(
                             standard_requested_battery_w,
                             max_charge_w,
                             max(0.0, residual_before_w),
-                            room_wh
-                            / charge_efficiency
-                            / standard_integration_hours,
+                            _direct_marketing_route_charge_limit(room_wh, standard_integration_hours, energy_parameters),
                         )
                     elif standard_requested_battery_w < 0.0:
                         deficit_w = max(0.0, -residual_before_w)
@@ -6545,6 +6713,10 @@ def _materialize_direct_marketing_trajectory(
                     available_wh * discharge_efficiency / slot_hours,
                 )
                 battery_w = -discharge_w
+        energy_conversion = _direct_marketing_route_energy_conversion(
+            energy_parameters, round(battery_w, 3), canonical_passthrough=standard_passthrough,
+        )
+        charge_efficiency = energy_conversion["charge"] if not standard_passthrough else base["meta"]["efficiencies"]["charge"]
         energy_integration_hours = (
             standard_integration_duration_s / 3600.0
             if standard_transition is not None
@@ -6686,6 +6858,8 @@ def _materialize_direct_marketing_trajectory(
                 "external_ac": _round_or_none(external_ac.get("point"), 3),
             },
             "pv_axis_evidence": copy.deepcopy(pv_axis_evidence),
+            "pv_operating_projection": pv_operating_projection,
+            "energy_conversion": energy_conversion,
             "loads_w": {
                 "house": round(home_w, 3),
                 "heat": round(heat_w, 3),
@@ -7811,6 +7985,12 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(plan.get("direct_marketing_trajectory"), dict)
         else None
     )
+    operating_projection = bool(
+        isinstance(trajectory, dict)
+        and isinstance(trajectory.get("meta"), dict)
+        and trajectory["meta"].get("pv_aggregation_contract")
+        == DIRECT_MARKETING_OPERATING_PV_CONTRACT
+    )
     headroom_projection_state = _direct_marketing_headroom_projection_state(
         direct,
         plan,
@@ -7846,8 +8026,11 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
         )
         else None
     )
+    if operating_projection:
+        expected_standard_projection_binding = _direct_marketing_operating_baseline_binding(plan)
     if (
-        headroom_projection_state.get("present") is True
+        not operating_projection
+        and headroom_projection_state.get("present") is True
         and headroom_projection_state.get("valid") is not True
         and not bool(
             isinstance(trajectory, dict)
@@ -8130,6 +8313,13 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                     == "PROJECTION_ONLY"
                     or trajectory_slot.get("headroom_projection") is not None
                 )
+                if operating_projection and projection_only_slot:
+                    return {
+                        "valid": False,
+                        "block_reason_code": "DIRECT_MARKETING_OPERATING_TRAJECTORY_CANDIDATE_EFFECT",
+                        "plan_id": plan_id,
+                        "slot": None,
+                    }
                 selection_requested_w = _canonical_trajectory_finite_number(
                     selection.get("requested_w")
                 )
@@ -8497,6 +8687,19 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                         or canonical_external_ac_w is not None
                     )
                 )
+                if operating_projection:
+                    expected_operating = _direct_marketing_operating_pv_projection(direct, canonical_slot)
+                    if trajectory_slot.get("pv_operating_projection") != expected_operating:
+                        return {
+                            "valid": False,
+                            "block_reason_code": "DIRECT_MARKETING_OPERATING_PV_BINDING_MISMATCH",
+                            "plan_id": plan_id,
+                            "slot": None,
+                        }
+                    operating_values = expected_operating["energy_projection_w"]
+                    canonical_pv_w = operating_values["total"]
+                    canonical_e3dc_dc_w = operating_values["e3dc_dc"]
+                    canonical_external_ac_w = operating_values["external_ac"]
                 if not bool(
                     trajectory_pv_types_valid
                     and canonical_pv_types_valid
@@ -8760,9 +8963,35 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                     else (
                         standard_integration_duration_s
                         if standard_rebased_valid
-                        else float(SLOT_DURATION_S)
+                        else (
+                            (end_ms - max(start_ms, _safe_int(plan.get("generated_at_ts_ms"), start_ms))) / 1000.0
+                            if operating_projection else float(SLOT_DURATION_S)
+                        )
                     )
                 )
+                # Neue Trajektorien binden jeden Wirkungsgrad an dieselben
+                # Routenfaktoren und Eingangsseiten wie der ausgewählte Plan.
+                # Alttrajektorien ohne Marker behalten ihren alten Vertrag.
+                charge_efficiency = _canonical_trajectory_finite_number(efficiencies.get("charge"))
+                discharge_efficiency = _canonical_trajectory_finite_number(efficiencies.get("discharge"))
+                if meta.get("energy_conversion_contract") == DIRECT_MARKETING_ROUTE_ENERGY_CONTRACT:
+                    energy_parameters = _direct_marketing_route_energy_parameters(
+                        direct, action,
+                        selection.get("pv_store_source_contract") if selection.get("selected") is True
+                        else delegation.get("pv_store_source_contract"),
+                        min(max(0.0, residual_before_w), e3dc_dc_w)
+                        if residual_before_w is not None and e3dc_dc_w is not None else None,
+                        efficiencies,
+                    )
+                    expected_conversion = (
+                        _direct_marketing_route_energy_conversion(energy_parameters, battery_w, canonical_passthrough=standard_passthrough_valid)
+                        if energy_parameters is not None and battery_w is not None else None
+                    )
+                    if expected_conversion is None or revision_hash(trajectory_slot.get("energy_conversion")) != revision_hash(expected_conversion):
+                        return {"valid": False, "block_reason_code": "DIRECT_MARKETING_ROUTE_ENERGY_BINDING_INVALID", "plan_id": plan_id, "slot": start_ms}
+                    if not standard_passthrough_valid:
+                        charge_efficiency = expected_conversion["charge"]
+                        discharge_efficiency = expected_conversion["discharge"]
                 expected_soc_end_pct = None
                 if None not in {
                     battery_w,
@@ -8822,7 +9051,10 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                         1.0,
                         (discharge_efficiency or 0.0) + 0.0000005,
                     )
-                    slot_h = 0.25
+                    # Derselbe Zeitabschnitt wie in der SoC-Integration:
+                    # ein angebrochener Slot darf seine verbleibende Energie
+                    # innerhalb der Restdauer abgeben, nie über die Reserve.
+                    slot_h = (integration_duration_s or SLOT_DURATION_S) / 3600.0
                     available_discharge_hi_w = max(
                         0.0,
                         (start_hi_pct - reserve_lo_pct)
@@ -8899,6 +9131,11 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                         if selection.get("selected") is True
                         else delegation_max_curve_charge_w
                     )
+                    dc_only_charge = bool(
+                        source_contract == "E3DC_DC"
+                        or meta.get("energy_conversion_contract") == DIRECT_MARKETING_ROUTE_ENERGY_CONTRACT
+                        and energy_parameters["charge_input_basis"] == "dc_input"
+                    )
                     charge_caps = [
                         value
                         for value in (
@@ -8906,7 +9143,7 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                             max_charge_w,
                             max(0.0, residual_before_w or 0.0),
                             e3dc_dc_w
-                            if source_contract == "E3DC_DC"
+                            if dc_only_charge
                             else None,
                         )
                         if value is not None
@@ -8914,7 +9151,7 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                     action_power_invalid = bool(
                         requested_charge_w is None
                         or max_charge_w is None
-                        or source_contract == "E3DC_DC"
+                        or dc_only_charge
                         and e3dc_dc_w is None
                         and (battery_w or 0.0) > 0.001
                         or charge_caps
@@ -9134,8 +9371,10 @@ def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
                         "plan_id": plan_id,
                         "slot": None,
                     }
-                if seen_headroom_projection_ids != set(
-                    headroom_projection_state.get("projection_ids") or set()
+                if seen_headroom_projection_ids != (
+                    set() if operating_projection else set(
+                        headroom_projection_state.get("projection_ids") or set()
+                    )
                 ):
                     return {
                         "valid": False,

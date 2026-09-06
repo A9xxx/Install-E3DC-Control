@@ -1,14 +1,19 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.4.5a
+Dokumentation Stand: 5.4.5b
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
 Installationspfad und Python-Umgebung aus dem geprüften Installationskontext.
 
-5.4.5a lässt den Simple-Stable-Updater unter dem bereits gehaltenen
+5.4.5b enthält Wartungskorrekturen für Wallbox-Budget, Fahrzeug-SoC,
+Speicherprognose und Diagnose. Updateeinstieg, Backup, reine Rechtereparatur
+und Rückfallweg bleiben erhalten; nach erfolgreichem Update die Webansicht
+neu laden. Einzelheiten stehen in den [Release Notes](../RELEASE_NOTES.md).
+
+Seit 5.4.5a verwendet der Simple-Stable-Updater unter dem bereits gehaltenen
 systemweiten Update-Lock den vollständigen Recovery-Resolver des regulären
-Updaters verwenden, bevor ein neues Backup oder ein neuer Dateiaustausch
+Updaters, bevor ein neues Backup oder ein neuer Dateiaustausch
 beginnt. Eine vollständig gebundene Unterbrechung der frühen Vorbereitung kann
 damit sicher abgeschlossen oder bereinigt werden. Unklare, fremde,
 widersprüchliche oder bereits weiter fortgeschrittene Zustände bleiben

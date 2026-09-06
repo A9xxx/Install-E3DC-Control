@@ -1425,6 +1425,7 @@ function directMarketingTrajectoryViewModel(data = {}) {
     if (!/^sha256:[0-9a-f]{64}$/.test(String(contract.trajectory_revision || ''))) return evidenceLimit('DIRECT_MARKETING_TRAJECTORY_REVISION_INVALID');
     if (!contract.meta || typeof contract.meta !== 'object') return evidenceLimit('DIRECT_MARKETING_TRAJECTORY_META_MISSING');
     if (!Array.isArray(contract.slots) || contract.slots.length === 0) return evidenceLimit('DIRECT_MARKETING_TRAJECTORY_SLOTS_MISSING');
+    const operatingProjection = contract.meta.pv_aggregation_contract === 'selected_actions_operating_pv_v1';
 
     const canonicalJson = value => {
         if (Array.isArray(value)) return '[' + value.map(canonicalJson).join(',') + ']';
@@ -1562,7 +1563,8 @@ function directMarketingTrajectoryViewModel(data = {}) {
             && standardProjectionBinding.executable === false
             && standardProjectionBinding.commands_allowed === false
             && standardProjectionBinding.hardware_effect === false
-            && standardProjectionBinding.source_schema === 'direct_marketing_headroom_projection_plan_v1'
+            && standardProjectionBinding.source_schema === (operatingProjection
+                ? 'canonical_dispatch_input_revisions_v1' : 'direct_marketing_headroom_projection_plan_v1')
             && /^sha256:[0-9a-f]{64}$/.test(String(standardProjectionBinding.source_revision || ''));
         const delegatedPvStore = action === 'PV_STORE'
             && delegation && typeof delegation === 'object'
@@ -1585,6 +1587,7 @@ function directMarketingTrajectoryViewModel(data = {}) {
             || Object.prototype.hasOwnProperty.call(selection, 'projected_w')
             || Object.prototype.hasOwnProperty.call(selection, 'projection_id');
         let projectionRole = false;
+        if (operatingProjection && projectionOnlyMarker) return evidenceLimit('DIRECT_MARKETING_OPERATING_TRAJECTORY_CANDIDATE_EFFECT');
         let projectedW = null;
         let projectionEffectiveStartTs = null;
         let projectionEffectiveDurationS = null;
@@ -2344,6 +2347,25 @@ function storageSparklineSeries(data = {}) {
             target: []
         };
     }
+    // Die DV-Trajektorie ist eine bereits geprüfte Planprognose. Ein noch
+    // nicht bestätigter aktueller Hardwareeffekt darf ihre Zukunft nicht
+    // ausblenden. Klassische Kurven sind dabei kein Ersatz für DV-SoC.
+    if (trajectory.directMarketing.active === true) {
+        const dv = trajectory.directMarketing;
+        if (dv.state !== 'complete' || dv.series.soc.length < 2) {
+            return {
+                state: 'direct_marketing_evidence_limit',
+                reasonCode: dv.reasonCode || 'DIRECT_MARKETING_TRAJECTORY_INCOMPLETE',
+                planId, forecast: [], target: []
+            };
+        }
+        return {
+            state: 'bound', reasonCode: null, planId,
+            source: 'direct_marketing_planned_soc',
+            forecast: downsampleStorageSparkline(dv.series.soc.map(point => ({ts: point.x, soc: point.y}))),
+            target: []
+        };
+    }
     const projectionDisplay = storageSparklineProjectionDisplay(data);
     if (projectionDisplay) {
         return {state: 'projection_hidden', reasonCode: projectionDisplay.reasonCode, planId, forecast: [], target: []};
@@ -2446,6 +2468,7 @@ function storageSparklineProjectionDisplay(data = {}) {
         return {
             curveState: 'hidden-dv-evidence-limit',
             text: 'DV-Wirkung nicht belegt',
+            projectionStage: 'unconfirmed',
             reasonCode: 'STORAGE_CLASSICAL_CURVE_HIDDEN_DV_EVIDENCE_LIMIT'
         };
     }
@@ -2457,6 +2480,7 @@ function storageSparklineProjectionDisplay(data = {}) {
     const projectionStage = effectConfirmed ? 'effective' : (requestObserved ? 'requested' : 'planned');
     const stagedDisplay = (curveState, reasonCode, effectiveText, requestedText, plannedText) => ({
         curveState: effectConfirmed ? curveState : `${curveState}-${projectionStage}`,
+        projectionStage: effectConfirmed ? 'confirmed' : projectionStage,
         text: effectConfirmed ? effectiveText : (requestObserved ? requestedText : plannedText),
         reasonCode: effectConfirmed ? reasonCode : `${reasonCode}_${projectionStage.toUpperCase()}`
     });
@@ -2519,6 +2543,9 @@ function storageSparklineProjectionDisplay(data = {}) {
 }
 
 function storageSparklineUnavailableDisplay(data = {}, series = {}) {
+    if (series.state === 'direct_marketing_evidence_limit') {
+        return {curveState: 'incomplete-dv', text: 'DV-SoC-Prognose noch nicht vollständig'};
+    }
     if (series.state === 'projection_hidden') {
         return storageSparklineProjectionDisplay(data)
             || {curveState: 'hidden', text: 'SoC-Prognose bewusst ausgeblendet'};
@@ -2577,11 +2604,12 @@ function renderStorageCurveSparkline(data = {}) {
     const state = document.getElementById('stat-regler-sparkline-state');
     if (!wrap || !forecastLine || !targetLine || !state) return;
     const neutralAriaLabel = 'Ladekurvenvorschau';
-    const sourceLabel = 'Standard-SoC-Prognose';
-    const sourceDetail = 'Basis-SoC ohne DV-, Pre-Dump- und Netzladewirkung';
+    let sourceLabel = 'Standard-SoC-Prognose';
+    let sourceDetail = 'Basis-SoC ohne DV-, Pre-Dump- und Netzladewirkung';
     const clear = (curveState, text) => {
         forecastLine.setAttribute('points', '');
         targetLine.setAttribute('points', '');
+        forecastLine.removeAttribute('stroke-dasharray');
         wrap.dataset.state = curveState;
         wrap.dataset.runtimeState = curveState;
         wrap.dataset.curveSource = '';
@@ -2603,6 +2631,17 @@ function renderStorageCurveSparkline(data = {}) {
         const unavailable = storageSparklineUnavailableDisplay(data, series);
         clear(unavailable.curveState, unavailable.text);
         return;
+    }
+    const plannedDirectMarketing = series.source === 'direct_marketing_planned_soc';
+    if (plannedDirectMarketing) {
+        sourceLabel = 'DV-SoC · geplant';
+        sourceDetail = 'Erwarteter Speicherstand nach dem DV-Plan; die tatsächliche Ausführung wird separat geprüft';
+        if (data.direct_marketing_trajectory.slots.some(slot => slot.pv_operating_projection?.soc_projection_basis === 'conditional_weather_auto')) {
+            sourceDetail += '. Ohne veröffentlichte Strompreise ist der Verlauf vorläufig unter E3DC-AUTO und Wetterpotential berechnet';
+        }
+        forecastLine.setAttribute('stroke-dasharray', '4 3');
+    } else {
+        forecastLine.removeAttribute('stroke-dasharray');
     }
     const domainPoints = series.forecast.concat(series.target);
     const minTs = series.forecast[0].ts;
@@ -2628,6 +2667,15 @@ function renderStorageCurveSparkline(data = {}) {
     ));
     wrap.dataset.state = 'fresh';
     wrap.dataset.curveSource = series.source;
+    if (plannedDirectMarketing) {
+        const execution = storageSparklineProjectionDisplay(data);
+        const executionText = execution ? execution.text : 'Aktuelle Ausführung wird getrennt bewertet';
+        wrap.dataset.runtimeState = execution ? execution.projectionStage || 'unconfirmed' : 'unconfirmed';
+        state.textContent = sourceLabel;
+        wrap.title = `${sourceDetail}. Aktueller Slot: ${executionText}.`;
+        wrap.setAttribute('aria-label', `${sourceLabel}. ${sourceDetail}. Aktueller Slot: ${executionText}.`);
+        return;
+    }
     const runtime = storageDispatchRuntimeForDisplay(data);
     const runtimePresent = data.storage_dispatch_runtime && typeof data.storage_dispatch_runtime === 'object';
     if (runtime) {
@@ -10039,6 +10087,87 @@ function buildForecastChartTimeContext(data, gridColor, textColor, isDarkMode) {
     return buildCompactChartTimeContext(timestamps, sourceLabels, gridColor, textColor, isDarkMode, 8);
 }
 
+function directMarketingBalanceSeries(data = {}, view = null) {
+    if (data.direct_marketing_enabled !== true) return {state: 'inactive', battery: data.bat, grid: data.grid};
+    const timestamps = Array.isArray(data.timestamps) ? data.timestamps : [];
+    const unavailable = () => ({state: 'evidence_limit', battery: timestamps.map(() => null), grid: timestamps.map(() => null)});
+    const trajectory = view || directMarketingTrajectoryViewModel(data);
+    const contract = data.direct_marketing_trajectory;
+    if (trajectory.state !== 'complete' || trajectory.planId !== data.storage_plan_meta?.plan_id
+        || trajectory.planId !== contract?.plan_id || timestamps.length === 0) return unavailable();
+    const battery = [], grid = [];
+    let previousTs = null;
+    for (const ts of timestamps) {
+        if (!Number.isFinite(ts) || (previousTs !== null && ts <= previousTs)) return unavailable();
+        previousTs = ts;
+        const slot = trajectory.slots.find(item => item.startTs === ts);
+        if (!slot) {
+            if (ts >= contract.valid_from_ts_ms && ts < contract.horizon_end_ts_ms) return unavailable();
+            battery.push(null); grid.push(null);
+            continue;
+        }
+        if (!Number.isFinite(slot.batteryW) || !Number.isFinite(slot.gridW)) return unavailable();
+        battery.push(slot.batteryW); grid.push(slot.gridW);
+    }
+    // Dieselbe validierte DV-Bilanz wie der SoC; keine zweite Berechnung.
+    return {state: 'complete', battery, grid};
+}
+
+function directMarketingOperatingPvSeries(data = {}, view = null) {
+    const timestamps = Array.isArray(data.timestamps) ? data.timestamps : [];
+    const empty = () => timestamps.map(() => null);
+    if (data.direct_marketing_enabled !== true) {
+        return {state: 'inactive', operating: data.pv, weatherPotential: null};
+    }
+    const unavailable = () => ({state: 'evidence_limit', operating: empty(), weatherPotential: data.pv});
+    const trajectory = view || directMarketingTrajectoryViewModel(data);
+    const meta = data.direct_marketing_pv_projection;
+    const contract = data.direct_marketing_trajectory;
+    const operating = data.pv_operating_available;
+    const weather = data.pv_weather_potential;
+    if (trajectory.state !== 'complete' || !meta || meta.complete !== true
+        || meta.schema_version !== 'direct_marketing_pv_projection_v1'
+        || meta.source !== 'canonical_direct_marketing_operating_pv'
+        || meta.plan_id !== trajectory.planId || meta.plan_id !== data.storage_plan_meta?.plan_id
+        || meta.trajectory_revision !== contract?.trajectory_revision
+        || meta.valid_from_ts_ms !== contract?.valid_from_ts_ms
+        || meta.horizon_end_ts_ms !== contract?.horizon_end_ts_ms
+        || !Array.isArray(operating) || !Array.isArray(weather) || timestamps.length === 0
+        || operating.length !== timestamps.length || weather.length !== timestamps.length) return unavailable();
+    const finitePower = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+    let previousTs = null;
+    let conditionalPoints = 0;
+    for (let index = 0; index < timestamps.length; index += 1) {
+        const ts = timestamps[index];
+        if (!Number.isFinite(ts) || (previousTs !== null && ts <= previousTs)) return unavailable();
+        previousTs = ts;
+        const slot = contract.slots.find(item => item.start_ts_ms === ts);
+        if (!slot) {
+            if ((ts >= meta.valid_from_ts_ms && ts < meta.horizon_end_ts_ms)
+                || operating[index] !== null || weather[index] !== null) return unavailable();
+            continue;
+        }
+        const projection = slot.pv_operating_projection;
+        if (!projection || !finitePower(weather[index])
+            || !finitePower(projection.weather_potential_w?.total)
+            || Math.abs(weather[index] - projection.weather_potential_w.total) > 1) return unavailable();
+        if (projection.complete === false && projection.external_ac_off_basis === 'future_price_unconfirmed'
+            && projection.soc_projection_basis === 'conditional_weather_auto') {
+            if (operating[index] !== null || projection.operating_available_w?.total !== null
+                || !finitePower(projection.energy_projection_w?.total)
+                || Math.abs(slot.pv_w.total - projection.energy_projection_w.total) > 1
+                || Math.abs(slot.pv_w.total - weather[index]) > 1) return unavailable();
+            conditionalPoints += 1;
+            continue;
+        }
+        if (projection.complete === false || !finitePower(operating[index]) || !finitePower(projection.operating_available_w?.total)
+            || Math.abs(operating[index] - slot.pv_w.total) > 1
+            || Math.abs(operating[index] - projection.operating_available_w.total) > 1) return unavailable();
+    }
+    // Nur Quellenzuordnung: keine Frontend-Leistungs- oder Energierechnung.
+    return {state: conditionalPoints > 0 ? 'partial' : 'complete', operating: operating.slice(), weatherPotential: weather.slice()};
+}
+
 function renderForecastKwhSummary(data = {}) {
     const forecastBar = document.getElementById('forecast-kwh-summary');
     if (!forecastBar) return false;
@@ -10071,10 +10200,19 @@ function renderForecastKwhSummary(data = {}) {
         if (day.climate_kwh > 0 || hasClimateData) {
             consumption.push(summaryValue('❄', `${label}: Klima`, day.climate_kwh));
         }
+        const completeOperatingDay = data.direct_marketing_enabled === true
+            && typeof day.pv_operating_available_kwh === 'number' && Number.isFinite(day.pv_operating_available_kwh)
+            && typeof day.pv_weather_potential_kwh === 'number' && Number.isFinite(day.pv_weather_potential_kwh);
+        const pvSummary = completeOperatingDay
+            ? summaryValue('☀', `${label}: geplanter nutzbarer PV-Ertrag nach bekannten Abschaltungen`, day.pv_operating_available_kwh)
+                + summaryValue('⛅', `${label}: PV-Wetterpotential ohne geplante Abschaltungen`, day.pv_weather_potential_kwh)
+            : summaryValue('☀', data.direct_marketing_enabled === true
+                ? `${label}: PV-Prognose; betrieblicher Tageswert noch nicht vollständig belegt`
+                : `${label}: PV-Ertrag`, day.pv_kwh);
         return `<span class="forecast-summary-day forecast-summary-${key}">
             <span class="forecast-summary-label text-secondary fw-normal">${label}</span>
             <span class="forecast-summary-lines">
-                <span class="forecast-summary-line forecast-summary-yield">${summaryValue('☀', `${label}: PV-Ertrag`, day.pv_kwh)}</span>
+                <span class="forecast-summary-line forecast-summary-yield">${pvSummary}</span>
                 <span class="forecast-summary-line forecast-summary-consumption">${consumption.join('')}</span>
             </span>
         </span>`;
@@ -10134,11 +10272,20 @@ function loadJsForecastChart(file = '') {
             );
             const useDirectMarketingSoc = Array.isArray(directMarketingSoc);
             const currentSoc = currentSocMarkerForTimestamps(data.timestamps || []);
+            const operatingPv = directMarketingOperatingPvSeries(data, directMarketingView);
+            const directMarketingPv = operatingPv.state !== 'inactive';
+            const balanceProjection = directMarketingBalanceSeries(data, directMarketingView);
+            const directMarketingBalance = balanceProjection.state !== 'inactive';
+            const forecastBattery = balanceProjection.battery;
+            const forecastGrid = balanceProjection.grid;
+            const mapBalanceFlip = arr => directMarketingBalance && chartFlipNegatives && arr
+                ? arr.map(value => value === null ? null : Math.abs(value)) : mapFlip(arr);
             let datasets = [
-                { label: 'Sonne (PV)', data: data.pv, borderColor: getFlowColor('pv', '#ffc107'), backgroundColor: flowColorAlpha('pv', 0.15, '#ffc107'), fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y', order: 10 },
+                { label: directMarketingPv ? (operatingPv.state === 'complete' ? 'PV betrieblich verfügbar (Plan)' : (operatingPv.state === 'partial' ? 'PV betrieblich verfügbar (Plan; Preisstand teilweise offen)' : 'PV-Verfügbarkeit nicht belegt')) : 'Sonne (PV)', data: operatingPv.operating, borderColor: getFlowColor('pv', '#ffc107'), backgroundColor: flowColorAlpha('pv', 0.15, '#ffc107'), fill: true, tension: directMarketingPv ? 0 : 0.3, stepped: directMarketingPv ? 'after' : false, pointRadius: 0, borderWidth: 2, yAxisID: 'y', order: 10 },
+                ...(directMarketingPv ? [{label: 'PV-Wetterpotential', data: operatingPv.weatherPotential, borderColor: getFlowColor('pv', '#ffc107'), fill: false, borderDash: [3, 4], tension: 0, stepped: 'after', pointRadius: 0, borderWidth: 1.5, yAxisID: 'y', order: 11}] : []),
                 { label: 'Hausverbrauch', data: data.home, borderColor: getFlowColor('home', '#0dcaf0'), tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y', order: 10 },
-                { label: 'Batterie', data: mapFlip(data.bat), borderColor: getFlowColor('battery', '#198754'), tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y', segment: { borderDash: dashIfNeg(data.bat) }, order: 10 },
-                { label: 'Netz', data: mapFlip(data.grid), borderColor: getFlowColor('grid', '#6c757d'), tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y', segment: { borderDash: dashIfNeg(data.grid) }, order: 10 }
+                { label: directMarketingBalance ? 'Batterie (DV-Plan)' : 'Batterie', data: mapBalanceFlip(forecastBattery), borderColor: getFlowColor('battery', '#198754'), tension: directMarketingBalance ? 0 : 0.3, stepped: directMarketingBalance ? 'after' : false, pointRadius: 0, borderWidth: 2, yAxisID: 'y', segment: { borderDash: dashIfNeg(forecastBattery) }, order: 10 },
+                { label: directMarketingBalance ? 'Netz (DV-Plan)' : 'Netz', data: mapBalanceFlip(forecastGrid), borderColor: getFlowColor('grid', '#6c757d'), tension: directMarketingBalance ? 0 : 0.3, stepped: directMarketingBalance ? 'after' : false, pointRadius: 0, borderWidth: 2, yAxisID: 'y', segment: { borderDash: dashIfNeg(forecastGrid) }, order: 10 }
             ];
             pushPredumpCandidateDataset(datasets, predumpCandidateW);
             pushPredumpHeadroomDataset(datasets, predumpHeadroomW);
@@ -10207,10 +10354,10 @@ function loadJsForecastChart(file = '') {
 
                 let origVal = chartRawY(ctx);
                 if (chartFlipNegatives) {
-                    if (l === 'Batterie') origVal = data.bat[ctx.dataIndex];
+                    if (cleanLabel === 'Batterie') origVal = forecastBattery[ctx.dataIndex];
                     else if (l === 'Wallbox' || l === 'Wallbox 1') origVal = data.wb[ctx.dataIndex];
                     else if (l === 'Wallbox 2') origVal = data.wb2[ctx.dataIndex];
-                    else if (l === 'Netz') origVal = data.grid[ctx.dataIndex];
+                    else if (cleanLabel === 'Netz') origVal = forecastGrid[ctx.dataIndex];
                 }
 
                 let val = chartRawY(ctx);
@@ -13388,7 +13535,7 @@ function _renderStorageCurveExplanation(meta, reason) {
     }
     const activeTarget = _storageActiveCurveTarget(meta, window._storageControlSoc ?? window._storageLiveSoc);
     const curveStatus = effectiveProjectionHidden
-        ? 'Die Direktvermarktung führt den aktuellen Slot; eine klassische Sollkurve wird erst nach bestätigter Freigabe wieder angezeigt.'
+        ? 'Die klassische Sollkurve ist ausgeblendet. Eine vollständig belegte DV-SoC-Prognose bleibt als geplanter Verlauf sichtbar; der aktuelle Ausführungsstatus wird getrennt bewertet.'
         : (window._storageSollCurveSource === 'curve_anchors_fallback'
         ? 'Die blaue Sollkurve wird aus den gültigen, eingefrorenen Kurvenankern rekonstruiert, weil die slotweise Zielprojektion in diesem Snapshot fehlt. Die Regelung selbst bleibt unverändert.'
         : (meta.has_target_curve === false
@@ -13409,7 +13556,7 @@ function _renderStorageCurveExplanation(meta, reason) {
         ? ''
         : ' Achtung: laufende Prognose-Neubewertung ist nicht aktiv markiert.';
     const targetReachText = effectiveProjectionHidden
-        ? (targetReachReason || 'Ziel, Erreichbarkeit und Ladeleistung bleiben bis zur bestätigten Wirkung unbekannt.')
+        ? (targetReachReason || 'Geplanter SoC-Verlauf und aktuelle Hardwarewirkung sind getrennte Angaben. Fehlende Wirkungsbestätigung macht eine gültige DV-Prognose nicht ungültig.')
         : targetReachState === 'unreachable_auto'
         ? `${targetReachBaseText} Restprognose bis ${reachableSoc}. Punktlandungs-Simulation: ${simMaxSoc}.${targetReachEnergyText}${targetReachStableText}${targetReachServoText}${targetReachRecheckText}`
         : `${targetReachBaseText} Fachlich erreichbar: ${reachableSoc}. Punktlandungs-Simulation: ${simMaxSoc}.${targetReachEnergyText}${targetReachStableText}${targetReachServoText}${targetReachRecheckText}`;

@@ -1865,7 +1865,10 @@ class ParallelStorageRegulator:
         house_deficit_w = max(0, fixed_load_w - pv_w)
         price_curve_need_w = max(i_fc_w, i_min_lade_w)
         price_export_w = max(0, -grid_ema_w, pv_w - fixed_load_w - int(wallbox_w))
-        curve_export_w = max(0, -grid_ema_w)
+        # Auch ein negativer Netzpunkt kann aus Batterieentladung entstehen.
+        # Nur der Exportrest ohne diesen Anteil darf eine PV-Nachladung tragen.
+        curve_battery_discharge_w = max(0, -bat_w)
+        curve_export_w = max(0, -grid_ema_w - curve_battery_discharge_w)
         curve_safe_charge_w = max(0, int(curve_export_w) - max(150, self.grid_limit_w))
         if (
             previous_parallel_state in ("parallel_curve_charge", "parallel_curve_charge_cap")
@@ -1878,7 +1881,7 @@ class ParallelStorageRegulator:
             # AUTO selbst ist kein Grund, neu in CHRG zu springen.
             curve_safe_charge_w = max(
                 curve_safe_charge_w,
-                max(0, int(bat_w) + max(0, -grid_ema_w) - max(150, self.grid_limit_w)),
+                max(0, int(bat_w) + curve_export_w - max(150, self.grid_limit_w)),
             )
         curve_safe_charge_w = min(curve_safe_charge_w, self.max_charge_w)
         if previous_parallel_state in ("parallel_curve_charge", "parallel_curve_charge_cap"):
@@ -3037,6 +3040,8 @@ class ParallelStorageRegulator:
             "shortfall_target_soc": active_state.get("shortfall_target_soc"),
             "shortfall_target_gap_pct": active_state.get("shortfall_target_gap_pct"),
             "shortfall_real_surplus_w": active_state.get("shortfall_real_surplus_w"),
+            "shortfall_battery_discharge_w": active_state.get("shortfall_battery_discharge_w"),
+            "shortfall_pv_export_w": active_state.get("shortfall_pv_export_w"),
             "shortfall_catchup_curve_pressure": active_state.get("shortfall_catchup_curve_pressure"),
             "shortfall_catchup_blocked_curve_ready": active_state.get("shortfall_catchup_blocked_curve_ready"),
             "shortfall_catchup_blocked_low_surplus": active_state.get("shortfall_catchup_blocked_low_surplus"),
@@ -3290,6 +3295,7 @@ class ParallelStorageRegulator:
             "curve_need_raw_w": _safe_int(active_state.get("curve_need_raw_w"), 0),
             "lookahead_need_w": _safe_int(active_state.get("lookahead_need_w"), 0),
             "curve_export_w": curve_export_w,
+            "curve_battery_discharge_w": curve_battery_discharge_w,
             "curve_safe_charge_w": curve_safe_charge_w,
             "curve_ifc_export_catchup_active": curve_ifc_export_catchup_active,
             "curve_ifc_export_catchup_floor_w": curve_ifc_export_catchup_floor_w,
@@ -4080,6 +4086,8 @@ class ParallelStorageRegulator:
                 "shortfall_target_soc": active_state.get("shortfall_target_soc"),
             "shortfall_target_gap_pct": active_state.get("shortfall_target_gap_pct"),
             "shortfall_real_surplus_w": active_state.get("shortfall_real_surplus_w"),
+            "shortfall_battery_discharge_w": active_state.get("shortfall_battery_discharge_w"),
+            "shortfall_pv_export_w": active_state.get("shortfall_pv_export_w"),
             "shortfall_catchup_enter_w": active_state.get("shortfall_catchup_enter_w"),
             "shortfall_catchup_nominal_enter_w": active_state.get("shortfall_catchup_nominal_enter_w"),
             "shortfall_late_catchup_enter_w": active_state.get("shortfall_late_catchup_enter_w"),
@@ -4389,6 +4397,7 @@ class ParallelStorageRegulator:
                 "curve_need_raw_w": _safe_int(active_state.get("curve_need_raw_w"), 0),
                 "lookahead_need_w": _safe_int(active_state.get("lookahead_need_w"), 0),
                 "curve_export_w": curve_export_w,
+                "curve_battery_discharge_w": curve_battery_discharge_w,
                 "curve_safe_charge_w": curve_safe_charge_w,
                 "curve_ifc_export_catchup_active": curve_ifc_export_catchup_active,
                 "curve_ifc_export_catchup_floor_w": curve_ifc_export_catchup_floor_w,

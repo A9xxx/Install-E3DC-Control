@@ -1,6 +1,6 @@
 # Direktvermarktung und Preis-Shadow
 
-> Stand: 2026-07-10
+> Stand: 2026-09-06
 > Status: Dokumentation für Safe-Shadow und den aktiven Storage-Manager-Owner-Vertrag
 
 ## Ziel
@@ -14,6 +14,69 @@ Wirtschaftlichkeitsprüfungen passen.
 
 Der Storage Manager bleibt Chef. EcoScore, EPEX-Daten und Direktvermarktungs-
 Konfiguration sind Entscheidungshilfen, aber kein zweiter Regler.
+
+## Plan, Prognose und tatsächliche Ausführung
+
+Ein vollständiger Zeitraster allein ist noch kein vollständiger Aktionsplan.
+Wird ein Verkaufskandidat beispielsweise wegen der Hausreserve verworfen,
+bleibt für diesen Zeitraum die normale Hausversorgung als eigene Planaktion
+erhalten. Der verworfene Kandidat und sein Ablehnungsgrund sind zusätzliche
+Diagnoseinformationen, keine geplante Batterieentladung.
+
+Die passive Eco+-Basisplanung hängt nicht davon ab, ob PV-Speichern aktiviert
+oder gerade ein DV-Befehl freigegeben ist. Auch bekannte Viertelstunden ohne
+Marktpreis behalten die normale Hausversorgung als Basis. Fehlende Preise und
+fehlende tatsächliche Wirkung werden weiterhin separat ausgewiesen; sie sind
+keine Lade- oder Verkaufsfreigabe. Mehrdeutige Ausführungsfenster oder bereits
+angeforderte beziehungsweise versuchte Ausgaben werden nicht stillschweigend
+als passive Basis umbenannt.
+
+Die Anzeige **„DV-SoC · geplant“** beschreibt die erwartete Speicherentwicklung
+aus dem gewählten Plan. Sie bleibt auch dann sichtbar, wenn für den aktuellen
+Slot noch kein Hardwareeffekt bestätigt ist. **Geplant**, **angefordert** und
+**bestätigt** sind verschiedene Zustände. Eine unvollständige oder zu einer
+anderen Planrevision gehörende Prognose wird nicht durch eine scheinbar
+passende Standardkurve ersetzt.
+
+Wetterbedingtes PV-Potenzial und betriebsbedingt nutzbare PV sind getrennte
+Größen. Eine konfigurierte, feste Abschaltregel für einen Zusatzwechselrichter
+kann als ausdrücklich gekennzeichnete Planannahme berücksichtigt werden.
+Eine unbekannte lokale Schaltregel oder ein unbekannter zukünftiger Zeitplan
+des Direktvermarkters bleibt dagegen unbestätigt. Insbesondere bedeutet eine
+Einspeisegrenze von 0 W nicht, dass auch die E3/DC-DC-Erzeugung für Haus und
+Speicher vollständig entfällt. Bewusste Abregelung ist kein Wetterfehler.
+
+Für einen bereits begonnenen Viertelstundenslot zählen nur die verbleibenden
+Sekunden. SoC-Integration und der daraus berechnete Reserve-Leistungsdeckel
+verwenden dieselbe Restdauer. Dadurch wird weder bereits vergangene Energie
+erneut geplant noch eine korrekte Restslot-Prognose verworfen.
+
+Die hinterlegten konstanten Wirkungsgrade sind keine gemessene
+Wechselrichter-Teillastkennlinie. Ohne belastbare Eingaben werden weder eine
+pauschale Wiederanlaufzeit noch zusätzliche Grund- oder Anlaufverluste
+angenommen. Eine unbekannte Kennlinie ist eine Modellgrenze, kein zusätzlicher
+Abzug von der prognostizierten Batterieladung.
+
+Die PV-Aufnahmeplanung schreibt Hausbedarf und bereits ausgewählte Nachladung
+zeitlich fort. Günstigere spätere Ladefenster behalten ihren reservierten
+Speicherplatz. Ein tatsächlich ausgewähltes Verkaufsfenster kann anschließend
+zusätzlichen Platz für bereits wirtschaftlich zulässige PV-Ladefenster schaffen.
+Diese Nachallokation erfolgt einmal und zunächst im bestehenden DC-Pfad. Die
+erneute Prüfung muss denselben Exportzeitraum, dieselbe Batterieabgabe und
+denselben Reserveboden bestätigen; andernfalls bleibt der vorherige konsistente
+Plan erhalten. Ein verworfener Kandidat oder eine Entladung nach dem Ladefenster
+schafft keinen vorzeitig nutzbaren Platz. Die AUTO-Hausversorgung wird während
+einer gewählten Batterieabgabe nicht noch einmal zusätzlich abgezogen.
+
+Das ist eine bedingte Zukunftsplanung, kein Nachweis einer bereits erfolgten
+Entladung und keine zusätzliche Hardwarefreigabe. Bei einer späteren
+Neuplanung ohne gewählten Export fällt dessen zusätzlicher Ladeplatz wieder
+weg. Die Nachallokation wählt keine neuen Verkaufsfenster und ist keine
+vollständige gemeinsame Neuoptimierung aller Lade- und Verkaufsmöglichkeiten.
+
+Eco, Eco+ und das gewählte Profitprofil bestimmen weiterhin die wirtschaftliche
+Auswahl. Die Prognose erteilt keine zusätzliche Hardwarefreigabe und ändert
+keine E3/DC-Steuerbefehle oder Schutzgrenzen.
 
 Warn- und Verantwortungsgrenze: E3DC-Control berechnet Nettoerlös, Marge,
 Reserve, PV-Überschuss und Netzpunkt plausibel und warnt bei riskanten

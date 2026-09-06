@@ -841,6 +841,7 @@ def _wallbox_transient_grid_pm_output_hold_contract(
     }
     result = {
         "contract": "wallbox_transient_grid_pm_output_hold_v1",
+        "observed_ts": now_value,
         "active": False,
         "output_hold_only": False,
         "new_output_authorized": False,
@@ -4399,6 +4400,111 @@ def _pv_only_allowed_power_w(
         - _non_negative(grid_import_for_budget_w)
         - _non_negative(battery_discharge_w),
     )
+
+
+def _wallbox_idle_pv_balance_contract(
+    live,
+    statuses,
+    *,
+    now_ts,
+    max_age_s,
+    live_sample_valid,
+    producer_authorized,
+    authorized_budget_w,
+    grid_reserve_w,
+    filtered_available_w,
+):
+    """Ergänzt nur im bestätigten Leerlauf die zeitgleiche EMS-Restbilanz.
+
+    Ein langsamer Netzfilter darf nach dem Ladeende nicht mit einer neuen
+    Wallbox-Null verrechnet werden. Netzpunkt und Batterie stammen deshalb
+    hier aus demselben frischen EMS-Frame. Es wird KEINE Wallboxlast addiert
+    und keine Batterieladung freigegeben. Der zentrale Rahmen bleibt Deckel;
+    laufende Ladung, Wh-Wächter und ihre Filter bleiben unverändert.
+    """
+    def finite(value):
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return number if math.isfinite(number) else None
+
+    data = live if isinstance(live, dict) else {}
+    grid = finite(data.get("Grid_Power"))
+    battery = finite(data.get("Battery_Power"))
+    sample_ts = finite(data.get("_ts"))
+    sample_elapsed = finite(data.get("_elapsed"))
+    cap = finite(authorized_budget_w)
+    reserve = finite(grid_reserve_w)
+    now = finite(now_ts)
+    age_limit = finite(max_age_s)
+    result = {
+        "source": "existing_filtered_balance",
+        "reason": "producer_budget_not_authorized",
+        "live_sample_ts": sample_ts,
+        "wallbox_sample_ts": None,
+        "grid_raw_w": grid,
+        "grid_filtered_w": finite(data.get("Grid_Power_Filtered")),
+        "wallbox_power_w": None,
+        "coherent_available_w": None,
+        "available_w": max(0.0, finite(filtered_available_w) or 0.0),
+    }
+    if producer_authorized is not True or cap is None or cap <= 0.0:
+        return result
+    if (
+        live_sample_valid is not True
+        or data.get("RSCP_Sample_Valid") is not True
+        or data.get("Grid_Power_Valid") is not True
+    ):
+        result["reason"] = "live_sample_invalid"
+        return result
+    if any(value is None for value in (grid, battery, sample_ts, sample_elapsed, reserve, now, age_limit)):
+        result["reason"] = "non_finite_input"
+        return result
+    # _ts markiert das Ende der RSCP-Abfragen. Auch die Sammeldauer zählt
+    # deshalb zum konservativen Alter der ältesten Messung im Frame.
+    if (
+        sample_ts <= 0.0
+        or sample_elapsed < 0.0
+        or now < sample_ts
+        or now - sample_ts + sample_elapsed > max(0.0, age_limit)
+    ):
+        result["reason"] = "live_sample_stale"
+        return result
+    result["reason"] = "charging_or_status_unknown"
+    if not isinstance(statuses, list) or not statuses:
+        return result
+    status_times = []
+    for entry in statuses:
+        status = entry.get("status") if isinstance(entry, dict) else None
+        if not isinstance(status, dict) or not _wallbox_demand_status_fresh(status, now_ts=now):
+            return result
+        powers = [finite(status.get(key)) for key in ("real_power_w", "phase_power_sum_w", "power_w") if key in status]
+        if (
+            status.get("charging") is not False
+            or not powers
+            or any(value is None or abs(value) > 0.0 for value in powers)
+        ):
+            return result
+        status_ts = finite(status.get("driver_status_last_sample_ts"))
+        if status_ts is None or status_ts <= 0.0 or not 0.0 <= now - status_ts <= max(0.0, age_limit):
+            return result
+        status_times.append(status_ts)
+    result["wallbox_sample_ts"] = min(status_times)
+    result["wallbox_power_w"] = 0.0
+    if grid >= 0.0:
+        result["reason"] = "grid_import_present"
+        return result
+    residual = max(0.0, -grid - max(0.0, -battery) - max(0.0, reserve))
+    result.update({
+        "source": "raw_ems_after_confirmed_idle",
+        "reason": "idle_frame_coherent",
+        "coherent_available_w": min(cap, residual),
+        "available_w": max(result["available_w"], min(cap, residual)),
+    })
+    return result
 
 
 def _wbminsoc_runtime_raise_output_contract(
@@ -24670,14 +24776,10 @@ def _wallbox_allocation_phase_count(
         and not _wb_status_real_charging(st)
         and openwb_pro_session.is_openwb_pro_charger(data.get("charger"))
     ):
-        # Vor dem ersten Ladestrom gibt es keine belastbaren Istphasen. Das
-        # connect.php-Phasenziel kann aus einem früheren Ladevorgang stammen
-        # und darf das gemeinsame Wattbudget daher nicht auf das 3p-Minimum
-        # von 4.140 W verteuern. Für die reine Startzuteilung wird 1p
-        # projektiert; der physische Phasenvertrag bleibt separat konservativ
-        # und aktive Transitionen, Recovery sowie laufende Ladung wurden oben
-        # bereits hart gebunden.
-        return 1
+        # Eine 1p-Startzuteilung benötigt eine passende Topologie oder die
+        # bestätigte Umschaltfähigkeit. HLC/unklare Pro-Signalisierung darf
+        # eine physisch dreiphasige Last nicht als 1p bepreisen.
+        return wallbox_decision.idle_start_phase_budget_count(contract)
 
     if _is_e3dc_shared_rscp_charger(data.get("charger"), st):
         # Ohne bestätigten Phasenbeleg bleibt der gemeinsame RSCP-Pfad konservativ 3p.
@@ -31023,7 +31125,7 @@ def _wallbox_phase_spec(config, charger_id, status, manager_set_amp=None):
             active_phase_count += 1
 
     if measured_phase_count == 3 and active_phase_count > 0:
-        phases = 3 if active_phase_count == 3 else 1
+        phases = active_phase_count
     else:
         try:
             phases = int(st.get("phases_in_use") or 0)
@@ -31031,7 +31133,7 @@ def _wallbox_phase_spec(config, charger_id, status, manager_set_amp=None):
             phases = 0
     if phases <= 0:
         pha = int(_cfg_float(st.get("pha"), 0.0))
-        phases = 3 if pha == 56 else (1 if pha in (8, 16, 32) else 0)
+        phases = 3 if pha == 56 else (2 if pha == 24 else (1 if pha in (8, 16, 32) else 0))
     if phases <= 0:
         # Eine momentan kleine Ladeleistung beweist keine einphasige
         # Hardware. Ohne frische Messung oder expliziten Profilvertrag bleibt
@@ -32939,13 +33041,33 @@ def run():
                                 _cd = next((cd for cd in chargers if cd.get("id") == _v.get("id")), None)
                                 _klass = _cd.get("charger").__class__.__name__ if _cd else ""
                                 if _klass in ("OpenWBCharger", "OpenWBProCharger"):
-                                    # Ohne echte Ladeleistung ist phases_in_use
-                                    # bei openWB/openWB Pro oft nur Ziel/Relais-
-                                    # Zustand. Fuer einen ruhigen Start darf
-                                    # das nicht die Mindestleistung auf 3p
-                                    # festnageln; die 3p-Anforderung passiert
-                                    # weiter unten sobald genug Budget da ist.
-                                    detected_phases = 1
+                                    _idle_phase_contract = wallbox_decision.phase_observation_contract(
+                                        _st,
+                                        _cd,
+                                        config=config,
+                                        charger_id=int(_v.get("id", 1)),
+                                        detected_phases=_wallbox_phase_spec(
+                                            config, int(_v.get("id", 1)), _st,
+                                        )["phases"],
+                                        phase_capability=_wallbox_phase_switch_capability(
+                                            _klass, _st, config,
+                                        ),
+                                        vehicle_phase_capability=VehicleManager.vehicle_phase_capability(
+                                            status=_st,
+                                            profiles=_load_saved_car_profiles(),
+                                            config=config,
+                                            charger_id=int(_v.get("id", 1)),
+                                        ),
+                                        charger_class_name=_klass,
+                                    )
+                                    detected_phases = _wallbox_allocation_phase_count(
+                                        _cd,
+                                        _st,
+                                        phase_contract=_idle_phase_contract,
+                                        fallback_phases=wallbox_decision.idle_start_phase_budget_count(
+                                            _idle_phase_contract,
+                                        ),
+                                    )
                                     break
                         except Exception:
                             pass
@@ -33938,6 +34060,18 @@ def run():
                         grid_import_for_budget_w=grid_import_for_budget_w,
                         battery_discharge_w=bat_discharge_w,
                     )
+                    _budget_balance_diagnostic = _wallbox_idle_pv_balance_contract(
+                        live,
+                        valid_chargers_status,
+                        now_ts=time.time(),
+                        max_age_s=live_fresh_guard_s,
+                        live_sample_valid=not _budget_live_sample_invalid,
+                        producer_authorized=_fresh_wallbox_budget_authorized,
+                        authorized_budget_w=_authorized_wallbox_budget_w,
+                        grid_reserve_w=grid_reserve_w,
+                        filtered_available_w=pv_only_allowed_w,
+                    )
+                    pv_only_allowed_w = _budget_balance_diagnostic["available_w"]
                     pv_surplus_ex_wb_w = max(0.0, pv_power_raw - home_w - grid_reserve_w)
                     openwb_pro_curve_direct_start_min_w = 6.0 * 230.0
                     bat_assist_allowed_w = max(0.0, pv_power_raw + bat_discharge_w - home_w - grid_reserve_w)
@@ -48024,6 +48158,15 @@ def run():
                         "budget_stale": _budget_stale,
                         "budget_timeout": _budget_timeout,
                         "storage_state": _budget_state,
+                        "producer_budget_w": _budget.get("budget_w"),
+                        "budget_balance_diagnostic": _budget_balance_diagnostic,
+                        "transient_grid_pm_output_hold_by_id": {
+                            str(box.get("id")): box.get(
+                                "_transient_grid_pm_output_hold_contract"
+                            )
+                            for box in chargers
+                            if isinstance(box, dict)
+                        },
                     })
                     write_status(ui_state)
 

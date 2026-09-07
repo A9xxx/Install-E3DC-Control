@@ -1,9 +1,9 @@
 {
-  "version": "5.4.5b",
+  "version": "5.4.5c",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.5b",
-  "release_date": "2026-09-06",
-  "description": "v5.4.5b - Wallbox-Budget, Fahrzeug-SoC und konsistente Speicher- und PV-Prognosen",
+  "stable_release": "v5.4.5c",
+  "release_date": "2026-09-07",
+  "description": "v5.4.5c - Ruhigere DC-first-Ladegrenzen, native E3/DC-Wallbox und verständlicher Update-Status",
   "update_strategy": "backup_replace_restart_v1",
   "installer_requires": "python3",
   "sanitized_republication": false,

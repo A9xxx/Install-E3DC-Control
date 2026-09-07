@@ -160,6 +160,25 @@ getrennte Verträge; Manager, Treiber und Diagnose geben denselben Zustand aus.
 
 ## E3DC-native Regelvertrag
 
+Die native E3/DC-Wallbox wird über die lokale RSCP-Verbindung des
+Hauskraftwerks angesprochen. Maßgeblich sind dessen Serveradresse, Port,
+Benutzer, Portalpasswort und RSCP-/AES-Passwort aus der gemeinsamen
+Konfiguration. Eine im Wallboxbereich eingetragene Ladepunkt-IP ersetzt diese
+Verbindung nicht. In JSON gespeicherte Zeichen wie `#`, `//` und Leerzeichen
+innerhalb eines Passworts gehören unverändert zum Wert.
+
+Für efy, Multi Connect und Easy Connect muss die bewusst gewählte
+WBchar6-Kompatibilitätsregelung aktiviert sein, wenn die native Regelung
+steuern soll. Bei ausgeschaltetem Kompatibilitätsmodus bleibt dieser Pfad
+beobachtend. Eine erfolgreiche Anmeldung allein erteilt keine Steuerfreigabe.
+
+Bei wiederholt fehlgeschlagener RSCP-Anmeldung werden die Verbindungsversuche
+mit wachsendem Abstand bis höchstens 30 Sekunden wiederholt. Fehlgeschlagene
+Verbindungen werden geschlossen; eine erfolgreiche Sitzung wird für weitere
+Abfragen wiederverwendet. Bei einer Authentifizierungsmeldung zunächst die
+gemeinsamen RSCP-Einstellungen lokal prüfen. Zugangsdaten gehören nicht in
+öffentliche Diagnoseauszüge oder Supportnachrichten.
+
 Die native E3DC-Wallbox wird anders behandelt als openWB, openWB Pro oder go-e.
 Die E3DC-RSCP-Schnittstelle arbeitet als Flankensteuerung mit
 Messwert-Rückmeldung und nicht als absoluter Start-/Stop-Schalter:

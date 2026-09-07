@@ -6272,6 +6272,7 @@ REQUIRED_WEB_FILES = (
     "get_shadow_snapshot.php",
     "pv_forecast_diagnostics.js",
     "pv_forecast_diagnostics.min.js",
+    "update_status.js",
     "solar.js",
     "solar.min.js",
 )

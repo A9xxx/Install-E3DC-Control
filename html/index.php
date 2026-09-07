@@ -2498,6 +2498,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
     <script src="assets/vendor/jquery/jquery-3.6.0.min.js"></script>
     <script src="assets/vendor/bootstrap/js/bootstrap.bundle.min.js"></script>
     <script src="<?= getAssetUrl('pv_forecast_diagnostics.js') ?>" defer></script>
+    <script src="<?= getAssetUrl('update_status.js') ?>" defer></script>
     <script src="<?= getAssetUrl('solar.js') ?>" defer></script>
     <script>
         function updateTime() {

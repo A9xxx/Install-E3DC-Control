@@ -2,10 +2,11 @@
 
 Diese Anleitung fasst die schnellsten Schritte zusammen, um E3DC-Control auf einem frischen Raspberry Pi OS (oder ähnlichem Debian-System) zu installieren.
 
-Aktueller Stable-Stand: `v5.4.5b`.
+Aktueller Stable-Stand: `v5.4.5c`.
 
-5.4.5b verbessert Wallbox-Budget, Fahrzeug-SoC, Speicher- und PV-Vorschau
-sowie Diagnose. Installation, Web-Update und Docker-Host-Helfer behalten ihre
+5.4.5c bündelt kleine Öffnungen der DC-first-Ladegrenze, verbessert die
+Verbindung zur nativen E3/DC-Wallbox und setzt die Web-Statusbeobachtung nach
+Verbindungsstörungen fort. Installation und Docker-Update behalten ihre
 bisherigen Wege. Nach einem erfolgreichen Update die Seite neu laden;
 Details stehen in den [Release Notes](../RELEASE_NOTES.md).
 
@@ -471,7 +472,7 @@ Ohne das Label bleibt auch ein versehentlich gestarteter Watchtower für den
 Hauptcontainer wirkungslos. Der oben gezeigte manuelle Host-Helfer bleibt der
 empfohlene Updateweg.
 
-**Docker-Rückfall von v5.4.5b auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.4.5c auf den veröffentlichten Docker-Rollback-Root:**
 ```bash
 (
   set -euo pipefail

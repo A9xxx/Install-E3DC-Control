@@ -1,6 +1,6 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.5b
+> **Stand:** v5.4.5c
 >
 > **Neu in 5.4.5a:** Ein frisch beobachteter openWB-Fahrzeug-SoC kann mit
 > Quelle und Alter rein lesend erscheinen, wenn er zur aktuellen Stecksession
@@ -327,6 +327,20 @@ E3/DC bleibt in AUTO und die Entladung für wechselnden Hausverbrauch
 bleibt offen. Die Funktion ist deshalb DC-first, aber keine physikalische
 Garantie für einen ausschließlich internen DC/DC-Energiepfad. Preis- und
 ausdrücklich freigegebenes Netzladen besitzen eigenständige Verträge.
+
+Die Beobachtung bleibt schnell, kleine Öffnungen des Laderahmens werden jedoch
+gesammelt. Eine zeitbezogene Nachführung vergleicht den gewünschten Verlauf mit
+dem frisch bestätigten Gerätewert. Nicht jeder intern berechnete Zwischenwert
+erzeugt einen neuen Geräteauftrag. Eine kleinere verbindliche Plan-, Quellen-
+oder Schutzgrenze wirkt ohne zusätzliche Wartefrist; auch Nutzer-Aus, Plan-0
+und ungültige Quelldaten behalten ihren Vorrang.
+
+Ein kleiner verbleibender Abstand zum Ladeziel wird nicht unbegrenzt im Totband
+gehalten. Die Abschlussregel berücksichtigt eine begrenzte Wartezeit, während
+die vorhandene Protokolltoleranz erhalten bleibt. Berechneter Wunsch, offener
+Auftrag und bestätigter Laderahmen sind getrennte Zustände. Ein unterdrückter
+Wunsch ist kein neuer Gerätewert. Die tatsächliche Batterieladung kann wegen
+Hauslast oder Gerätebegrenzungen weiterhin unter dem oberen Rahmen liegen.
 
 ### 3.2 Ladefreigabe bei Kurvenrückstand
 

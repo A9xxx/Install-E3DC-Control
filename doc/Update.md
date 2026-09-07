@@ -5,17 +5,25 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.4.5b`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.4.5c`. Das Dashboard startet ausschließlich
 den argumentlosen, root-eigenen Systemjob. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
 
-5.4.5b ist ein Wartungsupdate für Wallbox-Budget, Fahrzeug-SoC, Speicher- und
-PV-Vorschau sowie Diagnose. Der vorhandene Updateablauf wird dafür nicht
-ersetzt. Nach dem erfolgreichen Abschluss bitte die Seite neu laden; der
-Service-Worker verwendet eine neue Cachekennung. Die vollständigen
-Änderungen stehen in den [Release Notes](../RELEASE_NOTES.md).
+5.4.5c verbessert die DC-first-Ladegrenzen, die native E3/DC-Wallbox und die
+Statusanzeige. Eine kurze Verbindungsstörung nach einer längeren Sicherung
+beendet die Beobachtung nicht mehr vorzeitig. Nach dem Neuladen lässt sich
+derselbe Auftrag in derselben Browsersitzung innerhalb seiner ursprünglichen
+Frist weiterverfolgen; auch eine unklare Startantwort startet keinen zweiten
+Auftrag. Das Ende der Statusbeobachtung beendet keinen laufenden Systemauftrag.
+
+Während der Webserver für den Dateiaustausch nicht erreichbar ist, zeigt die
+Ansicht nur den letzten bestätigten Schritt. Ein unbekannter Abschluss bleibt
+unbestätigt. Nach erfolgreichem Update bitte die Seite neu laden. Eine vorher
+bereits geöffnete ältere Ansicht kann bis dahin noch die bisherige Statusmeldung
+zeigen. Die vollständigen Änderungen stehen in den
+[Release Notes](../RELEASE_NOTES.md).
 
 Seit 5.4.5a verwendet der Simple-Stable-Updater vor einem neuen Backup oder
 Dateiaustausch unter dem bereits gehaltenen systemweiten Update-Lock den

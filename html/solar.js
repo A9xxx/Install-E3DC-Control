@@ -7202,27 +7202,25 @@ function e3dcHandleLiveAuthFailure(error) {
 }
 
 async function e3dcParseJsonResponse(response, context = 'Anfrage') {
-    const text = await response.text();
     if (!response.ok) {
-        throw new Error(context + ': HTTP ' + response.status);
+        const error = new Error(context + ': HTTP ' + response.status);
+        error.status = response.status;
+        throw error;
     }
-    const trimmed = text.trim();
-    if (!trimmed) {
-        throw new Error(context + ': leere Antwort');
-    }
+    const text = await response.text();
     try {
-        return JSON.parse(trimmed);
-    } catch (parseErr) {
-        const preview = trimmed.slice(0, 160).replace(/\s+/g, ' ');
-        if (/^<!doctype html/i.test(trimmed) || /^<html/i.test(trimmed)) {
-            throw new Error(context + ': Webserver lieferte HTML statt JSON. Bitte Seite nach dem Update neu laden. Vorschau: ' + preview);
-        }
-        throw new Error(context + ': ungültige JSON-Antwort (' + parseErr.message + '). Vorschau: ' + preview);
+        return JSON.parse(text);
+    } catch (_parseError) {
+        const error = new Error(context + ': ungültige JSON-Antwort');
+        error.code = 'invalid_response';
+        throw error;
     }
 }
 
 const E3DC_INSTALLER_UPDATE_POLL_TIMEOUT_MS = 10000;
 const E3DC_INSTALLER_UPDATE_START_TIMEOUT_MS = 30000;
+let e3dcInstallerUpdatePollTimer = null;
+let e3dcInstallerUpdateStartPending = false;
 
 function e3dcNormalizeSelfUpdateRunId(value) {
     const normalized = (typeof value === 'string') ? value.trim().toLowerCase() : '';
@@ -7280,6 +7278,7 @@ async function e3dcReadInstallerUpdateBaseline() {
         const data = await e3dcFetchUpdateJsonWithTimeout(
             e3dcActionUrl('action=poll_self_update&t=' + Date.now())
         );
+        e3dcValidateUpdatePoll(data);
         return {
             available: true,
             runId: e3dcNormalizeSelfUpdateRunId(data && data.run_id),
@@ -7378,77 +7377,85 @@ function checkInstallerUpdate(force = false) {
 
 // Beim Laden nur informativ prüfen. Der Update-Start ist weder von diesem
 // Netzwerkcheck noch von einem Versionsvergleich abhängig.
-document.addEventListener('DOMContentLoaded', () => checkInstallerUpdate(false));
+document.addEventListener('DOMContentLoaded', () => {
+    if (!e3dcResumeInstallerUpdate()) checkInstallerUpdate(false);
+});
 
 async function startInstallerUpdate(btnId = 'btn-update-installer', purpose = 'update') {
-    const normalizedPurpose = purpose === 'permissions_repair' ? 'permissions_repair' : 'update';
-    const btn = document.getElementById(btnId);
-    let origText = '';
-    if(btn) {
-        origText = btn.innerHTML;
-        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Starte...';
-        btn.disabled = true;
-    }
-    const question = normalizedPurpose === 'permissions_repair'
-        ? "Möchtest Du die vollständige Systemreparatur starten?\n\nDies ist kein reiner Rechtecheck: Der Systemjob erstellt ein verifiziertes Backup, gleicht alle Produktdateien mit dem veröffentlichten Stable-Stand ab, setzt die Rechte neu und startet die Dienste nach dem kurzen Dateiaustausch wieder. Dabei kann dieselbe Version erneut installiert werden."
-        : "Möchtest Du E3DC-Control auf den veröffentlichten Stable-Stand aktualisieren oder die installierte Version reparieren?\n\nDer Updater erstellt zuerst ein Backup und startet die Dienste nach dem kurzen Dateiaustausch neu.";
-    if (!confirm(question)) {
-        if (btn) { btn.innerHTML = origText; btn.disabled = false; }
-        return;
-    }
-    let confirmLocalDrift = false;
-    let confirmationToken = '';
+    if (e3dcInstallerUpdateStartPending || e3dcInstallerUpdatePollTimer !== null) return;
+    e3dcInstallerUpdateStartPending = true;
     try {
-        const response = await e3dcPostUpdateActionWithTimeout(
-            'action=check_self_update_drift&t=' + Date.now(),
-            {}
+        const normalizedPurpose = purpose === 'permissions_repair' ? 'permissions_repair' : 'update';
+        const btn = document.getElementById(btnId);
+        let origText = '';
+        if(btn) {
+            origText = btn.innerHTML;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Starte...';
+            btn.disabled = true;
+        }
+        const question = normalizedPurpose === 'permissions_repair'
+            ? "Möchtest Du die vollständige Systemreparatur starten?\n\nDies ist kein reiner Rechtecheck: Der Systemjob erstellt ein verifiziertes Backup, gleicht alle Produktdateien mit dem veröffentlichten Stable-Stand ab, setzt die Rechte neu und startet die Dienste nach dem kurzen Dateiaustausch wieder. Dabei kann dieselbe Version erneut installiert werden."
+            : "Möchtest Du E3DC-Control auf den veröffentlichten Stable-Stand aktualisieren oder die installierte Version reparieren?\n\nDer Updater erstellt zuerst ein Backup und startet die Dienste nach dem kurzen Dateiaustausch neu.";
+        if (!confirm(question)) {
+            if (btn) { btn.innerHTML = origText; btn.disabled = false; }
+            return;
+        }
+        let confirmLocalDrift = false;
+        let confirmationToken = '';
+        try {
+            const response = await e3dcPostUpdateActionWithTimeout(
+                'action=check_self_update_drift&t=' + Date.now(),
+                {}
+            );
+            const preflight = await e3dcParseJsonResponse(response, 'Update-Inhaltsprüfung');
+            if (!preflight || preflight.success !== true) {
+                throw new Error((preflight && preflight.message) || 'Lokale Inhalte konnten nicht geprüft werden.');
+            }
+            const driftItems = Array.isArray(preflight.content_drift) ? preflight.content_drift : [];
+            const driftCount = Number(preflight.content_drift_count || 0);
+            if (driftCount !== driftItems.length) {
+                throw new Error('Die Inhaltsprüfung lieferte keine vollständige Dateiliste.');
+            }
+            if (preflight.requires_confirmation === true || driftCount > 0) {
+                const paths = driftItems.map(item => {
+                    const path = String(item && item.path || '');
+                    const status = String(item && item.status || '');
+                    if (!path) return '';
+                    return status === 'unknown_retired_file' || status === 'local_retired_content_changed'
+                        ? `${path} (freigegebener Altpfad würde gelöscht)`
+                        : path;
+                }).filter(Boolean);
+                const token = String(preflight.confirmation_token || '').trim().toLowerCase();
+                if (!/^[0-9a-f]{64}$/.test(token)) {
+                    throw new Error('Die Inhaltsprüfung lieferte keine gültige Dateilistenbindung.');
+                }
+                const driftQuestion = driftCount > 0
+                    ? `${driftCount} lokal geänderte oder kollidierende Produktdatei(en) würden durch den veröffentlichten Stable-Stand ersetzt oder als freigegebener Altpfad gelöscht:\n\n${paths.join('\n')}\n\nUnbekannte Dateien außerhalb dieses Zielumfangs bleiben unberührt. Soll das Update diese exakt genannten Eingriffe trotzdem ausführen?`
+                    : 'Die veröffentlichte Altversion dieser Installation konnte nicht sicher als Inhaltsbaseline gebunden werden. Der Updater kann deshalb lokale Änderungen in den bekannten Produktpfaden nicht einzeln abgrenzen.\n\nDas verifizierte Vollbackup bleibt bestehen und unbekannte Dateien außerhalb der Zielprojektion bleiben unberührt. Soll der veröffentlichte Stable-Stand die bekannten Produktpfade trotzdem ersetzen?';
+                if (!confirm(driftQuestion)) {
+                    if (btn) { btn.innerHTML = origText; btn.disabled = false; }
+                    return;
+                }
+                confirmLocalDrift = true;
+                confirmationToken = token;
+            }
+        } catch (error) {
+            const message = 'Update wurde vor Backup und Dienständerung sicher abgebrochen:\n'
+                + (error && error.message ? error.message : String(error));
+            if (btn) { btn.innerHTML = origText; btn.disabled = false; }
+            alert(message);
+            return;
+        }
+        await startInstallerUpdateRun(
+            btn,
+            origText,
+            normalizedPurpose,
+            confirmLocalDrift,
+            confirmationToken
         );
-        const preflight = await e3dcParseJsonResponse(response, 'Update-Inhaltsprüfung');
-        if (!preflight || preflight.success !== true) {
-            throw new Error((preflight && preflight.message) || 'Lokale Inhalte konnten nicht geprüft werden.');
-        }
-        const driftItems = Array.isArray(preflight.content_drift) ? preflight.content_drift : [];
-        const driftCount = Number(preflight.content_drift_count || 0);
-        if (driftCount !== driftItems.length) {
-            throw new Error('Die Inhaltsprüfung lieferte keine vollständige Dateiliste.');
-        }
-        if (preflight.requires_confirmation === true || driftCount > 0) {
-            const paths = driftItems.map(item => {
-                const path = String(item && item.path || '');
-                const status = String(item && item.status || '');
-                if (!path) return '';
-                return status === 'unknown_retired_file' || status === 'local_retired_content_changed'
-                    ? `${path} (freigegebener Altpfad würde gelöscht)`
-                    : path;
-            }).filter(Boolean);
-            const token = String(preflight.confirmation_token || '').trim().toLowerCase();
-            if (!/^[0-9a-f]{64}$/.test(token)) {
-                throw new Error('Die Inhaltsprüfung lieferte keine gültige Dateilistenbindung.');
-            }
-            const driftQuestion = driftCount > 0
-                ? `${driftCount} lokal geänderte oder kollidierende Produktdatei(en) würden durch den veröffentlichten Stable-Stand ersetzt oder als freigegebener Altpfad gelöscht:\n\n${paths.join('\n')}\n\nUnbekannte Dateien außerhalb dieses Zielumfangs bleiben unberührt. Soll das Update diese exakt genannten Eingriffe trotzdem ausführen?`
-                : 'Die veröffentlichte Altversion dieser Installation konnte nicht sicher als Inhaltsbaseline gebunden werden. Der Updater kann deshalb lokale Änderungen in den bekannten Produktpfaden nicht einzeln abgrenzen.\n\nDas verifizierte Vollbackup bleibt bestehen und unbekannte Dateien außerhalb der Zielprojektion bleiben unberührt. Soll der veröffentlichte Stable-Stand die bekannten Produktpfade trotzdem ersetzen?';
-            if (!confirm(driftQuestion)) {
-                if (btn) { btn.innerHTML = origText; btn.disabled = false; }
-                return;
-            }
-            confirmLocalDrift = true;
-            confirmationToken = token;
-        }
-    } catch (error) {
-        const message = 'Update wurde vor Backup und Dienständerung sicher abgebrochen:\n'
-            + (error && error.message ? error.message : String(error));
-        if (btn) { btn.innerHTML = origText; btn.disabled = false; }
-        alert(message);
-        return;
+    } finally {
+        e3dcInstallerUpdateStartPending = false;
     }
-    startInstallerUpdateRun(
-        btn,
-        origText,
-        normalizedPurpose,
-        confirmLocalDrift,
-        confirmationToken
-    );
 }
 
 async function startInstallerUpdateRun(
@@ -7491,6 +7498,8 @@ async function startInstallerUpdateRun(
 
     const action = isRepair ? 'fix_permissions' : 'run_self_update';
     const baseline = await e3dcReadInstallerUpdateBaseline();
+    const pendingObservation = e3dcUpdateObservation(purpose,
+        e3dcCreateInstallerUpdateRunBinding(baseline), updateStartedAt, 60 * 60 * 1000);
     try {
         const response = await e3dcPostUpdateActionWithTimeout('action=' + action + '&t=' + Date.now(), {
             reinstall: '0',
@@ -7498,11 +7507,15 @@ async function startInstallerUpdateRun(
             confirmation_token: confirmLocalDrift ? confirmationToken : ''
         });
         const data = await e3dcParseJsonResponse(response, operationName + '-Start');
-        if (data && data.success) {
+        if (!data || typeof data.success !== 'boolean') {
+            throw new Error('Startantwort enthält keine eindeutige Bestätigung.');
+        }
+        if (data.success === true) {
             if (log) log.innerText = (data.message || "Update gestartet.") + "\nWarte auf Log-Ausgabe...\n";
             const runBinding = e3dcCreateInstallerUpdateRunBinding(baseline, data.run_id);
             pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText, updateStartedAt, purpose, runBinding);
         } else {
+            pendingObservation.clear();
             const msg = "Update konnte nicht gestartet werden:\n" + ((data && data.message) || "Unbekannter Fehler");
             if (log) log.innerText = msg;
             if (spinner) {
@@ -7551,52 +7564,15 @@ function e3dcRenderInstallerUpdateStatus(updateStatus, startedAt) {
     if (!summary || !title || !detail || !step || !elapsed || !progress) return;
     const operationName = status.purpose === 'permissions_repair' ? 'Systemreparatur' : 'Update';
 
-    let titleText = operationName + " wird vorbereitet";
-    let detailText = "Die Anlage arbeitet weiter.";
-    let stepText = "Start";
-    let progressWidth = 5;
-    let alertClass = "alert-info";
-    let badgeClass = "bg-info text-dark";
-    const servicesConfirmed = logText.includes("[STATUS] Regelung und Weboberfläche laufen wieder.");
-
-    if (logText.includes("[1/4]")) {
-        titleText = "Sicherung und Integritätsprüfung";
-        detailText = "Die Anlage arbeitet während dieser längsten Phase normal weiter.";
-        stepText = "Schritt 1 von 4";
-        progressWidth = 22;
-    }
-    if (logText.includes("[2/4]")) {
-        titleText = "Kurze Anlagenunterbrechung";
-        detailText = "Regelung und Weboberfläche sind für den kontrollierten Dateiaustausch angehalten.";
-        stepText = "Schritt 2 von 4";
-        progressWidth = 48;
-        alertClass = "alert-warning";
-        badgeClass = "bg-warning text-dark";
-    }
-    if (logText.includes("[3/4]")) {
-        titleText = "Produktdateien und Rechte werden aktualisiert";
-        detailText = "Die kurze kontrollierte Anlagenunterbrechung dauert noch an.";
-        stepText = "Schritt 3 von 4";
-        progressWidth = 70;
-        alertClass = "alert-warning";
-        badgeClass = "bg-warning text-dark";
-    }
-    if (logText.includes("[4/4]")) {
-        titleText = "Dienste werden gestartet und geprüft";
-        detailText = "Regelung und Weboberfläche kehren jetzt kontrolliert in Betrieb zurück.";
-        stepText = "Schritt 4 von 4";
-        progressWidth = 88;
-    }
-    if (servicesConfirmed) {
-        titleText = "Anlage läuft wieder";
-        detailText = "Nur Abschlussbereinigung und Backup-Limit werden noch geprüft.";
-        stepText = "Abschlussprüfung";
-        progressWidth = 96;
-        alertClass = "alert-info";
-        badgeClass = "bg-info text-dark";
-    }
+    const phase = e3dcUpdatePhase(logText);
+    let titleText = phase.title;
+    let detailText = phase.detail;
+    let stepText = phase.step;
+    let progressWidth = phase.progress;
+    let alertClass = phase.warning ? 'alert-warning' : 'alert-info';
+    let badgeClass = phase.warning ? 'bg-warning text-dark' : 'bg-info text-dark';
     if (status.successFound) {
-        titleText = operationName + " erfolgreich abgeschlossen";
+        titleText = operationName + " abgeschlossen";
         detailText = "Regelung, Weboberfläche und Rückfallweg wurden bestätigt.";
         stepText = "Fertig";
         progressWidth = 100;
@@ -7626,14 +7602,26 @@ function e3dcRenderInstallerUpdateStatus(updateStatus, startedAt) {
         if (details) details.open = true;
     }
 
+    if (status.observationWarning || status.runBindingPending) {
+        const warning = status.observationWarning || {
+            title: 'Warte auf den zugehörigen Auftragsstatus',
+            detail: 'Der aktuelle Auftragszustand ist noch nicht bestätigt. Der Status wird automatisch erneut abgefragt.',
+        };
+        titleText = warning.title;
+        detailText = warning.detail + (logText && !status.runBindingPending ? ' Letzter bestätigter Schritt: ' + phase.title + '.' : '');
+        alertClass = 'alert-warning';
+        badgeClass = 'bg-warning text-dark';
+    }
+
     summary.className = "alert " + alertClass + " mb-2";
     title.textContent = titleText;
     detail.textContent = detailText;
     step.className = "badge " + badgeClass + " text-nowrap";
     step.textContent = stepText;
-    elapsed.textContent = "Laufzeit: " + e3dcFormatInstallerUpdateElapsed(startedAt);
+    elapsed.textContent = "Seit Auftrag: " + e3dcFormatInstallerUpdateElapsed(startedAt);
+    progress.setAttribute("aria-valuetext", stepText + " – Phasenanzeige, keine Restzeitprognose");
     progress.style.width = progressWidth + "%";
-    progress.classList.toggle("progress-bar-animated", !status.successFound && !status.errorFound && !status.exitFailed && !status.completionFailed && !status.abortedFound);
+    progress.classList.toggle("progress-bar-animated", !status.observationWarning && !status.runBindingPending && !status.successFound && !status.errorFound && !status.exitFailed && !status.completionFailed && !status.abortedFound);
 }
 
 function e3dcClassifyInstallerUpdatePoll(data) {
@@ -7805,75 +7793,63 @@ function e3dcAdvanceInstallerUpdateLaunchGrace(updateStatus, previousPolls, maxG
     };
 }
 
-function pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText, updateStartedAt = Date.now(), purpose = 'update', runBinding = null) {
-    let tick = 0;
-    let stoppedPolls = 0;
+function pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText, updateStartedAt = Date.now(), purpose = 'update', runBinding = null, maxPollDurationMs = 60 * 60 * 1000) {
+    if (e3dcInstallerUpdatePollTimer !== null) return;
     let launchingPolls = 0;
     let executingStoppedPolls = 0;
-    let transientPollErrors = 0;
     let lastUpdateStatus = {logText: "", running: true, purpose};
     let pollInFlight = false;
-    const maxStoppedGracePolls = 6;
     const maxLaunchingGracePolls = 15;
     const maxExecutingStoppedGracePolls = 6;
-    const maxTransientPollErrors = 120;
-    const maxPollTicks = 60 * 60;
-    const pollStartedAt = Date.now();
-    const maxTransientPollDurationMs = 2 * 60 * 1000;
-    const maxPollDurationMs = 60 * 60 * 1000;
     const binding = runBinding || e3dcCreateInstallerUpdateRunBinding({available: false});
+    const observation = e3dcUpdateObservation(purpose, binding, updateStartedAt, maxPollDurationMs);
+    let stopped = false;
+    const stopPolling = () => {
+        stopped = true;
+        clearInterval(interval);
+        e3dcInstallerUpdatePollTimer = null;
+        observation.clear();
+    };
+    const stopObservation = message => {
+        stopPolling();
+        e3dcRenderInstallerUpdateStatus({...lastUpdateStatus, observationWarning: {
+            title: 'Statusbeobachtung beendet', detail: message,
+        }}, updateStartedAt);
+        if (log) log.innerText += '\n\n[HINWEIS] ' + message;
+        if (spinner) spinner.className = 'fas fa-info-circle text-warning me-2';
+        if (closeBtn) closeBtn.style.display = 'block';
+        if (finishBtn) { finishBtn.disabled = false; finishBtn.innerText = 'Schließen'; finishBtn.onclick = null; }
+        if (btn) { btn.innerHTML = origText; btn.disabled = false; }
+    };
+    const timeoutMessage = 'Die Statusbeobachtung endet nach ' + Math.round(maxPollDurationMs / 60000)
+        + ' Minuten. Der aktuelle Auftragszustand ist nicht bestätigt. Der Auftrag wird dadurch nicht beendet. Prüfe das Update-Protokoll.';
     const interval = setInterval(() => {
-        if (pollInFlight) return;
+        if (stopped) return;
+        if (observation.expired()) { stopObservation(timeoutMessage); return; }
+        if (pollInFlight || !observation.ready()) return;
         pollInFlight = true;
-        tick++;
         e3dcFetchUpdateJsonWithTimeout(e3dcActionUrl('action=poll_self_update&t=' + Date.now()))
             .then(data => {
-                transientPollErrors = 0;
+                if (stopped) return;
+                if (observation.expired()) { stopObservation(timeoutMessage); return; }
+                e3dcValidateUpdatePoll(data);
                 const runState = e3dcBindInstallerUpdatePoll(data, binding);
                 if (runState.replaced) {
-                    clearInterval(interval);
-                    const message = "Der Status gehört inzwischen zu einem anderen Systemjob. "
-                        + "Der Abschluss des gestarteten Auftrags wird deshalb nicht aus fremden Daten abgeleitet. "
-                        + "Lade die Seite neu und prüfe das Update-Protokoll.";
-                    if (log) log.innerText += "\n\n[HINWEIS] " + message;
-                    if (spinner) {
-                        spinner.classList.remove('fa-spin', 'fa-sync');
-                        spinner.classList.add('fa-info-circle', 'text-warning');
-                    }
-                    if (closeBtn) closeBtn.style.display = 'block';
-                    if (finishBtn) finishBtn.disabled = false;
-                    if (btn) { btn.innerHTML = origText; btn.disabled = false; }
+                    stopObservation('Der Status gehört inzwischen zu einem anderen Auftrag. Sein Ergebnis wird nicht für Deinen Auftrag übernommen. Prüfe das Update-Protokoll.');
                     return;
                 }
                 if (!runState.bound) {
                     launchingPolls = 0;
-                    stoppedPolls = 0;
                     executingStoppedPolls = 0;
-                    lastUpdateStatus = {
-                        logText: "Warte auf die eindeutige Laufkennung des neu gestarteten Systemjobs...\n"
-                            + "Ein alter Abschlussstatus wird nicht als Ergebnis dieses Auftrags übernommen.",
-                        running: true,
-                        purpose,
-                        runBindingPending: true,
-                    };
-                    e3dcRenderInstallerUpdateStatus(lastUpdateStatus, updateStartedAt);
-                    if (log) log.innerText = lastUpdateStatus.logText;
-                    if (tick >= maxPollTicks || (Date.now() - pollStartedAt) >= maxPollDurationMs) {
-                        clearInterval(interval);
-                        if (log) {
-                            log.innerText += "\n\n[HINWEIS] Kein eindeutig zugeordneter Abschlussstatus. "
-                                + "Der Systemjob wird dadurch nicht beendet; lade die Seite neu und prüfe das Protokoll.";
-                        }
-                        if (spinner) {
-                            spinner.classList.remove('fa-spin', 'fa-sync');
-                            spinner.classList.add('fa-info-circle', 'text-warning');
-                        }
-                        if (closeBtn) closeBtn.style.display = 'block';
-                        if (finishBtn) finishBtn.disabled = false;
-                        if (btn) { btn.innerHTML = origText; btn.disabled = false; }
-                    }
+                    const message = 'Für diesen Auftrag liegt noch kein eindeutig zugeordneter Status vor. '
+                        + 'Ein alter Abschluss wird nicht übernommen; der Status wird erneut abgefragt.';
+                    e3dcRenderInstallerUpdateStatus({...lastUpdateStatus, observationWarning: {
+                        title: 'Warte auf den zugehörigen Auftragsstatus', detail: message,
+                    }}, updateStartedAt);
+                    if (log) log.innerText = lastUpdateStatus.logText + '\n\n[STATUS] ' + message;
                     return;
                 }
+                observation.accept();
                 let updateStatus = e3dcClassifyInstallerUpdatePoll(data);
                 updateStatus.purpose = purpose;
                 const launchGrace = e3dcAdvanceInstallerUpdateLaunchGrace(
@@ -7893,7 +7869,6 @@ function pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText, u
                         }
                         log.scrollTop = log.scrollHeight;
                     }
-                    stoppedPolls = 0;
                     executingStoppedPolls = 0;
                     return;
                 }
@@ -7916,7 +7891,6 @@ function pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText, u
                         }
                         log.scrollTop = log.scrollHeight;
                     }
-                    stoppedPolls = 0;
                     return;
                 }
                 const {
@@ -7939,20 +7913,16 @@ function pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText, u
                     log.scrollTop = log.scrollHeight;
                 }
 
-                if (!running && !successFound && !exitKnown && !completionFailed && !abortedFound && !errorFound && tick < maxPollTicks) {
-                    stoppedPolls++;
-                    if (stoppedPolls <= maxStoppedGracePolls) {
-                        if (stoppedPolls === 1 && log) {
-                            log.innerText += "\n\n[INFO] Update-Prozess beendet, warte auf Abschlussstatus und letzte Logzeilen...";
-                        }
-                        return;
-                    }
-                } else {
-                    stoppedPolls = 0;
+                if (!running && !successFound && !exitKnown && !completionFailed && !abortedFound && !errorFound) {
+                    e3dcRenderInstallerUpdateStatus({...updateStatus, observationWarning: {
+                        title: 'Abschluss noch nicht bestätigt',
+                        detail: 'Es liegt noch kein bestätigtes Endergebnis vor. Der Status wird automatisch erneut abgefragt.',
+                    }}, updateStartedAt);
+                    return;
                 }
 
-                if (!running || successFound || exitKnown || completionFailed || abortedFound || errorFound || tick >= maxPollTicks) {
-                    clearInterval(interval);
+                if (!running || successFound || exitKnown || completionFailed || abortedFound || errorFound) {
+                    stopPolling();
                     const ok = successFound && !exitFailed && !completionFailed && !errorFound;
                     if (spinner) {
                         spinner.classList.remove('fa-spin', 'fa-sync');
@@ -7975,9 +7945,6 @@ function pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText, u
                             }
                         } else if (abortedFound) {
                             log.innerText += "\n\n[INFO] System Update wurde abgebrochen.";
-                        } else if (tick >= maxPollTicks) {
-                            log.innerText += "\n\n[HINWEIS] Die Weboberfläche beendet das Polling nach 60 Minuten. "
-                                + "Der Updateprozess wird dadurch nicht beendet; bitte Konsolen- oder Diagnose-Log prüfen.";
                         } else if (exitFailed) {
                             log.innerText += "\n\n[FEHLER] System Update beendet mit Exitcode " + exitCode + ".";
                         } else {
@@ -7995,42 +7962,17 @@ function pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText, u
                 }
             })
             .catch(err => {
-                transientPollErrors++;
-                if (transientPollErrors <= maxTransientPollErrors
-                    && (Date.now() - pollStartedAt) < maxTransientPollDurationMs
-                    && (Date.now() - pollStartedAt) < maxPollDurationMs) {
-                    e3dcRenderInstallerUpdateStatus(lastUpdateStatus, updateStartedAt);
-                    const statusDetail = document.getElementById('update-status-detail');
-                    if (statusDetail) {
-                        statusDetail.textContent = "Die Weboberfläche wird gerade neu gestartet. "
-                            + "Der Updateauftrag läuft unabhängig weiter.";
-                    }
-                    if (log && transientPollErrors === 1) {
-                        log.innerText += "\n\n[STATUS] Die Weboberfläche wird für den kontrollierten Dateiaustausch neu gestartet. Der Systemjob läuft unabhängig weiter; die Verbindung wird automatisch erneut geprüft.";
-                    }
-                    return;
-                }
-                clearInterval(interval);
-                if (log) {
-                    log.innerText += "\n\n[HINWEIS] Die Weboberfläche konnte nach zwei Minuten noch nicht wieder erreicht werden. Der Systemjob wurde dadurch nicht beendet. Lade die Seite neu, um den aktuellen Abschlussstatus zu lesen.";
-                }
-                e3dcRenderInstallerUpdateStatus({...lastUpdateStatus, running: false}, updateStartedAt);
-                const statusTitle = document.getElementById('update-status-title');
-                const statusDetail = document.getElementById('update-status-detail');
-                if (statusTitle) statusTitle.textContent = "Verbindung noch nicht wiederhergestellt";
-                if (statusDetail) statusDetail.textContent = "Der Systemjob läuft unabhängig von dieser Anzeige weiter. Lade die Seite neu, um den aktuellen Status zu lesen.";
-                if (spinner) {
-                    spinner.classList.remove('fa-spin', 'fa-sync');
-                    spinner.classList.add('fa-info-circle', 'text-warning');
-                }
-                if (closeBtn) closeBtn.style.display = 'block';
-                if (finishBtn) finishBtn.disabled = false;
-                if(btn) { btn.innerHTML = origText; btn.disabled = false; }
+                if (stopped) return;
+                if (observation.expired()) { stopObservation(timeoutMessage); return; }
+                const warning = observation.fail(err);
+                e3dcRenderInstallerUpdateStatus({...lastUpdateStatus, observationWarning: warning}, updateStartedAt);
+                if (log) log.innerText = lastUpdateStatus.logText + '\n\n[STATUS] ' + warning.title + '. ' + warning.detail;
             })
             .finally(() => {
                 pollInFlight = false;
             });
     }, 1000);
+    e3dcInstallerUpdatePollTimer = interval;
 }
 
 // Gemeinsame Update-Logik
@@ -8039,102 +7981,41 @@ function startSystemUpdate(btnId = null) {
 }
 
 function pollUpdate(log, spinner, closeBtn, finishBtn) {
-    let tick = 0;
-    let stoppedPolls = 0;
-    let transientPollErrors = 0;
-    let pollInFlight = false;
-    const maxStoppedGracePolls = 6;
-    const maxTransientPollErrors = 120;
-    const pollStartedAt = Date.now();
-    const maxTransientPollDurationMs = 2 * 60 * 1000;
-    const interval = setInterval(() => {
-        if (pollInFlight) return;
-        pollInFlight = true;
-        tick++;
-        e3dcFetchUpdateJsonWithTimeout(e3dcActionUrl('action=run_update&mode=poll&t=' + Date.now()))
-            .then(data => {
-                transientPollErrors = 0;
-                if (typeof data.log === 'string') log.innerText = data.log;
-                const modalBody = log.parentElement;
-                modalBody.scrollTop = modalBody.scrollHeight;
+    // Ältere Aufrufer beobachten denselben kanonischen Auftrag mit ihrer bisherigen Gesamtgrenze.
+    const saved = e3dcReadUpdateObservation('update', 6 * 60 * 1000);
+    return pollInstallerUpdate(log, spinner, closeBtn, finishBtn, null, '',
+        saved ? saved.startedAt : Date.now(), 'update', saved ? saved.binding : null, 6 * 60 * 1000);
+}
 
-                const logText = data.log || "";
-                const releaseCompletionFound = /(?:^|\r?\n)\[OK\]\s+Update abgeschlossen\.\s*(?:\r?\n)+Version:\s*v?\d+\.\d+\.\d+[A-Za-z0-9._-]*/i.test(logText);
-                const successFound = releaseCompletionFound ||
-                                     logText.includes("Update erfolgreich abgeschlossen") ||
-                                     logText.includes("Update abgeschlossen") ||
-                                     logText.includes("Du bist auf dem neuesten Stand") ||
-                                     logText.includes("Vorgang abgebrochen");
-                const exitCode = Number.isInteger(data.exit_code) ? data.exit_code : null;
-                const exitKnown = exitCode !== null;
-                const exitOk = exitKnown && exitCode === 0;
-                const exitFailed = exitKnown && exitCode !== 0;
-                const errorFound = /(traceback|exception|critical|fatal|permission denied|web-update kann nicht starten|konnte prozess nicht starten|konnte update-prozess nicht starten)/i.test(logText);
-
-                if (!data.running && !successFound && !exitKnown && tick < 360) {
-                    stoppedPolls++;
-                    if (stoppedPolls <= maxStoppedGracePolls) {
-                        if (stoppedPolls === 1) {
-                            log.innerText += "\n\n[INFO] Update-Prozess beendet, warte auf Abschlussstatus und letzte Logzeilen...";
-                        }
-                        return;
-                    }
-                } else {
-                    stoppedPolls = 0;
-                }
-
-                if (!data.running || successFound || exitKnown || tick >= 360) {
-                    clearInterval(interval);
-                    setTimeout(() => {
-                        spinner.classList.remove('fa-spin', 'fa-sync');
-                        const ok = (successFound || exitOk || data.success === true) && !exitFailed && !errorFound;
-                        if (ok) {
-                            spinner.classList.add('fa-check-circle', 'text-success');
-                            log.innerText += "\n\n✓ Update beendet. Bitte Seite neu laden.";
-                            // Optional: Reload triggern oder Badges resetten
-                            if(typeof checkInstallerUpdate === 'function') checkInstallerUpdate();
-                        } else {
-                            spinner.classList.add('fa-times-circle', 'text-danger');
-                            if (tick >= 360) {
-                                log.innerText += "\n\n✗ Update beendet: Zeitüberschreitung beim Warten auf den Abschluss.";
-                            } else if (exitFailed) {
-                                log.innerText += "\n\n✗ Update beendet mit Exitcode " + exitCode + ".";
-                            } else {
-                                log.innerText += "\n\n✗ Update beendet, aber ohne eindeutigen Abschlussstatus.";
-                            }
-                        }
-                        closeBtn.style.display = 'block';
-                        finishBtn.disabled = false;
-                        finishBtn.innerText = ok ? "Neu laden" : "Schließen";
-                        finishBtn.onclick = ok ? () => location.reload() : null;
-                    }, 500);
-                }
-            })
-            .catch(err => {
-                transientPollErrors++;
-                if (transientPollErrors <= maxTransientPollErrors
-                    && (Date.now() - pollStartedAt) < maxTransientPollDurationMs) {
-                    console.info("Update poll transient:", err);
-                    if (log && transientPollErrors === 1) {
-                        log.innerText += "\n\n[STATUS] Die Weboberfläche wird für den kontrollierten Dateiaustausch neu gestartet. Der Systemjob läuft unabhängig weiter; die Verbindung wird automatisch erneut geprüft.";
-                    }
-                    return;
-                }
-                clearInterval(interval);
-                if (log) {
-                    log.innerText += "\n\n[HINWEIS] Die Weboberfläche konnte nach zwei Minuten noch nicht wieder erreicht werden. Der Systemjob wurde dadurch nicht beendet. Lade die Seite neu, um den aktuellen Abschlussstatus zu lesen.";
-                }
-                if (spinner) {
-                    spinner.classList.remove('fa-spin', 'fa-sync');
-                    spinner.classList.add('fa-info-circle', 'text-warning');
-                }
-                closeBtn.style.display = 'block';
-                finishBtn.disabled = false;
-            })
-            .finally(() => {
-                pollInFlight = false;
-            });
-    }, 1000);
+function e3dcResumeInstallerUpdate() {
+    if (e3dcInstallerUpdatePollTimer !== null) return true;
+    let purpose = 'update';
+    let saved = e3dcReadUpdateObservation(purpose, 60 * 60 * 1000);
+    if (!saved) {
+        purpose = 'permissions_repair';
+        saved = e3dcReadUpdateObservation(purpose, 60 * 60 * 1000);
+    }
+    if (!saved) return false;
+    const log = document.getElementById('update-log');
+    if (!log) return false;
+    const spinner = document.getElementById('update-spinner');
+    const closeBtn = document.getElementById('update-close-btn');
+    const finishBtn = document.getElementById('update-finish-btn');
+    const btn = document.getElementById('btn-update-installer');
+    const origText = btn ? btn.innerHTML : '';
+    const title = document.getElementById('update-modal-title');
+    if (title) title.innerText = purpose === 'permissions_repair' ? 'Systemreparatur' : 'System Update';
+    log.innerText = 'Der gespeicherte Auftrag wird erneut abgefragt. Warte auf den zugehörigen Status...';
+    if (spinner) spinner.className = 'fas fa-sync fa-spin me-2';
+    if (closeBtn) closeBtn.style.display = 'none';
+    if (finishBtn) { finishBtn.disabled = true; finishBtn.innerText = 'Schließen'; finishBtn.onclick = null; }
+    if (btn) btn.disabled = true;
+    e3dcRenderInstallerUpdateStatus({purpose, runBindingPending: true}, saved.startedAt);
+    const modal = document.getElementById('updateModal');
+    if (modal && window.bootstrap) bootstrap.Modal.getOrCreateInstance(modal).show();
+    pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText,
+        saved.startedAt, purpose, saved.binding, saved.maxDurationMs);
+    return true;
 }
 
 let releaseRollbackState = null;

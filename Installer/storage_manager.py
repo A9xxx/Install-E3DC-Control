@@ -5266,7 +5266,11 @@ def confirm_storage_dc_first_charge_recovery_anchor(
     )
     readback_charge_w = safe_int(readback.get("max_charge_w"), -1)
     charge_matches = bool(
-        readback_charge_w == candidate_w
+        (
+            candidate_w > 0
+            and readback_charge_w >= 0
+            and abs(readback_charge_w - candidate_w) < RSCP_POWER_SETTINGS_TOLERANCE_W
+        )
         or (
             candidate_w == 0
             and 0 <= readback_charge_w <= bounded_zero_w
@@ -5322,7 +5326,12 @@ def confirm_storage_dc_first_charge_recovery_anchor(
         )
         return False
 
-    payload["storage_dc_first_charge_last_confirmed_limit_w"] = candidate_w
+    # Positive Rahmen werden am tatsächlichen Readback verankert, nicht an
+    # einem innerhalb der Protokolltoleranz lediglich akzeptierten Wunsch.
+    # Der besondere gebundene Nullvertrag bleibt davon getrennt.
+    payload["storage_dc_first_charge_last_confirmed_limit_w"] = (
+        readback_charge_w if candidate_w > 0 else 0
+    )
     payload["storage_dc_first_charge_last_confirmed_ts"] = evidence_ts
     payload["storage_dc_first_charge_confirmation_status"] = (
         "confirmed_power_settings_readback"
@@ -5331,6 +5340,14 @@ def confirm_storage_dc_first_charge_recovery_anchor(
         evidence_age_s,
         3,
     )
+    if isinstance(payload.get("storage_dc_first_opening"), dict):
+        opening = copy.deepcopy(payload["storage_dc_first_opening"])
+        opening["confirmed_w"] = readback_charge_w
+        opening["confirmed_ts"] = evidence_ts
+        opening["bounded_zero_confirmed"] = bool(
+            candidate_w == 0 and readback_charge_w > 0
+        )
+        payload["storage_dc_first_opening"] = opening
     return True
 
 
@@ -11207,6 +11224,189 @@ def storage_dc_first_charge_candidate(decision: Dict[str, Any]) -> bool:
     }
 
 
+def storage_dc_first_opening_frame(
+    cfg: Dict[str, Any],
+    live: Dict[str, Any],
+    previous_state: Dict[str, Any],
+    *,
+    target_w: int,
+    source_valid: bool,
+    steady: bool,
+    step_up_w: int,
+    owner: str,
+    urgent: bool,
+    now_s: float,
+    time_sample: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Bündelt nur Öffnungen; kleinere verbindliche Grenzen wirken sofort.
+
+    Der interne Verlauf ist kein ausgegebener oder bestätigter Gerätewert.
+    Nur ein frischer Readback darf die nächste Öffnung verankern. Die bisher
+    für einen nominalen Zwei-Sekunden-Zyklus konfigurierte Schrittweite wird
+    einmalig in W/s übersetzt; die vergangene Zeit stammt aus monotonic.
+    """
+    current_time = (
+        copy.deepcopy(time_sample)
+        if isinstance(time_sample, dict)
+        else control_time.sample(wall_ts=now_s)
+    )
+    prior = previous_state.get("storage_dc_first_opening")
+    prior = prior if isinstance(prior, dict) else {}
+    same_owner = bool(
+        prior.get("schema") == "storage_dc_first_opening_v1"
+        and prior.get("owner") == owner
+        and previous_state.get("storage_dc_first_charge_limit_active") is True
+        and previous_state.get("storage_dc_first_charge_limit_source_valid") is True
+    )
+    elapsed = control_time.elapsed_contract(
+        prior.get("time_sample") if same_owner else None,
+        current_time,
+        max_step_s=10.0,
+    )
+    dt_s = safe_float(elapsed.get("elapsed_s"), 0.0)
+    continuous = bool(same_owner and elapsed.get("known"))
+    target_w = max(0, int(target_w))
+    rate_w_s = max(5.0, float(step_up_w) / 2.0)
+    delta_w = (
+        50 if urgent else max(
+            100,
+            safe_int(cfg.get("storage_curve_charge_servo_deadband_w"), 200 if steady else 150),
+        )
+    )
+    minimum_s = 8.0 if steady and not urgent else 2.0
+    finish_s = 30.0
+
+    readback = _storage_curve_cap_live_power_settings(live, now_s=now_s)
+    fresh_readback = readback is not None
+    anchor_valid = bool(readback is not None and readback["limits_used"])
+    anchor_w = int(readback["max_charge_w"]) if anchor_valid else 0
+    previous_request_w = max(0, safe_int(prior.get("requested_w"), 0))
+    previous_ramp_w = max(0.0, safe_float(prior.get("ramp_w"), anchor_w))
+
+    diagnostics = previous_state.get("rscp_power_settings")
+    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    requested = diagnostics.get("requested")
+    requested = requested if isinstance(requested, dict) else {}
+    pending_w = None
+    if (
+        same_owner and diagnostics.get("confirmed") is not True
+        and requested.get("limits_used") is True
+        and isinstance(requested.get("max_charge_w"), int)
+        and not isinstance(requested.get("max_charge_w"), bool)
+        and requested["max_charge_w"] >= 0
+        and diagnostics.get("status") in {
+            "pending_readback", "pending_readback_missing", "retry_backoff",
+            "readback_mismatch", "readback_stale", "pending_target_conflict",
+        }
+    ):
+        pending_w = int(requested["max_charge_w"])
+        if anchor_valid and _storage_curve_cap_power_settings_match(
+            readback,
+            requested,
+            bounded_zero_w=(
+                max(EMS_POWER_SETTINGS_NONZERO_MIN_W,
+                    safe_int(diagnostics.get("bounded_zero_w"), 0))
+                if pending_w == 0 else 0
+            ),
+        ):
+            pending_w = None
+
+    # Unvermutete externe Vertragsänderungen sind keine angesparte Rampenzeit.
+    if (
+        continuous and anchor_valid and pending_w is None
+        and abs(anchor_w - previous_request_w) >= RSCP_POWER_SETTINGS_TOLERANCE_W
+    ):
+        continuous = False
+        dt_s = 0.0
+    since_output_s = (
+        max(0.0, safe_float(prior.get("since_output_s"), 0.0)) + dt_s
+        if continuous else 0.0
+    )
+    opening_age_s = (
+        max(0.0, safe_float(prior.get("opening_age_s"), 0.0)) + dt_s
+        if continuous and target_w > anchor_w else 0.0
+    )
+    ramp_w = min(
+        float(target_w),
+        max(float(anchor_w), previous_ramp_w) + rate_w_s * dt_s
+        if continuous else float(anchor_w),
+    )
+    phase = "target"
+    output_w = min(anchor_w, target_w)
+    if not source_valid or target_w <= 0:
+        output_w, ramp_w, phase = 0, 0.0, "source_or_target_zero"
+    elif anchor_valid and target_w < anchor_w:
+        # Auch eine Absenkung innerhalb der Protokolltoleranz bleibt fachlich
+        # sofort verbindlich. Der tatsächliche Readback wird separat geführt.
+        output_w, ramp_w, phase = target_w, float(target_w), "hard_down"
+    elif pending_w is not None:
+        if (
+            anchor_valid and 0 < pending_w < EMS_POWER_SETTINGS_NONZERO_MIN_W
+            and anchor_w == EMS_POWER_SETTINGS_NONZERO_MIN_W
+            and anchor_w - pending_w >= RSCP_POWER_SETTINGS_TOLERANCE_W
+        ):
+            # Ein Gerät kann einen kleinen positiven Rahmen auf 300 W
+            # begrenzen. Den unbestätigten Wunsch zunächst konservativ in
+            # den etablierten Nullvertrag überführen; sonst bliebe auch ein
+            # später wieder höheres Ziel am unmöglichen Altauftrag hängen.
+            output_w, phase = 0, "pending_minimum_zero"
+        else:
+            output_w, phase = min(target_w, pending_w), "pending_confirmation"
+        ramp_w = float(min(anchor_w, output_w))
+        since_output_s = opening_age_s = 0.0
+    elif not anchor_valid:
+        # Ein erster begrenzter Auftrag ist noch kein Rampenanker. Ohne seine
+        # frische Bestätigung wird derselbe Wunsch nicht weiter hochgezählt.
+        initial_w = (
+            previous_request_w if same_owner and previous_request_w > 0
+            else max(EMS_POWER_SETTINGS_NONZERO_MIN_W, step_up_w)
+        )
+        output_w = min(target_w, initial_w)
+        ramp_w, phase = float(output_w), "awaiting_initial_readback"
+        since_output_s = opening_age_s = 0.0
+    elif not continuous:
+        output_w, ramp_w, phase = anchor_w, float(anchor_w), "confirmed_anchor"
+    elif target_w - anchor_w < RSCP_POWER_SETTINGS_TOLERANCE_W:
+        # Bestehende technische Auflösung: kein periodischer neuer Wunsch
+        # für einen bereits als gleich akzeptierten Rest unter 50 W.
+        output_w, phase = anchor_w, "readback_tolerance_hold"
+        opening_age_s = 0.0
+    elif (
+        anchor_w > 0 or ramp_w >= min(target_w, EMS_POWER_SETTINGS_NONZERO_MIN_W)
+    ) and (
+        (int(ramp_w) - anchor_w >= delta_w and since_output_s >= minimum_s)
+        or (ramp_w >= target_w and opening_age_s >= finish_s)
+    ):
+        output_w = min(target_w, int(ramp_w))
+        phase = "opening_event" if output_w < target_w else "target_complete"
+        since_output_s = opening_age_s = 0.0
+    else:
+        output_w, phase = anchor_w, "opening_hold"
+    output_w = min(target_w, max(0, int(output_w)))
+    return {
+        "schema": "storage_dc_first_opening_v1",
+        "owner": owner,
+        "time_sample": current_time,
+        "time_continuous": continuous,
+        "time_blockers": list(elapsed.get("blockers") or []),
+        "elapsed_s": dt_s,
+        "target_w": target_w,
+        "ramp_w": ramp_w,
+        "requested_w": output_w,
+        "confirmed_w": anchor_w if anchor_valid else None,
+        "readback_fresh": fresh_readback,
+        "pending_w": pending_w,
+        "phase": phase,
+        "rate_w_s": rate_w_s,
+        "event_delta_w": delta_w,
+        "minimum_interval_s": minimum_s,
+        "finish_after_s": finish_s,
+        "since_output_s": since_output_s,
+        "opening_age_s": opening_age_s,
+        "urgent": urgent,
+    }
+
+
 def apply_storage_dc_first_charge_limit(
     cfg: Dict[str, Any],
     live: Dict[str, Any],
@@ -11216,6 +11416,7 @@ def apply_storage_dc_first_charge_limit(
     previous_state: Optional[Dict[str, Any]] = None,
     now_s: Optional[float] = None,
     plan: Optional[Dict[str, Any]] = None,
+    time_sample: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Setzt einen MAX_CHARGE_POWER-Rahmen; E3DC-AUTO und Entladung bleiben frei."""
 
@@ -11364,34 +11565,36 @@ def apply_storage_dc_first_charge_limit(
     elif previous_limit_w > 0 and target_limit_w < turn_off_w:
         target_limit_w = 0
 
-    deadband_w = max(
-        100,
-        safe_int(cfg.get("storage_curve_charge_servo_deadband_w"), 150),
-    )
     steady_mode = bool(decision.get("steady_curve_guidance_enabled"))
     default_step_up = 50 if steady_mode else 250
-    default_step_down = 50 if steady_mode else 500
 
     step_up_w = max(
         10 if steady_mode else 250,
         safe_int(cfg.get("storage_curve_charge_servo_step_up_w"), default_step_up),
     )
-    step_down_w = max(
-        10 if steady_mode else 250,
-        safe_int(cfg.get("storage_curve_charge_servo_step_down_w"), default_step_down),
+    shadow_payload = result.get("shadow_payload")
+    shadow_payload = shadow_payload if isinstance(shadow_payload, dict) else {}
+    shadow_inputs = shadow_payload.get("inputs", {})
+    shadow_inputs = shadow_inputs if isinstance(shadow_inputs, dict) else {}
+    opening = storage_dc_first_opening_frame(
+        cfg, live, previous_state,
+        target_w=target_limit_w,
+        source_valid=bool(source.get("valid")),
+        steady=steady_mode,
+        step_up_w=step_up_w,
+        owner=("direct_marketing" if str(result.get("state") or "").startswith("direct_marketing_") else "curve"),
+        urgent=bool(
+            shadow_inputs.get("curve_cap_hard_pressure_active")
+            or shadow_inputs.get("adaptive_latest_charge_due")
+            or shadow_inputs.get("shortfall_pv_catchup_active")
+            or safe_int(shadow_inputs.get("curve_hard_anchor_need_w"), 0) > 0
+        ),
+        now_s=now_value,
+        time_sample=time_sample,
     )
-    # Der vorgelagerte Regler besitzt eine eigene Abwärtsrampe. Damit bei
-    # schnellen Wolken (PV-Einbruch) der Laderahmen nicht nervös springt,
-    # wird auch hier eine weiche Abwärtsrampe (step_down_w) genutzt.
-    if target_limit_w < previous_limit_w:
-        applied_limit_w = max(target_limit_w, previous_limit_w - step_down_w)
-        ramp_phase = "soft_down" if applied_limit_w > target_limit_w else "target"
-    elif previous_active and target_limit_w - previous_limit_w < deadband_w:
-        applied_limit_w = previous_limit_w
-        ramp_phase = "deadband_hold"
-    else:
-        applied_limit_w = min(target_limit_w, previous_limit_w + step_up_w)
-        ramp_phase = "soft_up" if applied_limit_w < target_limit_w else "target"
+    applied_limit_w = opening["requested_w"]
+    ramp_phase = opening["phase"]
+    deadband_w = opening["event_delta_w"]
     source_offer_w = (
         min(
             max(0, safe_int(source.get("total_pv_w"), 0)),
@@ -11494,6 +11697,7 @@ def apply_storage_dc_first_charge_limit(
     result["storage_dc_first_charge_ramp_phase"] = ramp_phase
     result["storage_dc_first_charge_deadband_w"] = deadband_w
     result["storage_dc_first_charge_step_up_w"] = step_up_w
+    result["storage_dc_first_opening"] = opening
     if recovery_anchor.get("valid"):
         last_confirmed_limit_w = max(
             0,
@@ -29741,6 +29945,11 @@ def decide_next_cycle(
         "storage_dc_first_charge_ramp_phase": str(
             decision.get("storage_dc_first_charge_ramp_phase") or ""
         ),
+        "storage_dc_first_opening": copy.deepcopy(
+            decision.get("storage_dc_first_opening")
+            if isinstance(decision.get("storage_dc_first_opening"), dict)
+            else {}
+        ),
         "storage_dc_first_charge_deadband_w": max(
             0,
             safe_int(decision.get("storage_dc_first_charge_deadband_w"), 0),
@@ -30671,6 +30880,11 @@ def decide_next_cycle(
         ),
         "storage_dc_first_charge_ramp_phase": str(
             decision.get("storage_dc_first_charge_ramp_phase") or ""
+        ),
+        "storage_dc_first_opening": copy.deepcopy(
+            decision.get("storage_dc_first_opening")
+            if isinstance(decision.get("storage_dc_first_opening"), dict)
+            else {}
         ),
         "storage_dc_first_charge_deadband_w": max(
             0,
@@ -32734,6 +32948,11 @@ def write_state(payload: Dict[str, Any], plan: Dict[str, Any]) -> None:
         "direct_marketing_pv_store_blocker": payload.get("direct_marketing_pv_store_blocker"),
         "direct_marketing_pv_store_auto_limit_active": payload.get("direct_marketing_pv_store_auto_limit_active"),
         "storage_dc_first_charge_limit_enabled": bool(payload.get("storage_dc_first_charge_limit_enabled")),
+        "storage_dc_first_opening": copy.deepcopy(
+            payload.get("storage_dc_first_opening")
+            if isinstance(payload.get("storage_dc_first_opening"), dict)
+            else {}
+        ),
         "storage_dc_first_charge_limit_active": bool(payload.get("storage_dc_first_charge_limit_active")),
         "storage_dc_first_charge_limit_contract_version": payload.get(
             "storage_dc_first_charge_limit_contract_version"

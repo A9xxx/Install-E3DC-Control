@@ -202,15 +202,11 @@ def _load_config_uncached():
                 with open(cand, 'r') as f:
                     v4_data = json.load(f)
                 if isinstance(v4_data, dict):
-                    def _clean(val):
-                        s = str(val)
-                        if '//' in s: s = s.split('//')[0]
-                        if '#' in s: s = s.split('#')[0]
-                        return s.strip()
-
                     def _is_scalar(val):
                         return val is None or isinstance(val, (str, int, float, bool))
 
+                    # JSON-Werte sind wörtlich: # und // sind keine Kommentare,
+                    # Rand-Leerzeichen können zu einem Passwort gehören.
                     # Ältere PHP-Stände speicherten Werte teilweise unter
                     # {"config": {"key": "val"}}. Diese Kompatibilität bleibt
                     # erhalten, aber kanonische Top-Level-Werte müssen gewinnen.
@@ -220,12 +216,12 @@ def _load_config_uncached():
                     if isinstance(legacy_config, dict):
                         for sub_k, sub_v in legacy_config.items():
                             if _is_scalar(sub_v):
-                                conf[str(sub_k).lower()] = _clean(sub_v)
+                                conf[str(sub_k).lower()] = str(sub_v)
 
                     for k, v in v4_data.items():
                         if k == "config" or not _is_scalar(v):
                             continue
-                        conf[str(k).lower()] = _clean(v)
+                        conf[str(k).lower()] = str(v)
             except Exception as e:
                 logger.error(f"Fehler beim Lesen der v4 JSON ({cand}): {e}")
             break

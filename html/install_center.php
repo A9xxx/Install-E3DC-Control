@@ -4089,6 +4089,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_runtime_permissions_rep
 </div>
 
 <script src="<?= getAssetUrl('pv_forecast_diagnostics.js') ?>" defer></script>
+<script src="<?= getAssetUrl('update_status.js') ?>"></script>
 <script>
 const installCenterCsrfToken = <?= json_encode(installCenterCsrfToken(), JSON_UNESCAPED_UNICODE) ?>;
 const serviceControlCsrfToken = <?= json_encode(e3dcCsrfToken(), JSON_UNESCAPED_UNICODE) ?>;
@@ -6025,6 +6026,9 @@ async function runModuleAction(moduleKey, action) {
 
 const INSTALL_CENTER_UPDATE_POLL_TIMEOUT_MS = 10000;
 const INSTALL_CENTER_UPDATE_START_TIMEOUT_MS = 30000;
+const INSTALL_CENTER_UPDATE_MAX_DURATION_MS = 30 * 60 * 1000;
+let permissionRepairPollTimer = null;
+let permissionRepairStartPending = false;
 
 function normalizePermissionRepairRunId(value) {
     const normalized = (typeof value === 'string') ? value.trim().toLowerCase() : '';
@@ -6049,8 +6053,19 @@ async function loadUpdateJsonWithTimeout(url, timeoutMs = INSTALL_CENTER_UPDATE_
         credentials: 'same-origin',
         signal: controller ? controller.signal : undefined
     }).then(async response => {
-        if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
-        return await response.json();
+        if (!response.ok) {
+            const error = new Error(`HTTP ${response.status}`);
+            error.status = response.status;
+            error.kind = response.status === 401 || response.status === 403 ? 'auth' : 'http';
+            throw error;
+        }
+        try {
+            return await response.json();
+        } catch (_error) {
+            const error = new Error('Die Statusantwort enthält kein gültiges JSON.');
+            error.kind = 'invalid_response';
+            throw error;
+        }
     });
     return await Promise.race([requestPromise, timeoutPromise])
         .finally(() => {
@@ -6110,6 +6125,7 @@ async function readPermissionRepairDriftPreflight() {
 async function readPermissionRepairBaseline() {
     try {
         const data = await loadUpdateJsonWithTimeout(`index.php?action=poll_self_update&t=${Date.now()}`);
+        e3dcValidateUpdatePoll(data);
         return {
             available: true,
             runId: normalizePermissionRepairRunId(data && data.run_id),
@@ -6167,81 +6183,136 @@ function bindPermissionRepairPoll(data, binding) {
     };
 }
 
-function pollPermissionRepairUpdate(runBinding = null) {
-    const log = document.getElementById('actionLog');
-    const modalBody = document.getElementById('jobModalBody');
-    let ticks = 0;
-    let transientErrors = 0;
+function renderPermissionRepairUpdate(view, output = '') {
+    for (const id of ['actionLog', 'jobModalBody']) {
+        const target = document.getElementById(id);
+        if (!target) continue;
+        const previousDetails = target.querySelector('details[data-update-details]');
+        const detailsOpen = previousDetails ? previousDetails.open : false;
+        const phase = view.phase || {};
+        const progress = view.finished ? 100 : Number(phase.progress || 0);
+        const icon = view.finished
+            ? (view.ok ? 'fa-circle-check ok' : 'fa-circle-xmark bad')
+            : (view.warning ? 'fa-triangle-exclamation warn' : 'fa-spinner fa-spin warn');
+        target.innerHTML = `
+            <div class="result-title"><i class="fas ${icon}"></i>${esc(view.title)}</div>
+            <div class="text-secondary small mt-2">${esc(view.detail || '')}</div>
+            ${phase.step ? `<div class="small mt-2">${esc(view.finished ? (view.ok ? 'Fertig' : 'Beendet') : phase.step)}</div>
+                <div class="progress mt-1" style="height: 6px" aria-label="Bestätigter Arbeitsschritt">
+                    <div class="progress-bar" style="width: ${Math.max(0, Math.min(100, progress))}%"></div>
+                </div>` : ''}
+            <details data-update-details class="mt-3"${detailsOpen ? ' open' : ''}>
+                <summary>Technische Details anzeigen</summary>
+                <pre class="raw-json mt-2">${esc(output || 'Noch kein Protokoll für diesen Auftrag bestätigt.')}</pre>
+            </details>`;
+    }
+}
+
+function pollPermissionRepairUpdate(runBinding = null, startedAt = Date.now(), maxDurationMs = INSTALL_CENTER_UPDATE_MAX_DURATION_MS) {
+    if (permissionRepairPollTimer !== null) return;
     let lastOutput = '';
+    let lastPhase = null;
+    let stopped = false;
     let pollInFlight = false;
-    const maxTransientErrors = 120;
     const binding = runBinding || createPermissionRepairRunBinding({available: false});
-    const pollStartedAt = Date.now();
-    const maxTransientDurationMs = 2 * 60 * 1000;
-    const maxPollDurationMs = 30 * 60 * 1000;
+    const observation = e3dcUpdateObservation(
+        'permissions_repair', binding, startedAt, maxDurationMs
+    );
+    const stop = () => {
+        stopped = true;
+        window.clearInterval(timer);
+        if (permissionRepairPollTimer === timer) permissionRepairPollTimer = null;
+        observation.clear();
+    };
+    const stopIfExpired = () => {
+        if (stopped) return true;
+        if (!observation.expired()) return false;
+        stop();
+        renderPermissionRepairUpdate({
+            title: 'Statusbeobachtung nach ' + Math.round(maxDurationMs / 60000) + ' Minuten beendet',
+            detail: 'Für diesen Auftrag ist kein abschließendes Ergebnis bestätigt. Diese Anzeige beendet keinen Systemjob. Prüfe das Update-Protokoll und den Anlagenstatus.',
+            warning: true, phase: lastPhase
+        }, lastOutput);
+        return true;
+    };
     const timer = window.setInterval(async () => {
-        if (pollInFlight) return;
+        if (stopIfExpired() || pollInFlight || !observation.ready()) return;
         pollInFlight = true;
-        ticks += 1;
         try {
             const data = await loadUpdateJsonWithTimeout(`index.php?action=poll_self_update&t=${Date.now()}`);
-            transientErrors = 0;
+            if (stopIfExpired()) return;
+            e3dcValidateUpdatePoll(data);
             const runState = bindPermissionRepairPoll(data, binding);
             if (runState.replaced) {
-                window.clearInterval(timer);
-                const html = `<div class="warn">Der Status gehört inzwischen zu einem anderen Systemjob. Der Abschluss des gestarteten Reparaturlaufs wird deshalb nicht aus fremden Daten abgeleitet. Lade die Seite neu und prüfe das Update-Protokoll.</div>`;
-                log.innerHTML = html;
-                if (modalBody) modalBody.innerHTML = html;
+                stop();
+                renderPermissionRepairUpdate({
+                    title: 'Status gehört zu einem anderen Auftrag',
+                    detail: 'Der Abschluss dieser Systemreparatur wird deshalb nicht aus fremden Daten abgeleitet. Prüfe das Update-Protokoll.',
+                    warning: true, phase: lastPhase
+                }, lastOutput);
                 return;
             }
             if (!runState.bound) {
-                const html = `
-                    <div class="result-title"><i class="fas fa-spinner fa-spin warn"></i>Warte auf eindeutige Laufkennung</div>
-                    <div class="text-secondary small mt-2">Ein alter Abschlussstatus wird nicht als Ergebnis dieses Reparaturauftrags übernommen.</div>`;
-                log.innerHTML = html;
-                if (modalBody) modalBody.innerHTML = html;
-                if (ticks >= 1800 || (Date.now() - pollStartedAt) >= maxPollDurationMs) {
-                    window.clearInterval(timer);
-                    const timeoutHtml = `<div class="warn">Kein eindeutig zugeordneter Abschlussstatus. Der Systemjob wurde dadurch nicht beendet. Lade die Seite neu und prüfe das Update-Protokoll.</div>`;
-                    log.innerHTML = timeoutHtml;
-                    if (modalBody) modalBody.innerHTML = timeoutHtml;
-                }
+                renderPermissionRepairUpdate({
+                    title: 'Warte auf eindeutige Auftragskennung',
+                    detail: 'Für diesen Auftrag liegt noch kein zugeordneter Status vor. Ein alter Abschluss wird nicht übernommen; der Status wird erneut abgefragt.',
+                    warning: true, phase: lastPhase
+                }, lastOutput);
                 return;
             }
-            const output = typeof data.log === 'string' ? data.log : '';
-            lastOutput = output || lastOutput;
-            const state = data.completion || (data.running ? 'running' : 'unknown');
-            const finished = state === 'success' || state === 'failed';
-            const ok = state === 'success';
-            const html = `
-                <div class="result-title"><i class="fas ${finished ? (ok ? 'fa-circle-check ok' : 'fa-circle-xmark bad') : 'fa-spinner fa-spin warn'}"></i>${finished ? (ok ? 'Reparatur/Systemabgleich abgeschlossen' : 'Reparatur/Systemabgleich fehlgeschlagen') : 'Reparatur/Systemabgleich läuft'}</div>
-                <pre class="raw-json mt-2">${esc(output || 'Warte auf Protokoll...')}</pre>`;
-            log.innerHTML = html;
-            if (modalBody) modalBody.innerHTML = html;
-            if (finished || ticks >= 1800 || (Date.now() - pollStartedAt) >= maxPollDurationMs) {
-                window.clearInterval(timer);
-                await loadInstallCenter();
+            observation.accept();
+            lastOutput = data.log || lastOutput;
+            const phase = e3dcUpdatePhase(lastOutput);
+            if (/\[[1-4]\/4\]|Regelung und Weboberfläche laufen wieder/.test(lastOutput)) lastPhase = phase;
+            const exitCode = Number.isInteger(data.exit_code) ? data.exit_code : null;
+            const failed = data.completion === 'failed' || (exitCode !== null && exitCode !== 0);
+            const finished = data.running === false
+                && (failed || data.completion === 'success' || exitCode === 0);
+            const ok = finished && !failed;
+            renderPermissionRepairUpdate({
+                title: finished
+                    ? (ok ? 'Systemreparatur abgeschlossen' : 'Systemreparatur fehlgeschlagen')
+                    : (data.running ? phase.title : 'Abschluss noch nicht bestätigt'),
+                detail: finished
+                    ? (ok ? 'Der zugehörige Systemjob hat den erfolgreichen Abschluss bestätigt.'
+                        : 'Das Protokoll nennt Ursache, Anlagenzustand und den nächsten Schritt.')
+                    : (data.running ? phase.detail
+                        : 'Es liegt noch kein bestätigtes Endergebnis vor. Der Status wird automatisch erneut abgefragt.'),
+                finished, ok, phase,
+                warning: !data.running || phase.warning
+            }, lastOutput);
+            if (finished) {
+                stop();
+                // Fehler beim Neuladen des Katalogs ändern das bestätigte Jobergebnis nicht.
+                await loadInstallCenter().catch(() => {});
             }
         } catch (err) {
-            transientErrors += 1;
-            if (transientErrors <= maxTransientErrors
-                && (Date.now() - pollStartedAt) < maxTransientDurationMs) {
-                const html = `
-                    <div class="result-title"><i class="fas fa-spinner fa-spin warn"></i>Weboberfläche wird kontrolliert neu gestartet</div>
-                    <div class="text-secondary small mt-2">Der root-eigene Systemjob läuft unabhängig weiter. Die Verbindung wird automatisch erneut geprüft.</div>
-                    ${lastOutput ? `<pre class="raw-json mt-2">${esc(lastOutput)}</pre>` : ''}`;
-                log.innerHTML = html;
-                if (modalBody) modalBody.innerHTML = html;
-            } else {
-                window.clearInterval(timer);
-                const html = `<div class="warn">Die Weboberfläche konnte nach zwei Minuten noch nicht wieder erreicht werden. Der Systemjob wurde dadurch nicht beendet. Lade die Seite neu, um den aktuellen Abschlussstatus zu lesen.</div>`;
-                log.innerHTML = html;
-                if (modalBody) modalBody.innerHTML = html;
-            }
+            if (stopIfExpired()) return;
+            const failure = observation.fail(err);
+            renderPermissionRepairUpdate({
+                title: failure.title,
+                detail: `${failure.detail}${lastPhase ? ' Letzter bestätigter Schritt: ' + lastPhase.title + '.' : ' Für diesen Auftrag ist noch kein Arbeitsschritt bestätigt.'}`,
+                warning: true, phase: lastPhase
+            }, lastOutput);
         } finally {
             pollInFlight = false;
         }
     }, 1000);
+    permissionRepairPollTimer = timer;
+    stopIfExpired();
+}
+
+function resumePermissionRepairUpdate() {
+    if (permissionRepairStartPending || permissionRepairPollTimer !== null) return;
+    const saved = e3dcReadUpdateObservation('permissions_repair', 60 * 60 * 1000);
+    if (!saved) return;
+    showJobModal(
+        '<i class="fas fa-tools text-warning me-2"></i>Systemreparatur beobachten',
+        'Gespeicherten Auftrag ausschließlich lesend weiterverfolgen',
+        '<div class="job-progress-box">Der Status des bisherigen Auftrags wird erneut gelesen...</div>',
+        true
+    );
+    pollPermissionRepairUpdate(saved.binding, saved.startedAt, saved.maxDurationMs);
 }
 
 async function callRuntimePermissionsLauncher(action, confirmationToken = '') {
@@ -6344,6 +6415,16 @@ async function runRuntimePermissionsRepair() {
 }
 
 async function runPermissionRepairUpdate() {
+    if (permissionRepairStartPending || permissionRepairPollTimer !== null) return;
+    permissionRepairStartPending = true;
+    try {
+        await startPermissionRepairUpdate();
+    } finally {
+        permissionRepairStartPending = false;
+    }
+}
+
+async function startPermissionRepairUpdate() {
     if (!confirm('Vollständige Systemreparatur starten?\n\nDies ist kein reiner Rechtecheck: Der Systemjob erstellt ein verifiziertes Backup, gleicht alle Produktdateien mit dem veröffentlichten Stable-Stand ab, setzt die Rechte neu und startet die Dienste neu. Dabei kann dieselbe Version erneut installiert werden.')) return;
     const log = document.getElementById('actionLog');
     showJobModal(
@@ -6399,37 +6480,43 @@ async function runPermissionRepairUpdate() {
         return;
     }
     baseline = await readPermissionRepairBaseline();
+    const startedAt = Date.now();
+    const pendingObservation = e3dcUpdateObservation(
+        'permissions_repair', createPermissionRepairRunBinding(baseline), startedAt,
+        INSTALL_CENTER_UPDATE_MAX_DURATION_MS
+    );
     try {
         const response = await postPermissionRepairWithTimeout(body);
         const text = await response.text();
         let data = null;
         try { data = JSON.parse(text); } catch (_error) {}
-        if (data && !data.success) {
+        if (data && data.success === false) {
+            pendingObservation.clear();
             const html = `<div class="bad">Systemreparatur wurde nicht gestartet: ${esc(data.message || text || `HTTP ${response.status}`)}</div>`;
             log.innerHTML = html;
             const modalBody = document.getElementById('jobModalBody');
             if (modalBody) modalBody.innerHTML = html;
             return;
         }
-        if (!response.ok || !data) {
-            const html = `<div class="result-title"><i class="fas fa-spinner fa-spin warn"></i>Startantwort nicht lesbar; Status wird geprüft</div><div class="text-secondary small mt-2">Der Systemjob kann die Weboberfläche bereits für den Dateiaustausch neu starten. Sein kanonischer Abschlussstatus wird unabhängig von dieser Antwort weiter abgefragt.</div>`;
+        if (!response.ok || !data || data.success !== true) {
+            const html = `<div class="result-title"><i class="fas fa-spinner fa-spin warn"></i>Startantwort nicht lesbar; Status wird geprüft</div><div class="text-secondary small mt-2">Ob der Systemjob gestartet wurde, ist noch nicht bestätigt. Der vorhandene Status wird ausschließlich lesend geprüft; es wird kein zweiter Startauftrag gesendet.</div>`;
             log.innerHTML = html;
             const modalBody = document.getElementById('jobModalBody');
             if (modalBody) modalBody.innerHTML = html;
-            pollPermissionRepairUpdate(createPermissionRepairRunBinding(baseline));
+            pollPermissionRepairUpdate(createPermissionRepairRunBinding(baseline), startedAt);
             return;
         }
         const html = `<div class="result-title"><i class="fas fa-spinner fa-spin warn"></i>Systemjob gestartet</div><div class="text-secondary small mt-2">${esc(data.message || 'Backup, Rechteprojektion und Systemabgleich laufen im Hintergrund.')}</div>`;
         log.innerHTML = html;
         const modalBody = document.getElementById('jobModalBody');
         if (modalBody) modalBody.innerHTML = html;
-        pollPermissionRepairUpdate(createPermissionRepairRunBinding(baseline, data.run_id));
+        pollPermissionRepairUpdate(createPermissionRepairRunBinding(baseline, data.run_id), startedAt);
     } catch (err) {
         const html = `<div class="result-title"><i class="fas fa-spinner fa-spin warn"></i>Startantwort nicht lesbar; Status wird geprüft</div><div class="text-secondary small mt-2">Es liegt noch kein bestätigter Fehler des Systemjobs vor. Der kanonische Abschlussstatus wird weiter abgefragt.</div>`;
         log.innerHTML = html;
         const modalBody = document.getElementById('jobModalBody');
         if (modalBody) modalBody.innerHTML = html;
-        pollPermissionRepairUpdate(createPermissionRepairRunBinding(baseline));
+        pollPermissionRepairUpdate(createPermissionRepairRunBinding(baseline), startedAt);
     }
 }
 
@@ -6653,6 +6740,7 @@ async function loadInstallCenterPvForecastDiagnostics() {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+    resumePermissionRepairUpdate();
     loadInstallCenter();
     loadInstallCenterPvForecastDiagnostics();
     window.setInterval(refreshInstallerStatusOnly, 12000);

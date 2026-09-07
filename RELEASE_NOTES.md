@@ -1,4 +1,75 @@
-# E3DC-Control v5.4.5b
+# E3DC-Control v5.4.5c
+
+Release-Stand: 2026-09-07.
+
+E3DC-Control 5.4.5c bündelt kleine Öffnungen der Speicher-Ladegrenze,
+verbessert die Verbindung zur nativen E3/DC-Wallbox und macht den Verlauf
+von Web-Updates und Systemreparaturen verständlicher.
+
+## Ruhigere DC-first-Ladegrenzen
+
+Kleine Erhöhungen der oberen Speicher-Ladegrenze werden gesammelt. Die
+Nachführung berücksichtigt die verstrichene Zeit und die frische Rückmeldung
+des Geräts. Dadurch wird nicht jeder berechnete Zwischenschritt einzeln
+angefordert. Ein verbleibender nutzbarer Abstand zur gewünschten Grenze
+wird nach begrenzter Wartezeit freigegeben.
+
+Kleinere verbindliche Plan-, Quellen- und Schutzgrenzen greifen weiterhin
+ohne zusätzliche Wartefrist. Nutzer-`Aus`, ein Ladeplan mit 0 W und ungültige
+Quelldaten behalten ihren Vorrang. Der DC-first-Rahmen bleibt an die dafür
+freigegebene E3/DC-PV-Leistung gebunden. Zusatzwechselrichter erhalten keine
+neue Freigabe zum Laden des Speichers.
+
+Offene Geräteaufträge gelten noch nicht als wirksame Grenze. Auch ein vom
+Gerät nicht bestätigbarer kleiner Rahmen kann eine später wieder zulässige
+Öffnung nicht dauerhaft blockieren. Die Ladegrenze ist eine Obergrenze:
+Hausverbrauch und Gerätebegrenzungen können die tatsächliche Batterieladung
+darunter halten. Hinweise zum Betrieb stehen im
+[Speicherablauf](doc/Speicher_Ladesteuerung_Ablauf.md).
+
+## Native E3/DC-Wallbox: Zugang und Verbindung
+
+In der JSON-Konfiguration gespeicherte Zugangsdaten werden vollständig
+übernommen. Zeichen wie `#`, `//` und zum Passwort gehörende Leerzeichen
+werden nicht mehr als Kommentar oder überflüssiger Abstand entfernt.
+
+Eine bestehende angemeldete RSCP-Verbindung wird für weitere Abfragen
+wiederverwendet. Nach fehlgeschlagener Verbindung oder Anmeldung wird die
+Verbindung geschlossen. Weitere Anmeldeversuche folgen mit wachsendem
+Abstand bis höchstens 30 Sekunden. Eine erfolgreiche Anmeldung erteilt
+keine zusätzliche Steuerfreigabe; `Aus`, manuelle Pausen und die erforderliche
+Kompatibilitätseinstellung bleiben maßgeblich. Die Einrichtung beschreibt
+[Native Wallbox](doc/Native_Wallbox.md).
+
+## Web-Update: Verlauf wieder aufnehmen
+
+Ein kurzer Verbindungsfehler nach einer längeren Sicherung beendet die
+Statusbeobachtung nicht mehr vorzeitig. Bei längeren Störungen wird der
+Status in größeren Abständen weiter abgefragt. Fehlende Verbindung,
+fehlende Anmeldung und eine nicht verwertbare Antwort erhalten
+unterschiedliche Meldungen.
+
+Nach dem Neuladen kann der bisherige Auftrag innerhalb seiner ursprünglichen
+Beobachtungsfrist in derselben Browsersitzung weiterverfolgt werden. Eine
+unklare Startantwort führt ebenfalls nur zur Statusprüfung und startet
+keinen zweiten Auftrag. Die Systemreparatur kann im Dashboard und in der
+Installationszentrale weiter beobachtet werden.
+
+Die Kurzansicht zeigt bestätigte Arbeitsschritte. Während der Webserver
+für den Dateiaustausch nicht erreichbar ist, bleibt nur der letzte
+bestätigte Schritt sichtbar. Ein noch unbekannter Abschluss wird weder
+als Erfolg noch als bestätigter Updatefehler ausgegeben. Das Ende der
+Statusbeobachtung beendet keinen laufenden Systemauftrag.
+
+## Updatehinweise
+
+Das Update erfolgt über die bisherigen Wege für Weboberfläche, Konsole
+oder Docker. Nach erfolgreichem Abschluss bitte die Seite neu laden.
+Eine vor dem Update bereits geöffnete ältere Ansicht kann bis zum Neuladen
+noch ihre bisherige Statusmeldung zeigen. Die bestehenden Backup- und
+Rückfallwege sind in [Update](doc/Update.md) beschrieben.
+
+## Enthaltener Stand aus 5.4.5b
 
 Release-Stand: 2026-09-06.
 

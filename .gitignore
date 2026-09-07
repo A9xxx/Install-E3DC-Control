@@ -374,6 +374,7 @@
 !/html/send_status_telegram.php
 !/html/send_weekly_telegram.php
 !/html/service_control.php
+!/html/update_status.js
 !/html/solar.js
 !/html/solar.min.js
 !/html/style.css

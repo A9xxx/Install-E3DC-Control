@@ -6,6 +6,25 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.5c] – 2026-09-07
+
+### 🔋 Ruhigere DC-first-Ladegrenzen
+
+- **Kleine Öffnungen gesammelt:** Die obere Speicher-Ladegrenze steigt anhand der verstrichenen Zeit und frischer Geräterückmeldungen. Kleine Zwischenschritte werden gebündelt, statt jeden davon einzeln anzufordern. Ein verbleibender nutzbarer Abstand zur gewünschten Grenze wird nach begrenzter Wartezeit freigegeben.
+- **Harte Absenkungen bleiben sofort wirksam:** Kleinere Plan-, Quellen- und Schutzgrenzen erhalten keine zusätzliche Wartefrist. Nutzer-`Aus`, ein Ladeplan mit 0 W und ungültige Quelldaten behalten ihren Vorrang. Der DC-first-Rahmen verwendet weiterhin nur die dafür freigegebene E3/DC-PV-Leistung; Zusatzwechselrichter erhalten keine neue Speicherfreigabe.
+- **Bestätigung vor weiterer Öffnung:** Offene Geräteaufträge werden nicht als bereits wirksame Ladegrenze behandelt. Ein vom Gerät nicht bestätigbarer kleiner Rahmen kann die spätere Öffnung nicht dauerhaft blockieren. Die tatsächliche Batterieladung kann wegen Hauslast oder Gerätebegrenzungen unter der oberen Ladegrenze liegen.
+
+### 🚗 Native E3/DC-Wallbox
+
+- **Zugangsdaten vollständig übernehmen:** In der JSON-Konfiguration gespeicherte Passwörter behalten Zeichen wie `#`, `//` und zugehörige Leerzeichen. Solche Zeichen werden nicht mehr versehentlich als Kommentar oder überflüssiger Abstand entfernt.
+- **Angemeldete Verbindung wiederverwenden:** Eine bestehende RSCP-Sitzung wird für weitere Abfragen genutzt. Fehlgeschlagene Verbindungen werden geschlossen; erneute Anmeldeversuche folgen mit wachsendem Abstand bis höchstens 30 Sekunden. Eine erfolgreiche Anmeldung ersetzt keine erforderliche Wallbox-Freigabe.
+
+### 🖥️ Web-Update und Systemreparatur
+
+- **Status nach Unterbrechungen weiterlesen:** Ein kurzer Verbindungsfehler nach einer längeren Sicherung beendet die Statusbeobachtung nicht mehr vorzeitig. Bei länger fehlender Verbindung fragt die Oberfläche langsamer weiter und unterscheidet Verbindungs-, Anmelde- und Antwortfehler.
+- **Bestehenden Auftrag wiederfinden:** Nach dem Neuladen kann derselbe Auftrag innerhalb der ursprünglichen Beobachtungsfrist in derselben Browsersitzung weiterverfolgt werden. Auch eine unklare Startantwort löst keinen zweiten Startauftrag aus.
+- **Bestätigte Schritte verständlich anzeigen:** Sicherung, Dateiaustausch, Dienststart und Abschluss erscheinen als kurze Statusmeldungen. Während die Weboberfläche nicht erreichbar ist, bleibt nur der letzte bestätigte Schritt sichtbar. Ein unbekannter Abschluss wird weder als Erfolg noch als bestätigter Updatefehler ausgegeben; das Ende der Statusbeobachtung beendet keinen laufenden Systemauftrag.
+
 ## [5.4.5b] – 2026-09-06
 
 ### 🚗 Wallbox-Budget und Fahrzeug-Ladestand

@@ -1235,6 +1235,11 @@ class RscpConnection:
         self._authenticated = False
         self._authorized_transition_tags = frozenset()
 
+    @property
+    def connected(self) -> bool:
+        """Meldet eine offene, lokal authentifizierte RSCP-Sitzung."""
+        return self._sock is not None and self._authenticated
+
     @contextmanager
     def authorized_transition_write(self, *tag_names: str):
         """Lehnt nicht freigegebene direkte Wallboxtransitionen ausnahmslos ab."""

@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.5b Stable</span>
+            <span class="badge bg-success text-light">v5.4.5c Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.5b</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.5c</code> in <code>.env</code> gesetzt.</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
 if [ -f ./docker_compose_update.py ]; then
   E3DC_DOCKER_HELPER=./docker_compose_update.py
@@ -212,6 +212,25 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                         <li>Nach der Freigabe im Account den RESTful API Security Token erzeugen.</li>
                         <li>Im Config-Editor unter <em>Tarif</em> den ENTSO-E-Token als Fallback-Token eintragen und mit <em>ENTSO-E testen</em> prüfen.</li>
                     </ol>
+                </div>
+            </div>
+        </div>
+
+        <h4 class="mb-4 text-accent"><i class="fas fa-screwdriver-wrench me-2"></i>Stable 5.4.5c: Ruhigere Ladegrenzen, native Wallbox und Update-Status</h4>
+        <div class="col-12 faq-item" data-tags="5.4.5c stable dc first speicher ladegrenze regelruhe e3dc native wallbox rscp passwort verbindung update status systemreparatur">
+            <div class="card bg-card border-0 shadow-sm">
+                <div class="card-body">
+                    <h5 class="card-title">
+                        <span class="tag">5.4.5c</span>
+                        Was verbessert das Wartungsrelease 5.4.5c?
+                    </h5>
+                    <ul>
+                        <li><strong>Speicher-Ladegrenze:</strong> Kleine Öffnungen werden anhand der verstrichenen Zeit und frischer Geräterückmeldungen gesammelt. Kleinere Plan-, Quellen- und Schutzgrenzen greifen weiterhin ohne zusätzliche Wartefrist. <code>Aus</code>, ein Ladeplan mit 0 W und ungültige Quelldaten behalten ihren Vorrang. Zusatzwechselrichter erhalten keine neue Speicherfreigabe.</li>
+                        <li><strong>Native E3/DC-Wallbox:</strong> JSON-Zugangsdaten behalten Sonderzeichen und zum Passwort gehörende Leerzeichen. Angemeldete Verbindungen werden wiederverwendet; bei Anmeldefehlern wächst der Abstand bis zum nächsten Versuch auf höchstens 30 Sekunden. Die erforderlichen Steuerfreigaben bleiben bestehen.</li>
+                        <li><strong>Update-Status:</strong> Die Oberfläche fragt nach Verbindungsstörungen weiter ab und unterscheidet Verbindungs-, Anmelde- und Antwortfehler. Nach dem Neuladen kann sie denselben Auftrag in derselben Browsersitzung innerhalb seiner ursprünglichen Frist weiterverfolgen. Eine unklare Startantwort startet keinen zweiten Auftrag.</li>
+                        <li><strong>Bestätigte Schritte:</strong> Die Kurzansicht zeigt Sicherung, Dateiaustausch, Dienststart und Abschluss. Bei nicht erreichbarem Webserver bleibt der letzte bestätigte Schritt sichtbar. Ein noch unbekanntes Ergebnis bleibt ausdrücklich unbestätigt; das Ende der Anzeige beendet keinen laufenden Systemauftrag.</li>
+                    </ul>
+                    <p>Nach dem Update bitte die Seite neu laden. Eine bereits vor dem Update geöffnete ältere Ansicht kann bis dahin noch die bisherige Statusmeldung zeigen. Die Speicher-Ladegrenze ist eine Obergrenze; die tatsächliche Batterieladung kann darunter liegen.</p>
                 </div>
             </div>
         </div>

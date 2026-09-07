@@ -1,6 +1,6 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.5b
+Dokumentation Stand: 5.4.5c
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
@@ -14,10 +14,12 @@ Dashboard, Konsole und Installer-Menü denselben Dispatcher. Die automatische
 Updateprüfung verwendet dieselbe Stable-Quelle, informiert aber nur über einen
 neuen Stand.
 
-5.4.5b aktualisiert Wallbox-, Fahrzeug-SoC-, Prognose- und Diagnosefunktionen.
-Der Installer verwendet dafür weiterhin denselben Backup-, Rechte- und
-Dienstumfang. Die reine Rechtereparatur bleibt vom Update getrennt.
-Die Nutzeränderungen stehen in den [Release Notes](../RELEASE_NOTES.md).
+5.4.5c verbessert die DC-first-Ladegrenzen, die native E3/DC-Wallbox und die
+Statusbeobachtung. Die Oberfläche kann denselben Update- oder Reparaturauftrag
+nach dem Neuladen innerhalb der ursprünglichen Frist weiterverfolgen.
+Backup-, Rechte- und Dienstumfang bleiben erhalten; die reine Rechtereparatur
+bleibt vom Update getrennt. Die Nutzeränderungen stehen in den
+[Release Notes](../RELEASE_NOTES.md).
 
 Seit 5.4.5a wird vor jeder neuen Simple-Stable-Transaktion unter dem bereits
 gehaltenen systemweiten Update-Lock der vollständige gebundene

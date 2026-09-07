@@ -3261,11 +3261,13 @@ class E3DCCharger(WallboxDriver):
         except (TypeError, ValueError):
             self.server_port = 0
         self.user = str(self.config.get("e3dc_user") or "").strip()
-        self.password = str(self.config.get("e3dc_password") or "").strip()
-        self.aes_password = str(self.config.get("aes_password") or "").strip()
+        self.password = str(self.config.get("e3dc_password") or "")
+        self.aes_password = str(self.config.get("aes_password") or "")
         self.wb_index    = int(wb_id) - 1
         self.conn        = None
         self.last_connect_time = 0
+        self._rscp_connect_failures = 0
+        self._rscp_connect_retry_after = 0.0
         import threading
         # Das letzte Gate kann die Übergabe ohne Schreibzugriff aufrufen, während
         # unter dieser Sperre ein Befehlsrahmen vorbereitet wird. Reentranz
@@ -3898,12 +3900,14 @@ class E3DCCharger(WallboxDriver):
             ))
 
     def _ensure_connected(self):
+        if time.monotonic() < getattr(self, "_rscp_connect_retry_after", 0.0):
+            return False
         if not (
             self.server_ip
             and 1 <= int(self.server_port) <= 65535
             and self.user
-            and self.password
-            and self.aes_password
+            and self.password.strip()
+            and self.aes_password.strip()
         ):
             self._record_rscp_error("connect", "unvollständige lokale RSCP-Konfiguration")
             return False
@@ -3911,14 +3915,30 @@ class E3DCCharger(WallboxDriver):
         if self.conn is None or not getattr(self.conn, 'connected', False) or (now - self.last_connect_time > 300):
             try:
                 from rscp_client import RscpConnection
-                if self.conn and getattr(self.conn, 'connected', False):
+                if self.conn is not None:
                     self.conn.close()
                 self.conn = RscpConnection(self.server_ip, self.server_port, self.aes_password)
                 self.conn.connect()
                 self.conn.authenticate(self.user, self.password)
                 self.last_connect_time = now
+                self._rscp_connect_failures = 0
+                self._rscp_connect_retry_after = 0.0
                 self._record_rscp_ok("connect")
             except Exception as e:
+                failed_conn = self.conn
+                self.conn = None
+                if failed_conn is not None:
+                    try:
+                        failed_conn.close()
+                    except Exception:
+                        pass
+                self._rscp_connect_failures = min(
+                    4, int(getattr(self, "_rscp_connect_failures", 0)) + 1
+                )
+                # Fehlgeschlagene Anmeldung nicht bei jeder Statusabfrage
+                # wiederholen. Gesunde Sitzungen und deren Heartbeat bleiben frei.
+                retry_s = min(30.0, 5.0 * 2 ** (self._rscp_connect_failures - 1))
+                self._rscp_connect_retry_after = time.monotonic() + retry_s
                 self._record_rscp_error("connect", e)
                 logger.error(f"[WB{self.wb_id}] RSCP Verbindungsfehler: {e}")
                 return False

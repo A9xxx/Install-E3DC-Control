@@ -6,6 +6,14 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.5d] – 2026-09-08
+
+### 🐳 Docker-Datenrechte und Containerstart
+
+- **Bestehende Datenvolumes starten wieder:** Die Startprüfung akzeptiert den regulären Standardschutz `2770` und stimmt die anschließende Rechteverwaltung darauf ab. Der konfigurierte Kompatibilitätsmodus verwendet weiterhin `2775`.
+- **Sichere Übergänge:** Bekannte sichere Altmodi werden nach Eigentümer-, Gruppen- und Dateiprüfung angepasst. Unsichere Dateien oder Verknüpfungen bleiben ein Startabbruch; fehlende Wallbox-Anforderungsdateien sind zulässig.
+- **Verständlichere Fehlermeldung:** Die Prüfung benennt den gemeinsamen Datenordner und mögliche Modus-5-Anforderungsdateien. Sie gilt auch ohne Wallbox. Der dokumentierte Host-Updateweg und die getrennten persistenten Volumes bleiben erhalten.
+
 ## [5.4.5c] – 2026-09-07
 
 ### 🔋 Ruhigere DC-first-Ladegrenzen

@@ -1,6 +1,6 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.5c
+Dokumentation Stand: 5.4.5d
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist
@@ -14,12 +14,10 @@ Dashboard, Konsole und Installer-Menü denselben Dispatcher. Die automatische
 Updateprüfung verwendet dieselbe Stable-Quelle, informiert aber nur über einen
 neuen Stand.
 
-5.4.5c verbessert die DC-first-Ladegrenzen, die native E3/DC-Wallbox und die
-Statusbeobachtung. Die Oberfläche kann denselben Update- oder Reparaturauftrag
-nach dem Neuladen innerhalb der ursprünglichen Frist weiterverfolgen.
-Backup-, Rechte- und Dienstumfang bleiben erhalten; die reine Rechtereparatur
-bleibt vom Update getrennt. Die Nutzeränderungen stehen in den
-[Release Notes](../RELEASE_NOTES.md).
+5.4.5d korrigiert den Docker-Start mit bestehenden Datenvolumes im
+Standardschutzmodus. Startprüfung und Rechteverwaltung verwenden denselben
+konfigurierten Datenschutzmodus. Der bisherige Host-Updateweg bleibt erhalten.
+Einzelheiten stehen in den [Release Notes](../RELEASE_NOTES.md).
 
 Seit 5.4.5a wird vor jeder neuen Simple-Stable-Transaktion unter dem bereits
 gehaltenen systemweiten Update-Lock der vollständige gebundene

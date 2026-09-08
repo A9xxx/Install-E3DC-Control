@@ -1,6 +1,6 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.5c
+> **Stand:** v5.4.5d
 >
 > **Neu in 5.4.5a:** Ein frisch beobachteter openWB-Fahrzeug-SoC kann mit
 > Quelle und Alter rein lesend erscheinen, wenn er zur aktuellen Stecksession

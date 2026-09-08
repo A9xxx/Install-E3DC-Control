@@ -2,15 +2,13 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.5c`. Die Tags `latest`, `v5.4.5c` und
-`5.4.5c` bezeichnen denselben Stable-Stand.
+Der aktuelle Stable-Stand ist `v5.4.5d`. Die Tags `latest`, `v5.4.5d` und
+`5.4.5d` bezeichnen denselben Stable-Stand.
 
-5.4.5c verbessert die DC-first-Ladegrenzen und die native E3/DC-Wallbox.
-Die überarbeitete Statusbeobachtung begleitet Web-Updates und Systemreparaturen
-auf Bare-Metal-Systemen; der Docker-Updateweg läuft weiterhin über den Host.
-Image-Pull, isolierte Volumes, Ramdisk und Health-Prüfung behalten ihren
-bisherigen Ablauf. Die [Release Notes](../RELEASE_NOTES.md) beschreiben die
-Produktänderungen.
+5.4.5d korrigiert den Docker-Start mit bestehenden Datenvolumes im
+Standardschutzmodus. Startprüfung und Rechteverwaltung verwenden denselben
+konfigurierten Datenschutzmodus. Der bisherige Host-Updateweg bleibt erhalten.
+Einzelheiten stehen in den [Release Notes](../RELEASE_NOTES.md).
 
 Seit 5.4.5a gibt es zusätzlich die rein lesende Anzeige eines frisch beobachteten
 openWB-Fahrzeug-SoC samt Quelle und Alter. Ohne eindeutige Zuordnung zur
@@ -322,6 +320,21 @@ Volumes. Ein abweichendes Bind-Mount-Layout ist kein Teil des manuellen
 Quickstarts und darf die ausgelieferte Compose-Datei nicht ungeprüft ersetzen.
 Die Ramdisk ist absichtlich flüchtig und gehört nicht ins Backup.
 
+Vor der Modusübernahme werden Datenordner und Konfigurationsdatei auf sichere
+Eigentümer, Rechte und unveränderte Identität geprüft. Verknüpfte, für alle
+beschreibbare oder über 4 MiB große Konfigurationsdateien werden abgewiesen.
+Fehlt die Konfiguration beim Erststart, gilt der Standardmodus.
+
+Für die Wurzel des Datenvolumes gilt der konfigurierte Datenschutzmodus:
+`2770` im Standardmodus, `2775` im ausdrücklich gewählten Kompatibilitätsmodus.
+Der Containerstart übernimmt diesen Modus auch für bestehende Volumes und
+ergänzt bei sicheren Altbeständen gegebenenfalls das Setgid-Bit. Eigentümer,
+Gruppe und vorhandene Modus-5-Anforderungsdateien werden vor der Anpassung
+geprüft. Unsichere Eigentümer, Verknüpfungen oder für alle beschreibbare
+Ordner bleiben ein Startabbruch. Diese Datenordnerprüfung gilt auch ohne
+Wallbox; fehlende Anforderungsdateien sind zulässig und müssen nicht angelegt
+werden.
+
 Die aktuellen Dateien `pv_forecast.json` und `ml_prediction.json` sind
 flüchtige Rechenergebnisse in der Ramdisk und werden neu erzeugt. Das Volume
 `e3dc_forecast_evidence` enthält dagegen nicht die laufende Prognose, sondern
@@ -398,7 +411,7 @@ unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.5c` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.5d` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -425,7 +438,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.5c` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.5d` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash

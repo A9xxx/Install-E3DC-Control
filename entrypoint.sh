@@ -230,10 +230,148 @@ MATTER_RESET_BLOCKED=0
 MODE5_USER_START_REQUEST="/var/www/html/data/wallbox_mode5_user_start_request.json"
 MODE5_USER_START_LOCK="${MODE5_USER_START_REQUEST}.lock"
 
+# Den zentralen Datenschutzmodus einmal für diese Startprüfung binden.
+# Neue Volumes und Altbestände dürfen auf den gewählten Modus wechseln,
+# ohne die nachfolgenden Datei- und Eigentümerprüfungen zu umgehen.
+if ! DATA_DIR_MODE="$(/usr/bin/python3 -I -B - <<'PY'
+import grp
+import json
+import os
+import pwd
+import stat
+import sys
+
+sys.path.insert(0, "/app/pi/Install/Installer")
+from config_secret_permissions import config_secret_dir_mode_text
+
+parent_path = "/var/www/html/data"
+config_name = "e3dc_v4.json"
+max_size = 4 * 1024 * 1024
+
+
+def parent_identity(metadata):
+    return (
+        metadata.st_dev, metadata.st_ino, metadata.st_mode,
+        metadata.st_uid, metadata.st_gid,
+    )
+
+
+def config_identity(metadata):
+    return (
+        metadata.st_dev, metadata.st_ino, metadata.st_mode,
+        metadata.st_uid, metadata.st_gid, metadata.st_nlink,
+        metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns,
+    )
+
+
+try:
+    web_uid = pwd.getpwnam("www-data").pw_uid
+    web_gid = grp.getgrnam("www-data").gr_gid
+    parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    parent_before = os.lstat(parent_path)
+    parent_fd = os.open(parent_path, parent_flags)
+    try:
+        parent = os.fstat(parent_fd)
+        if (
+            parent_identity(parent_before) != parent_identity(parent)
+            or not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid not in {0, web_uid}
+            or parent.st_gid != web_gid
+            or stat.S_IMODE(parent.st_mode) not in {0o770, 0o775, 0o2770, 0o2775}
+        ):
+            raise SystemExit(1)
+
+        config_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        try:
+            config_fd = os.open(config_name, config_flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            config_fd = None
+
+        payload = None
+        if config_fd is not None:
+            try:
+                before = os.fstat(config_fd)
+                named_before = os.stat(config_name, dir_fd=parent_fd, follow_symlinks=False)
+                if (
+                    config_identity(before) != config_identity(named_before)
+                    or not stat.S_ISREG(before.st_mode)
+                    or before.st_nlink != 1
+                    or before.st_uid not in {0, web_uid}
+                    or before.st_gid not in {0, web_gid}
+                    or stat.S_IMODE(before.st_mode) not in {0o600, 0o640, 0o644, 0o660, 0o664}
+                    or not 0 <= before.st_size <= max_size
+                ):
+                    raise SystemExit(1)
+
+                payload = bytearray()
+                while len(payload) <= max_size:
+                    chunk = os.read(config_fd, min(65536, max_size + 1 - len(payload)))
+                    if not chunk:
+                        break
+                    payload.extend(chunk)
+                after = os.fstat(config_fd)
+                named_after = os.stat(config_name, dir_fd=parent_fd, follow_symlinks=False)
+                if (
+                    len(payload) > max_size
+                    or len(payload) != before.st_size
+                    or config_identity(before) != config_identity(after)
+                    or config_identity(before) != config_identity(named_after)
+                ):
+                    raise SystemExit(1)
+            finally:
+                os.close(config_fd)
+        else:
+            # Nur ein weiterhin fehlender Name darf den Standardmodus wählen.
+            try:
+                os.stat(config_name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise SystemExit(1)
+
+        parent_post_fd = os.open(parent_path, parent_flags)
+        try:
+            if any(
+                parent_identity(metadata) != parent_identity(parent)
+                for metadata in (
+                    os.fstat(parent_fd), os.fstat(parent_post_fd), os.lstat(parent_path),
+                )
+            ):
+                raise SystemExit(1)
+        finally:
+            os.close(parent_post_fd)
+    finally:
+        os.close(parent_fd)
+
+    # Wie der zentrale Leser: ungültiges JSON einer sicheren Datei nutzt Standard.
+    data = {}
+    if payload is not None:
+        try:
+            decoded = json.loads(payload.decode("utf-8-sig"))
+            if isinstance(decoded, dict):
+                data = decoded
+        except Exception:
+            pass
+    print(config_secret_dir_mode_text(data))
+except (KeyError, OSError, TypeError, ValueError):
+    raise SystemExit(1)
+PY
+)"; then
+    echo "-> FEHLER: Datenschutzmodus für den persistenten Datenordner konnte nicht ermittelt werden."
+    exit 1
+fi
+case "$DATA_DIR_MODE" in
+    2770|2775) ;;
+    *)
+        echo "-> FEHLER: Ungültiger Datenschutzmodus für den persistenten Datenordner."
+        exit 1
+        ;;
+esac
+
 mode5_user_start_surface_action() {
     local target="$MODE5_USER_START_REQUEST"
     local action="${1:-verify}"
-    /usr/bin/python3 -I -B - "$target" "$action" <<'PY'
+    /usr/bin/python3 -I -B - "$target" "$action" "$DATA_DIR_MODE" <<'PY'
 import grp
 import os
 import pwd
@@ -244,6 +382,9 @@ target = sys.argv[1]
 action = sys.argv[2]
 parent_path = os.path.dirname(target)
 try:
+    expected_mode = int(sys.argv[3], 8)
+    if expected_mode not in {0o2770, 0o2775}:
+        raise SystemExit(1)
     web = pwd.getpwnam("www-data")
     group = grp.getgrnam("www-data")
     allowed_parent_uids = {0, int(web.pw_uid)}
@@ -256,8 +397,8 @@ try:
         and parent.st_uid in allowed_parent_uids
         and parent.st_gid == int(group.gr_gid)
     )
-    strict_parent = base_parent_safe and parent_mode == 0o2775
-    legacy_parent = base_parent_safe and parent_mode == 0o775
+    strict_parent = base_parent_safe and parent_mode == expected_mode
+    legacy_parent = base_parent_safe and parent_mode in {0o770, 0o775, 0o2770, 0o2775}
     contracts = (
         (target, {int(web.pw_uid)}, True),
         (target + ".lock", {0, int(web.pw_uid)}, False),
@@ -293,17 +434,17 @@ try:
             or (current.st_dev, current.st_ino) != (parent.st_dev, parent.st_ino)
             or current.st_uid not in allowed_parent_uids
             or current.st_gid != int(group.gr_gid)
-            or stat.S_IMODE(current.st_mode) != 0o775
+            or stat.S_IMODE(current.st_mode) != parent_mode
         ):
             raise SystemExit(1)
-        os.fchmod(descriptor, 0o2775)
+        os.fchmod(descriptor, expected_mode)
         changed = os.fstat(descriptor)
         named = os.lstat(parent_path)
         if (
-            stat.S_IMODE(changed.st_mode) != 0o2775
+            stat.S_IMODE(changed.st_mode) != expected_mode
             or (named.st_dev, named.st_ino) != (changed.st_dev, changed.st_ino)
             or named.st_uid not in allowed_parent_uids
-            or stat.S_IMODE(named.st_mode) != 0o2775
+            or stat.S_IMODE(named.st_mode) != expected_mode
         ):
             raise SystemExit(1)
     finally:
@@ -325,7 +466,7 @@ mode5_user_start_repair_legacy_parent() {
 if ! mode5_user_start_surface_is_safe; then
     if ! mode5_user_start_repair_legacy_parent \
         || ! mode5_user_start_surface_is_safe; then
-        echo "-> FEHLER: Persistente Modus-5-Anforderungsfläche ist unsicher; keine Datenrechte geändert."
+        echo "-> FEHLER: Persistenter Datenordner oder Modus-5-Anforderungsdateien verletzen den Schutzvertrag (Datenordner-Zielmodus: $DATA_DIR_MODE)."
         exit 1
     fi
 fi
@@ -342,7 +483,7 @@ find -P /var/www/html/data -xdev \
        -o -path "$MODE5_USER_START_LOCK" \) -prune -o \
     \( -type d -o -type f \) \
     -exec chown -h www-data:www-data -- {} +
-chmod 2775 /var/www/html/data
+chmod "$DATA_DIR_MODE" /var/www/html/data
 if ! mode5_user_start_surface_is_safe; then
     echo "-> FEHLER: Persistente Modus-5-Anforderungsfläche wechselte während der Datenrechteprüfung."
     exit 1

@@ -1,3 +1,25 @@
+# E3DC-Control v5.4.5d
+
+Dieses Korrekturrelease behebt einen Docker-Startabbruch bei bestehenden Datenvolumes im Standardschutzmodus.
+
+## Docker-Start mit erhaltenen Daten
+
+- Ein korrekt geschützter Datenordner mit `2770` wird beim Start wieder akzeptiert. Die bisherige Prüfung verlangte fälschlich ausschließlich `2775`.
+- Startprüfung und anschließende Rechteverwaltung verwenden durchgehend den konfigurierten Datenschutzmodus: `2770` im Standardmodus, `2775` im ausdrücklich gewählten Kompatibilitätsmodus.
+- Die Konfigurationsquelle wird vor der Modusübernahme auf sichere Eigentümer, Rechte, Dateityp und unveränderte Identität geprüft.
+- Sichere bekannte Altmodi werden bei Bedarf angepasst. Eigentümer, Gruppe, Verknüpfungen und vorhandene Anforderungsdateien werden weiterhin geprüft; unsichere Bestände bleiben gesperrt.
+- Die Meldung benennt den gemeinsamen Datenordner und mögliche Modus-5-Anforderungsdateien. Die Prüfung gilt auch ohne Wallbox; fehlende Anforderungsdateien müssen nicht angelegt werden.
+
+## Update
+
+Docker-Updates erfolgen weiterhin über den dokumentierten Host-Helfer. Bestehende Datenvolumes bleiben erhalten. Ein längerer Start-Timeout behebt keine ausdrücklich gemeldete Rechteverletzung. Ordnerrechte müssen für diese Korrektur nicht pauschal gelockert werden.
+
+Für einen bewussten Versionspin lautet der Eintrag `E3DC_IMAGE_TAG=v5.4.5d`. Ohne Pin folgt die Compose-Datei dem nach erfolgreicher Veröffentlichung aktualisierten Tag `latest`. Der dokumentierte Docker-Rückfallstand bleibt `v5.3.2b`.
+
+Die Änderungen aus 5.4.5c sind weiterhin enthalten. Dieses Release ändert keine Speicher-, Wallbox- oder Wärmeregelentscheidung.
+
+---
+
 # E3DC-Control v5.4.5c
 
 Release-Stand: 2026-09-07.

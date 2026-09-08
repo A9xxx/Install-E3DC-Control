@@ -136,3 +136,6 @@ diagnostics
 **/.env
 .env.*
 **/.env.*
+
+# Standalone second-device controller is distributed as source, not started in the EMS image.
+E3DC-Slave

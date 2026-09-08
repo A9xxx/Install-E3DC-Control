@@ -1379,17 +1379,18 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
                     </div>
                     <span class="badge border border-secondary text-secondary"><?= htmlspecialchars(readInstalledVersion() ?: 'V4') ?></span>
                 </div>
+                <div class="d-flex flex-wrap gap-2 mt-3">
+                    <a href="install_center.php?return=mobile" class="btn btn-outline-info flex-fill py-3 rounded-4 fw-bold shadow-sm"><i class="fas fa-screwdriver-wrench me-2"></i>Installationszentrale</a>
                 <?php if (!$isDocker): ?>
-                    <div class="d-grid gap-2 mt-3">
-                        <button id="btn-update-installer" class="btn btn-outline-info w-100 py-3 rounded-4 fw-bold shadow-sm" onclick="startInstallerUpdate()" title="Aktualisiert E3DC-Control über den sicheren Systemjob">
+                        <button id="btn-update-installer" class="btn btn-outline-info flex-fill py-3 rounded-4 fw-bold shadow-sm" onclick="startInstallerUpdate()" title="Aktualisiert E3DC-Control über den sicheren Systemjob">
                             <i class="fas fa-sync-alt me-2"></i>System Update <span id="update-badge-installer" class="badge bg-danger ms-1" style="display:none;">!</span>
                         </button>
-                    </div>
                 <?php else: ?>
                     <div class="alert alert-secondary small mb-0 mt-3 rounded-4">
                         <i class="fab fa-docker me-2"></i>Docker-Installationen werden über das Container-Image aktualisiert.
                     </div>
                 <?php endif; ?>
+                </div>
             </div>
 
             <button class="btn btn-outline-info w-100 py-3 rounded-4 border-secondary fw-bold shadow-sm mt-3 btn-diagnose" onclick="showDiagnoseModal()">

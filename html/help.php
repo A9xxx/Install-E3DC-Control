@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.5d Stable</span>
+            <span class="badge bg-success text-light">v5.4.5e Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.5d</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.5e</code> in <code>.env</code> gesetzt.</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
 if [ -f ./docker_compose_update.py ]; then
   E3DC_DOCKER_HELPER=./docker_compose_update.py
@@ -214,6 +214,16 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                     </ol>
                 </div>
             </div>
+        </div>
+
+        <h4 class="mb-4 text-accent">Stable 5.4.5e: Speicher-Aus, Slave-Beispiel und PV-Diagnose</h4>
+        <div class="col-12 faq-item" data-tags="5.4.5e speicher aus slave pv diagnose installationszentrale">
+            <div class="card bg-card border-0 shadow-sm"><div class="card-body">
+                <h5 class="card-title">Was verbessert Wartungsrelease 5.4.5e?</h5>
+                <p><strong>Speicherregelung aktiv:</strong> Der neue Schalter oben in der Konfiguration gibt die Speichergrenzen beim Ausschalten einmalig mit Bestätigungsprüfung frei. Anzeige und Datenerfassung laufen weiter. Vor einem anderen Speicherregler die bestätigte Freigabe abwarten.</p>
+                <p>Eine geplante Ladepause vor Kurvenbeginn bleibt auch bei kleiner werdendem Restüberschuss erhalten. Das optionale Beispiel <code>E3DC-Slave</code> ergänzt 100 W Entladestart und eine Rückleseprüfung; es wird nicht automatisch installiert.</p>
+                <p>Energy-Charts ergänzt fehlende Börsenpreise. Die PV-Diagnose erfasst getrennte Ist-Messungen und Begrenzungshinweise; automatische Ladekurvenkorrektur folgt erst nach Feldprüfung. Die Installationszentrale steht neben System Update, ihr Rückweg bleibt beim Scrollen sichtbar.</p>
+            </div></div>
         </div>
 
         <h4 class="mb-4 text-accent"><i class="fas fa-screwdriver-wrench me-2"></i>Stable 5.4.5d: Docker-Datenrechte</h4>

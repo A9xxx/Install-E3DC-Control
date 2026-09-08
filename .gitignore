@@ -11,6 +11,7 @@
 !/.github/scripts/
 !/.github/workflows/
 !/Installer/Forecast/
+!/Installer/Forecast/pv_observation_quality.py
 !/Installer/Heat/
 !/Installer/Storage/
 !/Installer/Wallbox/
@@ -64,6 +65,7 @@
 !/Installer/Storage/predump.py
 !/Installer/Storage/process_singleton.py
 !/Installer/Storage/rscp_commands.py
+!/Installer/Storage/regulation_switch.py
 !/Installer/Wallbox/__init__.py
 !/Installer/Wallbox/actuator_contracts.py
 !/Installer/Wallbox/charger_controller.py
@@ -375,6 +377,7 @@
 !/html/send_weekly_telegram.php
 !/html/service_control.php
 !/html/update_status.js
+!/html/storage_regulation.js
 !/html/solar.js
 !/html/solar.min.js
 !/html/style.css
@@ -395,3 +398,11 @@
 **/*.backup
 **/*.bak
 /backups/
+
+# Optional standalone slave example; no customer configuration or runtime data.
+!/E3DC-Slave/
+!/E3DC-Slave/s10_slave.py
+!/E3DC-Slave/slave_policy.py
+!/E3DC-Slave/power_limits.py
+!/E3DC-Slave/config.example.json
+!/E3DC-Slave/README.md

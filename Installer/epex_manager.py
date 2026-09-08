@@ -5,6 +5,7 @@ import sys
 import time
 import json
 import logging
+import math
 import inspect
 import hashlib
 import re
@@ -904,6 +905,63 @@ def _slot_resolution_min(slot, default=15):
             continue
     return int(default)
 
+def _parse_energy_charts_prices(payload):
+    """Energy-Charts /price: genuine quarter-hour DE-LU day-ahead slots.
+
+    Timestamps denote interval starts (UTC epoch seconds); prices are EUR/MWh.
+    Never fabricate quarter-hour prices from hourly data or bridge missing slots.
+    """
+    if not isinstance(payload, dict) or payload.get("unit") != "EUR / MWh":
+        raise ValueError("Energy-Charts: unbekannte Preiseinheit")
+    times = payload.get("unix_seconds")
+    prices = payload.get("price")
+    if not isinstance(times, list) or not isinstance(prices, list) or len(times) != len(prices) or len(times) < 2:
+        raise ValueError("Energy-Charts: unvollstaendige Preisreihe")
+    if any(isinstance(t, bool) or not isinstance(t, (int, float)) or not math.isfinite(t) or t <= 0 or t % 900 for t in times):
+        raise ValueError("Energy-Charts: ungueltige Zeitstempel")
+    if any(b - a != 900 for a, b in zip(times, times[1:])):
+        raise ValueError("Energy-Charts: kein zusammenhaengendes 15-Minuten-Raster")
+    slots = []
+    for timestamp, price in zip(times, prices):
+        if price is None:
+            continue
+        if isinstance(price, bool) or not isinstance(price, (int, float)) or not math.isfinite(price):
+            raise ValueError("Energy-Charts: ungueltiger Preis")
+        slots.append({
+            "start_timestamp": int(timestamp * 1000),
+            "end_timestamp": int((timestamp + 900) * 1000),
+            "marketprice": float(price),
+            "price_source": "energy_charts",
+            "price_resolution_min": 15,
+            "source_resolution_min": 15,
+        })
+    return slots
+
+
+def fetch_energy_charts_day_ahead_prices():
+    """Public Fraunhofer ISE Energy-Charts.info fallback, no API key required.
+
+    Source attribution: Energy-Charts.info; data license supplied by /price.
+    Called only on missing primary DV data, at the regular 30-minute cadence.
+    """
+    now = datetime.now(timezone.utc)
+    params = urllib.parse.urlencode({
+        "bzn": "DE-LU",
+        "start": int((now - timedelta(hours=24)).timestamp()),
+        "end": int((now + timedelta(hours=48)).timestamp()),
+    })
+    req = urllib.request.Request(
+        "https://api.energy-charts.info/price?" + params,
+        headers={"User-Agent": "E3DC-Control-V4/1.0", "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as response:
+        slots = _parse_energy_charts_prices(json.loads(response.read().decode("utf-8")))
+    if not price_data_has_future_slots(slots, min_horizon_s=900):
+        raise ValueError("Energy-Charts: kein ausreichender Zukunftshorizont")
+    logger.info("DV-Day-Ahead-Preise von Energy-Charts.info geladen (%d Viertelstunden).", len(slots))
+    return slots
+
+
 def _fetch_direct_marketing_market_data(config, entsoe_data=None, smard_data=None):
     if not _direct_marketing_wants_market_overlay(config):
         return None
@@ -968,6 +1026,10 @@ def _fetch_direct_marketing_market_data(config, entsoe_data=None, smard_data=Non
         )
         return [merged[start] for start in sorted(merged)]
 
+    try:
+        return fetch_energy_charts_day_ahead_prices()
+    except Exception as exc:
+        logger.warning("Energy-Charts-DV-Ersatzquelle nicht verfuegbar: %s", exc)
     return None
 
 def apply_direct_marketing_market_overlay(price_data, market_data, config=None):

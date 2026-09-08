@@ -1,6 +1,53 @@
 # Speicher-Ladesteuerung - Systemablauf
 
-> **Stand:** v5.4.5d
+## Speicherregelung ausschalten
+
+In der Konfiguration steht oben der Schalter **Speicherregelung aktiv**, in
+der einfachen und erweiterten Ansicht sowie auf dem Mobilgerät. Die Änderung
+wird sofort gespeichert; der laufende Speicherregler übernimmt sie im nächsten
+Zyklus. Bestehende Installationen sind ohne Änderung weiterhin eingeschaltet.
+
+Beim Ausschalten gibt der laufende Regler seine Speicherlimits einmal frei.
+Die Anzeige unterscheidet die gespeicherte Einstellung von der bestätigten
+Limitfreigabe. Danach sendet E3DC-Control keine Speicherbefehle mehr. Auch
+manuelles Laden und Entladen, Pre-Dump, preisgesteuertes Laden, Direktverkauf
+aus der Batterie und die Speicherstützung für Verbraucher sind dann inaktiv.
+Messwerte, Aufzeichnung, Prognose und Oberfläche laufen weiter. Die Ladekurve
+bleibt eine Prognose; bei ausgeschalteter Speicherregelung wird der Speicher
+nicht entlang dieser Kurve geregelt.
+
+Wallbox, Wärme und die separate Steuerung eines Zusatzwechselrichters behalten
+ihre eigenen Einstellungen. Der gemeinsame Verbraucherregler arbeitet weiter
+mit gemessenem Überschuss und bereits laufenden Verbraucherlasten. Er fordert
+dafür keine zusätzliche Batterieentladung an. Tatsächliche Batterieladung wird
+nicht noch einmal als freies PV-Budget angeboten.
+
+**Aus ist keine Batteriesperre:** Das E3DC beziehungsweise ein externer Regler
+übernimmt die Speichersteuerung. Für eine Visualisierung des eigenen zweiten
+S10 bleibt diese Instanz daher normal mit ihrem eigenen E3DC verbunden; eine
+Shadow-Simulation mit Daten einer anderen Instanz ist dafür nicht erforderlich.
+
+Vor dem Start eines externen Speicherreglers die bestätigte Limitfreigabe
+abwarten. Ein früherer aktiver Leistungsbefehl kann noch bis zum geräteseitigen
+Timeout nachwirken. Die Freigabebestätigung belegt die Rückgabe der Limits,
+nicht eine bestimmte physische Lade- oder Entladeleistung.
+
+Startet der Dienst bereits ausgeschaltet, sendet er auch keine Freigabebefehle:
+Ein inzwischen übernehmender externer Regler bleibt unangetastet. Fehlt eine
+frühere Bestätigung oder wurde die Freigabe unterbrochen, zeigt die Oberfläche
+das ausdrücklich an. Eine unbestätigte Freigabe wird nicht automatisch
+wiederholt; vorhandene Gerätevorgaben müssen vor einer externen Übernahme am
+E3DC geprüft werden. Bei fehlender HA-Schreiberberechtigung erfolgt ebenfalls
+kein Freigabebefehl.
+
+Beim Wiedereinschalten gelten die aktuellen Einstellungen und frische
+Gerätedaten. Alte manuelle Ladebefehle und Speicherlimits aus der Pause werden
+nicht wieder aufgenommen. Technisch wird der Schalter als
+`storage_regulation_enabled` (`1`/`0`, Standard `1`) gespeichert; der Web-Schalter
+bindet die Übernahme mit `storage_regulation_changed_ts` an die aktuelle
+Bedienaktion. Ein Dienststopp allein ersetzt diese geordnete Abschaltung nicht.
+
+> **Stand:** v5.4.5e
 >
 > **Neu in 5.4.5a:** Ein frisch beobachteter openWB-Fahrzeug-SoC kann mit
 > Quelle und Alter rein lesend erscheinen, wenn er zur aktuellen Stecksession

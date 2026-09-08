@@ -423,6 +423,7 @@ def _ems_live_request_items():
         _nil(RscpTag.EMS_REQ_BAT_SOC),
         _nil(RscpTag.EMS_REQ_POWER_WB_ALL),
         _nil(RscpTag.EMS_REQ_STATUS),
+        _nil(RscpTag.EMS_REQ_IS_PV_DERATING),
         _nil(RscpTag.EMS_REQ_REMAINING_BAT_CHARGE_POWER),
         _nil(RscpTag.EMS_REQ_REMAINING_BAT_DISCHARGE_POWER),
         _nil(RscpTag.EMS_REQ_EMERGENCY_POWER_STATUS),  # 0=NOT_POSSIBLE, 1=ACTIVE, 2=NOT_ACTIVE, 3=NOT_AVAILABLE
@@ -430,6 +431,11 @@ def _ems_live_request_items():
 
 
 def _decode_ems_live_response(resp):
+    derating_item = find_tag(resp, RscpTag.EMS_IS_PV_DERATING)
+    derating_valid = (isinstance(derating_item, dict)
+                      and derating_item.get("type") == RscpType.Bool
+                      and type(derating_item.get("value")) is bool)
+    derating = derating_item["value"] if derating_valid else None
     pv   = _iv(resp, RscpTag.EMS_POWER_PV)
     bat  = _iv(resp, RscpTag.EMS_POWER_BAT)
     home = _iv(resp, RscpTag.EMS_POWER_HOME)
@@ -465,7 +471,7 @@ def _decode_ems_live_response(resp):
 
     print(f"     PV={pv}W (davon Ext={ext_pv}W)  Bat={bat:+d}W  Home={home}W  Grid={grid:+.0f}W  WB={wb}W  Heizstab={heizstab}W  SOC={soc:.0f}%")
     print(f"     Autarkie={_fv(resp,RscpTag.EMS_AUTARKY):.1f}%  Eigenverbrauch={_fv(resp,RscpTag.EMS_SELF_CONSUMPTION):.1f}%  "
-          "PV-Drosselung=nicht belegt  AC-Limit=nicht belegt")
+          f"PV-Drosselung={derating if derating_valid else 'nicht belegt'}")
     remaining_charge_text = f"{remaining_charge_w}W" if remaining_charge_valid else "nicht verfügbar"
     remaining_discharge_text = f"{remaining_discharge_w}W" if remaining_discharge_valid else "nicht verfügbar"
     print(f"     Verbl.Lade={remaining_charge_text}  Verbl.Entlade={remaining_discharge_text}")
@@ -501,6 +507,10 @@ def _decode_ems_live_response(resp):
         "SOC": soc,
         "autarky_pct": round(_fv(resp, RscpTag.EMS_AUTARKY), 1),
         "self_consumption_pct": round(_fv(resp, RscpTag.EMS_SELF_CONSUMPTION), 1),
+        "pv_observation_derating_active": derating,
+        "pv_observation_derating_active_valid": derating_valid,
+        "pv_observation_derating_active_source": "rscp_ems_is_pv_derating" if derating_valid else "rscp_missing_or_invalid",
+        # Vorhandene Reglerverbraucher haben einen anderen Freigabevertrag.
         "pv_derating_active": None,
         "pv_derating_active_valid": False,
         "pv_derating_active_source": "unsupported_unverified",
@@ -989,6 +999,7 @@ def get_pvi(conn):
         result[f"dc{s}_max_w"] = mp
 
     # AC-Phasen einzeln abfragen
+    measured_ac = []
     for p in range(ac_count):
         ac_req = [_container(RscpTag.PVI_REQ_DATA, [
             _uint16(RscpTag.PVI_INDEX, 0),
@@ -999,6 +1010,7 @@ def get_pvi(conn):
         ac_resp = conn.request(ac_req)
         apd = find_tag(ac_resp, RscpTag.PVI_DATA)
         av = apd['value'] if apd and isinstance(apd.get('value'), list) else []
+        measured_ac.append(_optional_float_in_container(find_tag(av, RscpTag.PVI_AC_POWER)))
 
         def _ac_float(tag):
             item = find_tag(av, tag)
@@ -1021,6 +1033,9 @@ def get_pvi(conn):
         result[f"ac{p}_v"] = v
         result[f"ac{p}_a"] = a
 
+    ac_valid = (0 < len(measured_ac) <= 3 and all(value is not None and math.isfinite(value) for value in measured_ac))
+    result.update(pvi_ac_power_w=sum(measured_ac) if ac_valid else None,
+                  pvi_ac_power_valid=ac_valid, pvi_ac_observed_at_s=time.time())
     return result
 
 
@@ -1476,16 +1491,32 @@ def get_wb(conn, cfg):
 
 
 def get_system_info(conn):
-    """Seriennummer und SW-Version."""
+    """Seriennummer, SW-Version und statische AC-Nennleistung (GET)."""
     print("  -> System-Info ...")
     resp = conn.request([
         _nil(RscpTag.INFO_REQ_SERIAL_NUMBER),
         _nil(RscpTag.INFO_REQ_SW_RELEASE),
+        _nil(RscpTag.EMS_REQ_GET_SYS_SPECS),
     ])
     sn  = find_tag_value(resp, RscpTag.INFO_SERIAL_NUMBER) or "N/A"
     rel = find_tag_value(resp, RscpTag.INFO_SW_RELEASE)    or "N/A"
     print(f"     Seriennummer={sn}  SW={rel}")
-    return {"serial_number": sn, "sw_release": rel}
+    specs = find_tag(resp, RscpTag.EMS_GET_SYS_SPECS)
+    nominal = None
+    for item in specs.get("value", []) if isinstance(specs, dict) and isinstance(specs.get("value"), list) else []:
+        if not isinstance(item, dict) or item.get("tag") != RscpTag.EMS_SYS_SPEC:
+            continue
+        values = item.get("value")
+        if isinstance(values, list) and find_tag_value(values, RscpTag.EMS_SYS_SPEC_NAME) == "maxAcPower":
+            watts, valid = _typed_int_tag(values, RscpTag.EMS_SYS_SPEC_VALUE_INT)
+            if valid and watts > 0:
+                nominal = watts
+    # Eigener Name: Nennleistung ist weder ein aktives Leistungslimit noch DC-Max.
+    return {"serial_number": sn, "sw_release": rel,
+            "e3dc_ac_nominal_power_w": nominal,
+            "e3dc_ac_nominal_power_valid": nominal is not None,
+            "e3dc_ac_nominal_power_source": "rscp_sys_specs_maxAcPower" if nominal is not None else "rscp_missing_or_invalid",
+            "e3dc_ac_nominal_observed_at_s": time.time()}
 
 
 # ---------------------------------------------------------------------------

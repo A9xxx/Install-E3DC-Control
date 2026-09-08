@@ -2385,9 +2385,10 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
         <?php elseif ($seite === 'config'): ?>
             <div class="row justify-content-center">
                 <div class="col-12 col-lg-10 col-xl-8">
-                    <div class="mb-3 d-flex justify-content-between align-items-center">
+                    <div class="mb-3 d-flex flex-wrap justify-content-between align-items-center gap-2">
                         <a href="index.php" class="btn btn-outline-secondary btn-sm"><i class="fas fa-arrow-left me-2"></i>Zurück</a>
-                        <div>
+                        <div class="d-flex flex-wrap gap-2">
+                            <a href="install_center.php?return=desktop" class="btn btn-outline-info btn-sm me-2"><i class="fas fa-screwdriver-wrench me-2"></i>Installationszentrale</a>
                             <!-- Sicheres System-Update -->
                             <?php if (!$isDocker): ?>
                             <button id="btn-update-installer" class="btn btn-outline-info btn-sm me-2" onclick="startInstallerUpdate()" title="Aktualisiert E3DC-Control über den sicheren Systemjob">

@@ -2,10 +2,10 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.5d`. Die Tags `latest`, `v5.4.5d` und
-`5.4.5d` bezeichnen denselben Stable-Stand.
+Der aktuelle Stable-Stand ist `v5.4.5e`. Die Tags `latest`, `v5.4.5e` und
+`5.4.5e` bezeichnen denselben Stable-Stand.
 
-5.4.5d korrigiert den Docker-Start mit bestehenden Datenvolumes im
+5.4.5e korrigiert den Docker-Start mit bestehenden Datenvolumes im
 Standardschutzmodus. Startprüfung und Rechteverwaltung verwenden denselben
 konfigurierten Datenschutzmodus. Der bisherige Host-Updateweg bleibt erhalten.
 Einzelheiten stehen in den [Release Notes](../RELEASE_NOTES.md).
@@ -411,7 +411,7 @@ unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.5d` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.5e` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -438,7 +438,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.5d` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.5e` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash

@@ -57,6 +57,12 @@ from Wallbox.modes import (  # noqa: E402
 from Wallbox import phase_transition as wallbox_phase_transition_policy  # noqa: E402
 from Wallbox import start_hold as wallbox_start_hold_policy  # noqa: E402
 import consumer_priority  # noqa: E402
+from Storage.regulation_switch import (  # noqa: E402
+    StorageRegulationSwitch,
+    read_storage_regulation_config,
+    read_storage_regulation_enabled,
+    storage_regulation_enabled,
+)
 from consumer_priority import (  # noqa: E402
     CONSUMER_MIN_W,
     allocate_consumer_budget_contract,
@@ -26120,6 +26126,98 @@ def apply_peak_shaving_secondary_candidate(
     return result
 
 
+def storage_observation_payload(
+    cfg: Dict[str, Any], live: Dict[str, Any], wb_intent: Dict[str, Any],
+    wb_native: Dict[str, Any], previous_state: Dict[str, Any], now_s: float,
+) -> Dict[str, Any]:
+    """Keep the shared consumer allocator alive without a battery promise.
+
+    Grid export is residual AFTER all running consumers and actual battery
+    charging. Subtract actual battery discharge so it cannot fund new loads.
+    The existing allocator adds only measured consumer commitments back once.
+    """
+    valid = bool(
+        all(_live_numeric_present(live, key) for key in (
+            "PV_Power", "Grid_Power", "Bat_Power", "Home_Power",
+        ))
+        and _live_numeric_present(live, "_ts")
+        and 0 < safe_float(live.get("_ts"), 0) <= now_s
+        and now_s - safe_float(live.get("_ts"), 0) <= 10
+        and live_power_plausibility(live).get("sample_valid", True)
+    )
+    pv_w = max(0, safe_int(live.get("PV_Power"), 0))
+    grid_w = safe_int(live.get("Grid_Power"), 0)
+    bat_w = safe_int(live.get("Bat_Power"), 0)
+    fresh_intent = bool(wb_intent) and 0 <= now_s - safe_float(wb_intent.get("ts"), 0) <= 60
+    mode = normalize_wb_mode(wb_intent.get("wb_mode_active", cfg.get("wb1_mode", 0)))
+    wb = build_wallbox_budget_context(
+        cfg, live, wb_intent, wb_native, wb_intent_fresh=fresh_intent,
+        wb_intent_bev_full_blocked=bool(wb_intent.get("bev_full_blocked")),
+        wb_mode=mode, wp_w=max(0, safe_int(live.get("WP_Power"), 0)),
+        pv_w=pv_w, home_w=max(0, safe_int(live.get("Home_Power"), 0)),
+    )
+    evidence = wallbox_actual_power_snapshot(
+        live, wb_native, now_s=now_s, require_fresh_evidence=True,
+    )
+    consumer_live = dict(wb.live_with_wallbox)
+    residual_w = min(pv_w, -grid_w + min(0, bat_w)) if valid else 0
+    available_w = max(0, residual_w)
+    hp_w = max(0, safe_int(live.get("WP_Power"), 0))
+    hp_running = bool(live.get("Heatpump_Compressor_Running") or live.get("Heatpump_Running")
+                      or (live.get("Heatpump_Power_Known") is True and hp_w >= 500))
+    contract = build_flexible_consumer_budget_contract(
+        cfg, consumer_live, wb_intent,
+        available_w=available_w, signed_residual_w=residual_w,
+        available_is_residual_after_running=True,
+        flexible_after_commitments_w=available_w,
+        wallbox_possible_w=wb.wb_possible_w,
+        wallbox_eligible=bool(fresh_intent and wb.wb_car_present and mode != MODE_OFF),
+        wallbox_online=wallbox_consumer_online(
+            wb_native, measurement_valid=evidence.get("measurement_valid") is True,
+            intent_fresh=fresh_intent, car_present=wb.wb_car_present,
+        ),
+        wallbox_current_w=max(0, safe_int(evidence.get("power_w"), 0)),
+        wallbox_power_known=evidence.get("measurement_valid") is True and valid,
+        wallbox_reserved_w=0, wallbox_start_hold_w=0,
+        wallbox_forced_off=False, phase_transition_active=False,
+        heatpump_running=hp_running, heatpump_commitment_w=hp_w if hp_running else 0,
+        heatpump_new_start_allowed=not bool(live.get("Heatpump_Pause_Active")),
+        heatpump_pause_active=bool(live.get("Heatpump_Pause_Active")),
+        evidence_valid=valid, protected=False,
+        previous_state=previous_state, now_s=now_s,
+    )
+    allocations = validate_consumer_command_allocations(contract)
+    budget_w = max(0, safe_int((allocations.get("allocations") or {}).get("wallbox"), 0)) if allocations.get("valid") is True else 0
+    reason = "Speicherregelung aus; Messwerte und Verbraucherregelung laufen weiter."
+    return {
+        "state": "storage_observation", "mode": MODE_AUTO, "mode_name": "BEOBACHTUNG",
+        "val": 0, "protected": False, "suppress_rscp_output": True,
+        "storage_regulation_enabled": False,
+        "reason": reason, "display_reason": reason,
+        "manager_title": "Speicher-Regelung", "state_label": "Speicherregelung aus",
+        "control_owner": "observation", "control_owner_label": "Nur Beobachtung",
+        "soc": live.get("SOC"), "pv_w": live.get("PV_Power"),
+        "grid_w": live.get("Grid_Power"), "bat_w": live.get("Bat_Power"),
+        "home_w": live.get("Home_Power"), "wallbox_w": wb.wallbox_w,
+        "wallbox_power_source": wb.wallbox_power_source,
+        "live_sample_valid": valid, "live_stale": not valid,
+        "rscp_command_path": "suppressed_storage_regulation_off",
+        "rscp_request_transaction": {"send_called": False, "attempted": False,
+            "issued": False, "confirmed": False, "reason": "storage_regulation_off"},
+        "budget": {
+            "state": "pv_surplus", "storage_state": "storage_observation",
+            "budget_w": budget_w, "raw_iAVal_w": budget_w, "iAVal_w": budget_w,
+            "consumer_budget_contract": contract, "reason": reason,
+            "wb_possible_power_w": wb.wb_possible_w,
+            "live_sample_invalid": not valid, "storage_charge_request_w": 0,
+            "wb_storage_cap_w": 0, "wb_storage_extra_w": 0,
+            "iFc_w": 0, "iMinLade_w": 0,
+            "wallbox_start_hold_battery_support_allowed": False,
+            "predump_active": False, "force_wallbox_stop": False,
+        },
+    }
+
+
 def decide_next_cycle(
     cfg: Dict[str, Any],
     live: Dict[str, Any],
@@ -26134,6 +26232,9 @@ def decide_next_cycle(
     wb_native = wb_native or {}
     manual_override = manual_override or {}
     previous_state = previous_state or {}
+
+    if not storage_regulation_enabled(cfg):
+        return storage_observation_payload(cfg, live, wb_intent, wb_native, previous_state, now_s)
 
     input_snapshot = build_storage_input_snapshot(live, plan, wb_native, now_s=now_s)
     live_model = input_snapshot.live
@@ -27609,26 +27710,29 @@ def decide_next_cycle(
                         next_curve_evening_release.get("max_lead_s"),
                         0,
                     )
+                elif bool(shadow_inputs.get("pre_curve_hold_active")):
+                    # A downstream consumer may consume the offered PV power.
+                    # Missing residual surplus does not cancel an explicit hold.
+                    # Evening release above remains higher priority.
+                    auto_limit_charge_w = 0
+                    auto_limit_enabled = True
+                    auto_limit_release = False
+                    auto_storage_req_w = 0
+                    decision["val"] = 0
+                    decision["pre_curve_zero_hold_preserved"] = True
+                    auto_limit_reason = "Vor Kurvenstart: Ladepause bleibt trotz wechselndem Verbraucherbudget aktiv"
                 elif (
-                    (
-                        adaptive_above_ceiling
-                        or not can_reach_target
-                        or bool(shadow_inputs.get("pre_curve_hold_active"))
-                    )
+                    (adaptive_above_ceiling or not can_reach_target)
                     and not hold_offer_active
                 ):
                     auto_limit_charge_w = max_charge_w
                     auto_limit_enabled = False
                     auto_limit_release = True
                     auto_limit_reason = (
-                        "Vor Kurvenstart ohne realen Ladepfad: EMS-Grenzen frei, E3DC darf autonom regeln"
-                        if bool(shadow_inputs.get("pre_curve_hold_active"))
-                        else (
-                            "SoC oberhalb der adaptiven Obergrenze ohne Ladeangebot: "
-                            "EMS-Grenzen frei, E3DC darf autonom laden"
-                            if adaptive_above_ceiling
-                            else "Keine aktive Ladekurve: EMS-Grenzen frei, E3DC darf autonom laden"
-                        )
+                        "SoC oberhalb der adaptiven Obergrenze ohne Ladeangebot: "
+                        "EMS-Grenzen frei, E3DC darf autonom laden"
+                        if adaptive_above_ceiling
+                        else "Keine aktive Ladekurve: EMS-Grenzen frei, E3DC darf autonom laden"
                     )
                     auto_storage_req_w = 0
                     decision["val"] = max_charge_w
@@ -32744,7 +32848,10 @@ def write_state(payload: Dict[str, Any], plan: Dict[str, Any]) -> None:
         prior_persisted_state,
         saved_ts=state_ts,
     )
+    if payload.get("storage_regulation_enabled") is False:
+        curve_cap_handover = {}
     state = {
+        "storage_regulation": copy.deepcopy(payload.get("storage_regulation")),
         "storage_plan_id": plan.get("plan_id"),
         "state": payload["state"],
         "reason": payload["reason"],
@@ -41698,6 +41805,15 @@ def execute_rscp_cycle(
         return payload["rscp_power_settings"]
     ha_admission = evaluate_writer_admission()
     payload["ha_writer_admission"] = copy.deepcopy(ha_admission)
+    if (payload.get("storage_regulation_enabled") is False
+            or read_storage_regulation_enabled(V4_CFG) is not True):
+        payload["rscp_command_path"] = "suppressed_storage_regulation_off"
+        payload["rscp_request_transaction"] = {
+            "send_called": False, "attempted": False, "issued": False,
+            "confirmed": False, "reason": "storage_regulation_off_or_unreadable",
+        }
+        payload["rscp_power_settings"] = ctrl.power_settings_diagnostics()
+        return payload["rscp_power_settings"]
     if ha_admission.get("allowed") is not True:
         # Rollen- oder Leaseverlust darf keinen vermeintlich sicheren
         # Gegenbefehl erzeugen. Auch AUTO/Stop wäre bereits ein zweiter
@@ -42141,13 +42257,15 @@ def main() -> None:
         )
         raise SystemExit(73) from exc
     log.info("=== E3DC Storage Manager gestartet ===")
-    cfg = load_cfg()
-    cfg_ts = time.time()
+    config_snapshot = read_storage_regulation_config(V4_CFG)
+    cfg = config_snapshot or {}
+    requested_regulation = storage_regulation_enabled(cfg) if config_snapshot is not None else None
     rscp_settings = rscp_settings_from_cfg(cfg)
     startup_ha_admission = evaluate_writer_admission()
     ctrl: Optional[BattCtrl] = (
         BattCtrl(*rscp_settings)
         if startup_ha_admission.get("allowed") is True
+        and requested_regulation is True
         and _rscp_runtime_settings_complete(rscp_settings)
         else None
     )
@@ -42156,6 +42274,11 @@ def main() -> None:
         max_age_s=2 * 60 * 60,
     )
     persisted_consumer_budget_state = read_json_file(STATE_F)
+    regulation_switch = StorageRegulationSwitch(
+        requested_regulation,
+        persisted_consumer_budget_state.get("storage_regulation") or {},
+        safe_float(cfg.get("storage_regulation_changed_ts"), 0),
+    )
     persisted_manager_state = read_json_file(
         STATE_F,
         max_age_s=wallbox_start_hold_policy.DEFAULT_HOLD_S + 60.0,
@@ -42199,17 +42322,93 @@ def main() -> None:
     last_ha_admission_sig: Optional[Tuple[Any, ...]] = None
     while not _stop:
         start = time.time()
-        if start - cfg_ts > 60:
-            cfg = load_cfg()
-            cfg_ts = start
-            new_settings = rscp_settings_from_cfg(cfg)
-            if new_settings != rscp_settings:
-                if ctrl:
-                    ctrl.close_for_handover()
-                rscp_settings = new_settings
-                ctrl = None
+        # The user's off switch must not wait for the old 60-second reload.
+        current_cfg = read_storage_regulation_config(V4_CFG)
+        requested_regulation = storage_regulation_enabled(current_cfg) if current_cfg is not None else None
+        if current_cfg is not None:
+            cfg = current_cfg
+        new_settings = rscp_settings_from_cfg(cfg)
+        if new_settings != rscp_settings:
+            if ctrl:
+                ctrl.close_for_handover()
+            rscp_settings = new_settings
+            ctrl = None
+        was_enabled = regulation_switch.enabled
+        release_requested = regulation_switch.advance(
+            requested_regulation, request_ts=safe_float(cfg.get("storage_regulation_changed_ts"), 0),
+            now_s=start,
+        )
         cycle_s = auto_limit_heartbeat_s(cfg) if auto_limit_heartbeat_enabled(cfg) else CYCLE_S
         ha_admission = evaluate_writer_admission()
+        if requested_regulation is not True:
+            live = read_json_file(LIVE_F, max_age_s=30)
+            heater_status = read_json_file(HEATER_STATUS_F, max_age_s=45)
+            if heater_status:
+                try:
+                    heater_status["_source_mtime_s"] = os.path.getmtime(HEATER_STATUS_F)
+                except OSError:
+                    heater_status = {}
+            live = augment_consumer_live(
+                live, read_json_file(ENERGY_DECISION_F, max_age_s=45), cfg,
+                heater_status,
+            )
+            payload = storage_observation_payload(
+                cfg, live, read_json_file(WB_INTENT_F, max_age_s=90),
+                read_json_file(WB_NATIVE_F, max_age_s=90), previous_state, start,
+            )
+            payload["storage_regulation"] = dict(regulation_switch.status)
+            payload["ha_writer_admission"] = ha_admission
+            # Publish pending before the one release opportunity. A crash or
+            # restart must leave uncertainty visible, never repeat the write.
+            write_state(payload, {})
+            if release_requested:
+                receipt = None
+                reason = "release_authority_unavailable"
+                try:
+                    if (ctrl is not None and ownership.successor_confirmed and not _stop
+                            and evaluate_writer_admission().get("allowed") is True
+                            and read_storage_regulation_enabled(V4_CFG) is False):
+                        receipt = ctrl.release_power_limits_explicit()
+                        reason = ""
+                except Exception as exc:
+                    reason = "release_error:" + type(exc).__name__
+                regulation_switch.complete_release(receipt, reason=reason)
+                payload["storage_regulation"] = dict(regulation_switch.status)
+                if isinstance(receipt, dict):
+                    payload["rscp_request_transaction"] = dict(receipt, send_called=True)
+                write_state(payload, {})
+                log.info("Speicherregelung ausgeschaltet; Limitfreigabe: %s",
+                         regulation_switch.status.get("release_status"))
+            if ctrl is not None:
+                ctrl.close_for_handover()
+                ctrl = None
+            if was_enabled is True:
+                ownership.require_successor_confirmation("storage_regulation_disabled")
+            pending_curve_cap_handover_state = None
+            curve_cap_orphan_observation = {}
+            # The inverter's own DV relay policy is independent of the battery
+            # switch, just like wallbox and heat control.
+            if requested_regulation is False:
+                try:
+                    plan = load_validated_canonical_plan_snapshot(PLAN_F, max_age_s=1800) or {}
+                    payload["direct_marketing_aux_inverter_shelly"] = direct_marketing_aux_inverter_shelly_control(
+                        cfg, start, live=payload, direct_plan=plan.get("direct_marketing"),
+                    )
+                except Exception as exc:
+                    log.debug("DV-Zusatz-WR bei Speicherpause: %s", type(exc).__name__)
+            payload["storage_dispatch_runtime"] = build_runtime_overlay({}, payload, live, now_ms=int(start * 1000))
+            atomic_write_on_change(DISPATCH_RUNTIME_F, payload["storage_dispatch_runtime"], force_interval_s=15, indent=2)
+            write_wb_budget(payload)
+            write_storage_decision_surface(payload)
+            previous_state = payload
+            time.sleep(max(0.2, min(3.0, cycle_s) - (time.time() - start)))
+            continue
+        if was_enabled is not True:
+            # Only consumer acceptance state survives; no pre-pause storage
+            # setpoint, battery grant, manual request or curve-cap handover.
+            previous_state = {"budget": copy.deepcopy(previous_state.get("budget") or {})}
+            pending_curve_cap_handover_state = None
+            curve_cap_orphan_observation = {}
         ha_admission_sig = (
             bool(ha_admission.get("allowed")),
             str(ha_admission.get("reason") or ""),
@@ -42349,6 +42548,10 @@ def main() -> None:
         wb_native = read_json_file(WB_NATIVE_F, max_age_s=90)
         manual_max_age_s = manual_override_max_age_s(cfg)
         manual = read_json_file(MANUAL_OVERRIDE_F)
+        if manual and not regulation_switch.manual_allowed(
+            manual, safe_float(cfg.get("storage_regulation_changed_ts"), 0),
+        ):
+            manual = {}
         if manual_override_expired(manual, start, manual_max_age_s):
             log.info("Manueller Batterie-Override abgelaufen; Automatik übernimmt.")
             try:
@@ -42374,6 +42577,7 @@ def main() -> None:
             heater_status,
         )
         payload = decide_next_cycle(cfg, live, plan, wb_intent, wb_native, manual, previous_state, start)
+        payload["storage_regulation"] = dict(regulation_switch.status)
         runtime_suite = storage_budget_runtime_contract_suite(
             cfg,
             payload,
@@ -42568,6 +42772,7 @@ def main() -> None:
         STATE_F,
         {
             "state": "stopped",
+            "storage_regulation": dict(regulation_switch.status),
             "reason": "Dienst beendet; POWER_SETTINGS ohne Freigabeschreiben übergeben",
             "next_manager": True,
             "storage_manager_ownership": ownership.diagnostic(),

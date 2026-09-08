@@ -1,0 +1,27 @@
+{
+  "slave_host": "SLAVE_HOST_EINTRAGEN",
+  "mqtt_host": "MQTT_HOST_EINTRAGEN",
+  "mqtt_port": 1883,
+  "mqtt_tls": false,
+  "mqtt_user": "MQTT_BENUTZER_EINTRAGEN",
+  "master_topic": "e3dcMaster/ha/state",
+  "controller": {
+    "max_charge_w": 3000,
+    "max_discharge_w": 3000,
+    "reserve_pct": 10,
+    "resume_discharge_pct": 12,
+    "charge_stop_pct": 100,
+    "charge_resume_pct": 98,
+    "buffer_w": 200,
+    "deadband_w": 75,
+    "step_w": 50,
+    "interval_s": 5,
+    "neutral_s": 20,
+    "max_age_s": 15,
+    "night_enabled": false,
+    "master_capacity_wh": 0,
+    "slave_capacity_wh": 0,
+    "master_reserve_pct": 10,
+    "discharge_start_w": 100
+  }
+}

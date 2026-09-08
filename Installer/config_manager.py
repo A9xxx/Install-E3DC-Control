@@ -71,6 +71,7 @@ V4_BLOCK_PV = {
     # Legacy forecast*/FC-Felder bleiben parallel lesbar und werden nicht ersetzt.
     'pv_forecast_topology_config',
     'pv_e3dc_dc_inverter_limit_w', 'pv_external_ac_inverter_limit_w',
+    'pv_external_ac_observation_mode',
     'forecast_diagnostics_enable',
     'ml_home_cap_kw',   # Max. Hausverbrauch im ML-Training (kW) – verhindert WB-Artefakte
 }
@@ -175,6 +176,7 @@ V4_BLOCK_TARIFF = {
 
 # --- Block 4: Speicher-Manager (Ersatzwerte) ---
 V4_BLOCK_STORAGE = {
+    'storage_regulation_enabled', 'storage_regulation_changed_ts',
     'speichergroesse',           # Batteriegröße kWh (Fallback wenn RSCP nicht liefert)
     'maximumladeleistung',       # Max Ladeleistung W (Lade-Limit)
     'maximaleentladeleistung',   # Max Entladeleistung W

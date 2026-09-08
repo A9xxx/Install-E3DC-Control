@@ -180,3 +180,64 @@ systemctl status e3dc-forecast-evidence --no-pager
 Die Installationszentrale zeigt zusätzlich, ob Quelle, Zeitstempel und
 Prognosedienst verfügbar sind. Ein Neustart oder eine Reparatur sollte erst
 nach einem Backup und über den vorgesehenen Installerweg erfolgen.
+
+## Getrennte Ist-Kalibrierung und begrenzte Erzeugung
+
+Im Config-Editor lässt sich unter den PV-Flächen die **Ist-Messung des
+Zusatzwechselrichters** bestätigen. Voraussetzung ist ein eigener
+Erzeugungszähler direkt am Zusatz-WR, dessen Leistung als Generatoreingang
+an E3DC gemeldet wird. Eine saldierte Hausmessung genügt nicht. Die Angabe
+gilt ab Erfassung; ältere Messungen werden dadurch nicht nachträglich
+aufgewertet. Bei mehreren Zusatzwechselrichtern betrifft sie deren gemeinsame
+Messgrenze und das zugehörige gemeinsame AC-Limit.
+
+Die zusätzliche Auswahl **ohne externe Abregelung oder Abschaltung** ist eine
+Betreiberbestätigung der Anlagenverdrahtung und Steuerung. Sie passt nicht zu
+Anlagen mit Schützabschaltung oder externer Leistungssteuerung. Ohne diese
+Bestätigung müssen unabhängige, gültige Statusdaten für den Zusatz-WR
+vorliegen. Fehlen diese, bleibt sein Begrenzungszustand unbekannt. Der
+E3DC-Abregelstatus wird ausschließlich dem E3DC zugeordnet.
+
+Die Diagnose trennt drei Grenzen: E3DC-DC-Eingang, E3DC-AC-Ausgang und
+Netzeinspeisung. Die AC-Nennleistung stammt aus dem RSCP-Systemmerkmal
+`maxAcPower`; vorhandene explizite AC-Einstellungen können zusätzlich
+begrenzen. Das DC-Limit wird niemals als AC-Nennleistung verwendet. Der
+direkte RSCP-GET für den Abregelstatus und die Systemmerkmale sind anhand
+der [Herstellerdefinitionen](https://s10.e3dc.com/s10/js/rscpLibV0.9.3.min.js)
+abgeglichen. Fehlende oder ungültige Antworten bleiben unbekannt. Die neuen
+Diagnosefelder erteilen keine zusätzlichen Steuerfreigaben.
+
+Ein Überschreiten der gepufferten Einspeiseschwelle bei gleichzeitiger
+Batterieladung kann eine Aufnahme des Überschusses durch den Abregelschutz
+anzeigen. Dafür wird der Schutz nicht ausgeschaltet. Es ist eine Abschätzung,
+kein unabhängiger Nachweis verlorener oder geretteter Energie. PV-Leistung
+einschließlich DC-Batterieladung wird nicht mit einer AC-Nennleistung
+verglichen. Für möglichen AC-Clippingbetrieb zählt der gemessene AC-Ausgang;
+ein Abstand zur Grenze von höchstens zwei Prozent beziehungsweise 100 W
+gilt vorsorglich als Verdachtsbereich, nicht als sicherer Clippingnachweis.
+Andere, nicht gemeldete interne Begrenzungen bleiben eine Nachweisgrenze.
+
+Die laufende Diagnose integriert frische Live-Messungen zeitgewichtet in
+Viertelstunden. Lücken über 45 Sekunden werden nicht extrapoliert. Nur
+vollständig erfasste Viertelstunden mit unveränderter Messzuordnung und
+bekanntem, unbegrenztem Zustand gehen in den gesonderten Kalibriervergleich
+ein. Abregelung, Clipping-Verdacht, Abschaltung und unbekannte Zustände
+werden ausgeschlossen. Ein Wechsel innerhalb der Viertelstunde wird
+vorsorglich dem schlechteren Zustand zugeordnet. Gesamtkennzahlen behalten
+ihre bisherige Bedeutung und enthalten diese Zeiten weiterhin.
+
+Je Quelle wird ein eigener Faktor aus dem Verhältnis von Ist-Energie und
+Rohprognose berechnet. Voraussetzungen sind mindestens sieben UTC-Tage,
+mindestens 64 Lernfenster und 32 Prüffenster. Die letzten drei Tage sind
+ausschließlich Prüfdaten. Der Faktor muss zwischen 0,75 und 1,40 liegen,
+mindestens zwei Prozent von eins abweichen und den mittleren absoluten
+Fehler auf den späteren Tagen um mindestens fünf Prozent verbessern.
+Diese Schwellen sind vorsichtige technische Auswahlregeln; sie beweisen
+weder statistische Signifikanz noch eine P50-Prognose.
+
+Die Anzeige unterscheidet fehlende Messzuordnung, Datensammlung, einen
+geprüften Faktor und eine nicht ausreichend verbesserte Korrektur. **Die neue
+Kalibrierung bleibt diagnostisch:** Sie verändert weder die bestehende
+Prognosekorrektur noch automatisch die Ladekurve. Die getrennte Anwendung
+auf die Regelung benötigt zunächst ausreichende Feldmessungen. Das Archiv,
+die Auswahl und die Web-Ausgabe zeigen diese Grenze ausdrücklich.

@@ -1715,18 +1715,24 @@ def _deterministic_reference_contract(compared_slots: int) -> dict[str, Any]:
     }
 
 
-def _observation_quality_contract() -> dict[str, Any]:
+def _observation_quality_contract(details=None) -> dict[str, Any]:
+    sources = (details or {}).get("source_quality") or []
+    collected = any(item.get("quality_slots", 0) > 0 for item in sources)
     return {
         "observation_source_contract": HISTORY_SOURCE_CONTRACT,
-        "curtailment_exclusion_status": "EVIDENCE_LIMIT",
-        "inverter_clipping_exclusion_status": "EVIDENCE_LIMIT",
-        "external_shutdown_exclusion_status": "EVIDENCE_LIMIT",
+        "curtailment_exclusion_status": "partially_filtered" if collected else "EVIDENCE_LIMIT",
+        "inverter_clipping_exclusion_status": "partially_filtered" if collected else "EVIDENCE_LIMIT",
+        "external_shutdown_exclusion_status": "partially_filtered" if collected else "EVIDENCE_LIMIT",
+        "scope": "quality_filtered_stage_metrics_only",
         "availability_forecast_claim_allowed": False,
         "decision_use_allowed": False,
     }
 
 
-def _source_diagnostics(compared_slots: int) -> list[dict[str, Any]]:
+def _source_diagnostics(compared_slots: int, details=None) -> list[dict[str, Any]]:
+    external = next((item for item in (details or {}).get("source_quality", [])
+                     if item.get("signal") == "pv_external_ac"), {})
+    external_ready = external.get("eligible_slots", 0) > 0
     return [
         {
             "signal": FORECAST_SIGNAL_CONTRACT,
@@ -1737,10 +1743,10 @@ def _source_diagnostics(compared_slots: int) -> list[dict[str, Any]]:
         },
         {
             "signal": "pv_external_ac",
-            "status": "EVIDENCE_LIMIT",
+            "status": "diagnostisch" if external_ready else "EVIDENCE_LIMIT",
             "forecast_source_contract": FORECAST_SOURCE_CONTRACT,
-            "observation_source_contract": None,
-            "reason": "validated_external_ac_history_missing",
+            "observation_source_contract": "operator_bound_e3dc_add_power_15m_v1" if external_ready else None,
+            "reason": "quality_filtered_observations" if external_ready else "validated_external_ac_history_missing",
         },
         {
             "signal": "house_base_load",
@@ -2284,6 +2290,7 @@ def calculate_diagnostic_summary(
         else "EVIDENCE_LIMIT"
     )
 
+    details = calculate_details(connection, revision, current_method_revision, now_s)
     return {
         "schema_version": SUMMARY_SCHEMA,
         "calculated_at_utc_s": now_s,
@@ -2324,11 +2331,9 @@ def calculate_diagnostic_summary(
             persistence_compared
         ),
         "probabilistic_evidence": _probabilistic_evidence_contract(),
-        "observation_quality": _observation_quality_contract(),
-        "source_diagnostics": _source_diagnostics(compared),
-        "diagnostic_details": calculate_details(
-            connection, revision, current_method_revision, now_s
-        ),
+        "observation_quality": _observation_quality_contract(details),
+        "source_diagnostics": _source_diagnostics(compared, details),
+        "diagnostic_details": details,
         "metrics": {
             "trefferabweichung_wh": rounded("trefferabweichung_wh"),
             "richtungsversatz_wh": rounded("richtungsversatz_wh"),
@@ -2655,8 +2660,8 @@ def _sanitized_summary(payload: dict[str, Any]) -> dict[str, Any]:
             persistence_compared_slots
         ),
         "probabilistic_evidence": _probabilistic_evidence_contract(),
-        "observation_quality": _observation_quality_contract(),
-        "source_diagnostics": _source_diagnostics(compared_slots),
+        "observation_quality": _observation_quality_contract(sanitize_details(payload.get("diagnostic_details"))),
+        "source_diagnostics": _source_diagnostics(compared_slots, sanitize_details(payload.get("diagnostic_details"))),
         "diagnostic_details": sanitize_details(payload.get("diagnostic_details")),
         "metrics": sanitized_metrics,
         "labels": dict(DIAGNOSTIC_LABELS),

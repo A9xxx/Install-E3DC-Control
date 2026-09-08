@@ -112,6 +112,11 @@ class StorageManagerOwnership:
         self._publish_state(SUCCESSOR_CONFIRMED, evidence=evidence_text)
         return True
 
+    def require_successor_confirmation(self, evidence: str) -> None:
+        """Keep the lock, but forget hardware ownership after an explicit pause."""
+        if self.state in {OWNER_ACQUIRED, SUCCESSOR_CONFIRMED}:
+            self._publish_state(OWNER_ACQUIRED, evidence=evidence)
+
     def begin_termination(self) -> bool:
         if self.state == TERMINATING:
             return False

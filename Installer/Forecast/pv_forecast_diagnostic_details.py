@@ -9,6 +9,10 @@ import hashlib
 import json
 import math
 from collections import Counter
+try:
+    from . import pv_observation_quality as observation_quality
+except ImportError:  # Direkter Diagnoseaufruf ohne Paketkontext.
+    import pv_observation_quality as observation_quality
 
 
 DETAIL_SCHEMA = "pv_forecast_diagnostic_details_v1"
@@ -214,11 +218,11 @@ class ExternalEnergyAccumulator:
         self.latest_timestamp = None
         self.slots = {}
 
-    def observe(self, live, topology_revision, now_s):
+    def observe(self, live, topology_revision, now_s, config=None):
         live = live if isinstance(live, dict) else {}
         ts, watts, age = number(live.get("_ts")), number(live.get("Ext_PV_Power")), number(live.get("Ext_PV_Power_Age_S"))
         valid = (ts is not None and 0 <= now_s - ts <= MAX_SAMPLE_GAP_S
-                 and age is not None and age <= MAX_SAMPLE_GAP_S and watts is not None
+                 and age is not None and 0 <= age <= MAX_SAMPLE_GAP_S and watts is not None and watts >= 0
                  and live.get("Ext_PV_Power_Valid") is True and live.get("RSCP_Sample_Valid") is True
                  and live.get("Ext_PV_Power_Source") == EXTERNAL_SOURCE
                  and isinstance(topology_revision, str) and topology_revision.startswith("sha256:"))
@@ -230,9 +234,10 @@ class ExternalEnergyAccumulator:
                 self.previous = None
             return
         self.latest_timestamp = ts
-        derating = (live.get("pv_derating_active") if live.get("pv_derating_active_valid") is True
-                    and isinstance(live.get("pv_derating_active"), bool) else None)
-        current = (ts, watts, topology_revision, derating)
+        quality = observation_quality.classify(live, config or {}, now_s)
+        external_curtailment = quality["signals"]["pv_external_ac"]["curtailment"]
+        derating = {"observed": True, "not_observed": False}.get(external_curtailment)
+        current = (ts, watts, topology_revision, derating, quality)
         previous = self.previous
         if previous and ts <= previous[0]:
             if ts < previous[0]:
@@ -257,6 +262,26 @@ class ExternalEnergyAccumulator:
             state["covered"] += stop - cursor
             state["max_gap"] = max(state["max_gap"], gap)
             state["segments"] += 1
+            duration = stop - cursor
+            old_quality = previous[4]
+            binding = quality["binding"]
+            if state["binding"] is None:
+                state["binding"] = binding
+            if (old_quality["binding"]["revision"] != binding["revision"]
+                    or state["binding"]["revision"] != binding["revision"]):
+                state["binding_changed"] = True
+            for signal in SIGNALS:
+                before = old_quality["signals"][signal]
+                after = quality["signals"][signal]
+                # Übergänge gehören konservativ zum schlechteren Zustand.
+                states = (before["state"], after["state"])
+                severity = ("measurement_invalid", "shutdown", "curtailed", "clipping_suspected", "unknown",
+                            "protection_absorbing", "unrestricted")
+                selected = next(item for item in severity if item in states)
+                state["quality_seconds"][signal][selected] += duration
+                if before["meter_confirmed"] and after["meter_confirmed"]:
+                    state["meter_seconds"][signal] += duration
+                state["limits"][signal] = after["ac_limit_w"]
             if previous[3] is True or derating is True:
                 state["derating_observed"] = True
             if previous[3] is None or derating is None:
@@ -266,7 +291,11 @@ class ExternalEnergyAccumulator:
     @staticmethod
     def _empty():
         return {"energy": 0.0, "covered": 0.0, "max_gap": 0.0, "segments": 0,
-                "derating_observed": False, "derating_unknown": False}
+                "derating_observed": False, "derating_unknown": False,
+                "binding": None, "binding_changed": False,
+                "quality_seconds": {signal: Counter() for signal in SIGNALS},
+                "meter_seconds": {signal: 0.0 for signal in SIGNALS},
+                "limits": {signal: None for signal in SIGNALS}}
 
     def closed(self, now_s):
         result = []
@@ -275,6 +304,16 @@ class ExternalEnergyAccumulator:
             if start + 900 + MAX_SAMPLE_GAP_S > now_s:
                 continue
             complete = abs(state["covered"] - 900) < 1e-6
+            quality_signals = {}
+            for signal in SIGNALS:
+                seconds = state["quality_seconds"][signal]
+                eligible_s = sum(seconds.get(key, 0) for key in ("unrestricted", "protection_absorbing"))
+                quality_signals[signal] = {
+                    "state_seconds": {key: round(seconds.get(key, 0), 6) for key in observation_quality.STATES},
+                    "meter_confirmed": complete and abs(state["meter_seconds"][signal] - 900) < 1e-6,
+                    "calibration_eligible": complete and not state["binding_changed"] and abs(eligible_s - 900) < 1e-6,
+                    "ac_limit_w": state["limits"][signal],
+                }
             result.append({"schema_version": "pv_external_ac_observation_v1",
                 "topology_revision": topology, "slot_start_utc_s": start,
                 "slot_end_utc_s": start + 900, "observed_at_utc_s": int(now_s),
@@ -289,7 +328,13 @@ class ExternalEnergyAccumulator:
                 "gross_generation_independently_proven": False,
                 "curtailment": "observed" if state["derating_observed"] else
                     "unknown" if state["derating_unknown"] or not complete else "not_observed",
-                "clipping": "unknown", "external_shutdown": "unknown",
+                "clipping": "suspected" if quality_signals["pv_external_ac"]["state_seconds"]["clipping_suspected"] > 0 else
+                    "not_observed" if quality_signals["pv_external_ac"]["calibration_eligible"] else "unknown",
+                "external_shutdown": "observed" if quality_signals["pv_external_ac"]["state_seconds"]["shutdown"] > 0 else
+                    "not_observed" if quality_signals["pv_external_ac"]["calibration_eligible"] else "unknown",
+                "observation_quality": {"schema_version": observation_quality.SCHEMA,
+                    "binding": state["binding"], "binding_changed": state["binding_changed"],
+                    "signals": quality_signals},
                 "decision_use_allowed": False})
             del self.slots[(topology, start)]
         return result
@@ -383,6 +428,25 @@ def calculate_details(connection, topology_revision, method_revision, now_s):
         key = row["slot_start_utc_s"]
         if item.get("valid") is True or key not in external:
             external[key] = item
+    latest_quality_binding = None
+    if external:
+        newest = max(external.values(), key=lambda r: r.get("slot_start_utc_s", 0))
+        latest_quality_binding = ((newest.get("observation_quality") or {}).get("binding") or {}).get("revision")
+    source_quality = []
+    for signal in SIGNALS:
+        qualities = [observation_quality.slot_quality(record, signal, latest_quality_binding) for record in external.values()]
+        totals = Counter()
+        for quality in qualities:
+            totals.update(quality["state_seconds"])
+        source_quality.append({"signal": signal, "observed_slots": len(qualities),
+            "quality_slots": sum(q["complete"] for q in qualities),
+            "meter_confirmed_slots": sum(q["meter_confirmed"] for q in qualities),
+            "eligible_slots": sum(q["eligible"] for q in qualities),
+            "excluded_slots": sum(not q["eligible"] for q in qualities),
+            "state_seconds": dict(totals),
+            "ac_limit_w": next((q["ac_limit_w"] for q in reversed(qualities) if q["ac_limit_w"] is not None), None)})
+    calibration_pairs = {signal: [] for signal in SIGNALS}
+    filtered_stages = {}
     stages = {}
     stage_archive_count = 0
     for start, row in latest.items():
@@ -402,6 +466,13 @@ def calculate_details(connection, topology_revision, method_revision, now_s):
             measured = actual.get(start) if key[0] == SIGNALS[0] else (external.get(start) or {}).get("actual_energy_wh")
             if predicted is not None and measured is not None and max(predicted, measured) >= 25:
                 stages.setdefault(key, []).append((predicted, measured))
+                quality = observation_quality.slot_quality(external.get(start) or {}, key[0], latest_quality_binding)
+                if quality["eligible"]:
+                    filtered_stages.setdefault(key, []).append((predicted, measured))
+                    if key[1] == "ensemble_before_bias":
+                        calibration_pairs[key[0]].append((start, predicted, measured))
+    for source in source_quality:
+        source["calibration"] = observation_quality.calibration(calibration_pairs[source["signal"]])
     # Ein vollständiger UTC-Tag stammt aus genau einer Ausgabe, die bereits
     # vor Tagesbeginn erzeugt UND archiviert war. Keine Slot-Mosaike.
     daily_candidates = {}
@@ -433,6 +504,9 @@ def calculate_details(connection, topology_revision, method_revision, now_s):
         "stage_archived_slots": stage_archive_count,
         "stage_metrics": [{"signal": signal, "stage": stage, **error_metrics(stages.get((signal, stage), []))}
                           for signal in SIGNALS for stage in STAGES],
+        "quality_filtered_stage_metrics": [{"signal": signal, "stage": stage, **error_metrics(filtered_stages.get((signal, stage), []))}
+                          for signal in SIGNALS for stage in STAGES],
+        "source_quality": source_quality,
         "frozen_daily": {"basis": "latest_complete_issue_captured_before_utc_day_start",
             "forecast_days": len(daily), "compared_days": len(day_pairs),
             "incomplete_observation_days": len(daily) - len(day_pairs),
@@ -442,7 +516,7 @@ def calculate_details(connection, topology_revision, method_revision, now_s):
             "incomplete_slots": sum(r.get("valid") is not True for r in external.values()),
             "covered_seconds": round(sum(r.get("covered_seconds", 0) for r in external.values()), 3),
             "curtailment_observed_slots": sum(r.get("curtailment") == "observed" for r in external.values()),
-            "quality_filtered_comparison_allowed": False,
+            "quality_filtered_comparison_allowed": source_quality[1]["eligible_slots"] > 0,
             "gross_generation_independently_proven": False,
             "clipping_status": "unknown", "shutdown_status": "unknown"}}
 
@@ -462,14 +536,21 @@ def sanitize_details(value):
     for item in (value.get("stage_metrics") or [])[:len(SIGNALS) * len(STAGES)]:
         if isinstance(item, dict) and item.get("signal") in SIGNALS and item.get("stage") in STAGES:
             result["stage_metrics"].append({"signal": item["signal"], "stage": item["stage"], **_metrics_projection(item),
-                                             "compared_slots": int(number(item.get("compared_slots")) or 0)})
+                                              "compared_slots": int(number(item.get("compared_slots")) or 0)})
+    result["quality_filtered_stage_metrics"] = []
+    for item in (value.get("quality_filtered_stage_metrics") or [])[:len(SIGNALS) * len(STAGES)]:
+        if isinstance(item, dict) and item.get("signal") in SIGNALS and item.get("stage") in STAGES:
+            result["quality_filtered_stage_metrics"].append({"signal": item["signal"], "stage": item["stage"],
+                **_metrics_projection(item), "compared_slots": int(number(item.get("compared_slots")) or 0)})
+    result["source_quality"] = observation_quality.sanitize_source_summary(value.get("source_quality"))
     daily = value.get("frozen_daily") or {}
     result["frozen_daily"] = {"basis": "latest_complete_issue_captured_before_utc_day_start", **_metrics_projection(daily),
         **{k: int(number(daily.get(k)) or 0) for k in ("forecast_days", "compared_days", "incomplete_observation_days")}}
     external = value.get("external_observation") or {}
     result["external_observation"] = {"source": EXTERNAL_SOURCE,
         **{k: number(external.get(k)) for k in ("observed_slots", "complete_slots", "incomplete_slots", "covered_seconds", "curtailment_observed_slots")},
-        "quality_filtered_comparison_allowed": False, "gross_generation_independently_proven": False,
+        "quality_filtered_comparison_allowed": result["source_quality"][1]["eligible_slots"] > 0,
+        "gross_generation_independently_proven": False,
         "clipping_status": "unknown", "shutdown_status": "unknown"}
     return result
 

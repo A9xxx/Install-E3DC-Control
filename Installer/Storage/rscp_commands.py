@@ -1153,10 +1153,10 @@ class BattCtrl:
         )
         return receipt
 
-    def release_power_limits_explicit(self) -> None:
+    def release_power_limits_explicit(self) -> Dict[str, Any]:
         """Gibt POWER_SETTINGS ausdrücklich frei; kein Prozess-Cleanup."""
 
-        self.send(
+        return self.send(
             MODE_AUTO,
             self._auto_discharge_cap,
             force=True,

@@ -319,7 +319,7 @@ def main() -> int:
                         _slots, current_revision, _published, _contract = load_current_forecast(now_utc_s=int(now_s))
                         forecast_identity = identity
                     live, _stat = _bounded_json_file(LIVE_PATH, max_bytes=MAX_CONFIG_BYTES)
-                    accumulator.observe(live, current_revision, now_s)
+                    accumulator.observe(live, current_revision, now_s, config=config)
                 except Exception:
                     # Eine fehlende, veraltete oder ungültige Probe öffnet eine Lücke.
                     accumulator.observe({}, None, now_s)

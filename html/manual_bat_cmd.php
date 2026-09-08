@@ -60,7 +60,15 @@ if ($action === 'auto') {
         ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         exit;
     }
-    echo json_encode(['ok' => true, 'msg' => 'Automatik aktiv — manueller Override entfernt.']);
+    echo json_encode(['ok' => true, 'msg' => 'Manueller Override entfernt. Die Einstellung der Speicherregelung bleibt unverändert.']);
+    exit;
+}
+
+$storageConfig = json_decode((string)@file_get_contents('/var/www/html/data/e3dc_v4.json'), true);
+$storageEnabled = is_array($storageConfig) && in_array(strtolower(trim((string)($storageConfig['storage_regulation_enabled'] ?? '1'))), ['1', 'true', 'yes', 'on', 'ja', 'ein', 'aktiv'], true);
+if (!$storageEnabled) {
+    http_response_code(409);
+    echo json_encode(['ok' => false, 'msg' => 'Speicherregelung ist aus oder die Konfiguration ist nicht lesbar. Zum manuellen Laden oder Entladen zuerst die Speicherregelung aktivieren.']);
     exit;
 }
 

@@ -1,12 +1,12 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.4.5d
+Dokumentation Stand: 5.4.5e
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
 Installationspfad und Python-Umgebung aus dem geprüften Installationskontext.
 
-5.4.5d korrigiert den Docker-Start mit bestehenden Datenvolumes im
+5.4.5e korrigiert den Docker-Start mit bestehenden Datenvolumes im
 Standardschutzmodus. Startprüfung und Rechteverwaltung verwenden denselben
 konfigurierten Datenschutzmodus. Der bisherige Host-Updateweg bleibt erhalten.
 Einzelheiten stehen in den [Release Notes](../RELEASE_NOTES.md).

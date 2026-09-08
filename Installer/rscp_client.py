@@ -368,6 +368,15 @@ class RscpType:
 
 # Bekannte Tag-Codes (Subset für vital_stats / Batterie-Diagnostik)
 class RscpTag:
+    # Herstellerdefinition: https://s10.e3dc.com/s10/js/rscpLibV0.9.3.min.js
+    # Ausschließlich GET; GET_SYS_SPECS antwortet tatsächlich auf 0x01800098.
+    EMS_REQ_IS_PV_DERATING                     = 0x01000024
+    EMS_IS_PV_DERATING                         = 0x01800024
+    EMS_REQ_GET_SYS_SPECS                      = 0x01000097
+    EMS_GET_SYS_SPECS                          = 0x01800098
+    EMS_SYS_SPEC                              = 0x01000099
+    EMS_SYS_SPEC_NAME                         = 0x0100009B
+    EMS_SYS_SPEC_VALUE_INT                    = 0x0100009C
     """Single productive RSCP tag registry."""
     BAT_ASOC                                    = 0x0380000F
     BAT_CHARGE_CYCLES                           = 0x03800008

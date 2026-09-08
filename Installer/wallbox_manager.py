@@ -31670,7 +31670,7 @@ def run():
                 {c_data["id"]: wb_legacy_global_mode for c_data in chargers},
                 native_enabled=True,
             )
-            logger.info(f"Verbunden mit {len(chargers)} Wallbox(en). Modus={wb_dist_mode}. Starte Regel-Schleife.")
+            logger.info(f"{len(chargers)} Wallbox(en) konfiguriert. Modus={wb_dist_mode}. Starte Regel-Schleife; Verbindungsstatus folgt aus den Treiberdaten.")
             _active_chargers.clear()
             _active_chargers.extend(chargers)
 

@@ -402,6 +402,7 @@ $defaults = [
     "solcast_api_slot_fc1" => "", "solcast_api_slot_fc2" => "", "solcast_api_slot_fc3" => "", "solcast_api_slot_fc4" => "",
     "pv_forecast_coupling_fc1" => "", "pv_forecast_coupling_fc2" => "", "pv_forecast_coupling_fc3" => "", "pv_forecast_coupling_fc4" => "",
     "pv_external_ac_inverter_limit_w" => "", "pv_e3dc_dc_inverter_limit_w" => "",
+    "pv_external_ac_observation_mode" => "unverified",
     "pv_forecast_topology_config" => "",
     "forecast_diagnostics_enable" => "0",
     "ml_home_cap_kw" => "6.0",
@@ -2918,7 +2919,7 @@ if ($configEditorRequestMethod === 'POST') {
         }
     } elseif (isset($_POST['quick_toggle_key'])) {
         header('Content-Type: application/json; charset=utf-8');
-        $allowedQuickToggles = ['predump_enable'];
+        $allowedQuickToggles = ['predump_enable', 'storage_regulation_enabled'];
         $quickKey = strtolower(trim((string)($_POST['quick_toggle_key'] ?? '')));
         if (!in_array($quickKey, $allowedQuickToggles, true)) {
             echo json_encode(['success' => false, 'message' => 'Schalter nicht erlaubt']);
@@ -2934,8 +2935,14 @@ if ($configEditorRequestMethod === 'POST') {
         $old_v4_data = $v4_data;
         $v4_data[$quickKey] = in_array(strtolower(trim((string)($_POST['quick_toggle_value'] ?? '0'))), ['1', 'true', 'yes', 'on'], true) ? 1 : 0;
 
+        $quickValues = [$quickKey => $v4_data[$quickKey]];
+        if ($quickKey === 'storage_regulation_enabled') {
+            // Bind status and invalidate older manual overrides in the same
+            // canonical config transaction as the user's switch.
+            $quickValues['storage_regulation_changed_ts'] = sprintf('%.6F', microtime(true));
+        }
         $mutation = saveE3dcConfigValuesDetailed(
-            [$quickKey => $v4_data[$quickKey]],
+            $quickValues,
             $v4_config_file_path,
             '/var/www/html/ramdisk/e3dc_config_cache.json'
         );
@@ -2946,6 +2953,8 @@ if ($configEditorRequestMethod === 'POST') {
             'success' => $success,
             'key' => $quickKey,
             'value' => $v4_data[$quickKey],
+            'request_ts' => $quickValues['storage_regulation_changed_ts'] ?? null,
+            'state_unknown' => !empty($mutation['state_unknown']),
             'message' => $success
                 ? ('Gespeichert' . ($retentionWarning !== ''
                     ? '. Hinweis zur Bereinigung: ' . $retentionWarning
@@ -3474,6 +3483,7 @@ $groups = [
         "solcast_api_slot_fc1", "solcast_api_slot_fc2", "solcast_api_slot_fc3", "solcast_api_slot_fc4",
         "pv_forecast_coupling_fc1", "pv_forecast_coupling_fc2", "pv_forecast_coupling_fc3", "pv_forecast_coupling_fc4",
         "pv_external_ac_inverter_limit_w", "pv_e3dc_dc_inverter_limit_w", "pv_forecast_topology_config",
+        "pv_external_ac_observation_mode",
         "forecast_diagnostics_enable", "ml_home_cap_kw"
     ],
     "Erweitertes Feintuning" => [
@@ -3571,7 +3581,6 @@ $groups = [
     "Webansicht & Updates" => [
         "frontend_variant", "frontend_detail_mode", "show_forecast", "darkmode", "web_pin", "config_secret_protection_mode", "check_updates", "auto_update_enable", "auto_update_time"
     ],
-    "Installationszentrale" => [],
     "Sonstiges" => []
 ];
 $frontendHiddenKeys = [
@@ -4665,6 +4674,21 @@ async function readConfirmedConfigJson(response) {
     </div>
     <?= $message ?>
 
+    <?php
+        $storageRegulationEnabled = in_array(strtolower(trim((string)($config['storage_regulation_enabled']['value'] ?? '1'))), ['1', 'true', 'yes', 'on', 'ja', 'ein', 'aktiv'], true);
+        $storageRegulationRequestTs = (float)($config['storage_regulation_changed_ts']['value'] ?? 0);
+    ?>
+    <div class="border rounded p-3 mb-3 mx-1" id="storageRegulationControl" data-request-ts="<?= htmlspecialchars(json_encode($storageRegulationRequestTs), ENT_QUOTES) ?>">
+        <div class="form-check form-switch">
+            <input class="form-check-input" type="checkbox" role="switch" id="storageRegulationEnabled" data-quick-toggle="storage_regulation_enabled" aria-describedby="storageRegulationHelp storageRegulationState" <?= $storageRegulationEnabled ? 'checked' : '' ?>>
+            <label class="form-check-label fw-bold" for="storageRegulationEnabled">Speicherregelung aktiv</label>
+        </div>
+        <div class="small text-body-secondary mt-2" id="storageRegulationHelp">Aus: E3DC-Control gibt die Speichersteuerung einmal frei und beobachtet anschließend nur. Messwerte, Aufzeichnung und Oberfläche laufen weiter. Wallbox, Wärme und die separate Zusatzwechselrichter-Steuerung behalten ihre eigenen Einstellungen.</div>
+        <div class="small text-body-secondary mt-2" id="storageRegulationState" role="status" aria-live="polite">Status der Speicherregelung wird geladen …</div>
+        <div class="small text-body-secondary mt-1">Vor dem Start eines externen Speicherreglers die bestätigte Limitfreigabe abwarten. „Aus“ sperrt die Batterie nicht: E3DC beziehungsweise der externe Regler übernimmt.</div>
+    </div>
+    <script src="storage_regulation.js?v=1" defer></script>
+
     <div class="px-1" id="configAdvancedSearch">
         <input type="text" id="configSearch" class="form-control" placeholder="🔍 Variable suchen..." onkeyup="filterConfig()">
     </div>
@@ -5116,7 +5140,7 @@ async function readConfirmedConfigJson(response) {
             $isEbaGroup = in_array($title, $eba_groups);
 
             // Spezialfall für leere "Sonstiges" Gruppe (Auffangbecken)
-            if (empty($keys) && $title !== "Weitere Parameter" && $title !== "Installationszentrale" && $title !== "Standort & PV-Prognose" && $title !== "Speicher & Konfiguration" && $title !== "Tarif & Strompreise" && $title !== "Benachrichtigungen") return;
+            if (empty($keys) && $title !== "Weitere Parameter" && $title !== "Standort & PV-Prognose" && $title !== "Speicher & Konfiguration" && $title !== "Tarif & Strompreise" && $title !== "Benachrichtigungen") return;
 
             // Variablen sammeln (nur wenn in der Datei oder als Standardwert vorhanden)
             foreach ($keys as $k) {
@@ -5131,7 +5155,7 @@ async function readConfirmedConfigJson(response) {
                     }
                 }
             }
-            if (empty($items) && $title !== "Installationszentrale" && $title !== "Standort & PV-Prognose" && $title !== "Speicher & Konfiguration" && $title !== "Tarif & Strompreise" && $title !== "Benachrichtigungen") return;
+            if (empty($items) && $title !== "Standort & PV-Prognose" && $title !== "Speicher & Konfiguration" && $title !== "Tarif & Strompreise" && $title !== "Benachrichtigungen") return;
 
 
             // SPEZIAL-LAYOUT für V4 Smart Home
@@ -9046,22 +9070,6 @@ async function readConfirmedConfigJson(response) {
             return;
             endif;
 
-            if ($title === "Installationszentrale"):
-        ?>
-        <a class="card config-card config-group-el mb-2 text-decoration-none" id="group-install-center" data-search-text="<?= $groupSearchText ?> direkt oeffnen öffnen" href="<?= htmlspecialchars($configInstallCenterUrl, ENT_QUOTES, 'UTF-8') ?>">
-            <div class="config-header position-relative" style="justify-content: center;">
-                <span class="fs-6 fw-bold"><i class="fas fa-route me-2 text-info"></i><?= $title ?></span>
-                <span class="btn btn-sm btn-outline-info fw-bold position-absolute" style="right: 12px;">
-                    <i class="fas fa-up-right-from-square me-1"></i>Öffnen
-                </span>
-            </div>
-            <div class="px-3 pb-3 text-center small text-muted">
-                Diagnose, Dry-Run, Freigabe-Check, sichere Installation und Rückbau direkt in der Installationszentrale.
-            </div>
-        </a>
-        <?php
-            return;
-            endif;
         ?>
         <?php
             $groupIcons = [
@@ -9072,7 +9080,6 @@ async function readConfirmedConfigJson(response) {
                 "HA Master/Slave Cluster" => "fa-server text-info",
                 "E3DC System-Verbindung" => "fa-solar-panel text-warning",
                 "Webansicht & Updates" => "fa-desktop text-primary",
-                "Installationszentrale" => "fa-route text-info",
                 "Sonstiges" => "fa-sliders-h text-secondary"
             ];
             $iconClass = $groupIcons[$title] ?? "fa-sliders-h text-secondary";
@@ -10769,6 +10776,16 @@ async function readConfirmedConfigJson(response) {
                                     value="<?= htmlspecialchars($config['pv_e3dc_dc_inverter_limit_w']['value'] ?? '') ?>" placeholder="optional bei fehlendem Live-Readback">
                                 <div class="text-muted" style="font-size:0.68rem;">Ein frischer PVI-DC-Max-Readback bleibt vorrangig.</div>
                             </div>
+                            <div class="col-12">
+                                <label class="config-label" for="pv_external_ac_observation_mode">Ist-Messung des Zusatzwechselrichters</label>
+                                <?php $pvMeterMode = $config['pv_external_ac_observation_mode']['value'] ?? 'unverified'; ?>
+                                <select id="pv_external_ac_observation_mode" name="values[pv_external_ac_observation_mode]" class="form-select form-select-sm config-input">
+                                    <option value="unverified" <?= $pvMeterMode === 'unverified' ? 'selected' : '' ?>>Messzuordnung noch nicht bestätigt</option>
+                                    <option value="generation_meter" <?= $pvMeterMode === 'generation_meter' ? 'selected' : '' ?>>Eigener Erzeugungszähler am Zusatz-WR, als E3DC-Generatoreingang</option>
+                                    <option value="generation_meter_uncontrolled" <?= $pvMeterMode === 'generation_meter_uncontrolled' ? 'selected' : '' ?>>Eigener Erzeugungszähler; Zusatz-WR ohne externe Abregelung oder Abschaltung</option>
+                                </select>
+                                <div class="text-muted" style="font-size:0.75rem;">Nur bestätigen, wenn der Zähler ausschließlich die Erzeugung dieses Wechselrichters erfasst. Die letzte Option bestätigt zusätzlich, dass keine externe Leistungssteuerung oder Schützabschaltung vorhanden ist. Die Angabe gilt für künftig erfasste Messungen. AC-Nennleistung des E3DC wird separat aus RSCP gelesen; das DC-Limit bleibt davon unabhängig.</div>
+                            </div>
                             <div class="col-12 col-md-6">
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['solcast_calls_per_day'] ?? '') ?>" style="font-size:0.72rem; color:#f59e0b; font-weight:600;">API-Abrufe/Tag Konto 1</label>
                                 <input type="number" min="1" max="500" step="1" name="values[solcast_calls_per_day]" class="form-control form-control-sm config-input"
@@ -11649,7 +11666,7 @@ async function readConfirmedConfigJson(response) {
 	            </div>
 	        </details>
 
-        <?php $rest = array_diff_key($config, array_flip($allGroupKeys));
+        <?php $rest = array_diff_key($config, array_flip(array_merge($allGroupKeys, ['storage_regulation_enabled', 'storage_regulation_changed_ts'])));
         if (!empty($rest)): ?>
         <details class="card config-card config-group-el mb-3" id="group-weitere-parameter" data-search-text="weitere parameter sonstiges unbekannte variablen">
             <summary class="config-header position-relative" style="justify-content: center;">
@@ -15100,8 +15117,12 @@ document.addEventListener('DOMContentLoaded', () => {
     document.querySelectorAll('[data-quick-toggle]').forEach(toggle => {
         toggle.addEventListener('change', async () => {
             const key = toggle.dataset.quickToggle;
-            const status = document.getElementById(key === 'predump_enable' ? 'predumpQuickSaveState' : '');
+            const storageSwitch = key === 'storage_regulation_enabled';
+            const status = document.getElementById(storageSwitch ? 'storageRegulationState' : (key === 'predump_enable' ? 'predumpQuickSaveState' : ''));
             const previous = !toggle.checked;
+            toggle.disabled = true;
+            let uncertain = false;
+            let responseConfirmed = false;
             if (status) {
                 status.className = 'badge rounded-pill bg-info-subtle text-info-emphasis ms-2';
                 status.textContent = 'Speichere...';
@@ -15117,19 +15138,33 @@ document.addEventListener('DOMContentLoaded', () => {
                     body
                 });
                 const data = await readConfirmedConfigJson(response);
-                if (data.success !== true) throw new Error(data.message || 'Fehler beim Speichern');
+                responseConfirmed = true;
+                if (data.success !== true) {
+                    uncertain = data.state_unknown === true;
+                    throw new Error(data.message || 'Fehler beim Speichern');
+                }
+                if (storageSwitch) {
+                    document.getElementById('storageRegulationControl').dataset.requestTs = String(data.request_ts || 0);
+                }
                 if (status) {
-                    status.className = toggle.checked
+                    status.className = storageSwitch ? 'small text-body-secondary mt-2' : toggle.checked
                         ? 'badge rounded-pill bg-success-subtle text-success-emphasis ms-2'
                         : 'badge rounded-pill bg-warning-subtle text-warning-emphasis ms-2';
-                    status.textContent = toggle.checked ? 'Pre-Dump gespeichert: EIN' : 'Pre-Dump gespeichert: AUS';
+                    status.textContent = storageSwitch
+                        ? 'Gespeichert – warte auf Rückmeldung des Speicherreglers …'
+                        : (toggle.checked ? 'Pre-Dump gespeichert: EIN' : 'Pre-Dump gespeichert: AUS');
                 }
             } catch (error) {
-                toggle.checked = previous;
+                if (storageSwitch && !responseConfirmed) uncertain = true;
+                if (!uncertain) toggle.checked = previous;
                 if (status) {
                     status.className = 'badge rounded-pill bg-danger-subtle text-danger-emphasis ms-2';
-                    status.textContent = error.message || 'Speichern fehlgeschlagen';
+                    status.textContent = uncertain
+                        ? 'Speicherzustand unklar. Bitte die Seite neu laden und den Reglerstatus prüfen.'
+                        : (error.message || 'Speichern fehlgeschlagen');
                 }
+            } finally {
+                toggle.disabled = uncertain;
             }
         });
     });

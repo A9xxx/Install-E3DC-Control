@@ -500,6 +500,17 @@ def validate_pv_forecast_topology_config(cfg: Optional[Dict[str, Any]]) -> Dict[
         ),
     )
     e3dc_limit = safe_float(cfg.get("pv_e3dc_dc_inverter_limit_w"), 0.0)
+    meter_mode = cfg.get("pv_external_ac_observation_mode", "unverified")
+    known_meter_modes = ("unverified", "generation_meter", "generation_meter_uncontrolled")
+    result["pv_external_ac_observation_mode"] = _entry(
+        key="pv_external_ac_observation_mode", label="Ist-Messung des Zusatzwechselrichters", unit="",
+        configured=meter_mode, live_value=None, live_key=None,
+        effective=meter_mode if meter_mode in known_meter_modes else "unverified",
+        source="user" if meter_mode in known_meter_modes[1:] else "unverified",
+        severity="info" if meter_mode in known_meter_modes else "warning",
+        message="Die Betreiberangabe gilt ab Erfassung. Begrenzungsstatus und AC-Limit werden separat geprüft."
+                if meter_mode in known_meter_modes[1:] else "Die Messzuordnung ist noch nicht bestätigt; kein neuer Kalibrierfaktor aus diesen Messungen.",
+    )
     result["pv_e3dc_dc_inverter_limit_w"] = _entry(
         key="pv_e3dc_dc_inverter_limit_w",
         label="E3DC-DC-Wechselrichterlimit",

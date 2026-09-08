@@ -2710,6 +2710,20 @@ function loadPvForecastDiagnosticEvidence($currentTopologyRevision, $diagnostics
         if (!is_array($payload)) {
             return $fallback;
         }
+        $projectedDetails = forecastDiagnosticDetailsProjection($payload['diagnostic_details'] ?? null);
+        foreach (($projectedDetails['source_quality'] ?? []) as $source) {
+            if ($source['quality_slots'] > 0) {
+                foreach (['curtailment_exclusion_status', 'inverter_clipping_exclusion_status', 'external_shutdown_exclusion_status'] as $key) {
+                    $observationQuality[$key] = 'partially_filtered';
+                }
+                $observationQuality['scope'] = 'quality_filtered_stage_metrics_only';
+            }
+            if ($source['signal'] === 'pv_external_ac' && $source['eligible_slots'] > 0) {
+                $sourceDiagnostics[1]['status'] = 'diagnostisch';
+                $sourceDiagnostics[1]['observation_source_contract'] = 'operator_bound_e3dc_add_power_15m_v1';
+                $sourceDiagnostics[1]['reason'] = 'quality_filtered_observations';
+            }
+        }
         if (!preg_match('/^sha256:[0-9a-f]{64}$/', $expectedRevision)) {
             $payloadRev = is_string($payload['topology_revision'] ?? null) ? trim($payload['topology_revision']) : '';
             if (preg_match('/^sha256:[0-9a-f]{64}$/', $payloadRev)) {
@@ -2776,9 +2790,9 @@ function loadPvForecastDiagnosticEvidence($currentTopologyRevision, $diagnostics
             || ($payload['probabilistic_evidence']['decision_use_allowed'] ?? null) !== false
             || !is_array($payload['observation_quality'] ?? null)
             || ($payload['observation_quality']['observation_source_contract'] ?? '') !== 'e3dc_db_history_day_15m_v1'
-            || ($payload['observation_quality']['curtailment_exclusion_status'] ?? '') !== 'EVIDENCE_LIMIT'
-            || ($payload['observation_quality']['inverter_clipping_exclusion_status'] ?? '') !== 'EVIDENCE_LIMIT'
-            || ($payload['observation_quality']['external_shutdown_exclusion_status'] ?? '') !== 'EVIDENCE_LIMIT'
+            || ($payload['observation_quality']['curtailment_exclusion_status'] ?? '') !== $observationQuality['curtailment_exclusion_status']
+            || ($payload['observation_quality']['inverter_clipping_exclusion_status'] ?? '') !== $observationQuality['inverter_clipping_exclusion_status']
+            || ($payload['observation_quality']['external_shutdown_exclusion_status'] ?? '') !== $observationQuality['external_shutdown_exclusion_status']
             || ($payload['observation_quality']['availability_forecast_claim_allowed'] ?? null) !== false
             || ($payload['observation_quality']['decision_use_allowed'] ?? null) !== false
         ) {
@@ -3009,7 +3023,7 @@ function loadPvForecastDiagnosticEvidence($currentTopologyRevision, $diagnostics
             'probabilistic_evidence' => $probabilisticEvidence,
             'observation_quality' => $observationQuality,
             'source_diagnostics' => $sourceDiagnostics,
-            'diagnostic_details' => forecastDiagnosticDetailsProjection($payload['diagnostic_details'] ?? null),
+            'diagnostic_details' => $projectedDetails,
             'metrics' => $metrics,
             'labels' => $metricLabels,
         ]);
@@ -3055,13 +3069,32 @@ function forecastDiagnosticDetailsProjection($raw) {
     $signals = ['pv_e3dc_dc', 'pv_external_ac'];
     $stages = ['provider_m1_raw', 'provider_m2_raw', 'provider_m3_raw',
         'ensemble_before_bias', 'bias_corrected_before_caps', 'displayed_postprocessed'];
-    foreach (array_slice(is_array($raw['stage_metrics'] ?? null) ? $raw['stage_metrics'] : [], 0, 12) as $item) {
+    foreach (['stage_metrics', 'quality_filtered_stage_metrics'] as $collection) {
+      $result[$collection] = [];
+      foreach (array_slice(is_array($raw[$collection] ?? null) ? $raw[$collection] : [], 0, 12) as $item) {
         if (!is_array($item) || !in_array($item['signal'] ?? null, $signals, true)
             || !in_array($item['stage'] ?? null, $stages, true)) continue;
-        $result['stage_metrics'][] = array_merge($metrics($item), [
+        $result[$collection][] = array_merge($metrics($item), [
             'signal' => $item['signal'], 'stage' => $item['stage'],
             'compared_slots' => (int)($number($item['compared_slots'] ?? null) ?? 0),
         ]);
+      }
+    }
+    $result['source_quality'] = [];
+    $states = ['unrestricted', 'protection_absorbing', 'curtailed', 'clipping_suspected', 'shutdown', 'unknown', 'measurement_invalid'];
+    foreach (array_slice(is_array($raw['source_quality'] ?? null) ? $raw['source_quality'] : [], 0, 2) as $item) {
+        if (!is_array($item) || !in_array($item['signal'] ?? null, $signals, true)) continue;
+        $source = ['signal' => $item['signal'], 'ac_limit_w' => $number($item['ac_limit_w'] ?? null), 'state_seconds' => []];
+        foreach (['observed_slots', 'quality_slots', 'meter_confirmed_slots', 'eligible_slots', 'excluded_slots'] as $key) {
+            $source[$key] = (int)($number($item[$key] ?? null) ?? 0);
+        }
+        foreach ($states as $key) $source['state_seconds'][$key] = $number($item['state_seconds'][$key] ?? null) ?? 0;
+        $fit = is_array($item['calibration'] ?? null) ? $item['calibration'] : [];
+        $source['calibration'] = ['status' => in_array($fit['status'] ?? null, ['collecting', 'validated', 'not_improved'], true) ? $fit['status'] : 'collecting', 'decision_use_allowed' => false];
+        foreach (['factor', 'compared_slots', 'compared_days', 'training_slots', 'validation_slots', 'validation_raw_mae_wh', 'validation_corrected_mae_wh'] as $key) {
+            $source['calibration'][$key] = $number($fit[$key] ?? null);
+        }
+        $result['source_quality'][] = $source;
     }
     $daily = is_array($raw['frozen_daily'] ?? null) ? $raw['frozen_daily'] : [];
     $result['frozen_daily'] = array_merge($metrics($daily), [
@@ -3078,6 +3111,9 @@ function forecastDiagnosticDetailsProjection($raw) {
     ];
     foreach (['observed_slots', 'complete_slots', 'incomplete_slots', 'covered_seconds', 'curtailment_observed_slots'] as $key) {
         $result['external_observation'][$key] = $number($external[$key] ?? null);
+    }
+    foreach ($result['source_quality'] as $source) {
+        if ($source['signal'] === 'pv_external_ac') $result['external_observation']['quality_filtered_comparison_allowed'] = $source['eligible_slots'] > 0;
     }
     return $result;
 }

@@ -6,6 +6,27 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.5e] – 2026-09-08
+
+
+
+- Neuer Schalter **Speicherregelung aktiv** oben in der Konfiguration. Die Speicherregelung gibt beim Ausschalten ihre Begrenzungen einmalig mit Bestätigungsprüfung frei. Datenerfassung, Anzeige und Prognose laufen weiter.
+- Ein bereits ausgeschalteter Speicherregler startet ohne Hardwarebefehle. Manuelle Batterieaktionen sind gesperrt; beim Wiedereinschalten wird der aktuelle Gerätezustand neu geprüft.
+
+### Zweiter S10 und ruhige Ladepause
+
+- Eine ausdrücklich geplante Ladepause vor Kurvenbeginn bleibt erhalten, wenn ein nachgelagerter Verbraucher den PV-Überschuss nutzt. Ein kleiner werdendes Restangebot allein gibt die Batterie nicht mehr zur autonomen Ladung frei. Bestehende Schutzpfade und die Freigabe heutiger Rest-PV vor einer erst morgen beginnenden Kurve behalten ihren Vorrang.
+- Optionales, anonymes Beispiel im Ordner **E3DC-Slave**: eigenständiger Testregler mit 100-W-Entladestart, Rückleseprüfung, Hysterese und optionaler Nachtverteilung. Beobachtung ist die Vorgabe; aktive Befehle benötigen `--execute`. Das Beispiel wird nicht automatisch installiert.
+
+### Preise, PV-Diagnose und Bedienung
+
+- **Energy-Charts** ergänzt die Ersatzquellen für fehlende Börsenpreise in der Direktvermarktung. Vorhandene Preis- und Wirtschaftlichkeitsprüfungen bleiben maßgeblich.
+- Die PV-Diagnose kann einen getrennten Generatorzähler des Zusatzwechselrichters berücksichtigen. Neue Messfenster werden nach Messqualität, Abregelhinweisen und möglicher AC-Begrenzung eingeordnet. Geprüfte Korrekturfaktoren erscheinen zunächst nur diagnostisch; eine automatische Ladekurvenkorrektur ist noch nicht enthalten.
+- Die Installationszentrale steht oben neben System Update. Ihr Rückweg zur Konfiguration bleibt beim Scrollen sichtbar. Desktop und Mobilansicht verwenden dieselbe Navigation.
+- Die Regelruhe-Anzeige trennt einen unauffälligen Befund von eingeschränkter Beurteilbarkeit. Nachweisgrenzen stehen als Fußnote; belegte Warnungen bleiben sichtbar.
+- Das Wallbox-Startprotokoll unterscheidet konfigurierte Wallboxen von einer tatsächlich bestätigten Verbindung.
+
+
 ## [5.4.5d] – 2026-09-08
 
 ### 🐳 Docker-Datenrechte und Containerstart

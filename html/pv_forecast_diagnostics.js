@@ -102,6 +102,9 @@
             ? diagnostic.observation_quality
             : {};
         const contractElement = document.getElementById('pv-forecast-diagnostic-contract');
+        const qualitySources = Array.isArray(diagnostic.diagnostic_details?.source_quality)
+            ? diagnostic.diagnostic_details.source_quality : [];
+        const externalQuality = qualitySources.find(item => item.signal === 'pv_external_ac');
         if (contractElement) {
             const isPointForecast = valueContract.distribution_type === 'deterministic_point';
             const p50Proven = valueContract.p50_claim === 'proven';
@@ -111,10 +114,16 @@
                 isPointForecast ? 'Punktprognose' : 'Prognosevertrag nicht belegt',
                 p50Proven ? 'P50 bestätigt' : 'kein belegtes P50'
             ];
-            if (externalAcMissing) {
+            if (externalQuality && Number(externalQuality.meter_confirmed_slots) > 0) {
+                parts.push(externalQuality.calibration?.status === 'validated'
+                    ? 'Zusatz-WR: Korrekturfaktor auf späteren Tagen geprüft'
+                    : 'Zusatz-WR: Erzeugungszähler bestätigt, Kalibrierung sammelt Daten');
+            } else if (externalAcMissing) {
                 parts.push('Zusatz-WR ohne getrennte Ist-Kalibrierung');
             }
-            if (
+            if (qualitySources.some(item => Number(item.quality_slots) > 0)) {
+                parts.push('Begrenzungsfilter für neue Kalibrierfenster aktiv');
+            } else if (
                 observationQuality.curtailment_exclusion_status === 'EVIDENCE_LIMIT'
                 || observationQuality.inverter_clipping_exclusion_status === 'EVIDENCE_LIMIT'
             ) {
@@ -199,8 +208,23 @@
                 const daily = details.frozen_daily || {};
                 lines.push(`Eingefrorene Tagesprognose: ${fmt(daily.compared_days, 0)} vollständig verglichene UTC-Tage aus ${fmt(daily.forecast_days, 0)} Ausgaben mit 96 Fenstern; MAE ${fmt(daily.mae_wh)} Wh/Tag, Richtungsversatz ${fmt(daily.bias_wh)} Wh/Tag. Je Tag genau eine vollständige, vor Tagesbeginn erzeugte und archivierte Ausgabe.`);
                 const external = details.external_observation || {};
-                lines.push(`Zusatz-WR-Messung: ${fmt(external.complete_slots, 0)} vollständige und ${fmt(external.incomplete_slots, 0)} lückenhafte Viertelstunden. Zeitgewichtete vorhandene Live-Messwerte; keine unabhängig belegte Bruttomessung. Clipping und Abschaltung bleiben unbekannt.`);
+                lines.push(`Zusatz-WR-Messung: ${fmt(external.complete_slots, 0)} vollständige und ${fmt(external.incomplete_slots, 0)} lückenhafte Viertelstunden. ` + (qualitySources.length
+                    ? 'Die Erzeugungszuordnung beruht auf der Betreiberbestätigung in der Config und gilt ab Erfassung.'
+                    : 'Zeitgewichtete vorhandene Live-Messwerte; keine unabhängig belegte Bruttomessung. Clipping und Abschaltung bleiben unbekannt.'));
+                for (const source of qualitySources) {
+                    const fit = source.calibration || {};
+                    const states = source.state_seconds || {};
+                    const label = source.signal === 'pv_e3dc_dc' ? 'E3DC-DC' : 'Zusatz-WR';
+                    lines.push(`${label}: ${fmt(source.eligible_slots, 0)} für Kalibrierung geeignete Viertelstunden; ${fmt(source.excluded_slots, 0)} ausgeschlossen oder unbekannt. AC-Grenze ${fmt(source.ac_limit_w, 0)} W. Abgeregelt ${fmt(Number(states.curtailed || 0) / 60)} min, Clipping-Verdacht ${fmt(Number(states.clipping_suspected || 0) / 60)} min, abgeschaltet ${fmt(Number(states.shutdown || 0) / 60)} min, Zustand unbekannt ${fmt(Number(states.unknown || 0) / 60)} min.`);
+                    const fitting = fit.status === 'validated' ? `Korrekturfaktor ${fmt(fit.factor, 3)} auf späteren Tagen geprüft`
+                        : fit.status === 'not_improved' ? 'Korrektur verbessert die späteren Prüftage nicht ausreichend'
+                            : 'Kalibrierung sammelt unabhängige Tage';
+                    lines.push(`${label}: ${fitting}; ${fmt(fit.compared_days, 0)} Tage, ${fmt(fit.training_slots, 0)} Lernfenster und ${fmt(fit.validation_slots, 0)} spätere Prüffenster. Prüf-MAE roh ${fmt(fit.validation_raw_mae_wh)} Wh, korrigiert ${fmt(fit.validation_corrected_mae_wh)} Wh.`);
+                }
+                if (qualitySources.length) lines.push('Die neue Kalibrierung ist diagnostisch: Faktoren werden noch nicht automatisch auf die Ladekurve angewandt. Abregelung, Clipping-Verdacht, Abschaltung und unbekannte Zustände werden nur im gesonderten Kalibriervergleich ausgeschlossen; Gesamtkennzahlen enthalten sie weiterhin. Der Abregelschutz bleibt aktiv. Ohne Vergleichsanlage ist vermiedene Abregelung eine Abschätzung; eine P50-Aussage erfordert eine eigene statistische Prüfung.');
                 const names = { provider_m1_raw: 'Forecast.Solar roh', provider_m2_raw: 'Open-Meteo roh', provider_m3_raw: 'Solcast roh', ensemble_before_bias: 'Ensemble vor Bias', bias_corrected_before_caps: 'Nach Bias, vor Limits', displayed_postprocessed: 'Endprognose' };
+                const filteredStages = (details.quality_filtered_stage_metrics || []).filter(item => Number(item.compared_slots) > 0);
+                if (filteredStages.length) lines.push('Begrenzungsgefilterter Vergleich: ' + filteredStages.map(item => `${item.signal === 'pv_e3dc_dc' ? 'E3DC-DC' : 'Zusatz-WR'} ${names[item.stage] || ''}: ${fmt(item.compared_slots, 0)} Fenster, MAE ${fmt(item.mae_wh)} Wh`).join(' · ') + '.');
                 const stages = (details.stage_metrics || []).filter(item => Number(item.compared_slots) > 0);
                 if (stages.length) {
                     lines.push('Prognosestufen, jeweils eigene Ertragsfenster: ' + stages.map(item => `${item.signal === 'pv_e3dc_dc' ? 'E3DC-DC' : 'Zusatz-WR'} ${names[item.stage] || ''}: ${fmt(item.compared_slots, 0)} Fenster, MAE ${fmt(item.mae_wh)} Wh, Bias ${fmt(item.bias_wh)} Wh`).join(' · ') + '. Unterschiede bei den Fallzahlen erlauben keinen direkten Modellvergleich.');

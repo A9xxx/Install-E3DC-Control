@@ -33,10 +33,10 @@ function validateInstallCenterCsrf() {
 function installCenterDashboardReturnUrl() {
     $requested = strtolower(trim((string)($_GET['return'] ?? $_GET['from'] ?? '')));
     if (in_array($requested, ['mobile', 'mobile.php'], true)) {
-        return 'mobile.php';
+        return 'mobile.php?seite=config';
     }
     if (in_array($requested, ['desktop', 'dashboard', 'index', 'index.php'], true)) {
-        return 'index.php';
+        return 'index.php?seite=config';
     }
 
     $referer = $_SERVER['HTTP_REFERER'] ?? '';
@@ -48,15 +48,15 @@ function installCenterDashboardReturnUrl() {
         if ($refHost === '' || $currentHost === '' || $refHost === $currentHost) {
             $entry = strtolower(basename((string)($parts['path'] ?? '')));
             if ($entry === 'mobile.php') {
-                return 'mobile.php';
+                return 'mobile.php?seite=config';
             }
             if ($entry === 'index.php') {
-                return 'index.php';
+                return 'index.php?seite=config';
             }
         }
     }
 
-    return 'index.php';
+    return 'index.php?seite=config';
 }
 
 function runInstallerAction($action, $module = null) {
@@ -3740,7 +3740,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_runtime_permissions_rep
         body { background: var(--bg); color: #e9ecef; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
         .page-shell { max-width: 1520px; margin: 0 auto; padding: 26px 18px 40px; }
         .topbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 20px; }
-        .back-btn { border: 1px solid #3a4148; color: #ced4da; text-decoration: none; padding: 7px 12px; border-radius: 6px; }
+        .return-nav { position: sticky; top: 0; z-index: 100; padding: 12px 0; margin-bottom: 8px; background: var(--bg); border-bottom: 1px solid var(--line); }
+        .back-btn { display: inline-flex; align-items: center; border: 1px solid #3a4148; color: #ced4da; text-decoration: none; padding: 7px 12px; border-radius: 6px; }
         .back-btn:hover { border-color: var(--cyan); color: #fff; }
         .security-note { border: 1px solid rgba(0,217,255,.35); background: rgba(0,217,255,.08); border-radius: 8px; padding: 12px 14px; }
         .module-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 14px; }
@@ -3860,9 +3861,11 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_runtime_permissions_rep
 </head>
 <body>
 <main class="page-shell">
+    <nav class="return-nav" aria-label="Zurück zur Konfiguration">
+            <a class="back-btn" href="<?= htmlspecialchars(installCenterDashboardReturnUrl(), ENT_QUOTES, 'UTF-8') ?>"><i class="fas fa-arrow-left me-1"></i> Zurück zur Konfiguration</a>
+    </nav>
     <div class="topbar">
         <div>
-            <a class="back-btn" href="<?= htmlspecialchars(installCenterDashboardReturnUrl(), ENT_QUOTES, 'UTF-8') ?>"><i class="fas fa-arrow-left me-1"></i> Zurück zum Dashboard</a>
             <h1 class="mt-3 mb-1 fw-bold"><i class="fas fa-screwdriver-wrench text-info me-2"></i>Installationszentrale</h1>
             <div class="text-secondary">Module installieren, Dienste prüfen und optionale Verbraucher sauber aktivieren oder deaktivieren.</div>
         </div>
@@ -4789,17 +4792,18 @@ function renderRawDetails(data) {
 
 function ruleCalmStatusBadge(status) {
     const normalized = String(status || 'UNKNOWN').toUpperCase();
-    if (normalized === 'PASS') return '<span class="badge text-bg-success">ruhig</span>';
+    if (normalized === 'OBSERVED_CLEAR' || normalized === 'PASS') return '<span class="badge text-bg-success">Keine Auffälligkeit erkannt*</span>';
+    if (normalized === 'EVIDENCE_LIMIT' || normalized === 'UNKNOWN') return '<span class="badge text-bg-secondary">Nicht beurteilbar*</span>';
     if (normalized === 'FAIL') return '<span class="badge text-bg-warning">auffällig</span>';
     return `<span class="badge text-bg-secondary">${esc(normalized || 'unbekannt')}</span>`;
 }
 
 function ruleCalmDataQualityBadge(status) {
     const normalized = String(status || 'NOT_ANALYZED').toUpperCase();
-    if (normalized === 'PASS') return '<span class="badge text-bg-success">unauffällig</span>';
+    if (normalized === 'OBSERVED_CLEAR' || normalized === 'PASS') return '<span class="badge text-bg-success">Keine Auffälligkeit erkannt*</span>';
     if (normalized === 'HINT') return '<span class="badge text-bg-info">Hinweis</span>';
     if (normalized === 'FAIL') return '<span class="badge text-bg-warning">auffällig</span>';
-    if (normalized === 'EVIDENCE_LIMIT') return '<span class="badge text-bg-secondary">EVIDENCE_LIMIT</span>';
+    if (normalized === 'EVIDENCE_LIMIT') return '<span class="badge text-bg-secondary">Nicht beurteilbar*</span>';
     return '<span class="badge text-bg-secondary">nicht ausgewertet</span>';
 }
 
@@ -4934,9 +4938,9 @@ function renderRuleCalmTimeline(data) {
     return `<div class="text-secondary small mt-1">Die Zeitachse zeigt echte Wechsel und Schutzereignisse, nicht jeden Record.</div><div class="rule-calm-timeline">${rows}</div>`;
 }
 
-function renderRuleCalmViolations(violations, emptyText = 'Keine auffälligen Muster erkannt.') {
+function renderRuleCalmViolations(violations, emptyText = 'Keine auffälligen Muster erkannt.', assessed = true) {
     if (!violations.length) {
-        return `<div class="result-tile"><span class="ok">${esc(emptyText)}</span></div>`;
+        return `<div class="result-tile"><span class="${assessed ? 'ok' : 'text-secondary'}">${esc(emptyText)}</span></div>`;
     }
     const rows = violations.map(item => {
         const samples = Array.isArray(item.events)
@@ -5005,6 +5009,16 @@ function renderRuleCalmAnalysis(data) {
     const evidenceLimit = partial || legacy || typedEvidenceLimit;
     const missingServices = Array.isArray(data.missing_services) ? data.missing_services : [];
     const analyzedServices = Array.isArray(data.analyzed_services) ? data.analyzed_services : [];
+    // Befund und Nachweisabdeckung bleiben getrennt; Backend-Status unveraendert.
+    const controlChecks = Object.entries(checks).filter(([name]) => name !== 'storage_live_plausibility');
+    const controlFinding = controlStatus === 'FAIL' || violations.length > 0 || controlChecks.some(([, check]) => check?.ok === false);
+    const qualityCheck = checks.storage_live_plausibility;
+    const qualityFinding = dataQualityStatus === 'FAIL' || qualityCheck?.ok === false;
+    const hasControlData = !legacy && analyzedServices.some(service => Number(records[service] || 0) > 0) && controlChecks.length > 0;
+    const hasQualityData = !legacy && Number(records.storage || 0) > 0 && qualityCheck && typeof qualityCheck === 'object';
+    const controlDisplay = controlFinding ? 'FAIL' : hasControlData && ['PASS', 'EVIDENCE_LIMIT'].includes(controlStatus) ? 'OBSERVED_CLEAR' : 'UNKNOWN';
+    const qualityDisplay = qualityFinding ? 'FAIL' : dataQualityStatus === 'HINT' || dataQualityFindings.length > 0 || qualityCheck?.hints?.length > 0 ? 'HINT' : hasQualityData && ['PASS', 'EVIDENCE_LIMIT'].includes(dataQualityStatus) ? 'OBSERVED_CLEAR' : dataQualityStatus === 'NOT_ANALYZED' ? 'NOT_ANALYZED' : 'EVIDENCE_LIMIT';
+    const findingClass = controlFinding || qualityFinding ? 'warn' : controlDisplay === 'OBSERVED_CLEAR' ? 'ok' : 'text-secondary';
     const recordRange = ruleCalmRecordRange(data);
     const scopeDetail = ruleCalmScopeDetail(data);
     const renderCheckRow = ([name, check]) => {
@@ -5023,25 +5037,19 @@ function renderRuleCalmAnalysis(data) {
         ? renderCheckRow(['storage_live_plausibility', checks.storage_live_plausibility])
         : '<li>Keine Speicher-Datenqualität ausgewertet.</li>';
     const historical = data.scope === 'latest';
-    const laneMeaning = controlStatus === 'FAIL'
+    const laneMeaning = controlFinding
         ? 'Im Entscheidungs-/Ausgangspfad wurde ein belegtes Ping-Pong, Veto oder ein Pfadkonflikt erkannt.'
-        : controlStatus === 'EVIDENCE_LIMIT'
-        ? 'Fehlende, beschädigte oder zusammengefasste Nachweise begrenzen die Aussage über den gewählten Zeitraum.'
-        : 'In den auswertbaren Entscheidungs- und Ausgangsbeobachtungen wurde kein Ping-Pong erkannt.';
-    const dataQualityMeaning = dataQualityStatus === 'FAIL'
+        : controlDisplay === 'OBSERVED_CLEAR'
+        ? 'In den ausgewerteten Entscheidungs- und Ausgangsbeobachtungen wurde keine Regelauffälligkeit erkannt.'
+        : 'Für eine Beurteilung der Regelruhe liegen keine ausreichend auswertbaren Daten vor.';
+    const dataQualityMeaning = qualityFinding
         ? 'Wiederholte oder anhaltende Messwertschutz-Guards machen die Datenqualität auffällig.'
-        : dataQualityStatus === 'HINT'
-        ? 'Ein einzelner oder kurzer Messwertschutz-Guard ist als Datenqualitätshinweis eingeordnet.'
-        : dataQualityStatus === 'PASS'
-        ? 'Im ausgewerteten Speicherverlauf liegt kein Messwertqualitätsbefund vor.'
-        : dataQualityStatus === 'EVIDENCE_LIMIT'
-        ? 'Live-Nachweise oder die vollständige zeitliche Messwertfolge sind nicht durchgehend verfügbar.'
-        : 'Die Speicher-Datenqualität wurde nicht separat ausgewertet.';
-    const meaning = legacy
-        ? 'Diese gespeicherte Auswertung stammt aus dem alten Public-v2-Vertrag. Ihr damaliger PASS-/FAIL-Status enthält keine belastbare Domänen-Vollständigkeit und wird deshalb nur als EVIDENCE_LIMIT angezeigt.'
-        : partial
-        ? `Die Auswertung ist unvollständig: ${missingServices.map(ruleCalmServiceLabel).join(', ')} hatte keine auswertbaren Records. Die getrennten Befunde gelten nur für ${analyzedServices.map(ruleCalmServiceLabel).join(', ')}. ${laneMeaning} ${dataQualityMeaning}`
-        : `${historical ? 'Historischer Befund: ' : ''}${laneMeaning} ${dataQualityMeaning}${historical ? ' Das ist kein Beleg für einen Fehler des aktuellen Prozesses.' : ''}`;
+        : qualityDisplay === 'HINT'
+        ? 'Einzelne oder kurze Messwertschutz-Ereignisse sind als Datenqualitätshinweis eingeordnet.'
+        : qualityDisplay === 'OBSERVED_CLEAR'
+        ? 'Im ausgewerteten Speicherverlauf wurde kein Messwertqualitätsbefund erkannt.'
+        : 'Die Datenqualität ist anhand der vorliegenden Daten nicht beurteilbar.';
+    const meaning = `${historical ? 'Historischer Befund: ' : ''}${laneMeaning} ${dataQualityMeaning}${historical ? ' Der Befund gilt für den ausgewerteten Zeitraum.' : ''}`;
     const effectiveGaps = data.effective_min_gap_s || {};
     const ownerGap = Math.max(
         Number(effectiveGaps.storage_contract_owner || 0),
@@ -5051,7 +5059,7 @@ function renderRuleCalmAnalysis(data) {
     const gapText = `Musterabstand ${data.min_gap_s || 180}s${ownerGap > Number(data.min_gap_s || 180) ? ` · Contract/Owner/State ${ownerGap}s` : ''}`;
     const title = historical ? 'Historische Regelruhe-Diagnose' : 'Aktuelle Regelruhe-Diagnose';
     return `
-        <div class="result-title"><i class="fas fa-wave-square ${controlStatus === 'PASS' ? 'ok' : 'warn'}"></i>${esc(title)} <span>Regelruhe ${ruleCalmStatusBadge(controlStatus)}</span> <span>Datenqualität ${ruleCalmDataQualityBadge(dataQualityStatus)}</span>${legacy ? ' <span class="badge text-bg-warning">LEGACY / EVIDENCE_LIMIT</span>' : (partial ? ' <span class="badge text-bg-warning">TEILWEISE / EVIDENCE_LIMIT</span>' : '')}${historical ? ' <span class="badge text-bg-secondary">historisch</span>' : ''}</div>
+        <div class="result-title"><i class="fas fa-wave-square ${findingClass}"></i>${esc(title)} <span>Regelruhe ${ruleCalmStatusBadge(controlDisplay)}</span> <span>Datenqualität ${ruleCalmDataQualityBadge(qualityDisplay)}</span>${historical ? ' <span class="badge text-bg-secondary">historisch</span>' : ''}</div>
         <div class="text-secondary small">${esc(data.source_label || 'Entscheidungsverlauf')} · ${scopeDetail ? esc(scopeDetail) + ' · ' : ''}Geprüfte Records ${esc(recordRange)} · ${esc(gapText)}</div>
         <div class="result-grid">
             <div class="result-tile"><strong>Speicher</strong>${esc(records.storage ?? 0)} Entscheidungsdatensätze<div class="text-secondary mt-1">${esc(events.storage_contract_owner ?? 0)} Contract-Zustände · ${esc(events.storage_owner ?? 0)} Owner-Zustände · ${esc(events.storage_state ?? 0)} Entscheidungszustände</div><div class="text-secondary mt-1">${esc(events.storage_value_update ?? 0)} Sollwertupdates bei gleichem Zustand · ${esc(events.storage_live_plausibility ?? 0)} Messwertschutzfälle</div></div>
@@ -5061,18 +5069,24 @@ function renderRuleCalmAnalysis(data) {
             <div class="result-tile"><strong>EMS</strong>${esc(records.ems ?? 0)} Records<div class="text-secondary mt-1">${esc(events.ems_decision ?? 0)} kanonische Entscheidungen</div></div>
             <div class="result-tile"><strong>Prüfzeitraum</strong>${esc(recordRange)}<div class="text-secondary mt-1">aus den geprüften Records</div></div>
             <div class="result-tile"><strong>Prozessgrenze</strong>${historical ? 'prozessübergreifende Historie' : esc((data.scope_context || {}).cutoff_time || 'nicht ermittelbar')}<div class="text-secondary mt-1">${historical ? 'kein Beleg für den aktuellen Prozess' : 'ältere Records ausgeschlossen'}</div></div>
-            <div class="result-tile"><strong>Regelruhe</strong>${ruleCalmStatusBadge(controlStatus)}<div class="text-secondary mt-1">${violations.length ? `${esc(violations.length)} belegte Regelmuster` : 'kein belegtes Execution-/Ausgangs-Ping-Pong'}</div></div>
-            <div class="result-tile"><strong>Datenqualität</strong>${ruleCalmDataQualityBadge(dataQualityStatus)}<div class="text-secondary mt-1">${dataQualityFindings.length ? `${esc(dataQualityFindings.length)} Befund` : 'kein separater Befund'}</div></div>
+            <div class="result-tile"><strong>Regelruhe</strong>${ruleCalmStatusBadge(controlDisplay)}<div class="text-secondary mt-1">${violations.length ? `${esc(violations.length)} belegte Regelmuster` : 'kein belegtes Execution-/Ausgangs-Ping-Pong'}</div></div>
+            <div class="result-tile"><strong>Datenqualität</strong>${ruleCalmDataQualityBadge(qualityDisplay)}<div class="text-secondary mt-1">${dataQualityFindings.length ? `${esc(dataQualityFindings.length)} Befund` : 'kein separater Befund'}</div></div>
         </div>
         <div class="result-tile mt-2"><strong>Einordnung</strong>${esc(meaning)}<div class="text-secondary mt-1">${esc(data.privacy_note || 'Read-only Diagnose ohne Hardwarezugriff.')}</div></div>
-        ${evidenceLimit ? `<div class="result-tile warn mt-2"><strong>EVIDENCE_LIMIT</strong>${legacy ? 'Historischer Public-Vertrag ohne Evidenz-Lanes' : (partial ? `Ohne auswertbare Entscheidungen: ${esc(missingServices.map(ruleCalmServiceLabel).join(', '))}` : 'Die Nachweisgrenzen sind nach Bereich und Ursache aufgeschlüsselt.')}<div class="text-secondary mt-1">Diese Auswertung erlaubt keine vollständige Grün-Aussage; echte Veto-/Pfadkonflikte und belegte Ausgangswechsel bleiben davon unabhängig sichtbar.</div></div>` : ''}
-        ${renderRuleCalmEvidence(data.history_coverage)}
         <div class="text-secondary small mt-2">Sollwertupdates und Messwertschutz zählen keine Leistungsänderungen. Eine bestätigte Ausgabetransaktion kann mehrere Protokollbefehle enthalten; ein beibehaltener Readback ist kein neuer Schreibbefehl.</div>
         <div class="mt-2"><strong>Regelpfade und Ausgänge</strong><ul class="result-list">${checkRows || '<li>Keine Prüfbereiche gefunden.</li>'}</ul></div>
         <div class="mt-2"><strong>Datenqualität</strong><ul class="result-list">${dataQualityCheckRow}</ul></div>
-        <div class="mt-2"><strong>Datenqualitätsbefunde</strong>${renderRuleCalmViolations(dataQualityFindings, 'Kein Messwertqualitätsbefund erkannt.')}</div>
-        <div class="mt-2"><strong>Regelauffälligkeiten mit Zeitpunkt</strong>${renderRuleCalmViolations(violations, 'Keine belegten Regelmuster erkannt.')}</div>
+        <div class="mt-2"><strong>Datenqualitätsbefunde</strong>${renderRuleCalmViolations(dataQualityFindings, qualityFinding ? 'Datenqualität auffällig; keine Einzelbefunde mit Zeitpunkt vorhanden.' : hasQualityData ? 'Kein Messwertqualitätsbefund erkannt.' : 'Keine auswertbaren Messwertprüfungen vorhanden.', hasQualityData && !qualityFinding)}</div>
+        <div class="mt-2"><strong>Regelauffälligkeiten mit Zeitpunkt</strong>${renderRuleCalmViolations(violations, controlFinding ? 'Regelauffälligkeit gemeldet; keine Einzelbefunde mit Zeitpunkt vorhanden.' : hasControlData ? 'Keine belegten Regelmuster erkannt.' : 'Keine auswertbaren Regelprüfungen vorhanden.', hasControlData && !controlFinding)}</div>
         <div class="mt-2"><strong>Zeitachse</strong>${renderRuleCalmTimeline(data)}</div>
+        <footer class="text-secondary small mt-3 border-top pt-2" aria-label="Aussagegrenzen der Diagnose">
+            * „Keine Auffälligkeit erkannt“ gilt ausschließlich für die ausgewerteten Daten und Prüfbereiche. Auch ein grüner Befund schließt Probleme außerhalb dieser Beobachtungen nicht aus; Datenlücken, zusammengefasste Verläufe und nicht erfasste Vorgänge können unentdeckt bleiben.
+            ${evidenceLimit ? `<div class="mt-1">Die Datenabdeckung ist begrenzt.${legacy ? ' Die gespeicherte Auswertung stammt aus einem älteren Diagnoseformat.' : ''}${partial ? ` Nicht auswertbar: ${esc(missingServices.map(ruleCalmServiceLabel).join(', '))}.` : ''}</div>` : ''}
+            <details class="mt-2"><summary>Datenabdeckung und technische Details</summary>
+                <div class="mt-1">Technischer Status: Regelruhe ${esc(controlStatus)} · Datenqualität ${esc(dataQualityStatus)}</div>
+                ${renderRuleCalmEvidence(data.history_coverage)}
+            </details>
+        </footer>
         <details class="mt-2">
             <summary class="text-secondary small">Forum-Zusammenfassung anzeigen</summary>
             <div id="ruleCalmForumText" class="raw-json">${esc(data.forum_summary || '')}</div>

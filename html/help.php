@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.5e Stable</span>
+            <span class="badge bg-success text-light">v5.4.5f Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.5e</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.5f</code> in <code>.env</code> gesetzt.</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
 if [ -f ./docker_compose_update.py ]; then
   E3DC_DOCKER_HELPER=./docker_compose_update.py
@@ -214,6 +214,16 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                     </ol>
                 </div>
             </div>
+        </div>
+
+        <h4 class="mb-4 text-accent">Stable 5.4.5f: Speicherführung, Verbindungen und Diagramme</h4>
+        <div class="col-12 faq-item" data-tags="5.4.5f stable speicher direktvermarktung rscp docker diagramme kapazität">
+            <div class="card bg-card border-0 shadow-sm"><div class="card-body">
+                <h5 class="card-title">Was verbessert Wartungsrelease 5.4.5f?</h5>
+                <p>Die Direktvermarktung berücksichtigt günstige PV-Ladestunden innerhalb der bestehenden Sicherheitsladekurve. Ein vollständiger Ladeaufschub ist nicht enthalten. Lade- und Entladegrenzen bleiben unabhängig; schwankende Rest-PV löst vor einer erst morgen beginnenden Kurve keine wechselnden Ladepausen mehr aus.</p>
+                <p>RSCP-Antworten werden vollständig empfangen und angekündigte Prüfsummen geprüft. Native Wallboxen übernehmen neue Zugangsdaten beim Dienstneustart. Das eigenständige Slave-Skript hält seine Verbindung offen und prüft vor einem Wiederanlauf frische Daten und Gerätegrenzen.</p>
+                <p>Docker-Konfigurationen erhalten beim Start und bei der Migration die nötigen Dateirechte. Bitte auch den Host-Updatehelfer aktualisieren. Vitals trennt Kapazitätsquellen, die PV-Diagnose zeigt ihren aktuellen Sammelstand, und Diagramme behalten passende Zeitachsen bei Ansichtswechseln. Nach dem Update das Dashboard neu laden.</p>
+            </div></div>
         </div>
 
         <h4 class="mb-4 text-accent">Stable 5.4.5e: Speicher-Aus, Slave-Beispiel und PV-Diagnose</h4>
@@ -1249,20 +1259,20 @@ WB1 hat Ladevorgang physisch abgebrochen (Versuch 1/3)!</pre>
                 <div class="faq-question">
                     <div>
                         <span class="tag">Batterie</span>
-                        Im Konfigurations-Editor steht "32.7 kWh (Brutto)" aber Vitals zeigt nur 17.7 kWh &mdash; was stimmt?
+                        Warum unterscheiden sich konfigurierte Kapazität und Batterie-Vitals?
                     </div>
                     <i class="fas fa-chevron-down"></i>
                 </div>
                 <div class="faq-answer">
                     <p>Der Konfigurations-Editor liest aus den Live-Daten getrennte Schrankwerte und daraus gebildete Systemwerte:</p>
                     <ul>
-                        <li><strong><code>bat_total_full_cap_kwh</code> (Brutto/System):</strong> Die aufsummierte Nennkapazit&auml;t aller erkannten Batterieschr&auml;nke laut E3DC/BMS.</li>
+                        <li><strong><code>bat_total_full_cap_kwh</code> (BMS/System):</strong> Die aufsummierten BMS-Kapazitätswerte aller erkannten Batterieschränke. Diese Umrechnung ist kein Nachweis der installierten Bruttokapazität.</li>
                         <li><strong><code>bat_total_usable_kwh</code> (Nutzbar/System):</strong> Die aufsummierte nutzbare Kapazit&auml;t aller erkannten Batterieschr&auml;nke. <strong>Er ist der relevante RSCP-Live-Wert f&uuml;r Plausibilit&auml;t und Fallbacks.</strong></li>
                         <li><strong><code>bat_usable_kwh</code>, <code>bat1_usable_kwh</code> ...:</strong> Einzelne Schrankwerte. Bei Speichererweiterungen darf <code>bat_usable_kwh</code> nicht als Gesamtsystem gelesen werden.</li>
                     </ul>
                     <p>Ab <strong>v5.1.x</strong> zeigt der Konfigurations-Editor bevorzugt <code>bat_total_usable_kwh</code> als prim&auml;ren Wert ("nutzbar") an. Vitals nutzt ebenfalls die Schrank-/Pack-Summe und bleibt die beste Detailansicht.</p>
                     <p><strong>Was sollte ich als <code>speichergroesse</code> konfigurieren?</strong><br>
-                    Den Wert, den Vitals als <em>"Im Neuzustand nutzbar"</em> ausweist. Dieser Wert ist die tats&auml;chliche Planungsgrundlage f&uuml;r den Storage Simulator und die Ladekurven.</p>
+                    Die zur Anlage passende nutzbare Herstellerangabe als Referenz. Vitals zeigt diese Konfiguration getrennt von BMS-Spezifikation, FCC und USABLE. Die aus Ah mit angenommener Modulspannung berechneten BMS-Werte sind keine belegte Brutto- oder Neuzustandskapazität. Die SOH-Schätzung verwendet nur die konfigurierte Referenz; BMS-Nutzwerte werden nicht nochmals mit SOH multipliziert. Fehlende Werte bleiben unbekannt.</p>
                 </div>
             </div>
         </div>

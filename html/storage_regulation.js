@@ -35,7 +35,7 @@ function storageRegulationStatus(state, enabled, requestTs, nowS) {
             if (!control.isConnected) return;
             if (!document.hidden && !toggle.disabled) {
                 try {
-                    const response = await fetch('ramdisk/storage_manager_state.json?_=' + Date.now(), {cache: 'no-store', signal: AbortSignal.timeout(4000)});
+                    const response = await fetch('config_editor.php?config_action=storage_regulation_status&_=' + Date.now(), {cache: 'no-store', signal: AbortSignal.timeout(4000)});
                     const state = response.ok ? await response.json() : null;
                     if (!toggle.disabled) {
                         const result = storageRegulationStatus(state, toggle.checked, Number(control.dataset.requestTs || 0), Date.now() / 1000);

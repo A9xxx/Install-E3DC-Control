@@ -1,5 +1,19 @@
 # Speicher-Ladesteuerung - Systemablauf
 
+## Beobachtete Wallbox und Speichergrenzen
+
+Bei „Nur Beobachten, Wallbox regelt“ bleibt die Wallbox selbstständig. Ein
+Preisfenster kann trotzdem die Batterieentladung für diese Last begrenzen.
+Bei aktiver, erreichbarer Speicherladekurve wird die Ladegrenze dabei weiterhin
+aus dem Kurvenbedarf berechnet. Der Beginn einer beobachteten Ladung öffnet
+also nicht automatisch die maximale Batterieladeleistung.
+
+Lade- und Entladegrenze bleiben unabhängig: notwendiges PV-Laden, harte Reserven
+und Abregelschutz haben Vorrang; eine Entladesperre erteilt keine Netzladefreigabe.
+Expliziter E3DC-Autobetrieb und Betrieb ohne gültiges Kurvenziel behalten ihre
+bisherige Freigabe. Reservierte Kurvenladeleistung steht nicht zugleich als
+zusätzliches Verbraucherbudget bereit.
+
 ## Speicherregelung ausschalten
 
 In der Konfiguration steht oben der Schalter **Speicherregelung aktiv**, in
@@ -47,7 +61,7 @@ nicht wieder aufgenommen. Technisch wird der Schalter als
 bindet die Übernahme mit `storage_regulation_changed_ts` an die aktuelle
 Bedienaktion. Ein Dienststopp allein ersetzt diese geordnete Abschaltung nicht.
 
-> **Stand:** v5.4.5e
+> **Stand:** v5.4.5f
 >
 > **Neu in 5.4.5a:** Ein frisch beobachteter openWB-Fahrzeug-SoC kann mit
 > Quelle und Alter rein lesend erscheinen, wenn er zur aktuellen Stecksession
@@ -252,6 +266,15 @@ Die Planung erzeugt:
 Vergangene und aktive Anker werden eingefroren. Zukünftige Anker dürfen sich
 bewegen, aber zukünftige Pre-Dump-/Startanker dürfen nicht durch den aktuellen
 SoC nach oben gezogen werden.
+
+Beginnt die erste Ladekurve erst am folgenden Kalendertag und liegt ihr
+Start noch außerhalb des Vorhaltefensters (standardmäßig acht Stunden),
+löst allein dieser morgige Startanker heute keine Ladepause aus. E3DC darf
+Rest-PV autonom nutzen; kurzfristige Schwankungen von PV und Netzexport
+wechseln diese Freigabe nicht. Die bestehende SoC-Obergrenze sowie Preis-,
+Reserve-, Netz- und Abregelschutz gelten weiter. Innerhalb des
+Vorhaltefensters übernimmt wieder die reguläre Vorstartentscheidung.
+Die Anzeige nennt beim Startanker Datum und Uhrzeit.
 
 ### Effektive Direktvermarktungsprojektion
 

@@ -30,7 +30,7 @@ $cutoff = $isArchive ? 0 : (time() - ($hours * 3600));
 $lines = file($historyFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
 
 $data = [
-    'labels' => [], 'pv' => [], 'home' => [], 'bat' => [], 
+    'labels' => [], 'timestamps' => [], 'pv' => [], 'home' => [], 'bat' => [],
     'grid' => [], 'wb' => [], 'wb2' => [], 'wp' => [], 'hs' => [], 'climate' => [], 'soc' => [], 'price' => [],
     'pv_total_w' => [], 'pv_e3dc_w' => [], 'pv_external_w' => [],
     'dc0_w' => [], 'dc1_w' => [], 'grid_p1' => [], 'grid_p2' => [], 'grid_p3' => [],
@@ -346,6 +346,7 @@ ksort($buckets);
 foreach ($buckets as $ts => $b) {
     $c = $b['count'];
     $data['labels'][] = date('H:i', $ts);
+    $data['timestamps'][] = (int)$ts * 1000;
     $data['pv'][] = round($b['pv'] / $c);
     $data['pv_total_w'][] = round($b['pv_total_w'] / $c);
     $data['pv_e3dc_w'][] = round($b['pv_e3dc_w'] / $c);

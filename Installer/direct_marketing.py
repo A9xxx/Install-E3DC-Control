@@ -10575,6 +10575,13 @@ def build_direct_marketing_shadow_plan(
     flags["settlement_fee_basis_valid"] = settlement_accounting["variable_fee"]["basis_valid"]
 
     flags["live_soc_valid"] = _valid_soc_input(current_soc)
+    # Eigene Freigabe für die Preisformung der Sicherheitsladekurve. Die
+    # Fensterfreigabe bleibt unabhängig: kein Verkaufsfenster bedeutet weder
+    # Safe-Modus noch ein Verbot der bereits aktivierten PV-Speicherung.
+    flags["price_curve_allowed"] = bool(
+        mode == "eco_plus" and flags["pv_store_enable"]
+        and flags["live_soc_valid"] and flags["settlement_fee_basis_valid"]
+    )
     current_soc = safe_float(current_soc, 0.0) if flags["live_soc_valid"] else 0.0
 
     reserve = _reserve_state(config, mode, current_soc, capacity_wh, target_soc or current_soc)

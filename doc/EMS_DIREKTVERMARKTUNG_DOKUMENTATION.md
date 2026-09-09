@@ -17,6 +17,30 @@ Konfiguration sind Entscheidungshilfen, aber kein zweiter Regler.
 
 ## Plan, Prognose und tatsächliche Ausführung
 
+### Preisführung innerhalb der Sicherheitsladekurve
+
+Bei aktivem Eco+ und erlaubter PV-Speicherung verteilt ein getrennter Planungskern
+die nötige DC-Ladeenergie nach dem Nettoverkaufspreis. Dafür ist kein negativer
+Preis und kein freigegebenes Verkaufsfenster erforderlich. Diese Freigabe wird
+als `price_curve_allowed` getrennt von den ausführbaren DV-Fenstern geführt.
+
+Die bisherige Kurvenuntergrenze bleibt für jeden Zeitschritt bindend. Günstige
+Stunden können mehr Ladeleistung erhalten; daraus ergibt sich später reguläres
+Halten oberhalb der Kurve. Eine Punktprognose erlaubt kein zusätzliches Warten
+unterhalb dieser Sicherheitskurve. Insbesondere bedeutet die Funktion nicht,
+dass vor einer festen Uhrzeit grundsätzlich gar nicht geladen wird.
+
+Der Storage Manager begrenzt die Zusatzladung anhand des frischen DC-/AC-Splits
+und des Netzpunkts, fährt sie schrittweise hoch und berücksichtigt weiterhin
+Speicherplatzreservierungen sowie Abregelschutz. Fehlende Preise, eine unvollständige
+Quellentrennung oder ein im Korridor nicht erfüllbarer Plan lassen die bestehende
+Regelung unverändert. Aus, Safe und ausgeschaltete Speicherregelung bleiben wirksam.
+Die Entscheidung ist unter `direct_marketing_price_curve` in der Speicherdiagnose
+nachvollziehbar; der Planungskern selbst sendet keine Befehle.
+
+Die automatische Korrektur der PV-Prognose anhand von Messdaten ist hiervon
+unabhängig und wird durch diese Preisführung nicht eingeschaltet.
+
 Ein vollständiger Zeitraster allein ist noch kein vollständiger Aktionsplan.
 Wird ein Verkaufskandidat beispielsweise wegen der Hausreserve verworfen,
 bleibt für diesen Zeitraum die normale Hausversorgung als eigene Planaktion

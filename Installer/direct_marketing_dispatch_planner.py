@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Lückenloser Direktvermarktungs-Dispatch als reiner Shadow-Vertrag.
+"""Reine Planungsfunktionen für Direktvermarktung und PV-Preiskurve.
 
 Das Modul liest ausschließlich bereits normalisierte Planungsdaten. Es kennt
 keine Treiber, keine RSCP-Tags und keinen Hardwareausgang. Der Storage Manager
-bleibt der einzige spätere Aktor; dieser Vertrag ist noch nicht ausführbar.
+bleibt der einzige Aktor. Der Dispatch-Vertrag bleibt Shadow; der getrennte
+Preiskurvenkandidat wird im AUTO-Laderahmen erneut auf Live-Grenzen geprüft.
 """
 
 from __future__ import annotations
@@ -823,6 +824,156 @@ def build_planning_input_v1(
     # `planned_action` und Batterieprojektionen sind absichtlich nicht enthalten.
     input_contract["input_id"] = _revision(input_contract)
     return input_contract
+
+
+def build_pv_price_charge_curve(
+    source: Dict[str, Any], canonical_plan: Dict[str, Any], *,
+    now_ms: int, current_soc: float, capacity_wh: float, max_charge_w: float,
+    settlement_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Verteilt DC-Ladeenergie nach Nettoverkaufspreis im bestehenden Korridor.
+
+    Die Punktprognose ist kein Nachweis für zusätzliches Warten. Deshalb
+    bleiben sämtliche bisherigen Kurvenuntergrenzen als Zwischenziele erhalten.
+    Das Ergebnis enthält ausschließlich Planung; der Speicherregler prüft
+    aktuelle Quelle, Betriebsart, Schutzfunktionen und Leistungsrahmen erneut.
+    """
+    result = {"schema": "dv_pv_price_charge_curve_v1", "feasible": False,
+              "commands_allowed": False, "reason": "inputs_incomplete", "slots": [],
+              "additional_forecast_wait_allowed": False,
+              "forecast_basis": "point_with_existing_curve_floor"}
+    def number(value):
+        return _safe_float(value) if type(value) in (int, float) else None
+    if not isinstance(settlement_config, dict):
+        result["reason"] = "settlement_basis_invalid"
+        return result
+    try:
+        from .direct_marketing import _net_sell_components
+    except ImportError:
+        from direct_marketing import _net_sell_components
+    settlement_basis = _net_sell_components(0.0, settlement_config)
+    if (settlement_basis.get("fee_basis_valid") is not True
+            or number(settlement_basis.get("net_sell_ct")) is None):
+        result["reason"] = "settlement_basis_invalid"
+        return result
+    def points(values):
+        rows = []
+        for item in values or []:
+            if not isinstance(item, dict):
+                return []
+            ts, soc = number(item.get("ts")), number(item.get("soc"))
+            if ts is None or soc is None or not 0 <= soc <= 100:
+                return []
+            rows.append((ts, soc))
+        return sorted(rows) if len({t for t, _ in rows}) == len(rows) else []
+    def at(curve, ts):
+        if ts <= curve[0][0]:
+            return curve[0][1]
+        for (a, x), (b, y) in zip(curve, curve[1:]):
+            if ts <= b:
+                return x + (y-x) * (ts-a) / (b-a)
+        return curve[-1][1]
+    floor = points(source.get("soc_min_curve") or source.get("target_timeline"))
+    target = points(source.get("target_timeline"))
+    ceiling = points(source.get("soc_ceiling_curve"))
+    deadline = number(source.get("ladeende_ts"))
+    if not floor or not target or deadline is None or not now_ms < deadline <= now_ms+86400000:
+        return result
+    if (number(current_soc) is None or not 0 <= current_soc <= 100
+            or number(capacity_wh) is None or capacity_wh <= 0
+            or number(max_charge_w) is None or max_charge_w <= 0):
+        return result
+    if floor[0][0] > now_ms or floor[-1][0] < deadline or target[-1][0] < deadline:
+        return result
+    if source.get("soc_ceiling_curve") and (not ceiling or ceiling[0][0] > now_ms or ceiling[-1][0] < deadline):
+        return result
+    eta = number(source.get("charge_efficiency_pct", 95.0))
+    eta_discharge = number(source.get("discharge_efficiency_pct", 95.0))
+    if eta is None or eta_discharge is None or not 0 < eta <= 100 or not 0 < eta_discharge <= 100:
+        return result
+    eta, eta_discharge = eta/100, eta_discharge/100
+    rows, deficit_wh, cursor = [], 0.0, now_ms
+    for raw in canonical_plan.get("slots") or []:
+        if not isinstance(raw, dict):
+            return result
+        start, end = number(raw.get("start_ts_ms")), number(raw.get("end_ts_ms"))
+        if start is None or end is None or end <= start:
+            return result
+        if end <= now_ms or start >= deadline:
+            continue
+        start, end = max(start, now_ms), min(end, deadline)
+        if start != cursor or len(rows) >= 96:
+            result["reason"] = "slot_coverage_invalid"
+            return result
+        row = _planning_slot(raw)
+        prices = raw.get("prices_ct_kwh") if isinstance(raw.get("prices_ct_kwh"), dict) else {}
+        # Canonical gross_sell enthält den Marktpreis dieses Intervalls.
+        # net_sell kann dagegen ein Fenstermittel oder ein Bruttofallback sein.
+        market_price = number(prices.get("gross_sell"))
+        price_revision = prices.get("tariff_revision")
+        if not (row["price_fresh"] and market_price is not None
+                and isinstance(price_revision, str) and price_revision
+                and row["topology_complete"] and row["load_forecast_valid"]):
+            result["reason"] = "price_or_source_evidence_incomplete"
+            return result
+        settlement = _net_sell_components(market_price, settlement_config)
+        net_sell = number(settlement.get("net_sell_ct"))
+        if settlement.get("fee_basis_valid") is not True or net_sell is None:
+            result["reason"] = "settlement_basis_invalid"
+            return result
+        dc, ac, load = row["e3dc_dc_pv_w"], row["external_ac_pv_w"], row["load_w"]
+        if any(v is None or v < 0 for v in (dc, ac, load)):
+            return result
+        hours = (end-start)/3600000
+        deficit_wh += max(0.0, load-dc-ac) * hours / eta_discharge
+        capacity = min(max_charge_w, max(0.0, dc-max(0.0, load-ac))) * hours * eta
+        floor_soc = max(at(floor, end), at(target, end) if end == deadline else 0.0)
+        ceiling_soc = min(at(ceiling, start), at(ceiling, end)) if ceiling else 100.0
+        rows.append({"start_ts_ms": int(start), "end_ts_ms": int(end),
+                     "net_sell_ct_kwh": net_sell, "market_price_ct_kwh": market_price,
+                     "price_revision": price_revision, "capacity_wh": capacity,
+                     "floor_wh": max(0.0, (floor_soc-current_soc)*capacity_wh/100+deficit_wh),
+                     "ceiling_wh": max(0.0, (ceiling_soc-current_soc)*capacity_wh/100+deficit_wh),
+                     "battery_wh": 0.0})
+        cursor = end
+    if not rows or cursor != deadline:
+        result["reason"] = "deadline_not_covered"
+        return result
+    price_basis = {"source": "canonical_interval_market_price",
+                   "settlement_at_zero_market_ct": settlement_basis,
+                   "plan_id": canonical_plan.get("plan_id"),
+                   "intervals": [{key: row[key] for key in ("start_ts_ms", "end_ts_ms",
+                       "market_price_ct_kwh", "net_sell_ct_kwh", "price_revision")} for row in rows]}
+    result["price_basis"] = price_basis
+    result["price_basis_revision"] = _revision(price_basis)
+    # Jeder frühere Termin bleibt bindend. Gleiche Preise erhalten die frühere
+    # Belegung: erneutes Planen darf die Ladung nicht immer weiter verschieben.
+    for deadline_index, row in enumerate(rows):
+        needed = row["floor_wh"] - sum(x["battery_wh"] for x in rows[:deadline_index+1])
+        for index in sorted(range(deadline_index+1), key=lambda i: (rows[i]["net_sell_ct_kwh"], i)):
+            if needed <= 1e-6:
+                break
+            available = rows[index]["capacity_wh"] - rows[index]["battery_wh"]
+            prefix_wh = 0.0
+            for j, future in enumerate(rows):
+                prefix_wh += future["battery_wh"]
+                if j >= index:
+                    available = min(available, future["ceiling_wh"]-prefix_wh)
+            amount = min(needed, max(0.0, available))
+            rows[index]["battery_wh"] += amount
+            needed -= amount
+        if needed > 1e-6:
+            result.update(reason="dc_energy_or_corridor_insufficient", shortfall_wh=round(needed, 1))
+            return result
+    for row in rows:
+        row["charge_input_w"] = row["battery_wh"] / eta * 3600000 / (row["end_ts_ms"]-row["start_ts_ms"])
+    result.update(feasible=True, reason="price_ordered_with_existing_curve_floor", slots=rows,
+                  current_charge_w=rows[0]["charge_input_w"],
+                  deadline_ts_ms=int(deadline),
+                  input_revision=_revision({"rows": rows, "soc": current_soc, "capacity_wh": capacity_wh,
+                                            "eta": eta, "eta_discharge": eta_discharge,
+                                            "price_basis_revision": result["price_basis_revision"]}))
+    return result
 
 
 def _interval_contains(item: Dict[str, Any], start_ms: int, end_ms: int) -> bool:

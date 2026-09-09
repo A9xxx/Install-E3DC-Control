@@ -3297,6 +3297,13 @@ class ParallelStorageRegulator:
             "curve_export_w": curve_export_w,
             "curve_battery_discharge_w": curve_battery_discharge_w,
             "curve_safe_charge_w": curve_safe_charge_w,
+            "price_curve_coupling_active": bool(active_state.get("price_curve_coupling_active")),
+            "price_curve_charge_limit_w": (
+                min(self.max_charge_w, max(i_fc_w, curve_cap_target_w))
+                if curve_cap_hard_pressure_active
+                else 0 if pre_curve_hold_active or forecast_curve_landing_hold_active
+                else min(self.max_charge_w, i_fc_w, curve_safe_charge_w)
+            ),
             "curve_ifc_export_catchup_active": curve_ifc_export_catchup_active,
             "curve_ifc_export_catchup_floor_w": curve_ifc_export_catchup_floor_w,
             "curve_ifc_export_catchup_w": curve_ifc_export_catchup_w,
@@ -3385,7 +3392,7 @@ class ParallelStorageRegulator:
                 "load",
             )
         elif active_state_name == "price_plan_storage_hold":
-            if price_curve_need_w > 0 and price_export_w > 500:
+            if price_curve_need_w > 0 and price_export_w > 500 and not active_state.get("price_curve_coupling_active"):
                 self.price_house_discharge_w = 0
                 decision = choose(
                     "parallel_price_auto",
@@ -4399,6 +4406,13 @@ class ParallelStorageRegulator:
                 "curve_export_w": curve_export_w,
                 "curve_battery_discharge_w": curve_battery_discharge_w,
                 "curve_safe_charge_w": curve_safe_charge_w,
+                "price_curve_coupling_active": bool(active_state.get("price_curve_coupling_active")),
+                "price_curve_charge_limit_w": (
+                    min(self.max_charge_w, max(i_fc_w, curve_cap_target_w))
+                    if curve_cap_hard_pressure_active
+                    else 0 if pre_curve_hold_active or forecast_curve_landing_hold_active
+                    else min(self.max_charge_w, i_fc_w, curve_safe_charge_w)
+                ),
                 "curve_ifc_export_catchup_active": curve_ifc_export_catchup_active,
                 "curve_ifc_export_catchup_floor_w": curve_ifc_export_catchup_floor_w,
                 "curve_ifc_export_catchup_w": curve_ifc_export_catchup_w,

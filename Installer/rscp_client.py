@@ -13,6 +13,7 @@ Lizenz: MIT
 
 import struct
 import socket
+import select
 import time
 import zlib
 import logging
@@ -334,7 +335,7 @@ class RscpCipher:
 # Quelle: RSCPGui _rscp_utils.py -> _FRAME_HEADER_FORMAT = '<HHQIH'
 _FRAME_MAGIC       = 0xE3DC
 _FRAME_CTRL        = 0x0011    # Bit 4 = CRC im Frame aktiv
-_FRAME_HEADER_FMT  = '<HHQIH'  # magic, ctrl, ts_sec, ts_ns, length
+_FRAME_HEADER_FMT  = '<HHQIH'  # Nur Feldbreiten; Magic und CTRL werden separat als BE gelesen
 _FRAME_HEADER_SIZE = struct.calcsize(_FRAME_HEADER_FMT)  # = 18 Bytes
 _MAGIC_CHECK_FMT   = '>H'      # magic ist big-endian (E3DC Protokoll)
 
@@ -1018,29 +1019,33 @@ def _decode_value(type_byte: int, data: bytes):
     return data
 
 
-def _decode_tlv(data: bytes, pos: int) -> tuple:
+def _decode_tlv(data: bytes, pos: int, *, strict: bool = False) -> tuple:
     """Dekodiert ein einzelnes TLV-Element. Gibt (tag, type, value, next_pos) zurück."""
     if pos + _TAG_HEADER_SIZE > len(data):
+        if strict:
+            raise ValueError("Unvollständiger RSCP-TLV-Header")
         return None, None, None, len(data)
     tag, type_byte, length = struct.unpack_from(_TAG_HEADER_FMT, data, pos)
     start = pos + _TAG_HEADER_SIZE
     end = start + length
+    if strict and end > len(data):
+        raise ValueError("Unvollständiger RSCP-TLV-Wert")
     value_bytes = data[start:end]
 
     if type_byte == RscpType.Container:
-        value = _decode_tlv_list(value_bytes)
+        value = _decode_tlv_list(value_bytes, strict=strict)
     else:
         value = _decode_value(type_byte, value_bytes)
 
     return tag, type_byte, value, end
 
 
-def _decode_tlv_list(data: bytes) -> list:
+def _decode_tlv_list(data: bytes, *, strict: bool = False) -> list:
     """Dekodiert eine Liste von TLV-Elementen."""
     items = []
     pos = 0
     while pos < len(data):
-        tag, type_byte, value, next_pos = _decode_tlv(data, pos)
+        tag, type_byte, value, next_pos = _decode_tlv(data, pos, strict=strict)
         if tag is None:
             break
         items.append({'tag': tag, 'type': type_byte, 'value': value})
@@ -1122,9 +1127,9 @@ def _encode_tlv_list(items: list) -> bytes:
 def _build_frame(payload: bytes) -> bytes:
     """
     Baut einen RSCP-Frame im E3DC-Drahtformat:
-    MAGIC(2 BE) + CTRL(2 LE) + Timestamp_sec(8 LE) + Timestamp_ns(4 LE) + Length(2 LE)
+    MAGIC(2 BE) + CTRL(2 BE) + Timestamp_sec(8 LE) + Timestamp_ns(4 LE) + Length(2 LE)
     + Payload + CRC32(4 LE)
-    Format entspricht RSCPGui _FRAME_HEADER_FORMAT = '<HHQIH'
+    RSCPGui nutzt dieselben Feldbreiten; Magic und CTRL sind im Drahtformat BE.
     ACHTUNG: MAGIC wird von E3DC big-endian geprüft (0xE3DC = [0xe3, 0xdc])
     Daher: struct.pack('<H', 0xE3DC) wäre [0xDC, 0xE3] - FALSCH!
     Wir schreiben die Magic-Bytes direkt als b'\xe3\xdc'.
@@ -1133,7 +1138,7 @@ def _build_frame(payload: bytes) -> bytes:
     ts_ns  = 0
     ctrl   = _FRAME_CTRL
     length = len(payload)
-    # Header: Magic (raw BE bytes) + CTRL(2 LE) + TS_SEC(8 LE) + TS_NS(4 LE) + LENGTH(2 LE)
+    # Header: Magic (raw BE bytes) + CTRL(2 BE) + TS_SEC(8 LE) + TS_NS(4 LE) + LENGTH(2 LE)
     header = b'\xe3\xdc'   # MAGIC: raw bytes [e3, dc] = BE 0xE3DC ✓
     header += b'\x00\x11'  # CTRL: raw [00, 11] = BE 0x0011 (Bit4=CRC, Bit0=Version)
                             # ACHTUNG: struct.pack('<H', 0x0011) wäre [11, 00] - FALSCH!
@@ -1146,33 +1151,41 @@ def _build_frame(payload: bytes) -> bytes:
     return frame_without_crc + struct.pack('<I', crc)
 
 
+def _frame_layout(data: bytes) -> tuple:
+    """Liest Länge und CRC-Bit mit der Byteordnung des RSCP-Headers."""
+    if len(data) < _FRAME_HEADER_SIZE:
+        raise ValueError("Unvollständiger RSCP-Frameheader")
+    magic, ctrl = struct.unpack_from('>HH', data)
+    if magic != _FRAME_MAGIC:
+        raise ValueError("Ungültiges RSCP-Magic")
+    length = struct.unpack_from('<H', data, _FRAME_HEADER_SIZE - 2)[0]
+    has_crc = bool(ctrl & 0x0010)
+    return length, has_crc, _FRAME_HEADER_SIZE + length + (4 if has_crc else 0)
+
+
 def _parse_frame(data: bytes) -> tuple:
     """
     Parst einen E3DC RSCP-Frame.
-    Erwartet Format '<HHQIH' (18 Byte Header) + Payload + CRC32(4).
+    Erwartet 18 Byte Header + Payload + optionale CRC32(4), danach Zero-Padding.
     Gibt (payload_bytes, ok) zurück.
     """
-    if len(data) < _FRAME_HEADER_SIZE + 4:
-        log.error(f"Frame zu kurz: {len(data)} Bytes")
+    try:
+        length, has_crc, total_expected = _frame_layout(data)
+    except (ValueError, struct.error):
+        log.error("Ungültiger RSCP-Frameheader")
         return None, False
-
-    # Magic big-endian prüfen
-    magic = struct.unpack_from('>H', data, 0)[0]
-    if magic != _FRAME_MAGIC:
-        log.error(f"Ungültiges RSCP-Magic: {magic:#06x} (erwartet {_FRAME_MAGIC:#06x})")
-        return None, False
-
-    _, ctrl, ts_sec, ts_ns, length = struct.unpack_from(_FRAME_HEADER_FMT, data)
-
-    total_expected = _FRAME_HEADER_SIZE + length + 4  # Header + Payload + CRC
     if len(data) < total_expected:
         log.error(f"Frame unvollständig: {len(data)}/{total_expected} Bytes")
+        return None, False
+    padded_expected = ((total_expected + 31) // 32) * 32
+    if len(data) > padded_expected or any(data[total_expected:]):
+        log.error("Unerwartete Daten nach dem RSCP-Frame")
         return None, False
 
     payload = data[_FRAME_HEADER_SIZE : _FRAME_HEADER_SIZE + length]
 
     # CRC32 prüfen wenn CTRL-Bit 4 gesetzt (0x0010)
-    if ctrl & 0x0010:
+    if has_crc:
         crc_received = struct.unpack_from('<I', data, _FRAME_HEADER_SIZE + length)[0]
         crc_calc = zlib.crc32(data[:_FRAME_HEADER_SIZE + length]) & 0xFFFFFFFF
         if crc_received != crc_calc:
@@ -1226,11 +1239,12 @@ def find_all_values(items, tag_code: int) -> list:
 class RscpConnection:
     """
     Verwaltete RSCP-TCP-Verbindung zum E3DC-Kraftwerk.
-    Singleton-Verbindung: erst verbinden, dann beliebig viele Requests senden.
+    Eine Sitzung pro Objekt; der Aufrufer sendet Anfragen nacheinander.
     """
 
     TIMEOUT = 10.0   # Sekunden
     RECV_BUF = 65536
+    MAX_FRAME_SIZE = ((_FRAME_HEADER_SIZE + 0xFFFF + 4 + 31) // 32) * 32
 
     def __init__(self, host: str, port: int, rscp_password: str):
         self.host = host
@@ -1242,6 +1256,7 @@ class RscpConnection:
         self._sock = None
         self._cipher = None
         self._authenticated = False
+        self._received_frame = False
         self._authorized_transition_tags = frozenset()
 
     @property
@@ -1259,12 +1274,16 @@ class RscpConnection:
         yield self
 
     def connect(self):
-        """Öffnet TCP-Verbindung und authentifiziert sich."""
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.settimeout(self.TIMEOUT)
-        self._sock.connect((self.host, self.port))
-        self._cipher = RscpCipher(self._key)
-        self._authenticated = False
+        """Öffnet eine neue TCP-Verbindung; authenticate() meldet sie anschließend an."""
+        self.close()
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._sock.settimeout(self.TIMEOUT)
+            self._sock.connect((self.host, self.port))
+            self._cipher = RscpCipher(self._key)
+        except Exception:
+            self.close()
+            raise
         log.debug(f"TCP-Verbindung zu {self.host}:{self.port} aufgebaut")
 
     def _send_frame(self, payload_items: list):
@@ -1273,27 +1292,62 @@ class RscpConnection:
             payload_items,
             authorized_transition_tags=self._authorized_transition_tags,
         )
-        payload = _encode_tlv_list(payload_items)
-        frame = _build_frame(payload)
-        encrypted = self._cipher.encrypt(frame)
-        self._sock.sendall(encrypted)
+        try:
+            # Bereits anstehende Daten gehören zu keinem neuen Auftrag. Nicht überlesen.
+            if self._received_frame and select.select([self._sock], [], [], 0)[0]:
+                raise ConnectionError("Unangeforderte RSCP-Daten oder geschlossene Sitzung vor neuem Auftrag")
+            payload = _encode_tlv_list(payload_items)
+            frame = _build_frame(payload)
+            encrypted = self._cipher.encrypt(frame)
+            self._sock.sendall(encrypted)
+        except Exception:
+            self.close()
+            raise
 
     def _recv_frame(self) -> list:
-        """Empfängt, entschlüsselt und dekodiert einen RSCP-Frame."""
-        raw = self._sock.recv(self.RECV_BUF)
-        if not raw:
-            raise ConnectionError("Verbindung geschlossen")
-        # Blockgröße-Alignment sicherstellen (TCP-Fragmentierung)
-        while len(raw) % 32 != 0:
-            chunk = self._sock.recv(self.RECV_BUF)
-            if not chunk:
-                break
-            raw += chunk
-        decrypted = self._cipher.decrypt(raw)
-        payload, ok = _parse_frame(decrypted)
-        if not ok or payload is None:
-            return []
-        return _decode_tlv_list(payload)
+        """Empfängt genau einen vollständigen Frame innerhalb einer Gesamtfrist."""
+        deadline = time.monotonic() + self.TIMEOUT
+        raw = bytearray()
+        prefix = None
+        expected = None
+        sock = self._sock
+        try:
+            while True:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Gesamtfrist für RSCP-Antwort überschritten")
+                if prefix is None and len(raw) >= 32:
+                    prefix = self._cipher.decrypt(bytes(raw[:32]))
+                    _, _, plain_size = _frame_layout(prefix)
+                    expected = ((plain_size + 31) // 32) * 32
+                    if expected > self.MAX_FRAME_SIZE:
+                        raise ValueError("RSCP-Frame überschreitet die zulässige Größe")
+                if expected is not None:
+                    if len(raw) > expected:
+                        raise ValueError("Nicht zuordenbare Zusatzdaten nach RSCP-Antwort")
+                    if len(raw) == expected:
+                        decrypted = prefix + self._cipher.decrypt(bytes(raw[32:]))
+                        payload, ok = _parse_frame(decrypted)
+                        if not ok or payload is None:
+                            raise ValueError("Ungültiger oder unvollständiger RSCP-Frame")
+                        result = _decode_tlv_list(payload, strict=True)
+                        sock.settimeout(self.TIMEOUT)
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("Gesamtfrist für RSCP-Antwort überschritten")
+                        self._received_frame = True
+                        return result
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Gesamtfrist für RSCP-Antwort überschritten")
+                sock.settimeout(remaining)
+                chunk = sock.recv(min(self.RECV_BUF, self.MAX_FRAME_SIZE + 1 - len(raw)))
+                if not chunk:
+                    raise ConnectionError("Verbindung vor vollständiger RSCP-Antwort geschlossen")
+                raw.extend(chunk)
+                if len(raw) > self.MAX_FRAME_SIZE:
+                    raise ValueError("RSCP-Empfang überschreitet die zulässige Größe")
+        except Exception:
+            self.close()
+            raise
 
     def authenticate(self, portal_user: str, portal_password: str):
         """Sendet Authentication-Container und prüft die Antwort."""
@@ -1303,21 +1357,31 @@ class RscpConnection:
                 {'tag': RscpTag.RSCP_AUTHENTICATION_PASSWORD, 'type': RscpType.CString, 'value': portal_password},
             ]}
         ]
-        self._send_frame(auth_payload)
-        response = self._recv_frame()
-        auth_level = find_tag_value(response, RscpTag.RSCP_AUTHENTICATION)
-        if auth_level and int(auth_level) >= 10:
-            self._authenticated = True
-            log.debug(f"RSCP-Authentifizierung erfolgreich (Level {auth_level})")
-        else:
-            raise ConnectionError(f"RSCP-Authentifizierung fehlgeschlagen (Level: {auth_level})")
+        try:
+            self._send_frame(auth_payload)
+            response = self._recv_frame()
+            auth_item = find_tag(response, RscpTag.RSCP_AUTHENTICATION)
+            auth_level = auth_item.get('value') if isinstance(auth_item, dict) else None
+            if (isinstance(auth_item, dict) and auth_item.get('type') != RscpType.Error
+                    and type(auth_level) is int and auth_level >= 10):
+                self._authenticated = True
+                log.debug(f"RSCP-Authentifizierung erfolgreich (Level {auth_level})")
+            else:
+                raise ConnectionError(f"RSCP-Authentifizierung fehlgeschlagen (Level: {auth_level})")
+        except Exception:
+            self.close()
+            raise
 
     def request(self, items: list) -> list:
         """Sendet eine Liste von TLV-Anfragen und gibt die Antwort zurück."""
         if not self._authenticated:
             raise RuntimeError("Nicht authentifiziert – connect() und authenticate() zuerst aufrufen")
-        self._send_frame(items)
-        return self._recv_frame()
+        try:
+            self._send_frame(items)
+            return self._recv_frame()
+        except Exception:
+            self.close()
+            raise
 
     def close(self):
         """Schließt die TCP-Verbindung."""
@@ -1326,8 +1390,10 @@ class RscpConnection:
                 self._sock.close()
             except Exception:
                 pass
-            self._sock = None
-            self._authenticated = False
+        self._sock = None
+        self._cipher = None
+        self._authenticated = False
+        self._received_frame = False
 
     def __enter__(self):
         return self
@@ -1428,8 +1494,8 @@ def fetch_battery_vitals(host: str, port: int, portal_user: str,
                 spec_cap = find_tag_value(bat_spec['value'], RscpTag.BAT_SPECIFIED_CAPACITY)
 
             # BAT_MODULE_VOLTAGE: String-Spannung des Akkus in Volt (Live-Wert, schwankt!)
-            # Fuer die Umrechnung von Ah in Wh nutzen wir die nominale Spannung von 51.8V
-            # (756 Ah * 51.8V = 39160 Wh = Exakter Wert von BAT_SPECIFIED_CAPACITY)
+            # Modellannahme für die Anzeige ausgelesener Ah-Werte, kein
+            # Nachweis einer Typenschild- oder Neuzustandskapazität.
             nominal_voltage_v = 51.8
 
             # BAT_FCC: Full Charge Capacity in Ah (bestaetigt via RSCPGui Quellcode: + ' Ah')
@@ -1454,7 +1520,7 @@ def fetch_battery_vitals(host: str, port: int, portal_user: str,
                     result['system_info']['installed_capacity_wh'] = 0
                 result['system_info']['installed_capacity_wh'] += specified_wh
 
-            cap_ah = fcc_ah if fcc_ah is not None else usable_cap_ah
+            cap_ah = fcc_ah
             if cap_ah is not None:
                 uc_wh = int(float(cap_ah) * nominal_voltage_v)
                 # Nur plausibel, wenn der Ah-Wert mindestens die halbe spezifizierte
@@ -1494,7 +1560,7 @@ def fetch_battery_vitals(host: str, port: int, portal_user: str,
                 'temp_max_global': round(float(t_max), 1) if t_max is not None else None,
                 'temp_min_global': round(float(t_min), 1) if t_min is not None else None,
                 'fcc_wh': fcc_wh,
-                'usable_wh': real_usable_wh if real_usable_wh is not None else (int(specified_wh * 0.9) if specified_wh else None),
+                'usable_wh': real_usable_wh,
                 'specified_wh': specified_wh,
                 'packs': [],
             }

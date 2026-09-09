@@ -6,6 +6,12 @@ require_once __DIR__ . '/helpers.php';
 require_once __DIR__ . '/eeg_tariff_tables.php';
 
 $configEditorRequestMethod = strtoupper((string)($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+$configEditorStatusRequest = $configEditorRequestMethod === 'GET'
+    && ($_GET['config_action'] ?? '') === 'storage_regulation_status';
+if ($configEditorStatusRequest) {
+    header('Content-Type: application/json; charset=utf-8');
+    sendNoCacheHeaders();
+}
 if ($configEditorRequestMethod === 'POST') {
     $configEditorAction = (string)($_POST['config_action'] ?? '');
     $configEditorPostIsAjax =
@@ -15,7 +21,31 @@ if ($configEditorRequestMethod === 'POST') {
     requireWebAuth($configEditorPostIsAjax);
     e3dcRequireCsrfToken($configEditorPostIsAjax);
 } else {
-    requireWebAuth(false);
+    requireWebAuth($configEditorStatusRequest);
+}
+
+if ($configEditorStatusRequest) {
+    session_write_close();
+    // Runtime files stay HTTP-protected; expose only the switch acknowledgement.
+    $statusRaw = e3dcReadRegularFileBound(__DIR__ . '/ramdisk/storage_manager_state.json');
+    $statusData = is_string($statusRaw) ? json_decode($statusRaw, true) : null;
+    $regulationStatus = is_array($statusData) ? ($statusData['storage_regulation'] ?? null) : null;
+    if (!is_array($regulationStatus)
+        || !is_numeric($statusData['ts'] ?? null)
+        || !is_finite((float)$statusData['ts'])
+    ) {
+        http_response_code(503);
+        echo json_encode(['error' => 'Reglerstatus nicht verfügbar.']);
+        exit;
+    }
+    echo json_encode([
+        'ts' => $statusData['ts'],
+        'state' => is_string($statusData['state'] ?? null) ? $statusData['state'] : null,
+        'storage_regulation' => array_intersect_key($regulationStatus, array_flip([
+            'requested_enabled', 'request_ts', 'release_status', 'release_confirmed',
+        ])),
+    ]);
+    exit;
 }
 
 function e3dc_config_editor_wallbox_toggle_checked(array $config, $key) {
@@ -713,7 +743,7 @@ $tooltips = [
     "direct_marketing_safety_margin_ct_per_kwh" => "Sicherheitskorrektur in ct/kWh gegen Preis-, Prognose- und Messunsicherheit. Positive Werte rechnen konservativer, negative Werte aggressiver.",
     "direct_marketing_export_enable" => "Erlaubt aktive Batterieeinspeisung im Direktvermarktungszweig. Bleibt separat vom Hauptschalter aus.",
     "direct_marketing_grid_charge_enable" => "Erlaubt Netzladen für Direktvermarktung. Nur mit zusätzlicher Wirtschaftlichkeitsprüfung.",
-    "direct_marketing_pv_store_enable" => "Erlaubt Eco+, PV-Überschuss in niedrigen Direktvermarktungsfenstern aktiv in den Speicher zu laden. Das ist kein Netzladen und keine Batterieeinspeisung.",
+    "direct_marketing_pv_store_enable" => "Erlaubt PV-Speicherung in günstigen Direktvermarktungsfenstern. Eco+ nutzt zusätzlich den Nettoverkaufspreis für die DC-Ladeleistung innerhalb der bestehenden Sicherheitsladekurve, auch ohne Verkaufsfenster. Reserve, Zwischenziele und Abregelschutz haben Vorrang. Eine Punktprognose erlaubt kein zusätzliches Warten unterhalb der Sicherheitskurve.",
     "direct_marketing_pv_store_threshold_ct" => "Netto-Einspeiseschwelle in ct/kWh, unterhalb der PV weich bevorzugt gespeichert wird. Harte Ladepriorität und Headroom-Kante bleiben Marktpreise unter 0 ct/kWh. Leer = EEG-/Tarifschwelle, wenn berechenbar, sonst Preis-Score.",
     "direct_marketing_pv_store_max_w" => "Maximale PV-Speicherladeleistung im Direktvermarktungsfenster. 0 = System-Ladelimit und realen PV-Überschuss nutzen.",
     "direct_marketing_pv_store_min_surplus_w" => "Mindest-PV-Überschuss für aktives PV-Speichern. Unterhalb dieses Werts bleibt die normale Speicherregelung zuständig.",
@@ -4687,7 +4717,7 @@ async function readConfirmedConfigJson(response) {
         <div class="small text-body-secondary mt-2" id="storageRegulationState" role="status" aria-live="polite">Status der Speicherregelung wird geladen …</div>
         <div class="small text-body-secondary mt-1">Vor dem Start eines externen Speicherreglers die bestätigte Limitfreigabe abwarten. „Aus“ sperrt die Batterie nicht: E3DC beziehungsweise der externe Regler übernimmt.</div>
     </div>
-    <script src="storage_regulation.js?v=1" defer></script>
+    <script src="storage_regulation.js?v=2" defer></script>
 
     <div class="px-1" id="configAdvancedSearch">
         <input type="text" id="configSearch" class="form-control" placeholder="🔍 Variable suchen..." onkeyup="filterConfig()">
@@ -10278,7 +10308,7 @@ async function readConfirmedConfigJson(response) {
                             <?php if ($rscp_bat_usable_kwh): ?>
                             &bull; <?= $rscp_bat_usable_kwh ?> kWh (nutzbar)
                             <?php elseif ($rscp_bat_kwh): ?>
-                            &bull; <?= $rscp_bat_kwh ?> kWh (Brutto)
+                            &bull; <?= $rscp_bat_kwh ?> kWh (BMS-Angabe)
                             <?php endif; ?>
                         </span>
                         <?php else: ?>
@@ -10299,14 +10329,14 @@ async function readConfirmedConfigJson(response) {
                         <span class="config-rscp-status <?= $diff_pct < 15 ? 'text-success' : 'text-warning' ?> ms-1">
                             <?php if ($diff_pct < 15): ?>
                                 <i class="fas fa-check-circle me-1"></i>Batterie nutzbar (RSCP): <strong><?= $rscp_bat_usable_kwh ?> kWh</strong>
-                                <?php if ($rscp_bat_kwh): ?>&mdash; Brutto installiert: <?= $rscp_bat_kwh ?> kWh<?php endif; ?>
+                                <?php if ($rscp_bat_kwh): ?>&mdash; BMS-Kapazitätsangabe: <?= $rscp_bat_kwh ?> kWh<?php endif; ?>
                                 <?php if ($rscp_bat_raw_usable_kwh && abs($rscp_bat_raw_usable_kwh - $rscp_bat_usable_kwh) > 1.0): ?>&mdash; Rohwert <?= $rscp_bat_raw_usable_kwh ?> kWh plausibilisiert<?php endif; ?>
                                 &mdash; konfigurierter Wert <code>speichergroesse = <?= htmlspecialchars($config['speichergroesse']['value'] ?? '?') ?></code> passt. [OK]
                             <?php else: ?>
                                 <i class="fas fa-exclamation-triangle me-1"></i>Batterie nutzbar (RSCP): <strong><?= $rscp_bat_usable_kwh ?> kWh</strong>
-                                <?php if ($rscp_bat_kwh): ?>&mdash; Brutto: <?= $rscp_bat_kwh ?> kWh<?php endif; ?>
+                                <?php if ($rscp_bat_kwh): ?>&mdash; BMS-Kapazitätsangabe: <?= $rscp_bat_kwh ?> kWh<?php endif; ?>
                                 <?php if ($rscp_bat_raw_usable_kwh && abs($rscp_bat_raw_usable_kwh - $rscp_bat_usable_kwh) > 1.0): ?>&mdash; Rohwert <?= $rscp_bat_raw_usable_kwh ?> kWh plausibilisiert<?php endif; ?>
-                                &mdash; empfohlener Wert für <code>speichergroesse</code>: <strong><?= $rscp_bat_usable_kwh ?> kWh</strong>.
+                                &mdash; Referenz für <code>speichergroesse</code> mit der nutzbaren Herstellerangabe vergleichen; der BMS-Wert ist keine belegte Neuzustandskapazität.
                                 <?php if ($cur_speicher > 0): ?>
                                     Aktuell konfiguriert: <code><?= htmlspecialchars($config['speichergroesse']['value'] ?? '?') ?> kWh</code> (Abweichung <?= round($diff_pct) ?>%).
                                 <?php endif; ?>
@@ -10314,9 +10344,9 @@ async function readConfirmedConfigJson(response) {
                         </span>
                         <?php elseif ($rscp_bat_kwh): ?>
                         <span class="config-rscp-status text-warning ms-1">
-                            <i class="fas fa-exclamation-triangle me-1"></i>Batterie Brutto (RSCP): <strong><?= $rscp_bat_kwh ?> kWh</strong>
-                            &mdash; Netto-Nutzkapazität (für <code>speichergroesse</code>) ist ca. <strong><?= round($rscp_bat_kwh * 0.92, 1) ?> kWh</strong> (typ. 92%).
-                            Der konfigurierte Wert <code>speichergroesse = <?= htmlspecialchars($config['speichergroesse']['value'] ?? '?') ?></code> ist bereits der realistischere Wert.
+                            <i class="fas fa-info-circle me-1"></i>BMS-Kapazitätsangabe (RSCP): <strong><?= $rscp_bat_kwh ?> kWh</strong>
+                            &mdash; Eine nutzbare Neuzustandskapazität lässt sich daraus nicht mit einem pauschalen Prozentsatz ableiten.
+                            Konfigurierte Referenz: <code>speichergroesse = <?= htmlspecialchars($config['speichergroesse']['value'] ?? '?') ?></code> kWh. Bitte mit der nutzbaren Herstellerangabe vergleichen.
                         </span>
                         <?php endif; ?>
 

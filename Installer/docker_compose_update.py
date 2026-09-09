@@ -2250,23 +2250,52 @@ def _capture_previous_runtime(
     if str(before.get("Image") or "") != contract["image_id"]:
         raise DockerUpdateError("Die lokale Altimage-ID widerspricht dem laufenden Container.")
     running = (before.get("State") or {}).get("Running") is True
-    if running and _runtime_version(cli, container_id) != contract["version"]:
-        raise DockerUpdateError("Altimage und laufende Altversion widersprechen sich.")
+    restarting = (before.get("State") or {}).get("Restarting") is True
+    runtime_version_verified = False
+    runtime_error: DockerUpdateError | None = None
+    if running and not restarting:
+        try:
+            runtime_version = _runtime_version(cli, container_id)
+        except DockerUpdateError as exc:
+            runtime_error = exc
+        else:
+            if runtime_version != contract["version"]:
+                raise DockerUpdateError("Altimage und laufende Altversion widersprechen sich.")
+            runtime_version_verified = True
     after = _e3dc_stop_authority(cli, container_id)
-    stable_keys = lambda info: (
+    identity_keys = lambda info: (
         str(info.get("Id") or ""),
         str(info.get("Image") or ""),
+        str((info.get("Config") or {}).get("Image") or ""),
         bool((info.get("State") or {}).get("Running")),
+    )
+    runtime_keys = lambda info: (
         int(info.get("RestartCount") or 0),
         str((info.get("State") or {}).get("StartedAt") or ""),
     )
-    if stable_keys(before) != stable_keys(after):
+    if identity_keys(before) != identity_keys(after):
         raise DockerUpdateError("Der Altcontainer driftete während seiner Rückfallbindung.")
+    # Docker setzt Running auch während Restarting. Nur eine tatsächlich
+    # beobachtete Neustartphase erlaubt die Bindung ohne ausführbares VERSION-Lesen.
+    restarting = running and (
+        restarting or (after.get("State") or {}).get("Restarting") is True
+    )
+    if runtime_error is not None and not restarting:
+        raise runtime_error
+    if not restarting and runtime_keys(before) != runtime_keys(after):
+        raise DockerUpdateError("Der Altcontainer driftete während seiner Rückfallbindung.")
+    if running and not runtime_version_verified:
+        print(
+            "→ Altcontainer in Neustartphase: Image-ID und OCI-Version sind gebunden; "
+            "die Laufzeit-VERSION ist derzeit nicht bestätigt.",
+            flush=True,
+        )
     return {
         "present": True,
         "running": running,
         "container_id": container_id,
         "contract": contract,
+        "runtime_version_verified": runtime_version_verified,
     }
 
 

@@ -5,16 +5,18 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.4.5e`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.4.5f`. Das Dashboard startet ausschließlich
 den argumentlosen, root-eigenen Systemjob. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
 
-5.4.5e korrigiert den Docker-Start mit bestehenden Datenvolumes im
-Standardschutzmodus. Startprüfung und Rechteverwaltung verwenden denselben
-konfigurierten Datenschutzmodus. Der bisherige Host-Updateweg bleibt erhalten.
-Einzelheiten stehen in den [Release Notes](../RELEASE_NOTES.md).
+5.4.5f korrigiert das Speichern der Konfiguration mit übernommenen
+Docker-Datenvolumes und berücksichtigt erkannte Neustartphasen beim Update.
+Konfigurationsmigrationen bestätigen die benötigten Dateirechte vor dem
+Ersetzen. Der Host-Helfer muss für diese Updatekorrektur separat aktualisiert
+werden; ein neues Containerimage ersetzt ihn nicht. Einzelheiten stehen in
+den [Release Notes](../RELEASE_NOTES.md).
 
 Während der Webserver für den Dateiaustausch nicht erreichbar ist, zeigt die
 Ansicht nur den letzten bestätigten Schritt. Ein unbekannter Abschluss bleibt

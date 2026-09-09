@@ -241,3 +241,18 @@ Kalibrierung bleibt diagnostisch:** Sie verändert weder die bestehende
 Prognosekorrektur noch automatisch die Ladekurve. Die getrennte Anwendung
 auf die Regelung benötigt zunächst ausreichende Feldmessungen. Das Archiv,
 die Auswahl und die Web-Ausgabe zeigen diese Grenze ausdrücklich.
+
+Der aktuelle Mess- und Kalibriersammelstand wird getrennt von der gespeicherten
+Prognosezusammenfassung aktualisiert und mit einem eigenen Zeitstand angezeigt.
+Er berücksichtigt abgeschlossene Viertelstunden mit einer Stunde Abstand.
+Eine neu bestätigte Messzuordnung wird deshalb erst sichtbar, wenn passende
+vollständige Viertelstunden ausgewertet werden können. Für die Meldung
+„Erzeugungszähler bestätigt, Kalibrierung sammelt Daten“ ist noch kein geprüfter
+Korrekturfaktor erforderlich. Die genannten Mindestzahlen unabhängiger Tage
+und Lern-/Prüffenster gelten erst für dessen Bewertung.
+
+Ein älterer oder nicht verfügbarer Sammelstand wird als solcher gekennzeichnet.
+Die gespeicherten Prognosekennzahlen behalten ihren eigenen Auswertungszeitpunkt;
+ein aktueller Messstand wertet ältere Messungen oder Prognosen nicht nachträglich
+auf. Nach einem Wechsel der Messzuordnung müssen neue passende Viertelstunden
+gesammelt werden.

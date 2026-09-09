@@ -1,12 +1,14 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.5e</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.5f</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.4.5e**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.4.5f**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+
+Dieses Wartungsrelease verbessert die Speicherführung, RSCP-Verbindungen, Docker-Konfigurationsrechte und Diagramme. Preisabhängige PV-Ladung bleibt innerhalb der bestehenden Sicherheitsladekurve; die PV-Kalibrierung arbeitet weiterhin diagnostisch.
 
 Ein optionales Beispiel für einen zweiten Speicher liegt unter [E3DC-Slave](E3DC-Slave/README.md).
 
@@ -42,7 +44,7 @@ sondern eine eindeutige Auswahl verlangt.
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
 
-> **Neu in 5.4.5e:** Speicherregelung separat ausschalten, geplante Ladepause bei nachgelagerten Verbrauchern erhalten, Energy-Charts als Preisersatz und getrennte PV-Messdiagnose. Das optionale Beispiel E3DC-Slave ergänzt 100 W Entladestart. Installationszentrale und Rücknavigation sind leichter erreichbar. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
+> **Neu in 5.4.5f:** Speicherregelung separat ausschalten, geplante Ladepause bei nachgelagerten Verbrauchern erhalten, Energy-Charts als Preisersatz und getrennte PV-Messdiagnose. Das optionale Beispiel E3DC-Slave ergänzt 100 W Entladestart. Installationszentrale und Rücknavigation sind leichter erreichbar. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
 
 > **Neu in 5.4.5d:** Docker startet wieder mit bestehenden Datenvolumes im Standardschutzmodus `2770`. Startprüfung und Rechteverwaltung berücksichtigen denselben konfigurierten Datenschutzmodus. Die Korrektur gilt auch ohne Wallbox; unsichere Dateizustände bleiben gesperrt. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
 
@@ -483,7 +485,7 @@ sudo docker compose logs --tail=80 e3dc-control
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin wird
-> `E3DC_IMAGE_TAG=v5.4.5e` in `.env` gesetzt. `config --images` zeigt vor dem
+> `E3DC_IMAGE_TAG=v5.4.5f` in `.env` gesetzt. `config --images` zeigt vor dem
 > Pull das tatsächlich gewählte Image.
 >
 > Vor dem `pull` prüft der Helfer mindestens 2 GiB freien Platz im

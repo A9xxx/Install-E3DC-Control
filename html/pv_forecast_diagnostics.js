@@ -102,8 +102,29 @@
             ? diagnostic.observation_quality
             : {};
         const contractElement = document.getElementById('pv-forecast-diagnostic-contract');
-        const qualitySources = Array.isArray(diagnostic.diagnostic_details?.source_quality)
-            ? diagnostic.diagnostic_details.source_quality : [];
+        const progress = diagnostic.quality_progress;
+        const progressAge = Date.now() / 1000 - Number(progress?.calculated_at_utc_s);
+        const progressFresh = progress?.schema_version === 'pv_forecast_quality_progress_v1'
+            && progress.available === true && progress.reason === 'ok' && progress.decision_use_allowed === false
+            && /^sha256:[0-9a-f]{64}$/.test(progress.topology_revision || '')
+            && /^sha256:[0-9a-f]{64}$/.test(progress.method_revision || '')
+            && /^sha256:[0-9a-f]{64}$/.test(progress.observation_binding_revision || '')
+            && progress.topology_revision === diagnostic.topology_revision
+            && progress.method_revision === diagnostic.forecast_issue_contract?.method_revision
+            && Number.isInteger(progress.calculated_at_utc_s) && Number.isInteger(progress.evaluation_end_utc_s)
+            && progress.evaluation_end_utc_s === progress.calculated_at_utc_s - 3600
+            && progressAge >= 0 && progressAge <= 1800 && Array.isArray(progress.source_quality)
+            && progress.source_quality.length === 2
+            && new Set(progress.source_quality.map(item => item?.signal)).size === 2
+            && progress.source_quality.every(item => item && ['pv_e3dc_dc', 'pv_external_ac'].includes(item.signal)
+                && ['observed_slots', 'quality_slots', 'meter_confirmed_slots', 'eligible_slots', 'excluded_slots']
+                    .every(key => Number.isInteger(item[key]) && item[key] >= 0)
+                && item.eligible_slots <= item.meter_confirmed_slots && item.meter_confirmed_slots <= item.quality_slots
+                && item.quality_slots <= item.observed_slots && item.eligible_slots + item.excluded_slots === item.observed_slots);
+        const archivedQualitySources = Array.isArray(diagnostic.diagnostic_details?.source_quality)
+            ? diagnostic.diagnostic_details.source_quality.filter(item => item && typeof item === 'object') : [];
+        const qualitySources = progressFresh ? progress.source_quality : archivedQualitySources;
+        const archivedExternalQuality = archivedQualitySources.find(item => item.signal === 'pv_external_ac');
         const externalQuality = qualitySources.find(item => item.signal === 'pv_external_ac');
         if (contractElement) {
             const isPointForecast = valueContract.distribution_type === 'deterministic_point';
@@ -115,14 +136,14 @@
                 p50Proven ? 'P50 bestätigt' : 'kein belegtes P50'
             ];
             if (externalQuality && Number(externalQuality.meter_confirmed_slots) > 0) {
-                parts.push(externalQuality.calibration?.status === 'validated'
+                parts.push((progressFresh ? '' : 'Archivstand: ') + (externalQuality.calibration?.status === 'validated'
                     ? 'Zusatz-WR: Korrekturfaktor auf späteren Tagen geprüft'
-                    : 'Zusatz-WR: Erzeugungszähler bestätigt, Kalibrierung sammelt Daten');
+                    : 'Zusatz-WR: Erzeugungszähler bestätigt, Kalibrierung sammelt Daten'));
             } else if (externalAcMissing) {
                 parts.push('Zusatz-WR ohne getrennte Ist-Kalibrierung');
             }
             if (qualitySources.some(item => Number(item.quality_slots) > 0)) {
-                parts.push('Begrenzungsfilter für neue Kalibrierfenster aktiv');
+                parts.push(progressFresh ? 'Begrenzungsfilter für neue Kalibrierfenster aktiv' : 'Archivstand: Begrenzungsfilter belegt');
             } else if (
                 observationQuality.curtailment_exclusion_status === 'EVIDENCE_LIMIT'
                 || observationQuality.inverter_clipping_exclusion_status === 'EVIDENCE_LIMIT'
@@ -201,6 +222,9 @@
             if (details && details.schema_version === 'pv_forecast_diagnostic_details_v1' && details.decision_use_allowed === false) {
                 const date = value => Number(value) > 0 ? new Date(Number(value) * 1000).toLocaleString('de-DE', { timeZone: 'UTC' }) + ' UTC' : '–';
                 lines.push(`Zusätzliche Detailaufzeichnung: ${date(details.period_start_utc_s)} bis ${date(details.period_end_utc_s)}.`);
+                lines.push(progressFresh
+                    ? `Aktueller Kalibrier-Sammelstand: ${date(progress.calculated_at_utc_s)}; abgeschlossene Messfenster bis ${date(progress.evaluation_end_utc_s)}. Aktualisierung etwa alle 15 Minuten, mit einer Stunde Abschlussabstand. Die Kennzahlen des archivierten Berichts bleiben unverändert.`
+                    : 'Aktueller Kalibrier-Sammelstand nicht verfügbar. Die folgenden Quellen- und Kalibrierwerte zeigen den archivierten Bericht.');
                 lines.push(`Erwartetes Tageslicht nach Sonnenfenster-Schätzung: ${fmt(details.compared_daylight_slots, 0)} / ${fmt(details.expected_daylight_slots, 0)} Fenster (${fmt(details.daylight_coverage_pct)} %). ${fmt(details.daylight_unknown_slots, 0)} Fenster mit unbekannter Tageslichtzuordnung; ${fmt(details.unarchived_slots, 0)} Lücken zwischen erster und letzter Ausgabe.`);
                 const reasons = { topology_unbound: 'Zuordnung fehlt', forecast_not_fresh: 'Prognose veraltet', forecast_value_missing: 'Prognosewert fehlt', observation_missing_or_invalid: 'Ist fehlt/ungültig', below_25_wh: 'unter 25 Wh' };
                 const counts = details.exclusion_counts || {};
@@ -208,7 +232,7 @@
                 const daily = details.frozen_daily || {};
                 lines.push(`Eingefrorene Tagesprognose: ${fmt(daily.compared_days, 0)} vollständig verglichene UTC-Tage aus ${fmt(daily.forecast_days, 0)} Ausgaben mit 96 Fenstern; MAE ${fmt(daily.mae_wh)} Wh/Tag, Richtungsversatz ${fmt(daily.bias_wh)} Wh/Tag. Je Tag genau eine vollständige, vor Tagesbeginn erzeugte und archivierte Ausgabe.`);
                 const external = details.external_observation || {};
-                lines.push(`Zusatz-WR-Messung: ${fmt(external.complete_slots, 0)} vollständige und ${fmt(external.incomplete_slots, 0)} lückenhafte Viertelstunden. ` + (qualitySources.length
+                lines.push(`Zusatz-WR-Messung im archivierten Bericht: ${fmt(external.complete_slots, 0)} vollständige und ${fmt(external.incomplete_slots, 0)} lückenhafte Viertelstunden. ` + (Number(archivedExternalQuality?.meter_confirmed_slots) > 0
                     ? 'Die Erzeugungszuordnung beruht auf der Betreiberbestätigung in der Config und gilt ab Erfassung.'
                     : 'Zeitgewichtete vorhandene Live-Messwerte; keine unabhängig belegte Bruttomessung. Clipping und Abschaltung bleiben unbekannt.'));
                 for (const source of qualitySources) {
@@ -224,7 +248,7 @@
                 if (qualitySources.length) lines.push('Die neue Kalibrierung ist diagnostisch: Faktoren werden noch nicht automatisch auf die Ladekurve angewandt. Abregelung, Clipping-Verdacht, Abschaltung und unbekannte Zustände werden nur im gesonderten Kalibriervergleich ausgeschlossen; Gesamtkennzahlen enthalten sie weiterhin. Der Abregelschutz bleibt aktiv. Ohne Vergleichsanlage ist vermiedene Abregelung eine Abschätzung; eine P50-Aussage erfordert eine eigene statistische Prüfung.');
                 const names = { provider_m1_raw: 'Forecast.Solar roh', provider_m2_raw: 'Open-Meteo roh', provider_m3_raw: 'Solcast roh', ensemble_before_bias: 'Ensemble vor Bias', bias_corrected_before_caps: 'Nach Bias, vor Limits', displayed_postprocessed: 'Endprognose' };
                 const filteredStages = (details.quality_filtered_stage_metrics || []).filter(item => Number(item.compared_slots) > 0);
-                if (filteredStages.length) lines.push('Begrenzungsgefilterter Vergleich: ' + filteredStages.map(item => `${item.signal === 'pv_e3dc_dc' ? 'E3DC-DC' : 'Zusatz-WR'} ${names[item.stage] || ''}: ${fmt(item.compared_slots, 0)} Fenster, MAE ${fmt(item.mae_wh)} Wh`).join(' · ') + '.');
+                if (filteredStages.length) lines.push('Begrenzungsgefilterter Vergleich im archivierten Bericht: ' + filteredStages.map(item => `${item.signal === 'pv_e3dc_dc' ? 'E3DC-DC' : 'Zusatz-WR'} ${names[item.stage] || ''}: ${fmt(item.compared_slots, 0)} Fenster, MAE ${fmt(item.mae_wh)} Wh`).join(' · ') + '.');
                 const stages = (details.stage_metrics || []).filter(item => Number(item.compared_slots) > 0);
                 if (stages.length) {
                     lines.push('Prognosestufen, jeweils eigene Ertragsfenster: ' + stages.map(item => `${item.signal === 'pv_e3dc_dc' ? 'E3DC-DC' : 'Zusatz-WR'} ${names[item.stage] || ''}: ${fmt(item.compared_slots, 0)} Fenster, MAE ${fmt(item.mae_wh)} Wh, Bias ${fmt(item.bias_wh)} Wh`).join(' · ') + '. Unterschiede bei den Fallzahlen erlauben keinen direkten Modellvergleich.');

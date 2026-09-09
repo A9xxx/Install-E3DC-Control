@@ -25,6 +25,20 @@ Dieses Modul erweitert **E3DC-Control** um eine intelligente Steuerung für Wär
 
 ---
 
+### Erneute Boost-Anfrage nach ungenutzter Startfreigabe
+
+Eine abgelaufene Startzuteilung sperrt neue Starts zunächst. Wenn frische
+Rückmeldungen wieder Normalbetrieb, einen stehenden Verdichter und weniger als
+50 W Aufnahme bestätigen, kann nach mindestens 60 Sekunden ab Ende der alten
+Zuteilung eine Rücknahme der Startbereitschaft gemeldet werden. Erst nachdem der
+Storage Manager diese Rücknahme verarbeitet hat, folgt eine neue Budgetanfrage.
+Die Rücknahme selbst schaltet die Wärmepumpe nicht.
+
+Ein neuer Boost benötigt weiterhin Wärmebedarf und eine frische, ausreichende
+Zuteilung. Aktives Signal, Pumpenvorlauf, unklare Daten, Sperrzeiten und ausgeschaltete
+Automatik erlauben keinen erzwungenen Neustart. Die 60 Sekunden sind eine
+zusätzliche Wartefrist, kein Ersatz für die geräteeigenen Schutzzeiten.
+
 ## 2. Voraussetzungen
 
 *   **Wärmepumpe:** Luxtronik 2.0 oder 2.1 Steuerung.

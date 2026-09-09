@@ -1,9 +1,9 @@
 {
-  "version": "5.4.5e",
+  "version": "5.4.5f",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.5e",
-  "release_date": "2026-09-08",
-  "description": "v5.4.5e - Speicher-Aus, ruhige Ladepause, PV-Messdiagnose und Slave-Beispiel",
+  "stable_release": "v5.4.5f",
+  "release_date": "2026-09-09",
+  "description": "v5.4.5f - Speicherführung, RSCP-Verbindungen, Docker-Speichern und Diagramme",
   "update_strategy": "backup_replace_restart_v1",
   "installer_requires": "python3",
   "sanitized_republication": false,

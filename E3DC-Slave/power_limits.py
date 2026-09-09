@@ -1,5 +1,6 @@
 """Set the native discharge threshold once; verify without refresh writes."""
 from dataclasses import replace
+import time
 
 class PowerSettingsError(RuntimeError):
     pass
@@ -19,8 +20,9 @@ def read_settings(device):
 
 class PowerLimits:
     """One setup attempt per process; changed settings require operator review."""
-    def __init__(self, device, settings, execute=False):
+    def __init__(self, device, settings, execute=False, communication_errors=()):
         self.device, self.settings, self.execute = device, settings, execute
+        self.communication_errors = communication_errors
         self.expected, self.next_check, self.started = None, 0, False
         self.receipt = {'status': 'observation_only'}
 
@@ -41,24 +43,39 @@ class PowerLimits:
         self.receipt = {'status': 'setup_unconfirmed', 'before': before, 'requested': expected}
         if before != expected:
             # Explicit limits avoid the library fallback to the hardware maxima.
-            result = self.device.set_power_limits(enable=True, discharge_start=threshold,
-                max_charge=before['maxChargePower'], max_discharge=before['maxDischargePower'])
-            if type(result) is not int or result not in (0, 1):
-                raise PowerSettingsError('power_settings_rejected')
-        if read_settings(self.device) != expected:
+            try:
+                result = self.device.set_power_limits(enable=True, discharge_start=threshold,
+                    max_charge=before['maxChargePower'], max_discharge=before['maxDischargePower'])
+            except self.communication_errors as exc:
+                # Unbestätigten Schreibversuch ausschließlich durch Lesen klären.
+                self.receipt['write_error'] = type(exc).__name__
+            else:
+                if type(result) is not int or result not in (0, 1):
+                    raise PowerSettingsError('power_settings_rejected')
+        for delay in (0, 0.5, 1):
+            if delay:
+                time.sleep(delay)
+            actual = read_settings(self.device)
+            self.receipt['actual'] = actual
+            if actual == expected:
+                break
+        if actual != expected:
+            self.receipt['status'] = 'power_settings_readback_mismatch'
             raise PowerSettingsError('power_settings_readback_mismatch')
         self.expected, self.next_check = expected, now + 30
-        self.receipt = {'status': 'settings_readback_confirmed', 'before': before, 'actual': expected}
+        self.receipt = dict(self.receipt, status='settings_readback_confirmed', actual=expected)
         return replace(self.settings, discharge_start_w=threshold)
 
-    def check(self, now):
+    def check(self, now, force=False):
         if not self.execute:
             return
         if self.expected is None:
             raise PowerSettingsError('power_settings_not_confirmed')
-        if now >= self.next_check:
-            if read_settings(self.device) != self.expected:
-                self.receipt = dict(self.receipt, status='settings_changed_or_unconfirmed')
+        if force or now >= self.next_check:
+            actual = read_settings(self.device)
+            self.receipt = dict(self.receipt, actual=actual)
+            if actual != self.expected:
+                self.receipt['status'] = 'settings_changed_or_unconfirmed'
                 raise PowerSettingsError('power_settings_changed_stop_without_rewrite')
             self.next_check = now + 30
 

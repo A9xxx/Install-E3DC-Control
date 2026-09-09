@@ -242,7 +242,8 @@ import stat
 import sys
 
 sys.path.insert(0, "/app/pi/Install/Installer")
-from config_secret_permissions import config_secret_dir_mode_text
+from config_secret_permissions import config_secret_dir_mode, config_secret_dir_mode_text, config_secret_file_mode
+from secure_file_transaction import SecureFileTransactionError, ensure_bound_directory
 
 parent_path = "/var/www/html/data"
 config_name = "e3dc_v4.json"
@@ -281,6 +282,24 @@ try:
         ):
             raise SystemExit(1)
 
+        backup_name = "config_backups"
+        try:
+            backup_before = os.stat(backup_name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            backup_before = None
+        if backup_before is not None and (
+            not stat.S_ISDIR(backup_before.st_mode)
+            or backup_before.st_uid not in {0, web_uid}
+            or backup_before.st_gid not in {0, web_gid}
+            or stat.S_IMODE(backup_before.st_mode) & 0o002
+        ):
+            raise SystemExit(1)
+        backup_identity = None if backup_before is None else (
+            backup_before.st_dev, backup_before.st_ino,
+            backup_before.st_uid, backup_before.st_gid,
+            stat.S_IMODE(backup_before.st_mode),
+        )
+
         config_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
         try:
             config_fd = os.open(config_name, config_flags, dir_fd=parent_fd)
@@ -288,6 +307,7 @@ try:
             config_fd = None
 
         payload = None
+        config_data = {}
         if config_fd is not None:
             try:
                 before = os.fstat(config_fd)
@@ -318,6 +338,29 @@ try:
                     or config_identity(before) != config_identity(named_after)
                 ):
                     raise SystemExit(1)
+                # Auch ohne Inhaltsmigration müssen ältere Dateien dem aktuellen
+                # Rechtevertrag entsprechen. Nur die bereits gebundene Datei ändern.
+                config_data = {}
+                try:
+                    decoded = json.loads(payload.decode("utf-8-sig"))
+                    if isinstance(decoded, dict):
+                        config_data = decoded
+                except (UnicodeError, ValueError):
+                    pass
+                expected_mode = config_secret_file_mode(config_data)
+                if stat.S_IMODE(after.st_mode) != expected_mode:
+                    os.fchmod(config_fd, expected_mode)
+                confirmed = os.fstat(config_fd)
+                named_confirmed = os.stat(config_name, dir_fd=parent_fd, follow_symlinks=False)
+                if (
+                    config_identity(confirmed) != config_identity(named_confirmed)
+                    or (confirmed.st_dev, confirmed.st_ino, confirmed.st_uid, confirmed.st_gid,
+                        confirmed.st_nlink, confirmed.st_size, confirmed.st_mtime_ns)
+                    != (before.st_dev, before.st_ino, before.st_uid, before.st_gid,
+                        before.st_nlink, before.st_size, before.st_mtime_ns)
+                    or stat.S_IMODE(confirmed.st_mode) != expected_mode
+                ):
+                    raise SystemExit(1)
             finally:
                 os.close(config_fd)
         else:
@@ -328,6 +371,16 @@ try:
                 pass
             else:
                 raise SystemExit(1)
+
+        # Der spätere root-Migrationslauf darf keinen noch unvorbereiteten
+        # Backupordner erzeugen. Nur dieses gebundene Verzeichnis vorbereiten.
+        ensure_bound_directory(
+            os.path.join(parent_path, backup_name),
+            uid=web_uid, gid=web_gid, mode=config_secret_dir_mode(config_data),
+            expected_identity=backup_identity,
+            expected_parent_identity=(parent.st_dev, parent.st_ino),
+            expected_missing=backup_before is None,
+        )
 
         parent_post_fd = os.open(parent_path, parent_flags)
         try:
@@ -353,7 +406,7 @@ try:
         except Exception:
             pass
     print(config_secret_dir_mode_text(data))
-except (KeyError, OSError, TypeError, ValueError):
+except (KeyError, OSError, TypeError, ValueError, SecureFileTransactionError):
     raise SystemExit(1)
 PY
 )"; then

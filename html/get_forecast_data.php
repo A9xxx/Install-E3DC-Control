@@ -3024,6 +3024,9 @@ function loadPvForecastDiagnosticEvidence($currentTopologyRevision, $diagnostics
             'observation_quality' => $observationQuality,
             'source_diagnostics' => $sourceDiagnostics,
             'diagnostic_details' => $projectedDetails,
+            'quality_progress' => forecastQualityProgressProjection($payload['quality_progress'] ?? null,
+                $expectedRevision, $expectedMethodRevision, null,
+                @filemtime('/var/www/html/data/e3dc_v4.json') ?: null),
             'metrics' => $metrics,
             'labels' => $metricLabels,
         ]);
@@ -3034,6 +3037,54 @@ function loadPvForecastDiagnosticEvidence($currentTopologyRevision, $diagnostics
             fclose($handle);
         }
     }
+}
+
+function forecastQualityProgressProjection($raw, $topology, $method, $now = null, $configModifiedAt = 0) {
+    $now = $now ?? time();
+    if (!is_array($raw) || ($raw['schema_version'] ?? '') !== 'pv_forecast_quality_progress_v1'
+        || ($raw['decision_use_allowed'] ?? null) !== false
+        || !is_string($topology) || !preg_match('/^sha256:[0-9a-f]{64}$/', $topology)
+        || !is_string($method) || !preg_match('/^sha256:[0-9a-f]{64}$/', $method)
+        || ($raw['topology_revision'] ?? null) !== $topology || ($raw['method_revision'] ?? null) !== $method
+        || !is_string($raw['observation_binding_revision'] ?? null)
+        || !preg_match('/^sha256:[0-9a-f]{64}$/', $raw['observation_binding_revision'])
+        || !is_int($raw['calculated_at_utc_s'] ?? null) || !is_int($raw['evaluation_end_utc_s'] ?? null)
+        || $raw['calculated_at_utc_s'] <= 0 || $now < $raw['calculated_at_utc_s']
+        || $configModifiedAt === null || $configModifiedAt >= $raw['calculated_at_utc_s']
+        || $now - $raw['calculated_at_utc_s'] > 1800
+        || $raw['evaluation_end_utc_s'] !== $raw['calculated_at_utc_s'] - 3600) return null;
+    $available = ($raw['available'] ?? null) === true && ($raw['reason'] ?? '') === 'ok';
+    if ($available) {
+        $seen = [];
+        if (!is_array($raw['source_quality'] ?? null) || count($raw['source_quality']) !== 2) return null;
+        foreach ($raw['source_quality'] as $source) {
+            if (!is_array($source) || !in_array($source['signal'] ?? '', ['pv_e3dc_dc', 'pv_external_ac'], true)
+                || in_array($source['signal'], $seen, true) || !is_array($source['calibration'] ?? null)
+                || !is_array($source['state_seconds'] ?? null)
+                || !in_array($source['calibration']['status'] ?? null, ['collecting', 'validated', 'not_improved'], true)) return null;
+            foreach (['unrestricted', 'protection_absorbing', 'curtailed', 'clipping_suspected', 'shutdown', 'unknown', 'measurement_invalid'] as $state) {
+                if (!array_key_exists($state, $source['state_seconds'])
+                    || is_bool($source['state_seconds'][$state]) || !is_numeric($source['state_seconds'][$state])
+                    || !is_finite((float)$source['state_seconds'][$state]) || $source['state_seconds'][$state] < 0) return null;
+            }
+            $seen[] = $source['signal'];
+            foreach (['observed_slots', 'quality_slots', 'meter_confirmed_slots', 'eligible_slots', 'excluded_slots'] as $key) {
+                if (!is_int($source[$key] ?? null) || $source[$key] < 0) return null;
+            }
+            if ($source['quality_slots'] > $source['observed_slots']
+                || $source['meter_confirmed_slots'] > $source['quality_slots']
+                || $source['eligible_slots'] > $source['meter_confirmed_slots']
+                || $source['eligible_slots'] + $source['excluded_slots'] !== $source['observed_slots']) return null;
+        }
+    }
+    $details = forecastDiagnosticDetailsProjection(['schema_version' => 'pv_forecast_diagnostic_details_v1',
+        'decision_use_allowed' => false, 'source_quality' => $available ? $raw['source_quality'] : []]);
+    return ['schema_version' => 'pv_forecast_quality_progress_v1', 'available' => $available,
+        'reason' => $available ? 'ok' : 'quality_progress_unavailable', 'decision_use_allowed' => false,
+        'calculated_at_utc_s' => $raw['calculated_at_utc_s'], 'evaluation_end_utc_s' => $raw['evaluation_end_utc_s'],
+        'topology_revision' => $topology, 'method_revision' => $method,
+        'observation_binding_revision' => $raw['observation_binding_revision'],
+        'source_quality' => $details['source_quality']];
 }
 
 function forecastDiagnosticDetailsProjection($raw) {

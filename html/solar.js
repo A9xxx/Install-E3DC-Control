@@ -5480,10 +5480,12 @@ function renderDirectMarketingCurveSection(data = null) {
         || (plan && plan.flags && plan.flags.commands_allowed === false);
     const physicalAction = directMarketingRuntimePhysicalAction(data);
     const active = Boolean(physicalAction) || (monitor && monitor.active === true);
+    const priceCurveAllowed = Boolean(plan && plan.flags && plan.flags.price_curve_allowed === true);
     const stateText = active ? 'aktiv'
-        : (shadow ? 'Beobachtung, keine Befehle'
+        : (priceCurveAllowed ? 'Preisführung der Sicherheitsladekurve freigegeben'
+            : shadow ? 'Beobachtung, keine Befehle'
             : ((monitor && monitor.state === 'waiting') ? 'wartet auf Fenster' : 'beobachtet'));
-    const stateColor = active ? 'text-success' : (shadow ? 'text-warning' : 'text-muted');
+    const stateColor = active ? 'text-success' : (priceCurveAllowed ? 'text-info' : (shadow ? 'text-warning' : 'text-muted'));
     const owner = (monitor && monitor.plan_owner) || (plan && plan.plan_owner) || 'direct_marketing';
     const reasonGroups = directMarketingReasonGroups(monitor);
     const uniqueReasons = values => values.filter(Boolean).filter((label, idx, arr) => arr.indexOf(label) === idx).slice(0, 4);
@@ -8332,6 +8334,8 @@ function switchChartMode(mode, view = 'normal') {
 
     // Setze chart-mode Flag auf dem Body element für CSS Scoping (z.B. header-regler-plan)
     document.body.setAttribute('data-chart-mode', mode);
+    const costDetails = document.getElementById('diagramDetails');
+    if (costDetails && mode !== 'price') costDetails.style.display = 'none';
 
     const select = document.getElementById('chart-mode-select');
     if (select) {
@@ -9396,37 +9400,99 @@ function currentSocMarkerForTimestamps(timestamps, maxDistanceMs = 30 * 60 * 100
     return {soc, data, index: nearestIndex};
 }
 
-function directMarketingSocProjectionForTimestamps(view, timestamps = []) {
+function directMarketingSocDisplayPoints(view) {
     if (!view || view.active !== true || view.state !== 'complete'
-        || !view.series || !Array.isArray(view.series.soc)
-        || !Array.isArray(timestamps) || timestamps.length === 0) {
-        return null;
+        || !Array.isArray(view.slots) || !view.slots.length) return [];
+    const points = [];
+    const append = (x, y) => {
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+        const last = points[points.length - 1];
+        if (last && last.x === x) return;
+        points.push({x, y});
+    };
+    for (const slot of view.slots) {
+        const anchor = slot.provenance?.integration_anchor_ts_ms;
+        const projectionStart = slot.projectionEffectiveStartTs;
+        const start = Number.isFinite(anchor) && anchor >= slot.startTs && anchor < slot.endTs
+            ? anchor : (Number.isFinite(projectionStart) && projectionStart >= slot.startTs
+                && projectionStart < slot.endTs ? projectionStart : slot.startTs);
+        const projectedEnd = start + slot.projectionEffectiveDurationS * 1000;
+        const end = Number.isFinite(slot.projectionEffectiveDurationS)
+            && projectedEnd > start && projectedEnd <= slot.endTs ? projectedEnd : slot.endTs;
+        append(slot.startTs, slot.socStartPct);
+        append(start, slot.socStartPct);
+        append(end, slot.socEndPct);
+        append(slot.endTs, slot.socEndPct);
     }
-    const points = view.series.soc
-        .map(point => ({
-            x: chartTimestampMs(point && point.x),
-            y: Number(point && point.y),
-        }))
-        .filter(point => point.x !== null && Number.isFinite(point.y))
-        .sort((left, right) => left.x - right.x);
-    if (points.length < 2) return null;
+    return points;
+}
 
-    let cursor = 0;
+function directMarketingSocProjectionForTimestamps(view, timestamps = []) {
+    const points = directMarketingSocDisplayPoints(view);
+    if (points.length < 2 || !Array.isArray(timestamps) || !timestamps.length) return null;
+    const sampled = new Set(timestamps.map(chartTimestampMs));
+    // SoC verbindet die unveränderten Bilanz-Eckpunkte. Teilintervalle beginnen
+    // erst am belegten Integrationsanker; außerhalb des Plans bleibt eine Lücke.
     const projection = timestamps.map(value => {
         const timestamp = chartTimestampMs(value);
         if (timestamp === null || timestamp < points[0].x
-            || timestamp > points[points.length - 1].x) {
-            return null;
+            || timestamp > points[points.length - 1].x) return null;
+        const slot = view.slots.find(item => timestamp >= item.startTs && timestamp < item.endTs);
+        if (slot) {
+            const anchor = slot.provenance?.integration_anchor_ts_ms;
+            const partialStart = Number.isFinite(anchor) ? anchor : slot.projectionEffectiveStartTs;
+            const partialEnd = Number.isFinite(slot.projectionEffectiveDurationS)
+                && Number.isFinite(partialStart) ? partialStart + slot.projectionEffectiveDurationS * 1000 : null;
+            // Fehlt ein Teilslot-Anker im gröberen Darstellungsraster, wird die
+            // betroffene Strecke ausgelassen. Keine Ladebewegung vor dem Anker.
+            if (Number.isFinite(partialStart) && partialStart > slot.startTs
+                && partialStart < slot.endTs && !sampled.has(partialStart)
+                && timestamp < partialStart) return null;
+            if (Number.isFinite(partialEnd) && partialEnd < slot.endTs
+                && !sampled.has(partialEnd) && timestamp < partialEnd) return null;
         }
-        while (cursor + 1 < points.length && points[cursor + 1].x <= timestamp) {
-            cursor += 1;
-        }
-        return points[cursor].y;
+        const rightIndex = points.findIndex(point => point.x >= timestamp);
+        const right = points[rightIndex];
+        if (!right) return null;
+        if (right.x === timestamp || rightIndex === 0) return right.y;
+        const left = points[rightIndex - 1];
+        return left.y + (right.y - left.y) * (timestamp - left.x) / (right.x - left.x);
     });
     return projection.some(Number.isFinite) ? projection : null;
 }
 
-function buildCompactChartTimeContext(timestamps, fallbackLabels, gridColor, textColor, isDarkMode, maxTicksLimit = 8) {
+function directMarketingPvDisplayStyle(data, weather = false) {
+    const smooth = {tension: 0.3, cubicInterpolationMode: 'monotone', stepped: false, spanGaps: false};
+    if (weather || data?.direct_marketing_enabled !== true) return smooth;
+    const slots = data.direct_marketing_trajectory?.slots;
+    if (!Array.isArray(slots) || !slots.length) return {tension: 0, stepped: 'after', spanGaps: false};
+    const displayed = directMarketingOperatingPvSeries(data);
+    if (!['complete', 'partial'].includes(displayed.state)) return {tension: 0, stepped: 'after', spanGaps: false};
+    const visiblePoints = new Map(data.timestamps.map((timestamp, index) => [timestamp, displayed.operating[index]]));
+    let previous = null;
+    for (const slot of slots) {
+        if (!visiblePoints.has(slot.start_ts_ms) || visiblePoints.get(slot.start_ts_ms) === null) {
+            // Eine validierte Preis-/Prognoselücke bleibt durch spanGaps:false
+            // offen. Die nächste belegte Teilstrecke beginnt unabhängig davon.
+            previous = null;
+            continue;
+        }
+        const projection = slot?.pv_operating_projection;
+        if (!projection || typeof projection.external_ac_off !== 'boolean'
+            || typeof projection.external_ac_off_basis !== 'string') {
+            return {tension: 0, stepped: 'after', spanGaps: false};
+        }
+        const current = JSON.stringify([projection.external_ac_off, projection.external_ac_off_basis,
+            projection.e3dc_export_limit_w ?? null, projection.e3dc_export_limit_basis ?? null]);
+        if (previous !== null && current !== previous) return {tension: 0, stepped: 'after', spanGaps: false};
+        previous = current;
+    }
+    // Nur die Linie wird verbunden. Intervallwerte und Energiesummen bleiben
+    // unverändert; Preiswechsel und Abschaltgrenzen behalten ihre Stufen.
+    return smooth;
+}
+
+function buildCompactChartTimeContext(timestamps, fallbackLabels, gridColor, textColor, isDarkMode, maxTicksLimit = 8, gridOptions = {}) {
     const sourceTimestamps = Array.isArray(timestamps) ? timestamps : [];
     const sourceLabels = Array.isArray(fallbackLabels) ? fallbackLabels : [];
     const count = Math.max(sourceTimestamps.length, sourceLabels.length);
@@ -9454,8 +9520,7 @@ function buildCompactChartTimeContext(timestamps, fallbackLabels, gridColor, tex
     const zoneLabels = [];
     const localSlotCounts = new Map();
     const dateParts = [];
-    const daySeparatorIndices = new Set();
-    let previousDayKey = '';
+    const normalizedTimestamps = [];
 
     for (let index = 0; index < count; index += 1) {
         const timestamp = chartTimestampMs(sourceTimestamps[index]);
@@ -9468,9 +9533,11 @@ function buildCompactChartTimeContext(timestamps, fallbackLabels, gridColor, tex
         const zonePart = validDate
             ? zoneFormatter.formatToParts(date).find(part => part.type === 'timeZoneName')
             : null;
-        if (dayKey && previousDayKey && dayKey !== previousDayKey) daySeparatorIndices.add(index);
-        if (dayKey) previousDayKey = dayKey;
-        if (localSlotKey) localSlotCounts.set(localSlotKey, (localSlotCounts.get(localSlotKey) || 0) + 1);
+        normalizedTimestamps.push(validDate ? timestamp : null);
+        if (localSlotKey) {
+            if (!localSlotCounts.has(localSlotKey)) localSlotCounts.set(localSlotKey, new Set());
+            localSlotCounts.get(localSlotKey).add(zonePart ? zonePart.value : '');
+        }
         baseTimeLabels.push(timeLabel);
         localSlotKeys.push(localSlotKey);
         zoneLabels.push(zonePart ? zonePart.value : '');
@@ -9479,7 +9546,7 @@ function buildCompactChartTimeContext(timestamps, fallbackLabels, gridColor, tex
 
     const timeLabels = baseTimeLabels.map((timeLabel, index) => (
         localSlotKeys[index]
-        && localSlotCounts.get(localSlotKeys[index]) > 1
+        && localSlotCounts.get(localSlotKeys[index]).size > 1
         && zoneLabels[index]
             ? `${timeLabel} ${zoneLabels[index]}`
             : timeLabel
@@ -9488,21 +9555,12 @@ function buildCompactChartTimeContext(timestamps, fallbackLabels, gridColor, tex
         dateParts[index] ? `${dateParts[index]} ${timeLabel}` : timeLabel
     ));
 
-    const compactTickIndices = new Set();
     const boundedTickLimit = Math.max(2, Number(maxTicksLimit) || 8);
-    if (count > 0) compactTickIndices.add(0);
-    if (count > 1) compactTickIndices.add(count - 1);
-    daySeparatorIndices.forEach(index => compactTickIndices.add(index));
-    const remainingTickSlots = Math.max(0, boundedTickLimit - compactTickIndices.size);
-    for (let slot = 1; slot <= remainingTickSlots; slot += 1) {
-        const index = Math.round((slot * (count - 1)) / (remainingTickSlots + 1));
-        if (index >= 0 && index < count) compactTickIndices.add(index);
-    }
-
-    const chartDataIndex = context => {
-        const tickValue = Number(context && context.tick ? context.tick.value : Number.NaN);
-        return Number.isFinite(tickValue) ? Math.round(tickValue) : -1;
-    };
+    const tickLabels = new Map();
+    const midnightTicks = new Set();
+    const chronological = count > 1 && normalizedTimestamps.length === count
+        && normalizedTimestamps.every((timestamp, index) => Number.isFinite(timestamp)
+            && (index === 0 || timestamp > normalizedTimestamps[index - 1]));
 
     return {
         labels: timeLabels,
@@ -9512,35 +9570,108 @@ function buildCompactChartTimeContext(timestamps, fallbackLabels, gridColor, tex
             return dateTimeLabels[index] || timeLabels[index] || '';
         },
         xScale: {
+            type: 'category',
+            offset: false,
             afterBuildTicks: scale => {
                 if (!scale || !Array.isArray(scale.ticks)) return;
-                scale.ticks = scale.ticks.filter(tick => {
-                    const value = Number(tick && tick.value);
-                    return Number.isFinite(value) && compactTickIndices.has(Math.round(value));
+                tickLabels.clear();
+                midnightTicks.clear();
+                const min = Math.max(0, Number(scale.min) || 0);
+                const max = Math.min(count - 1, Number(scale.max) || 0);
+                const timestampAt = index => {
+                    const low = Math.floor(index), high = Math.ceil(index);
+                    return normalizedTimestamps[low]
+                        + (normalizedTimestamps[high] - normalizedTimestamps[low]) * (index - low);
+                };
+                const fixedClockGrid = chronological && max > min;
+                let candidates;
+                if (fixedClockGrid) {
+                    const from = timestampAt(min), until = timestampAt(max);
+                    const hours = (until - from) / 3600000;
+                    const steps = [1 / 60, 5 / 60, 0.25, 0.5, 1, 3, 6, 12, 24];
+                    const adaptiveStep = steps.find(step => step >= hours / 8) || 24;
+                    const requestedStep = Number(gridOptions.tickStepHours);
+                    const stepHours = requestedStep > 0 && hours >= requestedStep * 2
+                        ? requestedStep : adaptiveStep;
+                    const stepMinutes = Math.max(1, Math.round(stepHours * 60));
+                    // Das Raster folgt der lokalen Uhrzeit, auch an Zeitumstellungstagen.
+                    // Zwischen Messpunkten wird nur die Achsenposition interpoliert.
+                    const increment = Math.min(stepMinutes, 60) * 60000;
+                    candidates = [];
+                    let low = Math.floor(min);
+                    for (let timestamp = Math.ceil(from / increment) * increment; timestamp <= until; timestamp += increment) {
+                        const date = new Date(timestamp);
+                        const timeLabel = timeFormatter.format(date);
+                        const [hour, minute] = timeLabel.split(':').map(Number);
+                        if ((hour * 60 + minute) % stepMinutes !== 0) continue;
+                        while (low + 1 < count && normalizedTimestamps[low + 1] < timestamp) low += 1;
+                        const high = Math.min(count - 1, low + 1);
+                        const value = low + (timestamp - normalizedTimestamps[low])
+                            / (normalizedTimestamps[high] - normalizedTimestamps[low]);
+                        const localKey = `${dayKeyFormatter.format(date)}|${timeLabel}`;
+                        const zone = zoneFormatter.formatToParts(date).find(part => part.type === 'timeZoneName');
+                        candidates.push({value, timeLabel, datePart: dateFormatter.format(date),
+                            localKey, zone: zone ? zone.value : '', midnight: hour === 0 && minute === 0});
+                    }
+                    const repeatedSlots = new Map();
+                    candidates.forEach(tick => repeatedSlots.set(tick.localKey, (repeatedSlots.get(tick.localKey) || 0) + 1));
+                    candidates.forEach(tick => {
+                        if (repeatedSlots.get(tick.localKey) > 1 && tick.zone) tick.timeLabel += ` ${tick.zone}`;
+                    });
+                } else {
+                    // Ohne belastbare Zeitstempel bleiben vorhandene Beschriftungen erhalten.
+                    candidates = scale.ticks.map(tick => ({value: Number(tick.value),
+                        timeLabel: timeLabels[tick.value] || '', datePart: dateParts[tick.value] || '', midnight: false}));
+                }
+                const widths = [scale.width, scale.maxWidth, scale.chart && scale.chart.width]
+                    .map(Number).filter(value => Number.isFinite(value) && value > 0);
+                const width = widths.length ? Math.min(...widths) : 300;
+                const font = scale.options && scale.options.ticks && scale.options.ticks.font || {};
+                const fontSize = Number(font.size) || 12;
+                const ctx = scale.ctx;
+                if (ctx && ctx.save) ctx.save();
+                if (ctx) ctx.font = `${font.style || 'normal'} ${font.weight || ''} ${fontSize}px ${font.family || 'Arial'}`;
+                const positions = candidates.map((tick, index) => {
+                    const label = (index === 0 || tick.midnight) && tick.datePart
+                        ? [tick.datePart, tick.timeLabel] : [tick.timeLabel];
+                    const labelWidth = Math.max(...label.map(line => ctx && ctx.measureText
+                        ? ctx.measureText(line).width : line.length * fontSize * 0.6));
+                    if (tick.midnight) midnightTicks.add(tick.value);
+                    return {tick, label, x: (tick.value - min) * width / Math.max(1, max - min), width: labelWidth};
                 });
+                if (ctx && ctx.restore) ctx.restore();
+                // Nur Text wird bei Platzmangel ausgedünnt; feste Rasterlinien bleiben.
+                const selected = [];
+                const add = candidate => {
+                    if (candidate && selected.length < boundedTickLimit && selected.every(other =>
+                        Math.abs(candidate.x - other.x) >= (candidate.width + other.width) / 2 + 18
+                    )) selected.push(candidate);
+                };
+                positions.filter(candidate => candidate.tick.midnight).forEach(add);
+                add(positions[0]);
+                positions.forEach(add);
+                candidates.forEach(tick => tickLabels.set(tick.value, ''));
+                selected.forEach(candidate => tickLabels.set(candidate.tick.value, candidate.label));
+                scale.ticks = (fixedClockGrid ? candidates : selected.map(candidate => candidate.tick)
+                    .sort((left, right) => left.value - right.value)).map(tick => ({value: tick.value}));
             },
             grid: {
-                color: ctx => daySeparatorIndices.has(chartDataIndex(ctx))
-                    ? (isDarkMode ? 'rgba(148, 163, 184, 0.65)' : 'rgba(100, 116, 139, 0.5)')
-                    : gridColor,
-                lineWidth: ctx => daySeparatorIndices.has(chartDataIndex(ctx)) ? 2 : 1
+                // Auch gemischte Balken-/Liniencharts markieren die Uhrzeit selbst.
+                offset: false,
+                color: ctx => {
+                    const dark = typeof DARK_MODE !== 'undefined' ? DARK_MODE : isDarkMode;
+                    if (midnightTicks.has(Number(ctx && ctx.tick && ctx.tick.value))) {
+                        return dark ? 'rgba(148, 163, 184, 0.65)' : 'rgba(100, 116, 139, 0.5)';
+                    }
+                    return typeof DARK_MODE !== 'undefined' ? (dark ? '#333' : '#e9ecef') : gridColor;
+                },
+                lineWidth: ctx => midnightTicks.has(Number(ctx && ctx.tick && ctx.tick.value)) ? 2 : 1
             },
             ticks: {
                 color: textColor,
                 autoSkip: false,
-                maxTicksLimit: boundedTickLimit,
                 maxRotation: 0,
-                callback: function(value, index) {
-                    const numericValue = Number(value);
-                    const dataIndex = Number.isFinite(numericValue) ? Math.round(numericValue) : index;
-                    const timeLabel = timeLabels[dataIndex]
-                        || (this.getLabelForValue ? this.getLabelForValue(value) : String(value));
-                    if (dataIndex === 0 || daySeparatorIndices.has(dataIndex)) {
-                        const datePart = dateParts[dataIndex] || '';
-                        return datePart ? [datePart, timeLabel] : timeLabel;
-                    }
-                    return timeLabel;
-                }
+                callback: value => tickLabels.get(Number(value)) || ''
             }
         }
     };
@@ -9588,6 +9719,7 @@ function renderDirectMarketingForecastChart(data = {}, options = {}) {
             .concat(view.slots
                 .filter(slot => slot.plannedRole === 'projection' && Number.isFinite(slot.projectionEffectiveStartTs))
                 .map(slot => slot.projectionEffectiveStartTs))
+            .concat(directMarketingSocDisplayPoints(view).map(point => point.x))
             .concat([view.slots[view.slots.length - 1].endTs])
     )).sort((left, right) => left - right);
     const slotIndexForTimestamp = timestamp => view.slots.findIndex(slot => slot.startTs <= timestamp && timestamp < slot.endTs);
@@ -9602,14 +9734,11 @@ function renderDirectMarketingForecastChart(data = {}, options = {}) {
             && timestamp < slot.projectionEffectiveStartTs + slot.projectionEffectiveDurationS * 1000)) return null;
         return values[slotIndex] ?? null;
     });
-    const socForPoints = pointTimestamps.map(timestamp => {
-        const slotIndex = slotIndexForTimestamp(timestamp);
-        return slotIndex >= 0 ? view.slots[slotIndex].socStartPct : view.slots[view.slots.length - 1].socEndPct;
-    });
+    const socForPoints = directMarketingSocProjectionForTimestamps(view, pointTimestamps);
     const isDark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
     const tickColor = isDark ? '#adb5bd' : '#6c757d';
     const gridColor = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.07)';
-    const timeContext = buildCompactChartTimeContext(pointTimestamps, [], gridColor, tickColor, isDark, 8);
+    const timeContext = buildCompactChartTimeContext(pointTimestamps, [], gridColor, tickColor, isDark, 8, {tickStepHours: 12});
     const currentSoc = currentSocMarkerForTimestamps(pointTimestamps);
     if (stateEl) {
         const currentSocText = currentSoc.soc !== null ? ` · aktueller SoC ${currentSoc.soc.toFixed(1)}%` : '';
@@ -9621,7 +9750,7 @@ function renderDirectMarketingForecastChart(data = {}, options = {}) {
     _directMarketingForecastChartInstance = new Chart(canvas, {
         type: 'line',
         data: {labels: timeContext.labels, datasets: [
-            ...(view.state === 'complete' ? [{label: 'DV-SoC-Prognose', data: socForPoints, borderColor: '#8b5cf6', backgroundColor: 'rgba(139,92,246,0.08)', borderWidth: 2.5, pointRadius: 0, tension: 0, stepped: 'after', yAxisID: 'ySoc', order: 1}] : []),
+            ...(view.state === 'complete' ? [{label: 'DV-SoC-Prognose', data: socForPoints, borderColor: '#8b5cf6', backgroundColor: 'rgba(139,92,246,0.08)', borderWidth: 2.5, pointRadius: 0, tension: 0, stepped: false, spanGaps: false, yAxisID: 'ySoc', order: 1}] : []),
             ...(currentSoc.index >= 0 ? [{label: 'Aktueller SoC (Messwert)', data: currentSoc.data, showLine: false, borderColor: '#22c55e', backgroundColor: '#22c55e', pointRadius: 6, pointHoverRadius: 8, pointStyle: 'circle', yAxisID: 'ySoc', order: 0}] : []),
             {label: 'PV speichern (Plan)', data: seriesForPoints(view.series.pvStoreW).map(value => value === null ? null : value / 1000), type: 'bar', borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.38)', borderWidth: 1, borderSkipped: false, yAxisID: 'yPower', order: 3},
             {label: 'Wirtschaftlicher Export (Plan)', data: seriesForPoints(view.series.economicExportW).map(value => value === null ? null : value / 1000), type: 'bar', borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.38)', borderWidth: 1, borderSkipped: false, yAxisID: 'yPower', order: 3},
@@ -9863,15 +9992,76 @@ function loadJsLiveChart(hours, file = null) {
 
             datasets = applyHiddenState(datasets);
 
+            // Jeder Datensatz erhält eigene Achsen und Tooltip-Closures.
+            const liveTimeContext = buildCompactChartTimeContext(data.timestamps, data.labels, gridColor, textColor, isDarkMode, 12);
+            const liveXScale = liveTimeContext.xScale;
+            const liveTooltip = {
+                filter: function(item) {
+                    if (item.dataset.label && item.dataset.label.includes('__HIDDEN__')) return false;
+                    if (item.dataset.label === 'Peak-Ersparnis') {
+                        let limitIdx = item.chart.data.datasets.findIndex(d => d.label === '__HIDDEN__Abregel-Limit');
+                        if (limitIdx >= 0) {
+                            let limitVal = item.chart.data.datasets[limitIdx].data[item.dataIndex];
+                            if (chartRawY(item) <= limitVal) return false;
+                        }
+                    }
+                    return true;
+                },
+                callbacks: {
+                    title: liveTimeContext.tooltipTitle,
+                    label: (ctx) => {
+                        let unit = 'W'; let l = ctx.dataset.label;
+                        if (l && l.includes('__HIDDEN__')) return null;
+                        if (l.includes('(%)') || l === 'SoC (%)') unit = '%'; else if (l.includes('Spannung')) unit = 'V'; else if (l.includes('Strompreis')) unit = 'ct/kWh'; else if (l.includes('Strom')) unit = 'A';
+                        else if (l.includes('(°C)')) unit = '°C'; else if (l.includes('(Hz)')) unit = 'Hz';
+                        let cleanLabel = l.replace(/\s\([^)]+\)/, ''); // Entfernt "(°C)" aus der Anzeige im Text
+
+                        let origVal = chartRawY(ctx);
+                        if (chartFlipNegatives) {
+                            if (l === 'Batterie Leistung' || l === 'Batterie') origVal = data.bat[ctx.dataIndex];
+                            else if (l === 'Netz Gesamt' || l === 'Netz') origVal = data.grid[ctx.dataIndex];
+                            else if (l === 'Wallbox' || l === 'Wallbox 1' || l === 'Wallbox Gesamt') origVal = data.wb[ctx.dataIndex];
+                            else if (l === 'Wallbox 2') origVal = data.wb2[ctx.dataIndex];
+                            else if (l === 'WR Gesamt') origVal = data.ac_total[ctx.dataIndex];
+                            else if (l === 'L1' && CURRENT_VIEW === 'grid') origVal = data.grid_p1[ctx.dataIndex];
+                            else if (l === 'L2' && CURRENT_VIEW === 'grid') origVal = data.grid_p2[ctx.dataIndex];
+                            else if (l === 'L3' && CURRENT_VIEW === 'grid') origVal = data.grid_p3[ctx.dataIndex];
+                            else if (l === 'Strom') origVal = data.bat_a[ctx.dataIndex];
+                            else if (l === 'Strom K2') origVal = data.bat1_a[ctx.dataIndex];
+                        }
+
+                        let val = chartRawY(ctx);
+                        if (cleanLabel === 'Peak-Ersparnis') {
+                            let limitIdx = ctx.chart.data.datasets.findIndex(d => d.label === '__HIDDEN__Abregel-Limit');
+                            if (limitIdx >= 0) {
+                                val = Math.round(val - ctx.chart.data.datasets[limitIdx].data[ctx.dataIndex]);
+                            }
+                        } else if (cleanLabel === 'Batterie' || cleanLabel === 'Batterie Leistung') {
+                            cleanLabel = origVal > 0 ? 'Laden' : (origVal < 0 ? 'Entladen' : 'Batterie');
+                            val = Math.abs(val);
+                        } else if (cleanLabel === 'Netz' || cleanLabel === 'Netz Gesamt') {
+                            cleanLabel = origVal > 0 ? 'Netzbezug' : (origVal < 0 ? 'Einspeisung' : 'Netz');
+                            val = Math.abs(val);
+                        } else if (cleanLabel === 'Wallbox' || cleanLabel === 'Wallbox 1' || cleanLabel === 'Wallbox 2' || cleanLabel === 'Wallbox Gesamt') {
+                            cleanLabel = origVal < -50 ? `${cleanLabel} V2H` : cleanLabel;
+                            val = Math.abs(val);
+                        }
+                        return ` ${cleanLabel}: ${val} ${unit}`;
+                    }
+                }
+            };
+
             if (liveLineChart) {
                 liveLineChart.resetZoom();
-                liveLineChart.data.labels = data.labels; liveLineChart.data.datasets = datasets;
-                liveLineChart.options.scales = { x: liveLineChart.options.scales.x, ...yAxes };
+                liveLineChart.data.labels = liveTimeContext.labels; liveLineChart.data.datasets = datasets;
+                liveLineChart.options.scales = { x: liveXScale, ...yAxes };
+                liveLineChart.options.plugins.legend.display = true;
+                liveLineChart.options.plugins.tooltip = liveTooltip;
                 liveLineChart.update('none');
             } else {
                 const ctx = document.getElementById('liveChartCanvas').getContext('2d');
                 liveLineChart = new Chart(ctx, {
-                    type: 'line', data: { labels: data.labels, datasets: datasets },
+                    type: 'line', data: { labels: liveTimeContext.labels, datasets: datasets },
                     options: {
                         responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
                         plugins: {
@@ -9890,62 +10080,12 @@ function loadJsLiveChart(hours, file = null) {
                                     saveHiddenDataset(legendItem.text, isHidden);
                                 }
                             },
-                            tooltip: {
-                                filter: function(item) {
-                                    if (item.dataset.label && item.dataset.label.includes('__HIDDEN__')) return false;
-                                    if (item.dataset.label === 'Peak-Ersparnis') {
-                                        let limitIdx = item.chart.data.datasets.findIndex(d => d.label === '__HIDDEN__Abregel-Limit');
-                                        if (limitIdx >= 0) {
-                                            let limitVal = item.chart.data.datasets[limitIdx].data[item.dataIndex];
-                                            if (chartRawY(item) <= limitVal) return false;
-                                        }
-                                    }
-                                    return true;
-                                },
-                                callbacks: { label: (ctx) => {
-                                let unit = 'W'; let l = ctx.dataset.label;
-                                if (l && l.includes('__HIDDEN__')) return null;
-                                if (l.includes('(%)') || l === 'SoC (%)') unit = '%'; else if (l.includes('Spannung')) unit = 'V'; else if (l.includes('Strompreis')) unit = 'ct/kWh'; else if (l.includes('Strom')) unit = 'A';
-                                else if (l.includes('(°C)')) unit = '°C'; else if (l.includes('(Hz)')) unit = 'Hz';
-                                let cleanLabel = l.replace(/\s\([^)]+\)/, ''); // Entfernt "(°C)" aus der Anzeige im Text
-
-                                let origVal = chartRawY(ctx);
-                                if (chartFlipNegatives) {
-                                    if (l === 'Batterie Leistung' || l === 'Batterie') origVal = data.bat[ctx.dataIndex];
-                                    else if (l === 'Netz Gesamt' || l === 'Netz') origVal = data.grid[ctx.dataIndex];
-                                    else if (l === 'Wallbox' || l === 'Wallbox 1' || l === 'Wallbox Gesamt') origVal = data.wb[ctx.dataIndex];
-                                    else if (l === 'Wallbox 2') origVal = data.wb2[ctx.dataIndex];
-                                    else if (l === 'WR Gesamt') origVal = data.ac_total[ctx.dataIndex];
-                                    else if (l === 'L1' && CURRENT_VIEW === 'grid') origVal = data.grid_p1[ctx.dataIndex];
-                                    else if (l === 'L2' && CURRENT_VIEW === 'grid') origVal = data.grid_p2[ctx.dataIndex];
-                                    else if (l === 'L3' && CURRENT_VIEW === 'grid') origVal = data.grid_p3[ctx.dataIndex];
-                                    else if (l === 'Strom') origVal = data.bat_a[ctx.dataIndex];
-                                    else if (l === 'Strom K2') origVal = data.bat1_a[ctx.dataIndex];
-                                }
-
-                                let val = chartRawY(ctx);
-                                if (cleanLabel === 'Peak-Ersparnis') {
-                                    let limitIdx = ctx.chart.data.datasets.findIndex(d => d.label === '__HIDDEN__Abregel-Limit');
-                                    if (limitIdx >= 0) {
-                                        val = Math.round(val - ctx.chart.data.datasets[limitIdx].data[ctx.dataIndex]);
-                                    }
-                                } else if (cleanLabel === 'Batterie' || cleanLabel === 'Batterie Leistung') {
-                                    cleanLabel = origVal > 0 ? 'Laden' : (origVal < 0 ? 'Entladen' : 'Batterie');
-                                    val = Math.abs(val);
-                                } else if (cleanLabel === 'Netz' || cleanLabel === 'Netz Gesamt') {
-                                    cleanLabel = origVal > 0 ? 'Netzbezug' : (origVal < 0 ? 'Einspeisung' : 'Netz');
-                                    val = Math.abs(val);
-                                } else if (cleanLabel === 'Wallbox' || cleanLabel === 'Wallbox 1' || cleanLabel === 'Wallbox 2' || cleanLabel === 'Wallbox Gesamt') {
-                                    cleanLabel = origVal < -50 ? `${cleanLabel} V2H` : cleanLabel;
-                                    val = Math.abs(val);
-                                }
-                                return ` ${cleanLabel}: ${val} ${unit}`;
-                            } } },
+                            tooltip: liveTooltip,
                             zoom: {
                                 pan: { enabled: true, mode: 'x' },
                                 zoom: { wheel: { enabled: true }, pinch: { enabled: true }, mode: 'x' }
                             }
-                        }, scales: { x: { grid: { color: gridColor }, ticks: { maxTicksLimit: 12, color: textColor } }, ...yAxes }
+                        }, scales: { x: liveXScale, ...yAxes }
                     }
                 });
                 const canvas = document.getElementById('liveChartCanvas');
@@ -9965,7 +10105,7 @@ function loadJsLiveChart(hours, file = null) {
 function buildForecastChartTimeContext(data, gridColor, textColor, isDarkMode) {
     const sourceLabels = Array.isArray(data && data.labels) ? data.labels : [];
     const timestamps = Array.isArray(data && data.timestamps) ? data.timestamps : [];
-    return buildCompactChartTimeContext(timestamps, sourceLabels, gridColor, textColor, isDarkMode, 8);
+    return buildCompactChartTimeContext(timestamps, sourceLabels, gridColor, textColor, isDarkMode, 8, {tickStepHours: 12});
 }
 
 function directMarketingBalanceSeries(data = {}, view = null) {
@@ -10151,7 +10291,7 @@ function loadJsForecastChart(file = '') {
                 directMarketingView,
                 data.timestamps || []
             );
-            const useDirectMarketingSoc = Array.isArray(directMarketingSoc);
+            const useDirectMarketingSoc = directMarketingView.active === true;
             const currentSoc = currentSocMarkerForTimestamps(data.timestamps || []);
             const operatingPv = directMarketingOperatingPvSeries(data, directMarketingView);
             const directMarketingPv = operatingPv.state !== 'inactive';
@@ -10162,8 +10302,8 @@ function loadJsForecastChart(file = '') {
             const mapBalanceFlip = arr => directMarketingBalance && chartFlipNegatives && arr
                 ? arr.map(value => value === null ? null : Math.abs(value)) : mapFlip(arr);
             let datasets = [
-                { label: directMarketingPv ? (operatingPv.state === 'complete' ? 'PV betrieblich verfügbar (Plan)' : (operatingPv.state === 'partial' ? 'PV betrieblich verfügbar (Plan; Preisstand teilweise offen)' : 'PV-Verfügbarkeit nicht belegt')) : 'Sonne (PV)', data: operatingPv.operating, borderColor: getFlowColor('pv', '#ffc107'), backgroundColor: flowColorAlpha('pv', 0.15, '#ffc107'), fill: true, tension: directMarketingPv ? 0 : 0.3, stepped: directMarketingPv ? 'after' : false, pointRadius: 0, borderWidth: 2, yAxisID: 'y', order: 10 },
-                ...(directMarketingPv ? [{label: 'PV-Wetterpotential', data: operatingPv.weatherPotential, borderColor: getFlowColor('pv', '#ffc107'), fill: false, borderDash: [3, 4], tension: 0, stepped: 'after', pointRadius: 0, borderWidth: 1.5, yAxisID: 'y', order: 11}] : []),
+                { label: directMarketingPv ? (operatingPv.state === 'complete' ? 'PV betrieblich verfügbar (Plan)' : (operatingPv.state === 'partial' ? 'PV betrieblich verfügbar (Plan; Preisstand teilweise offen)' : 'PV-Verfügbarkeit nicht belegt')) : 'Sonne (PV)', data: operatingPv.operating, borderColor: getFlowColor('pv', '#ffc107'), backgroundColor: flowColorAlpha('pv', 0.15, '#ffc107'), fill: true, ...directMarketingPvDisplayStyle(data), pointRadius: 0, borderWidth: 2, yAxisID: 'y', order: 10 },
+                ...(directMarketingPv ? [{label: 'PV-Wetterpotential', data: operatingPv.weatherPotential, borderColor: getFlowColor('pv', '#ffc107'), fill: false, borderDash: [3, 4], ...directMarketingPvDisplayStyle(data, true), pointRadius: 0, borderWidth: 1.5, yAxisID: 'y', order: 11}] : []),
                 { label: 'Hausverbrauch', data: data.home, borderColor: getFlowColor('home', '#0dcaf0'), tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y', order: 10 },
                 { label: directMarketingBalance ? 'Batterie (DV-Plan)' : 'Batterie', data: mapBalanceFlip(forecastBattery), borderColor: getFlowColor('battery', '#198754'), tension: directMarketingBalance ? 0 : 0.3, stepped: directMarketingBalance ? 'after' : false, pointRadius: 0, borderWidth: 2, yAxisID: 'y', segment: { borderDash: dashIfNeg(forecastBattery) }, order: 10 },
                 { label: directMarketingBalance ? 'Netz (DV-Plan)' : 'Netz', data: mapBalanceFlip(forecastGrid), borderColor: getFlowColor('grid', '#6c757d'), tension: directMarketingBalance ? 0 : 0.3, stepped: directMarketingBalance ? 'after' : false, pointRadius: 0, borderWidth: 2, yAxisID: 'y', segment: { borderDash: dashIfNeg(forecastGrid) }, order: 10 }
@@ -10176,14 +10316,15 @@ function loadJsForecastChart(file = '') {
                     : (forecastSocCurrent
                         ? 'Standard-SoC-Prognose (%)'
                         : 'SoC-Planung (nicht aktuell) (%)'),
-                data: useDirectMarketingSoc ? directMarketingSoc : data.soc,
+                data: useDirectMarketingSoc ? (directMarketingSoc || data.labels.map(() => null)) : data.soc,
                 borderColor: useDirectMarketingSoc ? '#8b5cf6' : '#20c997',
                 backgroundColor: useDirectMarketingSoc
                     ? 'rgba(139,92,246,0.08)'
                     : 'rgba(32,201,151,0.08)',
                 tension: useDirectMarketingSoc ? 0 : 0.45,
                 cubicInterpolationMode: useDirectMarketingSoc ? undefined : 'monotone',
-                stepped: useDirectMarketingSoc ? 'after' : false,
+                stepped: false,
+                spanGaps: false,
                 pointRadius: 0,
                 borderWidth: useDirectMarketingSoc ? 2.5 : 2,
                 borderDash: useDirectMarketingSoc || forecastSocCurrent ? undefined : [5, 5],
@@ -10327,35 +10468,30 @@ function loadJsHybridChart(hours, file = null) {
     const pastHours = hours / 2;
     const futureHours = hours / 2;
 
-    // Hilfsfunktionen für Zeitrechnung
-    const parseClockMins = (label) => {
-        const match = String(label || '').match(/^(\d{1,2}):(\d{2})/);
-        if (!match) return null;
-        const h = Number(match[1]);
-        const m = Number(match[2]);
-        if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
-        return (((h % 24) + 24) % 24) * 60 + Math.max(0, Math.min(59, m));
-    };
-    const liftClockMins = (clockMins, refMins) => {
-        let mins = clockMins;
-        if (refMins !== null && refMins !== undefined && Number.isFinite(refMins)) {
-            mins = clockMins + Math.floor(refMins / 1440) * 1440;
-            while (mins < refMins - 60) mins += 1440;
-            while (mins > refMins + 36 * 60) mins -= 1440;
+    const clockFormatter = new Intl.DateTimeFormat('de-DE', {
+        timeZone: 'Europe/Berlin', hour: '2-digit', minute: '2-digit'
+    });
+    const fmtTime = minutes => clockFormatter.format(new Date(minutes * 60000));
+    const sourceMinutes = (source, anchorMs = Date.now()) => {
+        const labels = Array.isArray(source.labels) ? source.labels : [];
+        const timestamps = Array.isArray(source.timestamps) ? source.timestamps : [];
+        if (timestamps.length === labels.length && timestamps.every(value => chartTimestampMs(value) !== null)) {
+            return timestamps.map(value => chartTimestampMs(value) / 60000);
         }
-        return mins;
-    };
-    const fmtTime = (totalMins) => {
-        const m = ((totalMins % 1440) + 1440) % 1440;
-        return `${String(Math.floor(m / 60)).padStart(2,'0')}:${String(m % 60).padStart(2,'0')}`;
-    };
-    const hybridDateBase = new Date();
-    hybridDateBase.setHours(0, 0, 0, 0);
-    const hybridDateFormatter = new Intl.DateTimeFormat('de-DE', { weekday: 'short', day: '2-digit', month: '2-digit' });
-    const formatHybridDatePart = (totalMins) => {
-        if (totalMins === null || totalMins === undefined || !Number.isFinite(totalMins)) return '';
-        const date = new Date(hybridDateBase.getTime() + Math.round(totalMins) * 60000);
-        return hybridDateFormatter.format(date);
+        // Kompatibilität mit alten Verlaufdateien ohne Zeitstempel. Rückwärts
+        // vom letzten bekannten Zeitpunkt zuordnen, damit Mitternacht stimmt.
+        const result = labels.map(() => null);
+        let next = anchorMs;
+        for (let i = labels.length - 1; i >= 0; i--) {
+            const match = String(labels[i] || '').match(/^(\d{1,2}):(\d{2})/);
+            if (!match || Number(match[1]) > 23 || Number(match[2]) > 59) continue;
+            const date = new Date(next);
+            date.setHours(Number(match[1]), Number(match[2]), 0, 0);
+            if (date.getTime() > next + 60000) date.setDate(date.getDate() - 1);
+            result[i] = date.getTime() / 60000;
+            next = date.getTime();
+        }
+        return result;
     };
 
     let urlLive = 'get_chart_data.php?hours=' + pastHours;
@@ -10370,15 +10506,23 @@ function loadJsHybridChart(hours, file = null) {
     ]).then(([data, forecastData]) => {
         if (!isCurrentJsChartRequest('hybrid', requestGeneration)) return;
         if (data.error) return;
-        updateForecastProjectionStatus(forecastData);
+        const directMarketingView = renderDirectMarketingForecastChart(forecastData);
+        updateForecastProjectionStatus(forecastData, directMarketingView);
         updatePvForecastDiagnostics(forecastData);
-        renderDirectMarketingForecastChart(forecastData);
         if (forecastData.error || !forecastData.labels) forecastData = { labels: [], pv: [], home: [], bat: [], grid: [], soc: [] };
 
         const isDarkMode = typeof DARK_MODE !== 'undefined' ? DARK_MODE : true;
         const textColor = isDarkMode ? '#aaa' : '#666';
         const gridColor = isDarkMode ? '#333' : '#e9ecef';
-        const mapFlip = (arr) => chartFlipNegatives && arr ? arr.map(Math.abs) : arr;
+        const mapFlip = arr => chartFlipNegatives && arr
+            ? arr.map(value => value === null ? null : Math.abs(value)) : arr;
+        const operatingPv = directMarketingOperatingPvSeries(forecastData, directMarketingView);
+        const balance = directMarketingBalanceSeries(forecastData, directMarketingView);
+        const directMarketing = directMarketingView.active === true;
+        const directMarketingSoc = directMarketingSocProjectionForTimestamps(directMarketingView, forecastData.timestamps || []);
+        const forecastSoc = directMarketing ? (directMarketingSoc || forecastData.labels.map(() => null)) : forecastData.soc;
+        const valueAt = (values, index) => values && typeof values[index] === 'number'
+            && Number.isFinite(values[index]) ? values[index] : null;
 
         // --- Live-Daten auf 15-Minuten-Buckets downsampeln ---
         // Damit beide Chart-Hälften gleiche Punkt-Dichte haben und "Jetzt" in der Mitte liegt
@@ -10394,18 +10538,7 @@ function loadJsHybridChart(hours, file = null) {
         const hasPrice = !!(data.price);
         const hasDvGrid = !!(data.dv_grid);
 
-        const rawAbsMins = [];
-        let prevLiveAbsMins = null;
-        rawLabels.forEach((lbl, i) => {
-            const clockMins = parseClockMins(lbl);
-            if (clockMins === null) {
-                rawAbsMins[i] = null;
-                return;
-            }
-            const absMins = liftClockMins(clockMins, prevLiveAbsMins);
-            rawAbsMins[i] = absMins;
-            prevLiveAbsMins = absMins;
-        });
+        const rawAbsMins = sourceMinutes(data);
 
         const buckets = {};
         rawLabels.forEach((lbl, i) => {
@@ -10414,7 +10547,11 @@ function loadJsHybridChart(hours, file = null) {
             const slotKey = Math.floor(mins / SLOT) * SLOT;
             if (!buckets[slotKey]) buckets[slotKey] = { count: 0 };
             const b = buckets[slotKey];
-            const add = (k, v) => { if (v !== null && v !== undefined) b[k] = (b[k] || 0) + v; };
+            const add = (k, v) => {
+                if (typeof v !== 'number' || !Number.isFinite(v)) return;
+                b[k] = (b[k] || 0) + v;
+                b[k + '_count'] = (b[k + '_count'] || 0) + 1;
+            };
             add('pv', data.pv[i]); add('home', data.home[i]); add('bat', data.bat[i]);
             add('grid', data.grid[i]); add('soc', data.soc[i]);
             if (hasWb1) add('wb', data.wb[i]);
@@ -10431,22 +10568,11 @@ function loadJsHybridChart(hours, file = null) {
 
         // Finde Startpunkt für Prognose (Nahtloser Übergang ab letztem Live-Slot)
         const lastLiveMins = slotKeys.length > 0 ? slotKeys[slotKeys.length - 1] : null;
-        const forecastAbsMins = [];
-        let prevForecastMins = null;
-        for (let i = 0; i < forecastData.labels.length; i++) {
-            const clockMins = parseClockMins(forecastData.labels[i]);
-            if (clockMins === null) {
-                forecastAbsMins[i] = null;
-                continue;
-            }
-            const refMins = prevForecastMins !== null ? prevForecastMins : lastLiveMins;
-            const absMins = liftClockMins(clockMins, refMins);
-            forecastAbsMins[i] = absMins;
-            prevForecastMins = absMins;
-        }
+        const forecastAbsMins = sourceMinutes(forecastData,
+            (lastLiveMins === null ? Date.now() : lastLiveMins * 60000) + futureHours * 3600000);
 
-        let startIndex = file ? 0 : forecastData.labels.length;
-        if (!file && lastLiveMins !== null) {
+        let startIndex = lastLiveMins === null ? 0 : forecastData.labels.length;
+        if (lastLiveMins !== null) {
             for (let i = 0; i < forecastAbsMins.length; i++) {
                 const fMins = forecastAbsMins[i];
                 if (fMins !== null && fMins > lastLiveMins) {
@@ -10457,18 +10583,10 @@ function loadJsHybridChart(hours, file = null) {
         }
 
         let labels = [], pv = [], home = [], bat = [], grid = [], soc = [], storageTargetCurve = [], marketCharge = [], predumpHeadroomW = [], predumpCandidateW = [], wb = [], wb2 = [], wp = [], hs = [], climate = [], price = [], dv_grid = [];
-        const labelDateParts = [];
-        const labelDateTimes = [];
-        const daySeparatorIndices = new Set();
-        const rememberHybridLabelDate = (totalMins, fallbackLabel = '') => {
-            const idx = labels.length - 1;
-            const timeLabel = labels[idx] || fallbackLabel || '';
-            const datePart = formatHybridDatePart(totalMins);
-            const previousDate = labelDateParts.length ? labelDateParts[labelDateParts.length - 1] : '';
-            if (datePart && previousDate && previousDate !== datePart) daySeparatorIndices.add(idx);
-            labelDateParts.push(datePart);
-            labelDateTimes.push(datePart ? `${datePart} ${timeLabel}` : timeLabel);
-        };
+        const timestamps = [];
+        const weatherPotential = [], directMarketingMarketPrice = [], directMarketingMarketNetSell = [];
+        const rememberHybridLabelDate = totalMins => timestamps.push(
+            Number.isFinite(totalMins) ? totalMins * 60000 : null);
         let pv_m1 = [], pv_m2 = [], pv_m3 = [], pv_ensemble = [];
         const forecastByAbsSlot = {};
         forecastAbsMins.forEach((absMins, i) => {
@@ -10477,26 +10595,31 @@ function loadJsHybridChart(hours, file = null) {
         });
 
         slotKeys.forEach(slotMin => {
-            const b = buckets[slotMin], n = b.count || 1;
+            const b = buckets[slotMin];
+            const mean = key => b[key + '_count'] ? b[key] / b[key + '_count'] : null;
+            const rounded = (key, places = 0) => mean(key) === null ? null : Number(mean(key).toFixed(places));
             const fmstr = fmtTime(slotMin);
             labels.push(fmstr);
             rememberHybridLabelDate(slotMin, fmstr);
-            pv.push(Math.round((b.pv || 0) / n));
-            home.push(Math.round((b.home || 0) / n));
-            bat.push(Math.round((b.bat || 0) / n));
-            grid.push(Math.round((b.grid || 0) / n));
-            soc.push(+((b.soc || 0) / n).toFixed(1));
+            pv.push(rounded('pv'));
+            home.push(rounded('home'));
+            bat.push(rounded('bat'));
+            grid.push(rounded('grid'));
+            soc.push(rounded('soc', 1));
             storageTargetCurve.push(null);
             marketCharge.push(0);
             predumpHeadroomW.push(0);
             predumpCandidateW.push(0);
-            if (hasWb1) wb.push(Math.round((b.wb || 0) / n));
-            if (hasWb2) wb2.push(Math.round((b.wb2 || 0) / n));
-            if (hasWp) wp.push(Math.round((b.wp || 0) / n));
-            if (hasHs) hs.push(Math.round((b.hs || 0) / n));
-            if (hasClimate) climate.push(Math.round((b.climate || 0) / n));
-            if (hasPrice) price.push(b.price !== undefined ? +((b.price / n).toFixed(2)) : null);
-            dv_grid.push(Math.round((b.dv_grid || 0) / n));
+            if (hasWb1) wb.push(rounded('wb'));
+            if (hasWb2) wb2.push(rounded('wb2'));
+            if (hasWp) wp.push(rounded('wp'));
+            if (hasHs) hs.push(rounded('hs'));
+            if (hasClimate) climate.push(rounded('climate'));
+            if (hasPrice) price.push(rounded('price', 2));
+            dv_grid.push(rounded('dv_grid'));
+            weatherPotential.push(null);
+            directMarketingMarketPrice.push(null);
+            directMarketingMarketNetSell.push(null);
 
             // History (Live-Daten) mit vergangenen Wetter-Prognosen auffüllen
             let m1 = null, m2 = null, m3 = null, ens = null;
@@ -10517,7 +10640,7 @@ function loadJsHybridChart(hours, file = null) {
         const historyLength = labels.length;
 
         // Prognose auf futureHours begrenzen
-        const lastMins = lastLiveMins !== null ? lastLiveMins : 0;
+        const lastMins = lastLiveMins !== null ? lastLiveMins : Math.floor(Date.now() / 900000) * 15;
         const endMinutes = file ? Infinity : lastMins + futureHours * 60;
 
         for (let i = startIndex; i < forecastData.labels.length; i++) {
@@ -10528,22 +10651,25 @@ function loadJsHybridChart(hours, file = null) {
             }
             labels.push((fMins !== null && Number.isFinite(fMins)) ? fmtTime(fMins) : forecastData.labels[i]);
             rememberHybridLabelDate(fMins, forecastData.labels[i]);
-            pv.push(forecastData.pv[i] || 0);
-            home.push(forecastData.home[i] || 0);
-            bat.push(forecastData.bat[i] || 0);
-            grid.push(forecastData.grid[i] || 0);
-            soc.push(forecastData.soc[i] || 0);
+            pv.push(valueAt(operatingPv.operating, i));
+            home.push(valueAt(forecastData.home, i));
+            bat.push(valueAt(balance.battery, i));
+            grid.push(valueAt(balance.grid, i));
+            soc.push(valueAt(forecastSoc, i));
+            weatherPotential.push(valueAt(operatingPv.weatherPotential, i));
+            directMarketingMarketPrice.push(directMarketing ? valueAt(forecastData.market_price, i) : null);
+            directMarketingMarketNetSell.push(directMarketing ? valueAt(forecastData.direct_marketing_market_net_sell_ct, i) : null);
             storageTargetCurve.push(forecastData.storage_target_curve ? (forecastData.storage_target_curve[i] ?? null) : null);
             marketCharge.push(forecastData.market_charge ? (forecastData.market_charge[i] || 0) : 0);
             predumpHeadroomW.push(forecastData.predump_w ? Math.max(0, parseFloat(forecastData.predump_w[i]) || 0) : 0);
             predumpCandidateW.push(forecastData.predump_candidate_w ? Math.max(0, parseFloat(forecastData.predump_candidate_w[i]) || 0) : 0);
-            if (hasWb1) wb.push(forecastData.wb ? (forecastData.wb[i] || 0) : 0);
-            if (hasWb2) wb2.push(forecastData.wb2 ? (forecastData.wb2[i] || 0) : 0);
-            if (hasWp && forecastData.wp) wp.push(forecastData.wp[i] || 0);
+            if (hasWb1) wb.push(valueAt(forecastData.wb, i));
+            if (hasWb2) wb2.push(valueAt(forecastData.wb2, i));
+            if (hasWp) wp.push(valueAt(forecastData.wp, i));
             if (hasHs) hs.push(0);
-            if (hasClimate) climate.push(forecastData.climate ? (forecastData.climate[i] || 0) : 0);
-            if (hasPrice) price.push(forecastData.price ? (forecastData.price[i] ?? null) : null);
-            dv_grid.push(forecastData.dv_grid ? (forecastData.dv_grid[i] || 0) : 0);
+            if (hasClimate) climate.push(valueAt(forecastData.climate, i));
+            if (hasPrice) price.push(valueAt(forecastData.price, i));
+            dv_grid.push(valueAt(forecastData.dv_grid, i));
 
             pv_m1.push(forecastData.pv_m1 ? (forecastData.pv_m1[i] ?? null) : null);
             pv_m2.push(forecastData.pv_m2 ? (forecastData.pv_m2[i] ?? null) : null);
@@ -10574,11 +10700,16 @@ function loadJsHybridChart(hours, file = null) {
         pushPredumpHeadroomDataset(datasets, predumpHeadroomW, { borderDash: dashIfNegOrFore(null) });
 
         datasets.push(
-            { label: 'Sonne (PV)', data: pv, borderColor: getFlowColor('pv', '#ffc107'), backgroundColor: flowColorAlpha('pv', 0.15, '#ffc107'), fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y', segment: { borderDash: dashIfNegOrFore(null) }, order: 10 }
+            { label: directMarketing ? 'PV betrieblich verfügbar (Plan)' : 'Sonne (PV)', data: pv, borderColor: getFlowColor('pv', '#ffc107'), backgroundColor: flowColorAlpha('pv', 0.15, '#ffc107'), fill: true, ...directMarketingPvDisplayStyle(forecastData), pointRadius: 0, borderWidth: 2, yAxisID: 'y', segment: { borderDash: dashIfNegOrFore(null) }, order: 10 }
         );
 
+        if (directMarketing) datasets.push({label: 'PV-Wetterpotential', data: weatherPotential,
+            borderColor: getFlowColor('pv', '#ffc107'), fill: false, borderDash: [3, 4],
+            ...directMarketingPvDisplayStyle(forecastData, true), pointRadius: 0,
+            borderWidth: 1.5, yAxisID: 'y', order: 11});
+
         // --- NEU: PEAK SHAVING OVERLAY ---
-        if (typeof SHOW_PEAK_SHAVING !== 'undefined' && SHOW_PEAK_SHAVING && typeof E3DC_LIMITS !== 'undefined' && E3DC_LIMITS.einspeise > 0) {
+        if (!directMarketing && typeof SHOW_PEAK_SHAVING !== 'undefined' && SHOW_PEAK_SHAVING && typeof E3DC_LIMITS !== 'undefined' && E3DC_LIMITS.einspeise > 0) {
             let limitLineData = pv.map((_, i) => {
                 let h = home[i] || 0;
                 let w = wp[i] || 0;
@@ -10605,18 +10736,19 @@ function loadJsHybridChart(hours, file = null) {
 
         datasets.push(
             { label: 'Hausverbrauch', data: home, borderColor: getFlowColor('home', '#0dcaf0'), tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y', segment: { borderDash: dashIfNegOrFore(null) }, order: 10 },
-            { label: 'Batterie', data: mapFlip(bat), borderColor: getFlowColor('battery', '#198754'), tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y', segment: { borderDash: dashIfNegOrFore(bat) }, order: 10 },
-            { label: 'Netz', data: mapFlip(grid), borderColor: getFlowColor('grid', '#6c757d'), tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y', segment: { borderDash: dashIfNegOrFore(grid) }, order: 10 }
+            { label: directMarketing ? 'Batterie (DV-Plan)' : 'Batterie', data: mapFlip(bat), borderColor: getFlowColor('battery', '#198754'), tension: directMarketing ? 0 : 0.3, stepped: directMarketing ? 'after' : false, spanGaps: false, pointRadius: 0, borderWidth: 2, yAxisID: 'y', segment: { borderDash: dashIfNegOrFore(bat) }, order: 10 },
+            { label: directMarketing ? 'Netz (DV-Plan)' : 'Netz', data: mapFlip(grid), borderColor: getFlowColor('grid', '#6c757d'), tension: directMarketing ? 0 : 0.3, stepped: directMarketing ? 'after' : false, spanGaps: false, pointRadius: 0, borderWidth: 2, yAxisID: 'y', segment: { borderDash: dashIfNegOrFore(grid) }, order: 10 }
         );
         datasets.push({
-            label: forecastSocCurrent
+            label: directMarketing ? 'DV-SoC-Prognose (%)' : forecastSocCurrent
                 ? 'Standard-SoC-Prognose (%)'
                 : 'SoC-Planung (nicht aktuell) (%)',
             data: soc,
-            borderColor: '#20c997',
+            borderColor: directMarketing ? '#8b5cf6' : '#20c997',
             backgroundColor: 'rgba(32,201,151,0.08)',
-            tension: 0.45,
-            cubicInterpolationMode: 'monotone',
+            tension: directMarketing ? 0 : 0.45,
+            cubicInterpolationMode: directMarketing ? undefined : 'monotone',
+            spanGaps: false,
             stepped: false,
             pointRadius: 0,
             borderWidth: 2,
@@ -10675,37 +10807,56 @@ function loadJsHybridChart(hours, file = null) {
         }
 
         datasets = applyHiddenState(datasets);
-        const hybridTooltipTitle = (items) => {
-            if (!items || !items.length) return '';
-            const idx = items[0].dataIndex;
-            return labelDateTimes[idx] || labels[idx] || '';
-        };
-        const buildHybridXScale = () => ({
-            grid: {
-                color: (ctx) => daySeparatorIndices.has(ctx.index) ? (isDarkMode ? 'rgba(148, 163, 184, 0.65)' : 'rgba(100, 116, 139, 0.5)') : gridColor,
-                lineWidth: (ctx) => daySeparatorIndices.has(ctx.index) ? 2 : 1
-            },
-            ticks: {
-                maxRotation: 0,
-                autoSkip: true,
-                maxTicksLimit: 8,
-                color: textColor,
-                callback: function(value, index) {
-                    const label = this.getLabelForValue ? this.getLabelForValue(value) : (labels[index] || value);
-                    const datePart = labelDateParts[index] || '';
-                    if (datePart && (index === 0 || daySeparatorIndices.has(index))) return [datePart, label];
-                    return label;
-                }
+        const hybridTimeContext = buildCompactChartTimeContext(timestamps, labels, gridColor, textColor, isDarkMode, 8);
+        labels = hybridTimeContext.labels;
+        const hybridTooltipTitle = hybridTimeContext.tooltipTitle;
+        const buildHybridXScale = () => hybridTimeContext.xScale;
+        const hybridTooltipFilter = item => {
+            if (!item.dataset || String(item.dataset.label || '').includes('__HIDDEN__') || item.raw === null) return false;
+            if (item.dataset.label === 'Peak-Ersparnis') {
+                const limit = item.chart.data.datasets.find(dataset => dataset.label === '__HIDDEN__Abregel-Limit');
+                if (limit && chartRawY(item) <= limit.data[item.dataIndex]) return false;
             }
-        });
+            return true;
+        };
+        const hybridTooltipLabel = ctx => {
+            const label = String(ctx.dataset.label || '');
+            if (label.includes('__HIDDEN__') || ctx.raw === null) return '';
+            let cleanLabel = label.replace(/\s\([^)]+\)/, '');
+            let value = chartRawY(ctx);
+            const unit = label.includes('SoC') ? '%' : label.toLowerCase().includes('preis') ? 'ct/kWh' : 'W';
+            if (cleanLabel === 'Batterie') {
+                const original = bat[ctx.dataIndex];
+                cleanLabel = original > 0 ? 'Laden' : original < 0 ? 'Entladen' : 'Batterie';
+                value = Math.abs(value);
+            } else if (cleanLabel === 'Netz') {
+                const original = grid[ctx.dataIndex];
+                cleanLabel = original > 0 ? 'Netzbezug' : original < 0 ? 'Einspeisung' : 'Netz';
+                value = Math.abs(value);
+            } else if (cleanLabel.startsWith('Wallbox')) {
+                const original = (cleanLabel === 'Wallbox 2' ? wb2 : wb)[ctx.dataIndex];
+                if (original < -50) cleanLabel += ' V2H';
+                value = Math.abs(value);
+            } else if (cleanLabel === 'Peak-Ersparnis') {
+                const limit = ctx.chart.data.datasets.find(dataset => dataset.label === '__HIDDEN__Abregel-Limit');
+                if (limit) value = Math.round(value - limit.data[ctx.dataIndex]);
+            }
+            const measured = ctx.dataIndex < historyLength || label === 'Aktueller SoC (Messwert)';
+            const forecastSeries = ['Sonne', 'PV betrieblich verfügbar', 'Hausverbrauch', 'Batterie', 'Netz', 'SoC',
+                'Standard-SoC-Prognose', 'DV-SoC-Prognose', 'SoC-Planung', 'Wallbox 1', 'Wallbox 2', 'Wärmepumpe', 'Klima', 'Heizstab'];
+            const sourceLabel = label.replace(/\s\([^)]+\)/g, '').trim();
+            const sourceNote = forecastSeries.includes(sourceLabel)
+                ? (measured ? 'Messwert' : (directMarketing && ['PV betrieblich verfügbar', 'Batterie', 'Netz', 'DV-SoC-Prognose'].includes(sourceLabel) ? 'DV-Plan' : 'Prognose')) : '';
+            return ` ${cleanLabel}: ${value} ${unit}${sourceNote ? ` · ${sourceNote}` : ''}`;
+        };
+        const hybridTooltip = {filter: hybridTooltipFilter,
+            callbacks: {title: hybridTooltipTitle, label: hybridTooltipLabel}};
 
         if (liveLineChart) {
             liveLineChart.resetZoom();
             liveLineChart.options.plugins.legend.display = true;
             liveLineChart.data.labels = labels; liveLineChart.data.datasets = datasets;
-            if (liveLineChart.options.plugins.tooltip && liveLineChart.options.plugins.tooltip.callbacks) {
-                liveLineChart.options.plugins.tooltip.callbacks.title = hybridTooltipTitle;
-            }
+            liveLineChart.options.plugins.tooltip = hybridTooltip;
             liveLineChart.options.scales = { x: buildHybridXScale(), ...yAxes };
             liveLineChart.update('none');
         } else {
@@ -10730,50 +10881,7 @@ function loadJsHybridChart(hours, file = null) {
                                 saveHiddenDataset(legendItem.text, isHidden);
                             }
                         },
-                            tooltip: {
-                            filter: function(item) {
-                                if (item.dataset && item.dataset.label && item.dataset.label.includes('__HIDDEN__')) return false;
-                                if (item.dataset && item.dataset.label === 'Peak-Ersparnis') {
-                                    let limitIdx = item.chart.data.datasets.findIndex(d => d.label === '__HIDDEN__Abregel-Limit');
-                                    if (limitIdx >= 0) {
-                                        let limitVal = item.chart.data.datasets[limitIdx].data[item.dataIndex];
-                                            if (chartRawY(item) <= limitVal) return false;
-                                    }
-                                }
-                                return true;
-                            },
-                            callbacks: { title: hybridTooltipTitle, label: (ctx) => {
-                            let unit = 'W'; let l = ctx.dataset.label;
-                            if (l && l.includes('__HIDDEN__')) return '';
-                            if (l.includes('(%)') || l.includes('SoC')) unit = '%'; else if (l.toLowerCase().includes('preis')) unit = 'ct/kWh';
-                            let cleanLabel = l.replace(/\s\([^)]+\)/, '');
-
-                            let origVal = chartRawY(ctx);
-                            if (chartFlipNegatives) {
-                                if (l === 'Batterie') origVal = bat[ctx.dataIndex];
-                                    else if (l === 'Wallbox' || l === 'Wallbox 1') origVal = wb[ctx.dataIndex];
-                                    else if (l === 'Wallbox 2') origVal = wb2[ctx.dataIndex];
-                                else if (l === 'Netz') origVal = grid[ctx.dataIndex];
-                            }
-
-                            let val = chartRawY(ctx);
-                            if (cleanLabel === 'Peak-Ersparnis') {
-                                let limitIdx = ctx.chart.data.datasets.findIndex(d => d.label === '__HIDDEN__Abregel-Limit');
-                                if (limitIdx >= 0) {
-                                    val = Math.round(val - ctx.chart.data.datasets[limitIdx].data[ctx.dataIndex]);
-                                }
-                            } else if (cleanLabel === 'Batterie' || cleanLabel === 'Batterie Leistung') {
-                                cleanLabel = origVal > 0 ? 'Laden' : (origVal < 0 ? 'Entladen' : 'Batterie');
-                                val = Math.abs(val);
-                            } else if (cleanLabel === 'Netz' || cleanLabel === 'Netz Gesamt') {
-                                cleanLabel = origVal > 0 ? 'Netzbezug' : (origVal < 0 ? 'Einspeisung' : 'Netz');
-                                val = Math.abs(val);
-                            } else if (cleanLabel === 'Wallbox' || cleanLabel === 'Wallbox 1' || cleanLabel === 'Wallbox 2' || cleanLabel === 'Wallbox Gesamt') {
-                                cleanLabel = origVal < -50 ? `${cleanLabel} V2H` : cleanLabel;
-                                val = Math.abs(val);
-                            }
-                            return ` ${cleanLabel}: ${val} ${unit}`;
-                        } } },
+                        tooltip: hybridTooltip,
                         zoom: {
                             pan: { enabled: true, mode: 'x' },
                             zoom: { wheel: { enabled: true }, pinch: { enabled: true }, mode: 'x' }
@@ -10827,6 +10935,7 @@ function loadJsPriceChart(hours, file = null) {
         const gridColor = isDarkMode ? '#333' : '#e9ecef';
 
         let labels = [...data.labels];
+        const priceTimestamps = labels.map((_, index) => chartTimestampMs(data.timestamps && data.timestamps[index]));
         let price = data.price ? [...data.price] : new Array(labels.length).fill(null);
         let ecoScore = data.eco_score ? [...data.eco_score] : new Array(labels.length).fill(null);
 
@@ -10856,8 +10965,9 @@ function loadJsPriceChart(hours, file = null) {
                 prevFMins = fMins;
             }
             labels.push(forecastData.labels[i]);
-            if (forecastData.price) price.push(forecastData.price[i] ?? null);
-            if (forecastData.eco_score) ecoScore.push(forecastData.eco_score[i] ?? null);
+            priceTimestamps.push(chartTimestampMs(forecastData.timestamps && forecastData.timestamps[i]));
+            price.push(forecastData.price ? (forecastData.price[i] ?? null) : null);
+            ecoScore.push(forecastData.eco_score ? (forecastData.eco_score[i] ?? null) : null);
         }
 
         let datasets = [];
@@ -10876,21 +10986,29 @@ function loadJsPriceChart(hours, file = null) {
             datasets.push({ label: 'Ø-Bezugspreis', data: new Array(labels.length).fill(costs.avg_price), borderColor: '#0dcaf0', borderDash: [4, 4], tension: 0, pointRadius: 0, borderWidth: 2, fill: false, yAxisID: 'y' });
         }
 
+        const priceTimeContext = buildCompactChartTimeContext(priceTimestamps, labels, gridColor, textColor, isDarkMode, 12);
+        const priceXScale = priceTimeContext.xScale;
+        labels = priceTimeContext.labels;
+        const priceTooltip = {
+            filter: item => !!item.dataset.label && !item.dataset.label.includes('__HIDDEN__'),
+            callbacks: {
+                title: priceTimeContext.tooltipTitle,
+                label: ctx => ctx.dataset.label === 'Strompreis (ct/kWh)'
+                    ? electricityPriceTooltipLabel(ctx, ecoScore)
+                    : ` ${ctx.dataset.label}: ${chartRawY(ctx)}`
+            }
+        };
+
         if (liveLineChart) {
             liveLineChart.resetZoom();
             liveLineChart.options.plugins.legend.display = true;
             liveLineChart.data.labels = labels; liveLineChart.data.datasets = datasets;
-            liveLineChart.options.scales = { x: liveLineChart.options.scales.x, ...yAxes };
-            liveLineChart.options.plugins.tooltip.callbacks.label = (ctx) => {
-                if (ctx.dataset.label === 'Strompreis (ct/kWh)') {
-                    return electricityPriceTooltipLabel(ctx, ecoScore);
-                }
-                return ` ${ctx.dataset.label}: ${chartRawY(ctx)}`;
-            };
+            liveLineChart.options.scales = { x: priceXScale, ...yAxes };
+            liveLineChart.options.plugins.tooltip = priceTooltip;
             liveLineChart.update('none');
         } else {
             const ctx = document.getElementById('liveChartCanvas').getContext('2d');
-            liveLineChart = new Chart(ctx, { type: 'line', data: { labels: labels, datasets: datasets }, options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false }, plugins: { legend: { position: 'top', labels: { usePointStyle: true, boxWidth: 8, padding: 15, color: textColor, filter: function(item) { return item.text && !item.text.includes('__HIDDEN__'); } }, onClick: function(e, legendItem, legend) { const index = legendItem.datasetIndex; const ci = legend.chart; const isHidden = ci.isDatasetVisible(index); if (isHidden) ci.hide(index); else ci.show(index); legendItem.hidden = isHidden; saveHiddenDataset(legendItem.text, isHidden); } }, tooltip: { callbacks: { label: (ctx) => { if (ctx.dataset.label === 'Strompreis (ct/kWh)') { return electricityPriceTooltipLabel(ctx, ecoScore); } else { return ` ${ctx.dataset.label}: ${chartRawY(ctx)}`; } } } }, zoom: { pan: { enabled: true, mode: 'x' }, zoom: { wheel: { enabled: true }, pinch: { enabled: true }, mode: 'x' } } }, scales: { x: { grid: { color: gridColor }, ticks: { maxTicksLimit: 12, color: textColor } }, ...yAxes } } });
+            liveLineChart = new Chart(ctx, { type: 'line', data: { labels: labels, datasets: datasets }, options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false }, plugins: { legend: { position: 'top', labels: { usePointStyle: true, boxWidth: 8, padding: 15, color: textColor, filter: function(item) { return item.text && !item.text.includes('__HIDDEN__'); } }, onClick: function(e, legendItem, legend) { const index = legendItem.datasetIndex; const ci = legend.chart; const isHidden = ci.isDatasetVisible(index); if (isHidden) ci.hide(index); else ci.show(index); legendItem.hidden = isHidden; saveHiddenDataset(legendItem.text, isHidden); } }, tooltip: priceTooltip, zoom: { pan: { enabled: true, mode: 'x' }, zoom: { wheel: { enabled: true }, pinch: { enabled: true }, mode: 'x' } } }, scales: { x: priceXScale, ...yAxes } } });
         }
 
         const detailsEl = document.getElementById('diagramDetails');
@@ -10924,7 +11042,10 @@ window.addEventListener('themeChanged', () => {
         const isDarkMode = typeof DARK_MODE !== 'undefined' ? DARK_MODE : true;
         const t = isDarkMode ? '#aaa' : '#666'; const g = isDarkMode ? '#333' : '#e9ecef';
         liveLineChart.options.plugins.legend.labels.color = t;
-        liveLineChart.options.scales.x.grid.color = g; liveLineChart.options.scales.x.ticks.color = t;
+        if (typeof liveLineChart.config.options.scales.x.grid.color !== 'function') {
+            liveLineChart.options.scales.x.grid.color = g;
+        }
+        liveLineChart.options.scales.x.ticks.color = t;
         for (let s in liveLineChart.options.scales) {
             if (s.startsWith('y')) {
                 if (liveLineChart.options.scales[s].grid) liveLineChart.options.scales[s].grid.color = g;
@@ -13842,7 +13963,7 @@ function _renderStorageCurveChart(socPoints) {
         const dvHeadroomProjectionData = sortedTs.map(ts => interpHeadroomProjection(ts));
         const dvHoldData = sortedTs.map(ts => interpDvHold(ts));
         const directMarketingSoc = directMarketingSocProjectionForTimestamps(dvView, sortedTs);
-        const useDirectMarketingSoc = Array.isArray(directMarketingSoc);
+        const useDirectMarketingSoc = dvView.active === true;
 
         // Jetzt-Linie: Index des ersten Timestamps >= nowMs
         const nowIdx = (nowMs >= sortedTs[0] && nowMs <= sortedTs[sortedTs.length - 1])
@@ -13908,7 +14029,7 @@ function _renderStorageCurveChart(socPoints) {
                     },
                     {
                         label: useDirectMarketingSoc ? 'DV-SoC-Prognose' : 'Standard-SoC-Prognose',
-                        data: useDirectMarketingSoc ? directMarketingSoc : simSocData,
+                        data: useDirectMarketingSoc ? (directMarketingSoc || sortedTs.map(() => null)) : simSocData,
                         borderColor: useDirectMarketingSoc ? '#8b5cf6' : '#a78bfa',
                         backgroundColor: useDirectMarketingSoc
                             ? 'rgba(139,92,246,0.08)'
@@ -13917,7 +14038,8 @@ function _renderStorageCurveChart(socPoints) {
                         borderDash: useDirectMarketingSoc ? [] : [3, 3],
                         pointRadius: 0,
                         tension: useDirectMarketingSoc ? 0 : 0.25,
-                        stepped: useDirectMarketingSoc ? 'after' : false,
+                        stepped: false,
+                        spanGaps: false,
                         fill: false,
                         hidden: false,
                         yAxisID: 'ySoc',
@@ -14169,15 +14291,6 @@ wrap.style.display = '';
     const timeContext = buildCompactChartTimeContext(sortedTs, [], gridColor, tickColor, isDark, 7);
 
     const rawSlots = Array.isArray(view.slots) ? view.slots : [];
-    const interpDvSoc = ts => {
-        const slot = rawSlots.find(s => ts >= s.startTs && ts < s.endTs);
-        if (slot) return slot.socStartPct;
-        if (rawSlots.length > 0) {
-            if (ts < rawSlots[0].startTs) return rawSlots[0].socStartPct;
-            if (ts >= rawSlots[rawSlots.length - 1].endTs) return rawSlots[rawSlots.length - 1].socEndPct;
-        }
-        return null;
-    };
     const interpDvPvStore = ts => {
         const slot = rawSlots.find(s => ts >= s.startTs && ts < s.endTs);
         if (slot && slot.plannedAllowed && (slot.action === 'PV_STORE' || slot.action === 'DV_CURVE_CHARGE')) {
@@ -14206,7 +14319,7 @@ wrap.style.display = '';
     };
 
     const socData = view.state === 'complete'
-        ? sortedTs.map(ts => interpDvSoc(ts))
+        ? directMarketingSocProjectionForTimestamps(view, sortedTs)
         : sortedTs.map(() => null);
     const pvStoreKw = sortedTs.map(ts => interpDvPvStore(ts));
     const exportKw = sortedTs.map(ts => interpDvExport(ts));
@@ -14243,7 +14356,8 @@ wrap.style.display = '';
                     borderWidth: 2.5,
                     pointRadius: 0,
                     tension: 0,
-                    stepped: 'after',
+                    stepped: false,
+                    spanGaps: false,
                     yAxisID: 'ySoc',
                     order: 1
                 }] : []),

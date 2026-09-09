@@ -8766,14 +8766,14 @@ def build_display(payload: Dict[str, Any]) -> Dict[str, str]:
     shadow_payload = payload.get("shadow_payload") if isinstance(payload.get("shadow_payload"), dict) else {}
     shadow_inputs = shadow_payload.get("inputs") if isinstance(shadow_payload.get("inputs"), dict) else {}
 
-    def _fmt_time_from_ts(value: Any) -> str:
+    def _fmt_time_from_ts(value: Any, include_date: bool = False) -> str:
         ts = safe_float(value, 0.0)
         if ts <= 0.0:
             return "--:--"
         if ts > 10000000000.0:
             ts /= 1000.0
         try:
-            return datetime.datetime.fromtimestamp(ts).strftime("%H:%M")
+            return datetime.datetime.fromtimestamp(ts).strftime("%d.%m. %H:%M" if include_date else "%H:%M")
         except Exception:
             return "--:--"
 
@@ -8942,7 +8942,7 @@ def build_display(payload: Dict[str, Any]) -> Dict[str, str]:
     elif state == "parallel_curve_auto_hold" and auto_limit_enabled and bool(shadow_inputs.get("pre_curve_hold_active")):
         first_soc = shadow_inputs.get("first_curve_soc")
         first_soc_txt = f"{safe_float(first_soc):.1f}%" if first_soc is not None else "--"
-        first_time = _fmt_time_from_ts(shadow_inputs.get("first_curve_ts"))
+        first_time = _fmt_time_from_ts(shadow_inputs.get("first_curve_ts"), include_date=True)
         ifc_w = safe_int(payload.get("iFc_w"), 0)
         start_w = safe_int(shadow_inputs.get("pre_curve_ifc_start_w"), 0)
         threshold_txt = f"; Frühstart ab {start_w} W iFc" if start_w > 0 else ""
@@ -8987,6 +8987,17 @@ def build_display(payload: Dict[str, Any]) -> Dict[str, str]:
             f"{curve_relation_text(payload)}. "
             f"E3DC-AUTO mit EMS-Ladegrenze {auto_limit_charge_w} W: "
             "die Batterieladung wird geführt, die Hausversorgung bleibt intern geregelt."
+        )
+    elif (
+        state == "parallel_curve_auto_hold"
+        and bool(auto_limit.get("release"))
+        and bool(payload.get("next_curve_evening_pv_release_active"))
+    ):
+        first_time = _fmt_time_from_ts(shadow_inputs.get("first_curve_ts"), include_date=True)
+        reason = (
+            f"Morgenkurve ab {first_time}: Ihr Vorhaltefenster hat noch nicht begonnen. "
+            "E3DC arbeitet bis dahin autonom; wechselnde Rest-PV löst keine Ladepause aus. "
+            "Preisfenster, Reserve-, Netz- und Abregelschutz behalten Vorrang."
         )
     elif state == "parallel_curve_auto_hold" and pv_w <= 250:
         reason = (
@@ -9149,7 +9160,7 @@ def build_display(payload: Dict[str, Any]) -> Dict[str, str]:
     elif state == "parallel_curve_charge" and bool(shadow_inputs.get("pre_curve_ifc_start_active")):
         first_soc = shadow_inputs.get("first_curve_soc")
         first_soc_txt = f"{safe_float(first_soc):.1f}%" if first_soc is not None else "--"
-        first_time = _fmt_time_from_ts(shadow_inputs.get("first_curve_ts"))
+        first_time = _fmt_time_from_ts(shadow_inputs.get("first_curve_ts"), include_date=True)
         ifc_w = safe_int(payload.get("iFc_w"), 0)
         start_w = safe_int(shadow_inputs.get("pre_curve_ifc_start_w"), 0)
         reason = (
@@ -13893,6 +13904,76 @@ def apply_post_final_pv_store_auto_release(
         "budget_w": max(0, safe_int(pv_after_fixed_w, 0)),
     })
     return result, True
+
+
+def direct_marketing_price_curve_frame(
+    cfg: Dict[str, Any], plan: Dict[str, Any], live: Dict[str, Any], now_s: float,
+    *, current_limit_w: int, max_charge_w: int, previous_state: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Preisabhängiger DC-Laderahmen oberhalb des sicheren Kurvenbedarfs.
+
+    Dies ist eine Preisformung der normalen AUTO-Kurve, kein Verkaufsfenster
+    und keine Ausführung des Shadow-Dispatch. Ein fehlendes Verkaufsfenster
+    ist daher zulässig. Beobachtung, fehlende Preise oder ungültige Quellen
+    geben dagegen keine Änderung frei.
+    """
+    result = {"active": False, "reason": "disabled", "max_charge_w": current_limit_w}
+    direct = direct_marketing_plan(plan)
+    flags = direct.get("flags") if isinstance(direct.get("flags"), dict) else {}
+    mode = str(cfg.get("direct_marketing_mode") or "").lower()
+    if not (cfg_bool(cfg, "direct_marketing_enable", False)
+            and mode in {"eco_plus", "eco+", "ecoplus"}
+            and direct.get("mode") == "eco_plus"
+            and flags.get("price_curve_allowed") is True
+            and cfg_bool(cfg, "direct_marketing_pv_store_enable", True)
+            and flags.get("pv_store_enable") is True):
+        return result
+    canonical = validate_canonical_plan(plan, int(now_s*1000))
+    if canonical.get("valid") is not True:
+        result["reason"] = "canonical_plan_invalid"
+        return result
+    source = storage_dc_first_live_source_contract(cfg, live, now_s)
+    if source.get("valid") is not True:
+        result["reason"] = "live_dc_source_invalid"
+        return result
+    try:
+        try:
+            from .direct_marketing_dispatch_planner import build_pv_price_charge_curve
+        except ImportError:
+            from direct_marketing_dispatch_planner import build_pv_price_charge_curve
+        capacity_wh = safe_float(cfg.get("speichergroesse"), 0.0)*1000.0
+        price_limits = [max_charge_w]
+        for configured in (cfg.get("direct_marketing_pv_store_max_w"), flags.get("pv_store_max_w")):
+            value = safe_int(configured, 0)
+            if value > 0:
+                price_limits.append(value)
+        price_max_w = min(price_limits)
+        schedule = build_pv_price_charge_curve(
+            plan, plan, now_ms=int(now_s*1000), current_soc=live.get("SOC"),
+            capacity_wh=capacity_wh, max_charge_w=price_max_w, settlement_config=cfg,
+        )
+    except (TypeError, ValueError, KeyError, OverflowError):
+        result["reason"] = "price_curve_inputs_invalid"
+        return result
+    result["planning"] = schedule
+    if schedule.get("feasible") is not True:
+        result["reason"] = str(schedule.get("reason") or "price_curve_infeasible")
+        return result
+    # Eine Punktprognose darf den bisherigen sicheren Ladebedarf nicht senken.
+    # Frühes Laden in günstigen Stunden schafft danach regulären Kurven-Hold.
+    requested = max(0, min(price_max_w, safe_int(schedule.get("current_charge_w"), 0)))
+    available = max(0, safe_int(source.get("e3dc_dc_surplus_w"), 0))
+    requested = min(requested, available)
+    previous = previous_state.get("auto_limit") or {}
+    previous_limit = safe_int(previous.get("max_charge_w"), current_limit_w)
+    previous_fresh = 0 <= now_s-safe_float(previous_state.get("ts"), 0.0) <= 30
+    ramp_base = max(current_limit_w, previous_limit if previous_fresh else 0)
+    step = max(100, safe_int(cfg.get("direct_marketing_pv_store_ramp_step_w"), 300))
+    applied = max(current_limit_w, min(requested, ramp_base+step))
+    result.update(active=True, reason=("curve_floor_priority" if requested < current_limit_w else "price_curve_dc_charge"),
+                  max_charge_w=applied, requested_w=requested, dc_available_w=available,
+                  plan_id=canonical.get("plan_id"), slot_id=canonical.get("slot_id"))
+    return result
 
 
 def direct_marketing_curve_charge_reservation_cap(
@@ -19536,14 +19617,25 @@ def next_curve_evening_pv_release_context(
         max(0, -safe_int(grid_ema_w, 0)),
     )
     threshold_w = max(300, safe_int(offer_threshold_w, 300))
+    # Die Morgenkurve darf heutige Rest-PV nicht anhand eines Sekundenwerts
+    # sperren. Diese Freigabe gilt nur für ihren Vorstart-Hold außerhalb des
+    # Vorhaltefensters; andere Regelzustände behalten ihre eigene Autorität.
+    try:
+        current_day = datetime.datetime.fromtimestamp(float(now_s)).date()
+        first_curve_day = datetime.datetime.fromtimestamp(first_curve_ts_s).date()
+        next_day_anchor = first_curve_day == current_day + datetime.timedelta(days=1)
+    except (ValueError, OverflowError, OSError):
+        next_day_anchor = False
+    scope_valid = bool(shadow_inputs.get("pre_curve_hold_active")) and next_day_anchor
     active = bool(
-        seconds_to_first > max_lead_s
-        and pv_w > 250
-        and real_offer_w >= threshold_w
+        scope_valid
+        and seconds_to_first > max_lead_s
         and soc < release_soc_ceiling
     )
     return {
         "active": active,
+        "scope_valid": scope_valid,
+        "offer_controls_release": False,
         "first_curve_ts_s": first_curve_ts_s,
         "seconds_to_first_curve": max(0, int(round(seconds_to_first))),
         "max_lead_s": int(round(max_lead_s)),
@@ -26866,12 +26958,22 @@ def decide_next_cycle(
         post_final_pv_store_auto_release = bool(
             post_final_pv_store_auto.get("active")
         )
+        price_curve_coupling_active = bool(
+            price_hold
+            and awattar_mode != 0
+            and target_soc is not None
+            and target_ts is not None
+            and (can_reach_target or shortfall_pv_catchup_active)
+            and not evening_release
+            and not post_final_pv_store_auto_release
+            and not (planned_load.get("active") and planned_load.get("confirmed"))
+        )
         if bool(planned_load.get("active")) and bool(planned_load.get("confirmed")):
             if str(planned_load.get("mode") or "") == "price_support" and bool(planned_load.get("support_allowed")):
                 state_name = "planned_load_price_support"
             else:
                 state_name = "planned_load_storage_hold"
-        elif awattar_mode == 0 or price_hold:
+        elif awattar_mode == 0 or (price_hold and not price_curve_coupling_active):
             state_name = "price_plan_storage_hold"
         elif post_final_pv_store_auto_release:
             state_name = "evening_release"
@@ -27028,6 +27130,11 @@ def decide_next_cycle(
         elif not can_reach_target:
             state_name = "auto"
 
+        # Entladeschutz verändert die zuvor berechnete Ladeanforderung nicht.
+        # Ein echter Netzladeauftrag wurde bereits im vorrangigen Pfad entschieden.
+        if price_curve_coupling_active:
+            state_name = "price_plan_storage_hold"
+
         headroom_execution = legacy_headroom_execution_contract(
             cfg,
             live,
@@ -27037,6 +27144,7 @@ def decide_next_cycle(
         )
         active_state = {
             "state": state_name,
+            "price_curve_coupling_active": price_curve_coupling_active,
             "storage_state": state_name,
             "mode": MODE_AUTO,
             "val": max_charge_w,
@@ -27564,10 +27672,13 @@ def decide_next_cycle(
                 and not bool(wb_intent.get("battery_departure_active"))
             )
             if auto_state == "parallel_price_hold":
-                auto_limit_charge_w = max_charge_w
+                auto_limit_charge_w = (
+                    max(0, min(max_charge_w, safe_int(shadow_inputs.get("price_curve_charge_limit_w"), 0)))
+                    if shadow_inputs.get("price_curve_coupling_active") else max_charge_w
+                )
                 auto_limit_discharge_w = 0
-                auto_limit_reason = "Preis-/Slotfenster: E3DC-AUTO mit Entladegrenze 0W"
-                auto_storage_req_w = 0
+                auto_limit_reason = f"Preis-/Slotfenster: Entladegrenze 0W, unabhängige Ladegrenze {auto_limit_charge_w}W"
+                auto_storage_req_w = min(auto_limit_charge_w, max(0, pv_after_fixed_w)) if price_curve_coupling_active else 0
             elif auto_state == "parallel_planned_load_hold":
                 auto_limit_charge_w = max_charge_w
                 auto_limit_discharge_w = 0
@@ -27613,10 +27724,13 @@ def decide_next_cycle(
                 ]
                 decision["planned_load_support"] = support
             elif auto_state == "parallel_price_house_discharge":
-                auto_limit_charge_w = max_charge_w
+                auto_limit_charge_w = (
+                    max(0, min(max_charge_w, safe_int(shadow_inputs.get("price_curve_charge_limit_w"), 0)))
+                    if shadow_inputs.get("price_curve_coupling_active") else max_charge_w
+                )
                 auto_limit_discharge_w = max(0, min(max_discharge_w, val))
-                auto_limit_reason = "Preis-/Slotfenster: E3DC-AUTO mit begrenzter Hausstuetze"
-                auto_storage_req_w = 0
+                auto_limit_reason = f"Preis-/Slotfenster: begrenzte Hausstütze, unabhängige Ladegrenze {auto_limit_charge_w}W"
+                auto_storage_req_w = min(auto_limit_charge_w, max(0, pv_after_fixed_w)) if price_curve_coupling_active else 0
             elif auto_state == "parallel_curve_auto_hold":
                 auto_limit_charge_w = 0
                 shadow_inputs = decision.get("shadow_payload", {}).get("inputs", {}) if isinstance(decision.get("shadow_payload"), dict) else {}
@@ -28455,6 +28569,22 @@ def decide_next_cycle(
                             f"{auto_limit_reason}; Freilauf-Öffnung: "
                             f"EMS-Ladegrenze steigt weich auf {auto_limit_charge_w}W"
                         )
+
+            if (auto_state in {"parallel_curve_auto_hold", "parallel_curve_charge"}
+                    and auto_limit_enabled and not auto_limit_release
+                    and not bool(shadow_inputs.get("pre_curve_hold_active"))
+                    and not bool(shadow_inputs.get("headroom_reserve_active"))
+                    and not bool(shadow_inputs.get("curve_cap_hard_pressure_active"))):
+                price_curve = direct_marketing_price_curve_frame(
+                    cfg, plan, live, now_s, current_limit_w=auto_limit_charge_w,
+                    max_charge_w=max_charge_w, previous_state=previous_state,
+                )
+                decision["direct_marketing_price_curve"] = price_curve
+                if price_curve.get("active"):
+                    auto_limit_charge_w = max(0, safe_int(price_curve.get("max_charge_w"), auto_limit_charge_w))
+                    auto_storage_req_w = min(auto_limit_charge_w, max(0, pv_after_fixed_w))
+                    decision["val"] = auto_limit_charge_w
+                    auto_limit_reason += f"; DV-Verkaufspreis: DC-Laderahmen {auto_limit_charge_w}W, Sicherheitskurve hat Vorrang"
 
             reservation_cap = direct_marketing_curve_charge_reservation_cap(
                 cfg,
@@ -29969,6 +30099,7 @@ def decide_next_cycle(
         "direct_marketing_policy_executor_gate": decision.get("direct_marketing_policy_executor_gate") if isinstance(decision.get("direct_marketing_policy_executor_gate"), dict) else None,
         "direct_marketing_future_pv_store_reservation": decision.get("direct_marketing_future_pv_store_reservation") if isinstance(decision.get("direct_marketing_future_pv_store_reservation"), dict) else None,
         "direct_marketing_future_pv_store_reservation_active": bool(decision.get("direct_marketing_future_pv_store_reservation_active")),
+        "direct_marketing_price_curve": decision.get("direct_marketing_price_curve"),
         "direct_marketing_future_pv_store_reservation_cap_w": safe_int(decision.get("direct_marketing_future_pv_store_reservation_cap_w"), 0),
         "direct_marketing_post_final_pv_store_auto_active": bool(decision.get("direct_marketing_post_final_pv_store_auto_active")),
         "direct_marketing_post_final_pv_store_auto_reason": decision.get("direct_marketing_post_final_pv_store_auto_reason"),
@@ -30905,6 +31036,7 @@ def decide_next_cycle(
         "direct_marketing_policy_executor_gate": decision.get("direct_marketing_policy_executor_gate") if isinstance(decision.get("direct_marketing_policy_executor_gate"), dict) else None,
         "direct_marketing_future_pv_store_reservation": decision.get("direct_marketing_future_pv_store_reservation") if isinstance(decision.get("direct_marketing_future_pv_store_reservation"), dict) else None,
         "direct_marketing_future_pv_store_reservation_active": bool(decision.get("direct_marketing_future_pv_store_reservation_active")),
+        "direct_marketing_price_curve": decision.get("direct_marketing_price_curve"),
         "direct_marketing_future_pv_store_reservation_cap_w": safe_int(decision.get("direct_marketing_future_pv_store_reservation_cap_w"), 0),
         "direct_marketing_post_final_pv_store_auto_active": bool(decision.get("direct_marketing_post_final_pv_store_auto_active")),
         "direct_marketing_post_final_pv_store_auto_reason": decision.get("direct_marketing_post_final_pv_store_auto_reason"),

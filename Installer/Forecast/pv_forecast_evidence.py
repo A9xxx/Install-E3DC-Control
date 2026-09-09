@@ -98,6 +98,9 @@ LEAD_TIME_BUCKETS = (
 
 ARCHIVE_MIN_INTERVAL_S = 6 * 60 * 60
 SUMMARY_MIN_INTERVAL_S = 24 * 60 * 60
+QUALITY_PROGRESS_SCHEMA = "pv_forecast_quality_progress_v1"
+QUALITY_PROGRESS_MAX_AGE_S = 30 * 60
+QUALITY_PROGRESS_BUDGET_S = 10.0
 RAW_RETENTION_S = 90 * 24 * 60 * 60
 EVALUATION_WINDOW_S = RAW_RETENTION_S
 MIN_EVALUATION_DELAY_S = 60 * 60
@@ -2406,6 +2409,116 @@ def append_summary_if_due(
         return payload
 
 
+def current_quality_progress(summary, config, *, now_utc_s, database_path=EVIDENCE_DB_PATH):
+    """Aktueller Sammelstand; archivierte Auswertungen bleiben unverändert."""
+    try:
+        from .pv_observation_quality import binding
+    except ImportError:
+        from pv_observation_quality import binding
+    now_s = int(now_utc_s)
+    topology = _valid_revision(summary.get("topology_revision"))
+    method = _valid_revision((summary.get("forecast_issue_contract") or {}).get("method_revision"))
+    expected_binding = binding(config)["revision"]
+    progress = {"schema_version": QUALITY_PROGRESS_SCHEMA, "available": False,
+        "reason": "quality_progress_unavailable", "calculated_at_utc_s": now_s,
+        "evaluation_end_utc_s": now_s - MIN_EVALUATION_DELAY_S,
+        "topology_revision": topology, "method_revision": method,
+        "observation_binding_revision": expected_binding, "decision_use_allowed": False,
+        "source_quality": []}
+    if topology is None or method is None:
+        return progress
+    try:
+        with database(database_path, write=False) as connection:
+            connection.execute("BEGIN")
+            deadline = time.monotonic() + QUALITY_PROGRESS_BUDGET_S
+            connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
+            contract = _latest_issue_contract(connection, topology)
+            if contract.get("method_revision") != method:
+                progress["reason"] = "quality_progress_method_changed"
+                return progress
+            latest = connection.execute("""SELECT slot_start_utc_s, payload_json
+                FROM forecast_external_observations WHERE topology_revision=?
+                AND slot_start_utc_s+900<=? ORDER BY slot_start_utc_s DESC,
+                observed_at_utc_s DESC, observation_id DESC LIMIT 1""",
+                (topology, progress["evaluation_end_utc_s"])).fetchone()
+            if latest is None:
+                progress["reason"] = "quality_progress_waiting_for_closed_slot"
+                return progress
+            # Dieselbe Auswahl wie calculate_details: gültige Beobachtungen
+            # behalten Vorrang vor späteren unvollständigen Teilintervallen.
+            record = None
+            for row in connection.execute("""SELECT payload_json FROM forecast_external_observations
+                    WHERE topology_revision=? AND slot_start_utc_s=?
+                    ORDER BY observed_at_utc_s, observation_id""", (topology, latest["slot_start_utc_s"])):
+                candidate = json.loads(row["payload_json"])
+                if candidate.get("valid") is True or record is None:
+                    record = candidate
+            actual_binding = ((record.get("observation_quality") or {}).get("binding") or {}).get("revision")
+            if actual_binding != expected_binding:
+                progress["reason"] = "quality_progress_waiting_for_current_binding"
+                return progress
+            if latest["slot_start_utc_s"] + 900 < progress["evaluation_end_utc_s"] - QUALITY_PROGRESS_MAX_AGE_S:
+                progress["reason"] = "quality_progress_observations_stale"
+                return progress
+            details = calculate_details(connection, topology, method, now_s)
+            if time.monotonic() > deadline:
+                progress["reason"] = "quality_progress_budget_exceeded"
+                return progress
+            progress.update(available=True, reason="ok", source_quality=details["source_quality"])
+    except Exception:
+        # Diagnosefehler dürfen einen vorhandenen Kennzahlbericht nicht ersetzen.
+        progress["reason"] = "quality_progress_unavailable"
+    return progress
+
+
+def sanitize_quality_progress(value, topology_revision, method_revision, *, now_utc_s=None):
+    """Zeit- und revisionsgebundene öffentliche Projektion ohne freie Texte."""
+    now_s = int(time.time() if now_utc_s is None else now_utc_s)
+    if not isinstance(value, dict) or value.get("schema_version") != QUALITY_PROGRESS_SCHEMA:
+        return None
+    calculated = value.get("calculated_at_utc_s")
+    end = value.get("evaluation_end_utc_s")
+    if (value.get("decision_use_allowed") is not False
+            or _valid_revision(topology_revision) is None or _valid_revision(method_revision) is None
+            or value.get("topology_revision") != topology_revision
+            or value.get("method_revision") != method_revision
+            or _valid_revision(value.get("observation_binding_revision")) is None
+            or type(calculated) is not int or type(end) is not int
+            or calculated <= 0 or not 0 <= now_s - calculated <= QUALITY_PROGRESS_MAX_AGE_S
+            or end != calculated - MIN_EVALUATION_DELAY_S):
+        return None
+    available = value.get("available") is True
+    sources = value.get("source_quality")
+    if available:
+        if (not isinstance(sources, list) or len(sources) != 2
+                or any(not isinstance(source, dict) for source in sources)
+                or {source.get("signal") for source in sources if isinstance(source.get("signal"), str)}
+                    != {"pv_e3dc_dc", "pv_external_ac"}):
+            return None
+        for source in sources:
+            keys = ("observed_slots", "quality_slots", "meter_confirmed_slots", "eligible_slots", "excluded_slots")
+            if (any(type(source.get(key)) is not int or source[key] < 0 for key in keys)
+                    or not isinstance(source.get("calibration"), dict)
+                    or not isinstance(source.get("state_seconds"), dict)
+                    or not source["eligible_slots"] <= source["meter_confirmed_slots"] <= source["quality_slots"] <= source["observed_slots"]
+                    or source["excluded_slots"] + source["eligible_slots"] != source["observed_slots"]):
+                return None
+    try:
+        details = sanitize_details({"schema_version": "pv_forecast_diagnostic_details_v1",
+            "decision_use_allowed": False, "source_quality": sources if available else []})
+    except (TypeError, ValueError, AttributeError, OverflowError):
+        return None
+    reasons = {"ok", "quality_progress_unavailable", "quality_progress_method_changed",
+        "quality_progress_waiting_for_closed_slot", "quality_progress_waiting_for_current_binding",
+        "quality_progress_observations_stale", "quality_progress_budget_exceeded"}
+    reason = value.get("reason") if isinstance(value.get("reason"), str) and value["reason"] in reasons else "quality_progress_unavailable"
+    return {"schema_version": QUALITY_PROGRESS_SCHEMA, "available": available and reason == "ok",
+        "reason": reason, "calculated_at_utc_s": calculated, "evaluation_end_utc_s": end,
+        "topology_revision": topology_revision, "method_revision": method_revision,
+        "observation_binding_revision": value["observation_binding_revision"], "decision_use_allowed": False,
+        "source_quality": details["source_quality"] if available and reason == "ok" else []}
+
+
 def latest_summary_for_topology(
     topology_revision: str,
     *,
@@ -2663,6 +2776,8 @@ def _sanitized_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "observation_quality": _observation_quality_contract(sanitize_details(payload.get("diagnostic_details"))),
         "source_diagnostics": _source_diagnostics(compared_slots, sanitize_details(payload.get("diagnostic_details"))),
         "diagnostic_details": sanitize_details(payload.get("diagnostic_details")),
+        "quality_progress": sanitize_quality_progress(payload.get("quality_progress"), topology_revision,
+            issue_contract.get("method_revision")),
         "metrics": sanitized_metrics,
         "labels": dict(DIAGNOSTIC_LABELS),
     }

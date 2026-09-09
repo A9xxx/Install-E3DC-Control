@@ -3967,6 +3967,47 @@ def heatpump_power_observation(wp_data, wp_status=None):
     return observed_wp_power_w, True, observed_wp_power_w >= 500
 
 
+def heatpump_start_rearm_readiness(ctx, now_ts=None):
+    """Bestätigt die Ruhephase vor einer neuen Luxtronik-Budgetanfrage.
+
+    Nach einer ungenutzten Startlease bleibt die zentrale Ready-Latch gesperrt.
+    Ein frischer Normal-Readback ohne Verdichter/Pumpenvorlauf darf nach der
+    Rücknahmefrist eine Ready-Low-Runde anfordern. Er erteilt keinen Startbefehl.
+    """
+    source = ctx if isinstance(ctx, dict) else {}
+    inactive = {"active": False, "reason": "no_confirmed_rearm"}
+    if source.get("wp_type") != 0 or _safe_int(source.get("AUTO_MODE"), 0) != 1:
+        return inactive
+    now_value = time.time() if now_ts is None else now_ts
+    payload = source.get("wb_budget_data")
+    if not isinstance(payload, dict):
+        return inactive
+    _contract, projection = select_storage_primary_budget(payload, now_ts=now_value)
+    if projection is None:
+        return inactive
+    lease = payload.get("consumer_budget_contract", {}).get("start_leases", {}).get("heatpump", {})
+    if not isinstance(lease, dict) or lease.get("rearm_required") is not True:
+        return inactive
+    if lease.get("evidence_limit") is True or lease.get("timebase_evidence_limit") is True:
+        return inactive
+    if lease.get("offered") is True or lease.get("late_start_unresolved") is True:
+        return inactive
+    ended = max(_safe_float(lease.get("expires_s"), 0), _safe_float(lease.get("withdrawal_watermark_s"), 0))
+    retry = _safe_float(lease.get("retry_not_before_s"), 0)
+    if ended <= 0 or now_value < max(retry, ended + 60.0):
+        return inactive
+    readback = heatpump_positive_actuator_readback(source, now_ts=now_value)
+    power_w, power_known, _accepting = heatpump_power_observation(source.get("wp_data"), source.get("wp_status"))
+    if readback.get("nonpositive_confirmed") is not True or _safe_float(readback.get("ts"), 0) <= ended:
+        return inactive
+    if not power_known or power_w >= 50 or source.get("wp_compressor_running_now") is not False:
+        return inactive
+    if source.get("wp_compressor_observation_valid") is not True:
+        return inactive
+    return {"active": True, "reason": "confirmed_idle_ready_low_handshake", "expired_at": ended,
+            "readback_ts": readback["ts"], "actuator_command_allowed": False}
+
+
 def heatpump_budget_request_readiness(ctx):
     """Bindet eine neue Budgetanfrage an frische Geräte- und Temperaturgates."""
 
@@ -3985,6 +4026,9 @@ def heatpump_budget_request_readiness(ctx):
         else {}
     )
     blockers = []
+    rearm_request = source.get("heatpump_start_rearm_request")
+    if isinstance(rearm_request, dict) and rearm_request.get("active") is True:
+        blockers.append("heatpump_start_rearm_pending")
     if demand_class in ("", "none"):
         blockers.append("heatpump_positive_demand_missing")
     # Die aktortypisierte Startreserve (direkt 25 s, SG-Ready 150 s) ist nur
@@ -5244,6 +5288,7 @@ def build_energy_decision_record(ctx):
             "accepting_power": bool(heatpump_accepting_power),
             "source_ts": heatpump_source_ts,
             "budget_start_ready": bool(heatpump_budget_readiness.get("ready")),
+            "start_rearm_request": copy.deepcopy(ctx.get("heatpump_start_rearm_request") or {}),
             "budget_start_request_w": _safe_int(
                 heatpump_budget_readiness.get("request_w"),
                 0,
@@ -9205,6 +9250,7 @@ def main():
             heatpump_accounting_budget_w = None
             central_heatpump_boost_permission_active = False
             storage_state_name = 'unknown'
+            heatpump_start_rearm_request = {"active": False, "reason": "not_evaluated"}
             budget_is_fresh = False
             storage_budget_source_contract = {
                 "schema_version": "storage_budget_fallback_contract_v1",
@@ -11344,6 +11390,13 @@ def main():
                             "signal_restarted": False,
                             "start_reservation_rearmed": False,
                         })
+
+                    heatpump_start_rearm_request = heatpump_start_rearm_readiness(locals(), now_ts=time.time())
+                    if heatpump_start_rearm_request.get("active") is True:
+                        heatpump_positive_output_blocked_this_cycle = True
+                        heatpump_positive_output_block_reasons.append("heatpump_start_rearm_pending")
+                        heatpump_budget_demand_active_class = "none"
+                        heatpump_budget_demand_first_seen_ts = 0.0
 
                     if (
                         heatpump_budget_demand_class

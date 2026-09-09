@@ -19,6 +19,7 @@ try:
         SUMMARY_JSON_PATH,
         EvidenceLimitError,
         append_summary_if_due,
+        current_quality_progress,
         archive_forecast_snapshot,
         database,
         enforce_retention,
@@ -41,6 +42,7 @@ except ImportError:  # pragma: no cover - Paketimport
         SUMMARY_JSON_PATH,
         EvidenceLimitError,
         append_summary_if_due,
+        current_quality_progress,
         archive_forecast_snapshot,
         database,
         enforce_retention,
@@ -278,6 +280,11 @@ def run_cycle(
             "control_effect": False,
         }
 
+    # Nur die RAM-Veröffentlichung ergänzen; archivierte Tagesberichte behalten
+    # ihre ursprünglichen Kennzahlen, Zeitstände und unveränderlichen Datensätze.
+    summary = dict(summary)
+    summary["quality_progress"] = current_quality_progress(
+        summary, config, now_utc_s=now_s, database_path=database_path)
     publish_summary_json(summary, summary_path=summary_path)
     return {
         "status": "ok",

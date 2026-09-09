@@ -104,38 +104,19 @@ function prognosisClass($value, $warnYears, $dangerYears = null) {
     return $value < $warnYears ? 'text-warning' : 'text-success';
 }
 
-// --- DEGRADATION & KAPAZITÄTS-PROGNOSE ---
-$brutto_installiert = 0.0;
-$speicher_gross = 0.0;
-
-if (!empty($vitals['system_info']['usable_capacity_wh'])) {
-    // FCC (Full Charge Capacity) in Ah * 51.8V = Wh (entspricht der installierten Brutto-Hardware)
-    $brutto_installiert = floatval($vitals['system_info']['usable_capacity_wh']) / 1000.0;
-    
-    // Echte nutzbare Kapazitaet im Neuzustand (USABLE_CAPACITY, ca. 10% weniger als Brutto)
-    if (!empty($vitals['system_info']['real_usable_capacity_wh'])) {
-        $speicher_gross = floatval($vitals['system_info']['real_usable_capacity_wh']) / 1000.0;
-    } else {
-        $speicher_gross = $brutto_installiert * 0.9;
-    }
-    $netto_basis = $speicher_gross;
-} elseif (!empty($vitals['system_info']['installed_capacity_wh'])) {
-    // Fallback: BAT_SPECIFIED_CAPACITY (Datenblatt-Nennkapazitaet, meist hoeher als real)
-    $brutto_installiert = floatval($vitals['system_info']['installed_capacity_wh']) / 1000.0;
-    // E3DC reserviert hardwareseitig ca. 10% (Usable = 90% von Design Capacity)
-    $speicher_gross = $brutto_installiert * 0.9;
-    $netto_basis = $speicher_gross;
-} else {
-    // Letzter Fallback: speichergroesse aus V4 Config
-    $_vconf = loadE3dcConfig();
-    $_vsize = parseConfigFloat($_vconf['config']['speichergroesse'] ?? '0');
-    if ($_vsize > 0) {
-        $speicher_gross = $_vsize;
-        $brutto_installiert = $speicher_gross / 0.9;
-        $netto_basis = $speicher_gross;
-    }
+function vitalPositiveCapacity($value, $divisor = 1.0) {
+    if (!is_numeric($value)) return null;
+    $number = (float)$value / $divisor;
+    return is_finite($number) && $number > 0 ? $number : null;
 }
 
+// Neuzustandsreferenz und BMS-Angaben haben unterschiedliche Quellen.
+// Aus einem Ah-Wert oder einer pauschalen Reserve entsteht kein Typenschildwert.
+$_vconf = loadE3dcConfig();
+$speicher_gross = vitalPositiveCapacity(parseConfigFloat($_vconf['config']['speichergroesse'] ?? '0'));
+$bms_specified_kwh = vitalPositiveCapacity($vitals['system_info']['installed_capacity_wh'] ?? null, 1000.0);
+$bms_fcc_kwh = vitalPositiveCapacity($vitals['system_info']['usable_capacity_wh'] ?? null, 1000.0);
+$bms_usable_kwh = vitalPositiveCapacity($vitals['system_info']['real_usable_capacity_wh'] ?? null, 1000.0);
 
 $systemAgeYears = 0;
 $prodString = $vitals['system_info']['production_date'] ?? '';
@@ -222,10 +203,9 @@ if ($avgSoh === null) {
     $diagnosticHints[] = "Es wurden keine belastbaren Pack-SOH-Werte gelesen. Die Seite zeigt dann keine Verschleissprognose, damit kein falscher Batteriezustand entsteht.";
 }
 $cyclesPerYear = $systemAgeYears > 0 ? $maxCycles / $systemAgeYears : 0;
-// netto_jetzt = echte nutzbare Kapazitaet (USABLE_CAPACITY in Ah*V) * SOH-Faktor
-// Bei neuem BMS-Wert: netto_basis = USABLE_CAPACITY (kleiner als FCC = speicher_gross)
-$netto_basis_use = isset($netto_basis) ? $netto_basis : $speicher_gross;
-$netto_jetzt = $avgSoh !== null ? $netto_basis_use * ($avgSoh / 100) : null;
+// SOH nur einmal auf die konfigurierte nutzbare Neuzustandsreferenz anwenden.
+$netto_jetzt = $speicher_gross !== null && $avgSoh !== null && $avgSoh >= 0 && $avgSoh <= 100
+    ? $speicher_gross * ($avgSoh / 100) : null;
 $generatedAtTs = isset($vitals['generated_at']) ? (int)$vitals['generated_at'] : time();
 $generatedAtText = date('d.m.Y H:i:s', $generatedAtTs);
 $worstPackLabel = $worstPack ? 'Schrank '.$worstPack['cabinet'].' / Pack '.$worstPack['pack'] : 'N/A';
@@ -253,7 +233,7 @@ if ($vitals && !empty($vitals['cabinets'])) {
                 'v_per_100' => $v_per_cycle * 100,
                 'v_per_year' => $v_per_year,
                 'usable_kwh' => $usableKwh,
-                'current_kwh' => $usableKwh > 0 ? $usableKwh * ($c_soh / 100.0) : null,
+                'current_kwh' => $usableKwh > 0 ? $usableKwh : null,
                 'projection_reliable' => $projectionReliable,
                 'jBis80' => $jBis80,
                 'jBis70' => $jBis70
@@ -471,13 +451,10 @@ function saveVitalsPdf() {
                             <div class="px-3 pt-3">
                                 <div class="small text-body-secondary d-flex flex-wrap gap-3">
                                     <?php if (!empty($cab['specified_wh'])): ?>
-                                        <span><i class="fas fa-layer-group me-1"></i>Installiert: <?= number_format($cab['specified_wh'] / 1000, 1, ',', '.') ?> kWh</span>
+                                        <span><i class="fas fa-layer-group me-1"></i>BMS-Spezifikation: <?= number_format($cab['specified_wh'] / 1000, 1, ',', '.') ?> kWh</span>
                                     <?php endif; ?>
                                     <?php if (!empty($cab['usable_wh'])): ?>
-                                        <span><i class="fas fa-battery-three-quarters me-1"></i>Nutzbar nominal: <?= number_format($cab['usable_wh'] / 1000, 1, ',', '.') ?> kWh</span>
-                                        <?php if (!empty($cab['soh_avg'])): ?>
-                                            <span><i class="fas fa-heartbeat me-1"></i>Geschätzt aktuell: <?= number_format(($cab['usable_wh'] / 1000) * ((float)$cab['soh_avg'] / 100), 1, ',', '.') ?> kWh</span>
-                                        <?php endif; ?>
+                                        <span><i class="fas fa-battery-three-quarters me-1"></i>BMS-Nutzkapazität (aus Ah abgeleitet): <?= number_format($cab['usable_wh'] / 1000, 1, ',', '.') ?> kWh</span>
                                     <?php endif; ?>
                                 </div>
                             </div>
@@ -637,7 +614,7 @@ function saveVitalsPdf() {
             <?php endif; ?>
         </div>
 
-        <?php if ($vitals && $speicher_gross > 0 && $maxCycles > 0 && $avgSoh !== null): ?>
+        <?php if ($vitals): ?>
         <div class="glass-card mb-4 fade-in" style="animation-delay: 0.2s;">
             <div class="d-flex justify-content-between align-items-center mb-4">
                 <h4 class="mb-0"><i class="fas fa-chart-line text-info me-2"></i> Degradations-Prognose & Speicherwert</h4>
@@ -648,16 +625,25 @@ function saveVitalsPdf() {
                 <div class="col-12">
                     <div class="card shadow-sm border-0 bg-body-secondary">
                         <div class="card-body p-4 text-center">
-                            <h6 class="text-body-secondary text-uppercase fw-bold mb-3"><i class="fas fa-battery-half text-primary me-2"></i>Real Nutzkapazität Gesamtsystem</h6>
-                            <h2 class="display-5 fw-bold text-body mb-2"><?= number_format($netto_jetzt, 2, ',', '.') ?> <span class="fs-4 text-muted">kWh</span></h2>
+                            <h6 class="text-body-secondary text-uppercase fw-bold mb-3"><i class="fas fa-battery-half text-primary me-2"></i>Nutzkapazität – SOH-basierte Schätzung</h6>
+                            <h2 class="display-5 fw-bold text-body mb-2"><?= $netto_jetzt !== null ? fmtVital($netto_jetzt, 2, ' kWh') : 'nicht bestimmbar' ?></h2>
                             <p class="text-muted small">
-                                Im Neuzustand nutzbar: <?= number_format($speicher_gross, 1, ',', '.') ?> kWh<br>
-                                Brutto installiert (Hardware): <?= number_format($brutto_installiert, 1, ',', '.') ?> kWh
+                                Nutzbare Referenz aus Konfiguration: <?= fmtVital($speicher_gross, 1, ' kWh') ?><br>
+                                BMS-Spezifikation: <?= fmtVital($bms_specified_kwh, 2, ' kWh') ?><br>
+                                BMS-FCC (aus Ah abgeleitet): <?= fmtVital($bms_fcc_kwh, 2, ' kWh') ?><br>
+                                BMS-Nutzkapazität (aus Ah abgeleitet): <?= fmtVital($bms_usable_kwh, 2, ' kWh') ?>
                             </p>
-                            
+                            <p class="text-muted small mb-0">
+                                Die nutzbare Neuzustandsreferenz kannst Du in der Konfiguration über <strong>speichergroesse</strong> anpassen.
+                                Verwende dafür die passende Herstellerangabe. BMS-Angaben ersetzen das Typenschild nicht.
+                                Die Ah-Umrechnung verwendet die angenommene Nennspannung von 51,8 V.
+                                Die SOH-Schätzung ist kein Kapazitätstest; auf ausgelesene BMS-Kapazitäten wird kein weiterer SOH-Abschlag angewendet.
+                            </p>
+                            <?php if ($avgSoh !== null): ?>
                             <div class="progress mt-4 bg-dark-subtle shadow-sm" style="height: 24px; border-radius: 12px; font-size: 0.9rem;">
-                                <div class="progress-bar bg-info text-dark fw-bold" role="progressbar" style="width: <?= $avgSoh ?>%;">Durchschnitts-SOH <?= number_format($avgSoh, 1, ',', '.') ?>%</div>
+                                <div class="progress-bar bg-info text-dark fw-bold" role="progressbar" style="width: <?= max(0, min(100, $avgSoh)) ?>%;">Durchschnitts-SOH <?= number_format($avgSoh, 1, ',', '.') ?>%</div>
                             </div>
+                            <?php endif; ?>
                         </div>
                     </div>
                 </div>
@@ -688,7 +674,7 @@ function saveVitalsPdf() {
                                     </div>
                                     <?php if ($cData['current_kwh'] !== null): ?>
                                     <div class="d-flex justify-content-between align-items-center border-bottom pb-2 mb-2">
-                                        <span class="text-muted small">Aktuelle Nutzkapazität</span>
+                                        <span class="text-muted small">BMS-Nutzkapazität (aus Ah)</span>
                                         <strong class="text-body">~<?= number_format($cData['current_kwh'], 1, ',', '.') ?> kWh</strong>
                                     </div>
                                     <?php endif; ?>

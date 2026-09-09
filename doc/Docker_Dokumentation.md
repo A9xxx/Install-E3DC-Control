@@ -2,13 +2,15 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.5e`. Die Tags `latest`, `v5.4.5e` und
-`5.4.5e` bezeichnen denselben Stable-Stand.
+Der aktuelle Stable-Stand ist `v5.4.5f`. Die Tags `latest`, `v5.4.5f` und
+`5.4.5f` bezeichnen denselben Stable-Stand.
 
-5.4.5e korrigiert den Docker-Start mit bestehenden Datenvolumes im
-Standardschutzmodus. Startprüfung und Rechteverwaltung verwenden denselben
-konfigurierten Datenschutzmodus. Der bisherige Host-Updateweg bleibt erhalten.
-Einzelheiten stehen in den [Release Notes](../RELEASE_NOTES.md).
+5.4.5f korrigiert das Speichern der Konfiguration mit übernommenen
+Docker-Datenvolumes und berücksichtigt erkannte Neustartphasen beim Update.
+Konfigurationsmigrationen bestätigen die benötigten Dateirechte vor dem
+Ersetzen. Der Host-Helfer muss für diese Updatekorrektur separat aktualisiert
+werden; ein neues Containerimage ersetzt ihn nicht. Einzelheiten stehen in
+den [Release Notes](../RELEASE_NOTES.md).
 
 Seit 5.4.5a gibt es zusätzlich die rein lesende Anzeige eines frisch beobachteten
 openWB-Fahrzeug-SoC samt Quelle und Alter. Ohne eindeutige Zuordnung zur
@@ -411,7 +413,7 @@ unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.5e` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.5f` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -438,7 +440,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.5e` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.5f` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash
@@ -758,6 +760,13 @@ erst nach dem imagegebundenen Healthcheck; zwei identische Snapshots binden
 zusätzlich Container-ID, Image-ID, Restart-Zähler, Startzeit, Dienstsatz und
 Laufzeit-`VERSION`.
 
+Ein vorhandener Container in einer von Docker bestätigten Neustartphase
+(`restarting`) muss vor dem Update nicht manuell gestoppt werden. Der Helfer
+bindet dann das alte Image über seine ID und OCI-Version und weist ausdrücklich
+darauf hin, wenn dessen Laufzeit-`VERSION` gerade nicht gelesen werden kann.
+Ein neuer Container oder ein Rückfall gilt weiterhin erst nach erfolgreichem
+Healthcheck und stabiler Laufzeitprüfung als bestätigt.
+
 Vor dem `pull` verlangt der Helfer mindestens 2 GiB nachweisbaren freien Platz
 im DockerRootDir. Schlägt die Prüfung oder das Entpacken mit Platzmangel fehl,
 bleiben Altcontainer und Volumes erhalten; die Ausgabe nennt
@@ -802,6 +811,23 @@ Eine Wartungsfreiheit wird auch im Opt-in-Betrieb nicht zugesichert.
 ## 4. Befehle & Fehlerbehebung (Troubleshooting)
 
 Da du nicht mehr klassisch über die Linux-Konsole auf E3DC zugreifst, nutzt du nun Docker-Befehle, um das System zu steuern:
+
+**Konfiguration nicht gespeichert: `target_metadata_invalid`**
+
+Die vorhandene `data/e3dc_v4.json` hat nicht den für das Speichern erwarteten
+Dateimodus oder die erwartete Gruppe. Das kann bei übernommenen Datenvolumes
+auftreten, obwohl die Datei für den Webserver schreibbar ist. Der Standardmodus
+verwendet `0660`, der ausdrücklich gewählte Kompatibilitätsmodus `0664`, jeweils
+mit Gruppe `www-data`. Auch Speichern ohne sichtbare Änderung kann eine neue
+Datei erzeugen, etwa wenn Werte normalisiert oder Standardwerte ergänzt werden.
+
+Der Containerstart gleicht den Modus einer bereits vorhandenen, sicher geprüften
+Konfigurationsdatei an die gewählte Einstellung an. Eine Konfigurationsmigration
+setzt und prüft Besitzer, Gruppe und Modus schon an der vorbereiteten Datei,
+bevor sie die bisherige Konfiguration ersetzt. Im Container benötigt sie dafür
+kein `sudo`. Fehlgeschlagene Rechteänderungen werden nicht als erfolgreicher
+Speichervorgang bestätigt. Der erfolgreiche Containerstart und das erfolgreiche
+Speichern in der Oberfläche sind getrennte Funktionsprüfungen.
 
 **Dashboard im Terminal ansehen (E3DC Screen):**
 *Da es keinen klassischen Linux `screen` mehr gibt, schaust du dir einfach den Live-Output des Containers an:*

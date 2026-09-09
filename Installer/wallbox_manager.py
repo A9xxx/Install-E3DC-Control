@@ -7554,10 +7554,41 @@ def _persistent_wallbox_structure_snapshot(config):
     """Bindet ausschließlich persistente Strukturwerte, nie Runtime-Discovery."""
 
     cfg = config if isinstance(config, dict) else {}
-    return {
+    snapshot = {
         key: str(cfg.get(key, "") or "")
         for key in _PERSISTENT_WALLBOX_STRUCTURE_KEYS
     }
+    native_types = {
+        "native", "e3dc", "e3dc_easy", "e3dc_easy_connect", "e3dc_legacy",
+        "e3dc_efy", "e3dc_auto", "e3dc_multi", "e3dc_multi_connect",
+        "e3dc_multi_connect_ii",
+    }
+    wb_types = [
+        str(cfg.get(key, "")).strip().lower()
+        for key in ("wb_native_type", "wb_native_type2")
+    ]
+    uses_e3dc = any(wb_type in native_types for wb_type in wb_types) or (
+        not wb_types[0] and bool(cfg.get("server_ip", ""))
+    )
+    if uses_e3dc:
+        # Native Treiber binden diese Werte beim Aufbau. Auch die bestehende
+        # WB1-Autoerkennung benötigt bei Änderungen eine neue RSCP-Verbindung.
+        # Nur ein interner Vergleichswert, keine Zugangsdaten im Struktursnapshot.
+        try:
+            server_port = int(cfg.get("server_port", 5033))
+        except (TypeError, ValueError):
+            server_port = 0
+        connection = [
+            str(cfg.get("server_ip") or "").strip(),
+            server_port,
+            str(cfg.get("e3dc_user") or "").strip(),
+            str(cfg.get("e3dc_password") or ""),
+            str(cfg.get("aes_password") or ""),
+        ]
+        snapshot["_e3dc_rscp_connection"] = hashlib.sha256(
+            json.dumps(connection, ensure_ascii=True).encode("utf-8")
+        ).hexdigest()
+    return snapshot
 
 
 def _runtime_wallbox_discovery_overlay(runtime_config, persistent_config):

@@ -5,6 +5,8 @@ import re
 import shutil
 import datetime
 import sys
+import stat
+import tempfile
 
 # Standard-Ausgabe auf UTF-8 erzwingen
 try:
@@ -823,23 +825,79 @@ def _load_v4() -> dict:
 
 
 def _save_v4(data: dict) -> bool:
-    """Schreibt e3dc_v4.json atomar (temp-Datei, dann rename)."""
-    tmp = V4_CONFIG_FILE + '.tmp'
+    """Veröffentlicht die Konfiguration erst nach bestätigten Dateirechten."""
+    tmp = None
     try:
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-        os.replace(tmp, V4_CONFIG_FILE)
+        import grp
+        import pwd
+
+        def identity(metadata):
+            return (
+                metadata.st_dev, metadata.st_ino, metadata.st_mode,
+                metadata.st_uid, metadata.st_gid, metadata.st_nlink,
+                metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns,
+            )
+
         try:
-            install_user = get_install_user()
-            run_command(f'sudo chown {install_user}:www-data {V4_CONFIG_FILE}')
-            run_command(f'sudo chmod {config_secret_file_mode_text(data)} {V4_CONFIG_FILE}')
-        except Exception:
-            apply_config_secret_permissions(V4_CONFIG_FILE, data=data)
-            pass
+            before = os.lstat(V4_CONFIG_FILE)
+        except FileNotFoundError:
+            before = None
+        if before is not None and (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1):
+            raise OSError('Die vorhandene Konfiguration ist keine einzelne reguläre Datei.')
+
+        uid = pwd.getpwnam(get_install_user()).pw_uid
+        gid = grp.getgrnam('www-data').gr_gid
+        mode = int(config_secret_file_mode_text(data), 8)
+        fd, tmp = tempfile.mkstemp(prefix='.e3dc_v4.', suffix='.tmp', dir=os.path.dirname(V4_CONFIG_FILE))
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+            f.flush()
+            # Im Container läuft die Migration als root und braucht kein sudo.
+            # Auch der reguläre Installationsbenutzer kann seine Datei direkt setzen.
+            for operation, command in (
+                (lambda: os.fchown(f.fileno(), uid, gid), ['chown', f'{uid}:{gid}']),
+                (lambda: os.fchmod(f.fileno(), mode), ['chmod', f'{mode:o}']),
+            ):
+                try:
+                    operation()
+                except PermissionError:
+                    if os.geteuid() == 0:
+                        raise
+                    result = run_command(['sudo', '-n', *command, '--', tmp], use_shell=False)
+                    if not isinstance(result, dict) or result.get('success') is not True:
+                        raise OSError('Die Dateirechte der vorbereiteten Konfiguration konnten nicht gesetzt werden.')
+            prepared = os.fstat(f.fileno())
+            named = os.lstat(tmp)
+            if (
+                identity(prepared) != identity(named)
+                or not stat.S_ISREG(prepared.st_mode)
+                or prepared.st_nlink != 1
+                or prepared.st_uid != uid
+                or prepared.st_gid != gid
+                or stat.S_IMODE(prepared.st_mode) != mode
+            ):
+                raise OSError('Die Dateirechte der vorbereiteten Konfiguration sind nicht bestätigt.')
+            os.fsync(f.fileno())
+            try:
+                current = os.lstat(V4_CONFIG_FILE)
+            except FileNotFoundError:
+                current = None
+            if (before is None) != (current is None) or (
+                before is not None and identity(before) != identity(current)
+            ):
+                raise OSError('Die vorhandene Konfiguration wurde während der Vorbereitung verändert.')
+            os.replace(tmp, V4_CONFIG_FILE)
+            tmp = None
         return True
     except Exception as e:
         logging.getLogger('config_manager').error(f'Fehler beim Schreiben von e3dc_v4.json: {e}')
         return False
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 def _sort_by_blocks(data: dict) -> dict:
     """Sortiert ein Dict nach der kanonischen Block-Reihenfolge."""
     data = _normalise_v4_values(data)

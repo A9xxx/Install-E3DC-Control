@@ -14,7 +14,9 @@ LABEL org.opencontainers.image.title="E3DC-Control" \
       org.opencontainers.image.revision="${E3DC_REVISION}" \
       org.opencontainers.image.created="${E3DC_CREATED}" \
       io.e3dc.git.tree="${E3DC_TREE}" \
-      io.e3dc.source.manifest="${E3DC_SOURCE_MANIFEST}"
+      io.e3dc.source.manifest="${E3DC_SOURCE_MANIFEST}" \
+      io.e3dc.network.bridge-preflight="1" \
+      io.e3dc.runtime.uid="991"
 
 # 1. Systempakete (Laufzeitumgebung - ändert sich selten)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -51,6 +53,11 @@ ENV E3DC_CONTAINER_INSTALL_USER=root
 RUN pip3 install --upgrade pip wheel setuptools && \
     pip3 install --prefer-binary paho-mqtt requests websocket-client websockets luxtronik hyundai_kia_connect_api pywebpush pycryptodome pymodbus
 
+# Feste Laufzeitidentität; Installation und unveränderlicher Produktcode bleiben Root.
+RUN groupadd --gid 991 e3dc-runtime && \
+    useradd --uid 991 --gid 991 --groups www-data --no-create-home \
+        --home-dir /nonexistent --shell /usr/sbin/nologin e3dc-runtime
+
 # 4. Verzeichnisse und statische Konfiguration
 RUN mkdir -p /app/pi/Install /var/www/html/tmp /var/www/html/logs /var/www/html/data /var/www/html/ramdisk && \
     install -d -o root -g root -m 0755 /etc/e3dc-control && \
@@ -67,6 +74,8 @@ RUN echo '{"install_user": "root", "home_dir": "/app", "install_path": "/app/pi/
 # sobald dort Projektcode liegt. Mit Dev-Volume gewinnt der Host-Code, sonst
 # gewinnt der im Image enthaltene Release-Code.
 COPY --chown=root:root --chmod=0555 entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY --chown=root:root --chmod=0555 Installer/docker_runtime_exec.py /usr/local/bin/e3dc-docker-runtime
+COPY --chown=root:root --chmod=0644 Installer/docker_runtime_identity.py /usr/local/lib/e3dc-control/docker_runtime_identity.py
 COPY --chown=root:root --chmod=0555 Installer/docker_healthcheck.py /usr/local/bin/e3dc-docker-healthcheck
 COPY --chown=root:root --chmod=0555 Installer/docker_logrotate_manager.py /usr/local/bin/e3dc-docker-logrotate
 COPY --chown=root:root --chmod=0555 Installer/docker_matter_storage_guard.py /usr/local/bin/e3dc-docker-matter-storage-guard
@@ -109,6 +118,10 @@ RUN find -P /app/pi/Install -xdev -type d -exec chmod 0755 -- {} + && \
     test -f /app/pi/Install/Installer/update_recovery_journal.py && \
     test -f /app/pi/Install/Installer/update_recovery_surface.py && \
     test -f /app/pi/Install/Installer/docker_compose_update.py && \
+    test -f /app/pi/Install/Installer/docker_network_preflight.py && \
+    test -f /app/pi/Install/Installer/docker_runtime_identity.py && \
+    test -f /app/pi/Install/Installer/docker_runtime_exec.py && \
+    test -f /app/pi/Install/Installer/docker_runtime_permissions.py && \
     test -f /app/pi/Install/Installer/docker_logrotate_manager.py && \
     test -f /app/pi/Install/Installer/docker_matter_storage_guard.py && \
     test -f /app/pi/Install/Installer/docker-logrotate.conf && \

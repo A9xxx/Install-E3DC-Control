@@ -2,7 +2,7 @@
 
 Diese Anleitung fasst die schnellsten Schritte zusammen, um E3DC-Control auf einem frischen Raspberry Pi OS (oder ähnlichem Debian-System) zu installieren.
 
-Aktueller Stable-Stand: `v5.4.5f`.
+Aktueller Stable-Stand: `v5.4.6`.
 
 5.4.5f korrigiert das Speichern der Konfiguration mit übernommenen
 Docker-Datenvolumes und berücksichtigt erkannte Neustartphasen beim Update.
@@ -428,6 +428,16 @@ Danach ist das System über die IP des Docker-Hosts erreichbar. Eine frische
 Konfiguration wird im Config-Editor eingerichtet.
 
 **Docker-Updates:**
+
+Vor dem Imagewechsel den tatsächlich verwendeten Host-Updater aktualisieren,
+einschließlich einer gegebenenfalls bevorzugten Kopie direkt im Compose-Ordner.
+Ein neues Containerimage ersetzt diese Hostdatei nicht. Benötigte Volumes bei
+gestopptem Container auf dem Host mit erhaltenen numerischen Eigentümern und
+Dateirechten sichern. Container-Neuerstellungen bei beendeter Fahrzeugladung
+und ohne laufenden Phasenwechsel durchführen; private Wallbox-Steuerzustände
+überleben nur den Neustart desselben Containers. Die
+[Docker-Dokumentation](Docker_Dokumentation.md) beschreibt die Details.
+
 ```bash
 (
   set -euo pipefail
@@ -473,7 +483,15 @@ Ohne das Label bleibt auch ein versehentlich gestarteter Watchtower für den
 Hauptcontainer wirkungslos. Der oben gezeigte manuelle Host-Helfer bleibt der
 empfohlene Updateweg.
 
-**Docker-Rückfall von v5.4.5f auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.4.6 auf den veröffentlichten Docker-Rollback-Root:**
+
+Der aktuelle Host-Updater ist für die private Rückmigration zwingend. Aus
+Bridge zuerst dieselbe aktuelle Runtime-Version im Hostprofil neu aufbauen
+und den gesunden Start prüfen; erst danach den folgenden Root-Rückfall
+ausführen. Den vorhandenen Runtime-Container und seine lokale Image-ID bis
+zum Abschluss erhalten. Die vollständigen Sicherungs- und Rückfallschritte
+stehen in der [Docker-Dokumentation](Docker_Dokumentation.md).
+
 ```bash
 (
   set -euo pipefail
@@ -535,7 +553,7 @@ Passwort und AES-Passwort speichern und den Container einmal neu starten.
 
 ## Wichtige Befehle für die Wartung
 
-Nach der Installation können Sie den Installer über `bash "$E3DC_INSTALL_PATH/e3dc-setup"` starten und die gewünschte Wartungsoption wählen:
+Auf Bare Metal kannst Du den Installer nach der Installation über `bash "$E3DC_INSTALL_PATH/e3dc-setup"` starten und die gewünschte Wartungsoption wählen. Für Docker gelten die Host-Update- und Sicherungswege oben:
 
 - **E3DC-Control installieren oder aktualisieren:**
   - Option `1` (Installation / Update)

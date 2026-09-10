@@ -1056,13 +1056,20 @@ function updateVehiclePage(data) {
             const isIntegrated = (v.last_updated_at || v.odometer || v.bat_12v || v.id);
             const isDummy = (v.is_manual && !isIntegrated);
 
-            tabsEl.innerHTML += `
-                <li class="nav-item" role="presentation">
-                    <button class="nav-link ${isActive} fw-bold" data-bs-toggle="pill" data-bs-target="#pane-${idx}" type="button" role="tab" style="border-radius: 20px; padding: 8px 20px; margin-right: 5px;">
-                        <i class="fas fa-car me-2"></i>${v.name}
-                    </button>
-                </li>
-            `;
+            const tabItem = document.createElement('li');
+            tabItem.className = 'nav-item';
+            tabItem.setAttribute('role', 'presentation');
+            const tabButton = document.createElement('button');
+            tabButton.className = `nav-link ${isActive} fw-bold`;
+            tabButton.setAttribute('data-bs-toggle', 'pill');
+            tabButton.setAttribute('data-bs-target', `#pane-${idx}`);
+            tabButton.type = 'button';
+            tabButton.setAttribute('role', 'tab');
+            tabButton.style.cssText = 'border-radius: 20px; padding: 8px 20px; margin-right: 5px;';
+            tabButton.innerHTML = '<i class="fas fa-car me-2"></i>';
+            tabButton.appendChild(document.createTextNode(String(v.name ?? '')));
+            tabItem.appendChild(tabButton);
+            tabsEl.appendChild(tabItem);
 
             contentEl.innerHTML += `
                 <div class="tab-pane fade ${isShow}" id="pane-${idx}" role="tabpanel" data-interpolated="${isDummy}">
@@ -1124,9 +1131,22 @@ function updateVehiclePage(data) {
         let locHtml = '--';
         if (v.is_at_home === true) locHtml = '<i class="fas fa-home text-info"></i> Zuhause';
         else if (v.is_at_home === false) locHtml = '<i class="fas fa-road text-warning"></i> Unterwegs';
-        if (v.car_lat && v.car_lon && locHtml !== '--') {
-            let gmapsUrl = `https://www.google.com/maps/search/?api=1&query=${v.car_lat},${v.car_lon}`;
-            $(`#fz-home-${idx}`).html(`<a href="${gmapsUrl}" target="_blank" class="text-decoration-none" style="color: inherit;" title="Auf Google Maps anzeigen">${locHtml} <i class="fas fa-external-link-alt small text-muted ms-1"></i></a>`);
+        const coordinatesPresent = [v.car_lat, v.car_lon].every(value =>
+            typeof value === 'number' || (typeof value === 'string' && value.trim() !== ''));
+        const latitude = coordinatesPresent ? Number(v.car_lat) : NaN;
+        const longitude = coordinatesPresent ? Number(v.car_lon) : NaN;
+        const validCoordinates = coordinatesPresent && Number.isFinite(latitude) && Math.abs(latitude) <= 90
+            && Number.isFinite(longitude) && Math.abs(longitude) <= 180;
+        if (validCoordinates && locHtml !== '--') {
+            const locationLink = document.createElement('a');
+            locationLink.href = `https://www.google.com/maps/search/?api=1&query=${latitude},${longitude}`;
+            locationLink.target = '_blank';
+            locationLink.rel = 'noopener noreferrer';
+            locationLink.className = 'text-decoration-none';
+            locationLink.style.color = 'inherit';
+            locationLink.title = 'Auf Google Maps anzeigen';
+            locationLink.innerHTML = locHtml + ' <i class="fas fa-external-link-alt small text-muted ms-1"></i>';
+            $(`#fz-home-${idx}`).empty().append(locationLink);
         } else {
             $(`#fz-home-${idx}`).html(locHtml);
         }
@@ -1878,9 +1898,11 @@ function storageSimCurveStatusReason(status, planId, pointCount) {
                 && Number(ts) > 0
                 && (index === 0 || Number(ts) > Number(slotStarts[index - 1])))
             && new Set(slotStarts.map(Number)).size === slotStarts.length;
-        if (!Number.isFinite(displayDayStart) || displayDayStart <= 0
-            || !slotAxisValid
-            || validSocCount < 2 || pointCount !== validSocCount) {
+        if (!Number.isSafeInteger(displayDayStart) || displayDayStart <= 0) {
+            return 'STORAGE_SIM_CURVE_STATUS_DAY_INVALID';
+        }
+        if (!slotAxisValid) return 'STORAGE_SIM_CURVE_STATUS_AXIS_INVALID';
+        if (validSocCount < 2 || pointCount !== validSocCount) {
             return 'STORAGE_SIM_CURVE_STATUS_COUNT_MISMATCH';
         }
         return null;
@@ -2060,6 +2082,61 @@ function storageTargetCurveForDisplay(targetCurve, curveAnchors) {
     };
 }
 
+function storageBoundTargetCurve(data = {}) {
+    // Der Sollpfad ist ein eigener Planbestand. Seine Anzeige benötigt keine
+    // SoC-Prognose, aber eine eigene vollständige Plan- und Tagesbindung.
+    const empty = () => ({points: [], source: 'missing'});
+    const numberOrNull = value => ['number', 'string'].includes(typeof value)
+        ? storageTrajectoryNumberOrNull(value) : null;
+    const meta = data.storage_plan_meta;
+    const status = data.storage_sim_curve_status ?? meta?.storage_sim_curve_status;
+    const reason = typeof status?.reason_code === 'string'
+        ? status.reason_code.trim().toUpperCase() : '';
+    // Der Server kann den gesamten Plan auch ohne neue Metadaten verwerfen.
+    // Gespeicherte Sollpunkte dürfen diese Meldung nicht überstimmen.
+    if (['STORAGE_PLAN_STALE', 'STORAGE_PLAN_MISSING', 'CANONICAL_PLAN_INVALID',
+        'CANONICAL_SLOT_AXIS_INVALID', 'PROJECTION_HIDDEN_BY_EFFECTIVE_PLAN'].includes(reason)
+        || String(status?.status || '').toUpperCase() === 'HIDDEN') return empty();
+    if (!meta || meta.schema_version !== 'storage_dispatch_plan_v1'
+        || !/^sha256:[0-9a-f]{64}$/.test(String(meta.plan_id || ''))
+        || meta.target_projection_authorized !== true
+        || meta.clear_classical_curves === true
+        || meta.effective_storage_plan?.clear_classical_curves === true
+        || data.effective_storage_plan?.clear_classical_curves === true
+        || data.storage_plan_stale === true || meta.stale === true || meta.fresh === false) return empty();
+    const dayStart = numberOrNull(meta.display_day_start);
+    const dayEnd = numberOrNull(meta.display_day_end);
+    if (!Number.isSafeInteger(dayStart) || !Number.isSafeInteger(dayEnd)
+        || dayStart <= 0 || dayEnd <= dayStart) return empty();
+    for (const [key, source, slotBound] of [
+        ['storage_target_curve', 'canonical_target_projection', true],
+        ['storage_curve_anchors', 'canonical_target_anchor', false]
+    ]) {
+        const raw = data[key];
+        if (!Array.isArray(raw) || raw.length < 2) continue;
+        const points = [];
+        const slots = new Set();
+        let valid = true;
+        for (const point of raw) {
+            const ts = numberOrNull(point?.ts);
+            const soc = numberOrNull(point?.soc);
+            if (!point || point.plan_id !== meta.plan_id || point.projection_source !== source
+                || !Number.isSafeInteger(ts) || ts < dayStart || ts >= dayEnd
+                || (points.length && ts <= points[points.length - 1].ts)
+                || soc === null || soc < 0 || soc > 100
+                || (slotBound && (!/^sha256:[0-9a-f]{64}$/.test(String(point.slot_id || ''))
+                    || slots.has(point.slot_id)))) {
+                valid = false;
+                break;
+            }
+            if (slotBound) slots.add(point.slot_id);
+            points.push({ts, soc});
+        }
+        if (valid) return {points, source: key};
+    }
+    return empty();
+}
+
 function storageCurveBundleAssessment(data, planId) {
     const status = data && data.storage_sim_curve_status && typeof data.storage_sim_curve_status === 'object'
         ? data.storage_sim_curve_status
@@ -2215,7 +2292,14 @@ function cacheStorageCurveData(data) {
                 'storage_curve_anchors'
             ]
             : ['storage_sim_curve'];
-        curvesToClear.forEach(key => { mergedData[key] = []; });
+        const incomingTarget = storageBoundTargetCurve(data);
+        curvesToClear.forEach(key => {
+            // Nur neu gelieferte, eigenständig gebundene Sollpunkte dürfen
+            // einen Planwechsel trotz fehlender SoC-Prognose überstehen.
+            if (planChanged && incomingTarget.points.length >= 2
+                && key === incomingTarget.source) return;
+            mergedData[key] = [];
+        });
         const incomingStatus = incomingAssessment && incomingAssessment.status
             && incomingAssessment.status.plan_id === incomingPlanId
             ? incomingAssessment.status
@@ -2395,12 +2479,15 @@ function storageSparklineSeries(data = {}) {
             CANONICAL_SLOT_AXIS_INVALID: 'invalid_slot_axis',
             STORAGE_PLAN_STALE: 'stale_plan'
         };
+        const target = storageBoundTargetCurve(data);
         return {
-            state: stateByReason[trajectory.base.reasonCode] || 'invalid_forecast',
+            state: target.points.length >= 2 ? 'target_only'
+                : (stateByReason[trajectory.base.reasonCode] || 'invalid_forecast'),
             reasonCode: trajectory.base.reasonCode || 'STORAGE_BASE_EVIDENCE_LIMIT',
             planId,
+            source: target.points.length >= 2 ? 'target_curve' : null,
             forecast: [],
-            target: []
+            target: downsampleStorageSparkline(target.points)
         };
     }
     const forecast = trajectory.base.soc
@@ -2561,7 +2648,9 @@ function storageSparklineUnavailableDisplay(data = {}, series = {}) {
         STORAGE_PLAN_MISSING: {curveState: 'missing', text: 'Kein aktueller Speicherplan'},
         STORAGE_PLAN_STALE: {curveState: 'stale', text: 'Speicherplan ist veraltet'},
         STORAGE_SIM_CURVE_STATUS_PLAN_MISMATCH: {curveState: 'mismatch', text: 'SoC-Projektion gehört zu einer anderen Planrevision'},
-        STORAGE_SIM_CURVE_STATUS_COUNT_MISMATCH: {curveState: 'incomplete', text: 'SoC-Projektion ist noch nicht vollständig übertragen'},
+        STORAGE_SIM_CURVE_STATUS_COUNT_MISMATCH: {curveState: 'incomplete', text: 'SoC-Projektion unvollständig'},
+        STORAGE_SIM_CURVE_STATUS_DAY_INVALID: {curveState: 'invalid', text: 'Anzeigetag der SoC-Projektion ungültig'},
+        STORAGE_SIM_CURVE_STATUS_AXIS_INVALID: {curveState: 'invalid', text: 'Zeitpunkte der SoC-Projektion ungültig'},
         STORAGE_SIM_CURVE_STATUS_INVALID: {curveState: 'invalid', text: 'SoC-Projektionsstatus ist ungültig'}
     };
     const reasonCode = String(series.reasonCode || '').trim().toUpperCase();
@@ -2627,7 +2716,7 @@ function renderStorageCurveSparkline(data = {}) {
         return;
     }
     const series = storageSparklineSeries(data);
-    if (series.state !== 'bound') {
+    if (!['bound', 'target_only'].includes(series.state)) {
         const unavailable = storageSparklineUnavailableDisplay(data, series);
         clear(unavailable.curveState, unavailable.text);
         return;
@@ -2644,8 +2733,9 @@ function renderStorageCurveSparkline(data = {}) {
         forecastLine.removeAttribute('stroke-dasharray');
     }
     const domainPoints = series.forecast.concat(series.target);
-    const minTs = series.forecast[0].ts;
-    const maxTs = series.forecast[series.forecast.length - 1].ts;
+    const axisPoints = series.state === 'target_only' ? series.target : series.forecast;
+    const minTs = axisPoints[0].ts;
+    const maxTs = axisPoints[axisPoints.length - 1].ts;
     let minSoc = Math.min(...domainPoints.map(point => point.soc));
     let maxSoc = Math.max(...domainPoints.map(point => point.soc));
     const minSpan = 12;
@@ -2665,6 +2755,16 @@ function renderStorageCurveSparkline(data = {}) {
         series.target.filter(point => point.ts >= minTs && point.ts <= maxTs),
         domain
     ));
+    if (series.state === 'target_only') {
+        const unavailable = storageSparklineUnavailableDisplay(data, series);
+        wrap.dataset.state = 'target-only';
+        wrap.dataset.runtimeState = 'projection-unavailable';
+        wrap.dataset.curveSource = 'target_curve';
+        state.textContent = 'Sollkurve · SoC-Prognose fehlt';
+        wrap.title = `Geplanter Soll-SoC, gestrichelt. ${unavailable.text}. Die Sollkurve ist keine SoC-Prognose.`;
+        wrap.setAttribute('aria-label', wrap.title);
+        return;
+    }
     wrap.dataset.state = 'fresh';
     wrap.dataset.curveSource = series.source;
     if (plannedDirectMarketing) {

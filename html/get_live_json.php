@@ -3152,7 +3152,7 @@ function liveStorageCanonicalDisplayDay($plan, $timezoneName = 'Europe/Berlin', 
         }
         $slotDays[$date]['slot_count']++;
         $slotDays[$date]['slot_ids'][] = $slotId;
-        $slotDays[$date]['slot_start_ts_ms'][] = (int)round($startTsMs);
+        $slotDays[$date]['slot_start_ts_ms'][] = round($startTsMs);
     }
     if ($axisInvalid) {
         $invalid['reason_code'] = 'CANONICAL_SLOT_AXIS_INVALID';
@@ -9387,8 +9387,10 @@ if ($storagePlanFresh) {
         $dispatchSlots = $canonicalPlan ? $storPlan['slots'] : [];
         foreach ($dispatchSlots as $slot) {
             if (!is_array($slot)) continue;
-            $tsMs = (int)($slot['start_ts_ms'] ?? 0);
-            $ts = (int)floor($tsMs / 1000);
+            // Millisekunden bleiben auch unter 32-Bit-PHP unverengt.
+            $tsMs = liveStorageFiniteNumber($slot['start_ts_ms'] ?? null);
+            if ($tsMs === null) continue;
+            $ts = (int)floor($tsMs / 1000.0);
             if ($ts < $today0 || $ts >= $today1) continue;
             $projection = is_array($slot['projection'] ?? null)
                 ? $slot['projection']
@@ -9415,7 +9417,13 @@ if ($storagePlanFresh) {
                 ? (float)$slot['soc_pct']['ceiling']
                 : null;
             if (!$effectiveProjectionHidden && $targetSoc !== null) {
-                $targetCurve[] = ['ts' => $tsMs, 'soc' => round($targetSoc, 1)];
+                $targetCurve[] = [
+                    'ts' => $tsMs,
+                    'soc' => round($targetSoc, 1),
+                    'plan_id' => $storPlan['plan_id'],
+                    'slot_id' => $slotId,
+                    'projection_source' => 'canonical_target_projection',
+                ];
             }
             if ($reserveFloor !== null) $socMinCurve[] = ['ts' => $tsMs, 'soc' => round($reserveFloor, 1)];
             if ($ceiling !== null) $socCeilingCurve[] = ['ts' => $tsMs, 'soc' => round($ceiling, 1)];
@@ -9431,7 +9439,7 @@ if ($storagePlanFresh) {
             if ($boundSimPoint === null) continue;
             $simCurve[] = [
                 'ts' => $tsMs,
-                'end_ts' => (int)($slot['end_ts_ms'] ?? 0),
+                'end_ts' => liveStorageFiniteNumber($slot['end_ts_ms'] ?? null),
                 'plan_id' => $storPlan['plan_id'],
                 'slot_id' => $slotId,
                 'soc' => $soc !== null ? round($soc, 1) : null,
@@ -9482,6 +9490,8 @@ if ($storagePlanFresh) {
             $ts = (int)($slot['ts'] / 1000);
             if ($ts >= $today0 && $ts < $today1) {
                 $curveAnchors[] = [
+                    'plan_id' => $storPlan['plan_id'] ?? null,
+                    'projection_source' => 'canonical_target_anchor',
                     'ts' => $ts * 1000,
                     'soc' => round((float)$slot['soc'], 1),
                     't' => $slot['t'] ?? date('H:i', $ts),

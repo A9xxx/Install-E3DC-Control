@@ -1818,7 +1818,7 @@ def install_docker_routine():
     container_name: e3dc-control
     hostname: e3dc-control
     restart: unless-stopped
-    network_mode: host # Benötigt für stabile RSCP-Verbindung zum E3DC im LAN
+    network_mode: host # Kompatibilität für Matter/mDNS und vorhandene Host-Loopback-Ziele; RSCP ist ein TCP-Client
     logging:
       driver: json-file
       options:

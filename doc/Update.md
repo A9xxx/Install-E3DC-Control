@@ -5,18 +5,28 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.4.5f`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.4.6`. Das Dashboard startet ausschließlich
 den argumentlosen, root-eigenen Systemjob. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
 
-5.4.5f korrigiert das Speichern der Konfiguration mit übernommenen
-Docker-Datenvolumes und berücksichtigt erkannte Neustartphasen beim Update.
-Konfigurationsmigrationen bestätigen die benötigten Dateirechte vor dem
-Ersetzen. Der Host-Helfer muss für diese Updatekorrektur separat aktualisiert
-werden; ein neues Containerimage ersetzt ihn nicht. Einzelheiten stehen in
-den [Release Notes](../RELEASE_NOTES.md).
+5.4.6 ergänzt eine unprivilegierte EMS-Laufzeit und einen optionalen
+Bridge-Betrieb für Docker. Vor dem Imagewechsel den tatsächlich verwendeten
+Host-Updater aktualisieren, einschließlich einer gegebenenfalls direkt im
+Compose-Ordner vorhandenen Kopie. Ein Containerimage ersetzt diese Hostdatei
+nicht. Der aktuelle Helfer bereitet bei einem Rückfall auf ältere Root-Images
+die privaten Daten vor. Aus Bridge zuerst dieselbe aktuelle Runtime-Version
+im Hostprofil neu aufbauen und ihren gesunden Start prüfen; erst danach den
+regulären Rückfall auf das ältere Root-Image durchführen.
+
+Benötigte Docker-Volumes bei gestopptem Container mit erhaltenen numerischen
+Eigentümern und Dateirechten auf dem Host sichern. Container-Neuerstellungen
+bei beendeter Fahrzeugladung und ohne laufenden Phasenwechsel durchführen;
+private Wallbox-Steuerzustände überleben weiterhin nur einen Neustart
+desselben Containers. Einzelheiten stehen in der
+[Docker-Dokumentation](Docker_Dokumentation.md) und den
+[Release Notes](../RELEASE_NOTES.md).
 
 Während der Webserver für den Dateiaustausch nicht erreichbar ist, zeigt die
 Ansicht nur den letzten bestätigten Schritt. Ein unbekannter Abschluss bleibt

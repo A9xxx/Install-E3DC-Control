@@ -6,6 +6,26 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.6] – 2026-09-10
+
+### Sicherheit und Docker
+
+- EMS-Python-Dienste laufen unter einem eigenen unprivilegierten Konto. Start und Healthcheck prüfen die tatsächlichen Prozessrechte; private Modell- und Prognosedaten werden vor dem Dienststart sicher übernommen. Der aktuelle Host-Updater führt auch die erforderliche Rückmigration für ältere Root-Images aus.
+- Fahrzeugnamen und Meldungen des E3/DC-Leistungsmessertests werden als Text dargestellt. Kartenlinks entstehen nur aus gültigen Koordinaten.
+- Neue optionale Bridge-Vorlage mit Start- und Imageprüfung. Hostnetz bleibt Standard; Matter/mDNS und Host-Loopback-Abhängigkeiten benötigen den bisherigen Betriebsweg.
+
+### Speicheranzeige und Ladekurven
+
+- AUTO, DC only und DC + Zusatz-PV sind in der Speicheranzeige unterscheidbar. Bestätigte und noch angeforderte Ladegrenzen werden getrennt benannt.
+- Die kleine Vorschau zeigt eine gültige, unabhängig gebundene Sollkurve auch bei fehlender SoC-Prognose. Ungültige oder veraltete Pläne werden weiterhin ausgeblendet. Der Prognosestart erhält eine eindeutige Beschriftung.
+- Die Ladekurvenprojektion vermeidet den Integerüberlauf bei Millisekunden-Zeitstempeln unter 32-Bit-PHP.
+
+### Updatehinweise
+
+Dashboard neu laden. Docker-Nutzer aktualisieren vor dem Upgrade auch den verwendeten Host-Updater und sichern die benötigten Volumes bei gestopptem Container mit erhaltenen Eigentümern und Rechten. Container-Neuerstellungen bei beendeter Fahrzeugladung durchführen; private Wallbox-Steuerzustände überleben weiterhin nur den Neustart desselben Containers. Rückfälle auf ältere Root-Images benötigen den aktuellen Host-Updater. Details stehen in der [Docker-Dokumentation](doc/Docker_Dokumentation.md).
+
+Aus Bridge zuerst dieselbe aktuelle Runtime-Version im Hostprofil wiederherstellen und den gesunden Start prüfen; erst danach auf ein älteres Root-Image zurückfallen.
+
 ## [5.4.5f] – 2026-09-09
 
 ### Speicher, Direktvermarktung und Wärme

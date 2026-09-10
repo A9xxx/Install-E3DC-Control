@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,8 @@ LOGROTATE_HEALTH_PATH = Path(
 )
 MAX_EXPECTATION_BYTES = 16 * 1024
 MAX_CMDLINE_BYTES = 64 * 1024
+MAX_PROCESS_STATUS_BYTES = 64 * 1024
+CAPABILITY_FIELDS = ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")
 # Der Taktgeber lässt bewusst 300 bis 3600 Sekunden zu. Prozesspräsenz und
 # Ergebnisalter werden getrennt geprüft; 300 Sekunden Reserve verhindern einen
 # falschen Health-Ausfall direkt vor dem nächsten zulässigen Lauf.
@@ -65,6 +68,112 @@ OPTIONAL_DEPENDENCY_PROCESSES = {
 }
 MULTI_PROCESS_MASTERS = {"apache2", "avahi-daemon"}
 HEALTHY_PROCESS_STATES = {"R", "S", "D", "I"}
+EMS_PROCESS_NAMES = frozenset(
+    name for name in REQUIRED_PROCESSES if name.endswith(".py")
+) | frozenset(
+    name for name, _label in OPTIONAL_PROCESSES.values() if name.endswith(".py")
+)
+
+
+def _load_runtime_identity():
+    """Lädt beim isolierten Image-Start nur die unveränderliche Identitätsbindung."""
+
+    script = Path(__file__).resolve()
+    helper = (
+        Path("/usr/local/lib/e3dc-control/docker_runtime_identity.py")
+        if script == Path("/usr/local/bin/e3dc-docker-healthcheck")
+        else script.with_name("docker_runtime_identity.py")
+    )
+    spec = importlib.util.spec_from_file_location("e3dc_docker_runtime_identity", helper)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Docker-Laufzeitidentität ist nicht ladbar")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _read_process_security(pid: str) -> dict:
+    """Liest Kernel-Credentials statt die Identität aus Prozessnamen abzuleiten."""
+
+    with open(os.path.join("/proc", pid, "status"), "rb", buffering=0) as handle:
+        raw = handle.read(MAX_PROCESS_STATUS_BYTES + 1)
+    if len(raw) > MAX_PROCESS_STATUS_BYTES:
+        raise RuntimeError(f"Prozess-Credentials für PID {pid} sind zu groß")
+    fields = {}
+    required = {"Uid", "Gid", "Groups", "NoNewPrivs", *CAPABILITY_FIELDS}
+    for line in raw.decode("ascii", errors="strict").splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key in required:
+            if key in fields:
+                raise RuntimeError(f"Prozess-Credentials für PID {pid} sind mehrdeutig")
+            fields[key] = value.split()
+    if set(fields) != required:
+        raise RuntimeError(f"Prozess-Credentials für PID {pid} sind unvollständig")
+    try:
+        uids = tuple(int(value, 10) for value in fields["Uid"])
+        gids = tuple(int(value, 10) for value in fields["Gid"])
+        groups = tuple(sorted(int(value, 10) for value in fields["Groups"]))
+        if len(uids) != 4 or len(gids) != 4 or len(fields["NoNewPrivs"]) != 1:
+            raise ValueError("Ungültige Credential-Dimension")
+        if any(len(fields[name]) != 1 for name in CAPABILITY_FIELDS):
+            raise ValueError("Ungültige Capability-Dimension")
+        no_new_privs = int(fields["NoNewPrivs"][0], 10)
+        capabilities = tuple(int(fields[name][0], 16) for name in CAPABILITY_FIELDS)
+        if any(value < 0 for value in (*uids, *gids, *groups, *capabilities)):
+            raise ValueError("Negative Credential-Werte")
+        if no_new_privs not in (0, 1):
+            raise ValueError("Ungültiger NoNewPrivs-Wert")
+    except ValueError as exc:
+        raise RuntimeError(f"Prozess-Credentials für PID {pid} sind ungültig") from exc
+    return {
+        "uids": uids,
+        "gids": gids,
+        "groups": groups,
+        "no_new_privs": no_new_privs,
+        "capabilities": capabilities,
+    }
+
+
+def _require_runtime_processes(processes: tuple[dict, ...], identity) -> None:
+    """Prüft jeden EMS-Worker und seine Kinder auf vollständig abgegebene Rechte."""
+
+    runtime_pids = {
+        process["pid"]
+        for name in EMS_PROCESS_NAMES | frozenset(identity.RUNTIME_PYTHON_SCRIPTS)
+        for process in _matching_processes(processes, name)
+    }
+    # Auch umbenannte oder inzwischen an PID 1 übergebene Runtime-Kinder bleiben
+    # gebunden. Keine der vier UID-Spalten darf durch einen Rückfall ausweichen.
+    runtime_pids.update(
+        process["pid"]
+        for process in processes
+        if identity.RUNTIME_UID in process["security"]["uids"]
+    )
+    while True:
+        children = {
+            process["pid"] for process in processes if process["ppid"] in runtime_pids
+        }
+        previous_size = len(runtime_pids)
+        runtime_pids.update(children)
+        if len(runtime_pids) == previous_size:
+            break
+    for process in processes:
+        if process["pid"] not in runtime_pids:
+            continue
+        security = process["security"]
+        if (
+            security["uids"] != (identity.RUNTIME_UID,) * 4
+            or security["gids"] != (identity.RUNTIME_GID,) * 4
+            or set(security["groups"]) not in (
+                {identity.WEB_GID},
+                {identity.WEB_GID, identity.RUNTIME_GID},
+            )
+            or security["no_new_privs"] != 1
+            or any(security["capabilities"])
+        ):
+            raise RuntimeError(
+                f"EMS-Prozess PID {process['pid']} verletzt die unprivilegierte Laufzeitidentität"
+            )
 
 
 def _read_optional_expectation_nofollow(path: Path) -> tuple[str, ...]:
@@ -268,12 +377,14 @@ def _process_snapshot() -> tuple[dict, ...]:
                 continue
             try:
                 state_before, parent_pid, start_time = _read_process_stat(entry.name)
+                security_before = _read_process_security(entry.name)
                 with open(
                     os.path.join("/proc", entry.name, "cmdline"),
                     "rb",
                     buffering=0,
                 ) as command_file:
                     payload = command_file.read(MAX_CMDLINE_BYTES + 1)
+                security_after = _read_process_security(entry.name)
                 state_after, parent_after, start_after = _read_process_stat(entry.name)
             except (FileNotFoundError, ProcessLookupError):
                 continue
@@ -291,29 +402,30 @@ def _process_snapshot() -> tuple[dict, ...]:
                 state_after,
                 parent_after,
                 start_after,
-            ):
+            ) or security_before != security_after:
                 raise RuntimeError(f"Prozess PID {entry.name} driftete im Snapshot")
             argv = tuple(
                 token.decode("utf-8", errors="replace")
                 for token in payload.split(b"\0")
                 if token
             )
-            if argv:
-                processes.append(
-                    {
-                        "pid": int(entry.name),
-                        "ppid": parent_pid,
-                        "start_time": start_time,
-                        "state": state_before,
-                        "argv": argv,
-                    }
-                )
+            processes.append(
+                {
+                    "pid": int(entry.name),
+                    "ppid": parent_pid,
+                    "start_time": start_time,
+                    "state": state_before,
+                    "argv": argv,
+                    "security": security_before,
+                }
+            )
     return tuple(processes)
 
 
 def _matching_processes(processes: tuple[dict, ...], expected: str) -> tuple[dict, ...]:
     """Bindet Prozesse an vollständige argv-Token statt Teilstrings."""
 
+    processes = tuple(process for process in processes if process["argv"])
     if expected == "apache2":
         return tuple(
             process
@@ -385,12 +497,16 @@ def _apache_config_valid() -> bool:
 
 def main() -> int:
     try:
+        identity = _load_runtime_identity()
+        identity.validate_runtime_account()
+        identity.validate_docker_product_binding()
         optional_services = _read_optional_expectation_nofollow(
             OPTIONAL_EXPECTATION_PATH
         )
         expected = dict(REQUIRED_PROCESSES)
         expected.update(_configured_processes(optional_services))
         processes = _process_snapshot()
+        _require_runtime_processes(processes, identity)
         missing = []
         unstable = []
         stable_snapshot = {}

@@ -22,7 +22,7 @@ DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 def expected_labels(expected: dict) -> dict[str, str]:
     """Return the complete, closed label set emitted by the release Dockerfile."""
 
-    return {
+    labels = {
         "org.opencontainers.image.title": TITLE,
         "org.opencontainers.image.description": DESCRIPTION,
         "org.opencontainers.image.source": SOURCE,
@@ -33,6 +33,12 @@ def expected_labels(expected: dict) -> dict[str, str]:
         "io.e3dc.git.tree": str(expected.get("tree", "")),
         "io.e3dc.source.manifest": str(expected.get("source_manifest", "")),
     }
+    version = re.fullmatch(r"([0-9]+)\.([0-9]+)\.([0-9]+)[a-z]?", str(expected.get("version", "")))
+    if version and tuple(int(part) for part in version.groups()) >= (5, 4, 6):
+        # Ab dieser Version sind Netzwerkprüfung und Laufzeitkonto Teil des
+        # geschlossenen Imagevertrags; ältere Rückfallimages behalten ihren Vertrag.
+        labels.update({"io.e3dc.network.bridge-preflight": "1", "io.e3dc.runtime.uid": "991"})
+    return labels
 
 
 def expected_build_args(expected: dict) -> dict[str, str]:

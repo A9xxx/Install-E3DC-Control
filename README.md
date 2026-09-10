@@ -1,14 +1,14 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.5f</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.6</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.4.5f**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.4.6**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
 
-Dieses Wartungsrelease verbessert die Speicherführung, RSCP-Verbindungen, Docker-Konfigurationsrechte und Diagramme. Preisabhängige PV-Ladung bleibt innerhalb der bestehenden Sicherheitsladekurve; die PV-Kalibrierung arbeitet weiterhin diagnostisch.
+Dieses Update verbessert die Sicherheit von Docker-Diensten und Webtexten sowie die Speicheranzeige. Die EMS-Dienste verwenden ein eigenes unprivilegiertes Laufzeitkonto. Eine gültige Sollkurve bleibt bei fehlender SoC-Prognose sichtbar; AUTO und begrenzte DC-Ladung sind klar unterscheidbar. Der zusätzliche Bridge-Betrieb ist optional. Vor einem Docker-Upgrade den aktuellen Host-Updater und die Hinweise zu Volume-Sicherung und Rückfall in der [Docker-Dokumentation](doc/Docker_Dokumentation.md) beachten.
 
 Ein optionales Beispiel für einen zweiten Speicher liegt unter [E3DC-Slave](E3DC-Slave/README.md).
 
@@ -44,7 +44,7 @@ sondern eine eindeutige Auswahl verlangt.
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
 
-> **Neu in 5.4.5f:** Speicherregelung separat ausschalten, geplante Ladepause bei nachgelagerten Verbrauchern erhalten, Energy-Charts als Preisersatz und getrennte PV-Messdiagnose. Das optionale Beispiel E3DC-Slave ergänzt 100 W Entladestart. Installationszentrale und Rücknavigation sind leichter erreichbar. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
+> **Neu in 5.4.6:** Sichere Textausgabe für Fahrzeugnamen und Leistungsmessertests, eigene Docker-Laufzeit ohne Root-Rechte für EMS-Dienste und eine optionale Bridge-Vorlage. Die Speicheranzeige nennt den Bestätigungsstand des DC-Laderahmens; Sollkurve und SoC-Prognose bleiben getrennt erkennbar. Einzelheiten und Updatehinweise stehen in den [Release Notes](RELEASE_NOTES.md).
 
 > **Neu in 5.4.5d:** Docker startet wieder mit bestehenden Datenvolumes im Standardschutzmodus `2770`. Startprüfung und Rechteverwaltung berücksichtigen denselben konfigurierten Datenschutzmodus. Die Korrektur gilt auch ohne Wallbox; unsichere Dateizustände bleiben gesperrt. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
 
@@ -379,8 +379,8 @@ erfolgreiche Neuinstallation.
 |---|---|---|
 | `e3dc_data` | Konfiguration, SQLite-Historie, Betriebszustand und sichere Warmstartdaten | immer sichern |
 | `e3dc_logs` | Laufzeitprotokolle und neu aufbaubare Auswertungsreihen | optional |
-| `e3dc_ml` | root-privates, anlagenspezifisches Lernmodell außerhalb des Webroots | empfohlen; sonst ist ein neues Training nötig |
-| `e3dc_forecast_evidence` | optionale, root-private Prognosediagnose mit rollierender Aufbewahrung bis zu 90 Tagen | optional; Verlust setzt nur die Diagnosehistorie zurück |
+| `e3dc_ml` | privates lokales Lernmodell des Laufzeitkontos außerhalb des Webroots | empfohlen; sonst ist ein neues Training nötig |
+| `e3dc_forecast_evidence` | optionale private Prognosediagnose des Laufzeitkontos mit rollierender Aufbewahrung bis zu 90 Tagen | optional; Verlust setzt nur die Diagnosehistorie zurück |
 | `e3dc_instance_role` | root-privater create-once-Anker für exakt `ha_mode=off` | auf demselben Docker-Host erhalten; nicht zwischen Hosts kopieren |
 
 Die Ramdisk bleibt absichtlich flüchtig und gehört nicht ins Backup. ML-Modell
@@ -391,6 +391,19 @@ mit festen Größen- und Aufbewahrungsgrenzen rotiert; der Healthcheck bindet de
 Logrotate-Prozess und seinen frischen Ergebnisnachweis ein. Weitere Details,
 einschließlich Migration und Bind-Mount-Variante,
 stehen in der [Docker-Dokumentation](doc/Docker_Dokumentation.md).
+
+Vollständige Docker-Sicherungen erfolgen auf dem Host bei gestopptem Container.
+Dabei numerische Eigentümer und Dateirechte erhalten. Das allgemeine
+Vollbackup-Menü innerhalb des Containers unterstützt die getrennten privaten
+Laufzeitdaten nicht; die regelmäßige Sicherung der Verbrauchshistorie bleibt
+verfügbar. Keine zusätzliche Compose-Option `user:` setzen: Der administrative
+Start bereitet die Datenrechte vor und gibt erst danach die EMS-Rechte ab.
+
+Container-Neuerstellungen bei beendeter Fahrzeugladung und ohne laufenden
+Phasenwechsel durchführen. Private Wallbox-Steuerzustände überleben einen
+Neustart desselben Containers, aber keine Neuerstellung. Bridge bleibt ein
+bewusster Wechsel für kompatible Named-Volume-Installationen; standardmäßig
+ist die Oberfläche dort nur am Docker-Host unter `127.0.0.1:8085` erreichbar.
 
 ### Optionaler lokaler Selbstbau für Entwickler
 
@@ -468,6 +481,16 @@ davon getrennt. Ein privates Registry-Image verwendet stattdessen dessen
 vollständigen Namen, beispielsweise `registry.example/username/e3dc-control:tag`.
 
 ### GHCR-Updates einspielen
+
+Vor dem Imagewechsel den tatsächlich verwendeten Host-Updater aktualisieren,
+einschließlich einer gegebenenfalls bevorzugten Kopie direkt im Compose-Ordner.
+Das Containerimage ersetzt diese Hostdatei nicht. Ein Rückfall auf ältere
+Root-Images benötigt den aktuellen Helfer für die private Rückmigration.
+Aus dem Bridge-Betrieb zuerst dieselbe aktuelle Runtime-Version im Hostprofil
+wiederherstellen und ihren gesunden Start prüfen; erst danach das ältere
+Root-Image über den Host-Updater wählen. Die vollständige Reihenfolge steht
+in der [Docker-Dokumentation](doc/Docker_Dokumentation.md).
+
 ```bash
 cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
 if [ -f ./docker_compose_update.py ]; then
@@ -485,7 +508,7 @@ sudo docker compose logs --tail=80 e3dc-control
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin wird
-> `E3DC_IMAGE_TAG=v5.4.5f` in `.env` gesetzt. `config --images` zeigt vor dem
+> `E3DC_IMAGE_TAG=v5.4.6` in `.env` gesetzt. `config --images` zeigt vor dem
 > Pull das tatsächlich gewählte Image.
 >
 > Vor dem `pull` prüft der Helfer mindestens 2 GiB freien Platz im

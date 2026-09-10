@@ -1,5 +1,19 @@
 # Speicher-Ladesteuerung - Systemablauf
 
+## Anzeige der E3DC-Regelung
+
+**E3DC führt: AUTO** bezeichnet den autonomen Freilauf ohne angeforderte
+Speicherbegrenzung durch E3DC-Control. Bei aktivem DC-Laderahmen heißt die Anzeige
+**E3DC führt: DC only**: E3DC regelt autonom, während E3DC-Control den Laderahmen
+anhand der E3DC-PV-Leistung begrenzt. Ist zusätzliches Laden aus dem Überschuss
+des Zusatzwechselrichters freigegeben, erscheint **DC + Zusatz-PV**.
+
+Die Erläuterung unterscheidet eine bestätigte Ladegrenze von einer noch offenen
+Geräterückmeldung. Fehlt eine gültige Aufteilung der PV-Leistung, wird das
+ausdrücklich angezeigt. Eine Ladegrenze in Watt ist keine gemessene Ladeleistung.
+„DC only“ beschreibt die Ladestrategie; der technische E3DC-Modus bleibt AUTO.
+Die Anzeige ist kein messtechnischer Nachweis der Herkunft jedes geladenen Watts.
+
 ## Beobachtete Wallbox und Speichergrenzen
 
 Bei „Nur Beobachten, Wallbox regelt“ bleibt die Wallbox selbstständig. Ein
@@ -61,7 +75,7 @@ nicht wieder aufgenommen. Technisch wird der Schalter als
 bindet die Übernahme mit `storage_regulation_changed_ts` an die aktuelle
 Bedienaktion. Ein Dienststopp allein ersetzt diese geordnete Abschaltung nicht.
 
-> **Stand:** v5.4.5f
+> **Stand:** v5.4.6
 >
 > **Neu in 5.4.5a:** Ein frisch beobachteter openWB-Fahrzeug-SoC kann mit
 > Quelle und Alter rein lesend erscheinen, wenn er zur aktuellen Stecksession

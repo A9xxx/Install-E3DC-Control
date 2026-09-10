@@ -1,5 +1,15 @@
 # Backup-System
 
+Die nachfolgenden Installer-Vollbackups und Wiederherstellungsbefehle gelten
+für Bare-Metal-Installationen. Docker verwendet getrennte persistente Volumes
+mit unterschiedlichen Eigentümern und Rechten. Vollständige Docker-Sicherungen
+werden auf dem Host bei gestopptem Container erstellt; dabei numerische
+Eigentümer und Dateirechte einschließlich des Laufzeitkontos erhalten.
+Das Vollbackup-Menü innerhalb des Containers unterstützt diesen Datenbestand
+nicht. Die regelmäßige Sicherung der Verbrauchshistorie bleibt verfügbar.
+Die [Docker-Dokumentation](Docker_Dokumentation.md) beschreibt den Sicherungs-
+und Rückfallweg.
+
 Der Installer legt vor jedem Update und Rollback einen verifizierten
 Sicherungspunkt an. Ein fehlendes, leeres, unvollständiges oder nicht lesbares
 Backup bricht den Vorgang ab. Diese Sperre kann nicht umgangen werden.

@@ -1,9 +1,9 @@
 {
-  "version": "5.4.5f",
+  "version": "5.4.6",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.5f",
-  "release_date": "2026-09-09",
-  "description": "v5.4.5f - Speicherführung, RSCP-Verbindungen, Docker-Speichern und Diagramme",
+  "stable_release": "v5.4.6",
+  "release_date": "2026-09-10",
+  "description": "v5.4.6 - Web-Sicherheit, Docker-Laufzeitrechte und Ladekurvenanzeige",
   "update_strategy": "backup_replace_restart_v1",
   "installer_requires": "python3",
   "sanitized_republication": false,

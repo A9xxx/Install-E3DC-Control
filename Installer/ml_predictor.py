@@ -107,6 +107,26 @@ def _trusted_ml_identity():
         raise PermissionError("ML-Store-Owner ist kein lokales Systemkonto") from exc
     if account.pw_name == "www-data":
         raise PermissionError("ML-Modell darf nicht dem Web-Benutzer gehoeren")
+    if os.path.dirname(os.path.abspath(__file__)) == "/app/pi/Install/Installer":
+        # Ein Worker kann sein eigenes Modell neu trainieren. Root darf dieses
+        # spätere Pickle weder lesen noch durch einen Eigentümerwechsel als
+        # vertrauenswürdigen Root-Code übernehmen. Ein Image-Rückfall legt die
+        # Modelle deshalb zuvor privat in Quarantäne und trainiert neu.
+        try:
+            from Installer.docker_runtime_identity import (
+                RUNTIME_UID, RUNTIME_GID, is_docker_runtime_process,
+            )
+        except ModuleNotFoundError:
+            from docker_runtime_identity import (
+                RUNTIME_UID, RUNTIME_GID, is_docker_runtime_process,
+            )
+        if (
+            (uid, gid) != (RUNTIME_UID, RUNTIME_GID)
+            or not is_docker_runtime_process()
+        ):
+            raise PermissionError(
+                "Privates Docker-Modell ist nur für die gebundene unprivilegierte Laufzeit zugelassen"
+            )
     return uid, gid, {0, uid}, {0, gid}
 
 

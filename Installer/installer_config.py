@@ -166,6 +166,17 @@ def _bound_local_role_metadata():
 def get_install_user():
     """Löst die lokale Rolle ohne Rückautorisierung aus Web-Metadaten auf."""
 
+    # Die Laufzeit darf den administrativen Codebesitzer lesen, erhält dadurch
+    # aber weder dessen Prozessrechte noch Schreibrechte am Produktbaum. Eine
+    # bloße Container-Umgebungsvariable autorisiert keinen fremden EUID.
+    module_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if module_root == "/app/pi/Install" and os.geteuid() == 991:
+        from .docker_runtime_identity import is_docker_runtime_process
+
+        if not is_docker_runtime_process():
+            raise RuntimeError("Docker-Laufzeitidentität ist nicht exakt gebunden")
+        return "root"
+
     container_mode = str(os.environ.get("E3DC_CONTAINER_MODE") or "").strip().lower()
     container_user = str(
         os.environ.get("E3DC_CONTAINER_INSTALL_USER") or ""

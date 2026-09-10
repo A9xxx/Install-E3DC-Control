@@ -132,6 +132,10 @@
 !/Installer/direct_marketing_identity.py
 !/Installer/docker_healthcheck.py
 !/Installer/docker_compose_update.py
+!/Installer/docker_network_preflight.py
+!/Installer/docker_runtime_identity.py
+!/Installer/docker_runtime_exec.py
+!/Installer/docker_runtime_permissions.py
 !/Installer/docker_logrotate_manager.py
 !/Installer/docker_matter_storage_guard.py
 !/Installer/docker-logrotate.conf
@@ -309,6 +313,7 @@
 !/doc/Watchdog.md
 !/doc/Web_Push_Dokumentation.md
 !/docker-compose.yml
+!/docker-compose.bridge.yml
 !/e3dc-bootstrap
 !/e3dc-update-bootstrap
 !/e3dc-setup

@@ -1,28 +1,25 @@
-# E3DC-Control v5.4.5f
+# E3DC-Control v5.4.6
 
-## Speicher, Direktvermarktung und Wärme
+Dieses Update verbessert die Sicherheit der Docker-Dienste und Weboberfläche sowie die Darstellung von Speicherregelung und Ladekurven.
 
-- Die PV-Ladeleistung in Eco+ berücksichtigt günstige Verkaufspreise auch ohne Verkaufs- oder Negativpreisfenster. Die bestehende Sicherheitsladekurve, DC-Quellentrennung, Reserven und Abregelschutz bleiben bindend. Ein vollständiger Ladeaufschub bis zur billigsten Stunde ist nicht enthalten.
-- Preisbedingter Entladeschutz erhält eine unabhängig berechnete Speicherladegrenze. Der Start einer nur beobachteten Wallbox öffnet dadurch nicht mehr allein die maximale Batterieladeleistung.
-- Eine erst am Folgetag beginnende Ladekurve verursacht außerhalb ihres Vorhaltefensters keine wechselnden Ladepausen durch schwankende Rest-PV. Die Anzeige nennt den Kurvenbeginn mit Datum.
-- Nach einer ungenutzten Wärmepumpen-Startfreigabe kann bei bestätigtem Stillstand erneut ein Budget angefragt werden. Nutzersperren und die zentrale Freigabe bleiben maßgeblich.
+## Sicherheit und Docker
 
-## Verbindungen und Docker
+- Die EMS-Python-Dienste laufen im Container unter einem eigenen Konto ohne Root-Rechte. Start und Healthcheck prüfen die tatsächlichen Prozessrechte. Private Modelle und Prognosebelege werden vor dem Dienststart geprüft und auf das Laufzeitkonto übernommen. Administrative Initialisierung und Apache-Master behalten ihre erforderlichen Rechte.
+- Fahrzeugnamen und Meldungen des E3/DC-Leistungsmessertests werden sicher als Text dargestellt. Ungültige Kartenkoordinaten erzeugen keinen Link.
+- Eine optionale Bridge-Vorlage veröffentlicht nur den Webport. Hostnetz bleibt der Standard. Bridge setzt passende Geräteadressen voraus und unterstützt keine Matter-/mDNS-, Link-Local- oder Host-Loopback-Abhängigkeiten. Einrichtung und Einschränkungen stehen in der [Docker-Dokumentation](doc/Docker_Dokumentation.md#optionaler-bridge-betrieb).
 
-- Der native RSCP-Client empfängt vollständige TCP-Frames und prüft angekündigte Prüfsummen korrekt. Unvollständige oder beschädigte Antworten entwerten die Verbindung; unbestätigte Schreibaufträge werden nicht automatisch wiederholt.
-- Native E3DC-Wallboxen übernehmen geänderte RSCP-Verbindungseinstellungen über den bestehenden Dienstneustart.
-- Das eigenständige Skript im Ordner E3DC-Slave verwendet eine gemeinsame RSCP-Verbindung, begrenzte Lesewiederholungen und eine datensparsame Fehlerdiagnose. Ein Wiederanlauf benötigt frische Master-Daten und bestätigte Gerätegrenzen. Die 100-W-Entladestartschwelle bleibt erhalten; das Skript wird nicht automatisch installiert.
-- Docker-Updates berücksichtigen erkannte Neustartphasen des alten Containers. Start und Konfigurationsmigration stellen bei sicher gebundenen Dateien die benötigten Rechte für das Speichern her. Unzulässige Dateieigentümer und Verknüpfungen bleiben gesperrt.
+## Speicheranzeige und Ladekurven
 
-## Anzeige und Bedienung
-
-- Vitals unterscheidet konfigurierte Nutzkapazität und BMS-Werte. Ein doppelter SOH-Abschlag und pauschale Ableitungen der Neuzustandskapazität entfallen; Schätzwerte bleiben gekennzeichnet.
-- Die PV-Diagnose zeigt den aktuellen Kalibriersammelstand mit eigener Zeitbasis. Historische Kennzahlen bleiben erhalten. Automatische Ladekurvenkorrektur und eine statistisch belegte P50-Aussage sind weiterhin nicht enthalten.
-- Zeitachsen und Tooltips werden bei Ansichtswechseln neu gebunden. Verlauf und Prognose erhalten feste Uhrzeitraster und hervorgehobene Tageswechsel. DV-Hybrid und geglättete Planverläufe erhalten Datenlücken und echte Abschaltkanten.
-- Der Speicherschalter erhält seine bestätigte Regler-Rückmeldung über einen geschützten Statuszugang.
+- Die Speicheranzeige unterscheidet **AUTO**, **DC only** und **DC + Zusatz-PV**. Sie kennzeichnet, ob die Ladegrenze bereits bestätigt ist. Die Grenze in Watt beschreibt den erlaubten Laderahmen, nicht die gemessene Batterieladung.
+- Eine gültige Sollkurve bleibt in der kleinen Vorschau sichtbar, wenn die SoC-Prognose fehlt. Fehlende Prognosen werden benannt; veraltete oder ungültige Pläne bleiben ausgeblendet. **Prognosestart** bezeichnet den Start des erwarteten Speicherverlaufs und wird nicht mehr als Sollwert ausgegeben.
+- Die Millisekunden-Zeitstempel der Ladekurvenprojektion werden auch unter 32-Bit-PHP korrekt verarbeitet. Docker benötigt weiterhin ein 64-Bit-System.
 
 ## Updatehinweise
 
-Nach dem Update das Dashboard neu laden. Docker-Nutzer aktualisieren auch den Host-Helfer `Installer/docker_compose_update.py`; ein Containerimage ersetzt diese Hostdatei nicht. Der dokumentierte Updateweg und die bestehenden Rückfallgrenzen bleiben bestehen.
+Nach dem Update das Dashboard neu laden.
 
-Für das eigenständige Slave-Skript die zusammengehörigen Python-Dateien aktualisieren und die eigene Konfiguration erhalten. Der Master muss weiterhin aktuelle MQTT-Daten liefern. Die Meldung `RSCP_ERR_ALREADY_IN_USE` allein beweist weder einen fremden Regler noch eine durch dieses Update bereits beseitigte Gerätebelegung.
+**Docker:** Vor dem Upgrade den verwendeten Host-Helfer `Installer/docker_compose_update.py` aktualisieren; ein neues Image ersetzt diese Hostdatei nicht. Benötigte Volumes bei gestopptem Container mit numerischen Eigentümern und Dateirechten auf dem Host sichern. Keine zusätzliche Compose-Option `user:` setzen.
+
+Updates und Container-Neuerstellungen bei beendeter Fahrzeugladung und ohne laufenden Phasenwechsel durchführen. Private Wallbox-Steuerzustände überleben einen Neustart desselben Containers, aber keine Neuerstellung. Einen Rückfall auf ältere Root-Images ausschließlich über den aktuellen Host-Updater ausführen. Modelle aus dem unprivilegierten Betrieb werden dabei privat archiviert; das ältere Image trainiert bei Bedarf neu. Einzelheiten zu Sicherung, Migration und Rückfall stehen in der [Docker-Dokumentation](doc/Docker_Dokumentation.md).
+
+Aus dem Bridge-Betrieb zuerst dieselbe aktuelle Runtime-Version im Hostprofil neu aufbauen und deren gesunden Start prüfen. Erst danach folgt der reguläre Rückfall auf das ältere Root-Image.

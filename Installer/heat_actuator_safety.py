@@ -91,8 +91,23 @@ class NarrowRuntimeContext:
             except AttributeError:
                 return ContextVerdict(False, "posix_identity_unavailable", str(root))
 
+            expected_owner = euid
+            if euid == 991 and str(root) == "/app/pi/Install":
+                try:
+                    try:
+                        from Installer.docker_runtime_identity import is_docker_runtime_process
+                    except ModuleNotFoundError:
+                        from docker_runtime_identity import is_docker_runtime_process
+                    if not is_docker_runtime_process():
+                        return ContextVerdict(False, "docker_runtime_identity_invalid", str(root))
+                except (ImportError, RuntimeError, OSError):
+                    return ContextVerdict(False, "docker_runtime_identity_unavailable", str(root))
+                # Der dedizierte Worker kontrolliert keine Produktdatei. Deren
+                # unveränderlicher Besitzer bleibt nach separatem Nachweis root.
+                expected_owner = 0
+
             module_stat = module_path.stat()
-            if euid != 0 and module_stat.st_uid != euid:
+            if euid != 0 and module_stat.st_uid != expected_owner:
                 return ContextVerdict(False, "module_owner_mismatch", str(root))
             if module_stat.st_mode & 0o022:
                 return ContextVerdict(False, "module_group_or_world_writable", str(root))
@@ -102,7 +117,7 @@ class NarrowRuntimeContext:
                 if not self._regular_single_link(marker):
                     return ContextVerdict(False, f"invalid_product_marker:{marker_rel}", str(root))
                 marker_stat = marker.stat()
-                if euid != 0 and marker_stat.st_uid != euid:
+                if euid != 0 and marker_stat.st_uid != expected_owner:
                     return ContextVerdict(False, f"marker_owner_mismatch:{marker_rel}", str(root))
                 if marker_stat.st_mode & 0o022:
                     return ContextVerdict(False, f"marker_group_or_world_writable:{marker_rel}", str(root))

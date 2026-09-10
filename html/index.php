@@ -2212,7 +2212,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                     <span id="stat-regler-sparkline-state" class="storage-curve-sparkline-state">Keine Plandaten</span>
                                 </div>
                                 <div class="d-flex justify-content-between small mb-1 align-items-center">
-                                    <span class="text-muted"><i class="fas fa-play text-success opacity-75 me-1"></i><span id="stat-regler-rb-label">Kurvenstart:</span></span>
+                                    <span class="text-muted"><i class="fas fa-play text-success opacity-75 me-1"></i><span id="stat-regler-rb-label">Prognosestart:</span></span>
                                     <span class="fw-bold">
                                         <span id="stat-regler-rb-time" class="text-body pe-2">--:--</span>
                                         <span id="stat-regler-rb-soc" class="text-success" style="font-size: 0.8em;">--%</span>
@@ -3418,7 +3418,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 const isFutureDay = dayLabel === 'Morgen' || (lk.day_offset || 0) > 0;
                 const fmtSoc = v => (v !== null && v !== undefined && !isNaN(parseFloat(v))) ? parseFloat(v).toFixed(1) + '%' : '--';
                 $('#stat-regler-day, #sc-modal-day').text(dayLabel);
-                $('#stat-regler-rb-label').text(isFutureDay ? 'Morgenpuffer:' : 'Kurvenstart:');
+                $('#stat-regler-rb-label').text('Prognosestart:');
                 $('#stat-regler-soll-label').text(isFutureDay ? 'Morgenpuffer' : 'Jetzt');
 
                 // Phase-Badge
@@ -3430,9 +3430,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 const lsT   = lk.ladestart ? lk.ladestart.t   : '--:--';
                 const lsSoc = lk.ladestart ? lk.ladestart.soc : null;
                 $('#stat-regler-rb-time').text(lsT);
-                const startSuffix = isFutureDay
-                    ? (!lk.has_target_curve ? ' (Prognose)' : ' (Puffer)')
-                    : ' (Soll)';
+                const startSuffix = ' (Prognose)';
                 $('#stat-regler-rb-soc').text(lsSoc !== null ? (fmtSoc(lsSoc) + startSuffix) : '');
 
                 // PV-Peak – abgeblendet wenn heute bereits vergangen

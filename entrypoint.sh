@@ -905,13 +905,6 @@ if [ "$LOGROTATE_READY" -ne 1 ]; then
     exit 1
 fi
 
-echo "-> Starte Apache Webserver als überwachten Vordergrundprozess..."
-configure_apache_web_port
-apache2ctl -D FOREGROUND > /proc/1/fd/1 2>&1 &
-APACHE_PID=$!
-
-echo "-> Starte Python Hintergrunddienste..."
-
 # Die V4-Konfiguration wird exakt einmal gelesen. Derselbe kanonische Vertrag
 # entscheidet damit für systemd und Docker, welche Zusatzdienste gewollt sind.
 # Import-, JSON- und Vertragsfehler stoppen den Container vor dem ersten
@@ -919,6 +912,7 @@ echo "-> Starte Python Hintergrunddienste..."
 if ! OPTIONAL_SERVICE_PROJECTION="$(
     "$PYTHON_EXEC" - "$V4_CONFIG" <<'PY'
 import json
+import os
 import sys
 
 SUPPORTED_DOCKER_OPTIONALS = (
@@ -947,6 +941,13 @@ try:
         raise ValueError("e3dc_v4.json muss ein JSON-Objekt enthalten")
 
     configured = configured_optional_services(config)
+    from Installer.docker_network_preflight import bridge_start_blockers
+
+    network_blockers = bridge_start_blockers(
+        config, environment=os.environ, optional_services=configured,
+    )
+    if network_blockers:
+        raise ValueError(" ".join(network_blockers))
     unsupported = tuple(
         service for service in configured if service not in SUPPORTED_DOCKER_OPTIONALS
     )
@@ -1030,20 +1031,42 @@ if optional_service_selected "e3dc-matter-bridge"; then
     fi
 fi
 
+# Private Bestände werden vor jedem EMS-Prozess geprüft und eng migriert.
+# Kein Laufzeitprozess darf bei fehlgeschlagener Privilegienabgabe als Root starten.
+EMS_EXEC=("$PYTHON_EXEC" -I -B /usr/local/bin/e3dc-docker-runtime)
+RUNTIME_MIGRATION=(/usr/bin/python3 -B -E -s /app/pi/Install/Installer/docker_runtime_permissions.py migrate)
+if optional_service_selected "e3dc-forecast-evidence"; then
+    RUNTIME_MIGRATION+=(--include-forecast)
+fi
+if ! "${RUNTIME_MIGRATION[@]}"; then
+    echo "-> FEHLER: Private Laufzeitdaten konnten nicht sicher migriert werden."
+    exit 1
+fi
+if ! "${EMS_EXEC[@]}" -- "$PYTHON_EXEC" -c 'pass'; then
+    echo "-> FEHLER: EMS-Laufzeitidentität ist nicht sicher startfähig."
+    exit 1
+fi
+
+echo "-> Starte Apache Webserver als überwachten Vordergrundprozess..."
+configure_apache_web_port
+apache2ctl -D FOREGROUND > /proc/1/fd/1 2>&1 &
+APACHE_PID=$!
+
+echo "-> Starte Python Hintergrunddienste..."
 cd /app/pi/Install/Installer
 
 # E3DC Live RSCP Client ZUERST starten -- liefert live_data_py.json fuer storage_simulator.
 # Ohne diesen Schritt wuerde storage_simulator mit SOC=0% starten -> Discharge-Sperre!
 echo "-> E3DC Live RSCP Client (zuerst, liefert Live-SoC)..."
-nohup $PYTHON_EXEC e3dc_live.py --write --loops 0 --interval 3 > /proc/1/fd/1 2>&1 &
+nohup "${EMS_EXEC[@]}" -- "$PYTHON_EXEC" e3dc_live.py --write --loops 0 --interval 3 2>&1 &
 E3DC_LIVE_STARTED=1
 echo "   -> Warte 10s auf erste RSCP-Messung..."
 sleep 10
 
 # === INITIALER SOFORT-FORECAST (VOR Simulator-Start!) ===
 echo "-> Initialer PV-Forecast (--once, vor Daemon-Start)..."
-if $PYTHON_EXEC Forecast/pv_forecast_service.py --once >> /proc/1/fd/1 2>&1; then
-    SLOTS=$(python3 -c "import json; d=json.load(open('/var/www/html/ramdisk/pv_forecast.json')); print(len(d))" 2>/dev/null || echo '?')
+if "${EMS_EXEC[@]}" -- "$PYTHON_EXEC" Forecast/pv_forecast_service.py --once 2>&1; then
+    SLOTS=$("${EMS_EXEC[@]}" -- "$PYTHON_EXEC" -c "import json; d=json.load(open('/var/www/html/ramdisk/pv_forecast.json')); print(len(d))" 2>/dev/null || echo '?')
     echo "   -> pv_forecast.json erstellt (${SLOTS} Slots)."
 else
     echo "   -> Forecast-Init fehlgeschlagen (API nicht erreichbar). Daemon holt nach."
@@ -1052,128 +1075,124 @@ fi
 # ML-Vorhersage: Das anlagenspezifische Modell liegt in einem privaten Volume.
 # Ein altes Web-Pickle wird niemals geladen oder übernommen.
 export E3DC_ML_MODEL_DIR="/var/lib/e3dc-control/ml"
-install -d -o root -g root -m 0700 "$E3DC_ML_MODEL_DIR"
-if ! $PYTHON_EXEC ml_predictor.py --model-ready >/dev/null 2>&1; then
+if ! "${EMS_EXEC[@]}" -- "$PYTHON_EXEC" ml_predictor.py --model-ready >/dev/null 2>&1; then
     echo "   -> Kein ML-Modell vorhanden: versuche einmaliges Training aus lokaler Historie..."
-    $PYTHON_EXEC ml_predictor.py --train >> /var/www/html/logs/storage_simulator.log 2>&1 || true
+    "${EMS_EXEC[@]}" --log storage_simulator.log -- "$PYTHON_EXEC" ml_predictor.py --train || true
 fi
-if $PYTHON_EXEC ml_predictor.py --model-ready >/dev/null 2>&1; then
+if "${EMS_EXEC[@]}" -- "$PYTHON_EXEC" ml_predictor.py --model-ready >/dev/null 2>&1; then
     echo "   -> ML-Vorhersage (ml_predictor --predict)..."
-    $PYTHON_EXEC ml_predictor.py --predict >> /var/www/html/logs/storage_simulator.log 2>&1 || true
+    "${EMS_EXEC[@]}" --log storage_simulator.log -- "$PYTHON_EXEC" ml_predictor.py --predict || true
 else
     echo "   -> Kein ML-Modell vorhanden (< 50 Samples) -- Storage Simulator nutzt Fallback."
 fi
 
 # WebSocket Server (immer)
-nohup $PYTHON_EXEC e3dc_websocket.py > /var/www/html/logs/e3dc_websocket.log 2>&1 &
+nohup "${EMS_EXEC[@]}" --log e3dc_websocket.log -- "$PYTHON_EXEC" e3dc_websocket.py &
 
 # Klimaanlage Live (read-only, nur bei kanonischer Aktivierung)
 if optional_service_selected "e3dc-climate-live"; then
     echo "   -> Klimaanlagen-Monitor (read-only) aktiv."
-    nohup $PYTHON_EXEC climate_live.py > /var/www/html/logs/climate_live.log 2>&1 &
+    nohup "${EMS_EXEC[@]}" --log climate_live.log -- "$PYTHON_EXEC" climate_live.py &
 fi
 
 # Klimaanlagen-Regelstatus (read-only, nur bei expliziter Aktivierung)
 if optional_service_selected "e3dc-climate-control"; then
     echo "   -> Klimaanlagen-Regelstatus (read-only) aktiv."
-    nohup $PYTHON_EXEC climate_control.py > /var/www/html/logs/climate_control.log 2>&1 &
+    nohup "${EMS_EXEC[@]}" --log climate_control.log -- "$PYTHON_EXEC" climate_control.py &
 fi
 
 # Energy Manager (nur bei kanonisch vollständig konfigurierter Wärmekopplung)
 if optional_service_selected "energy_manager"; then
     echo "   -> Energy Manager aktiv."
-    nohup $PYTHON_EXEC luxtronik/energy_manager.py > /proc/1/fd/1 2>&1 &
+    nohup "${EMS_EXEC[@]}" -- "$PYTHON_EXEC" luxtronik/energy_manager.py 2>&1 &
 fi
 
 # Luxtronik Live-Daten (NUR wenn Wärmepumpe explizit aktiviert)
 if optional_service_selected "e3dc-lux-live"; then
     echo "   -> Luxtronik WebSocket-Client aktiv."
-    nohup $PYTHON_EXEC luxtronik/lux_live.py > /var/www/html/logs/lux_live.log 2>&1 &
+    nohup "${EMS_EXEC[@]}" --log lux_live.log -- "$PYTHON_EXEC" luxtronik/lux_live.py &
 fi
 
 # IDM Live-Daten (NUR wenn IDM-IP konfiguriert)
 if optional_service_selected "e3dc-idm-live"; then
     echo "   -> IDM Modbus-Client aktiv."
-    nohup $PYTHON_EXEC idm/idm_live.py > /var/www/html/logs/idm_live.log 2>&1 &
+    nohup "${EMS_EXEC[@]}" --log idm_live.log -- "$PYTHON_EXEC" idm/idm_live.py &
 fi
 
 # Stiebel ISG Live-Daten (read-only)
 if optional_service_selected "e3dc-stiebel-live"; then
     echo "   -> Stiebel ISG Live aktiv."
-    nohup $PYTHON_EXEC stiebel/stiebel_live.py > /var/www/html/logs/stiebel_live.log 2>&1 &
+    nohup "${EMS_EXEC[@]}" --log stiebel_live.log -- "$PYTHON_EXEC" stiebel/stiebel_live.py &
 fi
 
 # Dimplex WPM Live-Daten (read-only, nur bei vollständiger expliziter Freigabe)
 if optional_service_selected "e3dc-dimplex-live"; then
     echo "   -> Dimplex WPM Live aktiv."
-    nohup $PYTHON_EXEC dimplex/dimplex_live.py > /var/www/html/logs/dimplex_live.log 2>&1 &
+    nohup "${EMS_EXEC[@]}" --log dimplex_live.log -- "$PYTHON_EXEC" dimplex/dimplex_live.py &
 fi
 
 # Heizstab Manager (nur bei kanonisch vollständiger Konfiguration)
 if optional_service_selected "e3dc-heizstab"; then
     echo "   -> Heizstab Manager aktiv."
-    nohup $PYTHON_EXEC heizstab_manager.py > /var/www/html/logs/heizstab_manager.log 2>&1 &
+    nohup "${EMS_EXEC[@]}" --log heizstab_manager.log -- "$PYTHON_EXEC" heizstab_manager.py &
 fi
 
 # Native Wallbox Manager (Python PID-Regler für Go-e etc.)
 if optional_service_selected "e3dc-wallbox-manager"; then
     echo "   -> Native Wallbox Manager aktiv."
-    nohup $PYTHON_EXEC wallbox_manager.py > /proc/1/fd/1 2>&1 &
+    nohup "${EMS_EXEC[@]}" -- "$PYTHON_EXEC" wallbox_manager.py 2>&1 &
 fi
 
 # MQTT Hub (wenn in config konfiguriert)
 if optional_service_selected "e3dc-mqtt-hub"; then
     echo "   -> MQTT Hub aktiv."
-    nohup $PYTHON_EXEC e3dc_mqtt_hub.py > /proc/1/fd/1 2>&1 &
+    nohup "${EMS_EXEC[@]}" -- "$PYTHON_EXEC" e3dc_mqtt_hub.py 2>&1 &
 fi
 
 # Bluelink (wenn konfiguriert)
 if optional_service_selected "e3dc-bluelink"; then
     echo "   -> Bluelink Client aktiv."
-    nohup $PYTHON_EXEC bluelink_client.py > /var/www/html/logs/bluelink_client.log 2>&1 &
+    nohup "${EMS_EXEC[@]}" --log bluelink_client.log -- "$PYTHON_EXEC" bluelink_client.py &
 fi
 
 # EPEX Manager (Neu in V4)
 echo "   -> EPEX Manager aktiv."
-nohup $PYTHON_EXEC epex_manager.py > /proc/1/fd/1 2>&1 &
+nohup "${EMS_EXEC[@]}" -- "$PYTHON_EXEC" epex_manager.py 2>&1 &
 
 # Weather & PV Forecast Manager (Daemon: 60-Min-Zyklus)
 # WICHTIG: Erster Fetch laeuft synchron VOR dem Daemon-Start (s.u.),
 # damit pv_forecast.json sofort verfuegbar ist.
 echo "   -> PV Forecast & Weather Manager aktiv."
-nohup $PYTHON_EXEC Forecast/pv_forecast_service.py > /proc/1/fd/1 2>&1 &
+nohup "${EMS_EXEC[@]}" -- "$PYTHON_EXEC" Forecast/pv_forecast_service.py 2>&1 &
 
 # Rein diagnostische PV-Prognosediagnose. Ohne ausdrückliche Aktivierung wird
 # weder ein Prozess gestartet noch E3/DC-Historie gelesen oder eine DB erzeugt.
 if optional_service_selected "e3dc-forecast-evidence"; then
-    FORECAST_EVIDENCE_DIR="/var/lib/e3dc-control/forecast-evidence"
-    install -d -o root -g root -m 0700 "$FORECAST_EVIDENCE_DIR"
     echo "   -> PV-Prognosediagnose (read-only, niedrige Priorität) aktiv."
-    nohup nice -n 10 ionice -c 3 "$PYTHON_EXEC" forecast_evidence_sidecar.py \
-        > /proc/1/fd/1 2>&1 &
+    nohup nice -n 10 ionice -c 3 "${EMS_EXEC[@]}" -- "$PYTHON_EXEC" forecast_evidence_sidecar.py 2>&1 &
 else
     echo "   -> PV-Prognosediagnose ausgeschaltet (keine Historienabfrage/DB)."
 fi
 
 # Storage Simulator (Neu in V4)
 echo "   -> Storage Simulator aktiv."
-nohup $PYTHON_EXEC storage_simulator.py > /proc/1/fd/1 2>&1 &
+nohup "${EMS_EXEC[@]}" -- "$PYTHON_EXEC" storage_simulator.py 2>&1 &
 
 # Storage Manager (Gehirn Live - Neu in V4.0.5)
 echo "   -> Storage Manager (Gehirn Live) aktiv."
-nohup $PYTHON_EXEC storage_manager.py > /proc/1/fd/1 2>&1 &
+nohup "${EMS_EXEC[@]}" -- "$PYTHON_EXEC" storage_manager.py 2>&1 &
 
 # E3DC Live RSCP Client (Immer aktiv - Python-nativer Datenstream fuer V4 KI/Forecast)
 if [ "${E3DC_LIVE_STARTED:-0}" != "1" ]; then
     echo "   -> E3DC Live RSCP Client aktiv."
-    nohup $PYTHON_EXEC e3dc_live.py --write --loops 0 --interval 3 > /proc/1/fd/1 2>&1 &
+    nohup "${EMS_EXEC[@]}" -- "$PYTHON_EXEC" e3dc_live.py --write --loops 0 --interval 3 2>&1 &
 else
     echo "   -> E3DC Live RSCP Client bereits aktiv."
 fi
 
 # Notifier / Scheduler (Immer aktiv - ersetzt Cronjobs in Docker)
 echo "   -> Notification & Schedule Manager aktiv."
-nohup $PYTHON_EXEC notification_manager.py > /var/www/html/logs/notification_manager.log 2>&1 &
+nohup "${EMS_EXEC[@]}" --log notification_manager.log -- "$PYTHON_EXEC" notification_manager.py &
 
 # Matter Bridge (optional, read-only Statusendpunkte)
 if optional_service_selected "e3dc-matter-bridge"; then

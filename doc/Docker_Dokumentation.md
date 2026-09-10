@@ -2,15 +2,19 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.5f`. Die Tags `latest`, `v5.4.5f` und
-`5.4.5f` bezeichnen denselben Stable-Stand.
+Der aktuelle Stable-Stand ist `v5.4.6`. Die Tags `latest`, `v5.4.6` und
+`5.4.6` bezeichnen denselben Stable-Stand.
 
-5.4.5f korrigiert das Speichern der Konfiguration mit übernommenen
-Docker-Datenvolumes und berücksichtigt erkannte Neustartphasen beim Update.
-Konfigurationsmigrationen bestätigen die benötigten Dateirechte vor dem
-Ersetzen. Der Host-Helfer muss für diese Updatekorrektur separat aktualisiert
-werden; ein neues Containerimage ersetzt ihn nicht. Einzelheiten stehen in
-den [Release Notes](../RELEASE_NOTES.md).
+5.4.6 startet EMS-Python-Dienste mit dem eigenen unprivilegierten Konto
+`e3dc-runtime`. Private Modelle und Prognosebelege werden vor dem Start geprüft
+und übernommen. Der aktuelle Host-Updater ist auch für den Rückfall auf ältere
+Root-Images erforderlich. Vor dem Upgrade den tatsächlich verwendeten Helfer
+aktualisieren, einschließlich einer gegebenenfalls direkt im Compose-Ordner
+vorhandenen Kopie; ein neues Containerimage ersetzt diese Hostdatei nicht.
+Zusätzlich steht eine ausdrücklich wählbare Bridge-Vorlage für kompatible
+Named-Volume-Installationen bereit. Hostnetz bleibt Standard. Vor einem Wechsel
+die unten beschriebenen Sicherungs-, Netzwerk- und Wallbox-Wartungshinweise
+beachten. Einzelheiten stehen in den [Release Notes](../RELEASE_NOTES.md).
 
 Seit 5.4.5a gibt es zusätzlich die rein lesende Anzeige eines frisch beobachteten
 openWB-Fahrzeug-SoC samt Quelle und Alter. Ohne eindeutige Zuordnung zur
@@ -295,9 +299,13 @@ sudo docker compose config --images e3dc-control
 ```
 
 Ohne bewussten Pin muss genau
-`ghcr.io/a9xxx/install-e3dc-control:latest` erscheinen. `network_mode: host`
-ermöglicht den Zugriff auf das E3/DC-Hauskraftwerk und lokale
-MQTT-/Wallbox-Geräte, ohne ein separates Port-Mapping anzulegen.
+`ghcr.io/a9xxx/install-e3dc-control:latest` erscheinen. Die mitgelieferte
+Standarddatei verwendet `network_mode: host`. Dadurch teilen sich Container
+und Host den Netzwerkbereich; der Container bindet seine Ports direkt auf
+dem Host. Das erhält die Kompatibilität mit Matter/mDNS und bestehenden
+Konfigurationen, die einen MQTT-Broker über die Loopback-Adresse des Hosts
+ansprechen. Ausgehende RSCP-, Modbus-TCP-, HTTP- und MQTT-Verbindungen
+benötigen für sich genommen kein Hostnetz.
 
 Das Docker-Engine-Log des Hauptcontainers ist damit auf drei Dateien zu je
 10 MiB begrenzt. Diese Grenze gilt zusätzlich zu den getrennt persistierten
@@ -313,14 +321,24 @@ Rechtevertrag getrennt:
 |---|---|---|
 | `e3dc_data` | Konfiguration, SQLite-Historie, Betriebszustand und sichere Docker-Warmstartdaten | immer sichern |
 | `e3dc_logs` | Laufzeitprotokolle sowie neu aufbaubare adaptive Auswertungsreihen | optional; Löschen setzt Support- und Auswertungshistorie zurück |
-| `e3dc_ml` | root-privates lokales Lernmodell außerhalb des Webroots | empfohlen; ohne Backup ist ein neues Training aus der Historie nötig |
-| `e3dc_forecast_evidence` | optionale, root-private Prognosebelege mit rollierender Aufbewahrung bis zu 90 Tagen | optional; Verlust beeinflusst die Regelung nicht, setzt aber die Diagnosehistorie zurück |
+| `e3dc_ml` | privates lokales Lernmodell des Laufzeitkontos außerhalb des Webroots | empfohlen; ohne Backup ist ein neues Training aus der Historie nötig |
+| `e3dc_forecast_evidence` | optionale private Prognosebelege des Laufzeitkontos mit rollierender Aufbewahrung bis zu 90 Tagen | optional; Verlust beeinflusst die Regelung nicht, setzt aber die Diagnosehistorie zurück |
 | `e3dc_instance_role` | root-privater create-once-Anker für exakt `ha_mode=off`; überlebt Container-Recreates | auf demselben Docker-Host erhalten; nicht als Rollenanker auf einen anderen Host kopieren |
 
 Die mitgelieferte Compose-Datei verwendet für alle fünf Bereiche benannte
 Volumes. Ein abweichendes Bind-Mount-Layout ist kein Teil des manuellen
 Quickstarts und darf die ausgelieferte Compose-Datei nicht ungeprüft ersetzen.
 Die Ramdisk ist absichtlich flüchtig und gehört nicht ins Backup.
+
+Vollständige Docker-Sicherungen werden auf dem Host bei gestopptem Container
+von den benötigten Volumes erstellt. Dabei numerische Eigentümer und
+Dateirechte erhalten, einschließlich UID/GID `991` und einer vorhandenen
+privaten Modellquarantäne. Das allgemeine Vollbackup-Menü im Container setzt
+weiterhin den administrativen Installationsbesitzer für den Modellstore
+voraus und unterstützt diese getrennten Docker-Bestände nicht. Die geplante
+Sicherung der Verbrauchshistorie durch den Aufgabenplaner bleibt verfügbar.
+Nach einer Wiederherstellung zuerst das zugehörige aktuelle Runtime-Image
+starten und dessen Datenmigration und Healthcheck prüfen.
 
 Vor der Modusübernahme werden Datenordner und Konfigurationsdatei auf sichere
 Eigentümer, Rechte und unveränderte Identität geprüft. Verknüpfte, für alle
@@ -345,8 +363,8 @@ Tagen.
 
 `e3dc_ml` darf nicht einfach unter das heutige Web-`data` verschoben werden:
 Der Datenbaum gehört dem Webbenutzer, während das verifizierte, serialisierte
-Modell und die privaten Prognosebelege aus Sicherheitsgründen root-privat
-bleiben. Eine Reduktion auf nur `e3dc_data` und `e3dc_logs` würde unterschiedliche
+Modell und die privaten Prognosebelege ausschließlich dem getrennten
+Laufzeitkonto gehören. Der Webbenutzer erhält darauf keine Zugriffsrechte. Eine Reduktion auf nur `e3dc_data` und `e3dc_logs` würde unterschiedliche
 Eigentümer-, Sicherheits-, Aufbewahrungs- und Backupverträge vermischen und
 wird deshalb nicht unterstützt. Eine spätere Zusammenlegung privater Volumes
 benötigt eine verifizierte Datenmigration samt Rechteprüfung und Rückfallweg.
@@ -413,7 +431,7 @@ unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.5f` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.6` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -440,7 +458,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.5f` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.6` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash
@@ -464,10 +482,54 @@ den Docker-Daemon des Hosts steuern. Die Weboberfläche kann deshalb die
 passenden Befehle für den gewählten Tag anzeigen, aber sie führt sie im
 Docker-Betrieb nicht selbst aus.
 
+Beim Rückfall von einem Image mit dem Laufzeitkonto `e3dc-runtime` auf ein
+älteres Root-Image ist der **aktuelle Host-Updater** zwingend. Er bestätigt
+zuerst den Containerstillstand. Anschließend führt ein isolierter Helfer aus
+der unveränderlich gebundenen neuen Image-ID die private Rückmigration und
+die anschließende Root-Rechteprüfung aus. Der Helfer erhält ausschließlich die
+beiden geprüften privaten Named Volumes, kein Netzwerk und keine EMS-Dienste.
+Weitere laufende Nutzer dieser Volumes, fremde Volume-Treiber oder ungeprüfte
+Volume-Optionen sperren den Rückfall. Dasselbe Verfahren gilt für den
+automatischen Rückfall nach einem fehlgeschlagenen Start des neuen Images,
+auch wenn dessen EMS-Dienste noch nie gesund waren.
+
+Diese Rückmigration benötigt einen vorhandenen Runtime-Container im
+Hostprofil. Aus dem Bridge-Betrieb zuerst nach dem unten beschriebenen
+Netzwerk-Rückweg dieselbe aktuelle Runtime-Version im Hostprofil neu aufbauen
+und den gesunden Start prüfen. Erst danach folgt der normale gebundene
+Rückfall auf das ältere Root-Image. Netzwerkwechsel und Root-Downgrade dürfen
+nicht durch einen direkten Start des Altimages zusammengezogen werden.
+
+Modelldateien aus dem unprivilegierten Betrieb werden dabei unverändert im
+privaten Unterordner `.root-rollback-models` archiviert und vom aktiven
+Modellpfad entfernt. Das ältere Root-Image darf diese serialisierten Dateien
+nicht laden; es trainiert bei Bedarf neu. Private Prognosebelege bleiben
+inhaltlich erhalten. Eine fehlgeschlagene Migration oder Rechteprüfung
+verhindert den Start des Altimages.
+
+Entferne vor diesem Rückfall weder den vorhandenen Runtime-Container noch
+seine lokale Image-ID. Sie liefern die geprüfte Quelle für die Rückmigration.
+Ein Altimage-Erststart auf bereits vorhandenen privaten Volumes ohne diesen
+Container ist gesperrt. Rohe `docker compose up`-/`run`-Aufrufe und ein älterer
+Host-Updater führen diesen Schutzschritt nicht aus und sind dafür kein
+unterstützter Rückfallweg. Falls der Container bereits entfernt wurde, stelle
+zuerst das aktuelle Image mit Runtime-Unterstützung über den Host-Updater
+wieder her und prüfe dessen gesunden Betrieb; danach folgt der reguläre
+Root-Rückfall mit demselben aktuellen Updater. Der Hilfscontainer übernimmt keine Wallbox-Leases
+aus dem Containerlayer; die unten beschriebene Grenze bei Container-Recreate
+bleibt bestehen.
+
 Der fest gebundene historische Rückfall-Root `v5.3.2b` enthält noch keinen
 imagegebundenen Healthcheck. Nur für genau diesen Tag belegt der Rückfall daher
 zwei identische laufende Container-Snapshots statt `healthy`. Ein aktuelles oder
 künftiges Image ohne Healthcheck bleibt dagegen ein harter Fehler.
+
+Das historische Image `v5.3.2b` installiert seine Matter-NPM-Abhängigkeiten
+beim ersten Start nach, auch wenn Matter deaktiviert ist. Solange diese Pakete
+nicht bereits installiert sind, benötigt der Start Zugriff auf die NPM-Paketquelle.
+Ohne diese Voraussetzung kann der Container laufen, während die EMS-Dienste
+noch auf die Installation warten. Prüfe nach diesem Rückfall deshalb zusätzlich
+die erreichbare Weboberfläche und den tatsächlichen Dienststart.
 
 Für einen dauerhaft festgehaltenen Tag wird derselbe Wert zusätzlich als
 `E3DC_IMAGE_TAG=v5.3.2b` in einer vorhandenen `.env` ergänzt, ohne andere dort
@@ -584,7 +646,7 @@ Image abgedeckt werden.
 In der Ausgabe von `docker compose config` ist `volume: {}` bei benannten
 Volumes normal. Docker verwaltet deren echten Hostpfad. Das gilt insbesondere
 für `e3dc_ml`, `e3dc_forecast_evidence` und `e3dc_instance_role`; diese
-root-privaten Datenklassen bleiben dadurch vom Webverzeichnis getrennt. Den Pfad siehst du bei Bedarf mit
+privaten Datenklassen bleiben dadurch vom Webverzeichnis getrennt. Den Pfad siehst du bei Bedarf mit
 `docker volume inspect <Compose-Projekt>_e3dc_forecast_evidence`.
 
 Pruefen, ob der neue Entrypoint aktiv ist:
@@ -624,7 +686,8 @@ s=socket.create_connection((cfg["server_ip"], int(cfg.get("server_port") or 5033
 print("TCP 5033 OK")
 s.close()
 PY
-/opt/venv/bin/python3 /app/pi/Install/Installer/e3dc_live.py --loops 1
+/opt/venv/bin/python3 -I -B /usr/local/bin/e3dc-docker-runtime -- \
+  /opt/venv/bin/python3 /app/pi/Install/Installer/e3dc_live.py --loops 1
 '
 ```
 
@@ -653,6 +716,92 @@ Container endet mit Fehler. Nach erfolgreichem Start erreichst du das Dashboard
 
 ---
 
+## Optionaler Bridge-Betrieb
+
+`docker-compose.bridge.yml` bietet einen ausdrücklich wählbaren Betrieb mit
+eigenem Docker-Netz. Nur der Webport wird veröffentlicht; WebSockets laufen
+weiter über Apache unter `/ws`. Die Vorlage verwendet dieselben fünf Named
+Volumes wie die Standarddatei. Installationen mit `./data`-/`./logs`-Bind-Mounts
+dürfen sie nicht übernehmen, weil dadurch andere Datenbereiche gewählt würden.
+Der automatische Installer und bestehende Installationen behalten Hostnetz.
+
+Voraussetzung sind ein Image mit Bridge-Unterstützung und geroutete
+Geräteadressen. Matter/mDNS, Link-Local-Ziele und MQTT über Host-Loopback sind
+in diesem Betriebsweg nicht unterstützt. openWB mit HTTP-Secondary benötigt
+eine explizite, aus dem LAN erreichbare `wb_openwb_parent_ip`. Die Startprüfung
+verhindert bekannte unvereinbare Einstellungen vor Apache und den
+EMS-Diensten. Sie prüft keine DNS-Auflösung oder tatsächliche Erreichbarkeit.
+
+Im Bridge-Betrieb bleibt Apache intern auf Port 80. Ohne zusätzliche Angaben
+ist die Oberfläche ausschließlich am Docker-Host über `127.0.0.1:8085`
+erreichbar, beispielsweise für einen dortigen Reverse Proxy. Für direkten
+LAN-Zugang setze in `.env` eine passende Host-IP und den gewünschten äußeren
+Port, etwa `E3DC_PUBLISH_BIND=192.0.2.20` und `E3DC_PUBLISH_PORT=8085`.
+`E3DC_WEB_BIND` bleibt im Container leer und `E3DC_WEB_PORT` bleibt `80`.
+
+### Bewusster Wechsel und Rückfall
+
+Verwende denselben Compose-Ordner und Projektnamen. Sichere vorher die
+funktionierende `docker-compose.yml` als `docker-compose.host.bak`, die
+vorhandene `.env` und die persistenten Daten. Halte den aktuell eingesetzten
+versionierten Runtime-Image-Tag für den Rückweg fest, beispielsweise `v5.4.6`.
+Ein älterer Root-Tag eignet sich nicht für diesen ersten Netzwerk-Rückweg.
+Prüfe eine administrativ zugängliche Kopie der aktuellen
+Konfiguration, ohne ihren Inhalt auszugeben:
+
+```bash
+python3 Installer/docker_network_preflight.py --config <Pfad-zur-e3dc_v4.json>
+```
+
+Nach erfolgreicher Prüfung in einem Wartungsfenster die laufende Instanz
+stoppen und ausschließlich den gestoppten Hauptcontainer entfernen:
+
+```bash
+sudo docker compose --profile auto-update stop watchtower e3dc-control
+sudo docker compose rm -f e3dc-control
+cp -- docker-compose.bridge.yml docker-compose.yml
+sudo docker compose config --images e3dc-control
+sudo python3 Installer/docker_compose_update.py --compose-dir . --sudo
+```
+
+Die Named Volumes bleiben dabei erhalten. Verwende kein `down -v` oder
+`volume rm`. Ein bestehender Hostcontainer wird unter der Bridge-Vorlage
+abgewiesen; bloßes Stoppen genügt daher nicht. Der Host-Updater prüft vor dem
+Start, dass Ziel- und gegebenenfalls Rückfallimage Bridge unterstützen. Nutze
+für diesen Betriebsweg den Host-Updater; direkte `docker compose up`-Aufrufe
+und Watchtower umgehen dessen Imageprüfung. Automatische Updates bleiben
+hier ausgeschaltet.
+
+Prüfe anschließend Webzugang, `/ws`, frische RSCP-Livewerte und alle genutzten
+MQTT-, Wallbox- und Wärmeanbindungen. Ein erfolgreicher Start allein bestätigt
+noch nicht die Anlagenkommunikation. Beim ersten Wechsel ist der alte
+Hostcontainer bereits entfernt; es gibt deshalb keinen automatischen
+Rückfall auf ihn. Bei Problemen den Bridgecontainer wie oben stoppen und
+entfernen, `docker-compose.host.bak` wieder als `docker-compose.yml` einsetzen
+und die ursprüngliche `.env` wiederherstellen. Anschließend dieselbe aktuelle
+Runtime-Version über den Host-Updater im Hostprofil neu aufbauen; einen
+gegebenenfalls älteren Pin aus der wiederhergestellten `.env` dabei ausdrücklich
+mit dem zuvor festgehaltenen Runtime-Tag übersteuern:
+
+```bash
+sudo python3 Installer/docker_compose_update.py --compose-dir . --sudo --image-tag <bisheriger-Runtime-Tag>
+```
+
+Erst nach dem bestätigten gesunden Start dieses Runtime-Containers kann ein
+älteres Root-Image über den regulären Rückfallweg oben gewählt werden. Den
+nun vorhandenen Runtime-Container und seine lokale Image-ID bis zum Abschluss
+erhalten: Sie liefern die gebundene Quelle für die private Rückmigration.
+Ein direkter Wechsel vom entfernten Bridgecontainer auf ein altes Root-Image
+überspringt diesen Schutzschritt und ist nicht unterstützt.
+
+Für spätere inkompatible Adress-, Matter- oder openWB-Typ-/Rollenänderungen
+über die WebUI kehre zuerst kontrolliert zum Host-Betrieb zurück. Prüfe die
+geänderte Konfiguration, bevor Du erneut Bridge wählst. Es gibt keine
+fortlaufende Konfigurationssperre im Bridge-Container. Gewöhnliche Bedienung,
+Zeitpläne und Sollwerte ohne Wechsel von Netzadressen, Gerätetypen oder Rollen
+bleiben nutzbar. Ein Downgrade auf ein älteres Image ohne Bridge-Unterstützung
+erfordert ebenfalls zuerst die Rückkehr zum Host-Betrieb.
+
 ## 2. Architektur & Unterschiede zur normalen Installation
 
 Wenn E3DC-Control in Docker läuft, verhält es sich intern etwas anders als bei einer "Bare-Metal" Installation auf dem Raspberry Pi.
@@ -666,6 +815,52 @@ Wenn E3DC-Control in Docker läuft, verhält es sich intern etwas anders als bei
 * **Imagegebundener Healthcheck:** Das Image prüft Apache, alle Pflichtprozesse und exakt die beim Boot aus der Konfiguration projizierten Zusatzdienste. Es liest dafür nur den PID-Namensraum, die root-gebundene Boot-Projektion und die Apache-Konfiguration; RSCP, Geräte und Aktoren werden nicht angesprochen. Die Hostbefehle verlangen anschließend zwei identische Snapshots derselben Container-, Image- und Startgeneration mit unverändert grünem Healthstatus.
 
 ### Aktive Hintergrunddienste im Container
+
+Die 19 EMS-Python-Dienste und die ML-Startaufträge laufen unter dem festen
+Systemkonto `e3dc-runtime` mit UID/GID `991`, ohne Login und ohne
+administrative Rechte. Die zusätzliche Gruppe `www-data` ermöglicht den
+vorgesehenen Zugriff auf gemeinsame Konfigurations-, Ramdisk- und Logdateien.
+Der Start entfernt sämtliche Linux-Capabilities und setzt `NoNewPrivs`;
+Kindprozesse des Aufgabenplaners erben diese Einschränkungen. Das
+Laufzeitkonto und seine Prozessrechte werden unabhängig von Webwerten und
+Umgebungsangaben geprüft.
+
+Initialisierung, PID 1, Apache-Master und Logrotation behalten ihre
+administrative Rolle. Produktcode, Python-Venv, Starthelfer und Rollenanker
+bleiben root-kontrolliert. Der Installationsbenutzer `root` in den
+Pfadmetadaten bezeichnet weiterhin diesen administrativen Besitzer und
+nicht die Prozessidentität der EMS-Dienste. Apache-PHP und die optionale
+Matter-Bridge verwenden weiterhin ihren bisherigen Webbenutzer.
+
+Vor dem ersten EMS-Start werden bekannte private Modell- und Diagnosebestände
+auf das Laufzeitkonto migriert. Private Verzeichnisse bleiben `0700`, Dateien
+`0600`; unklare Eigentümer, Verknüpfungen oder fremde Inhalte führen zum
+Abbruch vor dem Workerstart. Die Prüfung ändert keine Anlagenkonfiguration
+und lädt keine serialisierten Modelle. Ein zusätzliches `user:` in Compose
+oder ein pauschales `USER` im Dockerfile wird weiterhin nicht unterstützt:
+Der privilegierte Start muss erst die überprüften Daten- und Prozessverträge
+vorbereiten. Ein Start mit Root-Rechten als Ersatz bei Fehlern ist
+nicht vorgesehen.
+
+Der imagegebundene Healthcheck prüft neben dem Dienstsatz die tatsächlichen
+UIDs, GIDs, Gruppen, Capabilities und `NoNewPrivs` der EMS-Prozesse und ihrer
+Kindprozesse. Ein laufender Prozess mit falschen Rechten gilt nicht als
+gesunder EMS-Dienst. Der Web-Neustart funktioniert weiterhin über den
+Notifier-Exit und den vollständigen Neustart durch PID 1; dafür erhält der
+Notifier keine zusätzlichen Rechte.
+
+Der private openWB-Pro-Steuerzustand liegt unter
+`/var/lib/e3dc-control/runtime/private-control`. Vorhandene Zustände am
+bisherigen Pfad `/root/.e3dc-control-state` werden vor dem Workerstart geprüft
+und unter Erhalt des Inhalts übernommen. Beide Pfade liegen im beschreibbaren
+Containerlayer: Ein Neustart desselben Containers erhält diese Zustände,
+ein Entfernen oder Neuerstellen des Containers erhält sie nicht. Das war
+bereits beim bisherigen Root-Pfad so. Auch der Hostbefehl
+`--recreate-current` erstellt den Container neu; er ist deshalb kein
+zustandserhaltender Prozessneustart. Führe solche Wartungsarbeiten bei
+beendeter Fahrzeugladung und ohne laufende Phasen-/Steuerübergabe aus und
+prüfe den Wiederanlauf. Eine Persistenz dieses privaten Steuerzustands über
+Container-Recreates hinaus ist damit nicht zugesichert.
 
 Folgende Python-Dienste startet die `entrypoint.sh`. Persistente Dienstlogs liegen unter `/var/www/html/logs/`; Einträge mit „Docker-Engine-Log“ erscheinen in `docker compose logs`:
 
@@ -900,16 +1095,24 @@ Laufzeitmodell mit einer neuen Vergleichshistorie; die Regelung ist davon nicht
 betroffen. Das alte benannte Docker-Volume wird bei `docker compose down` ohne
 `--volumes` nicht gelöscht.
 
-Pruefung im Container:
+Prüfung im Container:
 ```bash
 sudo docker exec -it e3dc-control bash
 ls -ld /var/www/html/ramdisk
 ls -la /var/lib/e3dc-control/ml
-/opt/venv/bin/python3 /app/pi/Install/Installer/ml_predictor.py --train
-/opt/venv/bin/python3 /app/pi/Install/Installer/ml_predictor.py --model-ready
-/opt/venv/bin/python3 /app/pi/Install/Installer/ml_predictor.py --predict
+/opt/venv/bin/python3 -I -B /usr/local/bin/e3dc-docker-runtime -- \
+  /opt/venv/bin/python3 /app/pi/Install/Installer/ml_predictor.py --train
+/opt/venv/bin/python3 -I -B /usr/local/bin/e3dc-docker-runtime -- \
+  /opt/venv/bin/python3 /app/pi/Install/Installer/ml_predictor.py --model-ready
+/opt/venv/bin/python3 -I -B /usr/local/bin/e3dc-docker-runtime -- \
+  /opt/venv/bin/python3 /app/pi/Install/Installer/ml_predictor.py --predict
 ls -l /var/www/html/ramdisk/ml_prediction.json
 ```
+
+Der feste Launcher gibt vor jedem Python-Worker die Rootrechte an das
+gebundene Laufzeitkonto ab. Das gilt auch für manuelles Training und
+Diagnosebefehle aus einer Root-Shell. Moderne Modelldateien dürfen nicht durch
+einen direkten Root-Aufruf von `ml_predictor.py` geladen werden.
 
 Kommt beim Training `Nicht genug Trainingsdaten`, ist das bei neuen Systemen
 normal. Der Storage Simulator nutzt dann automatisch den konservativen

@@ -48,6 +48,12 @@ MAX_COMPOSE_BYTES = 512 * 1024
 MAX_ENV_BYTES = 128 * 1024
 MIN_DOCKER_FREE_BYTES = 2 * 1024 * 1024 * 1024
 DOCKER_STORAGE_FULL_CODE = "DOCKER_STORAGE_FULL"
+BRIDGE_IMAGE_LABEL = "io.e3dc.network.bridge-preflight"
+RUNTIME_IMAGE_LABEL = "io.e3dc.runtime.uid"
+PRIVATE_RUNTIME_TARGETS = (
+    "/var/lib/e3dc-control/ml",
+    "/var/lib/e3dc-control/forecast-evidence",
+)
 ROLE_VOLUME_NAME = "e3dc_instance_role"
 ROLE_VOLUME_TARGET = "/etc/e3dc-control"
 DATA_VOLUME_TARGET = "/var/www/html/data"
@@ -100,7 +106,9 @@ def _active_yaml_lines(value: str) -> tuple[str, ...]:
     return tuple(result)
 
 
-def _known_compose_template(*, bind_mounts: bool, current: bool) -> tuple[str, ...]:
+def _known_compose_template(
+    *, bind_mounts: bool, current: bool, bridge: bool = False,
+) -> tuple[str, ...]:
     data_source = "./data" if bind_mounts else "e3dc_data"
     log_source = "./logs" if bind_mounts else "e3dc_logs"
     lines = [
@@ -117,6 +125,15 @@ def _known_compose_template(*, bind_mounts: bool, current: bool) -> tuple[str, .
             "    network_mode: host",
         ]
     )
+    if bridge:
+        if not current or bind_mounts:
+            raise ValueError("Bridge wird ausschließlich als aktueller Named-Volume-Vertrag unterstützt.")
+        lines[-1:] = [
+            "    networks:",
+            "      - e3dc",
+            "    ports:",
+            '      - "${E3DC_PUBLISH_BIND:-127.0.0.1}:${E3DC_PUBLISH_PORT:-8085}:80"',
+        ]
     if current:
         lines.extend(
             [
@@ -183,12 +200,21 @@ def _known_compose_template(*, bind_mounts: bool, current: bool) -> tuple[str, .
     lines.extend(["  e3dc_ml:", "  e3dc_forecast_evidence:"])
     if current:
         lines.append(f"  {ROLE_VOLUME_NAME}:")
+    if bridge:
+        position = lines.index("      - E3DC_CONTAINER_MODE=1") + 1
+        lines.insert(position, "      - E3DC_CONTAINER_NETWORK_MODE=bridge")
+        lines.extend(["networks:", "  e3dc:", "    driver: bridge"])
     return tuple(lines)
 
 
 KNOWN_CURRENT_TEMPLATES = {
     _known_compose_template(bind_mounts=False, current=True): "repo_named_volumes",
     _known_compose_template(bind_mounts=True, current=True): "installer_bind_mounts",
+    _known_compose_template(bind_mounts=False, current=True, bridge=True): "repo_named_volumes",
+}
+KNOWN_CURRENT_TEMPLATE_HASHES = {
+    # Exakte aktive YAML-Form nach Migration der veröffentlichten R0-Standarddatei.
+    "cc277eabaa3471e74abea4c337c18f5f00b73179b6bc0486be06e2d2c2211a24": "repo_named_volumes",
 }
 KNOWN_542_LEGACY_HASHES = {
     "4310fab1ceb4d354d2ca950f0e95a6696f5f68a17f986071b9fa8994a38e4412": "repo_named_volumes",
@@ -1288,6 +1314,43 @@ def _validate_watchtower_identity(
     return (info.get("State") or {}).get("Running") is True
 
 
+def _projection_uses_bridge(projection: dict[str, Any]) -> bool:
+    service = ((projection.get("services") or {}).get(SERVICE_NAME) or {})
+    return (service.get("environment") or {}).get("E3DC_CONTAINER_NETWORK_MODE") == "bridge"
+
+
+def _validate_bridge_runtime(projection: dict[str, Any], info: dict[str, Any]) -> None:
+    """Bindet den optionalen Bridge-Betrieb an Netz und veröffentlichte Ports."""
+    if not _projection_uses_bridge(projection):
+        return
+    service = projection["services"][SERVICE_NAME]
+    network = (projection.get("networks") or {}).get("e3dc") or {}
+    name = str(network.get("name") or "")
+    host_config = info.get("HostConfig") or {}
+    networks = (info.get("NetworkSettings") or {}).get("Networks") or {}
+    if (
+        not name or network.get("driver") != "bridge"
+        or host_config.get("NetworkMode") != name or set(networks) != {name}
+    ):
+        raise DockerUpdateError(
+            "Der vorhandene Container entspricht nicht dem gewählten Bridge-Netz. "
+            "Ein Wechsel vom Host-Betrieb benötigt den dokumentierten manuellen Ablauf."
+        )
+    expected = sorted(
+        (str(port.get("target")), str(port.get("protocol", "tcp")),
+         str(port.get("host_ip") or ""), str(port.get("published") or ""))
+        for port in service.get("ports") or ()
+    )
+    actual = []
+    for target, bindings in (host_config.get("PortBindings") or {}).items():
+        container_port, _, protocol = str(target).partition("/")
+        for binding in bindings or ():
+            actual.append((container_port, protocol, str(binding.get("HostIp") or ""),
+                           str(binding.get("HostPort") or "")))
+    if sorted(actual) != expected:
+        raise DockerUpdateError("Die real veröffentlichten Bridge-Ports widersprechen der Compose-Projektion.")
+
+
 def _validate_e3dc_container_binding(
     cli: DockerCli,
     projection: dict[str, Any],
@@ -1320,6 +1383,7 @@ def _validate_e3dc_container_binding(
             "docker-compose.yml erzeugt; ein früheres Override muss manuell geprüft werden."
         )
 
+    _validate_bridge_runtime(projection, info)
     projected_service = ((projection.get("services") or {}).get(SERVICE_NAME) or {})
     projected_volumes = [
         item
@@ -1487,8 +1551,13 @@ def _safe_custom_mount(item: dict[str, Any]) -> bool:
 
 def _legacy_532b_projection_topology(projection: dict[str, Any]) -> str:
     services = projection.get("services") or {}
-    e3dc = services.get(SERVICE_NAME) or {}
-    watchtower = services.get("watchtower") or {}
+    e3dc = dict(services.get(SERVICE_NAME) or {})
+    watchtower = dict(services.get("watchtower") or {})
+    for service in (e3dc, watchtower):
+        for key in ("command", "entrypoint"):
+            # Compose-null verwendet den Image-Default; leere Werte tun das nicht.
+            if key in service and service[key] is None:
+                service.pop(key)
     image = _require_official_image(str(e3dc.get("image") or ""))
     if _tag_version(image) != LEGACY_NO_HEALTHCHECK_VERSION:
         raise DockerUpdateError("Die semantische Altmigration gilt nur für v5.3.2b.")
@@ -1865,7 +1934,9 @@ def _classify_compose_source(
         active = _active_yaml_lines(data.decode("utf-8"))
     except UnicodeDecodeError as exc:
         raise DockerUpdateError("Compose ist nicht gültig UTF-8-kodiert.") from exc
-    current_topology = KNOWN_CURRENT_TEMPLATES.get(active)
+    current_topology = KNOWN_CURRENT_TEMPLATES.get(active) or KNOWN_CURRENT_TEMPLATE_HASHES.get(
+        hashlib.sha256("\n".join(active).encode("utf-8")).hexdigest()
+    )
     published_532b = legacy_hash in PUBLISHED_532B_NORMALISED_HASHES
     legacy_532b_topology = "repo_named_volumes" if published_532b else ""
     if projection is not None:
@@ -1874,12 +1945,14 @@ def _classify_compose_source(
             or ""
         )
         if _tag_version(projected_image) == LEGACY_NO_HEALTHCHECK_VERSION:
-            semantic_topology = _legacy_532b_projection_topology(projection)
-            if published_532b and semantic_topology != legacy_532b_topology:
-                raise DockerUpdateError(
-                    "Die veröffentlichte v5.3.2b-Datei widerspricht ihrer gebundenen Topologie."
-                )
-            legacy_532b_topology = semantic_topology
+            # Ein gewählter Rückfalltag ändert nicht die aktuelle Compose-Struktur.
+            if current_topology is None:
+                semantic_topology = _legacy_532b_projection_topology(projection)
+                if published_532b and semantic_topology != legacy_532b_topology:
+                    raise DockerUpdateError(
+                        "Die veröffentlichte v5.3.2b-Datei widerspricht ihrer gebundenen Topologie."
+                    )
+                legacy_532b_topology = semantic_topology
         elif published_532b:
             raise DockerUpdateError(
                 "Der veröffentlichte v5.3.2b-Blob projiziert nicht sein gebundenes Altimage."
@@ -2152,6 +2225,7 @@ def _image_contract(
     image: str,
     *,
     legacy_no_healthcheck_version: str = "",
+    require_bridge: bool = False,
 ) -> dict[str, str]:
     output = _require_success(
         cli.run(["image", "inspect", image]),
@@ -2195,6 +2269,16 @@ def _image_contract(
             f"{tagged_version} gegenüber {image_version}."
         )
 
+    if require_bridge and labels.get(BRIDGE_IMAGE_LABEL) != "1":
+        raise DockerUpdateError(
+            "Das Image unterstützt den geprüften Bridge-Start nicht. "
+            "Alte Images dürfen ausschließlich im dokumentierten Host-Betrieb gestartet werden."
+        )
+
+    runtime_uid = labels.get(RUNTIME_IMAGE_LABEL)
+    if RUNTIME_IMAGE_LABEL in labels and runtime_uid != "991":
+        raise DockerUpdateError("Das Image besitzt eine unbekannte Docker-Laufzeitidentität.")
+
     expected_health = ("CMD", *CONTAINER_HEALTHCHECK_COMMAND)
     legacy_health = bool(
         legacy_version == LEGACY_NO_HEALTHCHECK_VERSION
@@ -2210,12 +2294,56 @@ def _image_contract(
         "image_id": image_id,
         "version": image_version,
         "legacy_without_healthcheck": "1" if legacy_health else "0",
+        "runtime_uid": "991" if runtime_uid == "991" else "0",
     }
 
 
 def _projection_has_role(projection: dict[str, Any]) -> bool:
     service = ((projection.get("services") or {}).get(SERVICE_NAME) or {})
     return bool(_volume_mapping(service, ROLE_VOLUME_TARGET))
+
+
+def _previous_image_reference(cli: DockerCli, container: dict[str, Any]) -> str:
+    """Bindet auch einen erfolgreich auf die feste Altimage-ID zurückgerollten Container."""
+    reference = str((container.get("Config") or {}).get("Image") or "")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", reference):
+        return _require_official_image(reference)
+    if reference != str(container.get("Image") or ""):
+        raise DockerUpdateError("Der gepinnte Altimage-Verweis widerspricht der realen Container-ID.")
+    output = _require_success(cli.run(["image", "inspect", reference]), "Bindung des gepinnten Altimages")
+    try:
+        values = json.loads(output)
+        if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0], dict):
+            raise ValueError("kein eindeutiges Image")
+        info = values[0]
+        if info.get("Id") != reference:
+            raise ValueError("abweichende Image-ID")
+        labels = (info.get("Config") or {}).get("Labels") or {}
+        tags = info.get("RepoTags") or []
+        if not isinstance(labels, dict) or not isinstance(tags, list):
+            raise ValueError("ungültige Tag-/Labelbindung")
+        version = _normalise_version(labels.get("org.opencontainers.image.version"))
+    except (TypeError, ValueError) as exc:
+        raise DockerUpdateError("Das gepinnte Altimage besitzt keine eindeutige lokale Identität.") from exc
+    candidates = []
+    for tag in tags:
+        try:
+            official = _require_official_image(str(tag))
+        except DockerUpdateError:
+            continue
+        tagged_version = _tag_version(official)
+        if (
+            official == OFFICIAL_IMAGE_REPOSITORY + ":latest"
+            or (version and tagged_version == version)
+            or (version in {"", "unknown"} and tagged_version == LEGACY_NO_HEALTHCHECK_VERSION)
+        ):
+            candidates.append(official)
+    if not candidates:
+        raise DockerUpdateError("Dem gepinnten Altimage fehlt ein passender offizieller lokaler Rückfalltag.")
+    # Der Rückfall stellt diesen Alias bereits wieder her. Der bestehende
+    # _image_contract prüft anschließend erneut OCI/Health/Capabilities und
+    # dessen Image-ID gegen den Container; das neue Compose-Ziel bleibt separat.
+    return sorted(set(candidates), key=lambda tag: (tag.endswith(":latest"), tag))[0]
 
 
 def _capture_previous_runtime(
@@ -2234,9 +2362,7 @@ def _capture_previous_runtime(
         projection,
         require_role=_projection_has_role(projection),
     )
-    image_ref = _require_official_image(
-        str((before.get("Config") or {}).get("Image") or "")
-    )
+    image_ref = _previous_image_reference(cli, before)
     legacy_version = (
         LEGACY_NO_HEALTHCHECK_VERSION
         if _tag_version(image_ref) == LEGACY_NO_HEALTHCHECK_VERSION
@@ -2246,6 +2372,7 @@ def _capture_previous_runtime(
         cli,
         image_ref,
         legacy_no_healthcheck_version=legacy_version,
+        require_bridge=_projection_uses_bridge(projection),
     )
     if str(before.get("Image") or "") != contract["image_id"]:
         raise DockerUpdateError("Die lokale Altimage-ID widerspricht dem laufenden Container.")
@@ -2389,13 +2516,191 @@ def _restore_old_image_reference(cli: DockerCli, contract: dict[str, str]) -> No
         raise DockerUpdateError("Die wiederhergestellte Altimage-Referenz ist nicht identisch.")
 
 
+def _private_volume_snapshot(cli: DockerCli, name: str) -> dict[str, Any]:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+        raise DockerUpdateError("Das private Named Volume besitzt keinen sicheren Namen.")
+    output = _require_success(cli.run(["volume", "inspect", name]), "Private Volume-Bindung")
+    try:
+        values = json.loads(output)
+        if len(values) != 1 or not isinstance(values[0], dict):
+            raise ValueError("mehrdeutig")
+        info = values[0]
+        if (
+            info.get("Name") != name or info.get("Driver") != "local"
+            or info.get("Scope") != "local" or info.get("Options")
+            or not info.get("CreatedAt") or not str(info.get("Mountpoint") or "").startswith("/")
+        ):
+            raise ValueError("fremder Volume-Vertrag")
+        return info
+    except (TypeError, ValueError) as exc:
+        raise DockerUpdateError("Das private Volume ist nicht als vorhandenes lokales Named Volume gebunden.") from exc
+
+
+def _require_fresh_legacy_volumes(cli: DockerCli, projection: dict[str, Any]) -> None:
+    """Ein entfernter 991-Container darf nicht als ungeprüfter Legacy-Erststart gelten."""
+    output = _require_success(cli.run(["volume", "ls", "--format", "{{.Name}}"]), "Inventar vor Legacy-Erststart")
+    existing = set(output.splitlines())
+    service = (projection.get("services") or {}).get(SERVICE_NAME) or {}
+    for target in PRIVATE_RUNTIME_TARGETS:
+        for mount in _volume_mapping(service, target):
+            name = str(((projection.get("volumes") or {}).get(mount.get("source")) or {}).get("name") or "")
+            if not name or name in existing:
+                raise DockerUpdateError(
+                    "Ein Altimage darf vorhandene private Volumes ohne gebundenen Quellcontainer nicht starten. "
+                    "Für den Rückfall muss der Runtime-Container bis zum geprüften Host-Updater erhalten bleiben."
+                )
+
+
+def _require_private_volumes_idle(cli: DockerCli, names: tuple[str, ...]) -> None:
+    for name in names:
+        output = _require_success(
+            cli.run(["ps", "-a", "-q", "--filter", "volume=" + name]),
+            "Inventar der privaten Volume-Nutzer",
+        )
+        for container_id in output.splitlines():
+            info = _inspect_container(cli, container_id.strip())
+            state = info.get("State") or {}
+            if state.get("Running") or state.get("Restarting") or state.get("Paused"):
+                raise DockerUpdateError("Ein weiterer Container benutzt noch ein privates E3DC-Volume; Rückfall bleibt gesperrt.")
+
+
+def _run_private_root_conversion(
+    cli: DockerCli, image_id: str, mounts: tuple[tuple[str, str], ...],
+) -> None:
+    """Nur der feste Offline-Helfer des gebundenen neuen Images erhält zwei Volumes."""
+    name = "e3dc-private-rollback-" + secrets.token_hex(16)
+    marker = "io.e3dc.private-rollback=" + name
+    helper = "/app/pi/Install/Installer/docker_runtime_permissions.py"
+    command = (
+        f"/usr/bin/python3 -B -E -s {helper} rollback-root && "
+        f"exec /usr/bin/python3 -B -E -s {helper} check-root"
+    )
+    arguments = [
+        "create", "--name", name, "--label", marker, "--network", "none",
+        "--restart", "no", "--user", "0:0", "--cap-drop", "ALL",
+        "--cap-add", "CHOWN", "--cap-add", "DAC_OVERRIDE", "--cap-add", "FOWNER",
+        "--security-opt", "no-new-privileges", "--entrypoint", "/bin/sh",
+    ]
+    for target, volume_name in mounts:
+        arguments.extend(["--mount", f"type=volume,src={volume_name},dst={target},volume-nocopy"])
+    arguments.extend([image_id, "-ec", command])
+    container_id = ""
+    try:
+        container_id = _require_success(cli.run(arguments, timeout=DEFAULT_WAIT_TIMEOUT_S), "Erzeugung des privaten Rückfallhelfers")
+        if not re.fullmatch(r"[0-9a-f]{64}", container_id):
+            raise DockerUpdateError("Der private Rückfallhelfer besitzt keine eindeutige Container-ID.")
+        _require_success(
+            cli.run(["start", "--attach", container_id], timeout=DEFAULT_WAIT_TIMEOUT_S),
+            "Private Rückmigration und Root-Rechteprüfung",
+        )
+        info = _inspect_container(cli, container_id)
+        state = info.get("State") or {}
+        if state.get("Status") != "exited" or state.get("Running") or state.get("ExitCode") != 0:
+            raise DockerUpdateError("Die private Rückmigration wurde nicht erfolgreich beendet.")
+    finally:
+        # Auch bei Client-Timeout oder unterbrochenem create darf kein Helfer
+        # weiter an denselben Dateien arbeiten, während ein EMS wieder startet.
+        found = _require_success(
+            cli.run(["ps", "-a", "-q", "--no-trunc", "--filter", "name=^/" + name + "$"]),
+            "Stillstand des privaten Rückfallhelfers",
+        ).splitlines()
+        if len(found) > 1:
+            raise CandidateStopError("Das Inventar des privaten Rückfallhelfers ist mehrdeutig.")
+        for found_id in found:
+            info = _inspect_container(cli, found_id)
+            if (
+                str(info.get("Image") or "") != image_id
+                or str(info.get("Name") or "") != "/" + name
+                or ((info.get("Config") or {}).get("Labels") or {}).get("io.e3dc.private-rollback") != name
+                or (container_id and found_id != container_id)
+            ):
+                raise CandidateStopError("Die Identität des privaten Rückfallhelfers driftete; Altstart bleibt gesperrt.")
+            if (info.get("State") or {}).get("Running"):
+                _require_success(cli.run(["stop", "--time", "30", found_id], timeout=60), "Stopp des privaten Rückfallhelfers")
+            info = _inspect_container(cli, found_id)
+            if (info.get("State") or {}).get("Running") or (info.get("State") or {}).get("Restarting"):
+                raise CandidateStopError("Der private Rückfallhelfer ist nicht bestätigt gestoppt.")
+            _require_success(cli.run(["rm", found_id]), "Entfernung des beendeten Rückfallhelfers")
+
+
+def _reverse_private_runtime(
+    cli: DockerCli, source_contract: dict[str, str], projection: dict[str, Any],
+) -> None:
+    """Verifiziert den gestoppten 991-Container und migriert vor einem Root-Start."""
+    image_id = str(source_contract.get("image_id") or "")
+    bound_image = _image_contract(cli, image_id)
+    if (
+        source_contract.get("runtime_uid") != "991" or bound_image.get("runtime_uid") != "991"
+        or bound_image["image_id"] != image_id
+        or bound_image["version"] != source_contract.get("version")
+    ):
+        raise DockerUpdateError("Für die private Rückmigration fehlt das gebundene neue Runtime-Image.")
+    ids = _named_container_ids(cli, SERVICE_NAME)
+    if len(ids) != 1:
+        raise DockerUpdateError("Für die private Rückmigration fehlt der eindeutig gestoppte Quellcontainer.")
+    before = _e3dc_stop_authority(cli, ids[0])
+    _validate_e3dc_container_binding(cli, projection, require_role=True)
+    state = before.get("State") or {}
+    if before.get("Image") != image_id or state.get("Running") or state.get("Restarting") or state.get("Paused"):
+        raise DockerUpdateError("Das gebundene Runtime-Image ist vor der privaten Rückmigration nicht gestoppt.")
+    mounts = []
+    for target in PRIVATE_RUNTIME_TARGETS:
+        found = [item for item in before.get("Mounts") or () if item.get("Destination") == target]
+        if len(found) != 1 or found[0].get("Type") != "volume" or found[0].get("RW") is not True:
+            raise DockerUpdateError("Der private Rückfall benötigt die beiden gebundenen beschreibbaren Named Volumes.")
+        mounts.append((target, str(found[0].get("Name") or "")))
+    names = tuple(name for _target, name in mounts)
+    if len(set(names)) != len(names):
+        raise DockerUpdateError("Die beiden privaten Speicher dürfen nicht dasselbe Volume verwenden.")
+    volumes = {name: _private_volume_snapshot(cli, name) for name in names}
+    _require_private_volumes_idle(cli, names)
+    _run_private_root_conversion(cli, image_id, tuple(mounts))
+    _require_private_volumes_idle(cli, names)
+    if {name: _private_volume_snapshot(cli, name) for name in names} != volumes:
+        raise DockerUpdateError("Die privaten Volume-Identitäten drifteten während der Rückmigration.")
+    after = _e3dc_stop_authority(cli, ids[0])
+    _validate_e3dc_container_binding(cli, projection, require_role=True)
+    # Docker darf vollständige Mount-Datensätze in anderer Reihenfolge liefern.
+    mounts_before = sorted(json.dumps(item, sort_keys=True) for item in before.get("Mounts") or ())
+    mounts_after = sorted(json.dumps(item, sort_keys=True) for item in after.get("Mounts") or ())
+    if (
+        _named_container_ids(cli, SERVICE_NAME) != ids or after.get("Image") != image_id
+        or mounts_after != mounts_before
+        or (after.get("State") or {}).get("Running") or (after.get("State") or {}).get("Restarting")
+    ):
+        raise DockerUpdateError("Der gebundene Quellcontainer driftete während der privaten Rückmigration.")
+    print("✓ Private Volumes sind offline für den Root-Rückfall vorbereitet und geprüft.", flush=True)
+
+
 def _rollback_previous_runtime(
     cli: DockerCli,
     compose_contract: dict[str, Any],
     previous: dict[str, Any],
     *,
     wait_timeout: int,
+    candidate_contract: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    old_contract = dict(previous.get("contract") or {})
+    if (
+        previous.get("present") and old_contract.get("runtime_uid", "0") == "0"
+        and (candidate_contract or {}).get("runtime_uid") == "991"
+    ):
+        # War bereits das Erzeugen des Kandidaten gescheitert, kann der exakt
+        # gebundene alte Container noch unverändert existieren; dann lief keine Migration.
+        ids = _named_container_ids(cli, SERVICE_NAME)
+        untouched = False
+        if ids == (previous.get("container_id"),):
+            info = _e3dc_stop_authority(cli, ids[0])
+            if info.get("Image") == old_contract.get("image_id"):
+                _validate_e3dc_container_binding(
+                    cli, compose_contract.get("pre_projection") or {},
+                    require_role=_projection_has_role(compose_contract.get("pre_projection") or {}),
+                )
+                if (info.get("State") or {}).get("Running") or (info.get("State") or {}).get("Restarting"):
+                    raise CandidateStopError("Der ursprüngliche Root-Container ist vor dem Rückfall nicht gestoppt.")
+                untouched = True
+        if not untouched:
+            _reverse_private_runtime(cli, candidate_contract or {}, compose_contract["projection"])
     restored = _restore_compose_contract_preimage(cli, compose_contract)
     if not previous.get("present") or not previous.get("running"):
         return {
@@ -2404,7 +2709,6 @@ def _rollback_previous_runtime(
             "version": "",
         }
 
-    old_contract = dict(previous.get("contract") or {})
     old_image_id = str(old_contract.get("image_id") or "")
     pinned_data = _compose_with_image(restored["data"], old_image_id)
     pinned = _replace_active_compose_data(
@@ -2741,6 +3045,9 @@ def update_container(args: argparse.Namespace) -> dict[str, Any]:
     previous: dict[str, Any] | None = None
     contract: dict[str, str] | None = None
     candidate_started = False
+    stop_contract: dict[str, str] | None = None
+    stop_projection: dict[str, Any] | None = None
+    private_conversion_pending = False
     try:
         pre_projection = compose_contract.get("pre_projection") or {}
         previous = _capture_previous_runtime(cli, pre_projection)
@@ -2793,6 +3100,7 @@ def update_container(args: argparse.Namespace) -> dict[str, Any]:
             cli,
             selected_after,
             legacy_no_healthcheck_version=args.legacy_no_healthcheck_version,
+            require_bridge=_projection_uses_bridge(compose_contract["projection"]),
         )
         print(
             f"✓ Gezogene Identität gebunden: {contract['image_id']} / Version {contract['version']}",
@@ -2810,11 +3118,41 @@ def update_container(args: argparse.Namespace) -> dict[str, Any]:
             cli,
             selected_after,
             legacy_no_healthcheck_version=args.legacy_no_healthcheck_version,
+            require_bridge=_projection_uses_bridge(compose_contract["projection"]),
         )
         if pre_start_contract != contract:
             raise DockerUpdateError(
                 "Die lokale Tag-, Image-ID-, OCI- oder Health-Bindung driftete vor dem Start."
             )
+        if not previous.get("present") and contract.get("runtime_uid") == "0":
+            _require_fresh_legacy_volumes(cli, compose_contract["projection"])
+        if (
+            previous.get("present")
+            and (previous.get("contract") or {}).get("runtime_uid") == "991"
+            and contract.get("runtime_uid") == "0"
+        ):
+            # Der bewusste Downgrade ist ab dem ersten Stopp eine Laufzeit-
+            # Transaktion. Ein gescheiterter Helfer darf keinen Root-Start auslösen.
+            candidate_started = True
+            stop_contract = previous["contract"]
+            stop_projection = pre_projection
+            if _stop_candidate(cli, expected_image_id=stop_contract["image_id"], expected_projection=pre_projection):
+                raise CandidateStopError("Der Altcontainer driftete vor dem privaten Root-Rückfall.")
+            private_conversion_pending = True
+            _reverse_private_runtime(cli, stop_contract, pre_projection)
+            private_conversion_pending = False
+            _require_prepared_contract(
+                cli, compose_contract, require_role=pre_up_role_required,
+                runtime_projection=pre_projection,
+            )
+            if _image_contract(
+                cli, selected_after,
+                legacy_no_healthcheck_version=args.legacy_no_healthcheck_version,
+                require_bridge=_projection_uses_bridge(compose_contract["projection"]),
+            ) != contract:
+                raise DockerUpdateError("Das gewählte Altimage driftete nach der privaten Rückmigration.")
+        stop_contract = contract
+        stop_projection = compose_contract["projection"]
         candidate_started = True
         up_result = cli.compose(
             [
@@ -2847,8 +3185,8 @@ def update_container(args: argparse.Namespace) -> dict[str, Any]:
             try:
                 stopped_with_contract_drift = _stop_candidate(
                     cli,
-                    expected_image_id=contract["image_id"],
-                    expected_projection=compose_contract["projection"],
+                    expected_image_id=(stop_contract or contract)["image_id"],
+                    expected_projection=stop_projection or compose_contract["projection"],
                 )
             except CandidateStopError as stop_exc:
                 raise CandidateStopError(
@@ -2856,12 +3194,18 @@ def update_container(args: argparse.Namespace) -> dict[str, Any]:
                 ) from exc
             print("✓ Fehlerhafter Updatekandidat ist bestätigt gestoppt.", file=sys.stderr)
             _diagnostics(cli)
+            if private_conversion_pending:
+                raise CandidateStopError(
+                    f"{exc}; die private Rückmigration ist unbestätigt. Alle EMS-Container bleiben gestoppt; "
+                    "kein Altimage wurde gestartet."
+                ) from exc
             try:
                 rollback = _rollback_previous_runtime(
                     cli,
                     compose_contract,
                     previous or {"present": False, "running": False},
                     wait_timeout=args.wait_timeout,
+                    candidate_contract=contract,
                 )
             except BaseException as rollback_exc:
                 raise CandidateStopError(

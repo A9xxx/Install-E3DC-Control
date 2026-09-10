@@ -224,8 +224,23 @@ def _validate_private_ml_store_for_permissions(expected_uid, expected_gid):
     )
 
 
+def _docker_private_store_repair_blocked():
+    """Erhält im Docker-Produktstamm den separaten Laufzeitbesitz."""
+    if os.path.realpath(__file__) != "/app/pi/Install/Installer/permissions.py":
+        return False
+    perm_logger.error(
+        "Private Docker-Daten werden ausschließlich beim geprüften Containerstart "
+        "migriert. Container über die Docker-Verwaltung stoppen und neu starten; "
+        "die Installer-Rechtereparatur darf den Laufzeitbesitz nicht ändern."
+    )
+    return True
+
+
 def ensure_private_ml_model_store():
     """Repariert die privaten ML-Verzeichnisse und nur die bekannte Sperrdatei."""
+
+    if _docker_private_store_repair_blocked():
+        return False
 
     try:
         account = pwd.getpwnam(INSTALL_USER)
@@ -284,6 +299,9 @@ def ensure_private_ml_model_store():
 
 def ensure_private_forecast_evidence_store():
     """Bindet den Diagnosezustand an einen privaten Ein-Writer-Pfad."""
+
+    if _docker_private_store_repair_blocked():
+        return False
 
     try:
         account = pwd.getpwnam(INSTALL_USER)

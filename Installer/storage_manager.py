@@ -8753,7 +8753,7 @@ def charge_acceptance_diagnostic_contract(
     }
 
 
-def build_display(payload: Dict[str, Any]) -> Dict[str, str]:
+def build_display(payload: Dict[str, Any], *, now_s: Optional[float] = None) -> Dict[str, str]:
     state = str(payload.get("state") or "parallel_auto")
     soc = safe_float(payload.get("soc"), 0.0)
     curve_soc = payload.get("curve_soc")
@@ -9012,6 +9012,50 @@ def build_display(payload: Dict[str, Any]) -> Dict[str, str]:
     elif state == "parallel_auto":
         raw_reason = str(payload.get("reason") or "")
         if (
+            payload.get("storage_dc_first_charge_limit_active") is True
+            and auto_limit_enabled
+            and safe_int(payload.get("mode"), MODE_AUTO) == MODE_AUTO
+        ):
+            source_valid = payload.get("storage_dc_first_charge_limit_source_valid") is True
+            auxiliary_allowed = payload.get("storage_forecast_shortfall_aux_ac_charge_allowed") is True
+            if not source_valid:
+                label = "E3DC führt: PV-Daten fehlen"
+                reason = "Die Aufteilung der PV-Leistung ist nicht ausreichend bestätigt."
+            elif auxiliary_allowed:
+                label = "E3DC führt: DC + Zusatz-PV"
+                reason = (
+                    "E3DC regelt autonom. E3DC-Control begrenzt den Laderahmen; "
+                    "zusätzlich zur E3DC-PV ist auch Überschuss des Zusatzwechselrichters freigegeben."
+                )
+            else:
+                label = "E3DC führt: DC only"
+                reason = (
+                    "E3DC regelt autonom. E3DC-Control begrenzt den Laderahmen "
+                    "anhand der E3DC-PV-Leistung."
+                )
+            # Nur vorhandene Ausgangsevidenz lesen; die Anzeige sendet keine Befehle.
+            execution = _storage_rscp_execution_history_contract(
+                payload, history_ts=safe_float(now_s, safe_float(payload.get("ts"), 0.0))
+            )
+            readback = execution.get("readback")
+            confirmed = bool(
+                execution.get("evidence_valid") is True
+                and execution.get("execution_class") == "AUTO_LIMITED"
+                and _storage_curve_cap_power_settings_match(
+                    readback, _storage_curve_cap_target_power_settings(payload)
+                )
+                and (auto_limit_charge_w != 0 or readback.get("max_charge_w") == 0)
+            )
+            if confirmed:
+                reason += f" Bestätigte Ladegrenze: {readback['max_charge_w']} W."
+            else:
+                label += " (Bestätigung offen)"
+                reason += (
+                    f" Angeforderte Ladegrenze: {auto_limit_charge_w} W; "
+                    "die Bestätigung des aktuellen Laderahmens steht noch aus."
+                )
+            reason += " Die Ladegrenze ist keine gemessene Ladeleistung."
+        elif (
             "Kurve fordert Ladung" in raw_reason
             or "AUTO-Haltezeit" in raw_reason
         ):
@@ -30136,6 +30180,9 @@ def decide_next_cycle(
         "direct_marketing_pv_store_execution": str(decision.get("direct_marketing_pv_store_execution") or ""),
         "direct_marketing_pv_store_blocker": str(decision.get("direct_marketing_pv_store_blocker") or ""),
         "direct_marketing_pv_store_auto_limit_active": bool(decision.get("direct_marketing_pv_store_auto_limit_active")),
+        "storage_forecast_shortfall_aux_ac_charge_allowed": (
+            decision.get("storage_forecast_shortfall_aux_ac_charge_allowed") is True
+        ),
         "storage_dc_first_charge_limit_enabled": bool(decision.get("storage_dc_first_charge_limit_enabled")),
         "storage_dc_first_charge_limit_active": bool(decision.get("storage_dc_first_charge_limit_active")),
         "storage_dc_first_charge_limit_contract_version": safe_int(
@@ -31073,6 +31120,9 @@ def decide_next_cycle(
         "direct_marketing_pv_store_execution": str(decision.get("direct_marketing_pv_store_execution") or ""),
         "direct_marketing_pv_store_blocker": str(decision.get("direct_marketing_pv_store_blocker") or ""),
         "direct_marketing_pv_store_auto_limit_active": bool(decision.get("direct_marketing_pv_store_auto_limit_active")),
+        "storage_forecast_shortfall_aux_ac_charge_allowed": (
+            decision.get("storage_forecast_shortfall_aux_ac_charge_allowed") is True
+        ),
         "storage_dc_first_charge_limit_enabled": bool(decision.get("storage_dc_first_charge_limit_enabled")),
         "storage_dc_first_charge_limit_active": bool(decision.get("storage_dc_first_charge_limit_active")),
         "storage_dc_first_charge_limit_contract_version": safe_int(
@@ -42786,6 +42836,15 @@ def main() -> None:
             )
         payload = apply_wallbox_ifc_safe_projection(payload, in_place=True)
         finalize_storage_dispatch_phase5_request(payload)
+        if (
+            payload.get("state") == "parallel_auto"
+            and payload.get("storage_dc_first_charge_limit_active") is True
+        ):
+            # Erst nach dem Ausgang kann die Anzeige dessen Bestätigung nennen.
+            output_display = build_display(payload, now_s=time.time())
+            payload.update(output_display)
+            if isinstance(payload.get("budget"), dict):
+                payload["budget"].update(output_display)
         payload["storage_dispatch_runtime"] = build_runtime_overlay(
             plan,
             payload,

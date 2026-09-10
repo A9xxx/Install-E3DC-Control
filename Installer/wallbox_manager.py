@@ -19232,6 +19232,22 @@ def _repair_mode5_user_start_legacy_parent(
             os.close(descriptor)
 
 
+def _bound_docker_runtime_identity():
+    """Bindet ausschließlich das feste Docker-Konto, ohne Bare-Metal zu erweitern."""
+    if int(getattr(os, "geteuid", lambda: -1)()) != 991:
+        return None
+    try:
+        try:
+            from Installer import docker_runtime_identity
+        except ModuleNotFoundError:
+            import docker_runtime_identity
+        if docker_runtime_identity.is_docker_runtime_process():
+            return docker_runtime_identity
+    except (ImportError, RuntimeError, OSError):
+        pass
+    return None
+
+
 def _mode5_user_start_surface_contract(request_file):
     """Prüft die gruppengebundene persistente PHP->Manager-Fläche."""
 
@@ -19247,6 +19263,10 @@ def _mode5_user_start_surface_contract(request_file):
         allowed_parent_uids.discard(-1)
         runtime_group_allowed = bool(
             os.geteuid() == 0 or os.getegid() == trusted_gid
+            or (
+                trusted_gid == 33
+                and _bound_docker_runtime_identity() is not None
+            )
         )
         expected_parent_mode = int(config_secret_dir_mode())
         if (
@@ -19726,6 +19746,18 @@ def _openwb_pro_mode0_private_state_dir():
             "web_user_must_not_own_control_lease"
         )
     configured = str(os.environ.get(OPENWB_PRO_MODE0_STATE_DIR_ENV, "") or "").strip()
+    docker_identity = _bound_docker_runtime_identity()
+    if docker_identity is not None:
+        if configured and configured != docker_identity.CONTROL_STATE_DIRECTORY:
+            raise openwb_pro_control_lease.ControlLeasePersistenceError(
+                "docker_control_lease_override_forbidden"
+            )
+        try:
+            return docker_identity.runtime_control_state_directory()
+        except (OSError, RuntimeError) as exc:
+            raise openwb_pro_control_lease.ControlLeasePersistenceError(
+                "docker_control_lease_directory_invalid"
+            ) from exc
     if configured:
         directory = os.path.abspath(configured)
     else:

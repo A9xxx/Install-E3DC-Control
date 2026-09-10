@@ -12327,12 +12327,12 @@ function testE3dcPmIndex() {
     if (isNaN(idx) || idx < 0 || idx > 7) {
         fb.style.display = 'block';
         fb.className = 'mt-2 small alert alert-warning p-2';
-        fb.innerHTML = '<i class="fas fa-exclamation-triangle me-1"></i>Bitte einen gültigen PM-Index zwischen 0 und 7 eingeben.';
+        renderConfigStatus(fb, 'Bitte einen gültigen PM-Index zwischen 0 und 7 eingeben.', '', 'fas fa-exclamation-triangle me-1');
         return;
     }
     fb.style.display = 'block';
     fb.className = 'mt-2 small alert alert-info p-2';
-    fb.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Frage E3DC PM-Index ' + idx + ' per RSCP ab...';
+    renderConfigStatus(fb, 'Frage E3DC PM-Index ' + idx + ' per RSCP ab...', '', 'fas fa-spinner fa-spin me-1');
     if (btn) btn.disabled = true;
 
     fetch('index.php?action=test_pm_index&index=' + idx)
@@ -12341,19 +12341,19 @@ function testE3dcPmIndex() {
             if (btn) btn.disabled = false;
             if (data.success && data.plausible_consumer) {
                 fb.className = 'mt-2 small alert alert-success p-2';
-                fb.innerHTML = '<i class="fas fa-check-circle me-1"></i><strong>Plausibel!</strong> ' + (data.message || 'Leistungsbezug erkannt.');
+                renderConfigStatus(fb, 'Plausibel! ' + (data.message || 'Leistungsbezug erkannt.'), '', 'fas fa-check-circle me-1');
             } else if (data.success && data.is_producer) {
                 fb.className = 'mt-2 small alert alert-danger p-2';
-                fb.innerHTML = '<i class="fas fa-hand me-1"></i><strong>Veto / Warnung!</strong> ' + (data.message || 'Zähler misst Einspeisung (Erzeugungsanlage, keine WP)!');
+                renderConfigStatus(fb, 'Veto / Warnung! ' + (data.message || 'Zähler misst Einspeisung (Erzeugungsanlage, keine WP)!'), '', 'fas fa-hand me-1');
             } else {
                 fb.className = 'mt-2 small alert alert-danger p-2';
-                fb.innerHTML = '<i class="fas fa-times-circle me-1"></i><strong>Fehler:</strong> ' + (data.message || data.error || 'Zähler antwortet nicht.');
+                renderConfigStatus(fb, 'Fehler: ' + (data.message || data.error || 'Zähler antwortet nicht.'), '', 'fas fa-times-circle me-1');
             }
         })
         .catch(err => {
             if (btn) btn.disabled = false;
             fb.className = 'mt-2 small alert alert-danger p-2';
-            fb.innerHTML = '<i class="fas fa-times-circle me-1"></i>Verbindungsfehler: ' + err;
+            renderConfigStatus(fb, 'Verbindungsfehler: ' + String(err?.message ?? err), '', 'fas fa-times-circle me-1');
         });
 }
 

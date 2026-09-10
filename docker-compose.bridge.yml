@@ -1,8 +1,11 @@
+# Optionaler Bridge-Betrieb für geprüfte Installationen ohne Matter/mDNS
+# oder Host-Loopback-Abhängigkeiten. Siehe doc/Docker_Dokumentation.md.
+# Für den Betrieb bewusst als docker-compose.yml übernehmen; kein Override.
 services:
   e3dc-control:
     # Ohne E3DC_IMAGE_TAG folgt die Installation dem geprüften Stable-Tag
     # "latest". Ein fester Pin oder Rückfall wird bewusst in .env gesetzt,
-    # zum Beispiel: E3DC_IMAGE_TAG=v5.4.6
+    # Es sind ausschließlich Images mit geprüfter Bridge-Unterstützung zulässig.
     image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"
 
     # Lokaler Entwickler-Selbstbau mit getrenntem Compose-Override:
@@ -11,7 +14,10 @@ services:
     container_name: e3dc-control
     hostname: e3dc-control
     restart: unless-stopped
-    network_mode: host
+    networks:
+      - e3dc
+    ports:
+      - "${E3DC_PUBLISH_BIND:-127.0.0.1}:${E3DC_PUBLISH_PORT:-8085}:80"
     logging:
       driver: json-file
       options:
@@ -43,10 +49,9 @@ services:
     environment:
       - TZ=Europe/Berlin
       - E3DC_CONTAINER_MODE=1
-      # Optional für NAS/Synology mit belegtem Port 80:
-      # - E3DC_WEB_PORT=8085
-      # Optional auf eine konkrete Host-IP/Schnittstelle binden:
-      # - E3DC_WEB_BIND=192.0.2.20
+      - E3DC_CONTAINER_NETWORK_MODE=bridge
+      # Apache bleibt intern auf Port 80. Den äußeren Port und die
+      # Host-IP setzen E3DC_PUBLISH_PORT / E3DC_PUBLISH_BIND in .env.
 
   watchtower:
     image: containrrr/watchtower
@@ -74,3 +79,7 @@ volumes:
   e3dc_ml:
   e3dc_forecast_evidence:
   e3dc_instance_role:
+
+networks:
+  e3dc:
+    driver: bridge

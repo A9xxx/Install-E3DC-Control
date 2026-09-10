@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.5f Stable</span>
+            <span class="badge bg-success text-light">v5.4.6 Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,9 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.5f</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.6</code> in <code>.env</code> gesetzt.</p>
+                <p>Vor dem Imagewechsel den tatsächlich verwendeten Host-Updater aktualisieren, einschließlich einer gegebenenfalls direkt im Compose-Ordner vorhandenen Kopie. Das Containerimage ersetzt diese Hostdatei nicht. Vollständige Docker-Sicherungen erfolgen auf dem Host bei gestopptem Container mit erhaltenen numerischen Eigentümern und Dateirechten. Das allgemeine Vollbackup-Menü im Container unterstützt die getrennten privaten Laufzeitdaten nicht.</p>
+                <p>Container-Neuerstellungen bei beendeter Fahrzeugladung und ohne laufenden Phasenwechsel durchführen. Private Wallbox-Steuerzustände überleben einen Neustart desselben Containers, aber keine Neuerstellung. Ein Rückfall auf ältere Root-Images benötigt den aktuellen Host-Updater. Aus Bridge zuerst dieselbe aktuelle Runtime-Version im Hostprofil neu aufbauen und den gesunden Start prüfen; erst danach den regulären Root-Rückfall ausführen. Einzelheiten stehen in der Docker-Dokumentation.</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
 if [ -f ./docker_compose_update.py ]; then
   E3DC_DOCKER_HELPER=./docker_compose_update.py
@@ -214,6 +216,17 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                     </ol>
                 </div>
             </div>
+        </div>
+
+        <h4 class="mb-4 text-accent">Stable 5.4.6: Sicherheit und Speicheranzeige</h4>
+        <div class="col-12 faq-item" data-tags="5.4.6 stable sicherheit docker bridge root sollkurve prognose dc">
+            <div class="card bg-card border-0 shadow-sm"><div class="card-body">
+                <h5 class="card-title">Was verbessert Version 5.4.6?</h5>
+                <p>Die Speicheranzeige unterscheidet <strong>AUTO</strong>, <strong>DC only</strong> und <strong>DC + Zusatz-PV</strong> und nennt den Bestätigungsstand der Ladegrenze. Eine Ladegrenze ist keine gemessene Batterieleistung. Die kleine Vorschau zeigt eine gültige Sollkurve auch ohne SoC-Prognose; fehlende Prognosen und veraltete Pläne bleiben erkennbar. Der <strong>Prognosestart</strong> ist entsprechend beschriftet.</p>
+                <p>Fahrzeugnamen und Meldungen des Leistungsmessertests werden sicher als Text ausgegeben. Die Docker-EMS-Dienste laufen unter einem eigenen Konto ohne Root-Rechte; administrative Initialisierung und Apache-Master behalten ihre erforderlichen Rechte. Private Modelle und Prognosebelege werden vor dem Dienststart geprüft und übernommen.</p>
+                <p>Hostnetz bleibt Standard. Die optionale Bridge-Vorlage eignet sich für kompatible Named-Volume-Installationen ohne Matter-/mDNS- oder Host-Loopback-Abhängigkeiten. Anfangs ist nur der Webport am Docker-Host unter <code>127.0.0.1:8085</code> erreichbar. Voraussetzungen und Netzwerkwechsel sind in der Docker-Dokumentation beschrieben.</p>
+                <p>Nach dem Update das Dashboard neu laden. Docker-Nutzer aktualisieren vorab den verwendeten Host-Updater, sichern die Volumes auf dem Host und beachten die Wartungs- und Rückfallhinweise oben.</p>
+            </div></div>
         </div>
 
         <h4 class="mb-4 text-accent">Stable 5.4.5f: Speicherführung, Verbindungen und Diagramme</h4>

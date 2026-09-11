@@ -6,6 +6,18 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.6a] – 2026-09-11
+
+### Docker-Korrekturen
+
+- Behebt den Startabbruch beim Zugriff auf das interne Laufzeitmodul nach dem Wechsel auf das unprivilegierte Konto. Verzeichnisrechte und tatsächlicher Privilegienwechsel werden bereits beim Imagebau geprüft.
+- Der Host-Updater übernimmt die bekannte alte Named-Volume-Vorlage mit festem latest, zwei oder fünf Standardvolumes und gültigen direkt eingetragenen Web-Einstellungen. Vorhandene Daten, Port und Bindadresse bleiben erhalten; unbekannte Privilegien und abweichende Volumezuordnungen bleiben gesperrt.
+- Ein fehlgeschlagener Rückstart des vorherigen Images führt zu einem zusätzlichen, eindeutig gebundenen Containerstopp. Nicht bestätigter Stillstand wird als Sicherheitsfehler gemeldet.
+
+### Updatehinweise
+
+Docker-Nutzer aktualisieren zuerst den Host-Helfer und sichern die benötigten Volumes bei gestopptem Container. Danach den dokumentierten Host-Updateweg verwenden. Ein fester Image-Pin benötigt v5.4.6a. Unsichere Dateirechte der einzelnen Compose-Datei, etwa 0777, müssen auf dem Host korrigiert werden. Wartungsfenster und Rückfallgrenzen bleiben bestehen; Details stehen in der [Docker-Dokumentation](doc/Docker_Dokumentation.md).
+
 ## [5.4.6] – 2026-09-10
 
 ### Sicherheit und Docker

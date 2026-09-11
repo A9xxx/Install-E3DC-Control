@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -205,6 +206,44 @@ def _known_compose_template(
         lines.insert(position, "      - E3DC_CONTAINER_NETWORK_MODE=bridge")
         lines.extend(["networks:", "  e3dc:", "    driver: bridge"])
     return tuple(lines)
+
+
+def _known_legacy_named_template(*, private_volumes: bool) -> tuple[str, ...]:
+    lines = [
+        "services:", "  e3dc-control:",
+        f"    image: {OFFICIAL_IMAGE_REPOSITORY}:latest",
+        "    container_name: e3dc-control", "    restart: unless-stopped",
+        "    network_mode: host", "    volumes:",
+        f"      - e3dc_data:{DATA_VOLUME_TARGET}",
+        f"      - e3dc_logs:{LOG_VOLUME_TARGET}",
+    ]
+    if private_volumes:
+        lines.extend([
+            "      - e3dc_ml:/var/lib/e3dc-control/ml",
+            "      - e3dc_forecast_evidence:/var/lib/e3dc-control/forecast-evidence",
+            f"      - {ROLE_VOLUME_NAME}:{ROLE_VOLUME_TARGET}",
+        ])
+    lines.extend([
+        "    tmpfs:",
+        "      - /var/www/html/ramdisk:size=32M,uid=33,gid=33,mode=2775",
+        "    environment:", "      - TZ=Europe/Berlin",
+        "  watchtower:", "    image: containrrr/watchtower",
+        "    container_name: watchtower", "    restart: unless-stopped",
+        "    volumes:", "      - /var/run/docker.sock:/var/run/docker.sock",
+        "    environment:", "      - TZ=Europe/Berlin",
+        "      - DOCKER_API_VERSION=1.40", "      - WATCHTOWER_CLEANUP=true",
+        "      - WATCHTOWER_POLL_INTERVAL=86400",
+        "volumes:", "  e3dc_data:", "  e3dc_logs:",
+    ])
+    if private_volumes:
+        lines.extend(["  e3dc_ml:", "  e3dc_forecast_evidence:", f"  {ROLE_VOLUME_NAME}:"])
+    return tuple(lines)
+
+
+KNOWN_LEGACY_NAMED_TEMPLATES = {
+    _known_legacy_named_template(private_volumes=False): 2,
+    _known_legacy_named_template(private_volumes=True): 5,
+}
 
 
 KNOWN_CURRENT_TEMPLATES = {
@@ -1356,8 +1395,11 @@ def _validate_e3dc_container_binding(
     projection: dict[str, Any],
     *,
     require_role: bool,
+    expected_container_id: str | None = None,
 ) -> None:
     ids = _named_container_ids(cli, SERVICE_NAME)
+    if expected_container_id is not None and ids != (expected_container_id,):
+        raise DockerUpdateError("Die erwartete Containeridentität wechselte vor der Vertragsprüfung.")
     if len(ids) > 1:
         raise DockerUpdateError("Mehrere globale e3dc-control-Container sind nicht eindeutig.")
     if not ids:
@@ -1549,7 +1591,12 @@ def _safe_custom_mount(item: dict[str, Any]) -> bool:
     }
 
 
-def _legacy_532b_projection_topology(projection: dict[str, Any]) -> str:
+def _legacy_532b_projection_topology(
+    projection: dict[str, Any],
+    *,
+    known_named_mount_count: int = 0,
+    web_options: dict[str, str] | None = None,
+) -> str:
     services = projection.get("services") or {}
     e3dc = dict(services.get(SERVICE_NAME) or {})
     watchtower = dict(services.get("watchtower") or {})
@@ -1559,7 +1606,26 @@ def _legacy_532b_projection_topology(projection: dict[str, Any]) -> str:
             if key in service and service[key] is None:
                 service.pop(key)
     image = _require_official_image(str(e3dc.get("image") or ""))
-    if _tag_version(image) != LEGACY_NO_HEALTHCHECK_VERSION:
+    if known_named_mount_count:
+        if (
+            known_named_mount_count not in {2, 5} or image != OFFICIAL_IMAGE_REPOSITORY + ":latest"
+            or set(services) != {SERVICE_NAME, "watchtower"} or not projection.get("name")
+        ):
+            raise DockerUpdateError("Die bekannte Named-Volume-Altform projiziert nicht ihren festen Imagevertrag.")
+        if set(e3dc) - {"image", "container_name", "restart", "network_mode", "volumes", "tmpfs", "environment"}:
+            raise DockerUpdateError("Die bekannte Altform projiziert zusätzliche Dienstfelder.")
+        if set(watchtower) - {"image", "container_name", "restart", "volumes", "environment", "networks"}:
+            raise DockerUpdateError("Die bekannte Altform projiziert zusätzliche Watchtower-Felder.")
+        if e3dc.get("environment") != {"TZ": "Europe/Berlin", **(web_options or {})} or e3dc.get("tmpfs") != [
+            "/var/www/html/ramdisk:size=32M,uid=33,gid=33,mode=2775"
+        ]:
+            raise DockerUpdateError("Web-Einstellungen, Umgebung oder Ramdisk widersprechen der bekannten Altform.")
+        if watchtower.get("environment") != {
+            "TZ": "Europe/Berlin", "DOCKER_API_VERSION": "1.40",
+            "WATCHTOWER_CLEANUP": "true", "WATCHTOWER_POLL_INTERVAL": "86400",
+        } or watchtower.get("restart") != "unless-stopped":
+            raise DockerUpdateError("Watchtower widerspricht der bekannten Altform.")
+    elif _tag_version(image) != LEGACY_NO_HEALTHCHECK_VERSION:
         raise DockerUpdateError("Die semantische Altmigration gilt nur für v5.3.2b.")
     if (
         str(e3dc.get("container_name") or "") != SERVICE_NAME
@@ -1599,8 +1665,34 @@ def _legacy_532b_projection_topology(projection: dict[str, Any]) -> str:
     log_type = str(mappings[LOG_VOLUME_TARGET][0].get("type") or "")
     if data_type != log_type or data_type not in {"bind", "volume"}:
         raise DockerUpdateError("Daten und Logs verwenden keine einheitliche sichere Topologie.")
+    known_sources = {
+        DATA_VOLUME_TARGET: "e3dc_data", LOG_VOLUME_TARGET: "e3dc_logs",
+    }
+    if known_named_mount_count == 5:
+        known_sources.update({
+            "/var/lib/e3dc-control/ml": "e3dc_ml",
+            "/var/lib/e3dc-control/forecast-evidence": "e3dc_forecast_evidence",
+            ROLE_VOLUME_TARGET: ROLE_VOLUME_NAME,
+        })
+    if known_named_mount_count and (
+        len(volume_items) != known_named_mount_count
+        or {str(item.get("target") or "") for item in volume_items} != set(known_sources)
+        or set(projection.get("volumes") or {}) != set(known_sources.values())
+    ):
+        raise DockerUpdateError("Die bekannte Altform besitzt nicht genau ihre Standardvolumes.")
     for item in volume_items:
         target = str(item.get("target") or "")
+        if known_named_mount_count:
+            if (
+                item.get("type") != "volume" or item.get("source") != known_sources.get(target)
+                or bool(item.get("read_only")) or item.get("volume") not in (None, {})
+                or set(item) - {"type", "source", "target", "read_only", "volume"}
+            ):
+                raise DockerUpdateError("Ein Standardvolume widerspricht der bekannten Altform.")
+            top_volume = (projection.get("volumes") or {}).get(known_sources[target]) or {}
+            if set(top_volume) != {"name"} or top_volume.get("name") != str(projection.get("name") or "") + "_" + known_sources[target]:
+                raise DockerUpdateError("Ein Standardvolume ist nicht an das Compose-Projekt gebunden.")
+            continue
         if target in {DATA_VOLUME_TARGET, LOG_VOLUME_TARGET}:
             if bool(item.get("read_only")):
                 raise DockerUpdateError(f"Der persistente Mount {target} ist schreibgeschützt.")
@@ -1923,6 +2015,43 @@ def _project_legacy_532b_compose(data: bytes, *, topology: str) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
+def _without_literal_web_options(data: bytes) -> tuple[tuple[str, ...], dict[str, str]]:
+    lines = data.decode("utf-8").splitlines()
+    active = _active_yaml_lines(data.decode("utf-8"))
+    if not any(re.match(r"      - E3DC_WEB_(?:PORT|BIND)=", line) for line in lines):
+        return active, {}
+    span = _service_field_span(lines, SERVICE_NAME, "environment")
+    if span is None:
+        return active, {}
+    start, end = span
+    options: dict[str, str] = {}
+    remove: set[int] = set()
+    for index in range(start + 1, end):
+        match = re.fullmatch(r"      - (E3DC_WEB_PORT|E3DC_WEB_BIND)=(.*)", lines[index])
+        if match is None:
+            continue
+        key, value = match.groups()
+        # Nur ein durch Leerraum eingeleiteter Kommentar endet einen YAML-Skalar.
+        value = re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
+        if key in options:
+            raise DockerUpdateError(f"{key} ist mehrfach in der Compose-Datei vorhanden.")
+        if key == "E3DC_WEB_PORT":
+            if not re.fullmatch(r"[0-9]{1,5}", value) or not 1 <= int(value) <= 65535:
+                raise DockerUpdateError("E3DC_WEB_PORT muss ein literaler Port zwischen 1 und 65535 sein.")
+        elif value:
+            address = value[1:-1] if value.startswith("[") and value.endswith("]") else value
+            try:
+                parsed = ipaddress.ip_address(address)
+                if "%" in address or (address != value and parsed.version != 6):
+                    raise ValueError("keine eindeutige IP-Adresse")
+            except ValueError as exc:
+                raise DockerUpdateError("E3DC_WEB_BIND muss leer oder eine literale IPv4-/IPv6-Adresse sein.") from exc
+        options[key] = value
+        remove.add(index)
+    comparison = "\n".join(line for index, line in enumerate(lines) if index not in remove)
+    return _active_yaml_lines(comparison), options
+
+
 def _classify_compose_source(
     data: bytes,
     projection: dict[str, Any] | None = None,
@@ -1937,6 +2066,19 @@ def _classify_compose_source(
     current_topology = KNOWN_CURRENT_TEMPLATES.get(active) or KNOWN_CURRENT_TEMPLATE_HASHES.get(
         hashlib.sha256("\n".join(active).encode("utf-8")).hexdigest()
     )
+    literal_web_error: DockerUpdateError | None = None
+    try:
+        comparison, web_options = _without_literal_web_options(data)
+    except DockerUpdateError as exc:
+        # Die bisherige R0-Semantik darf ihre bereits erlaubten ENV-Ausdrücke behalten.
+        comparison, web_options = active, {}
+        literal_web_error = exc
+    # Ausschließlich bekannte Hostvorlagen; die Originaldatei bleibt unverändert.
+    if current_topology is None and "    network_mode: host" in comparison:
+        current_topology = KNOWN_CURRENT_TEMPLATES.get(comparison) or KNOWN_CURRENT_TEMPLATE_HASHES.get(
+            hashlib.sha256("\n".join(comparison).encode("utf-8")).hexdigest()
+        )
+    known_named_mount_count = KNOWN_LEGACY_NAMED_TEMPLATES.get(comparison, 0)
     published_532b = legacy_hash in PUBLISHED_532B_NORMALISED_HASHES
     legacy_532b_topology = "repo_named_volumes" if published_532b else ""
     if projection is not None:
@@ -1944,7 +2086,15 @@ def _classify_compose_source(
             (((projection.get("services") or {}).get(SERVICE_NAME) or {}).get("image"))
             or ""
         )
-        if _tag_version(projected_image) == LEGACY_NO_HEALTHCHECK_VERSION:
+        if (current_topology or known_named_mount_count) and web_options:
+            projected_environment = ((projection.get("services") or {}).get(SERVICE_NAME) or {}).get("environment") or {}
+            if any(projected_environment.get(key) != value for key, value in web_options.items()):
+                raise DockerUpdateError("Die projizierten Web-Einstellungen widersprechen ihren literalen Compose-Werten.")
+        if known_named_mount_count:
+            _legacy_532b_projection_topology(
+                projection, known_named_mount_count=known_named_mount_count, web_options=web_options,
+            )
+        elif _tag_version(projected_image) == LEGACY_NO_HEALTHCHECK_VERSION:
             # Ein gewählter Rückfalltag ändert nicht die aktuelle Compose-Struktur.
             if current_topology is None:
                 semantic_topology = _legacy_532b_projection_topology(projection)
@@ -1957,16 +2107,21 @@ def _classify_compose_source(
             raise DockerUpdateError(
                 "Der veröffentlichte v5.3.2b-Blob projiziert nicht sein gebundenes Altimage."
             )
-    if topology is None and current_topology is None and not legacy_532b_topology:
+    if topology is None and current_topology is None and not legacy_532b_topology and not known_named_mount_count:
+        if literal_web_error is not None:
+            raise literal_web_error
         raise DockerUpdateError(
             "Automatisch migriert werden die semantisch sichere v5.3.2b-Compose-Datei, "
+            "die bekannte Named-Volume-Altform mit latest und zwei oder fünf Standardvolumes, "
             "die unveränderten veröffentlichten 5.4.2–5.4.2d-Dateien und der "
             "aktuelle Pflichtvertrag. Prozess-, Hardware- oder schreibbare "
             "Fremdmount-Anpassungen müssen manuell geprüft werden."
         )
-    found = sum(bool(item) for item in (topology, current_topology, legacy_532b_topology))
+    found = sum(bool(item) for item in (topology, current_topology, legacy_532b_topology, known_named_mount_count))
     if found != 1:
         raise DockerUpdateError("Der Compose-Stand ist strukturell mehrdeutig.")
+    if known_named_mount_count:
+        return "repo_named_volumes", "legacy_named_standard"
     if legacy_532b_topology:
         return legacy_532b_topology, "legacy_532b"
     return topology or current_topology or "", "legacy_542" if topology is not None else "current"
@@ -2079,7 +2234,7 @@ def _prepare_compose_contract(cli: DockerCli) -> dict[str, Any]:
 
         candidate_data = (
             _project_legacy_532b_compose(source["data"], topology=topology)
-            if compose_state == "legacy_532b"
+            if compose_state in {"legacy_532b", "legacy_named_standard"}
             else _project_current_compose(source["data"], topology=topology)
         )
         candidate_name, candidate_path = _write_candidate(
@@ -2128,8 +2283,12 @@ def _prepare_compose_contract(cli: DockerCli) -> dict[str, Any]:
             raise DockerUpdateError(
                 f"Compose-Endprüfung fehlgeschlagen; der gebundene Preimage wurde wiederhergestellt: {exc}"
             ) from exc
+        origin_label = {
+            "legacy_532b": "5.3.2b", "legacy_542": "5.4.2",
+            "legacy_named_standard": "(bekannte Named-Volume-Altform)",
+        }[compose_state]
         print(
-            f"✓ Compose {('5.3.2b' if compose_state == 'legacy_532b' else '5.4.2')} "
+            f"✓ Compose {origin_label} "
             "wurde atomar auf den aktuellen Host-Vertrag migriert; "
             "Daten- und Logtopologie blieb unverändert.",
             flush=True,
@@ -2719,47 +2878,63 @@ def _rollback_previous_runtime(
     )
     pinned_contract = dict(old_contract)
     pinned_contract["image"] = old_image_id
-    start_error: BaseException | None = None
-    verification: dict[str, Any] | None = None
     try:
-        up_result = cli.compose(
-            [
-                "up",
-                "-d",
-                "--pull",
-                "never",
-                "--force-recreate",
-                "--wait",
-                "--wait-timeout",
-                str(wait_timeout),
-                SERVICE_NAME,
-            ],
-            timeout=wait_timeout + START_TIMEOUT_GRACE_S,
-            capture=True,
-        )
-        _require_success(up_result, "Start des gebundenen Altcontainers")
-        verification = _verify_candidate(cli, pinned_contract)
-        _restore_old_image_reference(cli, old_contract)
-    except BaseException as exc:
-        start_error = exc
-    finally:
+        start_error: BaseException | None = None
+        verification: dict[str, Any] | None = None
         try:
-            _replace_active_compose_data(
-                cli,
-                expected_data=pinned["data"],
-                replacement_data=restored["data"],
-                metadata_source=restored,
+            up_result = cli.compose(
+                [
+                    "up",
+                    "-d",
+                    "--pull",
+                    "never",
+                    "--force-recreate",
+                    "--wait",
+                    "--wait-timeout",
+                    str(wait_timeout),
+                    SERVICE_NAME,
+                ],
+                timeout=wait_timeout + START_TIMEOUT_GRACE_S,
+                capture=True,
             )
-        except BaseException as restore_exc:
+            _require_success(up_result, "Start des gebundenen Altcontainers")
+            verification = _verify_candidate(cli, pinned_contract)
+            _restore_old_image_reference(cli, old_contract)
+        except BaseException as exc:
+            start_error = exc
+        finally:
+            try:
+                _replace_active_compose_data(
+                    cli,
+                    expected_data=pinned["data"],
+                    replacement_data=restored["data"],
+                    metadata_source=restored,
+                )
+            except BaseException as restore_exc:
+                raise CandidateStopError(
+                    "Der Altcontainer-Rückfall konnte die originale Compose-Datei nicht "
+                    f"wiederherstellen: {restore_exc}"
+                ) from restore_exc
+        if start_error is not None:
             raise CandidateStopError(
-                "Der Altcontainer-Rückfall konnte die originale Compose-Datei nicht "
-                f"wiederherstellen: {restore_exc}"
-            ) from restore_exc
-    if start_error is not None:
+                f"Der gebundene Altcontainer konnte nicht wieder gestartet werden: {start_error}"
+            ) from start_error
+        second = _verify_candidate(cli, pinned_contract)
+    except BaseException as rollback_exc:
+        try:
+            _stop_candidate(
+                cli,
+                expected_image_id=old_image_id,
+                expected_projection=compose_contract.get("pre_projection") or {},
+                require_contract_binding=True,
+            )
+        except BaseException as stop_exc:
+            raise CandidateStopError(
+                f"{rollback_exc}; der Rückfallcontainer ist nicht bestätigt gestoppt: {stop_exc}"
+            ) from stop_exc
         raise CandidateStopError(
-            f"Der gebundene Altcontainer konnte nicht wieder gestartet werden: {start_error}"
-        ) from start_error
-    second = _verify_candidate(cli, pinned_contract)
+            f"{rollback_exc}; der fehlgeschlagene Rückfallcontainer ist bestätigt gestoppt."
+        ) from rollback_exc
     return {
         "restored": True,
         "previous_running": True,
@@ -2959,6 +3134,7 @@ def _stop_candidate(
     *,
     expected_image_id: str,
     expected_projection: dict[str, Any],
+    require_contract_binding: bool = False,
 ) -> bool:
     previous_ids: tuple[str, ...] | None = None
     stable = 0
@@ -2973,17 +3149,29 @@ def _stop_candidate(
             running = []
             for container_id in ids:
                 info = _e3dc_stop_authority(cli, container_id)
+                image_matches = str(info.get("Image") or "") == expected_image_id
+                if require_contract_binding and not image_matches:
+                    raise CandidateStopError("Der Rückfallcontainer nutzt nicht das gebundene Altimage.")
                 try:
+                    binding_options = (
+                        {"expected_container_id": container_id} if require_contract_binding else {}
+                    )
                     _validate_e3dc_container_binding(
                         cli,
                         expected_projection,
                         require_role=False,
+                        **binding_options,
                     )
                 except DockerUpdateError:
+                    if require_contract_binding:
+                        raise
                     contract_drift = True
-                if str(info.get("Image") or "") != expected_image_id:
+                if not image_matches:
                     contract_drift = True
-                if (info.get("State") or {}).get("Running") is True:
+                state = info.get("State") or {}
+                if state.get("Running") is True or (
+                    require_contract_binding and state.get("Restarting") is True
+                ):
                     running.append(container_id)
                     stop_result = cli.run(
                         ["stop", "--time", "30", container_id],

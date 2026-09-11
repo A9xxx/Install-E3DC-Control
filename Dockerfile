@@ -61,6 +61,7 @@ RUN groupadd --gid 991 e3dc-runtime && \
 # 4. Verzeichnisse und statische Konfiguration
 RUN mkdir -p /app/pi/Install /var/www/html/tmp /var/www/html/logs /var/www/html/data /var/www/html/ramdisk && \
     install -d -o root -g root -m 0755 /etc/e3dc-control && \
+    install -d -o root -g root -m 0755 /usr/local/lib/e3dc-control && \
     install -d -o root -g root -m 0700 /var/lib/e3dc-control/forecast-evidence && \
     chown -R www-data:www-data /var/www/html && \
     chmod 2775 /var/www/html/data
@@ -82,6 +83,8 @@ COPY --chown=root:root --chmod=0555 Installer/docker_matter_storage_guard.py /us
 COPY --chown=root:root --chmod=0644 Installer/docker-logrotate.conf /etc/logrotate.d/e3dc-control
 RUN test "$(stat -c '%u:%g:%a' /usr/local/bin/entrypoint.sh)" = "0:0:555" && \
     test "$(stat -c '%u:%g:%a' /usr/local/bin/e3dc-docker-matter-storage-guard)" = "0:0:555" && \
+    test "$(stat -c '%u:%g:%a' /usr/local/lib/e3dc-control)" = "0:0:755" && \
+    test "$(stat -c '%u:%g:%a' /usr/local/lib/e3dc-control/docker_runtime_identity.py)" = "0:0:644" && \
     ln -sf /usr/local/bin/entrypoint.sh /app/entrypoint.sh
 
 # 6. Anwendungscode für Production-/Image-only-Docker.
@@ -147,6 +150,10 @@ RUN find -P /app/pi/Install -xdev -type d -exec chmod 0755 -- {} + && \
     test -x /app/pi/Install/Installer/web_update_launcher.sh && \
     test -z "$(find -P /app/pi/Install -xdev \( ! -uid 0 -o ! -gid 0 \) -print -quit)" && \
     test -z "$(find -P /app/pi/Install -xdev \( -type f -o -type d \) -perm /0022 -print -quit)"
+
+# Prüft den tatsächlichen Privilegienwechsel und Modulzugriff vor der Imagefreigabe.
+RUN /opt/venv/bin/python3 -I -B /usr/local/bin/e3dc-docker-runtime -- \
+    /opt/venv/bin/python3 -I -B -c 'pass'
 
 WORKDIR /app/pi/Install
 

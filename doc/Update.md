@@ -5,14 +5,14 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.4.6`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.4.6a`. Das Dashboard startet ausschließlich
 den argumentlosen, root-eigenen Systemjob. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
 
-5.4.6 ergänzt eine unprivilegierte EMS-Laufzeit und einen optionalen
-Bridge-Betrieb für Docker. Vor dem Imagewechsel den tatsächlich verwendeten
+5.4.6a korrigiert Docker-Start und Host-Update. Die seit 5.4.6 verwendete
+unprivilegierte EMS-Laufzeit und der optionale Bridge-Betrieb bleiben erhalten. Vor dem Imagewechsel den tatsächlich verwendeten
 Host-Updater aktualisieren, einschließlich einer gegebenenfalls direkt im
 Compose-Ordner vorhandenen Kopie. Ein Containerimage ersetzt diese Hostdatei
 nicht. Der aktuelle Helfer bereitet bei einem Rückfall auf ältere Root-Images

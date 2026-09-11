@@ -2,10 +2,10 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.6`. Die Tags `latest`, `v5.4.6` und
-`5.4.6` bezeichnen denselben Stable-Stand.
+Der aktuelle Stable-Stand ist `v5.4.6a`. Die Tags `latest`, `v5.4.6a` und
+`5.4.6a` bezeichnen denselben Stable-Stand.
 
-5.4.6 startet EMS-Python-Dienste mit dem eigenen unprivilegierten Konto
+5.4.6a startet EMS-Python-Dienste mit dem eigenen unprivilegierten Konto
 `e3dc-runtime`. Private Modelle und Prognosebelege werden vor dem Start geprüft
 und übernommen. Der aktuelle Host-Updater ist auch für den Rückfall auf ältere
 Root-Images erforderlich. Vor dem Upgrade den tatsächlich verwendeten Helfer
@@ -420,18 +420,26 @@ Fehlt `docker_compose_update.py` in einer älteren Docker-Installation, verwende
 einen separaten frischen Checkout des veröffentlichten `main` als
 Verwaltungsbaum. Starte daraus `Installer/docker_compose_update.py` und übergib
 mit `--compose-dir` den absoluten Pfad des bestehenden
-`e3dc-docker`-Verzeichnisses. Der Helfer migriert ausschließlich unveränderte
-offizielle 5.3.2b-Compose-Datei, Compose-Dateien aus 5.4.2 bis 5.4.2d sowie die
-bekannte Installer-Bind-Mount-Variante atomar, also ganz oder gar nicht. `.env` und die
+`e3dc-docker`-Verzeichnisses. Der Helfer migriert die unveränderte offizielle
+5.3.2b-Compose-Datei, Compose-Dateien aus 5.4.2 bis 5.4.2d sowie die bekannte
+Installer-Bind-Mount-Variante atomar, also ganz oder gar nicht. Unterstützt wird
+auch die alte offizielle Named-Volume-Vorlage mit festem `latest`, entweder mit
+den ursprünglichen Daten- und Logvolumes oder mit allen fünf Standardvolumes
+einschließlich ML, Prognosediagnose und Instanzanker. In dieser Variante dürfen
+`E3DC_WEB_PORT` und `E3DC_WEB_BIND` als eindeutige, direkt eingetragene gültige
+Werte gesetzt sein. Die Web-Einstellungen bleiben bei der Migration erhalten;
+zusätzliche Mounts, Gerätefreigaben oder Prozessänderungen sind damit nicht
+freigegeben. Der Helfer prüft weiterhin die tatsächliche Projekt- und
+Volumezuordnung des vorhandenen Containers. `.env` und die
 vorhandenen Daten-, Log-, ML- und Forecast-Quellen bleiben unverändert. Einen
 alten Watchtower stoppt und prüft er vor Migration und Pull; er bleibt danach
-aus und darf nur per ausdrücklichem Opt-in wieder aktiviert werden. Ältere,
-angepasste, per Override ergänzte oder mehrdeutige Compose-Stände bleiben
+aus und darf nur per ausdrücklichem Opt-in wieder aktiviert werden. Andere
+ältere, angepasste, per Override ergänzte oder mehrdeutige Compose-Stände bleiben
 unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.6` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.6a` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -458,7 +466,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.6` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.6a` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash
@@ -744,7 +752,7 @@ Port, etwa `E3DC_PUBLISH_BIND=192.0.2.20` und `E3DC_PUBLISH_PORT=8085`.
 Verwende denselben Compose-Ordner und Projektnamen. Sichere vorher die
 funktionierende `docker-compose.yml` als `docker-compose.host.bak`, die
 vorhandene `.env` und die persistenten Daten. Halte den aktuell eingesetzten
-versionierten Runtime-Image-Tag für den Rückweg fest, beispielsweise `v5.4.6`.
+versionierten Runtime-Image-Tag für den Rückweg fest, beispielsweise `v5.4.6a`.
 Ein älterer Root-Tag eignet sich nicht für diesen ersten Netzwerk-Rückweg.
 Prüfe eine administrativ zugängliche Kopie der aktuellen
 Konfiguration, ohne ihren Inhalt auszugeben:
@@ -967,8 +975,11 @@ im DockerRootDir. Schlägt die Prüfung oder das Entpacken mit Platzmangel fehl,
 bleiben Altcontainer und Volumes erhalten; die Ausgabe nennt
 `docker system df -v`, DockerRootDir und `df -h` als nächste Diagnose. Nach einem begonnenen
 Kandidatenstart führt jeder Fehler zum verifizierten Stopp und zum gebundenen
-Rückstart des vorherigen Images. Bleibt Kandidatenstillstand oder Rückstart
-unbestätigt, meldet der Helfer einen gesonderten Sicherheitsfehler.
+Rückstart des vorherigen Images. Scheitert auch dieser Rückstart oder dessen
+Prüfung, stoppt der Helfer zusätzlich den zugehörigen Rückfallcontainer. Dafür
+prüft er erneut dessen Container- und Image-ID, Projekt und Mounts. Kann er die
+Zuordnung oder den Stillstand nicht bestätigen, meldet er einen gesonderten
+Sicherheitsfehler; fremde oder inzwischen veränderte Container bleiben unberührt.
 
 Für einen Rückfall wird ausschließlich der Host-Helfer aus dem Abschnitt
 „Gezielte Rückfallversion“ verwendet. Er erhält den freigegebenen Tag über
@@ -1006,6 +1017,24 @@ Eine Wartungsfreiheit wird auch im Opt-in-Betrieb nicht zugesichert.
 ## 4. Befehle & Fehlerbehebung (Troubleshooting)
 
 Da du nicht mehr klassisch über die Linux-Konsole auf E3DC zugreifst, nutzt du nun Docker-Befehle, um das System zu steuern:
+
+**Host-Updater meldet einen unsicheren Dateimodus der Compose-Datei**
+
+Der Helfer akzeptiert keine Compose-Datei, die für die Gruppe oder andere
+Benutzer schreibbar ist, etwa mit Modus `0777`. Prüfe die einzelne Datei im
+tatsächlich mit `--compose-dir` verwendeten Verzeichnis und korrigiere dort
+ihren Modus:
+
+```bash
+stat -c 'Modus=%a Eigentümer=%u Gruppe=%g Datei=%n' -- docker-compose.yml
+sudo chmod 0644 -- docker-compose.yml
+stat -c 'Modus=%a Eigentümer=%u Gruppe=%g Datei=%n' -- docker-compose.yml
+```
+
+Die Änderung betrifft ausschließlich diese Datei. Sie ersetzt weder die
+Prüfung der Compose-Struktur noch eine erforderliche Volume-Migration. Bleibt
+der gemeldete Modus trotz `chmod` unverändert, müssen die Dateirechte auf dem
+Docker-Host beziehungsweise dessen Dateisystem geprüft werden.
 
 **Konfiguration nicht gespeichert: `target_metadata_invalid`**
 

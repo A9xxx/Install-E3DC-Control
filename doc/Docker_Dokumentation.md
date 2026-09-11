@@ -2,10 +2,10 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.6a`. Die Tags `latest`, `v5.4.6a` und
-`5.4.6a` bezeichnen denselben Stable-Stand.
+Der aktuelle Stable-Stand ist `v5.4.6b`. Die Tags `latest`, `v5.4.6b` und
+`5.4.6b` bezeichnen denselben Stable-Stand.
 
-5.4.6a startet EMS-Python-Dienste mit dem eigenen unprivilegierten Konto
+5.4.6b startet EMS-Python-Dienste mit dem eigenen unprivilegierten Konto
 `e3dc-runtime`. Private Modelle und Prognosebelege werden vor dem Start geprüft
 und übernommen. Der aktuelle Host-Updater ist auch für den Rückfall auf ältere
 Root-Images erforderlich. Vor dem Upgrade den tatsächlich verwendeten Helfer
@@ -439,7 +439,7 @@ unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.6a` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.6b` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -466,7 +466,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.6a` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.6b` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash
@@ -752,7 +752,7 @@ Port, etwa `E3DC_PUBLISH_BIND=192.0.2.20` und `E3DC_PUBLISH_PORT=8085`.
 Verwende denselben Compose-Ordner und Projektnamen. Sichere vorher die
 funktionierende `docker-compose.yml` als `docker-compose.host.bak`, die
 vorhandene `.env` und die persistenten Daten. Halte den aktuell eingesetzten
-versionierten Runtime-Image-Tag für den Rückweg fest, beispielsweise `v5.4.6a`.
+versionierten Runtime-Image-Tag für den Rückweg fest, beispielsweise `v5.4.6b`.
 Ein älterer Root-Tag eignet sich nicht für diesen ersten Netzwerk-Rückweg.
 Prüfe eine administrativ zugängliche Kopie der aktuellen
 Konfiguration, ohne ihren Inhalt auszugeben:

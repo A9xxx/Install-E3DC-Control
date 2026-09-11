@@ -6,6 +6,15 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.6b] – 2026-09-11
+
+### Docker-Korrekturupdate
+
+- Enthält die unten beschriebenen Korrekturen für den Docker-Start, ältere Compose-Dateien und den sicheren Rückfallstopp.
+- Die Imageprüfung akzeptiert wiederholt referenzierte Layer, wie sie bei reinen Build-Prüfschritten entstehen. Alle Layer werden weiterhin auf portable Dateieigentümer geprüft; mehrdeutige oder nicht reguläre Archivdateien werden abgewiesen.
+
+Docker-Nutzer aktualisieren zuerst den Host-Updater und verwenden anschließend den dokumentierten Updateweg. Das stabile Docker-Image für dieses Korrekturupdate ist `v5.4.6b`; für `v5.4.6a` wurde kein stabiles Image freigegeben. Die [Docker-Dokumentation](doc/Docker_Dokumentation.md) erklärt Sicherung, Migration und Rückfall.
+
 ## [5.4.6a] – 2026-09-11
 
 ### Docker-Korrekturen

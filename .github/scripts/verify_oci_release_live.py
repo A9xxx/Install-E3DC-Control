@@ -75,9 +75,20 @@ def _runtime_layer_owner_errors(image_reference: str, platform: str) -> list[str
                 image_reference,
             )
             with tarfile.open(archive_path, mode="r:*") as image_archive:
-                manifest_stream = image_archive.extractfile("manifest.json")
-                if manifest_stream is None:
-                    raise ValueError("manifest.json ist keine reguläre Datei")
+                members_by_name: dict[str, list[tarfile.TarInfo]] = {}
+                for member in image_archive.getmembers():
+                    members_by_name.setdefault(member.name, []).append(member)
+
+                def regular_file(name: str):
+                    members = members_by_name.get(name, [])
+                    if len(members) != 1 or not members[0].isreg():
+                        raise ValueError(f"{name} ist keine eindeutige reguläre Archivdatei")
+                    stream = image_archive.extractfile(members[0])
+                    if stream is None:
+                        raise ValueError(f"{name} kann nicht gelesen werden")
+                    return stream
+
+                manifest_stream = regular_file("manifest.json")
                 with manifest_stream:
                     manifest = json.load(manifest_stream)
                 if not isinstance(manifest, list) or len(manifest) != 1:
@@ -87,15 +98,14 @@ def _runtime_layer_owner_errors(image_reference: str, platform: str) -> list[str
                     not isinstance(layers, list)
                     or not layers
                     or any(not isinstance(layer, str) or not layer for layer in layers)
-                    or len(layers) != len(set(layers))
                 ):
-                    raise ValueError("manifest.json enthält keine eindeutige Layer-Liste")
+                    raise ValueError("manifest.json enthält keine gültige Layer-Liste")
 
                 errors: list[str] = []
+                # Docker bewahrt die Layer-Reihenfolge; derselbe Inhalt darf
+                # mehrfach referenziert sein. Jede Archivdatei muss eindeutig sein.
                 for index, layer_name in enumerate(layers, start=1):
-                    layer_stream = image_archive.extractfile(layer_name)
-                    if layer_stream is None:
-                        raise ValueError(f"Layer {index} ist keine reguläre Datei")
+                    layer_stream = regular_file(layer_name)
                     with layer_stream, tarfile.open(fileobj=layer_stream, mode="r:*") as layer:
                         errors.extend(
                             _portable_owner_errors(

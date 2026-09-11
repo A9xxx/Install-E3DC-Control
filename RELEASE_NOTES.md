@@ -1,4 +1,4 @@
-# E3DC-Control v5.4.6a
+# E3DC-Control v5.4.6b
 
 Dieses Korrekturupdate behebt den Docker-Startabbruch nach 5.4.6 und verbessert die Übernahme älterer Compose-Installationen.
 
@@ -8,9 +8,11 @@ Dieses Korrekturupdate behebt den Docker-Startabbruch nach 5.4.6 und verbessert 
 - Der Host-Updater erkennt zusätzlich die bekannte alte Named-Volume-Vorlage mit festem `latest`: sowohl die ursprünglichen Daten-/Logvolumes als auch die vollständig um drei private Standardvolumes ergänzte Form. Gültige direkt eingetragene Web-Port- und Bindadressen bleiben erhalten. Projekt- und Volumezuordnung werden weiterhin geprüft.
 - Scheitert nach einem Update auch der Rückstart des vorherigen Images oder dessen Prüfung, stoppt der Host-Updater den eindeutig zugeordneten Rückfallcontainer. Ein unbestätigter Stillstand wird ausdrücklich gemeldet.
 
+Die Imageprüfung unterstützt wiederholt referenzierte Layer und prüft weiterhin sämtliche Dateieigentümer. Mehrdeutige oder nicht reguläre Archivdateien werden abgewiesen. Für `v5.4.6a` wurde kein stabiles Docker-Image freigegeben; dieses Korrekturupdate wird als `v5.4.6b` bereitgestellt.
+
 ## Updatehinweise
 
-**Zuerst den verwendeten Host-Helfer `Installer/docker_compose_update.py` aktualisieren.** Ein neues Containerimage ersetzt diese Datei auf dem Docker-Host nicht. Danach das Update aus dem bestehenden Compose-Verzeichnis mit dem aktuellen Helfer ausführen. Ein fester Image-Pin muss bewusst auf `v5.4.6a` geändert werden; `latest` folgt dem korrigierten Stable-Image.
+**Zuerst den verwendeten Host-Helfer `Installer/docker_compose_update.py` aktualisieren.** Ein neues Containerimage ersetzt diese Datei auf dem Docker-Host nicht. Danach das Update aus dem bestehenden Compose-Verzeichnis mit dem aktuellen Helfer ausführen. Ein fester Image-Pin muss bewusst auf `v5.4.6b` geändert werden; `latest` folgt dem korrigierten Stable-Image.
 
 Benötigte Volumes bei gestopptem Container mit erhaltenen numerischen Eigentümern und Dateirechten auf dem Host sichern. Updates und Container-Neuerstellungen bei beendeter Fahrzeugladung und ohne laufenden Phasenwechsel durchführen. Keine zusätzliche Compose-Option `user:` setzen. Private Wallbox-Steuerzustände überleben einen Neustart desselben Containers, aber keine Neuerstellung.
 

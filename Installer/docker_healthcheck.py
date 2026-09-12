@@ -107,6 +107,13 @@ def _read_process_security(pid: str) -> dict:
             if key in fields:
                 raise RuntimeError(f"Prozess-Credentials für PID {pid} sind mehrdeutig")
             fields[key] = value.split()
+    if set(fields) == required - {"NoNewPrivs"}:
+        # Alte Kernel zeigen das Bit nicht pro PID. Der Containervertrag muss
+        # dann bereits Root-Launcher und Docker-exec/Healthcheck beschränken.
+        # UID, Gruppen und sämtliche Capability-Felder bleiben PID-genau.
+        if not _load_runtime_identity().legacy_container_no_new_privs():
+            raise RuntimeError(f"Prozess-Credentials für PID {pid} sind unvollständig")
+        fields["NoNewPrivs"] = ["1"]
     if set(fields) != required:
         raise RuntimeError(f"Prozess-Credentials für PID {pid} sind unvollständig")
     try:

@@ -18,26 +18,30 @@ Dieses Modul erweitert **E3DC-Control** um eine intelligente Steuerung für Wär
 *   **Smart-Home-Schnittstelle:** Nutzt Modbus TCP zur Kommunikation mit der Wärmepumpe.
 *   **System-Integration:** Vollständig in den E3DC-Control Installer, Status-Check und Rechte-Management integriert.
 
-> **Update 4.9.3:** Das Frontend ergaenzt wichtige Livewerte wie Sole Ein/Aus,
-> Vorlauf/Ruecklauf-Soll, Warmwasser-Soll und Energiezaehler jetzt robuster
+> **Update 4.9.3:** Das Frontend ergänzt wichtige Livewerte wie Sole Ein/Aus,
+> Vorlauf/Rücklauf-Soll, Warmwasser-Soll und Energiezähler jetzt robuster
 > direkt aus den Luxtronik-Daten, wenn die WebSocket-Zwischendatei einzelne
-> Felder nicht enthaelt.
+> Felder nicht enthält.
 
 ---
 
-### Erneute Boost-Anfrage nach ungenutzter Startfreigabe
+### PV-Boost nach einem Update
 
-Eine abgelaufene Startzuteilung sperrt neue Starts zunächst. Wenn frische
-Rückmeldungen wieder Normalbetrieb, einen stehenden Verdichter und weniger als
-50 W Aufnahme bestätigen, kann nach mindestens 60 Sekunden ab Ende der alten
-Zuteilung eine Rücknahme der Startbereitschaft gemeldet werden. Erst nachdem der
-Storage Manager diese Rücknahme verarbeitet hat, folgt eine neue Budgetanfrage.
-Die Rücknahme selbst schaltet die Wärmepumpe nicht.
+Für den automatischen Luxtronik-PV-Boost (`wp_type=0`) werden ein elektrisches
+Leistungsprofil und ausdrücklich erlaubte Akku-/Netzkontingente benötigt.
+Fehlen diese Angaben, warten neue optionale PV-Starts. Normale Heizung,
+Warmwasser-Zeitfenster und deren bestehende Schutzfunktionen bleiben unabhängig.
+Die Installation selbst wird dadurch nicht blockiert. Die Einrichtung steht
+im Config Editor unter **PV-Überschuss-Boost → Luxtronik: Leistungsprofil und
+Energie zur Überbrückung**.
 
-Ein neuer Boost benötigt weiterhin Wärmebedarf und eine frische, ausreichende
-Zuteilung. Aktives Signal, Pumpenvorlauf, unklare Daten, Sperrzeiten und ausgeschaltete
-Automatik erlauben keinen erzwungenen Neustart. Die 60 Sekunden sind eine
-zusätzliche Wartefrist, kein Ersatz für die geräteeigenen Schutzzeiten.
+Eine ungenutzte Startfreigabe wird nicht als Ende des Wärmebedarfs behandelt.
+Heizung und Warmwasser besitzen getrennt zugeordnete Aufträge und
+Rückmeldungen. Ein berechtigter Warmwasser-Timer verriegelt deshalb keinen
+neuen Heizungsauftrag. Nach einem ausbleibenden Start wird der betroffene
+PV-Auftrag kontrolliert zurückgenommen; ein neuer Start wartet auf geklärte
+Wirkung, frische Daten, ausreichende Deckung und die Wiedereinschaltsperre.
+Ein bestätigter Sollwert allein beweist keinen Verdichterlauf.
 
 ## 2. Voraussetzungen
 
@@ -78,16 +82,84 @@ Die Bearbeitung erfolgt am einfachsten über das **Web-Interface** (Config Edito
 **Pfad:** `/var/www/html/data/e3dc_v4.json`
 
 ### Wichtige Parameter (in e3dc_v4.json)
+
 | Parameter | Beschreibung | Standard |
 | :--- | :--- | :--- |
 | `luxtronik_ip` | IP-Adresse der Wärmepumpe im lokalen Netzwerk. | `0.0.0.0` (nicht konfiguriert) |
-| `GRID_START_LIMIT` | Einspeiseleistung in Watt, ab der der Boost startet. **Negativ** bedeutet Einspeisung. | `-3500` |
-| `MIN_SOC` | Mindest-Ladestand der Hausbatterie in %, damit der Boost freigegeben wird. | `65` |
-| `AT_LIMIT` | Außentemperatur-Grenze in °C. Unterscheidet zwischen Sommer- (nur WW) und Winterbetrieb. | `14.0` |
-| `WWS` | Warmwasser-Sollwert im Boost-Modus (Sommer/Übergang). | `55.0` |
-| `WWW` | Warmwasser-Sollwert im Winterbetrieb. | `45.0` |
-| `HZ` | Absoluter Heizungs-Setpoint für den Rücklauf während des Boosts. | `32.0` |
+| `grid_start_limit` | Startschwelle in Watt; **negativ** bedeutet Einspeisung. Die zentrale Verteilung berücksichtigt Verbraucherprioritäten. Kein Ersatz für die maximale elektrische Geräteaufnahme. | `-3500` |
+| `min_soc` | Mindest-Ladestand der Hausbatterie für neue Boost-Starts. Die physische Notstromreserve wird zusätzlich geschützt. | `80` |
+| `heizgrenze_temp` | Außentemperatur-Grenze in °C zwischen Sommer- und Winterbetrieb. | `10.0` |
+| `wws` | Warmwasser-Sollwert im Boost-Modus im Sommer. | `50.0` |
+| `www` | Warmwasser-Sollwert im Boost-Modus im Winter. | `48.0` |
+| `hz` | Absoluter Heizungs-Sollwert für den Rücklauf während des Boosts. | `32.0` |
 | `luxtronik_pause_setpoint_c` | Rücklauf-Sollwert für die weiche SHI-Sollwertsperre. EMS-Sicherheitsbereich 15 bis 22 °C; keine echte EVU-/SG-Ready-Sperre. | `20.0` |
+
+### Leistungsprofil und Quellen für den Luxtronik-PV-Boost
+
+Die folgenden Werte gelten für `wp_type=0`. Das Leistungsprofil muss die
+maximal mögliche **elektrische** Aufnahme innerhalb derselben Messgrenze
+beschreiben, die der Regler für die WP verwendet. Thermische Heizleistung,
+typischer Verbrauch und Startschwelle sind keine sicheren Obergrenzen.
+Nicht erfasste Pumpen verbleiben in der Hauslast oder werden separat genau
+einmal berücksichtigt. Eine mögliche Zusatzheizung darf weder im Profil
+fehlen noch nochmals als eigener Verbraucher abgezogen werden.
+
+| Parameter | Bedeutung | Standard |
+| :--- | :--- | :--- |
+| `wp_pv_max_power_w` | Belegte maximale elektrische Aufnahme in W innerhalb der WP-Messgrenze. `0` bedeutet: Profil fehlt. | `0` |
+| `wp_pv_battery_max_w` | Maximal erlaubte Akku-Überbrückungsleistung für die WP in W. `0` sperrt diese Quelle. | `0` |
+| `wp_pv_battery_limit_wh` | Akkuenergie für PV-Überbrückung in den jeweils letzten 24 Stunden. `0` sperrt diese Quelle. | `0` |
+| `wp_pv_grid_max_w` | Maximal erlaubte Netz-Überbrückungsleistung für die WP in W. `0` sperrt diese Quelle. | `0` |
+| `wp_pv_grid_limit_wh` | Netzenergie für PV-Überbrückung in den jeweils letzten 24 Stunden. `0` sperrt diese Quelle. | `0` |
+| `wp_min_runtime_min` | Geschützte Verdichterlaufzeit ab bestätigtem physischem Start. | `30` |
+| `wp_restart_block_min` | Wiedereinschaltsperre nach bestätigtem Verdichterstopp. | `20` |
+| `pv_boost_delay` | Dauer der stabilen PV-Startqualifikation in Sekunden, bevor eine verbindliche Startzuteilung beginnt. | `30` |
+| `wp_pv_reaction_s` | Für Messung, Kommunikation und wirksame Lastanpassung anzusetzende Reaktionsfrist in Sekunden. Muss zum Geräteprofil passen. | `30` |
+| `wp_pv_start_wait_s` | Wartefrist auf den tatsächlichen Verdichterstart nach einem Auftrag; mindestens 600 Sekunden. | `600` |
+| `wp_pv_handoff_timeout_s` | Frist für die Übergabe von Wallboxleistung vor dem WP-Auftrag in Sekunden. | `120` |
+
+Bei jeder Quelle müssen Leistung **und** Energie erlaubt sein. Vor einem
+optionalen Start reserviert der Regler Energie für die maximale Geräteaufnahme
+während Mindestlaufzeit, Startwartefrist und Reaktionsfrist. Die konfigurierten
+Kontingente müssen diese Zusage auch bei ausfallender PV tragen können.
+Erwarteter Sonnenschein ersetzt diese Deckung nicht. Reicht das Kontingent
+nicht, wartet der zusätzliche PV-Start mit einem Diagnosegrund. Aktuelle
+Speicherleistung, Notstromreserve, Hausanschlussgrenzen und bereits gebundene
+Verbraucher begrenzen die tatsächlich verfügbare Deckung zusätzlich.
+
+Bei freier Speicherautomatik kann der Akku einen Lastsprung bereits übernehmen,
+bevor die nächste EMS-Vorgabe wirkt. Auch eine überwiegend aus dem Netz
+vorgesehene Überbrückung benötigt deshalb ein erlaubtes Akku-Reaktionspolster,
+solange eine wirksame Entladesperre nicht belegt ist. Eine gewünschte
+Speicherbetriebsart allein belegt weder eine Sperre noch verfügbare Leistung.
+
+Verbrauchte Wh werden aus der gebundenen Restenergie umgebucht. Spätere
+Einspeisung erstattet sie nicht. Das rollierende 24-Stunden-Kontingent wird
+weder um Mitternacht noch durch Wolkenwechsel, HZ-/WW-Wechsel,
+Prioritätswechsel oder Dienstneustart zurückgesetzt. Nach geklärtem Zyklusende
+wird nur ungenutzte Reservierung freigegeben. Fehlende Messungen oder ein
+ungültiger Laufzeitzustand erzeugen keine kostenlose Energie und erlauben
+keinen neuen Start ohne geklärte Deckung.
+
+Das Energiekonto und die noch möglicherweise wirksamen PV-Kanalaufträge
+werden getrennt und privat dauerhaft gespeichert. Neue Energiezusagen und
+Auftragsabsichten werden vor ihrer Freigabe gesichert. Ein Dienst- oder
+Hostneustart eröffnet deshalb kein neues Kontingent. Fehlt ein vertrauenswürdiges
+Konto, etwa bei der ersten Einrichtung oder einer Docker-Neuerstellung,
+warten neue optionale PV-Starts zunächst 24 Stunden nachweisbar verstrichene
+Laufzeit. Ein weiterer Neustart behält die Restwartezeit bei. Die Freigabe
+setzt anschließend frische Messwerte, einen bestätigten Verdichterstillstand
+und geklärte alte Aufträge voraus. Normale Heizung und berechtigte
+Warmwasser-Zeitfenster bleiben davon unabhängig. Die privaten Dateien dürfen
+nicht als vermeintliche Reparatur gelöscht werden.
+
+Die Fristen sind Einstellungen des Energiemanagements, keine garantierten
+Herstellerzeiten. Ohne belegte Leistungsrampe muss die Überbrückung den
+möglichen Leistungssprung tragen. Die AIT-SHI-Anleitung empfiehlt für
+PV-Betrieb eine Ausschaltverzögerung. Eine dort beschriebene weiche
+Leistungsbegrenzung kann bei entsprechender Temperaturabweichung übergangen
+werden und ist deshalb keine harte elektrische Obergrenze.
+[AIT-SHI-Anleitung, Seiten 5 und 16](https://files.ait-group.net/FILES/Alpha-InnoTec/Betriebsanleitungen/01%20Waermepumpen/05%20Regler/Zubehoer/83026900aDE_SHI.pdf)
 
 ---
 
@@ -101,9 +173,26 @@ Das Skript läuft als Systemd-Service (`energy_manager`) im Hintergrund.
     *   Liegt ein gültiger Besitzer vor, z.B. Pre-Dump, Preisfenster oder freigegebenes Wärmebudget aus dem Storage Manager?
     *   Sind Mindestlaufzeit, Komfortgrenzen, Warmwasser-/Heizgrenzen und Schutzwerte erfüllt?
     *   -> **Boost AN** (Warmwasser-Soll wird erhöht, ggf. Heizung angehoben).
-3.  **Abschaltung:**
-    *   Wird Strom aus dem Netz bezogen (> 50W) oder die Batterie entladen?
-    *   -> Ein Timer startet. Nach 10 Minuten Defizit wird der **Boost AUS** geschaltet (Reset auf Normalwerte).
+3.  **PV-Freigabe und Rücknahme bei Luxtronik:**
+    *   Bei WP-Vorrang erhält nutzbarer Wärmebedarf zuerst eine abgesicherte Freigabe. Die Wallbox nutzt den tatsächlich nicht angenommenen Rest und passt ihren Ladestrom an.
+    *   Bei Wallbox-Vorrang beginnen neue optionale WP-Starts aus dem verbleibenden Rahmen. Ein bereits geschützter Verdichter behält seine gebundene Deckung.
+    *   Fällt der Überschuss weg, tragen erlaubte Akku-/Netzquellen den geschützten Übergang. Die Rücknahme wartet auf das Ende der Mindestlaufzeit und der noch wirksamen Signalhaltezeit.
+    *   Nur benannte Schutzfunktionen, etwa Nutzer-Aus, Gerätestörung, Notstromreserve, Hausanschlussgrenze oder eine harte Quellenenergiegrenze, dürfen die Schutzzeit verkürzen. Gewöhnlicher Netzbezug, ein Budgetwechsel oder eine wirtschaftliche Priorität sind kein solcher Schutzfall.
+
+Heizung und Warmwasser teilen sich denselben Verdichter und werden elektrisch
+nur einmal bilanziert. Ein zulässiges normales Warmwasser-Zeitfenster benötigt
+keinen PV-Boost. Dessen Rückmeldung darf einen unabhängigen Heizungsauftrag
+nicht als bereits ausgeführt bestätigen. Die interne Luxtronik darf ihren
+Takt bei erreichtem Ziel selbst beenden; der Regler erhöht keine Temperaturen,
+um eine Mindestlaufzeit künstlich zu erzwingen.
+
+Startqualifikation, Leistungsübergabe und Befehlsprüfung besitzen getrennte
+Fristen. Die 25 Sekunden für die Befehlsprüfung beginnen erst mit dem
+tatsächlich gesendeten WP-Auftrag. Vorher muss eine erforderliche Absenkung
+der Wallboxleistung tatsächlich sichtbar sein. Ein Phasenwechsel bleibt im
+eigenen Schutzablauf der Wallbox; seine Sperrzeit wird nicht auf jede
+Ladestromanpassung übertragen. Nach einer Signalrücknahme bleiben eine noch
+ungeklärte Startwirkung und ein weiterlaufender Verdichter berücksichtigt.
 
 Der vollständige Minutenverlauf bleibt als begrenzter Live-Puffer in der
 RAM-Disk. Das persistente Luxtronik-Betriebsarchiv schreibt höchstens eine
@@ -168,14 +257,14 @@ gestarteten Zyklus vor einem EMS-bedingten Abbruch. Er zwingt die Wärmepumpe
 nicht zum Überheizen: Erreicht die Luxtronik den Zielwert und beendet den Lauf
 selbst, wird der externe Auftrag freigegeben.
 
-Ein direkter 55-°C-Boost aus PV-Überschuss, Pre-Dump oder Preislogik bleibt
-bei einem kurzen Budgetwechsel während der Signalhaltezeit und der
-konfigurierten Defizitfrist stabil. Fehlt anschließend weiterhin ein
-startfähiges Budget, wird ausschließlich das Warmwasserziel auf den aktiven
-Timerwert oder auf die normale Luxtronik-Regelung zurückgegeben. Ein Heiztakt
-gilt dabei nicht als Warmwasserlauf. Ein physisch belegter WW-Zyklus bleibt
-geschützt; nach der Rücknahme öffnet erst eine neue, zur aktuellen
-Wärmeanfrage gehörende Budgetentscheidung den direkten Boost erneut.
+Ein zusätzlicher Warmwasser-Sollwert benötigt einen zugehörigen Auftrag aus
+PV-Überschuss, Pre-Dump oder Preislogik. Beim Luxtronik-PV-Boost tragen die
+getrennten Quellenkontingente die zugesagte Schutzfrist. Wird der zusätzliche
+Auftrag danach zurückgenommen, gilt wieder der berechtigte Timerwert oder
+die normale Luxtronik-Regelung. Ein Heiztakt gilt nicht als Warmwasserlauf;
+beide Betriebsarten nutzen jedoch denselben physisch geschützten Verdichter.
+Nach der Rücknahme benötigt ein neuer Boost erneut eine zur aktuellen
+Wärmeanfrage gehörende Budgetentscheidung.
 
 ---
 

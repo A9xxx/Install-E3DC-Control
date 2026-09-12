@@ -126,6 +126,8 @@ def allocate_consumer_budget_contract(
     wp_runon_s=600.0,
     wp_runon_active_override=None,
     priority_front=(),
+    reclaimable_active=(),
+    heatpump_exclusive_budget_w=0,
 ):
     """Teilt genau einen versiegelbaren Verbraucherrahmen deterministisch auf.
 
@@ -136,6 +138,7 @@ def allocate_consumer_budget_contract(
     """
 
     total = _strict_nonnegative_int(total_budget_w)
+    hp_exclusive = _strict_nonnegative_int(heatpump_exclusive_budget_w)
     requested = _strict_power_map(requests_w)
     enabled_map = _strict_bool_map(enabled)
     active_map = _strict_bool_map(active, default=False)
@@ -161,9 +164,16 @@ def allocate_consumer_budget_contract(
         len(front) == len(set(front))
         and all(consumer in CONSUMERS for consumer in front)
     )
+    reclaimable = list(reclaimable_active or ())
+    reclaimable_valid = bool(
+        len(reclaimable) == len(set(reclaimable))
+        and all(consumer == "wallbox" for consumer in reclaimable)
+    )
     reason = None
     if total is None:
         reason = "total_budget_type_invalid"
+    elif hp_exclusive is None or hp_exclusive > total:
+        reason = "heatpump_exclusive_source_invalid"
     elif requested is None:
         reason = "consumer_requests_invalid"
     elif enabled_map is None:
@@ -178,6 +188,8 @@ def allocate_consumer_budget_contract(
         reason = "consumer_time_contract_invalid"
     elif wp_runon_active_override is not None and runon_override is None:
         reason = "consumer_priority_runon_override_invalid"
+    elif not reclaimable_valid:
+        reason = "consumer_reclaimable_activity_invalid"
     elif not front_valid:
         reason = "consumer_priority_override_invalid"
     elif any(
@@ -226,25 +238,40 @@ def allocate_consumer_budget_contract(
             item for item in effective_order if item not in front
         ]
 
-    remaining = total
+    remaining = total - hp_exclusive
+    exclusive_remaining = hp_exclusive
+
+    def available_for(consumer):
+        return remaining + (exclusive_remaining if consumer == "heatpump" else 0)
+
+    def consume(consumer, watts):
+        nonlocal remaining, exclusive_remaining
+        own_w = min(watts, exclusive_remaining) if consumer == "heatpump" else 0
+        exclusive_remaining -= own_w
+        remaining -= watts - own_w
+
     allocations = {consumer: 0 for consumer in CONSUMERS}
     blockers = []
 
     # Laufende Verbraucher erhalten nur dann ihre vollständige Mindest- oder
     # Reservierungsleistung, wenn der gemeinsame Rahmen sie physikalisch trägt.
     for consumer in effective_order:
-        if not active_map[consumer] or requests[consumer] <= 0:
+        if (
+            not active_map[consumer]
+            or requests[consumer] <= 0
+            or consumer in reclaimable
+        ):
             continue
         floor_w = max(minimums[consumer], reservations[consumer])
         floor_w = min(floor_w, requests[consumer])
         if requests[consumer] < minimums[consumer]:
             blockers.append(consumer + "_request_below_minimum")
             continue
-        if remaining < floor_w:
+        if available_for(consumer) < floor_w:
             blockers.append(consumer + "_active_minimum_unfunded")
             continue
         allocations[consumer] = floor_w
-        remaining -= floor_w
+        consume(consumer, floor_w)
 
     # Oberhalb der aktiven Mindestlasten gilt die konfigurierte Reihenfolge
     # strikt. Dadurch bleibt auch bei identischen Eingaben jede Permutation
@@ -257,16 +284,18 @@ def allocate_consumer_budget_contract(
             blockers.append(consumer + "_request_below_minimum")
             continue
         missing_w = request_w - allocations[consumer]
-        if allocations[consumer] == 0 and remaining < minimums[consumer]:
+        if allocations[consumer] == 0 and available_for(consumer) < minimums[consumer]:
             blockers.append(consumer + "_minimum_unfunded")
             continue
-        grant_w = min(missing_w, remaining)
+        grant_w = min(missing_w, available_for(consumer))
         if allocations[consumer] == 0 and grant_w < minimums[consumer]:
             blockers.append(consumer + "_partial_start_blocked")
             continue
         allocations[consumer] += grant_w
-        remaining -= grant_w
+        consume(consumer, grant_w)
 
+    shared_remaining_w = remaining
+    remaining += exclusive_remaining
     allocation_sum = sum(allocations.values())
     conserved = bool(allocation_sum <= total and allocation_sum + remaining == total)
     if not conserved:
@@ -320,6 +349,11 @@ def allocate_consumer_budget_contract(
         "consumer_priority_wp_runon_s": float(runon),
         "consumer_priority_wp_runon_active": wp_runon_active,
         "priority_front": front,
+        "reclaimable_active": reclaimable,
+        "heatpump_exclusive_budget_w": hp_exclusive,
+        "heatpump_exclusive_allocated_w": hp_exclusive - exclusive_remaining,
+        "heatpump_exclusive_remaining_w": exclusive_remaining,
+        "shared_remaining_w": shared_remaining_w,
         "invariant_conserved": conserved,
         "blockers": sorted(set(blockers)),
         "heatpump_start_request_w": int(hp_request_w),
@@ -377,6 +411,19 @@ def validate_consumer_budget_contract(contract):
         return {**result, "reason_code": "consumer_budget_sum_mismatch"}
     if allocation_sum > total or allocation_sum + remaining != total:
         return {**result, "reason_code": "consumer_budget_overallocated"}
+    if "heatpump_exclusive_budget_w" in data:
+        exclusive = _strict_nonnegative_int(data.get("heatpump_exclusive_budget_w"))
+        used = _strict_nonnegative_int(data.get("heatpump_exclusive_allocated_w"))
+        unused = _strict_nonnegative_int(data.get("heatpump_exclusive_remaining_w"))
+        shared_left = _strict_nonnegative_int(data.get("shared_remaining_w"))
+        if (
+            any(value is None for value in (exclusive, used, unused, shared_left))
+            or exclusive > total or used + unused != exclusive
+            or used > allocations["heatpump"]
+            or shared_left + unused != remaining
+            or allocation_sum - used > total - exclusive
+        ):
+            return {**result, "reason_code": "heatpump_exclusive_source_conservation_failed"}
     for consumer in CONSUMERS:
         allocation = allocations[consumer]
         if enabled_map[consumer] and minimums[consumer] > limits[consumer]:

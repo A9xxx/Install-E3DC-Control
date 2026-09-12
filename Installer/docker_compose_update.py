@@ -109,6 +109,7 @@ def _active_yaml_lines(value: str) -> tuple[str, ...]:
 
 def _known_compose_template(
     *, bind_mounts: bool, current: bool, bridge: bool = False,
+    no_new_privileges: bool = True,
 ) -> tuple[str, ...]:
     data_source = "./data" if bind_mounts else "e3dc_data"
     log_source = "./logs" if bind_mounts else "e3dc_logs"
@@ -120,6 +121,8 @@ def _known_compose_template(
     ]
     if current:
         lines.append("    hostname: e3dc-control")
+        if no_new_privileges:
+            lines.extend(("    security_opt:", "      - no-new-privileges:true"))
     lines.extend(
         [
             "    restart: unless-stopped",
@@ -250,6 +253,14 @@ KNOWN_CURRENT_TEMPLATES = {
     _known_compose_template(bind_mounts=False, current=True): "repo_named_volumes",
     _known_compose_template(bind_mounts=True, current=True): "installer_bind_mounts",
     _known_compose_template(bind_mounts=False, current=True, bridge=True): "repo_named_volumes",
+}
+KNOWN_PRE_NNP_TEMPLATES = {
+    _known_compose_template(bind_mounts=bind, current=True, bridge=bridge, no_new_privileges=False): topology
+    for bind, bridge, topology in (
+        (False, False, "repo_named_volumes"),
+        (True, False, "installer_bind_mounts"),
+        (False, True, "repo_named_volumes"),
+    )
 }
 KNOWN_CURRENT_TEMPLATE_HASHES = {
     # Exakte aktive YAML-Form nach Migration der veröffentlichten R0-Standarddatei.
@@ -895,11 +906,24 @@ def _compose_projection(cli: DockerCli, compose_file: Path) -> dict[str, Any]:
     return value
 
 
+def _container_no_new_privileges(service: dict[str, Any], *, required: bool = False) -> bool:
+    options = service.get("security_opt")
+    if options is None and not required:
+        return False
+    if not isinstance(options, list) or len(options) != 1 or options[0] not in (
+        "no-new-privileges:true", "no-new-privileges=true", "no-new-privileges",
+    ):
+        raise DockerUpdateError("Der Container benötigt ausschließlich security_opt: [no-new-privileges:true].")
+    return True
+
+
 def _without_migration_fields(value: dict[str, Any]) -> dict[str, Any]:
     cleaned = json.loads(json.dumps(value))
     services = cleaned.get("services") or {}
     e3dc = services.get(SERVICE_NAME) or {}
     watchtower = services.get("watchtower") or {}
+    if _container_no_new_privileges(e3dc):
+        e3dc.pop("security_opt")
     for key in ("hostname", "image", "logging"):
         e3dc.pop(key, None)
     labels = e3dc.get("labels")
@@ -967,6 +991,7 @@ def _validate_projection_delta(
             "Die Compose-Projektion änderte mehr als die freigegebenen Pflichtfelder."
         )
     service = (after.get("services") or {}).get(SERVICE_NAME) or {}
+    _container_no_new_privileges(service, required=True)
     watchtower = (after.get("services") or {}).get("watchtower") or {}
     if service.get("hostname") != SERVICE_NAME:
         raise DockerUpdateError("Der projizierte Container-Hostname ist nicht gebunden.")
@@ -1103,7 +1128,7 @@ def _project_current_compose(data: bytes, *, topology: str) -> bytes:
         ("  e3dc_forecast_evidence:",),
         (f"  {ROLE_VOLUME_NAME}:",),
     )
-    candidate = "".join(lines).encode("utf-8")
+    candidate = _project_container_no_new_privileges("".join(lines).encode("utf-8"))
     try:
         active = _active_yaml_lines(candidate.decode("utf-8"))
     except UnicodeDecodeError as exc:
@@ -1690,7 +1715,13 @@ def _legacy_532b_projection_topology(
             ):
                 raise DockerUpdateError("Ein Standardvolume widerspricht der bekannten Altform.")
             top_volume = (projection.get("volumes") or {}).get(known_sources[target]) or {}
-            if set(top_volume) != {"name"} or top_volume.get("name") != str(projection.get("name") or "") + "_" + known_sources[target]:
+            # Compose 2.20 gibt auch den Standardwert external=false aus.
+            # Externe Volumes und zusätzliche Treiberoptionen bleiben gesperrt.
+            if (
+                set(top_volume) - {"name", "external"}
+                or top_volume.get("external", False) is not False
+                or top_volume.get("name") != str(projection.get("name") or "") + "_" + known_sources[target]
+            ):
                 raise DockerUpdateError("Ein Standardvolume ist nicht an das Compose-Projekt gebunden.")
             continue
         if target in {DATA_VOLUME_TARGET, LOG_VOLUME_TARGET}:
@@ -2012,7 +2043,7 @@ def _project_legacy_532b_compose(data: bytes, *, topology: str) -> bytes:
     )
     for name in ("e3dc_ml", "e3dc_forecast_evidence", ROLE_VOLUME_NAME):
         _ensure_top_volume(lines, name)
-    return ("\n".join(lines) + "\n").encode("utf-8")
+    return _project_container_no_new_privileges(("\n".join(lines) + "\n").encode("utf-8"))
 
 
 def _without_literal_web_options(data: bytes) -> tuple[tuple[str, ...], dict[str, str]]:
@@ -2052,10 +2083,42 @@ def _without_literal_web_options(data: bytes) -> tuple[tuple[str, ...], dict[str
     return _active_yaml_lines(comparison), options
 
 
+def _without_container_no_new_privileges(data: bytes) -> tuple[bytes, bool]:
+    """Entfernt nur das eine Schutzfeld für den Vergleich mit bekannten Altvorlagen."""
+    try:
+        lines = data.decode("utf-8").splitlines(keepends=True)
+    except UnicodeDecodeError as exc:
+        raise DockerUpdateError("Compose ist nicht gültig UTF-8-kodiert.") from exc
+    span = _service_field_span(lines, SERVICE_NAME, "security_opt")
+    if span is None:
+        return data, False
+    start, end = span
+    active = _active_yaml_lines("".join(lines[start:end]))
+    if active != ("    security_opt:", "      - no-new-privileges:true"):
+        raise DockerUpdateError("Die Compose-Sicherheitsoption entspricht nicht dem gebundenen NNP-Vertrag.")
+    # Kommentare und Leerzeilen bleiben erhalten, damit auch veröffentlichte Hashes gebunden bleiben.
+    remove = {index for index in range(start, end) if _active_yaml_lines(lines[index])}
+    return "".join(line for index, line in enumerate(lines) if index not in remove).encode("utf-8"), True
+
+
+def _project_container_no_new_privileges(data: bytes) -> bytes:
+    _without, protected = _without_container_no_new_privileges(data)
+    if protected:
+        return data
+    _line_ending(data)
+    if not data.endswith(b"\n"):
+        raise DockerUpdateError("Compose muss mit einem eindeutigen Zeilenende enden.")
+    lines = data.decode("utf-8").splitlines(keepends=True)
+    _insert_after_sequence(lines, ("    hostname: e3dc-control",),
+                           ("    security_opt:", "      - no-new-privileges:true"))
+    return "".join(lines).encode("utf-8")
+
+
 def _classify_compose_source(
     data: bytes,
     projection: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
+    data, protected = _without_container_no_new_privileges(data)
     normalised = _normalised_lf_bytes(data)
     legacy_hash = hashlib.sha256(normalised).hexdigest()
     topology = KNOWN_542_LEGACY_HASHES.get(legacy_hash)
@@ -2063,7 +2126,7 @@ def _classify_compose_source(
         active = _active_yaml_lines(data.decode("utf-8"))
     except UnicodeDecodeError as exc:
         raise DockerUpdateError("Compose ist nicht gültig UTF-8-kodiert.") from exc
-    current_topology = KNOWN_CURRENT_TEMPLATES.get(active) or KNOWN_CURRENT_TEMPLATE_HASHES.get(
+    current_topology = KNOWN_PRE_NNP_TEMPLATES.get(active) or KNOWN_CURRENT_TEMPLATE_HASHES.get(
         hashlib.sha256("\n".join(active).encode("utf-8")).hexdigest()
     )
     literal_web_error: DockerUpdateError | None = None
@@ -2075,7 +2138,7 @@ def _classify_compose_source(
         literal_web_error = exc
     # Ausschließlich bekannte Hostvorlagen; die Originaldatei bleibt unverändert.
     if current_topology is None and "    network_mode: host" in comparison:
-        current_topology = KNOWN_CURRENT_TEMPLATES.get(comparison) or KNOWN_CURRENT_TEMPLATE_HASHES.get(
+        current_topology = KNOWN_PRE_NNP_TEMPLATES.get(comparison) or KNOWN_CURRENT_TEMPLATE_HASHES.get(
             hashlib.sha256("\n".join(comparison).encode("utf-8")).hexdigest()
         )
     known_named_mount_count = KNOWN_LEGACY_NAMED_TEMPLATES.get(comparison, 0)
@@ -2124,7 +2187,9 @@ def _classify_compose_source(
         return "repo_named_volumes", "legacy_named_standard"
     if legacy_532b_topology:
         return legacy_532b_topology, "legacy_532b"
-    return topology or current_topology or "", "legacy_542" if topology is not None else "current"
+    return topology or current_topology or "", (
+        "legacy_542" if topology is not None else "current" if protected else "current_without_nnp"
+    )
 
 
 def _prepare_compose_contract(cli: DockerCli) -> dict[str, Any]:
@@ -2233,7 +2298,9 @@ def _prepare_compose_contract(cli: DockerCli) -> dict[str, Any]:
             }
 
         candidate_data = (
-            _project_legacy_532b_compose(source["data"], topology=topology)
+            _project_container_no_new_privileges(source["data"])
+            if compose_state == "current_without_nnp"
+            else _project_legacy_532b_compose(source["data"], topology=topology)
             if compose_state in {"legacy_532b", "legacy_named_standard"}
             else _project_current_compose(source["data"], topology=topology)
         )
@@ -2245,6 +2312,11 @@ def _prepare_compose_contract(cli: DockerCli) -> dict[str, Any]:
         )
         candidate_projection = _compose_projection(cli, candidate_path)
         _validate_projection_delta(before_projection, candidate_projection, topology=topology)
+        if compose_state == "current_without_nnp":
+            narrowed = json.loads(json.dumps(candidate_projection))
+            narrowed["services"][SERVICE_NAME].pop("security_opt")
+            if narrowed != before_projection:
+                raise DockerUpdateError("Die aktuelle Compose-Vorlage änderte mehr als den NNP-Schutz.")
         _stop_update_watchtower(cli, before_projection)
         _require_same_snapshot(
             directory_fd,
@@ -2286,6 +2358,7 @@ def _prepare_compose_contract(cli: DockerCli) -> dict[str, Any]:
         origin_label = {
             "legacy_532b": "5.3.2b", "legacy_542": "5.4.2",
             "legacy_named_standard": "(bekannte Named-Volume-Altform)",
+            "current_without_nnp": "(bisheriger Pflichtvertrag ohne containerweites NNP)",
         }[compose_state]
         print(
             f"✓ Compose {origin_label} "

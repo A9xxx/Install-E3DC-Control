@@ -18,6 +18,11 @@ import time
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 try:
+    from .heatpump_pv_contract import heatpump_pv_config as _heatpump_pv_config
+except ImportError:  # pragma: no cover - direkter Skriptaufruf
+    from heatpump_pv_contract import heatpump_pv_config as _heatpump_pv_config
+
+try:
     from reserve import live_ep_reserve_details
 except Exception:  # pragma: no cover - package import fallback
     from .reserve import live_ep_reserve_details  # type: ignore
@@ -530,6 +535,67 @@ def validate_pv_forecast_topology_config(cfg: Optional[Dict[str, Any]]) -> Dict[
     return result
 
 
+def validate_heatpump_pv_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Beratende Prüfung; fehlende Deckung sperrt nur neue optionale PV-Starts."""
+    if not _is_enabled(cfg, "luxtronik") or safe_float(cfg.get("wp_type"), -1.0) != 0:
+        return {}
+    profile = _heatpump_pv_config(cfg)
+    entries = {}
+    rules = (
+        ("wp_pv_max_power_w", "WP: maximale elektrische Aufnahme", "W", "max_power_w", 0.0),
+        ("wp_pv_battery_limit_wh", "WP: Akkuenergie in 24 Stunden", "Wh", "battery_limit_wh", 0.0),
+        ("wp_pv_grid_limit_wh", "WP: Netzenergie in 24 Stunden", "Wh", "grid_limit_wh", 0.0),
+        ("wp_pv_battery_max_w", "WP: Akku-Überbrückungsleistung", "W", "battery_max_w", 0.0),
+        ("wp_pv_grid_max_w", "WP: Netz-Überbrückungsleistung", "W", "grid_max_w", 0.0),
+        ("wp_pv_reaction_s", "WP: Reaktionsfrist", "s", "reaction_s", 30.0),
+        ("wp_pv_start_wait_s", "WP: Verdichter-Startwartefrist", "s", "start_wait_s", 600.0),
+        ("wp_pv_handoff_timeout_s", "WP: Übergabefrist Wallbox", "s", "handoff_timeout_s", 120.0),
+    )
+    for key, label, unit, profile_key, default in rules:
+        raw = cfg.get(key, default)
+        try:
+            numeric = float(raw)
+            valid = not isinstance(raw, bool) and math.isfinite(numeric) and numeric >= 0
+        except (TypeError, ValueError, OverflowError):
+            valid = False
+        effective = profile[profile_key]
+        if key in {"wp_pv_max_power_w", "wp_pv_reaction_s", "wp_pv_handoff_timeout_s"}:
+            valid = valid and effective > 0
+        elif key == "wp_pv_start_wait_s":
+            valid = valid and effective >= profile["signal_hold_s"]
+        message = "Konfigurationswert ist plausibel; aktuelle Quellen- und Schutzgrenzen werden zusätzlich geprüft."
+        if not valid:
+            message = "Profilwert fehlt oder ist ungültig. Neue optionale PV-Starts warten; normale Heizung und Warmwasser bleiben unabhängig."
+        elif effective == 0:
+            message = "Diese Überbrückungsquelle ist gesperrt. Leistung und Wh-Kontingent müssen beide größer als null sein."
+        entries[key] = _entry(
+            key=key, label=label, unit=unit,
+            configured=raw if _has_user_value(cfg, key) else None,
+            live_value=None, live_key=None, effective=effective,
+            source="user" if _has_user_value(cfg, key) else "default",
+            severity="ok" if valid else "warning", message=message,
+        )
+    duration_s = profile["min_runtime_s"] + profile["start_wait_s"] + profile["reaction_s"]
+    hours = duration_s / 3600.0
+    required_wh = profile["max_power_w"] * hours
+    available_wh = sum(
+        min(profile[source + "_limit_wh"], profile[source + "_max_w"] * hours)
+        for source in ("battery", "grid")
+    )
+    funded = profile["valid"] and available_wh + 1e-6 >= required_wh
+    entries["wp_pv_energy_reservation"] = _entry(
+        key="wp_pv_energy_reservation", label="WP: Energie vor PV-Start", unit="Wh",
+        configured=None, live_value=None, live_key=None, effective=required_wh,
+        source="derived", severity="ok" if funded else "warning",
+        message=(
+            "Die eingestellten Quellen können rechnerisch die volle Schutzfrist tragen. Bereits verbrauchte oder gebundene Wh, Speicherreserve und aktuelle Leistungsgrenzen werden vor jedem Start zusätzlich berücksichtigt."
+            if funded else
+            "Das elektrische Profil oder die Akku-/Netzdeckung reicht für die volle Schutzfrist noch nicht aus. Neue optionale PV-Starts warten. Dies ist kein Installationsfehler und sperrt keine normale Heizung oder Warmwasserbereitung."
+        ),
+    )
+    return entries
+
+
 def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Liefert die beratende Prüfung der Speicherkonfiguration.
 
@@ -546,6 +612,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     storage: Dict[str, Dict[str, Any]] = {}
     wallbox: Dict[str, Dict[str, Any]] = {}
     consumer: Dict[str, Dict[str, Any]] = {}
+    consumer.update(validate_heatpump_pv_config(cfg))
     price: Dict[str, Dict[str, Any]] = {}
     forecast = validate_solcast_config(cfg)
     forecast.update(validate_pv_forecast_topology_config(cfg))

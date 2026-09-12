@@ -80,6 +80,9 @@
 !/Installer/Wallbox/diagnostics.py
 !/Installer/Wallbox/drivers.py
 !/Installer/Wallbox/e3dc_session.py
+!/Installer/Wallbox/fixed_phase_session.py
+!/Installer/Wallbox/fixed_phase_runtime.py
+!/Installer/Wallbox/fixed_start_energy.py
 !/Installer/Wallbox/goe_session.py
 !/Installer/Wallbox/modes.py
 !/Installer/Wallbox/openwb_pro_session.py
@@ -156,6 +159,8 @@
 !/Installer/ha_root_runtime.py
 !/Installer/ha_writer_admission.py
 !/Installer/heat_actuator_safety.py
+!/Installer/heatpump_pv_contract.py
+!/Installer/heatpump_pv_state.py
 !/Installer/heizstab_manager.py
 !/Installer/idm/idm_scanner.py
 !/Installer/idm/idm_live.py

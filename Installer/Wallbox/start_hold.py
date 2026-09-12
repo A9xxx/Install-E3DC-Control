@@ -4,7 +4,8 @@ Das Modul besitzt weder Hardware- noch Datei-I/O. Der Wallbox Manager meldet
 eine sitzungsgebundene Mindestleistungsreservierung an; ausschließlich der
 Storage Manager darf daraus ein vollständig finanziertes Wattbudget freigeben.
 Die gemeinsame 40-Wh-Grenze begrenzt die zusätzliche Energie und wird deshalb
-bei mehreren Wallboxen nicht vervielfacht; sie ist keine Netzbezugsfreigabe.
+bei mehreren Wallboxen nicht vervielfacht. Nur ein ausdrücklich typisierter
+Erkennungsstart kann eine zusätzliche begrenzte Netzfreigabe tragen.
 """
 
 from __future__ import annotations
@@ -31,6 +32,45 @@ DEFAULT_HOLD_S = 180.0
 DEFAULT_ENERGY_WH = 40.0
 DEFAULT_HARD_IMPORT_W = 2500.0
 ACTIVE_STAGES = frozenset({"await_receipt", "committed"})
+FIXED_DETECTION_KIND = "fixed_phase_detection"
+
+
+def _fixed_detection_metadata(item):
+    """Validiert ausschließlich die private, bereits reservierte Probeenergie."""
+    if not isinstance(item, dict) or item.get("request_kind") != FIXED_DETECTION_KIND:
+        return None
+    numbers = {}
+    for key in ("bridge_remaining_wh", "bridge_remaining_s", "minimum_real_pv_w"):
+        value = item.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            return None
+        numbers[key] = float(value)
+    used = item.get("bridge_used_wh", 0.0)
+    if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(float(used)):
+        return None
+    if (not str(item.get("bridge_reservation_id") or "")
+        or item.get("grid_support_allowed") is not True
+        or not 0.0 < numbers["bridge_remaining_s"] <= 30.0
+        or not 0.0 < numbers["bridge_remaining_wh"] <= DEFAULT_ENERGY_WH
+        or not 0.0 <= float(used) <= DEFAULT_ENERGY_WH
+        or numbers["bridge_remaining_wh"] + float(used) > DEFAULT_ENERGY_WH + 1e-6
+        or numbers["minimum_real_pv_w"] != 1380.0):
+        return None
+    return {"request_kind": FIXED_DETECTION_KIND,
+            "bridge_reservation_id": str(item["bridge_reservation_id"]),
+            "grid_support_allowed": True, "bridge_used_wh": float(used), **numbers}
+
+
+def _fixed_grant_matches(request, grant):
+    if request.get("request_kind") != FIXED_DETECTION_KIND:
+        return grant.get("request_kind") != FIXED_DETECTION_KIND
+    meta = _fixed_detection_metadata(request)
+    return bool(meta and grant.get("request_kind") == FIXED_DETECTION_KIND
+                and grant.get("bridge_reservation_id") == meta["bridge_reservation_id"]
+                and 0.0 <= _float(grant.get("grid_support_w"), -1.0)
+                and 0.0 < _float(grant.get("bridge_remaining_s"), 0.0) <= 30.0
+                and 0.0 < _float(grant.get("bridge_remaining_wh"), 0.0) <= DEFAULT_ENERGY_WH)
+
 
 
 def _float(value, default=0.0):
@@ -57,8 +97,12 @@ def _current_session_id(data):
     )
 
 
-def _normalize_group_members(items):
-    """Normalisiert die beim Start belegte Wallbox-/Stecksession-Gruppe."""
+def _normalize_group_members(items, *, allow_two_phase=False, allow_running_current=False):
+    """Normalisiert die beim Start belegte Wallbox-/Stecksession-Gruppe.
+
+    Eine typisierte Probe darf die bereits laufenden Ströme anderer Mitglieder
+    binden. Der Probeowner selbst bleibt durch Request und Intent exakt 6 A.
+    """
 
     result = []
     seen = set()
@@ -75,8 +119,8 @@ def _normalize_group_members(items):
             wb_id <= 0
             or wb_id in seen
             or not session_id
-            or phases not in (1, 3)
-            or minimum_amp != 6
+            or phases not in ((1, 2, 3) if allow_two_phase else (1, 3))
+            or not (6 <= minimum_amp <= 32 if allow_running_current else minimum_amp == 6)
             or minimum_power_w < nominal_minimum_power_w
         ):
             return []
@@ -116,6 +160,7 @@ def begin_request(
     minimum_amp=6,
     now_ts=0.0,
     arm_s=DEFAULT_ARM_S,
+    request_kind="",
 ):
     """Erzeugt höchstens einen Startversuch je physischer Stecksession.
 
@@ -138,7 +183,7 @@ def begin_request(
     quantum_w = max(0, _int(minimum_quantum_w, 0))
     required_w = max(0, _int(group_minimum_w, 0))
     charger_id = max(0, _int(wb_id, 0))
-    normalized_members = _normalize_group_members(group_members)
+    normalized_members = _normalize_group_members(group_members, allow_two_phase=request_kind == FIXED_DETECTION_KIND, allow_running_current=request_kind == FIXED_DETECTION_KIND)
     provided_group_members_invalid = bool(
         group_members is not None and not normalized_members
     )
@@ -162,7 +207,7 @@ def begin_request(
         charger_id <= 0
         or not session_id
         or not str(request_cycle_token or "")
-        or phases not in (1, 3)
+        or phases not in ((1, 2, 3) if request_kind == FIXED_DETECTION_KIND else (1, 3))
         or amp != 6
         or quantum_w < amp * 230 * phases
         or required_w < quantum_w
@@ -200,6 +245,8 @@ def begin_request(
         "receipt_force_state": None,
         "receipt_ts": 0.0,
     }
+    if request_kind == FIXED_DETECTION_KIND:
+        request["request_kind"] = FIXED_DETECTION_KIND
     data[STATE_KEY] = request
     data.pop(GRANT_KEY, None)
     return deepcopy(request)
@@ -264,6 +311,11 @@ def commit_receipt(box, receipt, *, now_ts=0.0, hold_s=DEFAULT_HOLD_S):
         "receipt_force_state": proof.get("force_state"),
         "receipt_ts": receipt_ts,
     })
+    if request.get("request_kind") == FIXED_DETECTION_KIND:
+        meta = _fixed_detection_metadata(request)
+        if meta is None:
+            return {}
+        committed["expires_ts"] = min(request["expires_ts"], receipt_ts + meta["bridge_remaining_s"])
     data[STATE_KEY] = committed
     return deepcopy(committed)
 
@@ -341,7 +393,7 @@ def intent_contract(wb_intent, *, now_ts):
         minimum_w = max(0, _int(item.get("minimum_quantum_w"), 0))
         group_w = max(0, _int(item.get("group_minimum_w"), 0))
         raw_group_members = item.get("group_members")
-        group_members = _normalize_group_members(raw_group_members)
+        group_members = _normalize_group_members(raw_group_members, allow_two_phase=item.get("request_kind") == FIXED_DETECTION_KIND, allow_running_current=item.get("request_kind") == FIXED_DETECTION_KIND)
         selected_group_member = next(
             (
                 member
@@ -350,6 +402,8 @@ def intent_contract(wb_intent, *, now_ts):
             ),
             None,
         )
+        if item.get("request_kind") == FIXED_DETECTION_KIND and _fixed_detection_metadata(item) is None:
+            blockers.append("fixed_detection_energy_unbound")
         if not intent_fresh:
             blockers.append("stale_intent")
         if item.get("schema_version") != REQUEST_SCHEMA:
@@ -362,10 +416,11 @@ def intent_contract(wb_intent, *, now_ts):
             blockers.append("wb_id_invalid")
         target_phases = _int(item.get("target_phases"), 0)
         minimum_amp = _int(item.get("minimum_amp"), 0)
-        if target_phases not in (1, 3) or minimum_amp != 6:
+        allowed_phases = (1, 2, 3) if item.get("request_kind") == FIXED_DETECTION_KIND else (1, 3)
+        if target_phases not in allowed_phases or minimum_amp != 6:
             blockers.append("not_supported_phase_6a")
         if (
-            target_phases not in (1, 3)
+            target_phases not in allowed_phases
             or minimum_w < minimum_amp * 230 * target_phases
             or group_w < minimum_w
         ):
@@ -459,9 +514,21 @@ def arbitrate_grants(
     hard_import_w=DEFAULT_HARD_IMPORT_W,
     clock_sample=None,
     max_known_step_s=15.0,
+    fixed_grid_available_w=0.0,
+    fixed_battery_available_w=0.0,
+    fixed_real_pv_w=None,
 ):
     """Erteilt genau ein globales, zeit- und energiegebundenes Wattbudget."""
 
+    if any(isinstance(item, dict) and item.get("request_kind") == FIXED_DETECTION_KIND for item in (requests or [])):
+        return _arbitrate_fixed_detection(
+            requests, base_budget_w=base_budget_w, grid_import_w=grid_import_w,
+            previous=previous, now_ts=now_ts, hard_blockers=hard_blockers,
+            battery_support_allowed=battery_support_allowed,
+            storage_charge_request_w=storage_charge_request_w,
+            grid_available_w=fixed_grid_available_w, battery_available_w=fixed_battery_available_w,
+            real_pv_w=fixed_real_pv_w, hard_import_w=hard_import_w,
+        )
     now_value = _float(now_ts, 0.0)
     base_w = max(0, _int(base_budget_w, 0))
     grid_w = max(0, _int(grid_import_w, 0))
@@ -819,6 +886,98 @@ def arbitrate_grants(
     }
 
 
+def _arbitrate_fixed_detection(
+    requests, *, base_budget_w, grid_import_w, previous, now_ts, hard_blockers,
+    battery_support_allowed, storage_charge_request_w, grid_available_w,
+    battery_available_w, real_pv_w, hard_import_w,
+):
+    """Finanziert nur die benannte Probe; das private Gruppenkonto besitzt Wh."""
+    items = [deepcopy(x) for x in (requests or []) if isinstance(x, dict)]
+    blockers = [str(x) for x in (hard_blockers or []) if str(x)]
+    previous = previous if isinstance(previous, dict) else {}
+    item = items[0] if len(items) == 1 else {}
+    meta = _fixed_detection_metadata(item)
+    now = _float(now_ts, 0.0)
+    base = max(0, _int(base_budget_w, 0))
+    required = max(0, _int(item.get("group_minimum_w"), 0))
+    if len(items) != 1 or not meta:
+        blockers.append("fixed_probe_group_or_energy_invalid")
+    if not _active_request(item, now):
+        blockers.append("fixed_probe_request_inactive")
+    if (previous.get("active") is True
+        and previous.get("request_kind") != FIXED_DETECTION_KIND):
+        blockers.append("other_start_hold_active")
+    phases = _int(item.get("target_phases"), 0)
+    if (phases not in (1, 2, 3) or required <= 0
+        or _int(item.get("minimum_amp"), 0) != 6
+        or _int(item.get("minimum_quantum_w"), 0) != 6 * 230 * phases):
+        blockers.append("fixed_probe_minimum_invalid")
+    remaining_s = min(_float(item.get("expires_ts"), 0.0) - now,
+                      (meta or {}).get("bridge_remaining_s", 0.0))
+    if remaining_s <= 0:
+        blockers.append("fixed_probe_expired")
+    if item.get("stage") == "await_receipt" and (
+        real_pv_w is None or _float(real_pv_w, -1.0) < 1380.0
+    ):
+        blockers.append("fixed_probe_real_pv_missing")
+    if max(0.0, _float(grid_import_w)) >= max(300.0, _float(hard_import_w, DEFAULT_HARD_IMPORT_W)):
+        blockers.append("hard_grid_import")
+    extension = max(0, required - base)
+    charge = min(extension, max(0, _int(storage_charge_request_w, 0)))
+    battery = min(extension - charge, max(0, _int(battery_available_w, 0))) if battery_support_allowed else 0
+    grid = min(extension - charge - battery, max(0, _int(grid_available_w, 0)))
+    uncovered = extension - charge - battery - grid
+    # Reservierung bleibt global und zeitlich abnehmend. Sie wird weder hier
+    # erneut integriert noch durch eine neue Storage-Episode aufgefüllt.
+    energy = (meta or {}).get("bridge_remaining_wh", 0.0)
+    if (battery + grid) * max(0.0, remaining_s) / 3600.0 > energy + 1e-6:
+        blockers.append("fixed_probe_energy_insufficient")
+    if uncovered > 0:
+        blockers.append("extension_unfunded")
+    active = not blockers
+    effective = max(base, required) if active else base
+    episode = "fixed:" + str((meta or {}).get("bridge_reservation_id") or "")
+    grants = []
+    if active:
+        grants.append({
+            "schema_version": GRANT_SCHEMA, "active": True,
+            "grant_state": "committed" if item.get("stage") == "committed" else "armed",
+            "reservation_id": item["reservation_id"], "wb_id": item["wb_id"],
+            "plug_session_id": item["plug_session_id"], "request_cycle_token": item["request_cycle_token"],
+            "group_members": deepcopy(item.get("group_members") or []),
+            "episode_id": episode, "base_budget_w": base,
+            "granted_total_budget_w": required, "storage_effective_budget_w": effective,
+            "granted_deficit_ceiling_w": extension, "used_deficit_wh": meta["bridge_used_wh"],
+            "started_ts": _float(item.get("started_ts"), 0.0), "expires_ts": now + remaining_s,
+            **meta, "bridge_remaining_s": remaining_s,
+            "grid_support_w": grid, "discharge_support_w": battery,
+        })
+    return {
+        "schema_version": GRANT_SCHEMA, "request_kind": FIXED_DETECTION_KIND,
+        "active": active, "status": (grants[0]["grant_state"] if active else blockers[0]),
+        "committed": item.get("stage") == "committed", "episode_id": episode,
+        "episode_open": bool(items), "episode_committed": item.get("stage") == "committed",
+        "episode_terminal": bool(not active and item.get("stage") == "committed"),
+        "episode_terminal_reason": blockers[0] if blockers else "",
+        "reservation_ids": [str(item.get("reservation_id") or "")],
+        "grants": grants, "base_budget_w": base, "required_group_minimum_w": required,
+        "effective_budget_w": effective, "extension_w": extension if active else 0,
+        "charge_reduction_w": charge if active else 0,
+        "discharge_support_w": battery if active else 0, "grid_support_w": grid if active else 0,
+        "funding_required_w": extension, "funding_covered_w": charge + battery + grid,
+        "funding_applied_w": charge + battery + grid if active else 0,
+        "funding_uncovered_w": uncovered, "battery_support_allowed": bool(battery_support_allowed),
+        "grid_support_allowed": bool(active and meta and meta["grid_support_allowed"]),
+        "used_deficit_wh": (meta or {}).get("bridge_used_wh", 0.0),
+        "remaining_deficit_wh": energy, "remaining_s": max(0.0, remaining_s),
+        "bridge_remaining_wh": energy, "bridge_remaining_s": max(0.0, remaining_s),
+        "bridge_reservation_id": str((meta or {}).get("bridge_reservation_id") or ""),
+        "energy_account_owner": "wallbox_fixed_start_energy",
+        "source_mode": "fixed_detection_bound_sources" if active else "unfunded",
+        "blockers": blockers, "last_sample_ts": now,
+    }
+
+
 def apply_grant(box, grant, *, now_ts):
     """Bindet eine Storage-Freigabe exakt an Request und Stecksession."""
 
@@ -827,9 +986,11 @@ def apply_grant(box, grant, *, now_ts):
     item = grant if isinstance(grant, dict) else {}
     now_value = _float(now_ts, 0.0)
     request_group_members = _normalize_group_members(
-        request.get("group_members") if isinstance(request, dict) else None
+        request.get("group_members") if isinstance(request, dict) else None,
+        allow_two_phase=isinstance(request, dict) and request.get("request_kind") == FIXED_DETECTION_KIND,
+        allow_running_current=isinstance(request, dict) and request.get("request_kind") == FIXED_DETECTION_KIND,
     )
-    grant_group_members = _normalize_group_members(item.get("group_members"))
+    grant_group_members = _normalize_group_members(item.get("group_members"), allow_two_phase=item.get("request_kind") == FIXED_DETECTION_KIND, allow_running_current=item.get("request_kind") == FIXED_DETECTION_KIND)
     valid = bool(
         isinstance(request, dict)
         and request.get("schema_version") == REQUEST_SCHEMA
@@ -843,6 +1004,7 @@ def apply_grant(box, grant, *, now_ts):
         and _int(item.get("wb_id"), 0) == _int(request.get("wb_id"), -1)
         and str(item.get("request_cycle_token") or "")
         == str(request.get("request_cycle_token") or "")
+        and _fixed_grant_matches(request, item)
         and request_group_members
         and grant_group_members == request_group_members
         and str(item.get("episode_id") or "")
@@ -864,10 +1026,14 @@ def committed_grant_budget(box, *, base_budget_w, now_ts):
     base_w = max(0, _int(base_budget_w, 0))
     now_value = _float(now_ts, 0.0)
     request_group_members = _normalize_group_members(
-        request.get("group_members") if isinstance(request, dict) else None
+        request.get("group_members") if isinstance(request, dict) else None,
+        allow_two_phase=isinstance(request, dict) and request.get("request_kind") == FIXED_DETECTION_KIND,
+        allow_running_current=isinstance(request, dict) and request.get("request_kind") == FIXED_DETECTION_KIND,
     )
     grant_group_members = _normalize_group_members(
-        grant.get("group_members") if isinstance(grant, dict) else None
+        grant.get("group_members") if isinstance(grant, dict) else None,
+        allow_two_phase=isinstance(grant, dict) and grant.get("request_kind") == FIXED_DETECTION_KIND,
+        allow_running_current=isinstance(grant, dict) and grant.get("request_kind") == FIXED_DETECTION_KIND,
     )
     valid = bool(
         isinstance(request, dict)
@@ -886,6 +1052,7 @@ def committed_grant_budget(box, *, base_budget_w, now_ts):
         and _int(grant.get("wb_id"), 0) == _int(request.get("wb_id"), -1)
         and str(grant.get("request_cycle_token") or "")
         == str(request.get("request_cycle_token") or "")
+        and _fixed_grant_matches(request, grant)
         and request_group_members
         and grant_group_members == request_group_members
         and grant.get("active") is True

@@ -9,6 +9,7 @@ Produktpfade gebunden. Dieser Vertrag führt keine Schreiboperation aus.
 
 from __future__ import annotations
 
+import ctypes
 import grp
 import os
 from pathlib import Path
@@ -108,6 +109,38 @@ def validate_docker_product_binding() -> None:
         _validate_root_path(marker, directory=False)
 
 
+def current_process_no_new_privs() -> int:
+    """Liest das Kernelbit direkt; das proc-Statusfeld fehlt vor Linux 4.10."""
+    try:
+        prctl = ctypes.CDLL(None, use_errno=True).prctl
+        prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
+        prctl.restype = ctypes.c_int
+        result = prctl(39, 0, 0, 0, 0)  # PR_GET_NO_NEW_PRIVS, seit Linux 3.5.
+    except (AttributeError, OSError) as exc:
+        raise RuntimeError("Kernel-Privilegienbeschränkung ist nicht abfragbar.") from exc
+    if result not in (0, 1):
+        raise RuntimeError("Kernel-Privilegienbeschränkung konnte nicht bestätigt werden.")
+    return result
+
+
+def legacy_container_no_new_privs() -> bool:
+    """Bindet alte Kernel an den Schutz des gesamten Docker-Containers.
+
+    Auf diesen Kerneln muss bereits der privilegierte Launcher das Bit tragen.
+    Docker übernimmt die Containeroption auch für exec und den Healthcheck.
+    Das Bit kann nach fork/exec nicht zurückgenommen werden.
+    """
+    with open("/proc/self/status", "r", encoding="ascii") as handle:
+        if any(line.startswith("NoNewPrivs:") for line in handle):
+            return False
+    if current_process_no_new_privs() != 1:
+        raise RuntimeError(
+            "Dieser Kernel benötigt security_opt: [no-new-privileges:true] "
+            "für den gesamten Docker-Container."
+        )
+    return True
+
+
 def _runtime_process_has_no_privileges() -> bool:
     """Prüft die vom Kernel ausgewiesenen Privilegien des aufrufenden Prozesses."""
     try:
@@ -120,13 +153,14 @@ def _runtime_process_has_no_privileges() -> bool:
             values.get("Uid", "").split() == [str(RUNTIME_UID)] * 4
             and values.get("Gid", "").split() == [str(RUNTIME_GID)] * 4
             and
-            values.get("NoNewPrivs") == "1"
+            current_process_no_new_privs() == 1
+            and ("NoNewPrivs" not in values or values["NoNewPrivs"] == "1")
             and all(
                 key in values and int(values[key], 16) == 0
                 for key in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")
             )
         )
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError):
         return False
 
 

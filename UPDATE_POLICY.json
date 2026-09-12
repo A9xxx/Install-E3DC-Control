@@ -1,9 +1,9 @@
 {
-  "version": "5.4.6b",
+  "version": "5.4.6c",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.6b",
-  "release_date": "2026-09-11",
-  "description": "v5.4.6b - Docker-Start, Compose-Migration und Rückfallstopp",
+  "stable_release": "v5.4.6c",
+  "release_date": "2026-09-12",
+  "description": "v5.4.6c - Wallbox-Phasenerkennung, PV-Wärmeregelung und Docker-Kompatibilität",
   "update_strategy": "backup_replace_restart_v1",
   "installer_requires": "python3",
   "sanitized_republication": false,

@@ -1,6 +1,6 @@
 # Betrieb des E3DC-Control Installers
 
-Dokumentation Stand: 5.4.6b
+Dokumentation Stand: 5.4.6c
 
 Der Installer ist der freigegebene Einstieg für Installation, Update,
 Reparatur, Backup, Rollback und Deinstallation. Die vollständige Bedienung ist

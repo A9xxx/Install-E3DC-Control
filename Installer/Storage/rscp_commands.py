@@ -966,7 +966,12 @@ class BattCtrl:
         force: bool = False,
         discharge_cap_w: Optional[int] = None,
         auto_limit: Optional[Dict[str, Any]] = None,
+        set_power_only: bool = False,
     ) -> Dict[str, Any]:
+        if type(set_power_only) is not bool:
+            raise ValueError("set_power_only muss ein boolescher Wert sein")
+        if set_power_only and (type(mode) is not int or type(val) is not int or val < 0):
+            raise ValueError("Flüchtige Leistungsvorgaben benötigen ganzzahlige Werte")
         mode = int(mode)
         val = max(0, int(val))
         def _auto_limit_int(key: str, default: int) -> int:
@@ -981,6 +986,7 @@ class BattCtrl:
             auto_limit=auto_limit,
             discharge_cap_w=discharge_cap_w,
             auto_discharge_cap_w=self._auto_discharge_cap,
+            set_power_only=set_power_only,
         )
 
         receipt: Dict[str, Any] = {
@@ -1031,6 +1037,17 @@ class BattCtrl:
             return step
 
         self._last_power_settings_wire_receipt = {}
+
+        if set_power_only:
+            # Dieser Ausgang hat genau einen flüchtigen Leistungsbefehl. Eine
+            # Wärmefreigabe darf keine Konfigurations- oder POWER_SETTINGS-
+            # Schreibfolge als Nebenwirkung auslösen.
+            step = self._send_set_power_receipt(mode, val, force=force)
+            receipt["substeps"]["set_power"] = step
+            _record_primary(step)
+            receipt["output_complete"] = bool(step.get("issued") or step.get("retained"))
+            receipt["partial"] = bool(receipt["attempted"] and not receipt["output_complete"])
+            return receipt
 
         if command_contract.get("auto_limit_release"):
             auto_discharge_cap = max(
@@ -1199,12 +1216,21 @@ def rscp_command_contract(
     auto_limit: Optional[Dict[str, Any]] = None,
     discharge_cap_w: Optional[int] = None,
     auto_discharge_cap_w: int = 0,
+    set_power_only: bool = False,
 ) -> Dict[str, Any]:
     """Describe the RSCP command path without opening a connection or sending."""
     mode_i = safe_int(mode, MODE_AUTO)
     val_i = max(0, safe_int(val, 0))
     current_mode_i = safe_int(current_mode, -1)
     auto = auto_limit if isinstance(auto_limit, dict) else {}
+    if type(set_power_only) is not bool:
+        raise ValueError("set_power_only muss ein boolescher Wert sein")
+    if set_power_only and (
+        type(mode) is not int or type(val) is not int or val < 0
+        or mode not in (MODE_AUTO, MODE_IDLE, MODE_DISCH)
+        or auto_limit not in (None, {})
+    ):
+        raise ValueError("Unzulässige Kombination für flüchtige Leistungsvorgabe")
     auto_release = bool(auto.get("release"))
     limit_refresh = bool(auto.get("enabled"))
     release_active_mode = current_mode_i in ACTIVE_RELEASE_MODES
@@ -1222,7 +1248,10 @@ def rscp_command_contract(
     set_power_auto_suppressed = False
     release_strategy = "none"
     path = "mode:%s" % mode_label(mode_i)
-    if auto_release:
+    if set_power_only:
+        path = "set_power_only"
+        release_strategy = "volatile_set_power"
+    elif auto_release:
         path = "auto_limit_release"
         release_strategy = "stop_set_power_refresh"
         set_power_auto_suppressed = bool(set_power_auto_requested or release_active_mode)

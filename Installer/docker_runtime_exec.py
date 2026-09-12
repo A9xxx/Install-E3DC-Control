@@ -79,6 +79,7 @@ def main(argv=None) -> int:
     if not args.dropped:
         if os.getresuid() != (0, 0, 0):
             raise RuntimeError("Der privilegierte EMS-Start benötigt den Container-Bootstrap")
+        identity.legacy_container_no_new_privs()
         forwarded = (["--log", args.log] if args.log else []) + ["--"] + command
         os.execv("/usr/bin/setpriv", [
             "/usr/bin/setpriv", "--reuid=991", "--regid=991", "--groups=991,33",

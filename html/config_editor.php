@@ -440,6 +440,9 @@ $defaults = [
     // V4 Smart Home / Energy Manager
     "luxtronik" => "0", "wp_type" => "-1", "wp_source_type" => "auto", "luxtronik_ip" => "0.0.0.0", "idm_ip" => "0.0.0.0", "idm_port" => "502", "idm_e_total" => "0", "idm_cooling_boost_min_at" => "23.0", "idm_pv_surplus_enable" => "1", "idm_pv_surplus_max_kw" => "2.0", "idm_pv_surplus_min_kw" => "0.8", "idm_pv_surplus_ramp_kw" => "0.2", "idm_pv_surplus_deadband_kw" => "0.1", "idm_pv_surplus_heartbeat_s" => "60", "idm_pv_surplus_min_write_interval_s" => "10", "shelly_sg_ip" => "", "shelly_pause_ip" => "", "auto_mode" => "1", "grid_start_limit" => "-3500", "pv_boost_delay" => "30",
     "stop_delay_minutes" => "10", "wp_min_runtime_min" => "30", "wp_restart_block_min" => "20", "min_soc" => "80", "heizgrenze_temp" => "10.0", "wws" => "50.0", "www" => "48.0", "hz" => "32.0", "khl" => "16.0",
+    "wp_pv_max_power_w" => "0", "wp_pv_battery_limit_wh" => "0", "wp_pv_grid_limit_wh" => "0",
+    "wp_pv_battery_max_w" => "0", "wp_pv_grid_max_w" => "0", "wp_pv_reaction_s" => "30",
+    "wp_pv_start_wait_s" => "600", "wp_pv_handoff_timeout_s" => "120",
     "price_boost_enable" => "0", "heat_price_boost_scope" => "both", "heat_price_boost_windows" => "",
     "price_limit" => "20.0", "price_hard_limit" => "-99.0", "price_pause_limit" => "35.0", "price_min_duration" => "60",
     "price_max_daily" => "180", "manual_boost_max_duration" => "180", "manual_boost_min_soc" => "25", "wq_min_temp" => "1.0",
@@ -881,8 +884,16 @@ $tooltips = [
     "grid_start_limit"       => "Einspeisung in Watt ab der der WP-Boost gestartet wird. Negativ = Einspeisung! z.B. -4500 = Boost erst ab 4500W Einspeisung.",
     "pv_boost_delay"         => "Verzögerung in Sekunden bevor der PV-Boost ausgelöst wird (verhindert Wolken-Flatter). Standard: 30s.",
     "stop_delay_minutes"     => "Minuten nach denen der Boost gestoppt wird wenn das Limit unterschritten bleibt. Standard: 10 Min.",
-    "wp_min_runtime_min"     => "Mindestlaufzeit eines PV-Boosts in Minuten. Verhindert kurze Wärmepumpen-Takte; Notreserve und starker Netzbezug dürfen trotzdem hart stoppen.",
+    "wp_min_runtime_min"     => "Luxtronik: Schutzzeit ab bestätigtem Verdichterstart. Nur benannte Schutzfunktionen wie Nutzer-Aus, Gerätestörung, Notstromreserve oder Hausanschlussgrenze dürfen sie verkürzen; gewöhnlicher Netzbezug und Budgetwechsel nicht. Die Wärmepumpe darf ihren Takt selbst beenden.",
     "wp_restart_block_min"   => "Wiedereinschaltsperre nach einem PV-Boost-Stopp in Minuten. Glättet Wolkenwechsel und verhindert Start/Stop-Pendeln.",
+    "wp_pv_max_power_w"      => "Luxtronik: belegte maximale elektrische Aufnahme innerhalb der WP-Messgrenze, einschließlich dort erfasster Pumpen und möglicher Zusatzheizung. Keine thermische Heizleistung und keine Startschwelle. 0 = Profil fehlt, neue optionale PV-Starts warten.",
+    "wp_pv_battery_limit_wh" => "Maximale Akkuenergie für optionale PV-Überbrückung in den jeweils letzten 24 Stunden. Verbrauch und gebundene Energie bleiben bei Wolkenwechseln und Neustarts erhalten. 0 = keine Akkuüberbrückung.",
+    "wp_pv_grid_limit_wh"    => "Maximale Netzenergie für optionale PV-Überbrückung in den jeweils letzten 24 Stunden. Dieses Kontingent erlaubt begrenzten Netzbezug; spätere Einspeisung erstattet keine verbrauchten Wh. 0 = keine Netzüberbrückung.",
+    "wp_pv_battery_max_w"    => "Maximale für die WP erlaubte Akku-Überbrückungsleistung. Tatsächliche Speichergrenzen, Notstromreserve und andere gebundene Verbraucher gelten zusätzlich. 0 = keine Akkuüberbrückung.",
+    "wp_pv_grid_max_w"       => "Maximale für die WP erlaubte Netz-Überbrückungsleistung. Hausanschlussgrenzen gelten zusätzlich. Leistung in W und Energiekontingent in Wh müssen beide ausreichen. 0 = keine Netzüberbrückung.",
+    "wp_pv_reaction_s"       => "Für das Geräteprofil anzusetzende Reaktionsfrist einschließlich Messalter, Steuerung und wirksamer Lastanpassung. Standard 30 Sekunden ist eine Planungsannahme und muss zur Anlage passen; keine garantierte Herstellergrenze.",
+    "wp_pv_start_wait_s"     => "Wartefrist auf einen tatsächlich gestarteten Verdichter nach dem WP-Auftrag. Mindestens 600 Sekunden. Danach wird der ungenutzte PV-Auftrag unter Beachtung der Schutzzeiten zurückgenommen; seine Wirkung bleibt bis zur Klärung gebunden.",
+    "wp_pv_handoff_timeout_s" => "Wartefrist auf die tatsächlich gesunkene Wallboxleistung vor dem WP-Startauftrag. Standard 120 Sekunden. Diese Frist beginnt vor der gesonderten Prüfung des gesendeten WP-Befehls.",
     "min_soc"                => "Minimaler Batterie-SoC (%) unter dem der WP-Boost nie gestartet wird. Dient dem Notreserve-Schutz.",
     "heizgrenze_temp"        => "Außentemperatur (°C) unter der Heizungs-Boost aktiviert wird. Standard: 10°C.",
     "wws"                    => "Warmwasser-Solltemperatur Sommer (°C). Luxtronik/IDM: Register-Sollwert für Software-Thermostat.",
@@ -3460,6 +3471,8 @@ $groups = [
         "ww_timer_enable", "wwvon", "wwbis", "ww_normal", "ww_eco", "ww_circ_von", "ww_circ_bis", "ww_circ_on", "ww_circ_off", "ww_circ_boost",
         "wq_min_temp", "rl_source", "manual_boost_min_soc", "manual_boost_max_duration",
         "auto_mode", "grid_start_limit", "pv_boost_delay", "stop_delay_minutes", "wp_min_runtime_min", "wp_restart_block_min",
+        "wp_pv_max_power_w", "wp_pv_battery_limit_wh", "wp_pv_grid_limit_wh", "wp_pv_battery_max_w", "wp_pv_grid_max_w",
+        "wp_pv_reaction_s", "wp_pv_start_wait_s", "wp_pv_handoff_timeout_s",
         "consumer_priority_order", "consumer_priority_wp_runon_s",
         "pv_pause_enable", "pv_pause_soc", "pv_pause_watt", "pv_pause_timeout_minutes", "pv_pause_min_at", "pv_pause_max_temp_drop", "luxtronik_pause_setpoint_c",
         "matter_bridge"
@@ -5988,19 +6001,61 @@ async function readConfirmedConfigJson(response) {
                     <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['pv_boost_delay'] ?? '') ?>">Start-Verzögerung (Sek)</label>
                     <input type="number" name="values[pv_boost_delay]" class="form-control config-input" value="<?= $val('pv_boost_delay') ?>" placeholder="<?= $defaults['pv_boost_delay'] ?>">
                 </div>
+                <?php if ($wp_type_val !== '0'): ?>
                 <div class="col-6 col-md-4">
                     <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['stop_delay_minutes'] ?? '') ?>">Stop-Verzögerung (Min)</label>
                         <input type="number" name="values[stop_delay_minutes]" class="form-control config-input" value="<?= $val('stop_delay_minutes') ?>" placeholder="<?= $defaults['stop_delay_minutes'] ?>">
                     </div>
+                <?php endif; ?>
                 <div class="col-6 col-md-4">
                     <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wp_min_runtime_min'] ?? '') ?>">Mindestlaufzeit (Min)</label>
-                    <input type="number" min="0" name="values[wp_min_runtime_min]" class="form-control config-input" value="<?= $val('wp_min_runtime_min') ?>" placeholder="<?= $defaults['wp_min_runtime_min'] ?>">
+                    <input type="number" min="<?= $wp_type_val === '0' ? '1' : '0' ?>" name="values[wp_min_runtime_min]" class="form-control config-input" value="<?= $val('wp_min_runtime_min') ?>" placeholder="<?= $defaults['wp_min_runtime_min'] ?>">
                 </div>
                 <div class="col-6 col-md-4">
                     <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wp_restart_block_min'] ?? '') ?>">Wiedereinschaltsperre (Min)</label>
                     <input type="number" min="0" name="values[wp_restart_block_min]" class="form-control config-input" value="<?= $val('wp_restart_block_min') ?>" placeholder="<?= $defaults['wp_restart_block_min'] ?>">
                 </div>
                 </div>
+                <?php if ($wp_type_val === '0'): ?>
+                <div class="border rounded p-3 mb-3">
+                    <h6 class="small fw-bold mb-2">Luxtronik: Leistungsprofil und Energie zur Überbrückung</h6>
+                    <p class="small text-muted mb-2">Vor einem zusätzlichen PV-Start müssen Leistung und Energie für die geschützte Laufzeit einschließlich Startwartezeit und Reaktion gedeckt sein. Trage die belegte maximale elektrische Aufnahme innerhalb der WP-Messgrenze ein; die Start-Grenze ist dafür kein Ersatz. Pumpen und eine mögliche Zusatzheizung müssen korrekt berücksichtigt sein.</p>
+                    <div class="row g-2">
+                    <?php foreach ([
+                        'wp_pv_max_power_w' => 'Maximale elektrische WP-Aufnahme (W)',
+                        'wp_pv_battery_max_w' => 'Akkuüberbrückung: Leistung (W)',
+                        'wp_pv_battery_limit_wh' => 'Akkuüberbrückung: Energie in 24 h (Wh)',
+                        'wp_pv_grid_max_w' => 'Netzüberbrückung: Leistung (W)',
+                        'wp_pv_grid_limit_wh' => 'Netzüberbrückung: Energie in 24 h (Wh)',
+                    ] as $wpPvKey => $wpPvLabel): ?>
+                        <div class="col-12 col-md-6">
+                            <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap[$wpPvKey] ?? '') ?>"><?= htmlspecialchars($wpPvLabel) ?></label>
+                            <input type="number" min="0" step="1" name="values[<?= htmlspecialchars($wpPvKey) ?>]" class="form-control config-input" value="<?= $val($wpPvKey) ?>" placeholder="<?= $defaults[$wpPvKey] ?>">
+                            <?= $configValidationMarker($wpPvKey) ?>
+                        </div>
+                    <?php endforeach; ?>
+                    </div>
+                    <p class="small text-muted mt-2 mb-1">0 W beim Leistungsprofil bedeutet: neue optionale PV-Starts warten. Bei einer Quelle sperrt 0 W oder 0 Wh deren Überbrückung. Die Wh-Grenzen gelten rollierend für 24 Stunden; Wolkenwechsel, neue Sollwerte und Neustarts füllen sie nicht neu. Normale Heizung und Warmwasser bleiben unabhängig.</p>
+                    <?= $configValidationMarker('wp_pv_energy_reservation') ?>
+                    <details class="mt-2">
+                        <summary class="small fw-bold">Fristen für das Geräteprofil</summary>
+                        <p class="small text-muted mt-2 mb-2">Diese Planungsfristen müssen zur tatsächlichen Messung und Geräteantwort passen. Sie sind keine garantierten Herstellerzeiten.</p>
+                        <div class="row g-2">
+                        <?php foreach ([
+                            'wp_pv_reaction_s' => ['Reaktionsfrist (s)', 1],
+                            'wp_pv_start_wait_s' => ['Verdichter-Startwartefrist (s)', 600],
+                            'wp_pv_handoff_timeout_s' => ['Übergabefrist Wallbox (s)', 1],
+                        ] as $wpPvKey => $wpPvField): ?>
+                            <div class="col-12 col-md-4">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap[$wpPvKey] ?? '') ?>"><?= htmlspecialchars($wpPvField[0]) ?></label>
+                                <input type="number" min="<?= $wpPvField[1] ?>" step="1" name="values[<?= htmlspecialchars($wpPvKey) ?>]" class="form-control config-input" value="<?= $val($wpPvKey) ?>" placeholder="<?= $defaults[$wpPvKey] ?>">
+                                <?= $configValidationMarker($wpPvKey) ?>
+                            </div>
+                        <?php endforeach; ?>
+                        </div>
+                    </details>
+                </div>
+                <?php endif; ?>
                 <div class="row g-2 mb-2">
                     <div class="col-6 col-md-3">
                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['min_soc'] ?? '') ?>">Min SoC (%)</label>

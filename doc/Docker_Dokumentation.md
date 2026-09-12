@@ -2,10 +2,18 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.6b`. Die Tags `latest`, `v5.4.6b` und
-`5.4.6b` bezeichnen denselben Stable-Stand.
+Der aktuelle Stable-Stand ist `v5.4.6c`. Die Tags `latest`, `v5.4.6c` und
+`5.4.6c` bezeichnen denselben Stable-Stand.
 
-5.4.6b startet EMS-Python-Dienste mit dem eigenen unprivilegierten Konto
+5.4.6c enthält außerdem die begrenzte Phasenerkennung fester E3DC-Wallboxen,
+die korrigierte Zuteilung zwischen mehreren Ladepunkten und geschützte
+Luxtronik-PV-Aufträge. Vor optionalem Wärmepumpen-PV-Boost das elektrische
+Leistungsprofil und erlaubte Überbrückungskontingente im Config Editor prüfen.
+Ältere Compose-Versionen dürfen bei bekannten Altvorlagen den Standardwert
+`external: false` ausdrücklich ausgeben; externe Volumes werden dadurch nicht
+freigegeben.
+
+5.4.6c startet EMS-Python-Dienste mit dem eigenen unprivilegierten Konto
 `e3dc-runtime`. Private Modelle und Prognosebelege werden vor dem Start geprüft
 und übernommen. Der aktuelle Host-Updater ist auch für den Rückfall auf ältere
 Root-Images erforderlich. Vor dem Upgrade den tatsächlich verwendeten Helfer
@@ -15,6 +23,72 @@ Zusätzlich steht eine ausdrücklich wählbare Bridge-Vorlage für kompatible
 Named-Volume-Installationen bereit. Hostnetz bleibt Standard. Vor einem Wechsel
 die unten beschriebenen Sicherungs-, Netzwerk- und Wallbox-Wartungshinweise
 beachten. Einzelheiten stehen in den [Release Notes](../RELEASE_NOTES.md).
+
+## Containerweiter Privilegienschutz und ältere Kernel
+
+Die mitgelieferten Compose-Vorlagen begrenzen den gesamten E3DC-Container mit
+`security_opt: [no-new-privileges:true]`. Der aktuelle Host-Updater ergänzt
+bekannte bisherige Standardvorlagen kontrolliert um diesen Schutz. Ein
+zusätzliches `user:` ist dafür weder erforderlich noch zulässig. Unbekannte
+Sicherheitsoptionen und beliebige zusätzliche Compose-Dateien werden dadurch
+nicht automatisch freigegeben.
+
+Auf älteren Kerneln, insbesondere Linux 4.4, fehlt das spätere
+`NoNewPrivs`-Feld in `/proc/<pid>/status`. Die Laufzeit prüft dort zusätzlich
+das Kernelbit direkt. Der Schutz muss bereits am gesamten Container anliegen,
+damit sowohl der Startprozess als auch spätere Docker-exec- und
+Healthcheck-Prozesse gebunden sind. Gruppen, UID und sämtliche
+Capability-Felder werden weiterhin geprüft.
+
+Installationen mit einem lokalen Korrekturimage und einer zusätzlichen
+Compose-Datei benötigen vor dem normalen Update den zu diesem Korrekturpaket
+gehörenden Übergang. Die zusätzliche Datei nicht blind entfernen und vorher
+weder das gebundene Altimage noch den zur Rücknahme benötigten Helfer ersetzen.
+Deren unveränderte Bindung wird für die kontrollierte Rücknahme benötigt.
+
+### Wechsel vom lokalen Kernel-4.4-Korrekturpaket R2
+
+Dieser Abschnitt gilt ausschließlich für das lokale Paket
+`e3dc-feldfix-5.4.6b-k44-r2` mit seiner ursprünglichen Sicherung. Dessen
+Rücknahme stellt das damals gebundene offizielle Image mit denselben fünf
+Datenvolumes **gestoppt** wieder her. Erst danach übernimmt der aktuelle
+Host-Updater den regulären Versionswechsel.
+
+Bei beendeter Fahrzeugladung und ohne laufenden Phasenwechsel zuerst den
+passenden Sicherungsordner einsetzen und die Rücknahme ausführen:
+
+```bash
+sudo python3 ./e3dc-feldfix-5.4.6b-k44-r2/feldfix.py zurueck \
+  --compose-dir . \
+  --backup-dir "/absoluter/pfad/zur/ursprünglichen-feldfix-sicherung"
+```
+
+**Vor diesem Schritt weder den alten Host-Helfer ersetzen noch ein neues Image
+pullen.** Die Rücknahme prüft die ursprüngliche Image-ID, die fünf Volumes und
+die Hashes von Compose, `.env`, Ergänzungsdatei und Helfer. Bei einer abweichenden
+Bindung anhalten und die Abweichung prüfen; keine Prüfung umgehen. Die
+zurückgestellte Altinstanz nicht manuell starten.
+
+Nach bestätigter Rücknahme den neuen offiziellen Helfer herunterladen und
+installieren, anschließend das Ziel ausdrücklich wählen:
+
+```bash
+curl -q -fsS --proto '=https' --tlsv1.2 \
+  -o ./docker_compose_update-5.4.6c.py \
+  https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control/v5.4.6c/Installer/docker_compose_update.py
+if [ ! -d ./Installer ]; then
+  sudo install -d -m 0755 ./Installer
+fi
+sudo install -m 0644 ./docker_compose_update-5.4.6c.py ./Installer/docker_compose_update.py
+sudo python3 ./Installer/docker_compose_update.py \
+  --compose-dir . --sudo --image-tag v5.4.6c
+```
+
+Der aktuelle Helfer akzeptiert die gebundene gestoppte Altinstanz, ergänzt bei
+bekannter Standardvorlage den containerweiten Privilegienschutz und erhält die
+Volumezuordnung. Scheitert der Wechsel, wird eine bereits vorher gestoppte
+Altinstanz beim Rückfall nicht unaufgefordert gestartet. Die ursprüngliche
+Sicherung bis zur bestätigten Funktion der neuen Version behalten.
 
 Seit 5.4.5a gibt es zusätzlich die rein lesende Anzeige eines frisch beobachteten
 openWB-Fahrzeug-SoC samt Quelle und Alter. Ohne eindeutige Zuordnung zur
@@ -439,7 +513,7 @@ unverändert gesperrt und benötigen eine manuelle Prüfung.
 
 Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
 `latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.6b` in der Datei `.env`
+bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.6c` in der Datei `.env`
 gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
 Image.
 
@@ -466,7 +540,7 @@ Versionswahl.
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.6b` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.6c` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash
@@ -752,7 +826,7 @@ Port, etwa `E3DC_PUBLISH_BIND=192.0.2.20` und `E3DC_PUBLISH_PORT=8085`.
 Verwende denselben Compose-Ordner und Projektnamen. Sichere vorher die
 funktionierende `docker-compose.yml` als `docker-compose.host.bak`, die
 vorhandene `.env` und die persistenten Daten. Halte den aktuell eingesetzten
-versionierten Runtime-Image-Tag für den Rückweg fest, beispielsweise `v5.4.6b`.
+versionierten Runtime-Image-Tag für den Rückweg fest, beispielsweise `v5.4.6c`.
 Ein älterer Root-Tag eignet sich nicht für diesen ersten Netzwerk-Rückweg.
 Prüfe eine administrativ zugängliche Kopie der aktuellen
 Konfiguration, ohne ihren Inhalt auszugeben:

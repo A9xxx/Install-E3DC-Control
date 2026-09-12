@@ -37,8 +37,60 @@ Hysterese- und Schutzlogik, nutzt aber je Wallbox den passenden Treiber.
 | `Aus` | NGNA: E3DC-Control beobachtet nur. Eine Standardfreigabe wird nur einmalig nach bewusstem Wechsel auf `Aus` in der WebUI gesendet. |
 | `PV-Kurve ruhig` | Lädt entlang der Speicher-Ladekurve mit Hysterese. Der Hausspeicher behält Vorrang, wenn die Prognose knapper wird. |
 | `Grundladung stabil` | Hält eine ruhige Grundladung, solange das Speicherziel laut Planung erreichbar bleibt. |
-| `PV + Akku bis Untergrenze` | Erlaubt dem Auto PV plus Hausspeicher nur oberhalb der Hausakku-Untergrenze; Netz bleibt außen vor. |
+| `PV + Akku bis Untergrenze` | Nutzt PV und oberhalb der Hausakku-Untergrenze zusätzlich den Speicher. Die unten beschriebene begrenzte Phasenerkennung darf kurz Netzleistung überbrücken. |
 | `Sofort bis Preislimit` | Netzladen nur, wenn der aktuelle Preis unter dem Wallbox-Preislimit liegt. |
+
+## Phasenerkennung an einer festen Wallbox
+
+Bei einer durch Python stromgeregelten E3DC-Wallbox ohne nutzbare Phasenumschaltung
+kann ein unbekanntes Fahrzeug mit 6 A gestartet werden, sobald mindestens
+1.380 W echter, zentral freigegebener PV-Anteil verfügbar sind. Die 6 A gelten
+je genutzter Phase: Das Fahrzeug beziehungsweise das Kabel bestimmt, ob daraus
+ungefähr 1,38, 2,76 oder 4,14 kW werden. Es erfolgt kein Phasenwechselbefehl.
+Die Grundbedeutung der Stromvorgabe ist in der
+[Herstellerbeschreibung zu IEC 61851](https://infosys.beckhoff.com/content/1031/el6761/18724365579.html)
+erläutert.
+
+Reicht das PV-Angebot zunächst nicht für die mögliche dreiphasige Last, muss
+der zentrale Leistungsentscheider die fehlende Leistung ausdrücklich freigeben.
+Netzleistung bleibt dabei durch die Hausanschlussgrenzen begrenzt; eine gesperrte
+oder erschöpfte Batterie ist keine Voraussetzung für diese Netzüberbrückung.
+Die Batterie darf nur innerhalb ihrer eigenen Leistungs- und Reservegrenzen
+beitragen. `Aus`, fehlende Freigaben, ungültige Messwerte und harte
+Schutzgrenzen verhindern die Probe.
+
+Für diese Erkennung gilt ein gemeinsames Konto für alle Wallboxen mit höchstens
+40 Wh und genau einem Probeversuch zur selben Zeit. Eine kleinere konfigurierte
+Wh-Stoppgrenze bleibt wirksam. Der mögliche Verbrauch wird vor dem Start privat
+gespeichert; das Erkennungsfenster dauert höchstens 30 Sekunden. Der Wh-Wert
+beschreibt die konservativ berechnete PV-Deckungslücke, keine getrennte Messung
+der Batterieenergie. Fehlende oder widersprüchliche Messwerte beenden die
+Überbrückung konservativ.
+
+Während einer reservierten Probe startet kein weiterer ruhender Ladepunkt aus
+dieser Zusage. Bereits laufende Ladungen bleiben in der gemeinsamen Zuteilung
+berücksichtigt; eine ausdrücklich konfigurierte Wallboxpriorität bleibt wirksam.
+
+Mehrere frische, vollständige Phasenmessungen bei stabilen 6 A bestätigen die
+benutzten Phasen. Im laufenden Dienst bleiben diese bei Ladepausen und 0 W
+erhalten. Erst bestätigtes Abstecken beginnt die Erkennung erneut. Eine später
+zusätzlich gemessene Phase erhöht die angesetzte Last sofort. Fehlen nach einem
+Dienstneustart sichere Belege für die unveränderte Steckepisode, wird die
+Phasenzahl erneut konservativ ermittelt.
+
+Deckt die PV-Leistung die erkannte Last, geht die Ladung ohne erzwungenen Stopp
+in die normale Regelung über. Andernfalls beendet der Wh- oder Zeitwächter die
+Probe. Nach einem solchen Stopp gibt es in derselben Stecksession keine weitere
+Überbrückungsprobe; eine normale Ladung mit ausreichendem PV-Angebot bleibt
+unter den bestehenden Wiederanlaufzeiten möglich. Abstecken und Dienstneustart
+löschen den verbrauchten Anteil nicht. Nur fortlaufend belegte tatsächliche
+PV-Ladung baut die Defizitschuld langsam wieder ab.
+
+Herstellereigene efy-Automatik, go-e und die Rollensteuerung einer normalen
+openWB behalten ihre eigenen Startpfade. Geräte mit einem Mindeststrom oberhalb von
+6 A erhalten keine 6-A-Probe; für sie gilt weiterhin die normale konservative
+Startzuteilung. Ohne vollständige Phasenmessung wird keine kleinere Phasenzahl
+behauptet. Es ist keine zusätzliche Konfiguration erforderlich.
 
 ## Budget beim Ende der tatsächlichen Ladung
 

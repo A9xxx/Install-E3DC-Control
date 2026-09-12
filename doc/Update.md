@@ -5,13 +5,13 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.4.6b`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.4.6c`. Das Dashboard startet ausschließlich
 den argumentlosen, root-eigenen Systemjob. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
 
-5.4.6b korrigiert Docker-Start und Host-Update. Die seit 5.4.6 verwendete
+5.4.6c ergänzt die begrenzte Wallbox-Phasenerkennung und geschützte Luxtronik-PV-Aufträge. Vor optionalen PV-Boosts müssen das elektrische Leistungsprofil und die erlaubten Überbrückungskontingente im Config Editor eingetragen sein. Die [Luxtronik-Dokumentation](Luxtronik.md) erklärt die Einrichtung. Die Docker-Start- und Host-Updatekorrekturen sind weiterhin enthalten. Die seit 5.4.6 verwendete
 unprivilegierte EMS-Laufzeit und der optionale Bridge-Betrieb bleiben erhalten. Vor dem Imagewechsel den tatsächlich verwendeten
 Host-Updater aktualisieren, einschließlich einer gegebenenfalls direkt im
 Compose-Ordner vorhandenen Kopie. Ein Containerimage ersetzt diese Hostdatei

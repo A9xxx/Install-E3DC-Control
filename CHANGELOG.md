@@ -6,6 +6,24 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.6c] – 2026-09-12
+
+### Wallboxen und Phasenerkennung
+
+- Begrenzter 6-A-Erkennungsstart für feste Python-E3DC-Wallboxen, belastbare 1/2/3-Phasenmessung und Erhalt der Phasenkenntnis über Ladepausen. Gemeinsames privates Konto mit höchstens 40 Wh und 30 Sekunden; fehlende Messungen oder Schutzgrenzen beenden die Probe.
+- Korrigierte Zuteilung bei mehreren Wallboxen und nicht mehr angenommener Fahrzeugleistung. Laufende Ladungen, Erkennungsprobe, Phasenwechsel und CP-Wiederanlauf erhalten gegenseitig gebundene Leistungsfreigaben. Ein rein lesender Backendmodus erzeugt keine Probe.
+- Eigene verbrauchte Defizitstopps erlauben einen späteren normalen PV-Wiederanlauf; Nutzer-Aus, fremde Stopps und Phasenwechselschutz bleiben wirksam.
+
+### Wärmepumpe
+
+- Getrennte Luxtronik-Aufträge für Heizung und Warmwasser verhindern unberechtigte optionale Boosts und verlorene Heizungsfreigaben. Verbraucherpriorität und Wallboxrest folgen der tatsächlich angenommenen Leistung.
+- Physische Verdichter-Mindestlaufzeit, kontrollierte Leistungsübergabe und dauerhaft gespeicherte Akku-/Netz-Wh-Grenzen schützen optionale PV-Starts.
+
+### Docker und Updatehinweise
+
+- Bekannte Compose-Altvorlagen dürfen den Standardwert `external: false` ausdrücklich ausgeben. Ältere Kernel können den Privilegienschutz ohne das spätere proc-Statusfeld nachweisen; die erforderliche Containerbeschränkung bleibt verbindlich.
+- Luxtronik-Nutzer hinterlegen vor optionalem PV-Boost das elektrische Leistungsprofil und erlaubte Überbrückungskontingente. Docker-Nutzer aktualisieren zuerst den Host-Updater und beachten Sicherung und Wartungsfenster. Details in den [Release Notes](RELEASE_NOTES.md).
+
 ## [5.4.6b] – 2026-09-11
 
 ### Docker-Korrekturupdate

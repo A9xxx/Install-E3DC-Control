@@ -57,6 +57,8 @@ from Wallbox.modes import (  # noqa: E402
 from Wallbox import phase_transition as wallbox_phase_transition_policy  # noqa: E402
 from Wallbox import start_hold as wallbox_start_hold_policy  # noqa: E402
 import consumer_priority  # noqa: E402
+import heatpump_pv_contract as heatpump_pv_policy  # noqa: E402
+import heatpump_pv_state as heatpump_pv_checkpoint  # noqa: E402
 from Storage.regulation_switch import (  # noqa: E402
     StorageRegulationSwitch,
     read_storage_regulation_config,
@@ -4529,6 +4531,7 @@ def augment_consumer_live(
         "Heatpump_Start_Ready",
         "Heatpump_Start_Request_W",
         "Heatpump_Start_Demand_Class",
+        "Heatpump_PV_Contract",
         "Heatpump_Budget_Offered",
         "Heatpump_Signal_Active_Confirmed",
         "Heatpump_Signal_Readback_TS",
@@ -4680,6 +4683,14 @@ def augment_consumer_live(
             merged["Heatpump_Withdrawal_Source"] = heatpump[
                 "budget_withdrawal_source"
             ]
+
+    # Der neue PV-Bedarf bleibt ein eigener typisierter Vertrag. Die reine
+    # Policy prüft Frische, Kanal- und Auftragsbindung vor jeder Freigabe.
+    # Vorbelegte Live-Daten dürfen diesen Energy-Manager-Vertrag nicht ersetzen.
+    if str(cfg.get("wp_type", "")).strip() == "0":
+        pv_demand = heatpump.get("pv_contract")
+        if isinstance(pv_demand, dict):
+            merged["Heatpump_PV_Contract"] = copy.deepcopy(pv_demand)
 
     heater = heater_status if isinstance(heater_status, dict) else {}
     if shelly_3em_heatpump:
@@ -11708,6 +11719,40 @@ def apply_storage_dc_first_charge_limit(
     result["mode"] = MODE_AUTO
     result["val"] = applied_limit_w
     result["storage_req_w"] = applied_limit_w
+    # Der Verbraucherrest wurde vor der Begrenzung des Laderahmens berechnet.
+    # Eine freigewordene Planreservierung darf nur durch aktuell gemessenen
+    # PV-Export gedeckt werden. Die noch nicht aufgenommene Ladeleistung des
+    # neuen Rahmens bleibt dabei reserviert; Akkuentladung öffnet kein Budget.
+    consumer_release_w = 0
+    if (
+        source.get("valid") is True
+        and str(result.get("state") or "") in {
+            "parallel_curve_charge", "parallel_curve_charge_cap",
+            "parallel_curve_auto_charge", "parallel_curve_auto_hold", "parallel_auto",
+        }
+        and not result.get("protected")
+        and not result.get("force_wallbox_stop")
+        and safe_float(source.get("battery_power_w"), -1.0) >= 0.0
+    ):
+        base_budget_w = max(0, safe_int(bound_decision.get("budget_w"), 0))
+        reserved_w = min(
+            planner_limit_w,
+            max(0, safe_int(bound_decision.get("storage_req_w"), 0)),
+        )
+        released_reservation_w = max(0, reserved_w - applied_limit_w)
+        measured_residual_w = max(0, min(
+            safe_int(source.get("no_import_cap_w"), 0) - applied_limit_w,
+            -safe_int(source.get("grid_w"), 0)
+            - safe_int(source.get("no_import_margin_w"), 100),
+            safe_int(source.get("total_pv_w"), 0) - applied_limit_w,
+        ))
+        consumer_release_w = min(
+            released_reservation_w,
+            max(0, measured_residual_w - base_budget_w),
+        )
+        if consumer_release_w > 0:
+            result["budget_w"] = base_budget_w + consumer_release_w
+    result["storage_dc_first_consumer_release_w"] = consumer_release_w
     owner_context = (
         result.get("direct_marketing_pv_store_control")
         if isinstance(result.get("direct_marketing_pv_store_control"), dict)
@@ -20070,6 +20115,19 @@ def apply_wallbox_start_hold_decision(
     )
     base_budget_w = max(0, safe_int(result.get("budget_w"), 0))
     storage_request_w = max(0, safe_int(result.get("storage_req_w"), 0))
+    fixed_detection = any(
+        isinstance(item, dict) and item.get("request_kind") == "fixed_phase_detection"
+        for item in intent.get("requests", [])
+    )
+    if fixed_detection:
+        # Nur der typisierte, privat vorreservierte Erkennungsstart darf den
+        # kurzen Netzanteil verwenden. Der alte Start-Hold bleibt unverändert.
+        return apply_wallbox_fixed_start_sources(
+            cfg, live, wallbox_intent, intent, result, previous,
+            now_s=now_s, hard_blockers=hard_blockers,
+            battery_support_allowed=battery_support_allowed,
+            max_discharge_w=max_discharge_w,
+        )
     grant = wallbox_start_hold_policy.arbitrate_grants(
         intent.get("requests", []),
         base_budget_w=base_budget_w,
@@ -20223,6 +20281,90 @@ def apply_wallbox_start_hold_decision(
             safe_float(grant.get("used_deficit_wh"), 0.0),
         )
     )[:220]
+    return result
+
+
+def apply_wallbox_fixed_start_sources(
+    cfg, live, wb_intent, intent, decision, previous, *, now_s,
+    hard_blockers, battery_support_allowed, max_discharge_w,
+):
+    """Bindet die Probe an frische Quellen und einen flüchtigen Entladerahmen."""
+    result = dict(decision)
+    blockers = list(hard_blockers)
+    values = {}
+    for key in ("PV_Power", "Home_Power", "Battery_Power", "Grid_Power", "Wallbox_Power"):
+        value = live.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            blockers.append("fixed_probe_source_unknown")
+        else:
+            values[key] = float(value)
+    if (live.get("RSCP_Sample_Valid") is False or live.get("Power_Decision_Usable") is False
+        or live.get("Grid_Power_Valid") is False):
+        blockers.append("fixed_probe_source_invalid")
+    # Bestehende Wärmeschutzbindung wird nicht durch einen optionalen Start
+    # auf einen anderen Speicherowner umgestellt.
+    old_wp = (((previous.get("budget") or {}).get("consumer_budget_contract") or {})
+              .get("heatpump_pv_contract") or {})
+    if old_wp.get("hold_required") or old_wp.get("command_outstanding"):
+        blockers.append("protected_heatpump_source_binding")
+    wallbox_w = max(0, int(values.get("Wallbox_Power", 0)))
+    house_cap = house_heatpump_discharge_cap_w(live, wallbox_w, max_discharge_w)
+    prior_auto = result.get("auto_limit") or {}
+    if isinstance(prior_auto, dict) and prior_auto.get("enabled") is True:
+        house_cap = min(house_cap, max(0, safe_int(prior_auto.get("max_discharge_w"), 0)))
+    grid_room = grid_charge_room_w(cfg, live)
+    grid_power = max(0.0, values.get("Grid_Power", 0.0))
+    amps = max(0.0, safe_float(cfg.get("grid_max_amps"), 0.0))
+    actual_grid_room = max(0.0, (amps - max(0.0, safe_float(cfg.get("grid_max_reserve_amp"), 2.0))) * 690.0 - grid_power)
+    peak = result.get("peak_shaving") or {}
+    peak_room = safe_float(peak.get("grid_import_headroom_w"), float("inf")) if isinstance(peak, dict) else float("inf")
+    grid_available = max(0, int(min(max(0, grid_room), actual_grid_room, max(0.0, peak_room)))) if grid_room is not None else 0
+    base = max(0, safe_int(result.get("budget_w"), 0))
+    storage_request = max(0, safe_int(result.get("storage_req_w"), 0))
+    # PCC und die gebundene WB-Istleistung liefern den bereits verfügbaren
+    # PV-Anteil. Eine Batterieentladung wird dabei ausdrücklich abgezogen.
+    battery_power = values.get("Battery_Power", 0.0)
+    pv_frame = max(0, int(wallbox_w - values.get("Grid_Power", 0.0) - max(0.0, -battery_power)))
+    grant_pv_base = pv_frame
+    # Nur real laufende und bilanziell PV-gedeckte Speicherladung kann durch
+    # Rücknahme zusätzliche PV liefern; Netzladung und bloße Sollwerte nicht.
+    charge_available = min(storage_request, max(0, int(battery_power)),
+                           max(0, int(battery_power - max(0.0, values.get("Grid_Power", 0.0)))))
+    grid_already_bound = min(grid_power, max(0, wallbox_w - pv_frame))
+    if grid_room is not None:
+        grid_available = max(0, int(min(max(0, grid_room) + grid_already_bound,
+            actual_grid_room + grid_already_bound, max(0.0, peak_room) + grid_already_bound)))
+    grant = wallbox_start_hold_policy.arbitrate_grants(
+        intent.get("requests", []), base_budget_w=grant_pv_base,
+        grid_import_w=grid_power, previous=previous.get("wallbox_start_hold_grants"),
+        now_ts=now_s, hard_blockers=blockers,
+        battery_support_allowed=battery_support_allowed,
+        storage_charge_request_w=charge_available,
+        fixed_battery_available_w=max(0, int(max_discharge_w) - house_cap) if battery_support_allowed else 0,
+        fixed_grid_available_w=grid_available,
+        fixed_real_pv_w=grant_pv_base + charge_available,
+        hard_import_w=max(1200.0, safe_float(cfg.get("wb_pv_hard_import_w"), 2500.0)),
+        clock_sample=control_time.sample(wall_ts=now_s),
+    )
+    result["wallbox_start_hold_intent"] = intent
+    result["wallbox_start_hold_grants"] = grant
+    if not grant.get("active"):
+        return result
+    discharge = min(max(0, int(max_discharge_w)), house_cap + max(0, safe_int(grant.get("discharge_support_w"), 0)))
+    # Der zusätzlich bewilligte Netz-/Akkuanteil bleibt WB-exklusiv. Er wird
+    # niemals als gemeinsame PV an WP oder Heizstab weitergegeben.
+    result.update({
+        "budget_w": base,
+        "storage_req_w": max(0, storage_request - safe_int(grant.get("charge_reduction_w"), 0)),
+        "mode": MODE_DISCH if discharge > 0 else MODE_IDLE,
+        "val": discharge, "auto_limit": {},
+        "wallbox_fixed_start_set_power_only": True,
+        "wallbox_fixed_start_output": {"mode": MODE_DISCH if discharge > 0 else MODE_IDLE, "val": discharge},
+        "wallbox_fixed_start_support_w": safe_int(grant.get("required_group_minimum_w"), 0),
+        "wallbox_fixed_start_grid_support_w": safe_int(grant.get("grid_support_w"), 0),
+        "wallbox_start_hold_charge_reduction_w": safe_int(grant.get("charge_reduction_w"), 0),
+        "wallbox_start_hold_discharge_support_w": safe_int(grant.get("discharge_support_w"), 0),
+    })
     return result
 
 
@@ -20419,6 +20561,296 @@ def validated_wallbox_phase_probe_request(
     }
 
 
+def heatpump_pv_source_contract(
+    cfg: Dict[str, Any], live: Dict[str, Any], decision: Dict[str, Any], *,
+    now_s: float, evidence_valid: bool, max_discharge_w: int,
+    non_controllable_house_w: int, wallbox_w: int,
+    wallbox_power_known: bool, heatpump_w: int, heater_w: int,
+    battery_floor_soc: float,
+    heatpump_bridge_committed: bool = False,
+    wallbox_status: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Ordnet gemessene Quellen einmal zu und begrenzt WP-Überbrückung.
+
+    Hauslast steht vor flexiblen Verbrauchern. Deren konfigurierte Reihenfolge
+    bestimmt die Zuordnung der gemessenen Quellen; kein ganzer Hausnetzbezug
+    wird als WP-Verbrauch gezählt. Dies ist eine Bilanzzuordnung, keine Aussage
+    über den Weg einzelner Elektronen und kein zusätzlicher RSCP-Ausgang.
+    """
+    def number(value: Any) -> Optional[float]:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        result = float(value)
+        return result if math.isfinite(result) else None
+
+    def configured_nonnegative(key: str) -> float:
+        try:
+            value = cfg.get(key, 0)
+            result = float(value) if not isinstance(value, bool) else math.nan
+        except (TypeError, ValueError):
+            result = math.nan
+        return max(0.0, result) if math.isfinite(result) else 0.0
+
+    absent_types = {"none", "off", "disabled", "0"}
+    wb_types = [str(cfg.get(key, "")).strip().lower()
+                for key in ("wb_native_type", "wb_native_type2")]
+    wallbox_absent = bool(all(value in absent_types for value in wb_types)
+                          and max(0, int(wallbox_w)) == 0)
+    external_slots = [index + 1 for index, value in enumerate(wb_types)
+                      if value and value not in absent_types | {"e3dc", "efy"}]
+    effective_wallbox_known = bool(wallbox_power_known or wallbox_absent)
+    if external_slots:
+        native = wallbox_status if isinstance(wallbox_status, dict) else {}
+        details = native.get("wb_details") if isinstance(native.get("wb_details"), list) else []
+        effective_wallbox_known = bool(
+            wallbox_power_known and _wallbox_status_sample_fresh(native, now_s=now_s, max_age_s=10.0)
+            and all(any(
+                isinstance(detail, dict) and type(detail.get("id")) is int
+                and detail["id"] == slot
+                and _wallbox_status_sample_fresh(detail, now_s=now_s, max_age_s=10.0)
+                and number(detail.get("power_w")) is not None
+                for detail in details) for slot in external_slots)
+        )
+    heater_configured = bool(
+        cfg_bool(cfg, "heizstab", False)
+        or str(cfg.get("heizstab_ip", "")).strip() not in ("", "0.0.0.0")
+        or str(cfg.get("shelly_heiz_ip", "")).strip() not in ("", "0.0.0.0")
+    )
+    heater_ts = number(live.get("Heater_Evidence_TS"))
+    heater_evidence_valid = bool(not heater_configured or (
+        live.get("Heater_Power_Known") is True and live.get("Heater_Status_Valid") is True
+        and heater_ts is not None and 0.0 <= now_s - heater_ts <= 10.0
+        and number(live.get("Heizstab_Power")) is not None
+    ))
+    sample_ts = number(live.get("_ts"))
+    pv_w = number(live.get("PV_Power"))
+    battery_w = number(live.get("Battery_Power") if "Battery_Power" in live else live.get("Bat_Power"))
+    grid_w = number(live.get("Grid_Power"))
+    soc = number(live.get("SOC"))
+    fresh = bool(
+        evidence_valid and sample_ts is not None
+        and 0.0 <= now_s - sample_ts <= 10.0
+        and all(value is not None for value in (pv_w, battery_w, grid_w, soc))
+        and live.get("Heatpump_Power_Known") is True
+        and effective_wallbox_known and heater_evidence_valid
+    )
+    pools = {
+        "pv": max(0.0, pv_w or 0.0),
+        "battery": max(0.0, -(battery_w or 0.0)),
+        "grid": max(0.0, grid_w or 0.0),
+    }
+    loads = {
+        "house": max(0, int(non_controllable_house_w)),
+        "heatpump": max(0, int(heatpump_w)),
+        "wallbox": max(0, int(wallbox_w)),
+        "heater": max(0, int(heater_w)),
+    }
+    assigned = {}
+    unassigned_w = 0.0
+    for consumer in ("house",) + tuple(priority_order_from_config(cfg)):
+        remaining = float(loads[consumer])
+        assigned[consumer] = {}
+        for source in ("pv", "battery", "grid"):
+            share = min(remaining, pools[source])
+            assigned[consumer][source] = share
+            pools[source] -= share
+            remaining -= share
+        unassigned_w += remaining
+    # Größere Lücken weisen auf eine unvollständige Messgrenze hin. Sie sind
+    # keine null Watt Unterstützung und dürfen keine neue Freigabe erzeugen.
+    fresh = bool(fresh and unassigned_w <= 250.0)
+    protection_reason = ""
+    if not fresh:
+        protection_reason = "heatpump_source_evidence_invalid"
+    elif decision.get("safety_veto") is True:
+        safety_state = str(decision.get("state") or "")
+        protection_reason = (
+            "emergency_reserve" if "reserve" in safety_state
+            else "house_connection_limit" if "peak" in safety_state or "grid_limit" in safety_state
+            else "invalid_control_data"
+        )
+    elif decision.get("protected") is True and not heatpump_bridge_committed:
+        protection_reason = "storage_protected"
+
+    # Akkuenergie ohne bestätigte Kapazität oder explizites Anlagenprofil wird
+    # nicht aus einem Default geschätzt. Die WP darf geschützte Reserven und
+    # schon durch andere Lasten benötigte Entladeleistung nicht verplanen.
+    capacity_kwh = next((
+        value for value in (
+            number(live.get("bat_full_cap_kwh")),
+            number(live.get("battery_capacity_kwh")),
+            configured_nonnegative("speichergroesse"),
+        ) if value is not None and value > 0.0
+    ), None)
+    battery_available_wh = (
+        max(0.0, (soc - max(0.0, battery_floor_soc) - 0.2) / 100.0)
+        * capacity_kwh * 1000.0
+        if fresh and soc is not None and capacity_kwh is not None else 0.0
+    )
+    battery_dispatch_allowed = bool(
+        fresh and not protection_reason
+        and (
+            heatpump_bridge_committed
+            or (
+                safe_int(decision.get("mode"), -1) == MODE_AUTO
+                and not decision.get("controlled_wallbox_auto_limit_active")
+                and not decision.get("wallbox_storage_protection")
+                and not decision.get("controlled_wallbox_wbminsoc_pause")
+                and not decision.get("curve_auto_hold_continuation_active")
+                and not decision.get("curve_cap_feedback_active")
+                and not ((decision.get("auto_limit") or {}).get("enabled") is True)
+            )
+        )
+        and not decision.get("suppress_rscp_output")
+    )
+    other_battery_w = sum(
+        assigned[consumer]["battery"]
+        for consumer in ("house", "wallbox", "heater")
+    )
+    battery_available_w = min(
+        configured_nonnegative("wp_pv_battery_max_w"),
+        max(0.0, float(max_discharge_w) - other_battery_w),
+    ) if battery_dispatch_allowed and battery_available_wh > 0.0 else 0.0
+    peak = decision.get("peak_shaving") or {}
+    grid_headroom_w = number(peak.get("grid_import_headroom_w")) if isinstance(peak, dict) else None
+    house_grid_room_w = (
+        grid_charge_room_w(cfg, live)
+        if configured_nonnegative("grid_max_amps") > 0.0 else None
+    )
+    # Viertelstunden-Headroom ist keine momentane Anschlussgrenze. Der
+    # vorhandene Hausanschlussrahmen begrenzt zusätzlich; ohne Profil kein Netzgrant.
+    actual_grid_room_w = max(0.0,
+        max(0.0, configured_nonnegative("grid_max_amps")
+            - max(0.0, safe_float(cfg.get("grid_max_reserve_amp"), 2.0)))
+        * 230.0 * 3.0 - max(0.0, grid_w or 0.0),
+    )
+    grid_available_w = min(
+        configured_nonnegative("wp_pv_grid_max_w"),
+        max(0.0, float(house_grid_room_w)) + assigned["heatpump"]["grid"],
+        # Bestehende Akkuladung ist vor bestätigter Rücknahme keine sofortige
+        # Anschlussreserve für einen möglichen WP-Leistungssprung.
+        actual_grid_room_w + assigned["heatpump"]["grid"],
+        max(0.0, grid_headroom_w) + assigned["heatpump"]["grid"]
+        if grid_headroom_w is not None else math.inf,
+    ) if fresh and not protection_reason and house_grid_room_w is not None else 0.0
+    return {
+        "schema": "heatpump_pv_source_v1",
+        "fresh": fresh,
+        "sample_ts": sample_ts or 0.0,
+        "shared_capacity_w": 0,
+        "prospective_capacity_w": 0,
+        "battery_available_w": int(battery_available_w),
+        "battery_reaction_available_w": 0,
+        # Ohne bestätigte aktuelle Entladeisolierung ist auch bei erlaubter
+        # Netzquelle ein möglicher AUTO-Nachlauf aus demselben Akkukonto gedeckt.
+        "battery_response_required_w": configured_nonnegative("wp_pv_max_power_w"),
+        "battery_response_required_wh": (
+            configured_nonnegative("wp_pv_max_power_w")
+            * heatpump_pv_policy.heatpump_pv_config(cfg)["reaction_s"] / 3600.0
+        ),
+        "battery_available_wh": battery_available_wh if battery_dispatch_allowed else 0.0,
+        "grid_available_w": int(grid_available_w),
+        "battery_actual_w": assigned["heatpump"]["battery"] if fresh else 0.0,
+        "grid_actual_w": assigned["heatpump"]["grid"] if fresh else 0.0,
+        "protection_reason": protection_reason,
+        "source_assignments_w": assigned,
+        "source_assignment_uncertain": not fresh,
+        "wallbox_power_known": effective_wallbox_known,
+        "wallbox_explicitly_absent": wallbox_absent,
+        "heater_evidence_valid": heater_evidence_valid,
+        "source_unassigned_w": unassigned_w,
+        "battery_dispatch_allowed": battery_dispatch_allowed,
+        "battery_floor_soc": max(0.0, battery_floor_soc),
+    }
+
+
+def apply_heatpump_pv_bridge_decision(
+    cfg: Dict[str, Any], live: Dict[str, Any], decision: Dict[str, Any],
+    grant: Dict[str, Any], source: Dict[str, Any], *,
+    wallbox_w: int, max_charge_w: int, max_discharge_w: int,
+) -> Dict[str, Any]:
+    """Bindet WP-Unterstützung ausschließlich an den flüchtigen SET_POWER-Pfad.
+
+    PV wird gemäß derselben Quellenzuordnung genau einmal berücksichtigt.
+    Auch ein entfallender Akkuanteil begrenzt die physische Entladevorgabe;
+    eine offene AUTO-Freigabe ist dafür kein gleichwertiger Ausgang.
+    """
+    result = dict(decision)
+    state = heatpump_pv_policy.validate_heatpump_pv_state(grant.get("state"))
+    if not (
+        grant.get("allocation_owned") is not False
+        and source.get("fresh") is True and cfg_bool(cfg, "auto_mode", True)
+        and grant.get("valid") is True and not grant.get("protection_reason")
+        and (grant.get("hold_required") is True or grant.get("command_outstanding") is True)
+        and state.get("cycle_owned") is True
+        and result.get("safety_veto") is not True
+        and not result.get("suppress_rscp_output")
+    ):
+        return result
+    assigned = source.get("source_assignments_w")
+    if not isinstance(assigned, dict) or any(
+        not isinstance(assigned.get(name), dict)
+        for name in ("house", "heatpump", "wallbox", "heater")
+    ):
+        return result
+    actual_wp_w = max(0, safe_int(live.get("WP_Power"), 0))
+    wp_pv_w = max(0, safe_int(assigned["heatpump"].get("pv"), 0))
+    wp_deficit_w = max(0, actual_wp_w - wp_pv_w)
+    response_wh = max(0.0, safe_float(source.get("battery_response_required_wh"), 0.0))
+    response_w = max(0.0, safe_float(source.get("battery_response_required_w"), 0.0))
+    response_backed = bool(
+        response_wh > 0.0
+        and safe_float(state.get("battery_reserved_wh"), 0.0) >= response_wh
+        and safe_float(grant.get("battery_remaining_wh"), 0.0) >= response_wh
+        and safe_float(source.get("battery_available_wh"), 0.0) >= response_wh
+        and safe_float(source.get("battery_available_w"), 0.0) >= response_w
+    )
+    if wp_deficit_w == 0 and response_backed:
+        # Vollständig PV-gedeckte Wärme braucht keinen Entladebefehl. Normales
+        # PV-Speichern bleibt möglich; der ausdrücklich reservierte Akkuanteil
+        # trägt den möglichen Nachlauf bis zum nächsten flüchtigen Ausgang.
+        result["heatpump_pv_response_buffer_backed"] = True
+        return result
+    support_w = min(
+        max(0, safe_int(grant.get("battery_available_w"), 0)),
+        max(0, safe_int(source.get("battery_available_w"), 0)),
+        max(0, int(max_discharge_w)), wp_deficit_w,
+    )
+    # Laufende fremde Quellenrechte werden nicht als WP-Hilfe umetikettiert.
+    # Haus/Heizstab behalten höchstens den bestehenden normalen Entladerahmen;
+    # WB-Hilfe bleibt zusätzlich an den bereits geprüften eigenen Sourcecap gebunden.
+    prior_auto = result.get("auto_limit") if isinstance(result.get("auto_limit"), dict) else {}
+    prior_mode = safe_int(result.get("mode"), -1)
+    prior_limit = (
+        max(0, safe_int(prior_auto.get("max_discharge_w"), 0))
+        if prior_mode == MODE_AUTO and prior_auto.get("enabled") is True
+        else max_discharge_w if prior_mode == MODE_AUTO
+        else max(0, safe_int(result.get("val"), 0)) if prior_mode == MODE_DISCH
+        else 0
+    )
+    other_deficits = {
+        consumer: max(0, safe_int(assigned[consumer].get("battery"), 0))
+        + max(0, safe_int(assigned[consumer].get("grid"), 0))
+        for consumer in ("house", "wallbox", "heater")
+    }
+    other_deficits["wallbox"] = min(
+        other_deficits["wallbox"],
+        max(0, safe_int(source.get("wallbox_battery_authorized_w"), 0)),
+    )
+    non_wp_w = min(prior_limit, sum(other_deficits.values()))
+    discharge_w = min(max(0, int(max_discharge_w)), non_wp_w + support_w)
+    result.update({
+        "mode": MODE_DISCH if discharge_w > 0 else MODE_IDLE,
+        "val": discharge_w,
+        "auto_limit": {},
+        "heatpump_pv_set_power_only": True,
+        "heatpump_pv_bridge_dispatch_w": support_w,
+        "heatpump_pv_non_wp_discharge_w": non_wp_w,
+        "house_heatpump_discharge_cap_w": discharge_w,
+    })
+    return result
+
+
 def build_flexible_consumer_budget_contract(
     cfg: Dict[str, Any],
     live: Dict[str, Any],
@@ -20451,6 +20883,7 @@ def build_flexible_consumer_budget_contract(
     wallbox_exclusive_start_support_w: int = 0,
     wallbox_running_hold_support_w: int = 0,
     phase_transition_preoutput_only: bool = False,
+    heatpump_source_contract: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Projiziert Anlagenzustand auf genau einen flexiblen Wattvertrag."""
 
@@ -21762,10 +22195,103 @@ def build_flexible_consumer_budget_contract(
             "timebase_rearm_count": 0,
         }
 
+    pv_demand = live.get("Heatpump_PV_Contract")
+    previous_pv_contract = previous_contract.get("heatpump_pv_contract")
+    previous_pv_contract = previous_pv_contract if isinstance(previous_pv_contract, dict) else {}
+    heatpump_pv_accounting_active = bool(
+        wp_type == "0"
+        and (isinstance(pv_demand, dict) or previous_pv_contract)
+    )
+    prior_pv_state = heatpump_pv_policy.validate_heatpump_pv_state(previous_pv_contract.get("state"))
+    pv_command = pv_demand.get("command") if isinstance(pv_demand, dict) else {}
+    pv_command = pv_command if isinstance(pv_command, dict) else {}
+    pv_effect_outstanding = bool(
+        prior_pv_state.get("cycle_owned") or prior_pv_state.get("active_command")
+        or ((pv_command.get("prepared_ts") or pv_command.get("issued_ts"))
+            and pv_command.get("withdrawal_confirmed") is not True)
+    )
+    other_heat_demand = bool(
+        heatpump_command_eligible and heatpump_evidence_fresh
+        and live.get("Heatpump_Start_Ready") is True
+        and str(live.get("Heatpump_Start_Demand_Class") or "").strip().casefold()
+        in {"pre_dump", "market_price", "price", "ww_immediate_manual", "ww_timer_comfort", "ww_timer_eco"}
+    )
+    # Das Energiekonto existiert auch ohne laufenden PV-Auftrag. Seine bloße
+    # Fortführung darf einen frischen Preis-/Pre-Dump-/Komfortauftrag nicht
+    # übernehmen. Ein möglicherweise bereits ausgespielter PV-Auftrag behält
+    # dagegen seine Quelle und Schutzzeit bis zum bestätigten Entzug.
+    heatpump_pv_path = bool(
+        heatpump_pv_accounting_active and (pv_effect_outstanding or not other_heat_demand)
+    )
+    pv_clock = {
+        "wall_s": current_clock_sample.get("wall_ts", now_s),
+        "monotonic_s": current_clock_sample.get("monotonic_ts"),
+        "boot_id": current_clock_sample.get("boot_id"),
+    }
+    pv_request_contract = {}
+    pv_source = copy.deepcopy(heatpump_source_contract) if isinstance(heatpump_source_contract, dict) else {
+        "fresh": False, "sample_ts": now_s,
+        "battery_available_w": 0, "battery_available_wh": 0,
+        "grid_available_w": 0, "battery_actual_w": 0, "grid_actual_w": 0,
+    }
+    pv_wallbox_reclaimable = bool(
+        heatpump_pv_path
+        and configured_order.index("heatpump") < configured_order.index("wallbox")
+        and wallbox_command_eligible and wallbox_online and wallbox_power_evidence_fresh
+        and not phase_transition_active and wallbox_reserved_w <= 0
+        and wallbox_start_hold_w <= 0 and wallbox_exclusive_start_support_w <= 0
+    )
+    if heatpump_pv_accounting_active:
+        if available_is_residual_after_running and not phase_transition_active:
+            pv_shared_frame_w = max(0, int(signed_residual_w)
+                + measured_acceptance_w["wallbox"] + measured_acceptance_w["heater"]
+                + (heatpump_observed_w if heatpump_evidence_fresh
+                   and live.get("Heatpump_Power_Known") is True else 0))
+            pv_shared_frame_w = max(0, pv_shared_frame_w - max(0, int(signed_residual_w))
+                                    + max(0, int(available_w)))
+        else:
+            pv_shared_frame_w = max(0, int(available_w))
+            if phase_transition_active and heatpump_running:
+                pv_shared_frame_w += max(0, int(heatpump_commitment_w))
+        other_claim_w = measured_acceptance_w["heater"]
+        if not pv_wallbox_reclaimable:
+            other_claim_w += max(
+                measured_acceptance_w["wallbox"], int(wallbox_reserved_w),
+                int(wallbox_start_hold_w),
+                min(wallbox_cap_w, CONSUMER_MIN_W["wallbox"])
+                if wallbox_command_eligible
+                and configured_order.index("wallbox") < configured_order.index("heatpump")
+                else 0,
+            )
+        pv_source["prospective_capacity_w"] = max(0, pv_shared_frame_w - other_claim_w)
+        pv_source["shared_capacity_w"] = pv_source["prospective_capacity_w"]
+        if not cfg_bool(cfg, "auto_mode", True):
+            pv_source["protection_reason"] = "user_off"
+        elif (isinstance(pv_demand, dict)
+              and 0.0 <= now_s - safe_float(pv_demand.get("sample_ts"), 0.0) <= 45.0
+              and pv_demand.get("protection_reason") in heatpump_pv_policy.HARD_PROTECTIONS):
+            pv_source["protection_reason"] = pv_demand["protection_reason"]
+        pv_observation = pv_demand.get("observation") if isinstance(pv_demand, dict) else {}
+        evaluated_pv_demand = pv_demand
+        if not heatpump_pv_path and isinstance(pv_demand, dict):
+            evaluated_pv_demand = {**pv_demand, "requested": False, "qualified": False}
+        pv_request_contract = heatpump_pv_policy.evaluate_heatpump_pv_request(
+            evaluated_pv_demand, pv_observation, previous_pv_contract.get("state"), pv_source,
+            clock_sample=pv_clock, config=heatpump_pv_policy.heatpump_pv_config(cfg),
+        )
+        if not heatpump_command_eligible or not heatpump_new_start_allowed:
+            pv_request_contract["start_candidate"] = False
+            pv_request_contract.setdefault("blockers", []).append("heatpump_start_not_eligible")
+            if not (pv_request_contract.get("state") or {}).get("active_command"):
+                pv_request_contract["request_w"] = measured_acceptance_w["heatpump"]
+        heatpump_cap_w = max(heatpump_cap_w, safe_int(pv_request_contract.get("max_power_w"), 0),
+                            safe_int(pv_request_contract.get("request_w"), 0))
+
     heatpump_demand_ready = bool(
         heatpump_command_eligible
         and heatpump_evidence_fresh
         and live.get("Heatpump_Start_Ready") is True
+        and not heatpump_pv_path
     )
     heatpump_start_ready = bool(
         heatpump_demand_ready
@@ -21869,6 +22395,18 @@ def build_flexible_consumer_budget_contract(
             request_generation=wallbox_start_generation,
         ),
     }
+    if heatpump_pv_path:
+        start_leases["heatpump"] = {
+            "offered": False, "request_w": 0, "pending_request_w": 0,
+            "started_s": 0.0, "expires_s": 0.0, "retry_not_before_s": 0.0,
+            "reason": "heatpump_pv_contract_owns_start", "state": "released",
+            "signal_is_acceptance": False, "acceptance_required": False,
+            "remaining_s": 0.0, "timebase_status": "inactive", "time_guard": {},
+            "rearm_required": False, "ready_latched": False,
+            "withdrawal_watermark_s": 0.0, "timebase_rearm_count": 0,
+        }
+        heatpump_start_request_w = max(0, safe_int(pv_request_contract.get("request_w"), 0))
+        heatpump_start_ready = pv_request_contract.get("start_candidate") is True
     start_leases["wallbox"]["request_generation"] = (
         wallbox_start_generation
     )
@@ -22030,7 +22568,8 @@ def build_flexible_consumer_budget_contract(
         + late_start_evidence_limit_consumers
     )
     wallbox_idle_heatpump_start_priority_active = bool(
-        not phase_transition_active
+        configured_order.index("wallbox") < configured_order.index("heatpump")
+        and not phase_transition_active
         and wallbox_online
         and evidence_valid
         and wallbox_command_eligible
@@ -22123,6 +22662,12 @@ def build_flexible_consumer_budget_contract(
                 0,
                 safe_int(start_leases[consumer].get("request_w"), 0),
             )
+
+    if heatpump_pv_path:
+        request_caps_w["heatpump"] = max(
+            measured_acceptance_w["heatpump"],
+            max(0, safe_int(pv_request_contract.get("request_w"), 0)),
+        )
 
     # Nur ein frisches, noch nicht angenommenes Startangebot darf einmalig den
     # gesamten Wallbox-Geräterahmen anfordern. Nach realer Annahme bestimmt der
@@ -22348,11 +22893,12 @@ def build_flexible_consumer_budget_contract(
             requests_w["wallbox"],
             wallbox_running_hold_support_w,
         )
-        priority_front = ("wallbox",) + tuple(
-            consumer
-            for consumer in priority_front
-            if consumer != "wallbox"
-        )
+        if not (pv_wallbox_reclaimable and pv_request_contract.get("start_candidate") is True):
+            priority_front = ("wallbox",) + tuple(
+                consumer
+                for consumer in priority_front
+                if consumer != "wallbox"
+            )
 
     # Reale, nicht wattgenau modulierbare Mitverbraucher sind bereits am
     # Netzpunkt vorhanden. Sie werden deshalb vor jeder frei verteilbaren
@@ -22636,6 +23182,35 @@ def build_flexible_consumer_budget_contract(
         shared_source_total_w - shared_noncommand_reserve_w,
     )
 
+    heatpump_exclusive_source_w = 0
+    if heatpump_pv_path:
+        heatpump_exclusive_source_w = max(0, int(math.floor(
+            safe_float(pv_request_contract.get("bridge_battery_w"), 0.0)
+            + safe_float(pv_request_contract.get("bridge_grid_w"), 0.0)
+        )))
+        heatpump_exclusive_source_w = min(
+            heatpump_exclusive_source_w, request_caps_w["heatpump"],
+        )
+        # Die physische feste Last kann oben bereits den Accounting-Rahmen
+        # angehoben haben. Ihre jetzt belegte Quelle ersetzt diesen Anteil;
+        # sie ist keine zweite Leistung neben derselben laufenden WP.
+        heatpump_source_rebound_w = min(
+            heatpump_exclusive_source_w, fixed_running_outside_budget_w,
+            fresh_running_commitments_w["heatpump"],
+        )
+        heatpump_source_add_w = heatpump_exclusive_source_w - heatpump_source_rebound_w
+        total_w += heatpump_source_add_w
+        gross_total_budget_w += heatpump_source_add_w
+        shared_source_total_w = max(0, shared_source_total_w - heatpump_source_rebound_w)
+        shared_command_source_w = max(0, shared_command_source_w - heatpump_source_rebound_w)
+        protected_fixed_source_claim_w["heatpump"] = max(
+            0, protected_fixed_source_claim_w["heatpump"] - heatpump_source_rebound_w,
+        )
+        fixed_source_protected_w = max(0, fixed_source_protected_w - heatpump_source_rebound_w)
+        requests_w["heatpump"] = min(
+            request_caps_w["heatpump"], requests_w["heatpump"] + heatpump_exclusive_source_w,
+        )
+
     previous_active = previous_contract.get("active")
     if not isinstance(previous_active, dict):
         previous_active = {
@@ -22666,6 +23241,12 @@ def build_flexible_consumer_budget_contract(
             minimums_for_contract["heatpump"],
             heatpump_start_transaction_bind_w,
         )
+    if heatpump_pv_path and requests_w["heatpump"] > 0:
+        minimums_for_contract["heatpump"] = min(
+            requests_w["heatpump"],
+            max(minimums_for_contract["heatpump"],
+                safe_int(pv_request_contract.get("minimum_w"), 0)),
+        )
     maximums_map = {
         "heatpump": heatpump_cap_w,
         "wallbox": wallbox_cap_w,
@@ -22688,6 +23269,7 @@ def build_flexible_consumer_budget_contract(
                     if available_is_residual_after_running and not phase_transition_active
                     else 0,
                     safe_int(start_leases["heatpump"].get("request_w"), 0),
+                    requests_w["heatpump"] if heatpump_pv_path else 0,
                     max(0, int(heatpump_commitment_w))
                     if phase_transition_active and heatpump_running
                     else 0,
@@ -22735,6 +23317,9 @@ def build_flexible_consumer_budget_contract(
             wp_runon_s=priority_runon_s_from_config(cfg),
             wp_runon_active_override=bool(priority_runon.get("active")),
             priority_front=priority_front,
+            reclaimable_active=("wallbox",) if pv_wallbox_reclaimable
+                and pv_request_contract.get("start_candidate") is True else (),
+            heatpump_exclusive_budget_w=heatpump_exclusive_source_w,
         )
 
     contract = allocate_current_contract()
@@ -23076,7 +23661,7 @@ def build_flexible_consumer_budget_contract(
         )
         remaining_w = max(0, safe_int(contract.get("remaining_w"), 0))
         wallbox_residual_backfill_w = min(
-            remaining_w,
+            max(0, remaining_w - safe_int(contract.get("heatpump_exclusive_remaining_w"), 0)),
             max(
                 0,
                 (wallbox_zero_reuse_limit_w if wallbox_confirmed_zero_reused_w > 0
@@ -23103,6 +23688,11 @@ def build_flexible_consumer_budget_contract(
             }
             contract["allocation_sum_w"] = sum(allocations.values())
             contract["remaining_w"] = remaining_w - wallbox_residual_backfill_w
+            if "shared_remaining_w" in contract:
+                contract["shared_remaining_w"] = max(
+                    0, safe_int(contract.get("shared_remaining_w"), 0)
+                    - wallbox_residual_backfill_w,
+                )
             requests_w["wallbox"] = wallbox_allocated_w
             request_caps_w["wallbox"] = wallbox_allocated_w
             contract["invariant_conserved"] = bool(
@@ -23662,6 +24252,36 @@ def build_flexible_consumer_budget_contract(
         released_budget_w=released_w,
         released_budget_allocations_w=dict(command_allocations),
     )
+    if heatpump_pv_accounting_active:
+        own_funded_w = min(
+            hp_cmd_w, max(0, safe_int(contract.get("heatpump_exclusive_allocated_w"), 0)),
+        )
+        battery_funded_w = min(
+            own_funded_w, max(0, safe_int(pv_request_contract.get("bridge_battery_w"), 0)),
+        )
+        grid_funded_w = max(0, own_funded_w - battery_funded_w)
+        pv_grant = heatpump_pv_policy.bind_heatpump_pv_grant(
+            pv_request_contract, allocated_w=hp_cmd_w,
+            shared_funded_w=min(max(0, hp_cmd_w - own_funded_w),
+                                max(0, safe_int(pv_source.get("shared_capacity_w"), 0))),
+            battery_funded_w=battery_funded_w, grid_funded_w=grid_funded_w,
+            wallbox_actual_w=(max(0, int(wallbox_current_w)) if wallbox_power_evidence_fresh
+                              else math.inf),
+            wallbox_target_w=command_allocations["wallbox"],
+            phase_transition_active=phase_transition_active,
+            clock_sample=pv_clock,
+        )
+        pv_grant["allocation_owned"] = heatpump_pv_path
+        if not heatpump_pv_path:
+            pv_grant.update({"command_authorized": False, "hold_required": False,
+                             "withdrawal_required": False, "protection_reason": "",
+                             "reason": "accounting_only_other_heat_demand"})
+        contract["heatpump_pv_contract"] = pv_grant
+        contract["heatpump_pv_source"] = pv_source
+        if heatpump_pv_path:
+            contract["heatpump_boost_permission_active"] = bool(
+                pv_grant.get("command_authorized") is True or pv_grant.get("hold_required") is True
+            )
     contract["heatpump_start_funding"] = hp_funding_contract
     contract["released_budget_receiver"] = released_receiver
     contract["heatpump_start_request_w"] = hp_req_w
@@ -29154,6 +29774,9 @@ def decide_next_cycle(
             wallbox_start_support_limit_w,
             max(0, int(max_discharge_w + base_wb_budget_w)),
         )
+    fixed_start_support_w = max(0, safe_int(decision.get("wallbox_fixed_start_support_w"), 0))
+    fixed_start_grid_w = max(0, safe_int(decision.get("wallbox_fixed_start_grid_support_w"), 0))
+    wallbox_exclusive_start_support_w = max(wallbox_exclusive_start_support_w, fixed_start_support_w)
     if ep_reserve_hold_active:
         # Die Notstromreserve ist ein lokales Batterie-Veto. Auch eine laufende
         # PV-Fortsetzung darf deshalb niemals den Ziel-/Start-Supportrahmen aus
@@ -29186,7 +29809,7 @@ def decide_next_cycle(
     )
 
     if max_controllable_ceiling_w > 0 and live_home_w > 0 and not cfg.get("_test_mock_bypass"):
-        wallbox_exclusive_start_support_w = min(wallbox_exclusive_start_support_w, max_controllable_ceiling_w)
+        wallbox_exclusive_start_support_w = min(wallbox_exclusive_start_support_w, max_controllable_ceiling_w + fixed_start_grid_w)
         budget_w = min(budget_w, max_controllable_ceiling_w)
 
     if ep_reserve_hold_active:
@@ -29370,6 +29993,38 @@ def decide_next_cycle(
         intent_fresh=wb_intent_fresh,
         car_present=wb_car_present,
     )
+    previous_heatpump_pv = (
+        ((previous_state.get("budget") or {}).get("consumer_budget_contract") or {})
+        .get("heatpump_pv_contract") or {}
+    )
+    previous_heatpump_pv_state = heatpump_pv_policy.validate_heatpump_pv_state(
+        previous_heatpump_pv.get("state"),
+    )
+    heatpump_sources = heatpump_pv_source_contract(
+        cfg, live, decision, now_s=now_s,
+        evidence_valid=consumer_source_evidence_valid,
+        max_discharge_w=max_discharge_w,
+        non_controllable_house_w=non_controllable_house_w,
+        wallbox_w=observed_wallbox_commitment_w,
+        wallbox_power_known=effective_wallbox_power_known,
+        heatpump_w=wp_w,
+        heater_w=max(0, safe_int(live.get("Heizstab_Power"), 0)),
+        battery_floor_soc=max(ep_reserve_soc(cfg, live),
+                              safe_float(adaptive_floor_soc, 0.0)),
+        heatpump_bridge_committed=bool(
+            previous_heatpump_pv_state.get("cycle_owned") is True
+            or previous_heatpump_pv_state.get("active_command") is True
+        ),
+        wallbox_status=wb_native,
+    )
+    # Die erste Auswertung nach Wiederanlauf besitzt keine Zwischenproben.
+    # Der reine Kontovertrag belastet nur möglicherweise aktive Wärmequellen
+    # konservativ. Im nächsten regulären Payload fehlt dieser Startup-Marker.
+    heatpump_sources["restart"] = bool(previous_state.get("heatpump_pv_checkpoint_restore"))
+    heatpump_sources["wallbox_battery_authorized_w"] = max(
+        0, max(wallbox_exclusive_start_support_w, wallbox_running_hold_support_w) - fixed_start_grid_w
+        - safe_int((heatpump_sources.get("source_assignments_w") or {}).get("wallbox", {}).get("pv"), 0),
+    )
     consumer_budget_contract = build_flexible_consumer_budget_contract(
         cfg,
         live,
@@ -29389,7 +30044,9 @@ def decide_next_cycle(
         wallbox_online=wallbox_consumer_is_online,
         wallbox_current_w=observed_wallbox_commitment_w,
         wallbox_power_known=bool(
-            effective_wallbox_power_known
+            (effective_wallbox_power_known
+             or (str(cfg.get("wp_type", "")).strip() == "0"
+                 and heatpump_sources.get("wallbox_explicitly_absent") is True))
             and consumer_source_evidence_valid
         ),
         wallbox_reserved_w=phase_transition_reserved_w,
@@ -29425,7 +30082,18 @@ def decide_next_cycle(
         wallbox_running_hold_support_w=(
             wallbox_running_hold_support_w
         ),
+        heatpump_source_contract=heatpump_sources,
     )
+    consumer_budget_contract["wallbox_fixed_start_grid_support_w"] = fixed_start_grid_w
+    consumer_budget_contract["wallbox_fixed_start_support_w"] = fixed_start_support_w
+    decision = apply_heatpump_pv_bridge_decision(
+        cfg, live_with_wallbox, decision,
+        consumer_budget_contract.get("heatpump_pv_contract") or {}, heatpump_sources,
+        wallbox_w=observed_wallbox_commitment_w,
+        max_charge_w=max_charge_w, max_discharge_w=max_discharge_w,
+    )
+    mode = safe_int(decision.get("mode"), MODE_AUTO)
+    val = max(0, safe_int(decision.get("val"), 0))
     consumer_budget_validation = validate_consumer_budget_contract(
         consumer_budget_contract
     )
@@ -29505,6 +30173,7 @@ def decide_next_cycle(
 
     consumer_budget_contract["predump_discharge_add_contract"] = predump_discharge_contract
     budget = {
+        "heatpump_pv_contract": copy.deepcopy(consumer_budget_contract.get("heatpump_pv_contract") or {}),
         "budget_w": budget_w,
         "predump_discharge_contract": predump_discharge_contract,
         "predump_discharge_allocations_w": dict(predump_discharge_allocations_w),
@@ -30185,6 +30854,9 @@ def decide_next_cycle(
         ),
         "storage_dc_first_charge_limit_enabled": bool(decision.get("storage_dc_first_charge_limit_enabled")),
         "storage_dc_first_charge_limit_active": bool(decision.get("storage_dc_first_charge_limit_active")),
+        "storage_dc_first_consumer_release_w": max(
+            0, safe_int(decision.get("storage_dc_first_consumer_release_w"), 0),
+        ),
         "storage_dc_first_charge_limit_contract_version": safe_int(
             decision.get("storage_dc_first_charge_limit_contract_version"),
             0,
@@ -31125,6 +31797,9 @@ def decide_next_cycle(
         ),
         "storage_dc_first_charge_limit_enabled": bool(decision.get("storage_dc_first_charge_limit_enabled")),
         "storage_dc_first_charge_limit_active": bool(decision.get("storage_dc_first_charge_limit_active")),
+        "storage_dc_first_consumer_release_w": max(
+            0, safe_int(decision.get("storage_dc_first_consumer_release_w"), 0),
+        ),
         "storage_dc_first_charge_limit_contract_version": safe_int(
             decision.get("storage_dc_first_charge_limit_contract_version"),
             0,
@@ -31363,6 +32038,10 @@ def decide_next_cycle(
         "parallel_mode": mode,
         "parallel_val": val,
         "auto_limit": decision.get("auto_limit"),
+        "heatpump_pv_set_power_only": decision.get("heatpump_pv_set_power_only") is True,
+        "wallbox_fixed_start_set_power_only": decision.get("wallbox_fixed_start_set_power_only") is True,
+        "wallbox_fixed_start_output": decision.get("wallbox_fixed_start_output"),
+        "heatpump_pv_bridge_dispatch_w": max(0, safe_int(decision.get("heatpump_pv_bridge_dispatch_w"), 0)),
         "manual_target_soc": decision.get("manual_target_soc"),
         "manual_release_mode": decision.get("manual_release_mode"),
         "hard_mode_guard_errors": decision.get("hard_mode_guard_errors"),
@@ -32890,7 +33569,18 @@ def _consumer_budget_runtime_projection(
         and heatpump_duration_valid
     ):
         return None
+    pv_state = None
+    if "heatpump_pv_contract" in contract:
+        pv_contract = contract.get("heatpump_pv_contract")
+        pv_state = heatpump_pv_policy.validate_heatpump_pv_state(
+            pv_contract.get("state") if isinstance(pv_contract, dict) else None,
+        )
+        if not pv_state:
+            # Ein beschädigtes Energiekonto ist eine persistierte Quarantäne,
+            # kein fehlender Zustand mit erneut verfügbaren Wh.
+            pv_state = {"schema": "heatpump_pv_state_invalid_v1"}
     return {
+        **({"heatpump_pv_contract": {"state": pv_state}} if pv_state is not None else {}),
         "schema_version": contract.get("schema_version"),
         "consumer_priority_key": priority_key,
         "consumer_priority_changed_at_s": float(priority_changed_at_s),
@@ -32963,6 +33653,10 @@ def restore_consumer_budget_runtime_previous_state(
         )
         and stored_projection == projection
     ):
+        if isinstance(contract, dict) and "heatpump_pv_contract" in contract:
+            return {"budget": {"consumer_budget_contract": {
+                "heatpump_pv_contract": {"state": {"schema": "heatpump_pv_state_invalid_v1"}},
+            }}}
         return {}
     return {
         "budget": {
@@ -32977,6 +33671,260 @@ def restore_consumer_budget_runtime_previous_state(
             "status": "VALIDATED_RAM_STATE_RESTORED",
         },
     }
+
+
+def restore_heatpump_pv_durable_state(
+    previous_state: Dict[str, Any],
+    durable_state: Any,
+    *,
+    clock_sample: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Führt das dauerhafte Wärmekonto mit der jüngeren Ramdisk-Projektion zusammen."""
+    result = copy.deepcopy(previous_state if isinstance(previous_state, dict) else {})
+    budget = result.setdefault("budget", {})
+    contract = budget.setdefault("consumer_budget_contract", {})
+    runtime = contract.get("heatpump_pv_contract")
+    runtime_state = runtime.get("state") if isinstance(runtime, dict) else None
+    durable = heatpump_pv_policy.validate_heatpump_pv_state(durable_state)
+    ram = heatpump_pv_policy.validate_heatpump_pv_state(runtime_state)
+    chosen = copy.deepcopy(durable or durable_state or {"schema": "heatpump_pv_state_invalid_v1"})
+
+    def quarantine(value: Dict[str, Any]) -> None:
+        if value.get("uncertain_state") is not True:
+            value["quarantine_remaining_s"] = 86400.0
+        value["uncertain_state"] = True
+        value["checkpoint_reconciliation_required"] = True
+    if ram:
+        ram_clock = ram.get("clock") if isinstance(ram.get("clock"), dict) else {}
+        disk_clock = durable.get("clock") if isinstance(durable.get("clock"), dict) else {}
+        same_boot = bool(
+            durable and ram_clock.get("boot_id")
+            and ram_clock.get("boot_id") == disk_clock.get("boot_id")
+            and ram_clock.get("boot_id") == clock_sample.get("boot_id")
+        )
+        ram_mono = _consumer_runtime_finite(ram_clock.get("monotonic_s"))
+        disk_mono = _consumer_runtime_finite(disk_clock.get("monotonic_s"))
+        if same_boot and ram_mono is not None and disk_mono is not None:
+            chosen = copy.deepcopy(ram if ram_mono >= disk_mono else durable)
+        elif not durable:
+            # Der jüngere flüchtige Stand darf eine fehlende oder beschädigte
+            # dauerhafte Kontohistorie nicht als neues Wh-Kontingent freigeben.
+            chosen = copy.deepcopy(ram)
+            quarantine(chosen)
+        else:
+            # Ohne gemeinsame Zeitachse werden keine Wh gegeneinander verrechnet
+            # oder Restfristen als abgelaufen angenommen. Die dauerhafte Bindung
+            # bleibt samt Kompressorschutz erhalten.
+            chosen = copy.deepcopy(durable)
+            quarantine(chosen)
+    if durable:
+        disk_clock = durable.get("clock") if isinstance(durable.get("clock"), dict) else {}
+        if disk_clock.get("boot_id") != clock_sample.get("boot_id"):
+            quarantine(chosen)
+    contract["heatpump_pv_contract"] = {"state": chosen}
+    result["heatpump_pv_checkpoint_restore"] = {
+        "durable_valid": bool(durable), "runtime_valid": bool(ram),
+        "reconciliation_required": bool(
+            chosen.get("uncertain_state") or chosen.get("checkpoint_reconciliation_required")
+        ),
+    }
+    return result
+
+
+def finalize_wallbox_fixed_start_output(payload):
+    """Entzieht die optionale Probe bei jeder ungeklärten finalen Quellenänderung."""
+    result = copy.deepcopy(payload)
+    budget = result.get("budget") or {}
+    grant = budget.get("wallbox_start_hold_grants") or {}
+    if grant.get("request_kind") != "fixed_phase_detection":
+        result.pop("wallbox_fixed_start_set_power_only", None)
+        return result
+    expected = result.get("wallbox_fixed_start_output") or {}
+    valid = bool(
+        grant.get("active") is True
+        and result.get("wallbox_fixed_start_set_power_only") is True
+        and result.get("mode") in (MODE_DISCH, MODE_IDLE)
+        and expected.get("mode") == result.get("mode")
+        and expected.get("val") == result.get("val")
+        and not result.get("auto_limit")
+        and not result.get("suppress_rscp_output")
+        and not result.get("force_wallbox_stop")
+        and not result.get("safety_veto")
+        and safe_int(budget.get("budget_w"), 0) >= safe_int(grant.get("required_group_minimum_w"), 1)
+    )
+    if valid:
+        return result
+    result.pop("wallbox_fixed_start_set_power_only", None)
+    budget = apply_wallbox_start_hold_runtime_cap(budget, 0)
+    contract = budget.get("consumer_budget_contract") or {}
+    if contract:
+        budget["consumer_budget_contract"] = cap_consumer_budget_contract(contract, {"wallbox": 0})
+    for key in ("budget_w", "raw_iAVal_w", "iAVal_w", "budget_amp_1ph", "budget_amp_3ph"):
+        budget[key] = 0
+    budget["wallbox_fixed_start_final_source_bound"] = False
+    result["budget"] = _apply_consumer_budget_contract_projection(budget)
+    result["wallbox_start_hold_grants"] = copy.deepcopy(budget.get("wallbox_start_hold_grants"))
+    return result
+
+
+def finalize_heatpump_pv_output_owner(
+    cfg: Dict[str, Any], plan: Dict[str, Any],
+    before_arbitration: Dict[str, Any], payload: Dict[str, Any],
+    *, now_s: float,
+) -> Dict[str, Any]:
+    """Bindet die Wärmezusage nach allen Speicherentscheidern an den finalen Ausgang."""
+    result = copy.deepcopy(payload)
+    initial_budget = before_arbitration.get("budget") or {}
+    initial_contract = initial_budget.get("consumer_budget_contract") or {}
+    grant = initial_contract.get("heatpump_pv_contract")
+    grant = copy.deepcopy(grant) if isinstance(grant, dict) else {}
+    source = initial_contract.get("heatpump_pv_source") or {}
+    state = heatpump_pv_policy.validate_heatpump_pv_state(grant.get("state"))
+    output_keys = ("mode", "val", "auto_limit", "suppress_rscp_output")
+    changed = any(result.get(key) != before_arbitration.get(key) for key in output_keys)
+    if not grant:
+        if changed:
+            result.pop("heatpump_pv_set_power_only", None)
+        return result
+    if grant.get("allocation_owned") is False:
+        # Nur die aktuelle Kontoprojektion nachführen. Die fachlich getrennte
+        # Verbraucherfreigabe und der finale Speicherowner bleiben unverändert.
+        budget = result.setdefault("budget", {})
+        budget.setdefault("consumer_budget_contract", {})["heatpump_pv_contract"] = grant
+        budget["heatpump_pv_contract"] = copy.deepcopy(grant)
+        result.pop("heatpump_pv_set_power_only", None)
+        return result
+    try:
+        path = storage_decision_path_contract(result, plan)
+        own_ram_output = bool(
+            state.get("cycle_owned") and grant.get("valid")
+            and before_arbitration.get("heatpump_pv_set_power_only") is True
+            and result.get("heatpump_pv_set_power_only") is True
+            and all(result.get(key) == before_arbitration.get(key)
+                    for key in ("mode", "val", "auto_limit"))
+        )
+        if own_ram_output:
+            # Die Pfadklassifikation erkennt DISCH als aktiven Speicherpfad.
+            # Der exakt gebundene eigene WP-Ausgang ist kein fremder Owner;
+            # zusätzliche Pfade und sämtliche expliziten Vetos bleiben bestehen.
+            path = copy.deepcopy(path)
+            path["active_paths"] = [name for name in path.get("active_paths", [])
+                                    if name != "storage_active"]
+        owner_guard = _phase5_owner_safety_veto_contract(result, path)
+    except Exception:
+        owner_guard = {"veto": True, "reason_codes": ["FINAL_OWNER_CONTRACT_INVALID"]}
+    source_ts = _consumer_runtime_finite(source.get("sample_ts"))
+    hard_veto = bool(
+        owner_guard.get("veto") or result.get("safety_veto")
+        or result.get("suppress_rscp_output")
+        or result.get("storage_regulation_enabled") is False
+        or source.get("fresh") is not True or source_ts is None
+        or not 0.0 <= now_s - source_ts <= 10.0
+        or grant.get("protection_reason")
+    )
+    protected_binding = bool(
+        state.get("cycle_owned") and grant.get("valid")
+        and (grant.get("hold_required") or grant.get("command_outstanding"))
+    )
+    retained = bool(changed and protected_binding and not hard_veto)
+    if retained:
+        # Reine Speicheroptimierung darf eine bereits vor dem Kompressorstart
+        # zugesagte Wärmequelle während ihrer Schutzfrist nicht zurücknehmen.
+        for key in (
+            *output_keys, "mode_name", "storage_req_w", "state", "priority",
+            "reason", "display_reason", "protected",
+            "heatpump_pv_set_power_only", "heatpump_pv_bridge_dispatch_w",
+            "heatpump_pv_non_wp_discharge_w", "house_heatpump_discharge_cap_w",
+        ):
+            if key in before_arbitration:
+                result[key] = copy.deepcopy(before_arbitration[key])
+            else:
+                result.pop(key, None)
+        diagnostic = copy.deepcopy(result.get("storage_dispatch_phase5") or {})
+        diagnostic.update({
+            "selected": False, "executable": False, "commands_allowed": False,
+            "selected_source": "protected_heatpump_source_binding",
+            "hardware_effect": False,
+        })
+        result["storage_dispatch_phase5"] = diagnostic
+    elif changed or hard_veto:
+        result.pop("heatpump_pv_set_power_only", None)
+        grant["command_authorized"] = False
+        grant["blockers"] = list(dict.fromkeys([
+            *(grant.get("blockers") or []), "final_storage_source_not_bound",
+        ]))
+        grant["reason"] = "final_storage_source_not_bound"
+        if hard_veto and protected_binding:
+            # Die Frist wird nur mit dem bestehenden, benannten Schutzveto
+            # übergeben. Wh und Kompressoranker werden dadurch nicht gelöscht.
+            grant["hold_required"] = False
+            grant["withdrawal_required"] = True
+            grant["protection_reason"] = (
+                grant.get("protection_reason") or (
+                    "emergency_reserve" if result.get("ep_reserve_hold") or result.get("ep_reserve_discharge_hold")
+                    else "house_connection_limit" if str(result.get("state") or "").startswith("peak_shaving")
+                    else "invalid_control_data"
+                )
+            )
+    budget = result.setdefault("budget", {})
+    contract = budget.setdefault("consumer_budget_contract", {})
+    contract["heatpump_pv_contract"] = grant
+    contract["heatpump_pv_source"] = copy.deepcopy(source)
+    budget["heatpump_pv_contract"] = copy.deepcopy(grant)
+    permission = bool(grant.get("command_authorized") or grant.get("hold_required"))
+    contract["heatpump_boost_permission_active"] = permission
+    budget["heatpump_boost_permission_active"] = permission
+    result["heatpump_pv_final_owner"] = {
+        "bound": bool(not hard_veto and (not changed or retained)),
+        "protected_binding_retained": retained,
+        "owner_guard": owner_guard,
+    }
+    return result
+
+
+def checkpoint_heatpump_pv_grant(
+    payload: Dict[str, Any],
+    *,
+    now_s: float,
+    force: bool = False,
+) -> bool:
+    """Persistiert das einzige Wh-Konto, bevor ein neuer Wärmeauftrag sichtbar wird."""
+    budget = payload.get("budget") if isinstance(payload.get("budget"), dict) else {}
+    contract = budget.get("consumer_budget_contract")
+    contract = contract if isinstance(contract, dict) else {}
+    grant = contract.get("heatpump_pv_contract")
+    if not isinstance(grant, dict) or not grant:
+        return True
+    state = grant.get("state")
+    new_command = grant.get("command_authorized") is True
+    try:
+        persisted = heatpump_pv_checkpoint.persist_heatpump_pv_checkpoint(
+            state, now_s=now_s, force=bool(force or new_command),
+        ) is True
+    except Exception as exc:
+        log.error("Dauerhaftes Wärmekonto konnte nicht gesichert werden: %s", type(exc).__name__)
+        persisted = False
+    grant = copy.deepcopy(grant)
+    grant["checkpoint_confirmed"] = persisted
+    if not persisted:
+        grant["command_authorized"] = False
+        grant["blockers"] = list(dict.fromkeys([
+            *(grant.get("blockers") or []), "energy_checkpoint_unconfirmed",
+        ]))
+        grant["reason"] = "energy_checkpoint_unconfirmed"
+        # Laufende Schutzbindungen und belegte Wh bleiben erhalten. Der Fehler
+        # verweigert ausschließlich eine neue Zusage; er erzeugt keinen Stopp.
+    contract["heatpump_pv_contract"] = grant
+    budget["heatpump_pv_contract"] = copy.deepcopy(grant)
+    if grant.get("allocation_owned") is not False:
+        contract["heatpump_boost_permission_active"] = bool(
+            grant.get("command_authorized") or grant.get("hold_required")
+        )
+        budget["heatpump_boost_permission_active"] = contract["heatpump_boost_permission_active"]
+    payload["heatpump_pv_checkpoint"] = {
+        "confirmed": persisted, "new_command_blocked": bool(new_command and not persisted),
+    }
+    return persisted
 
 
 def carry_consumer_budget_runtime_state(
@@ -33243,6 +34191,7 @@ def write_state(payload: Dict[str, Any], plan: Dict[str, Any]) -> None:
             else {}
         ),
         "storage_dc_first_charge_limit_active": bool(payload.get("storage_dc_first_charge_limit_active")),
+        "storage_dc_first_consumer_release_w": payload.get("storage_dc_first_consumer_release_w", 0),
         "storage_dc_first_charge_limit_contract_version": payload.get(
             "storage_dc_first_charge_limit_contract_version"
         ),
@@ -33531,7 +34480,7 @@ _WB_BUDGET_CONTROL_KEYS = {
     "adaptive_curve_relation", "direct_marketing_active", "direct_marketing_policy_target_state",
     "force_wallbox_stop", "predump_active", "predump_allow_wallbox", "predump_floor_hold",
     "predump_target_soc", "predump_bev_block_w", "predump_discharge_allocations_w", "predump_discharge_add_w",
-    "predump_discharge_contract", "heatpump_start_funding",
+    "predump_discharge_contract", "heatpump_start_funding", "heatpump_pv_contract",
     "live_sample_invalid", "phase_contract",
     "phases", "budget_ready", "can_start_or_hold", "real_charging", "switch_to_1p_ready",
     "iFc_w", "iMinLade_w", "iMinLade_raw_w", "iMinLade2_w", "iBattLoad_w",
@@ -33950,6 +34899,7 @@ def apply_wallbox_start_hold_runtime_cap(
         "extension_w": 0,
         "charge_reduction_w": 0,
         "discharge_support_w": 0,
+        "grid_support_w": 0,
         "blockers": blockers,
     })
     result["wallbox_start_hold_active"] = False
@@ -41915,6 +42865,7 @@ def execute_rscp_cycle(
         auto_limit=payload_auto_limit,
         discharge_cap_w=safe_int(payload.get("max_discharge_w"), 0),
         auto_discharge_cap_w=getattr(ctrl, "_auto_discharge_cap", 0),
+        **({"set_power_only": True} if (payload.get("heatpump_pv_set_power_only") is True or payload.get("wallbox_fixed_start_set_power_only") is True) else {}),
     )
     payload["rscp_command_contract_version"] = safe_int(rscp_contract.get("contract_version"), 0)
     payload["rscp_command_path"] = rscp_contract.get("path")
@@ -42025,6 +42976,7 @@ def execute_rscp_cycle(
         or bool(rscp_contract.get("limit_refresh")),
         discharge_cap_w=safe_int(payload.get("max_discharge_w"), 0),
         auto_limit=payload_auto_limit,
+        **({"set_power_only": True} if (payload.get("heatpump_pv_set_power_only") is True or payload.get("wallbox_fixed_start_set_power_only") is True) else {}),
     )
     if not isinstance(send_receipt, dict):
         send_receipt = {}
@@ -42479,6 +43431,11 @@ def main() -> None:
         # Wallclock-Alter ist hier keine Ablaufquelle: Restzeit, Bootwechsel und
         # Uhrsprünge entscheidet der monotone Guard im ersten Producerzyklus.
         previous_state.update(restored_consumer_budget)
+    previous_state = restore_heatpump_pv_durable_state(
+        previous_state,
+        heatpump_pv_checkpoint.load_heatpump_pv_checkpoint(now_s=time.time()),
+        clock_sample=control_time.sample(),
+    )
     if isinstance(persisted_manager_state, dict) and isinstance(
         persisted_manager_state.get("wallbox_start_hold_grants"),
         dict,
@@ -42780,6 +43737,7 @@ def main() -> None:
         # und unmittelbar vor dem einzigen RSCP-Ausgang. Der bestätigte
         # POWER_SETTINGS-Zustand stammt aus dem vorherigen Managerzyklus; ein
         # Phase-5-Fehler verändert die Legacyentscheidung nicht.
+        heatpump_source_bound_payload = copy.deepcopy(payload)
         payload = apply_storage_dispatch_phase5(
             cfg,
             plan,
@@ -42796,6 +43754,10 @@ def main() -> None:
             payload,
             now_s=time.time(),
         )
+        payload = finalize_heatpump_pv_output_owner(
+            cfg, plan, heatpump_source_bound_payload, payload, now_s=time.time(),
+        )
+        payload = finalize_wallbox_fixed_start_output(payload)
         # Phase 5 und die unmittelbare Quellenprüfung liegen absichtlich vor
         # dem einzigen RSCP-Ausgang. Die veröffentlichte Anzeige muss deshalb
         # den finalen Hardwarevertrag und nicht die frühere Vorentscheidung
@@ -42821,6 +43783,7 @@ def main() -> None:
         # Aktive Eingriffe müssen gehalten werden: einige E3DC-Firmwares fallen
         # sonst nach wenigen Sekunden in interne PV-Ladung/Entladung zurück.
         # AUTO bleibt der einzige bewusst nicht ge-heartbeatete Freilaufpfad.
+        checkpoint_heatpump_pv_grant(payload, now_s=start)
         execute_rscp_cycle(ctrl, payload, ownership)
         confirm_storage_dc_first_charge_recovery_anchor(
             payload,
@@ -42949,6 +43912,7 @@ def main() -> None:
         ctrl.close_for_handover()
     stop_ts = int(time.time())
     persisted_terminal_state = read_json_file(STATE_F)
+    checkpoint_heatpump_pv_grant(previous_state, now_s=stop_ts, force=True)
     stopped_consumer_budget_state = terminal_consumer_budget_runtime_state(
         previous_state,
         persisted_terminal_state,

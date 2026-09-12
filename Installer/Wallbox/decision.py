@@ -745,8 +745,10 @@ def wallbox_detail_status_contract(
         }
 
     start_permission_active = bool(
-        manager_set_amp > 0
-        or cap_value > 0
+        (
+            bool(physical.get("budget_ready", allowed_value_w >= min_power_w))
+            and (manager_set_amp > 0 or cap_value > 0)
+        )
         or scheduled_slot_active
         or price_boost_active
         or predump_wallbox_active
@@ -2043,9 +2045,15 @@ def openwb_phase_switch_capability(
         # Die offizielle openWB-Pro-Dokumentation nennt ``basic iec61851``;
         # aktuelle connect.php-Versionen liefern für denselben reinen
         # IEC-61851-PWM-Pfad auch den Kurzwert ``basic``. Nur diese beiden
-        # exakten Werte öffnen die Phasenumschaltung. HLC-, ISO-15118- und
-        # kombinierte Diagnosewerte bleiben weiterhin fail-closed.
-        signaling_basic = signaling in ("basic", "basic iec61851")
+        # exakten Werte sowie der PWM-Modus mit SoC-Abfrage öffnen die
+        # Phasenumschaltung. openWB/core sperrt den Wechsel bei echtem HLC;
+        # basic+fake_highlevel_dc bleibt ein eigener Kommunikationswert.
+        # Referenz: openWB/core, packages/control/chargepoint/chargepoint.py,
+        # hw_supports_phase_switch und initiate_phase_switch.
+        # Unbekannte Kombinationen und echte HLC-/ISO-15118-Werte bleiben zu.
+        signaling_basic = signaling in (
+            "basic", "basic iec61851", "basic+fake_highlevel_dc",
+        )
         signaling_hlc = bool("hlc" in signaling or "iso15118" in signaling)
         can_switch = bool(
             status_fresh
@@ -2361,11 +2369,35 @@ def phase_observation_contract(
         and wallbox_phases >= 3
     )
 
+    # Ein eigener fester Strompfad bindet die bestätigte Stecksession an den
+    # aktuellen Zyklus. Momentane Null-/Teilphasen dürfen sie nicht verkleinern.
+    fixed_session = cd.get("_fixed_phase_session_contract")
+    fixed_session = fixed_session if isinstance(fixed_session, dict) else {}
+    fixed_session_bound = bool(
+        fixed_session.get("contract") == "fixed_phase_session_v1"
+        and fixed_session.get("active") is True
+        and str(fixed_session.get("session_id") or "")
+        and fixed_session.get("session_id") == cd.get("_fixed_phase_session_id")
+        and str(cd.get("_wallbox_cycle_token") or "")
+        and fixed_session.get("cycle_token") == cd.get("_wallbox_cycle_token")
+        and not can_switch
+        and not autonomous_can_switch
+        and charger_class_name != "OpenWBCharger"
+        and valid_phase_count(fixed_session.get("command_phase_count"), 0)
+    )
+    fixed_session_phases = valid_phase_count(fixed_session.get("command_phase_count"), 0)
+
     phase_evidence_valid = False
     reason_code = "none"
     vehicle_phase_source = "none"
 
-    if actual_phases:
+    if fixed_session_bound:
+        effective = max(fixed_session_phases, actual_phases)
+        phase_evidence_valid = fixed_session.get("confirmed") is True
+        basis = "fixed_session_confirmed" if phase_evidence_valid else "fixed_session_start_upper_bound"
+        reason_code = str(fixed_session.get("reason") or basis)
+        vehicle_phase_source = "session_stable_6a_measurement" if phase_evidence_valid else "fixed_session_start_upper_bound"
+    elif actual_phases:
         effective = actual_phases
         basis = actual_source
         phase_evidence_valid = True
@@ -2397,7 +2429,7 @@ def phase_observation_contract(
         phase_evidence_valid = True
         vehicle_phase_source = "evse_idle_target_readback"
         reason_code = f"evse_idle_confirmed_target_{target}p"
-    elif vehicle_profile_phase_bound and vehicle_phases >= 3:
+    elif vehicle_profile_phase_bound and vehicle_phases in (2, 3):
         effective = min(evse_supply_phases, vehicle_phases)
         basis = "vehicle_profile"
         phase_evidence_valid = True
@@ -2446,6 +2478,9 @@ def phase_observation_contract(
     return {
         "actual_phases": int(actual_phases),
         "actual_source": actual_source,
+        "fixed_session_phase_bound": bool(fixed_session_bound),
+        "fixed_session_phase_confirmed": bool(fixed_session_bound and fixed_session.get("confirmed") is True),
+        "fixed_session_phase_count": int(fixed_session_phases if fixed_session_bound else 0),
         "effective_phases": int(effective),
         "effective_source": basis,
         "effective_load_phases": int(effective),

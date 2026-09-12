@@ -107,7 +107,12 @@ RUN find -P /app/pi/Install -xdev -type d -exec chmod 0755 -- {} + && \
     test -f /app/pi/Install/Installer/Storage/process_singleton.py && \
     test -f /app/pi/Install/Installer/Wallbox/process_singleton.py && \
     test -f /app/pi/Install/Installer/Wallbox/start_hold.py && \
+    test -f /app/pi/Install/Installer/Wallbox/fixed_phase_session.py && \
+    test -f /app/pi/Install/Installer/Wallbox/fixed_phase_runtime.py && \
+    test -f /app/pi/Install/Installer/Wallbox/fixed_start_energy.py && \
     test -f /app/pi/Install/Installer/control_time.py && \
+    test -f /app/pi/Install/Installer/heatpump_pv_contract.py && \
+    test -f /app/pi/Install/Installer/heatpump_pv_state.py && \
     test -f /app/pi/Install/Installer/direct_marketing_actions.py && \
     test -f /app/pi/Install/Installer/docker_healthcheck.py && \
     test -f /app/pi/Install/Installer/ha_writer_admission.py && \

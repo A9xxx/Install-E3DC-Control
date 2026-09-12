@@ -1817,6 +1817,8 @@ def install_docker_routine():
     image: "ghcr.io/a9xxx/install-e3dc-control:${{E3DC_IMAGE_TAG:-latest}}"
     container_name: e3dc-control
     hostname: e3dc-control
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
     network_mode: host # Kompatibilität für Matter/mDNS und vorhandene Host-Loopback-Ziele; RSCP ist ein TCP-Client
     logging:

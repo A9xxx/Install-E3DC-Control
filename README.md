@@ -1,12 +1,12 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.6c</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.6d</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.4.6c**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.4.6d**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
 
 Dieses Update ergänzt die begrenzte Phasenerkennung fester E3DC-Wallboxen, verbessert die Leistungszuteilung und schützt den Luxtronik-PV-Boost durch getrennte Aufträge und Energiegrenzen. Vor automatischem PV-Boost das elektrische Leistungsprofil und erlaubte Kontingente im Config Editor prüfen. Vor dem Docker-Upgrade zuerst den aktuellen Host-Updater und die Hinweise zu Volume-Sicherung und Rückfall in der [Docker-Dokumentation](doc/Docker_Dokumentation.md) beachten.
 
@@ -44,7 +44,7 @@ sondern eine eindeutige Auswahl verlangt.
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
 
-> **Neu in 5.4.6c:** Begrenzter 6-A-Erkennungsstart an festen E3DC-Wallboxen, abgestimmte Mehrfachladung und Luxtronik-PV-Aufträge mit Verdichter- und Energiegrenzen. Zusätzlich verbesserte Kompatibilität älterer Compose-Versionen und Kernel. Bitte zuerst den Host-Updater aktualisieren und bei Luxtronik das Leistungsprofil prüfen. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
+> **Neu in 5.4.6d:** Eigene Compose-Dateien und Bind-Mounts, korrigiertes manuelles Speicherladen und zeitgerichtete Halteplanung, verständlichere Konfiguration sowie verbesserte Luxtronik-PV- und Warmwasserregelung. Einzelheiten und Betriebsgrenzen stehen in den [Release Notes](RELEASE_NOTES.md).
 
 > **Neu in 5.4.5d:** Docker startet wieder mit bestehenden Datenvolumes im Standardschutzmodus `2770`. Startprüfung und Rechteverwaltung berücksichtigen denselben konfigurierten Datenschutzmodus. Die Korrektur gilt auch ohne Wallbox; unsichere Dateizustände bleiben gesperrt. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
 
@@ -508,7 +508,7 @@ sudo docker compose logs --tail=80 e3dc-control
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin wird
-> `E3DC_IMAGE_TAG=v5.4.6c` in `.env` gesetzt. `config --images` zeigt vor dem
+> `E3DC_IMAGE_TAG=v5.4.6d` in `.env` gesetzt. `config --images` zeigt vor dem
 > Pull das tatsächlich gewählte Image.
 >
 > Vor dem `pull` prüft der Helfer mindestens 2 GiB freien Platz im

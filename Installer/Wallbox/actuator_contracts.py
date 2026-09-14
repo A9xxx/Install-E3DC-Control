@@ -353,12 +353,12 @@ class WallboxCapability:
             source = str(phase_cap.get("source") or "fail_closed")
             evidence_quality = "unknown"
         elif autonomous:
-            # Belegt ist die interne efy-Phasenautomatik. Dass der vorhandene
-            # WBchar6-Pfad sie aktiviert, bleibt ein feldverifizierter Vertrag.
+            # Herstellerfähigkeit und historischer Feldnachweis bleiben
+            # getrennt; die Diagnose übernimmt die gebundene Herkunft.
             phase_control = "autonomous_vendor"
             supported_phases = (1, 3)
             source = str(phase_cap.get("autonomous_source") or source)
-            evidence_quality = "field_verified_legacy"
+            evidence_quality = str(phase_cap.get("autonomous_provenance") or "unknown")
         elif direct:
             phase_control = "direct"
             supported_phases = (1, 3)

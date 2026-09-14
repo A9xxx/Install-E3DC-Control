@@ -27,13 +27,18 @@ Dieses Modul erweitert **E3DC-Control** um eine intelligente Steuerung für Wär
 
 ### PV-Boost nach einem Update
 
-Für den automatischen Luxtronik-PV-Boost (`wp_type=0`) werden ein elektrisches
-Leistungsprofil und ausdrücklich erlaubte Akku-/Netzkontingente benötigt.
-Fehlen diese Angaben, warten neue optionale PV-Starts. Normale Heizung,
-Warmwasser-Zeitfenster und deren bestehende Schutzfunktionen bleiben unabhängig.
-Die Installation selbst wird dadurch nicht blockiert. Die Einrichtung steht
-im Config Editor unter **PV-Überschuss-Boost → Luxtronik: Leistungsprofil und
-Energie zur Überbrückung**.
+Für den automatischen Luxtronik-PV-Boost (`wp_type=0`) gibt es zwei
+Betriebsarten. **Messwertgeführt mit Wh-Wächtern** verwendet eine plausible
+Startleistung und danach die gemessene Aufnahme. **Vollständige
+Vorreservierung** erhält die bisherige strenge Energiezusage. Bestehende
+Konfigurationen bleiben beim Update in ihrer bisherigen Betriebsart. Der
+Wechsel erfolgt ausdrücklich im Config Editor unter **PV-Überschuss-Boost →
+Luxtronik: PV-Automatik und Wolkenüberbrückung**.
+
+Akku und Netz dürfen nur mit ausdrücklich eingeräumter Leistung und Energie
+überbrücken. Fehlende Deckung lässt neue optionale PV-Starts warten. Normale
+Heizung, Warmwasser-Zeitfenster und deren Schutzfunktionen bleiben unabhängig.
+Die Installation selbst wird dadurch nicht blockiert.
 
 Eine ungenutzte Startfreigabe wird nicht als Ende des Wärmebedarfs behandelt.
 Heizung und Warmwasser besitzen getrennt zugeordnete Aufträge und
@@ -94,71 +99,147 @@ Die Bearbeitung erfolgt am einfachsten über das **Web-Interface** (Config Edito
 | `hz` | Absoluter Heizungs-Sollwert für den Rücklauf während des Boosts. | `32.0` |
 | `luxtronik_pause_setpoint_c` | Rücklauf-Sollwert für die weiche SHI-Sollwertsperre. EMS-Sicherheitsbereich 15 bis 22 °C; keine echte EVU-/SG-Ready-Sperre. | `20.0` |
 
-### Leistungsprofil und Quellen für den Luxtronik-PV-Boost
+### PV-Automatik und Überbrückung
 
-Die folgenden Werte gelten für `wp_type=0`. Das Leistungsprofil muss die
-maximal mögliche **elektrische** Aufnahme innerhalb derselben Messgrenze
-beschreiben, die der Regler für die WP verwendet. Thermische Heizleistung,
-typischer Verbrauch und Startschwelle sind keine sicheren Obergrenzen.
-Nicht erfasste Pumpen verbleiben in der Hauslast oder werden separat genau
-einmal berücksichtigt. Eine mögliche Zusatzheizung darf weder im Profil
-fehlen noch nochmals als eigener Verbraucher abgezogen werden.
+Für die normale Einrichtung genügt die Wahl **Messwertgeführt mit
+Wh-Wächtern**. Danach die erlaubten Quellen auswählen und eine
+**Voreinstellung übernehmen**. Die Vorschau nennt vorab alle vier Werte,
+die übernommen werden. Erst das Speichern aktiviert die Änderungen.
+Das Öffnen der Seite, ein Betriebsartwechsel oder die Auswahl einer
+Voreinstellung verändert vorhandene Quellenwerte nicht automatisch.
+
+| Voreinstellung | Akkuenergie in 24 Stunden | Netzenergie in 24 Stunden |
+| :--- | ---: | ---: |
+| Kurze Überbrückung | 500 Wh | 50 Wh |
+| Normale Überbrückung | 1.000 Wh | 100 Wh |
+| Lange Überbrückung | 2.000 Wh | 200 Wh |
+
+Nur ausdrücklich ausgewählte Quellen werden beim Übernehmen freigegeben.
+Für den Akku schlägt die Bedienung den elektrischen Profilwert, ersatzweise
+die Startleistung vor; für eine erlaubte Netzüberbrückung 1.000 W. Aktuelle
+Speicher-, Reserve- und Hausanschlussgrenzen begrenzen diese Werte zusätzlich.
+Die Voreinstellungen sind veränderbare Projektwerte, keine Hersteller- oder
+Normvorgaben. Eine universell passende Energiemenge gibt es wegen
+unterschiedlicher Anlagenleistung, Modulation und Laufzeit nicht.
+
+**Feinabstimmung: Start, Quellen und Verdichterschutz** enthält die selten
+benötigten Einzelwerte. Ein Wechsel zur messwertgeführten Regelung behält
+die Werte bei, ändert aber bewusst die Bedeutung positiver Wh-Kontingente:
+Sie können während einer bestätigten Mindestlaufzeit überschritten werden.
+Wer eine absolute Energiezusage benötigt, behält die vollständige
+Vorreservierung bei.
 
 | Parameter | Bedeutung | Standard |
 | :--- | :--- | :--- |
-| `wp_pv_max_power_w` | Belegte maximale elektrische Aufnahme in W innerhalb der WP-Messgrenze. `0` bedeutet: Profil fehlt. | `0` |
-| `wp_pv_battery_max_w` | Maximal erlaubte Akku-Überbrückungsleistung für die WP in W. `0` sperrt diese Quelle. | `0` |
+| `wp_pv_control_mode` | `measured`: Istaufnahme und Wh-Wächter; `reserved`: vollständige Vorreservierung. | `reserved` |
+| `wp_pv_start_power_w` | Erwartete elektrische Startleistung. `0` übernimmt den Betrag von `grid_start_limit`, ersatzweise 3.500 W; ein positiver Profilwert begrenzt den Startwert. | `0` |
+| `wp_pv_max_power_w` | Elektrischer Profilwert innerhalb der WP-Messgrenze. Im Messwertbetrieb optional; `0` bedeutet unbekannt. Bei Vorreservierung ist ein belegter Maximalwert erforderlich. | `0` |
+| `wp_pv_battery_max_w` | Erlaubte Akku-Überbrückungsleistung in W. `0` sperrt diese Quelle. | `0` |
 | `wp_pv_battery_limit_wh` | Akkuenergie für PV-Überbrückung in den jeweils letzten 24 Stunden. `0` sperrt diese Quelle. | `0` |
-| `wp_pv_grid_max_w` | Maximal erlaubte Netz-Überbrückungsleistung für die WP in W. `0` sperrt diese Quelle. | `0` |
+| `wp_pv_grid_max_w` | Erlaubte Netz-Überbrückungsleistung in W. `0` sperrt diese Quelle. | `0` |
 | `wp_pv_grid_limit_wh` | Netzenergie für PV-Überbrückung in den jeweils letzten 24 Stunden. `0` sperrt diese Quelle. | `0` |
 | `wp_min_runtime_min` | Geschützte Verdichterlaufzeit ab bestätigtem physischem Start. | `30` |
 | `wp_restart_block_min` | Wiedereinschaltsperre nach bestätigtem Verdichterstopp. | `20` |
-| `pv_boost_delay` | Dauer der stabilen PV-Startqualifikation in Sekunden, bevor eine verbindliche Startzuteilung beginnt. | `30` |
-| `wp_pv_reaction_s` | Für Messung, Kommunikation und wirksame Lastanpassung anzusetzende Reaktionsfrist in Sekunden. Muss zum Geräteprofil passen. | `30` |
-| `wp_pv_start_wait_s` | Wartefrist auf den tatsächlichen Verdichterstart nach einem Auftrag; mindestens 600 Sekunden. | `600` |
-| `wp_pv_handoff_timeout_s` | Frist für die Übergabe von Wallboxleistung vor dem WP-Auftrag in Sekunden. | `120` |
+| `pv_boost_delay` | Dauer der stabilen PV-Startqualifikation vor einer verbindlichen Startzuteilung in Sekunden. | `30` |
+| `wp_pv_reaction_s` | Reaktionsfrist für Messung, Kommunikation und wirksame Lastanpassung in Sekunden. | `30` |
+| `wp_pv_start_wait_s` | Wartefrist auf den tatsächlichen Verdichterstart; mindestens 600 Sekunden. | `600` |
+| `wp_pv_handoff_timeout_s` | Frist für die bestätigte Übergabe von Wallboxleistung in Sekunden. | `120` |
 
-Bei jeder Quelle müssen Leistung **und** Energie erlaubt sein. Vor einem
-optionalen Start reserviert der Regler Energie für die maximale Geräteaufnahme
-während Mindestlaufzeit, Startwartefrist und Reaktionsfrist. Die konfigurierten
-Kontingente müssen diese Zusage auch bei ausfallender PV tragen können.
-Erwarteter Sonnenschein ersetzt diese Deckung nicht. Reicht das Kontingent
-nicht, wartet der zusätzliche PV-Start mit einem Diagnosegrund. Aktuelle
-Speicherleistung, Notstromreserve, Hausanschlussgrenzen und bereits gebundene
-Verbraucher begrenzen die tatsächlich verfügbare Deckung zusätzlich.
+Der elektrische Profilwert ist keine thermische Heizleistung. Er beschreibt
+die WP-Messgrenze einschließlich dort erfasster Pumpen und möglicher
+Zusatzheizung. Nicht erfasste Pumpen verbleiben in der Hauslast; jede Leistung
+wird genau einmal bilanziert. Im Messwertbetrieb toleriert die
+Plausibilitätsprüfung Abweichungen bis zum größeren Wert aus 100 W und 5 %
+des Profils. Das berücksichtigt begrenzte Messauflösung und einen gerundeten
+Profilwert; es ist keine Herstellerfreigabe. Die Istaufnahme wird vollständig
+gezählt und keine Hardware- oder Quellengrenze angehoben.
 
-Bei freier Speicherautomatik kann der Akku einen Lastsprung bereits übernehmen,
-bevor die nächste EMS-Vorgabe wirkt. Auch eine überwiegend aus dem Netz
-vorgesehene Überbrückung benötigt deshalb ein erlaubtes Akku-Reaktionspolster,
-solange eine wirksame Entladesperre nicht belegt ist. Eine gewünschte
-Speicherbetriebsart allein belegt weder eine Sperre noch verfügbare Leistung.
+Eine bewusst niedrige Akku-Leistungsfreigabe kann eine zusätzliche
+Leistungsreserve erfordern: Die freie E3DC-Automatik könnte bei einem
+Lastsprung zunächst mehr Akkuenergie einsetzen als erlaubt. Wird sie deshalb
+über den flüchtigen Speicherausgang begrenzt, darf die Regelung keine
+zusätzliche sofortige Akkuantwort voraussetzen. In diesem Fall wartet ein
+Start auf genügend freie Leistung; auch während des Betriebs kann weniger
+Restleistung für die Wallbox verfügbar sein. Der Regler ändert dafür keine
+permanenten E3DC-Leistungseinstellungen.
 
-Verbrauchte Wh werden aus der gebundenen Restenergie umgebucht. Spätere
-Einspeisung erstattet sie nicht. Das rollierende 24-Stunden-Kontingent wird
-weder um Mitternacht noch durch Wolkenwechsel, HZ-/WW-Wechsel,
-Prioritätswechsel oder Dienstneustart zurückgesetzt. Nach geklärtem Zyklusende
-wird nur ungenutzte Reservierung freigegeben. Fehlende Messungen oder ein
-ungültiger Laufzeitzustand erzeugen keine kostenlose Energie und erlauben
-keinen neuen Start ohne geklärte Deckung.
+#### Messwertgeführt mit Wh-Wächtern
 
-Das Energiekonto und die noch möglicherweise wirksamen PV-Kanalaufträge
-werden getrennt und privat dauerhaft gespeichert. Neue Energiezusagen und
-Auftragsabsichten werden vor ihrer Freigabe gesichert. Ein Dienst- oder
-Hostneustart eröffnet deshalb kein neues Kontingent. Fehlt ein vertrauenswürdiges
-Konto, etwa bei der ersten Einrichtung oder einer Docker-Neuerstellung,
-warten neue optionale PV-Starts zunächst 24 Stunden nachweisbar verstrichene
-Laufzeit. Ein weiterer Neustart behält die Restwartezeit bei. Die Freigabe
-setzt anschließend frische Messwerte, einen bestätigten Verdichterstillstand
-und geklärte alte Aufträge voraus. Normale Heizung und berechtigte
-Warmwasser-Zeitfenster bleiben davon unabhängig. Die privaten Dateien dürfen
-nicht als vermeintliche Reparatur gelöscht werden.
+Vor dem Start muss ausreichend Überschuss für den Startwert qualifiziert
+sein. Eine ausgeschaltete WP mit 0 W Aufnahme begründet keinen kostenlosen
+Start. Zusätzlich prüft der Regler Quellenleistung und einen kurzen
+Reaktionspuffer: elektrischer Profilwert, ersatzweise Startwert, multipliziert
+mit der Reaktionsfrist. Eine Reservierung der Maximalleistung für die gesamte
+Startwartezeit und Mindestlaufzeit entfällt.
 
-Die Fristen sind Einstellungen des Energiemanagements, keine garantierten
-Herstellerzeiten. Ohne belegte Leistungsrampe muss die Überbrückung den
-möglichen Leistungssprung tragen. Die AIT-SHI-Anleitung empfiehlt für
-PV-Betrieb eine Ausschaltverzögerung. Eine dort beschriebene weiche
-Leistungsbegrenzung kann bei entsprechender Temperaturabweichung übergangen
-werden und ist deshalb keine harte elektrische Obergrenze.
+Nach dem bestätigten Start bestimmt die tatsächliche Aufnahme das laufende
+Budget. Beispielsweise verbleiben bei 2.000 W verfügbarer Leistung und
+1.500 W WP-Aufnahme 500 W für nachrangige Verbraucher, soweit Quellenreaktion
+und übrige Schutzgrenzen dies erlauben. Die Wh-Wächter zählen nur die
+zugeordnete tatsächliche Akku- und Netzüberbrückung: 300 W für zehn Minuten
+sind 50 Wh. Erwartete Leistung wird nicht als gemessener Verbrauch gebucht.
+
+Erreicht ein positiver Wh-Wächter sein Kontingent, wird das Ende des
+zusätzlichen Boosts vorgemerkt. Während der bestätigten Mindestlaufzeit
+bleibt die erlaubte Überbrückung bestehen; Verbrauch und Überschreitung
+werden weitergezählt. Anschließend wird die PV-Anhebung zurückgenommen.
+Nutzer-Aus, eine gesperrte Quelle (`0 W` oder `0 Wh`) sowie harte Geräte-,
+Reserve-, Daten- und Leistungsgrenzen haben Vorrang. Ein fehlender bestätigter
+Verdichterstart begründet keine unbegrenzte Verlängerung der Energiezusage.
+
+Kommt nach einer Wolke ausreichend Überschuss zurück, kann eine allein
+wetterbedingte Rücknahme entfallen. Ein bereits erreichtes Wh-Kontingent
+wird dadurch nicht wieder frei. Die Rücknahme des Boost-Signals beweist
+keinen physischen Verdichterstopp; ein weiterlaufender Verdichter und eine
+noch ungeklärte Startwirkung bleiben berücksichtigt. Die normale
+Wärmepumpenregelung entscheidet weiter über ihren Wärmebedarf.
+
+#### Vollständige Vorreservierung
+
+Diese Betriebsart reserviert vor einem optionalen Start Energie für die
+maximale Geräteaufnahme während Mindestlaufzeit, Startwartefrist und
+Reaktionsfrist. Die konfigurierten Quellen müssen diese Zusage auch bei
+ausfallender PV tragen können. Erwarteter Sonnenschein ersetzt die Deckung
+nicht. Ist sie unzureichend, wartet der zusätzliche PV-Start.
+
+#### Anzeige und dauerhafte Energiekonten
+
+Die rechnerische Konfigurationsprüfung zeigt den **zuletzt geprüften
+gespeicherten Stand**, keine aktuelle Startfreigabe. Der erforderliche
+Puffer hängt von der Betriebsart ab. Pro Quelle begrenzen sowohl das
+Wh-Kontingent als auch die erlaubte Leistung während derselben Frist die
+rechnerische Abdeckung. Aktuelle Quellenleistung, Reserve und bereits
+verbrauchte oder gebundene Energie werden zur Laufzeit zusätzlich geprüft.
+Nach einer Eingabeänderung wird die bisherige Aussage als noch nicht
+aktualisiert gekennzeichnet. Nach dem Speichern die erneute Prüfung durch
+die laufende Regelung abwarten und die Seite neu laden.
+
+Im Messwertbetrieb ergänzt ein beim Laden frischer Wächterstand den
+Verbrauch, das Restkontingent, einen möglichen Überlauf und die verbleibende
+Verdichterschutzzeit. Ohne frische, gültige Daten erscheinen keine erfundenen
+Nullwerte. Für einen neuen Stand die Seite neu laden.
+
+Spätere Einspeisung erstattet verbrauchte Wh nicht. Das rollierende
+24-Stunden-Kontingent wird weder um Mitternacht noch durch Wolkenwechsel,
+HZ-/WW-Wechsel, Betriebsartwechsel, Prioritätswechsel oder Dienstneustart
+zurückgesetzt. Nach geklärtem Zyklusende wird nur ungenutzte Reservierung
+freigegeben. Ungültige Messungen erzeugen keine kostenlose Energie.
+
+Das Energiekonto und möglicherweise noch wirksame PV-Kanalaufträge werden
+getrennt und privat gespeichert. Neue Zusagen werden vor ihrer Freigabe
+gesichert. Fehlt ein vertrauenswürdiges Konto, etwa bei erster Einrichtung
+oder Docker-Neuerstellung, warten neue optionale PV-Starts zunächst
+24 Stunden nachweisbar verstrichene Laufzeit. Ein weiterer Neustart behält
+die Restwartezeit bei. Danach werden frische Daten, bestätigter Stillstand
+und geklärte alte Aufträge benötigt. Normale Heizung und berechtigte
+Warmwasser-Zeitfenster bleiben unabhängig. Private Kontodateien nicht als
+vermeintliche Reparatur löschen.
+
+Die Fristen sind EMS-Einstellungen, keine garantierten Herstellerzeiten.
+Die AIT-SHI-Anleitung empfiehlt für PV-Betrieb eine Ausschaltverzögerung.
+Eine dort beschriebene weiche Leistungsbegrenzung kann bei entsprechender
+Temperaturabweichung übergangen werden und ist daher keine harte elektrische
+Obergrenze. Daraus folgt keine allgemeingültige Vorgabe für Wh-Kontingente.
 [AIT-SHI-Anleitung, Seiten 5 und 16](https://files.ait-group.net/FILES/Alpha-InnoTec/Betriebsanleitungen/01%20Waermepumpen/05%20Regler/Zubehoer/83026900aDE_SHI.pdf)
 
 ---
@@ -328,3 +409,7 @@ Die Modbus-Sitzung bleibt auch im Zustand `NORMAL` offen.
 Das ist reine Verbindungsverwaltung und keine zusätzliche Regelwirkung:
 `Mode 0` bleibt ohne externe SHI-Beeinflussung, und die dauerhafte Sitzung
 erzeugt weder zusätzliche Sollwerte noch zusätzliche FC06-Schreibbefehle.
+
+### Warmwasser-Sollwerte des Software-Timers
+
+Bei aktiviertem Software-Timer gilt innerhalb des Zeitfensters der Normal-Sollwert und außerhalb der Eco-Sollwert. Der Timer hält seinen Sollwert auch nach Erreichen der Temperatur aufrecht; die Wärmepumpe entscheidet mit ihrer eigenen Regelung über den Verdichterbetrieb. Ein freigegebener Boost kann den Sollwert vorübergehend anheben. Anschließend gilt wieder der zum Zeitfenster passende Timer-Sollwert. Eine Absenkung wartet bei einem noch laufenden Warmwasserzyklus auf dessen bestätigtes Ende; Schutzabschaltungen bleiben vorrangig.

@@ -422,17 +422,25 @@ def _autarky_first_state(config, forecast, reserve, efficiency):
         safe_float((forecast or {}).get("full_horizon_shortage_wh"), 0.0),
     )
     energy_horizon_complete = bool((forecast or {}).get("energy_horizon_complete"))
-    # Die Autarkie-Diagnose bewertet bewusst die aggregierte Tagesenergie.
-    # Eine kleine zeitliche Unterdeckung bleibt separat als
-    # full_horizon_shortage_wh sichtbar und muss zusätzlich die Mindestgröße
-    # für einen wirtschaftlich sinnvollen Ladejob erreichen.
-    horizon_sufficient = bool(balance_wh >= buffer_wh)
+    # Späterer PV-Ertrag kann eine vorherige Versorgungslücke nicht decken.
+    # Die bereits chronologisch berechnete Unterdeckung berücksichtigt den
+    # Speicherinhalt, seine Kapazität und den Zeitpunkt des PV-Überschusses.
+    # Kleine Ladejobs bleiben durch die nachfolgende Mindestgröße gesperrt.
+    aggregate_energy_sufficient = bool(balance_wh >= buffer_wh)
+    chronological_energy_sufficient = bool(
+        energy_horizon_complete and full_horizon_shortage_wh <= 0.001
+    )
+    horizon_sufficient = bool(
+        aggregate_energy_sufficient and chronological_energy_sufficient
+    )
     low_soc_escape = bool(current_soc <= low_soc_pct + 0.001)
     active = bool(enabled and horizon_sufficient and not low_soc_escape)
     return {
         "enabled": bool(enabled),
         "active": active,
         "horizon_sufficient": horizon_sufficient,
+        "aggregate_energy_sufficient": aggregate_energy_sufficient,
+        "chronological_energy_sufficient": chronological_energy_sufficient,
         "low_soc_escape": low_soc_escape,
         "current_soc_pct": round(current_soc, 1),
         "low_soc_threshold_pct": round(low_soc_pct, 1),
@@ -479,14 +487,14 @@ def _consumer_release(config, action=None):
 
     Legacy ``cheap_grid_*`` flags intentionally do not unlock the normal
     forecast market path. They stay scoped to the legacy/negative-price boost.
-    Storage is split because grid charging and discharge holding have different
-    operator risk profiles. The normal grid-charge market path must not release
+    Grid charging includes discharge holding; hold-only operation remains
+    available without permission to charge from the grid. The normal grid-charge market path must not release
     heat pumps: they already have forecast/PV/pre-dump owners with takt
     protection, and short relative-price slots are too coarse for compressor
     protection.
     """
     storage_grid = _market_enabled(config, "market_battery_grid_charge_enable", False)
-    storage_hold = _market_enabled(config, "market_battery_hold_enable", False)
+    storage_hold = storage_grid or _market_enabled(config, "market_battery_hold_enable", False)
     action = str(action or "").strip()
     if action == "negative_price_absorb":
         return _negative_price_consumer_release(config)
@@ -578,6 +586,11 @@ def current_market_consumer_release(storage_plan, device, config=None, now_ms=No
     if action not in CONSUMER_RELEASE_ACTIONS:
         result["reason"] = "contract_not_consumer_release"
         return result
+    # Ein gespeicherter Vertrag darf eine inzwischen widerrufene normale
+    # Marktfreigabe nicht bis zur nächsten Planung weiterverwenden.
+    if action != "negative_price_absorb" and not cfg_bool(config.get("grid_friendly_mode", 1), True):
+        result["reason"] = "grid_friendly_mode_disabled"
+        return result
     if str(device).strip().lower() not in released_set:
         result["reason"] = "consumer_not_released"
         return result
@@ -637,6 +650,7 @@ def _reserve_state(config, current_soc, capacity_wh, target_soc, target_timeline
         "hard_available_discharge_soc_pct": round(hard_available_soc, 1),
         "hard_available_discharge_wh": round((hard_available_soc / 100.0) * capacity_wh, 0),
         "hard_usable_capacity_wh": round((hard_usable_capacity_soc / 100.0) * capacity_wh, 0),
+        "policy_usable_capacity_wh": round(((100.0 - reserve_floor) / 100.0) * capacity_wh, 0),
     }
 
 
@@ -904,6 +918,8 @@ def _future_need(
     reserve,
     efficiency,
     required_energy_horizon_end_ts_ms,
+    now_ms=None,
+    hold_billing_floor_ct=None,
 ):
     policy_available_from_storage_wh = max(
         0.0,
@@ -933,6 +949,35 @@ def _future_need(
     uncovered_high_deficit_wh = 0.0
     full_horizon_shortage_wh = 0.0
     horizon_energy_wh = min(hard_available_from_storage_wh, hard_usable_capacity_wh)
+    policy_capacity_wh = max(0.0, safe_float(
+        reserve.get("policy_usable_capacity_wh"),
+        hard_usable_capacity_wh - max(
+            0.0, hard_available_from_storage_wh - policy_available_from_storage_wh,
+        ),
+    ))
+    policy_energy_wh = min(policy_available_from_storage_wh, policy_capacity_wh)
+    held_energy_wh = policy_energy_wh
+    hold_hard_energy_wh = horizon_energy_wh
+    hold_hard_shortage_wh = 0.0
+    economic_shift_need_wh = 0.0
+    best_future_hold = None
+    hold_energy_complete = True
+    current = annotated[start_idx] if 0 <= start_idx < len(annotated) else {}
+    # Der laufende Slot zählt beim Halten nur mit seiner verbleibenden Last.
+    # Die bestehende Netzladebilanz über zukünftige Slots bleibt unverändert.
+    if now_ms is not None and current:
+        remaining = _clamp(
+            (safe_float(current.get("end_ts"), 0.0) - now_ms)
+            / max(1.0, safe_float(current.get("end_ts"), 0.0) - current["ts"]),
+            0.0, 1.0,
+        )
+        policy_energy_wh = max(0.0, policy_energy_wh - current["deficit_wh"] * remaining)
+        hold_hard_energy_wh = max(0.0, hold_hard_energy_wh - current["deficit_wh"] * remaining)
+        current_surplus_wh = current["surplus_wh"] * remaining * max(0.01, efficiency)
+        policy_energy_wh = min(policy_capacity_wh, policy_energy_wh + current_surplus_wh)
+        held_energy_wh = min(policy_capacity_wh, held_energy_wh + current_surplus_wh)
+        hold_hard_energy_wh = min(hard_usable_capacity_wh, hold_hard_energy_wh + current_surplus_wh)
+        hold_energy_complete = bool(current.get("energy_inputs_complete"))
     energy_horizon_complete = True
     energy_horizon_reasons = []
     energy_horizon_slot_count = 0
@@ -977,6 +1022,36 @@ def _future_need(
             int(safe_float(slot.get("ts"), 0.0))
             in price_prefix_timestamps
         )
+        hold_energy_complete = bool(hold_energy_complete and energy_horizon_complete)
+        hold_hard_slot_shortage_wh = max(0.0, slot["deficit_wh"] - hold_hard_energy_wh)
+        hold_hard_energy_wh = min(hard_usable_capacity_wh, max(
+            0.0, hold_hard_energy_wh - slot["deficit_wh"],
+        ) + slot["surplus_wh"] * max(0.01, efficiency))
+        # Beide Vorräte beachten alle Hauslasten und dieselbe rechtzeitige PV.
+        # Der Vergleichsvorrat wird nur vor teuren Lastslots erhalten. Eine
+        # spätere Vollladung begrenzt ihn ebenso; PV-Spill erzeugt keinen Nutzen.
+        policy_shortage_wh = max(0.0, slot["deficit_wh"] - policy_energy_wh)
+        policy_energy_wh = max(0.0, policy_energy_wh - slot["deficit_wh"])
+        if (
+            slot["is_high"]
+            and slot_has_bound_price
+            and (hold_billing_floor_ct is None or slot["billing_ct"] >= hold_billing_floor_ct)
+        ):
+            held_shortage_wh = max(0.0, slot["deficit_wh"] - held_energy_wh)
+            held_energy_wh = max(0.0, held_energy_wh - slot["deficit_wh"])
+            avoidable_wh = max(0.0, policy_shortage_wh - held_shortage_wh)
+            if (
+                hold_energy_complete
+                and avoidable_wh > 0.001
+            ):
+                economic_shift_need_wh += avoidable_wh
+                hold_hard_shortage_wh += hold_hard_slot_shortage_wh
+                if best_future_hold is None or slot["billing_ct"] > best_future_hold["billing_ct"]:
+                    best_future_hold = slot
+        if slot["surplus_wh"] > 0.0:
+            added_wh = slot["surplus_wh"] * max(0.01, efficiency)
+            policy_energy_wh = min(policy_capacity_wh, policy_energy_wh + added_wh)
+            held_energy_wh = min(policy_capacity_wh, held_energy_wh + added_wh)
         if slot_has_bound_price:
             if (
                 best_future_high is None
@@ -1038,10 +1113,6 @@ def _future_need(
         if "energy_horizon_tail_missing" not in energy_horizon_reasons:
             energy_horizon_reasons.append("energy_horizon_tail_missing")
 
-    economic_shift_need_wh = max(
-        0.0,
-        uncovered_high_deficit_wh - policy_available_from_storage_wh,
-    )
     full_horizon_shortage_wh = max(0.0, full_horizon_shortage_wh)
     return {
         "future_deficit_wh": round(future_deficit_wh, 0),
@@ -1053,6 +1124,9 @@ def _future_need(
         "hard_available_discharge_wh": round(hard_available_from_storage_wh, 0),
         "hard_usable_capacity_wh": round(hard_usable_capacity_wh, 0),
         "economic_shift_need_wh": round(economic_shift_need_wh, 0),
+        "best_future_hold_billing_ct": best_future_hold["billing_ct"] if best_future_hold else None,
+        "best_future_hold_end_ts": int((best_future_hold or {}).get("end_ts", 0)),
+        "hold_hard_high_shortage_wh": round(hold_hard_shortage_wh, 0),
         "full_horizon_shortage_wh": round(full_horizon_shortage_wh, 0),
         "grid_charge_need_wh": round(full_horizon_shortage_wh, 0),
         "energy_horizon_complete": bool(energy_horizon_complete),
@@ -1093,12 +1167,136 @@ def _future_need(
     }
 
 
+def _hold_horizon_allocation(annotated, current_idx, reserve, efficiency, now_ms,
+                             charge_limit_w=None, discharge_limit_w=None):
+    """Verteilt vorhandene Energie und rechtzeitige PV nach Bezugskosten.
+
+    Min-Cost-Max-Flow auf einem zeitgerichteten Speichernetz: erst möglichst
+    viel prognostizierten Bedarf decken, dann die vermiedenen Bezugskosten
+    maximieren. Kein Netzladen, keine neue Reserve und keine Geräteausgänge.
+    Die Ladekurve ist ein Ladeziel; die Hausversorgung verwendet ausschließlich
+    den Bestand oberhalb der bereits gebundenen harten Reserve.
+    """
+    from collections import deque
+    from math import isfinite
+
+    eps = 1e-6
+    current = annotated[current_idx]
+    prefix, _quality = _future_price_prefix(annotated, current_idx)
+    rows = [current] + prefix
+    if len(rows) < 2 or len(rows) > 193:
+        return {"valid": False, "reason": "hold_horizon_unavailable"}
+    expected = current["ts"]
+    for row in rows:
+        if (not row.get("energy_inputs_complete") or not row.get("price_inputs_complete")
+                or abs(row["ts"] - expected) > 1000):
+            return {"valid": False, "reason": "hold_horizon_inputs_incomplete"}
+        expected = row["end_ts"]
+    capacity = max(0.0, safe_float(reserve.get("hard_usable_capacity_wh"), 0))
+    available = min(capacity, max(0.0, safe_float(reserve.get("hard_available_discharge_wh"), 0)))
+    remaining = _clamp((current["end_ts"] - now_ms) / max(1, current["end_ts"] - current["ts"]), 0, 1)
+    loads = [float(row["deficit_wh"]) * (remaining if i == 0 else 1) for i, row in enumerate(rows)]
+    pv = [float(row["surplus_wh"]) * efficiency * (remaining if i == 0 else 1) for i, row in enumerate(rows)]
+    prices = [float(row["billing_ct"]) for row in rows]
+
+    hours = [(row["end_ts"] - (now_ms if i == 0 else row["ts"])) / 3600000
+             for i, row in enumerate(rows)]
+    numbers = [capacity, available, efficiency, *loads, *pv, *prices, *hours]
+    numbers += [v for v in (charge_limit_w, discharge_limit_w) if v is not None]
+    if (not all(isfinite(float(v)) for v in numbers) or not 0 < efficiency <= 1
+            or any(v < 0 for v in loads + pv) or any(v <= 0 for v in hours)
+            or any(loads[i] > eps and pv[i] > eps for i in range(len(rows)))
+            or any(v is not None and v < 0 for v in (charge_limit_w, discharge_limit_w))):
+        return {"valid": False, "reason": "hold_horizon_inputs_invalid"}
+    if charge_limit_w is not None:
+        pv = [min(value, charge_limit_w * hours[i] * efficiency) for i, value in enumerate(pv)]
+    demand_caps = [min(value, discharge_limit_w * hours[i]) if discharge_limit_w is not None else value
+                   for i, value in enumerate(loads)]
+
+    def allocate(initial, demands):
+        count = len(rows)
+        source, sink = count, count + 1
+        graph = [[] for _ in range(count + 2)]
+        def edge(u, v, cap, cost):
+            forward = [v, len(graph[v]), max(0.0, cap), cost]
+            reverse = [u, len(graph[u]), 0.0, -cost]
+            graph[u].append(forward); graph[v].append(reverse)
+            return forward
+        edge(source, 0, initial, 0.0)
+        sinks = []
+        for i in range(count):
+            edge(source, i, pv[i], 0.0)
+            sinks.append(edge(i, sink, demands[i], -prices[i]))
+            if i + 1 < count:
+                edge(i, i + 1, capacity, 0.0)
+        # Kürzeste augmentierende Wege; Rückkanten erlauben die Korrektur
+        # früherer Zuteilungen, statt Energie beim ersten Bedarf zu verbrauchen.
+        for _ in range(4 * count * count + 1):
+            distance = [float('inf')] * len(graph)
+            parents = [None] * len(graph)
+            distance[source] = 0.0
+            queue = deque([source]); queued = {source}
+            relaxations = 0
+            while queue:
+                u = queue.popleft(); queued.remove(u)
+                for j, e in enumerate(graph[u]):
+                    if e[2] > eps and distance[e[0]] > distance[u] + e[3] + eps:
+                        relaxations += 1
+                        if relaxations > 8 * len(graph) ** 3:
+                            raise ValueError("hold_horizon_path_limit")
+                        distance[e[0]] = distance[u] + e[3]
+                        parents[e[0]] = (u, j)
+                        if e[0] not in queued:
+                            queue.append(e[0]); queued.add(e[0])
+            if parents[sink] is None:
+                delivered = [max(0.0, demands[i] - sinks[i][2]) for i in range(count)]
+                return delivered
+            amount = float('inf'); node = sink
+            while node != source:
+                u, j = parents[node]; amount = min(amount, graph[u][j][2]); node = u
+            node = sink
+            while node != source:
+                u, j = parents[node]; e = graph[u][j]
+                e[2] -= amount; graph[node][e[1]][2] += amount; node = u
+        raise ValueError("hold_horizon_iteration_limit")
+
+    try:
+        supplied = allocate(available, demand_caps)
+        automatic_now = min(available, demand_caps[0])
+        forced_loads = list(demand_caps); forced_loads[0] -= automatic_now
+        forced = allocate(available - automatic_now, forced_loads)
+    except ValueError as exc:
+        return {"valid": False, "reason": str(exc)}
+    forced[0] += automatic_now
+    hold_wh = max(0.0, automatic_now - supplied[0])
+    saving_ct = sum((supplied[i] - forced[i]) * prices[i] / 1000 for i in range(len(rows)))
+    benefit_price = prices[0] + saving_ct * 1000 / hold_wh if hold_wh > eps else prices[0]
+    baseline_missing = max(0.0, sum(loads) - sum(forced))
+    end_ts = int(current["end_ts"])
+    if demand_caps[0] > eps and hold_wh > eps:
+        # Zeitanteil statt neuer dynamischer Leistungsregister: vorhandene
+        # Entladesperre für die benötigte Energiemenge, danach wieder AUTO.
+        end_ts = int(min(current["end_ts"], now_ms + (current["end_ts"] - now_ms) * hold_wh / demand_caps[0]))
+    schedule = [{"start_ts": int(row["ts"]), "end_ts": int(row["end_ts"]),
+                 "billing_ct": prices[i], "load_wh": round(loads[i], 3),
+                 "battery_pv_supply_wh": round(supplied[i], 3),
+                 "grid_wh": round(max(0.0, loads[i] - supplied[i]), 3)} for i, row in enumerate(rows)]
+    used_future = [i for i in range(1, len(rows)) if supplied[i] > forced[i] + eps]
+    return {"valid": True, "reason": "chronological_cost_allocation",
+            "schema_version": "storage_hold_horizon_v1", "reserve_source": "physical_reserve",
+            "available_wh": round(available, 3), "hold_wh": round(hold_wh, 3),
+            "saving_ct": round(max(0.0, saving_ct), 6), "benefit_price_ct": benefit_price,
+            "hold_end_ts": end_ts, "needed_end_ts": int(rows[max(used_future)]["end_ts"]) if used_future else end_ts,
+            "baseline_uncovered_wh": round(baseline_missing, 3), "schedule": schedule}
+
+
 def _economic_state(
     config,
     annotated,
     current_idx,
     reserve,
     required_energy_horizon_end_ts_ms,
+    now_ms=None,
 ):
     efficiency_pct = _clamp(
         _configured_float(
@@ -1159,14 +1357,21 @@ def _economic_state(
     )
 
     current = annotated[current_idx]
+    current_billing_ct = safe_float(current.get("billing_ct"), 0.0)
+    effective_hold_cost_ct = current_billing_ct + safety_correction
+    hold_billing_floor_ct = effective_hold_cost_ct + max(
+        profit_hold_ct,
+        max(1.0, abs(effective_hold_cost_ct)) * margin_hold_pct / 100.0,
+    )
     forecast = _future_need(
         annotated,
         current_idx,
         reserve,
         efficiency,
         required_energy_horizon_end_ts_ms,
+        now_ms=now_ms,
+        hold_billing_floor_ct=hold_billing_floor_ct,
     )
-    current_billing_ct = safe_float(current.get("billing_ct"), 0.0)
     future_benefit_ct = safe_float(
         forecast.get("best_future_high_billing_ct"),
         current_billing_ct,
@@ -1181,13 +1386,17 @@ def _economic_state(
 
     # Holding the battery is not grid-charging: no additional storage cycle is
     # created, so roundtrip efficiency and battery wear do not belong here.
-    effective_hold_cost_ct = current_billing_ct + safety_correction
-    future_hold_spread_ct = future_benefit_ct - effective_hold_cost_ct
+    future_hold_benefit_ct = safe_float(
+        forecast.get("best_future_hold_billing_ct"), current_billing_ct,
+    )
+    future_hold_spread_ct = future_hold_benefit_ct - effective_hold_cost_ct
     future_hold_margin_pct = (future_hold_spread_ct / max(1.0, abs(effective_hold_cost_ct))) * 100.0
     economic_shift_need_wh = safe_float(forecast.get("economic_shift_need_wh"), 0.0)
     hold_profit_ok = bool(
         economic_shift_need_wh > 100.0
         and forecast.get("future_high_deficit_wh", 0.0) > 0.0
+        and future_hold_benefit_ct > current_billing_ct
+        and future_hold_spread_ct > 0.0
         and future_hold_spread_ct >= profit_hold_ct
         and future_hold_margin_pct >= margin_hold_pct
     )
@@ -1203,6 +1412,7 @@ def _economic_state(
         "future_benefit_ct": round(future_benefit_ct, 2),
         "effective_grid_charge_cost_ct": round(effective_charge_cost_ct, 2),
         "effective_hold_cost_ct": round(effective_hold_cost_ct, 2),
+        "future_hold_benefit_ct": round(future_hold_benefit_ct, 2),
         "grid_spread_ct_per_kwh": round(grid_spread_ct, 2),
         "grid_margin_pct": round(grid_margin_pct, 1),
         "grid_profit_ok": grid_profit_ok,
@@ -1656,9 +1866,42 @@ def build_market_economics_plan(
         current_idx,
         reserve,
         required_energy_horizon_end_ts_ms,
+        now_ms=now_ms,
     )
     forecast = dict(forecast)
     current = annotated[current_idx]
+    charge_limit_w = max(0.0, safe_float(config.get("maximumladeleistung"), 5000.0))
+    discharge_limit_w = max(0.0, safe_float(config.get("maximaleentladeleistung"), charge_limit_w))
+    hold_allocation = _hold_horizon_allocation(
+        annotated, current_idx, reserve, _efficiency, now_ms,
+        charge_limit_w=charge_limit_w, discharge_limit_w=discharge_limit_w,
+    )
+    forecast["hold_horizon"] = hold_allocation
+    allocation_valid = hold_allocation.get("valid") is True
+    hold_wh = safe_float(hold_allocation.get("hold_wh"), 0.0) if allocation_valid else 0.0
+    if allocation_valid:
+        hold_benefit = safe_float(hold_allocation.get("benefit_price_ct"), current["billing_ct"])
+        hold_cost = current["billing_ct"] + economics["safety_correction_ct_per_kwh"]
+        hold_spread = hold_benefit - hold_cost
+        hold_margin = hold_spread / max(1.0, abs(hold_cost)) * 100.0
+        economics.update({
+            "future_hold_benefit_ct": round(hold_benefit, 3),
+            "hold_spread_ct_per_kwh": round(hold_spread, 3),
+            "hold_margin_pct": round(hold_margin, 3),
+            "hold_profit_ok": bool(allocation_valid and hold_wh > 0.001
+                and hold_allocation.get("saving_ct", 0) > 0.000001
+                and hold_benefit > current["billing_ct"]
+                and hold_spread >= economics["profit_hold_ct_per_kwh"]
+                and hold_margin >= economics["margin_hold_pct"]),
+        })
+    else:
+        # Unbekannte Preise bleiben unbekannt; kein Ersatzpreis und kein Halteauftrag.
+        hold_benefit = forecast.get("best_future_hold_billing_ct")
+        economics["hold_profit_ok"] = False
+    forecast.update({"economic_shift_need_wh": hold_wh,
+        "best_future_hold_billing_ct": hold_benefit,
+        "best_future_hold_end_ts": hold_allocation.get("needed_end_ts", current["end_ts"]),
+        "hold_hard_high_shortage_wh": hold_allocation.get("baseline_uncovered_wh", 0)})
     current_price_complete = bool(annotated[current_idx].get("price_inputs_complete"))
     current_price_reasons = list(annotated[current_idx].get("price_input_reasons") or [])
     price_prefix_usable = bool(
@@ -1732,7 +1975,7 @@ def build_market_economics_plan(
         current_price_complete,
         int(
             safe_float(
-                forecast.get("best_future_high_end_ts"),
+                forecast.get("best_future_hold_end_ts"),
                 current.get("end_ts"),
             )
         ),
@@ -1789,9 +2032,16 @@ def build_market_economics_plan(
         hold_price_action_contract.get("complete")
     )
     economic_shift_need_open = (
-        safe_float(forecast.get("economic_shift_need_wh"), 0.0) > 100.0
+        safe_float(forecast.get("economic_shift_need_wh"), 0.0) > 0.001
     )
     normal_market_autarky_blocked = bool(autarky_first.get("active"))
+    # Der Haltenachweis enthält auch die verbleibende Last des aktuellen
+    # Slots. Eine dort belegte echte Lücke darf nicht von der ausschließlich
+    # zukünftigen Netzladebilanz als gedeckt zurückgewiesen werden.
+    hold_autarky_blocked = bool(
+        normal_market_autarky_blocked
+        and safe_float(forecast.get("hold_hard_high_shortage_wh"), 0.0) <= 0.001
+    )
     blocked_reasons = []
     if not tariff_supported:
         blocked_reasons.append("unsupported_tariff")
@@ -1878,9 +2128,8 @@ def build_market_economics_plan(
         and storage_hold_released
         and economic_shift_need_open
         and hold_price_action_complete
-        and not normal_market_autarky_blocked
-        and forecast.get("future_high_deficit_wh", 0.0) > 0.0
-        and reserve.get("available_discharge_wh", 0.0) > 100.0
+        and not hold_autarky_blocked
+        and reserve.get("hard_available_discharge_wh", 0.0) > 0.001
     ):
         active_contract = _new_contract(
             current,
@@ -1890,6 +2139,8 @@ def build_market_economics_plan(
             economics=economics,
             consumers={"storage": True},
         )
+        active_contract["end_ts"] = min(active_contract["end_ts"], hold_allocation["hold_end_ts"])
+        active_contract["end_t"] = datetime.fromtimestamp(active_contract["end_ts"] / 1000).strftime("%H:%M")
 
     contracts = []
     current_price_prefix_end_ts_ms = int(
@@ -1920,6 +2171,7 @@ def build_market_economics_plan(
                 idx,
                 reserve,
                 required_energy_horizon_end_ts_ms,
+                now_ms=now_ms,
             )
             slot_forecast = dict(slot_forecast)
             slot_current_price_complete = bool(

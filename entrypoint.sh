@@ -276,11 +276,38 @@ try:
         if (
             parent_identity(parent_before) != parent_identity(parent)
             or not stat.S_ISDIR(parent.st_mode)
-            or parent.st_uid not in {0, web_uid}
-            or parent.st_gid != web_gid
-            or stat.S_IMODE(parent.st_mode) not in {0o770, 0o775, 0o2770, 0o2775}
         ):
-            raise SystemExit(1)
+            raise ValueError("Der Datenordner ist kein unverändert gebundenes echtes Verzeichnis.")
+        parent_ready = (
+            parent.st_uid in {0, web_uid}
+            and parent.st_gid == web_gid
+            and stat.S_IMODE(parent.st_mode) in {0o770, 0o775, 0o2770, 0o2775}
+        )
+        if not parent_ready and parent.st_uid in {0, web_uid} and not os.listdir(parent_fd):
+            # Docker legt neue Bindquellen oft als root:root/0755 an. Nur die
+            # leere Wurzel vorbereiten, mit IDs aus diesem Container-Namespace.
+            os.fchmod(parent_fd, 0o700)
+            if os.listdir(parent_fd):
+                raise ValueError("Der Datenordner wurde während der Erstvorbereitung befüllt.")
+            os.fchown(parent_fd, web_uid, web_gid)
+            os.fchmod(parent_fd, config_secret_dir_mode({}))
+            parent = os.fstat(parent_fd)
+            if parent_identity(parent) != parent_identity(os.lstat(parent_path)):
+                raise ValueError("Der Datenordner wechselte während der Erstvorbereitung.")
+            parent_ready = (
+                parent.st_uid == web_uid and parent.st_gid == web_gid
+                and stat.S_IMODE(parent.st_mode) == config_secret_dir_mode({})
+            )
+            print("-> Leeren Datenordner für den Container vorbereitet.", file=sys.stderr)
+        if not parent_ready:
+            raise ValueError(
+                "Datenordner besitzt im Container UID=%s, GID=%s, Modus=%04o; "
+                "erwartet UID 0 oder %s, GID %s und Modus 2770/2775. "
+                "Vorhandene Daten wurden nicht geändert. "
+                "Bitte den Daten-Mount und seine Rechte auf dem Host prüfen; "
+                "bei User-Namespace-Betrieb gelten dort die abgebildeten Container-IDs."
+                % (parent.st_uid, parent.st_gid, stat.S_IMODE(parent.st_mode), web_uid, web_gid)
+            )
 
         backup_name = "config_backups"
         try:
@@ -293,7 +320,7 @@ try:
             or backup_before.st_gid not in {0, web_gid}
             or stat.S_IMODE(backup_before.st_mode) & 0o002
         ):
-            raise SystemExit(1)
+            raise ValueError("config_backups muss ein echtes Verzeichnis mit passendem Eigentümer und ohne Schreibrecht für andere sein.")
         backup_identity = None if backup_before is None else (
             backup_before.st_dev, backup_before.st_ino,
             backup_before.st_uid, backup_before.st_gid,
@@ -321,7 +348,7 @@ try:
                     or stat.S_IMODE(before.st_mode) not in {0o600, 0o640, 0o644, 0o660, 0o664}
                     or not 0 <= before.st_size <= max_size
                 ):
-                    raise SystemExit(1)
+                    raise ValueError("e3dc_v4.json besitzt einen unzulässigen Dateityp, Eigentümer, Modus, Verknüpfungszähler oder Umfang.")
 
                 payload = bytearray()
                 while len(payload) <= max_size:
@@ -337,7 +364,7 @@ try:
                     or config_identity(before) != config_identity(after)
                     or config_identity(before) != config_identity(named_after)
                 ):
-                    raise SystemExit(1)
+                    raise ValueError("e3dc_v4.json wurde während der Startprüfung verändert.")
                 # Auch ohne Inhaltsmigration müssen ältere Dateien dem aktuellen
                 # Rechtevertrag entsprechen. Nur die bereits gebundene Datei ändern.
                 config_data = {}
@@ -360,7 +387,7 @@ try:
                         before.st_nlink, before.st_size, before.st_mtime_ns)
                     or stat.S_IMODE(confirmed.st_mode) != expected_mode
                 ):
-                    raise SystemExit(1)
+                    raise ValueError("Die gezielte Rechtekorrektur von e3dc_v4.json konnte nicht bestätigt werden.")
             finally:
                 os.close(config_fd)
         else:
@@ -370,7 +397,7 @@ try:
             except FileNotFoundError:
                 pass
             else:
-                raise SystemExit(1)
+                raise ValueError("e3dc_v4.json entstand während der Startprüfung neu.")
 
         # Der spätere root-Migrationslauf darf keinen noch unvorbereiteten
         # Backupordner erzeugen. Nur dieses gebundene Verzeichnis vorbereiten.
@@ -390,7 +417,7 @@ try:
                     os.fstat(parent_fd), os.fstat(parent_post_fd), os.lstat(parent_path),
                 )
             ):
-                raise SystemExit(1)
+                raise ValueError("Der Datenordner wechselte während der Startprüfung.")
         finally:
             os.close(parent_post_fd)
     finally:
@@ -406,7 +433,8 @@ try:
         except Exception:
             pass
     print(config_secret_dir_mode_text(data))
-except (KeyError, OSError, TypeError, ValueError, SecureFileTransactionError):
+except (KeyError, OSError, TypeError, ValueError, SecureFileTransactionError) as exc:
+    print("-> Datenordner-Prüfung: %s" % exc, file=sys.stderr)
     raise SystemExit(1)
 PY
 )"; then

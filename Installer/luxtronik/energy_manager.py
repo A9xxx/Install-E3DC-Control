@@ -4176,7 +4176,16 @@ def luxtronik_pv_contract_cycle(ctx, previous, *, clock_sample):
         "request_id": state["request_id"], "revision": state.get("revision", 0),
         "requested": requested, "qualified": False, "channels": channels,
         "comfort_ww": comfort, "observation": observation, "command": command,
-        "request_w": cfg["max_power_w"], "protection_reason": protection,
+        "request_w": (max(0.0, float(observation["power_w"]))
+                      if cfg.get("control_mode") == "measured"
+                      and observation.get("compressor_running") is True
+                      and observation.get("power_w") is not None
+                      and observation["power_w"] > 0
+                      else cfg.get("start_power_w", cfg["max_power_w"])
+                      if cfg.get("control_mode") == "measured" else cfg["max_power_w"]),
+        "control_mode": cfg.get("control_mode", "reserved"),
+        "start_power_w": cfg.get("start_power_w", cfg["max_power_w"]),
+        "protection_reason": protection,
         "blockers": ([protection] if protection else []) +
                     ([] if baseline is not None or summer else ["normal_heating_target_missing"]) +
                     ([] if cfg["valid"] else ["electrical_profile_missing_or_invalid"]),
@@ -5020,6 +5029,9 @@ def luxtronik_ww_command_request(
     ww_boost_owner_recent,
     cooldown_s,
     blind_heartbeat_s,
+    *,
+    persistent_timer_target=False,
+    timer_reduction_allowed=False,
 ):
     """Return the WW command that should be sent, or (None, None, None).
 
@@ -5035,7 +5047,9 @@ def luxtronik_ww_command_request(
     send_temp = target_ww_temp if target_ww_mode == 1 else None
 
     ww_satisfied_by_temp = False
-    if target_ww_mode == 1 and target_ww_temp is not None:
+    # Der Software-Timer besitzt auch nach Erreichen seinen Sollwert.
+    # SHI-Modus 0 gäbe die interne Warmwasserregelung wieder frei.
+    if target_ww_mode == 1 and target_ww_temp is not None and not persistent_timer_target:
         ww_ist = data.get("Warmwasser_Ist", data.get("Warmwasser-Ist"))
         if ww_ist is not None:
             ww_satisfied_by_temp = _safe_float(ww_ist, -99.0) >= _safe_float(target_ww_temp, 0.0)
@@ -5054,6 +5068,16 @@ def luxtronik_ww_command_request(
     )
     last_matches = bool(last_mode_matches and last_temp_matches)
 
+    # Auch innerhalb des Schreib-Cooldowns darf der Timer einen noch
+    # laufenden WW-Zyklus nicht durch einen niedrigeren Sollwert beenden.
+    if persistent_timer_target and not timer_reduction_allowed and send_mode == 1:
+        current_target = status.get("WW_Setpoint")
+        if current_target is None:
+            current_target = last_ww_temp
+        if (current_target is not None and send_temp is not None
+                and _safe_float(send_temp, 0.0) < _safe_float(current_target, 0.0) - 0.5):
+            return None, None, None
+
     if time_since_last_ww_cmd < cooldown_s:
         if not last_matches:
             return send_mode, send_temp, "target_changed"
@@ -5070,7 +5094,8 @@ def luxtronik_ww_command_request(
             return None, None, None
 
         if send_mode == 1 and live_ww_mode == 1 and live_ww_temp is not None and send_temp is not None:
-            if _safe_float(send_temp, 0.0) < (_safe_float(live_ww_temp, 0.0) - 0.5):
+            if (not (persistent_timer_target and timer_reduction_allowed)
+                    and _safe_float(send_temp, 0.0) < (_safe_float(live_ww_temp, 0.0) - 0.5)):
                 ww_ist = data.get("Warmwasser_Ist", data.get("Warmwasser-Ist"))
                 if ww_ist is not None and _safe_float(ww_ist, -99.0) < (_safe_float(live_ww_temp, 0.0) - 0.5):
                     return None, None, None
@@ -13040,6 +13065,20 @@ def main():
                             ww_boost_owner_recent,
                             WW_COOLDOWN_SECS,
                             WW_HEARTBEAT_SECS,
+                            persistent_timer_target=bool(
+                                wp_type == 0 and WW_TIMER_ENABLE
+                                and not force_ww and not force_pause
+                                and not ww_positive_output_hard_blocked
+                                and target_ww_mode == 1
+                                and target_ww_temp is not None and ww_timer_target_c is not None
+                                and abs(float(target_ww_temp) - float(ww_timer_target_c)) <= 0.05
+                            ),
+                            # Eine Absenkung wartet konservativ auf das bestätigte
+                            # Ende eines laufenden WW-Zyklus. Boost-/Schutzpfade
+                            # behalten ihre vorgelagerten Rücknahmebedingungen.
+                            timer_reduction_allowed=(
+                                luxtronik_ww_runtime_contract.get("state") == "not_running"
+                            ),
                         )
 
                         ww_positive_bookkeeping_active = bool(

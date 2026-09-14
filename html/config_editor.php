@@ -443,6 +443,7 @@ $defaults = [
     "wp_pv_max_power_w" => "0", "wp_pv_battery_limit_wh" => "0", "wp_pv_grid_limit_wh" => "0",
     "wp_pv_battery_max_w" => "0", "wp_pv_grid_max_w" => "0", "wp_pv_reaction_s" => "30",
     "wp_pv_start_wait_s" => "600", "wp_pv_handoff_timeout_s" => "120",
+    "wp_pv_control_mode" => "reserved", "wp_pv_start_power_w" => "0",
     "price_boost_enable" => "0", "heat_price_boost_scope" => "both", "heat_price_boost_windows" => "",
     "price_limit" => "20.0", "price_hard_limit" => "-99.0", "price_pause_limit" => "35.0", "price_min_duration" => "60",
     "price_max_daily" => "180", "manual_boost_max_duration" => "180", "manual_boost_min_soc" => "25", "wq_min_temp" => "1.0",
@@ -708,8 +709,8 @@ $tooltips = [
     "market_autarky_first_enable" => "PV-autark zuerst: blockiert normales Markt-Netzladen und Speicher-Halten, wenn Speicher plus erwarteter PV-Überschuss den restlichen Horizont decken. Negativpreis-Boost bleibt separat.",
     "market_autarky_low_soc_pct" => "Low-SOC-Ausnahme in %. Fällt der Speicher darunter, darf ein explizit freigegebener Markt-Speicherpfad trotz guter Tagesprognose wieder Netzladen prüfen.",
     "market_autarky_horizon_buffer_wh" => "Energiepuffer in Wh für die Autarkieprüfung. Nur wenn die Horizontbilanz oberhalb dieses Puffers liegt, blockiert PV-autark zuerst den normalen Marktpfad.",
-    "market_battery_grid_charge_enable" => "Explizite Freigabe für normales Prognose-Markt-Netzladen des Speichers. Standard aus: die Prognose darf den Akku ohne neue bewusste Freigabe nicht aus dem Netz laden.",
-    "market_battery_hold_enable" => "Explizite Freigabe für normale Prognose-Markt-Entladesperren des Speichers. Standard aus: Wolken und PV-Kanten sollen nicht durch Akku-Halten zu Netzbezug führen.",
+    "market_battery_grid_charge_enable" => "Erlaubt bedarfs- und preisabhängiges Netzladen und schaltet Speicher halten mit ein. Standard aus. Ein günstiger Preis allein startet noch keine Ladung.",
+    "market_battery_hold_enable" => "Bewahrt vorhandene Batterieenergie für spätere teure Stunden, wenn die Planung einen Vorteil erkennt. Bei Speicher-Netzladen automatisch eingeschlossen; ohne Netzladen separat wählbar. Keine dauerhafte Entladesperre.",
     "market_wallbox_enable" => "Erlaubt dem normalen Marktpfad Wallbox-Netzladen nur für Ladepunkte im Modus 'Sofort bis Preislimit'. PV-/Akku-Modi bleiben PV-geführt; geplante Lade-Slots bleiben separat.",
     "market_heatpump_enable" => "Historischer Schlüssel: Der normale Marktpfad steuert Wärmepumpen nicht mehr. Wärmepumpen laufen über PV-/Forecast-Budget, Pre-Dump oder den separaten Negativpreis-Boost.",
     "market_heater_enable" => "Erlaubt dem normalen Marktpfad, Heizstab/Heizer in günstigen relativen Preisfenstern vorzuschlagen.",
@@ -886,9 +887,11 @@ $tooltips = [
     "stop_delay_minutes"     => "Minuten nach denen der Boost gestoppt wird wenn das Limit unterschritten bleibt. Standard: 10 Min.",
     "wp_min_runtime_min"     => "Luxtronik: Schutzzeit ab bestätigtem Verdichterstart. Nur benannte Schutzfunktionen wie Nutzer-Aus, Gerätestörung, Notstromreserve oder Hausanschlussgrenze dürfen sie verkürzen; gewöhnlicher Netzbezug und Budgetwechsel nicht. Die Wärmepumpe darf ihren Takt selbst beenden.",
     "wp_restart_block_min"   => "Wiedereinschaltsperre nach einem PV-Boost-Stopp in Minuten. Glättet Wolkenwechsel und verhindert Start/Stop-Pendeln.",
-    "wp_pv_max_power_w"      => "Luxtronik: belegte maximale elektrische Aufnahme innerhalb der WP-Messgrenze, einschließlich dort erfasster Pumpen und möglicher Zusatzheizung. Keine thermische Heizleistung und keine Startschwelle. 0 = Profil fehlt, neue optionale PV-Starts warten.",
-    "wp_pv_battery_limit_wh" => "Maximale Akkuenergie für optionale PV-Überbrückung in den jeweils letzten 24 Stunden. Verbrauch und gebundene Energie bleiben bei Wolkenwechseln und Neustarts erhalten. 0 = keine Akkuüberbrückung.",
-    "wp_pv_grid_limit_wh"    => "Maximale Netzenergie für optionale PV-Überbrückung in den jeweils letzten 24 Stunden. Dieses Kontingent erlaubt begrenzten Netzbezug; spätere Einspeisung erstattet keine verbrauchten Wh. 0 = keine Netzüberbrückung.",
+    "wp_pv_control_mode"    => "Messwertgeführt: Startwert für die Qualifikation, danach Istaufnahme und Wh-Wächter. Eine geschützte Mindestlaufzeit kann positive Wh-Kontingente überschreiten. Vollständige Vorreservierung erhält das bisherige Verhalten. Die Umstellung verändert keine Quellenfreigaben.",
+    "wp_pv_start_power_w"   => "Typische elektrische Startaufnahme für die Überschussqualifikation. 0 übernimmt die bestehende Start-Grenze. Nach dem Start entscheidet die Istaufnahme. Ein manueller Wert ist eine Betriebsschätzung, keine elektrische Geräteobergrenze.",
+    "wp_pv_max_power_w"      => "Elektrischer Profilwert innerhalb der WP-Messgrenze, einschließlich dort erfasster Pumpen und möglicher Zusatzheizung. Kein pauschaler Dauerbedarf. In der messwertgeführten Regelung bedeutet 0: unbekannt. Dort werden Messabweichungen bis zum größeren Wert aus 100 W und 5 % toleriert; der gesamte Istverbrauch wird gezählt. Das ist eine Plausibilitätstoleranz, keine Erhöhung von Hardware- oder Quellengrenzen. Die vollständige Vorreservierung benötigt einen belegten Maximalwert.",
+    "wp_pv_battery_limit_wh" => "Akku-Wh-Wächter innerhalb der letzten 24 Stunden. Messwertgeführt wird beim Erreichen der zusätzliche Boost nach der geschützten Laufzeit beendet; Verbrauch und mögliche Überschreitung werden weitergezählt. 0 sperrt die Quelle. Vollständige Vorreservierung behält die bisherige Bedeutung.",
+    "wp_pv_grid_limit_wh"    => "Netz-Wh-Wächter innerhalb der letzten 24 Stunden. Messwertgeführt wird beim Erreichen der zusätzliche Boost nach der geschützten Laufzeit beendet; Verbrauch und mögliche Überschreitung werden weitergezählt. 0 sperrt die Quelle. Spätere Einspeisung erstattet keine verbrauchten Wh.",
     "wp_pv_battery_max_w"    => "Maximale für die WP erlaubte Akku-Überbrückungsleistung. Tatsächliche Speichergrenzen, Notstromreserve und andere gebundene Verbraucher gelten zusätzlich. 0 = keine Akkuüberbrückung.",
     "wp_pv_grid_max_w"       => "Maximale für die WP erlaubte Netz-Überbrückungsleistung. Hausanschlussgrenzen gelten zusätzlich. Leistung in W und Energiekontingent in Wh müssen beide ausreichen. 0 = keine Netzüberbrückung.",
     "wp_pv_reaction_s"       => "Für das Geräteprofil anzusetzende Reaktionsfrist einschließlich Messalter, Steuerung und wirksamer Lastanpassung. Standard 30 Sekunden ist eine Planungsannahme und muss zur Anlage passen; keine garantierte Herstellergrenze.",
@@ -941,8 +944,8 @@ $tooltips = [
     "ww_timer_enable"        => "Aktiviert den Software-WW-Timer (überschreibt den Hardware-Timer der Luxtronik/IDM). Vorsicht!",
     "wwvon"                  => "WW-Timer: Startzeit als Dezimalzahl (z.B. 10.0 = 10:00 Uhr, 10.5 = 10:30 Uhr).",
     "wwbis"                  => "WW-Timer: Endzeit als Dezimalzahl (z.B. 17.0 = 17:00 Uhr).",
-    "ww_normal"              => "Warmwasser-Temperatur im Normalbetrieb (°C). Intern: IDM Register 1712.",
-    "ww_eco"                 => "Warmwasser-Temperatur im Eco-Modus (°C).",
+    "ww_normal"              => "Warmwasser-Solltemperatur innerhalb des Software-Zeitfensters (°C).",
+    "ww_eco"                 => "Warmwasser-Solltemperatur außerhalb des Software-Zeitfensters (°C). Ein freigegebener Boost kann sie vorübergehend anheben.",
     "ww_circ_von"            => "Zirkulationspumpe Start: Dezimalstunde (z.B. 5.5 = 05:30 Uhr).",
     "ww_circ_bis"            => "Zirkulationspumpe Ende: Dezimalstunde (z.B. 20.5 = 20:30 Uhr).",
     "ww_circ_on"             => "Zirkulations-Takt AN in Minuten (z.B. 5 = 5 Min läuft sie).",
@@ -1465,6 +1468,85 @@ function e3dc_config_auto_install_rules() {
     ];
 }
 
+function e3dc_config_setting_requirements() {
+    // Anzeigevoraussetzungen aus Markt-/Tarifvertrag und vorhandenen Geräteprofilen.
+    // Dieser Katalog erteilt keine Laufzeitfreigabe und verändert keine Werte.
+    $eco = ['when' => ['type' => 'enabled', 'key' => 'grid_friendly_mode'], 'reason' => 'Netzdienlichen Eco-Modus aktivieren.'];
+    $marketTariff = ['when' => ['type' => 'in', 'key' => 'stromtarif_typ', 'values' => ['tibber', 'awattar', 'dynamic', 'epex', 'octopus_heat', 'special']], 'reason' => 'Einen zeitvariablen Tarif wählen: EPEX/Tibber, Octopus Heat oder Spezialtarif.'];
+    $spotTariff = ['when' => ['type' => 'in', 'key' => 'stromtarif_typ', 'values' => ['tibber', 'awattar', 'dynamic', 'epex']], 'reason' => 'Ein Börsenpreistarif mit echten Negativpreis-Slots ist erforderlich; Octopus Heat und Spezialtarif zählen nicht dazu.'];
+    $negativeBoost = ['when' => ['type' => 'enabled', 'key' => 'cheap_grid_boost_enable'], 'reason' => 'Negativpreis-Boost aktivieren.'];
+    $wallbox = ['when' => ['type' => 'enabled', 'key' => 'wb_native_enable'], 'reason' => 'Native Wallbox-Regelung aktivieren.'];
+    $heat = ['when' => ['any' => [
+        ['type' => 'enabled', 'key' => 'luxtronik'],
+        ['type' => 'address', 'key' => 'shelly_sg_ip'],
+        ['type' => 'address', 'key' => 'shelly_pause_ip'],
+    ]], 'reason' => 'WP/Verbraucher aktivieren oder eine Shelly-Anbindung für die Wärmepumpensteuerung einrichten.'];
+    $heatAuto = ['when' => ['type' => 'enabled', 'key' => 'auto_mode'], 'reason' => 'Bei WP/Verbraucher „Automatik darf steuern“ aktivieren; im Monitoring bleibt die automatische Steuerung aus.'];
+    $rules = [];
+    foreach ([
+        'market_battery_grid_charge_enable' => 'Speicher-Netzladen',
+        'market_battery_hold_enable' => 'Speicher halten',
+        'market_wallbox_enable' => 'Wallbox im normalen Marktpfad',
+        'market_heater_enable' => 'Heizstab im normalen Marktpfad',
+    ] as $key => $label) {
+        $rules[$key] = ['label' => $label, 'requirements' => [$eco, $marketTariff], 'summary' => true,
+            'note' => 'Freigabe für den normalen Marktpfad. Bedarf, Preisvorteil und aktuelle gültige Daten werden zusätzlich geprüft; dies ist kein Sofortstart.'];
+    }
+    $rules['market_wallbox_enable']['requirements'][] = $wallbox;
+    $rules['market_wallbox_enable']['note'] = 'Zusätzlich muss der betreffende Ladepunkt auf „Sofort bis Preislimit“ stehen. PV-Modi und gespeicherte Ladepläne behalten ihre eigenen Regeln.';
+    foreach ([
+        'cheap_grid_battery_enable' => 'Speicher im Negativpreis-Boost',
+        'cheap_grid_wallbox_enable' => 'Wallbox im Negativpreis-Boost',
+        'cheap_grid_heatpump_enable' => 'Wärmepumpe im Negativpreis-Boost',
+        'cheap_grid_heater_enable' => 'Heizstab im Negativpreis-Boost',
+    ] as $key => $label) {
+        $rules[$key] = ['label' => $label, 'requirements' => [$spotTariff, $negativeBoost],
+            'note' => 'Getrennte Freigabe nur für den Negativpreis-Boost. Sie aktiviert kein normales günstiges Netzladen.'];
+    }
+    $rules['cheap_grid_wallbox_enable']['requirements'][] = $wallbox;
+    $rules['cheap_grid_heatpump_enable']['requirements'] = array_merge($rules['cheap_grid_heatpump_enable']['requirements'], [$heat, $heatAuto]);
+    $rules['cheap_grid_boost_enable'] = ['label' => 'Negativpreis-Boost', 'requirements' => [$spotTariff], 'summary' => true,
+        'note' => 'Verbraucher unten getrennt freigeben. Ein günstiges Zeitfenster allein ist kein Negativpreis-Slot.'];
+    $rules['auto_mode'] = ['label' => 'WP-Automatik', 'requirements' => [$heat],
+        'note' => 'Die ausgewählte Geräteanbindung bestimmt, ob nur Messwerte oder auch Steuerbefehle möglich sind.'];
+    $rules['wp_type'] = ['label' => 'Wärmepumpentyp', 'requirements' => [
+        ['when' => ['type' => 'enabled', 'key' => 'luxtronik'], 'reason' => 'WP/Verbraucher für die native Geräteanbindung aktivieren. Eine separate Shelly-Anbindung bleibt davon unabhängig.'],
+    ],
+        'note' => 'Typabhängige Anschluss- und Steuerfelder folgen dem gewählten Gerät. Reine Leistungsmessung erlaubt noch keine Wärmepumpensteuerung.'];
+    foreach (['wb_native_type', 'wb_native_type2'] as $key) {
+        $rules[$key] = ['label' => 'Wallboxtyp', 'requirements' => [$wallbox],
+            'note' => 'Gerätetyp und Betriebsrolle bestimmen verfügbare Strom- und Phasensteuerung. Ein gespeicherter Typ bestätigt noch keine Geräteverbindung.'];
+    }
+    foreach (['wb_native_mode', 'wbmaxladestrom', 'wb_min_surplus_w', 'wb1_max_amp', 'wb2_max_amp'] as $key) {
+        $rules[$key] = ['label' => 'Wallbox-Regelung', 'requirements' => [$wallbox], 'note' => 'Wirkt nur für eingerichtete, aktiv gesteuerte Ladepunkte innerhalb ihrer Geräte- und Fahrzeuggrenzen.'];
+    }
+    $rules['wb_native_mode']['note'] = 'Die Verteilpriorität wirkt erst bei zwei tatsächlich vorhandenen, aktiv gesteuerten Ladepunkten.';
+    foreach (['heat_policy_runtime_enable', 'grid_start_limit', 'pv_boost_delay', 'wp_min_runtime_min', 'wp_restart_block_min'] as $key) {
+        $rules[$key] = ['label' => 'Wärmepumpen-Regelung', 'requirements' => [$heat, $heatAuto],
+            'note' => 'Der gewählte Wärmepumpentyp und seine Steuerfähigkeit bestimmen die Wirkung. Schutzfunktionen haben Vorrang.'];
+    }
+    $rules['market_heatpump_enable'] = ['label' => 'Alter Wärmepumpen-Marktschalter (market_heatpump_enable)', 'requirements' => [
+        ['when' => ['any' => []], 'reason' => 'Dieser historische Schalter wird nicht mehr zur Wärmepumpensteuerung verwendet. PV-/Forecast-Regelung, Pre-Dump und Negativpreis-Boost werden im Wärmepumpenbereich eingestellt.'],
+    ], 'summary' => true];
+    $rules['price_boost_enable'] = ['label' => 'Wärmepumpen-Preisverschiebung (price_boost_enable)', 'requirements' => [
+        ['when' => ['any' => []], 'reason' => 'Diese Preisverschiebung bewertet derzeit nur mögliche Wärmefenster; der Schalter löst noch keine Wärmepumpensteuerung aus.'],
+    ], 'summary' => true];
+    foreach (['direct_marketing_export_enable', 'direct_marketing_grid_charge_enable', 'direct_marketing_pv_store_enable'] as $key) {
+        $rules[$key] = ['label' => 'Direktvermarktungsfreigabe', 'requirements' => [
+            ['when' => ['type' => 'enabled', 'key' => 'direct_marketing_enable'], 'reason' => 'Direktvermarktung aktivieren.'],
+        ], 'note' => 'Die Wirkung richtet sich zusätzlich nach dem gewählten Direktvermarktungsprofil; die profilabhängigen Felder werden im Bereich eingeblendet.'];
+    }
+    foreach (['direct_marketing_min_window_profit_eur', 'direct_marketing_min_export_energy_kwh', 'direct_marketing_min_export_window_min'] as $key) {
+        $rules[$key] = ['label' => 'Startgrenze für Direktvermarktung', 'requirements' => [
+            ['when' => ['type' => 'equals', 'key' => 'direct_marketing_profit_profile', 'value' => 'standard'], 'reason' => 'Diese Startgrenze gilt im Profitprofil „Standard“. „Aggressiv“ und „Experte“ verwenden sie nicht; die harten Schutzgrenzen bleiben bestehen.'],
+        ]];
+    }
+    $rules['storage_curve_sliding_horizon_enable'] = ['label' => 'Gleitender Prognosehorizont', 'requirements' => [
+        ['when' => ['type' => 'equals', 'key' => 'storage_curve_target_mode', 'value' => 'forecast_100'], 'reason' => 'Den Zielkurven-Modus „Prognose auf 100%“ wählen. In der Ankerkurve bleibt diese Auswahl ohne Wirkung.'],
+    ], 'summary' => true, 'note' => 'Nur im Prognose-100-Modus wirksam; beim Wechsel zur Ankerkurve bleibt die Auswahl für den Rückwechsel gespeichert.'];
+    return $rules;
+}
+
 function e3dc_config_auto_install_known_modules() {
     $known = [];
     foreach (e3dc_config_auto_install_rules() as $module => $rule) {
@@ -1790,7 +1872,15 @@ function e3dc_aux_inverter_prepare_config($data) {
     return $data;
 }
 
+function e3dc_storage_market_prepare_config($data) {
+    if (in_array(strtolower(trim((string)($data['market_battery_grid_charge_enable'] ?? '0'))), ['1', 'true', 'yes', 'on'], true)) {
+        $data['market_battery_hold_enable'] = 1;
+    }
+    return $data;
+}
+
 function e3dc_write_v4_json($file_path, $data, $install_user) {
+    $data = e3dc_storage_market_prepare_config($data);
     $data = e3dc_aux_inverter_prepare_config($data);
     $json_content = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
     if ($json_content === false) return false;
@@ -2823,6 +2913,21 @@ if ($configEditorRequestMethod === 'POST') {
         $token = $postedValues['entsoe_api_token'] ?? ($_POST['entsoe_api_token'] ?? '');
         echo json_encode(e3dc_entsoe_api_test($token), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         exit;
+    } elseif (($_POST['config_action'] ?? '') === 'disable_legacy_heat_market') {
+        // Ausschließlich den wirkungslosen Altwert ändern; keine fremden Formularwerte übernehmen.
+        $mutation = saveE3dcConfigValuesDetailed(
+            ['market_heatpump_enable' => 0],
+            $v4_config_file_path,
+            '/var/www/html/ramdisk/e3dc_config_cache.json'
+        );
+        if (!empty($mutation['success'])) {
+            $config = readConfig($v4_config_file_path);
+            $message = "<div class='alert alert-success'>Der alte Wärmepumpen-Marktschalter wurde deaktiviert: <code>market_heatpump_enable = 0</code>. Die Wärmepumpen-Preisverschiebung bleibt unverändert.</div>";
+            $message .= e3dc_config_retention_warning_html($mutation);
+        } else {
+            $status = htmlspecialchars((string)($mutation['status'] ?? 'unknown'), ENT_QUOTES, 'UTF-8');
+            $message = "<div class='alert alert-danger'>Das Deaktivieren konnte nicht bestätigt werden ($status). Bitte den gespeicherten Wert prüfen.</div>";
+        }
     } elseif (($_POST['config_action'] ?? '') === 'create_manual_backup') {
         $backup = e3dcCreateConfirmedV4Backup(
             $v4_config_file_path,
@@ -3333,7 +3438,7 @@ if ($configEditorRequestMethod === 'POST') {
                 static function($boundCurrent) use ($v4_data) {
                     return [
                         'success' => true,
-                        'data' => e3dc_aux_inverter_prepare_config($v4_data),
+                        'data' => e3dc_storage_market_prepare_config(e3dc_aux_inverter_prepare_config($v4_data)),
                     ];
                 },
                 'save',
@@ -3450,6 +3555,7 @@ if ($configEditorRequestMethod === 'POST') {
 
 $groups = [
     "V4 Smart Home (Regelung & KI)" => [
+        "cheap_grid_heatpump_enable", "heat_policy_runtime_enable", "price_boost_enable", "heat_price_boost_scope", "heat_price_boost_windows", "price_limit", "price_hard_limit", "price_pause_limit", "price_min_duration", "price_max_daily",
         "luxtronik", "wp_type", "wp_source_type", "idm_ip", "idm_port", "idm_e_total", "luxtronik_ip",
         "heizstab", "heizstab_type", "heizstab_ip", "heizstab_port", "heizstab_max_w", "shelly_heiz_ip", "shelly_heiz_w", "hs_min_surplus_w", "hs_min_soc", "hs_auto_mode",
         "climate_enable", "climate_name", "climate_meter_ip", "climate_meter_type", "climate_meter_phase", "climate_min_power_w", "climate_poll_s", "climate_history_enable", "climate_history_interval_s", "climate_forecast_enable",
@@ -3472,6 +3578,7 @@ $groups = [
         "wq_min_temp", "rl_source", "manual_boost_min_soc", "manual_boost_max_duration",
         "auto_mode", "grid_start_limit", "pv_boost_delay", "stop_delay_minutes", "wp_min_runtime_min", "wp_restart_block_min",
         "wp_pv_max_power_w", "wp_pv_battery_limit_wh", "wp_pv_grid_limit_wh", "wp_pv_battery_max_w", "wp_pv_grid_max_w",
+        "wp_pv_control_mode", "wp_pv_start_power_w",
         "wp_pv_reaction_s", "wp_pv_start_wait_s", "wp_pv_handoff_timeout_s",
         "consumer_priority_order", "consumer_priority_wp_runon_s",
         "pv_pause_enable", "pv_pause_soc", "pv_pause_watt", "pv_pause_timeout_minutes", "pv_pause_min_at", "pv_pause_max_temp_drop", "luxtronik_pause_setpoint_c",
@@ -3546,11 +3653,9 @@ $groups = [
         "peak_shaving_hysteresis_w", "peak_shaving_soc_hysteresis_pct", "peak_shaving_max_sample_gap_s",
         "peak_shaving_release_debounce_s",
         "cheap_grid_boost_enable", "cheap_grid_price_limit_ct", "cheap_grid_min_duration_min",
-        "cheap_grid_battery_enable", "cheap_grid_wallbox_enable", "cheap_grid_heatpump_enable", "cheap_grid_heater_enable",
+        "cheap_grid_battery_enable", "cheap_grid_wallbox_enable", "cheap_grid_heater_enable",
         "cheap_grid_battery_max_soc", "cheap_grid_battery_max_w", "cheap_grid_pv_buffer_pct", "cheap_grid_soc_hysteresis_pct",
-        "heat_policy_runtime_enable", "ems_budget_runtime_enable",
-        "price_boost_enable", "heat_price_boost_scope", "heat_price_boost_windows",
-        "price_limit", "price_hard_limit", "price_pause_limit", "price_min_duration", "price_max_daily",
+        "ems_budget_runtime_enable",
         "heat_heater_grid_boost_enable", "heat_heater_grid_boost_ack", "heat_heater_grid_boost_requires_deficit",
         "heat_heater_grid_boost_price_limit_ct", "heat_heater_grid_boost_max_w",
         "heat_heater_min_temp_c", "heat_heater_max_temp_c", "heat_wp_daily_kwh",
@@ -3792,8 +3897,116 @@ $peakReserveSourceLabel = (
 )
     ? 'E3/DC / RSCP'
     : 'Konfigurations-Fallback';
+function heatpumpPvRuntimeForDisplay($payload, $now = null): ?array {
+    $runtime = is_array($payload) ? ($payload['heatpump_pv_contract'] ?? null) : null;
+    if (!is_array($runtime) || ($runtime['schema'] ?? '') !== 'heatpump_pv_contract_v1'
+        || ($runtime['control_mode'] ?? '') !== 'measured' || ($runtime['valid'] ?? null) !== true) return null;
+    $now = $now ?? microtime(true);
+    foreach (['sample_ts', 'window_battery_used_wh', 'window_grid_used_wh', 'battery_remaining_wh', 'grid_remaining_wh', 'battery_overrun_wh', 'grid_overrun_wh', 'compressor_protected_remaining_s'] as $key) {
+        $value = $runtime[$key] ?? null;
+        if (is_bool($value) || !is_numeric($value) || !is_finite((float)$value) || (float)$value < 0) return null;
+    }
+    if ($runtime['sample_ts'] > $now || $now - $runtime['sample_ts'] > 45) return null;
+    return $runtime;
+}
+
+function readHeatpumpPvRuntime(): ?array {
+    $file = '/var/www/html/ramdisk/wb_pv_budget.json';
+    if (!is_readable($file)) return null;
+    return heatpumpPvRuntimeForDisplay(json_decode((string)@file_get_contents($file), true));
+}
+
+function renderHeatpumpPvReservationStatus($entry, $runtime = null): string {
+    $calculation = is_array($entry) && is_array($entry['calculation'] ?? null) ? $entry['calculation'] : [];
+    $measured = ($calculation['control_mode'] ?? 'reserved') === 'measured';
+    $complete = isset($calculation['profile_valid']) && is_bool($calculation['profile_valid']);
+    $requiredFields = ['max_power_w', 'min_runtime_s', 'start_wait_s', 'reaction_s', 'duration_s', 'required_wh', 'available_wh', 'missing_wh', 'battery_available_wh', 'grid_available_wh'];
+    if ($measured) $requiredFields = array_merge($requiredFields, ['start_power_w', 'reservation_power_w']);
+    foreach ($requiredFields as $key) {
+        $value = $calculation[$key] ?? null;
+        $complete = $complete && !is_bool($value) && is_numeric($value) && is_finite((float)$value) && (float)$value >= 0;
+    }
+    $fmt = function($value, int $decimals = 0): string {
+        return number_format((float)$value, $decimals, ',', '.');
+    };
+    $fieldLabels = [
+        'wp_pv_control_mode' => 'Betriebsart der PV-Regelung',
+        'wp_pv_start_power_w' => 'Startleistung',
+        'wp_pv_max_power_w' => 'Elektrischer Profilwert',
+        'wp_min_runtime_min' => 'Mindestlaufzeit',
+        'wp_restart_block_min' => 'Wiedereinschaltsperre',
+        'wp_pv_start_wait_s' => 'Wartezeit auf den Verdichterstart',
+        'wp_pv_reaction_s' => 'Berücksichtigte Reaktionszeit',
+        'wp_pv_handoff_timeout_s' => 'Wartezeit auf die Leistungsreduzierung der Wallbox',
+        'wp_pv_battery_max_w' => 'Maximale Leistung aus dem Hausakku',
+        'wp_pv_battery_limit_wh' => 'Energiekontingent des Hausakkus',
+        'wp_pv_grid_max_w' => 'Maximale Leistung aus dem Stromnetz',
+        'wp_pv_grid_limit_wh' => 'Energiekontingent des Stromnetzes',
+    ];
+    ob_start();
+    ?>
+    <div id="wpPvReservationStatus" class="border rounded p-3 mt-3" data-config-validation-key="wp_pv_energy_reservation" data-control-mode="<?= $measured ? 'measured' : 'reserved' ?>" role="status" aria-live="polite">
+        <h6 class="small fw-bold mb-2">Rechnerische Absicherung: zuletzt geprüfter gespeicherter Stand</h6>
+        <p class="small text-warning fw-bold mb-2" data-wp-pv-reservation-dirty hidden>Einstellungen bearbeitet: Diese Prüfung wurde noch nicht aktualisiert. Sie bezieht sich auf den zuletzt geprüften gespeicherten Stand. Nach dem Speichern die aktualisierte Prüfung der laufenden Regelung abwarten und die Seite neu laden.</p>
+        <div data-wp-pv-reservation-result>
+        <?php if (!$complete): ?>
+            <p class="small text-muted mb-2">Zum zuletzt geprüften gespeicherten Stand liegt noch keine vollständige Berechnung vor. Sobald die laufende Regelung sie bereitstellt, die Seite neu laden.</p>
+        <?php elseif (!$calculation['profile_valid']): ?>
+            <p class="small text-warning fw-bold mb-2">Im zuletzt geprüften gespeicherten Stand fehlen gültige Profilwerte für einen zusätzlichen PV-Start.</p>
+            <?php $invalidFields = is_array($calculation['invalid_fields'] ?? null) ? $calculation['invalid_fields'] : []; ?>
+            <?php if ($invalidFields): ?>
+                <p class="small mb-2">In diesem Stand zu prüfen: <?= htmlspecialchars(implode(', ', array_map(static fn($key) => $fieldLabels[(string)$key] ?? (string)$key, $invalidFields))) ?>.</p>
+            <?php endif; ?>
+        <?php elseif ($measured): ?>
+            <?php $funded = (float)$calculation['missing_wh'] <= 0.000001; ?>
+            <p class="small fw-bold <?= $funded ? 'text-success' : 'text-warning' ?> mb-2"><?= $funded ? 'Für den zuletzt geprüften Stand ist der kurze Reaktionspuffer rechnerisch gedeckt.' : 'Für den zuletzt geprüften Stand fehlt noch Deckung des kurzen Reaktionspuffers.' ?></p>
+            <div class="small mb-2">Reaktionspuffer: <strong><?= $fmt($calculation['required_wh'], 1) ?> Wh</strong> · Mit den Quellen abdeckbar: <strong><?= $fmt($calculation['available_wh'], 1) ?> Wh</strong> · Fehlbetrag: <strong><?= $fmt($calculation['missing_wh'], 1) ?> Wh</strong></div>
+            <p class="small mb-2">Im Lauf bestimmt die gemessene Aufnahme das Budget. Der Wh-Wächter zählt nur die Überbrückung aus Akku und Netz. Ein erreichtes Kontingent merkt das Boost-Ende nach der geschützten Laufzeit vor; der Verbrauch bis dahin kann das Kontingent überschreiten.</p>
+            <details class="small mb-2">
+                <summary>Startwert und kurze Reaktionsabdeckung</summary>
+                <div>Startwert: <?= $fmt($calculation['start_power_w'] ?? 0) ?> W. Reaktionsabdeckung: <?= $fmt($calculation['reservation_power_w'] ?? 0) ?> W × <?= $fmt($calculation['duration_s']) ?> s ÷ 3.600 = <?= $fmt($calculation['required_wh'], 1) ?> Wh.</div>
+                <div>Die elektrische Leistungsfähigkeit wird vor dem Start zusätzlich geprüft. Eine volle Maximalleistungsreservierung für Mindestlaufzeit und Startwartezeit entfällt.</div>
+            </details>
+        <?php else: ?>
+            <?php $funded = (float)$calculation['missing_wh'] <= 0.000001; ?>
+            <p class="small fw-bold <?= $funded ? 'text-success' : 'text-warning' ?> mb-2"><?= $funded ? 'Für den zuletzt geprüften gespeicherten Stand ist die Überbrückung rechnerisch gedeckt.' : 'Für den zuletzt geprüften gespeicherten Stand reicht die Überbrückungsenergie nicht für einen zusätzlichen PV-Start.' ?></p>
+            <div class="small mb-2">Benötigt: <strong><?= $fmt($calculation['required_wh']) ?> Wh</strong> · Mit den Grenzen dieses Stands abdeckbar: <strong><?= $fmt($calculation['available_wh']) ?> Wh</strong> · Fehlbetrag: <strong><?= $fmt($calculation['missing_wh']) ?> Wh</strong></div>
+            <div class="small text-muted mb-2">Davon Hausakku: <?= $fmt($calculation['battery_available_wh']) ?> Wh · Stromnetz: <?= $fmt($calculation['grid_available_wh']) ?> Wh. Die Abdeckung berücksichtigt jeweils das Leistungs- und Energielimit.</div>
+            <details class="small mb-2">
+                <summary>Berechnung für den zuletzt geprüften gespeicherten Stand</summary>
+                <div class="mt-1"><?= $fmt($calculation['max_power_w']) ?> W × <?= $fmt($calculation['duration_s'] / 60, 1) ?> Min ÷ 60 = <?= $fmt($calculation['required_wh']) ?> Wh.</div>
+                <div>Berücksichtigte Zeit: <?= $fmt($calculation['min_runtime_s'] / 60, 1) ?> Min Mindestlaufzeit + <?= $fmt($calculation['start_wait_s'] / 60, 1) ?> Min Startwartezeit + <?= $fmt($calculation['reaction_s'] / 60, 1) ?> Min Reaktionszeit.</div>
+                <div>Die Deckung wird unter der Annahme eines wegfallenden PV-Überschusses geprüft.</div>
+            </details>
+        <?php endif; ?>
+        </div>
+        <p class="small text-muted mb-1">Angezeigt wird der zuletzt geprüfte gespeicherte Stand, kein aktuelles Restkontingent und keine aktuelle Startfreigabe. Auch nach dem Speichern kann die Berechnung noch den vorherigen Stand zeigen. Tatsächlich verfügbare Akkuenergie, bereits verbrauchte oder gebundene Kontingente und aktuelle Schutzgrenzen werden vor jedem Start zusätzlich geprüft.</p>
+        <?php if ($measured): ?>
+        <div class="border-top pt-2 mt-2" data-wp-pv-runtime>
+            <?php if (is_array($runtime)): ?>
+            <h6 class="small fw-bold">Wh-Wächterstand beim Laden der Seite</h6>
+            <p class="small text-muted mb-1">Messzeit: <?= htmlspecialchars(date('d.m.Y H:i:s T', (int)$runtime['sample_ts'])) ?>. Für einen neuen Stand die Seite neu laden.</p>
+            <?php foreach (['battery' => 'Hausakku', 'grid' => 'Stromnetz'] as $source => $label): ?>
+            <p class="small mb-1"><?= htmlspecialchars($label) ?>: <?= $fmt($runtime['window_' . $source . '_used_wh'], 1) ?> Wh verbraucht · <?= $fmt($runtime[$source . '_remaining_wh'], 1) ?> Wh verbleibend · <?= $fmt($runtime[$source . '_overrun_wh'], 1) ?> Wh über dem Kontingent.</p>
+            <?php endforeach; ?>
+            <p class="small mb-1">Verbleibende Verdichterschutzzeit: <?= $fmt($runtime['compressor_protected_remaining_s'] / 60, 1) ?> Min.</p>
+            <?php $reactionReserve = $runtime['reaction_reserve_w'] ?? null; ?>
+            <?php if (!is_bool($reactionReserve) && is_numeric($reactionReserve) && is_finite((float)$reactionReserve) && (float)$reactionReserve > 0): ?>
+            <p class="small mb-1">Zusätzlich gebundene Leistungsreserve: <?= $fmt($reactionReserve) ?> W. Die sofort verfügbare Quellenreaktion deckt einen möglichen WP-Leistungssprung noch nicht vollständig; dadurch bleibt weniger Restleistung für nachrangige Verbraucher.</p>
+            <?php endif; ?>
+            <?php if (($runtime['energy_guard_pending'] ?? false) === true): ?><p class="small text-warning fw-bold mb-1">Wh-Wächter erreicht: Boost-Ende nach der geschützten Laufzeit vorgemerkt.</p><?php endif; ?>
+            <?php else: ?><p class="small text-muted mb-1">Kein frischer Wächterstand verfügbar. Verbrauch und verbleibende Schutzzeit werden nicht als null angenommen.</p><?php endif; ?>
+        </div>
+        <?php endif; ?>
+        <p class="small text-muted mb-0">Normale Heizung und Warmwasserbereitung bleiben unabhängig.</p>
+    </div>
+    <?php
+    return (string)ob_get_clean();
+}
+
 $configValidationMarker = function($key) use ($configValidationByKey) {
     $entry = $configValidationByKey[strtolower($key)] ?? null;
+    if (strtolower($key) === 'wp_pv_energy_reservation') return renderHeatpumpPvReservationStatus($entry, readHeatpumpPvRuntime());
     if (!is_array($entry) || (($entry['severity'] ?? '') !== 'warning')) return '';
     $unit = (string)($entry['unit'] ?? '');
     $fmt = function($value) use ($unit): string {
@@ -3861,6 +4074,19 @@ async function readConfirmedConfigJson(response) {
 }
 </script>
 <style>
+    .config-setting-inactive {
+        filter: grayscale(1);
+        opacity: 0.65;
+    }
+    .config-setting-requirement {
+        max-width: 40rem;
+        line-height: 1.4;
+    }
+    .config-setting-requirement-inactive {
+        color: var(--bs-body-color);
+        border-left: 3px solid var(--bs-secondary-color, #6c757d);
+        padding-left: 0.55rem;
+    }
     .config-card { border-radius: 16px; margin-bottom: 12px; overflow: hidden; }
     .config-header { color: #22d3ee; font-weight: bold; padding: 12px 15px; border-bottom: 1px solid var(--bs-border-color); cursor: pointer; display: flex; justify-content: space-between; align-items: center; text-decoration: none; }
     .config-group-el > summary.config-header {
@@ -4741,6 +4967,39 @@ async function readConfirmedConfigJson(response) {
         <input type="hidden" name="save_all" value="1">
         <input type="hidden" name="config_auto_install_confirmed" id="configAutoInstallConfirmed" value="0">
         <?php
+            $configSettingRequirements = e3dc_config_setting_requirements();
+            $configRequirementKeys = array_keys($configSettingRequirements);
+            array_walk_recursive($configSettingRequirements, function($value, $key) use (&$configRequirementKeys) {
+                if ($key === 'key' && is_string($value)) $configRequirementKeys[] = $value;
+            });
+            $configRequirementBaseline = [];
+            foreach (array_unique($configRequirementKeys) as $key) {
+                $configRequirementBaseline[$key] = (string)($config[$key]['value'] ?? ($defaults[$key] ?? ''));
+            }
+            $configRequirementWarnings = [];
+            foreach ($configSettingRequirements as $key => $meta) {
+                if (empty($meta['summary']) || !e3dc_cfg_enabled($configRequirementBaseline, $key, false)) continue;
+                $reasons = [];
+                foreach ($meta['requirements'] as $requirement) {
+                    if (!e3dc_config_auto_rule_matches($configRequirementBaseline, $requirement['when'])) $reasons[] = $requirement['reason'];
+                }
+                if ($reasons) $configRequirementWarnings[] = ['key' => $key, 'text' => $meta['label'] . ': ' . implode(' ', $reasons)];
+            }
+        ?>
+        <div class="alert alert-warning mx-1 mt-3" id="configRequirementSummary" role="status" aria-live="polite" <?= $configRequirementWarnings ? '' : 'hidden' ?>>
+            <strong>Aktivierte Einstellungen ohne Wirkung</strong>
+            <ul class="mb-1 mt-2" data-config-requirement-list>
+                <?php foreach ($configRequirementWarnings as $warning): ?>
+                <li><?= htmlspecialchars($warning['text'], ENT_QUOTES, 'UTF-8') ?>
+                    <?php if ($warning['key'] === 'market_heatpump_enable'): ?>
+                    <button type="submit" name="config_action" value="disable_legacy_heat_market" data-config-isolated-action formnovalidate class="btn btn-sm btn-outline-warning ms-2" title="Speichert nur diesen Altwert. Andere Änderungen bitte vorher speichern.">Jetzt deaktivieren</button>
+                    <?php endif; ?>
+                </li>
+                <?php endforeach; ?>
+            </ul>
+            <div class="small">Die Auswahl bleibt gespeichert und bearbeitbar. Die Hinweise folgen der Formularauswahl; Änderungen werden erst durch Speichern übernommen. Dies ist keine Bestätigung laufender Geräte oder einer aktuellen Ladefreigabe.</div>
+        </div>
+        <?php
             $simpleRaw = function($key, $fallback = '') use ($config, $defaults) {
                 $lk = strtolower((string)$key);
                 $value = $config[$lk]['value'] ?? ($defaults[$key] ?? $fallback);
@@ -5122,6 +5381,7 @@ async function readConfirmedConfigJson(response) {
                         </div>
                     </div>
                     <div class="config-simple-actions">
+                        <button type="button" class="btn btn-sm btn-outline-info" onclick="openAdvancedConfigGroup('group-luxtronik', 'wpGridBoostSettings')">Netzboost und Preise</button>
                         <button type="button" class="btn btn-sm btn-outline-warning" onclick="openAdvancedConfigGroup('group-luxtronik', 'conf_lux')" title="Vorhandene Wärmepumpe prüfen, aktivieren oder Typ wechseln.">
                             <i class="fas fa-wand-magic-sparkles me-1"></i>WP-Assistent
                         </button>
@@ -5990,8 +6250,157 @@ async function readConfirmedConfigJson(response) {
                     </div>
                 </div>
 
+                <section tabindex="-1" id="wpGridBoostSettings" class="border rounded p-3 mb-3">
+                    <h6 class="fw-bold">Wärmepumpe: Netzstrom und Preissteuerung</h6>
+                    <div class="row g-3">
+                        <div class="col-12">
+                            <div class="d-flex flex-wrap align-items-start justify-content-between gap-2 p-3 rounded-3 border border-info-subtle" style="background: rgba(14,165,233,0.08);">
+                                <div>
+                                    <div class="fw-bold text-info"><i class="fas fa-route me-2"></i>Wärme in die Gesamtplanung einbeziehen</div>
+                                    <div class="small text-muted mt-1">Aus: Wärmepumpe und Heizstab laufen nach der bisherigen sicheren Regelung. Ein: Die gemeinsame Planung darf Wärme-Starts und einen ausdrücklich freigegebenen Heizstab-Netzboost begrenzen. Dieser Schalter allein aktiviert keine Wärmepumpen-Preisverschiebung.</div>
+                                </div>
+                                <div class="form-check form-switch m-0">
+                                    <input type="hidden" name="values[heat_policy_runtime_enable]" value="0">
+                                    <input class="form-check-input" type="checkbox" name="values[heat_policy_runtime_enable]" value="1" id="conf_heat_policy_runtime_enable" <?= $isTrue('heat_policy_runtime_enable') ? 'checked' : '' ?>>
+                                    <label class="form-check-label ms-2 config-label" for="conf_heat_policy_runtime_enable" data-tooltip="<?= htmlspecialchars($tooltipMap['heat_policy_runtime_enable'] ?? '') ?>">Aktiv nutzen</label>
+                                </div>
+                            </div>
+                        </div>
+
+                        <?php if ($wpPriceBoostControllable): ?>
+                        <div class="col-12">
+                            <div class="p-3 rounded-3 border border-info-subtle" id="heat_price_boost_controls" style="background: rgba(14,165,233,0.05);">
+                                <div class="d-flex flex-wrap align-items-start justify-content-between gap-3">
+                                    <div class="flex-grow-1">
+                                        <div class="fw-bold text-info"><i class="fas fa-clock-rotate-left me-2"></i>Wärmepumpen-Preisverschiebung</div>
+                                        <div class="small text-muted mt-1">
+                                            Noch ohne Steuerwirkung: Diese Funktion plant günstige Wärmezeiten mit Netzstrom. Die aktive Ausführung ist noch nicht verfügbar. Der Schalter speichert Deinen Wunsch; er startet derzeit keinen Netzboost.
+                                        </div>
+                                    </div>
+                                    <div class="form-check form-switch m-0">
+                                        <input type="hidden" name="values[price_boost_enable]" value="0">
+                                        <input class="form-check-input" type="checkbox" name="values[price_boost_enable]" value="1" id="conf_price_boost_enable" <?= $isTrue('price_boost_enable') ? 'checked' : '' ?>>
+                                        <label class="form-check-label ms-2 config-label" for="conf_price_boost_enable" data-tooltip="<?= htmlspecialchars($tooltipMap['price_boost_enable'] ?? '') ?>">Preisabhängigen Netzboost vormerken</label>
+                                        <?= $configValidationMarker('price_boost_enable') ?>
+                                    </div>
+                                </div>
+
+                                <div class="row g-3 mt-1">
+                                    <div class="col-md-3">
+                                        <label class="config-label" for="conf_heat_price_boost_scope" data-tooltip="<?= htmlspecialchars($tooltipMap['heat_price_boost_scope'] ?? '') ?>">Wärmeziel</label>
+                                        <select class="form-select config-input" name="values[heat_price_boost_scope]" id="conf_heat_price_boost_scope">
+                                            <option value="both" <?= $val('heat_price_boost_scope') === 'both' ? 'selected' : '' ?>>Heizung und Warmwasser</option>
+                                            <?php if ($wpPriceBoostSeparateTargets): ?>
+                                            <option value="heating" <?= $val('heat_price_boost_scope') === 'heating' ? 'selected' : '' ?>>Nur Heizung</option>
+                                            <option value="dhw" <?= $val('heat_price_boost_scope') === 'dhw' ? 'selected' : '' ?>>Nur Warmwasser</option>
+                                            <?php endif; ?>
+                                        </select>
+                                        <?= $configValidationMarker('heat_price_boost_scope') ?>
+                                    </div>
+                                    <div class="col-md-5">
+                                        <label class="config-label" for="conf_heat_price_boost_windows" data-tooltip="<?= htmlspecialchars($tooltipMap['heat_price_boost_windows'] ?? '') ?>">Erlaubte Zeitfenster</label>
+                                        <textarea class="form-control config-input" name="values[heat_price_boost_windows]" id="conf_heat_price_boost_windows" rows="2" placeholder="02:00-06:00&#10;12:00-16:00"><?= $val('heat_price_boost_windows') ?></textarea>
+                                        <div class="form-text">Leer bedeutet ganztägige Planung; je Zeile <code>HH:MM-HH:MM</code>.</div>
+                                        <?= $configValidationMarker('heat_price_boost_windows') ?>
+                                    </div>
+                                    <div class="col-md-4">
+                                        <div class="p-2 rounded-3 border border-danger-subtle h-100">
+                                            <div class="small fw-bold text-danger"><i class="fas fa-plug-circle-bolt me-1"></i>Negativpreis-Boost – eigene Freigabe</div>
+                                            <div class="form-check form-switch mt-2">
+                                                <input type="hidden" name="values[cheap_grid_heatpump_enable]" value="0">
+                                                <input class="form-check-input" type="checkbox" name="values[cheap_grid_heatpump_enable]" value="1" id="conf_cheap_grid_heatpump_enable" <?= $isTrue('cheap_grid_heatpump_enable') ? 'checked' : '' ?>>
+                                                <label class="form-check-label config-label" for="conf_cheap_grid_heatpump_enable" data-tooltip="<?= htmlspecialchars($tooltipMap['cheap_grid_heatpump_enable'] ?? '') ?>">WP für Negativpreis-Boost freigeben</label>
+                                            </div>
+                                            <div class="small text-muted mt-1">Nur echte Börsenpreistarife liefern belastbare Negativpreis-Slots. Zusätzlich muss der gemeinsame Negativpreis-Boost im Tarifbereich eingeschaltet sein. Dies ist unabhängig von der noch nicht aktiven allgemeinen Preisverschiebung.</div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="row g-3 mt-1">
+                                    <div class="col-6 col-md-2">
+                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['price_limit'] ?? '') ?>">Preis-Limit</label>
+                                        <div class="input-group">
+                                            <input type="number" step="0.1" name="values[price_limit]" class="form-control config-input" value="<?= $val('price_limit') ?>">
+                                            <span class="input-group-text bg-body-tertiary">ct/kWh</span>
+                                        </div>
+                                        <?= $configValidationMarker('price_limit') ?>
+                                    </div>
+                                    <div class="col-6 col-md-2">
+                                        <label class="config-label text-success" data-tooltip="<?= htmlspecialchars($tooltipMap['price_hard_limit'] ?? '') ?>">Sehr günstig</label>
+                                        <div class="input-group">
+                                            <input type="number" step="0.1" name="values[price_hard_limit]" class="form-control config-input" value="<?= $val('price_hard_limit') ?>">
+                                            <span class="input-group-text bg-body-tertiary">ct/kWh</span>
+                                        </div>
+                                        <?= $configValidationMarker('price_hard_limit') ?>
+                                    </div>
+                                    <div class="col-6 col-md-2">
+                                        <label class="config-label text-danger" data-tooltip="<?= htmlspecialchars($tooltipMap['price_pause_limit'] ?? '') ?>">Sperr-Limit</label>
+                                        <div class="input-group">
+                                            <input type="number" step="0.1" name="values[price_pause_limit]" class="form-control config-input" value="<?= $val('price_pause_limit') ?>" placeholder="<?= $defaults['price_pause_limit'] ?>">
+                                            <span class="input-group-text bg-body-tertiary">ct/kWh</span>
+                                        </div>
+                                        <?= $configValidationMarker('price_pause_limit') ?>
+                                    </div>
+                                    <div class="col-6 col-md-3">
+                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['price_min_duration'] ?? '') ?>">Mindestdauer</label>
+                                        <div class="input-group">
+                                            <input type="number" min="0" name="values[price_min_duration]" class="form-control config-input" value="<?= $val('price_min_duration') ?>">
+                                            <span class="input-group-text bg-body-tertiary">min</span>
+                                        </div>
+                                    </div>
+                                    <div class="col-6 col-md-3">
+                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['price_max_daily'] ?? '') ?>">Tagesmaximum</label>
+                                        <div class="input-group">
+                                            <input type="number" min="0" name="values[price_max_daily]" class="form-control config-input" value="<?= $val('price_max_daily') ?>">
+                                            <span class="input-group-text bg-body-tertiary">min</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        <?php else: ?>
+                        <div class="col-12">
+                            <div class="alert alert-secondary border-secondary-subtle mb-0">
+                                <div class="fw-bold"><i class="fas fa-eye me-2"></i>Wärmepumpen-Preisverschiebung nicht steuerbar</div>
+                                <div class="small mt-1">Für die gewählte Anlagenart ist kein passender Wärmeaktor gebunden. Die Tarifdaten bleiben sichtbar, erzeugen aber keinen Wärme-Candidate und keinen Aktorbefehl.</div>
+                            </div>
+                        </div>
+                        <?php endif; ?>
+
+                    </div>
+                </section>
                 <?php if ($showWpBoostControls): ?>
                 <h6 class="text-muted small fw-bold mt-4 mb-2 border-bottom pb-1">PV-Überschuss-Boost</h6>
+                <?php if ($wp_type_val === '0'): ?>
+                <div class="border rounded p-3 mb-3" id="wpPvControls">
+                    <h6 class="small fw-bold mb-2">Luxtronik: PV-Automatik und Wolkenüberbrückung</h6>
+                    <label class="config-label" for="conf_wp_pv_control_mode">Betriebsart der PV-Regelung</label>
+                    <select class="form-select config-input mb-2" id="conf_wp_pv_control_mode" name="values[wp_pv_control_mode]">
+                        <option value="measured" <?= $val('wp_pv_control_mode') === 'measured' ? 'selected' : '' ?>>Messwertgeführt: Istaufnahme und Wh-Wächter (empfohlen)</option>
+                        <option value="reserved" <?= $val('wp_pv_control_mode') === 'reserved' ? 'selected' : '' ?>>Vollständige Vorreservierung (bisheriges Verhalten)</option>
+                        <?php if (!in_array($val('wp_pv_control_mode'), ['measured', 'reserved'], true)): ?>
+                        <option value="<?= $val('wp_pv_control_mode') ?>" selected>Ungültige gespeicherte Betriebsart – bitte auswählen</option>
+                        <?php endif; ?>
+                    </select>
+                    <p class="small text-muted mb-2" data-wp-mode-description>Vorhandene Werte bleiben erhalten. Messwertgeführt zählt die tatsächliche Überbrückung. Ein erreichter Wh-Wächter beendet den zusätzlichen Boost nach der geschützten Mindestlaufzeit; der Verbrauch bis dahin wird weitergezählt. Ausgeschlossene Quellen und Hardwaregrenzen bleiben vorrangig.</p>
+                    <div class="rounded bg-body-tertiary p-3 my-2" data-wp-measured-only <?= $val('wp_pv_control_mode') === 'measured' ? '' : 'hidden' ?>>
+                        <label for="wpPvBridgePreset" class="config-label">Wolkenüberbrückung voreinstellen</label>
+                        <select class="form-select mb-2" id="wpPvBridgePreset">
+                            <option value="normal" selected>Normal: Akku 1.000 Wh / Netz 100 Wh</option>
+                            <option value="short">Kurz: Akku 500 Wh / Netz 50 Wh</option>
+                            <option value="long">Großzügig: Akku 2.000 Wh / Netz 200 Wh</option>
+                        </select>
+                        <div class="d-flex flex-wrap gap-3 mb-2">
+                            <label><input type="checkbox" id="wpPvPresetBattery" <?= !array_key_exists('wp_pv_battery_limit_wh', $config) || ((float)$val('wp_pv_battery_limit_wh') > 0 && (float)$val('wp_pv_battery_max_w') > 0) ? 'checked' : '' ?>> Akkuüberbrückung erlauben</label>
+                            <label><input type="checkbox" id="wpPvPresetGrid" <?= (float)$val('wp_pv_grid_limit_wh') > 0 && (float)$val('wp_pv_grid_max_w') > 0 ? 'checked' : '' ?>> Begrenzte Netzunterstützung erlauben</label>
+                        </div>
+                        <p class="small mb-2" id="wpPvPresetPreview" aria-live="polite">Die Auswahl wird erst mit „Voreinstellung übernehmen“ in die Eingabefelder übertragen.</p>
+                        <button type="button" class="btn btn-sm btn-outline-primary" id="wpPvApplyPreset">Voreinstellung übernehmen</button>
+                        <p class="small text-muted mt-2 mb-0">Projektvorgaben für die Energie innerhalb von 24 Stunden. Zur Einhaltung der Mindestlaufzeit kann der Verbrauch darüber liegen. Wirksam wird die Auswahl erst beim Speichern; eigene Werte lassen sich in der Feinabstimmung setzen.</p>
+                    </div>
+                    <details class="mt-3" id="wpPvFineSettings">
+                        <summary class="small fw-bold">Feinabstimmung: Start, Quellen und Verdichterschutz</summary>
+                        <p class="small text-muted mt-2">Die technischen Zeiten sind bereits voreingestellt. Passe sie nur an, wenn Dein Geräteprofil andere Zeiten benötigt. In der messwertgeführten Regelung ist der elektrische Profilwert kein ständig benötigtes Budget. Der Betrag der Start-Grenze wird als Startleistung verwendet, solange die optionale Startleistung auf 0 steht.</p>
                 <div class="row g-2 mb-2">
                 <div class="col-12 col-md-4">
                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['grid_start_limit'] ?? '') ?>">Start-Grenze (Watt, negativ=Einspeisung)</label>
@@ -6016,35 +6425,40 @@ async function readConfirmedConfigJson(response) {
                     <input type="number" min="0" name="values[wp_restart_block_min]" class="form-control config-input" value="<?= $val('wp_restart_block_min') ?>" placeholder="<?= $defaults['wp_restart_block_min'] ?>">
                 </div>
                 </div>
-                <?php if ($wp_type_val === '0'): ?>
-                <div class="border rounded p-3 mb-3">
-                    <h6 class="small fw-bold mb-2">Luxtronik: Leistungsprofil und Energie zur Überbrückung</h6>
-                    <p class="small text-muted mb-2">Vor einem zusätzlichen PV-Start müssen Leistung und Energie für die geschützte Laufzeit einschließlich Startwartezeit und Reaktion gedeckt sein. Trage die belegte maximale elektrische Aufnahme innerhalb der WP-Messgrenze ein; die Start-Grenze ist dafür kein Ersatz. Pumpen und eine mögliche Zusatzheizung müssen korrekt berücksichtigt sein.</p>
-                    <div class="row g-2">
-                    <?php foreach ([
-                        'wp_pv_max_power_w' => 'Maximale elektrische WP-Aufnahme (W)',
-                        'wp_pv_battery_max_w' => 'Akkuüberbrückung: Leistung (W)',
-                        'wp_pv_battery_limit_wh' => 'Akkuüberbrückung: Energie in 24 h (Wh)',
-                        'wp_pv_grid_max_w' => 'Netzüberbrückung: Leistung (W)',
-                        'wp_pv_grid_limit_wh' => 'Netzüberbrückung: Energie in 24 h (Wh)',
-                    ] as $wpPvKey => $wpPvLabel): ?>
+                        <div class="mb-3" data-wp-measured-only <?= $val('wp_pv_control_mode') === 'measured' ? '' : 'hidden' ?>>
+                            <label class="config-label" for="conf_wp_pv_start_power_w" data-tooltip="<?= htmlspecialchars($tooltipMap['wp_pv_start_power_w'] ?? '') ?>">Startleistung (W), 0 = bestehende Start-Grenze</label>
+                            <input type="number" min="0" step="1" id="conf_wp_pv_start_power_w" name="values[wp_pv_start_power_w]" class="form-control config-input" value="<?= $val('wp_pv_start_power_w') ?>">
+                            <?= $configValidationMarker('wp_pv_start_power_w') ?>
+                        </div>
+                    <div class="mb-3">
+                        <label class="config-label" for="conf_wp_pv_max_power_w" data-tooltip="<?= htmlspecialchars($tooltipMap['wp_pv_max_power_w'] ?? '') ?>">Elektrischer Profilwert (W, optional bei Ist-Regelung)</label>
+                        <input type="number" min="0" step="1" id="conf_wp_pv_max_power_w" name="values[wp_pv_max_power_w]" class="form-control config-input" value="<?= $val('wp_pv_max_power_w') ?>" placeholder="<?= $defaults['wp_pv_max_power_w'] ?>">
+                        <?= $configValidationMarker('wp_pv_max_power_w') ?>
+                    </div>
+                    <div class="row g-3">
+                    <?php foreach (['battery' => 'Hausakku', 'grid' => 'Stromnetz'] as $wpPvSource => $wpPvSourceLabel): ?>
                         <div class="col-12 col-md-6">
-                            <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap[$wpPvKey] ?? '') ?>"><?= htmlspecialchars($wpPvLabel) ?></label>
-                            <input type="number" min="0" step="1" name="values[<?= htmlspecialchars($wpPvKey) ?>]" class="form-control config-input" value="<?= $val($wpPvKey) ?>" placeholder="<?= $defaults[$wpPvKey] ?>">
-                            <?= $configValidationMarker($wpPvKey) ?>
+                            <fieldset class="border rounded p-3 h-100">
+                                <legend class="float-none w-auto px-1 small fw-bold">Überbrückung aus dem <?= htmlspecialchars($wpPvSourceLabel) ?></legend>
+                                <?php foreach (['_max_w' => 'Maximale Leistung (W)', '_limit_wh' => 'Energiekontingent innerhalb von 24 Stunden (Wh)'] as $wpPvSuffix => $wpPvLabel): ?>
+                                    <?php $wpPvKey = 'wp_pv_' . $wpPvSource . $wpPvSuffix; ?>
+                                    <div class="mb-2">
+                                        <label class="config-label" for="conf_<?= htmlspecialchars($wpPvKey) ?>" data-tooltip="<?= htmlspecialchars($tooltipMap[$wpPvKey] ?? '') ?>"><?= htmlspecialchars($wpPvLabel) ?></label>
+                                        <input type="number" min="0" step="1" id="conf_<?= htmlspecialchars($wpPvKey) ?>" name="values[<?= htmlspecialchars($wpPvKey) ?>]" class="form-control config-input" value="<?= $val($wpPvKey) ?>" placeholder="<?= $defaults[$wpPvKey] ?>">
+                                        <?= $configValidationMarker($wpPvKey) ?>
+                                    </div>
+                                <?php endforeach; ?>
+                            </fieldset>
                         </div>
                     <?php endforeach; ?>
                     </div>
-                    <p class="small text-muted mt-2 mb-1">0 W beim Leistungsprofil bedeutet: neue optionale PV-Starts warten. Bei einer Quelle sperrt 0 W oder 0 Wh deren Überbrückung. Die Wh-Grenzen gelten rollierend für 24 Stunden; Wolkenwechsel, neue Sollwerte und Neustarts füllen sie nicht neu. Normale Heizung und Warmwasser bleiben unabhängig.</p>
-                    <?= $configValidationMarker('wp_pv_energy_reservation') ?>
-                    <details class="mt-2">
-                        <summary class="small fw-bold">Fristen für das Geräteprofil</summary>
-                        <p class="small text-muted mt-2 mb-2">Diese Planungsfristen müssen zur tatsächlichen Messung und Geräteantwort passen. Sie sind keine garantierten Herstellerzeiten.</p>
+                        <p class="small text-muted mt-2">0 W oder 0 Wh bei einer Quelle sperrt ihre Überbrückung. Der elektrische Profilwert darf in der messwertgeführten Regelung unbekannt (0) bleiben. Die vollständige Vorreservierung benötigt einen belegten Wert. Gezählt wird rollierend über 24 Stunden; Wolken und Neustarts füllen die Kontingente nicht neu.</p>
+                        <h6 class="small fw-bold mt-3">Zeiten für Start und Reaktion</h6>
                         <div class="row g-2">
                         <?php foreach ([
-                            'wp_pv_reaction_s' => ['Reaktionsfrist (s)', 1],
-                            'wp_pv_start_wait_s' => ['Verdichter-Startwartefrist (s)', 600],
-                            'wp_pv_handoff_timeout_s' => ['Übergabefrist Wallbox (s)', 1],
+                            'wp_pv_start_wait_s' => ['Wartezeit auf den Verdichterstart (s)', 600],
+                            'wp_pv_reaction_s' => ['Berücksichtigte Reaktionszeit (s)', 1],
+                            'wp_pv_handoff_timeout_s' => ['Wartezeit auf die Leistungsreduzierung der Wallbox (s)', 1],
                         ] as $wpPvKey => $wpPvField): ?>
                             <div class="col-12 col-md-4">
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap[$wpPvKey] ?? '') ?>"><?= htmlspecialchars($wpPvField[0]) ?></label>
@@ -6054,6 +6468,32 @@ async function readConfirmedConfigJson(response) {
                         <?php endforeach; ?>
                         </div>
                     </details>
+                    <?= $configValidationMarker('wp_pv_energy_reservation') ?>
+                </div>
+                <?php else: ?>
+                <div class="row g-2 mb-2">
+                <div class="col-12 col-md-4">
+                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['grid_start_limit'] ?? '') ?>">Start-Grenze (Watt, negativ=Einspeisung)</label>
+                        <input type="number" name="values[grid_start_limit]" class="form-control config-input" value="<?= $val('grid_start_limit') ?>">
+                    </div>
+                <div class="col-6 col-md-4">
+                    <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['pv_boost_delay'] ?? '') ?>">Start-Verzögerung (Sek)</label>
+                    <input type="number" name="values[pv_boost_delay]" class="form-control config-input" value="<?= $val('pv_boost_delay') ?>" placeholder="<?= $defaults['pv_boost_delay'] ?>">
+                </div>
+                <?php if ($wp_type_val !== '0'): ?>
+                <div class="col-6 col-md-4">
+                    <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['stop_delay_minutes'] ?? '') ?>">Stop-Verzögerung (Min)</label>
+                        <input type="number" name="values[stop_delay_minutes]" class="form-control config-input" value="<?= $val('stop_delay_minutes') ?>" placeholder="<?= $defaults['stop_delay_minutes'] ?>">
+                    </div>
+                <?php endif; ?>
+                <div class="col-6 col-md-4">
+                    <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wp_min_runtime_min'] ?? '') ?>">Mindestlaufzeit (Min)</label>
+                    <input type="number" min="<?= $wp_type_val === '0' ? '1' : '0' ?>" name="values[wp_min_runtime_min]" class="form-control config-input" value="<?= $val('wp_min_runtime_min') ?>" placeholder="<?= $defaults['wp_min_runtime_min'] ?>">
+                </div>
+                <div class="col-6 col-md-4">
+                    <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wp_restart_block_min'] ?? '') ?>">Wiedereinschaltsperre (Min)</label>
+                    <input type="number" min="0" name="values[wp_restart_block_min]" class="form-control config-input" value="<?= $val('wp_restart_block_min') ?>" placeholder="<?= $defaults['wp_restart_block_min'] ?>">
+                </div>
                 </div>
                 <?php endif; ?>
                 <div class="row g-2 mb-2">
@@ -6093,25 +6533,25 @@ async function readConfirmedConfigJson(response) {
                 <div class="form-check form-switch mb-2 config-item ps-5 border-0 bg-transparent">
                     <input type="hidden" name="values[ww_timer_enable]" value="0">
                     <input class="form-check-input" type="checkbox" name="values[ww_timer_enable]" value="1" id="conf_ww_timer" <?= $isTrue('ww_timer_enable') ? 'checked' : '' ?> style="transform: scale(1.2); margin-left: -2.5em;">
-                    <label class="form-check-label ms-2 fw-bold text-danger" for="conf_ww_timer">Hardware-Timer überschreiben (Software Timer aktiv)</label>
+                    <label class="form-check-label ms-2 fw-bold text-danger config-label" for="conf_ww_timer" data-tooltip="<?= htmlspecialchars($tooltipMap['ww_timer_enable'] ?? '') ?>">Hardware-Timer überschreiben (Software Timer aktiv)</label>
                 </div>
                 <div class="row g-2 mb-2 p-2 rounded bg-opacity-10 bg-danger border border-danger">
                     <div class="col-12"><div class="fw-bold text-danger small mb-1"><i class="fas fa-hot-tub me-1"></i>Warmwasser Bereitstellung</div></div>
-                    <div class="col-3 col-md-2"><label class="config-label text-danger">Start (Dezimal)</label><input type="number" step="0.1" name="values[wwvon]" class="form-control config-input bg-danger bg-opacity-10" value="<?= $val('wwvon') ?>" placeholder="0.0"></div>
-                    <div class="col-3 col-md-2"><label class="config-label text-danger">Ende (Dezimal)</label><input type="number" step="0.1" name="values[wwbis]" class="form-control config-input bg-danger bg-opacity-10" value="<?= $val('wwbis') ?>" placeholder="24.0"></div>
-                    <div class="col-3 col-md-2"><label class="config-label text-danger">Temp Normal</label><input type="number" step="0.1" name="values[ww_normal]" class="form-control config-input bg-danger bg-opacity-10" value="<?= $val('ww_normal') ?>" placeholder="45.0"></div>
-                    <div class="col-3 col-md-2"><label class="config-label text-danger">Temp Eco</label><input type="number" step="0.1" name="values[ww_eco]" class="form-control config-input bg-danger bg-opacity-10" value="<?= $val('ww_eco') ?>" placeholder="35.0"></div>
+                    <div class="col-3 col-md-2"><label class="config-label text-danger" data-tooltip="<?= htmlspecialchars($tooltipMap['wwvon'] ?? '') ?>">Start (Dezimal)</label><input type="number" step="0.1" name="values[wwvon]" class="form-control config-input bg-danger bg-opacity-10" value="<?= $val('wwvon') ?>" placeholder="0.0"></div>
+                    <div class="col-3 col-md-2"><label class="config-label text-danger" data-tooltip="<?= htmlspecialchars($tooltipMap['wwbis'] ?? '') ?>">Ende (Dezimal)</label><input type="number" step="0.1" name="values[wwbis]" class="form-control config-input bg-danger bg-opacity-10" value="<?= $val('wwbis') ?>" placeholder="24.0"></div>
+                    <div class="col-3 col-md-2"><label class="config-label text-danger" data-tooltip="<?= htmlspecialchars($tooltipMap['ww_normal'] ?? '') ?>">Temp Normal</label><input type="number" step="0.1" name="values[ww_normal]" class="form-control config-input bg-danger bg-opacity-10" value="<?= $val('ww_normal') ?>" placeholder="45.0"></div>
+                    <div class="col-3 col-md-2"><label class="config-label text-danger" data-tooltip="<?= htmlspecialchars($tooltipMap['ww_eco'] ?? '') ?>">Temp Eco</label><input type="number" step="0.1" name="values[ww_eco]" class="form-control config-input bg-danger bg-opacity-10" value="<?= $val('ww_eco') ?>" placeholder="35.0"></div>
 
                     <div class="col-12 mt-2"><div class="fw-bold text-danger small mb-1"><i class="fas fa-sync me-1"></i>Zirkulationspumpe (Reg 10070)</div></div>
-                    <div class="col-6 col-md-2"><label class="config-label text-danger">Start (Dezimal)</label><input type="number" step="0.1" name="values[ww_circ_von]" class="form-control config-input bg-danger bg-opacity-10" value="<?= $val('ww_circ_von') ?>" placeholder="5.5"></div>
-                    <div class="col-6 col-md-2"><label class="config-label text-danger">Ende (Dezimal)</label><input type="number" step="0.1" name="values[ww_circ_bis]" class="form-control config-input bg-danger bg-opacity-10" value="<?= $val('ww_circ_bis') ?>" placeholder="20.0"></div>
-                    <div class="col-4 col-md-2"><label class="config-label text-danger">Takt AN (Min)</label><input type="number" name="values[ww_circ_on]" class="form-control config-input bg-danger bg-opacity-10" value="<?= $val('ww_circ_on') ?>" placeholder="5"></div>
-                    <div class="col-4 col-md-2"><label class="config-label text-danger">Takt AUS (Min)</label><input type="number" name="values[ww_circ_off]" class="form-control config-input bg-danger bg-opacity-10" value="<?= $val('ww_circ_off') ?>" placeholder="25"></div>
+                    <div class="col-6 col-md-2"><label class="config-label text-danger" data-tooltip="<?= htmlspecialchars($tooltipMap['ww_circ_von'] ?? '') ?>">Start (Dezimal)</label><input type="number" step="0.1" name="values[ww_circ_von]" class="form-control config-input bg-danger bg-opacity-10" value="<?= $val('ww_circ_von') ?>" placeholder="5.5"></div>
+                    <div class="col-6 col-md-2"><label class="config-label text-danger" data-tooltip="<?= htmlspecialchars($tooltipMap['ww_circ_bis'] ?? '') ?>">Ende (Dezimal)</label><input type="number" step="0.1" name="values[ww_circ_bis]" class="form-control config-input bg-danger bg-opacity-10" value="<?= $val('ww_circ_bis') ?>" placeholder="20.0"></div>
+                    <div class="col-4 col-md-2"><label class="config-label text-danger" data-tooltip="<?= htmlspecialchars($tooltipMap['ww_circ_on'] ?? '') ?>">Takt AN (Min)</label><input type="number" name="values[ww_circ_on]" class="form-control config-input bg-danger bg-opacity-10" value="<?= $val('ww_circ_on') ?>" placeholder="5"></div>
+                    <div class="col-4 col-md-2"><label class="config-label text-danger" data-tooltip="<?= htmlspecialchars($tooltipMap['ww_circ_off'] ?? '') ?>">Takt AUS (Min)</label><input type="number" name="values[ww_circ_off]" class="form-control config-input bg-danger bg-opacity-10" value="<?= $val('ww_circ_off') ?>" placeholder="25"></div>
                     <div class="col-4 col-md-4 pt-4">
                         <div class="form-check form-switch p-0 ps-5 mt-1">
                             <input type="hidden" name="values[ww_circ_boost]" value="0">
                             <input class="form-check-input" type="checkbox" name="values[ww_circ_boost]" value="1" id="conf_ww_circ_boost" <?= $isTrue('ww_circ_boost') ? 'checked' : '' ?> style="transform: scale(1.1); margin-left: -2.2em;">
-                            <label class="form-check-label ms-1 text-danger small" for="conf_ww_circ_boost">Dauerhaft Ein bei Boost</label>
+                            <label class="form-check-label config-label ms-1 text-danger small" data-tooltip="<?= htmlspecialchars($tooltipMap['ww_circ_boost'] ?? '') ?>" for="conf_ww_circ_boost">Dauerhaft Ein bei Boost</label>
                         </div>
                     </div>
                 </div>
@@ -7564,16 +8004,17 @@ async function readConfirmedConfigJson(response) {
                                     ] as $mk => $meta): ?>
                                     <div class="form-check form-switch">
                                         <input type="hidden" name="values[<?= $mk ?>]" value="0">
-                                        <input class="form-check-input" type="checkbox" name="values[<?= $mk ?>]" value="1" id="conf_<?= $mk ?>" <?= $isTrue($mk) ? 'checked' : '' ?>>
+                                        <input class="form-check-input" type="checkbox" name="values[<?= $mk ?>]" value="1" id="conf_<?= $mk ?>" <?= ($isTrue($mk) || ($mk === 'market_battery_hold_enable' && $isTrue('market_battery_grid_charge_enable'))) ? 'checked' : '' ?>>
                                         <label class="form-check-label config-label" for="conf_<?= $mk ?>" data-tooltip="<?= htmlspecialchars($tooltipMap[$mk] ?? '') ?>"><i class="fas <?= $meta[1] ?> me-1"></i><?= $meta[0] ?></label>
                                     </div>
                                     <?php endforeach; ?>
                                 </div>
+                                <div class="small text-muted mt-2" id="storage-market-hold-hint">Speicher-Netzladen schließt Halten ein. Halten allein bleibt separat wählbar.</div>
                             </div>
                             <div class="col-lg-4">
                                 <div class="p-2 rounded-3 border border-info-subtle h-100" data-market-heatpump-route>
                                     <div class="small fw-bold text-info"><i class="fas fa-fire-flame-simple me-1"></i>Wärmepumpe</div>
-                                    <div class="small text-muted">Preis-Boost, Wärmeziel und Zeitfenster werden zentral im Wärmepumpenbereich festgelegt.</div>
+                                    <a class="small" href="#wpGridBoostSettings" onclick="openAdvancedConfigGroup('group-luxtronik', 'wpGridBoostSettings'); return false;">WP-Freigaben, Wärmeziel und Zeitfenster im Smart-Home-Bereich einstellen</a>
                                 </div>
                             </div>
                         </div>
@@ -7700,120 +8141,6 @@ async function readConfirmedConfigJson(response) {
                                 </div>
                             </div>
                         </div>
-
-                        <div class="col-12">
-                            <div class="d-flex flex-wrap align-items-start justify-content-between gap-2 p-3 rounded-3 border border-info-subtle" style="background: rgba(14,165,233,0.08);">
-                                <div>
-                                    <div class="fw-bold text-info"><i class="fas fa-route me-2"></i>Wärme in die Gesamtplanung einbeziehen</div>
-                                    <div class="small text-muted mt-1">Aus: Wärmepumpe und Heizstab laufen nach der bisherigen sicheren Regelung. Ein: Die gemeinsame Planung darf Wärme-Starts und einen ausdrücklich freigegebenen Heizstab-Netzboost begrenzen. Dieser Schalter allein aktiviert keine Wärmepumpen-Preisverschiebung.</div>
-                                </div>
-                                <div class="form-check form-switch m-0">
-                                    <input type="hidden" name="values[heat_policy_runtime_enable]" value="0">
-                                    <input class="form-check-input" type="checkbox" name="values[heat_policy_runtime_enable]" value="1" id="conf_heat_policy_runtime_enable" <?= $isTrue('heat_policy_runtime_enable') ? 'checked' : '' ?>>
-                                    <label class="form-check-label ms-2 config-label" for="conf_heat_policy_runtime_enable" data-tooltip="<?= htmlspecialchars($tooltipMap['heat_policy_runtime_enable'] ?? '') ?>">Aktiv nutzen</label>
-                                </div>
-                            </div>
-                        </div>
-
-                        <?php if ($showWpBoostControls): ?>
-                        <div class="col-12">
-                            <div class="p-3 rounded-3 border border-info-subtle" id="heat_price_boost_controls" style="background: rgba(14,165,233,0.05);">
-                                <div class="d-flex flex-wrap align-items-start justify-content-between gap-3">
-                                    <div class="flex-grow-1">
-                                        <div class="fw-bold text-info"><i class="fas fa-clock-rotate-left me-2"></i>Wärmepumpen-Preisverschiebung</div>
-                                        <div class="small text-muted mt-1">
-                                            Candidate/Shadow: Günstige Wärmefenster werden nur bewertet. Eine Wirkung setzt eine gültige Wärme-/PV-Prognose, vollständige Horizont-Evidenz und einen gebundenen <code>heat_intent_v1</code>-Aktivierungsvertrag voraus; bis dahin bleibt die Auswahl effektiv aus.
-                                        </div>
-                                    </div>
-                                    <div class="form-check form-switch m-0">
-                                        <input type="hidden" name="values[price_boost_enable]" value="0">
-                                        <input class="form-check-input" type="checkbox" name="values[price_boost_enable]" value="1" id="conf_price_boost_enable" <?= $isTrue('price_boost_enable') ? 'checked' : '' ?>>
-                                        <label class="form-check-label ms-2 config-label" for="conf_price_boost_enable" data-tooltip="<?= htmlspecialchars($tooltipMap['price_boost_enable'] ?? '') ?>">als Candidate anfordern</label>
-                                        <?= $configValidationMarker('price_boost_enable') ?>
-                                    </div>
-                                </div>
-
-                                <div class="row g-3 mt-1">
-                                    <div class="col-md-3">
-                                        <label class="config-label" for="conf_heat_price_boost_scope" data-tooltip="<?= htmlspecialchars($tooltipMap['heat_price_boost_scope'] ?? '') ?>">Wärmeziel</label>
-                                        <select class="form-select config-input" name="values[heat_price_boost_scope]" id="conf_heat_price_boost_scope">
-                                            <option value="both" <?= $val('heat_price_boost_scope') === 'both' ? 'selected' : '' ?>>Heizung und Warmwasser</option>
-                                            <?php if ($wpPriceBoostSeparateTargets): ?>
-                                            <option value="heating" <?= $val('heat_price_boost_scope') === 'heating' ? 'selected' : '' ?>>Nur Heizung</option>
-                                            <option value="dhw" <?= $val('heat_price_boost_scope') === 'dhw' ? 'selected' : '' ?>>Nur Warmwasser</option>
-                                            <?php endif; ?>
-                                        </select>
-                                        <?= $configValidationMarker('heat_price_boost_scope') ?>
-                                    </div>
-                                    <div class="col-md-5">
-                                        <label class="config-label" for="conf_heat_price_boost_windows" data-tooltip="<?= htmlspecialchars($tooltipMap['heat_price_boost_windows'] ?? '') ?>">Erlaubte Zeitfenster</label>
-                                        <textarea class="form-control config-input" name="values[heat_price_boost_windows]" id="conf_heat_price_boost_windows" rows="2" placeholder="02:00-06:00&#10;12:00-16:00"><?= $val('heat_price_boost_windows') ?></textarea>
-                                        <div class="form-text">Leer bedeutet ganztägige Shadow-Auswertung; je Zeile <code>HH:MM-HH:MM</code>.</div>
-                                        <?= $configValidationMarker('heat_price_boost_windows') ?>
-                                    </div>
-                                    <div class="col-md-4">
-                                        <div class="p-2 rounded-3 border border-danger-subtle h-100">
-                                            <div class="small fw-bold text-danger"><i class="fas fa-plug-circle-bolt me-1"></i>Negativpreis-Sonderpfad – getrennte Freigabe</div>
-                                            <div class="form-check form-switch mt-2">
-                                                <input type="hidden" name="values[cheap_grid_heatpump_enable]" value="0">
-                                                <input class="form-check-input" type="checkbox" name="values[cheap_grid_heatpump_enable]" value="1" id="conf_cheap_grid_heatpump_enable" <?= $isTrue('cheap_grid_heatpump_enable') ? 'checked' : '' ?>>
-                                                <label class="form-check-label config-label" for="conf_cheap_grid_heatpump_enable" data-tooltip="<?= htmlspecialchars($tooltipMap['cheap_grid_heatpump_enable'] ?? '') ?>">Wärmepumpe bei echtem Negativpreis prüfen</label>
-                                            </div>
-                                            <div class="small text-muted mt-1">Nur echte Börsenpreistarife liefern belastbare Negativpreis-Slots. Diese Freigabe öffnet keinen allgemeinen Günstigpreis-Pfad.</div>
-                                        </div>
-                                    </div>
-                                </div>
-
-                                <div class="row g-3 mt-1">
-                                    <div class="col-6 col-md-2">
-                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['price_limit'] ?? '') ?>">Preis-Limit</label>
-                                        <div class="input-group">
-                                            <input type="number" step="0.1" name="values[price_limit]" class="form-control config-input" value="<?= $val('price_limit') ?>">
-                                            <span class="input-group-text bg-body-tertiary">ct/kWh</span>
-                                        </div>
-                                        <?= $configValidationMarker('price_limit') ?>
-                                    </div>
-                                    <div class="col-6 col-md-2">
-                                        <label class="config-label text-success" data-tooltip="<?= htmlspecialchars($tooltipMap['price_hard_limit'] ?? '') ?>">Sehr günstig</label>
-                                        <div class="input-group">
-                                            <input type="number" step="0.1" name="values[price_hard_limit]" class="form-control config-input" value="<?= $val('price_hard_limit') ?>">
-                                            <span class="input-group-text bg-body-tertiary">ct/kWh</span>
-                                        </div>
-                                        <?= $configValidationMarker('price_hard_limit') ?>
-                                    </div>
-                                    <div class="col-6 col-md-2">
-                                        <label class="config-label text-danger" data-tooltip="<?= htmlspecialchars($tooltipMap['price_pause_limit'] ?? '') ?>">Sperr-Limit</label>
-                                        <div class="input-group">
-                                            <input type="number" step="0.1" name="values[price_pause_limit]" class="form-control config-input" value="<?= $val('price_pause_limit') ?>" placeholder="<?= $defaults['price_pause_limit'] ?>">
-                                            <span class="input-group-text bg-body-tertiary">ct/kWh</span>
-                                        </div>
-                                        <?= $configValidationMarker('price_pause_limit') ?>
-                                    </div>
-                                    <div class="col-6 col-md-3">
-                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['price_min_duration'] ?? '') ?>">Mindestdauer</label>
-                                        <div class="input-group">
-                                            <input type="number" min="0" name="values[price_min_duration]" class="form-control config-input" value="<?= $val('price_min_duration') ?>">
-                                            <span class="input-group-text bg-body-tertiary">min</span>
-                                        </div>
-                                    </div>
-                                    <div class="col-6 col-md-3">
-                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['price_max_daily'] ?? '') ?>">Tagesmaximum</label>
-                                        <div class="input-group">
-                                            <input type="number" min="0" name="values[price_max_daily]" class="form-control config-input" value="<?= $val('price_max_daily') ?>">
-                                            <span class="input-group-text bg-body-tertiary">min</span>
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                        <?php else: ?>
-                        <div class="col-12">
-                            <div class="alert alert-secondary border-secondary-subtle mb-0">
-                                <div class="fw-bold"><i class="fas fa-eye me-2"></i>Wärmepumpen-Preisverschiebung nicht steuerbar</div>
-                                <div class="small mt-1">Für die gewählte Anlagenart ist kein passender Wärmeaktor gebunden. Die Tarifdaten bleiben sichtbar, erzeugen aber keinen Wärme-Candidate und keinen Aktorbefehl.</div>
-                            </div>
-                        </div>
-                        <?php endif; ?>
 
                         <div class="col-12">
                             <div class="alert alert-warning border-warning-subtle mb-0">
@@ -9891,8 +10218,7 @@ async function readConfirmedConfigJson(response) {
                                            id="conf_storage_curve_sliding_horizon_enable"
                                            data-sliding-horizon-toggle
                                            data-requires-target-mode="forecast_100"
-                                           <?= ($slidingHorizonEnabled && $slidingHorizonAllowed) ? 'checked' : '' ?>
-                                           <?= $slidingHorizonAllowed ? '' : 'disabled' ?>>
+                                           <?= $slidingHorizonEnabled ? 'checked' : '' ?>>
                                     <label class="form-check-label config-label fw-bold text-info" for="conf_storage_curve_sliding_horizon_enable" data-tooltip="<?= htmlspecialchars($tooltipMap['storage_curve_sliding_horizon_enable'] ?? '') ?>">
                                         <i class="fas fa-wave-square me-1"></i>Gleitender Prognosehorizont
                                     </label>
@@ -11946,14 +12272,17 @@ foreach (array_unique($configAutoInstallKeys) as $key) {
 const CONFIG_AUTO_INSTALL_MODULES = <?= json_encode($configAutoInstallCatalog, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT) ?>;
 const CONFIG_AUTO_INSTALL_BASELINE = <?= json_encode($configAutoInstallBaseline, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT) ?>;
 const CONFIG_AUTO_INSTALL_DOCKER = <?= e3dc_config_auto_install_is_docker() ? 'true' : 'false' ?>;
+const CONFIG_SETTING_REQUIREMENTS = <?= json_encode($configSettingRequirements, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT) ?>;
+const CONFIG_REQUIREMENT_BASELINE = <?= json_encode($configRequirementBaseline, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT) ?>;
 
-function configAutoInstallFieldValue(form, key) {
+function configAutoInstallFieldValue(form, key, baseline = CONFIG_AUTO_INSTALL_BASELINE) {
     if (!form || !key) return '';
     const fieldName = `values[${key}]`;
     const activeFields = Array.from(form.elements || [])
         .filter((field) => field.name === fieldName && !field.disabled);
     if (!activeFields.length) {
-        return String(CONFIG_AUTO_INSTALL_BASELINE[key] ?? '').trim();
+        if (baseline === CONFIG_AUTO_INSTALL_BASELINE) return String(CONFIG_AUTO_INSTALL_BASELINE[key] ?? '').trim();
+        return String(baseline[key] ?? '').trim();
     }
     if (typeof FormData === 'function') {
         const values = Array.from(new FormData(form).getAll(fieldName));
@@ -11986,16 +12315,16 @@ function configAutoInstallHasAddress(form, key) {
     return value !== '' && value !== '0' && value !== '0.0.0.0' && value !== 'none' && value !== 'null';
 }
 
-function configAutoInstallRuleMatches(form, rule) {
+function configAutoInstallRuleMatches(form, rule, baseline = CONFIG_AUTO_INSTALL_BASELINE) {
     if (!rule || typeof rule !== 'object') return false;
-    if (Array.isArray(rule.all)) return rule.all.every((part) => configAutoInstallRuleMatches(form, part));
-    if (Array.isArray(rule.any)) return rule.any.some((part) => configAutoInstallRuleMatches(form, part));
+    if (Array.isArray(rule.all)) return rule.all.every((part) => configAutoInstallRuleMatches(form, part, baseline));
+    if (Array.isArray(rule.any)) return rule.any.some((part) => configAutoInstallRuleMatches(form, part, baseline));
     const key = String(rule.key || '');
     const type = String(rule.type || '');
     if (!key || !type) return false;
-    if (type === 'enabled') return configAutoInstallEnabled(form, key);
-    if (type === 'address') return configAutoInstallHasAddress(form, key);
-    const value = configAutoInstallFieldValue(form, key).trim();
+    const value = configAutoInstallFieldValue(form, key, baseline).trim();
+    if (type === 'enabled') return configAutoInstallEnabledValue(value);
+    if (type === 'address') return !['', '0', '0.0.0.0', 'none', 'null'].includes(value.toLowerCase());
     if (type === 'nonempty') return value !== '';
     const normalized = value.toLowerCase();
     if (type === 'equals') return normalized === String(rule.value || '').trim().toLowerCase();
@@ -12005,6 +12334,176 @@ function configAutoInstallRuleMatches(form, rule) {
         return type === 'in' ? contained : !contained;
     }
     return false;
+}
+
+function updateConfigSettingRequirements() {
+    const form = document.getElementById('configEditorForm');
+    if (!form) return;
+    const warnings = [];
+    Object.entries(CONFIG_SETTING_REQUIREMENTS).forEach(([key, meta]) => {
+        const reasons = meta.requirements
+            .filter(requirement => !configAutoInstallRuleMatches(form, requirement.when, CONFIG_REQUIREMENT_BASELINE))
+            .map(requirement => requirement.reason);
+        const inactive = reasons.length > 0;
+        const text = inactive
+            ? 'Zurzeit ohne Wirkung: ' + reasons.join(' ') + ' Die Auswahl bleibt bearbeitbar und wird beim Speichern erhalten.'
+            : 'Voraussetzungen in der Auswahl erfüllt. ' + (meta.note || 'Die tatsächliche Freigabe prüft die laufende Regelung.');
+        // Keine disabled-, checked- oder value-Änderung: Auch inaktive Werte gehören zum POST.
+        Array.from(form.elements).filter(field => field.name === `values[${key}]` && field.type !== 'hidden').forEach((field, index) => {
+            const noteId = `configRequirement_${key}_${index}`;
+            let note = document.getElementById(noteId);
+            if (!note) {
+                note = document.createElement('div');
+                note.id = noteId;
+                note.className = 'config-setting-requirement small mt-1';
+                const wrapper = field.closest('.form-check') || field.closest('.input-group')?.parentElement || field.parentElement;
+                wrapper.appendChild(note);
+                const describedBy = new Set((field.getAttribute('aria-describedby') || '').split(/\s+/).filter(Boolean));
+                describedBy.add(noteId);
+                field.setAttribute('aria-describedby', Array.from(describedBy).join(' '));
+            }
+            if (note.textContent !== text) note.textContent = text;
+            note.classList.toggle('text-body-secondary', !inactive);
+            note.classList.toggle('config-setting-requirement-inactive', inactive);
+            field.classList.toggle('config-setting-inactive', inactive);
+        });
+        if (inactive && meta.summary && configAutoInstallEnabledValue(configAutoInstallFieldValue(form, key, CONFIG_REQUIREMENT_BASELINE))) {
+            warnings.push({key, text: meta.label + ': ' + reasons.join(' ')});
+        }
+    });
+    const summary = document.getElementById('configRequirementSummary');
+    const list = summary?.querySelector('[data-config-requirement-list]');
+    if (summary && list) {
+        const signature = JSON.stringify(warnings);
+        if (summary.dataset.requirementSignature !== signature) {
+            list.replaceChildren(...warnings.map(warning => {
+                const item = document.createElement('li');
+                item.textContent = warning.text;
+                if (warning.key === 'market_heatpump_enable') {
+                    const button = document.createElement('button');
+                    button.type = 'submit';
+                    button.name = 'config_action';
+                    button.value = 'disable_legacy_heat_market';
+                    button.formNoValidate = true;
+                    button.setAttribute('data-config-isolated-action', '');
+                    button.className = 'btn btn-sm btn-outline-warning ms-2';
+                    button.textContent = 'Jetzt deaktivieren';
+                    button.title = 'Speichert nur diesen Altwert. Andere Änderungen bitte vorher speichern.';
+                    item.appendChild(button);
+                }
+                return item;
+            }));
+            summary.dataset.requirementSignature = signature;
+        }
+        summary.hidden = warnings.length === 0;
+    }
+}
+
+function initConfigSettingRequirements() {
+    const form = document.getElementById('configEditorForm');
+    if (!form) return;
+    let pending = false;
+    const update = event => {
+        const key = /^values\[([^\]]+)\]$/.exec(event.target?.name || '')?.[1];
+        if (!key || !(key in CONFIG_REQUIREMENT_BASELINE) || pending) return;
+        pending = true;
+        queueMicrotask(() => {
+            pending = false;
+            updateConfigSettingRequirements();
+        });
+    };
+    form.addEventListener('change', update);
+    form.addEventListener('input', update);
+    updateConfigSettingRequirements();
+}
+
+function initHeatpumpPvControls() {
+    const form = document.getElementById('configEditorForm');
+    const box = document.getElementById('wpPvControls');
+    if (!form || !box || box.dataset.initialized === 'true') return;
+    box.dataset.initialized = 'true';
+    const field = key => form.elements.namedItem('values[' + key + ']');
+    const mode = field('wp_pv_control_mode');
+    const preset = document.getElementById('wpPvBridgePreset');
+    const battery = document.getElementById('wpPvPresetBattery');
+    const grid = document.getElementById('wpPvPresetGrid');
+    const preview = document.getElementById('wpPvPresetPreview');
+    const button = document.getElementById('wpPvApplyPreset');
+    const number = (key, fallback) => {
+        const raw = String(field(key)?.value ?? '').trim();
+        const value = Number(raw);
+        return raw !== '' && Number.isFinite(value) ? value : fallback;
+    };
+    const presetValues = () => {
+        const energy = {short: [500, 50], normal: [1000, 100], long: [2000, 200]}[preset?.value];
+        if (!energy) return null;
+        const maximum = number('wp_pv_max_power_w', 0);
+        const explicitStart = number('wp_pv_start_power_w', 0);
+        const start = explicitStart > 0 ? explicitStart : Math.abs(number('grid_start_limit', -3500));
+        const batteryW = Math.round(maximum > 0 ? maximum : (start > 0 ? start : 3500));
+        return {
+            wp_pv_battery_max_w: battery?.checked ? batteryW : 0,
+            wp_pv_battery_limit_wh: battery?.checked ? energy[0] : 0,
+            wp_pv_grid_max_w: grid?.checked ? 1000 : 0,
+            wp_pv_grid_limit_wh: grid?.checked ? energy[1] : 0,
+        };
+    };
+    const update = () => {
+        const measured = mode?.value === 'measured';
+        box.querySelectorAll('[data-wp-measured-only]').forEach(element => { element.hidden = !measured; });
+        const description = box.querySelector('[data-wp-mode-description]');
+        if (description) description.textContent = measured
+            ? 'Nach dem Start zählt die Istaufnahme. Ein erreichter Wh-Wächter beendet den zusätzlichen Boost nach der geschützten Mindestlaufzeit; Verbrauch und Überschreitung werden weitergezählt. 0 bei einer Quelle bleibt eine Sperre.'
+            : 'Die vollständige Vorreservierung behält die bisherigen Quellen- und Energiezusagen. Der Wechsel zu „Messwertgeführt“ erhält die eingetragenen Werte, erlaubt aber einen gezählten Wh-Überlauf zum Schutz der Mindestlaufzeit.';
+        const values = presetValues();
+        if (preview && values) {
+            const fmt = value => value.toLocaleString('de-DE');
+            preview.textContent = 'Diese Auswahl setzt: Hausakku ' + fmt(values.wp_pv_battery_max_w) + ' W / ' + fmt(values.wp_pv_battery_limit_wh) + ' Wh; Stromnetz ' + fmt(values.wp_pv_grid_max_w) + ' W / ' + fmt(values.wp_pv_grid_limit_wh) + ' Wh. Die Wh-Werte gelten für 24 Stunden, mit Vorrang der geschützten Mindestlaufzeit.';
+        }
+    };
+    box.addEventListener('change', update);
+    box.addEventListener('input', update);
+    button?.addEventListener('click', () => {
+        if (mode?.value !== 'measured') return;
+        const values = presetValues();
+        if (!values) return;
+        for (const [key, value] of Object.entries(values)) {
+            const target = field(key);
+            if (!target) continue;
+            target.value = String(value);
+            target.dispatchEvent(new Event('input', {bubbles: true}));
+            target.dispatchEvent(new Event('change', {bubbles: true}));
+        }
+        if (preview) preview.textContent += ' In die Eingabefelder übernommen; zum Aktivieren speichern.';
+    });
+    update();
+}
+
+function initHeatpumpPvReservationStatus() {
+    initHeatpumpPvControls();
+    const form = document.getElementById('configEditorForm');
+    const status = document.getElementById('wpPvReservationStatus');
+    if (!form || !status) return;
+    const keys = new Set([
+        'wp_pv_max_power_w', 'wp_min_runtime_min', 'wp_restart_block_min',
+        'wp_pv_control_mode', 'wp_pv_start_power_w', 'grid_start_limit',
+        'wp_pv_start_wait_s', 'wp_pv_reaction_s', 'wp_pv_handoff_timeout_s',
+        'wp_pv_battery_max_w', 'wp_pv_battery_limit_wh',
+        'wp_pv_grid_max_w', 'wp_pv_grid_limit_wh', 'luxtronik', 'wp_type', 'auto_mode',
+    ]);
+    const markPending = event => {
+        const key = /^values\[([^\]]+)\]$/.exec(event.target?.name || '')?.[1];
+        if (!keys.has(key)) return;
+        const note = status.querySelector('[data-wp-pv-reservation-dirty]');
+        const result = status.querySelector('[data-wp-pv-reservation-result]');
+        if (note) note.hidden = false;
+        if (result) result.classList.add('opacity-50');
+        status.dataset.pending = 'true';
+    };
+    form.addEventListener('input', markPending);
+    form.addEventListener('change', markPending);
+    const mode = form.elements.namedItem('values[wp_pv_control_mode]');
+    if (mode && mode.value !== status.dataset.controlMode) markPending({target: mode});
 }
 
 function configAutoInstallModuleChanged(form, meta) {
@@ -12449,6 +12948,7 @@ function setConfigEditorView(view) {
     if (typeof updateStorageAuxAcToggle === 'function') {
         updateStorageAuxAcToggle();
     }
+    updateConfigSettingRequirements();
 }
 
 function openAdvancedConfigGroup(groupId, focusId) {
@@ -13187,12 +13687,12 @@ function updateStorageCurveSlidingHorizonToggle() {
         el.classList.toggle('d-none', !slidingAllowed);
     });
     if (!toggle) return;
-    toggle.disabled = !slidingAllowed;
-    if (!slidingAllowed) toggle.checked = false;
+    // Das Profil begrenzt die Wirkung, nicht den gespeicherten Nutzerwunsch.
+    toggle.classList.toggle('config-setting-inactive', !slidingAllowed);
     if (hint) {
         hint.textContent = slidingAllowed
             ? 'Aktiviert den gleitenden Prognosehorizont für den 100%-Prognosepfad. Die Regelung darf nur entspannen, wenn Prognosevertrauen, Abendziel und Abregeldruck passen.'
-            : 'Nur aktivierbar, wenn der Zielkurven-Modus auf Prognose auf 100% steht.';
+            : 'In der Ankerkurve ohne Wirkung. Die Auswahl bleibt für den Rückwechsel zu Prognose auf 100% gespeichert.';
     }
     if (box) box.classList.toggle('opacity-75', !slidingAllowed);
 }
@@ -13244,6 +13744,28 @@ function marketPathPreviewFormat(value, digits) {
         minimumFractionDigits: digits,
         maximumFractionDigits: digits
     });
+}
+
+function initStorageMarketHoldCoupling() {
+    const charge = document.getElementById('conf_market_battery_grid_charge_enable');
+    const hold = document.getElementById('conf_market_battery_hold_enable');
+    const hint = document.getElementById('storage-market-hold-hint');
+    if (!charge || !hold) return;
+    const sync = () => {
+        if (charge.checked) hold.checked = true;
+        // Nicht deaktivieren: Der aktive Wert muss beim Speichern mitgesendet werden.
+        hold.setAttribute('aria-disabled', charge.checked ? 'true' : 'false');
+        hold.setAttribute('aria-describedby', 'storage-market-hold-hint');
+        if (hint) hint.textContent = charge.checked
+            ? 'Halten ist durch Speicher-Netzladen eingeschlossen. Die Planung entscheidet, wann es wirtschaftlich sinnvoll ist.'
+            : 'Halten ist separat wählbar und erlaubt selbst kein Netzladen.';
+    };
+    hold.addEventListener('click', event => {
+        if (charge.checked) event.preventDefault();
+    });
+    hold.addEventListener('change', sync);
+    charge.addEventListener('change', sync);
+    sync();
 }
 
 function updateMarketPathPreview() {
@@ -15194,7 +15716,10 @@ document.addEventListener('DOMContentLoaded', initStorageCurveConfigPreview);
 document.addEventListener('DOMContentLoaded', initStorageCurveSlidingHorizonToggle);
 document.addEventListener('DOMContentLoaded', initStorageAuxAcToggle);
 document.addEventListener('DOMContentLoaded', initDirectMarketingEegRateUi);
+document.addEventListener('DOMContentLoaded', initStorageMarketHoldCoupling);
 document.addEventListener('DOMContentLoaded', initMarketPathPreview);
+document.addEventListener('DOMContentLoaded', initConfigSettingRequirements);
+document.addEventListener('DOMContentLoaded', initHeatpumpPvReservationStatus);
 
 // Der Button #btn-update-config ruft es bereits auf.
 

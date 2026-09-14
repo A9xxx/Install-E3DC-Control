@@ -1,9 +1,9 @@
 {
-  "version": "5.4.6c",
+  "version": "5.4.6d",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.6c",
-  "release_date": "2026-09-12",
-  "description": "v5.4.6c - Wallbox-Phasenerkennung, PV-Wärmeregelung und Docker-Kompatibilität",
+  "stable_release": "v5.4.6d",
+  "release_date": "2026-09-14",
+  "description": "v5.4.6d - Docker-Kompatibilität, Speicherplanung und Wärmepumpenbedienung",
   "update_strategy": "backup_replace_restart_v1",
   "installer_requires": "python3",
   "sanitized_republication": false,

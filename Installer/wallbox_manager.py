@@ -9793,9 +9793,9 @@ def _current_autonomous_solar_output_contract(c_data):
         == "wbchar6_solar_mode"
         and phase.get("autonomous_phase_switch_capable") is True
         and phase.get("autonomous_phase_switch_source")
-        == wallbox_decision.EFY_WBCHAR6_AUTONOMOUS_SOURCE
+        in wallbox_decision.E3DC_AUTONOMOUS_SOLAR_SOURCES
         and phase.get("autonomous_phase_switch_provenance")
-        == wallbox_decision.EFY_WBCHAR6_PROVENANCE
+        in wallbox_decision.E3DC_AUTONOMOUS_SOLAR_PROVENANCES
         and phase.get("autonomous_phase_handoff_method")
         == "set_amp_autonomous_solar"
         and phase.get("autonomous_phase_protocol_mode")
@@ -14698,6 +14698,7 @@ def _wallbox_group_deficit_owner_contract(
                 _cfg_float(data.get("current_set_amp"), 0.0),
             )
             current_source = "pending_same_session_previous_command"
+        measured_subminimum_charge = False
         if reported_current is None:
             blockers.append("reported_current_missing")
             effective_current = 0.0
@@ -14739,7 +14740,18 @@ def _wallbox_group_deficit_owner_contract(
                 # ausgangsseitig gesperrt.
                 effective_current = physical_current
             if real_charging and effective_current + 1e-6 < minimum:
-                blockers.append("reported_current_below_minimum")
+                measured_subminimum_charge = bool(
+                    current_source == "verified_phase_power_current_lower_bound"
+                    and output_current.get("available") is not True
+                    and 0.0 < effective_current < minimum
+                )
+                if measured_subminimum_charge:
+                    # P/253 V ist eine Untergrenze, kein EVSE-Stromangebot.
+                    # Reale Ladung bleibt im Wh-Konto, ohne daraus einen
+                    # positiven Strom- oder Phasenauftrag abzuleiten.
+                    current_output_blocker = "measured_subminimum_stop_watch_only"
+                else:
+                    blockers.append("reported_current_below_minimum")
 
         charger_class = charger.__class__.__name__ if charger is not None else ""
         phase_capability = _wallbox_phase_switch_capability(
@@ -14809,6 +14821,7 @@ def _wallbox_group_deficit_owner_contract(
             "pending_retained": pending_owner,
             "current_output_blocker": current_output_blocker,
             "current_output_ready": not bool(current_output_blocker),
+            "measured_subminimum_charge": measured_subminimum_charge,
         })
 
     unallocated = [
@@ -22385,7 +22398,13 @@ def _advance_wallbox_group_deficit_action(
         data["_wallbox_group_deficit_action_dispatch"] = result
         return result
     output_blocker = str(owner.get("current_output_blocker") or "")
-    if output_blocker:
+    if output_blocker and not (
+        action_type == wallbox_deficit_control.ACTION_STOP
+        and output_blocker in {
+            "measured_subminimum_stop_watch_only",
+            "native_running_mode_output_unbound",
+        }
+    ):
         result["blocker"] = output_blocker
         result["fail_closed_no_output"] = True
         data["_wallbox_group_deficit_action_dispatch"] = result
@@ -23075,6 +23094,9 @@ def _run_wallbox_group_deficit_cutover(
                 pcc_import_w=grid_power_w,
                 marginal_wb_id=effective_owner_id,
                 current_amp=candidate.get("current_amp"),
+                measured_subminimum_charge=(
+                    candidate.get("measured_subminimum_charge") is True
+                ),
                 actual_phases=candidate.get("actual_phases"),
                 # Der Netzpunkt bleibt vorrangig. Das zweite Konto erhält
                 # ausschließlich die Summe positiver, je Ladepunkt gebundener
@@ -23266,6 +23288,19 @@ def _wallbox_group_deficit_display_contract(cutover, threshold_wh):
         "component": "none",
     }
     data = cutover if isinstance(cutover, dict) else {}
+    owner = data.get("owner") if isinstance(data.get("owner"), dict) else {}
+    result.update({
+        "binding_ready": data.get("binding_ready") is True,
+        "blocker": str(data.get("blocker") or ""),
+        "candidate_ids": list(data.get("candidate_ids") or []),
+        "excluded_reasons": dict(owner.get("excluded") or {}),
+        "budget_accounting_valid": (
+            (data.get("authorized_budget_overrun") or {}).get("available") is True
+        ),
+        "budget_accounting_blockers": list(
+            (data.get("authorized_budget_overrun") or {}).get("blockers") or []
+        ),
+    })
     decision = data.get("decision") if isinstance(data.get("decision"), dict) else {}
     ledger = decision.get("ledger") if isinstance(decision.get("ledger"), dict) else {}
     cascade = decision.get("cascade") if isinstance(decision.get("cascade"), dict) else {}
@@ -32102,9 +32137,9 @@ def _wallbox_house_fuse_cap_amp(
         autonomous_efy = bool(
             phase_capability.get("autonomous_can_switch") is True
             and phase_capability.get("autonomous_source")
-            == wallbox_decision.EFY_WBCHAR6_AUTONOMOUS_SOURCE
+            in wallbox_decision.E3DC_AUTONOMOUS_SOLAR_SOURCES
             and phase_capability.get("autonomous_provenance")
-            == wallbox_decision.EFY_WBCHAR6_PROVENANCE
+            in wallbox_decision.E3DC_AUTONOMOUS_SOLAR_PROVENANCES
             and phase_capability.get("autonomous_handoff_method")
             == "set_amp_autonomous_solar"
             and phase_capability.get("autonomous_protocol_mode")
@@ -36149,9 +36184,9 @@ def run():
                                 and not _floor_cd.get("_bev_full_blocked", False)
                                 and _floor_capability.get("autonomous_can_switch") is True
                                 and _floor_capability.get("autonomous_source")
-                                == wallbox_decision.EFY_WBCHAR6_AUTONOMOUS_SOURCE
+                                in wallbox_decision.E3DC_AUTONOMOUS_SOLAR_SOURCES
                                 and _floor_capability.get("autonomous_provenance")
-                                == wallbox_decision.EFY_WBCHAR6_PROVENANCE
+                                in wallbox_decision.E3DC_AUTONOMOUS_SOLAR_PROVENANCES
                                 and _floor_capability.get("autonomous_handoff_method")
                                 == "set_amp_autonomous_solar"
                                 and _floor_capability.get("autonomous_protocol_mode")
@@ -37370,13 +37405,13 @@ def run():
                         _source_accounting_decoupled = bool(
                             _source_projection.get("decoupled") is True
                         )
-                        # Eine autonome efy-/WBchar6-Sonnenfreigabe ist nur
-                        # eine Admission. Die Firmware wählt den Realstrom;
-                        # ohne strikt durchsetzbaren Wattdeckel darf daraus
-                        # keine Budgetüberziehung entstehen. Ebenso bleibt
-                        # eine noch nicht quellengebundene Fremdreservierung
-                        # für dieses Konto unbekannt.
-                        _strict_source_contract_valid = bool(
+                        # Die Quellenfreigabe ist auch bei autonomem
+                        # Sonnenmodus ein gültiger Rahmen für das Wh-Konto.
+                        # Gemessene Mehrleistung wird bilanziert, ohne einen
+                        # momentan durchsetzbaren Wattdeckel zu behaupten.
+                        # Dieser Vertrag erteilt keine positive Ausgangs-
+                        # autorität. Ungebundene Reservierungen bleiben offen.
+                        _source_energy_contract_valid = bool(
                             _cap_source_data_fresh
                             and _cap_source_safety_valid
                             and _cap_source_binding_key.startswith("sha256:")
@@ -37390,7 +37425,6 @@ def run():
                                 is not True
                             )
                             and not _source_reservation_active
-                            and _cid not in _floor_autonomous_eligible_ids
                         )
                         # Die Start-Haltebeobachtung kann ihre eigene Session
                         # weiter unten im selben Zyklus erst anlegen/adoptieren.
@@ -37429,7 +37463,7 @@ def run():
                                 _cap_source_safety_valid
                             ),
                             "source_contract_valid": (
-                                _strict_source_contract_valid
+                                _source_energy_contract_valid
                             ),
                             "cap_basis": _source_cap_basis,
                             "eligible_budget_tiers": _source_tiers,
@@ -42564,16 +42598,27 @@ def run():
                                 detected_phases=detected_phases,
                             )
                         )
+                        # Nach einer autonomen 1p-Freigabe muss auch das
+                        # Stromziel zur Freigabe passen; ein altes 3p-Nullziel
+                        # würde den berechtigten Start am finalen Ausgang sperren.
                         if (
-                            cap_amp <= 0
+                            (cap_amp <= 0 or _current_autonomous_solar_output_contract(c_data))
                             and _prio_target is None
                             and not _configured_group_ids
                             and charger_connected
                             and _physical_budget.get("can_start_or_hold", False)
-                            and not _physical_budget.get("real_charging", False)
+                            and (
+                                not _physical_budget.get("real_charging", False)
+                                or _current_autonomous_solar_output_contract(c_data)
+                            )
                         ):
+                            _autonomous_current_rebind = bool(
+                                _current_autonomous_solar_output_contract(c_data)
+                            )
                             _phase_current_budget_w = (
-                                phase_one_phase_start_budget_w
+                                float(c_allowed_w or 0.0)
+                                if _autonomous_current_rebind
+                                else phase_one_phase_start_budget_w
                                 if _physical_phase_count == 1
                                 else float(c_allowed_w or 0.0)
                             )
@@ -42581,7 +42626,11 @@ def run():
                                 allowed_w=_phase_current_budget_w,
                                 detected_phases=_physical_phase_count,
                                 min_amp=wb_min_amp_cfg,
-                                max_amp=charger_max_amp,
+                                max_amp=(
+                                    min(charger_max_amp, cap_amp)
+                                    if _autonomous_current_rebind and cap_amp > 0
+                                    else charger_max_amp
+                                ),
                                 house_fuse_cap_amp=house_fuse_cap_amp,
                                 apply_house_fuse=_single_house_fuse_cap_active,
                                 base_6a_active=base_6a_active,

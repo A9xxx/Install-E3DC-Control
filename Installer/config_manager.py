@@ -363,6 +363,7 @@ V4_BLOCK_HEATPUMP = {
     'auto_mode', 'grid_start_limit',
     'pv_boost_delay', 'stop_delay_minutes', 'wp_min_runtime_min',
     'wp_restart_block_min', 'min_soc',
+    'wp_pv_control_mode', 'wp_pv_start_power_w',
     'wp_pv_max_power_w', 'wp_pv_battery_limit_wh', 'wp_pv_grid_limit_wh',
     'wp_pv_battery_max_w', 'wp_pv_grid_max_w', 'wp_pv_reaction_s',
     'wp_pv_start_wait_s', 'wp_pv_handoff_timeout_s',

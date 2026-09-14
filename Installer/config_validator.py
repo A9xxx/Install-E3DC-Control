@@ -540,7 +540,9 @@ def validate_heatpump_pv_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]
     if not _is_enabled(cfg, "luxtronik") or safe_float(cfg.get("wp_type"), -1.0) != 0:
         return {}
     profile = _heatpump_pv_config(cfg)
+    measured = profile.get("control_mode") == "measured"
     entries = {}
+    invalid_fields = []
     rules = (
         ("wp_pv_max_power_w", "WP: maximale elektrische Aufnahme", "W", "max_power_w", 0.0),
         ("wp_pv_battery_limit_wh", "WP: Akkuenergie in 24 Stunden", "Wh", "battery_limit_wh", 0.0),
@@ -551,6 +553,11 @@ def validate_heatpump_pv_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]
         ("wp_pv_start_wait_s", "WP: Verdichter-Startwartefrist", "s", "start_wait_s", 600.0),
         ("wp_pv_handoff_timeout_s", "WP: Übergabefrist Wallbox", "s", "handoff_timeout_s", 120.0),
     )
+    if measured or "wp_pv_start_power_w" in cfg:
+        rules += (("wp_pv_start_power_w", "WP: Startleistung", "W", "start_power_w", 0.0),)
+    mode = str(cfg.get("wp_pv_control_mode", "reserved")).strip().lower()
+    if mode not in {"measured", "reserved"}:
+        invalid_fields.append("wp_pv_control_mode")
     for key, label, unit, profile_key, default in rules:
         raw = cfg.get(key, default)
         try:
@@ -559,13 +566,18 @@ def validate_heatpump_pv_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]
         except (TypeError, ValueError, OverflowError):
             valid = False
         effective = profile[profile_key]
-        if key in {"wp_pv_max_power_w", "wp_pv_reaction_s", "wp_pv_handoff_timeout_s"}:
+        if key in {"wp_pv_reaction_s", "wp_pv_handoff_timeout_s"} or (key == "wp_pv_max_power_w" and not measured):
             valid = valid and effective > 0
         elif key == "wp_pv_start_wait_s":
             valid = valid and effective >= profile["signal_hold_s"]
         message = "Konfigurationswert ist plausibel; aktuelle Quellen- und Schutzgrenzen werden zusätzlich geprüft."
         if not valid:
+            invalid_fields.append(key)
             message = "Profilwert fehlt oder ist ungültig. Neue optionale PV-Starts warten; normale Heizung und Warmwasser bleiben unabhängig."
+        elif key == "wp_pv_max_power_w" and effective == 0:
+            message = "Keine elektrische Obergrenze eingetragen. Die Automatik verwendet die Startleistung; aktuelle Quellen- und Hardwaregrenzen bleiben wirksam."
+        elif key == "wp_pv_start_power_w":
+            message = "Startwert für die Überschussqualifikation. 0 übernimmt die bestehende Start-Grenze; nach dem Start zählt die gemessene Aufnahme."
         elif effective == 0:
             message = "Diese Überbrückungsquelle ist gesperrt. Leistung und Wh-Kontingent müssen beide größer als null sein."
         entries[key] = _entry(
@@ -575,24 +587,70 @@ def validate_heatpump_pv_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]
             source="user" if _has_user_value(cfg, key) else "default",
             severity="ok" if valid else "warning", message=message,
         )
-    duration_s = profile["min_runtime_s"] + profile["start_wait_s"] + profile["reaction_s"]
+    for key, default, positive in (("wp_min_runtime_min", 30.0, True),
+                                   ("wp_restart_block_min", 20.0, False)):
+        raw = cfg.get(key, default)
+        try:
+            numeric = float(raw)
+            valid = not isinstance(raw, bool) and math.isfinite(numeric) and (
+                numeric > 0 if positive else numeric >= 0
+            )
+        except (TypeError, ValueError, OverflowError):
+            valid = False
+        if not valid:
+            invalid_fields.append(key)
+    duration_s = (profile["reaction_s"] if measured else
+                  profile["min_runtime_s"] + profile["start_wait_s"] + profile["reaction_s"])
     hours = duration_s / 3600.0
-    required_wh = profile["max_power_w"] * hours
-    available_wh = sum(
-        min(profile[source + "_limit_wh"], profile[source + "_max_w"] * hours)
+    reserve_power_w = (profile["max_power_w"] or profile.get("start_power_w", 0.0)) if measured else profile["max_power_w"]
+    required_wh = reserve_power_w * hours
+    source_available_wh = {
+        source: min(profile[source + "_limit_wh"], profile[source + "_max_w"] * hours)
         for source in ("battery", "grid")
-    )
+    }
+    available_wh = sum(source_available_wh.values())
+    missing_wh = max(0.0, required_wh - available_wh)
     funded = profile["valid"] and available_wh + 1e-6 >= required_wh
+    message = (
+        "Die eingestellten Quellen können rechnerisch die volle Schutzfrist tragen. Bereits verbrauchte oder gebundene Wh, Speicherreserve und aktuelle Leistungsgrenzen werden vor jedem Start zusätzlich berücksichtigt."
+        if funded else
+        "Die eingestellte Überbrückungsenergie reicht für die abgesicherte Start- und Laufzeit nicht aus. Neue zusätzliche PV-Starts warten; normale Heizung und Warmwasserbereitung bleiben unabhängig."
+    )
+    if measured:
+        message = (
+            "Die eingestellten Quellen decken rechnerisch den kurzen Reaktionspuffer. Im Lauf zählt die Istaufnahme. Erreichte Wh-Wächter beenden den zusätzlichen Boost nach der geschützten Laufzeit; der Verbrauch bis dahin wird weitergezählt."
+            if funded else
+            "Für den kurzen Reaktionspuffer fehlen Quellenleistung oder Energie. Die laufende Regelung prüft vor einem neuen Start die tatsächliche Deckung."
+        )
+    if not profile["valid"]:
+        message = "Das Leistungsprofil ist noch unvollständig oder ungültig. Bitte die markierten Profilwerte prüfen. Normale Heizung und Warmwasserbereitung bleiben unabhängig."
     entries["wp_pv_energy_reservation"] = _entry(
         key="wp_pv_energy_reservation", label="WP: Energie vor PV-Start", unit="Wh",
         configured=None, live_value=None, live_key=None, effective=required_wh,
         source="derived", severity="ok" if funded else "warning",
-        message=(
-            "Die eingestellten Quellen können rechnerisch die volle Schutzfrist tragen. Bereits verbrauchte oder gebundene Wh, Speicherreserve und aktuelle Leistungsgrenzen werden vor jedem Start zusätzlich berücksichtigt."
-            if funded else
-            "Das elektrische Profil oder die Akku-/Netzdeckung reicht für die volle Schutzfrist noch nicht aus. Neue optionale PV-Starts warten. Dies ist kein Installationsfehler und sperrt keine normale Heizung oder Warmwasserbereitung."
-        ),
+        message=message,
     )
+    # Zahlen aus derselben Prüfung für die Anzeige bereitstellen. Sie beschreiben
+    # Konfigurationsgrenzen, weder Live-Restkontingente noch E3DC-Messwerte.
+    entries["wp_pv_energy_reservation"]["calculation"] = {
+        "control_mode": profile.get("control_mode", "reserved"),
+        "start_power_w": profile.get("start_power_w", 0.0),
+        "reservation_power_w": reserve_power_w,
+        "battery_limit_wh": profile["battery_limit_wh"],
+        "grid_limit_wh": profile["grid_limit_wh"],
+        "max_power_w": profile["max_power_w"],
+        "min_runtime_s": profile["min_runtime_s"],
+        "start_wait_s": profile["start_wait_s"],
+        "reaction_s": profile["reaction_s"],
+        "duration_s": duration_s,
+        "required_wh": required_wh,
+        "available_wh": available_wh,
+        "missing_wh": missing_wh,
+        "battery_available_wh": source_available_wh["battery"],
+        "grid_available_wh": source_available_wh["grid"],
+        "profile_valid": profile["valid"],
+        "invalid_fields": invalid_fields,
+    }
     return entries
 
 
@@ -2059,6 +2117,10 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         else:
             effective = bool(default_enabled)
             source = "default"
+        hold_included = key == "market_battery_hold_enable" and _is_enabled(cfg, "market_battery_grid_charge_enable")
+        if hold_included:
+            effective = True
+            source = "grid_charge_includes_hold"
         price[key] = _entry(
             key=key,
             label=label,
@@ -2070,7 +2132,9 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             source=source,
             severity="ok",
             message=(
-                "Marktpfad-Freigabe ist aktiv; Speicherpfade sind bewusst separat zu prüfen."
+                "Speicher-Netzladen schließt Speicher-Halten ein; der tatsächliche Einsatz bleibt bedarfs- und preisabhängig."
+                if hold_included else
+                "Marktpfad-Freigabe ist aktiv; der tatsächliche Einsatz bleibt bedarfs- und preisabhängig."
                 if effective and key.startswith("market_battery_")
                 else ("Marktpfad-Freigabe ist aktiv." if effective else "Marktpfad-Freigabe ist aus.")
             ),

@@ -25,7 +25,10 @@ EFY_AUTONOMOUS_PRODUCT_CAPABILITY = "e3dc_efy_autonomous_solar_product"
 EFY_WBCHAR6_AUTONOMOUS_SOURCE = (
     "configured_family_plus_field_verified_wbchar6"
 )
+E3DC_MANUFACTURER_SOLAR_SOURCE = "configured_family_plus_manufacturer_documented_solar"
+E3DC_AUTONOMOUS_SOLAR_SOURCES = frozenset({EFY_WBCHAR6_AUTONOMOUS_SOURCE, E3DC_MANUFACTURER_SOLAR_SOURCE})
 EFY_WBCHAR6_PROVENANCE = "field_verified_legacy"
+E3DC_AUTONOMOUS_SOLAR_PROVENANCES = frozenset({EFY_WBCHAR6_PROVENANCE, "manufacturer_documented"})
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -2106,6 +2109,25 @@ def openwb_phase_switch_capability(
     }
 
 
+def e3dc_autonomous_solar_provenance(status):
+    """Bindet den Sonnenmodus an ein dokumentiertes Modell und den vorhandenen Transport."""
+    st = status or {}
+    family = str(st.get("e3dc_device_family") or "").strip().lower()
+    if family not in {"efy", "multi_connect_ii"}:
+        return ""
+    if st.get("e3dc_device_family_source") not in {"configured", "configured_type"}:
+        return ""
+    if st.get("e3dc_control_backend") != "wbchar6_compat":
+        return ""
+    if (st.get("e3dc_autonomous_solar_capable") is True
+            and st.get("e3dc_autonomous_solar_provenance") == "manufacturer_documented"):
+        return "manufacturer_documented"
+    if (family == "efy" and st.get("e3dc_efy_autonomous_wbchar6_verified") is True
+            and st.get("e3dc_efy_autonomous_wbchar6_provenance") == EFY_WBCHAR6_PROVENANCE):
+        return EFY_WBCHAR6_PROVENANCE
+    return ""
+
+
 def wallbox_phase_switch_capability(
     charger_class_name: str,
     status: Optional[Dict[str, Any]] = None,
@@ -2149,17 +2171,7 @@ def wallbox_phase_switch_capability(
             and 0.0 <= sample_age_s <= 15.0
         )
         autonomous_efy = bool(
-            str(st.get("e3dc_device_family", "") or "").strip().lower()
-            == "efy"
-            and str(st.get("e3dc_device_family_source", "") or "")
-            in {"configured", "configured_type"}
-            and str(st.get("e3dc_control_backend", "") or "")
-            == "wbchar6_compat"
-            and st.get("e3dc_efy_autonomous_wbchar6_verified") is True
-            and str(
-                st.get("e3dc_efy_autonomous_wbchar6_provenance") or ""
-            )
-            == EFY_WBCHAR6_PROVENANCE
+            e3dc_autonomous_solar_provenance(st)
             and status_fresh
         )
         return {
@@ -2174,12 +2186,14 @@ def wallbox_phase_switch_capability(
                 else "not_freshly_confirmed"
             ),
             "autonomous_source": (
-                EFY_WBCHAR6_AUTONOMOUS_SOURCE
+                (E3DC_MANUFACTURER_SOLAR_SOURCE
+                 if e3dc_autonomous_solar_provenance(st) == "manufacturer_documented"
+                 else EFY_WBCHAR6_AUTONOMOUS_SOURCE)
                 if autonomous_efy
                 else "fail_closed"
             ),
             "autonomous_provenance": (
-                EFY_WBCHAR6_PROVENANCE
+                e3dc_autonomous_solar_provenance(st)
                 if autonomous_efy
                 else "unknown"
             ),
@@ -2299,17 +2313,7 @@ def phase_observation_contract(
         can_switch = False
         autonomous_can_switch = bool(
             autonomous_can_switch
-            and str(st.get("e3dc_device_family", "") or "").strip().lower()
-            == "efy"
-            and str(st.get("e3dc_device_family_source", "") or "")
-            in {"configured", "configured_type"}
-            and str(st.get("e3dc_control_backend", "") or "")
-            == "wbchar6_compat"
-            and st.get("e3dc_efy_autonomous_wbchar6_verified") is True
-            and str(
-                st.get("e3dc_efy_autonomous_wbchar6_provenance") or ""
-            )
-            == EFY_WBCHAR6_PROVENANCE
+            and e3dc_autonomous_solar_provenance(st)
         )
     if charger_class_name == "E3DCCharger" and normalized_driver == "e3dc_native":
         can_switch = False
@@ -2694,19 +2698,17 @@ def wallbox_executable_budget(
         == "set_amp_autonomous_solar"
         and str(phase_contract.get("autonomous_phase_protocol_mode") or "")
         == "wbchar6_solar_mode"
+        # Während der reinen PV-Freigabe bleibt derselbe Herstellerregler
+        # zuständig. Mehr Budget oder eine bestätigte 1p-Ladung dürfen die
+        # Sonnenmodus-Automatik nicht wieder durch Mode 2 ersetzen.
         and budget_w >= one_phase_min_w
-        and (
-            require_one_phase
-            or budget_w < nominal_min_power_w
-        )
     )
     if autonomous_1p_ready:
         # Die efy erhält keinen Phasenbefehl. E3DC-Control übergibt ausschließlich
         # den bereits kanonischen WBchar6-Sonnenmodus mit Stromdeckel; die im
         # explizit konfigurierte efy besitzt die herstellereigene 1p-/3p-
-        # Produktfähigkeit. Ihre Aktivierung über WBchar6 bleibt dagegen ein
-        # feldverifizierter Legacy-Vertrag; der frische ALG-Status bindet die
-        # konkrete Steck-/Ladesitzung.
+        # Produktfähigkeit. Die Herkunft der Fähigkeit bleibt im Vertrag
+        # sichtbar; der frische ALG-Status bindet die konkrete Ladesitzung.
         # Für diesen eng gebundenen Übergabepfad darf die Watt-/Ampere-Projektion
         # deshalb das 1p-Minimum verwenden.
         phases = 1
@@ -3032,11 +3034,11 @@ def autonomous_solar_output_contract(
         == "wbchar6_solar_mode"
         and phase_contract.get("autonomous_phase_switch_capable") is True
         and str(phase_contract.get("autonomous_phase_switch_source") or "")
-        == EFY_WBCHAR6_AUTONOMOUS_SOURCE
+        in E3DC_AUTONOMOUS_SOLAR_SOURCES
         and str(
             phase_contract.get("autonomous_phase_switch_provenance") or ""
         )
-        == EFY_WBCHAR6_PROVENANCE
+        in E3DC_AUTONOMOUS_SOLAR_PROVENANCES
         and str(phase_contract.get("autonomous_phase_handoff_method") or "")
         == "set_amp_autonomous_solar"
         and str(phase_contract.get("autonomous_phase_protocol_mode") or "")

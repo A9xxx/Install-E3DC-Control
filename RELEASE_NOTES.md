@@ -1,32 +1,39 @@
-# E3DC-Control v5.4.6c
+# E3DC-Control v5.4.6d
 
-Dieses Update verbessert die PV-Ladung an festen E3DC-Wallboxen, die Leistungsverteilung zwischen Wallbox und Wärmepumpe sowie die Kompatibilität älterer Docker-Installationen.
-
-## Wallboxen
-
-- Feste, durch Python stromgeregelte E3DC-Wallboxen können unbekannte Fahrzeuge mit 6 A je verfügbarer Phase erkennen. Dafür werden mindestens 1.380 W echter freier PV-Anteil und eine zentrale Freigabe für die mögliche Mehrleistung benötigt. Die tatsächlich genutzten Phasen werden aus mehreren vollständigen Messungen ermittelt; eine reine Statusanzeige erhält keine Steuerfreigabe.
-- Ein gemeinsames dauerhaft gespeichertes Konto begrenzt die zusätzliche PV-Deckungslücke auf höchstens 40 Wh und die Probe auf höchstens 30 Sekunden. Kleinere konfigurierte Grenzen bleiben wirksam. Abstecken oder Dienstneustart erneuern das Guthaben nicht. Fehlende Messungen und harte Schutzgrenzen stoppen die Probe.
-- Erkannte Phasen bleiben über Ladepausen erhalten. Bei ausreichendem PV-Angebot geht die Ladung ohne erzwungenen Stopp in die normale Regelung über. Nach einem Defizitstopp bleibt ein normaler PV-finanzierter Wiederanlauf unter den bestehenden Wiederanlaufzeiten möglich.
-- Laufende zweite Wallboxen werden mit ihrer gebundenen Leistung berücksichtigt; freie Leistung eines Fahrzeugs kann wieder dem anderen Ladepunkt zugutekommen. Reservierte Startleistung darf keinen weiteren ruhenden Ladepunkt starten.
-- Phasenwechsel, CP-Unterbrechung, Wiederanlauf und Erkennungsprobe werden gegenseitig abgestimmt. Der bestehende Schutzabstand für einen weiteren Phasenwechsel darf den bestätigten Wiederanlauf nicht blockieren. Herstellereigene efy-Automatik sowie die bestehenden openWB- und go-e-Steuerwege behalten ihre eigenen Rollen.
-
-## Wärmepumpe und Verbraucherpriorität
-
-- Luxtronik-Heizung und Warmwasser erhalten getrennte PV-Aufträge. Ein Warmwasser-Zeitfenster blockiert keinen berechtigten Heizungsauftrag; eine ausbleibende Reaktion beendet den zugrunde liegenden Wärmebedarf nicht stillschweigend. Ohne passenden PV-, Preis-, Zeitplan- oder manuellen Auftrag entsteht kein optionaler Warmwasser-Boost.
-- Die zentrale Verteilung berücksichtigt tatsächliche Aufnahme, Startreserve und konfigurierte Verbraucherpriorität. Die Wallbox erhält den freigegebenen Rest. Bei Wärmepumpenvorrang wird die tatsächliche Rücknahme von Wallboxleistung vor einem neuen Verdichterstart abgewartet.
-- Mindestlaufzeit und Wiedereinschaltschutz orientieren sich am physischen Verdichterlauf. Akku- und Netzüberbrückung werden getrennt begrenzt und dauerhaft bilanziert. Eine optionale Startfreigabe benötigt ein eingetragenes elektrisches Leistungsprofil und ausdrücklich erlaubte Kontingente.
+Dieses Wartungsupdate verbessert Docker-Updates mit eigenen Compose-Dateien, die Speicherplanung und die Bedienung der Wärmepumpe.
 
 ## Docker
 
-- Der Host-Updater akzeptiert bei bekannten Compose-Altvorlagen auch den von älteren Compose-Versionen ausdrücklich ausgegebenen Standardwert `external: false`. Externe Volumes und zusätzliche Treiberoptionen bleiben gesondert geschützt.
-- Der Privilegienschutz kann auf älteren Kerneln ohne `NoNewPrivs`-Statusfeld direkt über die Kernelabfrage nachgewiesen werden. Dort muss zusätzlich der gesamte Container mit `no-new-privileges` gestartet werden; UID-, Gruppen- und Capability-Prüfungen bleiben bestehen.
+Der Host-Updater unterstützt ausdrücklich ausgewählte Compose-Dateien und Ergänzungen, Projekt- und Dienstnamen, mehrere getrennte Instanzen sowie Bind-Mounts. Kompatible eigene Ergänzungen bleiben erhalten; geprüft wird die tatsächlich zusammengeführte Konfiguration des ausgewählten E3DC-Dienstes. Neu angelegte leere Datenordner werden gezielt vorbereitet. Vorhandene Datenordner erhalten bei unpassenden Rechten eine konkrete Fehlermeldung.
+
+Ein bestehender Container-Hostname wird bei fehlender Compose-Vorgabe für den persistenten Rollenanker übernommen. Ein bereits widersprüchlicher Rollenanker benötigt weiterhin eine gezielte Prüfung. Nach einem fehlgeschlagenen Update wird eine zuvor gestoppte Altinstanz ausdrücklich als gestoppt gemeldet.
+
+## Speicher und Tarife
+
+- Manuelles positives Laden ist auch an der Notstromreserve möglich. Entladen und Export bleiben dort gesperrt; Nutzer-Aus, Inselbetrieb, ungültige Messdaten und Anschlussgrenzen behalten Vorrang.
+- Die Freigabe zum Netzladen schließt Speicherhalten ein und aktiviert den zugehörigen Schalter. Speicherhalten allein bleibt wählbar.
+- Die Halteplanung berücksichtigt die zeitliche Reihenfolge von Verbrauch, PV und bekannten Preisen. Spätere PV verdeckt keine frühere Versorgungslücke; die weiche Ladekurve wird nicht als zusätzliche harte Hausreserve behandelt.
+- Heat-/Sondertarifpreise werden über den bekannten Planungshorizont berücksichtigt. Eco-Aus widerruft die normale Marktfreigabe auch bei noch vorhandenen älteren Plänen.
+
+## Wärmepumpe und Bedienung
+
+- Luxtronik hält bei aktivem Warmwasser-Timer den Normal-/Eco-Sollwert auch nach Erreichen der Temperatur. Temporäre Boosts werden weiterhin zurückgenommen; eine Absenkung wartet auf das bestätigte Ende eines laufenden Warmwasserzyklus. Bestätigte identische Werte werden nicht fortlaufend neu geschrieben.
+- Die PV-Regelung kann bewusst auf Istaufnahme mit Wh-Wächtern umgestellt werden. Voreinstellungen erleichtern die Einrichtung; bestehende Konfigurationen behalten ihre bisherige reservierte Betriebsart. Quellen-Aus und harte Schutzgrenzen bleiben vorrangig. Im messwertgeführten Modus kann ein positives Wh-Kontingent während der geschützten Mindestlaufzeit überschritten werden; die Anzeige weist dies aus.
+- WP-Freigaben stehen gesammelt im Smart-Home-/WP-Bereich. Unwirksame Einstellungen zeigen ihre Voraussetzungen. Leere optionale Wallbox-Modusfelder verhindern das Speichern nicht mehr. Timer-Tooltips sind angebunden.
+- Die allgemeine WP-Preisverschiebung löst weiterhin keine zusätzlichen Heizläufe aus. Ein wirkungsloser alter Freigabewert kann im Hinweisfeld deaktiviert werden. Bestehende, gesondert freigegebene Negativpreis- und Pre-Dump-Funktionen sind davon getrennt.
+
+## Wallboxen
+
+Die Modellwahl efy bzw. Multi Connect II bindet die herstellereigene Sonnenmodus-Automatik. Eine reine PV-Freigabe bleibt bei wechselndem Budget im Sonnenmodus. Reale Ladung bleibt auch bei einer konservativ aus Leistung abgeleiteten Stromuntergrenze im zentralen Wh-Wächter; daraus entsteht keine zusätzliche Strom- oder Phasenfreigabe. Gültig zugeteiltes Budget wird auch bei autonomer Phasenwahl energetisch bilanziert.
+
+**Betriebsgrenze:** E3DC übernimmt weiterhin die automatische Phasenwahl. Ein 6-A-Angebot erzwingt keine einzelne Phase. Ein zuverlässiger einphasiger Wiederanlauf der efy bei kleinem PV-Budget ist noch nicht bestätigt; dieses Update enthält keine direkte externe 1-/3-Phasensteuerung.
 
 ## Updatehinweise
 
-**Luxtronik:** Vor neuen automatischen PV-Boosts im Config Editor unter **PV-Überschuss-Boost → Luxtronik: Leistungsprofil und Energie zur Überbrückung** die maximale elektrische Aufnahme sowie erlaubte Akku-/Netzleistung und Wh-Kontingente eintragen. Fehlende Angaben lassen optionale PV-Starts warten; sie blockieren keine Installation und ersetzen keine herstellerseitige Heizungs- oder Warmwasserregelung. Ein einzelner gemessener Warmwasser-Betriebspunkt ist keine garantierte Geräteobergrenze.
+**Docker:** Zuerst den tatsächlich verwendeten Host-Helfer aus diesem Release aktualisieren. Ein neues Image ersetzt diese Hostdatei nicht. Bei eigenen Dateinamen und Ergänzungen den vollständigen Dateisatz gemäß [Docker-Dokumentation](doc/Docker_Dokumentation.md) ausdrücklich auswählen. Ein fester Image-Pin muss bewusst auf `v5.4.6d` geändert werden.
 
-**Docker:** Zuerst den verwendeten Host-Helfer `Installer/docker_compose_update.py` aktualisieren; ein neues Image ersetzt diese Hostdatei nicht. Benötigte Volumes bei gestopptem Container mit numerischen Eigentümern und Dateirechten sichern. Keine zusätzliche Compose-Option `user:` setzen. Ein fester Pin muss bewusst auf `v5.4.6c` geändert werden.
+Vor dem Update Daten bei gestopptem Container mit numerischen Eigentümern und Rechten sichern. Updates bei beendeter Fahrzeugladung und ohne laufenden Phasenwechsel durchführen. Kein zusätzliches `user:` setzen. Bei vorhandenen lokalen Korrekturimages zuerst deren dokumentierten Übergang beachten. Rückfälle auf ältere Root-Images ausschließlich über den aktuellen Host-Updater ausführen.
 
-Updates und Container-Neuerstellungen bei beendeter Fahrzeugladung und ohne laufenden Phasenwechsel durchführen. Private Wallbox-Steuerzustände überleben einen Neustart desselben Containers, aber keine Neuerstellung. Rückfälle auf ältere Root-Images ausschließlich über den aktuellen Host-Updater ausführen. Aus Bridge zuerst dieselbe aktuelle Runtime-Version im Hostprofil wiederherstellen und ihren gesunden Start prüfen.
+**Luxtronik:** Den aktiven Warmwasser-Timer und Normal-/Eco-Sollwert prüfen. Die neue PV-Betriebsart wird bewusst gewählt; bestehende Kontingente werden nicht ungefragt ersetzt.
 
-Einzelheiten stehen in [Native Wallbox](doc/Native_Wallbox.md), [Luxtronik](doc/Luxtronik.md), [Docker](doc/Docker_Dokumentation.md) und [Update](doc/Update.md).
+Weitere Einzelheiten: [Speicher](doc/Speicher_Ladesteuerung_Ablauf.md), [Luxtronik](doc/Luxtronik.md), [Wallbox](doc/Native_Wallbox.md), [Konfiguration](doc/Frontend_Ansichten.md) und [Update](doc/Update.md).

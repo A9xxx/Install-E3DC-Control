@@ -80,6 +80,7 @@ from consumer_priority import (  # noqa: E402
 import control_time  # noqa: E402
 from runtime_logging import configure_service_logger  # noqa: E402
 from config_validator import write_config_validation  # noqa: E402
+from market_economics import cfg_bool as market_cfg_bool  # noqa: E402
 from tariff_schedule import (  # noqa: E402
     supports_spot_market_prices,
     tariff_type as configured_tariff_type,
@@ -8133,6 +8134,7 @@ HARD_DISCHARGE_OWNER_PREFIXES = (
     "direct_marketing_eco_plus_headroom_export",
 )
 HARD_GRID_OWNER_PREFIXES = (
+    "manual_override_grid",
     "peak_shaving_recharge",
     "price_boost_grid",
     "storm_guard_grid",
@@ -8790,6 +8792,8 @@ def build_display(payload: Dict[str, Any], *, now_s: Optional[float] = None) -> 
 
     labels = {
         "manual_override": "Manuell",
+        "manual_override_grid": "Manuelles Laden aus PV und Netz",
+        "manual_override_charge_wait": "Manuelles Laden wartet",
         "manual_override_done": "Manuell beendet",
         "emergency_power": "Notstrom-Automatik",
         "ep_reserve_discharge_hold": "Notstromreserve",
@@ -8863,6 +8867,8 @@ def build_display(payload: Dict[str, Any], *, now_s: Optional[float] = None) -> 
         "parallel_evening_release": "E3DC",
         "parallel_wb_auto": "Wallbox Manager",
         "manual_override": "Storage Manager",
+        "manual_override_grid": "Storage Manager",
+        "manual_override_charge_wait": "Storage Manager",
         "manual_override_done": "E3DC",
         "ep_reserve_discharge_hold": "Storage Manager",
         "pre_discharge": "Storage Manager",
@@ -15838,10 +15844,19 @@ def market_economics_storage_action_authorized(
     contract: Optional[Dict[str, Any]] = None,
 ) -> bool:
     action = str(action or "").strip()
+    # Die aktuelle Eco-Freigabe widerruft auch einen noch gültigen Altvertrag.
+    # Negativpreis-Aufnahme behält ihre eigene ausdrückliche Freigabe.
+    if action in {"grid_charge", "hold_discharge"} and not market_cfg_bool(
+        cfg.get("grid_friendly_mode", 1), True,
+    ):
+        return False
     if action == "grid_charge":
         return cfg_bool(cfg, "market_battery_grid_charge_enable", False)
     if action == "hold_discharge":
-        return cfg_bool(cfg, "market_battery_hold_enable", False)
+        return (
+            cfg_bool(cfg, "market_battery_grid_charge_enable", False)
+            or cfg_bool(cfg, "market_battery_hold_enable", False)
+        )
     if action == "negative_price_absorb":
         return (
             market_negative_price_tariff_coherent(cfg, market, contract)
@@ -20602,14 +20617,35 @@ def heatpump_pv_source_contract(
     if external_slots:
         native = wallbox_status if isinstance(wallbox_status, dict) else {}
         details = native.get("wb_details") if isinstance(native.get("wb_details"), list) else []
+        configured_slots = [index + 1 for index, value in enumerate(wb_types)
+                            if value and value not in absent_types]
+        # Der Manager publiziert bei mehreren Wallboxen die Messbelege je
+        # Slot. Das Aggregat ist kein weiterer Treiber und besitzt deshalb
+        # keinen eigenen driver_status-Zeitstempel. Jede konfigurierte
+        # Wallbox braucht weiterhin genau einen frischen Leistungsbeleg.
+        slot_samples = {
+            slot: [detail for detail in details if isinstance(detail, dict)
+                   and type(detail.get("id")) is int and detail["id"] == slot]
+            for slot in configured_slots
+        }
+        detail_evidence_valid = all(
+            len(samples) == 1
+            and _wallbox_status_sample_fresh(samples[0], now_s=now_s, max_age_s=10.0)
+            and number(samples[0].get("power_w")) is not None
+            and number(samples[0].get("power_w")) >= 0.0
+            for samples in slot_samples.values()
+        )
+        # Ein tatsächlich vorhandener globaler Treiberbeleg darf dabei
+        # nicht trotz explizit ungültigem oder veraltetem Status gelten.
+        global_evidence_present = any(key in native for key in (
+            "driver_status_last_sample_ts", "driver_status_valid",
+            "driver_status_stale", "driver_status_degraded",
+            "driver_status_glitch", "driver_status_plausible",
+        ))
         effective_wallbox_known = bool(
-            wallbox_power_known and _wallbox_status_sample_fresh(native, now_s=now_s, max_age_s=10.0)
-            and all(any(
-                isinstance(detail, dict) and type(detail.get("id")) is int
-                and detail["id"] == slot
-                and _wallbox_status_sample_fresh(detail, now_s=now_s, max_age_s=10.0)
-                and number(detail.get("power_w")) is not None
-                for detail in details) for slot in external_slots)
+            wallbox_power_known and detail_evidence_valid
+            and (not global_evidence_present or _wallbox_status_sample_fresh(
+                native, now_s=now_s, max_age_s=10.0))
         )
     heater_configured = bool(
         cfg_bool(cfg, "heizstab", False)
@@ -20711,6 +20747,10 @@ def heatpump_pv_source_contract(
         configured_nonnegative("wp_pv_battery_max_w"),
         max(0.0, float(max_discharge_w) - other_battery_w),
     ) if battery_dispatch_allowed and battery_available_wh > 0.0 else 0.0
+    pv_config = heatpump_pv_policy.heatpump_pv_config(cfg)
+    measured_control = pv_config.get("control_mode") == "measured"
+    if measured_control and pv_config.get("battery_limit_wh", 0) <= 0:
+        battery_available_w = 0.0
     peak = decision.get("peak_shaving") or {}
     grid_headroom_w = number(peak.get("grid_import_headroom_w")) if isinstance(peak, dict) else None
     house_grid_room_w = (
@@ -20733,20 +20773,50 @@ def heatpump_pv_source_contract(
         max(0.0, grid_headroom_w) + assigned["heatpump"]["grid"]
         if grid_headroom_w is not None else math.inf,
     ) if fresh and not protection_reason and house_grid_room_w is not None else 0.0
+    if measured_control and pv_config.get("grid_limit_wh", 0) <= 0:
+        grid_available_w = 0.0
+    reaction_s = pv_config["reaction_s"]
+    capability_w = pv_config["max_power_w"] or pv_config.get("start_power_w", 0)
+    if measured_control and fresh:
+        capability_w = max(capability_w, max(0, int(heatpump_w)))
+    # AUTO kann einen Lastsprung zuerst vollständig aus dem Akku decken.
+    # Ein Netzbudget begrenzt diesen autonomen Akkuanteil nicht. Nur eine
+    # tatsächlich vollständig erlaubte Antwort darf als schnelle Quelle gelten.
+    auto_response_w = min(capability_w, max(0.0, float(max_discharge_w) - other_battery_w))
+    auto_response_wh = auto_response_w * reaction_s / 3600.0
+    auto_response_backed = bool(
+        measured_control and battery_dispatch_allowed
+        and safe_int(decision.get("mode"), -1) == MODE_AUTO
+        and not ((decision.get("auto_limit") or {}).get("enabled") is True)
+        and battery_available_w >= auto_response_w
+        and auto_response_w > 0.0
+        and min(battery_available_wh, pv_config["battery_limit_wh"]) >= auto_response_wh
+    )
     return {
         "schema": "heatpump_pv_source_v1",
+        "control_mode": pv_config.get("control_mode", "reserved"),
         "fresh": fresh,
         "sample_ts": sample_ts or 0.0,
         "shared_capacity_w": 0,
         "prospective_capacity_w": 0,
         "battery_available_w": int(battery_available_w),
-        "battery_reaction_available_w": 0,
-        # Ohne bestätigte aktuelle Entladeisolierung ist auch bei erlaubter
-        # Netzquelle ein möglicher AUTO-Nachlauf aus demselben Akkukonto gedeckt.
-        "battery_response_required_w": configured_nonnegative("wp_pv_max_power_w"),
-        "battery_response_required_wh": (
-            configured_nonnegative("wp_pv_max_power_w")
-            * heatpump_pv_policy.heatpump_pv_config(cfg)["reaction_s"] / 3600.0
+        "battery_reaction_available_w": int(battery_available_w) if auto_response_backed else 0,
+        # Im Messwertbetrieb wird eine nicht gedeckte AUTO-Antwort vor dem
+        # Wärmeauftrag am vorhandenen flüchtigen Speicherausgang begrenzt.
+        "battery_response_required_w": 0.0 if measured_control else capability_w,
+        "battery_response_required_wh": 0.0 if measured_control else capability_w * reaction_s / 3600.0,
+        "battery_auto_response_w": auto_response_w,
+        "battery_auto_response_wh": auto_response_wh,
+        "battery_isolation_required": bool(measured_control and not auto_response_backed),
+        "battery_reaction_reason": (
+            "reserved_control" if not measured_control
+            else "auto_response_backed" if auto_response_backed
+            else "battery_source_unavailable" if battery_available_w <= 0
+            else "storage_output_not_open_auto" if (
+                safe_int(decision.get("mode"), -1) != MODE_AUTO
+                or ((decision.get("auto_limit") or {}).get("enabled") is True))
+            else "battery_auto_response_exceeds_grant" if battery_available_w < auto_response_w
+            else "battery_response_energy_unfunded"
         ),
         "battery_available_wh": battery_available_wh if battery_dispatch_allowed else 0.0,
         "grid_available_w": int(grid_available_w),
@@ -20777,12 +20847,20 @@ def apply_heatpump_pv_bridge_decision(
     """
     result = dict(decision)
     state = heatpump_pv_policy.validate_heatpump_pv_state(grant.get("state"))
+    pv_config = heatpump_pv_policy.heatpump_pv_config(cfg)
+    measured_control = pv_config.get("control_mode") == "measured"
+    new_start = bool(measured_control and grant.get("command_authorized") is True
+                     and grant.get("start_candidate") is True and not state.get("cycle_owned"))
+    measured_cycle = bool(measured_control and state.get("cycle_owned") is True)
+    source_withdrawal = bool(measured_cycle and grant.get("protection_reason") == "bridge_source_disabled")
     if not (
         grant.get("allocation_owned") is not False
         and source.get("fresh") is True and cfg_bool(cfg, "auto_mode", True)
-        and grant.get("valid") is True and not grant.get("protection_reason")
-        and (grant.get("hold_required") is True or grant.get("command_outstanding") is True)
-        and state.get("cycle_owned") is True
+        and grant.get("valid") is True and (not grant.get("protection_reason") or source_withdrawal)
+        # Signalentzug ist kein physischer Stopp. Eine ausgeschaltete Quelle
+        # bleibt auch nach bestätigt zurückgenommenem Sollwert isoliert.
+        and (new_start or measured_cycle or grant.get("hold_required") is True or grant.get("command_outstanding") is True)
+        and (new_start or state.get("cycle_owned") is True)
         and result.get("safety_veto") is not True
         and not result.get("suppress_rscp_output")
     ):
@@ -20796,19 +20874,34 @@ def apply_heatpump_pv_bridge_decision(
     actual_wp_w = max(0, safe_int(live.get("WP_Power"), 0))
     wp_pv_w = max(0, safe_int(assigned["heatpump"].get("pv"), 0))
     wp_deficit_w = max(0, actual_wp_w - wp_pv_w)
-    response_wh = max(0.0, safe_float(source.get("battery_response_required_wh"), 0.0))
-    response_w = max(0.0, safe_float(source.get("battery_response_required_w"), 0.0))
+    response_wh = max(0.0, safe_float(source.get(
+        "battery_auto_response_wh" if measured_control else "battery_response_required_wh"), 0.0))
+    response_w = max(0.0, safe_float(source.get(
+        "battery_auto_response_w" if measured_control else "battery_response_required_w"), 0.0))
+    protected_energy_overrun = bool(
+        measured_control and state.get("compressor_running") is True
+        and grant.get("hold_required") is True
+        and safe_float(grant.get("compressor_protected_remaining_s"), 0.0) > 0.0
+        and pv_config["battery_limit_wh"] > 0.0 and pv_config["battery_max_w"] > 0.0
+    )
     response_backed = bool(
         response_wh > 0.0
         and safe_float(state.get("battery_reserved_wh"), 0.0) >= response_wh
-        and safe_float(grant.get("battery_remaining_wh"), 0.0) >= response_wh
+        and (protected_energy_overrun
+             or safe_float(grant.get("battery_remaining_wh"), 0.0) >= response_wh)
         and safe_float(source.get("battery_available_wh"), 0.0) >= response_wh
         and safe_float(source.get("battery_available_w"), 0.0) >= response_w
     )
-    if wp_deficit_w == 0 and response_backed:
-        # Vollständig PV-gedeckte Wärme braucht keinen Entladebefehl. Normales
-        # PV-Speichern bleibt möglich; der ausdrücklich reservierte Akkuanteil
-        # trägt den möglichen Nachlauf bis zum nächsten flüchtigen Ausgang.
+    if new_start:
+        result["heatpump_pv_start_source_binding_required"] = True
+    if response_backed and (
+        source.get("battery_isolation_required") is False if measured_control
+        else wp_deficit_w == 0
+    ):
+        # Die vollständig erlaubte AUTO-Antwort bleibt im Messwertbetrieb
+        # dieselbe schnelle Quelle, die bereits das Restbudget trägt. Ein
+        # nachträglicher fester Ausgang würde diese Reaktionszusage aufheben.
+        # Im bisherigen Reservierungsbetrieb bleibt der reine PV-Fall erhalten.
         result["heatpump_pv_response_buffer_backed"] = True
         return result
     support_w = min(
@@ -25655,21 +25748,56 @@ def manual_override_storage_decision(
             "auto_limit": charge_block_auto_limit(cfg, max_discharge_w, reason),
         }
     if mode == "charge" and (target <= 0 or soc < target - 0.2):
+        charge_w = max(0, int(max_charge_w))
+        charge_live_valid = bool(
+            _live_numeric_present(live, "SOC")
+            and 0.0 <= soc <= 100.0
+            and _live_numeric_present(live, "Grid_Power")
+            and _live_numeric_present(live, "Battery_Power")
+            and live_power_plausibility(live).get("sample_valid") is True
+            and live.get("Power_Decision_Usable") is not False
+        )
+        room_w = grid_charge_room_w(cfg, live)
+        if room_w is not None:
+            # Auch ein manueller Ladeauftrag darf den Hausanschluss nicht
+            # überlasten. Ein ungültiger Netzpunkt belegt keinen freien Rahmen.
+            charge_w = min(charge_w, room_w)
+        if not charge_live_valid:
+            charge_w = 0
+        if charge_w < EMS_POWER_SETTINGS_NONZERO_MIN_W:
+            reason = (
+                "Manuelles Laden wartet: frische gültige Leistungsdaten erforderlich"
+                if not charge_live_valid else
+                "Manuelles Laden wartet: kein freier Hausanschlussrahmen"
+            )
+            return {
+                "state": "manual_override_charge_wait",
+                "mode": MODE_AUTO,
+                "val": 0,
+                "priority": "manual",
+                "reason": reason,
+                "protected": True,
+                "storage_req_w": 0,
+                "budget_w": 0,
+                "auto_limit": discharge_block_auto_limit(cfg, 0, reason),
+            }
         return {
-            "state": "manual_override",
-            "mode": MODE_CHRG,
-            "val": max_charge_w,
+            "state": "manual_override_grid",
+            # Der bewusste Handauftrag erlaubt PV+Netz. CHRG allein kann auf
+            # DC-Systemen auf PV begrenzt sein; GRID ist der Netzladevertrag.
+            "mode": MODE_GRID,
+            "val": charge_w,
             "priority": "manual",
-            "reason": "Manuell laden",
+            "reason": "Manuell laden aus PV und Netz",
             "protected": True,
-            "storage_req_w": max_charge_w,
+            "storage_req_w": charge_w,
             "budget_w": 0,
         }
     if (
         mode == "charge"
         and target > 0
         and soc >= target - 0.2
-        and not (previous_manual_done and previous_manual_release_mode == MODE_CHRG)
+        and not (previous_manual_done and previous_manual_release_mode in (MODE_CHRG, MODE_GRID))
     ):
         reason = "Manuell laden beendet: Ziel %.1f%% erreicht (SoC %.1f%%); E3DC AUTO freigeben" % (target, soc)
         return {
@@ -25683,7 +25811,7 @@ def manual_override_storage_decision(
             "budget_w": 0,
             "manual_target_soc": target,
             "manual_reached_soc": round(soc, 2),
-            "manual_release_mode": MODE_CHRG,
+            "manual_release_mode": MODE_GRID,
             "auto_limit": {
                 "enabled": False,
                 "release": True,
@@ -25740,6 +25868,31 @@ def manual_override_storage_decision(
         }
 
     return None
+
+
+def manual_decision_with_reserve_floor(
+    manual_decision: Dict[str, Any], reserve_hold: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Manuelle Ladefreigabe und Entladeschutz gemeinsam erhalten."""
+    if reserve_hold is None:
+        return manual_decision
+    mode = safe_int(manual_decision.get("mode"), MODE_AUTO)
+    if mode == MODE_DISCH:
+        return reserve_hold
+    result = dict(manual_decision)
+    result.update(
+        discharge_allowed=False, export_allowed=False,
+        reserve_floor_charge_override=mode in (MODE_CHRG, MODE_GRID) and safe_int(result.get("val"), 0) > 0,
+        reserve_floor_charge_reason=reserve_hold.get("reason"),
+        ep_reserve_recovery=copy.deepcopy(reserve_hold.get("ep_reserve_recovery")),
+    )
+    if mode == MODE_AUTO:
+        # Ziel erreicht, Warten oder manuelle Ladesperre dürfen weder die
+        # gehaltene Reserve freigeben noch eine zweite Ladefreigabe erzeugen.
+        auto = dict(result.get("auto_limit") or {})
+        auto.update(release=False, enabled=True, max_discharge_w=0)
+        result["auto_limit"] = auto
+    return result
 
 
 def predump_curve_floor_guard(
@@ -25844,11 +25997,16 @@ def protected_decision(
             "budget_w": 0,
         }
 
+    manual_decision = manual_override_storage_decision(
+        cfg, live, manual_override, max_charge_w, max_discharge_w, previous_state,
+    )
     reserve_hold = ep_reserve_floor_decision(
         cfg, live, max_charge_w, previous_state,
         now_s=now_s, recovery_context=reserve_recovery,
     )
     if reserve_hold is not None:
+        if manual_decision is not None:
+            return manual_decision_with_reserve_floor(manual_decision, reserve_hold)
         peak_owner = (
             peak_shaving_evaluation.get("decision")
             if isinstance(peak_shaving_evaluation, dict)
@@ -25885,14 +26043,6 @@ def protected_decision(
             return market_owner
         return reserve_hold
 
-    manual_decision = manual_override_storage_decision(
-        cfg,
-        live,
-        manual_override,
-        max_charge_w,
-        max_discharge_w,
-        previous_state,
-    )
     if manual_decision is not None:
         return manual_decision
 
@@ -27195,11 +27345,14 @@ def decide_next_cycle(
         live_sample_invalid
         and not live_stale
         and not soc_unrealistic
+        and safe_int(live_with_wallbox.get(
+            "Notstrom_Status", live_with_wallbox.get("ems_emergency_power_status"),
+        ), 0) not in (1, 4)
         and manual_override_mode in ("charge", "discharge")
     ):
-        # Ein Leistungsglitch allein hebt den manuellen Auftrag nicht auf.
-        # Die harte beziehungsweise noch gehaltene Notstromreserve bleibt
-        # jedoch auch in diesem Sonderpfad vor Entladung und AUTO-Freigabe.
+        # Ein Leistungsglitch löscht den manuellen Auftrag nicht. Netzladen
+        # wartet dabei auf gültige Leistungsdaten; die gehaltene Reserve
+        # bleibt auch in diesem Sonderpfad vor Entladung und AUTO-Freigabe.
         manual_invalid_sample_decision = manual_override_storage_decision(
             cfg,
             live_with_wallbox,
@@ -27211,14 +27364,15 @@ def decide_next_cycle(
         if manual_invalid_sample_decision is not None:
             manual_invalid_sample_decision = dict(manual_invalid_sample_decision)
             manual_invalid_sample_decision["live_plausibility_manual_override_kept"] = True
-            if manual_invalid_sample_decision.get("mode") != MODE_CHRG:
-                manual_reserve_veto = ep_reserve_floor_decision(
-                    cfg, live_with_wallbox, max_charge_w, previous_state,
-                    now_s=now_s, recovery_context=reserve_recovery,
-                )
-                if manual_reserve_veto is not None:
-                    reserve_recovery = manual_reserve_veto["ep_reserve_recovery"]
-                    manual_invalid_sample_decision = manual_reserve_veto
+            manual_reserve_veto = ep_reserve_floor_decision(
+                cfg, live_with_wallbox, max_charge_w, previous_state,
+                now_s=now_s, recovery_context=reserve_recovery,
+            )
+            manual_invalid_sample_decision = manual_decision_with_reserve_floor(
+                manual_invalid_sample_decision, manual_reserve_veto,
+            )
+            if manual_reserve_veto is not None:
+                reserve_recovery = manual_reserve_veto["ep_reserve_recovery"]
     decision = None
     stale_guard = storage_live_stale_decision(
         cfg=cfg,
@@ -32039,6 +32193,7 @@ def decide_next_cycle(
         "parallel_val": val,
         "auto_limit": decision.get("auto_limit"),
         "heatpump_pv_set_power_only": decision.get("heatpump_pv_set_power_only") is True,
+        "heatpump_pv_start_source_binding_required": decision.get("heatpump_pv_start_source_binding_required") is True,
         "wallbox_fixed_start_set_power_only": decision.get("wallbox_fixed_start_set_power_only") is True,
         "wallbox_fixed_start_output": decision.get("wallbox_fixed_start_output"),
         "heatpump_pv_bridge_dispatch_w": max(0, safe_int(decision.get("heatpump_pv_bridge_dispatch_w"), 0)),
@@ -33794,10 +33949,14 @@ def finalize_heatpump_pv_output_owner(
         budget["heatpump_pv_contract"] = copy.deepcopy(grant)
         result.pop("heatpump_pv_set_power_only", None)
         return result
+    own_ram_output = False
     try:
         path = storage_decision_path_contract(result, plan)
         own_ram_output = bool(
-            state.get("cycle_owned") and grant.get("valid")
+            (state.get("cycle_owned") or (
+                before_arbitration.get("heatpump_pv_start_source_binding_required") is True
+                and grant.get("command_authorized") is True
+            )) and grant.get("valid")
             and before_arbitration.get("heatpump_pv_set_power_only") is True
             and result.get("heatpump_pv_set_power_only") is True
             and all(result.get(key) == before_arbitration.get(key)
@@ -33814,19 +33973,27 @@ def finalize_heatpump_pv_output_owner(
     except Exception:
         owner_guard = {"veto": True, "reason_codes": ["FINAL_OWNER_CONTRACT_INVALID"]}
     source_ts = _consumer_runtime_finite(source.get("sample_ts"))
-    hard_veto = bool(
+    output_hard_veto = bool(
         owner_guard.get("veto") or result.get("safety_veto")
         or result.get("suppress_rscp_output")
         or result.get("storage_regulation_enabled") is False
         or source.get("fresh") is not True or source_ts is None
         or not 0.0 <= now_s - source_ts <= 10.0
-        or grant.get("protection_reason")
+    )
+    hard_veto = bool(output_hard_veto or grant.get("protection_reason"))
+    source_isolation = bool(
+        heatpump_pv_policy.heatpump_pv_config(cfg).get("control_mode") == "measured"
+        and state.get("cycle_owned") and grant.get("valid")
+        and source.get("battery_isolation_required") is True
+        and grant.get("protection_reason") in (None, "", "bridge_source_disabled")
+        and before_arbitration.get("heatpump_pv_set_power_only") is True
     )
     protected_binding = bool(
         state.get("cycle_owned") and grant.get("valid")
-        and (grant.get("hold_required") or grant.get("command_outstanding"))
+        and (grant.get("hold_required") or grant.get("command_outstanding") or source_isolation)
     )
-    retained = bool(changed and protected_binding and not hard_veto)
+    retained = bool(changed and protected_binding
+                    and not output_hard_veto and (not hard_veto or source_isolation))
     if retained:
         # Reine Speicheroptimierung darf eine bereits vor dem Kompressorstart
         # zugesagte Wärmequelle während ihrer Schutzfrist nicht zurücknehmen.
@@ -33848,7 +34015,10 @@ def finalize_heatpump_pv_output_owner(
         })
         result["storage_dispatch_phase5"] = diagnostic
     elif changed or hard_veto:
-        result.pop("heatpump_pv_set_power_only", None)
+        # Quellen-Aus entzieht die Wärmefreigabe, aber nicht die bereits
+        # gebundene flüchtige Akku-Isolierung während des realen Auslaufs.
+        if not (source_isolation and own_ram_output and not changed and not output_hard_veto):
+            result.pop("heatpump_pv_set_power_only", None)
         grant["command_authorized"] = False
         grant["blockers"] = list(dict.fromkeys([
             *(grant.get("blockers") or []), "final_storage_source_not_bound",
@@ -33880,6 +34050,57 @@ def finalize_heatpump_pv_output_owner(
         "owner_guard": owner_guard,
     }
     return result
+
+
+def confirm_heatpump_pv_start_source_output(payload: Dict[str, Any]) -> None:
+    """Veröffentlicht neue Messwert-Starts erst nach dem vorhandenen RSCP-Beleg."""
+    if payload.get("heatpump_pv_start_source_binding_required") is not True:
+        return
+    budget = payload.get("budget") or {}
+    contract = budget.get("consumer_budget_contract") or {}
+    grant = contract.get("heatpump_pv_contract")
+    if not isinstance(grant, dict) or grant.get("command_authorized") is not True:
+        return
+    transaction = payload.get("rscp_request_transaction") or {}
+    substeps = transaction.get("substeps") or {}
+    step = substeps.get("set_power") or {}
+    retained_at = _consumer_runtime_finite(step.get("prior_same_target_issued_at"))
+    volatile_bound = bool(
+        transaction.get("path") == "set_power_only"
+        and safe_int(step.get("mode"), -1) == safe_int(payload.get("mode"), -2)
+        and safe_int(step.get("value_w"), -1) == safe_int(payload.get("val"), -2)
+        and step.get("acknowledged") is not False
+        and ((transaction.get("issued") is True and step.get("issued") is True
+              and step.get("response_returned") is True)
+             or (transaction.get("retained") is True and step.get("retained") is True
+                 and retained_at is not None and retained_at > 0.0))
+    )
+    bound = bool(
+        transaction.get("send_called") is True
+        and transaction.get("output_complete") is True
+        and transaction.get("partial") is not True
+        and payload.get("suppress_rscp_output") is not True
+        and (volatile_bound if payload.get("heatpump_pv_set_power_only") is True
+             else transaction.get("confirmed") is True)
+    )
+    # SET_POWER besitzt im vorhandenen Treiber keinen verlässlichen Geräte-ACK.
+    # Ein vollständiger zielgleicher Ausgabe-/Haltebeleg wird nicht zu einer
+    # physischen Wirkungsbestätigung umetikettiert.
+    grant["source_output_bound"] = bound
+    grant["source_output_evidence"] = (
+        "volatile_set_power_issued_or_retained_ack_unknown" if bound and volatile_bound
+        else "existing_output_confirmed" if bound else "output_not_bound"
+    )
+    if not bound:
+        grant["command_authorized"] = False
+        grant["reason"] = "heatpump_source_output_not_bound"
+        grant["blockers"] = list(dict.fromkeys([
+            *(grant.get("blockers") or []), "heatpump_source_output_not_bound",
+        ]))
+    permission = bool(grant.get("command_authorized") or grant.get("hold_required"))
+    contract["heatpump_boost_permission_active"] = permission
+    budget["heatpump_boost_permission_active"] = permission
+    budget["heatpump_pv_contract"] = copy.deepcopy(grant)
 
 
 def checkpoint_heatpump_pv_grant(
@@ -43785,6 +44006,7 @@ def main() -> None:
         # AUTO bleibt der einzige bewusst nicht ge-heartbeatete Freilaufpfad.
         checkpoint_heatpump_pv_grant(payload, now_s=start)
         execute_rscp_cycle(ctrl, payload, ownership)
+        confirm_heatpump_pv_start_source_output(payload)
         confirm_storage_dc_first_charge_recovery_anchor(
             payload,
             now_s=time.time(),

@@ -3305,6 +3305,14 @@ class E3DCCharger(WallboxDriver):
         self._hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self._hb_thread.start()
 
+    def _autonomous_solar_product_provenance(self):
+        """Herstellerfähigkeit aus expliziter Modellwahl, ohne Feldnachweis vorzutäuschen."""
+        if self.device_family_source not in {"configured", "configured_type"}:
+            return ""
+        if self.device_family not in {"efy", "multi_connect_ii"}:
+            return ""
+        return "manufacturer_documented"
+
     def _backend_contract_fields(self):
         if self.control_backend == E3DC_BACKEND_WBCHAR6:
             label = "WBchar6-Kompatibilität"
@@ -3333,6 +3341,8 @@ class E3DCCharger(WallboxDriver):
             "e3dc_direct_transition_write_allowed": False,
             "e3dc_direct_readback_ts": float(self.direct_transition_readback_ts or 0.0),
             "e3dc_wbchar6_compat_explicit": bool(self.wbchar6_compat_explicit),
+            "e3dc_autonomous_solar_capable": bool(self._autonomous_solar_product_provenance()),
+            "e3dc_autonomous_solar_provenance": self._autonomous_solar_product_provenance() or "unknown",
             "e3dc_efy_autonomous_wbchar6_verified": bool(
                 self.efy_autonomous_wbchar6_verified
             ),
@@ -4930,12 +4940,12 @@ class E3DCMultiConnectCharger(E3DCCharger):
             else None
         )
         blocker = ""
-        if self.device_family != "efy":
-            blocker = "device_family_not_efy"
+        if self.device_family not in {"efy", "multi_connect_ii"}:
+            blocker = "device_family_not_autonomous_solar"
         elif self.device_family_source not in {"configured", "configured_type"}:
             blocker = "device_family_not_explicitly_configured"
-        elif not self.efy_autonomous_wbchar6_verified:
-            blocker = "field_verified_wbchar6_capability_missing"
+        elif not self._autonomous_solar_product_provenance():
+            blocker = "documented_autonomous_solar_capability_missing"
         elif self.control_backend != E3DC_BACKEND_WBCHAR6:
             blocker = "wbchar6_compat_not_bound"
         elif not readback_finite:
@@ -4949,11 +4959,7 @@ class E3DCMultiConnectCharger(E3DCCharger):
             "allowed": not blocker,
             "blocker": blocker,
             "family_source": str(self.device_family_source or ""),
-            "provenance": (
-                "field_verified_legacy"
-                if self.efy_autonomous_wbchar6_verified
-                else "unverified"
-            ),
+            "provenance": self._autonomous_solar_product_provenance() or "unverified",
             "backend": str(self.control_backend or ""),
             "readback_age_s": age_s,
             "max_age_s": float(max_age_s),

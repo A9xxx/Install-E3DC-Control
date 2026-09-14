@@ -258,6 +258,7 @@ def step_group_deficit(
     marginal_wb_id: Any,
     current_amp: Any,
     actual_phases: Any,
+    measured_subminimum_charge: bool = False,
     authorized_budget_overrun_w: Any = None,
     authorized_budget_contract_valid: bool = False,
     supports_phase_switch: bool = False,
@@ -283,6 +284,11 @@ def step_group_deficit(
     Aufrufer bestätigt diesen Quellenvertrag explizit mit
     ``authorized_budget_contract_valid=True``; ein fehlender oder ungültiger
     Vertrag bleibt unbekannt und wird nicht als 0 W interpretiert.
+
+    Eine explizit bestätigte reale Ladung mit einer nur aus Leistung
+    abgeleiteten Stromuntergrenze unter dem Mindeststrom bleibt als
+    ``measured_subminimum_charge`` im Wh-Konto. Sie erlaubt ausschließlich
+    Beobachten und den energiebasierten Stop, keinen positiven Ausgang.
 
     Netzbezug reduziert oberhalb des Mindeststroms sofort und proportional.
     Die Wh-Schwelle entscheidet über Budget-Abregelung sowie die nächste
@@ -312,7 +318,10 @@ def step_group_deficit(
         phase_switch_pending_timeout_s,
         name="phase_switch_pending_timeout_s",
     )
-    if current + 1e-6 < minimum:
+    subminimum_watch = bool(
+        measured_subminimum_charge is True and 0.0 < current < minimum
+    )
+    if current + 1e-6 < minimum and not subminimum_watch:
         # 0 A ist als physischer Bereitschafts-/Stoppzustand erlaubt. Ein
         # positiver Unterstrom darf hingegen nicht als reguläre Ladestufe
         # interpretiert werden.
@@ -320,7 +329,7 @@ def step_group_deficit(
             raise DeficitControlInputError("positiver current_amp liegt unter min_amp")
 
     topology = _topology(
-        supports_phase_switch=bool(supports_phase_switch),
+        supports_phase_switch=bool(supports_phase_switch) and not subminimum_watch,
         prevent_phase_switch=bool(prevent_phase_switch),
         actual_phases=phases,
     )

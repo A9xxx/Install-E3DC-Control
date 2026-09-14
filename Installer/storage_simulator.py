@@ -14,6 +14,11 @@ import threading
 from datetime import datetime, timedelta
 
 try:
+    from .tariff_schedule import recurring_tariff_slots, tariff_type
+except ImportError:
+    from tariff_schedule import recurring_tariff_slots, tariff_type
+
+try:
     from .planned_loads import apply_planned_loads_to_timeline
 except Exception:
     from planned_loads import apply_planned_loads_to_timeline
@@ -707,6 +712,45 @@ def check_awattar(epex_slots, current_soc, target_soc, v4_config):
     except Exception as e:
         logger.warning('check_awattar Fehler: %s' % e)
         return 1, 'Fehler: %s' % e, 0.0
+
+
+def bind_configured_billing_prices(timeline, config, slot_ms=900000):
+    """Bindet bekannte Zeitfenstertarife unabhängig vom Börsenpreishorizont."""
+    if tariff_type(config) not in ("octopus_heat", "special", "spezial", "special_tariff") or not timeline:
+        return 0
+    start_ms = int(timeline[0]["ts"])
+    end_ms = int(timeline[-1]["ts"]) + slot_ms
+    prices = {
+        int(row["start_timestamp"]): row for row in recurring_tariff_slots(
+            config, now_ms=start_ms, lookback_ms=0,
+            horizon_ms=end_ms - start_ms, slot_ms=slot_ms,
+        )
+    }
+    bound = 0
+    for slot in timeline:
+        price = prices.get(int(slot["ts"]))
+        if price is None or not math.isfinite(float(price["billing_price_ct"])):
+            continue
+        # Die lokale Abrechnung macht einen fehlenden oder veralteten
+        # Börsenpreis nicht gültig. Dessen eigene Frische bleibt erhalten.
+        if "market_price_available" not in slot:
+            slot["marketprice"] = None
+            slot["market_price_available"] = False
+            slot["market_price_stale"] = True
+        slot.update(
+            billing_price_ct=price["billing_price_ct"],
+            billing_price_source="configured_tariff",
+            price_source="configured_tariff",
+            price_available=True, price_fresh=True, price_stale=False,
+            price_status="configured_tariff_interval",
+            optimization_score=None, pure_eco_score=None,
+            eco_score_available=False,
+        )
+        # Vorhandene Börsenauflösung niemals zur Tarifauflösung umdeuten.
+        slot.setdefault("price_resolution_min", price["price_resolution_min"])
+        slot.setdefault("source_resolution_min", price["source_resolution_min"])
+        bound += 1
+    return bound
 
 
 class StorageSimulator:
@@ -5051,6 +5095,10 @@ class StorageSimulator:
                     slot["price_available"] = bool(_price_available)
                     slot["price_fresh"] = bool(_price_fresh and not _price_stale)
                     slot["price_stale"] = bool(_price_stale or not _price_fresh)
+                    slot["market_price_available"] = bool(_price_available)
+                    slot["market_price_stale"] = not bool(_price_available and _price_fresh and not _price_stale)
+                    if e.get("price_source"):
+                        slot["market_price_source"] = e["price_source"]
                     slot["price_status"] = (
                         "source_interval_match"
                         if slot["price_available"] and slot["price_fresh"]
@@ -5103,6 +5151,7 @@ class StorageSimulator:
             # Netto PV Überschuss
             _refresh_slot_energy(slot)
 
+        bind_configured_billing_prices(timeline, self.v4_config, slot_ms)
         planned_load_meta = apply_planned_loads_to_timeline(timeline, self.v4_config)
         for slot in timeline:
             _refresh_slot_energy(slot)

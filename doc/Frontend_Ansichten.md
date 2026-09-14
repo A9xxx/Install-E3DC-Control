@@ -46,7 +46,41 @@ Die einfache Config-Ansicht ist als Raster aufgebaut:
 6. **Standort & PV**
    Standort und erste PV-Fläche für die Prognose.
 
+## Voraussetzungen von Einstellungen
+
+Der Config-Editor kennzeichnet abhängige Einstellungen grau, wenn eine benötigte
+Freigabe oder ein passendes Profil fehlt. Direkt am Feld steht, welche
+Voraussetzung fehlt. Beispielsweise benötigt **Speicher-Netzladen** auch den
+**netzdienlichen Eco-Modus** und einen unterstützten zeitvariablen Tarif.
+Aktivierte, dadurch unwirksame Markteinstellungen erscheinen zusätzlich in
+einem Hinweis oberhalb der Konfiguration, auch in der einfachen Ansicht.
+
+Die Auswahl bleibt bearbeitbar und wird beim Speichern erhalten. So lassen
+sich Werte für einen späteren Profilwechsel vorbereiten. Die Hinweise folgen
+der aktuellen Formularauswahl; wirksam werden Änderungen erst nach dem
+Speichern. Erfüllte Voraussetzungen bestätigen noch keine laufende Ladung:
+Bedarf, Messdaten, Geräteverbindung und Schutzgrenzen prüft die Regelung
+zusätzlich. Die vorhandene Prüfung der wirksamen Konfiguration bleibt für
+konkrete Profilüberschreibungen maßgeblich.
+
 ## Wärmepumpe, BWWP und Heizstab
+
+Die WP-Freigaben für Netzstrom stehen zusammen unter **Smart Home → Wärmepumpe →
+Netzstrom und Preissteuerung**. **Netzboost und Preise** in der einfachen Ansicht
+öffnet diesen Bereich direkt. Im Tarifbereich führt ein kurzer Verweis dorthin.
+
+- **Preisabhängigen Netzboost vormerken** (`price_boost_enable`) speichert die
+  gewünschte allgemeine Preisverschiebung. Diese plant derzeit nur und löst
+  noch keinen zusätzlichen Netzboost aus.
+- **WP für Negativpreis-Boost freigeben** (`cheap_grid_heatpump_enable`) ist eine
+  eigene Freigabe. Sie benötigt außerdem den gemeinsamen Negativpreis-Boost im
+  Tarifbereich sowie passende Preise, Betriebsfreigaben und Schutzbedingungen.
+- Der historische `market_heatpump_enable` ist wirkungslos. Wenn er noch aktiv
+  gespeichert ist, nennt das Warnfeld die Variable und bietet **Jetzt deaktivieren**.
+  Dieser Knopf speichert ausschließlich `market_heatpump_enable = 0`.
+  Andere offene Formularänderungen deshalb vorher speichern.
+
+PV-Boost und seine Überbrückungs-/Schutzwerte bleiben im selben WP-Bereich.
 
 Eine native Wärmepumpe und ein Zusatzverbraucher sind fachlich getrennt:
 

@@ -6,6 +6,15 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.4.6d] – 2026-09-14
+
+- Docker: eigene Compose-Dateien und Ergänzungen, Instanzwahl und Bind-Mounts; gezielte Vorbereitung leerer Datenordner, Erhalt bestehender Hostidentität und korrekte Meldung eines gestoppten Rückfalls.
+- Speicher: manuelles Laden an der Notstromreserve, gekoppelte Freigabe von Netzladen und Halten sowie zeitgerichtete Energieverteilung über bekannte Preisfenster.
+- Luxtronik: dauerhafter Normal-/Eco-Sollwert bei aktivem Warmwasser-Timer; bewusst wählbare PV-Regelung nach Istaufnahme mit Wh-Wächtern und Mindestlaufzeitschutz.
+- Bedienung: Voraussetzungen unwirksamer Einstellungen, gemeinsame WP-Gruppe und funktionierende Timer-Tooltips; leere optionale Wallbox-Modi verhindern das Speichern nicht mehr.
+- Wallbox: stabilere Sonnenmodus-Übergabe für efy/Multi Connect II und vollständigeres Wh-Konto bei gemessener Ladung. Ein zuverlässiger einphasiger efy-Wiederanlauf bei kleinem Budget ist noch nicht bestätigt.
+- Allgemeine aktive WP-Preisverschiebung und direkte externe efy-/Multi-II-Phasensteuerung sind nicht enthalten. Betriebsgrenzen und Updatehinweise stehen in den [Release Notes](RELEASE_NOTES.md).
+
 ## [5.4.6c] – 2026-09-12
 
 ### Wallboxen und Phasenerkennung

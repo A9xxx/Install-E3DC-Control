@@ -224,6 +224,32 @@ WBchar6-Kompatibilitätsregelung aktiviert sein, wenn die native Regelung
 steuern soll. Bei ausgeschaltetem Kompatibilitätsmodus bleibt dieser Pfad
 beobachtend. Eine erfolgreiche Anmeldung allein erteilt keine Steuerfreigabe.
 
+Bei ausdrücklich ausgewählter **efy** oder **Multi Connect II** erkennt die
+Regelung die vom Hersteller dokumentierte automatische 1-/3-Phasenumschaltung.
+Ein zusätzlicher versteckter Nachweis-Schalter ist dafür nicht erforderlich.
+Im freigegebenen PV-Betrieb kann der vorhandene Sonnenmodus die Phasenwahl an
+die E3/DC-Automatik übergeben. Die Diagnose unterscheidet diese Herstellerfähigkeit
+von einem tatsächlich beobachteten Phasenwechsel. Die automatische
+Phasenumschaltung muss auch am E3/DC-Gerät aktiviert sein.
+
+Das freigegebene Budget bleibt dabei der Rahmen für die Energieabrechnung:
+Gemessene Mehrleistung zählt auch im autonomen Sonnenmodus im Wh-Wächter.
+Eine nur aus Phasenleistungen geschätzte Stromuntergrenze unter 6 A ist kein
+Beweis für einen Ladestopp. Eine bestätigte reale Ladung bleibt überwacht;
+aus dieser Schätzung entstehen keine positiven Strom- oder Phasenbefehle.
+
+Diese Übergabe setzt frische, gültige Statusdaten und den aktivierten
+Kompatibilitätspfad voraus. `Aus`, Stopps, Hausanschlussgrenzen, Wh-Wächter und
+Speicherreserven bleiben wirksam. Die Stromvorgabe gilt je genutzter Phase;
+ein Wattbudget ist in diesem Automatikpfad keine vom Gerät garantierte harte
+Leistungsgrenze. Die elektrische Absicherung berücksichtigt deshalb weiterhin
+die mögliche dreiphasige Last. Direkte Phasen-Schreibbefehle werden dadurch
+nicht freigeschaltet. Easy Connect, nicht eindeutig bestimmte Geräte und die
+Modellwahl Multi Connect ohne II erhalten diese Fähigkeit nicht automatisch.
+
+Referenzen: [E3/DC-Wallboxen](https://www.e3dc.com/produkte/wallbox-ii/),
+[Herstellerdaten Multi Connect / Multi Connect II](https://www.e3dc.com/ch/wp-content/uploads/sites/4/2022/09/E3DC_TDB_wallbox-multi-connect.pdf).
+
 Bei wiederholt fehlgeschlagener RSCP-Anmeldung werden die Verbindungsversuche
 mit wachsendem Abstand bis höchstens 30 Sekunden wiederholt. Fehlgeschlagene
 Verbindungen werden geschlossen; eine erfolgreiche Sitzung wird für weitere

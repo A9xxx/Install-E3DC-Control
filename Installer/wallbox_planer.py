@@ -1663,7 +1663,9 @@ def _validate_candidate_config(raw):
 
     for wb_id in (1, 2):
         for key in (f"wb{wb_id}_mode",):
-            if key in flat:
+            # Fehlende optionale Modi bleiben wie im Planer ungesetzt.
+            # Explizites 0 bleibt Aus; nichtleere ungültige Werte bleiben Fehler.
+            if key in flat and flat[key] is not None and str(flat[key]).strip() != "":
                 _candidate_finite(flat[key], key, 0, 20)
         for key in (
             f"wb{wb_id}_locked",

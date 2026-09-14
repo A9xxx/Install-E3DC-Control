@@ -14,6 +14,77 @@ ausdrücklich angezeigt. Eine Ladegrenze in Watt ist keine gemessene Ladeleistun
 „DC only“ beschreibt die Ladestrategie; der technische E3DC-Modus bleibt AUTO.
 Die Anzeige ist kein messtechnischer Nachweis der Herkunft jedes geladenen Watts.
 
+## Automatisches Netzladen bei zeitvariablem Tarif
+
+Für normales preisabhängiges Speichernachladen müssen der **netzdienliche
+Eco-Modus** und **Speicher-Netzladen** eingeschaltet sein. Der separate
+Negativpreis-Boost und die früheren aWATTar-Optionen ersetzen diese Freigaben
+nicht. Ein günstiges Zeitfenster allein startet noch keine Ladung: Prognose,
+nutzbarer Speicherinhalt, Preisvorteil, Verluste und Mindestlademenge bestimmen
+den Bedarf. Innerhalb eines geeigneten Fensters kann der Plan bis zum
+berechneten spätesten Ladebeginn warten.
+
+Die Deckungsprüfung beachtet die zeitliche Reihenfolge und die
+Speicherkapazität. Erwartete PV am nächsten Nachmittag kann eine vorherige
+Versorgungslücke in der Nacht nicht decken. Reichen Speicher und rechtzeitig
+verfügbare PV aus, bleibt das normale Netzladen aus.
+
+Bei **Octopus Heat** und einem konfigurierten **Spezialtarif** sind die täglich
+wiederkehrenden Abrechnungspreise über den vollständigen Planungshorizont
+bekannt. Fehlende morgige Börsenpreise verkürzen diese Tarifachse nicht.
+Börsenpreise für Direktvermarktung bleiben davon getrennt; aus einem
+konfigurierten Kundentarif wird kein Börsenpreis abgeleitet.
+
+## Speicher für teure Stunden halten
+
+Mit **Speicher halten** kann der Haushalt in günstigeren Stunden Strom aus dem
+Netz beziehen, während vorhandene Batterieenergie für spätere teure Stunden
+verbleibt. Dafür müssen Eco-Modus und Halten freigegeben sein. Die Planung
+berücksichtigt auch den Verbrauch bis zur Preisspitze und rechtzeitige PV.
+Füllt PV den Speicher vorher ohnehin wieder auf, entfällt dieser Haltevorteil.
+
+Die Planung verteilt die verfügbare Batterieenergie über den zusammenhängend
+bekannten Preisabschnitt. Sie berücksichtigt den prognostizierten Verbrauch,
+rechtzeitig nutzbare PV, Speicherkapazität und Lade-/Entladeleistung. Dabei soll
+vorhandene Energie möglichst viel Bedarf decken und bevorzugt teuren Netzbezug
+vermeiden. Eine spätere günstigere Haltemöglichkeit wird mitbewertet.
+Die Ladekurve ist dabei ein Ladeziel; sie wird nicht als zusätzliche harte
+Entladereserve für die Hausversorgung verwendet. Die gebundene Schutzreserve
+bleibt unangetastet.
+
+Wird nur ein Teil der aktuellen Viertelstunde zum Halten benötigt, endet der
+Halteauftrag entsprechend früher. Dieser Zeitanteil wird aus der prognostizierten
+Last und möglichen Entladeleistung berechnet; er ist keine gemessene Wh-Abschaltung.
+Neue Messwerte und Prognosen werden bei der Neuplanung berücksichtigt. Fehlende
+oder ungültige Eingaben geben keinen Halteauftrag frei. Der Storage Manager prüft
+weiterhin die aktuellen Schutzgrenzen und die Gültigkeit des Auftrags.
+
+**Speicher-Netzladen** schließt die Freigabe **Speicher halten** automatisch ein.
+Der Halten-Schalter erscheint eingeschaltet und lässt sich bei aktivem Netzladen
+nicht ausschalten. Beim Speichern werden beide Freigaben übernommen. Auch ältere
+Konfigurationen mit Netzladen an und Halten aus werden entsprechend ausgewertet.
+Wird Netzladen ausgeschaltet, bleibt Halten separat wählbar und zunächst an;
+für vollständig ausgeschaltete Markt-Speicherpfade beide Schalter ausschalten.
+Dies ist eine Freigabe, kein dauerhafter Halteauftrag: Ohne zeitlichen Bedarf
+und wirtschaftlichen Vorteil wird der Speicher nicht gehalten.
+
+Halten benötigt keine Mindestlademenge und gibt selbst kein Netzladen frei.
+Reicht die vorhandene Energie trotz Halten nicht aus, wird zusätzliches
+Netzladen nur mit eigener Freigabe und nach seinen Bedarfs- und Preisprüfungen
+geplant. Geänderte Lasten oder Prognosen können die Planung im Betrieb ändern.
+
+## Manuelles Laden aus PV und Netz
+
+Ein bewusster manueller Ladeauftrag darf den Speicher auch an oder unterhalb
+der Notstromreserve aufladen. Entladen und Export bleiben an dieser Grenze
+gesperrt. Bei fehlenden gültigen Leistungsdaten oder fehlendem freien
+Hausanschlussrahmen wartet der Auftrag. Inselbetrieb und ausgeschaltete
+Speicherregelung geben kein manuelles Netzladen frei.
+
+Ziel-SoC und Ablaufzeit beenden den manuellen Auftrag. Ein gespeicherter
+Ladeauftrag beziehungsweise eine angeforderte Leistung bestätigt noch keine
+physische Batterieladung; dafür ist die gemessene Batterieleistung maßgeblich.
+
 ## Beobachtete Wallbox und Speichergrenzen
 
 Bei „Nur Beobachten, Wallbox regelt“ bleibt die Wallbox selbstständig. Ein
@@ -75,7 +146,7 @@ nicht wieder aufgenommen. Technisch wird der Schalter als
 bindet die Übernahme mit `storage_regulation_changed_ts` an die aktuelle
 Bedienaktion. Ein Dienststopp allein ersetzt diese geordnete Abschaltung nicht.
 
-> **Stand:** v5.4.6c
+> **Stand:** v5.4.6d
 >
 > **Neu in 5.4.5a:** Ein frisch beobachteter openWB-Fahrzeug-SoC kann mit
 > Quelle und Alter rein lesend erscheinen, wenn er zur aktuellen Stecksession

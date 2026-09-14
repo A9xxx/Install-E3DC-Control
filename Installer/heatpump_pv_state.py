@@ -174,6 +174,7 @@ def _transition_signature(state):
     keys = ("request_id", "revision", "active_command", "cycle_owned", "signal_withdrawn",
             "withdrawal_pending", "running_since_s", "last_stop_s", "issued_ts", "offered_ts",
             "max_power_w", "uncertain_state",
+            "energy_guard_pending", "energy_guard_sources", "withdrawal_reason",
             "quarantine_reason", "compressor_running")
     value = {key: state.get(key) for key in keys}
     value["clock_boot_id"] = (state.get("clock") or {}).get("boot_id")

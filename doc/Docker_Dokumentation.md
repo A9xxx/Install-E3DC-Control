@@ -2,10 +2,10 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.6c`. Die Tags `latest`, `v5.4.6c` und
-`5.4.6c` bezeichnen denselben Stable-Stand.
+Der aktuelle Stable-Stand ist `v5.4.6d`. Die Tags `latest`, `v5.4.6d` und
+`5.4.6d` bezeichnen denselben Stable-Stand.
 
-5.4.6c enthält außerdem die begrenzte Phasenerkennung fester E3DC-Wallboxen,
+5.4.6d enthält außerdem die begrenzte Phasenerkennung fester E3DC-Wallboxen,
 die korrigierte Zuteilung zwischen mehreren Ladepunkten und geschützte
 Luxtronik-PV-Aufträge. Vor optionalem Wärmepumpen-PV-Boost das elektrische
 Leistungsprofil und erlaubte Überbrückungskontingente im Config Editor prüfen.
@@ -13,7 +13,7 @@ Leistungsprofil und erlaubte Überbrückungskontingente im Config Editor prüfen
 `external: false` ausdrücklich ausgeben; externe Volumes werden dadurch nicht
 freigegeben.
 
-5.4.6c startet EMS-Python-Dienste mit dem eigenen unprivilegierten Konto
+5.4.6d startet EMS-Python-Dienste mit dem eigenen unprivilegierten Konto
 `e3dc-runtime`. Private Modelle und Prognosebelege werden vor dem Start geprüft
 und übernommen. Der aktuelle Host-Updater ist auch für den Rückfall auf ältere
 Root-Images erforderlich. Vor dem Upgrade den tatsächlich verwendeten Helfer
@@ -28,10 +28,11 @@ beachten. Einzelheiten stehen in den [Release Notes](../RELEASE_NOTES.md).
 
 Die mitgelieferten Compose-Vorlagen begrenzen den gesamten E3DC-Container mit
 `security_opt: [no-new-privileges:true]`. Der aktuelle Host-Updater ergänzt
-bekannte bisherige Standardvorlagen kontrolliert um diesen Schutz. Ein
-zusätzliches `user:` ist dafür weder erforderlich noch zulässig. Unbekannte
-Sicherheitsoptionen und beliebige zusätzliche Compose-Dateien werden dadurch
-nicht automatisch freigegeben.
+den ausgewählten E3DC-Dienst bei Bedarf kontrolliert um diesen Schutz. Ein
+zusätzliches `user:` ist dafür weder erforderlich noch zulässig. Eigene
+Dateinamen, ausdrücklich gewählte Compose-Ergänzungen und weitere Dienste
+sind unterstützt; geprüft wird der aufgelöste E3DC-Dienst. Hinweise dazu
+stehen unter „Eigene Compose-Dateien, OMV und mehrere Instanzen“.
 
 Auf älteren Kerneln, insbesondere Linux 4.4, fehlt das spätere
 `NoNewPrivs`-Feld in `/proc/<pid>/status`. Die Laufzeit prüft dort zusätzlich
@@ -74,14 +75,14 @@ installieren, anschließend das Ziel ausdrücklich wählen:
 
 ```bash
 curl -q -fsS --proto '=https' --tlsv1.2 \
-  -o ./docker_compose_update-5.4.6c.py \
-  https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control/v5.4.6c/Installer/docker_compose_update.py
+  -o ./docker_compose_update-5.4.6d.py \
+  https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control/v5.4.6d/Installer/docker_compose_update.py
 if [ ! -d ./Installer ]; then
   sudo install -d -m 0755 ./Installer
 fi
-sudo install -m 0644 ./docker_compose_update-5.4.6c.py ./Installer/docker_compose_update.py
+sudo install -m 0644 ./docker_compose_update-5.4.6d.py ./Installer/docker_compose_update.py
 sudo python3 ./Installer/docker_compose_update.py \
-  --compose-dir . --sudo --image-tag v5.4.6c
+  --compose-dir . --sudo --image-tag v5.4.6d
 ```
 
 Der aktuelle Helfer akzeptiert die gebundene gestoppte Altinstanz, ergänzt bei
@@ -400,8 +401,9 @@ Rechtevertrag getrennt:
 | `e3dc_instance_role` | root-privater create-once-Anker für exakt `ha_mode=off`; überlebt Container-Recreates | auf demselben Docker-Host erhalten; nicht als Rollenanker auf einen anderen Host kopieren |
 
 Die mitgelieferte Compose-Datei verwendet für alle fünf Bereiche benannte
-Volumes. Ein abweichendes Bind-Mount-Layout ist kein Teil des manuellen
-Quickstarts und darf die ausgelieferte Compose-Datei nicht ungeprüft ersetzen.
+Volumes. Eigene Bind-Mounts sind ebenfalls möglich; der Quickstart zeigt
+bewusst die Standardform. Die vorhandenen Datenquellen beim Wechsel erhalten
+und die Hinweise zu eigenen Compose-Dateien sowie zur Datensicherung beachten.
 Die Ramdisk ist absichtlich flüchtig und gehört nicht ins Backup.
 
 Vollständige Docker-Sicherungen werden auf dem Host bei gestopptem Container
@@ -493,54 +495,151 @@ Docker-Daemons.
 Fehlt `docker_compose_update.py` in einer älteren Docker-Installation, verwende
 einen separaten frischen Checkout des veröffentlichten `main` als
 Verwaltungsbaum. Starte daraus `Installer/docker_compose_update.py` und übergib
-mit `--compose-dir` den absoluten Pfad des bestehenden
-`e3dc-docker`-Verzeichnisses. Der Helfer migriert die unveränderte offizielle
-5.3.2b-Compose-Datei, Compose-Dateien aus 5.4.2 bis 5.4.2d sowie die bekannte
-Installer-Bind-Mount-Variante atomar, also ganz oder gar nicht. Unterstützt wird
-auch die alte offizielle Named-Volume-Vorlage mit festem `latest`, entweder mit
-den ursprünglichen Daten- und Logvolumes oder mit allen fünf Standardvolumes
-einschließlich ML, Prognosediagnose und Instanzanker. In dieser Variante dürfen
-`E3DC_WEB_PORT` und `E3DC_WEB_BIND` als eindeutige, direkt eingetragene gültige
-Werte gesetzt sein. Die Web-Einstellungen bleiben bei der Migration erhalten;
-zusätzliche Mounts, Gerätefreigaben oder Prozessänderungen sind damit nicht
-freigegeben. Der Helfer prüft weiterhin die tatsächliche Projekt- und
-Volumezuordnung des vorhandenen Containers. `.env` und die
-vorhandenen Daten-, Log-, ML- und Forecast-Quellen bleiben unverändert. Einen
-alten Watchtower stoppt und prüft er vor Migration und Pull; er bleibt danach
-aus und darf nur per ausdrücklichem Opt-in wieder aktiviert werden. Andere
-ältere, angepasste, per Override ergänzte oder mehrdeutige Compose-Stände bleiben
-unverändert gesperrt und benötigen eine manuelle Prüfung.
+mit `--compose-dir` den bestehenden Projektpfad. Der Helfer erhält vorhandene
+Daten-, Log-, ML-, Prognose- und Instanzrollenquellen. Fehlende erforderliche
+private Volumes sowie `E3DC_CONTAINER_MODE=1` und `no-new-privileges:true`
+werden nur im ausgewählten E3DC-Dienst ergänzt. Vorhandene Kommentare und
+andere Dienste bleiben erhalten; die aufgelöste Compose-Konfiguration wird
+vor und nach dem Dateiaustausch verglichen.
 
-Ohne `E3DC_IMAGE_TAG` folgt diese Compose-Datei dem geprüften Stable-Tag
-`latest`. Ein fester Tag bleibt bei `pull` absichtlich unverändert. Für einen
-bewussten Pin wird zum Beispiel `E3DC_IMAGE_TAG=v5.4.6c` in der Datei `.env`
-gesetzt. `docker compose config --images` zeigt vorab das tatsächlich gewählte
-Image.
+### Eigene Compose-Dateien, OMV und mehrere Instanzen
 
-Ältere Installationen können in ihrer `docker-compose.yml` noch einen Tag
-direkt in der `image:`-Zeile enthalten, zum Beispiel `v5.3.2b` oder
-`v5.4.0a`. Bei diesen Dateien hat `E3DC_IMAGE_TAG` noch keine Wirkung. Stelle
-die Zeile deshalb einmalig auf die variable Form um:
+Eigene Dateinamen, Labels, Ressourcenlimits, Umgebungswerte und unabhängige
+Zusatzdienste sind kein Grund für einen Updateabbruch. Dateiname, Projektname
+und Zielservice lassen sich ausdrücklich wählen:
+
+```bash
+sudo python3 ./Installer/docker_compose_update.py \
+  --compose-dir /srv/compose/energie \
+  --compose-file anlage-a.yml \
+  --project-name energie-a --service speicher-a --sudo
+```
+
+Bei mehreren Dateien jedes `--compose-file` in derselben Reihenfolge angeben,
+mit der der bestehende Container erstellt wurde. Relative Dateipfade beziehen
+sich auf `--compose-dir`; absolute Pfade sind ebenfalls möglich:
+
+```bash
+sudo python3 ./Installer/docker_compose_update.py \
+  --compose-dir /srv/compose/energie \
+  -f basis.yml -f eigene-ergaenzungen.yml \
+  --project-name energie --service speicher-a --sudo
+```
+
+Ohne `-f` gilt weiterhin `docker-compose.yml`. Nicht ausgewählte zusätzliche
+Compose-Dateien werden nicht automatisch hinzugezogen. Ausgewählte Dateien
+können weiterhin beispielsweise `env_file` oder `extends` verwenden. Der Helfer ergänzt
+notwendige Felder ausschließlich in der **letzten ausgewählten Datei**; zuvor
+aufgelöste Werte der anderen Dienste und bestehende Mounts bleiben erhalten.
+Für benötigte Ergänzungen normale YAML-Block-/Listenform verwenden. JSON als
+Compose-Datei ist ebenfalls möglich. Eine komplexe, nicht sicher erweiterbare
+Inline-Form wird vor dem Austausch mit einer konkreten Meldung angehalten.
+
+Bei genau einem offiziellen E3DC-Dienst kann `--service` entfallen. Bei mehreren
+E3DC-Diensten ist die Auswahl erforderlich. Das funktioniert sowohl mit mehreren
+Diensten in einem Projekt als auch mit getrennten Projekten. Der Containername
+darf abweichen oder von Compose vergeben werden. Projekt, Service, verwendeter
+Dateisatz und reale Container-ID müssen zusammenpassen. Weitere Dienste werden
+weder gestoppt noch durch `depends_on` beim Update oder Rückfall mitgestartet.
+
+Ein bereits vorhandenes Default-Bridge- oder benanntes Bridge-Netz bleibt
+inklusive veröffentlichter Ports erhalten. Bei älteren Konfigurationen ergänzt
+der Helfer `E3DC_CONTAINER_NETWORK_MODE=bridge` und prüft Netztreiber,
+Netzwerk-ID und Ports am bestehenden Container. Der später eingeführte
+Bridge-Image-Marker wird einem bereits laufenden alten Image nicht rückwirkend
+abverlangt; das neue Zielimage muss Bridge unterstützen. Ein Wechsel zwischen
+Host- und Bridge-Netz gehört weiterhin in den gesonderten dokumentierten Ablauf.
+Bei OMV dafür immer den vollständigen bisherigen Dateisatz einschließlich des
+Overrides auswählen; eine Basisdatei allein belegt noch nicht die wirksame Topologie.
+Wenn OMV Dateien neu erzeugt, die benötigten Ergänzungen auch in der dafür
+maßgeblichen OMV-Konfiguration beibehalten.
+
+Für zwei eigenständige Instanzen auf demselben Host getrennte Datenquellen,
+Bridge-Netze und getrennte Portfreigaben verwenden. Unterschiedliche Webports
+über `E3DC_WEB_PORT` allein reichen im gemeinsamen Hostnetz nicht aus, weil
+der interne WebSocket-Port 8765 dort kollidiert. Ein physischer
+E3DC-Master/Slave-Verbund ist keine automatische Festlegung der Software-HA-Rolle;
+die bestehende Rollen-Konfiguration nicht allein wegen des Updates ändern.
+
+Jede eigene Instanz erhält von Anfang an einen festen Hostnamen, zum Beispiel
+`hostname: energie-a` beziehungsweise `hostname: energie-b` im jeweiligen
+Service. Der persistente Rollenanker ist an diesen Namen gebunden. Fehlt der
+Eintrag bei einem vorhandenen Container, übernimmt der Helfer dessen bisherigen
+internen Hostnamen unverändert in das letzte Override. Auch beim Rückfall bleibt
+dieser Name erhalten; Ankerdateien werden dafür nicht gelöscht oder umgeschrieben.
+
+Die fünf persistenten Bereiche dürfen gezielt mit eigenen Hostordnern eingebunden
+werden, beispielsweise:
+
+```yaml
+volumes:
+  - /srv/e3dc/instanz-a/data:/var/www/html/data
+  - /srv/e3dc/instanz-a/logs:/var/www/html/logs
+  - /srv/e3dc/instanz-a/ml:/var/lib/e3dc-control/ml
+  - /srv/e3dc/instanz-a/forecast:/var/lib/e3dc-control/forecast-evidence
+  - /srv/e3dc/instanz-a/role:/etc/e3dc-control
+```
+
+Auch lokale Named Volumes mit `driver_opts: {type: none, o: bind, device: ...}`
+können ihre bestehende Ablage behalten. Die laufende Mountzuordnung wird geprüft;
+ein Update tauscht keine vorhandene Datenquelle aus. Zwei eigenständige
+E3DC-Dienste dürfen nicht dieselben persistenten Speicher benutzen.
+
+Ein frisch erzeugter **leerer Datenordner** wird beim Containerstart gezielt
+vorbereitet. Die UID/GID stammt aus dem Container und berücksichtigt damit dessen
+User-Namespace. Ein gefüllter Ordner wird durch diese Erststartkorrektur weder
+geleert noch pauschal rekursiv umgeschrieben. Nicht passende bestehende Rechte
+werden mit Container-UID/GID, Modus und nächstem Prüfschritt gemeldet. Host-IDs
+bei User-Namespace-Betrieb nicht aus Containerzahlen erraten; keine pauschale
+`chmod 777`- oder rekursive Rechtekorrektur auf der gesamten Backupablage verwenden.
+Die vorhandene inhaltserhaltende Image-Migration bleibt für den Wechsel zwischen
+Root- und unprivilegiertem Betrieb zuständig.
+
+Vorher bei gestopptem Zielcontainer alle benötigten Datenquellen mit numerischen
+Eigentümern und Rechten sichern. **Der Host-Updater erstellt kein Vollbackup der
+Nutzerdaten.** Er hält den Compose-Ausgangsstand für seine laufende Transaktion
+und kann bei einem Startfehler die alte Compose-Datei und das gebundene Altimage
+wiederherstellen. Bei einem Rückfall vor einen unprivilegierten Betrieb werden
+private Modelle über den vorhandenen Offline-Migrationshelfer vorbereitet;
+andere Datenbestände werden nicht aus einem alten Archiv überschrieben.
+
+Ein weiterhin aktiver Watchtower darf nicht gleichzeitig denselben Zielcontainer
+aktualisieren. Der Helfer prüft das bekannte Watchtower-Opt-in und meldet eine
+konkrete Konkurrenz. Fremde Dienste werden nicht automatisch angehalten.
+Sicherheitsrelevante Eingriffe wie ein eigener Entrypoint, ein überschreibendes
+`user:`, zusätzliche Gerätefreigaben oder Produktpfade überlagernde Mounts
+benötigen weiterhin eine fachliche Prüfung; harmlose Labels und Zusatzdienste
+werden damit nicht gleichgesetzt.
+
+### Imageauswahl
+
+Ohne ausdrücklichen Tag verwendet der Helfer das Image des ausgewählten Dienstes.
+Die mitgelieferte variable Zeile folgt ohne `E3DC_IMAGE_TAG` dem geprüften Stable-Tag
+`latest`. Ein vorhandener fester Tag bleibt absichtlich bestehen.
+
+`--image-tag v5.4.6d` funktioniert auch bei einer fest eingetragenen OMV-Imagezeile.
+Der Helfer schreibt diese Auswahl dauerhaft nur in das `image:`-Feld des
+Zieldienstes. Die `.env` und das Image anderer E3DC-Dienste bleiben unverändert.
+Bei einem gescheiterten Update wird die vorherige Zeile im Rahmen des verifizierten
+Rückfalls wiederhergestellt. Soll die Instanz später wieder dem Stable-Kanal folgen, denselben Helfer mit
+`--image-tag latest` aufrufen. Alternativ lässt sich bewusst die ursprüngliche
+variable Form wieder einsetzen:
 
 ```yaml
 image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"
 ```
 
-Sichere die vorhandene Compose-Datei vorher und prüfe anschließend die
-tatsächlich aufgelöste Image-Adresse:
+Vorher die Compose-Datei sichern und die Auswahl prüfen. Bei eigenen Dateien
+und mehreren Diensten dieselben `-f`, `--project-name` und den Zielservice auch
+für die lesende Compose-Ausgabe verwenden:
 
 ```bash
-cp -a docker-compose.yml docker-compose.yml.before-image-variable
 sudo docker compose config --images e3dc-control
 ```
 
-Erst wenn dort der gewünschte Tag erscheint, folgt der Host-Helfer. Ein eventuell bereits vorhandener Eintrag
-`E3DC_IMAGE_TAG=...` in `.env` bleibt dabei die maßgebliche bewusste
-Versionswahl.
-
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.6c` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.4.6d` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash
@@ -826,7 +925,7 @@ Port, etwa `E3DC_PUBLISH_BIND=192.0.2.20` und `E3DC_PUBLISH_PORT=8085`.
 Verwende denselben Compose-Ordner und Projektnamen. Sichere vorher die
 funktionierende `docker-compose.yml` als `docker-compose.host.bak`, die
 vorhandene `.env` und die persistenten Daten. Halte den aktuell eingesetzten
-versionierten Runtime-Image-Tag für den Rückweg fest, beispielsweise `v5.4.6c`.
+versionierten Runtime-Image-Tag für den Rückweg fest, beispielsweise `v5.4.6d`.
 Ein älterer Root-Tag eignet sich nicht für diesen ersten Netzwerk-Rückweg.
 Prüfe eine administrativ zugängliche Kopie der aktuellen
 Konfiguration, ohne ihren Inhalt auszugeben:
@@ -1060,8 +1159,8 @@ Für einen Rückfall wird ausschließlich der Host-Helfer aus dem Abschnitt
 `--image-tag`, bindet Image und Laufzeit und bestätigt bei einem Fehler den
 Stillstand des Kandidaten. Der einzige vorgesehene öffentliche Rollback-Root
 ist `ghcr.io/a9xxx/install-e3dc-control:v5.3.2b`; dieser Stand selbst verweist
-auf kein älteres Image. Ein dauerhafter Pin in `.env` wird erst nach dem
-verifizierten Rückfall gesetzt. Rohe Pull-/Up-Befehle ersetzen den Helfer nicht.
+auf kein älteres Image. `--image-tag` speichert die ausgewählte Version im
+Zieldienst; `.env` bleibt unverändert. Rohe Pull-/Up-Befehle ersetzen den Helfer nicht.
 
 Watchtower ist nur noch ein ausdrückliches Opt-in. Das Enable-Label steht mit
 `${E3DC_WATCHTOWER_ENABLE:-false}` ebenfalls standardmäßig auf `false`. Das Upstream-Projekt wird

@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.6c Stable</span>
+            <span class="badge bg-success text-light">v5.4.6d Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.6c</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.6d</code> in <code>.env</code> gesetzt.</p>
                 <p>Vor dem Imagewechsel den tatsächlich verwendeten Host-Updater aktualisieren, einschließlich einer gegebenenfalls direkt im Compose-Ordner vorhandenen Kopie. Das Containerimage ersetzt diese Hostdatei nicht. Vollständige Docker-Sicherungen erfolgen auf dem Host bei gestopptem Container mit erhaltenen numerischen Eigentümern und Dateirechten. Das allgemeine Vollbackup-Menü im Container unterstützt die getrennten privaten Laufzeitdaten nicht.</p>
                 <p>Container-Neuerstellungen bei beendeter Fahrzeugladung und ohne laufenden Phasenwechsel durchführen. Private Wallbox-Steuerzustände überleben einen Neustart desselben Containers, aber keine Neuerstellung. Ein Rückfall auf ältere Root-Images benötigt den aktuellen Host-Updater. Aus Bridge zuerst dieselbe aktuelle Runtime-Version im Hostprofil neu aufbauen und den gesunden Start prüfen; erst danach den regulären Root-Rückfall ausführen. Einzelheiten stehen in der Docker-Dokumentation.</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
@@ -216,6 +216,16 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                     </ol>
                 </div>
             </div>
+        </div>
+
+        <h4 class="mb-4 text-accent">Stable 5.4.6d: Docker, Speicher und Wärmepumpe</h4>
+        <div class="col-12 faq-item" data-tags="5.4.6d stable docker compose speichern halten warmwasser">
+            <div class="card bg-card border-0 shadow-sm"><div class="card-body">
+                <h5 class="card-title">Was verbessert Wartungsrelease 5.4.6d?</h5>
+                <p>Der Docker-Updater unterstützt ausdrücklich gewählte Compose-Dateien, mehrere Instanzen, Bind-Mounts und eigene kompatible Ergänzungen. Vor dem Update den Host-Helfer aktualisieren.</p>
+                <p>Manuelles Speicherladen bleibt an der Notstromreserve möglich. Netzladen schließt Speicherhalten ein; die Halteplanung berücksichtigt den zeitlichen Energiebedarf und bekannte Preise.</p>
+                <p>Luxtronik hält den aktiven Warmwasser-Timer auf Normal oder Eco. PV-Regelung nach Istaufnahme ist bewusst wählbar; Quellenkontingente und Verdichterschutz bleiben wirksam. Die allgemeine WP-Preisverschiebung steuert weiterhin keine zusätzlichen Heizläufe.</p>
+            </div></div>
         </div>
 
         <h4 class="mb-4 text-accent">Stable 5.4.6c: PV-Ladung und Wärmepumpe</h4>

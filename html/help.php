@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.5.0 Stable</span>
+            <span class="badge bg-success text-light">v5.5.0a Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.5.0</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.5.0a</code> in <code>.env</code> gesetzt.</p>
                 <p><strong>Update-Knopf und Auto-Update:</strong> Der Container tauscht sein Image nicht selbst. Läuft das Compose-Profil <code>auto-update</code> (Watchtower-Fork <code>ghcr.io/nicholas-fedor/watchtower</code>), gibt der Knopf <strong>System Update</strong> Watchtower über dessen lokale HTTP-API das Signal: Watchtower lädt das Image, erstellt den Container neu, und die Oberfläche lädt nach dem Start neu. Mit <strong>Auto-Update</strong> im Config-Editor passiert dasselbe täglich zur eingestellten Uhrzeit; Watchtower selbst pollt nicht. Gibt es kein neues Image, passiert nichts.</p>
                 <p>Einmalige Freischaltung auf dem Docker-Host im Compose-Ordner (Token für beide Dienste in <code>.env</code>, Container mit Token neu erstellen, Watchtower starten):</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
@@ -223,6 +223,16 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                     </ol>
                 </div>
             </div>
+        </div>
+
+        <h4 class="mb-4 text-accent">Stable 5.5.0a: Sicherheitskorrektur der Web-PIN</h4>
+        <div class="col-12 faq-item" data-tags="5.5.0a stable sicherheit web pin api header x-api-pin sperre fehlversuche cloudflare tunnel reverse proxy update">
+            <div class="card bg-card border-0 shadow-sm"><div class="card-body">
+                <h5 class="card-title">Was bringt Stable-Release 5.5.0a?</h5>
+                <p>Die Sperre nach Fehlversuchen (5 falsche Versuche, danach 10 Minuten Sperre) gilt jetzt auch für den API-Zugriff per Header (<code>X-API-PIN</code>). Der Sperrschlüssel hängt nur noch von der Client-Adresse ab (IPv4-Adresse bzw. IPv6-/64-Netz); ein wechselnder User-Agent umgeht die Sperre nicht mehr. <code>CF-Connecting-IP</code> wird nur bei Verbindungen von <code>127.0.0.1</code> bzw. <code>::1</code> berücksichtigt, also bei einem lokal angebundenen Tunnel. Parallele Anfragen können die Sperre nicht mehr überholen; Fehlversuche werden auch unter Last vollständig gezählt.</p>
+                <p><strong>Empfehlung:</strong> Eine Web-PIN mit mindestens 6 Zeichen verwenden; Buchstaben und Ziffern sind erlaubt. Die Sperre gilt je Client-Adresse, ein Widget mit veralteter PIN sperrt deshalb auch die Browser-Anmeldung vom selben Gerät bzw. Netz. Hinweise für Widgets, Skripte und einen weiteren lokalen Reverse-Proxy stehen in <?= e3dcDocLink('API_Documentation.md') ?>.</p>
+                <p><strong>Update:</strong> Wie gewohnt über <strong>System Update</strong> bzw. das Docker-Update; eine Konfigurationsänderung ist nicht nötig. Wallbox-, Speicher-, Wärmepumpen- und Hardwarelogik entsprechen unverändert 5.5.0. Für ein Update von 5.4.x gelten zusätzlich die Hinweise zu 5.5.0.</p>
+            </div></div>
         </div>
 
         <h4 class="mb-4 text-accent">Stable 5.5.0: Wallbox, Speicher und Docker-Update</h4>

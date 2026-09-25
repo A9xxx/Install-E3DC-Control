@@ -6,6 +6,21 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.5.0a] – 2026-09-25
+
+### Sicherheit
+
+- Web-PIN: Die Sperre nach Fehlversuchen (5 falsche Versuche, danach 10 Minuten Sperre) gilt jetzt auch für den API-Zugriff per Header (`X-API-PIN`). Bisher ließ sich die PIN über diesen Header ohne Sperre durchprobieren. Während einer Sperre wird auch die richtige PIN abgewiesen; eine erfolgreiche Anmeldung setzt den Zähler zurück.
+- Der Sperrschlüssel hängt nur noch von der Client-Adresse ab (IPv4-Adresse bzw. IPv6-/64-Netz). Ein wechselnder User-Agent umgeht die Sperre nicht mehr. Ein Widget mit veralteter PIN sperrt deshalb auch die Browser-Anmeldung vom selben Gerät bzw. Netz.
+- `CF-Connecting-IP` wird nur bei Verbindungen von `127.0.0.1` bzw. `::1` ausgewertet, also bei einem lokal angebundenen Tunnel; bei allen anderen Verbindungen wird der Header ignoriert. Andere Weiterleitungs-Header wie `X-Forwarded-For` werden nicht ausgewertet.
+- Parallele Anfragen können die Sperre nicht mehr überholen; Fehlversuche werden auch unter Last vollständig gezählt.
+- Der Konfigurationseditor empfiehlt für `web_pin` jetzt mindestens 6 Zeichen; Buchstaben und Ziffern sind erlaubt.
+- Die [API-Dokumentation](doc/API_Documentation.md) beschreibt Sperre, PIN-Empfehlung und den Betrieb hinter einem weiteren lokalen Reverse-Proxy. Sie nennt außerdem korrekt, dass Cross-Origin-Browserzugriffe (CORS-Preflight) abgewiesen werden; dieses Verhalten ist unverändert.
+
+### Update
+
+- Normales Web-Systemupdate bzw. Docker-Update wie gewohnt; eine Konfigurationsänderung ist nicht nötig. Wallbox-, Speicher-, Wärmepumpen- und Hardwarelogik entsprechen unverändert 5.5.0.
+
 ## [5.5.0] – 2026-09-25
 
 ### Wallbox

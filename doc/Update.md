@@ -5,11 +5,19 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.5.0`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.5.0a`. Das Dashboard startet ausschließlich
 den argumentlosen, root-eigenen Systemjob. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
+
+5.5.0a ist ein Sicherheitsupdate für die Web-PIN: Die Sperre nach
+Fehlversuchen gilt jetzt auch für den API-Zugriff per Header. Das Update läuft
+wie gewohnt über **System Update** bzw. das [Docker-Update](#docker-update);
+eine Konfigurationsänderung ist nicht nötig. Einzelheiten stehen in den
+[Release Notes](../RELEASE_NOTES.md) und der
+[API-Dokumentation](API_Documentation.md). Für ein Update von 5.4.x gelten
+zusätzlich die folgenden Hinweise zu 5.5.0.
 
 5.5.0 bringt unter anderem das Startfenster und den messbasierten einphasigen
 Stromdeckel der openWB Pro, zeitgerichtetes Netzladen des Speichers mit

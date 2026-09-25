@@ -317,10 +317,94 @@ function e3dcWebAuthFailureFile() {
     return sys_get_temp_dir() . '/e3dc_web_auth_failures.json';
 }
 
+/**
+ * Wandelt eine Adresse in ihre binäre Form um. IPv4-gemappte IPv6-Adressen
+ * (::ffff:a.b.c.d) gelten als IPv4, eine Zonenangabe (%eth0) wird ignoriert.
+ * Liefert false, wenn die Adresse keine gültige IP ist.
+ */
+function e3dcWebAuthPackAddress($address) {
+    $address = trim((string)$address);
+    $zonePos = strpos($address, '%');
+    if ($zonePos !== false) {
+        $address = substr($address, 0, $zonePos);
+    }
+    if ($address === '' || filter_var($address, FILTER_VALIDATE_IP) === false) {
+        return false;
+    }
+    $packed = @inet_pton($address);
+    if (!is_string($packed)) {
+        return false;
+    }
+    if (strlen($packed) === 16 && substr($packed, 0, 12) === str_repeat("\0", 10) . "\xff\xff") {
+        return substr($packed, 12);
+    }
+    return $packed;
+}
+
+/** Loopback sind 127.0.0.0/8 und ::1 (auch als IPv4-gemappte Adresse). */
+function e3dcWebAuthIsLoopbackAddress($address) {
+    $packed = e3dcWebAuthPackAddress($address);
+    if ($packed === false) {
+        return false;
+    }
+    if (strlen($packed) === 4) {
+        return ord($packed[0]) === 127;
+    }
+    return $packed === str_repeat("\0", 15) . "\x01";
+}
+
+/**
+ * Adresse des Clients für die Fehlversuchssperre.
+ *
+ * Maßgeblich ist REMOTE_ADDR. Nur wenn die Verbindung von einer lokalen
+ * Loopback-Adresse kommt (etwa ein lokal angebundener Tunnel), wird eine
+ * syntaktisch gültige CF-Connecting-IP verwendet. Aus dem Netz kommende
+ * Anfragen können sich damit keine fremde Adresse geben. X-Forwarded-For
+ * wird bewusst nicht ausgewertet.
+ */
+function e3dcWebAuthClientAddress() {
+    $remoteAddr = trim((string)($_SERVER['REMOTE_ADDR'] ?? ''));
+    if (e3dcWebAuthIsLoopbackAddress($remoteAddr)) {
+        $tunnelAddr = trim((string)($_SERVER['HTTP_CF_CONNECTING_IP'] ?? ''));
+        if ($tunnelAddr !== '' && filter_var($tunnelAddr, FILTER_VALIDATE_IP) !== false) {
+            return $tunnelAddr;
+        }
+    }
+    return $remoteAddr;
+}
+
+/**
+ * Sperrbereich einer Adresse: IPv4 die Adresse selbst, IPv6 das /64-Präfix.
+ * Ein Gerät mit wechselnden IPv6-Privacy-Adressen bleibt so derselbe Client.
+ */
+function e3dcWebAuthAddressScope($address) {
+    $packed = e3dcWebAuthPackAddress($address);
+    if ($packed === false) {
+        $address = trim((string)$address);
+        return $address === '' ? 'unknown' : 'raw:' . $address;
+    }
+    if (strlen($packed) === 4) {
+        return inet_ntop($packed);
+    }
+    return inet_ntop(substr($packed, 0, 8) . str_repeat("\0", 8)) . '/64';
+}
+
+/**
+ * Sperrschlüssel je Client-Adresse. Der User-Agent gehört bewusst nicht dazu,
+ * sonst ließe sich die Sperre durch einen wechselnden User-Agent umgehen.
+ */
 function e3dcWebAuthClientKey() {
-    $remoteAddr = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
-    $userAgent = $_SERVER['HTTP_USER_AGENT'] ?? '';
-    return hash('sha256', $remoteAddr . '|' . $userAgent);
+    return hash('sha256', e3dcWebAuthAddressScope(e3dcWebAuthClientAddress()));
+}
+
+/** Meldet ein Problem der Fehlversuchsdatei einmal je Anfrage im PHP-Fehlerlog. */
+function e3dcWebAuthReportStorageProblem($message) {
+    static $reported = false;
+    if ($reported) {
+        return;
+    }
+    $reported = true;
+    error_log('E3DC-Control Web-Anmeldung: ' . $message);
 }
 
 function e3dcWebAuthReadFailures() {
@@ -334,11 +418,65 @@ function e3dcWebAuthReadFailures() {
 function e3dcWebAuthWriteFailures($data) {
     $file = e3dcWebAuthFailureFile();
     $dir = dirname($file);
-    if (!is_dir($dir) || !is_writable($dir)) return;
-    $tmp = $file . '.tmp';
-    @file_put_contents($tmp, json_encode($data, JSON_UNESCAPED_SLASHES));
-    @rename($tmp, $file);
-    @chmod($file, 0664);
+    if (!is_dir($dir) || !is_writable($dir)) {
+        e3dcWebAuthReportStorageProblem('Verzeichnis für Fehlversuche nicht beschreibbar (' . $dir . '), Fehlversuche werden nicht gespeichert.');
+        return false;
+    }
+    $payload = json_encode($data, JSON_UNESCAPED_SLASHES);
+    if (!is_string($payload)) {
+        e3dcWebAuthReportStorageProblem('Fehlversuche ließen sich nicht als JSON kodieren.');
+        return false;
+    }
+    try {
+        $suffix = bin2hex(random_bytes(6));
+    } catch (Throwable $e) {
+        $suffix = (string)mt_rand();
+    }
+    $tmp = $file . '.' . getmypid() . '.' . $suffix . '.tmp';
+    $written = @file_put_contents($tmp, $payload);
+    if ($written !== strlen($payload)) {
+        @unlink($tmp);
+        e3dcWebAuthReportStorageProblem('Fehlversuche konnten nicht vollständig geschrieben werden (' . $file . ').');
+        return false;
+    }
+    @chmod($tmp, 0664);
+    if (!@rename($tmp, $file)) {
+        @unlink($tmp);
+        e3dcWebAuthReportStorageProblem('Fehlversuchsdatei konnte nicht ersetzt werden (' . $file . ').');
+        return false;
+    }
+    return true;
+}
+
+/**
+ * Exklusive Sperre für Lesen, Ändern und Schreiben der Fehlversuchsdatei.
+ * Gelingt sie nicht, läuft der Vorgang wie bisher ohne Sperre weiter und das
+ * Problem wird gemeldet; die Anmeldung wird dadurch nicht blockiert.
+ */
+function e3dcWebAuthAcquireFailureLock() {
+    $lockFile = e3dcWebAuthFailureFile() . '.lock';
+    $existed = file_exists($lockFile);
+    $handle = @fopen($lockFile, 'c');
+    if ($handle === false) {
+        e3dcWebAuthReportStorageProblem('Sperrdatei für Fehlversuche nicht nutzbar (' . $lockFile . ').');
+        return null;
+    }
+    if (!@flock($handle, LOCK_EX)) {
+        @fclose($handle);
+        e3dcWebAuthReportStorageProblem('Sperre für Fehlversuche nicht erhalten (' . $lockFile . ').');
+        return null;
+    }
+    if (!$existed) {
+        @chmod($lockFile, 0664);
+    }
+    return $handle;
+}
+
+function e3dcWebAuthReleaseFailureLock($handle) {
+    if (is_resource($handle)) {
+        @flock($handle, LOCK_UN);
+        @fclose($handle);
+    }
 }
 
 function e3dcWebAuthPruneFailures($data, $now = null) {
@@ -364,11 +502,9 @@ function e3dcWebAuthLockRemaining($clientKey = null) {
     return max(0, $lockedUntil - $now);
 }
 
-function e3dcWebAuthRecordFailure($clientKey = null) {
-    $clientKey = $clientKey ?? e3dcWebAuthClientKey();
-    $now = time();
-    $data = e3dcWebAuthPruneFailures(e3dcWebAuthReadFailures(), $now);
-    $record = $data[$clientKey] ?? ['count' => 0, 'first_ts' => $now, 'last_ts' => 0, 'locked_until' => 0];
+/** Zählt einen Fehlversuch im Eintrag eines Clients (ohne Dateizugriff). */
+function e3dcWebAuthNextFailureRecord($record, $now) {
+    $record = is_array($record) ? $record : ['count' => 0, 'first_ts' => $now, 'last_ts' => 0, 'locked_until' => 0];
     if (($now - (int)($record['first_ts'] ?? 0)) > WEB_AUTH_FAILURE_WINDOW_S) {
         $record = ['count' => 0, 'first_ts' => $now, 'last_ts' => 0, 'locked_until' => 0];
     }
@@ -377,17 +513,77 @@ function e3dcWebAuthRecordFailure($clientKey = null) {
     if ($record['count'] >= WEB_AUTH_FAILURE_LIMIT) {
         $record['locked_until'] = $now + WEB_AUTH_FAILURE_WINDOW_S;
     }
-    $data[$clientKey] = $record;
-    e3dcWebAuthWriteFailures($data);
+    return $record;
+}
+
+function e3dcWebAuthRecordFailure($clientKey = null) {
+    $clientKey = $clientKey ?? e3dcWebAuthClientKey();
+    $lock = e3dcWebAuthAcquireFailureLock();
+    try {
+        $now = time();
+        $data = e3dcWebAuthPruneFailures(e3dcWebAuthReadFailures(), $now);
+        $record = e3dcWebAuthNextFailureRecord($data[$clientKey] ?? null, $now);
+        $data[$clientKey] = $record;
+        e3dcWebAuthWriteFailures($data);
+    } finally {
+        e3dcWebAuthReleaseFailureLock($lock);
+    }
     return max(0, (int)($record['locked_until'] ?? 0) - $now);
+}
+
+/**
+ * Entscheidet einen PIN-Versuch (Login-Formular oder Header) atomar.
+ *
+ * Sperrprüfung, Ergebnis und Zählung laufen unter derselben exklusiven Sperre,
+ * damit parallele Versuche die Grenze von WEB_AUTH_FAILURE_LIMIT Fehlversuchen
+ * nicht überholen. Während einer Sperre wird auch die richtige PIN abgewiesen
+ * und nichts gezählt. Ein Treffer löscht nur einen vorhandenen Eintrag; ohne
+ * Eintrag wird die Fehlversuchsdatei nicht geschrieben. Gelingt die Sperre
+ * nicht, läuft die Entscheidung wie bisher ohne Sperre.
+ *
+ * Liefert ['authenticated' => bool, 'lock_remaining' => Sekunden].
+ */
+function e3dcWebAuthDecideAttempt($clientKey, $pinMatches) {
+    $lock = e3dcWebAuthAcquireFailureLock();
+    try {
+        $now = time();
+        $data = e3dcWebAuthPruneFailures(e3dcWebAuthReadFailures(), $now);
+        $record = $data[$clientKey] ?? null;
+        $lockedUntil = is_array($record) ? (int)($record['locked_until'] ?? 0) : 0;
+        if ($lockedUntil > $now) {
+            return ['authenticated' => false, 'lock_remaining' => $lockedUntil - $now];
+        }
+        if ($pinMatches) {
+            if ($record !== null) {
+                unset($data[$clientKey]);
+                e3dcWebAuthWriteFailures($data);
+            }
+            return ['authenticated' => true, 'lock_remaining' => 0];
+        }
+        $record = e3dcWebAuthNextFailureRecord($record, $now);
+        $data[$clientKey] = $record;
+        e3dcWebAuthWriteFailures($data);
+        return ['authenticated' => false, 'lock_remaining' => max(0, (int)$record['locked_until'] - $now)];
+    } finally {
+        e3dcWebAuthReleaseFailureLock($lock);
+    }
 }
 
 function e3dcWebAuthClearFailures($clientKey = null) {
     $clientKey = $clientKey ?? e3dcWebAuthClientKey();
-    $data = e3dcWebAuthReadFailures();
-    if (isset($data[$clientKey])) {
-        unset($data[$clientKey]);
-        e3dcWebAuthWriteFailures($data);
+    // Ohne Eintrag wird weder gesperrt noch geschrieben (kein Schreibzugriff je Widget-Abruf).
+    if (!isset(e3dcWebAuthReadFailures()[$clientKey])) {
+        return;
+    }
+    $lock = e3dcWebAuthAcquireFailureLock();
+    try {
+        $data = e3dcWebAuthReadFailures();
+        if (isset($data[$clientKey])) {
+            unset($data[$clientKey]);
+            e3dcWebAuthWriteFailures($data);
+        }
+    } finally {
+        e3dcWebAuthReleaseFailureLock($lock);
     }
 }
 
@@ -451,11 +647,26 @@ function isWebAuthenticated() {
         $token = trim($_SERVER['HTTP_X_API_PIN']);
     }
 
-    if ($token !== '' && e3dcWebAuthHashEquals($pin, $token)) {
-        return true;
+    if ($token === '') {
+        return false;
     }
 
-    return false;
+    // Header-Anmeldung unterliegt derselben Fehlversuchssperre wie das Login-Formular.
+    // Das Ergebnis gilt für die ganze Anfrage, damit ein falsches Token bei
+    // mehrfacher Prüfung nur einmal zählt.
+    static $tokenResults = [];
+    $resultKey = hash('sha256', $pin . "\0" . $token);
+    if (array_key_exists($resultKey, $tokenResults)) {
+        return $tokenResults[$resultKey];
+    }
+
+    // Der Vergleich läuft konstant-zeitig vor der Sperre; Sperrprüfung und Zählung
+    // entscheidet e3dcWebAuthDecideAttempt atomar. Während einer Sperre wird auch
+    // die richtige PIN abgewiesen, sonst bliebe das Rate-Orakel offen.
+    $clientKey = e3dcWebAuthClientKey();
+    $pinMatches = e3dcWebAuthHashEquals($pin, $token);
+    $decision = e3dcWebAuthDecideAttempt($clientKey, $pinMatches);
+    return $tokenResults[$resultKey] = ($decision['authenticated'] === true);
 }
 
 function requireWebAuth($isAjax = true) {
@@ -527,18 +738,16 @@ function handleWebLogin() {
         $conf = loadE3dcConfig();
         $pin = $conf['config']['web_pin'] ?? '';
         $clientKey = e3dcWebAuthClientKey();
-        $lockRemaining = e3dcWebAuthLockRemaining($clientKey);
-        if ($lockRemaining > 0) {
-            $_SESSION['login_error'] = true;
-            $_SESSION['login_error_message'] = 'Zu viele falsche PIN-Versuche. Bitte warte ' . ceil($lockRemaining / 60) . ' Minuten.';
-        } elseif ($pin !== '' && isset($_POST['pin']) && e3dcWebAuthHashEquals($pin, $_POST['pin'])) {
+        $pinMatches = $pin !== '' && isset($_POST['pin']) && e3dcWebAuthHashEquals($pin, $_POST['pin']);
+        // Sperrprüfung, Ergebnis und Zählung atomar (siehe e3dcWebAuthDecideAttempt).
+        $decision = e3dcWebAuthDecideAttempt($clientKey, $pinMatches);
+        if ($decision['authenticated'] === true) {
             session_regenerate_id(true);
             $_SESSION['web_authenticated'] = true;
             unset($_SESSION['login_error']);
             unset($_SESSION['login_error_message']);
-            e3dcWebAuthClearFailures($clientKey);
         } else {
-            $lockRemaining = e3dcWebAuthRecordFailure($clientKey);
+            $lockRemaining = (int)$decision['lock_remaining'];
             $_SESSION['login_error'] = true;
             if ($lockRemaining > 0) {
                 $_SESSION['login_error_message'] = 'Zu viele falsche PIN-Versuche. Bitte warte ' . ceil($lockRemaining / 60) . ' Minuten.';

@@ -580,7 +580,7 @@ $tooltips = [
     "frontend_variant"       => "Wählt das Dashboard-Layout. Klassisch bleibt der stabile Rückfallpfad; Modern aktiviert das neue Grid-/Badge-Frontend.",
     "frontend_detail_mode"   => "Steuert die Informationsdichte der neuen Oberfläche: kompakt, normal oder detailreich.",
     "darkmode"               => "Dashboard-Darstellung: 1=Dunkel (Standard), 0=Hell.",
-    "web_pin"                => "Optionaler 4-stelliger PIN zum Schutz des Web-Interface. Leer lassen = kein Schutz.",
+    "web_pin"                => "Optional. Mindestens 6 Zeichen empfohlen, Buchstaben und Ziffern erlaubt. Leer lassen = kein Schutz.",
     "wbcostpowers"           => "Typische Wallbox-Ladeleistungen in kW (komma-getrennt), z.B. '7.2, 11.0, 22.0'. Wird für Kostenberechnung genutzt.",
     "matter_bridge"          => "Aktiviert die Matter Bridge für Apple Home / Google Home / Alexa (Node.js Dienst erforderlich).",
     "config_secret_protection_mode" => "Standard schützt e3dc_v4.json und Config-Backups mit 660 für Install-User:www-data. Kompatibilität erlaubt 664 für eigene externe Leser.",

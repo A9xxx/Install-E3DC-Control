@@ -2,7 +2,7 @@
 
 Diese Anleitung fasst die schnellsten Schritte zusammen, um E3DC-Control auf einem frischen Raspberry Pi OS (oder ähnlichem Debian-System) zu installieren.
 
-Aktueller Stable-Stand: `v5.5.0`.
+Aktueller Stable-Stand: `v5.5.0a`.
 
 5.4.5f korrigiert das Speichern der Konfiguration mit übernommenen
 Docker-Datenvolumes und berücksichtigt erkannte Neustartphasen beim Update.
@@ -519,7 +519,7 @@ Hauptcontainer auch bei laufendem Watchtower ausgenommen. Einzelheiten stehen
 in der [Docker-Dokumentation](Docker_Dokumentation.md), Abschnitt „Updates:
 Weboberfläche, Host und Watchtower“.
 
-**Docker-Rückfall von v5.5.0 auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.5.0a auf den veröffentlichten Docker-Rollback-Root:**
 
 Der aktuelle Host-Updater ist für die private Rückmigration zwingend. Aus
 Bridge zuerst dieselbe aktuelle Runtime-Version im Hostprofil neu aufbauen

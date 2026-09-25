@@ -1,3 +1,54 @@
+# E3DC-Control v5.5.0a
+
+E3DC-Control 5.5.0a ist ein Sicherheitsupdate für die Web-PIN. Wallbox-,
+Speicher-, Wärmepumpen- und Hardwarelogik entsprechen unverändert 5.5.0.
+
+## Sicherheitskorrektur
+
+- **Sperre auch für den API-Zugriff:** Die Sperre nach Fehlversuchen (5 falsche
+  Versuche, danach 10 Minuten Sperre) gilt jetzt auch für den API-Zugriff per
+  Header (`X-API-PIN`). Bisher ließ sich die PIN über diesen Header ohne Sperre
+  durchprobieren. Während einer Sperre wird auch
+  die richtige PIN abgewiesen.
+- **Sperre je Client-Adresse:** Der Sperrschlüssel hängt nur noch von der
+  Client-Adresse ab (IPv4-Adresse bzw. IPv6-/64-Netz). Ein wechselnder
+  User-Agent umgeht die Sperre nicht mehr.
+- **Client-Adresse hinter einem lokalen Tunnel:** `CF-Connecting-IP` wird nur
+  bei Verbindungen von `127.0.0.1` bzw. `::1` berücksichtigt, also bei einem
+  lokal angebundenen Tunnel; aus dem Netz kommende Anfragen können sich damit
+  keine fremde Adresse geben.
+- **Vollständige Zählung:** Parallele Anfragen können die Sperre nicht mehr
+  überholen; Fehlversuche werden auch unter Last vollständig gezählt.
+
+## Empfehlungen
+
+- **Web-PIN:** Eine PIN mit mindestens 6 Zeichen verwenden; Buchstaben und
+  Ziffern sind erlaubt. Eine kurze, rein numerische PIN ist deutlich leichter
+  zu erraten.
+- **Widgets und Skripte:** Die Sperre gilt je Client-Adresse. Ein Widget mit
+  veralteter PIN sperrt deshalb auch die Browser-Anmeldung vom selben Gerät
+  bzw. Netz. Nach einer PIN-Änderung zuerst alle Widgets und Skripte anpassen.
+- **Weiterer lokaler Reverse-Proxy:** Wer auf demselben System zusätzlich einen
+  anderen Reverse-Proxy betreibt, beachtet den Hinweis in der
+  [API-Dokumentation](doc/API_Documentation.md), Abschnitt „Sperre nach
+  Fehlversuchen“.
+
+## Updatehinweise
+
+- **Bare Metal:** Das Update wie gewohnt über **System Update** in der
+  Weboberfläche starten. Eine Konfigurationsänderung ist nicht nötig.
+- **Docker:** Von 5.5.0 aus wie gewohnt über den Knopf **System Update** (mit
+  eingerichtetem Watchtower) oder auf dem Host mit `sudo docker compose pull`
+  und `sudo docker compose up -d`. Ein fester Pin in `.env` wird bewusst auf
+  `v5.5.0a` geändert.
+- **Von 5.4.x:** Das Update führt direkt auf 5.5.0a. Dafür gelten die
+  Updatehinweise, die Konfigurationshinweise und die bekannten Einschränkungen
+  von 5.5.0 weiter unten.
+- **Rückfall:** Ein Rückfall auf 5.5.0 oder älter hebt diese Korrektur wieder
+  auf.
+
+---
+
 # E3DC-Control v5.5.0
 
 Dieses Release bringt an der openWB Pro ein Startfenster und einen messbasierten einphasigen Stromdeckel, eine ruhigere und robustere Phasenumschaltung, ein Akku-Wh-Konto für die Wallbox-Stützung in `PV-Kurve ruhig`, zeitgerichtetes Netzladen des Speichers mit Ladeprofil, einen saisonalen Luxtronik-PV-Boost, die Bluelink-Anmeldung mit Benutzer und Passwort, einen optionalen, rein lesenden Zusatzwechselrichter und unter Docker den Update-Knopf über Watchtower. Bitte vor dem Update die Abschnitte „Updatehinweise“, „Konfiguration prüfen“ und „Bekannte Einschränkungen“ lesen.

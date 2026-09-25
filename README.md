@@ -1,14 +1,16 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.5.0</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.5.0a</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.5.0**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.5.0a**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
 
-Dieses Update bringt an der openWB Pro ein Startfenster je Stecksession, einen messbasierten einphasigen Stromdeckel mit Software-Nachweis der Phasenzuordnung und die Phasenhochschaltung nach evcc/openWB-Muster; in `PV-Kurve ruhig` begrenzt ein Akku-Wh-Konto die Stützung der Wallbox aus dem Hausspeicher. Der Speicher lädt bei zeitvariablen Tarifen zeitgerichtet bis zum Fensterende mit wählbarem Ladeprofil, der Bluelink-Client meldet sich mit Benutzer und Passwort an, ein zusätzlicher Wechselrichter kann per Modbus TCP ausgelesen werden, und Docker aktualisiert über den Update-Knopf oder zur eingestellten Uhrzeit per Watchtower-Signal. Vor dem Update die Hinweise in den [Release Notes](RELEASE_NOTES.md) beachten (Hausabsicherung `grid_max_amps` ausdrücklich eintragen, Konfigurations-Backup); vor dem Docker-Upgrade die Hinweise zu Volume-Sicherung und Rückfall in der [Docker-Dokumentation](doc/Docker_Dokumentation.md).
+5.5.0a ist ein Sicherheitsupdate für die Web-PIN: Die Sperre nach Fehlversuchen gilt jetzt auch für den API-Zugriff per Header und lässt sich weder über einen wechselnden User-Agent noch über parallele Anfragen umgehen. Das Update läuft wie gewohnt über **System Update** bzw. das Docker-Update; eine Konfigurationsänderung ist nicht nötig. Empfohlen wird eine Web-PIN mit mindestens 6 Zeichen; Einzelheiten stehen in der [API-Dokumentation](doc/API_Documentation.md).
+
+Gegenüber 5.4.x bringt das Update außerdem an der openWB Pro ein Startfenster je Stecksession, einen messbasierten einphasigen Stromdeckel mit Software-Nachweis der Phasenzuordnung und die Phasenhochschaltung nach evcc/openWB-Muster; in `PV-Kurve ruhig` begrenzt ein Akku-Wh-Konto die Stützung der Wallbox aus dem Hausspeicher. Der Speicher lädt bei zeitvariablen Tarifen zeitgerichtet bis zum Fensterende mit wählbarem Ladeprofil, der Bluelink-Client meldet sich mit Benutzer und Passwort an, ein zusätzlicher Wechselrichter kann per Modbus TCP ausgelesen werden, und Docker aktualisiert über den Update-Knopf oder zur eingestellten Uhrzeit per Watchtower-Signal. Vor dem Update die Hinweise in den [Release Notes](RELEASE_NOTES.md) beachten (Hausabsicherung `grid_max_amps` ausdrücklich eintragen, Konfigurations-Backup); vor dem Docker-Upgrade die Hinweise zu Volume-Sicherung und Rückfall in der [Docker-Dokumentation](doc/Docker_Dokumentation.md).
 
 Ein optionales Beispiel für einen zweiten Speicher liegt unter [E3DC-Slave](E3DC-Slave/README.md).
 
@@ -43,6 +45,8 @@ sondern eine eindeutige Auswahl verlangt.
 > **Config-Schutz:** Standardinstallationen speichern `data/e3dc_v4.json` und lokale Config-Backups mit `660` für Install-User und `www-data`, damit WebUI und Dienste weiter automatisch starten, die Datei aber nicht mehr weltlesbar ist. Der normale Config-Download ist redigiert; der Raw-Download enthält Zugangsdaten und wird nur angeboten, wenn eine Web-PIN gesetzt ist. Der Kompatibilitätsmodus (`664`) ist nur für eigene externe Leser gedacht.
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
+
+> **Neu in 5.5.0a:** Sicherheitskorrektur der Web-PIN. Die Sperre nach Fehlversuchen gilt auch für den API-Zugriff per Header (`X-API-PIN`), hängt nur noch von der Client-Adresse ab (IPv4-Adresse bzw. IPv6-/64-Netz) und zählt Fehlversuche auch bei parallelen Anfragen vollständig. `CF-Connecting-IP` wird nur bei einem lokal angebundenen Tunnel berücksichtigt. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
 
 > **Neu in 5.5.0:** Startfenster, messbasierter einphasiger Stromdeckel und Phasenhochschaltung an der openWB Pro, Akku-Wh-Konto für die Wallbox-Stützung in `PV-Kurve ruhig`, zeitgerichtetes Netzladen des Speichers mit Ladeprofil, saisonaler Luxtronik-PV-Boost und Warmwasser sofort als Nutzerbefehl, Bluelink-Anmeldung mit Benutzer und Passwort, Zusatzwechselrichter per Modbus TCP, je Datei komprimierte Backups und Docker-Update per Watchtower-Signal. Einzelheiten und Betriebsgrenzen stehen in den [Release Notes](RELEASE_NOTES.md).
 
@@ -523,7 +527,7 @@ sudo docker compose logs --tail=80 e3dc-control
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin oder Rückfall wird
-> `E3DC_IMAGE_TAG=v5.5.0` in `.env` gesetzt und `sudo docker compose up -d`
+> `E3DC_IMAGE_TAG=v5.5.0a` in `.env` gesetzt und `sudo docker compose up -d`
 > ausgeführt. `config --images` zeigt vor dem Pull das tatsächlich gewählte
 > Image.
 

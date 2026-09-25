@@ -1,9 +1,9 @@
 {
-  "version": "5.5.0",
+  "version": "5.5.0a",
   "min_version": "4.0.0",
-  "stable_release": "v5.5.0",
+  "stable_release": "v5.5.0a",
   "release_date": "2026-09-25",
-  "description": "v5.5.0 - Wallbox-Startfenster und Phasenwechsel, zeitgerichtetes Speicher-Netzladen, Bluelink-Anmeldung und Docker-Update-Knopf",
+  "description": "v5.5.0a - Sicherheitskorrektur: PIN-Sperre nach Fehlversuchen gilt auch für den API-Zugriff per Header",
   "update_strategy": "backup_replace_restart_v1",
   "installer_requires": "python3",
   "sanitized_republication": false,

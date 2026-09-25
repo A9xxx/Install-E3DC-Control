@@ -75,8 +75,12 @@ Compose-Datei mountet deshalb direkt:
 
 ```yaml
 tmpfs:
-  - /var/www/html/ramdisk:size=32M,uid=33,gid=33,mode=2775
+  - /var/www/html/ramdisk:size=64M,uid=33,gid=33,mode=2775
 ```
+
+Ältere Compose-Dateien mounten 32M. Der Container meldet das beim Start als
+Hinweis; die neue Größe gilt nach Anpassen der `tmpfs`-Zeile und
+`docker compose up -d`.
 
 Der Container-Entrypoint prüft diesen Mount vor Apache und vor jedem
 Python-/Node-Dienst mit `/usr/bin/findmnt`. Fehlt das exakte `tmpfs`, beendet er

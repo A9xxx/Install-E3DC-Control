@@ -64,6 +64,27 @@ function getAssetUrl($filePath) {
     return $filePath;
 }
 
+// Doku-Verweise im Web als Links auf die veröffentlichte Projektdokumentation (GitHub).
+if (!defined('E3DC_DOC_BASE_URL')) {
+    define('E3DC_DOC_BASE_URL', 'https://github.com/A9xxx/Install-E3DC-Control/blob/main/doc/');
+}
+
+/**
+ * Liefert den Verweis auf eine Datei aus doc/ als anklickbaren Link (neuer Tab) auf die veröffentlichte Dokumentation.
+ * Lokal liegt doc/ nicht unter dem Web-Root. Unzulässige Namen fallen auf die reine Textdarstellung zurück.
+ */
+function e3dcDocLink($file, $label = null) {
+    $name = ltrim(trim((string)$file), '/');
+    if (strpos($name, 'doc/') === 0) $name = substr($name, 4);
+    $text = $label === null ? 'doc/' . $name : (string)$label;
+    if (!preg_match('/\A[A-Za-z0-9_.-]+\.md\z/D', $name) || strpos($name, '..') !== false) {
+        return '<code>' . htmlspecialchars($text, ENT_QUOTES, 'UTF-8') . '</code>';
+    }
+    $url = E3DC_DOC_BASE_URL . rawurlencode($name);
+    return '<a href="' . htmlspecialchars($url, ENT_QUOTES, 'UTF-8') . '" target="_blank" rel="noopener">'
+        . htmlspecialchars($text, ENT_QUOTES, 'UTF-8') . '</a>';
+}
+
 /**
  * Berechnet das Alter nur aus einem echten, plausiblen JSON-Zeitstempel.
  */
@@ -602,46 +623,35 @@ function handleHAManagerLog() {
 /**
  * Setzt das Flag für einen Force-Refresh des Auto-SoC
  */
-function e3dcBluelinkRefreshTokenConfigured($v4Path = '/var/www/html/data/e3dc_v4.json', $txtPath = null) {
-    $topLevelBound = false;
-    $token = '';
+function e3dcBluelinkCredentialsConfigured($v4Path = '/var/www/html/data/e3dc_v4.json') {
+    // Folgt dem Anmeldevertrag des Bluelink-Clients (load_bluelink_config und
+    // _credentials_complete in bluelink_client.py): Benutzer ohne Randleerzeichen
+    // und Passwort unverändert müssen gesetzt sein. Beide Werte liest der Client
+    // nur aus der V4-Konfiguration; ein vorhandener oberster Schlüssel gilt auch
+    // leer, sonst zählt ein nicht leerer Wert aus dem Block config. Ohne beide
+    // Angaben gibt es weder Weck-Schaltfläche noch Fahrzeug-Anforderung.
     $v4Raw = e3dcReadRegularFileBound((string)$v4Path, 1048576);
     $v4 = is_string($v4Raw) ? @json_decode($v4Raw, true) : null;
-    if (is_array($v4)) {
-        if (array_key_exists('bluelink_refresh_token', $v4)) {
-            $topLevelBound = true;
-            $value = $v4['bluelink_refresh_token'];
-            $token = (is_scalar($value) || $value === null) ? trim((string)$value) : '';
-        } elseif (isset($v4['config']) && is_array($v4['config'])
-            && array_key_exists('bluelink_refresh_token', $v4['config'])) {
-            $value = $v4['config']['bluelink_refresh_token'];
-            if (is_scalar($value) || $value === null) {
-                $token = trim((string)$value);
-            }
+    if (!is_array($v4)) {
+        return false;
+    }
+    $nested = (isset($v4['config']) && is_array($v4['config'])) ? $v4['config'] : [];
+    // Wie str(wert or leer) im Client: None, False, 0 und 0.0 zählen als leer;
+    // Nicht-Skalare gelten als nicht gesetzt.
+    $text = static function ($value) {
+        if ($value === null || $value === false || $value === 0 || $value === 0.0 || !is_scalar($value)) {
+            return '';
         }
-    }
-    if ($topLevelBound || $token !== '') {
-        return $token !== '';
-    }
-
-    if ($txtPath === null) {
-        $paths = getInstallPaths();
-        $txtPath = !empty($paths['valid'])
-            ? rtrim((string)$paths['install_path'], '/') . '/e3dc.config.txt'
-            : '';
-    }
-    if (!is_string($txtPath) || $txtPath === '') return false;
-    $txtRaw = e3dcReadRegularFileBound($txtPath, 1048576);
-    if (!is_string($txtRaw)) return false;
-    foreach (preg_split('/\R/', $txtRaw) ?: [] as $line) {
-        $trimmed = trim((string)$line);
-        if ($trimmed === '' || str_starts_with($trimmed, '#') || strpos($line, '=') === false) continue;
-        [$key, $value] = array_map('trim', explode('=', $line, 2));
-        if (strtolower($key) === 'bluelink_refresh_token' && $value !== '') {
-            return true;
+        return (string)$value;
+    };
+    $resolve = static function ($key) use ($v4, $nested, $text) {
+        if (array_key_exists($key, $v4)) {
+            return $text($v4[$key]);
         }
-    }
-    return false;
+        $value = $text($nested[$key] ?? null);
+        return trim($value) !== '' ? $value : '';
+    };
+    return trim($resolve('bluelink_user')) !== '' && $resolve('bluelink_password') !== '';
 }
 
 function e3dcPublishRuntimeCommandFile($targetFile, $payload, $mode = 0664, $temporaryPrefix = '.e3dc_runtime.') {
@@ -1051,8 +1061,8 @@ function handleForceSocUpdate() {
             exit;
         };
 
-        if (!e3dcBluelinkRefreshTokenConfigured()) {
-            $fail('Kein Bluelink-Token konfiguriert.', 400);
+        if (!e3dcBluelinkCredentialsConfigured()) {
+            $fail('Keine Bluelink-Zugangsdaten konfiguriert.', 400);
         }
         $flagResult = e3dcPublishForceBluelinkFlag($flagFile);
         if (empty($flagResult['success'])) {
@@ -2211,7 +2221,7 @@ function getInstallPaths() {
     }
     if ($installRoot === null) return e3dcInvalidInstallPaths('Installationskontext fehlt.');
     if ($sourceRoot !== null && $sourceRoot !== $installRoot) {
-        return e3dcInvalidInstallPaths('Installationsmetadaten und ausgefuehrter Release-Baum widersprechen sich.');
+        return e3dcInvalidInstallPaths('Installationsmetadaten und ausgeführter Release-Baum widersprechen sich.');
     }
 
     $installUser = trim((string)(getenv('E3DC_INSTALL_USER') ?: ($metadata['install_user'] ?? '')));
@@ -2232,7 +2242,7 @@ function getInstallPaths() {
         return e3dcInvalidInstallPaths('Home-Verzeichnis fehlt oder ist ungültig.');
     }
     $homeDir = (string)@realpath($homeDir);
-    if ($homeDir === '') return e3dcInvalidInstallPaths('Home-Verzeichnis ist nicht aufloesbar.');
+    if ($homeDir === '') return e3dcInvalidInstallPaths('Home-Verzeichnis ist nicht auflösbar.');
 
     $venvPath = trim((string)(getenv('E3DC_VENV_PATH') ?: ($metadata['venv_path'] ?? '')));
     if ($venvPath !== '' && !str_starts_with($venvPath, '/')) {
@@ -4236,7 +4246,7 @@ function normalizeWallboxTypeConfig($type) {
         'e3dc_multi_connect' => 'e3dc_multi',
         'e3dc-multi' => 'e3dc_multi',
         'e3dc multi' => 'e3dc_multi',
-        'e3dc_easy' => 'e3dc',
+        'e3dc_easy' => 'e3dc_easy_connect', // Wie config_manager.WALLBOX_TYPE_ALIASES
         'e3dc_legacy' => 'e3dc',
         'native' => 'e3dc',
         'off' => 'none',
@@ -5134,7 +5144,7 @@ function e3dcStableUpdateCheck() {
         ['max_output_bytes' => 4096]
     );
     $effectiveUrl = trim((string)($request['stdout'] ?? ''));
-    if (empty($request['ok']) || strpos($effectiveUrl, $releasePrefix) !== 0) {
+    if (empty($request['success']) || strpos($effectiveUrl, $releasePrefix) !== 0) {
         $detail = trim((string)($request['stderr'] ?? ''));
         return [
             'success' => false,
@@ -5183,26 +5193,120 @@ function e3dcReadUpdatePolicy() {
 
 function e3dcDockerHostUpdateCommandText() {
     return implode("\n", [
-        '(',
-        '  set -euo pipefail',
-        '  if [ -f ./docker_compose_update.py ]; then',
-        '    E3DC_DOCKER_HELPER=./docker_compose_update.py',
-        '  elif [ -f ./Installer/docker_compose_update.py ]; then',
-        '    E3DC_DOCKER_HELPER=./Installer/docker_compose_update.py',
-        '  else',
-        '    echo "docker_compose_update.py fehlt; zuerst den aktuellen Release-Verwaltungsbaum bereitstellen." >&2',
-        '    exit 2',
-        '  fi',
-        '  sudo python3 "$E3DC_DOCKER_HELPER" --compose-dir . --sudo',
-        '  sudo docker compose logs --tail=80 e3dc-control',
-        ')',
+        'sudo docker compose pull',
+        'sudo docker compose up -d',
+        'sudo docker compose logs --tail=80 e3dc-control',
+    ]);
+}
+
+/**
+ * Einmalige Freischaltung des Update-Knopfs: Token in .env, Container mit
+ * Token neu erstellen, Watchtower-Profil starten.
+ */
+function e3dcDockerWatchtowerSetupCommandText() {
+    return implode("\n", [
+        "printf 'E3DC_WATCHTOWER_API_TOKEN=%s\\n' \"$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \\n')\" >> .env",
+        'sudo docker compose up -d',
+        'sudo docker compose --profile auto-update up -d watchtower',
     ]);
 }
 
 function e3dcDockerHostUpdateMessage() {
-    return "Docker-Installation erkannt. Der Web-Updater führt im Container bewusst keinen Release-Wechsel aus.\n"
-         . "Bitte auf dem Docker-Host in das Verzeichnis Deiner vorhandenen Compose-Konfiguration wechseln und dort ausführen:\n\n"
-         . e3dcDockerHostUpdateCommandText();
+    return "Docker-Installation erkannt. Watchtower ist nicht eingerichtet, deshalb stößt der Container den Imagewechsel nicht selbst an.\n"
+         . "Auf dem Docker-Host im Verzeichnis Deiner Compose-Konfiguration ausführen:\n\n"
+         . e3dcDockerHostUpdateCommandText()
+         . "\n\nOder einmalig Watchtower freischalten; danach startet dieser Knopf Updates selbst und der Config-Editor bietet Auto-Update:\n\n"
+         . e3dcDockerWatchtowerSetupCommandText();
+}
+
+/**
+ * Watchtower ist eingerichtet, wenn der Container URL und Token aus .env
+ * erhalten hat. Die Werte selbst werden nie an den Browser ausgegeben.
+ */
+function e3dcDockerWatchtowerConfigured() {
+    $url = trim((string)(getenv('E3DC_WATCHTOWER_API_URL') ?: ''));
+    $token = trim((string)(getenv('E3DC_WATCHTOWER_API_TOKEN') ?: ''));
+    return $url !== '' && $token !== '';
+}
+
+function e3dcDockerWatchtowerClientPath() {
+    foreach (getFooterInstallRootCandidates() as $root) {
+        $candidate = rtrim($root, '/') . '/Installer/docker_watchtower_client.py';
+        if (is_file($candidate) && !is_link($candidate) && is_readable($candidate)) {
+            return $candidate;
+        }
+    }
+    return '';
+}
+
+/**
+ * Gibt Watchtower das Signal für das eigene Image. Der Container steuert den
+ * Docker-Daemon nicht; Pull und Neuerstellung übernimmt Watchtower.
+ */
+function e3dcDockerTriggerWatchtowerUpdate() {
+    if (!e3dcDockerWatchtowerConfigured()) {
+        return [
+            'success' => false,
+            'docker' => true,
+            'watchtower' => false,
+            'status' => 'not_configured',
+            'message' => e3dcDockerHostUpdateMessage(),
+            'commands' => e3dcDockerHostUpdateCommandText(),
+        ];
+    }
+    $client = e3dcDockerWatchtowerClientPath();
+    if ($client === '') {
+        return [
+            'success' => false,
+            'docker' => true,
+            'watchtower' => true,
+            'status' => 'client_missing',
+            'message' => "Der Watchtower-Client fehlt im Produktbaum. Auf dem Docker-Host ausführen:\n\n" . e3dcDockerHostUpdateCommandText(),
+            'commands' => e3dcDockerHostUpdateCommandText(),
+        ];
+    }
+    $process = e3dcRunArgvProcess(
+        ['/usr/bin/python3', '-I', '-B', $client, 'trigger', '--reason', 'webui'],
+        30.0,
+        ['max_output_bytes' => 8192]
+    );
+    $decoded = json_decode(trim((string)($process['stdout'] ?? '')), true);
+    if (!is_array($decoded) || !isset($decoded['status'])) {
+        $detail = trim((string)($process['stderr'] ?? '')) ?: trim((string)($process['error'] ?? ''));
+        return [
+            'success' => false,
+            'docker' => true,
+            'watchtower' => true,
+            'status' => 'client_error',
+            'message' => 'Watchtower-Signal lieferte keine gültige Antwort.'
+                . ($detail !== '' ? "\n" . $detail : '')
+                . "\n\nAlternativ auf dem Docker-Host ausführen:\n\n" . e3dcDockerHostUpdateCommandText(),
+            'commands' => e3dcDockerHostUpdateCommandText(),
+        ];
+    }
+    $status = (string)$decoded['status'];
+    $message = (string)($decoded['message'] ?? '');
+    if (!empty($decoded['success'])) {
+        return [
+            'success' => true,
+            'docker' => true,
+            'watchtower' => true,
+            'status' => $status,
+            'current_version' => readInstalledVersion(),
+            'message' => 'Update angestoßen. ' . $message,
+        ];
+    }
+    $hint = $status === 'unreachable'
+        ? "\n\nWatchtower starten (Compose-Ordner auf dem Docker-Host):\n\nsudo docker compose --profile auto-update up -d watchtower\n\nOder direkt aktualisieren:\n\n" . e3dcDockerHostUpdateCommandText()
+        : ($status === 'busy' ? '' : "\n\nAlternativ auf dem Docker-Host ausführen:\n\n" . e3dcDockerHostUpdateCommandText());
+    return [
+        'success' => false,
+        'docker' => true,
+        'watchtower' => true,
+        'status' => $status,
+        'message' => $message . $hint,
+        'commands' => e3dcDockerHostUpdateCommandText(),
+    ];
 }
 
 function e3dcDockerReleaseCommandText($tag) {
@@ -5776,13 +5880,13 @@ function handleReleaseRollback() {
             exit;
         }
         if (!$confirm) {
-            echo json_encode(['status' => 'error', 'message' => 'Rückfall erfordert Nutzerbestaetigung.']);
+            echo json_encode(['status' => 'error', 'message' => 'Rückfall erfordert Nutzerbestätigung.']);
             exit;
         }
         if (e3dcIsDockerEnvironment()) {
             echo json_encode([
                 'status' => 'docker',
-                'message' => 'Docker-Rückfall wird nicht im Container ausgefuehrt.',
+                'message' => 'Docker-Rückfall wird nicht im Container ausgeführt.',
                 'commands' => e3dcDockerReleaseCommandText($tag),
             ]);
             exit;
@@ -5939,18 +6043,7 @@ function handleSelfUpdateCheck() {
         header('Cache-Control: no-cache, no-store, must-revalidate');
         header('Content-Type: application/json');
 
-        if (e3dcIsDockerEnvironment()) {
-            echo json_encode([
-                'success' => true,
-                'missing' => 0,
-                'skipped' => true,
-                'docker' => true,
-                'message' => e3dcDockerHostUpdateMessage(),
-                'commands' => e3dcDockerHostUpdateCommandText(),
-            ]);
-            exit;
-        }
-
+        $isDocker = e3dcIsDockerEnvironment();
         $cacheFile = '/var/www/html/ramdisk/e3dc_self_update_status.json';
         $forceCheck = isset($_GET['force']) || isset($_GET['force_check']);
         if (!$forceCheck && file_exists($cacheFile) && (time() - filemtime($cacheFile) < 14400)) {
@@ -5964,9 +6057,32 @@ function handleSelfUpdateCheck() {
             // Nach dem Start folgt deshalb wieder der normale Stable-Vergleich.
         }
         $result = e3dcStableUpdateCheck();
+        if ($isDocker) {
+            // Docker zeigt den Hinweis; ausgeführt wird der Wechsel von Watchtower
+            // oder mit den Host-Befehlen, nie vom Container selbst.
+            $result['docker'] = true;
+            $result['watchtower'] = e3dcDockerWatchtowerConfigured();
+            if (!$result['watchtower']) {
+                $result['message'] = e3dcDockerHostUpdateMessage();
+                $result['commands'] = e3dcDockerHostUpdateCommandText();
+            }
+        }
         file_put_contents($cacheFile, json_encode($result));
         @chmod($cacheFile, 0666);
         echo json_encode($result);
+        exit;
+    }
+
+    if (isset($_GET['action']) && $_GET['action'] === 'installed_version') {
+        requireWebAuth(true);
+        header('Cache-Control: no-cache, no-store, must-revalidate');
+        header('Content-Type: application/json');
+        $version = readInstalledVersion();
+        echo json_encode([
+            'success' => $version !== '',
+            'version' => $version,
+            'docker' => e3dcIsDockerEnvironment(),
+        ]);
         exit;
     }
 }
@@ -6223,12 +6339,15 @@ function e3dcStartCanonicalWebUpdateJob(
         ? (string)$purpose
         : 'update';
     if (e3dcIsDockerEnvironment()) {
-        return [
-            'success' => false,
-            'docker' => true,
-            'message' => e3dcDockerHostUpdateMessage(),
-            'commands' => e3dcDockerHostUpdateCommandText(),
-        ];
+        if ($purpose !== 'update') {
+            return [
+                'success' => false,
+                'docker' => true,
+                'message' => "Die Systemreparatur gibt es im Docker-Betrieb nicht: Produktdateien und Rechte kommen unverändert aus dem Image. Bei Problemen den Container neu erstellen:\n\n" . e3dcDockerHostUpdateCommandText(),
+                'commands' => e3dcDockerHostUpdateCommandText(),
+            ];
+        }
+        return e3dcDockerTriggerWatchtowerUpdate();
     }
     $launcherInspection = e3dcInspectWebUpdateLauncher();
     if (empty($launcherInspection['ok'])) {
@@ -6762,7 +6881,7 @@ function e3dcRunServiceWrapperAction($action, array $services) {
             'success' => false,
             'changed' => [],
             'ignored' => [],
-            'errors' => ['Unzulaessige Dienstaktion: ' . $action],
+            'errors' => ['Unzulässige Dienstaktion: ' . $action],
         ];
     }
 
@@ -6772,7 +6891,7 @@ function e3dcRunServiceWrapperAction($action, array $services) {
             'success' => false,
             'changed' => [],
             'ignored' => [],
-            'errors' => ['Service-Wrapper nicht gefunden. Bitte Rechte-Reparatur ausfuehren.'],
+            'errors' => ['Service-Wrapper nicht gefunden. Bitte Rechte-Reparatur ausführen.'],
         ];
     }
 
@@ -7691,7 +7810,7 @@ function handleWatchdogStatus() {
         $isDocker = file_exists('/.dockerenv');
         $isLux = (isset($c['luxtronik']) && in_array(strtolower(trim($c['luxtronik'])), ['1', 'true']));
         $isEM = $isLux || (isset($c['auto_mode']) && in_array(strtolower(trim($c['auto_mode'])), ['1', 'true'])) || (isset($c['morning_boost_enable']) && in_array(strtolower(trim($c['morning_boost_enable'])), ['1', 'true']));
-        $isBlue = !empty($c['bluelink_refresh_token']);
+        $isBlue = !empty($c['bluelink_user']);
         $isMqtt = !empty($c['mqtt_hub_ip']) && $c['mqtt_hub_ip'] !== '0.0.0.0';
         $isHa = (isset($c['ha_mode']) && !in_array(strtolower(trim($c['ha_mode'])), ['off', '']));
 
@@ -7971,7 +8090,7 @@ function renderDiagnoseModal($dialogClass = 'modal-lg modal-dialog-scrollable') 
     $isDocker = file_exists('/.dockerenv');
     $isLux = (isset($c['luxtronik']) && in_array(strtolower(trim($c['luxtronik'])), ['1', 'true']));
     $isEM = $isLux || (isset($c['auto_mode']) && in_array(strtolower(trim($c['auto_mode'])), ['1', 'true'])) || (isset($c['morning_boost_enable']) && in_array(strtolower(trim($c['morning_boost_enable'])), ['1', 'true']));
-    $isBlue = !empty($c['bluelink_refresh_token']);
+    $isBlue = !empty($c['bluelink_user']);
     $isMqtt = !empty($c['mqtt_hub_ip']) && $c['mqtt_hub_ip'] !== '0.0.0.0';
     $isHa = (isset($c['ha_mode']) && !in_array(strtolower(trim($c['ha_mode'])), ['off', '']));
 

@@ -538,7 +538,14 @@ function installCenterModuleConfigFields($moduleKey) {
             installCenterConfigField('matter_bridge', 'Matter Bridge aktivieren', 'select', $bool),
         ],
         'bluelink' => [
-            installCenterConfigField('bluelink_refresh_token', 'Refresh Token', 'password', [], 'Leer lassen = unverändert.', true),
+            // Benutzer/Passwort-Login statt Refresh-Token.
+            installCenterConfigField('bluelink_user', 'Benutzer (E-Mail)', 'text', [], 'E-Mail des Hyundai/Kia-Kontos.'),
+            installCenterConfigField('bluelink_password', 'Passwort', 'password', [], 'Leer lassen = unverändert.', true),
+            installCenterConfigField('bluelink_pin', 'PIN (optional)', 'password', [], 'Nur Ziffern; leer lassen = unverändert.', true),
+            installCenterConfigField('bluelink_brand', 'Marke', 'select', [
+                ['value' => 'hyundai', 'label' => 'Hyundai (Bluelink)'],
+                ['value' => 'kia', 'label' => 'Kia (Kia Connect)'],
+            ]),
             installCenterConfigField('bluelink_vin', 'VIN'),
             installCenterConfigField('bluelink_car_name', 'Fahrzeugname'),
             installCenterConfigField('bluelink_interval', 'Intervall (Min)', 'number', [], '', false, '15'),
@@ -917,8 +924,8 @@ function installCenterIsPseudonymousDiagnosticKey($key) {
 
 function installCenterIsSensitiveConfigKey($key) {
     $key = (string)$key;
-    if (preg_match('/(password|passwort|pwd|(?:^|[_-])pass(?:$|[_-])|(?:^|[_-])pw(?:$|[_-])|token|secret|api.?key|apikey|credential|auth)/iu', $key) === 1) {
-        return true;
+    if (preg_match('/(password|passwort|pwd|(?:^|[_-])pass(?:$|[_-])|(?:^|[_-])pw(?:$|[_-])|token|secret|api.?key|apikey|credential|auth|bluelink_pin|bluelink_user)/iu', $key) === 1) {
+        return true; // Bluelink-PIN und Konto (E-Mail) redigiert
     }
     return preg_match('/(password|passwort|pwd|token|secret|api.?key|apikey|mail|email|chat.?id|latitude|longitude|breitengrad|laenge|länge|laengengrad|längengrad|^lat$|^lon$|^lng$|^long$|height|hoehe|höhe|elevation|altitude)/iu', (string)$key) === 1;
 }
@@ -1037,7 +1044,7 @@ $message = 'Aktuelle Ramdisk-Prognose fehlt, ein Warmstart-Cache ist vorhanden. 
         'database' => installCenterFileMeta($dbPath),
         'ml_training_data_rows' => $trainingRows,
         'daily_stats_rows' => $dailyRows,
-        'note' => 'ml_prediction.json ist Ramdisk/Warmstart. Das persistente Modell liegt ausserhalb des Webzugriffs und wird hier weder gelesen noch offengelegt.',
+        'note' => 'ml_prediction.json ist Ramdisk/Warmstart. Das persistente Modell liegt außerhalb des Webzugriffs und wird hier weder gelesen noch offengelegt.',
     ];
 }
 
@@ -2389,6 +2396,7 @@ function installCenterDiagnosticCandidates() {
         'wallbox_storage_intent.json',
         'energy_decision_latest.json',
         'wallbox_decision_latest.json',
+        'wallbox_transaction_errors.jsonl',
         'config_validation.json',
         'mqtt_ha_inbound.json',
         'external_wb.json',
@@ -2540,6 +2548,7 @@ function installCenterDiagnosticPresets($items) {
         'ramdisk:storage_decision_latest.json',
         'ramdisk:ems_decision_latest.json',
         'ramdisk:wallbox_decision_latest.json',
+        'ramdisk:wallbox_transaction_errors.jsonl',
         'log:e3dc_live.log',
         'log:storage_manager.log',
         'log:wallbox_manager.log',
@@ -5643,6 +5652,10 @@ function renderPermissionsResult(data, action) {
     const repairableCount = Number(data.runtime_repairable_issue_count || 0);
     const systemRepairCount = Number(data.system_repair_required_count || 0);
     const repairAvailable = Boolean(data.repair_available);
+    // Docker-Rechte: im Container setzt der Startvorgang die Rechte; kein Rechte-Launcher, kein Systemabgleich.
+    const containerModel = data.expectation_model === 'container' || data.docker === true;
+    const containerRestartCount = Number(data.container_restart_issue_count || 0);
+    const imageRequiredCount = Number(data.image_required_issue_count || 0);
     const rows = checks.map(item => {
         const isOk = item.ok;
         const repairClass = item.repair_class || '';
@@ -5652,7 +5665,11 @@ function renderPermissionsResult(data, action) {
                 ? ' <span class="badge text-bg-info">Reparierbar</span>'
                 : repairClass === 'system_repair_required'
                     ? ' <span class="badge text-bg-warning">Systemabgleich</span>'
-                    : ' <span class="badge text-bg-secondary">Nur melden</span>';
+                    : repairClass === 'container_restart'
+                        ? ' <span class="badge text-bg-info">Containerstart</span>'
+                        : repairClass === 'image_required'
+                            ? ' <span class="badge text-bg-warning">Image prüfen</span>'
+                            : ' <span class="badge text-bg-secondary">Nur melden</span>';
         return `<li>${boolBadge(isOk, 'OK', 'Prüfen', true)}${classBadge} <span class="small-code">${esc(item.path)}</span>${item.issue ? ` <span class="text-secondary">- ${esc(item.issue)}</span>` : ''}</li>`;
     }).join('');
     const stepItems = steps.map(step => `<li>${esc(step)}</li>`).join('');
@@ -5662,20 +5679,26 @@ function renderPermissionsResult(data, action) {
     const instruction = data.repair_instruction || data.repair_message || '';
     const repairButton = repairableCount > 0 && repairAvailable
         ? `<div class="mt-3"><button class="btn btn-warning rounded-pill" type="button" onclick="runRuntimePermissionsRepair()"><i class="fas fa-screwdriver-wrench me-1"></i> Rechte reparieren</button><div class="text-secondary small mt-2">Releasegleiche Einträge werden sofort repariert. Lokal geänderte Dateien werden vollständig angezeigt und erst nach Deiner exakten Bestätigung berücksichtigt; ihr Inhalt bleibt unverändert.</div></div>`
+        : containerModel && (containerRestartCount > 0 || imageRequiredCount > 0)
+            ? `<div class="warn mt-3">Im Container setzt der Startvorgang die Rechte der Laufzeitpfade; einen Rechte-Launcher gibt es dort nicht. Bitte den Container auf dem Docker-Host neu starten und danach erneut prüfen. Befunde am Produktbaum oder Laufzeitkonto erfordern ein neues Image.</div>`
         : repairableCount > 0
             ? `<div class="warn mt-3">Der enge Rechte-Launcher ist noch nicht sicher installiert. Bis dahin bleibt der Konsolen- oder vollständige Systemweg erforderlich.</div>`
             : '';
+    const repairTiles = containerModel
+        ? `<div class="result-tile"><strong>Containerstart</strong>${boolBadge(containerRestartCount === 0, 'nicht nötig', containerRestartCount + ' Befund(e)', true)}<div class="text-secondary mt-1">Der Startvorgang setzt die Rechte der Laufzeitpfade</div></div>
+            <div class="result-tile"><strong>Image prüfen</strong>${boolBadge(imageRequiredCount === 0, 'nicht nötig', imageRequiredCount + ' Befund(e)', true)}<div class="text-secondary mt-1">Produktbaum und Laufzeitkonto bleiben root-kontrolliert</div></div>`
+        : `<div class="result-tile"><strong>Reine Rechtereparatur</strong>${boolBadge(repairAvailable, 'verfügbar', 'nicht verfügbar', true)}<div class="text-secondary mt-1">${esc(repairableCount + ' reparierbare Befund(e)')}</div></div>
+            <div class="result-tile"><strong>Vollständiger Systemabgleich</strong>${boolBadge(systemRepairCount === 0, 'nicht nötig', systemRepairCount + ' Befund(e)', true)}<div class="text-secondary mt-1">Bleibt als getrennte Aktion erhalten</div></div>`;
     return `
         <div class="result-title"><i class="fas ${ok ? 'fa-circle-check ok' : 'fa-triangle-exclamation warn'}"></i>${esc(title)}</div>
         <div class="text-secondary small">${esc(data.summary || 'Prüfung abgeschlossen.')}</div>
         <div class="result-grid">
             <div class="result-tile"><strong>Ergebnis</strong>${boolBadge(ok, 'alles OK', issueCount + ' Hinweis(e)', true)}</div>
-            <div class="result-tile"><strong>Reine Rechtereparatur</strong>${boolBadge(repairAvailable, 'verfügbar', 'nicht verfügbar', true)}<div class="text-secondary mt-1">${esc(repairableCount + ' reparierbare Befund(e)')}</div></div>
-            <div class="result-tile"><strong>Vollständiger Systemabgleich</strong>${boolBadge(systemRepairCount === 0, 'nicht nötig', systemRepairCount + ' Befund(e)', true)}<div class="text-secondary mt-1">Bleibt als getrennte Aktion erhalten</div></div>
+            ${repairTiles}
             <div class="result-tile"><strong>Installationspfad</strong><div class="text-secondary mt-1 small-code">${esc(installPath || 'nicht erkannt')}</div></div>
         </div>
         ${repairButton}
-        ${repairCommand ? `<details class="mt-3"><summary><strong>Konsolen-Rückfallweg für reine Rechte</strong></summary><div class="text-secondary small mt-1">${esc(instruction)}</div><pre class="raw-json mt-2">${esc(repairCommand)}</pre></details>` : ''}
+        ${repairCommand ? `<details class="mt-3"><summary><strong>${containerModel ? 'Neustart auf dem Docker-Host' : 'Konsolen-Rückfallweg für reine Rechte'}</strong></summary><div class="text-secondary small mt-1">${esc(instruction)}</div><pre class="raw-json mt-2">${esc(repairCommand)}</pre></details>` : ''}
         ${systemRepairCommand ? `<details class="mt-2"><summary><strong>Vollständiger Systemabgleich</strong></summary><div class="text-secondary small mt-1">Nur für fehlende oder unsichere Dateien beziehungsweise einen gewünschten Stable-Abgleich; mit Backup und Dienstneustart.</div><pre class="raw-json mt-2">${esc(systemRepairCommand)}</pre></details>` : ''}
         ${stepItems ? `<div><strong>Geplanter Ablauf</strong><ul class="result-list">${stepItems}</ul></div>` : ''}
         ${rows ? `<div class="mt-2"><strong>Geprüfte Pfade</strong><ul class="result-list">${rows}</ul></div>` : ''}

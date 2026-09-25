@@ -31,12 +31,16 @@ STATE_CHARGING = "charging"
 STATE_PHASE_WAIT = "phase_wait"
 STATE_STOPPING = "stopping"
 STATE_ENDED = "ended"
+STATE_START_RETRY = "start_retry"
 
 CONTRACT_NAME = "openwb_pro_connect_php_level_state"
 MANAGER_WAKEUP_DISCONNECT_MAX_LAG_S = 30.0
 RELEASABLE_ZERO_ANCHOR_REASONS = frozenset({
     "openwb_pro_curve_direct_zero",
     "openwb_pro_curve_direct_main_zero",
+    # 0 A nach T_HOLD ohne PV-Budget im Startfenster ist ein
+    # lösbarer Anker – Budget derselben Stecksession erlaubt das Wiederangebot.
+    "openwb_pro_start_window_zero_budget_off",
     # Beide Gründe sind vorübergehende Policy-Ergebnisse. Ein später wieder
     # positives, ausführbares Budget derselben Stecksession muss den Start
     # erneut erlauben; Nutzer-Aus und Safety-Gates werden separat geprüft.
@@ -127,6 +131,7 @@ _STATE_LABELS = {
     STATE_PHASE_WAIT: ("Phasenwechsel", "warning"),
     STATE_STOPPING: ("Stoppt", "warning"),
     STATE_ENDED: ("Ladung beendet", "secondary"),
+    STATE_START_RETRY: ("Start abgelehnt – Wiederholung", "warning"),
 }
 
 
@@ -340,6 +345,170 @@ def phase_cp_interrupt_duration_s(config: Optional[Dict[str, Any]] = None) -> fl
 def start_wakeup_delay_s(config: Optional[Dict[str, Any]] = None) -> float:
     cfg = config or {}
     return max(0.0, _safe_float(cfg.get("openwb_pro_start_wakeup_delay_s", 5), 5.0))
+
+
+START_CP_GRACE_DEFAULT_S = 60.0
+
+# Startfenster der openWB Pro – Konstanten.
+START_WINDOW_SCHEMA = "openwb_pro_start_window_v1"
+START_CP_GRACE_MIN_S = 60.0
+START_WINDOW_HOLD_DEFAULT_S = 180.0
+START_WINDOW_HOLD_MIN_S = 60.0
+START_WINDOW_HOLD_MAX_S = 600.0
+START_WINDOW_RETRY_CYCLE_DEFAULT_S = 300.0
+START_WINDOW_RETRY_CYCLE_MIN_S = 180.0
+START_WINDOW_RETRY_CYCLE_MAX_S = 1200.0
+START_WINDOW_READBACK_TIMEOUT_S = 20.0
+START_WINDOW_REEMIT_MAX = 2
+START_WINDOW_UNRESPONSIVE_PAUSE_S = 60.0
+START_WINDOW_RAISE_DELAY_S = 30.0
+START_WINDOW_CONFIRM_FRAMES = 2
+START_WINDOW_CONFIRM_POWER_W = 500.0
+START_WINDOW_CONFIRM_ENERGY_WH = 5.0
+START_WINDOW_CP_POWER_MAX_W = 100.0
+START_WINDOW_CP_SETTLE_MIN_S = 15.0
+START_WINDOW_PHASETARGET_QUIET_S = 60.0
+START_WINDOW_OFFER_LOST_FRAMES = 2
+START_WINDOW_STATUS_FRESH_S = 10.0
+START_WINDOW_STALE_ABORT_FRAMES = 2
+# Übernahme eines stehenden Angebots nur bis
+# clamp (keine +2-A-Toleranz mehr) – darüber Startbefehl clamp bzw. regulating.
+START_WINDOW_ADOPT_TOLERANCE_A = 0.0
+START_WINDOW_CYCLES_MAX = 3
+START_WINDOW_HLC_FACTOR = 2.0
+START_WINDOW_BUDGET_COHERENCE_FRAMES = 2
+START_WINDOW_DISCONNECT_FRAMES = 2
+START_WINDOW_GAP_RESET_S = 300.0
+START_WINDOW_BASIC_SIGNALING = ("basic", "basic iec61851")
+START_WINDOW_STATE_INACTIVE = "inactive"
+START_WINDOW_STATE_BUDGET_WAIT = "budget_wait"
+START_WINDOW_STATE_OFFER_PENDING = "offer_pending"
+START_WINDOW_STATE_BOX_UNRESPONSIVE = "box_unresponsive"
+START_WINDOW_STATE_OFFER_FROZEN = "offer_frozen"
+START_WINDOW_STATE_CHARGING_CONFIRMED = "charging_confirmed"
+START_WINDOW_STATE_REGULATING = "regulating"
+START_WINDOW_STATE_RETRY_WAIT = "retry_wait"
+START_WINDOW_STATE_EXHAUSTED = "exhausted"
+START_WINDOW_STATE_OFF_NO_BUDGET = "off_no_budget"
+START_WINDOW_STATE_ABORTED_HARD = "aborted_hard"
+START_WINDOW_ENFORCING_STATES = frozenset({
+    START_WINDOW_STATE_BUDGET_WAIT,
+    START_WINDOW_STATE_OFFER_PENDING,
+    START_WINDOW_STATE_BOX_UNRESPONSIVE,
+    START_WINDOW_STATE_OFFER_FROZEN,
+    START_WINDOW_STATE_CHARGING_CONFIRMED,
+    START_WINDOW_STATE_RETRY_WAIT,
+    START_WINDOW_STATE_EXHAUSTED,
+    START_WINDOW_STATE_OFF_NO_BUDGET,
+})
+START_WINDOW_FREEZE_STATES = frozenset({
+    START_WINDOW_STATE_OFFER_PENDING,
+    START_WINDOW_STATE_BOX_UNRESPONSIVE,
+    START_WINDOW_STATE_OFFER_FROZEN,
+    START_WINDOW_STATE_RETRY_WAIT,
+    START_WINDOW_STATE_EXHAUSTED,
+})
+START_WINDOW_SETPOINT_STATES = frozenset({
+    START_WINDOW_STATE_OFFER_PENDING,
+    START_WINDOW_STATE_OFFER_FROZEN,
+    START_WINDOW_STATE_CHARGING_CONFIRMED,
+    START_WINDOW_STATE_RETRY_WAIT,
+    START_WINDOW_STATE_EXHAUSTED,
+})
+START_WINDOW_ZERO_STATES = frozenset({
+    START_WINDOW_STATE_OFF_NO_BUDGET,
+    START_WINDOW_STATE_ABORTED_HARD,
+})
+START_WINDOW_NO_BUDGET_CLOCK_STATES = frozenset({
+    START_WINDOW_STATE_BUDGET_WAIT,
+    START_WINDOW_STATE_OFFER_FROZEN,
+    START_WINDOW_STATE_RETRY_WAIT,
+    START_WINDOW_STATE_EXHAUSTED,
+})
+# charging_confirmed führt eine eigene
+# Nullbudget-Uhr (0 A nach 60 s ohne Budget, openWB-Abschaltverzögerung) und
+# einen Wh-Deckel (100 Wh Netzbezug innerhalb derselben Nullbudget-Episode;
+# Zuwachs nur in Frames ohne Budget, ein Budgetframe setzt
+# Uhr und Wh zurück). Beides gibt 0 A nur frei (zero_allowed); gesendet wird
+# es vom bestehenden Nullbudget-Pfad.
+START_WINDOW_CONFIRMED_ZERO_BUDGET_S = 60.0
+START_WINDOW_CONFIRMED_GRID_IMPORT_MAX_WH = 100.0
+START_WINDOW_GRID_INTEGRATION_MAX_DT_S = 30.0
+# Re-Arm aus regulating/charging_confirmed nur
+# nach einem eigenen 0 A des Managers (Beleg: letzter 0-A-Strombefehl der
+# Stecksession, Eingang last_zero_reason). Das 0 A der Phasensequenz bzw. der
+# Phasenwartezeit gehört zu dieser Grundfamilie und zählt nicht; ohne Beleg
+# (box-seitiger Abfall) bleibt der Zustand stehen.
+START_WINDOW_SEQUENCE_ZERO_REASON_PREFIXES = (
+    "openwb_pro_phase_",
+)
+# Typisierte Ausnahme – Absenkung auf den Mindeststrom unter
+# Nullbudget bei bestätigter Ladung im Startfenster (nie Anhebung, nie 0 A).
+MINIMUM_HOLD_REDUCTION_SCHEMA = "openwb_pro_minimum_hold_reduction_v1"
+MINIMUM_HOLD_REDUCTION_REASON = "minimum_hold_reduction"
+# Zustände vor dem eigenen bestätigten Angebot.
+# Eine dort bereits laufende Ladung (2 Frames > 500 W bei stehendem Box-Angebot,
+# z. B. nach Neustart/Force-Start/Lücke > 300 s) wird übernommen; Absenkungen ≥ 6 A
+# sind sofort erlaubt (Netzbezug statt Deadlock), 0 A bleibt gesperrt.
+START_WINDOW_PRE_OFFER_STATES = frozenset({
+    START_WINDOW_STATE_BUDGET_WAIT,
+    START_WINDOW_STATE_OFFER_PENDING,
+    START_WINDOW_STATE_BOX_UNRESPONSIVE,
+})
+# Weiche EMS-Stoppgründe („halten“): Budget-, Prioritäts-, Pre-Dump-,
+# wbminSoC- und Zuteilungsstopps schreiben im Startfenster kein 0 A. Jeder andere
+# Grund (Pause, Sperre, Notaus, Nutzer-Aus, Trennung, Hausanschluss, Slot-Ende,
+# Ladeende, start_rejected, unbekannt) gilt als hart – fail-closed.
+START_WINDOW_SOFT_STOP_REASON_PREFIXES = (
+    "openwb_pro_curve_direct",
+    "openwb_pro_start_window_zero_budget_off",
+    "zero_budget",
+    "storage_charge_reserve",
+    "min_current_import_integral",
+    "priority_",
+    "wbminsoc_",
+    "predump_",
+    "hold_target_below_minimum",
+    "group_deficit",
+    "native_battery_drain_zero_budget",
+    "battery_departure_floor",
+)
+
+
+def start_window_stop_reason_is_soft(reason: Any) -> bool:
+    """Weicher EMS-Stoppgrund (im Startfenster halten) – Präfixvergleich, sonst hart."""
+
+    text = str(reason or "").strip().lower()
+    if not text:
+        return False
+    return any(text.startswith(prefix) for prefix in START_WINDOW_SOFT_STOP_REASON_PREFIXES)
+
+
+def start_cp_grace_s(
+    config: Optional[Dict[str, Any]] = None,
+    cp_capability: Optional[Dict[str, Any]] = None,
+) -> float:
+    """Karenz vor dem ersten Start-CP-Impuls einer Stecksession.
+
+    Ein per Anlagenfreigabe (``on``) aktivierter Impuls folgt nicht sofort dem
+    ersten Stromangebot: Ein normal startendes Fahrzeug zieht innerhalb von
+    10-30 s Strom und wird nicht unterbrochen. Erst wenn nach der Karenz noch
+    keine Ladung läuft, kommt der begrenzte Impuls (evcc-Verhalten; etwa ein
+    Fahrzeug, das nach einem 0-A-Schnitt ein Angebot nicht annimmt und erst
+    durch den Impuls aufwacht). Ein explizites Fahrzeugprofil, das den Impuls zum Start
+    verlangt, behält den sofortigen Impuls (Karenz 0).
+    """
+
+    cfg = config if isinstance(config, dict) else {}
+    capability = cp_capability if isinstance(cp_capability, dict) else {}
+    # Ein CP-Impuls wenige Sekunden nach dem Start bringt die Ladung nicht sicher in Gang:
+    # ein Fahrzeugprofil mit Impulsbedarf erlaubt den Impuls, verkürzt die
+    # Karenz aber nie unter START_CP_GRACE_MIN_S (evcc 30 s, hier 60 s).
+    capability.get("automatic_profile_capability")  # nur „Impuls erlaubt“, keine Karenz 0
+    return max(
+        START_CP_GRACE_MIN_S,
+        min(600.0, _safe_float(cfg.get("openwb_pro_start_cp_grace_s"), START_CP_GRACE_DEFAULT_S)),
+    )
 
 
 def start_disconnect_reset_s(config: Optional[Dict[str, Any]] = None) -> float:
@@ -1888,8 +2057,15 @@ def start_wakeup_step_contract(
     *,
     now_ts: Any = 0,
     cp_payload: Optional[Dict[str, Any]] = None,
+    cp_source: str = "",
+    window: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Liefert die begrenzten Wake-up-Schritte je Stecksession.
+
+    Ein CP-Impuls ersetzt nie einen Strombefehl. Nur der
+    Wake-up-Tick (``cp_source="wakeup_tick"``) darf ``send_cp_interrupt``
+    erhalten, und nur wenn das Startfenster ihn als fällig meldet
+    (``window["cp_due"]``); jeder andere Aufrufer bekommt ``allow_without_cp``.
 
     Der erste positive Sollstrom wird immer zuerst gesendet. Benötigt das
     wirksame Fahrzeugprofil eine CP-Unterbrechung, folgt der erste kurze
@@ -1906,7 +2082,8 @@ def start_wakeup_step_contract(
     method_text = str(method or "").strip()
     amp_value = _safe_float(amp, 0.0)
     delay_s = start_wakeup_delay_s(cfg)
-    retry_s = max(30.0, _safe_float(cfg.get("wb_openwb_start_retry_s"), 45.0))
+    # Untergrenze 60 s; die Wiederholung bestimmt der Zyklus des Startfensters.
+    retry_s = max(60.0, _safe_float(cfg.get("wb_openwb_start_retry_s"), 45.0))
     plug_session_id = str(data.get("_openwb_pro_plug_session_id") or "")
     issued_session_id = str(data.get("_openwb_pro_start_current_session_id") or "")
     issued_ts = _safe_float(data.get("_openwb_pro_start_current_issued_ts"), 0.0)
@@ -1930,6 +2107,7 @@ def start_wakeup_step_contract(
         st,
         is_openwb_pro=True,
     )
+    grace_s = start_cp_grace_s(cfg, cp_capability)
     base = {
         "contract": "openwb_pro_start_wakeup_step_v1",
         "action": "allow",
@@ -1940,6 +2118,7 @@ def start_wakeup_step_contract(
         "state_patch": {},
         "success_state_patch": {},
         "delay_s": float(delay_s),
+        "grace_s": float(grace_s),
         "retry_s": float(retry_s),
         "max_retries": int(max_retries),
         "sent_count": int(sent_count),
@@ -2123,6 +2302,16 @@ def start_wakeup_step_contract(
             "reason": "bounded_cp_retry_interval",
             "command_patch": {**command_patch, "_guard_allow_restart_after_stop": True},
         }
+    if sent_count == 0 and grace_s > 0.0 and now_value - issued_ts < grace_s:
+        # Karenz: das erste Angebot darf ohne Unterbrechung zum Start führen;
+        # der Impuls kommt erst, wenn danach noch keine Ladung läuft.
+        return {
+            **base,
+            "action": "allow_within_start_grace",
+            "reason": "start_cp_grace_active",
+            "grace_remaining_s": round(max(0.0, grace_s - (now_value - issued_ts)), 1),
+            "command_patch": command_patch,
+        }
 
     cp_state = st.get("cp_interrupt_isactive")
     cp_active = bool(
@@ -2155,6 +2344,25 @@ def start_wakeup_step_contract(
             "state_patch": {
                 "_openwb_pro_start_wakeup_pending": False,
             },
+        }
+
+    if str(cp_source or "") != "wakeup_tick":
+        # Der Strombefehl geht immer raus; der Impuls
+        # kommt ausschließlich aus dem Wake-up-Tick.
+        return {
+            **base,
+            "action": "allow_without_cp",
+            "allow": True,
+            "reason": "cp_only_from_wakeup_tick",
+            "command_patch": command_patch,
+        }
+    if window is not None and not bool((window or {}).get("cp_due", False)):
+        return {
+            **base,
+            "action": "allow_without_cp",
+            "allow": True,
+            "reason": "start_window_cp_not_due",
+            "command_patch": command_patch,
         }
 
     payload = cp_payload if isinstance(cp_payload, dict) else {}
@@ -2199,6 +2407,7 @@ def vehicle_finished_drop_contract(
     startup_grace_s: Any = 90,
     min_amp: Any = 6,
     had_confirmed_charge: Optional[bool] = None,
+    observed_charge_in_run: bool = False,
     observe_only: bool = False,
     openwb_mode9_monitor: bool = False,
     stop_sent_active: bool = False,
@@ -2260,7 +2469,7 @@ def vehicle_finished_drop_contract(
         and previous.get("confirmed") is not True
     )
     manager_session_active = bool(
-        is_manager_charging or pending_same_session
+        is_manager_charging or pending_same_session or observed_charge_in_run
     )
     sample_ts = max(
         _safe_float(st.get("driver_status_last_sample_ts"), 0.0),
@@ -2286,7 +2495,10 @@ def vehicle_finished_drop_contract(
         blockers.append("status_not_fresh")
     if real_charging:
         blockers.append("real_charge_still_active")
-    if time_since_start <= grace_s:
+    # Nach tatsächlich gemessener Ladung kann die ruhige Drop-Prüfung schon
+    # während der Startfrist beginnen. Die endgültige Bestätigung wartet
+    # weiterhin sowohl diese Frist als auch die vollständige Drop-Dauer ab.
+    if time_since_start <= grace_s and not observed_charge_in_run:
         blockers.append("startup_grace_active")
     if current_amp < min_current:
         blockers.append("no_minimum_manager_current_offer")
@@ -2332,6 +2544,7 @@ def vehicle_finished_drop_contract(
         drop_confirmed = bool(
             drop_frames >= confirm_frames
             and drop_age_s >= confirm_s
+            and time_since_start > grace_s
         )
         candidate = {
             "since_ts": float(since_ts),
@@ -2372,18 +2585,1289 @@ def vehicle_finished_drop_contract(
         "time_since_start_s": float(time_since_start),
         "startup_grace_s": float(grace_s),
         "had_confirmed_charge": bool(confirmed),
+        "observed_charge_in_run": bool(observed_charge_in_run),
         "drop_confirmed": bool(drop_confirmed),
         "drop_age_s": float(drop_age_s),
         "drop_frames": int(drop_frames),
         "required_drop_s": float(confirm_s),
         "required_drop_frames": int(confirm_frames),
-        "remaining_drop_s": max(0.0, float(confirm_s - drop_age_s)),
+        "remaining_drop_s": max(0.0, float(confirm_s - drop_age_s),
+                                grace_s - time_since_start if observed_charge_in_run else 0.0),
         "candidate": candidate,
         "state_patch": {
             "_openwb_pro_vehicle_finished_candidate": candidate or None,
         },
         "ts": float(now_value),
     }
+
+
+PARKED_FINISH_EVIDENCE_SCHEMA = "openwb_pro_parked_finish_evidence_v1"
+PARKED_FINISH_RESTORE_SCHEMA = (
+    "openwb_pro_parked_finish_evidence_restore_v1"
+)
+
+
+def parked_finish_evidence_restore_contract(
+    parked: Optional[Dict[str, Any]] = None,
+    status: Optional[Dict[str, Any]] = None,
+    *,
+    plug_session_id: Any = "",
+    zero_anchor_active: bool = False,
+    stop_sent_active: bool = False,
+    manual_pause: bool = False,
+    mode_off: bool = False,
+    locked: bool = False,
+    emergency_stop: bool = False,
+    last_manager_stop_ts: Any = 0.0,
+    now_ts: Any = 0.0,
+    max_park_s: Any = 0.0,
+    user_start_requested: bool = False,
+) -> Dict[str, Any]:
+    """Entscheidet, ob ein geparkter Ladeendebeleg wieder gelten darf.
+
+    Der Beleg ist an die Stecksession gebunden: ``max_park_s`` <= 0 bedeutet
+    keine Zeitgrenze. Ein ausdrücklicher Nutzerstart derselben Session
+    verwirft ihn ebenso wie neues Abstecken.
+
+    Ein temporärer Budget-Nullanker ist kein Beleg gegen ein bereits
+    beobachtetes Fahrzeug-Ladeende. Er ist aber auch keine Bestätigung: Solange
+    der Manager selbst 0 A anbietet, beweist ein ausbleibender Wiederstart
+    nichts. Der Beleg wird deshalb geparkt und erst wieder gültig, wenn der
+    Anker gelöst ist, dieselbe Stecksession weiterläuft und keine
+    widersprechende Evidenz vorliegt.
+
+    Der Vertrag verkürzt keine Frist. Er liefert ``resume_shift_s``, um die
+    Drop-Uhr genau um die Parkdauer nach vorn zu schieben; die Bestätigung
+    braucht danach unverändert ihre vollen Frames und Sekunden aus Proben mit
+    tatsächlichem Mindestangebot. Nutzer-Aus, Nutzerpause, Sperre, Notaus, ein
+    gesendeter Stopp, ein neuer Managerstopp nach dem Parken, eine fremde
+    Stecksession, reale Ladung, eine CP-Unterbrechung sowie fehlende oder
+    unfrische Statusevidenz verwerfen den Beleg.
+    """
+
+    item = parked if isinstance(parked, dict) else {}
+    st = status if isinstance(status, dict) else {}
+    session_id = str(plug_session_id or "")
+    now_value = _safe_float(now_ts, 0.0)
+    parked_since = _safe_float(item.get("parked_since_ts"), 0.0)
+    park_limit_s = max(0.0, _safe_float(max_park_s, 0.0))
+    result = {
+        "contract": PARKED_FINISH_RESTORE_SCHEMA,
+        "restore": False,
+        "discard": False,
+        "reason": "no_parked_evidence",
+        "resume_shift_s": 0.0,
+        "parked_s": 0.0,
+        "plug_session_id": session_id,
+    }
+    if not item or item.get("contract") != PARKED_FINISH_EVIDENCE_SCHEMA:
+        return result
+    parked_s = max(0.0, now_value - parked_since)
+    result["parked_s"] = parked_s
+
+    def discard(reason: str) -> Dict[str, Any]:
+        result["discard"] = True
+        result["reason"] = reason
+        return result
+
+    if not session_id or str(item.get("plug_session_id") or "") != session_id:
+        return discard("foreign_plug_session")
+    if item.get("reason_code") not in RELEASABLE_ZERO_ANCHOR_REASONS:
+        return discard("anchor_not_releasable")
+    if parked_since <= 0.0 or now_value <= 0.0:
+        return discard("parked_timebase_missing")
+    if bool(user_start_requested):
+        return discard("user_start_request")
+    if park_limit_s > 0.0 and parked_s > park_limit_s:
+        return discard("parked_too_long")
+    if bool(manual_pause) or bool(mode_off) or bool(locked) or bool(emergency_stop):
+        return discard("user_or_safety_state")
+    if bool(stop_sent_active):
+        return discard("manager_stop_active")
+    if _safe_float(last_manager_stop_ts, 0.0) > parked_since + 1e-6:
+        return discard("newer_manager_stop")
+    if not status_connected(st):
+        return discard("vehicle_not_connected")
+    if status_real_charging(st) or status_real_power(st) > 500.0:
+        return discard("real_charge_resumed")
+    if bool(st.get("cp_interrupt_isactive", False)):
+        return discard("cp_interrupt_active")
+    if not _fresh_valid_status(st):
+        result["reason"] = "status_not_fresh"
+        return result
+    if bool(zero_anchor_active):
+        # Weiter geparkt: Der Anker haelt noch, es wird nichts bestaetigt.
+        result["reason"] = "still_parked"
+        return result
+    result["restore"] = True
+    result["reason"] = "resume_after_budget_pause"
+    result["resume_shift_s"] = parked_s
+    return result
+
+
+VEHICLE_OFFER_HOLD_SCHEMA = "openwb_pro_vehicle_offer_hold_v1"
+
+
+def vehicle_offer_hold_contract(
+    *,
+    plug_session_id: Any = "",
+    reason_code: Any = "",
+    status: Optional[Dict[str, Any]] = None,
+    offered_amp: Any = 0.0,
+    min_amp: Any = 6.0,
+    finish_candidate: bool = False,
+    charge_observation: bool = False,
+    parked_evidence: bool = False,
+    vehicle_idle: bool = False,
+    real_charge_confirmed: bool = False,
+    stop_sent_active: bool = False,
+    manual_pause: bool = False,
+    mode_off: bool = False,
+    locked: bool = False,
+    emergency_stop: bool = False,
+    explicit_stop_blocked: bool = False,
+    start_offer_age_s: Any = None,
+    start_grace_s: Any = 0.0,
+    window_active: bool = False,
+) -> Dict[str, Any]:
+    """Hält ein Mindestangebot ohne Abnahme statt eines vorübergehenden 0 A.
+
+    ``window_active`` (Startfenster der openWB Pro hält das
+    Angebot) erzwingt das Halten unabhängig von Ladeende-Evidenz;
+    Nutzer-/Sicherheitszustände und harte Kanten bleiben vorrangig.
+
+    Start-Schutzfenster: Ein frisch ausgegebenes
+    Startangebot braucht die Annahmelatenz des Fahrzeugs (typisch 10–30 s).
+    Solange ``start_offer_age_s`` unter ``start_grace_s`` liegt und das
+    Fahrzeug noch nicht zieht, gilt das Angebot ebenfalls als zu haltender
+    Bestand; ein Budget-Dip in diesen Sekunden erzeugt sonst Start/Stop.
+
+    Hintergrund: Nach einem App-Stopp des Fahrzeugs setzte die
+    Budgetkette den Rahmen des Ladepunkts auf 0 W, obwohl kein Watt mehr floss
+    und PV eingespeist wurde. Der Manager gab 0 A aus, die Ladeende-
+    Bestätigung brach ab, und das nächste Neuangebot ließ das Fahrzeug gegen
+    den Nutzerstopp wieder anlaufen.
+
+    Ein Angebot an ein nicht ziehendes Fahrzeug kostet nichts. Solange in
+    derselben Stecksession ein Ladeende geprüft wird, ein geparkter Beleg
+    vorliegt oder Bereitschaft besteht, ersetzt dieser Vertrag jeden
+    vorübergehenden Policy-Nullausgang (lösbare Ankergründe) durch das Halten
+    des bestehenden Mindestangebots. Nutzer-Aus, Nutzerpause, Sperre, Notaus,
+    harte oder explizite Stoppkanten, ein bereits gesendeter Stopp, fehlende
+    frische Statusevidenz, ein getrenntes oder real ladendes Fahrzeug und ein
+    Angebot unter Mindeststrom lassen den bisherigen Pfad unverändert.
+    """
+
+    st = status if isinstance(status, dict) else {}
+    code = str(reason_code or "")
+    minimum = max(6.0, _safe_float(min_amp, 6.0))
+    offered = _safe_float(offered_amp, 0.0)
+    result = {
+        "contract": VEHICLE_OFFER_HOLD_SCHEMA,
+        "hold": False,
+        "reason": "",
+        "reason_code": code,
+        "hold_amp": 0.0,
+        "plug_session_id": str(plug_session_id or ""),
+    }
+
+    def no_hold(reason: str) -> Dict[str, Any]:
+        result["reason"] = reason
+        return result
+
+    if not str(plug_session_id or ""):
+        return no_hold("no_plug_session")
+    if code not in RELEASABLE_ZERO_ANCHOR_REASONS:
+        return no_hold("anchor_not_releasable")
+    if bool(manual_pause) or bool(mode_off) or bool(locked) or bool(emergency_stop):
+        return no_hold("user_or_safety_state")
+    if bool(explicit_stop_blocked):
+        return no_hold("explicit_stop_blocked")
+    if bool(stop_sent_active):
+        return no_hold("manager_stop_active")
+    if not _fresh_valid_status(st):
+        return no_hold("status_not_fresh")
+    if not status_connected(st):
+        return no_hold("vehicle_not_connected")
+    if status_real_charging(st) or status_real_power(st) > 250.0:
+        return no_hold("vehicle_drawing")
+    if offered < minimum:
+        return no_hold("no_minimum_offer_to_hold")
+    vehicle_end = bool(
+        finish_candidate or charge_observation or parked_evidence
+        or vehicle_idle or real_charge_confirmed
+    )
+    grace = max(0.0, _safe_float(start_grace_s, 0.0))
+    age = _safe_float(start_offer_age_s, -1.0) if start_offer_age_s is not None else -1.0
+    start_grace = bool(grace > 0.0 and 0.0 <= age < grace)
+    if not (vehicle_end or start_grace or bool(window_active)):
+        return no_hold("no_vehicle_end_evidence")
+    result["hold"] = True
+    result["hold_amp"] = offered
+    result["reason"] = (
+        "vehicle_idle_offer_hold" if vehicle_idle
+        else "finish_confirm_offer_hold" if vehicle_end
+        else "start_window_offer_hold" if bool(window_active)
+        else "start_grace_offer_hold"
+    )
+    result["start_grace_remaining_s"] = (
+        round(grace - age, 1) if start_grace and not vehicle_end else 0.0
+    )
+    return result
+
+
+def start_window_hlc_factor(evse_signaling: Any = None) -> float:
+    """Faktor auf T_HOLD/T_CYCLE/GRACE – 1,0 nur bei reinem PWM."""
+
+    text = str(evse_signaling or "").strip().lower()
+    return 1.0 if text in START_WINDOW_BASIC_SIGNALING else float(START_WINDOW_HLC_FACTOR)
+
+
+def _start_window_bounded_cfg(cfg: Dict[str, Any], key: str, default: float, low: float, high: float) -> float:
+    raw = cfg.get(key)
+    if raw is None or isinstance(raw, bool) or str(raw).strip() == "":
+        return float(default)
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(value) or value < low or value > high:
+        return float(default)
+    return float(value)
+
+
+def start_window_hold_s(config: Optional[Dict[str, Any]] = None, evse_signaling: Any = None) -> float:
+    """T_HOLD: Fensterlänge ab Readback und Abschaltverzögerung ohne Budget (60–600 s, Standard 180)."""
+
+    cfg = config if isinstance(config, dict) else {}
+    return _start_window_bounded_cfg(
+        cfg, "openwb_pro_start_hold_s", START_WINDOW_HOLD_DEFAULT_S,
+        START_WINDOW_HOLD_MIN_S, START_WINDOW_HOLD_MAX_S,
+    ) * start_window_hlc_factor(evse_signaling)
+
+
+def start_retry_cycle_s(config: Optional[Dict[str, Any]] = None, evse_signaling: Any = None) -> float:
+    """T_CYCLE: Wiederholzyklus des Startfensters (180–1200 s, Standard 300)."""
+
+    cfg = config if isinstance(config, dict) else {}
+    return _start_window_bounded_cfg(
+        cfg, "openwb_pro_start_retry_cycle_s", START_WINDOW_RETRY_CYCLE_DEFAULT_S,
+        START_WINDOW_RETRY_CYCLE_MIN_S, START_WINDOW_RETRY_CYCLE_MAX_S,
+    ) * start_window_hlc_factor(evse_signaling)
+
+
+def start_window_cp_grace_s(config: Optional[Dict[str, Any]] = None, evse_signaling: Any = None) -> float:
+    """GRACE: Karenz ab dem bestätigten Angebot (≥ 60 s) mal HLC-Faktor."""
+
+    return start_cp_grace_s(config) * start_window_hlc_factor(evse_signaling)
+
+
+def start_offer_power_confirmed(
+    status: Optional[Dict[str, Any]],
+    prev_frame: Optional[Dict[str, Any]] = None,
+    *,
+    stable_hw_power_w: Any = 0.0,
+) -> bool:
+    """Ladeannahme nur mit Leistung, nicht mit ``charge_state`` allein.
+
+    Hintergrund: ``charge_state True`` bei 0 W löschte die
+    Startbelege und ließ 0-A-Schnitte zu. Ein Frame gilt erst mit
+    ``charge_state``/``charging`` UND > 500 W; der Aufrufer zählt zwei Frames
+    (oder ein Energiedelta > 5 Wh). ``prev_frame`` erlaubt die Zwei-Frame-
+    Prüfung direkt im Vertrag.
+    """
+
+    def _frame_ok(frame: Optional[Dict[str, Any]], extra_w: float) -> bool:
+        st = frame if isinstance(frame, dict) else {}
+        if not _fresh_valid_status(st):
+            return False
+        power_w = max(
+            _safe_float(st.get("real_power_w"), 0.0),
+            _safe_float(st.get("phase_power_sum_w"), 0.0),
+            _safe_float(st.get("power_w"), 0.0),
+            extra_w,
+        )
+        return bool((st.get("charge_state") or st.get("charging")) and power_w > START_WINDOW_CONFIRM_POWER_W)
+
+    current_ok = _frame_ok(status, _safe_float(stable_hw_power_w, 0.0))
+    if prev_frame is None:
+        return current_ok
+    return bool(current_ok and _frame_ok(prev_frame, 0.0))
+
+
+def _start_window_fresh_core(plug_session_id: Any) -> Dict[str, Any]:
+    return {
+        "schema": START_WINDOW_SCHEMA,
+        "plug_session_id": str(plug_session_id or ""),
+        "state": START_WINDOW_STATE_INACTIVE,
+        "prev_state": "",
+        "anchor_ts": 0.0,
+        "offer_amp": 0.0,
+        "box_offer_amp": 0.0,
+        "command_ts": 0.0,
+        "command_amp": 0.0,
+        "command_seen_ts": 0.0,
+        "reemit_count": 0,
+        "unresponsive_until": 0.0,
+        "cycle": 0,
+        "cycle_anchor_ts": 0.0,
+        "retry_due_ts": 0.0,
+        "cp_in_cycle": 0,
+        "cp_count_session": 0,
+        "cp_settle_until": 0.0,
+        "no_budget_since": 0.0,
+        "confirmed_no_budget_since": 0.0,
+        "grid_import_wh_in_window": 0.0,
+        "budget_ok_frames": 0,
+        "offer_lost_frames": 0,
+        "confirm_frames": 0,
+        "stale_frames": 0,
+        "disconnect_frames": 0,
+        "energy_wh_anchor": None,
+        "last_change_ts": 0.0,
+        "charging_since_ts": 0.0,
+        "exhausted": False,
+        "zero_sent": False,
+        "slot_active": False,
+        "hlc_factor": 1.0,
+        "evse_signaling": "",
+        "reason": "",
+        "hard_edge_reason": "",
+        "hold_events": {},
+        "transition_ts": 0.0,
+        "updated_ts": 0.0,
+    }
+
+
+START_WINDOW_CORE_KEYS = tuple(_start_window_fresh_core("").keys())
+
+
+def start_window_contract(
+    previous: Optional[Dict[str, Any]],
+    *,
+    now_ts: Any,
+    config: Optional[Dict[str, Any]] = None,
+    inputs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Startfenster der openWB Pro – reiner Vertrag.
+
+    Angebot stellen, einfrieren, wiederholen – nie 0 A aus Budgetgründen.
+    Zustände: inactive → budget_wait → (Adoption eines stehenden Angebots
+    ≤ clamp ohne Befehl | Startbefehl 6 A) offer_pending → (Readback ≥ 6 A
+    = anchor_ts) offer_frozen [t_rb, t_rb+T_HOLD: kein 0 A, keine Änderung] →
+    charging_confirmed (2 Frames > 500 W; danach nur Änderungen ≥ 6 A im
+    30-s-Raster) → regulating. Fensterende ohne Ladung → retry_wait (Zyklen
+    T_CYCLE, ≤ 1 CP je Zyklus frühestens Anker+GRACE, nur bei Readback ≥ 6 A ∧
+    ¬charge_state ∧ ≤ 100 W ∧ ¬cp_active ∧ 60 s nach phasetarget) → nach 3 Zyklen
+    exhausted (Angebot bleibt, kein CP). Nullbudget: Box-Angebot T_HOLD
+    unverändert, dann 0 A lösbar (off_no_budget); Box 0 A → kein Write.
+    offer_lost (Box nullt in 2 Frames) → Wiederangebot 6 A, neuer Anker. Ohne
+    Readback nach 20 s identischer Befehl (max. 2 → box_unresponsive 60 s).
+    Harte Kanten → aborted_hard (0 A). HLC-Faktor ×2 datengetrieben aus
+    ``evse_signaling``. Keine I/O, keine Zeitabfrage; ``previous`` ist der
+    persistierte Kern derselben Stecksession.
+    """
+
+    prev = previous if isinstance(previous, dict) else {}
+    inp = inputs if isinstance(inputs, dict) else {}
+    cfg = config if isinstance(config, dict) else {}
+    now = _safe_float(now_ts, 0.0)
+    plug_session_id = str(inp.get("plug_session_id") or "")
+    evse = str(inp.get("evse_signaling") or "")
+    hlc = start_window_hlc_factor(evse)
+    t_hold = start_window_hold_s(cfg, evse)
+    t_cycle = start_retry_cycle_s(cfg, evse)
+    grace_s = start_window_cp_grace_s(cfg, evse)
+    cp_settle_s = max(start_wakeup_delay_s(cfg), START_WINDOW_CP_SETTLE_MIN_S)
+    cp_max = start_cp_retry_limit(cfg)
+
+    same_session = bool(
+        plug_session_id
+        and prev.get("schema") == START_WINDOW_SCHEMA
+        and str(prev.get("plug_session_id") or "") == plug_session_id
+    )
+    w = _start_window_fresh_core(plug_session_id)
+    if same_session:
+        for key in START_WINDOW_CORE_KEYS:
+            if key in prev:
+                w[key] = prev[key]
+        w["hold_events"] = dict(prev.get("hold_events") or {}) if isinstance(prev.get("hold_events"), dict) else {}
+        w["plug_session_id"] = plug_session_id
+
+    connected = bool(inp.get("connected", False))
+    status_fresh = bool(inp.get("status_fresh", False))
+    offered_rb = max(0.0, _safe_float(inp.get("offered_rb"), 0.0))
+    charge_state = bool(inp.get("charge_state", False))
+    power_rb = max(0.0, _safe_float(inp.get("power_rb"), 0.0))
+    energy_raw = inp.get("energy_wh")
+    energy_wh = _safe_float(energy_raw, 0.0) if energy_raw is not None else None
+    cp_active = bool(inp.get("cp_interrupt_isactive", False))
+    cp_glitch = bool(inp.get("cp_glitch", False))
+    budget_valid = inp.get("budget_valid", True) is not False
+    budget_w = _safe_float(inp.get("budget_w"), 0.0)
+    cap_amp = max(0.0, _safe_float(inp.get("cap_amp"), 0.0))
+    min_w = max(0.0, _safe_float(inp.get("min_w"), 0.0))
+    deckel_amp = _safe_float(inp.get("deckel_amp"), 0.0)
+    hard_edge_in = bool(inp.get("hard_edge", False))
+    hard_edge_reason_in = str(inp.get("hard_edge_reason") or "")
+    user_off = bool(inp.get("user_off", False))
+    soc_known = bool(inp.get("soc_known", False))
+    soc_reached = bool(inp.get("soc_reached", False))
+    last_phasetarget_ts = _safe_float(inp.get("last_phasetarget_ts"), 0.0)
+    sequence_active = bool(inp.get("phase_sequence_active", False))
+    reservation_active = bool(inp.get("reservation_active", False))
+    cp_enabled = bool(inp.get("cp_enabled", False))
+    start_blocked_by_session = bool(inp.get("start_blocked_by_session", False))
+    slot_active = bool(inp.get("slot_active", False))
+    command_ts = _safe_float(inp.get("command_ts"), 0.0)
+    command_amp = _safe_float(inp.get("command_amp"), 0.0)
+    # Netzleistung (positiv = Bezug) für den Wh-Deckel; None = kein gültiger Wert.
+    grid_raw = inp.get("grid_w")
+    grid_w = _safe_float(grid_raw, 0.0) if grid_raw is not None else None
+    # Grund des letzten eigenen 0-A-Strombefehls dieser
+    # Stecksession (Manager-Beleg); leer = kein eigenes 0 A → kein Re-Arm.
+    last_zero_reason = str(inp.get("last_zero_reason") or "").strip().lower()
+    own_zero_sent = bool(
+        last_zero_reason
+        and not last_zero_reason.startswith(START_WINDOW_SEQUENCE_ZERO_REASON_PREFIXES)
+    )
+
+    transitions = []
+
+    def goto(new_state: str, reason: str) -> None:
+        if w["state"] != new_state:
+            transitions.append((w["state"], new_state, reason))
+            w["prev_state"] = w["state"]
+            w["state"] = new_state
+            w["transition_ts"] = now
+            if new_state == START_WINDOW_STATE_CHARGING_CONFIRMED:
+                # Eigene Nullbudget-Uhr und Wh-Deckel beginnen mit der Bestätigung.
+                w["confirmed_no_budget_since"] = 0.0
+                w["grid_import_wh_in_window"] = 0.0
+        w["reason"] = reason
+
+    def note_hold(reason: str) -> None:
+        events = w["hold_events"]
+        events[reason] = int(events.get(reason, 0) or 0) + 1
+        w["reason"] = reason
+
+    def reset_offer(keep_zero_sent: bool = False) -> None:
+        w["anchor_ts"] = 0.0
+        w["offer_amp"] = 0.0
+        w["command_ts"] = 0.0
+        w["command_amp"] = 0.0
+        w["command_seen_ts"] = now
+        w["reemit_count"] = 0
+        w["confirm_frames"] = 0
+        w["offer_lost_frames"] = 0
+        w["energy_wh_anchor"] = None
+        if not keep_zero_sent:
+            w["zero_sent"] = False
+
+    state = str(w["state"] or START_WINDOW_STATE_INACTIVE)
+
+    # Lücke ohne Bewertung (Modus Aus/Pause ohne Markierung, Regelstillstand > 300 s):
+    # Angebotsphasen beginnen neu ab budget_wait (Zähler bleiben), eine bestätigte
+    # Ladung gilt als reguliert. Ein Manager-Neustart innerhalb der Frist setzt
+    # den Fensterrest aus anchor_ts fort.
+    updated_ts = _safe_float(w.get("updated_ts"), 0.0)
+    if state in START_WINDOW_ENFORCING_STATES and updated_ts > 0.0 and now - updated_ts > START_WINDOW_GAP_RESET_S:
+        if state == START_WINDOW_STATE_CHARGING_CONFIRMED:
+            goto(START_WINDOW_STATE_REGULATING, "window_gap_regulating")
+        else:
+            goto(START_WINDOW_STATE_BUDGET_WAIT, "window_gap_reset")
+            reset_offer()
+        w["stale_frames"] = 0
+        w["disconnect_frames"] = 0
+        w["budget_ok_frames"] = 0
+        w["no_budget_since"] = 0.0
+        state = w["state"]
+
+    # Frames
+    w["stale_frames"] = 0 if status_fresh else int(w.get("stale_frames", 0) or 0) + 1
+    cp_settle_until = _safe_float(w.get("cp_settle_until"), 0.0)
+    if connected:
+        w["disconnect_frames"] = 0
+    elif now >= cp_settle_until and not cp_glitch and status_fresh:
+        w["disconnect_frames"] = int(w.get("disconnect_frames", 0) or 0) + 1
+    budget_ok_now = bool(budget_valid and min_w > 0.0 and budget_w + 1e-9 >= min_w)
+    if budget_ok_now:
+        w["budget_ok_frames"] = int(w.get("budget_ok_frames", 0) or 0) + 1
+        w["no_budget_since"] = 0.0
+    else:
+        w["budget_ok_frames"] = 0
+    confirm_now = bool(status_fresh and charge_state and power_rb > START_WINDOW_CONFIRM_POWER_W)
+    w["confirm_frames"] = int(w.get("confirm_frames", 0) or 0) + 1 if confirm_now else 0
+    energy_anchor = w.get("energy_wh_anchor")
+    energy_confirmed = bool(
+        energy_wh is not None
+        and energy_anchor is not None
+        and energy_wh - _safe_float(energy_anchor, 0.0) > START_WINDOW_CONFIRM_ENERGY_WH
+    )
+    charge_confirmed = bool(
+        int(w["confirm_frames"]) >= START_WINDOW_CONFIRM_FRAMES or energy_confirmed
+    )
+    offer_seen = bool(status_fresh and offered_rb >= 6.0)
+    offer_missing = bool(
+        status_fresh
+        and offered_rb < 6.0
+        and now >= cp_settle_until
+        and not cp_active
+        and not cp_glitch
+        and not bool(w.get("zero_sent", False))
+    )
+    if offer_seen:
+        w["offer_lost_frames"] = 0
+    elif offer_missing:
+        w["offer_lost_frames"] = int(w.get("offer_lost_frames", 0) or 0) + 1
+    if status_fresh:
+        w["box_offer_amp"] = float(offered_rb)
+    offer_lost_now = bool(int(w["offer_lost_frames"]) >= START_WINDOW_OFFER_LOST_FRAMES)
+    # Eigenes 0 A nach bestätigter Ladung – Box-Angebot in 2 frischen
+    # Frames < 6 A, Fahrzeug zieht nicht (¬charge_state ∧ ≤ 100 W).
+    # Nur mit Beleg eines eigenen 0 A und außerhalb von
+    # Phasensequenz/Reservierung – Sequenz-0-A oder box-seitiger Abfall sind keine Einladung.
+    offer_ended_after_charge = bool(
+        offer_lost_now
+        and not charge_state
+        and power_rb <= START_WINDOW_CP_POWER_MAX_W
+        and own_zero_sent
+        and not sequence_active
+        and not reservation_active
+    )
+    new_command = bool(
+        command_ts > _safe_float(w.get("command_seen_ts"), 0.0)
+        and command_amp >= 6.0
+    )
+
+    # Harte Kanten
+    hard_edge = bool(hard_edge_in or user_off)
+    hard_reason = hard_edge_reason_in or ("mode_off" if user_off else "")
+    if state in START_WINDOW_ENFORCING_STATES:
+        if int(w["stale_frames"]) >= START_WINDOW_STALE_ABORT_FRAMES:
+            hard_edge = True
+            hard_reason = hard_reason or "driver_status_invalid"
+        if bool(w.get("slot_active", False)) and not slot_active:
+            hard_edge = True
+            hard_reason = hard_reason or "scheduled_slot_ended"
+    w["slot_active"] = slot_active
+
+    output = {"action": "none", "amp": None, "force_state": None, "reason": ""}
+    start_due = False
+    reemit_due = False
+    start_amp = 0.0
+    offer_lost_flag = False
+    raise_allowed = False
+    reduce_allowed = False
+    confirmed_zero_release = False
+
+    def do_zero_budget_off() -> None:
+        nonlocal output
+        goto(START_WINDOW_STATE_OFF_NO_BUDGET, "zero_budget_off")
+        output = {
+            "action": "zero_budget_off",
+            "amp": 0.0,
+            "force_state": None,
+            "reason": "openwb_pro_start_window_zero_budget_off",
+        }
+        w["zero_sent"] = True
+        w["anchor_ts"] = 0.0
+        w["offer_amp"] = 0.0
+        w["confirm_frames"] = 0
+        w["offer_lost_frames"] = 0
+        w["no_budget_since"] = 0.0
+        w["command_seen_ts"] = now
+
+    def do_rearm_after_charge(reason: str) -> None:
+        # Das eigene 0 A hat die Ladeepisode beendet –
+        # off_no_budget, damit die nächste Budgetfreigabe ein neues 6-A-Fenster
+        # eröffnet (Anhebungen nur im 30-s-Raster). Eine bestätigte Ladung zählt
+        # nicht als Ablehnung: Wiederholzyklen und exhausted beginnen neu;
+        # cp_count_session bleibt je Stecksession, zero_sent hält offer_lost still.
+        goto(START_WINDOW_STATE_OFF_NO_BUDGET, reason)
+        w["zero_sent"] = True
+        w["anchor_ts"] = 0.0
+        w["offer_amp"] = 0.0
+        w["command_ts"] = 0.0
+        w["command_amp"] = 0.0
+        w["command_seen_ts"] = now
+        w["reemit_count"] = 0
+        w["confirm_frames"] = 0
+        w["offer_lost_frames"] = 0
+        w["energy_wh_anchor"] = None
+        w["no_budget_since"] = 0.0
+        w["confirmed_no_budget_since"] = 0.0
+        w["cycle"] = 0
+        w["cycle_anchor_ts"] = 0.0
+        w["retry_due_ts"] = 0.0
+        w["cp_in_cycle"] = 0
+        w["exhausted"] = False
+
+    def do_reoffer(reason: str) -> None:
+        nonlocal offer_lost_flag
+        goto(START_WINDOW_STATE_OFFER_PENDING, reason)
+        reset_offer()
+        offer_lost_flag = True
+
+    def do_freeze(offer: float, reason: str) -> None:
+        goto(START_WINDOW_STATE_OFFER_FROZEN, reason)
+        w["anchor_ts"] = now
+        w["offer_amp"] = float(offer)
+        w["confirm_frames"] = 0
+        w["offer_lost_frames"] = 0
+        w["energy_wh_anchor"] = energy_wh
+        w["reemit_count"] = 0
+        w["zero_sent"] = False
+        if _safe_float(w.get("cycle_anchor_ts"), 0.0) <= 0.0:
+            w["cycle_anchor_ts"] = now
+
+    def do_start(amp: float, reason: str) -> None:
+        nonlocal start_due, start_amp
+        start_due = True
+        start_amp = float(amp)
+        w["reason"] = reason
+
+    def adopt_command(reason: str, count_reemit: bool) -> None:
+        if count_reemit and _safe_float(w.get("command_ts"), 0.0) > 0.0:
+            w["reemit_count"] = int(w.get("reemit_count", 0) or 0) + 1
+        else:
+            w["reemit_count"] = 0
+        w["command_ts"] = command_ts
+        w["command_amp"] = command_amp
+        w["command_seen_ts"] = command_ts
+        w["offer_amp"] = float(command_amp)
+        w["zero_sent"] = False
+        goto(START_WINDOW_STATE_OFFER_PENDING, reason)
+
+    def do_confirm_charging() -> None:
+        goto(START_WINDOW_STATE_CHARGING_CONFIRMED, "charge_confirmed")
+        w["charging_since_ts"] = now
+        if _safe_float(w.get("anchor_ts"), 0.0) > 0.0 and now >= _safe_float(w.get("anchor_ts"), 0.0) + t_hold:
+            goto(START_WINDOW_STATE_REGULATING, "window_complete")
+
+    def adopt_running_charge(reason: str) -> None:
+        # Laufende Ladung vor dem eigenen
+        # Angebot (Neustart, Force-Start, Lücke > 300 s, erster Deploy ohne
+        # persistierten Kern) – das stehende Box-Angebot wird übernommen.
+        # Deckt das Budget das Angebot (≤ clamp+2 A), läuft das Fenster als
+        # charging_confirmed (Anker jetzt, 30-s-Raster, kein 0 A bis
+        # Anker+T_HOLD). Liegt es darüber, braucht die laufende Ladung kein
+        # Startfenster: regulating, damit die bestehende Regelung sofort
+        # absenken darf (kein start_due, das der Kaltstart bei > 500 W nie
+        # ausführt; kein Gate-Veto reduction_frozen; kein unbegrenzter Bezug).
+        w["anchor_ts"] = now
+        w["offer_amp"] = float(offered_rb)
+        w["offer_lost_frames"] = 0
+        w["energy_wh_anchor"] = energy_wh
+        w["reemit_count"] = 0
+        w["zero_sent"] = False
+        w["charging_since_ts"] = now
+        w["last_change_ts"] = 0.0
+        if _safe_float(w.get("cycle_anchor_ts"), 0.0) <= 0.0:
+            w["cycle_anchor_ts"] = now
+        covered = bool(
+            clamp_amp >= 6.0
+            and offered_rb <= min(float(deckel_amp), clamp_amp + START_WINDOW_ADOPT_TOLERANCE_A)
+        )
+        if covered:
+            goto(START_WINDOW_STATE_CHARGING_CONFIRMED, reason)
+        else:
+            goto(START_WINDOW_STATE_REGULATING, reason + "_above_budget")
+
+    def enter_retry_cycle() -> None:
+        w["cycle"] = int(w.get("cycle", 0) or 0) + 1
+        if _safe_float(w.get("cycle_anchor_ts"), 0.0) <= 0.0:
+            w["cycle_anchor_ts"] = _safe_float(w.get("anchor_ts"), now) or now
+        if int(w["cycle"]) == 1:
+            # Zyklus 1 rastert ab dem ersten Anker; ein CP aus der Fensterphase zählt bereits dazu.
+            w["retry_due_ts"] = _safe_float(w.get("cycle_anchor_ts"), now) + t_cycle
+        else:
+            w["cycle_anchor_ts"] = _safe_float(w.get("cycle_anchor_ts"), now) + t_cycle
+            w["retry_due_ts"] = _safe_float(w.get("retry_due_ts"), now) + t_cycle
+            w["cp_in_cycle"] = 0
+        if int(w["cycle"]) > START_WINDOW_CYCLES_MAX:
+            w["exhausted"] = True
+            goto(START_WINDOW_STATE_EXHAUSTED, "cycles_exhausted")
+        else:
+            goto(START_WINDOW_STATE_RETRY_WAIT, "retry_cycle_%d" % int(w["cycle"]))
+
+    if state == START_WINDOW_STATE_INACTIVE:
+        if connected and status_fresh and plug_session_id and not hard_edge:
+            goto(START_WINDOW_STATE_BUDGET_WAIT, "plug_session_started")
+            reset_offer()
+            w["budget_ok_frames"] = 1 if budget_ok_now else 0
+    elif hard_edge and state != START_WINDOW_STATE_ABORTED_HARD:
+        goto(START_WINDOW_STATE_ABORTED_HARD, hard_reason or "hard_edge")
+        w["hard_edge_reason"] = hard_reason or "hard_edge"
+        output = {"action": "hard_zero", "amp": 0.0, "force_state": 1, "reason": hard_reason or "hard_edge"}
+        w["zero_sent"] = True
+        w["command_seen_ts"] = now
+    elif state != START_WINDOW_STATE_ABORTED_HARD and int(w["disconnect_frames"]) >= START_WINDOW_DISCONNECT_FRAMES:
+        goto(START_WINDOW_STATE_INACTIVE, "vehicle_disconnected")
+        reset_offer()
+    state = str(w["state"])
+
+    if state == START_WINDOW_STATE_ABORTED_HARD:
+        if not hard_edge and connected and status_fresh:
+            came_from_regulating = str(w.get("prev_state") or "") == START_WINDOW_STATE_REGULATING
+            goto(START_WINDOW_STATE_BUDGET_WAIT, "hard_edge_released")
+            w["hard_edge_reason"] = ""
+            reset_offer()
+            w["budget_ok_frames"] = 1 if budget_ok_now else 0
+            if came_from_regulating:
+                # Pause/Aus nach bestätigter Ladung – das neue
+                # 6-A-Fenster zählt keine alten Ablehnungen (Zyklen neu, exhausted False).
+                w["cycle"] = 0
+                w["cycle_anchor_ts"] = 0.0
+                w["retry_due_ts"] = 0.0
+                w["cp_in_cycle"] = 0
+                w["exhausted"] = False
+        else:
+            w["reason"] = w.get("hard_edge_reason") or hard_reason or "hard_edge"
+    state = str(w["state"])
+
+    if state in START_WINDOW_NO_BUDGET_CLOCK_STATES and not budget_ok_now:
+        if _safe_float(w.get("no_budget_since"), 0.0) <= 0.0:
+            w["no_budget_since"] = now
+    no_budget_expired = bool(
+        _safe_float(w.get("no_budget_since"), 0.0) > 0.0
+        and now - _safe_float(w.get("no_budget_since"), 0.0) >= t_hold
+    )
+    can_start_now = bool(
+        int(w["budget_ok_frames"]) >= START_WINDOW_BUDGET_COHERENCE_FRAMES
+        and not start_blocked_by_session
+        and not reservation_active
+        and not sequence_active
+        and connected
+        and status_fresh
+    )
+    clamp_amp = 0.0
+    if deckel_amp >= 6.0:
+        clamp_amp = max(6.0, min(float(deckel_amp), float(math.floor(cap_amp))))
+    anchor_ts = _safe_float(w.get("anchor_ts"), 0.0)
+    # Laufende Ladung (2 Frames > 500 W) mit stehendem
+    # Box-Angebot ≥ 6 A vor dem eigenen Angebot – übernehmen statt
+    # einfrieren/Startbefehl (Deadlock nach Neustart/Force-Start/Gap-Reset).
+    running_charge_adoptable = bool(charge_confirmed and offer_seen)
+
+    if state == START_WINDOW_STATE_BUDGET_WAIT:
+        if running_charge_adoptable:
+            adopt_running_charge("running_charge_adopted")
+        elif new_command:
+            adopt_command("start_command_issued", count_reemit=False)
+        elif offer_seen and confirm_now:
+            # Erster Frame > 500 W bei stehendem Angebot: kein Startbefehl, kein
+            # Einfrieren – der zweite Frame entscheidet (Übernahme).
+            w["reason"] = "running_charge_pending"
+        elif can_start_now:
+            if deckel_amp < 6.0:
+                note_hold("deckel_below_minimum")
+            elif offer_seen and offered_rb <= min(float(deckel_amp), clamp_amp + START_WINDOW_ADOPT_TOLERANCE_A):
+                do_freeze(offered_rb, "adopted_standing_offer")
+            else:
+                do_start(clamp_amp if offer_seen else 6.0, "start_due")
+        elif not budget_ok_now:
+            if offer_seen and no_budget_expired:
+                do_zero_budget_off()
+            elif offer_seen:
+                note_hold("budget_wait_offer_standing")
+            else:
+                w["reason"] = "no_budget_no_offer" if budget_valid else "budget_unknown_hold"
+        elif start_blocked_by_session:
+            note_hold("start_blocked_by_session")
+        elif reservation_active or sequence_active:
+            note_hold("phase_sequence_or_reservation")
+        else:
+            w["reason"] = "budget_coherence_pending" if status_fresh else "status_glitch_hold"
+    elif state == START_WINDOW_STATE_OFFER_PENDING:
+        if new_command:
+            adopt_command("start_command_issued", count_reemit=True)
+        if offer_seen:
+            do_freeze(offered_rb, "readback_confirmed")
+        elif _safe_float(w.get("command_ts"), 0.0) <= 0.0:
+            if can_start_now:
+                do_start(6.0, "reoffer_due")
+            elif not budget_ok_now:
+                w["reason"] = "reoffer_waits_for_budget"
+            else:
+                w["reason"] = "reoffer_blocked"
+        elif now - _safe_float(w.get("command_ts"), 0.0) >= START_WINDOW_READBACK_TIMEOUT_S:
+            if int(w.get("reemit_count", 0) or 0) < START_WINDOW_REEMIT_MAX:
+                reemit_due = True
+                start_amp = max(6.0, _safe_float(w.get("command_amp"), 6.0))
+                w["reason"] = "readback_timeout_reemit"
+            else:
+                goto(START_WINDOW_STATE_BOX_UNRESPONSIVE, "box_unresponsive")
+                w["unresponsive_until"] = now + START_WINDOW_UNRESPONSIVE_PAUSE_S
+        else:
+            w["reason"] = "awaiting_readback"
+    elif state == START_WINDOW_STATE_BOX_UNRESPONSIVE:
+        if new_command:
+            adopt_command("start_command_issued", count_reemit=False)
+        elif offer_seen:
+            do_freeze(offered_rb, "readback_confirmed_late")
+        elif now >= _safe_float(w.get("unresponsive_until"), 0.0) and can_start_now:
+            do_start(6.0, "unresponsive_retry")
+        else:
+            w["reason"] = "box_unresponsive"
+    elif state == START_WINDOW_STATE_OFFER_FROZEN:
+        if charge_confirmed:
+            do_confirm_charging()
+        elif offer_lost_now:
+            do_reoffer("offer_lost")
+        elif anchor_ts > 0.0 and now >= anchor_ts + t_hold:
+            enter_retry_cycle()
+        elif not budget_ok_now and no_budget_expired and offer_seen:
+            do_zero_budget_off()
+        else:
+            if offer_seen and abs(offered_rb - _safe_float(w.get("offer_amp"), 0.0)) >= 0.5:
+                w["offer_amp"] = float(offered_rb)
+                w["reason"] = "late_readback_adopted"
+            elif not budget_ok_now:
+                note_hold("budget_dip_hold" if budget_valid else "budget_unknown_hold")
+            elif not status_fresh:
+                note_hold("status_glitch_hold")
+            else:
+                w["reason"] = "offer_frozen"
+            if new_command:
+                w["command_seen_ts"] = command_ts
+    elif state == START_WINDOW_STATE_CHARGING_CONFIRMED:
+        if offer_ended_after_charge:
+            # Freigegebenes/eigenes 0 A hat die Ladung beendet.
+            do_rearm_after_charge("confirmed_offer_ended")
+        elif anchor_ts > 0.0 and now >= anchor_ts + t_hold:
+            goto(START_WINDOW_STATE_REGULATING, "window_complete")
+        else:
+            if new_command:
+                w["command_seen_ts"] = command_ts
+                if abs(command_amp - _safe_float(w.get("offer_amp"), 0.0)) >= 0.5:
+                    w["offer_amp"] = float(command_amp)
+                    w["last_change_ts"] = command_ts
+            # Das eingefrorene
+            # Angebot ist das, was die Box wirklich stehen hat. Das gemerkte
+            # offer_amp stammt aus einem Befehl, der abgesetzt werden sollte -
+            # nicht aus einem, der die Box erreicht hat. Bleibt eine Schreibung
+            # aus (z. B. zweiter logischer Hardwareausgang im selben
+            # Managerzyklus, verworfen), laeuft das Gedaechtnis der Box davon
+            # und jeder spaetere, reale Zielwert darunter gilt als "Absenkung"
+            # und wird eingefroren (z. B. 20 A gegen ein Phantomangebot von 24 A,
+            # während die Box 10 A stehen hatte). Nach Ablauf des 30-s-Rasters
+            # - jede echte Schreibung ist dann laengst zurueckgelesen - wird das
+            # Angebot auf den frischen Readback zurueckgeholt. last_change_ts
+            # bleibt unberuehrt, damit das Raster allein die Freigabe steuert.
+            # Nur hier, nur mit frischem Readback >= 6 A; sonst wie bisher.
+            w["offer_resynced_to_readback"] = bool(
+                status_fresh
+                and offered_rb >= 6.0
+                and _safe_float(w.get("offer_amp"), 0.0) > offered_rb + 0.5
+                and now - _safe_float(w.get("last_change_ts"), 0.0) >= START_WINDOW_RAISE_DELAY_S
+            )
+            if w["offer_resynced_to_readback"]:
+                w["offer_amp"] = float(offered_rb)
+            last_change = _safe_float(w.get("last_change_ts"), 0.0)
+            raise_allowed = reduce_allowed = bool(
+                now >= anchor_ts + START_WINDOW_RAISE_DELAY_S
+                and now - last_change >= START_WINDOW_RAISE_DELAY_S
+            )
+            # Eigene Nullbudget-Uhr und Wh-Deckel.
+            # Netzbezug zählt nur innerhalb der laufenden Nullbudget-Episode (ab dem zweiten
+            # Frame ohne Budget, dt ≤ 30 s); ein Budgetframe setzt Uhr und Wh zurück.
+            frame_dt = min(START_WINDOW_GRID_INTEGRATION_MAX_DT_S, max(0.0, now - updated_ts)) if updated_ts > 0.0 else 0.0
+            if budget_ok_now:
+                w["confirmed_no_budget_since"] = 0.0
+                w["grid_import_wh_in_window"] = 0.0
+            elif _safe_float(w.get("confirmed_no_budget_since"), 0.0) <= 0.0:
+                w["confirmed_no_budget_since"] = now
+                w["grid_import_wh_in_window"] = 0.0
+            elif grid_w is not None and grid_w > 0.0 and frame_dt > 0.0:
+                w["grid_import_wh_in_window"] = round(
+                    _safe_float(w.get("grid_import_wh_in_window"), 0.0) + grid_w * frame_dt / 3600.0, 3
+                )
+            confirmed_zero_release = bool(
+                not budget_ok_now
+                and (
+                    now - _safe_float(w.get("confirmed_no_budget_since"), now) >= START_WINDOW_CONFIRMED_ZERO_BUDGET_S
+                    or _safe_float(w.get("grid_import_wh_in_window"), 0.0) >= START_WINDOW_CONFIRMED_GRID_IMPORT_MAX_WH
+                )
+            )
+            if confirmed_zero_release:
+                w["reason"] = "charging_confirmed_zero_released"
+            else:
+                w["reason"] = "charging_confirmed" if raise_allowed else "charging_confirmed_raster_hold"
+    elif state == START_WINDOW_STATE_RETRY_WAIT:
+        if charge_confirmed:
+            do_confirm_charging()
+        elif offer_lost_now:
+            do_reoffer("offer_lost")
+        elif now >= _safe_float(w.get("retry_due_ts"), 0.0) > 0.0:
+            enter_retry_cycle()
+        elif not budget_ok_now and no_budget_expired and offer_seen:
+            do_zero_budget_off()
+        else:
+            if new_command:
+                w["command_seen_ts"] = command_ts
+            if not budget_ok_now:
+                note_hold("budget_dip_hold" if budget_valid else "budget_unknown_hold")
+            else:
+                w["reason"] = "retry_cycle_%d" % int(w.get("cycle", 1) or 1)
+    elif state == START_WINDOW_STATE_EXHAUSTED:
+        if charge_confirmed:
+            do_confirm_charging()
+        elif offer_lost_now:
+            do_reoffer("offer_lost_exhausted")
+        elif not budget_ok_now and no_budget_expired and offer_seen:
+            do_zero_budget_off()
+        else:
+            if new_command:
+                w["command_seen_ts"] = command_ts
+            w["reason"] = "exhausted"
+    elif state == START_WINDOW_STATE_OFF_NO_BUDGET:
+        if new_command:
+            adopt_command("reoffer_after_zero_budget", count_reemit=False)
+        elif can_start_now:
+            do_start(6.0, "reoffer_due")
+        else:
+            w["reason"] = "off_no_budget"
+    elif state == START_WINDOW_STATE_REGULATING:
+        if offer_ended_after_charge:
+            # Der Zustand regulating ist nicht terminal – nach dem eigenen 0 A
+            # (Wolke, Abend, Priorität) eröffnet die nächste Budgetfreigabe ein 6-A-Fenster.
+            do_rearm_after_charge("regulating_offer_ended")
+        else:
+            w["reason"] = "regulating"
+    state = str(w["state"])
+    anchor_ts = _safe_float(w.get("anchor_ts"), 0.0)
+
+    cycle_anchor_ts = _safe_float(w.get("cycle_anchor_ts"), 0.0)
+    cp_due = bool(
+        state in (START_WINDOW_STATE_OFFER_FROZEN, START_WINDOW_STATE_RETRY_WAIT)
+        and connected
+        and status_fresh
+        and offered_rb >= 6.0
+        and not charge_state
+        and power_rb <= START_WINDOW_CP_POWER_MAX_W
+        and not cp_active
+        and (last_phasetarget_ts <= 0.0 or now - last_phasetarget_ts >= START_WINDOW_PHASETARGET_QUIET_S)
+        and not sequence_active
+        and not reservation_active
+        and now >= max(anchor_ts, cycle_anchor_ts) + grace_s
+        and int(w.get("cp_in_cycle", 0) or 0) == 0
+        and int(w.get("cp_count_session", 0) or 0) < cp_max
+        and cp_enabled
+        and now >= _safe_float(w.get("cp_settle_until"), 0.0)
+        and not bool(w.get("exhausted", False))
+    )
+
+    active = state in START_WINDOW_ENFORCING_STATES
+    freeze_active = state in START_WINDOW_FREEZE_STATES
+    zero_allowed = bool(
+        state in START_WINDOW_ZERO_STATES
+        or output["action"] in ("zero_budget_off", "hard_zero")
+        or not active
+        or confirmed_zero_release
+    )
+    if not active:
+        raise_allowed = True
+        reduce_allowed = True
+    hold_required = bool(
+        active
+        and state not in (START_WINDOW_STATE_CHARGING_CONFIRMED, START_WINDOW_STATE_OFF_NO_BUDGET)
+        and output["action"] == "none"
+    )
+    w["hlc_factor"] = float(hlc)
+    w["evse_signaling"] = evse
+    w["updated_ts"] = now
+    if start_due or reemit_due:
+        output = {
+            "action": "reemit" if reemit_due else "start",
+            "amp": float(start_amp),
+            "force_state": 2,
+            "reason": "openwb_pro_start_window_start",
+        }
+    elif output["action"] == "none" and active and hold_required:
+        output = {"action": "hold", "amp": None, "force_state": None, "reason": w.get("reason") or state}
+
+    result = dict(w)
+    result.update({
+        "active": bool(active),
+        "freeze_active": bool(freeze_active),
+        "zero_allowed": bool(zero_allowed),
+        "raise_allowed": bool(raise_allowed),
+        "reduce_allowed": bool(reduce_allowed),
+        "start_due": bool(start_due),
+        "start_amp": float(start_amp),
+        "reemit_due": bool(reemit_due),
+        "cp_due": bool(cp_due),
+        "hard_edge": bool(hard_edge and state == START_WINDOW_STATE_ABORTED_HARD),
+        "hard_edge_reason": str(w.get("hard_edge_reason") or (hard_reason if hard_edge else "")),
+        "min_offer_standing": bool(offered_rb >= 6.0),
+        "hold_required": bool(hold_required),
+        "holds_setpoint": bool(state in START_WINDOW_SETPOINT_STATES),
+        "offer_lost": bool(offer_lost_flag),
+        "charge_confirmed": bool(charge_confirmed),
+        "confirmed_zero_release": bool(confirmed_zero_release),
+        # Beleg des eigenen 0 A (Diagnose, kein Kernschlüssel).
+        "last_zero_reason": last_zero_reason,
+        "own_zero_sent": bool(own_zero_sent),
+        "confirmed_no_budget_s": (
+            round(now - _safe_float(w.get("confirmed_no_budget_since"), 0.0), 1)
+            if _safe_float(w.get("confirmed_no_budget_since"), 0.0) > 0.0
+            else 0.0
+        ),
+        "budget_ok": bool(budget_ok_now),
+        "budget_w": float(budget_w),
+        "min_w": float(min_w),
+        "cap_amp": float(cap_amp),
+        "deckel_amp": float(deckel_amp),
+        "clamp_amp": float(clamp_amp),
+        "offered_rb": float(offered_rb),
+        "power_rb": float(power_rb),
+        "soc_known": bool(soc_known),
+        "soc_reached": bool(soc_reached),
+        "t_hold_s": float(t_hold),
+        "t_cycle_s": float(t_cycle),
+        "grace_s": float(grace_s),
+        "cp_settle_s": float(cp_settle_s),
+        "cp_max_session": int(cp_max),
+        "offer_frozen_until": float(anchor_ts + t_hold) if anchor_ts > 0.0 else 0.0,
+        "retry_next_ts": _safe_float(w.get("retry_due_ts"), 0.0),
+        "retry_cycle": "%d/%d" % (min(int(w.get("cycle", 0) or 0), START_WINDOW_CYCLES_MAX), START_WINDOW_CYCLES_MAX),
+        "output": output,
+        "transitions": list(transitions),
+    })
+    return result
+
+
+def minimum_hold_reduction_contract(
+    window: Optional[Dict[str, Any]],
+    *,
+    min_amp: Any = 6,
+    phases: Any = 0,
+    wb_id: Any = 0,
+    cycle_token: Any = "",
+    plug_session_id: Any = "",
+) -> Dict[str, Any]:
+    """Typisierte Absenkung auf den Mindeststrom unter Nullbudget – reiner Vertrag.
+
+    Aktiv nur im Zustand ``charging_confirmed`` (Startfenster/Mindesthalt) mit
+    bestätigter Ladung (> 500 W), ohne Budget (``budget_ok`` False), solange das
+    Fenster 0 A noch nicht freigibt, bei stehendem Angebot über dem Mindeststrom
+    und im 30-s-Raster (``reduce_allowed``). Ergebnis: genau ein Zielwert
+    ``target_amp`` = Mindeststrom (nie Anhebung, nie 0 A). Fehlt das Fenster oder
+    eine Bedingung, ist der Vertrag inaktiv – die Gates verhalten sich wie heute.
+    """
+
+    w = window if isinstance(window, dict) else {}
+    minimum = max(1.0, _safe_float(min_amp, 6.0))
+    phase_count = int(_safe_float(phases, 0.0))
+    if phase_count not in (1, 2, 3):
+        phase_count = 0
+    memo_offer = _safe_float(w.get("offer_amp"), 0.0)
+    box_offer = _safe_float(w.get("box_offer_amp"), 0.0)
+    # Beobachtung an das frische Box-Readback gebunden – nie
+    # über dem Readback (sonst wäre die 'Absenkung' auf einen Mindeststrom > 6 A real
+    # eine Anhebung); ohne Readback ≥ 6 A inaktiv (fail-closed).
+    if box_offer >= 6.0:
+        offer = min(memo_offer, box_offer) if memo_offer >= 6.0 else box_offer
+    else:
+        offer = 0.0
+    result = {
+        "schema": MINIMUM_HOLD_REDUCTION_SCHEMA,
+        "active": False,
+        "reason": "",
+        "wb_id": int(_safe_float(wb_id, 0.0)),
+        "plug_session_id": str(plug_session_id or ""),
+        "cycle_token": str(cycle_token or ""),
+        "state": str(w.get("state") or ""),
+        "target_amp": float(minimum),
+        "observed_amp": round(offer, 3),
+        "box_offer_amp": round(box_offer, 3),
+        "min_amp": float(minimum),
+        "phases": phase_count,
+        "target_w": round(minimum * 230.0 * phase_count, 1) if phase_count else None,
+    }
+    if not w or w.get("active") is not True:
+        result["reason"] = "window_inactive"
+    elif str(w.get("state") or "") != START_WINDOW_STATE_CHARGING_CONFIRMED:
+        result["reason"] = "not_charging_confirmed"
+    elif not result["plug_session_id"] or str(w.get("plug_session_id") or "") != result["plug_session_id"]:
+        result["reason"] = "session_mismatch"
+    elif not result["cycle_token"] or result["wb_id"] <= 0:
+        result["reason"] = "binding_missing"
+    elif bool(w.get("budget_ok", False)):
+        result["reason"] = "budget_ok"
+    elif bool(w.get("zero_allowed", False)):
+        result["reason"] = "zero_released"
+    elif not bool(w.get("charge_confirmed", False)) or _safe_float(w.get("power_rb"), 0.0) <= START_WINDOW_CONFIRM_POWER_W:
+        result["reason"] = "charge_not_confirmed"
+    elif box_offer < 6.0:
+        result["reason"] = "offer_readback_missing"
+    elif offer < minimum + 0.5:
+        result["reason"] = "offer_at_minimum"
+    elif not bool(w.get("reduce_allowed", False)):
+        result["reason"] = "raster_hold"
+    else:
+        result["active"] = True
+        result["reason"] = MINIMUM_HOLD_REDUCTION_REASON
+    return result
+
+
+def start_window_core(window: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Persistenter Kern (nur Schlüssel des Kerns) aus einem Vertragsergebnis/Memo."""
+
+    src = window if isinstance(window, dict) else {}
+    core = {key: src.get(key) for key in START_WINDOW_CORE_KEYS if key in src}
+    if isinstance(core.get("hold_events"), dict):
+        core["hold_events"] = dict(core["hold_events"])
+    return core
+
+
+def start_window_output_rule(
+    window: Optional[Dict[str, Any]],
+    cmd_amp: Any,
+    force_state: Any = None,
+    physical_offer_amp: Any = None,
+) -> Dict[str, Any]:
+    """Regel des Executor-Gates für einen Strombefehl im Startfenster.
+
+    Rückgabe ``allowed``, ``reason`` (Vetogrund) und ``change`` ∈ {none, zero,
+    same, raise, reduce}. Identische Werte (Keepalive/Re-Emit) passieren;
+    Anhebung/Absenkung nur mit ``raise_allowed``/``reduce_allowed``; 0 A oder
+    ``force_state 1`` nur mit ``zero_allowed``.
+
+    ``physical_offer_amp`` (Beleg des Managers) ist das physisch stehende
+    Angebot der Box aus einem frischen Readback, nach oben begrenzt durch einen
+    noch nicht zurückgemeldeten eigenen Strombefehl. Liegt es bei mindestens
+    6 A, passiert jeder Befehl ab 6 A darunter als Absenkung in jedem
+    Fensterzustand, auch wenn die bisherige Regel ihn einfröre. Die Regel wirkt
+    nur freigebend: Was bisher erlaubt war, bleibt erlaubt; 0 A,
+    ``force_state 1`` und Anhebungen bleiben unverändert beim Fenster.
+    """
+
+    w = window if isinstance(window, dict) else {}
+    state = str(w.get("state") or "")
+    amp = _safe_float(cmd_amp, 0.0)
+    try:
+        fs = int(float(force_state)) if force_state is not None else None
+    except (TypeError, ValueError):
+        fs = None
+    result = {"allowed": True, "reason": "window_not_enforcing", "change": "none", "state": state}
+    if not bool(w.get("active", False)) or state not in START_WINDOW_ENFORCING_STATES:
+        return result
+    offer = _safe_float(w.get("offer_amp"), 0.0)
+    if offer < 6.0:
+        offer = _safe_float(w.get("box_offer_amp"), 0.0)
+    if amp < 6.0 or fs == 1:
+        result["change"] = "zero"
+        if bool(w.get("zero_allowed", False)):
+            result["reason"] = "zero_allowed"
+        else:
+            result["allowed"] = False
+            result["reason"] = "budget_wait_zero" if state == START_WINDOW_STATE_BUDGET_WAIT else "offer_frozen_zero"
+        return result
+    physical = _safe_float(physical_offer_amp, 0.0) if physical_offer_amp is not None else 0.0
+    if not math.isfinite(physical):
+        physical = 0.0
+    # Absenkung gegen das physisch stehende Angebot: die sichere Richtung, im
+    # Fenster nie gesperrt (Netzbezug statt Festhalten).
+    physical_reduction = bool(physical >= 6.0 and amp <= physical - 0.5)
+
+    def _allow_physical_reduction() -> Dict[str, Any]:
+        result["allowed"] = True
+        result["change"] = "reduce"
+        result["reason"] = "reduce_below_physical_offer"
+        result["physical_offer_amp"] = float(physical)
+        return result
+
+    if offer >= 6.0 and abs(amp - offer) < 0.5:
+        result["change"] = "same"
+        result["reason"] = "identical_offer"
+        return result
+    if offer >= 6.0 and amp < offer:
+        result["change"] = "reduce"
+        if bool(w.get("reduce_allowed", False)):
+            result["reason"] = "reduce_allowed"
+        elif (
+            state in START_WINDOW_PRE_OFFER_STATES
+            and _safe_float(w.get("power_rb"), 0.0) > START_WINDOW_CONFIRM_POWER_W
+        ):
+            # Laufende Ladung vor dem eigenen Angebot –
+            # Absenkung ≥ 6 A sofort erlaubt (Netzbezug), 0 A bleibt gesperrt.
+            result["reason"] = "running_charge_reduce"
+        elif physical_reduction:
+            return _allow_physical_reduction()
+        else:
+            result["allowed"] = False
+            result["reason"] = "reduction_frozen"
+        return result
+    result["change"] = "raise"
+    if bool(w.get("raise_allowed", False)) or bool(w.get("start_due", False)) or bool(w.get("reemit_due", False)):
+        result["reason"] = "raise_allowed" if bool(w.get("raise_allowed", False)) else "start_due"
+    elif physical_reduction:
+        # Gegen das gemerkte Angebot eine Anhebung, gegen das physisch stehende
+        # (etwa nach einem Neustart der Box) eine Absenkung.
+        return _allow_physical_reduction()
+    else:
+        result["allowed"] = False
+        result["reason"] = "raise_not_due"
+    return result
+
+
+def _start_window_hhmm(ts: float, with_seconds: bool = False) -> str:
+    try:
+        import datetime as _dt
+
+        stamp = _dt.datetime.fromtimestamp(float(ts))
+        return stamp.strftime("%H:%M:%S" if with_seconds else "%H:%M")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "--:--"
+
+
+def start_window_reason_text(window: Optional[Dict[str, Any]], now_ts: Any = 0) -> str:
+    """Klartext des Startfensters für Session-Reason und Dashboard."""
+
+    w = window if isinstance(window, dict) else {}
+    state = str(w.get("state") or "")
+    now = _safe_float(now_ts, 0.0)
+    offer = _safe_float(w.get("offer_amp"), 0.0)
+    cycle = min(int(_safe_int(w.get("cycle"), 0)), START_WINDOW_CYCLES_MAX)
+    if state == START_WINDOW_STATE_OFFER_PENDING:
+        amp = offer if offer >= 6.0 else _safe_float(w.get("command_amp"), 6.0)
+        return "Startangebot %.0f A gesendet; warte auf Bestätigung der Box." % max(6.0, amp)
+    if state == START_WINDOW_STATE_OFFER_FROZEN:
+        remaining = max(0.0, _safe_float(w.get("offer_frozen_until"), 0.0) - now)
+        return "Startfenster %d/%d: %.0f A angeboten, wartet auf Ladeannahme (noch %02d:%02d)." % (
+            max(1, cycle),
+            START_WINDOW_CYCLES_MAX,
+            offer,
+            int(remaining // 60),
+            int(remaining % 60),
+        )
+    if state == START_WINDOW_STATE_CHARGING_CONFIRMED:
+        return "Startfenster bis %s (nur Anhebungen/Absenkungen ≥ 6 A)." % _start_window_hhmm(
+            _safe_float(w.get("offer_frozen_until"), 0.0), with_seconds=True
+        )
+    if state == START_WINDOW_STATE_RETRY_WAIT:
+        return "Start abgelehnt – Wiederholung %s (Zyklus %d/%d); Angebot %.0f A bleibt stehen." % (
+            _start_window_hhmm(_safe_float(w.get("retry_next_ts"), 0.0)),
+            max(1, cycle),
+            START_WINDOW_CYCLES_MAX,
+            offer,
+        )
+    if state == START_WINDOW_STATE_EXHAUSTED:
+        return (
+            "Fahrzeug lädt trotz Freigabe nicht (%d/%d); Angebot %.0f A bleibt stehen, kein weiterer Weckimpuls."
+            % (START_WINDOW_CYCLES_MAX, START_WINDOW_CYCLES_MAX, offer)
+        )
+    if state == START_WINDOW_STATE_OFF_NO_BUDGET:
+        return "Wartet auf PV-Budget – Angebot nach %d s ohne Budget beendet (0 A, wird bei Budget wiederholt)." % int(
+            round(_safe_float(w.get("t_hold_s"), START_WINDOW_HOLD_DEFAULT_S))
+        )
+    if state == START_WINDOW_STATE_BOX_UNRESPONSIVE:
+        return "Box spiegelt den Startbefehl nicht; Wiederholung in %d s." % max(
+            0, int(_safe_float(w.get("unresponsive_until"), 0.0) - now)
+        )
+    return str(w.get("reason") or state)
 
 
 def apply_vehicle_finished_drop_to_status(
@@ -3333,6 +4817,7 @@ def start_retry_guard_contract(
     session: Optional[Dict[str, Any]] = None,
     now_ts: Any = 0,
     reason: str = "",
+    start_window: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Decide whether a start/retry command may bypass the chatter guard.
 
@@ -3424,6 +4909,17 @@ def start_retry_guard_contract(
         and temporary_stop_hint in ("stopping", "waiting_start_release")
         and budget_ready
     )
+    window_memo = (
+        start_window
+        if isinstance(start_window, dict)
+        else data.get("_openwb_pro_start_window_contract")
+    )
+    window_memo = window_memo if isinstance(window_memo, dict) else {}
+    no_contactor_cycle = bool(
+        temporary_stop_hint in ("stop_command_settled", "waiting_start_release")
+        and not bool(data.get("_had_real_charge_in_session", False))
+        and window_memo.get("active") is True
+    )
     command_valid = bool(
         (
             method in ("set_amp_and_state", "set_current", "set_direct_current")
@@ -3451,6 +4947,11 @@ def start_retry_guard_contract(
     elif soft_retry_releases_own_stop:
         allow = True
         block_reason = "soft_reject_retry_due"
+    elif temporary_stop_active and no_contactor_cycle:
+        # Ein eigener Politik-Nullausgang ohne gemessene Ladung
+        # ist kein Schützzyklus; das Startfenster darf erneut anbieten.
+        allow = True
+        block_reason = "start_window_retry_no_contactor"
     elif temporary_stop_active:
         block_reason = "temporary_stop_active"
     elif stop_active:
@@ -3760,8 +5261,13 @@ def evaluate_session(
     now_ts: Any = 0,
     start_verify_s: Any = 180,
     stable_hw_power_w: Any = 0.0,
+    start_window: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Classify one manager-owned openWB Pro session."""
+    """Classify one manager-owned openWB Pro session.
+
+    ``start_window`` (Memo des Startfensters) liefert den
+    Angebotswert ohne ``cap``, den Zustand ``start_retry`` und die Texte.
+    """
 
     st = status or {}
     data = state_data if isinstance(state_data, dict) else {}
@@ -3775,7 +5281,17 @@ def evaluate_session(
         _safe_float(st.get("offered_current_raw", 0), 0.0),
         _safe_float(st.get("evse_current", 0), 0.0),
     )
-    offered_amp = max(current_amp, cap, hw_amp if hw_amp >= min_current else 0)
+    window = start_window if isinstance(start_window, dict) else {}
+    window_active = bool(window.get("active", False))
+    window_state = str(window.get("state") or "") if window_active else ""
+    window_offer_amp = max(0.0, _safe_float(window.get("offer_amp"), 0.0)) if window_active else 0.0
+    if window_active and window_offer_amp >= min_current:
+        # Das stehende Fensterangebot ist die Anzeige-/Manager-Wahrheit, nicht der Deckel
+        # (kein „13.0 A freigegeben“ bei 6 A Angebot). Vor dem Angebot (budget_wait, off_no_budget)
+        # bleibt der Deckel Teil der Startanforderung, sonst wäre kein Startbefehl mehr sendbar.
+        offered_amp = max(current_amp, hw_amp if hw_amp >= min_current else 0, window_offer_amp)
+    else:
+        offered_amp = max(current_amp, cap, hw_amp if hw_amp >= min_current else 0)
     connected = status_connected(st)
     real_power_w = max(status_real_power(st), _safe_float(stable_hw_power_w, 0.0))
     real_charging = bool(status_real_charging(st) or real_power_w > 500.0)
@@ -3819,6 +5335,10 @@ def evaluate_session(
                 last_start_age_s is not None
                 and last_start_age_s <= verify_s
             )
+            or window_state in (
+                START_WINDOW_STATE_OFFER_PENDING,
+                START_WINDOW_STATE_OFFER_FROZEN,
+            )
         )
     )
     temporary_stop = temporary_ems_stop_contract(
@@ -3846,7 +5366,9 @@ def evaluate_session(
         reason = "Kein Fahrzeug verbunden."
     elif real_charging:
         state = STATE_CHARGING
-        reason = "Echte Ladung mit %.0f W bestaetigt." % real_power_w
+        reason = "Echte Ladung mit %.0f W bestätigt." % real_power_w
+        if window_state == START_WINDOW_STATE_CHARGING_CONFIRMED:
+            reason = "%s %s" % (reason, start_window_reason_text(window, now))
     elif ended_latched:
         state = STATE_ENDED
         reason = (
@@ -3868,13 +5390,22 @@ def evaluate_session(
         reason = "Phasenwechsel läuft; Stromrampe wartet auf plausiblen Status."
     elif wakeup_pending:
         state = STATE_WAKEUP
-        reason = "CP-Wake-up gesendet; Stromfreigabe wartet auf Einschaltverzoegerung."
+        reason = "CP-Wake-up gesendet; Stromfreigabe wartet auf Einschaltverzögerung."
+    elif window_state in (START_WINDOW_STATE_RETRY_WAIT, START_WINDOW_STATE_EXHAUSTED) and connected:
+        state = STATE_START_RETRY
+        reason = start_window_reason_text(window, now)
+    elif start_verifying and window_state in (
+        START_WINDOW_STATE_OFFER_PENDING,
+        START_WINDOW_STATE_OFFER_FROZEN,
+    ):
+        state = STATE_STARTING
+        reason = start_window_reason_text(window, now)
     elif start_verifying:
         state = STATE_STARTING
         reason = "%.1f A freigegeben; openWB Pro wartet auf echte Ladeleistung." % offered_amp
     elif start_requested:
         state = STATE_OFFERED
-        reason = "%.1f A freigegeben; noch keine echte Ladebestaetigung." % offered_amp
+        reason = "%.1f A freigegeben; noch keine echte Ladebestätigung." % offered_amp
     elif temporary_waiting:
         state = STATE_IDLE
         reason = "Temporärer EMS-Stopp; wartet auf neue Startfreigabe oder Mindestleistung."
@@ -3889,7 +5420,7 @@ def evaluate_session(
         or temporary_stop.get("start_blocked", False)
     )
     can_send_start_command = bool(
-        state in (STATE_OFFERED, STATE_STARTING, STATE_PHASE_WAIT)
+        state in (STATE_OFFERED, STATE_STARTING, STATE_PHASE_WAIT, STATE_START_RETRY)
         and physical_budget_ready
         and not start_blocked
         and offered_amp >= min_current
@@ -3943,6 +5474,7 @@ def evaluate_session(
         "start_blocked": bool(start_blocked),
         "can_send_start_command": bool(can_send_start_command),
         "counts_as_real_charge": bool(real_charging),
+        "start_window": dict(window) if window_active else {},
     }
 
 
@@ -3984,6 +5516,16 @@ def apply_session_to_status(status: Optional[Dict[str, Any]], session: Dict[str,
     status["openwb_pro_session_start_blocked"] = bool(session.get("start_blocked", False))
     status["openwb_pro_session_can_send_start_command"] = bool(session.get("can_send_start_command", False))
     status["openwb_pro_session_counts_as_real_charge"] = bool(session.get("counts_as_real_charge", False))
+    # Startfenster-Skalare für Snapshot/Dashboard (index.php liest nur den Snapshot).
+    window = session.get("start_window") if isinstance(session.get("start_window"), dict) else {}
+    status["openwb_pro_start_window_state"] = str(window.get("state") or "inactive")
+    status["openwb_pro_start_window_anchor_ts"] = _safe_float(window.get("anchor_ts"), 0.0)
+    status["openwb_pro_start_window_offer_frozen_until"] = _safe_float(window.get("offer_frozen_until"), 0.0)
+    status["openwb_pro_start_window_retry_cycle"] = str(window.get("retry_cycle") or "")
+    status["openwb_pro_start_window_retry_next_ts"] = _safe_float(window.get("retry_next_ts"), 0.0)
+    status["openwb_pro_start_window_reason"] = str(window.get("reason") or "")
+    status["openwb_pro_start_window_evse_signaling"] = str(window.get("evse_signaling") or "")
+    status["openwb_pro_start_window_command_ts"] = _safe_float(window.get("command_ts"), 0.0)
     liveness = session.get("start_liveness") if isinstance(session.get("start_liveness"), dict) else {}
     status["openwb_pro_start_liveness_contract"] = liveness
     status["openwb_pro_start_liveness_state"] = str(liveness.get("state") or "inactive")

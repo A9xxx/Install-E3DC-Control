@@ -37,7 +37,12 @@ def request_missing_openwb_cloud_soc(wb_id, config, status, soc_info=None, now=N
         normalize_wb_mode(configured_mode) == MODE_OFF
         or wallbox_soc_tracker._contract_flag_active(config.get(f"wb{wb_id}_locked"))
         or wallbox_soc_tracker._contract_flag_active(config.get(f"wb{wb_id}_manual_pause"))
-        or not str(config.get("bluelink_refresh_token") or "").strip()
+        # Folgt dem Anmeldevertrag des Bluelink-Clients (_credentials_complete):
+        # Benutzer ohne Randleerzeichen und Passwort unverändert müssen gesetzt
+        # sein, sonst kann der Client den Auftrag nicht bedienen. Der Client
+        # wird bewusst nicht importiert (Bibliotheksimport und Logging beim Laden).
+        or not str(config.get("bluelink_user") or "").strip()
+        or not str(config.get("bluelink_password") or "")
         or status.get("driver_status_valid") is not True
         or status.get("plug_state") is not True
         or wallbox_soc_tracker._soc_record_vetoed(status)

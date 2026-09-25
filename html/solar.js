@@ -7323,6 +7323,145 @@ const E3DC_INSTALLER_UPDATE_POLL_TIMEOUT_MS = 10000;
 const E3DC_INSTALLER_UPDATE_START_TIMEOUT_MS = 30000;
 let e3dcInstallerUpdatePollTimer = null;
 let e3dcInstallerUpdateStartPending = false;
+// Docker: der Update-Check meldet, ob Watchtower das Signal entgegennimmt.
+let e3dcDockerUpdateContext = null;
+const E3DC_DOCKER_UPDATE_OBSERVATION_KEY = 'e3dc-docker-update-observation';
+const E3DC_DOCKER_UPDATE_POLL_MS = 10000;
+const E3DC_DOCKER_UPDATE_MAX_MS = 25 * 60 * 1000;
+
+function e3dcRenderDockerUpdateStatus(status, startedAt) {
+    const summary = document.getElementById('update-status-summary');
+    const title = document.getElementById('update-status-title');
+    const detail = document.getElementById('update-status-detail');
+    const step = document.getElementById('update-status-step');
+    const elapsed = document.getElementById('update-status-elapsed');
+    const progress = document.getElementById('update-progress-bar');
+    if (!summary || !title || !detail || !step || !elapsed || !progress) return;
+    title.innerText = status.title || '';
+    detail.innerText = status.detail || '';
+    step.innerText = status.step || '';
+    elapsed.innerText = 'Laufzeit: ' + e3dcFormatInstallerUpdateElapsed(startedAt);
+    progress.style.width = Math.max(0, Math.min(100, Number(status.progress) || 0)) + '%';
+    progress.classList.toggle('progress-bar-animated', !status.done);
+    progress.classList.toggle('progress-bar-striped', !status.done);
+    summary.className = 'alert mb-2 ' + (status.alertClass || 'alert-info');
+    step.className = 'badge text-nowrap ' + (status.badgeClass || 'bg-info text-dark');
+}
+
+function e3dcReadDockerUpdateObservation() {
+    try {
+        const saved = JSON.parse(sessionStorage.getItem(E3DC_DOCKER_UPDATE_OBSERVATION_KEY));
+        if (!saved || !Number.isFinite(saved.startedAt) || typeof saved.fromVersion !== 'string') return null;
+        if (saved.startedAt > Date.now() || Date.now() - saved.startedAt >= E3DC_DOCKER_UPDATE_MAX_MS) {
+            sessionStorage.removeItem(E3DC_DOCKER_UPDATE_OBSERVATION_KEY);
+            return null;
+        }
+        return saved;
+    } catch (_error) {
+        return null;
+    }
+}
+
+function e3dcClearDockerUpdateObservation() {
+    try { sessionStorage.removeItem(E3DC_DOCKER_UPDATE_OBSERVATION_KEY); } catch (_error) { /* optional */ }
+}
+
+// Nach dem Container-Neustart lädt der Browser die Seite neu; dann wird die
+// vorher gemerkte Ausgangsversion mit der jetzt installierten verglichen.
+function e3dcResumeDockerUpdate() {
+    const saved = e3dcReadDockerUpdateObservation();
+    if (!saved) return false;
+    e3dcFetchUpdateJsonWithTimeout(e3dcActionUrl('action=installed_version&t=' + Date.now()))
+        .then(data => {
+            const version = data && typeof data.version === 'string' ? data.version : '';
+            if (version && version !== saved.fromVersion) {
+                e3dcClearDockerUpdateObservation();
+                alert('Docker-Update abgeschlossen: E3DC-Control läuft jetzt in Version ' + version + '.');
+            }
+        })
+        .catch(() => { /* Die nächste Seite prüft erneut. */ });
+    return false;
+}
+
+function pollDockerImageUpdate(log, spinner, closeBtn, finishBtn, btn, origText, updateStartedAt, fromVersion) {
+    if (e3dcInstallerUpdatePollTimer !== null) return;
+    const startVersion = typeof fromVersion === 'string' ? fromVersion : '';
+    try {
+        sessionStorage.setItem(E3DC_DOCKER_UPDATE_OBSERVATION_KEY, JSON.stringify({startedAt: updateStartedAt, fromVersion: startVersion}));
+    } catch (_error) { /* Browserspeicher kann gesperrt sein. */ }
+    let sawOutage = false;
+    let pollInFlight = false;
+    const appendLog = text => { if (log) log.innerText += text + '\n'; };
+    const finish = status => {
+        clearInterval(interval);
+        e3dcInstallerUpdatePollTimer = null;
+        e3dcRenderDockerUpdateStatus({...status, done: true}, updateStartedAt);
+        if (spinner) spinner.className = status.spinnerClass || 'fas fa-check-circle text-success me-2';
+        if (closeBtn) closeBtn.style.display = 'block';
+        if (finishBtn) { finishBtn.disabled = false; finishBtn.innerText = 'Schließen'; finishBtn.onclick = null; }
+        if (btn) { btn.innerHTML = origText; btn.disabled = false; }
+    };
+    e3dcRenderDockerUpdateStatus({
+        title: 'Watchtower lädt das neue Image',
+        detail: 'Der Download kann auf Raspberry Pi oder NAS einige Minuten dauern. Die Anlage läuft währenddessen weiter.',
+        step: 'Download', progress: 20,
+    }, updateStartedAt);
+    appendLog('Ausgangsversion: ' + (startVersion || 'unbekannt'));
+    const interval = setInterval(() => {
+        if (pollInFlight) return;
+        if (Date.now() - updateStartedAt >= E3DC_DOCKER_UPDATE_MAX_MS) {
+            e3dcClearDockerUpdateObservation();
+            appendLog('[HINWEIS] Innerhalb von ' + Math.round(E3DC_DOCKER_UPDATE_MAX_MS / 60000) + ' Minuten wurde keine neue Version aktiv.');
+            finish({
+                title: 'Keine neue Version aktiv',
+                detail: 'Watchtower hat kein neues Image aktiviert. Mögliche Gründe: kein neueres Release, fester E3DC_IMAGE_TAG in .env oder ein langsamer Download. Auf dem Host prüfen: sudo docker logs --tail 50 watchtower',
+                step: 'Prüfen', progress: 100, alertClass: 'alert-warning', badgeClass: 'bg-warning text-dark',
+                spinnerClass: 'fas fa-info-circle text-warning me-2',
+            });
+            return;
+        }
+        pollInFlight = true;
+        e3dcFetchUpdateJsonWithTimeout(e3dcActionUrl('action=installed_version&t=' + Date.now()), 8000)
+            .then(data => {
+                const version = data && typeof data.version === 'string' ? data.version : '';
+                if (version && startVersion && version !== startVersion) {
+                    e3dcClearDockerUpdateObservation();
+                    appendLog('Neue Version aktiv: ' + version + '. Seite wird neu geladen.');
+                    finish({
+                        title: 'Update abgeschlossen: Version ' + version,
+                        detail: 'Der Container wurde mit dem neuen Image erstellt. Die Seite lädt in wenigen Sekunden neu.',
+                        step: 'Fertig', progress: 100, alertClass: 'alert-success', badgeClass: 'bg-success',
+                    });
+                    window.setTimeout(() => window.location.reload(), 4000);
+                    return;
+                }
+                if (sawOutage) {
+                    e3dcRenderDockerUpdateStatus({
+                        title: 'Container wieder erreichbar',
+                        detail: 'Die Version ist unverändert (' + (version || 'unbekannt') + '). Watchtower prüft noch oder es gab kein neues Image.',
+                        step: 'Prüfen', progress: 80,
+                    }, updateStartedAt);
+                } else {
+                    e3dcRenderDockerUpdateStatus({
+                        title: 'Watchtower lädt das neue Image',
+                        detail: 'Der Download kann auf Raspberry Pi oder NAS einige Minuten dauern. Die Anlage läuft währenddessen weiter.',
+                        step: 'Download', progress: 20 + Math.min(40, Math.floor((Date.now() - updateStartedAt) / 15000)),
+                    }, updateStartedAt);
+                }
+            })
+            .catch(() => {
+                if (!sawOutage) appendLog('Weboberfläche nicht erreichbar: Container wird neu erstellt.');
+                sawOutage = true;
+                e3dcRenderDockerUpdateStatus({
+                    title: 'Container wird neu erstellt',
+                    detail: 'Watchtower ersetzt den laufenden Container durch das neue Image. Konfiguration und Daten bleiben in den Docker-Volumes erhalten.',
+                    step: 'Neustart', progress: 70, alertClass: 'alert-warning', badgeClass: 'bg-warning text-dark',
+                }, updateStartedAt);
+            })
+            .finally(() => { pollInFlight = false; });
+    }, E3DC_DOCKER_UPDATE_POLL_MS);
+    e3dcInstallerUpdatePollTimer = interval;
+}
 
 function e3dcNormalizeSelfUpdateRunId(value) {
     const normalized = (typeof value === 'string') ? value.trim().toLowerCase() : '';
@@ -7462,6 +7601,9 @@ function checkInstallerUpdate(force = false) {
         const badge = document.getElementById('update-badge-installer');
         const btn = document.getElementById('btn-update-installer');
         const missing = Number(data && data.missing);
+        e3dcDockerUpdateContext = data && data.docker === true
+            ? {docker: true, watchtower: data.watchtower === true}
+            : null;
         if (data.success && Number.isFinite(missing) && missing > 0) {
             if(badge) {
                 badge.style.display = 'inline-block';
@@ -7480,6 +7622,7 @@ function checkInstallerUpdate(force = false) {
 // Beim Laden nur informativ prüfen. Der Update-Start ist weder von diesem
 // Netzwerkcheck noch von einem Versionsvergleich abhängig.
 document.addEventListener('DOMContentLoaded', () => {
+    e3dcResumeDockerUpdate();
     if (!e3dcResumeInstallerUpdate()) checkInstallerUpdate(false);
 });
 
@@ -7495,10 +7638,15 @@ async function startInstallerUpdate(btnId = 'btn-update-installer', purpose = 'u
             btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Starte...';
             btn.disabled = true;
         }
+        const dockerWatchtower = Boolean(e3dcDockerUpdateContext && e3dcDockerUpdateContext.docker && e3dcDockerUpdateContext.watchtower);
+        const dockerWithoutWatchtower = Boolean(e3dcDockerUpdateContext && e3dcDockerUpdateContext.docker && !e3dcDockerUpdateContext.watchtower);
         const question = normalizedPurpose === 'permissions_repair'
             ? "Möchtest Du die vollständige Systemreparatur starten?\n\nDies ist kein reiner Rechtecheck: Der Systemjob erstellt ein verifiziertes Backup, gleicht alle Produktdateien mit dem veröffentlichten Stable-Stand ab, setzt die Rechte neu und startet die Dienste nach dem kurzen Dateiaustausch wieder. Dabei kann dieselbe Version erneut installiert werden."
-            : "Möchtest Du E3DC-Control auf den veröffentlichten Stable-Stand aktualisieren oder die installierte Version reparieren?\n\nDer Updater erstellt zuerst ein Backup und startet die Dienste nach dem kurzen Dateiaustausch neu.";
-        if (!confirm(question)) {
+            : dockerWatchtower
+                ? "Möchtest Du E3DC-Control auf den veröffentlichten Stable-Stand aktualisieren?\n\nWatchtower lädt das neue Container-Image und erstellt den Container neu. Regelung und Weboberfläche sind dabei einige Minuten nicht erreichbar; Konfiguration und Daten bleiben in den Docker-Volumes erhalten. Gibt es kein neues Image, passiert nichts."
+                : "Möchtest Du E3DC-Control auf den veröffentlichten Stable-Stand aktualisieren oder die installierte Version reparieren?\n\nDer Updater erstellt zuerst ein Backup und startet die Dienste nach dem kurzen Dateiaustausch neu.";
+        // Ohne Watchtower zeigt der Start nur die Host-Befehle; dafür ist keine Sicherheitsfrage nötig.
+        if (!dockerWithoutWatchtower && !confirm(question)) {
             if (btn) { btn.innerHTML = origText; btn.disabled = false; }
             return;
         }
@@ -7612,10 +7760,37 @@ async function startInstallerUpdateRun(
         if (!data || typeof data.success !== 'boolean') {
             throw new Error('Startantwort enthält keine eindeutige Bestätigung.');
         }
-        if (data.success === true) {
+        if (data.success === true && data.docker === true && data.watchtower === true) {
+            pendingObservation.clear();
+            if (log) log.innerText = (data.message || "Update angestoßen.") + "\n";
+            if (details) details.open = false;
+            pollDockerImageUpdate(log, spinner, closeBtn, finishBtn, btn, origText, updateStartedAt, data.current_version);
+        } else if (data.success === true) {
             if (log) log.innerText = (data.message || "Update gestartet.") + "\nWarte auf Log-Ausgabe...\n";
             const runBinding = e3dcCreateInstallerUpdateRunBinding(baseline, data.run_id);
             pollInstallerUpdate(log, spinner, closeBtn, finishBtn, btn, origText, updateStartedAt, purpose, runBinding);
+        } else if (data.docker === true) {
+            // Der Container führt den Wechsel nicht selbst aus: Host-Befehle
+            // oder Watchtower-Hinweis anzeigen, kein Fehlerzustand der Anlage.
+            pendingObservation.clear();
+            const msg = (data && data.message) || "Docker-Update: bitte die Host-Befehle verwenden.";
+            if (log) log.innerText = msg;
+            if (spinner) spinner.className = 'fab fa-docker text-info me-2';
+            if (closeBtn) closeBtn.style.display = 'block';
+            if (finishBtn) finishBtn.disabled = false;
+            const watchtowerProblem = data.watchtower === true;
+            e3dcRenderDockerUpdateStatus({
+                title: watchtowerProblem ? 'Watchtower hat das Signal nicht angenommen' : 'Update auf dem Docker-Host ausführen',
+                detail: watchtowerProblem
+                    ? 'Die technischen Details nennen die Ursache und die Host-Befehle.'
+                    : 'Der Container tauscht sein Image nicht selbst. Die technischen Details zeigen die Befehle und die einmalige Freischaltung von Watchtower für diesen Knopf.',
+                step: 'Host', progress: 100, done: true,
+                alertClass: watchtowerProblem ? 'alert-warning' : 'alert-info',
+                badgeClass: watchtowerProblem ? 'bg-warning text-dark' : 'bg-info text-dark',
+            }, updateStartedAt);
+            if (details) details.open = true;
+            if (!modal) alert(msg);
+            if(btn) { btn.innerHTML = origText; btn.disabled = false; }
         } else {
             pendingObservation.clear();
             const msg = "Update konnte nicht gestartet werden:\n" + ((data && data.message) || "Unbekannter Fehler");
@@ -8512,6 +8687,11 @@ function switchChartMode(mode, view = 'normal') {
     if (forecastDiagnosticCard && mode !== 'forecast' && mode !== 'hybrid') {
         forecastDiagnosticCard.hidden = true;
     }
+    // Diagnosekarte des Zusatzwechselrichters nur im PV-Diagramm.
+    const extInverterCard = document.getElementById('ext-inverter-diagnostic-card');
+    if (extInverterCard && (mode !== 'live' || view !== 'pv')) {
+        extInverterCard.hidden = true;
+    }
 
     if (mode === 'flow') {
         if(title) title.innerHTML = '<i class="fas fa-project-diagram me-2 text-info"></i>Live Energiefluss';
@@ -9062,6 +9242,80 @@ function externalPvTopologyVisual(data, nodeState = {}) {
         topologySource: pv.legacyExternalEvidence ? 'legacy_power_balance' : pv.topologySource,
         evidenceState: pv.legacyExternalEvidence ? 'compatible_payload' : pv.topologyEvidenceState
     };
+}
+
+// Zusatzwechselrichter (Direktlesung) – Diagnosekarte (Desktop) und Kompaktkarte (Mobil).
+// Nur Anzeige: die Regelgröße bleibt der E3DC-Messwert (pv_external_w).
+const EXT_INVERTER_STATE_LABELS = {
+    run: 'Betrieb', stop: 'Stopp', key_stop: 'Stopp (Schalter)', emergency_stop: 'Not-Aus', standby: 'Bereitschaft',
+    initial_standby: 'Bereitschaft (Start)', starting: 'Anlauf', alarm_run: 'Betrieb (Alarm)', derating_run: 'Betrieb (gedrosselt)',
+    dispatch_run: 'Betrieb (Vorgabe)', fault: 'Fehler', communication_fault: 'Kommunikationsfehler'
+};
+
+function extInverterStateText(block) {
+    if (!block || typeof block !== 'object') return 'Keine Daten';
+    if (!block.valid) {
+        const error = String(block.error || '');
+        if (!block.enabled) return 'Nicht konfiguriert';
+        if (error === 'no_sample_yet') return 'Wartet auf erste Lesung';
+        if (error.startsWith('stale_')) return 'Daten veraltet';
+        return error ? `Keine Lesung (${error})` : 'Keine Lesung';
+    }
+    const key = String(block.state_name || '').toLowerCase();
+    return EXT_INVERTER_STATE_LABELS[key] || (key ? key.replace(/_/g, ' ') : 'Unbekannt');
+}
+
+function extInverterFormat(value, unit, digits = 0) {
+    const n = e3dcFiniteNumberOrNull(value);
+    if (n === null) return '–';
+    return `${n.toLocaleString('de-DE', {minimumFractionDigits: digits, maximumFractionDigits: digits})}${unit}`;
+}
+
+function updateExtInverterCards(data) {
+    const block = data && data.ext_inverter && typeof data.ext_inverter === 'object' ? data.ext_inverter : null;
+    const relevant = !!(block && (block.enabled || block.valid));
+    const valid = !!(block && block.valid);
+    const stateName = block ? String(block.state_name || '') : '';
+    const stateText = extInverterStateText(block);
+    let stateClass = 'text-bg-secondary';
+    if (!valid) stateClass = relevant ? 'text-bg-warning' : 'text-bg-secondary';
+    else if (['fault', 'communication_fault', 'emergency_stop'].includes(stateName)) stateClass = 'text-bg-danger';
+    else if (stateName === 'run' || stateName.endsWith('_run')) stateClass = 'text-bg-success';
+    const phases = valid ? ['ac_p1_w', 'ac_p2_w', 'ac_p3_w'].map(k => extInverterFormat(block[k], ' W')).join(' | ') : '–';
+    const mppt = valid && Array.isArray(block.mppt) ? block.mppt.map(m => extInverterFormat(m && m.w, ' W')).join(' | ') : '–';
+    const setText = (id, text) => { const el = document.getElementById(id); if (el) el.textContent = text; };
+
+    const card = document.getElementById('ext-inverter-diagnostic-card');
+    if (card) {
+        const inPvChart = typeof CURRENT_VIEW !== 'undefined' && CURRENT_VIEW === 'pv';
+        card.hidden = !(relevant && inPvChart);
+        if (!card.hidden) {
+            const badge = document.getElementById('ext-inverter-state');
+            if (badge) { badge.textContent = stateText; badge.className = `badge ${stateClass}`; }
+            setText('ext-inverter-ac', valid ? extInverterFormat(block.ac_w, ' W') : '–');
+            setText('ext-inverter-phases', phases);
+            setText('ext-inverter-dc', valid ? `${extInverterFormat(block.dc_w, ' W')} (MPPT ${mppt})` : '–');
+            setText('ext-inverter-temp', valid ? extInverterFormat(block.temp_c, ' °C', 1) : '–');
+            setText('ext-inverter-daily', valid ? extInverterFormat(block.daily_kwh, ' kWh', 1) : '–');
+            setText('ext-inverter-total', valid ? `${extInverterFormat(block.total_kwh, ' kWh')} · ${extInverterFormat(block.running_h, ' h')}` : '–');
+            setText('ext-inverter-age', valid ? extInverterFormat(block.age_s, ' s') : '–');
+            setText('ext-inverter-source', `${block.type || 'none'} · ${block.host || '–'}:${block.port || '–'} · Unit ${block.unit_id ?? '–'} · alle ${block.poll_s ?? '–'} s`
+                + (valid && block.nominal_kw ? ` · ${extInverterFormat(block.nominal_kw, ' kW', 1)} Nennleistung` : ''));
+        }
+    }
+    const strip = document.getElementById('m-ext-inverter-strip');
+    if (strip) {
+        // 'block' wie bei der Speicherkarte – die Klasse mobile-storage-strip ist per CSS display:none,
+        // ein leerer Inline-Stil ('') würde die Karte nicht sichtbar machen.
+        strip.style.display = relevant ? 'block' : 'none';
+        if (relevant) {
+            setText('m-ext-inverter-state', stateText);
+            setText('m-ext-inverter-ac', valid ? extInverterFormat(block.ac_w, ' W') : '–');
+            setText('m-ext-inverter-daily', valid ? `Heute ${extInverterFormat(block.daily_kwh, ' kWh', 1)}` : 'Heute –');
+            setText('m-ext-inverter-temp', valid ? extInverterFormat(block.temp_c, ' °C', 1) : '–');
+            setText('m-ext-inverter-phases', valid ? `L1/L2/L3: ${phases}` : (block.error ? `Keine Lesung: ${block.error}` : '–'));
+        }
+    }
 }
 
 function livePvBreakdownHtml(data) {
@@ -9966,18 +10220,26 @@ function loadJsLiveChart(hours, file = null) {
                 if (hasExternalPv) {
                     datasets.push(
                         { label: 'E3DC-PV', data: data.pv_e3dc_w, borderColor: '#f59e0b', borderDash: [3, 3], tension: 0.3, pointRadius: 0, borderWidth: 2 },
-                        { label: 'Zusatz-WR', data: data.pv_external_w, borderColor: '#22c55e', borderDash: [6, 4], tension: 0.3, pointRadius: 0, borderWidth: 2 }
+                        { label: 'Zusatz-WR (E3DC-Messung)', data: data.pv_external_w, borderColor: '#22c55e', borderDash: [6, 4], tension: 0.3, pointRadius: 0, borderWidth: 2 }
                     );
                 }
                 datasets.push(
                     { label: 'String 1', data: data.dc0_w, borderColor: '#fd7e14', borderDash: [5, 5], tension: 0.3, pointRadius: 0, borderWidth: 2 },
                     { label: 'String 2', data: data.dc1_w, borderColor: '#e83e8c', borderDash: [5, 5], tension: 0.3, pointRadius: 0, borderWidth: 2 }
                 );
+                // Strings des Zusatzwechselrichters (Direktlesung), nur wenn Werte vorliegen.
+                [['ext_mppt1_w', 'Zusatz-WR String 1', '#16a34a'], ['ext_mppt2_w', 'Zusatz-WR String 2', '#0d9488'], ['ext_mppt3_w', 'Zusatz-WR String 3', '#65a30d']].forEach(([key, label, color]) => {
+                    if (chartSeriesHasFiniteValue(data[key])) datasets.push({ label, data: data[key], borderColor: color, borderDash: [2, 3], tension: 0.3, pointRadius: 0, borderWidth: 1.5 });
+                });
             } else if (CURRENT_VIEW === 'grid') {
                 const gridPhaseDatasets = [];
                 if (chartSeriesHasFiniteValue(data.grid_p1)) gridPhaseDatasets.push({ label: 'L1', data: mapFlip(data.grid_p1), borderColor: '#8b5cf6', tension: 0.3, pointRadius: 0, borderWidth: 1.5, segment: { borderDash: dashIfNeg(data.grid_p1) } });
                 if (chartSeriesHasFiniteValue(data.grid_p2)) gridPhaseDatasets.push({ label: 'L2', data: mapFlip(data.grid_p2), borderColor: '#ec4899', tension: 0.3, pointRadius: 0, borderWidth: 1.5, segment: { borderDash: dashIfNeg(data.grid_p2) } });
                 if (chartSeriesHasFiniteValue(data.grid_p3)) gridPhaseDatasets.push({ label: 'L3', data: mapFlip(data.grid_p3), borderColor: '#14b8a6', tension: 0.3, pointRadius: 0, borderWidth: 1.5, segment: { borderDash: dashIfNeg(data.grid_p3) } });
+                // Phasenleistung des Zusatzwechselrichters (Direktlesung), nur wenn Werte vorliegen.
+                [['ext_pv_p1', 'Zusatz-WR L1', '#a78bfa'], ['ext_pv_p2', 'Zusatz-WR L2', '#f9a8d4'], ['ext_pv_p3', 'Zusatz-WR L3', '#5eead4']].forEach(([key, label, color]) => {
+                    if (chartSeriesHasFiniteValue(data[key])) gridPhaseDatasets.push({ label, data: data[key], borderColor: color, borderDash: [2, 3], tension: 0.3, pointRadius: 0, borderWidth: 1.5 });
+                });
                 datasets = [
                     { label: 'Netz Gesamt', data: mapFlip(data.grid), borderColor: getFlowColor('grid', '#6c757d'), backgroundColor: flowColorAlpha('grid', 0.15, '#6c757d'), fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2, segment: { borderDash: dashIfNeg(data.grid) } },
                     { label: 'WR Gesamt', data: mapFlip(data.ac_total), borderColor: '#ffc107', borderDash: [5, 5], tension: 0.3, pointRadius: 0, borderWidth: 2, segment: { borderDash: dashIfNeg(data.ac_total) } },
@@ -11718,6 +11980,7 @@ function processLiveData(data) {
     cacheStorageCurveData(data);
     renderDirectMarketingDashboardStatus(data);
     publishE3dcLiveData(data);
+    updateExtInverterCards(data);
 
     if (data.forecast && data.forecast.length > 0) {
         FORECAST_DATA = data.forecast;
@@ -12319,7 +12582,7 @@ function processLiveData(data) {
                 .addClass(isWinter ? 'bg-primary text-white' : 'bg-info text-dark')
                 .html(`<i class="fas ${isWinter ? 'fa-snowflake' : 'fa-sun'}"></i> ${data.wp_season_label}`);
             if (data.wp_season_temp != null && data.wp_heating_limit_temp != null) {
-                wpSeasonBadge.attr('title', `Aussen ${Number(data.wp_season_temp).toFixed(1)}C / Heizgrenze ${Number(data.wp_heating_limit_temp).toFixed(1)}C`);
+                wpSeasonBadge.attr('title', `Außen ${Number(data.wp_season_temp).toFixed(1)}C / Heizgrenze ${Number(data.wp_heating_limit_temp).toFixed(1)}C`);
             }
         } else {
             wpSeasonBadge.hide();
@@ -12687,6 +12950,7 @@ function processMobileData(data) {
         const wb1Configured = wallboxConfiguredFlag(data, 1);
         const wb2Configured = wallboxConfiguredFlag(data, 2);
         publishE3dcLiveData(data);
+        updateExtInverterCards(data);
         const timeElem = document.getElementById('live-time');
         if (timeElem) timeElem.innerText = data.time;
 
@@ -13430,7 +13694,7 @@ function _formatStorageReason(reason) {
     }
 
     if (text.includes('WB-KURVENENTLASTUNG') || text.includes('WB-Kurvenentlastung') || text.includes('tl_brake_wb_relief_guard')) {
-        return `${time}: WB-Kurvenentlastung aktiv. Der Speicher liegt oberhalb der Sollkurve und stuetzt die Wallbox ruhig am Netzpunkt.`;
+        return `${time}: WB-Kurvenentlastung aktiv. Der Speicher liegt oberhalb der Sollkurve und stützt die Wallbox ruhig am Netzpunkt.`;
     }
 
     if (text.includes('KURVEN-BREMSE') || text.includes('TL-BREMSE')) {
@@ -13447,7 +13711,7 @@ function _formatStorageReason(reason) {
             msg += ` Kurvennachlauf: Der Speicher liegt ${nowLag} unter der aktuellen Sollkurve, deshalb wird aktiv zur Kurve aufgeladen.`;
         }
         if (text.includes('[Rampe') || text.includes('[Hysterese]')) {
-            msg += ' Rampe und Hysterese glaetten den Sollwert, damit die Ladung ruhig bleibt.';
+            msg += ' Rampe und Hysterese glätten den Sollwert, damit die Ladung ruhig bleibt.';
         }
         return msg;
     }
@@ -13457,7 +13721,7 @@ function _formatStorageReason(reason) {
     }
 
     if (text.includes('KURVEN-HALTEWAECHTER')) {
-        return `${time}: Kurven-Haltewaechter aktiv. Kurzer Netzbezug wurde erkannt, daher darf der Speicher gegensteuern, statt starr im Halt zu bleiben.`;
+        return `${time}: Kurven-Haltewächter aktiv. Kurzer Netzbezug wurde erkannt, daher darf der Speicher gegensteuern, statt starr im Halt zu bleiben.`;
     }
 
     if (text.includes('KURVEN-DUMP') || text.includes('TL-AUTODUMP')) {

@@ -1,9 +1,13 @@
 # Rollback
 
-Ein Rollback besteht aus zwei getrennten Teilen: Ein Docker-Programmstand kann
-auf einen in `UPDATE_POLICY.json` für Docker freigegebenen Image-Tag gesetzt
-werden; persistente Betriebsdaten einer Bare-Metal-Installation können aus
-einem manifestierten Sicherungspunkt wiederhergestellt werden.
+Ein Rollback besteht aus zwei getrennten Teilen: Ein Docker-Programmstand wird
+auf dem Host über den Image-Tag gewechselt; persistente Betriebsdaten einer
+Bare-Metal-Installation können aus einem manifestierten Sicherungspunkt
+wiederhergestellt werden. Als Docker-Rückfall-Image gibt `UPDATE_POLICY.json`
+den Rollback-Root `v5.3.2b` frei; der Wechsel auf dieses ältere Root-Image
+läuft über den Host-Helfer mit Rückmigration. Ein Wechsel zwischen
+Runtime-Images, etwa von 5.5.0 zurück auf 5.4.6d, erfolgt auf dem Host per
+`E3DC_IMAGE_TAG` (siehe „Rückfall von 5.5.0 auf 5.4.x“).
 
 Die Konsolenbeispiele verwenden den zuvor geprüften absoluten Produktpfad:
 
@@ -11,6 +15,36 @@ Die Konsolenbeispiele verwenden den zuvor geprüften absoluten Produktpfad:
 export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
+
+## Rückfall von 5.5.0 auf 5.4.x
+
+**Docker:** Ein Rückfall auf 5.4.6d erfolgt auf dem Host mit
+`E3DC_IMAGE_TAG=v5.4.6d` in `.env` und `sudo docker compose up -d`; ein
+Rückfall auf ein älteres Root-Image bleibt dem Host-Helfer vorbehalten (siehe
+[Docker-Dokumentation](Docker_Dokumentation.md)). Beim Rückfall auf 5.4.x
+entfernt die Konfigurationsbereinigung der älteren Version die in 5.5.0 neuen
+Einstellungen (u. a. Bluelink-Zugang, Zusatzwechselrichter, Marktprofil, neue
+Wallbox-Phasenparameter). Die beim Start angelegte Sicherung unter
+`data/config_backups/` enthält sie weiterhin; nach einer erneuten
+Aktualisierung auf 5.5.0 die Werte dort nachsehen und neu eintragen. Die
+Bluelink-Anbindung von 5.4.x benötigt ihren bisherigen Refresh-Token, den 5.5.0
+aus der Konfiguration entfernt hat; er steht in der vor dieser Bereinigung
+angelegten Sicherung unter `data/config_backups/` und muss nach dem Rückfall
+wieder eingetragen werden. Automatische Sicherungen in diesem Ordner werden
+auf die 20 neuesten gekürzt; neue entstehen bei jedem Containerstart und beim
+Speichern im Konfigurationseditor. Die benötigte Sicherung deshalb rechtzeitig
+an einen anderen Ort kopieren: die mit dem Refresh-Token direkt nach dem
+Update auf 5.5.0, die mit den neuen Werten direkt nach dem Rückfall.
+
+**Bare Metal:** Der Rückweg ist das beim Update angelegte verifizierte Backup
+(siehe „Betriebsdaten wiederherstellen“). Es stellt Programmstand und
+Konfiguration von vor dem Update wieder her; unter 5.5.0 neu eingetragene
+Werte wie Bluelink-Zugang oder Zusatzwechselrichter sind darin nicht enthalten.
+Sicherungspunkte werden ab 5.5.0 je Datei komprimiert, Update-Backups ebenso
+wie manuell angelegte (siehe [Backup](Backup.md)); ältere Versionen lesen
+dieses Format nicht. Nach dem Rückfall auf 5.4.x lassen sich die unter 5.5.0
+angelegten Sicherungspunkte deshalb erst nach einer erneuten Aktualisierung
+auf 5.5.0 wiederherstellen.
 
 ## Gebundene Recovery in 5.4.5a
 
@@ -244,7 +278,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand ist `v5.4.5a`.
+Der aktuelle Stable-Stand ist `v5.5.0`.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

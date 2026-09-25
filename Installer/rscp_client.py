@@ -725,6 +725,36 @@ BLOCKED_TYPE_CONFLICT_NO_SEND_TAG_NAMES = frozenset({
 BLOCKED_HARDWARE_PROTECTION_NO_SEND_TAG_NAMES = frozenset({
     "WB_REQ_SET_NUMBER_PHASES",
 })
+# Direkte Phasensteuerung (e3dc_direct_phase_control_v1): Diese vier Schreib-Tags
+# werden ausschließlich typstreng und nur auf einer Verbindung freigegeben, die
+# der Treiber ausdrücklich für den Direktvertrag markiert hat. Typen und Ablauf
+# nach evcc charger/e3dc.go (getestet Multi Connect II FW 7.0.6.0/1.0.3.0):
+# Sonnenmodus/Auto-Phasen/Abort als Bool, Phasenzahl als UChar8 1|3; die
+# Wallbox fährt die Umschaltfolge (Strom runter, schalten, hochfahren) selbst.
+DIRECT_PHASE_CONTROL_WRITE_TYPES = {
+    "WB_REQ_SET_SUN_MODE_ACTIVE": RscpType.Bool,
+    "WB_REQ_SET_AUTO_PHASE_SWITCH_ENABLED": RscpType.Bool,
+    "WB_REQ_SET_ABORT_CHARGING": RscpType.Bool,
+    "WB_REQ_SET_NUMBER_PHASES": RscpType.UChar8,
+}
+DIRECT_PHASE_CONTROL_PHASE_VALUES = (1, 3)
+
+
+def direct_phase_control_item_valid(item: dict) -> bool:
+    """Prüft ein freigegebenes Direkt-Schreibelement typstreng."""
+    if not isinstance(item, dict):
+        return False
+    tag = item.get("tag")
+    for name, expected in DIRECT_PHASE_CONTROL_WRITE_TYPES.items():
+        if tag != getattr(RscpTag, name):
+            continue
+        if item.get("type") != expected:
+            return False
+        value = item.get("value")
+        if expected == RscpType.Bool:
+            return type(value) is bool
+        return type(value) is int and value in DIRECT_PHASE_CONTROL_PHASE_VALUES
+    return False
 
 RSCP_TAG_PROVENANCE_CLASS = {
     **PROVISIONAL_READ_ONLY_TAG_PROVENANCE,
@@ -826,7 +856,11 @@ def validate_outbound_rscp_items(
     blocked_hardware_tags = {
         getattr(RscpTag, name) for name in BLOCKED_HARDWARE_PROTECTION_NO_SEND_TAG_NAMES
     }
-    _ = authorized_transition_tags
+    authorized_direct_tags = {
+        getattr(RscpTag, name)
+        for name in (authorized_transition_tags or frozenset())
+        if isinstance(name, str) and name in DIRECT_PHASE_CONTROL_WRITE_TYPES
+    }
 
     def walk(values):
         if not isinstance(values, list):
@@ -868,9 +902,13 @@ def validate_outbound_rscp_items(
                     raise ValueError("mirror request tag has invalid type or value")
             if tag in blocked_type_conflict_tags:
                 raise ValueError("blocked type-conflict tag is never outbound-capable")
-            if tag in blocked_hardware_tags:
+            if tag in authorized_direct_tags:
+                # Freigabe nur mit exakt dem dokumentierten Typ und Wert.
+                if not direct_phase_control_item_valid(item):
+                    raise ValueError("direct phase control tag has invalid type or value")
+            elif tag in blocked_hardware_tags:
                 raise ValueError("hardware-protected tag is never outbound-capable")
-            if tag in blocked_unreleased_transition_tags:
+            elif tag in blocked_unreleased_transition_tags:
                 raise ValueError("unreleased transition tag is never outbound-capable")
             if type_byte == RscpType.Container:
                 walk(value)
@@ -1258,20 +1296,38 @@ class RscpConnection:
         self._authenticated = False
         self._received_frame = False
         self._authorized_transition_tags = frozenset()
+        # Fail-closed: erst der Treiber mit aktivem Direktvertrag gibt frei.
+        self._direct_phase_control_released = False
 
     @property
     def connected(self) -> bool:
         """Meldet eine offene, lokal authentifizierte RSCP-Sitzung."""
         return self._sock is not None and self._authenticated
 
+    def set_direct_phase_control_released(self, released: bool) -> None:
+        """Markiert die Sitzung für den Direktvertrag (nur der Treiber setzt das)."""
+        self._direct_phase_control_released = bool(released)
+        if not self._direct_phase_control_released:
+            self._authorized_transition_tags = frozenset()
+
+    @property
+    def direct_phase_control_released(self) -> bool:
+        return bool(self._direct_phase_control_released)
+
     @contextmanager
     def authorized_transition_write(self, *tag_names: str):
-        """Lehnt nicht freigegebene direkte Wallboxtransitionen ausnahmslos ab."""
-        unknown = set(tag_names) - set(BLOCKED_UNRELEASED_TRANSITION_NO_SEND_TAG_NAMES)
+        """Gibt direkte Wallboxwrites nur typstreng und nur bei markiertem Direktvertrag frei."""
+        unknown = set(tag_names) - set(DIRECT_PHASE_CONTROL_WRITE_TYPES)
         if unknown:
             raise ValueError(f"unsupported transition guard: {sorted(unknown)}")
-        raise ValueError("direct wallbox transition writes are not released")
-        yield self
+        if not self._direct_phase_control_released:
+            raise ValueError("direct wallbox transition writes are not released")
+        previous = self._authorized_transition_tags
+        self._authorized_transition_tags = frozenset(tag_names)
+        try:
+            yield self
+        finally:
+            self._authorized_transition_tags = previous
 
     def connect(self):
         """Öffnet eine neue TCP-Verbindung; authenticate() meldet sie anschließend an."""

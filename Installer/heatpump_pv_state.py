@@ -291,7 +291,7 @@ def validate_heatpump_pv_command(state):
         if (isinstance(target, bool) or not isinstance(target, (int, float))
                 or not math.isfinite(target) or not 0 <= target <= 100):
             return {}
-    for key in ("confirmed", "withdrawal_confirmed", "withdrawal_requested"):
+    for key in ("confirmed", "readback_confirmed", "withdrawal_confirmed", "withdrawal_requested"):
         if key in value and type(value[key]) is not bool:
             return {}
     return value

@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -1674,13 +1675,21 @@ def install_docker_routine():
 
     print("Dieser Assistent installiert Docker, beendet die lokalen Dienste")
     print("und migriert deine bestehende Installation (Daten & Config) vollautomatisch")
-    print("in die isolierte Docker-Umgebung. Updates erfolgen standardmäßig bewusst")
-    print("über Docker Compose; der nicht mehr gepflegte Watchtower bleibt nur")
-    print("für bestehende Installationen als ausdrücklich optionales Profil erhalten.\n")
+    print("in die isolierte Docker-Umgebung. Updates laufen danach über den")
+    print("Update-Knopf der Weboberfläche oder das Auto-Update zur eingestellten")
+    print("Uhrzeit; ausgeführt werden sie vom optionalen Watchtower-Dienst.\n")
 
     if input("Möchtest du jetzt zu Docker wechseln? (j/n): ").strip().lower() != 'j':
         print("Abbruch.")
         return False
+
+    print("\nWatchtower zieht neue Images und erstellt den Container neu. Dafür")
+    print("benötigt es Zugriff auf den Docker-Socket des Hosts; es handelt nur auf")
+    print("Signal von E3DC-Control (Update-Knopf oder Auto-Update im Config-Editor).")
+    print("Ohne Watchtower zeigt der Update-Knopf die Host-Befehle zum Aktualisieren.")
+    start_watchtower = input(
+        "Watchtower für Update-Knopf und Auto-Update einrichten? (j/n): "
+    ).strip().lower() == 'j'
 
     install_user = get_install_user()
 
@@ -1809,7 +1818,8 @@ def install_docker_routine():
         os.makedirs(data_dir, exist_ok=True)
         os.makedirs(logs_dir, exist_ok=True)
 
-        # 3. docker-compose.yml generieren (Watchtower nur als Opt-in-Profil)
+        # 3. docker-compose.yml generieren (Watchtower als Opt-in-Profil, das
+        #    Update-Knopf und Auto-Update der Weboberfläche ausführt)
         compose_content = f"""services:
   e3dc-control:
     # Ohne E3DC_IMAGE_TAG folgt die Installation dem Stable-Tag "latest".
@@ -1827,7 +1837,10 @@ def install_docker_routine():
         max-size: "10m"
         max-file: "3"
     labels:
-      - com.centurylinklabs.watchtower.enable=${{E3DC_WATCHTOWER_ENABLE:-false}}
+      # Watchtower aktualisiert diesen Container nur, wenn das Profil
+      # "auto-update" läuft. Mit E3DC_WATCHTOWER_ENABLE=false in .env bleibt
+      # der Container auch dann ausgenommen.
+      - com.centurylinklabs.watchtower.enable=${{E3DC_WATCHTOWER_ENABLE:-true}}
     volumes:
       - ./data:/var/www/html/data
       - ./logs:/var/www/html/logs
@@ -1835,14 +1848,24 @@ def install_docker_routine():
       - e3dc_forecast_evidence:/var/lib/e3dc-control/forecast-evidence
       - e3dc_instance_role:/etc/e3dc-control
     tmpfs:
-      - /var/www/html/ramdisk:size=32M,uid=33,gid=33,mode=2775
+      - /var/www/html/ramdisk:size=64M,uid=33,gid=33,mode=2775
     environment:
       - TZ=Europe/Berlin
       - E3DC_CONTAINER_MODE=1
+      # Update-Knopf und Auto-Update der Weboberfläche geben Watchtower über
+      # dessen lokale HTTP-API das Signal. Das Token steht in .env.
+      - E3DC_WATCHTOWER_API_URL=http://127.0.0.1:${{E3DC_WATCHTOWER_API_PORT:-18080}}
+      - E3DC_WATCHTOWER_API_TOKEN=${{E3DC_WATCHTOWER_API_TOKEN:-}}
   watchtower:
-    image: containrrr/watchtower
+    # containrrr/watchtower ist seit Dezember 2025 archiviert. Der gepflegte
+    # Fork ist label- und umgebungskompatibel; der Major-Tag "1" schützt vor
+    # der angekündigten Konfigurationsänderung in Watchtower 2.
+    image: ghcr.io/nicholas-fedor/watchtower:1
     container_name: watchtower
     restart: unless-stopped
+    # Hostnetz, damit die HTTP-API ausschließlich auf der Loopback-Adresse des
+    # Hosts liegt und E3DC-Control sie unter 127.0.0.1 erreicht.
+    network_mode: host
     logging:
       driver: json-file
       options:
@@ -1854,10 +1877,15 @@ def install_docker_routine():
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - TZ=Europe/Berlin
-      - DOCKER_API_VERSION=1.40
       - WATCHTOWER_CLEANUP=true
       - WATCHTOWER_LABEL_ENABLE=true
-      - WATCHTOWER_POLL_INTERVAL=86400 # Prüft alle 24h, erster Lauf sofort
+      # Watchtower handelt nur auf Signal von E3DC-Control: Update-Knopf oder
+      # Auto-Update zur im Config-Editor eingestellten Uhrzeit.
+      - WATCHTOWER_HTTP_API_ENDPOINTS=update
+      - WATCHTOWER_HTTP_API_HOST=127.0.0.1
+      - WATCHTOWER_HTTP_API_PORT=${{E3DC_WATCHTOWER_API_PORT:-18080}}
+      - WATCHTOWER_HTTP_API_TOKEN=${{E3DC_WATCHTOWER_API_TOKEN:-}}
+      - WATCHTOWER_HTTP_API_PERIODIC_POLLS=false
 
 volumes:
   e3dc_ml:
@@ -1868,6 +1896,20 @@ volumes:
         with open(os.path.join(docker_dir, "docker-compose.yml"), "w") as f:
             f.write(compose_content)
         print("  ✓ docker-compose.yml mit optionalem Watchtower-Profil erstellt.")
+
+        # Das Token verbindet Update-Knopf/Auto-Update mit Watchtower. Es wird
+        # nur ergänzt, nie überschrieben; eine vorhandene .env bleibt erhalten.
+        env_path = os.path.join(docker_dir, ".env")
+        env_lines = []
+        if os.path.isfile(env_path):
+            with open(env_path, "r", encoding="utf-8") as env_file:
+                env_lines = env_file.read().splitlines()
+        if not any(line.startswith("E3DC_WATCHTOWER_API_TOKEN=") for line in env_lines):
+            env_lines.append("E3DC_WATCHTOWER_API_TOKEN=" + secrets.token_hex(24))
+            env_fd = os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(env_fd, "w", encoding="utf-8") as env_file:
+                env_file.write("\n".join(env_lines) + "\n")
+            print("  ✓ Watchtower-API-Token in .env erzeugt.")
 
         # 4. Image vollständig laden, solange die Host-Dienste noch laufen.
         print("\n→ Lade Docker-Image...")
@@ -2083,10 +2125,26 @@ volumes:
             print("✓ DOCKER MIGRATION ERFOLGREICH!")
             print("="*60)
             print("Dein System läuft nun vollständig isoliert in Docker.")
-            print("Updates werden über den mitkopierten, fail-closed Host-Helfer installiert:")
-            print("sudo python3 ./docker_compose_update.py --compose-dir . --sudo")
-            print("Das nicht mehr gepflegte Watchtower-Profil bleibt wegen seines")
-            print("weitreichenden Docker-Socket-Zugriffs standardmäßig aus.")
+            if start_watchtower:
+                watchtower_result = subprocess.run(
+                    ["sudo", "docker", "compose", "--profile", "auto-update", "up", "-d", "watchtower"],
+                    cwd=docker_dir,
+                    capture_output=True,
+                    text=True,
+                )
+                if watchtower_result.returncode == 0:
+                    print("Watchtower läuft: Updates startest du über den Update-Knopf der")
+                    print("Weboberfläche oder automatisch über 'Auto-Update' im Config-Editor.")
+                else:
+                    print("Watchtower konnte nicht gestartet werden:")
+                    print(watchtower_result.stderr.strip())
+                    print("Später nachholen mit: sudo docker compose --profile auto-update up -d watchtower")
+            else:
+                print("Ohne Watchtower aktualisierst du auf dem Host mit:")
+                print("sudo docker compose pull && sudo docker compose up -d")
+                print("Watchtower später nachrüsten: sudo docker compose --profile auto-update up -d watchtower")
+            print("Der mitkopierte Host-Helfer docker_compose_update.py bleibt für den")
+            print("geprüften Wechsel mit automatischem Rückfall verfügbar.")
             print(f"Deine persistenen Daten liegen sicher in: {data_dir}")
             print("Die optionale PV-Prognosediagnose startet im privaten Docker-Volume")
             print("bewusst mit einer neuen Vergleichshistorie; Bare-Metal-Rohdaten")

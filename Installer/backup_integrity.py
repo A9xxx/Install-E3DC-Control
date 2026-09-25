@@ -12,8 +12,10 @@ from __future__ import annotations
 import datetime as _datetime
 import ctypes
 import errno
+import gzip
 import hashlib
 import json
+import zlib
 import os
 import pwd
 import re
@@ -84,6 +86,23 @@ BACKUP_ESTIMATE_FIXED_OVERHEAD_BYTES = 64 * 1024
 BACKUP_ESTIMATE_SOURCE_OVERHEAD_BYTES = 1024
 BACKUP_ESTIMATE_DIRECTORY_OVERHEAD_BYTES = 4 * 1024
 BACKUP_ESTIMATE_FILE_OVERHEAD_BYTES = 8 * 1024
+# Dateien ab 4 KiB aus Programmbaum, Web-Programm und Datenverzeichnissen
+# (Historien, Konfiguration, Matter-Storage) und die Prognosebelege werden je
+# Datei gzip-komprimiert gesichert. Das Manifest führt Größe und SHA-256 des
+# Originalinhalts und der gespeicherten Bytes. Einzeldatei-Quellen, Units,
+# /etc/e3dc-control, übriger Systemzustand und ML-Dateien bleiben Kopien.
+COMPRESSED_ENTRY_ENCODING = "gzip"
+COMPRESSED_ENTRY_SUFFIX = ".gz"
+COMPRESSED_ENTRY_MIN_BYTES = 4096
+COMPRESSED_ENTRY_CATEGORIES = frozenset({
+    "web-data", "web-history-backups", "install-data", "install-tree", "web-program",
+})
+COMPRESSED_SYSTEM_STATE_PREFIXES = ("forecast-evidence",)
+_ALREADY_COMPRESSED_SUFFIXES = frozenset({
+    ".gz", ".tgz", ".xz", ".zip", ".bz2", ".zst",
+    ".png", ".jpg", ".jpeg", ".ico", ".woff", ".woff2", ".pkl",
+})
+SUPPORTED_ENTRY_ENCODINGS = frozenset({COMPRESSED_ENTRY_ENCODING})
 
 
 class BackupIntegrityError(RuntimeError):
@@ -381,12 +400,12 @@ def _open_regular_file_nofollow(path: PathValue) -> Tuple[int, os.stat_result]:
     try:
         before = os.stat(candidate.name, dir_fd=parent_descriptor, follow_symlinks=False)
         if not stat.S_ISREG(before.st_mode):
-            raise BackupIntegrityError("Nur regulaere Dateien sind erlaubt: {}".format(candidate))
+            raise BackupIntegrityError("Nur reguläre Dateien sind erlaubt: {}".format(candidate))
         descriptor = os.open(candidate.name, os.O_RDONLY | _NOFOLLOW, dir_fd=parent_descriptor)
         opened = os.fstat(descriptor)
         if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
             os.close(descriptor)
-            raise BackupIntegrityError("Quelldatei wurde waehrend des Oeffnens ausgetauscht: {}".format(candidate))
+            raise BackupIntegrityError("Quelldatei wurde während des Öffnens ausgetauscht: {}".format(candidate))
         return descriptor, opened
     finally:
         os.close(parent_descriptor)
@@ -684,7 +703,7 @@ def _read_private_ml_entry(
     try:
         opened = os.fstat(descriptor)
         if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
-            raise BackupIntegrityError("Privater ML-Eintrag wurde beim Oeffnen ausgetauscht: {}".format(name))
+            raise BackupIntegrityError("Privater ML-Eintrag wurde beim Öffnen ausgetauscht: {}".format(name))
         payload = bytearray()
         while len(payload) <= maximum:
             chunk = os.read(descriptor, min(1024 * 1024, maximum + 1 - len(payload)))
@@ -695,7 +714,7 @@ def _read_private_ml_entry(
         before_signature = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
         after_signature = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
         if len(payload) > maximum or len(payload) != before.st_size or before_signature != after_signature:
-            raise BackupIntegrityError("Privater ML-Eintrag wurde waehrend des Lesens veraendert: {}".format(name))
+            raise BackupIntegrityError("Privater ML-Eintrag wurde während des Lesens verändert: {}".format(name))
         return bytes(payload)
     finally:
         os.close(descriptor)
@@ -942,7 +961,7 @@ def validate_private_ml_store(
             raise BackupIntegrityError("Privates ML-Modellverzeichnis besitzt einen falschen Owner")
         try:
             if owner_uid == pwd.getpwnam("www-data").pw_uid:
-                raise BackupIntegrityError("Privates ML-Modellverzeichnis darf nicht www-data gehoeren")
+                raise BackupIntegrityError("Privates ML-Modellverzeichnis darf nicht www-data gehören")
         except KeyError:
             pass
         current = root.parent
@@ -966,7 +985,7 @@ def validate_private_ml_store(
         opened = os.fstat(descriptor)
         if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
             os.close(descriptor)
-            raise BackupIntegrityError("Privates ML-Modellverzeichnis wurde beim Oeffnen ausgetauscht")
+            raise BackupIntegrityError("Privates ML-Modellverzeichnis wurde beim Öffnen ausgetauscht")
     finally:
         os.close(parent_descriptor)
 
@@ -999,7 +1018,7 @@ def validate_private_ml_store(
 
         if ML_MODEL_MANIFEST_NAME not in names:
             if model_names:
-                raise BackupIntegrityError("ML-Modellartefakt ohne Manifest ist nicht zulaessig")
+                raise BackupIntegrityError("ML-Modellartefakt ohne Manifest ist nicht zulässig")
             return {
                 "state": "untrained",
                 "root": str(root),
@@ -1031,7 +1050,7 @@ def validate_private_ml_store(
             expected_hash = _ML_MODEL_FILE_RE.fullmatch(name).group(1)  # type: ignore[union-attr]
             payload = _read_private_ml_entry(descriptor, name, owner_uid, ML_MODEL_MAX_BYTES)
             if hashlib.sha256(payload).hexdigest() != expected_hash:
-                raise BackupIntegrityError("Privates ML-Artefakt stimmt nicht mit seinem Dateihash ueberein")
+                raise BackupIntegrityError("Privates ML-Artefakt stimmt nicht mit seinem Dateihash überein")
         return {
             "state": "ready",
             "root": str(root),
@@ -1069,7 +1088,7 @@ def _verify_private_ml_backup_contract(backup: Path, manifest: Dict[str, object]
         directory_uid = int(ml_directory_metadata.get("uid", -1))
         try:
             if directory_uid == pwd.getpwnam("www-data").pw_uid:
-                raise BackupIntegrityError("Privates ML-Verzeichnis im Backup darf nicht www-data gehoeren")
+                raise BackupIntegrityError("Privates ML-Verzeichnis im Backup darf nicht www-data gehören")
         except KeyError:
             pass
 
@@ -1101,7 +1120,7 @@ def _verify_private_ml_backup_contract(backup: Path, manifest: Dict[str, object]
         if owner_uid is None:
             owner_uid = entry_uid
         elif entry_uid != owner_uid:
-            raise BackupIntegrityError("Private ML-Backupeintraege besitzen verschiedene Owner")
+            raise BackupIntegrityError("Private ML-Backupeinträge besitzen verschiedene Owner")
     if entries_by_name and ml_directory_metadata is None:
         raise BackupIntegrityError("Verzeichnismetadaten des privaten ML-Stores fehlen im Backup")
     if owner_uid is not None and int(ml_directory_metadata.get("uid", -1)) != owner_uid:
@@ -1130,7 +1149,7 @@ def _verify_private_ml_backup_contract(backup: Path, manifest: Dict[str, object]
         raise BackupIntegrityError("ML-Manifest im Backup verweist nicht exakt auf sein Modell")
     model_entry, model_path = entries_by_name[model_name]
     if str(model_entry.get("sha256") or "") != expected_hash or sha256_file(model_path) != expected_hash:
-        raise BackupIntegrityError("ML-Modell im Backup stimmt nicht mit seinem inneren Manifest ueberein")
+        raise BackupIntegrityError("ML-Modell im Backup stimmt nicht mit seinem inneren Manifest überein")
 
     for name in model_names:
         entry, path = entries_by_name[name]
@@ -1168,7 +1187,7 @@ def _account_home_boundaries() -> Set[Path]:
         try:
             boundaries.add(_lexical_absolute(raw))
         except BackupIntegrityError as exc:
-            raise BackupIntegrityError("Ungueltige Konten-Homegrenze") from exc
+            raise BackupIntegrityError("Ungültige Konten-Homegrenze") from exc
     return boundaries
 
 
@@ -1182,7 +1201,7 @@ def _validate_backup_root_location(root: Path, install: Path) -> Tuple[Path, Pat
             )
         )
     if root in _protected_backup_locations(install):
-        raise BackupIntegrityError("Backup-Root ist ein geschuetzter Home-/Install-/Systempfad: {}".format(root))
+        raise BackupIntegrityError("Backup-Root ist ein geschützter Home-/Install-/Systempfad: {}".format(root))
     home_boundaries = _account_home_boundaries()
     try:
         home_boundaries.add(_lexical_absolute(Path.home()))
@@ -1191,10 +1210,10 @@ def _validate_backup_root_location(root: Path, install: Path) -> Tuple[Path, Pat
     if any(_is_within(root, boundary) for boundary in home_boundaries):
         raise BackupIntegrityError("Backup-Root darf nicht innerhalb eines Benutzer-Home liegen.")
     if _is_within(root, install) or _is_within(install, root):
-        raise BackupIntegrityError("Backup-Root und Installationsbaum duerfen sich nicht ueberlappen.")
+        raise BackupIntegrityError("Backup-Root und Installationsbaum dürfen sich nicht überlappen.")
     for forbidden_parent in (Path("/etc"), Path("/usr"), Path("/bin"), Path("/sbin"), Path("/lib"), Path("/proc"), Path("/sys"), Path("/dev"), Path("/run"), Path("/var/www")):
         if _is_within(root, forbidden_parent):
-            raise BackupIntegrityError("Backup-Root liegt unter einem geschuetzten Systempfad: {}".format(root))
+            raise BackupIntegrityError("Backup-Root liegt unter einem geschützten Systempfad: {}".format(root))
     return root, install
 
 
@@ -1348,7 +1367,7 @@ def _read_root_marker(root: Path) -> Dict[str, object]:
                 break
             data += block
             if len(data) > 65536:
-                raise BackupIntegrityError("Backup-Root-Marker ist unplausibel gross.")
+                raise BackupIntegrityError("Backup-Root-Marker ist unplausibel groß.")
         after = os.fstat(descriptor)
         named_after = os.lstat(str(marker))
         if identity != (
@@ -1380,7 +1399,7 @@ def _read_root_marker(root: Path) -> Dict[str, object]:
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise BackupIntegrityError("Backup-Root-Marker ist unlesbar: {}".format(exc))
     if not isinstance(payload, dict):
-        raise BackupIntegrityError("Backup-Root-Marker ist ungueltig.")
+        raise BackupIntegrityError("Backup-Root-Marker ist ungültig.")
     return payload
 
 
@@ -1421,7 +1440,7 @@ def configured_backup_root(install_root: PathValue) -> Path:
         else:
             marker = _read_root_marker(root)
             if marker != _root_marker_payload(install):
-                raise BackupIntegrityError("Backup-Root gehoert zu einer anderen Installation.")
+                raise BackupIntegrityError("Backup-Root gehört zu einer anderen Installation.")
     return root
 
 
@@ -1489,14 +1508,14 @@ def validate_existing_backup_root(backup_root: PathValue, install_root: PathValu
     os.close(descriptor)
     marker = _read_root_marker(root)
     if marker != _root_marker_payload(install):
-        raise BackupIntegrityError("Backup-Root-Marker stimmt nicht mit der Installation ueberein.")
+        raise BackupIntegrityError("Backup-Root-Marker stimmt nicht mit der Installation überein.")
     return root
 
 
 def _validate_category(category: str) -> str:
     value = str(category or "").strip().lower()
     if not _CATEGORY_RE.fullmatch(value):
-        raise BackupIntegrityError("Ungueltige Backup-Kategorie: {!r}".format(category))
+        raise BackupIntegrityError("Ungültige Backup-Kategorie: {!r}".format(category))
     return value
 
 
@@ -1524,6 +1543,115 @@ def _copy_fd_to_path(source_descriptor: int, destination: Path, source_mode: int
         os.close(descriptor)
     os.chmod(str(destination), source_mode & 0o777)
     return total_size, hasher.hexdigest()
+
+
+def _entry_should_be_compressed(
+    category: str,
+    relative: Path,
+    size: int,
+    *,
+    root_is_file: bool,
+    sibling_names: Optional[Set[str]] = None,
+) -> bool:
+    """Statischer Vertrag: Programm-, Daten- und Prognosedateien ab 4 KiB werden komprimiert."""
+
+    if root_is_file or size < COMPRESSED_ENTRY_MIN_BYTES:
+        return False
+    if category == "system-state":
+        if not relative.parts or relative.parts[0] not in COMPRESSED_SYSTEM_STATE_PREFIXES:
+            return False
+    elif category not in COMPRESSED_ENTRY_CATEGORIES:
+        return False
+    if relative.suffix.lower() in _ALREADY_COMPRESSED_SUFFIXES:
+        return False
+    # Ein gleichnamiger Nachbar mit .gz-Endung würde denselben Backuppfad
+    # belegen; diese Datei bleibt dann unkomprimiert.
+    if sibling_names is not None and relative.name + COMPRESSED_ENTRY_SUFFIX in sibling_names:
+        return False
+    return True
+
+
+def _copy_fd_to_gzip_path(
+    source_descriptor: int,
+    destination: Path,
+    source_mode: int,
+) -> tuple[int, str, int, str]:
+    """Schreibt die Quelle gzip-komprimiert und liest sie zur Kontrolle zurück.
+
+    Liefert Größe und SHA-256 des Originalinhalts sowie der gespeicherten Bytes.
+    """
+
+    _ensure_directory_tree(destination.parent)
+    descriptor = os.open(
+        str(destination), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600
+    )
+    content_hasher = hashlib.sha256()
+    content_size = 0
+    try:
+        os.lseek(source_descriptor, 0, os.SEEK_SET)
+        with os.fdopen(descriptor, "wb", closefd=False) as raw:
+            with gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=6, mtime=0) as archive:
+                while True:
+                    block = os.read(source_descriptor, 1024 * 1024)
+                    if not block:
+                        break
+                    content_hasher.update(block)
+                    content_size += len(block)
+                    archive.write(block)
+            raw.flush()
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.chmod(str(destination), source_mode & 0o777)
+    stored_size = destination.stat().st_size
+    stored_sha = sha256_file(destination)
+    readback_size, readback_sha = _gzip_content_digest(destination, content_size)
+    if readback_size != content_size or readback_sha != content_hasher.hexdigest():
+        _unlink_if_exists(destination)
+        raise BackupIntegrityError(
+            "Komprimierte Backupkopie ließ sich nicht identisch zurücklesen: {}".format(destination)
+        )
+    return content_size, content_hasher.hexdigest(), stored_size, stored_sha
+
+
+def _gzip_content_digest(path: Path, expected_size: int) -> tuple[int, str]:
+    """Entpackt eine gespeicherte gzip-Datei begrenzt und liefert Größe und SHA-256."""
+
+    descriptor, _metadata = _open_regular_file_nofollow(path)
+    digest = hashlib.sha256()
+    total = 0
+    limit = max(0, int(expected_size)) + 1
+    try:
+        with os.fdopen(descriptor, "rb", closefd=False) as raw:
+            with gzip.GzipFile(fileobj=raw, mode="rb") as archive:
+                while True:
+                    block = archive.read(1024 * 1024)
+                    if not block:
+                        break
+                    total += len(block)
+                    if total > limit:
+                        raise BackupIntegrityError(
+                            "Komprimierte Backupdatei ist größer als im Manifest: {}".format(path)
+                        )
+                    digest.update(block)
+    except (OSError, EOFError, gzip.BadGzipFile, zlib.error) as exc:
+        raise BackupIntegrityError("Komprimierte Backupdatei ist nicht lesbar: {}".format(path)) from exc
+    finally:
+        os.close(descriptor)
+    return total, digest.hexdigest()
+
+
+def _compress_backup_copy_in_place(destination: Path, source_mode: int) -> tuple[int, str, int, str]:
+    """Komprimiert eine bereits konsistent kopierte Datei (SQLite-Online-Kopie)."""
+
+    compressed = destination.with_name(destination.name + COMPRESSED_ENTRY_SUFFIX)
+    descriptor, _metadata = _open_regular_file_nofollow(destination)
+    try:
+        result = _copy_fd_to_gzip_path(descriptor, compressed, source_mode)
+    finally:
+        os.close(descriptor)
+    _unlink_if_exists(destination)
+    return result
 
 
 def _copy_sqlite_fd(source_descriptor: int, destination: Path, source_mode: int) -> tuple[int, str]:
@@ -1950,6 +2078,7 @@ def copy_persistent_sources(
         root_is_file: bool,
         item: PersistentSource,
         record: Dict[str, object],
+        sibling_names: Optional[Set[str]] = None,
     ) -> bool:
         restore_text = str(source_path)
         if not stat.S_ISREG(metadata.st_mode):
@@ -1969,10 +2098,32 @@ def copy_persistent_sources(
         destination = backup / archive_relative
         suffix = source_path.suffix.lower()
         sqlite_source = suffix in {".db", ".sqlite", ".sqlite3"}
+        compress = _entry_should_be_compressed(
+            category,
+            relative,
+            int(metadata.st_size),
+            root_is_file=root_is_file,
+            sibling_names=sibling_names,
+        )
+        stored_size: Optional[int] = None
+        stored_sha: Optional[str] = None
         if sqlite_source:
             size, sha = _copy_sqlite_fd(source_descriptor, destination, stat.S_IMODE(metadata.st_mode))
+            if compress:
+                size, sha, stored_size, stored_sha = _compress_backup_copy_in_place(
+                    destination, stat.S_IMODE(metadata.st_mode)
+                )
+        elif compress:
+            size, sha, stored_size, stored_sha = _copy_fd_to_gzip_path(
+                source_descriptor,
+                destination.with_name(destination.name + COMPRESSED_ENTRY_SUFFIX),
+                stat.S_IMODE(metadata.st_mode),
+            )
         else:
             size, sha = _copy_fd_to_path(source_descriptor, destination, stat.S_IMODE(metadata.st_mode))
+        if compress:
+            archive_relative = archive_relative.with_name(archive_relative.name + COMPRESSED_ENTRY_SUFFIX)
+            destination = backup / archive_relative
         after = os.fstat(source_descriptor)
         if (
             (after.st_dev, after.st_ino) != (metadata.st_dev, metadata.st_ino)
@@ -1983,7 +2134,7 @@ def copy_persistent_sources(
                 _unlink_if_exists(destination)
                 record_skipped_entry(record, relative, after, "live-drift")
                 return False
-            raise BackupIntegrityError("Quelle wurde waehrend des Backups ausgetauscht: {}".format(source_path))
+            raise BackupIntegrityError("Quelle wurde während des Backups ausgetauscht: {}".format(source_path))
         if not sqlite_source and (
             after.st_size != metadata.st_size
             or after.st_mtime_ns != metadata.st_mtime_ns
@@ -2005,7 +2156,7 @@ def copy_persistent_sources(
                 )
             )
         restore_destinations.add(restore_text)
-        mapped_entries.append({
+        mapped_entry: Dict[str, object] = {
             "backup_path": archive_relative.as_posix(),
             "restore_path": restore_text,
             "category": category,
@@ -2014,7 +2165,14 @@ def copy_persistent_sources(
             "restore_gid": int(metadata.st_gid),
             "size": size,
             "sha256": sha,
-        })
+        }
+        if compress:
+            mapped_entry.update({
+                "encoding": COMPRESSED_ENTRY_ENCODING,
+                "stored_size": int(stored_size or 0),
+                "stored_sha256": str(stored_sha),
+            })
+        mapped_entries.append(mapped_entry)
         return True
 
     def walk_directory(
@@ -2027,7 +2185,9 @@ def copy_persistent_sources(
         record: Dict[str, object],
     ) -> int:
         copied = 0
-        for name in sorted(os.listdir(directory_descriptor)):
+        listing = sorted(os.listdir(directory_descriptor))
+        sibling_names = set(listing)
+        for name in listing:
             if _persistent_entry_is_excluded(name, relative, item):
                 continue
             child_relative = relative / name
@@ -2120,6 +2280,7 @@ def copy_persistent_sources(
                         False,
                         item,
                         record,
+                        sibling_names,
                     ):
                         copied += 1
                 finally:
@@ -2128,7 +2289,7 @@ def copy_persistent_sources(
                 if may_skip_unsafe_entry(item):
                     record_skipped_entry(record, child_relative, metadata, "special")
                     continue
-                raise BackupIntegrityError("Nicht regulaerer Eintrag in Backupquelle: {}".format(child_path))
+                raise BackupIntegrityError("Nicht regulärer Eintrag in Backupquelle: {}".format(child_path))
         return copied
 
     for source in sources:
@@ -2243,7 +2404,7 @@ def copy_persistent_sources(
                     record["source_type"] = "skipped"
                     record_skipped_entry(record, Path(), metadata, "special")
                     continue
-                raise BackupIntegrityError("Backupquelle ist kein regulaerer Pfad: {}".format(source_path))
+                raise BackupIntegrityError("Backupquelle ist kein regulärer Pfad: {}".format(source_path))
         finally:
             os.close(parent_descriptor)
         if bound_source_root is not None:
@@ -2256,7 +2417,7 @@ def copy_persistent_sources(
 def _safe_relative_path(value: str) -> Path:
     relative = Path(str(value or ""))
     if relative.is_absolute() or not relative.parts or ".." in relative.parts:
-        raise BackupIntegrityError("Ungueltiger relativer Manifestpfad: {!r}".format(value))
+        raise BackupIntegrityError("Ungültiger relativer Manifestpfad: {!r}".format(value))
     return relative
 
 
@@ -2276,7 +2437,7 @@ def _scan_backup_files(backup: Path) -> List[Path]:
                 continue
             metadata = os.lstat(str(candidate))
             if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-                raise BackupIntegrityError("Ungueltiger Dateityp im Backup: {}".format(candidate))
+                raise BackupIntegrityError("Ungültiger Dateityp im Backup: {}".format(candidate))
             files.append(candidate)
     return sorted(files)
 
@@ -2312,7 +2473,7 @@ def finalize_backup(
 ) -> Dict[str, object]:
     backup = _assert_no_symlink_components(backup_dir)
     if kind not in {SYSTEM_BACKUP_KIND, WEB_SNAPSHOT_KIND, QUIESCED_OVERLAY_KIND}:
-        raise BackupIntegrityError("Ungueltige Backup-Art: {}".format(kind))
+        raise BackupIntegrityError("Ungültige Backup-Art: {}".format(kind))
     mapped_entries_list = [dict(item) for item in mapped_entries]
     source_records_list = [dict(item) for item in source_records]
     mapped = {str(item["backup_path"]): item for item in mapped_entries_list}
@@ -2347,7 +2508,7 @@ def finalize_backup(
         overlay_install_root = None
     files = _scan_backup_files(backup)
     if not files and kind != QUIESCED_OVERLAY_KIND:
-        raise BackupIntegrityError("Leeres Backup ist nicht zulaessig.")
+        raise BackupIntegrityError("Leeres Backup ist nicht zulässig.")
     manifest_files: List[Dict[str, object]] = []
     for path in files:
         relative = path.relative_to(backup).as_posix()
@@ -2357,7 +2518,7 @@ def finalize_backup(
         if entry_size is None or entry_sha is None:
             entry_size = path.stat().st_size
             entry_sha = sha256_file(path)
-        manifest_files.append({
+        manifest_entry: Dict[str, object] = {
             "path": relative,
             "size": int(entry_size),
             "sha256": str(entry_sha),
@@ -2366,7 +2527,17 @@ def finalize_backup(
             "gid": int(mapping.get("restore_gid", path.stat().st_gid)),
             "category": mapping.get("category"),
             "restore_path": mapping.get("restore_path"),
-        })
+        }
+        encoding = mapping.get("encoding")
+        if encoding is not None:
+            if encoding not in SUPPORTED_ENTRY_ENCODINGS:
+                raise BackupIntegrityError("Unbekannte Backup-Kodierung: {}".format(encoding))
+            manifest_entry.update({
+                "encoding": str(encoding),
+                "stored_size": int(mapping["stored_size"]),
+                "stored_sha256": str(mapping["stored_sha256"]),
+            })
+        manifest_files.append(manifest_entry)
     unknown = sorted(set(mapped) - {str(item["path"]) for item in manifest_files})
     if unknown:
         raise BackupIntegrityError("Manifestzuordnung verweist auf fehlende Dateien: {}".format(unknown[:3]))
@@ -2386,6 +2557,11 @@ def finalize_backup(
         "files": manifest_files,
         "sources": source_records_list,
     }
+    file_encodings = sorted({
+        str(item["encoding"]) for item in manifest_files if item.get("encoding")
+    })
+    if file_encodings:
+        manifest["file_encodings"] = file_encodings
     if kind == QUIESCED_OVERLAY_KIND:
         manifest.update({
             "transaction_id": overlay_transaction_id,
@@ -2429,11 +2605,11 @@ def verify_backup(
         digest_text = _read_small_file(digest_path, 4096, "ascii").strip().split()
         manifest_bytes = _read_small_file_bytes(manifest_path, 16 * 1024 * 1024)
     except (FileNotFoundError, OSError, UnicodeError) as exc:
-        raise BackupIntegrityError("Backup, Pflichtmanifest oder Manifest-Pruefsumme fehlt: {}".format(exc))
+        raise BackupIntegrityError("Backup, Pflichtmanifest oder Manifest-Prüfsumme fehlt: {}".format(exc))
     if len(digest_text) != 2 or digest_text[1] != MANIFEST_NAME or not _SHA256_RE.fullmatch(digest_text[0]):
-        raise BackupIntegrityError("Manifest-Pruefsummendatei ist ungueltig.")
+        raise BackupIntegrityError("Manifest-Prüfsummendatei ist ungültig.")
     if hashlib.sha256(manifest_bytes).hexdigest() != digest_text[0]:
-        raise BackupIntegrityError("Manifest-Pruefsumme stimmt nicht.")
+        raise BackupIntegrityError("Manifest-Prüfsumme stimmt nicht.")
     if (
         expected_manifest_sha256 is not None
         and digest_text[0] != str(expected_manifest_sha256)
@@ -2458,7 +2634,7 @@ def verify_backup(
         WEB_SNAPSHOT_KIND,
         QUIESCED_OVERLAY_KIND,
     }:
-        raise BackupIntegrityError("Backup ist nicht als vollstaendig markiert.")
+        raise BackupIntegrityError("Backup ist nicht als vollständig markiert.")
     if expected_kind and manifest.get("kind") != expected_kind:
         raise BackupIntegrityError("Backup-Art stimmt nicht: erwartet {}, ist {}".format(expected_kind, manifest.get("kind")))
     if not isinstance(manifest.get("backup_id"), str) or not manifest.get("backup_id"):
@@ -2483,11 +2659,11 @@ def verify_backup(
     if not isinstance(entries, list) or (
         not entries and manifest.get("kind") != QUIESCED_OVERLAY_KIND
     ):
-        raise BackupIntegrityError("Leeres oder unvollstaendiges Backup-Manifest.")
+        raise BackupIntegrityError("Leeres oder unvollständiges Backup-Manifest.")
     expected_paths: Set[str] = set()
     for entry in entries:
         if not isinstance(entry, dict):
-            raise BackupIntegrityError("Ungueltiger Manifesteintrag.")
+            raise BackupIntegrityError("Ungültiger Manifesteintrag.")
         relative = _safe_relative_path(str(entry.get("path", "")))
         relative_text = relative.as_posix()
         if relative_text in expected_paths:
@@ -2499,9 +2675,34 @@ def verify_backup(
             raise BackupIntegrityError("Manifestdatei fehlt oder ist unsicher: {}".format(relative_text))
         expected_sha = str(entry.get("sha256", ""))
         if not _SHA256_RE.fullmatch(expected_sha):
-            raise BackupIntegrityError("Ungueltige SHA-256 fuer {}".format(relative_text))
-        if metadata.st_size != int(entry.get("size", -1)) or sha256_file(path) != expected_sha:
-            raise BackupIntegrityError("Backup-Datei stimmt nicht mit Manifest ueberein: {}".format(relative_text))
+            raise BackupIntegrityError("Ungültige SHA-256 für {}".format(relative_text))
+        encoding = entry.get("encoding")
+        if encoding is None:
+            if metadata.st_size != int(entry.get("size", -1)) or sha256_file(path) != expected_sha:
+                raise BackupIntegrityError("Backup-Datei stimmt nicht mit Manifest überein: {}".format(relative_text))
+        elif encoding == COMPRESSED_ENTRY_ENCODING:
+            # Verifiziert werden die gespeicherten Bytes; der Originalinhalt wird
+            # beim Erstellen zurückgelesen und beim Restore erneut gegen die
+            # Inhalts-SHA-256 geprüft.
+            stored_sha = str(entry.get("stored_sha256", ""))
+            try:
+                stored_size = int(entry.get("stored_size", -1))
+                content_size = int(entry.get("size", -1))
+            except (TypeError, ValueError) as exc:
+                raise BackupIntegrityError("Ungültige Kodierungsmetadaten für {}".format(relative_text)) from exc
+            if (
+                not relative_text.endswith(COMPRESSED_ENTRY_SUFFIX)
+                or not _SHA256_RE.fullmatch(stored_sha)
+                or stored_size < 0
+                or content_size < 0
+                or manifest.get("file_encodings") in (None, [])
+                or COMPRESSED_ENTRY_ENCODING not in list(manifest.get("file_encodings") or [])
+            ):
+                raise BackupIntegrityError("Ungültige Kodierungsmetadaten für {}".format(relative_text))
+            if metadata.st_size != stored_size or sha256_file(path) != stored_sha:
+                raise BackupIntegrityError("Backup-Datei stimmt nicht mit Manifest überein: {}".format(relative_text))
+        else:
+            raise BackupIntegrityError("Unbekannte Backup-Kodierung für {}".format(relative_text))
         restore_path = entry.get("restore_path")
         if restore_path is not None:
             _lexical_absolute(str(restore_path))
@@ -2510,20 +2711,27 @@ def verify_backup(
                 uid = int(entry.get("uid", -1))
                 gid = int(entry.get("gid", -1))
             except (TypeError, ValueError) as exc:
-                raise BackupIntegrityError("Ungueltige Restore-Metadaten fuer {}".format(relative_text)) from exc
+                raise BackupIntegrityError("Ungültige Restore-Metadaten für {}".format(relative_text)) from exc
             if mode < 0 or mode > 0o7777 or uid < 0 or gid < 0:
-                raise BackupIntegrityError("Ungueltige Restore-Metadaten fuer {}".format(relative_text))
+                raise BackupIntegrityError("Ungültige Restore-Metadaten für {}".format(relative_text))
+    file_encodings = manifest.get("file_encodings")
+    if file_encodings is not None and (
+        not isinstance(file_encodings, list)
+        or not file_encodings
+        or any(item not in SUPPORTED_ENTRY_ENCODINGS for item in file_encodings)
+    ):
+        raise BackupIntegrityError("Manifest nennt eine unbekannte Backup-Kodierung")
     sources = manifest.get("sources")
     if not isinstance(sources, list) or (
         manifest.get("kind") == QUIESCED_OVERLAY_KIND and not sources
     ):
-        raise BackupIntegrityError("Manifest-Sources muessen eine Liste sein")
+        raise BackupIntegrityError("Manifest-Sources müssen eine Liste sein")
     for record in sources:
         if not isinstance(record, dict):
-            raise BackupIntegrityError("Ungueltiger Source-Eintrag im Manifest")
+            raise BackupIntegrityError("Ungültiger Source-Eintrag im Manifest")
         source_type = str(record.get("source_type") or "")
         if source_type not in {"file", "directory", "missing", "skipped"}:
-            raise BackupIntegrityError("Ungueltiger Source-Typ im Manifest")
+            raise BackupIntegrityError("Ungültiger Source-Typ im Manifest")
         _lexical_absolute(str(record.get("source") or ""))
         skipped_entries = record.get("skipped_entries", [])
         if not isinstance(skipped_entries, list):
@@ -2562,9 +2770,9 @@ def verify_backup(
                     directory_uid = int(directory.get("uid", -1))
                     directory_gid = int(directory.get("gid", -1))
                 except (TypeError, ValueError) as exc:
-                    raise BackupIntegrityError("Ungueltige Verzeichnismetadaten im Manifest") from exc
+                    raise BackupIntegrityError("Ungültige Verzeichnismetadaten im Manifest") from exc
                 if directory_mode < 0 or directory_mode > 0o7777 or directory_uid < 0 or directory_gid < 0:
-                    raise BackupIntegrityError("Ungueltige Verzeichnismetadaten im Manifest")
+                    raise BackupIntegrityError("Ungültige Verzeichnismetadaten im Manifest")
     actual_paths = {path.relative_to(backup).as_posix() for path in _scan_backup_files(backup)}
     if actual_paths != expected_paths:
         raise BackupIntegrityError(
@@ -2826,7 +3034,7 @@ def _read_small_file_bytes(path: PathValue, maximum: int) -> bytes:
     descriptor, metadata = _open_regular_file_nofollow(path)
     try:
         if metadata.st_size > maximum:
-            raise BackupIntegrityError("Datei ist unplausibel gross: {}".format(path))
+            raise BackupIntegrityError("Datei ist unplausibel groß: {}".format(path))
         chunks: List[bytes] = []
         remaining = maximum + 1
         while remaining > 0:
@@ -2837,7 +3045,7 @@ def _read_small_file_bytes(path: PathValue, maximum: int) -> bytes:
             remaining -= len(block)
         data = b"".join(chunks)
         if len(data) > maximum:
-            raise BackupIntegrityError("Datei ist unplausibel gross: {}".format(path))
+            raise BackupIntegrityError("Datei ist unplausibel groß: {}".format(path))
         return data
     finally:
         os.close(descriptor)
@@ -3003,7 +3211,7 @@ def _exact_cleanup_candidates(
             return
         root_meta = os.lstat(str(source))
         if stat.S_ISLNK(root_meta.st_mode) or not stat.S_ISDIR(root_meta.st_mode):
-            raise BackupIntegrityError("Restore-Flaeche ist kein sicheres Verzeichnis: {}".format(source))
+            raise BackupIntegrityError("Restore-Fläche ist kein sicheres Verzeichnis: {}".format(source))
         for directory, dirnames, filenames in os.walk(str(source), topdown=True, followlinks=False):
             directory_path = Path(directory)
             relative = directory_path.relative_to(source)
@@ -3030,7 +3238,7 @@ def _exact_cleanup_candidates(
                 ):
                     continue
                 if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-                    raise BackupIntegrityError("Unsicherer Eintrag in Restore-Flaeche: {}".format(candidate))
+                    raise BackupIntegrityError("Unsicherer Eintrag in Restore-Fläche: {}".format(candidate))
                 if (
                     candidate not in original_dirs
                     and not _is_volatile_emergency_latch_ancestor(candidate)
@@ -3055,7 +3263,7 @@ def _exact_cleanup_candidates(
                     continue
                 metadata = os.lstat(str(candidate))
                 if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-                    raise BackupIntegrityError("Unsicherer Eintrag in Restore-Flaeche: {}".format(candidate))
+                    raise BackupIntegrityError("Unsicherer Eintrag in Restore-Fläche: {}".format(candidate))
                 if candidate not in expected_paths:
                     cleanup_files[str(candidate)] = {
                         "path": candidate, "dev": metadata.st_dev, "ino": metadata.st_ino,
@@ -3194,13 +3402,13 @@ def _exact_cleanup_candidates(
 
     source_records = manifest.get("sources", [])
     if not isinstance(source_records, list):
-        raise BackupIntegrityError("Manifest-Sources muessen eine Liste sein")
+        raise BackupIntegrityError("Manifest-Sources müssen eine Liste sein")
     for record in source_records:
         if not isinstance(record, dict):
-            raise BackupIntegrityError("Ungueltiger Source-Eintrag im Manifest")
+            raise BackupIntegrityError("Ungültiger Source-Eintrag im Manifest")
         source = _lexical_absolute(str(record.get("source") or ""))
         if not _restore_target_allowed(source, roots, files):
-            raise BackupIntegrityError("Source-Flaeche liegt ausserhalb der Restore-Positivliste: {}".format(source))
+            raise BackupIntegrityError("Source-Fläche liegt außerhalb der Restore-Positivliste: {}".format(source))
         if _is_below_volatile_emergency_latch(source):
             # Auch alte Manifeste dürfen einen historischen Latch nicht als
             # eigenständige Restore- oder Cleanup-Quelle reaktivieren.
@@ -3209,7 +3417,7 @@ def _exact_cleanup_candidates(
         exclude_anywhere = {str(name) for name in record.get("exclude_anywhere", [])}
         for name in exclude_top | exclude_anywhere:
             if not name or name in {".", ".."} or "/" in name or "\\" in name:
-                raise BackupIntegrityError("Ungueltiger Source-Ausschluss im Manifest")
+                raise BackupIntegrityError("Ungültiger Source-Ausschluss im Manifest")
         source_type = str(record.get("source_type") or "")
         present = bool(record.get("present"))
         skipped_paths = {
@@ -3305,11 +3513,11 @@ def _exact_cleanup_candidates(
                     "mode": stat.S_IMODE(metadata.st_mode), "uid": metadata.st_uid, "gid": metadata.st_gid,
                 }
             else:
-                raise BackupIntegrityError("Neu entstandene Source-Flaeche ist unsicher: {}".format(source))
+                raise BackupIntegrityError("Neu entstandene Source-Fläche ist unsicher: {}".format(source))
         elif source_type == "skipped":
             continue
         elif source_type not in {"file", "directory", "missing", "skipped"}:
-            raise BackupIntegrityError("Ungueltiger Source-Typ im Manifest")
+            raise BackupIntegrityError("Ungültiger Source-Typ im Manifest")
     if bound_install_root is not None:
         _verify_bound_persistent_install_root(bound_install_root)
     return list(cleanup_files.values()), list(cleanup_dirs.values())
@@ -3348,7 +3556,7 @@ def _copy_fd_to_temp_at(source_descriptor: int, parent_descriptor: int, prefix: 
         except FileExistsError:
             continue
     else:
-        raise BackupIntegrityError("Kein eindeutiger Restore-Stagingname verfuegbar")
+        raise BackupIntegrityError("Kein eindeutiger Restore-Stagingname verfügbar")
     try:
         os.lseek(source_descriptor, 0, os.SEEK_SET)
         while True:
@@ -3365,10 +3573,67 @@ def _copy_fd_to_temp_at(source_descriptor: int, parent_descriptor: int, prefix: 
     return name
 
 
+def _copy_gzip_fd_to_temp_at(
+    source_descriptor: int,
+    parent_descriptor: int,
+    prefix: str,
+    expected_size: int,
+) -> str:
+    """Entpackt einen komprimierten Backupeintrag größenbegrenzt ins Staging."""
+
+    for _attempt in range(100):
+        name = "{}{}".format(prefix, uuid.uuid4().hex)
+        try:
+            descriptor = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise BackupIntegrityError("Kein eindeutiger Restore-Stagingname verfügbar")
+    limit = max(0, int(expected_size)) + 1
+    total = 0
+    try:
+        try:
+            os.lseek(source_descriptor, 0, os.SEEK_SET)
+            with os.fdopen(os.dup(source_descriptor), "rb") as raw:
+                with gzip.GzipFile(fileobj=raw, mode="rb") as archive:
+                    while True:
+                        block = archive.read(1024 * 1024)
+                        if not block:
+                            break
+                        total += len(block)
+                        if total > limit:
+                            raise BackupIntegrityError(
+                                "Komprimierter Backupeintrag ist größer als im Manifest"
+                            )
+                        view = memoryview(block)
+                        while view:
+                            written = os.write(descriptor, view)
+                            view = view[written:]
+            os.fsync(descriptor)
+        except (EOFError, gzip.BadGzipFile, zlib.error) as exc:
+            raise BackupIntegrityError("Komprimierter Backupeintrag ist nicht lesbar") from exc
+        finally:
+            os.close(descriptor)
+    except BaseException:
+        # Ein unvollständiges Staging darf nicht im Zielordner liegen bleiben.
+        try:
+            os.unlink(name, dir_fd=parent_descriptor)
+        except OSError:
+            pass
+        raise
+    return name
+
+
 def _entry_metadata(parent_descriptor: int, name: str) -> os.stat_result:
     metadata = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-        raise BackupIntegrityError("Restore-Eintrag ist keine regulaere Datei: {}".format(name))
+        raise BackupIntegrityError("Restore-Eintrag ist keine reguläre Datei: {}".format(name))
     return metadata
 
 
@@ -3378,7 +3643,7 @@ def _entry_sha256(parent_descriptor: int, name: str) -> str:
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
-            raise BackupIntegrityError("Restore-Eintrag ist keine regulaere Datei: {}".format(name))
+            raise BackupIntegrityError("Restore-Eintrag ist keine reguläre Datei: {}".format(name))
         while True:
             block = os.read(descriptor, 1024 * 1024)
             if not block:
@@ -3417,7 +3682,7 @@ def _verify_entry(
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
-            raise BackupIntegrityError("Restore-Ziel ist keine regulaere Datei: {}".format(name))
+            raise BackupIntegrityError("Restore-Ziel ist keine reguläre Datei: {}".format(name))
         if expected_identity is not None and (
             metadata.st_dev,
             metadata.st_ino,
@@ -3431,7 +3696,7 @@ def _verify_entry(
                 break
             digest.update(block)
         if digest.hexdigest() != expected_sha:
-            raise BackupIntegrityError("Restore-Pruefsumme stimmt nicht: {}".format(name))
+            raise BackupIntegrityError("Restore-Prüfsumme stimmt nicht: {}".format(name))
         _apply_descriptor_metadata(descriptor, mode, uid, gid, name)
         os.fsync(descriptor)
         durable = os.fstat(descriptor)
@@ -3510,7 +3775,7 @@ def _exchange_entries(
     libc = ctypes.CDLL(None, use_errno=True)
     renameat2 = getattr(libc, "renameat2", None)
     if renameat2 is None:
-        raise BackupIntegrityError("Atomarer Restore-Austausch wird vom System nicht unterstuetzt")
+        raise BackupIntegrityError("Atomarer Restore-Austausch wird vom System nicht unterstützt")
     renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
     renameat2.restype = ctypes.c_int
     result = renameat2(
@@ -3532,7 +3797,7 @@ def _unique_missing_name(parent_descriptor: int, prefix: str) -> str:
             os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
         except FileNotFoundError:
             return name
-    raise BackupIntegrityError("Kein eindeutiger Quarantaenename verfuegbar")
+    raise BackupIntegrityError("Kein eindeutiger Quarantänename verfügbar")
 
 
 def _verify_parent_binding(parent_path: Path, parent_descriptor: int, expected: os.stat_result) -> None:
@@ -3544,7 +3809,7 @@ def _verify_parent_binding(parent_path: Path, parent_descriptor: int, expected: 
     opened = os.fstat(parent_descriptor)
     identity = (expected.st_dev, expected.st_ino)
     if (opened.st_dev, opened.st_ino) != identity or (current.st_dev, current.st_ino) != identity:
-        raise BackupIntegrityError("Restore-Zielverzeichnis wurde waehrend der Transaktion ausgetauscht: {}".format(parent_path))
+        raise BackupIntegrityError("Restore-Zielverzeichnis wurde während der Transaktion ausgetauscht: {}".format(parent_path))
 
 
 def _verify_restore_parent_binding(
@@ -3620,11 +3885,11 @@ def _manifest_directory_entries(
                 # gehören nie zur historischen Restore-Semantik.
                 continue
             if not _restore_target_allowed(path, roots, files):
-                raise BackupIntegrityError("Restore-Verzeichnis liegt ausserhalb der Positivliste: {}".format(path))
+                raise BackupIntegrityError("Restore-Verzeichnis liegt außerhalb der Positivliste: {}".format(path))
             if str(path) in result:
                 previous = result[str(path)]
                 if any(previous[key] != entry[key] for key in ("mode", "uid", "gid")):
-                    raise BackupIntegrityError("Widerspruechliche Verzeichnismetadaten: {}".format(path))
+                    raise BackupIntegrityError("Widersprüchliche Verzeichnismetadaten: {}".format(path))
             else:
                 result[str(path)] = entry
     return sorted(result.values(), key=lambda item: (len(Path(str(item["path"])).parts), str(item["path"])))
@@ -3974,11 +4239,11 @@ def _remove_directory_tree_at(
     try:
         opened = os.fstat(descriptor)
         if (opened.st_dev, opened.st_ino) != (expected_dev, expected_ino):
-            raise BackupIntegrityError("Cleanup-Quarantaene wurde ausgetauscht")
+            raise BackupIntegrityError("Cleanup-Quarantäne wurde ausgetauscht")
         for child in sorted(os.listdir(descriptor)):
             metadata = os.stat(child, dir_fd=descriptor, follow_symlinks=False)
             if stat.S_ISLNK(metadata.st_mode):
-                raise BackupIntegrityError("Symlink in Cleanup-Quarantaene: {}".format(child))
+                raise BackupIntegrityError("Symlink in Cleanup-Quarantäne: {}".format(child))
             if stat.S_ISDIR(metadata.st_mode):
                 _remove_directory_tree_at(
                     descriptor,
@@ -3990,12 +4255,12 @@ def _remove_directory_tree_at(
             elif stat.S_ISREG(metadata.st_mode):
                 os.unlink(child, dir_fd=descriptor)
             else:
-                raise BackupIntegrityError("Unerlaubter Eintrag in Cleanup-Quarantaene: {}".format(child))
+                raise BackupIntegrityError("Unerlaubter Eintrag in Cleanup-Quarantäne: {}".format(child))
     finally:
         os.close(descriptor)
     current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
     if (current.st_dev, current.st_ino) != (expected_dev, expected_ino):
-        raise BackupIntegrityError("Cleanup-Quarantaene wurde vor rmdir ausgetauscht")
+        raise BackupIntegrityError("Cleanup-Quarantäne wurde vor rmdir ausgetauscht")
     os.rmdir(name, dir_fd=parent_descriptor)
 
 
@@ -4179,7 +4444,7 @@ def restore_persistent_payload(
                 # wird geprüft, aber weder bereitgestellt noch restauriert.
                 continue
             if not _restore_target_allowed(destination, roots, files):
-                raise BackupIntegrityError("Restore-Ziel liegt ausserhalb der Positivliste: {}".format(destination))
+                raise BackupIntegrityError("Restore-Ziel liegt außerhalb der Positivliste: {}".format(destination))
             parent_descriptor, destination_name, _is_bound = (
                 _open_restore_target_parent(destination, bound_install_root)
             )
@@ -4205,16 +4470,28 @@ def restore_persistent_payload(
             source = backup / _safe_relative_path(str(entry["path"]))
             source_descriptor, _source_metadata = _open_regular_file_nofollow(source)
             try:
-                new_name = _copy_fd_to_temp_at(
-                    source_descriptor,
-                    parent_descriptor,
-                    ".{}.e3dc-new-".format(destination_name),
-                )
+                if entry.get("encoding") == COMPRESSED_ENTRY_ENCODING:
+                    new_name = _copy_gzip_fd_to_temp_at(
+                        source_descriptor,
+                        parent_descriptor,
+                        ".{}.e3dc-new-".format(destination_name),
+                        int(entry.get("size", 0)),
+                    )
+                elif entry.get("encoding") is not None:
+                    raise BackupIntegrityError(
+                        "Unbekannte Backup-Kodierung beim Restore: {}".format(destination)
+                    )
+                else:
+                    new_name = _copy_fd_to_temp_at(
+                        source_descriptor,
+                        parent_descriptor,
+                        ".{}.e3dc-new-".format(destination_name),
+                    )
             finally:
                 os.close(source_descriptor)
             new_sha = str(entry["sha256"])
             if _entry_sha256(parent_descriptor, new_name) != new_sha:
-                raise BackupIntegrityError("Restore-Staging-Pruefsumme stimmt nicht: {}".format(destination))
+                raise BackupIntegrityError("Restore-Staging-Prüfsumme stimmt nicht: {}".format(destination))
             new_metadata = _entry_metadata(parent_descriptor, new_name)
             manifest_mode = int(entry.get("mode", 0o600)) & 0o7777
             manifest_uid = int(entry["uid"])
@@ -4333,7 +4610,7 @@ def restore_persistent_payload(
             })
 
         if not staged and expected_kind != QUIESCED_OVERLAY_KIND:
-            raise BackupIntegrityError("Backup enthaelt keine wiederherstellbaren Dateien.")
+            raise BackupIntegrityError("Backup enthält keine wiederherstellbaren Dateien.")
 
         try:
             for item in staged:
@@ -4349,7 +4626,7 @@ def restore_persistent_payload(
                         or current.st_uid != item["original_uid"]
                         or current.st_gid != item["original_gid"]
                     ):
-                        raise BackupIntegrityError("Restore-Ziel wurde vor Austausch veraendert: {}".format(destination))
+                        raise BackupIntegrityError("Restore-Ziel wurde vor Austausch verändert: {}".format(destination))
                     old_name = _unique_missing_name(parent_descriptor, ".{}.e3dc-old-".format(destination.name))
                     os.replace(destination.name, old_name, src_dir_fd=parent_descriptor, dst_dir_fd=parent_descriptor)
                     item["old_name"] = old_name
@@ -4370,7 +4647,7 @@ def restore_persistent_payload(
                     item["placeholder_gid"] = int(placeholder_metadata.st_gid)
                     quarantined = _entry_metadata(parent_descriptor, old_name)
                     if (quarantined.st_dev, quarantined.st_ino) != (item["original_dev"], item["original_ino"]):
-                        raise BackupIntegrityError("Restore-Ziel-Swap vor Quarantaene erkannt: {}".format(destination))
+                        raise BackupIntegrityError("Restore-Ziel-Swap vor Quarantäne erkannt: {}".format(destination))
                     quarantined_sha = _entry_sha256(parent_descriptor, old_name)
                     if (
                         quarantined_sha != item["original_sha"]
@@ -4384,7 +4661,7 @@ def restore_persistent_payload(
                         item["original_mode"] = stat.S_IMODE(quarantined.st_mode)
                         item["original_uid"] = int(quarantined.st_uid)
                         item["original_gid"] = int(quarantined.st_gid)
-                        raise BackupIntegrityError("Restore-Ziel wurde waehrend Quarantaene veraendert: {}".format(destination))
+                        raise BackupIntegrityError("Restore-Ziel wurde während Quarantäne verändert: {}".format(destination))
                 else:
                     placeholder = os.open(
                         destination.name,
@@ -4431,7 +4708,7 @@ def restore_persistent_payload(
                     item["original_uid"] = int(displaced.st_uid)
                     item["original_gid"] = int(displaced.st_gid)
                     raise BackupIntegrityError(
-                        "Restore-Platzhalter wurde unmittelbar vor Austausch veraendert: {}".format(destination)
+                        "Restore-Platzhalter wurde unmittelbar vor Austausch verändert: {}".format(destination)
                     )
                 if item.get("old_name") and _refresh_original_binding_if_changed(
                     item,
@@ -4439,7 +4716,7 @@ def restore_persistent_payload(
                     str(item["old_name"]),
                 ):
                     raise BackupIntegrityError(
-                        "Restore-Original wurde am atomaren Austauschrand veraendert: {}".format(destination)
+                        "Restore-Original wurde am atomaren Austauschrand verändert: {}".format(destination)
                     )
                 os.unlink(displaced_name, dir_fd=parent_descriptor)
                 item["new_name"] = None
@@ -4514,7 +4791,7 @@ def restore_persistent_payload(
                     (current.st_dev, current.st_ino) != (item["dev"], item["ino"])
                     or _directory_tree_digest(descriptor) != item["tree_digest"]
                 ):
-                    raise BackupIntegrityError("Post-Backup-Verzeichnis wurde vor Cleanup veraendert: {}".format(destination))
+                    raise BackupIntegrityError("Post-Backup-Verzeichnis wurde vor Cleanup verändert: {}".format(destination))
                 old_name = _unique_missing_name(parent_descriptor, ".{}.e3dc-extra-".format(destination.name))
                 os.replace(destination.name, old_name, src_dir_fd=parent_descriptor, dst_dir_fd=parent_descriptor)
                 item["old_name"] = old_name
@@ -4602,7 +4879,7 @@ def restore_persistent_payload(
                     (quarantined.st_dev, quarantined.st_ino) != (item["dev"], item["ino"])
                     or _entry_sha256(parent_descriptor, str(item["old_name"])) != item["sha256"]
                 ):
-                    raise BackupIntegrityError("Cleanup-Quarantaene driftete vor Commit: {}".format(destination))
+                    raise BackupIntegrityError("Cleanup-Quarantäne driftete vor Commit: {}".format(destination))
                 os.unlink(destination.name, dir_fd=parent_descriptor)
                 item["placeholder_removed"] = True
                 _verify_restore_parent_binding(
@@ -4804,7 +5081,7 @@ def restore_persistent_payload(
                             != (item["placeholder_dev"], item["placeholder_ino"])
                             or not stat.S_ISREG(placeholder.st_mode)
                         ):
-                            raise BackupIntegrityError("Cleanup-Ziel wurde vor Ruecklauf neu belegt")
+                            raise BackupIntegrityError("Cleanup-Ziel wurde vor Rücklauf neu belegt")
                         os.unlink(destination.name, dir_fd=parent_descriptor)
                     _replace_between(
                         parent_descriptor,
@@ -4861,12 +5138,12 @@ def restore_persistent_payload(
                                 (current.st_dev, current.st_ino) != (item["new_dev"], item["new_ino"])
                                 or _entry_sha256(parent_descriptor, destination.name) != item["new_sha"]
                             ):
-                                raise BackupIntegrityError("Restore-Ziel wurde vor Ruecklauf fremd ersetzt")
+                                raise BackupIntegrityError("Restore-Ziel wurde vor Rücklauf fremd ersetzt")
                         elif (
                             (current.st_dev, current.st_ino)
                             != (item["placeholder_dev"], item["placeholder_ino"])
                         ):
-                            raise BackupIntegrityError("Restore-Platzhalter wurde vor Ruecklauf ersetzt")
+                            raise BackupIntegrityError("Restore-Platzhalter wurde vor Rücklauf ersetzt")
                         os.unlink(destination.name, dir_fd=parent_descriptor)
                     if item["original_exists"]:
                         _replace_between(
@@ -4892,7 +5169,7 @@ def restore_persistent_payload(
                     else:
                         try:
                             os.stat(destination.name, dir_fd=parent_descriptor, follow_symlinks=False)
-                            raise BackupIntegrityError("Neu angelegtes Ziel blieb nach Ruecklauf bestehen")
+                            raise BackupIntegrityError("Neu angelegtes Ziel blieb nach Rücklauf bestehen")
                         except FileNotFoundError:
                             pass
                     _verify_restore_parent_binding(
@@ -4929,12 +5206,12 @@ def restore_persistent_payload(
 
             if rollback_errors:
                 raise BackupIntegrityError(
-                    "Restore fehlgeschlagen ({}) UND Ruecklauf unvollstaendig: {}".format(
+                    "Restore fehlgeschlagen ({}) UND Rücklauf unvollständig: {}".format(
                         restore_exc, "; ".join(rollback_errors)
                     )
                 )
             raise BackupIntegrityError(
-                "Restore fehlgeschlagen; vollstaendiger Ruecklauf verifiziert: {}".format(restore_exc)
+                "Restore fehlgeschlagen; vollständiger Rücklauf verifiziert: {}".format(restore_exc)
             )
 
         cleanup_residues: List[str] = []
@@ -4969,8 +5246,8 @@ def restore_persistent_payload(
                     cleanup_residues.append(str(item["destination"]))
         if cleanup_residues:
             print(
-                "[!] Restore ist committed und verifiziert; {} verborgene Quarantaene-Reste "
-                "konnten nur fuer spaetere Bereinigung vorgemerkt werden.".format(len(cleanup_residues))
+                "[!] Restore ist committed und verifiziert; {} verborgene Quarantäne-Reste "
+                "konnten nur für spätere Bereinigung vorgemerkt werden.".format(len(cleanup_residues))
             )
         return len(applied)
     finally:

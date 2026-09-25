@@ -28,6 +28,12 @@ except Exception as e:
     VehicleManager = None
     IMPORT_ERROR = str(e)
 
+# Typisierte Fehler der Bibliothek (optional; ohne Bibliothek bleiben die Textregeln).
+try:
+    from hyundai_kia_connect_api import exceptions as _bluelink_exceptions
+except Exception:  # pragma: no cover - Bibliothek fehlt oder zu alt
+    _bluelink_exceptions = None
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("BluelinkClient")
 
@@ -35,7 +41,7 @@ def get_install_path():
     root = Path(__file__).resolve().parent.parent
     markers = (root / "VERSION", root / "installer_main.py", root / "Installer")
     if not all(marker.exists() for marker in markers):
-        raise RuntimeError("Bluelink: Release-Root ist nicht eindeutig aufloesbar")
+        raise RuntimeError("Bluelink: Release-Root ist nicht eindeutig auflösbar")
     return str(root)
 
 CONFIG_FILE = os.path.join(get_install_path(), "e3dc.config.txt")
@@ -44,6 +50,10 @@ VEHICLES_JSON_FILE = "/var/www/html/ramdisk/vehicles.json"
 FORCE_FLAG_FILE = "/var/www/html/ramdisk/force_bluelink.flag"
 BLUELINK_REFRESH_SCHEMA = "bluelink_refresh_status_v1"
 BLUELINK_SOC_SOURCES = {"bluelink", "hyundai", "kia", "cloud", "vehicle_cloud"}
+# Anmeldung mit Benutzer/Passwort (Region 1 = Europa; Marke hyundai → 2, kia → 1 laut Bibliothek).
+BLUELINK_REGION_EUROPE = 1
+BLUELINK_BRAND_CODES = {"hyundai": 2, "kia": 1}
+BLUELINK_DEFAULT_BRAND = "hyundai"
 
 
 class BluelinkVehicleDataMissing(RuntimeError):
@@ -348,18 +358,61 @@ def _latest_vehicle_source_timestamp(vehicles):
     return max(source_timestamps) if source_timestamps else None
 
 
+def _typed_refresh_error_code(error):
+    """Typisierte Bibliotheksfehler (hyundai_kia_connect_api.exceptions) → Statuscode."""
+    library = _bluelink_exceptions
+    if library is None or error is None:
+        return None
+    for name, code in (
+        ("AuthenticationOTPRequired", "otp_required"),
+        ("ConsentRequiredError", "consent_required"),
+        ("PINMissingError", "pin_missing"),
+        ("AuthenticationError", "authentication_failed"),
+        ("RateLimitingError", "rate_limited"),
+        ("RequestTimeoutError", "timeout"),
+    ):
+        cls = getattr(library, name, None)
+        if isinstance(cls, type) and isinstance(error, cls):
+            return code
+    return None
+
+
 def _refresh_error_code(error):
     typed_code = getattr(error, "refresh_error_code", None)
     if typed_code == "vehicle_data_missing":
         return typed_code
+    library_code = _typed_refresh_error_code(error)
+    if library_code is not None:
+        return library_code
     text = str(error or "").strip().lower()
     if "timed out" in text or "timeout" in text:
         return "timeout"
     if "too many requests" in text or "rate limit" in text or "429" in text:
         return "rate_limited"
-    if "unauthorized" in text or "authentication" in text or "invalid token" in text:
+    if "otp" in text or "one-time" in text:
+        return "otp_required"
+    if "consent" in text:
+        return "consent_required"
+    if "unauthorized" in text or "authentication" in text or "invalid token" in text or "signin failed" in text:
         return "authentication_failed"
     return "api_error"
+
+
+BLUELINK_ERROR_HINTS = {
+    "otp_required": (
+        "Das Hyundai/Kia-Konto verlangt einen Einmalcode (Zwei-Faktor-Anmeldung/OTP); das wird nicht unterstützt. "
+        "Bitte die Zwei-Faktor-Anmeldung für dieses Konto deaktivieren oder ein Konto ohne Zwei-Faktor-Anmeldung verwenden."
+    ),
+    "consent_required": (
+        "Das Hyundai/Kia-Konto verlangt eine Bestätigung der Nutzungsbedingungen. "
+        "Bitte einmal in der Hersteller-App oder auf der Hersteller-Website anmelden und bestätigen."
+    ),
+    "pin_missing": "Das Hyundai/Kia-Konto verlangt eine PIN; bitte bluelink_pin im Konfigurations-Editor eintragen.",
+    "authentication_failed": (
+        "Anmeldung abgewiesen: Bitte Benutzer (E-Mail) und Passwort des Hyundai/Kia-Kontos im Konfigurations-Editor "
+        "prüfen; eine aktive Zwei-Faktor-Anmeldung wird nicht unterstützt."
+    ),
+}
 
 
 def _refresh_error_message(code):
@@ -367,9 +420,112 @@ def _refresh_error_message(code):
         "timeout": "Hyundai/Kia-Cloud antwortet nicht rechtzeitig.",
         "rate_limited": "Hyundai/Kia-Cloud begrenzt weitere Abfragen.",
         "authentication_failed": "Hyundai/Kia-Anmeldung wurde abgewiesen.",
+        "otp_required": "Hyundai/Kia-Anmeldung verlangt einen Einmalcode (Zwei-Faktor); nicht unterstützt.",
+        "consent_required": "Hyundai/Kia-Konto verlangt eine Bestätigung in der Hersteller-App.",
+        "pin_missing": "Hyundai/Kia-Konto verlangt eine PIN.",
         "vehicle_data_missing": "Hyundai/Kia-Cloud lieferte keine verwertbaren Fahrzeugdaten.",
         "api_error": "Hyundai/Kia-Fahrzeugdaten konnten nicht aktualisiert werden.",
     }.get(str(code or ""), "Hyundai/Kia-Fahrzeugdaten konnten nicht aktualisiert werden.")
+
+
+def _mask_account(user):
+    """Kontoname nur verkürzt ins Log (erstes Zeichen + Domain)."""
+    text = str(user or "").strip()
+    if not text:
+        return "(leer)"
+    local, _, domain = text.partition("@")
+    head = local[:1] + "***"
+    return head + "@" + domain if domain else head
+
+
+def _bluelink_secrets(config):
+    """Werte, die niemals in Log oder Statusdatei erscheinen dürfen."""
+    config = config if isinstance(config, dict) else {}
+    return tuple(
+        str(config.get(key) or "")
+        for key in ("password", "pin", "user")
+        if str(config.get(key) or "").strip()
+    )
+
+
+def _describe_bluelink_error(error, secrets=()):
+    """Exception-Typ, HTTP-Status und (gekürzte, redigierte) Server-Antwort für das Log."""
+    parts = [type(error).__name__]
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    if isinstance(status, int):
+        parts.append("HTTP %d" % status)
+    text = str(error or "").strip()
+    if not text and response is not None:
+        text = str(getattr(response, "text", "") or "")
+    text = " ".join(text.split())[:300]
+    for secret in secrets:
+        if secret and secret in text:
+            text = text.replace(secret, "***")
+    if text:
+        parts.append(text)
+    return " | ".join(parts)
+
+
+def _bluelink_brand_code(value):
+    """hyundai|kia → Markencode der Bibliothek; unbekannt/leer → Hyundai."""
+    text = str(value or "").strip().lower()
+    return BLUELINK_BRAND_CODES.get(text, BLUELINK_BRAND_CODES[BLUELINK_DEFAULT_BRAND])
+
+
+def _credentials_complete(config):
+    config = config if isinstance(config, dict) else {}
+    return bool(str(config.get("user") or "").strip()) and bool(str(config.get("password") or ""))
+
+
+def _credentials_fingerprint(config):
+    """Vergleichswert (ohne Klartext im Log) – geänderte Zugangsdaten erzwingen eine neue Anmeldung."""
+    config = config if isinstance(config, dict) else {}
+    return (
+        str(config.get("user") or "").strip(),
+        str(config.get("password") or ""),
+        str(config.get("pin") or "").strip(),
+        _bluelink_brand_code(config.get("brand")),
+    )
+
+
+def _ensure_vehicle_manager(session, config):
+    """Hält genau einen VehicleManager je Zugangsdaten im Prozess (Token-Cache; kein Re-Login je Intervall)."""
+    fingerprint = _credentials_fingerprint(config)
+    manager = session.get("vm")
+    if manager is not None and session.get("fingerprint") != fingerprint:
+        logger.info("Bluelink-Zugangsdaten geändert; Anmeldung wird erneuert.")
+        manager = None
+    if manager is None:
+        user, password, pin, brand_code = fingerprint
+        manager = VehicleManager(
+            region=BLUELINK_REGION_EUROPE,
+            brand=brand_code,
+            username=user,
+            password=password,
+            pin=pin,
+        )
+        session["vm"] = manager
+        session["fingerprint"] = fingerprint
+        session["logged_in"] = False
+        logger.info(
+            "Bluelink-Anmeldung vorbereitet (Konto %s, Marke %s, PIN %s).",
+            _mask_account(user),
+            "Kia" if brand_code == BLUELINK_BRAND_CODES["kia"] else "Hyundai",
+            "gesetzt" if pin else "leer",
+        )
+    return manager
+
+
+def _handle_refresh_failure(session, error):
+    """Anmeldefehler verwerfen den Token-Cache (nächster Zyklus meldet sich neu an) und loggen den Handlungshinweis."""
+    code = _refresh_error_code(error)
+    if code in ("otp_required", "consent_required", "pin_missing", "authentication_failed"):
+        session["vm"] = None
+        session["fingerprint"] = None
+        session["logged_in"] = False
+        logger.error("Bluelink: %s", BLUELINK_ERROR_HINTS.get(code, _refresh_error_message(code)))
+    return code
 
 
 def build_refresh_status(
@@ -639,8 +795,17 @@ def write_json_atomic(path, payload, indent=None):
             pass
 
 def load_bluelink_config():
-    """Lädt Token, VIN und Heimat-Koordinaten aus der V4-Konfig mit TXT-Fallback."""
-    config = {'refresh_token': None, 'vin': None, 'car_name': None, 'bluelink_interval': '15', 'hoehe': '0', 'laenge': '0'}
+    """Lädt Zugangsdaten (Benutzer/Passwort/PIN/Marke), VIN und Heimat-Koordinaten aus der V4-Konfig mit TXT-Fallback.
+
+    Anmeldung mit Benutzer/Passwort statt Refresh-Token. Die Zugangsdaten kommen ausschließlich aus der
+    zugriffsgeschützten V4-Konfiguration; ein noch vorhandener alter Schlüssel bluelink_refresh_token wird nicht mehr
+    verwendet und nur als Hinweis gemeldet (legacy_token_present).
+    """
+    config = {
+        'user': None, 'password': None, 'pin': '', 'brand': BLUELINK_DEFAULT_BRAND,
+        'vin': None, 'car_name': None, 'bluelink_interval': '15', 'hoehe': '0', 'laenge': '0',
+        'legacy_token_present': False,
+    }
     v4_bound_keys = set()
     if os.path.exists(V4_CONFIG_FILE):
         try:
@@ -648,8 +813,14 @@ def load_bluelink_config():
                 v4 = json.load(f)
             if isinstance(v4, dict):
                 sub_cfg = v4.get('config') if isinstance(v4.get('config'), dict) else {}
+                for legacy_source in (v4, sub_cfg):
+                    if str(legacy_source.get('bluelink_refresh_token') or '').strip():
+                        config['legacy_token_present'] = True
                 for source_key, target_key, stringify in (
-                    ('bluelink_refresh_token', 'refresh_token', False),
+                    ('bluelink_user', 'user', False),
+                    ('bluelink_password', 'password', False),
+                    ('bluelink_pin', 'pin', True),
+                    ('bluelink_brand', 'brand', True),
                     ('bluelink_vin', 'vin', False),
                     ('bluelink_car_name', 'car_name', False),
                     ('bluelink_interval', 'bluelink_interval', True),
@@ -679,8 +850,8 @@ def load_bluelink_config():
             if '=' in line and not line.strip().startswith('#'):
                 key, value = [x.strip() for x in line.split('=', 1)]
                 key = key.lower()
-                if key == 'bluelink_refresh_token' and key not in v4_bound_keys and not config['refresh_token']:
-                    config['refresh_token'] = value
+                if key == 'bluelink_refresh_token' and value:
+                    config['legacy_token_present'] = True
                 elif key == 'bluelink_vin' and key not in v4_bound_keys and not config['vin']:
                     config['vin'] = value
                 elif key == 'bluelink_car_name' and key not in v4_bound_keys and not config['car_name']:
@@ -696,28 +867,39 @@ def load_bluelink_config():
 def main():
     if VehicleManager is None:
         logger.error(f"Fehler beim Laden der Bluelink-API: {IMPORT_ERROR}")
-        logger.error("Bitte pruefe die Installation manuell auf der Konsole.")
+        logger.error("Bitte prüfe die Installation manuell auf der Konsole.")
         return
         
     last_update = 0
-    missing_token_logged = False
+    missing_credentials_logged = False
+    legacy_token_logged = False
+    # VehicleManager samt Token im Prozess halten; Re-Login nur nach Anmeldefehler oder Änderung der Zugangsdaten.
+    session = {"vm": None, "fingerprint": None, "logged_in": False}
 
     while True:
         config = load_bluelink_config()
-        refresh_token = config.get('refresh_token')
         vin = config.get('vin')
         try: interval = int(config.get('bluelink_interval', 15))
         except ValueError: interval = 15
         
         if interval < 5: interval = 5 # Absicherung für die API
 
-        if not refresh_token:
-            if not missing_token_logged:
-                logger.info("Bluelink ist ohne refresh_token deaktiviert; warte auf Konfiguration.")
-                missing_token_logged = True
+        if not _credentials_complete(config):
+            if config.get('legacy_token_present') and not legacy_token_logged:
+                logger.warning(
+                    "Der bisherige Bluelink-Refresh-Token wird nicht mehr verwendet; bitte Benutzer (E-Mail) und "
+                    "Passwort des Hyundai/Kia-Kontos im Konfigurations-Editor hinterlegen."
+                )
+                legacy_token_logged = True
+            if not missing_credentials_logged:
+                logger.info("Bluelink ist ohne Zugangsdaten deaktiviert; warte auf Konfiguration.")
+                missing_credentials_logged = True
+            session["vm"] = None
+            session["fingerprint"] = None
+            session["logged_in"] = False
             time.sleep(60)
             continue
-        missing_token_logged = False
+        missing_credentials_logged = False
             
         now = time.time()
         force_requested = os.path.exists(FORCE_FLAG_FILE)
@@ -732,9 +914,13 @@ def main():
             try:
                 force_request = _read_force_refresh_request() if force_requested else None
                 requested_vehicle_id = None
-                # Region 1 = Europa, Brand 2 = Hyundai (1 = Kia)
-                vm = VehicleManager(region=1, brand=2, username="token-login@example.invalid", password=refresh_token, pin="")
+                # Benutzer/Passwort-Login (Region 1 = Europa, Marke aus bluelink_brand); der Manager bleibt
+                # im Prozess, check_and_refresh_token() meldet nur beim ersten Mal an und erneuert sonst den Token bei Ablauf.
+                vm = _ensure_vehicle_manager(session, config)
                 vm.check_and_refresh_token()
+                if not session.get("logged_in"):
+                    session["logged_in"] = True
+                    logger.info("Bluelink-Anmeldung erfolgreich (%d Fahrzeug(e) im Konto).", len(getattr(vm, "vehicles", None) or {}))
                 
                 if force_requested:
                     logger.info(
@@ -905,7 +1091,9 @@ def main():
                     
                     # --- DEBUG: Alle rohen Fahrzeugdaten für den Nutzer speichern ---
             except Exception as e:
-                logger.error(f"Ein Fehler ist aufgetreten: {e}")
+                # Typ, HTTP-Status und Server-Antwort ohne Geheimnisse; Anmeldefehler verwerfen den Token-Cache.
+                logger.error("Bluelink-Abruf fehlgeschlagen: %s", _describe_bluelink_error(e, _bluelink_secrets(config)))
+                _handle_refresh_failure(session, e)
                 
                 # Letzten bestätigten SoC erhalten, aber Versuch und Fehler
                 # getrennt davon publizieren. Der neue Datei-Zeitpunkt ist

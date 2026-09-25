@@ -103,6 +103,19 @@ _QUIESCED_OVERLAY_KEYS = frozenset(
         "parent_backup_id",
     }
 )
+# Enthält die Nachsicherung gzip-kodierte Einträge, nennt das Manifest die
+# Kodierungen zusätzlich in ``file_encodings``. verify_backup prüft dieses Feld
+# vor jeder Vertragsbindung (Liste, nicht leer, nur bekannte Kodierungen).
+_QUIESCED_OVERLAY_OPTIONAL_KEYS = frozenset({"file_encodings"})
+
+
+def _overlay_manifest_keys_complete(manifest: Dict[str, object]) -> bool:
+    """Pflichtschlüssel vollständig, zusätzlich nur bekannte optionale Schlüssel."""
+
+    keys = set(manifest)
+    return _QUIESCED_OVERLAY_KEYS <= keys <= (
+        _QUIESCED_OVERLAY_KEYS | _QUIESCED_OVERLAY_OPTIONAL_KEYS
+    )
 
 
 @dataclass(frozen=True)
@@ -1478,7 +1491,7 @@ def _verify_quiesced_overlay_contract(
             "Ruhende Daten-Nachsicherung ist nicht root:root 0700 gebunden"
         )
     manifest = verify_backup(path, expected_kind=QUIESCED_OVERLAY_KIND)
-    if set(manifest) != _QUIESCED_OVERLAY_KEYS:
+    if not _overlay_manifest_keys_complete(manifest):
         raise BackupIntegrityError(
             "Overlay-Manifest besitzt einen unbekannten oder unvollständigen Vertrag"
         )
@@ -1523,7 +1536,7 @@ def _validate_overlay_manifest_against_contract(
     contract: _QuiescedOverlayContract,
 ) -> None:
     if (
-        set(manifest) != _QUIESCED_OVERLAY_KEYS
+        not _overlay_manifest_keys_complete(manifest)
         or manifest.get("kind") != QUIESCED_OVERLAY_KIND
         or str(manifest.get("state") or "") != "complete"
         or _normalized_transaction_id(manifest.get("transaction_id"))
@@ -1633,7 +1646,7 @@ def _verify_prune_quarantine_contract(
             raise BackupIntegrityError(
                 "Quarantäne-Rest besitzt nicht den privaten Overlay-Modus"
             )
-        if set(manifest) != _QUIESCED_OVERLAY_KEYS:
+        if not _overlay_manifest_keys_complete(manifest):
             raise BackupIntegrityError(
                 "Quarantäne-Rest besitzt keinen vollständigen Overlay-Vertrag"
             )

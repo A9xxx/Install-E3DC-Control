@@ -29,6 +29,28 @@ Speicherkapazität. Erwartete PV am nächsten Nachmittag kann eine vorherige
 Versorgungslücke in der Nacht nicht decken. Reichen Speicher und rechtzeitig
 verfügbare PV aus, bleibt das normale Netzladen aus.
 
+Der Netzladebedarf wird zeitgerichtet bestimmt: Er reicht nur bis zum nächsten
+nutzbaren günstigen Preisfenster; was dieses Fenster liefern kann, wird
+angerechnet. Die für das laufende Fenster erwartete PV-Erzeugung wird zuerst
+berücksichtigt; aus dem Netz wird nur der Rest geladen, der zum Fensterende
+noch fehlt. Das Netzladen liegt deshalb am Ende des Fensters, davor lädt der
+Speicher aus PV und bleibt entladegesperrt; nach dem spätesten Ladestart wird
+aus dem Netz geladen, auch wenn PV gerade lädt. Ladeziel und Job folgen dem
+Sollbestand am Fensterende (Bedarf bis zum nächsten nutzbaren Fenster plus
+Puffer) und bleiben im Fenster stabil; deckt der erwartete Bestand den
+Sollbestand, bleibt das Netzladen aus. Für die Ladedauer wird die
+tatsächlich beobachtete Ladeleistung des Speichers verwendet. Ist das Ziel
+erreicht, wird im selben Fenster nicht erneut aus dem Netz geladen (Hysterese
+1 %, `market_target_hysteresis_pct`). Bei Tariftypen mit festem Zeitfenster
+(z. B. Octopus Heat) ist das konfigurierte Tarifzeitfenster die Regelgröße,
+nicht der Börsenpreis. Hinweis: Eine negative Sicherheitskorrektur
+(`market_safety_correction_ct_per_kwh`) kann auch Grundtarifstunden
+rechnerisch lohnend machen und erhöht damit das Ladevolumen. Das Ladeprofil
+(Wirtschaftlich / Ausgeglichen / Komfort / Eigene Einstellungen) bestimmt
+Marge, Sicherheitskorrektur und Preislimit; Komfort ersetzt die
+PV-Autarkie-Sperre durch das Zeitziel (siehe Börsenpreis-Optimierung,
+Abschnitt „Ladeprofil“).
+
 Bei **Octopus Heat** und einem konfigurierten **Spezialtarif** sind die täglich
 wiederkehrenden Abrechnungspreise über den vollständigen Planungshorizont
 bekannt. Fehlende morgige Börsenpreise verkürzen diese Tarifachse nicht.
@@ -146,7 +168,7 @@ nicht wieder aufgenommen. Technisch wird der Schalter als
 bindet die Übernahme mit `storage_regulation_changed_ts` an die aktuelle
 Bedienaktion. Ein Dienststopp allein ersetzt diese geordnete Abschaltung nicht.
 
-> **Stand:** v5.4.6d
+> **Stand:** v5.5.0
 >
 > **Neu in 5.4.5a:** Ein frisch beobachteter openWB-Fahrzeug-SoC kann mit
 > Quelle und Alter rein lesend erscheinen, wenn er zur aktuellen Stecksession
@@ -220,11 +242,21 @@ Bedienaktion. Ein Dienststopp allein ersetzt diese geordnete Abschaltung nicht.
 > dort nach der Übergabe keine Strombefehle mehr sendet.
 > Optionale Grenz- und Reservewerte je Phase werden phasenbezogen angewendet;
 > bei unbekannter einphasiger Zuordnung gilt der ungünstigste Fall. Die Reserve
-> bildet den statisch konfigurierten Abstand für andere Verbraucher. Mangels
-> echter PCC-Phasen-RMS-Messung bleibt eine aus Wirkleistung durch `P/230`
-> abgeleitete Stromangabe rein diagnostisch und darf keine zusätzliche
-> Ladeleistung autorisieren.
-> Fehlt `grid_max_amps` oder ist der Wert leer, gelten 35 A je Phase. Mehrere
+> bildet den statisch konfigurierten Abstand für andere Verbraucher. Für den
+> Gruppen-Phasenclamp bleibt eine aus Wirkleistung durch `P/230` abgeleitete
+> Stromangabe rein diagnostisch; nur der einphasige Deckel der openWB Pro
+> nutzt den Bezug je Netzphase aus dem E3DC-Wurzelzähler geteilt durch die
+> Wechselrichter-Spannung als freigegebene Messbasis (siehe
+> `doc/Native_Wallbox.md`). Das Speicherbudget bleibt für die Wallbox bindend;
+> die eigene, im Hauswert nachlaufende Ladeleistung kann es für einige Zyklen
+> einbrechen lassen, weil die Speicherseite die Wallboxleistung erst mit dem
+> nächsten Messrahmen aus dem Hauswert herausrechnet. Das Startfenster des
+> Wallbox-Managers hält das Stromangebot der openWB Pro über solche Einbrüche
+> hinweg (kein 0 A aus Budgetgründen im Fenster).
+> Fehlt `grid_max_amps` oder ist der Wert leer, gelten 35 A je Phase. Der
+> Standard 35 A gilt nur für den Skalarpfad (3p-Gruppenbudget); die einphasige
+> Freigabe > 20 A an einer openWB Pro verlangt eine ausdrücklich eingetragene
+> Hausabsicherung. Mehrere
 > Ladepunkte teilen diesen Phasenrahmen ohne pauschale Gleichteilung. Ein
 > gebundenes einphasiges Fahrzeugprofil bestimmt die reale Lastphase; ohne
 > Fahrzeugbeleg bleibt die feste Wallboxtopologie maßgeblich.
@@ -323,7 +355,11 @@ storage_manager.py
 
 Die Dienste kommunizieren über Dateien in der Ramdisk. Der Simulator plant, der
 Manager regelt. Ein Zyklus hat genau einen Entscheider und genau einen
-RSCP-Ausgang.
+RSCP-Ausgang. Die verbindlichen Grundsätze dieser Regelung (harte Schranken vor
+Optimierung, Ein-Entscheider je Aktor, Anti-Flattern, fehlende Daten sind keine
+Freigabe, Akkustützung der Wallbox nach Korridorlage) stehen in
+`doc/V4_Konfiguration_und_Regelung.md`, Abschnitt „Regelungsphilosophie
+(verbindlich)“.
 
 ## 1. Planung
 
@@ -459,6 +495,53 @@ Adaptive Headroom-Werte werden dabei nicht als direkter Entladeauftrag gelesen:
 Im Dashboard wird daraus `frei / Reserve max`. Ein Pre-Dump-Auftrag entsteht
 erst, wenn `predump_dump_wh` beziehungsweise `Pre-Dump-Bedarf` größer null ist.
 
+### Schreibbremse für die AUTO-Ladegrenze
+
+Im Kurvenladebetrieb, im freien `AUTO` und in der Netzentlastung schreibt der
+Manager die EMS-Ladegrenze (`MAX_CHARGE_POWER` mit `POWER_LIMITS_USED`) nicht
+bei jeder kleinen Schwankung des Messrahmens neu:
+
+- Nicht schützende Änderungen gehen höchstens alle 30 s hinaus, gezählt ab dem
+  letzten Schreibvorgang der EMS-Power-Settings. Eine Absenkung und der
+  Wechsel von der Freigabe auf eine Ladegrenze müssen zusätzlich 10 s lang
+  gleich angefordert sein. Abweichungen unter 200 W bleiben stehen; besteht
+  eine Abweichung länger als 300 s, schreibt der Manager den aktuellen Wert
+  trotzdem.
+- Schützende Absenkungen wirken im selben Zyklus: 0-W-Halt, Halten bei Kurve
+  oberhalb oder vor dem Kurvenstart, Planwert 0, weiche Kurvengrenzen,
+  Gleitpfad und Kurvenkante.
+- In beide Richtungen ohne Wartezeit, also auch beim Anheben, führen wie
+  bisher: Abregel- und Exportdruck an einer Einspeisegrenze, Vorgaben der
+  Direktvermarktung (Preiskurve, Reservierung, Nachlauf), die Führung einer
+  ladenden Wallbox in `PV-Kurve ruhig`, die Wallbox-Reserve, die kontrollierte
+  Wallbox-Grenze und die Zielkorridor-Schnellladung.
+- Keine Freigabe wird verzögert, die Netzbezug verhindern kann: Bei Netzbezug
+  geht die Freigabe einer gehaltenen Ladegrenze sofort hinaus, denn eine
+  gehaltene Ladegrenze begrenzt die Entladung auf die Entladegrenze der
+  EMS-Power-Settings. Ebenso geht eine Öffnung sofort hinaus, wenn die
+  Einspeisung schon innerhalb des Abregelpuffers (`abregel_puffer_w`) unter
+  der Einspeisegrenze liegt. In `AUTO` lädt der Speicher nicht aus dem Netz;
+  eine gehaltene Ladegrenze verschiebt nur PV-Leistung zwischen Speicher und
+  Einspeisung.
+- Ein eigener, per Rücklesen bestätigter Schreibvorgang gilt 4,5 s lang als
+  Nachweis für denselben Wert; ein älterer Live-Wert aus dem laufenden
+  Lesezyklus löst in dieser Zeit keinen zweiten Schreibvorgang mit diesem Wert
+  aus. Ein neuer Wert, der nur innerhalb der Rücklesetoleranz vom letzten
+  abweicht, wird wie bisher gegen den Live-Wert geprüft.
+- Außerhalb der Bremse arbeiten wie bisher Nutzer-`Aus`, Notstromreserve,
+  ungültige Messdaten, der Abregelpfad, die Reservierung für späteres
+  Direktvermarktungs-Speichern, die E3/DC-PV-Ladebegrenzung (3.1), die
+  PV-only-Entladegrenze der Wallbox, der Start vor der Kurve bei hohem Bedarf
+  und harte Lademodi. Die Entscheidungshistorie zählt die Schreibvorgänge je
+  Pfad (`write_brake`).
+
+Die Grenze „höchstens alle 30 s“ gilt nur für nicht schützende Änderungen.
+Schützende Absenkungen, Freigaben bei Netzbezug, die in beide Richtungen
+sofort wirkenden Vorgaben und die Pfade außerhalb der Bremse können öfter
+schreiben. Unter wechselnder Bewölkung oder Last tastet die Bremse den
+Messrahmen nur alle 30 s ab. Die Ladegrenze folgt dann verzögert; einzelne
+Abschnitte speisen dadurch mehr ein, andere weniger.
+
 ### 3.1 Optionale E3/DC-PV-Ladebegrenzung
 
 `storage_dc_first_charge_limit_enable = 1` begrenzt Kurvenladung und
@@ -497,6 +580,51 @@ Auftrag und bestätigter Laderahmen sind getrennte Zustände. Ein unterdrückter
 Wunsch ist kein neuer Gerätewert. Die tatsächliche Batterieladung kann wegen
 Hauslast oder Gerätebegrenzungen weiterhin unter dem oberen Rahmen liegen.
 
+Bei Dringlichkeit öffnet der Laderahmen schneller: Liegt der Speicher unter
+der Korridor-Untergrenze der Ladekurve, muss ein Abendziel-Rückstand aufgeholt
+werden, ist der späteste Ladebeginn erreicht, fehlt Energie bis zu einem
+harten Kurvenanker oder steht die Kurvengrenze unter hartem Einspeisedruck,
+öffnet der Rahmen mit mindestens 125 W/s (250 W je 2-s-Regelzyklus) statt mit
+der ruhigen Rampe. Ohne Dringlichkeit bleibt die ruhige Öffnung aktiv.
+
+Fällt das E3/DC-PV-Angebot unter die Einschaltschwelle von 300 W (bei
+laufendem Rahmen unter die Ausschaltschwelle von 150 W), gilt:
+
+- Ohne nennenswerte Zusatz-AC-PV (unter 150 W, nach einer Freigabe unter
+  300 W) wird ein laufender Rahmen bei kurzen Einbrüchen, etwa durch Wolken,
+  bis zu 600 s gehalten (`storage_dc_first_low_offer_hold_s`). Dauert der
+  Einbruch länger oder läuft noch kein Rahmen, etwa morgens, gibt der Manager
+  den Rahmen frei: E3/DC-AUTO ohne Ladegrenze und ohne Heartbeat. Die
+  Rückkehr verlangt ein Angebot von mindestens 300 W über 60 s
+  (`storage_dc_first_offer_return_s`) und startet direkt am Ziel.
+  `storage_dc_first_low_offer_hold_enable = 0` schaltet Halten und Freigabe
+  ab.
+- Liefert der Zusatz-Wechselrichter selbst Leistung, gilt DC-first: Der Rahmen
+  wird ohne Haltezeit auf 0 W gekappt und nicht freigegeben, weil ein
+  gehaltener oder freigegebener Rahmen den Speicher aus Zusatz-AC-PV laden
+  würde.
+- Vorrang hat ein volles Ladeziel: Ist das Ladeziel gefährdet (Rückstand unter
+  der Korridor-Untergrenze, Abendziel-Rückstand, spätester Ladebeginn erreicht
+  oder ein harter Kurvenanker bereits verfehlt), bleiben Halten und Freigabe
+  auch mit Zusatz-AC-PV wirksam; der Speicher darf dann auch aus dem
+  Zusatz-Wechselrichter laden. Hoher Einspeisedruck allein zählt nicht dazu,
+  ebenso wenig das planmäßige Laden vor einem noch nicht erreichten
+  Kurvenanker. Beginnt die Gefährdung während einer Kappung, gibt der Manager
+  ohne Wartezeit frei. Endet sie, bleibt der Vorrang noch 600 s
+  (`storage_dc_first_low_offer_hold_s`) wirksam, damit der Rahmen nicht
+  zwischen Freigabe und Kappung pendelt; erst danach gilt wieder DC-first.
+- Ohne gültigen PV-Split gibt es weder Halten noch Freigabe; der Rahmen bleibt
+  bei 0 W.
+
+Grenzen dieser Regel: Nach einer Kappung wegen Zusatz-AC-PV gibt der Manager
+frei, sobald die Zusatz-AC-PV unter 150 W fällt, ohne erneute Haltezeit. Nach
+einer Freigabe bleibt Zusatz-AC-PV bis 299 W zulässig. Während der
+Rückkehrprüfung (bis 60 s) bleibt der Rahmen freigegeben und kann in dieser
+Zeit auch Zusatz-AC-PV aufnehmen. Oberhalb der Schwelle bleibt der Rahmen
+auch bei gefährdetem Ladeziel auf die E3/DC-PV-Leistung begrenzt; nur der
+unterhalb der Schwelle gehaltene oder freigegebene Rahmen nimmt dann auch
+Zusatz-AC-PV auf.
+
 ### 3.2 Ladefreigabe bei Kurvenrückstand
 
 Seit 5.4.2a gilt ein `EMS_USER_CHARGE_LIMIT`-Readback aus frischen, validen
@@ -528,6 +656,20 @@ Der Storage Manager veröffentlicht ein Budget für andere Dienste:
 | Wallbox | nutzt Budget, Modus, Mindeststrom, Phasenlogik und Hysterese |
 | Wärmepumpe | nutzt Budget und Mindestlaufzeiten über den Energy Manager |
 | Heizstab | nutzt Budget nur bei expliziter Freigabe |
+
+Das Wallbox-Potenzial, das der Storage Manager als Anforderung des
+Wallboxanteils im Verbraucherbudget ansetzt (`possible_power_w`), ist die Summe über alle aktiven Ladepunkte
+(angesteckt, ladend, Sollstrom > 0 oder Leistung > 250 W): je Ladepunkt
+max(6, min(32, Maximalstrom)) · 230 V · Phasen. Eine phasenumschaltfähige
+Box zählt mit ihrem 3p-Potenzial, auch wenn sie gerade einphasig lädt, damit
+das Budget eine spätere Hochschaltung nicht vorab deckelt; eine ausdrücklich
+einphasige Versorgung oder ein einphasiges Fahrzeug aus dem Phasenvertrag
+zählt einphasig. Fehlende Daten werden nicht erfunden: ein Ladepunkt ohne
+Sollstrom zählt nicht; ohne Phasenmeldung gilt an einer festen Box eine
+Phase, an einer umschaltfähigen Box ihr 3p-Potenzial.
+Schieflast-, Hausanschluss- und Deckelgrenzen setzt der Wallbox-Manager
+anschließend je Ladepunkt; den einphasigen Deckel mit Schieflast-Wächter
+gibt es dabei nur an der openWB Pro.
 
 Wärmepumpenleistung wird aus `energy_decision_latest.json` übernommen und in den
 Livewerten als `WP_Power` geführt. Wenn der Hausverbrauch die WP bereits enthält,

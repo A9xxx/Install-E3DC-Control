@@ -2,10 +2,23 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.4.6d`. Die Tags `latest`, `v5.4.6d` und
-`5.4.6d` bezeichnen denselben Stable-Stand.
+Der aktuelle Stable-Stand ist `v5.5.0`. Die Tags `latest`, `v5.5.0` und
+`5.5.0` bezeichnen denselben Stable-Stand.
 
-5.4.6d enthält außerdem die begrenzte Phasenerkennung fester E3DC-Wallboxen,
+**Updates im Überblick:** Der Knopf **System Update** in der Weboberfläche und
+das **Auto-Update** im Config-Editor geben dem optionalen Watchtower-Dienst das
+Signal, das neue Image zu laden und den Container neu zu erstellen; der
+Container selbst steuert den Docker-Daemon nie. Ohne Watchtower genügt auf dem
+Host `sudo docker compose pull && sudo docker compose up -d`. Der Host-Helfer
+`Installer/docker_compose_update.py` bleibt der geprüfte Weg mit automatischem
+Rückfall. Einzelheiten stehen unter
+[3. Updates: Weboberfläche, Host und Watchtower](#3-updates-weboberfläche-host-und-watchtower).
+
+Der Knopf **System Update** steht ab 5.5.0 zur Verfügung. Das Update von 5.4.x auf 5.5.0 erfolgt
+noch über den Host-Weg; ab dem nächsten Release genügt der Knopf. Die Schritte
+stehen im Abschnitt 3 unter „Übergang von 5.4.x auf 5.5.0“.
+
+Weiterhin enthalten sind die begrenzte Phasenerkennung fester E3DC-Wallboxen,
 die korrigierte Zuteilung zwischen mehreren Ladepunkten und geschützte
 Luxtronik-PV-Aufträge. Vor optionalem Wärmepumpen-PV-Boost das elektrische
 Leistungsprofil und erlaubte Überbrückungskontingente im Config Editor prüfen.
@@ -13,16 +26,59 @@ Leistungsprofil und erlaubte Überbrückungskontingente im Config Editor prüfen
 `external: false` ausdrücklich ausgeben; externe Volumes werden dadurch nicht
 freigegeben.
 
-5.4.6d startet EMS-Python-Dienste mit dem eigenen unprivilegierten Konto
+Seit 5.4.6 starten EMS-Python-Dienste mit dem eigenen unprivilegierten Konto
 `e3dc-runtime`. Private Modelle und Prognosebelege werden vor dem Start geprüft
 und übernommen. Der aktuelle Host-Updater ist auch für den Rückfall auf ältere
-Root-Images erforderlich. Vor dem Upgrade den tatsächlich verwendeten Helfer
-aktualisieren, einschließlich einer gegebenenfalls direkt im Compose-Ordner
+Root-Images erforderlich. Wer den Helfer verwendet, aktualisiert ihn vor dem
+Upgrade, einschließlich einer gegebenenfalls direkt im Compose-Ordner
 vorhandenen Kopie; ein neues Containerimage ersetzt diese Hostdatei nicht.
 Zusätzlich steht eine ausdrücklich wählbare Bridge-Vorlage für kompatible
 Named-Volume-Installationen bereit. Hostnetz bleibt Standard. Vor einem Wechsel
 die unten beschriebenen Sicherungs-, Netzwerk- und Wallbox-Wartungshinweise
 beachten. Einzelheiten stehen in den [Release Notes](../RELEASE_NOTES.md).
+
+## Host-Helfer auf dem Docker-Host ausführen
+
+Dieser Abschnitt betrifft den optionalen Host-Helfer. Der normale Updateweg
+über die Weboberfläche benötigt ihn nicht.
+
+**Alle Aufrufe von `Installer/docker_compose_update.py` gehören auf den
+Docker-Host, nicht in eine Shell innerhalb des Containers.** Der Host ist der
+Rechner bzw. das NAS, auf dem Docker und die verwendeten Compose-Dateien liegen.
+Ein über `docker exec ... /bin/bash` geöffneter Container ist dafür der falsche
+Arbeitsort. Wenn Du noch in dieser Shell bist, kehre mit `exit` zur Host-Shell
+zurück. `sudo: command not found` im Container wird nicht durch Nachinstallieren
+von `sudo` oder bloßes Weglassen von `sudo` behoben; der Helfer muss auf dem Host
+laufen. Auch der Download und das Kopieren des Helfers erfolgen dort.
+
+Den tatsächlich verwendeten Projektordner und Dateisatz auf dem Host ermitteln:
+
+```bash
+sudo docker inspect --type container --format 'Ordner={{index .Config.Labels "com.docker.compose.project.working_dir"}}{{println}}Dateien={{index .Config.Labels "com.docker.compose.project.config_files"}}' e3dc-control
+```
+
+Bei einem anderen Containernamen `e3dc-control` entsprechend ersetzen.
+Den unter `Ordner=` ausgegebenen Pfad verwenden, beispielsweise:
+
+```bash
+E3DC_DOCKER_PATH="/absoluter/pfad/zum/compose-projekt"
+cd "$E3DC_DOCKER_PATH"
+```
+
+Den Beispielpfad vorher durch die tatsächliche Ausgabe ersetzen. Fehlen die
+Compose-Labels oder existieren die angegebenen Dateien nicht mehr, zuerst den
+Startweg in der verwendeten Docker-/NAS-Verwaltung prüfen. Nicht ersatzweise
+im Containerverzeichnis `/app/pi/Install` arbeiten oder eine neue Compose-Datei
+über die vorhandene Konfiguration kopieren.
+
+Unter `Dateien=` können mehrere Dateien stehen. Beim Update alle mit `-f`
+in derselben Reihenfolge auswählen; Details stehen unter
+[Eigene Compose-Dateien, OMV und mehrere Instanzen](#eigene-compose-dateien-omv-und-mehrere-instanzen).
+Danach den aktuellen veröffentlichten Host-Helfer installieren und den passenden
+Updateweg dieser Anleitung verwenden. Ein Download eines älteren, fest
+angegebenen Tags liefert weiterhin dessen alten Helfer, auch nach einem
+Image-Update. Für lokale Korrekturpakete gilt zuerst der unten beschriebene
+zugehörige Übergang.
 
 ## Containerweiter Privilegienschutz und ältere Kernel
 
@@ -75,14 +131,14 @@ installieren, anschließend das Ziel ausdrücklich wählen:
 
 ```bash
 curl -q -fsS --proto '=https' --tlsv1.2 \
-  -o ./docker_compose_update-5.4.6d.py \
-  https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control/v5.4.6d/Installer/docker_compose_update.py
+  -o ./docker_compose_update-5.5.0.py \
+  https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control/v5.5.0/Installer/docker_compose_update.py
 if [ ! -d ./Installer ]; then
   sudo install -d -m 0755 ./Installer
 fi
-sudo install -m 0644 ./docker_compose_update-5.4.6d.py ./Installer/docker_compose_update.py
+sudo install -m 0644 ./docker_compose_update-5.5.0.py ./Installer/docker_compose_update.py
 sudo python3 ./Installer/docker_compose_update.py \
-  --compose-dir . --sudo --image-tag v5.4.6d
+  --compose-dir . --sudo --image-tag v5.5.0
 ```
 
 Der aktuelle Helfer akzeptiert die gebundene gestoppte Altinstanz, ergänzt bei
@@ -350,7 +406,7 @@ sudo usermod -aG docker "$USER"
 
 ### Schritt 2: Verzeichnis vorbereiten
 Der Repository-Checkout liefert die kanonische Compose-Datei und den
-fail-closed Host-Updater. Der Anwendungscode selbst kommt im Normalfall
+optionalen Host-Helfer. Der Anwendungscode selbst kommt im Normalfall
 weiterhin aus dem veröffentlichten GHCR-Image.
 ```bash
 export E3DC_DOCKER_PATH="/absoluter/pfad/zur/docker-installation"
@@ -446,7 +502,7 @@ wird deshalb nicht unterstützt. Eine spätere Zusammenlegung privater Volumes
 benötigt eine verifizierte Datenmigration samt Rechteprüfung und Rückfallweg.
 
 **Synology / NAS mit belegtem Port 80:**
-Wenn der Host Port 80 selbst abfaengt oder auf die NAS-GUI umleitet, kannst du
+Wenn der Host Port 80 selbst abfängt oder auf die NAS-GUI umleitet, kannst du
 den Apache-Port im Container per ENV setzen. Mit `network_mode: "host"` gibt es
 kein Docker-`ports:`-Mapping; der Container bindet direkt auf dem Host-Port.
 
@@ -460,16 +516,29 @@ environment:
 
 Danach erreichst du E3DC-Control z.B. unter
 `http://<NAS-IP>:8085/`. Der Synology Reverse Proxy kann dann auf diesen Port
-weiterleiten. `E3DC_WEB_BIND` erwartet eine IP-Adresse der gewuenschten
+weiterleiten. `E3DC_WEB_BIND` erwartet eine IP-Adresse der gewünschten
 Schnittstelle, keinen Interface-Namen wie `eth0`.
 
 **Wichtig bei bestehenden Images:**
 `docker compose up -d --wait --wait-timeout 300 e3dc-control` baut ein vorhandenes Image nicht automatisch neu und
 zieht auch nicht zwingend die neueste Version. Wenn `E3DC_WEB_PORT` im Container
-sichtbar ist, Apache aber trotzdem weiter auf `0.0.0.0:80` hoert, laeuft sehr
+sichtbar ist, Apache aber trotzdem weiter auf `0.0.0.0:80` hört, läuft sehr
 wahrscheinlich noch ein altes Image oder ein alter Container.
 
-Fertiges GitHub-Image aktualisieren:
+Erststart und Update auf dem Host im Compose-Projektverzeichnis:
+
+```bash
+cd "$E3DC_DOCKER_PATH"
+sudo docker compose pull
+sudo docker compose up -d
+sudo docker compose logs --tail=80 e3dc-control
+```
+
+Damit anschließend der Knopf **System Update** und das Auto-Update der
+Weboberfläche funktionieren, einmalig Watchtower freischalten; siehe
+[3. Updates: Weboberfläche, Host und Watchtower](#3-updates-weboberfläche-host-und-watchtower).
+
+Der geprüfte Weg mit automatischem Rückfall bleibt der Host-Helfer:
 
 ```bash
 cd "$E3DC_DOCKER_PATH"
@@ -604,8 +673,9 @@ private Modelle über den vorhandenen Offline-Migrationshelfer vorbereitet;
 andere Datenbestände werden nicht aus einem alten Archiv überschrieben.
 
 Ein weiterhin aktiver Watchtower darf nicht gleichzeitig denselben Zielcontainer
-aktualisieren. Der Helfer prüft das bekannte Watchtower-Opt-in und meldet eine
-konkrete Konkurrenz. Fremde Dienste werden nicht automatisch angehalten.
+aktualisieren. Der Helfer prüft laufende Watchtower-Container gegen das
+Enable-Label des Zielcontainers und bricht bei einer konkreten Konkurrenz ab.
+Fremde Dienste werden nicht automatisch angehalten.
 Sicherheitsrelevante Eingriffe wie ein eigener Entrypoint, ein überschreibendes
 `user:`, zusätzliche Gerätefreigaben oder Produktpfade überlagernde Mounts
 benötigen weiterhin eine fachliche Prüfung; harmlose Labels und Zusatzdienste
@@ -617,7 +687,7 @@ Ohne ausdrücklichen Tag verwendet der Helfer das Image des ausgewählten Dienst
 Die mitgelieferte variable Zeile folgt ohne `E3DC_IMAGE_TAG` dem geprüften Stable-Tag
 `latest`. Ein vorhandener fester Tag bleibt absichtlich bestehen.
 
-`--image-tag v5.4.6d` funktioniert auch bei einer fest eingetragenen OMV-Imagezeile.
+`--image-tag v5.5.0` funktioniert auch bei einer fest eingetragenen OMV-Imagezeile.
 Der Helfer schreibt diese Auswahl dauerhaft nur in das `image:`-Feld des
 Zieldienstes. Die `.env` und das Image anderer E3DC-Dienste bleiben unverändert.
 Bei einem gescheiterten Update wird die vorherige Zeile im Rahmen des verifizierten
@@ -639,7 +709,7 @@ sudo docker compose config --images e3dc-control
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.4.6d` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.5.0` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash
@@ -830,7 +900,7 @@ für `e3dc_ml`, `e3dc_forecast_evidence` und `e3dc_instance_role`; diese
 privaten Datenklassen bleiben dadurch vom Webverzeichnis getrennt. Den Pfad siehst du bei Bedarf mit
 `docker volume inspect <Compose-Projekt>_e3dc_forecast_evidence`.
 
-Pruefen, ob der neue Entrypoint aktiv ist:
+Prüfen, ob der neue Entrypoint aktiv ist:
 
 ```bash
 sudo docker exec e3dc-control sh -lc '
@@ -850,12 +920,11 @@ VirtualHost configuration:
 ```
 
 Wenn das Dashboard danach erreichbar ist, aber oben `Warte auf E3DC...` zeigt,
-ist der Webserver repariert und der naechste Schritt ist RSCP: Konfiguration
-speichern, Container neu starten und dann Port/Anmeldung pruefen.
+ist der Webserver repariert und der nächste Schritt ist RSCP: Konfiguration
+speichern, Container neu starten und dann Port/Anmeldung prüfen.
 
 ```bash
-sudo python3 ./Installer/docker_compose_update.py \
-  --compose-dir . --sudo --recreate-current
+sudo docker compose restart e3dc-control
 sudo docker exec e3dc-control sh -lc '
 python3 - <<PY
 import json, socket
@@ -873,12 +942,12 @@ PY
 ```
 
 Kommt `TCP 5033 OK`, aber `e3dc_live.py` liefert keine Daten, sind meist
-Benutzer, Passwort oder AES-Passwort zu pruefen. Scheitert schon TCP, liegt es
+Benutzer, Passwort oder AES-Passwort zu prüfen. Scheitert schon TCP, liegt es
 an IP, Netzwerk, VLAN, Firewall oder daran, dass RSCP am E3DC nicht erreichbar
 ist.
 
-Wenn du nur den Port aendern willst, ist es oft robuster, `E3DC_WEB_BIND`
-wegzulassen. Dann hoert Apache auf allen Host-IP-Adressen auf dem gewaehlten
+Wenn du nur den Port ändern willst, ist es oft robuster, `E3DC_WEB_BIND`
+wegzulassen. Dann hört Apache auf allen Host-IP-Adressen auf dem gewählten
 Port, z.B. `Listen 8085`.
 
 ### Schritt 4: Starten
@@ -925,7 +994,7 @@ Port, etwa `E3DC_PUBLISH_BIND=192.0.2.20` und `E3DC_PUBLISH_PORT=8085`.
 Verwende denselben Compose-Ordner und Projektnamen. Sichere vorher die
 funktionierende `docker-compose.yml` als `docker-compose.host.bak`, die
 vorhandene `.env` und die persistenten Daten. Halte den aktuell eingesetzten
-versionierten Runtime-Image-Tag für den Rückweg fest, beispielsweise `v5.4.6d`.
+versionierten Runtime-Image-Tag für den Rückweg fest, beispielsweise `v5.5.0`.
 Ein älterer Root-Tag eignet sich nicht für diesen ersten Netzwerk-Rückweg.
 Prüfe eine administrativ zugängliche Kopie der aktuellen
 Konfiguration, ohne ihren Inhalt auszugeben:
@@ -948,10 +1017,12 @@ sudo python3 Installer/docker_compose_update.py --compose-dir . --sudo
 Die Named Volumes bleiben dabei erhalten. Verwende kein `down -v` oder
 `volume rm`. Ein bestehender Hostcontainer wird unter der Bridge-Vorlage
 abgewiesen; bloßes Stoppen genügt daher nicht. Der Host-Updater prüft vor dem
-Start, dass Ziel- und gegebenenfalls Rückfallimage Bridge unterstützen. Nutze
-für diesen Betriebsweg den Host-Updater; direkte `docker compose up`-Aufrufe
-und Watchtower umgehen dessen Imageprüfung. Automatische Updates bleiben
-hier ausgeschaltet.
+Start, dass Ziel- und gegebenenfalls Rückfallimage Bridge unterstützen. Für
+den Netzwerkwechsel selbst den Host-Updater verwenden; direkte
+`docker compose up`-Aufrufe und Watchtower umgehen dessen Imageprüfung. Nach
+dem bestätigten Wechsel funktionieren Update-Knopf und Auto-Update auch im
+Bridge-Betrieb: Watchtower liegt dann im gemeinsamen Compose-Netz und wird
+unter `http://watchtower:8080` angesprochen.
 
 Prüfe anschließend Webzugang, `/ws`, frische RSCP-Livewerte und alle genutzten
 MQTT-, Wallbox- und Wärmeanbindungen. Ein erfolgreicher Start allein bestätigt
@@ -988,7 +1059,7 @@ erfordert ebenfalls zuerst die Rückkehr zum Host-Betrieb.
 Wenn E3DC-Control in Docker läuft, verhält es sich intern etwas anders als bei einer "Bare-Metal" Installation auf dem Raspberry Pi.
 
 * **Keine Cronjobs:** Docker-Container haben von Haus aus keinen Aufgabenplaner (Cron). Diese Aufgabe übernimmt vollautomatisch der in Python geschriebene **Schedule & Notification Manager** (`notification_manager.py`). Er läuft im Hintergrund und triggert die Minutenspeicherung, Backups und Telegram-Nachrichten.
-* **Web-Updates deaktiviert:** Da ein Container „immutable" (unveränderlich) ist, ist der „Update"-Knopf im Web-Dashboard deaktiviert. Klickst du darauf, informiert dich das System, dass Updates über Docker bezogen werden müssen.
+* **Web-Updates über Watchtower:** Ein Container ist „immutable" (unveränderlich); der Update-Knopf tauscht deshalb keine Dateien im Container, sondern gibt Watchtower das Signal, das neue Image zu laden und den Container neu zu erstellen. Ohne eingerichteten Watchtower zeigt der Knopf die Host-Befehle. Das Auto-Update im Config-Editor nutzt denselben Weg zur eingestellten Uhrzeit.
 * **Kein Systemd:** Befehle wie `systemctl restart e3dc` funktionieren im Container nicht. Wenn du den Dienst neu starten möchtest, startest du einfach den gesamten Container neu (siehe unten). Logs der Python-Dienste findest du unter `/var/www/html/logs/`.
 * **Auto-Start:** Du benötigst keine Watchdogs oder Crontab-Einträge mehr, damit E3DC nach einem Stromausfall hochfährt. Der Parameter `restart: unless-stopped` in der `docker-compose.yml` sorgt dafür, dass Docker das System immer am Leben hält.
 * **Fail-fast-Supervision:** PID 1 überwacht Apache als echten Vordergrundprozess sowie alle gestarteten Python-/Node-Worker. Endet einer dieser Dauerprozesse nach der Readiness, beendet sich der Container ungleich null; die Docker-Restart-Policy startet anschließend den vollständigen, konsistenten Dienstsatz neu.
@@ -1030,6 +1101,39 @@ gesunder EMS-Dienst. Der Web-Neustart funktioniert weiterhin über den
 Notifier-Exit und den vollständigen Neustart durch PID 1; dafür erhält der
 Notifier keine zusätzlichen Rechte.
 
+### Rechtemodell und Rechteprüfung im Container
+
+Der Container setzt seine Dateirechte bei jedem Start selbst. Sie weichen
+bewusst vom Bare-Metal-Modell ab, in dem der Installationsbenutzer die
+Laufzeitpfade und den Produktbaum besitzt:
+
+| Pfad | Besitzer:Gruppe | Modus | Zweck |
+|------|-----------------|-------|-------|
+| `/app/pi/Install` samt `Installer/` und Wrappern | `root:root` | `0755` / `0644` | Unveränderlicher Produktcode; nur ein neues Image ändert ihn |
+| `/var/www/html` | `root:www-data` | `0755` | Webroot, beim Start aus dem Produktbaum gefüllt |
+| `/var/www/html/tmp`, `/var/www/html/ramdisk` | `www-data:www-data` | `2775` | Laufzeitdaten von Web und Diensten |
+| `/var/www/html/logs` | `www-data:www-data` | `775` | Protokolle |
+| `/var/www/html/data` | `www-data:www-data` | `2770` (Kompatibilitätsmodus `2775`) | Persistente Daten, Konfiguration, Backups |
+| `/var/www/html/data/e3dc_v4.json` | `www-data:www-data` (oder `root:www-data`) | `0660` (Kompatibilitätsmodus `0664`) | Konfiguration; der Webserver schreibt sie, die Dienste lesen sie über die Gruppe |
+
+Die EMS-Dienste laufen als `e3dc-runtime` (UID 991) mit Zusatzgruppe
+`www-data`; darüber lesen sie Konfiguration, RAM-Disk und Protokolle. Der
+Konfigurationseditor bindet das Speichern im Container deshalb an den
+Webbenutzer `www-data` als Schreiber, den root-kontrollierten Produktbaum und
+das Laufzeitkonto in der Gruppe `www-data`; die Bare-Metal-Regel (Installations-
+benutzer in `www-data`) bleibt außerhalb des Containers unverändert.
+
+„Nur Rechte prüfen“ im Installationscenter verwendet im Container dieses
+Erwartungsmodell. Die gewollten Container-Rechte erzeugen keine Befunde. Ein
+Befund an einem Laufzeitpfad trägt die Klasse „Containerstart“: Der
+Startvorgang setzt Besitzer, Gruppe und Modus der Laufzeitpfade neu, ein
+Container-Neustart auf dem Docker-Host behebt ihn
+(`sudo docker compose restart e3dc-control`, danach erneut prüfen). Befunde am
+Produktbaum oder am Laufzeitkonto tragen die Klasse „Image prüfen“; sie werden
+nur durch ein neu bezogenes Image behoben. Den Bare-Metal-Rechte-Launcher und
+den vollständigen Systemabgleich gibt es im Container nicht; ein entsprechender
+Hinweis entfällt.
+
 Der private openWB-Pro-Steuerzustand liegt unter
 `/var/lib/e3dc-control/runtime/private-control`. Vorhandene Zustände am
 bisherigen Pfad `/root/.e3dc-control-state` werden vor dem Workerstart geprüft
@@ -1058,7 +1162,7 @@ Folgende Python-Dienste startet die `entrypoint.sh`. Persistente Dienstlogs lieg
 | `heizstab_manager.py` | Heizstab/Shelly als Wärmequelle konfiguriert | `heizstab_manager.log` |
 | `wallbox_manager.py` | Native Wallbox aktiviert, Legacy-Wallbox aus und `wbmode=0` | Docker-Engine-Log |
 | `e3dc_mqtt_hub.py` | Externer MQTT-Broker oder mindestens ein MQTT-Eingangstopic konfiguriert | Docker-Engine-Log |
-| `bluelink_client.py` | Bluelink-Refresh-Token oder VIN konfiguriert | `bluelink_client.log` |
+| `bluelink_client.py` | Bluelink-Benutzer (`bluelink_user`) und Bluelink-Passwort (`bluelink_password`) konfiguriert | `bluelink_client.log` |
 | `matter/matter_bridge.js` | Matter Bridge explizit aktiviert und Paket-/Lockdatei vorhanden | `matter_bridge.log` |
 | `epex_manager.py` | Immer | Docker-Engine-Log |
 | `Forecast/pv_forecast_service.py` | Immer | Docker-Engine-Log |
@@ -1097,17 +1201,16 @@ Vorgehen:
 
 ```bash
 cd "$E3DC_DOCKER_PATH"
-sudo python3 ./Installer/docker_compose_update.py \
-  --compose-dir . --sudo --recreate-current
+sudo docker compose restart e3dc-control
 ```
 
-Beim naechsten Start meldet der Container im Log:
+Beim nächsten Start meldet der Container im Log:
 
 ```text
 -> MQTT Hub aktiv.
 ```
 
-Pruefen kannst du den Dienst so:
+Prüfen kannst du den Dienst so:
 
 ```bash
 sudo docker logs e3dc-control | grep "MQTT Hub"
@@ -1116,25 +1219,184 @@ sudo docker exec e3dc-control tail -50 /var/www/html/logs/e3dc_mqtt_hub.log
 
 Wenn der MQTT Explorer bereits Werte im Broker zeigt, ist der Broker erreichbar.
 E3DC-Control liest diese Werte aber erst ein, wenn der MQTT-Hub im Container
-laeuft und die passenden Subscribe-Topics in der Config gesetzt sind. Der Hub
-uebernimmt nicht automatisch alle MQTT-Werte aus dem Broker.
+läuft und die passenden Subscribe-Topics in der Config gesetzt sind. Der Hub
+übernimmt nicht automatisch alle MQTT-Werte aus dem Broker.
 
 ---
 
-## 3. Updates und optionaler Watchtower
+## 3. Updates: Weboberfläche, Host und Watchtower
 
-Der sichere Standardweg bleibt bewusst auf dem Docker-Host:
+Der Container tauscht sein Image nie selbst und steuert den Docker-Daemon
+nicht. Es gibt drei Wege, die sich gegenseitig nicht ausschließen:
+
+| Weg | Wann | Was passiert |
+|---|---|---|
+| **System Update** in der Weboberfläche | Standard, sobald Watchtower eingerichtet ist | Der Knopf zeigt ein verfügbares Release und gibt Watchtower über dessen lokale HTTP-API das Signal. Watchtower lädt das Image, erstellt den Container mit unveränderter Konfiguration neu; die Oberfläche lädt nach dem Start neu. |
+| **Auto-Update** im Config-Editor | Wer nicht selbst klicken will | Der Notifier gibt täglich zur eingestellten Uhrzeit dasselbe Signal. Gibt es kein neues Image, passiert nichts. |
+| Host-Befehle | Ohne Watchtower, zur Kontrolle oder bei Problemen | `docker compose pull` und `docker compose up -d` im Compose-Ordner; der Host-Helfer ergänzt Platzprüfung, Healthcheck-Wartezeit und automatischen Rückfall. |
+
+Die Host-Befehle im Compose-Ordner:
+
 ```bash
 cd "$E3DC_DOCKER_PATH"
-sudo python3 ./Installer/docker_compose_update.py --compose-dir . --sudo
+sudo docker compose pull
+sudo docker compose up -d
 sudo docker compose logs --tail=80 e3dc-control
 ```
+
+Watchtower prüft Images nicht von sich aus: `WATCHTOWER_HTTP_API_PERIODIC_POLLS`
+ist in der Vorlage auf `false` gesetzt. Ob und wann aktualisiert wird,
+entscheidet ausschließlich die Einstellung in der Weboberfläche. Ein Pin
+`E3DC_IMAGE_TAG=...` in `.env` wird respektiert: Watchtower vergleicht nur den
+Tag, den der Container tatsächlich verwendet.
+
+Der Knopf **System Update** aktualisiert nur Container, deren Image aus der Registry
+(`ghcr.io/a9xxx/install-e3dc-control`) gezogen wurde. Ein selbst gebautes Image
+wird von Watchtower nicht geprüft; dann gelten die Host-Befehle
+`docker compose pull` / `up -d` bzw. der eigene Build.
+
+### Watchtower einmalig freischalten
+
+Auf dem Docker-Host im Compose-Ordner. Das Token verbindet beide Dienste; es
+wird nie an den Browser ausgegeben. Der zweite Befehl legt es in `.env` an,
+der dritte erstellt den Container damit neu, der vierte startet Watchtower:
+
+```bash
+cd "$E3DC_DOCKER_PATH"
+printf 'E3DC_WATCHTOWER_API_TOKEN=%s\n' "$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> .env
+sudo docker compose up -d
+sudo docker compose --profile auto-update up -d watchtower
+```
+
+Bestehende Installationen bringen zuvor die Compose-Datei auf den aktuellen
+Stand. Wer die unveränderte mitgelieferte `docker-compose.yml` mit den fünf
+benannten Volumes betreibt, aktualisiert den Checkout oder bezieht die Datei
+neu; eigene Ergänzungen in `.env` bleiben erhalten.
+
+Eine Compose-Datei aus der Docker-Einrichtung des Installers bindet Daten und
+Logs als Ordner ein (`./data` und `./logs` unter `volumes:`). Sie darf nicht
+durch die Vorlage ersetzt werden, weil der Container sonst mit leeren
+benannten Volumes ohne Konfiguration startet. In diesem Fall sowie bei OMV,
+eigenen Dateinamen oder eigenen Diensten die Änderungen in die maßgebliche
+Datei übertragen:
+
+- E3DC-Dienst: unter `environment:` `E3DC_WATCHTOWER_API_URL` und
+  `E3DC_WATCHTOWER_API_TOKEN` wie in der Vorlage. Das Label
+  `com.centurylinklabs.watchtower.enable` muss `true` ergeben. Ältere Dateien
+  tragen `${E3DC_WATCHTOWER_ENABLE:-false}`; dann die Zeile wie in der Vorlage
+  auf `${E3DC_WATCHTOWER_ENABLE:-true}` ändern. Sonst übergeht
+  Watchtower den Container, weil er nur markierte Container aktualisiert
+  (`WATCHTOWER_LABEL_ENABLE=true`), und der Knopf bleibt wirkungslos.
+- Watchtower-Dienst: Image `ghcr.io/nicholas-fedor/watchtower:1`,
+  `network_mode: host` und die `WATCHTOWER_HTTP_API_*`-Werte aus der Vorlage;
+  die Zeilen `WATCHTOWER_POLL_INTERVAL` und `DOCKER_API_VERSION` entfallen.
+  Ohne Hostnetz ist die nur auf `127.0.0.1` gebundene API für E3DC-Control
+  nicht erreichbar, und der Knopf meldet „Watchtower ist nicht erreichbar“.
+  Die Bridge-Vorlage `docker-compose.bridge.yml` verbindet beide Dienste
+  stattdessen über ihr eigenes Docker-Netz
+  (`E3DC_WATCHTOWER_API_URL=http://watchtower:8080`).
+- Optional die RAM-Disk wie in der Vorlage auf `size=64M` anheben.
+
+Die Vorlage verwendet den gepflegten Fork `ghcr.io/nicholas-fedor/watchtower:1`;
+das ursprüngliche `containrrr/watchtower` ist seit Dezember 2025 archiviert.
+Labels und Umgebungswerte sind kompatibel. Die HTTP-API liegt im Hostnetz nur
+auf `127.0.0.1` (Port `E3DC_WATCHTOWER_API_PORT`, Standard `18080`) und verlangt
+das Token; der Aufruf beschränkt sich per `image=`-Filter auf das E3DC-Image.
+Watchtower benötigt für Pull und Neuerstellung den Docker-Socket des Hosts;
+wer das nicht möchte, lässt das Profil aus und aktualisiert mit den
+Host-Befehlen. Mit `E3DC_WATCHTOWER_ENABLE=false` in `.env` bleibt der
+E3DC-Container auch bei laufendem Watchtower ausgenommen.
+
+Ein Watchtower aus einer älteren Compose-Datei (Original-Image, tägliches
+Polling) wird mit `sudo docker compose --profile auto-update up -d watchtower`
+auf die neue Vorlage gebracht oder mit
+`sudo docker compose --profile auto-update stop watchtower` und
+`sudo docker compose --profile auto-update rm -f watchtower` entfernt.
+
+### Übergang von 5.4.x auf 5.5.0
+
+Der Knopf **System Update** steht ab 5.5.0 zur Verfügung. Das Update von 5.4.x auf 5.5.0 erfolgt
+noch über den Host-Weg; ab dem nächsten Release genügt der Knopf. Eine
+Docker-Installation mit 5.4.x zeigt grundsätzlich keinen Versionshinweis;
+ihre Weboberfläche nennt höchstens die Host-Befehle.
+
+1. Auf dem Docker-Host im Compose-Ordner die Compose-Datei auf den Stand
+   dieses Release bringen, wie oben unter „Watchtower einmalig freischalten“
+   beschrieben: die unveränderte mitgelieferte Datei ersetzen; eine vom
+   Installer erzeugte Datei mit `./data`- und `./logs`-Ordnern sowie OMV- und
+   eigene Dateien nicht ersetzen, sondern die Änderungen übertragen.
+2. Einen festen Pin in `.env` gegebenenfalls bewusst auf `v5.5.0` ändern.
+   Wer noch kein Watchtower-Token hat (`grep E3DC_WATCHTOWER_API_TOKEN .env`
+   zeigt keinen Eintrag), trägt es jetzt mit dem zweiten Befehl aus
+   „Watchtower einmalig freischalten“ in `.env` ein. Dann erstellt der
+   nächste Schritt den Container gleich mit Token, und eine zweite
+   Neuerstellung entfällt.
+3. Mit den Host-Befehlen `sudo docker compose pull` und
+   `sudo docker compose up -d` aktualisieren. Wer den Host-Helfer verwendet,
+   nimmt den Helfer aus diesem Release und stoppt einen laufenden Watchtower
+   vorher.
+4. Watchtower wie oben beschrieben einmalig freischalten. Steht das Token
+   schon in `.env`, genügt der letzte Befehl
+   `sudo docker compose --profile auto-update up -d watchtower`; das Token
+   nicht ein zweites Mal anhängen.
+
+Die neue Vorlage mountet die RAM-Disk mit 64 MB; ältere Compose-Dateien mit
+32 MB meldet der Container beim Start als Hinweis.
+
+### Ablauf und Grenzen
+
+Nach dem Signal antwortet Watchtower sofort; Download und Neuerstellung laufen
+im Hintergrund und dauern auf Raspberry Pi oder NAS einige Minuten. Regelung
+und Weboberfläche sind während der Neuerstellung kurz nicht erreichbar;
+Konfiguration, Historie und private Volumes bleiben erhalten. Die Oberfläche
+wartet bis zu 25 Minuten auf die neue Version und lädt dann neu. Wallbox-
+Steuerzustände im Containerlayer überleben eine Neuerstellung nicht; Updates
+deshalb bei beendeter Fahrzeugladung anstoßen.
+
+Startet das neue Image nicht, bleibt der Container in der Docker-Neustartschleife;
+einen automatischen Rückfall gibt es auf diesem Weg nicht. Rückweg auf dem
+Host: `E3DC_IMAGE_TAG=v5.5.0` (den bisherigen Tag) in `.env` setzen und
+`sudo docker compose up -d` ausführen. Fehlerursachen zeigt
+`sudo docker compose logs --tail=80 e3dc-control`, Watchtower selbst
+`sudo docker logs --tail 50 watchtower`.
+
+Watchtower entfernt nach erfolgreichem Wechsel das alte Image
+(`WATCHTOWER_CLEANUP=true`); ein Rückfall zieht die gewünschte Version per Tag
+(`E3DC_IMAGE_TAG`) neu. Nach einem Watchtower-Wechsel erstellt ein späteres
+`docker compose up -d` den Container einmal neu (gleiches Image, Daten bleiben).
+
+Beim Rückfall auf 5.4.x entfernt die Konfigurationsbereinigung der älteren
+Version die in 5.5.0 neuen Einstellungen (u. a. Bluelink-Zugang,
+Zusatzwechselrichter, Marktprofil, neue Wallbox-Phasenparameter). Die beim
+Start angelegte Sicherung unter `data/config_backups/` enthält sie weiterhin;
+nach einer erneuten Aktualisierung auf 5.5.0 die Werte dort nachsehen und neu
+eintragen. Die Bluelink-Anbindung von 5.4.x benötigt ihren bisherigen
+Refresh-Token, den 5.5.0 aus der Konfiguration entfernt hat; er steht in der
+vor dieser Bereinigung angelegten Sicherung unter `data/config_backups/` und
+muss nach dem Rückfall wieder eingetragen werden. Automatische Sicherungen in
+diesem Ordner werden auf die 20 neuesten gekürzt; neue entstehen bei jedem
+Containerstart und beim Speichern im Konfigurationseditor. Die benötigte
+Sicherung deshalb rechtzeitig an einen anderen Ort kopieren: die mit dem
+Refresh-Token direkt nach dem Update auf 5.5.0, die mit den neuen Werten
+direkt nach dem Rückfall.
+
+### Host-Helfer: geprüfter Weg mit automatischem Rückfall
+
+```bash
+cd "$E3DC_DOCKER_PATH"
+sudo docker compose --profile auto-update stop watchtower
+sudo python3 ./Installer/docker_compose_update.py --compose-dir . --sudo
+sudo docker compose --profile auto-update up -d watchtower
+sudo docker compose logs --tail=80 e3dc-control
+```
+
 Der Helfer aktualisiert Python/PHP-Code, Container-Startskript und Systempakete
 nur innerhalb des von Compose projizierten Tags. Er bindet das gezogene Image
 vor dem Start an sha256-ID und OCI-Version. `--wait` akzeptiert den Kandidaten
 erst nach dem imagegebundenen Healthcheck; zwei identische Snapshots binden
 zusätzlich Container-ID, Image-ID, Restart-Zähler, Startzeit, Dienstsatz und
-Laufzeit-`VERSION`.
+Laufzeit-`VERSION`. Ein laufender Watchtower wird vorher gestoppt, damit kein
+zweiter Supervisor denselben Container gleichzeitig ersetzt.
 
 Ein vorhandener Container in einer von Docker bestätigten Neustartphase
 (`restarting`) muss vor dem Update nicht manuell gestoppt werden. Der Helfer
@@ -1154,36 +1416,14 @@ prüft er erneut dessen Container- und Image-ID, Projekt und Mounts. Kann er die
 Zuordnung oder den Stillstand nicht bestätigen, meldet er einen gesonderten
 Sicherheitsfehler; fremde oder inzwischen veränderte Container bleiben unberührt.
 
-Für einen Rückfall wird ausschließlich der Host-Helfer aus dem Abschnitt
-„Gezielte Rückfallversion“ verwendet. Er erhält den freigegebenen Tag über
-`--image-tag`, bindet Image und Laufzeit und bestätigt bei einem Fehler den
-Stillstand des Kandidaten. Der einzige vorgesehene öffentliche Rollback-Root
-ist `ghcr.io/a9xxx/install-e3dc-control:v5.3.2b`; dieser Stand selbst verweist
-auf kein älteres Image. `--image-tag` speichert die ausgewählte Version im
-Zieldienst; `.env` bleibt unverändert. Rohe Pull-/Up-Befehle ersetzen den Helfer nicht.
-
-Watchtower ist nur noch ein ausdrückliches Opt-in. Das Enable-Label steht mit
-`${E3DC_WATCHTOWER_ENABLE:-false}` ebenfalls standardmäßig auf `false`. Das Upstream-Projekt wird
-nicht mehr gepflegt. Der Dienst liegt für bestehende Installationen im
-Compose-Profil `auto-update` und startet bei einem normalen
-`docker compose up -d --wait --wait-timeout 300 e3dc-control` nicht. Sein notwendiger Zugriff auf
-`/var/run/docker.sock` gibt dem Container weitreichende Kontrolle über den
-Docker-Host. Wer diese Risiken bewusst akzeptiert, aktiviert das Profil:
-
-```bash
-cd "$E3DC_DOCKER_PATH"
-printf '%s\n' 'E3DC_WATCHTOWER_ENABLE=true' >> .env
-sudo python3 ./Installer/docker_compose_update.py \
-  --compose-dir . --sudo --recreate-current
-sudo docker compose --profile auto-update up -d watchtower
-```
-
-Der Enable-Label-Filter begrenzt Watchtower dabei auf E3DC-Control; andere
-Container des Hosts werden nicht automatisch aktualisiert. Ein bereits aus
-einer älteren Compose-Datei laufender Watchtower wird mit
-`sudo docker compose --profile auto-update stop watchtower` und danach
-`sudo docker compose --profile auto-update rm -f watchtower` deaktiviert.
-Eine Wartungsfreiheit wird auch im Opt-in-Betrieb nicht zugesichert.
+Der Helfer ist Pflicht für 5.3.2b-Altbestände (Compose-Migration auf die fünf
+Volumes) und für den Rückfall von einem Runtime-Image auf ein älteres
+Root-Image; siehe „Gezielte Rückfallversion“. Er erhält den freigegebenen Tag
+über `--image-tag`, bindet Image und Laufzeit und bestätigt bei einem Fehler
+den Stillstand des Kandidaten. Der einzige vorgesehene öffentliche
+Rollback-Root ist `ghcr.io/a9xxx/install-e3dc-control:v5.3.2b`; dieser Stand
+selbst verweist auf kein älteres Image. `--image-tag` speichert die
+ausgewählte Version im Zieldienst; `.env` bleibt unverändert.
 
 ---
 
@@ -1208,6 +1448,16 @@ Die Änderung betrifft ausschließlich diese Datei. Sie ersetzt weder die
 Prüfung der Compose-Struktur noch eine erforderliche Volume-Migration. Bleibt
 der gemeldete Modus trotz `chmod` unverändert, müssen die Dateirechte auf dem
 Docker-Host beziehungsweise dessen Dateisystem geprüft werden.
+
+**Weitere Parameter nicht gespeichert: „nicht sicher über die gemeinsame www-data-Gruppe gebunden“**
+
+Das Anlegen oder Löschen unter „Weitere Parameter“ prüft die Bindung von
+Webbenutzer, Installationsbesitz und Laufzeitkonto (siehe „Rechtemodell und
+Rechteprüfung im Container“). Erscheint die Meldung, fehlt dem Laufzeitkonto
+`e3dc-runtime` die Gruppe `www-data` oder der Webserver läuft nicht als
+`www-data`. Container neu starten und im Installationscenter „Nur Rechte
+prüfen“ ausführen; bleibt der Befund am Laufzeitkonto, das Image neu beziehen.
+Das Speichern der regulären Editorfelder ist davon nicht betroffen.
 
 **Konfiguration nicht gespeichert: `target_metadata_invalid`**
 
@@ -1242,37 +1492,36 @@ sudo docker exec e3dc-control tail -f /var/www/html/logs/e3dc_live.log
 **E3DC-Control komplett neu starten (inkl. Webserver und Diensten):**
 ```bash
 cd "$E3DC_DOCKER_PATH"
-sudo python3 ./Installer/docker_compose_update.py \
-  --compose-dir . --sudo --recreate-current
+sudo docker compose restart e3dc-control
 ```
 
 **ML-Prognose fehlt (`ml_prediction.json` nicht vorhanden):**
 `/var/www/html/ramdisk` ist im Docker absichtlich ein `tmpfs`. Nach jedem
 Container-Neustart oder `--force-recreate` ist dieser Ordner leer und wird von
-den Diensten neu befuellt. Die Datei `ml_prediction.json` ist kein persistenter
-Bestandteil der Installation, sondern das temporaere Ergebnis von
+den Diensten neu befüllt. Die Datei `ml_prediction.json` ist kein persistenter
+Bestandteil der Installation, sondern das temporäre Ergebnis von
 `ml_predictor.py --predict`.
 
 Der private Modellstore `/var/lib/e3dc-control/ml` wird ebenfalls nicht im Docker-Image
 mitgeliefert. Er enthält ein lokales Lernmodell und wird erst aus den eigenen
 Verlaufsdaten des jeweiligen Systems erzeugt. Bei einer frischen Installation
 oder nach einem Wechsel von einer alten Host-Installation in ein neues Docker-
-Volume kann das Training zunaechst melden:
+Volume kann das Training zunächst melden:
 
 ```text
 Nicht genug Trainingsdaten: 0 Datensaetze (benoetigt: 50).
 ```
 
 Das ist kein Docker- oder Rechtefehler. Es bedeutet nur, dass im neuen
-persistent gemounteten `data`-Bereich noch keine verwertbare Historie fuer das
+persistent gemounteten `data`-Bereich noch keine verwertbare Historie für das
 ML-Modell vorhanden ist. Der Storage Simulator nutzt in dieser Zeit automatisch
 den konservativen Verbrauchs-Fallback.
 
 Ab den neueren Images sichert der Entrypoint beim normalen Container-Stopp
 wichtige Warmstartdaten aus der Ramdisk nach
-`/var/www/html/data/docker_ramdisk_cache/` und spielt sie beim naechsten Start
+`/var/www/html/data/docker_ramdisk_cache/` und spielt sie beim nächsten Start
 wieder ein. Gesichert werden nur unkritische Prognose-, Preis- und
-Verlaufsdaten, keine Steuerflags und keine Live-Schaltzustaende. Dadurch bleibt
+Verlaufsdaten, keine Steuerflags und keine Live-Schaltzustände. Dadurch bleibt
 das Dashboard nach einem Rebuild schneller plausibel, während die Dienste die
 Daten anschließend frisch nachrechnen.
 
@@ -1320,7 +1569,7 @@ Kommt beim Training `Nicht genug Trainingsdaten`, ist das bei neuen Systemen
 normal. Der Storage Simulator nutzt dann automatisch den konservativen
 Fallback, bis genug Historie vorhanden ist.
 
-Wenn du pruefen moechtest, ob ueberhaupt neue Historie entsteht:
+Wenn du prüfen möchtest, ob überhaupt neue Historie entsteht:
 
 ```bash
 sudo docker exec e3dc-control ls -l /var/www/html/ramdisk/live_history.txt
@@ -1329,6 +1578,6 @@ sudo docker exec e3dc-control ls -l /var/www/html/data
 ```
 
 Wachsen dort Live- oder Verlaufsdaten, einfach weiterlaufen lassen. Bleibt das
-Training nach mehreren Tagen weiter bei `0 Datensaetze`, pruefe zuerst, ob dein
-Docker-Volume bzw. Host-Mount fuer `/var/www/html/data` wirklich dauerhaft
+Training nach mehreren Tagen weiter bei `0 Datensaetze`, prüfe zuerst, ob dein
+Docker-Volume bzw. Host-Mount für `/var/www/html/data` wirklich dauerhaft
 erhalten bleibt.

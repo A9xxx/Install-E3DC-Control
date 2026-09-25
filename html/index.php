@@ -321,6 +321,17 @@ if (isset($_GET['ajax']) && $_GET['ajax'] == '1') {
 	        body.frontend-modern .dashboard-view > #wb-native-alert {
 	            grid-column: 1 / -1;
 	        }
+            #wb-stor-metrics {
+                height: 2rem;
+                flex: 0 0 2rem;
+                overflow-x: auto;
+                overflow-y: hidden;
+                scrollbar-width: thin;
+            }
+            #wb-stor-metrics > * {
+                flex-shrink: 0;
+                white-space: nowrap;
+            }
 	        body.frontend-modern #dashboard-status-cards-home {
 	            grid-area: status;
 	            min-width: 0;
@@ -1397,8 +1408,8 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     <div class="text-uppercase fw-bold d-flex align-items-center gap-1 mb-1" style="font-size:0.6rem; letter-spacing:0.06em; color:#818cf8;">
                         <i class="fas fa-brain" style="font-size:0.62rem;"></i> Speicherregelung &amp; Prognose
                     </div>
-                    <div class="d-flex align-items-center gap-2 flex-wrap">
-                        <span class="fw-bold" style="font-size:1.05rem; line-height:1;" id="wb-stor-state">--</span>
+                    <div class="fw-bold text-truncate mb-1" style="font-size:1.05rem; line-height:1.25;" id="wb-stor-state">--</div>
+                    <div id="wb-stor-metrics" class="d-flex align-items-start gap-2" tabindex="0" role="group" aria-label="Speicherkennzahlen">
                         <span class="badge rounded-pill" style="font-size:0.65rem; background:rgba(108,117,125,0.12); color:#adb5bd;" id="wb-budget-state-badge">--</span>
                         <span class="text-muted" style="font-size:0.78rem;" id="wb-stor-soll-soc">Soll: -- %</span>
                         <span class="badge rounded-pill" style="display:none; font-size:0.65rem; background:rgba(129,140,248,0.14); color:#a5b4fc;" id="wb-stor-ifc">Rahmen: -- W</span>
@@ -1407,7 +1418,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                         <span class="badge rounded-pill" style="display:none; font-size:0.65rem; background:rgba(245,158,11,0.15); color:#f59e0b;" id="storage-forecast-badge">--</span>
                     </div>
                     <div class="text-muted text-truncate mt-1" style="font-size:0.7rem;" id="wb-stor-reason" title="">--</div>
-                    <div id="wb-stor-dv-status" class="mt-1 d-flex flex-wrap align-items-center gap-2" style="display:none; font-size:0.68rem;">
+                    <div id="wb-stor-dv-status" class="mt-1 d-flex align-items-center gap-2" style="display:none; font-size:0.68rem;">
                         <span class="fw-bold text-success"><i class="fas fa-scale-balanced me-1"></i>DV</span>
                         <span id="wb-stor-dv-badge" class="badge rounded-pill bg-secondary bg-opacity-25 text-secondary">--</span>
                         <span id="wb-stor-dv-detail" class="text-muted text-truncate" style="min-width:0;" title="">--</span>
@@ -1477,16 +1488,20 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                 <span id="wb-native-1-dot" class="rounded-circle flex-shrink-0" style="width:7px;height:7px;background:#6c757d;"></span>
                                 <span>WB 1</span>
                                 <span id="wb-native-1-priority" class="badge rounded-pill bg-info bg-opacity-25 text-info border border-info border-opacity-50 d-none" style="font-size:0.52rem;">Prio</span>
+                                <span id="wb-native-1-energy" class="ms-auto text-info d-none" style="font-size:0.6rem; text-transform:none; white-space:nowrap;"></span>
                             </div>
                             <div class="text-truncate" style="font-size:0.75rem;"><span id="wb-native-1-amp" class="text-info fw-bold">0 A</span> <span id="wb-native-1-phase" class="badge bg-secondary bg-opacity-25 text-secondary ms-1" style="font-size:0.6rem;">--p</span> <span class="text-muted mx-1">|</span> <span id="wb-native-1-state" class="text-muted">Idle</span></div>
+                            <div id="wb-native-1-onephase" class="text-muted d-none text-truncate" style="font-size:0.6rem;"></div>
                         </div>
                         <div id="wb-native-2-slot" class="flex-fill rounded-2 px-2 py-1 wb-native-slot" style="border:1px solid rgba(108,117,125,0.24); background:rgba(108,117,125,0.06); min-width:0;">
                             <div class="d-flex align-items-center gap-1 text-muted text-uppercase" style="font-size:0.55rem;">
                                 <span id="wb-native-2-dot" class="rounded-circle flex-shrink-0" style="width:7px;height:7px;background:#6c757d;"></span>
                                 <span>WB 2</span>
                                 <span id="wb-native-2-priority" class="badge rounded-pill bg-info bg-opacity-25 text-info border border-info border-opacity-50 d-none" style="font-size:0.52rem;">Prio</span>
+                                <span id="wb-native-2-energy" class="ms-auto text-info d-none" style="font-size:0.6rem; text-transform:none; white-space:nowrap;"></span>
                             </div>
                             <div class="text-truncate" style="font-size:0.75rem;"><span id="wb-native-2-amp" class="text-info fw-bold">0 A</span> <span id="wb-native-2-phase" class="badge bg-secondary bg-opacity-25 text-secondary ms-1" style="font-size:0.6rem;">--p</span> <span class="text-muted mx-1">|</span> <span id="wb-native-2-state" class="text-muted">Idle</span></div>
+                            <div id="wb-native-2-onephase" class="text-muted d-none text-truncate" style="font-size:0.6rem;"></div>
                         </div>
                     </div>
                 </div>
@@ -1688,6 +1703,26 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                         </div>
                         <div id="pv-forecast-diagnostic-horizons" class="mt-1 text-muted">
                             Erfassungs-Vorlauf: noch keine revisionsgebundenen Stichproben.
+                        </div>
+                    </div>
+                    <?php /* Diagnosekarte Zusatzwechselrichter (Direktlesung), nur im PV-Diagramm und nur bei konfigurierter Lesung */ ?>
+                    <div id="ext-inverter-diagnostic-card" class="mx-3 mb-2 rounded border border-secondary-subtle bg-body-tertiary px-3 py-2 small" hidden>
+                        <div class="d-flex flex-wrap align-items-center justify-content-between gap-2">
+                            <span class="fw-bold"><i class="fas fa-solar-panel text-success me-1"></i>Zusatzwechselrichter (Direktlesung)</span>
+                            <span id="ext-inverter-state" class="badge text-bg-secondary">Keine Daten</span>
+                        </div>
+                        <div class="d-flex flex-wrap gap-2 gap-lg-3 mt-1 text-body">
+                            <span title="Wirkleistung gesamt laut Wechselrichter">AC gesamt: <strong id="ext-inverter-ac">–</strong></span>
+                            <span title="Phasenleistung L1 | L2 | L3 (Näherung Spannung × Strom je Phase)">Phasen: <strong id="ext-inverter-phases">–</strong></span>
+                            <span title="DC-Leistung gesamt und je MPPT-Tracker">DC: <strong id="ext-inverter-dc">–</strong></span>
+                            <span title="Innentemperatur des Wechselrichters">Temperatur: <strong id="ext-inverter-temp">–</strong></span>
+                            <span title="Tagesertrag laut Wechselrichter">Heute: <strong id="ext-inverter-daily">–</strong></span>
+                            <span title="Gesamtertrag und Betriebsstunden laut Wechselrichter">Gesamt: <strong id="ext-inverter-total">–</strong></span>
+                            <span title="Alter der letzten gültigen Lesung">Datenalter: <strong id="ext-inverter-age">–</strong></span>
+                        </div>
+                        <div class="d-flex flex-wrap justify-content-between gap-2 mt-1 text-muted">
+                            <span id="ext-inverter-source">–</span>
+                            <span>Nur Anzeige – die Regelung nutzt weiterhin den E3DC-Messwert des Zusatzwechselrichters.</span>
                         </div>
                     </div>
                     <div id="primaryChartSurface" class="card-body p-0 chart-container position-relative">
@@ -2009,7 +2044,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                             <span id="val-car-soc" class="badge text-bg-success fw-bold wallbox-car-badge" style="display:none; cursor: pointer; font-size: 0.8em;" onclick="event.stopPropagation(); forceSocUpdate()" title="SoC vom Auto abrufen"></span>
                                             <span id="wb-daily" class="badge bg-body-tertiary text-body border border-secondary-subtle tile-kwh-badge w-100 text-end" title="Wallbox 1 heute"><i class="fas fa-calendar-day text-info me-1"></i><span id="wb-daily-value">-- kWh</span></span>
                                             <div id="wb-session-container" class="d-flex flex-column align-items-end gap-1" style="display:none; font-size: 0.8em;">
-                                                <span id="wb-kva" class="badge bg-body-tertiary text-info border border-info border-opacity-50 w-100 text-end" style="display:none;" title="Scheinleistung: Spannung x Strom je Phase. Der grosse Wert bleibt die Wirkleistung in W."></span>
+                                                <span id="wb-kva" class="badge bg-body-tertiary text-info border border-info border-opacity-50 w-100 text-end" style="display:none;" title="Scheinleistung: Spannung x Strom je Phase. Der große Wert bleibt die Wirkleistung in W."></span>
                                                 <span id="wb-session" class="badge bg-body-tertiary text-body border border-secondary-subtle w-100 text-end" style="display:none;"></span>
                                                 <div class="d-flex gap-1 w-100 justify-content-end">
                                                     <span id="wb-time-target" class="badge bg-body-tertiary text-body border border-secondary-subtle" style="display:none;"></span>
@@ -2057,7 +2092,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                             <span id="val-car-soc2" class="badge text-bg-success fw-bold wallbox-car-badge" style="display:none; cursor: pointer; font-size: 0.8em;" onclick="event.stopPropagation(); forceSocUpdate()" title="SoC vom Auto abrufen"></span>
                                             <span id="wb2-daily" class="badge bg-body-tertiary text-body border border-secondary-subtle tile-kwh-badge w-100 text-end" title="Wallbox 2 heute"><i class="fas fa-calendar-day text-info me-1"></i><span id="wb2-daily-value">-- kWh</span></span>
                                             <div id="wb2-session-container" class="d-flex flex-column align-items-end gap-1" style="display:none; font-size: 0.8em;">
-                                                <span id="wb2-kva" class="badge bg-body-tertiary text-info border border-info border-opacity-50 w-100 text-end" style="display:none;" title="Scheinleistung: Spannung x Strom je Phase. Der grosse Wert bleibt die Wirkleistung in W."></span>
+                                                <span id="wb2-kva" class="badge bg-body-tertiary text-info border border-info border-opacity-50 w-100 text-end" style="display:none;" title="Scheinleistung: Spannung x Strom je Phase. Der große Wert bleibt die Wirkleistung in W."></span>
                                                 <span id="wb2-session" class="badge bg-body-tertiary text-body border border-secondary-subtle w-100 text-end" style="display:none;"></span>
                                                 <div class="d-flex gap-1 w-100 justify-content-end">
                                                     <span id="wb2-time-target" class="badge bg-body-tertiary text-body border border-secondary-subtle" style="display:none;"></span>
@@ -2398,6 +2433,9 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                 <i class="fas fa-life-ring me-2"></i>Rückfallhinweise
                             </button>
                             <?php else: ?>
+                            <button id="btn-update-installer" class="btn btn-outline-info btn-sm me-2" onclick="startInstallerUpdate()" title="Lädt das neue Container-Image über Watchtower und erstellt den Container neu; ohne Watchtower werden die Host-Befehle angezeigt">
+                                <i class="fas fa-sync-alt me-2"></i>System Update <span id="update-badge-installer" class="badge bg-danger ms-1" style="display:none;">!</span>
+                            </button>
                             <button class="btn btn-outline-secondary btn-sm me-2" onclick="openReleaseRollback()" title="Zeigt Docker-Befehle für Update und Rückfallversionen an">
                                 <i class="fab fa-docker me-2"></i>Docker Versionen
                             </button>
@@ -2896,7 +2934,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                `SoC ${field('SOC') || '--'}, Ziel ${field('Ziel') || '--'}, PV ${field('PV') || '--'}, Netz ${field('Grid') || '--'}.`;
                     }
                     if (text.includes('WB-KURVENENTLASTUNG') || text.includes('WB-Kurvenentlastung') || text.includes('tl_brake_wb_relief_guard')) {
-                        return `${time}: WB-Kurvenentlastung - Speicher liegt oberhalb der Sollkurve und stuetzt die Wallbox ruhig am Netzpunkt.`;
+                        return `${time}: WB-Kurvenentlastung - Speicher liegt oberhalb der Sollkurve und stützt die Wallbox ruhig am Netzpunkt.`;
                     }
                     if (text.includes('KURVEN-BREMSE') || text.includes('TL-BREMSE')) return `${time}: Ladekurven-Bremse - Speicher liegt oberhalb der Sollkurve.`;
                     if (text.includes('ABREGELSCHUTZ')) {
@@ -2906,7 +2944,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     }
                     if (text.includes('PRE-DISCH')) return `${time}: Pre-Dump - Speicher schafft Platz für spätere PV-Spitze.`;
                     if (text.includes('KURVEN-HALT') || text.includes('TL-IDLE')) return `${time}: Kurven-Halt - Speicher liegt am nächsten Kurvenziel; es wird kein aktiver Laderahmen gesetzt.`;
-                    if (text.includes('KURVEN-HALTEWAECHTER')) return `${time}: Kurven-Haltewaechter - kurzer Netzbezug erkannt, daher darf der Speicher gegensteuern.`;
+                    if (text.includes('KURVEN-HALTEWAECHTER')) return `${time}: Kurven-Haltewächter - kurzer Netzbezug erkannt, daher darf der Speicher gegensteuern.`;
                     if (text.includes('KURVEN-DUMP') || text.includes('TL-AUTODUMP')) return `${time}: Kurven-Entladung - Speicher liegt deutlich oberhalb der Kurve und gibt kontrolliert Energie frei.`;
                     if (text.includes('NOTSTROM-AUTO')) return `${time}: Notstrom/Inselbetrieb - E3DC arbeitet autonom, externe Verbraucher-Budgets sind gesperrt.`;
                     if (text.includes('ERHOLUNG-AUTO')) return `${time}: Erholung - E3DC arbeitet autonom, bis der Morgenpuffer wieder erreicht ist.`;
@@ -2936,7 +2974,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 const weatherReserveTarget = storagePlanMeta.planning_target_soc ?? storageCurveMeta.planning_target_soc;
                 const weatherBaseTarget = storagePlanMeta.target_soc ?? storageCurveMeta.config_target_soc;
                 const weatherReserveText = (() => {
-                    let msg = 'Heute kein Pre-Dump: schlechte Prognose. Energie bleibt im Speicher; die Regelung faehrt die Schlechtwetter-Kurve.';
+                    let msg = 'Heute kein Pre-Dump: schlechte Prognose. Energie bleibt im Speicher; die Regelung fährt die Schlechtwetter-Kurve.';
                     if (weatherReserveNeedKwh) msg += ` 48h-Defizit: ${weatherReserveNeedKwh} kWh.`;
                     if (weatherBaseTarget != null && weatherReserveTarget != null && Math.abs(parseFloat(weatherReserveTarget) - parseFloat(weatherBaseTarget)) > 0.2) {
                         msg += ` Speicherziel: ${parseFloat(weatherBaseTarget).toFixed(0)} -> ${parseFloat(weatherReserveTarget).toFixed(0)} %.`;
@@ -2981,9 +3019,9 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                         storStateEl.style.color = storageOperational.color;
                         setStableLiveTitle(
                             storStateEl,
-                            storageOperational.holdActive
+                            [storageOperational.label, storageOperational.holdActive
                                 ? storageOperational.badge
-                                : (storageOperational.plannedHint || '')
+                                : storageOperational.plannedHint].filter(Boolean).join(' · ')
                         );
                     } else {
                         storStateEl.textContent = data.storage_state_label || data.storage_state || '--';
@@ -3010,7 +3048,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     const end = w.end_local || fmtTs(w.end_timestamp);
                     const priceRaw = w.min_price_ct ?? w.min_billing_price ?? w.avg_billing_price;
                     const minPrice = priceRaw != null ? parseFloat(priceRaw).toFixed(2) + ' ct/kWh' : '';
-                    storReasonEl.textContent = `Preis-Boost bereit: naechstes Fenster ${start}-${end} ${minPrice}.`;
+                    storReasonEl.textContent = `Preis-Boost bereit: nächstes Fenster ${start}-${end} ${minPrice}.`;
                     storReasonEl.title = data.storage_reason || storReasonEl.textContent;
                 } else if (storReasonEl && data.storage_reason) {
                     const r = data.storage_reason || '--';
@@ -3144,7 +3182,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                         }
                         if (curveNeedRawW !== null && curveNeedRawW > 0) titleParts.push('Rohbedarf vor Kappe: ' + curveNeedRawW + ' W');
                         if (lookaheadNeedW !== null && lookaheadNeedW > 0) titleParts.push('Lookahead-Bedarf: ' + lookaheadNeedW + ' W');
-                        if (curveCatchupW !== null && curveCatchupW > 0) titleParts.push('Aufholbedarf aus Kurvenrueckstand: ' + curveCatchupW + ' W');
+                        if (curveCatchupW !== null && curveCatchupW > 0) titleParts.push('Aufholbedarf aus Kurvenrückstand: ' + curveCatchupW + ' W');
                         if (curveGapPct !== null && curveGapPct > 0) titleParts.push('Rückstand zur Sollkurve: ' + curveGapPct.toFixed(1) + ' %');
                         if (curveCatchupCapW !== null && curveCatchupCapW > 0) {
                             let capLine = 'Dynamische Aufhol-Kappe: ' + curveCatchupCapW + ' W';
@@ -4740,7 +4778,8 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                         && counter.valid === true
                         && counter.active === true
                         && counter.accumulating === true
-                        && ['grid', 'authorized_budget'].includes(component)
+                        // Komponente 'battery' (Akku-Wh-Zähler der PV-Kurve).
+                        && ['grid', 'authorized_budget', 'battery'].includes(component)
                         && Number.isFinite(usedWh)
                         && Number.isFinite(thresholdWh)
                         && Number.isFinite(remainingWh)
@@ -4749,7 +4788,8 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                         && remainingWh > 0
                     );
                     if (visible) {
-                        const label = component === 'grid' ? 'Netz-Puffer' : 'Budget-Puffer';
+                        const label = component === 'grid' ? 'Netz-Puffer'
+                            : component === 'battery' ? 'Akku-Puffer' : 'Budget-Puffer';
                         const remainingLabel = remainingWh.toLocaleString('de-DE', {
                             minimumFractionDigits: remainingWh < 10 ? 1 : 0,
                             maximumFractionDigits: 1
@@ -4757,11 +4797,14 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                         wbDeficitCounterEl.textContent = label + ': ' + remainingLabel + ' Wh übrig';
                         wbDeficitCounterEl.className = component === 'grid'
                             ? 'mt-1 text-warning fw-semibold'
-                            : 'mt-1 text-info fw-semibold';
+                            : component === 'battery'
+                                ? 'mt-1 text-primary fw-semibold'
+                                : 'mt-1 text-info fw-semibold';
                         wbDeficitCounterEl.title = usedWh.toLocaleString('de-DE', { maximumFractionDigits: 1 })
                             + ' / ' + thresholdWh.toLocaleString('de-DE', { maximumFractionDigits: 1 })
                             + ' Wh'
-                            + (Number.isFinite(deficitW) ? ' · ' + Math.round(deficitW).toLocaleString('de-DE') + ' W Defizit' : '')
+                            + (Number.isFinite(deficitW) ? ' · ' + Math.round(deficitW).toLocaleString('de-DE')
+                                + (component === 'battery' ? ' W Akku-Stützung' : ' W Defizit') : '')
                             + ' · bis zur nächsten Abregelstufe';
                         wbDeficitCounterEl.style.display = 'block';
                     } else {
@@ -4934,6 +4977,45 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                             } else {
                                 curAmpEl.removeAttribute('title');
                             }
+                            // Wh-Zähler in der Kopfzeile des Slots (hinter „WB n“), nur hinter einer ladenden Wallbox und nur solange aktiv:
+                            // Akku-Kontingent an der Korridor-Untergrenze bzw. Export-Wh bis zum 3p-Wechsel.
+                            const energyEl = document.getElementById('wb-native-'+wb.id+'-energy');
+                            let energyText = '';
+                            let energyTitle = '';
+                            const floorSupport = data.curve_floor_support && typeof data.curve_floor_support === 'object' ? data.curve_floor_support : {};
+                            const phaseEnergy = wb.phase_energy_policy && typeof wb.phase_energy_policy === 'object' ? wb.phase_energy_policy : {};
+                            if (floorSupport.active === true && ampRow && ampRow.realCharging) {
+                                const whUsed = Math.round(parseFloat(floorSupport.wh_used || 0));
+                                const whLimit = Math.round(parseFloat(floorSupport.wh_limit || 0));
+                                const floorPvOnly = String(floorSupport.class || '') === 'pv_only';
+                                energyText = floorPvOnly
+                                    ? 'PV-only ' + whUsed + '/' + whLimit + ' Wh'
+                                    : 'Akku ' + whUsed + '/' + whLimit + ' Wh';
+                                energyTitle = floorPvOnly
+                                    ? 'Wh-Kontingent an der Korridor-Untergrenze aufgebraucht: Wallbox nur aus PV-Überschuss.'
+                                    : 'Akkustützung an der Korridor-Untergrenze: verbrauchtes Kontingent / Grenze, danach nur PV.';
+                            } else if (phaseEnergy.active === true && phaseEnergy.reason === 'phase_up_export_wh_pending' && ampRow && ampRow.realCharging) {
+                                const exportWh = Math.round(parseFloat(phaseEnergy.export_wh || 0));
+                                const exportReq = Math.round(parseFloat(phaseEnergy.export_required_wh || 0));
+                                energyText = 'Export ' + exportWh + '/' + exportReq + ' Wh';
+                                energyTitle = '1p am Maximalstrom: verschenkte Export-Wh bis zum 3p-Wechsel (Einbrüche ziehen ab).';
+                            } else if (phaseEnergy.active === true && phaseEnergy.reason === 'phase_up_current_first_max' && ampRow && ampRow.realCharging) {
+                                // Erst bis zum wirksamen 1p-Deckel (Vertragsmemo/OBC/statisch), dann Export-Wh für 3p.
+                                const onePhaseMaxAmp = Math.round(parseFloat(phaseEnergy.one_phase_max_amp || 0));
+                                energyText = '1p bis ' + onePhaseMaxAmp + ' A';
+                                energyTitle = '1p: erst bis zum wirksamen Deckel ' + onePhaseMaxAmp + ' A (Quelle: ' + String(phaseEnergy.one_phase_max_source || 'static_fallback') + '), dann Export-Wh für 3p.';
+                            }
+                            if (energyEl) {
+                                if (energyText) {
+                                    energyEl.textContent = energyText;
+                                    energyEl.title = energyTitle;
+                                    energyEl.classList.remove('d-none');
+                                } else {
+                                    energyEl.textContent = '';
+                                    energyEl.removeAttribute('title');
+                                    energyEl.classList.add('d-none');
+                                }
+                            }
                             const curPhaseEl = document.getElementById('wb-native-'+wb.id+'-phase');
                             if (curPhaseEl) {
                                 curPhaseEl.textContent = slotPhases > 0 ? slotPhases + 'p' : '--p';
@@ -4942,6 +5024,111 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                 curPhaseEl.title = slotPhases > 0
                                     ? `WB${wb.id}: ${slotPhases}-phasig bestätigt aktiv`
                                     : `WB${wb.id}: Phasenwechsel- und Stop-Nachlaufwerte werden ausgeblendet`;
+                            }
+                            // Einphasiger Stromdeckel der openWB Pro aus der
+                            // Netzphasenmessung. Reine Anzeige des Manager-Vertrags aus dem Snapshot
+                            // (openwb_pro_one_phase_cap_contract / openwb_pro_phase_mapping_proof) – nur
+                            // Rundung und Formatierung, keine eigene Rechnung.
+                            const onePhaseEl = document.getElementById('wb-native-'+wb.id+'-onephase');
+                            if (onePhaseEl) {
+                                const capContract = wb.openwb_pro_one_phase_cap_contract && typeof wb.openwb_pro_one_phase_cap_contract === 'object'
+                                    ? wb.openwb_pro_one_phase_cap_contract : null;
+                                const mappingProof = wb.openwb_pro_phase_mapping_proof && typeof wb.openwb_pro_phase_mapping_proof === 'object'
+                                    ? wb.openwb_pro_phase_mapping_proof : {};
+                                const capMapping = capContract && capContract.mapping && typeof capContract.mapping === 'object' ? capContract.mapping : {};
+                                const mappingState = String((capContract && capContract.mapping_state) || mappingProof.state || '');
+                                const showOnePhase = capContract !== null && (slotPhases === 1 || mappingState === 'unverified');
+                                if (!showOnePhase) {
+                                    onePhaseEl.textContent = '';
+                                    onePhaseEl.removeAttribute('title');
+                                    onePhaseEl.className = 'text-muted d-none text-truncate';
+                                } else {
+                                    const fmtNum = (value, digits) => {
+                                        const num = parseFloat(value);
+                                        return Number.isFinite(num) ? num.toLocaleString('de-DE', {minimumFractionDigits: digits, maximumFractionDigits: digits}) : '--';
+                                    };
+                                    const capAmp = Math.round(parseFloat(capContract.cap_amp || 0));
+                                    const rawCapAmp = Math.round(parseFloat(capContract.raw_cap_amp !== undefined ? capContract.raw_cap_amp : capContract.cap_amp || 0));
+                                    const capReason = String(capContract.reason || '');
+                                    const rawReason = String(capContract.raw_reason || capReason);
+                                    const pccPhase = parseInt(capContract.pcc_phase || 0, 10);
+                                    const phaseIdx = Number.isFinite(pccPhase) && pccPhase > 0 ? pccPhase - 1 : -1;
+                                    const phaseLabel = pccPhase > 0 ? 'L' + pccPhase : 'L?';
+                                    const measured = Array.isArray(capContract.measured_pcc_a) ? capContract.measured_pcc_a : [];
+                                    const volts = Array.isArray(capContract.phase_voltage_v) ? capContract.phase_voltage_v : [];
+                                    const ramp = capContract.ramp && typeof capContract.ramp === 'object' ? capContract.ramp : {};
+                                    const evidence = mappingProof.evidence && typeof mappingProof.evidence === 'object' ? mappingProof.evidence : {};
+                                    const freshness = capContract.freshness && typeof capContract.freshness === 'object' ? capContract.freshness : {};
+                                    let mappingText;
+                                    if (mappingState === 'verified') {
+                                        mappingText = 'Zuordnung bestätigt';
+                                    } else if (mappingState === 'unverified') {
+                                        mappingText = 'Zuordnung widerlegt';
+                                    } else {
+                                        mappingText = 'Zuordnung ' + phaseLabel + ' wird geprüft (' + String(mappingProof.reason || capMapping.reason || 'pending')
+                                            + ', Sprünge ' + Math.round(parseFloat(evidence.consistent_weight || 0)) + '/2)';
+                                    }
+                                    const failTexts = {
+                                        pcc_basis_off: 'Messbasis aus (fest 20 A)',
+                                        phase_mapping_missing: 'keine Netzphase zugeordnet',
+                                        grid_phase_invalid: 'keine Netzphase zugeordnet (ungültig)',
+                                        phase_rotation_invalid: 'keine Netzphase zugeordnet (Rotation ungültig)',
+                                        phase_mapping_conflict: 'keine Netzphase zugeordnet (Widerspruch)',
+                                        grid_limit_not_explicit: 'Hausabsicherung nicht ausdrücklich eingetragen',
+                                        grid_contract_invalid: 'Hausanschlusslimit/Reserve ungültig',
+                                        mapping_pending: mappingText,
+                                        pcc_meter_mismatch: 'Wurzelzähler passt nicht zum Netzpunkt',
+                                        pcc_measurement_invalid: 'Netzphasen-Messung ungültig',
+                                        pcc_measurement_stale: 'Netzphasen-Messung nicht frisch',
+                                        pcc_phase_vector_invalid: 'Netzphasen-Messung ungültig (Vektor)',
+                                        wallbox_measurement_stale: 'Wallbox-Messung nicht frisch',
+                                        wallbox_measurement_invalid: 'Wallbox-Messung ungültig',
+                                        pcc_measurement_basis_missing: 'keine Messbindung in diesem Zyklus',
+                                        contract_exception: 'Vertragsfehler (Log)'
+                                    };
+                                    const prefix = '1p-Deckel WB' + wb.id + ' ' + capAmp + ' A';
+                                    const foreignText = 'Sicherung ' + fmtNum(capContract.operating_limit_a, 0) + ' A − Fremdlast ' + phaseLabel + ' ' + fmtNum(capContract.foreign_load_margin_a, 0) + ' A';
+                                    const importText = (phaseIdx >= 0 && measured.length === 3)
+                                        ? ' (Bezug ' + fmtNum(measured[phaseIdx], 0) + ' A, ' + fmtNum(volts.length === 3 ? volts[phaseIdx] : null, 0) + ' V)'
+                                        : '';
+                                    const imbalanceText = 'Schieflast ' + fmtNum(capContract.imbalance_a, 0) + ' A > ' + fmtNum(capContract.imbalance_max_a, 0) + ' A';
+                                    // Kurze Zusatzzeile ('1p 32 A · L3 bestätigt'), Details im Tooltip.
+                                    const mappingShort = mappingState === 'verified' ? 'bestätigt' : (mappingState === 'unverified' ? 'widerlegt' : 'wird geprüft');
+                                    const shortPrefix = '1p ' + capAmp + ' A · ' + phaseLabel + ' ' + mappingShort;
+                                    let onePhaseText = '';
+                                    let onePhaseDetail = '';
+                                    let onePhaseClass = 'text-muted text-truncate';
+                                    if (mappingState === 'unverified' || capReason === 'mapping_unverified') {
+                                        onePhaseDetail = prefix + ': ' + String(capMapping.hint || mappingProof.hint || ('Phasenzuordnung WB' + wb.id + ' stimmt nicht'));
+                                        onePhaseText = '1p ' + phaseLabel + ' Zuordnung widerlegt';
+                                        onePhaseClass = 'text-danger fw-bold text-truncate';
+                                    } else if (capContract.dynamic === true && capReason === 'ramp_limited') {
+                                        onePhaseDetail = '1p-Deckel WB' + wb.id + ' ' + capAmp + ' A (Ziel ' + rawCapAmp + ' A, +1 A je ' + Math.round(parseFloat(ramp.hold_s || 4)) + ' s): '
+                                            + (rawReason === 'imbalance_limit' ? imbalanceText : foreignText) + ' · ' + mappingText;
+                                        onePhaseText = '1p ' + capAmp + ' A → ' + rawCapAmp + ' A · ' + phaseLabel + ' ' + mappingShort;
+                                    } else if (capContract.dynamic === true && capReason === 'imbalance_limit') {
+                                        onePhaseDetail = prefix + ': ' + imbalanceText + ' · ' + mappingText;
+                                        onePhaseText = '1p ' + capAmp + ' A · Schieflast · ' + phaseLabel + ' ' + mappingShort;
+                                    } else if (capContract.dynamic === true && capReason === 'phase_headroom_exhausted') {
+                                        onePhaseDetail = prefix + ': Phase ' + phaseLabel + ' ausgelastet (Bezug ' + fmtNum(phaseIdx >= 0 && measured.length === 3 ? measured[phaseIdx] : null, 0)
+                                            + ' A ≥ ' + fmtNum(capContract.operating_limit_a, 0) + ' A) – Wallbox pausiert';
+                                        onePhaseText = '1p ' + phaseLabel + ' ausgelastet – Wallbox pausiert';
+                                        onePhaseClass = 'text-danger fw-bold text-truncate';
+                                    } else if (capContract.dynamic === true) {
+                                        onePhaseDetail = prefix + ': ' + foreignText + importText + ' · ' + mappingText;
+                                        onePhaseText = shortPrefix;
+                                    } else {
+                                        onePhaseDetail = prefix + ': ' + (failTexts[capReason] || capReason || 'Fail-closed');
+                                        onePhaseText = '1p ' + capAmp + ' A · ' + (failTexts[capReason] || capReason || 'Fail-closed');
+                                    }
+                                    onePhaseEl.textContent = onePhaseText;
+                                    onePhaseEl.className = onePhaseClass;
+                                    onePhaseEl.title = onePhaseDetail + '\n' + 'Grund: ' + capReason
+                                        + (capContract.raw_reason ? ' (' + String(capContract.raw_reason) + ')' : '')
+                                        + ' · Frische: Live ' + fmtNum(freshness.live_age_s, 1) + ' s, WB ' + fmtNum(freshness.wb_status_age_s, 1) + ' s, WR ' + fmtNum(freshness.pvi_age_s, 1) + ' s (max ' + fmtNum(freshness.max_age_s, 0) + ' s)'
+                                        + ' · Quelle: ' + String(capContract.pm_source || '--')
+                                        + ' · Zuordnung: ' + mappingState + (mappingProof.reason ? ' (' + String(mappingProof.reason) + ')' : '');
+                                }
                             }
                         }
                         if (curStateEl) {

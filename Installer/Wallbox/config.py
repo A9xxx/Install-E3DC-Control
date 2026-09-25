@@ -138,6 +138,8 @@ install_quiet_info_filter(
         "sigterm",
         "strukturaenderung",
         "parameteraenderung",
+        "strukturänderung",
+        "parameteränderung",
         "stecker gezogen",
         "netzladefenster beendet",
     ),
@@ -196,6 +198,13 @@ def _load_config_uncached():
         os.path.join(INSTALL_DIR, "data", "e3dc_v4.json"),
         os.path.join(INSTALL_DIR, "e3dc_v4.json"),
     ]
+    # Globale Fahrzeugwerte (car_*), die der Config-Editor bei leerem Feld als ""
+    # speichert: Ein leerer oder null-wertiger Eintrag gilt als nicht gesetzt und
+    # verdeckt keinen Wert aus der e3dc.config.txt.
+    unset_if_blank = (
+        "car_capacity", "car_target_unit", "car_target_kwh",
+        "car_target_soc", "car_max_soc_si", "car_charge_power",
+    )
     for cand in v4_candidates:
         if os.path.exists(cand):
             try:
@@ -204,6 +213,9 @@ def _load_config_uncached():
                 if isinstance(v4_data, dict):
                     def _is_scalar(val):
                         return val is None or isinstance(val, (str, int, float, bool))
+
+                    def _blank_car_value(key, val):
+                        return key in unset_if_blank and (val is None or str(val).strip() == "")
 
                     # JSON-Werte sind wörtlich: # und // sind keine Kommentare,
                     # Rand-Leerzeichen können zu einem Passwort gehören.
@@ -215,11 +227,11 @@ def _load_config_uncached():
                     legacy_config = v4_data.get("config")
                     if isinstance(legacy_config, dict):
                         for sub_k, sub_v in legacy_config.items():
-                            if _is_scalar(sub_v):
+                            if _is_scalar(sub_v) and not _blank_car_value(str(sub_k).lower(), sub_v):
                                 conf[str(sub_k).lower()] = str(sub_v)
 
                     for k, v in v4_data.items():
-                        if k == "config" or not _is_scalar(v):
+                        if k == "config" or not _is_scalar(v) or _blank_car_value(str(k).lower(), v):
                             continue
                         conf[str(k).lower()] = str(v)
             except Exception as e:
@@ -560,7 +572,7 @@ def compute_charge_score(battery_soc, battery_power, grid_power, config):
 
     if not forecast_loaded:
         # Kein Forecast: Regelung wie bisher (keine Score-Aenderung)
-        result['reason'] = 'Kein Forecast verfuegbar'
+        result['reason'] = 'Kein Forecast verfügbar'
         result['score'] = 0.5
         return result
 
@@ -595,7 +607,7 @@ def compute_charge_score(battery_soc, battery_power, grid_power, config):
         fraction_done = 1.0 - (bat_needed_kwh / (bat_capacity_kwh * bat_target_soc / 100.0))
         _wbminsoc = _safe_float(config.get('wbminsoc', 70), 70.0)
         target_soc = _wbminsoc + fraction_done * (bat_target_soc - _wbminsoc)
-        reason = f"PV knapp ({remaining_pv_kwh:.1f} kWh vs {bat_needed_kwh:.1f} kWh benoetigt)"
+        reason = f"PV knapp ({remaining_pv_kwh:.1f} kWh vs {bat_needed_kwh:.1f} kWh benötigt)"
     else:
         # Prognose reicht NICHT: Batterie muss prioritaet haben!
         score = 0.2
@@ -603,7 +615,7 @@ def compute_charge_score(battery_soc, battery_power, grid_power, config):
         # Einfache lineare Interpolation: Je weniger PV, desto hoeher der Mindest-SoC jetzt.
         linear_target = bat_target_soc - (remaining_pv_kwh / bat_capacity_kwh * 100.0)
         target_soc = max(_safe_float(config.get('wbminsoc', 70), 70.0), min(bat_target_soc, linear_target))
-        reason = f"PV-Defizit: {remaining_pv_kwh:.1f} kWh Prognose < {bat_needed_kwh:.1f} kWh benoetigt"
+        reason = f"PV-Defizit: {remaining_pv_kwh:.1f} kWh Prognose < {bat_needed_kwh:.1f} kWh benötigt"
 
     # Netzeinspeisung ueberschreibt Score nach oben: Wenn gerade massiv eingespeist wird,
     # ist genug da fuer beides (Batterie + Wallbox)

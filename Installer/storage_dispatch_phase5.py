@@ -907,9 +907,11 @@ def _power_settings_contract(
         )
     unchanged_valid = True
     if status == "confirmed_unchanged":
+        # Ein unveränderter Vertrag ist durch einen frischen Live-Readback oder
+        # durch den eigenen, per GET bestätigten Schreibvorgang belegt.
         unchanged_valid = bool(
             schema_valid
-            and settings.get("readback_source") == "canonical_live"
+            and settings.get("readback_source") in {"canonical_live", "own_set_verification"}
             and settings.get("readback_cycle_ts") is not None
             and target_values_match
             and evidence_fresh

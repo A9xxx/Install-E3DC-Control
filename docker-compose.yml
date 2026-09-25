@@ -2,7 +2,7 @@ services:
   e3dc-control:
     # Ohne E3DC_IMAGE_TAG folgt die Installation dem geprüften Stable-Tag
     # "latest". Ein fester Pin oder Rückfall wird bewusst in .env gesetzt,
-    # zum Beispiel: E3DC_IMAGE_TAG=v5.4.6d
+    # zum Beispiel: E3DC_IMAGE_TAG=v5.5.0
     image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"
 
     # Lokaler Entwickler-Selbstbau mit getrenntem Compose-Override:
@@ -20,7 +20,10 @@ services:
         max-size: "10m"
         max-file: "3"
     labels:
-      - com.centurylinklabs.watchtower.enable=${E3DC_WATCHTOWER_ENABLE:-false}
+      # Watchtower aktualisiert diesen Container nur, wenn das Profil
+      # "auto-update" läuft. Mit E3DC_WATCHTOWER_ENABLE=false in .env bleibt
+      # der Container auch dann ausgenommen.
+      - com.centurylinklabs.watchtower.enable=${E3DC_WATCHTOWER_ENABLE:-true}
 
     volumes:
       # PERSISTENTE DATEN (Konfiguration, SQLite, Backups)
@@ -40,20 +43,31 @@ services:
 
     tmpfs:
       # RAM-Disk für Live-Daten (pv_forecast.json, live_data_py.json, ...)
-      - /var/www/html/ramdisk:size=32M,uid=33,gid=33,mode=2775
+      - /var/www/html/ramdisk:size=64M,uid=33,gid=33,mode=2775
 
     environment:
       - TZ=Europe/Berlin
       - E3DC_CONTAINER_MODE=1
+      # Update-Knopf und Auto-Update der Weboberfläche geben Watchtower über
+      # dessen lokale HTTP-API das Signal. Das Token wird in .env gesetzt
+      # (siehe doc/Docker_Dokumentation.md, Abschnitt "Updates").
+      - E3DC_WATCHTOWER_API_URL=http://127.0.0.1:${E3DC_WATCHTOWER_API_PORT:-18080}
+      - E3DC_WATCHTOWER_API_TOKEN=${E3DC_WATCHTOWER_API_TOKEN:-}
       # Optional für NAS/Synology mit belegtem Port 80:
       # - E3DC_WEB_PORT=8085
       # Optional auf eine konkrete Host-IP/Schnittstelle binden:
       # - E3DC_WEB_BIND=192.0.2.20
 
   watchtower:
-    image: containrrr/watchtower
+    # containrrr/watchtower ist seit Dezember 2025 archiviert. Der gepflegte
+    # Fork ist label- und umgebungskompatibel; der Major-Tag "1" schützt vor
+    # der angekündigten Konfigurationsänderung in Watchtower 2.
+    image: ghcr.io/nicholas-fedor/watchtower:1
     container_name: watchtower
     restart: unless-stopped
+    # Hostnetz, damit die HTTP-API ausschließlich auf der Loopback-Adresse des
+    # Hosts liegt und E3DC-Control sie unter 127.0.0.1 erreicht.
+    network_mode: host
     logging:
       driver: json-file
       options:
@@ -65,10 +79,16 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - TZ=Europe/Berlin
-      - DOCKER_API_VERSION=1.40
       - WATCHTOWER_CLEANUP=true
       - WATCHTOWER_LABEL_ENABLE=true
-      - WATCHTOWER_POLL_INTERVAL=86400
+      # Watchtower handelt nur auf Signal von E3DC-Control: Update-Knopf oder
+      # Auto-Update zur im Config-Editor eingestellten Uhrzeit. Keine eigene
+      # Zeitsteuerung, damit die Entscheidung in der Weboberfläche liegt.
+      - WATCHTOWER_HTTP_API_ENDPOINTS=update
+      - WATCHTOWER_HTTP_API_HOST=127.0.0.1
+      - WATCHTOWER_HTTP_API_PORT=${E3DC_WATCHTOWER_API_PORT:-18080}
+      - WATCHTOWER_HTTP_API_TOKEN=${E3DC_WATCHTOWER_API_TOKEN:-}
+      - WATCHTOWER_HTTP_API_PERIODIC_POLLS=false
 
 volumes:
   e3dc_data:

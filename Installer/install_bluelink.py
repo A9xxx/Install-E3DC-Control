@@ -49,57 +49,33 @@ def write_bluelink_service_unit(service_content):
                 pass
 
 def configure_bluelink():
-    """Fragt den Refresh-Token ab und speichert ihn."""
-    config_file = os.path.join(get_install_path(), "e3dc.config.txt")
-    curr_token = ""
-    curr_vin = ""
+    """Zugangsdaten werden nicht mehr im Terminal abgefragt.
 
+    Benutzer (E-Mail), Passwort und optionale PIN des Hyundai/Kia-Kontos gehören in die zugriffsgeschützte
+    V4-Konfiguration (Konfigurations-Editor, Gruppe Fahrzeug Integration (Bluelink)); ein alter Refresh-Token in
+    e3dc.config.txt wird nicht mehr verwendet.
+    """
+    config_file = os.path.join(get_install_path(), "e3dc.config.txt")
+    legacy_token = False
     try:
         if os.path.exists(config_file):
             with open(config_file, 'r', encoding='utf-8') as f:
                 for line in f:
                     if '=' in line and not line.strip().startswith('#'):
                         k, v = [x.strip() for x in line.split('=', 1)]
-                        if k.lower() == 'bluelink_refresh_token': curr_token = v
-                        elif k.lower() == 'bluelink_vin': curr_vin = v
-    except: pass
+                        if k.lower() == 'bluelink_refresh_token' and v:
+                            legacy_token = True
+    except Exception:
+        pass
 
     print("\n=== Bluelink SoC-Abfrage einrichten ===")
-    print("Dieses Modul fragt den Ladestand deines Hyundai/Kia direkt ab.")
-    print("Du benötigst einen gültigen 'Refresh Token'.\n")
-
-    prompt_t = f"Bitte gib deinen Bluelink Refresh-Token ein [{curr_token[:10]}...]: " if curr_token else "Bitte gib deinen Bluelink Refresh-Token ein: "
-    token = input(prompt_t).strip() or curr_token
-    if not token:
-        print("Abbruch: Kein Token angegeben.")
-        return False
-
-    prompt_v = f"Optional: Gib die VIN deines Fahrzeugs ein [{curr_vin}]: " if curr_vin else "Optional: Gib die VIN deines Fahrzeugs ein (leer lassen für erstes Fahrzeug): "
-    vin = input(prompt_v).strip() or curr_vin
-
-    try:
-        with open(config_file, 'r', encoding='utf-8') as f:
-            content = f.read()
-
-        def upsert_param(text, key, val):
-            pattern = re.compile(r'^\s*' + re.escape(key) + r'\s*=.*$', re.IGNORECASE | re.MULTILINE)
-            if pattern.search(text):
-                return pattern.sub(f"{key} = {val}", text)
-            else:
-                return text + f"\n{key} = {val}"
-
-        content = upsert_param(content, "bluelink_refresh_token", token)
-        if vin:
-            content = upsert_param(content, "bluelink_vin", vin)
-
-        with open(config_file, 'w', encoding='utf-8') as f:
-            f.write(content)
-
-        print("✓ Konfiguration erfolgreich gespeichert.")
-        return True
-    except Exception as e:
-        print(f"✗ Fehler beim Speichern der Config: {e}")
-        return False
+    print("Dieses Modul fragt den Ladestand deines Hyundai/Kia direkt beim Hersteller ab.")
+    print("Die Anmeldung erfolgt mit Benutzer (E-Mail) und Passwort des Hyundai-/Kia-Kontos.")
+    print("Trage die Zugangsdaten im Web-Dashboard unter Konfiguration > Fahrzeug Integration (Bluelink) ein;")
+    print("hier im Installer werden keine Passwörter abgefragt oder gespeichert.")
+    if legacy_token:
+        print("Hinweis: Der in e3dc.config.txt gefundene Refresh-Token wird nicht mehr verwendet.")
+    return True
 
 def setup_bluelink_service():
     """Installiert Abhängigkeiten und richtet den Timer-Dienst ein."""

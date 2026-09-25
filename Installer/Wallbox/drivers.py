@@ -45,7 +45,7 @@ def _get_mqtt_module():
             mqtt = importlib.import_module("paho.mqtt.client")
         except Exception as e:
             mqtt = None
-            logger.debug(f"paho-mqtt nicht verfuegbar: {e}")
+            logger.debug(f"paho-mqtt nicht verfügbar: {e}")
     return mqtt
 
 
@@ -959,7 +959,7 @@ class OpenWBCharger(WallboxDriver):
                 logger.info(f"[WB{self.wb_id}] MQTT-Lesepfad für Fahrzeugdaten gestartet.")
             except Exception as e:
                 self.mqtt_client = None
-                logger.debug(f"[WB{self.wb_id}] MQTT-Lesepfad nicht verfuegbar: {e}")
+                logger.debug(f"[WB{self.wb_id}] MQTT-Lesepfad nicht verfügbar: {e}")
 
     def _config_first_nonempty(self, *keys, strip=True):
         """Ermittelt den ersten gesetzten Konfigwert ohne leere Fallbacks."""
@@ -1530,7 +1530,7 @@ class OpenWBCharger(WallboxDriver):
                     )
                     self.state['_session_start_ts'] = int(time.time())
                     self.state['session_kwh']        = 0.0
-                    logger.info(f"[WB{self.wb_id}] Auto eingesteckt! Session-Zaehler gestartet.")
+                    logger.info(f"[WB{self.wb_id}] Auto eingesteckt! Session-Zähler gestartet.")
                 elif not val:
                     self.state['_session_start_wh'] = None
                     self.state['_session_start_ts'] = None
@@ -1774,7 +1774,7 @@ class OpenWBCharger(WallboxDriver):
 
         mode = str(mode or "").strip().lower()
         if mode not in ("instant", "pv", "stop"):
-            logger.warning(f"[WB{self.wb_id}] openWB Primary: ungueltiger Modus {mode!r}")
+            logger.warning(f"[WB{self.wb_id}] openWB Primary: ungültiger Modus {mode!r}")
             return False
         if mode in ("pv", "stop"):
             # Eine neue Nutzer-/Policyentscheidung widerruft einen eventuell
@@ -1824,7 +1824,7 @@ class OpenWBCharger(WallboxDriver):
             self._set_control_state(
                 "primary_mode_failed",
                 "Primary-Modus nicht angenommen",
-                f"openWB Primary hat den Modus {mode} nicht bestaetigt.",
+                f"openWB Primary hat den Modus {mode} nicht bestätigt.",
                 "warning",
                 ok=False,
             )
@@ -1893,7 +1893,7 @@ class OpenWBCharger(WallboxDriver):
             self._set_control_state(
                 "primary_current_failed",
                 "Primary-Strom nicht angenommen",
-                f"openWB Primary hat {amp_value} A nicht bestaetigt.",
+                f"openWB Primary hat {amp_value} A nicht bestätigt.",
                 "warning",
                 amp=amp_value,
                 ok=False,
@@ -2104,7 +2104,7 @@ class OpenWBCharger(WallboxDriver):
             self._set_control_state(
                 "command_blocked",
                 "openWB-Befehle pausiert",
-                f"openWB hat {self._command_failure_count} Befehle nicht bestaetigt. E3DC-Control pausiert weitere openWB-Schreibbefehle noch {remaining}s und zeigt diesen Zustand im Frontend.",
+                f"openWB hat {self._command_failure_count} Befehle nicht bestätigt. E3DC-Control pausiert weitere openWB-Schreibbefehle noch {remaining}s und zeigt diesen Zustand im Frontend.",
                 "danger",
                 ok=None,
                 count_failure=False,
@@ -2125,8 +2125,8 @@ class OpenWBCharger(WallboxDriver):
                 status = "command_rejected_limit"
                 label = "openWB-Befehle nicht angenommen"
                 detail = (
-                    f"openWB hat {self._command_failure_count} Steuerbefehle in Folge nicht bestaetigt. "
-                    "Bitte openWB-Rolle/API pruefen; E3DC-Control zeigt den Fehler im Frontend und pausiert kurz weitere Schreibbefehle."
+                    f"openWB hat {self._command_failure_count} Steuerbefehle in Folge nicht bestätigt. "
+                    "Bitte openWB-Rolle/API prüfen; E3DC-Control zeigt den Fehler im Frontend und pausiert kurz weitere Schreibbefehle."
                 )
                 level = "danger"
         self.state["control_status"] = str(status or "")
@@ -2745,7 +2745,7 @@ class OpenWBCharger(WallboxDriver):
             self.state["_session_start_wh"] = daily_imported
             self.state["_session_start_ts"] = int(time.time())
             self.state["session_kwh"] = 0.0
-            logger.info(f"[WB{self.wb_id}] Auto eingesteckt! Session-Zaehler gestartet.")
+            logger.info(f"[WB{self.wb_id}] Auto eingesteckt! Session-Zähler gestartet.")
         elif not effective_plug_state:
             self.state["_session_start_wh"] = None
             self.state["_session_start_ts"] = None
@@ -4219,7 +4219,7 @@ class E3DCCharger(WallboxDriver):
                 if self.real_charging and not is_heartbeat:
                     abort_flag = 1
                 elif force_state == 1 and not is_heartbeat:
-                    logger.debug(f"[WB{self.wb_id}] Stop-Toggle unterdrueckt: Wallbox meldet keine aktive Ladung.")
+                    logger.debug(f"[WB{self.wb_id}] Stop-Toggle unterdrückt: Wallbox meldet keine aktive Ladung.")
             elif target_amp > 0:
                 # Wir wollen STARTEN/LADEN. Toggle (1) nur bei explizitem
                 # Startimpuls senden. force_state=None ist ein reiner
@@ -4423,7 +4423,7 @@ class E3DCCharger(WallboxDriver):
                 return False
             self.external_suspended = False
             if self.sonnenmodus:
-                logger.info(f"[WB{self.wb_id}] Python uebernimmt Steuerung (Netzmodus Mode=2)")
+                logger.info(f"[WB{self.wb_id}] Python übernimmt Steuerung (Netzmodus Mode=2)")
                 self.sonnenmodus = False
 
     def emergency_stop(self):
@@ -4572,6 +4572,58 @@ class E3DCMultiConnectCharger(E3DCCharger):
         self._release_attempted = False
         self.release_incomplete = False
         self.release_incomplete_reason = ""
+        # e3dc_direct_phase_control_v1: Uebernahme-/Rueckgabe-Episode und letzte Befehle.
+        self._direct_phase_request = None
+        self._direct_phase_request_ts = 0.0
+        self._direct_phase_confirmed_ts = 0.0
+        self._direct_last_error = ""
+        self._direct_last_error_ts = 0.0
+        self._direct_reclaim_count = 0
+
+    def _direct_phase_control_enabled(self):
+        """Stellschraube: Standard aus; nur explizit je Wallbox oder global eingeschaltet."""
+        cfg = self.config if isinstance(self.config, dict) else {}
+        for key in (
+            f"wb{self.wb_id}_e3dc_direct_phase_control_enable",
+            "wb_e3dc_direct_phase_control_enable",
+        ):
+            raw = cfg.get(key)
+            if raw in (None, ""):
+                continue
+            return str(raw).strip().lower() in ("1", "true", "yes", "on", "ja", "ein")
+        return False
+
+    def _direct_phase_control_eligible(self):
+        """Familie efy/Multi Connect explizit gesetzt und Direktrücklesung vollständig."""
+        return bool(
+            self._direct_phase_control_enabled()
+            and self.device_family in {"efy", "multi_connect", "multi_connect_ii"}
+            and self.device_family_source in {"configured", "configured_type"}
+            and self.direct_transition_readback_complete
+            and all(
+                type(self._transition_confirmed.get(name)) is bool
+                for name in ("sun_mode", "auto_phase", "abort")
+            )
+        )
+
+    def _direct_phase_control_status(self):
+        baseline = self._transition_baseline if isinstance(self._transition_baseline, dict) else None
+        return {
+            "contract": "e3dc_direct_phase_control_v1",
+            "enabled": bool(self._direct_phase_control_enabled()),
+            "eligible": bool(self._direct_phase_control_eligible()),
+            "owned": bool(baseline is not None and self._transition_write_performed),
+            "baseline": dict(baseline) if baseline else None,
+            "confirmed": {k: v for k, v in self._transition_confirmed.items()},
+            "confirmed_ts": float(self._transition_readback_ts or 0.0),
+            "phase_request": self._direct_phase_request,
+            "phase_request_ts": float(self._direct_phase_request_ts or 0.0),
+            "phase_confirmed_ts": float(self._direct_phase_confirmed_ts or 0.0),
+            "reclaim_count": int(self._direct_reclaim_count),
+            "last_error": self._direct_last_error,
+            "last_error_ts": float(self._direct_last_error_ts or 0.0),
+            "release_incomplete": bool(self.release_incomplete),
+        }
 
     def _configured_wb_index(self):
         for key in (
@@ -4766,9 +4818,37 @@ class E3DCMultiConnectCharger(E3DCCharger):
         )
         return state
 
+    _DIRECT_WRITE_TAGS = {
+        "sun_mode": ("WB_REQ_SET_SUN_MODE_ACTIVE", "sun_mode_active"),
+        "auto_phase": ("WB_REQ_SET_AUTO_PHASE_SWITCH_ENABLED", "auto_phase_switch_enabled"),
+        "abort": ("WB_REQ_SET_ABORT_CHARGING", "abort_charging"),
+        "phases": ("WB_REQ_SET_NUMBER_PHASES", "number_phases"),
+    }
+
     def _capture_transition_baseline(self):
-        """Direct Sun/Auto/Abort ownership is not released in Stable."""
-        return False
+        """Merkt Sonnenmodus/Auto-Phasen/Abort vor der ersten Übernahme (einmal je Episode)."""
+        if not self._direct_phase_control_eligible():
+            return False
+        if isinstance(self._transition_baseline, dict):
+            return True
+        state = self._read_transition_state()
+        if not all(type(state.get(name)) is bool for name in ("sun_mode", "auto_phase", "abort")):
+            return False
+        self._transition_baseline = {
+            "sun_mode": bool(state.get("sun_mode")),
+            "auto_phase": bool(state.get("auto_phase")),
+            "abort": bool(state.get("abort")),
+            "phases": state.get("phases"),
+            "ts": time.time(),
+        }
+        self._release_attempted = False
+        logger.info(
+            f"[WB{self.wb_id}] E3DC-Direktvertrag: Baseline gemerkt "
+            f"(Sonnenmodus={self._transition_baseline['sun_mode']}, "
+            f"Auto-Phasen={self._transition_baseline['auto_phase']}, "
+            f"Abort={self._transition_baseline['abort']}, Phasen={self._transition_baseline['phases']})."
+        )
+        return True
 
     def _clear_transition_ownership_episode(self):
         self._transition_baseline = None
@@ -4778,15 +4858,156 @@ class E3DCMultiConnectCharger(E3DCCharger):
         self._transition_write_performed = False
 
     def _transition_write_one(self, field, desired):
-        """Sperrt fehlersicher: Direkte E3/DC-Transitionsschreibvorgänge sind nicht freigegeben."""
-        _ = (field, desired)
+        """Schreibt genau ein Direkt-Tag typstreng und bestätigt es per Rücklesung.
+
+        Ohne Stellschraube oder ohne vollständige Rücklesung bleibt der Pfad
+        fehlersicher stumm (False). Die RSCP-Sitzung wird nur für diesen
+        einen Auftrag freigegeben.
+        """
+
+        if field not in self._DIRECT_WRITE_TAGS:
+            return False
+        if not self._direct_phase_control_eligible():
+            return False
+        from rscp_client import RscpTag, RscpType, DIRECT_PHASE_CONTROL_WRITE_TYPES
+        tag_name, readback_key = self._DIRECT_WRITE_TAGS[field]
+        value_type = DIRECT_PHASE_CONTROL_WRITE_TYPES[tag_name]
+        if value_type == RscpType.Bool:
+            value = bool(desired)
+        else:
+            try:
+                value = int(desired)
+            except (TypeError, ValueError):
+                return False
+            if value not in (1, 3):
+                return False
+        with self.lock:
+            if not self._ensure_connected():
+                return False
+            conn = self.conn
+        try:
+            conn.set_direct_phase_control_released(True)
+            with conn.authorized_transition_write(tag_name):
+                response = self._wb_request(
+                    [{'tag': getattr(RscpTag, tag_name), 'type': value_type, 'value': value}],
+                    write_action=f"e3dc_direct_{field}",
+                    write_payload={"field": field, "value": value},
+                )
+        except Exception as e:
+            self._direct_last_error = f"{field}: {e}"
+            self._direct_last_error_ts = time.time()
+            logger.error(f"[WB{self.wb_id}] E3DC-Direktvertrag {field}={value} abgewiesen: {e}")
+            return False
+        finally:
+            try:
+                conn.set_direct_phase_control_released(False)
+            except Exception:
+                pass
+        if response is None:
+            self._direct_last_error = f"{field}: keine RSCP-Antwort"
+            self._direct_last_error_ts = time.time()
+            return False
+        now = time.time()
+        self._transition_last_requested[field] = {"value": value, "ts": now}
+        self._transition_changed_by_us.add(field)
+        self._transition_write_performed = True
+        state = self._read_transition_state()
+        confirmed = state.get({"sun_mode": "sun_mode", "auto_phase": "auto_phase",
+                               "abort": "abort", "phases": "phases"}[field])
+        if field == "phases":
+            # Die Wallbox schaltet in eigener Folge; die Bestätigung kommt später.
+            self._direct_phase_request = value
+            self._direct_phase_request_ts = now
+            if confirmed == value:
+                self._direct_phase_confirmed_ts = now
+            logger.info(f"[WB{self.wb_id}] E3DC-Direktvertrag: Phasenziel {value} gesendet (Rücklesung {confirmed}).")
+            return True
+        if confirmed == value:
+            logger.info(f"[WB{self.wb_id}] E3DC-Direktvertrag: {field}={value} bestätigt.")
+            return True
+        self._direct_last_error = f"{field}: Rücklesung {confirmed} statt {value}"
+        self._direct_last_error_ts = now
+        logger.warning(f"[WB{self.wb_id}] E3DC-Direktvertrag: {field}={value} nicht bestätigt (Rücklesung {confirmed}).")
         return False
 
     def _restore_transition_state_once(self):
-        """Bleibt wirkungslos, da Stable nie direkten Übergangszustand besitzt."""
+        """Rückgabe: Sonnenmodus/Auto-Phasen aus der Baseline; Abort bleibt (Pause bleibt Pause)."""
         self._release_attempted = True
-        self._clear_transition_ownership_episode()
-        return True
+        baseline = self._transition_baseline if isinstance(self._transition_baseline, dict) else None
+        if baseline is None or not self._transition_write_performed:
+            self._clear_transition_ownership_episode()
+            return True
+        ok = True
+        for field in ("sun_mode", "auto_phase"):
+            if field not in self._transition_changed_by_us:
+                continue
+            desired = bool(baseline.get(field))
+            if self._transition_confirmed.get(field) == desired:
+                continue
+            if not self._transition_write_one(field, desired):
+                ok = False
+        self.release_incomplete = not ok
+        self.release_incomplete_reason = "" if ok else "Baseline (Sonnenmodus/Auto-Phasen) nicht bestätigt"
+        if ok:
+            logger.info(f"[WB{self.wb_id}] E3DC-Direktvertrag: Baseline wiederhergestellt, Wallbox regelt wieder selbst.")
+            self._clear_transition_ownership_episode()
+        else:
+            logger.warning(f"[WB{self.wb_id}] E3DC-Direktvertrag: Rückgabe unvollständig ({self.release_incomplete_reason}).")
+        return ok
+
+    def ensure_direct_ownership(self):
+        """Übernahme wie evcc: vor jedem Phasen-/Freigabebefehl Sonnenmodus und Auto-Phasen aus.
+
+        Schaltet das Portal zwischendurch zurück, wird erneut übernommen und
+        gezählt; die Baseline bleibt die der ersten Übernahme.
+        """
+
+        if not self._direct_phase_control_eligible():
+            return False
+        if not self._capture_transition_baseline():
+            return False
+        state = self._read_transition_state()
+        ok = True
+        for field in ("sun_mode", "auto_phase"):
+            if state.get(field) is False:
+                continue
+            if field in self._transition_changed_by_us and state.get(field) is True:
+                self._direct_reclaim_count += 1
+                logger.warning(
+                    f"[WB{self.wb_id}] E3DC-Direktvertrag: {field} wurde extern wieder eingeschaltet – übernehme erneut."
+                )
+            ok = self._transition_write_one(field, False) and ok
+        return ok
+
+    def set_phases(self, phases):
+        """Direkte Phasenumschaltung 1|3 über WB_REQ_SET_NUMBER_PHASES (nur mit Direktvertrag)."""
+        try:
+            target = int(phases)
+        except (TypeError, ValueError):
+            return False
+        if target not in (1, 3):
+            return False
+        if not self._direct_phase_control_eligible():
+            logger.warning(
+                f"[WB{self.wb_id}] Phasenumschaltung ignoriert: E3DC-Direktvertrag nicht aktiv "
+                f"(enabled={self._direct_phase_control_enabled()}, Familie={self.device_family})."
+            )
+            return False
+        if not command_gate.allow_command(
+            self,
+            action="e3dc_direct_set_phases",
+            payload={"phases": target},
+        ):
+            return False
+        if not self.ensure_direct_ownership():
+            return False
+        return self._transition_write_one("phases", target)
+
+    def restore_direct_ownership_on_exit(self):
+        """Dienststopp: Baseline zurück, Abort unverändert (eine Pause bleibt Pause)."""
+        if not isinstance(self._transition_baseline, dict) or not self._transition_write_performed:
+            return True
+        return self._restore_transition_state_once()
 
     @staticmethod
     def _direct_info_score(info):
@@ -5429,6 +5650,33 @@ class E3DCMultiConnectCharger(E3DCCharger):
         transition_complete = all(type(status.get(name)) is bool for name in (
             'sun_mode_active', 'auto_phase_switch_enabled', 'abort_charging'
         ))
+        if transition_complete:
+            self._transition_confirmed.update({
+                'sun_mode': status.get('sun_mode_active'),
+                'auto_phase': status.get('auto_phase_switch_enabled'),
+                'abort': status.get('abort_charging'),
+                'phases': status.get('number_phases'),
+            })
+            self._transition_readback_ts = time.time()
+        if self._direct_phase_control_enabled():
+            # Direktvertrag: Fähigkeit nur mit vollständiger Rücklesung; das
+            # Phasenziel ist die zurückgelesene Phasenzahl der Wallbox.
+            direct_eligible = bool(
+                transition_complete
+                and self.device_family in {"efy", "multi_connect", "multi_connect_ii"}
+                and self.device_family_source in {"configured", "configured_type"}
+            )
+            status['e3dc_direct_phase_control_eligible'] = direct_eligible
+            if direct_eligible:
+                status['can_switch_phases'] = True
+                status['phase_switch_capability'] = 'e3dc_direct_number_phases'
+                status['phase_switch_source'] = 'configured_direct_phase_control'
+                status['api_surface'] = 'rscp_wb_req_set_number_phases'
+                if status.get('number_phases') in (1, 3):
+                    status['phases_target'] = int(status['number_phases'])
+                    if self._direct_phase_request in (1, 3) and int(status['number_phases']) == int(self._direct_phase_request):
+                        self._direct_phase_confirmed_ts = time.time()
+            status['e3dc_direct_phase_control'] = self._direct_phase_control_status()
         self._update_device_identity(
             device_name=status.get('device_name'),
             wallbox_type=status.get('wallbox_type'),
@@ -5751,6 +5999,15 @@ class OpenWBProCharger(WallboxDriver):
             "_session_start_wh": None,
             "_session_start_ts": None,
             "_plug_state_observed": False,
+            # Treibereigene Stecksession
+            # ('wb<n>:<Steckzeit ms>'), persistiert in openwb_data_wb<n>.json
+            # und im Ankerpaar von manual_soc_wb<n>.json; ersetzt die Bindung
+            # des Paar-Restores an wb<n>_live_session.json des PHP-Integrators.
+            "_openwb_pro_driver_session_id": None,
+            # Letzter Zaehlerstand, den der Vorprozess in dieser
+            # Stecksession gesehen hat (openwb_data_wb<n>.json: imported_total_wh);
+            # Bezug der Restgrenze (Zaehlerkontinuitaet zum Vorprozess).
+            "_openwb_pro_driver_session_last_wh": None,
             "car_soc": 0.0,
             "car_soc_source": "",
             "car_soc_source_ts": None,
@@ -6016,6 +6273,14 @@ class OpenWBProCharger(WallboxDriver):
             "vehicle_id": self.state.get("vehicle_id") or self.state.get("rfid_tag"),
             "capacity": self.state.get("car_capacity_kwh", 0.0),
             "session_kwh": round(self.state.get("session_kwh", 0.0), 3),
+            # Ankerherkunft mitschreiben.
+            # Ab 20 Wh traegt die Datei nur noch source=openwb_pro_estimated;
+            # ohne dieses Paar erkannte ein Neustart des Wallbox-Managers den
+            # juengeren manuellen Anker nicht mehr und ankerte auf dem
+            # aelteren Roh-Sample neu. Fremde Leser
+            # (energy_manager, soc_tracker, get_live_json) ignorieren den
+            # verschachtelten Schluessel.
+            "openwb_pro_anchor": self._openwb_pro_anchor_payload(now_ts),
         }
         tmp = f"{soc_file}.tmp.{os.getpid()}.{time.monotonic_ns()}"
         try:
@@ -6037,7 +6302,325 @@ class OpenWBProCharger(WallboxDriver):
             logger.debug(f"[WB{self.wb_id}] openWB Pro manual_soc schreiben fehlgeschlagen: {e}")
             return False
 
-    def _openwb_pro_manual_start_sample(self, active_id=None):
+    def _openwb_pro_anchor_payload(self, now_ts):
+        """Ankerpaar fuer manual_soc_wb<n>.json, damit ein Neustart die
+        Herkunft (manuell/roh) und den Zaehlerstand des Ankers wiederfindet."""
+        anchor_imported = self._float(self.state.get("_soc_anchor_imported_wh"), None)
+        if anchor_imported is not None and not math.isfinite(anchor_imported):
+            anchor_imported = None
+        return {
+            "soc": self._soc_percent_value(self.state.get("_soc_anchor_soc")),
+            "imported_wh": anchor_imported,
+            "source": str(self.state.get("_soc_anchor_source") or ""),
+            "sample_ts": self._soc_source_timestamp(
+                self.state.get("_soc_anchor_sample_ts"), now_ts=now_ts
+            ),
+            "raw_ts": self._soc_source_timestamp(
+                self.state.get("_soc_anchor_raw_ts"), now_ts=now_ts
+            ),
+            # Zuletzt gesehener Roh-SoC der openWB Pro, damit
+            # ein Neustart ein Roh-Sample ohne Zeitstempel bzw. mit gleichem
+            # Zeitstempel als unveraendert (Paar gilt) oder geaendert (Roh gilt)
+            # einordnen kann.
+            "raw_soc": self._soc_percent_value(self.state.get("_soc_raw_value")),
+            # Stecksession des Treibers, damit ein Neustart das
+            # Paar ohne PHP-Sitzungsdatei derselben Session zuordnen kann
+            # (openWB Pro als WB1 ohne wb1_live_session.json; WB2 nach
+            # Downtime > Cron-Latenz, wenn PHP die Session neu eroeffnet hat).
+            "plug_session_id": str(self.state.get("_openwb_pro_driver_session_id") or "") or None,
+            "session_start_wh": self._openwb_pro_finite_or_none(self.state.get("_session_start_wh")),
+            "session_start_ts": int(self._float(self.state.get("_session_start_ts"), 0.0)) or None,
+            "vehicle_id": str(self.state.get("vehicle_id") or self.state.get("rfid_tag") or "") or None,
+        }
+
+    @staticmethod
+    def _openwb_pro_finite_or_none(value):
+        """Endliche Zahl oder None (kein bool, kein NaN/inf, kein Text)."""
+        if isinstance(value, bool) or value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    def _openwb_pro_new_driver_session_id(self, ts):
+        """Kennung der treibereigenen Stecksession 'wb<n>:<Epoche ms>'.
+        Die Epochzeit (nicht die Prozessuhr) macht die Kennung ueber Neustarts
+        hinweg vergleichbar; beim PHP-Restore wird der PHP-Sessionstart
+        eingesetzt, damit dieselbe Session nach jedem Neustart dieselbe
+        Kennung erhaelt."""
+        return "wb%s:%d" % (self.wb_id, int(round(self._float(ts, 0.0) * 1000.0)))
+
+    def _openwb_pro_driver_session_record(self, imported_wh, active_id=None):
+        """Eigene Stecksession des Vorprozesses
+        aus openwb_data_wb<n>.json (vom Treiber jeden Zyklus geschrieben).
+
+        Gilt nur beim ersten Zyklus nach dem Neustart (Aufrufer) und nur, wenn
+        die Datei von einem anderen Treiberprozess stammt (driver_instance_token),
+        plug_state True traegt, eine Session-ID und einen Startzaehler
+        (session_start_wh) enthaelt, nicht aelter als 24 h ist, der Zaehler
+        nicht zurueckgesetzt wurde (Startzaehler und letzter Zaehlerstand
+        hoechstens 100 Wh ueber dem aktuellen Wert) und die Fahrzeugkennung
+        (vehicle_id/rfid_tag) zur live gemeldeten passt, sofern beide vorhanden.
+        Damit ist der Session-Restore (Startzaehler exakt, session_kwh aus dem
+        Zaehler) unabhaengig von wb<n>_live_session.json des PHP-Integrators,
+        die fuer WB1 fehlt und fuer WB2 nach Downtime > Cron-Latenz neu
+        eroeffnet wird.
+
+        Ergänzende Regeln:
+        (1) Frisches Roh-Sample gewinnt: Der Aufrufer
+            setzt die Session NICHT fort, wenn live ein Roh-SoC mit
+            soc_timestamp JUENGER als der letzte Schreibzeitpunkt des
+            Vorprozesses (ts) und ungleich dessen car_soc_raw_ts vorliegt -
+            bei Fahrzeugen mit Roh-SoC nur beim Anstecken das sichere Zeichen
+            fuer Ab-/Anstecken in der Downtime
+            (_openwb_pro_driver_session_replugged). Dann Rueckfall auf
+            wb<n>_live_session.json (Stufe 2) bzw. neue Stecksession am
+            aktuellen Zaehler (session_kwh 0). Grund: session_kwh ist
+            entscheidungsrelevant - _wallbox_target_kwh_reached
+            (wallbox_manager) liest status.session_kwh; mit
+            wb<n>_target_unit=kwh gaelte ein frisch angestecktes Fahrzeug
+            sonst bis 24 h als 'Ziel erreicht'.
+            Restgrenze: EV ohne Roh-SoC und ohne Kennung -> Ab-/Anstecken in
+            der Downtime bei fortlaufendem Zaehler nicht erkennbar; die
+            Session wird fortgesetzt (Paar-Restgrenze siehe
+            _openwb_pro_persisted_anchor_in_session).
+        (2) Legacy-Erstzyklus: Faellt der erste Zyklus nach dem Neustart auf
+            /api/secc zurueck (_update_from_legacy_secc_status), setzt dieser
+            _plug_state_observed und ueberschreibt openwb_data_wb<n>.json mit
+            dem eigenen driver_instance_token; der Record des Vorprozesses
+            ist weg, der spaetere connect.php-Zyklus fragt ihn nicht mehr ab
+            (WB2: PHP-Rueckfall, WB1: keine Session/kein Paar-Restore bis zum
+            naechsten Steckzyklus). Bewusst unveraendert: Beobachtungsmarke
+            und Dateischreiben des Legacy-Pfads tragen dessen Session-Kante
+            (bestehendes Verhalten).
+        (3) Erster Neustart nach dem Upgrade ohne Record und ohne PHP-Datei
+            (WB1): keine Session, der Prozess schreibt driver_plug_session_id
+            und session_start_wh = None; der treibereigene Restore greift
+            erst nach einem Ab-/Ansteckzyklus.
+        Rueckgabe zusaetzlich: last_imported_wh (letzter Zaehler des
+        Vorprozesses, Bezug der Restgrenze) und raw_ts (car_soc_raw_ts)."""
+        out_file = os.path.join(RAMDISK_DIR, f"openwb_data_wb{self.wb_id}.json")
+        try:
+            with open(out_file, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        if str(data.get("source") or "").strip() != "openwb_pro":
+            return None
+        try:
+            if int(data.get("wb_id")) != int(self.wb_id):
+                return None
+        except (TypeError, ValueError):
+            return None
+        if str(data.get("driver_instance_token") or "") == self._driver_instance_token:
+            return None
+        if not self._boolish(data.get("plug_state")):
+            return None
+        session_id = str(data.get("driver_plug_session_id") or "").strip()
+        start_wh = self._openwb_pro_finite_or_none(data.get("session_start_wh"))
+        if not session_id or start_wh is None or start_wh < 0.0 or imported_wh + 100.0 < start_wh:
+            return None
+        now_ts = time.time()
+        file_ts = self._openwb_pro_parse_session_ts(data.get("ts"))
+        if file_ts <= 0 or now_ts - file_ts > 24 * 3600 or file_ts > now_ts + 300.0:
+            return None
+        file_vehicle = str(data.get("vehicle_id") or data.get("rfid_tag") or "").strip()
+        active_compact = self._compact_id(active_id)
+        if active_compact and file_vehicle and self._compact_id(file_vehicle) != active_compact:
+            return None
+        last_imported = self._openwb_pro_finite_or_none(data.get("imported_total_wh"))
+        if last_imported is not None and imported_wh + 100.0 < last_imported:
+            return None
+        return {
+            "session_id": session_id,
+            "start_wh": min(start_wh, imported_wh),
+            "start_ts": self._openwb_pro_parse_session_ts(data.get("session_start_ts")),
+            "vehicle_id": file_vehicle,
+            "last_imported_wh": last_imported,
+            "ts": file_ts,
+            # Zuletzt vom Vorprozess gemeldeter Roh-Zeitstempel.
+            "raw_ts": self._openwb_pro_parse_session_ts(data.get("car_soc_raw_ts")),
+        }
+
+    def _openwb_pro_driver_session_replugged(self, record, raw_soc, raw_soc_ts):
+        """True, wenn live ein gueltiges Roh-Sample mit Zeitstempel
+        vorliegt, das juenger als der letzte Schreibzeitpunkt des Vorprozesses
+        (record['ts']) und nicht dessen bekanntes Roh-Sample (record['raw_ts'])
+        ist - Zeichen fuer Ab-/Anstecken in der Downtime; die Stecksession des
+        Vorprozesses wird dann nicht fortgesetzt. Ohne Roh-SoC, ohne
+        Zeitstempel oder mit aelterem/gleichem Zeitstempel: False."""
+        if not record or self._soc_percent_value(raw_soc) is None:
+            return False
+        live_raw_ts = int(self._soc_source_timestamp(raw_soc_ts, now_ts=time.time()) or 0)
+        if live_raw_ts <= 0:
+            return False
+        record_ts = int(self._float(record.get("ts"), 0.0))
+        known_raw_ts = int(self._float(record.get("raw_ts"), 0.0))
+        return live_raw_ts > record_ts and live_raw_ts != known_raw_ts
+
+    def _openwb_pro_persisted_anchor_pair(self, sample, imported_wh, expected_source=None):
+        """Vom Treiber mitgeschriebenes Ankerpaar (soc, imported_wh) aus
+        manual_soc_wb<n>.json, sofern plausibel (kein Zaehlerreset, Quelle passt).
+        Damit wird nach einem Neustart exakt am alten Anker weitergerechnet,
+        ohne Session-Energie doppelt zu zaehlen."""
+        anchor = (sample or {}).get("anchor")
+        if not isinstance(anchor, dict):
+            return None
+        soc = self._soc_percent_value(anchor.get("soc"))
+        anchor_imported = self._float(anchor.get("imported_wh"), None)
+        source = str(anchor.get("source") or "").strip()
+        if (
+            soc is None
+            or anchor_imported is None
+            or not math.isfinite(anchor_imported)
+            or anchor_imported < 0.0
+            or imported_wh + 100.0 < anchor_imported
+            or (expected_source and source != expected_source)
+        ):
+            return None
+        return {
+            "soc": soc,
+            "imported_wh": min(anchor_imported, imported_wh),
+            "source": source,
+            # Roh-Zeitstempel/-Wert des Paars fuer den
+            # Gleichstand persisted_ts == raw_ts und Roh-Samples ohne Zeitstempel.
+            "sample_ts": int(self._float(anchor.get("sample_ts"), 0.0)),
+            "raw_ts": int(self._float(anchor.get("raw_ts"), 0.0)),
+            "raw_soc": self._soc_percent_value(anchor.get("raw_soc")),
+            # Sessionbindung des Paars (Treiber-Session-ID,
+            # Startzaehler, Fahrzeugkennung); fehlt in Dateien der Vorgaengerversion.
+            "plug_session_id": str(anchor.get("plug_session_id") or "").strip(),
+            "session_start_wh": self._openwb_pro_finite_or_none(anchor.get("session_start_wh")),
+            "vehicle_id": str(anchor.get("vehicle_id") or "").strip(),
+        }
+
+    def _openwb_pro_persisted_anchor_in_session(
+        self, persisted_ts, pair, imported_wh, restored_session_wh, restored_session_start_ts,
+        raw_valid=False, ident_compact=None,
+    ):
+        """Bindet ein
+        persistiertes Ankerpaar aus manual_soc_wb<n>.json an die AKTUELLE
+        Stecksession.
+
+        Hintergrund: Bleibt die Datei nach dem Abstecken
+        mit plugged=True liegen (EV ohne ISO-15118-SoC, Prozess in der Downtime
+        beendet), darf weder das Wiederanstecken im selben Prozess noch ein
+        Neustart in einer neuen Session den alten Anker samt Energie der
+        Vorsession fortsetzen (z. B. deren Lademenge statt nahezu 0 kWh
+        und deren Fahrzeug-SoC).
+
+        Stufe 1 - treibereigene Stecksession:
+        Traegt das Paar plug_session_id oder session_start_wh,
+        entscheidet allein der Treiber. Dieselbe Session liegt vor, wenn
+          (1) das Fahrzeug steckt (Aufrufer),
+          (2) pair.plug_session_id der Session-ID entspricht, die beim Neustart
+              aus openwb_data_wb<n>.json fortgesetzt bzw. beim Anstecken
+              vergeben wurde, ODER pair.session_start_wh dem Startzaehler der
+              laufenden Session entspricht (+-1 Wh); der Ankerzaehler liegt nie
+              ueber dem aktuellen Zaehler (100 Wh Messjitter, siehe
+              _openwb_pro_persisted_anchor_pair),
+          (3) vehicle_id/RFID im Paar UND live identisch sind, sofern beide
+              vorhanden (die Dateiebene prueft der Leser bereits),
+          (4) kein Roh-Sample mit neuerem Zeitstempel vorliegt (Aufrufer,
+              bestehende Regel).
+        Restgrenze (dokumentiert): Ohne Roh-SoC UND ohne vergleichbare
+        Fahrzeugkennung ist Ab-/Anstecken in der Downtime bei stetig
+        fortlaufendem Zaehler nicht unterscheidbar; das Paar gilt dann nur
+        bei Zaehlerkontinuitaet zum Vorprozess: der aktuelle
+        Zaehler liegt hoechstens 500 Wh ueber dem letzten Zaehlerstand, den
+        der Vorprozess in dieser Session gesehen hat
+        (_openwb_pro_driver_session_last_wh aus openwb_data_wb<n>.json,
+        imported_total_wh), sonst wird es verworfen. Vorher galt
+        pair.imported_wh (Zaehler bei der manuellen Eingabe) als Bezug, und
+        ein legitimes Paar derselben Session wurde bei jedem Neustart
+        verworfen, sobald seit der Eingabe mehr als 500 Wh geladen waren.
+        Ohne bekannten Vorprozess-Zaehler
+        (Session aus wb<n>_live_session.json restauriert oder Record ohne
+        imported_total_wh) bleibt pair.imported_wh der Bezug. Mit Kennung,
+        aber ohne Roh-SoC,
+        ist das Wiederanstecken DESSELBEN Fahrzeugs in der Downtime ebenfalls
+        nicht unterscheidbar (Restore; liefert das Fahrzeug je Stecksession ein
+        neues soc_timestamp, greift der Roh-Vorrang). Die PHP-Sitzungsdatei spielt
+        in Stufe 1 keine Rolle.
+
+        Stufe 2 - Rueckfall fuer Paare ohne Sessionbindung (Vorgaengerversion)
+        und paarlose Dateien: Zeit- und Energiebindung ueber die Manager-
+        Session (beim Wiederanstecken 'jetzt', strikt) bzw. den aus
+        wb<n>_live_session.json restaurierten Start (900 s Toleranz, weil PHP
+        start_ts erst mit dem naechsten Seitenaufruf setzt). Energie: Der
+        Ankerzaehler darf nicht unter dem Session-Startzaehler liegen
+        (_session_start_wh, sonst imported_now - restored_session_wh); die
+        Toleranz ist sessionproportional max(250 Wh, 10 % der restaurierten
+        Session), weil der PHP-Integrator im Minutenraster integriert und
+        bei > 30 s alten Treiberdateien 0 W ansetzt (eine solche
+        Untererfassung verwarf sonst den korrekten manuellen Anker). Ohne
+        Sessionstart nach einem Neustart zaehlt ein aelteres Paar nicht.
+
+        Bekannte Grenzen:
+        - Der Leser verwirft die Datei 12 h nach dem Ankersample, der
+          soc_tracker uebernimmt nach 8 h; danach gilt wieder Roh-SoC + Session.
+        - Paarlose manual_start_soc-Dateien mit session_kwh (Vorgaengerversion,
+          soc_tracker) koennen ueber _openwb_pro_persisted_session_sample den
+          Sessionstart auf das manuelle Sample legen.
+        - PHP-Sitzungsdatei: Nur fuer WB1 haelt get_live_json.php die
+          Session 90 s offen (WB_GRACE_SECS); die WB2-Session schliesst beim
+          ersten Poll ohne wb2_locked (Cron-Latenz <= 60 s plus Seitenaufrufe)
+          und wird beim Wiederauftauchen neu eroeffnet. Stufe 1 ist davon
+          unabhaengig, Stufe 2 nur innerhalb dieses Fensters belastbar."""
+        pair = pair if isinstance(pair, dict) and pair else None
+        pair_session_id = str((pair or {}).get("plug_session_id") or "").strip()
+        pair_start_wh = (pair or {}).get("session_start_wh")
+        if pair and (pair_session_id or pair_start_wh is not None):
+            session_id = str(self.state.get("_openwb_pro_driver_session_id") or "").strip()
+            session_start_wh = self._openwb_pro_finite_or_none(self.state.get("_session_start_wh"))
+            same_session = bool(pair_session_id and session_id and pair_session_id == session_id)
+            if (
+                not same_session
+                and pair_start_wh is not None
+                and session_start_wh is not None
+                and abs(float(pair_start_wh) - session_start_wh) <= 1.0
+            ):
+                same_session = True
+            if not same_session:
+                return False
+            pair_vehicle = self._compact_id(pair.get("vehicle_id"))
+            if pair_vehicle and ident_compact and pair_vehicle != ident_compact:
+                return False
+            if not raw_valid and not (pair_vehicle and ident_compact):
+                # Restgrenze: ohne Roh-SoC und ohne vergleichbare
+                # Kennung nur bei Zaehlerkontinuitaet zum letzten Zaehlerstand
+                # des Vorprozesses (<= 500 Wh); ohne bekannten Vorprozess-
+                # Zaehler gegen den Ankerzaehler (bisheriges Verhalten).
+                last_wh = self._openwb_pro_finite_or_none(
+                    self.state.get("_openwb_pro_driver_session_last_wh")
+                )
+                if last_wh is None:
+                    last_wh = self._float(pair.get("imported_wh"), 0.0)
+                return imported_wh - last_wh <= 500.0
+            return True
+        session_start_ts = int(self._float(self.state.get("_session_start_ts"), 0.0))
+        restored_start_ts = int(self._float(restored_session_start_ts, 0.0))
+        if restored_start_ts > 0 and session_start_ts <= 0:
+            session_start_ts = restored_start_ts
+        time_tolerance_s = 900 if restored_start_ts > 0 else 1
+        if session_start_ts > 0 and persisted_ts + time_tolerance_s < session_start_ts:
+            return False
+        if not pair:
+            return session_start_ts > 0
+        session_start_wh = self._float(self.state.get("_session_start_wh"), None)
+        if session_start_wh is None or not math.isfinite(session_start_wh):
+            session_start_wh = max(
+                0.0, imported_wh - max(0.0, self._float(restored_session_wh, 0.0))
+            )
+        # Toleranz sessionproportional statt fest 250 Wh.
+        tolerance_wh = max(250.0, 0.10 * max(0.0, self._float(restored_session_wh, 0.0)))
+        return self._float(pair.get("imported_wh"), 0.0) + tolerance_wh >= session_start_wh
+
+    def _openwb_pro_manual_start_sample(self, active_id=None, allowed_sources=("manual_start_soc",)):
         soc_file = os.path.join(RAMDISK_DIR, f"manual_soc_wb{self.wb_id}.json")
         try:
             with open(soc_file, "r", encoding="utf-8") as handle:
@@ -6046,8 +6629,17 @@ class OpenWBProCharger(WallboxDriver):
             return None
         if not isinstance(data, dict):
             return None
-        if str(data.get("source") or "").strip() != "manual_start_soc":
+        source = str(data.get("source") or "").strip()
+        if source not in allowed_sources:
             return None
+        # manual_soc_wb<n>.json ist ueber den Pfad an diese Wallbox
+        # gebunden; ein abweichendes wb-Feld (Fremdschreiber/Kopie) zaehlt nicht.
+        if data.get("wb") not in (None, ""):
+            try:
+                if int(data.get("wb")) != int(self.wb_id):
+                    return None
+            except (TypeError, ValueError):
+                return None
         if "plugged" in data and self._plugged_explicitly_false(data.get("plugged")):
             return None
         if "soc_rule_confirmed" in data and data.get("soc_rule_confirmed") is not True:
@@ -6093,6 +6685,13 @@ class OpenWBProCharger(WallboxDriver):
             "vehicle_id": manual_vehicle_id,
             "name": str(data.get("name") or "").strip(),
             "capacity_kwh": self._float(data.get("capacity"), 0.0),
+            "source": source,
+            "session_kwh": self._float(data.get("session_kwh"), 0.0),
+            "anchor": (
+                data.get("openwb_pro_anchor")
+                if isinstance(data.get("openwb_pro_anchor"), dict)
+                else {}
+            ),
         }
 
     def _openwb_pro_parse_session_ts(self, value):
@@ -6271,6 +6870,7 @@ class OpenWBProCharger(WallboxDriver):
         anchor_missing = self.state.get("_soc_anchor_soc") is None or anchor_imported is None
 
         if not plug_state:
+            unplug_file_source = None
             if raw_valid:
                 self.state["_soc_raw_timestamp"] = raw_ts or int(now_ts)
                 self.state["_soc_raw_value"] = raw_soc
@@ -6279,13 +6879,40 @@ class OpenWBProCharger(WallboxDriver):
                 self.state["car_soc_source"] = "openwb_pro_raw"
                 self.state["car_soc_source_ts"] = raw_ts or int(now_ts)
                 self.state["car_soc_rule_confirmed"] = raw_rule_confirmed
-                self._write_openwb_pro_manual_soc("openwb_pro_raw")
+                unplug_file_source = "openwb_pro_raw"
+            elif (
+                str(self.state.get("car_soc_source") or "")
+                in ("openwb_pro_estimated", "openwb_pro_raw")
+                and self._soc_percent_value(self.state.get("car_soc")) is not None
+                and self._openwb_pro_manual_start_sample(
+                    allowed_sources=("openwb_pro_estimated", "openwb_pro_raw")
+                )
+            ):
+                # Ohne Roh-Sample beim Abstecken (EV ohne
+                # ISO-15118-SoC) blieb die eigene Datei mit plugged=True samt
+                # Ankerpaar liegen und wurde beim Wiederanstecken/Neustart als
+                # Anker der neuen Session gelesen. Die eigene openwb_pro_*-Datei
+                # wird jetzt mit plugged=False und ohne Ankerpaar (Anker vorher
+                # geloescht) neu geschrieben; manuelle Dateien (PHP-Form,
+                # soc_tracker) bleiben unangetastet.
+                unplug_file_source = str(self.state.get("car_soc_source"))
             self.state["_soc_anchor_soc"] = None
             self.state["_soc_anchor_imported_wh"] = None
             self.state["_soc_anchor_vehicle_id"] = None
+            # Ankerherkunft ebenfalls loeschen, sonst
+            # blockiert ein veralteter manual_start_soc-Marker nach Ab-/Anstecken
+            # im selben Prozess den Roh-Reanchor (nur noch Roh-SoC, keine Schaetzung).
+            self.state["_soc_anchor_source"] = None
+            self.state["_soc_anchor_sample_ts"] = None
+            self.state["_soc_anchor_raw_ts"] = None
+            self.state["_soc_anchor_rule_confirmed"] = None
             self.state["_soc_power_integrated_wh"] = 0.0
             self.state["_soc_delivered_wh"] = 0.0
             self.state["_soc_last_update_ts"] = None
+            if unplug_file_source:
+                # Nach dem Loeschen der Anker traegt die Datei plugged=False und
+                # ein leeres Ankerpaar (kein Restore in der naechsten Session).
+                self._write_openwb_pro_manual_soc(unplug_file_source)
             return
 
         last_update_ts = self._float(self.state.get("_soc_last_update_ts"), 0.0)
@@ -6311,19 +6938,52 @@ class OpenWBProCharger(WallboxDriver):
                 raw_supports_restored_session = now_ts - raw_ts > 900
         manual_ts = int(self._float((manual_sample or {}).get("ts"), 0.0))
         anchor_sample_ts = int(self._float(self.state.get("_soc_anchor_sample_ts"), 0.0))
-        manual_anchor_already = self.state.get("_soc_anchor_source") == "manual_start_soc"
-        manual_soc_changed = abs(self._float((manual_sample or {}).get("soc"), -1.0) - self._float(self.state.get("_soc_anchor_soc"), -1.0)) >= 0.2
+        # Eine Regel fuer laufenden Betrieb und
+        # Neustart - ein NEUERES manuelles Sample (manual_ts > Anker-Sample)
+        # re-ankert immer, auch bei gleichem Wert (Nutzer gibt 80 % erneut ein:
+        # die Schaetzung faellt auf 80 % am aktuellen Zaehler zurueck). Vorher
+        # wurde ein gleicher Wert im Prozess ignoriert, nach dem Neustart aber
+        # uebernommen. Rueckschreibungen des Treibers und des
+        # soc_trackers behalten soc_source_ts des Ankers und loesen nichts aus.
         manual_reanchor = bool(
             manual_sample
-            and (
-                reanchor
-                or (manual_ts > anchor_sample_ts + 1 and (not manual_anchor_already or manual_soc_changed))
-            )
+            and (reanchor or manual_ts > anchor_sample_ts + 1)
         )
         if manual_reanchor:
             self.state["_soc_anchor_soc"] = self._clamp_percent(manual_sample["soc"])
             manual_anchor_imported = imported_wh
-            if restored_session_wh > 20.0 and (anchor_missing or not prev_plug):
+            manual_pair = self._openwb_pro_persisted_anchor_pair(
+                manual_sample, imported_wh, expected_source="manual_start_soc"
+            )
+            manual_at_session_start = (
+                restored_session_start_ts <= 0
+                or manual_ts <= 0
+                or manual_ts <= restored_session_start_ts + 900
+            )
+            if manual_pair and (anchor_missing or not prev_plug) and not self._openwb_pro_persisted_anchor_in_session(
+                manual_ts,
+                manual_pair,
+                imported_wh,
+                restored_session_wh,
+                restored_session_start_ts,
+                raw_valid=raw_valid,
+                ident_compact=ident_compact,
+            ):
+                # Ein manuelles Paar einer fremden Stecksession
+                # (Datei nach Ab-/Anstecken liegengeblieben) wird nicht exakt
+                # fortgesetzt; das Sample gilt dann wie ein paarloses.
+                manual_pair = None
+            if manual_pair and (anchor_missing or not prev_plug):
+                # Vom Treiber persistierter manueller
+                # Anker (Neustart innerhalb der ersten 20 Wh) wird exakt am
+                # alten Zaehlerstand fortgesetzt.
+                self.state["_soc_anchor_soc"] = self._clamp_percent(manual_pair["soc"])
+                manual_anchor_imported = manual_pair["imported_wh"]
+            elif restored_session_wh > 20.0 and (anchor_missing or not prev_plug) and manual_at_session_start:
+                # Nur ein manuelles Sample vom Sessionstart beschreibt den
+                # SoC beim Anstecken. Ein mitten in der Session gesetztes Sample
+                # (z. B. Stunden nach dem Anstecken) gilt am aktuellen Zaehlerstand,
+                # sonst wuerde die gesamte Session-Energie doppelt gezaehlt.
                 manual_anchor_imported = max(0.0, imported_wh - restored_session_wh)
             self.state["_soc_anchor_imported_wh"] = manual_anchor_imported
             self.state["_soc_anchor_vehicle_id"] = ident_compact or self._compact_id(manual_sample.get("vehicle_id") or manual_sample.get("car_id")) or None
@@ -6343,8 +7003,148 @@ class OpenWBProCharger(WallboxDriver):
             self.state["_soc_power_integrated_wh"] = 0.0
             self.state["_soc_delivered_wh"] = 0.0
             self.state["_soc_last_update_ts"] = now_ts
+        # Nach dem Neustart des Wallbox-
+        # Managers ankerte der Treiber bedingungslos auf dem Roh-Sample der
+        # openWB Pro und datierte es um die
+        # gesamte wiederhergestellte Session zurueck, obwohl die eigene
+        # Datei manual_soc_wb<n>.json den juengeren manuellen Anker
+        # samt Schaetzung trug. Der persistierte Anker gewinnt
+        # jetzt, wenn sein soc_source_ts strikt juenger als das Roh-Sample ist
+        # oder kein zeitgestempeltes Roh-Sample vorliegt. Ein frisches
+        # Roh-Sample (neuerer Zeitstempel) und ein neues manuelles Sample
+        # bleiben vorrangig; im laufenden Betrieb aendert sich nichts.
+        # Zusätzlich: Bindung an die aktuelle Stecksession (sonst
+        # Restore eines liegengebliebenen Paars beim Wiederanstecken/Neustart in
+        # einer neuen Session), Gleichstand persisted_ts == raw_ts mit Paar vom
+        # selben Roh-Sample und Roh-Wert-Vergleich ohne Zeitstempel,
+        # Herkunft nach Paar-Restore 'openwb_pro_estimated'.
+        persisted_reanchor = False
+        if plug_state and (anchor_missing or not prev_plug) and not manual_reanchor:
+            persisted = self._openwb_pro_manual_start_sample(
+                active_id, allowed_sources=("openwb_pro_estimated",)
+            )
+            persisted_ts = int(self._float((persisted or {}).get("ts"), 0.0))
+            persisted_pair = (
+                self._openwb_pro_persisted_anchor_pair(persisted, imported_wh)
+                if persisted
+                else None
+            )
+            # Nur ein Anker der aktuellen Stecksession
+            # (Zeit + Zaehlerstand) darf fortgesetzt werden.
+            if persisted and (
+                persisted_ts <= 0
+                or not self._openwb_pro_persisted_anchor_in_session(
+                    persisted_ts,
+                    persisted_pair,
+                    imported_wh,
+                    restored_session_wh,
+                    restored_session_start_ts,
+                    raw_valid=raw_valid,
+                    ident_compact=ident_compact,
+                )
+            ):
+                persisted = None
+            persisted_wins = False
+            if persisted:
+                pair_raw_ts = int(self._float((persisted_pair or {}).get("raw_ts"), 0.0))
+                pair_raw_soc = (persisted_pair or {}).get("raw_soc")
+                raw_value_changed = bool(
+                    raw_valid
+                    and pair_raw_soc is not None
+                    and abs(pair_raw_soc - raw_soc) >= 0.3
+                )
+                if not raw_valid:
+                    persisted_wins = True
+                elif raw_ts <= 0:
+                    # Roh-Sample ohne Zeitstempel: nur ein unveraenderter
+                    # Roh-Wert laesst den persistierten Anker gewinnen; ein in
+                    # der Downtime geaenderter Wert ankert weiterhin neu.
+                    persisted_wins = not raw_value_changed
+                elif persisted_ts > raw_ts:
+                    persisted_wins = True
+                elif persisted_ts == raw_ts:
+                    # Gleichstand heisst, das Paar stammt
+                    # von genau diesem Roh-Sample; exakte Fortsetzung statt
+                    # Roh-Reanchor am aktuellen Zaehler (sonst ginge die seit
+                    # dem Sample geladene Energie verloren).
+                    persisted_wins = bool(
+                        persisted_pair
+                        and pair_raw_ts == raw_ts
+                        and not raw_value_changed
+                    )
+            if persisted_wins:
+                persisted_reanchor = True
+                if persisted_pair:
+                    # Ankerpaar aus der Datei: exakte Fortsetzung, keine
+                    # Doppelzaehlung der Session-Energie.
+                    self.state["_soc_anchor_soc"] = self._clamp_percent(persisted_pair["soc"])
+                    self.state["_soc_anchor_imported_wh"] = persisted_pair["imported_wh"]
+                    # Herkunft des Paars bleibt erhalten,
+                    # damit ein restaurierter manueller Anker im Prozess genau
+                    # wie ein frisch gesetzter behandelt wird (Roh-Sample nur
+                    # mit strikt neuerem Zeitstempel). Das frühere Problem
+                    # (gleicher manueller Wert als manual_anchor_already
+                    # ignoriert) loest jetzt die Regel: ein neueres manuelles
+                    # Sample re-ankert immer, unabhaengig vom Wert.
+                    self.state["_soc_anchor_source"] = persisted_pair["source"] or "openwb_pro_estimated"
+                else:
+                    # Aeltere Datei ohne Ankerpaar: Anzeigewert am aktuellen
+                    # Zaehlerstand (imported_wh jetzt), nicht am Sessionstart.
+                    self.state["_soc_anchor_soc"] = self._clamp_percent(persisted["soc"])
+                    self.state["_soc_anchor_imported_wh"] = imported_wh
+                    self.state["_soc_anchor_source"] = "openwb_pro_estimated"
+                self.state["_soc_anchor_vehicle_id"] = ident_compact or self._compact_id(persisted.get("vehicle_id") or persisted.get("car_id")) or None
+                self.state["_soc_anchor_sample_ts"] = persisted_ts
+                self.state["_soc_anchor_raw_ts"] = persisted.get("raw_soc_ts")
+                self.state["_soc_anchor_rule_confirmed"] = True
+                self.state["car_soc"] = round(self._clamp_percent(persisted["soc"]), 1)
+                self.state["car_soc_source"] = "openwb_pro_estimated"
+                self.state["car_soc_source_ts"] = persisted_ts
+                self.state["car_soc_raw_ts"] = persisted.get("raw_soc_ts")
+                self.state["car_soc_rule_confirmed"] = True
+                self.state["_soc_power_integrated_wh"] = 0.0
+                self.state["_soc_delivered_wh"] = 0.0
+                self.state["_soc_last_update_ts"] = now_ts
+                if raw_valid:
+                    # Das aeltere Roh-Sample gilt als gesehen; sonst wuerde
+                    # new_raw_sample im Folgezyklus den Anker wieder verwerfen.
+                    self.state["_soc_raw_timestamp"] = raw_ts or int(now_ts)
+                    self.state["_soc_raw_value"] = raw_soc
+                logger.info(
+                    f"[WB{self.wb_id}] openWB Pro: persistierten SoC-Anker "
+                    f"({self.state['_soc_anchor_source']}, {persisted['soc']:.1f} %) "
+                    f"nach Neustart fortgeführt."
+                )
         manual_anchor_active = self.state.get("_soc_anchor_source") == "manual_start_soc"
-        if raw_valid and not manual_anchor_active and (reanchor or new_raw_sample):
+        # Ein Roh-Sample ueberschreibt einen manuellen Anker (auch
+        # einen nach dem Neustart restaurierten) nur mit strikt neuerem
+        # Zeitstempel als das manuelle Sample; ohne oder mit aelterem
+        # Zeitstempel bleibt der manuelle Anker (z. B. Roh-SoC nur
+        # beim Anstecken, manueller Wert ist juenger).
+        # Fuer Roh-Samples OHNE Zeitstempel gilt die
+        # Regel asymmetrisch - im laufenden Prozess bleibt der manuelle
+        # Anker bei geaendertem Roh-Wert bestehen (nur Marker), nach einem
+        # Neustart ankert derselbe geaenderte Wert neu (persisted_wins =
+        # not raw_value_changed im Restore-Block). Bewusst so belassen (die Marker-Regel
+        # verlangt das Neustart-Verhalten); praktisch ohne Bedeutung, weil die
+        # openWB Pro soc_value mit soc_timestamp liefert.
+        # Ein manueller Start-SoC, der VOR dem
+        # Anstecken eingegeben wird, wird beim Anstecken vom Roh-Sample des
+        # Fahrzeugs ueberschrieben (soc_timestamp neuer als das manuelle
+        # Sample) - beabsichtigt (Roh-Vorrang); der manuelle Wert gilt, wenn
+        # er NACH dem Roh-Sample eingegeben wird (manueller Zeitstempel jünger als das Roh-Sample).
+        manual_anchor_sample_ts = int(self._float(self.state.get("_soc_anchor_sample_ts"), 0.0))
+        raw_newer_than_manual = bool(raw_valid and raw_ts > 0 and raw_ts > manual_anchor_sample_ts)
+        raw_blocked_by_manual = bool(manual_anchor_active and not raw_newer_than_manual)
+        if raw_valid and not persisted_reanchor and raw_blocked_by_manual:
+            # Roh-Marker auch bei aktivem manuellem Anker als
+            # 'gesehen' fortschreiben (kein Reanchor), damit raw_soc/raw_ts im
+            # Ankerpaar gefuellt sind und ein zweiter Neustart ein Roh-Sample
+            # ohne Zeitstempel als unveraendert/geaendert einordnen kann
+            # (z. B. manueller Anker vor dem ersten Roh-Sample).
+            self.state["_soc_raw_timestamp"] = raw_ts or int(now_ts)
+            self.state["_soc_raw_value"] = raw_soc
+        if raw_valid and not persisted_reanchor and not raw_blocked_by_manual and (reanchor or new_raw_sample):
             self.state["_soc_anchor_soc"] = self._clamp_percent(raw_soc)
             raw_anchor_imported = imported_wh
             if raw_supports_restored_session:
@@ -6488,6 +7288,18 @@ class OpenWBProCharger(WallboxDriver):
             "chargemode": self.state["chargemode_str"],
             "session_kwh": round(self.state["session_kwh"], 3),
             "session_start_ts": self.state.get("_session_start_ts") if self.state.get("plug_state") else None,
+            # Eigene Stecksession fuer den Neustart (Leser: nur
+            # dieser Treiber; get_live_json.php/soc_tracker ignorieren die Schluessel).
+            "driver_plug_session_id": (
+                (str(self.state.get("_openwb_pro_driver_session_id") or "") or None)
+                if self.state.get("plug_state")
+                else None
+            ),
+            "session_start_wh": (
+                self._openwb_pro_finite_or_none(self.state.get("_session_start_wh"))
+                if self.state.get("plug_state")
+                else None
+            ),
             "driver_instance_token": self._driver_instance_token,
             "cp_id": "pro",
             "wb_id": self.wb_id,
@@ -6761,11 +7573,42 @@ class OpenWBProCharger(WallboxDriver):
         prev_plug = self.state.get("plug_state", False)
         plug_observed = bool(self.state.get("_plug_state_observed", False))
         effective_plug_state = bool(plug_state or locked or charge_state or power_w > 50.0 or live_vehicle_id or live_rfid_tag)
-        restored_session = (
-            self._openwb_pro_persisted_session_sample(live_vehicle_id or live_rfid_tag)
-            if effective_plug_state
-            else {"kwh": 0.0, "start_ts": 0}
-        )
+        # Beim ersten Zyklus nach dem Neustart
+        # zuerst die eigene Stecksession aus openwb_data_wb<n>.json des
+        # Vorprozesses fortsetzen (Startzaehler exakt); wb<n>_live_session.json
+        # des PHP-Integrators ist nur noch Rueckfallebene (fehlt fuer WB1, wird
+        # fuer WB2 nach Downtime > Cron-Latenz neu eroeffnet).
+        driver_session = None
+        driver_session_replugged = False
+        if effective_plug_state and not plug_observed:
+            driver_session = self._openwb_pro_driver_session_record(
+                imported_wh, live_vehicle_id or live_rfid_tag
+            )
+            if driver_session and self._openwb_pro_driver_session_replugged(
+                driver_session, data.get("soc_value"), data.get("soc_timestamp")
+            ):
+                # Roh-Sample juenger als der letzte Zyklus des
+                # Vorprozesses (Ab-/Anstecken in der Downtime) - Stecksession
+                # nicht fortsetzen; PHP-Rueckfall (Stufe 2) oder neue Session.
+                logger.info(
+                    f"[WB{self.wb_id}] openWB Pro: Stecksession "
+                    f"{driver_session['session_id']} nicht fortgeführt - "
+                    f"frisches Roh-Sample nach dem letzten Zyklus des Vorprozesses."
+                )
+                driver_session = None
+                driver_session_replugged = True
+        if driver_session:
+            restored_session = {
+                "kwh": max(0.0, (imported_wh - driver_session["start_wh"]) / 1000.0),
+                "start_ts": driver_session["start_ts"],
+                "source": "driver_session",
+            }
+        else:
+            restored_session = (
+                self._openwb_pro_persisted_session_sample(live_vehicle_id or live_rfid_tag)
+                if effective_plug_state
+                else {"kwh": 0.0, "start_ts": 0}
+            )
         restored_session_kwh = max(0.0, self._float(restored_session.get("kwh"), 0.0))
         restored_session_wh = restored_session_kwh * 1000.0
         restored_start_ts = self._openwb_pro_parse_session_ts(
@@ -6777,24 +7620,61 @@ class OpenWBProCharger(WallboxDriver):
             or self.state.get("_session_start_wh") is None
             or self.state.get("_session_start_ts") is None
         ):
-            if restored_session_bound:
+            if driver_session:
+                # Exakter Startzaehler und Kennung der eigenen
+                # Stecksession des Vorprozesses.
+                self.state["_session_start_wh"] = driver_session["start_wh"]
+                self.state["_session_start_ts"] = driver_session["start_ts"] or int(time.time())
+                self.state["_openwb_pro_driver_session_id"] = driver_session["session_id"]
+                # Letzter Zaehler des Vorprozesses als Bezug der
+                # Restgrenze der Paarbindung.
+                self.state["_openwb_pro_driver_session_last_wh"] = driver_session["last_imported_wh"]
+                self.state["session_kwh"] = restored_session_kwh
+                logger.info(
+                    f"[WB{self.wb_id}] openWB Pro: eigene Stecksession "
+                    f"{driver_session['session_id']} mit {restored_session_kwh:.3f} kWh "
+                    f"nach Neustart fortgeführt."
+                )
+            elif restored_session_bound:
                 self.state["_session_start_wh"] = max(0.0, imported_wh - restored_session_wh)
                 self.state["_session_start_ts"] = restored_start_ts
                 self.state["session_kwh"] = restored_session_kwh
+                if not self.state.get("_openwb_pro_driver_session_id"):
+                    # Kennung aus dem PHP-Sessionstart, damit dieselbe
+                    # Session nach jedem Neustart dieselbe Kennung traegt.
+                    self.state["_openwb_pro_driver_session_id"] = (
+                        self._openwb_pro_new_driver_session_id(restored_start_ts)
+                    )
                 logger.info(
                     f"[WB{self.wb_id}] openWB Pro: laufende Session mit "
-                    f"{restored_session_kwh:.3f} kWh fortgefuehrt."
+                    f"{restored_session_kwh:.3f} kWh fortgeführt."
                 )
-            elif plug_observed and not prev_plug:
+            elif (plug_observed and not prev_plug) or driver_session_replugged:
                 self.state["_session_start_wh"] = imported_wh
                 self.state["_session_start_ts"] = int(time.time())
                 self.state["session_kwh"] = 0.0
-                logger.info(f"[WB{self.wb_id}] openWB Pro: Auto eingesteckt, Session-Zaehler gestartet.")
+                # Neue Stecksession beim Anstecken (plug edge);
+                # Ebenso nach dem Neustart, wenn ein frisches
+                # Roh-Sample das Ab-/Anstecken in der Downtime belegt und keine
+                # PHP-Session (Stufe 2) vorliegt.
+                self.state["_openwb_pro_driver_session_id"] = (
+                    self._openwb_pro_new_driver_session_id(time.time())
+                )
+                self.state["_openwb_pro_driver_session_last_wh"] = None
+                if driver_session_replugged:
+                    logger.info(
+                        f"[WB{self.wb_id}] openWB Pro: neue Stecksession nach Neustart "
+                        f"(frisches Roh-Sample), Session-Zähler gestartet."
+                    )
+                else:
+                    logger.info(f"[WB{self.wb_id}] openWB Pro: Auto eingesteckt, Session-Zähler gestartet.")
         elif not effective_plug_state:
             self.state["_session_start_wh"] = None
             self.state["_session_start_ts"] = None
             self.state["_session_vehicle_id"] = None
             self.state["_session_rfid_tag"] = None
+            self.state["_openwb_pro_driver_session_id"] = None
+            self.state["_openwb_pro_driver_session_last_wh"] = None
         self.state["_plug_state_observed"] = True
 
         if effective_plug_state:
@@ -6968,10 +7848,18 @@ class OpenWBProCharger(WallboxDriver):
             self.state["_session_start_wh"] = daily_imported
             self.state["_session_start_ts"] = int(time.time())
             self.state["session_kwh"] = 0.0
-            logger.info(f"[WB{self.wb_id}] openWB Pro: Auto eingesteckt, Session-Zaehler gestartet.")
+            logger.info(f"[WB{self.wb_id}] openWB Pro: Auto eingesteckt, Session-Zähler gestartet.")
         elif not plug_state:
             self.state["_session_start_wh"] = None
             self.state["_session_start_ts"] = None
+        # Im Legacy-Erstzyklus nach einem Neustart geht der
+        # Treiber-Record des Vorprozesses (openwb_data_wb<n>.json)
+        # verloren: die Beobachtungsmarke wird gesetzt und
+        # _write_openwb_pro_status ueberschreibt die Datei mit dem eigenen
+        # driver_instance_token; ein spaeterer connect.php-Zyklus fragt den
+        # Record nicht mehr ab (Rueckfall PHP-Session bzw. neue Session beim
+        # naechsten Steckzyklus). Bewusst unveraendert, siehe
+        # _openwb_pro_driver_session_record.
         self.state["_plug_state_observed"] = True
 
         start = self.state.get("_session_start_wh")

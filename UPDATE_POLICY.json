@@ -1,9 +1,9 @@
 {
-  "version": "5.4.6d",
+  "version": "5.5.0",
   "min_version": "4.0.0",
-  "stable_release": "v5.4.6d",
-  "release_date": "2026-09-14",
-  "description": "v5.4.6d - Docker-Kompatibilität, Speicherplanung und Wärmepumpenbedienung",
+  "stable_release": "v5.5.0",
+  "release_date": "2026-09-25",
+  "description": "v5.5.0 - Wallbox-Startfenster und Phasenwechsel, zeitgerichtetes Speicher-Netzladen, Bluelink-Anmeldung und Docker-Update-Knopf",
   "update_strategy": "backup_replace_restart_v1",
   "installer_requires": "python3",
   "sanitized_republication": false,

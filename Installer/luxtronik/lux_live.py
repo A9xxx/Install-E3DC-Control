@@ -23,7 +23,10 @@ signal.signal(signal.SIGINT, handle_sigterm)
 RAMDISK_FILE = "/var/www/html/ramdisk/waermepumpe.json"
 
 GLOBAL_WP_DATA = {}
-ID_TO_NAME = {}  # NEU: Das "Gedächtnis" des Skripts für die Speicher-IDs
+ID_TO_NAME = {}  # Zuordnung der aktuellen Geräte-Messwert-IDs
+INFORMATION_REFRESH = threading.Event()
+INFORMATION_REFRESH_INTERVAL_S = 300.0
+INFORMATION_REFRESH_MIN_S = 30.0
 
 def _read_ip():
     # Liest luxtronik_ip ausschliesslich aus e3dc_v4.json (Single Source of Truth)
@@ -75,18 +78,24 @@ def extract_values_and_map_ids(items, result_dict, parent_name=""):
 def update_values_from_refresh(items, result_dict):
     """Wertet die sekündlichen Updates aus, die nur noch aus IDs bestehen."""
     global ID_TO_NAME
+    unknown_values = False
     for item in items:
         item_id = item.get("id")
         value = item.get("value")
         sub_items = item.get("items")
         
         # Wenn wir die ID kennen, überschreiben wir den Wert in unseren Daten
-        if item_id and value is not None and item_id in ID_TO_NAME:
-            name = ID_TO_NAME[item_id]
-            result_dict[name] = clean_value(value)
-            
+        if item_id and value is not None:
+            if item_id in ID_TO_NAME:
+                name = ID_TO_NAME[item_id]
+                result_dict[name] = clean_value(value)
+            else:
+                unknown_values = True
+
         if sub_items:
-            update_values_from_refresh(sub_items, result_dict)
+            child_unknown = update_values_from_refresh(sub_items, result_dict)
+            unknown_values = unknown_values or child_unknown
+    return unknown_values
 
 def find_id_by_name(items, target_name):
     """Sucht rekursiv im Navigationsbaum nach der tagesaktuellen ID eines Menüs."""
@@ -102,11 +111,22 @@ def find_id_by_name(items, target_name):
 
 def poll_data(ws, info_id):
     """Fragt die Wärmepumpe jetzt exakt so ab wie die originale Web UI: Jede Sekunde!"""
+    INFORMATION_REFRESH.clear()
     ws.send(f"GET;{info_id}")
+    last_information_read = time.monotonic()
     while True:
         time.sleep(3) # Polling auf 3s entspannt, um Modbus nicht zu blockieren!
         try:
-            ws.send("REFRESH")
+            elapsed = time.monotonic() - last_information_read
+            # Geräteupdates können IDs und Messwertlisten ändern. Unbekannte
+            # Werte zeitnah, unverändert wiederverwendete IDs periodisch binden.
+            if (elapsed >= INFORMATION_REFRESH_INTERVAL_S
+                    or (INFORMATION_REFRESH.is_set() and elapsed >= INFORMATION_REFRESH_MIN_S)):
+                INFORMATION_REFRESH.clear()
+                ws.send(f"GET;{info_id}")
+                last_information_read = time.monotonic()
+            else:
+                ws.send("REFRESH")
         except:
             break
 
@@ -129,7 +149,7 @@ def save_to_ramdisk():
     os.replace(tmp_file, RAMDISK_FILE)
 
 def on_message(ws, message):
-    global GLOBAL_WP_DATA
+    global GLOBAL_WP_DATA, ID_TO_NAME
     try:
         data = json.loads(message)
         
@@ -140,14 +160,20 @@ def on_message(ws, message):
                 threading.Thread(target=poll_data, args=(ws, info_id), daemon=True).start()
             
         elif isinstance(data, dict) and data.get("type") == "Content":
-            # 1. Initialer Ladevorgang (Erstellt das Wörterbuch)
-            extract_values_and_map_ids(data.get("items", []), GLOBAL_WP_DATA)
+            # Eine vollständige Informationsseite ersetzt auch entfernte Werte.
+            items = data.get("items")
+            if not isinstance(items, list) or not items:
+                return
+            GLOBAL_WP_DATA = {}
+            ID_TO_NAME = {}
+            extract_values_and_map_ids(items, GLOBAL_WP_DATA)
             save_to_ramdisk()
             print(f"[{time.strftime('%H:%M:%S')}] Mapping erstellt: {len(GLOBAL_WP_DATA)} Sensoren erkannt.")
             
         elif isinstance(data, dict) and data.get("type") == "values":
             # 2. Sekündliche Updates von der Luxtronik verarbeiten!
-            update_values_from_refresh(data.get("items", []), GLOBAL_WP_DATA)
+            if update_values_from_refresh(data.get("items", []), GLOBAL_WP_DATA):
+                INFORMATION_REFRESH.set()
             save_to_ramdisk()
                 
     except json.JSONDecodeError:

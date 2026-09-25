@@ -37,7 +37,14 @@ $data = [
     'ac_total' => [], 'wb_p1' => [], 'wb_p2' => [], 'wb_p3' => [],
     'wb2_p1' => [], 'wb2_p2' => [], 'wb2_p3' => [], 'bat_v' => [], 'bat_a' => [],
     'bat1_v' => [], 'bat1_a' => [], 'wp_vl' => [], 'wp_rl' => [], 'wp_ww' => [], 'wp_at' => [],
-    'wp_kaelte' => [], 'wp_kaelte_soll' => [], 'wp_freq' => []
+    'wp_kaelte' => [], 'wp_kaelte_soll' => [], 'wp_freq' => [],
+    // Zusatzwechselrichter (Direktlesung) – Phasen, DC und drei MPPT-Spalten
+    'ext_pv_p1' => [], 'ext_pv_p2' => [], 'ext_pv_p3' => [], 'ext_pv_dc_w' => [], 'ext_mppt1_w' => [], 'ext_mppt2_w' => [], 'ext_mppt3_w' => []
+];
+// Spalte im Chart => Schlüssel in live_history.txt; gemittelt nur aus Zeilen mit Wert (ältere Zeilen ohne Spalte: null).
+$extInverterChartColumns = [
+    'ext_pv_p1' => 'ext_pv_p1_w', 'ext_pv_p2' => 'ext_pv_p2_w', 'ext_pv_p3' => 'ext_pv_p3_w', 'ext_pv_dc_w' => 'ext_pv_dc_w',
+    'ext_mppt1_w' => 'ext_mppt1_w', 'ext_mppt2_w' => 'ext_mppt2_w', 'ext_mppt3_w' => 'ext_mppt3_w',
 ];
 
 function e3dc_chart_optional_float($value) {
@@ -208,6 +215,7 @@ foreach ($lines as $line) {
             'p_cnt' => 0, 'b1_cnt' => 0, 'wp_cnt' => 0, 'wp_kaelte_cnt' => 0, 'wp_kaelte_soll_cnt' => 0,
             'eco_score' => 0, 'eco_cnt' => 0
         ];
+        foreach ($extInverterChartColumns as $extCol => $_extKey) { $buckets[$tsRounded][$extCol] = 0; $buckets[$tsRounded][$extCol . '_cnt'] = 0; }
     }
     
     $b = &$buckets[$tsRounded];
@@ -282,6 +290,10 @@ foreach ($lines as $line) {
     $b['bat_a'] += isset($d['bat_a']) ? $d['bat_a'] : 0;
     
     if (!empty($d['bat1_v'])) { $b['bat1_v'] += $d['bat1_v']; $b['bat1_a'] += $d['bat1_a']; $b['b1_cnt']++; }
+    foreach ($extInverterChartColumns as $extCol => $extKey) {
+        $extValue = e3dc_chart_optional_float($d[$extKey] ?? null);
+        if ($extValue !== null) { $b[$extCol] += $extValue; $b[$extCol . '_cnt']++; }
+    }
 
     $khl = null;
     foreach (['wp_kaelte_temp', 'Kaeltespeicher_Ist', 'Kaeltespeicher_Temp', 'Kältespeicher_Ist'] as $khlKey) {
@@ -390,6 +402,9 @@ foreach ($buckets as $ts => $b) {
     $data['wp_kaelte'][] = $b['wp_kaelte_cnt'] > 0 ? round($b['wp_kaelte'] / $b['wp_kaelte_cnt'], 1) : null;
     $data['wp_kaelte_soll'][] = $b['wp_kaelte_soll_cnt'] > 0 ? round($b['wp_kaelte_soll'] / $b['wp_kaelte_soll_cnt'], 1) : null;
     $data['wp_freq'][] = $b['wp_cnt'] > 0 ? round($b['wp_freq'] / $b['wp_cnt'], 1) : null;
+    foreach ($extInverterChartColumns as $extCol => $_extKey) {
+        $data[$extCol][] = $b[$extCol . '_cnt'] > 0 ? round($b[$extCol] / $b[$extCol . '_cnt']) : null;
+    }
 }
 
 $bucketKeys = array_keys($buckets);

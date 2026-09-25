@@ -60,6 +60,13 @@ require_exact_ramdisk_tmpfs() {
 # Apache, PHP und jedem Python-/Node-Dienst.
 require_exact_ramdisk_tmpfs
 
+# Ältere Compose-Dateien mounten 32M; die Vorlage sieht 64M vor. Nur Hinweis,
+# die Größe kommt aus dem Compose-Vertrag des Hosts.
+RAMDISK_SIZE_BYTES="$(/usr/bin/findmnt --kernel --first-only --mountpoint "$RAMDISK_DIR" --types tmpfs --noheadings --bytes --output SIZE 2>/dev/null || true)"
+if [ -n "$RAMDISK_SIZE_BYTES" ] && [ "$RAMDISK_SIZE_BYTES" -lt 67108864 ] 2>/dev/null; then
+    echo "-> HINWEIS: RAM-Disk ist $((RAMDISK_SIZE_BYTES / 1048576))M groß; die aktuelle Compose-Vorlage sieht 64M vor (tmpfs-Zeile anpassen und Container neu erstellen)."
+fi
+
 configure_apache_web_port() {
     local web_port="${E3DC_WEB_PORT:-80}"
     local web_bind="${E3DC_WEB_BIND:-}"
@@ -68,7 +75,7 @@ configure_apache_web_port() {
     local bind_for_apache
 
     if ! echo "$web_port" | grep -Eq '^[0-9]+$' || [ "$web_port" -lt 1 ] || [ "$web_port" -gt 65535 ]; then
-        echo "   -> WARNUNG: E3DC_WEB_PORT='$web_port' ist ungueltig, nutze Port 80."
+        echo "   -> WARNUNG: E3DC_WEB_PORT='$web_port' ist ungültig, nutze Port 80."
         web_port="80"
     fi
 
@@ -1274,7 +1281,7 @@ if optional_service_selected "e3dc-matter-bridge"; then
     fi
 fi
 
-echo "-> Alle Dienste gestartet. Container laeuft."
+echo "-> Alle Dienste gestartet. Container läuft."
 
 # PID 1 beendet den Container beim ersten unerwartet beendeten Kindprozess.
 # Das umfasst den Apache-Vordergrundprozess und alle Python-/Node-Worker. Auch

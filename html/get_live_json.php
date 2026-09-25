@@ -2431,6 +2431,70 @@ function vehicleValuePresent($value) {
     return true;
 }
 
+// Zusatzwechselrichter-Direktlesung für das Frontend (Whitelist, typisiert, fail-closed).
+// Nur Anzeige/Diagnose – die Regelgröße bleibt der E3DC-Messwert Ext_PV_Power (pv_external_w).
+function liveExtInverterNumber($value, $decimals = null) {
+    if ($value === null || $value === '' || is_bool($value) || !is_numeric($value)) return null;
+    $number = (float)$value;
+    if (!is_finite($number)) return null;
+    return $decimals === null ? (int)round($number) : round($number, $decimals);
+}
+
+function liveExtInverterProjection($block) {
+    if (!is_array($block)) return null;
+    $valid = liveBoolValue($block['valid'] ?? false, false);
+    $mppt = [];
+    $rawMppt = isset($block['mppt']) && is_array($block['mppt']) ? array_values($block['mppt']) : [];
+    for ($i = 0; $i < 3; $i++) {
+        $entry = isset($rawMppt[$i]) && is_array($rawMppt[$i]) ? $rawMppt[$i] : [];
+        $mppt[] = [
+            'index' => $i + 1,
+            'v' => $valid ? liveExtInverterNumber($entry['v'] ?? null, 1) : null,
+            'i' => $valid ? liveExtInverterNumber($entry['i'] ?? null, 2) : null,
+            'w' => $valid ? liveExtInverterNumber($entry['w'] ?? null) : null,
+        ];
+    }
+    $out = [
+        'schema' => (string)($block['schema'] ?? 'ext_inverter_v1'),
+        'type' => (string)($block['type'] ?? 'none'),
+        'enabled' => liveBoolValue($block['enabled'] ?? false, false),
+        'host' => (string)($block['host'] ?? ''),
+        'port' => liveExtInverterNumber($block['port'] ?? null),
+        'unit_id' => liveExtInverterNumber($block['unit_id'] ?? null),
+        'poll_s' => liveExtInverterNumber($block['poll_s'] ?? null),
+        'valid' => $valid,
+        'error' => $valid ? '' : (string)($block['error'] ?? 'invalid'),
+        'age_s' => liveExtInverterNumber($block['age_s'] ?? null, 1),
+        'state_name' => $valid && isset($block['state_name']) ? (string)$block['state_name'] : null,
+        'state_code' => $valid ? liveExtInverterNumber($block['state_code'] ?? null) : null,
+        'nominal_kw' => $valid ? liveExtInverterNumber($block['nominal_kw'] ?? null, 1) : null,
+        'output_type_name' => $valid && isset($block['output_type_name']) ? (string)$block['output_type_name'] : null,
+        'mppt' => $mppt,
+    ];
+    $numeric = ['ac_w' => null, 'ac_p1_w' => null, 'ac_p2_w' => null, 'ac_p3_w' => null, 'dc_w' => null,
+        'ac_v1' => 1, 'ac_v2' => 1, 'ac_v3' => 1, 'ac_i1' => 2, 'ac_i2' => 2, 'ac_i3' => 2, 'power_factor' => 3, 'freq_hz' => 2,
+        'daily_kwh' => 1, 'total_kwh' => 1, 'running_h' => null, 'temp_c' => 1];
+    foreach ($numeric as $key => $decimals) {
+        $out[$key] = $valid ? liveExtInverterNumber($block[$key] ?? null, $decimals) : null;
+    }
+    return $out;
+}
+
+// Spalten der Historie (live_history.txt): Phasen, DC und feste drei MPPT-Spalten; null ohne gültige Lesung.
+function liveExtInverterHistoryFields($ext) {
+    $valid = is_array($ext) && !empty($ext['valid']);
+    $fields = [
+        'ext_pv_p1_w' => $valid ? ($ext['ac_p1_w'] ?? null) : null,
+        'ext_pv_p2_w' => $valid ? ($ext['ac_p2_w'] ?? null) : null,
+        'ext_pv_p3_w' => $valid ? ($ext['ac_p3_w'] ?? null) : null,
+        'ext_pv_dc_w' => $valid ? ($ext['dc_w'] ?? null) : null,
+    ];
+    for ($i = 0; $i < 3; $i++) {
+        $fields['ext_mppt' . ($i + 1) . '_w'] = $valid && isset($ext['mppt'][$i]['w']) ? $ext['mppt'][$i]['w'] : null;
+    }
+    return $fields;
+}
+
 function liveBoolValue($value, $default = false) {
     if (is_bool($value)) return $value;
     if ($value === null || $value === '') return $default;
@@ -5429,6 +5493,14 @@ if (is_array($liveData) && isset($liveData['PV_Power'])) {
         $data['pv_external_source'] = $externalPowerValid
             ? (string)($liveData['Ext_PV_Power_Source'] ?? 'e3dc_add_power')
             : ($externalPowerReported ? 'invalid' : 'not_reported');
+        // Direktlesung des Zusatzwechselrichters durchreichen (nur wenn der Live-Dienst sie liefert).
+        if (isset($liveData['ext_inverter']) && is_array($liveData['ext_inverter'])) {
+            $data['ext_inverter'] = liveExtInverterProjection($liveData['ext_inverter']);
+            $data['ext_pv_valid'] = (bool)$data['ext_inverter']['valid'];
+            foreach (['ext_pv_p1_w' => 'ac_p1_w', 'ext_pv_p2_w' => 'ac_p2_w', 'ext_pv_p3_w' => 'ac_p3_w', 'ext_pv_dc_w' => 'dc_w', 'ext_pv_age_s' => 'age_s'] as $extFlatKey => $extSourceKey) {
+                $data[$extFlatKey] = $data['ext_pv_valid'] ? $data['ext_inverter'][$extSourceKey] : null;
+            }
+        }
         // Der Python-RSCP-Writer veröffentlicht den gesamten Live-Frame atomar.
         // Ein echter Batterieübergang auf 0 W darf deshalb nicht mit einem
         // früheren Lade-/Entladewert vermischt werden: Sonst widersprechen sich
@@ -6689,7 +6761,8 @@ if ($wbNativeEnable && ($wbConfigured || $wb2Configured) && file_exists($wbNativ
             $counterValid = (
                 ($rawCounter['schema_version'] ?? '') === 'wallbox_deficit_counter_display_v1'
                 && ($rawCounter['valid'] ?? false) === true
-                && in_array($component, ['none', 'grid', 'authorized_budget'], true)
+                // Komponente 'battery' (Akku-Wh-Zähler der PV-Kurve).
+                && in_array($component, ['none', 'grid', 'authorized_budget', 'battery'], true)
                 && $numbersValid
                 && $numbers['used_wh'] >= 0.0
                 && $numbers['threshold_wh'] >= 5.0
@@ -6708,7 +6781,7 @@ if ($wbNativeEnable && ($wbConfigured || $wb2Configured) && file_exists($wbNativ
             $counterActive = (
                 $counterAccumulating
                 && (($rawCounter['active'] ?? false) === true)
-                && in_array($component, ['grid', 'authorized_budget'], true)
+                && in_array($component, ['grid', 'authorized_budget', 'battery'], true)
                 && $numbers['deficit_w'] > 0.0
                 && $numbers['remaining_wh'] > 0.0
                 && (int)($rawCounter['owner_wb_id'] ?? 0) > 0
@@ -7735,6 +7808,12 @@ if ($validData && $historySampleValid && (time() - $lastWrite) >= 60 && !$isStan
         'Heizleistung Ist' => $data['Heizleistung Ist'] ?? 0,
         'Leistungsaufnahme' => $data['Leistungsaufnahme'] ?? 0,
     ];
+    // Zusatzwechselrichter-Spalten nur bei konfigurierter Direktlesung (ältere Zeilen bleiben lesbar).
+    if (isset($data['ext_inverter']) && is_array($data['ext_inverter']) && !empty($data['ext_inverter']['enabled'])) {
+        foreach (liveExtInverterHistoryFields($data['ext_inverter']) as $extHistoryKey => $extHistoryValue) {
+            $historyLine[$extHistoryKey] = $extHistoryValue;
+        }
+    }
 
     foreach ([
         'Aussentemp',
@@ -8274,7 +8353,7 @@ if (file_exists($_blFlag)) {
 } else {
     $data['car_force_running'] = false;
 }
-$data['has_bluelink'] = e3dcBluelinkRefreshTokenConfigured();
+$data['has_bluelink'] = e3dcBluelinkCredentialsConfigured();
 
 
 // --- NEU: Virtuelle Lade-Sessions (Interpolation & Restzeit) einmischen für Dual-WB ---

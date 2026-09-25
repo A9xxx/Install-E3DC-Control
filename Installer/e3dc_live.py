@@ -84,6 +84,11 @@ try:
     from external_pv_topology import ExternalPvTopologyEvidenceTracker, read_external_pv_topology
 except ImportError:  # pragma: no cover - Paketimport
     from Installer.external_pv_topology import ExternalPvTopologyEvidenceTracker, read_external_pv_topology
+# Zusatzwechselrichter (Sungrow Modbus TCP, nur lesend) – reiner Treiber, eigener Thread.
+try:
+    from ext_inverter_modbus import ExtInverterPoller, ext_inverter_settings, live_fields as ext_inverter_live_fields
+except ImportError:  # pragma: no cover - Paketimport
+    from Installer.ext_inverter_modbus import ExtInverterPoller, ext_inverter_settings, live_fields as ext_inverter_live_fields
 
 logger = configure_service_logger(
     "E3DCLive",
@@ -2952,6 +2957,109 @@ def record_live_plausibility_state(
 # Haupt-Schleife (Daemon + Einzel-Test)
 # ---------------------------------------------------------------------------
 
+def ext_inverter_start(cfg, reader=None):
+    """Zusatzwechselrichter-Lesung (nur lesend, Diagnose) im eigenen Thread starten.
+
+    Liefert (settings, poller); poller ist None bei Typ none oder ungültiger Konfiguration.
+    Kein Verbraucher der Regelung wertet diese Daten aus; sie landen nur in live_data_py.json.
+    """
+    settings = ext_inverter_settings(cfg)
+    if not settings.get("enabled"):
+        if settings.get("type") != "none" or settings.get("error") != "disabled":
+            logger.warning("Zusatzwechselrichter deaktiviert: %s", settings.get("error"))
+        return settings, None
+    poller = ExtInverterPoller(settings, **({"reader": reader} if reader is not None else {}))
+    poller.start()
+    logger.info(
+        "Zusatzwechselrichter %s: Modbus TCP %s:%s Unit %s alle %s s (nur lesend, Diagnose)",
+        settings.get("type"), settings.get("ip"), settings.get("port"), settings.get("unit_id"), settings.get("poll_s"),
+    )
+    return settings, poller
+
+
+_EXT_INVERTER_FLAT_KEYS = ("ext_pv_p1_w", "ext_pv_p2_w", "ext_pv_p3_w", "ext_pv_dc_w", "ext_pv_age_s")
+
+
+def ext_inverter_cycle_fields(settings, poller, now=None):
+    """Felder je Live-Zyklus aus dem letzten Stand des Threads (nie blockierend, fail-closed)."""
+    try:
+        sample = poller.snapshot() if poller is not None else None
+        return ext_inverter_live_fields(settings, sample, time.time() if now is None else now)
+    except Exception as exc:
+        fields = {
+            "ext_inverter": {"schema": "ext_inverter_v1", "valid": False, "error": "%s: %s" % (type(exc).__name__, exc)},
+            "ext_pv_valid": False,
+        }
+        fields.update({key: None for key in _EXT_INVERTER_FLAT_KEYS})
+        return fields
+
+
+# Zusatzwechselrichter-Konfiguration ohne Dienstneustart. Je Zyklus nur ein os.stat der Konfigdatei;
+# erst bei geändertem mtime wird neu gelesen, und nur bei geänderten ext_inverter_*-Werten der Poller neu gestartet.
+EXT_INVERTER_CONFIG_PATH = "/var/www/html/data/e3dc_v4.json"
+_EXT_INVERTER_RELOAD_KEYS = ("type", "enabled", "ip", "port", "unit_id", "poll_s", "error")
+_EXT_INVERTER_RELOAD_WARNED = {"mtime_ns": None}  # Warnung je unlesbarem Stand nur einmal
+
+
+def _config_file_mtime_ns(path=EXT_INVERTER_CONFIG_PATH):
+    """mtime (ns) der Konfigdatei oder None, wenn sie fehlt oder nicht lesbar ist."""
+    try:
+        return os.stat(path).st_mtime_ns
+    except OSError:
+        return None
+
+
+def ext_inverter_reload_if_changed(settings, poller, last_mtime_ns, *, config_path=EXT_INVERTER_CONFIG_PATH, loader=None, reader=None):
+    """Zusatzwechselrichter-Lesung an eine geänderte Konfiguration anpassen (Anzeige/Diagnose, keine Regelgröße).
+
+    Liefert (settings, poller, mtime_ns, reloaded). Datei fehlt oder mtime unverändert -> nichts (kein Voll-Parse).
+    Bei geändertem mtime wird die Konfiguration einmal gelesen; sind type/ip/port/unit_id/poll_s (normalisiert)
+    unverändert, bleibt der Poller. Sonst: alten Poller stoppen (nur Stopp-Signal – der alte Thread endet nach seiner
+    laufenden Lesung von selbst, kein Warten im RSCP-Pfad), genau eine INFO-Zeile, Neustart über ext_inverter_start
+    (fail-closed: ungültige Werte deaktivieren die Lesung, Block valid=False mit error). Lesefehler der Konfiguration
+    (Ausnahme oder leeres Ergebnis, Datei während des Lesens geändert) lassen den bisherigen Stand aktiv; das mtime wird
+    dann nicht gemerkt, der nächste Zyklus liest erneut.
+    """
+    mtime_ns = _config_file_mtime_ns(config_path)
+    if mtime_ns is None:
+        return settings, poller, last_mtime_ns, False
+    if mtime_ns == last_mtime_ns:
+        return settings, poller, mtime_ns, False
+    load = loader if loader is not None else _find_config
+    # _find_config fängt Lesefehler selbst ab und liefert {} – ein leeres Ergebnis ist KEIN gültiger
+    # Stand „Typ none“, sondern ein Lesefehler (Datei gerade in Arbeit oder korrupt). Warnung einmal je mtime, bisheriger
+    # Stand bleibt aktiv, mtime nicht merken -> nächster Zyklus liest erneut (selbstheilend, auch bei gleichem mtime).
+    captured = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(captured):
+            cfg = load()
+    except Exception as exc:
+        cfg, detail = None, str(exc)
+    else:
+        detail = (captured.getvalue().strip().splitlines() or ["leeres Ergebnis"])[-1].strip()
+    if _config_file_mtime_ns(config_path) != mtime_ns:
+        return settings, poller, last_mtime_ns, False
+    if not cfg:
+        if _EXT_INVERTER_RELOAD_WARNED["mtime_ns"] != mtime_ns:
+            _EXT_INVERTER_RELOAD_WARNED["mtime_ns"] = mtime_ns
+            logger.warning("Zusatzwechselrichter: Konfiguration nicht lesbar (%s); bisheriger Stand bleibt aktiv, nächster Zyklus liest erneut", detail)
+        return settings, poller, last_mtime_ns, False
+    current = settings if isinstance(settings, dict) else {}
+    wanted = ext_inverter_settings(cfg)
+    changed = [
+        "%s: %s -> %s" % (key, current.get(key), wanted.get(key))
+        for key in _EXT_INVERTER_RELOAD_KEYS
+        if current.get(key) != wanted.get(key)
+    ]
+    if not changed:
+        return settings, poller, mtime_ns, False
+    if poller is not None:
+        poller.stop(join_timeout_s=0.0)
+    logger.info("Zusatzwechselrichter neu geladen: %s", "; ".join(changed))
+    new_settings, new_poller = ext_inverter_start(cfg, reader=reader) if reader is not None else ext_inverter_start(cfg)
+    return new_settings, new_poller, mtime_ns, True
+
+
 def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=3, write=False):
     """
     Haupt-Schleife.
@@ -2972,6 +3080,11 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=3, write=False
             lambda: RscpConnection(host, port, aes_pw),
             lambda connection: connection.authenticate(user, pw),
         )
+    # Zusatzwechselrichter im eigenen Thread (Zykluszeit unberührt).
+    ext_inverter_cfg, ext_inverter_poller = ext_inverter_start(cfg)
+    # None -> der erste Zyklus liest die Konfiguration einmal und gleicht sie ab (deckt das Fenster
+    # zwischen dem Laden in __main__ und dem Schleifenstart ab); danach nur noch bei geändertem mtime.
+    ext_inverter_cfg_mtime_ns = None
     while True:
         run += 1
         if loops > 0 and run > loops:
@@ -2979,10 +3092,16 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=3, write=False
             kwh_retter.flush()
             if persistent_session is not None:
                 persistent_session.close()
+            if ext_inverter_poller is not None:
+                ext_inverter_poller.stop()
             break
         if loops != 1 and not daemon_quiet:  # Nicht bei Einzel-Run
             print(f"\n{'='*55}\nDurchlauf {run}{(' / ' + str(loops)) if loops > 0 else ' (Daemon)'}\n{'='*55}")
 
+        # Geänderte Zusatzwechselrichter-Konfiguration ohne Dienstneustart übernehmen (nur os.stat je Zyklus).
+        ext_inverter_cfg, ext_inverter_poller, ext_inverter_cfg_mtime_ns, _ext_reloaded = ext_inverter_reload_if_changed(
+            ext_inverter_cfg, ext_inverter_poller, ext_inverter_cfg_mtime_ns
+        )
         t_start = time.monotonic()
         if not daemon_quiet:
             print(f"\nVerbinde mit E3DC {host}:{port} ...")
@@ -3090,6 +3209,8 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=3, write=False
         clean["_ts"]      = int(time.time())
         clean["_elapsed"] = round(elapsed, 3)
         clean["RSCP_Acquisition"] = acquisition_diagnostics
+        # Letzter Stand des Zusatzwechselrichters (Block ext_inverter + flache ext_pv_*-Felder).
+        clean.update(ext_inverter_cycle_fields(ext_inverter_cfg, ext_inverter_poller))
         if errors:
             clean["_errors"] = errors
 

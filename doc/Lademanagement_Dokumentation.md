@@ -1,6 +1,6 @@
 # Dokumentation: Intelligentes Lademanagement
 
-Dieses Dokument beschreibt die intelligenten Lade- und Entladestrategien rund um V4 Storage Simulator, Storage Manager, Wallbox Manager und optionale Verbraucher. Das Ziel ist eine ruhige Speicher-Ladekurve, sinnvolles PV-Laden, geplantes Netzladen bei passenden Slots und kontrolliertes Freimachen von Speicherkapazitaet, wenn sonst Abregelung droht.
+Dieses Dokument beschreibt die intelligenten Lade- und Entladestrategien rund um V4 Storage Simulator, Storage Manager, Wallbox Manager und optionale Verbraucher. Das Ziel ist eine ruhige Speicher-Ladekurve, sinnvolles PV-Laden, geplantes Netzladen bei passenden Slots und kontrolliertes Freimachen von Speicherkapazität, wenn sonst Abregelung droht.
 
 ---
 
@@ -9,7 +9,7 @@ Dieses Dokument beschreibt die intelligenten Lade- und Entladestrategien rund um
 Das System ist modular aufgebaut und kann in zwei Hauptkonfigurationen genutzt werden:
 
 ### a) Nur Ladeplanung (Wallbox)
-*   **Zielgruppe:** Anwender, die **keine steuerbare Wärmepumpe** (Luxtronik) besitzen, aber die intelligente Entladung über ihre E3DC-Wallbox nutzen möchten.
+*   **Zielgruppe:** Anwender, die **keine steuerbare Wärmepumpe** (Luxtronik) besitzen, aber die intelligente Ladeplanung über ihre Wallbox (E3DC, openWB/openWB Pro oder go-e) nutzen möchten.
 *   **Installation:** Wählen Sie im Installer-Menü unter "Erweiterungen" den Punkt **"Intelligentes Lademanagement installieren/konfigurieren"**.
 *   **Funktion:** In diesem Modus werden nur die Wallbox-bezogenen Steuerungsoptionen aktiviert.
 
@@ -133,7 +133,7 @@ Dieses Feature hebt die klassische "Lade für X Stunden" Logik auf ein völlig n
 
 *   **Die Funktion:** Das System nutzt den echten Akkustand deines Elektroautos, wenn er bestätigt geliefert wird, zum Beispiel über den integrierten Bluelink-Client, EVCC, Home Assistant via MQTT oder die Wallbox selbst.
 *   **Ohne Smart-Vehicle (Manueller SoC):** Falls dein Fahrzeug über keine Schnittstelle verfügt, kannst du den aktuellen Ladezustand oben auf der Wallbox-Seite in der Karte **Fahrzeugzuordnung** eingeben. Der Wallbox Manager registriert ab diesem Moment die exakt eingeladene Energie (kWh) und interpoliert den SoC weiter.
-*   **Fahrzeug-Vorlagen Speichern (Gast-Fahrzeuge):** Für Autos ohne Cloud-Anbindung können im Lade-Menü bequeme Profile ("Honda e", "Skoda Elroq") samt Kapazität und typischer Ladeleistung gespeichert werden. Das System berechnet Ladezeiten und Restreichweite dann auto-spezifisch, selbst für reine "Gast-Fahrzeuge"!
+*   **Fahrzeug-Vorlagen Speichern (Gast-Fahrzeuge):** Für Autos ohne Cloud-Anbindung können im Lade-Menü bequeme Profile (zum Beispiel "Kleinwagen 36 kWh", "Kombi 77 kWh") samt Kapazität und typischer Ladeleistung gespeichert werden. Das System berechnet Ladezeiten und Restreichweite dann auto-spezifisch, selbst für reine "Gast-Fahrzeuge"!
 *   **Die Berechnung:** Hast du einen Ziel-SoC (z.B. 80%) im Config-Editor hinterlegt, berechnet der Energy Manager anhand der konfigurierten Batteriekapazität (z.B. 72 kWh) präzise die noch fehlende Energiemenge.
 *   **Verlust-Kalkulation:** Das System schlägt automatisch **10 % Ladeverluste** auf den Bedarf auf.
 *   **Die Ausführung & Anzeige:** Anhand der dynamischen Ladeleistung (z.B. 11 kW) wandelt das System die benötigten kWh in volle Lade-Stunden um, die auch im Dashboard direkt als **Restladezeit** (*"Voll: 3:30h"*) grafisch visualisiert werden. Dieser Wert wird zudem automatisch für die Preis-Logiken genutzt, sodass das E3DC Kernprogramm sofort die günstigsten Nachtstunden für die Ladung bucht.
@@ -162,13 +162,14 @@ Das System ist vollständig "Flotten-tauglich" und unterstützt ab Version 3.8.7
 ### Native Wallbox Steuerung
 Das alte Wallbox-Management wurde durch den nativen **Python Wallbox Manager** ersetzt. Die sichtbaren Nutzer-Modi sind:
 
-* **Aus:** NGNA. E3DC-Control laedt nicht und sendet keine laufenden Wallbox-Befehle. Nur beim bewussten Wechsel auf `Aus` in der WebUI wird einmalig die Grundeinstellung freigegeben.
+* **Aus:** NGNA. E3DC-Control lädt nicht und sendet keine laufenden Wallbox-Befehle. Nur beim bewussten Wechsel auf `Aus` in der WebUI wird einmalig die Grundeinstellung freigegeben.
 * **PV-Kurve ruhig:** Ruhiges Laden entlang der Speicher-Ladekurve.
 * **Grundladung stabil:** 1p/3p-Grundladung, solange der Hausspeicher `wbminSoc` laut Planung noch erreichen kann.
 * **PV + Akku bis Untergrenze:** Das Auto darf PV plus Hausspeicher oberhalb der Hausakku-Untergrenze nutzen; unterhalb der Grenze stützt der Speicher nur Hausverbrauch und Wärmepumpe, Netz bleibt außen vor.
 * **Sofort bis Preislimit:** Sofortiges Netzladen nur, wenn der aktuelle Preis unter dem Wallbox-Preislimit liegt.
+* **Akku bis Abfahrt:** Lädt im Freigabefenster vor der Abfahrtszeit aus PV und Hausspeicher bis zur Hausakku-Untergrenze `wbminSoc`; Netzladen bleibt gesperrt. Gestoppt wird bei erreichter Abfahrtszeit, vollem Fahrzeug oder erreichter Untergrenze.
 
-Geplantes Netzladen per Zeitfenster/Slot ist davon getrennt: Es darf in allen aktiven Modi laden und ignoriert das globale Wallbox-Preislimit, weil die guenstigsten Stunden bereits bei der Slotplanung ausgewaehlt werden. Im Modus **Aus** bleibt geplantes Laden gesperrt.
+Geplantes Netzladen per Zeitfenster/Slot ist davon getrennt: Es darf in allen aktiven Modi laden und ignoriert das globale Wallbox-Preislimit, weil die günstigsten Stunden bereits bei der Slotplanung ausgewählt werden. Im Modus **Aus** bleibt geplantes Laden gesperrt.
 
 ### Externe Wallboxen und MQTT
 Externe Wallboxen können gesteuert oder nur gemessen werden:

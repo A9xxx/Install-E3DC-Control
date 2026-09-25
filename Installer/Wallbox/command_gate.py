@@ -41,6 +41,25 @@ _GROUP_DEFICIT_DOWNWARD_KEYS = frozenset({
     "min_amp",
 })
 _GROUP_DEFICIT_DOWNWARD_SCOPE_SEAL = object()
+# Typisierte Absenkung auf den Mindeststrom unter Nullbudget
+# (Startfenster charging_confirmed) – eigener versiegelter Scope, gleiche
+# Strompfad-Dekodierung wie der PCC-Abwärtsvertrag, nie Start/Anhebung/0 A.
+_MINIMUM_HOLD_REDUCTION_SCOPE_ATTR = "_command_gate_minimum_hold_reduction_scope"
+_MINIMUM_HOLD_REDUCTION_SCHEMA = "openwb_pro_minimum_hold_reduction_v1"
+_MINIMUM_HOLD_REDUCTION_KEYS = frozenset({
+    "schema",
+    "active",
+    "wb_id",
+    "plug_session_id",
+    "cycle_token",
+    "target_amp",
+    "observed_amp",
+    "min_amp",
+})
+# Zeichenketten-Siegel (kein object()): Manager und Treiber können in Testumgebungen
+# verschiedene Modulinstanzen dieses Moduls sehen; die Prüfung bleibt an Schema,
+# Owner, Zyklustoken und exakten Zielwert gebunden.
+_MINIMUM_HOLD_REDUCTION_SCOPE_SEAL = "openwb_pro_minimum_hold_reduction_scope_seal_v1"
 _USER_OFF_RELEASE_TYPE = "user_off_handoff"
 _OPENWB_PRO_MODE0_BINDING_SCHEMA = "openwb_pro_mode0_output_binding_v1"
 _OPENWB_PRO_MODE0_BINDING_KEYS = frozenset({
@@ -434,6 +453,139 @@ def _storage_hard_block_allows_group_deficit_downward(
     )
 
 
+def _normalized_minimum_hold_reduction_authority(
+    value: Any,
+) -> Optional[Dict[str, Any]]:
+    """Validiert den kurzlebigen Mindeststrom-Absenkvertrag."""
+
+    if not isinstance(value, dict) or set(value) != _MINIMUM_HOLD_REDUCTION_KEYS:
+        return None
+    try:
+        wb_id = int(value.get("wb_id"))
+        target_amp = float(value.get("target_amp"))
+        observed_amp = float(value.get("observed_amp"))
+        min_amp = float(value.get("min_amp"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    plug_session_id = str(value.get("plug_session_id") or "")
+    cycle_token = str(value.get("cycle_token") or "")
+    if (
+        value.get("schema") != _MINIMUM_HOLD_REDUCTION_SCHEMA
+        or value.get("active") is not True
+        or wb_id < 1
+        or not plug_session_id
+        or len(plug_session_id) > 256
+        or not cycle_token
+        or len(cycle_token) > 160
+        or not all(
+            number == number and abs(number) != float("inf")
+            for number in (target_amp, observed_amp, min_amp)
+        )
+        or min_amp <= 0.0
+        or target_amp < 6.0
+        or target_amp < min_amp
+        or target_amp >= observed_amp
+    ):
+        return None
+    return {
+        "schema": _MINIMUM_HOLD_REDUCTION_SCHEMA,
+        "active": True,
+        "wb_id": wb_id,
+        "plug_session_id": plug_session_id,
+        "cycle_token": cycle_token,
+        "target_amp": target_amp,
+        "observed_amp": observed_amp,
+        "min_amp": min_amp,
+    }
+
+
+@contextlib.contextmanager
+def minimum_hold_reduction_scope(
+    charger: Any,
+    authority: Dict[str, Any],
+) -> Iterator[None]:
+    """Öffnet genau den gebundenen Mindeststrom-Abwärtsbefehl.
+
+    Der Scope verändert das Storage-Veto nicht; verschachtelte Treiberaufrufe
+    sehen nur die versiegelte Kopie. Ohne gültigen Vertrag oder bei fremdem
+    Ladepunkt wird nichts geöffnet (ValueError).
+    """
+
+    if charger is None:
+        raise ValueError("minimum_hold_reduction_charger_missing")
+    normalized = _normalized_minimum_hold_reduction_authority(authority)
+    if normalized is None:
+        raise ValueError("minimum_hold_reduction_authority_invalid")
+    context = getattr(charger, "_command_gate_context", None)
+    if not isinstance(context, dict):
+        raise ValueError("minimum_hold_reduction_command_context_missing")
+    try:
+        context_wb_id = int(context.get("wb_id", 0))
+    except (TypeError, ValueError, OverflowError):
+        context_wb_id = 0
+    if context_wb_id != normalized["wb_id"]:
+        raise ValueError("minimum_hold_reduction_owner_mismatch")
+    previous = getattr(charger, _MINIMUM_HOLD_REDUCTION_SCOPE_ATTR, None)
+    setattr(
+        charger,
+        _MINIMUM_HOLD_REDUCTION_SCOPE_ATTR,
+        (_MINIMUM_HOLD_REDUCTION_SCOPE_SEAL, dict(normalized)),
+    )
+    try:
+        yield
+    finally:
+        setattr(charger, _MINIMUM_HOLD_REDUCTION_SCOPE_ATTR, previous)
+
+
+def _storage_hard_block_allows_minimum_hold_reduction(
+    *,
+    charger: Any,
+    action: str,
+    payload: Any,
+) -> bool:
+    """Unter Storage-Veto nur die exakt gebundene Absenkung auf den Mindeststrom."""
+
+    scoped = getattr(charger, _MINIMUM_HOLD_REDUCTION_SCOPE_ATTR, None)
+    if not (
+        isinstance(scoped, tuple)
+        and len(scoped) == 2
+        and scoped[0] == _MINIMUM_HOLD_REDUCTION_SCOPE_SEAL
+    ):
+        return False
+    authority = _normalized_minimum_hold_reduction_authority(scoped[1])
+    if authority is None:
+        return False
+    context = getattr(charger, "_command_gate_context", None)
+    try:
+        context_wb_id = int((context or {}).get("wb_id", 0))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if context_wb_id != authority["wb_id"]:
+        return False
+    name = str(action or "").strip().lower()
+    data = payload if isinstance(payload, dict) else {}
+    # Der Sollstrom ≥ 6 A der openWB Pro setzt die Heartbeat-Lease voraus (Treiber
+    # erneuert sie alle ≤ 25 s): innerhalb des Scopes darf sie eingeschaltet werden –
+    # kein Strom, keine Phase, kein Start.
+    if name == "openwb_pro_set_heartbeat":
+        return data.get("enabled") is True
+    if name.startswith("openwb_pro_post_control") and set(data) == {"heartbeatenabled"}:
+        return str(data.get("heartbeatenabled") or "").strip().lower() in {"1", "true", "on"}
+    target = _group_deficit_downward_target_from_action(
+        charger,
+        action,
+        payload,
+    )
+    if target is None or target != target or abs(target) == float("inf"):
+        return False
+    return bool(
+        target >= 6.0
+        and target >= authority["min_amp"]
+        and target < authority["observed_amp"]
+        and abs(target - authority["target_amp"]) <= 0.051
+    )
+
+
 def _storage_hard_block_allows_output(
     *,
     charger: Any,
@@ -453,6 +605,12 @@ def _storage_hard_block_allows_output(
     if _is_typed_emergency_output(charger, name, data):
         return True
     if _storage_hard_block_allows_group_deficit_downward(
+        charger=charger,
+        action=name,
+        payload=data,
+    ):
+        return True
+    if _storage_hard_block_allows_minimum_hold_reduction(
         charger=charger,
         action=name,
         payload=data,

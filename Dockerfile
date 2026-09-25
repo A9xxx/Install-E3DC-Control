@@ -54,9 +54,16 @@ RUN pip3 install --upgrade pip wheel setuptools && \
     pip3 install --prefer-binary paho-mqtt requests websocket-client websockets luxtronik hyundai_kia_connect_api pywebpush pycryptodome pymodbus
 
 # Feste Laufzeitidentität; Installation und unveränderlicher Produktcode bleiben Root.
+# Rechtemodell im Container: Produktcode root:root ohne Gruppen-/Weltschreibbit,
+# Web-Publisher www-data, Laufzeitkonto e3dc-runtime (991) liest Konfiguration, Ramdisk und Logs
+# über die Gruppe www-data. Das Build-Gate belegt diese Gruppenbindung; die Rechteprüfung im
+# Installationscenter und der Konfigurationseditor erwarten im Container genau dieses Modell.
 RUN groupadd --gid 991 e3dc-runtime && \
     useradd --uid 991 --gid 991 --groups www-data --no-create-home \
-        --home-dir /nonexistent --shell /usr/sbin/nologin e3dc-runtime
+        --home-dir /nonexistent --shell /usr/sbin/nologin e3dc-runtime && \
+    test "$(id -u e3dc-runtime)" = "991" && \
+    test "$(id -g e3dc-runtime)" = "991" && \
+    case " $(id -nG e3dc-runtime) " in *" www-data "*) ;; *) echo "e3dc-runtime ist nicht in www-data" >&2; exit 1 ;; esac
 
 # 4. Verzeichnisse und statische Konfiguration
 RUN mkdir -p /app/pi/Install /var/www/html/tmp /var/www/html/logs /var/www/html/data /var/www/html/ramdisk && \
@@ -130,6 +137,7 @@ RUN find -P /app/pi/Install -xdev -type d -exec chmod 0755 -- {} + && \
     test -f /app/pi/Install/Installer/docker_runtime_identity.py && \
     test -f /app/pi/Install/Installer/docker_runtime_exec.py && \
     test -f /app/pi/Install/Installer/docker_runtime_permissions.py && \
+    test -f /app/pi/Install/Installer/docker_watchtower_client.py && \
     test -f /app/pi/Install/Installer/docker_logrotate_manager.py && \
     test -f /app/pi/Install/Installer/docker_matter_storage_guard.py && \
     test -f /app/pi/Install/Installer/docker-logrotate.conf && \

@@ -46,6 +46,12 @@ RSCP_POWER_SETTINGS_CONTRACT_VERSION = 2
 RSCP_POWER_SETTINGS_RETRY_S = 10.0
 RSCP_POWER_SETTINGS_READBACK_GRACE_S = 10.0
 RSCP_POWER_SETTINGS_TOLERANCE_W = 50
+# Ein eigener, per GET bestätigter POWER_SETTINGS-Schreibvorgang gilt bis zu
+# dieser Dauer (zwei Managertakte) als jüngerer Nachweis gegenüber einem
+# Live-Readback, der noch exakt den Vertrag vor diesem Schreibvorgang zeigt,
+# und zwar nur für ein wertgleiches Ziel.
+RSCP_POWER_SETTINGS_OWN_PROOF_MAX_AGE_S = 4.5
+RSCP_POWER_SETTINGS_OWN_PROOF_SOURCE = "own_set_verification"
 RSCP_SEND_RECEIPT_CONTRACT_VERSION = 1
 
 log = logging.getLogger("StorageManager")
@@ -62,6 +68,46 @@ def rscp_settings_from_cfg(cfg: Dict[str, Any]) -> Tuple[str, int, str, str, str
     aes = cfg.get("aes_password", cfg.get("rscp_password", cfg.get("rscp_pw", "")))
     rscp_pw = str(aes or pw or "").strip()
     return host, port, user, pw, rscp_pw
+
+
+def _power_settings_discharge_tightened(
+    before: Dict[str, Any],
+    after: Dict[str, Any],
+    discharge_cap_w: int,
+) -> bool:
+    """True, wenn ``after`` die Entladeseite gegenüber ``before`` verschärft."""
+
+    def effective(contract: Dict[str, Any]) -> Tuple[int, int]:
+        if not contract.get("limits_used"):
+            return int(discharge_cap_w), 0
+        return (
+            safe_int(contract.get("max_discharge_w"), 0),
+            safe_int(contract.get("discharge_start_w"), 0),
+        )
+
+    before_discharge_w, before_start_w = effective(before)
+    after_discharge_w, after_start_w = effective(after)
+    return bool(
+        after_discharge_w < before_discharge_w - RSCP_POWER_SETTINGS_TOLERANCE_W
+        or after_start_w > before_start_w + RSCP_POWER_SETTINGS_TOLERANCE_W
+    )
+
+
+def _power_settings_contract_identical(first: Any, second: Any) -> bool:
+    """Wertgleichheit zweier POWER_SETTINGS-Verträge ohne Toleranz.
+
+    Ohne EMS-Grenzen (``limits_used`` False) zählen die Leistungswerte nicht.
+    """
+    if not isinstance(first, dict) or not isinstance(second, dict):
+        return False
+    if bool(first.get("limits_used")) is not bool(second.get("limits_used")):
+        return False
+    if not first.get("limits_used"):
+        return True
+    return all(
+        first.get(key) == second.get(key)
+        for key in ("max_charge_w", "max_discharge_w", "discharge_start_w")
+    )
 
 
 class BattCtrl:
@@ -92,6 +138,8 @@ class BattCtrl:
         self._settings_set_requests = 0
         self._settings_get_requests = 0
         self._settings_suppressed = 0
+        self._settings_own_verified: Optional[Dict[str, Any]] = None
+        self._settings_own_proof_suppressed = 0
         self._last_power_settings_wire_receipt: Dict[str, Any] = {}
         self._last_set_power_receipt: Dict[str, Any] = {}
         self._power_settings_diag: Dict[str, Any] = {
@@ -122,6 +170,43 @@ class BattCtrl:
         self._settings_discharge_cap = -1
         self._settings_discharge_start = -1
         self._settings_limits_used = None
+        self._settings_own_verified = None
+
+    def _confirmed_power_settings_contract(self) -> Optional[Dict[str, Any]]:
+        """Bestätigter Cache-Vertrag oder ``None``, solange er unbekannt ist."""
+        if self._settings_limits_used is None:
+            return None
+        return {
+            "limits_used": bool(self._settings_limits_used),
+            "max_charge_w": int(self._settings_charge_cap),
+            "max_discharge_w": int(self._settings_discharge_cap),
+            "discharge_start_w": int(self._settings_discharge_start),
+        }
+
+    def _remember_own_verified_power_settings(
+        self,
+        requested: Dict[str, Any],
+        readback: Dict[str, Any],
+        before: Optional[Dict[str, Any]],
+        *,
+        acknowledged: Optional[bool],
+    ) -> None:
+        """Merkt den eigenen, per GET bestätigten Schreibvorgang als Nachweis."""
+        if before is None:
+            return
+        self._settings_own_verified = {
+            "requested": dict(requested),
+            "readback": dict(readback),
+            "pre": dict(before),
+            "acknowledged": acknowledged,
+            "discharge_tightened": _power_settings_discharge_tightened(
+                before,
+                requested,
+                self._auto_discharge_cap,
+            ),
+            "monotonic": time.monotonic(),
+            "ts": time.time(),
+        }
 
     def _power_settings_target_matches(
         self,
@@ -296,6 +381,11 @@ class BattCtrl:
             "retained": False,
             "reason": "request_started",
         }
+        # Vor jedem Wire-SET den bestätigten Vorvertrag merken und einen alten
+        # eigenen Nachweis verwerfen; nur ein per GET bestätigter SET wird neu
+        # zum Nachweis.
+        before = self._confirmed_power_settings_contract()
+        self._settings_own_verified = None
         self._settings_set_requests += 1
         response = self._c.request([{
             "tag": RscpTag.EMS_REQ_SET_POWER_SETTINGS,
@@ -336,6 +426,12 @@ class BattCtrl:
             if readback_matches:
                 assert isinstance(readback, dict)
                 self._accept_power_settings_readback(readback)
+                self._remember_own_verified_power_settings(
+                    requested,
+                    readback,
+                    before,
+                    acknowledged=None,
+                )
                 self._power_settings_diag = {
                     "schema": "rscp_power_settings_v1",
                     "contract_version": RSCP_POWER_SETTINGS_CONTRACT_VERSION,
@@ -421,6 +517,12 @@ class BattCtrl:
             return False
 
         self._accept_power_settings_readback(readback)
+        self._remember_own_verified_power_settings(
+            requested,
+            readback,
+            before,
+            acknowledged=True,
+        )
         bounded_zero_equivalent = bool(
             limits_used
             and charge_w == 0
@@ -454,6 +556,7 @@ class BattCtrl:
         diag["set_requests"] = self._settings_set_requests
         diag["get_requests"] = self._settings_get_requests
         diag["suppressed_unchanged"] = self._settings_suppressed
+        diag["own_proof_suppressed"] = self._settings_own_proof_suppressed
         diag["retry_remaining_s"] = round(
             max(0.0, self._settings_retry_after_monotonic - time.monotonic()),
             1,
@@ -678,6 +781,67 @@ class BattCtrl:
             discharge_start_w,
             limits_used,
         )
+        own_proof = self._settings_own_verified
+        # Der Nachweis gilt nur für ein wertgleiches Ziel. Ein nur innerhalb der
+        # Toleranz gleiches Ziel läuft wie bisher gegen den frischen Abgleich;
+        # sonst erreichte ein integrierender Pfad mit Schritten unter der
+        # Toleranz seinen Gleichgewichtswert nie und schriebe im Wechsel.
+        if (
+            not force
+            and not isinstance(self._settings_pending_target, dict)
+            and self._settings_last_reconcile_fresh
+            and isinstance(own_proof, dict)
+            and _power_settings_contract_identical(own_proof.get("requested"), target)
+            and not self._power_settings_target_matches(
+                charge_w,
+                discharge_w,
+                discharge_start_w,
+                limits_used,
+                bounded_zero_w,
+            )
+        ):
+            own_proof_age_s = time.monotonic() - float(own_proof.get("monotonic") or 0.0)
+            if (
+                0.0 <= own_proof_age_s <= RSCP_POWER_SETTINGS_OWN_PROOF_MAX_AGE_S
+                and self._power_settings_readback_matches(
+                    own_proof.get("readback"),
+                    charge_w,
+                    discharge_w,
+                    discharge_start_w,
+                    limits_used,
+                    bounded_zero_w,
+                )
+                and self._confirmed_power_settings_contract() == own_proof.get("pre")
+                and not own_proof.get("discharge_tightened")
+            ):
+                # Der frisch abgeglichene Live-Readback zeigt noch exakt den
+                # Vertrag vor dem eigenen, per GET bestätigten Schreibvorgang.
+                # Dieser ist der jüngere Nachweis; ein zweites SET mit
+                # demselben Ziel entfällt.
+                superseded = {
+                    "readback": dict(self._power_settings_diag.get("readback") or {}),
+                    "readback_cycle_ts": self._power_settings_diag.get("readback_cycle_ts"),
+                }
+                self._accept_power_settings_readback(dict(own_proof["readback"]))
+                self._settings_suppressed += 1
+                self._settings_own_proof_suppressed += 1
+                self._power_settings_diag = {
+                    "schema": "rscp_power_settings_v1",
+                    "contract_version": RSCP_POWER_SETTINGS_CONTRACT_VERSION,
+                    "status": "confirmed_unchanged",
+                    "stage": "target",
+                    "confirmed": True,
+                    "acknowledged": own_proof.get("acknowledged"),
+                    "requested": target,
+                    "readback": dict(own_proof["readback"]),
+                    "readback_source": RSCP_POWER_SETTINGS_OWN_PROOF_SOURCE,
+                    "readback_cycle_ts": own_proof.get("ts"),
+                    "own_proof_age_s": round(own_proof_age_s, 3),
+                    "superseded_live_readback": superseded,
+                    "bounded_zero_w": bounded_zero_w,
+                    "ts": int(time.time()),
+                }
+                return True
         if isinstance(self._settings_pending_target, dict):
             now_monotonic = time.monotonic()
             if self._pending_target_matches(target, bounded_zero_w):

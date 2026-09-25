@@ -129,11 +129,14 @@ def _wb2_configured_or_discovered(config):
         return True
     return _wb2_runtime_discovery_present(config)
 
-MISSING_SOC_WARNING_INTERVAL_S = 600
 MANUAL_SOC_UNCONFIRMED_SOURCES = frozenset({
     "simple_view_start_soc", "config_start_soc",
 })
-_last_missing_soc_warning_ts = 0.0
+# Hinweis "Kein Fahrzeug-SoC" einmal je Stecksession und
+# Wallbox als INFO (vorher WARNING alle 10 min, auch ohne Fahrzeug). Der Steckzustand
+# kommt aus dem Manager-Status; die Planung (0-%-Annahme) bleibt unverändert.
+MISSING_SOC_PLUG_STATUS_MAX_AGE_S = 120.0
+_missing_soc_session_noted = {}
 _CANDIDATE_MODE = False
 
 _CANDIDATE_SCHEMA = "wallbox_plan_candidate_v1"
@@ -157,16 +160,69 @@ def _uses_recurring_tariff_axis(config):
     return uses_recurring_tariff_axis(config)
 
 
-def _warn_missing_vehicle_soc(now=None):
-    global _last_missing_soc_warning_ts
+def _wallbox_plug_state(wb_id, now=None):
+    """Steckzustand einer Wallbox aus ramdisk/wallbox_native.json.
+
+    True/False nur aus einem frischen Manager-Status (``ts`` höchstens
+    MISSING_SOC_PLUG_STATUS_MAX_AGE_S alt), sonst None (unbekannt).
+    """
+    try:
+        with open(os.path.join(RAMDISK_DIR, "wallbox_native.json"), encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
     if now is None:
         now = time.time()
-    if now - _last_missing_soc_warning_ts < MISSING_SOC_WARNING_INTERVAL_S:
+    try:
+        age_s = float(now) - float(data.get("ts"))
+    except (TypeError, ValueError):
+        return None
+    if not (-5.0 <= age_s <= MISSING_SOC_PLUG_STATUS_MAX_AGE_S):
+        return None
+    try:
+        wb = int(wb_id or 1)
+    except (TypeError, ValueError):
+        return None
+    details = data.get("wb_details")
+    if isinstance(details, list) and details:
+        for item in details:
+            if not isinstance(item, dict):
+                continue
+            try:
+                item_id = int(item.get("id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if item_id == wb:
+                plug = item.get("plug")
+                return plug if isinstance(plug, bool) else None
+        return None
+    if wb == 1 and isinstance(data.get("connected"), bool):
+        return data.get("connected")
+    return None
+
+
+def _note_missing_vehicle_soc(wb_id, plug_state=None):
+    """Eine INFO-Zeile je Stecksession und Wallbox.
+
+    Abgesteckt (False) setzt die Session zurück und schreibt nichts; gesteckt
+    (True) oder unbekannt (None) schreibt höchstens eine Zeile, bis ein
+    Abstecken belegt ist.
+    """
+    try:
+        wb = int(wb_id or 1)
+    except (TypeError, ValueError):
+        wb = 1
+    if plug_state is False:
+        _missing_soc_session_noted.pop(wb, None)
         return False
-    _last_missing_soc_warning_ts = now
-    logger.warning(
-        "[Scheduler] Kein SoC bekannt - nehme 0% an (konservativ). "
-        "Bitte manuellen SoC in der UI eintragen!"
+    if _missing_soc_session_noted.get(wb):
+        return False
+    _missing_soc_session_noted[wb] = True
+    logger.info(
+        "[Scheduler] WB%d: Kein Fahrzeug-SoC bekannt – plane konservativ mit 0 %%.",
+        wb,
     )
     return True
 
@@ -521,7 +577,7 @@ def _remove_schedule_file(path, wb_id=None, reason=""):
         if reason:
             logger.info("[Scheduler] WB%s: %s", wb_id or "?", reason)
     except Exception as e:
-        logger.warning("[Scheduler] WB%s: Schedule konnte nicht geloescht werden: %s", wb_id or "?", e)
+        logger.warning("[Scheduler] WB%s: Schedule konnte nicht gelöscht werden: %s", wb_id or "?", e)
 
 
 def _clear_consumed_manual_plan(wb_id, reason=""):
@@ -533,7 +589,7 @@ def _clear_consumed_manual_plan(wb_id, reason=""):
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
-        logger.warning("[Scheduler] WB%s: Config fuer Plan-Reset nicht lesbar: %s", wb_id or "?", e)
+        logger.warning("[Scheduler] WB%s: Config für Plan-Reset nicht lesbar: %s", wb_id or "?", e)
         return False
     if not isinstance(data, dict):
         return False
@@ -604,9 +660,9 @@ def _write_schedule_file(path, slots, wb_id=None, combined=False):
     except PermissionError:
         # Datei kann von www-data angelegt sein. Solange das Schreiben gelang,
         # ist das kein Planungsfehler und soll nicht jede Runde den Log fuellen.
-        logger.debug("[Scheduler] chmod uebersprungen fuer %s", path)
+        logger.debug("[Scheduler] chmod übersprungen für %s", path)
     except Exception as e:
-        logger.debug("[Scheduler] chmod fuer %s nicht moeglich: %s", path, e)
+        logger.debug("[Scheduler] chmod für %s nicht möglich: %s", path, e)
     return True
 
 
@@ -617,6 +673,24 @@ def _schedule_has_current_or_future_slot(slots, current_ts):
         except Exception:
             continue
         if slot_ts + 900 > current_ts:
+            return True
+    return False
+
+
+def _schedule_belongs_to_window(slots, von_ts, bis_ts):
+    """True, wenn mindestens ein Slot im aktuellen Fenster [von_ts, bis_ts) liegt.
+
+    Bei täglicher Wiederholung entscheidet nicht die Uhrzeit, sondern die
+    Fensterinstanz: Solange ein verbrauchter Plan noch zum laufenden Fenster
+    gehört, bleibt er liegen (kein zweites Laden im selben Fenster). Erst wenn
+    das Fenster auf den nächsten Tag gerollt ist, wird neu geplant.
+    """
+    for slot in slots or []:
+        try:
+            slot_ts = int(slot.get("ts", 0))
+        except Exception:
+            continue
+        if von_ts <= slot_ts < bis_ts:
             return True
     return False
 
@@ -764,7 +838,7 @@ def generate_native_charging_schedule(config, wb_id=None):
         all_slots = sorted(all_slots, key=lambda x: (int(x.get("ts", 0)), int(x.get("wb_id", 1))))
         if not all_slots:
             if os.path.exists(combined_file):
-                _remove_schedule_file(combined_file, reason="Kein kombinierter Ladeplan aktiv - alten Schedule geloescht.")
+                _remove_schedule_file(combined_file, reason="Kein kombinierter Ladeplan aktiv - alten Schedule gelöscht.")
             return []
 
         try:
@@ -807,12 +881,21 @@ def generate_native_charging_schedule(config, wb_id=None):
         except Exception:
             return default
 
+    def _vehicle_value(name, default):
+        # Fahrzeugwert je Größe: nicht leerer wb{n}_*-Wert, sonst nicht leerer
+        # globaler car_*-Rückfall, sonst Standardwert. Leer gilt als fehlend;
+        # nichtleere ungültige Werte bleiben wie bisher ein Fehler.
+        for key in (f"wb{wb_id}_{name}", f"car_{name}"):
+            if key in config and str(config[key]).strip() != "":
+                return config[key]
+        return default
+
     wb_mode_raw = config.get(f"wb{wb_id}_mode", config.get("wb_mode", None))
     wb_mode_explicit = wb_mode_raw is not None and str(wb_mode_raw).strip() != ""
     wb_mode = _parse_int(wb_mode_raw, 0) if wb_mode_explicit else None
     if wb_mode_explicit and wb_mode == 0:
         if os.path.exists(schedule_file):
-            _remove_schedule_file(schedule_file, wb_id, "Wallbox-Modus aus - alten Schedule geloescht.")
+            _remove_schedule_file(schedule_file, wb_id, "Wallbox-Modus aus - alten Schedule gelöscht.")
         return []
 
     NATIVE_TYPES = {'openwb', 'openwb_pro', 'go-e', 'e3dc', 'e3dc_auto', 'e3dc_efy', 'e3dc_easy_connect', 'e3dc_multi', 'e3dc_multi_connect', 'e3dc_multi_connect_ii', 'dummy'}
@@ -821,12 +904,12 @@ def generate_native_charging_schedule(config, wb_id=None):
     # Zielplan entsteht nur, wenn die Smart-Zielplanung explizit aktiv ist.
     use_smart_soc       = smart_enable
     wb_car_id           = str(config.get(f"wb{wb_id}_car_id", "")).strip()
-    target_unit         = str(config.get(f"wb{wb_id}_target_unit", config.get("car_target_unit", "soc"))).strip().lower()
+    target_unit         = str(_vehicle_value("target_unit", "soc")).strip().lower()
     if target_unit not in ("soc", "kwh"):
         target_unit = "soc"
     no_vehicle_selected = wb_car_id in ("__none", "no_vehicle", "kein_fahrzeug")
     if use_smart_soc and no_vehicle_selected and target_unit != "kwh":
-        logger.info(f"[Scheduler] WB{wb_id}: Kein Fahrzeug ausgewaehlt - keine automatische SoC-Ladeplanung.")
+        logger.info(f"[Scheduler] WB{wb_id}: Kein Fahrzeug ausgewählt - keine automatische SoC-Ladeplanung.")
         use_smart_soc = False
 
     legacy_hours = config.get("wbhour", config.get("Wbhour", 0)) if wb_id == 1 else 0
@@ -839,7 +922,7 @@ def generate_native_charging_schedule(config, wb_id=None):
         if os.path.exists(schedule_file):
             try:
                 os.remove(schedule_file)
-                logger.info("[Scheduler] WB%d: Kein Ladeplan aktiv - alten Schedule geloescht.", wb_id)
+                logger.info("[Scheduler] WB%d: Kein Ladeplan aktiv - alten Schedule gelöscht.", wb_id)
             except Exception:
                 pass
         return []
@@ -856,14 +939,14 @@ def generate_native_charging_schedule(config, wb_id=None):
     # -----------------------------------------------------------------------
     if use_smart_soc:
         try:
-            target_soc = float(config.get(f"wb{wb_id}_target_soc", config.get("car_target_soc", 80)))
-            capacity   = float(config.get(f"wb{wb_id}_capacity",   config.get("car_capacity",   72.0)))
-            charge_kw  = float(config.get(f"wb{wb_id}_charge_power", config.get("car_charge_power", 11.0)))
+            target_soc = float(_vehicle_value("target_soc", 80))
+            capacity   = float(_vehicle_value("capacity", 72.0))
+            charge_kw  = float(_vehicle_value("charge_power", 11.0))
             if charge_kw <= 0:
                 charge_kw = 11.0
             if target_unit == "kwh":
                 target_kwh = max(0.0, _parse_float(
-                    config.get(f"wb{wb_id}_target_kwh", config.get("car_target_kwh", 0.0)),
+                    _vehicle_value("target_kwh", 0.0),
                     0.0,
                 ))
                 # Direct kWh planning intentionally does not need a vehicle SoC.
@@ -999,7 +1082,7 @@ def generate_native_charging_schedule(config, wb_id=None):
             # 4. Pessimistischer Fallback: 0% (laedt bis Ziel-SoC komplett durch)
             if current_soc is None:
                 current_soc = 0.0
-                _warn_missing_vehicle_soc()
+                _note_missing_vehicle_soc(wb_id, _wallbox_plug_state(wb_id))
 
             soc_delta  = max(0.0, target_soc - current_soc)
             needed_kwh = (soc_delta / 100.0) * capacity * 1.10   # +10% Ladeverlust
@@ -1103,6 +1186,22 @@ def generate_native_charging_schedule(config, wb_id=None):
     if wbhour >= 99:
         no_time_limit = True
 
+    # Tägliche Wiederholung: Ein manueller Stundenplan wird nach dem Fenster
+    # nicht auf 0 h zurückgesetzt, sondern für das nächste Fenster neu
+    # berechnet. Das gilt nur für ein festes Zeitfenster mit Startuhrzeit;
+    # "Jetzt", Sofortladen (99 h) und das 24h-Rollfenster kennen keine
+    # Fensterinstanz, die sich wiederholen könnte.
+    plan_repeat = str(config.get(f"wb{wb_id}_plan_repeat", "0")).strip().lower() in ("1", "true", "yes")
+    repeat_active = bool(
+        plan_repeat
+        and not use_smart_soc
+        and manual_wbhour_cfg > 0
+        and manual_wbhour_cfg < 99
+        and not wb_sofort_flag
+        and not start_now
+        and not no_time_limit
+    )
+
     # -----------------------------------------------------------------------
     # Tarif- und Eco-Daten laden.
     # epex_daten.json enthaelt den Rohmarktpreis. Fuer Octopus Heat/statische
@@ -1142,7 +1241,7 @@ def generate_native_charging_schedule(config, wb_id=None):
             if tariff_prices:
                 logger.debug("[Scheduler] %d Tarifpreise aus eco_score.json geladen.", len(tariff_prices))
             if eco_mode:
-                logger.debug("[Scheduler] Eco-Modus aktiv: %d Eco-Score Eintraege geladen.", len(eco_scores))
+                logger.debug("[Scheduler] Eco-Modus aktiv: %d Eco-Score Einträge geladen.", len(eco_scores))
         except Exception as e:
             logger.warning("[Scheduler] Eco-/Tarif-Datei nicht lesbar: %s", e)
 
@@ -1212,7 +1311,20 @@ def generate_native_charging_schedule(config, wb_id=None):
                 current_ts = int(now.timestamp())
                 if _schedule_has_current_or_future_slot(old_slots, current_ts):
                     return old_slots
-                if manual_wbhour_cfg > 0 or wb_sofort_flag:
+                if repeat_active and _schedule_belongs_to_window(old_slots, von_ts, bis_ts):
+                    # Der Plan dieses Fensters ist erledigt; bis zum nächsten
+                    # Fenster bleibt er als verbrauchter Beleg liegen, damit im
+                    # selben Fenster nicht erneut geladen wird.
+                    return old_slots
+                if repeat_active:
+                    _remove_schedule_file(
+                        schedule_file,
+                        wb_id,
+                        "Ladefenster %s-%s abgeschlossen - tägliche Wiederholung: "
+                        "Plan für das nächste Fenster wird neu berechnet." % (wbvon, wbbis),
+                    )
+                    old_slots_for_continuity = []
+                elif manual_wbhour_cfg > 0 or wb_sofort_flag:
                     _clear_consumed_manual_plan(
                         wb_id,
                         "alle geplanten Slots abgeschlossen - Plan verbraucht.",
@@ -1318,7 +1430,7 @@ def generate_native_charging_schedule(config, wb_id=None):
         price_limit = 0.0
     if price_limit > 0:
         logger.debug(
-            "[Scheduler] WB%d: Preislimit %.1f ct/kWh wirkt nur fuer Modus 5; geplante Ladefenster bleiben gueltig.",
+            "[Scheduler] WB%d: Preislimit %.1f ct/kWh wirkt nur für Modus 5; geplante Ladefenster bleiben gültig.",
             wb_id,
             price_limit,
         )
@@ -1397,7 +1509,7 @@ def generate_native_charging_schedule(config, wb_id=None):
     if running_preserved:
         logger.info(
             "[Scheduler] WB%d: Laufendes Ladefenster bleibt erhalten - "
-            "Plan-Aenderung ueberlappt den aktiven Slot.",
+            "Plan-Änderung überlappt den aktiven Slot.",
             wb_id,
         )
 

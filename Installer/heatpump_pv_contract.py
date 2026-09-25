@@ -56,6 +56,141 @@ def _clock(value, state):
     return wall, state.get("last_ts", wall) + mono - old_mono, current, False
 
 
+WW_WITHDRAWAL_SCOPE_SCHEMA = "heatpump_ww_release_withdrawal_scope_v1"
+
+
+def ww_release_withdrawal_scope_contract(
+    *,
+    independent_safety_stop=False,
+    timer_enabled=False,
+    timer_target_c=None,
+    live_ww_mode=None,
+    live_ww_setpoint=None,
+    status_valid=False,
+    tolerance_c=0.5,
+):
+    """Begrenzt eine Freigaberücknahme auf das eigene Angebot.
+
+    Die Rücknahme der positiven Wärmefreigabe hat den WW-Kanal bisher
+    unabhängig davon abgeschaltet, wem sein aktueller Auftrag gehört. Trug der
+    Kanal den Auftrag des normalen WW-Timers, stellte die Mismatch-Korrektur
+    ihn Sekunden später wieder her. Jeder dieser Schreibvorgänge mit Sollwert
+    löst am Gerät eine kurze Warmwasserbereitung aus.
+
+    Gehört der Kanal erkennbar dem normalen Timer, fasst die Rücknahme ihn
+    deshalb nicht an. Sie erzeugt damit keine neue Anforderung: Sie lässt
+    ausschließlich unverändert, was ohnehin schon gilt.
+
+    Eine unabhängige Safety- oder Herstellerschranke behält den harten
+    Nullausgang. Ohne gültige Statusevidenz bleibt es fail-closed ebenfalls
+    beim bisherigen Verhalten.
+    """
+
+    result = {
+        "contract": WW_WITHDRAWAL_SCOPE_SCHEMA,
+        "touch_ww": True,
+        "ww_mode": 0,
+        "reason": "release_owns_channel",
+        "timer_target_c": _number(timer_target_c, None),
+        "live_ww_mode": live_ww_mode,
+        "live_ww_setpoint": _number(live_ww_setpoint, None),
+    }
+    if bool(independent_safety_stop):
+        result["reason"] = "independent_safety_stop"
+        return result
+    if not bool(status_valid):
+        result["reason"] = "status_not_valid"
+        return result
+    if not bool(timer_enabled):
+        result["reason"] = "timer_disabled"
+        return result
+    target = _number(timer_target_c, None)
+    setpoint = _number(live_ww_setpoint, None)
+    if target is None or setpoint is None:
+        result["reason"] = "timer_target_or_setpoint_missing"
+        return result
+    try:
+        mode_value = int(live_ww_mode)
+    except (TypeError, ValueError):
+        result["reason"] = "live_mode_unreadable"
+        return result
+    if mode_value != 1:
+        result["reason"] = "channel_not_active"
+        return result
+    tolerance = _number(tolerance_c, 0.5)
+    if tolerance is None:
+        tolerance = 0.5
+    if abs(setpoint - target) > tolerance:
+        result["reason"] = "setpoint_not_timer_owned"
+        return result
+    result["touch_ww"] = False
+    result["ww_mode"] = None
+    result["reason"] = "normal_timer_owns_channel"
+    return result
+
+
+WW_CIRCULATION_BOOST_SCHEMA = "heatpump_ww_circulation_boost_v1"
+
+
+def ww_circulation_boost_contract(
+    *,
+    circ_boost_enabled=False,
+    legacy_force_ww=False,
+    pv_direct=False,
+    pv_output=None,
+):
+    """Entscheidet, ob eine Warmwasser-Boostphase die Zirkulation erzwingt.
+
+    Die Einstellung „Zirkulationspumpe während Boost-Phasen dauerhaft ein“
+    war bisher nur an den Legacy-Boostpfad (``force_ww``) gebunden. Die
+    PV-Wärmefreigabe läuft über den Vertragspfad und setzt den WW-Sollwert,
+    ohne ``force_ww`` zu setzen; die Pumpe folgte deshalb im Boost weiter dem
+    Takt-Timer, obwohl die Leitungen mit aufgewärmt werden sollen.
+
+    Der PV-Auftrag zählt jetzt ebenfalls als Boostphase: Der Vertrag muss den
+    WW-Kanal aktiv tragen und der Auftrag muss am Gerät starten oder noch
+    ausstehen. Eine angeforderte Rücknahme beendet die Phase nicht, solange
+    die Wärmepumpe den Auftrag noch zu Ende führt; erst der bestätigte
+    Abschluss, ein fremder Eigentümer des Kanals oder ein fehlender
+    Vertragspfad geben die Pumpe dem Timer zurück. Zirkulationsfenster,
+    Nutzerpause, Nutzer-Aus und Schreibtakt bleiben Sache des Aufrufers.
+    """
+
+    result = {
+        "contract": WW_CIRCULATION_BOOST_SCHEMA,
+        "force_on": False,
+        "source": "",
+        "reason": "circ_boost_disabled",
+    }
+    if not bool(circ_boost_enabled):
+        return result
+    if bool(legacy_force_ww):
+        result["force_on"] = True
+        result["source"] = "legacy_boost"
+        result["reason"] = "legacy_force_ww"
+        return result
+    if not bool(pv_direct):
+        result["reason"] = "no_pv_direct_path"
+        return result
+    output = _dict(pv_output)
+    channel = _dict((output.get("channels") or {}).get("ww"))
+    if not channel.get("active"):
+        result["reason"] = "pv_ww_channel_inactive"
+        return result
+    if output.get("competing_owner"):
+        result["reason"] = "competing_owner"
+        return result
+    if not (output.get("start") or output.get("command_outstanding")):
+        result["reason"] = "pv_command_not_outstanding"
+        return result
+    result["force_on"] = True
+    result["source"] = "pv_contract"
+    result["reason"] = (
+        "pv_ww_cycle_finishing" if output.get("withdraw") else "pv_ww_channel_held"
+    )
+    return result
+
+
 def heatpump_pv_config(cfg):
     """Alte absolute Zusage erhalten; Messwertbetrieb benötigt eine ausdrückliche Auswahl."""
     cfg = _dict(cfg)
@@ -90,6 +225,15 @@ def heatpump_pv_config(cfg):
         "start_wait_s": _number(cfg.get("wp_pv_start_wait_s"), 600.0),
         "handoff_timeout_s": _number(cfg.get("wp_pv_handoff_timeout_s"), 120.0),
         "command_timeout_s": 25.0,
+        # Sollwerthysterese der Anlage (HZ/WW): Die Wärmepumpe entscheidet den
+        # Verdichterstart selbst. E3DC-Control spiegelt nur ihre Schwellen, um
+        # Bedarf und Startreservierung vorherzusagen (Standard:
+        # Heizung 3,5 K, Warmwasser 8 K).
+        "hz_hysteresis_k": _number(cfg.get("wp_pv_hz_hysteresis_k"), 3.5),
+        "ww_hysteresis_k": _number(cfg.get("wp_pv_ww_hysteresis_k"), 8.0),
+        # Der Boost steht wie eine SG-Ready-Freigabe, bis die PV-Deckung
+        # so lange fehlt. Kurze Wolken entziehen den Sollwert nicht mehr.
+        "boost_release_s": max(30.0, _number(cfg.get("wp_pv_boost_release_s"), 300.0)),
         "freshness_s": 45.0,
         "window_s": 86400.0,
         "battery_limit_wh": _number(cfg.get("wp_pv_battery_limit_wh"), 0.0),
@@ -106,7 +250,8 @@ def heatpump_pv_config(cfg):
     for name in ("wp_pv_max_power_w", "wp_min_runtime_min", "wp_restart_block_min",
                  "wp_pv_reaction_s", "wp_pv_start_wait_s", "wp_pv_handoff_timeout_s",
                  "wp_pv_battery_limit_wh", "wp_pv_grid_limit_wh",
-                 "wp_pv_battery_max_w", "wp_pv_grid_max_w", "wp_pv_start_power_w"):
+                 "wp_pv_battery_max_w", "wp_pv_grid_max_w", "wp_pv_start_power_w",
+                 "wp_pv_hz_hysteresis_k", "wp_pv_ww_hysteresis_k", "wp_pv_boost_release_s"):
         if name in cfg and _number(cfg[name]) is None:
             result["valid"] = False
     result["reserve_duration_s"] = (
@@ -227,7 +372,23 @@ def validate_heatpump_pv_state(state):
         return {}
     if "withdrawal_reason" in result and not isinstance(result["withdrawal_reason"], str):
         return {}
+    for key in ("reservation_started_ts", "start_reservation_released_ts", "pv_unqualified_since_s"):
+        if key in result and result[key] is not None:
+            if _number(result[key]) is None:
+                return {}
+            result[key] = _number(result[key])
+    if "start_reservation_released" in result and type(result["start_reservation_released"]) is not bool:
+        return {}
+    if "handoff_required" in result and type(result["handoff_required"]) is not bool:
+        return {}
     return result
+
+
+def _clear_start_reservation_release(state):
+    """Startreservierung wieder scharf schalten (Verdichter läuft, Auftrag geschlossen, Sperre um)."""
+    state["start_reservation_released"] = False
+    state["start_reservation_released_ts"] = None
+    state["reservation_started_ts"] = None
 
 
 def _empty_state(now, maximum):
@@ -242,6 +403,8 @@ def _empty_state(now, maximum):
         "last_battery_w": 0.0, "last_grid_w": 0.0,
         "energy_window": [], "withdrawal_pending": False,
         "quarantine_remaining_s": 0.0,
+        "reservation_started_ts": None, "start_reservation_released": False,
+        "start_reservation_released_ts": None, "pv_unqualified_since_s": None,
     }
 
 
@@ -382,10 +545,12 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
     elif physical is False:
         if state["compressor_running"] is True:
             state["last_stop_s"] = now
-            if state["cycle_owned"]:
+            # Im Messwertbetrieb ist der Verdichterstopp kein Ende des
+            # Boosts. Der Sollwert bleibt stehen, die Anlage startet nach
+            # eigener Hysterese erneut; nur neue Startreservierungen warten die
+            # Wiedereinschaltsperre ab. Der Reservierungsbetrieb entzieht weiter.
+            if state["cycle_owned"] and not measured:
                 state["withdrawal_pending"] = True
-                if measured:
-                    state["withdrawal_reason"] = "compressor_stopped"
         state["running_since_s"] = None
     if physical is not None:
         state["compressor_running"] = physical
@@ -411,6 +576,7 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
                 "request_id": command["request_id"], "revision": command["revision"],
                 "issued_ts": issued,
             }
+        _clear_start_reservation_release(state)
     runtime = _number(cfg.get("min_runtime_s"), 1800.0)
     running_since = state["running_since_s"]
     remaining = max(0.0, running_since + runtime - now) if running_since is not None else 0.0
@@ -454,7 +620,8 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
     restart_remaining = max(0.0, state["last_stop_s"] + _number(cfg.get("restart_delay_s"), 1200.0) - now) if state["last_stop_s"] is not None else 0.0
     if restart_remaining > 0 and physical is not True:
         blockers.append("compressor_restart_delay")
-    if state["offered_ts"] is not None and not state["cycle_owned"]:
+    if (state["offered_ts"] is not None and not state["cycle_owned"]
+            and state.get("handoff_required", True) is not False):
         handoff_age = now - state["offered_ts"]
         handoff_timeout = _number(cfg.get("handoff_timeout_s"), 120.0)
         if handoff_age > handoff_timeout:
@@ -482,7 +649,15 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
     if measured:
         battery_cap = battery_cap if source_enabled["battery"] else 0.0
         grid_cap = grid_cap if source_enabled["grid"] else 0.0
-    reserve = _reserve_energy(capability_w, reserve_duration, battery_cap, battery_energy, grid_cap, grid_energy)
+    # Im Messwertbetrieb begrenzen Quellenleistung und Restenergie die
+    # verfügbare Hilfe. Sie erzeugen keine zusätzliche PV-Startschwelle.
+    reserve_battery_cap = min(battery_cap, battery_energy * 3600.0 / reaction_s) if measured else battery_cap
+    reserve_grid_cap = min(grid_cap, grid_energy * 3600.0 / reaction_s) if measured else grid_cap
+    reserve_power = min(capability_w, reserve_battery_cap + reserve_grid_cap) if measured else capability_w
+    reserve = _reserve_energy(reserve_power, reserve_duration,
+                              reserve_battery_cap, battery_energy, reserve_grid_cap, grid_energy)
+    if measured and reserve_power <= 0:
+        reserve = (0.0, 0.0)
     battery_response_wh = _number(source.get("battery_response_required_wh"), 0.0)
     battery_response_w = _number(source.get("battery_response_required_w"), 0.0)
     response_funded = bool(battery_cap >= battery_response_w and battery_energy >= battery_response_wh
@@ -490,7 +665,34 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
     if not response_funded and not state["cycle_owned"]:
         blockers.append("battery_response_reserve_unfunded")
     if reserve is None and not state["active_command"]:
-        blockers.append("reaction_energy_unfunded" if measured else "minimum_runtime_energy_unfunded")
+        blockers.append("minimum_runtime_energy_unfunded")
+    # Befristete Startreservierung: Der Sollwert
+    # steht für den Boost-Zeitraum, die Anlage startet nach eigener Hysterese.
+    # Bleibt der Verdichter über wp_pv_start_wait_s aus, geht die reservierte
+    # Startleistung an die nachrangigen Verbraucher; ab dem gemessenen Start
+    # bindet wieder die Istaufnahme. Ein nie ausgespielter Auftrag wird erst
+    # nach der Wiedereinschaltsperre erneut angeboten.
+    start_wait_s = _number(cfg.get("start_wait_s"), 600.0)
+    released = bool(state.get("start_reservation_released"))
+    if measured and released and physical is True:
+        _clear_start_reservation_release(state)
+        released = False
+    if measured and not released and physical is not True and not state.get("withdrawal_pending"):
+        anchors = [value for value in (state["issued_ts"], _number(state.get("reservation_started_ts")))
+                   if value is not None]
+        anchor = min(anchors) if anchors else None
+        if anchor is not None and now - anchor >= start_wait_s:
+            state["start_reservation_released"] = True
+            state["start_reservation_released_ts"] = now
+            state["battery_reserved_wh"] = state["grid_reserved_wh"] = 0.0
+            released = True
+    if measured and released and not state["cycle_owned"]:
+        released_ts = _number(state.get("start_reservation_released_ts"))
+        if released_ts is not None and now - released_ts >= _number(cfg.get("restart_delay_s"), 1200.0):
+            _clear_start_reservation_release(state)
+            released = False
+        else:
+            blockers.append("start_reservation_released")
     start_candidate = bool(not blockers and qualified and not state["cycle_owned"]
                            and clock_ok and not state.get("withdrawal_pending"))
     if start_candidate:
@@ -518,8 +720,9 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
             state["energy_guard_sources"] = sorted(set(state.get("energy_guard_sources", [])) | set(exhausted))
         # Nur der Wolkenrückzug darf durch erneut stabilen Überschuss entfallen.
         # Ein Kontingentende, Gerätestopp oder bereits ausgegebener Entzug bleibt bestehen.
-        terminal_reason = protection or ("start_wait_expired" if wait_expired else "")
-        terminal_reason = terminal_reason or ("command_unconfirmed" if command_expired else "")
+        # Eine abgelaufene Startwartefrist entzieht den Sollwert nicht mehr; sie
+        # gibt nur die Startreservierung frei (start_reservation_released).
+        terminal_reason = protection or ("command_unconfirmed" if command_expired else "")
         terminal_reason = terminal_reason or ("request_withdrawn" if not requested else "")
         if state.get("energy_guard_pending"):
             terminal_reason = terminal_reason or "energy_guard_exhausted"
@@ -527,12 +730,20 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
             state["withdrawal_pending"] = True
             state["withdrawal_reason"] = terminal_reason
         elif state["active_command"] and not qualified and not state["withdrawal_pending"]:
-            state["withdrawal_pending"] = True
-            state["withdrawal_reason"] = "pv_unqualified"
+            # Wolkenüberbrückung – erst nach boost_release_s ohne
+            # PV-Deckung wird der Sollwert zurückgenommen.
+            unqualified_since = _number(state.get("pv_unqualified_since_s"))
+            if unqualified_since is None:
+                state["pv_unqualified_since_s"] = now
+            elif now - unqualified_since >= _number(cfg.get("boost_release_s"), 300.0):
+                state["withdrawal_pending"] = True
+                state["withdrawal_reason"] = "pv_unqualified"
         elif (state["active_command"] and qualified and not command.get("withdrawal_requested")
               and state.get("withdrawal_reason") == "pv_unqualified"):
             state["withdrawal_pending"] = False
             state["withdrawal_reason"] = ""
+        if qualified or not state["active_command"]:
+            state["pv_unqualified_since_s"] = None
     else:
         if wait_expired or command_expired or not requested or protection:
             state["withdrawal_pending"] = bool(state["active_command"])
@@ -565,35 +776,37 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
             and not state.get("uncertain_state")):
         # Der kurze Antwortpuffer ist eine laufende Quellenbindung. Verbrauch
         # bleibt im 24-h-Konto; dieselbe belegte Reservehöhe ist kein neuer Topf.
+        rolling_power = min(capability_w, battery_cap + grid_cap)
         rolling_reserve = _reserve_energy(
-            capability_w, reaction_s, battery_cap, battery_energy, grid_cap, grid_energy,
+            rolling_power, reaction_s,
+            battery_cap, battery_energy, grid_cap, grid_energy,
         )
+        if rolling_power <= 0:
+            rolling_reserve = (0.0, 0.0)
         if rolling_reserve is not None:
             state["battery_reserved_wh"], state["grid_reserved_wh"] = rolling_reserve
         else:
             state["battery_reserved_wh"] = min(state["battery_reserved_wh"], battery_energy)
             state["grid_reserved_wh"] = min(state["grid_reserved_wh"], grid_energy)
-    # Bei gesicherter Überbrückung darf die WB den nicht angenommenen PV-Rest
-    # nutzen. Ohne Rampenbeleg decken Reserve und Quellen den ganzen Leistungssprung.
+    # Im Messwertbetrieb folgt das Budget der Istaufnahme. Der Start wird
+    # separat durch die qualifizierte PV-Startleistung gedeckt. Ein Profilwert
+    # ist keine zusätzliche dauerhafte PV-Reservierung für einen möglichen Sprung.
     actual = observed_w if observed_w is not None else max(maximum, state["max_power_w"])
     battery_reaction_w = min(battery_cap, _number(source.get("battery_reaction_available_w"), 0.0))
-    reaction_reserve = max(0.0, max(maximum, state["max_power_w"]) - actual - battery_reaction_w - grid_cap)
-    startup_shared_reserve = max(0.0, capability_w - battery_reaction_w - grid_cap) if measured else 0.0
+    reaction_reserve = 0.0 if measured else max(0.0, max(maximum, state["max_power_w"]) - actual - battery_reaction_w - grid_cap)
+    startup_shared_reserve = start_power if measured else 0.0
     if state["cycle_owned"]:
         request_w = actual + reaction_reserve
-        if physical is not True and command.get("confirmed") is not True:
+        if physical is not True and command.get("confirmed") is not True and not (measured and released):
             request_w = max(request_w, start_power if measured else maximum)
         if (measured and state["active_command"] and not state["signal_withdrawn"]
-                and not wait_expired and state.get("withdrawal_reason") != "compressor_stopped"
+                and not wait_expired and not released
+                and state.get("withdrawal_reason") != "compressor_stopped"
                 and (physical is not True or actual <= 0)):
             # Ein bestätigter Sollwert ist noch kein gemessener Verdichterstart.
             request_w = max(request_w, start_power)
     else:
         request_w = (start_power if measured else maximum) if start_candidate else (actual if physical is True else 0.0)
-        if measured and start_candidate:
-            # Ein Startwert belegt noch keine schnelle Quellenantwort. Auch vor
-            # dem ersten Messwert muss der ungedeckte Leistungssprung Platz haben.
-            request_w = max(request_w, startup_shared_reserve)
     if protection:
         request_w = actual if observed_w is not None else max(maximum, state["max_power_w"])
     # Die Energiequellen gleichen nur den WP-Anteil aus, niemals allgemeine Last.
@@ -612,6 +825,7 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
     reason = protection or ("protected_minimum_runtime" if hold_required else
              "withdrawal_required" if withdrawal_required else
              "running" if physical is True and state["active_command"] else
+             "start_reservation_released" if measured and released and state["active_command"] else
              "waiting_for_compressor" if state["active_command"] else
              "start_candidate" if start_candidate else (blockers[0] if blockers else "idle"))
     return {
@@ -646,19 +860,25 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
         "battery_response_required_w": battery_response_w,
         "quarantine_remaining_s": state.get("quarantine_remaining_s", 0.0),
         "window_battery_used_wh": window_battery, "window_grid_used_wh": window_grid,
-        "energy_reservation_required_wh": capability_w * reserve_duration / 3600.0,
+        "energy_reservation_power_w": reserve_power,
+        "energy_reservation_required_wh": reserve_power * reserve_duration / 3600.0,
         "measurement_uncertain": gap or not data_fresh or not source_fresh,
         "reaction_reserve_w": reaction_reserve, "max_power_w": maximum,
         "startup_shared_reserve_w": startup_shared_reserve,
         "handoff_timeout_s": _number(cfg.get("handoff_timeout_s"), 120.0),
         "command_timeout_s": _number(cfg.get("command_timeout_s"), 25.0),
+        "start_reservation_released": bool(measured and released),
+        "reservation_started_ts": state.get("reservation_started_ts"),
+        "pv_unqualified_since_s": state.get("pv_unqualified_since_s"),
+        "boost_release_s": _number(cfg.get("boost_release_s"), 300.0),
     }
 
 
 def bind_heatpump_pv_grant(request_contract, *, allocated_w, shared_funded_w,
                            battery_funded_w=0, grid_funded_w=0,
                            wallbox_actual_w=0, wallbox_target_w=0,
-                           phase_transition_active=False, clock_sample):
+                           phase_transition_active=False, clock_sample,
+                           handoff_required=True):
     """Nach der Verteilung: Quelle und tatsächliche WB-Absenkung vor Ausgang binden."""
     result = copy.deepcopy(_dict(request_contract))
     state = validate_heatpump_pv_state(result.get("state"))
@@ -670,14 +890,24 @@ def bind_heatpump_pv_grant(request_contract, *, allocated_w, shared_funded_w,
     required = _number(result.get("request_w"), 0.0)
     funded = allocation >= required and shared + battery + grid >= required
     if result.get("control_mode") == "measured" and result.get("start_candidate"):
-        # Langsam nachgeführte Akkuentladung ist keine zweite Deckung desselben
-        # schnellen Sprungs; dessen verbleibender Anteil braucht gebundene PV.
+        # Ein PV-Start braucht die gesamte Startleistung aus dem zugeteilten
+        # Überschuss. Überbrückung darf fehlende PV-Startleistung nicht ersetzen.
         funded = funded and shared >= _number(result.get("startup_shared_reserve_w"), 0.0)
-    waiting = _number(wallbox_actual_w, math.inf) > _number(wallbox_target_w, 0.0) + 100.0
+    # Bei Wärmepumpen-Vorrang ist die Wallbox-Absenkung keine Vorbedingung des
+    # Sollwerts: Die Reservierung senkt das Wallbox-Ziel, die Wallbox regelt parallel
+    # nach, die Anlage startet nach eigener Hysterese.
+    handoff_required = bool(handoff_required)
+    waiting = bool(handoff_required
+                   and _number(wallbox_actual_w, math.inf) > _number(wallbox_target_w, 0.0) + 100.0)
     transition = phase_transition_active is True
-    if state and result.get("start_candidate") and funded and state.get("offered_ts") is None:
-        state["offered_ts"] = now
-    handoff_expired = bool(state and state.get("offered_ts") is not None
+    if state:
+        state["handoff_required"] = handoff_required
+    if state and result.get("start_candidate") and funded:
+        if state.get("offered_ts") is None:
+            state["offered_ts"] = now
+        if _number(state.get("reservation_started_ts")) is None:
+            state["reservation_started_ts"] = now
+    handoff_expired = bool(handoff_required and state and state.get("offered_ts") is not None
                            and now - state["offered_ts"] > result.get("handoff_timeout_s", 120.0))
     command_deadline = (state["issued_ts"] + result.get("command_timeout_s", 25.0)) if state and state.get("issued_ts") is not None else None
     fresh = _fresh(result, wall, 45.0)
@@ -692,6 +922,7 @@ def bind_heatpump_pv_grant(request_contract, *, allocated_w, shared_funded_w,
         "allocated_w": allocation, "shared_funded_w": shared,
         "battery_funded_w": battery, "grid_funded_w": grid,
         "waiting_for_wallbox_reduction": waiting,
+        "handoff_required": handoff_required,
         "phase_transition_active": transition,
         "handoff_expired": handoff_expired, "command_deadline_s": command_deadline,
     })

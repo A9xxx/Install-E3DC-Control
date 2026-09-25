@@ -78,8 +78,17 @@ def resolve_mode_policy(
     wb_soc_hyst_pct: float,
     curve_wb_relief_active: bool,
     hysteresis_gate: Callable[[str, float, float, float, bool], bool],
+    storage_budget_authoritative: bool = False,
 ) -> Dict[str, Any]:
     """Resolve the shared policy profile for one controller mode.
+
+    ``storage_budget_authoritative``: Der Storage Manager hat die Speicherkurve
+    bereits in der Wallbox-Zuteilung berücksichtigt (gültiger, frischer
+    Consumer-Vertrag). Dann skaliert die Kurven-Fuzzy das Zusatzbudget nicht
+    ein zweites Mal und das Kurven-Gate schließt nicht separat; die
+    Zuteilung selbst trägt Vorrang und Stopp. Die Legacy-Entlastung
+    ``curve_wb_relief`` (mit Akku-Entladung) bleibt davon getrennt
+    (Beispiel: Fuzzy-Faktor unter 1 trotz ausreichender Zuteilung und Export).
 
     ``hysteresis_gate`` is supplied by the runtime state object so this helper
     stays free of global state while preserving the existing hysteresis memory.
@@ -155,6 +164,16 @@ def resolve_mode_policy(
 
     if curve_wb_relief_active:
         fz = max(fz, 1.0)
+    authoritative_applied = False
+    if (
+        bool(storage_budget_authoritative)
+        and mode in (1, 2, 3, 5, 6)
+        and mode != MODE_OFF
+        and (fz < 1.0 or not gate_open)
+    ):
+        fz = 1.0
+        gate_open = True
+        authoritative_applied = True
 
     return {
         "params": params,
@@ -165,6 +184,8 @@ def resolve_mode_policy(
         "fz": float(fz),
         "wbmin_mode4_gate_open": bool(wbmin_mode4_gate_open),
         "gate_open": bool(gate_open),
+        "storage_budget_authoritative": bool(storage_budget_authoritative),
+        "storage_budget_authoritative_applied": bool(authoritative_applied),
     }
 
 

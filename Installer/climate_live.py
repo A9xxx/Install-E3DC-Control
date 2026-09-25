@@ -20,7 +20,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,9 @@ HISTORY_FLUSH_INTERVAL_S = 5 * 60
 HISTORY_RETRY_BASE_S = 5
 HISTORY_RETRY_MAX_S = 5 * 60
 HISTORY_BUFFER_MAX_AGE_S = 24 * 60 * 60
+# Tagesdateien älter als diese Aufbewahrung werden nach einem erfolgreichen
+# Schreibvorgang entfernt. Die ML-Prognose liest höchstens 45 Tagesdateien.
+HISTORY_RETENTION_DAYS = 90
 # 24 h bei der kleinsten erlaubten 15-s-Abtastung ergeben 5.761 Sätze.
 HISTORY_BUFFER_MAX_ROWS = 6_000
 
@@ -344,7 +347,7 @@ def parse_shelly_pro3em_status(payload: dict[str, Any], cfg: dict[str, Any] | No
         emdata = {}
 
     if not em:
-        raise ValueError("Shelly.GetStatus enthaelt keinen em:0 Block")
+        raise ValueError("Shelly.GetStatus enthält keinen em:0 Block")
 
     phase = normalize_phase(cfg_text(cfg, "climate_meter_phase", "c"))
     if phase not in {"a", "b", "c", "total"}:
@@ -492,7 +495,7 @@ def parse_shelly_em_mini_gen4_status(payload: dict[str, Any], cfg: dict[str, Any
     payload = unwrap_shelly_status_payload(payload)
     em = payload.get("em1:0")
     if not isinstance(em, dict) or not em:
-        raise ValueError("Shelly.GetStatus enthaelt keinen em1:0 Block")
+        raise ValueError("Shelly.GetStatus enthält keinen em1:0 Block")
     emdata = payload.get("em1data:0")
     if not isinstance(emdata, dict):
         emdata = {}
@@ -526,7 +529,7 @@ def parse_shelly_pm_mini_status(payload: dict[str, Any], cfg: dict[str, Any] | N
     payload = unwrap_shelly_status_payload(payload)
     pm = payload.get("pm1:0")
     if not isinstance(pm, dict) or not pm:
-        raise ValueError("Shelly.GetStatus enthaelt keinen pm1:0 Block")
+        raise ValueError("Shelly.GetStatus enthält keinen pm1:0 Block")
     aenergy = pm.get("aenergy") if isinstance(pm.get("aenergy"), dict) else {}
     energy_wh = _safe_float_or_none(aenergy.get("total"))
     return _build_meter_status(
@@ -559,7 +562,7 @@ def parse_shelly_status(payload: dict[str, Any], cfg: dict[str, Any] | None = No
         return parse_shelly_pm_mini_status(payload, cfg, now_ts=now_ts)
     if meter_type == "shelly_em_gen1" or (meter_type == "auto" and isinstance(payload.get("emeters"), list)):
         return parse_shelly_em_gen1_status(payload, cfg, now_ts=now_ts)
-    raise ValueError(f"Nicht unterstuetzter Zaehler-Typ: {meter_type}")
+    raise ValueError(f"Nicht unterstützter Zähler-Typ: {meter_type}")
 
 
 def _has_supported_rpc_meter(payload: dict[str, Any]) -> bool:
@@ -1109,7 +1112,71 @@ def flush_history_buffer(
     if not isinstance(pending, list) or not pending:
         runtime_state.pop("history_pending", None)
     _clear_history_retry(runtime_state)
+    if wrote:
+        _maybe_prune_history(target_dir, list(groups))
     return wrote
+
+
+def prune_history_files(
+    history_dir: Path,
+    *,
+    reference_day: date,
+    retention_days: int = HISTORY_RETENTION_DAYS,
+) -> list[str]:
+    """Entfernt Tagesdateien, die älter als die Aufbewahrung sind.
+
+    Bezugspunkt ist der zuletzt geschriebene Tag, nicht die Wanduhr; so bleibt
+    das Ergebnis reproduzierbar. Es werden nur reguläre Dateien mit dem
+    Tagesnamen ``JJJJ-MM-TT.jsonl`` angefasst; fremde Namen und Verknüpfungen
+    bleiben unberührt. Fehler beim Löschen werden übersprungen.
+    """
+
+    removed: list[str] = []
+    cutoff = reference_day - timedelta(days=max(1, int(retention_days)))
+    try:
+        entries = sorted(os.scandir(history_dir), key=lambda entry: entry.name)
+    except OSError:
+        return removed
+    for entry in entries:
+        name = entry.name
+        if len(name) != 16 or not name.endswith(".jsonl"):
+            continue
+        try:
+            day = date.fromisoformat(name[:10])
+        except ValueError:
+            continue
+        if day >= cutoff:
+            continue
+        try:
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            os.unlink(entry.path)
+        except OSError:
+            continue
+        removed.append(name)
+    return removed
+
+
+# Je Historienordner der zuletzt bereinigte Kalendertag; bewusst kein Teil des
+# Laufzeitzustands, dessen Reset-Vertrag ein leeres Dict ist.
+_last_history_prune_day: dict[str, str] = {}
+
+
+def _maybe_prune_history(history_dir: Path, written_days: list[str]) -> list[str]:
+    """Bereinigt höchstens einmal je geschriebenem Kalendertag."""
+
+    if not written_days:
+        return []
+    newest = max(written_days)
+    key = str(history_dir)
+    if _last_history_prune_day.get(key) == newest:
+        return []
+    _last_history_prune_day[key] = newest
+    try:
+        reference_day = date.fromisoformat(newest)
+    except ValueError:
+        return []
+    return prune_history_files(history_dir, reference_day=reference_day)
 
 
 def append_history(
@@ -1215,7 +1282,7 @@ def collect_status(cfg: dict[str, Any]) -> dict[str, Any]:
         return error_status(cfg, "climate_meter_ip fehlt")
     meter_type = normalize_meter_type(cfg_text(cfg, "climate_meter_type", "shelly_pro3em"))
     if meter_type not in {"auto", "shelly_pro3em", "shelly_em_gen1", "shelly_em_mini_gen4", "shelly_pm_mini"}:
-        return error_status(cfg, f"Nicht unterstuetzter Zaehler-Typ: {meter_type}")
+        return error_status(cfg, f"Nicht unterstützter Zähler-Typ: {meter_type}")
 
     if meter_type == "shelly_em_gen1":
         payload = read_shelly_em_gen1(ip)
@@ -1266,7 +1333,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Read-only Klimaanlagen-Verbrauch per lokalem Shelly-Zähler lesen.")
     parser.add_argument("--once", action="store_true", help="Nur einen Zyklus ausführen.")
     parser.add_argument("--config", default=str(CONFIG_FILE), help="Pfad zur e3dc_v4.json.")
-    parser.add_argument("--output", default=str(RAMDISK_FILE), help="Zielpfad fuer climate_load.json.")
+    parser.add_argument("--output", default=str(RAMDISK_FILE), help="Zielpfad für climate_load.json.")
     parser.add_argument("--print", action="store_true", dest="print_status", help="Status auf stdout ausgeben.")
     args = parser.parse_args(argv)
 

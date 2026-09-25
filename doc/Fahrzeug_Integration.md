@@ -64,7 +64,8 @@ unveränderte Übernahme in eine neue Sitzung. Liefert die openWB Pro einen
 frischen, bestätigten Geräte-SoC, verwendet die Wallboxregelung diesen direkt
 und baut keinen zusätzlichen Cloud-Schätzanker auf.
 
-Bei aktiv geregelter openWB Pro und eingerichteter Bluelink-Zuordnung kann
+Bei aktiv geregelter openWB Pro, hinterlegten Bluelink-Zugangsdaten (Benutzer
+und Passwort) und eingerichteter Bluelink-Zuordnung kann
 ein fehlender brauchbarer SoC beim Anstecken einen automatischen Abruf für
 genau das zugeordnete Cloudfahrzeug auslösen. Pro Stecksession wird höchstens
 ein Auftrag gestellt; schnelle erneute Steckvorgänge respektieren zusätzlich
@@ -76,21 +77,31 @@ und verändert weder Ladefreigabe noch Phasen- oder Stromregelung.
 ---
 
 ## Weg 1: Der autarke Bluelink-Client (Hyundai & Kia)
-Wenn du ein Fahrzeug von Hyundai oder Kia besitzt, bietet der Installer einen eigenen, autarken Client, der den SoC direkt von den Herstellerservern abruft.
+Wenn du ein Fahrzeug von Hyundai oder Kia besitzt, bietet das System einen eigenen, autarken Client, der den SoC direkt von den Herstellerservern abruft. Die Anmeldung erfolgt mit den Zugangsdaten des Hyundai-/Kia-Kontos (Hyundai Bluelink bzw. Kia Connect); ein separat erzeugter Token ist nicht mehr nötig.
 
-**Einrichtung (Token erstellen):**
-Hyundai und Kia nutzen ein hCaptcha, weshalb der Login über ein Skript am Computer erfolgen muss.
-1. Lade dir das empfohlene Python-Hilfsskript auf deinen Windows/Mac-PC herunter: Anleitung im EVCC Wiki
-2. Führe das Skript aus und logge dich im sich öffnenden Chrome-Fenster mit deinen Bluelink-Daten ein.
-3. Kopiere den im Terminal generierten, sehr langen `refresh_token`.
-4. Führe den Menüpunkt **107 (Hyundai/Kia SoC-Abfrage einrichten)** im E3DC-Installer aus.
-5. Füge dort deinen Token ein.
+**Einrichtung (Zugangsdaten hinterlegen):**
+1. Installiere den Dienst über den Installer-Menüpunkt **43 (Hyundai/Kia SoC-Abfrage (Bluelink))**; er richtet die Python-Abhängigkeit und den Dienst `e3dc-bluelink` ein. Im Installer werden keine Zugangsdaten abgefragt.
+2. Öffne im Web-Dashboard den **Config-Editor**, Gruppe **Fahrzeug Integration (Bluelink)**, und trage ein:
+   * `bluelink_user`: die E-Mail-Adresse deines Hyundai-/Kia-Kontos,
+   * `bluelink_password`: das Passwort des Kontos (Passwortfeld, wird lokal gespeichert),
+   * `bluelink_pin`: die PIN des Kontos – optional, nur Ziffern, nur wenn das Konto eine PIN verlangt,
+   * `bluelink_brand`: `hyundai` oder `kia`.
+3. Speichern. Der Dienst meldet sich beim nächsten Abruf an; die Anmeldung wird im Prozess gehalten und nur bei Ablauf erneuert, nicht bei jedem Intervall neu ausgeführt. Benutzer und Passwort sind beide erforderlich: Fehlt eines davon, meldet sich der Dienst nicht an und ruft keinen SoC ab; die Schaltfläche „Fahrzeug aufwecken“ wird nicht angeboten, und beim Anstecken an einer openWB Pro wird kein automatischer Abruf beauftragt. Unter Docker startet der Container den Dienst erst, wenn beide Angaben gesetzt sind; nach dem Speichern den Container einmal neu starten.
 
-**Konfiguration im Web-Dashboard:**
-Im Config-Editor unter der neuen Gruppe **Fahrzeug Integration (Bluelink)** kannst du nun jederzeit:
-* Den `refresh_token` erneuern.
-* Die `bluelink_vin` (Fahrgestellnummer) eintragen, falls du mehrere Autos hast.
-* Die `bluelink_interval` (Refresh-Rate in Minuten) anpassen. Wir empfehlen **15 bis 30 Minuten**, um die 12V-Batterie des Autos nicht unnötig durch ständiges Aufwecken zu entladen.
+Alternativ findest du dieselben Felder auf der Seite **Wallbox** in der Karte **Fahrzeug Cloud-Integration**.
+
+**Weitere Einstellungen:**
+* `bluelink_vin` (Fahrgestellnummer): eintragen, wenn mehrere Fahrzeuge im Konto sind, damit das richtige Fahrzeug verwendet wird.
+* `bluelink_interval` (Abfrage-Intervall in Minuten): Wir empfehlen **15 bis 30 Minuten**, um die 12V-Batterie des Autos nicht unnötig durch ständiges Aufwecken zu entladen und die Abfragelimits des Herstellers einzuhalten.
+* `bluelink_car_name`: Anzeigename im Dashboard.
+
+**Wenn die Anmeldung fehlschlägt:**
+* Meldung `Authentication failed` bzw. `Hyundai/Kia-Anmeldung wurde abgewiesen`: Zugangsdaten prüfen (E-Mail, Passwort, Marke) und testweise in der Hersteller-App anmelden.
+* Meldung zu Einmalcode/OTP: Das Konto verwendet die Zwei-Faktor-Anmeldung. Diese wird vom Client **nicht unterstützt**; deaktiviere sie für das Konto oder verwende ein Konto ohne Zwei-Faktor-Anmeldung.
+* Meldung zu einer erforderlichen Bestätigung: Einmal in der Hersteller-App oder auf der Hersteller-Website anmelden und die Nutzungsbedingungen bestätigen.
+* Details stehen im Dienstprotokoll (`sudo journalctl -u e3dc-bluelink -n 50`) und in der Diagnose des Dashboards; Passwörter und PIN erscheinen dort nicht.
+
+**Datenschutz:** Die Zugangsdaten werden nur lokal in der zugriffsgeschützten Konfiguration gespeichert, ausschließlich für die Anmeldung beim Hersteller verwendet und in Diagnosepaketen, Logs sowie Cluster-/Shadow-Übertragungen redigiert. Ein früher hinterlegter Refresh-Token wird bei der Konfigurationsbereinigung entfernt.
 
 ---
 
@@ -111,7 +122,7 @@ Wenn du EVCC bereits nutzt, kann dieses System den Auto-SoC an E3DC-Control send
 4. Trage bei `mqtt_hub_sub_soc_topic` das korrekte Topic deines Autos ein.
    *(Beispiel: `evcc/vehicles/db:4/soc` oder `evcc/loadpoints/1/vehicleSoc`)*
 
-Wichtig: `evcc/loadpoints/1/chargePower` ist die Ladeleistung der Wallbox und gehoert in den Bereich **Wallbox-Leistung per MQTT** (`wb_topic`), nicht in das SoC-Feld.
+Wichtig: `evcc/loadpoints/1/chargePower` ist die Ladeleistung der Wallbox und gehört in den Bereich **Wallbox-Leistung per MQTT** (`wb_topic`), nicht in das SoC-Feld.
 
 ---
 

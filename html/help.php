@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.4.6d Stable</span>
+            <span class="badge bg-success text-light">v5.5.0 Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,9 +134,15 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.4.6d</code> in <code>.env</code> gesetzt.</p>
-                <p>Vor dem Imagewechsel den tatsächlich verwendeten Host-Updater aktualisieren, einschließlich einer gegebenenfalls direkt im Compose-Ordner vorhandenen Kopie. Das Containerimage ersetzt diese Hostdatei nicht. Vollständige Docker-Sicherungen erfolgen auf dem Host bei gestopptem Container mit erhaltenen numerischen Eigentümern und Dateirechten. Das allgemeine Vollbackup-Menü im Container unterstützt die getrennten privaten Laufzeitdaten nicht.</p>
-                <p>Container-Neuerstellungen bei beendeter Fahrzeugladung und ohne laufenden Phasenwechsel durchführen. Private Wallbox-Steuerzustände überleben einen Neustart desselben Containers, aber keine Neuerstellung. Ein Rückfall auf ältere Root-Images benötigt den aktuellen Host-Updater. Aus Bridge zuerst dieselbe aktuelle Runtime-Version im Hostprofil neu aufbauen und den gesunden Start prüfen; erst danach den regulären Root-Rückfall ausführen. Einzelheiten stehen in der Docker-Dokumentation.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.5.0</code> in <code>.env</code> gesetzt.</p>
+                <p><strong>Update-Knopf und Auto-Update:</strong> Der Container tauscht sein Image nicht selbst. Läuft das Compose-Profil <code>auto-update</code> (Watchtower-Fork <code>ghcr.io/nicholas-fedor/watchtower</code>), gibt der Knopf <strong>System Update</strong> Watchtower über dessen lokale HTTP-API das Signal: Watchtower lädt das Image, erstellt den Container neu, und die Oberfläche lädt nach dem Start neu. Mit <strong>Auto-Update</strong> im Config-Editor passiert dasselbe täglich zur eingestellten Uhrzeit; Watchtower selbst pollt nicht. Gibt es kein neues Image, passiert nichts.</p>
+                <p>Einmalige Freischaltung auf dem Docker-Host im Compose-Ordner (Token für beide Dienste in <code>.env</code>, Container mit Token neu erstellen, Watchtower starten):</p>
+                <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
+printf 'E3DC_WATCHTOWER_API_TOKEN=%s\n' "$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> .env
+sudo docker compose up -d
+sudo docker compose --profile auto-update up -d watchtower</pre>
+                <p>Ohne Watchtower aktualisierst Du auf dem Host mit <code>sudo docker compose pull &amp;&amp; sudo docker compose up -d</code>. Der Host-Helfer <code>Installer/docker_compose_update.py</code> bleibt der geprüfte Weg mit automatischem Rückfall und ist Pflicht für 5.3.2b-Altbestände sowie für den Rückfall von einem Runtime-Image auf ein älteres Root-Image. Wechsel auf eine bestimmte Runtime-Version, etwa der Rückfall auf 5.4.6d: <code>E3DC_IMAGE_TAG=v5.4.6d</code> in <code>.env</code> setzen und <code>sudo docker compose up -d</code>; Watchtower respektiert diesen Pin.</p>
+                <p><strong>Host-Helfer:</strong> Einen laufenden Watchtower vorher mit <code>sudo docker compose --profile auto-update stop watchtower</code> stoppen und den tatsächlich verwendeten Helfer aus dem aktuellen Release nutzen, einschließlich einer gegebenenfalls direkt im Compose-Ordner vorhandenen Kopie:</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
 if [ -f ./docker_compose_update.py ]; then
   E3DC_DOCKER_HELPER=./docker_compose_update.py
@@ -149,9 +155,9 @@ fi
 sudo python3 "$E3DC_DOCKER_HELPER" --compose-dir . --sudo
 sudo docker compose logs --tail=80 e3dc-control</pre>
                 <p>Der Host-Helfer prüft vor dem Pull mindestens 2 GiB freien Platz im DockerRootDir, zieht das gewählte GHCR-Image ausdrücklich und bindet seine SHA-256-ID sowie OCI-Version vor dem Start. Danach verlangt er den imagegebundenen Healthcheck und zwei identische Laufzeit-Snapshots. Scheitert Start, Warten, Snapshot oder Versionsabgleich, stoppt er den Kandidaten, stellt den belegten Ausgangsstand wieder her und bestätigt dessen Rückstart. Volumes werden nicht automatisch gelöscht.</p>
-                <p>Der nicht mehr gepflegte Watchtower ist wegen seines weitreichenden Docker-Socket-Zugriffs kein Standardstart. Für den bewussten Opt-in muss in <code>.env</code> zusätzlich <code>E3DC_WATCHTOWER_ENABLE=true</code> gesetzt und danach das Profil <code>auto-update</code> gestartet werden. Ohne das Label-Opt-in bleibt auch ein versehentlich gestarteter Watchtower wirkungslos.</p>
+                <p>Container-Neuerstellungen bei beendeter Fahrzeugladung und ohne laufenden Phasenwechsel durchführen. Private Wallbox-Steuerzustände überleben einen Neustart desselben Containers, aber keine Neuerstellung. Vollständige Docker-Sicherungen erfolgen auf dem Host bei gestopptem Container mit erhaltenen numerischen Eigentümern und Dateirechten; das allgemeine Vollbackup-Menü im Container unterstützt die getrennten privaten Laufzeitdaten nicht. Aus Bridge zuerst dieselbe aktuelle Runtime-Version im Hostprofil neu aufbauen und den gesunden Start prüfen; erst danach den regulären Root-Rückfall ausführen. Einzelheiten stehen in der Docker-Dokumentation.</p>
                 <p><strong>HA-Abgrenzung:</strong> Docker ist nur mit exakt <code>ha_mode=off</code> freigegeben. HA-Master/-Slave und Shadow bleiben Bare-Metal-Betriebsarten. Der Container projiziert den persistenten Instanzrollenanker create-once auf <code>off</code> und stoppt vor jedem Hardware-Writer, wenn Konfiguration und Anker nicht exakt passen. Beim ersten Wechsel einer nativen Installation verhindert ausschließlich der Installer-Menüpunkt <strong>31</strong> die Doppelsteuerung durch kontrolliertes Stoppen und Deaktivieren aller Host-Dienste. Zusätzlich werden manuelle Hardware-Writer und Legacy-Screens über zwei stabile <code>/proc</code>-Snapshots erkannt und blockieren die Migration; der Installer beendet sie nicht. Ein vorhandener E3DC-Container, eine vorhandene Compose-Datei oder bereits verwaltete E3DC-Docker-Daten stoppen diesen Migrationsweg vor der ersten Änderung; bestehende Docker-Installationen nutzen den Compose-Updateweg.</p>
-                <p>Der Docker-Rückfall erfolgt ausschließlich auf ein in der Update-Policy mit <code>docker_supported</code> freigegebenes Image. <code>v5.3.2b</code> ist nicht als Bare-Metal-Programm-Rückfall freigegeben.</p>
+                <p>Der Docker-Rückfall erfolgt ausschließlich auf ein in der Update-Policy mit <code>docker_supported</code> freigegebenes Image; gemeint ist der von Weboberfläche und Host-Helfer angebotene Rückfall mit Rückmigration auf das Root-Image <code>v5.3.2b</code>. Davon getrennt ist der Wechsel zwischen Runtime-Images, etwa von 5.5.0 zurück auf 5.4.6d, per <code>E3DC_IMAGE_TAG</code> wie oben beschrieben. <code>v5.3.2b</code> ist nicht als Bare-Metal-Programm-Rückfall freigegeben.</p>
             </div></div>
         </div>
 
@@ -172,7 +178,8 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                         <li><strong>BWWP/Heizstab:</strong> Zusatzverbraucher ergänzen, ohne die vorhandene Wärmepumpe zu ersetzen.</li>
                         <li>Die Wallbox-Seite trennt einfache Bedienung nach Energiequelle, Ladeabsicht und Ziel; Phasen, Treiber und Schutzzeiten bleiben in der erweiterten Ansicht.</li>
                     </ul>
-                    <p class="mb-0">Die ausführliche Projekt-Dokumentation liegt in <code>doc/Frontend_Ansichten.md</code>.</p>
+                    <?php /* Doku-Link */ ?>
+                    <p class="mb-0">Die ausführliche Projekt-Dokumentation liegt in <?= e3dcDocLink('Frontend_Ansichten.md') ?>.</p>
                 </div>
             </div>
         </div>
@@ -216,6 +223,18 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                     </ol>
                 </div>
             </div>
+        </div>
+
+        <h4 class="mb-4 text-accent">Stable 5.5.0: Wallbox, Speicher und Docker-Update</h4>
+        <div class="col-12 faq-item" data-tags="5.5.0 stable wallbox openwb pro startfenster phasen deckel akku speicher netzladen ladeprofil luxtronik warmwasser bluelink zusatzwechselrichter docker watchtower update">
+            <div class="card bg-card border-0 shadow-sm"><div class="card-body">
+                <h5 class="card-title">Was bringt Stable-Release 5.5.0?</h5>
+                <p>An der openWB Pro hält ein Startfenster das erste Stromangebot nach dem Anstecken stabil; nach drei erfolglosen Weckzyklen bleibt das Angebot mit der Meldung „Fahrzeug lädt trotz Freigabe nicht“ stehen. Einphasiges Laden über 20 A gibt der Deckel erst frei, wenn eine einphasige Obergrenze über 20 A (<code>wb1_openwb_pro_1p_max_amp</code> bzw. <code>wb2_openwb_pro_1p_max_amp</code>; leer = 20 A), die Hausabsicherung (<code>grid_max_amps</code>) und die Netzphase des Ladepunkts eingetragen sind und die Zuordnung beim Laden nachgewiesen wurde. In <code>PV-Kurve ruhig</code> stützt der Hausspeicher die Ladung nur mit einem kleinen Wh-Kontingent.</p>
+                <p>Preisbasiertes Netzladen plant den Bedarf bis zum nächsten günstigen Fenster, rechnet erwartete PV zuerst an und lädt aus dem Netz am Ende des Fensters. Das Ladeprofil (Wirtschaftlich, Ausgeglichen, Komfort, Eigene Einstellungen) wird beim Update ohne Verhaltensänderung aus den bisherigen Werten gesetzt.</p>
+                <p>Der Luxtronik-PV-Boost arbeitet mit Saisonkanälen und einstellbarer Anlagenhysterese; Warmwasser sofort endet regulär mit erreichter Zieltemperatur. Bluelink meldet sich mit Benutzer und Passwort an – die Zugangsdaten nach dem Update im Config-Editor eintragen. Ein Sungrow-Zusatzwechselrichter kann rein lesend per Modbus TCP angezeigt werden.</p>
+                <p><strong>Bare Metal:</strong> Installationen mit 5.4.4c bis 5.4.6d zeigen den Hinweis auf 5.5.0 wegen eines Fehlers ihrer Update-Prüfung nicht an; <strong>System Update</strong> startet das Update trotzdem.</p>
+                <p><strong>Docker:</strong> Der Knopf <strong>System Update</strong> steht ab 5.5.0 zur Verfügung. Das Update von 5.4.x auf 5.5.0 erfolgt noch über den Host-Weg; ab dem nächsten Release genügt der Knopf. Er aktualisiert nur Container, deren Image aus der Registry (<code>ghcr.io/a9xxx/install-e3dc-control</code>) gezogen wurde. Eine Docker-Installation mit 5.4.x zeigt grundsätzlich keinen Versionshinweis; ihre Weboberfläche nennt höchstens die Host-Befehle.</p>
+            </div></div>
         </div>
 
         <h4 class="mb-4 text-accent">Stable 5.4.6d: Docker, Speicher und Wärmepumpe</h4>
@@ -1155,8 +1174,8 @@ Was korrigiert das Stable-Release 5.4.1d?
                         <li><strong>Einphasiges Laden (L1):</strong> 16 Ampere * 230 Volt = ~3.680 Watt (3,6 kW)</li>
                         <li><strong>Dreiphasiges Laden:</strong> 16 Ampere * 230 Volt * 3 = ~11.040 Watt (11 kW)</li>
                     </ul>
-                    <p>Wenn Ihr Auto nur einphasig lädt, ist bei 16A physikalisch bei 3.6kW Schluss. Haben Sie eine zugelassene <strong>22 kW Wallbox</strong> installiert und wollen bis zu 32A ins Auto schicken (7.2kW einphasig / 22kW dreiphasig), heben Sie im Konfigurations-Editor den globalen Fallback <strong>Max. Ladestrom</strong> oder in <em>Wallbox</em> gezielt <strong>WB1 Max A</strong>/<strong>WB2 Max A</strong> an. So kann z.B. WB1 mit 32A und WB2 weiter mit 16A begrenzt bleiben.</p>
-                    <p>Beim Betrieb mehrerer Ladepunkte addiert E3DC-Control die angezeigten Amperewerte nicht als einzelne Gesamtsumme. Maßgeblich für die leistungsfaire Verteilung sind die reale Phasenzahl sowie Fahrzeug- und Ladepunktgrenzen; gemessene L1/L2/L3-Ströme am Ladepunkt bleiben zusätzliche Diagnose. Solange kein bestätigter phasenaufgelöster PCC-RMS-Stromvektor vorhanden ist, bleibt der Hausanschlussschutz konservativ; aus phasenbezogener Wirkleistung wird keine zusätzliche Amperefreigabe abgeleitet.</p>
+                    <p>Wenn Ihr Auto nur einphasig lädt, ist bei 16A physikalisch bei 3.6kW Schluss. Haben Sie eine zugelassene <strong>22 kW Wallbox</strong> installiert und wollen bis zu 32A ins Auto schicken (7.2kW einphasig / 22kW dreiphasig), heben Sie im Konfigurations-Editor den globalen Fallback <strong>Max. Ladestrom</strong> oder in <em>Wallbox</em> gezielt <strong>WB1 Max A</strong>/<strong>WB2 Max A</strong> an. So kann z.B. WB1 mit 32A und WB2 weiter mit 16A begrenzt bleiben. Einphasig mehr als 20 A (4,6 kVA) nur mit Zustimmung des Netzbetreibers: An E3DC-, openWB- und go-e-Ladepunkten begrenzen beim einphasigen Laden nur der eingestellte Maximalstrom und die Hausabsicherung; wer die Grenze einhalten muss, trägt dort 20 A ein. Das begrenzt an diesem Ladepunkt auch das dreiphasige Laden, bei einer 32-A-Wallbox von 22 kW auf 13,8 kW. An der openWB Pro gilt der einphasige Deckel (Standard 20 A).</p>
+                    <p>Beim Betrieb mehrerer Ladepunkte addiert E3DC-Control die angezeigten Amperewerte nicht als einzelne Gesamtsumme. Maßgeblich für die leistungsfaire Verteilung sind die reale Phasenzahl sowie Fahrzeug- und Ladepunktgrenzen; gemessene L1/L2/L3-Ströme am Ladepunkt bleiben zusätzliche Diagnose. Solange kein bestätigter phasenaufgelöster PCC-RMS-Stromvektor vorhanden ist, bleibt der Hausanschlussschutz konservativ. Aus der Wirkleistung je Netzphase (E3DC-Wurzelzähler) leitet E3DC-Control nur an der openWB Pro einen einphasigen Deckel über 20 A ab – mit einer Obergrenze über 20 A in <strong>WB1 openWB Pro 1p Max. (A)</strong> bzw. <strong>WB2 openWB Pro 1p Max. (A)</strong> (leer = 20 A), eingetragener Hausabsicherung, nachgewiesener Phasenzuordnung, frischen Messwerten und Schieflast-Wächter; sonst gilt dort höchstens 20 A.</p>
                 </div>
             </div>
         </div>
@@ -1255,17 +1274,9 @@ Was korrigiert das Stable-Release 5.4.1d?
                     <p>Wenn Sie E3DC-Control als <strong>Docker-Container</strong> betreiben, werden Hintergrunddienste wie der Native Wallbox Manager oder Smart-Home-Hubs aus Container-Architektur-Gründen immer <strong>nur einmalig beim Booten</strong> des Containers durch die <code>entrypoint.sh</code> gestartet.</p>
                     <p>Wenn Sie das Feature also gerade ganz frisch im Konfigurations-Editor nachträglich <strong>eingeschaltet</strong> und gespeichert haben, läuft der verantwortliche Python-Hintergrundprozess aktuell schlichtweg noch nicht!</p>
                     <div class="alert alert-warning mb-0 mt-3 border-0">
-                        <strong>🔌 Lösung:</strong> Erzeuge den gesamten Docker-Container neu und warte auf den imagegebundenen Healthcheck. Beim Hochfahren liest der Container Deine neue Konfiguration und startet das Ladeprogramm dauerhaft mit.
+                        <strong>🔌 Lösung:</strong> Starte den Container neu, zum Beispiel über <strong>Notfall-Neustart (Reset)</strong> (mobil: <strong>E3DC-Control Neustart</strong>) in der Oberfläche oder auf dem Host. Beim Hochfahren liest der Container Deine neue Konfiguration und startet das Ladeprogramm dauerhaft mit.
                         <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
-if [ -f ./docker_compose_update.py ]; then
-  E3DC_DOCKER_HELPER=./docker_compose_update.py
-elif [ -f ./Installer/docker_compose_update.py ]; then
-  E3DC_DOCKER_HELPER=./Installer/docker_compose_update.py
-else
-  echo "docker_compose_update.py fehlt; aktuellen Release-Verwaltungsbaum bereitstellen." >&2
-  exit 2
-fi
-sudo python3 "$E3DC_DOCKER_HELPER" --compose-dir . --sudo --recreate-current</pre>
+sudo docker compose restart e3dc-control</pre>
                     </div>
                 </div>
             </div>
@@ -1342,31 +1353,16 @@ WB1 hat Ladevorgang physisch abgebrochen (Versuch 1/3)!</pre>
                                 <li><strong>Heizstab / Shelly:</strong> die sichtbaren Shelly-/Heizstab-Felder im Frontend ausfüllen, nicht die internen Roh-Keys suchen.</li>
                             </ul>
                         </li>
-                        <li><strong>Container neu erzeugen</strong> (liest beim n&auml;chsten Boot die neue Konfiguration und wartet auf den Healthcheck):
+                        <li><strong>Container neu starten</strong> (über <strong>Notfall-Neustart (Reset)</strong>, mobil <strong>E3DC-Control Neustart</strong>, in der Oberfläche oder auf dem Host; liest beim n&auml;chsten Boot die neue Konfiguration):
                             <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
-if [ -f ./docker_compose_update.py ]; then
-  E3DC_DOCKER_HELPER=./docker_compose_update.py
-elif [ -f ./Installer/docker_compose_update.py ]; then
-  E3DC_DOCKER_HELPER=./Installer/docker_compose_update.py
-else
-  echo "docker_compose_update.py fehlt; aktuellen Release-Verwaltungsbaum bereitstellen." >&2
-  exit 2
-fi
-sudo python3 "$E3DC_DOCKER_HELPER" --compose-dir . --sudo --recreate-current</pre>
+sudo docker compose restart e3dc-control</pre>
                         </li>
                     </ol>
                     <p>Die internen Config-Keys sind nur noch f&uuml;r Diagnose und Support interessant. Im normalen Betrieb reicht die Frontend-Auswahl plus anschlie&szlig;ender Container-Neustart.</p>
-                    <p>Nach Updates übernimmt der Host-Helfer die aufgelöste Image-Auswahl, den expliziten Pull sowie den gebundenen Start- und Rückfallvertrag:</p>
+                    <p>Updates startest Du über den Knopf <strong>System Update</strong> (mit eingerichtetem Watchtower) oder auf dem Host:</p>
                     <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
-if [ -f ./docker_compose_update.py ]; then
-  E3DC_DOCKER_HELPER=./docker_compose_update.py
-elif [ -f ./Installer/docker_compose_update.py ]; then
-  E3DC_DOCKER_HELPER=./Installer/docker_compose_update.py
-else
-  echo "docker_compose_update.py fehlt; aktuellen Release-Verwaltungsbaum bereitstellen." >&2
-  exit 2
-fi
-sudo python3 "$E3DC_DOCKER_HELPER" --compose-dir . --sudo
+sudo docker compose pull
+sudo docker compose up -d
 sudo docker compose logs --tail=80 e3dc-control</pre>
                     <p>Das gilt auch f&uuml;r die &uuml;brigen im Container-Startskript angebundenen optionalen Dienste, etwa Wallbox Manager und Bluelink.</p>
                 </div>
@@ -1387,7 +1383,7 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                     <p>Wenn die Ladeleistung von evcc nicht erscheint, prüfen Sie folgende Punkte:</p>
                     <ul>
                         <li><strong>Zweite Wallbox aktiv?</strong> Wenn nur eine evcc-Wallbox vorhanden ist, muss der aktuelle Typ für WB2 auf <strong>Keine / Aus</strong> stehen. In älteren Konfigurationen ohne diesen Typ-Schlüssel gelten eine befüllte <code>wb2_ip</code> oder ein <code>wb2_topic</code> weiterhin als positiver Bestandsbeleg.</li>
-                        <li><strong>MQTT Topics:</strong> evcc sendet die Ladeleistung standardmäßig auf <code>evcc/loadpoints/1/chargePower</code>. Dieses Topic gehoert im Config Editor unter <strong>Schnittstellen & MQTT</strong> in <strong>Wallbox-Leistung per MQTT</strong> -> <code>wb_topic</code>, nicht in das Fahrzeug-SoC-Feld.</li>
+                        <li><strong>MQTT Topics:</strong> evcc sendet die Ladeleistung standardmäßig auf <code>evcc/loadpoints/1/chargePower</code>. Dieses Topic gehört im Config Editor unter <strong>Schnittstellen & MQTT</strong> in <strong>Wallbox-Leistung per MQTT</strong> -> <code>wb_topic</code>, nicht in das Fahrzeug-SoC-Feld.</li>
                         <li><strong>SoC getrennt lassen:</strong> <code>evcc/loadpoints/1/vehicleSoc</code> bleibt bei <code>mqtt_hub_sub_soc_topic</code>. Ladeleistung und Fahrzeug-SoC sind zwei getrennte MQTT-Abos.</li>
                         <li><strong>Zugangsdaten:</strong> Falls Ihr Mosquitto-Broker passwortgeschützt ist, müssen die Daten für den direkten Wallbox-Leistungsbroker bei <code>wb_user</code> & <code>wb_pass</code> eingetragen werden.</li>
                         <li><strong>localhost vs. IP:</strong> Wenn Mosquitto als Add-on in Home Assistant läuft, funktioniert <code>localhost</code> im Terminal meist nicht. Nutzen Sie die echte IP Ihres HA-Systems (z.B. <code>192.0.2.150</code>).</li>
@@ -1413,6 +1409,8 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                     Nach dem Speichern erzeugt der private Planer die Datei <code>native_wallbox_schedule_wb1.json</code> beziehungsweise <code>native_wallbox_schedule_wb2.json</code>. Die ausgewählten 15-Minuten-Abschnitte erscheinen auf der Seite <strong>Wallbox</strong> im Ladeplan und in der Zeitleiste. Bei <strong>Auto</strong> wählt der Planer innerhalb des vorgegebenen Zeitraums die günstigsten Abschnitte; die sichtbaren gelben Planblöcke sind die tatsächlich ausgewählten Ladezeiten.</p>
                     <p><strong>Warum kann ein morgiges Fenster fehlen?</strong><br>
                     Feste Tarife, Octopus Heat und Spezialtarife werden aus ihrem täglich wiederkehrenden Tarifprofil geplant und benötigen dafür keine morgigen EPEX-Slots. Dynamische Tarife wie Tibber oder aWATTar bleiben dagegen gesperrt, bis die zukünftigen Preise veröffentlicht wurden. Eine fehlgeschlagene Kandidatenplanung verändert weder Konfiguration noch bestehenden Ladeplan.</p>
+                    <p><strong>Warum steht die manuelle Ladezeit nach der Nacht wieder auf 0 h?</strong><br>
+                    Ein manueller Stundenplan ist ein einmaliger Auftrag: Sind alle geplanten Abschnitte durchlaufen oder ist das Zeitfenster abgelaufen, setzt der Planer die Ladezeit auf <code>0 h</code> zurück, damit die Wallbox nicht unbemerkt jede Nacht Netzstrom lädt. Wer jede Nacht dieselbe Anzahl günstiger Stunden möchte, aktiviert im Ladeplan <strong>Täglich wiederholen</strong>: Die Ladezeit bleibt erhalten und wird für jedes neue Zeitfenster erneut auf die günstigsten Abschnitte gelegt; innerhalb eines bereits abgearbeiteten Fensters wird nicht ein zweites Mal geladen. Die Wiederholung braucht eine feste Startuhrzeit unter <em>Frühestens ab</em>; mit <em>Jetzt</em>, Sofortladen oder <em>Ziel-SoC berechnet Dauer</em> bleibt sie ohne Wirkung.</p>
                 </div>
             </div>
         </div>
@@ -1554,7 +1552,7 @@ cat /var/www/html/data/e3dc_v4.json | python3 -c \
                     <p>Der System-Watchdog (PiGuard) reagiert sensibel auf klemmende Dienste. Prüfen Sie zuerst, ob die V4-Dienste aktiv sind und ob alte Legacy-Prozesse den RSCP-Port 5033 blockieren.</p>
                     <pre>systemctl is-active e3dc-live e3dc-storage-manager apache2
 journalctl -u e3dc-live -n 80 --no-pager</pre>
-                    <p>Falls ein alter Legacy-Dienst noch existiert, kann er deaktiviert werden: <code>sudo systemctl disable --now e3dc.service</code>. Danach <code>sudo systemctl restart e3dc-live piguard</code> ausfuehren.</p>
+                    <p>Falls ein alter Legacy-Dienst noch existiert, kann er deaktiviert werden: <code>sudo systemctl disable --now e3dc.service</code>. Danach <code>sudo systemctl restart e3dc-live piguard</code> ausführen.</p>
                 </div>
             </div>
         </div>
@@ -2203,10 +2201,10 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                     <p>Ab v4.9.0 ist <code>AUTO</code> nur noch ein Freigabe-Befehl. Wenn der E3DC bereits im AUTO-Modus ist, sendet Python keinen wiederholten RSCP-Befehl mehr. Die E3DC-Firmware regelt Hausversorgung, Speicher und Netzpunkt dann allein.</p>
                     <p><strong>Wetterbasiertes Laden im E3/DC:</strong> Wenn E3DC-Control die Ladekurve führt, sollte diese E3/DC-Funktion ausgeschaltet sein. Sie ist ein zweiter Ladeplaner und kann Ladekapazität zurückhalten, obwohl E3DC-Control bereits eine passende AUTO-Ladeobergrenze bereitstellt. Die Open-Meteo-/Forecast-Prognose von E3DC-Control bleibt davon unabhängig aktiv. Bei gleichzeitigem E3/DC-Status <em>Laden gesperrt</em> und <em>Warten auf Sonnenschein</em> zeigt E3DC-Control das externe Veto an, verändert die Geräteeinstellung aber nicht automatisch.</p>
                     <p>Ab v4.9.1a gibt die Nachtfreigabe den E3DC bei <code>PV=0W</code> wieder in <code>AUTO</code> frei, statt die Tagesladekurve nachts mit <code>IDLE</code> oder Autodump zu erzwingen. Aktiver Pre-Discharge ist davon ausgenommen und läuft weiter.</p>
-                    <p>Ab v4.9.1b folgt Pre-Discharge einer eigenen Entladerampe mit Hysterese. Die normale Ladekurve kann den morgendlichen Pre-Dump dadurch nicht mehr zu frueh pausieren.</p>
+                    <p>Ab v4.9.1b folgt Pre-Discharge einer eigenen Entladerampe mit Hysterese. Die normale Ladekurve kann den morgendlichen Pre-Dump dadurch nicht mehr zu früh pausieren.</p>
                     <p>Ab v4.9.1c sendet die aktive Ladekurve ihren berechneten <code>iFc</code>-Wert direkt als Lade- oder Entlade-Führung. Dadurch entstehen keine kurzen Gegenkorrekturen mehr, bei denen zuerst ein um 100 W versetzter Wert und danach sofort der begrenzte Wert an den E3DC gesendet wird.</p>
                     <p>Ab v4.9.2 nutzt der Preis-Boost das Verhalten des C++-Vorgängers <code>awtest=3</code>: Im günstigen Preisfenster bleibt der Speicher per <code>GRID</code> im Ladepfad, während freigegebene Wallboxen und Wärmepumpen Netzleistung nutzen dürfen. Nach Ende des Preisfensters prüfen alle Dienste die Fensterzeit selbst und fallen wieder auf Ladekurve bzw. Autonom-Regelung zurück.</p>
-                    <p>Das ist wichtig, weil wiederholte AUTO-Befehle bestimmte Anlagen alle 30 Sekunden leicht anstossen konnten. Sichtbar war das als kurze Welle aus Batterie-Laden und Netzeinspeisung.</p>
+                    <p>Das ist wichtig, weil wiederholte AUTO-Befehle bestimmte Anlagen alle 30 Sekunden leicht anstoßen konnten. Sichtbar war das als kurze Welle aus Batterie-Laden und Netzeinspeisung.</p>
                     <p>Für openWB und openWB Pro trennt V4 jetzt öffentliche Modi von der internen Treiberlogik. <code>Aus / autonom</code> sendet keine Ladebefehle, <code>PV-Kurve ruhig</code> regelt weich entlang der Speicher-Kurve, und <code>Sofort bis Preislimit</code> öffnet Netzstrom nur bei freigegebener Preisgrenze. Die Batterieentladung hat eine SoC-Hysterese, damit sie an wbminSoC nicht taktet.</p>
                 </div>
             </div>
@@ -2225,7 +2223,7 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                 <div class="faq-answer">
                     <p>Bis v4.7.8 konnte die TL-BREMSE im Log korrekt erscheinen, real aber noch <code>AUTO</code> senden. Damit war die harte Ladebegrenzung praktisch wieder freigegeben. Ab <strong>v4.7.9</strong> sendet die harte TL-Bremse echtes <code>IDLE</code> mit niedrigem Lade-Limit.</p>
                     <p><code>storage_morning_soc=0</code> bedeutet ab v4.7.9 "kein Morgen-Deckel" und nicht mehr "Kurve bei 0% starten". Bereits eingefrorene 0%-Altanker werden verworfen und beim nächsten Planlauf sauber neu aufgebaut.</p>
-                    <p>Wenn der Speicher oberhalb der Ladekurve liegt und Last oder Wolken den PV-Überschuss druecken, bleibt der E3DC im normalen Betrieb autonom. Aktives Entladen ist nur noch ein Schutzpfad für Pre-Dump, Preislogik und manuelle Befehle. Abregelschutz, Pre-Dump, aWATTar und Notreserve haben immer Vorrang, damit daraus keine Regelschleife entsteht.</p>
+                    <p>Wenn der Speicher oberhalb der Ladekurve liegt und Last oder Wolken den PV-Überschuss drücken, bleibt der E3DC im normalen Betrieb autonom. Aktives Entladen ist nur noch ein Schutzpfad für Pre-Dump, Preislogik und manuelle Befehle. Abregelschutz, Pre-Dump, aWATTar und Notreserve haben immer Vorrang, damit daraus keine Regelschleife entsteht.</p>
                     <pre>storage_morning_soc = 0   # Morgen-Deckel aus</pre>
                 </div>
             </div>

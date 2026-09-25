@@ -54,6 +54,24 @@ function e3dc_config_editor_wallbox_toggle_checked(array $config, $key) {
     return in_array(strtolower(trim((string)$value)), ['1', 'true', 'yes', 'on'], true);
 }
 
+// Geheimnisse und PINs bleiben beim Speichern Text (führende Nullen, Exponentenschreibweise),
+// wie es Install-Center (Passwortfelder) und Wallbox-Seite bereits tun. Koordinaten u. ä. bleiben Zahlen.
+function e3dc_config_editor_text_only_key($key) {
+    $k = strtolower(trim((string)$key));
+    if (in_array($k, ['bluelink_user', 'bluelink_password', 'bluelink_pin', 'web_pin'], true)) {
+        return true;
+    }
+    return preg_match('/(password|passwort|pwd|token|secret|api[_-]?key|apikey|(^|[_-])pin$)/', $k) === 1;
+}
+
+function e3dc_config_editor_store_posted_value($key, $value) {
+    $value = trim((string)$value);
+    if ($value === '' || e3dc_config_editor_text_only_key($key) || !is_numeric($value)) {
+        return $value;
+    }
+    return (strpos($value, '.') !== false) ? floatval($value) : intval($value);
+}
+
 function e3dc_config_editor_solcast_slot(array $config, string $key, int $legacySlot): array {
     $raw = trim((string)($config[$key]['value'] ?? ''));
     $stored = in_array($raw, ['1', '2'], true) ? $raw : '';
@@ -275,6 +293,7 @@ $defaults = [
     "wurzelzaehler" => "0", "wurzelzaehler_invertiert" => "0",
     "live_grid_pm_delta_debounce_enable" => "1", "live_grid_pm_delta_soft_threshold_w" => "250", "live_grid_pm_delta_hard_threshold_w" => "2000",
     "live_grid_pm_delta_persist_count" => "2", "live_grid_pm_delta_persist_window_s" => "20",
+    "ext_inverter_type" => "none", "ext_inverter_ip" => "", "ext_inverter_port" => "502", "ext_inverter_unit_id" => "1", "ext_inverter_poll_s" => "10", // Zusatzwechselrichter (Modbus TCP, nur lesend)
     "check_updates" => "1", "auto_update_enable" => "0", "auto_update_time" => "23:00",
 
     // Webansicht
@@ -288,6 +307,9 @@ $defaults = [
     "ep_reserve_pct" => "8.0",
     "storage_curve_target_mode" => "anchored",
     "storage_curve_sliding_horizon_enable" => "0",
+    // Prognose-100 später Vollstand nur mit Grund, Kurvenende-Puffer (Standardwerte wie im Simulator).
+    "storage_forecast100_late_full_guard_enable" => "1",
+    "storage_curve_end_guard_min" => "45",
     "storage_dc_first_charge_limit_enable" => "0",
     "storage_forecast_shortfall_aux_ac_charge_enable" => "0",
     "storage_curve_charge_servo_mode" => "dynamic",
@@ -361,6 +383,7 @@ $defaults = [
     "heat_heater_grid_boost_enable" => "0", "heat_heater_grid_boost_ack" => "0", "heat_heater_grid_boost_requires_deficit" => "1",
     "heat_heater_grid_boost_price_limit_ct" => "0.0", "heat_heater_grid_boost_max_w" => "3000",
     "heat_heater_min_temp_c" => "45.0", "heat_heater_max_temp_c" => "60.0", "heat_wp_daily_kwh" => "",
+    "market_charge_profile" => "", "market_price_limit_ct" => "",
     "market_min_margin_pct" => "10.0", "market_safety_correction_ct_per_kwh" => "0.0",
     "market_autarky_first_enable" => "1", "market_autarky_low_soc_pct" => "20.0",
     "market_autarky_horizon_buffer_wh" => "500",
@@ -443,6 +466,7 @@ $defaults = [
     "wp_pv_max_power_w" => "0", "wp_pv_battery_limit_wh" => "0", "wp_pv_grid_limit_wh" => "0",
     "wp_pv_battery_max_w" => "0", "wp_pv_grid_max_w" => "0", "wp_pv_reaction_s" => "30",
     "wp_pv_start_wait_s" => "600", "wp_pv_handoff_timeout_s" => "120",
+    "wp_pv_hz_hysteresis_k" => "3.5", "wp_pv_ww_hysteresis_k" => "8", "wp_pv_boost_release_s" => "300",
     "wp_pv_control_mode" => "reserved", "wp_pv_start_power_w" => "0",
     "price_boost_enable" => "0", "heat_price_boost_scope" => "both", "heat_price_boost_windows" => "",
     "price_limit" => "20.0", "price_hard_limit" => "-99.0", "price_pause_limit" => "35.0", "price_min_duration" => "60",
@@ -490,17 +514,27 @@ $defaults = [
     "grid_max_amps" => "35", "grid_max_amps_l1" => "", "grid_max_amps_l2" => "", "grid_max_amps_l3" => "",
     "grid_wallbox_reserve_amps" => "2", "grid_wallbox_reserve_amps_l1" => "", "grid_wallbox_reserve_amps_l2" => "", "grid_wallbox_reserve_amps_l3" => "",
     "wb1_grid_phase" => "", "wb2_grid_phase" => "", "wb1_openwb_pro_1p_max_amp" => "", "wb2_openwb_pro_1p_max_amp" => "",
+    "wb_pcc_phase_basis" => "e3dc_pm_active_power", "wb_pcc_power_factor_margin" => "0.9", "grid_pcc_imbalance_max_a" => "20", // 1p-Deckel openWB Pro aus Netzphasenmessung
     "wb_surplus_target_grid_w" => "-125", "wb_surplus_noise_w" => "100", "phase_transition_safety_margin_w" => "0", "heatpump_start_settle_s" => "30",
+    "wb_curve_pv_only_house_reserve_w" => "300", // Messreserve der PV-only-Entladeklemme
+    "storage_home_wp_split" => "auto", // Wärmepumpe im Hauswert (auto/include/separate), Alias-Tabelle in storage_manager.py
     "wb_restart_delay_s" => "60", "wb_min_charge_time_s" => "300", "wb_cloud_stop_delay_s" => "180", "wb_phase_change_hold_s" => "180",
+    "wb_phase_down_delay_s" => "480", "wb_phase_up_forecast_hold_s" => "60", "wb_phase_up_symmetry_enable" => "0", // Vorlauf 60 s (die 480 s sind die Sperre nach dem Wechsel), Symmetrie-Klausel aus
+    "wb_phase_up_export_wh" => "120", // Export-Wh-Konto 1p→3p (vorher 250 Wh), schaltet alternativ zur Uhr
+    "wb_pv_only_release_hold_s" => "120", "wb_pv_only_hold_stale_guard_s" => "45",
     "wb1_restart_delay_s" => "", "wb1_min_charge_time_s" => "", "wb1_cloud_stop_delay_s" => "", "wb1_phase_change_hold_s" => "",
     "wb2_restart_delay_s" => "", "wb2_min_charge_time_s" => "", "wb2_cloud_stop_delay_s" => "", "wb2_phase_change_hold_s" => "", "wb_openwb_zero_budget_hold_s" => "300",
     "openwb_pro_phase_wait_s" => "480", "openwb_pro_phase_cp_interrupt_duration_s" => "5", "openwb_pro_phase_restart_delay_s" => "0", "openwb_pro_start_wakeup_delay_s" => "5",
+    "openwb_pro_automatic_start_cp_enable" => "auto", "openwb_pro_start_cp_grace_s" => "60",
+    "openwb_pro_start_hold_s" => "180", "openwb_pro_start_retry_cycle_s" => "300",
+    "wb_native_floor_retry_enable" => "0",
     "wb_openwb_primary_enable" => "0", "wb_openwb_auto_discovery" => "1", "wb_openwb_auto_role_enable" => "1", "wb_openwb_command_fail_limit" => "3", "wb_openwb_command_block_s" => "300", "wb_openwb_modbus_secondary_enable" => "0", "wb_openwb_modbus_port" => "1502", "wb_openwb_modbus_unit" => "1", "wb_openwb_modbus_connector" => "", "wb_openwb_modbus_offset" => "0",
     "wb_shadow_start_delay_s" => "75", "wb_shadow_power_ramp_s" => "60", "wb_shadow_meter_delay_s" => "30", "wb_shadow_meter_ramp_s" => "10", "wb_shadow_phase_pause_s" => "120", "wb_shadow_zero_budget_stop_s" => "300", "wb_shadow_zero_budget_grid_stop_s" => "90",
     "wb_native_enable" => "0", "wb_native_type" => "e3dc_auto", "wb_native_ip" => "", "wb1_topic_prefix" => "", "wb_native_type2" => "", "wb_native_ip2" => "", "wb2_topic_prefix" => "", "wb_native_mode" => "0", "dvcarlimit" => "0.0",
     "wb1_e3dc_wbchar6_compat_enable" => "1", "wb2_e3dc_wbchar6_compat_enable" => "1",
+    "wb_e3dc_direct_phase_control_enable" => "0", // Experimenteller E3DC-Direktvertrag, Standard aus
     "smart_wbhour_enable" => "0", "car_capacity" => "72.0", "car_target_unit" => "soc", "car_target_kwh" => "20", "car_target_soc" => "80", "car_max_soc_si" => "90", "car_charge_power" => "11.0",
-    "bluelink_interval" => "15", "bluelink_vin" => "", "bluelink_car_name" => "", "bluelink_refresh_token" => "", "bluelink_ignore_plug_status" => "0",
+    "bluelink_interval" => "15", "bluelink_vin" => "", "bluelink_car_name" => "", "bluelink_user" => "", "bluelink_password" => "", "bluelink_pin" => "", "bluelink_brand" => "hyundai", "bluelink_ignore_plug_status" => "0",
     "v2h_enable" => "0", "v2h_min_soc" => "40", "v2h_bat_soc_limit" => "10",
 
     // Benachrichtigungen
@@ -532,9 +566,14 @@ $tooltips = [
     "live_grid_pm_delta_hard_threshold_w" => "Abweichung in Watt, ab der ein Grid-PM-Delta sofort regelwirksam bleibt.",
     "live_grid_pm_delta_persist_count" => "Anzahl auffälliger Grid-PM-Delta-Samples im Zeitfenster, bevor der Grund regelwirksam wird.",
     "live_grid_pm_delta_persist_window_s" => "Zeitfenster in Sekunden für wiederholte Grid-PM-Delta-Samples.",
+    "ext_inverter_type" => "Zusatzwechselrichter: none = keine Direktlesung (Standard), sungrow_modbus = Sungrow-String-Wechselrichter (SG-Serie) per Modbus TCP nur lesend abfragen. Nur setzen, wenn ein zweiter Wechselrichter über LAN erreichbar ist; die Regelung nutzt weiterhin den E3DC-Messwert des externen Leistungsmessers, die Direktlesung liefert Phasen-/String-Daten und Diagnose in live_data_py.json (Block ext_inverter).",
+    "ext_inverter_ip" => "IPv4-Adresse des Zusatzwechselrichters bzw. seines Kommunikationsmoduls (Modbus TCP). Ohne gültige Adresse bleibt die Direktlesung deaktiviert.",
+    "ext_inverter_port" => "Modbus-TCP-Port des Zusatzwechselrichters (Standard 502).",
+    "ext_inverter_unit_id" => "Modbus-Unit-ID des Zusatzwechselrichters (Standard 1, erlaubt 0–247).",
+    "ext_inverter_poll_s" => "Abfrageintervall der Direktlesung in Sekunden (Standard 10, erlaubt 5–60). Die Lesung läuft in einem eigenen Hintergrundthread; die RSCP-Zykluszeit des Live-Dienstes wird davon nicht beeinflusst. Ein Stand gilt nur bis zum doppelten Intervall plus Verbindungszeitüberschreitung als gültig.",
     "check_updates"          => "Prüft im Hintergrund regelmäßig auf verfügbare System-Updates (1=an, 0=aus).",
-    "auto_update_enable"     => "Führt gefundene Updates automatisch aus (nur bei stabiler Verbindung). Empfohlen: 0 für Produktivsysteme.",
-    "auto_update_time"       => "Uhrzeit (HH:MM) für das tägliche automatische Update, z.B. 23:00. Dienste werden kurz neu gestartet.",
+    "auto_update_enable"     => "Führt gefundene Updates automatisch aus (nur bei stabiler Verbindung). Docker: gibt zur Uhrzeit Watchtower das Signal, das neue Image zu laden und den Container neu zu erstellen. Empfohlen: 0 für Produktivsysteme.",
+    "auto_update_time"       => "Uhrzeit (HH:MM) für das tägliche automatische Update, z.B. 23:00. Dienste werden kurz neu gestartet; in Docker wird der Container neu erstellt.",
 
     // Webansicht
     "show_forecast"          => "Zeigt Prognose-Kurven (PV, Speicher) im Dashboard an.",
@@ -554,6 +593,8 @@ $tooltips = [
     "einspeiselimit"         => "Einspeisebegrenzung in kW (z.B. 7.0). Der Abregelschutz nutzt diesen Wert als Ziel-Netzpunkt, sofern er unter dem per RSCP gemeldeten E3DC-Derating liegt.",
     "storage_curve_target_mode" => "Zielkurven-Modus. Ankerkurve nutzt Morgen-Puffer, Zwischenziele und Tagesziel wie bisher. Prognose auf 100% berechnet die Speicher-Zielkurve allein aus PV- und Verbrauchsprognose bis 100% am Freilauf; Schutzpfade, Pre-Dump und Abregelreserve bleiben aktiv.",
     "storage_curve_sliding_horizon_enable" => "Optionaler erweiterter Modus: erlaubt dem 100%-Prognosepfad, die Ladung über einen gleitenden Prognosehorizont zu entspannen, wenn Vertrauen, Zielerreichbarkeit und Abregeldruck sicher sind. Nur bei Zielkurven-Modus 'Prognose auf 100%' aktivierbar.",
+    "storage_forecast100_late_full_guard_enable" => "Nur im Zielkurven-Modus 'Prognose auf 100%'. An (Standard): 100 % werden erst kurz vor dem PV-Ende geplant, aber nur mit Grund – Einspeiselimit unter der erwarteten PV-Spitze, Abregeldruck in der Prognose, Direktvermarktung aktiv oder Pre-Dump geplant. So bleibt Platz für Spitzen, die sonst abgeregelt würden. Ein einmal eingetretener Grund gilt bis zum Ende des Tages. Ohne Grund endet die Kurve am letzten nutzbaren Überschuss minus Kurvenende-Puffer: Überschuss geht mittags in den Speicher statt ins Netz, und Wolken am Nachmittag gefährden das Ziel weniger. Aus: nie spätes Kurvenende.",
+    "storage_curve_end_guard_min" => "Puffer in Minuten zwischen Kurvenende und dem letzten nutzbaren PV-Überschuss (Prognose auf 100% mit Grund: vor dem PV-Ende). Größer = Speicher früher voll und mehr Reserve gegen Wolken und Prognosefehler, kleiner = später voll. Bereich 30–120, Standard 45.",
     "storage_dc_first_charge_limit_enable" => "Begrenzt Kurvenladung und DV-PV-Speichern auf die aktuell am E3DC gemessene DC-gekoppelte PV-Leistung. Der E3DC bleibt dabei in AUTO und darf jederzeit entladen; PV-Leistung eines Zusatzwechselrichters wird standardmäßig nicht als Laderahmen verwendet. Fehlt ein frischer, gültiger PV-Split, werden diese PV-basierten Ladepfade sicher auf 0 W begrenzt. Preis- und ausdrücklich freigegebenes Netzladen bleiben eigenständig.",
     "storage_forecast_shortfall_aux_ac_charge_enable" => "Nicht freigegebene Option innerhalb der E3DC-DC-Kopplung für die Prognose-100-Ladekurve. Getrennte PV- und Lastquantile dürfen nicht verrechnet werden, weil daraus ohne Abhängigkeitsmodell kein Quantil des Speicherüberschusses entsteht. Ein freigegebener Joint-Horizon-Produzent und eine fachlich beschlossene Risikoschwelle fehlen; die Option ist deshalb nicht auswählbar und bleibt EVIDENCE_LIMIT. E3DC_DC_ONLY bleibt wirksam. Fehlende oder schlechte Daten sowie Netzbezug sperren immer. Die Direktvermarktung besitzt dafür einen getrennten Zusatzwechselrichter-Pfad.",
     "storage_curve_charge_servo_mode" => "Ladeführung für laufende Kurvenladung. Dynamisch reagiert wie bisher direkt auf die aktuelle Zielkurve. Ruhig / Kurven-Servo hält eine bereits aktive Kurvenladung mit gedämpften Schritten, solange PV und Netzpunkt sicher sind; Schutzpfade bleiben vorrangig.",
@@ -597,23 +638,36 @@ $tooltips = [
     "tl_emergency_tolerance_pct" => "Mindestabstand für die harte TL-Notbremse. Schützt vor alten 3%-Configs, damit die TL-Kurve nicht zum Alltagsregler wird. Empfehlung: 30.0.",
     "tl_lookahead_h"    => "Vorausschau-Horizont in Stunden für das iFc-Zwischenziel. Der Storage Manager zielt beim Laden immer auf den Kurven-Punkt in dieser Zeit voraus (statt sofort auf 95% um 21:45 Uhr). Kleinerer Wert = aggressivere Kurzzeit-Regelung. Empfehlung: 2.0.",
     "tl_grid_limit_w"   => "Grid-Wächter: Maximal erlaubter Netzbezug (Watt) bevor die TL-Bremse automatisch aufgehoben wird. Wenn die Batterie im IDLE-Modus trotzdem Strom aus dem Netz zieht (z.B. wegen einer Wolke), hebt der Manager die Bremse auf und lässt die Batterie entladen. 100 W = Standard (filtert Messrauschen). 0 W = sehr sensitiv.",
-    "wb_restart_delay_s" => "Globale Wiedereinschaltverzögerung nach einem Wallbox-Stop in Sekunden. Wirkt bei PV-/Wolkenbetrieb; geplante Ladefenster starten sofort.",
-    "wb_min_charge_time_s" => "Globale Mindestladezeit nach Start in Sekunden. Kurze Wolken stoppen die Ladung nicht sofort; harte Stopps und Ladefenster-Ende bleiben vorrangig.",
-    "wb_cloud_stop_delay_s" => "Globale Wolken-Haltezeit in Sekunden: so lange darf eine laufende Ladung bei 0W PV-Budget weich gehalten werden, bevor gestoppt wird.",
-    "wb_phase_change_hold_s" => "Globale Haltezeit nach Phasenwechsel in Sekunden. Der erste Hochlauf pro Stecksession darf sofort erfolgen; danach wird diese Zeit gehalten.",
-    "wb1_restart_delay_s" => "Optionaler WB1-Override für die Wiedereinschaltverzögerung. Leer = globaler Wert.",
-    "wb1_min_charge_time_s" => "Optionaler WB1-Override für die Mindestladezeit. Leer = globaler Wert.",
-    "wb1_cloud_stop_delay_s" => "Optionaler WB1-Override für die Wolken-Haltezeit. Leer = globaler Wert.",
-    "wb1_phase_change_hold_s" => "Optionaler WB1-Override für die Phasenwechsel-Haltezeit. Leer = globaler Wert.",
-    "wb2_restart_delay_s" => "Optionaler WB2-Override für die Wiedereinschaltverzögerung. Leer = globaler Wert.",
-    "wb2_min_charge_time_s" => "Optionaler WB2-Override für die Mindestladezeit. Leer = globaler Wert.",
-    "wb2_cloud_stop_delay_s" => "Optionaler WB2-Override für die Wolken-Haltezeit. Leer = globaler Wert.",
-    "wb2_phase_change_hold_s" => "Optionaler WB2-Override für die Phasenwechsel-Haltezeit. Leer = globaler Wert.",
+    "wb_restart_delay_s" => "Pause nach einem Wallbox-Stopp, bevor bei PV-Betrieb wieder gestartet wird (Sekunden). Schützt das Schütz vor Flattern bei wechselnder Sonne. Geplante Ladefenster starten sofort.",
+    "wb_min_charge_time_s" => "So lange läuft eine gestartete Ladung mindestens (Sekunden), auch wenn der Überschuss kurz einbricht. Harte Stopps – Nutzer-Aus, Ladefenster-Ende, Schutzgrenzen – haben Vorrang.",
+    "wb_cloud_stop_delay_s" => "Wolken-Halt: So lange darf eine laufende Ladung bei 0 W PV-Budget am Mindeststrom weiterlaufen (Sekunden), bevor gestoppt wird. Überbrückt Wolkenlücken ohne Schützwechsel.",
+    "wb_phase_change_hold_s" => "Nach einem Phasenwechsel wird der Strom so lange nicht weiter angehoben (Sekunden), damit das Fahrzeug den Wechsel sicher übernimmt. Der erste Hochlauf je Stecksession darf sofort erfolgen.",
+    "wb_phase_down_delay_s" => "Beharrung 3p→1p (Sekunden, Standard 480 = openWB-Referenz, mindestens 60): So lange muss der Überschuss dauerhaft unter dem 3p-Minimum liegen, bevor auf eine Phase geschaltet wird. Schutzfunktionen – Netzbezug über der Schwelle, wbminSoC-Untergrenze, unerlaubter Akkubezug – verkürzen auf 60 s.",
+    "wb_phase_up_forecast_hold_s" => "Vorlauf 1p→3p (Sekunden, Standard 60, mindestens 30): So lange muss die Hochschaltbedingung gelten – der Überschuss (Einspeisung plus Wallbox oder das frische Budget des Speicherreglers, Akku-Entladung zählt als Defizit) liegt im 30-s-Mittel über dem 3p-Minimum plus Puffer (4140 W + 300 W an der openWB Pro) und die eine Phase ist ausgereizt: bei phasenschaltfähigem Paar (Fahrzeugprofil 3-phasig, Wallbox schaltfähig) steht der gemessene Strom bis auf 2 A am Referenzstrom – dem kleineren Wert aus 1p-Deckel und aufgerundetem (3p-Minimum + Puffer)/230 V, an der openWB Pro 20 A – oder der Zielstrom liegt darüber; sonst gilt der wirksame 1p-Deckel (Zielstrom darüber, gemessener Strom bis auf 1 A daran oder – nur mit Symmetrie-Klausel – der Schieflastwert). Eine 16-A-Wallbox (1p höchstens 3,68 kW) schaltet also hoch, sobald der Überschuss das 3p-Minimum trägt. Die Uhr leckt: Wolkenlücken zählen sie zurück statt sie zu löschen, erst 15 s durchgehend ohne Bedingung setzen sie auf 0. Alternativ schaltet ein volles Export-Wh-Konto (Export-Wh 1p→3p) auch vor Ablauf des Vorlaufs. Kurze Netzbezugs-Blips unter 30 s setzen die Uhr nicht zurück. Die 480 s sind nicht der Vorlauf, sondern die Sperre nach jedem Phasenwechsel (Pro Phasen-Cooldown).",
+    "wb_phase_up_export_wh" => "Export-Wh 1p→3p (Wattstunden, Standard 120, mindestens 50): Energiekonto der Hochschaltung. Es füllt sich mit dem Überschuss oberhalb des Referenzstroms (verschenkte Einspeisung bzw. Budget über dem 1p-Angebot), solange die Hochschaltbedingung gilt; unter dem 3p-Minimum plus Puffer zieht es das 3p-Defizit ab, sonst hält es; es sättigt bei der doppelten Schwelle. Ist das Konto voll, wird auf drei Phasen geschaltet, auch wenn der Vorlauf 1p→3p noch läuft (Uhr ODER Konto). Kleinere Werte schalten schneller, größere Werte verlangen mehr nachgewiesenen Überschuss.",
+    "wb_phase_up_symmetry_enable" => "Symmetrie-Klausel 1p→3p (Standard aus): Ein = eine einphasige Ladung gilt schon ab dem Schieflastwert (Schieflast-Wächter am Netzpunkt, Standard 20 A ≈ 4,6 kVA) als ausgereizt und darf mit ausreichend Überschuss (3p-Minimum plus Puffer) auf drei Phasen wechseln, damit die Einspeisung nicht einseitig auf einer Netzphase reduziert wird. Aus = nur Überschuss und wirksamer 1p-Deckel zählen. Vor dem Einschalten klären, ob die Unsymmetriegrenze des Netzbetreibers auch für die Einspeiseseite gilt.",
+    // Schlüssel gilt zusätzlich für den Wiederanlauf nach einem Kaskaden-Stop des Gruppen-Defizitreglers.
+    "wb_pv_only_release_hold_s" => "PV-only Halt-Freigabe (Sekunden, Standard 120, mindestens 30): Hat die Mehrfach-Wallbox-Zuteilung eine laufende Wallbox in der PV-only-Klasse auf den Mindeststrom gesetzt (Slot 0), wird eine Slot-Erhöhung erst übernommen, wenn der Slot so lange ununterbrochen über dem Mindeststrom stand; Slot 0 hält sofort wieder. Verhindert das Pendeln zwischen Mindeststrom und vollem Slot, wenn das Budget um das 3p-Minimum der anderen Wallbox liegt. Gilt ebenso für den Wiederanlauf nach einem Kaskaden-Stop des Gruppen-Defizitreglers (Netz- oder Akku-Wh-Konto): Der Start erfolgt erst, wenn das PV-Budget die Mindestleistung der erwarteten Phasenzahl (1p 1380 W, 3p 4140 W) so lange durchgehend deckt – eine einzelne Wolkenlücke startet nicht.",
+    "wb_pv_only_hold_stale_guard_s" => "PV-only Halt-Gnadenfrist (Sekunden, Standard 45, 10 bis 300): So lange trägt ein einzelner Poll-Aussetzer der Wallbox (kein frischer Status) oder eine kurz nicht bereite Gruppenzuteilung den Halt-Zustand weiter, ohne einen neuen Halt zu erteilen. Ohne Gnadenfrist setzt ein Aussetzer die Halt-Freigabe zurück und der nächste Zyklus gibt den vollen Slotstrom auf den Draht. Dauert der Aussetzer länger, endet die Halt-Episode.",
+    "wb1_restart_delay_s" => "Abweichende Wiedereinschalt-Pause nur für Wallbox 1 (Sekunden). Leer = globaler Wert.",
+    "wb1_min_charge_time_s" => "Abweichende Mindestladezeit nur für Wallbox 1 (Sekunden). Leer = globaler Wert.",
+    "wb1_cloud_stop_delay_s" => "Abweichender Wolken-Halt nur für Wallbox 1 (Sekunden). Leer = globaler Wert.",
+    "wb1_phase_change_hold_s" => "Abweichender Phasen-Halt nur für Wallbox 1 (Sekunden). Leer = globaler Wert.",
+    "wb2_restart_delay_s" => "Abweichende Wiedereinschalt-Pause nur für Wallbox 2 (Sekunden). Leer = globaler Wert.",
+    "wb2_min_charge_time_s" => "Abweichende Mindestladezeit nur für Wallbox 2 (Sekunden). Leer = globaler Wert.",
+    "wb2_cloud_stop_delay_s" => "Abweichender Wolken-Halt nur für Wallbox 2 (Sekunden). Leer = globaler Wert.",
+    "wb2_phase_change_hold_s" => "Abweichender Phasen-Halt nur für Wallbox 2 (Sekunden). Leer = globaler Wert.",
     "wb_openwb_zero_budget_hold_s" => "Legacy-Fallback für openWB Pro 0W-Haltezeit; neue Installationen nutzen die Wallbox-Zeitparameter oben.",
-    "openwb_pro_phase_wait_s" => "Cooldown und Leistungsreservierung nach einem openWB-Pro-Phasenwechsel. Dieser Wert belegt nicht die reale CP-Unterbrechungsdauer.",
-    "openwb_pro_phase_cp_interrupt_duration_s" => "Kurzer Geräteimpuls beim Phasenwechsel, wirksam 2 bis 30 Sekunden. Ein früherer Wert von 480 Sekunden wird auf 5 Sekunden migriert; der getrennte 480-Sekunden-Cooldown sperrt nur einen weiteren Phasenwechsel.",
-    "openwb_pro_phase_restart_delay_s" => "Zusätzliche Wiederanlaufverzögerung nach Ende der Phasen-CP-Unterbrechung. Strom wird außerdem nur bei frischem CP-inaktiv- und Zielphasen-Readback freigegeben.",
-    "openwb_pro_start_wakeup_delay_s" => "Kurze Wartezeit nach einem separaten Start-/Wake-up-CP-Impuls. Dieser Impuls bleibt kurz und wird nicht auf 480 Sekunden verlängert.",
+    "openwb_pro_phase_wait_s" => "Sperre nach einer bestätigten Phasenumschaltung der openWB Pro (Sekunden, Standard 480 = openWB-Referenz): so lange gibt es keinen weiteren Phasenwechsel, egal was das Budget sagt. Das ist nicht die Dauer der CP-Unterbrechung.",
+    "openwb_pro_phase_cp_interrupt_duration_s" => "Kurze Unterbrechung des Steuersignals (CP) beim Phasenwechsel, 2 bis 30 Sekunden – nur so lange, wie das Gerät braucht. Ein alter Wert 480 wird auf 5 migriert; die 480-Sekunden-Sperre ist ein eigener Wert (Pro Phasen-Cooldown).",
+    "openwb_pro_phase_restart_delay_s" => "Zusätzliche Wartezeit nach dem CP-Impuls des Phasenwechsels, bevor wieder Strom angeboten wird (Sekunden). Strom fließt außerdem erst nach frischem Readback von CP-inaktiv und Zielphasen.",
+    "openwb_pro_start_wakeup_delay_s" => "Wartezeit nach einem Weckimpuls (Start-CP-Impuls), bevor der Strom erneut angeboten wird (Sekunden). Der Impuls bleibt kurz und wird nie auf 480 Sekunden verlängert.",
+    "openwb_pro_automatic_start_cp_enable" => "Weckimpuls der openWB Pro, wenn ein Fahrzeug das Stromangebot nicht annimmt. Auto: nur mit Fahrzeugprofil, das den Impuls verlangt. Ein: für die ganze Anlage – nach der Karenz bis zu 3 Impulse je Stecken, höchstens ein Impuls je Wiederholzyklus. Aus: nie.",
+    "openwb_pro_start_cp_grace_s" => "Wartezeit ab dem bestätigten Stromangebot der openWB Pro, bevor der erste Weckimpuls kommt (Sekunden). Ein normal startendes Auto zieht innerhalb von 10–60 s Strom und wird nicht unterbrochen. Ein Weckimpuls kommt nie unter 60 s, nie solange die Box kein Angebot ≥ 6 A meldet, nie bei angenommener PWM und nie kurz nach einem Phasenwechsel. Ein Fahrzeugprofil mit Impulsbedarf erlaubt den Impuls, verkürzt die Karenz aber nicht.",
+    // Startfenster und Wiederholzyklus der openWB Pro.
+    "openwb_pro_start_hold_s" => "So lange bleibt das Stromangebot nach dem bestätigten Angebot der Box (Readback ≥ 6 A) stehen: kein 0 A und keine Anhebung, bis das Auto Leistung aufnimmt (wie die Abschaltverzögerung von evcc, 3 min). Eine Absenkung ab 6 A, etwa nach einem Neustart der Box, folgt sofort. Nur Nutzer-Aus, Pause, Sperre, Notaus, Hausanschlussgrenze oder ungültige Messwerte stoppen früher. Dieselbe Zeit gilt als Abschaltverzögerung ohne PV-Budget.",
+    "openwb_pro_start_retry_cycle_s" => "Nimmt das Auto das Stromangebot im Startfenster nicht an, bleibt das Angebot stehen und wird in diesem Abstand als neuer Startzyklus gewertet: je Zyklus höchstens ein Weckimpuls, höchstens drei Zyklen je Stecken (openWB empfiehlt 3–5 Minuten). Danach bleibt das Angebot mit der Meldung „Fahrzeug lädt trotz Freigabe nicht“ stehen. Ein Ladeende wird nur bei erreichtem Ziel-SoC gesetzt. Es wird nie 0 A geschrieben, solange PV-Budget vorhanden ist.",
+    "wb_native_floor_retry_enable" => "E3DC-Wallbox: Darf nach einem eigenen Stopp (wbminSoC-Untergrenze, Wolke, Akku- oder Netzstopp) in derselben Stecksession wieder gestartet werden? Aus (Standard): gesperrt bis zum Dienstneustart. Ein: neuer Startimpuls nur nach frischem Leerlauf-Readback, mit Budget und Überschuss über dem Phasenminimum, ohne Netzbezug oder Entladung – geprüft unmittelbar vor dem Impuls.",
     "wb_openwb_auto_discovery" => "Liest openWB Software 2.x read-only aus und erkennt vorhandene Ladepunkte automatisch.",
     "wb_openwb_auto_role_enable" => "Passt den openWB-Treiber an die erkannte Primary-/Secondary-Rolle an, ohne die openWB-Konfiguration zu ändern.",
     "wb_openwb_command_fail_limit" => "Anzahl nicht bestätigter openWB-Schreibbefehle, bevor der Fehler im Frontend gemeldet und kurz pausiert wird.",
@@ -704,8 +758,10 @@ $tooltips = [
     "heat_wp_daily_kwh" => "Fallback-Wärmebedarf pro 24h, wenn keine empirischen Messdaten vorhanden sind. Leer bedeutet: erst ML/Historie, dann konservativer wissenschaftlicher Fallback.",
     "cheap_grid_battery_max_soc" => "Obergrenze für Netzladen des Speichers in %. Zusätzlich begrenzt die PV-Prognose, damit PV-Freiraum erhalten bleibt.",
     "cheap_grid_battery_max_w" => "Maximale Netzladeleistung in Watt. 0 = Systemlimit aus der Speicher-Konfiguration nutzen.",
-    "market_min_margin_pct" => "Mindestmarge für preisbasierte Speicher-Netzladung nach Wirkungsgrad, Batteriekosten und Sicherheitskorrektur. Halten nutzt nur Preisabstand und Sicherheitskorrektur. Empfehlung und Standard: 10%.",
-    "market_safety_correction_ct_per_kwh" => "Sicherheitskorrektur in ct/kWh für die normale Preisregelung. Positive Werte rechnen konservativer, negative Werte aggressiver.",
+    "market_charge_profile" => "Ladeprofil für preisbasiertes Speicher-Netzladen. Wirtschaftlich: nur bei Prognosedefizit und 10 % Marge. Ausgeglichen: nur bei Prognosedefizit, ohne Marge. Komfort: im Preisfenster bis zum Zielstand am Fensterende, PV wird zuerst angerechnet, kein Defizit nötig. Eigene Einstellungen: alle Felder frei. Notstromreserve, Hausanschluss und Reserven gelten in jedem Profil.",
+    "market_price_limit_ct" => "Komfort-Preislimit in ct/kWh: bis zu diesem Abrechnungspreis wird im Preisfenster geladen. Leer = Mittelpreis des Tarifs (Octopus Heat aus den festen Fenstern) bzw. des gebundenen Preishorizonts, je Plan bestimmt. Nur im Profil Komfort wirksam; der Negativpreis-Boost nutzt weiterhin seine eigene Preisgrenze.",
+    "market_min_margin_pct" => "Mindestmarge für preisbasierte Speicher-Netzladung nach Wirkungsgrad, Batteriekosten und Sicherheitskorrektur. Halten nutzt nur Preisabstand und Sicherheitskorrektur. Empfehlung und Standard: 10%. Wird vom Ladeprofil gesetzt; nur bei „Eigene Einstellungen“ frei.",
+    "market_safety_correction_ct_per_kwh" => "Sicherheitskorrektur in ct/kWh für die normale Preisregelung. Positive Werte rechnen konservativer, negative Werte aggressiver. Negative Werte machen auch Normalpreis-Stunden rechnerisch lohnend und erhöhen das Ladevolumen. Wird vom Ladeprofil gesetzt; nur bei „Eigene Einstellungen“ frei.",
     "market_autarky_first_enable" => "PV-autark zuerst: blockiert normales Markt-Netzladen und Speicher-Halten, wenn Speicher plus erwarteter PV-Überschuss den restlichen Horizont decken. Negativpreis-Boost bleibt separat.",
     "market_autarky_low_soc_pct" => "Low-SOC-Ausnahme in %. Fällt der Speicher darunter, darf ein explizit freigegebener Markt-Speicherpfad trotz guter Tagesprognose wieder Netzladen prüfen.",
     "market_autarky_horizon_buffer_wh" => "Energiepuffer in Wh für die Autarkieprüfung. Nur wenn die Horizontbilanz oberhalb dieses Puffers liegt, blockiert PV-autark zuerst den normalen Marktpfad.",
@@ -895,8 +951,11 @@ $tooltips = [
     "wp_pv_battery_max_w"    => "Maximale für die WP erlaubte Akku-Überbrückungsleistung. Tatsächliche Speichergrenzen, Notstromreserve und andere gebundene Verbraucher gelten zusätzlich. 0 = keine Akkuüberbrückung.",
     "wp_pv_grid_max_w"       => "Maximale für die WP erlaubte Netz-Überbrückungsleistung. Hausanschlussgrenzen gelten zusätzlich. Leistung in W und Energiekontingent in Wh müssen beide ausreichen. 0 = keine Netzüberbrückung.",
     "wp_pv_reaction_s"       => "Für das Geräteprofil anzusetzende Reaktionsfrist einschließlich Messalter, Steuerung und wirksamer Lastanpassung. Standard 30 Sekunden ist eine Planungsannahme und muss zur Anlage passen; keine garantierte Herstellergrenze.",
-    "wp_pv_start_wait_s"     => "Wartefrist auf einen tatsächlich gestarteten Verdichter nach dem WP-Auftrag. Mindestens 600 Sekunden. Danach wird der ungenutzte PV-Auftrag unter Beachtung der Schutzzeiten zurückgenommen; seine Wirkung bleibt bis zur Klärung gebunden.",
-    "wp_pv_handoff_timeout_s" => "Wartefrist auf die tatsächlich gesunkene Wallboxleistung vor dem WP-Startauftrag. Standard 120 Sekunden. Diese Frist beginnt vor der gesonderten Prüfung des gesendeten WP-Befehls.",
+    "wp_pv_start_wait_s"     => "Wartefrist auf einen tatsächlich gestarteten Verdichter nach dem WP-Auftrag (Sekunden, mindestens 600). So lange bleibt die Startleistung für die Wärmepumpe reserviert. Startet der Verdichter nicht, geht die Reservierung an die nachrangigen Verbraucher (z. B. Wallbox); der Sollwert bleibt stehen, die Anlage startet nach ihrer eigenen Hysterese, und ab dem gemessenen Verdichterstart zählt wieder die Istaufnahme.",
+    "wp_pv_hz_hysteresis_k"  => "Schalthysterese der Wärmepumpe für die Heizung in Kelvin, wie in der Anlage hinterlegt (Standard 3,5 K). E3DC-Control meldet Heizbedarf erst, wenn der Rücklauf um diesen Wert unter dem PV-Sollwert liegt – so wird nur reserviert, wenn die Anlage mit stehendem Sollwert auch wirklich startet.",
+    "wp_pv_ww_hysteresis_k"  => "Schalthysterese der Wärmepumpe für Warmwasser in Kelvin, wie in der Anlage hinterlegt (Standard 8 K). E3DC-Control meldet Warmwasserbedarf erst, wenn die Ist-Temperatur um diesen Wert unter dem PV-Sollwert liegt.",
+    "wp_pv_boost_release_s"  => "Wolkenüberbrückung des PV-Boosts (Sekunden, Standard 300, mindestens 30). Der Boost steht wie eine SG-Ready-Freigabe: Die PV-Sollwerte bleiben gesetzt, bis die PV-Deckung so lange unter der Startleistung liegt oder eine Schutzfunktion greift. Ein Verdichterstopp oder eine erreichte Temperatur beenden den Boost nicht – die Anlage regelt intern.",
+    "wp_pv_handoff_timeout_s" => "Wartefrist auf die tatsächlich gesunkene Wallboxleistung vor dem WP-Startauftrag (Sekunden, Standard 120). Gilt nur bei Wallbox-Vorrang; bei Wärmepumpen-Vorrang wird der Sollwert sofort gesetzt und die Wallbox regelt parallel auf ihr gesenktes Ziel. Diese Frist beginnt vor der gesonderten Prüfung des gesendeten WP-Befehls.",
     "min_soc"                => "Minimaler Batterie-SoC (%) unter dem der WP-Boost nie gestartet wird. Dient dem Notreserve-Schutz.",
     "heizgrenze_temp"        => "Außentemperatur (°C) unter der Heizungs-Boost aktiviert wird. Standard: 10°C.",
     "wws"                    => "Warmwasser-Solltemperatur Sommer (°C). Luxtronik/IDM: Register-Sollwert für Software-Thermostat.",
@@ -958,33 +1017,39 @@ $tooltips = [
     "dvcarlimit"             => "Netzpreislimit nur für den Wallbox-Modus 'Sofort bis Preislimit'. Geplante Ladefenster werden dadurch nicht gekürzt, blockiert oder gelöscht.",
     "wb_native_type"         => "E3/DC-Produktfamilie und Transportrolle. Auto belegt den gemeinsamen RSCP-Status; direkte Sun-/Auto-/Abort-, Maximalstrom- und native Phasenbefehle bleiben gesperrt.",
     "wb1_e3dc_wbchar6_compat_enable" => "Empfohlene Community-Regelung für E3/DC efy, Easy Connect und bestehende E3/DC-Anlagen: Modus und Strom laufen über den flüchtigen WBchar6-Rahmen. Startimpulse sind je bestätigter Stop-Episode begrenzt.",
+    "wb_e3dc_direct_phase_control_enable" => "Experimentell, Standard aus. Ein: E3DC-Control schaltet bei ausdrücklich gewählter E3/DC efy oder Multi Connect die Phasen selbst. Je Phasenwechsel werden die Geräteeinstellungen Sonnenmodus, automatische Phasenumschaltung und Phasenzahl geschrieben und bei der Rückgabe wiederhergestellt. Ob die Wallbox diese Einstellungen dauerhaft speichert, ist nicht belegt – nicht für den Dauerbetrieb empfohlen. Solange der Schalter an ist, gibt es keine Sonnenmodus-Übergabe an die E3/DC-Automatik. Je Wallbox überschreibbar mit wb1_/wb2_e3dc_direct_phase_control_enable.",
     "wb_native_ip"           => "IP-Adresse Wallbox 1 (leer bei E3DC-eigener Wallbox, die per RSCP gesteuert wird).",
     "wb1_topic_prefix"       => "MQTT Topic Prefix für openWB 1, z.B. 'openWB/simpleAPI/chargepoint'.",
     "wb_native_type2"        => "Hardware-Typ Wallbox 2 (optional). Ein fehlender oder leerer Altbestandswert bleibt unverändert und erlaubt nur die frisch bestätigte openWB-Autoerkennung; 'none' schaltet Wallbox 2 ausdrücklich aus.",
     "wb_native_ip2"          => "IP-Adresse Wallbox 2.",
     "wb2_topic_prefix"       => "MQTT Topic Prefix für openWB 2.",
-    "wbminsoc"               => "Minimaler Batterie-SoC (%) damit die Wallbox laden darf. Unter diesem Wert: Laden gesperrt.",
-    "wbmaxladestrom"         => "Globaler Fallback für den maximalen Ladestrom. Einzelne Wallboxen können in Wallbox.php abweichend begrenzt werden, z.B. WB1 32A und WB2 16A.",
-    "wb1_max_amp"            => "Optionaler maximaler Sollstrom für Wallbox 1. Leer bedeutet: bisherigen globalen Max. Ladestrom/Fallback verwenden.",
-    "wb2_max_amp"            => "Optionaler maximaler Sollstrom für Wallbox 2. Leer bedeutet: bisherigen globalen Max. Ladestrom/Fallback verwenden.",
-    "wb1_current_step_amp"   => "Strom-Schrittweite für Wallbox 1. 1,0 A ist konservativ. 0,1 A nur nutzen, wenn Treiber und Wallbox/Firmware Dezimal-Ampere wirklich übernehmen; openWB Pro kann 0,1 A.",
-    "wb2_current_step_amp"   => "Strom-Schrittweite für Wallbox 2. 1,0 A ist konservativ. 0,1 A nur nutzen, wenn Treiber und Wallbox/Firmware Dezimal-Ampere wirklich übernehmen; openWB Pro kann 0,1 A.",
-    "wb_surplus_target_grid_w" => "Zielwert der schnellen Wallbox-PV-Regelung am Netzanschlusspunkt. Negativ bedeutet eine kleine Resteinspeisung.",
-    "wb_surplus_noise_w"     => "Zusätzlicher Totbereich der schnellen Wallbox-PV-Regelung in Watt. Verhindert Nachregeln auf Messrauschen.",
-    "phase_transition_safety_margin_w" => "Zusätzliche Leistungsreserve je aktivem Phasenwechsel in Watt. 0 verwendet die automatisch berechnete Reserve.",
-    "heatpump_start_settle_s" => "Zeit in Sekunden, in der nach einem erkannten Wärmepumpenstart keine Wallbox-Aufregelung erfolgt.",
-    "grid_max_amps"          => "Hausabsicherung/SLS in Ampere je Phase (z. B. 35, 40, 50 oder 63 A). Dieses harte Hardwarelimit gilt in allen von E3DC-Control aktiv geregelten Lademodi. Ohne bestätigte PCC-RMS-Phasenströme wird aus Wirkleistung kein zusätzlicher Spielraum berechnet; maßgeblich bleiben Hausabsicherung minus konfigurierte Reserve sowie die Wallbox-Grenzen.",
+    "wbminsoc"               => "Haus-Priorität: Unter diesem Hausakku-SoC (%) bekommt die Wallbox keinen Strom aus dem Speicher – nur echten PV-Überschuss. Darüber darf der Akku im Rahmen der Ladekurve mithelfen. Reines PV-Laden wird dadurch nie gesperrt.",
+    "wbmaxladestrom"         => "Standard-Maximalstrom je Wallbox (A). Gilt, wenn bei WB1/WB2 kein eigener Wert steht. Die Hausabsicherung bleibt immer die harte Obergrenze.",
+    "wb1_max_amp"            => "Eigener Maximalstrom für Wallbox 1 (A). Leer = Standard-Maximalstrom.",
+    "wb2_max_amp"            => "Eigener Maximalstrom für Wallbox 2 (A). Leer = Standard-Maximalstrom.",
+    "wb1_current_step_amp"   => "Schrittweite, in der der Ladestrom von Wallbox 1 geändert wird. 1 A ist für alle Wallboxen sicher; 0,5 A und 0,1 A nur, wenn Wallbox und Firmware Dezimal-Ampere wirklich umsetzen (openWB Pro kann 0,1 A).",
+    "wb2_current_step_amp"   => "Schrittweite, in der der Ladestrom von Wallbox 2 geändert wird. 1 A ist für alle Wallboxen sicher; 0,5 A und 0,1 A nur, wenn Wallbox und Firmware Dezimal-Ampere wirklich umsetzen (openWB Pro kann 0,1 A).",
+    "wb_surplus_target_grid_w" => "Zielwert am Netzanschluss für die schnelle PV-Regelung der Wallbox (W). Negativ = kleine Resteinspeisung als Sicherheitsabstand zum Netzbezug, z. B. −125 W.",
+    "wb_surplus_noise_w"     => "Totbereich der schnellen PV-Regelung (W): Abweichungen unterhalb dieses Werts werden ignoriert, damit der Ladestrom nicht auf Messrauschen reagiert.",
+    "phase_transition_safety_margin_w" => "Zusätzliche Leistungsreserve während eines Phasenwechsels (W). 0 = automatisch aus Mindeststrom und Phasenzahl berechnet.",
+    "heatpump_start_settle_s" => "Nach einem erkannten Wärmepumpenstart wird die Wallbox so lange nicht weiter hochgeregelt (Sekunden), damit der Verdichter seinen Anlaufstrom sicher bekommt.",
+    "wb_curve_pv_only_house_reserve_w" => "Reserve unter der Ladekurve (W): Liegt der Hausspeicher unter seinem Zielkorridor und ist das Stützkontingent der Wallbox-Ladung verbraucht, deckt der Akku nur noch Hauslast und Wärmepumpe – plus diese Reserve, die er zusätzlich zur Hauslast liefern darf, damit Lastsprünge nicht ins Netz gehen. Die Wallboxen bekommen dann nur echten PV-Überschuss. Standard 300 W, Mindestwert 300 W (kleinere Werte hebt die Regelung automatisch an).",
+    "storage_home_wp_split" => "Wärmepumpe im Hauswert: Sagt dem Speicher-Manager, ob die Leistung der Wärmepumpe schon im Hauswert des E3DC steckt. „Wärmepumpe steckt im Hauswert“ (include): Das E3DC misst die Wärmepumpe im Hausverbrauch mit – typisch ohne separaten Wurzelzähler, wenn die Wärmepumpe hinter dem E3DC-Hausanschluss hängt; die Regelung rechnet die gemeldete WP-Leistung aus dem Hauswert heraus und führt Haus und Wärmepumpe getrennt. „Wärmepumpe getrennt gemessen“ (separate): Die Wärmepumpe hängt an einem eigenen Zähler außerhalb des E3DC-Hauswerts und zählt zusätzlich dazu. „Automatisch“ (auto, Standard): Die Regelung rät je Messung – die Wärmepumpe gilt als im Hauswert enthalten, wenn der rohe Hauswert mindestens 500 W bzw. 55 % der WP-Leistung erreicht. Achtung: Bei kleiner Rohhauslast (z. B. Verdichterstopp, der Hauswert fällt vor der WP-Leistung) kann die Automatik zwischen beiden Sichten springen; wer seine Anlage kennt, wählt deshalb fest include oder separate.",
+    "grid_max_amps"          => "Hausabsicherung/SLS in Ampere je Phase (z. B. 35, 40, 50 oder 63 A). Dieses harte Hardwarelimit gilt in allen von E3DC-Control aktiv geregelten Lademodi. Nur ein ausdrücklich eingetragener Wert gibt den einphasigen Deckel der openWB Pro über 20 A frei – der Standard 35 A zählt dafür nicht. Maßgeblich bleiben Hausabsicherung minus konfigurierte Reserve sowie die Wallbox-Grenzen.",
     "grid_max_amps_l1"       => "Optionales abweichendes Betriebslimit für Netzphase L1. Leer verwendet die globale Hausabsicherung. Nur einen tatsächlich bekannten Wert eintragen.",
     "grid_max_amps_l2"       => "Optionales abweichendes Betriebslimit für Netzphase L2. Leer verwendet die globale Hausabsicherung. Nur einen tatsächlich bekannten Wert eintragen.",
     "grid_max_amps_l3"       => "Optionales abweichendes Betriebslimit für Netzphase L3. Leer verwendet die globale Hausabsicherung. Nur einen tatsächlich bekannten Wert eintragen.",
-    "grid_wallbox_reserve_amps" => "Betriebsreserve für übrige Hausverbraucher unterhalb der Hausabsicherung je Phase. Der Wallbox-Regler begrenzt das gemeinsame Wallbox-Budget auf Hausabsicherung minus Reserve (z. B. bei 50 A SLS und 10 A Reserve auf 40 A je Phase).",
+    "grid_wallbox_reserve_amps" => "Betriebsreserve für übrige Hausverbraucher unterhalb der Hausabsicherung je Phase. Der Wallbox-Regler begrenzt das gemeinsame Wallbox-Budget auf Hausabsicherung minus Reserve (z. B. bei 50 A SLS und 10 A Reserve auf 40 A je Phase). Für den einphasigen Deckel der openWB Pro gilt dasselbe Betriebslimit; die Reserve deckt zusammen mit der Leistungsfaktor-Reserve Messverzug (RSCP 2–3 s, Rampe 1 A je Regelschritt) und den Spannungs-Fallback ab – unter 2 A nicht empfohlen.",
     "grid_wallbox_reserve_amps_l1" => "Optionale zusätzliche Reserve für Netzphase L1. Leer verwendet die globale Wallbox-Reserve.",
     "grid_wallbox_reserve_amps_l2" => "Optionale zusätzliche Reserve für Netzphase L2. Leer verwendet die globale Wallbox-Reserve.",
     "grid_wallbox_reserve_amps_l3" => "Optionale zusätzliche Reserve für Netzphase L3. Leer verwendet die globale Wallbox-Reserve.",
-    "wb1_grid_phase"         => "Physische Zuordnung der lokalen Wallbox-Phase L1 zum Netzanschlusspunkt L1, L2 oder L3. Erst nach Messprüfung setzen; keine automatische Vermutung.",
-    "wb2_grid_phase"         => "Physische Zuordnung der lokalen Wallbox-Phase L1 zum Netzanschlusspunkt L1, L2 oder L3. Erst nach Messprüfung setzen; keine automatische Vermutung.",
-    "wb1_openwb_pro_1p_max_amp" => "Nutzergrenze für einphasiges Laden an openWB Pro 1. Über 20 A benötigen zusätzlich eine gebundene, frische phasenaufgelöste PCC-RMS-Strommessung. Reine Wirkleistung reicht als Sicherungsschutz nicht aus.",
-    "wb2_openwb_pro_1p_max_amp" => "Nutzergrenze für einphasiges Laden an openWB Pro 2. Über 20 A benötigen zusätzlich eine gebundene, frische phasenaufgelöste PCC-RMS-Strommessung. Reine Wirkleistung reicht als Sicherungsschutz nicht aus.",
+    "wb1_grid_phase"         => "Auf welcher Netzphase (L1, L2 oder L3) liegt die lokale Phase L1 von Wallbox 1? Eintragen, was der Elektriker angeschlossen hat; E3DC-Control prüft die Zuordnung beim einphasigen Laden ab 8 A automatisch (Last und Stromsprünge müssen auf dieser Netzphase erscheinen). Stimmt sie nicht, zeigt das Dashboard „Phasenzuordnung WB1 stimmt nicht: Last auf Lx statt Ly“ und es bleibt bei 20 A. Eine Änderung setzt den Nachweis zurück.",
+    "wb2_grid_phase"         => "Auf welcher Netzphase (L1, L2 oder L3) liegt die lokale Phase L1 von Wallbox 2? Eintragen, was der Elektriker angeschlossen hat; E3DC-Control prüft die Zuordnung beim einphasigen Laden ab 8 A automatisch (Last und Stromsprünge müssen auf dieser Netzphase erscheinen). Stimmt sie nicht, zeigt das Dashboard „Phasenzuordnung WB2 stimmt nicht: Last auf Lx statt Ly“ und es bleibt bei 20 A. Eine Änderung setzt den Nachweis zurück.",
+    "wb1_openwb_pro_1p_max_amp" => "Obergrenze für einphasiges Laden an openWB Pro 1 (A). Mehr als 20 A werden dynamisch freigegeben aus Hausabsicherung − Reserve − gemessenem Bezug der zugeordneten Netzphase (E3DC-Wurzelzähler ÷ Wechselrichter-Spannung), begrenzt durch den Schieflast-Wächter; Anhebung 1 A je Regelschritt, Absenkung sofort; nur bei bestätigter Zuordnung und frischen Messwerten, sonst 20 A.",
+    "wb2_openwb_pro_1p_max_amp" => "Obergrenze für einphasiges Laden an openWB Pro 2 (A). Mehr als 20 A werden dynamisch freigegeben aus Hausabsicherung − Reserve − gemessenem Bezug der zugeordneten Netzphase (E3DC-Wurzelzähler ÷ Wechselrichter-Spannung), begrenzt durch den Schieflast-Wächter; Anhebung 1 A je Regelschritt, Absenkung sofort; nur bei bestätigter Zuordnung und frischen Messwerten, sonst 20 A.",
+    "wb_pcc_phase_basis"     => "Messbasis 1p-Deckel openWB Pro: Woraus der einphasige Stromdeckel der openWB Pro oberhalb von 20 A berechnet wird. Standard: Netzbezug je Phase vom E3DC-Wurzelzähler geteilt durch die vom Wechselrichter gemessene Phasenspannung (sonst 230 V) plus gemessener Wallbox-Strom. „Aus“ hält fest 20 A. Für mehr als 20 A müssen eine einphasige Obergrenze über 20 A („openWB Pro 1p Max.“ der Wallbox) und die Hausabsicherung ausdrücklich eingetragen, die Netzphase der Wallbox zugeordnet und diese Zuordnung von E3DC-Control beim Laden automatisch bestätigt sein („Zuordnung bestätigt“ im Dashboard). Fehlen frische Messwerte (10 s), gilt sofort wieder 20 A.",
+    "wb_pcc_power_factor_margin" => "Leistungsfaktor-Reserve Fremdlast: Sicherheitsfaktor für den Anteil des Netzbezugs, der nicht von der Wallbox stammt (Haus, Wärmepumpe, zweite Wallbox): dessen Strom wird durch diesen Faktor geteilt, weil aus Wirkleistung und Spannung kein Blindstrom sichtbar ist. 0,9 = 11 % Aufschlag; 1,0 nur bei rein ohmschen Lasten. Der Wallbox-Anteil wird als echter Strom von der openWB Pro gemessen und braucht keinen Aufschlag.",
+    "grid_pcc_imbalance_max_a" => "Schieflast-Wächter am Netzpunkt (A), nur openWB Pro: Höchste zulässige Differenz der Bezugsströme zwischen der Wallbox-Phase und der am wenigsten belasteten Phase am Hausanschluss; Einspeisung zählt als 0 A (20 A ≙ 4,6 kVA, übliche Netzbetreiber-Vorgabe). Das E3DC entlädt und speist in der Regel gleichmäßig über alle drei Phasen: Dann sinkt der Bezug der Wallbox-Phase, und der Deckel steigt nachts auf etwa 28–29 A, tagsüber je nach Einspeisung bis zur eingestellten 1p-Obergrenze. Ohne jeden Ausgleich (leerer Akku, keine PV) bleibt er bei 20 A; unter 20 A senkt der Wächter nie. Wer einphasig strikt 20 A einhalten muss, lässt die 1p-Obergrenze der openWB Pro leer. Nur nach Rücksprache mit dem Netzbetreiber erhöhen.",
     "wbcostpowers"           => "Typische Wallbox-Ladeleistungen in kW für Kostenberechnung, z.B. '7.2, 11.0, 22.0'.",
     "smart_wbhour_enable"    => "Dynamische Ladeplanung: 1=Auto (SoC-basiert), 0=Manuell (wbhour aus UI).",
     "car_capacity"           => "Fahrzeug-Batteriekapazität in kWh (für SoC-basierte Ladeplanung ohne Bluelink).",
@@ -998,7 +1063,10 @@ $tooltips = [
     "v2h_bat_soc_limit"      => "Haus-Speicher-SoC (%) für die read-only V2H/V2G-Warnung.",
 
     // Bluelink (Hyundai/Kia SoC)
-    "bluelink_refresh_token" => "Hyundai/Kia Bluelink oAuth Refresh-Token für automatische SoC-Abfrage. Via App oder Token-Generator.",
+    "bluelink_user"          => "Benutzer (E-Mail) des Hyundai-Bluelink- bzw. Kia-Connect-Kontos für die automatische SoC-Abfrage. Wird lokal gespeichert und in Diagnosen redigiert.",
+    "bluelink_password"      => "Passwort des Hyundai-/Kia-Kontos. Wird lokal gespeichert, als Passwortfeld angezeigt und in Diagnosen redigiert; eine aktive Zwei-Faktor-Anmeldung (Einmalcode) wird nicht unterstützt.",
+    "bluelink_pin"           => "Optionale PIN des Hyundai-/Kia-Kontos (nur Ziffern); nur nötig, wenn das Konto eine PIN verlangt.",
+    "bluelink_brand"         => "Marke des Herstellerkontos: hyundai (Bluelink) oder kia (Kia Connect).",
     "bluelink_vin"           => "Fahrzeug-Identifikationsnummer (VIN) des Hyundai/Kia Fahrzeugs.",
     "bluelink_car_name"      => "Anzeigename des Fahrzeugs im Dashboard.",
     "bluelink_interval"      => "Abfrage-Intervall in Minuten (Standard: 15). Achtung: zu häufige Abfragen können Bluelink-API-Limits triggern.",
@@ -1071,7 +1139,7 @@ $tooltips = [
     "climate_meter_phase"    => "Phase oder Messkanal der Klimaanlage. Beim Shelly EM Gen1 Kanal 0, Kanal 1 oder Summe wählen; bei den übrigen Zählern die elektrische Phase.",
     "climate_min_power_w"    => "Leistungsschwelle, ab der die Klimaanlage als aktiv gilt. Das ist nur Diagnose und kein Schaltwert.",
     "climate_poll_s"         => "Leseintervall des Klima-Messdienstes in Sekunden.",
-    "climate_history_enable" => "Speichert eine eigene Klima-Historie unter data/climate_history, damit Prognose und Auswertung später nicht aus dem Hausverbrauch raten müssen.",
+    "climate_history_enable" => "Speichert eine eigene Klima-Historie unter data/climate_history, damit Prognose und Auswertung später nicht aus dem Hausverbrauch raten müssen. Tagesdateien älter als 90 Tage werden automatisch entfernt; die Prognose nutzt höchstens 45 Tage.",
     "climate_history_interval_s" => "Erfassungsintervall der Klima-Historie in Sekunden. Die Messpunkte werden im RAM gesammelt und spätestens alle fünf Minuten gebündelt in die Tagesdatei geschrieben.",
     "climate_forecast_enable" => "Aktiviert die Klima-Verbrauchsprognose aus gemessener Klima-Historie und Wetter-/Außentemperatur. Das wirkt nur auf Planung und Anzeige, nicht auf Schaltbefehle.",
     "climate_control_enable" => "Aktiviert den Klima-Statusdienst. Toshiba wird nur read-only gelesen; es werden keine Toshiba-Kommandos gesendet.",
@@ -1441,8 +1509,9 @@ function e3dc_config_auto_install_rules() {
         'bluelink' => [
             'label' => 'Hyundai/Kia Bluelink',
             'service' => 'e3dc-bluelink',
-            'config_keys' => ['bluelink_refresh_token', 'bluelink_vin'],
-            'when' => ['any' => [['type' => 'nonempty', 'key' => 'bluelink_refresh_token'], ['type' => 'nonempty', 'key' => 'bluelink_vin']]],
+            'config_keys' => ['bluelink_user', 'bluelink_password', 'bluelink_pin', 'bluelink_brand', 'bluelink_vin'],
+            // Wie optional_service_contract.py: Der Client meldet sich nur mit Benutzer und Passwort an.
+            'when' => ['all' => [['type' => 'nonempty', 'key' => 'bluelink_user'], ['type' => 'nonempty', 'key' => 'bluelink_password']]],
         ],
         // e3dc-notifier ist ein Kerndienst und wird vom Update/Install-All sichergestellt.
         'mqtt' => [
@@ -1494,6 +1563,13 @@ function e3dc_config_setting_requirements() {
     }
     $rules['market_wallbox_enable']['requirements'][] = $wallbox;
     $rules['market_wallbox_enable']['note'] = 'Zusätzlich muss der betreffende Ladepunkt auf „Sofort bis Preislimit“ stehen. PV-Modi und gespeicherte Ladepläne behalten ihre eigenen Regeln.';
+    // Ladeprofil und Komfort-Preislimit (nur im Profil Komfort wirksam).
+    $rules['market_charge_profile'] = ['label' => 'Ladeprofil Speicher-Netzladen', 'requirements' => [$eco, $marketTariff,
+        ['when' => ['type' => 'enabled', 'key' => 'market_battery_grid_charge_enable'], 'reason' => 'Speicher-Netzladen freigeben; ohne Freigabe bleibt jedes Profil wirkungslos.']],
+        'summary' => true, 'note' => 'Das Profil setzt Marge, Sicherheitskorrektur und Preislimit. Notstromreserve, Hausanschluss, Reserven und Ladeziel gelten in jedem Profil.'];
+    $rules['market_price_limit_ct'] = ['label' => 'Komfort-Preislimit', 'requirements' => [$eco, $marketTariff,
+        ['when' => ['type' => 'equals', 'key' => 'market_charge_profile', 'value' => 'comfort'], 'reason' => 'Ladeprofil „Komfort“ wählen.']],
+        'note' => 'Leer = Mittelpreis des Tarifs bzw. des gebundenen Preishorizonts. Der Negativpreis-Boost behält seine eigene Preisgrenze.'];
     foreach ([
         'cheap_grid_battery_enable' => 'Speicher im Negativpreis-Boost',
         'cheap_grid_wallbox_enable' => 'Wallbox im Negativpreis-Boost',
@@ -1742,7 +1818,7 @@ function e3dc_apply_config_backup_dir_permissions($path, $install_user, $data = 
 
 function e3dc_config_sensitive_key($key) {
     $k = strtolower((string)$key);
-    if (preg_match('/(password|passwort|pwd|token|secret|api[_-]?key|apikey|aes|private|chat[_-]?id|web[_-]?pin|refresh[_-]?token)/', $k)) {
+    if (preg_match('/(password|passwort|pwd|token|secret|api[_-]?key|apikey|aes|private|chat[_-]?id|web[_-]?pin|refresh[_-]?token|bluelink[_-]?pin|bluelink[_-]?user)/', $k)) {
         return true;
     }
     return in_array($k, ['hoehe', 'laenge', 'latitude', 'longitude', 'email'], true);
@@ -1872,9 +1948,40 @@ function e3dc_aux_inverter_prepare_config($data) {
     return $data;
 }
 
+function e3dc_market_charge_profile_effective($data) {
+    // Dieselbe reine Ableitung wie Planer-Vertrag und Update-Migration (Marge != 10 oder
+    // Sicherheitskorrektur != 0 -> custom, sonst economic); ein gesetztes Profil bleibt.
+    $raw = strtolower(trim((string)($data['market_charge_profile'] ?? '')));
+    if (in_array($raw, ['economic', 'balanced', 'comfort', 'custom'], true)) return $raw;
+    if ($raw !== '') return 'economic';
+    $read = function($primary, $fallback, $default) use ($data) {
+        foreach ([$primary, $fallback] as $key) {
+            $v = trim((string)($data[$key] ?? ''));
+            if ($v === '') continue;
+            $n = str_replace(',', '.', $v);
+            if (is_numeric($n)) return (float)$n;
+        }
+        return (float)$default;
+    };
+    $margin = $read('market_min_margin_pct', 'direct_marketing_min_margin_pct', 10.0);
+    $safety = $read('market_safety_correction_ct_per_kwh', 'direct_marketing_safety_margin_ct_per_kwh', 0.0);
+    return (abs($margin - 10.0) > 0.05 || abs($safety) > 0.005) ? 'custom' : 'economic';
+}
+
 function e3dc_storage_market_prepare_config($data) {
     if (in_array(strtolower(trim((string)($data['market_battery_grid_charge_enable'] ?? '0'))), ['1', 'true', 'yes', 'on'], true)) {
         $data['market_battery_hold_enable'] = 1;
+    }
+    // Profil und Zahlen können nicht auseinanderlaufen – bei economic/balanced/comfort werden Marge und
+    // Sicherheitskorrektur auf die Profilwerte normalisiert (auch über „Weitere Parameter“ oder Upload).
+    if (array_key_exists('market_charge_profile', $data)) {
+        $profile = e3dc_market_charge_profile_effective($data);
+        $data['market_charge_profile'] = $profile;
+        $presets = ['economic' => ['10.0', '0.0'], 'balanced' => ['0.0', '0.0'], 'comfort' => ['0.0', '0.0']];
+        if (isset($presets[$profile])) {
+            $data['market_min_margin_pct'] = $presets[$profile][0];
+            $data['market_safety_correction_ct_per_kwh'] = $presets[$profile][1];
+        }
     }
     return $data;
 }
@@ -2025,11 +2132,42 @@ function e3dc_config_editor_write_new_stream($handle, $bytes) {
         && hash_equals(hash('sha256', $bytes), hash('sha256', $confirmed));
 }
 
-function e3dc_config_editor_publish_authority($installUser, $groupName = 'www-data') {
-    if (!function_exists('posix_geteuid')
-        || !function_exists('posix_getpwuid')
-        || !function_exists('posix_getpwnam')
-        || !function_exists('posix_getgrnam')) {
+function e3dc_config_editor_container_publish_binding(array $publisher, array $install, array $group, $runtime) {
+    // Docker-Rechte: Container-Vertrag. Der Produktcode bleibt root-kontrolliert (Installationsbesitz root oder
+    // Gruppenmitglied), der Web-Publisher ist www-data und das feste Laufzeitkonto e3dc-runtime (uid 991) liest die
+    // Konfiguration über die gemeinsame Gruppe. Reine Funktion ohne Schreiboperation.
+    $groupGid = (int)($group['gid'] ?? -1);
+    $members = (array)($group['members'] ?? []);
+    $publisherName = (string)($publisher['name'] ?? '');
+    $publisherBound = $publisherName === 'www-data'
+        && ((int)($publisher['gid'] ?? -2) === $groupGid || in_array($publisherName, $members, true));
+    $installBound = (int)($install['uid'] ?? -1) === 0
+        || (int)($install['gid'] ?? -2) === $groupGid
+        || in_array((string)($install['name'] ?? ''), $members, true);
+    $runtimeBound = is_array($runtime)
+        && (string)($runtime['name'] ?? '') === 'e3dc-runtime'
+        && (int)($runtime['uid'] ?? -1) === 991
+        && ((int)($runtime['gid'] ?? -2) === $groupGid || in_array('e3dc-runtime', $members, true));
+    if (!$publisherBound || !$installBound || !$runtimeBound) {
+        return [
+            'success' => false,
+            'message' => 'Im Container sind Web-Publisher (www-data), Installationsbesitz (root) und das Laufzeitkonto e3dc-runtime nicht über die gemeinsame www-data-Gruppe gebunden.',
+            'hint' => ' Bitte den Container neu starten; bleibt die Meldung bestehen, das Image prüfen (Installationscenter „Nur Rechte prüfen“).',
+        ];
+    }
+    return ['success' => true];
+}
+
+function e3dc_config_editor_publish_authority($installUser, $groupName = 'www-data', $probe = null) {
+    // Docker-Rechte: $probe (nur Tests) simuliert Topologie und Konten (docker, publisher_uid, publisher, install,
+    // group, runtime); ohne $probe gelten die posix-Funktionen. Die Bare-Metal-Regel bleibt unverändert; nur im
+    // Container greift ersatzweise der Container-Vertrag (e3dc_config_editor_container_publish_binding).
+    $probe = is_array($probe) ? $probe : null;
+    if ($probe === null
+        && (!function_exists('posix_geteuid')
+            || !function_exists('posix_getpwuid')
+            || !function_exists('posix_getpwnam')
+            || !function_exists('posix_getgrnam'))) {
         return [
             'success' => false,
             'message' => 'Die lokale Benutzer- und Gruppenbindung ist nicht verfügbar.',
@@ -2037,14 +2175,15 @@ function e3dc_config_editor_publish_authority($installUser, $groupName = 'www-da
     }
     $installUser = trim((string)$installUser);
     $groupName = trim((string)$groupName);
-    $publisherUid = (int)posix_geteuid();
-    $publisher = @posix_getpwuid($publisherUid);
-    $install = $installUser !== '' ? @posix_getpwnam($installUser) : false;
-    $group = $groupName !== '' ? @posix_getgrnam($groupName) : false;
+    $publisherUid = $probe !== null ? (int)($probe['publisher_uid'] ?? -1) : (int)posix_geteuid();
+    $publisher = $probe !== null ? ($probe['publisher'] ?? false) : @posix_getpwuid($publisherUid);
+    $install = $installUser !== '' ? ($probe !== null ? ($probe['install'] ?? false) : @posix_getpwnam($installUser)) : false;
+    $group = $groupName !== '' ? ($probe !== null ? ($probe['group'] ?? false) : @posix_getgrnam($groupName)) : false;
     if (!is_array($publisher) || !is_array($install) || !is_array($group)) {
         return [
             'success' => false,
             'message' => 'Installationsbenutzer, Web-Publisher oder gemeinsame Gruppe konnten nicht gebunden werden.',
+            'hint' => ' Bitte im Installationscenter „Rechte prüfen und reparieren“ ausführen.',
         ];
     }
     $publisherName = (string)($publisher['name'] ?? '');
@@ -2054,13 +2193,24 @@ function e3dc_config_editor_publish_authority($installUser, $groupName = 'www-da
         || in_array($installUser, (array)($group['members'] ?? []), true);
     $publisherInGroup = (int)($publisher['gid'] ?? -2) === $groupGid
         || in_array($publisherName, (array)($group['members'] ?? []), true);
+    $topology = 'bare_metal';
     if (!$installInGroup
         || !$publisherInGroup
         || !in_array($publisherName, [$installUser, 'www-data'], true)) {
-        return [
-            'success' => false,
-            'message' => 'Der Web-Publisher und der Installationsbenutzer sind nicht sicher über die gemeinsame www-data-Gruppe gebunden.',
-        ];
+        $isContainer = $probe !== null
+            ? !empty($probe['docker'])
+            : (function_exists('e3dcIsDockerEnvironment') && e3dcIsDockerEnvironment());
+        if (!$isContainer) {
+            return [
+                'success' => false,
+                'message' => 'Der Web-Publisher und der Installationsbenutzer sind nicht sicher über die gemeinsame www-data-Gruppe gebunden.',
+                'hint' => ' Bitte im Installationscenter „Rechte prüfen und reparieren“ ausführen.',
+            ];
+        }
+        $runtime = $probe !== null ? ($probe['runtime'] ?? false) : @posix_getpwnam('e3dc-runtime');
+        $binding = e3dc_config_editor_container_publish_binding($publisher, $install, $group, $runtime);
+        if (empty($binding['success'])) return $binding;
+        $topology = 'container';
     }
     return [
         'success' => true,
@@ -2068,6 +2218,7 @@ function e3dc_config_editor_publish_authority($installUser, $groupName = 'www-da
         'install_uid' => $installUid,
         'group_gid' => $groupGid,
         'publisher_name' => $publisherName,
+        'topology' => $topology,
     ];
 }
 
@@ -2326,7 +2477,8 @@ function e3dc_config_editor_extra_key_transaction(
             'success' => false,
             'code' => 'publisher_authority_failed',
             'message' => (string)($authority['message'] ?? 'Der Web-Publisher konnte nicht sicher gebunden werden.')
-                . ' Bitte im Installationscenter „Rechte prüfen und reparieren“ ausführen.',
+                // Docker-Rechte: der Hinweis folgt der Topologie (Bare-Metal: Rechtereparatur, Container: Neustart).
+                . (string)($authority['hint'] ?? ' Bitte im Installationscenter „Rechte prüfen und reparieren“ ausführen.'),
         ];
     }
     $directory = dirname((string)$filePath);
@@ -3352,12 +3504,8 @@ if ($configEditorRequestMethod === 'POST') {
             if (is_array($value) || is_object($value)) {
                 continue;
             }
-            $value = trim($value);
-            if ($value !== '' && is_numeric($value)) {
-                $v4_data[$key] = (strpos($value, '.') !== false) ? floatval($value) : intval($value);
-            } else {
-                $v4_data[$key] = $value;
-            }
+            // Geheimnis-/PIN-Schlüssel bleiben Text, alles andere wie bisher Zahl/Text.
+            $v4_data[$key] = e3dc_config_editor_store_posted_value($key, $value);
         }
         if ($topologyUiDirty && !$config_validation_failed) {
             $v4_data['pv_forecast_topology_config'] = $topology_to_save;
@@ -3400,7 +3548,7 @@ if ($configEditorRequestMethod === 'POST') {
                 'e3dc_multi_connect' => 'e3dc_multi',
                 'e3dc-multi' => 'e3dc_multi',
                 'e3dc multi' => 'e3dc_multi',
-                'e3dc_easy' => 'e3dc',
+                'e3dc_easy' => 'e3dc_easy_connect', // Wie config_manager.WALLBOX_TYPE_ALIASES
                 'e3dc_legacy' => 'e3dc',
                 'native' => 'e3dc',
                 'off' => 'none',
@@ -3580,6 +3728,7 @@ $groups = [
         "wp_pv_max_power_w", "wp_pv_battery_limit_wh", "wp_pv_grid_limit_wh", "wp_pv_battery_max_w", "wp_pv_grid_max_w",
         "wp_pv_control_mode", "wp_pv_start_power_w",
         "wp_pv_reaction_s", "wp_pv_start_wait_s", "wp_pv_handoff_timeout_s",
+        "wp_pv_hz_hysteresis_k", "wp_pv_ww_hysteresis_k", "wp_pv_boost_release_s",
         "consumer_priority_order", "consumer_priority_wp_runon_s",
         "pv_pause_enable", "pv_pause_soc", "pv_pause_watt", "pv_pause_timeout_minutes", "pv_pause_min_at", "pv_pause_max_temp_drop", "luxtronik_pause_setpoint_c",
         "matter_bridge"
@@ -3587,22 +3736,29 @@ $groups = [
     "Wallbox & Fahrzeug" => [
         "wb_native_enable", "wb_native_mode", "wb_native_type", "wb_native_ip", "wb_native_cp_id", "wb1_topic_prefix", "wb_native_type2", "wb_native_ip2", "wb2_topic_prefix", "wb_native_eco", "dvcarlimit",
         "wb1_e3dc_wbchar6_compat_enable", "wb2_e3dc_wbchar6_compat_enable",
+        "wb_e3dc_direct_phase_control_enable",
         "wbminsoc", "wbcostpowers", "wbmaxladestrom", "wb1_max_amp", "wb2_max_amp", "wb1_current_step_amp", "wb2_current_step_amp",
         "grid_max_amps", "grid_max_amps_l1", "grid_max_amps_l2", "grid_max_amps_l3",
         "grid_wallbox_reserve_amps", "grid_wallbox_reserve_amps_l1", "grid_wallbox_reserve_amps_l2", "grid_wallbox_reserve_amps_l3",
         "wb1_grid_phase", "wb2_grid_phase", "wb1_openwb_pro_1p_max_amp", "wb2_openwb_pro_1p_max_amp",
+        "wb_pcc_phase_basis", "wb_pcc_power_factor_margin", "grid_pcc_imbalance_max_a",
         "wb_surplus_target_grid_w", "wb_surplus_noise_w", "phase_transition_safety_margin_w", "heatpump_start_settle_s",
+        "wb_curve_pv_only_house_reserve_w",
+        "storage_home_wp_split",
         "wb_restart_delay_s", "wb_min_charge_time_s", "wb_cloud_stop_delay_s", "wb_phase_change_hold_s",
+        "wb_phase_down_delay_s", "wb_phase_up_forecast_hold_s", "wb_phase_up_symmetry_enable", "wb_phase_up_export_wh",
+        "wb_pv_only_release_hold_s", "wb_pv_only_hold_stale_guard_s",
         "wb1_restart_delay_s", "wb1_min_charge_time_s", "wb1_cloud_stop_delay_s", "wb1_phase_change_hold_s",
         "wb2_restart_delay_s", "wb2_min_charge_time_s", "wb2_cloud_stop_delay_s", "wb2_phase_change_hold_s",
         "smart_wbhour_enable", "car_capacity", "car_target_unit", "car_target_kwh", "car_target_soc", "car_max_soc_si", "car_charge_power",
-        "bluelink_refresh_token", "bluelink_vin", "bluelink_car_name", "bluelink_interval", "bluelink_ignore_plug_status",
+        "bluelink_user", "bluelink_password", "bluelink_pin", "bluelink_brand", "bluelink_vin", "bluelink_car_name", "bluelink_interval", "bluelink_ignore_plug_status",
         "v2h_enable", "v2h_min_soc", "v2h_bat_soc_limit"
     ],
     // Nur noch, was storage_manager.py wirklich als Rückfallwert benötigt
     "Speicher & Konfiguration" => [
         "speichergroesse", "maximumladeleistung", "maximaleentladeleistung", "einspeiselimit", "ep_reserve_pct",
         "storage_curve_target_mode", "storage_curve_sliding_horizon_enable",
+        "storage_forecast100_late_full_guard_enable", "storage_curve_end_guard_min",
         "storage_dc_first_charge_limit_enable",
         "storage_forecast_shortfall_aux_ac_charge_enable",
         "storage_curve_charge_servo_mode",
@@ -3639,7 +3795,7 @@ $groups = [
     "Erweitertes Feintuning" => [
         // Trajektorienbegrenzung (Ladekurve aktiv verfolgen)
         "tl_enable", "tl_tolerance_pct", "tl_emergency_tolerance_pct", "tl_lookahead_h", "tl_grid_limit_w",
-        "wb_openwb_zero_budget_hold_s", "openwb_pro_phase_wait_s", "openwb_pro_phase_cp_interrupt_duration_s", "openwb_pro_phase_restart_delay_s", "openwb_pro_start_wakeup_delay_s", "wb_openwb_primary_enable", "wb_openwb_auto_discovery", "wb_openwb_auto_role_enable", "wb_openwb_command_fail_limit", "wb_openwb_command_block_s", "wb_openwb_modbus_secondary_enable", "wb_openwb_modbus_port", "wb_openwb_modbus_unit", "wb_openwb_modbus_connector", "wb_openwb_modbus_offset",
+        "wb_openwb_zero_budget_hold_s", "openwb_pro_phase_wait_s", "openwb_pro_phase_cp_interrupt_duration_s", "openwb_pro_phase_restart_delay_s", "openwb_pro_start_wakeup_delay_s", "openwb_pro_automatic_start_cp_enable", "openwb_pro_start_cp_grace_s", "openwb_pro_start_hold_s", "openwb_pro_start_retry_cycle_s", "wb_native_floor_retry_enable", "wb_openwb_primary_enable", "wb_openwb_auto_discovery", "wb_openwb_auto_role_enable", "wb_openwb_command_fail_limit", "wb_openwb_command_block_s", "wb_openwb_modbus_secondary_enable", "wb_openwb_modbus_port", "wb_openwb_modbus_unit", "wb_openwb_modbus_connector", "wb_openwb_modbus_offset",
         "wb_shadow_start_delay_s", "wb_shadow_power_ramp_s", "wb_shadow_meter_delay_s", "wb_shadow_meter_ramp_s", "wb_shadow_phase_pause_s", "wb_shadow_zero_budget_stop_s", "wb_shadow_zero_budget_grid_stop_s",
         // Feinabstimmung für Vorentladung und Abregelschutz
         "pd_eco_min", "pd_eco_max", "pd_max_hours",
@@ -3659,6 +3815,7 @@ $groups = [
         "heat_heater_grid_boost_enable", "heat_heater_grid_boost_ack", "heat_heater_grid_boost_requires_deficit",
         "heat_heater_grid_boost_price_limit_ct", "heat_heater_grid_boost_max_w",
         "heat_heater_min_temp_c", "heat_heater_max_temp_c", "heat_wp_daily_kwh",
+        "market_charge_profile", "market_price_limit_ct",
         "market_min_margin_pct", "market_safety_correction_ct_per_kwh",
         "market_autarky_first_enable", "market_autarky_low_soc_pct", "market_autarky_horizon_buffer_wh",
         "market_battery_grid_charge_enable", "market_battery_hold_enable",
@@ -3726,6 +3883,10 @@ $groups = [
         "live_grid_pm_delta_debounce_enable", "live_grid_pm_delta_soft_threshold_w", "live_grid_pm_delta_hard_threshold_w",
         "live_grid_pm_delta_persist_count", "live_grid_pm_delta_persist_window_s"
     ],
+    // Zusatzwechselrichter (Sungrow Modbus TCP, nur lesend) – generischer Renderer, Typ als Auswahl.
+    "Zusatzwechselrichter" => [
+        "ext_inverter_type", "ext_inverter_ip", "ext_inverter_port", "ext_inverter_unit_id", "ext_inverter_poll_s"
+    ],
     "Webansicht & Updates" => [
         "frontend_variant", "frontend_detail_mode", "show_forecast", "darkmode", "web_pin", "config_secret_protection_mode", "check_updates", "auto_update_enable", "auto_update_time"
     ],
@@ -3747,6 +3908,7 @@ $frontendHiddenKeys = [
     "storage_curve_charge_servo_max_age_s",
     "storage_parallel_diff_enable", "storage_parallel_diff_min_w", "storage_parallel_diff_log_interval_s",
     "storage_live_stale_guard_s", "storage_auto_limit_heartbeat_enable", "storage_auto_limit_heartbeat_s",
+    "storage_curve_frame_write_brake_enable",
     "storage_decision_history_enable", "storage_decision_history_max_bytes", "storage_decision_history_retention_days", "storage_decision_history_interval_s",
     "wallbox_decision_history_enable", "wallbox_decision_history_max_bytes", "wallbox_decision_history_retention_days", "wallbox_decision_history_interval_s",
     "energy_decision_history_enable", "energy_decision_history_max_bytes", "energy_decision_history_retention_days", "energy_decision_history_interval_s",
@@ -3938,6 +4100,9 @@ function renderHeatpumpPvReservationStatus($entry, $runtime = null): string {
         'wp_pv_start_wait_s' => 'Wartezeit auf den Verdichterstart',
         'wp_pv_reaction_s' => 'Berücksichtigte Reaktionszeit',
         'wp_pv_handoff_timeout_s' => 'Wartezeit auf die Leistungsreduzierung der Wallbox',
+        'wp_pv_hz_hysteresis_k' => 'Hysterese Heizung',
+        'wp_pv_ww_hysteresis_k' => 'Hysterese Warmwasser',
+        'wp_pv_boost_release_s' => 'Wolkenüberbrückung des Boosts',
         'wp_pv_battery_max_w' => 'Maximale Leistung aus dem Hausakku',
         'wp_pv_battery_limit_wh' => 'Energiekontingent des Hausakkus',
         'wp_pv_grid_max_w' => 'Maximale Leistung aus dem Stromnetz',
@@ -4588,6 +4753,30 @@ async function readConfirmedConfigJson(response) {
     .forecast-pause-step.safe { color: #86efac; }
     .forecast-pause-step.pause { color: #fbbf24; }
     .forecast-pause-step.boost { color: #f87171; }
+    /* Erklärkarten „Wenn → dann“ (Wallbox-Grenzen, Schaltzeiten, Phasen): gleiche
+       Bildsprache wie die Quell-Erholung, als wiederverwendbare Klassen. */
+    .config-flow-help { background: rgba(14,165,233,0.06); border: 1px solid rgba(14,165,233,0.24); }
+    .config-flow-title { color: #38bdf8; font-size: 0.84rem; }
+    .config-flow { display: grid; grid-template-columns: 30px 1fr; gap: 0 12px; font-size: 0.8rem; line-height: 1.5; }
+    .config-flow-rail { display: flex; flex-direction: column; align-items: center; }
+    .config-flow-line { width: 2px; flex: 1; margin: 4px 0; background: rgba(148,163,184,0.35); }
+    .config-flow-icon {
+        width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+        font-size: 0.82rem; color: #f8fafc; box-shadow: 0 0 0 2px rgba(15,23,42,0.18); flex: 0 0 auto;
+    }
+    .config-flow-icon.sky { background: #0c2a3d; border: 1.5px solid #38bdf8; }
+    .config-flow-icon.green { background: #1a3a1a; border: 1.5px solid #86efac; }
+    .config-flow-icon.amber { background: #2d1b00; border: 1.5px solid #fbbf24; }
+    .config-flow-icon.red { background: #3b0a0a; border: 1.5px solid #f87171; }
+    .config-flow-icon.violet { background: #2e1065; border: 1.5px solid #c4b5fd; }
+    .config-flow-step { padding-bottom: .6rem; }
+    .config-flow-step.sky { color: #38bdf8; }
+    .config-flow-step.green { color: #86efac; }
+    .config-flow-step.amber { color: #fbbf24; }
+    .config-flow-step.red { color: #f87171; }
+    .config-flow-step.violet { color: #c4b5fd; }
+    .config-flow-step .config-flow-then { color: var(--bs-body-color); opacity: .85; }
+    .config-flow-value { font-weight: 700; }
 	    .config-rscp-live-badge {
 	        font-size: 0.72em;
 	        background: rgba(16,185,129,0.20) !important;
@@ -4727,6 +4916,29 @@ async function readConfirmedConfigJson(response) {
     body[data-bs-theme="light"] .forecast-pause-help [style*="color:#f87171"],
     body[data-theme="light"] .forecast-pause-step.boost,
     body[data-theme="light"] .forecast-pause-help [style*="color:#f87171"] { color: #b91c1c !important; }
+    html[data-bs-theme="light"] .config-flow-help,
+    body[data-bs-theme="light"] .config-flow-help,
+    body[data-theme="light"] .config-flow-help { background: #f0f9ff !important; border-color: #7dd3fc !important; }
+    html[data-bs-theme="light"] .config-flow-title,
+    body[data-bs-theme="light"] .config-flow-title,
+    body[data-theme="light"] .config-flow-title { color: #0369a1 !important; }
+    html[data-bs-theme="light"] .config-flow-line,
+    body[data-bs-theme="light"] .config-flow-line,
+    body[data-theme="light"] .config-flow-line { background: rgba(71,85,105,0.35) !important; }
+    html[data-bs-theme="light"] .config-flow-icon,
+    body[data-bs-theme="light"] .config-flow-icon,
+    body[data-theme="light"] .config-flow-icon { color: #ffffff !important; box-shadow: 0 0 0 2px rgba(255,255,255,0.9), 0 1px 3px rgba(15,23,42,0.18); }
+    html[data-bs-theme="light"] .config-flow-icon.sky, body[data-bs-theme="light"] .config-flow-icon.sky, body[data-theme="light"] .config-flow-icon.sky { background: #0369a1 !important; border-color: #0ea5e9 !important; }
+    html[data-bs-theme="light"] .config-flow-icon.green, body[data-bs-theme="light"] .config-flow-icon.green, body[data-theme="light"] .config-flow-icon.green { background: #166534 !important; border-color: #22c55e !important; }
+    html[data-bs-theme="light"] .config-flow-icon.amber, body[data-bs-theme="light"] .config-flow-icon.amber, body[data-theme="light"] .config-flow-icon.amber { background: #92400e !important; border-color: #f59e0b !important; }
+    html[data-bs-theme="light"] .config-flow-icon.red, body[data-bs-theme="light"] .config-flow-icon.red, body[data-theme="light"] .config-flow-icon.red { background: #b91c1c !important; border-color: #ef4444 !important; }
+    html[data-bs-theme="light"] .config-flow-icon.violet, body[data-bs-theme="light"] .config-flow-icon.violet, body[data-theme="light"] .config-flow-icon.violet { background: #5b21b6 !important; border-color: #8b5cf6 !important; }
+    html[data-bs-theme="light"] .config-flow-step.sky, body[data-bs-theme="light"] .config-flow-step.sky, body[data-theme="light"] .config-flow-step.sky { color: #075985 !important; }
+    html[data-bs-theme="light"] .config-flow-step.green, body[data-bs-theme="light"] .config-flow-step.green, body[data-theme="light"] .config-flow-step.green { color: #166534 !important; }
+    html[data-bs-theme="light"] .config-flow-step.amber, body[data-bs-theme="light"] .config-flow-step.amber, body[data-theme="light"] .config-flow-step.amber { color: #92400e !important; }
+    html[data-bs-theme="light"] .config-flow-step.red, body[data-bs-theme="light"] .config-flow-step.red, body[data-theme="light"] .config-flow-step.red { color: #b91c1c !important; }
+    html[data-bs-theme="light"] .config-flow-step.violet, body[data-bs-theme="light"] .config-flow-step.violet, body[data-theme="light"] .config-flow-step.violet { color: #5b21b6 !important; }
+    html[data-bs-theme="light"] .config-flow-step .config-flow-then, body[data-bs-theme="light"] .config-flow-step .config-flow-then, body[data-theme="light"] .config-flow-step .config-flow-then { color: #1f2937 !important; opacity: 1; }
     html[data-bs-theme="light"] .config-rscp-live-badge,
     body[data-bs-theme="light"] .config-rscp-live-badge,
     body[data-theme="light"] .config-rscp-live-badge {
@@ -5556,7 +5768,7 @@ async function readConfirmedConfigJson(response) {
                                     <option value="-1" <?= ($wp_type_val === '-1') ? 'selected' : '' ?>>Keine W&auml;rmepumpe / deaktiviert</option>
                                     <option value="0" <?= ($wp_type_val === '0') ? 'selected' : '' ?>>Luxtronik</option>
                                     <option value="1" <?= ($wp_type_val === '1') ? 'selected' : '' ?>>IDM Navigator 2.0</option>
-                                    <option value="2" <?= ($wp_type_val === '2') ? 'selected' : '' ?>>Heizstab / Shelly-Heizluefter</option>
+                                    <option value="2" <?= ($wp_type_val === '2') ? 'selected' : '' ?>>Heizstab / Shelly-Heizlüfter</option>
                                     <option value="3" <?= ($wp_type_val === '3') ? 'selected' : '' ?> <?= ($nativeWpConfigured && $wp_type_val !== '3') ? 'disabled' : '' ?>>Shelly Pro3EM (WP ohne native Anbindung)</option>
                                     <option value="4" <?= ($wp_type_val === '4') ? 'selected' : '' ?>>Stiebel Eltron ISG / WPM</option>
                                     <option value="5" <?= ($wp_type_val === '5') ? 'selected' : '' ?>>Dimplex WPM Touch / NWPM</option>
@@ -5862,7 +6074,7 @@ async function readConfirmedConfigJson(response) {
                                     <input type="number" name="values[heizstab_max_w]" class="form-control config-input" value="<?= $val('heizstab_max_w') ?>" placeholder="3000">
                                 </div>
                                 <div class="col-12 mt-2">
-                                    <label class="config-label text-info fw-bold"><i class="fas fa-plug me-1"></i>Shelly Heizluefter / Heizstrahler</label>
+                                    <label class="config-label text-info fw-bold"><i class="fas fa-plug me-1"></i>Shelly Heizlüfter / Heizstrahler</label>
                                 </div>
                                 <div class="col-12 col-md-6">
                                     <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['shelly_heiz_ip'] ?? '') ?>">Shelly IP</label>
@@ -6459,10 +6671,25 @@ async function readConfirmedConfigJson(response) {
                             'wp_pv_start_wait_s' => ['Wartezeit auf den Verdichterstart (s)', 600],
                             'wp_pv_reaction_s' => ['Berücksichtigte Reaktionszeit (s)', 1],
                             'wp_pv_handoff_timeout_s' => ['Wartezeit auf die Leistungsreduzierung der Wallbox (s)', 1],
+                            'wp_pv_boost_release_s' => ['Wolkenüberbrückung des Boosts (s)', 30],
                         ] as $wpPvKey => $wpPvField): ?>
                             <div class="col-12 col-md-4">
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap[$wpPvKey] ?? '') ?>"><?= htmlspecialchars($wpPvField[0]) ?></label>
                                 <input type="number" min="<?= $wpPvField[1] ?>" step="1" name="values[<?= htmlspecialchars($wpPvKey) ?>]" class="form-control config-input" value="<?= $val($wpPvKey) ?>" placeholder="<?= $defaults[$wpPvKey] ?>">
+                                <?= $configValidationMarker($wpPvKey) ?>
+                            </div>
+                        <?php endforeach; ?>
+                        </div>
+                        <h6 class="small fw-bold mt-3">Hysterese der Anlage</h6>
+                        <p class="small text-muted mb-2">Die Wärmepumpe entscheidet den Verdichterstart selbst; E3DC-Control setzt nur die PV-Sollwerte und spiegelt hier ihre Schaltschwellen. Der Boost steht wie eine SG-Ready-Freigabe: Sobald die PV-Deckung reicht, im Winter Heizung und Warmwasser, im Sommer Warmwasser – ohne auf einen thermischen Bedarf zu warten und bis die PV-Deckung länger als die Wolkenüberbrückung fehlt. Die Startreservierung ist auf die Wartezeit oben befristet: Läuft der Verdichter bis dahin nicht an, geht die reservierte Leistung an die nachrangigen Verbraucher, der Sollwert bleibt stehen.</p>
+                        <div class="row g-2">
+                        <?php foreach ([
+                            'wp_pv_hz_hysteresis_k' => ['Hysterese Heizung (K)', '3.5'],
+                            'wp_pv_ww_hysteresis_k' => ['Hysterese Warmwasser (K)', '8'],
+                        ] as $wpPvKey => $wpPvField): ?>
+                            <div class="col-6 col-md-4">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap[$wpPvKey] ?? '') ?>"><?= htmlspecialchars($wpPvField[0]) ?></label>
+                                <input type="number" min="0" max="30" step="0.1" name="values[<?= htmlspecialchars($wpPvKey) ?>]" class="form-control config-input" value="<?= $val($wpPvKey) ?>" placeholder="<?= htmlspecialchars($wpPvField[1]) ?>">
                                 <?= $configValidationMarker($wpPvKey) ?>
                             </div>
                         <?php endforeach; ?>
@@ -6653,7 +6880,7 @@ async function readConfirmedConfigJson(response) {
                         'e3dc_multi_connect' => 'e3dc_multi',
                         'e3dc-multi' => 'e3dc_multi',
                         'e3dc multi' => 'e3dc_multi',
-                        'e3dc_easy' => 'e3dc',
+                        'e3dc_easy' => 'e3dc_easy_connect', // Wie config_manager.WALLBOX_TYPE_ALIASES
                         'e3dc_legacy' => 'e3dc',
                         'native' => 'e3dc',
                         'off' => 'none',
@@ -7059,11 +7286,30 @@ async function readConfirmedConfigJson(response) {
                     </div>
                 </div>
 
-                <h6 class="text-muted small fw-bold mt-4 mb-2 border-bottom pb-1">Hyundai/Kia Bluelink</h6>
+                <h6 class="text-muted small fw-bold mt-4 mb-2 border-bottom pb-1">Fahrzeug Integration (Bluelink)</h6>
                 <div class="row g-2 mb-3">
                     <div class="col-12 col-md-6 config-item">
-                        <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['bluelink_refresh_token'] ?? '') ?>">Refresh Token</label>
-                        <input type="text" name="values[bluelink_refresh_token]" class="form-control config-input" value="<?= $val('bluelink_refresh_token') ?>" placeholder="Optional">
+                        <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['bluelink_user'] ?? '') ?>">Benutzer (E-Mail)</label>
+                        <input type="email" name="values[bluelink_user]" class="form-control config-input" value="<?= $val('bluelink_user') ?>" autocomplete="off" placeholder="E-Mail des Hyundai/Kia-Kontos">
+                        <?= $configValidationMarker('bluelink_user') ?>
+                    </div>
+                    <div class="col-12 col-md-6 config-item">
+                        <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['bluelink_password'] ?? '') ?>">Passwort</label>
+                        <input type="password" name="values[bluelink_password]" class="form-control config-input" value="<?= $val('bluelink_password') ?>" autocomplete="new-password" spellcheck="false" placeholder="Passwort des Hyundai/Kia-Kontos">
+                        <?= $configValidationMarker('bluelink_password') ?>
+                    </div>
+                    <div class="col-6 col-md-3 config-item">
+                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['bluelink_pin'] ?? '') ?>">PIN</label>
+                        <input type="password" name="values[bluelink_pin]" class="form-control config-input" value="<?= $val('bluelink_pin') ?>" inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="Optional">
+                        <?= $configValidationMarker('bluelink_pin') ?>
+                    </div>
+                    <div class="col-6 col-md-3 config-item">
+                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['bluelink_brand'] ?? '') ?>">Marke</label>
+                        <select class="form-select config-input" name="values[bluelink_brand]">
+                            <option value="hyundai" <?= ($val('bluelink_brand') === 'kia') ? '' : 'selected' ?>>Hyundai (Bluelink)</option>
+                            <option value="kia" <?= ($val('bluelink_brand') === 'kia') ? 'selected' : '' ?>>Kia (Kia Connect)</option>
+                        </select>
+                        <?= $configValidationMarker('bluelink_brand') ?>
                     </div>
                     <div class="col-12 col-md-6 config-item">
                         <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['bluelink_vin'] ?? '') ?>">VIN</label>
@@ -7086,7 +7332,7 @@ async function readConfirmedConfigJson(response) {
                     </div>
                     <div class="col-12">
                         <small class="text-muted" style="font-size: 0.75rem;">
-                            <i class="fas fa-info-circle me-1"></i> Optionaler Fahrzeug-SoC für Hyundai/Kia; ohne Token bleibt die Wallbox-Regelung unverändert.
+                            <i class="fas fa-info-circle me-1"></i> Optionaler Fahrzeug-SoC für Hyundai/Kia; ohne Zugangsdaten bleibt die Wallbox-Regelung unverändert. Eine aktive Zwei-Faktor-Anmeldung (Einmalcode) des Herstellerkontos wird nicht unterstützt.
                         </small>
                     </div>
                 </div>
@@ -7104,7 +7350,7 @@ async function readConfirmedConfigJson(response) {
                     <div class="col-6 col-lg-3">
                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['car_capacity'] ?? '') ?>">Fahrzeugakku</label>
                         <div class="input-group">
-                            <input type="number" min="1" max="300" step="0.1" name="values[car_capacity]" class="form-control config-input" value="<?= $val('car_capacity') ?>">
+                            <input type="number" min="1" max="300" step="0.1" name="values[car_capacity]" class="form-control config-input" value="<?= $val('car_capacity') ?>" placeholder="<?= $defaults['car_capacity'] ?>">
                             <span class="input-group-text bg-body-tertiary">kWh</span>
                         </div>
                     </div>
@@ -7118,28 +7364,29 @@ async function readConfirmedConfigJson(response) {
                     <div class="col-6 col-lg-3" data-car-target-unit="soc">
                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['car_target_soc'] ?? '') ?>">Ziel-Ladestand</label>
                         <div class="input-group">
-                            <input type="number" min="0" max="100" step="1" name="values[car_target_soc]" class="form-control config-input" value="<?= $val('car_target_soc') ?>">
+                            <input type="number" min="0" max="100" step="1" name="values[car_target_soc]" class="form-control config-input" value="<?= $val('car_target_soc') ?>" placeholder="<?= $defaults['car_target_soc'] ?>">
                             <span class="input-group-text bg-body-tertiary">%</span>
                         </div>
                     </div>
                     <div class="col-6 col-lg-3" data-car-target-unit="kwh">
                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['car_target_kwh'] ?? '') ?>">Gewünschte Lademenge</label>
                         <div class="input-group">
-                            <input type="number" min="0" max="300" step="0.1" name="values[car_target_kwh]" class="form-control config-input" value="<?= $val('car_target_kwh') ?>">
+                            <?php /* Platzhalter 0: Ohne Lademenge setzt der Planer kein kWh-Ziel an; 20 kWh ist nur die Vorbelegung der Wallbox-Ansicht. */ ?>
+                            <input type="number" min="0" max="300" step="0.1" name="values[car_target_kwh]" class="form-control config-input" value="<?= $val('car_target_kwh') ?>" placeholder="0">
                             <span class="input-group-text bg-body-tertiary">kWh</span>
                         </div>
                     </div>
                     <div class="col-6 col-lg-3">
                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['car_max_soc_si'] ?? '') ?>">Oberer Fahrzeug-Ladestand</label>
                         <div class="input-group">
-                            <input type="number" min="0" max="100" step="1" name="values[car_max_soc_si]" class="form-control config-input" value="<?= $val('car_max_soc_si') ?>">
+                            <input type="number" min="0" max="100" step="1" name="values[car_max_soc_si]" class="form-control config-input" value="<?= $val('car_max_soc_si') ?>" placeholder="<?= $defaults['car_max_soc_si'] ?>">
                             <span class="input-group-text bg-body-tertiary">%</span>
                         </div>
                     </div>
                     <div class="col-6 col-lg-3">
                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['car_charge_power'] ?? '') ?>">Übliche Ladeleistung</label>
                         <div class="input-group">
-                            <input type="number" min="0.5" max="100" step="0.1" name="values[car_charge_power]" class="form-control config-input" value="<?= $val('car_charge_power') ?>">
+                            <input type="number" min="0.5" max="100" step="0.1" name="values[car_charge_power]" class="form-control config-input" value="<?= $val('car_charge_power') ?>" placeholder="<?= $defaults['car_charge_power'] ?>">
                             <span class="input-group-text bg-body-tertiary">kW</span>
                         </div>
                     </div>
@@ -7188,6 +7435,21 @@ async function readConfirmedConfigJson(response) {
                     </details>
                 </div>
 
+                <?php
+                // Erklärkarten „Wenn → dann“: Werte kommen aus der gespeicherten Konfiguration,
+                // sonst aus dem Standardwert; das JS unten hält sie beim Tippen aktuell.
+                $flowVal = function($key, $fallback = '') use ($rawVal, $defaults) {
+                    $v = trim((string)$rawVal($key));
+                    if ($v === '') $v = (string)($defaults[$key] ?? $fallback);
+                    return '<span class="config-flow-value" data-flow-key="' . htmlspecialchars($key) . '" data-flow-fallback="'
+                        . htmlspecialchars((string)($defaults[$key] ?? $fallback)) . '">' . htmlspecialchars($v) . '</span>';
+                };
+                $flowStep = function($tone, $icon, $if, $then, $last = false) {
+                    return '<div class="config-flow-rail"><div class="config-flow-icon ' . $tone . '">' . $icon . '</div>'
+                        . ($last ? '' : '<div class="config-flow-line"></div>') . '</div>'
+                        . '<div class="config-flow-step ' . $tone . '"><strong>' . $if . '</strong> <span class="config-flow-then">&rarr; ' . $then . '</span></div>';
+                };
+                ?>
                 <h6 class="text-muted small fw-bold mt-4 mb-2 border-bottom pb-1">Hausanschluss & gemeinsame Grenzen</h6>
                 <div class="wallbox-limits-grid" data-wallbox-count="<?= $hasSecondWallbox ? '2' : '1' ?>">
                     <div class="col-6 col-lg-4">
@@ -7212,14 +7474,22 @@ async function readConfirmedConfigJson(response) {
                         </div>
                     </div>
                     <div class="col-12">
-                        <small class="text-muted">
-                            <i class="fas fa-info-circle me-1"></i>Die Hausanschlussgrenze gilt in allen von E3DC-Control aktiv geregelten Lademodi. Im Modus Nur beobachten / autonom sendet E3DC-Control keine Stromvorgabe; dort muss die Wallbox oder der externe Regler den Hausanschluss absichern.
-                        </small>
+                        <div class="config-flow-help rounded-3 p-3">
+                            <div class="config-flow-title fw-bold mb-3"><i class="fas fa-route me-1"></i>Wie schützt E3DC-Control den Hausanschluss?</div>
+                            <div class="config-flow">
+                                <?= $flowStep('red', '&#128737;', 'Hausabsicherung ' . $flowVal('grid_max_amps', '35') . ' A je Phase', 'harte Grenze für alle aktiv geregelten Lademodi; kein Sollstrom darf sie überschreiten.') ?>
+                                <?= $flowStep('amber', '&#8722;', 'Reserve ' . $flowVal('grid_wallbox_reserve_amps', '2') . ' A bleibt frei', 'für Haus, Wärmepumpe und Herd; die Wallboxen bekommen nur den Rest.') ?>
+                                <?= $flowStep('green', '&#10003;', 'Wallbox-Budget <span class="config-flow-value" data-flow-computed="wallbox_budget">' . htmlspecialchars((string)$curBudgetAmps) . '</span> A je Phase', 'mehr bekommen WB1 und WB2 auch zusammen nie – bei zwei Wallboxen wird es aufgeteilt.') ?>
+                                <?= $flowStep('sky', '&#128065;', 'Modus „Beobachten / autonom“', 'E3DC-Control sendet keine Stromvorgabe; dann muss die Wallbox oder ihr Ladeprofil die Hausgrenze selbst kennen.') ?>
+                                <?= $flowStep('sky', '&#9889;', '1p-Deckel openWB Pro', 'Sicherung − Reserve − Fremdlast der Wallbox-Phase (E3DC-Wurzelzähler), begrenzt vom Schieflast-Wächter; mehr als 20 A erst nach Software-Nachweis der Phasenzuordnung.', true) ?>
+                            </div>
+                        </div>
                     </div>
 
                     <details class="col-12 mt-2">
                         <summary class="small fw-bold text-muted">Abweichende Phasengrenzen (optional)</summary>
                         <div class="row g-2 mt-1">
+                            <div class="col-12"><small class="text-muted">Nur ausfüllen, wenn eine Netzphase wirklich anders abgesichert ist oder mehr Reserve braucht. Leer heißt: die Werte oben gelten für alle drei Phasen.</small></div>
                             <?php foreach ([1, 2, 3] as $gridPhase): ?>
                             <div class="col-6 col-lg-2">
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['grid_max_amps_l' . $gridPhase] ?? '') ?>">Netz L<?= $gridPhase ?> Limit (A)</label>
@@ -7232,21 +7502,71 @@ async function readConfirmedConfigJson(response) {
                             <?php endforeach; ?>
                             <div class="col-12">
                                 <small class="text-muted">
-                                    Phasenwerte sind optional. Leer bedeutet globale Hausgrenze bzw. globale Reserve; eine höhere openWB-Pro-Freigabe benötigt zusätzlich eine bestätigte Wallbox-zu-Netzphasen-Zuordnung und frische Messwerte.
+                                    Eine höhere einphasige Freigabe an einer openWB Pro braucht eine ausdrücklich eingetragene Hausabsicherung, die Zuordnung „Wallbox-Phase → Netzphase“ (unten bei den Ladepunkten) und den automatischen Software-Nachweis dieser Zuordnung beim Laden; ohne das bleibt es bei 20 A.
                                 </small>
                             </div>
                         </div>
                     </details>
 
+                    <?php
+                        /* Einphasiger Stromdeckel der openWB Pro aus der Netzphasenmessung.
+                           Messbasis (Auswahl; unbekannte Altwerte bleiben als eigene, vorausgewählte Option sichtbar),
+                           Leistungsfaktor-Reserve auf den Fremdanteil und Schieflast-Wächter. Regeln identisch zu
+                           wallbox_manager._wb_pcc_phase_basis / config_validator (unbekannt wirkt wie off). */
+                        $pccBasisRaw = trim($rawVal('wb_pcc_phase_basis'));
+                        $pccBasisNorm = strtolower($pccBasisRaw);
+                        if ($pccBasisNorm === '' || $pccBasisNorm === 'e3dc_pm_active_power') {
+                            $pccBasisMode = 'e3dc_pm_active_power';
+                        } elseif ($pccBasisNorm === 'off') {
+                            $pccBasisMode = 'off';
+                        } else {
+                            $pccBasisMode = 'unknown';
+                        }
+                    ?>
                     <details class="col-12 mt-2">
-                        <summary class="small fw-bold text-muted">Erweiterte Ladepunkteinstellungen (optional)</summary>
+                        <summary class="small fw-bold text-muted">Einphasiger Deckel openWB Pro (Messbasis)</summary>
                         <div class="row g-2 mt-1">
-                            <div class="col-6" data-wallbox-column="1">
+                            <div class="col-12"><small class="text-muted">Nur für openWB Pro mit einphasigem Laden über 20 A. Der Deckel wird aus Hausabsicherung − Reserve − gemessenem Fremdbezug der zugeordneten Netzphase berechnet, +1 A je Regelschritt angehoben und sofort abgesenkt; ohne frische Messwerte oder ohne bestätigte Zuordnung gilt 20 A.</small></div>
+                            <div class="col-6 col-lg-4">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_pcc_phase_basis'] ?? '') ?>">Messbasis 1p-Deckel openWB Pro</label>
+                                <select class="form-select config-input" name="values[wb_pcc_phase_basis]">
+                                    <?php if ($pccBasisMode === 'unknown'): ?>
+                                    <option value="<?= htmlspecialchars($pccBasisRaw) ?>" selected>aktueller Wert „<?= htmlspecialchars($pccBasisRaw) ?>“ (unbekannt, wirkt wie Aus)</option>
+                                    <?php endif; ?>
+                                    <option value="e3dc_pm_active_power" <?= ($pccBasisMode === 'e3dc_pm_active_power') ? 'selected' : '' ?>>E3DC-Wurzelzähler je Phase (Standard)</option>
+                                    <option value="off" <?= ($pccBasisMode === 'off') ? 'selected' : '' ?>>Aus – fest 20 A</option>
+                                </select>
+                                <?= $configValidationMarker('wb_pcc_phase_basis') ?>
+                            </div>
+                            <div class="col-6 col-lg-4">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_pcc_power_factor_margin'] ?? '') ?>">Leistungsfaktor-Reserve Fremdlast</label>
+                                <input type="number" min="0.8" max="1.0" step="0.01" name="values[wb_pcc_power_factor_margin]" class="form-control config-input" value="<?= $val('wb_pcc_power_factor_margin') ?>" placeholder="0.9">
+                                <?= $configValidationMarker('wb_pcc_power_factor_margin') ?>
+                            </div>
+                            <div class="col-6 col-lg-4">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['grid_pcc_imbalance_max_a'] ?? '') ?>">Schieflast-Wächter am Netzpunkt (A)</label>
+                                <input type="number" min="10" max="32" step="1" name="values[grid_pcc_imbalance_max_a]" class="form-control config-input" value="<?= $val('grid_pcc_imbalance_max_a') ?>" placeholder="20">
+                                <?= $configValidationMarker('grid_pcc_imbalance_max_a') ?>
+                            </div>
+                        </div>
+                    </details>
+
+                    <details class="col-12 mt-2">
+                        <summary class="small fw-bold text-muted">Ladepunkte: Ströme und Phasen (optional)</summary>
+                        <div class="row g-2 mt-1">
+                            <div class="col-12"><small class="text-muted">Grenzen je Wallbox. Leer heißt: der Standard-Maximalstrom gilt. Alles hier wirkt nur für eingerichtete, aktiv geregelte Ladepunkte innerhalb ihrer Geräte- und Fahrzeuggrenzen.</small></div>
+                            <div class="col-6 col-lg-4" data-wallbox-common>
+                                <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['wbmaxladestrom'] ?? '') ?>">Standard-Maximalstrom je Wallbox (6–32 A)</label>
+                                <input type="number" min="6" max="32" step="1" name="values[wbmaxladestrom]" class="form-control config-input" value="<?= $val('wbmaxladestrom') ?>" placeholder="<?= $defaults['wbmaxladestrom'] ?>">
+                                <?= $configValidationMarker('wbmaxladestrom') ?>
+                            </div>
+                            <div class="col-12"><h6 class="text-muted small fw-bold mt-2 mb-0">Wallbox 1</h6></div>
+                            <div class="col-6 col-lg-3" data-wallbox-column="1">
                                 <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_max_amp'] ?? '') ?>">WB1 Max. Ladestrom (A)</label>
-                                <input type="number" min="6" max="32" name="values[wb1_max_amp]" class="form-control config-input" value="<?= $val('wb1_max_amp') ?>" placeholder="leer = Fallback">
+                                <input type="number" min="6" max="32" name="values[wb1_max_amp]" class="form-control config-input" value="<?= $val('wb1_max_amp') ?>" placeholder="leer = Standard">
                                 <?= $configValidationMarker('wb1_max_amp') ?>
                             </div>
-                            <div class="col-6" data-wallbox-column="1">
+                            <div class="col-6 col-lg-3" data-wallbox-column="1">
                                 <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_current_step_amp'] ?? '') ?>">WB1 Strom-Schritt</label>
                                 <select name="values[wb1_current_step_amp]" class="form-select config-input">
                                     <?php foreach (['1.0' => '1 A', '0.5' => '0,5 A', '0.1' => '0,1 A'] as $stepValue => $stepLabel): ?>
@@ -7267,12 +7587,13 @@ async function readConfirmedConfigJson(response) {
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_openwb_pro_1p_max_amp'] ?? '') ?>">WB1 openWB Pro 1p Max. (A)</label>
                                 <input type="number" min="6" max="32" step="0.5" name="values[wb1_openwb_pro_1p_max_amp]" class="form-control config-input" value="<?= $val('wb1_openwb_pro_1p_max_amp') ?>" placeholder="leer = sicher 20 A">
                             </div>
-                            <div class="col-6" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
+                            <div class="col-12" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>><h6 class="text-muted small fw-bold mt-2 mb-0">Wallbox 2</h6></div>
+                            <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
                                 <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_max_amp'] ?? '') ?>">WB2 Max. Ladestrom (A)</label>
-                                <input type="number" min="6" max="32" name="values[wb2_max_amp]" class="form-control config-input" value="<?= $val('wb2_max_amp') ?>" placeholder="leer = Fallback">
+                                <input type="number" min="6" max="32" name="values[wb2_max_amp]" class="form-control config-input" value="<?= $val('wb2_max_amp') ?>" placeholder="leer = Standard">
                                 <?= $configValidationMarker('wb2_max_amp') ?>
                             </div>
-                            <div class="col-6" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
+                            <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
                                 <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_current_step_amp'] ?? '') ?>">WB2 Strom-Schritt</label>
                                 <select name="values[wb2_current_step_amp]" class="form-select config-input">
                                     <?php foreach (['1.0' => '1 A', '0.5' => '0,5 A', '0.1' => '0,1 A'] as $stepValue => $stepLabel): ?>
@@ -7296,45 +7617,84 @@ async function readConfirmedConfigJson(response) {
                         </div>
                     </details>
 
-                    <div class="col-12" data-wallbox-common>
-                        <details class="col-12">
-                            <summary class="small fw-bold text-muted">Erweiterte Treibereinstellungen</summary>
-                            <div class="row g-2 mt-1">
-                                <div class="col-6 col-lg-4">
-                                    <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['wbmaxladestrom'] ?? '') ?>">Standard-Maximalstrom je Wallbox (6–32 A)</label>
-                                    <input type="number" min="6" max="32" step="1" name="values[wbmaxladestrom]" class="form-control config-input" value="<?= $val('wbmaxladestrom') ?>" placeholder="<?= $defaults['wbmaxladestrom'] ?>">
-                                    <?= $configValidationMarker('wbmaxladestrom') ?>
-                                </div>
-                            </div>
-                        </details>
-                    </div>
-
                     <details class="col-12 mt-3" data-wallbox-common>
-                        <summary class="small fw-bold text-muted">Erweiterte Wallbox-Regelung – nur für erfahrene Nutzer</summary>
+                        <summary class="small fw-bold text-muted">Regelung: PV-Überschuss und Hausakku</summary>
                         <div class="row g-2 mt-2">
-                            <div class="col-6 col-lg-3">
+                            <div class="col-6 col-lg-4">
+                                <label class="config-label text-warning" data-tooltip="<?= htmlspecialchars($tooltipMap['wbminsoc'] ?? '') ?>">Haus-Priorität (Batterie-Reserve SoC %)</label>
+                                <input type="number" min="0" max="100" name="values[wbminsoc]" class="form-control config-input" value="<?= $val('wbminsoc') ?>" placeholder="<?= $defaults['wbminsoc'] ?>">
+                            </div>
+                            <div class="col-6 col-lg-2">
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_surplus_target_grid_w'] ?? '') ?>">PV-Netzziel (W)</label>
                                 <input type="number" min="-1000" max="500" step="25" name="values[wb_surplus_target_grid_w]" class="form-control config-input" value="<?= $val('wb_surplus_target_grid_w') ?>" placeholder="<?= $defaults['wb_surplus_target_grid_w'] ?>">
                             </div>
-                            <div class="col-6 col-lg-3">
+                            <div class="col-6 col-lg-2">
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_surplus_noise_w'] ?? '') ?>">PV-Totbereich (W)</label>
                                 <input type="number" min="0" max="2000" step="10" name="values[wb_surplus_noise_w]" class="form-control config-input" value="<?= $val('wb_surplus_noise_w') ?>" placeholder="<?= $defaults['wb_surplus_noise_w'] ?>">
                             </div>
-                            <div class="col-6 col-lg-3">
+                            <div class="col-6 col-lg-2">
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['phase_transition_safety_margin_w'] ?? '') ?>">Phasenreserve (W)</label>
                                 <input type="number" min="0" max="5000" step="50" name="values[phase_transition_safety_margin_w]" class="form-control config-input" value="<?= $val('phase_transition_safety_margin_w') ?>" placeholder="<?= $defaults['phase_transition_safety_margin_w'] ?>">
                             </div>
-                            <div class="col-6 col-lg-3">
+                            <div class="col-6 col-lg-2">
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['heatpump_start_settle_s'] ?? '') ?>">WP-Anlaufruhe (s)</label>
                                 <input type="number" min="0" max="300" step="5" name="values[heatpump_start_settle_s]" class="form-control config-input" value="<?= $val('heatpump_start_settle_s') ?>" placeholder="<?= $defaults['heatpump_start_settle_s'] ?>">
                             </div>
-                            <div class="col-6">
-                                <label class="config-label text-warning" data-tooltip="<?= htmlspecialchars($tooltipMap['wbminsoc'] ?? '') ?>">Haus-Priorität (Batterie-Reserve SoC %)</label>
-                                <input type="number" name="values[wbminsoc]" class="form-control config-input" value="<?= $val('wbminsoc') ?>" placeholder="<?= $defaults['wbminsoc'] ?>">
+                            <?php /* Messreserve der PV-only-Entladeklemme; Boden 300 W gilt zusätzlich in storage_manager.py */ ?>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_curve_pv_only_house_reserve_w'] ?? '') ?>">Reserve unter der Kurve (W)</label>
+                                <input type="number" min="0" max="10000" step="1" name="values[wb_curve_pv_only_house_reserve_w]" class="form-control config-input" value="<?= $val('wb_curve_pv_only_house_reserve_w') ?>" placeholder="<?= $defaults['wb_curve_pv_only_house_reserve_w'] ?>">
+                                <?= $configValidationMarker('wb_curve_pv_only_house_reserve_w') ?>
                             </div>
-                            <div class="col-12 mt-3">
-                                <h6 class="text-muted small fw-bold mb-2 border-bottom pb-1">Schaltzeiten & Hysterese</h6>
+                            <?php
+                                /* Wärmepumpe im Hauswert. Alias-Tabelle identisch zu
+                                   storage_manager.augment_consumer_live / Storage/predump.py; unbekannte Altwerte bleiben
+                                   als eigene, vorausgewählte Option sichtbar (nichts wird stillschweigend verworfen). */
+                                $wpSplitRaw = trim($rawVal('storage_home_wp_split'));
+                                $wpSplitNorm = strtolower($wpSplitRaw);
+                                if ($wpSplitNorm === '' || $wpSplitNorm === 'auto') {
+                                    $wpSplitMode = 'auto';
+                                } elseif (in_array($wpSplitNorm, ['1', 'true', 'yes', 'on', 'include', 'included', 'home_includes_wp'], true)) {
+                                    $wpSplitMode = 'include';
+                                } elseif (in_array($wpSplitNorm, ['0', 'false', 'no', 'off', 'separate', 'excluded', 'home_excludes_wp'], true)) {
+                                    $wpSplitMode = 'separate';
+                                } else {
+                                    $wpSplitMode = 'unknown';
+                                }
+                                $wpSplitFlowLabels = ['auto' => 'Automatisch', 'include' => 'Wärmepumpe steckt im Hauswert', 'separate' => 'Wärmepumpe getrennt gemessen'];
+                                $wpSplitFlowLabel = $wpSplitMode === 'unknown' ? ('aktueller Wert „' . $wpSplitRaw . '“') : $wpSplitFlowLabels[$wpSplitMode];
+                            ?>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['storage_home_wp_split'] ?? '') ?>">Wärmepumpe im Hauswert</label>
+                                <select class="form-select config-input" name="values[storage_home_wp_split]">
+                                    <?php if ($wpSplitMode === 'unknown'): ?>
+                                    <option value="<?= htmlspecialchars($wpSplitRaw) ?>" selected>aktueller Wert „<?= htmlspecialchars($wpSplitRaw) ?>“ (unbekannt, wirkt wie Automatisch)</option>
+                                    <?php endif; ?>
+                                    <option value="auto" <?= ($wpSplitMode === 'auto') ? 'selected' : '' ?>>Automatisch (Heuristik)</option>
+                                    <option value="include" <?= ($wpSplitMode === 'include') ? 'selected' : '' ?>>Wärmepumpe steckt im Hauswert</option>
+                                    <option value="separate" <?= ($wpSplitMode === 'separate') ? 'selected' : '' ?>>Wärmepumpe getrennt gemessen</option>
+                                </select>
+                                <?= $configValidationMarker('storage_home_wp_split') ?>
                             </div>
+                            <div class="col-12">
+                                <div class="config-flow-help rounded-3 p-3">
+                                    <div class="config-flow-title fw-bold mb-3"><i class="fas fa-route me-1"></i>Wie verteilt E3DC-Control den PV-Überschuss?</div>
+                                    <div class="config-flow">
+                                        <?= $flowStep('amber', '&#128267;', 'Hausakku unter ' . $flowVal('wbminsoc', '70') . ' %', 'die Wallbox bekommt keinen Strom aus dem Speicher, nur echten PV-Überschuss. Darüber darf der Akku im Rahmen der Ladekurve mithelfen.') ?>
+                                        <?= $flowStep('sky', '&#9728;', 'Netzpunkt-Ziel ' . $flowVal('wb_surplus_target_grid_w', '-125') . ' W', 'der schnelle Regler hält diese kleine Resteinspeisung; Schwankungen unter ' . $flowVal('wb_surplus_noise_w', '100') . ' W werden ignoriert, damit der Ladestrom nicht zappelt.') ?>
+                                        <?= $flowStep('violet', '&#8646;', 'Phasenwechsel steht an', 'zusätzlich ' . $flowVal('phase_transition_safety_margin_w', '0') . ' W Reserve vorhalten (0 = automatisch berechnet).') ?>
+                                        <?= $flowStep('amber', '&#9889;', 'Speicher unter der Ladekurve, Stützkontingent verbraucht', 'die Wallboxen bekommen nur echten PV-Überschuss; der Akku deckt Hauslast und Wärmepumpe plus ' . $flowVal('wb_curve_pv_only_house_reserve_w', '300') . ' W Reserve, nicht die Autos.') ?>
+                                        <?= $flowStep('violet', '&#9832;', 'Wärmepumpe im Hauswert: <span class="config-flow-value" data-flow-key="storage_home_wp_split" data-flow-fallback="Automatisch">' . htmlspecialchars($wpSplitFlowLabel) . '</span>', 'so trennt der Speicher-Manager Hauslast und Wärmepumpe: „Automatisch“ entscheidet je Messung nach der Rohhauslast, „steckt im Hauswert“ rechnet die Wärmepumpenleistung aus dem E3DC-Hauswert heraus, „getrennt gemessen“ zählt sie zusätzlich dazu.') ?>
+                                        <?= $flowStep('green', '&#9208;', 'Wärmepumpe ist gerade angelaufen', 'für ' . $flowVal('heatpump_start_settle_s', '30') . ' s keine Wallbox-Aufregelung, damit der Verdichter seinen Strom sicher bekommt.', true) ?>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </details>
+
+                    <details class="col-12 mt-2" data-wallbox-common>
+                        <summary class="small fw-bold text-muted">Schaltzeiten: Start, Wolken, Stopp</summary>
+                        <div class="row g-2 mt-2">
                             <div class="col-6 col-lg-3">
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_restart_delay_s'] ?? '') ?>">Wiedereinschalten (s)</label>
                                 <input type="number" min="0" max="1800" name="values[wb_restart_delay_s]" class="form-control config-input" value="<?= $val('wb_restart_delay_s') ?>" placeholder="<?= $defaults['wb_restart_delay_s'] ?>">
@@ -7347,9 +7707,91 @@ async function readConfirmedConfigJson(response) {
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_cloud_stop_delay_s'] ?? '') ?>">Wolken-Halt (s)</label>
                                 <input type="number" min="0" max="3600" name="values[wb_cloud_stop_delay_s]" class="form-control config-input" value="<?= $val('wb_cloud_stop_delay_s') ?>" placeholder="<?= $defaults['wb_cloud_stop_delay_s'] ?>">
                             </div>
+                            <?php /* Freigabe-Hysterese + Gnadenfrist des PV-only-Laufhalts bei Mehrfach-Wallbox. */ ?>
                             <div class="col-6 col-lg-3">
-                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_phase_change_hold_s'] ?? '') ?>">Phasen-Halt (s)</label>
-                                <input type="number" min="0" max="1800" name="values[wb_phase_change_hold_s]" class="form-control config-input" value="<?= $val('wb_phase_change_hold_s') ?>" placeholder="<?= $defaults['wb_phase_change_hold_s'] ?>">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_pv_only_release_hold_s'] ?? '') ?>">PV-only Halt-Freigabe (s)</label>
+                                <input type="number" min="30" max="3600" step="10" name="values[wb_pv_only_release_hold_s]" class="form-control config-input" value="<?= $val('wb_pv_only_release_hold_s') ?>" placeholder="<?= $defaults['wb_pv_only_release_hold_s'] ?>">
+                                <?= $configValidationMarker('wb_pv_only_release_hold_s') ?>
+                            </div>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_pv_only_hold_stale_guard_s'] ?? '') ?>">PV-only Halt-Gnadenfrist (s)</label>
+                                <input type="number" min="10" max="300" step="5" name="values[wb_pv_only_hold_stale_guard_s]" class="form-control config-input" value="<?= $val('wb_pv_only_hold_stale_guard_s') ?>" placeholder="<?= $defaults['wb_pv_only_hold_stale_guard_s'] ?>">
+                                <?= $configValidationMarker('wb_pv_only_hold_stale_guard_s') ?>
+                            </div>
+                            <div class="col-12">
+                                <div class="config-flow-help rounded-3 p-3">
+                                    <div class="config-flow-title fw-bold mb-3"><i class="fas fa-route me-1"></i>Wann startet, hält und stoppt die Wallbox?</div>
+                                    <div class="config-flow">
+                                        <?= $flowStep('green', '&#9654;', 'Überschuss reicht für den Mindeststrom', 'die Wallbox startet – nach einem Stopp aber frühestens nach ' . $flowVal('wb_restart_delay_s', '60') . ' s, damit das Schütz nicht flattert.') ?>
+                                        <?= $flowStep('sky', '&#9729;', 'Eine Wolke nimmt den Überschuss weg', 'die laufende Ladung wird bis zu ' . $flowVal('wb_cloud_stop_delay_s', '180') . ' s am Mindeststrom gehalten; die Mindestladezeit von ' . $flowVal('wb_min_charge_time_s', '300') . ' s schützt zusätzlich vor Takten.') ?>
+                                        <?= $flowStep('red', '&#9632;', 'Wolken-Halt und Mindestladezeit sind abgelaufen', 'die Ladung stoppt. Ein Ladefenster-Ende, Nutzer-Aus und Schutzgrenzen stoppen immer sofort.', true) ?>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-12">
+                                <small class="text-muted" style="font-size: 0.75rem;">
+                                    <i class="fas fa-info-circle me-1"></i> Die Werte gelten global für alle nativen Wallboxen. Leer gelassene WB1/WB2-Felder verwenden die globalen Werte. Geplante Ladefenster starten ohne 6-A-Anlaufbremse bis zum abgesicherten Maximaldeckel und enden hart mit 0 W.
+                                </small>
+                            </div>
+                            <div class="col-6 col-lg-3" data-wallbox-column="1">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_restart_delay_s'] ?? '') ?>">WB1 Wiederein. (s)</label>
+                                <input type="number" min="0" max="1800" name="values[wb1_restart_delay_s]" class="form-control config-input" value="<?= $val('wb1_restart_delay_s') ?>" placeholder="global">
+                            </div>
+                            <div class="col-6 col-lg-3" data-wallbox-column="1">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_min_charge_time_s'] ?? '') ?>">WB1 Mindest (s)</label>
+                                <input type="number" min="0" max="7200" name="values[wb1_min_charge_time_s]" class="form-control config-input" value="<?= $val('wb1_min_charge_time_s') ?>" placeholder="global">
+                            </div>
+                            <div class="col-6 col-lg-3" data-wallbox-column="1">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_cloud_stop_delay_s'] ?? '') ?>">WB1 Wolken (s)</label>
+                                <input type="number" min="0" max="3600" name="values[wb1_cloud_stop_delay_s]" class="form-control config-input" value="<?= $val('wb1_cloud_stop_delay_s') ?>" placeholder="global">
+                            </div>
+                            <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_restart_delay_s'] ?? '') ?>">WB2 Wiederein. (s)</label>
+                                <input type="number" min="0" max="1800" name="values[wb2_restart_delay_s]" class="form-control config-input" value="<?= $val('wb2_restart_delay_s') ?>" placeholder="global">
+                            </div>
+                            <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_min_charge_time_s'] ?? '') ?>">WB2 Mindest (s)</label>
+                                <input type="number" min="0" max="7200" name="values[wb2_min_charge_time_s]" class="form-control config-input" value="<?= $val('wb2_min_charge_time_s') ?>" placeholder="global">
+                            </div>
+                            <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_cloud_stop_delay_s'] ?? '') ?>">WB2 Wolken (s)</label>
+                                <input type="number" min="0" max="3600" name="values[wb2_cloud_stop_delay_s]" class="form-control config-input" value="<?= $val('wb2_cloud_stop_delay_s') ?>" placeholder="global">
+                            </div>
+                        </div>
+                    </details>
+
+                    <details class="col-12 mt-2" data-wallbox-common>
+                        <summary class="small fw-bold text-muted">Phasenwechsel (openWB Pro und E3DC-Direktvertrag)</summary>
+                        <div class="row g-2 mt-2">
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_phase_down_delay_s'] ?? '') ?>">Beharrung 3p→1p (s)</label>
+                                <input type="number" min="60" max="3600" step="30" name="values[wb_phase_down_delay_s]" class="form-control config-input" value="<?= $val('wb_phase_down_delay_s') ?>" placeholder="480">
+                            </div>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_phase_up_forecast_hold_s'] ?? '') ?>">Vorlauf 1p→3p (s)</label>
+                                <input type="number" min="30" max="3600" step="30" name="values[wb_phase_up_forecast_hold_s]" class="form-control config-input" value="<?= $val('wb_phase_up_forecast_hold_s') ?>" placeholder="60">
+                                <?= $configValidationMarker('wb_phase_up_forecast_hold_s') ?>
+                            </div>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_phase_up_symmetry_enable'] ?? '') ?>">Symmetrie-Klausel 1p→3p</label>
+                                <select name="values[wb_phase_up_symmetry_enable]" class="form-select config-input">
+                                    <option value="0" <?= !$isTrue('wb_phase_up_symmetry_enable') ? 'selected' : '' ?>>Aus</option>
+                                    <option value="1" <?= $isTrue('wb_phase_up_symmetry_enable') ? 'selected' : '' ?>>Ein (ab Schieflastwert)</option>
+                                </select>
+                                <?= $configValidationMarker('wb_phase_up_symmetry_enable') ?>
+                            </div>
+                            <?php /* Experimenteller E3DC-Direktvertrag, Standard aus; nur Sichtbarkeit. */ ?>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label text-danger" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_e3dc_direct_phase_control_enable'] ?? '') ?>">E3DC-Direktvertrag (experimentell)</label>
+                                <select name="values[wb_e3dc_direct_phase_control_enable]" class="form-select config-input">
+                                    <option value="0" <?= !$isTrue('wb_e3dc_direct_phase_control_enable') ? 'selected' : '' ?>>Aus (empfohlen)</option>
+                                    <option value="1" <?= $isTrue('wb_e3dc_direct_phase_control_enable') ? 'selected' : '' ?>>Ein (schreibt Geräteeinstellungen)</option>
+                                </select>
+                                <?= $configValidationMarker('wb_e3dc_direct_phase_control_enable') ?>
+                            </div>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_phase_up_export_wh'] ?? '') ?>">Export-Wh 1p→3p (Wh)</label>
+                                <input type="number" min="50" max="2000" step="10" name="values[wb_phase_up_export_wh]" class="form-control config-input" value="<?= $val('wb_phase_up_export_wh') ?>" placeholder="120">
                             </div>
                             <div class="col-6 col-lg-3">
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['openwb_pro_phase_wait_s'] ?? '') ?>">Pro Phasen-Cooldown (s)</label>
@@ -7366,50 +7808,87 @@ async function readConfirmedConfigJson(response) {
                                 <input type="number" min="0" max="1800" name="values[openwb_pro_phase_restart_delay_s]" class="form-control config-input" value="<?= $val('openwb_pro_phase_restart_delay_s') ?>" placeholder="0">
                             </div>
                             <div class="col-6 col-lg-3">
-                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['openwb_pro_start_wakeup_delay_s'] ?? '') ?>">Pro Wake-up-Nachlauf (s)</label>
-                                <input type="number" min="0" max="120" name="values[openwb_pro_start_wakeup_delay_s]" class="form-control config-input" value="<?= $val('openwb_pro_start_wakeup_delay_s') ?>" placeholder="5">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_phase_change_hold_s'] ?? '') ?>">Phasen-Halt (s)</label>
+                                <input type="number" min="0" max="1800" name="values[wb_phase_change_hold_s]" class="form-control config-input" value="<?= $val('wb_phase_change_hold_s') ?>" placeholder="<?= $defaults['wb_phase_change_hold_s'] ?>">
+                            </div>
+                            <div class="col-12">
+                                <div class="config-flow-help rounded-3 p-3">
+                                    <div class="config-flow-title fw-bold mb-3"><i class="fas fa-route me-1"></i>Wann schaltet E3DC-Control die Phasen um?</div>
+                                    <div class="config-flow">
+                                        <?= $flowStep('sky', '&#9201;', 'Der Überschuss reicht ' . $flowVal('wb_phase_down_delay_s', '480') . ' s lang nicht mehr für drei Phasen', 'dann erst wird auf eine Phase geschaltet. Kurze Wolkenlücken lösen nichts aus. Netzbezug über der Schwelle, die wbminSoC-Untergrenze und unerlaubter Akkubezug verkürzen die Wartezeit auf 60 s.') ?>
+                                        <?= $flowStep('green', '&#9650;', 'Der Überschuss (gemessen oder frisches Budget) trägt im 30-s-Mittel drei Phasen (4140 W + Puffer) und die eine Phase ist ausgereizt (schaltfähiges Paar: bis auf 2 A am Referenzstrom, an der openWB Pro 20 A) – ' . $flowVal('wb_phase_up_forecast_hold_s', '60') . ' s auf der leckenden Uhr', 'oder das Export-Wh-Konto ist voll (' . $flowVal('wb_phase_up_export_wh', '120') . ' Wh Überschuss über dem Referenzstrom; Wolken ziehen nur das 3p-Defizit ab) – dann wird auf drei Phasen geschaltet. Wolkenlücken zählen die Uhr zurück, erst 15 s ohne Bedingung löschen sie; Netzbezugs-Blips unter 30 s zählen nicht. Eine 16-A-Wallbox gilt ab dem 3p-Minimum als ausgereizt.') ?>
+                                        <?= $flowStep('amber', '&#8646;', 'Die Umschaltung selbst', 'openWB Pro trennt kurz den CP (' . $flowVal('openwb_pro_phase_cp_interrupt_duration_s', '5') . ' s), danach ' . $flowVal('openwb_pro_phase_restart_delay_s', '0') . ' s Nachlauf, bevor wieder Strom fließt. E3DC-Wallboxen schalten nur mit aktivem Direktvertrag.') ?>
+                                        <?= $flowStep('violet', '&#9203;', 'Das Fahrzeug lädt nach dem Wechsel wieder', 'für ' . $flowVal('wb_phase_change_hold_s', '180') . ' s wird der Strom nicht weiter angehoben, bis das Fahrzeug den Wechsel verdaut hat. Der erste Hochlauf je Stecksession darf sofort erfolgen.') ?>
+                                        <?= $flowStep('red', '&#128274;', 'Nach einer bestätigten Umschaltung', $flowVal('openwb_pro_phase_wait_s', '480') . ' s Sperre: kein weiterer Phasenwechsel, egal was das Budget sagt. Erst danach beginnt die nächste Beharrung – zwei Schützwechsel binnen acht Minuten gibt es nie.', true) ?>
+                                    </div>
+                                </div>
                             </div>
                             <div class="col-12">
                                 <small class="text-muted" style="font-size: 0.75rem;">
-                                    <i class="fas fa-info-circle me-1"></i> Leer gelassene WB1/WB2-Felder verwenden die globalen Werte. Ladefenster starten ohne 6A-Anlaufbremse bis zum abgesicherten Maximaldeckel und enden hart mit 0 W.
+                                    <i class="fas fa-info-circle me-1"></i> Der Phasen-Halt gilt global für alle nativen Wallboxen; leer gelassene WB1/WB2-Felder verwenden den globalen Wert.
                                 </small>
                             </div>
                             <div class="col-6 col-lg-3" data-wallbox-column="1">
-                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_restart_delay_s'] ?? '') ?>">WB1 Wiederein. (s)</label>
-                                <input type="number" min="0" max="1800" name="values[wb1_restart_delay_s]" class="form-control config-input" value="<?= $val('wb1_restart_delay_s') ?>" placeholder="global">
-                            </div>
-                            <div class="col-6 col-lg-3" data-wallbox-column="1">
-                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_min_charge_time_s'] ?? '') ?>">WB1 Mindest (s)</label>
-                                <input type="number" min="0" max="7200" name="values[wb1_min_charge_time_s]" class="form-control config-input" value="<?= $val('wb1_min_charge_time_s') ?>" placeholder="global">
-                            </div>
-                            <div class="col-6 col-lg-3" data-wallbox-column="1">
-                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_cloud_stop_delay_s'] ?? '') ?>">WB1 Wolken (s)</label>
-                                <input type="number" min="0" max="3600" name="values[wb1_cloud_stop_delay_s]" class="form-control config-input" value="<?= $val('wb1_cloud_stop_delay_s') ?>" placeholder="global">
-                            </div>
-                            <div class="col-6 col-lg-3" data-wallbox-column="1">
-                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_phase_change_hold_s'] ?? '') ?>">WB1 Phasen (s)</label>
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_phase_change_hold_s'] ?? '') ?>">WB1 Phasen-Halt (s)</label>
                                 <input type="number" min="0" max="1800" name="values[wb1_phase_change_hold_s]" class="form-control config-input" value="<?= $val('wb1_phase_change_hold_s') ?>" placeholder="global">
                             </div>
                             <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
-                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_restart_delay_s'] ?? '') ?>">WB2 Wiederein. (s)</label>
-                                <input type="number" min="0" max="1800" name="values[wb2_restart_delay_s]" class="form-control config-input" value="<?= $val('wb2_restart_delay_s') ?>" placeholder="global">
-                            </div>
-                            <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
-                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_min_charge_time_s'] ?? '') ?>">WB2 Mindest (s)</label>
-                                <input type="number" min="0" max="7200" name="values[wb2_min_charge_time_s]" class="form-control config-input" value="<?= $val('wb2_min_charge_time_s') ?>" placeholder="global">
-                            </div>
-                            <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
-                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_cloud_stop_delay_s'] ?? '') ?>">WB2 Wolken (s)</label>
-                                <input type="number" min="0" max="3600" name="values[wb2_cloud_stop_delay_s]" class="form-control config-input" value="<?= $val('wb2_cloud_stop_delay_s') ?>" placeholder="global">
-                            </div>
-                            <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
-                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_phase_change_hold_s'] ?? '') ?>">WB2 Phasen (s)</label>
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_phase_change_hold_s'] ?? '') ?>">WB2 Phasen-Halt (s)</label>
                                 <input type="number" min="0" max="1800" name="values[wb2_phase_change_hold_s]" class="form-control config-input" value="<?= $val('wb2_phase_change_hold_s') ?>" placeholder="global">
                             </div>
-                            <div class="col-12 mt-1">
-                                <small class="text-muted" style="font-size: 0.75rem;">
-                                    <i class="fas fa-info-circle me-1"></i> Diese Werte gelten global für alle angeschlossenen nativen Wallboxen.
-                                </small>
+                        </div>
+                    </details>
+
+                    <details class="col-12 mt-2" data-wallbox-common>
+                        <summary class="small fw-bold text-muted">Fahrzeug-Weckruf und Wiederanlauf</summary>
+                        <div class="row g-2 mt-2">
+                            <?php $proStartCpMode = strtolower(trim((string)$val('openwb_pro_automatic_start_cp_enable')));
+                                  $proStartCpMode = in_array($proStartCpMode, ['1', 'true', 'yes', 'on', 'ja'], true) ? 'on'
+                                      : (in_array($proStartCpMode, ['0', 'false', 'no', 'off', 'nein'], true) ? 'off' : 'auto'); ?>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['openwb_pro_automatic_start_cp_enable'] ?? '') ?>">Pro Start-CP-Impuls</label>
+                                <select name="values[openwb_pro_automatic_start_cp_enable]" class="form-select config-input">
+                                    <option value="auto" <?= $proStartCpMode === 'auto' ? 'selected' : '' ?>>Auto (nur mit Fahrzeugprofil)</option>
+                                    <option value="on" <?= $proStartCpMode === 'on' ? 'selected' : '' ?>>Ein (Anlagenfreigabe)</option>
+                                    <option value="off" <?= $proStartCpMode === 'off' ? 'selected' : '' ?>>Aus</option>
+                                </select>
+                            </div>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['openwb_pro_start_cp_grace_s'] ?? '') ?>">Pro Start-CP-Karenz (s)</label>
+                                <input type="number" min="60" max="600" name="values[openwb_pro_start_cp_grace_s]" class="form-control config-input" value="<?= $val('openwb_pro_start_cp_grace_s') ?>" placeholder="60">
+                            </div>
+                            <?php /* Startfenster und Wiederholzyklus der openWB Pro. */ ?>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['openwb_pro_start_hold_s'] ?? '') ?>">Pro Startfenster (s)</label>
+                                <input type="number" min="60" max="600" name="values[openwb_pro_start_hold_s]" class="form-control config-input" value="<?= $val('openwb_pro_start_hold_s') ?>" placeholder="180">
+                            </div>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['openwb_pro_start_retry_cycle_s'] ?? '') ?>">Pro Start-Wiederholzyklus (s)</label>
+                                <input type="number" min="180" max="1200" step="60" name="values[openwb_pro_start_retry_cycle_s]" class="form-control config-input" value="<?= $val('openwb_pro_start_retry_cycle_s') ?>" placeholder="300">
+                            </div>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['openwb_pro_start_wakeup_delay_s'] ?? '') ?>">Pro Wake-up-Nachlauf (s)</label>
+                                <input type="number" min="0" max="120" name="values[openwb_pro_start_wakeup_delay_s]" class="form-control config-input" value="<?= $val('openwb_pro_start_wakeup_delay_s') ?>" placeholder="5">
+                            </div>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_native_floor_retry_enable'] ?? '') ?>">E3DC Floor-Wiederanlauf</label>
+                                <select name="values[wb_native_floor_retry_enable]" class="form-select config-input">
+                                    <option value="0" <?= !$isTrue('wb_native_floor_retry_enable') ? 'selected' : '' ?>>Aus (gesperrt bis Neustart)</option>
+                                    <option value="1" <?= $isTrue('wb_native_floor_retry_enable') ? 'selected' : '' ?>>Ein (revalidierter Wiederanlauf)</option>
+                                </select>
+                            </div>
+                            <div class="col-12">
+                                <div class="config-flow-help rounded-3 p-3">
+                                    <div class="config-flow-title fw-bold mb-3"><i class="fas fa-route me-1"></i>Was passiert, wenn das Auto nicht anspringt?</div>
+                                    <div class="config-flow">
+                                        <?php /* Startfenster, Weckimpuls und Wiederholzyklus. */ ?>
+                                        <?= $flowStep('sky', '&#128268;', 'Anstecken', 'sofort Mindeststrom 6 A als Angebot (bei stehendem Box-Angebot: übernehmen). Startfenster ' . $flowVal('openwb_pro_start_hold_s', '180') . ' s: Angebot eingefroren, Budget-Einbrüche halten – kein 0 A, keine Anhebung; Absenkung ab 6 A sofort.') ?>
+                                        <?= $flowStep('sky', '&#9200;', 'Strom ist freigegeben, das Auto nimmt ihn nicht an', 'Weckimpuls frühestens ' . $flowVal('openwb_pro_start_cp_grace_s', '60') . ' s nach dem bestätigten Angebot, nur bei stehendem Angebot – Modus „' . $flowVal('openwb_pro_automatic_start_cp_enable', 'Auto') . '“. Wiederholung alle ' . $flowVal('openwb_pro_start_retry_cycle_s', '300') . ' s (höchstens 3), danach Meldung ohne Stop – kein „Ladung beendet“ ohne erreichten Ziel-SoC.') ?>
+                                        <?= $flowStep('amber', '&#9201;', 'Nach dem Weckimpuls', $flowVal('openwb_pro_start_wakeup_delay_s', '5') . ' s warten, dann wird der Strom erneut angeboten.') ?>
+                                        <?= $flowStep('violet', '&#128260;', 'E3DC-Wallbox hat wegen wbminSoC, Wolke oder Netzbezug selbst gestoppt', 'Wiederanlauf „' . $flowVal('wb_native_floor_retry_enable', 'Aus') . '“: Aus = gesperrt bis zum Dienstneustart; Ein = neuer Startimpuls erst nach frischem Leerlauf-Readback, Budget über dem Phasenminimum und ohne Netzbezug.') ?>
+                                        <?= $flowStep('green', '&#10003;', 'Auto lädt', 'ab hier regelt die normale Überschuss-Logik den Strom.', true) ?>
+                                    </div>
+                                </div>
                             </div>
                         </div>
                     </details>
@@ -7902,13 +8381,58 @@ async function readConfirmedConfigJson(response) {
                     </div>
                 </section>
 
+                <?php
+                // Ladeprofil (Select) – Vorbelegung identisch zur Migration/Vertrag; gesperrte Felder
+                // sind readonly (nie disabled, sonst fehlt der Schlüssel beim Speichern).
+                $marketChargeProfile = e3dc_market_charge_profile_effective([
+                    'market_charge_profile' => html_entity_decode($val('market_charge_profile')),
+                    'market_min_margin_pct' => html_entity_decode($val('market_min_margin_pct')),
+                    'market_safety_correction_ct_per_kwh' => html_entity_decode($val('market_safety_correction_ct_per_kwh')),
+                    'direct_marketing_min_margin_pct' => html_entity_decode($val('direct_marketing_min_margin_pct')),
+                    'direct_marketing_safety_margin_ct_per_kwh' => html_entity_decode($val('direct_marketing_safety_margin_ct_per_kwh')),
+                ]);
+                $marketProfileLocked = $marketChargeProfile !== 'custom';
+                $marketProfilePresets = ['economic' => ['10.0', '0.0'], 'balanced' => ['0.0', '0.0'], 'comfort' => ['0.0', '0.0']];
+                $marketProfileMargin = $marketProfileLocked ? $marketProfilePresets[$marketChargeProfile][0] : $val('market_min_margin_pct');
+                $marketProfileSafety = $marketProfileLocked ? $marketProfilePresets[$marketChargeProfile][1] : $val('market_safety_correction_ct_per_kwh');
+                $marketProfileReadonly = $marketProfileLocked ? ' readonly aria-readonly="true"' : '';
+                $marketProfileLockedClass = $marketProfileLocked ? ' bg-body-tertiary' : '';
+                ?>
                 <div class="row g-3 mt-2 align-items-stretch" id="opt_market_economics" style="display: <?= $showMarketSettings ? 'flex' : 'none' ?>;">
                     <div class="col-lg-4 col-xl-3">
                         <div class="market-path-input-stack">
                             <div>
+                                <label class="config-label" for="conf_market_charge_profile" data-tooltip="<?= htmlspecialchars($tooltipMap['market_charge_profile'] ?? '') ?>">Ladeprofil</label>
+                                <select class="form-select config-input" name="values[market_charge_profile]" id="conf_market_charge_profile" onchange="applyMarketChargeProfile(this.value)">
+                                    <option value="economic" <?= ($marketChargeProfile === 'economic') ? 'selected' : '' ?>>Wirtschaftlich – Netz nur bei Defizit und 10 % Marge</option>
+                                    <option value="balanced" <?= ($marketChargeProfile === 'balanced') ? 'selected' : '' ?>>Ausgeglichen – Netz bei Defizit, ohne Marge</option>
+                                    <option value="comfort" <?= ($marketChargeProfile === 'comfort') ? 'selected' : '' ?>>Komfort – Netz im Preisfenster bis Zielstand am Fensterende</option>
+                                    <option value="custom" <?= ($marketChargeProfile === 'custom') ? 'selected' : '' ?>>Eigene Einstellungen</option>
+                                </select>
+                                <?= $configValidationMarker('market_charge_profile') ?>
+                            </div>
+                            <div data-market-profile-only="comfort" style="display: <?= $marketChargeProfile === 'comfort' ? '' : 'none' ?>;">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['market_price_limit_ct'] ?? '') ?>">Komfort-Preislimit</label>
+                                <div class="input-group">
+                                    <input type="number" step="0.1" min="0" name="values[market_price_limit_ct]" id="conf_market_price_limit_ct" class="form-control config-input" value="<?= $val('market_price_limit_ct') ?>" placeholder="leer = Mittelpreis">
+                                    <span class="input-group-text bg-body-tertiary">ct/kWh</span>
+                                </div>
+                                <div class="small text-muted" data-market-price-limit-hint>leer = Mittelpreis des Preishorizonts, wird je Plan bestimmt</div>
+                                <?= $configValidationMarker('market_price_limit_ct') ?>
+                            </div>
+                            <div data-market-profile-only="comfort" style="display: <?= $marketChargeProfile === 'comfort' ? '' : 'none' ?>;">
+                                <?php // Spiegelfeld ohne name: der reale Schlüssel cheap_grid_battery_max_soc liegt im Negativpreis-Block (immer im DOM); JS koppelt beide. ?>
+                                <label class="config-label" for="conf_market_comfort_max_soc_mirror" data-tooltip="<?= htmlspecialchars($tooltipMap['cheap_grid_battery_max_soc'] ?? '') ?>">Komfort-Ziel: Speicher max.</label>
+                                <div class="input-group">
+                                    <input type="number" step="0.5" min="0" max="100" id="conf_market_comfort_max_soc_mirror" class="form-control" value="<?= $val('cheap_grid_battery_max_soc') !== '' ? $val('cheap_grid_battery_max_soc') : '80' ?>" data-market-comfort-max-soc-mirror>
+                                    <span class="input-group-text bg-body-tertiary">%</span>
+                                </div>
+                                <div class="small text-muted">Ziel zum Fensterende = min(Ladeziel, Speicher max. <span data-market-comfort-max-soc><?= $val('cheap_grid_battery_max_soc') !== '' ? $val('cheap_grid_battery_max_soc') : '80' ?></span> %); PV wird zuerst angerechnet. Gleicher Wert wie „Speicher max.“ im Block „Netzladen bei negativen Preisen“ (<code>cheap_grid_battery_max_soc</code>).</div>
+                            </div>
+                            <div>
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['market_min_margin_pct'] ?? '') ?>">Preis-Mindestmarge</label>
                                 <div class="input-group">
-                                    <input type="number" step="0.1" min="0" name="values[market_min_margin_pct]" class="form-control config-input" value="<?= $val('market_min_margin_pct') ?>">
+                                    <input type="number" step="0.1" min="0" name="values[market_min_margin_pct]" id="conf_market_min_margin_pct" class="form-control config-input<?= $marketProfileLockedClass ?>" value="<?= $marketProfileMargin ?>"<?= $marketProfileReadonly ?> data-market-profile-locked>
                                     <span class="input-group-text bg-body-tertiary">%</span>
                                 </div>
                                 <?= $configValidationMarker('market_min_margin_pct') ?>
@@ -7916,7 +8440,7 @@ async function readConfirmedConfigJson(response) {
                             <div>
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['market_safety_correction_ct_per_kwh'] ?? '') ?>">Preis-Sicherheitskorrektur</label>
                                 <div class="input-group">
-                                    <input type="number" step="0.01" min="-10" max="50" name="values[market_safety_correction_ct_per_kwh]" class="form-control config-input" value="<?= $val('market_safety_correction_ct_per_kwh') ?>">
+                                    <input type="number" step="0.01" min="-10" max="50" name="values[market_safety_correction_ct_per_kwh]" id="conf_market_safety_correction_ct_per_kwh" class="form-control config-input<?= $marketProfileLockedClass ?>" value="<?= $marketProfileSafety ?>"<?= $marketProfileReadonly ?> data-market-profile-locked>
                                     <span class="input-group-text bg-body-tertiary">ct/kWh</span>
                                 </div>
                                 <?= $configValidationMarker('market_safety_correction_ct_per_kwh') ?>
@@ -7926,7 +8450,7 @@ async function readConfirmedConfigJson(response) {
                                     <i class="fas fa-shield-halved text-success mt-1"></i>
                                     <div>
                                         <div class="config-label fw-bold" data-tooltip="<?= htmlspecialchars($tooltipMap['market_autarky_first_enable'] ?? '') ?>">PV-autark zuerst</div>
-                                        <div class="small text-muted">Feste Schutzinvariante: Bei ausreichender Speicher-/PV-Deckung bleibt der normale Marktpfad blockiert.</div>
+                                        <div class="small text-muted" data-market-autarky-text>Feste Schutzinvariante: Bei ausreichender Speicher-/PV-Deckung bleibt der normale Marktpfad blockiert.</div>
                                     </div>
                                 </div>
                                 <?= $configValidationMarker('market_autarky_first_enable') ?>
@@ -9492,6 +10016,7 @@ async function readConfirmedConfigJson(response) {
                 "HA Master/Slave Cluster" => "fa-server text-info",
                 "E3DC System-Verbindung" => "fa-solar-panel text-warning",
                 "Webansicht & Updates" => "fa-desktop text-primary",
+                "Zusatzwechselrichter" => "fa-solar-panel text-success",
                 "Sonstiges" => "fa-sliders-h text-secondary"
             ];
             $iconClass = $groupIcons[$title] ?? "fa-sliders-h text-secondary";
@@ -9520,15 +10045,18 @@ async function readConfirmedConfigJson(response) {
                                 <?= $key ?>
                                 <?php if ($isHidden): ?><span class="badge bg-secondary ms-1 text-uppercase" style="font-size:0.55em; opacity:0.7;" title="Standardwert (wird erst beim Ausfüllen in die Datei geschrieben)">Default</span><?php endif; ?>
                             </label>
-                            <div class="d-flex align-items-center gap-2">
-                                <input type="checkbox" name="comments[]" value="<?= $key ?>" class="form-check-input small" title="Auskommentieren" style="accent-color: #22d3ee;" <?= $data['commented'] ? 'checked':'' ?>>
-                            </div>
+                            <?php /* Keine „Auskommentieren“-Checkbox mehr – die JSON-Konfiguration kennt keine Kommentare, der Speicherpfad las sie nie. */ ?>
                         </div>
                         <div class="input-group input-group-sm">
                             <?php if (str_ends_with($key, '_enable') || str_ends_with($key, '_active') || $key === 'matter_bridge'): ?>
                                 <select name="values[<?= $key ?>]" class="form-select config-input">
                                     <option value="0" <?= ($data['value'] == '0' || $data['value'] == '') ? 'selected' : '' ?>>Aus (0)</option>
                                     <option value="1" <?= ($data['value'] == '1' || strtolower($data['value']) == 'true') ? 'selected' : '' ?>>Ein (1)</option>
+                                </select>
+                            <?php elseif ($key === 'ext_inverter_type'): ?>
+                                <select name="values[<?= $key ?>]" class="form-select config-input">
+                                    <option value="none" <?= (strtolower(trim((string)$data['value'])) === 'sungrow_modbus') ? '' : 'selected' ?>>Aus (none)</option>
+                                    <option value="sungrow_modbus" <?= (strtolower(trim((string)$data['value'])) === 'sungrow_modbus') ? 'selected' : '' ?>>Sungrow String-Wechselrichter (Modbus TCP, nur lesend)</option>
                                 </select>
                             <?php elseif (str_ends_with($key, '_time')): ?>
                                 <input type="time" name="values[<?= $key ?>]" class="form-control config-input" value="<?= htmlspecialchars($data['value']) ?>">
@@ -9538,9 +10066,17 @@ async function readConfirmedConfigJson(response) {
                                 <input type="text" name="values[<?= $key ?>]" class="form-control config-input" value="<?= htmlspecialchars($data['value']) ?>" placeholder="Standard: <?= $defaults[$key] ?? '' ?>">
                             <?php endif; ?>
                         </div>
+                        <?php if ($title === "Zusatzwechselrichter") echo $configValidationMarker($key); ?>
                     </div>
                 <?php endforeach; ?>
                 </div>
+
+                <?php if ($title === "Zusatzwechselrichter"): ?>
+                <div class="alert alert-secondary small py-2 mt-3 mb-0">
+                    <?php /* Hot-Reload-Hinweis und Doku-Link (e3dcDocLink) */ ?>
+                    <i class="fas fa-info-circle me-1"></i><strong>Zusatzwechselrichter (nur lesend):</strong> nur wenn ein zweiter Wechselrichter über LAN erreichbar ist; die Regelung nutzt weiterhin den E3DC-Messwert, die Direktlesung liefert Phasen-/String-Daten und Diagnose. Unterstützt wird die Registerbelegung der Sungrow-String-Wechselrichter (SG-Serie) über Modbus TCP; ungültige Angaben deaktivieren die Lesung. Änderungen wirken innerhalb weniger Sekunden ohne Neustart des Live-Dienstes. Details: <?= e3dcDocLink('Zusatzwechselrichter.md') ?>.
+                </div>
+                <?php endif; ?>
 
                 <?php if ($title === "E3DC System-Verbindung"): ?>
                 <?php
@@ -9783,6 +10319,15 @@ async function readConfirmedConfigJson(response) {
                                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['auto_update_time'] ?? '') ?>">Auto-Update Uhrzeit</label>
                                         <input type="time" name="values[auto_update_time]" class="form-control config-input" value="<?= $webEsc('auto_update_time') ?>">
                                     </div>
+                                    <?php if (e3dcIsDockerEnvironment()): ?>
+                                    <div class="col-12">
+                                        <?php if (function_exists('e3dcDockerWatchtowerConfigured') && e3dcDockerWatchtowerConfigured()): ?>
+                                        <div class="small text-body-secondary"><i class="fab fa-docker me-1"></i>Docker: Update-Knopf und Auto-Update geben Watchtower das Signal (Token vorhanden). Watchtower muss dafür laufen: <code>docker compose --profile auto-update up -d watchtower</code>.</div>
+                                        <?php else: ?>
+                                        <div class="small text-body-secondary"><i class="fab fa-docker me-1"></i>Docker: Ohne Watchtower-Token in <code>.env</code> bleibt Auto-Update wirkungslos; der Update-Knopf zeigt dann die Host-Befehle und die einmalige Freischaltung.</div>
+                                        <?php endif; ?>
+                                    </div>
+                                    <?php endif; ?>
                                 </div>
                             </div>
                         </div>
@@ -9973,7 +10518,8 @@ async function readConfirmedConfigJson(response) {
                     <div class="mt-3 rounded-3 p-2 config-wizard-safe" style="font-size:0.78rem;">
                         <i class="fas fa-lock me-1 text-success"></i>
                         Sicherheitsrahmen: feste Topic-Allowlist, keine Shell-Befehle, keine RSCP-Kommandos aus MQTT, keine systemd-Aktionen.
-                        Die vollständige Topic-Tabelle steht in <code>doc/Smart_Home_Mqtt_Websockets.md</code>.
+                        <?php /* Doku-Link */ ?>
+                        Die vollständige Topic-Tabelle steht in <?= e3dcDocLink('Smart_Home_Mqtt_Websockets.md') ?>.
                     </div>
                 </div>
                 <?php endif; ?>
@@ -10230,6 +10776,25 @@ async function readConfirmedConfigJson(response) {
                                 </div>
                             </div>
                         </div>
+                        <?php /* Später Vollstand nur mit Grund (nur Prognose auf 100%). */ ?>
+                        <div class="col-12 d-none" data-forecast100-curve-setting>
+                            <div class="rounded-3 p-2" style="background:rgba(14,165,233,0.07); border:1px solid rgba(14,165,233,0.18);">
+                                <div class="form-check form-switch mb-1">
+                                    <input type="hidden" name="values[storage_forecast100_late_full_guard_enable]" value="0">
+                                    <input class="form-check-input config-input" type="checkbox"
+                                           name="values[storage_forecast100_late_full_guard_enable]"
+                                           value="1"
+                                           id="conf_storage_forecast100_late_full_guard_enable"
+                                           <?= $sbool('storage_forecast100_late_full_guard_enable') ? 'checked' : '' ?>>
+                                    <label class="form-check-label config-label fw-bold text-info" for="conf_storage_forecast100_late_full_guard_enable" data-tooltip="<?= htmlspecialchars($tooltipMap['storage_forecast100_late_full_guard_enable'] ?? '') ?>">
+                                        <i class="fas fa-hourglass-half me-1"></i>Später Vollstand nur mit Grund
+                                    </label>
+                                </div>
+                                <div class="text-muted" style="font-size:0.72rem;">
+                                    100 % erst kurz vor dem PV-Ende nur bei Einspeiselimit, Abregeldruck, Direktvermarktung oder Pre-Dump; sonst endet die Kurve am letzten nutzbaren Überschuss. Aus = nie spätes Kurvenende.
+                                </div>
+                            </div>
+                        </div>
                         <div class="col-6 col-md-4" data-anchored-curve-setting>
                             <label class="config-label fw-bold text-success" data-tooltip="<?= htmlspecialchars($tooltipMap['storage_morning_soc'] ?? '') ?>"><i class="fas fa-moon me-1"></i>Morgen-Puffer (%)</label>
                             <input type="number" min="0" max="50" name="values[storage_morning_soc]" class="form-control config-input" value="<?= $sv('storage_morning_soc') ?>" placeholder="20">
@@ -10244,6 +10809,12 @@ async function readConfirmedConfigJson(response) {
                             <label class="config-label fw-bold text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['storage_target_soc'] ?? '') ?>"><i class="fas fa-flag-checkered me-1"></i>Tagesziel (%)</label>
                             <input type="number" min="50" max="100" name="values[storage_target_soc]" class="form-control config-input" value="<?= $sv('storage_target_soc') ?>" placeholder="90">
                             <div class="text-muted" style="font-size:0.72rem;">Ziel bei Freilauf</div>
+                        </div>
+                        <?php /* Kurvenende-Puffer, wirkt in beiden Zielkurven-Modi. */ ?>
+                        <div class="col-6 col-md-4">
+                            <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['storage_curve_end_guard_min'] ?? '') ?>"><i class="fas fa-cloud-sun me-1"></i>Kurvenende-Puffer (min)</label>
+                            <input type="number" min="30" max="120" step="5" name="values[storage_curve_end_guard_min]" class="form-control config-input" value="<?= $sv('storage_curve_end_guard_min') ?>" placeholder="45">
+                            <div class="text-muted" style="font-size:0.72rem;">Abstand zum letzten nutzbaren Überschuss</div>
                         </div>
                         <div class="col-12">
                             <div class="rounded-3 p-2 mt-1" style="background:rgba(16,185,129,0.08); border:1px solid rgba(16,185,129,0.22);">
@@ -10762,7 +11333,7 @@ async function readConfirmedConfigJson(response) {
                                     placeholder="z.B. 51.163375" style="font-size:0.8rem; font-family:monospace;">
                             </div>
                             <div class="col-6">
-                                <label style="font-size:0.68rem; color:#9ca3af;">Laengengrad (Longitude)</label>
+                                <label style="font-size:0.68rem; color:#9ca3af;">Längengrad (Longitude)</label>
                                 <input type="text" id="wiz_lon" name="values[laenge]"
                                     class="form-control form-control-sm config-input"
                                     value="<?= htmlspecialchars($cur_laenge ?: $de_mitte_lon) ?>"
@@ -12097,7 +12668,7 @@ async function readConfirmedConfigJson(response) {
                     <div class="col-12 col-md-6 col-xl-4 config-item" data-search-key="<?= htmlspecialchars($restKeyNormalized, ENT_QUOTES, 'UTF-8') ?>" data-default-hidden="false">
                         <div class="d-flex justify-content-between align-items-center mb-1">
                             <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap[$restKeyNormalized] ?? 'Keine Beschreibung.') ?>"><?= htmlspecialchars((string)$key, ENT_QUOTES, 'UTF-8') ?></label>
-                            <input type="checkbox" name="comments[]" value="<?= htmlspecialchars((string)$key, ENT_QUOTES, 'UTF-8') ?>" class="form-check-input small" title="Auskommentieren" <?= $data['commented'] ? 'checked':'' ?>>
+                            <?php /* Keine „Auskommentieren“-Checkbox (siehe Hauptraster). */ ?>
                         </div>
                         <div class="input-group input-group-sm">
                             <input type="text" name="values[<?= htmlspecialchars((string)$key, ENT_QUOTES, 'UTF-8') ?>]" class="form-control config-input" value="<?= htmlspecialchars($data['value']) ?>">
@@ -12488,6 +13059,7 @@ function initHeatpumpPvReservationStatus() {
         'wp_pv_max_power_w', 'wp_min_runtime_min', 'wp_restart_block_min',
         'wp_pv_control_mode', 'wp_pv_start_power_w', 'grid_start_limit',
         'wp_pv_start_wait_s', 'wp_pv_reaction_s', 'wp_pv_handoff_timeout_s',
+        'wp_pv_hz_hysteresis_k', 'wp_pv_ww_hysteresis_k', 'wp_pv_boost_release_s',
         'wp_pv_battery_max_w', 'wp_pv_battery_limit_wh',
         'wp_pv_grid_max_w', 'wp_pv_grid_limit_wh', 'luxtronik', 'wp_type', 'auto_mode',
     ]);
@@ -12990,7 +13562,42 @@ function updateWallboxBudgetDisplay() {
     if (isNaN(resVal)) resVal = 2.0;
     var budget = Math.max(0, gridVal - resVal);
     display.textContent = (Math.round(budget * 10) / 10).toFixed(1).replace('.0', '');
+    document.querySelectorAll('[data-flow-computed="wallbox_budget"]').forEach(function (el) {
+        el.textContent = display.textContent;
+    });
 }
+
+// Erklärkarten „Wenn → dann“: Zahlen folgen den Eingabefeldern beim Tippen
+// (leeres Feld = Platzhalter bzw. Standardwert, Auswahlfelder = sichtbarer Text).
+function updateConfigFlowValues() {
+    document.querySelectorAll('[data-flow-key]').forEach(function (el) {
+        var key = el.getAttribute('data-flow-key');
+        var input = document.querySelector('[name="values[' + key + ']"]');
+        if (!input) return;
+        var value = '';
+        if (input.tagName === 'SELECT') {
+            var option = input.options[input.selectedIndex];
+            value = option ? option.text.replace(/\s*\(.*\)\s*$/, '') : '';
+        } else {
+            value = String(input.value || '').trim();
+            if (value === '') value = String(input.getAttribute('placeholder') || '').trim();
+            if (value === '' || value === 'global' || value.indexOf('leer') === 0) {
+                value = String(el.getAttribute('data-flow-fallback') || '');
+            }
+        }
+        el.textContent = value;
+    });
+}
+document.addEventListener('DOMContentLoaded', function () {
+    updateConfigFlowValues();
+    ['input', 'change'].forEach(function (eventName) {
+        document.addEventListener(eventName, function (event) {
+            var target = event.target;
+            if (!target || !target.name || target.name.indexOf('values[') !== 0) return;
+            updateConfigFlowValues();
+        });
+    });
+});
 
 function filterConfig() {
     var input = document.getElementById('configSearch');
@@ -13475,6 +14082,7 @@ const DIRECT_MARKETING_PREVIEW_KEYS = [
     'direct_marketing_eeg_grid_export_risk_ack'
 ];
 const MARKET_PATH_PREVIEW_KEYS = [
+    'market_charge_profile', 'market_price_limit_ct', 'cheap_grid_battery_max_soc',
     'market_min_margin_pct', 'market_safety_correction_ct_per_kwh',
     'market_autarky_first_enable', 'market_autarky_low_soc_pct', 'market_autarky_horizon_buffer_wh',
     'market_roundtrip_efficiency_pct', 'market_degradation_ct_per_kwh',
@@ -13768,6 +14376,126 @@ function initStorageMarketHoldCoupling() {
     sync();
 }
 
+// Ladeprofil – Preset-Tabelle (Marge %, Sicherheit ct); Komfort-Preislimit leer = Tarif-Mittelpreis.
+const MARKET_CHARGE_PROFILE_PRESETS = {
+    economic: { margin: 10, safety: 0, label: 'Wirtschaftlich' },
+    balanced: { margin: 0, safety: 0, label: 'Ausgeglichen' },
+    comfort: { margin: 0, safety: 0, label: 'Komfort' },
+    custom: { margin: null, safety: null, label: 'Eigene Einstellungen' }
+};
+
+function marketChargeProfileValue() {
+    const select = document.getElementById('conf_market_charge_profile');
+    const raw = String(select ? select.value : 'economic').trim().toLowerCase();
+    return Object.prototype.hasOwnProperty.call(MARKET_CHARGE_PROFILE_PRESETS, raw) ? raw : 'economic';
+}
+
+function marketTariffMeanPriceCt() {
+    // Octopus Heat: feste Fenster 02–06 h und 12–16 h günstig (8 h), 18–21 h teuer (3 h), sonst Basis (13 h).
+    const tariffInput = document.querySelector('[name="values[stromtarif_typ]"]');
+    const tariff = String(tariffInput ? tariffInput.value : 'static').trim().toLowerCase();
+    const basis = Math.max(0, storageCurvePreviewNumber('strompreis_basis', 25));
+    if (tariff === 'octopus_heat') {
+        const cheap = Math.max(0, storageCurvePreviewNumber('strompreis_cheap', basis));
+        const uht = Math.max(0, storageCurvePreviewNumber('strompreis_uht', Math.max(basis, cheap)));
+        return Math.round(((cheap * 8) + (basis * 13) + (uht * 3)) / 24 * 10) / 10;
+    }
+    if (['special', 'spezial', 'special_tariff'].includes(tariff)) {
+        // Spezialtarif: Tagesplan 'HH[:MM] Preis' – zeitgewichteter Mittelwert über 24 h.
+        const raw = String(storageCurvePreviewFieldValue('strompreis_spezial', '') || '');
+        const entries = [];
+        const re = /(?:^|[^\d])([0-2]?\d)(?:[:.](\d{1,2}))?\s+(-?\d+(?:[,.]\d+)?)/g;
+        let m;
+        while ((m = re.exec(raw)) !== null) {
+            const minute = (Number(m[1]) % 24) * 60 + Number(m[2] || 0);
+            const price = Number(String(m[3]).replace(',', '.'));
+            if (Number.isFinite(price)) entries.push([minute, price]);
+        }
+        if (!entries.length) return null;
+        entries.sort((a, b) => a[0] - b[0]);
+        let total = 0;
+        for (let i = 0; i < entries.length; i++) {
+            const start = entries[i][0];
+            const end = i + 1 < entries.length ? entries[i + 1][0] : 1440;
+            total += entries[i][1] * (end - start);
+        }
+        // Anteil vor dem ersten Eintrag gilt der letzte Eintrag (Tageswechsel).
+        total += entries[entries.length - 1][1] * entries[0][0];
+        return Math.round(total / 1440 * 10) / 10;
+    }
+    return null;
+}
+
+function applyMarketChargeProfile(profileRaw) {
+    const profile = Object.prototype.hasOwnProperty.call(MARKET_CHARGE_PROFILE_PRESETS, String(profileRaw || '').toLowerCase())
+        ? String(profileRaw).toLowerCase() : 'economic';
+    const preset = MARKET_CHARGE_PROFILE_PRESETS[profile];
+    const locked = profile !== 'custom';
+    const margin = document.getElementById('conf_market_min_margin_pct');
+    const safety = document.getElementById('conf_market_safety_correction_ct_per_kwh');
+    [[margin, preset.margin, 1], [safety, preset.safety, 2]].forEach(([el, value, digits]) => {
+        if (!el) return;
+        if (locked) {
+            el.value = Number(value).toFixed(digits);
+            el.setAttribute('readonly', 'readonly');
+            el.setAttribute('aria-readonly', 'true');
+            el.classList.add('bg-body-tertiary');
+        } else {
+            el.removeAttribute('readonly');
+            el.setAttribute('aria-readonly', 'false');
+            el.classList.remove('bg-body-tertiary');
+        }
+    });
+    document.querySelectorAll('[data-market-profile-only]').forEach(el => {
+        el.style.display = String(el.getAttribute('data-market-profile-only')).split(' ').includes(profile) ? '' : 'none';
+    });
+    const limitInput = document.getElementById('conf_market_price_limit_ct');
+    const limitHint = document.querySelector('[data-market-price-limit-hint]');
+    const meanPrice = marketTariffMeanPriceCt();
+    if (limitInput) {
+        limitInput.placeholder = meanPrice === null ? 'leer = Mittelpreis' : `leer = ${marketPathPreviewFormat(meanPrice, 1)}`;
+    }
+    if (limitHint) {
+        limitHint.textContent = meanPrice === null
+            ? 'leer = Mittelpreis des Preishorizonts, wird je Plan bestimmt'
+            : `leer = Mittelpreis des Tarifs ${marketPathPreviewFormat(meanPrice, 1)} ct/kWh (aus den festen Tarifzeiten)`;
+    }
+    const autarkyText = document.querySelector('[data-market-autarky-text]');
+    if (autarkyText) {
+        autarkyText.textContent = profile === 'comfort'
+            ? 'Im Komfort-Profil durch das Zeitziel ersetzt: PV zuerst, Netz nur für den Rest bis zum Fensterende.'
+            : 'Feste Schutzinvariante: Bei ausreichender Speicher-/PV-Deckung bleibt der normale Marktpfad blockiert.';
+    }
+    ['market_autarky_low_soc_pct', 'market_autarky_horizon_buffer_wh'].forEach(key => {
+        document.querySelectorAll(`[name="values[${key}]"]`).forEach(el => {
+            el.classList.toggle('text-muted', profile === 'comfort');
+            el.setAttribute('title', profile === 'comfort' ? 'Im Komfort-Profil ohne Wirkung (Zeitziel statt Autarkie-Sperre).' : '');
+        });
+    });
+    const comfortMax = document.querySelector('[data-market-comfort-max-soc]');
+    if (comfortMax) comfortMax.textContent = marketPathPreviewFormat(storageCurvePreviewClamp(storageCurvePreviewNumber('cheap_grid_battery_max_soc', 80), 0, 100), 1);
+    updateMarketPathPreview();
+}
+
+function initMarketChargeProfile() {
+    const select = document.getElementById('conf_market_charge_profile');
+    if (!select) return;
+    // Spiegelfeld Komfort-Ziel <-> reales Feld cheap_grid_battery_max_soc (Negativpreis-Block, ggf. ausgeblendet).
+    const mirror = document.getElementById('conf_market_comfort_max_soc_mirror');
+    const real = document.querySelector('[name="values[cheap_grid_battery_max_soc]"]');
+    if (mirror && real) {
+        mirror.value = String(real.value || '').trim() === '' ? '80' : real.value;
+        mirror.addEventListener('input', () => {
+            real.value = mirror.value;
+            real.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+        real.addEventListener('input', () => {
+            if (document.activeElement !== mirror) mirror.value = real.value;
+        });
+    }
+    applyMarketChargeProfile(select.value);
+}
+
 function updateMarketPathPreview() {
     const formulaNote = document.querySelector('[data-market-formula-note]');
     const previewInfo = document.querySelector('[data-market-preview-info]');
@@ -13794,9 +14522,21 @@ function updateMarketPathPreview() {
     );
     const directDegradation = storageCurvePreviewNumber('direct_marketing_degradation_ct_per_kwh', 4);
     const degradation = Math.max(0, storageCurvePreviewNumber('market_degradation_ct_per_kwh', directDegradation));
-    const safety = storageCurvePreviewClamp(storageCurvePreviewNumber('market_safety_correction_ct_per_kwh', 0), -10, 50);
-    const margin = Math.max(0, storageCurvePreviewNumber('market_min_margin_pct', 10));
-    const autarkyFirst = true;
+    // Marge/Sicherheit aus der Preset-Tabelle (nicht aus den Feldern, außer custom).
+    const chargeProfile = marketChargeProfileValue();
+    const chargePreset = MARKET_CHARGE_PROFILE_PRESETS[chargeProfile];
+    const safety = chargePreset.safety === null
+        ? storageCurvePreviewClamp(storageCurvePreviewNumber('market_safety_correction_ct_per_kwh', 0), -10, 50)
+        : chargePreset.safety;
+    const margin = chargePreset.margin === null
+        ? Math.max(0, storageCurvePreviewNumber('market_min_margin_pct', 10))
+        : chargePreset.margin;
+    const isComfortProfile = chargeProfile === 'comfort';
+    const autarkyFirst = !isComfortProfile;
+    const comfortMaxSoc = storageCurvePreviewClamp(storageCurvePreviewNumber('cheap_grid_battery_max_soc', 80), 0, 100);
+    const configuredPriceLimit = storageCurvePreviewNumber('market_price_limit_ct', 0);
+    const tariffMeanPrice = marketTariffMeanPriceCt();
+    const comfortPriceLimit = configuredPriceLimit > 0 ? configuredPriceLimit : tariffMeanPrice;
     const autarkyLowSoc = storageCurvePreviewClamp(storageCurvePreviewNumber('market_autarky_low_soc_pct', 20), 0, 100);
     const autarkyBufferWh = Math.max(0, storageCurvePreviewNumber('market_autarky_horizon_buffer_wh', 500));
     const safetyPrefix = safety > 0 ? '+ ' : (safety < 0 ? '- ' : '± ');
@@ -13819,8 +14559,11 @@ function updateMarketPathPreview() {
 
     const autarkyText = autarkyFirst
         ? `PV-autark zuerst blockiert den normalen Marktpfad, solange Speicher plus erwartete PV den Horizont mit ${marketPathPreviewFormat(autarkyBufferWh, 0)} Wh Puffer decken; Ausnahme ab ${marketPathPreviewFormat(autarkyLowSoc, 1)} % SOC. `
-        : 'PV-autark zuerst ist ausgeschaltet. ';
-    const formulaText = `Rechenbasis: ${autarkyText}Halten ohne Akku-Zyklus; Netzladen inkl. ×${marketPathPreviewFormat(factor, 2)} Wirkungsgrad, ${marketPathPreviewFormat(degradation, 1)} ct Akku, ${safetyPrefix}${marketPathPreviewFormat(Math.abs(safety), 2)} ct Sicherheit, ${marketPathPreviewFormat(margin, 1)} % Marge.`;
+        : 'Komfort-Profil: PV-autark zuerst ist durch das Zeitziel ersetzt (PV zuerst, Netz nur für den Rest bis zum Fensterende). ';
+    const profileLabel = chargePreset.label;
+    const formulaText = isComfortProfile
+        ? `Rechenbasis Profil ${profileLabel}: ${autarkyText}Preislimit ${comfortPriceLimit === null ? 'Mittelpreis des Preishorizonts' : marketPathPreviewFormat(comfortPriceLimit, 1) + ' ct'}${configuredPriceLimit > 0 ? '' : ' (Tarif-Mittel)'}, Ziel min(Ladeziel, ${marketPathPreviewFormat(comfortMaxSoc, 0)} %), ×${marketPathPreviewFormat(factor, 2)} Wirkungsgrad nur für die Ladedauer.`
+        : `Rechenbasis Profil ${profileLabel}: ${autarkyText}Halten ohne Akku-Zyklus; Netzladen inkl. ×${marketPathPreviewFormat(factor, 2)} Wirkungsgrad, ${marketPathPreviewFormat(degradation, 1)} ct Akku, ${safetyPrefix}${marketPathPreviewFormat(Math.abs(safety), 2)} ct Sicherheit, ${marketPathPreviewFormat(margin, 1)} % Marge.`;
     const fixedTooltip = `${autarkyText}Halten: Entladung sperren, wenn die Prognose späteren Bezug sieht und dieser spätere Bezug teurer ist als das aktuelle Fenster plus Sicherheitskorrektur. Netzladen: erst wenn der spätere Bezugspreis auch die Lade-Schwelle inkl. Wirkungsgrad, Akku-Kosten, Sicherheitskorrektur und Mindestmarge übersteigt. Verbraucherfreigabe und Prognosedefizit bleiben Pflicht.`;
     const dynamicTooltip = `${autarkyText}EPEX wird je Börsenslot bewertet. Halten vergleicht den aktuellen Arbeitspreis plus Sicherheitskorrektur mit einem späteren Bezugspreis. Netzladen nutzt zusätzlich Wirkungsgrad, Akku-Kosten und Mindestmarge und startet nur bei Prognosebedarf sowie freigegebenem Verbraucher.`;
 
@@ -13849,10 +14592,29 @@ function updateMarketPathPreview() {
         return;
     }
     if (isOctopus || isSpecial) {
-        if (tariffBadge) tariffBadge.textContent = isOctopus ? 'Octopus Heat' : 'Spezialtarif';
+        if (tariffBadge) tariffBadge.textContent = (isOctopus ? 'Octopus Heat' : 'Spezialtarif') + ' · Profil ' + profileLabel;
         if (lowLabel) lowLabel.textContent = isOctopus ? 'LT / günstig' : 'Spezial / günstig';
         if (normalLabel) normalLabel.textContent = isOctopus ? 'Normalpreis' : 'Normalfenster';
         if (highLabel) highLabel.textContent = isOctopus ? 'Teuer / später' : 'Vergleich später';
+        if (isComfortProfile) {
+            // Komfort: Laden im Preisfenster (Slots <= Limit) bis zum Ziel am Fensterende, kein Defizit nötig.
+            const limitKnown = comfortPriceLimit !== null;
+            const lowInWindow = limitKnown && lowPrice <= comfortPriceLimit + 0.001;
+            const normalInWindow = limitKnown && basis <= comfortPriceLimit + 0.001;
+            if (lowAction) lowAction.textContent = lowInWindow ? 'laden bis Ziel' : 'kein Laden';
+            if (lowDetail) {
+                lowDetail.textContent = lowInWindow
+                    ? `Laden im Preisfenster ≤ ${marketPathPreviewFormat(comfortPriceLimit, 1)} ct/kWh bis min(Ladeziel, Speicher max. ${marketPathPreviewFormat(comfortMaxSoc, 0)} %) zum Fensterende; PV zuerst, kein Prognosedefizit nötig.`
+                    : (limitKnown ? `${marketPathPreviewFormat(lowPrice, 1)} > ${marketPathPreviewFormat(comfortPriceLimit, 1)} ct/kWh: kein Laden – Limit liegt unter dem günstigsten Tarifpreis.` : 'Preislimit unbekannt: kein Laden.');
+            }
+            if (normalAction) normalAction.textContent = normalInWindow ? 'laden bis Ziel' : 'halten';
+            if (normalDetail) {
+                normalDetail.textContent = normalInWindow
+                    ? `${marketPathPreviewFormat(basis, 1)} ≤ ${marketPathPreviewFormat(comfortPriceLimit, 1)} ct/kWh: Laden auch zu Normalpreis-Stunden (Limit prüfen).`
+                    : `${marketPathPreviewFormat(basis, 1)} > ${limitKnown ? marketPathPreviewFormat(comfortPriceLimit, 1) : '?'} ct/kWh: kein Laden. Halten, wenn späterer Bezug > ${marketPathPreviewFormat(normalHoldThreshold, 1)} ct/kWh.`;
+            }
+            return;
+        }
         if (lowAction) lowAction.textContent = 'halten / laden';
         if (lowDetail) {
             lowDetail.textContent = lowCanGridChargeAtHigh
@@ -13868,11 +14630,21 @@ function updateMarketPathPreview() {
         return;
     }
     if (isDynamic) {
-        if (tariffBadge) tariffBadge.textContent = 'EPEX / dynamisch';
+        if (tariffBadge) tariffBadge.textContent = 'EPEX / dynamisch · Profil ' + profileLabel;
         if (previewInfo) previewInfo.setAttribute('data-tooltip', dynamicTooltip);
         if (lowLabel) lowLabel.textContent = 'Günstiger Slot';
         if (normalLabel) normalLabel.textContent = 'Normaler Slot';
         if (highLabel) highLabel.textContent = 'Später teuer';
+        if (isComfortProfile) {
+            if (lowAction) lowAction.textContent = 'laden bis Ziel';
+            if (lowDetail) lowDetail.textContent = configuredPriceLimit > 0
+                ? `Slots ≤ ${marketPathPreviewFormat(configuredPriceLimit, 1)} ct/kWh laden bis min(Ladeziel, Speicher max. ${marketPathPreviewFormat(comfortMaxSoc, 0)} %) zum Fensterende; PV zuerst, kein Prognosedefizit nötig.`
+                : `Ohne Limit gilt der Mittelpreis des gebundenen Preishorizonts je Plan; Slots darunter laden bis min(Ladeziel, Speicher max. ${marketPathPreviewFormat(comfortMaxSoc, 0)} %) zum Fensterende. Bei flacher Preiskurve lädt fast jeder Slot – eigenes Limit empfohlen.`;
+            if (normalAction) normalAction.textContent = 'je Slot';
+            if (normalDetail) normalDetail.textContent = 'Slots über dem Limit: kein Laden; Halten bleibt preisabhängig möglich.';
+            if (formulaNote) formulaNote.textContent = `${formulaText} EPEX: Fenster laufen mit jedem Börsenslot.`;
+            return;
+        }
         if (lowAction) lowAction.textContent = 'Spread prüfen';
         if (lowDetail) {
             lowDetail.textContent = 'Halten und Netzladen werden je Slot aus aktuellem Börsenpreis und späterem Bezugspreis berechnet.';
@@ -15718,6 +16490,7 @@ document.addEventListener('DOMContentLoaded', initStorageAuxAcToggle);
 document.addEventListener('DOMContentLoaded', initDirectMarketingEegRateUi);
 document.addEventListener('DOMContentLoaded', initStorageMarketHoldCoupling);
 document.addEventListener('DOMContentLoaded', initMarketPathPreview);
+document.addEventListener('DOMContentLoaded', initMarketChargeProfile);  // Ladeprofil
 document.addEventListener('DOMContentLoaded', initConfigSettingRequirements);
 document.addEventListener('DOMContentLoaded', initHeatpumpPvReservationStatus);
 

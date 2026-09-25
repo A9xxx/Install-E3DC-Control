@@ -86,7 +86,10 @@ def optional_service_configured(service: str, config: Mapping[str, object]) -> b
     if name == "e3dc-matter-bridge":
         return _enabled(config, "matter_bridge")
     if name == "e3dc-bluelink":
-        return _nonempty(config, "bluelink_refresh_token") or _nonempty(config, "bluelink_vin")
+        # Der Bluelink-Client meldet sich nur mit Benutzer und Passwort an; erst
+        # beide zusammen machen den Dienst fachlich gewollt. Dieselbe Regel steht
+        # in e3dc_config_auto_install_rules() des Konfigurations-Editors.
+        return _nonempty(config, "bluelink_user") and _nonempty(config, "bluelink_password")
     if name == "e3dc-mqtt-hub":
         mqtt_ip = _text(config, "mqtt_hub_ip").lower()
         return (
@@ -116,6 +119,11 @@ def preinstalled_optional_service_expected(
             or _nonempty(config, "wb_topic")
             or _nonempty(config, "wb2_topic")
         )
+    if name == "e3dc-bluelink":
+        # Ein bereits installierter Dienst bleibt mit gesetztem Benutzer erwartet,
+        # auch solange das Passwort fehlt: Der Client wartet dann ohne Anmeldung,
+        # und Update oder Reparatur stoppen keinen laufenden Dienst.
+        return _nonempty(config, "bluelink_user")
     return optional_service_configured(name, config)
 
 

@@ -858,35 +858,35 @@ def _candidate_score(
 
     if grid_ema_w > 600:
         if mode == MODE_DISCH:
-            score += _score_add(reasons, 2.0, "Netzbezug: Entladen entlastet den Uebergabepunkt")
+            score += _score_add(reasons, 2.0, "Netzbezug: Entladen entlastet den Übergabepunkt")
         elif mode == MODE_AUTO:
             score += _score_add(reasons, 1.2, "Netzbezug: AUTO gibt dem E3DC Entladung frei")
         elif mode == MODE_IDLE:
-            score += _score_add(reasons, -1.1, "Netzbezug: IDLE kann Batteriestuetze blockieren")
+            score += _score_add(reasons, -1.1, "Netzbezug: IDLE kann Batteriestütze blockieren")
         elif mode in (MODE_CHRG, MODE_GRID):
-            score += _score_add(reasons, -2.4, "Netzbezug: Laden verschaerft den Bezug")
+            score += _score_add(reasons, -2.4, "Netzbezug: Laden verschärft den Bezug")
     elif grid_ema_w < -800:
         if mode in (MODE_CHRG, MODE_GRID):
             score += _score_add(
                 reasons,
                 1.4 if charge_need else 0.4,
-                "Einspeisung: Laden nutzt Ueberschuss" if charge_need else "Einspeisung: Laden ist moeglich, aber Kurvenbedarf klein",
+                "Einspeisung: Laden nutzt Überschuss" if charge_need else "Einspeisung: Laden ist möglich, aber Kurvenbedarf klein",
             )
         elif mode == MODE_AUTO:
-            score += _score_add(reasons, 1.0, "Einspeisung: AUTO laesst den E3DC aufnehmen")
+            score += _score_add(reasons, 1.0, "Einspeisung: AUTO lässt den E3DC aufnehmen")
         elif mode == MODE_DISCH:
-            score += _score_add(reasons, -2.0, "Einspeisung: zusaetzliches Entladen waere unguenstig")
+            score += _score_add(reasons, -2.0, "Einspeisung: zusätzliches Entladen wäre ungünstig")
 
     if "abregel" in state.lower():
         if mode in (MODE_CHRG, MODE_GRID) and grid_ema_w < -1000:
-            score += _score_add(reasons, 2.4, "Abregelschutz: aktive Ladefreigabe schuetzt vor Abregelung")
+            score += _score_add(reasons, 2.4, "Abregelschutz: aktive Ladefreigabe schützt vor Abregelung")
         elif mode == MODE_AUTO and grid_ema_w < -1000:
             score += _score_add(reasons, 0.6, "Abregelschutz: AUTO kann helfen, ist aber weniger verbindlich")
 
     if curve_delta is not None:
         if state == "parallel_night_floor_hold" and curve_delta < 0.0:
             if mode == MODE_IDLE:
-                score += _score_add(reasons, 1.2, "Nachtreserve: IDLE schuetzt die Untergrenze")
+                score += _score_add(reasons, 1.2, "Nachtreserve: IDLE schützt die Untergrenze")
             elif mode == MODE_AUTO:
                 score += _score_add(reasons, -1.2, "Nachtreserve: AUTO kann die Untergrenze weiter entladen")
         if curve_delta < -tolerance:
@@ -895,20 +895,20 @@ def _candidate_score(
             elif mode == MODE_AUTO:
                 score += _score_add(reasons, 0.9, "Unter Ladekurve: AUTO kann aufholen")
             elif mode in (MODE_IDLE, MODE_DISCH):
-                score += _score_add(reasons, -1.5, "Unter Ladekurve: Halten/Entladen gefaehrdet Ziel")
+                score += _score_add(reasons, -1.5, "Unter Ladekurve: Halten/Entladen gefährdet Ziel")
         elif curve_delta > tolerance:
             if mode == MODE_AUTO:
-                score += _score_add(reasons, 1.0, "Ueber Ladekurve: AUTO vermeidet unnoetige Bremse")
+                score += _score_add(reasons, 1.0, "Über Ladekurve: AUTO vermeidet unnötige Bremse")
             elif mode == MODE_IDLE:
-                score += _score_add(reasons, 0.6, "Ueber Ladekurve: IDLE kann Speicher beruhigen")
+                score += _score_add(reasons, 0.6, "Über Ladekurve: IDLE kann Speicher beruhigen")
             elif mode == MODE_DISCH and grid_ema_w >= -300:
-                score += _score_add(reasons, 0.7, "Ueber Ladekurve: Entladen kann Richtung Kurve helfen")
+                score += _score_add(reasons, 0.7, "Über Ladekurve: Entladen kann Richtung Kurve helfen")
             elif mode in (MODE_CHRG, MODE_GRID) and pv_after_fixed_w < val + 300:
-                score += _score_add(reasons, -1.3, "Ueber Ladekurve: zusaetzliches Laden wirkt zu frueh")
+                score += _score_add(reasons, -1.3, "Über Ladekurve: zusätzliches Laden wirkt zu früh")
 
     if wb_active or wallbox_w > 250:
         if mode == MODE_AUTO:
-            score += _score_add(reasons, 1.3, "Wallbox aktiv: AUTO laesst E3DC und WB ruhiger zusammenarbeiten")
+            score += _score_add(reasons, 1.3, "Wallbox aktiv: AUTO lässt E3DC und WB ruhiger zusammenarbeiten")
         elif mode == MODE_IDLE:
             score += _score_add(reasons, -1.2, "Wallbox aktiv: IDLE kann Netzbezug provozieren")
         elif mode in (MODE_CHRG, MODE_GRID):
@@ -920,7 +920,7 @@ def _candidate_score(
             score += _score_add(reasons, 0.3, "Kein WB-Budget: AUTO ist neutral und robust")
 
     if previous_state and state and state != previous_state:
-        score += _score_add(reasons, -0.25, "Schaltunruhe: Zustandswechsel gegenueber letztem Shadow-Vergleich")
+        score += _score_add(reasons, -0.25, "Schaltunruhe: Zustandswechsel gegenüber letztem Shadow-Vergleich")
     if mode in (MODE_CHRG, MODE_DISCH, MODE_GRID) and val < 300:
         score += _score_add(reasons, -0.4, "Kleinstwert: Regelmodus ohne wirksame Leistung")
 
@@ -1304,6 +1304,13 @@ class ParallelStorageRegulator:
         self.curve_guard_enter_below_pct = max(0.0, _safe_float(
             self.cfg.get("storage_parallel_curve_guard_enter_below_pct"), 1.0
         ))
+        # DC-first-Owner halten: unter der Korridor-Untergrenze bleibt der
+        # Laderahmen bei anliegender PV gebunden, statt bei jeder Wolke in den
+        # neutralen Freilauf zu kippen (Rampenneustart, Heartbeat-Wechsel).
+        self.dc_first_owner_hold_enabled = bool(
+            _cfg_bool(self.cfg, "storage_dc_first_charge_limit_enable", False)
+            and _cfg_bool(self.cfg, "storage_dc_first_owner_hold_enable", True)
+        )
         self.price_house_discharge_enter_w = max(300, _safe_int(
             self.cfg.get("storage_parallel_price_house_discharge_enter_w"), 300
         ))
@@ -1590,7 +1597,7 @@ class ParallelStorageRegulator:
             ) % (previous_state, decision.state)
         else:
             reason = (
-                "Zustandshaltezeit: %s bleibt noch %ds aktiv, bevor %s uebernehmen darf"
+                "Zustandshaltezeit: %s bleibt noch %ds aktiv, bevor %s übernehmen darf"
             ) % (previous_state, remaining_s, decision.state)
         trace.append({
             "step": "transition_table",
@@ -2830,19 +2837,24 @@ class ParallelStorageRegulator:
             )
         )
         curve_edge_soft_charge_w = 0
+        # Kantengrenze ohne Messterm (Vorwert, iFc, Einstiegsleistung). Die
+        # Schreibbremse des Storage Managers wertet eine Absenkung nur dann als
+        # Schutz, wenn der gehaltene Laderahmen über dieser Grenze liegt.
+        curve_edge_soft_bound_w = 0
         if curve_edge_soft_charge_active:
-            curve_edge_soft_charge_w = min(
+            curve_edge_soft_bound_w = min(
                 self.max_charge_w,
-                curve_safe_charge_w,
                 max(
                     self.curve_charge_enter_w,
                     i_fc_w,
                     int(round(previous_parallel_val * self.curve_edge_soft_factor)),
                 ),
             )
+            curve_edge_soft_charge_w = min(curve_safe_charge_w, curve_edge_soft_bound_w)
             if curve_edge_soft_charge_w < self.curve_charge_enter_w:
                 curve_edge_soft_charge_active = False
                 curve_edge_soft_charge_w = 0
+                curve_edge_soft_bound_w = 0
         price_house_discharge_keep = bool(
             previous_parallel_state == "parallel_price_house_discharge"
             and (
@@ -3031,6 +3043,9 @@ class ParallelStorageRegulator:
             "curve_above_pct": round(curve_above_pct, 2),
             "adaptive_curve_active": adaptive_curve_active,
             "adaptive_curve_relation": adaptive_curve_relation,
+            "curve_floor_full_charge_active": bool(_truthy(active_state.get("curve_floor_full_charge_active"))),
+            "evening_release_latched": bool(_truthy(active_state.get("evening_release_latched"))),
+            "evening_release_latch_reason": str(active_state.get("evening_release_latch_reason") or ""),
             "adaptive_soc_floor": None if adaptive_floor_soc is None else round(float(adaptive_floor_soc), 2),
             "adaptive_soc_ceiling": None if adaptive_ceiling_soc is None else round(float(adaptive_ceiling_soc), 2),
             "can_reach_target": can_reach_target,
@@ -3322,7 +3337,7 @@ class ParallelStorageRegulator:
         })
 
         if active_state_name == "no_data" or active_mode < 0:
-            decision = choose("parallel_no_data", -1, 0, "Keine gueltigen Live-Daten", "failsafe")
+            decision = choose("parallel_no_data", -1, 0, "Keine gültigen Live-Daten", "failsafe")
         elif any(active_state_name.startswith(prefix) for prefix in self.PASSTHROUGH_STATES):
             decision = choose(
                 "parallel_passthrough",
@@ -3385,7 +3400,7 @@ class ParallelStorageRegulator:
                 MODE_AUTO,
                 support_w,
                 (
-                    "Geplante externe Last preisgefuehrt stuetzen: "
+                    "Geplante externe Last preisgeführt stützen: "
                     f"Entladung bis {support_w}W erlaubt "
                     f"(erwartet {expected_w}W, erkannt {observed_w}W)"
                 ),
@@ -3398,7 +3413,7 @@ class ParallelStorageRegulator:
                     "parallel_price_auto",
                     MODE_AUTO,
                     self.max_charge_w,
-                    "Preis-/Slotfenster: PV-Ueberschuss darf Speicher entlang der Kurve laden",
+                    "Preis-/Slotfenster: PV-Überschuss darf Speicher entlang der Kurve laden",
                     "price",
                 )
             elif (
@@ -3411,7 +3426,7 @@ class ParallelStorageRegulator:
                     "parallel_price_house_discharge",
                     MODE_AUTO,
                     int(self.price_house_discharge_w),
-                    "Preis-/Slotfenster: Auto darf Netz nutzen, Haus/WP/Klima wird per E3DC-AUTO begrenzt aus Akku gestuetzt",
+                    "Preis-/Slotfenster: Auto darf Netz nutzen, Haus/WP/Klima wird per E3DC-AUTO begrenzt aus Akku gestützt",
                     "price",
                 )
             else:
@@ -3429,7 +3444,7 @@ class ParallelStorageRegulator:
                 "parallel_price_house_discharge",
                 MODE_AUTO,
                 max(active_val, target_house_w),
-                "Teures Preisfenster: Haus/WP/Klima per E3DC-AUTO begrenzt aus Speicher stuetzen",
+                "Teures Preisfenster: Haus/WP/Klima per E3DC-AUTO begrenzt aus Speicher stützen",
                 "price",
             )
         elif active_state_name == "evening_release" and not curve_cap_hard_pressure_active and not shortfall_pv_catchup_active:
@@ -3438,7 +3453,7 @@ class ParallelStorageRegulator:
                 "parallel_evening_release",
                 MODE_AUTO,
                 self.max_charge_w,
-                "Freilauf erreicht: EMS-Grenzen freigeben, E3DC uebernimmt Rest-PV und Nachtversorgung",
+                "Freilauf erreicht: EMS-Grenzen freigeben, E3DC übernimmt Rest-PV und Nachtversorgung",
                 "default",
             )
         elif curve_cap_active:
@@ -3463,9 +3478,9 @@ class ParallelStorageRegulator:
                 MODE_DISCH,
                 headroom_discharge_w,
                 (
-                    "Abregel-Headroom: SoC liegt %.1f Prozentpunkte ueber der "
+                    "Abregel-Headroom: SoC liegt %.1f Prozentpunkte über der "
                     "Untergrenze; Platz-Schaff-Entladung %dW, Abregelschutz "
-                    "ueberstimmt sofort"
+                    "überstimmt sofort"
                 ) % (headroom_discharge_gap_pct, headroom_discharge_w),
                 "headroom",
             )
@@ -3515,7 +3530,7 @@ class ParallelStorageRegulator:
                 "parallel_evening_release",
                 MODE_AUTO,
                 self.max_charge_w,
-                "Freilauf erreicht: EMS-Grenzen freigeben, E3DC uebernimmt Rest-PV und Nachtversorgung",
+                "Freilauf erreicht: EMS-Grenzen freigeben, E3DC übernimmt Rest-PV und Nachtversorgung",
                 "default",
             )
         elif forecast_shortfall_pv_release_active:
@@ -3538,7 +3553,7 @@ class ParallelStorageRegulator:
                 self.max_charge_w,
                 (
                     "Prognose-100-Landevertrag: Sollkurve ist erreicht und Tagesziel bleibt "
-                    "erreichbar; EMS-Ladegrenze 0W haelt Speicherplatz bis zum Freilauf frei"
+                    "erreichbar; EMS-Ladegrenze 0W hält Speicherplatz bis zum Freilauf frei"
                 ),
                 "curve",
             )
@@ -3577,12 +3592,12 @@ class ParallelStorageRegulator:
             self.price_house_discharge_w = 0
             if headroom_reserve_active:
                 curve_hold_reason = (
-                    "Abregelreserve aktiv: Speicherplatz fuer PV-Spitzen freihalten; "
+                    "Abregelreserve aktiv: Speicherplatz für PV-Spitzen freihalten; "
                     "echter Netz-/WR-Druck bleibt Pflichtladung"
                 )
             else:
                 curve_hold_reason = (
-                    "Kurvenkante stabilisiert; EMS-Ladegrenze bleibt 0W bis der Speicher unter die untere Hysterese faellt"
+                    "Kurvenkante stabilisiert; EMS-Ladegrenze bleibt 0W bis der Speicher unter die untere Hysterese fällt"
                     if (
                         curve_settle_hold_active
                         or curve_crossed_from_charge_hold
@@ -3715,7 +3730,10 @@ class ParallelStorageRegulator:
         elif (
             adaptive_curve_relation == "below_floor"
             and i_fc_w >= self.curve_charge_enter_w
-            and pv_after_fixed_w >= self.curve_charge_enter_w
+            and (
+                pv_after_fixed_w >= self.curve_charge_enter_w
+                or (self.dc_first_owner_hold_enabled and pv_w > 250)
+            )
             and curve_safe_charge_w < self.curve_charge_enter_w
             and grid_ema_w < self.grid_relief_enter_w
         ):
@@ -3914,7 +3932,7 @@ class ParallelStorageRegulator:
                 previous_parallel_state,
                 MODE_AUTO,
                 self.max_charge_w,
-                "AUTO-Haltezeit: %s bleibt noch %ds aktiv, damit kurze Wolken-/Lastspruenge "
+                "AUTO-Haltezeit: %s bleibt noch %ds aktiv, damit kurze Wolken-/Lastsprünge "
                 "nicht zwischen AUTO und externer Vorgabe pendeln" % (
                     previous_parallel_state,
                     remaining_s,
@@ -3958,6 +3976,37 @@ class ParallelStorageRegulator:
                     "Kurvenladung stabilisiert: AUTO-Freilauf bleibt noch "
                     "%ds gesperrt, solange PV-/Kurvendruck sichtbar ist"
                 ) % remaining_s,
+                "curve",
+            )
+
+        # Ohne diese Regel fiel nach dem Ende der Wallboxführung der
+        # Regler für Sekunden in den Neutralzustand (AUTO-Freilauf, limits=off,
+        # ohne Ladegrenze). Der Akku zog kurz mit voller Rate, der Verbraucherrahmen wurde
+        # auf 0 gerechnet. Solange die Kurve Ladung anfordert, bleibt stattdessen
+        # die IFC-Ladeanforderung als EMS-Ladegrenze wirksam; die reguläre
+        # Kurvenlogik darf den Brückenzustand jederzeit ablösen.
+        wallbox_release_ifc_bridge_active = bool(
+            previous_parallel_state == "parallel_wb_auto"
+            and decision.state == "parallel_auto"
+            and decision.priority == "default"
+            and pv_w > 250
+            and grid_ema_w < self.grid_relief_enter_w
+            and (
+                i_fc_w >= self.curve_charge_keep_w
+                or i_min_lade_w >= 250
+                or adaptive_curve_relation == "below_floor"
+            )
+        )
+        if wallbox_release_ifc_bridge_active:
+            bridge_val = int(min(self.max_charge_w, max(self.curve_charge_enter_w, i_fc_w)))
+            decision = choose(
+                "parallel_curve_auto_hold",
+                MODE_AUTO,
+                bridge_val,
+                (
+                    "Wallboxende: IFC-Ladeanforderung %dW bleibt als EMS-Ladegrenze "
+                    "wirksam; kein AUTO-Freilauf"
+                ) % bridge_val,
                 "curve",
             )
 
@@ -4084,6 +4133,14 @@ class ParallelStorageRegulator:
                 "curve_above_pct": round(curve_above_pct, 2),
                 "adaptive_curve_active": adaptive_curve_active,
                 "adaptive_curve_relation": adaptive_curve_relation,
+                "curve_floor_full_charge_active": bool(_truthy(active_state.get("curve_floor_full_charge_active"))),
+                # Ziel-Flags für den DC-first-Postprozessor (Vorrang und
+                # Dringlichkeitsrate); sie standen bisher nur im active_state.
+                "adaptive_latest_charge_due": bool(_truthy(active_state.get("adaptive_latest_charge_due"))),
+                "curve_hard_anchor_need_w": max(0, _safe_int(active_state.get("curve_hard_anchor_need_w"), 0)),
+                "curve_hard_anchor_missed": bool(_truthy(active_state.get("curve_hard_anchor_missed"))),
+                "evening_release_latched": bool(_truthy(active_state.get("evening_release_latched"))),
+                "evening_release_latch_reason": str(active_state.get("evening_release_latch_reason") or ""),
                 "adaptive_soc_floor": None if adaptive_floor_soc is None else round(float(adaptive_floor_soc), 2),
                 "adaptive_soc_ceiling": None if adaptive_ceiling_soc is None else round(float(adaptive_ceiling_soc), 2),
                 "can_reach_target": can_reach_target,
@@ -4238,10 +4295,12 @@ class ParallelStorageRegulator:
                 "curve_edge_export_keep_active": curve_edge_export_keep_active,
                 "curve_edge_soft_charge_active": curve_edge_soft_charge_active,
                 "curve_edge_soft_charge_w": curve_edge_soft_charge_w,
+                "curve_edge_soft_bound_w": curve_edge_soft_bound_w,
                 "curve_edge_soft_hold_s": self.curve_edge_soft_hold_s,
                 "curve_edge_soft_factor": round(self.curve_edge_soft_factor, 3),
                 "curve_under_ifc_charge_due": curve_under_ifc_charge_due,
                 "curve_charge_release_stabilize_active": curve_charge_release_stabilize_active,
+                "wallbox_release_ifc_bridge_active": wallbox_release_ifc_bridge_active,
                 "curve_charge_release_stabilize_s": self.curve_charge_release_stabilize_s,
                 "curve_charge_soc_step_hold_active": curve_charge_soc_step_hold_active,
                 "curve_charge_soc_step_hold_s": self.curve_charge_soc_step_hold_s,

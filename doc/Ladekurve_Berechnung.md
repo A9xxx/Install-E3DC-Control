@@ -179,15 +179,54 @@ sanft geöffnet:
 
 - kurz vor Freilauf werden harte Ladegrenzen nicht bis zur letzten Sekunde
   festgehalten,
-- der Simulator setzt den letzten aktiven Kurvenabschnitt nur noch 30 Minuten
-  vor das prognostizierte Ende des nutzbaren PV-Überschusses, weil der Manager
-  die Ladegrenze selbst innerhalb eines 30-Minuten-Fensters weich öffnet,
+- der Simulator setzt das Kurvenende um den Kurvenende-Puffer
+  (`storage_curve_end_guard_min`, Standard 45 Minuten, Bereich 30–120) vor das
+  prognostizierte Ende des nutzbaren PV-Überschusses; der Manager öffnet die
+  Ladegrenze davor zusätzlich weich,
 - der E3DC darf schwache Rest-PV autonom mitnehmen,
 - am Abend wird keine Kurvenjagd mehr erzwungen, wenn keine relevante PV mehr
   kommt.
 
 Das Ziel ist ein ruhiger Übergang ohne Sprung von `0 W` auf maximale
 Speicherladung.
+
+### Kurvenende im Zielkurven-Modus „Prognose auf 100%“
+
+Im Modus „Prognose auf 100%“ (`storage_curve_target_mode = forecast_100`) kann
+das Kurvenende später liegen: 100 Prozent werden dann erst kurz vor dem
+PV-Ende geplant (PV-Ende minus Kurvenende-Puffer). Das hält Speicherplatz für
+Mittagsspitzen frei und verhindert, dass ein großer Speicher stundenlang bei
+100 Prozent steht. Dieser späte Vollstand gilt nur mit Grund:
+
+- ein Einspeiselimit ist konfiguriert (`einspeiselimit`) und liegt unter der
+  erwarteten PV-Spitze des Kurventags abzüglich 300 W Grundlast; ein Limit
+  oberhalb der erreichbaren PV-Leistung regelt nie ab und zählt nicht,
+- die Prognose zeigt für den Kurventag vermeidbaren Abregeldruck an der
+  Einspeisegrenze, am gemeldeten Wechselrichter-Derating oder an der DC-Grenze
+  (Eintritt ab 300 Wh),
+- Direktvermarktung ist aktiv (`direct_marketing_enable`),
+- Pre-Dump ist für den Kurventag geplant oder aktiv.
+
+Ein eingetretener Abregeldruck- oder Einspeiselimit-Grund gilt bis zum Ende
+des Kurventags. Die Rechnung betrachtet nur die noch kommenden Stunden; ohne
+dieses Halten würde der Grund an jedem sonnigen Nachmittag wegfallen und das
+Kurvenende täglich springen.
+
+Ohne Grund endet die Kurve wie in der Ankerkurve am letzten nutzbaren
+Überschuss minus Kurvenende-Puffer. Überschuss oberhalb der Kurve geht dann
+mittags in den Speicher statt ins Netz, und Wolken am Nachmittag gefährden das
+Tagesziel weniger.
+
+Der Schalter `storage_forecast100_late_full_guard_enable` (Standard an, im
+Konfigurations-Editor „Später Vollstand nur mit Grund“) schaltet den späten
+Vollstand ganz ab (`0` = nie). Die Plan-Diagnose nennt den Grund in
+`target_curve_meta.late_full_reason`: `none` = kein Grund, `disabled` =
+abgeschaltet, sonst die Gründe, zum Beispiel `export_limit`,
+`curtailment_pressure`, `direct_marketing` oder `predump`.
+`target_curve_meta.late_full_export_limit_state` zeigt, ob das Einspeiselimit
+bindet (`binding`, `held`) oder oberhalb der PV-Spitze liegt (`not_binding`);
+`late_full_pv_peak_w` ist die dafür verwendete PV-Spitze. Die Ankerkurve ist
+davon nicht betroffen.
 
 ## 9. Preis- und Netzladen
 

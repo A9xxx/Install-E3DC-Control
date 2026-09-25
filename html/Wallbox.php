@@ -902,7 +902,10 @@ function getDetectedOpenwbVehiclesForWallbox($savedCars, $config = []) {
             'soc' => $socConfirmed ? $socValue : null,
             'range_km' => $socConfirmed ? ($data['car_range'] ?? null) : null,
             'power' => (int)($data['phases_in_use'] ?? 0) >= 3 ? 11.0 : (isset($data['charge_power']) ? (float)$data['charge_power'] : 11.0),
-            'max_phases' => isset($data['max_phases']) && is_numeric($data['max_phases']) ? (int)$data['max_phases'] : ((int)($data['phases_in_use'] ?? 0) >= 3 ? 3 : null),
+            // Eine beobachtete Einphasigkeit ist eine Phasenzahl,
+            // kein „unbekannt“. Ohne Wert galt der Ladepunkt als 3p-fähig
+            // (Folge: 3p-Deckel im 1p-Betrieb, vergebliche Hochschaltversuche).
+            'max_phases' => isset($data['max_phases']) && is_numeric($data['max_phases']) ? (int)$data['max_phases'] : ((int)($data['phases_in_use'] ?? 0) >= 3 ? 3 : ((int)($data['phases_in_use'] ?? 0) === 1 ? 1 : null)),
             'source' => $socSource !== '' ? $socSource : ($data['source'] ?? ($wb === 1 ? 'openWB' : 'openWB Pro')),
         ];
     }
@@ -1126,12 +1129,19 @@ if (isset($_POST['save_wb_status_ajax'])) {
             );
         }
     }
+    // Interaktive Moduswechsel folgen oft dicht aufeinander; eine laufende
+    // Transaktion (Planer-Unterprozess) hält die Sperre mehrere Sekunden.
+    $txOptions['lock_timeout'] = 6.0;
     $tx = e3dcWallboxPlanTransaction($updates, $txOptions);
     if (!empty($tx['success'])) {
         echo "OK";
     } else {
+        e3dcWbTxRecordFailure($tx, 'save_wb_status_ajax', $wbId);
         header("HTTP/1.1 500 Internal Server Error");
-        echo "Transaction Error: " . ($tx['code'] ?? 'unknown');
+        $txDetail = trim((string)($tx['error'] ?? ''));
+        if ($txDetail === '') $txDetail = trim((string)($tx['message'] ?? ''));
+        echo "Transaction Error: " . ($tx['code'] ?? 'unknown')
+            . ($txDetail !== '' ? ' - ' . $txDetail : '');
     }
     exit;
 }
@@ -1267,6 +1277,9 @@ if (isset($_POST['save_simple_wallbox_mode_ajax'])) {
     $tx = e3dcWallboxPlanTransaction($updates, [
         'operation' => $planHours === '0' ? 'clear' : 'plan',
         'abort_flag' => $planHours === '0' ? 'create' : 'remove',
+        // Schnelle Folgeklicks warten auf die laufende Transaktion, statt in
+        // die 2-s-Sperre zu laufen (Planer-Unterprozess braucht 2–4 s).
+        'lock_timeout' => 6.0,
         'mode_transition' => [
             'wb_id' => $wbId,
             'new_mode' => $newMode,
@@ -1279,8 +1292,14 @@ if (isset($_POST['save_simple_wallbox_mode_ajax'])) {
     if (!empty($tx['success'])) {
         echo "OK";
     } else {
+        e3dcWbTxRecordFailure($tx, 'save_simple_wallbox_mode_ajax', $wbId);
         header("HTTP/1.1 500 Internal Server Error");
-        echo "Transaction Error: " . ($tx['code'] ?? 'unknown');
+        // Der Fehlergrund gehört zum Nutzer: Der Badge zeigt ihn als Tooltip,
+        // statt nur "Speichern fehlgeschlagen" ohne Erklärung zu melden.
+        $txDetail = trim((string)($tx['error'] ?? ''));
+        if ($txDetail === '') $txDetail = trim((string)($tx['message'] ?? ''));
+        echo "Transaction Error: " . ($tx['code'] ?? 'unknown')
+            . ($txDetail !== '' ? ' - ' . $txDetail : '');
     }
     exit;
 }
@@ -1384,6 +1403,7 @@ if (isset($_POST['save_simple_wallbox'])) {
     if (!empty($tx['success'])) {
         $message = successMessage('Ladeplan gespeichert. Die Wallbox-Regelung wird neu berechnet.');
     } else {
+        e3dcWbTxRecordFailure($tx, 'save_simple_wallbox', $wbId);
         $message = errorMessage('Ladeplan nicht gespeichert', (string)($tx['message'] ?? 'Die transaktionale Planung ist fehlgeschlagen.'));
     }
 }
@@ -1545,6 +1565,7 @@ if (isset($_POST['save_soc_settings'])) {
             }
         }
         $fromNowKey = "save_wbvon_now_wb{$planWb}";
+        $fromVal = null;
         if (isset($_POST[$fromModeKey]) || isset($_POST[$fromKey]) || isset($_POST[$fromNowKey])) {
             $fromMode = strtolower(trim((string)($_POST[$fromModeKey] ?? 'time')));
             $fromVal = isset($_POST[$fromKey]) ? trim($_POST[$fromKey]) : '';
@@ -1555,6 +1576,15 @@ if (isset($_POST['save_soc_settings'])) {
             }
             $updates["wb{$planWb}_wbvon"] = $fromVal;
             if ($planWb === 1) $updates['wbvon'] = $fromVal;
+        }
+        // Tägliche Wiederholung: nur mit fester Startuhrzeit sinnvoll. Bei
+        // "Jetzt" wird der Schalter im Formular gesperrt und hier hart auf 0
+        // gesetzt, damit Config und Planer dieselbe Wahrheit sehen.
+        $repeatKey = "plan_repeat_wb{$planWb}";
+        if (isset($_POST[$repeatKey])) {
+            $repeatVal = ($_POST[$repeatKey] === '1') ? '1' : '0';
+            if ($fromVal === 'now') $repeatVal = '0';
+            $updates["wb{$planWb}_plan_repeat"] = $repeatVal;
         }
         if (isset($_POST[$toKey])) {
             $toVal = trim($_POST[$toKey]);
@@ -1594,6 +1624,7 @@ if (isset($_POST['save_soc_settings'])) {
     if (!empty($tx['success'])) {
         $message = successMessage('Ladeplanung je Wallbox gespeichert.');
     } else {
+        e3dcWbTxRecordFailure($tx, 'save_soc_settings');
         $message = errorMessage('Ladeplanung nicht gespeichert', (string)($tx['message'] ?? 'Die transaktionale Planung ist fehlgeschlagen.'));
     }
 }
@@ -1907,6 +1938,41 @@ if (isset($_POST['update_custom_car_cp'])) {
         }
     }
 }
+if (isset($_POST['update_custom_car_phases'])) {
+    // Phasenzahl eines bestehenden Profils direkt in der
+    // Vorlagentabelle ändern; alle anderen Profilwerte bleiben exakt erhalten.
+    $cars = $savedCarsRaw === false ? [] : json_decode($savedCarsRaw, true);
+    if (!is_array($cars)) $cars = [];
+    $profileId = trim((string)($_POST['update_custom_car_phases'] ?? ''));
+    $phasesRaw = trim((string)($_POST['custom_car_max_phases'] ?? ''));
+    $phases = is_numeric($phasesRaw) ? (int)$phasesRaw : 0;
+    $targetIndex = null;
+    foreach ($cars as $idx => $car) {
+        if (is_array($car) && (string)($car['id'] ?? '') === $profileId) {
+            $targetIndex = $idx;
+            break;
+        }
+    }
+    if ($targetIndex === null) {
+        $message = errorMessage('Phasenzahl nicht gespeichert', 'Das ausgewählte Fahrzeugprofil wurde nicht gefunden.');
+    } elseif (!in_array($phases, [1, 2, 3], true)) {
+        $message = errorMessage('Phasenzahl nicht gespeichert', 'Bitte wähle 1, 2 oder 3 Phasen.');
+    } else {
+        $cars[$targetIndex]['max_phases'] = $phases;
+        $cars[$targetIndex]['phases'] = $phases;
+        $tx = e3dcWallboxPlanTransaction([], [
+            'operation' => 'plan',
+            'saved_cars' => $cars,
+            'expected_saved_cars_sha256' => $savedCarsExpectedRevision,
+        ]);
+        if (!empty($tx['success']) && !empty($tx['canonical_committed'])) {
+            $profileName = (string)($cars[$targetIndex]['name'] ?? 'Fahrzeug');
+            $message = successMessage("✓ Phasenzahl für '{$profileName}' auf {$phases}p gespeichert. Der Wallbox-Manager übernimmt sie im nächsten Regelzyklus.");
+        } else {
+            $message = errorMessage('Phasenzahl nicht gespeichert', (string)($tx['message'] ?? 'Der kanonische Profil-Commit ist fehlgeschlagen.'));
+        }
+    }
+}
 if (isset($_POST['delete_custom_car'])) {
     $cars = $savedCarsRaw === false ? [] : json_decode($savedCarsRaw, true);
     if (!is_array($cars)) $cars = [];
@@ -1953,7 +2019,11 @@ if (isset($_POST['delete_custom_car'])) {
 if (isset($_POST['save_cloud_integration'])) {
     $updates = [
         'bluelink_vin' => trim($_POST['bluelink_vin'] ?? ''),
-        'bluelink_refresh_token' => trim($_POST['bluelink_refresh_token'] ?? ''),
+        // Benutzer/Passwort-Login statt Refresh-Token.
+        'bluelink_user' => trim($_POST['bluelink_user'] ?? ''),
+        'bluelink_password' => (string)($_POST['bluelink_password'] ?? ''),
+        'bluelink_pin' => preg_replace('/\D+/', '', (string)($_POST['bluelink_pin'] ?? '')),
+        'bluelink_brand' => (($_POST['bluelink_brand'] ?? '') === 'kia') ? 'kia' : 'hyundai',
         'bluelink_car_name' => trim($_POST['bluelink_car_name'] ?? ''),
         'bluelink_interval' => (string)(int)($_POST['bluelink_interval'] ?? '15'),
         'bluelink_ignore_plug_status' => isset($_POST['bluelink_ignore_plug_status']) && $_POST['bluelink_ignore_plug_status'] == '1' ? '1' : '0'
@@ -2086,13 +2156,27 @@ function parseWallboxConfigValues($filePath) {
         'wb_no_time_limit' => '0',
         'wb_sofort' => '0',
         'wb_native_eco' => '0',
-        'bluelink_refresh_token' => '',
+        'bluelink_user' => '',
+        'bluelink_password' => '',
+        'bluelink_pin' => '',
+        'bluelink_brand' => 'hyundai',
         'bluelink_vin' => '',
         'bluelink_car_name' => '',
         'bluelink_interval' => '15',
         'bluelink_ignore_plug_status' => '0',
         'wbcostpowers' => '7.2, 11.0, 22.0'
     ];
+    // Leere oder null-wertige globale Fahrzeugwerte (car_*) gelten wie fehlende: Ein
+    // solcher Eintrag der e3dc_v4.json verdeckt keinen Wert aus der e3dc.config.txt,
+    // und ohne Wert behält die Ansicht ihren Standardwert, statt 0 in Akku- und
+    // Zielfelder vorzubelegen.
+    $carViewDefaults = array_intersect_key($result, array_flip([
+        'car_capacity', 'car_target_unit', 'car_target_kwh', 'car_target_soc', 'car_max_soc_si', 'car_charge_power',
+    ]));
+    $isBlankCarValue = function ($key, $value) use ($carViewDefaults) {
+        return array_key_exists($key, $carViewDefaults)
+            && ($value === null || (is_string($value) && trim($value) === ''));
+    };
 
     if (is_file($filePath) && is_readable($filePath)) {
         $lines = file($filePath, FILE_IGNORE_NEW_LINES);
@@ -2113,10 +2197,17 @@ function parseWallboxConfigValues($filePath) {
         if (is_array($jsonData)) {
             foreach ($jsonData as $jKey => $jVal) {
                 $lowerKey = strtolower(trim($jKey));
-                if (array_key_exists($lowerKey, $result)) {
+                if (array_key_exists($lowerKey, $result) && !$isBlankCarValue($lowerKey, $jVal)) {
                     $result[$lowerKey] = $jVal;
                 }
             }
+        }
+    }
+
+    foreach ($carViewDefaults as $carKey => $carDefault) {
+        $carValue = $result[$carKey];
+        if ($isBlankCarValue($carKey, $carValue)) {
+            $result[$carKey] = $carDefault;
         }
     }
 
@@ -2152,9 +2243,9 @@ function parseWallboxConfigValues($filePath) {
         $v4_data = @json_decode(@file_get_contents($v4_path), true);
         if (is_array($v4_data)) {
             foreach ($result as $k => $v) {
-                if (isset($v4_data[$k])) {
+                if (isset($v4_data[$k]) && !$isBlankCarValue($k, $v4_data[$k])) {
                     $result[$k] = (string)$v4_data[$k];
-                } elseif (isset($v4_data['config'][$k])) {
+                } elseif (isset($v4_data['config'][$k]) && !$isBlankCarValue($k, $v4_data['config'][$k])) {
                     $result[$k] = (string)$v4_data['config'][$k];
                 }
             }
@@ -3230,6 +3321,24 @@ if ($hasWb2) {
     })();
     </script>
     <style>
+        /* Ladeplan-Zeitstrahl: Bootstrap zeichnet die Spur in --bs-tertiary-bg, dem
+           Hintergrund des Plan-Panels – im Dunkelmodus unsichtbar. Sichtbare Spur,
+           Füllung bis zum eingestellten Wert (--wb-plan-pct) und Stundenskala. */
+        .wallbox-plan-range::-webkit-slider-runnable-track {
+            height: .6rem;
+            border: 1px solid rgba(var(--bs-body-color-rgb), .28);
+            background: linear-gradient(90deg, var(--bs-primary) 0, var(--bs-primary) var(--wb-plan-pct, 0%), rgba(var(--bs-body-color-rgb), .22) var(--wb-plan-pct, 0%));
+        }
+        .wallbox-plan-range::-webkit-slider-thumb { margin-top: -.3rem; }
+        .wallbox-plan-range::-moz-range-track {
+            height: .6rem;
+            border: 1px solid rgba(var(--bs-body-color-rgb), .28);
+            background: rgba(var(--bs-body-color-rgb), .22);
+        }
+        .wallbox-plan-range::-moz-range-progress { height: .6rem; border-radius: 1rem; background: var(--bs-primary); }
+        .wallbox-plan-range:disabled::-webkit-slider-runnable-track { background: rgba(var(--bs-body-color-rgb), .12); }
+        .wallbox-plan-range:disabled::-moz-range-progress { background: rgba(var(--bs-body-color-rgb), .3); }
+        .wallbox-plan-scale { display: flex; justify-content: space-between; font-size: .68rem; color: var(--bs-secondary-color); margin-top: -.2rem; padding: 0 .1rem; }
         .wallbox-view-panel[hidden] { display: none !important; }
         html[data-e3dc-wallbox-view="advanced"] #wallboxSimpleView { display: none !important; }
         html[data-e3dc-wallbox-view="advanced"] #wallboxAdvancedView[hidden] { display: block !important; }
@@ -3687,16 +3796,20 @@ if ($hasWb2) {
         $fromIsNow = in_array(strtolower(trim((string)$from)), ['now', 'jetzt'], true);
         $fromLabel = $fromIsNow ? 'Jetzt' : htmlspecialchars($from);
         $toLabel = htmlspecialchars($to);
-        $windowLabel = (($wallboxConfig['wb_no_time_limit'] ?? '0') === '1' || (!$fromIsNow && $fromLabel === '00:00' && $toLabel === '00:00'))
+        $noTimeLimit = (($wallboxConfig['wb_no_time_limit'] ?? '0') === '1' || (!$fromIsNow && $fromLabel === '00:00' && $toLabel === '00:00'));
+        $smartActive = (($wallboxConfig["wb{$wb}_smart_wbhour_enable"] ?? (($wb === 1) ? ($wallboxConfig['smart_wbhour_enable'] ?? '0') : '0')) === '1');
+        // Tägliche Wiederholung gilt nur für einen manuellen Stundenplan mit
+        // fester Startuhrzeit; der Planer ignoriert den Schalter sonst.
+        $repeat = (($wallboxConfig["wb{$wb}_plan_repeat"] ?? '0') === '1')
+            && !$fromIsNow && !$noTimeLimit && !$smartActive && $hoursRaw > 0 && $hoursRaw < 99;
+        $windowLabel = $noTimeLimit
             ? '24h / günstigste Slots'
-            : $fromLabel . ' - ' . $toLabel . ' Uhr';
-        $smart = (($wallboxConfig["wb{$wb}_smart_wbhour_enable"] ?? (($wb === 1) ? ($wallboxConfig['smart_wbhour_enable'] ?? '0') : '0')) === '1')
-            ? 'Ziel-SoC aktiv'
-            : 'manuelle Stunden';
-        return [$hoursRaw, $hoursLabel, $windowLabel, $smart, $from, $to];
+            : $fromLabel . ' - ' . $toLabel . ' Uhr' . ($repeat ? ' · täglich' : '');
+        $smart = $smartActive ? 'Ziel-SoC aktiv' : 'manuelle Stunden';
+        return [$hoursRaw, $hoursLabel, $windowLabel, $smart, $from, $to, $repeat];
     };
-    [$wb1PlanHoursRaw, $wb1PlanHoursLabel, $wb1PlanWindowLabel, $wb1SmartPlanLabel, $wb1PlanFrom, $wb1PlanTo] = $planInfo(1);
-    [$wb2PlanHoursRaw, $wb2PlanHoursLabel, $wb2PlanWindowLabel, $wb2SmartPlanLabel, $wb2PlanFrom, $wb2PlanTo] = $planInfo(2);
+    [$wb1PlanHoursRaw, $wb1PlanHoursLabel, $wb1PlanWindowLabel, $wb1SmartPlanLabel, $wb1PlanFrom, $wb1PlanTo, $wb1PlanRepeat] = $planInfo(1);
+    [$wb2PlanHoursRaw, $wb2PlanHoursLabel, $wb2PlanWindowLabel, $wb2SmartPlanLabel, $wb2PlanFrom, $wb2PlanTo, $wb2PlanRepeat] = $planInfo(2);
     $wb1TargetLabel = htmlspecialchars($wallboxConfig['wb1_target_soc'] ?? $wallboxConfig['car_target_soc'] ?? '80');
     $wb2TargetLabel = htmlspecialchars($wallboxConfig['wb2_target_soc'] ?? '80');
     $wbModeOptionsBase = [
@@ -4456,7 +4569,7 @@ if ($hasWb2) {
                             </div>
 
                             <div class="row g-2 align-items-end">
-                                <div class="col-12 col-lg-4">
+                                <div class="col-12 col-lg-4<?= $hasWb2 ? ' col-xl-12' : '' ?>">
                                     <label class="form-label text-muted small fw-bold mb-1">Fahrzeug</label>
                                     <select name="wb1_car_id" id="wb1_car_selector" class="form-select form-select-sm rounded-pill fw-bold car-selector" data-wb="1">
                                         <?php $wb1SelectedCar = canonicalWallboxVehicleSelection($wallboxConfig['wb1_car_id'] ?? $wallboxConfig['car_id'] ?? '__none', $saved_cars); ?>
@@ -4474,15 +4587,15 @@ if ($hasWb2) {
                                         <?php endforeach; ?>
                                     </select>
                                 </div>
-                                <div class="col-6 col-lg-2">
+                                <div class="col-6 col-lg<?= $hasWb2 ? ' col-xl-4' : '' ?>">
                                     <label class="form-label text-muted small fw-bold mb-1">Akku kWh</label>
                                     <input type="number" step="0.1" name="wb1_capacity" class="form-control form-control-sm rounded-pill" value="<?= htmlspecialchars($wallboxConfig['wb1_capacity'] ?? '72.0') ?>">
                                 </div>
-                                <div class="col-6 col-lg-2">
+                                <div class="col-6 col-lg<?= $hasWb2 ? ' col-xl-4' : '' ?>">
                                     <label class="form-label text-muted small fw-bold mb-1">Leistung kW</label>
                                     <input type="number" step="0.1" name="wb1_charge_power" class="form-control form-control-sm rounded-pill" value="<?= htmlspecialchars($wallboxConfig['wb1_charge_power'] ?? '11.0') ?>">
                                 </div>
-                                <div class="col-6 col-lg-2">
+                                <div class="col-6 col-lg<?= $hasWb2 ? ' col-xl-4' : '' ?>">
                                     <label class="form-label text-muted small fw-bold mb-1">Min. Strom</label>
                                     <select name="wb1_min_amp" class="form-select form-select-sm rounded-pill">
                                         <?php $wb1MinAmp = (int)($wallboxConfig['wb1_min_amp'] ?? 6); ?>
@@ -4491,11 +4604,11 @@ if ($hasWb2) {
                                         <?php endforeach; ?>
                                     </select>
                                 </div>
-                                <div class="col-6 col-lg-1">
+                                <div class="col-6 col-lg<?= $hasWb2 ? ' col-xl-4' : '' ?>">
                                     <label class="form-label text-muted small fw-bold mb-1">Ziel %</label>
                                     <input type="number" name="wb1_target_soc" class="form-control form-control-sm rounded-pill" value="<?= htmlspecialchars($wallboxConfig['wb1_target_soc'] ?? '80') ?>">
                                 </div>
-                                <div class="col-6 col-lg-1">
+                                <div class="col-6 col-lg<?= $hasWb2 ? ' col-xl-4' : '' ?>">
                                     <label class="form-label text-muted small fw-bold mb-1">Boost %</label>
                                     <input type="number" name="wb1_max_soc_si" class="form-control form-control-sm rounded-pill" value="<?= htmlspecialchars($wallboxConfig['wb1_max_soc_si'] ?? '90') ?>">
                                 </div>
@@ -4518,7 +4631,7 @@ if ($hasWb2) {
                             </div>
 
                             <div class="row g-2 align-items-end">
-                                <div class="col-12 col-lg-4">
+                                <div class="col-12 col-lg-4 col-xl-12">
                                     <label class="form-label text-muted small fw-bold mb-1">Fahrzeug</label>
                                     <select name="wb2_car_id" id="wb2_car_selector" class="form-select form-select-sm rounded-pill fw-bold car-selector" data-wb="2">
                                         <?php $wb2SelectedCar = canonicalWallboxVehicleSelection($wallboxConfig['wb2_car_id'] ?? '__none', $saved_cars); ?>
@@ -4536,15 +4649,15 @@ if ($hasWb2) {
                                         <?php endforeach; ?>
                                     </select>
                                 </div>
-                                <div class="col-6 col-lg-2">
+                                <div class="col-6 col-lg col-xl-4">
                                     <label class="form-label text-muted small fw-bold mb-1">Akku kWh</label>
                                     <input type="number" step="0.1" name="wb2_capacity" class="form-control form-control-sm rounded-pill" value="<?= htmlspecialchars($wallboxConfig['wb2_capacity'] ?? '72.0') ?>">
                                 </div>
-                                <div class="col-6 col-lg-2">
+                                <div class="col-6 col-lg col-xl-4">
                                     <label class="form-label text-muted small fw-bold mb-1">Leistung kW</label>
                                     <input type="number" step="0.1" name="wb2_charge_power" class="form-control form-control-sm rounded-pill" value="<?= htmlspecialchars($wallboxConfig['wb2_charge_power'] ?? '11.0') ?>">
                                 </div>
-                                <div class="col-6 col-lg-2">
+                                <div class="col-6 col-lg col-xl-4">
                                     <label class="form-label text-muted small fw-bold mb-1">Min. Strom</label>
                                     <select name="wb2_min_amp" class="form-select form-select-sm rounded-pill">
                                         <?php $wb2MinAmp = (int)($wallboxConfig['wb2_min_amp'] ?? 6); ?>
@@ -4553,11 +4666,11 @@ if ($hasWb2) {
                                         <?php endforeach; ?>
                                     </select>
                                 </div>
-                                <div class="col-6 col-lg-1">
+                                <div class="col-6 col-lg col-xl-4">
                                     <label class="form-label text-muted small fw-bold mb-1">Ziel %</label>
                                     <input type="number" name="wb2_target_soc" class="form-control form-control-sm rounded-pill" value="<?= htmlspecialchars($wallboxConfig['wb2_target_soc'] ?? '80') ?>">
                                 </div>
-                                <div class="col-6 col-lg-1">
+                                <div class="col-6 col-lg col-xl-4">
                                     <label class="form-label text-muted small fw-bold mb-1">Boost %</label>
                                     <input type="number" name="wb2_max_soc_si" class="form-control form-control-sm rounded-pill" value="<?= htmlspecialchars($wallboxConfig['wb2_max_soc_si'] ?? '90') ?>">
                                 </div>
@@ -4604,6 +4717,8 @@ if ($hasWb2) {
             $wb2NativeEcoActive = (($wallboxConfig['wb2_native_eco'] ?? '0') === '1');
             $wb1NativePlanHours = max(0, min(24, (int)($wallboxConfig['wb1_plan_hours'] ?? $wallboxConfig['wbhour'] ?? 0)));
             $wb2NativePlanHours = max(0, min(24, (int)($wallboxConfig['wb2_plan_hours'] ?? 0)));
+            $wb1PlanRepeatChecked = (($wallboxConfig['wb1_plan_repeat'] ?? '0') === '1');
+            $wb2PlanRepeatChecked = (($wallboxConfig['wb2_plan_repeat'] ?? '0') === '1');
             $activePlanLabels = [];
             foreach ([1, 2] as $activePlanWb) {
                 if ($activePlanWb === 2 && !$hasWb2) continue;
@@ -4645,8 +4760,8 @@ if ($hasWb2) {
                 <div class="row mb-3 g-3 align-items-stretch">
                     <?php
                     $planPanels = [
-                        1 => ['title' => 'Wallbox 1', 'color' => 'info', 'hours' => $wb1NativePlanHours, 'smart' => $wb1SmartPlanActive, 'eco' => $wb1NativeEcoActive, 'from' => $wb1PlanFrom, 'to' => $wb1PlanTo],
-                        2 => ['title' => 'Wallbox 2', 'color' => 'warning', 'hours' => $wb2NativePlanHours, 'smart' => $wb2SmartPlanActive, 'eco' => $wb2NativeEcoActive, 'from' => $wb2PlanFrom, 'to' => $wb2PlanTo],
+                        1 => ['title' => 'Wallbox 1', 'color' => 'info', 'hours' => $wb1NativePlanHours, 'smart' => $wb1SmartPlanActive, 'eco' => $wb1NativeEcoActive, 'from' => $wb1PlanFrom, 'to' => $wb1PlanTo, 'repeat' => $wb1PlanRepeatChecked, 'repeat_active' => $wb1PlanRepeat],
+                        2 => ['title' => 'Wallbox 2', 'color' => 'warning', 'hours' => $wb2NativePlanHours, 'smart' => $wb2SmartPlanActive, 'eco' => $wb2NativeEcoActive, 'from' => $wb2PlanFrom, 'to' => $wb2PlanTo, 'repeat' => $wb2PlanRepeatChecked, 'repeat_active' => $wb2PlanRepeat],
                     ];
                     foreach ($planPanels as $planWb => $planPanel):
                         if ($planWb === 2 && !$hasWb2) continue;
@@ -4657,17 +4772,19 @@ if ($hasWb2) {
                         <div class="border rounded-3 p-3 h-100 bg-body-tertiary border-<?= $planPanel['color'] ?>-subtle">
                             <div class="d-flex justify-content-between align-items-center mb-3">
                                 <h6 class="fw-bold text-<?= $planPanel['color'] ?> mb-0"><i class="fas fa-calendar-check me-2"></i><?= $planPanel['title'] ?></h6>
-                                <span class="badge bg-<?= $planPanel['color'] ?>-subtle text-<?= $planPanel['color'] ?>">eigener Plan</span>
+                                <span class="badge bg-<?= $planPanel['color'] ?>-subtle text-<?= $planPanel['color'] ?>" data-plan-repeat-badge-wb="<?= $planWb ?>"><?= $planPanel['repeat_active'] ? 'täglich wiederholt' : 'eigener Plan' ?></span>
                             </div>
                             <?php if ($isNativeEnabled): ?>
                             <label for="nativePlanHoursWb<?= $planWb ?>" class="form-label text-muted small fw-bold d-flex justify-content-between mb-1">
                                 <span data-bs-toggle="tooltip" title="Feste Anzahl günstiger Stunden. Bei aktivem Ziel-SoC berechnet E3DC-Control die Dauer automatisch aus Fahrzeug-SoC, Ziel-SoC und Ladeleistung.">Manuelle Ladezeit im Preisfenster</span>
                                 <span id="nativePlanHoursValWb<?= $planWb ?>" class="badge bg-secondary text-white"><?= $planPanel['smart'] ? 'Auto' : ((int)$planPanel['hours'] . ' h') ?></span>
                             </label>
-                            <input type="range" id="nativePlanHoursWb<?= $planWb ?>" name="native_plan_hours_wb<?= $planWb ?>" class="form-range"
+                            <input type="range" id="nativePlanHoursWb<?= $planWb ?>" name="native_plan_hours_wb<?= $planWb ?>" class="form-range wallbox-plan-range"
                                    value="<?= (int)$planPanel['hours'] ?>" min="0" max="24" step="1"
                                    data-plan-hours-wb="<?= $planWb ?>"
-                                   oninput="document.getElementById('nativePlanHoursValWb<?= $planWb ?>').innerText=this.value + ' h';">
+                                   style="--wb-plan-pct: <?= (int)round((int)$planPanel['hours'] / 24 * 100) ?>%;"
+                                   oninput="document.getElementById('nativePlanHoursValWb<?= $planWb ?>').innerText=this.value + ' h'; this.style.setProperty('--wb-plan-pct', Math.round(this.value / 24 * 100) + '%');">
+                            <div class="wallbox-plan-scale" aria-hidden="true"><span>0 h</span><span>6 h</span><span>12 h</span><span>18 h</span><span>24 h</span></div>
                             <div class="row g-2 mt-1">
                                 <div class="col-6">
                                     <label class="form-label text-muted small fw-bold mb-1" data-bs-toggle="tooltip" title="Startanker für die Optimierung. Jetzt bedeutet: ab dem aktuellen Zeitpunkt planen, auch nach einer späteren Neuberechnung."><i class="fas fa-play me-1"></i>Frühestens ab</label>
@@ -4695,7 +4812,7 @@ if ($hasWb2) {
                                     <input type="hidden" name="smart_wbhour_enable_wb<?= $planWb ?>" value="0">
                                     <input class="form-check-input" type="checkbox" name="smart_wbhour_enable_wb<?= $planWb ?>" value="1"
                                            id="smartWbhourEnableWb<?= $planWb ?>" data-plan-smart-wb="<?= $planWb ?>" <?= $planPanel['smart'] ? 'checked' : '' ?>>
-                                    <label class="form-check-label small fw-bold" for="smartWbhourEnableWb<?= $planWb ?>" data-bs-toggle="tooltip" title="Nutzt den bekannten Fahrzeug-SoC. Wenn kein frischer SoC vorliegt, bleibt die manuelle Ladezeit massgeblich.">Ziel-SoC berechnet Dauer</label>
+                                    <label class="form-check-label small fw-bold" for="smartWbhourEnableWb<?= $planWb ?>" data-bs-toggle="tooltip" title="Nutzt den bekannten Fahrzeug-SoC. Wenn kein frischer SoC vorliegt, bleibt die manuelle Ladezeit maßgeblich.">Ziel-SoC berechnet Dauer</label>
                                 </div>
                                 <div class="form-check form-switch">
                                     <input type="hidden" name="wb_native_eco_wb<?= $planWb ?>" value="0">
@@ -4704,9 +4821,18 @@ if ($hasWb2) {
                                            <?= $planPanel['eco'] ? 'checked' : '' ?>>
                                     <label class="form-check-label small fw-bold text-success" for="nativeEcoToggleWb<?= $planWb ?>" data-bs-toggle="tooltip" title="Berücksichtigt zusätzlich den Eco-/Netzdienlichkeits-Score. Der echte Tarifpreis bleibt die Hauptsortierung.">Eco</label>
                                 </div>
+                                <div class="form-check form-switch">
+                                    <input type="hidden" name="plan_repeat_wb<?= $planWb ?>" value="0">
+                                    <input class="form-check-input" type="checkbox" role="switch"
+                                           id="planRepeatToggleWb<?= $planWb ?>" name="plan_repeat_wb<?= $planWb ?>" value="1"
+                                           data-plan-repeat-wb="<?= $planWb ?>"
+                                           <?= $planPanel['repeat'] ? 'checked' : '' ?>>
+                                    <label class="form-check-label small fw-bold" for="planRepeatToggleWb<?= $planWb ?>" data-bs-toggle="tooltip" title="Die manuelle Ladezeit bleibt nach dem Zeitfenster erhalten und wird jeden Tag für dasselbe Fenster neu auf die günstigsten Stunden geplant. Ohne Wiederholung wird die Ladezeit nach dem Fenster auf 0 h zurückgesetzt. Nur mit fester Startuhrzeit, nicht mit Jetzt oder Ziel-SoC.">Täglich wiederholen</label>
+                                </div>
                             </div>
                             <div class="form-text mt-2" style="font-size:0.72rem;">
                                 Auto: Dauer kommt aus Fahrzeug-SoC, Ziel-SoC und Ladeleistung. Manuell: feste Anzahl günstiger Stunden.
+                                <span data-plan-repeat-hint-wb="<?= $planWb ?>">Täglich wiederholen: Der Plan wird jeden Tag im Fenster neu berechnet, statt nach dem Fenster auf 0 h zu fallen.</span>
                             </div>
                             <?php else: ?>
                             <div class="text-muted small">Native Wallbox-Steuerung ist nicht aktiv.</div>
@@ -4740,9 +4866,36 @@ if ($hasWb2) {
                         badge.className = 'badge bg-secondary text-white';
                     }
                 }
+                // Tägliche Wiederholung braucht eine Fensterinstanz: feste
+                // Startuhrzeit und manuelle Stunden. Bei "Jetzt" oder Ziel-SoC
+                // bleibt der Schalter sichtbar, aber gesperrt; der Planer
+                // ignoriert ihn dann ebenfalls.
+                function syncPlanRepeat(wb) {
+                    const repeat = document.querySelector('[data-plan-repeat-wb="' + wb + '"]');
+                    if (!repeat) return;
+                    const smart = document.querySelector('[data-plan-smart-wb="' + wb + '"]');
+                    const mode = document.querySelector('[data-plan-from-mode-wb="' + wb + '"]');
+                    const range = document.querySelector('[data-plan-hours-wb="' + wb + '"]');
+                    const badge = document.querySelector('[data-plan-repeat-badge-wb="' + wb + '"]');
+                    const hint = document.querySelector('[data-plan-repeat-hint-wb="' + wb + '"]');
+                    const blocked = Boolean((smart && smart.checked) || (mode && mode.value === 'now'));
+                    repeat.disabled = blocked;
+                    const label = repeat.closest('.form-check');
+                    if (label) label.classList.toggle('opacity-50', blocked);
+                    const hours = range ? (parseInt(range.value || '0', 10) || 0) : 0;
+                    const active = !blocked && repeat.checked && hours > 0;
+                    if (badge) badge.textContent = active ? 'täglich wiederholt' : 'eigener Plan';
+                    if (hint) {
+                        hint.textContent = blocked
+                            ? 'Täglich wiederholen ist nur mit fester Startuhrzeit und manuellen Stunden möglich.'
+                            : (repeat.checked
+                                ? 'Täglich wiederholen: Der Plan wird jeden Tag im Fenster neu berechnet, statt nach dem Fenster auf 0 h zu fallen.'
+                                : 'Ohne Wiederholung wird die Ladezeit nach dem Fenster auf 0 h zurückgesetzt.');
+                    }
+                }
                 document.querySelectorAll('[data-plan-smart-wb]').forEach(function (el) {
                     const wb = el.getAttribute('data-plan-smart-wb');
-                    el.addEventListener('change', function () { syncPlanHours(wb); });
+                    el.addEventListener('change', function () { syncPlanHours(wb); syncPlanRepeat(wb); });
                     syncPlanHours(wb);
                 });
                 function syncPlanNow(wb) {
@@ -4755,8 +4908,15 @@ if ($hasWb2) {
                 }
                 document.querySelectorAll('[data-plan-from-mode-wb]').forEach(function (el) {
                     const wb = el.getAttribute('data-plan-from-mode-wb');
-                    el.addEventListener('change', function () { syncPlanNow(wb); });
+                    el.addEventListener('change', function () { syncPlanNow(wb); syncPlanRepeat(wb); });
                     syncPlanNow(wb);
+                });
+                document.querySelectorAll('[data-plan-repeat-wb]').forEach(function (el) {
+                    const wb = el.getAttribute('data-plan-repeat-wb');
+                    el.addEventListener('change', function () { syncPlanRepeat(wb); });
+                    const range = document.querySelector('[data-plan-hours-wb="' + wb + '"]');
+                    if (range) range.addEventListener('input', function () { syncPlanRepeat(wb); });
+                    syncPlanRepeat(wb);
                 });
                 function parsePlanTime(value, fallbackHours, fallbackMinutes) {
                     const match = String(value || '').match(/^(\d{1,2}):(\d{2})$/);
@@ -5072,7 +5232,20 @@ if ($hasWb2) {
                                     <td class="ps-3 border-secondary-subtle"><strong><?= htmlspecialchars($car['name'] ?? '') ?></strong></td>
                                     <td class="border-secondary-subtle"><?= number_format((float)($car['capacity'] ?? 0), 1, ',', '.') ?> kWh</td>
                                     <td class="border-secondary-subtle"><?= number_format((float)($car['power'] ?? 0), 1, ',', '.') ?> kW</td>
-                                    <td class="border-secondary-subtle"><?= htmlspecialchars((string)(wallboxVehicleMaxPhases($car) ?: '--')) ?>p</td>
+                                    <td class="border-secondary-subtle">
+                                        <?php $carPhases = wallboxVehicleMaxPhases($car); ?>
+                                        <form action="<?= htmlspecialchars($formAction) ?>" method="post" class="d-flex align-items-center gap-1">
+                                            <?= e3dcCsrfInput() ?>
+                                            <input type="hidden" name="update_custom_car_phases" value="<?= htmlspecialchars($car['id'] ?? '') ?>">
+                                            <select name="custom_car_max_phases" class="form-select form-select-sm" aria-label="Phasenzahl für <?= htmlspecialchars($car['name'] ?? 'Fahrzeug') ?>" title="<?= $carPhases === '' ? 'Phasenzahl fehlt – ohne Wert gilt das Fahrzeug als 3p-fähig' : 'Maximale Phasenzahl des Fahrzeugs' ?>">
+                                                <?php if ($carPhases === ''): ?><option value="" selected>--</option><?php endif; ?>
+                                                <?php foreach ([1, 2, 3] as $phaseOption): ?>
+                                                    <option value="<?= $phaseOption ?>" <?= (int)$carPhases === $phaseOption ? 'selected' : '' ?>><?= $phaseOption ?>p</option>
+                                                <?php endforeach; ?>
+                                            </select>
+                                            <button type="submit" class="btn btn-outline-success btn-sm" title="Phasenzahl speichern" aria-label="Phasenzahl speichern"><i class="fas fa-save"></i></button>
+                                        </form>
+                                    </td>
                                     <td class="border-secondary-subtle">
                                         <form action="<?= htmlspecialchars($formAction) ?>" method="post" class="d-flex align-items-center gap-1">
                                             <?= e3dcCsrfInput() ?>
@@ -5112,10 +5285,27 @@ if ($hasWb2) {
                     <form action="<?= htmlspecialchars($formAction) ?>" method="post">
                         <?= e3dcCsrfInput() ?>
                         <div class="row g-3 mb-3">
-                            <div class="col-12">
-                                <label class="form-label text-muted small fw-bold mb-1">Token (Refresh Token)</label>
-                                <input type="password" name="bluelink_refresh_token" class="form-control form-control-sm rounded-pill"
-                                       value="<?= htmlspecialchars($wallboxConfig['bluelink_refresh_token'] ?? '') ?>">
+                            <div class="col-12 col-md-6">
+                                <label class="form-label text-muted small fw-bold mb-1">Benutzer (E-Mail des Kontos)</label>
+                                <input type="email" name="bluelink_user" class="form-control form-control-sm rounded-pill" autocomplete="off"
+                                       value="<?= htmlspecialchars($wallboxConfig['bluelink_user'] ?? '') ?>">
+                            </div>
+                            <div class="col-12 col-md-6">
+                                <label class="form-label text-muted small fw-bold mb-1">Passwort</label>
+                                <input type="password" name="bluelink_password" class="form-control form-control-sm rounded-pill" autocomplete="new-password" spellcheck="false"
+                                       value="<?= htmlspecialchars($wallboxConfig['bluelink_password'] ?? '') ?>">
+                            </div>
+                            <div class="col-6 col-md-3">
+                                <label class="form-label text-muted small fw-bold mb-1">PIN (optional)</label>
+                                <input type="password" name="bluelink_pin" class="form-control form-control-sm rounded-pill" inputmode="numeric" pattern="[0-9]*" autocomplete="off"
+                                       value="<?= htmlspecialchars($wallboxConfig['bluelink_pin'] ?? '') ?>">
+                            </div>
+                            <div class="col-6 col-md-3">
+                                <label class="form-label text-muted small fw-bold mb-1">Marke</label>
+                                <select name="bluelink_brand" class="form-select form-select-sm rounded-pill">
+                                    <option value="hyundai" <?= (($wallboxConfig['bluelink_brand'] ?? '') === 'kia') ? '' : 'selected' ?>>Hyundai (Bluelink)</option>
+                                    <option value="kia" <?= (($wallboxConfig['bluelink_brand'] ?? '') === 'kia') ? 'selected' : '' ?>>Kia (Kia Connect)</option>
+                                </select>
                             </div>
                             <div class="col-12 col-md-6">
                                 <label class="form-label text-muted small fw-bold mb-1">VIN (Fahrgestellnummer)</label>
@@ -5413,6 +5603,7 @@ function initSimpleWallboxTargetControls() {
         };
         element.className = classes[variant] || classes.success;
         element.textContent = text;
+        element.removeAttribute('title');
     }
 
     function setModeState(form, text, variant = 'success') {
@@ -5463,9 +5654,16 @@ function initSimpleWallboxTargetControls() {
             }
         } else if (intent === 'scheduled') {
             if (energy === 'grid_price') {
+                // Der Planer braucht einen bestätigten Fahrzeug-SoC (Ist-SoC oder
+                // frischer Fahrzeugwert); ohne ihn lädt der Manager sofort bis
+                // Preislimit und meldet das als Hinweis im Dashboard.
+                const istSoc = String(form.querySelector('[data-simple-current-soc]')?.value || '').trim();
+                const socNote = istSoc !== ''
+                    ? ` · Dauer aus Ist-SoC ${istSoc}%`
+                    : ' · ohne bestätigten Fahrzeug-SoC lädt sie sofort bis Preislimit';
                 ruleText = planActive
-                    ? `Betriebsart: Fertig bis · Netz erlaubt, günstige Zeiten bis ${ready}`
-                    : 'Betriebsart: Fertig bis · Netz erlaubt, Ladeplan speichern';
+                    ? `Betriebsart: Fertig bis · Netz erlaubt, günstige Zeiten bis ${ready}${socNote}`
+                    : `Betriebsart: Fertig bis · Netz erlaubt, Ladeplan speichern${socNote}`;
                 setModeState(form, planActive ? 'Ladeplan aktiv' : 'Ladeplan speichern', planActive ? 'info' : 'warning');
             } else if (energy === 'pv_battery') {
                 ruleText = `Betriebsart: Fertig bis · PV + Akku bis ${ready}, Hausakku-Reserve ${reserve}%, Netz bleibt aus`;
@@ -5700,6 +5898,15 @@ function initSimpleWallboxTargetControls() {
     };
 
     function saveSimpleOperatingMode(form) {
+        if (form.dataset.simpleSaveInFlight === '1') {
+            // Eine Transaktion läuft noch (Planer-Unterprozess, mehrere Sekunden
+            // auf dem Pi). Ein zweiter paralleler POST liefe in die 2-s-Sperre
+            // und scheiterte; stattdessen gewinnt die letzte Auswahl und wird
+            // nach Abschluss genau einmal gesendet.
+            form.dataset.simpleSavePending = '1';
+            setModeState(form, 'Speichert...', 'warning');
+            return;
+        }
         normalizeSimpleChoice(form);
         const energy = selectedEnergy(form);
         const intent = selectedIntent(form);
@@ -5737,6 +5944,8 @@ function initSimpleWallboxTargetControls() {
         formData.append('simple_house_reserve', globalReserveValue(true));
         formData.append('simple_price_limit', globalPriceValue());
         setModeState(form, 'Speichert...', 'warning');
+        form.dataset.simpleSaveInFlight = '1';
+        form.dataset.simpleSavePending = '0';
         wallboxPost(formData)
         .then(res => wallboxRequireConfirmedText(res, ['OK', 'PLAN_REQUIRED']))
         .then(text => {
@@ -5746,12 +5955,32 @@ function initSimpleWallboxTargetControls() {
                 return;
             }
             form.dataset.simplePlanActive = '0';
-            rememberSimpleMode(form);
+            // Gespeichert ist, was gesendet wurde – nicht, was inzwischen
+            // angeklickt sein könnte.
+            form.dataset.simpleSavedEnergy = energy;
+            form.dataset.simpleSavedIntent = intent;
             syncAdvancedModeFromSimple(form, energy, intent);
             if (previousMode !== nextMode) setWallboxPauseUi(wbIdx, false, false);
             setModeState(form, 'Betriebsart gespeichert', 'success');
-        }).catch(() => {
+        }).catch((error) => {
+            // Die Auswahl zeigt wieder den tatsächlich gespeicherten Modus;
+            // der Servergrund bleibt als Tooltip am Badge lesbar. Wartet schon
+            // eine neuere Auswahl, wird die nicht überschrieben.
+            if (form.dataset.simpleSavePending !== '1') restoreSimpleMode(form);
             setModeState(form, 'Speichern fehlgeschlagen', 'danger');
+            const badge = form.querySelector('[data-simple-mode-state]');
+            if (badge) badge.title = (error && error.message) ? String(error.message) : '';
+        }).finally(() => {
+            form.dataset.simpleSaveInFlight = '0';
+            if (form.dataset.simpleSavePending !== '1') return;
+            form.dataset.simpleSavePending = '0';
+            if (selectedEnergy(form) === (form.dataset.simpleSavedEnergy || 'pv')
+                && selectedIntent(form) === (form.dataset.simpleSavedIntent || 'surplus')) {
+                setModeState(form, 'Betriebsart gespeichert', 'success');
+                updateStatus(form);
+                return;
+            }
+            saveSimpleOperatingMode(form);
         });
     }
 

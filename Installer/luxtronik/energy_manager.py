@@ -49,7 +49,13 @@ try:
     from Installer.Heat import intent as heat_intent
     from Installer.Heat import policy as heat_policy
     from Installer import control_time
-    from Installer.heatpump_pv_contract import heatpump_pv_config, qualify_heatpump_pv_demand, HARD_PROTECTIONS
+    from Installer.heatpump_pv_contract import (
+        heatpump_pv_config,
+        qualify_heatpump_pv_demand,
+        ww_release_withdrawal_scope_contract,
+        ww_circulation_boost_contract,
+        HARD_PROTECTIONS,
+    )
     from Installer.heatpump_pv_state import load_heatpump_pv_command_checkpoint, persist_heatpump_pv_command_checkpoint
     from Installer.storage_dispatch_contract import (
         revision_hash as storage_contract_revision_hash,
@@ -73,7 +79,13 @@ except ModuleNotFoundError:
     from Heat import intent as heat_intent
     from Heat import policy as heat_policy
     import control_time
-    from heatpump_pv_contract import heatpump_pv_config, qualify_heatpump_pv_demand, HARD_PROTECTIONS
+    from heatpump_pv_contract import (
+        heatpump_pv_config,
+        qualify_heatpump_pv_demand,
+        ww_release_withdrawal_scope_contract,
+        ww_circulation_boost_contract,
+        HARD_PROTECTIONS,
+    )
     from heatpump_pv_state import load_heatpump_pv_command_checkpoint, persist_heatpump_pv_command_checkpoint
     from storage_dispatch_contract import (
         revision_hash as storage_contract_revision_hash,
@@ -1274,10 +1286,10 @@ class IDMHeatpump:
             kw_bucket = 0.0 if send_kw <= 0.001 else round(send_kw / 0.5) * 0.5
             info_bucket = (source_bucket, kw_bucket)
             if self.last_surplus_info_bucket != info_bucket:
-                logger.info(f"IDM PV-Ueberschuss (Reg 74) -> {send_kw:.2f} kW (Ziel {target_kw:.2f} kW, Limit {self.surplus_max_kw:.2f} kW)")
+                logger.info(f"IDM PV-Überschuss (Reg 74) -> {send_kw:.2f} kW (Ziel {target_kw:.2f} kW, Limit {self.surplus_max_kw:.2f} kW)")
                 self.last_surplus_info_bucket = info_bucket
             else:
-                logger.debug(f"IDM PV-Ueberschuss gehalten -> {send_kw:.2f} kW (Ziel {target_kw:.2f} kW)")
+                logger.debug(f"IDM PV-Überschuss gehalten -> {send_kw:.2f} kW (Ziel {target_kw:.2f} kW)")
             return True
         except Exception as e:
             logger.error(f"IDM update_surplus Fehler: {e}")
@@ -3982,6 +3994,26 @@ def _luxtronik_pv_number(value):
     return result if math.isfinite(result) else None
 
 
+def luxtronik_pv_boost_active(*, measured, boost_latched, season_hz, season_ww,
+                              thermal_hz, thermal_ww):
+    """Entscheidet die PV-Boost-Anforderung.
+
+    Ein ausgespielter Auftrag hält den Boost (Latch). Im Messwertbetrieb wird in
+    der Saison ohne thermischen Startbedarf angefordert: Die Sollwerte stehen wie
+    eine SG-Ready-Freigabe, sobald der Storage Manager die PV-Deckung bestätigt;
+    die Anlage startet nach eigener Hysterese, die Startreservierung ist auf
+    wp_pv_start_wait_s befristet. Im reservierten Betrieb bindet die Reservierung
+    die volle Leistung für die ganze Laufzeit, deshalb bleibt dort der thermische
+    Bedarf nach Anlagenhysterese der Auslöser.
+    """
+
+    if boost_latched:
+        return True
+    if measured:
+        return bool(season_hz or season_ww)
+    return bool(thermal_hz or thermal_ww)
+
+
 def luxtronik_pv_contract_cycle(ctx, previous, *, clock_sample):
     """Kanalbedarf und Rückmeldung; die Quellen- und Laufzeitbindung besitzt Storage."""
     ctx = ctx if isinstance(ctx, dict) else {}
@@ -4049,8 +4081,17 @@ def luxtronik_pv_contract_cycle(ctx, previous, *, clock_sample):
                          and target <= comfort["target_c"] + 0.1)
         withdrawals.append(bool(typed and (mode == 0 or normal_ww)))
     newer_readback = bool(fresh and sample_ts > float(command.get("issued_ts") or command.get("prepared_ts") or 0))
-    command["confirmed"] = bool(newer_readback and confirmations and all(confirmations))
-    command["withdrawal_confirmed"] = bool(newer_readback and withdrawals and all(withdrawals))
+    # Ein Schreib-ACK ist noch keine bestätigte Übernahme durch die WP.
+    # Der erste frische Datensatz kann weiterhin den vorherigen Normalwert
+    # enthalten. Das ist ohne vorherige Übernahme kein externer Entzug.
+    readback_confirmed = bool(newer_readback and confirmations and all(confirmations))
+    command["readback_confirmed"] = bool(command.get("readback_confirmed") is True
+                                          or command.get("confirmed") is True
+                                          or readback_confirmed)
+    command["confirmed"] = readback_confirmed
+    command["withdrawal_confirmed"] = bool(
+        newer_readback and withdrawals and all(withdrawals)
+        and (command["readback_confirmed"] or command.get("withdrawal_requested") is True))
     command_outstanding = bool((command.get("issued_ts") or command.get("prepared_ts")) and not command["withdrawal_confirmed"])
     budget = ctx.get("wb_budget_data") if isinstance(ctx.get("wb_budget_data"), dict) else {}
     source, projection = select_storage_primary_budget(budget, now_ts=now_s)
@@ -4060,6 +4101,26 @@ def luxtronik_pv_contract_cycle(ctx, previous, *, clock_sample):
     source_valid = bool(projection is not None and source.get("accepted") is True
                         and grant.get("schema") == "heatpump_pv_contract_v1"
                         and grant_ts is not None and 0 <= now_s - grant_ts <= 45)
+    # Nach einem Neustart kann der private Schreibintent älter sein als
+    # der bereits bestätigte Abschluss bei Storage. Nur denselben Auftrag
+    # bei frischem Normalzustand und ruhendem Verdichter abschließen.
+    grant_state = grant.get("state") if isinstance(grant.get("state"), dict) else {}
+    closed_command = grant_state.get("closed_command")
+    closed_command = closed_command if isinstance(closed_command, dict) else {}
+    closed_in_storage = bool(
+        source_valid and grant.get("valid") is True
+        and grant.get("request_id") == command.get("request_id")
+        and grant.get("revision") == command.get("revision")
+        and grant.get("signal_withdrawn") is True and grant.get("cycle_owned") is False
+        and (command.get("issued_ts") or command.get("prepared_ts"))
+        and closed_command.get("request_id") == command.get("request_id")
+        and closed_command.get("revision") == command.get("revision")
+        and closed_command.get("issued_ts") == (command.get("issued_ts") or command.get("prepared_ts"))
+        and newer_readback and withdrawals and all(withdrawals)
+        and observation.get("compressor_running") is False)
+    if closed_in_storage:
+        command["withdrawal_confirmed"] = True
+        command_outstanding = False
     control_identity = command if command_outstanding else state
     fresh_control = bool(source_valid and grant.get("valid") is True
                          and grant.get("request_id") == control_identity.get("request_id")
@@ -4129,23 +4190,53 @@ def luxtronik_pv_contract_cycle(ctx, previous, *, clock_sample):
             return False
         threshold = target if (old_channels.get(channel) or {}).get("active") else target - hysteresis
         return actual < threshold
+    # Die Hysterese ist die der Anlage (wp_pv_hz_hysteresis_k / wp_pv_ww_hysteresis_k):
+    # Sie bestimmt nur, ab wann Bedarf gemeldet wird; den Verdichterstart entscheidet
+    # die Wärmepumpe mit stehendem Sollwert selbst.
+    hz_hysteresis_k = _luxtronik_pv_number(cfg.get("hz_hysteresis_k"))
+    ww_hysteresis_k = _luxtronik_pv_number(cfg.get("ww_hysteresis_k"))
+    hz_hysteresis_k = 3.5 if hz_hysteresis_k is None else hz_hysteresis_k
+    ww_hysteresis_k = 8.0 if ww_hysteresis_k is None else ww_hysteresis_k
+    # Der PV-Boost ist ein Latch wie eine
+    # SG-Ready-Freigabe. Die Saison bestimmt die Kanäle (Winter: Heizung und
+    # Warmwasser, Sommer: Warmwasser, sofern der Komfort-Timer das Ziel nicht
+    # ohnehin hält). Ein ausgespielter Auftrag hält alle Saisonkanäle, bis der
+    # Storage Manager ihn zurücknimmt (PV-Deckung fehlt länger als
+    # wp_pv_boost_release_s oder Schutz). Die Luxtronik regelt intern.
+    # Beispiel: Im Sommer liegt das Warmwasser über dem Timer-Sollwert, aber
+    # unter dem PV-Sollwert. Im Messwertbetrieb wird der Boost in der Saison ohne thermischen
+    # Startbedarf angefordert – die PV-Deckung entscheidet im Storage Manager,
+    # den Verdichterstart die Anlage; die Startreservierung ist befristet. Der
+    # reservierte Betrieb behält den thermischen Auslöser nach Anlagenhysterese.
+    season_hz = bool(allowed and not summer and outside is not None
+                     and heating_limit is not None and baseline is not None)
+    season_ww = bool(allowed and not (comfort["active"] and comfort["target_c"] is not None
+                                      and ww_target is not None and comfort["target_c"] >= ww_target))
+    thermal_hz = bool(season_hz and thermal("hz", hz_actual, hz_target, hz_hysteresis_k))
+    thermal_ww = bool(season_ww and thermal("ww", ww_actual, ww_target, ww_hysteresis_k))
+    boost_latched = bool(command_outstanding
+                         and any((value or {}).get("active") for value in command_channels.values()))
+    measured_boost = bool(cfg.get("control_mode") == "measured")
+    boost_active = luxtronik_pv_boost_active(
+        measured=measured_boost, boost_latched=boost_latched,
+        season_hz=season_hz, season_ww=season_ww,
+        thermal_hz=thermal_hz, thermal_ww=thermal_ww)
     channels = {
-        "hz": {"active": bool(allowed and not summer and outside is not None
-                                and heating_limit is not None and baseline is not None
-                                and thermal("hz", hz_actual, hz_target, 2.0)), "target_c": hz_target},
-        "ww": {"active": bool(allowed and thermal("ww", ww_actual, ww_target, 8.0)
-                                and not (comfort["active"] and comfort["target_c"] is not None
-                                         and ww_target is not None and comfort["target_c"] >= ww_target)),
-               "target_c": ww_target},
+        "hz": {"active": bool(season_hz and boost_active), "target_c": hz_target},
+        "ww": {"active": bool(season_ww and boost_active), "target_c": ww_target},
     }
     thermal_requested = any(channel["active"] for channel in channels.values())
     requested = thermal_requested
     if (command.get("withdrawal_confirmed") and not was_withdrawal_confirmed
-            and not command.get("withdrawal_requested")):
+            and not command.get("withdrawal_requested") and not closed_in_storage
+            and not measured_boost):
         # Ein externer Entzug ist kein Anlass, denselben Auftrag automatisch
         # erneut zu senden. Erst eine neue Bedarfskante darf wieder qualifizieren.
+        # Im Messwertbetrieb steht die Anforderung wie ein SG-Ready-Signal;
+        # die neue Kante ist die PV-Requalifikation (Storage Manager, Sperrzeiten
+        # wp_pv_start_wait_s / Wiedereinschaltsperre), kein thermischer Reset.
         state["await_thermal_reset"] = True
-    if not thermal_requested:
+    if not thermal_requested or measured_boost:
         state["await_thermal_reset"] = False
     if state.get("await_thermal_reset"):
         requested = False
@@ -4235,6 +4326,7 @@ def luxtronik_pv_prepare_output(state, demand, output, *, now_s):
         command = {"schema": "heatpump_pv_command_state_v1",
                    "request_id": demand["request_id"], "revision": demand["revision"],
                    "prepared_ts": now_s, "issued_ts": None, "confirmed": False,
+                   "readback_confirmed": False,
                    "withdrawal_confirmed": False, "withdrawal_requested": False,
                    "channels": {name: copy.deepcopy(value) for name, value in
                                 (output.get("channels") or {}).items() if value.get("active")},
@@ -4268,6 +4360,7 @@ def luxtronik_pv_note_write(state, demand, channel, mode, target_c, *, now_s):
         command.update({"schema": "heatpump_pv_command_state_v1",
                         "request_id": demand["request_id"], "revision": demand["revision"],
                         "prepared_ts": now_s, "issued_ts": None,
+                        "readback_confirmed": False,
                         "confirmed": False, "withdrawal_confirmed": False,
                         "withdrawal_requested": False, "channels": {}, "acknowledged_channels": {}})
     if not command.get("issued_ts"):
@@ -4575,7 +4668,9 @@ def trim_luxtronik_ramdisk_history(
     """Keep only a bounded live Luxtronik window in tmpfs.
 
     Das persistente Archiv enthält kompakte Fünf-Minuten-Stützstellen. Diese
-    Ramdisk-Datei bleibt der vollständige Minutenpuffer für Live-Charts.
+    Ramdisk-Datei ist der Minutenpuffer für Live-Charts im selben kompakten
+    Zeilenformat (ts, data, status); der volle Reglerzustand steht nur in
+    RAMDISK_FILE. Ein Tag zu je ~4,4 KB bleibt damit unter dem 8-MiB-Deckel.
     """
     try:
         if not os.path.exists(path):
@@ -4638,7 +4733,18 @@ def maybe_trim_luxtronik_ramdisk_history(now_ts=None, path=HISTORY_FILE):
     return trim_luxtronik_ramdisk_history(path=path)
 
 def append_luxtronik_history(payload, now_obj=None, history_path=HISTORY_FILE):
-    line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+    # Ramdisk-Minutenpuffer und Tagesarchiv teilen sich das kompakte
+    # Zeilenformat (ts, data, status). Der volle Reglerzustand bleibt in
+    # RAMDISK_FILE; als ~27-KB-Zeile füllte er den 8-MiB-Deckel der Historie
+    # nach rund fünf Stunden, sodass das 24-h-Minutenfenster nie zustande kam.
+    line = (
+        json.dumps(
+            _luxtronik_compact_archive_payload(payload),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
     archive_path = luxtronik_archive_path_for_payload(payload, now_obj)
     archive_ok = True
     archive_due, archive_bucket = _luxtronik_archive_due(
@@ -4647,17 +4753,8 @@ def append_luxtronik_history(payload, now_obj=None, history_path=HISTORY_FILE):
         now_obj,
     )
     if archive_due:
-        archive_payload = _luxtronik_compact_archive_payload(payload)
-        archive_line = (
-            json.dumps(
-                archive_payload,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            + "\n"
-        )
         try:
-            _append_history_line(archive_path, archive_line)
+            _append_history_line(archive_path, line)
             _last_luxtronik_archive_bucket_by_path[archive_path] = archive_bucket
         except Exception as exc:
             archive_ok = False
@@ -4758,7 +4855,7 @@ def _cleanup_energy_decision_history(retention_days):
             if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
                 os.remove(path)
     except Exception as exc:
-        logger.debug("Energy-Decision Cleanup uebersprungen: %s", exc)
+        logger.debug("Energy-Decision Cleanup übersprungen: %s", exc)
 
 def energy_history_critical_events(record):
     """Verdichtet nur sicherheits- und aktorrelevante Energy-Kanten."""
@@ -5158,6 +5255,362 @@ def heatpump_ww_timer_target_allowed(
     )
 
 
+# Warmwasser sofort: Grenzen des Nutzerbefehls (Luxtronik SHI).
+MANUAL_WW_SOFORT_READBACK_GRACE_S = 60.0
+MANUAL_WW_SOFORT_WRITE_BLOCK_ABORT_S = 300.0
+MANUAL_WW_SOFORT_WRITE_FAILURE_ABORT = 5
+MANUAL_WW_SOFORT_RECOMMAND_MAX = 3
+# Warmwasser sofort: 'Ziel erreicht' ist das reguläre Ende eines Warmwasser-Zyklus - Toleranz zur Solltemperatur und
+# die Laufzustände, in denen kein Warmwasser-Zyklus mehr läuft. Die eingestellte Dauer bleibt die Obergrenze.
+MANUAL_WW_SOFORT_TARGET_TOLERANCE_K = 0.5
+MANUAL_WW_SOFORT_CYCLE_DONE_STATES = frozenset({"not_running", "other_domain"})
+MANUAL_WW_SOFORT_SOURCE_RECOVERY_PRIORITY_TEXT = (
+    "Warmwasser-Sofort (Nutzerbefehl) hat Vorrang vor Quell-Erholung"
+)
+MANUAL_WW_SOFORT_REASON_TEXT = {
+    "expired": "Dauer abgelaufen",
+    "target_reached": "Zieltemperatur erreicht",
+    "user_stop": "vom Nutzer gestoppt",
+    "hardware_or_source_protection": "Hardware-/Quellenschutz der Wärmepumpe",
+    "source_recovery_pause": "Quell-Erholungspause",
+    "write_not_allowed": "Schreibsperre (Live-Daten ungültig, Ferien-/Frostschutzmodus oder Anlaufwartezeit) länger als 5 min",
+    "modbus_write_failed": "Modbus-Schreibfehler (5x in Folge)",
+    "readback_not_confirmed": "Luxtronik übernimmt den SHI-Befehl nicht (nach Neubefehl weiterhin Modus 0)",
+    "readback_lost_repeatedly": "SHI-Befehl wiederholt zurückgesetzt",
+    # Warmwasser sofort: der WP-Regelblock läuft nicht -> niemand führt den Befehl aus (Flag bleibt, Anzeige 'angefordert').
+    "automatic_off": "Wärmepumpen-Automatik aus",
+    "manual_boost": "manueller Wärmepumpen-Boost aktiv",
+    "heatpump_unavailable": "Wärmepumpe nicht verbunden",
+}
+
+
+def manual_ww_sofort_reason_text(reason):
+    """Klartext eines WW-Sofort-Endegrunds für Log und Anzeige."""
+    key = str(reason or "").strip()
+    return MANUAL_WW_SOFORT_REASON_TEXT.get(key, key or "unbekannt")
+
+
+def _manual_ww_sofort_readback(wp_status, now_ts, max_age_s):
+    """Frische, typisierte SHI-WW-Rücklesung (Modus, Sollwert, Zeitstempel) oder valid=False."""
+    status = wp_status if isinstance(wp_status, dict) else {}
+    source_ts = _strict_storage_budget_ts(status.get("source_ts"))
+    mode = normalize_luxtronik_shi_mode(status.get("SHI_WW_Mode", status.get("WW_Mode")))
+    setpoint = status.get("WW_Setpoint")
+    now_value = _safe_float(now_ts, 0.0)
+    valid = bool(
+        status.get("valid") is True
+        and status.get("source_fresh") is True
+        and source_ts is not None
+        and 0.0 <= now_value - source_ts <= max(1.0, _safe_float(max_age_s, 45.0))
+        and mode is not None
+    )
+    return {
+        "valid": valid,
+        "ts": source_ts if valid else 0.0,
+        "mode": mode if valid else None,
+        "setpoint": (
+            _safe_float(setpoint, -999.0)
+            if valid and setpoint is not None and not isinstance(setpoint, bool)
+            else None
+        ),
+    }
+
+
+def luxtronik_manual_ww_sofort_contract(
+    state,
+    *,
+    flag_present,
+    flag_ts,
+    duration_s,
+    now_ts,
+    target_c,
+    write_allowed,
+    hard_stop_reason="",
+    wp_status=None,
+    last_cmd=None,
+    other_write_ts=0.0,
+    write_failures=0,
+    timer_enabled=False,
+    readback_max_age_s=45.0,
+    readback_grace_s=MANUAL_WW_SOFORT_READBACK_GRACE_S,
+    ww_ist_c=None,  # Warmwasser sofort: Warmwasser-Ist, Frische und Laufzustand entscheiden über das reguläre Ende
+    ww_ist_fresh=False,
+    ww_runtime_state="",
+    target_tolerance_k=MANUAL_WW_SOFORT_TARGET_TOLERANCE_K,
+    control_inactive_reason="",
+):
+    """Nutzerbefehl Warmwasser sofort (Luxtronik SHI) – ein Entscheider.
+
+    Ziel ist SHI-Modus 1 mit der Boost-Solltemperatur für die konfigurierte Dauer ab Flag-Zeitpunkt, unabhängig vom
+    PV-/Speicherbudget (der Budget-Handshake meldet den Bedarf nur als Speicherstützung). Reguläres Ende ist die
+    erreichte Zieltemperatur (ww_ist_c frisch und mindestens target_c - target_tolerance_k und ww_runtime_state
+    meldet keinen laufenden Warmwasser-Zyklus mehr -> Ereignis end/target_reached, Flag entfernt, genau einmal je
+    Flag-Zeitstempel; fehlende oder veraltete Temperaturdaten beenden nie). Dieses reguläre
+    Ende setzt einen BELEGTEN Warmwasser-Zyklus voraus - erst wenn in diesem Befehl einmal ww_runtime_state
+    'ww_running' gemeldet hat (cycle_seen), darf die erreichte Temperatur beenden. Ohne Verdichterevidenz meldet
+    der Laufzustand 'not_running', ohne etwas gemessen zu haben; ein bereits warmer Speicher hat nie einen Zyklus
+    gezeigt. In beiden Fällen bleibt es beim bisherigen Ende. Sonst endet der Befehl durch
+    Ablauf, Nutzer-Stopp (Flag entfernt) oder harte Schutzgründe (hard_stop_reason: Hardware-/Quellenschutz;
+    Schreibsperre länger als MANUAL_WW_SOFORT_WRITE_BLOCK_ABORT_S; wiederholte Schreibfehler;
+    Rücklesung nach dem Neubefehl weiterhin Modus 0). Rücklesungs-Karenz: eine Rücklesung Modus 0, deren Zeitstempel
+    höchstens readback_grace_s nach dem letzten eigenen Befehl liegt (eigener WW-Befehl oder Direktschreibung anderer
+    Pfade, other_write_ts), ist kein Verlust und hält weitere Befehle zurück (command_hold, deckungsgleich mit dem
+    Verlustfenster; ohne Rücklesung hält ein passender eigener Befehl für die Karenz). Danach zählt eine frische
+    Rücklesung Modus 0 als Verlust: genau ein Neubefehl (Ereignis readback_lost); bleibt die Rücklesung nach dessen
+    Karenz auf 0, endet der Befehl (readback_not_confirmed). Eine Rücklesung Modus 1 mit Soll nach dem eigenen Befehl
+    bestätigt sofort (readback_confirmed). Setzt eine eigene Direktschreibung eines anderen Regelpfads (other_write_ts
+    jünger als der eigene WW-Befehl) den Kanal auf 0, folgt sofort ein Neubefehl (Ereignis channel_reset, einmal je
+    Direktschreibung). control_inactive_reason (automatic_off | manual_boost | heatpump_unavailable) meldet, dass der
+    WP-Regelblock nicht läuft: ein aktiver Befehl wird beendet (abort, Flag bleibt), ein angeforderter bleibt wartend.
+    Ohne Schreibrecht wird nicht gestartet (wartend); der Zustand bleibt erhalten, bis die Sperre die Frist
+    überschreitet. Nach dem Ende übernimmt der WW-Timer die Automatik; ohne Timer bleibt release_pending, bis einmal
+    Modus 0 geschrieben oder zurückgelesen wurde.
+    Rückgabe: active, target_ww_mode, target_ww_temp, until_ts, command_hold, readback_tolerated, release_pending,
+    remove_flag, pending, events ([{event, reason}] mit start | end | abort | readback_lost | readback_confirmed),
+    readback (Diagnose), state (persistieren und beim nächsten Aufruf übergeben).
+    """
+    prev = state if isinstance(state, dict) else {}
+    now = _safe_float(now_ts, 0.0)
+    duration = max(60.0, _safe_float(duration_s, 0.0))
+    flag_at = _safe_float(flag_ts, 0.0) if flag_present else 0.0
+    requested = bool(flag_at > 0.0 and now < flag_at + duration)
+    expired = bool(flag_at > 0.0 and now >= flag_at + duration)
+    target = _safe_float(target_c, 0.0)
+    cmd = last_cmd if isinstance(last_cmd, dict) else {}
+    cmd_ts = _safe_float(cmd.get("ts"), 0.0)
+    cmd_mode = _safe_int(cmd.get("mode"), -1) if cmd.get("mode") is not None else -1
+    cmd_matches = bool(
+        cmd_mode == 1
+        and cmd.get("temp") is not None
+        and target > 0.0
+        and abs(_safe_float(cmd.get("temp"), -999.0) - target) <= 0.5
+    )
+    grace = max(0.0, _safe_float(readback_grace_s, MANUAL_WW_SOFORT_READBACK_GRACE_S))
+    own_ts = max(cmd_ts, _safe_float(other_write_ts, 0.0))
+    readback = _manual_ww_sofort_readback(wp_status, now, readback_max_age_s)
+    was_active = bool(prev.get("active"))
+    stop_reason = str(hard_stop_reason or "").strip()
+    control_reason = str(control_inactive_reason or "").strip()  # Warmwasser sofort
+    timer = bool(timer_enabled)
+    events = []
+    remove_flag = False
+    command_hold = False
+    readback_tolerated = False
+    # Warmwasser sofort: ein Warmwasser-Zyklus. Das Ziel gilt als erreicht, wenn die frische Isttemperatur die
+    # Solltemperatur (abzüglich Toleranz) hält UND kein Warmwasser-Zyklus mehr läuft. Fehlende, veraltete oder
+    # nicht domänengebundene Daten beenden nie - dann bleiben Ablauf, Nutzer-Stopp und die harten Schranken.
+    ww_tolerance = max(0.0, _safe_float(target_tolerance_k, MANUAL_WW_SOFORT_TARGET_TOLERANCE_K))
+    ww_ist = (
+        _safe_float(ww_ist_c, -999.0)
+        if ww_ist_c is not None and not isinstance(ww_ist_c, bool)
+        else None
+    )
+    ww_runtime_now = str(ww_runtime_state or "").strip()
+    # Warmwasser sofort: 'Ziel erreicht' setzt einen belegten Warmwasser-Zyklus voraus. Der Laufzustand meldet
+    # 'not_running' auch dann, wenn gar keine Verdichterevidenz vorliegt - fehlende Daten sind keine Freigabe.
+    # Erst wenn in diesem Befehl einmal 'ww_running' beobachtet wurde, darf die erreichte Temperatur beenden;
+    # ein bereits warmer Speicher hält damit weiterhin den Sollwert bis zum Ablauf der Dauer.
+    ww_cycle_seen = bool(was_active and (bool(prev.get("cycle_seen")) or ww_runtime_now == "ww_running"))
+    ww_target_reached = bool(
+        ww_cycle_seen
+        and bool(ww_ist_fresh)
+        and ww_ist is not None
+        and ww_ist > -900.0
+        and target > 0.0
+        and ww_ist >= target - ww_tolerance
+        and ww_runtime_now in MANUAL_WW_SOFORT_CYCLE_DONE_STATES
+    )
+    completed_flag_ts = _safe_float(prev.get("completed_flag_ts"), 0.0)
+    new = {
+        "active": False,
+        "pending": False,
+        "started_ts": 0.0,
+        "until_ts": 0.0,
+        "target_c": 0.0,
+        "readback_confirmed": False,
+        "recommand_pending": False,
+        "recommand_total": 0,
+        "write_blocked_since": 0.0,
+        "channel_reset_ts": 0.0,
+        "cycle_seen": False,  # Warmwasser sofort: in diesem Befehl wurde ein laufender WW-Zyklus beobachtet
+        "completed_flag_ts": completed_flag_ts,  # Warmwasser sofort: genau ein Warmwasser-Zyklus je Flag-Zeitstempel
+        "release_pending": bool(prev.get("release_pending")) and not timer,
+        "last_event": str(prev.get("last_event") or ""),
+        "last_event_reason": str(prev.get("last_event_reason") or ""),
+        "last_event_ts": _safe_float(prev.get("last_event_ts"), 0.0),
+    }
+
+    def keep_active():
+        new.update({
+            "active": True,
+            "pending": False,
+            "started_ts": _safe_float(prev.get("started_ts"), 0.0) or flag_at,
+            "until_ts": flag_at + duration,
+            "target_c": target,
+            "readback_confirmed": bool(prev.get("readback_confirmed")),
+            "recommand_pending": bool(prev.get("recommand_pending")),
+            "recommand_total": max(0, _safe_int(prev.get("recommand_total"), 0)),
+            "write_blocked_since": 0.0,
+            "channel_reset_ts": _safe_float(prev.get("channel_reset_ts"), 0.0),
+            "cycle_seen": ww_cycle_seen,  # Warmwasser sofort: belegter Warmwasser-Zyklus dieses Befehls
+            "release_pending": False,
+        })
+
+    def finish(event, why):
+        new.update({
+            "active": False,
+            "pending": False,
+            "started_ts": 0.0,
+            "until_ts": 0.0,
+            "target_c": 0.0,
+            "readback_confirmed": False,
+            "recommand_pending": False,
+            "recommand_total": 0,
+            "write_blocked_since": 0.0,
+            "channel_reset_ts": 0.0,
+            "release_pending": not timer,
+            "last_event": event,
+            "last_event_reason": why,
+            "last_event_ts": now,
+        })
+        events.append({"event": event, "reason": why})
+
+    if was_active:
+        if not flag_present:
+            finish("end", "user_stop")
+        elif expired:
+            finish("end", "expired")
+            remove_flag = True
+        elif control_reason:
+            # Warmwasser sofort: der WP-Regelblock läuft nicht (Automatik aus, manueller WP-Boost, keine Wärmepumpe) -
+            # niemand führt den Befehl aus: ehrlich beenden; das Flag bleibt (Anzeige 'angefordert', Neustart mit der Automatik).
+            finish("abort", control_reason)
+        elif stop_reason:
+            finish("abort", stop_reason)
+            remove_flag = True
+        elif ww_target_reached:
+            # Warmwasser sofort: reguläres Ende - der Warmwasser-Zyklus ist fertig (Ziel erreicht, kein Zyklus mehr).
+            # Die eingestellte Dauer ist nur die Obergrenze; das Flag wird entfernt, danach übernimmt die Automatik.
+            finish("end", "target_reached")
+            remove_flag = True
+            new["completed_flag_ts"] = flag_at
+        elif _safe_int(write_failures, 0) >= MANUAL_WW_SOFORT_WRITE_FAILURE_ABORT:
+            finish("abort", "modbus_write_failed")
+            remove_flag = True
+        elif not write_allowed:
+            since = _safe_float(prev.get("write_blocked_since"), 0.0) or now
+            if now - since >= MANUAL_WW_SOFORT_WRITE_BLOCK_ABORT_S:
+                finish("abort", "write_not_allowed")
+                remove_flag = True
+            else:
+                keep_active()
+                new["write_blocked_since"] = since
+        else:
+            keep_active()
+            # Warmwasser sofort: Halten und Verlustfenster sind deckungsgleich. Eine Rücklesung Modus 0 innerhalb der Karenz
+            # nach dem letzten eigenen Befehl wird toleriert UND hält weitere Befehle zurück; erst der festgestellte Verlust
+            # (Rücklesung jünger als own_ts + Karenz) gibt genau einen Neubefehl frei. Ohne Rücklesung hält der eigene
+            # passende Befehl für die Karenz (Blind-Heartbeat bleibt).
+            command_hold = bool(cmd_matches and (now - cmd_ts) < grace)
+            other_ts = _safe_float(other_write_ts, 0.0)
+            channel_reset = bool(cmd_matches and other_ts > cmd_ts)
+            if cmd_matches and readback["valid"]:
+                readback_matches = bool(
+                    readback["mode"] == 1
+                    and readback["setpoint"] is not None
+                    and abs(readback["setpoint"] - target) <= 0.5
+                )
+                if readback_matches and readback["ts"] >= own_ts:
+                    # Bestätigung unabhängig von der Karenz: die Rücklesung nach dem eigenen Befehl zeigt den Zielzustand.
+                    if not new["readback_confirmed"]:
+                        events.append({"event": "readback_confirmed", "reason": "shi_mode_1"})
+                    new["readback_confirmed"] = True
+                    new["recommand_pending"] = False
+                elif readback["mode"] == 0:
+                    if readback["ts"] > own_ts + grace:
+                        if new["recommand_pending"]:
+                            finish("abort", "readback_not_confirmed")
+                            remove_flag = True
+                        elif new["recommand_total"] >= MANUAL_WW_SOFORT_RECOMMAND_MAX:
+                            finish("abort", "readback_lost_repeatedly")
+                            remove_flag = True
+                        else:
+                            new["readback_confirmed"] = False
+                            new["recommand_pending"] = True
+                            new["recommand_total"] += 1
+                            events.append({"event": "readback_lost", "reason": "shi_mode_0_after_grace"})
+                        command_hold = False
+                    elif channel_reset and readback["ts"] >= other_ts:
+                        # Eigene Direktschreibung eines anderen Regelpfads hat den WW-Kanal auf 0 gesetzt: kein Verlust,
+                        # sofort ein Neubefehl (eine Schreibrunde je Übergang), Ereignis einmal je Direktschreibung.
+                        readback_tolerated = True
+                        command_hold = False
+                        if new["channel_reset_ts"] != other_ts:
+                            new["channel_reset_ts"] = other_ts
+                            new["readback_confirmed"] = False
+                            events.append({"event": "channel_reset", "reason": "own_direct_write"})
+                    else:
+                        readback_tolerated = True
+                        command_hold = True
+    elif requested and flag_at > 0.0 and completed_flag_ts == flag_at:
+        # Warmwasser sofort: dieser Nutzerbefehl ist mit erreichter Zieltemperatur bereits beendet (genau einmal).
+        # Liegt das Flag noch (Entfernen fehlgeschlagen), wird es weiter angefordert, aber nicht neu gestartet.
+        remove_flag = True
+    elif requested:
+        if control_reason:
+            new["pending"] = True  # Warmwasser sofort: wartend, bis der WP-Regelblock wieder läuft (kein Start, kein Ereignis)
+        elif stop_reason:
+            finish("abort", stop_reason)
+            remove_flag = True
+        elif not write_allowed:
+            since = _safe_float(prev.get("write_blocked_since"), 0.0) or now
+            if now - since >= MANUAL_WW_SOFORT_WRITE_BLOCK_ABORT_S:
+                finish("abort", "write_not_allowed")
+                remove_flag = True
+            else:
+                new["pending"] = True
+                new["write_blocked_since"] = since
+        else:
+            new.update({
+                "active": True,
+                "pending": False,
+                "started_ts": flag_at,
+                "until_ts": flag_at + duration,
+                "target_c": target,
+                "release_pending": False,
+                "last_event": "start",
+                "last_event_reason": "",
+                "last_event_ts": now,
+            })
+            events.append({"event": "start", "reason": "user_command"})
+            command_hold = bool(cmd_matches and (now - cmd_ts) < grace)
+    elif expired:
+        remove_flag = True
+
+    if new["release_pending"] and not new["active"]:
+        if (
+            timer
+            or (readback["valid"] and readback["mode"] == 0)
+            or (cmd_mode == 0 and cmd_ts > 0.0 and cmd_ts >= new["last_event_ts"])
+        ):
+            new["release_pending"] = False
+    active = bool(new["active"])
+    return {
+        "active": active,
+        "target_ww_mode": 1 if active else None,
+        "target_ww_temp": target if active else None,
+        "until_ts": new["until_ts"],
+        "command_hold": bool(active and command_hold),
+        "readback_tolerated": bool(active and readback_tolerated),
+        "release_pending": bool(new["release_pending"]),
+        "remove_flag": remove_flag,
+        "pending": bool(new["pending"]),
+        "events": events,
+        "readback": readback,
+        "state": new,
+    }
+
+
 def heatpump_start_reservation_duration_s(wp_type, shelly_sg_ip=""):
     """Gibt 150 s nur für SG-Ready-/Relaispfade zurück.
 
@@ -5514,7 +5967,7 @@ def build_energy_decision_record(ctx):
     )
 
     decision_state = "beobachtet"
-    decision_reason = "Keine aktive Waermefreigabe"
+    decision_reason = "Keine aktive Wärmefreigabe"
     observed_wp_power_w, heatpump_power_known, heatpump_accepting_power = heatpump_power_observation(
         wp_data,
         wp_status,
@@ -5528,7 +5981,7 @@ def build_energy_decision_record(ctx):
     heatpump_budget_readiness = heatpump_budget_request_readiness(ctx)
     if predump_heatpump_active:
         decision_state = "predump_waerme_hold" if predump_heatpump_hold_active else "predump_waerme_start"
-        decision_reason = "Pre-Dump gibt Waermepumpe frei; Mindestlaufzeit schuetzt vor kurzem Takten"
+        decision_reason = "Pre-Dump gibt Wärmepumpe frei; Mindestlaufzeit schützt vor kurzem Takten"
     elif price_boost_active:
         decision_state = "preis_waerme_aktiv" if heatpump_accepting_power else "preis_waerme_budget_frei"
         if market_plan_heatpump_active:
@@ -5554,17 +6007,17 @@ def build_energy_decision_record(ctx):
     elif pv_pause_active:
         decision_state = "waerme_pause"
         decision_reason = (
-            str(heatpump_pause_request.get("reason") or "Quell-Erholung aktiv; Waermepumpe wird wegen Preis/PV-Strategie gehalten")
+            str(heatpump_pause_request.get("reason") or "Quell-Erholung aktiv; Wärmepumpe wird wegen Preis/PV-Strategie gehalten")
             if source_recovery_pause_requested or pv_pause_owner == "source_recovery_heatpump"
-            else "Quell-Erholung aktiv; Waermepumpe wird wegen Preis/PV-Strategie gehalten"
+            else "Quell-Erholung aktiv; Wärmepumpe wird wegen Preis/PV-Strategie gehalten"
         )
     elif manual_heatpump_active or manual_ww_boost_active_export:
         decision_state = "manuelle_waermefreigabe"
-        decision_reason = "Manuelle Waermefreigabe aktiv"
+        decision_reason = "Manuelle Wärmefreigabe aktiv"
     elif boost_active:
         decision_state = "pv_waerme_aktiv" if heatpump_accepting_power else "pv_waerme_budget_frei"
         decision_reason = (
-            "PV-/Budget-Freigabe aktiv; Waermepumpe nimmt Leistung an"
+            "PV-/Budget-Freigabe aktiv; Wärmepumpe nimmt Leistung an"
             if heatpump_accepting_power
             else (
                 "PV-/Budget-Freigabe angeboten; Wärmepumpe nimmt aktuell keine Leistung auf"
@@ -5574,10 +6027,10 @@ def build_energy_decision_record(ctx):
         )
     elif predump_heatpump_targets_reached:
         decision_state = "zieltemperatur_erreicht"
-        decision_reason = "Pre-Dump-Waermefreigabe blockiert: Zieltemperaturen erreicht"
+        decision_reason = "Pre-Dump-Wärmefreigabe blockiert: Zieltemperaturen erreicht"
     elif predump_heatpump_protect_block:
         decision_state = "wq_schutz"
-        decision_reason = "Waermefreigabe blockiert: Waermequelle zu kalt"
+        decision_reason = "Wärmefreigabe blockiert: Wärmequelle zu kalt"
 
     predump_heatpump_hold_until = _safe_float(ctx.get("predump_heatpump_hold_until", 0.0), 0.0)
     heatpump_budget_w = ctx.get("heatpump_budget_w")
@@ -5955,9 +6408,15 @@ def source_recovery_heat_override_state(
     min_soc,
     heat_policy_decision=None,
     ww_cycle_started_ts=0.0,
+    manual_ww_sofort_active=False,
     now_ts=None,
 ):
-    """Entscheidet, ob nutzbares Wärmebudget eine Quellen-Erholungspause beendet."""
+    """Entscheidet, ob nutzbares Wärmebudget eine Quellen-Erholungspause beendet.
+
+    Ein laufender Nutzerbefehl 'Warmwasser sofort' hat Vorrang. Die
+    Quell-Erholung ist Optimierung, keine harte Schranke: Sie startet nicht und gibt eine
+    laufende Pause frei, solange der Nutzerbefehl läuft; danach greift sie wieder normal.
+    """
 
     now_value = time.time() if now_ts is None else _safe_float(now_ts, time.time())
     relevant = bool(source_recovery_pause_allowed or source_recovery_pause_active)
@@ -5986,7 +6445,11 @@ def source_recovery_heat_override_state(
     override = False
     release_reason = ""
     if relevant:
-        if ww_remaining_s > 0.0 or policy_ww_hold:
+        if manual_ww_sofort_active:
+            # Warmwasser sofort: Nutzerbefehl schlägt die Optimierung - die Quell-Erholung wartet auf das Vertragsende.
+            override = True
+            release_reason = MANUAL_WW_SOFORT_SOURCE_RECOVERY_PRIORITY_TEXT
+        elif ww_remaining_s > 0.0 or policy_ww_hold:
             override = True
             release_reason = "WW-Mindestlaufzeit hat Vorrang vor Quell-Erholung"
         elif policy_forced_heat:
@@ -6187,8 +6650,10 @@ def luxtronik_operating_stage(
 ):
     """Projiziert den belegten Luxtronik-Warmwasserablauf für die Anzeige.
 
-    SHI-WW ist nur eine bestätigte Anforderung. BUP beziehungsweise eine an
-    den WW-Betriebszustand gebundene ZUP beweisen die Hydraulik, aber niemals
+    SHI-WW beschreibt die externe Sollwertvorgabe, auch bei Eco ohne Bedarf.
+    Eine Anforderung benötigt den frischen Geräte-Warmwasserstatus.
+    BUP beziehungsweise eine an den WW-Betriebszustand gebundene ZUP
+    beweisen die Hydraulik, aber niemals
     den Verdichter. Ein Verdichterstart benötigt eine eigene, frische
     Beobachtung. Die 40-Hz-Zwischenstufe wird nur aus der Istfrequenz gezeigt.
     Das Erreichen eines vorhandenen, höheren Frequenzsolls ist eine Ziellast;
@@ -6231,15 +6696,6 @@ def luxtronik_operating_stage(
         if ww_status is not None:
             ww_status = int(round(ww_status))
 
-    shi_ww_mode = None
-    if web_fresh:
-        shi_ww_mode = normalize_luxtronik_shi_mode(
-            status.get(
-                "SHI_WW_Mode",
-                status.get("WW_Mode", data.get("WW_Mode")),
-            )
-        )
-
     bup = _optional_finite_float(data.get("BUP")) if web_fresh else None
     zup = _optional_finite_float(data.get("ZUP")) if web_fresh else None
     bup_active = bup is not None and bup > 0.0
@@ -6247,10 +6703,7 @@ def luxtronik_operating_stage(
     status_ww_requested = ww_status in (2, 3)
     status_ww_active = ww_status == 3
     ww_domain = bool(operating_ww or status_ww_requested or bup_active)
-    ww_requested = bool(
-        status_ww_requested
-        or (shi_ww_mode is not None and shi_ww_mode > 0)
-    )
+    ww_requested = status_ww_requested
 
     if status_ww_requested:
         evidence.append(
@@ -6258,8 +6711,6 @@ def luxtronik_operating_stage(
             if status_ww_active
             else "warmwater_status_requested"
         )
-    if shi_ww_mode is not None and shi_ww_mode > 0:
-        evidence.append("shi_warmwater_request_readback")
     if operating_ww:
         evidence.append("operating_mode_warmwater")
     if bup_active:
@@ -6361,7 +6812,7 @@ def luxtronik_operating_stage(
         else:
             result.update({
                 "stage": "ww_compressor_started",
-                "label": "WW-Verdichter gestartet",
+                "label": "WW-Verdichter läuft",
                 "reason_code": "WW_COMPRESSOR_CONFIRMED",
             })
         return result
@@ -7447,7 +7898,7 @@ def cleanup_legacy_energy_state_file(path=LEGACY_ENERGY_STATE_FILE):
         pass
     try:
         os.remove(path)
-        logger.info("Entferne alten Energy-Manager-Status %s: V5 nutzt Pre-Dump, Ladekurve und Storage-Manager-Auftraege.", mode)
+        logger.info("Entferne alten Energy-Manager-Status %s: V5 nutzt Pre-Dump, Ladekurve und Storage-Manager-Aufträge.", mode)
         return True
     except Exception as exc:
         logger.debug("Alter Energy-Manager-Status konnte nicht entfernt werden: %s", exc)
@@ -8306,7 +8757,7 @@ def main():
         wp = ShellyHeatpump(shelly_sg_ip, shelly_pause_ip, SHELLY_HEATPUMP_STATE_FILE)
         logger.info(f"Shelly SG-Ready WP-Steuerung aktiv (SG-Ready: {shelly_sg_ip}, EVU-Pause: {shelly_pause_ip}).")
     elif wp_type < 0:
-        logger.info("Keine native Waermepumpe aktiv; Energy Manager laeuft nur fuer Smart Charging/Heizstab.")
+        logger.info("Keine native Wärmepumpe aktiv; Energy Manager läuft nur für Smart Charging/Heizstab.")
 
     # Prüfen, ob der Neustart durch ein Update ausgelöst wurde, um eine Endlosschleife zu verhindern.
     restarted_by_update = False
@@ -8355,6 +8806,10 @@ def main():
     wp_last_pv_boost_stop_ts = 0.0
     wp_last_ww_cycle_start_ts = 0.0
     wp_last_ww_cycle_target_c = 0.0
+    # Warmwasser sofort: Zustand des Nutzerbefehls (luxtronik_manual_ww_sofort_contract) und eigener Schreibfehlerzähler.
+    manual_ww_sofort_state = {}
+    manual_ww_sofort = {}
+    manual_ww_write_failures = 0
     wp_compressor_was_running = None
     wp_compressor_running_now = False
     wp_compressor_observation_valid = False
@@ -8606,7 +9061,7 @@ def main():
     import signal
     import sys
     def handle_sigterm(sig, frame):
-        logger.info("Dienst wird beendet (SIGTERM). Schliesse Verbindung sauber ab...")
+        logger.info("Dienst wird beendet (SIGTERM). Schließe Verbindung sauber ab...")
         try:
             if latest_energy_live_state:
                 persist_energy_restart_checkpoint(
@@ -8631,7 +9086,7 @@ def main():
                 wp.close()
                 logger.info("WP-Verbindung geschlossen.")
             except Exception as e:
-                logger.error(f"Fehler beim Schliessen der WP-Verbindung: {e}")
+                logger.error(f"Fehler beim Schließen der WP-Verbindung: {e}")
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, handle_sigterm)
@@ -8787,7 +9242,7 @@ def main():
                 if current_mtime != config_mtime:
                     config_cache = load_e3dc_config_dict()
                     config_mtime = current_mtime
-                    logger.info("Konfiguration aktualisiert (Dateiaenderung erkannt).")
+                    logger.info("Konfiguration aktualisiert (Dateiänderung erkannt).")
         except Exception as e:
             logger.error(f"Fehler beim Konfigurations-Check: {e}")
 
@@ -9492,7 +9947,7 @@ def main():
                                     # Er laeuft bei jedem Zyklus, sobald wp_write_allowed=True gilt.
                                     # D.h. nach einem Crash wird der Boost spaetestens nach 65s zurueckgesetzt.
                                     if (time.time() - last_safety_check_time) > 1800:
-                                        logger.info(f"Sicherheits-Reset: WP Boost (WW={wp_status.get('WW_Mode')}, HZ={wp_status.get('HZ_Mode')}, HZ-Set={hz_set}C) ohne SW-Anforderung - setze zurueck.")
+                                        logger.info(f"Sicherheits-Reset: WP Boost (WW={wp_status.get('WW_Mode')}, HZ={wp_status.get('HZ_Mode')}, HZ-Set={hz_set}C) ohne SW-Anforderung - setze zurück.")
                                         last_safety_check_time = time.time()
 
                                     if wp_write_allowed:
@@ -9503,11 +9958,11 @@ def main():
                                         reset_ok = True
                                         if illegal_hz:
                                             if not wp.write_hz_boost(0, None):
-                                                logger.warning(f"HZ-Reset fehlgeschlagen! WP laeuft im Boost (HZ_Mode=1, Set={hz_set}C) ohne SW-Anforderung.")
+                                                logger.warning(f"HZ-Reset fehlgeschlagen! WP läuft im Boost (HZ_Mode=1, Set={hz_set}C) ohne SW-Anforderung.")
                                                 reset_ok = False
                                         if illegal_ww:
                                             if not wp.write_ww_boost(0, CONF_WWW):
-                                                logger.warning(f"WW-Reset fehlgeschlagen! WP laeuft im Boost (WW_Mode=1) ohne SW-Anforderung.")
+                                                logger.warning(f"WW-Reset fehlgeschlagen! WP läuft im Boost (WW_Mode=1) ohne SW-Anforderung.")
                                                 reset_ok = False
                                         if reset_ok:
                                             logger.debug("WP Boost Reset erfolgreich.")
@@ -10637,7 +11092,7 @@ def main():
                 current_wbh = get_cfg_int(current_config, 'wbhour', -1)
                 if not smart_wbhour_handoff_logged:
                     logger.info(
-                        "Smart-wbhour wird vom Wallbox-Planer gefuehrt; "
+                        "Smart-wbhour wird vom Wallbox-Planer geführt; "
                         "Energy Manager schreibt keine Wallbox-Ladeplanung mehr."
                     )
                     smart_wbhour_handoff_logged = True
@@ -10724,7 +11179,7 @@ def main():
                     if current_wbh > 0 and 0 < max_h < current_wbh and (wb1_locked or wb2_locked): max_h = current_wbh
                     if current_wbh != max_h:
                         logger.debug(
-                            "Smart-wbhour Bedarf waere %sh; Wallbox-Planer berechnet und schreibt den Plan.",
+                            "Smart-wbhour Bedarf wäre %sh; Wallbox-Planer berechnet und schreibt den Plan.",
                             max_h,
                         )
             # --- Ende Fahrzeug & SoC management ---
@@ -10956,6 +11411,9 @@ def main():
                     source_recovery_pause_latched = bool(source_recovery_latch.get("cached_fresh"))
                     heatpump_pause_request = source_recovery_latch.get("request") or {}
                     source_recovery_pause_context = source_recovery_latch.get("context") or {}
+                    # Warmwasser sofort: Vorrang des Nutzerbefehls vor der Quell-Erholung. Gelesen wird der Zustand des
+                    # Vorzyklus, weil dieser Pausenblock vor dem Flag-Block des Nutzerbefehls liegt.
+                    manual_ww_sofort_priority_active = bool(manual_ww_sofort_state.get("active"))
                     if heat_policy_runtime_enabled:
                         source_recovery_pre_policy_state = source_recovery_heat_override_state(
                             source_recovery_pause_allowed=source_recovery_pause_allowed,
@@ -10966,14 +11424,25 @@ def main():
                             soc=soc,
                             min_soc=MIN_SOC,
                             ww_cycle_started_ts=wp_last_ww_cycle_start_ts,
+                            manual_ww_sofort_active=manual_ww_sofort_priority_active,
                             now_ts=time.time(),
                         )
                     else:
                         source_recovery_pre_policy_state = {
-                            "override": False,
+                            "override": bool(
+                                manual_ww_sofort_priority_active
+                                and (source_recovery_pause_allowed or source_recovery_pause_active)
+                            ),
                             "budget_ready": False,
-                            "release_reason": "",
-                            "blocks_boost": bool(source_recovery_pause_allowed or source_recovery_pause_active),
+                            "release_reason": (
+                                MANUAL_WW_SOFORT_SOURCE_RECOVERY_PRIORITY_TEXT
+                                if manual_ww_sofort_priority_active
+                                else ""
+                            ),
+                            "blocks_boost": bool(
+                                (source_recovery_pause_allowed or source_recovery_pause_active)
+                                and not manual_ww_sofort_priority_active
+                            ),
                             "ww_cycle_min_runtime_remaining_s": 0.0,
                         }
                     source_recovery_heat_budget_override = bool(source_recovery_pre_policy_state.get("override"))
@@ -11116,7 +11585,10 @@ def main():
                             # Hysterese: Timer abbrechen, wenn Netzbezug um 500W über Limit steigt
                             if pv_pause_active and pv_pause_pending_end is not None and grid > (GRID_START_LIMIT + 500):
                                 pv_pause_pending_end = None
-                            elif not boost_active and not heatpump_pv_output.get("command_outstanding") and soc >= PV_PAUSE_SOC and not car_blocks_pause and time.time() > pv_pause_blocked_until:
+                            # Warmwasser sofort: der Nutzerbefehl hat Vorrang vor JEDER Pause, nicht nur vor der
+                            # als Quell-Erholung etikettierten - eine PV-Prognosepause schriebe sonst WW-Modus 0
+                            # mitten in den laufenden Befehl.
+                            elif not boost_active and not heatpump_pv_output.get("command_outstanding") and soc >= PV_PAUSE_SOC and not car_blocks_pause and not manual_ww_sofort_priority_active and time.time() > pv_pause_blocked_until:
                                 peak_found = False
                                 if forecast:
                                     gmt = time.gmtime(); now_gmt = gmt.tm_hour + gmt.tm_min / 60.0
@@ -11146,7 +11618,9 @@ def main():
                                                 pv_pause_owner = "legacy_pv_pause"
                         elif not boost_active and not heatpump_pv_output.get("command_outstanding") and not car_blocks_pause and time.time() > pv_pause_blocked_until:
                             peak_found = bool(source_recovery_pause_eligible)
-                            if not peak_found and soc >= PV_PAUSE_SOC and forecast:
+                            # Warmwasser sofort: Vorrang des Nutzerbefehls auch im Rückfall auf die
+                            # PV-Prognosepause - sonst startet bei gleicher Prognoselage doch eine Pause.
+                            if not peak_found and not manual_ww_sofort_priority_active and soc >= PV_PAUSE_SOC and forecast:
                                 gmt = time.gmtime(); now_gmt = gmt.tm_hour + gmt.tm_min / 60.0
                                 max_future_w = 0.0; current_w = 0.0
                                 for entry in forecast:
@@ -11161,7 +11635,13 @@ def main():
                                 and wp_write_allowed
                                 and automatic_heat_actuation_allowed
                             ):
-                                pause_reason = str(heatpump_pause_request.get("reason") or f"Prognose > {PV_PAUSE_WATT}W")
+                                # Warmwasser sofort: ehrliche Anzeige - der Grundtext der Quell-Erholung gehört
+                                # zur Quell-Erholung; eine PV-Prognosepause nennt ihren eigenen Grund.
+                                pause_reason = (
+                                    str(heatpump_pause_request.get("reason") or f"Prognose > {PV_PAUSE_WATT}W")
+                                    if source_recovery_pause_eligible
+                                    else f"Prognose > {PV_PAUSE_WATT}W"
+                                )
                                 logger.info(f"Starte {pause_label} ({pause_reason}).")
                                 heatpump_positive_output_blocked_this_cycle = True
                                 heatpump_positive_output_block_reasons.append(
@@ -11184,6 +11664,9 @@ def main():
                         and (
                             PV_PAUSE_ENABLE != 1
                             or pv_pause_owner == "source_recovery_heatpump"
+                            # Warmwasser sofort: ein laufender Nutzerbefehl gibt jede Pause frei, nicht nur die
+                            # als Quell-Erholung etikettierte.
+                            or manual_ww_sofort_priority_active
                         )
                     ):
                         source_recovery_was_owner = pv_pause_owner == "source_recovery_heatpump"
@@ -11426,6 +11909,7 @@ def main():
                             min_soc=MIN_SOC,
                             heat_policy_decision=heat_policy_decision,
                             ww_cycle_started_ts=wp_last_ww_cycle_start_ts,
+                            manual_ww_sofort_active=manual_ww_sofort_priority_active,
                             now_ts=time.time(),
                         )
                         source_recovery_heat_budget_override = bool(source_recovery_policy_state.get("override"))
@@ -11514,10 +11998,16 @@ def main():
                             ])[0]
                         )
 
+                    # Warmwasser sofort: Solange der Nutzerbefehl aktiv ist, bewertet allein sein Vertrag die WW-Rücklesung
+                    # (Karenz 60 s, ein Neubefehl, dann Abbruch) – keine zweite Rücknahmekante, kein Modus-0/1-Flattern.
+                    manual_ww_sofort_owns_readback = bool(
+                        wp_type == 0 and manual_ww_sofort_state.get("active")
+                    )
                     if (
                         wp
                         and heatpump_positive_signal_started_ts > 0.0
                         and not heatpump_positive_signal_restored_unconfirmed
+                        and not manual_ww_sofort_owns_readback
                     ):
                         heatpump_positive_signal_actuator_readback = (
                             heatpump_positive_actuator_readback(
@@ -11659,6 +12149,12 @@ def main():
                     manual_ww_target_c = (
                         CONF_WWS if at_mittel > HEIZGRENZE_TEMP else CONF_WWW
                     )
+                    # Warmwasser sofort: der Nutzerbefehl senkt nie einen aktiven Timer-Sollwert.
+                    if WW_TIMER_ENABLE and ww_timer_target_c is not None:
+                        manual_ww_target_c = max(
+                            _safe_float(manual_ww_target_c, 0.0),
+                            _safe_float(ww_timer_target_c, 0.0),
+                        )
                     existing_ww_signal = bool(
                         heatpump_positive_signal_window.get("active") is True
                         and heatpump_positive_signal_demand_class.startswith(
@@ -12117,12 +12613,45 @@ def main():
                         )
                         automatic_heat_start_allowed = False
                         central_heatpump_command_cap_w = 0
-                        if wp.set_boost(0, None, 0, CONF_WWW):
+                        # Die Rücknahme entfernt ausschließlich das eigene
+                        # Angebot. Trägt der WW-Kanal erkennbar den Auftrag des
+                        # normalen Timers, bleibt er unangetastet; sonst stellt
+                        # ihn die Mismatch-Korrektur Sekunden später wieder her
+                        # und jeder dieser Schreibvorgänge startet kurz WW.
+                        _ww_withdrawal_scope = ww_release_withdrawal_scope_contract(
+                            independent_safety_stop=bool(
+                                heatpump_signal_independent_safety_stop
+                            ),
+                            timer_enabled=bool(
+                                wp_type == 0
+                                and WW_TIMER_ENABLE
+                                and ww_timer_target_c is not None
+                            ),
+                            timer_target_c=ww_timer_target_c,
+                            live_ww_mode=(wp_status or {}).get("WW_Mode"),
+                            live_ww_setpoint=(wp_status or {}).get(
+                                "WW_Setpoint"
+                            ),
+                            status_valid=bool((wp_status or {}).get("valid")),
+                        )
+                        heatpump_ww_withdrawal_scope = dict(
+                            _ww_withdrawal_scope
+                        )
+                        if wp.set_boost(
+                            0,
+                            None,
+                            _ww_withdrawal_scope.get("ww_mode"),
+                            CONF_WWW,
+                        ):
                             logger.info(
-                                "Beende positive Wärmefreigabe: %s.",
+                                "Beende positive Wärmefreigabe: %s. WW-Kanal: %s.",
                                 "unabhängige Safety-/Herstellerschranke"
                                 if heatpump_signal_independent_safety_stop
                                 else "fachliche Nachfrage im aktuellen Zyklus beendet",
+                                "unverändert, normaler Timer besitzt den Auftrag"
+                                if _ww_withdrawal_scope.get("touch_ww") is False
+                                else "zurückgenommen (%s)"
+                                % str(_ww_withdrawal_scope.get("reason") or ""),
                             )
                             last_wp_command_time = time.time()
                             wp_last_pv_boost_stop_ts = time.time()
@@ -12219,7 +12748,7 @@ def main():
                         if not price_boost_active:
                             if wp_write_allowed and automatic_heat_start_allowed and not heatpump_pv_output.get("command_outstanding"):
                                 if predump_heatpump_active:
-                                    msg = "Start Pre-Dump-Verbraucherfreigabe (Waermepumpe)."
+                                    msg = "Start Pre-Dump-Verbraucherfreigabe (Wärmepumpe)."
                                 else:
                                     msg = f"Start Preis-Boost ({current_price} ct)" if price_action == "BOOST" else f"Start Nachtstrom-Boost (NT: {current_price} ct)"
                                 logger.info(msg)
@@ -12780,19 +13309,130 @@ def main():
                         if modbus_at is not None and ws_at is not None:
                             diff = abs(modbus_at - float(ws_at))
                             if diff > 3.0:
-                                logger.warning(f"Modbus Health-Check: Aussentemp Divergenz! Modbus={modbus_at:.1f}C vs WebSocket={ws_at:.1f}C (Diff={diff:.1f}K) -> Reconnect")
+                                logger.warning(f"Modbus Health-Check: Außentemp Divergenz! Modbus={modbus_at:.1f}C vs WebSocket={ws_at:.1f}C (Diff={diff:.1f}K) -> Reconnect")
                                 wp.close()  # Erzwingt Reconnect beim naechsten Zyklus
 
                     # ---------------------------------------------------------
                     # WARM WATER SOFTWARE TIMER ENFORCEMENT & WW SOFORT
                     # ---------------------------------------------------------
                     manual_ww_flag = "/var/www/html/ramdisk/manual_ww_boost.flag"
+                    manual_ww_flag_ts = 0.0
                     if os.path.exists(manual_ww_flag):
                         try:
-                            if (time.time() - os.path.getmtime(manual_ww_flag)) < (WW_SOFORT_DURATION * 60):
+                            manual_ww_flag_ts = float(os.path.getmtime(manual_ww_flag))
+                            if (time.time() - manual_ww_flag_ts) < (WW_SOFORT_DURATION * 60):
                                 manual_ww_active = True
-                            else: os.remove(manual_ww_flag)
-                        except: pass
+                        except Exception:
+                            manual_ww_flag_ts = 0.0
+                    # Warmwasser sofort (Luxtronik): Nutzerbefehl = Modus 1 + Boost-Soll für ww_sofort_duration, unabhängig vom
+                    # PV-/Speicherbudget; Ende nur durch Ablauf, Nutzer-Stopp oder harte Schutzgründe. Andere Aktortypen
+                    # behalten den bisherigen Pfad.
+                    if wp_type == 0 and wp:
+                        manual_ww_hard_stop_reason = ""
+                        if heatpump_signal_typed_protection_stop:
+                            manual_ww_hard_stop_reason = "hardware_or_source_protection"
+                        # Warmwasser sofort: Die Quell-Erholung ist Optimierung, keine harte Schranke - sie beendet den
+                        # Nutzerbefehl nicht mehr, sondern wartet, bis er regulär endet (Ziel erreicht, Ablauf, Stopp).
+                        # Warmwasser-Ist und Laufzustand entscheiden über das reguläre Ende (ein Warmwasser-Zyklus).
+                        manual_ww_ist_c = wp_data.get("Warmwasser_Ist") if isinstance(wp_data, dict) else None
+                        manual_ww_ist_fresh = bool(
+                            manual_ww_ist_c is not None
+                            and isinstance(wp_status, dict)
+                            and wp_status.get("valid") is True
+                            and wp_status.get("source_fresh") is True
+                        )
+                        manual_ww_sofort = luxtronik_manual_ww_sofort_contract(
+                            manual_ww_sofort_state,
+                            flag_present=manual_ww_flag_ts > 0.0,
+                            flag_ts=manual_ww_flag_ts,
+                            duration_s=float(WW_SOFORT_DURATION) * 60.0,
+                            now_ts=time.time(),
+                            target_c=manual_ww_target_c,
+                            write_allowed=bool(wp_write_allowed),
+                            hard_stop_reason=manual_ww_hard_stop_reason,
+                            wp_status=wp_status,
+                            last_cmd={
+                                "ts": getattr(wp, "last_ww_cmd_time", 0.0),
+                                "mode": getattr(wp, "last_ww_mode", None),
+                                "temp": getattr(wp, "last_ww_temp", None),
+                            },
+                            other_write_ts=last_wp_command_time,
+                            write_failures=manual_ww_write_failures,
+                            timer_enabled=bool(WW_TIMER_ENABLE),
+                            readback_max_age_s=_safe_float(
+                                current_config.get("consumer_acceptance_evidence_max_age_s"),
+                                45.0,
+                            ),
+                            ww_ist_c=manual_ww_ist_c,
+                            ww_ist_fresh=manual_ww_ist_fresh,
+                            # Warmwasser sofort: ohne gültige Verdichterbeobachtung ist der Laufzustand nicht
+                            # belegt - dann 'unknown' statt 'not_running'. Fehlende Daten sind keine Freigabe.
+                            ww_runtime_state=str(luxtronik_ww_runtime_contract.get("state") or "")
+                            if wp_compressor_observation_valid
+                            else "unknown",
+                        )
+                        manual_ww_sofort_state = manual_ww_sofort["state"]
+                        if not manual_ww_sofort["active"]:
+                            manual_ww_write_failures = 0
+                        for manual_ww_event in manual_ww_sofort["events"]:
+                            manual_ww_kind = str(manual_ww_event.get("event") or "")
+                            manual_ww_why = str(manual_ww_event.get("reason") or "")
+                            if manual_ww_kind == "start":
+                                logger.info(
+                                    "WW-Sofort gestartet: SHI-Modus 1, Ziel %.1f °C bis %s "
+                                    "(Nutzerbefehl, unabhängig vom PV-/Speicherbudget).",
+                                    _safe_float(manual_ww_target_c, 0.0),
+                                    datetime.fromtimestamp(manual_ww_sofort["until_ts"]).strftime("%H:%M"),
+                                )
+                            elif manual_ww_kind == "end":
+                                logger.info(
+                                    "WW-Sofort beendet: %s; Rückkehr in die Automatik.",
+                                    manual_ww_sofort_reason_text(manual_ww_why),
+                                )
+                            elif manual_ww_kind == "abort":
+                                logger.warning(
+                                    "WW-Sofort abgebrochen: %s; Rückkehr in die Automatik.",
+                                    manual_ww_sofort_reason_text(manual_ww_why),
+                                )
+                            elif manual_ww_kind == "readback_lost":
+                                logger.error(
+                                    "WW-Sofort: Luxtronik meldet SHI-Modus 0 mehr als %d s nach dem eigenen Befehl "
+                                    "- einmaliger Neubefehl (Modus 1, Ziel %.1f °C).",
+                                    int(MANUAL_WW_SOFORT_READBACK_GRACE_S),
+                                    _safe_float(manual_ww_target_c, 0.0),
+                                )
+                            elif manual_ww_kind == "readback_confirmed":
+                                logger.info(
+                                    "WW-Sofort: Luxtronik bestätigt SHI-Modus 1, Ziel %.1f °C.",
+                                    _safe_float(manual_ww_target_c, 0.0),
+                                )
+                            elif manual_ww_kind == "channel_reset":
+                                # Warmwasser sofort: eigene Direktschreibung eines anderen Regelpfads (z. B. Pausen-/Preis-/
+                                # Sicherheitsstopp) hat den WW-Kanal auf 0 gesetzt - kein Verlust, ein Neubefehl.
+                                logger.info(
+                                    "WW-Sofort: WW-Kanal durch eine Direktschreibung eines anderen Regelpfads auf SHI-Modus 0 "
+                                    "gesetzt - Sollwert wird erneut gesetzt (Modus 1, Ziel %.1f °C).",
+                                    _safe_float(manual_ww_target_c, 0.0),
+                                )
+                            cycle_actions.append({
+                                "action": "manual_ww_sofort_%s" % manual_ww_kind,
+                                "owner": "manual_ww_sofort",
+                                "reason": manual_ww_why,
+                                "target_c": _safe_float(manual_ww_target_c, 0.0),
+                                "until_ts": manual_ww_sofort["until_ts"],
+                            })
+                        if manual_ww_sofort["remove_flag"]:
+                            try:
+                                os.remove(manual_ww_flag)
+                            except OSError:
+                                pass
+                    else:
+                        manual_ww_sofort = {}
+                        if manual_ww_flag_ts > 0.0 and (time.time() - manual_ww_flag_ts) >= (WW_SOFORT_DURATION * 60):
+                            try:
+                                os.remove(manual_ww_flag)
+                            except OSError:
+                                pass
 
                     if wp_write_allowed and wp:
                         current_hour_decimal = now.hour + (now.minute / 60.0)
@@ -12800,6 +13440,7 @@ def main():
                         target_ww_mode = None
                         target_ww_temp = None
                         target_circ = None
+                        ww_circ_boost_source = ""
 
                         boost_ww_temp = CONF_WWS if at_mittel > HEIZGRENZE_TEMP else CONF_WWW
                         force_pause = (pre_pause_active or pv_pause_active)
@@ -12811,6 +13452,11 @@ def main():
                                 heatpump_positive_output_block_reasons,
                             )
                         )
+                        # Warmwasser sofort: Budget-/Ökonomie-Sperrgründe gelten nicht für den Nutzerbefehl; seine harten
+                        # Schutzgründe prüft der Vertrag selbst (bei aktivem Vertrag liegt keiner vor).
+                        manual_ww_sofort_active = bool(manual_ww_sofort.get("active"))
+                        if manual_ww_sofort_active:
+                            ww_positive_output_hard_blocked = False
                         positive_signal_active = bool(
                             heatpump_positive_signal_window.get("active")
                             is True
@@ -12904,7 +13550,11 @@ def main():
                             and pv_pause_owner == "source_recovery_heatpump"
                         )
 
-                        if ww_positive_output_hard_blocked:
+                        if manual_ww_sofort_active:
+                            # Warmwasser sofort: Nutzerbefehl schlägt Budget-Tor, Legacy-PV-/Preis-Pause und Boost-Pfade.
+                            target_ww_mode = manual_ww_sofort.get("target_ww_mode")
+                            target_ww_temp = manual_ww_sofort.get("target_ww_temp")
+                        elif ww_positive_output_hard_blocked:
                             target_ww_mode = 0
                             target_ww_temp = CONF_WWW
                         elif force_pause and source_recovery_owns_pause:
@@ -12936,7 +13586,8 @@ def main():
                             if target_ww_mode is None:
                                 target_ww_mode = 0
                                 target_ww_temp = CONF_WWW
-                        elif manual_ww_active:
+                        elif manual_ww_active and wp_type != 0:
+                            # Bisheriger Pfad anderer Aktortypen; Luxtronik: Warmwasser sofort (Vertrag oben).
                             target_ww_mode = 0
                             target_ww_temp = CONF_WWW
                         elif WW_TIMER_ENABLE:
@@ -12959,6 +13610,10 @@ def main():
                             else:
                                 target_ww_mode = 0
                                 target_ww_temp = CONF_WWW
+                        elif manual_ww_sofort.get("release_pending"):
+                            # Warmwasser sofort: nach dem Ende ohne Timer einmal Modus 0 (Rückkehr in die Automatik).
+                            target_ww_mode = 0
+                            target_ww_temp = CONF_WWW
 
                         if luxtronik_pv_direct:
                             if (heatpump_pv_output.get("start") or heatpump_pv_output.get("keep")):
@@ -12988,9 +13643,20 @@ def main():
                                 target_circ = 1 if cycle_time_minutes < WW_CIRC_ON else 0
                             else:
                                 target_circ = 0
-                            # WW_CIRC_BOOST: PV-Boost erzwingt Zirkulation EIN (ueberschreibt 0 auf 1)
-                            if force_ww and WW_CIRC_BOOST:
+                            # WW_CIRC_BOOST: Eine Warmwasser-Boostphase erzwingt
+                            # Zirkulation EIN (überschreibt 0 auf 1). Neben dem
+                            # Legacy-Boost (force_ww) zählt auch der gehaltene
+                            # PV-Vertragskanal; eine Rücknahme oder ein fremder
+                            # Eigentümer gibt die Pumpe dem Timer zurück.
+                            _ww_circ_boost = ww_circulation_boost_contract(
+                                circ_boost_enabled=bool(WW_CIRC_BOOST),
+                                legacy_force_ww=bool(force_ww),
+                                pv_direct=bool(luxtronik_pv_direct),
+                                pv_output=heatpump_pv_output,
+                            )
+                            if _ww_circ_boost["force_on"]:
                                 target_circ = 1
+                                ww_circ_boost_source = _ww_circ_boost["source"]
 
                         pv_ww_contract_withdrawal = bool(
                             luxtronik_pv_direct and heatpump_pv_output.get("withdraw"))
@@ -13052,6 +13718,9 @@ def main():
                             (active_boost_type or force_pause)
                             and (time.time() - float(last_wp_command_time or 0.0)) < max(WW_COOLDOWN_SECS, 30.0)
                         )
+                        if manual_ww_sofort_active:
+                            # Warmwasser sofort: Karenz des eigenen Befehls statt Boost-/Pausen-Cooldown.
+                            ww_boost_owner_recent = bool(manual_ww_sofort.get("command_hold"))
 
                         time_since_last_ww_cmd = time.time() - getattr(wp, 'last_ww_cmd_time', 0)
                         send_ww_mode, send_ww_temp, ww_update_reason = luxtronik_ww_command_request(
@@ -13065,7 +13734,7 @@ def main():
                             ww_boost_owner_recent,
                             WW_COOLDOWN_SECS,
                             WW_HEARTBEAT_SECS,
-                            persistent_timer_target=bool(
+                            persistent_timer_target=manual_ww_sofort_active or bool(  # Warmwasser sofort: Soll bleibt bis zum Ende
                                 wp_type == 0 and WW_TIMER_ENABLE
                                 and not force_ww and not force_pause
                                 and not ww_positive_output_hard_blocked
@@ -13192,6 +13861,8 @@ def main():
                                 automatic_heat_start_allowed = False
                                 central_heatpump_command_cap_w = 0
                             if wp.write_ww_boost(send_ww_mode, send_ww_temp):
+                                if manual_ww_sofort_active and send_ww_mode == 1:
+                                    manual_ww_write_failures = 0  # Warmwasser sofort
                                 if luxtronik_pv_direct and heatpump_pv_ww_write and send_ww_mode == 1:
                                     luxtronik_pv_note_write(heatpump_pv_state, heatpump_pv_contract,
                                                           "ww", send_ww_mode, send_ww_temp, now_s=time.time())
@@ -13305,6 +13976,8 @@ def main():
                                         heatpump_positive_signal_retry_not_before_ts,
                                         time.time() + 60.0,
                                     )
+                                if manual_ww_sofort_active and send_ww_mode == 1:
+                                    manual_ww_write_failures += 1  # Warmwasser sofort: 5 Fehlschläge in Folge beenden den Befehl
                                 logger.warning(
                                     "WW Timer/Boost konnte nicht geschrieben werden: Mode=%s, Temp=%s (%s).",
                                     send_ww_mode,
@@ -13327,7 +14000,11 @@ def main():
                                     if circ_heartbeat and not circ_mode_changed:
                                         logger.debug(f"Zirkulation Heartbeat: {target_circ}")
                                     else:
-                                        logger.info(f"Zirkulation Set: {target_circ}")
+                                        logger.info(
+                                            "Zirkulation Set: %s%s",
+                                            target_circ,
+                                            f" (Boost: {ww_circ_boost_source})" if ww_circ_boost_source else "",
+                                        )
                                 else:
                                     # GANZ WICHTIG: mode auf target_circ setzen, auch bei Fehler!
                                     # Wenn es auf 'None' bleibt, versucht die nächste Iteration (2 Sek später)
@@ -13337,6 +14014,61 @@ def main():
                                     logger.error(f"Zirkulation Set {target_circ} via Modbus abgewiesen! (Sperre für Heartbeat-Zeit)")
 
                 except Exception as req_err: logger.error(f"Fehler Logik: {req_err}")
+
+            # Warmwasser sofort: Läuft der WP-Regelblock nicht (manueller WP-Boost, Automatik aus, keine Wärmepumpe), führt
+            # niemand den Nutzerbefehl aus. Derselbe Vertrag setzt einen aktiven Zustand dann ehrlich zurück (Ereignis abort,
+            # Flag bleibt -> Anzeige 'angefordert', Neustart sobald die Automatik wieder läuft); ein angeforderter Befehl
+            # bleibt wartend, ein abgelaufenes Flag wird entfernt.
+            manual_ww_sofort_flag_path = "/var/www/html/ramdisk/manual_ww_boost.flag"
+            if wp_type == 0 and (os.path.exists(FLAG_FILE) or AUTO_MODE != 1 or not wp) and (
+                manual_ww_sofort_state.get("active")
+                or manual_ww_sofort_state.get("pending")
+                or os.path.exists(manual_ww_sofort_flag_path)
+            ):
+                try:
+                    manual_ww_skip_flag_ts = float(os.path.getmtime(manual_ww_sofort_flag_path))
+                except OSError:
+                    manual_ww_skip_flag_ts = 0.0
+                manual_ww_skip_reason = (
+                    "manual_boost" if os.path.exists(FLAG_FILE)
+                    else ("automatic_off" if AUTO_MODE != 1 else "heatpump_unavailable")
+                )
+                manual_ww_sofort = luxtronik_manual_ww_sofort_contract(
+                    manual_ww_sofort_state,
+                    flag_present=manual_ww_skip_flag_ts > 0.0,
+                    flag_ts=manual_ww_skip_flag_ts,
+                    duration_s=float(WW_SOFORT_DURATION) * 60.0,
+                    now_ts=time.time(),
+                    target_c=_safe_float(manual_ww_sofort_state.get("target_c"), 0.0),
+                    write_allowed=False,
+                    control_inactive_reason=manual_ww_skip_reason,
+                    timer_enabled=bool(WW_TIMER_ENABLE),
+                )
+                manual_ww_sofort_state = manual_ww_sofort["state"]
+                manual_ww_write_failures = 0
+                for manual_ww_event in manual_ww_sofort["events"]:
+                    manual_ww_kind = str(manual_ww_event.get("event") or "")
+                    manual_ww_why = str(manual_ww_event.get("reason") or "")
+                    if manual_ww_kind == "abort":
+                        logger.warning(
+                            "WW-Sofort ausgesetzt: %s; der Befehl bleibt angefordert, bis die Automatik wieder "
+                            "übernimmt oder die Dauer abläuft.",
+                            manual_ww_sofort_reason_text(manual_ww_why),
+                        )
+                    elif manual_ww_kind == "end":
+                        logger.info("WW-Sofort beendet: %s.", manual_ww_sofort_reason_text(manual_ww_why))
+                    cycle_actions.append({
+                        "action": "manual_ww_sofort_%s" % manual_ww_kind,
+                        "owner": "manual_ww_sofort",
+                        "reason": manual_ww_why,
+                        "target_c": _safe_float(manual_ww_sofort_state.get("target_c"), 0.0),
+                        "until_ts": manual_ww_sofort["until_ts"],
+                    })
+                if manual_ww_sofort["remove_flag"]:
+                    try:
+                        os.remove(manual_ww_sofort_flag_path)
+                    except OSError:
+                        pass
 
             # 3. Daten schreiben
             manual_heatpump_active = bool(
@@ -13553,6 +14285,8 @@ def main():
                 "pv_pause_blocked_until": pv_pause_blocked_until,
                 "manual_heatpump_active": manual_heatpump_active,
                 "manual_ww_boost_active": manual_ww_boost_active_export,
+                # Warmwasser sofort: Zustand des Nutzerbefehls (aktiv bis, Rücklesung, letztes Ereignis mit Grund).
+                "manual_ww_sofort": dict(manual_ww_sofort_state),
                 "wp_last_pv_boost_start_ts": wp_last_pv_boost_start_ts,
                 "wp_last_pv_boost_stop_ts": wp_last_pv_boost_stop_ts,
                 "luxtronik_ww_runtime": dict(
@@ -13686,7 +14420,7 @@ def main():
                 last_history_write = time.time()
 
             decision_state = "beobachtet"
-            decision_reason = "Keine aktive Waermefreigabe"
+            decision_reason = "Keine aktive Wärmefreigabe"
             observed_wp_power_w, heatpump_power_known, heatpump_accepting_power = heatpump_power_observation(
                 wp_data,
                 wp_status,
@@ -13694,7 +14428,7 @@ def main():
             heatpump_source_ts = heatpump_native_source_timestamp(wp_status)
             if predump_heatpump_active:
                 decision_state = "predump_waerme_hold" if predump_heatpump_hold_active else "predump_waerme_start"
-                decision_reason = "Pre-Dump gibt Waermepumpe frei; Mindestlaufzeit schuetzt vor kurzem Takten"
+                decision_reason = "Pre-Dump gibt Wärmepumpe frei; Mindestlaufzeit schützt vor kurzem Takten"
             elif price_boost_active:
                 decision_state = "preis_waerme_aktiv" if heatpump_accepting_power else "preis_waerme_budget_frei"
                 if market_heatpump_active:
@@ -13720,17 +14454,17 @@ def main():
             elif pv_pause_active:
                 decision_state = "waerme_pause"
                 decision_reason = (
-                    str(heatpump_pause_request.get("reason") or "Quell-Erholung aktiv; Waermepumpe wird wegen Preis/PV-Strategie gehalten")
+                    str(heatpump_pause_request.get("reason") or "Quell-Erholung aktiv; Wärmepumpe wird wegen Preis/PV-Strategie gehalten")
                     if pv_pause_owner == "source_recovery_heatpump"
-                    else "Quell-Erholung aktiv; Waermepumpe wird wegen Preis/PV-Strategie gehalten"
+                    else "Quell-Erholung aktiv; Wärmepumpe wird wegen Preis/PV-Strategie gehalten"
                 )
             elif manual_heatpump_active or manual_ww_boost_active_export:
                 decision_state = "manuelle_waermefreigabe"
-                decision_reason = "Manuelle Waermefreigabe aktiv"
+                decision_reason = "Manuelle Wärmefreigabe aktiv"
             elif boost_active:
                 decision_state = "pv_waerme_aktiv" if heatpump_accepting_power else "pv_waerme_budget_frei"
                 decision_reason = (
-                    "PV-/Budget-Freigabe aktiv; Waermepumpe nimmt Leistung an"
+                    "PV-/Budget-Freigabe aktiv; Wärmepumpe nimmt Leistung an"
                     if heatpump_accepting_power
                     else (
                         "PV-/Budget-Freigabe angeboten; Wärmepumpe nimmt aktuell keine Leistung auf"
@@ -13740,10 +14474,10 @@ def main():
                 )
             elif predump_heatpump_targets_reached:
                 decision_state = "zieltemperatur_erreicht"
-                decision_reason = "Pre-Dump-Waermefreigabe blockiert: Zieltemperaturen erreicht"
+                decision_reason = "Pre-Dump-Wärmefreigabe blockiert: Zieltemperaturen erreicht"
             elif predump_heatpump_protect_block:
                 decision_state = "wq_schutz"
-                decision_reason = "Waermefreigabe blockiert: Waermequelle zu kalt"
+                decision_reason = "Wärmefreigabe blockiert: Wärmequelle zu kalt"
 
             energy_record = {
                 "ts": int(time.time()),
@@ -13842,7 +14576,7 @@ def main():
                     path=EMS_DECISION_LATEST_PATH,
                 )
             except Exception as exc:
-                logger.debug("EMS-Decision-Surface fuer Energy konnte nicht geschrieben werden: %s", exc)
+                logger.debug("EMS-Decision-Surface für Energy konnte nicht geschrieben werden: %s", exc)
 
             # --- Stündliches Datei-Backup (Ersatz für blockierte C++ system() Aufrufe) ---
             if now.minute == 2 and last_debug_archive_hour != now.hour:

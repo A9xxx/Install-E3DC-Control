@@ -1,14 +1,14 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.4.6d</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.5.0</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.4.6d**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.5.0**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
 
-Dieses Update ergänzt die begrenzte Phasenerkennung fester E3DC-Wallboxen, verbessert die Leistungszuteilung und schützt den Luxtronik-PV-Boost durch getrennte Aufträge und Energiegrenzen. Vor automatischem PV-Boost das elektrische Leistungsprofil und erlaubte Kontingente im Config Editor prüfen. Vor dem Docker-Upgrade zuerst den aktuellen Host-Updater und die Hinweise zu Volume-Sicherung und Rückfall in der [Docker-Dokumentation](doc/Docker_Dokumentation.md) beachten.
+Dieses Update bringt an der openWB Pro ein Startfenster je Stecksession, einen messbasierten einphasigen Stromdeckel mit Software-Nachweis der Phasenzuordnung und die Phasenhochschaltung nach evcc/openWB-Muster; in `PV-Kurve ruhig` begrenzt ein Akku-Wh-Konto die Stützung der Wallbox aus dem Hausspeicher. Der Speicher lädt bei zeitvariablen Tarifen zeitgerichtet bis zum Fensterende mit wählbarem Ladeprofil, der Bluelink-Client meldet sich mit Benutzer und Passwort an, ein zusätzlicher Wechselrichter kann per Modbus TCP ausgelesen werden, und Docker aktualisiert über den Update-Knopf oder zur eingestellten Uhrzeit per Watchtower-Signal. Vor dem Update die Hinweise in den [Release Notes](RELEASE_NOTES.md) beachten (Hausabsicherung `grid_max_amps` ausdrücklich eintragen, Konfigurations-Backup); vor dem Docker-Upgrade die Hinweise zu Volume-Sicherung und Rückfall in der [Docker-Dokumentation](doc/Docker_Dokumentation.md).
 
 Ein optionales Beispiel für einen zweiten Speicher liegt unter [E3DC-Slave](E3DC-Slave/README.md).
 
@@ -44,6 +44,8 @@ sondern eine eindeutige Auswahl verlangt.
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
 
+> **Neu in 5.5.0:** Startfenster, messbasierter einphasiger Stromdeckel und Phasenhochschaltung an der openWB Pro, Akku-Wh-Konto für die Wallbox-Stützung in `PV-Kurve ruhig`, zeitgerichtetes Netzladen des Speichers mit Ladeprofil, saisonaler Luxtronik-PV-Boost und Warmwasser sofort als Nutzerbefehl, Bluelink-Anmeldung mit Benutzer und Passwort, Zusatzwechselrichter per Modbus TCP, je Datei komprimierte Backups und Docker-Update per Watchtower-Signal. Einzelheiten und Betriebsgrenzen stehen in den [Release Notes](RELEASE_NOTES.md).
+
 > **Neu in 5.4.6d:** Eigene Compose-Dateien und Bind-Mounts, korrigiertes manuelles Speicherladen und zeitgerichtete Halteplanung, verständlichere Konfiguration sowie verbesserte Luxtronik-PV- und Warmwasserregelung. Einzelheiten und Betriebsgrenzen stehen in den [Release Notes](RELEASE_NOTES.md).
 
 > **Neu in 5.4.5d:** Docker startet wieder mit bestehenden Datenvolumes im Standardschutzmodus `2770`. Startprüfung und Rechteverwaltung berücksichtigen denselben konfigurierten Datenschutzmodus. Die Korrektur gilt auch ohne Wallbox; unsichere Dateizustände bleiben gesperrt. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
@@ -68,13 +70,13 @@ sondern eine eindeutige Auswahl verlangt.
 ### ⚡ Smart Charging & Luxtronik Energy Manager
 * **Multi-EV Support (Flotten-Management):** Das System unterstützt mehrere Fahrzeuge per Bluelink, MQTT, openWB-SoC oder manueller Vorlage. Auf der Wallbox-Seite werden Fahrzeuge direkt pro Wallbox zugeordnet, damit Akku, Ziel-SoC und Ladeleistung auch bei Wallboxen ohne Fahrzeugerkennung eindeutig passen.
 * **Dynamische Ladezeit-Berechnung:** Das Dashboard (und das Backend) berechnet durchgängig anhand der aktuellen Ladeleistung vollautomatisch die geschätzte Restdauer bis zum Erreichen von 100% sowie zum Ziel-SoC.
-* **Universal-Wallbox Integration:** Nativer, entkoppelter Python Wallbox Manager mit Dual-WB Support für E3DC, openWB/openWB Pro und go-e. openWB Pro wird direkt über `connect.php` als Aktuator geführt, normale openWB-Software bleibt sauber in Primary-/Secondary-Rollen getrennt. Die sichtbaren Modi sind `Aus`, `PV-Kurve ruhig`, `Grundladung stabil`, `PV + Akku bis Untergrenze`, `Sofort bis Preislimit` und `Akku bis Abfahrt`; geplantes Netzladen greift in allen aktiven Modi und bleibt bei `Aus` gesperrt, spontane Marktfreigaben für Wallbox-Netzladen benötigen dagegen `Sofort bis Preislimit`. Im Beobachten-Modus kann der Storage Manager optional nur den Hausspeicher bis zur Untergrenze führen, ohne Wallbox-Befehle zu senden.
+* **Universal-Wallbox Integration:** Nativer, entkoppelter Python Wallbox Manager mit Dual-WB Support für E3DC, openWB/openWB Pro und go-e. openWB Pro wird direkt über `connect.php` als Aktuator geführt, normale openWB-Software bleibt sauber in Primary-/Secondary-Rollen getrennt. Die sichtbaren Modi sind `Aus`, `PV-Kurve ruhig`, `Grundladung stabil`, `PV + Akku bis Untergrenze`, `Sofort bis Preislimit` und `Akku bis Abfahrt`; geplantes Netzladen greift in allen aktiven Modi und bleibt bei `Aus` gesperrt, spontane Marktfreigaben für Wallbox-Netzladen benötigen dagegen `Sofort bis Preislimit`. Im Beobachten-Modus kann der Storage Manager optional nur den Hausspeicher bis zur Untergrenze führen, ohne Wallbox-Befehle zu senden. An der openWB Pro hält ein Startfenster das erste Stromangebot über kurze Budget-Einbrüche hinweg stabil, ein messbasierter einphasiger Stromdeckel gibt mehr als 20 A erst nach dem Software-Nachweis der Phasenzuordnung frei, und geplante Ladefenster mit fester Startuhrzeit können täglich wiederholt werden. Details: [Native Wallbox](doc/Native_Wallbox.md).
 * **V2H/V2G-Vorbereitung (read-only):** Bidirektionale Wallboxleistung und gemeldete Fähigkeitsdaten werden erkannt und angezeigt. Eine aktive V2H-/V2G-Steuerung oder SoC-Abschaltung ist derzeit nicht freigegeben. Details: [V2H/V2G-Status](doc/V2x_Dokumentation.md).
 * **Intelligenter SoC- und Reichweiten-Sync:** Verzichtest du auf eine direkte Fahrzeuganbindung, kann der **SoC des Fahrzeugs am Dashboard manuell übermittelt werden**. Das System rechnet (interpoliert) ab dann vollautomatisch im Hintergrund die eingeladene Energie ein. Eine aktuell von openWB gemeldete Gesamtreichweite hat Vorrang; nur wenn dieser Wert fehlt, veraltet oder nicht zur aktuellen Fahrzeugidentität passt, berechnet E3DC-Control die Restreichweite aus Akku-Kapazität und hinterlegtem Verbrauch.
 * **Universal Wärmepumpen-Integration:** Native Anbindung für **Luxtronik** (WebSocket), **IDM-Wärmepumpen** (Modbus-TCP) und **Stiebel Eltron ISG/WPM** (read-only Live-Daten). IDM kann mit PV-Überschuss und konfigurierbarer Leistungsobergrenze ruhig als Grundlast laufen; Stiebel liefert Livewerte und nutzt optional einen externen Shelly-Leistungsmesser für die elektrische Live-Leistung in Dashboard/R5. SG-Ready per WLAN-Shelly bleibt als robuste Freigabe für andere Marken verfügbar. Details: [Stiebel-Eltron-ISG-Dokumentation](doc/Stiebel_Eltron_ISG.md).
 * **Storage Simulator & adaptive Ladekurve:** Die Anlage plant vollautomatisch voraus. Wetterprognosen, saisonaler Nachtverbrauch, EPEX/Eco-Score und optionales Mittagsziel erzeugen eine geglättete Soll-SoC-Kurve. Der Storage Manager führt die Kurve weich über `iFc`, Kontroll-SoC und gedämpften Aufholbedarf; [Pre-Dump](doc/Pre_Dump.md) schafft vor Kurvenstart Platz gegen Abregelung. Die Abregelreserve hält an passenden Hochleistungs-/Cloud-Edge-Tagen Speicherplatz für PV-Spitzen frei, ohne echten Netz-/WR-Abregeldruck zu blockieren. Der optionale [Unwetterwächter](doc/Unwetterwaechter.md) kann DWD-Warnungen als Kurvenanker oder Nachtreserve berücksichtigen; Speicher-Netzladen und Speicher-Halten im normalen Marktpfad bleiben getrennte, standardmäßig ausgeschaltete Opt-ins und werden beim Ausführen erneut gegen die aktuelle Freigabe geprüft. Zusätzlich blockiert `PV-autark zuerst` den normalen Marktpfad, wenn Speicher plus erwartete PV den restlichen Horizont decken; fällt der SOC unter die Low-SOC-Schwelle, darf ein bewusst freigegebener Speicherpfad wieder wirtschaftlich prüfen. Live-PV und Netzexport haben beim normalen Markt-Netzladen Ausführungsvorrang: dann wartet der Marktpfad in AUTO, statt GRID vorzuziehen.
 * **Dynamische Preisquellen:** SMARD bleibt die Standardquelle für Börsenstrompreise. Optional kann ein ENTSO-E-Token als 15-Minuten-Fallback hinterlegt werden; danach bleibt aWATTar der grobe Stundenfallback. Einzelheiten stehen in der [Börsenpreis-Optimierung](doc/Boersenpreis_Optimierung.md).
-* **E3/DC-PV-Ladebegrenzung:** Kurvenladung und DV-PV-Speichern können optional auf die frisch ermittelte E3/DC-PV-Leistung begrenzt werden. E3/DC bleibt dabei in AUTO, die Hausversorgung darf jederzeit entladen und zusätzliche AC-PV erhöht den flüchtigen Laderahmen nicht. Bei fehlendem gültigem PV-Split werden diese PV-basierten Ladepfade sicher auf 0 W begrenzt; Preis- und ausdrücklich freigegebenes Netzladen bleiben eigenständig.
+* **E3/DC-PV-Ladebegrenzung:** Kurvenladung und DV-PV-Speichern können optional auf die frisch ermittelte E3/DC-PV-Leistung begrenzt werden. E3/DC bleibt dabei in AUTO, die Hausversorgung darf jederzeit entladen und zusätzliche AC-PV erhöht den flüchtigen Laderahmen nicht; nur bei gefährdetem Ladeziel darf der Speicher auch aus zusätzlicher AC-PV laden. Bei fehlendem gültigem PV-Split werden diese PV-basierten Ladepfade sicher auf 0 W begrenzt; Preis- und ausdrücklich freigegebenes Netzladen bleiben eigenständig.
 * **Optionale AC-Speicherroute:** Energie eines zusätzlichen AC-Wechselrichters kann getrennt für Reserve oder wirtschaftliches Speichern freigegeben werden. Standard ist `Aus`; E3/DC-DC bleibt vorrangig, Netzladen wird nicht freigegeben und fehlende Topologie- oder Unterdeckungsnachweise sperren den Pfad.
 * **Peak Shaving am Netzbezug:** Die optionale Lastspitzenbegrenzung schützt feste Zähler-Viertelstunden mit Sicherheitsabstand, Leistungs- und SoC-Hysterese, Messlückenkontrolle und einem Speicherpuffer oberhalb der Notstromreserve. Eine Netz-Nachladung dieses Puffers benötigt eine eigene ausdrückliche Freigabe.
 * **PV-Prognosediagnose:** Ein standardmäßig ausgeschalteter, rein lesender Diagnosedienst kann E3/DC-DC-Prognosen mit abgeschlossenen nativen 15-Minuten-Historienslots vergleichen. Die Werte bleiben Diagnose, wirken weder auf Modelle noch Regelung zurück und liegen privat außerhalb des Webverzeichnisses. PV-Flächen, Wechselrichtergruppen und Provider-Bindungen werden als versionierter Topologievertrag verwaltet. Details: [PV-Prognose](doc/PV_Prognose_Berechnung.md).
@@ -104,10 +106,10 @@ sondern eine eindeutige Auswahl verlangt.
 * **Betriebswartung:** Log-Rotation sowie ein Zielbestand von maximal drei verifizierten Update-Backup-Familien und separat maximal drei Web-Installer-Sicherungen reduzieren den Speicherbedarf. Aktive Schutzbindungen können den Zielbestand vorübergehend überschreiten. Die reine Rechtereparatur korrigiert nur Besitzer, Gruppe und Modus bekannter Pfade; sie erstellt kein Backup, ersetzt keine Inhalte und startet keine Dienste. Systemzustand und freier Speicher bleiben zu überwachen.
 
 ### 🔄 Auto-Update & Rollback
-* **Ein gemeinsamer Updateauftrag:** Web-Dashboard, Konsole und Installer-Menü starten denselben root-eigenen Hintergrundjob. Direkter Ziel-Updater und Installationszentrale verwenden `/run/lock/e3dc-control/update.lock`; sichere root-eigene Altmodi `0755`/`0644` werden vor jeder Mutation auf `0700`/`0600` normalisiert. Ein unsicherer Knoten bricht vor Produkt- und Dienständerungen kontrolliert ab, ein belegter Lock fordert zum Warten auf. Die automatische Prüfung verwendet dieselbe Stable-Quelle und informiert über einen neuen Stand, startet ihn aber nicht ungefragt. Lokales Git ist keine Updateautorität; der Ziel-Updater vergleicht die tatsächlich betriebenen Produktinhalte jedoch rein lesend mit dem veröffentlichten Altstand. Würden lokale Änderungen überschrieben oder freigegebene Altdateien gelöscht, nennt er die genaue Liste und verlangt eine daran gebundene Bestätigung. Danach erstellt er das Backup, ersetzt den Programmstand und prüft den Wiederanlauf.
+* **Ein gemeinsamer Updateauftrag:** Web-Dashboard, Konsole und Installer-Menü starten denselben root-eigenen Hintergrundjob. Direkter Ziel-Updater und Installationszentrale verwenden `/run/lock/e3dc-control/update.lock`; sichere root-eigene Altmodi `0755`/`0644` werden vor jeder Mutation auf `0700`/`0600` normalisiert. Ein unsicherer Knoten bricht vor Produkt- und Dienständerungen kontrolliert ab, ein belegter Lock fordert zum Warten auf. Die automatische Updateprüfung (Config-Editor „Update-Hinweis“, `check_updates`) verwendet dieselbe Stable-Quelle und zeigt einen neuen Stand nur an; sie startet ihn nicht. Das **Auto-Update** (`auto_update_enable` mit `auto_update_time`) im Config-Editor führt ein gefundenes Update täglich zur eingestellten Uhrzeit aus: auf Bare Metal startet es denselben root-eigenen Hintergrundjob, in Docker gibt es dem Watchtower-Dienst das Signal für Pull und Neuerstellung (siehe unten „GHCR-Updates einspielen“). Auf Bare Metal wertet der Wärmepumpen-Manager (`energy_manager`) diese Uhrzeit aus; ohne diesen Dienst startet dort kein Auto-Update. Lokales Git ist keine Updateautorität; der Ziel-Updater vergleicht die tatsächlich betriebenen Produktinhalte jedoch rein lesend mit dem veröffentlichten Altstand. Würden lokale Änderungen überschrieben oder freigegebene Altdateien gelöscht, nennt er die genaue Liste und verlangt eine daran gebundene Bestätigung. Danach erstellt er das Backup, ersetzt den Programmstand und prüft den Wiederanlauf.
 * **Ein-Datei-Bootstrap für Altinstallationen:** `e3dc-update-bootstrap` wird an einen beliebigen Ort auf den Raspberry Pi kopiert und mit `sudo /bin/sh ./e3dc-update-bootstrap` gestartet. Der veröffentlichte Updatepfad ermittelt Installationsordner, Installationsbenutzer und Rolle selbst, arbeitet als systemd-Auftrag im Hintergrund und führt den vorhandenen Alt-Updater nicht aus. Der genaue Ablauf und die verbleibenden echten Stop-Gründe stehen in [doc/Update.md](doc/Update.md).
 * **Optionale Updateprüfung:** Das System kann nachts nach einem freigegebenen Stable-Stand suchen und ihn im Dashboard anzeigen.
-* **Umgebungsgebundener Rückfall:** Docker kann auf das in `UPDATE_POLICY.json` exakt gebundene Image `v5.3.2b` zurückgesetzt werden. Bare-Metal-Installationen bieten für diesen Altstand keinen Programm-Rückfall an; verifizierte Datei-Backups bleiben wiederherstellbar.
+* **Umgebungsgebundener Rückfall:** Docker kann über den Host-Helfer auf das in `UPDATE_POLICY.json` exakt gebundene Root-Image `v5.3.2b` zurückgesetzt werden; zwischen Runtime-Images, etwa von 5.5.0 zurück auf 5.4.6d, wird auf dem Host per `E3DC_IMAGE_TAG` gewechselt ([Rollback](doc/Rollback.md)). Bare-Metal-Installationen bieten für den Altstand `v5.3.2b` keinen Programm-Rückfall an; verifizierte Datei-Backups bleiben wiederherstellbar.
 
 ## 💬 Community & Support
 
@@ -347,8 +349,19 @@ folgende Normalstart baut **kein** lokales Image.
 
 ### Schritt 3: Container aus dem GHCR-Image starten
 ```bash
-sudo python3 ./Installer/docker_compose_update.py --compose-dir . --sudo
+sudo docker compose up -d
 sudo docker compose logs --tail=80 e3dc-control
+```
+
+Damit der Knopf **System Update** in der Weboberfläche und das Auto-Update im
+Config-Editor funktionieren, einmalig den Watchtower-Dienst freischalten
+(Token für beide Dienste in `.env`, Container mit Token neu erstellen,
+Watchtower starten):
+
+```bash
+printf 'E3DC_WATCHTOWER_API_TOKEN=%s\n' "$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> .env
+sudo docker compose up -d
+sudo docker compose --profile auto-update up -d watchtower
 ```
 
 Die mitgelieferte Compose-Datei verwendet
@@ -482,76 +495,63 @@ vollständigen Namen, beispielsweise `registry.example/username/e3dc-control:tag
 
 ### GHCR-Updates einspielen
 
-Vor dem Imagewechsel den tatsächlich verwendeten Host-Updater aktualisieren,
-einschließlich einer gegebenenfalls bevorzugten Kopie direkt im Compose-Ordner.
-Das Containerimage ersetzt diese Hostdatei nicht. Ein Rückfall auf ältere
-Root-Images benötigt den aktuellen Helfer für die private Rückmigration.
-Aus dem Bridge-Betrieb zuerst dieselbe aktuelle Runtime-Version im Hostprofil
-wiederherstellen und ihren gesunden Start prüfen; erst danach das ältere
-Root-Image über den Host-Updater wählen. Die vollständige Reihenfolge steht
-in der [Docker-Dokumentation](doc/Docker_Dokumentation.md).
+**Über die Weboberfläche:** Der Knopf **System Update** zeigt ein verfügbares
+Release an und gibt Watchtower das Signal, das neue Image zu laden und den
+Container neu zu erstellen; die Oberfläche lädt nach dem Start neu. Mit
+**Auto-Update** im Config-Editor passiert dasselbe täglich zur eingestellten
+Uhrzeit. Der Container steuert den Docker-Daemon dabei nie selbst; Watchtower
+handelt ausschließlich auf dieses Signal und respektiert einen Pin in `.env`.
+Voraussetzung ist die einmalige Freischaltung aus Schritt 3.
+
+Der Knopf steht ab 5.5.0 zur Verfügung. Das Update von 5.4.x auf 5.5.0 erfolgt
+noch über den Host-Weg; ab dem nächsten Release genügt der Knopf. Die Schritte
+stehen in der [Docker-Dokumentation](doc/Docker_Dokumentation.md) unter
+„Übergang von 5.4.x auf 5.5.0“. Der Knopf aktualisiert nur Container, deren
+Image aus der Registry (`ghcr.io/a9xxx/install-e3dc-control`) gezogen wurde.
+Ein selbst gebautes Image wird von Watchtower nicht geprüft; dann gelten die
+Host-Befehle `docker compose pull` / `up -d` bzw. der eigene Build.
+
+**Auf dem Docker-Host** (ohne Watchtower oder zur Kontrolle):
 
 ```bash
 cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
-if [ -f ./docker_compose_update.py ]; then
-  E3DC_DOCKER_HELPER=./docker_compose_update.py
-elif [ -f ./Installer/docker_compose_update.py ]; then
-  E3DC_DOCKER_HELPER=./Installer/docker_compose_update.py
-else
-  echo "docker_compose_update.py fehlt; aktuellen Release-Verwaltungsbaum bereitstellen." >&2
-  exit 2
-fi
-sudo python3 "$E3DC_DOCKER_HELPER" --compose-dir . --sudo
+sudo docker compose pull
+sudo docker compose up -d
 sudo docker compose logs --tail=80 e3dc-control
 ```
 > Die mitgelieferte Compose-Datei verwendet
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
-> bei `pull` absichtlich nicht; für einen bewussten Pin wird
-> `E3DC_IMAGE_TAG=v5.4.6d` in `.env` gesetzt. `config --images` zeigt vor dem
-> Pull das tatsächlich gewählte Image.
->
-> Vor dem `pull` prüft der Helfer mindestens 2 GiB freien Platz im
-> DockerRootDir. Ein fehlgeschlagener `pull` ist ein harter Abbruch und löscht
-> keine Volumes. Nach begonnenem Kandidatenstart stoppt der Helfer bei jedem
-> Fehler den Kandidaten, stellt Compose-Preimage und belegtes Ausgangsimage
-> wieder her und prüft den Rückstart. Erst gezogene Image-ID, OCI-Version,
-> gestartete `VERSION` und zwei identische gesunde Snapshots bestätigen den
-> Wechsel.
+> bei `pull` absichtlich nicht; für einen bewussten Pin oder Rückfall wird
+> `E3DC_IMAGE_TAG=v5.5.0` in `.env` gesetzt und `sudo docker compose up -d`
+> ausgeführt. `config --images` zeigt vor dem Pull das tatsächlich gewählte
+> Image.
 
-Fehlt der Host-Helfer in einer älteren Docker-Installation, lege daneben einen
-frischen Checkout des veröffentlichten `main` als Verwaltungsbaum an und rufe
-dessen `Installer/docker_compose_update.py` mit `--compose-dir` für das
-bestehende `e3dc-docker`-Verzeichnis auf. Der Helfer migriert ausschließlich
-die semantisch gebundene offizielle 5.3.2b-Compose-Datei, unveränderte
-offizielle Compose-Dateien aus 5.4.2 bis 5.4.2d sowie die bekannte
-Installer-Bind-Mount-Variante atomar, also ganz oder gar nicht. `.env` und die
-vorhandenen Daten-, Log-, ML- und Forecast-Quellen bleiben unverändert. Einen
-alten Watchtower stoppt und prüft er vor Migration und Pull; er bleibt danach
-aus und darf nur über den unten beschriebenen ausdrücklichen Opt-in wieder
-aktiviert werden. Ältere, angepasste, per Override ergänzte oder mehrdeutige
-Compose-Stände bleiben unverändert gesperrt und benötigen eine manuelle Prüfung.
-
-Automatische Updates über Watchtower sind bewusst kein Standardstart. Das
-Upstream-Projekt wird nicht mehr gepflegt; zudem benötigt der Dienst für
-Container-Updates weitreichenden Zugriff auf den Docker-Socket des Hosts. Er
-bleibt nur für bestehende Installationen im Compose-Profil `auto-update`.
-Das Enable-Label ist mit `${E3DC_WATCHTOWER_ENABLE:-false}` ebenfalls
-standardmäßig falsch. Wer diese Risiken bewusst akzeptiert, setzt zuerst in
-`.env` exakt `E3DC_WATCHTOWER_ENABLE=true`, projiziert den Hauptcontainer mit
-dem sicheren Host-Helfer neu und startet danach Watchtower:
+**Geprüfter Weg mit automatischem Rückfall:** Der Host-Helfer
+`Installer/docker_compose_update.py` prüft vor dem Pull mindestens 2 GiB
+freien Platz, bindet Image-ID und OCI-Version, wartet auf den Healthcheck und
+stellt bei jedem Fehler den bisherigen Stand wieder her. Er ist Pflicht für
+5.3.2b-Altbestände (Compose-Migration auf die fünf Volumes) und für den
+Rückfall von einem Runtime-Image auf ein älteres Root-Image (private
+Rückmigration). Einen laufenden Watchtower vorher stoppen:
+`sudo docker compose --profile auto-update stop watchtower`.
 
 ```bash
-printf '%s\n' 'E3DC_WATCHTOWER_ENABLE=true' >> .env
 sudo python3 ./Installer/docker_compose_update.py --compose-dir . --sudo
-docker compose --profile auto-update up -d watchtower
 ```
 
-Ohne diesen ausdrücklichen Opt-in startet `docker compose up -d --wait --wait-timeout 300 e3dc-control` nur
-E3DC-Control. Ein bereits aus einer älteren Compose-Datei laufender
-Watchtower wird einmalig mit
-`docker compose --profile auto-update stop watchtower && docker compose --profile auto-update rm -f watchtower`
-deaktiviert.
+**Watchtower:** Das ursprüngliche `containrrr/watchtower` ist seit Dezember
+2025 archiviert; die Compose-Vorlage verwendet den gepflegten Fork
+`ghcr.io/nicholas-fedor/watchtower:1`. Er läuft nur im Compose-Profil
+`auto-update`, benötigt Zugriff auf den Docker-Socket des Hosts und prüft
+Images nicht von sich aus: Ohne Signal aus E3DC-Control passiert nichts.
+Wer den Container von Watchtower ausnehmen will, setzt
+`E3DC_WATCHTOWER_ENABLE=false` in `.env` und erstellt ihn neu. Ein Watchtower
+aus einer älteren Compose-Datei wird mit
+`sudo docker compose --profile auto-update up -d watchtower` auf die neue
+Vorlage gebracht oder mit
+`sudo docker compose --profile auto-update stop watchtower && sudo docker compose --profile auto-update rm -f watchtower`
+entfernt.
 
 > **Wichtig bei zusätzlichen Code-Volumes:** Ein lokales Verzeichnis unter
 > `/app/pi/Install` überschreibt den Release-Code aus dem Docker-Image. Für den

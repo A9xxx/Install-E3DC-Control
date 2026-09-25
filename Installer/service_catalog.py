@@ -450,7 +450,8 @@ MODULES: dict[str, ServiceModule] = {
         log_file="/var/www/html/logs/bluelink_client.log",
         alive_file="/var/www/html/ramdisk/vehicles.json",
         alive_max_age_s=600,
-        config_keys=("bluelink_refresh_token", "bluelink_vin", "bluelink_car_name", "bluelink_interval"),
+        # Benutzer/Passwort/PIN statt Refresh-Token.
+        config_keys=("bluelink_user", "bluelink_password", "bluelink_pin", "bluelink_brand", "bluelink_vin", "bluelink_car_name", "bluelink_interval"),
         required_config_keys=(),
         optional=True,
         actions=READ_ACTIONS + SERVICE_ACTIONS,

@@ -59,6 +59,7 @@ def _phase_powers(status):
 
 def _clear_candidate(state):
     state["stable_6a_since_s"] = None
+    state["stable_current_amp"] = None
     state["candidate_since_s"] = None
     state["candidate_mask"] = []
     state["candidate_samples"] = 0
@@ -253,15 +254,33 @@ def update_fixed_phase_session(
             reason = "session_phase_confirmation_preserved"
         return result()
 
-    stable_power = bool(mask and all(900.0 <= powers[index - 1] <= 1800.0 for index in mask))
-    if amp is None or abs(amp - 6.0) > 0.25 or not stable_power:
+    # Das kurze 6-A-Startfenster ist nicht der einzige mögliche Messbeleg.
+    # Auch eine später stabil laufende Ladung kann die Phasen bestätigen.
+    # Dazu muss jede belastete Phase zur Vorgabe passen: Das bisherige
+    # Leistungsband bei 6 A wird proportional mit dem Strom skaliert.
+    six_amp = bool(amp is not None and abs(amp - 6.0) <= 0.25)
+    measurement_amp = 6.0 if six_amp else amp
+    stable_power = bool(
+        measurement_amp is not None and measurement_amp >= 6.0
+        and mask and all(150.0 * measurement_amp <= powers[index - 1]
+                         <= 300.0 * measurement_amp for index in mask)
+    )
+    if not stable_power:
         _clear_candidate(state)
-        reason = "waiting_for_stable_6a_load"
+        reason = ("waiting_for_stable_running_load" if amp is not None and amp > 6.25
+                  else "waiting_for_stable_6a_load")
         return result()
+    previous_amp = _number(state.get("stable_current_amp"))
+    if previous_amp is None or abs(measurement_amp - previous_amp) > 0.25:
+        # Eine Stromrampe darf Einschwingzeit und Messbelege nicht addieren.
+        _clear_candidate(state)
+        state["stable_current_amp"] = measurement_amp
+    # Feldname bleibt für bestehende Checkpoints kompatibel; der Zeitanker
+    # gilt jetzt auch für eine nachträglich erkannte stabile Stromvorgabe.
     if state.get("stable_6a_since_s") is None:
         state["stable_6a_since_s"] = now
     if now - float(state["stable_6a_since_s"]) < max(0.0, float(settle_s)):
-        reason = "six_amp_start_settling"
+        reason = "six_amp_start_settling" if six_amp else "running_current_settling"
         return result()
     reference = state.get("candidate_reference_w") or []
     comparable = bool(
@@ -282,7 +301,7 @@ def update_fixed_phase_session(
     ):
         state["confirmed_phases"] = observed
         state["confirmed_mask"] = mask
-        reason = "stable_6a_phase_confirmation"
+        reason = "stable_6a_phase_confirmation" if six_amp else "stable_running_phase_confirmation"
     else:
-        reason = "collecting_stable_6a_samples"
+        reason = "collecting_stable_6a_samples" if six_amp else "collecting_stable_running_samples"
     return result()

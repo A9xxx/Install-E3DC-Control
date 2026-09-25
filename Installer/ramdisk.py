@@ -1099,9 +1099,12 @@ def setup_ramdisk():
         if not _restore_legacy_unit_prestate(legacy_transaction):
             print("  ✗ Legacy-Unit-Prestate konnte nicht restauriert werden.")
         return False
+    # 64 MiB: Luxtronik-Historie (8 MiB Cap), Tageshistorie, Speicherplan und
+    # Prognosen belegen zusammen bereits über 20 MiB; ein volles tmpfs würde alle
+    # Writer gleichzeitig stoppen. Das Update migriert einen bestehenden 32M-Eintrag.
     fstab_entry = (
         f"tmpfs {RAMDISK_PATH} tmpfs "
-        f"nodev,nosuid,size=32M,uid={user_uid},gid={www_data_gid},mode=2775 0 0"
+        f"nodev,nosuid,size=64M,uid={user_uid},gid={www_data_gid},mode=2775 0 0"
     )
     
     fstab_transaction = None

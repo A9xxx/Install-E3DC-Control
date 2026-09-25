@@ -72,6 +72,13 @@ try:
 except Exception:
     from reserve import effective_ep_reserve_pct
 
+# MODE_GRID des Storage Managers (eine Quelle) für die Lesung des laufenden
+# Markt-Netzladevorgangs aus dem Zustandsfile.
+try:
+    from .storage_parallel_regulator import MODE_GRID as STORAGE_MANAGER_MODE_GRID
+except Exception:
+    from storage_parallel_regulator import MODE_GRID as STORAGE_MANAGER_MODE_GRID
+
 try:
     from Wallbox.modes import MODE_OFF, MODE_TARGET, normalize_wb_mode
 except Exception:
@@ -113,6 +120,8 @@ ACTION_PROJECTION_FILE = os.path.join(
     "storage_plan_action_projection.json",
 )
 DIRECT_MARKETING_REPORT_FILE = os.path.join(RAMDISK_DIR, "direct_marketing_daily_report.json")
+# Zustandsfile des Storage Managers (beobachtete Markt-Ladeleistung, nur Planung).
+STORAGE_MANAGER_STATE_FILE = os.path.join(RAMDISK_DIR, "storage_manager_state.json")
 WB_INTENT_FILE = os.path.join(RAMDISK_DIR, "wallbox_storage_intent.json")
 HISTORY_DIR = "/var/www/html/data/history_backups"
 EMERGENCY_CURVE_FILE = os.path.join(RAMDISK_DIR, "storage_emergency_curve.json")
@@ -622,6 +631,111 @@ def historical_curve_start_soc(start_soc, first_anchor_soc):
     return min(start, anchor)
 
 
+# Alterung der beobachteten Ladeleistung (wie storage_manager.
+# MARKET_OBSERVED_CHARGE_MAX_AGE_S) und Frische des Zustandsfiles für die Lesung des laufenden Vorgangs
+# (Regelzyklus 3–10 s; stale -> kein laufender Vorgang, fail-closed = Mindestjob gilt).
+MARKET_OBSERVED_CHARGE_MAX_AGE_S = 7 * 86400.0
+MARKET_RUNNING_GRID_STATE_MAX_AGE_S = 120.0
+
+
+def _read_storage_manager_state(path=None):
+    state_path = STORAGE_MANAGER_STATE_FILE if path is None else str(path)
+    try:
+        if not os.path.exists(state_path):
+            return None
+        with open(state_path, "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+        return state if isinstance(state, dict) else None
+    except Exception:
+        return None
+
+
+def read_market_observed_charge_w(path=None, now_s=None):
+    """Beobachtete Batterieladeleistung (EWMA) des Storage Managers im Markt-Netzladen.
+
+    Rückgabe int W (>= 300) oder None (kein Zustandsfile, kein Wert, unplausibel). Der Wert deckelt nur die
+    Planung (Ladedauer, spätester Start); fehlt er, plant der Planer mit der konfigurierten Ladeleistung.
+    Älter als 7 Tage (market_grid_observed_charge_ts) -> None.
+    """
+    state = _read_storage_manager_state(path)
+    if state is None:
+        return None
+    try:
+        raw = state.get("market_grid_observed_charge_w")
+        value_w = int(round(float(raw)))
+        if value_w < 300 or value_w > 200000:
+            return None
+        value_ts = float(state.get("market_grid_observed_charge_ts") or 0.0)
+        reference_s = float(time.time() if now_s is None else now_s)
+        if value_ts > 0.0 and reference_s - value_ts > MARKET_OBSERVED_CHARGE_MAX_AGE_S:
+            return None
+        return value_w
+    except Exception:
+        return None
+
+
+def read_market_running_grid_window_end_ts(path=None, now_s=None):
+    """Fensterende (ms) eines laufenden Markt-Netzladevorgangs des Storage
+    Managers (state market_grid_charge, mode MODE_GRID, Zustandsfile frisch), sonst None. Der Planer lässt den
+    Job in diesem Fenster ohne Mindestjob bis zum Ziel weiterlaufen; fehlende oder alte Daten sind kein Beleg.
+    """
+    state = _read_storage_manager_state(path)
+    if state is None:
+        return None
+    try:
+        if str(state.get("state") or "") != "market_grid_charge":
+            return None
+        if int(float(state.get("mode"))) != int(STORAGE_MANAGER_MODE_GRID):
+            return None
+        state_ts = float(state.get("ts") or 0.0)
+        reference_s = float(time.time() if now_s is None else now_s)
+        if state_ts <= 0.0 or reference_s - state_ts > MARKET_RUNNING_GRID_STATE_MAX_AGE_S:
+            return None
+        window_end_ms = int(float(state.get("market_late_fill_window_end_ts") or 0))
+        if window_end_ms <= 0 or window_end_ms <= int(reference_s * 1000.0):
+            return None
+        return window_end_ms
+    except Exception:
+        return None
+
+
+def read_market_window_reference(path=None, now_s=None):
+    """Gebundene Fensterreferenz (market_plan.window_reference) aus dem
+    letzten storage_plan.json lesen und dem Planer zurückreichen, damit die Referenz je Fenster (Identität =
+    Fensterende) über die Replans gehalten wird. Fail-closed: fehlende Datei/Feld, unvollständige oder unplausible
+    Werte, vergangenes Fensterende, Bindung in der Zukunft (> 60 s) oder älter als der Planungshorizont -> None
+    (der Planer bindet neu). Der Planer prüft Fensterende, Tarif und Fensterschlüssel selbst noch einmal.
+    """
+    plan_path = OUTPUT_FILE if path is None else str(path)
+    try:
+        if not os.path.exists(plan_path):
+            return None
+        with open(plan_path, "r", encoding="utf-8") as handle:
+            plan = json.load(handle)
+        market_plan = plan.get("market_plan") if isinstance(plan, dict) else None
+        state = market_plan.get("window_reference") if isinstance(market_plan, dict) else None
+        if not isinstance(state, dict):
+            return None
+        window_end_ms = int(float(state.get("window_end_ts") or 0))
+        ref_ct = float(state.get("ref_ct"))
+        bound_ms = int(float(state.get("bound_ts") or 0))
+        now_ms = int(float(time.time() if now_s is None else now_s) * 1000.0)
+        if not math.isfinite(ref_ct):
+            return None
+        if window_end_ms <= now_ms or bound_ms <= 0 or bound_ms > now_ms + 60_000 or now_ms - bound_ms > MARKET_HORIZON_MS:
+            return None
+        return {
+            "window_end_ts": window_end_ms,
+            "ref_ct": ref_ct,
+            "bound_ts": bound_ms,
+            "tariff": str(state.get("tariff") or ""),
+            "low_key": str(state.get("low_key") or ""),
+            "slots": int(float(state.get("slots") or 0)),
+        }
+    except Exception:
+        return None
+
+
 def check_awattar(epex_slots, current_soc, target_soc, v4_config):
     """
     Vereinfachte Python-Version von Eba's CheckaWATTar() aus awattar.cpp.
@@ -1025,7 +1139,7 @@ class StorageSimulator:
         adaptive_headroom["manual_anchor_active"] = False
 
         if mode not in ("charge", "discharge") or raw_anchor_soc < 0.0:
-            adaptive_headroom["manual_anchor_reason"] = "ungueltiger manueller Anker"
+            adaptive_headroom["manual_anchor_reason"] = "ungültiger manueller Anker"
             return adaptive_headroom
         if now > hold_until:
             adaptive_headroom["manual_anchor_reason"] = "Manuelles Anker-Haltefenster ist abgelaufen"
@@ -1045,7 +1159,7 @@ class StorageSimulator:
         adaptive_headroom["manual_anchor_forecast_need_wh"] = round(needed_wh, 0)
         if capacity > 0.0 and forecast_surplus + 1.0 < needed_wh:
             adaptive_headroom["manual_anchor_reason"] = (
-                "Restprognose %.0fWh reicht fuer manuellen Anker nicht sicher aus" % forecast_surplus
+                "Restprognose %.0fWh reicht für manuellen Anker nicht sicher aus" % forecast_surplus
             )
             return adaptive_headroom
 
@@ -1103,7 +1217,7 @@ class StorageSimulator:
         adaptive_headroom["manual_anchor_hold_until_ts"] = int(hold_until)
         adaptive_headroom["manual_anchor_adjusted_points"] = int(changed)
         adaptive_headroom["manual_anchor_reason"] = (
-            "Manueller %s-Anker %.1f%% prognosebegrenzt fuer %.1fh uebernommen"
+            "Manueller %s-Anker %.1f%% prognosebegrenzt für %.1fh übernommen"
             % ("Lade" if mode == "charge" else "Entlade", anchor_soc, hold_h)
         )
         return adaptive_headroom
@@ -1395,6 +1509,127 @@ class StorageSimulator:
         if start_ts <= 0.0 or end_ts <= start_ts:
             return int(end_ts or 0)
         return int(max(start_ts + 3600000.0, end_ts - offset))
+
+    # Später Vollstand nur mit Grund. Eintritt Abregeldruck ab 300 Wh (Relevanzschwelle
+    # wie Pre-Dump und adaptiver Headroom).
+    # Einspeiselimit nur, wenn es bindet (Limit < PV-Spitze des Kurventags minus sichere Grundlast
+    # 300 W wie in der Druckrechnung). Abregeldruck und bindendes Einspeiselimit gelten nach dem Eintritt bis zum Ende
+    # des Kurventags (Vorplan desselben Tags trug den Grund): Die Timeline beginnt mit der aktuellen Stunde, Restdruck
+    # und Rest-PV-Spitze sinken am Nachmittag zwangsläufig; ohne Halten wechselte die Politik täglich mit Reset.
+    FORECAST100_LATE_FULL_PRESSURE_ENTER_WH = 300.0
+    FORECAST100_LATE_FULL_SAFE_LOAD_W = 300.0
+
+    @staticmethod
+    def _forecast100_late_full_reason(
+        guard_enabled,
+        configured_export_limit_w,
+        pressure_wh,
+        direct_marketing_enabled,
+        predump_active,
+        previous_reason="",
+        pv_peak_w=None,
+    ):
+        """Grund für das späte Forecast-100-Kurvenende (PV-Ende minus Puffer).
+
+        Das späte Ende hält Speicherplatz frei und lohnt sich nur, wenn sonst abgeregelt würde oder Energie gezielt
+        verschoben wird: bindendes Einspeiselimit, vermeidbarer Abregeldruck im Plan, aktive Direktvermarktung
+        oder Pre-Dump. Ohne Grund gilt das konservative Ende (letzter nutzbarer Überschuss minus Puffer), damit
+        Überschuss mittags in den Speicher statt ins Netz geht. pressure_wh None = Druck nicht berechenbar ->
+        bisheriges spätes Ende (kein stiller Wechsel). Ein gemeldetes E3DC-Derating ist kein Einspeiselimit-Grund
+        (jede Anlage meldet es); es wirkt nur über den Abregeldruck.
+        Einspeiselimit zählt nur, wenn es unter pv_peak_w minus sicherer Grundlast liegt (ein Limit
+        oberhalb jeder erreichbaren PV-Leistung regelt nie ab); pv_peak_w None -> bisheriges Verhalten (zählt).
+        Druck- und Einspeiselimit-Grund des Vorplans desselben Kurventags werden bis Tagesende gehalten.
+        Rückgabe: reason ('disabled', 'none' oder Gründe mit '+'), reasons, late_full, pressure_hold,
+        export_limit_state ('none', 'binding', 'held', 'not_binding', 'unknown'; leer bei 'disabled').
+        """
+        def _sf(value, default=0.0):
+            try:
+                return float(value)
+            except Exception:
+                return float(default)
+
+        if not guard_enabled:
+            return {
+                "reason": "disabled",
+                "reasons": [],
+                "late_full": False,
+                "pressure_hold": False,
+                "export_limit_state": "",
+            }
+        reasons = []
+        pressure_hold = False
+        previous = [part for part in str(previous_reason or "").split("+") if part]
+        limit_w = _sf(configured_export_limit_w, 0.0)
+        export_limit_state = "none"
+        if limit_w > 0.0:
+            peak_w = None if pv_peak_w is None else _sf(pv_peak_w, -1.0)
+            if peak_w is None or peak_w < 0.0:
+                export_limit_state = "unknown"
+            elif limit_w < peak_w - StorageSimulator.FORECAST100_LATE_FULL_SAFE_LOAD_W:
+                export_limit_state = "binding"
+            elif "export_limit" in previous:
+                export_limit_state = "held"
+            else:
+                export_limit_state = "not_binding"
+            if export_limit_state != "not_binding":
+                reasons.append("export_limit")
+        if pressure_wh is None:
+            reasons.append("pressure_unavailable")
+        else:
+            pressure = max(0.0, _sf(pressure_wh, 0.0))
+            if pressure >= StorageSimulator.FORECAST100_LATE_FULL_PRESSURE_ENTER_WH:
+                reasons.append("curtailment_pressure")
+            elif "curtailment_pressure" in previous:
+                reasons.append("curtailment_pressure")
+                pressure_hold = True
+        if direct_marketing_enabled:
+            reasons.append("direct_marketing")
+        if predump_active:
+            reasons.append("predump")
+        return {
+            "reason": "+".join(reasons) if reasons else "none",
+            "reasons": reasons,
+            "late_full": bool(reasons),
+            "pressure_hold": pressure_hold,
+            "export_limit_state": export_limit_state,
+        }
+
+    def _forecast100_late_full_pressure_wh(self, day_slots, now_ms, dc_limit_w, dc_limit_source=""):
+        """Vermeidbarer Abregeldruck (Wh) der verbleibenden Slots des Kurventags.
+
+        Gleiche Rechnung wie die Pre-Dump-Prüfung (slot_headroom_pressure, sichere Grundlast 300 W, keine
+        Wärmepumpe als Senke, Laderahmen max_charge_w): PCC-Grenze je Topologie (Einspeiselimit bzw. gemeldetes
+        E3DC-Derating) und typisierte DC-Grenze. Ohne wirksame Grenze 0 Wh. Fehler -> None.
+        """
+        try:
+            now = float(now_ms or 0.0)
+            charge_limit_w = max(0.0, float(getattr(self, "max_charge_w", 0.0) or 0.0))
+            expected_revision = (getattr(self, "pv_topology_contract", {}) or {}).get("revision")
+            pressure_wh = 0.0
+            for slot in day_slots or []:
+                if float(slot.get("ts", 0.0) or 0.0) < now - 60000.0:
+                    continue
+                pcc = self._pcc_headroom_limit_for_topology(slot.get("pv_topology_status"))
+                pressure = slot_headroom_pressure(
+                    total_pv_w=slot.get("pv_w", 0.0),
+                    e3dc_dc_pv_w=slot.get("e3dc_dc_pv_w"),
+                    external_ac_pv_w=slot.get("external_ac_pv_w"),
+                    topology_status=slot.get("pv_topology_status"),
+                    topology_revision=slot.get("pv_topology_revision"),
+                    expected_topology_revision=expected_revision,
+                    e3dc_dc_limit_w=dc_limit_w,
+                    pcc_limit_w=pcc.get("limit_w"),
+                    pcc_limit_active=pcc.get("active") is True,
+                    safe_consumers_w=300.0,
+                    charge_limit_w=charge_limit_w,
+                    e3dc_dc_limit_source=str(dc_limit_source or ""),
+                    pcc_limit_source=str(pcc.get("source") or getattr(self, "export_limit_source", "") or ""),
+                )
+                pressure_wh += float(pressure.get("preventable_w", 0.0) or 0.0) * 0.25
+            return round(pressure_wh, 1)
+        except Exception:
+            return None
 
     @staticmethod
     def _extend_curve_end_for_user_anchors(
@@ -2826,7 +3061,7 @@ class StorageSimulator:
                             return float(str(v).replace(',', '.'))
         except Exception as e:
             logger.error(f"Fehler beim Lesen des Live-SoC: {e}")
-        logger.warning("Konnte keinen gueltigen Live-SoC finden. Erzeuge keinen neuen Speicherplan.")
+        logger.warning("Konnte keinen gültigen Live-SoC finden. Erzeuge keinen neuen Speicherplan.")
         return None
 
     def _storm_guard_mode_from_config(self):
@@ -3055,11 +3290,11 @@ class StorageSimulator:
         window_end = min(max(end_ts, start_ts + 15 * 60000), float(curve_start_ts))
         if now_ms < precharge_ts:
             event["night_guard_active"] = False
-            event["night_guard_reason"] = "Nachtwarnung noch ausserhalb der Vorlaufzeit"
+            event["night_guard_reason"] = "Nachtwarnung noch außerhalb der Vorlaufzeit"
             return event, grid_charge
         if now_ms >= window_end:
             event["night_guard_active"] = False
-            event["night_guard_reason"] = "Nachtwarnung liegt ausserhalb des Restnacht-Fensters"
+            event["night_guard_reason"] = "Nachtwarnung liegt außerhalb des Restnacht-Fensters"
             return event, grid_charge
 
         night_load_wh = 0.0
@@ -3103,7 +3338,7 @@ class StorageSimulator:
             )
             return event, grid_charge
         if target_soc <= float(current_soc) + 0.2:
-            event["night_guard_reason"] = "Nachtreserve waere noetig, Ziel ist durch Max-SoC bereits erreicht"
+            event["night_guard_reason"] = "Nachtreserve wäre nötig, Ziel ist durch Max-SoC bereits erreicht"
             return event, grid_charge
 
         grid_charge = {
@@ -4395,7 +4630,7 @@ class StorageSimulator:
 
             if can_hold:
                 reason = ('Entladen stopp: %.1f %s hoch (min=%.1f in %.1fh) | '
-                          'SoC%.1f%% halten fuer Preisberg %.1f%%') % (
+                          'SoC%.1f%% halten für Preisberg %.1f%%') % (
                     curr_price, price_unit, min_future_price, hours_to_low, fSoC_eff, SollSoc)
                 return 0, reason, curr_price
 
@@ -4925,7 +5160,7 @@ class StorageSimulator:
                 if isinstance(p, dict)
             )
             if pv_forecast_unusable:
-                logger.warning("PV-Prognose enthaelt keine nutzbaren Zukunftsslots. Nutze Not-Ladekurve.")
+                logger.warning("PV-Prognose enthält keine nutzbaren Zukunftsslots. Nutze Not-Ladekurve.")
 
         if pv_forecast_unusable:
             pv_tl, forecast_meta = self._build_emergency_pv_timeline(start_dt, end_dt, slot_ms)
@@ -5182,7 +5417,7 @@ class StorageSimulator:
         if ml_available:
             logger.info(
                 f"  ML-Verbrauchsprofil: direkt={_ml_direct_slots}/{len(timeline)} Slots, "
-                f"Tagesprofil-Ergaenzung={_ml_profile_slots}, M1-Grundlast={_ml_base_slots}."
+                f"Tagesprofil-Ergänzung={_ml_profile_slots}, M1-Grundlast={_ml_base_slots}."
             )
 
         if _live_home_clamped_slots:
@@ -5603,7 +5838,7 @@ class StorageSimulator:
                             _predump_lock_reset_today = True
                             logger.info(
                                 f"Eco-Dump Lock neu bewertet: {today_date_str} hatte {_old_dump_wh:.0f}Wh, "
-                                f"adaptiv benoetigt {_old_adaptive_required_wh:.0f}Wh, "
+                                f"adaptiv benötigt {_old_adaptive_required_wh:.0f}Wh, "
                                 f"Abendziel-Risiko {_old_evening_shortfall_wh:.0f}Wh. Neuer Plan darf korrigieren."
                             )
                         elif _old_pressure_underestimated:
@@ -5611,7 +5846,7 @@ class StorageSimulator:
                             logger.info(
                                 f"Eco-Dump Lock neu bewertet: {today_date_str} hatte Rohdruck "
                                 f"{_old_raw_pressure_wh:.0f}Wh, aktueller Abregeldruck "
-                                f"{_old_curtailment_pressure_wh:.0f}Wh. Neuer Plan darf erhoehen."
+                                f"{_old_curtailment_pressure_wh:.0f}Wh. Neuer Plan darf erhöhen."
                             )
                         elif _lock_deadline_ms is not None and time.time() * 1000 >= _lock_deadline_ms:
                             _predump_lock_reset_today = True
@@ -5685,7 +5920,7 @@ class StorageSimulator:
             if not day_slots: continue
             if weather_reserve_active:
                 logger.info(
-                    "Schlechtwetterreserve aktiv: kein Pre-Dump; Energie wird fuer die kommenden Defizittage gehalten."
+                    "Schlechtwetterreserve aktiv: kein Pre-Dump; Energie wird für die kommenden Defizittage gehalten."
                 )
                 continue
 
@@ -6028,7 +6263,7 @@ class StorageSimulator:
                 _dump_end_ts_by_day[day_ms] = int(float(_positive_dump_slots[-1]["ts"]) + 900000)
             logger.info(
                 f"Pre-Discharge Punktlandung {day_label}: {dumped_wh:.0f} Wh in {n_slots} Slots "
-                f"({n_night} Nacht + {n_early} fruehe PV, {p_first:.0f}W->{p_last:.0f}W, "
+                f"({n_night} Nacht + {n_early} frühe PV, {p_first:.0f}W->{p_last:.0f}W, "
                 f"Rohdruck {raw_clipping_pressure_wh:.0f} Wh - Headroom {safe_headroom_wh:.0f} Wh "
                 f"= Restbedarf {preventable_clipping_wh:.0f} Wh + Regelpuffer {regelbuffer_wh:.0f} Wh, "
                 f"Ziel-SoC={dump_target_soc:.1f}%%, min_soc={min_soc_allowed:.0f}%)."
@@ -6076,7 +6311,7 @@ class StorageSimulator:
         if not self.predump_enabled:
             selected_predump_reason = "Pre-Dump deaktiviert"
         elif weather_reserve_active:
-            selected_predump_reason = "Pre-Dump pausiert: Schlechtwetterreserve haelt Energie im Speicher."
+            selected_predump_reason = "Pre-Dump pausiert: Schlechtwetterreserve hält Energie im Speicher."
         elif self.export_limit_w <= 0 and not (
             self.pv_topology_contract.get("split_usable") and _live_e3dc_dc_limit_w > 0.0
         ):
@@ -6188,7 +6423,7 @@ class StorageSimulator:
 
             if selected_day_offset > 0:
                 logger.info(
-                    "Sollkurven-Tag: %s gewaehlt, weil der aktuelle PV-Tag abgeschlossen ist."
+                    "Sollkurven-Tag: %s gewählt, weil der aktuelle PV-Tag abgeschlossen ist."
                     % selected_day_label
                 )
 
@@ -6242,37 +6477,16 @@ class StorageSimulator:
             _forecast100_late_full_guard_active = False
             _forecast100_late_full_guard_old_end_ts = None
             _forecast100_late_full_guard_policy = ""
-            if pv_start_ts and pv_end_ts:
-                curve_end_ts = self._conservative_curve_end_ts(
-                    today_slots_tl,
-                    pv_start_ts,
-                    pv_end_ts,
-                    LADEENDE_OFFSET_MS,
-                    _curve_relevant_surplus_w,
-                )
-                if forecast_only_curve and self._cfg_bool(
-                    self.v4_config.get("storage_forecast100_late_full_guard_enable"),
-                    True,
-                ):
-                    _late_curve_end_ts = self._forecast100_late_full_curve_end_ts(
-                        pv_start_ts,
-                        pv_end_ts,
-                        LADEENDE_OFFSET_MS,
-                    )
-                    if _late_curve_end_ts > int(curve_end_ts) + 15 * 60000:
-                        _forecast100_late_full_guard_active = True
-                        _forecast100_late_full_guard_old_end_ts = int(curve_end_ts)
-                        curve_end_ts = int(_late_curve_end_ts)
-                        logger.info(
-                            "Forecast-100 Vollstand-Schutz: Freilauf %s -> %s "
-                            "(spätes 100%%-Ziel statt früher Vollstand)."
-                            % (
-                                datetime.fromtimestamp(_forecast100_late_full_guard_old_end_ts / 1000).strftime("%H:%M"),
-                                datetime.fromtimestamp(curve_end_ts / 1000).strftime("%H:%M"),
-                            )
-                        )
-                    _forecast100_late_full_guard_policy = "forecast100_late_full_v1"
-
+            # Grund des späten Vollstands (Diagnose target_curve_meta.late_full_reason).
+            _forecast100_late_full_reason = ""
+            _forecast100_late_full_reasons = []
+            _forecast100_late_full_pressure_wh = None
+            _forecast100_late_full_pressure_hold = False
+            # Einspeiselimit bindend? (Diagnose late_full_export_limit_state / late_full_pv_peak_w)
+            _forecast100_late_full_export_limit_state = ""
+            _forecast100_late_full_pv_peak_w = None
+            # Vorplan vor der Kurvenende-Entscheidung laden (unverändert gelesen; Halten des
+            # Druckgrunds am selben Kurventag).
             _frozen_ladestart_soc = None
             existing_plan = {}
             if os.path.exists(OUTPUT_FILE):
@@ -6281,6 +6495,96 @@ class StorageSimulator:
                         existing_plan = json.load(_f)
                 except: pass
             existing_meta = existing_plan.get("target_curve_meta", {}) if isinstance(existing_plan, dict) else {}
+            if pv_start_ts and pv_end_ts:
+                curve_end_ts = self._conservative_curve_end_ts(
+                    today_slots_tl,
+                    pv_start_ts,
+                    pv_end_ts,
+                    LADEENDE_OFFSET_MS,
+                    _curve_relevant_surplus_w,
+                )
+                if forecast_only_curve:
+                    # Spätes 100-%-Ende nur mit Grund (Einspeiselimit, Abregeldruck, DV, Pre-Dump);
+                    # Schlüssel 0 = nie. Ankerkurve läuft nicht durch diesen Zweig.
+                    _late_guard_enabled = self._cfg_bool(
+                        self.v4_config.get("storage_forecast100_late_full_guard_enable"),
+                        True,
+                    )
+                    if _late_guard_enabled:
+                        _forecast100_late_full_pressure_wh = self._forecast100_late_full_pressure_wh(
+                            today_slots_tl,
+                            now_ms_select,
+                            _live_e3dc_dc_limit_w,
+                            _live_e3dc_dc_limit_source,
+                        )
+                    _late_previous_reason = ""
+                    try:
+                        if (
+                            isinstance(existing_meta, dict)
+                            and today_0_ms <= float(existing_plan.get("ladestart_ts", 0) or 0) < today_end_ms
+                        ):
+                            _late_previous_reason = str(existing_meta.get("late_full_reason") or "")
+                    except Exception:
+                        _late_previous_reason = ""
+                    _late_predump_active = bool(
+                        today_0_ms in _dump_active_days
+                        or (selected_day_offset == 0 and _existing_dump_active)
+                        or any(float(s.get("grid_dump_w", 0) or 0) > 0 for s in today_slots_tl)
+                    )
+                    # PV-Spitze des Kurventags (Timeline ab aktueller Stunde) für die Frage, ob das
+                    # konfigurierte Einspeiselimit überhaupt bindet; nicht bestimmbar -> None (bisheriges Verhalten).
+                    try:
+                        _late_pv_values = [float(s.get("pv_w", 0.0) or 0.0) for s in today_slots_tl]
+                        _forecast100_late_full_pv_peak_w = (
+                            round(max(_late_pv_values), 0) if _late_pv_values else None
+                        )
+                    except Exception:
+                        _forecast100_late_full_pv_peak_w = None
+                    _late_full_decision = self._forecast100_late_full_reason(
+                        _late_guard_enabled,
+                        getattr(self, "configured_export_limit_w", 0.0),
+                        _forecast100_late_full_pressure_wh,
+                        self._cfg_bool(self.v4_config.get("direct_marketing_enable"), False),
+                        _late_predump_active,
+                        _late_previous_reason,
+                        pv_peak_w=_forecast100_late_full_pv_peak_w,
+                    )
+                    _forecast100_late_full_reason = str(_late_full_decision.get("reason") or "")
+                    _forecast100_late_full_reasons = list(_late_full_decision.get("reasons") or [])
+                    _forecast100_late_full_pressure_hold = bool(_late_full_decision.get("pressure_hold"))
+                    _forecast100_late_full_export_limit_state = str(_late_full_decision.get("export_limit_state") or "")
+                    _late_curve_end_ts = self._forecast100_late_full_curve_end_ts(
+                        pv_start_ts,
+                        pv_end_ts,
+                        LADEENDE_OFFSET_MS,
+                    )
+                    if _late_full_decision.get("late_full"):
+                        if _late_curve_end_ts > int(curve_end_ts) + 15 * 60000:
+                            _forecast100_late_full_guard_active = True
+                            _forecast100_late_full_guard_old_end_ts = int(curve_end_ts)
+                            curve_end_ts = int(_late_curve_end_ts)
+                            logger.info(
+                                "Forecast-100 Vollstand-Schutz: Freilauf %s -> %s "
+                                "(spätes 100%%-Ziel statt früher Vollstand, Grund %s)."
+                                % (
+                                    datetime.fromtimestamp(_forecast100_late_full_guard_old_end_ts / 1000).strftime("%H:%M"),
+                                    datetime.fromtimestamp(curve_end_ts / 1000).strftime("%H:%M"),
+                                    _forecast100_late_full_reason,
+                                )
+                            )
+                        _forecast100_late_full_guard_policy = "forecast100_late_full_v1"
+                    elif _late_guard_enabled:
+                        _forecast100_late_full_guard_policy = "forecast100_conservative_end_v1"
+                        if _late_curve_end_ts > int(curve_end_ts) + 15 * 60000:
+                            logger.info(
+                                # Nur ein bindendes Einspeiselimit zählt.
+                                "Forecast-100 Vollstand-Schutz ohne Grund (kein bindendes Einspeiselimit, kein "
+                                "Abregeldruck, keine Direktvermarktung, kein Pre-Dump): Kurvenende %s statt %s."
+                                % (
+                                    datetime.fromtimestamp(int(curve_end_ts) / 1000).strftime("%H:%M"),
+                                    datetime.fromtimestamp(_late_curve_end_ts / 1000).strftime("%H:%M"),
+                                )
+                            )
             _curve_meta_mode = "forecast_only_100_v1" if forecast_only_curve else "hourly_weather_ml_v2"
             _curve_start_policy = "forecast_only_integral_v1" if forecast_only_curve else "frozen_anchor_v1"
             _existing_curve_contract_ok = bool(
@@ -6334,7 +6638,7 @@ class StorageSimulator:
                             _live_reanchor_before_morning_blocked = True
                             _live_reanchor_blocked_reason = (
                                 "Live-Reanker vor konfiguriertem Morgenanker blockiert: "
-                                "alter Tagesanker %.1f%% bleibt bis %s gueltig, Live-SoC %.1f%%."
+                                "alter Tagesanker %.1f%% bleibt bis %s gültig, Live-SoC %.1f%%."
                                 % (
                                     _old_ladestart_soc,
                                     datetime.fromtimestamp(float(_configured_morning_anchor_ts) / 1000).strftime("%H:%M"),
@@ -6356,7 +6660,7 @@ class StorageSimulator:
                             )
                             _live_reanchor_blocked_reason = (
                                 "Automatischer Live-Reanker deaktiviert: "
-                                "Tagesanker %.1f%% bleibt fix, Live-SoC %.1f%% aendert nur Erreichbarkeit/Diagnose."
+                                "Tagesanker %.1f%% bleibt fix, Live-SoC %.1f%% ändert nur Erreichbarkeit/Diagnose."
                                 % (_old_ladestart_soc, float(current_soc))
                             )
                             logger.info(_live_reanchor_blocked_reason)
@@ -6386,12 +6690,12 @@ class StorageSimulator:
                             morning_soc_tl = float(self.morning_soc)
                             logger.info(
                                 f"Kurvenstart-Fallback: PV-Start liegt in der Vergangenheit, "
-                                f"kein gueltiger frozen_anchor_v1 vorhanden -> Morgenpuffer {self.morning_soc:.1f}%%"
+                                f"kein gültiger frozen_anchor_v1 vorhanden -> Morgenpuffer {self.morning_soc:.1f}%%"
                             )
                         else:
                             morning_soc_tl = current_soc
                             logger.info(
-                                f"Kurvenstart-Fallback: storage_morning_soc=0, kein gueltiger Tagesanker -> "
+                                f"Kurvenstart-Fallback: storage_morning_soc=0, kein gültiger Tagesanker -> "
                                 f"Live-SoC {current_soc:.1f}%% als Notanker."
                             )
 
@@ -6604,7 +6908,7 @@ class StorageSimulator:
                                 ):
                                     _intermediate_anchor_config_changed = True
                                     logger.info(
-                                        "Zwischenziel %s geaendert/deaktiviert: Plan %.1f%% um %.2fh, Config %.1f%% um %.2fh."
+                                        "Zwischenziel %s geändert/deaktiviert: Plan %.1f%% um %.2fh, Config %.1f%% um %.2fh."
                                         % (_source_key, _frozen_soc, _frozen_hour, _configured_soc, _configured_hour)
                                     )
                                     continue
@@ -6639,7 +6943,7 @@ class StorageSimulator:
                     ):
                         _intermediate_anchor_config_changed = True
                         logger.info(
-                            "Zwischenziel storage_noon_target_soc geaendert/deaktiviert: Plan %.1f%% um %.2fh, Config %.1f%% um %.2fh."
+                            "Zwischenziel storage_noon_target_soc geändert/deaktiviert: Plan %.1f%% um %.2fh, Config %.1f%% um %.2fh."
                             % (
                                 float(existing_plan['noon_target_soc']),
                                 _legacy_noon_hour,
@@ -6653,7 +6957,7 @@ class StorageSimulator:
                             self.noon_hour = float(existing_plan['noon_hour'])
                         logger.debug(f"noon_target_soc eingefroren: {self.noon_target_soc:.0f}%% (aus Plan, kein Zwischenziel-Sprung)")
                 elif _skip_emergency_noon_freeze:
-                    logger.info("Forecast wieder verfuegbar: Notkurven-Zwischenziel wird nicht in den normalen Plan uebernommen.")
+                    logger.info("Forecast wieder verfügbar: Notkurven-Zwischenziel wird nicht in den normalen Plan übernommen.")
 
                 # FIX v4.6.9: ladestart_soc einfrieren (analog noon_target_soc)
                 # Problem: Simulator laeuft um 14:07 neu -> morning_soc_tl = aktueller SOC (66%)
@@ -6678,7 +6982,7 @@ class StorageSimulator:
                         )
                     else:
                         _frozen_ladestart_soc = _old_frozen_ladestart_soc
-                        logger.debug(f"ladestart_soc eingefroren: {_frozen_ladestart_soc:.1f}%% (aus Plan, verhindert SOC-Ueberschreibung)")
+                        logger.debug(f"ladestart_soc eingefroren: {_frozen_ladestart_soc:.1f}%% (aus Plan, verhindert SOC-Überschreibung)")
 
                 pv_duration_ms = pv_end_ts - pv_start_ts
 
@@ -6697,7 +7001,7 @@ class StorageSimulator:
                             logger.info(
                                 f"TL-Start: ladestart {datetime.fromtimestamp(_lts_f/1000).strftime('%H:%M')} "
                                 f"< pv_start {datetime.fromtimestamp(pv_start_ts/1000).strftime('%H:%M')} "
-                                f"-> Kurve ab Ladestart (bewoelkter Morgen-Fix)"
+                                f"-> Kurve ab Ladestart (bewölkter Morgen-Fix)"
                             )
 
                 # --- Rolling Frozen Window: stuendliche Ankerpunkte ---
@@ -6840,7 +7144,7 @@ class StorageSimulator:
                         _prev_anchor_soc = float(_anchor_soc)
                     else:
                         logger.info(
-                            "%s ignoriert: %.2fh liegt ausserhalb der Kurve (%s-%s)."
+                            "%s ignoriert: %.2fh liegt außerhalb der Kurve (%s-%s)."
                             % (
                                 _candidate["name"],
                                 _anchor_h,
@@ -7072,16 +7376,23 @@ class StorageSimulator:
                     existing_plan.get("ladestart_ts") and
                     today_0_ms <= float(existing_plan.get("ladestart_ts", 0)) < today_end_ms
                 )
+                # Reset genau beim Wechsel der Kurvenende-Politik (spät <-> konservativ); gleiche
+                # Politik wie der Vorplan -> kein Reset. Schlüssel 0 (Politik leer) -> kein Reset (wie bisher).
                 if (
                     _anchors_for_today
                     and forecast_only_curve
-                    and self._cfg_bool(self.v4_config.get("storage_forecast100_late_full_guard_enable"), True)
-                    and existing_meta.get("forecast100_late_full_guard_policy") != "forecast100_late_full_v1"
+                    and _forecast100_late_full_guard_policy
+                    and existing_meta.get("forecast100_late_full_guard_policy") != _forecast100_late_full_guard_policy
                 ):
                     _anchors_for_today = False
                     logger.info(
-                        "Rolling Window Reset: Forecast-100 Vollstand-Schutz aktiviert; "
-                        "zukünftige Anker werden neu auf spätes 100%%-Ziel geplant."
+                        "Rolling Window Reset: Forecast-100 Kurvenende-Politik %s -> %s (Grund %s); "
+                        "zukünftige Anker werden neu geplant."
+                        % (
+                            existing_meta.get("forecast100_late_full_guard_policy") or "-",
+                            _forecast100_late_full_guard_policy,
+                            _forecast100_late_full_reason or "-",
+                        )
                     )
                 _anchor_reset_allowed = True
                 try:
@@ -7093,7 +7404,7 @@ class StorageSimulator:
                     _anchor_reset_allowed = False
                 if _anchors_for_today and _intermediate_anchor_config_changed:
                     _anchors_for_today = False
-                    logger.info("Rolling Window Reset: zukuenftiges Zwischenziel wurde geaendert oder deaktiviert.")
+                    logger.info("Rolling Window Reset: zukünftiges Zwischenziel wurde geändert oder deaktiviert.")
                 if _anchors_for_today and not _anchor_reset_allowed and _frozen_ladestart_soc is not None:
                     try:
                         _frozen_start_soc = round(float(_frozen_ladestart_soc), 2)
@@ -7106,7 +7417,7 @@ class StorageSimulator:
                                     existing_anchors[1]["soc"] = _frozen_start_soc
                             logger.warning(
                                 "Rolling Window Konsistenz-Fix: eingefrorener Tagesanker %.1f%% "
-                                "wieder in die aktiven Anker uebernommen; kein Startanker-Reset nach Kurvenstart."
+                                "wieder in die aktiven Anker übernommen; kein Startanker-Reset nach Kurvenstart."
                                 % _frozen_start_soc
                             )
                     except Exception:
@@ -7161,7 +7472,7 @@ class StorageSimulator:
                         and float(existing_anchors[0].get("ts", 0)) < float(morning_anchor_ts)):
                     _anchors_for_today = False
                     logger.info(
-                        "Rolling Window Reset: Morgenanker %s ersetzt fruehere Tagesanker."
+                        "Rolling Window Reset: Morgenanker %s ersetzt frühere Tagesanker."
                         % datetime.fromtimestamp(morning_anchor_ts / 1000).strftime("%H:%M")
                     )
                 if (_anchors_for_today and _anchor_reset_allowed and morning_anchor_delayed and morning_anchor_ts
@@ -7206,7 +7517,7 @@ class StorageSimulator:
                             _anchors_for_today = False
                             logger.info(
                                 "Rolling Window Reset: Startanker %.1f%% -> %.1f%% "
-                                "(Konfig/Pre-Dump vor Ladestart geaendert)."
+                                "(Konfig/Pre-Dump vor Ladestart geändert)."
                                 % (_first_anchor_soc, _new_start_soc)
                             )
                     except Exception:
@@ -7307,7 +7618,7 @@ class StorageSimulator:
                                     curve_anchors[1]["soc"] = _reserve_start_floor
                             logger.info(
                                 "Startanker-Floor: %.1f%% -> %.1f%% "
-                                "(Notstrom-/Fallbackreserve als Mindestanker uebernommen)."
+                                "(Notstrom-/Fallbackreserve als Mindestanker übernommen)."
                                 % (_first_anchor_soc, _reserve_start_floor)
                             )
                     except Exception:
@@ -7332,7 +7643,7 @@ class StorageSimulator:
                     )
                     if tail_target_smoothing_points:
                         logger.info(
-                            "Tagesziel-Glaettung: %d spaete Anker auf gleichmaessigen Zielpfad angehoben."
+                            "Tagesziel-Glättung: %d späte Anker auf gleichmäßigen Zielpfad angehoben."
                             % tail_target_smoothing_points
                         )
                 if curve_anchors and published_curve_floor_active:
@@ -7416,6 +7727,15 @@ class StorageSimulator:
                         if _forecast100_late_full_guard_old_end_ts
                         else ""
                     ),
+                    # Grund des späten Vollstands ('none' = konservatives Kurvenende, 'disabled' =
+                    # Schlüssel 0, leer = Ankerkurve, sonst Gründe mit '+').
+                    "late_full_reason": _forecast100_late_full_reason,
+                    "late_full_reasons": list(_forecast100_late_full_reasons),
+                    "late_full_pressure_wh": _forecast100_late_full_pressure_wh,
+                    "late_full_pressure_hold": bool(_forecast100_late_full_pressure_hold),
+                    # 'not_binding' = Einspeiselimit oberhalb der PV-Spitze, kein Grund.
+                    "late_full_export_limit_state": _forecast100_late_full_export_limit_state,
+                    "late_full_pv_peak_w": _forecast100_late_full_pv_peak_w,
                     "morning_anchor_active": bool(morning_anchor_ts),
                     "morning_anchor_delayed": bool(morning_anchor_delayed),
                     "morning_anchor_t": datetime.fromtimestamp(morning_anchor_ts / 1000).strftime("%H:%M") if morning_anchor_ts else "",
@@ -7926,7 +8246,7 @@ class StorageSimulator:
                     "Tagesziel nicht mehr erreichbar; E3DC Auto statt Kurvenjagd"
                 )
                 logger.info(
-                    "Tagesziel %.1f%% nicht erreichbar (max %.1f%%). Sollziel bleibt fix, Storage Manager gibt bei Kurvenrueckstand Auto frei."
+                    "Tagesziel %.1f%% nicht erreichbar (max %.1f%%). Sollziel bleibt fix, Storage Manager gibt bei Kurvenrückstand Auto frei."
                     % (float(self.target_soc), max_reachable_soc)
                 )
         if weather_reserve_active:
@@ -8191,7 +8511,7 @@ class StorageSimulator:
                 target_curve_meta.update(_adaptive_summary)
                 logger.info(
                     "Adaptiver Headroom: Abregeldruck %.0fWh, Reserve %.0fWh, vorhanden %.0fWh, "
-                    "zusaetzlich %.0fWh, Floor %.1f%%, Ceiling %.1f%%."
+                    "zusätzlich %.0fWh, Floor %.1f%%, Ceiling %.1f%%."
                     % (
                         float(adaptive_headroom.get("curtailment_pressure_wh", 0.0) or 0.0),
                         float(adaptive_headroom.get("headroom_reserve_pressure_wh", 0.0) or 0.0),
@@ -8304,6 +8624,13 @@ class StorageSimulator:
             int(end_ms),
             _market_now_ms + MARKET_HORIZON_MS,
         )
+        # Beobachtete Markt-Ladeleistung (P_obs) aus dem Zustandsfile des Storage
+        # Managers; None -> konfigurierte Ladeleistung (heutiges Verhalten).
+        _market_observed_charge_w = read_market_observed_charge_w()
+        # Laufender Markt-Netzladevorgang (Fensterende) aus dem Zustandsfile.
+        _market_running_grid_window_end_ts = read_market_running_grid_window_end_ts()
+        # Gebundene Fensterreferenz des letzten Plans zurückreichen (fail-closed).
+        _market_window_reference = read_market_window_reference()
         market_plan = build_market_economics_plan(
             _market_economics_config,
             timeline,
@@ -8313,6 +8640,9 @@ class StorageSimulator:
             now_ms=_market_now_ms,
             target_timeline=target_timeline,
             required_energy_horizon_end_ts_ms=_market_required_horizon_end_ms,
+            observed_charge_w=_market_observed_charge_w,
+            running_grid_window_end_ts=_market_running_grid_window_end_ts,
+            window_reference=_market_window_reference,
         )
         if storm_grid_charge.get("active"):
             awattar_mode = 2

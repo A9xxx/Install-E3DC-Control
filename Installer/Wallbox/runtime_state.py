@@ -23,6 +23,8 @@ class WallboxRuntimeState:
 
     budget_stale_logged: bool = False
     budget_timeout_logged: bool = False
+    budget_read_bridged_count: int = 0
+    budget_read_bridged_last_log_ts: float = 0.0
     last_bound_wallbox_budget_w: float = 0.0
     last_bound_wallbox_budget_ts: float = 0.0
     last_bound_wallbox_budget_revision: str = ""
@@ -62,6 +64,24 @@ class WallboxRuntimeState:
     def reset_budget_log_flags(self):
         self.budget_stale_logged = False
         self.budget_timeout_logged = False
+
+    def note_budget_read_bridged(self, now_ts: float, *, min_log_gap_s: float = 300.0) -> bool:
+        """Zählt einen mit dem letzten gültigen Stand überbrückten Lesefehler.
+
+        Liefert True, wenn das Ereignis jetzt geloggt werden darf (höchstens
+        alle ``min_log_gap_s``); die Zählung läuft unabhängig davon weiter und
+        macht die Häufigkeit der Leserennbedingung sichtbar.
+        """
+
+        self.budget_read_bridged_count += 1
+        try:
+            now_value = float(now_ts or 0.0)
+        except (TypeError, ValueError):
+            now_value = 0.0
+        if now_value - self.budget_read_bridged_last_log_ts >= float(min_log_gap_s or 0.0):
+            self.budget_read_bridged_last_log_ts = now_value
+            return True
+        return False
 
     def apply_budget_freshness_guard(
         self,

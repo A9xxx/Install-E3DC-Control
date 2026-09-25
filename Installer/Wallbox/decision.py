@@ -11,9 +11,9 @@ import re
 from typing import Any, Dict, Iterable, Optional
 
 try:
-    from .modes import MODE_BATTERY_DEPARTURE, MODE_OFF, MODE_PRICE, mode_label, normalize_wb_mode, storage_floor_mode
+    from .modes import MODE_BATTERY_DEPARTURE, MODE_OFF, MODE_PRICE, MODE_TARGET, mode_label, normalize_wb_mode, storage_floor_mode
 except ImportError:  # pragma: no cover - fallback for direct Installer-path imports
-    from Wallbox.modes import MODE_BATTERY_DEPARTURE, MODE_OFF, MODE_PRICE, mode_label, normalize_wb_mode, storage_floor_mode
+    from Wallbox.modes import MODE_BATTERY_DEPARTURE, MODE_OFF, MODE_PRICE, MODE_TARGET, mode_label, normalize_wb_mode, storage_floor_mode
 
 try:
     from .ramps import running_charge_ramp_contract
@@ -345,6 +345,10 @@ def wallbox_operator_hint_contract(
     battery_departure_label: str = "",
     battery_departure_start_label: str = "",
     battery_departure_reason: str = "",
+    price_plan_bound: bool = False,
+    price_plan_soc_missing: bool = False,
+    price_plan_label: str = "",
+    price_plan_ready_by: str = "",
 ) -> Dict[str, str]:
     """Erzeugt den nutzerseitigen Wallbox-Hinweis ohne Nebenwirkungen."""
 
@@ -434,6 +438,29 @@ def wallbox_operator_hint_contract(
                 "operator_hint": "Sofort bis Preislimit wartet: aktueller Strompreis fehlt.",
                 "operator_hint_level": "warning",
                 "operator_hint_code": "price_missing",
+            }
+        plan_wb = (" (%s)" % price_plan_label) if price_plan_label else ""
+        ready_by = price_plan_ready_by or "Fertig bis"
+        if price_plan_soc_missing:
+            # Zielplan gewählt, aber kein bestätigter Fahrzeug-SoC: Dauer ist
+            # nicht planbar, deshalb spontanes Netzladen wie Sofort.
+            return {
+                "operator_hint": (
+                    "Fertig bis ohne bestätigten Fahrzeug-SoC%s: Ladedauer nicht planbar, "
+                    "lädt sofort bis Preislimit %s ct/kWh (Preis jetzt %s). Ist-SoC eintragen "
+                    "oder Fahrzeug-SoC verbinden, damit die günstigsten Stunden bis %s geplant werden."
+                ) % (plan_wb, limit_txt, price_txt, ready_by),
+                "operator_hint_level": "warning",
+                "operator_hint_code": "price_plan_soc_missing",
+            }
+        if price_plan_bound:
+            return {
+                "operator_hint": (
+                    "Fertig bis aktiv%s: Netzstrom nur in den geplanten günstigen Slots bis %s; "
+                    "außerhalb laden PV und Speicher. Preis jetzt %s ct/kWh, Limit %s ct/kWh."
+                ) % (plan_wb, ready_by, price_txt, limit_txt),
+                "operator_hint_level": "info",
+                "operator_hint_code": "price_plan_bound",
             }
         if not mode5_grid_allowed:
             if int(_safe_float(cap_amp, 0.0)) > 0:
@@ -576,6 +603,37 @@ def wallbox_detail_status_contract(
             "state_level": str(st.get("e3dc_session_level") or "info"),
             "state_reason": str(st.get("e3dc_session_reason") or ""),
             "min_power_w": min_power_w,
+        }
+
+    offer_hold = box.get("_openwb_pro_offer_hold") or {}
+    if (mode != MODE_OFF and connected_value and not budget_timeout
+            and offer_hold.get("active")
+            and offer_hold.get("plug_session_id")
+            and offer_hold.get("plug_session_id") == box.get("_openwb_pro_plug_session_id")
+            and offer_hold.get("cycle_token") == box.get("_wallbox_cycle_token")
+            and not status_real_charging(st)
+            # Eine bestätigte Bereitschaft hat Vorrang vor der Haltephase.
+            and not vehicle_idle_state(box.get("_vehicle_idle_state"), box.get("_openwb_pro_plug_session_id"))):
+        return {
+            "state": "Angebot gehalten",
+            "state_level": "info",
+            "state_reason": offer_hold.get("display_reason")
+            or "Fahrzeug nimmt nicht ab; Mindestangebot bleibt stehen.",
+            "min_power_w": min_power_w,
+        }
+
+    idle = box.get("_vehicle_idle_offer_contract") or {}
+    if (mode != MODE_OFF and connected_value and not budget_timeout
+            and not box.get("_bev_full_blocked")
+            and vehicle_idle_state(box.get("_vehicle_idle_state"), box.get("_openwb_pro_plug_session_id"))
+            and idle.get("cycle_token")
+            and idle.get("cycle_token") == box.get("_wallbox_cycle_token")
+            and idle.get("display_reason")):
+        return {
+            "state": "Bereit" if idle.get("target_amp", 0) > 0 and idle.get("offered_amp") == idle.get("target_amp") else "Warte",
+            "state_level": "info",
+            "state_reason": idle["display_reason"],
+            "min_power_w": idle.get("required_w", min_power_w),
         }
 
     openwb_pro_state = str(st.get("openwb_pro_session_state") or "")
@@ -741,9 +799,12 @@ def wallbox_detail_status_contract(
 
     if bool(physical.get("switch_to_1p_ready")):
         return {
-            "state": "Phasenwechsel",
+            "state": "Phasenwechsel angefordert",
             "state_level": "warning",
-            "state_reason": physical.get("reason") or "3p ist zu schwer; 1p-Start wird angefordert.",
+            "state_reason": (
+                physical.get("reason")
+                or "3p ist zu schwer; 1p-Start wird angefordert."
+            ) + " Eine Hardwarebestätigung der Umschaltung liegt noch nicht vor.",
             "min_power_w": min_power_w,
         }
 
@@ -761,7 +822,11 @@ def wallbox_detail_status_contract(
         return {
             "state": "Startfreigabe",
             "state_level": "warning",
-            "state_reason": "%d A freigegeben; Fahrzeug/Wallbox nimmt noch keine Leistung ab." % max(0, amp),
+            "state_reason": (
+                "%d A angefordert, Gerät bestätigt %d A; "
+                "Fahrzeug/Wallbox nimmt noch keine Leistung ab."
+                % (max(0, amp), max(0, int(round(hardware_offered_amp))))
+            ),
             "min_power_w": min_power_w,
         }
 
@@ -1716,6 +1781,52 @@ def e3dc_native_production_contract(
     }
 
 
+def vehicle_idle_state(value, plug_session_id) -> Dict[str, Any]:
+    """Prüft die gespeicherte Bereitschaft derselben Stecksession."""
+
+    if not isinstance(value, dict) or not plug_session_id:
+        return {}
+    try:
+        since = float(value.get("since"))
+        phases = int(value.get("phases"))
+    except (TypeError, ValueError, OverflowError):
+        return {}
+    if (value.get("plug_session_id") != plug_session_id
+            or not math.isfinite(since) or since <= 0
+            or phases not in (1, 2, 3) or phases != value.get("phases")):
+        return {}
+    return {"plug_session_id": plug_session_id, "since": since, "phases": phases}
+
+
+def vehicle_idle_offer_contract(*, min_amp, cap_amp, allowed_w, phases,
+                                authorized, resume_ready=True) -> Dict[str, Any]:
+    """Begrenzt die Bereitschaft auf das Mindestangebot der gehaltenen Phasen.
+
+    Die aufrufende Policy liefert die endgültige Budget-/Schutzfreigabe.
+    Fehlende Leistung oder eine laufende Wiederanlauffrist ergeben 0 A.
+    """
+
+    minimum = _safe_float(min_amp, 0.0)
+    cap = _safe_float(cap_amp, 0.0)
+    watts = _safe_float(allowed_w, 0.0)
+    phase_count = valid_phase_count(phases, 0)
+    valid = (all(math.isfinite(v) for v in (minimum, cap, watts))
+             and minimum >= 6.0 and phase_count > 0)
+    required = minimum * 230.0 * phase_count if valid else 0.0
+    budget_ready = bool(valid and authorized and cap >= minimum and watts >= required)
+    target = minimum if budget_ready and resume_ready else 0.0
+    return {
+        "contract": "wallbox_vehicle_idle_offer_v1",
+        "target_amp": target,
+        "required_w": required,
+        "phases": phase_count,
+        "budget_ready": budget_ready,
+        "reason": ("vehicle_idle_minimum_offer" if target > 0 else
+                   "vehicle_idle_restart_delay" if budget_ready else
+                   "vehicle_idle_budget_wait"),
+    }
+
+
 def charge_end_latch_contract(
     status: Optional[Dict[str, Any]] = None,
     *,
@@ -1733,6 +1844,7 @@ def charge_end_latch_contract(
     target_soc_reached: bool = False,
     target_reached_reason: str = "",
     external_restart_confirmed: bool = False,
+    vehicle_end_keeps_offer: bool = False,
     now_ts: Any = 0,
 ) -> Dict[str, Any]:
     """Entscheidet, ob ein beendeter Ladevorgang verriegelt oder freigegeben wird.
@@ -1868,6 +1980,10 @@ def charge_end_latch_contract(
         latched = True
         start_blocked = True
         reason = "target_soc_reached" if target_soc_reached else "vehicle_charge_ended"
+        if vehicle_end_keeps_offer and not target_soc_reached and not prev_latched:
+            action = "idle"
+            latched = False
+            start_blocked = False
     elif prev_latched:
         action = "hold"
         latched = True
@@ -2170,15 +2286,44 @@ def wallbox_phase_switch_capability(
             and sample_ok_ts == sample_ts
             and 0.0 <= sample_age_s <= 15.0
         )
+        # Ist der E3DC-Direktvertrag
+        # eingeschaltet (wb[_N]_e3dc_direct_phase_control_enable; der Treiber
+        # meldet ihn im Status), bleibt die Sonnenmodus-Übergabe an die
+        # efy-Automatik stillgelegt - sonst zwei Regler an einem Aktor. Ein
+        # eingeschalteter Vertrag ohne vollständige Rücklesung schließt beide
+        # Wege (fail-closed, feste Phasen wie ohne Vertrag).
+        direct_contract_status = st.get("e3dc_direct_phase_control")
+        direct_contract_enabled = bool(
+            (
+                isinstance(direct_contract_status, dict)
+                and direct_contract_status.get("enabled") is True
+            )
+            or isinstance(st.get("e3dc_direct_phase_control_eligible"), bool)
+        )
         autonomous_efy = bool(
             e3dc_autonomous_solar_provenance(st)
             and status_fresh
+            and not direct_contract_enabled
+        )
+        direct_phase_control = bool(
+            st.get("e3dc_direct_phase_control_eligible") is True
+            and st.get("phase_switch_capability") == "e3dc_direct_number_phases"
+            and status_fresh
         )
         return {
-            "can_switch": False,
-            "capability": "e3dc_multi_connect_cp_480_unverified",
-            "source": "disabled_by_hardware_protection",
-            "api_surface": "",
+            "can_switch": direct_phase_control,
+            "capability": (
+                "e3dc_direct_number_phases"
+                if direct_phase_control
+                else "e3dc_multi_connect_cp_480_unverified"
+            ),
+            "source": (
+                "configured_direct_phase_control"
+                if direct_phase_control
+                else "disabled_by_hardware_protection"
+            ),
+            "api_surface": "rscp_wb_req_set_number_phases" if direct_phase_control else "",
+            "direct_phase_control": direct_phase_control,
             "autonomous_can_switch": autonomous_efy,
             "autonomous_capability": (
                 EFY_AUTONOMOUS_PRODUCT_CAPABILITY
@@ -2231,8 +2376,13 @@ def phase_observation_contract(
     vehicle_phase_capability: Optional[Dict[str, Any]] = None,
     charger_class_name: str = "",
     driver_variant: str = "",
+    phase_latch: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Normalisiert Phasenbelege in einen typisierten Phasenvertrag."""
+    """Normalisiert Phasenbelege in einen typisierten Phasenvertrag.
+
+    ``phase_latch`` (Phasenwahrheit derselben Stecksession,
+    ``session_phase_latch_update``) entscheidet vor dem Fahrzeugprofil.
+    """
 
     st = status or {}
     cd = c_data or {}
@@ -2394,13 +2544,23 @@ def phase_observation_contract(
     phase_evidence_valid = False
     reason_code = "none"
     vehicle_phase_source = "none"
+    latch = phase_latch if isinstance(phase_latch, dict) else {}
+    phase_latch_phases = valid_phase_count(latch.get("phases"), 0)
+    phase_latch_valid = bool(
+        latch.get("schema") == SESSION_PHASE_LATCH_SCHEMA
+        and phase_latch_phases in (1, 3)
+        and str(latch.get("plug_session_id") or "")
+        and str(latch.get("plug_session_id") or "")
+        == str(cd.get("_openwb_pro_plug_session_id") or "")
+        and evse_phase_switch_capable
+    )
 
     if fixed_session_bound:
         effective = max(fixed_session_phases, actual_phases)
         phase_evidence_valid = fixed_session.get("confirmed") is True
         basis = "fixed_session_confirmed" if phase_evidence_valid else "fixed_session_start_upper_bound"
         reason_code = str(fixed_session.get("reason") or basis)
-        vehicle_phase_source = "session_stable_6a_measurement" if phase_evidence_valid else "fixed_session_start_upper_bound"
+        vehicle_phase_source = "session_stable_phase_measurement" if phase_evidence_valid else "fixed_session_start_upper_bound"
     elif actual_phases:
         effective = actual_phases
         basis = actual_source
@@ -2433,6 +2593,14 @@ def phase_observation_contract(
         phase_evidence_valid = True
         vehicle_phase_source = "evse_idle_target_readback"
         reason_code = f"evse_idle_confirmed_target_{target}p"
+    elif phase_latch_valid:
+        # Gelatchte Phasenwahrheit der Stecksession (eigener CP,
+        # plug=False-Frame oder target-0-Glitch fallen nicht auf 3p zurück).
+        effective = phase_latch_phases
+        basis = "session_phase_latch"
+        phase_evidence_valid = True
+        vehicle_phase_source = str(latch.get("source") or "evse_idle_target_readback")
+        reason_code = f"evse_session_phase_latch_{effective}p"
     elif vehicle_profile_phase_bound and vehicle_phases in (2, 3):
         effective = min(evse_supply_phases, vehicle_phases)
         basis = "vehicle_profile"
@@ -2498,6 +2666,7 @@ def phase_observation_contract(
         "target_phases": int(target),
         "reported_target_phases": int(reported_target),
         "idle_confirmed_target": bool(idle_confirmed_target),
+        "session_phase_latch_phases": int(phase_latch_phases if phase_latch_valid else 0),
         "switch_phases": int(switch_phases),
         "cap_phases": int(cap_phases),
         "cable_phases": int(cable_phases),
@@ -2539,6 +2708,136 @@ def phase_observation_contract(
         "charger_class": str(charger_class_name or ""),
         "driver_variant": normalized_driver,
     }
+
+
+SESSION_PHASE_LATCH_SCHEMA = "openwb_pro_session_phase_latch_v1"
+SESSION_PHASE_LATCH_CONFIRM_FRAMES = 2
+
+
+def session_phase_latch_update(
+    previous: Optional[Dict[str, Any]],
+    status: Optional[Dict[str, Any]] = None,
+    *,
+    plug_session_id: Any = "",
+    idle_confirmed_target: bool = False,
+    target: Any = 0,
+    real_charging: bool = False,
+    measured_phases: Any = 0,
+    cp_interrupt_active: bool = False,
+    plug_frame_ok: bool = True,
+    sequence_or_reservation_active: bool = False,
+    now_ts: Any = 0,
+) -> Dict[str, Any]:
+    """Phasenwahrheit der Stecksession.
+
+    Ein Wert je Zyklus für Zuteilung, Storage-Hard-Block, Direktphasen und
+    Physik-Mindestleistung. Setzen: zwei aufeinanderfolgende Frames
+    ``idle_confirmed_target`` mit gleichem Ziel ∈ {1, 3} (Quelle
+    ``evse_idle_target_readback``) oder zwei Frames gemessener Phasen bei
+    laufender Ladung (``measured_phases``). Halten: während des eigenen
+    CP-Impulses, eines einzelnen ``plug_frame_ok=False``-Frames, eines
+    ``target=0``-Glitches oder eines stale-Frames – kein Rückfall auf das
+    3p-Fahrzeugprofil. Lösen: neue ``plug_session_id``; zwei Frames eines
+    anderen bestätigten Readback-Ziels; aktive Sequenz oder Reservierung vor
+    dem bestätigten Ziel (der Sequenzer entscheidet). Eine Reservierung, deren
+    Ziel die Box nach dem Phasenbefehl frisch bestätigt hat oder die die
+    gebundene Startausnahme trägt, meldet der Aufrufer nicht als aktiv; er
+    reicht dann nur Belege für dieses Ziel durch. Bei einem einphasig
+    gebundenen Fahrzeug meldet er ein Leerlaufziel 3 als 1, solange die
+    Stecksession keine drei aktiven Phasen gemessen hat; gemessene Phasen
+    bleiben unverändert. Unbekannt (``phases`` 0): Aufrufer rechnen das
+    Budget-Minimum mit 3 (ein einphasig gebundenes Fahrzeug mit 1) und den
+    Deckel mit dem 1p-Deckel (konservativ).
+    """
+
+    prev = previous if isinstance(previous, dict) else {}
+    now = _safe_float(now_ts, 0.0)
+    session = str(plug_session_id or "")
+    same_session = bool(
+        session
+        and prev.get("schema") == SESSION_PHASE_LATCH_SCHEMA
+        and str(prev.get("plug_session_id") or "") == session
+    )
+    latch = {
+        "schema": SESSION_PHASE_LATCH_SCHEMA,
+        "plug_session_id": session,
+        "phases": int(prev.get("phases", 0) or 0) if same_session else 0,
+        "reported_target": int(prev.get("reported_target", 0) or 0) if same_session else 0,
+        "confirmed_frames": int(prev.get("confirmed_frames", 0) or 0) if same_session else 0,
+        "since_ts": _safe_float(prev.get("since_ts"), 0.0) if same_session else 0.0,
+        "last_ts": now,
+        "source": str(prev.get("source") or "") if same_session else "",
+        "reason": "",
+    }
+    if latch["phases"] not in (1, 3):
+        latch["phases"] = 0
+    if not session:
+        latch["reason"] = "no_plug_session"
+        latch["phases"] = 0
+        return latch
+    if not same_session:
+        latch["reason"] = "new_plug_session"
+    if bool(sequence_or_reservation_active):
+        latch.update({
+            "phases": 0,
+            "reported_target": 0,
+            "confirmed_frames": 0,
+            "since_ts": 0.0,
+            "source": "",
+            "reason": "phase_sequence_or_reservation_active",
+        })
+        return latch
+
+    st = status if isinstance(status, dict) else {}
+    stale = bool(
+        st.get("driver_status_valid") is False
+        or st.get("driver_status_stale") is True
+        or st.get("driver_status_glitch") is True
+    )
+    target_value = valid_phase_count(target, 0)
+    measured_value = valid_phase_count(measured_phases, 0)
+    candidate = 0
+    source = ""
+    if bool(real_charging) and measured_value in (1, 3):
+        candidate = measured_value
+        source = "measured_phases"
+    elif bool(idle_confirmed_target) and target_value in (1, 3):
+        candidate = target_value
+        source = "evse_idle_target_readback"
+
+    if bool(cp_interrupt_active):
+        latch["reason"] = "cp_interrupt_hold"
+        return latch
+    if not bool(plug_frame_ok):
+        latch["reason"] = "plug_frame_hold"
+        return latch
+    if stale:
+        latch["reason"] = "stale_frame_hold"
+        return latch
+    if not candidate:
+        latch["reason"] = "target_glitch_hold" if latch["phases"] else (latch["reason"] or "no_confirmed_target")
+        if latch["reported_target"] and latch["phases"] == 0:
+            # Halber Beleg ohne Fortsetzung: Zählung neu beginnen.
+            latch["confirmed_frames"] = 0
+            latch["reported_target"] = 0
+        return latch
+
+    if latch["reported_target"] == candidate:
+        latch["confirmed_frames"] = int(latch["confirmed_frames"]) + 1
+    else:
+        latch["reported_target"] = candidate
+        latch["confirmed_frames"] = 1
+    if int(latch["confirmed_frames"]) >= SESSION_PHASE_LATCH_CONFIRM_FRAMES:
+        if latch["phases"] != candidate:
+            latch["phases"] = candidate
+            latch["since_ts"] = now
+            latch["reason"] = "latched_%dp" % candidate
+        else:
+            latch["reason"] = "latch_confirmed"
+        latch["source"] = source
+    else:
+        latch["reason"] = "latch_pending" if latch["phases"] == 0 else "latch_held"
+    return latch
 
 
 def idle_start_phase_budget_count(phase_contract: Optional[Dict[str, Any]]) -> int:
@@ -4642,8 +4941,22 @@ def curve_direct_shared_minimum_hold_required(
     direct_target_amp: Any,
     min_amp: Any,
     explicit_stop_or_safety_blocked: bool,
+    offer_hold_required: bool = False,
+    start_window_frozen: bool = False,
+    start_window_reduction_allowed: bool = False,
 ) -> bool:
     """Übergibt einen Direct-0A-Rand an die gemeinsame Halte-/Stopppolicy.
+
+    ``start_window_frozen`` (Startfenster der openWB Pro friert
+    das Angebot ein) hält jeden Direct-Ausgang, solange keine harte oder
+    explizite Stoppkante vorliegt. Ausgenommen ist eine Absenkung ab 6 A
+    unter das physisch stehende Angebot (``start_window_reduction_allowed``):
+    Sie folgt dem gemeinsamen Mindeststromrand wie außerhalb des Fensters;
+    0 A und Anhebungen bleiben beim Fenster.
+
+    ``offer_hold_required`` steht für ein nicht ziehendes Fahrzeug, dessen
+    Ladeende gerade geprüft wird oder das in Bereitschaft steht: Ein
+    Mindestangebot kostet dann nichts und wird gehalten statt genullt.
 
     Der Direct-Regler bleibt für physisch ladbare Sollströme zuständig. Fällt
     sein finales, bereits allokiertes Ziel bei laufender Ladung unter den
@@ -4653,14 +4966,847 @@ def curve_direct_shared_minimum_hold_required(
     """
 
     minimum = max(6.0, _safe_float(min_amp, 6.0))
+    if (
+        bool(start_window_frozen)
+        and not bool(explicit_stop_or_safety_blocked)
+        and not bool(start_window_reduction_allowed)
+    ):
+        return True
     # Die bestätigte Charge-Truth ist hier maßgeblich. Eine fehlende oder
     # unterminimierte Stromtelemetrie darf keinen eigenen Direct-0A-Ausgang
     # wieder freigeben; sie wird erst im gemeinsamen Folgepfad bewertet.
     return bool(
-        charging_running
+        (charging_running or offer_hold_required)
         and not explicit_stop_or_safety_blocked
         and _safe_float(direct_target_amp, 0.0) < minimum
     )
+
+
+CURVE_BATTERY_SUPPORT_SCHEMA = "wallbox_curve_battery_support_v1"
+
+
+def curve_battery_support_contract(
+    *,
+    relation: Any = "",
+    support_wh_used: Any = 0.0,
+    support_wh_limit: Any = 0.0,
+    wallbox_charging: bool = False,
+    runtime_raise_active: bool = False,
+    floor_mode: bool = False,
+    wbminsoc_gate_open: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Entscheidet die Akkustützung der Wallbox nach Korridorlage.
+
+    Policy-Entscheidung: Die Sollkurve entscheidet, nicht
+    ein fester SoC-Wert. Über dem Korridor ist Stützung erlaubt, im Korridor
+    wird geladen und gehalten, unter dem Korridor bekommt die Wallbox nur den
+    PV-Überschuss. An der Korridor-Untergrenze darf ein benanntes kleines
+    Energiekontingent Wolkenlücken beim Mindeststrom überbrücken; ist es
+    aufgebraucht, gilt PV-only. wbminSoC begrenzt nur die Stützung, nie das
+    PV-Laden; eine Laufzeit-Anhebung sperrt die Stützung sofort.
+
+    Der Vertrag liefert nur die Autorisierung und ihren Grund. Ob der Storage
+    Manager daraus ein PV-only-Budget und eine Entladegrenze macht, entscheidet
+    er selbst als Ein-Entscheider der Speicherseite.
+
+    In den Modi mit Akkuladen bis zur Untergrenze (``floor_mode``) begrenzt
+    allein wbminSoC die Stützung. Ist das wbminSoC-Tor dort geschlossen
+    (``wbminsoc_gate_open`` False), meldet der Vertrag keine Stützung mehr
+    (Grund ``wbminsoc_floor_closed``, Klasse ``floor_closed``), wo die
+    Korridortabelle sonst eine Stützung ausweisen würde. Ein bereits nicht
+    autorisiertes Ergebnis (Laufzeit-Anhebung, PV-only unter dem Korridor)
+    bleibt unverändert; ``PV-Kurve ruhig`` ist davon nicht berührt.
+    """
+
+    result = _curve_battery_support_by_relation(
+        relation=relation,
+        support_wh_used=support_wh_used,
+        support_wh_limit=support_wh_limit,
+        wallbox_charging=wallbox_charging,
+        runtime_raise_active=runtime_raise_active,
+    )
+    if (
+        bool(floor_mode)
+        and wbminsoc_gate_open is False
+        and result.get("authorized") is True
+    ):
+        result.update(
+            authorized=False,
+            reason="wbminsoc_floor_closed",
+            budget_class="floor_closed",
+        )
+    return result
+
+
+def _curve_battery_support_by_relation(
+    *,
+    relation: Any = "",
+    support_wh_used: Any = 0.0,
+    support_wh_limit: Any = 0.0,
+    wallbox_charging: bool = False,
+    runtime_raise_active: bool = False,
+) -> Dict[str, Any]:
+    """Korridortabelle der Akkustützung ohne wbminSoC-Bezug."""
+
+    rel = str(relation or "").strip().lower()
+    used = max(0.0, _safe_float(support_wh_used, 0.0))
+    limit = max(0.0, _safe_float(support_wh_limit, 0.0))
+    result = {
+        "contract": CURVE_BATTERY_SUPPORT_SCHEMA,
+        "authorized": True,
+        "reason": "curve_relation_unknown",
+        "budget_class": "full",
+        "relation": rel,
+        "support_wh_used": round(used, 1),
+        "support_wh_limit": round(limit, 1),
+        "support_wh_remaining": 0.0,
+        "wallbox_charging": bool(wallbox_charging),
+    }
+    if bool(runtime_raise_active):
+        result.update(authorized=False, reason="wbminsoc_runtime_raise", budget_class="pv_only")
+        return result
+    if rel == "above_ceiling":
+        result["reason"] = "curve_above_target"
+        return result
+    if rel == "inside_band":
+        result["reason"] = "curve_within_corridor"
+        return result
+    if rel == "below_floor":
+        remaining = max(0.0, limit - used)
+        result["support_wh_remaining"] = round(remaining, 1)
+        if limit > 0.0 and remaining > 0.0:
+            result.update(reason="curve_floor_wh_guard", budget_class="floor_contingent")
+            return result
+        result.update(authorized=False, reason="curve_below_target_pv_only", budget_class="pv_only")
+        return result
+    # no_curve / unknown / leer: die Kurve schränkt nichts ein.
+    return result
+
+
+WBMINSOC_FLOOR_DIRECT_MINIMUM_SCHEMA = "wallbox_wbminsoc_floor_direct_minimum_v1"
+# Besitzermodi mit Direktabsenkung an der wbminSoC-Untergrenze. ``Sofort bis
+# Preislimit`` nutzt ohne Preis- oder Netzfenster denselben Regelpfad bis zur
+# Untergrenze wie ``PV + Akku bis Untergrenze``; ``Akku bis Abfahrt`` behält
+# seinen eigenen Stop an der Untergrenze.
+WBMINSOC_FLOOR_DIRECT_MINIMUM_MODES = (MODE_TARGET, MODE_PRICE)
+
+
+def _non_negative_finite_or_none(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    number = _safe_float(value, float("nan"))
+    if not math.isfinite(number) or number < 0.0:
+        return None
+    return float(number)
+
+
+def wbminsoc_floor_direct_minimum_contract(
+    *,
+    floor_gate_closed: Any = False,
+    owner_public_mode: Any = MODE_OFF,
+    pv_budget_w: Any = None,
+    pv_budget_valid: Any = False,
+    owner_cap_w: Any = None,
+    min_amp: Any = 6.0,
+    actual_phases: Any = 0,
+    supports_phase_switch: Any = False,
+    prevent_phase_switch: Any = False,
+    line_voltage_v: Any = 230.0,
+) -> Dict[str, Any]:
+    """Direktabsenkung der marginalen Wallbox an der wbminSoC-Untergrenze.
+
+    ``floor_gate_closed`` sind die gruppenweiten Torfakten des Regelpfads mit
+    Akkuladen bis zur Untergrenze (Regelpfad 9/10, wbminSoC-Tor geschlossen,
+    kein Netz-, Preis-, Boost- oder Pre-Dump-Fenster). Gebunden wird hier an
+    den Aktionsbesitzer: Die Direktabsenkung erhält ein Besitzer in
+    ``PV + Akku bis Untergrenze`` oder in ``Sofort bis Preislimit``, der ohne
+    Preis- oder Netzfenster denselben Regelpfad nutzt
+    (``WBMINSOC_FLOOR_DIRECT_MINIMUM_MODES``) – unabhängig davon, welcher Modus
+    einer anderen gesteckten Wallbox den Gruppenmodus bestimmt. ``Akku bis
+    Abfahrt`` behält seinen eigenen Stop an der Untergrenze.
+
+    Maßgeblich ist das PV-Budget des Besitzers: der kleinere Wert aus dem
+    batterieneutralen Gruppen-PV-Budget (``pv_budget_w``) und seiner eigenen
+    versiegelten Zuteilung (``owner_cap_w``). Trägt es die Mindestleistung der
+    aktuell belegten Phasenzahl nicht, ist der Vertrag aktiv. Für ein
+    schaltbares Paar, das dreiphasig lädt, meldet ``one_phase_carried``, ob
+    dasselbe Budget das 1p-Minimum trägt; nur dann darf die Kaskade nach dem
+    Kontodurchlauf auf 1p wechseln statt zu stoppen. Fehlt einer der beiden
+    Werte oder ist er ungültig, gilt das Budget als nicht tragfähig; die
+    Absenkung auf den Mindeststrom ist die sichere Richtung, der Stop bleibt
+    an das Energiekonto gebunden.
+
+    ``entry_immediate`` sagt, ob die Absenkung ohne Eintrittsbestätigung
+    erfolgen darf: wenn für den Besitzer kein PV anliegt (Gruppen-PV 0 W oder
+    eigene Zuteilung 0 W) oder das Gruppen-PV-Budget unbekannt ist. Liegt noch
+    PV an (Dämmerung, Wolke), bestätigt die Kaskade die Unterdeckung zuerst
+    über eine Haltezeit (Anti-Flattern). Der Vertrag selbst ist zustandslos;
+    das wbminSoC-Tor trägt die SoC-Hysterese. Er erteilt weder Start noch
+    Anhebung.
+    """
+
+    mode = normalize_wb_mode(owner_public_mode)
+    minimum = max(1.0, _safe_float(min_amp, 6.0))
+    voltage = max(1.0, _safe_float(line_voltage_v, 230.0))
+    phases = int(_safe_float(actual_phases, 0.0))
+    if phases not in (1, 3):
+        phases = 0
+    switchable = bool(supports_phase_switch is True and prevent_phase_switch is not True)
+    required_phases = phases
+    required_w = minimum * voltage * float(required_phases) if required_phases else 0.0
+    one_phase_w = minimum * voltage
+    group_budget = (
+        _non_negative_finite_or_none(pv_budget_w)
+        if pv_budget_valid is True
+        else None
+    )
+    owner_cap = _non_negative_finite_or_none(owner_cap_w)
+    owner_budget = (
+        min(group_budget, owner_cap)
+        if group_budget is not None and owner_cap is not None
+        else None
+    )
+    budget_ok = owner_budget is not None
+    pv_carries_minimum = bool(
+        budget_ok and required_w > 0.0 and owner_budget + 1e-6 >= required_w
+    )
+    one_phase_carried = bool(
+        switchable
+        and phases == 3
+        and budget_ok
+        and owner_budget + 1e-6 >= one_phase_w
+    )
+    pv_present = bool(
+        group_budget is not None
+        and group_budget > 0.0
+        and not (owner_cap is not None and owner_cap <= 0.0)
+    )
+    result = {
+        "schema": WBMINSOC_FLOOR_DIRECT_MINIMUM_SCHEMA,
+        "active": False,
+        "reason": "",
+        "owner_public_mode": int(mode),
+        "floor_gate_closed": bool(floor_gate_closed is True),
+        "group_pv_budget_w": round(group_budget, 3) if group_budget is not None else None,
+        "owner_cap_w": round(owner_cap, 3) if owner_cap is not None else None,
+        "pv_budget_w": round(owner_budget, 3) if budget_ok else None,
+        "pv_budget_valid": budget_ok,
+        "pv_carries_minimum": pv_carries_minimum,
+        "pv_present": pv_present,
+        "entry_immediate": not pv_present,
+        "required_w": round(required_w, 3),
+        "required_phases": int(required_phases),
+        "minimum_amp": round(minimum, 3),
+        "switchable": switchable,
+        "one_phase_required_w": round(one_phase_w, 3),
+        "one_phase_carried": one_phase_carried,
+    }
+    if floor_gate_closed is not True:
+        result["reason"] = "wbminsoc_floor_not_closed"
+    elif mode not in WBMINSOC_FLOOR_DIRECT_MINIMUM_MODES:
+        result["reason"] = "owner_mode_not_floor_direct"
+    elif required_phases not in (1, 3):
+        result["reason"] = "actual_phase_unproven"
+    elif pv_carries_minimum:
+        result["reason"] = "pv_carries_minimum"
+    else:
+        result.update(
+            active=True,
+            reason=(
+                "wbminsoc_floor_pv_below_minimum"
+                if budget_ok
+                else "wbminsoc_floor_pv_budget_unknown"
+            ),
+        )
+    return result
+
+
+PV_ONLY_RUNNING_MINIMUM_HOLD_SCHEMA = "wallbox_pv_only_running_minimum_hold_v1"
+
+
+def pv_only_running_minimum_hold_contract(
+    *,
+    pv_only_class: bool = False,
+    running: bool = False,
+    slot_amp: Any = 0,
+    reported_amp: Any = None,
+    min_amp: Any = 6,
+    phases: Any = 1,
+    wb_id: Any = 0,
+    cycle_token: Any = "",
+    plug_session_id: Any = "",
+    blockers: Any = (),
+    plug_connected: Any = None,
+) -> Dict[str, Any]:
+    """Mindesthalt einer laufenden Wallbox in PV-only-Klasse.
+
+    Erhält eine laufende Wallbox in der Kurvenklasse pv_only (Korridor unter-
+    schritten, Wh-Kontingent verbraucht) einen Zuteilungsslot unter dem
+    Mindeststrom, wird sie sofort auf den Mindeststrom gesetzt, statt ihren
+    Iststrom (aus dem Akku gedeckt) bis zum Netzbezug zu halten.
+    Der Vertrag ist reine Ausgangsautorität: Allokations-, Watt- und
+    Effektivstromvertrag lassen genau den Mindeststrom passieren. Er ändert
+    die Zuteilung nicht, erteilt weder Start (Ist unter Mindeststrom) noch
+    Hochregelung noch Stop; der Stop bleibt an das PV-Hybrid-Gate
+    (Wh-Integral) bzw. die Defizit-Kaskade gebunden. Ein Slot ab
+    Mindeststrom braucht keinen Halt (strict_down senkt direkt ab). Die
+    Klassen full und floor_contingent sind nicht betroffen. Der Ist-Beleg
+    ist ausschließlich der frische Hardware-Readback (``reported_amp``);
+    ohne Readback bleibt der Halt inaktiv. Der Storage Manager entscheidet
+    weiterhin allein, aus welcher Quelle der Mindeststrom gedeckt wird.
+
+    Der Vertrag spiegelt seine Eingaben
+    ``pv_only_class``, ``running`` und ``plug_connected`` (True/False nur aus
+    frischem Status, sonst None) im Ergebnis, damit die Freigabe-Hysterese
+    einen nicht frischen Status (openWB-Poll-Aussetzer) von einem echten Ende
+    (frisch nicht laufend, abgesteckt, Klassenwechsel) unterscheiden kann.
+    Die Vertragslogik selbst ist unveraendert.
+    """
+
+    minimum = max(1, int(_safe_float(min_amp, 6.0)))
+    slot = max(0, int(_safe_float(slot_amp, 0.0)))
+    reported_known = reported_amp is not None
+    observed = max(0.0, _safe_float(reported_amp, 0.0)) if reported_known else 0.0
+    phase_count = int(_safe_float(phases, 1.0))
+    if phase_count not in (1, 2, 3):
+        phase_count = 1
+    blocker_list = [
+        str(item).strip()
+        for item in (blockers or ())
+        if str(item or "").strip()
+    ]
+    result = {
+        "schema": PV_ONLY_RUNNING_MINIMUM_HOLD_SCHEMA,
+        "active": False,
+        "reason": "",
+        "wb_id": int(_safe_float(wb_id, 0.0)),
+        "cycle_token": str(cycle_token or ""),
+        "plug_session_id": str(plug_session_id or ""),
+        "slot_amp": slot,
+        "observed_amp": round(observed, 3),
+        "reported_offer_known": bool(reported_known),
+        "min_amp": minimum,
+        "phases": phase_count,
+        "hold_amp": 0.0,
+        "hold_w": 0.0,
+        "blockers": blocker_list,
+        # Eingabespiegel fuer die Freigabe-Hysterese.
+        "pv_only_class": bool(pv_only_class),
+        "running": bool(running),
+        "plug_connected": (
+            None if plug_connected is None else bool(plug_connected)
+        ),
+    }
+    if blocker_list:
+        result["reason"] = "blocked:" + blocker_list[0]
+    elif not pv_only_class:
+        result["reason"] = "not_pv_only_class"
+    elif not running:
+        result["reason"] = "not_running"
+    elif slot >= minimum:
+        result["reason"] = "slot_covers_minimum"
+    elif not reported_known:
+        result["reason"] = "fresh_reported_offer_missing"
+    elif observed + 1e-9 < float(minimum):
+        result["reason"] = "observed_below_minimum"
+    elif result["wb_id"] <= 0 or not result["cycle_token"]:
+        result["reason"] = "binding_incomplete"
+    else:
+        result.update(
+            active=True,
+            reason="pv_only_running_minimum_hold",
+            hold_amp=float(minimum),
+            hold_w=float(minimum) * 230.0 * float(phase_count),
+        )
+    return result
+
+
+PV_ONLY_RUNNING_MINIMUM_HOLD_RELEASE_SCHEMA = (
+    "wallbox_pv_only_running_minimum_hold_release_v1"
+)
+PV_ONLY_RUNNING_MINIMUM_HOLD_STATE_SCHEMA = (
+    "wallbox_pv_only_running_minimum_hold_state_v1"
+)
+PV_ONLY_RUNNING_MINIMUM_HOLD_RELEASE_DEFAULT_S = 120.0
+PV_ONLY_RUNNING_MINIMUM_HOLD_RELEASE_MIN_S = 30.0
+# Gnadenfrist, in der ein nicht frischer
+# Treiberstatus (openWB-Poll-Aussetzer) oder ein transienter Blocker den
+# Episodenzustand der Freigabe-Hysterese traegt, ohne einen Halt zu erteilen.
+PV_ONLY_RUNNING_MINIMUM_HOLD_STALE_GUARD_DEFAULT_S = 45.0
+PV_ONLY_RUNNING_MINIMUM_HOLD_STALE_GUARD_MIN_S = 10.0
+PV_ONLY_RUNNING_MINIMUM_HOLD_STALE_GUARD_MAX_S = 300.0
+PV_ONLY_RUNNING_MINIMUM_HOLD_TRANSIENT_BLOCKERS = ("group_allocation_not_ready",)
+
+
+# Wiederanlauf nach einem
+# Kaskaden-Stop des Gruppen-Defizitreglers nur mit stabilem PV-Budget.
+DEFICIT_RESTART_BUDGET_STABLE_SCHEMA = "wallbox_deficit_restart_budget_stable_v1"
+DEFICIT_RESTART_BUDGET_STABLE_STATE_SCHEMA = (
+    "wallbox_deficit_restart_budget_stable_state_v1"
+)
+DEFICIT_RESTART_BUDGET_STABLE_DEFAULT_S = 120.0
+DEFICIT_RESTART_BUDGET_STABLE_MIN_S = 30.0
+# Lueckenwaechter der
+# Stabilitaetsuhr – groesster zulaessiger Abstand zweier Bewertungen (s);
+# darueber beginnt die Uhr neu (nicht bewertete Zeit ist keine Deckung).
+DEFICIT_RESTART_BUDGET_STABLE_MAX_GAP_S = 30.0
+# Stop-Gruende der Kaskade (Netz-, Budget- und Akku-Wh-Konto), die den
+# Vertrag bewaffnen; alle drei sind Budget-Defizite derselben Stecksession.
+DEFICIT_RESTART_CASCADE_STOP_REASONS = (
+    "battery_support_threshold",
+    "minimum_current_energy_reached",
+    "phase_cooldown_minimum_grid_stop",
+)
+# Stops nach gescheitertem/verspaetetem Phasenabstieg
+# (phase_down_failed_<grid|battery>_stop, phase_down_timeout_<grid|battery>_stop)
+# sind dieselben Budget-Defizite der Kaskade und armieren den Vertrag ebenfalls.
+DEFICIT_RESTART_CASCADE_STOP_REASON_PREFIXES = (
+    "phase_down_failed_",
+    "phase_down_timeout_",
+)
+
+
+def deficit_restart_budget_stable_gate(
+    *,
+    previous: Any = None,
+    stop_completion: Any = None,
+    wb_id: Any = 0,
+    plug_session_id: Any = "",
+    budget_w: Any = None,
+    budget_valid: Any = False,
+    required_w: Any = 0.0,
+    phases: Any = 1,
+    real_charging: Any = False,
+    grid_unlocked: Any = False,
+    user_off: Any = False,
+    force_start: Any = False,
+    now_ts: Any = 0.0,
+    hold_s: Any = DEFICIT_RESTART_BUDGET_STABLE_DEFAULT_S,
+    max_gap_s: Any = DEFICIT_RESTART_BUDGET_STABLE_MAX_GAP_S,
+) -> Dict[str, Any]:
+    """Wiederanlauf nur mit stabilem PV-Budget.
+
+    „Das PV-Budget muss zur Phasenanzahl passen, also stabil.“ Nach einem
+    bestaetigten Kaskaden-Stop des Gruppen-Defizitreglers (Marker
+    ``_wallbox_group_deficit_stop_completion`` mit ``completed`` True,
+    ``owner_id`` == Ladepunkt, derselben ``plug_session_id`` und einem
+    Stop-Grund aus ``DEFICIT_RESTART_CASCADE_STOP_REASONS``) darf der
+    Ladepunkt erst wieder starten, wenn ``budget_w`` (batterieneutrales
+    PV-Budget) die Mindestleistung ``required_w`` der erwarteten Phasenzahl
+    (6 A · 230 V · Phasen) ununterbrochen ``hold_s`` (Standard 120 s,
+    mindestens 30 s) lang deckt. Ein einzelner Spitzenwert (Wolkenluecke)
+    startet nicht: jede Luecke und jeder ungueltige Frame (``budget_valid``
+    False, unbekannte Phasenzahl) setzt die Uhr auf null – fehlende Daten
+    sind keine Freigabe. Der Zustand ist an Ladepunkt, Stecksession und den
+    geloeschten Aktions-Latch des Stops gebunden; ein Marker einer anderen
+    Session oder eines anderen Owners bewaffnet nichts (Erststart nach dem
+    Anstecken bleibt unveraendert). Netz-/Preis-/Boost-Fenster
+    (``grid_unlocked``) blockieren nicht (die Uhr laeuft dabei nicht);
+    Nutzer-``Aus`` und ein ausdruecklicher Start (auch ``released_by`` im
+    Marker) geben die Episode frei, bis ein NEUER Stop mit anderem Latch
+    kommt; reale Ladung verbraucht die Episode (kein Blocker mehr). Reine
+    Funktion: liefert ``contract`` (Diagnose, ``blocked``) und ``state``.
+
+    Die Uhr ist an die
+    Anforderung gebunden – steigt ``required_w`` gegenueber dem zaehlenden
+    Vorzustand (z. B. 1p → 3p), beginnt sie neu (``clock_reset``
+    'required_rose'); sinkt sie (3p → 1p), laeuft sie weiter, weil das
+    niedrigere Niveau die ganze Zeit gedeckt war. Liegt zwischen zwei
+    Bewertungen mehr als ``max_gap_s`` (Klemmung ≥ 30 s), beginnt sie
+    ebenfalls neu (``clock_reset`` 'eval_gap'): nicht bewertete Zeit ist
+    keine Deckung.
+    """
+
+    now = _safe_float(now_ts, 0.0)
+    hold = max(
+        DEFICIT_RESTART_BUDGET_STABLE_MIN_S,
+        _safe_float(hold_s, DEFICIT_RESTART_BUDGET_STABLE_DEFAULT_S),
+    )
+    wb = int(_safe_float(wb_id, 0.0))
+    session = str(plug_session_id or "").strip()
+    marker = stop_completion if isinstance(stop_completion, dict) else {}
+    latch = str(marker.get("cleared_action_latch_id") or "").strip()
+    stop_reason = str(marker.get("stop_reason") or "").strip()
+    released_by = str(marker.get("released_by") or "").strip()
+    phase_count = int(_safe_float(phases, 0.0))
+    if phase_count not in (1, 2, 3):
+        phase_count = 0
+    required = _safe_float(required_w, 0.0)
+    budget_known = bool(
+        budget_w is not None and not isinstance(budget_w, bool)
+    )
+    budget = _safe_float(budget_w, -1.0) if budget_known else -1.0
+    budget_ok_data = bool(
+        budget_valid is True
+        and budget_known
+        and math.isfinite(budget)
+        and budget >= 0.0
+        and phase_count > 0
+        and required > 0.0
+    )
+    if not marker or marker.get("completed") is not True:
+        marker_state = "marker_missing"
+    elif wb <= 0 or int(_safe_float(marker.get("owner_id"), 0.0)) != wb:
+        marker_state = "other_owner"
+    elif not session or str(marker.get("plug_session_id") or "").strip() != session:
+        marker_state = "other_session"
+    elif stop_reason not in DEFICIT_RESTART_CASCADE_STOP_REASONS and not stop_reason.startswith(
+        DEFICIT_RESTART_CASCADE_STOP_REASON_PREFIXES
+    ):
+        marker_state = "not_cascade_stop"
+    elif not latch:
+        marker_state = "latch_missing"
+    else:
+        marker_state = "armed"
+    prev = previous if isinstance(previous, dict) else {}
+    prev_bound = bool(
+        prev.get("schema") == DEFICIT_RESTART_BUDGET_STABLE_STATE_SCHEMA
+        and marker_state == "armed"
+        and int(_safe_float(prev.get("wb_id"), 0.0)) == wb
+        and str(prev.get("plug_session_id") or "") == session
+        and str(prev.get("latch_id") or "") == latch
+    )
+    prev_phase = str(prev.get("phase") or "") if prev_bound else ""
+    prev_counting = bool(prev.get("counting")) if prev_bound else False
+    prev_since = _safe_float(prev.get("since_ts"), 0.0) if prev_bound else 0.0
+    # Anforderung und Zeitpunkt der letzten Bewertung
+    # des Vorzustands (Uhr neu bei Phasenanstieg oder Bewertungsluecke).
+    prev_required = (
+        _safe_float(prev.get("required_w"), 0.0) if prev_bound else 0.0
+    )
+    prev_eval = _safe_float(prev.get("last_eval_ts"), 0.0) if prev_bound else 0.0
+    gap_limit = max(
+        DEFICIT_RESTART_BUDGET_STABLE_MAX_GAP_S,
+        _safe_float(max_gap_s, DEFICIT_RESTART_BUDGET_STABLE_MAX_GAP_S),
+    )
+    state = {
+        "schema": DEFICIT_RESTART_BUDGET_STABLE_STATE_SCHEMA,
+        "phase": "idle",
+        "wb_id": wb,
+        "plug_session_id": session,
+        "latch_id": latch if marker_state == "armed" else "",
+        "counting": False,
+        "since_ts": 0.0,
+        "hold_s": hold,
+        "released_by": "",
+        "required_w": round(required, 3),
+        "phases": phase_count,
+        "last_eval_ts": now,
+    }
+    contract = {
+        "schema": DEFICIT_RESTART_BUDGET_STABLE_SCHEMA,
+        "wb_id": wb,
+        "plug_session_id": session,
+        "armed": marker_state == "armed",
+        "blocked": False,
+        "stable": False,
+        "reason": "",
+        "marker": marker_state,
+        "stop_reason": stop_reason,
+        "cleared_action_latch_id": latch,
+        "required_w": round(required, 3),
+        "phases": phase_count,
+        "budget_w": round(budget, 3) if budget_known else None,
+        "budget_valid": budget_ok_data,
+        "hold_s": hold,
+        "restart_stable_since_ts": 0.0,
+        "held_s": 0.0,
+        "remaining_s": 0.0,
+        "released_by": "",
+        "max_gap_s": gap_limit,
+        "eval_gap_s": 0.0,
+        "clock_reset": "",
+    }
+    result = {
+        "schema": DEFICIT_RESTART_BUDGET_STABLE_SCHEMA,
+        "contract": contract,
+        "state": state,
+    }
+    if marker_state != "armed":
+        contract["reason"] = "no_cascade_stop"
+        return result
+    if released_by or user_off is True or force_start is True or prev_phase == "released":
+        by = released_by or (
+            "user_off"
+            if user_off is True
+            else "force_start"
+            if force_start is True
+            else str(prev.get("released_by") or "released")
+        )
+        contract.update(reason="released_" + by, released_by=by)
+        state.update(phase="released", released_by=by)
+        return result
+    if real_charging is True or prev_phase == "consumed":
+        contract["reason"] = (
+            "consumed_real_charging" if real_charging is True else "consumed"
+        )
+        state["phase"] = "consumed"
+        return result
+    if grid_unlocked is True:
+        contract["reason"] = "grid_unlocked"
+        state["phase"] = "armed"
+        return result
+    covered = bool(budget_ok_data and budget + 1e-9 >= required)
+    counting = covered
+    # Uhr neu, wenn die Anforderung gegenueber dem
+    # zaehlenden Vorzustand gestiegen ist (1p → 3p) oder die letzte Bewertung
+    # laenger als gap_limit zurueckliegt (Bewertungsluecke).
+    clock_reset = ""
+    eval_gap = max(0.0, now - prev_eval) if prev_counting else 0.0
+    if covered and prev_counting:
+        if required > prev_required + 1e-6:
+            clock_reset = "required_rose"
+        elif eval_gap > gap_limit + 1e-9:
+            clock_reset = "eval_gap"
+    continues = bool(prev_counting and not clock_reset)
+    since = (prev_since if continues else now) if covered else 0.0
+    if counting and since > now:
+        # Rundung/negative Zeitbasis: nie in die Zukunft zaehlen.
+        since = now
+    held = max(0.0, now - since) if counting else 0.0
+    stable = bool(counting and held + 1e-9 >= hold)
+    remaining = 0.0 if stable else (max(0.0, hold - held) if counting else hold)
+    contract.update(
+        blocked=not stable,
+        stable=stable,
+        reason="satisfied" if stable else "deficit_restart_budget_unstable",
+        restart_stable_since_ts=since if counting else 0.0,
+        held_s=round(held, 1),
+        remaining_s=round(remaining, 1),
+        eval_gap_s=round(eval_gap, 1),
+        clock_reset=clock_reset,
+    )
+    state.update(phase="armed", counting=counting, since_ts=since if counting else 0.0)
+    return result
+
+
+def pv_only_running_minimum_hold_release_gate(
+    *,
+    contract: Any = None,
+    previous: Any = None,
+    now_ts: Any = 0.0,
+    release_hold_s: Any = PV_ONLY_RUNNING_MINIMUM_HOLD_RELEASE_DEFAULT_S,
+    stale_guard_s: Any = PV_ONLY_RUNNING_MINIMUM_HOLD_STALE_GUARD_DEFAULT_S,
+) -> Dict[str, Any]:
+    """Freigabe-Hysterese des Mindesthalts.
+
+    Der Allokator wechselte bei einem Budget um das 3p-Minimum (4140 W) je
+    Zyklus zwischen zwei Wallboxen (Mindeststrom/Slot 0 und umgekehrt). Der reine
+    Haltevertrag folgte dem Slot und liess eine Wallbox zwischen Halt
+    und Setz-Zweig pendeln; das PV-Hybrid-Energiegate setzte sein negatives
+    Wh-Integral bei jeder Alternation zurueck. Ist der Halt einmal aktiv,
+    wird eine Slot-Erhoehung erst uebernommen, wenn der Slot ununterbrochen
+    mindestens ``release_hold_s`` (Standard 120 s, mindestens 30 s) ueber dem
+    Mindeststrom stand; Slot 0 haelt sofort wieder (Kandidat verfaellt).
+    Der Zustand ist je Wallbox und Stecksession gebunden; Klassenwechsel,
+    Blocker, Stop, fehlender Readback oder Ist unter Mindeststrom beenden die
+    Episode sofort - die Hysterese erteilt nie einen Halt, den der reine
+    Vertrag nicht auch bei Slot 0 erteilen wuerde. Reine Funktion: liefert den
+    (ggf. auf ``release_pending`` angehobenen) Vertrag und den neuen Zustand.
+
+    Ein einzelner openWB-Poll-Aussetzer
+    (Status nicht frisch -> ``not_running`` bzw. ``fresh_reported_offer_missing``
+    ohne frischen Readback) oder der transiente Blocker
+    ``group_allocation_not_ready`` setzte den Zustand auf idle; der naechste
+    Zyklus mit vollem Slot traf auf ``no_episode`` und setzte den vollen Slotstrom auf
+    den Draht, der übernächste (Slot 0) wieder den Mindeststrom. Solche Zyklen tragen den
+    Episodenzustand jetzt fuer ``stale_guard_s`` (Standard 45 s, 10..300 s)
+    weiter (``release_gate`` ``stale_guard:<grund>``): Es wird kein Halt
+    erteilt, und die Kandidatenzeit der Freigabe laeuft nicht weiter (sie wird
+    um die Luecke verschoben). Dauert der Aussetzer laenger als die Gnadenfrist,
+    endet die Episode (``episode_ended:stale_guard_expired:<grund>``).
+    Klassenwechsel, budget_timeout, force_wallbox_stop und andere Blocker,
+    frisch nicht laufend sowie Ist unter Mindeststrom beenden die Episode
+    weiterhin sofort. Eine frisch gemeldete Steckkante (``plug_connected``
+    False) beendet die Episode unabhaengig von der Session-ID
+    (``episode_ended:disconnected``) - fuer Treiber mit leerer Session-ID ist
+    das die Bindung an die Stecksession.
+    """
+
+    base = dict(contract) if isinstance(contract, dict) else {}
+    base.setdefault("schema", PV_ONLY_RUNNING_MINIMUM_HOLD_SCHEMA)
+    base.setdefault("active", False)
+    base.setdefault("reason", "")
+    base.setdefault("hold_amp", 0.0)
+    base.setdefault("hold_w", 0.0)
+    now = _safe_float(now_ts, 0.0)
+    release_s = max(
+        PV_ONLY_RUNNING_MINIMUM_HOLD_RELEASE_MIN_S,
+        _safe_float(release_hold_s, PV_ONLY_RUNNING_MINIMUM_HOLD_RELEASE_DEFAULT_S),
+    )
+    guard_s = min(
+        PV_ONLY_RUNNING_MINIMUM_HOLD_STALE_GUARD_MAX_S,
+        max(
+            PV_ONLY_RUNNING_MINIMUM_HOLD_STALE_GUARD_MIN_S,
+            _safe_float(
+                stale_guard_s, PV_ONLY_RUNNING_MINIMUM_HOLD_STALE_GUARD_DEFAULT_S
+            ),
+        ),
+    )
+    wb_id = int(_safe_float(base.get("wb_id"), 0.0))
+    plug_session_id = str(base.get("plug_session_id") or "")
+    reason = str(base.get("reason") or "")
+    prev = previous if isinstance(previous, dict) else {}
+    prev_bound = bool(
+        prev.get("schema") == PV_ONLY_RUNNING_MINIMUM_HOLD_STATE_SCHEMA
+        and wb_id > 0
+        and int(_safe_float(prev.get("wb_id"), 0.0)) == wb_id
+        and str(prev.get("plug_session_id") or "") == plug_session_id
+        and str(prev.get("phase") or "") in ("hold", "release_pending")
+    )
+    prev_hold_since = _safe_float(prev.get("hold_since"), 0.0) if prev_bound else 0.0
+    prev_candidate_since = (
+        _safe_float(prev.get("release_candidate_since"), 0.0) if prev_bound else 0.0
+    )
+    prev_phase = str(prev.get("phase") or "") if prev_bound else ""
+    prev_stale_since = _safe_float(prev.get("stale_since"), 0.0) if prev_bound else 0.0
+    idle_state = {
+        "schema": PV_ONLY_RUNNING_MINIMUM_HOLD_STATE_SCHEMA,
+        "phase": "idle",
+        "wb_id": wb_id,
+        "plug_session_id": plug_session_id,
+        "hold_since": 0.0,
+        "release_candidate_since": 0.0,
+        "release_hold_s": release_s,
+        "stale_since": 0.0,
+        "stale_guard_s": guard_s,
+    }
+    base.update(
+        release_pending=False,
+        release_hold_s=release_s,
+        release_remaining_s=0.0,
+        hold_since=0.0,
+        deferred_slot_amp=0,
+        release_gate="",
+        stale_guard_s=guard_s,
+        stale_guard_remaining_s=0.0,
+    )
+    result = {
+        "schema": PV_ONLY_RUNNING_MINIMUM_HOLD_RELEASE_SCHEMA,
+        "contract": base,
+        "state": idle_state,
+    }
+    if base.get("active") is True:
+        hold_since = prev_hold_since if prev_hold_since > 0.0 else now
+        base["hold_since"] = hold_since
+        base["release_gate"] = "hold_active"
+        result["state"] = dict(idle_state, phase="hold", hold_since=hold_since)
+        return result
+    if not prev_bound:
+        base["release_gate"] = "no_episode"
+        return result
+    minimum = max(1, int(_safe_float(base.get("min_amp"), 6.0)))
+    status_fresh = base.get("reported_offer_known") is True
+    observed_ok = bool(
+        status_fresh
+        and _safe_float(base.get("observed_amp"), 0.0) + 1e-9 >= float(minimum)
+    )
+    # Frisch gemeldete Steckkante beendet
+    # die Episode unabhaengig von der (ggf. leeren) Session-ID.
+    if base.get("plug_connected") is False:
+        base["release_gate"] = "episode_ended:disconnected"
+        return result
+    # Nicht frischer Status (Poll-Aussetzer) oder transiente
+    # Blocker tragen den Zustand fuer die Gnadenfrist - ohne Halt. Ein frisch
+    # belegtes Ende (nicht laufend) oder ein Klassenwechsel traegt nie.
+    running_flag = base.get("running")
+    fresh_not_running = bool(status_fresh and running_flag is False)
+    blocker_list = [str(item or "") for item in (base.get("blockers") or ())]
+    transient = False
+    if base.get("pv_only_class") is not False and not fresh_not_running:
+        if reason == "fresh_reported_offer_missing":
+            transient = True
+        elif reason in ("not_running", "slot_covers_minimum") and not status_fresh:
+            transient = True
+        elif (
+            reason.startswith("blocked:")
+            and blocker_list
+            and all(
+                item in PV_ONLY_RUNNING_MINIMUM_HOLD_TRANSIENT_BLOCKERS
+                for item in blocker_list
+            )
+        ):
+            transient = True
+    if transient:
+        stale_since = prev_stale_since if prev_stale_since > 0.0 else now
+        stale_s = max(0.0, now - stale_since)
+        if stale_s > guard_s + 1e-9:
+            base["release_gate"] = "episode_ended:stale_guard_expired:" + reason
+            return result
+        base["release_gate"] = "stale_guard:" + reason
+        base["hold_since"] = prev_hold_since
+        base["stale_guard_remaining_s"] = round(max(0.0, guard_s - stale_s), 1)
+        result["state"] = dict(
+            idle_state,
+            phase=prev_phase,
+            hold_since=prev_hold_since,
+            release_candidate_since=prev_candidate_since,
+            stale_since=stale_since,
+        )
+        return result
+    if reason != "slot_covers_minimum":
+        base["release_gate"] = "episode_ended:" + reason
+        return result
+    if not observed_ok:
+        base["release_gate"] = "episode_ended:observed_below_minimum"
+        return result
+    candidate_since = prev_candidate_since if prev_candidate_since > 0.0 else now
+    if prev_stale_since > 0.0 and prev_candidate_since > 0.0:
+        # Die Kandidatenzeit lief waehrend der Luecke nicht
+        # weiter - um die Dauer der Luecke nach hinten verschieben.
+        candidate_since = min(
+            now, candidate_since + max(0.0, now - prev_stale_since)
+        )
+    held_s = max(0.0, now - candidate_since)
+    if held_s + 1e-9 >= release_s:
+        base["release_gate"] = "released_after_hold"
+        return result
+    phase_count = int(_safe_float(base.get("phases"), 1.0))
+    if phase_count not in (1, 2, 3):
+        phase_count = 1
+    base.update(
+        active=True,
+        reason="pv_only_running_minimum_hold_release_pending",
+        hold_amp=float(minimum),
+        hold_w=float(minimum) * 230.0 * float(phase_count),
+        release_pending=True,
+        release_remaining_s=round(max(0.0, release_s - held_s), 1),
+        hold_since=prev_hold_since,
+        deferred_slot_amp=max(0, int(_safe_float(base.get("slot_amp"), 0.0))),
+        release_gate="release_pending",
+    )
+    result["state"] = dict(
+        idle_state,
+        phase="release_pending",
+        hold_since=prev_hold_since,
+        release_candidate_since=candidate_since,
+    )
+    return result
+
+
+def curve_floor_support_wh_limit(
+    configured_wh: Any = None,
+    capacity_kwh: Any = None,
+    *,
+    min_wh: Any = 50.0,
+    share: Any = 0.005,
+) -> float:
+    """Wh-Kontingent an der Korridor-Untergrenze: 0,5 % der Speicherkapazität.
+
+    Die kleinste belastbare SoC-Auflösung des E3DC liegt bei 1 %-Schritten,
+    die Korridortoleranz bei 3 %; ein halbes Prozent der Nettokapazität ist
+    damit unterhalb jeder Kurvenauflösung und deckt bei 20 kWh (100 Wh) den
+    dreiphasigen Mindeststrom für rund anderthalb Minuten Wolke. Untergrenze
+    50 Wh, damit auch kleine Speicher eine Wolkenlücke überbrücken. Ein
+    ausdrücklich konfigurierter Wert > 0 hat Vorrang, nie unter der Untergrenze.
+    """
+
+    floor = max(0.0, _safe_float(min_wh, 50.0))
+    configured = _safe_float(configured_wh, 0.0)
+    if configured > 0.0:
+        return max(floor, configured)
+    capacity_wh = max(0.0, _safe_float(capacity_kwh, 0.0)) * 1000.0
+    return max(floor, capacity_wh * max(0.0, _safe_float(share, 0.005)))
 
 
 def openwb_mode9_pv_phase_down_required(
@@ -4698,6 +5844,7 @@ def phase_3p_budget_support_contract(
     strong_export_threshold_w: float,
     fresh_budget_authorized: bool,
     strong_export_safety_clear: bool,
+    up_grid_power_w: Any = None,
 ) -> Dict[str, Any]:
     """Trennt das physische 3p-Minimum vom 1→3-Hochwechselpuffer.
 
@@ -4706,6 +5853,8 @@ def phase_3p_budget_support_contract(
     bei starkem Export schon mit dem frischen, autorisierten physischen
     Mindestbudget als tragfähig gelten. Safety- und Freshness-Gates werden
     dabei nicht ersetzt, sondern als explizite Voraussetzung gebunden.
+    ``up_grid_power_w`` (30-s-Rohmittel) ersetzt nur für das
+    Netz-Kriterium des gewöhnlichen Aufstiegs den gefilterten Netzwert.
     """
 
     budget_w = max(0.0, _safe_float(phase_budget_w, 0.0))
@@ -4713,6 +5862,7 @@ def phase_3p_budget_support_contract(
     minimum_w = max(0.0, _safe_float(phase_3p_min_w, 0.0))
     buffer_w = max(0.0, _safe_float(phase_up_buffer_w, 0.0))
     grid_w = _safe_float(grid_power_w, 0.0)
+    up_grid_w = grid_w if up_grid_power_w is None else _safe_float(up_grid_power_w, grid_w)
     up_grid_allow_w = _safe_float(phase_up_grid_allow_w, 0.0)
     export_threshold_w = max(
         0.0,
@@ -4722,7 +5872,7 @@ def phase_3p_budget_support_contract(
 
     ordinary_up_supported = bool(
         budget_w >= minimum_w + buffer_w
-        and (grid_w < up_grid_allow_w or ordinary_override_allowed)
+        and (up_grid_w < up_grid_allow_w or ordinary_override_allowed)
     )
     strong_export_supported = bool(
         openwb_pro
@@ -4746,7 +5896,249 @@ def phase_3p_budget_support_contract(
         "up_buffer_w": buffer_w,
         "strong_export_threshold_w": export_threshold_w,
         "phase_target": target,
+        "up_grid_power_w": round(up_grid_w, 1),
     }
+
+
+PHASE_INDIVIDUAL_BUDGET_SCHEMA = "wallbox_phase_individual_budget_v1"
+
+
+IDLE_START_BUDGET_PROJECTION_SCHEMA = (
+    "wallbox_idle_start_budget_projection_v1"
+)
+
+
+def idle_start_budget_projection_contract(
+    *,
+    idle_phases: Any,
+    observed_phases: Any,
+    evse_phase_switch_capable: bool,
+    status_fresh: bool,
+    connected: bool,
+    start_attempt_consumed: bool,
+    authorized_budget_w: Any,
+    minimum_amp: Any = 6.0,
+    voltage_v: Any = 230.0,
+) -> Dict[str, Any]:
+    """Trennt die energetische Startprojektion von der elektrischen Reservierung.
+
+    Ein ruhender Ladepunkt ohne Istphasenbeleg wird konservativ dreiphasig
+    reserviert. Wird derselbe konservative Wert auch für die energetische
+    Projektion verwendet, fordert der Startanspruch genau das dreiphasige
+    Mindestbudget an. Reicht das autorisierte Budget nur für dieses Minimum,
+    entsteht ein geschlossener Kreis: Der Ladepunkt bekommt exakt sein
+    3p-Minimum, hält deshalb drei Phasen, kann dreiphasig nicht starten und
+    erneuert anschließend denselben Anspruch.
+
+    Dieser Vertrag erlaubt die energetische Bepreisung eines späteren
+    einphasigen Starts, ausschließlich nachdem der eine Startversuch dieser
+    Stecksession verbraucht ist und weiterhin keine Ladung läuft. Das
+    autorisierte Budget taugt dafür nicht als Auslöser: Es ist selbst das
+    Ergebnis des gestellten Anspruchs und entspricht dann genau dem
+    dreiphasigen Minimum. Die elektrische Reservierung bleibt konservativ: Eine
+    Zielphase wird nicht vor ihrer Hardwarebestätigung als verfügbare
+    elektrische Entlastung verbucht. Jeder Istphasenbeleg, eine fehlende
+    bestätigte Umschaltfähigkeit und jede unvollständige Evidenz halten den
+    Vertrag geschlossen.
+    """
+
+    conservative = valid_phase_count(idle_phases, 0) or 3
+    observed = valid_phase_count(observed_phases, 0)
+    amp = max(0.0, _safe_float(minimum_amp, 6.0)) or 6.0
+    voltage = max(200.0, min(260.0, _safe_float(voltage_v, 230.0)))
+    budget_w = max(0.0, _safe_float(authorized_budget_w, 0.0))
+    one_phase_w = amp * voltage
+    conservative_w = float(conservative) * amp * voltage
+    result = {
+        "contract": IDLE_START_BUDGET_PROJECTION_SCHEMA,
+        "apply": False,
+        "reason": "conservative_projection",
+        "energy_projection_phases": conservative,
+        "electrical_reservation_phases": conservative,
+        "one_phase_minimum_w": one_phase_w,
+        "conservative_minimum_w": conservative_w,
+        "authorized_budget_w": budget_w,
+        "observed_phases": observed,
+    }
+    if conservative < 3:
+        result["reason"] = "no_conservative_three_phase_reservation"
+        return result
+    if observed:
+        result["reason"] = "physical_phases_observed"
+        return result
+    if evse_phase_switch_capable is not True:
+        result["reason"] = "evse_phase_switch_not_confirmed"
+        return result
+    if status_fresh is not True or connected is not True:
+        result["reason"] = "status_evidence_missing"
+        return result
+    if start_attempt_consumed is not True:
+        # Der erste Startversuch dieser Stecksession bleibt unberührt. Erst
+        # wenn er verbraucht ist und weiterhin keine Ladung läuft, ist der
+        # dreiphasige Anspruch belegt gescheitert.
+        result["reason"] = "first_start_attempt_untouched"
+        return result
+    if budget_w + 1e-9 < one_phase_w:
+        result["reason"] = "budget_below_one_phase_minimum"
+        return result
+    result["apply"] = True
+    result["reason"] = "one_phase_start_projection"
+    result["energy_projection_phases"] = 1
+    return result
+
+
+DISPLAY_CAP_AMP_SCHEMA = "wallbox_display_cap_amp_v1"
+STOP_DISPLAY_TEXT_SCHEMA = "wallbox_stop_display_text_v1"
+
+
+def display_cap_amp_contract(
+    *,
+    live_cap_amp: Any,
+    surplus_quantized_amp: Any = None,
+) -> Dict[str, Any]:
+    """Zeigt niemals mehr Stromdeckel an, als aktuell wirklich gilt.
+
+    Die Detailprojektion hat bisher den quantisierten Zielstrom des
+    Überschussvertrags bevorzugt. Dessen Aktualisierung wird im
+    Bereitschaftspfad übersprungen, sodass ein alter Wert stehen bleiben kann,
+    während tatsächlich 0 oder 6 A angeboten werden. Der Überschusswert darf
+    den Deckel deshalb nur noch feiner auflösen, niemals überschreiten.
+    """
+
+    live = _safe_float(live_cap_amp, 0.0)
+    if not math.isfinite(live) or live < 0.0:
+        live = 0.0
+    result = {
+        "contract": DISPLAY_CAP_AMP_SCHEMA,
+        "cap_amp": live,
+        "live_cap_amp": live,
+        "surplus_quantized_amp": None,
+        "source": "live_cap",
+        "clamped": False,
+    }
+    if surplus_quantized_amp is None:
+        return result
+    surplus = _safe_float(surplus_quantized_amp, 0.0)
+    if not math.isfinite(surplus) or surplus <= 0.0:
+        return result
+    result["surplus_quantized_amp"] = surplus
+    if surplus <= live:
+        result["cap_amp"] = surplus
+        result["source"] = "surplus_quantized"
+        return result
+    # Ein höherer Überschusswert ist veraltet: Der wirksame Deckel gilt.
+    result["clamped"] = True
+    result["source"] = "live_cap_clamped_stale_surplus"
+    return result
+
+
+def manager_stop_display_text_contract(
+    *,
+    reason: Any = "",
+    releasable_reason: bool = False,
+    confirmed_offer_amp: Any = 0.0,
+    confirmed_power_w: Any = 0.0,
+    real_charging: bool = False,
+) -> Dict[str, Any]:
+    """Trennt gesendeten von bestätigtem Stopp und harten von temporärem Halt.
+
+    „Harter Stop gesendet; Messwert läuft nach“ wurde auch bei bereits
+    bestätigten 0 W angezeigt und behauptete zusätzlich einen harten Stopp,
+    wo nur ein temporärer Budgethalt vorlag. Beides wird hier unterschieden;
+    der eigentliche Regelungszustand wird dadurch nicht verändert.
+    """
+
+    code = str(reason or "stop")
+    amp = max(0.0, _safe_float(confirmed_offer_amp, 0.0))
+    power_w = abs(_safe_float(confirmed_power_w, 0.0))
+    output_confirmed_zero = bool(
+        not real_charging and amp < 0.5 and power_w <= 50.0
+    )
+    kind = "temporaerer_halt" if releasable_reason else "harter_stopp"
+    if output_confirmed_zero:
+        state = "Stop bestätigt" if not releasable_reason else "Halt bestätigt"
+        text = (
+            "Budgethalt aktiv; Gerät bestätigt 0 A und 0 W."
+            if releasable_reason
+            else "Stop gesendet und vom Gerät mit 0 A und 0 W bestätigt."
+        )
+        level = "info"
+    else:
+        state = "Stop gesendet" if not releasable_reason else "Halt gesendet"
+        text = (
+            "Budgethalt gesendet; Messwert läuft nach."
+            if releasable_reason
+            else "Harter Stop gesendet; Messwert läuft nach."
+        )
+        level = "warning"
+    return {
+        "contract": STOP_DISPLAY_TEXT_SCHEMA,
+        "state": state,
+        "state_level": level,
+        "state_reason": text,
+        "kind": kind,
+        "output_confirmed_zero": output_confirmed_zero,
+        "reason_code": code,
+        "confirmed_offer_amp": amp,
+        "confirmed_power_w": power_w,
+    }
+
+
+def phase_individual_budget_contract(
+    *,
+    group_phase_budget_w: Any,
+    authorized_output_cap_w: Any,
+    authorized_output_active: bool,
+    own_confirmed_power_w: Any,
+    multi_scope_active: bool,
+) -> Dict[str, Any]:
+    """Bindet die Phasenbewertung an dieselbe Budgetbasis wie den Ausgang.
+
+    Bei mehreren geregelten Ladepunkten begrenzt der Gruppenverteiler den
+    ausführbaren Stromausgang bereits auf den zugeteilten Anteil des
+    einzelnen Ladepunkts. Bewertet die Phasenwahl daneben weiter das
+    gemeinsame Gruppenbudget, kann ein Ladepunkt drei Phasen halten, obwohl
+    er sein dreiphasiges Mindestbudget nie zugeteilt bekommt. Ergebnis ist
+    ein pendelndes Stromangebot statt eines tragfähigen gemeinsamen Starts.
+
+    Eine bereits hardwarebestätigte eigene Ladeleistung bleibt Teil der
+    Basis. Sie ist physisch gedeckt und darf durch diese Kante keinen
+    zusätzlichen Phasenrückwechsel auslösen. Der Vertrag erteilt keine neue
+    Leistungsfreigabe: Er kann die Basis nur absenken, niemals anheben.
+    """
+
+    group_w = max(0.0, _safe_float(group_phase_budget_w, 0.0))
+    own_w = max(0.0, _safe_float(own_confirmed_power_w, 0.0))
+    result = {
+        "contract": PHASE_INDIVIDUAL_BUDGET_SCHEMA,
+        "applied": False,
+        "reason": "group_basis",
+        "group_budget_w": group_w,
+        "individual_budget_w": None,
+        "authorized_output_cap_w": None,
+        "own_confirmed_power_w": own_w,
+        "budget_w": group_w,
+    }
+    if not multi_scope_active:
+        result["reason"] = "single_allocation_scope"
+        return result
+    if authorized_output_active is not True:
+        # Ohne gebundenen Ausgangsdeckel dieses Zyklus bleibt die bisherige
+        # Basis unverändert. Eine unbelegte Annahme darf die Phasenwahl
+        # weder verschärfen noch öffnen.
+        result["reason"] = "output_cap_not_bound"
+        return result
+    cap_w = max(0.0, _safe_float(authorized_output_cap_w, 0.0))
+    individual_w = max(cap_w, own_w)
+    result["authorized_output_cap_w"] = cap_w
+    result["individual_budget_w"] = individual_w
+    if individual_w >= group_w:
+        result["reason"] = "individual_covers_group"
+        return result
+    result["applied"] = True
+    result["reason"] = "individual_allocation"
+    result["budget_w"] = individual_w
+    return result
 
 
 def phase_up_counterfactual_contract(
@@ -4832,6 +6224,468 @@ def phase_up_counterfactual_contract(
     }
 
 
+PHASE_ENERGY_POLICY_SCHEMA = "wallbox_phase_energy_policy_v1"
+LEAKY_ENERGY_ACCOUNT_SCHEMA = "wallbox_leaky_energy_account_v1"
+
+
+def leaky_energy_account(
+    prior: Optional[Dict[str, Any]],
+    *,
+    power_w: float,
+    now_ts: float,
+    max_dt_s: float = 30.0,
+    reset: bool = False,
+    max_wh: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Undichter Wh-Zähler: positive Leistung füllt, negative leert, nie unter 0.
+
+    Energie statt Uhr: Eine Wolkenlücke löscht den Stand nicht, sie zieht
+    nur ab. Lücken über ``max_dt_s`` werden nicht als Dauerleistung
+    nachgerechnet; ``reset`` setzt den Stand auf 0 (Phasenwechsel, Abstecken,
+    anderes Phasenziel). ``max_wh`` sättigt den Stand nach oben
+    (Anti-Windup, z. B. 2×Schwelle); ``None`` = ungedeckelt wie bisher.
+    """
+
+    prior = prior if isinstance(prior, dict) else {}
+    now_value = _safe_float(now_ts, 0.0)
+    prior_wh = max(0.0, _safe_float(prior.get("wh"), 0.0))
+    prior_ts = _safe_float(prior.get("ts"), 0.0)
+    cap_wh = None if max_wh is None else max(0.0, _safe_float(max_wh, 0.0))
+    if reset:
+        return {
+            "schema": LEAKY_ENERGY_ACCOUNT_SCHEMA,
+            "wh": 0.0,
+            "ts": now_value,
+            "dt_s": 0.0,
+            "power_w": round(_safe_float(power_w, 0.0), 1),
+            "reset": True,
+            "saturated": False,
+        }
+    dt_s = 0.0
+    if prior_ts > 0.0 and now_value > prior_ts:
+        dt_s = min(max(0.0, _safe_float(max_dt_s, 30.0)), now_value - prior_ts)
+    wh = max(0.0, prior_wh + _safe_float(power_w, 0.0) * dt_s / 3600.0)
+    saturated = False
+    if cap_wh is not None and wh >= cap_wh:
+        wh = cap_wh
+        saturated = True
+    return {
+        "schema": LEAKY_ENERGY_ACCOUNT_SCHEMA,
+        "wh": round(wh, 2),
+        "ts": now_value,
+        "dt_s": round(dt_s, 3),
+        "power_w": round(_safe_float(power_w, 0.0), 1),
+        "reset": False,
+        "saturated": bool(saturated),
+    }
+
+
+PHASE_UP_AVAILABILITY_SCHEMA = "wallbox_phase_up_availability_v1"
+# Mittelungsfenster der Phasenregel (evcc-Zyklus 30 s), Mindestabdeckung des
+# Fensters, bevor das Mittel als Freigabe zählt (fehlende Daten ≠ Freigabe), Rohnetz-Tor
+# erst nach 30 s anhaltendem Bezug, openWB nominal_difference 1 A, Direktvertrag-Cooldown.
+PHASE_UP_AVAIL_WINDOW_S = 30.0
+PHASE_UP_AVAIL_MIN_COVER_S = 15.0
+PHASE_UP_AVAIL_MAX_SAMPLES = 90
+PHASE_UP_IMPORT_BLOCK_S = 30.0
+PHASE_UP_NOMINAL_DIFF_A = 1.0
+PHASE_CHANGE_HOLD_DIRECT_DEFAULT_S = 480.0
+# Leckende Uhr – Reset erst nach so vielen Sekunden durchgehend falscher
+# Bedingung; Toleranz „Ist-Strom am Referenzstrom" (openWB nominal_difference 1 A plus
+# Fahrzeugabnahme ≈ 0,7 A unter dem Angebot); Standard des Export-Wh-Kontos.
+PHASE_UP_CLOCK_FALSE_RESET_S = 15.0
+PHASE_UP_EXHAUSTED_MARGIN_A = 2.0
+PHASE_UP_EXPORT_WH_DEFAULT = 120.0
+PHASE_UP_LEAKY_CLOCK_SCHEMA = "wallbox_phase_up_leaky_clock_v1"
+PHASE_UP_IMPORT_EVIDENCE_SCHEMA = "wallbox_phase_up_import_evidence_v1"
+
+
+def _phase_up_finite(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def phase_up_availability_grid_mean_w(
+    mean_state: Optional[Dict[str, Any]],
+    *,
+    now_ts: Any,
+    fallback_w: Any,
+    max_age_s: Any = 15.0,
+) -> float:
+    """30-s-Rohmittel des Netzpunkts aus dem Mittelungszustand (sonst Rückfallwert)."""
+
+    state = mean_state if isinstance(mean_state, dict) else {}
+    grid_mean = _phase_up_finite(state.get("grid_mean_w"))
+    age_s = _safe_float(now_ts, 0.0) - _safe_float(state.get("ts"), 0.0)
+    if (
+        grid_mean is None
+        or not bool(state.get("ready", False))
+        or age_s < 0.0
+        or age_s > max(0.0, _safe_float(max_age_s, 15.0))
+    ):
+        return _safe_float(fallback_w, 0.0)
+    return float(grid_mean)
+
+
+def phase_up_availability_contract(
+    *,
+    wb_current_a: Any,
+    phases: Any,
+    grid_power_raw_w: Any,
+    battery_power_w: Any,
+    margin_w: Any,
+    one_phase_max_amp_b: Any,
+    current_set_amp: Any,
+    phase_3p_min_w: Any,
+    up_buffer_w: Any,
+    symmetry_enable: bool = False,
+    imbalance_max_a: Any = 20.0,
+    mean_state: Optional[Dict[str, Any]] = None,
+    now_ts: Any = 0.0,
+    window_s: Any = PHASE_UP_AVAIL_WINDOW_S,
+    wb_power_w: Any = None,
+    voltage_v: Any = 230.0,
+    nominal_diff_a: Any = PHASE_UP_NOMINAL_DIFF_A,
+    min_cover_s: Any = PHASE_UP_AVAIL_MIN_COVER_S,
+    authorized_budget_w: Any = None,
+    switchable_pair: bool = False,
+    exhausted_margin_a: Any = PHASE_UP_EXHAUSTED_MARGIN_A,
+) -> Dict[str, Any]:
+    """Eine Messgröße für die Hochschaltung 1p→3p (evcc/openWB-Muster).
+
+    ``authorized_budget_w`` ist das frische, autorisierte Budget des
+    Ein-Entscheiders für diesen Ladepunkt (``None`` = nur gemessen). Es gilt
+    ``P_avail_eff = max(P_avail, Budget + min(0, Akku))`` – was der Akku
+    aufnimmt, ist für die Wallbox verfügbar; eine Entladung zählt wie beim
+    Messwert als Defizit (Budget der Kurvenklasse ``full`` enthält sie). Mit
+    ``switchable_pair`` (Auto und Box phasenschaltfähig) gilt der Referenzstrom
+    ``I_ref = min(Deckel_b-Minimum im Fenster, ⌈(3p-Minimum + Puffer)/230⌉)``
+    und „ausgereizt" := ``Ist_30 + 2 A ≥ I_ref`` oder ``P_avail_eff_30/230 ≥
+    I_ref``; ohne Paar bleibt der Grundpfad (Deckel_b bis 32 A, 1 A). Das Konto
+    füllt mit ``max(0, P_avail_eff − I_ref·230)``.
+
+    ``P_avail = P_wb + max(0, −Netz_roh − Marge) + min(0, Akku)`` (Akku-Entladung
+    zählt als Defizit) auf einem zeitbasierten gleitenden Mittel über
+    ``window_s`` je Ladepunkt (``mean_state`` wird zurückgegeben und im nächsten
+    Zyklus wieder übergeben). Bedingung (a) ``budget_ok``: Mittel ≥ 3p-Minimum +
+    Puffer; (b) ``one_phase_exhausted``: evcc-Zielstrom ``P_avail_30/230 V >
+    Deckel_b`` oder openWB ``Ist-Strom_30 + 1 A ≥ Deckel_b`` oder – nur mit
+    ``symmetry_enable`` – ``Ist-Strom_30 ≥ imbalance_max_a``. ``Deckel_b`` ist der
+    wirksame 1p-Deckel ohne den Grund ramp_limited. ``account_power_w`` füllt
+    das Export-Wh-Konto mit den verschenkten Wh oberhalb des 1p-Maximums (nur
+    bei (a) ∧ (b)), leert es mit dem 3p-Defizit unter der Schwelle und hält es
+    sonst. Fehlende Daten (``None``, nicht endlich) ⇒ ``data_valid`` False,
+    beide Bedingungen False, 0 W – nie eine Freigabe aus fehlenden Daten.
+    """
+
+    now_value = _safe_float(now_ts, 0.0)
+    volt = max(1.0, _safe_float(voltage_v, 230.0))
+    win = max(1.0, _safe_float(window_s, PHASE_UP_AVAIL_WINDOW_S))
+    cover_s = min(win, max(0.0, _safe_float(min_cover_s, PHASE_UP_AVAIL_MIN_COVER_S)))
+    state = mean_state if isinstance(mean_state, dict) else {}
+    samples = []
+    for sample in state.get("samples") or []:
+        if not isinstance(sample, (list, tuple)) or len(sample) < 4:
+            continue
+        sample_ts = _phase_up_finite(sample[0])
+        if sample_ts is None or sample_ts > now_value or sample_ts <= now_value - win:
+            continue
+        # Je Sample zusätzlich Deckel_b (Minimum im Fenster) und gemessenes
+        # P_avail; ältere Zustände ohne diese Felder zählen den aktuellen Deckel.
+        samples.append([
+            sample_ts,
+            _safe_float(sample[1], 0.0),
+            _safe_float(sample[2], 0.0),
+            _safe_float(sample[3], 0.0),
+            _safe_float(sample[4], 0.0) if len(sample) > 4 else 0.0,
+            _safe_float(sample[5], _safe_float(sample[1], 0.0)) if len(sample) > 5 else _safe_float(sample[1], 0.0),
+        ])
+    amp = _phase_up_finite(wb_current_a)
+    grid = _phase_up_finite(grid_power_raw_w)
+    battery = _phase_up_finite(battery_power_w)
+    data_valid = bool(amp is not None and amp >= 0.0 and grid is not None and battery is not None)
+    phase_count = valid_phase_count(phases, 1)
+    margin = max(0.0, _safe_float(margin_w, 0.0))
+    threshold_w = max(0.0, _safe_float(phase_3p_min_w, 0.0)) + max(0.0, _safe_float(up_buffer_w, 0.0))
+    cap_b = max(0.0, _safe_float(one_phase_max_amp_b, 0.0))
+    one_phase_max_w = cap_b * volt
+    imbalance_a = max(0.0, _safe_float(imbalance_max_a, 0.0))
+    nominal_diff = max(0.0, _safe_float(nominal_diff_a, PHASE_UP_NOMINAL_DIFF_A))
+    p_wb = 0.0
+    p_avail = 0.0
+    p_avail_eff = 0.0
+    # Budget des Ein-Entscheiders (Zuteilung) als zweite Quelle des
+    # Überschusses; fehlend/ungültig ⇒ nur gemessen. Die Akku-Entladung wird auch
+    # vom Budget abgezogen (Kurvenklasse full enthält die Stützung im Budget).
+    budget_w = _phase_up_finite(authorized_budget_w)
+    budget_avail_w = None
+    budget_used = False
+    margin_a = max(0.0, _safe_float(exhausted_margin_a, PHASE_UP_EXHAUSTED_MARGIN_A))
+    if data_valid:
+        power = _phase_up_finite(wb_power_w)
+        p_wb = power if (power is not None and power > 0.0) else amp * volt * phase_count
+        p_avail = p_wb + max(0.0, -grid - margin) + min(0.0, battery)
+        p_avail_eff = p_avail
+        if budget_w is not None and budget_w >= 0.0:
+            budget_avail_w = budget_w + min(0.0, battery)
+            if budget_avail_w > p_avail:
+                p_avail_eff = budget_avail_w
+                budget_used = True
+        samples.append([now_value, p_avail_eff, amp, grid, cap_b, p_avail])
+        samples = samples[-PHASE_UP_AVAIL_MAX_SAMPLES:]
+    count = len(samples)
+    covered_s = (now_value - samples[0][0]) if count else 0.0
+    ready = bool(count >= 2 and covered_s >= cover_s)
+    p_avail_mean = (sum(item[1] for item in samples) / count) if count else 0.0
+    amp_mean = (sum(item[2] for item in samples) / count) if count else 0.0
+    grid_mean = (sum(item[3] for item in samples) / count) if count else 0.0
+    measured_mean = (sum(item[5] for item in samples) / count) if count else 0.0
+    # Referenzstrom nur für ein phasenschaltfähiges Paar (Auto + Box):
+    # min(Deckel_b-Minimum im Fenster, ⌈(3p-Minimum + Puffer)/230 V⌉); ein
+    # dynamischer Deckel (Schieflast/PCC) über der Referenz spielt keine Rolle mehr.
+    pair = bool(switchable_pair and cap_b > 0.0)
+    cap_b_min = cap_b
+    if pair:
+        for item in samples:
+            if item[4] > 0.0:
+                cap_b_min = min(cap_b_min, item[4])
+    ref_ceiling_a = float(math.ceil(threshold_w / volt - 1e-9)) if threshold_w > 0.0 else 0.0
+    i_ref = min(cap_b_min, ref_ceiling_a) if pair else cap_b
+    reference_w = i_ref * volt if pair else one_phase_max_w
+    budget_ok = bool(data_valid and ready and p_avail_mean >= threshold_w)
+    if pair:
+        evcc_target = False
+        owb_at_max = False
+        ref_target = bool(data_valid and ready and i_ref > 0.0 and p_avail_mean / volt >= i_ref)
+        ref_at_max = bool(data_valid and ready and i_ref > 0.0 and amp_mean + margin_a >= i_ref)
+    else:
+        evcc_target = bool(data_valid and ready and cap_b > 0.0 and p_avail_mean / volt > cap_b)
+        owb_at_max = bool(data_valid and ready and cap_b > 0.0 and amp_mean + nominal_diff >= cap_b)
+        ref_target = False
+        ref_at_max = False
+    symmetry = bool(
+        symmetry_enable and data_valid and ready and imbalance_a > 0.0 and amp_mean >= imbalance_a
+    )
+    one_phase_exhausted = bool(evcc_target or owb_at_max or ref_target or ref_at_max or symmetry)
+    if not data_valid:
+        reason = "data_invalid"
+    elif not ready:
+        reason = "mean_not_ready"
+    elif cap_b <= 0.0:
+        reason = "no_one_phase_cap"
+    elif ref_target:
+        reason = "ref_target"
+    elif ref_at_max:
+        reason = "ref_at_max"
+    elif evcc_target:
+        reason = "evcc_target"
+    elif owb_at_max:
+        reason = "owb_at_max"
+    elif symmetry:
+        reason = "symmetry"
+    else:
+        reason = "none"
+    if not data_valid:
+        account_power_w = 0.0
+        account_mode = "hold"
+    elif budget_ok and one_phase_exhausted:
+        account_power_w = max(0.0, p_avail_eff - reference_w)
+        account_mode = "fill"
+    elif p_avail_eff < threshold_w:
+        account_power_w = min(0.0, p_avail_eff - threshold_w)
+        account_mode = "drain"
+    else:
+        account_power_w = 0.0
+        account_mode = "hold"
+    return {
+        "schema": PHASE_UP_AVAILABILITY_SCHEMA,
+        "data_valid": data_valid,
+        "ready": ready,
+        "p_wb_w": round(p_wb, 1),
+        "p_avail_w": round(p_avail, 1),
+        "p_avail_mean_w": round(p_avail_mean, 1),
+        "current_a": round(amp, 2) if amp is not None else None,
+        "current_mean_a": round(amp_mean, 2),
+        "grid_mean_w": round(grid_mean, 1),
+        "current_set_amp": round(_safe_float(current_set_amp, 0.0), 1),
+        "phases": int(phase_count),
+        "one_phase_max_amp_b": round(cap_b, 2),
+        "one_phase_max_w": round(one_phase_max_w, 1),
+        "threshold_w": round(threshold_w, 1),
+        "budget_ok": budget_ok,
+        "one_phase_exhausted": one_phase_exhausted,
+        "reason": reason,
+        "evcc_target": evcc_target,
+        "owb_at_max": owb_at_max,
+        "symmetry": symmetry,
+        "symmetry_enable": bool(symmetry_enable),
+        "imbalance_max_a": round(imbalance_a, 1),
+        "account_power_w": round(account_power_w, 1),
+        "account_mode": account_mode,
+        "window_s": round(win, 1),
+        "covered_s": round(covered_s, 1),
+        "sample_count": int(count),
+        # Referenzstrom, Budget, Diagnose.
+        "p_avail_eff_w": round(p_avail_eff, 1),
+        "p_avail_measured_mean_w": round(measured_mean, 1),
+        "authorized_budget_w": round(budget_w, 1) if (budget_w is not None and budget_w >= 0.0) else None,
+        "budget_avail_w": round(budget_avail_w, 1) if budget_avail_w is not None else None,
+        "budget_used": bool(budget_used),
+        "switchable_pair": bool(pair),
+        "i_ref_a": round(i_ref, 2),
+        "cap_b_min_a": round(cap_b_min, 2),
+        "reference_w": round(reference_w, 1),
+        "ref_target": ref_target,
+        "ref_at_max": ref_at_max,
+        "exhausted_margin_a": round(margin_a, 2),
+        "mean_state": {
+            "schema": PHASE_UP_AVAILABILITY_SCHEMA,
+            "samples": [
+                [round(s[0], 3), round(s[1], 1), round(s[2], 2), round(s[3], 1), round(s[4], 2), round(s[5], 1)]
+                for s in samples
+            ],
+            "ts": now_value,
+            "window_s": round(win, 1),
+            "ready": ready,
+            "grid_mean_w": round(grid_mean, 1),
+            "p_avail_mean_w": round(p_avail_mean, 1),
+        },
+    }
+
+
+def phase_up_leaky_clock(
+    prior: Optional[Dict[str, Any]],
+    *,
+    run: bool,
+    now_ts: Any,
+    hard_reset: bool = False,
+    external_since: Any = None,
+    false_reset_s: Any = PHASE_UP_CLOCK_FALSE_RESET_S,
+    max_dt_s: Any = 30.0,
+) -> Dict[str, Any]:
+    """EINE leckende Uhr der Hochschaltbedingung.
+
+    Läuft (+dt) bei wahrer Bedingung, zählt bei falscher Bedingung zurück (−dt,
+    Boden 0) und setzt erst nach ``false_reset_s`` durchgehend falscher
+    Bedingung oder bei ``hard_reset`` (Abstecken, nicht laden, 3p, < 30 s nach
+    Wechsel, Import-Block, Phasenblock) auf 0. ``since`` ist die Projektion
+    ``now − t_up`` (0 bei t_up 0) für Empfehlung und Executor; eine
+    Fremdschreibung von ``_phase_up_budget_since`` (``external_since`` ≠
+    zuletzt geschriebener ``since``: harter Reset 0.0 oder Neustart ``now``)
+    wird übernommen. Lücken über ``max_dt_s`` werden nicht nachgerechnet.
+    """
+
+    state = prior if isinstance(prior, dict) else {}
+    now_value = _safe_float(now_ts, 0.0)
+    t_up = max(0.0, _safe_float(state.get("t_up_s"), 0.0))
+    false_s = max(0.0, _safe_float(state.get("false_s"), 0.0))
+    prior_ts = _safe_float(state.get("ts"), 0.0)
+    written = _phase_up_finite(state.get("since"))
+    reset = ""
+    external = _phase_up_finite(external_since)
+    if external is not None and (written is None or abs(external - written) > 1e-6):
+        t_up = max(0.0, now_value - external) if external > 0.0 else 0.0
+        false_s = 0.0
+        reset = "external"
+    dt_s = 0.0
+    if prior_ts > 0.0 and now_value > prior_ts:
+        dt_s = min(max(0.0, _safe_float(max_dt_s, 30.0)), now_value - prior_ts)
+    if hard_reset:
+        t_up = 0.0
+        false_s = 0.0
+        reset = "hard"
+    elif run:
+        t_up += dt_s
+        false_s = 0.0
+    else:
+        false_s += dt_s
+        t_up = max(0.0, t_up - dt_s)
+        if false_s >= max(0.0, _safe_float(false_reset_s, PHASE_UP_CLOCK_FALSE_RESET_S)) and t_up > 0.0:
+            t_up = 0.0
+            reset = "false_timeout"
+    since = (now_value - t_up) if t_up > 0.0 else 0.0
+    return {
+        "schema": PHASE_UP_LEAKY_CLOCK_SCHEMA,
+        "t_up_s": round(t_up, 3),
+        "false_s": round(false_s, 3),
+        "ts": now_value,
+        "dt_s": round(dt_s, 3),
+        "run": bool(run),
+        "hard_reset": bool(hard_reset),
+        "since": since,
+        "reset": reset,
+    }
+
+
+def phase_up_import_evidence_contract(
+    *,
+    sequence_active: bool,
+    grid_power_raw_w: Any = None,
+    threshold_w: Any = 150.0,
+    grid_import_down_active: bool = False,
+    ledger: Optional[Dict[str, Any]] = None,
+    cascade_stage: Any = "",
+    action_type: Any = "",
+    current_down_settle_active: bool = False,
+) -> Dict[str, Any]:
+    """Beleg-Tor der Hochschaltung bei aktiver Defizitsequenz.
+
+    Die Mindeststrom-/Netz-Wh-Sequenz gilt auch, solange ein Defizitkonto
+    nur noch leckt (Rest > 0 Wh). Für die Hochschaltung zählt die Sequenz nur
+    mit Beleg: Rohnetz über der Schwelle, Import-Down-Tor, akkumulierendes
+    Konto (``counted_total_w > leak_applied_w``), Kaskadenstufe pending,
+    Aktion current_down/phase_down/stop oder Readback-Beruhigung nach
+    Strom-runter. Ein leckender Kontorest allein (``residue_only``) hält das
+    Tor nicht. Stufen-/Aktionsnamen wie ``Wallbox.deficit_control``.
+    """
+
+    result = {
+        "schema": PHASE_UP_IMPORT_EVIDENCE_SCHEMA,
+        "sequence_active": bool(sequence_active),
+        "active": False,
+        "reason": "sequence_inactive",
+    }
+    if not sequence_active:
+        return result
+    grid = _phase_up_finite(grid_power_raw_w)
+    limit = max(0.0, _safe_float(threshold_w, 150.0))
+    data = ledger if isinstance(ledger, dict) else {}
+    component = str(data.get("counted_component") or "none")
+    counted = _safe_float(data.get("counted_total_w"), 0.0)
+    leak = _safe_float(data.get("leak_applied_w"), 0.0)
+    accumulating = bool(component not in ("", "none") and counted > leak + 0.01)
+    stage = str(cascade_stage or "")
+    action = str(action_type or "")
+    if grid is not None and grid > limit:
+        reason = "grid_import_raw"
+    elif grid_import_down_active:
+        reason = "grid_import_down_gate"
+    elif current_down_settle_active:
+        reason = "current_down_settle"
+    elif stage in ("phase_down_pending", "stop_pending"):
+        reason = "cascade_pending"
+    elif action in ("current_down", "phase_down", "stop"):
+        reason = "cascade_action"
+    elif accumulating:
+        reason = "ledger_accumulating"
+    else:
+        reason = "residue_only"
+    result.update({
+        "active": reason != "residue_only",
+        "reason": reason,
+        "grid_power_raw_w": round(grid, 1) if grid is not None else None,
+        "counted_component": component,
+        "counted_total_w": round(counted, 1),
+        "leak_applied_w": round(leak, 1),
+    })
+    return result
+
+
 def phase_switch_recommendation(
     *,
     openwb_phase_capable: bool,
@@ -4874,14 +6728,49 @@ def phase_switch_recommendation(
     prefer_current_first_before_phase_up: bool = False,
     phase_up_min_runtime_s: float = 0.0,
     ordinary_grid_import_sequence_active: bool = False,
+    energy_phase_policy: bool = False,
+    battery_support_pv_only: bool = False,
+    phase_up_condition_active: bool = False,
+    phase_up_export_wh: float = 0.0,
+    phase_up_export_required_wh: float = 0.0,
+    direct_phase_control: bool = False,
+    phase_up_import_block_active: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    """Empfiehlt eine Phasenaktion, ohne einen Wallbox-Befehl zu senden."""
+    """Empfiehlt eine Phasenaktion, ohne einen Wallbox-Befehl zu senden.
+
+    Energie-Phasenpolitik (openWB Pro und E3DC-Direktvertrag,
+    ``energy_phase_policy``): 3p→1p am 3p-Minimum nur, wenn der Akku ohne
+    Autorisierung speist (Wh-Kontingent an der Korridor-Untergrenze
+    aufgebraucht) oder Netzbezug anliegt. 1p→3p erst, wenn die
+    Hochschaltbedingung ``phase_up_condition_active`` (P_avail_30 ≥ 3p-Minimum
+    + Puffer und 1p ausgereizt, ``phase_up_availability_contract``) gilt, das
+    Export-Wh-Konto das Kontingent erreicht hat und die Bedingung
+    ``phase_up_forecast_hold_s`` ununterbrochen stand (eine Uhr, vom Manager
+    geführt). ``phase_up_import_block_active`` ersetzt für die Hochschaltung den
+    Roh-Blip des Netzbezugs durch den ≥ 30 s anhaltenden Bezug (``None`` =
+    bisheriger Rohwert); Abstieg und Schutzpfade lesen weiter den Rohwert.
+    """
 
     if not openwb_phase_capable:
         return {
             "action": "KEEP_PHASES",
             "target_phases": 0,
             "reason": "phase_switch_not_capable",
+            "wait_s": 0,
+            "remaining_s": 0,
+        }
+
+    if openwb_pro and vehicle_1p_only:
+        # Ein einphasig hinterlegtes Fahrzeug nutzt an der openWB Pro unabhängig
+        # vom Phasenziel der Box genau eine Phase. Ein Phasenwechsel ändert seine
+        # Ladeleistung nicht, unterbricht aber die Verhandlung mit dem Fahrzeug
+        # und sperrt den nächsten Wechsel für 480 s. Die Box behält deshalb ihre
+        # Einstellung (1p oder 3p); Budget und Mindestleistung folgen dem
+        # Fahrzeugprofil, der Schieflast-Deckel den gemessenen aktiven Phasen.
+        return {
+            "action": "KEEP_PHASES",
+            "target_phases": 0,
+            "reason": "vehicle_1p_only_keeps_box_phases",
             "wait_s": 0,
             "remaining_s": 0,
         }
@@ -5008,11 +6897,24 @@ def phase_switch_recommendation(
     if start_1p_needed:
         return wait("SWITCH_1P", 1, "start_1p", 0, 0)
 
+    energy_policy = bool(energy_phase_policy and (openwb_pro or direct_phase_control))
+    # Rohnetz-Tor der Hochschaltung nur bei anhaltendem Bezug.
+    phase_up_import_blocked = bool(
+        ordinary_grid_import_sequence_active
+        if phase_up_import_block_active is None
+        else phase_up_import_block_active
+    )
     budget_phase_down_needed = bool(
         not ordinary_grid_import_sequence_active
         and (
             cap == 0
-            or (openwb_pro and cap <= 6)
+            or (
+                (openwb_pro or direct_phase_control)
+                and cap <= 6
+                # Energiepolitik: das 3p-Minimum allein ist kein Abstiegsgrund;
+                # erst der unautorisierte Akkubezug (Kontingent aufgebraucht).
+                and (battery_support_pv_only or not energy_policy)
+            )
             or grid_w > _safe_float(phase_down_grid_w, 0.0)
         )
     )
@@ -5036,7 +6938,7 @@ def phase_switch_recommendation(
             down_reason = "no_3p_budget"
         elif (
             not ordinary_grid_import_sequence_active
-            and openwb_pro
+            and (openwb_pro or direct_phase_control)
             and cap <= 6
         ):
             down_reason = "3p_minimum"
@@ -5052,11 +6954,14 @@ def phase_switch_recommendation(
             )
         ):
             down_wait_s = max(down_wait_s, _safe_float(phase_down_forecast_hold_s, down_wait_s))
-        elif openwb_pro and (
-            cap == 0
-            or cap <= 6
-            or grid_w > _safe_float(phase_down_grid_w, 0.0)
+        elif (openwb_pro or direct_phase_control) and (
+            # Nur Schutzfunktionen verkürzen die
+            # 480-s-Beharrung – Netzbezug über der Schwelle, wbminSoC-Unter-
+            # grenze, unautorisierte Akkustützung. Budgetmangel allein
+            # (Deckel 0 oder 3p-Minimum) wartet die volle Zeit ab.
+            grid_w > _safe_float(phase_down_grid_w, 0.0)
             or not wbminsoc_gate_open
+            or battery_support_pv_only
         ):
             down_wait_s = _safe_float(phase_down_fast_delay_s, down_wait_s)
         down_age_s = max(0.0, _safe_float(phase_down_since_age_s, 0.0))
@@ -5070,7 +6975,7 @@ def phase_switch_recommendation(
 
     phase_up_possible = bool(
         mode > 0
-        and not ordinary_grid_import_sequence_active
+        and not phase_up_import_blocked
         and cap > 0
         and phase_3p_supported
         and not vehicle_1p_only
@@ -5080,9 +6985,11 @@ def phase_switch_recommendation(
         and not phase_block_active
     )
     if phase_up_possible:
+        # Keine Sonderphilosophie je Wallbox-Typ – der Direktvertrag
+        # wartet dieselbe Vorlaufzeit wie die openWB Pro.
         up_wait_s = (
             max(0.0, _safe_float(phase_up_min_runtime_s, 0.0))
-            if openwb_pro
+            if (openwb_pro or direct_phase_control)
             else (0.0 if predump_wallbox_active else 45.0)
         )
         if (
@@ -5092,12 +6999,42 @@ def phase_switch_recommendation(
         ):
             up_wait_s = max(up_wait_s, _safe_float(phase_up_forecast_hold_s, up_wait_s))
         up_age_s = max(0.0, _safe_float(phase_up_since_age_s, 0.0))
+        account_full = False
+        if energy_policy:
+            export_wh = max(0.0, _safe_float(phase_up_export_wh, 0.0))
+            export_required_wh = max(0.0, _safe_float(phase_up_export_required_wh, 0.0))
+            # Grundname bleibt (Oberfläche erklärt ihn); die Uhr des
+            # Managers läuft bei „Wh pending" weiter, hier wird sie nicht berührt.
+            if not phase_up_condition_active:
+                return {
+                    "action": "KEEP_PHASES",
+                    "target_phases": 0,
+                    "reason": "phase_up_current_first_max",
+                    "wait_s": 0,
+                    "remaining_s": 0,
+                    "export_wh": round(export_wh, 1),
+                    "export_required_wh": round(export_required_wh, 1),
+                }
+            # Uhr ODER Konto – geschaltet wird, sobald die leckende Uhr
+            # den Vorlauf erreicht oder das Export-Wh-Konto voll ist; solange
+            # keines zutrifft, KEEP „Wh pending" mit der Restzeit der Uhr.
+            account_full = bool(export_wh + 0.001 >= export_required_wh)
+            if not account_full and up_age_s < up_wait_s:
+                return {
+                    "action": "KEEP_PHASES",
+                    "target_phases": 0,
+                    "reason": "phase_up_export_wh_pending",
+                    "wait_s": int(round(up_wait_s)),
+                    "remaining_s": int(round(max(0.0, up_wait_s - up_age_s))),
+                    "export_wh": round(export_wh, 1),
+                    "export_required_wh": round(export_required_wh, 1),
+                }
         return wait(
-            "SWITCH_3P" if up_age_s >= up_wait_s else "WAIT_3P",
+            "SWITCH_3P" if (up_age_s >= up_wait_s or account_full) else "WAIT_3P",
             3,
             "phase_up",
             up_wait_s,
-            up_age_s,
+            max(up_age_s, up_wait_s) if account_full else up_age_s,
         )
 
     if target == 3 and switch_phases in (0, 1):

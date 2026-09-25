@@ -5,11 +5,21 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.4.6d`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.5.0`. Das Dashboard startet ausschließlich
 den argumentlosen, root-eigenen Systemjob. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
+
+5.5.0 bringt unter anderem das Startfenster und den messbasierten einphasigen
+Stromdeckel der openWB Pro, zeitgerichtetes Netzladen des Speichers mit
+Ladeprofil, die Bluelink-Anmeldung mit Benutzer und Passwort sowie je Datei
+komprimierte Backups. Bare-Metal-Installationen mit 5.4.4c bis 5.4.6d zeigen
+den Hinweis auf 5.5.0 wegen eines Fehlers ihrer Update-Prüfung nicht an;
+**System Update** startet das Update trotzdem. Eine Docker-Installation mit
+5.4.x zeigt grundsätzlich keinen Versionshinweis; für den Wechsel auf 5.5.0
+gilt der Abschnitt [Docker-Update](#docker-update). Rückfallhinweise stehen in
+[Rollback](Rollback.md) und in den [Release Notes](../RELEASE_NOTES.md).
 
 5.4.6c ergänzt die begrenzte Wallbox-Phasenerkennung und geschützte Luxtronik-PV-Aufträge. Vor optionalen PV-Boosts müssen das elektrische Leistungsprofil und die erlaubten Überbrückungskontingente im Config Editor eingetragen sein. Die [Luxtronik-Dokumentation](Luxtronik.md) erklärt die Einrichtung. Die Docker-Start- und Host-Updatekorrekturen sind weiterhin enthalten. Die seit 5.4.6 verwendete
 unprivilegierte EMS-Laufzeit und der optionale Bridge-Betrieb bleiben erhalten. Vor dem Imagewechsel den tatsächlich verwendeten
@@ -340,6 +350,27 @@ entfernt. Mehrere geschützte Backups führen nicht zum Abbruch oder zu einer
 erzwungenen Löschung und dürfen die Zielgrenzen vorübergehend überschreiten:
 Ungeschützte Altbestände werden soweit sicher möglich entfernt, eine offene
 Zielgrenze wird gemeldet und später erneut angewendet.
+
+Im Vollbackup und in der ruhenden Daten-Nachsicherung liegen Dateien ab 4 KiB
+aus Programmbaum und Datenverzeichnissen – darunter Historien,
+Langzeitdatenbank, V4-Konfiguration und Matter-Storage – sowie die
+Prognosebelege gzip-komprimiert; Units, `/etc/e3dc-control` und einzeln
+gesicherte Dateien wie `e3dc.config.txt` bleiben unveränderte Kopien (siehe
+`doc/Backup.md`).
+
+Jeder Release-Wechsel legt seine Python-Abhängigkeiten in einem eigenen venv
+`~/venv_e3dc_release_<version>` an; das bisherige venv bleibt für den Rückfall
+unverändert. Nach dem bestätigten Start entfernt die Abschlussbereinigung ältere
+Release-venvs mit Updater-Marker: Behalten werden insgesamt so viele
+Release-venvs, wie Update-Backup-Familien aufbewahrt werden (Standard drei,
+einschließlich des aktiven). Ein unmarkiertes Alt-venv wie `~/.venv_e3dc`
+wird nur mit einem Hinweis zum manuellen Entfernen gemeldet. Ausgenommen ist
+ein venv, mit dem der Watchdog (`piguard`) eingerichtet wurde: Es bleibt
+erhalten und wird nicht als entfernbar gemeldet. Umrichten auf die aktive
+Umgebung: `e3dc-setup`, Menü 15 „Watchdog & Telegram konfigurieren“ →
+„Komplett neu installieren / reparieren“. Die bei diesem
+Wechsel geladenen apt-Pakete bleiben nicht im apt-Cache, pip arbeitet ohne
+Download-Cache.
 
 ### 5.4.4e: RAM-Disk und verlässlicher Rücklauf
 
@@ -942,8 +973,10 @@ Pfade für Logs, Dienste, Rechte, Web-Wrapper und Sudoers werden gegen die
 gebundene Produktinstallation aufgelöst.
 
 In einer Docker-Installation führen weder Weboberfläche noch Konsole einen
-Release-Wechsel im laufenden Container aus. Sie zeigen stattdessen die drei
-Host-Befehle aus dem Abschnitt [Docker-Update](#docker-update).
+Release-Wechsel im laufenden Container aus. Mit eingerichtetem Watchtower gibt
+der Knopf **System Update** Watchtower das Signal, das neue Image zu laden und
+den Container neu zu erstellen; ohne Watchtower zeigt er die Host-Befehle aus
+dem Abschnitt [Docker-Update](#docker-update).
 
 ## Alte Installationen und unterstützte Plattform
 
@@ -989,6 +1022,16 @@ Wiederherstellung eines verifizierten Datei-Backups der sichere Rückweg.
 
 ## Docker-Update
 
+Der Normalweg ist der Knopf **System Update** mit eingerichtetem Watchtower
+(siehe unten) oder auf dem Docker-Host `sudo docker compose pull` und
+`sudo docker compose up -d` im Compose-Ordner. Der Knopf steht ab 5.5.0 zur
+Verfügung. Das Update von 5.4.x auf 5.5.0 erfolgt noch über den Host-Weg; ab
+dem nächsten Release genügt der Knopf. Die Schritte stehen in der
+[Docker-Dokumentation](Docker_Dokumentation.md) unter „Übergang von 5.4.x auf
+5.5.0“. Der Host-Helfer bleibt der geprüfte Weg mit automatischem Rückfall und
+ist Pflicht für 5.3.2b-Altbestände sowie für den Rückfall auf ein älteres
+Root-Image:
+
 ```bash
 (
   set -euo pipefail
@@ -1015,30 +1058,44 @@ Docker-/Compose-Clientprozessgruppe vollständig. Fremde Aufrufe und der
 Docker-Daemon bleiben unangetastet.
 
 Der Web-Updater erkennt den Containerkontext auch über den Marker des
-offiziellen Images und zeigt diese Befehle an. Er benötigt keinen Zugriff auf
+offiziellen Images und zeigt ohne eingerichteten Watchtower diese Befehle an.
+Er benötigt keinen Zugriff auf
 den Docker-Socket und versucht bewusst nicht, den eigenen Container zu
 ersetzen.
 
-Der optionale Watchtower-Dienst startet nicht zusammen mit der
-Standardanwendung. Das Upstream-Projekt wird nicht mehr gepflegt und sein
-Docker-Socket-Zugriff ermöglicht weitreichende Kontrolle über den Docker-Host.
-Der Dienst bleibt nur für bestehende Installationen im Compose-Profil
-`auto-update`. Der bewusste Opt-in benötigt zusätzlich das standardmäßig
-deaktivierte Containerlabel:
+Der Watchtower-Dienst liegt im Compose-Profil `auto-update` und startet nicht
+zusammen mit der Standardanwendung. Er wird einmalig freigeschaltet, damit
+der Knopf **System Update** in der Weboberfläche und das **Auto-Update** im
+Config-Editor funktionieren: Beide geben Watchtower über dessen lokale
+HTTP-API (nur `127.0.0.1`, Token in `.env`) das Signal, das neue Image zu
+laden und den Container neu zu erstellen. Watchtower prüft Images nicht von
+sich aus, respektiert einen Pin `E3DC_IMAGE_TAG` in `.env` und benötigt für
+Pull und Neuerstellung den Docker-Socket des Hosts:
 
 ```bash
-printf '%s\n' 'E3DC_WATCHTOWER_ENABLE=true' >> .env
-sudo python3 ./Installer/docker_compose_update.py --compose-dir . --sudo
-docker compose --profile auto-update up -d watchtower
+printf 'E3DC_WATCHTOWER_API_TOKEN=%s\n' "$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> .env
+sudo docker compose up -d
+sudo docker compose --profile auto-update up -d watchtower
 ```
 
-Erst mit `E3DC_WATCHTOWER_ENABLE=true` berücksichtigt Watchtower durch den
-Enable-Label-Filter den E3DC-Control-Container. Ohne diesen Wert bleibt auch
-ein versehentlich gestartetes Profil für den Hauptcontainer wirkungslos. Ein
-bereits aus einer älteren Compose-Datei
-laufender Watchtower kann mit
-`docker compose --profile auto-update stop watchtower` und anschließend
-`docker compose --profile auto-update rm -f watchtower` entfernt werden.
+Das Containerlabel `com.centurylinklabs.watchtower.enable` steht in der mitgelieferten Compose-Datei standardmäßig auf `true`.
+Wer den Container von Watchtower ausnehmen will, setzt
+`E3DC_WATCHTOWER_ENABLE=false` in `.env` und erstellt ihn mit
+`sudo docker compose up -d` neu. Ein bereits aus einer älteren Compose-Datei
+laufender Watchtower (Original-Image, tägliches Polling) wird mit
+`sudo docker compose --profile auto-update up -d watchtower` auf die neue
+Vorlage gebracht oder mit
+`sudo docker compose --profile auto-update stop watchtower` und anschließend
+`sudo docker compose --profile auto-update rm -f watchtower` entfernt. Vor
+einem Lauf des Host-Helfers `docker_compose_update.py` wird Watchtower
+gestoppt; der Helfer bricht bei einem parallel aktiven Watchtower ab.
+Einzelheiten: [Docker-Dokumentation](Docker_Dokumentation.md), Abschnitt
+„Updates: Weboberfläche, Host und Watchtower“.
+
+Der Knopf aktualisiert nur Container, deren Image aus der Registry
+(`ghcr.io/a9xxx/install-e3dc-control`) gezogen wurde. Ein selbst gebautes Image
+wird von Watchtower nicht geprüft; dann gelten die Host-Befehle
+`docker compose pull` / `up -d` bzw. der eigene Build.
 
 Die mitgelieferte Compose-Datei verwendet standardmäßig
 `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ein in der
@@ -1049,3 +1106,8 @@ Update den gewünschten Stable-Tag oder `latest` anzeigen.
 Ein Docker-Rückfall verwendet ausschließlich einen Eintrag mit
 `docker_supported: true`, dessen freigegebenen Image-Tag beziehungsweise den
 verifizierten Digest. Der Container steuert den Host-Docker nicht selbst.
+Diese Bindung gilt für den von Update-Policy und Weboberfläche angebotenen
+Rückfall auf das Root-Image `v5.3.2b`, den der Host-Helfer mit Rückmigration
+ausführt. Ein Wechsel zwischen Runtime-Images, etwa von 5.5.0 zurück auf
+5.4.6d, erfolgt auf dem Host mit `E3DC_IMAGE_TAG` in `.env` und
+`sudo docker compose up -d` (siehe [Rollback](Rollback.md)).

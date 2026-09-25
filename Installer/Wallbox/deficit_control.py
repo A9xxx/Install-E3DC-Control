@@ -125,14 +125,22 @@ def _empty_ledger() -> Dict[str, Any]:
         "bucket_wh": 0.0,
         "grid_bucket_wh": 0.0,
         "authorized_budget_bucket_wh": 0.0,
+        "battery_bucket_wh": 0.0,
         "bucket_component": "none",
         "stage_generation": 0,
         "grid_deficit_w": None,
         "authorized_budget_overrun_w": None,
+        "battery_support_w": None,
+        "battery_threshold_wh": None,
+        "battery_contract_valid": False,
         "counted_component": "none",
         "counted_total_w": None,
         "counted_total_complete": False,
         "authorized_budget_contract_valid": False,
+        # Ruhezustand des Budgetkontos bei Export.
+        "export_rest_since_ts": None,
+        "export_rest_active": False,
+        "export_rest_contract_valid": False,
         "sample_valid": False,
         "sample_fresh": False,
         "dt_s": 0.0,
@@ -197,13 +205,145 @@ def _validated_previous(previous_state: Any) -> Dict[str, Any]:
 
 
 def _reset_bucket(ledger: Dict[str, Any], *, reason: str) -> None:
+    # Stand vor der Aktion bewahren
+    # (Journalzeile '%.0f/%.0f Wh'); das Akku-Konto wird mit zurueckgesetzt.
+    ledger["last_action_bucket_wh"] = round(
+        float(ledger.get("bucket_wh", 0.0) or 0.0),
+        3,
+    )
     ledger["bucket_wh"] = 0.0
     ledger["grid_bucket_wh"] = 0.0
+    ledger["battery_bucket_wh"] = 0.0
     ledger["authorized_budget_bucket_wh"] = 0.0
     ledger["bucket_component"] = "none"
     ledger["threshold_reached"] = False
     ledger["stage_generation"] = int(ledger.get("stage_generation", 0) or 0) + 1
     ledger["bucket_reset_reason"] = str(reason)
+
+
+# Die Untergrenzen-Episode wird je Wallbox geführt, unabhängig davon, welche
+# Wallbox gerade Aktionsbesitzer ist: Beginn der Unterdeckung (Eintritts-
+# bestätigung), bestätigte Episode und Anforderungszeitpunkt der Absenkung (je
+# Wallbox und Topologie). Die übrigen Schlüssel spiegeln nur den aktuellen
+# Aktionsbesitzer für Diagnose und Journal.
+_FLOOR_DIRECT_SINCE_KEY = "floor_direct_minimum_pending_since_by_wb"
+_FLOOR_DIRECT_CONFIRMED_KEY = "floor_direct_minimum_confirmed_by_wb"
+_FLOOR_DIRECT_REQUESTS_KEY = "floor_direct_minimum_requested_by_wb"
+_FLOOR_DIRECT_BOX_KEYS = (
+    _FLOOR_DIRECT_SINCE_KEY,
+    _FLOOR_DIRECT_CONFIRMED_KEY,
+    _FLOOR_DIRECT_REQUESTS_KEY,
+)
+_FLOOR_DIRECT_OWNER_KEYS = (
+    "floor_direct_minimum",
+    "floor_direct_minimum_pending",
+    "floor_direct_minimum_pending_since_ts",
+    "floor_direct_minimum_requested_ts",
+)
+
+
+def _floor_direct_map(cascade: Mapping[str, Any], key: str) -> Dict[str, Any]:
+    values = cascade.get(key)
+    return dict(values) if isinstance(values, Mapping) else {}
+
+
+def _store_floor_direct_map(
+    cascade: Dict[str, Any],
+    key: str,
+    values: Mapping[str, Any],
+) -> None:
+    if values:
+        cascade[key] = dict(values)
+    else:
+        cascade.pop(key, None)
+
+
+def _forget_floor_direct_box(cascade: Dict[str, Any], wb_id: int) -> None:
+    """Beendet die Untergrenzen-Episode genau dieser Wallbox."""
+
+    for key in _FLOOR_DIRECT_BOX_KEYS:
+        values = _floor_direct_map(cascade, key)
+        values.pop(str(wb_id), None)
+        _store_floor_direct_map(cascade, key, values)
+    for key in _FLOOR_DIRECT_OWNER_KEYS:
+        cascade.pop(key, None)
+
+
+def _sync_floor_direct_candidates(
+    cascade: Dict[str, Any],
+    immediate_by_wb: Any,
+    timestamp: float,
+) -> None:
+    """Führt die Episoden aller Wallboxen mit Direktabsenkung in diesem Zyklus.
+
+    ``immediate_by_wb`` nennt jede Wallbox, deren Untergrenzen-Vertrag in
+    diesem Zyklus gilt, mit ihrem Eintritt ohne Bestätigung. Eine Wallbox, die
+    fehlt, verlässt ihre Episode samt Zeitstempeln; eine neue beginnt ihre
+    Eintrittsbestätigung jetzt.
+    """
+
+    active: Dict[str, bool] = {}
+    reported = immediate_by_wb if isinstance(immediate_by_wb, Mapping) else {}
+    for key, immediate in reported.items():
+        try:
+            candidate_id = _wb_id(key)
+        except DeficitControlInputError:
+            continue
+        active[str(candidate_id)] = bool(immediate is True)
+    since = {
+        key: value
+        for key, value in _floor_direct_map(cascade, _FLOOR_DIRECT_SINCE_KEY).items()
+        if key in active and _finite(value) is not None and float(value) <= timestamp
+    }
+    confirmed = {
+        key: True
+        for key, value in _floor_direct_map(cascade, _FLOOR_DIRECT_CONFIRMED_KEY).items()
+        if key in active and value is True
+    }
+    requests = {
+        key: value
+        for key, value in _floor_direct_map(cascade, _FLOOR_DIRECT_REQUESTS_KEY).items()
+        if key in active
+    }
+    for key, immediate in active.items():
+        since.setdefault(key, float(timestamp))
+        if immediate:
+            confirmed[key] = True
+    _store_floor_direct_map(cascade, _FLOOR_DIRECT_SINCE_KEY, since)
+    _store_floor_direct_map(cascade, _FLOOR_DIRECT_CONFIRMED_KEY, confirmed)
+    _store_floor_direct_map(cascade, _FLOOR_DIRECT_REQUESTS_KEY, requests)
+
+
+def _floor_direct_request_ts(
+    cascade: Mapping[str, Any],
+    wb_id: int,
+    topology: str,
+) -> Optional[float]:
+    """Anforderungszeitpunkt der Absenkung genau dieser Wallbox und Topologie."""
+
+    entry = _floor_direct_map(cascade, _FLOOR_DIRECT_REQUESTS_KEY).get(str(wb_id))
+    if not isinstance(entry, Mapping) or str(entry.get("topology") or "") != topology:
+        return None
+    return _finite(entry.get("ts"))
+
+
+def _set_floor_direct_request(
+    cascade: Dict[str, Any],
+    wb_id: int,
+    topology: str,
+    timestamp: float,
+) -> None:
+    requests = _floor_direct_map(cascade, _FLOOR_DIRECT_REQUESTS_KEY)
+    requests[str(wb_id)] = {"ts": float(timestamp), "topology": str(topology)}
+    _store_floor_direct_map(cascade, _FLOOR_DIRECT_REQUESTS_KEY, requests)
+    cascade["floor_direct_minimum_requested_ts"] = float(timestamp)
+
+
+def _forget_floor_direct_request(cascade: Dict[str, Any], wb_id: int) -> None:
+    requests = _floor_direct_map(cascade, _FLOOR_DIRECT_REQUESTS_KEY)
+    requests.pop(str(wb_id), None)
+    _store_floor_direct_map(cascade, _FLOOR_DIRECT_REQUESTS_KEY, requests)
+    cascade.pop("floor_direct_minimum_requested_ts", None)
 
 
 def _result(
@@ -216,6 +356,10 @@ def _result(
     action: Dict[str, Any],
     duplicate_snapshot: bool = False,
 ) -> Dict[str, Any]:
+    if str(action.get("type") or "") == ACTION_STOP:
+        # Ein Stop beendet die Untergrenzen-Episode der gestoppten Wallbox;
+        # ihre Bestätigung und Anforderung gelten nie für eine spätere Ladung.
+        _forget_floor_direct_box(cascade, wb_id)
     return {
         "schema_version": STATE_SCHEMA,
         "snapshot_id": snapshot_id,
@@ -261,6 +405,13 @@ def step_group_deficit(
     measured_subminimum_charge: bool = False,
     authorized_budget_overrun_w: Any = None,
     authorized_budget_contract_valid: bool = False,
+    battery_support_w: Any = None,
+    battery_contract_valid: bool = False,
+    battery_threshold_wh: Any = None,
+    export_rest_contract_valid: bool = False,
+    battery_not_discharging: bool = False,
+    export_margin_w: Any = 200.0,
+    export_rest_min_s: Any = 30.0,
     supports_phase_switch: bool = False,
     prevent_phase_switch: bool = False,
     phase_switch_confirmed: bool = False,
@@ -275,6 +426,12 @@ def step_group_deficit(
     leak_w: Any = 100.0,
     tolerance_w: Any = 100.0,
     max_dt_s: Any = 30.0,
+    floor_direct_minimum: bool = False,
+    floor_direct_minimum_confirm_s: Any = 30.0,
+    floor_direct_minimum_immediate: bool = True,
+    floor_direct_minimum_entry_confirm_s: Any = 20.0,
+    floor_direct_minimum_phase_down: bool = False,
+    floor_direct_minimum_immediate_by_wb: Optional[Mapping[Any, Any]] = None,
 ) -> Dict[str, Any]:
     """Fortschreiben von genau einem PCC-Defizitkonto und einer Kaskade.
 
@@ -295,6 +452,54 @@ def step_group_deficit(
     elektromechanische Stufe am Mindeststrom. Ein Phasen-Cooldown blockiert
     ausschließlich ``phase_down``; Stromabsenkung und Stop bleiben davon
     unabhängig.
+
+    Das Budgetkonto ruht bei Export. Seine Zählgröße hängt an der
+    Zuteilung, nicht am Netzpunkt – bei sinkender Zuteilung und nachlaufender
+    Ist-Leistung zählt es ohne physikalisches Defizit. Es zählt daher nur, wenn
+    NICHT gilt: Rohnetz <= −``export_margin_w`` UND Akku lädt oder ruht
+    (``battery_not_discharging``), beides stabil >= ``export_rest_min_s``. Der
+    Aufrufer bestätigt die Quelle explizit mit ``export_rest_contract_valid``;
+    ohne Bestätigung ruht nichts und es wird gezählt wie ohne diese Regel.
+    Die Rangfolge Netz > Akku > Budget bleibt unverändert.
+
+    wbminSoC-Untergrenze (``floor_direct_minimum``): Der Aufrufer bestätigt,
+    dass die marginale Wallbox in einem Modus mit Akkuladen bis zur
+    Untergrenze an der geschlossenen wbminSoC-Untergrenze lädt und ihr
+    batterieneutrales PV-Budget die Mindestleistung der aktuellen Phasenzahl
+    nicht trägt. Liegt dabei noch PV an (``floor_direct_minimum_immediate``
+    False), muss diese Unterdeckung erst
+    ``floor_direct_minimum_entry_confirm_s`` ununterbrochen anstehen
+    (Anti-Flattern bei Wolkenkanten); bis dahin gilt die bisherige Kaskade,
+    nur die vom Budgetkonto ausgelöste Strom- und Phasenstufe wartet, das
+    Konto zählt weiter. Ohne PV oder ohne bekanntes PV-Budget gilt die
+    Episode sofort. In
+    der Episode senkt die Kaskade oberhalb des Mindeststroms in einem Schritt
+    auf den Mindeststrom der aktuellen Phasenzahl ab – ohne Kontoreset, auch
+    bei Netzbezug, unabhängig vom Kontostand. Am Mindeststrom läuft das
+    vorhandene Konto genau einmal bis zur Schwelle weiter (kein Neustart).
+    Danach wechselt eine dreiphasig ladende, schaltbare Wallbox auf 1p, wenn
+    der Aufrufer ``floor_direct_minimum_phase_down`` bestätigt (ihr PV-Budget
+    trägt das 1p-Minimum und der Phasenausgang ist vorhanden); sonst folgt
+    der Stop ohne Phasenabstieg. Bleibt die Bestätigung eines solchen
+    Phasenwechsels aus, endet die Episode im Stop statt in einem erneuten
+    Phasenauftrag. Ein Stop oberhalb des Mindeststroms ist nur die
+    fail-closed-Kante für eine Wallbox, die der Absenkung nicht folgt: Die
+    Absenkung wurde für genau diese Wallbox in ihrer Topologie vor mindestens
+    ``floor_direct_minimum_confirm_s`` angefordert, der Strom liegt weiter
+    darüber und das Konto hat die Schwelle erreicht. Ohne gezählte Komponente
+    bleibt es am Mindeststrom beim Halten; fehlende Daten lösen keinen Stop
+    aus.
+
+    Die Episode – Eintrittsbestätigung, bestätigte Episode und
+    Anforderungszeitpunkt – wird je Wallbox geführt und hängt nicht daran,
+    welche Wallbox gerade Aktionsbesitzer ist; ein Besitzerwechsel startet
+    nichts neu und überträgt nichts. ``floor_direct_minimum_immediate_by_wb``
+    nennt dazu in jedem Zyklus alle Wallboxen mit geltender Direktabsenkung
+    und ihren Eintritt ohne Bestätigung; eine dort fehlende Wallbox verlässt
+    ihre Episode. Ohne diese Angabe (``None``) wird nur die Episode des
+    aktuellen Besitzers fortgeschrieben. Ein Besitzer ohne Direktabsenkung,
+    ein Stop und eine stehende Wallbox beenden die Episode dieser Wallbox
+    samt Zeitstempeln.
     """
 
     previous = _validated_previous(previous_state)
@@ -317,6 +522,17 @@ def step_group_deficit(
     pending_timeout = _positive(
         phase_switch_pending_timeout_s,
         name="phase_switch_pending_timeout_s",
+    )
+    direct_candidate = bool(floor_direct_minimum is True)
+    direct_confirm_s = _positive(
+        floor_direct_minimum_confirm_s,
+        name="floor_direct_minimum_confirm_s",
+        allow_zero=True,
+    )
+    direct_entry_confirm_s = _positive(
+        floor_direct_minimum_entry_confirm_s,
+        name="floor_direct_minimum_entry_confirm_s",
+        allow_zero=True,
     )
     subminimum_watch = bool(
         measured_subminimum_charge is True and 0.0 < current < minimum
@@ -386,9 +602,20 @@ def step_group_deficit(
             "last_snapshot_id": sid,
             "grid_deficit_w": None,
             "authorized_budget_overrun_w": None,
+            "battery_support_w": None,
+            "battery_contract_valid": False,
             "counted_total_w": None,
             "counted_total_complete": False,
             "authorized_budget_contract_valid": False,
+            # Die 30-s-Stabilität des Ruhezustands darf eine
+            # Datenlücke nicht überleben. Bliebe der Zeitstempel über die Lücke
+            # stehen, wäre "stabil >= 30 s" beim ersten wieder gültigen
+            # Exportframe sofort erfüllt – ohne frisch belegte Stabilität. Der
+            # Ruhezustand wird nach jeder Lücke neu verdient (fail-closed wie
+            # die übrigen Felder in diesem Zweig).
+            "export_rest_since_ts": None,
+            "export_rest_active": False,
+            "export_rest_contract_valid": False,
             "sample_valid": bool(sample_valid and timestamp_monotonic and pcc_value is not None),
             "sample_fresh": bool(sample_fresh),
             "dt_s": 0.0,
@@ -429,6 +656,53 @@ def step_group_deficit(
         and budget_overrun >= 0.0
     )
     grid_deficit = max(0.0, float(pcc_value) - tolerance)
+    # Ruhezustand des Budgetkontos.
+    # Ein Export am Netzpunkt bei ladendem oder ruhendem Speicher ist der
+    # physikalische Gegenbeleg zu einer Budgetüberziehung: es fehlt nichts.
+    # Die Stabilität liegt im Ledger (``export_rest_since_ts``); ein einzelner
+    # Frame ohne Bedingung löscht sie wieder. Ohne bestätigte Quelle
+    # (``export_rest_contract_valid``) ruht nie etwas.
+    export_margin = _positive(export_margin_w, name="export_margin_w", allow_zero=True)
+    export_rest_min = _positive(
+        export_rest_min_s,
+        name="export_rest_min_s",
+        allow_zero=True,
+    )
+    export_rest_eligible = bool(
+        export_rest_contract_valid is True
+        and battery_not_discharging is True
+        and float(pcc_value) <= -export_margin
+    )
+    export_rest_since = _finite(ledger.get("export_rest_since_ts"))
+    if not export_rest_eligible:
+        export_rest_since = None
+    elif export_rest_since is None:
+        export_rest_since = float(timestamp)
+    budget_rest = bool(
+        export_rest_since is not None
+        and float(timestamp) - float(export_rest_since) >= export_rest_min
+    )
+    # Drittes Konto – Akku-Stuetzung der
+    # marginalen Wallbox ausserhalb der Floor-Modi. Der Aufrufer liefert die
+    # Nettogroesse min(Entladung, WB-Ist - PV-Rest) - Toleranz und bestaetigt
+    # Live-/PV-Daten explizit; ohne Vertrag bleibt das Konto unbekannt und
+    # eingefroren, nie 0 W. Schwelle ist das Kurven-Kontingent, nicht die
+    # Netz-Wh-Schwelle.
+    battery_value = _finite(battery_support_w)
+    battery_threshold_value = _finite(battery_threshold_wh)
+    battery_contract = bool(
+        battery_contract_valid is True
+        and battery_value is not None
+        and battery_value >= 0.0
+        and battery_threshold_value is not None
+        and battery_threshold_value > 0.0
+    )
+    battery_support: Optional[float] = (
+        max(0.0, float(battery_value)) if battery_contract else None
+    )
+    battery_threshold = (
+        float(battery_threshold_value) if battery_contract else threshold
+    )
     authorized_budget_overrun: Optional[float] = None
     if budget_contract_valid:
         # Der Quellenvertrag liefert bereits exakt
@@ -441,10 +715,45 @@ def step_group_deficit(
     # sichtbar, wird aber nicht zusätzlich in denselben Wh-Wächter gezählt.
     # Damit kann ein gemeinsamer physischer Mangel niemals zwei Wächter
     # beschleunigen. Erst ohne Netzbezug übernimmt der Budget-Wächter.
-    if grid_deficit > 0.0:
+    # Totzone geschlossen –
+    # Netz hat nur Vorrang, wenn sein Konto wirklich akkumuliert
+    # (Defizit > Leck). Im Band Toleranz < Import <= Toleranz + Leck wuerde
+    # 'grid' sonst das Akku-Konto pausieren, ohne selbst zu wachsen
+    # (Akku 1000 W + 250 W Import -> nie Stop). Ohne angebotene
+    # Akku-Stuetzung bleibt das Netzverhalten unveraendert.
+    grid_accumulating = bool(grid_deficit > leak)
+    battery_offered = bool(battery_support is not None and battery_support > 0.0)
+    # Rang nach erwarteter Zeit bis
+    # zur Schwelle statt fester Kante Toleranz + Leck. Netz zaehlt nur, wenn
+    # sein Konto die Netzschwelle mindestens so schnell erreicht wie das
+    # Akku-Konto sein Kontingent: (Defizit - Leck) / Schwelle >=
+    # (Stuetzung - Leck) / Kontingent. Sonst zaehlt der Akku (Netzkonto
+    # pausiert, s. u.). Ohne angebotene Akku-Stuetzung bleibt das
+    # Netzverhalten unveraendert (Netz zaehlt bei jedem Defizit > 0).
+    grid_rate = (grid_deficit - leak) / threshold
+    battery_rate = (
+        (float(battery_support or 0.0) - leak) / battery_threshold
+        if battery_offered
+        else None
+    )
+    grid_outranks = bool(
+        grid_deficit > 0.0
+        and (battery_rate is None or grid_rate >= battery_rate)
+    )
+    if grid_outranks:
         counted_component = "grid"
         counted_total = grid_deficit
-    elif authorized_budget_overrun is not None and authorized_budget_overrun > 0.0:
+    elif battery_support is not None and battery_support > 0.0:
+        # Akku vor Budgetueberziehung, nach Netz.
+        counted_component = "battery"
+        counted_total = battery_support
+    elif (
+        authorized_budget_overrun is not None
+        and authorized_budget_overrun > 0.0
+        # Ruht das Konto, wird es nicht zur gezählten Komponente;
+        # die Kachel folgt automatisch (counted_component 'none').
+        and not budget_rest
+    ):
         counted_component = "authorized_budget"
         counted_total = authorized_budget_overrun
     else:
@@ -470,11 +779,44 @@ def step_group_deficit(
         0.0,
         float(ledger.get("authorized_budget_bucket_wh", 0.0) or 0.0),
     )
-    grid_bucket = max(
-        0.0,
-        grid_bucket_before + (grid_deficit - leak) * dt_s / 3600.0,
+    # Das Netzkonto pausiert (eingefroren), solange der Akku als
+    # schnellere Komponente gezaehlt wird und das Netzkonto sonst wachsen
+    # wuerde - nie zwei wachsende Konten je Zyklus. Im Band (Defizit <= Leck)
+    # leakt es weiter wie bisher.
+    grid_paused = bool(counted_component == "battery" and grid_accumulating)
+    grid_bucket = (
+        grid_bucket_before
+        if grid_paused
+        else max(
+            0.0,
+            grid_bucket_before + (grid_deficit - leak) * dt_s / 3600.0,
+        )
     )
-    if grid_deficit > 0.0:
+    # Akku-Konto mit Netz-Leck und Netz-max_dt (dt_s ist geclamped).
+    # Netz hat Vorrang (pausiert); ohne Vertrag bleibt das Konto stehen.
+    battery_bucket_before = max(
+        0.0,
+        float(ledger.get("battery_bucket_wh", 0.0) or 0.0),
+    )
+    # Pausiert nur, solange das Netzkonto akkumuliert
+    # (grid_deficit > leak); im Toleranzband zaehlt bzw. leakt es normal.
+    # Pausiert nur, wenn das Netz gezaehlt wird UND akkumuliert;
+    # zaehlt der Akku (schneller an seiner Schwelle), laeuft sein Konto weiter.
+    if (
+        grid_accumulating and counted_component == "grid"
+    ) or not battery_contract:
+        battery_bucket = battery_bucket_before
+        battery_leak_applied_w = 0.0
+    else:
+        battery_bucket = max(
+            0.0,
+            battery_bucket_before
+            + (float(battery_support or 0.0) - leak) * dt_s / 3600.0,
+        )
+        battery_leak_applied_w = leak
+    # Bei Export haelt das Konto seinen Stand (kein Fuellen, kein
+    # Leeren) - wie bei fehlendem Quellenvertrag.
+    if grid_deficit > 0.0 or counted_component == "battery" or budget_rest:
         budget_bucket = budget_bucket_before
         budget_leak_applied_w = 0.0
     elif budget_contract_valid:
@@ -491,18 +833,26 @@ def step_group_deficit(
     active_bucket = (
         grid_bucket
         if counted_component == "grid"
+        else battery_bucket
+        if counted_component == "battery"
         else budget_bucket
         if counted_component == "authorized_budget"
-        else max(grid_bucket, budget_bucket)
+        else max(grid_bucket, battery_bucket, budget_bucket)
     )
     active_threshold_bucket = (
         grid_bucket
         if counted_component == "grid"
+        else battery_bucket
+        if counted_component == "battery"
         else budget_bucket
         if counted_component == "authorized_budget"
         else 0.0
     )
-    threshold_reached = active_threshold_bucket + 1e-9 >= threshold
+    # Das Akku-Konto hat seine eigene Schwelle (Kurven-Kontingent).
+    active_threshold = (
+        battery_threshold if counted_component == "battery" else threshold
+    )
+    threshold_reached = active_threshold_bucket + 1e-9 >= active_threshold
     grid_deficit_out = round(grid_deficit, 6)
     authorized_budget_overrun_out = (
         round(authorized_budget_overrun, 6)
@@ -516,32 +866,53 @@ def step_group_deficit(
         "bucket_wh": round(active_bucket, 9),
         "grid_bucket_wh": round(grid_bucket, 9),
         "authorized_budget_bucket_wh": round(budget_bucket, 9),
+        "battery_bucket_wh": round(battery_bucket, 9),
+        "battery_support_w": (
+            round(battery_support, 6) if battery_support is not None else None
+        ),
+        "battery_threshold_wh": (
+            round(battery_threshold, 6) if battery_contract else None
+        ),
+        "battery_contract_valid": bool(battery_contract),
+        "battery_leak_applied_w": round(battery_leak_applied_w, 6),
         "bucket_component": counted_component,
         "grid_deficit_w": grid_deficit_out,
         "authorized_budget_overrun_w": authorized_budget_overrun_out,
         "counted_component": counted_component,
         "counted_total_w": counted_total_out,
         "counted_total_complete": bool(
-            grid_deficit > 0.0 or budget_contract_valid
+            grid_deficit > 0.0 or battery_contract or budget_contract_valid
         ),
         "authorized_budget_contract_valid": bool(budget_contract_valid),
+        # Ruhezustand des Budgetkontos bei Export (Diagnose).
+        "export_rest_since_ts": export_rest_since,
+        "export_rest_active": bool(budget_rest),
+        "export_rest_contract_valid": bool(export_rest_contract_valid is True),
         "sample_valid": True,
         "sample_fresh": True,
         "dt_s": round(dt_s, 6),
         "dt_clamped": bool(raw_dt > max_dt + 1e-9),
         "leak_applied_w": round(
-            leak if counted_component == "grid" else budget_leak_applied_w,
+            leak
+            if counted_component == "grid"
+            else battery_leak_applied_w
+            if counted_component == "battery"
+            else budget_leak_applied_w,
             6,
         ),
-        "grid_leak_applied_w": round(leak, 6),
+        # 0 W, solange das Netzkonto hinter dem Akku pausiert.
+        "grid_leak_applied_w": round(0.0 if grid_paused else leak, 6),
         "authorized_budget_leak_applied_w": round(
             budget_leak_applied_w,
             6,
         ),
         "threshold_reached": bool(threshold_reached),
         "reason": (
+            # Grund folgt der gewaehlten Komponente.
             "grid_priority"
-            if grid_deficit > 0.0
+            if counted_component == "grid"
+            else "battery_support"
+            if counted_component == "battery"
             else "authorized_budget_overrun"
             if authorized_budget_overrun is not None
             and authorized_budget_overrun > 0.0
@@ -550,6 +921,15 @@ def step_group_deficit(
             else "within_tolerance"
         ),
     })
+
+    if floor_direct_minimum_immediate_by_wb is not None:
+        # Untergrenzen-Episoden aller Wallboxen in jedem gültigen Zyklus
+        # fortschreiben, auch während Phasen- oder Stopbestätigung.
+        _sync_floor_direct_candidates(
+            cascade,
+            floor_direct_minimum_immediate_by_wb,
+            float(timestamp),
+        )
 
     owner_changed = previous_owner != wb_id
     topology_changed = str(cascade.get("topology") or topology) != topology
@@ -619,7 +999,29 @@ def step_group_deficit(
             phase_switch_failed or pending_age_s + 1e-9 >= pending_timeout
         )
         if pending_terminal:
-            if grid_deficit > 0.0 and current > 1e-6:
+            # wbminSoC-Untergrenze: Bleibt der Phasenwechsel der Episode
+            # unbestätigt, endet sie fail-closed im Stop statt in einem
+            # erneuten Phasenauftrag am 3p-Minimum aus dem Akku.
+            floor_pending_stop = bool(
+                direct_candidate
+                and _floor_direct_map(cascade, _FLOOR_DIRECT_CONFIRMED_KEY).get(
+                    str(wb_id)
+                ) is True
+            )
+            # Nach gescheitertem Phasenwechsel stoppt auch die
+            # Akku-Stuetzung wie der Netzbezug (naechste Kaskadenstufe).
+            if (
+                grid_deficit > 0.0
+                or counted_component == "battery"
+                or floor_pending_stop
+            ) and current > 1e-6:
+                # Art folgt der gewaehlten Komponente.
+                if counted_component == "grid":
+                    _pending_kind = "grid"
+                elif counted_component == "battery" or not floor_pending_stop:
+                    _pending_kind = "battery"
+                else:
+                    _pending_kind = "wbminsoc_floor"
                 cascade.update({
                     "marginal_wb_id": wb_id,
                     "topology": topology,
@@ -629,9 +1031,9 @@ def step_group_deficit(
                     "phase_down_requested_sample_ts": None,
                     "phase_pending_age_s": round(pending_age_s, 6),
                     "reason": (
-                        "phase_down_failed_grid_stop"
+                        "phase_down_failed_%s_stop" % _pending_kind
                         if phase_switch_failed
-                        else "phase_down_timeout_grid_stop"
+                        else "phase_down_timeout_%s_stop" % _pending_kind
                     ),
                 })
                 _reset_bucket(ledger, reason="phase_pending_grid_stop")
@@ -703,6 +1105,7 @@ def step_group_deficit(
     ):
         if current <= 1e-6:
             _reset_bucket(ledger, reason="stop_confirmed")
+            _forget_floor_direct_box(cascade, wb_id)
             cascade["reason"] = "stop_confirmed"
             reason = "stop_confirmed"
         else:
@@ -722,6 +1125,13 @@ def step_group_deficit(
         )
 
     if owner_changed or topology_changed:
+        # Die Untergrenzen-Episoden laufen je Wallbox weiter; ein je Zyklus
+        # wechselnder Besitzer hielte sonst die Eintrittsbestätigung endlos
+        # offen. Nur die Spiegelwerte des bisherigen Besitzers entfallen; der
+        # Anforderungszeitpunkt bleibt an Wallbox und Topologie gebunden und
+        # wird nie auf eine andere Wallbox übertragen.
+        for key in _FLOOR_DIRECT_OWNER_KEYS:
+            cascade.pop(key, None)
         cascade.update({
             "marginal_wb_id": wb_id,
             "topology": topology,
@@ -747,6 +1157,7 @@ def step_group_deficit(
         # Die Komponenten bleiben diagnostisch sichtbar, es entsteht aber
         # weder ein Strom- noch ein Schaltbefehl aus fremdem Hausdefizit.
         _reset_bucket(ledger, reason="marginal_not_offering_current")
+        _forget_floor_direct_box(cascade, wb_id)
         cascade["reason"] = "marginal_not_offering_current"
         return _result(
             snapshot_id=sid,
@@ -759,6 +1170,127 @@ def step_group_deficit(
                 "marginal_not_offering_current",
                 stage=stage,
                 fail_closed=True,
+            ),
+        )
+
+    # wbminSoC-Untergrenze ohne tragfähiges PV-Budget: Mindeststrom, danach
+    # genau ein Durchlauf des vorhandenen Kontos, dann Stop. Die Absenkung
+    # setzt das Konto nicht zurück. Liegt noch PV an, bestätigt eine Haltezeit
+    # die Unterdeckung, bevor die Episode gilt; ohne PV gilt sie sofort. Die
+    # Haltezeit läuft je Wallbox, auch während eine andere Wallbox
+    # Aktionsbesitzer ist.
+    direct_floor = False
+    owner_key = str(wb_id)
+    if not direct_candidate:
+        _forget_floor_direct_box(cascade, wb_id)
+    else:
+        since_by_wb = _floor_direct_map(cascade, _FLOOR_DIRECT_SINCE_KEY)
+        pending_since = _finite(since_by_wb.get(owner_key))
+        if pending_since is None or pending_since > float(timestamp):
+            pending_since = float(timestamp)
+            since_by_wb[owner_key] = pending_since
+            _store_floor_direct_map(cascade, _FLOOR_DIRECT_SINCE_KEY, since_by_wb)
+        confirmed_by_wb = _floor_direct_map(cascade, _FLOOR_DIRECT_CONFIRMED_KEY)
+        direct_floor = bool(
+            confirmed_by_wb.get(owner_key) is True
+            or floor_direct_minimum_immediate is True
+            or float(timestamp) - pending_since + 1e-9 >= direct_entry_confirm_s
+        )
+        if direct_floor:
+            confirmed_by_wb[owner_key] = True
+            _store_floor_direct_map(cascade, _FLOOR_DIRECT_CONFIRMED_KEY, confirmed_by_wb)
+        cascade["floor_direct_minimum"] = direct_floor
+        cascade["floor_direct_minimum_pending"] = not direct_floor
+        cascade["floor_direct_minimum_pending_since_ts"] = pending_since
+    if at_minimum:
+        # Die Absenkung ist befolgt; ein späterer Anstieg wäre eine neue
+        # Anforderung mit eigener Bestätigungszeit.
+        _forget_floor_direct_request(cascade, wb_id)
+    energy_stage_step = bool(
+        not at_minimum
+        or (
+            phases == 3
+            and topology == TOPOLOGY_SWITCHABLE
+            and not phase_switch_sequence_active
+        )
+    )
+    if (
+        direct_candidate
+        and not direct_floor
+        and energy_stage_step
+        and grid_deficit <= 0.0
+        and threshold_reached
+    ):
+        # Eintritt noch in Bestätigung: weder Budgetstufe mit Kontoreset noch
+        # Phasenabstieg am 3p-Minimum; die gleich darauf geltende Episode
+        # übernimmt den Kontostand und entscheidet zwischen 1p und Stop.
+        cascade["reason"] = "wbminsoc_floor_direct_minimum_confirming"
+        return _result(
+            snapshot_id=sid,
+            sample_ts=timestamp,
+            wb_id=wb_id,
+            ledger=ledger,
+            cascade=cascade,
+            action=_hold_action(
+                wb_id,
+                "wbminsoc_floor_direct_minimum_confirming",
+                stage=stage,
+            ),
+        )
+    if direct_floor and not at_minimum:
+        # Der Anforderungszeitpunkt gehört genau dieser Wallbox in ihrer
+        # Topologie; ein zwischenzeitlicher Besitzerwechsel setzt ihn nicht
+        # zurück, damit auch bei wechselndem Besitzer eine nicht folgende
+        # Wallbox fail-closed stoppt.
+        requested_ts = _floor_direct_request_ts(cascade, wb_id, topology)
+        not_following = bool(
+            requested_ts is not None
+            and float(timestamp) - float(requested_ts) + 1e-9 >= direct_confirm_s
+        )
+        if not_following and threshold_reached:
+            cascade.update({
+                "stage": STAGE_STOP_PENDING,
+                "generation": int(cascade.get("generation", 0) or 0) + 1,
+                "phase_down_requested": False,
+                "reason": "wbminsoc_floor_direct_minimum_not_following_stop",
+            })
+            _reset_bucket(ledger, reason="stop_requested")
+            return _result(
+                snapshot_id=sid,
+                sample_ts=timestamp,
+                wb_id=wb_id,
+                ledger=ledger,
+                cascade=cascade,
+                action=_action(
+                    ACTION_STOP,
+                    wb_id,
+                    "minimum_current_energy_reached",
+                    stage=STAGE_STOP_PENDING,
+                    target_amp=0.0,
+                ),
+            )
+        if requested_ts is None:
+            _set_floor_direct_request(cascade, wb_id, topology, float(timestamp))
+        else:
+            cascade["floor_direct_minimum_requested_ts"] = float(requested_ts)
+        next_stage = _stage_for_physics(phases, minimum, minimum)
+        cascade.update({
+            "stage": next_stage,
+            "generation": int(cascade.get("generation", 0) or 0) + 1,
+            "reason": "wbminsoc_floor_direct_minimum",
+        })
+        return _result(
+            snapshot_id=sid,
+            sample_ts=timestamp,
+            wb_id=wb_id,
+            ledger=ledger,
+            cascade=cascade,
+            action=_action(
+                ACTION_CURRENT_DOWN,
+                wb_id,
+                "wbminsoc_floor_direct_minimum",
+                stage=next_stage,
+                target_amp=minimum,
             ),
         )
 
@@ -808,14 +1340,33 @@ def step_group_deficit(
             action=_action(
                 ACTION_CURRENT_DOWN,
                 wb_id,
-                "authorized_budget_overrun_threshold",
+                (
+                    "battery_support_threshold"
+                    if counted_component == "battery"
+                    else "authorized_budget_overrun_threshold"
+                ),
                 stage=next_stage,
                 target_amp=target,
             ),
         )
 
     if at_minimum and threshold_reached:
-        if phases == 3 and topology == TOPOLOGY_SWITCHABLE:
+        # An der wbminSoC-Untergrenze folgt nach dem Kontodurchlauf ein
+        # Phasenabstieg nur, wenn der Aufrufer ihn bestätigt (PV trägt das
+        # 1p-Minimum, Phasenausgang vorhanden); sonst direkt Stop. Eine bereits
+        # laufende Phasensequenz wird wie bisher abgewartet.
+        floor_phase_down = bool(
+            direct_floor and floor_direct_minimum_phase_down is True
+        )
+        if (
+            phases == 3
+            and topology == TOPOLOGY_SWITCHABLE
+            and (
+                phase_switch_sequence_active
+                or not direct_floor
+                or floor_phase_down
+            )
+        ):
             if phase_switch_sequence_active:
                 cascade.update({
                     "stage": STAGE_PHASE_DOWN_PENDING,
@@ -875,7 +1426,11 @@ def step_group_deficit(
                 "phase_down_requested": True,
                 "phase_down_requested_sample_ts": float(timestamp),
                 "phase_pending_age_s": 0.0,
-                "reason": "three_phase_minimum_energy_reached",
+                "reason": (
+                    "wbminsoc_floor_direct_minimum_phase_down"
+                    if floor_phase_down
+                    else "three_phase_minimum_energy_reached"
+                ),
             })
             return _result(
                 snapshot_id=sid,
@@ -886,7 +1441,11 @@ def step_group_deficit(
                 action=_action(
                     ACTION_PHASE_DOWN,
                     wb_id,
-                    "three_phase_minimum_energy_reached",
+                    (
+                        "battery_support_threshold"
+                        if counted_component == "battery"
+                        else "three_phase_minimum_energy_reached"
+                    ),
                     stage=STAGE_PHASE_DOWN_PENDING,
                     target_phases=1,
                 ),
@@ -899,7 +1458,11 @@ def step_group_deficit(
             "stage": STAGE_STOP_PENDING,
             "generation": int(cascade.get("generation", 0) or 0) + 1,
             "phase_down_requested": False,
-            "reason": "minimum_current_energy_reached",
+            "reason": (
+                "wbminsoc_floor_direct_minimum_stop"
+                if direct_floor
+                else "minimum_current_energy_reached"
+            ),
         })
         _reset_bucket(ledger, reason="stop_requested")
         return _result(
@@ -911,7 +1474,11 @@ def step_group_deficit(
             action=_action(
                 ACTION_STOP,
                 wb_id,
-                "minimum_current_energy_reached",
+                (
+                    "battery_support_threshold"
+                    if counted_component == "battery"
+                    else "minimum_current_energy_reached"
+                ),
                 stage=STAGE_STOP_PENDING,
                 target_amp=0.0,
             ),

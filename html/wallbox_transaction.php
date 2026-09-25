@@ -20,6 +20,35 @@ const E3DC_WB_TX_PLAN_FILES = [
     'native_wallbox_schedule.json',
 ];
 
+function e3dcWbTxRecordFailure(array $tx, $handler, $wbId = null, $context = []) {
+    // Fehlgeschlagene WebUI-Transaktionen hinterlassen sonst nur den Badge
+    // „Speichern fehlgeschlagen“ im Browser. Das Journal auf der Ramdisk
+    // macht Code, Grund und Zeitpunkt nachträglich lesbar (Diagnosepaket).
+    // Best effort, ohne Zugangsdaten, gedeckelt auf ~64 KB plus eine Rotation.
+    if (!empty($tx['success'])) return;
+    $dir = is_array($context) && !empty($context['ramdisk_dir'])
+        ? rtrim((string)$context['ramdisk_dir'], '/')
+        : '/var/www/html/ramdisk';
+    if (!is_dir($dir) || !is_writable($dir)) return;
+    $path = $dir . '/wallbox_transaction_errors.jsonl';
+    $entry = [
+        'ts' => gmdate('c'),
+        'handler' => substr((string)$handler, 0, 64),
+        'wb' => $wbId === null ? null : (int)$wbId,
+        'code' => substr((string)($tx['code'] ?? ''), 0, 64),
+        'message' => substr((string)($tx['message'] ?? ''), 0, 200),
+        'error' => substr((string)($tx['error'] ?? ''), 0, 256),
+        'transaction_id' => substr((string)($tx['transaction_id'] ?? ''), 0, 64),
+    ];
+    $line = json_encode($entry, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    if (!is_string($line)) return;
+    if (is_file($path) && !is_link($path) && (@filesize($path) ?: 0) > 65536) {
+        @rename($path, $path . '.1');
+    }
+    if (is_link($path)) return;
+    @file_put_contents($path, $line . "\n", FILE_APPEND | LOCK_EX);
+}
+
 function e3dcWbTxResult($success, $code, $message, array $extra = []) {
     return array_merge([
         'success' => (bool)$success,
@@ -904,6 +933,18 @@ function e3dcWbTxModeRequestBytes(array $snapshot, $wbId, $newMode, $oldMode, $k
     return $json . "\n";
 }
 
+function e3dcWbTxWallboxConfiguredAsOpenWbPro(array $config, $wbId) {
+    // Der typisierte Modus-5-Sofortauftrag (Pro-Stecksession, Boot-ID,
+    // Latch-Generation) ist ein openWB-Pro-Vertrag: Nur dieser Treiber führt
+    // eine persistierte Pro-Stecksession, und nur er wertet den Auftrag aus
+    // (Manager-Blocker `openwb_pro_driver_required`). E3DC-, openWB- und
+    // go-e-Wallboxen erhalten "Sofort bis Preislimit" als gewöhnlichen
+    // Konfigurationscommit; die Preisfreigabe entscheidet der Manager selbst.
+    $typeKey = max(1, min(2, (int)$wbId)) === 2 ? 'wb_native_type2' : 'wb_native_type';
+    $flat = e3dcWbTxFlattenConfig($config);
+    return normalizeWallboxTypeConfig($flat[$typeKey] ?? '') === 'openwb_pro';
+}
+
 function e3dcWbTxMode5SessionBinding($path, $wbId) {
     $snapshot = e3dcWbTxSnapshot($path, 4194304);
     if (empty($snapshot['exists'])) {
@@ -1049,7 +1090,18 @@ function e3dcWallboxPlanTransaction(array $updates, array $options = []) {
         if (empty($context['success'])) {
             return e3dcWbTxResult(false, 'context_invalid', $context['error'] ?? 'Laufzeitkontext ist ungültig.');
         }
+        $mode5RequestStatus = 'not_requested';
+        if ($mode5IntentRequested && !e3dcWbTxWallboxConfiguredAsOpenWbPro($rawConfig, $mode5WbId)) {
+            // Ohne openWB-Pro-Treiber existiert keine Pro-Stecksession, an die
+            // der Auftrag gebunden werden könnte; bisher scheiterte damit jeder
+            // Wechsel auf "Sofort · Netz erlaubt" an E3DC-/openWB-/go-e-Wallboxen
+            // mit "Speichern fehlgeschlagen". Modus 5 wird für diese Treiber
+            // als gewöhnlicher Konfigurationscommit übernommen.
+            $mode5IntentRequested = false;
+            $mode5RequestStatus = 'not_required_for_driver';
+        }
         if ($mode5IntentRequested) {
+            $mode5RequestStatus = 'bound';
             $mode5SessionBinding = e3dcWbTxMode5SessionBinding(
                 dirname($context['config_path']) . '/wallbox_phase_transition_state.json',
                 $mode5WbId
@@ -1170,7 +1222,8 @@ function e3dcWallboxPlanTransaction(array $updates, array $options = []) {
                 $requestKind = 'user';
                 $requestTarget = $ramdisk . '/wallbox_user_mode_request.json';
             } elseif (
-                $newMode === '5'
+                $mode5IntentRequested
+                && $newMode === '5'
                 && (string)($modeTransition['charge_intent'] ?? '') === 'instant'
                 && (string)($modeTransition['energy_mode'] ?? '') === 'grid_price'
             ) {
@@ -1525,6 +1578,7 @@ function e3dcWallboxPlanTransaction(array $updates, array $options = []) {
             'saved_cars_sha256' => $savedCarsRequested ? hash('sha256', (string)$savedCarsBytes) : null,
             'plan_manifest' => $plannerResult['plans'] ?? [],
             'canonical_committed' => true,
+            'mode5_request_status' => $requestKind === 'mode5_start' ? 'committed' : $mode5RequestStatus,
             'legacy_projection_status' => $legacyProjection['status'] ?? 'not_requested',
             'legacy_projection' => $legacyProjection['artifacts'] ?? [],
             'legacy_cleanup_status' => $legacyCleanup['status'] ?? 'not_requested',

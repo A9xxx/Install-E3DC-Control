@@ -938,6 +938,23 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
             <div class="mobile-storage-reason" id="m-storage-reason">--</div>
         </div>
 
+        <?php /* Kompaktkarte Zusatzwechselrichter (Direktlesung), nur bei konfigurierter Lesung; nur Anzeige */ ?>
+        <?php /* Nicht klickbar – kein Zeiger-Cursor (die Klasse erbt cursor: pointer von der Speicherkarte) */ ?>
+        <div class="dashboard-card mobile-storage-strip mb-2" id="m-ext-inverter-strip" style="display:none;cursor:default;" title="Zusatzwechselrichter (Direktlesung) – nur Anzeige, die Regelung nutzt den E3DC-Messwert">
+            <div class="mobile-storage-head">
+                <div class="mobile-storage-kicker"><i class="fas fa-solar-panel me-1"></i>Zusatzwechselrichter</div>
+                <span class="mobile-storage-state-pill" id="m-ext-inverter-state">--</span>
+            </div>
+            <div class="mobile-storage-main">
+                <div class="mobile-storage-title" id="m-ext-inverter-ac">--</div>
+            </div>
+            <div class="mobile-storage-chips">
+                <span class="mobile-storage-chip curve" id="m-ext-inverter-daily">Heute --</span>
+                <span class="mobile-storage-chip ems" id="m-ext-inverter-temp">--</span>
+            </div>
+            <div class="mobile-storage-reason" id="m-ext-inverter-phases">--</div>
+        </div>
+
         <div class="mobile-flow-switch" role="tablist" aria-label="Energiefluss-Ansicht">
             <button type="button" id="m-flow-tab-classic" class="active" onclick="setMobileFlowView('classic')" aria-pressed="true">
                 <i class="fas fa-project-diagram me-1"></i>Knoten
@@ -1381,15 +1398,9 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
                 </div>
                 <div class="d-flex flex-wrap gap-2 mt-3">
                     <a href="install_center.php?return=mobile" class="btn btn-outline-info flex-fill py-3 rounded-4 fw-bold shadow-sm"><i class="fas fa-screwdriver-wrench me-2"></i>Installationszentrale</a>
-                <?php if (!$isDocker): ?>
-                        <button id="btn-update-installer" class="btn btn-outline-info flex-fill py-3 rounded-4 fw-bold shadow-sm" onclick="startInstallerUpdate()" title="Aktualisiert E3DC-Control über den sicheren Systemjob">
+                        <button id="btn-update-installer" class="btn btn-outline-info flex-fill py-3 rounded-4 fw-bold shadow-sm" onclick="startInstallerUpdate()" title="<?= $isDocker ? 'Lädt das neue Container-Image über Watchtower und erstellt den Container neu; ohne Watchtower werden die Host-Befehle angezeigt' : 'Aktualisiert E3DC-Control über den sicheren Systemjob' ?>">
                             <i class="fas fa-sync-alt me-2"></i>System Update <span id="update-badge-installer" class="badge bg-danger ms-1" style="display:none;">!</span>
                         </button>
-                <?php else: ?>
-                    <div class="alert alert-secondary small mb-0 mt-3 rounded-4">
-                        <i class="fab fa-docker me-2"></i>Docker-Installationen werden über das Container-Image aktualisiert.
-                    </div>
-                <?php endif; ?>
                 </div>
             </div>
 

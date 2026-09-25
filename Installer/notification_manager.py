@@ -42,7 +42,7 @@ def safe_execute(cmd_list, silent=False):
         script_path = cmd_list[1] if len(cmd_list) > 1 else cmd_list[0]
         if os.path.exists(script_path):
             if not silent:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Fuehre aus: {' '.join(cmd_list)}", flush=True)
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Führe aus: {' '.join(cmd_list)}", flush=True)
             
             res = subprocess.run(cmd_list, capture_output=True, text=True, check=False)
             
@@ -58,10 +58,10 @@ def safe_execute(cmd_list, silent=False):
             return True
         else:
             if not silent:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Ueberspringe (Datei fehlt): {script_path}", flush=True)
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Überspringe (Datei fehlt): {script_path}", flush=True)
             return False
     except Exception as e:
-        print(f"Fehler bei der Ausfuehrung von {cmd_list}: {e}", flush=True)
+        print(f"Fehler bei der Ausführung von {cmd_list}: {e}", flush=True)
         return False
 
 def normalize_time(t_str):
@@ -217,6 +217,28 @@ def main():
                 silent=True,
             )
             last_run['history'] = history_id
+
+        # 7b. Docker-Auto-Update: Der Nutzer entscheidet im Config-Editor
+        # (auto_update_enable, auto_update_time); Watchtower führt nur aus.
+        # Ohne neues Image bleibt der Lauf leer, der Container läuft weiter.
+        # Bare Metal übernimmt denselben Schalter im Energy Manager.
+        if os.environ.get("E3DC_CONTAINER_MODE") == "1" and is_true(cfg.get('auto_update_enable', '0')) and not is_standby:
+            auto_update_time = normalize_time(cfg.get('auto_update_time', '23:00'))
+            auto_update_id = f"{c_date}_{auto_update_time}"
+            if c_time == auto_update_time and last_run.get('docker_auto_update') != auto_update_id:
+                last_run['docker_auto_update'] = auto_update_id
+                print(
+                    f"[{datetime.now().strftime('%H:%M:%S')}] Auto-Update: Signal an Watchtower "
+                    f"({auto_update_time} Uhr).",
+                    flush=True,
+                )
+                safe_execute([
+                    "/usr/bin/python3",
+                    os.path.join(script_dir, "docker_watchtower_client.py"),
+                    "trigger",
+                    "--reason",
+                    "schedule",
+                ])
 
         # 8. Docker-Neustartsignal: Das Entfernen bestätigt genau einen Konsum.
         # Der ungleiche Exit wird von PID 1 über wait -n erkannt und beendet den

@@ -1,10 +1,10 @@
 # Web-Push Benachrichtigungen
 
-E3DC-Control kann als PWA native Push-Nachrichten an Browser und Smartphones senden. Das ersetzt Telegram nicht zwingend, ist aber fuer lokale Statusmeldungen und Warnungen sehr praktisch.
+E3DC-Control kann als PWA native Push-Nachrichten an Browser und Smartphones senden. Das ersetzt Telegram nicht zwingend, ist aber für lokale Statusmeldungen und Warnungen sehr praktisch.
 
 ## Konfiguration
 
-Die VAPID-Schluessel und Push-Optionen liegen in:
+Die VAPID-Schlüssel und Push-Optionen liegen in:
 
 ```text
 /var/www/html/data/e3dc_v4.json
@@ -18,7 +18,7 @@ push_vapid_private = ...
 push_enabled = 1
 ```
 
-Die Schluessel werden automatisch erzeugt. Das Skript `Installer/generate_vapid.py` schreibt neue Keys direkt in `e3dc_v4.json`; ein expliziter Legacy-TXT-Pfad ist nur noch fuer alte Installationen gedacht.
+Die Schlüssel werden automatisch erzeugt. Das Skript `Installer/generate_vapid.py` schreibt neue Keys direkt in `e3dc_v4.json`; ein expliziter Legacy-TXT-Pfad ist nur noch für alte Installationen gedacht.
 
 ## Ablauf
 
@@ -32,13 +32,13 @@ Die Schluessel werden automatisch erzeugt. Das Skript `Installer/generate_vapid.
 - Ziel-SoC erreicht
 - Fahrzeug nicht angesteckt
 - automatischer Lade- oder Speicherstart
-- Update verfuegbar
+- Update verfügbar
 - Notstrom oder Systemwarnung
 - Watchdog-/HA-Failover
 
 ## Fehlerbehebung
 
 - Browser muss Benachrichtigungen erlauben.
-- PWA sollte einmal neu geladen werden, wenn VAPID-Keys geaendert wurden.
+- PWA sollte einmal neu geladen werden, wenn VAPID-Keys geändert wurden.
 - Bei Docker nach Aktivierung einmal den Container neu starten.
 - Logs liegen unter `/var/www/html/logs/`.

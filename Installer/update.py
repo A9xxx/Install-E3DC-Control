@@ -6533,7 +6533,7 @@ def _read_json_nofollow(path: str) -> tuple[dict, bytes]:
     descriptor, before = _open_regular_file_nofollow(candidate)
     try:
         if not stat.S_ISREG(before.st_mode) or before.st_size > 4 * 1024 * 1024:
-            raise RuntimeError(f"Ungueltige Konfigurationsdatei: {candidate}")
+            raise RuntimeError(f"Ungültige Konfigurationsdatei: {candidate}")
         chunks = []
         while True:
             chunk = os.read(descriptor, 64 * 1024)
@@ -6542,7 +6542,7 @@ def _read_json_nofollow(path: str) -> tuple[dict, bytes]:
             chunks.append(chunk)
         after = os.fstat(descriptor)
         if (before.st_dev, before.st_ino, before.st_size) != (after.st_dev, after.st_ino, after.st_size):
-            raise RuntimeError("Konfiguration wurde waehrend des Lesens veraendert")
+            raise RuntimeError("Konfiguration wurde während des Lesens verändert")
     finally:
         os.close(descriptor)
     raw = b"".join(chunks)
@@ -6562,7 +6562,7 @@ def _current_ha_mode(config_path: str = HA_CONFIG_PATH) -> str:
         raise RuntimeError("HA-/Shadow-Rolle fehlt in der Konfiguration")
     mode = str(data.get("ha_mode")).strip().lower()
     if mode not in VALID_HA_ROLES:
-        raise RuntimeError(f"Ungueltige HA-/Shadow-Rolle: {mode!r}")
+        raise RuntimeError(f"Ungültige HA-/Shadow-Rolle: {mode!r}")
     return mode
 
 
@@ -6714,9 +6714,9 @@ def start_installation_or_update(
 def _catalog_units_strict() -> tuple[str, ...]:
     units = tuple(str(unit).strip() for unit in allowed_services())
     if not units or any(not unit.endswith(".service") for unit in units):
-        raise RuntimeError("Service-Katalog ist unvollstaendig oder ungueltig")
+        raise RuntimeError("Service-Katalog ist unvollständig oder ungültig")
     if len(set(units)) != len(units):
-        raise RuntimeError("Service-Katalog enthaelt doppelte Units")
+        raise RuntimeError("Service-Katalog enthält doppelte Units")
     return units
 
 
@@ -6728,7 +6728,7 @@ def _capture_transition_state(
 ) -> TransitionState:
     requested = str(expected_role or "").strip().lower() or None
     if requested is not None and requested not in VALID_HA_ROLES:
-        raise RuntimeError(f"Ungueltige erwartete HA-/Shadow-Rolle: {requested!r}")
+        raise RuntimeError(f"Ungültige erwartete HA-/Shadow-Rolle: {requested!r}")
     legacy = False
     try:
         config, raw = _read_json_nofollow(config_path)
@@ -6736,7 +6736,7 @@ def _capture_transition_state(
             raise RuntimeError("HA-/Shadow-Rolle fehlt in der Konfiguration")
         role = str(config.get("ha_mode")).strip().lower()
         if role not in VALID_HA_ROLES:
-            raise RuntimeError(f"Ungueltige HA-/Shadow-Rolle: {role!r}")
+            raise RuntimeError(f"Ungültige HA-/Shadow-Rolle: {role!r}")
     except FileNotFoundError:
         if not allow_missing_config or requested is None:
             raise RuntimeError(f"HA-/Shadow-Konfiguration fehlt: {config_path}")
@@ -6887,24 +6887,24 @@ def _bind_explicit_bootstrap_role_anchor(
 def _verify_transition_state(state: TransitionState, *, expect_legacy_config_missing: bool = False) -> None:
     if expect_legacy_config_missing:
         if not state.bootstrap_legacy_config:
-            raise RuntimeError("Legacy-Konfigurationspruefung ist fuer diesen Ausgangszustand ungueltig")
+            raise RuntimeError("Legacy-Konfigurationsprüfung ist für diesen Ausgangszustand ungültig")
         try:
             _read_json_nofollow(state.config_path)
         except FileNotFoundError:
             return
         except Exception as exc:
-            raise RuntimeError("Urspruenglich fehlende V4-Konfiguration ist nach Recovery unsicher") from exc
-        raise RuntimeError("Urspruenglich fehlende V4-Konfiguration blieb nach Recovery bestehen")
+            raise RuntimeError("Ursprünglich fehlende V4-Konfiguration ist nach Recovery unsicher") from exc
+        raise RuntimeError("Ursprünglich fehlende V4-Konfiguration blieb nach Recovery bestehen")
     config, _raw = _read_json_nofollow(state.config_path)
     if "ha_mode" not in config:
         raise RuntimeError("HA-/Shadow-Rolle fehlt nach dem Release-Wechsel")
     role = str(config.get("ha_mode")).strip().lower()
     if role not in VALID_HA_ROLES or role != state.ha_role:
         raise RuntimeError(
-            f"HA-/Shadow-Rolle driftete waehrend Release-Wechsel: {state.ha_role} -> {role}"
+            f"HA-/Shadow-Rolle driftete während Release-Wechsel: {state.ha_role} -> {role}"
         )
     if not state.bootstrap_legacy_config and config != state.config:
-        raise RuntimeError("Betriebskonfiguration wurde waehrend Release-Wechsel veraendert")
+        raise RuntimeError("Betriebskonfiguration wurde während Release-Wechsel verändert")
 
 
 def _read_legacy_config_nofollow(path: str, maximum: int = 2 * 1024 * 1024) -> dict | None:
@@ -6916,7 +6916,7 @@ def _read_legacy_config_nofollow(path: str, maximum: int = 2 * 1024 * 1024) -> d
         return None
     try:
         if metadata.st_size > maximum:
-            raise RuntimeError("Legacy-Konfiguration ist unplausibel gross")
+            raise RuntimeError("Legacy-Konfiguration ist unplausibel groß")
         chunks = []
         remaining = maximum + 1
         while remaining > 0:
@@ -6929,7 +6929,7 @@ def _read_legacy_config_nofollow(path: str, maximum: int = 2 * 1024 * 1024) -> d
     finally:
         os.close(descriptor)
     if len(raw) > maximum or b"\x00" in raw:
-        raise RuntimeError("Legacy-Konfiguration ist ungueltig")
+        raise RuntimeError("Legacy-Konfiguration ist ungültig")
     try:
         text = raw.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
@@ -6940,14 +6940,14 @@ def _read_legacy_config_nofollow(path: str, maximum: int = 2 * 1024 * 1024) -> d
         if not stripped or stripped.startswith("#"):
             continue
         if "=" not in stripped:
-            raise RuntimeError("Legacy-Konfiguration enthaelt eine ungueltige Zeile")
+            raise RuntimeError("Legacy-Konfiguration enthält eine ungültige Zeile")
         key, value = stripped.split("=", 1)
         key = key.strip().lower()
         value = value.strip()
         if not re.fullmatch(r"[a-z0-9_]+", key):
-            raise RuntimeError("Legacy-Konfiguration enthaelt einen ungueltigen Schluessel")
+            raise RuntimeError("Legacy-Konfiguration enthält einen ungültigen Schlüssel")
         if key in values and values[key] != value:
-            raise RuntimeError("Legacy-Konfiguration enthaelt widerspruechliche Doppelwerte")
+            raise RuntimeError("Legacy-Konfiguration enthält widersprüchliche Doppelwerte")
         values[key] = value
     return values
 
@@ -6957,7 +6957,7 @@ def _migrate_bootstrap_legacy_config(repo_dir: str, state: TransitionState) -> N
 
     if not state.bootstrap_legacy_config:
         return
-    from .config_manager import V4_ALL_KEYS, _sort_by_blocks
+    from .config_manager import V4_ALL_KEYS, V4_TXT_IMPORT_SKIP_KEYS, _sort_by_blocks
 
     target = Path(state.config_path)
     candidates = (
@@ -6979,7 +6979,11 @@ def _migrate_bootstrap_legacy_config(repo_dir: str, state: TransitionState) -> N
     legacy_role = str(merged.get("ha_mode", "")).strip().lower()
     if legacy_role and legacy_role != state.ha_role:
         raise RuntimeError("Legacy-HA-/Shadow-Rolle weicht von --expected-ha-role ab")
-    migrated = {key: value for key, value in merged.items() if key in V4_ALL_KEYS and value != ""}
+    migrated = {
+        key: value
+        for key, value in merged.items()
+        if key in V4_ALL_KEYS and key not in V4_TXT_IMPORT_SKIP_KEYS and value != ""
+    }
     migrated["ha_mode"] = state.ha_role
     payload = (json.dumps(_sort_by_blocks(migrated), ensure_ascii=False, indent=4) + "\n").encode("utf-8")
 
@@ -6993,7 +6997,7 @@ def _migrate_bootstrap_legacy_config(repo_dir: str, state: TransitionState) -> N
         except FileNotFoundError:
             pass
         else:
-            raise RuntimeError("V4-Konfiguration entstand unerwartet waehrend der Migration")
+            raise RuntimeError("V4-Konfiguration entstand unerwartet während der Migration")
         descriptor = os.open(
             temporary,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
@@ -7443,14 +7447,14 @@ def _normalize_release_tag(tag: str) -> str:
     """Validiert einen Release-Tag fuer gezielte Rueckfallinstallationen."""
     tag = str(tag or '').strip()
     if not re.fullmatch(r'v?\d+\.\d+\.\d+[A-Za-z0-9._-]*', tag):
-        raise ValueError('Ungueltiger Release-Tag.')
+        raise ValueError('Ungültiger Release-Tag.')
     return tag if tag.startswith('v') else 'v' + tag
 
 
 def _validate_full_commit(commit: str) -> str:
     value = str(commit or '').strip().lower()
     if not FULL_COMMIT_RE.fullmatch(value):
-        raise ValueError('Ziel-Commit muss eine vollstaendige 40-stellige SHA-1 sein.')
+        raise ValueError('Ziel-Commit muss eine vollständige 40-stellige SHA-1 sein.')
     return value
 
 
@@ -7748,7 +7752,7 @@ def _delete_approved_stale_paths(
     errors: list[str] = []
     for raw_path in paths or []:
         if not isinstance(raw_path, str) or not raw_path.startswith('/'):
-            errors.append(f'Ungueltiger Stale-Pfad: {raw_path!r}')
+            errors.append(f'Ungültiger Stale-Pfad: {raw_path!r}')
             continue
         path = os.path.abspath(raw_path)
         if path != raw_path:
@@ -7962,11 +7966,11 @@ def _read_policy_from_commit(
         **_root_git_call_kwargs(root_authority),
     )
     if not raw or len(raw) > 1024 * 1024:
-        raise RuntimeError("UPDATE_POLICY.json ist leer oder zu gross")
+        raise RuntimeError("UPDATE_POLICY.json ist leer oder zu groß")
     try:
         policy = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"UPDATE_POLICY.json im Commit ist ungueltig: {exc}") from exc
+        raise RuntimeError(f"UPDATE_POLICY.json im Commit ist ungültig: {exc}") from exc
     if not isinstance(policy, dict):
         raise RuntimeError("UPDATE_POLICY.json muss ein JSON-Objekt sein")
     return policy
@@ -7977,7 +7981,7 @@ def _rollback_release_map(repo_dir: str, *, head_commit: str | None = None, inst
     user = install_user or get_install_user()
     commit = head_commit or _resolve_git_commit(repo_dir, "HEAD", user)
     if not commit:
-        raise RuntimeError("HEAD fuer Rueckfallpolicy konnte nicht verifiziert werden")
+        raise RuntimeError("HEAD für Rückfallpolicy konnte nicht verifiziert werden")
     policy = _read_policy_from_commit(repo_dir, commit, user)
     explicit = policy.get("rollback_release_shas") or {}
     if not isinstance(explicit, dict):
@@ -7986,7 +7990,7 @@ def _rollback_release_map(repo_dir: str, *, head_commit: str | None = None, inst
     result: dict[str, str] = {}
     for item in policy.get("rollback_releases") or []:
         if not isinstance(item, dict):
-            raise RuntimeError("rollback_releases enthaelt einen ungueltigen Eintrag")
+            raise RuntimeError("rollback_releases enthält einen ungültigen Eintrag")
         tag = _normalize_release_tag(str(item.get("tag") or item.get("version") or ""))
         raw_sha = item.get("commit_sha") or item.get("sha") or explicit.get(tag)
         sha = _validate_full_commit(str(raw_sha or ""))
@@ -8000,7 +8004,7 @@ def _rollback_release_map(repo_dir: str, *, head_commit: str | None = None, inst
         if bare_metal_supported:
             result[tag] = sha
     if set(explicit) - set(declared):
-        raise RuntimeError("rollback_release_shas enthaelt nicht deklarierte Tags")
+        raise RuntimeError("rollback_release_shas enthält nicht deklarierte Tags")
     return result
 
 
@@ -8051,7 +8055,7 @@ def _validate_policy_packages(policy: dict, key: str, allowlist: frozenset[str])
     packages: list[str] = []
     for item in raw:
         if not isinstance(item, str) or not PACKAGE_NAME_RE.fullmatch(item):
-            raise RuntimeError(f"Ungueltiger Paketname in {key}")
+            raise RuntimeError(f"Ungültiger Paketname in {key}")
         if item not in allowlist:
             raise RuntimeError(f"Nicht freigegebenes Paket in {key}: {item}")
         if item in packages:
@@ -11014,13 +11018,13 @@ def _installed_pip_packages(venv_python: str, install_user: str) -> dict[str, st
     try:
         rows = json.loads(result["stdout"])
     except json.JSONDecodeError as exc:
-        raise RuntimeError("Installierter venv-Paketstand ist ungueltig") from exc
+        raise RuntimeError("Installierter venv-Paketstand ist ungültig") from exc
     if not isinstance(rows, list):
-        raise RuntimeError("Installierter venv-Paketstand ist ungueltig")
+        raise RuntimeError("Installierter venv-Paketstand ist ungültig")
     installed: dict[str, str] = {}
     for row in rows:
         if not isinstance(row, dict):
-            raise RuntimeError("Installierter venv-Paketstand ist ungueltig")
+            raise RuntimeError("Installierter venv-Paketstand ist ungültig")
         name = _normalize_python_package_name(row.get("name"))
         version = str(row.get("version") or "").strip()
         if not name or not version or name in installed:
@@ -12698,7 +12702,7 @@ def _restore_package_transaction(state: PackageTransactionState) -> None:
             _remove_transaction_created_venv(state)
         else:
             if not state.venv_python:
-                raise RuntimeError("venv-Python fehlt fuer Paket-Ruecklauf")
+                raise RuntimeError("venv-Python fehlt für Paket-Rücklauf")
             before = dict(state.pip_before)
             after = _installed_pip_packages(state.venv_python, state.install_user)
             introduced = sorted(set(after) - set(before))
@@ -13070,7 +13074,7 @@ def _stop_v4_services_impl(
             action_authorizer=action_authorizer,
         )
 
-    print('\n[->] Stoppe E3DC-Control-Dienste fuer Release-Wechsel...')
+    print('\n[->] Stoppe E3DC-Control-Dienste für Release-Wechsel...')
     errors = []
     try:
         authorize_action()
@@ -13164,7 +13168,7 @@ def _stop_v4_services_impl(
         )
         sessions = listing.get("stdout", "")
         if re.search(r"\.(?:e3dc|E3DC)(?:\s|$)", sessions):
-            errors.append(f"Legacy-Screen-Session fuer {screen_user} ist weiterhin aktiv")
+            errors.append(f"Legacy-Screen-Session für {screen_user} ist weiterhin aktiv")
     # Stop-Abhängigkeiten und Watchdogs können eine zuvor gestoppte Unit
     # erneut aktivieren. Erst dieser zweite vollständige Pass beweist die
     # globale Aktorruhe. Ein erneutes failed ist Drift und darf nicht durch
@@ -13190,7 +13194,7 @@ def _stop_v4_services_impl(
         for error in errors:
             print(f'  [!] {error}')
         return False
-    print('  [OK] Aktor-/Writer-Dienste sind fuer den Release-Wechsel in Ruhe.')
+    print('  [OK] Aktor-/Writer-Dienste sind für den Release-Wechsel in Ruhe.')
     return True
 
 
@@ -14319,7 +14323,7 @@ def _restart_v4_services(
         elif not legacy_unit_present:
             print('  [OK] Kein Legacy e3dc.service vorhanden.')
         if legacy_recovery:
-            print('  [OK] Legacy-Betriebszustand bleibt fuer die Recovery erhalten.')
+            print('  [OK] Legacy-Betriebszustand bleibt für die Recovery erhalten.')
         else:
             run_authorized_command(
                 f'sudo -u {install_user} screen -S e3dc -X quit 2>/dev/null',
@@ -14388,7 +14392,7 @@ def _restart_v4_services(
                     )
                     activity = inactive.get('stdout', '').strip().lower()
                     if not stopped['success'] or activity not in {'inactive', 'failed'}:
-                        errors.append(f'{srv} konnte fuer Standby nicht sicher gestoppt werden')
+                        errors.append(f'{srv} konnte für Standby nicht sicher gestoppt werden')
             print(f'  [SKIP] {srv} bleibt gestoppt: {reason}.')
             continue
         if not _service_unit_exists(srv):
@@ -17283,7 +17287,7 @@ def _fetch_target_commit(
         if not commit or not _exact_commit_matches(commit, official):
             raise RuntimeError("Gefetchtes origin/main weicht vom offiziellen GitHub-Ref ab")
     if not commit:
-        raise RuntimeError("Exakter Ziel-Commit konnte nicht aufgeloest werden")
+        raise RuntimeError("Exakter Ziel-Commit konnte nicht aufgelöst werden")
     return commit
 
 
@@ -17304,7 +17308,7 @@ def _validate_target_release(
         **_root_git_call_kwargs(root_authority),
     ).strip().lstrip("v")
     if not version or str(policy.get("version") or "").strip().lstrip("v") != version:
-        raise RuntimeError("VERSION und verifizierte UPDATE_POLICY stimmen nicht ueberein")
+        raise RuntimeError("VERSION und verifizierte UPDATE_POLICY stimmen nicht überein")
     stable = _normalize_release_tag(str(policy.get("stable_release") or ""))
     expected_stable = _normalize_release_tag(version)
     if stable != expected_stable:
@@ -17480,10 +17484,10 @@ def _sync_release_web(
     html_src = os.path.join(repo_dir, "html")
     errors = _required_web_file_errors(html_src)
     if errors:
-        raise RuntimeError("Webquelle unvollstaendig: " + "; ".join(errors))
+        raise RuntimeError("Webquelle unvollständig: " + "; ".join(errors))
     _assert_tree_no_symlinks(html_src)
     if not _ensure_rsync_available(allow_install=False):
-        raise RuntimeError("rsync ist nicht verfuegbar")
+        raise RuntimeError("rsync ist nicht verfügbar")
     _prepare_webroot_dirs()
     preserved_arguments = [
         argument
@@ -25135,20 +25139,12 @@ def _execute_update_transaction(
             f"[!] {UPDATE_EXTERNAL_ACTION_REQUIRED}: Docker-Umgebung erkannt; "
             "im Container wurde kein Release-Wechsel ausgeführt."
         )
-        print("    Bitte auf dem Docker-Host im Compose-Verzeichnis ausführen:")
-        print("    (")
-        print("      set -euo pipefail")
-        print("      if [ -f ./docker_compose_update.py ]; then")
-        print("        E3DC_DOCKER_HELPER=./docker_compose_update.py")
-        print("      elif [ -f ./Installer/docker_compose_update.py ]; then")
-        print("        E3DC_DOCKER_HELPER=./Installer/docker_compose_update.py")
-        print("      else")
-        print("        echo 'docker_compose_update.py fehlt; aktuellen Release-Verwaltungsbaum bereitstellen.' >&2")
-        print("        exit 2")
-        print("      fi")
-        print('      sudo python3 "$E3DC_DOCKER_HELPER" --compose-dir . --sudo')
+        print("    Update über den Knopf 'System Update' der Weboberfläche (Watchtower)")
+        print("    oder auf dem Docker-Host im Compose-Verzeichnis:")
+        print("      sudo docker compose pull")
+        print("      sudo docker compose up -d")
         print("      sudo docker compose logs --tail=80 e3dc-control")
-        print("    )")
+        print("    Geprüfter Weg mit automatischem Rückfall: Installer/docker_compose_update.py")
         return False
 
     try:
@@ -25317,7 +25313,7 @@ def _execute_update_transaction(
         print(f"    Erwartete SHA    : {expected_sha}")
 
     if not headless:
-        answer = input("\nGeprueften Release-Wechsel jetzt starten? (j/n): ").strip().lower()
+        answer = input("\nGeprüften Release-Wechsel jetzt starten? (j/n): ").strip().lower()
         if answer != "j":
             print("[i] Release-Wechsel abgebrochen.")
             return True
@@ -25541,7 +25537,7 @@ def _execute_update_transaction(
         return False
 
     _enable_watchdog_update_pause(transition_name)
-    print("\n[->] Erstelle vollstaendiges externes, verifiziertes Backup...")
+    print("\n[->] Erstelle vollständiges externes, verifiziertes Backup...")
 
     def freeze_backup_receipt(backup_path, verified_manifest):
         nonlocal backup_receipt, full_backup_manifest
@@ -26295,7 +26291,7 @@ def _execute_update_transaction(
             **_root_git_call_kwargs(bootstrap_git_root_authority),
         )
         if not new_commit or not _exact_commit_matches(target_commit, new_commit):
-            raise RuntimeError("HEAD stimmt nicht exakt mit dem freigegebenen Ziel-SHA ueberein")
+            raise RuntimeError("HEAD stimmt nicht exakt mit dem freigegebenen Ziel-SHA überein")
 
         mutated = True
         _normalize_target_finalizer_files(
@@ -27161,7 +27157,7 @@ def run_initial_forecast(installer_dir: str | None = None):
     """
     # In Docker: kein direkter Script-Aufruf noetig (Service startet selbst)
     if _is_docker_environment():
-        print('[i] Docker: Forecast-Init wird vom Container-Daemon uebernommen.')
+        print('[i] Docker: Forecast-Init wird vom Container-Daemon übernommen.')
         return
 
     # This transition consumer deliberately follows the already running
@@ -27175,7 +27171,7 @@ def run_initial_forecast(installer_dir: str | None = None):
 
     print('\n[-] Initiale PV-Prognose wird abgerufen (einmaliger Sofort-Fetch)...')
     print('    (Normaler Daemon-Zyklus: 60 Min -- dieser Schritt macht pv_forecast.json')
-    print('     sofort verfuegbar ohne Wartezeit)\n')
+    print('     sofort verfügbar ohne Wartezeit)\n')
 
     # Schritt 1: PV-Prognose
     if os.path.exists(forecast_script):
@@ -27193,7 +27189,7 @@ def run_initial_forecast(installer_dir: str | None = None):
                 print(f'[OK] pv_forecast.json erstellt ({_slots} Slots).')
             else:
                 print(f'[!] pv_forecast_service.py Fehler (Code {result.returncode}).')
-                print('    -> Prognose erscheint beim naechsten Daemon-Zyklus.')
+                print('    -> Prognose erscheint beim nächsten Daemon-Zyklus.')
         except subprocess.TimeoutExpired:
             print('[!] Forecast-Timeout (>120s) -- API evtl. nicht erreichbar.')
         except Exception as _e:
@@ -27214,11 +27210,11 @@ def run_initial_forecast(installer_dir: str | None = None):
             ).returncode == 0
         except (OSError, subprocess.TimeoutExpired) as _e:
             ready = False
-            print(f'[!] ML-Bereitschaft konnte nicht geprueft werden: {_e}')
+            print(f'[!] ML-Bereitschaft konnte nicht geprüft werden: {_e}')
 
         if not ready:
             if os.path.lexists(legacy_ml_model):
-                print('\n[i] Legacy-ML-Modell erkannt; es wird niemals geladen oder uebernommen.')
+                print('\n[i] Legacy-ML-Modell erkannt; es wird niemals geladen oder übernommen.')
                 print('    -> Sicheres Neutraining erfolgt nur aus SQLite-/JSON-/Text-Trainingsdaten.')
             try:
                 train_result = subprocess.run(
@@ -27233,7 +27229,7 @@ def run_initial_forecast(installer_dir: str | None = None):
             except Exception as _e:
                 print(f'[!] ML-Neutraining fehlgeschlagen: {_e}')
 
-        print('\n[-] ML-Vorhersage wird sicher geprueft/berechnet (ml_predictor --predict)...')
+        print('\n[-] ML-Vorhersage wird sicher geprüft/berechnet (ml_predictor --predict)...')
         try:
             result = subprocess.run(
                 [python, ml_script, '--predict'],

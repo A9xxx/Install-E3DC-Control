@@ -6,6 +6,89 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.5.0] – 2026-09-25
+
+### Wallbox
+
+- openWB Pro: Nach dem Anstecken gilt je Stecksession ein Startfenster. Der Manager bietet 6 A an oder übernimmt ein bereits stehendes Angebot der Box und hält es mindestens `openwb_pro_start_hold_s` (Standard 180 s) ohne 0 A, auch bei kurzen Budgeteinbrüchen; eine Absenkung ab 6 A unter das zurückgemeldete Angebot der Box, etwa nach einem Neustart der Box, folgt sofort. Nimmt das Fahrzeug nicht an, folgt je Wiederholzyklus (`openwb_pro_start_retry_cycle_s`, Standard 300 s) höchstens ein Weckimpuls; nach drei Zyklen bleibt das Angebot ohne weitere Weckversuche stehen, und das Dashboard meldet „Fahrzeug lädt trotz Freigabe nicht“. Harte Gründe wie Nutzer-`Aus`, Hausanschlussgrenze oder das Ende eines geplanten Ladefensters beenden das Angebot weiterhin sofort. Eine laufende Ladung wird nach einem Neustart des Wallbox-Managers übernommen.
+- openWB Pro: Nach einem eigenen Stopp beginnt die nächste Freigabe wieder mit dem 6-A-Startfenster statt mit einem Sprung auf den Budgetstrom. Fehlt nach bestätigter Ladung das Budget, wird zunächst höchstens auf den Mindeststrom abgesenkt; 0 A folgt erst nach 60 s durchgehendem Budgetmangel oder 100 Wh Netzbezug in dieser Episode.
+- openWB Pro: Nach einem Phasenwechsel ohne laufende Ladung läuft die Box wieder an, auch nach Force-Start, Aus/Ein, Ablauf der Wartefrist und einem Neustart des Wallbox-Managers; zur Ausnahme bei einem schon vor dem Wechsel angebotenen Startstrom siehe „Bekannte Einschränkungen“ in den [Release Notes](RELEASE_NOTES.md).
+- openWB Pro: Einphasiges Laden über 20 A ist jetzt möglich. Der Deckel folgt dem Bezugsstrom je Netzphase aus dem E3DC-Wurzelzähler (`wb_pcc_phase_basis`) mit Leistungsfaktor-Reserve (`wb_pcc_power_factor_margin`) und Schieflast-Wächter (`grid_pcc_imbalance_max_a`, Standard 20 A). Voraussetzungen sind eine einphasige Obergrenze über 20 A (`wb<n>_openwb_pro_1p_max_amp`, leer = 20 A), eine ausdrücklich eingetragene Hausabsicherung (`grid_max_amps`), die Netzphase des Ladepunkts (`wb<n>_grid_phase`) und ein beim Laden automatisch erbrachter Nachweis dieser Zuordnung. Fehlt eine Voraussetzung oder sind die Messwerte älter als 10 s, gilt weiterhin der feste Deckel von 20 A. Angehoben wird um 1 A je Regelschritt, abgesenkt sofort; das Dashboard zeigt Deckel und Zuordnungsstatus am Ladepunkt.
+- openWB Pro: Beendet das Fahrzeug die Ladung selbst, bleibt bei ausreichendem Budget der Mindeststrom angeboten, zum Beispiel für eine Vorklimatisierung. Dabei entstehen keine wiederkehrenden Startimpulse und keine Phasenwechsel.
+- openWB Pro: Für ein einphasig hinterlegtes Fahrzeug schaltet der Manager die Phasen der Box nicht mehr um; bisher schaltete er vor dem Start auf eine Phase. Die Box behält ihre Einstellung. Mindestleistung und Budget richten sich nach dem Fahrzeug (6 A × 230 V = 1,38 kW), auch wenn die Box auf drei Phasen steht; der einphasige Stromdeckel greift nach den gemessenen aktiven Phasen. Misst die Box drei aktive Phasen, gelten für den Rest der Stecksession drei Phasen.
+- Phasenwechsel: Der Abstieg von drei auf eine Phase verlangt an der openWB Pro jetzt 480 s dauerhaft zu wenig Budget für drei Phasen statt 60 s (`wb_phase_down_delay_s`); Schutzgründe wie Netzbezug über der Schwelle, die Hausakku-Untergrenze oder nicht freigegebene Akkustützung verkürzen auf 60 s.
+- Phasenwechsel an der openWB Pro und bei eingeschalteter E3DC-Direktphasensteuerung: Die Hochschaltung von einer auf drei Phasen bewertet den verfügbaren Überschuss als 30-s-Mittel und berücksichtigt ein frisches Budget des Speicherreglers. Als „einphasig ausgereizt“ gilt bei phasenschaltfähigem Fahrzeug und Wallbox der Referenzstrom aus dreiphasigem Mindeststrom plus Puffer (an der openWB Pro etwa 20 A); die Hochschaltung wartet also nicht, bis die einphasige Ladung den höheren dynamischen Deckel erreicht. Eine leckende Uhr (Vorlauf `wb_phase_up_forecast_hold_s`, dort Standard 60 s) oder ein volles Export-Wh-Konto (`wb_phase_up_export_wh`, Standard 120 Wh) löst den Wechsel aus. Kurze Wolkenlücken setzen den Vorlauf nicht mehr zurück, Netzbezug sperrt erst nach 30 s, und das Startfenster hält eine fällige Hochschaltung bei bestätigter Ladung nicht mehr auf. Nach jedem Wechsel bleibt dort die Sperre von 480 s; an anderen Wallboxen gilt der eingestellte Phasen-Halt. Optional bewertet `wb_phase_up_symmetry_enable` (Standard aus) eine einphasige Ladung ab dem Schieflastwert als ausgereizt.
+- `PV-Kurve ruhig`: Der Hausspeicher stützt eine laufende Fahrzeugladung nur noch mit einem begrenzten Wh-Kontingent (0,5 % der Speicherkapazität, mindestens 50 Wh; `wb_curve_floor_support_wh`). Ein eigenes Akku-Wh-Konto im Defizitregler zählt die tatsächlich aus dem Speicher in die Wallbox fließende Energie und beendet die Stützung über Absenken, Phasenwechsel und Stopp. Netz-, Akku- und Budgetkonto werden getrennt geführt (Rangfolge Netz vor Akku vor Budget); das Budgetkonto ruht, solange der Netzpunkt stabil einspeist und der Speicher nicht entlädt. Nach einem solchen Stopp startet die Wallbox in derselben Stecksession erst wieder, wenn der PV-Überschuss die Mindestleistung 120 s lang deckt (`wb_pv_only_release_hold_s`). In `PV + Akku bis Untergrenze` und `Grundladung stabil` bleibt die Stützung wie bisher.
+- `PV-Kurve ruhig`: Liegt der Speicher unter seinem Kurvenkorridor, erhält die Wallbox nur PV-Überschuss; der Speicher begrenzt seine Entladung auf Hauslast plus Wärmepumpe zuzüglich einer Reserve (`wb_curve_pv_only_house_reserve_w`, Standard 300 W).
+- `PV + Akku bis Untergrenze` und `Sofort bis Preislimit` ohne Preis- oder Netzfenster: Ist die Hausakku-Untergrenze `wbminsoc` erreicht und trägt das batterieneutrale PV-Budget der Wallbox (der kleinere Wert aus Gruppen-PV und ihrer Zuteilung) die Mindestleistung der aktuellen Phasenzahl nicht, setzt die Regelung eine laufende Ladung direkt auf den Mindeststrom – ohne PV sofort, bei noch anliegender PV nach `wb_floor_pv_only_phase_down_hold_s` (Standard 20 s). Das Wh-Konto läuft danach ohne Neubeginn genau einmal bis zu seiner Schwelle (`wb_min_current_import_stop_wh`, Standard 40 Wh), dann folgt der Stopp (`minimum_current_energy_reached`); eine dreiphasig ladende openWB Pro wechselt stattdessen auf eine Phase, wenn ihr PV-Budget das einphasige Minimum trägt. Bisher senkte die Kaskade dort schrittweise ab, und das Konto begann bei jeder Stufe neu. An der geschlossenen Untergrenze meldet der Wallbox-Intent keine Akkustützung mehr (`wbminsoc_floor_closed`); sie öffnet erst oberhalb der Untergrenze plus Hysterese. Laden mehrere Wallboxen, wird eine Wallbox an der Untergrenze ohne Netzbezug zuerst abgesenkt, sofern sie selbst über ihrer Zuteilung lädt; Netzbezug hat Vorrang. Der Wiederanlauf in derselben Stecksession folgt unverändert dem Tor nach einem Kaskaden-Stopp.
+- Mehrere Ladepunkte: Zuteilung und Phasenbewertung verwenden den Anteil des einzelnen Ladepunkts statt des Gruppenbudgets. Ein Ladepunkt hält keine drei Phasen mehr, wenn seine eigene Zuteilung das dreiphasige Minimum nicht erreicht. Eine reine PV-Ladung unterhalb ihrer Zuteilung läuft mit Mindeststrom weiter (Freigabe nach 120 s, Gnadenfrist 45 s bei veralteten Daten), statt zwischen Stopp und Start zu pendeln. Ein einphasiges Fahrzeug an einer openWB Pro erhält höchstens den wirksamen einphasigen Deckel als Zuteilung.
+- Die frische Ladeleistung von openWB, openWB Pro und go-e wird unabhängig von einer E3DC-Wallbox immer vom Hauswert abgezogen.
+- „Netz erlaubt + Fertig bis“ bindet den Netzbezug an die geplanten günstigen Abschnitte, sobald ein bestätigter Fahrzeug-SoC vorliegt. Ohne bestätigten SoC lädt die Wallbox wie „Sofort bis Preislimit“, und das Dashboard zeigt einen Hinweis.
+- Ladeplan: Ein manueller Plan mit fester Startuhrzeit kann täglich wiederholt werden; ein abgearbeiteter Plan bleibt bis zum Ende seines Fensters liegen, sodass im selben Fenster nicht erneut geladen wird. Der Ladeplan zeigt einen Zeitstrahl. Fehlt der Fahrzeug-SoC, plant der Planer weiterhin konservativ mit 0 %; das Protokoll enthält dazu nur noch einen Hinweis je Stecksession und Wallbox statt einer Warnung alle zehn Minuten.
+- Wallbox-Seite: Die Phasenzahl eines gespeicherten Fahrzeugprofils ist direkt änderbar. Schnell aufeinanderfolgende Moduswechsel warten auf den laufenden Speichervorgang; ein fehlgeschlagener Speichervorgang nennt den Grund und wird ohne Zugangsdaten auf der RAM-Disk protokolliert (auch im Diagnosepaket).
+- Ein manuell eingetragener Fahrzeug-SoC an der openWB Pro bleibt nach einem Neustart des Wallbox-Managers in derselben Stecksession gültig; in eine neue Stecksession wird er nicht übernommen.
+- Feste E3DC-Wallboxen erkennen die genutzten Phasen auch bei einer später stabil höheren Stromvorgabe, wenn das kurze 6-A-Startfenster nicht ausgewertet werden konnte.
+- Kurzzeitige Lesefehler der Budgetdatei des Speicherreglers werden mit dem letzten gültigen Stand überbrückt. Hat ein Fahrzeug in einem geplanten Netzladefenster nie geladen, nimmt die Regelung die Freigabe am Fensterende ohne zusätzlichen Stoppbefehl zurück.
+- E3DC efy/Multi Connect: Der experimentelle Schalter `wb_e3dc_direct_phase_control_enable` (Standard aus) lässt E3DC-Control bei ausdrücklich gewählter efy oder Multi Connect die Phasen selbst schalten. Er schreibt dabei Geräteeinstellungen der Wallbox, ist nicht für den Dauerbetrieb empfohlen, und die Konfigurationsprüfung warnt, solange er eingeschaltet ist.
+
+### Speicher und Netzladen
+
+- Preisbasiertes Netzladen plant den Bedarf zeitgerichtet bis zum nächsten nutzbaren günstigen Preisfenster statt über eine pauschale 48-Stunden-Fehlmenge. Erwartete PV bis zum Fensterende wird zuerst angerechnet; aus dem Netz wird nur der verbleibende Rest geladen, und zwar am Ende des Fensters ab dem spätesten Ladestart. Ladeziel und Netzladejob folgen dem Sollbestand am Fensterende und bleiben im Fenster stabil. Ein erreichtes Ziel löst im selben Fenster keinen zweiten Netzladestart aus (Zielhysterese mindestens 1 SoC-Punkt).
+- Der Netzladevertrag gilt bis zum Ende des günstigen Fensters statt nur bis zum Ende des laufenden 15-Minuten-Abschnitts. Bei Tarifen mit festem Zeitfenster, etwa Octopus Heat, ist das Tarifzeitfenster die Regelgröße. Der mittlere Preis des Fensters wird beim ersten Plan gebildet und bis zum Fensterende beibehalten; er wandert bei Börsentarifen nicht mit den ablaufenden Abschnitten.
+- Neues Ladeprofil `market_charge_profile`: Wirtschaftlich, Ausgeglichen, Komfort oder Eigene Einstellungen. Das Profil setzt Marge und Sicherheitskorrektur. Komfort lädt im Preisfenster mit PV-Vorrang bis zum Zielstand „Speicher max.“, solange der Preis unter dem Komfort-Preislimit liegt (`market_price_limit_ct`, leer = Mittelpreis des Tarifs). Beim Update wird das Profil aus den vorhandenen Werten gesetzt: Standardwerte ergeben Wirtschaftlich, abweichende Marge oder Sicherheitskorrektur ergeben Eigene Einstellungen. Das Verhalten ändert sich dadurch nicht.
+- Für die Ladedauer zählt die tatsächlich beobachtete Ladeleistung des Speichers. Gemessen wird erst, wenn der Netzladebefehl eine Minute mit gleichem Sollwert ansteht; eine höhere Leistung hebt den Wert sofort an, abgesenkt wird er nur an der Ladegrenze oder bei Unterlieferung, und nach sieben Tagen verfällt er. Begrenzt er die Planung, prüft eine kurze Anhebeprobe je Viertelstunde, ob der Speicher wieder mehr aufnimmt.
+- Liegt der Speicher unter dem Reserveboden der Notstromreserve, bleibt das Ladeziel in allen Profilen rechnerisch konstant und wandert nicht mehr mit dem aktuellen Ladezustand.
+- Zielkurve „Prognose auf 100%“: Der späte Vollstand kurz vor dem PV-Ende wird nur noch mit Grund geplant, also bei bindendem Einspeiselimit, Abregeldruck, aktiver Direktvermarktung oder Pre-Dump. Sonst endet die Kurve am letzten nutzbaren Überschuss minus Kurvenende-Puffer (`storage_curve_end_guard_min`, Standard 45 min), sodass PV-Überschuss am Mittag in den Speicher statt ins Netz geht. Der Schalter `storage_forecast100_late_full_guard_enable` („Später Vollstand nur mit Grund“) steht im Konfigurationseditor; die Plan-Diagnose nennt den Grund.
+- DC-first mit Zusatz-Wechselrichter: Fällt das E3/DC-PV-Angebot kurz unter die Einschaltschwelle, hält der Manager einen laufenden Laderahmen bis zu 600 s; dauert der Einbruch länger, gibt er den Rahmen frei (E3/DC-AUTO ohne Ladegrenze). Liefert der Zusatz-Wechselrichter dabei selbst Leistung, wird wie bisher sofort gekappt, weil Zusatz-AC-PV den Laderahmen nicht erhöht. Ausnahme bei gefährdetem Ladeziel (Rückstand unter der Korridor-Untergrenze, Abendziel-Rückstand, spätester Ladebeginn erreicht oder harter Kurvenanker verfehlt): Dann bleiben Halten und Freigabe auch bei Leistung des Zusatz-Wechselrichters wirksam, und der Speicher kann aus Zusatz-AC-PV laden – aber nur, solange das E3/DC-PV-Angebot unter der Einschaltschwelle liegt. Liefert die E3/DC-PV mehr, begrenzt der Laderahmen die Ladung weiter auf die E3/DC-PV-Leistung. Bei Dringlichkeit öffnet der Laderahmen mit mindestens 125 W/s.
+- Ruhigere EMS-Ladegrenze: Im Kurvenladebetrieb, im freien AUTO und in der Netzentlastung schreibt der Manager nicht schützende Änderungen der AUTO-Ladegrenze höchstens alle 30 s; eine Absenkung erst nach 10 s gleichbleibender Anforderung, Abweichungen unter 200 W bleiben stehen. Schützende Absenkungen wie 0-W-Halt, Kurve oberhalb und Planwert 0 wirken sofort, ebenso die Freigabe bei Netzbezug und eine Öffnung nahe der Einspeisegrenze. Abregelung und Einspeisegrenze, Direktvermarktung, eine ladende Wallbox in `PV-Kurve ruhig` und die Zielkorridor-Schnellladung führen die Ladegrenze wie bisher in beide Richtungen ohne Wartezeit. Ein eigener, per Rücklesen bestätigter Schreibvorgang gilt 4,5 s lang als Nachweis für denselben Wert; ein älterer Live-Wert, der noch den vorherigen Wert zeigt, löst in dieser Zeit keinen zweiten Schreibvorgang mit diesem Wert aus. Einzelheiten: [Speicher](doc/Speicher_Ladesteuerung_Ablauf.md).
+- Ob die Wärmepumpenleistung im Hauswert steckt, ist im Konfigurationseditor wählbar (`storage_home_wp_split`: automatisch, enthalten, getrennt). Bisher nur intern gelesene Kurven-, Komfort- und Wallbox-Schlüssel bleiben beim Update erhalten.
+
+### Wärmepumpe (Luxtronik)
+
+- Der PV-Boost arbeitet als gehaltene Freigabe mit Saisonkanälen: im Winter Heizung und Warmwasser, im Sommer Warmwasser. Den Verdichterstart entscheidet die Anlage mit ihrer eigenen, jetzt einstellbaren Hysterese (`wp_pv_hz_hysteresis_k` 3,5 K, `wp_pv_ww_hysteresis_k` 8 K). Ein Verdichterstopp oder eine erreichte Temperatur beenden den Boost nicht; fehlt die PV-Deckung, werden die Sollwerte erst nach der Wolkenüberbrückung zurückgenommen (`wp_pv_boost_release_s`, Standard 300 s). Im Messwertbetrieb wird der Boost in der Saison auch ohne thermischen Startbedarf angefordert.
+- Die Startleistung ist nur für `wp_pv_start_wait_s` reserviert. Läuft der Verdichter bis dahin nicht an, geht die Reservierung an nachrangige Verbraucher; der Sollwert bleibt stehen. Mit eingeschaltetem Zirkulations-Boost läuft die Zirkulationspumpe auch während eines gehaltenen PV-Warmwasserauftrags.
+- Warmwasser sofort („1x WARM WASSER“) ist ein Nutzerbefehl: Er setzt unabhängig von PV-Überschuss und Speicherbudget die Warmwasser-Boost-Solltemperatur der Saison für höchstens 120 Minuten und endet regulär, sobald die Zieltemperatur erreicht und der Warmwasser-Zyklus beendet ist. Eine geplante Quell-Erholungspause unterbricht ihn nicht mehr, sondern wartet sein Ende ab; Schutzgründe beenden ihn weiterhin. Die Seite zeigt „WW-Sofort aktiv bis HH:MM“ beziehungsweise den Endegrund.
+- Die Wärmepumpen-Seite zeigt den laufenden Warmwasser-Verdichter mit Ist- und Sollfrequenz. Der Live-Leser erneuert die Messwertzuordnung bei unbekannten Geräte-IDs und spätestens alle fünf Minuten, sodass nach einem Geräteupdate neue oder geänderte Messwerte übernommen werden.
+
+### Fahrzeuge (Bluelink)
+
+- Die Hyundai-/Kia-Anbindung meldet sich mit Benutzer (E-Mail), Passwort, optionaler PIN und Marke an; der bisherige Refresh-Token entfällt und wird bei der Konfigurationsbereinigung entfernt. Die Zugangsdaten werden im Konfigurationseditor oder auf der Wallbox-Seite eingetragen, nur lokal gespeichert und in Protokollen, Diagnosepaketen sowie Cluster- und Shadow-Übertragungen redigiert. Die Anmeldung wird im Dienst gehalten und nur bei Ablauf erneuert.
+- Fehlerzustände wie abgewiesene Anmeldung, geforderter Einmalcode (Zwei-Faktor-Anmeldung wird nicht unterstützt), erforderliche Zustimmung im Konto, zu viele Anfragen oder Zeitüberschreitung werden benannt angezeigt. Ein laufender Dienst ohne vollständige Zugangsdaten wartet auf die Konfiguration, statt sich wiederholt neu zu starten. Wurde die Anbindung bisher nur mit Refresh-Token betrieben, bleibt der Dienst nach dem Update aus, bis Benutzer und Passwort eingetragen sind.
+
+### Zusatzwechselrichter
+
+- Ein zweiter, netzgekoppelter Sungrow-String-Wechselrichter (SG-Serie) kann rein lesend per Modbus TCP eingebunden werden (Editor-Gruppe „Zusatzwechselrichter“, `ext_inverter_*`). Dashboard und Diagramme zeigen Phasen-, String- und Diagnosedaten getrennt vom E3DC-Messwert; die Regelung nutzt weiterhin den Messwert des externen Leistungsmessers am E3DC. Fehlende oder veraltete Lesungen gelten als ungültig. Änderungen im Editor wirken ohne Neustart von `e3dc-live`. Einzelheiten: [Zusatzwechselrichter](doc/Zusatzwechselrichter.md).
+
+### Docker
+
+- Der Knopf **System Update** in der Weboberfläche und das **Auto-Update** im Config-Editor geben in Docker dem Watchtower-Dienst über dessen lokale HTTP-API das Signal, das neue Image zu laden und den Container neu zu erstellen. Watchtower prüft nicht von sich aus, respektiert einen Pin in `.env` und wird einmalig mit einem Token freigeschaltet; die Docker-Einrichtung im Installer bietet das gleich mit an. Die Compose-Vorlage verwendet den gepflegten Fork `ghcr.io/nicholas-fedor/watchtower:1` im Profil `auto-update`; das Watchtower-Label des E3DC-Containers steht standardmäßig auf `true`. Ohne Watchtower zeigt der Knopf die Host-Befehle. Der Host-Helfer bleibt der geprüfte Weg mit automatischem Rückfall.
+- Die Rechteprüfung im Installationscenter verwendet im Container ein eigenes Erwartungsmodell mit den Klassen „Containerstart“ und „Image prüfen“; gewollte Container-Rechte erzeugen keine Befunde mehr.
+- Die Compose-Vorlage mountet die RAM-Disk mit 64 MB. Ältere Compose-Dateien mit 32 MB meldet der Container beim Start als Hinweis.
+
+### Wartung
+
+- Backups: Update-Backups und manuell angelegte Sicherungspunkte legen Dateien ab 4 KiB aus Installationsbaum, Web-Programm und Datenverzeichnis (u. a. Historien, Langzeitdatenbank, V4-Konfiguration, automatische Konfigurationssicherungen und Matter-Storage) sowie die Prognosebelege je Datei gzip-komprimiert ab; das Manifest führt Größe und SHA-256 von Originalinhalt und gespeicherten Bytes. Units, `/etc/e3dc-control`, der übrige Systemzustand samt ML-Modell, einzeln gesicherte Dateien und bereits komprimierte Formate bleiben unveränderte Kopien. Ältere Versionen lesen dieses Format nicht, siehe Rückfallhinweise in den [Release Notes](RELEASE_NOTES.md).
+- Bare Metal: Das Update hebt die eigene RAM-Disk von 32 auf 64 MB an (fstab und Live-Remount). Jeder Release-Wechsel nutzt ein eigenes venv; nach bestätigtem Start werden ältere, vom Updater markierte Release-venvs entfernt. Behalten werden insgesamt so viele, wie Update-Backup-Familien aufbewahrt werden (Standard drei, einschließlich des aktiven); ein venv, das der Watchdog noch nutzt, bleibt immer erhalten. apt- und pip-Downloads bleiben nicht im Cache.
+- Tagesdateien der Klima-Historie werden nach 90 Tagen entfernt.
+
+### Oberfläche und Editor
+
+- Die Wallbox-Konfiguration im Config-Editor ist in thematische Gruppen mit „Wenn → dann“-Karten gegliedert, die die eingetragenen Werte nachvollziehbar machen; Tooltips wurden verständlicher formuliert. Neue Felder gibt es unter anderem für Startfenster, einphasigen Deckel, Phasenwechsel, Mindesthalt, Reserve unter der Kurve, Wärmepumpe im Hauswert, Wärmepumpen-Hysterese und Wolkenüberbrückung.
+- Das Dashboard zeigt am Ladepunkt das laufende Wh-Kontingent („Akku“ beziehungsweise „PV-only“), das Export-Wh-Konto bis zum Phasenwechsel und den wirksamen einphasigen Deckel mit Zuordnungsstatus.
+- Die wirkungslose Checkbox „Auskommentieren“ über den Editorfeldern ist entfernt; das Speichern ist unverändert. Dokumentationsverweise in Editor und Hilfe öffnen die veröffentlichte Dokumentation.
+
+### Behoben
+
+- Die Update-Prüfung der Weboberfläche meldete seit 5.4.4c immer, GitHub sei nicht erreichbar; der Hinweis auf eine neue Version erscheint wieder.
+- Die Werte im Config-Editor unter „Fahrzeug und Ladeziel“ (Fahrzeugakku, Ladeziel als Ziel-Ladestand oder Lademenge, oberer Ladestand, übliche Ladeleistung) bleiben jetzt erhalten. Bisher hat die Konfigurationsbereinigung sie beim Containerstart sowie bei Reparatur, Installation und Rückfall gelöscht. Sie gelten als globale Fahrzeugwerte für jede Wallbox ohne eigene Werte. Auch der Energy Manager nutzt für die Abstimmung von Wärmepumpe und Fahrzeugladung (PV-Pause/Boost, Meldung „Ladeziel erreicht“) ohne laufende Ladesitzung diesen globalen Ziel-Ladestand. Ein leeres Feld gilt als nicht gesetzt; dann gilt für Ladedauerplanung und Wallbox-Seite ein noch vorhandener Wert aus einer älteren `e3dc.config.txt`, sonst der Standardwert (72 kWh, 80 %, 11 kW). Die automatische Ladedauerplanung plant damit auch bei leeren Feldern, statt still keine Ladedauer zu planen. Aus einer älteren `e3dc.config.txt` werden diese Werte nicht in die Konfiguration übernommen.
+- Der automatische SoC-Abruf, der Docker-Start des Bluelink-Dienstes und der Knopf „Fahrzeug aufwecken“ setzen jetzt Benutzer und Passwort voraus – wie die Anmeldung selbst.
+- „Sofort bis Preislimit“ lässt sich an E3DC-, openWB- und go-e-Wallboxen wieder speichern; bisher meldete die Wallbox-Seite „Speichern fehlgeschlagen“.
+- Docker: Anlegen und Löschen unter „Weitere Parameter“ im Konfigurationseditor funktioniert im Container. Bisher blockierte die Bare-Metal-Regel „Installationsbenutzer in www-data“ diesen Weg.
+- Speicher: Ein Nachschwingen zwischen Halten und Automatikbetrieb an Viertelstundengrenzen ist behoben; ein laufender Haltevorgang wird bis zum Folgeplan überbrückt.
+- Luxtronik: Die RAM-Disk-Historie speichert nur noch Messwerte im kompakten Format; der Minutenpuffer reicht dadurch für 24 Stunden. Bisher füllten vollständige Reglerzustände ihn nach rund fünf Stunden.
+
+Betriebsgrenzen, Updatehinweise und Rückfall stehen in den [Release Notes](RELEASE_NOTES.md).
+
 ## [5.4.6d] – 2026-09-14
 
 - Docker: eigene Compose-Dateien und Ergänzungen, Instanzwahl und Bind-Mounts; gezielte Vorbereitung leerer Datenordner, Erhalt bestehender Hostidentität und korrekte Meldung eines gestoppten Rückfalls.
@@ -3236,7 +3319,7 @@ Für das eigenständige Slave-Skript die zusammengehörigen Python-Dateien aktua
 ### 🔋 Storage Manager
 
 - 🛡️ **Sicherheit:** RSCP-Derating bleibt Gegencheck.
-- 🧱 **Stabilität:** Kein sinusfoermiges Gegenregeln.
+- 🧱 **Stabilität:** Kein sinusförmiges Gegenregeln.
 - 🐛 **Fehlerbehebung:** Batterie- und Hausleistungs-Rückkopplung entfernt.
 - 🐛 **Fehlerbehebung:** Berechneter Ladebedarf wird oberhalb der Momentankurve nicht mehr vorgezogen.
 - 🛡️ **Sicherheit:** 300-W-Mindestfreigabe bei aktivem Abregelschutz.
@@ -3656,7 +3739,7 @@ Für das eigenständige Slave-Skript die zusammengehörigen Python-Dateien aktua
 
 ### 🔋 Storage Manager
 
-- 🐛 **Fehlerbehebung:** Ladekurve vor dem ersten Stuetzwert korrekt.
+- 🐛 **Fehlerbehebung:** Ladekurve vor dem ersten Stützwert korrekt.
 
 ### 🔌 Wallbox Manager
 
@@ -3725,7 +3808,7 @@ Für das eigenständige Slave-Skript die zusammengehörigen Python-Dateien aktua
 
 - 🐛 **Fehlerbehebung:** Hausverbrauch stabiler bei externer Wallboxlast.
 - ✨ **Verbesserung:** Prognose-Azimuth frei eingebbar.
-- ✨ **Verbesserung:** Prognose-Zeile aufgeraeumt.
+- ✨ **Verbesserung:** Prognose-Zeile aufgeräumt.
 
 ## [4.9.8g] – 2026-05-12
 
@@ -3917,7 +4000,7 @@ Für das eigenständige Slave-Skript die zusammengehörigen Python-Dateien aktua
 - ✨ **Verbesserung:** Optionale Integrationen können über das Installationszentrum eingerichtet werden.
 - ✨ **Verbesserung:** Konfigurationsbuttons springen zum richtigen Feld.
 - 🐛 **Fehlerbehebung:** Die Einrichtung optionaler Integrationen prüft die benötigten Zugriffsrechte.
-- 🐛 **Fehlerbehebung:** Kein falsches Gruen bei sofort crashenden Diensten.
+- 🐛 **Fehlerbehebung:** Kein falsches Grün bei sofort crashenden Diensten.
 
 ### 🔌 Wallbox Manager
 
@@ -4071,7 +4154,7 @@ Für das eigenständige Slave-Skript die zusammengehörigen Python-Dateien aktua
 - ✨ **Verbesserung:** Nachtfreigabe nach defensivem Start-Ruhezustand.
 - 🐛 **Fehlerbehebung:** Zweite Solcast-Konfiguration überlebt Docker-Neustart.
 - 🐛 **Fehlerbehebung:** Mehrere Solcast-Prognosen werden korrekt zusammengeführt.
-- 🐛 **Fehlerbehebung:** Solcast-Zwischenspeicher wird bei geaenderter Resource-ID erneuert.
+- 🐛 **Fehlerbehebung:** Solcast-Zwischenspeicher wird bei geänderter Resource-ID erneuert.
 - 🐛 **Fehlerbehebung:** ML-Prognose wird atomar geschrieben.
 
 ## [4.9.0] – 2026-04-30

@@ -152,7 +152,7 @@ $luxStagePresentations = [
     'standby' => ['bg-secondary text-white', 'fa-pause', 'Standby'],
     'ww_requested' => ['bg-info text-dark', 'fa-clock', 'Warmwasser angefordert'],
     'ww_hydraulics_active' => ['bg-primary text-white', 'fa-water', 'WW-Hydraulik aktiv'],
-    'ww_compressor_started' => ['bg-warning text-dark', 'fa-sync fa-spin', 'WW-Verdichter gestartet'],
+    'ww_compressor_started' => ['bg-warning text-dark', 'fa-sync fa-spin', 'WW-Verdichter läuft'],
     'ww_40hz_stage' => ['bg-warning text-dark', 'fa-gauge-high', 'WW-Verdichter bei 40 Hz'],
     'ww_target_load' => ['bg-danger text-white', 'fa-fire-flame-curved', 'WW-Ziellast erreicht'],
     'compressor_other_domain' => ['bg-warning text-dark', 'fa-sync fa-spin', 'Verdichter läuft'],
@@ -182,6 +182,19 @@ if (is_array($luxOperatingStage)) {
     }
 }
 $luxStageTitle = implode(' · ', $luxStageTitleParts);
+$luxStageFrequencyLabel = '';
+if ($luxStageStatus === 'OK' && ($luxOperatingStage['compressor_running'] ?? null) === true) {
+    $frequencyParts = [];
+    foreach (['frequency_hz' => 'Ist', 'frequency_target_hz' => 'Soll'] as $key => $label) {
+        $value = $luxOperatingStage[$key] ?? null;
+        if (is_numeric($value) && is_finite((float)$value) && (float)$value > 0) {
+            $frequencyParts[] = $label . ' ' . number_format((float)$value, 1, ',', '.') . ' Hz';
+        }
+    }
+    $luxStageFrequencyLabel = $frequencyParts
+        ? implode(' · ', $frequencyParts)
+        : 'Frequenz nicht verfügbar';
+}
 
 // Neustart auslösen (Absturzsicher)
 if (isset($_POST['restart_manager'])) {
@@ -555,6 +568,34 @@ if (isset($_POST['toggle_auto_mode'])) {
 
 $manualBoostActive = file_exists('/var/www/html/ramdisk/manual_boost.flag') || file_exists('/var/www/html/data/morning_boost_state.json');
 $manualWwActive = file_exists('/var/www/html/ramdisk/manual_ww_boost.flag');
+// Warmwasser sofort: Zustand des Nutzerbefehls aus dem Wärmepumpen-Manager (nur lesen; ehrliche Anzeige).
+$manualWwSofort = (is_array($json) && isset($json['manual_ww_sofort']) && is_array($json['manual_ww_sofort']))
+    ? $json['manual_ww_sofort'] : [];
+$manualWwSofortNow = time();
+$manualWwSofortUntil = (float)($manualWwSofort['until_ts'] ?? 0);
+$manualWwSofortActive = $manualWwActive && !empty($manualWwSofort['active']) && $manualWwSofortUntil > $manualWwSofortNow;
+$manualWwSofortLastEvent = (string)($manualWwSofort['last_event'] ?? '');
+$manualWwSofortLastTs = (float)($manualWwSofort['last_event_ts'] ?? 0);
+$manualWwSofortReasonText = [
+    'expired' => 'Dauer abgelaufen',
+    // Warmwasser sofort: reguläres Ende - ein Warmwasser-Zyklus ist fertig (die Dauer ist nur die Obergrenze).
+    'target_reached' => 'Zieltemperatur erreicht',
+    'user_stop' => 'vom Nutzer gestoppt',
+    'hardware_or_source_protection' => 'Hardware-/Quellenschutz der Wärmepumpe',
+    'source_recovery_pause' => 'Quell-Erholungspause',
+    'write_not_allowed' => 'Schreibsperre (Live-Daten ungültig, Ferien-/Frostschutzmodus oder Anlaufwartezeit) länger als 5 min',
+    'modbus_write_failed' => 'Modbus-Schreibfehler (5x in Folge)',
+    'readback_not_confirmed' => 'Luxtronik übernimmt den SHI-Befehl nicht (nach Neubefehl weiterhin Modus 0)',
+    'readback_lost_repeatedly' => 'SHI-Befehl wiederholt zurückgesetzt',
+    // Warmwasser sofort: der Wärmepumpen-Manager führt den Befehl nicht aus (Flag bleibt, Anzeige 'angefordert').
+    'automatic_off' => 'Wärmepumpen-Automatik aus',
+    'manual_boost' => 'manueller Wärmepumpen-Boost aktiv',
+    'heatpump_unavailable' => 'Wärmepumpe nicht verbunden',
+];
+$manualWwSofortReasonKey = (string)($manualWwSofort['last_event_reason'] ?? '');
+$manualWwSofortReason = $manualWwSofortReasonText[$manualWwSofortReasonKey] ?? ($manualWwSofortReasonKey !== '' ? $manualWwSofortReasonKey : 'unbekannt');
+$manualWwSofortDurationMin = (int)($conf['ww_sofort_duration'] ?? 0);
+if ($manualWwSofortDurationMin <= 0) $manualWwSofortDurationMin = 120;
 if ($success) {
     $currP = $heiz_kw;
     if ($currP > 0) {
@@ -755,7 +796,7 @@ if ($isChargingOnly) {
     $cardTitle = 'Intelligentes Lademanagement';
     $wpIcon = 'fa-charging-station';
 } elseif ($isHeaterPage) {
-    $cardTitle = 'Heizstab / Shelly-Heizluefter';
+    $cardTitle = 'Heizstab / Shelly-Heizlüfter';
     $wpIcon = 'fa-fire-burner';
 } elseif ($wpType == 4) {
     $cardTitle = 'Stiebel Eltron ISG';
@@ -1099,7 +1140,7 @@ if ($isChargingOnly) {
                             <button type="submit" name="manual_ww" value="off" class="btn btn-danger btn-sm w-100 fw-bold"><i class="fas fa-stop me-1"></i> WW-SOFORT STOPPEN</button>
                         <?php else: ?>
                             <!-- Das Warmwasser-Button als zweites Element in der Flexbox -->
-                            <button type="submit" name="manual_ww" value="on" class="btn btn-outline-danger btn-sm w-100 fw-bold" title="Warmwasser für 2 Stunden auf Maximum (inkl. Zirkulation)"><i class="fas fa-hot-tub me-1"></i> 1x WARM WASSER</button>
+                            <button type="submit" name="manual_ww" value="on" class="btn btn-outline-danger btn-sm w-100 fw-bold" title="<?= htmlspecialchars('Warmwasser sofort für ' . $manualWwSofortDurationMin . ' Minuten auf die Boost-Solltemperatur (Nutzerbefehl, unabhängig von PV- und Speicherbudget; inkl. Zirkulation)') ?>"><i class="fas fa-hot-tub me-1"></i> 1x WARM WASSER</button>
                         <?php endif; ?>
                     </form>
                     <form method="post">
@@ -1134,12 +1175,24 @@ if ($isChargingOnly) {
                             <div class="small text-muted">Außen <span class="fw-normal">(Ist/Mittel)</span></div>
                             <?php
                                 $a_ist = $data['Außentemperatur'] ?? ($data['Aussentemp'] ?? null);
-                                $a_mittel_raw = $data['Außentemperatur_Mittel'] ?? ($data['Aussentemp_Mittel'] ?? ($data['Aussen_Mittel'] ?? null));
+                                // Dieselben Quellen wie im Dashboard; ohne Heizgrenze keine Saison behaupten.
+                                $season_value = function ($keys) use ($data) {
+                                    foreach ($keys as $key) {
+                                        if (isset($data[$key]) && $data[$key] !== '' && $data[$key] !== '---') return $data[$key];
+                                    }
+                                    return null;
+                                };
+                                $a_mittel_raw = $season_value([
+                                    'Aussentemperatur_Mittel', 'Aussentemp_Mittel', 'Gemittelte Außentemperatur',
+                                    'Gemittelte Aussentemperatur', 'Mitteltemperatur', 'Außentemperatur_Mittel', 'Aussen_Mittel'
+                                ]);
                                 $season_raw = $a_mittel_raw ?? ($data['wp_season_temp'] ?? $a_ist);
-                                $a_mittel = is_numeric($season_raw) ? floatval($season_raw) : -99;
-                                $hg = floatval($data['Heizgrenze_Temperatur'] ?? ($data['Heizgrenze'] ?? 16.0));
-                                $ist_sommer = ($a_mittel !== -99 && $a_mittel >= $hg);
-                                $ist_winter = ($a_mittel !== -99 && $a_mittel < $hg);
+                                $a_mittel = is_numeric($season_raw) ? floatval($season_raw) : null;
+                                $hg_raw = $season_value(['Heizgrenze_Temperatur', 'Heizgrenze', 'Heizgrenze_Temp'])
+                                    ?? ($conf['heizgrenze_temp'] ?? null);
+                                $hg = is_numeric($hg_raw) ? floatval($hg_raw) : null;
+                                $ist_sommer = ($a_mittel !== null && $hg !== null && $a_mittel >= $hg);
+                                $ist_winter = ($a_mittel !== null && $hg !== null && $a_mittel < $hg);
                             ?>
                             <div class="fw-bold"><?= fmtVal($a_ist, '°C') ?>
                                 <span class="text-muted small fw-normal">/ <?= fmtVal($a_mittel_raw, '°C') ?></span>
@@ -1249,6 +1302,9 @@ if ($isChargingOnly) {
                                     <span class="badge <?= htmlspecialchars($luxStagePresentation[0]) ?>" title="<?= htmlspecialchars($luxStageTitle) ?>">
                                         <i class="fas <?= htmlspecialchars($luxStagePresentation[1]) ?> me-1"></i><?= htmlspecialchars($luxStageLabel) ?>
                                     </span>
+                                    <?php if ($luxStageFrequencyLabel !== ''): ?>
+                                        <span id="lux-stage-frequency" class="small text-muted"><?= htmlspecialchars($luxStageFrequencyLabel) ?></span>
+                                    <?php endif; ?>
                                 <?php else: ?>
                                     <span class="badge bg-secondary text-white" title="<?= htmlspecialchars($luxStageTitle ?: 'Frische typisierte Live-Evidenz fehlt') ?>">
                                         <i class="fas fa-circle-question me-1"></i>Status nicht belegt
@@ -1302,9 +1358,25 @@ if ($isChargingOnly) {
                                 </span>
                             <?php endif; ?>
 
-                            <?php if ($manualWwActive): ?>
+                            <?php if ($manualWwSofortActive): ?>
+                                <span class="badge bg-danger" title="<?= htmlspecialchars('Nutzerbefehl: SHI-Modus 1, Ziel ' . number_format((float)($manualWwSofort['target_c'] ?? 0), 1, ',', '.') . ' °C, unabhängig von PV- und Speicherbudget; Rücklesung ' . (!empty($manualWwSofort['readback_confirmed']) ? 'bestätigt' : 'ausstehend')) ?>">
+                                    <i class="fas fa-hot-tub me-1"></i> WW-Sofort aktiv bis <?= date('H:i', (int)$manualWwSofortUntil) ?>
+                                </span>
+                            <?php elseif ($manualWwActive && $wpType != 0): ?>
                                 <span class="badge bg-danger" title="Warmwasser-Timer überschrieben">
                                     <i class="fas fa-hot-tub me-1"></i> WW-Sofort Aktiv
+                                </span>
+                            <?php elseif ($manualWwActive): ?>
+                                <span class="badge bg-warning text-dark" title="Der Wärmepumpen-Manager führt den Befehl gerade nicht aus (Automatik aus, manueller Wärmepumpen-Boost, Anlaufwartezeit, Schreibsperre oder Dienst nicht aktiv).">
+                                    <i class="fas fa-hot-tub me-1"></i> WW-Sofort angefordert
+                                </span>
+                            <?php elseif ($manualWwSofortLastEvent === 'abort' && ($manualWwSofortNow - $manualWwSofortLastTs) < 6 * 3600): ?>
+                                <span class="badge bg-secondary" title="<?= htmlspecialchars('WW-Sofort wurde beendet: ' . $manualWwSofortReason) ?>">
+                                    <i class="fas fa-hot-tub me-1"></i> WW-Sofort abgebrochen <?= date('H:i', (int)$manualWwSofortLastTs) ?>: <?= htmlspecialchars($manualWwSofortReason) ?>
+                                </span>
+                            <?php elseif ($manualWwSofortLastEvent === 'end' && ($manualWwSofortNow - $manualWwSofortLastTs) < 3600): ?>
+                                <span class="badge bg-transparent text-muted border border-secondary" title="Rückkehr in die Automatik">
+                                    <i class="fas fa-hot-tub me-1"></i> WW-Sofort beendet <?= date('H:i', (int)$manualWwSofortLastTs) ?> (<?= htmlspecialchars($manualWwSofortReason) ?>)
                                 </span>
                             <?php endif; ?>
 

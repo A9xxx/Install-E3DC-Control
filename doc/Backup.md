@@ -71,6 +71,26 @@ Jeder gültige Sicherungspunkt enthält `backup-manifest.json` und
 Gruppe, Modus, Verzeichnisstruktur, Kategorie, Restore-Ziel und SHA-256 auf.
 SQLite wird über die Online-Backup-Schnittstelle konsistent gesichert.
 
+Update-Backups und manuell angelegte Sicherungspunkte legen Dateien ab 4 KiB
+je Datei gzip-komprimiert ab, sofern sie nicht bereits komprimiert sind (etwa
+Bilder, Schriften oder Archive). Das betrifft Installationsbaum und
+Web-Programm, das Datenverzeichnis mit den Tageshistorien unter
+`data/history_backups`, der Klima-Historie, dem Luxtronik-Archiv, der
+Langzeitdatenbank `e3dc_stats.db`, der V4-Konfiguration `e3dc_v4.json`, den
+automatischen Konfigurationssicherungen unter `data/config_backups` und dem
+Matter-Storage sowie die Prognosebelege unter
+`/var/lib/e3dc-control/forecast-evidence`. Solche Einträge liegen als
+`<name>.gz` im Sicherungspunkt; das Manifest führt sie mit `encoding: gzip`,
+der Größe und SHA-256 des Originalinhalts sowie Größe und SHA-256 der
+gespeicherten Bytes. Unveränderte Kopien bleiben Units, `/etc/e3dc-control`,
+der übrige Systemzustand unter `/var/lib/e3dc-control` samt privatem
+ML-Modell und einzeln gesicherte Dateien, etwa `e3dc.config.txt` im
+Update-Backup oder die Starter unter `/usr/local/sbin`. Beim Restore werden
+komprimierte Einträge entpackt und gegen die Inhalts-SHA-256 geprüft; für
+einen manuellen Blick genügt `zcat <name>.gz`.
+Ein älterer Stand ohne diese Erweiterung weist ein solches Backup bei der
+Verifikation ab, statt es falsch zu lesen.
+
 Beim Restore wird zuerst der gesamte Satz geprüft und vorbereitet. Alle Ziele
 bilden eine Transaktion: Scheitert ein Austausch, werden bereits ersetzte
 Dateien exakt zurückgesetzt und neu angelegte Ziele entfernt. Die Retention

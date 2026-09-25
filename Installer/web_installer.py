@@ -3426,7 +3426,7 @@ def create_backup_snapshot(action: str, module_key: str | None = None) -> dict[s
         if size > MAX_BACKUP_FILE_BYTES:
             skipped.append({
                 "path": str(source),
-                "reason": f"Datei groesser als {MAX_BACKUP_FILE_BYTES // 1024 // 1024} MB",
+                "reason": f"Datei größer als {MAX_BACKUP_FILE_BYTES // 1024 // 1024} MB",
                 "size": size,
             })
             continue
@@ -4561,8 +4561,8 @@ def remove_module(module_key: str | None = None) -> dict[str, Any]:
         steps.append(normalize_missing_unit_step({"step": "stop", **run_cmd(["systemctl", "stop", module.service_unit], timeout=20)}))
         steps.append(normalize_missing_unit_step({"step": "disable", **run_cmd(["systemctl", "disable", module.service_unit], timeout=20)}))
     else:
-        steps.append({"step": "stop", "ok": True, "noop": True, "message": "Unit war nicht vorhanden; kein Stop noetig."})
-        steps.append({"step": "disable", "ok": True, "noop": True, "message": "Unit war nicht vorhanden; kein Disable noetig."})
+        steps.append({"step": "stop", "ok": True, "noop": True, "message": "Unit war nicht vorhanden; kein Stop nötig."})
+        steps.append({"step": "disable", "ok": True, "noop": True, "message": "Unit war nicht vorhanden; kein Disable nötig."})
     if unit_path.exists():
         try:
             unit_path.unlink()
@@ -4574,7 +4574,7 @@ def remove_module(module_key: str | None = None) -> dict[str, Any]:
     if unit_known:
         steps.append({"step": "daemon_reload", **run_cmd(["systemctl", "daemon-reload"], timeout=20)})
     else:
-        steps.append({"step": "daemon_reload", "ok": True, "noop": True, "message": "Kein daemon-reload noetig; es wurde keine Unit entfernt."})
+        steps.append({"step": "daemon_reload", "ok": True, "noop": True, "message": "Kein daemon-reload nötig; es wurde keine Unit entfernt."})
     post_diag = diagnose_module(module.key).get(module.key, {})
     ok = all(step.get("ok", False) for step in steps[1:]) and not (post_diag.get("systemd") or {}).get("exists", False)
     already_absent = not unit_known and not unit_path.exists()
@@ -4591,7 +4591,7 @@ def remove_module(module_key: str | None = None) -> dict[str, Any]:
             "Dienststatus, Log und Alive-Datei erneut prüfen",
         ],
         "message": (
-            "Optionales Modul war bereits zurueckgebaut; keine Aenderung noetig."
+            "Optionales Modul war bereits zurückgebaut; keine Änderung nötig."
             if ok and already_absent
             else ("Optionales Modul wurde kontrolliert zurückgebaut." if ok else "Rückbau wurde ausgeführt, aber Nachprüfung meldet Fehler.")
         ),
@@ -4603,7 +4603,7 @@ def check_path(
     *,
     expected_owner: str | tuple[str, ...] | None = None,
     expected_group: str | None = "www-data",
-    expected_mode: int | None = None,
+    expected_mode: int | tuple[int, ...] | None = None,
     should_write: bool = False,
     expected_regular_file: bool = False,
 ) -> dict[str, Any]:
@@ -4639,9 +4639,15 @@ def check_path(
             problems.append(
                 f"Gruppe ist {meta.get('group')}, erwartet {expected_group}"
             )
-        if expected_mode is not None and meta.get("mode") != oct(expected_mode):
+        # Docker-Rechte: mehrere zulässige Modi (z. B. logs 775 oder 2775 im Container).
+        allowed_modes = (
+            tuple(int(mode) for mode in expected_mode)
+            if isinstance(expected_mode, tuple)
+            else ((int(expected_mode),) if expected_mode is not None else ())
+        )
+        if allowed_modes and meta.get("mode") not in tuple(oct(mode) for mode in allowed_modes):
             problems.append(
-                f"Modus ist {meta.get('mode')}, erwartet {oct(expected_mode)}"
+                f"Modus ist {meta.get('mode')}, erwartet {' oder '.join(oct(mode) for mode in allowed_modes)}"
             )
         if should_write and not writable:
             problems.append("nicht schreibbar für aktuellen Web-Installer-Kontext")
@@ -4785,22 +4791,32 @@ def runtime_permissions_repair_integrity_preview() -> dict[str, Any]:
     }
 
 
-def permissions_check() -> dict[str, Any]:
-    user = install_user()
-    data_mode = config_secret_dir_mode()
-    config_mode = config_secret_file_mode()
-    config_owners: tuple[str, ...] = (user,)
-    try:
-        import grp as _grp
-        import pwd as _pwd
+CONTAINER_RUNTIME_USER = "e3dc-runtime"
+CONTAINER_RUNTIME_UID = 991
+CONTAINER_PERMISSIONS_REPAIR_COMMAND = (
+    "# Auf dem Docker-Host im Compose-Ordner: der Startvorgang setzt die Rechte der Laufzeitpfade neu.\n"
+    "sudo docker compose restart e3dc-control\n"
+    "# Bleiben Befunde am Produktbaum (/app/pi/Install) bestehen, das Image neu beziehen:\n"
+    "sudo docker compose pull && sudo docker compose up -d"
+)
+CONTAINER_PERMISSIONS_REPAIR_MESSAGE = (
+    "Im Container setzt der Startvorgang die Rechte der Laufzeitpfade; einen "
+    "Rechte-Launcher gibt es dort nicht. Abweichungen werden durch einen "
+    "Container-Neustart behoben und danach erneut geprüft."
+)
+CONTAINER_PERMISSIONS_REPAIR_INSTRUCTION = (
+    "Auf dem Docker-Host im Compose-Ordner den Container neu starten; der "
+    "Startvorgang setzt Besitzer, Gruppe und Modus der Laufzeitpfade neu. "
+    "Der Produktbaum unter /app/pi/Install bleibt root-kontrolliert und wird "
+    "nur über ein neues Image geändert. Danach die Rechteprüfung wiederholen."
+)
 
-        install_account = _pwd.getpwnam(user)
-        web_group = _grp.getgrnam("www-data")
-        if install_account.pw_gid == web_group.gr_gid or user in web_group.gr_mem:
-            config_owners = (user, "www-data")
-    except (ImportError, KeyError, OSError):
-        pass
-    paths = [
+
+def bare_metal_permission_expectations(
+    user: str, config_owners: tuple[str, ...], data_mode: int, config_mode: int
+) -> list[tuple[Any, ...]]:
+    """Erwartungsmodell Bare-Metal: der Installationsbenutzer besitzt Laufzeitpfade und Produktbaum."""
+    return [
         (WEB_ROOT, "root", "www-data", 0o755, False),
         (TMP_DIR, user, "www-data", 0o2775, True),
         (RAMDISK_DIR, user, "www-data", 0o2775, True),
@@ -4813,6 +4829,103 @@ def permissions_check() -> dict[str, Any]:
         (INSTALLER_DIR / "web_update_launcher.sh", user, "www-data", 0o755, False),
         (CONFIG_FILE, config_owners, "www-data", config_mode, True),
     ]
+
+
+def container_permission_expectations(data_mode: int, config_mode: int) -> list[tuple[Any, ...]]:
+    """Docker-Rechte: Erwartungsmodell im Container.
+
+    Produktbaum und Wrapper bleiben root:root ohne Gruppenschreibbit (Identitätsvertrag der Laufzeit);
+    die Laufzeitpfade gehören www-data (der Startvorgang setzt sie); die Konfiguration gehört www-data oder
+    root mit Gruppe www-data und Schutzmodus, das Laufzeitkonto liest sie über die Gruppe.
+    """
+    return [
+        (WEB_ROOT, "root", "www-data", 0o755, False),
+        (TMP_DIR, "www-data", "www-data", 0o2775, True),
+        (RAMDISK_DIR, "www-data", "www-data", 0o2775, True),
+        (LOG_DIR, "www-data", "www-data", (0o775, 0o2775), True),
+        (DATA_DIR, "www-data", "www-data", data_mode, True),
+        (INSTALL_ROOT, "root", "root", 0o755, False),
+        (INSTALLER_DIR, "root", "root", 0o755, False),
+        (INSTALLER_DIR / "service_wrapper.sh", "root", "root", 0o755, False),
+        (INSTALLER_DIR / "installer_wrapper.sh", "root", "root", 0o755, False),
+        (INSTALLER_DIR / "web_update_launcher.sh", "root", "root", 0o755, False),
+        (CONFIG_FILE, ("www-data", "root"), "www-data", config_mode, True),
+    ]
+
+
+def container_runtime_binding_check() -> dict[str, Any]:
+    """Docker-Rechte: Prüfeintrag – das feste Laufzeitkonto liest die Konfiguration über die Gruppe www-data."""
+    label = f"Laufzeitkonto {CONTAINER_RUNTIME_USER} (uid {CONTAINER_RUNTIME_UID}) in Gruppe www-data"
+    problems: list[str] = []
+    try:
+        import grp as _grp
+        import pwd as _pwd
+
+        account = _pwd.getpwnam(CONTAINER_RUNTIME_USER)
+        web_group = _grp.getgrnam("www-data")
+        if int(account.pw_uid) != CONTAINER_RUNTIME_UID:
+            problems.append(f"uid ist {account.pw_uid}, erwartet {CONTAINER_RUNTIME_UID}")
+        if int(account.pw_gid) != int(web_group.gr_gid) and CONTAINER_RUNTIME_USER not in web_group.gr_mem:
+            problems.append("nicht Mitglied der Gruppe www-data")
+    except (ImportError, KeyError, OSError) as exc:
+        problems.append(f"Konto oder Gruppe nicht auflösbar: {exc}")
+    issue = "; ".join(problems) if problems else None
+    return {
+        "path": label,
+        "kind": "account",
+        "exists": True,
+        "owner": None,
+        "group": None,
+        "mode": None,
+        "writable": False,
+        "ok": issue is None,
+        "issue": issue,
+    }
+
+
+def classify_permission_issue(item: dict[str, Any], docker: bool) -> str:
+    """Reparaturklasse eines Befunds je Topologie.
+
+    Bare-Metal: strukturell -> system_repair_required, sonst runtime_repairable (Root-Launcher).
+    Container (Docker-Rechte): Laufzeitpfade -> container_restart (der Startvorgang setzt sie neu);
+    Produktbaum, Laufzeitkonto oder strukturelle Befunde -> image_required.
+    """
+    issue_text = str(item.get("issue") or "")
+    structural = (
+        not item.get("exists")
+        or "symbolischer Link" in issue_text
+        or "keine reguläre Datei" in issue_text
+        or "keine Einzeldatei" in issue_text
+    )
+    if not docker:
+        return "system_repair_required" if structural else "runtime_repairable"
+    path = str(item.get("path") or "")
+    if structural or item.get("kind") == "account" or path.startswith(str(INSTALL_ROOT)):
+        return "image_required"
+    return "container_restart"
+
+
+def permissions_check() -> dict[str, Any]:
+    user = install_user()
+    data_mode = config_secret_dir_mode()
+    config_mode = config_secret_file_mode()
+    docker_mode = is_docker()  # Docker-Rechte: Erwartungsmodell nach Topologie
+    config_owners: tuple[str, ...] = (user,)
+    try:
+        import grp as _grp
+        import pwd as _pwd
+
+        install_account = _pwd.getpwnam(user)
+        web_group = _grp.getgrnam("www-data")
+        if install_account.pw_gid == web_group.gr_gid or user in web_group.gr_mem:
+            config_owners = (user, "www-data")
+    except (ImportError, KeyError, OSError):
+        pass
+    paths = (
+        container_permission_expectations(data_mode, config_mode)
+        if docker_mode
+        else bare_metal_permission_expectations(user, config_owners, data_mode, config_mode)
+    )
     config_lock = DATA_DIR / ".e3dc_v4.transaction.lock"
     if os.path.lexists(config_lock):
         paths.append((config_lock, "www-data", "www-data", 0o660, True, True))
@@ -4834,27 +4947,31 @@ def permissions_check() -> dict[str, Any]:
             checks.append(
                 check_path(
                     session_file,
-                    expected_owner=user,
+                    # Container: Sitzungsdateien schreiben Laufzeitkonto oder Web-Publisher.
+                    expected_owner=(CONTAINER_RUNTIME_USER, "www-data", "root") if docker_mode else user,
                     expected_group="www-data",
-                    expected_mode=0o664,
+                    expected_mode=(0o664, 0o660) if docker_mode else 0o664,
                     should_write=True,
                 )
             )
+    if docker_mode:
+        checks.append(container_runtime_binding_check())
     issues = [item for item in checks if not item["ok"]]
-    runtime_launcher_state = runtime_permissions_repair_integrity_preview()
+    runtime_launcher_state = (
+        {"success": False, "status": "not_applicable", "items": [], "parents": []}
+        if docker_mode
+        else runtime_permissions_repair_integrity_preview()
+    )
     for item in issues:
-        issue_text = str(item.get("issue") or "")
-        structural = (
-            not item.get("exists")
-            or "symbolischer Link" in issue_text
-            or "keine reguläre Datei" in issue_text
-            or "keine Einzeldatei" in issue_text
-        )
-        item["repair_class"] = (
-            "system_repair_required" if structural else "runtime_repairable"
-        )
+        item["repair_class"] = classify_permission_issue(item, docker_mode)
     runtime_repairable_count = sum(
         1 for item in issues if item.get("repair_class") == "runtime_repairable"
+    )
+    container_restart_count = sum(
+        1 for item in issues if item.get("repair_class") == "container_restart"
+    )
+    image_required_count = sum(
+        1 for item in issues if item.get("repair_class") == "image_required"
     )
     system_repair_required_count = sum(
         1
@@ -4876,8 +4993,14 @@ def permissions_check() -> dict[str, Any]:
     system_repair_command = (
         "/usr/bin/sudo -n -- /usr/local/sbin/e3dc-web-update-launcher"
     )
+    if docker_mode:
+        # Docker-Rechte: im Container setzt der Startvorgang die Rechte; es gibt keinen Rechte-Launcher.
+        runtime_repair_command = CONTAINER_PERMISSIONS_REPAIR_COMMAND
+        system_repair_command = ""
     return {
         "success": True,
+        "docker": docker_mode,
+        "expectation_model": "container" if docker_mode else "bare_metal",
         "write_actions_enabled": WRITE_ACTIONS_ENABLED,
         "summary": "Rechteprüfung abgeschlossen. Es wurden keine Änderungen ausgeführt.",
         "checks": checks,
@@ -4885,12 +5008,14 @@ def permissions_check() -> dict[str, Any]:
         "issues": issues,
         "repair_available": bool(runtime_launcher_state.get("success")),
         "privileged_web_repair_enabled": bool(runtime_launcher_state.get("success")),
-        "repair_via": "root_owned_runtime_permissions_launcher",
+        "repair_via": "container_entrypoint" if docker_mode else "root_owned_runtime_permissions_launcher",
         "repair_launcher_status": runtime_launcher_state.get("status", "unbekannt"),
         "repair_launcher": runtime_launcher_state,
         "runtime_repairable_issue_count": runtime_repairable_count,
+        "container_restart_issue_count": container_restart_count,
+        "image_required_issue_count": image_required_count,
         "system_repair_required_count": system_repair_required_count,
-        "repair_message": (
+        "repair_message": CONTAINER_PERMISSIONS_REPAIR_MESSAGE if docker_mode else (
             "Die enge Rechtereparatur verändert ausschließlich Metadaten "
             "bekannter Pfade. Sie erstellt kein Backup, führt kein Update aus "
             "und startet keine Dienste neu."
@@ -4898,7 +5023,7 @@ def permissions_check() -> dict[str, Any]:
         "detected_install_path": str(INSTALL_ROOT),
         "repair_command": runtime_repair_command,
         "system_repair_command": system_repair_command,
-        "repair_instruction": (
+        "repair_instruction": CONTAINER_PERMISSIONS_REPAIR_INSTRUCTION if docker_mode else (
             "Per SSH am E3DC-Control-System anmelden und den folgenden Befehl "
             "optional mit --check-json rein lesend ausführen. Der Aufruf ohne "
             "Argument repariert releasegleiche Einträge sofort. Bei lokalen "
@@ -5250,7 +5375,7 @@ def repair_permissions(
             rollback = rollback_permissions()
             return {
                 "success": False,
-                "message": "Rechte-Reparatur abgebrochen: Ziel-sudoers hat die visudo-Pruefung nicht bestanden.",
+                "message": "Rechte-Reparatur abgebrochen: Ziel-sudoers hat die visudo-Prüfung nicht bestanden.",
                 "steps": steps,
                 "backup_snapshot": backup_snapshot,
                 "rollback": rollback,

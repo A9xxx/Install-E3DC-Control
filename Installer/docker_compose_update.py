@@ -70,6 +70,21 @@ VARIABLE_IMAGE_EXPRESSION = (
     f'"{OFFICIAL_IMAGE_REPOSITORY}:${{E3DC_IMAGE_TAG:-latest}}"'
 )
 WATCHTOWER_LABEL_LEGACY = "com.centurylinklabs.watchtower.enable=true"
+# containrrr/watchtower ist archiviert; der Fork ist label- und umgebungskompatibel.
+KNOWN_WATCHTOWER_REPOSITORIES = {
+    "containrrr/watchtower",
+    "docker.io/containrrr/watchtower",
+    "index.docker.io/containrrr/watchtower",
+    "registry-1.docker.io/containrrr/watchtower",
+    "nickfedor/watchtower",
+    "docker.io/nickfedor/watchtower",
+    "index.docker.io/nickfedor/watchtower",
+    "registry-1.docker.io/nickfedor/watchtower",
+    "ghcr.io/nicholas-fedor/watchtower",
+}
+KNOWN_WATCHTOWER_IMAGE_PATTERN = re.compile(
+    r"(?:^|/)(?:containrrr|nickfedor|nicholas-fedor)/watchtower(?::|@|$)"
+)
 WATCHTOWER_LABEL_CURRENT = (
     "com.centurylinklabs.watchtower.enable=${E3DC_WATCHTOWER_ENABLE:-false}"
 )
@@ -1282,13 +1297,7 @@ def _running_watchtower_image_ids(cli: DockerCli) -> tuple[str, ...]:
             repository = f"{prefix}/{image_name}" if separator else image_name
             if repository:
                 repositories.add(repository.lower())
-        official_repositories = {
-            "containrrr/watchtower",
-            "docker.io/containrrr/watchtower",
-            "index.docker.io/containrrr/watchtower",
-            "registry-1.docker.io/containrrr/watchtower",
-        }
-        if repositories & official_repositories:
+        if repositories & KNOWN_WATCHTOWER_REPOSITORIES:
             found.append(container_id)
             continue
 
@@ -1331,7 +1340,7 @@ def _validate_watchtower_identity(
         for part in str(labels.get("com.docker.compose.project.config_files") or "").split(",")
         if part.strip()
     ]
-    if image not in {"containrrr/watchtower", "containrrr/watchtower:latest"}:
+    if not KNOWN_WATCHTOWER_IMAGE_PATTERN.search(image.lower()):
         raise DockerUpdateError("Der gefundene Watchtower besitzt ein fremdes Image.")
     if labels.get("com.docker.compose.service") != "watchtower":
         raise DockerUpdateError("Der gefundene Watchtower gehört nicht zum Compose-Dienst.")
@@ -1549,7 +1558,7 @@ def _stop_update_watchtower(cli: DockerCli, projection: dict[str, Any]) -> bool:
         info = _inspect_container(cli, container_id.strip())
         config = info.get("Config") or {}
         image = str(config.get("Image") or "").lower()
-        if not re.search(r"(?:^|/)containrrr/watchtower(?::|@|$)", image):
+        if not KNOWN_WATCHTOWER_IMAGE_PATTERN.search(image):
             continue
         env = dict(item.split("=", 1) for item in config.get("Env") or [] if "=" in item)
         command = [str(item) for item in config.get("Cmd") or []]

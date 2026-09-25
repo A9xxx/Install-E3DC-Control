@@ -125,6 +125,9 @@ SECRET_KEY_PARTS = (
     "apikey",
     "secret",
     "aes",
+    # Bluelink-PIN und Konto (E-Mail) wandern nicht in den Shadow-Snapshot.
+    "bluelink_pin",
+    "bluelink_user",
 )
 
 

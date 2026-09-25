@@ -2,7 +2,7 @@
 
 Diese Anleitung fasst die schnellsten Schritte zusammen, um E3DC-Control auf einem frischen Raspberry Pi OS (oder ähnlichem Debian-System) zu installieren.
 
-Aktueller Stable-Stand: `v5.4.6d`.
+Aktueller Stable-Stand: `v5.5.0`.
 
 5.4.5f korrigiert das Speichern der Konfiguration mit übernommenen
 Docker-Datenvolumes und berücksichtigt erkannte Neustartphasen beim Update.
@@ -408,26 +408,59 @@ export E3DC_DOCKER_PATH="$HOME/e3dc-docker"
 git clone https://github.com/A9xxx/Install-E3DC-Control.git "$E3DC_DOCKER_PATH"
 cd "$E3DC_DOCKER_PATH"
 ```
-3. **Image ziehen, starten und vollständig prüfen:**
+3. **Container aus dem GHCR-Image starten:**
+
+```bash
+sudo docker compose up -d
+sudo docker compose logs --tail=80 e3dc-control
+```
+
+Ohne `E3DC_IMAGE_TAG` in `.env` zieht der Start das geprüfte Stable-Image
+`latest`. Die mitgelieferte Compose-Datei enthält die persistenten Daten-,
+Log-, Modell-, Prognose- und Instanzrollen-Volumes, die RAM-Disk, feste
+Loggrenzen und den Watchtower-Dienst im Compose-Profil `auto-update`. Docker
+ist nur für die eigenständige Rolle `ha_mode=off` freigegeben.
+
+Damit der Knopf **System Update** in der Weboberfläche und das Auto-Update
+im Config-Editor funktionieren, einmalig Watchtower freischalten (Token in
+`.env`, Container mit Token neu erstellen, Watchtower starten):
+
+```bash
+printf 'E3DC_WATCHTOWER_API_TOKEN=%s\n' "$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> .env
+sudo docker compose up -d
+sudo docker compose --profile auto-update up -d watchtower
+```
+
+Wer Start und Update mit Platzprüfung, Healthcheck-Wartezeit und automatischem
+Rückfall absichern will, verwendet stattdessen den Host-Helfer:
 
 ```bash
 sudo python3 ./Installer/docker_compose_update.py --compose-dir . --sudo
-sudo docker compose logs --tail=80 e3dc-control
 ```
 
 Der Helfer zieht das gewählte Image ausdrücklich, bindet Image-ID und
 Produktversion, wartet auf den Image-Healthcheck und verlangt zwei identische
 gesunde Folgesnapshots. Scheitert ein Schritt nach dem Kandidatenstart, stoppt
-er den Kandidaten wieder und bestätigt dessen Stillstand. Die mitgelieferte
-Compose-Datei enthält die persistenten Daten-, Log-, Modell-, Prognose- und
-Instanzrollen-Volumes, die RAM-Disk, feste Loggrenzen und den standardmäßig
-deaktivierten Watchtower-Vertrag. Docker ist nur für die eigenständige Rolle
-`ha_mode=off` freigegeben.
+er den Kandidaten wieder und bestätigt dessen Stillstand. Ein laufender
+Watchtower wird vorher gestoppt
+(`sudo docker compose --profile auto-update stop watchtower`); bei einem
+parallel aktiven Watchtower bricht der Helfer ab.
 
 Danach ist das System über die IP des Docker-Hosts erreichbar. Eine frische
 Konfiguration wird im Config-Editor eingerichtet.
 
 **Docker-Updates:**
+
+Der Knopf **System Update** in der Weboberfläche und das **Auto-Update** im
+Config-Editor geben Watchtower das Signal, das neue Image zu laden und den
+Container neu zu erstellen (Voraussetzung: die Freischaltung aus Schritt 3).
+Der Knopf steht ab 5.5.0 zur Verfügung; das Update von 5.4.x auf 5.5.0 erfolgt
+noch über den Host-Weg (siehe [Docker-Dokumentation](Docker_Dokumentation.md),
+„Übergang von 5.4.x auf 5.5.0“). Er aktualisiert nur Container, deren Image aus
+der Registry gezogen wurde; ein selbst gebautes Image prüft Watchtower nicht.
+Auf dem Host genügen `sudo docker compose pull` und
+`sudo docker compose up -d` im Compose-Ordner. Der Host-Helfer bleibt der
+geprüfte Weg mit automatischem Rückfall:
 
 Vor dem Imagewechsel den tatsächlich verwendeten Host-Updater aktualisieren,
 einschließlich einer gegebenenfalls bevorzugten Kopie direkt im Compose-Ordner.
@@ -470,20 +503,23 @@ gebundene offizielle 5.3.2b-Compose-Datei, unveränderte offizielle
 Compose-Dateien aus 5.4.2 bis 5.4.2d sowie die bekannte
 Installer-Bind-Mount-Variante atomar, also ganz oder gar nicht. `.env` und die
 vorhandenen Daten-, Log-, ML- und Forecast-Quellen bleiben unverändert. Einen
-alten Watchtower stoppt und prüft der Helfer vor Migration und Pull; er bleibt
-danach aus und darf nur per ausdrücklichem Opt-in wieder aktiviert werden.
+alten Watchtower stoppt der Helfer nicht selbst: Läuft ein Watchtower, der den
+Zielcontainer parallel aktualisieren könnte, meldet er die Konkurrenz und
+bricht vor Migration und Pull ab.
 Ältere, angepasste, per Override ergänzte oder mehrdeutige Compose-Stände
 bleiben unverändert gesperrt und benötigen eine manuelle Prüfung.
 
-Der optionale, nicht mehr gepflegte Watchtower startet nicht automatisch, weil
-er weitreichenden Zugriff auf den Docker-Socket des Hosts benötigt. Ein
-bewusster Opt-in benötigt **beides**: in `.env` exakt
-`E3DC_WATCHTOWER_ENABLE=true` und anschließend das Profil `auto-update`.
-Ohne das Label bleibt auch ein versehentlich gestarteter Watchtower für den
-Hauptcontainer wirkungslos. Der oben gezeigte manuelle Host-Helfer bleibt der
-empfohlene Updateweg.
+Watchtower startet nicht automatisch, weil er Zugriff auf den Docker-Socket des
+Hosts benötigt; er läuft nur im Compose-Profil `auto-update` und handelt
+ausschließlich auf das Signal aus E3DC-Control (kein eigenes Polling). Die
+Vorlage verwendet den gepflegten Fork `ghcr.io/nicholas-fedor/watchtower:1`.
+Das Containerlabel `com.centurylinklabs.watchtower.enable` steht standardmäßig
+auf `true`; mit `E3DC_WATCHTOWER_ENABLE=false` in `.env` bleibt der
+Hauptcontainer auch bei laufendem Watchtower ausgenommen. Einzelheiten stehen
+in der [Docker-Dokumentation](Docker_Dokumentation.md), Abschnitt „Updates:
+Weboberfläche, Host und Watchtower“.
 
-**Docker-Rückfall von v5.4.6d auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.5.0 auf den veröffentlichten Docker-Rollback-Root:**
 
 Der aktuelle Host-Updater ist für die private Rückmigration zwingend. Aus
 Bridge zuerst dieselbe aktuelle Runtime-Version im Hostprofil neu aufbauen
@@ -506,10 +542,15 @@ stehen in der [Docker-Dokumentation](Docker_Dokumentation.md).
 Soll der Pin dauerhaft gelten, wird `E3DC_IMAGE_TAG=v5.3.2b` in einer
 vorhandenen `.env` ergänzt, ohne andere Werte darin zu überschreiben.
 Der Container kann den Docker-Daemon des Hosts absichtlich nicht selbst
-bedienen. Die Weboberfläche zeigt für Docker deshalb nur die passenden
-Host-Befehle zur gewählten Version an. `v5.3.2b` ist der einzige vorgesehene
-öffentliche Docker-Rückfallstand und gibt selbst keinen älteren Image-Tag frei.
-Auf Bare Metal wird dieser Altstand nicht als Programm-Rückfall angeboten.
+bedienen. Ein Rückfall auf eine ältere Version erfolgt deshalb immer auf dem
+Host; die Weboberfläche zeigt dafür nur die passenden Host-Befehle zur
+gewählten Version an. `v5.3.2b` ist der einzige in der Update-Policy
+vorgesehene öffentliche Docker-Rückfallstand und gibt selbst keinen älteren
+Image-Tag frei; auf Bare Metal wird dieser Altstand nicht als
+Programm-Rückfall angeboten. Davon getrennt ist der Wechsel zwischen
+Runtime-Images, etwa von 5.5.0 zurück auf 5.4.6d: `E3DC_IMAGE_TAG=v5.4.6d`
+in `.env` setzen und `sudo docker compose up -d` ausführen (siehe
+[Rollback](Rollback.md)).
 
 **Wichtig zur Ramdisk im Docker:** `/var/www/html/ramdisk` ist flüchtig und
 nach jedem Container-Neustart leer. Dateien wie `ml_prediction.json` werden

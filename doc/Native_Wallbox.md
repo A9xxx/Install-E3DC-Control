@@ -3,6 +3,10 @@
 Der V4-Wallbox-Manager ist ein eigenständiger Python-Dienst. Er regelt E3DC,
 openWB/openWB Pro, go-e und reine Mess-Wallboxen über dieselbe Budget-,
 Hysterese- und Schutzlogik, nutzt aber je Wallbox den passenden Treiber.
+Die verbindlichen Grundsätze dahinter (harte Schranken, Ein-Entscheider je
+Aktor, Anti-Flattern, Akkustützung nach Korridorlage) stehen in
+`doc/V4_Konfiguration_und_Regelung.md`, Abschnitt „Regelungsphilosophie
+(verbindlich)“.
 
 ## Was kann der Wallbox-Manager?
 
@@ -37,8 +41,9 @@ Hysterese- und Schutzlogik, nutzt aber je Wallbox den passenden Treiber.
 | `Aus` | NGNA: E3DC-Control beobachtet nur. Eine Standardfreigabe wird nur einmalig nach bewusstem Wechsel auf `Aus` in der WebUI gesendet. |
 | `PV-Kurve ruhig` | Lädt entlang der Speicher-Ladekurve mit Hysterese. Der Hausspeicher behält Vorrang, wenn die Prognose knapper wird. |
 | `Grundladung stabil` | Hält eine ruhige Grundladung, solange das Speicherziel laut Planung erreichbar bleibt. |
-| `PV + Akku bis Untergrenze` | Nutzt PV und oberhalb der Hausakku-Untergrenze zusätzlich den Speicher. Die unten beschriebene begrenzte Phasenerkennung darf kurz Netzleistung überbrücken. |
-| `Sofort bis Preislimit` | Netzladen nur, wenn der aktuelle Preis unter dem Wallbox-Preislimit liegt. |
+| `PV + Akku bis Untergrenze` | Nutzt PV und oberhalb der Hausakku-Untergrenze zusätzlich den Speicher. Die unten beschriebene begrenzte Phasenerkennung darf kurz Netzleistung überbrücken. Ist die Untergrenze erreicht und trägt das PV-Budget dieser Wallbox die Mindestleistung der aktuellen Phasenzahl nicht, wird eine laufende Ladung bei dieser Phasenzahl auf den Mindeststrom gesetzt (ohne PV sofort, bei noch anliegendem PV nach 20 s Bestätigung) und nach einem Durchlauf des Wh-Kontos gestoppt; eine dreiphasig ladende openWB Pro wechselt stattdessen auf 1p, wenn das PV-Budget das 1p-Minimum trägt. Laden mehrere Wallboxen, wird diese Wallbox ohne Netzbezug zuerst abgesenkt, sofern sie selbst über ihrer Zuteilung lädt; deckt ihre Zuteilung die tatsächliche Ladeleistung, lädt sie weiter. Netzbezug und ein laufender Phasenwechsel einer anderen Wallbox haben Vorrang. |
+| `Sofort bis Preislimit` | Netzladen nur, wenn der aktuelle Preis unter dem Wallbox-Preislimit liegt. Ohne Preis- oder Netzfenster gilt an der Hausakku-Untergrenze dieselbe Absenkung wie in `PV + Akku bis Untergrenze`. |
+| `Akku bis Abfahrt` | Lädt im Freigabefenster vor der Abfahrtszeit aus PV und Hausspeicher bis zur Hausakku-Untergrenze `wbminsoc`; Netzladen bleibt gesperrt. Gestoppt wird bei erreichter Abfahrtszeit, vollem Fahrzeug oder erreichter Untergrenze. Abfahrtszeit `wb<n>_battery_departure_time` (Standard `06:30`), Fenster `wb<n>_battery_departure_window_h` (Standard 3 h, 1–36 h). |
 
 ## Phasenerkennung an einer festen Wallbox
 
@@ -72,7 +77,12 @@ dieser Zusage. Bereits laufende Ladungen bleiben in der gemeinsamen Zuteilung
 berücksichtigt; eine ausdrücklich konfigurierte Wallboxpriorität bleibt wirksam.
 
 Mehrere frische, vollständige Phasenmessungen bei stabilen 6 A bestätigen die
-benutzten Phasen. Im laufenden Dienst bleiben diese bei Ladepausen und 0 W
+benutzten Phasen. Wurde das kurze Startfenster nicht erfolgreich ausgewertet,
+kann die Erkennung auch bei einer später stabilen höheren Stromvorgabe erfolgen.
+Die Leistung jeder belasteten Phase muss dabei zur Stromvorgabe passen; eine
+Stromänderung startet die Einschwing- und Bestätigungszeit erneut. Die begrenzte
+6-A-Startprobe und ihr Energiekonto bleiben unverändert.
+Im laufenden Dienst bleiben bestätigte Phasen bei Ladepausen und 0 W
 erhalten. Erst bestätigtes Abstecken beginnt die Erkennung erneut. Eine später
 zusätzlich gemessene Phase erhöht die angesetzte Last sofort. Fehlen nach einem
 Dienstneustart sichere Belege für die unveränderte Steckepisode, wird die
@@ -115,6 +125,24 @@ Die Entscheidungsdiagnose trennt das ursprünglich vom Storage Manager gelesene
 Budget vom wirksamen Wallboxbudget. Sie zeigt außerdem die verwendete
 Bilanzquelle und deren Messzeiten. Diese Angaben erteilen keine Ladefreigabe.
 
+## Phasenwahl bei mehreren Ladepunkten
+
+Sind mehrere Ladepunkte aktiv geregelt, begrenzt die Gruppenverteilung den
+ausführbaren Stromausgang bereits auf den Anteil des einzelnen Ladepunkts.
+Die Phasenbewertung verwendet dieselbe Basis und nicht mehr das gemeinsame
+Gruppenbudget. Ein Ladepunkt hält dadurch keine drei Phasen mehr, wenn seine
+eigene Zuteilung das dreiphasige Mindestbudget gar nicht erreicht; er wechselt
+stattdessen auf den einphasigen Startpfad, der bei knappem Budget für beide
+Ladepunkte reicht.
+
+Eine bereits hardwarebestätigte eigene Ladeleistung bleibt Teil dieser Basis.
+Sie ist physisch gedeckt und löst durch diese Kante keinen zusätzlichen
+Phasenrückwechsel aus. Die Regel kann das Budget der Phasenbewertung nur
+absenken, nie anheben, und erteilt keine neue Leistungsfreigabe. Bei einer
+einzelnen Wallbox ändert sich nichts. Mindestströme, Hardware-Sperrzeiten für
+einen weiteren Phasenwechsel, CP-Schutz, Nutzer-`Aus` und die zentralen
+Leistungsgrenzen bleiben unverändert.
+
 ## Konfiguration
 
 Neue Systeme werden im Config-Editor in `data/e3dc_v4.json` konfiguriert.
@@ -137,7 +165,13 @@ wb_openwb_auto_discovery = 1
 wb_openwb_auto_role_enable = 1
 wb_openwb_command_fail_limit = 3
 wb_openwb_command_block_s = 300
-wb_openwb_start_cp_retries = 3   # openWB Pro: 1..3, Standard 3; ungültig -> 3
+wb_openwb_start_cp_retries = 3   # openWB Pro: 1..3, Standard 3; ungültig -> 3 (Deckel je Stecksession über alle Zyklen)
+openwb_pro_start_hold_s = 180    # openWB Pro Startfenster: 60..600 s, ungültig -> 180
+openwb_pro_start_retry_cycle_s = 300  # openWB Pro Start-Wiederholzyklus: 180..1200 s, ungültig -> 300
+openwb_pro_start_cp_grace_s = 60 # openWB Pro CP-Karenz: Untergrenze 60 s (Fahrzeugprofil verkürzt nicht), max 600
+wb_openwb_start_retry_s = 45     # openWB Pro: wirksam max(60, Wert); praktisch wirkungslos, der Zyklus entscheidet
+openwb_pro_start_reject_timeout_s = 120  # openWB Pro: wird gelesen, ohne Wirkung auf den Latch (SoC entscheidet)
+openwb_pro_start_grace_s = 60    # openWB Pro: Fallback für Alt-Aufrufer des Angebots-Halts; im Startfenster ohne Wirkung
 ```
 
 Eine alte `e3dc.config.txt` ist nur noch Migration und Legacy-Fallback. Neue
@@ -146,6 +180,42 @@ Einstellungen gehören in `e3dc_v4.json`.
 Die Ladepriorität wird in der Wallbox-WebUI nur angezeigt, wenn WB1 und WB2
 konfiguriert sind. Bei Ein-Wallbox-Anlagen bleibt die Verteilung automatisch
 ausgeglichen und der Prioritätsschalter wird ausgeblendet.
+
+### Ladeplan je Wallbox
+
+```ini
+wb1_plan_hours = 2          # manuelle Ladezeit im Preisfenster (0 = kein Plan, 99 = Sofort)
+wb1_wbvon = 00:00|now       # Frühestens ab: feste Uhrzeit oder rollender Jetzt-Anker
+wb1_wbbis = 07:00           # Fertig bis
+wb1_smart_wbhour_enable = 0 # 1 = Dauer aus Fahrzeug-SoC, Ziel-SoC und Ladeleistung
+wb1_native_eco = 1          # Eco-Score als Zusatzsortierung
+wb1_plan_repeat = 0         # 1 = Täglich wiederholen (nur feste Startuhrzeit, manuelle Stunden)
+```
+
+Ein manueller Stundenplan ist ohne Wiederholung ein einmaliger Auftrag: Sind
+alle geplanten Slots durchlaufen oder ist ein `now`-Fenster abgelaufen, setzt
+der Planer `wb{N}_plan_hours` auf `0` („Plan verbraucht“), damit nicht jede
+Nacht unbemerkt Netzstrom geladen wird. Mit `wb{N}_plan_repeat = 1` bleibt die
+Stundenzahl erhalten: Der verbrauchte Plan bleibt bis zum Ende des laufenden
+Fensters als Beleg liegen (kein zweites Laden im selben Fenster) und wird erst
+für das nächste Fenster neu auf die günstigsten Slots gelegt. Liegen für den
+Folgetag noch keine Preise vor, wartet der Planer ohne Reset. `now`, Sofortladen
+(`99`) und das 24h-Rollfenster kennen keine Fensterinstanz; dort bleibt der
+Schalter wirkungslos und die WebUI sperrt ihn.
+
+`Sofort bis Preislimit` (Modus 5) wird für E3DC-, openWB- und go-e-Wallboxen als
+gewöhnlicher Konfigurationscommit übernommen; die Preisfreigabe entscheidet der
+Manager zyklisch. Nur openWB Pro erhält zusätzlich den typisierten, an die
+Pro-Stecksession gebundenen Sofortauftrag (`wallbox_mode5_user_start_request.json`).
+
+„Netz erlaubt + Fertig bis“ (Modus 5 mit `wb{N}_smart_wbhour_enable = 1`) ist
+plan-gebunden, sobald ein bestätigter Fahrzeug-SoC vorliegt (manueller
+Ist-SoC oder frischer Fahrzeugwert nach demselben Vertrag wie „Auto voll“):
+Netzstrom fließt dann nur in den geplanten günstigen Slots bis „Fertig bis“,
+außerhalb laden PV und Speicher. Ohne bestätigten SoC kann der Planer die
+Dauer nicht bestimmen; die Wallbox lädt sofort bis Preislimit und das
+Dashboard meldet `price_plan_soc_missing` als Warnung. Die Entscheidung steht
+je Zyklus in `price_plan_bound_ids` / `price_plan_soc_missing_ids`.
 
 ## Sollstrom-Schrittweite
 
@@ -182,6 +252,13 @@ wird die SoC-Regelsession geschlossen; nach erneutem Anstecken bleibt sie ohne
 neue Bestätigung gesperrt. Laden nach PV, Mindestleistung, Preisfenster oder
 kWh-Ziel bleibt möglich.
 
+Fehlt bei aktiver Zielplanung ein bestätigter Fahrzeug-SoC, plant der Ladeplaner
+konservativ mit 0 % (volle Energiemenge bis zum Ziel). Die geplanten Ladefenster,
+auch solche mit Netzbezug, bleiben dann bestehen, selbst wenn das Fahrzeug
+bereits voll ist; die Regelung gibt in ihnen weiter frei. Für eine genaue
+Planung den Fahrzeug-SoC eintragen oder übertragen lassen. Im Protokoll steht
+dazu je Stecksession und Wallbox ein einzelner Hinweis.
+
 
 ## Zustandsmaschine und Ladeende
 
@@ -197,7 +274,13 @@ Der Wallbox-Manager verwendet eine explizite Zustandsmaschine. Die Diagnose zeig
 | `ended` | Die Session ist fachlich beendet und bleibt bis zu einer benannten Freigabe gelatcht. |
 | `rscp_error` | Antwort oder Rücklesung ist ungültig; es wird kein Erfolg vorgetäuscht. |
 
-Ein Ladeende darf grundsätzlich durch einen bewussten UI-Wechsel
+Bei der openWB Pro führt ein bestätigtes Fahrzeug-Ladeende zur Bereitschaft:
+Solange die Regelung das nötige Budget freigibt, bleibt der eingestellte
+Mindeststrom angeboten. Die Anzeige unterscheidet dieses Angebot von echter
+Ladeleistung. Eigene Ladeziele und Schutzsperren bleiben verbindlich. Für die
+anderen Treiber gilt weiterhin der bestehende Ladeende-Latch.
+
+Ein Ladeende-Latch darf grundsätzlich durch einen bewussten UI-Wechsel
 (`wallbox_php_limit_or_profile_change`) oder einen bestätigten Neustart des
 Fahrzeugs (`vehicle_self_restart`) freigegeben werden. Eine vollständig belegte
 3/3-Startablehnung der openWB Pro ist davon ausgenommen: Bloße Modus-, Limit-,
@@ -246,6 +329,21 @@ Leistungsgrenze. Die elektrische Absicherung berücksichtigt deshalb weiterhin
 die mögliche dreiphasige Last. Direkte Phasen-Schreibbefehle werden dadurch
 nicht freigeschaltet. Easy Connect, nicht eindeutig bestimmte Geräte und die
 Modellwahl Multi Connect ohne II erhalten diese Fähigkeit nicht automatisch.
+
+**Experimenteller Direktvertrag für Phasenwechsel.** Der Schalter
+`wb_e3dc_direct_phase_control_enable` (je Wallbox überschreibbar mit
+`wb1_…`/`wb2_…`) ist standardmäßig aus. Eingeschaltet schaltet E3DC-Control bei
+ausdrücklich gewählter efy oder Multi Connect die Phasen selbst: Je
+Phasenwechsel schreibt die Regelung die Geräteeinstellungen Sonnenmodus,
+automatische Phasenumschaltung und Phasenzahl und stellt Sonnenmodus und
+automatische Phasenumschaltung bei der Rückgabe wieder her. Ob die Wallbox
+diese Einstellungen dauerhaft speichert, ist nicht belegt; der Schalter ist
+deshalb nicht für den Dauerbetrieb empfohlen, und die Konfigurationsprüfung
+warnt, solange er eingeschaltet ist. Während der Direktvertrag eingeschaltet
+ist, übergibt die Regelung die Phasenwahl nicht zusätzlich an die
+E3/DC-Automatik (Sonnenmodus-Übergabe) – ein Regler je Wallbox. Fehlt dabei
+die vollständige Rücklesung der Geräteeinstellungen, bleiben beide Wege
+geschlossen und die Wallbox lädt mit fester Phasenzahl.
 
 Referenzen: [E3/DC-Wallboxen](https://www.e3dc.com/produkte/wallbox-ii/),
 [Herstellerdaten Multi Connect / Multi Connect II](https://www.e3dc.com/ch/wp-content/uploads/sites/4/2022/09/E3DC_TDB_wallbox-multi-connect.pdf).
@@ -370,9 +468,29 @@ Pfad bewährt:
   leicht zu Ping-Pong, weil die SW2 ihre eigene Regellogik gegen die Vorgaben
   von E3DC-Control setzt.
 * **Klare Stromvorgaben:** E3DC-Control trennt hart zwischen `0 A` als Stop und
-  dem normgerechten Startbereich ab `6 A`. Nach Ladeende werden keine
-  wiederkehrenden Ladeimpulse gesendet, damit Fahrzeugsteuergeräte und
-  12-V-Batterie schlafen können.
+  dem normgerechten Startbereich ab `6 A`. Beendet das Fahrzeug selbst die
+  Ladung, bleibt bei ausreichendem Budget der konfigurierte Mindeststrom
+  angeboten, zum Beispiel `6 A`. Das Fahrzeug kann damit selbst wieder laden
+  oder Energie für die Vorklimatisierung beziehen. Die Bereitschaft löst keine
+  wiederkehrenden Startimpulse, CP-Unterbrechungen oder Phasenwechsel aus.
+  Sie bleibt an dieselbe Stecksession gebunden und übersteht einen Neustart
+  des Managers. Sie bedeutet weder einen bestätigten Fahrzeug-SoC von 100 %
+  noch dauerhaft geschlossene Leistungsschütze.
+* **Budgetabhängige Bereitschaft:** Fehlt das Budget für die gehaltenen Phasen,
+  setzt die Regelung `ampere=0`. Bei erneut ausreichendem Budget bietet sie
+  den Mindeststrom nach den bestehenden Wiederanlauf- und Schutzfristen wieder
+  an. Es entsteht keine dauerhafte Fahrzeug-Ladeende-Sperre. `6 A` an drei
+  Phasen benötigen rund `4,14 kW`; eine Nullmessung wird nicht als einphasiges
+  Fahrzeug behandelt. Nach einem Stop der Defizit-Kaskade (Netz- oder
+  Akku-Wh-Konto) in derselben Stecksession bietet die Regelung den Mindeststrom
+  erst wieder an, wenn das PV-Budget die Mindestleistung der erwarteten
+  Phasenzahl `wb_pv_only_release_hold_s` (Standard 120 s) lang durchgehend
+  deckt; eine einzelne Wolkenlücke startet nicht. Eigene
+  Ziel-SoC-/Energiemengen- und Abfahrtsgrenzen, Nutzerpause und
+  Schutzvorgaben behalten Vorrang. `Aus` bleibt beobachtend.
+  Sobald echte Ladeleistung bestätigt wird, übernimmt die normale Regelung.
+  Bei der Pro ist `ampere=0` bereits der Stopbefehl; ein zusätzlicher
+  CP-Reset wird für die Budgetpause nicht gesendet.
 * **Phasenwechsel mit Haltezeit:** E3DC-Control setzt über `connect.php` nur das
   Ziel (`phasetarget=1` oder `phasetarget=3`). Die Hardware der Pro übernimmt
   Schütz-Trennung und CP-Ablauf. Nach der kurzen sicheren 0-A-/CP-Beruhigung
@@ -381,6 +499,69 @@ Pfad bewährt:
   Phasenausgangs. Eine reine Budgetreservierung erzeugt keinen Cooldown. Die
   Sperre schützt ausschließlich vor einem weiteren Phasenwechsel; sie
   blockiert weder den bestätigten Wiederanlauf noch die laufende Stromregelung.
+  Wechselt die Box ohne laufende Ladung, etwa vor dem Start auf eine Phase,
+  bietet das Startfenster nach dem frisch bestätigten neuen Ziel 6 A auf den
+  Zielphasen an; Startfenster und Phasenwahrheit der Stecksession warten dafür
+  nicht auf Ladeleistung. Die Phasenreservierung endet erst, wenn die
+  Zielphasen unter Last bestätigt sind (mindestens drei Messungen über 500 W,
+  stabil über mindestens 10 s). Das gilt auch nach Ablauf der
+  Reservierungsfrist, nach einem Neustart des Managers sowie nach einem
+  Force-Start oder einem Wechsel auf `Aus` und zurück; eine mehrdeutige
+  Ausgangslage bleibt gesperrt, bis der Recovery-Pfad sie klärt (siehe
+  „Recovery vor neuem Budget“).
+* **Phasenbeharrung 3p→1p 480 s:** Die Bedingung für einen Abstieg muss nach
+  der openWB-Referenz 480 s dauerhaft erfüllt sein – Budgetmangel am
+  3p-Minimum oder Deckel 0. Wolkenlücken und kurze Lastspitzen lösen so
+  keinen Schützwechsel aus. Nur Schutzfunktionen verkürzen die Wartezeit auf
+  den kurzen Schutzpfad (`60 s`): Netzbezug über `wb_phase_down_grid_w`,
+  wbminSoC-Untergrenze, unautorisierte Akkustützung, Speichervorrang und
+  Floor-PV-only. Konfigurierbar über `wb_phase_down_delay_s` (mindestens
+  `60`).
+* **Hochschaltung 1p→3p nach evcc/openWB-Muster:** Eine Messgröße entscheidet
+  in beide Richtungen: der verfügbare Überschuss `P_avail` = Wallbox-Leistung
+  + Einspeisung (abzüglich `wb_phase_up_export_margin_w`) – Akku-Entladung
+  (eine Entladung des Speichers zählt als Defizit, nicht als Überschuss), als
+  gleitendes 30-s-Mittel. Liegt ein frisches, autorisiertes Wallbox-Budget des
+  Speicherreglers vor, zählt der größere Wert aus Messung und Budget (abzüglich
+  einer Akku-Entladung): Was der Speicher in seiner Ladekurve aufnimmt, ist für
+  die Wallbox verfügbar. Als Budget zählt die für genau diesen Ladepunkt
+  zugeteilte Leistung; sie enthält die laufende Ladeleistung bereits und wird
+  nicht zusätzlich addiert. Hochgeschaltet wird, wenn (a) dieser Überschuss das
+  3p-Minimum plus Puffer trägt (`4140 W + wb_phase_up_buffer_w`, an der openWB
+  Pro 300 W) und (b) die eine Phase ausgereizt ist. Sind Fahrzeug (Profil
+  3-phasig) und Wallbox phasenschaltfähig, gilt der Referenzstrom: der kleinere
+  Wert aus dem 1p-Deckel und dem aufgerundeten Quotienten (3p-Minimum + Puffer)
+  / 230 V (an der openWB Pro 20 A) – ausgereizt, wenn der gemessene Strom bis
+  auf 2 A daran steht oder der Zielstrom `P_avail / 230 V` darüber liegt. Ein
+  dynamischer 1p-Deckel (Schieflast, Phasenreserve) oberhalb der Referenz
+  verschiebt die Schwelle nicht mehr auf 7,4 kW. Ohne schaltfähiges Paar zählt
+  der wirksame 1p-Deckel (Zielstrom darüber oder gemessener Strom bis auf 1 A
+  daran). Eine 16-A-Wallbox (einphasig höchstens 3,68 kW) gilt damit schon ab
+  dem 3p-Minimum als ausgereizt. Geschaltet wird, sobald die Uhr
+  `wb_phase_up_forecast_hold_s` (Standard `60 s`, mindestens `30`) den Vorlauf
+  erreicht **oder** das Export-Wh-Konto (`wb_phase_up_export_wh`, Standard
+  120 Wh) voll ist. Die Uhr leckt: Bei erfüllter Bedingung läuft sie, bei
+  Wolkenlücken zählt sie zurück, und erst 15 s ohne Bedingung setzen sie auf 0
+  (hart nur bei Abstecken, Ladeende, Phasenwechsel oder anhaltendem
+  Netzbezug). Das Konto füllt sich mit dem Überschuss oberhalb des
+  Referenzstroms, eine Wolke zieht nur das ab, was drei Phasen fehlen würde,
+  und es sättigt bei der doppelten Schwelle. Netzbezug sperrt die
+  Hochschaltung erst, wenn er 30 s anhält; ein Blip von wenigen Sekunden oder
+  ein nur noch abklingender Rest des Netz-Wh-Zählers setzt weder Uhr noch
+  Konto zurück. Fehlen Messwerte (Wallbox-Strom, Netz, Speicher), gibt es
+  weder Auf- noch Abstieg.
+  Nach jedem bestätigten Phasenwechsel gilt die Sperre von 480 s (openWB Pro:
+  `openwb_pro_phase_wait_s`; E3DC-Direktvertrag: derselbe Wert, solange kein
+  eigener `wb_phase_change_hold_s` gesetzt ist) – sie ist die Beruhigung nach
+  dem Schalten, nicht ein Vorlauf davor. Während dieser Sperre steht die Uhr
+  auf 0 und das Konto hält seinen Stand: Vorlauf und Konto werden nach der
+  Sperre neu verdient, damit auf einen Abstieg kein sofortiger Wiederaufstieg
+  folgt. Optional bewertet die
+  Symmetrie-Klausel `wb_phase_up_symmetry_enable` (Standard aus) eine
+  einphasige Ladung ab dem Schieflastwert `grid_pcc_imbalance_max_a`
+  (Standard 20 A) als ausgereizt, damit die Einspeisung nicht einseitig auf
+  einer Netzphase reduziert wird; vor dem Einschalten ist zu klären, ob die
+  Unsymmetriegrenze des Netzbetreibers auch für die Einspeiseseite gilt.
 * **Recovery vor neuem Budget:** Eine mögliche ältere Ausgangsgeneration wird
   vor einem neuen Storage-Grant und vor jeder Supersession ausgewertet. Ein
   gestrandeter 0-A-Intent darf nur anhand seines eigenen Intent-/ACK-Paars und
@@ -395,6 +576,21 @@ Pfad bewährt:
   oder eine bestätigte einphasige Last wird weiterhin einphasig behandelt.
   Zwei tatsächlich genutzte Phasen werden nicht auf eine Phase reduziert.
   Ein Auftrag, die Phasen unverändert zu lassen, löst keine Umschaltung aus.
+* **Einphasig hinterlegte Fahrzeuge:** Ist für den Ladepunkt ein Fahrzeug mit
+  einer Phase hinterlegt, schaltet E3DC-Control die Phasen der openWB Pro
+  nicht um. Das Fahrzeug nutzt ohnehin nur eine Phase; ein Wechsel änderte
+  seine Ladeleistung nicht, unterbräche aber die Verhandlung mit dem Fahrzeug
+  und sperrte den nächsten Wechsel für 480 s. Die Box behält ihre Einstellung
+  (eine oder drei Phasen). Mindestleistung und Budget richten sich nach dem
+  Fahrzeug (6 A × 230 V = 1,38 kW), auch wenn die Box auf drei Phasen steht.
+  Der einphasige Stromdeckel greift nach den gemessenen aktiven Phasen, also
+  auch an einer Box im 3p-Modus. Ein einphasiges Fahrzeug an einem 3p-Ziel
+  gilt nicht als laufender Phasenwechsel. Misst die Box dagegen drei aktive
+  Phasen, etwa bei einem falsch hinterlegten Profil, gelten nach zwei
+  Messungen für den Rest der Stecksession drei Phasen für Mindestleistung,
+  Budget und Stromdeckel; reicht das Budget dafür nicht, endet die Ladung
+  nach den Nullbudget-Regeln des Startfensters. Das Fahrzeugprofil sollte
+  deshalb die tatsächliche Phasenzahl tragen.
 * **CP-Interrupt nur als Weckruf:** `cp_interrupt=true` wird nicht für den
   normalen Phasenwechsel genutzt. Er ist ein gezielter Wakeup, wenn ein
   angestecktes Fahrzeug trotz freigegebener Leistung eingeschlafen ist.
@@ -415,6 +611,252 @@ Pfad bewährt:
   öffnen. Der Auftrag selbst sendet keinen Gerätebefehl und ändert kein
   Budget. Preislimit, Nutzer-`Aus`, Not-Aus, Speicherreserve, Netzpunkt- und
   Hardwaregrenzen bleiben danach unverändert vorrangig.
+* **Neustart der openWB Pro:** Startet die openWB Pro selbst neu, etwa nach
+  einem Stromausfall oder einem manuellen Neustart, gilt bis zur ersten
+  erfolgreichen Abfrage durch das EMS allein die Einstellung der Wallbox. Je
+  nach Konfiguration beginnt sie sofort mit ihrem eigenen Ladestrom; im
+  Werkszustand lädt sie laut Hersteller mit maximaler Leistung. Mit aktivem
+  Heartbeat pausiert sie dagegen, bis sie wieder regelmäßig abgefragt wird.
+  Das EMS sendet in dieser Zeit keine Befehle. Sobald es den Status wieder
+  liest, übernimmt es eine laufende Ladung und regelt sie auf das aktuelle
+  Budget. Kurzer Netzbezug oder Akkuentladung direkt nach einem Neustart der
+  Wallbox geht deshalb auf die Wallbox zurück, nicht auf die Regelung. Die
+  Absenkung auf das Budget (ab 6 A) folgt mit dem ersten frischen Status, auch
+  während des Startfensters.
+
+#### Startfenster, Wiederholzyklus und Weckimpuls
+
+Beim Ladestart an einer openWB Pro können Budget-Einbrüche durch die eigene,
+im Hauswert nachlaufende Ladeleistung, ein `charge_state` ohne Leistung und
+die Readback-Latenz der Box zu 0-A-Schnitten, doppelten Kaltstarts, verfrühten
+Weckimpulsen und einem „Ladung beendet“ ohne SoC-Beleg führen. Der
+Wallbox-Manager führt deshalb je Stecksession ein Startfenster
+(`openwb_pro_start_window`, Vertrag
+`openwb_pro_session.start_window_contract`, Ein-Entscheider je Zyklus):
+
+- Zustände: `inactive` → `budget_wait` (angesteckt, Budget ≥ Mindestleistung
+  in 2 Frames) → Adoption eines stehenden Box-Angebots ohne Befehl, wenn es
+  ≤ clamp(cap, 6, Deckel) liegt, sonst genau ein Startbefehl 6 A
+  (`offer_pending`) → Readback ≥ 6 A setzt den Anker (`offer_frozen`) →
+  bis Anker + `openwb_pro_start_hold_s` kein 0 A und keine Anhebung →
+  `charging_confirmed` (2 Frames > 500 W oder > 5 Wh; erst hier werden die
+  Startbelege gelöscht) mit Anhebungen/Absenkungen ≥ 6 A im 30-s-Raster →
+  `regulating`. Ohne Ladung: `retry_wait` (Zyklen von
+  `openwb_pro_start_retry_cycle_s`, je Zyklus höchstens ein Weckimpuls), nach
+  drei Zyklen `exhausted` (Angebot bleibt stehen, Meldung „Fahrzeug lädt trotz
+  Freigabe nicht“, kein Weckimpuls mehr).
+- Absenkungen: Ein Strombefehl ab 6 A unter dem Angebot, das die Box frisch
+  zurückmeldet (Status höchstens 10 s alt; ein eigener, noch nicht
+  zurückgemeldeter Strombefehl begrenzt den Wert nach oben), passiert das
+  Fenster in jedem Zustand und auch außerhalb des Rasters, im Executor-Gate
+  wie im Direktpfad. An der Wattgrenze wird eine solche Absenkung nie
+  verworfen, höchstens auf 6 A geklemmt. Das betrifft etwa ein übernommenes
+  Box-Angebot über dem Budget oder eine Box, die nach ihrem eigenen Neustart
+  mit höherem Strom lädt. 0 A, `force_state 1` und Anhebungen bleiben Sache
+  des Fensters. Kein Beleg für eine Absenkung sind ein veralteter Status und,
+  bis zur Rückmeldung der Box (höchstens 20 s), ein eigenes 0 A oder ein
+  anderer eigener Ausgang wie Phasenziel oder Weckimpuls; dann gilt die
+  Fensterregel ohne Absenkungsbeleg.
+- Nullbudget: ein Box-Angebot ≥ 6 A bleibt `openwb_pro_start_hold_s` stehen,
+  dann 0 A als lösbarer Anker (`off_no_budget`, „Wartet auf PV-Budget“); mit
+  Budget in 2 Frames erneut 6 A. Bietet die Box 0 A, wird nichts geschrieben.
+- Nullbudget nach bestätigter Ladung: In `charging_confirmed` läuft eine
+  eigene Nullbudget-Uhr. 0 A wird erst frei, wenn das Budget 60 s lang
+  durchgehend fehlt oder in dieser Nullbudget-Episode 100 Wh aus dem Netz
+  bezogen wurden (Grund `charging_confirmed_zero_released`); ein Frame mit
+  Budget setzt Uhr und Wh-Zähler zurück, Netzbezug mit Budget (Hauslast,
+  Akkustützung) zählt nicht. Fehlt das Budget, ist die Ladung bestätigt
+  (> 500 W) und steht das Angebot über dem Mindeststrom, darf der Manager
+  vorher im 30-s-Raster genau einen Befehl auf den Mindeststrom senden (Grund
+  `minimum_hold_reduction`). Diese Absenkung bindet sich an das Box-Readback
+  (ohne Readback ≥ 6 A keine Absenkung) und passiert Strom-, Zuteilungs- und
+  Budgettor nur als dieser eine Befehl; sie ist nie 0 A.
+- Wiederanlauf als Einladung: Sendet der Manager selbst 0 A (Nullbudget,
+  Prioritäts-, Pre-Dump- oder `wbminsoc`-Stopp, Stopp der Defizit-Kaskade,
+  Direktpfad), fällt das Fenster aus `regulating` oder `charging_confirmed`
+  nach `off_no_budget` (Grund `regulating_offer_ended` bzw.
+  `confirmed_offer_ended`: Box < 6 A in zwei frischen Frames, kein
+  `charge_state`, ≤ 100 W).
+  Die nächste Budgetfreigabe eröffnet wieder das 6-A-Fenster
+  (`offer_pending` → `offer_frozen` → `charging_confirmed`, Anhebungen im
+  30-s-Raster); es gibt keinen Sprung auf den Budgetstrom. Ein 0 A aus einer
+  Phasensequenz oder ein box-seitiger Abfall ohne eigenen Befehl lässt den
+  Zustand unverändert. Nutzerpause und Nutzer-`Aus` markieren das Fenster
+  ebenso; nach der Freigabe zählt eine zuvor bestätigte Ladung nicht als
+  Ablehnung (Zyklen beginnen bei null).
+- Ohne Readback nach 20 s wird derselbe Befehl höchstens zweimal wiederholt,
+  danach `box_unresponsive` (60 s Pause). Nullt die Box das Angebot in zwei
+  frischen Frames (außerhalb des eigenen CP-Nachlaufs), folgt ein
+  Wiederangebot 6 A mit neuem Anker.
+- Harte Kanten (0 A auch im Fenster): Nutzer-Aus, Pause, Sperre, Notaus,
+  Hausanschluss/Peak-Shaving/1p-Deckel unter 6 A, Ende eines geplanten
+  Ladefensters, bestätigte Trennung, ungültiger Boxstatus in zwei Frames,
+  Ladeende-Vertrag nach bestätigter Ladung. Keine Kanten: eigener CP-Impuls,
+  Phasenreservierung/-sequenz, Budget-/Speicher-Hard-Block, Prioritätswechsel,
+  ein einzelner ungültiger Frame.
+- Weckimpuls nur aus dem Wake-up-Tick und nur aus dem Readback: Angebot ≥ 6 A,
+  `charge_state` falsch, ≤ 100 W, kein aktiver CP, ≥ 60 s nach `phasetarget`,
+  frühestens Anker + `openwb_pro_start_cp_grace_s` (nie unter 60 s, auch mit
+  Fahrzeugprofil), ein Impuls je Zyklus, höchstens
+  `wb_openwb_start_cp_retries` je Stecken. Ein CP ersetzt nie einen Strombefehl.
+- HLC-Faktor: meldet die Box `evse_signaling` ≠ `basic`/`basic iec61851`
+  (etwa `basic+fake_highlevel_dc`), verdoppeln sich Fenster, Zyklus und Karenz;
+  reines PWM bleibt bei Faktor 1.
+- Phasenwahrheit der Stecksession (`openwb_pro_session_phase_latch`): zwei
+  bestätigte Frames des Box-Ziels bzw. gemessener Phasen latchen 1p/3p für
+  Zuteilung, Speicher-Hard-Block und Direktphasen; der eigene CP-Impuls, ein
+  einzelner Stecker-Frame oder ein Ziel-0-Glitch fallen nicht auf das
+  3p-Fahrzeugprofil zurück. Nach einem eigenen Phasenwechsel zählen die
+  Belege, sobald die Box das neue Ziel frisch bestätigt hat, und nur für
+  dieses Ziel. Bei einem einphasig hinterlegten Fahrzeug gilt ein
+  Leerlaufziel 3 der Box als eine Phase, bis die Stecksession drei aktive
+  Phasen misst.
+- Hauswert: die frische Ladeleistung von openWB/openWB Pro/go-e wird
+  immer vom Hauswert abgezogen (Deadband 100 W, Stale-Halt 30 s), unabhängig
+  von einer E3DC-Wallbox. Das Speicherbudget bleibt bindend.
+- „Ladung beendet“ entsteht nur noch bei `exhausted` mit frischem SoC ≥ Ziel
+  oder über den Ladeende-Vertrag nach bestätigter Ladung; sonst zeigt die
+  Session „Start abgelehnt – Wiederholung hh:mm (Zyklus n/3)“.
+- Nach bestätigter Ladung schützt das Fenster nur noch den Anlauf, es bremst
+  nicht die Regelung: Das eingefrorene Angebot ist stets das, was die Box
+  zurückmeldet. Ist der gemerkte Wert darüber hinausgelaufen, weil eine
+  Schreibung die Box nicht erreicht hat, wird er nach dem 30-s-Raster auf die
+  Rückmeldung zurückgeholt – eine Anhebung darüber gilt nie als Absenkung.
+  Steht ein Phasenwechsel an, während das Fahrzeug bestätigt lädt (> 500 W),
+  liegen Anker **und** bestätigte Ladung jeweils mindestens 30 s zurück und
+  steht die Box wirklich auf dem gemerkten Angebot (frische Rückmeldung), ist
+  der Start vorbei: das Phasenziel wird freigegeben. Das Fenster geht erst
+  dann auf `regulating`, wenn der Phasenwechsel wirklich angelaufen ist;
+  bricht er vorher ab, bleibt der Anlaufschutz vollständig stehen. Vor der
+  bestätigten Ladung bleibt beides gesperrt – dort ist ein Phasenziel der
+  Abbruch des laufenden Startversuchs.
+- Diagnose: `wb_details[].openwb_pro_start_window` (Zustand, Anker, Angebot,
+  Zyklus, Haltegründe), `openwb_pro_start_window_output_gate`,
+  `openwb_pro_session_phase_latch`, Statusfelder
+  `openwb_pro_start_window_*`; Persistenz in
+  `wallbox_phase_transition_state.json` je Stecksession.
+- Laufende Ladung beim Anstecken-Zustand: Läuft in `budget_wait` bereits
+  eine Ladung (zwei Frames > 500 W bei stehendem Box-Angebot, etwa nach
+  Manager-Neustart, Force-Start oder einer Lücke > 300 s), wird das Angebot
+  übernommen: deckt das Budget es (≤ clamp),
+  läuft das Fenster als `charging_confirmed`; liegt es darüber, gilt sofort
+  `regulating`, damit die Regelung ohne Startfenster absenken darf. Vor dem
+  eigenen Angebot sind Absenkungen ≥ 6 A bei > 500 W sofort erlaubt, 0 A
+  nie. Weiche EMS-Stopps (Priorität, Pre-Dump, wbminSoC, Zuteilung,
+  Nullbudget) halten auch als typisierte Stopps im Fenster; harte Gründe
+  stoppen unverändert. Der Fast-Pfad und das Executor-Gate lesen vor der
+  Materialisierung den persistierten Fensterkern derselben Stecksession
+  (konservativ: keine Anhebung, kein 0 A; Absenkungen unter das frisch
+  zurückgemeldete Angebot passieren wie oben). Der Kern wird bei jedem
+  Zustandsübergang und im aktiven Fenster alle 120 s gesichert, damit der
+  Fensterrest einen Neustart überlebt.
+
+#### Einphasiger Stromdeckel aus Netzphasenmessung
+
+Ohne phasenaufgelöste Strommessung am Netzpunkt bleibt einphasiges Laden an
+einer openWB Pro fest auf 20 A gedeckelt. Freigegebene Messbasis für einen
+höheren Deckel ist der Bezugsstrom je Netzphase aus dem E3DC-Wurzelzähler:
+Wirkleistung je Phase (`grid_p1..3`, nur Bezug, Einspeisung zählt nie als
+Spielraum) geteilt durch die vom Wechselrichter gemessene Phasenspannung
+(`ac0..2_v`, plausibel 180–260 V und jünger als 10 s, sonst 230 V) plus der
+von der openWB Pro gemessene Wallbox-Strom.
+
+* **Formeln** (k = zugeordnete Netzphase aus `wb<n>_grid_phase`, m = Bezug je
+  Phase in A, I_wb = gemessener Wallbox-Strom, PF = `wb_pcc_power_factor_margin`):
+  Fremdlast `I_fremd = max(0, m_k − I_wb)`, wirksamer Bezug
+  `I_eff = min(m_k, I_wb) + I_fremd / PF`, Headroom
+  `H_k = (Sicherung_k − Reserve_k) − I_eff` (vorzeichenbehaftet: bei Überlast
+  fällt der Deckel sofort unter den Ist-Strom), `cap_sich = I_wb + H_k`.
+* **Harte Schranken:** Nutzergrenze `wb<n>_openwb_pro_1p_max_amp`,
+  Wallboxgrenze, Betriebslimit Sicherung − Reserve; ganze Ampere, unter 6 A
+  → 0 A (Wallbox pausiert, Grund `phase_headroom_exhausted`).
+* **Schieflast-Wächter:** `cap_imb = max(20 A, I_wb + (grid_pcc_imbalance_max_a −
+  (m_k − min_{j≠k} m_j)))` (Standard 20 A ≙ 4,6 kVA). Bewertet wird die
+  Differenz der Bezugsströme am Netzpunkt, Einspeisung zählt als 0 A – nicht
+  die vorzeichenbehaftete Differenz der Phasenleistungen. Ohne jeden Ausgleich
+  (leerer Akku, keine PV) bleibt es bei 20 A. Entlädt oder speist das E3DC
+  dagegen symmetrisch über alle drei Phasen, sinkt der Bezug der Ladephase,
+  während die einspeisenden Nachbarphasen mit 0 A zählen: Der Deckel steigt
+  dann nachts auf etwa 28–29 A und tagsüber je nach Einspeisung bis zur
+  eingestellten Grenze. Mehr als 20 A entstehen auch, wenn beide
+  Nachbarphasen mehr Bezug haben als die Ladephase ohne Wallbox-Strom
+  (einphasige Verbraucher). Gleichmäßige dreiphasige Last (3p-Wallbox,
+  Wärmepumpe) hebt den Deckel nicht an, solange die Ladephase Bezug hat;
+  speisen die Nachbarphasen ein, kann sie ihn sogar senken. Wer einphasig
+  strikt bei 20 A bleiben muss, lässt `wb<n>_openwb_pro_1p_max_amp` leer.
+* **Fail-closed (20 A bzw. Nutzer-/Wallboxgrenze darunter):** Messbasis
+  `wb_pcc_phase_basis = off`, fehlende/widersprüchliche Zuordnung, nur der
+  stille Standard 35 A als Hausabsicherung (`grid_limit_not_explicit`),
+  ungültiges Limit/Reserve, Nachweis `pending`/`unverified`,
+  Wurzelzähler-Widerspruch (`Grid_PM_Delta_Rule_Effective`), ungültige oder
+  über 10 s alte Netzphasen-Messung (`_ts`), ungültiger/über 10 s alter
+  openWB-Status, kein Live-Snapshot im Zyklus (`pcc_measurement_basis_missing`),
+  Ausnahme im Vertrag (`contract_exception`).
+* **Rampe:** Anhebung +1 A je Regelschritt (`wb_stable_follow_hold_s`,
+  mindestens 4 s) und nur bei Headroom ≥ 1,5 A; Absenkung sofort, danach
+  dreifacher Nachlauf ohne Anhebung. Neue Stecksession, bestätigter
+  Phasenwechsel und jeder Fail-closed-Zyklus starten wieder bei 20 A
+  (20 → 32 A in rund 48–60 s).
+* **Software-Nachweis der Zuordnung:** E3DC-Control bestätigt
+  `wb<n>_grid_phase` beim einphasigen Laden selbst. Aus Plateaus des
+  Wallbox-Stroms (≥ 3 Stichproben über ≥ 10 s, Spannweite ≤ 0,5 A) prüft es
+  statisch `P_load_k / (I_wb · U_k) ≥ 0,8` (ab 8 A) und an Stromsprüngen
+  ≥ 3 A, ob die Laständerung `ΔP_j / (ΔI · U_j)` auf der zugeordneten Phase
+  erscheint (0,6–1,4) und auf den anderen nicht (< 0,5). Ladestart/-stopp
+  (Sprung ≥ 10 A) zählt doppelt. `verified` verlangt Statik ok und Sprünge
+  mit Gewicht ≥ 2 (mehr als das Doppelte der Widersprüche); `unverified`
+  entsteht nur aus Widersprüchen auf ein und derselben Fremdphase (Gewicht ≥ 2
+  oder ein Widerspruch plus 60 s Statik-Fehlschlag mit Trägerphase) und
+  bleibt bis zu einer Konfigurationsänderung bestehen (Dashboard rot:
+  „Phasenzuordnung WB2 stimmt nicht: Last auf L1 statt L3“). Ein reiner
+  Statik-Fehlschlag (z. B. externer AC-Zusatz-Wechselrichter auf der Phase)
+  bleibt `pending`. Der Nachweis liegt in
+  `data/wallbox_phase_mapping_state.json` (Schema
+  `wallbox_phase_mapping_proof_v1`, höchstens fünf Sprünge, überlebt Neustart
+  und neue Stecksession); Ändern von `wb<n>_grid_phase`/`_rotation` oder
+  Löschen der Datei setzt ihn zurück. Die Phasenlast ist die signierte Bilanz
+  `max(0, grid_p_j + ac_j_w)`, damit Einspeisung auf einer Fremdphase keinen
+  falschen Nachweis liefert.
+* **Geltung im 3p-Modus:** Der Deckel gilt für jeden 1p-Sollwert und
+  zusätzlich, wenn der Treiber nur eine aktive Phase meldet (einphasiges
+  Fahrzeug an einer Box im 3p-Modus). Drei gemessene und aktive Phasen heben
+  ihn auf.
+* **Energie-Phasenpolitik:** „Strom zuerst, dann Phasen“ bewertet die eine
+  Phase gegen den wirksamen Deckel (Vertrag, sonst min(20 A, statisch),
+  zusätzlich ein bestätigtes 1p-OBC-Limit des Fahrzeugs), nicht gegen den
+  statischen Nutzerwert; für die Hochschaltung zählt der Deckel ohne den
+  Rampengrund (Rohdeckel), sonst wäre „ausgereizt“ in jeder Anhebung trivial
+  wahr; für ein phasenschaltfähiges Paar gilt der kleinere Referenzstrom aus
+  Deckel und 3p-Minimum plus Puffer. Das Export-Wh-Konto (Standard 120 Wh)
+  füllt sich mit dem Überschuss oberhalb des Referenzstroms; Vorlauf 60 s oder
+  volles Konto, Sperre 480 s nach dem Wechsel (siehe „Hochschaltung 1p→3p nach
+  evcc/openWB-Muster“).
+* **Gruppenverteiler:** Der Zuteilungs-Slot eines 1p-only-Fahrzeugs an einer
+  openWB Pro ist höchstens der wirksame Deckel (20 A → 4,6 kW statt 7,36 kW);
+  phasenfähige Fahrzeuge bleiben unverändert.
+* **Diagnose:** `wb_details[].openwb_pro_one_phase_cap_contract` (Deckel,
+  Rohdeckel, Grund, Bezugsvektor, Spannungen, Fremdlast, Headroom, Schieflast,
+  Rampe, Frische, Zuordnung), `openwb_pro_phase_mapping_proof` (Zustand,
+  Statik, Sprünge, Evidenz), `openwb_pro_one_phase_cap_ramp` und
+  `phase_energy_policy.one_phase_max_source` in `ramdisk/wallbox_native.json`
+  und `wallbox_decision_latest.json`; Dashboard-Kurzzeile je Slot, z. B.
+  „1p 27 A · L3 bestätigt“ (während der Rampe „1p 26 A → 32 A · L3
+  bestätigt“, am Schieflast-Wächter „1p 20 A · Schieflast · L3 bestätigt“,
+  Zuordnung „wird geprüft“ oder rot „widerlegt“). Die Einzelheiten stehen im
+  Tooltip der Zeile, z. B. „1p-Deckel WB1 27 A: Sicherung 38 A − Fremdlast
+  L3 11 A (Bezug 27 A, 230 V) · Zuordnung bestätigt“ („Sicherung“ ist das
+  Betriebslimit Hausabsicherung − Reserve, im Beispiel 40 A − 2 A; mit
+  `grid_wallbox_reserve_amps = 10` stünde dort 30 A).
+* **Konfiguration:** `wb_pcc_phase_basis` (Standard `e3dc_pm_active_power`,
+  `off` = fest 20 A), `wb_pcc_power_factor_margin` (0,8–1,0, Standard 0,9),
+  `grid_pcc_imbalance_max_a` (10–32 A, Standard 20) im Config-Editor unter
+  Wallbox → „Hausanschluss & gemeinsame Grenzen“ → „Einphasiger Deckel openWB
+  Pro (Messbasis)“; Voraussetzung ist eine ausdrücklich eingetragene
+  `grid_max_amps` (oder `grid_max_amps_l<k>`). Leere Phasenfelder
+  `grid_max_amps_l<k>` / `grid_wallbox_reserve_amps_l<k>` (der Editor
+  speichert sie als leeren Text) gelten wie beim Validator als nicht gesetzt
+  – der Skalar gilt; nur ein nicht numerischer Eintrag sperrt den Deckel
+  (`grid_contract_invalid`).
 
 ### openWB Software 2.x als Primary
 
@@ -531,3 +973,18 @@ Grundeinstellung frei, z.B. 32 A und PV/Sonnenmodus bei E3DC. Danach wird nur
 noch beobachtet, bis wieder ein aktiver Modus gewählt wird. Ein Neustart, ein
 kurzer Verbindungsverlust oder "kein Fahrzeug verbunden" löst keine erneute
 Freigabe aus.
+
+### Logzeilen im Wallbox-Manager lesen
+
+| Meldung | Bedeutung | Handlung |
+|---|---|---|
+| `WB1 START: 0A -> 6A` / `Deckel: 6A -> 32A` | Freigabe gesendet, Stromdeckel gesetzt. | Keine; echtes Laden zeigt erst der Status „Lädt“ mit Leistung. |
+| `E3DC-Startimpuls wiederholt: 32A bei 0W` | Freigabe steht, das Fahrzeug nimmt keinen Strom an. | Fahrzeug schläft oder hat die Session beendet; E3DC kennt keinen CP-Interrupt über RSCP, meist hilft nur Neustecken. |
+| `Netzladefenster beendet: Wallbox gestoppt` | Geplanter Slot vorbei, Stop-Toggle gesendet. | Keine. |
+| `Netzladefenster beendet: Fahrzeug hat im Fenster nicht geladen …` | Freigabe stand, es wurde nie geladen; Freigabe auf Mindeststrom ohne Toggle zurückgenommen. | Keine; ein schlafendes Fahrzeug wird nicht angestoßen. |
+| `Flankengate: stop_toggle_downgraded` | Stop angefordert, aber ohne belegtes Laden wird kein Toggle gesendet. | Keine; Diagnosehinweis. |
+| `wb_pv_budget.json veraltet (Ns) – drossle WB auf 6A` | Storage Manager hat 15–45 s nichts geschrieben. | Storage-Manager-Journal prüfen, wenn es sich häuft. |
+| `wb_pv_budget.json Timeout (Ns) – stoppe WB` | Storage Manager > 45 s ohne Budgetdatei. | Storage Manager läuft nicht oder hängt; Dienst prüfen. |
+| `wb_pv_budget.json Lesefehler überbrückt (…)` | Lesezugriff traf den atomaren Austausch; der letzte gültige Stand zählt weiter. | Keine; nur die Häufigkeit ist ein Hinweis auf stark ausgelastete SD-Karte/CPU. |
+| `wb_pv_budget.json nicht lesbar und kein gültiger Vorstand` | Datei seit Prozessstart nie gültig gelesen. | Ramdisk und Storage Manager prüfen. |
+| `Plan verbraucht` / `Ladeplanung auf 0 gesetzt` | Manueller Ladeplan ohne Wiederholung ist abgearbeitet. | Bei täglichem Bedarf „Täglich wiederholen“ einschalten. |

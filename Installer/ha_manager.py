@@ -204,6 +204,9 @@ SECRET_CONFIG_EXACT_KEYS = {
     "rscp_password",
     "telegram_chat_id",
     "web_pin",
+    # Bluelink-Konto (E-Mail) und PIN bleiben lokal; das Passwort greift über "password".
+    "bluelink_user",
+    "bluelink_pin",
 }
 
 
@@ -1475,7 +1478,7 @@ def get_managed_services(action="start"):
 def _legacy_manage_services_unverified(action="start"):
     """Startet oder stoppt alle Dienste, die im HA-Verbund exklusiv sein muessen."""
     if action not in ("start", "stop"):
-        logger.error(f"Ungueltige Service-Aktion: {action}")
+        logger.error(f"Ungültige Service-Aktion: {action}")
         return
 
     for srv in get_managed_services(action):
@@ -1489,7 +1492,7 @@ def _legacy_manage_services_unverified(action="start"):
             if action == "start" and active:
                 continue
             if action == "start" and not service_is_enabled(srv):
-                logger.info(f"HA start uebersprungen (deaktiviert): {srv}")
+                logger.info(f"HA start übersprungen (deaktiviert): {srv}")
                 continue
 
             result = subprocess.run(
@@ -1621,7 +1624,7 @@ def _legacy_main_loop_unsafe():
             continue
 
         if not peer_ip:
-            logger.critical(f"HA-Konfiguration ungueltig: ha_peer_ip={raw_peer_ip!r} ist keine IP-Adresse.")
+            logger.critical(f"HA-Konfiguration ungültig: ha_peer_ip={raw_peer_ip!r} ist keine IP-Adresse.")
             if mode == "slave":
                 manage_services("stop")
             write_status(mode, "config_error_invalid_peer", False, last_sync)
@@ -1630,7 +1633,7 @@ def _legacy_main_loop_unsafe():
 
         if peer_points_to_self(peer_ip):
             logger.critical(
-                f"HA-Konfiguration ungueltig: peer_ip={peer_ip} zeigt auf diesen Pi. "
+                f"HA-Konfiguration ungültig: peer_ip={peer_ip} zeigt auf diesen Pi. "
                 "HA-Aktionen werden blockiert."
             )
             if mode == "slave":

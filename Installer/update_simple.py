@@ -1594,6 +1594,274 @@ def _write_target_venv_marker(
     return written.returncode == 0
 
 
+RELEASE_VENV_KEEP_COUNT = 3
+RAMDISK_FSTAB_PATH = Path("/etc/fstab")
+RAMDISK_SIZE_OPTION = "size=64M"
+LEGACY_RAMDISK_SIZE_OPTIONS = ("size=32M",)
+_RELEASE_VENV_NAME = re.compile(r"^venv_e3dc_release_[a-z0-9_]{1,80}(?:_[1-9][0-9]?)?$")
+LEGACY_VENV_NAMES = (".venv_e3dc",)
+# Hashliste des Watchdog-Bündels (piguard), identisch mit install_watchdog.MANIFEST_PATH.
+# Sie nennt den Interpreter, mit dem pi_guard.sh und boot_notify.sh laufen.
+WATCHDOG_MANIFEST_PATH = Path("/usr/local/lib/e3dc-control-watchdog.sha256")
+
+
+def _watchdog_bound_venvs(home: Path, manifest_path: Path = WATCHDOG_MANIFEST_PATH) -> set[Path] | None:
+    """Liefert die venvs im Home, deren Interpreter das Watchdog-Bündel bindet.
+
+    Ohne installiertes Bündel ist die Menge leer. Ist die Hashliste vorhanden,
+    aber nicht lesbar, liefert die Funktion ``None``: Dann ist unbekannt, welches
+    venv der Watchdog braucht, und die venv-Bereinigung unterbleibt.
+    """
+
+    home = Path(os.path.abspath(home))
+    try:
+        text = manifest_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return set()
+    except (OSError, UnicodeError):
+        return None
+    bound: set[Path] = set()
+    for line in text.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        interpreter = Path(parts[1].strip().lstrip("*"))
+        if interpreter.parent.name != "bin" or not interpreter.name.startswith("python"):
+            continue
+        venv = Path(os.path.abspath(interpreter.parent.parent))
+        if venv.parent == home:
+            bound.add(venv)
+    return bound
+
+
+def _release_venv_marker_mtime(venv: Path, install_uid: int) -> float | None:
+    """Liefert die Erstellzeit eines vom Updater markierten Release-venvs."""
+
+    try:
+        root = venv.lstat()
+        marker = (venv / ".e3dc-target-venv.json").lstat()
+    except OSError:
+        return None
+    if (
+        not stat.S_ISDIR(root.st_mode)
+        or stat.S_ISLNK(root.st_mode)
+        or root.st_uid != install_uid
+        or not stat.S_ISREG(marker.st_mode)
+        or marker.st_nlink != 1
+        or marker.st_uid != install_uid
+        or marker.st_size > 16384
+    ):
+        return None
+    return float(marker.st_mtime)
+
+
+def _select_stale_release_venvs(
+    home: Path,
+    active_venv: Path,
+    install_uid: int,
+    *,
+    keep_count: int = RELEASE_VENV_KEEP_COUNT,
+    protected: tuple[Path, ...] | set[Path] | frozenset[Path] = (),
+) -> tuple[list[Path], list[Path]]:
+    """Wählt markierte Release-venvs, die kein aufbewahrtes Backup mehr benötigt.
+
+    Behalten werden das aktive venv und die jüngsten weiteren Kandidaten bis
+    ``keep_count``; das entspricht den aufbewahrten Update-Backup-Familien,
+    deren Rückspielung ihr damaliges venv voraussetzt. Kandidaten sind nur
+    direkte, nutzereigene Unterordner des Homes mit Updater-Marker. Unmarkierte
+    Alt-venvs werden getrennt gemeldet und nie ausgewählt. Ein venv aus
+    ``protected`` (etwa vom Watchdog-Bündel gebunden) wird weder ausgewählt noch
+    als ungenutztes Alt-venv gemeldet.
+    """
+
+    home = Path(os.path.abspath(home))
+    active = Path(os.path.abspath(active_venv))
+    keep_count = max(1, int(keep_count))
+    protected_paths = {Path(os.path.abspath(path)) for path in protected}
+    candidates: list[tuple[float, str, Path]] = []
+    legacy: list[Path] = []
+    try:
+        names = sorted(os.listdir(home))
+    except OSError:
+        return [], []
+    for name in names:
+        path = home / name
+        if name in LEGACY_VENV_NAMES:
+            try:
+                info = path.lstat()
+            except OSError:
+                continue
+            if (
+                stat.S_ISDIR(info.st_mode)
+                and info.st_uid == install_uid
+                and path != active
+                and path not in protected_paths
+                and (path / "pyvenv.cfg").is_file()
+            ):
+                legacy.append(path)
+            continue
+        if not _RELEASE_VENV_NAME.match(name):
+            continue
+        if path in protected_paths:
+            continue
+        marker_mtime = _release_venv_marker_mtime(path, install_uid)
+        if marker_mtime is None:
+            continue
+        candidates.append((marker_mtime, name, path))
+    others = [
+        path
+        for _mtime, _name, path in sorted(candidates, key=lambda item: (-item[0], item[1]))
+        if path != active
+    ]
+    stale = others[max(0, keep_count - 1):]
+    return stale, legacy
+
+
+def _prune_stale_release_venvs(install_user: str, active_venv: Path) -> list[str]:
+    """Entfernt nach bestätigtem Start nicht mehr benötigte Release-venvs.
+
+    Läuft ausschließlich als Abschlussbereinigung; ein Fehler ergibt eine
+    Warnung, nie einen Updateabbruch. Gelöscht wird als Installationsnutzer
+    über denselben eng gebundenen Pfad wie beim Rückbau eines fehlgeschlagenen
+    Kandidaten.
+    """
+
+    warnings: list[str] = []
+    try:
+        account = pwd.getpwnam(str(install_user))
+        home = Path(account.pw_dir)
+        active = Path(os.path.abspath(active_venv))
+        if not home.is_absolute() or not home.is_dir() or active.parent != Path(os.path.abspath(home)):
+            return warnings
+        try:
+            from Installer.backup_retention import UPDATE_BACKUP_KEEP_COUNT
+
+            keep_count = max(1, int(UPDATE_BACKUP_KEEP_COUNT))
+        except Exception:
+            keep_count = RELEASE_VENV_KEEP_COUNT
+        watchdog_bound = _watchdog_bound_venvs(home)
+        if watchdog_bound is None:
+            warnings.append(
+                "Die Bereinigung alter Python-Umgebungen wurde übersprungen: Die Bindung "
+                "des Watchdog-Bündels ist nicht lesbar; alle Python-Umgebungen bleiben erhalten."
+            )
+            return warnings
+        stale, legacy = _select_stale_release_venvs(
+            home,
+            active,
+            account.pw_uid,
+            keep_count=keep_count,
+            protected=watchdog_bound,
+        )
+        for venv in sorted(watchdog_bound):
+            if venv != active and venv.is_dir():
+                print(
+                    f"[HINWEIS] Die Python-Umgebung {venv} wird noch vom Watchdog (piguard) "
+                    "genutzt und bleibt erhalten. Neu binden: e3dc-setup, Menü 15 "
+                    "„Watchdog & Telegram konfigurieren“ → „Komplett neu installieren / reparieren“.",
+                    flush=True,
+                )
+        if not stale and not legacy:
+            return warnings
+        runuser = _runuser_binary()
+        for venv in stale:
+            if _remove_created_target_venv_best_effort(runuser, install_user, home, venv):
+                print(f"[OK] Nicht mehr benötigte Python-Umgebung entfernt: {venv}", flush=True)
+            else:
+                warnings.append(
+                    f"Die nicht mehr benötigte Python-Umgebung {venv} konnte nicht entfernt "
+                    f"werden; sie kann manuell gelöscht werden: rm -rf {shlex.quote(str(venv))}"
+                )
+        for venv in legacy:
+            print(
+                f"[HINWEIS] Das Alt-venv {venv} wird nicht mehr verwendet und kann manuell "
+                f"entfernt werden: rm -rf {shlex.quote(str(venv))}",
+                flush=True,
+            )
+    except Exception as exc:
+        detail = str(exc).strip() or exc.__class__.__name__
+        warnings.append(
+            "Die Bereinigung alter Python-Umgebungen wurde übersprungen: " + detail
+        )
+    return warnings
+
+
+def _migrated_fstab_ramdisk_line(line: str) -> str | None:
+    """Liefert die auf 64M migrierte Zeile, wenn sie unser 32M-tmpfs-Eintrag ist."""
+
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    fields = stripped.split()
+    if len(fields) < 4 or fields[1] != str(RAMDISK_PATH) or fields[2] != "tmpfs":
+        return None
+    options = fields[3].split(",")
+    if RAMDISK_SIZE_OPTION in options:
+        return None
+    legacy = [option for option in options if option in LEGACY_RAMDISK_SIZE_OPTIONS]
+    if len(legacy) != 1:
+        return None
+    # Nur das Größen-Token ersetzen; Nutzerabstände und übrige Optionen bleiben.
+    return line.replace(legacy[0], RAMDISK_SIZE_OPTION, 1)
+
+
+def _migrate_ramdisk_size() -> list[str]:
+    """Hebt unsere 32M-RAM-Disk auf 64M: fstab-Zeile, daemon-reload, Live-Remount.
+
+    Best effort nach bestätigtem Start: Ein Fehler ergibt eine Warnung. Eine
+    fremde Größe oder ein fremder Eintrag bleibt unangetastet. Ein Remount
+    eines tmpfs mit neuer Größe behält den Inhalt.
+    """
+
+    warnings: list[str] = []
+    try:
+        info = RAMDISK_FSTAB_PATH.lstat()
+        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid not in (0, os.geteuid()):
+            return warnings
+        lines = RAMDISK_FSTAB_PATH.read_text(encoding="utf-8").splitlines(keepends=True)
+        migrated_index = -1
+        for index, line in enumerate(lines):
+            migrated = _migrated_fstab_ramdisk_line(line)
+            if migrated is not None:
+                lines[index] = migrated
+                migrated_index = index
+                break
+        if migrated_index < 0:
+            return warnings
+        payload = "".join(lines).encode("utf-8")
+        descriptor, temporary = tempfile.mkstemp(prefix=".fstab.e3dc-", dir=str(RAMDISK_FSTAB_PATH.parent))
+        try:
+            os.write(descriptor, payload)
+            os.fsync(descriptor)
+            os.fchmod(descriptor, stat.S_IMODE(info.st_mode))
+            os.fchown(descriptor, info.st_uid, info.st_gid)
+        finally:
+            os.close(descriptor)
+        try:
+            os.replace(temporary, RAMDISK_FSTAB_PATH)
+        except OSError:
+            os.unlink(temporary)
+            raise
+        print("[OK] RAM-Disk in /etc/fstab auf 64M gesetzt.", flush=True)
+        _run(["/usr/bin/systemctl", "daemon-reload"], timeout=60)
+        if _probe_ramdisk_tmpfs():
+            remount = _run(
+                ["/usr/bin/mount", "-o", "remount," + RAMDISK_SIZE_OPTION, str(RAMDISK_PATH)],
+                timeout=30,
+            )
+            if remount.returncode == 0:
+                print("[OK] RAM-Disk läuft ab sofort mit 64M.", flush=True)
+            else:
+                warnings.append(
+                    "Die RAM-Disk ist in /etc/fstab auf 64M gesetzt, der Live-Remount schlug fehl "
+                    f"({(remount.stderr or remount.stdout or '').strip()}); die neue Größe gilt ab dem nächsten Neustart."
+                )
+    except Exception as exc:
+        detail = str(exc).strip() or exc.__class__.__name__
+        warnings.append("Die RAM-Disk-Vergrößerung auf 64M wurde übersprungen: " + detail)
+    return warnings
+
+
 def _remove_created_target_venv_best_effort(
     runuser: Path,
     install_user: str,
@@ -1664,6 +1932,9 @@ def _repair_managed_venv_pip_packages(
         "--no-input",
         "--quiet",
         "--prefer-binary",
+        # Kein Wheel-Cache im Home des Installationsnutzers; jede Installation
+        # ist ohnehin an das Release gebunden.
+        "--no-cache-dir",
     ]
     install_targets = missing if venv_preexisted else packages
     if install_targets:
@@ -1857,6 +2128,10 @@ def _repair_packages(
                 "-y",
                 "--no-remove",
                 "--no-upgrade",
+                # Die in diesem Lauf geladenen .deb-Dateien nicht im apt-Cache
+                # behalten; fremde Cache-Inhalte bleiben unangetastet.
+                "-o",
+                "APT::Keep-Downloaded-Packages=false",
                 "--",
                 *missing,
             ],
@@ -7962,6 +8237,10 @@ def perform_update(
                     lock_descriptor,
                 )
             )
+            warnings.extend(
+                _prune_stale_release_venvs(install_user, venv_python.parent.parent)
+            )
+            warnings.extend(_migrate_ramdisk_size())
         except UpdateFailure as exc:
             if cutover_started:
                 state, recovery_solution = _safe_recover_failed_cutover(

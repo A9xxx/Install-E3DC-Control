@@ -56,6 +56,10 @@ V4_BLOCK_CONNECTION = {
     'live_grid_pm_delta_debounce_enable', 'live_grid_pm_delta_soft_threshold_w',
     'live_grid_pm_delta_hard_threshold_w', 'live_grid_pm_delta_persist_count',
     'live_grid_pm_delta_persist_window_s',
+    # Zusatzwechselrichter per Modbus TCP (nur lesend, Diagnose;
+    # die Regelung nutzt weiterhin den E3DC-Messwert Ext_PV_Power).
+    'ext_inverter_type', 'ext_inverter_ip', 'ext_inverter_port',
+    'ext_inverter_unit_id', 'ext_inverter_poll_s',
 }
 
 # --- Block 2: PV-Anlage & Standort ---
@@ -106,6 +110,8 @@ V4_BLOCK_TARIFF = {
     'heat_heater_min_temp_c', 'heat_heater_max_temp_c',
     'heat_wp_daily_kwh',
     # Preisbasierte Speicherregelung: gemeinsame Marktökonomie ohne Direktvermarktungszwang.
+    # Ladeprofil (economic|balanced|comfort|custom) und Komfort-Preislimit.
+    'market_charge_profile', 'market_price_limit_ct',
     'market_min_margin_pct', 'market_safety_correction_ct_per_kwh',
     'market_autarky_first_enable', 'market_autarky_low_soc_pct',
     'market_autarky_horizon_buffer_wh',
@@ -190,6 +196,8 @@ V4_BLOCK_STORAGE = {
     'storage_dispatch_runtime_budget_ms',
     'einspeiselimit',            # Einspeise-Limit W (für PV-Derating)
     'storage_curve_target_mode', 'storage_curve_sliding_horizon_enable',
+    # Prognose-100 später Vollstand nur mit Grund (0 = nie) und Kurvenende-Puffer (30–120 min).
+    'storage_forecast100_late_full_guard_enable', 'storage_curve_end_guard_min',
     'storage_dc_first_charge_limit_enable',
     'storage_forecast_shortfall_aux_ac_charge_enable',
     'storage_curve_charge_servo_mode', 'storage_curve_charge_servo_min_w',
@@ -250,10 +258,27 @@ V4_BLOCK_STORAGE = {
     'storage_parallel_wb_hold_s', 'storage_parallel_auto_hold_s',
     'storage_parallel_wb_auto_grid_abort_w', 'storage_parallel_grid_relief_enter_w',
     'storage_curve_mode_wallbox_discharge_protect',
+    # Akkustützung nach Korridorlage: Mindest-
+    # Hausgrundlast der Vor-Klemme und Messreserve der PV-only-Entladeklemme.
+    # Beide liest storage_manager.py; ohne Inventar-Eintrag entfernte
+    # cleanup_v4_config() sie als unbekannt.
+    'wb_curve_house_baseline_min_w', 'wb_curve_pv_only_house_reserve_w',
+    # Wärmepumpe im Hauswert – auto (Heuristik) /
+    # include (Home = max(0, Home_roh − WP)) / separate (WP zusätzlich). Gelesen
+    # in storage_manager.augment_consumer_live und Storage/predump.py; ohne
+    # Inventar-Eintrag entfernte cleanup_v4_config() den Schlüssel als unbekannt.
+    'storage_home_wp_split',
+    # Nur Inventar (kein Editor/Validator). Gelesen in
+    # storage_simulator.py (adaptiver Komfort-SoC, Standard an / 80 % / 25 kWh);
+    # ohne Inventar-Eintrag entfernt cleanup_v4_config() sie.
+    'storage_adaptive_comfort_enable', 'storage_adaptive_comfort_soc',
+    'storage_adaptive_large_storage_kwh',
     'storage_live_stale_guard_s', 'storage_parallel_curve_charge_reenter_w',
     'storage_parallel_curve_guard_enter_below_pct', 'storage_parallel_diff_enable',
     'storage_parallel_diff_min_w', 'storage_parallel_diff_log_interval_s',
     'storage_auto_limit_heartbeat_enable', 'storage_auto_limit_heartbeat_s',
+    # Versteckter Rückweg der Schreibbremse (Standard 1); nur Inventar.
+    'storage_curve_frame_write_brake_enable',
     'storage_curve_sliding_horizon_min_open_s',
     'storage_curve_latest_charge_freeze_s', 'storage_curve_latest_charge_replan_margin_s',
     'storage_curve_shortfall_late_catchup_enter_w',
@@ -294,6 +319,10 @@ V4_BLOCK_WALLBOX = {
     'wb_native_type2', 'wb_native_ip2',
     'wb1_e3dc_wbchar6_compat_enable', 'wb2_e3dc_wbchar6_compat_enable',
     'wb_e3dc_compat_migration_status',
+    # Experimenteller E3DC-Direktvertrag für Phasenwechsel (Standard aus),
+    # global und je Wallbox; ohne Inventar-Eintrag entfernt cleanup_v4_config() ihn.
+    'wb_e3dc_direct_phase_control_enable', 'wb1_e3dc_direct_phase_control_enable',
+    'wb2_e3dc_direct_phase_control_enable',
     'wb1_e3dc_device_family', 'wb2_e3dc_device_family',
     'wb_native_mode', 'wb_native_eco', 'wbmaxladestrom',
     'wb1_max_amp', 'wb2_max_amp',
@@ -304,6 +333,20 @@ V4_BLOCK_WALLBOX = {
     'grid_max_amps_l3', 'grid_wallbox_reserve_amps',
     'grid_wallbox_reserve_amps_l1', 'grid_wallbox_reserve_amps_l2',
     'grid_wallbox_reserve_amps_l3', 'dvcarlimit',
+    # 1p-Deckel openWB Pro aus Netzphasenmessung –
+    # Messbasis (e3dc_pm_active_power | off), Leistungsfaktor-Reserve auf den
+    # Fremdanteil (0,8–1,0) und Schieflast-Wächter am Netzpunkt (10–32 A).
+    'wb_pcc_phase_basis', 'wb_pcc_power_factor_margin', 'grid_pcc_imbalance_max_a',
+    # Nur Inventar (kein Editor/Validator). Gelesen in wallbox_manager.py
+    # (Energie-Phasenpolitik 1p→3p: Export-Wh-Konto, Marge, Hochschaltpuffer,
+    # Netzfreigabe; Zeitkonstante der Deckel-Anhebung); ohne Inventar-Eintrag
+    # entfernt cleanup_v4_config() sie.
+    'wb_phase_energy_policy_enable', 'wb_phase_up_export_wh',
+    'wb_phase_up_export_margin_w', 'wb_phase_up_buffer_w',
+    'wb_phase_up_grid_allow_w', 'wb_stable_follow_hold_s',
+    # Symmetrie-Klausel der Hochschaltung 1p→3p (0/1,
+    # Standard 0); Schwelle ist der bestehende Schieflastwert grid_pcc_imbalance_max_a.
+    'wb_phase_up_symmetry_enable',
     'wb_restart_delay_s', 'wb_min_charge_time_s',
     'wb_cloud_stop_delay_s', 'wb_phase_change_hold_s',
     'wb1_restart_delay_s', 'wb1_min_charge_time_s',
@@ -311,8 +354,22 @@ V4_BLOCK_WALLBOX = {
     'wb2_restart_delay_s', 'wb2_min_charge_time_s',
     'wb2_cloud_stop_delay_s', 'wb2_phase_change_hold_s',
     'wb_openwb_zero_budget_hold_s',
+    # Freigabe-Hysterese + Gnadenfrist des PV-only-Laufhalts.
+    'wb_pv_only_release_hold_s', 'wb_pv_only_hold_stale_guard_s',
+    # Nur Inventar (kein Editor/Validator). Gelesen in
+    # wallbox_manager.py (Wh-Stützkontingent unter der Kurve, Prognose-Stopp-
+    # Defizit, Haltezeit nach der Schnellphase); ohne Inventar-Eintrag entfernt
+    # cleanup_v4_config() sie.
+    'wb_curve_floor_support_wh', 'wb_curve_forecast_stop_shortfall_wh',
+    'wb_curve_relief_after_fast_hold_s',
     'openwb_pro_phase_wait_s', 'openwb_pro_phase_cp_interrupt_duration_s',
     'openwb_pro_phase_restart_delay_s', 'openwb_pro_start_wakeup_delay_s',
+    'openwb_pro_automatic_start_cp_enable', 'openwb_pro_start_cp_grace_s',
+    # Startfenster/Wiederholzyklus; bisher unsichtbare Startschlüssel ins Inventar.
+    'openwb_pro_start_hold_s', 'openwb_pro_start_retry_cycle_s', 'wb_openwb_start_cp_retries',
+    'wb_openwb_start_retry_s', 'openwb_pro_start_reject_timeout_s', 'openwb_pro_start_grace_s',
+    'wb_openwb_pro_curve_hold_s',
+    'wb_native_floor_retry_enable', 'wb1_native_floor_retry_enable', 'wb2_native_floor_retry_enable',
     'wb_shadow_start_delay_s', 'wb_shadow_power_ramp_s',
     'wb_shadow_meter_delay_s', 'wb_shadow_meter_ramp_s',
     'wb_shadow_phase_pause_s', 'wb_shadow_zero_budget_stop_s',
@@ -325,10 +382,11 @@ V4_BLOCK_WALLBOX = {
     'wb_openwb_command_block_s',
     'wbhour', 'wbvon', 'wbbis', 'wb_sofort', 'wb_no_time_limit',
     'wb_battery_departure_window_h',
-    'wb1_plan_hours', 'wb1_wbvon', 'wb1_wbbis',
+    'wb_phase_down_delay_s', 'wb_phase_up_forecast_hold_s',
+    'wb1_plan_hours', 'wb1_wbvon', 'wb1_wbbis', 'wb1_plan_repeat',
     'wb1_battery_departure_time', 'wb1_battery_departure_window_h',
     'wb1_smart_wbhour_enable', 'wb1_native_eco',
-    'wb2_plan_hours', 'wb2_wbvon', 'wb2_wbbis',
+    'wb2_plan_hours', 'wb2_wbvon', 'wb2_wbbis', 'wb2_plan_repeat',
     'wb2_battery_departure_time', 'wb2_battery_departure_window_h',
     'wb2_smart_wbhour_enable', 'wb2_native_eco',
     'wb_native_cp_id',
@@ -346,6 +404,10 @@ V4_BLOCK_WALLBOX = {
     'wb2_grid_phase', 'wb2_grid_phase_rotation',
     'wb2_openwb_pro_1p_max_amp',
     'smart_wbhour_enable', 'wbcostpowers',
+    # Globaler Fahrzeug-Rückfall, wenn wb{n}_* fehlt; gepflegt im Config-Editor
+    # unter „Fahrzeug und Ladeziel“.
+    'car_capacity', 'car_target_unit', 'car_target_kwh', 'car_target_soc',
+    'car_max_soc_si', 'car_charge_power',
     'shelly_wb_ip', 'shelly_wb2_ip',
     'v2h_enable', 'v2h_min_soc', 'v2h_bat_soc_limit',
     'wbminsoc',              # Mindest-SoC der Batterie für Wallbox-Betrieb (Hauspriorität)
@@ -367,6 +429,7 @@ V4_BLOCK_HEATPUMP = {
     'wp_pv_max_power_w', 'wp_pv_battery_limit_wh', 'wp_pv_grid_limit_wh',
     'wp_pv_battery_max_w', 'wp_pv_grid_max_w', 'wp_pv_reaction_s',
     'wp_pv_start_wait_s', 'wp_pv_handoff_timeout_s',
+    'wp_pv_hz_hysteresis_k', 'wp_pv_ww_hysteresis_k', 'wp_pv_boost_release_s',
     'heizgrenze_temp', 'wws', 'www', 'hz', 'khl',
     'pv_pause_enable', 'pv_pause_soc', 'pv_pause_watt',
     'pv_pause_timeout_minutes', 'pv_pause_min_at', 'pv_pause_max_temp_drop',
@@ -457,8 +520,10 @@ V4_BLOCK_HEATPUMP = {
 }
 
 # --- Block 8: Fahrzeuge & Bluelink ---
+# Anmeldung mit Benutzer/Passwort/PIN/Marke; der alte Refresh-Token steht in der Sperrliste.
 V4_BLOCK_VEHICLE = {
-    'bluelink_refresh_token', 'bluelink_vin', 'bluelink_car_name',
+    'bluelink_user', 'bluelink_password', 'bluelink_pin', 'bluelink_brand',
+    'bluelink_vin', 'bluelink_car_name',
     'bluelink_interval', 'bluelink_ignore_plug_status',
 }
 
@@ -517,6 +582,15 @@ V4_ALL_KEYS = (
 
 V4_LOCAL_PATH_KEYS = {'install_user', 'home_dir', 'install_path', 'venv_name', 'venv_path'}
 
+# Globale Fahrzeug-Rückfallwerte (car_*) werden im Config-Editor gepflegt und nicht
+# aus einer alten e3dc.config.txt übernommen. Die Textübernahme prüft weder
+# Inline-Kommentare noch Wertebereiche; ein ungültiger Wert bliebe dauerhaft in
+# e3dc_v4.json, und die Wallbox-Transaktionsprüfung lehnte danach jede Änderung ab.
+V4_TXT_IMPORT_SKIP_KEYS = frozenset({
+    'car_capacity', 'car_target_unit', 'car_target_kwh', 'car_target_soc',
+    'car_max_soc_si', 'car_charge_power',
+})
+
 # Schlüssel, die NIEMALS in e3dc_v4.json gespeichert werden dürfen
 V4_BLACKLIST = {
     # Laufzeitzustände (gehören in die Ramdisk)
@@ -548,6 +622,8 @@ V4_BLACKLIST = {
     'logfile',
     # Veralteter Altbestandsschalter
     'openwb',
+    # Bluelink meldet sich mit Benutzer/Passwort an; der oAuth-Refresh-Token ist Altbestand
+    'bluelink_refresh_token',
     'shelly0v10v', 'shelly0v10v_ip', 'shelly0v10vmin', 'shelly0v10vmax',
     'shelly0v10vezh1', 'shelly0v10vezh2', 'shelly0v10vezh3', 'shelly0v10vezh4',
     'tasmota',
@@ -558,8 +634,6 @@ V4_BLACKLIST = {
     'wpheizlast', 'wpleistung', 'wpheizgrenze', 'wpnat', 'wpmin', 'wpmax',
     'wppvon', 'wppvoff', 'wphk1', 'wphk1max', 'wphk2on', 'wphk2off',
     'wpehz', 'wpzwe', 'wpzwepvon', 'wpoffset', 'wpdyncop',
-    # Redundanz: car_* ist jetzt wb1_*
-    'car_capacity', 'car_target_unit', 'car_target_kwh', 'car_target_soc', 'car_max_soc_si', 'car_charge_power',
     # C++-Altbestand: Schlüssel für den Wallbox-Wirkungsgrad (leere Strings führen zum float()-Abbruch)
     # Großbuchstaben-Duplikate, die config_editor.php fälschlicherweise schreibt
     # (Korrekte Kleinbuchstaben-Keys existieren bereits)
@@ -574,7 +648,7 @@ V4_BLOCK_ORDER = [
     ('Speicher-Manager (Gehirn)',   V4_BLOCK_STORAGE),
     ('Preis-/KI-Logik',            V4_BLOCK_INTELLIGENCE),
     ('Wallbox',                     V4_BLOCK_WALLBOX),
-    ('Waermepumpe / Energie-Mgr',  V4_BLOCK_HEATPUMP),
+    ('Wärmepumpe / Energie-Mgr',  V4_BLOCK_HEATPUMP),
     ('Fahrzeuge & Bluelink',        V4_BLOCK_VEHICLE),
     ('Benachrichtigungen',          V4_BLOCK_NOTIFY),
     ('HA & Netzwerk',               V4_BLOCK_HA),
@@ -761,6 +835,69 @@ def resolve_legacy_e3dc_auto_wbchar6_migration(data: dict) -> tuple[dict, dict]:
         'migrated_wallboxes': migrated,
         'reason': 'legacy_e3dc_auto_active_missing_key' if migrated else 'not_applicable_or_explicit',
     }
+
+
+MARKET_CHARGE_PROFILES = ('economic', 'balanced', 'comfort', 'custom')
+
+
+def _market_profile_float(data: dict, primary: str, fallback: str, default: float) -> float:
+    for key in (primary, fallback):
+        raw = data.get(key)
+        if raw is None or str(raw).strip() == '':
+            continue
+        try:
+            return float(str(raw).replace(',', '.'))
+        except (TypeError, ValueError):
+            continue
+    return float(default)
+
+
+def derive_market_charge_profile(data: dict) -> tuple[str, str]:
+    """Reine Ableitung des Ladeprofils aus den vorhandenen Werten.
+
+    Identisch zu Installer/market_economics.derive_market_charge_profile (Vertrag bei fehlendem Schlüssel) und
+    zur Editor-Vorbelegung: Marge != 10 oder Sicherheitskorrektur != 0 -> 'custom', sonst 'economic'.
+    Kein Wert wird umgeschrieben; 'custom' liest exakt die heutigen Schlüssel.
+    """
+    source = data if isinstance(data, dict) else {}
+    margin = _market_profile_float(source, 'market_min_margin_pct', 'direct_marketing_min_margin_pct', 10.0)
+    safety = _market_profile_float(source, 'market_safety_correction_ct_per_kwh', 'direct_marketing_safety_margin_ct_per_kwh', 0.0)
+    if abs(margin - 10.0) > 0.05 or abs(safety) > 0.005:
+        return 'custom', 'margin_or_safety_deviates'
+    return 'economic', 'defaults'
+
+
+def resolve_market_charge_profile_migration(data: dict) -> tuple[dict, dict]:
+    """Setzt market_charge_profile genau einmal aus den vorhandenen Werten.
+
+    Nur wenn der Schlüssel fehlt oder leer ist; ein gesetzter Wert wird nie überschrieben, keine anderen Werte
+    werden verändert. Ergebnis: {schema, changed, profile, reason}.
+    """
+    source = dict(data or {})
+    result = dict(source)
+    current = str(source.get('market_charge_profile') or '').strip().lower()
+    if current:
+        return result, {
+            'schema': 'market_charge_profile_v1',
+            'changed': False,
+            'profile': current,
+            'reason': 'already_set' if current in MARKET_CHARGE_PROFILES else 'unknown_value_kept',
+        }
+    profile, reason = derive_market_charge_profile(source)
+    result['market_charge_profile'] = profile
+    return result, {
+        'schema': 'market_charge_profile_v1',
+        'changed': True,
+        'profile': profile,
+        'reason': reason,
+    }
+
+
+def market_charge_profile_migration_message(status: dict) -> str:
+    profile = str((status or {}).get('profile') or '')
+    if profile == 'custom':
+        return 'Ladeprofil gesetzt: Eigene Einstellungen (abweichende Marge/Sicherheitskorrektur erkannt)'
+    return 'Ladeprofil gesetzt: Wirtschaftlich (Standardwerte)'
 
 
 def migrate_legacy_e3dc_auto_wbchar6_config(path: str, dry_run: bool = False) -> dict:
@@ -990,12 +1127,22 @@ def cleanup_v4_config(dry_run: bool = False) -> bool:
         print('  [!] e3dc_v4.json ist leer oder unlesbar.')
         return False
 
+    # Ladeprofil vor Standardwerten und Unbekannt-Bereinigung aus den vorhandenen
+    # Werten setzen (nur wenn der Schlüssel fehlt); Backup ist oben bereits angelegt, dry_run schreibt nicht.
+    data, profile_migration = resolve_market_charge_profile_migration(data)
+    if profile_migration.get('changed'):
+        message = market_charge_profile_migration_message(profile_migration)
+        print(f"  [OK] {message}" + ('; Dry-run, kein Write' if dry_run else ''))
+        log.info('Marktpfad-Migration: %s', message)
+
     before_defaults = dict(data)
     data = apply_web_config_start_defaults(data)
     filled_defaults = [
         key for key in WEB_CONFIG_START_DEFAULTS
         if before_defaults.get(key) != data.get(key)
     ]
+    if profile_migration.get('changed'):
+        filled_defaults.append('market_charge_profile')
 
     removed_blacklist = []
     removed_unknown  = []
@@ -1014,6 +1161,10 @@ def cleanup_v4_config(dry_run: bool = False) -> bool:
         print(f'  Entferne {len(removed_blacklist)} Altlast-Keys (Blacklist):')
         for k in removed_blacklist:
             print(f'    - {k}')
+        if any(k.lower() == 'bluelink_refresh_token' for k in removed_blacklist):
+            print('  [i] Bluelink: Der Refresh-Token wird nicht mehr verwendet. Bitte Benutzer (E-Mail) und Passwort '
+                  'des Hyundai/Kia-Kontos im Konfigurations-Editor unter Fahrzeug Integration (Bluelink) hinterlegen.')
+            log.info('Bluelink-Migration: bluelink_refresh_token entfernt; Zugangsdaten (bluelink_user/bluelink_password) erforderlich.')
     if removed_unknown:
         print(f'  Entferne {len(removed_unknown)} unbekannte Keys:')
         for k in removed_unknown:
@@ -1164,7 +1315,8 @@ def _migrate_txt_config():
             val = val.strip()
 
             # Nur gültige Schlüssel migrieren, die im JSON noch nicht existieren
-            if key in V4_ALL_KEYS and key not in v4 and val != '':
+            if (key in V4_ALL_KEYS and key not in V4_TXT_IMPORT_SKIP_KEYS
+                    and key not in v4 and val != ''):
                 v4[key] = val
                 migrated_keys += 1
                 print(f'  [OK] V3-Migration: {key} in e3dc_v4.json übernommen.')

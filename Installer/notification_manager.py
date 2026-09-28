@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import time
+import sys
 import subprocess
 import os
 import json
@@ -130,6 +131,44 @@ def _consume_docker_restart_flag(path):
 def is_true(val):
     return str(val).lower() in ['1', 'true', 'on']
 
+def notify_heatpump_channel_alarm(cfg, last_run, script_dir):
+    """Meldet einen offenen SHI-Rücknahmealarm einmal; Fehlversand wird wiederholt."""
+    try:
+        with open('/var/www/html/ramdisk/luxtronik.json', 'r', encoding='utf-8') as stream:
+            alarm = json.load(stream).get('heatpump_channel_alarm') or {}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return
+    if not isinstance(alarm, dict):
+        return
+    if alarm.get('active') is not True:
+        last_run.pop('heatpump_channel_alarm', None)
+        return
+    raw_channels = alarm.get('channels')
+    if not isinstance(raw_channels, (list, tuple)):
+        return
+    channels = tuple(name for name in ('hz', 'ww') if name in raw_channels)
+    if not channels or not is_true(cfg.get('push_notify_warnings', '0')):
+        return
+    if last_run.get('heatpump_channel_alarm') == channels:
+        return
+    title = 'Wärmepumpe: Rücknahme nicht bestätigt'
+    body = 'Heizen' if channels == ('hz',) else 'Warmwasser' if channels == ('ww',) else 'Heizen und Warmwasser'
+    body += ': Grundzustand nicht bestätigt. Bitte SHI-Verbindung und Gerätestatus prüfen.'
+    try:
+        result = subprocess.run([
+            sys.executable, os.path.join(script_dir, 'send_push.py'), title, body,
+            '--url', '/index.php?seite=waermepumpe',
+        ], capture_output=True, text=True, timeout=30, check=False)
+        delivery = json.loads(result.stdout)
+        delivered = result.returncode == 0 and isinstance(delivery, dict) and delivery.get('success') is True
+    except (OSError, ValueError, subprocess.SubprocessError):
+        delivered = False
+    if delivered:
+        last_run['heatpump_channel_alarm'] = channels
+    else:
+        print('Wärmepumpe: Alarm-Push nicht bestätigt; erneuter Versuch folgt.', flush=True)
+
+
 def main():
     print("Starte E3DC Notification & Schedule Manager...", flush=True)
     last_run = {}
@@ -148,6 +187,9 @@ def main():
         # HA-Status ermitteln (Slave im Standby darf keine Stats senden)
         ha_status = get_ha_status()
         is_standby = (ha_status.get('mode') == 'slave' and ha_status.get('state') != 'failover')
+
+        if not is_standby:
+            notify_heatpump_channel_alarm(cfg, last_run, script_dir)
 
         # 1. Boot-Benachrichtigung einmalig beim Start des Dienstes senden
         if last_run.get('boot') != 'done' and not is_standby:

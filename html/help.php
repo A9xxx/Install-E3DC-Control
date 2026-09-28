@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.5.0a Stable</span>
+            <span class="badge bg-success text-light">v5.5.1 Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.5.0a</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.5.1</code> in <code>.env</code> gesetzt.</p>
                 <p><strong>Update-Knopf und Auto-Update:</strong> Der Container tauscht sein Image nicht selbst. Läuft das Compose-Profil <code>auto-update</code> (Watchtower-Fork <code>ghcr.io/nicholas-fedor/watchtower</code>), gibt der Knopf <strong>System Update</strong> Watchtower über dessen lokale HTTP-API das Signal: Watchtower lädt das Image, erstellt den Container neu, und die Oberfläche lädt nach dem Start neu. Mit <strong>Auto-Update</strong> im Config-Editor passiert dasselbe täglich zur eingestellten Uhrzeit; Watchtower selbst pollt nicht. Gibt es kein neues Image, passiert nichts.</p>
                 <p>Einmalige Freischaltung auf dem Docker-Host im Compose-Ordner (Token für beide Dienste in <code>.env</code>, Container mit Token neu erstellen, Watchtower starten):</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
@@ -223,6 +223,17 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                     </ol>
                 </div>
             </div>
+        </div>
+
+        <h4 class="mb-4 text-accent">Stable 5.5.1: Wallbox-Hochschaltung, Wärmepumpen-Kanalbesitz und Diagnose-Pseudonymisierung</h4>
+        <div class="col-12 faq-item" data-tags="5.5.1 stable wallbox openwb pro hochschaltung phasenreservierung 10-min-fenster waermepumpe luxtronik kanalbesitz netzboost vorschau diagnosepaket pseudonymisierung api bearer update">
+            <div class="card bg-card border-0 shadow-sm"><div class="card-body">
+                <h5 class="card-title">Was bringt Stable-Release 5.5.1?</h5>
+                <p>An der openWB Pro und am E3DC-Direktvertrag reserviert die Hochschaltung 1p→3p jetzt die bisher laufende Leistung beziehungsweise 6 A je Phase statt des vollen einphasigen Stroms auf drei Phasen umgerechnet; ein Auftrag ohne Geräteausgang bricht nach 90 s bzw. zwei Zyklen ohne Anforderung ab, danach folgt der nächste Versuch frühestens nach 15 Minuten. Ein zusätzliches, standardmäßig ausgeschaltetes 10-Minuten-Fenster (<code>wb_phase_up_window_enable</code>) kann bei stabilem Überschuss unabhängig von Vorlauf und Export-Wh-Konto hochschalten. In <code>PV + Akku bis Untergrenze</code> stützt der Hausspeicher die Wallbox bei offenem wbminSoC-Tor jetzt unabhängig von der Kurvenlage; unterhalb von <code>wbminsoc</code> gilt weiterhin <code>PV-Kurve ruhig</code>.</p>
+                <p>Bei der Luxtronik nimmt „Automatik darf steuern“ aus einen laufenden PV-Boost jetzt geordnet zurück (Heizung: SHI-Modus 0; Warmwasser: Grundzustand auf die eingestellte Untergrenze) und meldet eine unbestätigte Rücknahme als Alarm. Nur der Energy Manager schreibt die SHI-Register. Ein experimenteller, standardmäßig ausgeschalteter Netzboost (<code>price_boost_enable</code>, „Experimentellen Netzboost aktivieren“) kann die Wärmepumpe bei einem echten Negativpreisfenster, Wärmebedarf und aktueller Speicherzusage freigeben.</p>
+                <p>Das Diagnosepaket der Installationszentrale pseudonymisiert jetzt Seriennummern, MAC-Adressen, RFID-Tags, Fahrzeug-IDs, IP-Adressen, Hostnamen und weitere Gerätekennungen; der Schlüssel dafür bleibt ausschließlich auf der Anlage. Die API akzeptiert zusätzlich den Header <code>Authorization: Bearer</code> gleichwertig zu <code>X-API-PIN</code>; beide teilen sich dieselbe Sperre nach Fehlversuchen. Der Updater prüft vor dem Vollbackup und vor dem Dienststopp den freien Platz in <code>/run</code>, damit <code>systemctl daemon-reload</code> nicht an Platzmangel scheitert.</p>
+                <p><strong>Update:</strong> Wie gewohnt über <strong>System Update</strong> bzw. das Docker-Update; eine Konfigurationsänderung ist nicht nötig, da alle neuen Wallbox- und Wärmepumpen-Schalter standardmäßig aus sind.</p>
+            </div></div>
         </div>
 
         <h4 class="mb-4 text-accent">Stable 5.5.0a: Sicherheitskorrektur der Web-PIN</h4>
@@ -1596,8 +1607,10 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                     <i class="fas fa-chevron-down"></i>
                 </div>
                 <div class="faq-answer">
-                    <p>Der <strong>Redacted Download</strong> maskiert Passwörter, Tokens und andere Geheimnisse und ist für Diagnose und Support vorgesehen.</p>
-                    <p><strong>Raw-Download enthält Zugangsdaten und wird nur bei gesetzter Web-PIN angeboten.</strong> Prüfen Sie diese Datei vor jeder Weitergabe und behandeln Sie sie wie ein Passwort.</p>
+                    <p>Der Download <strong>„Einstellungen ohne Zugangsdaten“</strong> maskiert Passwörter, Tokens, Standort und RSCP-Zugangsdaten, enthält aber weiterhin IP-Adressen und Gerätekennungen. Er ist nicht zum Teilen gedacht; für Forum und Support bitte nur das Diagnosepaket der Installationszentrale verwenden.</p>
+                    <p><strong>Raw-Download enthält Zugangsdaten und wird nur bei gesetzter Web-PIN angeboten.</strong> Speichern Sie diese Datei nur privat und behandeln Sie sie wie ein Passwort.</p>
+                    <p>Import und Rollback behalten die Installationspfade sowie HA-Rolle und HA-Partner dieser Anlage bei. Den Gerätenamen behält eine Anlage mit HA-Rolle immer; eine Anlage ohne HA-Rolle übernimmt ihn aus der Datei, solange hier noch kein eigener Name eingetragen ist. Maskierte Zugangsdaten aus einer Datei ohne Zugangsdaten überschreiben die Werte dieser Anlage nicht. Die bereinigte Konfiguration aus einem Diagnosepaket lässt sich nicht importieren. Für Ersatzhardware, HA-Sicherungen und Rollenwechsel gilt die HA-Dokumentation, Abschnitt „Rolle und Rollenanker“. Das Rollenfeld im Config-Editor genügt dafür nicht. Der Installerweg (<code>e3dc-setup</code>, „7) Expertenmenü“ → „49) High Availability (Cluster)“) ist nur für Master/Slave mit erreichbarem Partner vorgesehen. Eine Shadow-Instanz übernimmt nur Stände einer Shadow-Instanz; der Dateiimport richtet keine Rolle ein. Aus einem Shadow-Stand werden keine Zugangsdaten der aktiven Anlage übernommen, etwa RSCP-, Geräte- und Dienstkonten; es gelten die Werte der Anlage, auf der der Stand eingespielt wird, auch wenn sie im Stand fehlen. Geräteadressen wie die IP-Adressen des E3DC und der Wallboxen gehören nicht zu diesen geschützten Werten; sie kommen aus dem Stand und sind danach im Config-Editor zu prüfen. Wird er auf der Shadow selbst eingespielt, kommen ihre eigenen Einstellungen wie Snapshot-Token, Web-PIN, Telegram und Standort aus der Datei; ein Master oder Slave behält auch diese Werte.</p>
+                    <p>Import, Rollback und normales Speichern sind auf 64 KiB (65.536 Byte) der fertig zusammengeführten JSON-Datei begrenzt. Darüber lesen die Dienste die Datei nicht; das Speichern wird ohne Änderung abgelehnt. „Rollenprüfung bestanden“ bedeutet nicht, dass die Regelung läuft: Der laufende Betrieb wurde dabei nicht geprüft. Bei gesperrter oder unklarer Rolle nicht Rolle oder Rollenanker zur Umgehung ändern. Das Kästchen „Für Einzelbetrieb ohne HA importieren/wiederherstellen“ ist nur im angebotenen Sonderfall zulässig und meint den dauerhaft stillgelegten anderen Knoten des früheren HA-Paars, nicht das ersetzte Gerät; es deaktiviert keinen Regler.</p>
                 </div>
             </div>
         </div>

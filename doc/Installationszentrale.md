@@ -79,15 +79,30 @@ Ausgangswechsel bleiben auch bei eingeschränkter Datenqualität sichtbar.
 
 Das Diagnosepaket wird lokal erzeugt und enthält nur technische Hilfsdaten:
 
-- maskierte Konfiguration ohne Passwörter, Tokens, E-Mail-Adressen und
+- maskierte Konfiguration ohne Passwörter, PINs, Tokens, E-Mail-Adressen und
   Standortwerte,
 - Installer-Status, Moduldiagnose und Jobstatus,
 - ausgewählte Logs,
 - ausgewählte Ramdisk-Dateien wie Live-Daten, Speicherplan und Modulstatus.
 
-LAN-IPs, Dienstnamen und technische Zustände bleiben bewusst enthalten, weil
-sie für die Fehlersuche wichtig sind. Das Paket sollte vor dem Versenden kurz
-geöffnet und geprüft werden.
+Kontonamen von Geräte- und Dienstkonten sowie Fahrzeugpositionen werden
+maskiert. IP-Adressen, der Hostname, MQTT-Topics, Fahrzeugnamen und
+Gerätekennungen werden pseudonymisiert: Seriennummern von Speicher, Wallbox und
+Zähler, MAC-Adressen, RFID-Tags, Fahrzeug-IDs und FIN, Klimageräte-IDs sowie
+Anlagen-IDs von Tarif- und Prognosediensten. Ein Pseudonym nennt die Art der Kennung und eine Prüfsumme,
+etwa `[serial-1a2b3c4d5e]`. Gleiche Kennungen erhalten in allen Paketen einer
+Anlage dasselbe Pseudonym, damit sich Pakete derselben Anlage vergleichen
+lassen. Der Schlüssel dafür liegt nur auf der Anlage
+(`/var/www/html/data/diagnostic_pseudonym.key`) und wird nie mitgeliefert; ohne
+ihn lassen sich die Kennungen nicht zurückrechnen. Wer die Zuordnung zu älteren
+Paketen aufheben möchte, löscht diese Datei; beim nächsten Paket entsteht ein
+neuer Schlüssel. Kann die Anlage die Datei nicht lesen oder anlegen, gilt der
+Schlüssel nur für das eine Paket; das Manifest nennt das unter
+`pseudonym_scope`. Modellbezeichnungen, Firmwarestände, Dienstnamen, Messwerte und
+technische Zustände bleiben enthalten, weil sie für die Fehlersuche wichtig
+sind. Die Laufzeitdateien der Anlage bleiben unverändert. Kennungen im Freitext
+ohne erkennbaren Feldnamen werden nicht in jedem Fall erkannt; das Paket sollte
+deshalb vor dem Versenden kurz geöffnet und geprüft werden.
 
 ## Docker
 

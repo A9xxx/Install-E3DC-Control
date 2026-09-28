@@ -106,13 +106,20 @@ def begin_phase_transition_reservation(
     wb_id: Any = None,
     from_phases: Any = None,
     restart_amp: Any = None,
+    restart_amp_authoritative: bool = False,
     current_step_amp: Any = None,
     effective_w_per_amp: Any = None,
     lease_s: Any = None,
     transition_id: Any = None,
     clock_sample: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Erstellt den allgemeinen Auftrag, bevor ein Gerätebefehl gesendet wird."""
+    """Erstellt den allgemeinen Auftrag, bevor ein Gerätebefehl gesendet wird.
+
+    ``restart_amp_authoritative`` meldet, dass der Aufrufer den tatsächlichen
+    Wiederanlaufstrom je Zielphase kennt (openWB Pro 1p→3p: normativ 6 A).
+    Dann gilt ``restart_amp`` statt des laufenden Stroms der alten Phasenzahl;
+    die bisherige Leistung bleibt über ``observed_before_w`` reserviert.
+    """
 
     data = state if isinstance(state, dict) else {}
     st = status if isinstance(status, dict) else {}
@@ -134,18 +141,25 @@ def begin_phase_transition_reservation(
     # Phasenvertrag unterdrückt gleichzeitig den möglichen 1p-/3p-Start.
     # Erst bestätigte Fahrzeugleistung darf deshalb oberhalb des normativen
     # Mindeststroms reserviert werden; die weitere Rampe folgt dem Budget.
-    current = (
-        max(
-            _safe_float(restart_amp, 0.0),
-            _safe_float(data.get("current_set_amp"), 0.0),
-            _safe_float(st.get("offered_current_raw"), 0.0),
-            _safe_float(st.get("evse_current"), 0.0),
-            _safe_float(st.get("amp"), 0.0),
-            float(_MIN_CHARGE_CURRENT_A),
+    if restart_amp_authoritative:
+        # Der laufende Strom der alten Phasenzahl ist kein Strom je
+        # Zielphase: 29 A einphasig wären dreiphasig 20 kW, obwohl die Box
+        # nach dem Wechsel mit 6 A je Phase wieder anläuft. Ein so überhöhter
+        # Auftrag erhält vom Speicherregler nie die volle Freigabe.
+        current = max(float(_MIN_CHARGE_CURRENT_A), _safe_float(restart_amp, 0.0))
+    else:
+        current = (
+            max(
+                _safe_float(restart_amp, 0.0),
+                _safe_float(data.get("current_set_amp"), 0.0),
+                _safe_float(st.get("offered_current_raw"), 0.0),
+                _safe_float(st.get("evse_current"), 0.0),
+                _safe_float(st.get("amp"), 0.0),
+                float(_MIN_CHARGE_CURRENT_A),
+            )
+            if real_charge_confirmed
+            else float(_MIN_CHARGE_CURRENT_A)
         )
-        if real_charge_confirmed
-        else float(_MIN_CHARGE_CURRENT_A)
-    )
     actual_phases = _safe_int(from_phases, 0) or _status_phase_count(st)
     # ``restart_amp`` ist wie der spätere openWB-Befehl ein Strom je Phase.
     # Eine Umrechnung mit dem Verhältnis alter/neuer Phasen würde deshalb bei

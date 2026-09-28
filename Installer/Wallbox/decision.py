@@ -5015,7 +5015,13 @@ def curve_battery_support_contract(
     (Grund ``wbminsoc_floor_closed``, Klasse ``floor_closed``), wo die
     Korridortabelle sonst eine Stützung ausweisen würde. Ein bereits nicht
     autorisiertes Ergebnis (Laufzeit-Anhebung, PV-only unter dem Korridor)
-    bleibt unverändert; ``PV-Kurve ruhig`` ist davon nicht berührt.
+    bleibt dann unverändert; ``PV-Kurve ruhig`` ist davon nicht berührt.
+
+    Ist das wbminSoC-Tor offen, stützt der Speicher die Wallbox in diesen
+    Modi unabhängig von der Korridorlage (Grund ``wbminsoc_floor_open``,
+    Klasse ``full``): Das Laden folgt weiter der normalen Kurve, bei
+    Akku-Bezug darf der Speicher bis wbminSoC entladen. Eine Laufzeit-Anhebung
+    von wbminSoC sperrt die Stützung weiterhin sofort.
     """
 
     result = _curve_battery_support_by_relation(
@@ -5034,6 +5040,17 @@ def curve_battery_support_contract(
             authorized=False,
             reason="wbminsoc_floor_closed",
             budget_class="floor_closed",
+        )
+    elif (
+        bool(floor_mode)
+        and wbminsoc_gate_open is True
+        and not bool(runtime_raise_active)
+        and (result.get("authorized") is not True or result.get("budget_class") != "full")
+    ):
+        result.update(
+            authorized=True,
+            reason="wbminsoc_floor_open",
+            budget_class="full",
         )
     return result
 
@@ -6686,6 +6703,197 @@ def phase_up_import_evidence_contract(
     return result
 
 
+PHASE_WINDOW_SCHEMA = "wallbox_phase_window_v2"
+PHASE_WINDOW_S = 600.0
+PHASE_WINDOW_BUCKET_S = 30.0
+PHASE_WINDOW_MIN_COVER_S = 540.0
+PHASE_WINDOW_MARGIN_PCT = 15.0
+PHASE_WINDOW_DIP_S = 120.0
+PHASE_WINDOW_DIP_MIN_COVER_RATIO = 0.9
+PHASE_WINDOW_MAX_DT_S = 10.0
+
+
+def phase_window_max_dt_s(*, idle_loop_s: Any, active_loop_s: Any) -> float:
+    """Größte Lücke, die eine Fensterprobe abdecken darf, gekoppelt an den Managertakt.
+
+    ``PHASE_WINDOW_MAX_DT_S`` gilt für den aktiven Takt (``active_loop_s``).
+    Im Leerlauf, etwa vor dem Anstecken, schläft der Manager länger
+    (``idle_loop_s``, aus ``wb_idle_poll_s``); die zulässige Lücke wächst um
+    genau diese Differenz. Sonst verwürfe das Fenster bei einem Leerlauftakt
+    ab 10 s jede Probe und füllte sich vor dem Anstecken nie.
+    """
+
+    active = max(0.0, _safe_float(active_loop_s, 0.0))
+    idle = max(active, _safe_float(idle_loop_s, active))
+    return PHASE_WINDOW_MAX_DT_S + (idle - active)
+
+
+def phase_window_sample_w(
+    *,
+    wb_power_w: Any,
+    grid_power_raw_w: Any,
+    battery_power_w: Any,
+    margin_w: Any = 125.0,
+    authorized_budget_w: Any = None,
+) -> Optional[float]:
+    """Verfügbarer Überschuss einer Probe wie in ``phase_up_availability_contract``.
+
+    ``P = P_wb + max(0, −Netz − Marge) + min(0, Akku)``. Ein frisches,
+    autorisiertes Budget des Speicherreglers ist die zweite Quelle
+    (``Budget + min(0, Akku)``); so zählt der vom Speicherregler freigegebene
+    Akkuanteil der PV-Kurve mit, eine Entladung aber als Defizit. Fehlende
+    Netz- oder Akkuwerte ergeben ``None`` und damit nie eine Freigabe.
+    """
+
+    grid = _phase_up_finite(grid_power_raw_w)
+    battery = _phase_up_finite(battery_power_w)
+    if grid is None or battery is None:
+        return None
+    wb = _phase_up_finite(wb_power_w)
+    p_wb = wb if (wb is not None and wb > 0.0) else 0.0
+    margin = max(0.0, _safe_float(margin_w, 0.0))
+    measured = p_wb + max(0.0, -grid - margin) + min(0.0, battery)
+    budget = _phase_up_finite(authorized_budget_w)
+    if budget is not None and budget >= 0.0:
+        return max(measured, budget + min(0.0, battery))
+    return measured
+
+
+def phase_window_contract(
+    prior: Optional[Dict[str, Any]],
+    *,
+    p_avail_w: Any,
+    data_valid: bool,
+    now_ts: Any,
+    threshold_w: Any,
+    dip_floor_w: Any,
+    window_s: Any = PHASE_WINDOW_S,
+    bucket_s: Any = PHASE_WINDOW_BUCKET_S,
+    min_cover_s: Any = PHASE_WINDOW_MIN_COVER_S,
+    dip_s: Any = PHASE_WINDOW_DIP_S,
+    max_dt_s: Any = PHASE_WINDOW_MAX_DT_S,
+) -> Dict[str, Any]:
+    """10-min-Fenster des verfügbaren Überschusses für 3p-Start und Hochschaltung.
+
+    Jede gültige Probe deckt die Zeit seit der vorigen Probe ab, höchstens
+    ``max_dt_s``; ungültige Proben und größere Abstände sind Lücken. Abdeckung
+    und Mittel werden exakt auf Zeitfenster relativ zu ``now_ts`` beschnitten,
+    ein Abschnitt vor dem Fenster zählt nie mit. Bereit nur, wenn
+    (1) gültige Proben mindestens ``min_cover_s`` der letzten ``window_s``
+    abdecken, (2) das zeitgewichtete Mittel darin mindestens ``threshold_w``
+    erreicht und (3) jeder 30-s-Abschnitt der letzten ``dip_s`` (gezählt ab
+    jetzt) zu mindestens 90 % abgedeckt ist und im Mittel über
+    ``dip_floor_w`` (3p-Minimum) liegt. Ein leerer oder lückenhafter
+    Abschnitt zählt wie ein Einbruch: Fehlende Daten sind nie eine Freigabe.
+    """
+
+    state = (
+        prior
+        if isinstance(prior, dict) and prior.get("schema") == PHASE_WINDOW_SCHEMA
+        else {}
+    )
+    now_value = _safe_float(now_ts, 0.0)
+    win = max(60.0, _safe_float(window_s, PHASE_WINDOW_S))
+    bucket = max(1.0, _safe_float(bucket_s, PHASE_WINDOW_BUCKET_S))
+    cover_needed = min(win, max(0.0, _safe_float(min_cover_s, PHASE_WINDOW_MIN_COVER_S)))
+    dip_window = min(win, max(bucket, _safe_float(dip_s, PHASE_WINDOW_DIP_S)))
+    section_count = max(1, int(round(dip_window / bucket)))
+    section_s = dip_window / section_count
+    threshold = max(0.0, _safe_float(threshold_w, 0.0))
+    floor_w = max(0.0, _safe_float(dip_floor_w, 0.0))
+    max_dt = max(0.0, _safe_float(max_dt_s, PHASE_WINDOW_MAX_DT_S))
+    # Rundungsspiel der Summen bei Unix-Zeitstempeln (keine fachliche Toleranz).
+    eps_s = 1e-3
+    # Probe = (Ende, Dauer, Leistung) und deckt (Ende − Dauer, Ende] ab.
+    samples = []
+    for item in state.get("samples") or []:
+        if not isinstance(item, (list, tuple)) or len(item) < 3:
+            continue
+        end = _phase_up_finite(item[0])
+        span = _phase_up_finite(item[1])
+        value = _phase_up_finite(item[2])
+        if end is None or span is None or value is None:
+            continue
+        if span <= 0.0 or span > max_dt:
+            continue
+        # Zukünftige Proben (Uhr zurückgestellt) und Proben vor dem Fenster fallen weg.
+        if end > now_value or end <= now_value - win:
+            continue
+        samples.append((end, span, value))
+    last_ts = _phase_up_finite(state.get("last_ts"))
+    sample = _phase_up_finite(p_avail_w)
+    valid = bool(data_valid and sample is not None)
+    dt = 0.0
+    if last_ts is not None and now_value > last_ts and now_value - last_ts <= max_dt:
+        dt = now_value - last_ts
+    if valid and dt > 0.0:
+        samples.append((now_value, dt, float(sample)))
+    samples.sort()
+
+    def _covered(lo: float, hi: float):
+        covered = 0.0
+        energy = 0.0
+        for end, span, value in samples:
+            overlap = min(end, hi) - max(end - span, lo)
+            if overlap > 0.0:
+                covered += overlap
+                energy += value * overlap
+        return covered, energy
+
+    cover, energy_sum = _covered(now_value - win, now_value)
+    mean_w = energy_sum / cover if cover > 0.0 else 0.0
+    section_cover_needed = PHASE_WINDOW_DIP_MIN_COVER_RATIO * section_s
+    sections = []
+    for index in range(section_count):
+        hi = now_value - index * section_s
+        section_cover, section_energy = _covered(hi - section_s, hi)
+        sections.append((
+            section_cover,
+            section_energy / section_cover if section_cover > 0.0 else None,
+        ))
+    dip_cover = sum(item[0] for item in sections)
+    dip_means = [item[1] for item in sections if item[1] is not None]
+    dip_min = min(dip_means) if dip_means else None
+    dip_section_cover_min = min(item[0] for item in sections)
+    dip_gap = any(
+        item[1] is None or item[0] + eps_s < section_cover_needed for item in sections
+    )
+    if not valid:
+        reason = "sample_invalid"
+    elif cover + eps_s < cover_needed:
+        reason = "cover_short"
+    elif mean_w < threshold:
+        reason = "mean_below_threshold"
+    elif dip_gap or dip_min is None or dip_min <= floor_w:
+        reason = "recent_dip"
+    else:
+        reason = "ready"
+    return {
+        "schema": PHASE_WINDOW_SCHEMA,
+        "ready": reason == "ready",
+        "reason": reason,
+        "mean_w": round(mean_w, 1),
+        "cover_s": round(cover, 1),
+        "dip_min_w": round(dip_min, 1) if dip_min is not None else None,
+        "dip_cover_s": round(dip_cover, 1),
+        "dip_section_cover_min_s": round(dip_section_cover_min, 1),
+        "dip_section_cover_needed_s": round(section_cover_needed, 1),
+        "dip_gap": bool(dip_gap),
+        "threshold_w": round(threshold, 1),
+        "dip_floor_w": round(floor_w, 1),
+        "window_s": round(win, 1),
+        "state": {
+            "schema": PHASE_WINDOW_SCHEMA,
+            "samples": [
+                [round(end, 3), round(span, 3), round(value, 1)]
+                for end, span, value in samples
+                if end > now_value - win
+            ],
+            "last_ts": now_value,
+        },
+    }
+
+
 def phase_switch_recommendation(
     *,
     openwb_phase_capable: bool,
@@ -6735,6 +6943,8 @@ def phase_switch_recommendation(
     phase_up_export_required_wh: float = 0.0,
     direct_phase_control: bool = False,
     phase_up_import_block_active: Optional[bool] = None,
+    phase_window_ready: bool = False,
+    vehicle_known_3p: bool = False,
 ) -> Dict[str, Any]:
     """Empfiehlt eine Phasenaktion, ohne einen Wallbox-Befehl zu senden.
 
@@ -6749,6 +6959,16 @@ def phase_switch_recommendation(
     geführt). ``phase_up_import_block_active`` ersetzt für die Hochschaltung den
     Roh-Blip des Netzbezugs durch den ≥ 30 s anhaltenden Bezug (``None`` =
     bisheriger Rohwert); Abstieg und Schutzpfade lesen weiter den Rohwert.
+    ``phase_window_ready`` (experimentelles 10-min-Fenster,
+    ``phase_window_contract``, vom Manager nur bei eingeschaltetem Schalter
+    gesetzt) ersetzt Uhr und Konto der Hochschaltung und erlaubt an der
+    openWB Pro das Phasenziel 3 vor dem Ladebeginn; Hardware-Sperre, Wartezeit
+    nach einem Wechsel, Import-Sperre, 1p-Fahrzeuge und die Budgetpflicht
+    (``phase_3p_supported``) bleiben unverändert wirksam. Den 3p-Start vor dem
+    Ladebeginn erhält nur ein Fahrzeug mit gebundenem dreiphasigem Profil
+    (``vehicle_known_3p``, wie ``known_3p_vehicle`` im 3p-Kaltstartvertrag);
+    unbekannte, ein- oder zweiphasige Fahrzeuge starten weiter über den
+    Strom-zuerst-Pfad.
     """
 
     if not openwb_phase_capable:
@@ -6814,6 +7034,36 @@ def phase_switch_recommendation(
             )
         )
     ):
+        if (
+            phase_window_ready
+            and energy_phase_policy
+            and target == 1
+            and phase_3p_supported
+            and not vehicle_1p_only
+            # Nur ein gebunden dreiphasiges Fahrzeug: Ein unbekanntes Fahrzeug
+            # könnte einphasig laden, während die Box auf 3p steht und die
+            # Zuteilung mit drei Phasen rechnet.
+            and vehicle_known_3p
+            and not phase_block_active
+            and not phase_1p_start_hold_active
+            and hold_elapsed
+            and not (
+                ordinary_grid_import_sequence_active
+                if phase_up_import_block_active is None
+                else phase_up_import_block_active
+            )
+        ):
+            # 10-min-Fenster des verfügbaren Überschusses erfüllt: Phasenziel 3
+            # über die vorhandene Sequenz vor Ladebeginn setzen statt zuerst
+            # einphasig zu starten.
+            return {
+                "action": "SWITCH_3P",
+                "target_phases": 3,
+                "reason": "phase_up",
+                "trigger": "start_window",
+                "wait_s": 0,
+                "remaining_s": 0,
+            }
         return {
             "action": "KEEP_PHASES",
             "target_phases": 0,
@@ -7003,6 +7253,23 @@ def phase_switch_recommendation(
         if energy_policy:
             export_wh = max(0.0, _safe_float(phase_up_export_wh, 0.0))
             export_required_wh = max(0.0, _safe_float(phase_up_export_required_wh, 0.0))
+            if phase_window_ready and (hw_charging or vehicle_known_3p):
+                # 10-min-Fenster erfüllt: kein weiterer Vorlauf über Uhr oder
+                # Konto; die harten Tore oben (Sperre, Import, 1p-Fahrzeug,
+                # 3p-Budget) sind bereits geprüft. Bei ruhender Box gilt es wie
+                # der Startzweig nur für ein gebunden dreiphasiges Fahrzeug;
+                # ein unbekanntes Fahrzeug könnte sonst einphasig an einer auf
+                # 3p gestellten Box laden.
+                return {
+                    "action": "SWITCH_3P",
+                    "target_phases": 3,
+                    "reason": "phase_up",
+                    "trigger": "window",
+                    "wait_s": int(round(up_wait_s)),
+                    "remaining_s": 0,
+                    "export_wh": round(export_wh, 1),
+                    "export_required_wh": round(export_required_wh, 1),
+                }
             # Grundname bleibt (Oberfläche erklärt ihn); die Uhr des
             # Managers läuft bei „Wh pending" weiter, hier wird sie nicht berührt.
             if not phase_up_condition_active:

@@ -2660,6 +2660,8 @@ def verify_backup(
         not entries and manifest.get("kind") != QUIESCED_OVERLAY_KIND
     ):
         raise BackupIntegrityError("Leeres oder unvollständiges Backup-Manifest.")
+    raw_file_encodings = manifest.get("file_encodings")
+    used_encodings: Set[str] = set()
     expected_paths: Set[str] = set()
     for entry in entries:
         if not isinstance(entry, dict):
@@ -2695,12 +2697,13 @@ def verify_backup(
                 or not _SHA256_RE.fullmatch(stored_sha)
                 or stored_size < 0
                 or content_size < 0
-                or manifest.get("file_encodings") in (None, [])
-                or COMPRESSED_ENTRY_ENCODING not in list(manifest.get("file_encodings") or [])
+                or not isinstance(raw_file_encodings, list)
+                or COMPRESSED_ENTRY_ENCODING not in raw_file_encodings
             ):
                 raise BackupIntegrityError("Ungültige Kodierungsmetadaten für {}".format(relative_text))
             if metadata.st_size != stored_size or sha256_file(path) != stored_sha:
                 raise BackupIntegrityError("Backup-Datei stimmt nicht mit Manifest überein: {}".format(relative_text))
+            used_encodings.add(COMPRESSED_ENTRY_ENCODING)
         else:
             raise BackupIntegrityError("Unbekannte Backup-Kodierung für {}".format(relative_text))
         restore_path = entry.get("restore_path")
@@ -2714,13 +2717,21 @@ def verify_backup(
                 raise BackupIntegrityError("Ungültige Restore-Metadaten für {}".format(relative_text)) from exc
             if mode < 0 or mode > 0o7777 or uid < 0 or gid < 0:
                 raise BackupIntegrityError("Ungültige Restore-Metadaten für {}".format(relative_text))
-    file_encodings = manifest.get("file_encodings")
+    file_encodings = raw_file_encodings
     if file_encodings is not None and (
         not isinstance(file_encodings, list)
         or not file_encodings
-        or any(item not in SUPPORTED_ENTRY_ENCODINGS for item in file_encodings)
+        or any(not isinstance(item, str) or item not in SUPPORTED_ENTRY_ENCODINGS for item in file_encodings)
     ):
         raise BackupIntegrityError("Manifest nennt eine unbekannte Backup-Kodierung")
+    # Die Liste nennt genau die tatsächlich verwendeten Kodierungen, jede einmal
+    # (so schreibt sie der Manifest-Writer). Eine Liste ohne passenden Eintrag
+    # oder mit Doppelnennung ist kein von uns erzeugtes Manifest.
+    if file_encodings is not None and (
+        len(set(file_encodings)) != len(file_encodings)
+        or set(file_encodings) != used_encodings
+    ):
+        raise BackupIntegrityError("Manifest-Kodierungsliste passt nicht zu den Dateieinträgen")
     sources = manifest.get("sources")
     if not isinstance(sources, list) or (
         manifest.get("kind") == QUIESCED_OVERLAY_KIND and not sources

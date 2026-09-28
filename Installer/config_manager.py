@@ -347,6 +347,9 @@ V4_BLOCK_WALLBOX = {
     # Symmetrie-Klausel der Hochschaltung 1p→3p (0/1,
     # Standard 0); Schwelle ist der bestehende Schieflastwert grid_pcc_imbalance_max_a.
     'wb_phase_up_symmetry_enable',
+    # Experimentelles 10-min-Fenster für 3p-Start und Hochschaltung 1p→3p
+    # (0/1, Standard 0); gelesen in wallbox_manager.py.
+    'wb_phase_up_window_enable',
     'wb_restart_delay_s', 'wb_min_charge_time_s',
     'wb_cloud_stop_delay_s', 'wb_phase_change_hold_s',
     'wb1_restart_delay_s', 'wb1_min_charge_time_s',

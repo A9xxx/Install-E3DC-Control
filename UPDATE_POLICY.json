@@ -1,9 +1,9 @@
 {
-  "version": "5.5.0a",
+  "version": "5.5.1",
   "min_version": "4.0.0",
-  "stable_release": "v5.5.0a",
-  "release_date": "2026-09-25",
-  "description": "v5.5.0a - Sicherheitskorrektur: PIN-Sperre nach Fehlversuchen gilt auch für den API-Zugriff per Header",
+  "stable_release": "v5.5.1",
+  "release_date": "2026-09-28",
+  "description": "v5.5.1 - Wallbox-Phasenreservierung und -Hochschaltung, Wärmepumpen-Kanalbesitz und experimenteller Netzboost, pseudonymisiertes Diagnosepaket",
   "update_strategy": "backup_replace_restart_v1",
   "installer_requires": "python3",
   "sanitized_republication": false,

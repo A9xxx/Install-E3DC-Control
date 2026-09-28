@@ -10834,6 +10834,37 @@ def _openwb_pro_phase_change_veto_until(c_data):
     )
 
 
+def _wallbox_phase_change_veto_until(
+    c_data,
+    *,
+    openwb_pro,
+    direct_phase_control,
+    phase_effective_hold_s,
+):
+    """Frist gegen eine neue Phasenkante je Ladepunkt (rein lesend).
+
+    openWB Pro: persistierte Hardware-Sperre samt 480-s-Wechselsperre
+    (``_openwb_pro_phase_change_veto_until``). E3DC-Direktvertrag: dieselbe
+    Beruhigung nach jedem Wechsel, also zusätzlich ``_last_phase_switch_ts``
+    plus ``phase_effective_hold_s`` (Standard 480 s). In dieser Sperre zählen
+    weder Uhr noch Export-Wh-Konto noch 10-min-Fenster; alle werden danach neu
+    verdient, damit auf einen Abstieg kein sofortiger Wiederaufstieg folgt.
+    Übrige Ladepunkte: ``_phase_3p_block_until`` wie bisher.
+    """
+
+    data = c_data if isinstance(c_data, dict) else {}
+    if openwb_pro:
+        return _openwb_pro_phase_change_veto_until(data)
+    until = float(data.get("_phase_3p_block_until", 0.0) or 0.0)
+    if direct_phase_control:
+        until = max(
+            until,
+            float(data.get("_last_phase_switch_ts", 0.0) or 0.0)
+            + max(0.0, _cfg_float(phase_effective_hold_s, 0.0)),
+        )
+    return until
+
+
 def _effective_phase_target(status, c_data, now_ts=None):
     """Return the phase target that must be used for physical budget checks."""
     now_ts = time.time() if now_ts is None else float(now_ts)
@@ -17260,11 +17291,20 @@ def _openwb_pro_phase_sequence_step(
             source="openwb_pro_phase_sequence",
             reason=sequence_reason,
             wb_id=c_id if c_id is not None else data.get("id", 0),
-            restart_amp=max(
-                6.0,
-                _cfg_float(data.get("current_set_amp"), 0.0),
-                _cfg_float(data.get("_last_openwb_hold_amp"), 0.0),
+            # 1p→3p läuft nach der Sequenz normativ mit 6 A je Phase wieder
+            # an (Startfreigabe der Hochschaltung, danach Rampe nach Budget);
+            # die bisher laufende Leistung reserviert observed_before_w. Der
+            # 1p-Strom ist kein Strom je Zielphase.
+            restart_amp=(
+                6.0
+                if target == 3
+                else max(
+                    6.0,
+                    _cfg_float(data.get("current_set_amp"), 0.0),
+                    _cfg_float(data.get("_last_openwb_hold_amp"), 0.0),
+                )
             ),
+            restart_amp_authoritative=bool(target == 3),
             current_step_amp=_current_step_amp_for_charger(active, default=0.1),
             clock_sample=clock_sample,
         )
@@ -19190,6 +19230,79 @@ def _apply_multi_allocation_output_gate(c_data, command, *, c_id=None):
     return cmd, True
 
 
+def _openwb_pro_own_phase_up_awaiting_grant(c_data, *, now_ts=None):
+    """True, solange die eigene 1p→3p-Reservierung der openWB Pro ohne Ausgang auf die Freigabe wartet.
+
+    Gebunden an den eigenen Sequenzauftrag (``GRANT_WAIT_SOURCE``) von 1 auf
+    3 Phasen in ``await_budget`` ohne jeden Ausgangsbeleg dieser Generation:
+    kein Commit, keine Sequenz, kein Intent, kein Ack, kein Recovery-Hold,
+    keine Wiederanlauffreigabe und kein Weck- oder CP-Beleg dieses Auftrags
+    (``preoutput_supersession_evidence_contract``). Ohne Geräte-I/O.
+    """
+
+    data = c_data if isinstance(c_data, dict) else {}
+    if not openwb_pro_session.is_openwb_pro_charger(data.get("charger")):
+        return False
+    reservation = data.get("_wallbox_phase_transition_reservation")
+    if not (
+        isinstance(reservation, dict)
+        and str(reservation.get("source") or "")
+        == wallbox_phase_transition.GRANT_WAIT_SOURCE
+        and _valid_phase_count(reservation.get("from_phases"), 0) == 1
+        and _valid_phase_count(reservation.get("target_phases"), 0) == 3
+        and not _phase_reservation_committed(reservation)
+    ):
+        return False
+    evidence = wallbox_phase_transition.preoutput_supersession_evidence_contract(
+        reservation,
+        sequence=data.get("_openwb_pro_phase_sequence"),
+        output_intent=data.get("_openwb_pro_phase_output_intent"),
+        output_ack=data.get("_openwb_pro_phase_output_ack"),
+        recovery_hold=data.get("_openwb_pro_phase_recovery_hold"),
+        restart_authorized=data.get("_openwb_pro_phase_restart_authorized"),
+        wakeup_active=_openwb_pro_phase_generation_wakeup_active(
+            data,
+            reservation,
+            now_ts=now_ts,
+        ),
+    )
+    return evidence.get("eligible") is True
+
+
+def _openwb_pro_phase_up_wait_output_phase_count(c_data, command=None):
+    """Phasenzahl der Stromumrechnung, solange die eigene Hochschaltung auf die Freigabe wartet.
+
+    Die Gruppenbindung (Zuteilung, elektrische Reservierung, Mindestslot)
+    bleibt dreiphasig. Die Box selbst zieht vor dem ersten Phasenausgang
+    dieser Generation nicht dreiphasig: Die Pro-Sequenz fährt vor jedem
+    Phasenziel auf 0 A. Belegt der frische Status eine laufende einphasige
+    Ladung (Statusziel 1, verifizierte Phasenleistung auf genau einer Phase),
+    rechnet der Wattdeckel den Strom deshalb mit dieser einen Phase um, statt
+    die weiterlaufende Ladung auf ein Drittel zu drosseln. Liefert 1, sonst 0
+    (keine Ausnahme). Ohne Geräte-I/O. Bei mehreren Ladepunkten begrenzt der
+    Mehrfachzuteilungsdeckel vorher weiter mit den dreiphasigen Gruppenampere.
+    """
+
+    box = c_data if isinstance(c_data, dict) else {}
+    cmd = command if isinstance(command, dict) else {}
+    if any(
+        _valid_phase_count(cmd.get(key), 0) > 1
+        for key in ("target_phases", "phases")
+    ):
+        return 0
+    if not _openwb_pro_own_phase_up_awaiting_grant(box):
+        return 0
+    status = _openwb_pro_driver_status(box, box.get("charger"))
+    if (
+        _wallbox_status_fresh_real_charging(status)
+        and status.get("phase_power_verified") is True
+        and _wallbox_observed_phase_count(status) == 1
+        and _valid_phase_count(status.get("phases_target"), 0) == 1
+    ):
+        return 1
+    return 0
+
+
 def _authorized_wallbox_output_phase_count(c_data, command=None):
     """Bindet den Strombefehl an die höchste aktuell wirksame Phasenzahl.
 
@@ -19199,11 +19312,17 @@ def _authorized_wallbox_output_phase_count(c_data, command=None):
     ``phases_target=3`` beschreibt dort die Wallbox, nicht die tatsächlich
     mögliche Fahrzeuglast. Explizite Phasenbefehle und
     Übergangsreservierungen bleiben dennoch die konservative Obergrenze; an
-    der openWB Pro nur eine laufende Übergangsreservierung.
+    der openWB Pro nur eine laufende Übergangsreservierung. Einzige Ausnahme:
+    Solange die eigene 1p→3p-Reservierung der openWB Pro ohne Ausgang auf die
+    Freigabe wartet und die Box frisch belegt einphasig lädt, folgt die
+    Stromumrechnung dieser einen Phase
+    (``_openwb_pro_phase_up_wait_output_phase_count``).
     """
 
     box = c_data if isinstance(c_data, dict) else {}
     cmd = command if isinstance(command, dict) else {}
+    if _openwb_pro_phase_up_wait_output_phase_count(box, cmd) == 1:
+        return 1
     candidates = []
     for value in (cmd.get("target_phases"), cmd.get("phases")):
         phase_count = _valid_phase_count(value, 0)
@@ -19333,6 +19452,12 @@ def _apply_authorized_wallbox_watt_output_gate(c_data, command, *, c_id=None):
         return cmd, True
     requested = max(0.0, _cfg_float(cmd.get("amp"), 0.0))
     phases = _authorized_wallbox_output_phase_count(box, cmd)
+    # Diagnose: Stromumrechnung mit der frisch belegten einen Phase, während
+    # die eigene 1p→3p-Reservierung ohne Ausgang auf die Freigabe wartet.
+    phase_up_wait_one_phase = bool(
+        phases == 1
+        and _openwb_pro_phase_up_wait_output_phase_count(box, cmd) == 1
+    )
     autonomous_projection = box.get("_autonomous_solar_watt_projection")
     autonomous_method_bound = bool(
         method == "set_amp_autonomous_solar"
@@ -19361,6 +19486,7 @@ def _apply_authorized_wallbox_watt_output_gate(c_data, command, *, c_id=None):
         "cap_amp": cap_amp,
         "cap_w": cap_w,
         "phases": phases,
+        "phase_up_wait_one_phase": phase_up_wait_one_phase,
         "cycle_token": box.get("_wallbox_cycle_token"),
         "reason": str(contract.get("reason") or "storage_wallbox_budget"),
         "watt_budget_semantics": (
@@ -19973,6 +20099,120 @@ def _bind_admitted_actuator_intent(c_data, command, *, c_id=None):
     return intent
 
 
+def _phase_reservation_committed(reservation):
+    """True, wenn die Reservierung einen Commit (Ausgangszusage) trägt.
+
+    ``grant_state`` allein genügt nicht: Ein erneut angewendeter Grant setzt
+    ihn nach dem Commit wieder auf ``granted``; ``committed_w`` und
+    ``committed_ts`` bleiben dagegen bestehen.
+    """
+
+    item = reservation if isinstance(reservation, dict) else {}
+    return bool(
+        int(_cfg_float(item.get("committed_w"), 0.0)) > 0
+        or _cfg_float(item.get("committed_ts"), 0.0) > 0.0
+        or str(item.get("grant_state") or "") == "committed"
+    )
+
+
+def _openwb_pro_phase_reservation_current_cap_amp(reservation):
+    """Strom je Phase, den eine zugesagte 1p→3p-Reservierung im Wiederanlauf trägt.
+
+    Gilt nur für eine aktive, committete Reservierung mit Ziel 3 in
+    ``confirm_target`` und nur, bis der Wiederanlauf unter Last bestätigt
+    ist (``restart_load_confirmed_ts``: drei gültige Messungen über 500 W,
+    stabil über 10 s, gleich mit wie vielen Phasen das Fahrzeug lädt). Ein
+    zwei- oder einphasig ladendes Fahrzeug bestätigt die Zielphasen nie und
+    bliebe sonst die ganze Stecksession auf dem Reservierungsstrom. Nach
+    Lease-Ablauf (``recovery_hold``) gilt kein Deckel; dort bindet die
+    Zuteilung weiter drei Phasen. Die Reservierung deckt die bisherige
+    Leistung beziehungsweise den 6-A-Wiederanlauf
+    (``planned_reservation_power_w`` ohne die Messreserve); der Deckel ist
+    diese Leistung je Phase, abgerundet auf die Stromschrittweite und nie
+    unter dem Wiederanlaufstrom. Sonst ``None`` (kein Deckel).
+    """
+
+    item = reservation if isinstance(reservation, dict) else {}
+    if not (
+        item.get("active") is True
+        and _valid_phase_count(item.get("target_phases"), 0) == 3
+        and _phase_reservation_committed(item)
+        and str(item.get("stage") or "") == "confirm_target"
+        and _cfg_float(item.get("restart_load_confirmed_ts"), 0.0) <= 0.0
+    ):
+        return None
+    w_per_amp = _cfg_float(item.get("effective_w_per_amp"), 0.0)
+    if not math.isfinite(w_per_amp) or w_per_amp <= 0.0:
+        w_per_amp = 230.0 * 3.0
+    restart_amp = max(6.0, _cfg_float(item.get("restart_amp"), 6.0))
+    reserved_w = max(
+        max(0.0, _cfg_float(item.get("observed_before_w"), 0.0)),
+        restart_amp * w_per_amp,
+    )
+    step = _cfg_float(item.get("current_step_amp"), 1.0)
+    if not math.isfinite(step) or step <= 0.0:
+        step = 1.0
+    cap_amp = math.floor(reserved_w / w_per_amp / step + 1e-9) * step
+    return round(max(restart_amp, cap_amp), 3)
+
+
+def _apply_openwb_pro_phase_reservation_output_gate(c_data, command, *, charger=None):
+    """Begrenzt Ströme der openWB Pro im Wiederanlauf nach 1p→3p auf die Phasenreservierung.
+
+    Budgetpflicht: Der Speicherregler hat für den Wechsel genau die
+    Reservierung freigegeben; bis der Wiederanlauf unter Last bestätigt ist
+    (Zielphasen bestätigt oder, bei einem zwei- oder einphasig ladenden
+    Fahrzeug, stabile Ladung mit weniger Phasen), überschreitet kein
+    Strombefehl diese Leistung. Danach folgt die Rampe wieder dem
+    Wattbudget. Nur absenkend, ohne Geräte-I/O; 0 A und Befehle ohne Strom
+    bleiben unverändert.
+    """
+
+    box = c_data if isinstance(c_data, dict) else {}
+    cmd = dict(command or {})
+    if not openwb_pro_session.is_openwb_pro_charger(charger):
+        return cmd
+    method = str(cmd.get("method") or cmd.get("kind") or "").strip()
+    if method not in (
+        "set_amp_and_state",
+        "set_current",
+        "set_direct_current",
+        "set_amp_sonnenmodus",
+        "set_amp_autonomous_solar",
+    ):
+        return cmd
+    requested = max(0.0, _cfg_float(cmd.get("amp"), 0.0))
+    if requested <= 0.0:
+        return cmd
+    reservation = box.get("_wallbox_phase_transition_reservation")
+    cap_amp = _openwb_pro_phase_reservation_current_cap_amp(reservation)
+    if cap_amp is None:
+        box.pop("_openwb_pro_phase_reservation_output_gate", None)
+        return cmd
+    applied = min(requested, cap_amp)
+    box["_openwb_pro_phase_reservation_output_gate"] = {
+        "contract": "openwb_pro_phase_reservation_output_gate_v1",
+        "active": True,
+        "method": method,
+        "requested_amp": requested,
+        "applied_amp": applied,
+        "cap_amp": cap_amp,
+        "limited": bool(applied < requested),
+        "reservation_id": str(
+            (reservation or {}).get("reservation_id")
+            or (reservation or {}).get("transition_id")
+            or ""
+        ),
+        "stage": str((reservation or {}).get("stage") or ""),
+        "requested_w": int(_cfg_float((reservation or {}).get("requested_w"), 0.0)),
+        "cycle_token": str(box.get("_wallbox_cycle_token") or ""),
+        "hardware_write": False,
+    }
+    if applied < requested:
+        cmd["amp"] = applied
+    return cmd
+
+
 def _execute_wallbox_driver_command(c_data, command, c_id=None, reason=""):
     """Einzelne Kante für Schreibzugriffe des Wallbox-Treibers.
 
@@ -20338,6 +20578,11 @@ def _execute_wallbox_driver_command(c_data, command, c_id=None, reason=""):
     )
     if not phase_cap_allowed:
         return False
+    cmd = _apply_openwb_pro_phase_reservation_output_gate(
+        box,
+        cmd,
+        charger=charger,
+    )
 
     def _cmd_int(name, default=0):
         try:
@@ -23153,6 +23398,264 @@ def _attach_wallbox_actuator_contract_diagnostics(wb_detail, c_data):
     wb_detail["admitted_actuator_intent_conflict_count"] = conflicts
 
 
+def _phase_window_step(
+    c_data,
+    config,
+    *,
+    now_ts,
+    openwb_pro,
+    direct_phase_control,
+    live,
+    live_fresh,
+    live_sample_invalid,
+    grid_power_w,
+    battery_power_w,
+    wb_power_w,
+    phase_budget_w,
+    allowed_w,
+    budget_fresh,
+    phase_3p_min_w,
+    phase_block_active,
+    max_dt_s=None,
+):
+    """Schreibt das experimentelle 10-min-Fenster eines Ladepunkts fort.
+
+    Ohne Geräte-I/O; verändert nur ``c_data["_phase_window_state"]``. Das
+    Fenster läuft immer mit (Diagnose), wirkt aber nur, wenn
+    ``wb_phase_up_window_enable`` (Standard 0) und die Energie-Phasenpolitik
+    eingeschaltet sind und die Box die openWB Pro oder der E3DC-Direktvertrag
+    ist (``effective_ready``). Live-Werte zählen nur frisch und plausibel,
+    das Budget des Speicherreglers nur frisch autorisiert (dieselbe Bindung
+    wie die Hochschaltregel). Während einer Phasensperre und der Haltezeit
+    nach jedem Wechsel (``phase_block_active``) beginnt das Fenster neu.
+    Schwelle: 3p-Minimum plus ``PHASE_WINDOW_MARGIN_PCT``. Die größte
+    Probenlücke folgt dem Leerlauftakt des Managers (``wb_idle_poll_s``,
+    ``phase_window_max_dt_s``), sofern ``max_dt_s`` nicht vorgegeben ist.
+    """
+
+    data = c_data if isinstance(c_data, dict) else {}
+    cfg = config if isinstance(config, dict) else {}
+    live_ok = bool(
+        isinstance(live, dict)
+        and live.get("Grid_Power") is not None
+        and live.get("Battery_Power") is not None
+        and live_fresh
+        and not live_sample_invalid
+    )
+    budget_w = (
+        min(float(phase_budget_w or 0.0), float(allowed_w or 0.0))
+        if budget_fresh
+        else None
+    )
+    sample_w = wallbox_decision.phase_window_sample_w(
+        wb_power_w=wb_power_w,
+        grid_power_raw_w=(grid_power_w if live_ok else None),
+        battery_power_w=(battery_power_w if live_ok else None),
+        margin_w=max(0.0, _cfg_float(cfg.get("wb_phase_up_export_margin_w"), 125.0)),
+        authorized_budget_w=budget_w,
+    )
+    # Nie unter dem physikalischen 3p-Minimum (6 A × 230 V × 3 Phasen).
+    floor_w = max(6 * 230.0 * 3, _cfg_float(phase_3p_min_w, 0.0))
+    window_max_dt_s = (
+        _cfg_float(max_dt_s, wallbox_decision.PHASE_WINDOW_MAX_DT_S)
+        if max_dt_s is not None
+        else wallbox_decision.phase_window_max_dt_s(
+            idle_loop_s=wallbox_loop_sleep_s(cfg),
+            active_loop_s=wallbox_loop_sleep_s(cfg, made_changes=True),
+        )
+    )
+    window = wallbox_decision.phase_window_contract(
+        None if phase_block_active else data.get("_phase_window_state"),
+        p_avail_w=sample_w,
+        data_valid=live_ok,
+        now_ts=now_ts,
+        threshold_w=floor_w * (1.0 + wallbox_decision.PHASE_WINDOW_MARGIN_PCT / 100.0),
+        dip_floor_w=floor_w,
+        max_dt_s=window_max_dt_s,
+    )
+    # In der Sperre bleibt kein Zeitanker stehen: Die erste Probe danach deckt
+    # keine Sperrzeit ab, das Fenster beginnt mit dem Ende der Sperre.
+    data["_phase_window_state"] = None if phase_block_active else window.get("state")
+    enabled = bool(
+        (openwb_pro or direct_phase_control)
+        and _truthy_config(cfg.get("wb_phase_energy_policy_enable", 1))
+        and _truthy_config(cfg.get("wb_phase_up_window_enable", 0))
+    )
+    result = {key: value for key, value in window.items() if key != "state"}
+    result.update({
+        "enabled": enabled,
+        "effective_ready": bool(enabled and window.get("ready") is True),
+        "live_ok": live_ok,
+        "sample_w": sample_w,
+        "budget_bound": budget_w is not None,
+        "block_restart": bool(phase_block_active),
+        "max_dt_s": round(window_max_dt_s, 1),
+    })
+    return result
+
+
+def _openwb_pro_phase_up_start_hold_amp(phase_budget_w, allowed_w):
+    """Erster Strom der openWB Pro nach einer ausgegebenen Hochschaltung 1p→3p.
+
+    Der Wiederanlauf beginnt normativ mit 6 A je Phase, wenn das frische
+    Wattbudget dafür reicht (6 A × 230 V × 3 Phasen), sonst mit 0 A. Er ist nie
+    höher: Die Phasenreservierung deckt genau diesen Wiederanlauf; die weitere
+    Rampe folgt danach dem Wattbudget des Speicherreglers.
+    """
+
+    available_w = min(
+        max(0.0, _cfg_float(phase_budget_w, 0.0)),
+        max(0.0, _cfg_float(allowed_w, 0.0)),
+    )
+    return 6.0 if available_w >= 6.0 * 230.0 * 3.0 else 0.0
+
+
+def _openwb_pro_phase_up_block_reason(c_data):
+    """Kurzer, lesbarer Grund, warum eine Pro-Hochschaltung (noch) nicht ausgegeben wurde."""
+
+    data = c_data if isinstance(c_data, dict) else {}
+    token = str(data.get("_wallbox_cycle_token") or "")
+    block = data.get("_openwb_pro_phase_generation_cycle_block")
+    if (
+        isinstance(block, dict)
+        and block.get("active") is True
+        and token
+        and str(block.get("cycle_token") or "") == token
+    ):
+        return str(block.get("reason") or "phase_generation_cycle_block")
+    hold = data.get("_openwb_pro_phase_recovery_hold")
+    if isinstance(hold, dict) and hold.get("active"):
+        return "recovery_hold:%s" % (hold.get("reason") or "")
+    reservation = data.get("_wallbox_phase_transition_reservation")
+    if isinstance(reservation, dict) and reservation:
+        if (
+            reservation.get("active")
+            and str(reservation.get("stage") or "") == "await_budget"
+        ):
+            return "await_storage_grant:%d/%d W" % (
+                int(_cfg_float(reservation.get("granted_w"), 0.0)),
+                int(_cfg_float(reservation.get("requested_w"), 0.0)),
+            )
+        return "reservation_%s:%s" % (
+            str(reservation.get("stage") or ""),
+            str(reservation.get("blocker") or ""),
+        )
+    gate = data.get("_openwb_pro_phase_output_capability_gate")
+    if isinstance(gate, dict) and gate.get("allowed") is False:
+        return "capability:%s" % (gate.get("blocker") or "")
+    dispatch = data.get("_wallbox_driver_dispatch_contract")
+    if isinstance(dispatch, dict) and dispatch.get("blocked"):
+        return str(dispatch.get("blocker") or "dispatch_blocked")
+    return "sequence_pending"
+
+
+def _update_openwb_pro_phase_up_dispatch_block(
+    c_data,
+    c_id,
+    *,
+    dispatched,
+    trigger=None,
+    now_ts=None,
+):
+    """Hält einen nicht ausgegebenen Hochschaltversuch in Diagnose und Log fest.
+
+    Ohne Geräte-I/O. Nach einer ausgegebenen Hochschaltung (``dispatched``)
+    und während einer zugesagten, normal laufenden Sequenz
+    (``_openwb_pro_phase_up_sequence_running``) gibt es keinen Blockadegrund;
+    ein alter wird gelöscht. Sonst stehen Grund
+    (``_openwb_pro_phase_up_block_reason``), Auslöser und Zeitpunkt unter
+    ``_openwb_pro_phase_up_dispatch_block`` für den Diagnoseexport, und das Log
+    meldet „Hochschaltung 1p→3p ausgesetzt“ je Grundklasse höchstens alle
+    300 s (ein Wechsel der Grundklasse meldet sofort). Das bloße Warten auf
+    die Speicherfreigabe meldet das Log erst nach der Wartegrenze
+    ``DEFAULT_GRANT_WAIT_S``; endet die eigene Sequenz dort, meldet der
+    Abbruch selbst.
+    """
+
+    data = c_data if isinstance(c_data, dict) else {}
+    if dispatched or _openwb_pro_phase_up_sequence_running(data):
+        _clear_openwb_pro_phase_up_dispatch_block(data)
+        return None
+    now_value = float(now_ts if now_ts is not None else time.time())
+    reason = _openwb_pro_phase_up_block_reason(data)
+    reason_class = reason.split(":", 1)[0]
+    record = {
+        "reason": reason,
+        "trigger": str(trigger or ""),
+        "ts": now_value,
+    }
+    data["_openwb_pro_phase_up_dispatch_block"] = record
+    log_due = True
+    if reason_class == "await_storage_grant":
+        reservation = data.get("_wallbox_phase_transition_reservation")
+        started_ts = (
+            _cfg_float(reservation.get("started_ts"), 0.0)
+            if isinstance(reservation, dict)
+            else 0.0
+        )
+        log_due = bool(
+            started_ts > 0.0
+            and now_value - started_ts
+            >= wallbox_phase_transition.DEFAULT_GRANT_WAIT_S
+        )
+    if log_due:
+        _log_state_once(
+            data,
+            "phase_up_dispatch_blocked",
+            (reason_class,),
+            "WB%s Hochschaltung 1p→3p ausgesetzt: %s" % (c_id, reason),
+            min_interval_s=300.0,
+        )
+    return record
+
+
+_OPENWB_PRO_PHASE_UP_RUNNING_STAGES = frozenset({
+    "ramp_to_zero",
+    "zero_settle",
+    "set_phase",
+    "cp_interrupt",
+    "restart_delay",
+    "confirm_target",
+})
+
+
+def _openwb_pro_phase_up_sequence_running(c_data):
+    """True, solange eine zugesagte Hochschaltung 1p→3p normal läuft.
+
+    Die Reservierung ist committed und steht in einer Sequenzstufe (0 A,
+    Phasenziel, Wiederanlauf, Zielbestätigung); weder ein Recovery-Hold noch
+    eine Zyklussperre des Ausgangs liegen an. Das ist kein Blockadegrund.
+    """
+
+    data = c_data if isinstance(c_data, dict) else {}
+    hold = data.get("_openwb_pro_phase_recovery_hold")
+    if isinstance(hold, dict) and hold.get("active"):
+        return False
+    if _openwb_pro_phase_generation_cycle_blocked(data):
+        return False
+    reservation = data.get("_wallbox_phase_transition_reservation")
+    return bool(
+        isinstance(reservation, dict)
+        and reservation.get("active") is True
+        and _valid_phase_count(reservation.get("target_phases"), 0) == 3
+        and _phase_reservation_committed(reservation)
+        and str(reservation.get("stage") or "")
+        in _OPENWB_PRO_PHASE_UP_RUNNING_STAGES
+    )
+
+
+def _clear_openwb_pro_phase_up_dispatch_block(c_data):
+    """Löscht den Blockadegrund einer Hochschaltung (ohne Geräte-I/O).
+
+    Aufrufer: ausgegebene oder fertige Sequenz, abgeschlossene oder
+    terminal beendete Generation, beendete Hochschaltanforderung (Fenster
+    weg, Sperre, Abstecken). Liefert, ob ein Grund gelöscht wurde.
+    """
+
+    data = c_data if isinstance(c_data, dict) else {}
+    return data.pop("_openwb_pro_phase_up_dispatch_block", None) is not None
+
+
 def _attach_openwb_pro_one_phase_diagnostics(wb_detail, c_data):
     """1p-Deckel-Diagnose in beide wb_detail-Builder spiegeln.
 
@@ -23181,6 +23684,18 @@ def _attach_openwb_pro_one_phase_diagnostics(wb_detail, c_data):
         # übersprungene 3p-Beobachtung eines einphasigen Fahrzeugs.
         ("_openwb_pro_start_window_phase_restart", "openwb_pro_start_window_phase_restart"),
         ("_wallbox_phase_observation_skip", "wallbox_phase_observation_skip"),
+        # Phasenauftrag: Lease-Gate, Ablaufauflösung, Recovery-Hold und das
+        # begrenzte Warten auf die Speicherfreigabe, damit ein blockierter
+        # Hochschaltversuch nicht ohne Diagnose endet.
+        ("_openwb_pro_phase_lease_gate", "openwb_pro_phase_lease_gate"),
+        ("_openwb_pro_phase_expiration_contract", "openwb_pro_phase_expiration_contract"),
+        ("_openwb_pro_phase_recovery_hold", "openwb_pro_phase_recovery_hold"),
+        ("_openwb_pro_phase_grant_wait_contract", "openwb_pro_phase_grant_wait"),
+        ("_openwb_pro_phase_grant_wait_abort", "openwb_pro_phase_grant_wait_abort"),
+        # Anforderung des Phasenziels je Generation und Stromdeckel der
+        # Reservierung bis zum bestätigten Wiederanlauf unter Last.
+        ("_openwb_pro_phase_up_request", "openwb_pro_phase_up_request"),
+        ("_openwb_pro_phase_reservation_output_gate", "openwb_pro_phase_reservation_output_gate"),
     ):
         value = c_data.get(source_key)
         if isinstance(value, dict):
@@ -23190,6 +23705,24 @@ def _attach_openwb_pro_one_phase_diagnostics(wb_detail, c_data):
         wb_detail["openwb_pro_phase_mapping_proof"] = (
             wallbox_phase_balancing.phase_mapping_proof_persistent(proof)
         )
+    reservation = c_data.get("_wallbox_phase_transition_reservation")
+    if isinstance(reservation, dict) and reservation:
+        wb_detail["phase_transition_reservation"] = {
+            key: reservation.get(key)
+            for key in (
+                "reservation_id", "stage", "active", "grant_state",
+                "requested_w", "granted_w", "restart_amp",
+                "observed_before_w", "blocker", "started_ts",
+                "lease_until_ts", "from_phases", "target_phases",
+                "grant_sufficient_ts", "restart_load_confirmed_ts",
+                "restart_load_phases",
+            )
+        }
+    dispatch_block = c_data.get("_openwb_pro_phase_up_dispatch_block")
+    if isinstance(dispatch_block, dict) and dispatch_block:
+        # Letzter nicht ausgegebener Hochschaltversuch (Grund und Zeitpunkt).
+        wb_detail["phase_up_block_reason"] = str(dispatch_block.get("reason") or "")
+        wb_detail["phase_up_block_ts"] = _cfg_float(dispatch_block.get("ts"), 0.0)
 
 
 def _wallbox_stop_observation_contract(status, *, now_ts=None):
@@ -31175,6 +31708,8 @@ def _finalize_completed_openwb_pro_phase_transition(c_data, status, *, now_ts=No
             now_ts if now_ts is not None else time.time()
         )
         data["_openwb_pro_phase_terminal_target"] = target
+        # Abgeschlossene Generation: kein veralteter Blockadegrund im Export.
+        _clear_openwb_pro_phase_up_dispatch_block(data)
         return True
 
     data.update(previous)
@@ -31187,10 +31722,58 @@ def _finalize_completed_openwb_pro_phase_transition(c_data, status, *, now_ts=No
     return False
 
 
+def _process_restart_probe_idle_readback(status, target_phases):
+    """Frischer Ruhe-Readback, der einen Ausgang der wiederhergestellten Generation ausschließt.
+
+    Die Generation ist per persistierter Evidenz ausgangslos (kein Sequenz-,
+    Intent-, Ack- oder Wiederanlaufbeleg). Der Readback bestätigt den
+    Gerätezustand: kein Laden (Ladebit explizit aus und Beobachtungsvertrag),
+    höchstens 50 W, CP explizit inaktiv und kein wirksames Stromangebot
+    (höchstens 0,5 A). Das initiale 6-A-Angebot der openWB Pro nach dem
+    Anstecken (siehe 3p-Kaltstartvertrag) zählt nur, wenn die Box frisch noch
+    die bisherige Phasenzahl meldet: Der Wiederanlauf dieser Generation käme
+    erst nach dem Phasenwechsel. Fehlende Felder sind nie ein Ruhebeleg.
+    """
+
+    st = status if isinstance(status, dict) else {}
+    target = _valid_phase_count(target_phases, 0)
+    offered = _fresh_wallbox_reported_current_amp(st)
+    if target not in (1, 3) or offered is None:
+        return False
+    previous_phases = 1 if target == 3 else 3
+    return bool(
+        st.get("cp_interrupt_isactive") in (False, 0)
+        and st.get("charging", st.get("charge_state")) in (False, 0)
+        and not _wb_status_real_charging(st)
+        and any(
+            st.get(key) is not None
+            for key in ("real_power_w", "power_w", "phase_power_sum_w")
+        )
+        and wallbox_phase_transition.status_power_w(st) <= 50.0
+        and (
+            offered <= 0.5
+            or (
+                offered <= 6.0
+                and openwb_pro_session.phase_target_readback_confirmed(
+                    st,
+                    previous_phases,
+                )
+            )
+        )
+    )
+
+
 def _finalize_process_restart_preoutput_openwb_pro_phase_transition(
     c_data, status, *, now_ts=None
 ):
-    """Supersediert eine alte No-output-Generation ohne Geräteausgang."""
+    """Supersediert eine alte No-output-Generation ohne Geräteausgang.
+
+    Auflösung nur mit einem frischen Readback nach der Wiederherstellung:
+    entweder laufende Ladung auf der Gegenphase (das alte Ziel ist nicht
+    wirksam) oder eine ruhende Box (``_process_restart_probe_idle_readback``).
+    Ohne diese Auflösung sperrt die Probe jeden positiven Strom, ``set_phases``
+    und CP; bei ruhender Box käme sonst nie ein Ladestart zustande.
+    """
 
     data = c_data if isinstance(c_data, dict) else {}
     st = status if isinstance(status, dict) else {}
@@ -31201,35 +31784,52 @@ def _finalize_process_restart_preoutput_openwb_pro_phase_transition(
         readback_ts /= 1000.0
     target = _valid_phase_count(marker.get("target_phases"), 0)
     observed = _wallbox_observed_phase_count(st)
-    if not (
+    fresh_after_restore = bool(
         marker.get("active") is True
-        and _wallbox_status_fresh_real_charging(st)
         and readback_ts > _cfg_float(marker.get("restored_ts"), 0.0) > 0.0
+        and target in (1, 3)
+    )
+    opposite_phase_charge = bool(
+        fresh_after_restore
+        and _wallbox_status_fresh_real_charging(st)
         and st.get("cp_interrupt_isactive") in (False, 0)
         and _wb_status_connected(st)
         and _wb_status_real_power(st) > 500.0
         and st.get("phase_power_verified") is True
-        and target in (1, 3)
         and observed in (1, 3)
         and observed != target
         and (_fresh_wallbox_reported_current_amp(st) or 0.0) >= 5.5
-    ):
+    )
+    idle_readback = bool(
+        fresh_after_restore
+        and not opposite_phase_charge
+        and _process_restart_probe_idle_readback(st, target)
+    )
+    if not (opposite_phase_charge or idle_readback):
         return False
+    previous_phases = 1 if target == 3 else 3
     result = _supersede_openwb_pro_preoutput_phase_reservation(
         data,
-        observed,
+        observed if opposite_phase_charge else previous_phases,
         now_ts=float(now_ts if now_ts is not None else time.time()),
     )
     result.update({
-        "source": "process_restart_fresh_opposite_phase_charge",
+        "source": (
+            "process_restart_fresh_opposite_phase_charge"
+            if opposite_phase_charge
+            else "process_restart_fresh_idle_readback"
+        ),
         "observed_phases": observed,
         "observed_power_w": round(_wb_status_real_power(st), 3),
         "hardware_write": False,
     })
+    if idle_readback:
+        result["offered_current_a"] = _fresh_wallbox_reported_current_amp(st)
     data["_openwb_pro_phase_preoutput_restart_terminal"] = dict(result)
     done = result.get("superseded") is True and result.get("persisted") is True
     if done:
         data.pop("_openwb_pro_phase_preoutput_restart_probe", None)
+        _clear_openwb_pro_phase_up_dispatch_block(data)
     return done
 
 
@@ -31254,10 +31854,6 @@ def _finalize_expired_uncommitted_openwb_pro_phase_transition(
     if not isinstance(reservation, dict):
         return False
     now_value = float(now_ts if now_ts is not None else time.time())
-    wakeup_until = max(
-        _cfg_float(data.get("_openwb_pro_start_wakeup_allowed_after"), 0.0),
-        _cfg_float(data.get("_openwb_pro_phase_wait_until"), 0.0),
-    )
     resolution = wallbox_phase_transition.expiration_resolution_contract(
         reservation,
         status=st,
@@ -31267,9 +31863,10 @@ def _finalize_expired_uncommitted_openwb_pro_phase_transition(
         output_ack=data.get("_openwb_pro_phase_output_ack"),
         recovery_hold=data.get("_openwb_pro_phase_recovery_hold"),
         restart_authorized=data.get("_openwb_pro_phase_restart_authorized"),
-        wakeup_active=bool(
-            wakeup_until > now_value
-            or data.get("_openwb_cp_start_sent", False)
+        wakeup_active=_openwb_pro_phase_generation_wakeup_active(
+            data,
+            reservation,
+            now_ts=now_value,
         ),
         clock_sample=_openwb_pro_control_time_sample(wall_ts=now_value),
     )
@@ -31289,6 +31886,8 @@ def _finalize_expired_uncommitted_openwb_pro_phase_transition(
         data["_openwb_pro_phase_terminal_expired_reason"] = str(
             resolution.get("reason") or "expired_uncommitted_idle_confirmed"
         )
+        # Die Generation ist terminal: kein veralteter Blockadegrund im Export.
+        _clear_openwb_pro_phase_up_dispatch_block(data)
         return True
 
     data.update(previous)
@@ -31304,6 +31903,261 @@ def _finalize_expired_uncommitted_openwb_pro_phase_transition(
         "terminal": False,
         "reason": "phase_expiration_cleanup_persist_failed",
     }
+    return False
+
+
+def _openwb_pro_phase_generation_wakeup_active(c_data, reservation, *, now_ts):
+    """Weck- bzw. CP-Beleg genau dieser Phasengeneration (Ablauf und Wartegrenze).
+
+    Ein CP-Start oder Weckimpuls zählt nur, wenn sein Zeitstempel nicht vor
+    dem Auftragsbeginn (``started_ts``) liegt (Muster
+    ``_phase_transition_preoutput_evidence``). Eine laufende Weck- oder
+    Phasenwartefrist und ein anstehender Weckversuch zählen immer. Das
+    Legacy-Flag ``_openwb_cp_start_sent`` bleibt nach einem Start-Weckimpuls
+    die ganze Stecksession gesetzt und belegt deshalb nur dann einen Ausgang,
+    wenn kein Zeitstempel vorliegt (fail-closed für Altbestände).
+    """
+
+    data = c_data if isinstance(c_data, dict) else {}
+    item = reservation if isinstance(reservation, dict) else {}
+    now_value = float(now_ts if now_ts is not None else time.time())
+    started_ts = _cfg_float(item.get("started_ts"), 0.0)
+    receipt = data.get("_openwb_pro_start_wakeup_receipt")
+    receipt = receipt if isinstance(receipt, dict) else {}
+    stamps = [
+        _cfg_float(value, 0.0)
+        for value in (
+            data.get("_openwb_last_cp_start_ts"),
+            data.get("_openwb_pro_start_wakeup_cp_ts"),
+            receipt.get("last_sent_ts"),
+        )
+    ]
+    stamp_bound = any(
+        ts > 0.0 and (started_ts <= 0.0 or ts >= started_ts)
+        for ts in stamps
+    )
+    legacy_flag_bound = bool(
+        data.get("_openwb_cp_start_sent", False)
+        and not any(ts > 0.0 for ts in stamps)
+    )
+    wait_until = max(
+        _cfg_float(data.get("_openwb_pro_start_wakeup_allowed_after"), 0.0),
+        _cfg_float(data.get("_openwb_pro_phase_wait_until"), 0.0),
+    )
+    return bool(
+        stamp_bound
+        or legacy_flag_bound
+        or bool(data.get("_openwb_pro_start_wakeup_pending", False))
+        or wait_until > now_value
+    )
+
+
+def _note_openwb_pro_phase_up_request(c_data, phase_recommendation, *, now_ts=None):
+    """Zählt Zyklen, in denen die Empfehlung das Ziel der eigenen Reservierung nicht mehr anfordert.
+
+    Ohne Geräte-I/O. Gebunden an die Generation (``reservation_id``) einer
+    aktiven, eigenen Pro-Reservierung im Warten auf die Speicherfreigabe;
+    je Managerzyklus (``_wallbox_cycle_token``) wird höchstens einmal
+    gezählt, und jede Anforderung desselben Ziels setzt den Zähler zurück.
+    Über den Abbruch entscheidet allein ``grant_wait_contract`` im Aggregator.
+    """
+
+    data = c_data if isinstance(c_data, dict) else {}
+    reservation = data.get("_wallbox_phase_transition_reservation")
+    if not (
+        isinstance(reservation, dict)
+        and reservation.get("active") is True
+        and str(reservation.get("stage") or "") == "await_budget"
+        and str(reservation.get("source") or "")
+        == wallbox_phase_transition.GRANT_WAIT_SOURCE
+    ):
+        data.pop("_openwb_pro_phase_up_request", None)
+        return None
+    recommendation = (
+        phase_recommendation if isinstance(phase_recommendation, dict) else {}
+    )
+    reservation_id = str(
+        reservation.get("reservation_id")
+        or reservation.get("transition_id")
+        or ""
+    )
+    target = _valid_phase_count(reservation.get("target_phases"), 0)
+    requested = bool(
+        target in (1, 3)
+        and _valid_phase_count(recommendation.get("target_phases"), 0) == target
+    )
+    token = str(data.get("_wallbox_cycle_token") or "")
+    previous = data.get("_openwb_pro_phase_up_request")
+    previous = (
+        previous
+        if isinstance(previous, dict)
+        and str(previous.get("reservation_id") or "") == reservation_id
+        else {}
+    )
+    cycles = max(0, int(_cfg_float(previous.get("unrequested_cycles"), 0.0)))
+    same_cycle = bool(token and str(previous.get("cycle_token") or "") == token)
+    if requested:
+        cycles = 0
+    elif not same_cycle:
+        cycles += 1
+    record = {
+        "reservation_id": reservation_id,
+        "target_phases": target,
+        "requested": requested,
+        "action": str(recommendation.get("action") or ""),
+        "reason": str(recommendation.get("reason") or ""),
+        "unrequested_cycles": cycles,
+        "cycle_token": token,
+        "ts": float(now_ts if now_ts is not None else time.time()),
+        "hardware_write": False,
+    }
+    data["_openwb_pro_phase_up_request"] = record
+    return record
+
+
+def _finalize_openwb_pro_phase_up_grant_wait(c_data, *, now_ts=None):
+    """Beendet eine 1p→3p-Reservierung ohne Ausgang nach begrenztem Warten.
+
+    Solange die Hochschaltung nur auf die Speicherfreigabe wartet, rechnen
+    Zuteilung und Speicherregler bereits mit drei Phasen, während die Box
+    einphasig weiterlädt. Nach
+    ``DEFAULT_GRANT_WAIT_S`` ohne ausreichenden Grant, nach
+    ``DEFAULT_GRANT_WAIT_S`` mit ungenutzter Freigabe oder sobald die
+    Empfehlung das Ziel zwei Zyklen lang nicht mehr anfordert, wird der
+    Auftrag deshalb ohne Geräte-I/O beendet. Ein Weck- oder CP-Beleg zählt
+    nur für diese Generation (``_openwb_pro_phase_generation_wakeup_active``).
+    Den nächsten Versuch sperrt dieselbe Rückzugsverzögerung wie nach einem
+    gescheiterten Hochschaltversuch (``wb_phase_retry_block_s``, mindestens
+    die Phasenwartezeit); während dieser Sperre beginnen Hochschaltuhr und
+    10-min-Fenster neu, und das Export-Wh-Konto beginnt bei 0: Beide werden
+    nach der Sperre neu verdient, kein Sofortversuch am Sperrende. Bei einem
+    Persistenzfehler bleibt der vorige Zustand erhalten und der Abbruch wird
+    im Folgezyklus wiederholt.
+    """
+
+    data = c_data if isinstance(c_data, dict) else {}
+    if not openwb_pro_session.is_openwb_pro_charger(data.get("charger")):
+        return False
+    reservation = data.get("_wallbox_phase_transition_reservation")
+    if not isinstance(reservation, dict) or not reservation:
+        # Ohne Auftrag keine veraltete Wartediagnose.
+        data.pop("_openwb_pro_phase_grant_wait_contract", None)
+        return False
+    now_value = float(now_ts if now_ts is not None else time.time())
+    reservation_id = str(
+        reservation.get("reservation_id")
+        or reservation.get("transition_id")
+        or ""
+    )
+    request = data.get("_openwb_pro_phase_up_request")
+    unrequested_cycles = (
+        max(0, int(_cfg_float(request.get("unrequested_cycles"), 0.0)))
+        if isinstance(request, dict)
+        and reservation_id
+        and str(request.get("reservation_id") or "") == reservation_id
+        else 0
+    )
+    contract = wallbox_phase_transition.grant_wait_contract(
+        reservation,
+        now_ts=now_value,
+        sequence=data.get("_openwb_pro_phase_sequence"),
+        output_intent=data.get("_openwb_pro_phase_output_intent"),
+        output_ack=data.get("_openwb_pro_phase_output_ack"),
+        recovery_hold=data.get("_openwb_pro_phase_recovery_hold"),
+        restart_authorized=data.get("_openwb_pro_phase_restart_authorized"),
+        wakeup_active=_openwb_pro_phase_generation_wakeup_active(
+            data,
+            reservation,
+            now_ts=now_value,
+        ),
+        unrequested_cycles=unrequested_cycles,
+    )
+    data["_openwb_pro_phase_grant_wait_contract"] = dict(contract)
+    if contract.get("abort") is not True:
+        return False
+
+    cfg = (
+        data.get("_openwb_pro_config")
+        if isinstance(data.get("_openwb_pro_config"), dict)
+        else {}
+    )
+    retry_backoff_s = max(
+        openwb_pro_session.phase_wait_s(cfg),
+        _cfg_float(cfg.get("wb_phase_retry_block_s"), 900.0),
+    )
+    retry_block_until = now_value + retry_backoff_s
+    touched_keys = (
+        "_wallbox_phase_transition_reservation",
+        "_phase_transition_grant",
+        "_phase_3p_block_until",
+        "_openwb_pro_phase_retry_block_until",
+        "_openwb_pro_phase_grant_wait_abort",
+        "_phase_up_export_account",
+        "_phase_window_state",
+        "_openwb_pro_phase_up_request",
+        "_openwb_pro_phase_up_dispatch_block",
+    )
+    previous = {
+        key: (key in data, deepcopy(data.get(key)))
+        for key in touched_keys
+    }
+    data.pop("_wallbox_phase_transition_reservation", None)
+    data.pop("_phase_transition_grant", None)
+    # Export-Wh-Konto und 10-min-Fenster werden nach der Sperre neu
+    # verdient; ein volles Konto löste sonst am Sperrende sofort den nächsten
+    # Versuch aus. Die Generation ist terminal: kein Blockadegrund mehr, der
+    # Abbruchbeleg steht unter _openwb_pro_phase_grant_wait_abort.
+    data.pop("_phase_up_export_account", None)
+    data.pop("_phase_window_state", None)
+    data.pop("_openwb_pro_phase_up_request", None)
+    data.pop("_openwb_pro_phase_up_dispatch_block", None)
+    data["_phase_3p_block_until"] = max(
+        _cfg_float(data.get("_phase_3p_block_until"), 0.0),
+        retry_block_until,
+    )
+    data["_openwb_pro_phase_retry_block_until"] = max(
+        _cfg_float(data.get("_openwb_pro_phase_retry_block_until"), 0.0),
+        retry_block_until,
+    )
+    data["_openwb_pro_phase_grant_wait_abort"] = {
+        **contract,
+        "action": "aborted_before_phase_output",
+        "retry_backoff_s": retry_backoff_s,
+        "retry_block_until_ts": retry_block_until,
+        "hardware_write": False,
+    }
+    if _save_wallbox_phase_state([data]):
+        abort_reason = str(contract.get("reason") or "")
+        if abort_reason == "grant_unused_no_output":
+            cause = "Speicherfreigabe %.0f s ungenutzt" % _cfg_float(
+                contract.get("grant_unused_s"), 0.0
+            )
+        elif abort_reason == "target_not_requested_no_output":
+            cause = "Hochschaltung nach %.0f s nicht mehr angefordert" % _cfg_float(
+                contract.get("elapsed_s"), 0.0
+            )
+        else:
+            cause = "keine Speicherfreigabe nach %.0f s" % _cfg_float(
+                contract.get("elapsed_s"), 0.0
+            )
+        logger.info(
+            "WB%s Hochschaltung 1p→3p ohne Ausgang abgebrochen: %s "
+            "(%d/%d W); nächster Versuch frühestens in %.0f min"
+            % (
+                data.get("id", "?"),
+                cause,
+                int(_cfg_float(contract.get("granted_w"), 0.0)),
+                int(_cfg_float(contract.get("requested_w"), 0.0)),
+                retry_backoff_s / 60.0,
+            )
+        )
+        return True
+
+    for key, (present, value) in previous.items():
+        if present:
+            data[key] = value
+        else:
+            data.pop(key, None)
     return False
 
 
@@ -31363,7 +32217,16 @@ def _wallbox_phase_transition_reservation(chargers, statuses=None, now_ts=None):
                 box, status, now_ts=now_value
             ):
                 updated = wallbox_phase_transition.inactive_reservation(
-                    "expired_uncommitted_idle_confirmed"
+                    str(
+                        box.get("_openwb_pro_phase_terminal_expired_reason")
+                        or "expired_uncommitted_idle_confirmed"
+                    )
+                )
+            elif _finalize_openwb_pro_phase_up_grant_wait(
+                box, now_ts=now_value
+            ):
+                updated = wallbox_phase_transition.inactive_reservation(
+                    "phase_up_grant_wait_expired"
                 )
         if str(updated.get("stage") or "") == "completed" and not updated.get("active"):
             _finalize_completed_openwb_pro_phase_transition(
@@ -34274,7 +35137,9 @@ def _phase_entry_requires_output_recovery(raw):
         and int(_cfg_float(reservation.get("committed_w"), 0.0)) == 0
         and _cfg_float(reservation.get("committed_ts"), 0.0) <= 0.0
         and int(_cfg_float(reservation.get("valid_frames"), 0.0)) == 0
-        and str(reservation.get("stage") or "") in ("", "await_budget")
+        # Auch die terminal abgelaufene, nie ausgegebene Generation ist kein
+        # unklarer Hardwareausgang und braucht keinen Neustart-Hold.
+        and str(reservation.get("stage") or "") in ("", "await_budget", "expired")
     )
     return bool(
         reservation
@@ -38212,6 +39077,7 @@ def run():
                     for c_data in chargers:
                         c = c_data['charger']
                         c_id = c_data['id']
+                        vehicle_manager.bind_driver_profile_context(c, config)
                         _charger_cycle_max_amp = _charger_max_amp(
                             config,
                             c_id,
@@ -38239,14 +39105,17 @@ def run():
                                 _mode0_status_override.get("cycle_token") or ""
                             ) == str(c_data.get("_wallbox_cycle_token") or "")
                         )
-                        if _mode0_status_bound:
+                        if _mode0_status_bound and _mode0_status_override.get("attempted") is True:
                             # Nur STATE_ZERO_SENT hat bereits exakt einen
-                            # connect.php-GET ausgeführt. Alle anderen
-                            # Mode-0-Zustände bleiben wirklich ausgangsruhig.
+                            # connect.php-GET ausgeführt; dessen Readback nicht doppelt lesen.
                             _raw_status = _mode0_status_override.get("raw_status")
                         else:
                             try:
-                                _raw_status = c.get_status()
+                                _raw_status = (
+                                    _wallbox_status_service.read_observation(c)
+                                    if normalize_wb_mode(wb_charge_mode.get(c_id, effective_public_wb_mode)) == MODE_OFF
+                                    else c.get_status()
+                                )
                             except Exception as _status_e:
                                 _raw_status = None
                                 logger.warning(f"[WB{c_id}] Treiberstatus nicht lesbar: {_status_e}")
@@ -42817,6 +43686,18 @@ def run():
                                 ),
                             ),
                         )
+                        _multi_scope = bool(
+                            len(_active_multi_ids) >= 2
+                            and _cid in _active_multi_ids
+                        )
+                        if not _multi_scope:
+                            # Dieselbe frische Phasenbindung gilt für Mindestbudget
+                            # und Wattdeckel, auch wenn der wartende Auftrag später
+                            # in diesem Zyklus ohne Ausgang beendet wird.
+                            _authorized_phases = (
+                                _openwb_pro_phase_up_wait_output_phase_count(_cd)
+                                or _authorized_phases
+                            )
                         _cd["_authorized_wallbox_watt_output_cap"] = {
                             "contract": "authorized_wallbox_watt_output_cap_v1",
                             "active": True,
@@ -42876,10 +43757,6 @@ def run():
                                 ),
                                 "reason": "remaining_interval_import_budget",
                             }
-                        _multi_scope = bool(
-                            len(_active_multi_ids) >= 2
-                            and _cid in _active_multi_ids
-                        )
                         if _multi_scope:
                             _safe_amp = int(
                                 (
@@ -47923,13 +48800,11 @@ def run():
                             and phase_budget_w < phase_3p_min_w + phase_up_buffer_w
                             and phase_one_phase_start_budget_w >= 6.0 * 230.0
                         )
-                        phase_change_veto_until = (
-                            _openwb_pro_phase_change_veto_until(c_data)
-                            if openwb_pro
-                            else float(
-                                c_data.get("_phase_3p_block_until", 0.0)
-                                or 0.0
-                            )
+                        phase_change_veto_until = _wallbox_phase_change_veto_until(
+                            c_data,
+                            openwb_pro=openwb_pro,
+                            direct_phase_control=e3dc_direct_phase_control,
+                            phase_effective_hold_s=phase_effective_hold_s,
                         )
                         phase_change_veto_active = bool(
                             now_ts < phase_change_veto_until
@@ -48057,10 +48932,54 @@ def run():
                         _phase_3p_block_active = phase_change_veto_active
                         if _phase_3p_block_active:
                             phase_3p_supported = False
+                        # Typneutrale Haltezeit nach jedem Phasenwechsel
+                        # (openWB Pro und E3DC-Direktvertrag gleich). Uhr und
+                        # Export-Wh-Konto halten in der Sperre (am
+                        # Direktvertrag enthält sie die Haltezeit, siehe
+                        # phase_change_veto_until); das 10-min-Fenster beginnt
+                        # in Sperre und Haltezeit neu, auch nach einem nur
+                        # beobachteten Wechsel.
+                        _phase_switch_hold_active = bool(
+                            now_ts - float(c_data.get("_last_phase_switch_ts", 0.0) or 0.0)
+                            < phase_effective_hold_s
+                        )
+                        _phase_up_hold_active = bool(
+                            _phase_3p_block_active or _phase_switch_hold_active
+                        )
                         phase_retry_block_s = max(
                             300.0,
                             float(_sf(config.get("wb_phase_retry_block_s", 900 if openwb_pro else 1800), 900.0 if openwb_pro else 1800.0)),
                         )
+
+                        # Experimentelles 10-min-Fenster des verfügbaren
+                        # Überschusses je Ladepunkt (Standard aus). Es wird
+                        # auch vor dem Anstecken fortgeschrieben, damit ein
+                        # 3p-Start möglich ist; während einer Phasensperre
+                        # und der Haltezeit nach jedem Wechsel beginnt es neu
+                        # (nach einem Wechsel neu verdient). Schalter,
+                        # Live-Frische, Budgetbindung, Schwelle und die an den
+                        # Leerlauftakt gekoppelte Probenlücke liegen in
+                        # _phase_window_step.
+                        _phase_window = _phase_window_step(
+                            c_data,
+                            config,
+                            now_ts=now_ts,
+                            openwb_pro=openwb_pro,
+                            direct_phase_control=e3dc_direct_phase_control,
+                            live=live,
+                            live_fresh=live_snapshot_fresh,
+                            live_sample_invalid=live_sample_invalid,
+                            grid_power_w=grid_power_raw,
+                            battery_power_w=battery_power_raw,
+                            wb_power_w=stable_hw_power_w,
+                            phase_budget_w=phase_budget_w,
+                            allowed_w=c_allowed_w,
+                            budget_fresh=_fresh_wallbox_budget_authorized,
+                            phase_3p_min_w=phase_3p_min_w,
+                            phase_block_active=_phase_up_hold_active,
+                        )
+                        _phase_window_enabled = _phase_window.get("enabled") is True
+                        _phase_window_ready = _phase_window.get("effective_ready") is True
 
                         if not charger_connected:
                             # Kein Fahrzeug an genau dieser Wallbox: keine
@@ -48078,6 +48997,10 @@ def run():
                                     charger_status,
                                     now_ts=now_ts,
                                 )
+                            if openwb_pro:
+                                # Ohne Fahrzeug endet jede Hochschaltanforderung;
+                                # nur Diagnose, keine Laufzeitbelege.
+                                _clear_openwb_pro_phase_up_dispatch_block(c_data)
                             if _wallbox_disconnect_runtime_reset_authorized(
                                 c_data,
                                 charger_status,
@@ -50941,7 +51864,9 @@ def run():
                         # wie die Uhr, die dort hart auf 0 steht. Sonst stünde das Konto
                         # am Sperrende voll und die Regel „Uhr ODER Konto" schaltete
                         # sofort wieder hoch; so werden Vorlauf bzw. Konto nach der
-                        # Sperre neu verdient.
+                        # Sperre neu verdient. Am E3DC-Direktvertrag zählt die
+                        # Haltezeit nach jedem Wechsel als diese Sperre (siehe
+                        # phase_change_veto_until), typneutral wie an der Pro.
                         c_data["_phase_up_export_account"] = wallbox_decision.leaky_energy_account(
                             c_data.get("_phase_up_export_account"),
                             power_w=(
@@ -51063,6 +51988,10 @@ def run():
                             phase_up_export_required_wh=_phase_up_export_required_wh,
                             direct_phase_control=e3dc_direct_phase_control,
                             phase_up_import_block_active=_phase_up_import_block_active,
+                            phase_window_ready=_phase_window_ready,
+                            # 3p-Start im Fenster nur mit gebundenem 3p-Profil
+                            # (gleiche Bedingung wie known_3p_vehicle).
+                            vehicle_known_3p=int(vehicle_max_phases or 0) >= 3,
                         )
                         _phase_up_since_diag = _cfg_float(c_data.get("_phase_up_budget_since"), 0.0)
                         c_data["_phase_energy_policy"] = {
@@ -51127,6 +52056,18 @@ def run():
                             "import_evidence": str(_phase_up_import_evidence.get("reason") or ""),
                             # Konto hält während der Sperre (Anti-Flattern).
                             "account_block_hold": bool(_phase_3p_block_active),
+                            # Experimentelles 10-min-Fenster (Diagnose auch
+                            # bei ausgeschaltetem Schalter) und Auslöser.
+                            "window_enabled": bool(_phase_window_enabled),
+                            "window_ready": bool(_phase_window.get("ready")),
+                            "window_reason": str(_phase_window.get("reason") or ""),
+                            "window_mean_w": _cfg_float(_phase_window.get("mean_w"), 0.0),
+                            "window_cover_s": _cfg_float(_phase_window.get("cover_s"), 0.0),
+                            "window_dip_min_w": _phase_window.get("dip_min_w"),
+                            "window_dip_cover_s": _cfg_float(_phase_window.get("dip_cover_s"), 0.0),
+                            "window_dip_gap": bool(_phase_window.get("dip_gap")),
+                            "window_threshold_w": _cfg_float(_phase_window.get("threshold_w"), 0.0),
+                            "trigger": str(phase_recommendation.get("trigger") or ""),
                         }
                         # Zweite, reine Verteidigungslinie direkt vor dem
                         # ersten möglichen Phasenausgang. Der normale Pfad
@@ -51154,6 +52095,15 @@ def run():
                                 "remaining_s": 0,
                                 "reason": "priority_forced_stop",
                             }
+                        if openwb_pro:
+                            # Fordert die Empfehlung das Ziel der eigenen,
+                            # ausgangslosen Reservierung nicht mehr an, endet
+                            # sie nach zwei Zyklen im Aggregator (Wartegrenze).
+                            _note_openwb_pro_phase_up_request(
+                                c_data,
+                                phase_recommendation,
+                                now_ts=now_ts,
+                            )
                         # Nach allen fachlichen Budget-/Schutzgrenzen: Bereitschaft
                         # hält die Phasen und erzeugt keine CP- oder Startversuche.
                         _idle_result = _apply_openwb_pro_vehicle_idle_offer(
@@ -51408,6 +52358,8 @@ def run():
                                 c_data["_phase_up_budget_since"] = 0.0
                                 if _phase_sequence_ready is not True:
                                     continue
+                                # Sequenz fertig: kein Blockadegrund mehr.
+                                _clear_openwb_pro_phase_up_dispatch_block(c_data)
 
                         _granted_phase_resume = (
                             _openwb_pro_granted_preoutput_phase_resume_contract(
@@ -51461,6 +52413,7 @@ def run():
                             c_data["_phase_up_budget_since"] = 0.0
                             if _granted_phase_ready is not True:
                                 continue
+                            _clear_openwb_pro_phase_up_dispatch_block(c_data)
                         if openwb_pro_phase_wait_active:
                             # Ticken der internen Phasenwechsel-Sequenz falls aktiv, da reguläre set_phases-Pfade blockiert sind.
                             phase_seq = c_data.get("_openwb_pro_phase_sequence")
@@ -52210,14 +53163,8 @@ def run():
                                         # Der bestätigte Wiederanlauf beginnt
                                         # normativ mit 6 A; die weitere Rampe
                                         # folgt danach dem frischen Wattbudget.
-                                        _phase_up_available_w = min(
-                                            max(0.0, float(phase_budget_w or 0.0)),
-                                            max(0.0, float(c_allowed_w or 0.0)),
-                                        )
-                                        _phase_up_start_hold_amp = (
-                                            6.0
-                                            if _phase_up_available_w >= 6.0 * 230.0 * 3.0
-                                            else 0.0
+                                        _phase_up_start_hold_amp = _openwb_pro_phase_up_start_hold_amp(
+                                            phase_budget_w, c_allowed_w
                                         )
                                         _mark_openwb_pro_phase_wait(
                                             c_data,
@@ -52294,12 +53241,36 @@ def run():
                                             )
                                         )
                                     c_data["is_charging"] = bool(hw_charging or (openwb_pro and _phase_up_start_hold_sent))
+                                    _update_openwb_pro_phase_up_dispatch_block(
+                                        c_data,
+                                        c_id,
+                                        dispatched=True,
+                                        now_ts=now_ts,
+                                    )
                                     continue
+                                if openwb_pro:
+                                    # Ein nicht ausgegebener Hochschaltauftrag
+                                    # bleibt in Diagnose und Log sichtbar.
+                                    _update_openwb_pro_phase_up_dispatch_block(
+                                        c_data,
+                                        c_id,
+                                        dispatched=False,
+                                        trigger=phase_recommendation.get("trigger"),
+                                        now_ts=now_ts,
+                                    )
                         elif not _phase_energy_policy:
                             # Unter der Energiepolitik führt der Vertrag die
                             # eine Uhr (KEEP „Wh pending" löscht sie nicht); nur der
                             # Pfad ohne Energiepolitik setzt sie hier wie bisher zurück.
                             c_data["_phase_up_budget_since"] = 0.0
+                        if openwb_pro and not (
+                            phase_switch_action in ("WAIT_3P", "SWITCH_3P")
+                            and phase_switch_reason == "phase_up"
+                        ):
+                            # Die Hochschaltanforderung endet ohne Ausgabe
+                            # (Fenster weg, Sperre, Ladepause): kein veralteter
+                            # Blockadegrund im Export.
+                            _clear_openwb_pro_phase_up_dispatch_block(c_data)
 
                         if (
                             openwb_phase_capable

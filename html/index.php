@@ -1398,6 +1398,11 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
         <!-- Native Storage/Wallbox Dashboard Status -->
         <?php $storageStatusEnabled = (float)($batteryCapacity ?? 0) > 0.0; ?>
         <?php $heatManagerEnabled = !empty($wpEnabled) || !empty($hsEnabled); ?>
+        <?php
+            // Beim E3DC-Leistungsmesser (wp_type=6) gibt es keinen Energy-Manager-Zustand zu zeigen;
+            // die Spalte würde Standby/Beobachtet ohne Beleg melden. Mit Heizstab bleibt sie.
+            if (getHeatpumpTypeConfig($_c ?? []) === 6 && empty($hsEnabled)) { $heatManagerEnabled = false; }
+        ?>
         <?php $nativeWallboxStatusEnabled = hasNativeWallboxStatusConfig($_c ?? []); ?>
         <?php if($storageStatusEnabled): ?>
         <div id="wb-native-alert" class="card shadow-sm mb-3 border-0" style="display:none; background: linear-gradient(135deg, rgba(168, 85, 247, 0.08) 0%, rgba(168, 85, 247, 0.01) 100%);">
@@ -2025,7 +2030,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                         <div class="wallbox-card-main">
                                             <div class="small fw-bold text-info text-truncate mb-1 tile-detail" id="wb-title" title="<?= htmlspecialchars($dashWb1Title) ?>"><i class="fas fa-charging-station me-1"></i><?= htmlspecialchars($dashWb1Title) ?></div>
                                             <div class="d-flex align-items-baseline gap-2 mb-1">
-                                                <div class="val-large text-body" id="val-wb" style="line-height:1;">0<span class="val-unit">W</span></div>
+                                                <div class="val-large text-body" id="val-wb" style="line-height:1;">–</div>
                                             </div>
                                             <div class="small text-muted text-truncate tile-detail" id="wb-status">Bereit</div>
                                             <div class="small text-muted tile-detail wallbox-identity-detail" id="wb-identity" style="display:none; font-size:0.7rem;"></div>
@@ -2073,7 +2078,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                         <div class="wallbox-card-main">
                                             <div class="small fw-bold text-info text-truncate mb-1 tile-detail" id="wb2-title" title="<?= htmlspecialchars($dashWb2Title) ?>"><i class="fas fa-charging-station me-1"></i><?= htmlspecialchars($dashWb2Title) ?></div>
                                             <div class="d-flex align-items-baseline gap-2 mb-1">
-                                                <div class="val-large text-body" id="val-wb2" style="line-height:1;">0<span class="val-unit">W</span></div>
+                                                <div class="val-large text-body" id="val-wb2" style="line-height:1;">–</div>
                                             </div>
                                             <div class="small text-muted text-truncate tile-detail" id="wb2-status">Bereit</div>
                                             <div class="small text-muted tile-detail wallbox-identity-detail" id="wb2-identity" style="display:none; font-size:0.7rem;"></div>
@@ -3192,7 +3197,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                             titleParts.push(capLine);
                         }
                         if (waitingForReserve && data.storage_reason) {
-                            titleParts.push('Warum noch nicht geladen wird: ' + formatStorageReasonInline(String(data.storage_reason)));
+                            titleParts.push('Warum noch nicht geregelt wird: ' + formatStorageReasonInline(String(data.storage_reason)));
                         }
                         if (iminW !== null) titleParts.push('iMin: ' + iminW + ' W');
                         if (data.storage_val_w != null) titleParts.push('RSCP-Sollwert: ' + Math.round(parseFloat(data.storage_val_w)) + ' W');
@@ -4320,6 +4325,25 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
             });
         }
 
+        function nativeWallboxObservationForDisplay(wb, packet) {
+            const observation = wb && wb.observation;
+            const now = Date.now() / 1000;
+            const number = value => typeof value === 'number' && Number.isFinite(value) ? value : null;
+            const sampleTs = number(observation?.sample_ts);
+            const packetTs = number(packet?.ts);
+            const fresh = observation?.valid === true && sampleTs !== null && packetTs !== null
+                && now - sampleTs >= -5 && now - sampleTs < 60
+                && now - packetTs >= -5 && now - packetTs < 60;
+            const values = fresh ? observation.values || {} : {};
+            const phases = number(values.phases);
+            return {
+                power_w: number(values.power_w),
+                phases: [0, 1, 2, 3].includes(phases) ? phases : null,
+                phases_source: [0, 1, 2, 3].includes(phases)
+                    ? String(observation?.phases_source || 'unknown') : 'unknown'
+            };
+        }
+
         async function updateNativeWallboxBanner() {
             try {
                 if (!nativeWallboxEnabled) {
@@ -4460,13 +4484,12 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     const amp = parseFloat(wb.amp) || setAmp;
                     const setAmpInfo = fractionalAmpInfo(wb, setAmp);
                     const ampInfo = fractionalAmpInfo(wb, amp);
-                    const power = Math.abs(parseFloat(wb.power_w || wb.phase_power_sum_w || 0));
+                    const observed = nativeWallboxObservationForDisplay(wb, data);
+                    const power = observed.power_w === null ? null : Math.abs(observed.power_w);
                     const state = String(wb.state || '').toLowerCase();
                     const realCharging = wallboxConfirmedCharging(wb, power, state);
                     const startRelease = state.includes('startfreigabe');
-                    const rawPhases = parseInt(wb.phases_in_use || wb.phases_actual || wb.phase_actual_phases || wb.phases_target || 0, 10) || 0;
-                    const measuredPhases = wallboxPhasePowerCount(wb);
-                    const phases = realCharging ? (measuredPhases || rawPhases) : 0;
+                    const phases = realCharging ? observed.phases : null;
                     const rawApparentKva = parseFloat(wb.apparent_power_kva);
                     const rawApparentVa = parseFloat(wb.apparent_power_va);
                     const apparentKva = Number.isFinite(rawApparentKva) && rawApparentKva > 0
@@ -4487,6 +4510,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                         realCharging,
                         startRelease,
                         phases,
+                        phasesSource: phases === null ? 'unknown' : observed.phases_source,
                         apparentKva
                     };
                 });
@@ -4841,12 +4865,12 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 const phEl = document.getElementById('wb-phases-badge');
                 if (phEl) {
                     const detailPhases = wbAmpRows.reduce((max, wb) => wb.realCharging ? Math.max(max, wb.phases || 0) : max, 0);
-                    const activePhases = parseInt(data.active_wb_phases || 0, 10) || 0;
-                    const ph = detailPhases > 0 ? detailPhases : (data.charging_active === true ? activePhases : 0);
-                    phEl.textContent = ph > 0 ? ph + 'ph' : '--ph';
+                    const ph = detailPhases;
+                    const reportedPhases = ph > 0 && wbAmpRows.some(wb => wb.realCharging && wb.phases === ph && wb.phasesSource === 'reported');
+                    phEl.textContent = ph > 0 ? ph + 'ph' + (reportedPhases ? ' (gemeldet)' : '') : '--ph';
                     phEl.style.color = ph === 3 ? '#10b981' : ph === 2 ? '#f59e0b' : (ph === 1 ? '#818cf8' : '#94a3b8');
                     phEl.title = ph > 0
-                        ? 'Bestätigte aktive Phasen der Wallbox-Regelung.'
+                        ? (reportedPhases ? 'Phasenzahl von der Wallbox gemeldet; keine Stromkanäle verfügbar.' : 'Aktive Phasen aus frischen Messkanälen.')
                         : 'Phasenwechsel- und Stop-Nachlaufwerte werden ausgeblendet.';
                     phEl.style.display = multiPowerDisplay ? 'none' : 'inline';
                 }
@@ -4857,10 +4881,8 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                         const va = parseFloat(wb.apparent_power_va || 0);
                         return sum + (kva > 0 ? kva : (va > 0 ? va / 1000 : 0));
                     }, 0);
-                    const detailPower = wbDetails.reduce((sum, wb) => {
-                        const power = Math.abs(parseFloat(wb.power_w || wb.phase_power_sum_w || 0));
-                        return sum + (Number.isFinite(power) ? power : 0);
-                    }, 0);
+                    const detailPower = wbAmpRows.reduce((sum, wb) =>
+                        sum === null || wb.power === null ? null : sum + wb.power, 0);
                     const nativeKva = detailKva > 0 ? detailKva : parseFloat(data.apparent_power_kva || 0);
                     if (multiPowerDisplay) {
                         kvaEl.title = 'Scheinleistung und Phasen sind ladepunktspezifisch und stehen in den Wallbox-Details.';
@@ -4963,17 +4985,22 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                             const displayAmp = ampRow ? ampRow.displayAmp : (parseFloat(wb.amp) || 0);
                             const precision = ampRow ? ampRow.precision : 0;
                             const slotPhases = ampRow && ampRow.realCharging ? ampRow.phases : 0;
-                            const slotKw = (displayAmp * 230 * slotPhases) / 1000;
+                            const slotKw = ampRow && ampRow.power !== null ? ampRow.power / 1000 : null;
+                            const reportedPhases = slotPhases > 0 && ampRow.phasesSource === 'reported';
                             const wbPhaseText = slotPhases > 0
-                                ? ' · ' + ampRow.phases + 'p'
+                                ? ' · ' + ampRow.phases + 'p' + (reportedPhases ? ' (gemeldet)' : '')
                                 : ' · --p';
-                            const wbPowerText = ' · ' + slotKw.toLocaleString('de-DE', {minimumFractionDigits: 1, maximumFractionDigits: 1}) + ' kW';
+                            const wbPowerText = ' · ' + (slotKw === null ? '–' : slotKw.toLocaleString('de-DE', {minimumFractionDigits: 1, maximumFractionDigits: 1})) + ' kW';
                             const wbKvaText = ampRow && ampRow.apparentKva !== null
                                 ? ' · ' + ampRow.apparentKva.toLocaleString('de-DE', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' kVA'
                                 : ' · -- kVA';
                             curAmpEl.textContent = fmtAmp(displayAmp, precision) + " A" + wbPhaseText + wbPowerText + wbKvaText;
-                            if (ampRow && ampRow.fineStep && ampRow.rawAmp > 0) {
-                                curAmpEl.title = '0,1-A-Feinregelung aktiv: Roh-Sollstrom ' + fmtAmp(ampRow.rawAmp, 1) + ' A';
+                            const ampTitle = ampRow && ampRow.fineStep && ampRow.rawAmp > 0
+                                ? '0,1-A-Feinregelung aktiv: Roh-Sollstrom ' + fmtAmp(ampRow.rawAmp, 1) + ' A' : '';
+                            const phaseTitle = reportedPhases ? 'Phasenzahl von der Wallbox gemeldet; keine Stromkanäle verfügbar.' : '';
+                            const slotTitle = [ampTitle, phaseTitle].filter(Boolean).join(' · ');
+                            if (slotTitle) {
+                                curAmpEl.title = slotTitle;
                             } else {
                                 curAmpEl.removeAttribute('title');
                             }

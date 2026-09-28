@@ -21,7 +21,10 @@ import requests as _requests
 
 from .config import logger, RAMDISK_DIR
 from . import command_gate
-from .soc_tracker import vehicle_soc_source_trusted
+from .soc_tracker import (
+    vehicle_soc_source_trusted, resolve_openwb_pro_profile,
+    openwb_pro_sample_matches_profile,
+)
 
 # paho-mqtt ergänzt bei openWB den strikt lesenden Fahrzeug-SoC-Pfad.
 # Leistung, Steckzustand und Steuerung bleiben standardmäßig beim HTTP-Pfad.
@@ -74,6 +77,74 @@ E3DC_DEVICE_FAMILIES = {
     "multi_connect_ii",
     "unknown",
 }
+
+
+def _observation_number(value):
+    """Nur endliche Rohmesswerte übernehmen, niemals boolesche Ersatzwerte."""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _observation_flag(value):
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().strip('"').lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def _observation_channels(*, power=None, powers=None, currents=None, phases=None,
+                          plug=None, locked=None, charging=None,
+                          phases_source="reported", current_threshold=0.2):
+    """Gemeinsamer Anzeigenvertrag aus den Kanälen genau einer Antwort."""
+    def channels(raw):
+        raw = raw if isinstance(raw, (list, tuple)) else []
+        return [_observation_number(raw[i]) if i < len(raw) else None for i in range(3)]
+
+    currents_supplied = currents is not None
+    powers = channels(powers)
+    currents = channels(currents)
+    power = _observation_number(power)
+    if power is None and all(value is not None for value in powers):
+        power = sum(powers)
+    phases = _observation_number(phases)
+    if phases not in (0, 1, 2, 3):
+        phases = None
+    if all(value is not None for value in currents):
+        phases = sum(abs(value) > current_threshold for value in currents)
+        phases_source = "current_channels"
+    elif currents_supplied:
+        # Eine unvollständige Kanalantwort erlaubt keine bekannte Istphasenzahl.
+        phases = None
+    if phases is None:
+        phases_source = "unknown"
+    values = {
+        "plug": _observation_flag(plug), "locked": _observation_flag(locked),
+        "charging": _observation_flag(charging), "power_w": power, "phases": phases,
+        "phases_source": phases_source,
+        "current_a": max(abs(value) for value in currents) if all(value is not None for value in currents) else None,
+    }
+    for i in range(3):
+        values["phase_power_l%d_w" % (i + 1)] = powers[i]
+        values["phase_current_l%d_a" % (i + 1)] = currents[i]
+    return values
+
+
+def _observation_status(status, values, source):
+    # Metadaten gehören zur Rückgabe, nicht zum persistenten Reglerzustand.
+    result = dict(status)
+    result["observation_values"] = dict(values)
+    result["observation_unavailable_fields"] = [key for key, value in values.items() if value is None]
+    result["driver_status_source"] = source
+    return result
 
 
 def _config_bool(config, *keys, default=False):
@@ -500,7 +571,23 @@ class GoECharger(WallboxDriver):
                 'charging':    car_status == 2,
                 'real_power_w': real_power,
             }
-            return self._sanitize_measurement_status(status)
+            raw_car = data.get("car")
+            if isinstance(raw_car, list):
+                raw_car = raw_car[0] if raw_car else None
+            car_known = _observation_number(raw_car) in (1, 2, 3, 4)
+            observed_phases = None
+            raw_currents = (nrg[4:7] if isinstance(nrg, list) else []) if "nrg" in data else None
+            if _observation_number(data.get("pnp")) in (1, 2, 3):
+                observed_phases = _observation_number(data["pnp"])
+            elif _observation_number(data.get("pha")) in (0, 8, 16, 24, 32, 56):
+                observed_phases = {0: 0, 8: 1, 16: 1, 24: 2, 32: 1, 56: 3}[float(data["pha"])]
+            values = _observation_channels(
+                power=real_power if len(nrg) > 11 and _observation_number(nrg[11]) is not None else None,
+                currents=raw_currents, phases=observed_phases, current_threshold=0.5,
+                plug=(car_status != 1) if car_known else None,
+                charging=(car_status == 2) if car_known else None,
+            )
+            return _observation_status(self._sanitize_measurement_status(status), values, "goe_api_status")
         except Exception as e:
             logger.error(f"[WB{self.wb_id}] Fehler beim Lesen des go-eChargers ({self.ip}): {e}")
             return None
@@ -2591,7 +2678,7 @@ class OpenWBCharger(WallboxDriver):
             logger.debug(f"[WB{self.wb_id}] Auto-SoC schreiben fehlgeschlagen: {e}")
             return False
 
-    def _update_from_simpleapi(self, payload):
+    def _update_from_simpleapi(self, payload, *, observe_only=False):
         """Normalisiert get_chargepoint_all=<ID> auf das interne Statusformat."""
         if not isinstance(payload, dict):
             return False
@@ -2688,7 +2775,9 @@ class OpenWBCharger(WallboxDriver):
         if phases <= 0:
             phases = self.state.get("phases_in_use", 0)
 
-        pro_backend = self._openwb_pro_backend_snapshot()
+        # Auch ein hinter openWB angebundener Pro-Reader erneuert via
+        # connect.php eine Steuerlease. Beobachten bleibt beim SimpleAPI-GET.
+        pro_backend = None if observe_only else self._openwb_pro_backend_snapshot()
         if pro_backend is not None:
             pro_powers = pro_backend.get("powers") if isinstance(pro_backend.get("powers"), list) else []
             p1 = self._float_value(pro_powers[0], 0.0) if len(pro_powers) > 0 else 0.0
@@ -2728,6 +2817,17 @@ class OpenWBCharger(WallboxDriver):
                 base_surface = "openwb_secondary_modbus" if self.modbus_enabled else "openwb_secondary_set_current_heartbeat"
             self.state["api_surface"] = f"{base_surface}+pro_backend"
             self.state["backend_pro_ip"] = pro_backend.get("_backend_ip", "")
+
+        observation_data = pro_backend if pro_backend is not None else cp_data
+        self._observation_values = _observation_channels(
+            power=observation_data.get("power_all") if pro_backend is not None else observation_data.get("power", observation_data.get("charging_power")),
+            powers=observation_data.get("powers"), currents=observation_data.get("currents"),
+            # Pro-Istphasen stammen nur aus vollständigen aktuellen Stromkanälen.
+            phases=None if pro_backend is not None else observation_data.get("phases_actual", observation_data.get("phases_in_use")),
+            plug=observation_data.get("plug_state"), charging=observation_data.get("charge_state"),
+            locked=observation_data.get("locked", observation_data.get("lock_state", observation_data.get("plug_locked"))),
+        )
+        self._observation_source = "openwb_pro_backend" if pro_backend is not None else "openwb_simpleapi"
 
         stable_vehicle_identity_current = bool(
             str(live_vehicle_id or "").strip()
@@ -3068,10 +3168,17 @@ class OpenWBCharger(WallboxDriver):
         except Exception as e:
             logger.debug(f"[WB{self.wb_id}] openwb_data.json schreiben fehlgeschlagen: {e}")
 
+    def get_observation_status(self):
+        """Liest ohne Lease-Refresh eines eventuell angebundenen Pro-Backends."""
+        return self._read_status(observe_only=True)
+
     def get_status(self):
+        return self._read_status()
+
+    def _read_status(self, *, observe_only=False):
         cp = self.cp_id if self.cp_id != "" else "auto"
         payload = self._http_get_json(f"get_chargepoint_all={cp}")
-        if payload is not None and self._update_from_simpleapi(payload):
+        if payload is not None and self._update_from_simpleapi(payload, observe_only=observe_only):
             now_ts = int(time.time())
             self.state.update({
                 "driver_status_valid": True,
@@ -3082,7 +3189,10 @@ class OpenWBCharger(WallboxDriver):
                 "driver_status_last_ok_ts": now_ts,
                 "driver_status_last_sample_ts": now_ts,
             })
-            return self._sanitize_measurement_status(self.state)
+            return _observation_status(
+                self._sanitize_measurement_status(self.state),
+                self._observation_values, self._observation_source,
+            )
         self.state.update({
             "driver_status_valid": False,
             "driver_status_stale": True,
@@ -3776,6 +3886,7 @@ class E3DCCharger(WallboxDriver):
         *,
         phase_values,
         fixed_phases,
+        observed_phase_power,
     ):
         """Versiegelt PM-Werte und feste Phase nur aus derselben RSCP-Probe."""
 
@@ -3880,7 +3991,15 @@ class E3DCCharger(WallboxDriver):
             sample_fresh=sample_fresh,
             phase_power_sample_valid=sample_valid,
         )
-        return sanitized
+        powers = [observed_phase_power.get(key) for key in ("l1", "l2", "l3")]
+        # Anschlussphasen belegen keine lastführenden Phasen; nur die vollständige Istprobe zählt.
+        phases = sum(value > 10 for value in powers) if all(value is not None for value in powers) else None
+        values = _observation_channels(
+            powers=powers, phases=phases, phases_source="power_channels",
+            plug=status.get("car_connected_rscp"), locked=status.get("plug_locked"),
+            charging=status.get("alg_charging"),
+        )
+        return _observation_status(sanitized, values, "rscp_same_response")
 
     def _heartbeat_loop(self):
         # Feldverifizierter Legacy-Pfad: Der externe RSCP-Rahmen muss zyklisch
@@ -4027,6 +4146,7 @@ class E3DCCharger(WallboxDriver):
             p1 = p2 = p3 = 0.0
             phase_probe_values = ()
             fixed_phase_probe = 0
+            observed_phase_power = {}
 
             for item in response:
                 if item['tag'] == RscpTag.WB_DATA:
@@ -4049,6 +4169,7 @@ class E3DCCharger(WallboxDriver):
                             )
                             if valid:
                                 container_phase_values[key] = value
+                                observed_phase_power[key] = value
                                 if key == 'l1':
                                     p1 = value
                                 elif key == 'l2':
@@ -4146,6 +4267,7 @@ class E3DCCharger(WallboxDriver):
                 status,
                 phase_values=phase_probe_values,
                 fixed_phases=fixed_phase_probe,
+                observed_phase_power=observed_phase_power,
             )
         except Exception as e:
             self._record_rscp_error("status", e)
@@ -5429,6 +5551,7 @@ class E3DCMultiConnectCharger(E3DCCharger):
         param_current = None
         phase_probe_values = ()
         fixed_phase_probe = 0
+        observed_phase_power = {}
 
         for item in response:
             if item.get('tag') != RscpTag.WB_DATA:
@@ -5493,6 +5616,7 @@ class E3DCMultiConnectCharger(E3DCCharger):
                     validate_mirror_read_item,
                 )
                 if valid:
+                    observed_phase_power[phase_key] = phase_value
                     if phase_key == 'l1':
                         p1 = phase_value
                     elif phase_key == 'l2':
@@ -5693,6 +5817,7 @@ class E3DCMultiConnectCharger(E3DCCharger):
             status,
             phase_values=phase_probe_values,
             fixed_phases=fixed_phase_probe,
+            observed_phase_power=observed_phase_power,
         )
 
     def release_to_e3dc(self, max_amp=16):
@@ -6200,39 +6325,11 @@ class OpenWBProCharger(WallboxDriver):
         return profile
 
     def _vehicle_profile(self, vehicle_id=None, fallback_name=None, allow_selected_fallback=True):
-        selected_id = str(self.config.get(f"wb{self.wb_id}_car_id") or "").strip()
-        if selected_id.lower() in ("__none", "none", "0", "false"):
-            selected_id = ""
-        selected_profile_id = selected_id if allow_selected_fallback else ""
-        capacity = self._float(self.config.get(f"wb{self.wb_id}_capacity"), 0.0)
-        profile = {
-            "id": selected_profile_id or None,
-            "name": str(fallback_name or "").strip(),
-            "vehicle_id": str(vehicle_id or "").strip(),
-            "capacity_kwh": capacity,
-            "efficiency": 0.90,
-            "consumption_kwh_100km": 0.0,
-        }
-        cars = self._saved_car_profiles()
-        probe = self._compact_id(vehicle_id)
-        if probe:
-            for car in cars:
-                for key in ("vehicle_id", "vehicle_mac", "mac", "rfid", "rfid_tag"):
-                    if self._compact_id(car.get(key)) == probe:
-                        return self._merge_vehicle_profile(profile, car)
-        if allow_selected_fallback:
-            for car in cars:
-                if not selected_id:
-                    continue
-                for key in ("id", "cloud_vehicle_id", "vehicle_id", "vehicle_mac", "mac", "rfid", "rfid_tag"):
-                    if str(car.get(key) or "").strip() == selected_id:
-                        return self._merge_vehicle_profile(profile, car)
-        fallback_norm = str(fallback_name or "").strip().lower()
-        if fallback_norm:
-            for car in cars:
-                if str(car.get("name") or "").strip().lower() == fallback_norm:
-                    return self._merge_vehicle_profile(profile, car)
-        return profile
+        # Anzeigename und alter Kapazitätswert erzeugen keine Identität.
+        return resolve_openwb_pro_profile(
+            getattr(self, "_vehicle_profile_config", self.config),
+            self.wb_id, vehicle_id=vehicle_id, profiles=self._saved_car_profiles(),
+        )
 
     def _write_openwb_pro_manual_soc(self, source):
         soc = self._soc_percent_value(self.state.get("car_soc"))
@@ -6675,6 +6772,8 @@ class OpenWBProCharger(WallboxDriver):
         active_compact = self._compact_id(active_id)
         if active_compact and manual_vehicle_id and self._compact_id(manual_vehicle_id) != active_compact:
             return None
+        if not openwb_pro_sample_matches_profile(data, self._vehicle_profile(active_id)):
+            return None
         return {
             "soc": soc,
             "ts": source_ts,
@@ -6823,12 +6922,10 @@ class OpenWBProCharger(WallboxDriver):
         fallback_name = self.state.get("car_name", "openWB Pro")
         profile = self._vehicle_profile(active_id, fallback_name=fallback_name, allow_selected_fallback=bool(active_id))
         capacity = self._float(profile.get("capacity_kwh"), 0.0)
-        if manual_sample and manual_sample.get("capacity_kwh", 0.0) > 0:
-            capacity = self._float(manual_sample.get("capacity_kwh"), capacity)
         efficiency = self._float(profile.get("efficiency"), 0.90)
         consumption = self._float(profile.get("consumption_kwh_100km"), 0.0)
-        if capacity > 0:
-            self.state["car_capacity_kwh"] = capacity
+        self.state["car_capacity_kwh"] = capacity if capacity > 0 else None
+        self.state["car_capacity_reason"] = profile.get("capacity_reason")
         self.state["car_efficiency"] = max(0.50, min(1.00, efficiency or 0.90))
         self.state["car_consumption_kwh_100km"] = consumption
         if profile.get("name"):
@@ -7210,6 +7307,13 @@ class OpenWBProCharger(WallboxDriver):
             self.state["car_soc_source_ts"] = raw_ts or int(now_ts)
             self.state["car_soc_rule_confirmed"] = raw_rule_confirmed
             self._write_openwb_pro_manual_soc("openwb_pro_raw")
+        elif capacity <= 0 and self.state.get("car_soc_source") in (
+            "openwb_pro_estimated", "wallbox_estimated_from_bluelink",
+        ):
+            self.state["car_soc"] = None
+            self.state["car_soc_rule_confirmed"] = False
+            self.state["car_soc_source"] = "unknown"
+            self.state["car_soc_invalid_reason"] = profile.get("capacity_reason")
 
     def _get_json(self, url):
         try:
@@ -7318,6 +7422,7 @@ class OpenWBProCharger(WallboxDriver):
             "car_name": self.state.get("car_name", "openWB Pro"),
             "car_id": self.state.get("car_id", None),
             "car_capacity_kwh": self.state.get("car_capacity_kwh", 0.0),
+            "car_capacity_reason": self.state.get("car_capacity_reason"),
             "car_efficiency": self.state.get("car_efficiency", 0.90),
             "car_consumption_kwh_100km": self.state.get("car_consumption_kwh_100km", 0.0),
             "vehicle_id": self.state.get("vehicle_id"),
@@ -7921,6 +8026,41 @@ class OpenWBProCharger(WallboxDriver):
         )
         self._write_openwb_pro_status()
 
+    def _secc_observation_status(self, data, source):
+        port = data.get("port0", data)
+        if not isinstance(port, dict) or not port:
+            return None
+        self._update_from_legacy_secc_status(data)
+
+        def scaled(path, divisor):
+            value = _observation_number(self._dig(port, path))
+            return value / divisor if value is not None else None
+
+        plug_flags = [_observation_flag(port.get(key)) for key in ("ev_present", "pluggable")]
+        plug = any(value is True for value in plug_flags) if any(value is not None for value in plug_flags) else None
+        locked = _observation_flag(self._dig(port, "plug_lock/state/actual"))
+        plug_status = str(self._dig(port, "ci/charge/plug/status") or "").strip().lower()
+        if locked is None and plug_status in ("locked", "unlocked"):
+            locked = plug_status == "locked"
+        values = _observation_channels(
+            power=scaled("metering/power/active_total/actual", 10.0),
+            currents=[scaled("metering/current/ac/l%d/actual" % phase, 1000.0) for phase in (1, 2, 3)],
+            # EVSE-Phasen sind Anschluss-/Zielstatus, keine lastführende Istmessung.
+            plug=plug, locked=locked, charging=port.get("charging"),
+        )
+        return _observation_status(self._sanitize_measurement_status(self.state), values, source)
+
+    def get_observation_status(self):
+        """Beobachtet die vorhandene SECC-Diagnosefläche ohne connect.php-Lease-Refresh.
+
+        Der bestehende Parser aktualisiert weiterhin Status und Sitzung; nur
+        die Anzeigekanäle werden getrennt und an diese Antwort gebunden.
+        """
+        data = self._get_json(self.fallback_status_url)
+        if not isinstance(data, dict):
+            return None
+        return self._secc_observation_status(data, "openwb_pro_api_secc_observe")
+
     def get_control_handoff_status(self):
         """Liest genau einmal die offizielle Pro-Fläche, ohne Legacy-Fallback.
 
@@ -7939,7 +8079,13 @@ class OpenWBProCharger(WallboxDriver):
                 # Diagnose, Fehler und Nicht-JSON-Antworten zählen nicht.
                 self._last_heartbeat_lease_refresh_ts = time.time()
             self._update_from_connect_status(data)
-            return self._sanitize_measurement_status(self.state)
+            values = _observation_channels(
+                power=data.get("power_all"), powers=data.get("powers"), currents=data.get("currents"),
+                # Istphasen ausschließlich aus vollständigen Stromkanälen dieser Antwort.
+                plug=data.get("plug_state"), charging=data.get("charge_state"),
+                locked=data.get("locked", data.get("plug_locked")),
+            )
+            return _observation_status(self._sanitize_measurement_status(self.state), values, "openwb_pro_connect_php")
         if isinstance(data, dict):
             self.state.update({
                 "can_switch_phases": False,
@@ -7971,8 +8117,7 @@ class OpenWBProCharger(WallboxDriver):
 
         data = self._get_json(self.fallback_status_url)
         if isinstance(data, dict):
-            self._update_from_legacy_secc_status(data)
-            return self._sanitize_measurement_status(self.state)
+            return self._secc_observation_status(data, "openwb_pro_api_secc")
 
         logger.error(f"[WB{self.wb_id}] openWB Pro Status nicht lesbar (/connect.php, /api/secc)")
         return None

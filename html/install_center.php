@@ -877,12 +877,31 @@ function installCenterSaveModuleConfig($moduleKey, $postedValues) {
 
 function installCenterRedactText($text) {
     $text = (string)$text;
-    $text = preg_replace('/[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}/i', '[redacted-email]', $text);
+    // Auch teilmaskierte Kontonamen wie „t***@<Domain>“ (bluelink_client).
+    $text = preg_replace('/[A-Z0-9._%+\-*]+@[A-Z0-9.\-]+\.[A-Z]{2,}/i', '[redacted-email]', $text);
     $locationKeys = 'lat|lon|lng|long|latitude|longitude|breitengrad|laenge|länge|laengengrad|längengrad|height|hoehe|höhe|elevation|altitude';
     $text = preg_replace('/([?&](?:' . $locationKeys . ')=)[^&\s"\']+/iu', '$1[redacted]', $text);
     $text = preg_replace('/("?(?:' . $locationKeys . ')"?\s*[:=]\s*)-?\d+(?:[.,]\d+)?/iu', '$1[redacted]', $text);
-    $secretKeys = 'password|passwort|pwd|pass|pw|token|secret|api[_-]?key|apikey|aes_password|chat[_-]?id|credential|auth';
+    $secretKeys = 'password|passwort|pwd|pass|pw|token|secret|api[_-]?key|apikey|aes_password|chat[_-]?id|credential|auth'
+        . '|(?<![A-Za-z0-9])pin|username|(?:e3dc|mqtt_hub|wb2?|stiebel_isg_web|bluelink)_user'
+        // Kontozeile von e3dc-live („Host: …  User: <Anmeldename>“); user_off
+        // oder user_charge_limit_w bleiben lesbar.
+        . '|(?<![A-Za-z0-9_])user(?![A-Za-z0-9_])';
     $text = preg_replace('/((?:' . $secretKeys . ')\s*[:=]\s*)[^,\s"\'\]\}\)]+/iu', '$1[redacted]', $text);
+    // Geheimnisse und Kontonamen in JSON-/Python-Schreibweise ("rscp_pw": "…",
+    // 'bluelink_pin': 1234) sowie key="wert". Maßgeblich ist dieselbe
+    // Schlüsselprüfung wie für strukturierte Dateien.
+    $text = preg_replace_callback(
+        '/(?<![A-Za-z0-9_])(["\']?)([A-Za-z][A-Za-z0-9_-]*)\1(\s*[:=]\s*)(?:"(?:[^"\\\\\r\n]|\\\\.)*"?|\'(?:[^\'\\\\\r\n]|\\\\.)*\'?|-?\d[\d.]*)/u',
+        function($match) {
+            if (!installCenterIsSensitiveConfigKey((string)$match[2])) return (string)$match[0];
+            $prefix = (string)$match[1] . (string)$match[2] . (string)$match[1] . (string)$match[3];
+            $valueQuote = substr((string)$match[0], strlen($prefix), 1);
+            $quote = in_array($valueQuote, ['"', "'"], true) ? $valueQuote : ((string)$match[1] === "'" ? "'" : '"');
+            return $prefix . $quote . '[redacted]' . $quote;
+        },
+        $text
+    );
     $text = preg_replace_callback(
         '/\b(?:\d{1,3}\.){3}\d{1,3}\b/',
         function($match) {
@@ -903,44 +922,379 @@ function installCenterRedactText($text) {
         },
         $text
     );
+    // Gerätekennungen in JSON-/Python-Schreibweise ("serial_number": "…")
+    // und als key=value (Seriennummer=…). Die Art der Kennung bestimmt
+    // ausschließlich installCenterDiagnosticIdentifierKind().
+    $text = preg_replace_callback(
+        '/(["\'])([A-Za-z][A-Za-z0-9_-]*)\1(\s*:\s*)(?:"([^"\\\\\r\n]*)"|\'([^\'\\\\\r\n]*)\'|(-?\d[\d.]*))/u',
+        function($match) {
+            $quotedValue = (string)($match[4] ?? '') !== '' ? (string)$match[4] : (string)($match[5] ?? '');
+            $rawValue = (string)($match[6] ?? '') !== '' ? (string)$match[6] : $quotedValue;
+            $kind = installCenterDiagnosticIdentifierKind((string)$match[2], $rawValue);
+            if ($kind === null && installCenterDiagnosticIsIdentityDigest((string)$match[2], $quotedValue)) $kind = 'device';
+            if ($kind === null || $kind === 'ip') return (string)$match[0];
+            $pseudonym = installCenterDiagnosticPseudonymizeValue($kind, $rawValue);
+            if ($pseudonym === $rawValue) return (string)$match[0];
+            return (string)$match[1] . (string)$match[2] . (string)$match[1] . (string)$match[3] . '"' . $pseudonym . '"';
+        },
+        $text
+    );
+    $text = preg_replace_callback(
+        '/\b([A-Za-z][A-Za-z0-9_-]*)(\s*[:=]\s*)([^\s,;"\'\[\]\}\)][^\s,;"\'\]\}\)]*)/u',
+        function($match) {
+            $kind = installCenterDiagnosticIdentifierKind((string)$match[1], (string)$match[3]);
+            if (!in_array($kind, installCenterDiagnosticDeviceIdentifierKinds(), true)) return (string)$match[0];
+            return (string)$match[1] . (string)$match[2] . installCenterDiagnosticPseudonymizeValue($kind, (string)$match[3]);
+        },
+        $text
+    );
+    $text = preg_replace_callback(
+        '/\b[0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5}\b/',
+        fn($match) => installCenterDiagnosticPseudonym('mac', (string)$match[0]),
+        $text
+    );
+    // e3dc_live meldet Zähler-Seriennummern schon ab 65536 (fünfstellig).
+    $text = preg_replace_callback(
+        '/(Wurzelz(?:ä|ae)hler\s+)(\d{5,})(?=\s+ist eine Seriennummer)/u',
+        fn($match) => (string)$match[1] . installCenterDiagnosticPseudonym('serial', (string)$match[2]),
+        $text
+    );
+    // Fahrzeugname aus dem Wallbox-Log („Fahrzeug: '<Name>' (ID=…)“), gleiches
+    // Pseudonym wie car_name in den JSON-Dateien.
+    $text = preg_replace_callback(
+        '/(Fahrzeug:\s*\')([^\'\r\n]+)(\')/u',
+        fn($match) => (string)$match[1] . installCenterDiagnosticPseudonymizeValue('vehicle', (string)$match[2]) . (string)$match[3],
+        $text
+    );
+    // Fahrzeugname aus der Planer-Zeile („Spezifischer SoC für <Name> aus
+    // vehicles.json: …“), gleiches Pseudonym wie name in vehicles.json.
+    $text = preg_replace_callback(
+        '/(Spezifischer SoC für\s+)(.+?)(\s+aus vehicles\.json:)/u',
+        fn($match) => (string)$match[1] . installCenterDiagnosticPseudonymizeValue('vehicle', (string)$match[2]) . (string)$match[3],
+        $text
+    );
+    // RFID-Tag im Freitext, etwa der Ersatzname „RFID <Tag>“ der Wallbox.
+    $text = preg_replace_callback(
+        '/\b(RFID\s+)([0-9A-Za-z_:-]{4,})/u',
+        fn($match) => (string)$match[1] . installCenterDiagnosticPseudonymizeValue('rfid', (string)$match[2]),
+        $text
+    );
+    // Topics aus festen Logzeilen des MQTT-Hubs („MQTT Eingangs-Topic … : <topic>“,
+    // „Abonniere SoC Topic auf Broker: <topic>“, „MQTT Topic mit NaN/Inf
+    // ignoriert: <topic>“), gleiches Pseudonym wie das Topic in der Konfiguration.
+    // Groß geschrieben und ohne /i: bereits pseudonymisierte "…topic"-Werte in
+    // JSON-Text bleiben unberührt.
+    $text = preg_replace_callback(
+        '/(\bTopic\b[^:\r\n]{0,40}:\s*)(?!\[)([^\s"\',;]+)/u',
+        fn($match) => (string)$match[1] . installCenterDiagnosticPseudonymizeValue('topic', (string)$match[2]),
+        $text
+    );
+    // Cloud-Fahrzeug-ID im URL-Pfad von Bluelink-Fehlermeldungen
+    // („… with url: /api/v1/spa/vehicles/<ID>/…“), gleiches Pseudonym wie die id
+    // in vehicles.json. Nur der Plural „/vehicles/“ und erst nach den Topic-Regeln,
+    // damit e3dc/vehicle/<Name>-Topics als ganzes Topic pseudonymisiert bleiben.
+    $text = preg_replace_callback(
+        '~(/vehicles/)(?![\[#+])([^/\s?\'"()]+)~u',
+        fn($match) => (string)$match[1] . installCenterDiagnosticPseudonymizeValue('vehicle', (string)$match[2]),
+        $text
+    );
+    // Hostname in Journalzeilen (journalctl -o short-iso: Zeit, Host, Dienst).
+    $text = preg_replace_callback(
+        '/^(\s*\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:[+-]\d{2}:?\d{2}|Z)?\s+)(\S+)(\s+[^\s:]+?(?:\[\d+\])?:)/m',
+        fn($match) => (string)$match[1] . installCenterDiagnosticPseudonymizeValue('ip', (string)$match[2]) . (string)$match[3],
+        $text
+    );
+    // Eigener Hostname an jeder anderen Stelle, nur als ganzes Wort und in
+    // exakter Schreibweise, damit Dienst- und Pfadnamen lesbar bleiben.
+    $hostname = installCenterDiagnosticLocalHostname();
+    if ($hostname !== '') {
+        $text = preg_replace_callback(
+            '/(?<![A-Za-z0-9_.\/-])' . preg_quote($hostname, '/') . '(?![A-Za-z0-9_\/-])/u',
+            fn($match) => installCenterDiagnosticPseudonymizeValue('ip', (string)$match[0]),
+            $text
+        ) ?? $text;
+    }
     return $text;
+}
+
+// Prüft einen Hostnamen für die Pseudonymisierung; leer bei zu kurzen oder
+// generischen Namen. e3dc-control ist der Standard-Hostname der
+// mitgelieferten Compose-Dateien und zugleich Dienstname, etwa in
+// „docker compose logs e3dc-control“; er kennzeichnet keine Anlage.
+function installCenterDiagnosticHostnameCandidate($name) {
+    $name = trim((string)$name);
+    if (strlen($name) < 3) return '';
+    if (in_array(strtolower($name), ['localhost', 'e3dc-control'], true)) return '';
+    if (preg_match('/^\[[a-z]+-[0-9a-f]{10}\]$/', $name)) return '';
+    return $name;
+}
+
+// Eigener Hostname für die Pseudonymisierung.
+function installCenterDiagnosticLocalHostname() {
+    static $hostname = null;
+    if ($hostname === null) {
+        $hostname = installCenterDiagnosticHostnameCandidate((string)(@gethostname() ?: ''));
+    }
+    return $hostname;
+}
+
+// Arten, die nur über ihren Schlüssel als Gerätekennung erkennbar sind.
+function installCenterDiagnosticDeviceIdentifierKinds() {
+    return ['serial', 'mac', 'rfid', 'device', 'account'];
+}
+
+// Schlüsseldatei je Anlage. Nur der Webaufruf legt sie an; auf der
+// Kommandozeile (Tests, Werkzeuge) gilt sie nur mit ausdrücklicher Angabe,
+// sonst bleibt der Schlüssel paketlokal.
+function installCenterDiagnosticPseudonymKeyFile() {
+    if (PHP_SAPI === 'cli') {
+        $override = getenv('E3DC_DIAGNOSTIC_PSEUDONYM_KEY_FILE');
+        return (is_string($override) && $override !== '') ? $override : null;
+    }
+    return '/var/www/html/data/diagnostic_pseudonym.key';
+}
+
+// Lädt den Schlüssel der Anlage oder legt ihn einmalig an (32 Byte, hex,
+// Datei 0640 für die Gruppe des Webservers). Eine vorhandene, aber nicht
+// lesbare oder ungültige Datei wird nie ersetzt, damit sich die Pseudonyme
+// nicht unbemerkt ändern; dann gilt ein Schlüssel nur für dieses Paket.
+function installCenterDiagnosticLoadPseudonymKey($file) {
+    $readKey = static function ($path) {
+        if (!is_file($path) || is_link($path) || !is_readable($path)) return null;
+        $raw = @file_get_contents($path);
+        if (!is_string($raw) || !preg_match('/^[0-9a-f]{64}$/', trim($raw))) return null;
+        return hex2bin(trim($raw));
+    };
+    $packageKey = static function ($reason) {
+        try {
+            $key = random_bytes(32);
+        } catch (\Throwable $e) {
+            $key = hash('sha256', uniqid('', true) . '|' . microtime(true) . '|' . getmypid() . '|' . mt_rand(), true);
+        }
+        return ['key' => $key, 'scope' => 'package', 'reason' => $reason];
+    };
+    if (!is_string($file) || $file === '') {
+        return $packageKey('no_key_file');
+    }
+    $existing = $readKey($file);
+    if ($existing !== null) {
+        return ['key' => $existing, 'scope' => 'installation', 'reason' => 'loaded'];
+    }
+    if (file_exists($file) || is_link($file)) {
+        return $packageKey('key_file_unreadable');
+    }
+    $dir = dirname($file);
+    if (!is_dir($dir) || !is_writable($dir)) {
+        return $packageKey('key_dir_not_writable');
+    }
+    $lock = @fopen($file . '.lock', 'c');
+    if ($lock === false) {
+        return $packageKey('key_lock_failed');
+    }
+    try {
+        if (!@flock($lock, LOCK_EX)) {
+            return $packageKey('key_lock_failed');
+        }
+        // Ein paralleler Aufruf kann die Datei inzwischen angelegt haben.
+        $existing = $readKey($file);
+        if ($existing !== null) {
+            return ['key' => $existing, 'scope' => 'installation', 'reason' => 'loaded'];
+        }
+        if (file_exists($file) || is_link($file)) {
+            return $packageKey('key_file_unreadable');
+        }
+        try {
+            $new = random_bytes(32);
+        } catch (\Throwable $e) {
+            return $packageKey('random_unavailable');
+        }
+        $tmp = $file . '.tmp.' . getmypid();
+        $oldUmask = umask(0027);
+        $written = @file_put_contents($tmp, bin2hex($new) . "\n");
+        umask($oldUmask);
+        if ($written === false || !@chmod($tmp, 0640) || !@rename($tmp, $file)) {
+            @unlink($tmp);
+            return $packageKey('key_write_failed');
+        }
+        $stored = $readKey($file);
+        if ($stored === null || !hash_equals($stored, $new)) {
+            return $packageKey('key_write_failed');
+        }
+        return ['key' => $stored, 'scope' => 'installation', 'reason' => 'created'];
+    } finally {
+        @flock($lock, LOCK_UN);
+        fclose($lock);
+    }
+}
+
+// Schlüssel der Pseudonyme: je Anlage gleich, damit gleiche Kennungen in allen
+// Diagnosepaketen dieser Anlage dasselbe Pseudonym erhalten. Der Schlüssel
+// verlässt die Anlage nie; ohne ihn ist ein Pseudonym nicht rückrechenbar.
+function installCenterDiagnosticPseudonymKeyState() {
+    static $state = null;
+    if ($state === null) {
+        $state = installCenterDiagnosticLoadPseudonymKey(installCenterDiagnosticPseudonymKeyFile());
+    }
+    return $state;
+}
+
+function installCenterDiagnosticPseudonymKey() {
+    return installCenterDiagnosticPseudonymKeyState()['key'];
+}
+
+function installCenterDiagnosticPseudonymScope() {
+    return (string)installCenterDiagnosticPseudonymKeyState()['scope'];
+}
+
+function installCenterDiagnosticIdentifierKind($key, $value = null) {
+    $key = strtolower(trim((string)$key));
+    if ($key === '') return null;
+    if ($key === 'wurzelzaehler') {
+        // Werte bis 65535 sind PM-Indizes, größere Werte Zähler-Seriennummern.
+        return (is_numeric($value) && (float)$value > 65535) ? 'serial' : null;
+    }
+    if (preg_match('/(?:^|[_-])(?:serial(?:[_-]?(?:number|no|nr))?|serialnumber|seriennummer|seriennr)$/', $key)) return 'serial';
+    if (preg_match('/(?:^|[_-])mac(?:[_-]?addr(?:ess)?)?$/', $key)) return 'mac';
+    if (preg_match('/(?:^|[_-])rfid(?:[_-]?tag)?$/', $key)) return 'rfid';
+    if (preg_match('/(?:^|[_-])(?:device[_-]?ids|device[_-]?unique[_-]?id|unique[_-]?id[_-]?tail|ac[_-]?id(?:[_-]?tail)?|config[_-]?selector)$/', $key)) return 'device';
+    if (preg_match('/(?:^|[_-])(?:home[_-]?id|resource[_-]?id(?:[_-]?\d+)?|client[_-]?id)$/', $key)) return 'account';
+    if (preg_match('/(?:^|[_-])(?:vin|profile[_-]?id)$/', $key)) return 'vehicle';
+    // Anzeigenamen der MQTT-SoC-Fahrzeuge (mqtt_hub_sub_soc_name[_2]); der MQTT-Hub
+    // verwendet sie als id und name in vehicles.json.
+    if (preg_match('/(?:^|[_-])sub[_-]?soc[_-]?name(?:[_-]?\d+)?$/', $key)) return 'vehicle';
+    // Fahrzeugschlüssel der Reichweiten- und Sitzungswerte (car_range_vehicle_key
+    // u. a.) tragen die Fahrzeug-ID oder den RFID-Tag.
+    if (preg_match('/(?:^|[_-])vehicle[_-]?key$/', $key)) return 'vehicle';
+    // Am Ende verankert: Zustands- und Messfelder wie car_range_valid,
+    // vehicle_identity_source oder vehicle_idle_* bleiben lesbar.
+    if (preg_match('/(^|[_-])(car|vehicle)([_-]|$)(?:.*[_-])?(?:name|id|ids|identity|identity_key|identifier)$|^(car_name|car_id|vehicle_name|vehicle_id|vin)$/i', $key)) {
+        return 'vehicle';
+    }
+    if (preg_match('/(^|[_-])(ip|host|hostname|topic)([_-]|$)|(_ip|_host|_hostname|_topic)$/i', $key)) {
+        return preg_match('/(?:car|vehicle|vin)/i', $key) ? 'vehicle' : (str_contains($key, 'topic') ? 'topic' : 'ip');
+    }
+    return null;
+}
+
+// Identitäts-Prüfsummen der Wallbox-Treiber (controller_identity, identity
+// u. a.) sind ungesalzene sha256-Werte über IP und Endpunkt und damit per
+// Probieren rückrechenbar. Sie werden mit Schlüssel pseudonymisiert; gleiche
+// Werte bleiben im Paket vergleichbar.
+function installCenterDiagnosticIsIdentityDigest($key, $value) {
+    return is_string($value)
+        && preg_match('/(?:^|[_-])identity$/', strtolower(trim((string)$key))) === 1
+        && preg_match('/^sha256:[0-9a-f]{64}$/i', trim($value)) === 1;
+}
+
+function installCenterDiagnosticIsPlaceholderIdentifier($value) {
+    $value = strtolower(trim((string)$value));
+    return in_array($value, ['', 'n/a', 'na', 'none', 'null', 'unknown', 'unbekannt', '-', '0', 'false', '__none', 'no_vehicle', 'kein_fahrzeug'], true);
 }
 
 function installCenterDiagnosticPseudonym($key, $value) {
     $key = strtolower(trim((string)$key));
     $value = trim((string)$value);
-    $prefix = preg_match('/(?:car|vehicle|vin)/i', $key) ? 'vehicle' : (str_contains($key, 'topic') ? 'topic' : 'ip');
-    return '[' . $prefix . '-' . substr(hash('sha256', $key . "\0" . $value), 0, 10) . ']';
+    $prefix = in_array($key, ['serial', 'mac', 'rfid', 'device', 'account', 'vehicle', 'topic', 'ip'], true)
+        ? $key
+        : (installCenterDiagnosticIdentifierKind($key, $value)
+            ?? (preg_match('/(?:car|vehicle|vin)/i', $key) ? 'vehicle' : (str_contains($key, 'topic') ? 'topic' : 'ip')));
+    if ($prefix === 'serial') $value = strtoupper($value);
+    if ($prefix === 'mac') $value = strtolower(str_replace('-', ':', $value));
+    // Wie die Klimasteuerung (_normalize_selector): Selektor, device_ids und
+    // ID-Endungen erhalten unabhängig von der Schreibweise dasselbe Pseudonym.
+    if ($prefix === 'device') $value = strtolower($value);
+    // RFID-Tags, MAC-Adressen und Fahrzeugkennungen teilen sich wie die
+    // Wallbox-Zuordnung (compact_vehicle_identifier über vehicle_id, vehicle_mac,
+    // mac, rfid und rfid_tag) einen Namensraum in Kompaktform: Reichweiten- und
+    // Sitzungsschlüssel tragen bei gleicher Kennung dieselbe Prüfsumme wie
+    // rfid_tag, vehicle_mac oder vehicle_id. Das Präfix bleibt je Feldart erhalten.
+    $hashKind = $prefix;
+    if ($prefix === 'rfid' || $prefix === 'vehicle' || $prefix === 'mac') {
+        $compact = preg_replace('/[^\p{L}\p{N}]+/u', '', strtolower($value));
+        if (is_string($compact) && $compact !== '') $value = $compact;
+        $hashKind = 'vehicle';
+    }
+    return '[' . $prefix . '-' . substr(hash_hmac('sha256', $hashKind . "\0" . $value, installCenterDiagnosticPseudonymKey()), 0, 10) . ']';
+}
+
+function installCenterDiagnosticPseudonymizeValue($kind, $value) {
+    if ($value === null || is_bool($value) || is_array($value) || is_object($value)) return $value;
+    $text = trim((string)$value);
+    if (installCenterDiagnosticIsPlaceholderIdentifier($text)) return $value;
+    if (preg_match('/^\[(?:[a-z]+-[0-9a-f]{10}|redacted[^\]]*)\]$/', $text)) return $value;
+    if ($kind === 'device' && preg_match('/[,;\s]/', $text)) {
+        $parts = array_values(array_filter(array_map('trim', preg_split('/[,;\s]+/', $text)), fn($part) => $part !== ''));
+        return implode(',', array_map(fn($part) => installCenterDiagnosticPseudonym($kind, $part), $parts));
+    }
+    return installCenterDiagnosticPseudonym($kind, $text);
 }
 
 function installCenterIsPseudonymousDiagnosticKey($key) {
-    $key = strtolower(trim((string)$key));
-    if ($key === '') return false;
-    if (preg_match('/(^|[_-])(car|vehicle)([_-]|$).*(name|id)|^(car_name|car_id|vehicle_name|vehicle_id|vin)$/i', $key)) {
-        return true;
-    }
-    return preg_match('/(^|[_-])(ip|host|hostname|topic)([_-]|$)|(_ip|_host|_hostname|_topic)$/i', $key) === 1;
+    return installCenterDiagnosticIdentifierKind($key) !== null;
 }
 
 function installCenterIsSensitiveConfigKey($key) {
     $key = (string)$key;
-    if (preg_match('/(password|passwort|pwd|(?:^|[_-])pass(?:$|[_-])|(?:^|[_-])pw(?:$|[_-])|token|secret|api.?key|apikey|credential|auth|bluelink_pin|bluelink_user)/iu', $key) === 1) {
+    // Umfasst die Muster von ha_manager.is_secret_config_key und dem
+    // Config-Editor: jede *_pin (web_pin ist zugleich API-Token), passwd, aes
+    // und private Schlüssel. Zusätzlich HTTP-/Web-Authentifizierung als ganzes
+    // Namensteil (Authorization, http_auth_*, WEB_AUTH_*); Regelwerte wie
+    // battery_support_authorized oder authorized_phases bleiben lesbar.
+    if (preg_match('/(password|passwort|passwd|pwd|(?:^|[_-])pass(?:$|[_-])|(?:^|[_-])pw(?:$|[_-])|(?:^|[_-])pin$|(?:^|[_-])aes(?:$|[_-])|(?:^|[_-])private(?:[_-]?key)?$|token|secret|api.?key|apikey|credential|(?:^|[_-])auth(?:$|[_-])|authorization$|(?:^|[_-])authentication(?:$|[_-])|bluelink_pin|bluelink_user)/iu', $key) === 1) {
         return true; // Bluelink-PIN und Konto (E-Mail) redigiert
     }
-    return preg_match('/(password|passwort|pwd|token|secret|api.?key|apikey|mail|email|chat.?id|latitude|longitude|breitengrad|laenge|länge|laengengrad|längengrad|^lat$|^lon$|^lng$|^long$|height|hoehe|höhe|elevation|altitude)/iu', (string)$key) === 1;
+    // Anmeldenamen von Geräte- und Dienstkonten sind Zugangsdaten.
+    if (preg_match('/^(?:e3dc_user|mqtt_hub_user|wb2?_user|stiebel_isg_web_user)$|(?:^|[_-])username$/iu', $key) === 1) {
+        return true;
+    }
+    return preg_match('/(password|passwort|pwd|token|secret|api.?key|apikey|mail|email|chat.?id|latitude|longitude|breitengrad|laenge|länge|laengengrad|längengrad|^lat$|^lon$|^lng$|^long$|[_-](?:lat|lon|lng)$|height|hoehe|höhe|elevation|altitude)/iu', (string)$key) === 1;
 }
 
-function installCenterRedactConfigValue($key, $value) {
+function installCenterRedactConfigValue($key, $value, $context = '') {
+    // Ein Wahrheitswert enthält kein Geheimnis; Prüfergebnisse wie
+    // phase5_boundary_pass oder http_auth_configured bleiben lesbar.
+    if (is_bool($value)) {
+        return $value;
+    }
     if (installCenterIsSensitiveConfigKey($key)) {
         return '[redacted]';
     }
-    if (installCenterIsPseudonymousDiagnosticKey($key) && is_scalar($value) && trim((string)$value) !== '') {
-        return installCenterDiagnosticPseudonym($key, $value);
+    $normalizedKey = strtolower(trim((string)$key));
+    $kind = installCenterDiagnosticIdentifierKind($key, is_scalar($value) ? $value : null);
+    if ($kind === null && installCenterDiagnosticIsIdentityDigest($normalizedKey, $value)) {
+        return installCenterDiagnosticPseudonymizeValue('device', $value);
+    }
+    if ($kind === null && $context === 'vehicle_item' && in_array($normalizedKey, ['id', 'name'], true)) {
+        $kind = 'vehicle'; // Cloud-Fahrzeug-ID und Fahrzeugname in vehicles.json
+    }
+    if ($kind === null && $context === 'topic_map') {
+        $kind = 'topic'; // Werte unter _topics (mqtt_ha_inbound.json) sind MQTT-Topics
+    }
+    if ($kind !== null && is_scalar($value)) {
+        return installCenterDiagnosticPseudonymizeValue($kind, $value);
+    }
+    if ($kind !== null && in_array($kind, installCenterDiagnosticDeviceIdentifierKinds(), true)
+        && is_array($value) && array_is_list($value)
+        && count(array_filter($value, fn($item) => !is_scalar($item) && $item !== null)) === 0) {
+        return array_map(fn($item) => installCenterDiagnosticPseudonymizeValue($kind, $item), $value);
     }
     if (is_array($value)) {
+        $childContext = '';
+        if ($normalizedKey === 'vehicles' && array_is_list($value)) {
+            $childContext = 'vehicle_list';
+        } elseif ($context === 'vehicle_list' && ctype_digit((string)$key)) {
+            $childContext = 'vehicle_item';
+        } elseif ($context === 'topic_map' || preg_match('/(?:^|[_-])topics$/', $normalizedKey)) {
+            $childContext = 'topic_map';
+        } elseif (!array_is_list($value)
+            && count(array_intersect(array_map(fn($childKey) => strtolower((string)$childKey), array_keys($value)), ['car_id', 'vehicle_id', 'rfid_tag'])) > 0) {
+            // Fahrzeugeintrag außerhalb von vehicles, etwa manual_soc_wb<n>.json:
+            // name ist dort der Fahrzeugname, „RFID <Tag>“ oder die Cloud-ID.
+            $childContext = 'vehicle_item';
+        }
         $out = [];
         foreach ($value as $childKey => $childValue) {
-            $out[$childKey] = installCenterRedactConfigValue((string)$childKey, $childValue);
+            $out[$childKey] = installCenterRedactConfigValue((string)$childKey, $childValue, $childContext);
         }
         return $out;
     }
@@ -961,7 +1315,7 @@ function installCenterRedactedConfig() {
         $redacted[$key] = installCenterRedactConfigValue((string)$key, $value);
     }
     return [
-        '_privacy_note' => 'Automatisch bereinigte Config: Passwörter, Tokens, E-Mail-Adressen und Standortwerte wurden maskiert.',
+        '_privacy_note' => 'Automatisch bereinigte Config: Passwörter, PINs, Tokens, Kontonamen, E-Mail-Adressen und Standortwerte wurden maskiert; Seriennummern sowie Fahrzeug-, Geräte- und Anlagenkennungen wurden pseudonymisiert.',
         'config' => $redacted
     ];
 }
@@ -2286,7 +2640,7 @@ function installCenterDiagnosticCandidates() {
             'path' => '/var/www/html/data/e3dc_v4.json',
             'bundle_size' => 30000,
             'default' => true,
-            'privacy' => 'Passwörter, Tokens, E-Mail und Standortwerte werden maskiert.'
+            'privacy' => 'Passwörter, Tokens, Kontonamen, E-Mail und Standortwerte werden maskiert; Geräte- und Fahrzeugkennungen pseudonymisiert.'
         ],
         [
             'id' => 'status:installer',
@@ -2435,7 +2789,7 @@ function installCenterDiagnosticCandidates() {
             'size' => @filesize($path) ?: 0,
             'bundle_size' => min(@filesize($path) ?: 0, 250000),
             'default' => in_array($base, ['storage_plan.json', 'storage_manager_state.json', 'storage_decision_latest.json', 'ems_decision_latest.json', 'live_decision_stability.json', 'config_validation.json', 'web_install_status.json'], true),
-            'privacy' => 'Live-/Planungsdaten, Text wird bereinigt.'
+            'privacy' => 'Live-/Planungsdaten, Text wird bereinigt; Seriennummern und Gerätekennungen werden pseudonymisiert.'
         ];
     }
     $auxMigrationPath = '/var/www/html/data/direct_marketing_aux_inverter_shelly_migration.json';
@@ -2455,7 +2809,7 @@ function installCenterDiagnosticCandidates() {
         'success' => true,
         'items' => $items,
         'presets' => installCenterDiagnosticPresets($items),
-        'privacy_note' => 'Das Paket wird lokal erzeugt. Passwörter, Tokens, E-Mail-Adressen und Standortwerte werden maskiert. Die Standardauswahl ist kompakt und forumstauglich; weitere Dateien können bewusst zusätzlich ausgewählt werden.'
+        'privacy_note' => 'Das Paket wird lokal erzeugt. Passwörter, Tokens, Kontonamen, E-Mail-Adressen und Standortwerte werden maskiert; Seriennummern, MAC-Adressen, RFID-Tags, Fahrzeug- und Gerätekennungen werden pseudonymisiert; gleiche Kennungen erhalten in allen Paketen dieser Anlage dasselbe Pseudonym. Die Standardauswahl ist kompakt und forumstauglich; weitere Dateien können bewusst zusätzlich ausgewählt werden.'
     ];
 }
 
@@ -2939,6 +3293,13 @@ function installCenterReadDiagnosticFile($path, $archiveName, $maxBytes = 90000)
             ];
         }
         $truncated = $offset > 0;
+        // Angeschnittene erste Zeile verwerfen: Ein Schnitt mitten in einem
+        // Feldnamen oder Logpräfix („Fahrzeug: '…'“) ließe den Wert sonst an
+        // jeder Erkennung vorbei. JSONL behandelt der Normalisierer selbst.
+        if ($truncated && $sourceFormat !== 'jsonl') {
+            $newline = strpos($text, "\n");
+            $text = $newline === false ? '' : substr($text, $newline + 1);
+        }
     }
     $normalized = installCenterNormalizeMachineReadableText($text, $sourceFormat, $truncated);
     $contentFormat = (string)($normalized['content_format'] ?? 'text');
@@ -3411,8 +3772,14 @@ function installCenterStreamDiagnosticBundle($selectedIds, $options = []) {
         . "Version: " . $versionLine . "\n"
         . "Git-Commit: " . $commitLine . "\n"
         . "Git-Worktree geändert: " . $dirtyLine . "\n\n"
-        . "Datenschutz: Passwörter, Tokens, E-Mail-Adressen, Chat-IDs und Standortwerte wurden automatisch maskiert.\n"
-        . "Fahrzeug-, Netzwerk- und MQTT-Identitäten wurden konsistent pseudonymisiert.\n"
+        . "Datenschutz: Passwörter, PINs, Tokens, Kontonamen, E-Mail-Adressen, Chat-IDs und Standortwerte einschließlich Fahrzeugpositionen wurden automatisch maskiert.\n"
+        . "Fahrzeug-, Netzwerk- und MQTT-Identitäten einschließlich des Hostnamens wurden pseudonymisiert, ebenso Gerätekennungen: Seriennummern von Speicher, Wallbox und Zähler, MAC-Adressen, RFID-Tags, Fahrzeug-IDs und FIN, Klimageräte-IDs sowie Anlagen-IDs von Tarif- und Prognosediensten.\n"
+        . "Ein Pseudonym nennt die Art der Kennung und eine Prüfsumme, z. B. [serial-1a2b3c4d5e]. "
+        . (installCenterDiagnosticPseudonymScope() === 'installation'
+            ? "Gleiche Kennungen erhalten in allen Diagnosepaketen dieser Anlage dasselbe Pseudonym; Pakete derselben Anlage lassen sich deshalb einander zuordnen. Der Schlüssel dafür bleibt auf der Anlage und wird nicht mitgeliefert; die Kennungen lassen sich daraus nicht zurückrechnen.\n"
+            : "Gleiche Kennungen erhalten innerhalb dieses Pakets dasselbe Pseudonym. Der Schlüssel dafür gilt nur für dieses Paket und wird nicht mitgeliefert; die Kennungen lassen sich daraus nicht zurückrechnen, und Pseudonyme verschiedener Pakete sind nicht vergleichbar.\n")
+        . "Modellbezeichnungen, Firmwarestände und Messwerte bleiben für die Fehlersuche erhalten.\n"
+        . "Kennungen im Freitext ohne erkennbaren Feldnamen werden nicht in jedem Fall erkannt.\n"
         . "Bitte das Paket vor dem Versenden einmal öffnen und prüfen.\n"
         . "Maschinenlesbarkeit: JSON/JSONL-Dateien enthalten keine Kommentar- oder Hinweiszeilen.\n"
         . "Maschinenhistorien werden immer geparst, gekürzt und strukturiert redigiert.\n"
@@ -3467,6 +3834,9 @@ function installCenterStreamDiagnosticBundle($selectedIds, $options = []) {
             'raw_machine_files_included' => false,
             'machine_histories_are_structurally_redacted' => true,
         ],
+        // installation: Pseudonyme sind mit anderen Paketen dieser Anlage vergleichbar;
+        // package: Schlüssel nur für dieses Paket (z. B. Schlüsseldatei nicht lesbar).
+        'pseudonym_scope' => installCenterDiagnosticPseudonymScope(),
         'privacy_note' => 'Dateiinhalte sind redigiert oder pseudonymisiert; das Manifest enthält Formate, Alter, Prüfsummen und Aufnahmezeiten, aber keine Zugangsdaten.',
     ];
     $bundleManifestPayload = installCenterFinalizeDiagnosticPayload(installCenterDiagnosticGeneratedPayload(

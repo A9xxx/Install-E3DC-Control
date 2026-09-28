@@ -23,6 +23,13 @@ TERMINAL_STAGES = frozenset({"completed", "aborted", "expired", "fault"})
 VISIBLE_STAGES = frozenset(ACTIVE_STAGES | TERMINAL_STAGES)
 DEFAULT_LEASE_S = 720.0
 DEFAULT_COOLDOWN_S = 480.0
+# Höchstes Warten einer ausgangslosen Hochschaltung auf die Speicherfreigabe.
+DEFAULT_GRANT_WAIT_S = 90.0
+# Nur Aufträge dieser Quelle (eigene Pro-Phasensequenz) haben eine Wartegrenze.
+GRANT_WAIT_SOURCE = "openwb_pro_phase_sequence"
+# Aufeinanderfolgende Managerzyklen, in denen die Empfehlung das Ziel einer
+# ausgangslosen Reservierung nicht mehr anfordert, bis sie ohne Ausgang endet.
+DEFAULT_GRANT_UNREQUESTED_CYCLES = 2
 CONFIRM_FRAMES = 3
 CONFIRM_S = 10.0
 DISCONNECT_CONFIRM_S = 60.0
@@ -30,6 +37,7 @@ STATE_KEY = "_wallbox_phase_transition_reservation"
 LEASE_TIMEBASE_KEY = "lease_timebase"
 DISCONNECT_TIMEBASE_KEY = "disconnect_timebase"
 STABLE_TIMEBASE_KEY = "stable_timebase"
+RESTART_LOAD_TIMEBASE_KEY = "restart_load_timebase"
 
 
 def _float(value, default=0.0):
@@ -339,6 +347,10 @@ def apply_grant(state, grant, *, now_ts=0.0, clock_sample=None):
     if granted >= requested and state_name in ("granted", "committed"):
         reservation["grant_state"] = state_name
         reservation["blocker"] = ""
+        # Eingang der ersten ausreichenden Freigabe dieser Generation: Ab hier
+        # begrenzt ``grant_wait_contract`` die Standzeit ohne Ausgang.
+        if _float(reservation.get("grant_sufficient_ts"), 0.0) <= 0.0:
+            reservation["grant_sufficient_ts"] = _float(now_ts, 0.0)
     elif state_name not in ("expired", "rejected"):
         reservation["grant_state"] = "waiting"
     data[STATE_KEY] = reservation
@@ -648,6 +660,48 @@ def update_reservation(
 
     power_w = status_power_w(st)
     phases = status_phase_count(st)
+    if str(reservation.get("stage") or "") == "confirm_target":
+        # Wiederanlauf unter Last, gleich mit wie vielen Phasen das Fahrzeug
+        # lädt: CONFIRM_FRAMES gültige Messungen über 500 W, stabil über
+        # CONFIRM_S. Ein zwei- oder einphasig ladendes Fahrzeug bestätigt die
+        # Zielphasen nie; dieser Beleg beendet nur den Wiederanlauf (etwa einen
+        # Stromdeckel bis zum Wiederanlauf), nicht die Reservierung selbst.
+        restart_load_confirmed_ts = _float(
+            reservation.get("restart_load_confirmed_ts"),
+            0.0,
+        )
+        if restart_load_confirmed_ts <= 0.0 and valid and power_w > 500.0 and phases >= 1:
+            reservation["restart_load_frames"] = _int(reservation.get("restart_load_frames"), 0) + 1
+            if _float(reservation.get("restart_load_since_ts"), 0.0) <= 0.0:
+                reservation["restart_load_since_ts"] = now
+            load_guard = reservation.get(RESTART_LOAD_TIMEBASE_KEY)
+            if isinstance(clock_sample, dict):
+                if not isinstance(load_guard, dict):
+                    load_guard = _guard_begin(
+                        CONFIRM_S,
+                        clock_sample,
+                        "restart_load_confirm",
+                    )
+                else:
+                    load_guard = _guard_step(
+                        load_guard,
+                        CONFIRM_S,
+                        clock_sample,
+                        "restart_load_confirm",
+                    )
+                reservation[RESTART_LOAD_TIMEBASE_KEY] = load_guard
+            load_stable = bool(
+                load_guard.get("active") is False
+                if isinstance(load_guard, dict)
+                else now - _float(reservation.get("restart_load_since_ts"), now) >= CONFIRM_S
+            )
+            if _int(reservation.get("restart_load_frames"), 0) >= CONFIRM_FRAMES and load_stable:
+                reservation["restart_load_confirmed_ts"] = now
+                reservation["restart_load_phases"] = phases
+        elif restart_load_confirmed_ts <= 0.0 and valid:
+            reservation["restart_load_frames"] = 0
+            reservation["restart_load_since_ts"] = 0.0
+            reservation.pop(RESTART_LOAD_TIMEBASE_KEY, None)
     confirmed = bool(valid and power_w > 500.0 and phases == _int(reservation.get("target_phases"), 0))
     if confirmed:
         reservation["valid_frames"] = _int(reservation.get("valid_frames"), 0) + 1
@@ -954,7 +1008,9 @@ def expiration_resolution_contract(
     """Klassifiziert, ob eine abgelaufene Reservierung ohne I/O entfernt werden kann.
 
     Nur eine ungebundene Reservierung, die nie einen Geräteausgang besaß, darf
-    beendet werden. Eine stale Wiederanlauffreigabe einer älteren, bereits
+    beendet werden – auch während die Box mit den bisherigen Phasen weiter
+    lädt, denn diese Ladung gehört nicht zur Generation. Eine stale
+    Wiederanlauffreigabe einer älteren, bereits
     bestätigten Phasengeneration ist nur dann harmlos, wenn ein frischer Idle-
     Readback weiterhin dieselbe Zielphase ausweist und CP explizit inaktiv ist.
     Jede mehrdeutige Ausgangsgeneration bleibt in ``recovery_hold`` fail-closed.
@@ -1092,12 +1148,19 @@ def expiration_resolution_contract(
     elif not cp_inactive:
         reason = "cp_state_not_inactive"
     elif ambiguous_output:
+        # Eine stale Wiederanlauffreigabe ohne Idle-Readback mit demselben
+        # Ziel ist nicht redundant und endet bereits hier; einen eigenen
+        # Zweig „Idle-Readback erforderlich“ gibt es deshalb nicht. Eine
+        # Generation ohne jeden Ausgangsbeleg ist auch bei laufender Ladung
+        # beendbar; sonst sperrt sie jeden neuen Phasenauftrag.
         reason = "expired_output_ambiguous"
-    elif not idle_readback:
-        reason = "idle_zero_readback_required"
     else:
         action = "terminalize"
-        reason = "expired_uncommitted_idle_confirmed"
+        reason = (
+            "expired_uncommitted_idle_confirmed"
+            if idle_readback
+            else "expired_uncommitted_no_output_confirmed"
+        )
 
     return {
         "contract": "wallbox_phase_expiration_resolution_v1",
@@ -1142,6 +1205,180 @@ def expiration_resolution_contract(
             generation_binding["restart_authorized_ignored_unrelated"]
         ),
         "generation_binding": generation_binding,
+        "ts": now,
+    }
+
+
+def grant_wait_contract(
+    reservation,
+    *,
+    now_ts=0.0,
+    max_wait_s=DEFAULT_GRANT_WAIT_S,
+    sequence=None,
+    output_intent=None,
+    output_ack=None,
+    recovery_hold=None,
+    restart_authorized=None,
+    wakeup_active=False,
+    unrequested_cycles=0,
+    max_unrequested_cycles=DEFAULT_GRANT_UNREQUESTED_CYCLES,
+):
+    """Begrenzt das Warten einer ausgangslosen Hochschaltung auf den Grant.
+
+    Solange eine 1p→3p-Reservierung nur auf die Speicherfreigabe wartet, lädt
+    die Box real mit den bisherigen Phasen weiter, während Zuteilung und
+    Speicherregler bereits mit den Zielphasen rechnen. Nach ``max_wait_s``
+    ohne ausreichenden Grant wird der Auftrag deshalb ohne Geräteausgang
+    beendet (``action="abort"``); den nächsten Versuch sperrt der Aufrufer
+    mit seiner Rückzugsverzögerung. Die Wartezeit ist die verbrauchte Lease
+    der monotonic Zeitbasis; nur eine Reservierung ohne Zeitbasis fällt auf
+    die Wallclock zurück. Eine ausreichende Freigabe hält den Auftrag nur,
+    solange die eigene Sequenz sie auch nutzt: Er endet ebenfalls ohne
+    Ausgang, sobald die Freigabe ``max_wait_s`` lang ungenutzt blieb (ab
+    ``grant_sufficient_ts``, höchstens die verbrauchte Lease) oder die
+    Empfehlung das Ziel ``max_unrequested_cycles`` Managerzyklen in Folge nicht
+    mehr anfordert (``unrequested_cycles``, vom Aufrufer an die Generation
+    gebunden). Jede Ausgangsevidenz, eine ungebundene Zeitbasis oder ein
+    Commit ergeben ``keep``. Die Grenze gilt nur für den eigenen
+    Sequenzauftrag (``GRANT_WAIT_SOURCE``); beobachtete Reservierungen ohne
+    eigenen Ausgang bleiben unberührt.
+    """
+
+    item = reservation if isinstance(reservation, dict) else {}
+    now = _float(now_ts, 0.0)
+    limit_s = max(0.0, _float(max_wait_s, DEFAULT_GRANT_WAIT_S))
+    unrequested = max(0, _int(unrequested_cycles, 0))
+    unrequested_limit = max(
+        1,
+        _int(max_unrequested_cycles, DEFAULT_GRANT_UNREQUESTED_CYCLES),
+    )
+    target = _int(item.get("target_phases"), 0)
+    from_phases = _int(item.get("from_phases"), 0)
+    guard = item.get(LEASE_TIMEBASE_KEY)
+    if isinstance(guard, dict):
+        timebase = "monotonic_guard"
+        timebase_unbound = bool(
+            guard.get("fail_closed") is True
+            or guard.get("valid") is False
+        )
+        duration_s = max(0.0, _float(guard.get("duration_s"), 0.0))
+        remaining_s = max(0.0, _float(guard.get("remaining_s"), duration_s))
+        elapsed_s = 0.0 if timebase_unbound else max(0.0, duration_s - remaining_s)
+    else:
+        timebase = "legacy_wallclock"
+        timebase_unbound = False
+        started = _float(item.get("started_ts"), 0.0)
+        elapsed_s = max(0.0, now - started) if started > 0.0 else 0.0
+    binding = output_evidence_binding_contract(
+        item,
+        sequence=sequence,
+        output_intent=output_intent,
+        output_ack=output_ack,
+        recovery_hold=recovery_hold,
+        restart_authorized=restart_authorized,
+    )
+    output_bound = bool(
+        any(
+            binding.get(key) is True
+            for key in (
+                "sequence_bound",
+                "output_intent_bound",
+                "output_ack_bound",
+                "recovery_hold_bound",
+                "restart_authorized_bound",
+            )
+        )
+        or bool(wakeup_active)
+    )
+    committed = bool(
+        max(0, _int(item.get("committed_w"), 0)) > 0
+        or _float(item.get("committed_ts"), 0.0) > 0.0
+        or max(0, _int(item.get("valid_frames"), 0)) > 0
+        or str(item.get("grant_state") or "") == "committed"
+    )
+    sufficient = grant_is_sufficient(item)
+    grant_ts = _float(item.get("grant_sufficient_ts"), 0.0)
+    # Standzeit einer ausreichenden, aber ungenutzten Freigabe: Wallclock seit
+    # ihrem Eingang, höchstens die verbrauchte Lease der monotonic Zeitbasis
+    # (eine vorgestellte Uhr verlängert sie nie über die Lease hinaus).
+    grant_unused_s = (
+        min(elapsed_s, max(0.0, now - grant_ts))
+        if sufficient and grant_ts > 0.0 and not timebase_unbound
+        else 0.0
+    )
+    target_unrequested = bool(unrequested >= unrequested_limit)
+
+    action = "keep"
+    if not item or item.get("active") is not True:
+        action = "none"
+        reason = "not_active"
+    elif str(item.get("stage") or "") != "await_budget":
+        reason = "not_waiting_for_grant"
+    elif target != 3 or from_phases == 3:
+        reason = "not_phase_up"
+    elif str(item.get("source") or "") != GRANT_WAIT_SOURCE:
+        # Nur der eigene Sequenzauftrag des Managers wartet auf eine Freigabe
+        # für einen Ausgang, den er selbst senden will. Eine beobachtete
+        # Reservierung (z. B. Ziel 3 bei einphasig ladendem Fahrzeug) hat
+        # keinen eigenen Ausgang und läuft über Lease-Ablauf und Aufräumer.
+        reason = "not_own_phase_sequence"
+    elif committed:
+        reason = "output_committed"
+    elif grant_recovery_blocked(item):
+        reason = "recovery_blocked"
+    elif sufficient:
+        # Die Freigabe gehört der Sequenz nur, solange sie sie auch nutzt.
+        # Ohne Ausgangsbeleg sperrt eine ungenutzte Freigabe sonst bis zum
+        # Lease-Ende (720 s) den Neustart und bepreist drei Phasen.
+        if output_bound or timebase_unbound:
+            reason = "grant_sufficient"
+        elif target_unrequested:
+            action = "abort"
+            reason = "target_not_requested_no_output"
+        elif grant_unused_s < limit_s:
+            reason = "grant_sufficient"
+        else:
+            action = "abort"
+            reason = "grant_unused_no_output"
+    elif output_bound:
+        reason = "output_evidence_bound"
+    elif timebase_unbound:
+        reason = "timebase_unbound"
+    elif target_unrequested:
+        action = "abort"
+        reason = "target_not_requested_no_output"
+    elif elapsed_s < limit_s:
+        reason = "grant_wait_running"
+    else:
+        action = "abort"
+        reason = "grant_wait_expired_no_output"
+    return {
+        "contract": "wallbox_phase_grant_wait_v1",
+        "action": action,
+        "reason": reason,
+        "abort": action == "abort",
+        "elapsed_s": round(elapsed_s, 1),
+        "max_wait_s": round(limit_s, 1),
+        "remaining_s": round(
+            max(0.0, limit_s - (grant_unused_s if sufficient else elapsed_s)),
+            1,
+        ),
+        "grant_sufficient_ts": grant_ts,
+        "grant_unused_s": round(grant_unused_s, 1),
+        "unrequested_cycles": unrequested,
+        "max_unrequested_cycles": unrequested_limit,
+        "timebase": timebase,
+        "timebase_unbound": timebase_unbound,
+        "reservation_id": str(
+            item.get("transition_id") or item.get("reservation_id") or ""
+        ),
+        "target_phases": target,
+        "from_phases": from_phases,
+        "requested_w": max(0, _int(item.get("requested_w"), 0)),
+        "granted_w": max(0, _int(item.get("granted_w"), 0)),
+        "grant_state": str(item.get("grant_state") or ""),
+        "output_evidence_bound": output_bound,
+        "hardware_write": False,
         "ts": now,
     }
 

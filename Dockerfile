@@ -118,6 +118,8 @@ RUN find -P /app/pi/Install -xdev -type d -exec chmod 0755 -- {} + && \
     test -f /app/pi/Install/Installer/Wallbox/fixed_phase_runtime.py && \
     test -f /app/pi/Install/Installer/Wallbox/fixed_start_energy.py && \
     test -f /app/pi/Install/Installer/control_time.py && \
+    test -f /app/pi/Install/Installer/heatpump_channel_owner.py && \
+    test -f /app/pi/Install/Installer/heatpump_em_dispatch.py && \
     test -f /app/pi/Install/Installer/heatpump_pv_contract.py && \
     test -f /app/pi/Install/Installer/heatpump_pv_state.py && \
     test -f /app/pi/Install/Installer/direct_marketing_actions.py && \

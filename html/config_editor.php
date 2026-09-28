@@ -888,7 +888,7 @@ $tooltips = [
     "luxtronik"              => "Aktiviert WP-/Verbrauchslogging und, falls erlaubt, den Energy Manager. Historischer Config-Key: luxtronik. Muss bei Luxtronik, IDM, Stiebel, Dimplex oder SG-Ready per Shelly aktiv sein.",
     "wp_type"                => "Wärmepumpen-Typ: -1=Keine WP, 0=Luxtronik (WebSocket), 1=IDM Navigator 2.0 (Modbus-TCP), 2=Heizstab/Shelly, 3=Shelly Pro3EM ohne native WP, 4=Stiebel Eltron ISG/WPM, 5=Dimplex WPM Touch/NWPM, 6=E3DC Leistungsmesser (PM).",
     "wp_e3dc_pm_index"       => "PM-Index des E3DC-Leistungsmessers für die Wärmepumpe (0..7, üblich: 1..6). Plausibilität vor dem Speichern testen.",
-    "wp_source_type"         => "Wärmequelle der Wärmepumpe. Quell-Erholung ist nur für speichernde Quellen wie Sole/Erdreich, Grundwasser oder Direktverdampfung sinnvoll; Luft blockiert diesen Pausenmodus.",
+    "wp_source_type"         => "Wärmequelle der Wärmepumpe. Sie bestimmt die Anzeige der Wärmequelle und die Farbbewertung von COP und Arbeitszahl; bei „Unbekannt“ werden die Werte nicht farblich bewertet. Quell-Erholung ist nur für speichernde Quellen wie Sole/Erdreich, Grundwasser oder Direktverdampfung sinnvoll; Luft blockiert diesen Pausenmodus.",
     "stiebel_isg_ip"        => "IP-Adresse des Stiebel-Eltron ISG im lokalen Netz.",
     "stiebel_isg_port"      => "Modbus-TCP-Port des ISG. Standard: 502.",
     "stiebel_isg_device_id" => "Modbus Unit-ID des ISG. Standard: 1.",
@@ -968,9 +968,9 @@ $tooltips = [
     "manual_boost_max_duration" => "Max. Dauer des manuellen Boosts in Minuten bevor er automatisch stoppt.",
 
     // Preis-Boost
-    "price_boost_enable"     => "Fordert eine preisbasierte Wärmeverschiebung als Candidate/Shadow an. Ohne vollständige Wärme-/PV-Evidenz und gebundenen heat_intent_v1-Aktivierungsvertrag bleibt sie effektiv aus.",
-    "heat_price_boost_scope" => "Wärmeziel für den Candidate: Heizung, Warmwasser oder beides. Ungültige Werte sperren die Preisverschiebung fail-closed.",
-    "heat_price_boost_windows" => "Optionale lokale Zeitfenster im Format HH:MM-HH:MM, eines pro Zeile. Leer bedeutet ganztägige Candidate-Auswertung; ungültige Einträge sperren fail-closed.",
+    "price_boost_enable"     => "Experimenteller Netzboost für Luxtronik, standardmäßig aus. Erlaubt den vorhandenen Negativpreis-Boost bei gemeinsamer Wärmeplanung, separater Negativpreisfreigabe und einer aktuellen Speicherzusage. Allgemeine günstige Preisfenster sind noch nicht aktiv. Schutzgrenzen und Automatik-Aus haben Vorrang.",
+    "heat_price_boost_scope" => "Wärmeziel für den experimentellen Netzboost: Heizung, Warmwasser oder beides. Ungültige Werte sperren den Netzboost.",
+    "heat_price_boost_windows" => "Optionale lokale Zeitfenster im Format HH:MM-HH:MM, eines pro Zeile. Leer erlaubt den experimentellen Netzboost ganztägig, sofern alle weiteren Freigaben vorliegen. Ungültige Einträge sperren ihn.",
     "price_limit"            => "Unter diesem Preis darf ein Wärme-Candidate entstehen. Ohne vollständige Evidenz und Aktivierungsvertrag startet dadurch keine Wärmepumpe.",
     "price_hard_limit"       => "Historische Sehr-günstig-Schwelle des Candidates. -99 deaktiviert sie; auch ein Unterschreiten ist keine eigenständige Aktorfreigabe.",
     "price_pause_limit"      => "Über diesem Preis wird der Wärme-Candidate verworfen (Hochpreis-Schutz).",
@@ -1604,9 +1604,13 @@ function e3dc_config_setting_requirements() {
     $rules['market_heatpump_enable'] = ['label' => 'Alter Wärmepumpen-Marktschalter (market_heatpump_enable)', 'requirements' => [
         ['when' => ['any' => []], 'reason' => 'Dieser historische Schalter wird nicht mehr zur Wärmepumpensteuerung verwendet. PV-/Forecast-Regelung, Pre-Dump und Negativpreis-Boost werden im Wärmepumpenbereich eingestellt.'],
     ], 'summary' => true];
-    $rules['price_boost_enable'] = ['label' => 'Wärmepumpen-Preisverschiebung (price_boost_enable)', 'requirements' => [
-        ['when' => ['any' => []], 'reason' => 'Diese Preisverschiebung bewertet derzeit nur mögliche Wärmefenster; der Schalter löst noch keine Wärmepumpensteuerung aus.'],
-    ], 'summary' => true];
+    $rules['price_boost_enable'] = ['label' => 'Experimenteller Wärmepumpen-Netzboost (price_boost_enable)', 'requirements' => [
+        $heat, $heatAuto, $spotTariff,
+        ['when' => ['type' => 'equals', 'key' => 'wp_type', 'value' => '0'], 'reason' => 'Der experimentelle Netzboost ist für Luxtronik verfügbar.'],
+        ['when' => ['type' => 'enabled', 'key' => 'heat_policy_runtime_enable'], 'reason' => 'Wärme in die Gesamtplanung einbeziehen aktivieren.'],
+        ['when' => ['type' => 'enabled', 'key' => 'cheap_grid_boost_enable'], 'reason' => 'Den gemeinsamen Negativpreis-Boost im Tarifbereich aktivieren.'],
+        ['when' => ['type' => 'enabled', 'key' => 'cheap_grid_heatpump_enable'], 'reason' => 'Die Wärmepumpe für den Negativpreis-Boost freigeben.'],
+    ], 'summary' => true, 'note' => 'Standardmäßig aus. Benötigt ein freigegebenes Negativpreisfenster, Wärmebedarf und eine aktuelle Speicherzusage. Allgemeine günstige Preisfenster bleiben ohne Steuerwirkung.'];
     foreach (['direct_marketing_export_enable', 'direct_marketing_grid_charge_enable', 'direct_marketing_pv_store_enable'] as $key) {
         $rules[$key] = ['label' => 'Direktvermarktungsfreigabe', 'requirements' => [
             ['when' => ['type' => 'enabled', 'key' => 'direct_marketing_enable'], 'reason' => 'Direktvermarktung aktivieren.'],
@@ -1818,7 +1822,10 @@ function e3dc_apply_config_backup_dir_permissions($path, $install_user, $data = 
 
 function e3dc_config_sensitive_key($key) {
     $k = strtolower((string)$key);
-    if (preg_match('/(password|passwort|pwd|token|secret|api[_-]?key|apikey|aes|private|chat[_-]?id|web[_-]?pin|refresh[_-]?token|bluelink[_-]?pin|bluelink[_-]?user)/', $k)) {
+    // Wie ha_manager.is_secret_config_key und die Installationszentrale:
+    // *_pass, *_pw, *_pin und passwd sowie die Anmeldenamen von Geräte- und
+    // Dienstkonten sind Zugangsdaten.
+    if (preg_match('/(password|passwort|passwd|pwd|(?:^|[_-])pass(?:$|[_-])|(?:^|[_-])pw(?:$|[_-])|(?:^|[_-])pin$|token|secret|api[_-]?key|apikey|aes|private|chat[_-]?id|web[_-]?pin|refresh[_-]?token|bluelink[_-]?pin|bluelink[_-]?user|^(?:e3dc_user|mqtt_hub_user|wb2?_user|stiebel_isg_web_user)$|(?:^|[_-])username$)/', $k)) {
         return true;
     }
     return in_array($k, ['hoehe', 'laenge', 'latitude', 'longitude', 'email'], true);
@@ -2075,14 +2082,35 @@ function e3dc_config_retention_warning_html($result) {
 }
 
 function e3dc_config_import_local_keys() {
-    return ['install_user', 'home_dir', 'install_path', 'venv_name', 'venv_path'];
+    // Wie HA_LOCAL_CONFIG_KEYS im HA-Abgleich (Installer/ha_manager.py): Installationsmetadaten,
+    // HA-Rolle, Peer und Gerätename bleiben lokal. Eine fremde Rolle widerspräche dem
+    // Rollenanker dieser Anlage und legte Regelung und Failover still.
+    return ['install_user', 'home_dir', 'install_path', 'venv_name', 'venv_path', 'ha_mode', 'ha_peer_ip', 'telegram_device_name'];
 }
 
 function e3dc_config_preserve_local_keys($current, $next) {
-    foreach (e3dc_config_import_local_keys() as $key) {
+    $localKeys = e3dc_config_import_local_keys();
+    // Schreibvarianten lokaler Schlüssel (HA_MODE, Ha_Mode) nie übernehmen: Die Dienste lesen
+    // Schlüssel klein geschrieben, eine Variante würde die lokale Rolle überdecken.
+    foreach (array_keys($next) as $key) {
+        $lower = strtolower((string)$key);
+        if ($lower !== (string)$key && in_array($lower, $localKeys, true)) unset($next[$key]);
+    }
+    // Ein HA-Knoten (auch Shadow) behält immer seinen Namen, auch den Standardnamen: Sonst trüge ein
+    // Slave den Namen aus der Sicherung des Masters, und beide Knoten meldeten sich gleich.
+    $localRole = e3dc_config_ha_role_text(is_array($current) ? ($current['ha_mode'] ?? '') : '');
+    foreach ($localKeys as $key) {
+        $localName = $key === 'telegram_device_name' && is_array($current) ? trim((string)($current[$key] ?? '')) : '';
+        if ($key === 'telegram_device_name' && in_array($localRole, ['', 'off'], true)
+            && ($localName === '' || $localName === 'E3DC-Control')
+            && is_string($next[$key] ?? null) && trim($next[$key]) !== '') {
+            // Nur ein Anzeigename: Ohne HA-Rolle und hier leer oder Standardname bleibt der aus der Datei.
+            continue;
+        }
         if (is_array($current) && array_key_exists($key, $current)) {
             $next[$key] = $current[$key];
         } else {
+            // Fehlt ein lokaler Schlüssel, bleibt er weg; eine fehlende Rolle wird nie still zu „off“.
             unset($next[$key]);
         }
     }
@@ -2595,6 +2623,31 @@ function e3dc_config_editor_extra_key_transaction(
             ];
         }
 
+        $candidate = $preimage;
+        if ($operation === 'delete') {
+            unset($candidate[$boundDeleteKey]);
+        } else {
+            $candidate[$key] = $requestedValue;
+        }
+        $candidateBytes = json_encode(
+            $candidate,
+            JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+        );
+        if (!is_string($candidateBytes)) {
+            return [
+                'success' => false,
+                'code' => 'encode_failed',
+                'message' => 'Die Konfigurationsänderung konnte nicht sicher kodiert werden.',
+            ];
+        }
+        $candidateBytes .= "\n";
+        if (strlen($candidateBytes) > e3dc_config_write_options()['max_json_bytes']) {
+            return [
+                'success' => false,
+                'code' => 'config_size_invalid',
+                'message' => e3dc_config_size_message(),
+            ];
+        }
         $backupResult = e3dc_backup_current_v4_json(
             $filePath,
             'extra_key',
@@ -2619,31 +2672,6 @@ function e3dc_config_editor_extra_key_transaction(
             ];
         }
 
-        $candidate = $preimage;
-        if ($operation === 'delete') {
-            unset($candidate[$boundDeleteKey]);
-        } else {
-            $candidate[$key] = $requestedValue;
-        }
-        $candidateBytes = json_encode(
-            $candidate,
-            JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
-        );
-        if (!is_string($candidateBytes)) {
-            return [
-                'success' => false,
-                'code' => 'encode_failed',
-                'message' => 'Die Konfigurationsänderung konnte nicht sicher kodiert werden.',
-            ];
-        }
-        $candidateBytes .= "\n";
-        if (strlen($candidateBytes) > 4 * 1024 * 1024) {
-            return [
-                'success' => false,
-                'code' => 'config_size_invalid',
-                'message' => 'Die geänderte e3dc_v4.json überschreitet die zulässige Größe.',
-            ];
-        }
         $publish = e3dc_config_editor_publish_atomic(
             $filePath,
             $candidateBytes,
@@ -2694,6 +2722,610 @@ function e3dc_config_extract_import_payload($decoded) {
         $clean[$key] = $value;
     }
     return $clean;
+}
+
+/**
+ * Bereinigte Konfiguration aus einem Diagnosepaket? Ihre Pseudonyme und Masken
+ * ([serial-…], [redacted]) sind keine Einstellungen und werden nie importiert.
+ * Muster wie in der Installationszentrale, die diese Kopie erzeugt.
+ */
+function e3dc_config_import_is_diagnostic_copy($decoded) {
+    if (!is_array($decoded)) return false;
+    if (array_key_exists('_privacy_note', $decoded)) return true;
+    if (is_array($decoded['config'] ?? null) && array_key_exists('_privacy_note', $decoded['config'])) return true;
+    $stack = [$decoded];
+    while ($stack) {
+        foreach (array_pop($stack) as $value) {
+            if (is_array($value)) {
+                $stack[] = $value;
+            } elseif (is_string($value) && preg_match('/^\[(?:[a-z]+-[0-9a-f]{10}|redacted[^\]]*)\]$/', trim($value))) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * Platzhalter aus „Einstellungen ohne Zugangsdaten“ sind keine Werte: Dort bleibt der Wert dieser
+ * Anlage; fehlt er hier, bleibt der Schlüssel weg. ***REDACTED*** ist nie ein echter Wert und gilt
+ * unter jedem Schlüssel als Platzhalter; ein leeres Feld nur unter geschützten Schlüsseln einer als
+ * redigiert markierten Datei. $stats zählt übernommene (kept) und hier leere oder fehlende (missing)
+ * Werte; missing_keys nennt deren Schlüssel für die Meldung.
+ */
+function e3dc_config_import_keep_local_secrets(array $import, $current, bool $redactedExport, array &$stats, $prefix = '') {
+    $current = is_array($current) ? $current : [];
+    $out = [];
+    foreach ($import as $key => $value) {
+        if ($value === '***REDACTED***' || ($redactedExport && $value === [] && e3dc_config_sensitive_key($key))) {
+            $local = array_key_exists($key, $current) ? $current[$key] : null;
+            if (array_key_exists($key, $current)) $out[$key] = $local;
+            if ($local === null || $local === '' || $local === [] || $local === '***REDACTED***') {
+                $stats['missing'] = (int)($stats['missing'] ?? 0) + 1;
+                $stats['missing_keys'][] = $prefix . $key;
+            } else {
+                $stats['kept'] = (int)($stats['kept'] ?? 0) + 1;
+            }
+            continue;
+        }
+        $out[$key] = is_array($value)
+            ? e3dc_config_import_keep_local_secrets($value, $current[$key] ?? [], $redactedExport, $stats, $prefix . $key . '.')
+            : $value;
+    }
+    // Eine Liste bleibt eine Liste, auch wenn ein Platzhalter-Element ohne lokalen Wert wegfällt.
+    if ($import !== [] && array_keys($import) === range(0, count($import) - 1)) {
+        $out = array_values($out);
+    }
+    return $out;
+}
+
+/**
+ * Eigene Einstellungen einer Shadow-Instanz unter den geschützten Schlüsseln: gemeinsames
+ * Snapshot-Token, Web-PIN, Telegram und Standort. In einem Shadow-Stand stammen sie von der Shadow;
+ * nur die Shadow selbst übernimmt sie daraus, ein Master oder Slave behält seine eigenen Werte.
+ */
+function e3dc_config_shadow_own_key($key) {
+    $k = strtolower((string)$key);
+    return in_array($k, ['shadow_snapshot_token', 'web_pin', 'hoehe', 'laenge', 'latitude', 'longitude'], true)
+        || str_starts_with($k, 'telegram_');
+}
+
+/**
+ * Ist diese Anlage eine Shadow? Rollenfeld „shadow“ oder Rollenanker „shadow“ ($anchorMode wie
+ * e3dc_config_ha_role_anchor_mode): Vom Rollenanker „shadow“ führt weder der Installer (install_ha.py,
+ * nur Master oder Slave) noch „System reparieren“ (update_bootstrap_discovery.py, der Rollenanker
+ * bleibt Rollenautorität) zu „off“; ein abweichendes Rollenfeld ändert daran nichts.
+ */
+function e3dc_config_ha_local_shadow($current, $anchorMode = null) {
+    return $anchorMode === 'shadow'
+        || e3dc_config_ha_role_text(is_array($current) ? ($current['ha_mode'] ?? '') : '') === 'shadow';
+}
+
+/**
+ * Stand von oder für eine Shadow-Instanz? Dann bringt er keine Zugangsdaten der aktiven Anlage mit.
+ * Den Rollenanker „shadow“ bei abweichendem Rollenfeld lehnt schon e3dc_config_import_ha_role_conflict
+ * ab; hier gilt er als zweite Sicherung ebenfalls als Shadow.
+ */
+function e3dc_config_import_drops_secrets($current, array $import, $anchorMode = null) {
+    return e3dc_config_ha_local_shadow($current, $anchorMode) || e3dc_config_import_file_ha_role($import) === 'shadow';
+}
+
+/**
+ * Geschützte Werte aus einem Shadow-Stand nicht übernehmen, auch verschachtelt: Dort bleibt der
+ * Wert dieser Anlage; fehlt er hier, bleibt der Schlüssel weg. Zugangsdaten der aktiven Anlage
+ * (RSCP-, Geräte- und Dienstkonten, API-Tokens) bleiben immer lokal. Die eigenen Einstellungen
+ * der Shadow ($shadowOwnFromFile) kommen nur auf der Shadow selbst aus der Datei; ein Master oder
+ * Slave behält auch Web-PIN, Telegram, Snapshot-Token und Standort.
+ * $dropped nennt die nicht übernommenen Schlüssel für die Meldung.
+ */
+function e3dc_config_import_drop_secrets(array $import, $current, array &$dropped, $prefix = '', bool $shadowOwnFromFile = false) {
+    $current = is_array($current) ? $current : [];
+    $out = [];
+    foreach ($import as $key => $value) {
+        if (e3dc_config_sensitive_key($key) && !($shadowOwnFromFile && e3dc_config_shadow_own_key($key))) {
+            if (array_key_exists($key, $current)) $out[$key] = $current[$key];
+            $dropped[] = $prefix . $key;
+            continue;
+        }
+        $out[$key] = is_array($value)
+            ? e3dc_config_import_drop_secrets($value, $current[$key] ?? [], $dropped, $prefix . $key . '.', $shadowOwnFromFile)
+            : $value;
+    }
+    return $out;
+}
+
+/**
+ * Geschützte Werte dieser Anlage, die im Shadow-Stand fehlen, in den Stand übernehmen, auch
+ * verschachtelt unter Elternschlüsseln, die der Stand mitbringt. Ein Rollback ersetzt die ganze
+ * Konfiguration; ohne diese Ergänzung verlöre ein Master oder Slave still etwa seine Web-PIN.
+ * Auf der Shadow selbst ($shadowOwnFromFile) folgen ihre eigenen Einstellungen dem Stand; ergänzt
+ * werden dort nur Zugangsdaten der aktiven Anlage. $kept nennt die ergänzten Schlüssel.
+ */
+function e3dc_config_import_keep_missing_secrets(array $import, $current, array &$kept, $prefix = '', bool $shadowOwnFromFile = false) {
+    if (!is_array($current)) return $import;
+    foreach ($current as $key => $value) {
+        $sensitive = e3dc_config_sensitive_key($key);
+        if (array_key_exists($key, $import)) {
+            if (!$sensitive && is_array($import[$key]) && is_array($value)) {
+                $import[$key] = e3dc_config_import_keep_missing_secrets($import[$key], $value, $kept, $prefix . $key . '.', $shadowOwnFromFile);
+            }
+            continue;
+        }
+        if ($sensitive && !($shadowOwnFromFile && e3dc_config_shadow_own_key($key))) {
+            $import[$key] = $value;
+            $kept[] = $prefix . $key;
+        }
+    }
+    return $import;
+}
+
+/**
+ * Shadow-Stand für Import und Rollback filtern: Stammt der Stand von einer Shadow oder ist diese
+ * Anlage eine Shadow (Rollenfeld oder Rollenanker, e3dc_config_ha_local_shadow), bleiben geschützte
+ * Werte lokal (siehe e3dc_config_import_drop_secrets), auch wenn sie im Stand fehlen
+ * (e3dc_config_import_keep_missing_secrets).
+ * $dropped nennt die aus dem Stand nicht übernommenen, $kept die hier ergänzten Schlüssel.
+ */
+function e3dc_config_import_shadow_filter(array $import, $current, array &$dropped, array &$kept, $anchorMode = null) {
+    if (!e3dc_config_import_drops_secrets($current, $import, $anchorMode)) return $import;
+    $localShadow = e3dc_config_ha_local_shadow($current, $anchorMode);
+    $import = e3dc_config_import_drop_secrets($import, $current, $dropped, '', $localShadow);
+    return e3dc_config_import_keep_missing_secrets($import, $current, $kept, '', $localShadow);
+}
+
+/** HA-Rolle als Text: klein, ohne Leerraum (auch geschützte Leerzeichen); Nicht-Text gilt als „unbekannt“. */
+function e3dc_config_ha_role_text($value) {
+    if ($value === null || $value === false || $value === '') return '';
+    if (!is_scalar($value)) return 'unbekannt';
+    return strtolower(trim(str_replace("\u{00A0}", ' ', (string)$value)));
+}
+
+/**
+ * Wert eines Schlüssels, wie ha_writer_admission.py die Konfiguration liest (_read_canonical_config):
+ * Schlüssel ohne Leerraum und klein geschrieben; bei mehreren Schreibweisen gilt die letzte.
+ */
+function e3dc_config_ha_config_value($config, $name) {
+    if (!is_array($config)) return null;
+    $found = null;
+    foreach ($config as $key => $value) {
+        if (strtolower(trim((string)$key)) === $name) $found = $value;
+    }
+    return $found;
+}
+
+/** IP-Adresse wie ha_writer_admission.py (_normalized_ip): kanonische Schreibweise, sonst ''. */
+function e3dc_config_ha_normalized_ip($value) {
+    if ($value === null || $value === false || !is_scalar($value)) return '';
+    $text = trim((string)$value);
+    if ($text === '' || filter_var($text, FILTER_VALIDATE_IP) === false) return '';
+    $packed = @inet_pton($text);
+    return $packed === false ? '' : (string)inet_ntop($packed);
+}
+
+/** Gesetzter Wert im Sinn von update_bootstrap_discovery.py (_configured_signal). */
+function e3dc_config_ha_configured_signal($value) {
+    if ($value === null || $value === false || $value === 0 || $value === 0.0 || $value === '' || $value === []) return false;
+    if (!is_scalar($value)) return true;
+    return !in_array(strtolower(trim((string)$value)), ['', '0', '0.0.0.0', 'false', 'none', 'null', 'off'], true);
+}
+
+/**
+ * Gesetzte HA-Einträge, die „System reparieren“ als Hinweis auf ein HA-Paar oder eine Shadow wertet
+ * (update_bootstrap_discovery.py): Mit einem davon bindet der Systemjob keine Rolle „off“, sondern
+ * bricht ab. Liefert die Schlüssel.
+ */
+function e3dc_config_ha_indicator_keys($config) {
+    $keys = [];
+    foreach (['ha_peer_ip', 'shadow_master_url', 'shadow_master_ip'] as $key) {
+        if (e3dc_config_ha_configured_signal(is_array($config) ? ($config[$key] ?? null) : null)) $keys[] = $key;
+    }
+    return $keys;
+}
+
+/** HA-Felder der Konfiguration für Meldungen (Rollenfeld, Partner-IP, Shadow-Einträge; keine Zugangsdaten). */
+function e3dc_config_ha_field_context($config) {
+    return is_array($config)
+        ? array_intersect_key($config, array_flip(['ha_mode', 'ha_peer_ip', 'shadow_master_url', 'shadow_master_ip']))
+        : [];
+}
+
+/**
+ * Rollenanker dieser Anlage (Vergleich wie ha_writer_admission.py). Nur der HA-Dialog im Installer
+ * wechselt die Rolle darin; das Rollenfeld im Config-Editor ändert nur die Config.
+ * state: ok, missing (fehlt), unreadable (für die Weboberfläche nicht lesbar), damaged (kein
+ * gültiger Anker, auch ein symbolischer Link) oder other_device (gehört zu einem anderen Gerät).
+ * mode und peer_ip nur bei ok, sonst null und ''. raw_mode, raw_peer_ip und raw_peer_signal: Rolle,
+ * Partner-IP und ob überhaupt eine Partner-IP eingetragen ist, wie „System reparieren“
+ * (update_bootstrap_discovery.py) sie ohne Schema- und Hostnamenprüfung aus der Datei liest, sonst
+ * null, '' und false; bei unreadable kennt sie nur der Systemjob.
+ */
+function e3dc_config_ha_role_anchor_state($path = '/etc/e3dc-control/instance_role.json') {
+    $result = static function ($state, $anchor = null, $mode = null) {
+        $rawMode = is_array($anchor) ? e3dc_config_ha_role_text($anchor['mode'] ?? '') : '';
+        $rawMode = in_array($rawMode, ['off', 'master', 'slave', 'shadow'], true) ? $rawMode : null;
+        return [
+            'mode' => $mode,
+            'state' => $state,
+            'peer_ip' => $mode !== null ? e3dc_config_ha_normalized_ip($anchor['peer_ip'] ?? '') : '',
+            'raw_mode' => $rawMode,
+            'raw_peer_ip' => $rawMode !== null ? e3dc_config_ha_normalized_ip($anchor['peer_ip'] ?? '') : '',
+            'raw_peer_signal' => $rawMode !== null && e3dc_config_ha_configured_signal($anchor['peer_ip'] ?? null),
+        ];
+    };
+    if (!file_exists($path) && !is_link($path)) return $result('missing');
+    // ha_writer_admission.py öffnet den Anker ohne symbolische Links (O_NOFOLLOW).
+    if (is_link($path) || !is_file($path)) return $result('damaged');
+    if (!is_readable($path)) return $result('unreadable');
+    $raw = @file_get_contents($path, false, null, 0, 65536);
+    if (!is_string($raw)) return $result('unreadable');
+    $anchor = json_decode($raw, true);
+    if (!is_array($anchor) || ($anchor['schema'] ?? null) !== 1) return $result('damaged', $anchor);
+    $node = $anchor['node_id'] ?? null;
+    if (!is_string($node) || $node !== trim((string)gethostname())) return $result('other_device', $anchor);
+    $mode = e3dc_config_ha_role_text($anchor['mode'] ?? '');
+    if (!in_array($mode, ['off', 'master', 'slave', 'shadow'], true)) return $result('damaged', $anchor);
+    return $result('ok', $anchor, $mode);
+}
+
+/** Rolle laut Rollenanker; null, wenn der Anker fehlt, unlesbar oder beschädigt ist oder zu einem anderen Gerät gehört. */
+function e3dc_config_ha_role_anchor_mode($path = '/etc/e3dc-control/instance_role.json') {
+    return e3dc_config_ha_role_anchor_state($path)['mode'];
+}
+
+/** HA-Rolle der Datei, auch unter Schreibvarianten des Schlüssels; '' oder 'off' = keine HA-Rolle. */
+function e3dc_config_import_file_ha_role(array $import) {
+    $file = '';
+    foreach ($import as $key => $value) {
+        if (strtolower((string)$key) !== 'ha_mode') continue;
+        $role = e3dc_config_ha_role_text($value);
+        if ($role !== '' && $role !== 'off') return $role;
+        if ($file === '') $file = $role;
+    }
+    return $file;
+}
+
+/**
+ * Passt der Stand zur HA-Rolle dieser Anlage? Liefert null oder die Rolle aus der Datei.
+ * - Eingerichtet als Master oder Slave heißt: Config und Rollenanker gleich. Nur dann übernimmt
+ *   die Anlage Stände aus einer HA-Rolle; ihre eigene Rolle bleibt dabei lokal.
+ * - Eine Shadow-Instanz übernimmt nur Stände einer Shadow-Instanz; Zugangsdaten der aktiven
+ *   Anlage gehören nicht dorthin.
+ * - Ohne eingerichtete Rolle (Ersatzhardware) liefe die Anlage mit lokal gehaltener Rolle als
+ *   Einzelregler neben dem früheren Partner; dann regelten zwei Instanzen einen Speicher.
+ * Zuerst gilt der Rollenanker: Trägt er Master oder Slave und weicht das Rollenfeld ab (auch
+ * „shadow“), passt kein Stand mit HA-Rolle und auf einem Rollenfeld „shadow“ gar keiner. Trägt er
+ * „shadow“, ist die Anlage eine Shadow, auch wenn das Rollenfeld abweicht: Dann passt kein Stand,
+ * ein Shadow-Stand erst wieder mit dem Rollenfeld „shadow“ (e3dc_config_ha_local_shadow).
+ */
+function e3dc_config_import_ha_role_conflict($current, array $import, $anchorMode) {
+    $file = e3dc_config_import_file_ha_role($import);
+    $config = e3dc_config_ha_role_text(is_array($current) ? ($current['ha_mode'] ?? '') : '');
+    if (in_array($anchorMode, ['master', 'slave'], true) && $config !== $anchorMode) {
+        if ($file !== '' && $file !== 'off') return $file;
+        return $config === 'shadow' ? 'off' : null;
+    }
+    if (e3dc_config_ha_local_shadow($current, $anchorMode)) {
+        if ($file === 'shadow' && $config === 'shadow') return null;
+        return $file === '' ? 'off' : $file;
+    }
+    if ($file === '' || $file === 'off') return null;
+    if (in_array($config, ['master', 'slave'], true) && $anchorMode === $config) return null;
+    return $file;
+}
+
+/**
+ * Grund eines HA-Konflikts für Meldung und Kästchen. Nur bei „no_role“ (keine Rolle in Config und
+ * Rollenanker, etwa Ersatzhardware) darf „Ohne HA“ bestätigt werden; sonst passt die Aussage des
+ * Kästchens nicht. Steht im Config-Editor „off“ oder nichts, im Rollenanker aber Master, Slave
+ * oder Shadow, ist das ein Widerspruch zur eingerichteten Rolle (anchor_mismatch), keine fehlende
+ * Rolle: Zugangsdaten einer HA-Sicherung gehören dann nicht auf dieses Gerät. Ein Rollenanker
+ * Master oder Slave geht dabei jeder Shadow-Regel vor, wie in e3dc_config_import_ha_role_conflict.
+ */
+function e3dc_config_ha_conflict_reason($current, $role, $anchorMode) {
+    $config = e3dc_config_ha_role_text(is_array($current) ? ($current['ha_mode'] ?? '') : '');
+    if (in_array($anchorMode, ['master', 'slave'], true) && $config !== $anchorMode) return 'anchor_mismatch';
+    if ($config === 'shadow') return 'shadow_local';
+    if ($role === 'shadow') return 'shadow_file';
+    if (in_array($config, ['master', 'slave'], true)) return $anchorMode === null ? 'anchor_unreadable' : 'anchor_mismatch';
+    if (in_array($anchorMode, ['master', 'slave', 'shadow'], true)) return 'anchor_mismatch';
+    return 'no_role';
+}
+
+/**
+ * Prüft einen Stand vor jeder Änderung (Import und Rollback, auch erneut unter der Sperre).
+ * Liefert null oder ['ha_role' => ..., 'reason' => ..., 'field' => HA-Felder für die Meldung].
+ */
+function e3dc_config_import_ha_rejection($current, array $import, bool $haPartnerOffConfirmed, $anchorMode) {
+    $role = e3dc_config_import_ha_role_conflict($current, $import, $anchorMode);
+    if ($role === null) return null;
+    $reason = e3dc_config_ha_conflict_reason($current, $role, $anchorMode);
+    if ($reason === 'no_role' && $haPartnerOffConfirmed) return null;
+    return ['ha_role' => $role, 'reason' => $reason, 'field' => e3dc_config_ha_field_context($current)];
+}
+
+/**
+ * Prüft eine hochgeladene Konfiguration vor jeder Änderung.
+ * status: ok, diagnostic_copy, invalid oder ha_role_conflict.
+ */
+function e3dc_config_import_check($decoded, $current, bool $haPartnerOffConfirmed, $anchorMode) {
+    if (e3dc_config_import_is_diagnostic_copy($decoded)) return ['status' => 'diagnostic_copy'];
+    $import = e3dc_config_extract_import_payload($decoded);
+    if ($import === null) return ['status' => 'invalid'];
+    unset($import['stop']);
+    $rejection = e3dc_config_import_ha_rejection($current, $import, $haPartnerOffConfirmed, $anchorMode);
+    if ($rejection !== null) return ['status' => 'ha_role_conflict'] + $rejection;
+    return [
+        'status' => 'ok',
+        'data' => $import,
+        'redacted' => is_array($decoded) && !empty($decoded['redacted']),
+        'ha_role' => e3dc_config_import_file_ha_role($import),
+    ];
+}
+
+/**
+ * Zustand des Rollenankers als Satzteil für Meldung und Hinweis (state wie
+ * e3dc_config_ha_role_anchor_state). „other_device“ entsteht nur bei abweichendem Hostnamen; der
+ * Hostname liegt mit dem Anker auf demselben Speichermedium. Eine unveränderte Kopie der Karte
+ * behält Hostnamen und Rollenanker, erst ihr Umbenennen ergibt einen fremden Anker.
+ */
+function e3dc_config_ha_anchor_problem($state) {
+    return [
+        'missing' => 'ihr Rollenanker fehlt',
+        'damaged' => 'ihr Rollenanker ist beschädigt',
+        'other_device' => 'ihr Rollenanker gehört zu einem anderen Gerät (anderer Hostname, etwa nach dem Umbenennen des Geräts oder einer kopierten Speicherkarte)',
+    ][(string)$state] ?? 'ihr Rollenanker ist für die Weboberfläche nicht lesbar';
+}
+
+/** Aufzählung für Meldungen: „a“, „a und b“, „a, b und c“. */
+function e3dc_config_join_de(array $parts) {
+    $parts = array_values($parts);
+    if (count($parts) <= 1) return (string)($parts[0] ?? '');
+    $last = array_pop($parts);
+    return implode(', ', $parts) . ' und ' . $last;
+}
+
+/**
+ * Zulassung steuernder Dienste nach Import oder Rollback, so wie ha_writer_admission.py
+ * (evaluate_writer_admission) sie beim nächsten Dienststart aus Konfiguration und Rollenanker
+ * berechnet: gültige Rolle (off, master, slave, shadow), bei Master und Slave eine gültige
+ * Partner-IP, ein lesbarer Rollenanker dieses Geräts mit derselben Rolle und derselben Partner-IP
+ * (bei „off“ und „shadow“ keine). Die Lease des HA-Managers ist Laufzeit und gehört nicht dazu.
+ * $anchor wie e3dc_config_ha_role_anchor_state.
+ * state: free (Writer zulässig), shadow oder blocked (gesperrt; reasons nennt alle Gründe, reason
+ * den ersten). Eine Shadow hat nie Writer (ha_shadow_writer_forbidden); mit Rollenfeld „shadow“ ist
+ * das ihr Normalbetrieb, außer der Rollenanker trägt Master oder Slave: Dann soll dieses Gerät regeln.
+ */
+function e3dc_config_ha_writer_state($config, array $anchor) {
+    $role = e3dc_config_ha_role_text(e3dc_config_ha_config_value($config, 'ha_mode'));
+    $anchorState = (string)($anchor['state'] ?? '');
+    $anchorMode = $anchorState === 'ok' ? ($anchor['mode'] ?? null) : null;
+    if ($role === 'shadow' && !in_array($anchorMode, ['master', 'slave'], true)) {
+        return ['state' => 'shadow', 'reason' => 'shadow', 'reasons' => [], 'role' => $role];
+    }
+    $valid = in_array($role, ['off', 'master', 'slave', 'shadow'], true);
+    $pair = in_array($role, ['master', 'slave'], true);
+    $peer = $pair ? e3dc_config_ha_normalized_ip(e3dc_config_ha_config_value($config, 'ha_peer_ip')) : '';
+    $reasons = [];
+    if (!$valid) $reasons[] = $role === '' ? 'role_missing' : 'role_invalid';
+    if ($anchorState !== 'ok') {
+        $reasons[] = in_array($anchorState, ['missing', 'damaged', 'other_device'], true) ? 'anchor_' . $anchorState : 'anchor_unreadable';
+    }
+    if ($pair && $peer === '') $reasons[] = 'peer_invalid';
+    if ($valid && $anchorState === 'ok') {
+        if ($anchorMode !== $role) {
+            $reasons[] = 'anchor_role';
+        } elseif (!($pair && $peer === '') && (string)($anchor['peer_ip'] ?? '') !== $peer) {
+            $reasons[] = 'anchor_peer';
+        }
+    }
+    if ($reasons === []) return ['state' => 'free', 'reason' => 'free', 'reasons' => [], 'role' => $role];
+    return ['state' => 'blocked', 'reason' => $reasons[0], 'reasons' => $reasons, 'role' => $role];
+}
+
+/** Gründe einer Sperre (e3dc_config_ha_writer_state) als Satzteil. */
+function e3dc_config_ha_block_text(array $writer, array $anchor) {
+    $role = htmlspecialchars((string)($writer['role'] ?? ''));
+    $parts = [];
+    foreach ((array)($writer['reasons'] ?? []) as $reason) {
+        if ($reason === 'role_missing') {
+            $parts[] = 'die HA-Rolle fehlt';
+        } elseif ($reason === 'role_invalid') {
+            $parts[] = "das Rollenfeld enthält keine gültige Rolle („{$role}“)";
+        } elseif ($reason === 'peer_invalid') {
+            $parts[] = "für die Rolle „{$role}“ fehlt eine gültige Partner-IP";
+        } elseif ($reason === 'anchor_role') {
+            // Master und Slave richtet nur der Installer ein (install_ha.py); „off“ und „shadow“ nicht.
+            $anchorMode = (string)($anchor['mode'] ?? '');
+            $parts[] = "das Rollenfeld („{$role}“) passt nicht zur "
+                . (in_array($anchorMode, ['master', 'slave'], true) ? 'im Installer eingerichteten Rolle „' . htmlspecialchars($anchorMode) . '“'
+                    : 'Rolle „' . htmlspecialchars($anchorMode) . '“ im Rollenanker');
+        } elseif ($reason === 'anchor_peer') {
+            $peer = (string)($anchor['peer_ip'] ?? '');
+            $parts[] = 'die Partner-IP passt nicht zum Rollenanker' . ($peer !== '' ? ' („' . htmlspecialchars($peer) . '“)' : '');
+        } else {
+            $parts[] = e3dc_config_ha_anchor_problem(substr((string)$reason, 7));
+        }
+    }
+    return e3dc_config_join_de($parts);
+}
+
+/** Passende Zeile der HA-Dokumentation; keine Reparaturanweisung aus unvollständigen Rollenquellen. */
+function e3dc_config_ha_help_row($config, array $anchor, bool $isDocker = false, $reason = '') {
+    if ($isDocker) return 'Docker-Ziel mit HA-/Shadow-Sicherung';
+    $state = (string)($anchor['state'] ?? '');
+    $rows = ['missing' => 'Anker fehlt', 'damaged' => 'Anker beschädigt',
+        'unreadable' => 'Anker unlesbar', 'other_device' => 'Anker von anderem Gerät'];
+    if (isset($rows[$state])) return $rows[$state];
+    if (in_array($reason, ['shadow_local', 'shadow_file'], true)
+        || e3dc_config_ha_local_shadow($config, $anchor['mode'] ?? null)) return 'Shadow einrichten';
+    if ($reason === 'no_role') return 'HA-Sicherung für Einzelbetrieb importieren';
+    return 'Rollenfeld und Rollenanker widersprechen sich';
+}
+
+/** Unmittelbare Warnung bleibt auch ohne Zugriff auf die Dokumentation sichtbar. */
+function e3dc_config_ha_warning($config, array $anchor, bool $isDocker = false, $reason = '') {
+    $row = htmlspecialchars(e3dc_config_ha_help_row($config, $anchor, $isDocker, $reason), ENT_QUOTES, 'UTF-8');
+    return ' Rolle oder Rollenanker nicht ändern, um die Sperre zu umgehen – sonst könnten zwei Anlagen denselben Speicher regeln.'
+        . ' Hilfe: HA-Dokumentation, Abschnitt „Rolle und Rollenanker“ → „' . $row . '“.';
+}
+
+/** Konfigurationsrolle, Dateirolle und Anker sind getrennte Befunde, kein Nachweis eines laufenden Writers. */
+function e3dc_config_ha_finding($config, $fileRole, array $anchor, bool $isDocker = false) {
+    $role = e3dc_config_ha_role_text(e3dc_config_ha_config_value($config, 'ha_mode'));
+    $role = htmlspecialchars(!is_array($config) ? 'nicht geprüft/lesbar' : ($role === '' ? 'fehlt' : $role), ENT_QUOTES, 'UTF-8');
+    $file = htmlspecialchars((string)$fileRole === '' ? 'ohne HA-Rolle' : (string)$fileRole, ENT_QUOTES, 'UTF-8');
+    $state = (string)($anchor['state'] ?? '');
+    $label = ['missing' => 'fehlt', 'damaged' => 'beschädigt', 'unreadable' => 'unlesbar',
+        'other_device' => 'anderes Gerät', 'ok' => 'passt zum Gerät'][$state] ?? 'nicht geprüft';
+    $anchorRole = htmlspecialchars((string)($anchor['mode'] ?? $anchor['raw_mode'] ?? 'unbekannt'), ENT_QUOTES, 'UTF-8');
+    return "Befund: Rolle laut Konfiguration „{$role}“, Rolle der Datei „{$file}“, Rollenanker: {$label} (Rolle „{$anchorRole}“)."
+        . ($isDocker ? ' Unter Docker wird diese Installation nur ohne HA betrieben (off).' : '');
+}
+
+/** Statische Rollenprüfung nach dem Commit; Laufzeit, Owner-Lease und Physik wurden nicht geprüft. */
+function e3dc_config_ha_writer_note($config, array $anchor, bool $isDocker = false) {
+    $writer = e3dc_config_ha_writer_state($config, $anchor);
+    if ($writer['state'] === 'blocked') {
+        return ' Rollenprüfung gesperrt: ' . e3dc_config_ha_block_text($writer, $anchor) . '. Der laufende Betrieb wurde nicht geprüft.'
+            . e3dc_config_ha_warning($config, $anchor, $isDocker);
+    }
+    if ($writer['state'] === 'shadow') {
+        return ' Rollenprüfung gesperrt: Shadow erlaubt absichtlich keine Hardwaresteuerung. Der laufende Betrieb wurde nicht geprüft.'
+            . e3dc_config_ha_warning($config, $anchor, $isDocker, 'shadow_local');
+    }
+    $note = ' Rollenprüfung bestanden; der laufende Betrieb wurde nicht geprüft.';
+    if ($writer['role'] === 'off' && e3dc_config_ha_indicator_keys($config) !== []) {
+        $note .= ' Zur Rolle off sind weiterhin HA-Einträge gesetzt.' . e3dc_config_ha_warning($config, $anchor, $isDocker);
+    }
+    return $note;
+}
+
+/** Abgelehnter Import/Rollback: Befund, unveränderter Stand und Prüfgrenze ohne Reparaturrezepte. */
+function e3dc_config_ha_conflict_message($role, $action, $reason = 'no_role', $isDocker = false, array $anchor = [], array $field = []) {
+    $finding = e3dc_config_ha_finding($field, $role, $anchor, $isDocker);
+    $label = $action === 'rollback' ? 'Wiederherstellung' : 'Import';
+    $reasonText = ['no_role' => 'HA-Sicherung ohne eingerichtete lokale Rolle',
+        'anchor_mismatch' => 'Rollenfeld und Rollenanker widersprechen sich',
+        'anchor_unreadable' => 'kein nutzbarer Rollenanker', 'shadow_local' => 'Datei passt nicht zur lokalen Shadow-Rolle',
+        'shadow_file' => 'Shadow-Datei passt nicht zur lokalen Rolle'][$reason] ?? 'Rollenkonflikt';
+    return "<div class='alert alert-warning py-2 border-0 mb-3 mx-2'>{$finding} Änderung: {$label} abgelehnt; es wurde nichts geändert."
+        . ' Rollenprüfung gesperrt: ' . $reasonText . '. Der laufende Betrieb wurde nicht geprüft.'
+        . e3dc_config_ha_warning($field, $anchor, $isDocker, $reason) . '</div>';
+}
+
+/** Gleiches Byte-Limit wie MAX_JSON_BYTES in ha_writer_admission.py; geprüft wird erst im gemeinsamen Schreiber. */
+function e3dc_config_write_options() {
+    return ['max_json_bytes' => 65536];
+}
+
+function e3dc_config_size_message() {
+    return 'Speichern abgelehnt; es wurde nichts geändert. Die fertig zusammengeführte Konfiguration überschreitet 64 KiB (65.536 Byte).'
+        . ' Die Dienste würden eine größere Datei nicht lesen; die Regelung wäre gesperrt.'
+        . ' Die Rollenprüfung des abgelehnten Stands wurde nicht abgeschlossen; der laufende Betrieb wurde nicht geprüft.';
+}
+
+/** Vorzeitig abgebrochene Datei-/Commitprüfung ist keine bestandene Rollenprüfung. */
+function e3dc_config_import_unchecked_note($config, $fileRole, array $anchor, bool $isDocker = false) {
+    $note = e3dc_config_ha_finding($config, $fileRole, $anchor, $isDocker)
+        . ' Rollenprüfung des abgelehnten oder unbestätigten Stands nicht abgeschlossen; der laufende Betrieb wurde nicht geprüft.';
+    if (!is_array($config) || e3dc_config_ha_writer_state($config, $anchor)['state'] !== 'free'
+        || !in_array((string)$fileRole, ['', 'off'], true)) {
+        $note .= e3dc_config_ha_warning($config, $anchor, $isDocker);
+    }
+    return $note;
+}
+
+/** Schlüsselnamen für eine Meldung: höchstens acht, maskiert, Rest als Anzahl. */
+function e3dc_config_import_key_list(array $keys) {
+    $keys = array_values(array_unique(array_map('strval', $keys)));
+    $shown = array_slice($keys, 0, 8);
+    $more = count($keys) - count($shown);
+    return htmlspecialchars(implode(', ', $shown)) . ($more > 0 ? " und $more weitere" : '');
+}
+
+/**
+ * Anzahl der Werte, die ein Import aus der Datei übernimmt, für die Meldung: ohne lokale Schlüssel
+ * (auch in anderer Schreibweise), ohne aus einem Shadow-Stand verworfene Werte und ohne Platzhalter,
+ * bei denen der Wert dieser Anlage bleibt oder fehlt ($stats wie e3dc_config_import_merge).
+ */
+function e3dc_config_import_value_count(array $import, array $stats, bool $redactedExport) {
+    $localKeyNames = e3dc_config_import_local_keys();
+    $dropped = array_map('strval', (array)($stats['dropped_keys'] ?? []));
+    $count = 0;
+    foreach ($import as $key => $value) {
+        if (in_array(strtolower((string)$key), $localKeyNames, true) || in_array((string)$key, $dropped, true)) continue;
+        if ($value === '***REDACTED***' || ($redactedExport && $value === [] && e3dc_config_sensitive_key($key))) continue;
+        $count++;
+    }
+    return $count;
+}
+
+/**
+ * Meldungsbaustein nach Import oder Rollback: von dieser Anlage übernommene und hier fehlende
+ * Platzhalter-Werte sowie aus einem Shadow-Stand nicht übernommene und hier beibehaltene
+ * geschützte Werte. Auf der Shadow selbst ($localShadow) betrifft das nur Zugangsdaten der aktiven
+ * Anlage; ihre eigenen Einstellungen wie Standort kommen dort aus dem Stand.
+ */
+function e3dc_config_import_secret_note(array $stats, bool $localShadow = false) {
+    $note = '';
+    $kept = (int)($stats['kept'] ?? 0);
+    if ($kept > 0) {
+        $note .= " $kept Werte mit Platzhalter (etwa Zugangsdaten oder Standort) wurden von dieser Anlage übernommen.";
+    }
+    $missing = (int)($stats['missing'] ?? 0);
+    if ($missing > 0) {
+        $note .= " $missing Werte mit Platzhalter fehlen auf dieser Anlage und müssen im Config-Editor neu eingetragen werden, sofern sie gebraucht werden: "
+            . e3dc_config_import_key_list((array)($stats['missing_keys'] ?? [])) . '.';
+    }
+    $dropped = (array)($stats['dropped_keys'] ?? []);
+    if ($dropped !== []) {
+        $note .= ($localShadow
+                ? ' Zugangsdaten der aktiven Anlage aus dem Shadow-Stand wurden nicht übernommen: '
+                : ' Geschützte Werte aus dem Shadow-Stand (etwa Zugangsdaten oder Standort) wurden nicht übernommen: ')
+            . e3dc_config_import_key_list($dropped) . '. Es gelten weiter die Werte dieser Anlage; fehlt ein Wert hier, bleibt er weg.';
+    }
+    $keptLocal = (array)($stats['kept_local_keys'] ?? []);
+    if ($keptLocal !== []) {
+        $note .= ($localShadow
+                ? ' Zugangsdaten der aktiven Anlage, die im Shadow-Stand fehlen, wurden von dieser Anlage beibehalten: '
+                : ' Geschützte Werte, die im Shadow-Stand fehlen, wurden von dieser Anlage beibehalten: ')
+            . e3dc_config_import_key_list($keptLocal) . '.';
+    }
+    return $note;
+}
+
+/**
+ * Neue Konfiguration aus dem gebundenen Stand und der geprüften Datei:
+ * Platzhalter behalten den lokalen Wert, lokale Schlüssel bleiben lokal, ein Shadow-Stand bringt
+ * keine Zugangsdaten der aktiven Anlage mit (auf der Shadow wie auf Master oder Slave); Master
+ * und Slave behalten dabei alle geschützten Werte, auch verschachtelte und im Stand fehlende.
+ * Shadow ist die Anlage mit Rollenfeld oder Rollenanker „shadow“ ($options['anchor']).
+ * Mit bestätigtem „Ohne HA“ und Rollenanker „off“ wird eine fehlende oder leere lokale Rolle
+ * „off“; ohne diese Bestätigung bleibt sie fehlend (gesperrt), nie still „off“.
+ */
+function e3dc_config_import_merge(array $boundCurrent, array $import, bool $redactedExport, array &$secretStats, array $options = []) {
+    $secretStats = ['kept' => 0, 'missing' => 0, 'missing_keys' => [], 'dropped_keys' => [], 'kept_local_keys' => []];
+    $import = e3dc_config_import_shadow_filter($import, $boundCurrent, $secretStats['dropped_keys'], $secretStats['kept_local_keys'], $options['anchor'] ?? null);
+    $clean = e3dc_config_import_keep_local_secrets($import, $boundCurrent, $redactedExport, $secretStats);
+    $next = array_replace($boundCurrent, $clean);
+    $next = e3dc_config_preserve_local_keys($boundCurrent, $next);
+    $next = e3dc_config_ha_off_after_confirmation($next, !empty($options['ha_off_confirmed']), $options['anchor'] ?? null);
+    return $next;
+}
+
+/** Fehlende oder leere Rolle nach bestätigtem „Ohne HA“ bei Rollenanker „off“ als „off“ eintragen. */
+function e3dc_config_ha_off_after_confirmation(array $next, bool $confirmed, $anchorMode) {
+    if ($confirmed && $anchorMode === 'off' && e3dc_config_ha_role_text($next['ha_mode'] ?? '') === '') {
+        $next['ha_mode'] = 'off';
+    }
+    return $next;
+}
+
+/** Ergebnis einer Import- oder Rollback-Mutation für die Meldung: ha_role_conflict, no_changes, success oder failed. */
+function e3dc_config_mutation_outcome(array $mutation) {
+    if (($mutation['status'] ?? '') === 'ha_role_conflict') return 'ha_role_conflict';
+    if (empty($mutation['success'])) return 'failed';
+    return ($mutation['status'] ?? '') === 'no_changes' ? 'no_changes' : 'success';
 }
 
 function e3dc_tibber_format_ct($value) {
@@ -3018,7 +3650,7 @@ if (in_array(($_GET['config_action'] ?? ''), ['download', 'download_redacted'], 
     if ($rawDownload && !e3dc_config_raw_download_pin_enabled($export_data)) {
         http_response_code(403);
         header('Content-Type: text/plain; charset=utf-8');
-        echo "Raw-Config-Download ist erst verfügbar, wenn eine Web-PIN gesetzt ist. Nutze bis dahin den redigierten Download.";
+        echo "Raw-Config-Download ist erst verfügbar, wenn eine Web-PIN gesetzt ist. Nutze bis dahin „Einstellungen ohne Zugangsdaten“.";
         exit;
     }
     if ($rawDownload && (string)($_GET['raw_confirm'] ?? '') !== '1') {
@@ -3049,6 +3681,11 @@ if (in_array(($_GET['config_action'] ?? ''), ['download', 'download_redacted'], 
 }
 
 /* --- POST-LOGIK --- */
+// Rolle aus einer abgelehnten HA-Sicherung; nur dann zeigen Import- bzw. Rollback-Dialog
+// das Kästchen „Ohne HA importieren“ bzw. „Ohne HA wiederherstellen“.
+$configUploadHaConflictRole = null;
+$configRollbackHaConflictRole = null;
+$configRollbackRejectedFile = null;
 if ($configEditorRequestMethod === 'POST') {
     if (($_POST['config_action'] ?? '') === 'test_tibber_api') {
         requireWebAuth(false);
@@ -3070,7 +3707,8 @@ if ($configEditorRequestMethod === 'POST') {
         $mutation = saveE3dcConfigValuesDetailed(
             ['market_heatpump_enable' => 0],
             $v4_config_file_path,
-            '/var/www/html/ramdisk/e3dc_config_cache.json'
+            '/var/www/html/ramdisk/e3dc_config_cache.json',
+                    e3dc_config_write_options()
         );
         if (!empty($mutation['success'])) {
             $config = readConfig($v4_config_file_path);
@@ -3078,7 +3716,7 @@ if ($configEditorRequestMethod === 'POST') {
             $message .= e3dc_config_retention_warning_html($mutation);
         } else {
             $status = htmlspecialchars((string)($mutation['status'] ?? 'unknown'), ENT_QUOTES, 'UTF-8');
-            $message = "<div class='alert alert-danger'>Das Deaktivieren konnte nicht bestätigt werden ($status). Bitte den gespeicherten Wert prüfen.</div>";
+            $message = "<div class='alert alert-danger'>" . ($status === 'config_too_large' ? e3dc_config_size_message() : "Das Deaktivieren konnte nicht bestätigt werden ($status).") . '</div>';
         }
     } elseif (($_POST['config_action'] ?? '') === 'create_manual_backup') {
         $backup = e3dcCreateConfirmedV4Backup(
@@ -3136,41 +3774,88 @@ if ($configEditorRequestMethod === 'POST') {
             $raw = (string)@file_get_contents((string)$upload['tmp_name']);
             $raw = preg_replace('/^\xEF\xBB\xBF/', '', $raw);
             $decoded = @json_decode($raw, true);
-            $import_data = e3dc_config_extract_import_payload($decoded);
             $current_data = e3dc_read_existing_v4_json($v4_config_file_path);
-            if ($import_data === null) {
+            $haAnchor = e3dc_config_ha_role_anchor_state();
+            $haAnchorMode = $haAnchor['mode'];
+            $haPartnerOffConfirmed = (string)($_POST['ha_partner_off_confirmed'] ?? '') === '1';
+            $importCheck = e3dc_config_import_check($decoded, $current_data, $haPartnerOffConfirmed, $haAnchorMode);
+            if ($importCheck['status'] === 'diagnostic_copy') {
+                $message = "<div class='alert alert-danger py-2 border-0 mb-3 mx-2'>Fehler: Das ist die bereinigte Konfiguration aus einem Diagnosepaket und kann nicht importiert werden. Die Konfiguration wurde nicht verändert.</div>";
+            } elseif ($importCheck['status'] === 'invalid') {
                 $message = "<div class='alert alert-danger py-2 border-0 mb-3 mx-2'>Fehler: Upload abgebrochen. Die Datei ist keine gültige E3DC-Control JSON-Konfiguration.</div>";
             } elseif ($current_data === null) {
                 $message = "<div class='alert alert-danger py-2 border-0 mb-3 mx-2'>Fehler: Bestehende Konfiguration ist nicht lesbar. Import abgebrochen.</div>";
+            } elseif ($importCheck['status'] === 'ha_role_conflict') {
+                // Das Kästchen „Ohne HA importieren“ gibt es nur für eine Anlage ohne Rolle.
+                if (($importCheck['reason'] ?? '') === 'no_role') $configUploadHaConflictRole = (string)$importCheck['ha_role'];
+                $message = e3dc_config_ha_conflict_message($importCheck['ha_role'], 'import', $importCheck['reason'] ?? 'no_role', e3dc_config_auto_install_is_docker(), $haAnchor, (array)($importCheck['field'] ?? []));
             } else {
-                unset($import_data['stop']);
+                $import_data = $importCheck['data'];
+                $redactedExport = !empty($importCheck['redacted']);
+                $secretStats = ['kept' => 0, 'missing' => 0];
                 $mutation = e3dcMutateV4ConfigDetailed(
-                    static function($boundCurrent) use ($import_data) {
-                        $next = array_replace($boundCurrent, $import_data);
-                        $next = e3dc_config_preserve_local_keys($boundCurrent, $next);
-                        return ['success' => true, 'data' => $next];
+                    static function($boundCurrent) use ($import_data, $redactedExport, $haPartnerOffConfirmed, $haAnchor, $haAnchorMode, &$secretStats) {
+                        // Erneut auf dem gesperrten Stand prüfen: Die Rolle kann sich seit dem Lesen geändert haben.
+                        $rejection = e3dc_config_import_ha_rejection($boundCurrent, $import_data, $haPartnerOffConfirmed, $haAnchorMode);
+                        if ($rejection !== null) {
+                            return ['success' => false, 'status' => 'ha_role_conflict'] + $rejection;
+                        }
+                        $next = e3dc_config_import_merge($boundCurrent, $import_data, $redactedExport, $secretStats, [
+                            'ha_off_confirmed' => $haPartnerOffConfirmed,
+                            'anchor' => $haAnchorMode,
+                        ]);
+                        // Nur statische Nachbewertung; Sperren bleiben ohne Reparaturanweisung sichtbar.
+                        return [
+                            'success' => true,
+                            'data' => $next,
+                            'ha_role_note' => e3dc_config_ha_writer_note($next, $haAnchor, e3dc_config_auto_install_is_docker()),
+                            'ha_finding' => e3dc_config_ha_finding($next, e3dc_config_import_file_ha_role($import_data), $haAnchor, e3dc_config_auto_install_is_docker()),
+                            'local_shadow' => e3dc_config_ha_local_shadow($boundCurrent, $haAnchorMode),
+                        ];
                     },
                     'preimport',
                     $v4_config_file_path,
-                    '/var/www/html/ramdisk/e3dc_config_cache.json'
+                    '/var/www/html/ramdisk/e3dc_config_cache.json',
+                    e3dc_config_write_options()
                 );
-                if (!empty($mutation['success'])) {
-                    $count = count($import_data);
+                $outcome = e3dc_config_mutation_outcome($mutation);
+                if ($outcome === 'ha_role_conflict') {
+                    // Unter der Sperre entsteht kein „no_role“: Die erste Prüfung mit derselben Bestätigung und demselben
+                    // Anker hätte es schon abgelehnt oder mit Bestätigung zugelassen; ein Kästchen gibt es hier deshalb nicht.
+                    $message = e3dc_config_ha_conflict_message($mutation['ha_role'] ?? '', 'import', $mutation['reason'] ?? 'no_role', e3dc_config_auto_install_is_docker(), $haAnchor, (array)($mutation['field'] ?? []));
+                } elseif (($mutation['status'] ?? '') === 'config_too_large') {
+                    $message = "<div class='alert alert-danger'>" . e3dc_config_size_message() . '</div>';
+                } elseif ($outcome === 'no_changes') {
+                    $message = "<div class='alert alert-info py-2 border-0 mb-3 mx-2'>Die Datei enthält keine Änderungen für diese Anlage; es wurde nichts geändert. " . (string)($mutation['ha_finding'] ?? '') . (string)($mutation['ha_role_note'] ?? '') . "</div>";
+                } elseif ($outcome === 'success') {
+                    $count = e3dc_config_import_value_count($import_data, $secretStats, $redactedExport);
                     $retentionWarning = e3dc_config_retention_warning_html($mutation);
-                    $messageClass = $retentionWarning === '' ? 'alert-success' : 'alert-warning';
-                    $message = "<div class='alert $messageClass py-2 border-0 mb-3 mx-2 animate__animated animate__fadeIn'>Konfiguration importiert ($count Werte). Lokale Installationspfade wurden beibehalten. Backup wurde bestätigt. Bitte IP-Adressen, HA-Rolle und aktive Dienste prüfen.$retentionWarning</div>";
+                    $roleNote = (string)($mutation['ha_role_note'] ?? '');
+                    $finding = (string)($mutation['ha_finding'] ?? '');
+                    $missingSecrets = (int)($secretStats['missing'] ?? 0);
+                    $messageClass = ($retentionWarning === '' && $missingSecrets === 0 && !str_contains($roleNote, 'gesperrt') && !str_contains($roleNote, 'zwei Anlagen')) ? 'alert-success' : 'alert-warning';
+                    $secretNote = e3dc_config_import_secret_note($secretStats, !empty($mutation['local_shadow']));
+                    $message = "<div class='alert $messageClass py-2 border-0 mb-3 mx-2 animate__animated animate__fadeIn'>Konfiguration importiert ($count Werte). Lokale Installationspfade wurden beibehalten. HA-Rolle und Peer dieser Anlage wurden beibehalten.$secretNote Backup wurde bestätigt. $finding$roleNote$retentionWarning</div>";
                     $config = readConfig($v4_config_file_path);
                     unset($config['stop']);
                 } else {
                     $status = (string)($mutation['status'] ?? 'unknown');
-                    $detail = !empty($mutation['state_unknown'])
-                        ? 'Die neue Konfiguration wurde veröffentlicht, ihr Cache-/Rückfallzustand konnte aber nicht sicher bestätigt werden.'
-                        : (!empty($mutation['rolled_back'])
-                            ? 'Der Import wurde nach einem Cachefehler vollständig zurückgesetzt.'
-                            : 'Import vor dem Commit abgebrochen; die bestehende Konfiguration blieb erhalten.');
-                    $message = "<div class='alert alert-danger py-2 border-0 mb-3 mx-2 animate__animated animate__shakeX'>$detail Fehlercode: " . htmlspecialchars($status) . ". Bitte im Installationscenter „Rechte prüfen und reparieren“ ausführen.</div>";
+                    $detail = !empty($mutation['rolled_back'])
+                        ? 'Die Konfiguration wurde auf den vorherigen Stand zurückgesetzt.'
+                            . (!empty($mutation['state_unknown']) ? ' Der Cachezustand konnte nicht bestätigt werden.' : '')
+                        : (!empty($mutation['state_unknown'])
+                            ? 'Die neue Konfiguration wurde veröffentlicht, ihr Cache-/Rückfallzustand konnte aber nicht sicher bestätigt werden.'
+                            : (!empty($mutation['published'])
+                                ? 'Die neue Konfiguration wurde geschrieben, die Schlussprüfung konnte sie aber nicht bestätigen. Bitte die Konfiguration im Editor prüfen.'
+                                : 'Import vor dem Commit abgebrochen; die bestehende Konfiguration blieb erhalten.'));
+                    $message = "<div class='alert alert-danger py-2 border-0 mb-3 mx-2 animate__animated animate__shakeX'>$detail Fehlercode: " . htmlspecialchars($status) . ". Der laufende Betrieb wurde nicht geprüft.</div>";
                 }
             }
+        }
+        if (!str_contains($message, 'Befund:')) {
+            $message .= "<div class='alert alert-warning'>" . e3dc_config_import_unchecked_note(
+                $current_data ?? null, $importCheck['ha_role'] ?? 'nicht geprüft', $haAnchor ?? [], e3dc_config_auto_install_is_docker()
+            ) . '</div>';
         }
     } elseif (isset($_POST['restore_backup'])) {
         requireWebAuth(false);
@@ -3189,31 +3874,79 @@ if ($configEditorRequestMethod === 'POST') {
             } else {
                 $current_data = e3dc_read_existing_v4_json($v4_config_file_path);
                 if ($current_data === null) $current_data = [];
+                $haAnchor = e3dc_config_ha_role_anchor_state();
+                $haAnchorMode = $haAnchor['mode'];
+                $haPartnerOffConfirmed = (string)($_POST['ha_partner_off_confirmed'] ?? '') === '1';
                 $mutation = e3dcMutateV4ConfigDetailed(
-                    static function($boundCurrent) use ($backup_data) {
+                    static function($boundCurrent) use ($backup_data, $haAnchor, $haAnchorMode, $haPartnerOffConfirmed) {
+                        // Gleiche HA-Prüfung wie beim Import: ein Stand aus einer HA-Rolle nur auf einem eingerichteten Knoten.
+                        $rejection = e3dc_config_import_ha_rejection($boundCurrent, $backup_data, $haPartnerOffConfirmed, $haAnchorMode);
+                        if ($rejection !== null) {
+                            return ['success' => false, 'status' => 'ha_role_conflict'] + $rejection;
+                        }
+                        // Wie beim Import: Ein Shadow-Stand bringt keine Zugangsdaten der aktiven Anlage mit, und
+                        // geschützte Werte dieser Anlage, die im Stand fehlen, bleiben erhalten.
+                        $dropped = [];
+                        $keptLocal = [];
+                        $backup_data = e3dc_config_import_shadow_filter($backup_data, $boundCurrent, $dropped, $keptLocal, $haAnchorMode);
                         $next = e3dc_config_preserve_local_keys($boundCurrent, $backup_data);
-                        return ['success' => true, 'data' => $next];
+                        $next = e3dc_config_ha_off_after_confirmation($next, $haPartnerOffConfirmed, $haAnchorMode);
+                        return [
+                            'success' => true,
+                            'data' => $next,
+                            'dropped_keys' => $dropped,
+                            'kept_local_keys' => $keptLocal,
+                            'ha_role_note' => e3dc_config_ha_writer_note($next, $haAnchor, e3dc_config_auto_install_is_docker()),
+                            'ha_finding' => e3dc_config_ha_finding($next, e3dc_config_import_file_ha_role($backup_data), $haAnchor, e3dc_config_auto_install_is_docker()),
+                            'local_shadow' => e3dc_config_ha_local_shadow($boundCurrent, $haAnchorMode),
+                        ];
                     },
                     'prerestore',
                     $v4_config_file_path,
-                    '/var/www/html/ramdisk/e3dc_config_cache.json'
+                    '/var/www/html/ramdisk/e3dc_config_cache.json',
+                    e3dc_config_write_options()
                 );
-                if (!empty($mutation['success'])) {
+                $outcome = e3dc_config_mutation_outcome($mutation);
+                if ($outcome === 'ha_role_conflict') {
+                    if (($mutation['reason'] ?? '') === 'no_role') $configRollbackHaConflictRole = (string)($mutation['ha_role'] ?? '');
+                    // Den abgelehnten Stand im Dialog wieder vorauswählen, nicht den neuesten.
+                    $configRollbackRejectedFile = $backupName;
+                    $message = e3dc_config_ha_conflict_message($mutation['ha_role'] ?? '', 'rollback', $mutation['reason'] ?? 'no_role', e3dc_config_auto_install_is_docker(), $haAnchor, (array)($mutation['field'] ?? []));
+                } elseif (($mutation['status'] ?? '') === 'config_too_large') {
+                    $message = "<div class='alert alert-danger'>" . e3dc_config_size_message() . '</div>';
+                } elseif ($outcome === 'no_changes') {
+                    $message = "<div class='alert alert-info py-2 border-0 mb-3 mx-2'>Der gewählte Stand enthält keine Änderungen für diese Anlage; es wurde nichts geändert. " . (string)($mutation['ha_finding'] ?? '') . (string)($mutation['ha_role_note'] ?? '') . "</div>";
+                } elseif ($outcome === 'success') {
                     $retentionWarning = e3dc_config_retention_warning_html($mutation);
-                    $messageClass = $retentionWarning === '' ? 'alert-success' : 'alert-warning';
-                    $message = "<div class='alert $messageClass py-2 border-0 mb-3 mx-2 animate__animated animate__fadeIn'>Konfiguration aus Backup wiederhergestellt. Der vorherige Stand wurde bestätigt gesichert; lokale Installationspfade wurden beibehalten.$retentionWarning</div>";
+                    $roleNote = (string)($mutation['ha_role_note'] ?? '');
+                    $finding = (string)($mutation['ha_finding'] ?? '');
+                    $messageClass = ($retentionWarning === '' && !str_contains($roleNote, 'gesperrt') && !str_contains($roleNote, 'zwei Anlagen')) ? 'alert-success' : 'alert-warning';
+                    $secretNote = e3dc_config_import_secret_note([
+                        'dropped_keys' => (array)($mutation['dropped_keys'] ?? []),
+                        'kept_local_keys' => (array)($mutation['kept_local_keys'] ?? []),
+                    ], !empty($mutation['local_shadow']));
+                    $message = "<div class='alert $messageClass py-2 border-0 mb-3 mx-2 animate__animated animate__fadeIn'>Konfiguration aus Backup wiederhergestellt. Der vorherige Stand wurde bestätigt gesichert; lokale Installationspfade wurden beibehalten. HA-Rolle und Peer dieser Anlage wurden beibehalten.$secretNote $finding$roleNote$retentionWarning</div>";
                     $config = readConfig($v4_config_file_path);
                     unset($config['stop']);
                 } else {
                     $status = (string)($mutation['status'] ?? 'unknown');
-                    $detail = !empty($mutation['state_unknown'])
-                        ? 'Die Wiederherstellung wurde veröffentlicht, ihr Cache-/Rückfallzustand konnte aber nicht sicher bestätigt werden.'
-                        : (!empty($mutation['rolled_back'])
-                            ? 'Die Wiederherstellung wurde nach einem Cachefehler vollständig auf den vorherigen Stand zurückgesetzt.'
-                            : 'Wiederherstellung vor dem Commit abgebrochen; der aktuelle Stand blieb erhalten.');
-                    $message = "<div class='alert alert-danger py-2 border-0 mb-3 mx-2 animate__animated animate__shakeX'>$detail Fehlercode: " . htmlspecialchars($status) . ". Bitte im Installationscenter „Rechte prüfen und reparieren“ ausführen.</div>";
+                    $detail = !empty($mutation['rolled_back'])
+                        ? 'Die Konfiguration wurde auf den vorherigen Stand zurückgesetzt.'
+                            . (!empty($mutation['state_unknown']) ? ' Der Cachezustand konnte nicht bestätigt werden.' : '')
+                        : (!empty($mutation['state_unknown'])
+                            ? 'Die Wiederherstellung wurde veröffentlicht, ihr Cache-/Rückfallzustand konnte aber nicht sicher bestätigt werden.'
+                            : (!empty($mutation['published'])
+                                ? 'Die neue Konfiguration wurde geschrieben, die Schlussprüfung konnte sie aber nicht bestätigen. Bitte die Konfiguration im Editor prüfen.'
+                                : 'Wiederherstellung vor dem Commit abgebrochen; der aktuelle Stand blieb erhalten.'));
+                    $message = "<div class='alert alert-danger py-2 border-0 mb-3 mx-2 animate__animated animate__shakeX'>$detail Fehlercode: " . htmlspecialchars($status) . ". Der laufende Betrieb wurde nicht geprüft.</div>";
                 }
             }
+        }
+        if (!str_contains($message, 'Befund:')) {
+            $message .= "<div class='alert alert-warning'>" . e3dc_config_import_unchecked_note(
+                $current_data ?? null, is_array($backup_data ?? null) ? e3dc_config_import_file_ha_role($backup_data) : 'nicht geprüft',
+                $haAnchor ?? [], e3dc_config_auto_install_is_docker()
+            ) . '</div>';
         }
     } elseif (isset($_POST['quick_toggle_key'])) {
         header('Content-Type: application/json; charset=utf-8');
@@ -3242,7 +3975,8 @@ if ($configEditorRequestMethod === 'POST') {
         $mutation = saveE3dcConfigValuesDetailed(
             $quickValues,
             $v4_config_file_path,
-            '/var/www/html/ramdisk/e3dc_config_cache.json'
+            '/var/www/html/ramdisk/e3dc_config_cache.json',
+                    e3dc_config_write_options()
         );
         $success = !empty($mutation['success']);
         $status = (string)($mutation['status'] ?? 'unknown');
@@ -3257,11 +3991,11 @@ if ($configEditorRequestMethod === 'POST') {
                 ? ('Gespeichert' . ($retentionWarning !== ''
                     ? '. Hinweis zur Bereinigung: ' . $retentionWarning
                     : ''))
-                : (!empty($mutation['state_unknown'])
+                : ($status === 'config_too_large' ? e3dc_config_size_message() : (!empty($mutation['state_unknown'])
                     ? 'Konfiguration wurde veröffentlicht, der Cache-/Rückfallzustand ist unklar. Bitte Rechte prüfen und reparieren.'
                     : (!empty($mutation['rolled_back'])
                         ? 'Änderung wurde nach einem Cachefehler vollständig zurückgesetzt.'
-                        : 'Fehler vor dem Speichern (' . $status . '). Bitte Rechte prüfen und reparieren.'))
+                        : 'Fehler vor dem Speichern (' . $status . '). Bitte Rechte prüfen und reparieren.')))
         ]);
         exit;
     }
@@ -3591,7 +4325,8 @@ if ($configEditorRequestMethod === 'POST') {
                 },
                 'save',
                 $v4_config_file_path,
-                '/var/www/html/ramdisk/e3dc_config_cache.json'
+                '/var/www/html/ramdisk/e3dc_config_cache.json',
+                    e3dc_config_write_options()
             );
             $success = !empty($mutation['success']);
             $config_mutation_status = (string)($mutation['status'] ?? 'unknown');
@@ -3654,6 +4389,9 @@ if ($configEditorRequestMethod === 'POST') {
                 'lock_metadata_invalid',
                 'lock_failed',
             ], true);
+            if ($config_mutation_status === 'config_too_large') {
+                $failure_details[] = e3dc_config_size_message();
+            }
             if ($config_load_failed) {
                 $failure_details[] = 'Die vorhandene e3dc_v4.json ist nicht lesbar oder enthält kein gültiges JSON.';
             }
@@ -5718,6 +6456,8 @@ async function readConfirmedConfigJson(response) {
                     '6' => 'E3DC Leistungsmesser (PM)'
                 ][$wp_type_val] ?? 'Keine Wärmepumpe';
                 $showWpSourceControls = $isLuxEnabled && in_array($wp_type_val, ['0','1'], true);
+                // Die Wärmequelle ist eine Eigenschaft jeder Wärmepumpe (Anzeige, COP-Farben, Quell-Erholung).
+                $showWpSourceTypeSelector = $isLuxEnabled && in_array($wp_type_val, ['0','1','3','4','5','6'], true);
                 $showShellySgControls = $isLuxEnabled && in_array($wp_type_val, ['-1','0'], true);
                 $shellySgConfigured = !in_array(strtolower(trim((string)$val('shelly_sg_ip'))), ['', '0', '0.0.0.0'], true);
                 $wpPriceBoostSeparateTargets = in_array($wp_type_val, ['0', '1'], true);
@@ -5778,7 +6518,7 @@ async function readConfirmedConfigJson(response) {
                                     Heizstab/BWWP bitte nicht als Wärmepumpe auswählen, sondern unten als Zusatzverbraucher konfigurieren.
                                 </div>
                             </div>
-                            <?php if ($showWpSourceControls): ?>
+                            <?php if ($showWpSourceTypeSelector): ?>
                             <div class="col-12 mt-2">
                                 <?php $wpSourceType = strtolower((string)($val('wp_source_type') ?: ($defaults['wp_source_type'] ?? 'auto'))); ?>
                                 <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['wp_source_type'] ?? '') ?>">Wärmequelle</label>
@@ -5790,7 +6530,7 @@ async function readConfirmedConfigJson(response) {
                                     <option value="direct" <?= in_array($wpSourceType, ['direct','direct_evaporation','direktverdampfung'], true) ? 'selected' : '' ?>>Direktverdampfung</option>
                                 </select>
                                 <div class="small text-muted mt-1">
-                                    Quell-Erholung wird nur bei Sole/Erdreich, Grundwasser oder Direktverdampfung erlaubt. Luft-Wärmepumpen werden dabei nicht pausiert.
+                                    Bestimmt die Anzeige der Wärmequelle und die Farbbewertung von COP und Arbeitszahl. Quell-Erholung wird nur bei Sole/Erdreich, Grundwasser oder Direktverdampfung erlaubt. Luft-Wärmepumpen werden dabei nicht pausiert. Die Quell-Erholung ist bisher nur mit Luxtronik und iDM erprobt.
                                 </div>
                             </div>
                             <?php endif; ?>
@@ -6484,15 +7224,15 @@ async function readConfirmedConfigJson(response) {
                             <div class="p-3 rounded-3 border border-info-subtle" id="heat_price_boost_controls" style="background: rgba(14,165,233,0.05);">
                                 <div class="d-flex flex-wrap align-items-start justify-content-between gap-3">
                                     <div class="flex-grow-1">
-                                        <div class="fw-bold text-info"><i class="fas fa-clock-rotate-left me-2"></i>Wärmepumpen-Preisverschiebung</div>
+                                        <div class="fw-bold text-info"><i class="fas fa-clock-rotate-left me-2"></i>Wärmepumpen-Netzboost <span class="badge text-bg-warning ms-1">Experimentell</span></div>
                                         <div class="small text-muted mt-1">
-                                            Noch ohne Steuerwirkung: Diese Funktion plant günstige Wärmezeiten mit Netzstrom. Die aktive Ausführung ist noch nicht verfügbar. Der Schalter speichert Deinen Wunsch; er startet derzeit keinen Netzboost.
+                                            Standardmäßig aus. Der Testbetrieb erlaubt den Negativpreis-Boost einer Luxtronik bei Wärmebedarf und aktueller Speicherzusage. Dafür müssen auch die gemeinsame Wärmeplanung und die beiden Negativpreisfreigaben eingeschaltet sein. Allgemeine günstige Preisfenster bleiben ohne Steuerwirkung.
                                         </div>
                                     </div>
                                     <div class="form-check form-switch m-0">
                                         <input type="hidden" name="values[price_boost_enable]" value="0">
                                         <input class="form-check-input" type="checkbox" name="values[price_boost_enable]" value="1" id="conf_price_boost_enable" <?= $isTrue('price_boost_enable') ? 'checked' : '' ?>>
-                                        <label class="form-check-label ms-2 config-label" for="conf_price_boost_enable" data-tooltip="<?= htmlspecialchars($tooltipMap['price_boost_enable'] ?? '') ?>">Preisabhängigen Netzboost vormerken</label>
+                                        <label class="form-check-label ms-2 config-label" for="conf_price_boost_enable" data-tooltip="<?= htmlspecialchars($tooltipMap['price_boost_enable'] ?? '') ?>">Experimentellen Netzboost aktivieren</label>
                                         <?= $configValidationMarker('price_boost_enable') ?>
                                     </div>
                                 </div>
@@ -6512,7 +7252,7 @@ async function readConfirmedConfigJson(response) {
                                     <div class="col-md-5">
                                         <label class="config-label" for="conf_heat_price_boost_windows" data-tooltip="<?= htmlspecialchars($tooltipMap['heat_price_boost_windows'] ?? '') ?>">Erlaubte Zeitfenster</label>
                                         <textarea class="form-control config-input" name="values[heat_price_boost_windows]" id="conf_heat_price_boost_windows" rows="2" placeholder="02:00-06:00&#10;12:00-16:00"><?= $val('heat_price_boost_windows') ?></textarea>
-                                        <div class="form-text">Leer bedeutet ganztägige Planung; je Zeile <code>HH:MM-HH:MM</code>.</div>
+                                        <div class="form-text">Leer erlaubt den Netzboost ganztägig; je Zeile <code>HH:MM-HH:MM</code>.</div>
                                         <?= $configValidationMarker('heat_price_boost_windows') ?>
                                     </div>
                                     <div class="col-md-4">
@@ -6523,7 +7263,7 @@ async function readConfirmedConfigJson(response) {
                                                 <input class="form-check-input" type="checkbox" name="values[cheap_grid_heatpump_enable]" value="1" id="conf_cheap_grid_heatpump_enable" <?= $isTrue('cheap_grid_heatpump_enable') ? 'checked' : '' ?>>
                                                 <label class="form-check-label config-label" for="conf_cheap_grid_heatpump_enable" data-tooltip="<?= htmlspecialchars($tooltipMap['cheap_grid_heatpump_enable'] ?? '') ?>">WP für Negativpreis-Boost freigeben</label>
                                             </div>
-                                            <div class="small text-muted mt-1">Nur echte Börsenpreistarife liefern belastbare Negativpreis-Slots. Zusätzlich muss der gemeinsame Negativpreis-Boost im Tarifbereich eingeschaltet sein. Dies ist unabhängig von der noch nicht aktiven allgemeinen Preisverschiebung.</div>
+                                            <div class="small text-muted mt-1">Nur echte Börsenpreistarife liefern belastbare Negativpreis-Slots. Zusätzlich muss der gemeinsame Negativpreis-Boost im Tarifbereich eingeschaltet sein. Für den Luxtronik-Testbetrieb muss zusätzlich der experimentelle Netzboost eingeschaltet sein.</div>
                                         </div>
                                     </div>
                                 </div>
@@ -6597,10 +7337,37 @@ async function readConfirmedConfigJson(response) {
                     <p class="small text-muted mb-2" data-wp-mode-description>Vorhandene Werte bleiben erhalten. Messwertgeführt zählt die tatsächliche Überbrückung. Ein erreichter Wh-Wächter beendet den zusätzlichen Boost nach der geschützten Mindestlaufzeit; der Verbrauch bis dahin wird weitergezählt. Ausgeschlossene Quellen und Hardwaregrenzen bleiben vorrangig.</p>
                     <div class="rounded bg-body-tertiary p-3 my-2" data-wp-measured-only <?= $val('wp_pv_control_mode') === 'measured' ? '' : 'hidden' ?>>
                         <label for="wpPvBridgePreset" class="config-label">Wolkenüberbrückung voreinstellen</label>
-                        <select class="form-select mb-2" id="wpPvBridgePreset">
-                            <option value="normal" selected>Normal: Akku 1.000 Wh / Netz 100 Wh</option>
-                            <option value="short">Kurz: Akku 500 Wh / Netz 50 Wh</option>
-                            <option value="long">Großzügig: Akku 2.000 Wh / Netz 200 Wh</option>
+                        <?php
+                        // Die gespeicherten Quellgrenzen bestimmen die Anzeige, nicht ein eigener Config-Key.
+                        $wpPvPresetNumber = static function($key, $fallback) use ($val) {
+                            $raw = trim((string)$val($key));
+                            return $raw !== '' && is_numeric($raw) && is_finite((float)$raw) ? (float)$raw : $fallback;
+                        };
+                        $wpPvPresetMaximum = $wpPvPresetNumber('wp_pv_max_power_w', 0);
+                        $wpPvPresetStart = $wpPvPresetNumber('wp_pv_start_power_w', 0);
+                        $wpPvPresetStart = $wpPvPresetStart > 0 ? $wpPvPresetStart : abs($wpPvPresetNumber('grid_start_limit', -3500));
+                        $wpPvPresetBatteryW = round($wpPvPresetMaximum > 0 ? $wpPvPresetMaximum : ($wpPvPresetStart > 0 ? $wpPvPresetStart : 3500));
+                        $wpPvPresetCurrent = [
+                            $wpPvPresetNumber('wp_pv_battery_max_w', null), $wpPvPresetNumber('wp_pv_battery_limit_wh', null),
+                            $wpPvPresetNumber('wp_pv_grid_max_w', null), $wpPvPresetNumber('wp_pv_grid_limit_wh', null),
+                        ];
+                        $wpPvPresetBattery = $wpPvPresetCurrent[0] > 0 && $wpPvPresetCurrent[1] > 0;
+                        $wpPvPresetGrid = $wpPvPresetCurrent[2] > 0 && $wpPvPresetCurrent[3] > 0;
+                        $wpPvStoredPreset = 'custom';
+                        foreach (['normal' => [1000, 100], 'short' => [500, 50], 'long' => [2000, 200]] as $name => $energy) {
+                            $expected = [$wpPvPresetBattery ? $wpPvPresetBatteryW : 0.0, $wpPvPresetBattery ? (float)$energy[0] : 0.0,
+                                         $wpPvPresetGrid ? 1000.0 : 0.0, $wpPvPresetGrid ? (float)$energy[1] : 0.0];
+                            if (($wpPvPresetBattery || $wpPvPresetGrid) && $wpPvPresetCurrent === $expected) {
+                                $wpPvStoredPreset = $name;
+                                break;
+                            }
+                        }
+                        ?>
+                        <select class="form-select mb-2" id="wpPvBridgePreset" name="wp_pv_bridge_preset">
+                            <option value="normal" <?= $wpPvStoredPreset === 'normal' ? 'selected' : '' ?>>Normal: Akku 1.000 Wh / Netz 100 Wh</option>
+                            <option value="short" <?= $wpPvStoredPreset === 'short' ? 'selected' : '' ?>>Kurz: Akku 500 Wh / Netz 50 Wh</option>
+                            <option value="long" <?= $wpPvStoredPreset === 'long' ? 'selected' : '' ?>>Großzügig: Akku 2.000 Wh / Netz 200 Wh</option>
+                            <option value="custom" <?= $wpPvStoredPreset === 'custom' ? 'selected' : '' ?>>Eigene Werte aus der Feinabstimmung</option>
                         </select>
                         <div class="d-flex flex-wrap gap-3 mb-2">
                             <label><input type="checkbox" id="wpPvPresetBattery" <?= !array_key_exists('wp_pv_battery_limit_wh', $config) || ((float)$val('wp_pv_battery_limit_wh') > 0 && (float)$val('wp_pv_battery_max_w') > 0) ? 'checked' : '' ?>> Akkuüberbrückung erlauben</label>
@@ -12632,11 +13399,11 @@ async function readConfirmedConfigJson(response) {
 	                <?php $rawConfigDownloadAllowed = e3dc_config_raw_download_pin_enabled($config); ?>
 	                <div class="alert alert-warning border-0 small py-2 px-3 mb-3 config-backup-warning">
 	                    <i class="fas fa-key me-1"></i>
-	                    Redigierte Downloads sind für Support geeignet. Roh-Downloads enthalten Zugangsdaten, Tokens und RSCP-Passwörter, sind nur mit gesetzter Web-PIN verfügbar und sollten nur privat gespeichert werden; Import und Rollback behalten lokale Installationspfade dieser Anlage bei.
+	                    „Einstellungen ohne Zugangsdaten“ enthält weiterhin IP-Adressen und Gerätekennungen und ist nicht zum Teilen gedacht. Für Forum und Support bitte nur das Diagnosepaket der Installationszentrale verwenden. Roh-Downloads enthalten Zugangsdaten, Tokens und RSCP-Passwörter, sind nur mit gesetzter Web-PIN verfügbar und sollten nur privat gespeichert werden. Import und Rollback behalten die Installationspfade und die HA-Rolle dieser Anlage bei.
 	                </div>
 	                <div class="d-flex flex-wrap gap-2">
 	                    <button type="submit" name="config_action" value="create_manual_backup" class="btn btn-outline-success rounded-pill px-3 shadow-sm" formnovalidate title="Legt einen lokalen, von der automatischen Bereinigung ausgenommenen Konfigurationsstand an."><i class="fas fa-shield-halved me-1"></i> Dauerhaft lokal sichern</button>
-	                    <a class="btn btn-outline-info rounded-pill px-3 shadow-sm" href="config_editor.php?config_action=download_redacted" title="Download ohne Passwörter, Tokens, Standort und RSCP-Zugangsdaten."><i class="fas fa-download me-1"></i> Redacted Download</a>
+	                    <a class="btn btn-outline-info rounded-pill px-3 shadow-sm" href="config_editor.php?config_action=download_redacted" title="Download ohne Passwörter, Tokens, Standort und RSCP-Zugangsdaten. Enthält weiterhin IP-Adressen und Gerätekennungen und ist nicht zum Teilen gedacht."><i class="fas fa-download me-1"></i> Einstellungen ohne Zugangsdaten</a>
 	                    <?php if ($rawConfigDownloadAllowed): ?>
 	                    <a class="btn btn-outline-danger rounded-pill px-3 shadow-sm" href="config_editor.php?config_action=download&raw_confirm=1" onclick="return confirm('Raw-Config enthält Zugangsdaten, Tokens und RSCP-Passwörter. Nur privat speichern und nicht ins Forum oder in Diagnosen hochladen. Wirklich herunterladen?');" title="Raw-Config enthält Passwörter, Tokens und RSCP-Zugangsdaten."><i class="fas fa-file-shield me-1"></i> Raw Download</a>
 	                    <?php else: ?>
@@ -12756,9 +13523,16 @@ async function readConfirmedConfigJson(response) {
                         Importiert eine zuvor heruntergeladene <code>e3dc_v4.json</code>. Vor dem Überschreiben wird automatisch ein Backup angelegt.
                     </p>
                     <div class="alert alert-warning border-0 small mb-3">
-                        Die Datei kann Passwörter, Tokens und RSCP-Zugangsdaten enthalten. Lokale Installationspfade dieser Anlage bleiben beim Import erhalten.
+                        Die Datei kann Passwörter, Tokens und RSCP-Zugangsdaten enthalten. Installationspfade und HA-Rolle dieser Anlage bleiben beim Import erhalten.
                     </div>
                     <input type="file" name="config_upload_file" class="form-control config-input" accept=".json,application/json" required>
+                    <?php if ($configUploadHaConflictRole !== null): ?>
+                    <div class="form-check mt-3">
+                        <input class="form-check-input" type="checkbox" name="ha_partner_off_confirmed" value="1" id="configUploadHaPartnerOff">
+                        <label class="form-check-label small" for="configUploadHaPartnerOff"><strong>Für Einzelbetrieb ohne HA importieren</strong><br>Ich bestätige: Der andere Knoten des früheren HA-Paars ist dauerhaft außer Betrieb und kann diesen Speicher nicht mehr regeln – auch nicht nach einem Neustart. Gemeint ist nicht das alte Gerät, das ich gerade ersetze. Ich will diese Sicherung für den Einzelbetrieb ohne HA importieren.</label>
+                    <p class="small mt-2">Ist der andere Knoten noch aktiv, nur vorübergehend ausgeschaltet oder lediglich nicht erreichbar, darfst du dieses Kästchen nicht verwenden. Auch das ersetzte Altgerät darf nicht gleichzeitig weiterregeln. Die Bestätigung schaltet kein anderes Gerät ab und repariert keinen Rollenanker.</p>
+</div>
+                    <?php endif; ?>
                 </div>
                 <div class="modal-footer border-secondary">
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Abbrechen</button>
@@ -12800,9 +13574,16 @@ async function readConfirmedConfigJson(response) {
                                 }
                                 $display = $mtime . " - " . $label;
                             ?>
-                                <option value="<?= htmlspecialchars($bname) ?>" <?= $index === 0 ? 'selected' : '' ?>><?= htmlspecialchars($display) ?></option>
+                                <option value="<?= htmlspecialchars($bname) ?>" <?= ($configRollbackRejectedFile !== null ? $bname === $configRollbackRejectedFile : $index === 0) ? 'selected' : '' ?>><?= htmlspecialchars($display) ?></option>
                             <?php endforeach; ?>
                         </select>
+                        <?php if ($configRollbackHaConflictRole !== null): ?>
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" name="ha_partner_off_confirmed" value="1" id="configRollbackHaPartnerOff">
+                            <label class="form-check-label small" for="configRollbackHaPartnerOff"><strong>Für Einzelbetrieb ohne HA wiederherstellen</strong><br>Ich bestätige: Der andere Knoten des früheren HA-Paars ist dauerhaft außer Betrieb und kann diesen Speicher nicht mehr regeln – auch nicht nach einem Neustart. Gemeint ist nicht das alte Gerät, das ich gerade ersetze. Ich will diese Sicherung für den Einzelbetrieb ohne HA wiederherstellen.</label>
+                        <p class="small mt-2">Ist der andere Knoten noch aktiv, nur vorübergehend ausgeschaltet oder lediglich nicht erreichbar, darfst du dieses Kästchen nicht verwenden. Auch das ersetzte Altgerät darf nicht gleichzeitig weiterregeln. Die Bestätigung schaltet kein anderes Gerät ab und repariert keinen Rollenanker.</p>
+</div>
+                        <?php endif; ?>
                     <?php endif; ?>
                 </div>
                 <div class="modal-footer border-secondary">
@@ -13000,25 +13781,43 @@ function initHeatpumpPvControls() {
     const grid = document.getElementById('wpPvPresetGrid');
     const preview = document.getElementById('wpPvPresetPreview');
     const button = document.getElementById('wpPvApplyPreset');
+    const sourceKeys = ['wp_pv_battery_max_w', 'wp_pv_battery_limit_wh', 'wp_pv_grid_max_w', 'wp_pv_grid_limit_wh'];
+    const basisKeys = ['wp_pv_max_power_w', 'wp_pv_start_power_w', 'grid_start_limit'];
+    const energies = {normal: [1000, 100], short: [500, 50], long: [2000, 200]};
     const number = (key, fallback) => {
         const raw = String(field(key)?.value ?? '').trim();
         const value = Number(raw);
         return raw !== '' && Number.isFinite(value) ? value : fallback;
     };
-    const presetValues = () => {
-        const energy = {short: [500, 50], normal: [1000, 100], long: [2000, 200]}[preset?.value];
+    const presetFor = (name, useBattery, useGrid) => {
+        const energy = energies[name];
         if (!energy) return null;
         const maximum = number('wp_pv_max_power_w', 0);
         const explicitStart = number('wp_pv_start_power_w', 0);
         const start = explicitStart > 0 ? explicitStart : Math.abs(number('grid_start_limit', -3500));
         const batteryW = Math.round(maximum > 0 ? maximum : (start > 0 ? start : 3500));
         return {
-            wp_pv_battery_max_w: battery?.checked ? batteryW : 0,
-            wp_pv_battery_limit_wh: battery?.checked ? energy[0] : 0,
-            wp_pv_grid_max_w: grid?.checked ? 1000 : 0,
-            wp_pv_grid_limit_wh: grid?.checked ? energy[1] : 0,
+            wp_pv_battery_max_w: useBattery ? batteryW : 0,
+            wp_pv_battery_limit_wh: useBattery ? energy[0] : 0,
+            wp_pv_grid_max_w: useGrid ? 1000 : 0,
+            wp_pv_grid_limit_wh: useGrid ? energy[1] : 0,
         };
     };
+    const presetValues = () => presetFor(preset?.value, !!battery?.checked, !!grid?.checked);
+    const entered = () => Object.fromEntries(sourceKeys.map(key => [key, number(key, NaN)]));
+    const sameValues = (left, right) => !!left && !!right && sourceKeys.every(key => left[key] === right[key]);
+    const syncPreset = () => {
+        const current = entered();
+        const useBattery = current.wp_pv_battery_max_w > 0 && current.wp_pv_battery_limit_wh > 0;
+        const useGrid = current.wp_pv_grid_max_w > 0 && current.wp_pv_grid_limit_wh > 0;
+        if (battery) battery.checked = useBattery;
+        if (grid) grid.checked = useGrid;
+        if (preset) preset.value = (useBattery || useGrid)
+            ? Object.keys(energies).find(name => sameValues(presetFor(name, useBattery, useGrid), current)) || 'custom'
+            : 'custom';
+    };
+    const fmt = value => Number.isFinite(value) ? value.toLocaleString('de-DE') : 'unbekannt';
+    const describe = values => 'Hausakku ' + fmt(values.wp_pv_battery_max_w) + ' W / ' + fmt(values.wp_pv_battery_limit_wh) + ' Wh; Stromnetz ' + fmt(values.wp_pv_grid_max_w) + ' W / ' + fmt(values.wp_pv_grid_limit_wh) + ' Wh';
     const update = () => {
         const measured = mode?.value === 'measured';
         box.querySelectorAll('[data-wp-measured-only]').forEach(element => { element.hidden = !measured; });
@@ -13027,17 +13826,29 @@ function initHeatpumpPvControls() {
             ? 'Nach dem Start zählt die Istaufnahme. Ein erreichter Wh-Wächter beendet den zusätzlichen Boost nach der geschützten Mindestlaufzeit; Verbrauch und Überschreitung werden weitergezählt. 0 bei einer Quelle bleibt eine Sperre.'
             : 'Die vollständige Vorreservierung behält die bisherigen Quellen- und Energiezusagen. Der Wechsel zu „Messwertgeführt“ erhält die eingetragenen Werte, erlaubt aber einen gezählten Wh-Überlauf zum Schutz der Mindestlaufzeit.';
         const values = presetValues();
-        if (preview && values) {
-            const fmt = value => value.toLocaleString('de-DE');
-            preview.textContent = 'Diese Auswahl setzt: Hausakku ' + fmt(values.wp_pv_battery_max_w) + ' W / ' + fmt(values.wp_pv_battery_limit_wh) + ' Wh; Stromnetz ' + fmt(values.wp_pv_grid_max_w) + ' W / ' + fmt(values.wp_pv_grid_limit_wh) + ' Wh. Die Wh-Werte gelten für 24 Stunden, mit Vorrang der geschützten Mindestlaufzeit.';
+        if (!preview) return;
+        const current = entered();
+        if (values && !sameValues(values, current)) {
+            preview.textContent = 'Diese Auswahl setzt: ' + describe(values) + '. Noch nicht übernommen: erst „Voreinstellung übernehmen“, dann speichern.';
+        } else if (preset?.value === 'custom') {
+            preview.textContent = 'Eigene Werte aus der Feinabstimmung: ' + describe(current) + '. Zum Ändern eine Voreinstellung wählen und übernehmen.';
+        } else {
+            preview.textContent = 'Eingetragen: ' + describe(current) + '. Die Wh-Werte gelten für 24 Stunden, mit Vorrang der geschützten Mindestlaufzeit.';
         }
     };
-    box.addEventListener('change', update);
-    box.addEventListener('input', update);
+    let applying = false;
+    const onEdit = event => {
+        const key = /^values\[([^\]]+)\]$/.exec(event.target?.name || '')?.[1];
+        if (!applying && (sourceKeys.includes(key) || basisKeys.includes(key))) syncPreset();
+        update();
+    };
+    box.addEventListener('change', onEdit);
+    box.addEventListener('input', onEdit);
     button?.addEventListener('click', () => {
         if (mode?.value !== 'measured') return;
         const values = presetValues();
         if (!values) return;
+        applying = true;
         for (const [key, value] of Object.entries(values)) {
             const target = field(key);
             if (!target) continue;
@@ -13045,8 +13856,12 @@ function initHeatpumpPvControls() {
             target.dispatchEvent(new Event('input', {bubbles: true}));
             target.dispatchEvent(new Event('change', {bubbles: true}));
         }
+        applying = false;
+        syncPreset();
+        update();
         if (preview) preview.textContent += ' In die Eingabefelder übernommen; zum Aktivieren speichern.';
     });
+    syncPreset();
     update();
 }
 

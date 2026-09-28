@@ -2715,9 +2715,21 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         ),
     )
     price_order_warning = price_limit > price_pause
+    heat_price_pilot_ready = bool(
+        heat_price_boost_requested
+        and heat_price_scope_valid
+        and heat_price_windows_valid
+        and cheap_grid_supported
+        and _is_enabled(cfg, "luxtronik")
+        and safe_float(cfg.get("wp_type"), -1.0) == 0
+        and _is_enabled({"auto_mode": cfg.get("auto_mode", 1)}, "auto_mode")
+        and _is_enabled(cfg, "heat_policy_runtime_enable")
+        and cheap_grid_enabled
+        and _is_enabled(cfg, "cheap_grid_heatpump_enable")
+    )
     price["price_boost_enable"] = _entry(
         key="price_boost_enable",
-        label="Wärmepumpen-Preisverschiebung",
+        label="Experimenteller Wärmepumpen-Netzboost",
         unit="-",
         configured=(
             cfg.get("price_boost_enable")
@@ -2726,41 +2738,23 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         ),
         live_value=None,
         live_key=None,
-        effective=False,
-        source=(
-            "evidence_limit"
-            if heat_price_boost_requested
-            else (
-                "user"
-                if _has_user_value(cfg, "price_boost_enable")
-                else "default"
-            )
-        ),
+        effective=heat_price_pilot_ready,
+        source=("experimental" if heat_price_boost_requested else (
+            "user" if _has_user_value(cfg, "price_boost_enable") else "default"
+        )),
         severity="warning" if heat_price_boost_requested else "ok",
         message=(
-            "Aus: Es wird kein allgemeiner Wärmepumpen-Preis-Boost angefordert."
-            if not heat_price_boost_requested
-            else (
-                "EVIDENCE_LIMIT: Der Scope ist ungültig; der Candidate bleibt "
-                "fail-closed und effektiv aus."
-                if not heat_price_scope_valid
-                else (
-                    "EVIDENCE_LIMIT: Mindestens ein Zeitfenster ist ungültig; "
-                    "der Candidate bleibt fail-closed und effektiv aus."
-                    if not heat_price_windows_valid
-                    else (
-                        "EVIDENCE_LIMIT: Der gewählte Tarif stellt keine "
-                        "belastbare Preisverschiebung für Wärme bereit."
-                        if not heat_price_tariff_allowed
-                        else (
-                            "Candidate/Shadow: Die Auswahl wird nur diagnostiziert. "
-                            "Ohne vollständige Wärme-/PV-Evidenz und einen gebundenen "
-                            "heat_intent_v1-Aktivierungsvertrag bleibt der Preis-Boost "
-                            "effektiv aus; heat_policy_runtime_enable allein aktiviert "
-                            "ihn nicht."
-                        )
-                    )
-                )
+            "Aus: Der experimentelle Wärmepumpen-Netzboost ist nicht freigegeben."
+            if not heat_price_boost_requested else (
+                "Experimenteller Testbetrieb freigegeben: Eine Luxtronik darf bei "
+                "einem bestätigten Negativpreisfenster, Wärmebedarf und aktueller "
+                "Speicherzusage boosten. Die Konfiguration bestätigt keinen laufenden "
+                "Boost. Allgemeine günstige Preisfenster bleiben ohne Steuerwirkung."
+                if heat_price_pilot_ready else
+                "Experimenteller Testbetrieb gesperrt: Benötigt Luxtronik mit Automatik, "
+                "gemeinsame Wärmeplanung, echten Börsentarif, beide Negativpreisfreigaben "
+                "sowie gültiges Wärmeziel und Zeitfenster. Allgemeine günstige "
+                "Preisfenster bleiben ohne Steuerwirkung."
             )
         ),
     )

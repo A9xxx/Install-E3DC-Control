@@ -161,6 +161,8 @@
 !/Installer/ha_root_runtime.py
 !/Installer/ha_writer_admission.py
 !/Installer/heat_actuator_safety.py
+!/Installer/heatpump_channel_owner.py
+!/Installer/heatpump_em_dispatch.py
 !/Installer/heatpump_pv_contract.py
 !/Installer/heatpump_pv_state.py
 !/Installer/heizstab_manager.py

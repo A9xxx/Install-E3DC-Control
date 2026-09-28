@@ -324,3 +324,67 @@ def persist_heatpump_pv_command_checkpoint(command, *, directory=None, now_s=Non
         signature_fn=lambda value: hashlib.sha256(_canonical(value)).hexdigest(),
         quarantine_required=False, heartbeat_s=math.inf,
     )
+
+
+CHANNEL_CHECKPOINT_BASENAME = "heatpump_channel_owners.json"
+CHANNEL_CHECKPOINT_SCHEMA = "heatpump_channel_owners_envelope_v1"
+
+
+def _channel_checkpoint_validator(value):
+    try:
+        from .heatpump_channel_owner import validate_checkpoint
+    except ImportError:
+        from heatpump_channel_owner import validate_checkpoint
+    return validate_checkpoint(value)
+
+
+def load_heatpump_channel_checkpoint(*, directory=None):
+    """Fehlend und unlesbar bleiben verschieden; keine implizite Besitzfreigabe.
+
+    Der Aufrufer muss bei ``missing`` zunächst die Altbelege migrieren. Bei
+    ``untrusted`` sind neue Angebote gesperrt, bis die Kanäle rekonsiliert sind.
+    Ein gültiger Zustand muss vor Verwendung mit ``resume_checkpoint`` an die
+    neue Prozessgeneration gebunden werden.
+    """
+    descriptor = None
+    try:
+        _, descriptor = _open_private_directory(directory)
+        value, _ = _read_checkpoint(
+            descriptor, basename=CHANNEL_CHECKPOINT_BASENAME,
+            schema=CHANNEL_CHECKPOINT_SCHEMA, validator=_channel_checkpoint_validator,
+        )
+        return {"status": "valid", "checkpoint": value, "reason": ""}
+    except FileNotFoundError:
+        return {"status": "missing", "checkpoint": None, "reason": "checkpoint_missing"}
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError, KeyError):
+        return {"status": "untrusted", "checkpoint": None, "reason": "checkpoint_untrusted"}
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _channel_checkpoint_signature(value):
+    # Laufende Uhrproben und identische Statusframes gehören in den Heartbeat.
+    # Neue Besitzbelege, Aktionen, ACKs, Sperren und Fehler bleiben sofort haltbar.
+    transition = copy.deepcopy(value)
+    transition.pop("updated_ts", None)
+    for channel in transition["channels"].values():
+        channel.pop("last_sample_ts", None)
+    return hashlib.sha256(_canonical(transition)).hexdigest()
+
+
+def persist_heatpump_channel_checkpoint(checkpoint, *, directory=None, now_s=None):
+    """Kanalübergang atomar sichern; unveränderte Zustände schreiben nicht erneut.
+
+    Diese API ist unabhängig von den bisherigen PV-Dateien. Ohne dauerhaften
+    positiven Intent darf der Aufrufer keinen neuen Sollwert übertragen. Eine
+    sichere Rücknahme bereits belegter eigener Wirkung bleibt eine getrennte
+    Entscheidung des Aufrufers.
+    """
+    return _persist_checkpoint(
+        checkpoint, directory=directory, now_s=now_s, force=True,
+        basename=CHANNEL_CHECKPOINT_BASENAME, schema=CHANNEL_CHECKPOINT_SCHEMA,
+        validator=_channel_checkpoint_validator,
+        signature_fn=_channel_checkpoint_signature,
+        quarantine_required=False, heartbeat_s=CHECKPOINT_HEARTBEAT_S,
+    )

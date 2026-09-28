@@ -110,6 +110,18 @@ UPDATE_DRIFT_CONFIRM_FILE = Path(
 _UPDATE_DRIFT_CONFIRM_TOKEN: str | None = None
 SUDOERS_FILE = Path("/etc/sudoers.d/020_e3dc_services")
 ROLE_ANCHOR_FILE = Path("/etc/e3dc-control/instance_role.json")
+# systemd verweigert daemon-reload, wenn in /run weniger als 16 MB frei sind
+# (org.freedesktop.systemd1.DiskFull). Die Marge deckt Laufzeitdateien ab, die
+# während des Releasewechsels in /run entstehen.
+RUN_FILESYSTEM = Path("/run")
+SYSTEMD_RELOAD_RESERVE_BYTES = 16 * 1024 * 1024
+RUN_FREE_SPACE_MARGIN_BYTES = 16 * 1024 * 1024
+RUN_SPACE_REMOUNT_COMMAND = "sudo mount -o remount,size=384M /run"
+DAEMON_RELOAD_RETRY_DELAY_SECONDS = 3.0
+# npm-Abhängigkeiten werden auf der Platte vorbereitet, nicht im heruntergeladenen
+# Release unter /run. /var/cache liegt bewusst außerhalb der gesicherten
+# Systemzustände unter /var/lib/e3dc-control.
+NPM_STAGING_ROOT = Path("/var/cache/e3dc-control/update-npm-staging")
 RAMDISK_PATH = Path("/var/www/html/ramdisk")
 APACHE_SECURITY_ENABLE_LINK = Path(
     "/etc/apache2/conf-enabled/e3dc-control-security.conf"
@@ -287,6 +299,110 @@ def _run(
         detail = (result.stderr or result.stdout or f"Exit {result.returncode}").strip()
         raise RuntimeError(f"{' '.join(command)}: {detail}")
     return result
+
+
+def _command_output_detail(result: subprocess.CompletedProcess[str]) -> str:
+    """Fasst stderr und stdout eines Kommandos für eine Abbruchmeldung zusammen."""
+
+    parts = [
+        text.strip()
+        for text in (result.stderr, result.stdout)
+        if isinstance(text, str) and text.strip()
+    ]
+    if not parts:
+        return f"Exit {result.returncode}, keine Ausgabe"
+    return f"Exit {result.returncode}: " + " | ".join(parts)
+
+
+def _daemon_reload() -> subprocess.CompletedProcess[str]:
+    """Führt systemctl daemon-reload aus; ein Fehlschlag wird einmal wiederholt."""
+
+    result = _run(["/usr/bin/systemctl", "daemon-reload"], timeout=60)
+    if result.returncode == 0:
+        return result
+    print(
+        "[WARNUNG] systemctl daemon-reload schlug fehl ("
+        + _command_output_detail(result)
+        + f"); ein Wiederholversuch folgt in {DAEMON_RELOAD_RETRY_DELAY_SECONDS:g} s.",
+        flush=True,
+    )
+    time.sleep(DAEMON_RELOAD_RETRY_DELAY_SECONDS)
+    return _run(["/usr/bin/systemctl", "daemon-reload"], timeout=60)
+
+
+def _daemon_reload_lacks_run_space(detail: str) -> bool:
+    normalized = str(detail or "").lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "diskfull",
+            "not enough space",
+            "no space left",
+            "kein platz",
+        )
+    )
+
+
+def _daemon_reload_solution(detail: str, default: str) -> str:
+    """Nennt bei Platzmangel in /run genau den vorübergehenden Ausweg."""
+
+    if _daemon_reload_lacks_run_space(detail):
+        return (
+            "In /run fehlt Platz für systemd. Vergrößere /run vorübergehend bis "
+            f"zum nächsten Neustart: {RUN_SPACE_REMOUNT_COMMAND} ; starte danach "
+            "denselben Updatebefehl erneut."
+        )
+    return default
+
+
+def _format_mebibytes(value: int) -> str:
+    return f"{max(0, int(value)) / (1024 * 1024):.1f} MB"
+
+
+def _preflight_run_free_space(phase: str) -> list[str]:
+    """Prüft vor jeder Änderung, ob systemd in /run noch neu laden kann.
+
+    systemd verweigert daemon-reload, wenn in /run weniger als 16 MB frei
+    sind. Ohne diese Reserve würde der Releasewechsel erst nach dem Dienststopp
+    scheitern. Deshalb gilt: unter der Reserve Abbruch vor jeder Änderung,
+    unter Reserve plus Marge nur eine Warnung.
+    """
+
+    try:
+        info = os.statvfs(RUN_FILESYSTEM)
+        block_size = int(info.f_frsize or info.f_bsize)
+        free = int(info.f_bavail) * block_size
+        total = int(info.f_blocks) * block_size
+    except OSError as exc:
+        warning = (
+            f"Der freie Platz in {RUN_FILESYSTEM} konnte {phase} nicht geprüft "
+            f"werden ({exc}); das Update läuft weiter."
+        )
+        print(f"[WARNUNG] {warning}", flush=True)
+        return [warning]
+    if free < SYSTEMD_RELOAD_RESERVE_BYTES:
+        _fail(
+            "E3DC-UPD-RUN-SPACE-001",
+            f"In {RUN_FILESYSTEM} sind {phase} nur {_format_mebibytes(free)} frei "
+            f"(Größe {_format_mebibytes(total)}). systemd verweigert "
+            "systemctl daemon-reload unterhalb von "
+            f"{_format_mebibytes(SYSTEMD_RELOAD_RESERVE_BYTES)} Reserve; der "
+            "Releasewechsel würde deshalb erst nach dem Dienststopp scheitern.",
+            "Vergrößere /run vorübergehend bis zum nächsten Neustart: "
+            f"{RUN_SPACE_REMOUNT_COMMAND} ; starte danach denselben "
+            "Updatebefehl erneut.",
+        )
+    if free < SYSTEMD_RELOAD_RESERVE_BYTES + RUN_FREE_SPACE_MARGIN_BYTES:
+        warning = (
+            f"In {RUN_FILESYSTEM} sind {phase} nur {_format_mebibytes(free)} frei "
+            f"(Größe {_format_mebibytes(total)}); systemd braucht für "
+            f"daemon-reload {_format_mebibytes(SYSTEMD_RELOAD_RESERVE_BYTES)} "
+            "Reserve. Das Update läuft weiter. Falls es später am Nachladen "
+            f"der Dienste scheitert: {RUN_SPACE_REMOUNT_COMMAND}"
+        )
+        print(f"[WARNUNG] {warning}", flush=True)
+        return [warning]
+    return []
 
 
 def _apply_failure_solution(detail: str, target_root: Path) -> str:
@@ -476,7 +592,12 @@ def _restore_service_masks_best_effort(prestate: ServicePrestate) -> tuple[str, 
             _run(["/usr/bin/systemctl", "mask", unit], timeout=30)
         if desired_runtime:
             _run(["/usr/bin/systemctl", "mask", "--runtime", unit], timeout=30)
-    _run(["/usr/bin/systemctl", "daemon-reload"], timeout=60)
+    reloaded = _daemon_reload()
+    if reloaded.returncode != 0:
+        failed.append(
+            "systemctl daemon-reload fehlgeschlagen: "
+            + _command_output_detail(reloaded)
+        )
     try:
         failed.extend(_service_mask_mismatches(prestate))
     except Exception as exc:
@@ -1717,13 +1838,19 @@ def _select_stale_release_venvs(
     return stale, legacy
 
 
-def _prune_stale_release_venvs(install_user: str, active_venv: Path) -> list[str]:
+def _prune_stale_release_venvs(
+    install_user: str,
+    active_venv: Path,
+    *,
+    extra_protected: Iterable[Path] = (),
+) -> list[str]:
     """Entfernt nach bestätigtem Start nicht mehr benötigte Release-venvs.
 
     Läuft ausschließlich als Abschlussbereinigung; ein Fehler ergibt eine
     Warnung, nie einen Updateabbruch. Gelöscht wird als Installationsnutzer
     über denselben eng gebundenen Pfad wie beim Rückbau eines fehlgeschlagenen
-    Kandidaten.
+    Kandidaten. ``extra_protected`` hält zusätzlich venvs zurück, etwa das
+    bisherige Watchdog-venv nach einer gescheiterten Neubindung.
     """
 
     warnings: list[str] = []
@@ -1751,7 +1878,7 @@ def _prune_stale_release_venvs(install_user: str, active_venv: Path) -> list[str
             active,
             account.pw_uid,
             keep_count=keep_count,
-            protected=watchdog_bound,
+            protected=watchdog_bound | {Path(os.path.abspath(path)) for path in extra_protected},
         )
         for venv in sorted(watchdog_bound):
             if venv != active and venv.is_dir():
@@ -1784,6 +1911,165 @@ def _prune_stale_release_venvs(install_user: str, active_venv: Path) -> list[str
             "Die Bereinigung alter Python-Umgebungen wurde übersprungen: " + detail
         )
     return warnings
+
+
+WATCHDOG_UNIT = "piguard.service"
+WATCHDOG_REBIND_TIMEOUT_SECONDS = 300
+WATCHDOG_REBIND_OK_PREFIX = "E3DC_WATCHDOG_REBIND_OK "
+WATCHDOG_MENU_HINT = (
+    "Neu binden: e3dc-setup, Menü 15 „Watchdog & Telegram konfigurieren“ → "
+    "„Komplett neu installieren / reparieren“."
+)
+# Läuft in einem eigenen Root-Prozess mit leerer Umgebung aus dem ersetzten
+# Produktbaum: derselbe transaktionale Weg wie Menü 15, ohne Notifier. Router-IP
+# und Überwachungsdatei bleiben die bisher installierten Werte.
+_WATCHDOG_REBIND_CHILD = (
+    "import sys\n"
+    "root, user, home, venv = sys.argv[1:5]\n"
+    "sys.path.insert(0, root)\n"
+    "try:\n"
+    "    from Installer import install_watchdog as w\n"
+    "    current = w.get_current_config()\n"
+    "    sha = w.install_watchdog_bundle(\n"
+    "        w.validate_router_ips(current.get('ROUTER_IP') or ''),\n"
+    "        current.get('MONITOR_FILE') or '',\n"
+    "        explicit_install_path=root,\n"
+    "        explicit_install_user=user,\n"
+    "        explicit_home_dir=home,\n"
+    "        explicit_venv_path=venv,\n"
+    "    )\n"
+    "except Exception as exc:\n"
+    "    print(type(exc).__name__ + ': ' + (str(exc).strip() or '-'), file=sys.stderr)\n"
+    "    raise SystemExit(1)\n"
+    "print('" + WATCHDOG_REBIND_OK_PREFIX + "' + str(sha))\n"
+)
+
+
+def _run_watchdog_bundle_installer(
+    target_root: Path,
+    install_user: str,
+    home: Path,
+    active_venv: Path,
+) -> tuple[bool, str]:
+    """Ruft den vorhandenen Watchdog-Installer mit explizitem aktivem venv auf.
+
+    Liefert ``(True, Bündel-SHA)`` oder ``(False, Kurzbefund)``. Der Installer
+    stellt bei einem Fehler selbst den vorherigen Zustand wieder her.
+    """
+
+    command = [
+        sys.executable or "/usr/bin/python3",
+        "-I",
+        "-B",
+        "-c",
+        _WATCHDOG_REBIND_CHILD,
+        str(target_root),
+        str(install_user),
+        str(home),
+        str(active_venv),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(target_root),
+            env={
+                "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+                "HOME": "/root",
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+            },
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+            timeout=WATCHDOG_REBIND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"Zeitüberschreitung nach {WATCHDOG_REBIND_TIMEOUT_SECONDS} s"
+    except OSError as exc:
+        return False, str(exc).strip() or exc.__class__.__name__
+    lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    ok_lines = [line for line in lines if line.startswith(WATCHDOG_REBIND_OK_PREFIX)]
+    if result.returncode == 0 and ok_lines:
+        return True, ok_lines[-1][len(WATCHDOG_REBIND_OK_PREFIX):].strip()
+    errors = [line.strip() for line in (result.stderr or "").splitlines() if line.strip()]
+    detail = errors[-1] if errors else f"Exit {result.returncode}"
+    return False, detail[:300]
+
+
+def _rebind_watchdog_after_venv_change(
+    target_root: Path,
+    install_user: str,
+    venv_python: Path,
+    active_before: Iterable[str],
+    started_services: Iterable[str],
+    *,
+    enabled_before: Iterable[str],
+) -> tuple[list[str], frozenset[Path]]:
+    """Bindet piguard nach bestätigtem Start an das neue aktive venv.
+
+    Nur wenn piguard vor dem Update aktiv und beim Systemstart aktiviert war,
+    vom Updater wieder gestartet wurde und das Watchdog-Bündel ein anderes venv
+    bindet. Der Installer aktiviert die Unit dauerhaft; eine bewusst
+    deaktivierte Unit bleibt deshalb unverändert, und die venv-Bereinigung
+    behält ihr gebundenes venv. Ein Fehlschlag ist eine Warnung: Die neue
+    Version bleibt, und das bisher gebundene venv wird als zweites Ergebnis
+    zurückgegeben, damit die venv-Bereinigung es behält.
+    """
+
+    warnings: list[str] = []
+    if (
+        WATCHDOG_UNIT not in set(active_before)
+        or WATCHDOG_UNIT not in set(enabled_before)
+        or WATCHDOG_UNIT not in set(started_services)
+    ):
+        return warnings, frozenset()
+    previous: frozenset[Path] = frozenset()
+    active = Path(os.path.abspath(Path(venv_python).parent.parent))
+    try:
+        home = Path(os.path.abspath(pwd.getpwnam(str(install_user)).pw_dir))
+        bound = _watchdog_bound_venvs(home)
+        # Unlesbare Bindung: Die venv-Bereinigung unterbleibt ohnehin und warnt.
+        if not bound or bound == {active}:
+            return warnings, frozenset()
+        previous = frozenset(bound - {active})
+        names = ", ".join(str(path) for path in sorted(previous))
+        print(
+            f"[INFO] Watchdog (piguard) nutzt noch {names}; er wird an die neue "
+            f"Python-Umgebung {active} gebunden …",
+            flush=True,
+        )
+        installed, detail = _run_watchdog_bundle_installer(
+            target_root,
+            install_user,
+            home,
+            active,
+        )
+        if installed:
+            if not _service_active(WATCHDOG_UNIT):
+                installed, detail = False, "piguard ist nach der Neubindung nicht aktiv"
+            elif _watchdog_bound_venvs(home) != {active}:
+                installed, detail = False, "die Hashliste des Watchdogs bindet nicht das neue venv"
+        if installed:
+            print(
+                f"[OK] Watchdog (piguard) an die Python-Umgebung {active} gebunden "
+                f"(Bündel {detail[:12]}).",
+                flush=True,
+            )
+            return warnings, frozenset()
+    except Exception as exc:
+        detail = str(exc).strip() or exc.__class__.__name__
+    try:
+        state = "aktiv" if _service_active(WATCHDOG_UNIT) else "nicht aktiv"
+    except Exception:
+        state = "unbekannt"
+    warnings.append(
+        "Der Watchdog (piguard) konnte nicht an die neue Python-Umgebung "
+        f"{active} gebunden werden: {detail}. Die neue Version bleibt aktiv; die "
+        f"bisher gebundene Python-Umgebung bleibt erhalten. piguard ist derzeit {state}. "
+        + WATCHDOG_MENU_HINT
+    )
+    return warnings, previous
 
 
 def _migrated_fstab_ramdisk_line(line: str) -> str | None:
@@ -1843,7 +2129,13 @@ def _migrate_ramdisk_size() -> list[str]:
             os.unlink(temporary)
             raise
         print("[OK] RAM-Disk in /etc/fstab auf 64M gesetzt.", flush=True)
-        _run(["/usr/bin/systemctl", "daemon-reload"], timeout=60)
+        reloaded = _daemon_reload()
+        if reloaded.returncode != 0:
+            warnings.append(
+                "systemd konnte /etc/fstab nach der RAM-Disk-Vergrößerung nicht neu "
+                f"laden ({_command_output_detail(reloaded)}); die neue Größe gilt "
+                "spätestens ab dem nächsten Neustart."
+            )
         if _probe_ramdisk_tmpfs():
             remount = _run(
                 ["/usr/bin/mount", "-o", "remount," + RAMDISK_SIZE_OPTION, str(RAMDISK_PATH)],
@@ -2241,12 +2533,17 @@ def _clear_legacy_update_blockers(backup_path: Path) -> Path | None:
                 f"Die alte Dienstsperre für {unit} konnte nicht archiviert werden: {exc}",
                 f"Entferne {dropin} und starte danach denselben Updatebefehl erneut.",
             )
-    reload_result = _run(["/usr/bin/systemctl", "daemon-reload"], timeout=60)
+    reload_result = _daemon_reload()
     if reload_result.returncode != 0:
+        detail = _command_output_detail(reload_result)
         _fail(
             "E3DC-UPD-SERVICE-RELOAD-001",
-            "systemd konnte die bereinigten Dienstdefinitionen nicht neu laden.",
-            "Führe sudo systemctl daemon-reload aus und starte danach denselben Updatebefehl erneut.",
+            "systemd konnte die bereinigten Dienstdefinitionen auch nach einem "
+            f"Wiederholversuch nicht neu laden: {detail}",
+            _daemon_reload_solution(
+                detail,
+                "Führe sudo systemctl daemon-reload aus und starte danach denselben Updatebefehl erneut.",
+            ),
         )
     return quarantine if archived else None
 
@@ -4565,18 +4862,80 @@ def _prepare_npm_module(
     return npm, warnings
 
 
+def _reset_npm_staging_root() -> Path:
+    """Legt den root-eigenen, plattengestützten npm-Arbeitsbereich frisch an."""
+
+    root = NPM_STAGING_ROOT
+    parent = root.parent
+    owner = os.geteuid()
+    parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    parent_metadata = parent.lstat()
+    if (
+        not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_uid != owner
+        or stat.S_IMODE(parent_metadata.st_mode) & 0o022
+    ):
+        raise RuntimeError(
+            f"{parent} ist kein root-eigenes, nur für root beschreibbares Verzeichnis"
+        )
+    if os.path.lexists(root):
+        metadata = root.lstat()
+        if stat.S_ISDIR(metadata.st_mode):
+            shutil.rmtree(root)
+        else:
+            root.unlink()
+    os.mkdir(root, 0o700)
+    os.chmod(root, 0o700)
+    metadata = root.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != owner
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise RuntimeError(f"{root} besitzt nach dem Anlegen falsche Metadaten")
+    return root
+
+
+def _remove_npm_staging_best_effort() -> None:
+    """Räumt den npm-Arbeitsbereich nach Erfolg oder Abbruch wieder ab."""
+
+    root = NPM_STAGING_ROOT
+    try:
+        if not os.path.lexists(root):
+            return
+        if stat.S_ISDIR(root.lstat().st_mode):
+            shutil.rmtree(root)
+        else:
+            root.unlink()
+    except OSError as exc:
+        print(
+            f"[WARNUNG] Der temporäre npm-Arbeitsbereich {root} konnte nicht "
+            f"entfernt werden ({exc}); er wird beim nächsten Update ersetzt.",
+            flush=True,
+        )
+
+
 def _prepare_selected_release_dependencies(
     release_root: Path,
     install_user: str,
     selected_units: Iterable[str],
-) -> tuple[frozenset[str], list[str]]:
-    """Erledigt optionale Netz-/Paketarbeit vollständig vor dem Dienststopp."""
+) -> tuple[frozenset[str], list[str], tuple[str, ...]]:
+    """Erledigt optionale Netz-/Paketarbeit vollständig vor dem Dienststopp.
+
+    npm arbeitet in einer Kopie von package.json/package-lock.json unter
+    NPM_STAGING_ROOT. Das heruntergeladene Release kann in /run liegen; dort
+    würden node_modules den Platz belegen, den systemd für daemon-reload
+    braucht. Rückgabe: vorbereitete Units, Warnungen und die releaserelativen
+    Arbeitsverzeichnisse mit vorbereitetem node_modules.
+    """
 
     from Installer.service_catalog import get_module_by_service
 
     prepared: set[str] = set()
+    staged: list[str] = []
     warnings: list[str] = []
     installer = release_root / "Installer"
+    staging_root: Path | None = None
     for raw_unit in sorted({_normalize_unit(unit) for unit in selected_units}):
         module = get_module_by_service(raw_unit)
         if module is None or str(module.runner or "python").strip().lower() != "npm":
@@ -4586,8 +4945,23 @@ def _prepare_selected_release_dependencies(
             module.working_directory or ".",
             label="Modul-Arbeitsverzeichnis",
         )
+        relative = workdir.relative_to(release_root.resolve()).as_posix()
+        try:
+            if staging_root is None:
+                staging_root = _reset_npm_staging_root()
+            stage_dir = staging_root / relative
+            stage_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            for name in ("package.json", "package-lock.json"):
+                if (workdir / name).is_file():
+                    shutil.copyfile(workdir / name, stage_dir / name)
+        except (OSError, RuntimeError) as exc:
+            _fail(
+                "E3DC-UPD-DEP-005",
+                f"Der npm-Arbeitsbereich {NPM_STAGING_ROOT} für {raw_unit} konnte vor dem Dienststopp nicht angelegt werden: {exc}",
+                "Prüfe freien Speicherplatz und Rechte mit df -h /var/cache und starte danach denselben Ein-Datei-Updater erneut; die laufenden Dienste wurden noch nicht gestoppt.",
+            )
         _npm, npm_warnings = _prepare_npm_module(
-            workdir,
+            stage_dir,
             install_user,
             raw_unit,
             stage_before_cutover=True,
@@ -4599,8 +4973,36 @@ def _prepare_selected_release_dependencies(
                 f"Die Abhängigkeiten des zuvor verwendeten Dienstes {raw_unit} konnten vor dem Dienststopp nicht vorbereitet werden: {detail}",
                 "Prüfe freien Speicherplatz, Netzwerkzugang sowie npm --version und starte danach denselben Ein-Datei-Updater erneut; die laufenden Dienste wurden noch nicht gestoppt.",
             )
+        if (stage_dir / "node_modules").is_dir():
+            staged.append(relative)
         prepared.add(raw_unit)
-    return frozenset(prepared), warnings
+    return frozenset(prepared), warnings, tuple(dict.fromkeys(staged))
+
+
+def _project_staged_npm_dependencies(
+    staged_workdirs: Iterable[str],
+    target_root: Path,
+    *,
+    uid: int,
+    gid: int,
+) -> None:
+    """Übernimmt vorbereitete node_modules mit den Rechten des Produktbaums."""
+
+    for relative in staged_workdirs:
+        source = NPM_STAGING_ROOT / relative / "node_modules"
+        if not source.is_dir():
+            raise RuntimeError(
+                f"Vorbereitete npm-Abhängigkeiten fehlen im Arbeitsbereich: {source}"
+            )
+        _project_release_tree(
+            source,
+            target_root / relative / "node_modules",
+            uid=uid,
+            gid=gid,
+            root_mode=0o755,
+            directory_mode=0o755,
+            executable_from_shebang=True,
+        )
 
 
 def _ensure_selected_catalog_services(
@@ -6768,12 +7170,18 @@ def _prepare_active_emergency_veto_before_update() -> bool:
                 "Produktdateien wurden nicht verändert."
             ),
         )
-    reloaded = _run(["/usr/bin/systemctl", "daemon-reload"], timeout=60)
+    reloaded = _daemon_reload()
     if reloaded.returncode != 0:
+        detail = _command_output_detail(reloaded)
         _fail(
             "E3DC-UPD-EMERGENCY-001",
-            "Der persistente Emergency-Startschutz konnte nicht in systemd geladen werden.",
-            "Prüfe systemctl daemon-reload und den root-eigenen Drop-in von e3dc-storage-manager.service; der Incident-Latch bleibt aktiv.",
+            "Der persistente Emergency-Startschutz konnte auch nach einem "
+            f"Wiederholversuch nicht in systemd geladen werden: {detail}",
+            _daemon_reload_solution(
+                detail,
+                "Prüfe systemctl daemon-reload und den root-eigenen Drop-in von e3dc-storage-manager.service.",
+            )
+            + " Der Incident-Latch bleibt aktiv.",
             system_state=(
                 "Der Incident-Latch ist aktiv und der Startschutz wurde auf Platte "
                 "projiziert, seine systemd-Wirksamkeit sowie der Writer-Stillstand "
@@ -6833,9 +7241,12 @@ def _rebind_active_emergency_veto_for_recovery() -> tuple[bool, str]:
         from Installer.emergency_release import ensure_persistent_emergency_start_veto
 
         ensure_persistent_emergency_start_veto()
-        reloaded = _run(["/usr/bin/systemctl", "daemon-reload"], timeout=60)
+        reloaded = _daemon_reload()
         if reloaded.returncode != 0:
-            raise RuntimeError("systemd daemon-reload fehlgeschlagen")
+            raise RuntimeError(
+                "systemd daemon-reload fehlgeschlagen: "
+                + _command_output_detail(reloaded)
+            )
         writer_state, writer_detail = _probe_emergency_storage_writer_state()
         if writer_state == "unknown":
             raise RuntimeError(
@@ -6869,12 +7280,17 @@ def _start_services(
         "[4/4] Regelung und Weboberfläche werden neu gestartet und geprüft …",
         flush=True,
     )
-    reload_result = _run(["/usr/bin/systemctl", "daemon-reload"], timeout=60)
+    reload_result = _daemon_reload()
     if reload_result.returncode != 0:
+        detail = _command_output_detail(reload_result)
         _fail(
             "E3DC-UPD-SERVICE-RELOAD-002",
-            "systemd konnte die neuen Dienstdefinitionen nicht laden.",
-            "Führe sudo systemctl daemon-reload aus und starte danach denselben Updatebefehl erneut.",
+            "systemd konnte die neuen Dienstdefinitionen auch nach einem "
+            f"Wiederholversuch nicht laden: {detail}",
+            _daemon_reload_solution(
+                detail,
+                "Führe sudo systemctl daemon-reload aus und starte danach denselben Updatebefehl erneut.",
+            ),
         )
     warnings: list[str] = []
     masked = {_normalize_unit(unit) for unit in masked_units}
@@ -7209,7 +7625,13 @@ def _start_previous_services_best_effort(
     role_was_active = bool(
         selected_role_service and selected_role_service in active_before
     )
-    _run(["/usr/bin/systemctl", "daemon-reload"], timeout=60)
+    reloaded = _daemon_reload()
+    if reloaded.returncode != 0:
+        print(
+            "[WARNUNG] systemctl daemon-reload schlug im Rücklauf auch nach einem "
+            "Wiederholversuch fehl: " + _command_output_detail(reloaded),
+            flush=True,
+        )
     ordered = list(active_before)
     if role_was_active and selected_role_service is not None:
         ordered.remove(selected_role_service)
@@ -7985,6 +8407,7 @@ def perform_update(
         services: tuple[str, ...] = ()
         enable_services: tuple[str, ...] = ()
         prepared_npm_units: frozenset[str] = frozenset()
+        staged_npm_workdirs: tuple[str, ...] = ()
         home_traversal_transition: tuple[DirectoryMetadataTransition, ...] | None = None
         warnings: list[str] = []
         try:
@@ -7995,6 +8418,7 @@ def perform_update(
                 phase="vor dem Vollbackup",
                 emit_details=True,
             )
+            warnings.extend(_preflight_run_free_space("vor dem Vollbackup"))
             with _bound_update_lock_environment(lock_descriptor):
                 backup_path = _create_backup(target_root, target_prebinding)
             _assert_named_directory_binding(target_prebinding)
@@ -8046,12 +8470,17 @@ def perform_update(
                 selected_catalog_units,
                 target_version=tag.removeprefix("v"),
             )
-            prepared_npm_units, npm_warnings = _prepare_selected_release_dependencies(
+            (
+                prepared_npm_units,
+                npm_warnings,
+                staged_npm_workdirs,
+            ) = _prepare_selected_release_dependencies(
                 release_root,
                 install_user,
                 selected_catalog_units,
             )
             warnings.extend(npm_warnings)
+            warnings.extend(_preflight_run_free_space("vor dem Dienststopp"))
             _assert_named_directory_binding(target_prebinding)
             active_before = service_prestate.active
             cutover_started = True
@@ -8086,6 +8515,12 @@ def perform_update(
                 release_root,
                 install_user,
                 target_prebinding,
+            )
+            _project_staged_npm_dependencies(
+                staged_npm_workdirs,
+                target_root,
+                uid=pwd.getpwnam(install_user).pw_uid,
+                gid=grp.getgrnam("www-data").gr_gid,
             )
             home_traversal_transition = _project_web_home_traversal(
                 install_user,
@@ -8237,8 +8672,21 @@ def perform_update(
                     lock_descriptor,
                 )
             )
+            watchdog_warnings, watchdog_previous_venvs = _rebind_watchdog_after_venv_change(
+                target_root,
+                install_user,
+                venv_python,
+                active_before,
+                services,
+                enabled_before=service_prestate.enabled,
+            )
+            warnings.extend(watchdog_warnings)
             warnings.extend(
-                _prune_stale_release_venvs(install_user, venv_python.parent.parent)
+                _prune_stale_release_venvs(
+                    install_user,
+                    venv_python.parent.parent,
+                    extra_protected=watchdog_previous_venvs,
+                )
             )
             warnings.extend(_migrate_ramdisk_size())
         except UpdateFailure as exc:
@@ -8309,6 +8757,7 @@ def perform_update(
                 system_state=state,
             )
     finally:
+        _remove_npm_staging_best_effort()
         os.close(lock_descriptor)
     print("\n[OK] Update abgeschlossen.")
     print(f"Version: {tag.removeprefix('v')}")

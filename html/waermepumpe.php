@@ -25,12 +25,19 @@ $conf['auto_mode'] = $conf['auto_mode'] ?? 1;
 $conf['wp_type'] = $conf['wp_type'] ?? -1;
 
 $wpType = (int)$conf['wp_type'];
+// Wärmequelle aus der Konfiguration (Luft, Sole, Grundwasser, Direktverdampfung, unbekannt);
+// der Herstellertyp sagt nichts über die Quelle.
+$wpSourceType = e3dcNormalizeHeatSourceType($conf['wp_source_type'] ?? 'auto');
 $pageContext = $seite ?? 'waermepumpe';
 $hasNativeHeatpump = isHeatpumpEnabledConfig($conf);
 $hasHeaterConfig = isHeaterEnabledConfig($conf);
 $isChargingOnly = ($pageContext === 'charging')
     || ($wpType < 0 && !$hasNativeHeatpump && !$hasHeaterConfig && (string)$conf['luxtronik'] === '0');
 $isHeaterPage = !$isChargingOnly && ($wpType === 2 || (!$hasNativeHeatpump && $hasHeaterConfig));
+if (!$isChargingOnly && $wpType === 6 && $hasHeaterConfig) {
+    // Beim E3DC-Leistungsmesser bleibt eine konfigurierte Heizstab-Seite wie bisher sichtbar.
+    $isHeaterPage = true;
+}
 
 $ramdiskFile = '/var/www/html/ramdisk/luxtronik.json';
 $stiebelRamdiskFile = '/var/www/html/ramdisk/stiebel_isg.json';
@@ -125,6 +132,10 @@ if ($wpType == 4) {
             if (isset($emJson[$k])) $json[$k] = $emJson[$k];
         }
     }
+} elseif ($wpType == 6) {
+    // E3DC-Leistungsmesser: nur die gemessene Leistung aus dem E3DC-Live-Dienst,
+    // keine Herstellerdatei (waermepumpe.json gehört zu Luxtronik/IDM).
+    $json = e3dcHeatpumpPmPagePayload('/var/www/html/ramdisk/live_data_py.json');
 } elseif ($wpType == 0 && file_exists($ramdiskFile)) {
     $json = json_decode(file_get_contents($ramdiskFile), true);
 } elseif (file_exists($liveJsonFile)) {
@@ -322,7 +333,8 @@ if (isset($data['Leistung_Verdichter_W']) || isset($data['Leistungsaufnahme'])) 
         $wp_power_w = 0;
     }
     $wp_source = 'modbus';
-} else {
+} elseif ($wpType !== 6) {
+    // Beim E3DC-Leistungsmesser zeigt die Messansicht den PM-Wert direkt.
     $historyFileLive = '/var/www/html/ramdisk/live_history.txt';
     if (file_exists($historyFileLive)) {
         $lines = @file($historyFileLive, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
@@ -361,47 +373,26 @@ if ($wp_power_w > 0 && $heiz_kw > 0) {
 
 $calc_freq = $data['Freq_Ist'] ?? 0;
 
-function getCOPColor($val, $type) {
-    if ($val <= 0) return 'text-secondary';
-    if ($type == 1) { // Luft/Wasser Wärmepumpe
-        if ($val >= 4.0) return 'text-success fw-bolder';
-        if ($val >= 3.0) return 'text-info';
-        if ($val >= 2.0) return 'text-warning';
-        return 'text-danger';
-    } else { // Sole/Wasser Wärmepumpe
-        if ($val >= 4.8) return 'text-success fw-bolder';
-        if ($val >= 3.8) return 'text-info';
-        if ($val >= 2.8) return 'text-warning';
-        return 'text-danger';
-    }
-}
-
-$copColor = getCOPColor($cop, $wpType);
-// Stats Logic (Min/Max Tracking für den Tag)
-$statsFile = '/var/www/html/ramdisk/luxtronik_stats.json';
+// COP-/AZ-Farben nach der konfigurierten Wärmequelle; ohne bekannte Quelle keine Bewertung.
+$copColor = e3dcHeatpumpCopColorClass($cop, $wpSourceType);
+// Tages-Min/Max aus dem Ramdisk-Minutenpuffer (nur Anzeige). Die Tagesstartwerte der
+// Energiezähler für die Tages-AZ kommen aus dem persistenten Tagesarchiv (siehe unten).
+// Archiv und Puffer schreibt der Energy Manager: Sein Zeitstempel bestimmt den Tag, die
+// Dateizeit seiner Daten die Frische. Bei veralteten Daten gilt die Uhr des Webservers.
+$emDayMtime = @filemtime($ramdiskFile);
+$emDayJson = ($wpType === 0) ? $json : (($emDayMtime !== false) ? json_decode((string)@file_get_contents($ramdiskFile), true) : null);
+$today = e3dcHeatpumpDataDay(
+    is_array($emDayJson) ? ($emDayJson['ts'] ?? '') : '',
+    null,
+    ($emDayMtime !== false) ? $emDayMtime : null
+);
 $historyFile = '/var/www/html/ramdisk/luxtronik_history.json';
-$today = date('Y-m-d');
-$stats = ['date' => $today, 'p_min' => null, 'p_max' => 0, 'cop_min' => null, 'cop_max' => 0, 'wm_start' => null, 'el_start' => null];
+$archiveFile = '/var/www/html/data/luxtronik_archive/luxtronik_' . $today . '.json';
+$stats = ['date' => $today, 'p_min' => null, 'p_max' => 0, 'cop_min' => null, 'cop_max' => 0];
 
-// Zuerst wm_start (und restliche Stats) aus der Datei laden, damit wir sie nicht durch History-Lücken verlieren
-if (file_exists($statsFile)) {
-    $tmp = @json_decode(file_get_contents($statsFile), true);
-    if ($tmp && isset($tmp['date']) && $tmp['date'] === $today) {
-        $stats = $tmp;
-    }
-}
-
-$historyUsed = false;
-if (file_exists($historyFile)) {
+if ($wpType !== 6 && file_exists($historyFile)) {
     $lines = @file($historyFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
     if ($lines !== false) {
-        $historyUsed = true;
-        // Min/Max für den Re-Parse resetten, aber wm_start beibehalten!
-        $stats['p_min'] = null;
-        $stats['p_max'] = 0;
-        $stats['cop_min'] = null;
-        $stats['cop_max'] = 0;
-
         foreach ($lines as $line) {
             $row = json_decode($line, true);
             if (!$row || !isset($row['ts']) || strpos($row['ts'], $today) !== 0) continue;
@@ -409,12 +400,6 @@ if (file_exists($historyFile)) {
             $p = floatval($d['Leistung_Heiz_kW'] ?? $d['Heizleistung Ist'] ?? 0);
             $v = $d['Leistung_Verdichter_W'] ?? (($d['Leistungsaufnahme'] ?? 0) * 1000);
             $c = ($v > 0 && $p > 0) ? ($p * 1000) / $v : 0;
-
-            // Falls wm_start NOCH null ist, können wir ihn aus der History fischen
-            $wm = floatval($d['Wärmemenge Gesamt'] ?? $d['Energie_Waerme_kWh'] ?? 0);
-            if ($wm > 0 && ($stats['wm_start'] === null || $wm < $stats['wm_start'])) {
-                $stats['wm_start'] = $wm;
-            }
 
             if ($p > 0) {
                 if ($stats['p_min'] === null || $p < $stats['p_min']) $stats['p_min'] = $p;
@@ -606,19 +591,7 @@ if ($success) {
         if ($stats['cop_min'] === null || $cop < $stats['cop_min']) $stats['cop_min'] = $cop;
         if ($cop > $stats['cop_max']) $stats['cop_max'] = $cop;
     }
-
-// Tages-Startwerte für Wärmemenge UND elektrische Energie (IDM-eigene Zähler)
-    $current_wm = floatval($data['Wärmemenge Gesamt'] ?? $data['Energie_Waerme_kWh'] ?? 0);
-    if ($current_wm > 0 && ($stats['wm_start'] === null || $stats['wm_start'] == 0)) {
-        $stats['wm_start'] = $current_wm;
-    }
-    $current_el = floatval($data['Leistungsaufnahme_Gesamt'] ?? $data['Energie_Elek_kWh'] ?? 0);
-    if ($current_el > 0 && ($stats['el_start'] === null || $stats['el_start'] == 0)) {
-        $stats['el_start'] = $current_el;
-    }
-
-    // Der Renderpfad bleibt read-only. Persistente Tagesstatistik wird vom
-    // zuständigen Hintergrunddienst gepflegt, nicht durch einen Seitenabruf.
+    // Der Renderpfad bleibt read-only; er schreibt keine Tagesstatistik.
 }
 
 $p_min_disp = ($stats['p_min'] !== null) ? number_format($stats['p_min'], 1, ',', '.') : '--';
@@ -649,8 +622,9 @@ function fmtDecTime($val) {
 
 $jaz = 0;
 $jazLabel = "Tages-AZ";
+$jazTitle = '';
 
-// Werte aus IDM oder Luxtronik
+// Gesamtzähler der Wärmepumpe für die Gesamt-JAZ (bei Stiebel ersatzweise die Tageszähler)
 $waerme_heute  = floatval($data['Wärmemenge Gesamt'] ?? $data['Energie_Waerme_kWh'] ?? $data['Waerme_Tag_kWh'] ?? 0);
 $elek_heute    = floatval($data['Leistungsaufnahme_Gesamt'] ?? $data['Energie_Elek_kWh'] ?? $data['Strom_Tag_kWh'] ?? 0);
 
@@ -660,18 +634,32 @@ if ($wpType == 4) {
     if ($stiebelWaermeTag > 0 && $stiebelStromTag > 0.05) {
         $jaz = $stiebelWaermeTag / $stiebelStromTag;
     }
-}
-
-// el_start beim ersten Aufruf des Tages setzen (wm_start wird oben gespeichert)
-if ($elek_heute > 0 && ($stats['el_start'] === null || $stats['el_start'] == 0)) {
-    $stats['el_start'] = $elek_heute;
-}
-
-$tagesWaerme = ($stats['wm_start'] > 0 && $waerme_heute >= $stats['wm_start']) ? ($waerme_heute - $stats['wm_start']) : 0;
-$tagesElektrisch = ($stats['el_start'] > 0 && $elek_heute >= $stats['el_start']) ? ($elek_heute - $stats['el_start']) : 0;
-
-if ($wpType != 4 && $tagesElektrisch > 0.05 && $tagesWaerme > 0) {
-    $jaz = $tagesWaerme / $tagesElektrisch;
+    $jazTitle = 'Tages-AZ aus den Tageszählern der ISG';
+} else {
+    // Tages-AZ = Zählerstand jetzt minus Tagesbeginn, je für Wärme und Strom.
+    // Der Tagesbeginn kommt aus dem Tagesarchiv des Energy Managers (ab Mitternacht),
+    // sonst aus dem Ramdisk-Puffer; ohne belegten Tagesbeginn bleibt die Anzeige leer.
+    // Dateien nur lesen, wenn die Kachel sichtbar ist und die WP beide Zähler liefert.
+    $nowCounters = e3dcHeatpumpEnergyCounters($data);
+    $showsDayTile = !$isChargingOnly && !$isHeaterPage && $wpType !== 1 && $wpType !== 6;
+    $dayStart = ($showsDayTile && $nowCounters['heat_kwh'] !== null && $nowCounters['elec_kwh'] !== null)
+        ? e3dcHeatpumpDayCounterStart($archiveFile, $historyFile, $today)
+        : ['heat_kwh' => null, 'elec_kwh' => null, 'ts' => null, 'source' => null];
+    $dayRatio = e3dcHeatpumpDayWorkRatio($dayStart, $nowCounters);
+    if ($dayRatio['ratio'] !== null) {
+        $jaz = $dayRatio['ratio'];
+    }
+    if ($dayRatio['since'] !== null && $dayRatio['since'] > '00:15') {
+        $jazLabel = 'Tages-AZ seit ' . $dayRatio['since'];
+    }
+    $jazTitle = ($dayRatio['ratio'] !== null)
+        ? sprintf(
+            'Wärme ÷ Strom seit %s: %s kWh ÷ %s kWh (Energiezähler der Wärmepumpe)',
+            $dayRatio['since'] ?? '00:00',
+            number_format((float)$dayRatio['heat_kwh'], 1, ',', '.'),
+            number_format((float)$dayRatio['elec_kwh'], 1, ',', '.')
+        )
+        : $dayRatio['reason'];
 }
 
 $gesamtJaz = 0;
@@ -804,6 +792,9 @@ if ($isChargingOnly) {
 } elseif ($wpType == 5) {
     $cardTitle = 'Dimplex WPM Touch';
     $wpIcon = 'fa-temperature-three-quarters';
+} elseif ($wpType == 6) {
+    $cardTitle = 'Wärmepumpe (E3DC-Leistungsmesser)';
+    $wpIcon = 'fa-gauge-high';
 } else {
     $cardTitle = ($wpType == 1) ? 'IDM Wärmepumpe' : 'Luxtronik Wärmepumpe';
     $wpIcon = 'fa-fire-alt';
@@ -827,11 +818,40 @@ if ($isChargingOnly) {
     $displayServiceLabel = 'Stiebel ISG Live';
 } elseif ($wpType == 5) {
     $displayServiceLabel = 'Dimplex WPM Live';
+} elseif ($wpType == 6) {
+    // Der Leistungsmesser kommt über den E3DC-Live-Dienst; maßgeblich ist die Frische der Messung.
+    $displayServiceLabel = 'E3DC-Live (Leistungsmesser)';
+    $displayServiceRunning = !empty($json['success']);
+    // Bereits in Großbuchstaben: strtoupper() setzt Umlaute nicht um.
+    $displayServiceStatus = !empty($json['success'])
+        ? 'AKTIV'
+        : (($json['age_s'] ?? null) !== null ? 'KEINE GÜLTIGE MESSUNG' : 'KEINE DATEN');
 }
 ?>
 
 <div id="luxtronik-card" class="card shadow-sm mb-4" style="border-radius: 16px;">
     <div class="card-body p-3">
+        <?php if (($json['heatpump_pv_day_protection']['blocked'] ?? false) === true): ?>
+            <div class="alert alert-warning" role="status" id="heatpump-pv-day-block">
+                PV-Boost ist für heute gesperrt: Die Wärmepumpe musste wegen derselben Geräteschutzursache zweimal zurückgenommen werden.
+                <?php $protectionLabels = ['heat_source_limit' => 'Wärmequelle', 'hardware_fault' => 'Gerätefehler', 'electrical_profile_exceeded' => 'Elektrischer Leistungsrahmen überschritten']; ?>
+                Ursache:
+                <?php foreach (($json['heatpump_pv_day_protection']['counts'] ?? []) as $reason => $count): ?>
+                    <?php if (is_numeric($count) && (int)$count >= 2): ?>
+                        <?= htmlspecialchars($protectionLabels[$reason] ?? 'Geräteschutz', ENT_QUOTES, 'UTF-8') ?>.
+                    <?php endif; ?>
+                <?php endforeach; ?>
+                Bitte die Schutzursache prüfen. Der reguläre Warmwasser-Zeitplan bleibt verfügbar.
+            </div>
+        <?php endif; ?>
+        <?php $channelAlarm = $json['heatpump_channel_alarm'] ?? []; ?>
+        <?php if (($channelAlarm['active'] ?? false) === true): ?>
+            <div class="alert alert-danger" role="alert" id="heatpump-channel-alarm">
+                <strong>Wärmepumpe: Rücknahme nicht bestätigt.</strong>
+                Heizen bzw. Warmwasser hat den angeforderten Grundzustand nicht bestätigt.
+                Bitte SHI-Verbindung und Gerätestatus prüfen. Ein Verdichterstillstand ist damit nicht bestätigt.
+            </div>
+        <?php endif; ?>
         <div class="d-flex justify-content-between align-items-center mb-3">
             <h5 class="card-title text-info fw-bold m-0"><i class="fas <?= $wpIcon ?> me-2"></i><?= $cardTitle ?></h5>
             <div>
@@ -1097,6 +1117,43 @@ if ($isChargingOnly) {
 
 
 
+        <?php elseif ($wpType == 6): // Nur Leistungsmessung über den E3DC-Leistungsmesser ?>
+            <?php
+                $pmData = is_array($data) ? $data : [];
+                $pmValid = !empty($json['success']);
+                $pmPowerW = $pmValid ? (int)($pmData['WP_Power'] ?? 0) : null;
+                $pmIndex = $pmData['wp_pm_index'] ?? ($conf['wp_e3dc_pm_index'] ?? null);
+                $pmAge = $json['age_s'] ?? null;
+            ?>
+            <div class="alert alert-info small py-2 mb-3">
+                <i class="fas fa-gauge-high me-1"></i>
+                Diese Wärmepumpe wird nur über den E3DC-Leistungsmesser<?= is_numeric($pmIndex) ? ' (PM-Index ' . (int)$pmIndex . ')' : '' ?> gemessen.
+                Temperaturen, Betriebszustand und Steuerung stehen ohne Hersteller-Anbindung nicht zur Verfügung.
+            </div>
+            <?php if (!$pmValid): ?>
+                <div class="alert alert-warning small py-2 mb-3">
+                    <i class="fas fa-exclamation-triangle me-1"></i>
+                    <?= htmlspecialchars((string)($json['error'] ?? 'Keine gültige Messung.')) ?>
+                </div>
+            <?php endif; ?>
+            <div class="row g-2 mb-3">
+                <div class="col-12 col-md-4">
+                    <div class="p-2 bg-body-tertiary rounded border text-center h-100 d-flex flex-column justify-content-center">
+                        <div class="small text-muted">Leistung</div>
+                        <div class="fw-bold text-warning"><?= $pmPowerW !== null ? number_format($pmPowerW / 1000, 2, ',', '.') . ' kW' : '--' ?></div>
+                        <div class="small text-muted" style="font-size:0.7rem;"><?= $pmAge !== null ? 'Messung vor ' . (int)$pmAge . ' s' : 'keine Messung' ?></div>
+                    </div>
+                </div>
+                <?php foreach (['wp_p1' => 'L1', 'wp_p2' => 'L2', 'wp_p3' => 'L3'] as $pmKey => $pmLabel): ?>
+                <div class="col-4 col-md-<?= $pmKey === 'wp_p3' ? '4' : '2' ?>">
+                    <div class="p-2 bg-body-tertiary rounded border text-center h-100 d-flex flex-column justify-content-center">
+                        <div class="small text-muted"><?= $pmLabel ?></div>
+                        <div class="fw-bold"><?= ($pmValid && is_numeric($pmData[$pmKey] ?? null)) ? number_format((float)$pmData[$pmKey], 0, ',', '.') . ' W' : '--' ?></div>
+                    </div>
+                </div>
+                <?php endforeach; ?>
+            </div>
+
         <?php else: // Luxtronik / IDM ?>
             <?php if ($manualBoostMessage !== ''): ?>
                 <?= $manualBoostMessage ?>
@@ -1272,7 +1329,7 @@ if ($isChargingOnly) {
                         <div class="p-2 bg-body-tertiary rounded border text-center h-100 d-flex flex-column justify-content-center">
                             <?php if ($wpType == 1 && $idmJazValue > 0): // IDM: Gesamt-JAZ aus Config ?>
                                 <div class="small text-muted">JAZ <span class="fw-normal text-muted" style="font-size:0.7rem;">(Gesamt)</span></div>
-                                <?php $idmJazColor = getCOPColor($idmJazValue, 1); ?>
+                                <?php $idmJazColor = e3dcHeatpumpCopColorClass($idmJazValue, $wpSourceType); ?>
                                 <div class="fw-bold <?= $idmJazColor ?>" title="JAZ = <?= number_format($idmWGesamt, 0, ',', '.') ?> kWh Wärme / <?= number_format($idmETotalCfg, 0, ',', '.') ?> kWh Strom (idm_e_total in Config)">
                                     <?= number_format($idmJazValue, 2, ',', '.') ?>
                                 </div>
@@ -1282,9 +1339,9 @@ if ($isChargingOnly) {
                                 <div class="text-muted small">-- </div>
                                 <div class="small text-muted" style="font-size:0.65rem;">idm_e_total= in Config</div>
                             <?php else: ?>
-                                <div class="small text-muted"><?= $jazLabel ?> <span title="Gesamt-AZ (JAZ)">/ JAZ</span></div>
-                                <?php $jazColor = getCOPColor($jaz, $wpType); $gesamtColor = getCOPColor($gesamtJaz, $wpType); ?>
-                                <div class="fw-bold <?= $jazColor ?>" title="Basierend auf Energie (Tages-Startwert) / el. Leistung vom Manager">
+                                <div class="small text-muted"><?= htmlspecialchars($jazLabel) ?> <span title="Gesamt-AZ (JAZ)">/ JAZ</span></div>
+                                <?php $jazColor = e3dcHeatpumpCopColorClass($jaz, $wpSourceType); $gesamtColor = e3dcHeatpumpCopColorClass($gesamtJaz, $wpSourceType); ?>
+                                <div class="fw-bold <?= $jazColor ?>" title="<?= htmlspecialchars($jazTitle) ?>">
                                     <?= ($jaz > 0 && $jaz <= 15) ? number_format($jaz, 2, ',', '.') : '--' ?>
                                     <span class="text-muted fw-normal small <?= $gesamtColor ?>">/ <?= ($gesamtJaz > 0 && $gesamtJaz <= 15) ? number_format($gesamtJaz, 2, ',', '.') : '--' ?></span>
                                 </div>
@@ -1416,23 +1473,29 @@ if ($isChargingOnly) {
                         <h6 class="text-muted text-uppercase small fw-bold mb-2">Wärmequelle</h6>
                         <div class="p-2 bg-body-tertiary rounded border d-flex align-items-center" style="min-height: 46px;">
                             <div class="small w-100 text-muted">
+                                <?php
+                                    // Beschriftung aus der konfigurierten Wärmequelle; die Messwerte kommen je Gerät.
+                                    $sourceKnown = ($wpSourceType !== 'auto');
+                                    $sourceLabel = e3dcHeatSourceLabel($wpSourceType);
+                                    $sourceIcon = $wpSourceType === 'air' ? 'fa-wind' : ($sourceKnown ? 'fa-water' : 'fa-thermometer-half');
+                                ?>
                                 <?php if ($wpType == 4): ?>
                                     <?php $sourceTemp = wpFirstVal($data, ['Quellentemperatur', 'Waermequelle_Temperatur', 'Wärmequelle_Temperatur'], null); ?>
                                     <div class="d-flex justify-content-between align-items-center">
-                                        <span><i class="fas fa-thermometer-half me-1"></i> ISG Wärmequelle</span>
+                                        <span><i class="fas <?= $sourceIcon ?> me-1"></i> <?= $sourceKnown ? htmlspecialchars($sourceLabel) . ' (ISG)' : 'ISG Wärmequelle' ?></span>
                                         <span class="text-info"><?= fmtVal($sourceTemp, '°C') ?></span>
                                     </div>
                                 <?php elseif ($wpType == 5): ?>
-                                    <i class="fas fa-wind me-1"></i> Dimplex/NWPM (Außen: <?= fmtVal(wpFirstVal($data, ['Außentemperatur', 'Aussentemp'], null), '°C') ?>)
-                                <?php elseif ($wpType == 1): // IDM Luft/Wasser Pumpe -> Kein Sole-Ein/Aus ?>
-                                    <i class="fas fa-wind me-1"></i> Luft/Wasser (Außen: <?= fmtVal(wpFirstVal($data, ['Außentemperatur', 'Aussentemp'], '--'), '°C') ?> | Zuluft: <?= fmtVal(wpFirstVal($data, ['Zuluft'], '--'), '°C') ?>)
+                                    <i class="fas <?= $sourceIcon ?> me-1"></i> <?= $sourceKnown ? htmlspecialchars($sourceLabel) : 'Dimplex/NWPM' ?> (Außen: <?= fmtVal(wpFirstVal($data, ['Außentemperatur', 'Aussentemp'], null), '°C') ?>)
+                                <?php elseif ($wpType == 1): // IDM: kein Sole-Ein/Aus im Datensatz ?>
+                                    <i class="fas <?= $sourceIcon ?> me-1"></i> <?= $wpSourceType === 'air' ? 'Luft/Wasser' : htmlspecialchars($sourceLabel) ?> (Außen: <?= fmtVal(wpFirstVal($data, ['Außentemperatur', 'Aussentemp'], '--'), '°C') ?><?php if (in_array($wpSourceType, ['air', 'auto'], true)): ?> | Zuluft: <?= fmtVal(wpFirstVal($data, ['Zuluft'], '--'), '°C') ?><?php endif; ?>)
                                 <?php else: ?>
                                     <?php
                                         $soleEin = wpFirstVal($data, ['Sole_Ein', 'Wärmequelle-Ein', 'Waermequelle_Ein', 'Waermequelle-Ein', 'WQ_Eintritt', 'Zuluft'], wpFirstVal($data, ['Außentemperatur', 'Aussentemp'], '--'));
                                         $soleAus = wpFirstVal($data, ['Sole_Aus', 'Wärmequelle-Aus', 'Waermequelle_Aus', 'Waermequelle-Aus', 'WQ_Austritt'], '--');
                                     ?>
                                     <div class="d-flex justify-content-between align-items-center">
-                                        <span><i class="fas fa-water me-1"></i> Sole Wärmequelle</span>
+                                        <span><i class="fas <?= $sourceIcon ?> me-1"></i> <?= htmlspecialchars($sourceLabel) ?></span>
                                         <div>
                                             <span class="text-info">Ein: <?= fmtVal($soleEin, '°C') ?></span>
                                             <span class="text-primary ms-2">Aus: <?= fmtVal($soleAus, '°C') ?></span>
@@ -1607,7 +1670,9 @@ if ($isChargingOnly) {
             <span class="small text-muted"><i class="fas fa-robot me-1"></i> <?= htmlspecialchars($displayServiceLabel) ?>: <span class="badge <?= $displayServiceRunning ? 'bg-success' : 'bg-danger' ?>"><?= strtoupper($displayServiceStatus) ?></span></span>
             <div class="d-flex gap-2">
                 <a href="<?= getContextPageUrl('config', ['expand' => 'luxtronik']) ?>#group-luxtronik" class="btn btn-sm btn-outline-secondary"><i class="fas fa-cog"></i></a>
+                <?php if ($wpType !== 6 || $isHeaterPage): // Beim Leistungsmesser gibt es keinen eigenen WP-Dienst; die Heizstab-Seite behält ihren Neustart ?>
                 <form method="post"><?= e3dcCsrfInput() ?><button type="submit" name="restart_manager" class="btn btn-sm btn-outline-info"><i class="fas fa-sync-alt"></i></button></form>
+                <?php endif; ?>
             </div>
         </div>
     </div>

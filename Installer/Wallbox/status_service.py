@@ -1,5 +1,6 @@
 """Treiberstatusprüfung und ausfallsichere Behandlung veralteter Daten."""
 
+import math
 import time
 
 
@@ -109,7 +110,10 @@ class StatusService:
         self.diagnostic_keys = tuple(diagnostic_keys)
 
     def copy_diagnostics(self, detail, status):
-        if not isinstance(detail, dict) or not isinstance(status, dict):
+        if not isinstance(detail, dict):
+            return detail
+        detail["observation"] = self.observation(status)
+        if not isinstance(status, dict):
             return detail
         for key in self.diagnostic_keys:
             if key in status and key not in detail:
@@ -138,6 +142,89 @@ class StatusService:
                 if key in detail:
                     detail[key] = False
         return detail
+
+    @staticmethod
+    def read_observation(driver):
+        """Liest ohne Schreibbefehl; Treiber mit Lease-seitigem GET wählen ihren Diagnosepfad."""
+        reader = getattr(driver, "get_observation_status", None)
+        return reader() if callable(reader) else driver.get_status()
+
+    @staticmethod
+    def observation(status):
+        """Anzeigeprojektion; interne ausfallsichere Reglerwerte bleiben unverändert."""
+        sample = status if isinstance(status, dict) else {}
+        fresh = bool(sample.get("driver_status_valid") is True
+                     and not any(sample.get(key) for key in (
+                         "driver_status_stale", "driver_status_degraded", "driver_status_glitch"))
+                     and sample.get("driver_status_plausible") is not False
+                     and (not _native_status_present(sample) or _native_status_fresh(sample)))
+        missing = set(sample.get("observation_unavailable_fields") or [])
+
+        def number(*keys):
+            for key in keys:
+                value = sample.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+                    return float(value)
+            return None
+
+        def flag(*keys):
+            for key in keys:
+                value = sample.get(key)
+                if isinstance(value, bool):
+                    return value
+            return None
+
+        plug = flag("plug_state", "plug", "car_connected_rscp")
+        if plug is None and sample.get("car") in (1, 2, 3, 4) and not isinstance(sample.get("car"), bool):
+            plug = sample["car"] != 1
+        currents = [number("phase_current_l%d_a" % phase) for phase in (1, 2, 3)]
+        values = {
+            "plug": plug,
+            "locked": flag("locked", "plug_locked"),
+            "charging": flag("charging", "charge_state"),
+            "power_w": number("real_power_w", "power_w"),
+            "phases": number("phases_actual", "phases_in_use"),
+            "current_a": max(currents) if all(value is not None for value in currents) else None,
+        }
+        for phase in (1, 2, 3):
+            values["phase_power_l%d_w" % phase] = number("phase_power_l%d_w" % phase)
+            values["phase_current_l%d_a" % phase] = currents[phase - 1]
+        # Explizite Rohkanäle haben Vorrang vor historischen Reglerersatzwerten.
+        # Fehlende Schlüssel dürfen nicht aus dem Reglerstatus aufgefüllt werden.
+        observed = sample.get("observation_values")
+        if isinstance(observed, dict):
+            for key in values:
+                value = observed.get(key)
+                if key in ("plug", "locked", "charging"):
+                    values[key] = value if isinstance(value, bool) else None
+                else:
+                    values[key] = float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
+        if isinstance(observed, dict):
+            phases_source = observed.get("phases_source", "reported")
+        elif all(value is not None for value in currents):
+            values["phases"] = sum(abs(value) > 0.2 for value in currents)
+            phases_source = "current_channels"
+        elif any("phase_current_l%d_a" % phase in sample for phase in (1, 2, 3)):
+            values["phases"] = None
+            phases_source = "unknown"
+        else:
+            phases_source = "reported"
+        if values["phases"] not in (0, 1, 2, 3):
+            values["phases"] = None
+        for key in values:
+            if not fresh or key in missing:
+                values[key] = None
+        absent = [key for key, value in values.items() if value is None]
+        return {
+            "schema_version": "wallbox_observation_v1", "valid": fresh,
+            "source": str(sample.get("driver_status_source") or sample.get("wb_status_source") or "driver_readback"),
+            "reason": str(sample.get("driver_status_reason") or "status_unavailable") if not fresh else ("partial_measurement" if absent else "fresh"),
+            "sample_ts": number("driver_status_last_ok_ts"),
+            "age_s": number("driver_status_age_s"), "values": values,
+            "missing_fields": absent,
+            "phases_source": phases_source if values["phases"] is not None and phases_source in (
+                "current_channels", "power_channels", "reported") else "unknown",
+        }
 
     def safe_stale_status(self, c_data, *, now_ts=None, age_s=999999.0, reason="status_unavailable"):
         now_value = time.time() if now_ts is None else float(now_ts)

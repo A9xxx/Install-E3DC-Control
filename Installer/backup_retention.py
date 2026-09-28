@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import contextvars
+import copy
 import hashlib
 import json
 import os
@@ -24,6 +26,8 @@ except ImportError:  # pragma: no cover - Produktivbetrieb erfolgt unter Linux.
 try:
     from .backup_integrity import (
         BackupIntegrityError,
+        MANIFEST_DIGEST_NAME,
+        MANIFEST_NAME,
         QuiescedOverlayRestoreGuard,
         QUIESCED_OVERLAY_KIND,
         ROOT_MARKER_NAME,
@@ -33,6 +37,7 @@ try:
         _lexical_absolute,
         _normalized_backup_id,
         _normalized_transaction_id,
+        _read_small_file_bytes,
         validate_existing_backup_root,
         validate_quiesced_overlay_guard,
         verify_backup,
@@ -41,6 +46,8 @@ try:
 except ImportError:  # pragma: no cover - Rückfall für direkte Skriptausführung
     from backup_integrity import (
         BackupIntegrityError,
+        MANIFEST_DIGEST_NAME,
+        MANIFEST_NAME,
         QuiescedOverlayRestoreGuard,
         QUIESCED_OVERLAY_KIND,
         ROOT_MARKER_NAME,
@@ -50,6 +57,7 @@ except ImportError:  # pragma: no cover - Rückfall für direkte Skriptausführu
         _lexical_absolute,
         _normalized_backup_id,
         _normalized_transaction_id,
+        _read_small_file_bytes,
         validate_existing_backup_root,
         validate_quiesced_overlay_guard,
         verify_backup,
@@ -1437,6 +1445,196 @@ def _overlay_directory_is_secure(metadata: os.stat_result) -> bool:
     )
 
 
+# Prüfergebnisse eines Bereinigungslaufs. Ohne aktiven Lauf bleibt jede Prüfung
+# eine vollständige verify_backup-Prüfung wie bisher.
+_VERIFY_RUN_CACHE: "contextvars.ContextVar[Optional[_VerifyRunCache]]" = (
+    contextvars.ContextVar("e3dc_backup_verify_run_cache", default=None)
+)
+
+
+def _backup_tree_identity(backup_dir: PathValue) -> Tuple[str, str]:
+    """Liefert eine Identität des Backup-Baums ohne Inhalts-Hash der Nutzdaten.
+
+    Gebunden werden Gerät, Inode, Typ, Modus, Owner, Linkanzahl, Größe sowie
+    mtime und ctime in Nanosekunden jedes Eintrags (ohne Symlinks zu folgen)
+    und die Bytes von Manifest und Manifest-Prüfsumme. Jede Änderung an Inhalt
+    oder Metadaten einer Datei verändert mindestens deren ctime; Austausch,
+    Hinzufügen oder Entfernen verändert Inode oder Verzeichniseinträge.
+    Rückgabe: (Identität, SHA-256 der Manifest-Bytes).
+    """
+
+    backup = _assert_no_symlink_components(backup_dir)
+    digest = hashlib.sha256()
+
+    def feed(relative: str, metadata: os.stat_result) -> None:
+        digest.update(
+            repr(
+                (
+                    relative,
+                    metadata.st_mode,
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_nlink,
+                    metadata.st_uid,
+                    metadata.st_gid,
+                    metadata.st_size,
+                    metadata.st_mtime_ns,
+                    metadata.st_ctime_ns,
+                )
+            ).encode("utf-8", "surrogateescape")
+            + b"\0"
+        )
+
+    top = os.lstat(str(backup))
+    if stat.S_ISLNK(top.st_mode) or not stat.S_ISDIR(top.st_mode):
+        raise BackupIntegrityError("Backup ist kein echtes Verzeichnis")
+    feed(".", top)
+    pending: List[Tuple[str, str]] = [(str(backup), "")]
+    while pending:
+        directory, prefix = pending.pop()
+        with os.scandir(directory) as iterator:
+            entries = sorted(iterator, key=lambda item: item.name)
+        for entry in entries:
+            relative = prefix + entry.name
+            metadata = entry.stat(follow_symlinks=False)
+            feed(relative, metadata)
+            if stat.S_ISDIR(metadata.st_mode):
+                pending.append((entry.path, relative + "/"))
+    manifest_bytes = _read_small_file_bytes(backup / MANIFEST_NAME, 16 * 1024 * 1024)
+    digest_bytes = _read_small_file_bytes(backup / MANIFEST_DIGEST_NAME, 4096)
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    digest.update(b"manifest\0" + manifest_sha256.encode("ascii") + b"\0")
+    digest.update(b"digest\0" + hashlib.sha256(digest_bytes).hexdigest().encode("ascii"))
+    return digest.hexdigest(), manifest_sha256
+
+
+@dataclass(frozen=True)
+class _VerifiedBackupEntry:
+    identity: str
+    manifest_sha256: str
+    manifest: Dict[str, object]
+
+
+class _VerifyRunCache:
+    """Merkt sich bestandene Vollprüfungen innerhalb genau eines Laufs.
+
+    Ein Treffer setzt eine unveränderte Baumidentität voraus; jede Abweichung,
+    ein Identitätsfehler oder eine abweichende erwartete Art bzw. Manifest-SHA
+    führt zur vollständigen Prüfung durch verify_backup. Fehlgeschlagene
+    Prüfungen werden nie gespeichert.
+    """
+
+    def __init__(self) -> None:
+        self._entries: Dict[str, _VerifiedBackupEntry] = {}
+        self.full_verifications = 0
+        self.hits = 0
+
+    def verify(
+        self,
+        backup_dir: PathValue,
+        expected_kind: Optional[str],
+        expected_manifest_sha256: Optional[str],
+    ) -> Dict[str, object]:
+        key = str(_lexical_absolute(backup_dir))
+        entry = self._entries.get(key)
+        if entry is not None:
+            try:
+                identity, _manifest_sha256 = _backup_tree_identity(backup_dir)
+            except Exception:
+                identity = None
+            if identity != entry.identity:
+                self._entries.pop(key, None)
+            elif (
+                not expected_kind
+                or entry.manifest.get("kind") == expected_kind
+            ) and (
+                expected_manifest_sha256 is None
+                or str(expected_manifest_sha256) == entry.manifest_sha256
+            ):
+                self.hits += 1
+                return copy.deepcopy(entry.manifest)
+            # Abweichende Erwartung bei gleicher Identität: Die Vollprüfung
+            # meldet den Fehler selbst; der gespeicherte Befund bleibt gültig.
+        try:
+            before: Optional[Tuple[str, str]] = _backup_tree_identity(backup_dir)
+        except Exception:
+            before = None
+        kwargs: Dict[str, Any] = {}
+        if expected_kind is not None:
+            kwargs["expected_kind"] = expected_kind
+        if expected_manifest_sha256 is not None:
+            kwargs["expected_manifest_sha256"] = expected_manifest_sha256
+        manifest = verify_backup(backup_dir, **kwargs)
+        self.full_verifications += 1
+        if before is not None:
+            try:
+                after: Optional[Tuple[str, str]] = _backup_tree_identity(backup_dir)
+            except Exception:
+                after = None
+            if after == before:
+                self._entries[key] = _VerifiedBackupEntry(
+                    identity=before[0],
+                    manifest_sha256=before[1],
+                    manifest=copy.deepcopy(manifest),
+                )
+        return manifest
+
+
+@contextmanager
+def _backup_verification_run() -> Iterator[_VerifyRunCache]:
+    """Aktiviert den Prüfcache für einen Lauf; verschachtelte Aufrufe teilen ihn."""
+
+    active = _VERIFY_RUN_CACHE.get()
+    if active is not None:
+        yield active
+        return
+    cache = _VerifyRunCache()
+    token = _VERIFY_RUN_CACHE.set(cache)
+    try:
+        yield cache
+    finally:
+        _VERIFY_RUN_CACHE.reset(token)
+
+
+def _run_verify_backup(
+    backup_dir: PathValue,
+    expected_kind: Optional[str] = None,
+    expected_manifest_sha256: Optional[str] = None,
+) -> Dict[str, object]:
+    """verify_backup mit Wiederverwendung einer bestandenen Prüfung im Lauf."""
+
+    cache = _VERIFY_RUN_CACHE.get()
+    if cache is None:
+        kwargs: Dict[str, Any] = {}
+        if expected_kind is not None:
+            kwargs["expected_kind"] = expected_kind
+        if expected_manifest_sha256 is not None:
+            kwargs["expected_manifest_sha256"] = expected_manifest_sha256
+        return verify_backup(backup_dir, **kwargs)
+    return cache.verify(backup_dir, expected_kind, expected_manifest_sha256)
+
+
+def _run_verified_manifest_sha256(
+    backup_dir: PathValue,
+    *,
+    expected_kind: Optional[str] = None,
+) -> str:
+    """verified_manifest_sha256 ohne zweiten Hashlauf innerhalb eines Laufs.
+
+    Im Lauf stützt sich die Bindung auf die (gegebenenfalls wiederverwendete)
+    vollständige Prüfung und bindet Manifest samt Prüfsummendatei erneut stabil.
+    """
+
+    if _VERIFY_RUN_CACHE.get() is None:
+        return verified_manifest_sha256(backup_dir, expected_kind=expected_kind)
+    manifest = _run_verify_backup(backup_dir, expected_kind=expected_kind)
+    return verified_manifest_sha256(
+        backup_dir,
+        expected_kind=expected_kind,
+        preverified_manifest=manifest,
+    )
+
+
 def _verify_system_backup_contract(
     root: Path,
     root_descriptor: int,
@@ -1447,13 +1645,13 @@ def _verify_system_backup_contract(
     before = os.stat(name, dir_fd=root_descriptor, follow_symlinks=False)
     if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
         raise BackupIntegrityError("Parent-Backup ist kein echtes Verzeichnis")
-    manifest = verify_backup(path, expected_kind=SYSTEM_BACKUP_KIND)
+    manifest = _run_verify_backup(path, expected_kind=SYSTEM_BACKUP_KIND)
     backup_id = _normalized_backup_id(manifest.get("backup_id"))
     if str(manifest.get("install_root") or "") != str(install):
         raise BackupIntegrityError(
             "Parent-Backup gehört nicht zur aktuellen Installation"
         )
-    manifest_sha256 = verified_manifest_sha256(
+    manifest_sha256 = _run_verified_manifest_sha256(
         path,
         expected_kind=SYSTEM_BACKUP_KIND,
     )
@@ -1490,7 +1688,7 @@ def _verify_quiesced_overlay_contract(
         raise BackupIntegrityError(
             "Ruhende Daten-Nachsicherung ist nicht root:root 0700 gebunden"
         )
-    manifest = verify_backup(path, expected_kind=QUIESCED_OVERLAY_KIND)
+    manifest = _run_verify_backup(path, expected_kind=QUIESCED_OVERLAY_KIND)
     if not _overlay_manifest_keys_complete(manifest):
         raise BackupIntegrityError(
             "Overlay-Manifest besitzt einen unbekannten oder unvollständigen Vertrag"
@@ -1509,7 +1707,7 @@ def _verify_quiesced_overlay_contract(
         raise BackupIntegrityError(
             "Ruhende Daten-Nachsicherung gehört nicht zur aktuellen Installation"
         )
-    manifest_sha256 = verified_manifest_sha256(
+    manifest_sha256 = _run_verified_manifest_sha256(
         path,
         expected_kind=QUIESCED_OVERLAY_KIND,
     )
@@ -1631,7 +1829,7 @@ def _verify_prune_quarantine_contract(
         )
 
     path = root / name
-    manifest = verify_backup(path)
+    manifest = _run_verify_backup(path)
     kind = str(manifest.get("kind") or "")
     if kind not in {SYSTEM_BACKUP_KIND, QUIESCED_OVERLAY_KIND}:
         raise BackupIntegrityError("Quarantäne-Rest besitzt keine freigegebene Backup-Art")
@@ -1656,7 +1854,7 @@ def _verify_prune_quarantine_contract(
             manifest.get("parent_backup_id"),
             label="Parent-Backup-ID",
         )
-    manifest_sha256 = verified_manifest_sha256(path, expected_kind=kind)
+    manifest_sha256 = _run_verified_manifest_sha256(path, expected_kind=kind)
 
     after = os.stat(name, dir_fd=root_descriptor, follow_symlinks=False)
     final_root = os.fstat(root_descriptor)
@@ -2021,8 +2219,8 @@ def _generic_verified_quarantine_contract(
         expected_dev=int(before.st_dev),
         expected_ino=int(before.st_ino),
     )
-    manifest = verify_backup(root / name, expected_kind=expected_kind)
-    manifest_sha256 = verified_manifest_sha256(
+    manifest = _run_verify_backup(root / name, expected_kind=expected_kind)
+    manifest_sha256 = _run_verified_manifest_sha256(
         root / name,
         expected_kind=expected_kind,
     )
@@ -2119,7 +2317,7 @@ def delete_bound_quiesced_overlay(
             raise BackupIntegrityError(
                 "Overlay-, Parent- oder Collection-Inode driftete vor Cleanup"
             )
-        parent_manifest = verify_backup(
+        parent_manifest = _run_verify_backup(
             parent,
             expected_kind=SYSTEM_BACKUP_KIND,
             expected_manifest_sha256=guard.parent_backup_manifest_sha256,
@@ -2133,7 +2331,7 @@ def delete_bound_quiesced_overlay(
             raise BackupIntegrityError(
                 "Parent-Manifest driftete vor dem Overlay-Cleanup"
             )
-        rebound = verify_backup(
+        rebound = _run_verify_backup(
             target,
             expected_kind=QUIESCED_OVERLAY_KIND,
             expected_manifest_sha256=guard.manifest_sha256,
@@ -2201,7 +2399,7 @@ def _delete_orphan_quiesced_overlay(
             raise BackupIntegrityError(
                 "Benannter Parent entstand vor dem verwaisten Overlay-Cleanup"
             )
-        rebound = verify_backup(
+        rebound = _run_verify_backup(
             contract.path,
             expected_kind=QUIESCED_OVERLAY_KIND,
             expected_manifest_sha256=contract.manifest_sha256,
@@ -2612,7 +2810,7 @@ def _prune_backup_dir_locked(
                         raise BackupIntegrityError(
                             "Geschützter Hilfseintrag besitzt keinen bekannten Namen"
                         )
-                    verify_backup(
+                    _run_verify_backup(
                         candidate,
                         expected_kind=QUIESCED_OVERLAY_KIND,
                     )
@@ -2651,7 +2849,7 @@ def _prune_backup_dir_locked(
                     expected_dev=metadata.st_dev,
                     expected_ino=metadata.st_ino,
                 )
-                verify_backup(candidate, expected_kind=expected_kind)
+                _run_verify_backup(candidate, expected_kind=expected_kind)
                 verified_metadata = os.stat(name, dir_fd=root_descriptor, follow_symlinks=False)
                 if (metadata.st_dev, metadata.st_ino) != (verified_metadata.st_dev, verified_metadata.st_ino):
                     raise BackupIntegrityError("Backup wurde während der Verifikation ausgetauscht.")
@@ -2776,8 +2974,8 @@ def _prune_backup_dir_locked(
                     expected_parent_mount_id=root_mount_id,
                     expected_entry_mount_id=entry_mount_id,
                 )
-                rebound_manifest = verify_backup(path, expected_kind=expected_kind)
-                rebound_manifest_sha256 = verified_manifest_sha256(
+                rebound_manifest = _run_verify_backup(path, expected_kind=expected_kind)
+                rebound_manifest_sha256 = _run_verified_manifest_sha256(
                     path,
                     expected_kind=expected_kind,
                 )
@@ -3587,7 +3785,9 @@ def prune_backup_dir(
     """Gatet die Einzel-Retention gegen Update-Lock und Recovery-Belege."""
 
     try:
-        with backup_maintenance_lock(require_no_update_state=False):
+        with backup_maintenance_lock(
+            require_no_update_state=False
+        ), _backup_verification_run():
             blockers = _update_state_blockers()
             if blockers:
                 message = (
@@ -3664,7 +3864,9 @@ def prune_quiesced_overlays(
     install = _lexical_absolute(install_path)
     root = validate_existing_backup_root(backup_root, install)
     try:
-        with backup_maintenance_lock(require_no_update_state=True):
+        with backup_maintenance_lock(
+            require_no_update_state=True
+        ), _backup_verification_run():
             return _prune_quiesced_overlays_locked(
                 install,
                 root,
@@ -3849,7 +4051,11 @@ def prune_install_backups(
         _lexical_absolute(path) for path in (preserve_paths or ())
     }
     try:
-        with backup_maintenance_lock(require_no_update_state=False):
+        # Innerhalb dieses Laufs wird jede unveränderte Sicherung höchstens
+        # einmal vollständig gehasht; der Prüfcache endet vor der Lock-Freigabe.
+        with backup_maintenance_lock(
+            require_no_update_state=False
+        ), _backup_verification_run():
             blockers = _update_state_blockers()
             if blockers:
                 message = (

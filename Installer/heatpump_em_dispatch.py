@@ -1,0 +1,417 @@
+"""Ein serialisierter Energy-Manager-Ausgang für beide Luxtronik-SHI-Kanäle.
+
+Policy-Aufrufe liefern Absichten. Besitz, Rücknahme und Transportbelege werden
+erst hier entschieden; Modus 0 schreibt niemals ein Temperaturregister.
+"""
+
+import copy
+import math
+import uuid
+from datetime import datetime
+
+try:
+    from . import control_time
+    from .heatpump_channel_owner import (
+        CHANNELS, advance, migrate_legacy, note_transport, raw_mode,
+        resume_checkpoint, validate_checkpoint,
+    )
+    from .heatpump_pv_state import (
+        load_heatpump_channel_checkpoint, persist_heatpump_channel_checkpoint,
+    )
+except ImportError:
+    import control_time
+    from heatpump_channel_owner import (
+        CHANNELS, advance, migrate_legacy, note_transport, raw_mode,
+        resume_checkpoint, validate_checkpoint,
+    )
+    from heatpump_pv_state import (
+        load_heatpump_channel_checkpoint, persist_heatpump_channel_checkpoint,
+    )
+
+
+def number(value):
+    return float(value) if type(value) in (int, float) and math.isfinite(value) else None
+
+
+def channel_observations(status):
+    """Nur unverfälschte Kanalwerte; ein ungültiger Nachbarkanal sperrt nicht mit."""
+    status = status if isinstance(status, dict) else {}
+    valid = status.get("SHI_Source_valid") is True
+    def target(name):
+        value = number(status.get("%s_Setpoint_Raw" % name.upper()))
+        return value if value is not None and 0 <= value <= 100 else None
+    return {name: {
+        "valid": valid,
+        "sample_ts": number(status.get("SHI_Source_ts")),
+        "raw_mode": status.get("SHI_%s_Mode_Raw" % name.upper()),
+        "target_c": target(name),
+    } for name in CHANNELS}
+
+
+class LuxtronikChannelController:
+    """Prozessgebundener Adapter; genau eine Instanz gehört zur EM-Hauptschleife."""
+
+    def __init__(self, legacy_command=None, legacy_state=None, *, clock_sample=None, directory=None):
+        self.directory = directory
+        self.clock = copy.deepcopy(clock_sample or control_time.sample())
+        self.now_s = max(0.000001, number(self.clock.get("wall_ts")) or 0.000001)
+        loaded = load_heatpump_channel_checkpoint(directory=directory)
+        self.load_status = loaded.get("status", "untrusted")
+        checkpoint = validate_checkpoint(loaded.get("checkpoint"))
+        if self.load_status == "valid" and checkpoint:
+            # Eine Offline-Wanduhrdifferenz verkürzt keine Sperre. Verbleibende
+            # Fristen werden nach Neustart konservativ erneut ab jetzt gehalten.
+            saved_ts = checkpoint["updated_ts"]
+            for state in checkpoint["channels"].values():
+                for key in ("stop_until", "next_attempt_ts"):
+                    state[key] = max(state[key], self.now_s + max(0.0, state[key] - saved_ts))
+            checkpoint = resume_checkpoint(checkpoint, now_s=self.now_s)
+        else:
+            # Fehlend ist kein leerer Anfang. Konkrete Altintents migrieren;
+            # unbekannte Flags/Dateien brauchen zunächst einen frischen Auto-Beleg.
+            checkpoint = migrate_legacy(
+                legacy_command if self.load_status == "missing" else None,
+                now_s=self.now_s,
+            )
+            checkpoint = resume_checkpoint(checkpoint, now_s=self.now_s)
+        self.checkpoint = checkpoint
+        self.clock_fault = not bool(self.clock.get("valid"))
+        self.requests = {}
+        self.pending_offers = {}
+        self.last_result = {}
+        self.persisted = self._persist()
+
+    def _persist(self):
+        return bool(persist_heatpump_channel_checkpoint(
+            self.checkpoint, directory=self.directory, now_s=self.now_s))
+
+    def _time(self, current):
+        elapsed = control_time.elapsed_contract(self.clock, current)
+        delta = elapsed.get("elapsed_s", 0.0)
+        wall_delta = elapsed.get("wall_delta_s")
+        # Wanduhrsprünge sind keine abgelaufene Mindestlauf-/Wiedereinschaltzeit.
+        if (not elapsed.get("known") or wall_delta is None
+                or abs(wall_delta - delta) > 5.0):
+            self.clock_fault = True
+        if elapsed.get("known"):
+            self.now_s += delta
+        self.clock = copy.deepcopy(current)
+        if self.clock_fault:
+            for state in self.checkpoint["channels"].values():
+                state["clock_fault"] = True
+                state["diagnostic"] = "control_clock_discontinuity"
+        return self.now_s
+
+    def pv_command(self, previous=None):
+        """Projiziert allein belegte Kanalzustände auf den bestehenden Speichervertrag."""
+        previous = previous if isinstance(previous, dict) else {}
+        channels = self.checkpoint["channels"]
+        active = [value for value in channels.values()
+                  if value["owner"] == "pv" and value["possible_effect"]]
+        identity = active[0] if active else previous
+        if not identity.get("request_id"):
+            return copy.deepcopy(previous)
+        matching = {name: state for name, state in channels.items()
+                    if state["owner"] == "pv"
+                    and state["request_id"] == identity.get("request_id")
+                    and state["revision"] == identity.get("revision")}
+        same_previous = bool(previous.get("request_id") == identity["request_id"]
+                             and previous.get("revision") == identity.get("revision"))
+        result = copy.deepcopy(previous) if same_previous else {}
+        requested_channels = copy.deepcopy(result.get("channels") or {})
+        requested_channels.update({name: {"active": True, "target_c": state["target_c"]}
+                                   for name, state in matching.items()})
+        if not requested_channels:
+            return result
+        # Ein haltbar jüngerer Eigenauftrag setzt zwingend die terminale
+        # Rückgabe des vorigen voraus. So reaktiviert ein Absturz zwischen
+        # neuem Kanalcheckpoint und altem PV-Export keine alten Besitzrechte.
+        old_anchor = number(result.get("prepared_ts")) or number(result.get("issued_ts"))
+        completion = {}
+        for name in requested_channels:
+            state = channels.get(name) or {}
+            if name in matching:
+                terminal = bool(not state["possible_effect"] and state["state"] in ("frei", "fremd"))
+                completion[name] = {"state": state["state"], "terminal": terminal,
+                                    "reason": state["diagnostic"],
+                                    "withdraw_ack_ts": state["withdraw_ack_ts"]}
+            else:
+                newer_owner = bool(old_anchor is not None and state.get("prepared_ts") is not None
+                                   and state["prepared_ts"] > old_anchor
+                                   and (state.get("request_id"), state.get("revision"))
+                                   != (identity.get("request_id"), identity.get("revision")))
+                completion[name] = {"state": state.get("state"), "terminal": newer_owner,
+                                    "reason": "subsequent_owned_request" if newer_owner else "old_request_unresolved",
+                                    "withdraw_ack_ts": None}
+        prepared = [state["prepared_ts"] for state in matching.values()]
+        sent = [state["sent_ts"] for state in matching.values() if state["sent_ts"] is not None]
+        if old_anchor is not None:
+            prepared.append(old_anchor)
+        old_sent = number(result.get("issued_ts"))
+        if old_sent is not None:
+            sent.append(old_sent)
+        if not prepared:
+            return result
+        acknowledged = copy.deepcopy(result.get("acknowledged_channels") or {})
+        acknowledged.update({name: {"active": True, "target_c": state["target_c"]}
+                             for name, state in matching.items() if state["sent_ts"] is not None})
+        result.update({
+            "schema": "heatpump_pv_command_state_v1",
+            "request_id": identity["request_id"], "revision": identity["revision"],
+            "prepared_ts": min(prepared), "issued_ts": min(sent) if sent else None,
+            "channels": requested_channels, "acknowledged_channels": acknowledged,
+            "confirmed": bool(len(matching) == len(requested_channels)
+                              and all(state["state"] == "eigen_aktiv" for state in matching.values())),
+            "readback_confirmed": bool(result.get("readback_confirmed")
+                                      or (len(matching) == len(requested_channels)
+                                          and all(state["confirmed_ts"] is not None for state in matching.values()))),
+            "withdrawal_requested": bool(result.get("withdrawal_requested")
+                                        or any(state["withdraw_requested_ts"] is not None for state in matching.values())),
+            "withdrawal_confirmed": all(value["terminal"] for value in completion.values()),
+            "channel_completion": completion,
+        })
+        return result
+
+    def _desired(self, owner, channel, target, *, identity=None, grant=True, purpose=""):
+        target = number(target)
+        if target is None or not 0 <= target <= 100:
+            return None
+        old = self.checkpoint["channels"][channel]
+        if identity is None:
+            key = (owner, channel, target, purpose)
+            if (old["owner"] == owner and old["target_c"] == target and old["possible_effect"]
+                    and (not purpose or str(old["request_id"]).startswith(purpose + ":"))):
+                identity = old
+            else:
+                identity = self.requests.setdefault(key, {"request_id": (purpose + ":" if purpose else "") + uuid.uuid4().hex, "revision": 0})
+        return {"owner": owner, "request_id": identity.get("request_id"),
+                "revision": identity.get("revision", 0), "target_c": target,
+                "valid": True, "grant": bool(grant)}
+
+    def cycle(self, ctx, wp, *, clock_sample=None):
+        now = self._time(clock_sample or control_time.sample())
+        day = self.checkpoint["pv_day_protection"]
+        today = datetime.fromtimestamp(now).date().isoformat()
+        if day["day"] is None or today > day["day"]:
+            day.update({"day": today, "counts": {}, "last_event": None, "blocked": False})
+        observations = channel_observations(ctx.get("wp_status"))
+        offers = list(getattr(wp, "channel_intents", []))
+        desired = {name: None for name in CHANNELS}
+        automatic = ctx.get("AUTO_MODE") == 1
+        user_off = "manual_user_off" in (ctx.get("heatpump_positive_output_block_reasons") or [])
+        pv_output = ctx.get("heatpump_pv_output") or {}
+        pv_demand = ctx.get("heatpump_pv_contract") or {}
+        pv_state = ctx.get("heatpump_pv_state") or {}
+        manual = ctx.get("manual_boost_command") or {}
+        manual_on = bool(manual.get("valid") and manual.get("action") == "on"
+                         and manual.get("schema") == "manual_heatpump_command_v1")
+        ww_state = ctx.get("manual_ww_sofort_state") or {}
+        ww_pending = bool(ctx.get("manual_ww_requested_before_io"))
+        ww_active = bool(ww_state.get("active") or ww_state.get("pending"))
+        blocks = set(ctx.get("heatpump_positive_output_block_reasons") or [])
+        hard = bool(ctx.get("heatpump_signal_typed_protection_stop")
+                    or blocks.intersection({"manual_source_temperature_stop", "manual_low_soc_stop",
+                                            "pre_control_independent_safety_stop", "independent_safety_stop"}))
+        protection_reason = str(pv_output.get("protection_reason") or pv_demand.get("protection_reason") or "")
+        if protection_reason not in ("", "user_off"):
+            hard = True
+        status_fresh = bool((ctx.get("wp_status") or {}).get("valid") is True
+                            and (ctx.get("wp_status") or {}).get("source_fresh") is True)
+        if not status_fresh or self.clock_fault:
+            hard = True
+        # Die vorhandene Policy entscheidet, ob Angebote fachlich zulässig sind.
+        # Der Automat entscheidet anschließend unabhängig für jeden Kanal über
+        # Übergabe und Rücknahme. Ein Wunsch ist niemals Fremdbesitz.
+        if pv_output.get("start") or pv_output.get("keep"):
+            pv_identity = (pv_state.get("command") or {}) if pv_output.get("keep") else pv_demand
+            for name in CHANNELS:
+                offer = (pv_output.get("channels") or {}).get(name) or {}
+                if offer.get("active"):
+                    desired[name] = self._desired("pv", name, offer.get("target_c"), identity=pv_identity)
+        # Bestehende Nicht-PV-Aufträge werden nur von ihrer aktuellen Policy
+        # gehalten. Caches oder alte globale Boostflags erzeugen keinen Besitz.
+        owner_live = {
+            "price": bool(ctx.get("price_heatpump_start_requested") or ctx.get("pre_pause_active") or ctx.get("pv_pause_active")),
+            "predump": bool(ctx.get("predump_heatpump_active")),
+            "manual": manual_on or ww_active,
+        }
+        for name, state in self.checkpoint["channels"].items():
+            current_request = owner_live.get(state["owner"])
+            if state["owner"] == "manual":
+                timer_owned = str(state["request_id"]).startswith("timer:")
+                current_request = (bool(ctx.get("WW_TIMER_ENABLE"))
+                                   and number(ctx.get("ww_timer_target_c")) == state["target_c"]
+                                   if timer_owned else manual_on or (name == "ww" and ww_active))
+            if state["possible_effect"] and state["owner"] != "pv" and current_request:
+                if not str(state["request_id"]).startswith("timer:") or desired[name] is None:
+                    desired[name] = self._desired(state["owner"], name, state["target_c"], identity=state)
+        requested = {
+            "price": bool(ctx.get("price_heatpump_start_requested") or ctx.get("pre_pause_active") or ctx.get("pv_pause_active")),
+            "predump": bool(ctx.get("predump_heatpump_active")),
+            "manual": bool(manual_on or ww_active),
+            "timer": bool(ctx.get("WW_TIMER_ENABLE")),
+        }
+        for key, pending in list(self.pending_offers.items()):
+            if not requested.get(pending["owner"]):
+                del self.pending_offers[key]
+        for offer in offers:
+            key = (offer["owner"], offer["channel"])
+            if offer["owner"] in requested:
+                if offer["mode"] == 1:
+                    self.pending_offers[key] = copy.deepcopy(offer)
+                else:
+                    self.pending_offers.pop(key, None)
+            elif offer["owner"] == "release" and offer["mode"] == 0:
+                for oldkey in list(self.pending_offers):
+                    if oldkey[1] == offer["channel"] and oldkey[0] in ("price", "predump"):
+                        del self.pending_offers[oldkey]
+        offers = list(self.pending_offers.values()) + offers
+        priority = {"pv": 0, "predump": 1, "price": 2, "manual": 3}
+        def rank(value):
+            return -1 if str(value.get("request_id")).startswith("timer:") else priority[value["owner"]]
+        for offer in offers:
+            name, source = offer["channel"], offer["owner"]
+            owner = "manual" if source == "timer" else source
+            if source == "release" and offer["mode"] == 0:
+                if desired[name] and desired[name]["owner"] != "manual":
+                    desired[name] = None
+                continue
+            if owner not in priority:
+                continue
+            # PV-Ausgaben stammen ausschließlich aus dem identitätsgebundenen
+            # Grant. Die nachgelagerte Absicht darf keine neue UUID erfinden.
+            if owner == "pv":
+                if offer["mode"] == 0 and desired[name] and desired[name]["owner"] == "pv":
+                    desired[name] = None
+                continue
+            if source == "timer" and (ww_pending or ww_active or (
+                    desired[name] is not None and rank(desired[name]) >= 0)):
+                continue
+            if offer["mode"] == 1:
+                if desired[name] is None or priority[owner] >= rank(desired[name]):
+                    desired[name] = self._desired(owner, name, offer["target_c"], purpose=source)
+            elif desired[name] and ((source == "timer" and rank(desired[name]) < 0)
+                                    or (source != "timer" and rank(desired[name]) <= priority[owner])):
+                desired[name] = None
+        # WW-Sofort hat Vorrang vor HZ; sein bloßes Dateiflag ist jedoch keine
+        # Vollmacht zur Übernahme eines fremden SHI-Sollwerts.
+        if manual_on and not blocks.intersection({"manual_command_expired", "manual_source_temperature_stop", "manual_low_soc_stop"}):
+            if ctx.get("wp_write_allowed") and not any(offer["owner"] == "manual" for offer in offers):
+                if number(ctx.get("at_mittel")) is not None and number(ctx.get("HEIZGRENZE_TEMP")) is not None:
+                    summer = ctx["at_mittel"] > ctx["HEIZGRENZE_TEMP"]
+                    if not summer:
+                        desired["hz"] = self._desired("manual", "hz", ctx.get("CONF_HZ"), purpose="manual")
+                    desired["ww"] = self._desired("manual", "ww", ctx.get("CONF_WWS") if summer else ctx.get("CONF_WWW"), purpose="manual")
+        if ww_pending or ww_active:
+            desired["hz"] = None
+            if ww_state.get("active") and ctx.get("wp_write_allowed"):
+                desired["ww"] = self._desired("manual", "ww", ww_state.get("target_c"), purpose="ww_immediate")
+        # Der manuelle Gesamtboost nutzt die bestehende Softwarehysterese
+        # auch zwischen den gedrosselten Policy-Aufrufen. WW-Sofort und der
+        # explizite Komforttimer besitzen jeweils ihre eigene Thermopolitik.
+        data = ctx.get("wp_data") or {}
+        for name in CHANNELS:
+            value = desired[name]
+            if not value or value["owner"] != "manual" or not str(value["request_id"]).startswith("manual:"):
+                continue
+            actual = number(data.get("Ruecklauf_Ist" if name == "hz" else "Warmwasser_Ist"))
+            if actual is not None:
+                own = self.checkpoint["channels"][name]
+                running = own["possible_effect"] and own["owner"] == "manual"
+                if name == "ww":
+                    running = running or (ctx.get("luxtronik_ww_runtime_contract") or {}).get("ww_running") is True
+                if actual >= value["target_c"] or (not running and actual >= value["target_c"] - (2.0 if name == "hz" else 8.0)):
+                    desired[name] = None
+        if day["blocked"]:
+            for name in CHANNELS:
+                if desired[name] and desired[name]["owner"] == "pv":
+                    desired[name] = None
+        if user_off or not automatic or hard:
+            desired = {name: None for name in CHANNELS}
+        if pv_output.get("withdraw"):
+            for name in CHANNELS:
+                if desired[name] and desired[name]["owner"] == "pv":
+                    desired[name] = None
+        restart_hold = max(0.0, number(ctx.get("WP_RESTART_BLOCK_MIN")) or 0.0) * 60.0
+        minimum_run = max(0.0, number(ctx.get("WP_MIN_RUNTIME_MIN")) or 0.0) * 60.0
+        last_start = number(ctx.get("wp_last_pv_boost_start_ts")) or 0.0
+        physical_hold = bool(ctx.get("WP_TAKT_PROTECT") and last_start > 0
+                             and now - last_start < minimum_run)
+        signal_hold = bool((ctx.get("heatpump_positive_signal_window") or {}).get("minimum_signal_hold_active"))
+        actions = []
+        for name in CHANNELS:
+            state = self.checkpoint["channels"][name]
+            # Das vor jedem Connect gelesene Nutzerflag schützt eine bereits
+            # belegte, außerhalb dieses Automaten liegende WW-Einstellung.
+            observed_mode = raw_mode(observations[name]["raw_mode"])
+            user_channel_pending = bool(name == "ww" and ww_pending and state["owner"] != "manual")
+            if (user_channel_pending and automatic and not user_off and not hard
+                    and (not observations[name]["valid"] or observed_mode is None)):
+                actions.append({"channel": "ww", "outcome": "user_request_waits_for_ownership_readback"})
+                continue
+            external_manual_evidence = bool(
+                ww_state.get("active") and ww_state.get("readback_confirmed")
+                and (number(ww_state.get("started_ts")) or 0.0) > (state["prepared_ts"] or 0.0))
+            manual_owned = bool(user_channel_pending and observed_mode in (1, 2)
+                                and external_manual_evidence)
+            own_signal_hold = bool(state["sent_ts"] is not None and now - state["sent_ts"] < 600.0)
+            stop_allowed = not (physical_hold or signal_hold or own_signal_hold
+                                or bool(ctx.get("heatpump_signal_manufacturer_cycle_hold"))
+                                or bool(pv_output.get("hold_required")))
+            if (ctx.get("heatpump_channel_stop_allowed") or {}).get(name) is False:
+                stop_allowed = False
+            if desired[name] and not state["possible_effect"]:
+                last_stop = number(ctx.get("wp_last_pv_boost_stop_ts")) or 0.0
+                takt_wait = bool(ctx.get("WP_TAKT_PROTECT") and last_stop > 0 and now < last_stop + restart_hold)
+                if (not ctx.get("wp_write_allowed") or takt_wait or self.clock_fault):
+                    desired[name] = None
+            old = copy.deepcopy(self.checkpoint)
+            self.checkpoint, action = advance(
+                self.checkpoint, name, now_s=now, observation=observations[name],
+                desired=desired[name], stop_allowed=bool(stop_allowed),
+                automatic_enabled=bool(automatic and not user_off), protection=bool(hard),
+                user_hold_s=restart_hold, signal_hold_s=600.0,
+                manual_owned=bool(manual_owned and automatic and not user_off and not hard),
+                baseline_target_c=number(ctx.get("WW_ECO")) if name == "ww" else None,
+                stop_reason=("user_off" if user_off else (protection_reason or "hard_protection") if hard else
+                             "policy_release" if desired[name] is None and any(
+                                 offer["channel"] == name and offer["mode"] == 0
+                                 for offer in offers) else None),
+            )
+            self.persisted = self._persist()
+            if action is None:
+                continue
+            if action["kind"] == "start" and not self.persisted:
+                # Kein IO, also weder Transportnote noch behauptete mögliche
+                # neue Wirkung. Ein Folgelauf muss den Intent erneut sichern.
+                self.checkpoint = old
+                actions.append({"action": action, "outcome": "intent_not_durable"})
+                continue
+            outcome = wp.dispatch_channel_action(action)
+            completed_clock = getattr(wp, "last_channel_transport_sample", None)
+            if isinstance(completed_clock, dict):
+                now = self._time(completed_clock)
+            self.checkpoint = note_transport(self.checkpoint, action, now_s=now, outcome=outcome)
+            # Ein Entzug zählt kanalübergreifend einmal pro PV-Auftrag/Ursache.
+            # Verbindungsfehler und Wiederholungen sind keine neue Schutzkante.
+            prior = old["channels"][name]
+            withdrawal_reason = self.checkpoint["channels"][name]["stop_reason"]
+            if (action["kind"] == "withdraw" and outcome in ("written", "write_failed")
+                    and prior["owner"] == "pv" and prior["possible_effect"]
+                    and not prior["protection_counted"]
+                    and withdrawal_reason in ("hardware_fault", "heat_source_limit", "electrical_profile_exceeded")):
+                day = self.checkpoint["pv_day_protection"]
+                day["last_event"] = "%s:%s:%s" % (prior["request_id"], prior["revision"], withdrawal_reason)
+                day["counts"][withdrawal_reason] = day["counts"].get(withdrawal_reason, 0) + 1
+                day["blocked"] = any(count >= 2 for count in day["counts"].values())
+                for peer in self.checkpoint["channels"].values():
+                    if (peer["owner"] == "pv" and peer["possible_effect"]
+                            and (peer["request_id"], peer["revision"]) == (prior["request_id"], prior["revision"])):
+                        peer["protection_counted"] = True
+            self.persisted = self._persist()
+            actions.append({"action": action, "outcome": outcome})
+        wp.channel_intents = []
+        self.last_result = {"checkpoint": copy.deepcopy(self.checkpoint), "actions": actions,
+                            "desired": desired, "checkpoint_durable": self.persisted,
+                            "load_status": self.load_status, "clock_fault": self.clock_fault}
+        return copy.deepcopy(self.last_result)

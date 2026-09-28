@@ -53,8 +53,137 @@ RSCP_POWER_SETTINGS_TOLERANCE_W = 50
 RSCP_POWER_SETTINGS_OWN_PROOF_MAX_AGE_S = 4.5
 RSCP_POWER_SETTINGS_OWN_PROOF_SOURCE = "own_set_verification"
 RSCP_SEND_RECEIPT_CONTRACT_VERSION = 1
+# Protokoll der E3DC-Antwort auf den Einzeltag EMS_REQ_SET_MAX_CHARGE_POWER
+# (0x01000101) auf oberster Ebene. Reine Beobachtung: Befehl, Zeitpunkt und
+# Häufigkeit des Schreibversuchs bleiben unverändert, es entsteht kein
+# zusätzlicher Lese- oder Schreibauftrag.
+RSCP_SINGLE_TAG_DIAG_SCHEMA = "rscp_max_charge_single_tag_v1"
+RSCP_SINGLE_TAG_LOG_SIGNATURE = "RSCP_SINGLE_TAG_0x01000101"
+# Gleiche Antworten erscheinen höchstens einmal je Fenster im Log; eine
+# geänderte Antwort (Status, Tag, Typ, Fehlercode; bei Wertantworten nur der
+# Wechsel Echo ja/nein) wird sofort geloggt, reine Wertwechsel zählt
+# log_suppressed bis zum nächsten Fenster.
+RSCP_SINGLE_TAG_LOG_INTERVAL_S = 3600.0
+RSCP_SINGLE_TAG_MAX_ITEMS = 8
+_RSCP_TYPE_NAMES = {
+    RscpType.Nil: "Nil",
+    RscpType.Bool: "Bool",
+    RscpType.Char8: "Char8",
+    RscpType.UChar8: "UChar8",
+    RscpType.Int16: "Int16",
+    RscpType.Uint16: "Uint16",
+    RscpType.Int32: "Int32",
+    RscpType.Uint32: "Uint32",
+    RscpType.Int64: "Int64",
+    RscpType.Uint64: "Uint64",
+    RscpType.Float32: "Float32",
+    RscpType.Double64: "Double64",
+    RscpType.Bitfield: "Bitfield",
+    RscpType.CString: "CString",
+    RscpType.Container: "Container",
+    RscpType.Timestamp: "Timestamp",
+    RscpType.ByteArray: "ByteArray",
+    RscpType.Error: "Error",
+}
 
 log = logging.getLogger("StorageManager")
+
+
+def _single_tag_scalar(value: Any) -> Any:
+    """JSON-taugliche Kopie eines Antwortwerts; Unbekanntes wird ``None``."""
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value[:32]).hex()
+    return None
+
+
+def _single_tag_item(item: Any, depth: int = 0) -> Optional[Dict[str, Any]]:
+    """Normalisiert ein dekodiertes RSCP-Antwortelement für die Diagnose."""
+    if not isinstance(item, dict):
+        return None
+    tag = item.get("tag")
+    type_byte = item.get("type")
+    tag_ok = type(tag) is int and tag >= 0
+    type_ok = type(type_byte) is int and type_byte >= 0
+    normalized: Dict[str, Any] = {
+        "tag": f"0x{tag:08X}" if tag_ok else None,
+        "type": type_byte if type_ok else None,
+        "type_name": _RSCP_TYPE_NAMES.get(type_byte) if type_ok else None,
+        "value": None,
+        "error_code": None,
+    }
+    value = item.get("value")
+    if type_ok and type_byte == RscpType.Error:
+        normalized["error_code"] = value if type(value) is int else None
+    elif type_ok and type_byte == RscpType.Container:
+        children = value if isinstance(value, list) else []
+        if depth < 1:
+            normalized["value"] = [
+                child
+                for child in (
+                    _single_tag_item(entry, depth + 1)
+                    for entry in children[:RSCP_SINGLE_TAG_MAX_ITEMS]
+                )
+                if child is not None
+            ]
+        else:
+            normalized["value"] = None
+    else:
+        normalized["value"] = _single_tag_scalar(value)
+    return normalized
+
+
+def classify_single_tag_response(response: Any) -> Dict[str, Any]:
+    """Ordnet die E3DC-Antwort auf den Einzeltag ohne Annahme über ihren Antworttag ein.
+
+    Fehlt die Antwort oder ist sie nicht auswertbar, bleiben Wert und Fehlercode
+    ``None`` und ``response_valid`` ist ``False``; ``0`` entsteht nie als Ersatz.
+    """
+    items = response if isinstance(response, list) else []
+    normalized = [
+        entry
+        for entry in (_single_tag_item(item) for item in items[:RSCP_SINGLE_TAG_MAX_ITEMS])
+        if entry is not None
+    ]
+    result: Dict[str, Any] = {
+        "response_status": "missing",
+        "response_valid": False,
+        "response_tag": None,
+        "response_type": None,
+        "response_type_name": None,
+        "response_value": None,
+        "error_code": None,
+        "response_item_count": len(items) if isinstance(response, list) else None,
+        "response_items": normalized,
+    }
+    if not normalized:
+        if isinstance(response, list) and response:
+            result["response_status"] = "unparsable"
+        return result
+    primary = normalized[0]
+    result.update({
+        "response_tag": primary.get("tag"),
+        "response_type": primary.get("type"),
+        "response_type_name": primary.get("type_name"),
+    })
+    if primary.get("tag") is None or primary.get("type") is None:
+        result["response_status"] = "unparsable"
+        return result
+    if primary["type"] == RscpType.Error:
+        result["error_code"] = primary.get("error_code")
+        result["response_status"] = "error"
+        result["response_valid"] = primary.get("error_code") is not None
+        return result
+    if primary["type"] == RscpType.Nil:
+        result["response_status"] = "nil"
+        return result
+    result["response_value"] = primary.get("value")
+    result["response_status"] = "value"
+    result["response_valid"] = primary.get("value") is not None
+    return result
 
 
 def rscp_settings_from_cfg(cfg: Dict[str, Any]) -> Tuple[str, int, str, str, str]:
@@ -142,6 +271,20 @@ class BattCtrl:
         self._settings_own_proof_suppressed = 0
         self._last_power_settings_wire_receipt: Dict[str, Any] = {}
         self._last_set_power_receipt: Dict[str, Any] = {}
+        self._single_tag_diag: Dict[str, Any] = {
+            "schema": RSCP_SINGLE_TAG_DIAG_SCHEMA,
+            "request_tag": f"0x{RscpTag.EMS_REQ_SET_MAX_CHARGE_POWER:08X}",
+            "attempts": 0,
+            "responses_valid": 0,
+            "responses_error": 0,
+            "responses_value": 0,
+            "responses_missing": 0,
+            "request_failures": 0,
+            "log_suppressed": 0,
+            "last": None,
+        }
+        self._single_tag_last_log_monotonic: Optional[float] = None
+        self._single_tag_last_log_key: Optional[Tuple[Any, ...]] = None
         self._power_settings_diag: Dict[str, Any] = {
             "schema": "rscp_power_settings_v1",
             "contract_version": RSCP_POWER_SETTINGS_CONTRACT_VERSION,
@@ -981,7 +1124,104 @@ class BattCtrl:
             self.close()
             return False
 
-    def set_max_charge_power(self, val: int, force: bool = False) -> Dict[str, Any]:
+    def max_charge_single_tag_diagnostics(self) -> Dict[str, Any]:
+        """Letzte E3DC-Antwort und Zähler zum Einzeltag 0x01000101 (nur Beobachtung)."""
+        diag = dict(self._single_tag_diag)
+        last = diag.get("last")
+        diag["last"] = dict(last) if isinstance(last, dict) else None
+        return diag
+
+    def _record_single_tag_response(
+        self,
+        *,
+        caller: str,
+        target_w: int,
+        sent_value_w: int,
+        response: Any,
+        request_failed: bool,
+        error: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Protokolliert die Antwort auf den Einzeltag; wirkt nie auf den Befehl zurück."""
+        try:
+            if request_failed:
+                classified = classify_single_tag_response(None)
+                classified["response_status"] = "request_failed"
+                classified["request_error"] = str(error)[:200] or None
+            else:
+                classified = classify_single_tag_response(response)
+            record: Dict[str, Any] = {
+                "ts": time.time(),
+                "caller": str(caller or "unknown")[:80],
+                "request_tag": self._single_tag_diag["request_tag"],
+                "request_type_name": "Int32",
+                "target_w": int(target_w),
+                "sent_value_w": int(sent_value_w),
+                **classified,
+            }
+            diag = self._single_tag_diag
+            diag["attempts"] = safe_int(diag.get("attempts"), 0) + 1
+            status = record.get("response_status")
+            if request_failed:
+                diag["request_failures"] = safe_int(diag.get("request_failures"), 0) + 1
+            elif record.get("response_valid") is True and status == "error":
+                diag["responses_error"] = safe_int(diag.get("responses_error"), 0) + 1
+            elif record.get("response_valid") is True and status == "value":
+                diag["responses_value"] = safe_int(diag.get("responses_value"), 0) + 1
+            else:
+                diag["responses_missing"] = safe_int(diag.get("responses_missing"), 0) + 1
+            if record.get("response_valid") is True:
+                diag["responses_valid"] = safe_int(diag.get("responses_valid"), 0) + 1
+            diag["last"] = record
+            # Ein Wert-Echo wechselt mit jedem gesendeten Wert; für das Log-Rate-Limit
+            # zählt nur Echo ja/nein, sonst würde jeder Versuch geloggt. "last" und die
+            # Zähler bleiben vollständig.
+            if status == "value":
+                value_key: Any = record.get("response_value") == record.get("sent_value_w")
+            else:
+                value_key = record.get("response_value")
+            log_key = (
+                status,
+                record.get("response_tag"),
+                record.get("response_type"),
+                value_key,
+                record.get("error_code"),
+            )
+            now_monotonic = time.monotonic()
+            due = bool(
+                self._single_tag_last_log_monotonic is None
+                or log_key != self._single_tag_last_log_key
+                or now_monotonic - self._single_tag_last_log_monotonic
+                >= RSCP_SINGLE_TAG_LOG_INTERVAL_S
+            )
+            if due:
+                suppressed = safe_int(diag.get("log_suppressed"), 0)
+                log.info(
+                    "%s: Aufrufer=%s gesendet=%dW (Ziel %dW) Antwort=%s Tag=%s Typ=%s Wert=%s "
+                    "Fehlercode=%s gültig=%s Versuche=%d unterdrückt=%d",
+                    RSCP_SINGLE_TAG_LOG_SIGNATURE,
+                    record["caller"],
+                    record["sent_value_w"],
+                    record["target_w"],
+                    status,
+                    record.get("response_tag"),
+                    record.get("response_type_name") or record.get("response_type"),
+                    record.get("response_value"),
+                    record.get("error_code"),
+                    "ja" if record.get("response_valid") is True else "nein",
+                    diag["attempts"],
+                    suppressed,
+                )
+                diag["log_suppressed"] = 0
+                self._single_tag_last_log_monotonic = now_monotonic
+                self._single_tag_last_log_key = log_key
+            else:
+                diag["log_suppressed"] = safe_int(diag.get("log_suppressed"), 0) + 1
+            return dict(record)
+        except Exception as exc:  # Diagnose darf den Ausgang nie beeinflussen.
+            log.debug("%s: Protokoll fehlgeschlagen: %s", RSCP_SINGLE_TAG_LOG_SIGNATURE, exc)
+            return None
+
+    def set_max_charge_power(self, val: int, force: bool = False, caller: str = "direct") -> Dict[str, Any]:
         val = int(val)
         receipt: Dict[str, Any] = {
             "kind": "max_charge_power",
@@ -1009,7 +1249,7 @@ class BattCtrl:
             "reason": "request_started",
         })
         try:
-            self._c.request([{"tag": RscpTag.EMS_REQ_SET_MAX_CHARGE_POWER, "type": RscpType.Int32, "value": actual}])
+            response = self._c.request([{"tag": RscpTag.EMS_REQ_SET_MAX_CHARGE_POWER, "type": RscpType.Int32, "value": actual}])
             self._charge_cap = val
             receipt.update({
                 "issued": True,
@@ -1018,10 +1258,27 @@ class BattCtrl:
                 "reason": "request_returned_ack_unknown",
             })
             log.info("RSCP MAX_CHARGE_POWER: %dW (Echt: %dW)", val, actual)
+            # Nur protokollieren: die Antwort ändert weder Receipt-Semantik
+            # noch Cache, Folgebefehle oder deren Zeitpunkt.
+            receipt["response"] = self._record_single_tag_response(
+                caller=caller,
+                target_w=val,
+                sent_value_w=actual,
+                response=response,
+                request_failed=False,
+            )
         except Exception as exc:
             log.error("RSCP set_max_charge: %s", exc)
             self._c = None
             receipt["reason"] = "request_failed"
+            receipt["response"] = self._record_single_tag_response(
+                caller=caller,
+                target_w=val,
+                sent_value_w=actual,
+                response=None,
+                request_failed=True,
+                error=type(exc).__name__,
+            )
         return receipt
 
     def set_max_discharge_power(self, val: int, force: bool = False) -> None:
@@ -1307,9 +1564,15 @@ class BattCtrl:
             receipt["output_complete"] = True
             return receipt
         elif mode == MODE_DISCH:
-            receipt["substeps"]["max_charge_power"] = self.set_max_charge_power(0)
+            receipt["substeps"]["max_charge_power"] = self.set_max_charge_power(
+                0,
+                caller=f"send:{mode_label(mode)}",
+            )
         elif mode in (MODE_CHRG, MODE_GRID):
-            receipt["substeps"]["max_charge_power"] = self.set_max_charge_power(val)
+            receipt["substeps"]["max_charge_power"] = self.set_max_charge_power(
+                val,
+                caller=f"send:{mode_label(mode)}",
+            )
         set_power = self._send_set_power_receipt(mode, val, force=force)
         receipt["substeps"]["set_power"] = set_power
         _record_primary(set_power)

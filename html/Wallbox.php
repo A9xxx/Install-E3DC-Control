@@ -6171,7 +6171,15 @@ function updateWallboxLiveStatus(data) {
     const statusCard = document.getElementById('wb-live-status');
     const valDisplay = document.getElementById('live-wb-val');
     const pulse = document.getElementById('status-pulse');
-    const wbPower = parseFloat(data && data.wb) || 0;
+    const rawPower = data && data.wb;
+    const observation = data && data.wb_observation;
+    const wbPower = rawPower === null || rawPower === undefined ? NaN : Number(rawPower);
+    if (!Number.isFinite(wbPower) || (observation && observation.valid !== true)) {
+        if (statusCard) statusCard.style.display = 'block';
+        if (pulse) pulse.classList.remove('pulse-active');
+        if (valDisplay) valDisplay.innerText = 'unbekannt';
+        return;
+    }
 
     if (wbPower > 10) { // Schwelle von 10 W, um Rauschen zu vermeiden
         if (statusCard) statusCard.style.display = 'block';

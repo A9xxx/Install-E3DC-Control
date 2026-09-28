@@ -7,9 +7,9 @@ The tracker keeps one estimation path for all wallbox types:
 - derive vehicle range from the saved capacity/consumption profile
 - write manual_soc_wbX.json so scheduler and UI see the same value
 
-openWB Pro keeps its own CCS/import counter estimator in the driver. Fresh
-values stay authoritative; an expired raw anchor may be replaced by a newer,
-unambiguously profile-bound vehicle value.
+openWB Pro keeps its CCS/import counter estimator in the driver. A newer,
+fresh and unambiguously profile-bound cloud value may replace an estimate;
+direct raw values retain their existing authority.
 """
 import json
 import math
@@ -24,6 +24,12 @@ SAVED_CARS_FILE = "/var/www/html/data/saved_cars.json"
 TMP_DIR = "/var/www/html/tmp"
 TRACKER_CHECKPOINT_ACTIVE_HEARTBEAT_S = 120.0
 TRACKER_CHECKPOINT_IDLE_HEARTBEAT_S = 900.0
+# Ein ungültiger Treiberstatus (RSCP-Ausfall, E3DC-Neustart, Stale-Schutz)
+# beweist keinen Stecker-Abzug. Eine offene SoC-Session wird so lange nur
+# gehalten; dauert die Lücke länger, endet die Schätzung ausfallsicher.
+TRACKER_STATUS_GAP_MAX_S = 1800.0
+TRACKER_METER_RESET_TOLERANCE_WH = 100.0
+TRACKER_SESSION_START_TOLERANCE_S = 5.0
 TRACKER_CHECKPOINT_SEMANTIC_KEYS = (
     "vehicle_key",
     "car_id",
@@ -754,6 +760,62 @@ def _unique_saved_profile(selected_id):
     return dict(matches[0]) if len(matches) == 1 else None
 
 
+def resolve_openwb_pro_profile(config, wb_id, vehicle_id=None, profiles=None):
+    """Binde Rechenparameter ausschließlich an das eindeutig gewählte Profil.
+
+    Der Wallbox-Konfigurationswert für die Kapazität und ein Anzeigename sind
+    keine Profilidentität. Eine eindeutig erkannte Live-Kennung bleibt vor
+    der statischen Auswahl führend; die Auswahl wird nie als Live-ID ausgegeben.
+    """
+    selected = str((config or {}).get(f"wb{wb_id}_car_id") or "").strip()
+    unknown = {
+        "id": None, "name": "", "vehicle_id": str(vehicle_id or "").strip(),
+        "capacity_kwh": None, "capacity_reason": "profile_assignment_unknown",
+        "efficiency": 0.90, "consumption_kwh_100km": 0.0,
+    }
+    cars = _load_saved_cars() if profiles is None else profiles
+    probe = _compact_id(vehicle_id)
+    if probe:
+        matches = [car for car in cars if isinstance(car, dict) and probe in _compact_aliases(
+            car, ("vehicle_id", "vehicle_mac", "mac", "rfid", "rfid_tag"),
+        )]
+        if len(matches) != 1:
+            return dict(unknown, capacity_reason="profile_identity_conflict")
+    else:
+        if not selected or selected.lower() in NO_VEHICLE_IDS:
+            return unknown
+        matches = [car for car in cars if isinstance(car, dict) and _matches_vehicle(car, selected)]
+    if len(matches) != 1:
+        return unknown
+    car = matches[0]
+    raw_capacity = car.get("capacity", car.get("capacity_kwh"))
+    capacity = _safe_float(raw_capacity, -1.0)
+    valid_capacity = not isinstance(raw_capacity, bool) and math.isfinite(capacity) and capacity > 0.0
+    efficiency = _safe_float(car.get("efficiency", car.get("charge_efficiency", car.get("charging_efficiency"))), 0.90)
+    if efficiency > 1.0:
+        efficiency /= 100.0
+    return {
+        "id": str(car.get("id") or selected).strip(),
+        "name": str(car.get("name") or "").strip(),
+        "profile_aliases": sorted(_compact_aliases(car)),
+        "vehicle_id": str(vehicle_id or "").strip(),
+        "capacity_kwh": capacity if valid_capacity else None,
+        "capacity_reason": "profile_bound" if valid_capacity else "profile_capacity_unknown",
+        "efficiency": max(0.50, min(1.0, efficiency or 0.90)),
+        "consumption_kwh_100km": _safe_float(
+            car.get("consumption", car.get("consumption_kwh_100km", car.get("avg_consumption"))), 0.0,
+        ),
+    }
+
+
+def openwb_pro_sample_matches_profile(sample, profile):
+    """Ein fremder Dateianker darf einen neu zugeordneten Wagen nicht verankern."""
+    if not profile.get("id"):
+        return False
+    sample_aliases = _compact_aliases(sample, ("car_id", "vehicle_id", "rfid_tag"))
+    return bool(sample_aliases) and sample_aliases.issubset(set(profile.get("profile_aliases") or []))
+
+
 def _manual_profile_binding(record, selected_id):
     """Typisiere einen Nutzeranker nur gegen genau ein gespeichertes Profil.
 
@@ -1063,8 +1125,111 @@ def _openwb_pro_tracker_session_sample(state, wb_id, profile, profile_aliases,
     }
 
 
+def _openwb_pro_status_anchor_sample(status, profile_aliases, config, now):
+    """Nur ein gültiger Anker dieses Profils begründet einen Neuheitsvorrang."""
+    anchor_aliases = _compact_aliases(status, (
+        "car_id", "vehicle_id", "rfid_tag", "car_soc_profile_id", "car_soc_vehicle_id",
+    ))
+    if not anchor_aliases or not anchor_aliases.issubset(profile_aliases):
+        return None
+    return _vehicle_soc_rule_sample(
+        dict(status, soc=status.get("car_soc"),
+             soc_source=status.get("car_soc_source"),
+             source=status.get("car_soc_source"),
+             soc_source_ts=status.get("car_soc_source_ts"),
+             soc_rule_confirmed=status.get("car_soc_rule_confirmed")),
+        config=config, now=now,
+    )
+
+
+def _openwb_pro_live_soc_candidates(config, wb_id, selected_id, profile_aliases, now,
+                                   diagnostics=None):
+    """Prüfe vorhandene Livewerte identisch für Ankerwahl und Anforderungssperre."""
+    candidates = []
+    profiles = [car for car in _load_saved_cars() if isinstance(car, dict)]
+    selected_profiles = [car for car in profiles if _matches_vehicle(car, selected_id)]
+    if len(selected_profiles) != 1:
+        if diagnostics is not None:
+            diagnostics["reason"] = "cloud_soc_ambiguous"
+        return []
+    selected_profile = selected_profiles[0]
+    selected_canonical = _compact_aliases(selected_profile, ("id", "profile_id"))
+    cloud_alias = _compact_id(selected_profile.get("cloud_vehicle_id"))
+    ambiguous = bool(cloud_alias and sum(
+        cloud_alias in _compact_aliases(car) for car in profiles
+    ) != 1)
+    for vehicle in _load_live_vehicles():
+        if not isinstance(vehicle, dict):
+            continue
+        vehicle_aliases = _compact_aliases(vehicle, PROFILE_ALIAS_KEYS + ("car_id",))
+        if not vehicle_aliases.intersection(profile_aliases):
+            continue
+        plugged_value = (
+            vehicle.get("is_plugged_in")
+            if "is_plugged_in" in vehicle
+            else vehicle.get("plugged")
+        )
+        if plugged_value is not True:
+            continue
+        raw_vehicle_slot = vehicle.get("wb_slot")
+        if isinstance(raw_vehicle_slot, bool):
+            continue
+        try:
+            vehicle_slot = int(raw_vehicle_slot or 0)
+        except (TypeError, ValueError):
+            vehicle_slot = 0
+        if vehicle_slot <= 0 and not _configured_vehicle_binding_unique(
+            config,
+            wb_id,
+            selected_id,
+        ):
+            continue
+        if vehicle_slot > 0 and vehicle_slot != int(wb_id):
+            continue
+
+        # Ein Alias muss über den gesamten Bestand genau dieses Profil meinen.
+        # Die Cloud-ID in "id" darf ein Alias sein; ein fremdes kanonisches
+        # Profil oder ein ausdrückliches profile_id/car_id widerspricht ihm.
+        matching_profiles = [car for car in profiles if (
+            _compact_aliases(car).intersection(vehicle_aliases)
+        )]
+        canonical_conflict = any(
+            _compact_id(vehicle.get(key))
+            and _compact_id(vehicle.get(key)) not in selected_canonical
+            for key in ("profile_id", "car_id")
+        )
+        if (len(matching_profiles) != 1
+            or matching_profiles[0] is not selected_profile
+            or canonical_conflict):
+            ambiguous = True
+            continue
+
+        # Zusätzliche typisierte Live-IDs müssen ebenfalls zum Profil gehören.
+        strong_live_aliases = _compact_aliases(
+            vehicle,
+            ("cloud_vehicle_id", "vehicle_id", "vehicle_mac", "mac", "rfid", "rfid_tag"),
+        )
+        if strong_live_aliases and not strong_live_aliases.issubset(profile_aliases):
+            continue
+        truth_sample = _vehicle_soc_rule_sample(vehicle, config=config, now=now)
+        if truth_sample is None:
+            continue
+        candidates.append((
+            vehicle,
+            truth_sample["soc"],
+            truth_sample["source"],
+            truth_sample["source_ts"],
+        ))
+
+    if ambiguous:
+        if diagnostics is not None:
+            diagnostics["reason"] = "cloud_soc_ambiguous"
+        return []
+    return candidates
+
+
 def _openwb_pro_profile_binding(config, wb_id, status, selected_id, now=None,
-                               tracker_state=None):
+                               tracker_state=None, diagnostics=None):
     """Liefere eine fail-closed Profil-/Live-SoC-Bindung für openWB Pro.
 
     Die openWB Pro liefert nicht auf jeder Anlage eine nutzbare Fahrzeug-ID.
@@ -1112,7 +1277,7 @@ def _openwb_pro_profile_binding(config, wb_id, status, selected_id, now=None,
         if live_id and live_id not in profile_aliases:
             return None
 
-    profile = _profile_for(config, wb_id, selected_id)
+    profile = resolve_openwb_pro_profile(config, wb_id)
     session_sample = _openwb_pro_same_session_sample(
         wb_id,
         profile,
@@ -1122,76 +1287,42 @@ def _openwb_pro_profile_binding(config, wb_id, status, selected_id, now=None,
         meter_wh,
         now,
     )
-    if session_sample:
+    retained_sample = _openwb_pro_tracker_session_sample(
+        tracker_state, wb_id, profile, profile_aliases,
+        plug_session_id, meter_wh, now, config,
+    )
+    fallback_samples = [sample for sample in (session_sample, retained_sample) if sample]
+    fallback_sample = max(fallback_samples, key=lambda sample: sample["ts"]) if fallback_samples else None
+    status_sample = _openwb_pro_status_anchor_sample(status, profile_aliases, config, now)
+    anchor_ts = max(
+        _timestamp((status_sample or {}).get("source_ts"), 0.0),
+        _timestamp((fallback_sample or {}).get("ts"), 0.0),
+    )
+
+    candidates = _openwb_pro_live_soc_candidates(
+        config, wb_id, selected_id, profile_aliases, now,
+        diagnostics=diagnostics,
+    )
+    if len(candidates) > 1:
+        # Auch gleiche Doppelwerte sind kein eindeutiger neuer Beleg. Ein
+        # bereits geprüfter Sitzungsanker bleibt davon unabhängig gültig.
+        if diagnostics is not None:
+            diagnostics["reason"] = "cloud_soc_ambiguous"
+        candidates = []
+    elif anchor_ts > 0.0:
+        candidates = [candidate for candidate in candidates if (
+            candidate[2] in VEHICLE_CLOUD_SOC_SOURCES
+            and candidate[3] > anchor_ts + 1.0
+        )]
+
+    if not candidates and fallback_sample:
+        # Derselbe Cloud-Anker wird nicht am jeweils neuesten Zähler erneut
+        # gesetzt. Sein ursprüngliches SoC-/Zählerpaar bleibt erhalten.
         return {
-            "sample": session_sample,
-            "profile": profile,
+            "sample": fallback_sample, "profile": profile,
             "plug_session_id": plug_session_id,
-            "meter_wh": meter_wh,
-            "meter_source": "session_kwh",
+            "meter_wh": meter_wh, "meter_source": "session_kwh",
         }
-
-    candidates = []
-    for vehicle in _load_live_vehicles():
-        if not isinstance(vehicle, dict):
-            continue
-        vehicle_aliases = _compact_aliases(vehicle)
-        if not vehicle_aliases.intersection(profile_aliases):
-            continue
-        plugged_value = (
-            vehicle.get("is_plugged_in")
-            if "is_plugged_in" in vehicle
-            else vehicle.get("plugged")
-        )
-        if plugged_value is not True:
-            continue
-        raw_vehicle_slot = vehicle.get("wb_slot")
-        if isinstance(raw_vehicle_slot, bool):
-            continue
-        try:
-            vehicle_slot = int(raw_vehicle_slot or 0)
-        except (TypeError, ValueError):
-            vehicle_slot = 0
-        if vehicle_slot <= 0 and not _configured_vehicle_binding_unique(
-            config,
-            wb_id,
-            selected_id,
-        ):
-            continue
-        if vehicle_slot > 0 and vehicle_slot != int(wb_id):
-            continue
-
-        # Zusätzliche typisierte Live-IDs müssen ebenfalls zum Profil gehören.
-        strong_live_aliases = _compact_aliases(
-            vehicle,
-            ("cloud_vehicle_id", "vehicle_id", "vehicle_mac", "mac", "rfid", "rfid_tag"),
-        )
-        if strong_live_aliases and not strong_live_aliases.issubset(profile_aliases):
-            continue
-        truth_sample = _vehicle_soc_rule_sample(vehicle, config=config, now=now)
-        if truth_sample is None:
-            continue
-        candidates.append((
-            vehicle,
-            truth_sample["soc"],
-            truth_sample["source"],
-            truth_sample["source_ts"],
-        ))
-
-    if not candidates:
-        # Ein beim Empfang frischer Cloud-Anker bleibt über den gemessenen
-        # Energiezuwachs nutzbar. Seine Quellzeit wird dabei nie verjüngt;
-        # neue oder rückgesetzte Sessions dürfen ihn nicht übernehmen.
-        retained_sample = _openwb_pro_tracker_session_sample(
-            tracker_state, wb_id, profile, profile_aliases,
-            plug_session_id, meter_wh, now, config,
-        )
-        if retained_sample:
-            return {
-                "sample": retained_sample, "profile": profile,
-                "plug_session_id": plug_session_id,
-                "meter_wh": meter_wh, "meter_source": "session_kwh",
-            }
     if len(candidates) != 1:
         return None
 
@@ -1319,6 +1450,51 @@ def _status_connected(status):
         return False
 
 
+def _tracker_status_gap_reason(status):
+    """Grund, wenn der Treiberstatus weder Stecker noch Energie belegt.
+
+    ``status_or_stale`` liefert bei einem RSCP-Ausfall oder E3DC-Neustart
+    zunächst eine entwertete Kopie und danach einen sicheren Stale-Status mit
+    ``car=1``. Beides ist fehlende Information und kein Stecker-Abzug.
+    """
+
+    if not isinstance(status, dict):
+        return ""
+    if (
+        status.get("driver_status_valid") is False
+        or _contract_flag_active(status.get("driver_status_stale"))
+        or _contract_flag_active(status.get("driver_status_degraded"))
+        or _contract_flag_active(status.get("driver_status_glitch"))
+        or status.get("driver_status_plausible") is False
+    ):
+        return (
+            str(status.get("driver_status_reason") or "").strip()
+            or "driver_status_invalid"
+        )
+    if "wb_status_valid" in status and status.get("wb_status_valid") is not True:
+        return (
+            str(status.get("wb_status_reason") or "").strip()
+            or "wb_status_invalid"
+        )
+    return ""
+
+
+def _status_session_start_ts(status):
+    if not isinstance(status, dict):
+        return 0.0
+    value = _timestamp(status.get("session_start_ts"), 0.0)
+    return value if math.isfinite(value) and value > 1577836800.0 else 0.0
+
+
+def _tracker_session_open(state):
+    return bool(
+        isinstance(state, dict)
+        and state.get("anchor_soc") is not None
+        and state.get("session_closed") is not True
+        and not _contract_flag_active(state.get("estimate_expired"))
+    )
+
+
 def _status_power_w(status):
     if not isinstance(status, dict):
         return 0.0
@@ -1367,6 +1543,64 @@ def _read_manual_soc(wb_id, default=None):
         if isinstance(legacy, dict):
             return legacy
     return default
+
+
+UNPLUGGED_ESTIMATE_KEYS = ("estimate_unconfirmed", "estimate_source", "estimate_ts")
+
+
+def _unplugged_estimate(data, state):
+    """Letzter geschätzter SoC der Session für die Anzeige nach echtem Abzug.
+
+    Übernommen wird nur eine vertrauenswürdige Hochrechnung, die zum Anker der
+    offenen Session gehört, oder der bereits so gekennzeichnete Wert eines
+    früheren Abzugszyklus. Sonst bleibt es beim Rückfall auf den Anker.
+    """
+
+    if not isinstance(data, dict):
+        return None
+    if _soc_record_vetoed(
+        data, include_profile_binding=False, include_plug_state=False
+    ):
+        return None
+    raw_soc = data.get("soc")
+    if isinstance(raw_soc, bool):
+        return None
+    soc = _safe_float(raw_soc, -1.0)
+    if not math.isfinite(soc) or soc < 0.0 or soc > 100.0:
+        return None
+    source = str(data.get("source") or "").strip()
+    if source == f"{ESTIMATED_PREFIX}_unplugged":
+        # Weiterer Abzugszyklus: den gekennzeichneten Wert unverändert halten.
+        if data.get("estimate_unconfirmed") is not True:
+            return None
+        estimate_source = str(data.get("estimate_source") or "").strip()
+        estimate_ts = _timestamp(data.get("estimate_ts"), 0.0)
+    else:
+        anchor_ts = _timestamp((state or {}).get("anchor_sample_ts"), 0.0)
+        data_anchor_ts = _timestamp(
+            data.get("raw_soc_ts", data.get("soc_source_ts")), 0.0
+        )
+        if (
+            not source.startswith(VEHICLE_ESTIMATED_SOURCE_PREFIX)
+            or anchor_ts <= 0.0
+            or abs(data_anchor_ts - anchor_ts) > 1.0
+        ):
+            return None
+        estimate_source = source
+        estimate_ts = _timestamp(data.get("ts"), 0.0)
+    if (
+        not estimate_source.startswith(VEHICLE_ESTIMATED_SOURCE_PREFIX)
+        or not vehicle_soc_source_trusted(estimate_source)
+        or not math.isfinite(estimate_ts)
+        or estimate_ts <= 0.0
+    ):
+        return None
+    return {
+        "soc": round(_clamp_percent(soc), 1),
+        "estimate_unconfirmed": True,
+        "estimate_source": estimate_source,
+        "estimate_ts": int(estimate_ts),
+    }
 
 
 def _tracker_state_path(wb_id):
@@ -1694,23 +1928,13 @@ class VehicleSocTracker:
         source_status = str(status.get("car_soc_source") or "").strip()
         is_openwb_pro = str(charger_class or "") == "OpenWBProCharger"
         status_soc = _safe_float(status.get("car_soc"), -1.0)
-        # Ein frischer bestätigter Roh-/Treiberschätzwert bleibt autoritativ.
-        # Der Dateizeitpunkt der zyklisch geschriebenen Manual-Datei darf den
-        # tatsächlichen Rohanker nicht verjüngen. Nach acht Stunden wird die
-        # direkte Quelle lokal entwertet und ein eindeutig profilgebundener,
-        # neuerer Fahrzeugwert darf übernehmen.
-        if (
-            source_status in OPENWB_PRO_SOURCES
-            and status_soc >= 0.0
-            and _is_confirmed_soc_source(source_status)
-        ):
-            if _openwb_pro_direct_soc_fresh(status, now=now):
-                return None
-            status["car_soc_rule_confirmed"] = False
 
         selected_id = str(config.get(f"wb{wb_id}_car_id") or "").strip()
         if selected_id.lower() in NO_VEHICLE_IDS:
             selected_id = ""
+        binding_diagnostics = {}
+        if is_openwb_pro and status.get("car_soc_invalid_reason") == "cloud_soc_ambiguous":
+            status.pop("car_soc_invalid_reason", None)
         profile_binding = (
             _openwb_pro_profile_binding(
                 config,
@@ -1719,16 +1943,49 @@ class VehicleSocTracker:
                 selected_id,
                 now=now,
                 tracker_state=self._load_state(wb_id),
+                diagnostics=binding_diagnostics,
             )
             if is_openwb_pro
             else None
         )
+        # Eine Schätzung sperrt einen jüngeren, gleichprofiligen Cloud-Anker
+        # nicht acht Stunden lang. Rohwerte bleiben direkt autoritativ; ohne
+        # eine belastbare neuere Bindung bleibt auch die Treiberschätzung.
+        bound_sample = (profile_binding or {}).get("sample") or {}
+        status_sample = _openwb_pro_status_anchor_sample(
+            status, set(((profile_binding or {}).get("profile") or {}).get("profile_aliases") or []),
+            config, now,
+        ) if is_openwb_pro else None
+        newer_cloud = bool(
+            bound_sample.get("source") in VEHICLE_CLOUD_SOC_SOURCES
+            and _timestamp(bound_sample.get("ts"), 0.0)
+            > _timestamp((status_sample or {}).get("source_ts"), 0.0) + 1.0
+        )
+        if source_status in OPENWB_PRO_SOURCES and status_soc >= 0.0:
+            if _openwb_pro_direct_soc_fresh(status, now=now):
+                if source_status == "openwb_pro_raw" or not newer_cloud:
+                    self._mark_tracker_not_current(
+                        wb_id, "openwb_pro_direct_soc_authoritative", now
+                    )
+                    return None
+            else:
+                status["car_soc_rule_confirmed"] = False
         if is_openwb_pro:
             if not profile_binding:
+                if binding_diagnostics.get("reason") == "cloud_soc_ambiguous":
+                    status.update({
+                        "car_soc": None, "car_soc_source": "unknown",
+                        "car_soc_rule_confirmed": False,
+                        "car_soc_source_ts": None, "car_soc_raw_ts": None,
+                        "car_soc_invalid_reason": "cloud_soc_ambiguous",
+                    })
                 self._invalidate_profile_fallback(
                     wb_id,
                     connected=_status_connected(status),
                     reason="profile_binding_invalid",
+                )
+                self._mark_tracker_not_current(
+                    wb_id, "profile_binding_invalid", now
                 )
                 return None
             sample = profile_binding["sample"]
@@ -1751,7 +2008,7 @@ class VehicleSocTracker:
         efficiency = _safe_float(profile.get("efficiency"), 0.90)
         efficiency = max(0.50, min(1.00, efficiency or 0.90))
         consumption = _safe_float(profile.get("consumption_kwh_100km"), 0.0)
-        if sample and _safe_float(sample.get("capacity_kwh"), 0.0) > 0:
+        if not is_openwb_pro and sample and _safe_float(sample.get("capacity_kwh"), 0.0) > 0:
             capacity = _safe_float(sample.get("capacity_kwh"), capacity)
 
         state = self._load_state(wb_id)
@@ -1769,6 +2026,20 @@ class VehicleSocTracker:
         )
         active_car_id = str((sample or {}).get("car_id") or profile.get("id") or selected_id or "").strip()
         vehicle_key = _compact_id(active_car_id or (sample or {}).get("vehicle_id") or selected_id or f"wb{wb_id}")
+        if not is_openwb_pro:
+            # Fehlende Treiberdaten sind weder Stecker-Abzug noch Ladung: die
+            # offene Session wird gehalten, nicht beendet und nicht integriert.
+            status_gap_reason = _tracker_status_gap_reason(status)
+            if status_gap_reason:
+                self._hold_session_for_status_gap(
+                    wb_id, state, now, status_gap_reason
+                )
+                return None
+            if state.get("status_gap_since") is not None and connected:
+                if not self._resume_after_status_gap(
+                    wb_id, state, now, meter_wh, meter_source, status
+                ):
+                    return None
         meter_reset = (
             meter_wh is not None
             and state.get("anchor_meter_wh") is not None
@@ -1807,20 +2078,7 @@ class VehicleSocTracker:
         if not connected:
             if state:
                 self._mark_manual_unplugged(wb_id, state)
-                self._save_state(wb_id, {
-                    "wb": wb_id,
-                    "vehicle_key": state.get("vehicle_key") or "",
-                    "car_id": state.get("car_id") or "",
-                    "vehicle_id": state.get("vehicle_id") or "",
-                    "name": state.get("name") or "",
-                    "connected": False,
-                    "charging": False,
-                    "last_update_ts": now,
-                    "session_closed": True,
-                    "closed_anchor_source": state.get("anchor_source") or "",
-                    "closed_anchor_ts": int(_timestamp(state.get("anchor_sample_ts"), now)),
-                    "closed_session_kwh": round(_safe_float(state.get("power_integrated_wh"), 0.0) / 1000.0, 3),
-                })
+                self._save_state(wb_id, self._closed_state(wb_id, state, now))
             return None
 
         if needs_anchor and sample:
@@ -1851,6 +2109,7 @@ class VehicleSocTracker:
                 "plug_session_id": plug_session_id,
             }
         elif not state_anchor_valid:
+            self._mark_tracker_not_current(wb_id, "anchor_invalid", now)
             return None
 
         if not _tracker_anchor_state_valid(
@@ -1873,8 +2132,19 @@ class VehicleSocTracker:
             self._expire_session_anchor(wb_id, state, now, connected, charging)
             return None
 
+        raw_cloud_only = is_openwb_pro and capacity <= 0
+        if raw_cloud_only:
+            # Ein vorhandener Cloudwert benötigt keine Rechenkapazität. Ohne
+            # Interpolation gilt seine rohe Frist, nicht die längere Schätzfrist.
+            if state.get("anchor_source") not in VEHICLE_CLOUD_SOC_SOURCES or not _tracker_anchor_state_valid(
+                state, now=now, config=config, wb_id=wb_id,
+                vehicle_key=vehicle_key, meter_estimation=False,
+            ):
+                self._mark_tracker_not_current(wb_id, "profile_capacity_unknown", now)
+                return None
+
         last_update = _timestamp(state.get("last_update_ts"), now)
-        if charging and now > last_update:
+        if not raw_cloud_only and charging and now > last_update:
             dt_s = min(max(0.0, now - last_update), 300.0)
             power_w = _status_power_w(status)
             if power_w > 50.0 and dt_s > 0.0:
@@ -1886,21 +2156,33 @@ class VehicleSocTracker:
             meter_delta_wh = max(0.0, meter_wh - _safe_float(anchor_meter, 0.0))
             state["last_meter_wh"] = meter_wh
             state["meter_source"] = meter_source
-        delivered_wh = max(meter_delta_wh, _safe_float(state.get("power_integrated_wh"), 0.0))
+        delivered_wh = 0.0 if raw_cloud_only else max(
+            meter_delta_wh, _safe_float(state.get("power_integrated_wh"), 0.0),
+        )
 
         state["wb"] = wb_id
         state["connected"] = connected
         state["charging"] = charging
         state["last_update_ts"] = now
-        state["capacity_kwh"] = capacity
+        state["capacity_kwh"] = None if raw_cloud_only else capacity
+        if is_openwb_pro:
+            state["capacity_reason"] = profile.get("capacity_reason")
         state["efficiency"] = efficiency
         state["consumption_kwh_100km"] = consumption
+        session_start_ts = _status_session_start_ts(status)
+        if session_start_ts > 0.0:
+            state["session_start_ts"] = session_start_ts
+        state["tracker_current"] = True
+        state.pop("tracker_not_current_reason", None)
+        state.pop("tracker_not_current_since", None)
         self._save_state(wb_id, state)
 
-        if capacity <= 0:
+        if capacity <= 0 and not raw_cloud_only:
             return None
 
-        estimated_soc = _clamp_percent(_safe_float(state.get("anchor_soc"), 0.0) + (delivered_wh / 1000.0) * efficiency / capacity * 100.0)
+        estimated_soc = _clamp_percent(state.get("anchor_soc")) if raw_cloud_only else _clamp_percent(
+            _safe_float(state.get("anchor_soc"), 0.0) + (delivered_wh / 1000.0) * efficiency / capacity * 100.0
+        )
         raw_source = str(state.get("anchor_source") or "")
         source = f"{ESTIMATED_PREFIX}_from_{raw_source}" if delivered_wh > 20.0 else raw_source
         anchor_sample_ts = _timestamp(state.get("anchor_sample_ts"), 0.0)
@@ -1935,7 +2217,7 @@ class VehicleSocTracker:
                 else state.get("vehicle_id") or ""
             ),
             "name": state.get("name") or profile.get("name") or active_car_id,
-            "capacity": capacity,
+            "capacity": state["capacity_kwh"],
             "wb": wb_id,
             "plugged": connected,
             "charging": charging,
@@ -1956,6 +2238,8 @@ class VehicleSocTracker:
             ),
             "ts": int(now),
         }
+        if is_openwb_pro:
+            result["capacity_reason"] = profile.get("capacity_reason")
         if (
             state.get("meter_source") == "session_kwh"
             and state.get("anchor_meter_wh") is not None
@@ -1970,7 +2254,7 @@ class VehicleSocTracker:
             result["consumption_kwh_100km"] = consumption
         if explicit_total_range:
             result.update(explicit_total_range)
-        elif consumption > 0:
+        elif consumption > 0 and not raw_cloud_only:
             result["range_km"] = round((capacity * estimated_soc / 100.0) / consumption * 100.0, 0)
             result["range_source"] = "wallbox_estimated_consumption"
             result["range_explicit"] = False
@@ -1984,7 +2268,7 @@ class VehicleSocTracker:
             ]
             result["charged_range_vehicle_key"] = explicit_charged_range["range_vehicle_key"]
             result["charged_range_explicit"] = True
-        elif consumption > 0:
+        elif consumption > 0 and not raw_cloud_only:
             result["charged_range_km"] = round(max(0.0, (delivered_wh / 1000.0) * efficiency / consumption * 100.0), 1)
             result["charged_range_source"] = "wallbox_estimated_consumption"
             result["charged_range_explicit"] = False
@@ -1994,6 +2278,147 @@ class VehicleSocTracker:
     def _write_manual_soc(self, wb_id, payload):
         path = _manual_soc_path(wb_id)
         _write_json_atomic(path, payload)
+
+    def _closed_state(self, wb_id, state, now, reason=""):
+        closed = {
+            "wb": int(wb_id),
+            "vehicle_key": (state or {}).get("vehicle_key") or "",
+            "car_id": (state or {}).get("car_id") or "",
+            "vehicle_id": (state or {}).get("vehicle_id") or "",
+            "name": (state or {}).get("name") or "",
+            "connected": False,
+            "charging": False,
+            "last_update_ts": now,
+            "session_closed": True,
+            "closed_anchor_source": (state or {}).get("anchor_source") or "",
+            "closed_anchor_ts": int(_timestamp((state or {}).get("anchor_sample_ts"), now)),
+            "closed_session_kwh": round(_safe_float((state or {}).get("power_integrated_wh"), 0.0) / 1000.0, 3),
+        }
+        if reason:
+            closed["closed_reason"] = str(reason)
+        return closed
+
+    def _mark_tracker_not_current(self, wb_id, reason, now):
+        """Kennzeichnet einen nicht mehr fortgeschriebenen Trackerzustand.
+
+        Der Zustand bleibt als Diagnose erhalten, trägt aber ausdrücklich
+        ``tracker_current=False`` samt Grund und Zeitpunkt, statt mit altem
+        ``last_update_ts`` wie ein laufender Tracker auszusehen.
+        """
+
+        state = self._load_state(wb_id)
+        if not state or state.get("session_closed") is True:
+            return
+        if (
+            state.get("tracker_current") is False
+            and state.get("tracker_not_current_reason") == reason
+        ):
+            return
+        marked = dict(state)
+        marked["tracker_current"] = False
+        marked["tracker_not_current_reason"] = str(reason or "")
+        marked["tracker_not_current_since"] = now
+        self._save_state(wb_id, marked)
+
+    def _hold_session_for_status_gap(self, wb_id, state, now, reason):
+        """Hält eine offene Session während ungültiger Treiberdaten an."""
+
+        if not _tracker_session_open(state):
+            return
+        since = _timestamp(state.get("status_gap_since"), 0.0)
+        if since <= 0.0:
+            held = dict(state)
+            held["status_gap_since"] = now
+            held["status_gap_reason"] = str(reason or "")
+            held["tracker_current"] = False
+            held["tracker_not_current_reason"] = "status_gap"
+            held["tracker_not_current_since"] = now
+            self._save_state(wb_id, held)
+            logger.info(
+                "[WB%d] Fahrzeug-SoC-Tracker: Treiberstatus ungültig (%s), "
+                "Session wird gehalten statt beendet.",
+                int(wb_id), reason,
+            )
+            return
+        if now - since > TRACKER_STATUS_GAP_MAX_S:
+            self._close_after_status_gap(wb_id, state, now, "status_gap_timeout")
+
+    def _resume_after_status_gap(self, wb_id, state, now, meter_wh, meter_source, status):
+        """Setzt dieselbe Session nach einer Datenlücke fort oder beendet sie.
+
+        Fortgesetzt wird nur bei belegter Kontinuität: Lücke innerhalb der
+        Frist, kein zurückgesetzter Sessionzähler und keine abweichende
+        Session-Startzeit. Energie der Lücke kommt ausschließlich aus dem
+        Zähler; die Leistungsintegration überspringt die Lücke.
+        """
+
+        since = _timestamp(state.get("status_gap_since"), 0.0)
+        gap_s = now - since if since > 0.0 else -1.0
+        if gap_s < 0.0 or gap_s > TRACKER_STATUS_GAP_MAX_S:
+            self._close_after_status_gap(wb_id, state, now, "status_gap_timeout")
+            return False
+        last_meter = state.get("last_meter_wh")
+        if (
+            meter_wh is not None
+            and last_meter is not None
+            and str(state.get("meter_source") or "") == str(meter_source or "")
+            and meter_wh + TRACKER_METER_RESET_TOLERANCE_WH < _safe_float(last_meter, 0.0)
+        ):
+            self._close_after_status_gap(
+                wb_id, state, now, "status_gap_meter_reset",
+                detail="Zähler %.0f Wh < %.0f Wh" % (
+                    float(meter_wh), _safe_float(last_meter, 0.0)
+                ),
+            )
+            return False
+        stored_start = _timestamp(state.get("session_start_ts"), 0.0)
+        current_start = _status_session_start_ts(status)
+        if (
+            stored_start > 0.0
+            and current_start > 0.0
+            and abs(current_start - stored_start) > TRACKER_SESSION_START_TOLERANCE_S
+        ):
+            self._close_after_status_gap(
+                wb_id, state, now, "status_gap_session_changed"
+            )
+            return False
+        state["last_update_ts"] = now
+        state["last_status_gap_s"] = round(gap_s, 1)
+        state["last_status_gap_reason"] = str(state.get("status_gap_reason") or "")
+        state.pop("status_gap_since", None)
+        state.pop("status_gap_reason", None)
+        logger.info(
+            "[WB%d] Fahrzeug-SoC-Tracker: Treiberstatus wieder gültig nach %.0f s, "
+            "dieselbe Session wird fortgesetzt.",
+            int(wb_id), gap_s,
+        )
+        return True
+
+    def _close_after_status_gap(self, wb_id, state, now, reason, detail=""):
+        """Beendet eine gehaltene Session ausfallsicher ohne Stecker-Behauptung."""
+
+        data = _read_manual_soc(wb_id, None)
+        if isinstance(data, dict):
+            data_ts = _timestamp(data.get("raw_soc_ts", data.get("ts")), 0.0)
+            state_ts = _timestamp((state or {}).get("anchor_sample_ts"), 0.0)
+            source = str(data.get("source") or "")
+            if source.startswith(ESTIMATED_PREFIX) or data_ts <= state_ts + 1.0:
+                data.update({
+                    "source": f"{ESTIMATED_PREFIX}_{reason}_expired",
+                    "soc_rule_confirmed": False,
+                    "plugged": False,
+                    "charging": False,
+                    "is_interpolated": False,
+                    "estimate_expired": True,
+                    "session_closed": True,
+                    "ts": int(now),
+                })
+                self._write_manual_soc(wb_id, data)
+        self._save_state(wb_id, self._closed_state(wb_id, state, now, reason=reason))
+        logger.info(
+            "[WB%d] Fahrzeug-SoC-Tracker: gehaltene Session beendet (%s%s).",
+            int(wb_id), reason, f"; {detail}" if detail else "",
+        )
 
     def _invalidate_profile_fallback(self, wb_id, connected, reason):
         """Sperre eine nicht mehr belastbar gebundene Pro-/Profil-Schätzung."""
@@ -2030,6 +2455,7 @@ class VehicleSocTracker:
             return
         raw_source = str(data.get("raw_source") or (state or {}).get("anchor_source") or source or "")
         raw_soc = _clamp_percent(_safe_float(data.get("raw_soc", (state or {}).get("anchor_soc", data.get("soc"))), 0.0))
+        estimate = _unplugged_estimate(data, state)
         data.update({
             "soc": raw_soc,
             "source": f"{ESTIMATED_PREFIX}_unplugged",
@@ -2042,4 +2468,11 @@ class VehicleSocTracker:
             "session_closed": True,
             "ts": int(time.time()),
         })
+        for key in UNPLUGGED_ESTIMATE_KEYS:
+            data.pop(key, None)
+        if estimate:
+            # Der letzte Schätzwert der Session bleibt als unbestätigte Anzeige
+            # stehen. Quelle und soc_rule_confirmed=false sperren ihn weiter als
+            # Regelwert und als Anker einer neuen Schätzung.
+            data.update(estimate)
         self._write_manual_soc(wb_id, data)

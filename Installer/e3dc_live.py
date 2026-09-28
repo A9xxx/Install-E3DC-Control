@@ -46,6 +46,59 @@ LIVE_PLAUSIBILITY_LOG_MAINTENANCE_RETRY_S = 5 * 60.0
 # zusätzlich ausreichend Feldhistorie, ohne die Zahl täglich gescannter
 # Diagnosedateien unbegrenzt wachsen zu lassen.
 LIVE_PLAUSIBILITY_LOG_RETENTION_DAYS = 30
+# Zusatzdiagnose zum Glitch-Log. Sie ist reine Protokollierung: kein Live-Wert,
+# kein Gültigkeitsflag und keine Detektorschwelle hängt davon ab. Sie steht in
+# einer eigenen Tagesdatei mit eigenem Größenbudget; das Glitch-Log selbst bleibt
+# in Inhalt und Größe unverändert. Rotation, Kompression und Aufbewahrung sind
+# dieselben wie beim Glitch-Log.
+LIVE_PLAUSIBILITY_DIAG_LOG_PREFIX = "live_plausibility_diag"
+LIVE_PLAUSIBILITY_DIAG_LOG_MAX_RECORDS = 3000
+LIVE_PLAUSIBILITY_DIAG_LOG_MAX_BYTES = 2 * 1024 * 1024
+LIVE_PLAUSIBILITY_DIAG_LOG_TARGET_BYTES = 1024 * 1024
+# Die Zusatzdiagnose läuft synchron und best-effort im Live-Zyklus. Sie startet
+# nur, wenn unmittelbar nach dem Glitch-I/O bis zur nächsten Akquise noch
+# mindestens 1 s bleibt. Braucht sie länger als 0,25 s (weniger als ein Zehntel
+# des 3-s-Takts, ein Vielfaches des üblichen Aufwands), pausiert sie 5 Minuten.
+# Ein blockierender Dateizugriff kann den Takt wie beim bestehenden Glitch-Log
+# verzögern; die Pause greift erst nach Rückkehr. Keine harte Laufzeitgarantie.
+# Ausgelassene Diagnosen werden gezählt.
+LIVE_PLAUSIBILITY_DIAG_MIN_SLACK_S = 1.0
+LIVE_PLAUSIBILITY_DIAG_BUDGET_S = 0.25
+LIVE_PLAUSIBILITY_DIAG_SUSPEND_S = 300.0
+# Je Episode höchstens 20 Frames (60 s im 3-s-Takt) mit Diagnose, einschließlich
+# des Erholungsframes. Das deckt das Persistfenster der Netz/PM-Abweichung (20 s)
+# und das Budget-Timeout der Wallbox (45 s) mit Reserve ab. Weitere Frames werden
+# nur gezählt und nicht mehr ausgewertet, damit ein Dauerfehler weder Laufzeit
+# noch Logdatei belastet.
+LIVE_PLAUSIBILITY_EPISODE_FRAME_LIMIT = 20
+# Gültige Einzelframe-Spitze: Netzleistung (EMS) weicht um mehr als 500 W vom
+# Mittel aus Vor- und Nachframe ab; alle drei Frames sind gültig und ohne
+# Diagnosegrund, der Detektor sieht sie also nicht.
+LIVE_PLAUSIBILITY_SPIKE_MIN_HEIGHT_W = 500.0
+# Vor- und Nachframe gelten als gleich, wenn sie weniger als 300 W auseinander
+# liegen. Zusammen mit der Mindesthöhe schließt die Toleranz Stufen und lineare
+# Rampen aus: Eine Stufe s erreicht 500 W Abweichung vom Mittel erst ab
+# s = 1000 W, ihr Nachbarabstand wäre dann 1000 W; eine lineare Rampe weicht gar
+# nicht vom Mittel ab. Übliches Rauschen der Netzleistung zwischen zwei Frames
+# bleibt darunter.
+LIVE_PLAUSIBILITY_SPIKE_NEIGHBOR_TOLERANCE_W = 300.0
+# Die drei Frames müssen zeitlich anschließen (3-s-Takt, ein verspäteter Zyklus erlaubt).
+LIVE_PLAUSIBILITY_SPIKE_MAX_FRAME_GAP_S = 10.0
+# Höchstens 4 Detailsätze je Stunde (höchstens 96 am Tag, etwa 0,2 MB). So bleibt
+# das Größenbudget der Diagnosedatei für Episodenframes verfügbar. Gezählt wird
+# jede Spitze; die Stundensumme steht in einem eigenen Satz.
+LIVE_PLAUSIBILITY_SPIKE_DETAIL_LIMIT_PER_HOUR = 4
+LIVE_PLAUSIBILITY_WALLBOX_STATUS_PATH = "/var/www/html/ramdisk/wallbox_native.json"
+# Derselbe Frischehorizont, den der Wallbox-Manager für diese Datei selbst nutzt.
+LIVE_PLAUSIBILITY_WALLBOX_STATUS_MAX_AGE_S = 20.0
+LIVE_PLAUSIBILITY_WALLBOX_STATUS_MAX_BYTES = 4 * 1024 * 1024
+LIVE_PLAUSIBILITY_WALLBOX_POINT_LIMIT = 4
+LIVE_PLAUSIBILITY_FRAME_DIAG_SCHEMA = "live_plausibility_frame_diag_v1"
+LIVE_PLAUSIBILITY_DIAG_RECORD_SCHEMA = "live_plausibility_diag_v1"
+# Zulässiger Vorlauf einer Samplezeit gegenüber der eigenen Uhr (wie beim gebundenen Dateileser).
+LIVE_PLAUSIBILITY_CLOCK_TOLERANCE_S = 5.0
+# Interner Schlüssel der Akquisezeiten; der Unterstrich hält ihn aus live_data_py.json.
+POWER_SNAPSHOT_TIMING_KEY = "_power_snapshot_timing"
 LIVE_LAST_VALID_HEARTBEAT_S = 30.0
 LIVE_GRID_POWER_FILTER_ALPHA = 0.03
 PM_AUTO_PROBE_LAST_INDEX = 7
@@ -60,6 +113,19 @@ _LIVE_LAST_VALID_MEMORY = {}
 _LIVE_LAST_VALID_WRITE_TS = {}
 _LIVE_PLAUSIBILITY_EVENT_MEMORY = {}
 _LIVE_PLAUSIBILITY_MAINTENANCE_DAY_BY_DIR = {}
+# Je Zielpfad: letzte Vergleichswerte, offener Spitzenkandidat und Stundenzähler.
+_LIVE_PLAUSIBILITY_SPIKE_MEMORY = {}
+# Je Zielpfad: offene Episode der Zusatzdiagnose (Detailbudget, Zähler).
+_LIVE_PLAUSIBILITY_DIAG_EPISODES = {}
+_LIVE_PLAUSIBILITY_DIAG_STATS = {
+    "errors": 0,
+    "last_error_type": None,
+    "last_error_stage": None,
+    "skipped_late": 0,
+    "skipped_suspended": 0,
+    "overruns": 0,
+    "suspended_until": 0.0,
+}
 
 # rscp_client.py liegt im selben Verzeichnis
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -89,6 +155,15 @@ try:
     from ext_inverter_modbus import ExtInverterPoller, ext_inverter_settings, live_fields as ext_inverter_live_fields
 except ImportError:  # pragma: no cover - Paketimport
     from Installer.ext_inverter_modbus import ExtInverterPoller, ext_inverter_settings, live_fields as ext_inverter_live_fields
+# Nur lesend und nur für die Glitch-Diagnose: Statusdatei des Wallbox-Managers.
+# Fehlt der Leser, bleiben die Wallboxfelder im Log leer; der Live-Dienst läuft weiter.
+try:
+    from live_snapshot import read_bound_json_value as _read_bound_json_value
+except ImportError:  # pragma: no cover - Paketimport
+    try:
+        from Installer.live_snapshot import read_bound_json_value as _read_bound_json_value
+    except ImportError:  # pragma: no cover - Diagnose ohne Wallbox-Manager-Daten
+        _read_bound_json_value = None
 
 logger = configure_service_logger(
     "E3DCLive",
@@ -1202,9 +1277,52 @@ def get_wp_pm(conn, cfg=None):
     }
 
 
+# Die Zeitmessung ist reine Diagnose. Sie wirft nie; ein Fehler darin lässt nur
+# die Akquisezeiten weg, der Messwert-Snapshot bleibt vollständig.
+def _snapshot_clock():
+    try:
+        return float(time.monotonic())
+    except Exception:
+        return None
+
+
+def _snapshot_request_timing(request_started_s):
+    try:
+        return (float(time.monotonic()) - float(request_started_s), float(time.time()))
+    except Exception:
+        return (None, None)
+
+
+def _power_snapshot_timing(started_s, request_timing, joint_attempts, pm_joint):
+    """Akquisezeiten der gemeinsamen EMS+PM-Anfrage, nur für die Zusatzdiagnose."""
+    request_s, observed_at_s = request_timing
+    finished_s = _snapshot_clock()
+    return {
+        "request_s": round(request_s, 4) if request_s is not None else None,
+        "total_s": (
+            round(max(0.0, finished_s - started_s), 4)
+            if finished_s is not None and started_s is not None
+            else None
+        ),
+        "joint_attempts": int(joint_attempts),
+        "pm_joint": bool(pm_joint),
+        "observed_at_s": round(observed_at_s, 3) if observed_at_s is not None else None,
+    }
+
+
+def _attach_power_snapshot_timing(data, started_s, request_timing, joint_attempts, pm_joint):
+    try:
+        data[POWER_SNAPSHOT_TIMING_KEY] = _power_snapshot_timing(started_s, request_timing, joint_attempts, pm_joint)
+    except Exception:
+        data.pop(POWER_SNAPSHOT_TIMING_KEY, None)
+    return data
+
+
 def get_power_snapshot(conn, cfg=None):
     """Liest EMS-Liveleistungen und Wurzelzählerphasen möglichst in einer RSCP-Anfrage."""
     print("  -> EMS Live-Leistungen + PM Netzphasen ...")
+    started_s = _snapshot_clock()
+    joint_attempts = 0
     raw_configured_index, configured_index, candidates = _pm_candidates(cfg)
     if raw_configured_index > 65535:
         print(
@@ -1212,24 +1330,32 @@ def get_power_snapshot(conn, cfg=None):
             f"nutze Auto-Suche 0..{PM_AUTO_PROBE_LAST_INDEX}."
         )
     last_response = None
+    last_timing = (None, None)
     best_pm = {}
     best_response = None
+    best_timing = (None, None)
     for idx in candidates:
+        joint_attempts += 1
+        request_started_s = _snapshot_clock()
         try:
             resp = conn.request(_ems_live_request_items() + [_pm_request_item(idx)])
         except Exception as exc:
             print(f"     Gemeinsamer Snapshot PM-Index {idx} fehlgeschlagen: {exc}")
             continue
+        request_timing = _snapshot_request_timing(request_started_s)
         last_response = resp
+        last_timing = request_timing
         pm = _decode_pm_response(resp, idx, configured_index)
         if pm:
             best_pm = pm
             best_response = resp
+            best_timing = request_timing
         if pm and (pm["grid_pm_available"] or idx == candidates[-1]):
             data = _decode_ems_live_response(resp)
             _print_pm_summary(pm)
             data.update(pm)
             data["power_snapshot_source"] = "joint_ems_pm"
+            _attach_power_snapshot_timing(data, started_s, request_timing, joint_attempts, True)
             return data
 
     if best_pm and best_response is not None:
@@ -1237,6 +1363,7 @@ def get_power_snapshot(conn, cfg=None):
         _print_pm_summary(best_pm)
         data.update(best_pm)
         data["power_snapshot_source"] = "joint_ems_pm_unavailable"
+        _attach_power_snapshot_timing(data, started_s, best_timing, joint_attempts, True)
         return data
 
     if last_response is not None:
@@ -1248,11 +1375,13 @@ def get_power_snapshot(conn, cfg=None):
             pm = {}
         data.update(pm)
         data["power_snapshot_source"] = "joint_ems_separate_pm" if pm else "joint_ems_only"
+        _attach_power_snapshot_timing(data, started_s, last_timing, joint_attempts, False)
         return data
 
     data = get_ems_live(conn)
     data.update(get_pm(conn, cfg))
     data["power_snapshot_source"] = "fallback_separate"
+    _attach_power_snapshot_timing(data, started_s, (None, None), joint_attempts, False)
     return data
 
 
@@ -1743,7 +1872,7 @@ def _finite_float(value, default=0.0):
 def _finite_optional_float(value):
     try:
         result = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if not math.isfinite(result):
         return None
@@ -2333,6 +2462,385 @@ def compact_live_plausibility_frame(clean):
     }
 
 
+# ---------------------------------------------------------------------------
+# Zusatzdiagnose für das Glitch-Log (nur lesend, regelungsneutral)
+# ---------------------------------------------------------------------------
+
+_PLAUSIBILITY_EXT_REASON_CODES = frozenset({
+    "disabled", "unknown_type", "invalid_ip", "invalid_port", "invalid_unit_id", "invalid_poll_s", "no_sample_yet",
+})
+_PLAUSIBILITY_E3DC_WB_REASON_CODES = frozenset({"missing", "stale", "wrong_type", "wrong_length"})
+_PLAUSIBILITY_WB_PHASE_KEYS = ("phase_power_l1_w", "phase_power_l2_w", "phase_power_l3_w")
+# Rücklesung der Box (openWB Pro bzw. openWB-Serie).
+_PLAUSIBILITY_WB_OFFER_READBACK_KEYS = ("offered_current_raw", "evse_current")
+# Vom Wallbox-Manager geführtes Angebot je Treibervertrag.
+_PLAUSIBILITY_WB_SESSION_OFFER_KEYS = (
+    "openwb_pro_session_offered_amp",
+    "openwb_secondary_session_offered_amp",
+    "goe_session_offered_amp",
+    "e3dc_session_offered_amp",
+)
+
+
+def _plausibility_number(value, digits=1):
+    """Endliche Zahl gerundet, sonst None; Wahrheitswerte zählen nicht als Messwert."""
+    if isinstance(value, bool):
+        return None
+    number = _finite_optional_float(value)
+    return round(number, digits) if number is not None else None
+
+
+def _plausibility_flag(value):
+    return value if isinstance(value, bool) else None
+
+
+def _plausibility_offset_s(observed_at_s, snapshot_at_s):
+    if observed_at_s is None or snapshot_at_s is None:
+        return None
+    return round(observed_at_s - snapshot_at_s, 3)
+
+
+# Nicht vorhandene oder nicht konfigurierte Quellen stehen nur mit ihrem Grund im Log;
+# sonst sind fehlende Werte null, nie 0. "reason" ist immer gesetzt ("ok" = gültig).
+def _plausibility_acquisition_diag(timing):
+    if not timing:
+        return {"reason": "unavailable"}
+    request_s = _plausibility_number(timing.get("request_s"), 4)
+    attempts = _plausibility_number(timing.get("joint_attempts"), 0)
+    return {
+        "request_s": request_s,
+        "total_s": _plausibility_number(timing.get("total_s"), 4),
+        "joint_attempts": int(attempts) if attempts is not None else None,
+        "pm_joint": _plausibility_flag(timing.get("pm_joint")),
+        "reason": "ok" if request_s is not None else "no_joint_request",
+    }
+
+
+def _plausibility_pvi_ac_diag(clean, snapshot_at_s):
+    """AC-Leistung des E3DC-Wechselrichters je Phase aus der bestehenden PVI-Abfrage."""
+    phase_keys = [f"ac{index}_w" for index in range(3) if f"ac{index}_w" in clean]
+    if "pvi_ac_power_valid" not in clean and not phase_keys:
+        return {"reason": "missing"}
+    phases = [_plausibility_number(clean.get(key)) for key in phase_keys]
+    valid = bool(clean.get("pvi_ac_power_valid") is True and phases and all(value is not None for value in phases))
+    return {
+        "phase_w": phases if valid else None,
+        "sum_w": _plausibility_number(clean.get("pvi_ac_power_w")) if valid else None,
+        "reason": "ok" if valid else "invalid",
+        # Die PVI-Abfrage folgt der gemeinsamen EMS+PM-Anfrage; positiv heißt später gelesen.
+        "offset_to_snapshot_s": _plausibility_offset_s(_finite_optional_float(clean.get("pvi_ac_observed_at_s")), snapshot_at_s),
+    }
+
+
+_PLAUSIBILITY_EXT_PHASE_BASIS = {
+    "phase": "u_phase_x_i",
+    "line": "u_line_div_sqrt3_x_i",
+}
+
+
+def _plausibility_ext_phase_values(clean):
+    return [_plausibility_number(clean.get(key)) for key in ("ext_pv_p1_w", "ext_pv_p2_w", "ext_pv_p3_w")]
+
+
+def _plausibility_ext_inverter_diag(clean, snapshot_at_s):
+    """Zusatzwechselrichter je Phase samt Alter; Fehlertexte und Adressen bleiben draußen."""
+    add_valid = clean.get("Ext_PV_Power_Valid") is True
+    # E3DC-eigene Messung externer Erzeugung aus derselben Anfrage wie das Netz.
+    ems_add_ext_pv_w = _plausibility_number(clean.get("Ext_PV_Power")) if add_valid else None
+    block = clean.get("ext_inverter") if isinstance(clean.get("ext_inverter"), dict) else None
+    if block is None:
+        return {"reason": "missing", "ems_add_ext_pv_w": ems_add_ext_pv_w}
+    valid = bool(clean.get("ext_pv_valid") is True and block.get("valid") is True)
+    error = str(block.get("error") or "")
+    kind = str(block.get("type") or "none")
+    kind = kind if kind.replace("_", "").isalnum() else "unknown"
+    if error in _PLAUSIBILITY_EXT_REASON_CODES and not valid:
+        return {"type": kind, "reason": error, "ems_add_ext_pv_w": ems_add_ext_pv_w}
+    return {
+        "type": kind,
+        "reason": "ok" if valid else ("stale" if error.startswith("stale_") else "read_error"),
+        # Phasenwerte sind Näherungen aus Spannung × Strom ohne Leistungsfaktor, keine
+        # gemessene Wirkleistung; die Basis steht daneben. ac_w ist die gemessene Summe.
+        "phase_w_approx": _plausibility_ext_phase_values(clean) if valid else None,
+        "phase_basis": _PLAUSIBILITY_EXT_PHASE_BASIS.get(str(block.get("ac_voltage_kind") or ""), "unknown"),
+        "ac_w": _plausibility_number(block.get("ac_w")) if valid else None,
+        "dc_w": _plausibility_number(clean.get("ext_pv_dc_w")) if valid else None,
+        # Das Alter bleibt auch bei veraltetem Stand sichtbar; die Werte nicht.
+        "age_s": _plausibility_number(block.get("age_s")),
+        "offset_to_snapshot_s": _plausibility_offset_s(_finite_optional_float(block.get("sample_ts")), snapshot_at_s),
+        "ems_add_ext_pv_w": ems_add_ext_pv_w,
+    }
+
+
+def _plausibility_e3dc_wallbox_diag(clean):
+    """E3DC-Wallbox (RSCP-Index 0) aus der bestehenden Abfrage dieses Zyklus."""
+    if "wb_p1" not in clean:
+        return {"reason": "missing"}
+    if clean.get("wb_status_valid") is not True:
+        reason = str(clean.get("wb_status_reason") or "")
+        return {"reason": reason if reason in _PLAUSIBILITY_E3DC_WB_REASON_CODES else "invalid"}
+    return {
+        "phase_w": [_plausibility_number(clean.get(key)) for key in ("wb_p1", "wb_p2", "wb_p3")],
+        "charging": _plausibility_flag(clean.get("wb_charging")),
+        "reason": "ok",
+    }
+
+
+def _plausibility_first_number(detail, keys):
+    for key in keys:
+        value = _plausibility_number(detail.get(key))
+        if value is not None:
+            return value, key
+    return None, None
+
+
+def _plausibility_wallbox_point_reason(detail, sample_age_s):
+    """Werte eines Ladepunkts gelten nur mit ausdrücklich gültigem, frischem Treiberstatus."""
+    if detail.get("driver_status_valid") is False:
+        return "driver_status_invalid"
+    if detail.get("driver_status_stale") is True:
+        return "driver_status_stale"
+    if detail.get("driver_status_valid") is not True:
+        return "validity_unknown"
+    if sample_age_s is None:
+        return "sample_time_missing"
+    if sample_age_s < -LIVE_PLAUSIBILITY_CLOCK_TOLERANCE_S:
+        return "sample_time_in_future"
+    if sample_age_s > LIVE_PLAUSIBILITY_WALLBOX_STATUS_MAX_AGE_S:
+        return "sample_stale"
+    return "ok"
+
+
+def _plausibility_wallbox_point_diag(detail, now_s):
+    """Ein Ladepunkt aus wallbox_native.json; nur Messwerte, keine Kennungen."""
+    try:
+        point_id = int(float(detail.get("id")))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not 1 <= point_id <= 8:
+        return None
+    sample_ts = _finite_optional_float(detail.get("driver_status_last_sample_ts"))
+    sample_age_s = round(now_s - sample_ts, 1) if sample_ts is not None else None
+    reason = _plausibility_wallbox_point_reason(detail, sample_age_s)
+    point = {
+        "id": point_id,
+        "reason": reason,
+        "sample_age_s": sample_age_s,
+        "plug": None,
+        "charging": None,
+        "phase_w": None,
+        "phase_reason": reason,
+        "phase_power_verified": None,
+        "phases_in_use": None,
+        "charge_power_w": None,
+        # Rücklesung der Box, wie der Treiber sie gemeldet hat.
+        "readback_offered_a": None,
+        "readback_offered_source": None,
+        # Vom Wallbox-Manager geführtes Angebot; kein Rücklesewert der Box.
+        "manager_offer_a": None,
+        "manager_offer_source": None,
+        "held_previous": None,
+    }
+    if reason != "ok":
+        return point
+    phases = [_plausibility_number(detail.get(key)) for key in _PLAUSIBILITY_WB_PHASE_KEYS]
+    phase_w = phases if all(value is not None for value in phases) else None
+    readback_a, readback_source = _plausibility_first_number(detail, _PLAUSIBILITY_WB_OFFER_READBACK_KEYS)
+    manager_a, manager_source = _plausibility_first_number(detail, _PLAUSIBILITY_WB_SESSION_OFFER_KEYS)
+    phases_in_use = _plausibility_number(detail.get("phases_in_use"), 0)
+    point.update({
+        "plug": _plausibility_flag(detail.get("plug")),
+        "charging": _plausibility_flag(detail.get("charging")),
+        "phase_w": phase_w,
+        "phase_reason": "ok" if phase_w is not None else "missing",
+        "phase_power_verified": _plausibility_flag(detail.get("phase_power_verified")),
+        "phases_in_use": int(phases_in_use) if phases_in_use is not None else None,
+        "charge_power_w": _plausibility_number(detail.get("charge_power_w")),
+        "readback_offered_a": readback_a,
+        "readback_offered_source": readback_source,
+        "manager_offer_a": manager_a,
+        "manager_offer_source": manager_source,
+        # Der Treiber hält nach einem unplausiblen Einzelwert kurz die letzte Messung.
+        "held_previous": detail.get("driver_status_glitch") is True,
+    })
+    return point
+
+
+_PLAUSIBILITY_WALLBOX_FAILURE_CACHE = {}
+
+
+def _plausibility_wallbox_generation(path):
+    try:
+        info = os.stat(path, follow_symlinks=False)
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+                info.st_ctime_ns, info.st_mode, info.st_nlink)
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _plausibility_wallbox_manager_diag(path, now_s):
+    """Phasenleistung und Angebotsstrom je Ladepunkt aus der Ramdisk des Wallbox-Managers."""
+    if _read_bound_json_value is None:
+        return {"reason": "reader_unavailable", "points": None}
+    # Gleicher gebundener Leser wie der Live-Snapshot: Größen-, Alters- und Generationsprüfung,
+    # Nur unveränderte Generationen im begrenzten Cache sind Treffer. Das Objekt
+    # wird nur gelesen (copy_data=False). Fehlgeschlagene Lese-/Parseversuche
+    # werden lokal ebenfalls begrenzt gespeichert, ohne jemals Werte freizugeben.
+    generation = _plausibility_wallbox_generation(path)
+    cache_key = os.fspath(path)
+    cached = _PLAUSIBILITY_WALLBOX_FAILURE_CACHE.get(cache_key)
+    if generation is not None and cached is not None and cached[0] == generation:
+        return {"reason": cached[1], "file_age_s": None, "points": None}
+    _PLAUSIBILITY_WALLBOX_FAILURE_CACHE.pop(cache_key, None)
+    payload, metadata = _read_bound_json_value(
+        path,
+        max_age_s=LIVE_PLAUSIBILITY_WALLBOX_STATUS_MAX_AGE_S,
+        max_bytes=LIVE_PLAUSIBILITY_WALLBOX_STATUS_MAX_BYTES,
+        copy_data=False,
+    )
+    metadata = metadata if isinstance(metadata, dict) else {}
+    result = {"reason": "ok", "file_age_s": _plausibility_number(metadata.get("age_s")), "points": None}
+    if not metadata.get("valid"):
+        result["reason"] = str(metadata.get("reason") or "source_unreadable")
+        if (result["reason"] == "source_unreadable" and generation is not None
+                and generation == _plausibility_wallbox_generation(path)):
+            _PLAUSIBILITY_WALLBOX_FAILURE_CACHE[cache_key] = (generation, result["reason"])
+            while len(_PLAUSIBILITY_WALLBOX_FAILURE_CACHE) > 8:
+                _PLAUSIBILITY_WALLBOX_FAILURE_CACHE.pop(next(iter(_PLAUSIBILITY_WALLBOX_FAILURE_CACHE)))
+        return result
+    if not isinstance(payload, dict):
+        result["reason"] = "json_root_not_object"
+        return result
+    status_ts = _finite_optional_float(payload.get("ts"))
+    result["status_ts_age_s"] = round(now_s - status_ts, 1) if status_ts is not None else None
+    details = payload.get("wb_details")
+    if not isinstance(details, list):
+        result["reason"] = "wb_details_missing"
+        return result
+    points = []
+    for detail in details:
+        if len(points) >= LIVE_PLAUSIBILITY_WALLBOX_POINT_LIMIT:
+            break
+        if isinstance(detail, dict):
+            point = _plausibility_wallbox_point_diag(detail, now_s)
+            if point is not None:
+                points.append(point)
+    result["points"] = points
+    return result
+
+
+def live_plausibility_frame_diagnostics(clean, *, acquisition=None, now_s=None, wallbox_status_path=None):
+    """Zusatzdiagnose für einen protokollierten Frame (nur lesend, ohne Kennungen).
+
+    Quellen sind ausschließlich bereits vorhandene Werte: die veröffentlichten
+    Werte dieses Frames (PVI-AC je Phase, Zusatzwechselrichter, E3DC-Wallbox),
+    die Akquisezeit der gemeinsamen EMS+PM-Anfrage und die Statusdatei des
+    Wallbox-Managers. Fehlende oder veraltete Werte sind null mit Grund, nie 0.
+    """
+    clean = clean if isinstance(clean, dict) else {}
+    now = _finite_float(now_s if now_s is not None else time.time(), time.time())
+    timing = acquisition if isinstance(acquisition, dict) else {}
+    snapshot_at_s = _finite_optional_float(timing.get("observed_at_s"))
+    return {
+        "schema": LIVE_PLAUSIBILITY_FRAME_DIAG_SCHEMA,
+        "acquisition": _plausibility_acquisition_diag(timing),
+        "e3dc_inverter_ac": _plausibility_pvi_ac_diag(clean, snapshot_at_s),
+        "ext_inverter": _plausibility_ext_inverter_diag(clean, snapshot_at_s),
+        "e3dc_wallbox": _plausibility_e3dc_wallbox_diag(clean),
+        "wallbox_manager": _plausibility_wallbox_manager_diag(
+            wallbox_status_path or LIVE_PLAUSIBILITY_WALLBOX_STATUS_PATH,
+            now,
+        ),
+        "errors_total": int(_LIVE_PLAUSIBILITY_DIAG_STATS.get("errors") or 0),
+    }
+
+
+def _live_plausibility_sample(frame, clean, acquisition):
+    """Kleiner Vergleichswert je Frame für Spitzen und Episodenvorlauf."""
+    reasons = frame.get("reasons") or []
+    pvi_phase_keys = [f"ac{index}_w" for index in range(3) if f"ac{index}_w" in clean]
+    pvi = [_plausibility_number(clean.get(key)) for key in pvi_phase_keys]
+    if clean.get("pvi_ac_power_valid") is not True or not pvi or any(value is None for value in pvi):
+        pvi = None
+    ext_valid = clean.get("ext_pv_valid") is True
+    timing = acquisition if isinstance(acquisition, dict) else {}
+    return {
+        "ts": frame.get("ts"),
+        "valid": bool(frame.get("valid")),
+        "clean": bool(frame.get("valid") and not reasons),
+        "reasons": list(reasons),
+        "grid_w": frame.get("grid_w"),
+        "grid_pm_sum_w": frame.get("grid_pm_sum_w"),
+        "grid_pm_delta_w": frame.get("grid_pm_delta_w"),
+        "grid_phase_w": list(frame.get("grid_phase_w") or []),
+        "pv_w": frame.get("pv_w"),
+        "battery_w": frame.get("battery_w"),
+        "home_w": frame.get("home_w"),
+        "wallbox_w": frame.get("wallbox_w"),
+        "pvi_ac_w": pvi,
+        "ext_pv_w_approx": _plausibility_ext_phase_values(clean) if ext_valid else None,
+        "ext_pv_age_s": _plausibility_number(clean.get("ext_pv_age_s")) if ext_valid else None,
+        "acq_request_s": _plausibility_number(timing.get("request_s"), 4),
+    }
+
+
+def _live_plausibility_diag_failure(stage, exc):
+    """Zählt einen Diagnosefehler und meldet ihn gedämpft; der Live-Takt läuft weiter."""
+    stats = _LIVE_PLAUSIBILITY_DIAG_STATS
+    stats["errors"] = int(stats.get("errors") or 0) + 1
+    stats["last_error_type"] = type(exc).__name__
+    stats["last_error_stage"] = str(stage)
+    try:
+        # Nur Stufe und Fehlerklasse: Ausnahmetexte können Kennungen enthalten.
+        _live_log_limiter.failure(
+            logger,
+            "plausibility_diag",
+            "Zusatzdiagnose übersprungen (%s): %s",
+            stage,
+            type(exc).__name__,
+        )
+    except Exception:
+        pass
+    return {
+        "schema": LIVE_PLAUSIBILITY_FRAME_DIAG_SCHEMA,
+        "error": "diag_failed",
+        "stage": str(stage),
+        "error_type": type(exc).__name__,
+        "errors_total": int(stats["errors"]),
+    }
+
+
+class _LivePlausibilityFrameContext:
+    """Rechnet Diagnose und Vergleichswert eines Frames höchstens einmal und nie werfend."""
+
+    def __init__(self, clean, frame, *, acquisition=None, now_s=None, wallbox_status_path=None):
+        self.clean = clean
+        self.frame = frame
+        self.acquisition = acquisition if isinstance(acquisition, dict) else None
+        self.now_s = now_s
+        self.wallbox_status_path = wallbox_status_path
+        self._diag = None
+        self._sample = None
+
+    def diag(self):
+        if self._diag is None:
+            try:
+                self._diag = live_plausibility_frame_diagnostics(
+                    self.clean,
+                    acquisition=self.acquisition,
+                    now_s=self.now_s,
+                    wallbox_status_path=self.wallbox_status_path,
+                )
+            except Exception as exc:
+                self._diag = _live_plausibility_diag_failure("frame_diag", exc)
+        return self._diag
+
+    def sample(self):
+        if self._sample is None:
+            self._sample = _live_plausibility_sample(self.frame, self.clean, self.acquisition)
+        return self._sample
+
+
 def _atomic_write_json(path, payload):
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
@@ -2449,9 +2957,9 @@ def _fsync_directory(path):
             os.close(directory_fd)
 
 
-def _closed_plausibility_log_paths(log_dir, current_log_path):
+def _closed_plausibility_log_paths(log_dir, current_log_path, log_prefix=LIVE_PLAUSIBILITY_LOG_PREFIX):
     current_name = os.path.basename(current_log_path)
-    prefix = f"{LIVE_PLAUSIBILITY_LOG_PREFIX}_"
+    prefix = f"{log_prefix}_"
     try:
         names = sorted(os.listdir(log_dir))
     except OSError:
@@ -2472,6 +2980,7 @@ def _cleanup_old_plausibility_gzip_logs(
     *,
     now_s=None,
     retention_days=LIVE_PLAUSIBILITY_LOG_RETENTION_DAYS,
+    log_prefix=LIVE_PLAUSIBILITY_LOG_PREFIX,
 ):
     """Löscht nur abgeschlossene Gzip-Tageslogs außerhalb der Feldretention."""
 
@@ -2479,7 +2988,7 @@ def _cleanup_old_plausibility_gzip_logs(
     current_day = time.strftime("%Y%m%d", time.localtime(now_s))
     current_day_start = time.mktime(time.strptime(current_day, "%Y%m%d"))
     cutoff_day_start = current_day_start - max(2, int(retention_days)) * 86400
-    prefix = f"{LIVE_PLAUSIBILITY_LOG_PREFIX}_"
+    prefix = f"{log_prefix}_"
     suffix = ".jsonl.gz"
     removed = []
     try:
@@ -2512,11 +3021,11 @@ def _cleanup_old_plausibility_gzip_logs(
     return removed
 
 
-def _compress_closed_plausibility_logs(log_dir, current_log_path):
+def _compress_closed_plausibility_logs(log_dir, current_log_path, log_prefix=LIVE_PLAUSIBILITY_LOG_PREFIX):
     """Komprimiert abgeschlossene Tageslogs hashgeprüft und stromausfallsicher."""
 
     compressed = []
-    source_paths = _closed_plausibility_log_paths(log_dir, current_log_path)
+    source_paths = _closed_plausibility_log_paths(log_dir, current_log_path, log_prefix)
     if source_paths is None:
         return compressed
     for source_path in source_paths:
@@ -2603,7 +3112,7 @@ def _compress_closed_plausibility_logs(log_dir, current_log_path):
     return compressed
 
 
-def _maybe_compress_closed_plausibility_logs(log_path, now_s=None):
+def _maybe_compress_closed_plausibility_logs(log_path, now_s=None, log_prefix=LIVE_PLAUSIBILITY_LOG_PREFIX):
     log_dir = os.path.dirname(log_path)
     current_name = os.path.basename(log_path)
     now_s = time.time() if now_s is None else float(now_s)
@@ -2611,7 +3120,10 @@ def _maybe_compress_closed_plausibility_logs(log_path, now_s=None):
         "%Y-%m-%d",
         time.localtime(now_s),
     )
-    maintenance = _LIVE_PLAUSIBILITY_MAINTENANCE_DAY_BY_DIR.get(log_dir)
+    # Die Diagnosedatei führt ihren Wartungsstand getrennt, damit sich beide Tagesdateien
+    # im selben Verzeichnis nicht gegenseitig als geänderten Tagespfad werten.
+    maintenance_key = log_dir if log_prefix == LIVE_PLAUSIBILITY_LOG_PREFIX else (log_dir, log_prefix)
+    maintenance = _LIVE_PLAUSIBILITY_MAINTENANCE_DAY_BY_DIR.get(maintenance_key)
     if isinstance(maintenance, str):
         maintenance = {
             "day": maintenance,
@@ -2631,16 +3143,19 @@ def _maybe_compress_closed_plausibility_logs(log_path, now_s=None):
             < LIVE_PLAUSIBILITY_LOG_MAINTENANCE_RETRY_S
         ):
             return []
-    result = _compress_closed_plausibility_logs(log_dir, log_path)
-    remaining = _closed_plausibility_log_paths(log_dir, log_path)
+    if log_prefix == LIVE_PLAUSIBILITY_LOG_PREFIX:
+        result = _compress_closed_plausibility_logs(log_dir, log_path)
+    else:
+        result = _compress_closed_plausibility_logs(log_dir, log_path, log_prefix)
+    remaining = _closed_plausibility_log_paths(log_dir, log_path, log_prefix)
     complete = remaining == []
-    _LIVE_PLAUSIBILITY_MAINTENANCE_DAY_BY_DIR[log_dir] = {
+    _LIVE_PLAUSIBILITY_MAINTENANCE_DAY_BY_DIR[maintenance_key] = {
         "day": maintenance_day,
         "current_name": current_name,
         "last_attempt_ts": now_s,
         "complete": complete,
     }
-    _cleanup_old_plausibility_gzip_logs(log_dir, now_s=now_s)
+    _cleanup_old_plausibility_gzip_logs(log_dir, now_s=now_s, log_prefix=log_prefix)
     return result
 
 
@@ -2805,6 +3320,7 @@ def flush_live_plausibility_event_states(now_s=None):
         if event is not None:
             closed.append(event)
             _LIVE_PLAUSIBILITY_EVENT_MEMORY.pop(last_valid_path, None)
+    _flush_live_plausibility_diagnostics(now_s)
     return closed
 
 
@@ -2814,14 +3330,50 @@ def record_live_plausibility_state(
     last_valid_path=LIVE_LAST_VALID_PATH,
     log_path=None,
     now_s=None,
+    acquisition=None,
+    wallbox_status_path=None,
+    diag_log_path=None,
+    diag_allowed=True,
+    diag_deadline_s=None,
 ):
-    """Speichert kompakte Live-Daten-Diagnosen, ohne Regelwerte zu verändern."""
+    """Speichert kompakte Live-Daten-Diagnosen, ohne Regelwerte zu verändern.
+
+    Das Glitch-Log selbst ist unverändert. Danach läuft die Zusatzdiagnose; sie
+    schreibt nur in ihre eigene Tagesdatei, liest nur und wirft nie.
+    """
     if not isinstance(clean, dict):
         return None
     frame = compact_live_plausibility_frame(clean)
     if not frame:
         return None
     now_s = time.time() if now_s is None else float(now_s)
+    diagnostics = None
+    try:
+        result = _record_live_plausibility_frame(
+            frame,
+            last_valid_path=last_valid_path,
+            log_path=log_path,
+            now_s=now_s,
+        )
+    finally:
+        diagnostics = _run_live_plausibility_diagnostics(
+            clean,
+            frame,
+            last_valid_path=last_valid_path,
+            log_path=log_path,
+            diag_log_path=diag_log_path,
+            now_s=now_s,
+            acquisition=acquisition,
+            wallbox_status_path=wallbox_status_path,
+            allowed=diag_allowed,
+            deadline_s=diag_deadline_s,
+        )
+    if diagnostics and isinstance(result, dict):
+        result["diagnostics"] = diagnostics
+    return result
+
+
+def _record_live_plausibility_frame(frame, *, last_valid_path, log_path, now_s):
     reasons = frame.get("reasons") or []
     if frame.get("valid") and not reasons:
         _LIVE_LAST_VALID_MEMORY[last_valid_path] = frame
@@ -2952,6 +3504,561 @@ def record_live_plausibility_state(
     if previous_close is not None:
         result["previous_close"] = previous_close
     return result
+
+
+# ---------------------------------------------------------------------------
+# Zusatzdiagnose: eigene Tagesdatei, Episodenframes und gültige Spitzen
+# ---------------------------------------------------------------------------
+
+def _plausibility_spike_rule():
+    return {
+        "signal": "Grid_Power",
+        "frames": "three_consecutive_valid_without_reasons",
+        "min_height_w": int(LIVE_PLAUSIBILITY_SPIKE_MIN_HEIGHT_W),
+        "neighbor_tolerance_w": int(LIVE_PLAUSIBILITY_SPIKE_NEIGHBOR_TOLERANCE_W),
+        "max_frame_gap_s": int(LIVE_PLAUSIBILITY_SPIKE_MAX_FRAME_GAP_S),
+        "detail_limit_per_hour": int(LIVE_PLAUSIBILITY_SPIKE_DETAIL_LIMIT_PER_HOUR),
+    }
+
+
+def _plausibility_spike_candidate(previous, sample):
+    """Notwendige Vorbedingung ohne Nachframe: sonst kann keine Spitze entstehen.
+
+    Aus |Nachbarabstand| < Toleranz und |Höhe| > Mindesthöhe folgt
+    |Spitze - Vorframe| > Mindesthöhe - Toleranz/2.
+    """
+    if not (isinstance(previous, dict) and isinstance(sample, dict)):
+        return False
+    if not (previous.get("clean") and sample.get("clean")):
+        return False
+    grid_before = _plausibility_number(previous.get("grid_w"))
+    grid_spike = _plausibility_number(sample.get("grid_w"))
+    ts_before = _finite_optional_float(previous.get("ts"))
+    ts_spike = _finite_optional_float(sample.get("ts"))
+    if None in (grid_before, grid_spike, ts_before, ts_spike):
+        return False
+    if not 0.0 < ts_spike - ts_before <= LIVE_PLAUSIBILITY_SPIKE_MAX_FRAME_GAP_S:
+        return False
+    return abs(grid_spike - grid_before) > (
+        LIVE_PLAUSIBILITY_SPIKE_MIN_HEIGHT_W - LIVE_PLAUSIBILITY_SPIKE_NEIGHBOR_TOLERANCE_W / 2.0
+    )
+
+
+def _plausibility_spike_offsets(previous, sample, following, key):
+    """Abweichung des Spitzenframes vom Mittel der Nachbarn, elementweise."""
+    series = [item.get(key) for item in (previous, sample, following)]
+    if not all(isinstance(values, list) and values for values in series):
+        return None
+    width = len(series[0])
+    if any(len(values) != width for values in series):
+        return None
+    numbers = [[_plausibility_number(value) for value in values] for values in series]
+    if any(value is None for values in numbers for value in values):
+        return None
+    return [
+        round(numbers[1][index] - (numbers[0][index] + numbers[2][index]) / 2.0, 1)
+        for index in range(width)
+    ]
+
+
+def _plausibility_spike_phase_form(offsets):
+    """Dreiphasig-symmetrisch: gleiches Vorzeichen auf allen Phasen und kleinste/größte Abweichung > 0,6."""
+    if not offsets or len(offsets) != 3:
+        return None
+    same_sign = all(value > 0 for value in offsets) or all(value < 0 for value in offsets)
+    if same_sign and min(abs(value) for value in offsets) / max(abs(value) for value in offsets) > 0.6:
+        return "symmetric_3p"
+    return "asymmetric"
+
+
+def _plausibility_spike_evidence(previous, sample, following):
+    """Bestätigt eine gültige Einzelframe-Spitze mit dem Nachframe oder liefert None."""
+    if not _plausibility_spike_candidate(previous, sample):
+        return None
+    if not (isinstance(following, dict) and following.get("clean")):
+        return None
+    grid_before = _plausibility_number(previous.get("grid_w"))
+    grid_spike = _plausibility_number(sample.get("grid_w"))
+    grid_after = _plausibility_number(following.get("grid_w"))
+    ts_before = _finite_optional_float(previous.get("ts"))
+    ts_spike = _finite_optional_float(sample.get("ts"))
+    ts_after = _finite_optional_float(following.get("ts"))
+    if grid_after is None or ts_after is None:
+        return None
+    if not 0.0 < ts_after - ts_spike <= LIVE_PLAUSIBILITY_SPIKE_MAX_FRAME_GAP_S:
+        return None
+    neighbor_delta_w = grid_after - grid_before
+    if abs(neighbor_delta_w) >= LIVE_PLAUSIBILITY_SPIKE_NEIGHBOR_TOLERANCE_W:
+        return None
+    height_w = grid_spike - (grid_before + grid_after) / 2.0
+    if abs(height_w) <= LIVE_PLAUSIBILITY_SPIKE_MIN_HEIGHT_W:
+        return None
+    pm_values = [_plausibility_number(item.get("grid_pm_sum_w")) for item in (previous, sample, following)]
+    phase_offsets = _plausibility_spike_offsets(previous, sample, following, "grid_phase_w")
+    return {
+        "height_w": round(height_w, 1),
+        # Netz > 0 ist Bezug: positiv heißt, der Frame lag Richtung Bezug.
+        "direction": "towards_import" if height_w > 0 else "towards_export",
+        "neighbor_delta_w": round(neighbor_delta_w, 1),
+        "dt_prev_s": round(ts_spike - ts_before, 1),
+        "dt_next_s": round(ts_after - ts_spike, 1),
+        "pm_height_w": (
+            round(pm_values[1] - (pm_values[0] + pm_values[2]) / 2.0, 1)
+            if None not in pm_values
+            else None
+        ),
+        "phase_offsets_w": phase_offsets,
+        "phase_form": _plausibility_spike_phase_form(phase_offsets),
+        "pvi_ac_offsets_w": _plausibility_spike_offsets(previous, sample, following, "pvi_ac_w"),
+        "ext_pv_offsets_w_approx": _plausibility_spike_offsets(previous, sample, following, "ext_pv_w_approx"),
+    }
+
+
+def _plausibility_spike_hour_key(ts):
+    return time.strftime("%Y%m%d%H", time.localtime(float(ts)))
+
+
+def _daily_plausibility_diag_log_path(now_s=None, log_dir=LIVE_PLAUSIBILITY_LOG_DIR):
+    now_s = time.time() if now_s is None else float(now_s)
+    day = time.strftime("%Y%m%d", time.localtime(now_s))
+    return os.path.join(log_dir, f"{LIVE_PLAUSIBILITY_DIAG_LOG_PREFIX}_{day}.jsonl")
+
+
+def _plausibility_diag_log_path(log_path, diag_log_path, now_s):
+    """Diagnosedatei neben einem vorgegebenen Glitch-Log, sonst die Tagesdatei zu now_s."""
+    if diag_log_path:
+        return diag_log_path
+    if log_path:
+        directory, name = os.path.split(log_path)
+        glitch_prefix = f"{LIVE_PLAUSIBILITY_LOG_PREFIX}_"
+        suffix = name[len(glitch_prefix):] if name.startswith(glitch_prefix) else name
+        return os.path.join(directory, f"{LIVE_PLAUSIBILITY_DIAG_LOG_PREFIX}_{suffix}")
+    return _daily_plausibility_diag_log_path(now_s)
+
+
+def _append_plausibility_diag_record(path, record, *, now_s):
+    """Schreibt in die eigene Tagesdatei: gleiche Wartung wie das Glitch-Log, eigenes Größenbudget.
+
+    Das Budget kürzt wie beim Glitch-Log auf die jüngsten Sätze; ein einzelner Satz
+    über der Grenze bliebe stehen, Diagnosesätze sind aber nur wenige KB groß.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _maybe_compress_closed_plausibility_logs(
+        path,
+        now_s=now_s,
+        log_prefix=LIVE_PLAUSIBILITY_DIAG_LOG_PREFIX,
+    )
+    existed = os.path.exists(path)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                sanitize_for_json(record),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+        )
+    if not existed:
+        try:
+            os.chmod(path, 0o664)
+        except Exception:
+            pass
+    _trim_jsonl_tail(
+        path,
+        max_records=LIVE_PLAUSIBILITY_DIAG_LOG_MAX_RECORDS,
+        max_bytes=LIVE_PLAUSIBILITY_DIAG_LOG_MAX_BYTES,
+        target_bytes=LIVE_PLAUSIBILITY_DIAG_LOG_TARGET_BYTES,
+    )
+
+
+def _plausibility_diag_record(record_kind, now_s, **fields):
+    return {
+        "ts": int(now_s),
+        "iso_ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now_s)),
+        "schema_version": LIVE_PLAUSIBILITY_DIAG_RECORD_SCHEMA,
+        "record_kind": record_kind,
+        **fields,
+    }
+
+
+def _close_plausibility_spike_hour(memory, *, now_s, diag_path=None):
+    """Schreibt die Stundensumme, sobald eine Stunde mit Spitzen endet.
+
+    Sie steht in der Datei des Tages, an dem sie geschrieben wird; die Summe der
+    letzten Stunde eines Tages also in der Datei des Folgetags. Zugeordnet wird
+    über hour_start_ts.
+    """
+    hour = memory.get("hour")
+    memory["hour"] = None
+    if not isinstance(hour, dict) or int(hour.get("detected") or 0) <= 0:
+        return None
+    try:
+        hour_start_ts = int(time.mktime(time.strptime(str(hour.get("key")), "%Y%m%d%H")))
+    except (OverflowError, TypeError, ValueError):
+        hour_start_ts = None
+    detected = int(hour.get("detected") or 0)
+    logged = int(hour.get("logged") or 0)
+    record = _plausibility_diag_record(
+        "valid_spike_hour_summary",
+        now_s,
+        hour_start_ts=hour_start_ts,
+    )
+    record.update({
+        "iso_hour": (
+            time.strftime("%Y-%m-%dT%H:00:00%z", time.localtime(hour_start_ts))
+            if hour_start_ts is not None
+            else None
+        ),
+        "detected": detected,
+        "logged": logged,
+        "suppressed": max(0, detected - logged),
+        "towards_import": int(hour.get("towards_import") or 0),
+        "towards_export": int(hour.get("towards_export") or 0),
+        "symmetric_3p": int(hour.get("symmetric_3p") or 0),
+        "max_abs_height_w": round(float(hour.get("max_abs_height_w") or 0.0), 1),
+        "total_detected": int(memory.get("total_detected") or 0),
+        "rule": _plausibility_spike_rule(),
+    })
+    if diag_path:
+        _append_plausibility_diag_record(diag_path, record, now_s=now_s)
+    return record
+
+
+def _count_plausibility_spike(memory, candidate, following, evidence, *, diag_path, now_s):
+    """Zählt jede Spitze; Detailsätze nur bis zur Stundengrenze."""
+    sample = candidate["sample"]
+    spike_ts = _finite_optional_float(sample.get("ts"))
+    spike_ts = now_s if spike_ts is None else spike_ts
+    key = _plausibility_spike_hour_key(spike_ts)
+    hour = memory.get("hour")
+    if isinstance(hour, dict) and hour.get("key") != key:
+        _close_plausibility_spike_hour(memory, now_s=now_s, diag_path=diag_path)
+        hour = None
+    if not isinstance(hour, dict):
+        hour = {
+            "key": key,
+            "detected": 0,
+            "logged": 0,
+            "towards_import": 0,
+            "towards_export": 0,
+            "symmetric_3p": 0,
+            "max_abs_height_w": 0.0,
+        }
+        memory["hour"] = hour
+    hour["detected"] = int(hour.get("detected") or 0) + 1
+    memory["total_detected"] = int(memory.get("total_detected") or 0) + 1
+    hour[evidence["direction"]] = int(hour.get(evidence["direction"]) or 0) + 1
+    if evidence.get("phase_form") == "symmetric_3p":
+        hour["symmetric_3p"] = int(hour.get("symmetric_3p") or 0) + 1
+    hour["max_abs_height_w"] = max(float(hour.get("max_abs_height_w") or 0.0), abs(float(evidence["height_w"])))
+    if int(hour.get("logged") or 0) >= LIVE_PLAUSIBILITY_SPIKE_DETAIL_LIMIT_PER_HOUR:
+        return {"action": "valid_spike_counted", "evidence": evidence}
+    record = _plausibility_diag_record(
+        "valid_spike",
+        now_s,
+        spike_ts=sample.get("ts"),
+        spike_iso_ts=time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(spike_ts)),
+    )
+    record.update({
+        **evidence,
+        "frames": [candidate["previous"], sample, following],
+        "diag": candidate.get("diag"),
+        "counts": {
+            "hour_detected": int(hour["detected"]),
+            "hour_logged": int(hour.get("logged") or 0) + 1,
+            "total_detected": int(memory["total_detected"]),
+        },
+    })
+    _append_plausibility_diag_record(diag_path, record, now_s=now_s)
+    hour["logged"] = int(hour.get("logged") or 0) + 1
+    return {"action": "valid_spike_recorded", "evidence": evidence, "record": record}
+
+
+def _plausibility_spike_memory(last_valid_path):
+    memory = _LIVE_PLAUSIBILITY_SPIKE_MEMORY.get(last_valid_path)
+    if not isinstance(memory, dict):
+        memory = {"history": [], "candidate": None, "hour": None, "total_detected": 0}
+        _LIVE_PLAUSIBILITY_SPIKE_MEMORY[last_valid_path] = memory
+    return memory
+
+
+def _track_live_plausibility_spikes(context, *, last_valid_path, diag_path):
+    """Erkennt gültige Einzelframe-Spitzen mit einem Frame Verzögerung.
+
+    Der Live-Pfad wartet nicht auf den Nachframe: Der Kandidat wird im
+    Folgezyklus bestätigt und erst dann protokolliert.
+    """
+    memory = _plausibility_spike_memory(last_valid_path)
+    now_s = float(context.now_s)
+    sample = context.sample()
+    result = None
+    candidate = memory.get("candidate")
+    memory["candidate"] = None
+    if isinstance(candidate, dict):
+        evidence = _plausibility_spike_evidence(candidate.get("previous"), candidate.get("sample"), sample)
+        if evidence is not None:
+            result = _count_plausibility_spike(
+                memory,
+                candidate,
+                sample,
+                evidence,
+                diag_path=diag_path,
+                now_s=now_s,
+            )
+    hour = memory.get("hour")
+    if isinstance(hour, dict) and hour.get("key") != _plausibility_spike_hour_key(now_s):
+        _close_plausibility_spike_hour(memory, now_s=now_s, diag_path=diag_path)
+    history = memory.get("history") if isinstance(memory.get("history"), list) else []
+    previous = history[-1] if history else None
+    if _plausibility_spike_candidate(previous, sample):
+        memory["candidate"] = {"previous": previous, "sample": sample, "diag": context.diag()}
+    history.append(sample)
+    memory["history"] = history[-3:]
+    return result
+
+
+def _reset_plausibility_spike_tracking(last_valid_path):
+    memory = _LIVE_PLAUSIBILITY_SPIKE_MEMORY.get(last_valid_path)
+    if isinstance(memory, dict):
+        memory["candidate"] = None
+        memory["history"] = []
+
+
+def _guarded_track_live_plausibility_spikes(context, *, last_valid_path, diag_path):
+    try:
+        return _track_live_plausibility_spikes(context, last_valid_path=last_valid_path, diag_path=diag_path)
+    except Exception as exc:
+        _reset_plausibility_spike_tracking(last_valid_path)
+        _live_plausibility_diag_failure("spike", exc)
+        return None
+
+
+def _plausibility_previous_sample(last_valid_path):
+    """Vergleichswert des Vorframes; die Spitzenerkennung hängt den aktuellen Frame erst danach an."""
+    memory = _LIVE_PLAUSIBILITY_SPIKE_MEMORY.get(last_valid_path)
+    history = memory.get("history") if isinstance(memory, dict) else None
+    return history[-1] if isinstance(history, list) and history else None
+
+
+def _plausibility_episode_summary(episode, end_reason):
+    return {
+        "start_ts": episode.get("start_ts"),
+        "signature": episode.get("signature"),
+        "frames_seen": int(episode.get("seen") or 0),
+        "frames_logged": int(episode.get("logged") or 0),
+        "frames_dropped": int(episode.get("dropped") or 0),
+        "frames_skipped": int(episode.get("skipped") or 0),
+        "frame_limit": LIVE_PLAUSIBILITY_EPISODE_FRAME_LIMIT,
+        "end_reason": end_reason,
+    }
+
+
+def _write_plausibility_episode_end(episode, *, now_s, diag_path, end_reason, context=None):
+    """Abschluss einer Episode; der Erholungsframe zählt ins Detailbudget."""
+    record = _plausibility_diag_record(
+        "episode_end",
+        now_s,
+        episode=_plausibility_episode_summary(episode, end_reason),
+    )
+    if context is not None and int(episode.get("logged") or 0) < LIVE_PLAUSIBILITY_EPISODE_FRAME_LIMIT:
+        episode["logged"] = int(episode.get("logged") or 0) + 1
+        record["episode"]["frames_logged"] = int(episode["logged"])
+        record["recovery_sample"] = context.sample()
+        record["diag"] = context.diag()
+    _append_plausibility_diag_record(diag_path, record, now_s=now_s)
+    return record
+
+
+def _plausibility_episode_for_state(last_valid_path, frame, state, *, now_s, diag_path, write):
+    """Liefert die Diagnose-Episode zum Glitch-Zustand; ein neuer Zustand schließt die alte ab."""
+    episode = _LIVE_PLAUSIBILITY_DIAG_EPISODES.get(last_valid_path)
+    if isinstance(episode, dict) and episode.get("state") is state:
+        return episode, False
+    if isinstance(episode, dict) and write:
+        _write_plausibility_episode_end(episode, now_s=now_s, diag_path=diag_path, end_reason="transition")
+    episode = {
+        "state": state,
+        "start_ts": int(float(state.get("first_seen_ts") or now_s)),
+        "signature": _plausibility_signature_payload(_plausibility_event_signature(frame)),
+        "seen": 0,
+        "logged": 0,
+        "dropped": 0,
+        "skipped": 0,
+    }
+    _LIVE_PLAUSIBILITY_DIAG_EPISODES[last_valid_path] = episode
+    return episode, True
+
+
+def _track_plausibility_episode(context, *, last_valid_path, diag_path):
+    """Detailframes einer Glitch-Episode: höchstens 20 je Episode, danach nur Zählung."""
+    frame = context.frame
+    now_s = float(context.now_s)
+    if frame.get("valid") and not (frame.get("reasons") or []):
+        episode = _LIVE_PLAUSIBILITY_DIAG_EPISODES.pop(last_valid_path, None)
+        if not isinstance(episode, dict):
+            return None
+        _write_plausibility_episode_end(
+            episode,
+            now_s=now_s,
+            diag_path=diag_path,
+            end_reason="recovered",
+            context=context,
+        )
+        return {"action": "episode_end_recorded"}
+    state = _LIVE_PLAUSIBILITY_EVENT_MEMORY.get(last_valid_path)
+    if not isinstance(state, dict):
+        return None
+    episode, started = _plausibility_episode_for_state(
+        last_valid_path, frame, state, now_s=now_s, diag_path=diag_path, write=True,
+    )
+    episode["seen"] = int(episode.get("seen") or 0) + 1
+    if int(episode.get("logged") or 0) >= LIVE_PLAUSIBILITY_EPISODE_FRAME_LIMIT:
+        # Budget erschöpft: keine Diagnose mehr, auch nicht für Heartbeat-Frames.
+        episode["dropped"] = int(episode.get("dropped") or 0) + 1
+        return {"action": "episode_frame_dropped"}
+    episode["logged"] = int(episode.get("logged") or 0) + 1
+    record = _plausibility_diag_record(
+        "episode_frame",
+        now_s,
+        episode={
+            "start_ts": episode["start_ts"],
+            "index": int(episode["seen"]),
+            "signature": episode["signature"],
+        },
+        frame=frame,
+        diag=context.diag(),
+    )
+    if started:
+        record["pre_frame"] = _plausibility_previous_sample(last_valid_path)
+    _append_plausibility_diag_record(diag_path, record, now_s=now_s)
+    return {"action": "episode_frame_recorded", "index": int(episode["seen"])}
+
+
+def _skip_live_plausibility_diagnostics(frame, *, last_valid_path, now_s):
+    """Ausgelassener Zyklus: nur Zähler im Speicher, keine Datei und keine Diagnose."""
+    _reset_plausibility_spike_tracking(last_valid_path)
+    if frame.get("valid") and not (frame.get("reasons") or []):
+        _LIVE_PLAUSIBILITY_DIAG_EPISODES.pop(last_valid_path, None)
+        return
+    state = _LIVE_PLAUSIBILITY_EVENT_MEMORY.get(last_valid_path)
+    if isinstance(state, dict):
+        episode, _started = _plausibility_episode_for_state(
+            last_valid_path, frame, state, now_s=now_s, diag_path=None, write=False,
+        )
+        episode["seen"] = int(episode.get("seen") or 0) + 1
+        episode["skipped"] = int(episode.get("skipped") or 0) + 1
+
+
+def _run_live_plausibility_diagnostics(
+    clean,
+    frame,
+    *,
+    last_valid_path,
+    log_path,
+    diag_log_path,
+    now_s,
+    acquisition,
+    wallbox_status_path,
+    allowed,
+    deadline_s=None,
+):
+    """Synchrone Best-effort-Diagnose; Pause nach Überziehung, keine harte Frist."""
+    stats = _LIVE_PLAUSIBILITY_DIAG_STATS
+    try:
+        started_s = _snapshot_clock()
+        if deadline_s is not None:
+            deadline = _finite_optional_float(deadline_s)
+            allowed = bool(allowed and started_s is not None and deadline is not None
+                           and deadline - started_s >= LIVE_PLAUSIBILITY_DIAG_MIN_SLACK_S)
+        suspended = bool(
+            started_s is not None
+            and started_s < float(stats.get("suspended_until") or 0.0)
+        )
+        if suspended or not allowed:
+            key = "skipped_suspended" if suspended else "skipped_late"
+            stats[key] = int(stats.get(key) or 0) + 1
+            _skip_live_plausibility_diagnostics(frame, last_valid_path=last_valid_path, now_s=now_s)
+            return {"action": "diagnostics_skipped", "reason": key}
+        diag_path = _plausibility_diag_log_path(log_path, diag_log_path, now_s)
+        context = _LivePlausibilityFrameContext(
+            clean,
+            frame,
+            acquisition=acquisition,
+            now_s=now_s,
+            wallbox_status_path=wallbox_status_path,
+        )
+        outcome = {"diag_path": diag_path}
+        try:
+            episode = _track_plausibility_episode(context, last_valid_path=last_valid_path, diag_path=diag_path)
+        except Exception as exc:
+            _LIVE_PLAUSIBILITY_DIAG_EPISODES.pop(last_valid_path, None)
+            _live_plausibility_diag_failure("episode", exc)
+            episode = None
+        if episode is not None:
+            outcome["episode"] = episode
+        # Für den Abschluss beim Dienstende: Pfad wird dann zum Schlusszeitpunkt bestimmt.
+        path_args = (log_path, diag_log_path)
+        open_episode = _LIVE_PLAUSIBILITY_DIAG_EPISODES.get(last_valid_path)
+        if isinstance(open_episode, dict):
+            open_episode["path_args"] = path_args
+        _plausibility_spike_memory(last_valid_path)["path_args"] = path_args
+        # Nach der Episode: der Vorframe der Episode ist der letzte Eintrag der Spitzenhistorie.
+        spike = _guarded_track_live_plausibility_spikes(context, last_valid_path=last_valid_path, diag_path=diag_path)
+        if spike is not None:
+            outcome["valid_spike"] = spike
+        finished_s = _snapshot_clock()
+        if (
+            started_s is not None
+            and finished_s is not None
+            and finished_s - started_s > LIVE_PLAUSIBILITY_DIAG_BUDGET_S
+        ):
+            stats["overruns"] = int(stats.get("overruns") or 0) + 1
+            stats["suspended_until"] = finished_s + LIVE_PLAUSIBILITY_DIAG_SUSPEND_S
+            outcome["overrun_s"] = round(finished_s - started_s, 3)
+            try:
+                _live_log_limiter.failure(
+                    logger,
+                    "plausibility_diag_budget",
+                    "Zusatzdiagnose brauchte %.2f s; sie pausiert %.0f s",
+                    finished_s - started_s,
+                    LIVE_PLAUSIBILITY_DIAG_SUSPEND_S,
+                )
+            except Exception:
+                pass
+        return outcome
+    except Exception as exc:
+        _live_plausibility_diag_failure("diagnostics", exc)
+        return None
+
+
+def _plausibility_flush_path(holder, now_s):
+    log_path, diag_log_path = holder.get("path_args") or (None, None)
+    return _plausibility_diag_log_path(log_path, diag_log_path, now_s)
+
+
+def _flush_live_plausibility_diagnostics(now_s):
+    """Beim sauberen Dienstende: offene Episoden und Stundensummen abschließen."""
+    for last_valid_path, episode in list(_LIVE_PLAUSIBILITY_DIAG_EPISODES.items()):
+        _LIVE_PLAUSIBILITY_DIAG_EPISODES.pop(last_valid_path, None)
+        try:
+            _write_plausibility_episode_end(
+                episode,
+                now_s=now_s,
+                diag_path=_plausibility_flush_path(episode, now_s),
+                end_reason="shutdown",
+            )
+        except Exception as exc:
+            _live_plausibility_diag_failure("episode_flush", exc)
+    for memory in list(_LIVE_PLAUSIBILITY_SPIKE_MEMORY.values()):
+        if not isinstance(memory, dict):
+            continue
+        memory["candidate"] = None
+        try:
+            _close_plausibility_spike_hour(memory, now_s=now_s, diag_path=_plausibility_flush_path(memory, now_s))
+        except Exception as exc:
+            _live_plausibility_diag_failure("spike_flush", exc)
+
 
 # ---------------------------------------------------------------------------
 # Haupt-Schleife (Daemon + Einzel-Test)
@@ -3246,13 +4353,6 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=3, write=False
         clean["External_PV_Topology_Source"] = str(topology.get("source") or "none")
         clean["External_PV_Topology_Evidence_State"] = str(topology.get("evidence_state") or "invalid")
         clean["External_PV_Topology_Reason"] = str(topology.get("reason") or "")
-        try:
-            record_live_plausibility_state(clean)
-        except Exception as diag_exc:
-            if daemon_quiet:
-                _live_log_limiter.failure(logger, "plausibility_write", "Plausibilitätsdiagnose konnte nicht geschrieben werden: %s", diag_exc)
-            else:
-                print(f"  [Plausibilität] Diagnose schreiben fehlgeschlagen: {diag_exc}")
 
         if daemon_quiet:
             logger.info("RSCP-Live: Abruf %.2fs, %d Felder, %d Fehler", elapsed, len(clean), len(errors))
@@ -3298,6 +4398,22 @@ def run_test(host, port, user, pw, aes_pw, cfg, loops=1, interval=3, write=False
         else:
             print("--- JSON-Ausgabe (würde in live_data_py.json geschrieben) ---")
             print(json.dumps(clean, indent=2, ensure_ascii=False, allow_nan=False))
+
+        # Glitch-Log erst nach dem Live-Schreiben; es liest clean nur. Die
+        # Zusatzdiagnose läuft nur, wenn bis zur nächsten Akquise genug Zeit bleibt.
+        try:
+            diag_slack_s = interval - (time.monotonic() - t_start)
+            record_live_plausibility_state(
+                clean,
+                acquisition=data.get(POWER_SNAPSHOT_TIMING_KEY),
+                diag_allowed=diag_slack_s >= LIVE_PLAUSIBILITY_DIAG_MIN_SLACK_S,
+                diag_deadline_s=t_start + interval,
+            )
+        except Exception as diag_exc:
+            if daemon_quiet:
+                _live_log_limiter.failure(logger, "plausibility_write", "Plausibilitätsdiagnose konnte nicht geschrieben werden: %s", diag_exc)
+            else:
+                print(f"  [Plausibilität] Diagnose schreiben fehlgeschlagen: {diag_exc}")
 
 
         # Letzte Wartezeit vor dem nächsten Durchlauf

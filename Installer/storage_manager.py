@@ -8220,6 +8220,51 @@ HARD_GRID_OWNER_PREFIXES = (
 HARD_IDLE_OWNER_PREFIXES = ("emergency_power",)
 
 
+def heatpump_pv_output_binding_valid(
+    decision: Dict[str, Any], *, sample_now_s: Optional[float] = None,
+) -> bool:
+    """Erkennt nur den aktuellen, an die Speicherzusage gebundenen WP-Ausgang."""
+    if decision.get("state") != "heatpump_pv_source_bound":
+        return False
+    budget = decision.get("budget")
+    contract = budget.get("consumer_budget_contract") if isinstance(budget, dict) else None
+    if not isinstance(contract, dict):
+        return False
+    grant = contract.get("heatpump_pv_contract")
+    source = contract.get("heatpump_pv_source")
+    if not isinstance(grant, dict) or not isinstance(source, dict):
+        return False
+    state = heatpump_pv_policy.validate_heatpump_pv_state(grant.get("state"))
+    sample_ts = _consumer_runtime_finite(source.get("sample_ts"))
+    decision_ts = _consumer_runtime_finite(
+        sample_now_s if sample_now_s is not None else decision.get("ts"))
+    val = decision.get("val")
+    cap = decision.get("house_heatpump_discharge_cap_w")
+    max_discharge_w = _consumer_runtime_finite(decision.get("max_discharge_w"))
+    return bool(
+        decision.get("state") == "heatpump_pv_source_bound"
+        and decision.get("protected") is True
+        and decision.get("heatpump_pv_set_power_only") is True
+        and isinstance(decision.get("heatpump_pv_bridge_fallback"), dict)
+        and not decision.get("safety_veto") and not decision.get("suppress_rscp_output")
+        and not decision.get("hard_mode_guard_errors")
+        and not decision.get("auto_limit")
+        and type(val) is int and val >= 0
+        and type(cap) is int and val == cap
+        and max_discharge_w is not None and val <= max_discharge_w
+        and decision.get("mode") == (MODE_DISCH if val > 0 else MODE_IDLE)
+        and grant.get("valid") is True and grant.get("allocation_owned") is not False
+        and grant.get("protection_reason") in (None, "", "bridge_source_disabled")
+        and (state.get("cycle_owned") is True or (
+            decision.get("heatpump_pv_start_source_binding_required") is True
+            and grant.get("command_authorized") is True and grant.get("start_candidate") is True
+        ))
+        and source.get("fresh") is True
+        and sample_ts is not None and decision_ts is not None
+        and 0.0 <= decision_ts - sample_ts <= 10.0
+    )
+
+
 def hard_mode_justification_errors(live: Dict[str, Any], decision: Dict[str, Any]) -> List[str]:
     state = str(decision.get("state") or "")
     mode = safe_int(decision.get("mode"), MODE_AUTO)
@@ -8229,6 +8274,8 @@ def hard_mode_justification_errors(live: Dict[str, Any], decision: Dict[str, Any
     grid_ema_w = safe_int(live.get("Grid_EMA_W", grid_w), grid_w)
     import_w = max(grid_w, grid_ema_w)
     errors: List[str] = []
+    heatpump_owner = heatpump_pv_output_binding_valid(
+        decision, sample_now_s=_consumer_runtime_finite(live.get("_ts")))
 
     if mode == MODE_DISCH:
         discharge_owner = protected and state.startswith(HARD_DISCHARGE_OWNER_PREFIXES)
@@ -8239,7 +8286,7 @@ def hard_mode_justification_errors(live: Dict[str, Any], decision: Dict[str, Any
             and import_w <= safe_int(decision.get("headroom_discharge_import_guard_w"), 150)
             and safe_int(decision.get("headroom_discharge_export_room_w"), 0) >= max(300, val_w)
         )
-        if not (discharge_owner or headroom_discharge_owner):
+        if not (discharge_owner or headroom_discharge_owner or heatpump_owner):
             errors.append(f"DISCH {val_w} W ohne geschützten Entlade-Besitzer: {state or 'unbekannt'}")
 
         if discharge_owner and state.startswith("direct_marketing_eco_plus_export"):
@@ -8286,13 +8333,14 @@ def hard_mode_justification_errors(live: Dict[str, Any], decision: Dict[str, Any
                 errors.append("Peak-Shaving-Netzladen überschreitet den Hausanschlussrahmen")
 
     if mode == MODE_IDLE:
-        idle_owner = protected and state.startswith(HARD_IDLE_OWNER_PREFIXES)
+        idle_owner = heatpump_owner or (protected and state.startswith(HARD_IDLE_OWNER_PREFIXES))
         if not idle_owner:
             errors.append(f"IDLE ohne expliziten Schutz-Besitzer: {state or 'unbekannt'}")
-        if import_w > 150:
+        if import_w > 150 and not heatpump_owner:
             errors.append(f"IDLE kann Netzbezug festhalten: {import_w} W")
 
-    if mode in (MODE_GRID, MODE_IDLE) and import_w > 150 and not state.startswith(HARD_GRID_OWNER_PREFIXES):
+    if (mode in (MODE_GRID, MODE_IDLE) and import_w > 150
+            and not heatpump_owner and not state.startswith(HARD_GRID_OWNER_PREFIXES)):
         errors.append(f"{mode_label(mode)} kann vermeidbaren Netzbezug festhalten: {import_w} W")
 
     return errors
@@ -8922,6 +8970,7 @@ def build_display(payload: Dict[str, Any], *, now_s: Optional[float] = None) -> 
         "wallbox_wbminsoc_curve_charge": "PV in Speicher",
         "wallbox_predump_floor_hold": "Pre-Dump-Untergrenze",
         "hard_mode_guard_auto": "Hard-Mode-Guard",
+        "heatpump_pv_source_bound": "WP-Quellenbegrenzung",
         "price_plan_house_discharge": "Slot: Hausstütze",
         "parallel_price_house_discharge": "Slot: Hausstütze",
         "parallel_price_hold": "Slot: Entladung gesperrt",
@@ -8994,6 +9043,7 @@ def build_display(payload: Dict[str, Any], *, now_s: Optional[float] = None) -> 
         "wallbox_wbminsoc_curve_charge": "Storage Manager",
         "wallbox_predump_floor_hold": "Storage Manager",
         "hard_mode_guard_auto": "Storage Manager",
+        "heatpump_pv_source_bound": "Storage Manager",
         "price_plan_house_discharge": "Storage Manager",
         "parallel_price_house_discharge": "Storage Manager",
         "parallel_price_hold": "Storage Manager",
@@ -17600,14 +17650,14 @@ def market_economics_decision(
             return None
         reason = (
             "Marktpfad: künftiger Preisberg mit Defizit prognostiziert, "
-            "Speicherentladung wird bis zum Hochpreisfenster gehalten"
+            "Speicherentladung wird bis zum Hochpreisfenster gehalten; "
+            "PV-Laden bleibt innerhalb der Ladekurve frei"
         )
-        auto_limit = discharge_block_auto_limit(cfg, 0, reason)
-        auto_limit["max_charge_w"] = 0
+        auto_limit = discharge_block_auto_limit(cfg, max_charge_w, reason)
         result = {
             "state": MARKET_ECONOMICS_STATES[action],
             "mode": MODE_AUTO,
-            "val": 0,
+            "val": max_charge_w,
             "reason": reason,
             "storage_req_w": 0,
             "budget_w": 0,
@@ -22198,6 +22248,15 @@ def heatpump_pv_source_contract(
     }
 
 
+# Nur der Ausgangsvertrag, keine Verbraucherbudgets oder Zustandshistorie.
+HEATPUMP_PV_OUTPUT_KEYS = (
+    "state", "mode", "val", "auto_limit", "priority", "protected", "reason",
+    "display_reason", "storage_req_w", "suppress_rscp_output",
+    "hard_mode_guard_errors", "hard_mode_guard_set_power_auto",
+    "hard_mode_guard_retry_s", "hard_mode_guard_contract_version",
+)
+
+
 def apply_heatpump_pv_bridge_decision(
     cfg: Dict[str, Any], live: Dict[str, Any], decision: Dict[str, Any],
     grant: Dict[str, Any], source: Dict[str, Any], *,
@@ -22227,6 +22286,9 @@ def apply_heatpump_pv_bridge_decision(
         and (new_start or state.get("cycle_owned") is True)
         and result.get("safety_veto") is not True
         and not result.get("suppress_rscp_output")
+        and not result.get("hard_mode_guard_errors")
+        and str(result.get("state") or "") != "hard_mode_guard_auto"
+        and not storage_protection_path_contract(result).get("active")
     ):
         return result
     assigned = source.get("source_assignments_w")
@@ -22315,8 +22377,22 @@ def apply_heatpump_pv_bridge_decision(
             "house_heatpump_discharge_cap_w": discharge_w,
         })
         return result
+    # Ein fester WP-Ausgang darf keinen fremden harten Besitzer übernehmen.
+    # Bereits aktive AUTO-Rahmen werden oben ausschließlich verschärft.
+    if _phase5_owner_safety_veto_contract(
+        result, storage_decision_path_contract(result),
+    ).get("veto"):
+        return result
+    result["heatpump_pv_bridge_fallback"] = {
+        key: copy.deepcopy(decision[key])
+        for key in HEATPUMP_PV_OUTPUT_KEYS if key in decision
+    }
     result.pop("heatpump_pv_isolation_cap_w", None)
     result.update({
+        "state": "heatpump_pv_source_bound",
+        "priority": "heatpump_pv",
+        "protected": True,
+        "reason": "Gebundene WP-Quellenbegrenzung aus gültiger Speicherzusage.",
         "mode": MODE_DISCH if discharge_w > 0 else MODE_IDLE,
         "val": discharge_w,
         "auto_limit": {},
@@ -29513,6 +29589,29 @@ def decide_next_cycle(
             export_allowed=False, budget_w=0, ep_reserve_floor_hold=True,
             auto_limit=discharge_block_auto_limit(cfg, held_charge_w, reserve_reason),
         )
+    # Der Markt hält vorhandene Energie zurück. Den PV-Laderahmen bestimmt
+    # weiterhin die normale Kurve einschließlich ihrer Hysteresen und Kappen.
+    # Erst nach dieser reinen Berechnung wird die Entladesperre überlagert;
+    # der Markt bleibt alleiniger Owner des ausgegebenen AUTO-Vertrags.
+    market_hold_decision = None
+    market_hold_previous_state = previous_state
+    if decision is not None and decision.get("state") == "market_discharge_hold":
+        market_hold_decision = decision
+        curve_context = previous_state.get("market_hold_curve_context")
+        if (previous_state.get("state") == "market_discharge_hold"
+                and isinstance(curve_context, dict)):
+            previous_state = dict(previous_state)
+            previous_state.update(
+                state=curve_context.get("state"),
+                parallel_state=curve_context.get("state"),
+                mode=curve_context.get("mode"),
+                parallel_mode=curve_context.get("mode"),
+                val=curve_context.get("val"),
+                parallel_val=curve_context.get("val"),
+                parallel_state_since_ts=curve_context.get("since_ts"),
+            )
+        curve_frame_memory_state = curve_frame_write_brake_memory_state(previous_state)
+        decision = None
     curve_frame_normal_regulation = decision is None
     if decision is None:
         pv_curve_before_start = bool(pv_w > 250)
@@ -31622,10 +31721,11 @@ def decide_next_cycle(
         decision.setdefault("observe_wallbox_reserve_floor_soc", observe_reserve_release.get("floor_soc"))
         decision.setdefault("observe_wallbox_reserve_release_floor_soc", observe_reserve_release.get("release_floor_soc"))
         decision.setdefault("observe_wallbox_reserve_soc", observe_reserve_release.get("soc"))
-    decision = apply_peak_shaving_secondary_candidate(
-        decision,
-        peak_shaving_evaluation,
-    )
+    if market_hold_decision is None:
+        decision = apply_peak_shaving_secondary_candidate(
+            decision,
+            peak_shaving_evaluation,
+        )
     decision = apply_direct_marketing_parallel_auto_reservation_cap(
         cfg,
         plan,
@@ -31646,6 +31746,42 @@ def decide_next_cycle(
         now_s=now_s,
         plan=plan,
     )
+    if market_hold_decision is not None:
+        curve_memory_active = curve_frame_write_brake_memory_state(decision) is not decision
+        curve_state = str(decision.get("state") or "")
+        curve_mode = safe_int(decision.get("mode"), MODE_AUTO)
+        curve_val = max(0, safe_int(decision.get("val"), 0))
+        curve_limit = decision.get("auto_limit") or {}
+        charge_cap_w = max_charge_w
+        if curve_limit.get("enabled") and not curve_limit.get("release"):
+            charge_cap_w = max(0, safe_int(curve_limit.get("max_charge_w"), 0))
+        elif curve_mode in (MODE_CHRG, MODE_GRID):
+            charge_cap_w = curve_val
+        elif curve_mode != MODE_AUTO:
+            charge_cap_w = 0
+        prior_curve_state = str(previous_state.get("parallel_state") or previous_state.get("state") or "")
+        prior_curve_since = safe_float(previous_state.get("parallel_state_since_ts"), now_s)
+        curve_context = {
+            "state": curve_state, "mode": curve_mode, "val": curve_val,
+            "since_ts": prior_curve_since if curve_state == prior_curve_state else now_s,
+        }
+        previous_state = market_hold_previous_state
+        decision.update(market_hold_decision)
+        auto_limit = dict(market_hold_decision["auto_limit"])
+        auto_limit["max_charge_w"] = min(max_charge_w, charge_cap_w)
+        auto_limit["bounded_zero_readback_max_w"] = (
+            EMS_POWER_SETTINGS_NONZERO_MIN_W if auto_limit["max_charge_w"] == 0 else 0
+        )
+        decision["auto_limit"] = auto_limit
+        decision["val"] = auto_limit["max_charge_w"]
+        if curve_memory_active:
+            # Nur internes Rechengedächtnis an die überlagerte Ausgabe binden;
+            # dies ist keine Gerätebestätigung. Frühere Kappen bleiben geprüft.
+            decision["curve_frame_write_brake"]["memory"]["held_auto_limit"] = copy.deepcopy(auto_limit)
+        decision["market_hold_curve_context"] = curve_context
+        # Sekundäre Schutzprioritäten bewerten den endgültigen Marktvertrag,
+        # nicht den ausschließlich für die Ladegrenze berechneten Kandidaten.
+        decision = apply_peak_shaving_secondary_candidate(decision, peak_shaving_evaluation)
     decision = enforce_hard_mode_guard(
         cfg,
         live_with_wallbox,
@@ -31654,6 +31790,12 @@ def decide_next_cycle(
         max_discharge_w,
         previous_state=previous_state,
         now_s=now_s,
+    )
+    # Ein Guard-Release ist für den Rest dieses Zyklus verbindlich.
+    hard_mode_guard_output = (
+        {key: copy.deepcopy(decision[key])
+         for key in HEATPUMP_PV_OUTPUT_KEYS if key in decision}
+        if decision.get("state") == "hard_mode_guard_auto" else None
     )
     decision = apply_controlled_wallbox_start_pending_storage_cap(
         cfg,
@@ -32515,12 +32657,18 @@ def decide_next_cycle(
     )
     consumer_budget_contract["wallbox_fixed_start_grid_support_w"] = fixed_start_grid_w
     consumer_budget_contract["wallbox_fixed_start_support_w"] = fixed_start_support_w
+    # Das Parallelgedächtnis gehört zur Entscheidung vor der WP-Übersetzung.
+    # Flüchtige WP-Ausgänge dürfen die 60-s-Haltung des Reglers nicht speisen.
+    parallel_state = str(decision.get("state") or "parallel_auto")
+    parallel_mode = safe_int(decision.get("mode"), MODE_AUTO)
+    parallel_val = max(0, safe_int(decision.get("val"), 0))
     decision = apply_heatpump_pv_bridge_decision(
         cfg, live_with_wallbox, decision,
         consumer_budget_contract.get("heatpump_pv_contract") or {}, heatpump_sources,
         wallbox_w=observed_wallbox_commitment_w,
         max_charge_w=max_charge_w, max_discharge_w=max_discharge_w,
     )
+    state = str(decision.get("state") or "parallel_auto")
     mode = safe_int(decision.get("mode"), MODE_AUTO)
     val = max(0, safe_int(decision.get("val"), 0))
     consumer_budget_validation = validate_consumer_budget_contract(
@@ -33728,7 +33876,7 @@ def decide_next_cycle(
         previous_parallel_since_ts = safe_float(previous_state.get("ts"), 0.0)
     parallel_state_since_ts = (
         previous_parallel_since_ts
-        if previous_parallel_state == state and previous_parallel_since_ts > 0
+        if previous_parallel_state == parallel_state and previous_parallel_since_ts > 0
         else now_s
     )
     predump_reopen_block = {}
@@ -34519,10 +34667,12 @@ def decide_next_cycle(
         "hardening_contracts_scope": hardening_contracts.get("scope"),
         "hardening_contracts": hardening_contracts.get("contracts", {}),
         "budget": budget,
-        "parallel_state": state,
+        "parallel_state": parallel_state,
         "parallel_state_since_ts": parallel_state_since_ts,
-        "parallel_mode": mode,
-        "parallel_val": val,
+        "parallel_mode": parallel_mode,
+        "parallel_val": parallel_val,
+        "hard_mode_guard_output": hard_mode_guard_output,
+        "heatpump_pv_bridge_fallback": decision.get("heatpump_pv_bridge_fallback"),
         "auto_limit": decision.get("auto_limit"),
         "curve_frame_write_brake": decision.get("curve_frame_write_brake"),
         "heatpump_pv_set_power_only": decision.get("heatpump_pv_set_power_only") is True,
@@ -34596,6 +34746,7 @@ def decide_next_cycle(
             else previous_state.get("last_auto_ts", 0)
         ),
         "shadow_payload": decision.get("shadow_payload"),
+        "market_hold_curve_context": decision.get("market_hold_curve_context"),
     }
     payload["smartcharge_external_veto"] = storage_smartcharge_external_veto_contract(
         live,
@@ -36267,6 +36418,46 @@ def finalize_heatpump_pv_output_owner(
 ) -> Dict[str, Any]:
     """Bindet die Wärmezusage nach allen Speicherentscheidern an den finalen Ausgang."""
     result = copy.deepcopy(payload)
+    guard_output = before_arbitration.get("hard_mode_guard_output")
+    later_protection_auto = bool(
+        safe_int(result.get("mode"), -1) == MODE_AUTO
+        and result.get("state") != "hard_mode_guard_auto"
+        and storage_protection_path_contract(result, plan).get("active")
+    )
+    if (isinstance(guard_output, dict)
+            and guard_output.get("state") == "hard_mode_guard_auto"
+            and not later_protection_auto):
+        suppressed = bool(result.get("suppress_rscp_output"))
+        for key in HEATPUMP_PV_OUTPUT_KEYS:
+            if key in guard_output:
+                result[key] = copy.deepcopy(guard_output[key])
+            else:
+                result.pop(key, None)
+        result["mode_name"] = mode_label(MODE_AUTO)
+        if suppressed:
+            result["suppress_rscp_output"] = True
+        result.pop("heatpump_pv_set_power_only", None)
+        result.pop("wallbox_fixed_start_set_power_only", None)
+
+    def revoke_bridge_output() -> None:
+        # Einen später gewählten Schutzvertrag erhalten. Ist noch der eigene
+        # WP-Ausgang gewählt, den vollständigen Vertrag vor der Brücke nehmen;
+        # nur das Flag zu löschen würde den normalen DISCH-Sendepfad aktivieren.
+        fallback = before_arbitration.get("heatpump_pv_bridge_fallback")
+        if (result.get("state") == "heatpump_pv_source_bound"
+                and isinstance(fallback, dict)):
+            suppressed = bool(result.get("suppress_rscp_output"))
+            for key in HEATPUMP_PV_OUTPUT_KEYS:
+                if key in fallback:
+                    result[key] = copy.deepcopy(fallback[key])
+                else:
+                    result.pop(key, None)
+            result["mode_name"] = mode_label(safe_int(result.get("mode"), MODE_AUTO))
+            if suppressed:
+                result["suppress_rscp_output"] = True
+        result.pop("heatpump_pv_set_power_only", None)
+        result.pop("heatpump_pv_start_source_binding_required", None)
+
     initial_budget = before_arbitration.get("budget") or {}
     initial_contract = initial_budget.get("consumer_budget_contract") or {}
     grant = initial_contract.get("heatpump_pv_contract")
@@ -36276,8 +36467,7 @@ def finalize_heatpump_pv_output_owner(
     output_keys = ("mode", "val", "auto_limit", "suppress_rscp_output")
     changed = any(result.get(key) != before_arbitration.get(key) for key in output_keys)
     if not grant:
-        if changed:
-            result.pop("heatpump_pv_set_power_only", None)
+        revoke_bridge_output()
         return result
     if grant.get("allocation_owned") is False:
         # Nur die aktuelle Kontoprojektion nachführen. Die fachlich getrennte
@@ -36285,7 +36475,7 @@ def finalize_heatpump_pv_output_owner(
         budget = result.setdefault("budget", {})
         budget.setdefault("consumer_budget_contract", {})["heatpump_pv_contract"] = grant
         budget["heatpump_pv_contract"] = copy.deepcopy(grant)
-        result.pop("heatpump_pv_set_power_only", None)
+        revoke_bridge_output()
         return result
     # Eine im EMS-Rahmen eingebettete Isolation (Entladegrenze) oder eine durch
     # den offenen Rahmen gedeckte AUTO-Antwort bleibt gebunden, solange der
@@ -36327,6 +36517,10 @@ def finalize_heatpump_pv_output_owner(
                 before_arbitration.get("heatpump_pv_start_source_binding_required") is True
                 and grant.get("command_authorized") is True
             )) and grant.get("valid")
+            and before_arbitration.get("state") == "heatpump_pv_source_bound"
+            and result.get("state") == "heatpump_pv_source_bound"
+            and result.get("protected") is True
+            and isinstance(before_arbitration.get("heatpump_pv_bridge_fallback"), dict)
             and before_arbitration.get("heatpump_pv_set_power_only") is True
             and result.get("heatpump_pv_set_power_only") is True
             and all(result.get(key) == before_arbitration.get(key)
@@ -36409,7 +36603,7 @@ def finalize_heatpump_pv_output_owner(
         # Quellen-Aus entzieht die Wärmefreigabe, aber nicht die bereits
         # gebundene flüchtige Akku-Isolierung während des realen Auslaufs.
         if not (source_isolation and own_ram_output and not changed and not output_hard_veto):
-            result.pop("heatpump_pv_set_power_only", None)
+            revoke_bridge_output()
         grant["command_authorized"] = False
         grant["blockers"] = list(dict.fromkeys([
             *(grant.get("blockers") or []), "final_storage_source_not_bound",
@@ -36729,11 +36923,15 @@ def write_state(payload: Dict[str, Any], plan: Dict[str, Any]) -> None:
         "rscp_power_settings": copy.deepcopy(payload.get("rscp_power_settings"))
         if isinstance(payload.get("rscp_power_settings"), dict)
         else None,
+        "rscp_max_charge_single_tag": copy.deepcopy(payload.get("rscp_max_charge_single_tag"))
+        if isinstance(payload.get("rscp_max_charge_single_tag"), dict)
+        else None,
         "ems_reaction": payload.get("ems_reaction") if isinstance(payload.get("ems_reaction"), dict) else None,
         "ems_budget_runtime": payload.get("ems_budget_runtime") if isinstance(payload.get("ems_budget_runtime"), dict) else None,
         "ems_budget_runtime_veto": bool(payload.get("ems_budget_runtime_veto")),
         "ems_budget_runtime_veto_reason": payload.get("ems_budget_runtime_veto_reason"),
         "last_auto_ts": payload.get("last_auto_ts"),
+        "market_hold_curve_context": payload.get("market_hold_curve_context"),
         "parallel_state": payload.get("parallel_state", payload.get("state")),
         "parallel_state_since_ts": payload.get("parallel_state_since_ts"),
         "parallel_mode": payload.get("parallel_mode", payload.get("mode")),
@@ -45491,6 +45689,17 @@ def wallbox_ifc_readback_gate_contract(
     }
 
 
+def _rscp_max_charge_single_tag_diagnostic(ctrl: Any) -> Optional[Dict[str, Any]]:
+    """Kopie der Einzeltag-Diagnose; ``None`` ohne echte BattCtrl-Quelle oder bei Fehler."""
+    try:
+        if not isinstance(ctrl, BattCtrl):
+            return None
+        diag = ctrl.max_charge_single_tag_diagnostics()
+    except Exception:
+        return None
+    return copy.deepcopy(diag) if isinstance(diag, dict) else None
+
+
 def execute_rscp_cycle(
     ctrl: BattCtrl,
     payload: Dict[str, Any],
@@ -45538,6 +45747,9 @@ def execute_rscp_cycle(
     )
     before_send = ctrl.power_settings_diagnostics()
     before_set_requests = max(0, safe_int(before_send.get("set_requests"), 0))
+    # Beobachtungsdiagnose zum Einzeltag 0x01000101; bleibt auch in Zyklen
+    # ohne Ausgang sichtbar und wirkt nicht auf die Entscheidung zurück.
+    payload["rscp_max_charge_single_tag"] = _rscp_max_charge_single_tag_diagnostic(ctrl)
     if payload.get("suppress_rscp_output") is True:
         payload["rscp_command_path"] = "suppressed_safe_fallback"
         payload["rscp_request_transaction"] = {
@@ -45622,6 +45834,7 @@ def execute_rscp_cycle(
     if not isinstance(send_receipt, dict):
         send_receipt = {}
     payload["rscp_power_settings"] = ctrl.power_settings_diagnostics()
+    payload["rscp_max_charge_single_tag"] = _rscp_max_charge_single_tag_diagnostic(ctrl)
     after_set_requests = max(
         before_set_requests,
         safe_int(payload["rscp_power_settings"].get("set_requests"), before_set_requests),

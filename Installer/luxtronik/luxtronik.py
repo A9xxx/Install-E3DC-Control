@@ -218,24 +218,19 @@ class LuxtronikModbus:
     def read_shi_status(self):
         """Liest SHI-Auftragsmodi; diese Werte sind keine physischen Zustände."""
         data = {}
-        # Holding Register ab 10000 (FC 03)
-        regs = self._send_request(3, 10000, 10)
-        if regs:
-            data['SHI_HZ_Mode'] = regs[0]      # 10000
-            data['SHI_HZ_Setpoint'] = regs[1] / 10 # 10001
-            data['SHI_WW_Mode'] = regs[5]      # 10005
-            data['SHI_WW_Setpoint'] = regs[6] / 10 # 10006
-        else:
-            # Fallback: Einzeln lesen falls Block-Read fehlschlägt
-            r1 = self._send_request(3, 10000, 2)
-            if r1: 
-                data['SHI_HZ_Mode'] = r1[0]
-                data['SHI_HZ_Setpoint'] = r1[1] / 10
-            
-            r2 = self._send_request(3, 10005, 2)
-            if r2:
-                data['SHI_WW_Mode'] = r2[0]
-                data['SHI_WW_Setpoint'] = r2[1] / 10
+        # Holding Register (FC 03) nur in den zwei belegten Bereichen lesen:
+        # Ein Blocklesen 10000..10009 beantworten Luxtronik-Regler mit
+        # Exception 2 (ungültige Adresse) und erzeugt dann je Zyklus einen
+        # zusätzlichen fehlschlagenden Request.
+        r1 = self._send_request(3, 10000, 2)
+        if r1:
+            data['SHI_HZ_Mode'] = r1[0]              # 10000
+            data['SHI_HZ_Setpoint'] = r1[1] / 10     # 10001
+
+        r2 = self._send_request(3, 10005, 2)
+        if r2:
+            data['SHI_WW_Mode'] = r2[0]              # 10005
+            data['SHI_WW_Setpoint'] = r2[1] / 10     # 10006
         # Kompatibilitätsfelder für bestehende Diagnosewerkzeuge.
         if 'SHI_HZ_Mode' in data:
             data['HZ_Mode'] = data['SHI_HZ_Mode']

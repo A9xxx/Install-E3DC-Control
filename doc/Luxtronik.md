@@ -51,6 +51,15 @@ geht die Reservierung an die nachrangigen Verbraucher, der Sollwert bleibt
 stehen, und ab dem gemessenen Verdichterstart bindet wieder die Istaufnahme.
 Ein nie ausgespielter Auftrag wird erst nach der Wiedereinschaltsperre erneut
 angeboten. Ein bestätigter Sollwert allein beweist keinen Verdichterlauf.
+Nimmt eine Schutzfunktion einen bereits ausgespielten PV-Auftrag zurück, zum
+Beispiel wegen fehlender oder ungültiger Daten, der Notstromreserve oder der
+Hausanschlussgrenze, wird ein neuer PV-Start ebenfalls erst nach der
+Wiedereinschaltsperre (`wp_restart_block_min`) angeboten, mindestens aber nach
+10 Minuten. So wiederholt ein Schutzgrund, der sich direkt nach jedem Start
+zeigt, Start und Rücknahme nicht im Minutentakt. Eine Rücknahme wegen
+fehlender PV-Deckung startet diese Sperre nicht, auch nicht, wenn danach im
+Nachlauf des Verdichters ein Schutzgrund auftritt, ebenso wenig ein Neustart
+des Energy Managers nach einer bereits abgeschlossenen Rücknahme.
 Der Boost selbst ist ein Latch wie eine SG-Ready-Freigabe: Die Saison bestimmt
 die Kanäle (Winter Heizung und Warmwasser, Sommer Warmwasser, sofern der
 Komfort-Timer das Ziel nicht ohnehin hält). Im Messwertbetrieb wird er in der
@@ -91,6 +100,61 @@ Wärmepumpen-Boost aktiv, wird der Befehl nicht ausgeführt; die Seite zeigt dan
 „WW-Sofort angefordert“, bis die Automatik wieder übernimmt oder die Dauer
 abläuft. Setzt ein anderer Regelpfad den Warmwasserkanal zurück, wird der
 Sollwert einmal erneut gesetzt (Protokollzeile, kein Fehler).
+
+### Ausschalten und Grundzustand
+
+„Automatik darf steuern“ ausschalten hat Vorrang vor automatischen Boosts.
+E3DC-Control nimmt die Anforderung zurück und prüft die Rückmeldung der
+Luxtronik:
+
+- **Heizung:** SHI-Modus 0 beendet die externe Beeinflussung. Ein noch
+  angezeigter alter Heizungs-Sollwert ist dann ohne Wirkung; es gelten die in
+  der Luxtronik hinterlegten Werte.
+- **Warmwasser:** Der externe Boost wird auf den Grundzustand zurückgenommen.
+  Das ist SHI-Modus 1 mit der konfigurierten Warmwasser-Untergrenze `ww_eco`,
+  mit der auch der Software-Timer außerhalb seines Zeitfensters arbeitet
+  (Standard 35 °C; ein bereits konfigurierter Wert bleibt maßgeblich). Die
+  Untergrenze ist eine Temperatureinstellung, kein Verdichter-Aus-Befehl.
+
+Eine Rücknahme braucht keine Bestätigung des vorherigen Auftrags. Weicht die
+Rückmeldung ab, wird sie im Abstand von 60 Sekunden höchstens dreimal gesendet.
+Bleibt der Grundzustand unbestätigt, erscheint auf der Wärmepumpenseite ein
+Alarm; eingerichtete Benachrichtigungen melden ihn zusätzlich. Der Alarm
+behauptet weder einen erfolgreichen Reset noch einen Verdichterstillstand.
+Kommt beim Start eines Boosts nur der Modus an, aber nicht der Sollwert, wird
+der Sollwert zurückgelesen und begrenzt erneut gesendet; bleibt er aus, wird
+der Auftrag auf dieselbe Weise zurückgenommen.
+
+Nach einem Schutzentzug gilt eine Wiedereinschaltsperre von mindestens zehn
+Minuten. Nach zwei Entzügen aus demselben Geräteschutzgrund bleibt der
+PV-Boost bis zum nächsten Tag gesperrt; der Grund wird angezeigt.
+Automatik-Aus startet ebenfalls die konfigurierte Wiedereinschaltsperre.
+
+### Netzboost (experimentell)
+
+Der Netzboost ist standardmäßig ausgeschaltet. Der Schalter `price_boost_enable`
+heißt im Konfigurationseditor „Experimentellen Netzboost aktivieren“. Er
+schaltet den vorhandenen **Negativpreis-Boost** für die Luxtronik frei.
+Günstige, aber positive Preisfenster lösen keinen Boost aus. Der Schalter
+allein startet nichts: Zusätzlich werden ein Börsentarif mit gültigem
+Negativpreisfenster, Wärmebedarf und eine aktuelle Zusage der Speicherregelung
+benötigt.
+
+Für einen begleiteten Test:
+
+1. Wärmepumpen-Automatik einschalten und die angezeigten Messwerte prüfen.
+2. Unter „Netzstrom und Preissteuerung“ die gemeinsame Wärmeplanung
+   aktivieren.
+3. Im Tarifbereich den gemeinsamen Negativpreis-Boost und bei der Wärmepumpe
+   „WP für Negativpreis-Boost freigeben“ einschalten.
+4. „Experimentellen Netzboost aktivieren“ einschalten.
+5. Während eines Negativpreisfensters Sollwert, SHI-Rückmeldung,
+   Verdichterstatus und tatsächliche Leistung beobachten. Fehlender
+   Wärmebedarf oder eine verweigerte Speicherzusage müssen einen Start
+   verhindern.
+6. Zum Beenden den Schalter wieder ausschalten; ein laufender Auftrag wird nach
+   seiner geschützten Mindestzeit zurückgenommen. Sofort endet jede
+   automatische Anforderung mit „Automatik darf steuern“ aus.
 
 ## 2. Voraussetzungen
 
@@ -183,7 +247,7 @@ Vorreservierung bei.
 | `wp_pv_grid_max_w` | Erlaubte Netz-Überbrückungsleistung in W. `0` sperrt diese Quelle. | `0` |
 | `wp_pv_grid_limit_wh` | Netzenergie für PV-Überbrückung in den jeweils letzten 24 Stunden. `0` sperrt diese Quelle. | `0` |
 | `wp_min_runtime_min` | Geschützte Verdichterlaufzeit ab bestätigtem physischem Start. | `30` |
-| `wp_restart_block_min` | Wiedereinschaltsperre nach bestätigtem Verdichterstopp. | `20` |
+| `wp_restart_block_min` | Wiedereinschaltsperre nach bestätigtem Verdichterstopp. Nach der schutzbedingten Rücknahme eines ausgespielten PV-Auftrags gilt sie ebenfalls, dann mindestens 10 Minuten, auch bei `0`. | `20` |
 | `pv_boost_delay` | Dauer der stabilen PV-Startqualifikation vor einer verbindlichen Startzuteilung in Sekunden. | `30` |
 | `wp_pv_reaction_s` | Reaktionsfrist für Messung, Kommunikation und wirksame Lastanpassung in Sekunden. | `30` |
 | `wp_pv_start_wait_s` | Wartefrist auf den tatsächlichen Verdichterstart; mindestens 600 Sekunden. So lange bleibt die Startleistung reserviert, danach geht sie an die nachrangigen Verbraucher. | `600` |
@@ -339,9 +403,18 @@ Normalwert als externer Entzug; die Regelung stellt das Boost-Ziel dann
 nicht selbstständig wieder her. Eine eigene Rücknahme bleibt auch ohne
 vorherige Übernahmebestätigung möglich, etwa bei Nutzer-Aus oder nach
 Ablauf der bestehenden Befehls- und Schutzfristen.
-Ein bei Storage bereits bestätigter Abschluss wird nach einem Neustart
-anhand desselben Auftrags und eines frischen ruhenden Normalzustands
-übernommen. Eine vorhandene externe Startsperre bleibt dabei bestehen.
+Ein bei Storage bereits bestätigter Abschluss desselben Auftrags wird nach
+einem Neustart übernommen, auch wenn der Kanal inzwischen einer anderen
+Steuerung gehört oder die gesicherte Rückmeldung aus einer älteren Version den
+Entzug nicht enthält. Storage bestätigt den Abschluss erst nach einem mit
+frischen Daten bestätigten Entzug und ruhendem Verdichter; solange Storage den
+Zyklus noch besitzt, bleibt der Auftrag offen. Eine vorhandene externe
+Startsperre bleibt dabei bestehen.
+Ein bestätigter Entzug bleibt für denselben Auftrag bestätigt. Setzt danach
+eine andere Steuerung den Kanal wieder auf den externen Sollwert, etwa
+Preis-Boost, Pre-Dump oder Preis-Pause, auch nach einem Neustart des Energy
+Managers, gilt der PV-Auftrag nicht wieder als offen. Er hält dann weder das
+Ende dieser Steuerung noch einen späteren PV-Boost auf.
 
 Startqualifikation, Leistungsübergabe und Befehlsprüfung besitzen getrennte
 Fristen. Die 25 Sekunden für die Befehlsprüfung beginnen erst mit dem
@@ -476,14 +549,25 @@ halten.
 ### Modbus-Verbindungsverhalten
 
 Die Luxtronik-SHI-Schnittstelle reagiert empfindlich auf konkurrierende
-Verbindungen und Schreibfolgen. Der Energy Manager besitzt deshalb genau einen
-Treiber und serialisiert alle Lese- und Schreibzugriffe auf dessen bestehender
-TCP-Sitzung. Der zusätzliche physische Status wird nicht über eine zweite
-Verbindung gelesen. Schreibbefehle werden nicht automatisch wiederholt; schlägt
-der Modus-Schreibschritt fehl, wird der zugehörige Setpoint nicht mehr
-geschrieben. Derselbe fehlgeschlagene Zielbefehl wird für 60 Sekunden nicht
-erneut auf den Bus gegeben. Die bewährte Reihenfolge und die Wartezeiten
-zwischen Modus und Setpoint bleiben unverändert.
+Verbindungen und Schreibfolgen; einen zweiten Schreiber lässt sie nicht zu,
+gleichzeitige Zugriffe führen zu Fehlermeldungen. Deshalb gilt:
+
+- **Nur der Energy Manager schreibt** die SHI-Register, über genau einen
+  Treiber. Andere Dienste und die Weboberfläche schreiben nicht selbst; ein
+  manueller Befehl aus der Weboberfläche wird als Auftrag an den Energy Manager
+  übergeben. Zusätzliche Programme, die dieselben SHI-Register schreiben (zum
+  Beispiel eigene Automationen), werden nicht unterstützt.
+- **Eine Sitzung, keine zusätzlichen Verbindungen:** Alle Lese- und
+  Schreibzugriffe des Energy Managers laufen serialisiert über dessen bestehende
+  TCP-Sitzung. Der physische Status und die Rückmeldung der SHI-Register
+  werden nicht über eine zweite Verbindung gelesen.
+- **Wiederholungen nur begrenzt:** Schlägt der Modus-Schreibschritt fehl, wird
+  der zugehörige Setpoint nicht mehr geschrieben. Derselbe fehlgeschlagene
+  Zielbefehl wird für 60 Sekunden nicht erneut auf den Bus gegeben. Rücknahmen
+  und nicht übernommene Sollwerte werden nach Rücklesen höchstens dreimal im
+  60-Sekunden-Abstand gesendet (siehe „Ausschalten und Grundzustand“). Die
+  bewährte Reihenfolge und die Wartezeiten zwischen Modus und Setpoint bleiben
+  unverändert.
 
 Die offiziellen FC04-Input-Adressen bilden keinen lückenlosen Block:
 `10000` enthält die Verdichter-/ZWE-Bitmaske, `10002..10004` enthalten

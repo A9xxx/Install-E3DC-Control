@@ -957,6 +957,11 @@ function vehicleSocKnown(vehicle) {
     return vehicleSocDisplayInfo(vehicle, 1).known;
 }
 
+function wallboxObservationUnknown(data, id) {
+    const observation = data?.[`${id}_observation`];
+    return data?.[id] === null || data?.[id] === undefined || (!!observation && observation.valid !== true);
+}
+
 function wallboxPrimaryVehicleActive(data, id, power, locked) {
     const valWb = Math.abs(parseFloat(power) || 0);
     return locked === true
@@ -2956,6 +2961,9 @@ function updateMobileRingFlow(data, values) {
     const bat = parseFloat(values.bat || 0);
     const grid = parseFloat(values.grid || 0);
     const home = Math.max(0, parseFloat(values.home || 0));
+    const wbUnknown = wallboxConfiguredFlag(data, 1) && wallboxObservationUnknown(data, 'wb');
+    const wb2Unknown = wallboxConfiguredFlag(data, 2) && wallboxObservationUnknown(data, 'wb2');
+    const consumptionKnown = !wbUnknown && !wb2Unknown;
     const wb = Math.max(0, parseFloat(values.wb || 0));
     const wb2 = Math.max(0, parseFloat(values.wb2 || 0));
     const wp = Math.max(0, parseFloat(values.wp || 0));
@@ -2986,7 +2994,7 @@ function updateMobileRingFlow(data, values) {
             pvDetail.title = '';
         }
     }
-    setRingText('m-ring-consumption-text', 'Verbrauch: ' + formatRingPower(consumption));
+    setRingText('m-ring-consumption-text', 'Verbrauch: ' + (consumptionKnown ? formatRingPower(consumption) : 'unbekannt'));
     setRingText('m-ring-home-text', formatRingPower(home));
     setRingText('m-ring-soc', storageSoc !== null ? 'Speicher ' + Math.round(storageSoc) + '%' : 'Speicher --%');
     setRingPathSegment('m-ring-arc-soc', storageSoc !== null ? storageSoc : 0, 0);
@@ -3032,8 +3040,8 @@ function updateMobileRingFlow(data, values) {
     setRingRow('m-ring-home-row', 'Haus ' + formatRingPower(home), home > 20);
     setRingRow('m-ring-wp-row', 'WP ' + formatRingPower(wpTotal), wpTotal > 20);
     setRingRow('m-ring-climate-row', 'Klima ' + formatRingPower(climate), climate > 20);
-    setRingRow('m-ring-wb-row', 'WB1 ' + formatRingPower(wb), wb > 50);
-    setRingRow('m-ring-wb2-row', 'WB2 ' + formatRingPower(wb2), wb2 > 50);
+    setRingRow('m-ring-wb-row', 'WB1 ' + (wbUnknown ? 'unbekannt' : formatRingPower(wb)), wbUnknown || wb > 50);
+    setRingRow('m-ring-wb2-row', 'WB2 ' + (wb2Unknown ? 'unbekannt' : formatRingPower(wb2)), wb2Unknown || wb2 > 50);
     setRingText('m-ring-vehicle', '');
 
     setRingStackSegments([
@@ -3049,7 +3057,7 @@ function updateMobileRingFlow(data, values) {
         {id: 'm-ring-arc-wb2', value: wb2},
         {id: 'm-ring-arc-bat-in', value: batCharge},
         {id: 'm-ring-arc-grid-export', value: exportW}
-    ], outputTotal, 88, 1.4);
+    ].map(segment => consumptionKnown ? segment : {...segment, value: 0}), outputTotal, 88, 1.4);
 }
 
 function mobileStoragePct(value, digits = 1) {
@@ -6528,7 +6536,7 @@ function updateEnergyFlowHoverCards(data, values = {}) {
         },
         wallbox: {
             title: 'Wallbox 1',
-            now: flowPlainWatts(Math.abs(values.wb ?? data.wb ?? 0)),
+            now: wallboxObservationUnknown(data, 'wb') ? '–' : flowPlainWatts(Math.abs(values.wb ?? data.wb ?? 0)),
             totalLabel: 'Heute / Session',
             total: `${flowHoverKwh(wb1Total, 1)} / ${flowHoverKwh(data.wb_session_kwh, 2)}`,
             items: [
@@ -6539,7 +6547,7 @@ function updateEnergyFlowHoverCards(data, values = {}) {
         },
         wallbox2: {
             title: 'Wallbox 2',
-            now: flowPlainWatts(Math.abs(values.wb2 ?? data.wb2 ?? 0)),
+            now: wallboxObservationUnknown(data, 'wb2') ? '–' : flowPlainWatts(Math.abs(values.wb2 ?? data.wb2 ?? 0)),
             totalLabel: 'Heute / Session',
             total: `${flowHoverKwh(wb2Total, 1)} / ${flowHoverKwh(data.wb2_session_kwh, 2)}`,
             items: [
@@ -9570,14 +9578,37 @@ function updateEnergyFlowPvNodes(data, container = document.getElementById('flow
     return {mainPvW, externalPvW: externalVisible ? pvSource.external : 0};
 }
 
+function energyFlowConsumptionValidity(data) {
+    const known = value => (typeof value === 'number' || (typeof value === 'string' && value.trim() !== ''))
+        && Number.isFinite(Number(value));
+    return {
+        home: known(Number.isFinite(parseFloat(data.home)) ? data.home : data.home_raw),
+        wallbox: !wallboxConfiguredFlag(data, 1) || (!wallboxObservationUnknown(data, 'wb') && known(data.wb)),
+        wallbox2: !wallboxConfiguredFlag(data, 2) || (!wallboxObservationUnknown(data, 'wb2') && known(data.wb2))
+    };
+}
+
 function updateEnergyFlowAggregates(values = {}, container = document.getElementById('flow-view')) {
     const generationW = Math.max(0, Number(values.pv || 0)) + Math.max(0, Number(values.external_pv || 0));
-    const consumptionW = ['home', 'wallbox', 'wallbox2', 'wp', 'hs', 'climate']
+    const consumerKeys = ['home', 'wallbox', 'wallbox2', 'wp', 'hs', 'climate'];
+    const validity = values.validity || {};
+    const unknownKeys = consumerKeys.filter(key => validity[key] === false || values[key] === null
+        || (key === 'home' && values[key] === undefined)
+        || (values[key] !== undefined && !Number.isFinite(Number(values[key]))));
+    // Bei unbekannten Beiträgen ist die bekannte Teilsumme nur eine Untergrenze.
+    const consumptionW = unknownKeys.includes('home') ? null : consumerKeys
+        .filter(key => !unknownKeys.includes(key))
         .reduce((sum, key) => sum + Math.max(0, Number(values[key] || 0)), 0);
     const generation = container ? container.querySelector('#f-val-generation') : null;
     const consumption = container ? container.querySelector('#f-val-consumption') : null;
     if (generation) generation.textContent = flowPlainWatts(generationW);
-    if (consumption) consumption.textContent = flowPlainWatts(consumptionW);
+    if (consumption) {
+        consumption.textContent = consumptionW === null ? '--'
+            : (unknownKeys.length ? '≥ ' : '') + flowPlainWatts(consumptionW);
+        consumption.title = unknownKeys.length
+            ? `unvollständig: Leistung von ${unknownKeys.map(key => getFlowLabel({wp: 'heatpump', hs: 'heater'}[key] || key)).join(', ')} unbekannt`
+            : '';
+    }
     return {generationW, consumptionW};
 }
 
@@ -11977,6 +12008,7 @@ function processLiveData(data) {
     if (!data) return;
     const wb1Configured = wallboxConfiguredFlag(data, 1);
     const wb2Configured = wallboxConfiguredFlag(data, 2);
+    const consumptionValidity = energyFlowConsumptionValidity(data);
     cacheStorageCurveData(data);
     renderDirectMarketingDashboardStatus(data);
     publishE3dcLiveData(data);
@@ -12039,10 +12071,10 @@ function processLiveData(data) {
     } else { haBadge.hide(); }
 
     // Rauschen (Floating Point Imprecision / V2H-Standby) bei Wallbox filtern
-    if (wb1Configured && data.wb !== undefined && Math.abs(data.wb) < 50) {
+    if (wb1Configured && data.wb !== undefined && data.wb !== null && Math.abs(data.wb) < 50) {
         data.wb = 0;
     }
-    if (wb2Configured && data.wb2 !== undefined && Math.abs(data.wb2) < 50) {
+    if (wb2Configured && data.wb2 !== undefined && data.wb2 !== null && Math.abs(data.wb2) < 50) {
         data.wb2 = 0;
     }
 
@@ -12075,7 +12107,7 @@ function processLiveData(data) {
         const fmtHead = (v) => formatWatts(v).replace(/<[^>]*>?/gm, '');
         $('#head-pv').text(fmtHead(data.pv)); $('#head-bat').text(fmtHead(batAbs));
         $('#head-soc').text(Math.round(houseSocValue) + '%').attr('title', 'Hausakku-SoC');
-        $('#head-home').text(fmtHead(homeVal)); $('#head-grid').text(fmtHead(gridAbs)); $('#head-wb').text(fmtHead(wbVal));
+        $('#head-home').text(fmtHead(homeVal)); $('#head-grid').text(fmtHead(gridAbs)); $('#head-wb').text((wb1Configured && wallboxObservationUnknown(data, 'wb')) || (wb2Configured && wallboxObservationUnknown(data, 'wb2')) ? '--' : fmtHead(wbVal));
         if(document.getElementById('head-wp')) $('#head-wp').text(fmtHead(wpVal));
         if(document.getElementById('head-climate')) $('#head-climate').text(fmtHead(climateVal));
     }
@@ -12298,7 +12330,7 @@ function processLiveData(data) {
             if (data.ac0_w !== undefined) details += `<div style="white-space:nowrap; font-size:0.8rem; opacity:0.8;">WR: ${data.ac0_w} | ${data.ac1_w} | ${data.ac2_w} W</div>`;
             $('#grid-details').html(details).show();
         } else { $('#grid-details').hide(); }
-        if (data.wb_p1 !== undefined && (data.wb_p1 > 0 || data.wb_p2 > 0 || data.wb_p3 > 0) && data.wb > 0) $('#wb-details').html(`L1: ${data.wb_p1}W | L2: ${data.wb_p2}W | L3: ${data.wb_p3}W`).show(); else $('#wb-details').hide();
+        if (data.wb_p1 !== undefined && (data.wb_p1 > 0 || data.wb_p2 > 0 || data.wb_p3 > 0) && data.wb > 0) $('#wb-details').html(`L1: ${data.wb_p1 ?? '–'}W | L2: ${data.wb_p2 ?? '–'}W | L3: ${data.wb_p3 ?? '–'}W`).show(); else $('#wb-details').hide();
 
         if (data.bat_v !== undefined) {
             let batDet = `K1: ${data.bat_v}V | ${data.bat_a}A`;
@@ -12307,6 +12339,20 @@ function processLiveData(data) {
         } else { $('#bat-details').hide(); }
 
         const updateSingleWallboxUI = (id, power, locked, mode, p1, p2, p3, session, apparentKva, powerFactor, setAmp, capAmp, statusAmp, offeredCurrentRaw, currentStepAmp, fractionalCurrentSupported, peaks, carName) => {
+            const observation = data[`${id}_observation`];
+            const observationUnknown = wallboxObservationUnknown(data, id);
+            if (observationUnknown) {
+                const suffix = id === 'wb' ? '' : '2';
+                const reason = String(observation?.reason || 'Messwert fehlt');
+                $(`#val-wb${suffix}`).text('--');
+                $(`#wb${suffix}-status`).text('Status unbekannt').attr('title', reason);
+                $(`#wb${suffix}-details`).text('Keine frischen Messwerte').attr('title', reason).show();
+                $(`#icon-wb${suffix}`).removeClass('bg-info text-info bg-warning text-warning bg-success text-success pulsating').addClass('bg-secondary text-secondary');
+                $(`#wb${suffix}-lock-overlay`).hide();
+                $(`#wb${suffix}-kva`).hide();
+                $(`#wb${suffix}-session`).hide();
+                return;
+            }
             const valWb = Math.abs(parseFloat(power) || 0);
             const isLocked = locked === true;
             const wbId = id === 'wb' ? '' : '2';
@@ -12350,25 +12396,35 @@ function processLiveData(data) {
             let activePhases = 0;
             if (p1 > 10) activePhases++; if (p2 > 10) activePhases++; if (p3 > 10) activePhases++;
 
+            const phasesReported = observation?.phases_source === 'reported';
             let phText = "";
             if (p1 !== undefined && (p1 > 0 || p2 > 0 || p3 > 0)) {
                 if (power > 0 && activePhases === 0) activePhases = 1;
                 phText = ` (${activePhases}-ph)`;
             }
+            if (observation) {
+                phText = [1, 2, 3].includes(data[`${id}_phases`]) ? ` (${data[`${id}_phases`]}-ph${phasesReported ? ' gemeldet' : ''})` : '';
+            }
 
             const statusEl = $(`#wb${wbId}-status`);
+            statusEl.removeAttr('title');
             if (power > 0) {
                 let t = `Lädt${phText}`;
                 if (mode !== undefined && mode !== 0 && mode !== null) t += ` | Mode ${mode}`;
                 statusEl.text(t);
             }
             else if (power < 0) statusEl.html(`<span class="text-success fw-bold"><i class="fas fa-bolt"></i> V2H Entladen</span>`);
-            else if (isLocked) {
+            else if (isLocked || (observation && data[`${id}_plug`] === true)) {
                 let t = `Verbunden`;
                 if (mode !== undefined && mode !== 0 && mode !== null) t += ` | Mode ${mode}`;
                 statusEl.text(t);
             }
+            else if (observation && data[`${id}_plug`] === null) statusEl.text('Steckstatus unbekannt');
             else statusEl.text('Bereit');
+            if (observation) {
+                const age = Number(observation.age_s);
+                statusEl.attr('title', `${observation.source || 'Treiber'} · ${Number.isFinite(age) ? Math.max(0, age).toFixed(0) + ' s' : 'Alter unbekannt'} · ${observation.reason || ''}`);
+            }
 
             if (p1 !== undefined && (p1 > 0 || p2 > 0 || p3 > 0) && valWb > 0) {
                 const pfInline = pf > 0 ? ` · LF ${pf.toLocaleString('de-DE', {minimumFractionDigits: 2, maximumFractionDigits: 2})}` : '';
@@ -12382,7 +12438,14 @@ function processLiveData(data) {
                 if (currentStatusAmp > 0) detailTitleParts.push(`Wallbox-Statusstrom ${fmtAmp(currentStatusAmp)} A.`);
                 const detailTitle = detailTitleParts.join('\n');
                 const ampInline = displaySetAmp > 0 ? ` | Soll ${fmtAmp(displaySetAmp, ampPrecision)} A` : '';
-                $(`#wb${wbId}-details`).html(`L1: ${p1}W | L2: ${p2}W | L3: ${p3}W${kvaInline}${ampInline}`).attr('title', detailTitle).show();
+                const fmtPhasePower = value => value !== null && value !== undefined && Number.isFinite(Number(value)) ? value : '--';
+                $(`#wb${wbId}-details`).html(`L1: ${fmtPhasePower(p1)}W | L2: ${fmtPhasePower(p2)}W | L3: ${fmtPhasePower(p3)}W${kvaInline}${ampInline}`).attr('title', detailTitle).show();
+            } else if (observation) {
+                const measured = [];
+                if ([1, 2, 3].includes(data[`${id}_phases`])) measured.push(`${data[`${id}_phases`]} Phasen${phasesReported ? ' (gemeldet)' : ''}`);
+                if (statusAmp !== null && statusAmp !== undefined && Number.isFinite(Number(statusAmp))) measured.push(`Iststrom ${fmtAmp(Number(statusAmp))} A`);
+                if ((observation.missing_fields || []).length) measured.push('Weitere Messwerte unbekannt');
+                $(`#wb${wbId}-details`).text(measured.join(' · ')).attr('title', observation.reason || '').toggle(measured.length > 0);
             } else {
                 $(`#wb${wbId}-details`).removeAttr('title').hide();
             }
@@ -12732,9 +12795,9 @@ function processLiveData(data) {
                     content += ` | WR: ${wrTotal}W (L1: ${data.ac0_w} | L2: ${data.ac1_w} | L3: ${data.ac2_w})`;
                 }
             } else if (CURRENT_VIEW === 'wb') {
-                if (data.wb_p1 !== undefined) content = `WB 1: ${data.wb_p1}W | ${data.wb_p2}W | ${data.wb_p3}W`;
+                if (data.wb_p1 !== undefined) content = `WB 1: ${data.wb_p1 ?? '–'}W | ${data.wb_p2 ?? '–'}W | ${data.wb_p3 ?? '–'}W`;
             } else if (CURRENT_VIEW === 'wb2') {
-                if (data.wb2_p1 !== undefined) content = `WB 2: ${data.wb2_p1}W | ${data.wb2_p2}W | ${data.wb2_p3}W`;
+                if (data.wb2_p1 !== undefined) content = `WB 2: ${data.wb2_p1 ?? '–'}W | ${data.wb2_p2 ?? '–'}W | ${data.wb2_p3 ?? '–'}W`;
             } else if (CURRENT_VIEW === 'hs') {
                 const hsActual = data.hs_power || 0;
                 const hsReq = data.hs_requested_w || data.hs_target_w || 0;
@@ -12830,9 +12893,9 @@ function processLiveData(data) {
             else { let newSpeed = (absVal < 500) ? 6.0 : ((absVal < 2000) ? 5.0 : ((absVal < 4500) ? 4.0 : ((absVal < 9000) ? 3.0 : 2.0))); if (cache.speed !== newSpeed) { el.style.animationDuration = newSpeed + 's'; cache.speed = newSpeed; } }
         };
         const pvFlow = updateEnergyFlowPvNodes(data, flowView); $('#f-val-home').text(formatWatts(homeVal).replace(/<[^>]*>?/gm, ''));
-        const flowAggregates = updateEnergyFlowAggregates({pv: pvFlow.mainPvW, external_pv: pvFlow.externalPvW, home: homeVal, wallbox: wb1Power, wallbox2: wb2Power, wp: wpVal, hs: hsVal, climate: climateVal}, flowView);
-        if (wb1Configured) $('#f-val-wb').text(formatWatts(Math.abs(wb1Power)).replace(/<[^>]*>?/gm, ''));
-        if (wb2Configured) $('#f-val-wb2').text(formatWatts(Math.abs(wb2Power)).replace(/<[^>]*>?/gm, ''));
+        const flowAggregates = updateEnergyFlowAggregates({pv: pvFlow.mainPvW, external_pv: pvFlow.externalPvW, home: homeVal, wallbox: wb1Power, wallbox2: wb2Power, wp: wpVal, hs: hsVal, climate: climateVal, validity: consumptionValidity}, flowView);
+        if (wb1Configured) $('#f-val-wb').text(wallboxObservationUnknown(data, 'wb') ? '--' : formatWatts(Math.abs(wb1Power)).replace(/<[^>]*>?/gm, ''));
+        if (wb2Configured) $('#f-val-wb2').text(wallboxObservationUnknown(data, 'wb2') ? '--' : formatWatts(Math.abs(wb2Power)).replace(/<[^>]*>?/gm, ''));
         $('#f-val-wp').text(formatWatts(wpVal).replace(/<[^>]*>?/gm, ''));
         $('#f-val-climate').text(formatWatts(climateVal).replace(/<[^>]*>?/gm, ''));
         $('#f-val-grid').text(formatWatts(gridVal).replace(/<[^>]*>?/gm, '')); $('#f-val-bat').text(formatWatts(batAbs).replace(/<[^>]*>?/gm, ''));
@@ -12949,6 +13012,7 @@ function processMobileData(data) {
         if (!data) return;
         const wb1Configured = wallboxConfiguredFlag(data, 1);
         const wb2Configured = wallboxConfiguredFlag(data, 2);
+        const consumptionValidity = energyFlowConsumptionValidity(data);
         publishE3dcLiveData(data);
         updateExtInverterCards(data);
         const timeElem = document.getElementById('live-time');
@@ -13008,8 +13072,8 @@ function processMobileData(data) {
         };
 
         // Rauschen filtern
-        if (wb1Configured && data.wb !== undefined && Math.abs(data.wb) < 50) data.wb = 0;
-        if (wb2Configured && data.wb2 !== undefined && Math.abs(data.wb2) < 50) data.wb2 = 0;
+        if (wb1Configured && data.wb !== undefined && data.wb !== null && Math.abs(data.wb) < 50) data.wb = 0;
+        if (wb2Configured && data.wb2 !== undefined && data.wb2 !== null && Math.abs(data.wb2) < 50) data.wb2 = 0;
 
         let pv = data.pv || 0; let bat = data.bat || 0; let grid = data.grid || 0;
         let h = Number.isFinite(parseFloat(data.home)) ? parseFloat(data.home) : (data.home_raw || 0);
@@ -13028,7 +13092,7 @@ function processMobileData(data) {
 
         const mobileFlowView = document.getElementById('flow-view');
         const pvFlow = updateEnergyFlowPvNodes(data, mobileFlowView); $('#f-val-home').html(formatWatts(h));
-        const flowAggregates = updateEnergyFlowAggregates({pv: pvFlow.mainPvW, external_pv: pvFlow.externalPvW, home: h, wallbox: wb, wallbox2: wb2, wp, hs: hsVal, climate}, mobileFlowView);
+        const flowAggregates = updateEnergyFlowAggregates({pv: pvFlow.mainPvW, external_pv: pvFlow.externalPvW, home: h, wallbox: wb, wallbox2: wb2, wp, hs: hsVal, climate, validity: consumptionValidity}, mobileFlowView);
         const yieldTag = $('#f-val-pv-yield');
         if (data.pv_today_kwh != null && data.pv_today_kwh > 0) yieldTag.text(data.pv_today_kwh.toLocaleString('de-DE', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' kWh').show();
         else yieldTag.hide();
@@ -13042,8 +13106,8 @@ function processMobileData(data) {
 
         updateVehicleWidgets(data);
 
-        if (wb1Configured) $('#f-val-wb').html(formatWatts(wb));
-        if (wb2Configured) $('#f-val-wb2').html(formatWatts(wb2));
+        if (wb1Configured) $('#f-val-wb').html(wallboxObservationUnknown(data, 'wb') ? '--' : formatWatts(wb));
+        if (wb2Configured) $('#f-val-wb2').html(wallboxObservationUnknown(data, 'wb2') ? '--' : formatWatts(wb2));
         $('#f-val-wp').html(formatWatts(wp)); $('#f-val-grid').html(formatWatts(grid));
         $('#f-val-hs').html(formatWatts(hsVal)); $('#f-val-climate').html(formatWatts(climate)); $('#f-val-bat').html(formatWatts(Math.abs(bat)));
         const hsTempNode = $('#f-val-hs-temp');
@@ -13281,8 +13345,8 @@ function processMobileData(data) {
             let content = '';
             if (CURRENT_VIEW === 'pv') { const pvBreakdownText = livePvBreakdownHtml(data); content = pvBreakdownText ? `Gesamt: ${data.pv}W | ${pvBreakdownText}` : `Gesamt: ${data.pv}W`; }
             else if (CURRENT_VIEW === 'grid') { const phaseText = liveGridPhaseLabeledText(data); content = phaseText ? `Netz: ${data.grid}W (${phaseText})` : `Netz: ${data.grid}W`; if (data.ac0_w !== undefined) { const wrTotal = (data.ac0_w || 0) + (data.ac1_w || 0) + (data.ac2_w || 0); content += `<br>WR: ${wrTotal}W (L1: ${data.ac0_w} | L2: ${data.ac1_w} | L3: ${data.ac2_w})`; } }
-            else if (CURRENT_VIEW === 'wb') { if (data.wb_p1 !== undefined) content = `WB 1 L1: ${data.wb_p1}W | L2: ${data.wb_p2}W | L3: ${data.wb_p3}W`; }
-            else if (CURRENT_VIEW === 'wb2') { if (data.wb2_p1 !== undefined) content = `WB 2 L1: ${data.wb2_p1}W | L2: ${data.wb2_p2}W | L3: ${data.wb2_p3}W`; }
+            else if (CURRENT_VIEW === 'wb') { if (data.wb_p1 !== undefined) content = `WB 1 L1: ${data.wb_p1 ?? '–'}W | L2: ${data.wb_p2 ?? '–'}W | L3: ${data.wb_p3 ?? '–'}W`; }
+            else if (CURRENT_VIEW === 'wb2') { if (data.wb2_p1 !== undefined) content = `WB 2 L1: ${data.wb2_p1 ?? '–'}W | L2: ${data.wb2_p2 ?? '–'}W | L3: ${data.wb2_p3 ?? '–'}W`; }
             else if (CURRENT_VIEW === 'hs') { const hsActual = data.hs_power || 0; const hsReq = data.hs_requested_w || data.hs_target_w || 0; content = `Heizstab Ist: ${hsActual}W`; if (hsReq > 0 && Math.abs(hsReq - hsActual) > 20) content += ` | Anforderung: ${hsReq}W`; if (data.elwa_water_temp_c != null) content += ` | Wasser: ${Number(data.elwa_water_temp_c).toFixed(1)}°C`; if (data.elwa_status) content += ` | Status: ${data.elwa_status}`; }
             else if (CURRENT_VIEW === 'climate') { const climateActual = data.climate_power_w || data.climate || 0; content = `Klima: ${climateActual}W`; if (data.climate_daily_kwh != null) content += ` | Heute: ${Number(data.climate_daily_kwh).toFixed(3)} kWh`; if (data.climate_source) content += ` | Quelle: ${data.climate_source}`; if (data.climate_phase) content += ` | Phase: ${String(data.climate_phase).toUpperCase()}`; }
             else if (CURRENT_VIEW === 'wp') { if (data.wp !== undefined) { content = `WP-Leistung: ${data.wp}W`; let ww = data.wp_ww_temp || (data.data && data.data.Warmwasser_Ist); let rl = data.wp_rl_temp || (data.data && data.data.Ruecklauf_Ist); let vl = data.wp_vl_temp || (data.data && data.data.Vorlauf_Ist); let khl = data.wp_kaelte_temp || (data.data && (data.data.Kaeltespeicher_Ist || data.data['Kältespeicher_Ist'])); if (ww) content += ` | WW: ${ww.toFixed(1)}°C`; if (rl) content += ` | RL: ${rl.toFixed(1)}°C`; if (vl) content += ` | VL: ${vl.toFixed(1)}°C`; if (khl) content += ` | Kältespeicher: ${khl.toFixed(1)}°C`; } }
@@ -13520,21 +13584,24 @@ function updateGridHealthUI(data) {
         }
     }
 
-    // Wallbox-Phasen (nur einblenden falls WB läuft oder connected)
-    const wbActive = typeof data.wb_p1 !== 'undefined' && (Math.abs(data.wb_p1) > 20 || Math.abs(data.wb_p2) > 20 || Math.abs(data.wb_p3) > 20);
+    // Wallbox-Istmessung: Fehlende Einzelkanäle und Phasen bleiben unbekannt.
+    const wbObservation = data.wb_observation;
+    const wbPhaseValues = [data.wb_p1, data.wb_p2, data.wb_p3].map(value =>
+        (wbObservation && wbObservation.valid !== true) || value === null || value === undefined
+            || !Number.isFinite(Number(value)) ? null : Number(value));
+    const wbActive = data.wb_charging === true || wbPhaseValues.some(value => value !== null && Math.abs(value) > 20)
+        || (wallboxConfiguredFlag(data, 1) && wallboxObservationUnknown(data, 'wb'));
     if (wbActive) {
         $('#gh-wb-container').show();
-        $('#gh-wb-l1').text(`${Math.round(data.wb_p1)} W`);
-        $('#gh-wb-l2').text(`${Math.round(data.wb_p2)} W`);
-        $('#gh-wb-l3').text(`${Math.round(data.wb_p3)} W`);
-
-        let phasesActive = 0;
-        if (Math.abs(data.wb_p1) > 50) phasesActive++;
-        if (Math.abs(data.wb_p2) > 50) phasesActive++;
-        if (Math.abs(data.wb_p3) > 50) phasesActive++;
-
-        let mBadge = $('#gh-wb-mode');
-        mBadge.text(`${phasesActive}p Laden`);
+        wbPhaseValues.forEach((value, index) => {
+            $('#gh-wb-l' + (index + 1)).text(value === null ? '– W' : `${Math.round(value)} W`);
+        });
+        const phasesActive = wbObservation
+            ? (wbObservation.valid === true && [0, 1, 2, 3].includes(data.wb_phases) ? data.wb_phases : null)
+            : (wbPhaseValues.every(value => value !== null)
+                ? wbPhaseValues.filter(value => Math.abs(value) > 50).length : null);
+        const mBadge = $('#gh-wb-mode');
+        mBadge.text(phasesActive === null ? 'Phasen unbekannt' : `${phasesActive}p ${wbObservation?.phases_source === 'reported' ? 'gemeldet' : 'Laden'}`);
         if (phasesActive === 1) mBadge.removeClass('bg-success bg-primary').addClass('bg-warning text-dark');
         else mBadge.removeClass('bg-warning text-dark').addClass('bg-primary');
     } else {

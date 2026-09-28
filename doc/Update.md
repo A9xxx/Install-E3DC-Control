@@ -5,11 +5,25 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.5.0a`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.5.1`. Das Dashboard startet ausschließlich
 den argumentlosen, root-eigenen Systemjob. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
+
+5.5.1 verbessert an der openWB Pro und am E3DC-Direktvertrag die
+Phasenreservierung und den bestätigten Wiederanlauf der Hochschaltung 1p→3p,
+ergänzt ein optionales 10-Minuten-Fenster für einen früheren 3p-Start, nimmt
+bei der Luxtronik einen laufenden PV-Boost nach „Automatik darf steuern“ aus
+geordnet zurück, ergänzt einen experimentellen Netzboost bei Negativpreisen,
+pseudonymisiert
+Kennungen im Diagnosepaket der Installationszentrale und lässt die API
+zusätzlich den Header `Authorization: Bearer` annehmen. Das Update läuft wie
+gewohnt über **System Update** bzw. das [Docker-Update](#docker-update); eine
+Konfigurationsänderung ist nicht nötig, da alle neuen Schalter standardmäßig
+aus sind. Einzelheiten stehen in den [Release Notes](../RELEASE_NOTES.md). Für
+ein Update von 5.4.x gelten zusätzlich die weiter unten stehenden Hinweise zu
+5.5.0a und 5.5.0.
 
 5.5.0a ist ein Sicherheitsupdate für die Web-PIN: Die Sperre nach
 Fehlversuchen gilt jetzt auch für den API-Zugriff per Header. Das Update läuft
@@ -142,6 +156,24 @@ Symlinks, Mehrfachlinks oder fremd beschreibbare Knoten stoppen kontrolliert
 vor der Mutation. Ist der Lock belegt, wartet E3DC-Control nicht in einer
 Neustartschleife, sondern fordert dazu auf, den laufenden Update- oder
 Backupauftrag zuerst abzuschließen.
+
+Vor dem Vollbackup und erneut unmittelbar vor dem Dienststopp prüft der
+Updater den freien Platz in `/run`. systemd lädt geänderte Dienstdefinitionen
+(`systemctl daemon-reload`) nur, wenn dort mindestens 16 MB frei sind. Liegt der
+freie Platz darunter, endet das Update mit `E3DC-UPD-RUN-SPACE-001`, bevor
+Dienste gestoppt oder Dateien ersetzt werden; knapp darüber erscheint nur eine
+Warnung. Abhilfe bis zum nächsten Neustart:
+
+```bash
+sudo mount -o remount,size=384M /run
+```
+
+Danach das Update erneut starten. npm-Abhängigkeiten optionaler Module wie der
+Matter-Bridge bereitet der Updater auf der Festplatte unter
+`/var/cache/e3dc-control/update-npm-staging` vor, nicht im heruntergeladenen
+Release unter `/run`, und entfernt diesen Arbeitsbereich nach dem Update wieder.
+Scheitert `systemctl daemon-reload`, versucht der Updater es nach kurzer
+Wartezeit einmal erneut und nennt bei einem Abbruch die Ausgabe von systemctl.
 
 ### Rettungsweg für heterogene Altinstallationen
 
@@ -374,8 +406,22 @@ Release-venvs, wie Update-Backup-Familien aufbewahrt werden (Standard drei,
 einschließlich des aktiven). Ein unmarkiertes Alt-venv wie `~/.venv_e3dc`
 wird nur mit einem Hinweis zum manuellen Entfernen gemeldet. Ausgenommen ist
 ein venv, mit dem der Watchdog (`piguard`) eingerichtet wurde: Es bleibt
-erhalten und wird nicht als entfernbar gemeldet. Umrichten auf die aktive
-Umgebung: `e3dc-setup`, Menü 15 „Watchdog & Telegram konfigurieren“ →
+erhalten und wird nicht als entfernbar gemeldet.
+
+War `piguard` vor dem Update aktiv und beim Systemstart aktiviert und nutzt er
+noch ein anderes venv, bindet
+das Update ihn nach dem bestätigten Start mit demselben transaktionalen
+Installer wie Menü 15 an das neue aktive venv; Router-IP und
+Überwachungsdatei bleiben unverändert, der Benachrichtigungsdienst wird nicht
+angefasst. Erfolg heißt: `piguard` läuft, und seine Hashliste bindet das neue
+venv. Scheitert die Neubindung, rollt der Installer auf den vorherigen
+Watchdog-Zustand zurück; gelingt auch das nicht, bleibt `piguard` gestoppt.
+Das Update meldet in beiden Fällen eine Warnung mit dem aktuellen
+`piguard`-Zustand, die neue Version bleibt aktiv, und das bisherige venv
+bleibt erhalten. Ein zuvor inaktiver oder beim Systemstart deaktivierter
+Watchdog bleibt unverändert; sein venv bleibt erhalten. Manuelles Umrichten
+auf die aktive Umgebung:
+`e3dc-setup`, Menü 15 „Watchdog & Telegram konfigurieren“ →
 „Komplett neu installieren / reparieren“. Die bei diesem
 Wechsel geladenen apt-Pakete bleiben nicht im apt-Cache, pip arbeitet ohne
 Download-Cache.

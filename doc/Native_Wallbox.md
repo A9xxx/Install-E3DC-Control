@@ -556,7 +556,12 @@ Pfad bewährt:
   dem Schalten, nicht ein Vorlauf davor. Während dieser Sperre steht die Uhr
   auf 0 und das Konto hält seinen Stand: Vorlauf und Konto werden nach der
   Sperre neu verdient, damit auf einen Abstieg kein sofortiger Wiederaufstieg
-  folgt. Optional bewertet die
+  folgt. Am E3DC-Direktvertrag gilt die Haltezeit nach jedem Wechsel als diese
+  Sperre, genau wie an der openWB Pro. Wie eine Hochschaltung an der openWB
+  Pro ausgegeben wird (Freigabe, Wartegrenze, Wiederanlauf), steht im
+  Abschnitt „Hochschaltung ausgeben: Freigabe, Wartegrenze und Wiederanlauf“;
+  das experimentelle 10-min-Fenster im Abschnitt „Experimentelles
+  10-min-Fenster 1p→3p“. Optional bewertet die
   Symmetrie-Klausel `wb_phase_up_symmetry_enable` (Standard aus) eine
   einphasige Ladung ab dem Schieflastwert `grid_pcc_imbalance_max_a`
   (Standard 20 A) als ausgereizt, damit die Einspeisung nicht einseitig auf
@@ -623,6 +628,161 @@ Pfad bewährt:
   Wallbox geht deshalb auf die Wallbox zurück, nicht auf die Regelung. Die
   Absenkung auf das Budget (ab 6 A) folgt mit dem ersten frischen Status, auch
   während des Startfensters.
+
+#### Hochschaltung ausgeben: Freigabe, Wartegrenze und Wiederanlauf
+
+Eine Hochschaltung 1p→3p an der openWB Pro braucht vor jedem Geräteausgang
+die Freigabe des Speicherreglers (Budgetpflicht: Der Speicherregler vergibt die
+Leistung, der Wallbox-Manager überschreitet sie nicht).
+
+- **Reservierung:** Reserviert werden die bisher laufende Leistung
+  beziehungsweise der Wiederanlauf mit 6 A je Phase (rund 4,14 kW) plus eine
+  kleine Messreserve, nicht der bisherige einphasige Strom je Zielphase
+  (29 A × 3 Phasen wären rund 20 kW).
+- **Wartegrenze:** Solange der Auftrag auf die Freigabe wartet, lädt die Box
+  einphasig weiter, während Zuteilung und Speicherregler schon mit drei Phasen
+  rechnen. Belegt der frische Status genau eine Phase (Statusziel 1,
+  verifizierte Phasenleistung), behält die einphasige Ladung dabei ihren
+  Strom im Rahmen des Budgets: Der Wattdeckel rechnet ihn mit dieser einen Phase um, denn vor dem
+  ersten Phasenausgang kann die Box nicht dreiphasig ziehen. Bei mehreren
+  Wallboxen bleibt die Stromzuteilung der Box dreiphasig, damit die
+  Phasenreservierung am Hausanschluss konservativ bleibt. Dies ist die
+  vorläufige Variante (b): Die mögliche Drittel-Leistungsbeschränkung bei
+  mehreren Ladepunkten bleibt eine bekannte Einschränkung. Bei einer
+  Einzelbox gilt dieselbe frische Phasenbindung auch für die Mindestbudget-
+  Sperre und noch im Zyklus eines ausgangslosen Abbruchs. Der Auftrag endet
+  ohne Geräteausgang, sobald eine dieser Bedingungen eintritt: keine
+  ausreichende Freigabe nach 90 s; eine erteilte Freigabe 90 s nach ihrem
+  Eingang ungenutzt; die Regelung fordert die Hochschaltung zwei Zyklen lang
+  nicht mehr an, etwa in einer Ladepause. Ein Weckimpuls oder CP-Start zählt
+  dabei nur als Ausgang, wenn er zu diesem Auftrag gehört; ein Weckstart vom
+  Beginn der Stecksession hält ihn nicht fest.
+- **Rückzug:** Nach einem solchen Abbruch folgt der nächste Versuch frühestens
+  nach `wb_phase_retry_block_s` (Standard 900 s, mindestens die
+  Phasenwartezeit von 480 s). Vorlauf, Export-Wh-Konto und 10-min-Fenster
+  beginnen neu und werden erst danach neu verdient; am Ende der Sperre folgt
+  kein Sofortversuch. Die Log-Zeile lautet „Hochschaltung 1p→3p ohne Ausgang
+  abgebrochen: …; nächster Versuch frühestens in 15 min“; die Ursache steht
+  dazwischen, zum Beispiel „keine Speicherfreigabe nach 90 s“,
+  „Speicherfreigabe 90 s ungenutzt“ oder „Hochschaltung nach 8 s nicht mehr
+  angefordert“.
+- **Wiederanlauf:** Nach dem Phasenwechsel läuft die Box mit 6 A je Phase an.
+  Bis der Wiederanlauf unter Last bestätigt ist (mindestens drei Messungen
+  über 500 W, stabil über mindestens 10 s, gleich mit wie vielen Phasen das
+  Fahrzeug lädt), begrenzt die Regelung jeden Strom auf die freigegebene
+  Reservierung, zum Beispiel auf 6,6 A dreiphasig nach 4,6 kW einphasiger
+  Ladung. Danach folgt die Rampe wieder dem Wattbudget, solange die
+  Reservierung besteht jedoch weiterhin auf drei Phasen umgerechnet.
+  Ein Fahrzeug mit zwei beziehungsweise einer tatsächlich genutzten Phase
+  erreicht bis zum Ende der Reservierung deshalb höchstens etwa zwei Drittel
+  beziehungsweise ein Drittel des Budgets. Der Lastbeleg beendet nur den
+  Wiederanlaufdeckel, nicht die an drei Zielphasen gebundene Reservierung.
+  Diese bekannte Grenze bleibt unverändert.
+- **Neustart des Managers:** Wartete ein Auftrag beim Neustart noch ohne
+  Ausgang, bleiben positiver Strom, Phasenziel und CP gesperrt, bis ein
+  frischer Readback nach dem Neustart vorliegt. Ein Ruhe-Readback (CP
+  inaktiv, Ladebit aus, höchstens 50 W und ein Stromangebot von höchstens
+  0,5 A oder das initiale 6-A-Angebot bei noch alter Phasenzahl) oder eine
+  belegte Ladung mit der bisherigen Phasenzahl beendet den Auftrag ohne
+  Geräteausgang; danach geht der Start normal durch. Fehlende Felder sind
+  kein Ruhebeleg.
+- **Diagnose:** Warum eine Hochschaltung nicht ausgegeben wurde, steht je
+  Wallbox in `ramdisk/wallbox_native.json` (`wb_details[]`) und
+  `ramdisk/wallbox_decision_latest.json` (`wallboxes[]`): `phase_up_block_reason` und
+  `phase_up_block_ts` (zum Beispiel `await_storage_grant:0/4750 W`),
+  `openwb_pro_phase_grant_wait` (Grund, Wartezeit, ungenutzte Freigabe),
+  `openwb_pro_phase_grant_wait_abort`, `openwb_pro_phase_up_request`,
+  `openwb_pro_phase_reservation_output_gate` und
+  `phase_transition_reservation` (dort zeigen `restart_load_confirmed_ts` und
+  `restart_load_phases`, wann und mit wie vielen Phasen der Wiederanlauf unter
+  Last bestätigt war). Das Log meldet „Hochschaltung 1p→3p
+  ausgesetzt: …“ je Grund höchstens alle 5 Minuten; das bloße Warten auf die
+  Freigabe erst nach 90 s. Eine normal laufende Umschaltung erzeugt keinen
+  Eintrag; nach Ausgabe, Abschluss, Abbruch oder Ende der Anforderung wird er
+  gelöscht.
+
+#### Experimentelles 10-min-Fenster 1p→3p
+
+Schalter `wb_phase_up_window_enable` (Standard 0 = aus). Der Schalter hat im
+Config-Editor noch kein eigenes Bedienelement; er wird wie
+`wb_phase_energy_policy_enable` direkt in der Konfiguration `e3dc_v4.json`
+gesetzt (`1` = ein, `0` = aus). Das Fenster wirkt nur an der openWB Pro
+und am E3DC-Direktvertrag und nur mit eingeschalteter Energie-Phasenpolitik
+(`wb_phase_energy_policy_enable`).
+
+- **Messgröße:** der verfügbare Überschuss wie bei der Hochschaltung
+  (Einspeisung plus Wallbox oder das frische Budget des Speicherreglers; eine
+  Akku-Entladung zählt als Defizit). Fehlende oder veraltete Messwerte zählen
+  nie als Überschuss.
+- **Bereit:** Das Mittel der letzten 10 Minuten erreicht das 3p-Minimum plus
+  15 % (rund 4,76 kW) bei mindestens 9 Minuten gültigen Messwerten, und in den
+  letzten 2 Minuten ist jeder 30-s-Abschnitt zu mindestens 90 % gemessen und
+  liegt über dem 3p-Minimum (4,14 kW). Eine Messung überbrückt höchstens 10 s
+  plus die Verlängerung des Leerlauftakts (`wb_idle_poll_s`, etwa 18 s bei
+  10 s Leerlauftakt); längere Lücken zählen als fehlende Daten.
+- **Wirkung:** Das Fenster ist ein zusätzlicher Auslöser. Ist es bereit,
+  schaltet die Regelung eine laufende einphasige Ladung ohne Vorlauf,
+  Export-Wh-Konto und die Bedingung „eine Phase ausgereizt“ auf drei Phasen
+  (`trigger` = `window`). Vor dem Ladebeginn setzt die openWB Pro das
+  Phasenziel 3 nur für ein Fahrzeug mit dreiphasigem Profil, auch wenn die
+  Box ruht (`trigger` = `start_window`); unbekannte, ein- und zweiphasige
+  Fahrzeuge starten weiter zuerst einphasig. Der bisherige Weg über Vorlauf
+  oder Export-Wh-Konto (ohne `trigger`) bleibt daneben wirksam und kann
+  früher hochschalten.
+- **Unverändert:** Sperre nach jedem Wechsel (480 s; das Fenster beginnt in ihr
+  neu und wird danach neu verdient, frühestens also 480 s plus 9 Minuten nach
+  einem Wechsel bereit; über Vorlauf oder Export-Wh-Konto frühestens 480 s
+  plus 60 s Vorlauf nach einem Abstieg), Netzbezugssperre, einphasige
+  Fahrzeuge, Freigabe durch den Speicherregler sowie Wartegrenze, Rückzug und
+  Wiederanlauf aus dem vorigen Abschnitt.
+- **Diagnose:** `phase_energy_policy.window_enabled`, `window_ready`,
+  `window_reason` (`ready`, `cover_short`, `mean_below_threshold`,
+  `recent_dip`, `sample_invalid`), `window_mean_w`, `window_cover_s`,
+  `window_dip_min_w`, `window_dip_cover_s`, `window_dip_gap`,
+  `window_threshold_w` und `trigger` (`window` für die Hochschaltung,
+  `start_window` für den dreiphasigen Start). Das Fenster läuft auch bei
+  ausgeschaltetem Schalter als Diagnose mit.
+
+**Testanleitung (Community):**
+
+1. Voraussetzungen: openWB Pro oder E3DC-Direktvertrag, Energie-Phasenpolitik
+   ein, für den Test des dreiphasigen Starts ein Fahrzeugprofil mit drei
+   Phasen. Möglichst eine Wallbox; mit zwei Wallboxen bitte ausdrücklich
+   vermerken.
+2. Einschalten: in `e3dc_v4.json` `wb_phase_up_window_enable` auf `1` setzen.
+   Zurück zum bisherigen Verhalten geht es jederzeit mit `0` (Standard);
+   weitere Schritte sind nicht nötig.
+3. Beobachten, am besten an einem Tag mit wechselnder Bewölkung. Das Fenster
+   ist ein zusätzlicher Auslöser; maßgeblich ist das Feld `trigger` des
+   Aufstiegs. Kommen Aufstiege mit `trigger` = `window` beziehungsweise
+   `start_window` nur bei stabilem Überschuss? Liegen zwischen einem Wechsel
+   und dem nächsten Aufstieg mit `trigger` = `window` mindestens rund
+   17 Minuten (480 s Sperre plus 9 Minuten Fenster)? Aufstiege ohne `trigger`
+   kommen weiter über Vorlauf oder Export-Wh-Konto, frühestens rund 9 Minuten
+   nach einem Abstieg (480 s Sperre plus 60 s Vorlauf); sie sind kein Fehler
+   des Fensters. Startet eine neue Ladung nur mit dreiphasigem Profil direkt
+   dreiphasig? Bleibt die Ladeleistung, solange eine Hochschaltung auf die
+   Freigabe wartet (`phase_transition_reservation.stage` = `await_budget`),
+   bei einer Einzelbox im Rahmen des einphasigen Budgets, statt auf rund
+   ein Drittel zu fallen? Mehrfachzuteilung bleibt vorläufig dreiphasig.
+   Endet bei einem zwei- oder einphasig ladenden Fahrzeug nach mindestens
+   drei Lastmessungen über mindestens 10 s der Wiederanlaufdeckel? Strom,
+   tatsächliche Phasen und Wattbudget notieren: Die Umrechnung bleibt bis
+   zum Ende der Reservierung dreiphasig; etwa zwei Drittel beziehungsweise
+   ein Drittel des Budgets sind dann die bekannte Grenze. Folgt nach
+   „ohne Ausgang abgebrochen“ kein
+   Sofortversuch? Entsteht durch den Wechsel Netzbezug?
+4. Rückmeldung: die Log-Zeilen „Hochschaltung 1p→3p …“ (einschließlich der
+   Ursache eines Abbruchs, zum Beispiel „keine Speicherfreigabe nach 90 s“,
+   „Speicherfreigabe 90 s ungenutzt“ oder „Hochschaltung nach N s nicht mehr
+   angefordert“) und „openWB auf 3p angefordert“ mit Uhrzeit sowie aus
+   `ramdisk/wallbox_decision_latest.json` (`wallboxes[]`) je Wallbox die
+   Felder `phase_energy_policy` (nur die `window_*`-Felder und `trigger`),
+   `phase_up_block_reason`, `openwb_pro_phase_grant_wait`,
+   `openwb_pro_phase_grant_wait_abort` und `phase_transition_reservation`.
+   Diese Felder enthalten nur Leistungs-, Zeit- und Zustandswerte; bitte keine
+   Zugangsdaten, IP-Adressen, Fahrzeugkennungen oder Standortangaben
+   mitsenden.
 
 #### Startfenster, Wiederholzyklus und Weckimpuls
 

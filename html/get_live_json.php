@@ -2048,6 +2048,48 @@ function applyVehicleSocDisplayCache(&$vehicle, $cache, $maxAgeS = 604800) {
     }
 }
 
+/**
+ * Anzeigewert nach echtem Stecker-Abzug: Der Fahrzeug-SoC-Tracker hält den
+ * zuletzt geschätzten SoC der Session als unbestätigten Schätzwert fest
+ * (estimate_unconfirmed). Er erscheint nur als Anzeige („geschätzt“), nie als
+ * Regelwert und nie als Anker einer neuen Schätzung.
+ */
+function vehicleSocUnpluggedEstimateDisplay($manual, $now = null, $maxAgeS = 604800) {
+    if (!is_array($manual)) return null;
+    $now = is_numeric($now) ? (int)$now : time();
+    if (strtolower(trim((string)($manual['source'] ?? ''))) !== 'wallbox_estimated_unplugged'
+        || ($manual['estimate_unconfirmed'] ?? null) !== true
+        || ($manual['soc_rule_confirmed'] ?? null) === true) {
+        return null;
+    }
+    $estimateSource = strtolower(trim((string)($manual['estimate_source'] ?? '')));
+    if (strpos($estimateSource, 'wallbox_estimated_from_') !== 0
+        || !wallboxSocSourceTrusted($estimateSource)
+        || vehicleSocExplicitVetoed($manual, false, false)) {
+        return null;
+    }
+    $soc = vehicleSocPercentValue($manual['soc'] ?? null);
+    $estimateTs = vehicleSocTimestamp($manual['estimate_ts'] ?? null, $now);
+    if ($soc === null || $estimateTs === null || ($now - $estimateTs) > $maxAgeS) return null;
+    $display = [
+        'soc' => round($soc, 2),
+        'soc_source' => $estimateSource,
+        'soc_source_ts' => $estimateTs,
+        'last_updated_at' => $estimateTs,
+        'soc_display_only' => true,
+        'soc_rule_confirmed' => false,
+        'soc_estimate_unconfirmed' => true,
+        'is_interpolated' => true,
+        'is_plugged_in' => false,
+        'is_charging' => false,
+    ];
+    if (!vehicleSocDisplayAllowed($display)) return null;
+    if (vehicleValuePresent($manual['range_km'] ?? null)) {
+        $display['range_km'] = (int)round((float)$manual['range_km']);
+    }
+    return $display;
+}
+
 function saveVehicleSocDisplayCache($file, $vehicles, $existingCache = [], $maxAgeS = 604800) {
     $now = time();
     $cache = is_array($existingCache) ? $existingCache : [];
@@ -2493,6 +2535,85 @@ function liveExtInverterHistoryFields($ext) {
         $fields['ext_mppt' . ($i + 1) . '_w'] = $valid && isset($ext['mppt'][$i]['w']) ? $ext['mppt'][$i]['w'] : null;
     }
     return $fields;
+}
+
+function liveApplyWallboxObservationProjection(&$data, $native, $enabled, $configured, $now = null) {
+    if (!$enabled) return;
+    $now = $now === null ? (float)time() : (float)$now;
+    $number = static function($value) {
+        return (is_int($value) || is_float($value)) && is_finite((float)$value) ? (float)$value : null;
+    };
+    $packetTs = $number(is_array($native) ? ($native['ts'] ?? null) : null);
+    $packetFresh = $packetTs !== null && $now - $packetTs >= -5 && $now - $packetTs < 60;
+    $observedPhases = [];
+    foreach ([1 => 'wb', 2 => 'wb2'] as $slot => $prefix) {
+        if (empty($configured[$slot])) continue;
+        $detail = null;
+        foreach ((is_array($native) ? ($native['wb_details'] ?? []) : []) as $candidate) {
+            if (is_array($candidate) && (int)($candidate['id'] ?? 0) === $slot) $detail = $candidate;
+        }
+        $observation = is_array($detail['observation'] ?? null) ? $detail['observation'] : [];
+        $sampleTs = $number($observation['sample_ts'] ?? null);
+        $age = $sampleTs !== null ? $now - $sampleTs : null;
+        $valid = $packetFresh && ($observation['schema_version'] ?? '') === 'wallbox_observation_v1'
+            && ($observation['valid'] ?? null) === true && $sampleTs !== null && $sampleTs > 0
+            && $age >= -5 && $age < 60;
+        $reason = !$packetFresh ? 'status_packet_stale_or_missing'
+            : (!$observation ? 'observation_missing'
+                : (!$valid ? (string)($observation['reason'] ?? 'observation_stale_or_invalid')
+                    : (string)($observation['reason'] ?? 'fresh')));
+        if (!$valid && in_array($reason, ['fresh', 'ok', 'partial_measurement'], true)) $reason = 'observation_stale_or_invalid';
+        $values = $valid && is_array($observation['values'] ?? null) ? $observation['values'] : [];
+        $map = ['power_w' => '', 'plug' => '_plug', 'locked' => '_locked', 'charging' => '_charging',
+                'phases' => '_phases', 'current_a' => '_status_amp',
+                'phase_power_l1_w' => '_p1', 'phase_power_l2_w' => '_p2', 'phase_power_l3_w' => '_p3',
+                'phase_current_l1_a' => '_i1', 'phase_current_l2_a' => '_i2', 'phase_current_l3_a' => '_i3'];
+        $missing = [];
+        foreach ($map as $field => $suffix) {
+            $raw = $values[$field] ?? null;
+            $value = in_array($field, ['plug', 'locked', 'charging'], true)
+                ? (is_bool($raw) ? $raw : null) : $number($raw);
+            $data[$prefix . $suffix] = $value;
+            if ($value === null) $missing[] = $field;
+        }
+        // Alle öffentlichen Ist-Aliase folgen derselben aktuellen Messung.
+        $data[$prefix . '_phases_actual'] = $data[$prefix . '_phases'];
+        $phaseSource = $observation['phases_source'] ?? 'unknown';
+        $data[$prefix . '_phases_source'] = $data[$prefix . '_phases'] !== null
+            && in_array($phaseSource, ['current_channels', 'power_channels', 'reported'], true)
+            ? $phaseSource : 'unknown';
+        $observedPhases[$slot] = $data[$prefix . '_phases'];
+        $data[$prefix . '_status_valid'] = $valid;
+        $data[$prefix . '_status_fresh'] = $valid;
+        $data[$prefix . '_status_source'] = (string)($observation['source'] ?? 'driver_readback');
+        $data[$prefix . '_status_reason'] = $reason;
+        $data[$prefix . '_observation'] = ['valid' => $valid, 'reason' => $reason,
+            'source' => $data[$prefix . '_status_source'], 'sample_ts' => $sampleTs,
+            'age_s' => $age, 'missing_fields' => $missing,
+            'phases_source' => $data[$prefix . '_phases_source']];
+        if (!$valid) {
+            $data[$prefix . '_state_text'] = 'Status unbekannt';
+            $data[$prefix . '_state_reason'] = $reason;
+        }
+        foreach (($data['wb_details'] ?? []) as $index => $uiDetail) {
+            if ((int)($uiDetail['id'] ?? 0) !== $slot) continue;
+            foreach ($map as $field => $suffix) {
+                $data['wb_details'][$index][$field] = $data[$prefix . $suffix];
+            }
+            foreach (['phases_actual', 'phases_in_use', 'phase_actual_phases'] as $field) {
+                $data['wb_details'][$index][$field] = $data[$prefix . '_phases'];
+            }
+            $data['wb_details'][$index]['phases_source'] = $data[$prefix . '_phases_source'];
+            $data['wb_details'][$index]['observation'] = $data[$prefix . '_observation'];
+        }
+    }
+    $activeSlot = (int)($data['active_wb_id'] ?? 0);
+    $data['active_wb_phases'] = $observedPhases[$activeSlot] ?? null;
+    $data['active_wb_phases_source'] = $data[($activeSlot === 2 ? 'wb2' : 'wb') . '_phases_source'] ?? 'unknown';
+    if (!isset($observedPhases[$activeSlot])) $data['active_wb_phases_source'] = 'unknown';
+    $data['detected_phases'] = $observedPhases[1] ?? null;
+    $data['wallbox_phases_reason'] = $data['detected_phases'] !== null && $data['active_wb_phases'] !== null
+        ? 'fresh' : 'phase_measurement_unavailable';
 }
 
 function liveBoolValue($value, $default = false) {
@@ -5751,14 +5872,29 @@ if (is_array($liveData) && isset($liveData['PV_Power'])) {
             }
         }
 
-        if (isset($liveData['WP_Power'])) {
-            $wp_pwr = (float)$liveData['WP_Power'];
+        if (isset($liveData['WP_Power']) || $wpTypeCfg === 6) {
+            $wp_pwr = (float)($liveData['WP_Power'] ?? 0);
             // Ghost-Filter: Eba-M's C++ Kern schreibt oft Fehlwerte (z.B. Außentemperatur Register 1000 = 912W) in WP_Power.
             // Wenn eine native Integration (IDM/Luxtronik) konfiguriert ist, ignorieren wir E3DC-WP-Power komplett!
             $wpType = $wpTypeCfg;
             $luxtronikOn = isset($confData['config']['luxtronik']) && in_array(strtolower(trim($confData['config']['luxtronik'])), ['1', 'true']);
 
-            if ($wpType == 0 && !$luxtronikOn) {
+            if ($wpType === 6) {
+                // wp_type=6 (E3DC-Leistungsmesser): Der PM ist die gewählte Quelle. Es gilt dieselbe
+                // Gültigkeitsregel wie im Storage Manager; eine ungültige Messung bleibt 0 W und wird
+                // als ungültig gekennzeichnet, es wird kein Ersatzwert gebildet.
+                $wpPmValid = e3dcHeatpumpPmPowerValid($liveData);
+                $data['wp'] = $wpPmValid ? (int)$liveData['WP_Power'] : 0;
+                $data['wp_power_valid'] = $wpPmValid;
+                $data['wp_power_source'] = (string)($liveData['WP_Power_Source'] ?? 'e3dc_pm');
+                // Wie der Storage Manager (storage_home_wp_split): Nur wenn die WP im
+                // E3DC-Hauswert steckt, wird sie später vom Hausverbrauch abgezogen.
+                $data['wp_home_includes_wp'] = $wpPmValid && e3dcHeatpumpHomeIncludesWp(
+                    $confData['config']['storage_home_wp_split'] ?? 'auto',
+                    $data['home_raw'] ?? 0,
+                    $data['wp']
+                );
+            } elseif ($wpType == 0 && !$luxtronikOn) {
 // Auto-Healing für Eba-M's Bug (Strompreis * 1000)
                 $fakeExpected = isset($scheduledPrice) ? $scheduledPrice * 1000 : 0;
                 if ($fakeExpected > 100 && abs($wp_pwr - $fakeExpected) < ($fakeExpected * 0.05)) {
@@ -5914,7 +6050,8 @@ if (is_array($liveData) && isset($liveData['PV_Power'])) {
 $shellyWpIp = $confData['config']['heizstab_shelly_ip']
     ?? $confData['config']['shellyem_ip']
     ?? '';
-if (!empty($shellyWpIp) && $shellyWpIp !== '0.0.0.0') {
+// Beim E3DC-Leistungsmesser (wp_type=6) ist der PM die gewählte Quelle; ein Shelly überschreibt ihn nicht.
+if (!empty($shellyWpIp) && $shellyWpIp !== '0.0.0.0' && $wpTypeCfg !== 6) {
 // Nur für wp_type != 3 direkt abfragen: Bei wp_type=3 liefert heizstab_manager
     // den praeziseren Wert aus heizstab_data.json (wurde oben bereits gesetzt).
 // Für wp_type=2 und alte shellyem_ip-Konfiguration: Direktabfrage als Fallback.
@@ -5943,7 +6080,9 @@ $wpSourceJson = null;
 $isIdm = false;
 $heatManagerSource = null;
 
-if ($wpConfigured && $wpTypeCfg !== 3) {
+// wp_type=6 (E3DC-Leistungsmesser) hat keine Herstellerdatei; alte luxtronik.json- oder
+// waermepumpe.json-Reste dürfen den PM-Wert nicht überschreiben.
+if ($wpConfigured && $wpTypeCfg !== 3 && $wpTypeCfg !== 6) {
     if ($wpTypeCfg === 4) {
         // Stiebel darf nur aus einem frischen, erfolgreichen und eindeutig
         // herstellergebundenen Vertrag stammen. Alte Luxtronik-Reste sind
@@ -7297,8 +7436,9 @@ if (!isset($data['home'])) {
     $data['home'] = (float)$data['home_raw'];
 }
 
-// 1. Wärmepumpe abziehen (falls sie Teil des Hausverbrauchs ist)
-if ($data['wp'] > 0) {
+// 1. Wärmepumpe abziehen (falls sie Teil des Hausverbrauchs ist). Beim E3DC-
+// Leistungsmesser (wp_type=6) entscheidet dieselbe Regel wie im Storage Manager.
+if ($data['wp'] > 0 && e3dcHeatpumpPowerCountsInHome($data, $wpTypeCfg)) {
     $data['home'] = max(0, $data['home'] - $data['wp']);
 }
 
@@ -7604,6 +7744,9 @@ if ($mqttHaInboundEnabled && file_exists($mqttHaInboundFile) && (time() - filemt
             $haWpPowerRaw = $getHaValue($haWp, 'power_w');
             if ($haWpPowerRaw === null) $haWpPowerRaw = $getHaValue($haWp, 'electric_w');
             $haWpPower = is_numeric($haWpPowerRaw) ? max(0, (float)$haWpPowerRaw) : null;
+            // Beim E3DC-Leistungsmesser bleibt der PM-Wert maßgeblich (wie beim Shelly):
+            // Mit ihm regelt der Storage Manager, und nach ihm richtet sich die Hausaufteilung.
+            if ($wpTypeCfg === 6) $haWpPower = null;
             if ($haWpPower !== null) {
                 $data['wp'] = (int)round($haWpPower);
                 $data['wp_electric_w'] = (float)$haWpPower;
@@ -7684,7 +7827,10 @@ e3dcApplyWallboxPresenceProjection($data, $wbConfigured, $wb2Configured, $wb2Exp
 
 if ($mqttHaAppliedConsumer) {
     $cleanHome = (float)($data['home_raw'] ?? $data['home'] ?? 0);
-    $cleanHome -= max(0, (float)($data['wp'] ?? 0));
+    // Beim E3DC-Leistungsmesser nur abziehen, wenn die WP im E3DC-Hauswert steckt (wie oben).
+    if (e3dcHeatpumpPowerCountsInHome($data, $wpTypeCfg)) {
+        $cleanHome -= max(0, (float)($data['wp'] ?? 0));
+    }
     $cleanHome -= max(0, (float)($data['hs_power'] ?? 0));
     $cleanHome -= max(0, (float)($data['climate_power_w'] ?? 0));
     if (!empty($data['is_external_wb'])) $cleanHome -= max(0, (float)($data['wb'] ?? 0));
@@ -7711,6 +7857,12 @@ if ($validData && $historySampleValid && (time() - $lastWrite) >= 60 && !$isStan
         // aus dem reinen Hausverbrauch herausgerechnet.
         $hsPowerForStats = max(0, (float)($data['hs_power'] ?? 0));
         $wpOnlyForStats = max(0, (float)$data['wp']);
+        // E3DC-Leistungsmesser mit WP außerhalb des E3DC-Hauswerts: Die Verlaufsbereiniger
+        // rechnen „roher Hauswert minus WP“. Bis die Zeile die Aufteilung selbst trägt,
+        // wird die WP dort wie vor 5.5.1 nicht gebucht; live bleibt sie sichtbar.
+        if (!e3dcHeatpumpPowerCountsInHome($data, $wpTypeCfg)) {
+            $wpOnlyForStats = 0;
+        }
         if (empty($data['mqtt_ha_inbound_history'])) {
             if (($data['hs_source'] ?? '') === 'mqtt_ha') $hsPowerForStats = 0;
             if (($data['wp_source'] ?? '') === 'mqtt_ha') $wpOnlyForStats = 0;
@@ -8247,6 +8399,7 @@ if (!empty($savedCars)) {
             continue;
         }
         $sc['soc'] = 0; // Default
+        $unpluggedEstimate = null;
         foreach([1, 2] as $idx) {
             $manSoC = "/var/www/html/ramdisk/manual_soc_wb{$idx}.json";
             if (file_exists($manSoC)) {
@@ -8333,6 +8486,23 @@ if (!empty($savedCars)) {
                     $sc['is_plugged_in'] = true;
                     $sc['is_charging'] = !empty($mD['charging']);
                 }
+                if ($mD && $manualProfileId !== null && $manualProfileId === ($sc['id'] ?? '')) {
+                    $estimateCandidate = vehicleSocUnpluggedEstimateDisplay($mD);
+                    if (is_array($estimateCandidate)
+                        && (!is_array($unpluggedEstimate)
+                            || $estimateCandidate['soc_source_ts'] > $unpluggedEstimate['soc_source_ts'])) {
+                        $unpluggedEstimate = $estimateCandidate;
+                    }
+                }
+            }
+        }
+        // Nach echtem Abzug bleibt der letzte Schätzwert als reine Anzeige
+        // stehen, solange kein bestätigter Wert für dieses Profil vorliegt.
+        if (is_array($unpluggedEstimate)
+            && ($sc['soc_rule_confirmed'] ?? null) !== true
+            && empty($sc['soc_profile_binding_invalid'])) {
+            foreach ($unpluggedEstimate as $estimateKey => $estimateValue) {
+                $sc[$estimateKey] = $estimateValue;
             }
         }
         $data['vehicles'][] = $sc;
@@ -9219,6 +9389,14 @@ if ($storagePlanFresh) {
         }
         $today0 = $storageDisplayDayStart ?: mktime(0, 0, 0);
         $today1 = $storageDisplayDayEnd ?: ($today0 + 86400);
+
+        try {
+            $storageTzLocal = new DateTimeZone($storageTimezoneName);
+        } catch (Exception $e) {
+            $storageTzLocal = new DateTimeZone('Europe/Berlin');
+        }
+        $todayLocalDt = new DateTimeImmutable('now', $storageTzLocal);
+        $todayLocal0 = (new DateTimeImmutable($todayLocalDt->format('Y-m-d') . ' 00:00:00', $storageTzLocal))->getTimestamp();
         $storageStateBinding = liveStorageStateCurveBinding(
             $storPlan,
             $storState,
@@ -10129,6 +10307,8 @@ if (!isset($data['house_battery_soc']) || !is_array($data['house_battery_soc']))
 
 // Session-/Legacypfade laufen für Bestandsmigration weiter, dürfen aber am
 // Ausgang keinen ausdrücklich deaktivierten Wallbox-Slot wieder projizieren.
+// Zuletzt gilt die zentrale Messprojektion; ältere Caches dürfen null nicht zu 0 verjüngen.
+liveApplyWallboxObservationProjection($data, $nativeWb ?? null, $wbNativeEnable, [1 => $wbConfigured, 2 => $wb2Configured]);
 e3dcApplyWallboxPresenceProjection($data, $wbConfigured, $wb2Configured, $wb2ExplicitlyDisabled);
 
 echo json_encode($data);

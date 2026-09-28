@@ -617,6 +617,41 @@ handleCORSAndExternalAuth();
 
 handleDiagnoseAck();
 
+/**
+ * Header der aktuellen Anfrage, wie der Webserver sie an PHP übergibt.
+ * Kleine Hilfsfunktion, damit die Anmeldung ohne Webserver prüfbar bleibt.
+ * Liefert ein leeres Array, wenn die SAPI keine Header-Liste anbietet.
+ */
+function e3dcWebAuthRequestHeaders() {
+    foreach (['getallheaders', 'apache_request_headers'] as $reader) {
+        if (function_exists($reader)) {
+            $headers = @$reader();
+            if (is_array($headers)) {
+                return $headers;
+            }
+        }
+    }
+    return [];
+}
+
+/**
+ * Wert des Headers Authorization. Apache mit mod_php legt ihn weder in
+ * HTTP_AUTHORIZATION noch in REDIRECT_HTTP_AUTHORIZATION ab; dann wird er aus
+ * der Header-Liste gelesen (Header-Name ohne Beachtung der Groß-/Kleinschreibung).
+ */
+function e3dcWebAuthAuthorizationHeader() {
+    $serverValue = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? null;
+    if ($serverValue !== null) {
+        return (string)$serverValue;
+    }
+    foreach (e3dcWebAuthRequestHeaders() as $name => $value) {
+        if (is_string($name) && strcasecmp($name, 'Authorization') === 0 && is_scalar($value)) {
+            return (string)$value;
+        }
+    }
+    return '';
+}
+
 function isWebAuthenticated() {
     if (PHP_SAPI === 'cli') {
         return true;
@@ -639,7 +674,7 @@ function isWebAuthenticated() {
     if ($pin === '') return true; // Kein PIN gesetzt -> Jeder ist authentifiziert
 
     // 2. Token-basierte Anmeldung (für Widgets und externe Apps)
-    $authHeader = $_SERVER['HTTP_AUTHORIZATION'] ?? $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ?? '';
+    $authHeader = e3dcWebAuthAuthorizationHeader();
     $token = '';
     if (preg_match('/Bearer\s+(.*)$/i', $authHeader, $matches)) {
         $token = trim($matches[1]);
@@ -3868,6 +3903,15 @@ function e3dcMutateV4ConfigDetailed(
         $json = @json_encode($next, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         if (!is_string($json)) return ['success' => false, 'status' => 'config_encode_failed'];
         $payload = $json . "\n";
+        // Der Config-Editor bindet das Leselimit der Writer-Zulassung an exakt diese Schreibbytes.
+        if (array_key_exists('max_json_bytes', $options)) {
+            $maxBytes = $options['max_json_bytes'];
+            if (!is_int($maxBytes) || $maxBytes < 1) return ['success' => false, 'status' => 'config_size_limit_invalid'];
+            if (strlen($payload) > $maxBytes) {
+                return ['success' => false, 'status' => 'config_too_large', 'published' => false,
+                    'serialized_bytes' => strlen($payload), 'max_json_bytes' => $maxBytes];
+            }
+        }
         if (hash_equals(hash('sha256', $preimage), hash('sha256', $payload))) {
             $result = array_merge($mutation, [
                 'success' => true,
@@ -4960,7 +5004,266 @@ function isHeatpumpEnabledConfig($cfg) {
         return cfgBool($cfg['luxtronik'] ?? null, false)
             || (!array_key_exists('luxtronik', $cfg) && cfgHasAddress($cfg['dimplex_ip'] ?? ''));
     }
+    if ($wpType === 6) {
+        // E3DC-Leistungsmesser: keine Adresse nötig. Der Live-Dienst und der
+        // Storage Manager lesen den PM allein anhand von wp_type=6.
+        return true;
+    }
     return false;
+}
+
+/**
+ * Gleiche Gültigkeitsregel wie der Storage Manager für wp_type=6: nur ein
+ * gültig markierter, ganzzahliger, nicht negativer PM-Wert ohne Erzeugerbefund.
+ */
+function e3dcHeatpumpPmPowerValid($live): bool {
+    if (!is_array($live)) return false;
+    return (($live['WP_Power_Valid'] ?? null) === true)
+        && is_int($live['WP_Power'] ?? null)
+        && (int)$live['WP_Power'] >= 0
+        && empty($live['wp_producer_detected']);
+}
+
+/**
+ * Steckt die WP-Leistung im E3DC-Hauswert? Gleiche Regel wie der Storage Manager
+ * für wp_type=6 (storage_home_wp_split): include/separate fest, sonst automatisch,
+ * wenn der rohe Hauswert mindestens max(500 W; 55 % der WP-Leistung) erreicht.
+ */
+function e3dcHeatpumpHomeIncludesWp($splitMode, $rawHomeW, $wpW): bool {
+    // Wie Python `str(value or "auto")`: leere oder falsche Werte (auch die Zahl 0) gelten als automatisch.
+    // Kommazahlen schreibt Python als „1.0“; sie treffen keine feste Einstellung und gelten ebenfalls als automatisch.
+    $isAuto = !is_scalar($splitMode) || $splitMode === false || $splitMode === '' || $splitMode === 0 || is_float($splitMode);
+    $mode = $isAuto ? 'auto' : strtolower(trim((string)$splitMode));
+    if (in_array($mode, ['1', 'true', 'yes', 'on', 'include', 'included', 'home_includes_wp'], true)) return true;
+    if (in_array($mode, ['0', 'false', 'no', 'off', 'separate', 'excluded', 'home_excludes_wp'], true)) return false;
+    // safe_int im Storage Manager rundet wie Python round(): .5 zur geraden Zahl. Verglichen wird
+    // ohne (int)-Umwandlung (PHP 8.5 warnt bei nicht darstellbaren Zahlen); floor entspricht int() ab 0.
+    $rawHomeF = is_numeric($rawHomeW) ? (float)$rawHomeW : 0.0;
+    $rawHome = max(0.0, round(is_finite($rawHomeF) ? $rawHomeF : 0.0, 0, PHP_ROUND_HALF_EVEN));
+    $wpF = is_numeric($wpW) ? (float)$wpW * 0.55 : 0.0;
+    return $rawHome >= max(500.0, floor(is_finite($wpF) ? $wpF : 0.0));
+}
+
+/**
+ * Zählt die WP-Leistung zum E3DC-Hauswert und wird deshalb aus Hauswert und Verlauf
+ * herausgerechnet? Beim E3DC-Leistungsmesser (wp_type=6) nur nach der Aufteilung
+ * wp_home_includes_wp (Regel wie Storage Manager), bei allen anderen Typen wie bisher immer.
+ */
+function e3dcHeatpumpPowerCountsInHome(array $data, int $wpType): bool {
+    return $wpType !== 6 || !empty($data['wp_home_includes_wp']);
+}
+
+/**
+ * Anzeigevertrag der WP-Seite für wp_type=6 aus live_data_py.json.
+ * Liefert nur Messwerte des Leistungsmessers; Temperaturen und Zustände
+ * gibt es ohne Hersteller-Anbindung nicht.
+ */
+function e3dcHeatpumpPmPagePayload(string $liveFile, ?int $now = null, int $maxAgeS = 120): array {
+    $now = $now ?? time();
+    $result = [
+        'success' => false,
+        'error' => 'Keine Daten vom E3DC-Live-Dienst.',
+        'data' => [],
+        'status' => [],
+        'source' => 'e3dc_pm',
+        'age_s' => null,
+        'valid' => false,
+    ];
+    if ($liveFile === '' || !is_file($liveFile) || !is_readable($liveFile)) {
+        return $result;
+    }
+    $mtime = @filemtime($liveFile);
+    $age = $mtime !== false ? max(0, $now - (int)$mtime) : null;
+    $result['age_s'] = $age;
+    $live = @json_decode((string)@file_get_contents($liveFile), true);
+    if (!is_array($live)) {
+        $result['error'] = 'Live-Daten nicht lesbar.';
+        return $result;
+    }
+    $valid = e3dcHeatpumpPmPowerValid($live);
+    $result['valid'] = $valid;
+    $result['data'] = [
+        'WP_Power' => $valid ? (int)$live['WP_Power'] : null,
+        'WP_Power_Valid' => $valid,
+        'WP_Power_Source' => (string)($live['WP_Power_Source'] ?? ''),
+        'wp_p1' => is_numeric($live['wp_p1'] ?? null) ? (float)$live['wp_p1'] : null,
+        'wp_p2' => is_numeric($live['wp_p2'] ?? null) ? (float)$live['wp_p2'] : null,
+        'wp_p3' => is_numeric($live['wp_p3'] ?? null) ? (float)$live['wp_p3'] : null,
+        'wp_pm_index' => is_numeric($live['wp_pm_index'] ?? null) ? (int)$live['wp_pm_index'] : null,
+        'wp_producer_detected' => !empty($live['wp_producer_detected']),
+    ];
+    if ($age === null || $age > $maxAgeS) {
+        $result['error'] = 'Live-Daten älter als ' . $maxAgeS . ' Sekunden.';
+        return $result;
+    }
+    if (!$valid) {
+        $result['error'] = !empty($live['wp_producer_detected'])
+            ? 'Der Leistungsmesser meldet Einspeisung; der Wert gilt nicht als WP-Verbrauch.'
+            : 'Der Leistungsmesser liefert keinen gültigen Wert.';
+        return $result;
+    }
+    $result['success'] = true;
+    $result['error'] = '';
+    return $result;
+}
+
+/**
+ * Wärmequelle aus wp_source_type, gleiche Zuordnung wie heat_source_policy()
+ * im Storage Manager: sole, water, air, direct oder auto (unbekannt).
+ */
+function e3dcNormalizeHeatSourceType($raw): string {
+    $value = strtolower(trim((string)$raw));
+    $value = strtr($value, ['ä' => 'ae', 'ö' => 'oe', 'ü' => 'ue', 'ß' => 'ss', '-' => '_', '/' => '_', ' ' => '_']);
+    $map = [
+        'sole' => 'sole', 'brine' => 'sole', 'ground' => 'sole', 'earth' => 'sole', 'erdreich' => 'sole',
+        'erdsonde' => 'sole', 'kollektor' => 'sole', 'geothermal' => 'sole',
+        'water' => 'water', 'grundwasser' => 'water', 'groundwater' => 'water',
+        'direct' => 'direct', 'direct_evaporation' => 'direct', 'direktverdampfung' => 'direct',
+        'air' => 'air', 'luft' => 'air',
+    ];
+    return $map[$value] ?? 'auto';
+}
+
+function e3dcHeatSourceLabel(string $sourceType): string {
+    return [
+        'sole' => 'Sole',
+        'water' => 'Grundwasser',
+        'air' => 'Luft',
+        'direct' => 'Direktverdampfung',
+    ][$sourceType] ?? 'Wärmequelle';
+}
+
+/**
+ * Farbklasse für COP und Arbeitszahl nach Wärmequelle. Ohne bekannte
+ * Wärmequelle wird nicht bewertet; der Herstellertyp sagt nichts über die Quelle.
+ */
+function e3dcHeatpumpCopColorClass($value, string $sourceType): string {
+    $val = is_numeric($value) ? (float)$value : 0.0;
+    if ($val <= 0) return 'text-secondary';
+    if ($sourceType === 'air') {
+        if ($val >= 4.0) return 'text-success fw-bolder';
+        if ($val >= 3.0) return 'text-info';
+        if ($val >= 2.0) return 'text-warning';
+        return 'text-danger';
+    }
+    if (in_array($sourceType, ['sole', 'water', 'direct'], true)) {
+        if ($val >= 4.8) return 'text-success fw-bolder';
+        if ($val >= 3.8) return 'text-info';
+        if ($val >= 2.8) return 'text-warning';
+        return 'text-danger';
+    }
+    return 'text-body';
+}
+
+/**
+ * Kumulierte WP-Energiezähler (kWh) aus einem Datensatz; null, wenn kein
+ * positiver Zählerstand vorliegt. Tageszähler (Stiebel) zählen hier nicht.
+ */
+function e3dcHeatpumpEnergyCounters($data): array {
+    $data = is_array($data) ? $data : [];
+    $pick = static function (array $keys) use ($data): ?float {
+        foreach ($keys as $key) {
+            $value = $data[$key] ?? null;
+            if (is_numeric($value) && is_finite((float)$value) && (float)$value > 0) {
+                return (float)$value;
+            }
+        }
+        return null;
+    };
+    return [
+        'heat_kwh' => $pick(['Wärmemenge Gesamt', 'Energie_Waerme_kWh']),
+        'elec_kwh' => $pick(['Leistungsaufnahme_Gesamt', 'Energie_Elek_kWh']),
+    ];
+}
+
+/**
+ * Tag der WP-Daten für Tagesarchiv und Tages-AZ. Der Energy Manager benennt sein
+ * Archiv nach dem Datum im Zeitstempel seiner Daten. Sind die Daten älter als 2 h,
+ * gilt der heutige Tag; sonst erschiene eine gestrige Tages-AZ als heutige.
+ * Die Frische kommt bevorzugt aus der Dateizeit ($sourceMtime), denn der naive
+ * Zeitstempel trägt keine Zeitzone (Energy Manager in UTC, Webserver in Berlin).
+ */
+function e3dcHeatpumpDataDay($ts, ?int $now = null, ?int $sourceMtime = null): string {
+    $now = $now ?? time();
+    $text = is_string($ts) ? trim($ts) : '';
+    if (preg_match('/^\d{4}-\d{2}-\d{2}/', $text)) {
+        $epoch = ($sourceMtime !== null && $sourceMtime > 0) ? $sourceMtime : strtotime($text);
+        if ($epoch !== false && abs($now - $epoch) <= 7200) {
+            return substr($text, 0, 10);
+        }
+    }
+    return date('Y-m-d', $now);
+}
+
+/**
+ * Tagesbeginn der WP-Energiezähler für die Tages-AZ. Quelle ist zuerst das
+ * persistente Tagesarchiv des Energy Managers (Stützstellen ab Mitternacht),
+ * sonst der Ramdisk-Minutenpuffer. Es zählt der erste Satz des Tages mit
+ * beiden Zählern; ein Startwert wird nie aus dem aktuellen Stand gebildet.
+ */
+function e3dcHeatpumpDayCounterStart(string $archiveFile, string $historyFile, string $today): array {
+    foreach (['archive' => $archiveFile, 'ramdisk' => $historyFile] as $source => $file) {
+        if ($file === '' || !is_file($file) || !is_readable($file)) continue;
+        $handle = @fopen($file, 'rb');
+        if ($handle === false) continue;
+        try {
+            while (($line = fgets($handle)) !== false) {
+                if (strpos($line, $today) === false) continue;
+                $row = json_decode($line, true);
+                if (!is_array($row)) continue;
+                $ts = (string)($row['ts'] ?? '');
+                if (strncmp($ts, $today, strlen($today)) !== 0) continue;
+                // Vom Energy Manager als veraltet gekennzeichnete Sätze sind kein Tagesbeginn.
+                if (is_array($row['status'] ?? null) && ($row['status']['source_fresh'] ?? null) === false) continue;
+                $counters = e3dcHeatpumpEnergyCounters($row['data'] ?? []);
+                if ($counters['heat_kwh'] === null || $counters['elec_kwh'] === null) continue;
+                return $counters + ['ts' => $ts, 'source' => $source];
+            }
+        } finally {
+            fclose($handle);
+        }
+    }
+    return ['heat_kwh' => null, 'elec_kwh' => null, 'ts' => null, 'source' => null];
+}
+
+/**
+ * Tages-Arbeitszahl aus Tagesbeginn und aktuellem Zählerstand. Unter
+ * $minElecKwh Strom bleibt die Anzeige leer: Der Stromzähler zählt in
+ * 0,1-kWh-Schritten, ab 1 kWh liegt der Rundungsfehler unter 10 %.
+ */
+function e3dcHeatpumpDayWorkRatio(array $start, array $now, float $minElecKwh = 1.0): array {
+    $result = ['ratio' => null, 'heat_kwh' => null, 'elec_kwh' => null, 'since' => null, 'reason' => ''];
+    $startTs = (string)($start['ts'] ?? '');
+    if ($startTs !== '' && preg_match('/T(\d{2}):(\d{2})/', $startTs, $m)) {
+        $result['since'] = $m[1] . ':' . $m[2];
+    }
+    if (($now['heat_kwh'] ?? null) === null || ($now['elec_kwh'] ?? null) === null) {
+        $result['reason'] = 'Energiezähler der Wärmepumpe fehlen';
+        return $result;
+    }
+    if (($start['heat_kwh'] ?? null) === null || ($start['elec_kwh'] ?? null) === null) {
+        $result['reason'] = 'Tagesbeginn der Energiezähler unbekannt';
+        return $result;
+    }
+    $heat = (float)$now['heat_kwh'] - (float)$start['heat_kwh'];
+    $elec = (float)$now['elec_kwh'] - (float)$start['elec_kwh'];
+    if ($heat < 0 || $elec < 0) {
+        $result['reason'] = 'Zählerstand kleiner als zu Tagesbeginn';
+        return $result;
+    }
+    $result['heat_kwh'] = round($heat, 1);
+    $result['elec_kwh'] = round($elec, 1);
+    if ($elec < $minElecKwh) {
+        $result['reason'] = 'Noch zu wenig Strom seit Tagesbeginn für eine belastbare Arbeitszahl';
+        return $result;
+    }
+    $ratio = $heat / $elec;
+    if ($ratio <= 0 || $ratio > 15) {
+        $result['reason'] = 'Arbeitszahl unplausibel';
+        return $result;
+    }
+    $result['ratio'] = $ratio;
+    return $result;
 }
 
 /**
@@ -9409,8 +9712,8 @@ function renderEnergyFlow($layout = 'mobile', $extraClass = '', $extraAttributes
         <div class="flow-node node-bat" id="f-node-bat" data-flow-node="battery" data-flow-color-key="battery" ' . $nodeAttrs('battery') . ' style="' . $nodeStyle('battery', 'battery') . '"><i class="fas fa-battery-half fa-icon"></i><div class="val" id="f-val-bat">0W</div><div class="label" data-flow-label-key="battery">' . $labelFor('battery', 'Speicher') . '</div><div class="label flow-secondary-label" id="f-lbl-soc">0%</div></div>
         <div class="flow-node node-home" id="f-node-home" data-flow-node="home" data-flow-color-key="home" ' . $nodeAttrs('home') . ' style="' . $nodeStyle('home', 'home') . '"><i class="fas fa-home fa-icon"></i><div class="val" id="f-val-home">0W</div><div class="label" data-flow-label-key="home">' . $labelFor('home', 'Haus') . '</div></div>
         ' . ($showWp ? '<div class="flow-node node-wp" id="f-node-wp" data-flow-node="heatpump" data-flow-color-key="heatpump" ' . $nodeAttrs('heatpump') . ' style="' . $nodeStyle('heatpump', 'heatpump') . '"><i class="fas fa-fire fa-icon"></i><div class="val" id="f-val-wp">0W</div><div class="label" data-flow-label-key="heatpump">' . $labelFor('heatpump', 'Wärmepumpe') . '</div></div>' : '') . '
-        ' . ($showWb ? '<div class="flow-node node-wb node-wb-1" id="f-node-wb" data-flow-node="wallbox" data-flow-color-key="wallbox" ' . $nodeAttrs('wallbox') . ' style="' . $nodeStyle('wallbox', 'wallbox') . '" title="'.$wb1_title.'"><i class="fas fa-charging-station fa-icon"></i><div class="val" id="f-val-wb">0W</div><div class="label" data-flow-label-key="wallbox">'.$wb1_name.'</div><i class="fas fa-lock" id="f-wb-lock" style="display:none; position:absolute; top:12%; right:22%; font-size:0.7rem; color:#ffc107;"></i><div class="price-tag" id="f-val-wb-session" style="display:none;"></div><div class="price-tag text-success border-success" id="f-val-car-soc" style="display:none; bottom: -42px; background: rgba(16, 185, 129, 0.1); cursor:pointer;" onclick="forceSocUpdate()" title="SoC vom Auto abrufen (Aufwecken)"></div></div>' : '') . '
-        ' . ($showWb2 ? '<div class="flow-node node-wb node-wb-2" id="f-node-wb2" data-flow-node="wallbox2" data-flow-color-key="wallbox2" ' . $nodeAttrs('wallbox2') . ' style="' . $nodeStyle('wallbox2', 'wallbox2') . '" title="'.$wb2_title.'"><i class="fas fa-charging-station fa-icon"></i><div class="val" id="f-val-wb2">0W</div><div class="label" data-flow-label-key="wallbox2">'.$wb2_name.'</div><i class="fas fa-lock" id="f-wb2-lock" style="display:none; position:absolute; top:12%; right:22%; font-size:0.7rem; color:#ffc107;"></i><div class="price-tag" id="f-val-wb2-session" style="display:none;"></div><div class="price-tag text-success border-success" id="f-val-car-soc2" style="display:none; bottom: -42px; background: rgba(16, 185, 129, 0.1); cursor:pointer;" onclick="forceSocUpdate()" title="SoC vom Auto abrufen (Aufwecken)"></div></div>' : '') . '
+        ' . ($showWb ? '<div class="flow-node node-wb node-wb-1" id="f-node-wb" data-flow-node="wallbox" data-flow-color-key="wallbox" ' . $nodeAttrs('wallbox') . ' style="' . $nodeStyle('wallbox', 'wallbox') . '" title="'.$wb1_title.'"><i class="fas fa-charging-station fa-icon"></i><div class="val" id="f-val-wb">–</div><div class="label" data-flow-label-key="wallbox">'.$wb1_name.'</div><i class="fas fa-lock" id="f-wb-lock" style="display:none; position:absolute; top:12%; right:22%; font-size:0.7rem; color:#ffc107;"></i><div class="price-tag" id="f-val-wb-session" style="display:none;"></div><div class="price-tag text-success border-success" id="f-val-car-soc" style="display:none; bottom: -42px; background: rgba(16, 185, 129, 0.1); cursor:pointer;" onclick="forceSocUpdate()" title="SoC vom Auto abrufen (Aufwecken)"></div></div>' : '') . '
+        ' . ($showWb2 ? '<div class="flow-node node-wb node-wb-2" id="f-node-wb2" data-flow-node="wallbox2" data-flow-color-key="wallbox2" ' . $nodeAttrs('wallbox2') . ' style="' . $nodeStyle('wallbox2', 'wallbox2') . '" title="'.$wb2_title.'"><i class="fas fa-charging-station fa-icon"></i><div class="val" id="f-val-wb2">–</div><div class="label" data-flow-label-key="wallbox2">'.$wb2_name.'</div><i class="fas fa-lock" id="f-wb2-lock" style="display:none; position:absolute; top:12%; right:22%; font-size:0.7rem; color:#ffc107;"></i><div class="price-tag" id="f-val-wb2-session" style="display:none;"></div><div class="price-tag text-success border-success" id="f-val-car-soc2" style="display:none; bottom: -42px; background: rgba(16, 185, 129, 0.1); cursor:pointer;" onclick="forceSocUpdate()" title="SoC vom Auto abrufen (Aufwecken)"></div></div>' : '') . '
         ' . ($showHs ? '<div class="flow-node node-hs" id="f-node-hs" data-flow-node="heater" data-flow-color-key="heater" ' . $nodeAttrs('heater') . ' style="' . $nodeStyle('heater', 'heater', $hsSize) . '"><i class="fas fa-fire-burner fa-icon" style="'.$hsIconSize.'"></i><div class="val" id="f-val-hs" style="'.$hsValSize.'">0W</div><div class="label" data-flow-label-key="heater" style="'.($showWp ? 'font-size: 0.5rem;' : '').'">' . $labelFor('heater', 'Heizstab') . '</div><div class="price-tag text-warning border-warning" id="f-val-hs-temp" style="display:none; bottom:-26px; background:rgba(253,126,20,0.12);"></div></div>' : '') . '
         ' . ($showClimate ? '<div class="flow-node node-climate" id="f-node-climate" data-flow-node="climate" data-flow-color-key="climate" ' . $nodeAttrs('climate') . ' style="' . $nodeStyle('climate', 'climate') . '"><i class="fas fa-snowflake fa-icon"></i><div class="val" id="f-val-climate">0W</div><div class="label" data-flow-label-key="climate">' . $labelFor('climate', 'Klima') . '</div></div>' : '') . '
 
@@ -10593,19 +10896,19 @@ function renderGridHealthModal($dialogClass = 'modal-md modal-dialog-scrollable'
                             <div class="col-4">
                                 <div class="bg-body-secondary rounded py-2 border border-secondary" style="border-radius: 8px !important;">
                                     <div class="text-muted" style="font-size:0.75em;">L1</div>
-                                    <div class="fw-bold" id="gh-wb-l1">0 W</div>
+                                    <div class="fw-bold" id="gh-wb-l1">– W</div>
                                 </div>
                             </div>
                             <div class="col-4">
                                 <div class="bg-body-secondary rounded py-2 border border-secondary" style="border-radius: 8px !important;">
                                     <div class="text-muted" style="font-size:0.75em;">L2</div>
-                                    <div class="fw-bold" id="gh-wb-l2">0 W</div>
+                                    <div class="fw-bold" id="gh-wb-l2">– W</div>
                                 </div>
                             </div>
                             <div class="col-4">
                                 <div class="bg-body-secondary rounded py-2 border border-secondary" style="border-radius: 8px !important;">
                                     <div class="text-muted" style="font-size:0.75em;">L3</div>
-                                    <div class="fw-bold" id="gh-wb-l3">0 W</div>
+                                    <div class="fw-bold" id="gh-wb-l3">– W</div>
                                 </div>
                             </div>
                         </div>

@@ -17,6 +17,7 @@ import select
 import time
 import zlib
 import logging
+import math
 from contextlib import contextmanager
 
 # Rijndael-256-CBC via pycryptodome (Standard-Paket, kein Sonder-Fork)
@@ -392,7 +393,7 @@ class RscpTag:
     BAT_DCB_INDEX                               = 0x03800100
     BAT_DCB_INFO                                = 0x03800042
     BAT_DCB_SOH                                 = 0x03800109
-    BAT_DCB_SOH_H20                             = 0x03800116
+    BAT_DCB_DESIGN_VOLTAGE                      = 0x03800116
     BAT_FCC                                     = 0x03800010
     BAT_INDEX                                   = 0x03040001
     BAT_INFO                                    = 0x03800020
@@ -1612,6 +1613,7 @@ def fetch_battery_vitals(host: str, port: int, portal_user: str,
                 # dem DCB-Loop aus echten Pack-SOH-Werten berechnet.
                 'asoc': round(float(asoc), 2) if asoc is not None else None,
                 'soh_avg': None,
+                'soh_reason': 'SOH_NOT_AVAILABLE',
                 'cycles': int(cycles) if cycles is not None else None,
                 'temp_max_global': round(float(t_max), 1) if t_max is not None else None,
                 'temp_min_global': round(float(t_min), 1) if t_min is not None else None,
@@ -1652,18 +1654,27 @@ def fetch_battery_vitals(host: str, port: int, portal_user: str,
                         # darf niemals unter dem angeforderten Packindex
                         # angezeigt werden.
                         continue
-                soh = find_tag_value(di, RscpTag.BAT_DCB_SOH)
-                if soh is None:
-                    soh = find_tag_value(di, RscpTag.BAT_DCB_SOH_H20)
+                # 0x03800116 ist die Designspannung, niemals ein Ersatz-SOH.
+                soh_items = [item for item in di if item.get('tag') == RscpTag.BAT_DCB_SOH]
+                soh_f = None
+                soh_reason = 'SOH_NOT_AVAILABLE'
+                if len(soh_items) > 1:
+                    soh_reason = 'SOH_AMBIGUOUS'
+                elif soh_items:
+                    item = soh_items[0]
+                    value = item.get('value')
+                    if (
+                        item.get('type') == RscpType.Float32
+                        and isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        and math.isfinite(float(value))
+                        and 0 < float(value) <= 110
+                    ):
+                        soh_f = float(value)
+                        soh_reason = 'BAT_DCB_SOH'
+                    else:
+                        soh_reason = 'SOH_INVALID'
                 pack_cycles = find_tag_value(di, RscpTag.BAT_DCB_CYCLE_COUNT)
-                if soh is None:
-                    continue
-                try:
-                    soh_f = float(soh)
-                except (TypeError, ValueError):
-                    continue
-                if soh_f <= 0 or soh_f > 110:
-                    continue
 
                 # Zell-Temperaturen parsen
                 pack_t_max, pack_t_min = cab['temp_max_global'], cab['temp_min_global']
@@ -1710,8 +1721,9 @@ def fetch_battery_vitals(host: str, port: int, portal_user: str,
                     'index': dcb_idx,
                     'response_index': response_dcb_index,
                     'index_confirmed': response_dcb_index == dcb_idx,
-                    'soh': round(soh_f, 2),
-                    'soh_source': 'BAT_DCB_SOH' if find_tag_value(di, RscpTag.BAT_DCB_SOH) is not None else 'BAT_DCB_SOH_H20',
+                    'soh': round(soh_f, 2) if soh_f is not None else None,
+                    'soh_source': 'BAT_DCB_SOH' if soh_f is not None else None,
+                    'soh_reason': soh_reason,
                     'cycles': int(pack_cycles) if pack_cycles is not None else cab['cycles'],
                     'temp_max': pack_t_max,
                     'temp_min': pack_t_min,
@@ -1738,6 +1750,7 @@ def fetch_battery_vitals(host: str, port: int, portal_user: str,
                     cab['soh_max'] = round(max(soh_values), 2)
                     cab['soh_spread'] = round(cab['soh_max'] - cab['soh_min'], 2)
                     cab['soh_avg'] = round(sum(soh_values) / len(soh_values), 2)
+                    cab['soh_reason'] = 'BAT_DCB_SOH'
                 if cycle_values:
                     cab['cycles_min'] = min(cycle_values)
                     cab['cycles_max'] = max(cycle_values)

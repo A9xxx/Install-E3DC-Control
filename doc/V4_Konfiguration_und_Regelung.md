@@ -110,7 +110,10 @@ Schranken gilt die folgende Rangfolge:
      Lastspitzen vor einem Schützwechsel aus; die Beruhigung nach dem Schalten
      ist allein die Hardware-Sperre. Während dieser Sperre zählen weder die
      Uhr noch das Energiekonto: beide werden danach neu verdient, damit auf
-     einen Abstieg kein sofortiger Wiederaufstieg folgt.
+     einen Abstieg kein sofortiger Wiederaufstieg folgt. Das gilt für jeden
+     Wallbox-Typ gleich: Am E3DC-Direktvertrag ist die Haltezeit nach jedem
+     Wechsel diese Sperre, und das experimentelle 10-min-Fenster beginnt in
+     ihr ebenfalls neu.
    - *Anti-Flattern.* Hysterese, Deadband, Zeitbedingungen und Energiewächter
      werden gemeinsam aus Messrauschen, realen Leistungsstufen und dem Verhalten
      der Aktorik ausgelegt. Jede Kante bekommt ihre eigene, passende Schwelle
@@ -138,12 +141,47 @@ Schranken gilt die folgende Rangfolge:
   beziehungsweise am Reserveboden der Direktvermarktung; der Speicher fällt in
   den normalen Betrieb zurück, unabhängig davon, was Preis- oder
   Direktvermarktungslogik verlangt.
-- Flash-Schreibschutz: Dynamische Regelung schreibt ausschließlich in flüchtige
-  RSCP-Register (`EMS_REQ_SET_POWER` und temporäre Laderahmen). Zyklische
-  Schreibbefehle in den permanenten E3DC-Konfigurationsspeicher gibt es nicht.
+- Flash-Schreibschutz: Kurzzeitige Leistungsvorgaben laufen über die flüchtige
+  Vorgabe `EMS_REQ_SET_POWER`. Den Laderahmen im AUTO-Betrieb setzt die Regelung
+  über `EMS_REQ_SET_POWER_SETTINGS`; dass der E3DC diese Einstellung nur flüchtig
+  hält, ist nicht belegt. Die Regelung schreibt sie deshalb nur bei echter
+  Änderung, nicht schützende Änderungen höchstens alle 30 s, und bestätigt jeden
+  Schreibvorgang per Rücklesen. Einstellungen, die der E3DC nachweislich dauerhaft
+  speichert, schreibt die Regelung nie zyklisch.
 - Diagnose-Reihenfolge bei unerklärlichem Verhalten: zuerst Messwertqualität,
   physikalische Glitches, Netzwerk-/API-Latenz, veraltete Daten, Phasenmessung
   und Hardwaregrenzen prüfen, bevor Einstellungen oder Regeln geändert werden.
+- **Eine Stellgröße je Regelkreis.** Innerhalb eines Regelkreises verändert die
+  Regelung nach Möglichkeit nur eine Größe, damit sich Regler nicht gegenseitig
+  aufschaukeln. Speicher und Verbraucher sind über das Budget entkoppelt; jede
+  Seite hat genau eine eigene Stellgröße.
+  1. **Speicher – Laderahmen.** Die Speicherladung ist das obere Stellglied.
+     Liefert der Speicherplan eine Ladekurve, ist `iFc` der Laderahmen: die
+     durchschnittlich nötige Ladeleistung bis zum nächsten Kurvenanker,
+     einschließlich gedämpftem Aufhol- und Abregelschutzbedarf. Ohne Ladekurve
+     (Kurvenlage `no_curve`) oder beim Halten für ein Hochpreisfenster ist das
+     Laden frei; eine PV-Spitze nimmt der Speicher dann ohne zusätzliche
+     Regelung auf. Verbraucher verstellen diesen Rahmen nicht.
+  2. **Speicher – Entladegrenze.** Sie ist keine nachgeführte Stellgröße,
+     sondern legt fest, wen der Speicher versorgt, etwa Hausverbrauch und
+     Wärmepumpe, aber nicht das Auto. Darf der Speicher keinen Verbraucher
+     versorgen, ist sie 0, und alle Verbraucher beziehen aus dem Netz. Läuft
+     eine Wallbox-Ladung bereits, darf der Speicher sie auch unter dem
+     Kurvenkorridor im Rahmen des Wh-Kontingents an der Untergrenze stützen,
+     damit kurze PV-Lücken nicht zu Schützschalten führen; ist es aufgebraucht,
+     übernimmt die reguläre Halte-, Phasen- und Stop-Politik.
+  3. **Verbraucher.** Was nach dem Laderahmen an PV übrig bleibt, geht als
+     Budget an die Verbraucher. Jeder Verbraucher regelt nur seine eigene
+     Leistung am Budget, die Wallbox zum Beispiel ihren Ladestrom.
+  4. **`PV + Akku bis Untergrenze`.** Die Stellgröße ist der Ladestrom der
+     Wallbox. Der Speicher lädt weiter nach der Ladekurve mit `iFc` als
+     Laderahmen, der PV-Rest geht als Budget an die Wallbox. Der Modus schaltet
+     den Speicher nicht in den freien Automatikbetrieb, damit auch ein großer
+     Speicher nicht vorzeitig voll ist. Oberhalb von `wbminsoc` darf der
+     Speicher die Wallbox bei Akku-Bezug unabhängig von der Kurvenlage bis
+     `wbminsoc` stützen. Unterhalb von `wbminsoc` verhält sich der Modus wie
+     `PV-Kurve ruhig`; an der Untergrenze senkt beziehungsweise stoppt der
+     Wallbox Manager die Ladung.
 
 ### Zentrale Wallbox-Policy
 
@@ -191,6 +229,7 @@ Schranken gilt die folgende Rangfolge:
      Entladung auf Hausverbrauch plus Wärmepumpe minus PV zuzüglich der Reserve
      `wb_curve_pv_only_house_reserve_w` (Standard und Mindestwert 300 W), damit
      der Automatikbetrieb des E3DC die Wallbox nicht aus dem Speicher speist.
+     Der Laderahmen des Speichers folgt dabei der Kurvenführung über `iFc`.
    - Wh-Kontingent an der Untergrenze: Unter dem Korridor darf der Speicher die
      Wallbox nur mit einem kleinen Energiekontingent stützen, um Wolkenlücken am
      Mindeststrom zu überbrücken. Das Kontingent ist `wb_curve_floor_support_wh`
@@ -254,6 +293,13 @@ Schranken gilt die folgende Rangfolge:
    Kurvenregel. „Aus“ bedeutet nie „unbegrenzt bis zur E3DC-Grenze“. Eine
    Anhebung von `wbminsoc` im laufenden Betrieb sperrt die Stützung sofort
    (`wbminsoc_runtime_raise`).
+   In den Modi mit Akkuladen bis zur Untergrenze (`PV + Akku bis
+   Untergrenze`, `Sofort bis Preislimit`, `Akku bis Abfahrt`) gilt die
+   Korridorregel aus Punkt 3 nur, solange das wbminSoC-Tor geschlossen ist.
+   Ist es offen, stützt der Speicher die Wallbox unabhängig von der
+   Korridorlage (Grund `wbminsoc_floor_open`); der Speicher lädt dabei weiter
+   nach der Ladekurve. Unterhalb von `wbminsoc` verhalten sich diese Modi wie
+   `PV-Kurve ruhig`.
    In `PV + Akku bis Untergrenze` – und in `Sofort bis Preislimit`, das ohne
    Preis- oder Netzfenster denselben Regelpfad bis zur Untergrenze nutzt –
    gilt an der erreichten Untergrenze: Das wbminSoC-Tor ist geschlossen, der
@@ -316,8 +362,8 @@ Schranken gilt die folgende Rangfolge:
    den Wallbox-Rahmen (`battery_support_authorized`, `battery_support_reason`
    mit den Werten `curve_above_target`, `curve_within_corridor`,
    `curve_floor_wh_guard`, `curve_below_target_pv_only` und
-   `wbminsoc_runtime_raise`). Den Grund `wbminsoc_floor_closed` meldet
-   dagegen nur der Wallbox-Intent (Punkt 5); in den Modi mit Akkuladen bis
+   `wbminsoc_runtime_raise`). Die Gründe `wbminsoc_floor_closed` und
+   `wbminsoc_floor_open` meldet dagegen nur der Wallbox-Intent (Punkt 5); in den Modi mit Akkuladen bis
    zur Untergrenze wertet die Speicherseite direkt das wbminSoC-Tor
    (`wbminsoc_gate_open` im Wallbox-Intent) aus.
    Der Wallbox Manager fordert keine Stützung an; er
@@ -435,7 +481,7 @@ Hysterese. Die sichtbaren Nutzer-Modi sind bewusst klein gehalten:
 | `Aus` | NGNA: keine aktive E3DC-Control-Ladung und keine laufenden Steuerbefehle. Nur beim bewussten Wechsel auf `Aus` in der WebUI wird einmalig die Wallbox-Grundeinstellung freigegeben. Geplantes Netzladen bleibt gesperrt. |
 | `PV-Kurve ruhig` | Laden entlang der Speicher-Ladekurve mit Hysterese; Speicherziel hat Vorrang. |
 | `Grundladung stabil` | Wie PV-Kurve ruhig, aber mit stabiler 1p/3p-Grundladung, solange `wbminSoc` laut Planung erreichbar bleibt. |
-| `PV + Akku bis Untergrenze` | Das Auto darf PV plus Hausspeicher oberhalb der Hausakku-Untergrenze nutzen; unterhalb der Grenze stützt der Speicher nur Hausverbrauch und Wärmepumpe, Netz bleibt außen vor. |
+| `PV + Akku bis Untergrenze` | Das Auto darf PV plus Hausspeicher oberhalb der Hausakku-Untergrenze nutzen; der Speicher lädt dabei weiter nach der Ladekurve. Unterhalb der Grenze lädt das Auto wie in `PV-Kurve ruhig` nur aus PV-Überschuss, der Speicher stützt nur Hausverbrauch und Wärmepumpe, Netz bleibt außen vor. |
 | `Sofort bis Preislimit` | Sofortiges Netzladen, solange der aktuelle Preis das Wallbox-Preislimit erfüllt. |
 | `Akku bis Abfahrt` | Lädt im Freigabefenster vor der Abfahrtszeit aus PV und Hausspeicher bis zur Hausakku-Untergrenze `wbminsoc`; Netzladen bleibt gesperrt. Gestoppt wird bei erreichter Abfahrtszeit, vollem Fahrzeug oder erreichter Untergrenze (`wb<n>_battery_departure_time`, `wb<n>_battery_departure_window_h`). |
 
@@ -494,6 +540,46 @@ Wichtige Schutzlogik:
   Startfenster (s)“, „Pro Start-Wiederholzyklus (s)“). Details:
   `doc/Native_Wallbox.md`, Abschnitt „Startfenster, Wiederholzyklus und
   Weckimpuls“.
+- openWB Pro, Hochschaltung 1p→3p: Die Regelung reserviert beim
+  Speicherregler die bisher laufende Leistung beziehungsweise den
+  Wiederanlauf mit 6 A je Phase, nicht den einphasigen Strom je Zielphase.
+  Solange der Auftrag auf die Freigabe wartet, rechnet die Zuteilung schon
+  mit drei Phasen; belegt der frische Status eine einphasige Ladung, behält
+  diese ihren Strom im Rahmen des Budgets. Die vorläufige Variante (b)
+  bindet bei einer Einzelbox Mindestbudget und Stromumrechnung an diese
+  eine Phase, auch im Zyklus eines Abbruchs ohne Ausgang. Bei mehreren
+  Wallboxen bleibt die Stromzuteilung zum Schutz des Hausanschlusses
+  dreiphasig; die dadurch mögliche Begrenzung auf etwa ein Drittel der
+  Leistung ist eine bekannte Einschränkung, kein Regelungsziel.
+  Ohne ausreichende Freigabe endet der Auftrag nach 90 s ohne Geräteausgang,
+  eine erteilte, aber ungenutzte Freigabe spätestens 90 s nach ihrem Eingang,
+  und fordert die Regelung die Hochschaltung zwei Zyklen lang nicht mehr an
+  (etwa in einer Ladepause), endet er sofort. Der nächste Versuch folgt
+  frühestens nach `wb_phase_retry_block_s` (Standard 900 s); Vorlauf,
+  Export-Wh-Konto und 10-min-Fenster werden danach neu verdient. Nach dem
+  Wechsel läuft die Box mit 6 A je Phase wieder an; bis der Wiederanlauf
+  unter Last bestätigt ist (drei Messungen über 500 W, stabil über 10 s,
+  gleich mit wie vielen Phasen das Fahrzeug lädt), begrenzt die Regelung
+  jeden Strom auf die freigegebene Reservierung. Danach folgt der Strom
+  wieder dem Wattbudget, jedoch bis zum Ende der Reservierung weiter auf
+  drei Phasen umgerechnet. Ein zwei- oder einphasig ladendes Fahrzeug
+  erreicht deshalb in dieser Zeit höchstens etwa zwei Drittel beziehungsweise
+  ein Drittel des Budgets. Diese bekannte Grenze wird hier nicht aufgehoben.
+  Details: `doc/Native_Wallbox.md`, Abschnitt „Hochschaltung ausgeben:
+  Freigabe, Wartegrenze und Wiederanlauf“.
+- Experimentelles 10-min-Fenster 1p→3p (`wb_phase_up_window_enable`,
+  Standard aus): Nur mit eingeschalteter Energie-Phasenpolitik an der openWB
+  Pro und am E3DC-Direktvertrag. Das Fenster ist ein zusätzlicher Auslöser:
+  Trägt der verfügbare Überschuss im 10-Minuten-Mittel das 3p-Minimum plus
+  15 % ohne Einbruch in den letzten 2 Minuten, schaltet die Regelung auf drei
+  Phasen; für diesen Auslöser entfallen Vorlauf, Export-Wh-Konto und die
+  Bedingung „eine Phase ausgereizt“. Der bisherige Weg über Vorlauf oder
+  Export-Wh-Konto bleibt daneben wirksam. Eine neue Ladung startet nur mit
+  einem Fahrzeugprofil mit drei Phasen direkt dreiphasig. Fehlende Messwerte
+  zählen nie als Überschuss. Sperre nach jedem Wechsel, Netzbezugssperre,
+  einphasige Fahrzeuge und die Freigabe durch den Speicherregler gelten
+  unverändert. Details und Testanleitung: `doc/Native_Wallbox.md`,
+  Abschnitt „Experimentelles 10-min-Fenster 1p→3p“.
 - openWB Pro mit einphasig hinterlegtem Fahrzeug: Die Phasen der Box werden
   nicht umgeschaltet; Mindestleistung und Budget folgen dem Fahrzeug
   (1,38 kW), der einphasige Stromdeckel den gemessenen aktiven Phasen.

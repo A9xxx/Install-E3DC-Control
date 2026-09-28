@@ -45,6 +45,7 @@ def request_missing_openwb_cloud_soc(wb_id, config, status, soc_info=None, now=N
         or not str(config.get("bluelink_password") or "")
         or status.get("driver_status_valid") is not True
         or status.get("plug_state") is not True
+        or status.get("car_soc_invalid_reason") == "cloud_soc_ambiguous"
         or wallbox_soc_tracker._soc_record_vetoed(status)
         or not wallbox_soc_tracker._fresh_timestamp(
             status.get("driver_status_last_sample_ts"), now,
@@ -67,7 +68,19 @@ def request_missing_openwb_cloud_soc(wb_id, config, status, soc_info=None, now=N
         or not wallbox_soc_tracker._configured_vehicle_binding_unique(config, wb_id, selected_id)
     ):
         return False
+    # Fehlende Rechenkapazität ist kein Anlass für einen neuen Cloudauftrag.
+    if wallbox_soc_tracker.resolve_openwb_pro_profile(config, wb_id)["capacity_kwh"] is None:
+        return False
     aliases = wallbox_soc_tracker._compact_aliases(profile)
+    # Mehrdeutige vorhandene Werte sind kein Anlass, das Fahrzeug erneut
+    # abzufragen. Diese Sperre gilt auch ohne einen nutzbaren Sitzungsanker.
+    binding_diagnostics = {}
+    candidates = wallbox_soc_tracker._openwb_pro_live_soc_candidates(
+        config, wb_id, selected_id, aliases, now,
+        diagnostics=binding_diagnostics,
+    )
+    if len(candidates) > 1 or binding_diagnostics.get("reason") == "cloud_soc_ambiguous":
+        return False
     if any(
         wallbox_soc_tracker._compact_id(status.get(key))
         and wallbox_soc_tracker._compact_id(status.get(key)) not in aliases
@@ -328,6 +341,31 @@ class VehicleManager:
     def soc_tracker(self):
         return self._soc_tracker
 
+    def bind_driver_profile_context(self, driver, config):
+        """Reiche die aktuelle Profilauswahl vor dem Poll ohne Treiberneustart durch."""
+        if driver.__class__.__name__ == "OpenWBProCharger":
+            previous = getattr(driver, "_vehicle_profile_config", driver.config)
+            key = f"wb{driver.wb_id}_car_id"
+            state = driver.state
+            if previous.get(key) != (config or {}).get(key) and not (
+                state.get("vehicle_id") or state.get("rfid_tag")
+            ):
+                # Ein anderer ausgewählter Wagen erbt keinen alten Rechenanker.
+                for field in (
+                    "_soc_anchor_soc", "_soc_anchor_imported_wh", "_soc_anchor_vehicle_id",
+                    "_soc_anchor_source", "_soc_anchor_sample_ts", "_soc_anchor_raw_ts",
+                    "_soc_anchor_rule_confirmed", "_soc_last_update_ts",
+                ):
+                    state[field] = None
+                state["_soc_delivered_wh"] = state["_soc_power_integrated_wh"] = 0.0
+                if state.get("car_soc_source") != "openwb_pro_raw":
+                    state["car_soc"] = None
+                    state["car_soc_source"] = "unknown"
+                    state["car_soc_rule_confirmed"] = False
+                    state["car_soc_source_ts"] = None
+                    state["car_soc_raw_ts"] = None
+            driver._vehicle_profile_config = dict(config or {})
+
     def update(self, wb_id, config, status, charger_class=""):
         """Return the existing tracker status patch without altering it."""
 
@@ -449,6 +487,8 @@ class VehicleManager:
             "capacity",
             status.get("car_capacity_kwh", 0.0),
         )
+        if "capacity_reason" in soc_info:
+            status["car_capacity_reason"] = soc_info["capacity_reason"]
         candidate_range = float(soc_info.get("range_km") or 0.0)
         candidate_range_source = str(soc_info.get("range_source") or "wallbox_estimated_consumption")
         if explicit_total_range:

@@ -6,6 +6,55 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.5.1] – 2026-09-28
+
+### Wallbox
+
+- Hochschaltung 1p→3p an der openWB Pro und am E3DC-Direktvertrag: Der Speicherregler reserviert jetzt die bisher laufende Leistung beziehungsweise den Wiederanlauf mit 6 A je Phase, nicht mehr den bisherigen einphasigen Strom auf drei Phasen umgerechnet. Ein Auftrag ohne Geräteausgang bricht nach 90 s ohne ausreichende Freigabe, 90 s nach einer ungenutzten Freigabe oder wenn die Regelung die Hochschaltung zwei Zyklen lang nicht mehr anfordert. Danach folgt der nächste Versuch frühestens nach `wb_phase_retry_block_s` (Standard 900 s); Vorlauf, Export-Wh-Konto und das 10-min-Fenster werden neu verdient. Nach dem Wechsel begrenzt die Regelung jeden Strom auf die freigegebene Reservierung, bis der Wiederanlauf unter Last bestätigt ist (mindestens drei Messungen über 500 W, stabil über 10 s); bis zum Ende der Reservierung bleibt die Umrechnung dreiphasig, ein zwei- oder einphasig ladendes Fahrzeug erreicht in dieser Zeit deshalb höchstens etwa zwei Drittel beziehungsweise ein Drittel des Budgets. Bei mehreren Wallboxen bleibt die Stromzuteilung zum Schutz des Hausanschlusses weiterhin dreiphasig. Diese Grenzen sind bekannte Einschränkungen, kein Regelungsziel.
+- Neues experimentelles 10-min-Fenster 1p→3p (`wb_phase_up_window_enable`, Standard aus, nur mit eingeschalteter Energie-Phasenpolitik): Trägt der verfügbare Überschuss im 10-Minuten-Mittel das 3p-Minimum plus 15 % ohne Einbruch in den letzten 2 Minuten, schaltet eine laufende einphasige Ladung ohne Vorlauf, Export-Wh-Konto und die Bedingung „eine Phase ausgereizt“ auf drei Phasen; eine neue Ladung mit dreiphasigem Fahrzeugprofil startet dann direkt dreiphasig. Sperre nach jedem Wechsel, Netzbezugssperre, einphasige Fahrzeuge und die Freigabe durch den Speicherregler gelten unverändert.
+- `PV + Akku bis Untergrenze`, `Sofort bis Preislimit` und `Akku bis Abfahrt`: Bei offenem wbminSoC-Tor stützt der Speicher die Wallbox jetzt unabhängig von der Kurvenlage (Grund `wbminsoc_floor_open`) und lädt dabei weiter nach der Ladekurve mit `iFc` als Laderahmen; unterhalb von `wbminsoc` verhalten sich diese Modi wie `PV-Kurve ruhig`.
+- Fehlende, ungültige oder veraltete Wallbox-Messwerte liefern jetzt `null` statt einer echten Nullmessung `0` (`wb`/`wb2`, `wb_observation`/`wb2_observation` mit `valid`, `reason`, `sample_ts`, `age_s`, `missing_fields`). Dashboard und Wallbox-Seite zeigen dafür „–“ bzw. „unbekannt“ statt 0 W und kennzeichnen eine von der Box nur gemeldete statt gemessene Phasenzahl als „(gemeldet)“.
+- Die Haltezeit nach einem Schützwechsel gilt jetzt einheitlich für jeden Wallbox-Typ, auch am E3DC-Direktvertrag; das experimentelle 10-min-Fenster beginnt in dieser Sperre ebenfalls neu.
+
+### Speicher
+
+- Börsenpreis-Optimierung: Hält die Preisregelung vorhandene Akkuenergie für spätere teure Stunden zurück („Speicher halten“), sperrt sie nur noch die Entladung. Das Laden aus PV-Überschuss bleibt im Rahmen der Ladekurve frei; bisher wurde während des Haltens auch das PV-Laden gesperrt und der Überschuss eingespeist.
+- Wärmepumpen-Brücke: Führt ein Schutzwächter den Speicher gerade im Automatikbetrieb, überschreibt die Übersetzung einer Wärmepumpen-Freigabe diesen Zustand nicht mehr mit einer eigenen Speichervorgabe.
+- Neuer Grundsatz „Eine Stellgröße je Regelkreis“: Der Laderahmen (`iFc`) ist die obere Stellgröße der Speicherladung, die Entladegrenze legt nur fest, wen der Speicher versorgen darf, und Verbraucher regeln ausschließlich am verbleibenden PV-Budget. In `PV + Akku bis Untergrenze` bleibt der Laderahmen dabei aktiv, statt den Speicher in den freien Automatikbetrieb zu schalten.
+- Flash-Schreibschutz erweitert: Der AUTO-Laderahmen (`EMS_REQ_SET_POWER_SETTINGS`) wird jetzt wie ein möglicherweise dauerhaft gespeichertes Register behandelt und nur bei echter Änderung geschrieben, nicht schützende Änderungen höchstens alle 30 s, jeweils mit Rücklese-Bestätigung.
+- Backup-Prüfung gehärtet: Die Manifest-Liste der Backup-Kodierungen muss jetzt genau zu den tatsächlich verwendeten Kodierungen der Dateieinträge passen (keine Doppelnennung, keine zusätzliche oder fehlende Kodierung), sonst gilt das Backup als ungültig.
+
+### Wärmepumpe (Luxtronik)
+
+- Ausschalten und Grundzustand: „Automatik darf steuern“ aus nimmt einen laufenden PV-Boost jetzt geordnet zurück – Heizung über SHI-Modus 0, Warmwasser über einen Reset auf die konfigurierte Untergrenze `ww_eco`. Weicht die Rückmeldung ab, wird die Rücknahme bis zu dreimal im 60-Sekunden-Abstand gesendet; bleibt der Grundzustand unbestätigt, erscheint auf der Wärmepumpenseite ein Alarm, der zusätzlich per Push gemeldet wird.
+- Die Wiedereinschaltsperre (`wp_restart_block_min`) gilt jetzt auch nach der schutzbedingten Rücknahme eines bereits ausgespielten PV-Auftrags, dann mindestens 10 Minuten, auch bei einem eingestellten Wert von 0. Nach zwei Entzügen aus demselben Geräteschutzgrund bleibt der PV-Boost bis zum nächsten Tag gesperrt.
+- Ein bei Storage bereits bestätigter Abschluss desselben Auftrags wird nach einem Neustart auch dann übernommen, wenn der SHI-Kanal inzwischen einer anderen Steuerung gehört oder die gesicherte Rückmeldung den Entzug nicht mehr enthält. Ein einmal bestätigter Entzug bleibt für denselben Auftrag bestätigt, auch wenn danach eine andere Steuerung (Preis-Boost, Pre-Dump, Preis-Pause) den Kanal wieder auf den externen Sollwert setzt.
+- Der SHI-Status wird nur noch aus den belegten Registerbereichen gelesen. Das bisherige Blocklesen über einen Bereich, den manche Regler mit einem Modbus-Fehler (Exception 2) beantworten, entfällt.
+- Nur der Energy Manager schreibt die SHI-Register, über genau einen Treiber und eine serialisierte TCP-Sitzung; andere Dienste und die Weboberfläche übergeben eigene Befehle als Auftrag an den Energy Manager.
+- Neuer experimenteller Netzboost (`price_boost_enable`, Konfigurationseditor „Experimentellen Netzboost aktivieren“, Standard aus): Schaltet den vorhandenen Negativpreis-Boost für die Luxtronik frei. Bisher blieb diese Auswahl fail-closed und wirkungslos (reine Candidate/Shadow-Diagnose); jetzt kann die Wärmepumpe bei einem echten Negativpreisfenster, Wärmebedarf und einer aktuellen Zusage der Speicherregelung tatsächlich boosten. Günstige, aber positive Preisfenster lösen weiterhin keinen Boost aus.
+
+### Webportal
+
+- Die Kennzeichnung prognosebasierter Abschnitte der Ladekurve verwendet einen sauber definierten lokalen Tagesbeginn; die bisherige PHP-Warnung beim Laden der Live-Daten entfällt.
+
+### Installationszentrale und Diagnose
+
+- Das Diagnosepaket pseudonymisiert jetzt IP-Adressen, Hostname, MQTT-Topics, Fahrzeugnamen sowie Seriennummern von Speicher, Wallbox und Zähler, MAC-Adressen, RFID-Tags, Fahrzeug-IDs und FIN, Klimageräte-IDs und Anlagen-IDs von Tarif- und Prognosediensten; Kontonamen von Geräte- und Dienstkonten sowie Fahrzeugpositionen werden maskiert. Gleiche Kennungen erhalten in allen Paketen einer Anlage dasselbe Pseudonym, damit sich Pakete vergleichen lassen; der dafür nötige Schlüssel liegt ausschließlich lokal auf der Anlage und wird nie mitgeliefert. Modellbezeichnungen, Firmwarestände, Dienstnamen und Messwerte bleiben wie bisher enthalten.
+- Der Konfigurations-Download „Einstellungen ohne Zugangsdaten“ maskiert jetzt zusätzlich Standort- und RSCP-Zugangsdaten; er enthält weiterhin IP-Adressen und Gerätekennungen und ist deshalb nicht zum Teilen gedacht.
+
+### High Availability
+
+- Die Dokumentation stellt jetzt klar, dass Rolle und Partner eines HA-Knotens ausschließlich über den Installer eingerichtet werden (`e3dc-setup`, Hauptmenü „7) Expertenmenü“ → „49) High Availability (Cluster)“); das Rollenfeld im Config-Editor ändert nur die Konfiguration, nicht die im System hinterlegte Rolle. Import und Rollback behalten Rolle, Partner und Gerätenamen eines Knotens bei. Eine neue Tabelle in der [HA-Dokumentation](doc/High_Availability_Dokumentation.md) beschreibt den sicheren Weg für Ersatzhardware, einen ausgefallenen Partner sowie einen fehlenden oder beschädigten Rollenanker.
+
+### API
+
+- Der API-Schlüssel kann jetzt gleichwertig per `X-API-PIN` oder `Authorization: Bearer` gesendet werden; bisher wurde `Authorization: Bearer` mit HTTP `403` abgewiesen. Beide Wege teilen sich Prüfung und Sperre nach Fehlversuchen. Sendet ein Client beide Header, gilt der Wert aus `Authorization: Bearer`. Ein vorgeschalteter Proxy oder Anmeldedienst, der einen eigenen `Authorization: Bearer`-Header durchreicht, löst dadurch bei jeder Anfrage einen Fehlversuch aus und kann die eigene Adresse sperren; der Proxy sollte diesen Header deshalb nicht weiterreichen.
+
+### Update
+
+- Vor dem Vollbackup und erneut unmittelbar vor dem Dienststopp prüft der Updater den freien Platz in `/run`. Sind dort weniger als 16 MB frei, bricht das Update mit `E3DC-UPD-RUN-SPACE-001` ab, bevor Dienste gestoppt oder Dateien ersetzt werden, statt erst nach dem Dienststopp an einem fehlschlagenden `systemctl daemon-reload` zu scheitern; knapp über der Reserve erscheint nur eine Warnung. npm-Abhängigkeiten optionaler Module wie der Matter-Bridge werden jetzt auf der Festplatte vorbereitet, nicht im heruntergeladenen Release unter `/run`. Ein fehlgeschlagenes `systemctl daemon-reload` wird einmal automatisch wiederholt.
+- Ein vor dem Update aktiver `piguard`-Watchdog, der noch ein anderes venv nutzt, wird nach dem bestätigten Start des Updates automatisch an das neue aktive venv gebunden; scheitert die Neubindung, rollt der Installer auf den vorherigen Watchdog-Zustand zurück und meldet eine Warnung, ohne die neue Version zurückzunehmen.
+
 ## [5.5.0a] – 2026-09-25
 
 ### Sicherheit

@@ -1,6 +1,6 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.5.1
+Dokumentation Stand: 5.5.2
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,

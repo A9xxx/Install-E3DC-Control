@@ -461,7 +461,7 @@ $defaults = [
     "ml_home_cap_kw" => "6.0",
 
     // V4 Smart Home / Energy Manager
-    "luxtronik" => "0", "wp_type" => "-1", "wp_source_type" => "auto", "luxtronik_ip" => "0.0.0.0", "idm_ip" => "0.0.0.0", "idm_port" => "502", "idm_e_total" => "0", "idm_cooling_boost_min_at" => "23.0", "idm_pv_surplus_enable" => "1", "idm_pv_surplus_max_kw" => "2.0", "idm_pv_surplus_min_kw" => "0.8", "idm_pv_surplus_ramp_kw" => "0.2", "idm_pv_surplus_deadband_kw" => "0.1", "idm_pv_surplus_heartbeat_s" => "60", "idm_pv_surplus_min_write_interval_s" => "10", "shelly_sg_ip" => "", "shelly_pause_ip" => "", "auto_mode" => "1", "grid_start_limit" => "-3500", "pv_boost_delay" => "30",
+    "luxtronik" => "0", "wp_type" => "-1", "wp_source_type" => "auto", "wp_page_preview_enable" => "0", "wp_buffer_sensor" => "none", "luxtronik_ip" => "0.0.0.0", "idm_ip" => "0.0.0.0", "idm_port" => "502", "idm_e_total" => "0", "idm_cooling_boost_min_at" => "23.0", "idm_pv_surplus_enable" => "1", "idm_pv_surplus_max_kw" => "2.0", "idm_pv_surplus_min_kw" => "0.8", "idm_pv_surplus_ramp_kw" => "0.2", "idm_pv_surplus_deadband_kw" => "0.1", "idm_pv_surplus_heartbeat_s" => "60", "idm_pv_surplus_min_write_interval_s" => "10", "shelly_sg_ip" => "", "shelly_pause_ip" => "", "auto_mode" => "1", "grid_start_limit" => "-3500", "pv_boost_delay" => "30",
     "stop_delay_minutes" => "10", "wp_min_runtime_min" => "30", "wp_restart_block_min" => "20", "min_soc" => "80", "heizgrenze_temp" => "10.0", "wws" => "50.0", "www" => "48.0", "hz" => "32.0", "khl" => "16.0",
     "wp_pv_max_power_w" => "0", "wp_pv_battery_limit_wh" => "0", "wp_pv_grid_limit_wh" => "0",
     "wp_pv_battery_max_w" => "0", "wp_pv_grid_max_w" => "0", "wp_pv_reaction_s" => "30",
@@ -494,6 +494,7 @@ $defaults = [
     "stiebel_isg_cop_estimate" => "3.0", "stiebel_isg_standby_w" => "35", "stiebel_isg_max_hz" => "60", "stiebel_isg_hz_power_map" => "",
     "stiebel_isg_scrape_hz_enable" => "0", "stiebel_isg_web_user" => "", "stiebel_isg_web_password" => "",
     "stiebel_isg_power_meter_enable" => "0", "stiebel_isg_power_meter_ip" => "0.0.0.0", "stiebel_isg_power_meter_type" => "auto",
+    "stiebel_isg_sg_ready_write" => "0",
     // Dimplex WPM Touch / NWPM (wp_type=5)
     "dimplex_ip" => "0.0.0.0", "dimplex_port" => "502", "dimplex_unit_id" => "1",
     "dimplex_wpm_software" => "",
@@ -514,6 +515,7 @@ $defaults = [
     "grid_max_amps" => "35", "grid_max_amps_l1" => "", "grid_max_amps_l2" => "", "grid_max_amps_l3" => "",
     "grid_wallbox_reserve_amps" => "2", "grid_wallbox_reserve_amps_l1" => "", "grid_wallbox_reserve_amps_l2" => "", "grid_wallbox_reserve_amps_l3" => "",
     "wb1_grid_phase" => "", "wb2_grid_phase" => "", "wb1_openwb_pro_1p_max_amp" => "", "wb2_openwb_pro_1p_max_amp" => "",
+    "wb1_openwb_pro_unplug_offer" => "safe", "wb2_openwb_pro_unplug_offer" => "safe", // openWB Pro nach dem Abstecken
     "wb_pcc_phase_basis" => "e3dc_pm_active_power", "wb_pcc_power_factor_margin" => "0.9", "grid_pcc_imbalance_max_a" => "20", // 1p-Deckel openWB Pro aus Netzphasenmessung
     "wb_surplus_target_grid_w" => "-125", "wb_surplus_noise_w" => "100", "phase_transition_safety_margin_w" => "0", "heatpump_start_settle_s" => "30",
     "wb_curve_pv_only_house_reserve_w" => "300", // Messreserve der PV-only-Entladeklemme
@@ -522,6 +524,7 @@ $defaults = [
     "wb_phase_down_delay_s" => "480", "wb_phase_up_forecast_hold_s" => "60", "wb_phase_up_symmetry_enable" => "0", // Vorlauf 60 s (die 480 s sind die Sperre nach dem Wechsel), Symmetrie-Klausel aus
     "wb_phase_up_export_wh" => "120", // Export-Wh-Konto 1p→3p (vorher 250 Wh), schaltet alternativ zur Uhr
     "wb_pv_only_release_hold_s" => "120", "wb_pv_only_hold_stale_guard_s" => "45",
+    "wb_grid_import_settle_s" => "10",
     "wb1_restart_delay_s" => "", "wb1_min_charge_time_s" => "", "wb1_cloud_stop_delay_s" => "", "wb1_phase_change_hold_s" => "",
     "wb2_restart_delay_s" => "", "wb2_min_charge_time_s" => "", "wb2_cloud_stop_delay_s" => "", "wb2_phase_change_hold_s" => "", "wb_openwb_zero_budget_hold_s" => "300",
     "openwb_pro_phase_wait_s" => "480", "openwb_pro_phase_cp_interrupt_duration_s" => "5", "openwb_pro_phase_restart_delay_s" => "0", "openwb_pro_start_wakeup_delay_s" => "5",
@@ -649,6 +652,7 @@ $tooltips = [
     // Schlüssel gilt zusätzlich für den Wiederanlauf nach einem Kaskaden-Stop des Gruppen-Defizitreglers.
     "wb_pv_only_release_hold_s" => "PV-only Halt-Freigabe (Sekunden, Standard 120, mindestens 30): Hat die Mehrfach-Wallbox-Zuteilung eine laufende Wallbox in der PV-only-Klasse auf den Mindeststrom gesetzt (Slot 0), wird eine Slot-Erhöhung erst übernommen, wenn der Slot so lange ununterbrochen über dem Mindeststrom stand; Slot 0 hält sofort wieder. Verhindert das Pendeln zwischen Mindeststrom und vollem Slot, wenn das Budget um das 3p-Minimum der anderen Wallbox liegt. Gilt ebenso für den Wiederanlauf nach einem Kaskaden-Stop des Gruppen-Defizitreglers (Netz- oder Akku-Wh-Konto): Der Start erfolgt erst, wenn das PV-Budget die Mindestleistung der erwarteten Phasenzahl (1p 1380 W, 3p 4140 W) so lange durchgehend deckt – eine einzelne Wolkenlücke startet nicht.",
     "wb_pv_only_hold_stale_guard_s" => "PV-only Halt-Gnadenfrist (Sekunden, Standard 45, 10 bis 300): So lange trägt ein einzelner Poll-Aussetzer der Wallbox (kein frischer Status) oder eine kurz nicht bereite Gruppenzuteilung den Halt-Zustand weiter, ohne einen neuen Halt zu erteilen. Ohne Gnadenfrist setzt ein Aussetzer die Halt-Freigabe zurück und der nächste Zyklus gibt den vollen Slotstrom auf den Draht. Dauert der Aussetzer länger, endet die Halt-Episode.",
+    "wb_grid_import_settle_s" => "Einschwingfrist nach neuem Netzbezug (Sekunden, Standard 10, 0 bis 30, 0 = aus): Der Hausspeicher gleicht eine Laständerung erst nach einigen Sekunden aus (E3DC etwa 5 bis 8 s). Solange neuer Netzbezug – etwa nach einer Anhebung der Wallbox oder bei einem Induktionskochfeld – kürzer ansteht und in der Reichweite des Speichers liegt, senkt die Wallbox nicht ab; angehoben wird erst nach Beruhigung in Schritten bis 2 A. Hausanschluss je Phase, Nutzer-Aus und Bezug über der Speicherreichweite wirken sofort; in der PV-only-Klasse und an der Notstromreserve gilt keine Frist.",
     "wb1_restart_delay_s" => "Abweichende Wiedereinschalt-Pause nur für Wallbox 1 (Sekunden). Leer = globaler Wert.",
     "wb1_min_charge_time_s" => "Abweichende Mindestladezeit nur für Wallbox 1 (Sekunden). Leer = globaler Wert.",
     "wb1_cloud_stop_delay_s" => "Abweichender Wolken-Halt nur für Wallbox 1 (Sekunden). Leer = globaler Wert.",
@@ -889,6 +893,8 @@ $tooltips = [
     "wp_type"                => "Wärmepumpen-Typ: -1=Keine WP, 0=Luxtronik (WebSocket), 1=IDM Navigator 2.0 (Modbus-TCP), 2=Heizstab/Shelly, 3=Shelly Pro3EM ohne native WP, 4=Stiebel Eltron ISG/WPM, 5=Dimplex WPM Touch/NWPM, 6=E3DC Leistungsmesser (PM).",
     "wp_e3dc_pm_index"       => "PM-Index des E3DC-Leistungsmessers für die Wärmepumpe (0..7, üblich: 1..6). Plausibilität vor dem Speichern testen.",
     "wp_source_type"         => "Wärmequelle der Wärmepumpe. Sie bestimmt die Anzeige der Wärmequelle und die Farbbewertung von COP und Arbeitszahl; bei „Unbekannt“ werden die Werte nicht farblich bewertet. Quell-Erholung ist nur für speichernde Quellen wie Sole/Erdreich, Grundwasser oder Direktverdampfung sinnvoll; Luft blockiert diesen Pausenmodus.",
+    "wp_page_preview_enable" => "Experimentell, Standard aus. Ein: Die Wärmepumpen-Seite zeigt einen Link zur neuen Ansicht mit Anlagenbild (Vorschau). Die neue Ansicht zeigt nur Messwerte; die Knöpfe Boost, Warmwasser und Automatik nutzen dieselben Aktionen wie die bisherige Seite.",
+    "wp_buffer_sensor"       => "Pufferfühler für die neue Wärmepumpen-Ansicht: keiner (Standard, kein Puffer im Anlagenbild), externer Rücklauf der Luxtronik (Ruecklauf_Extern) oder Pufferfühler der Stiebel-ISG. Ob der externe Rücklauf im Puffer sitzt, weiß nur der Betreiber. Nur Anzeige, keine Regelwirkung.",
     "stiebel_isg_ip"        => "IP-Adresse des Stiebel-Eltron ISG im lokalen Netz.",
     "stiebel_isg_port"      => "Modbus-TCP-Port des ISG. Standard: 502.",
     "stiebel_isg_device_id" => "Modbus Unit-ID des ISG. Standard: 1.",
@@ -904,6 +910,7 @@ $tooltips = [
     "stiebel_isg_power_meter_enable" => "Nutzt einen externen Shelly-Leistungsmesser als bevorzugte elektrische Wärmepumpenleistung. Der Stiebel-Dienst liest nur, es wird nichts geschaltet.",
     "stiebel_isg_power_meter_ip" => "IP-Adresse des Shelly-Leistungsmessers für die Stiebel-Wärmepumpe. Unterstützt Shelly Pro 3EM/3EM, Plus Plug, Plug S und PM-Geräte.",
     "stiebel_isg_power_meter_type" => "Zählertyp. Auto probiert Pro 3EM/3EM und Shelly-Plug/PM-Endpunkte der Reihe nach.",
+    "stiebel_isg_sg_ready_write" => "Experimentell, Standard aus. Der Wärmepumpen-Manager schreibt nur SG-Ready-Eingang 1 (Register 4002) des ISG: PV- oder Preisfreigabe = 1 (erhöhter Betrieb), sonst 0 (Normalbetrieb). Nur bei Zustandswechseln, mit Rücklesen. Voraussetzungen: im WPM SG Ready aktiviert und SG-Ready-Eingang = Modbus, Sicherheitstemperaturbegrenzer im Heizungsvorlauf, keine zweite SG-Ready-Steuerung, Automatik darf Geräte steuern. Wirksam nach Neustart des Wärmepumpen-Managers.",
     "dimplex_ip"             => "IP-Adresse des Dimplex WPM Touch / NWPM IP-Moduls im lokalen Netz.",
     "dimplex_port"           => "Modbus-TCP-Port der Dimplex WPM Touch / NWPM. Standard: 502.",
     "dimplex_unit_id"        => "Modbus Unit-ID. Meist 1.",
@@ -1047,6 +1054,8 @@ $tooltips = [
     "wb2_grid_phase"         => "Auf welcher Netzphase (L1, L2 oder L3) liegt die lokale Phase L1 von Wallbox 2? Eintragen, was der Elektriker angeschlossen hat; E3DC-Control prüft die Zuordnung beim einphasigen Laden ab 8 A automatisch (Last und Stromsprünge müssen auf dieser Netzphase erscheinen). Stimmt sie nicht, zeigt das Dashboard „Phasenzuordnung WB2 stimmt nicht: Last auf Lx statt Ly“ und es bleibt bei 20 A. Eine Änderung setzt den Nachweis zurück.",
     "wb1_openwb_pro_1p_max_amp" => "Obergrenze für einphasiges Laden an openWB Pro 1 (A). Mehr als 20 A werden dynamisch freigegeben aus Hausabsicherung − Reserve − gemessenem Bezug der zugeordneten Netzphase (E3DC-Wurzelzähler ÷ Wechselrichter-Spannung), begrenzt durch den Schieflast-Wächter; Anhebung 1 A je Regelschritt, Absenkung sofort; nur bei bestätigter Zuordnung und frischen Messwerten, sonst 20 A.",
     "wb2_openwb_pro_1p_max_amp" => "Obergrenze für einphasiges Laden an openWB Pro 2 (A). Mehr als 20 A werden dynamisch freigegeben aus Hausabsicherung − Reserve − gemessenem Bezug der zugeordneten Netzphase (E3DC-Wurzelzähler ÷ Wechselrichter-Spannung), begrenzt durch den Schieflast-Wächter; Anhebung 1 A je Regelschritt, Absenkung sofort; nur bei bestätigter Zuordnung und frischen Messwerten, sonst 20 A.",
+    "wb1_openwb_pro_unplug_offer" => "Verhalten der openWB Pro 1 nach dem Abstecken. Die Box behält sonst ihren letzten Sollstrom, und ein Auto lädt beim nächsten Anstecken sofort los, bevor die Regelung entscheidet. Sicherheitsvariante (Standard): Nach dem bestätigten Abstecken sendet E3DC-Control einmalig 0 A; beim Anstecken startet nichts, bis die Regelung freigibt. Schneller Start: einmalig 6 A; das Auto startet beim Anstecken sofort (auch aus Akku oder Netz) und zunächst ohne Zuteilung – Hausanschluss und eine zweite ladende Wallbox berücksichtigt erst die Regelung, sobald sie übernimmt. In „Aus“, bei Sperre oder unklaren Messwerten wird nichts gesendet; der Auftrag wartet, solange die Box getrennt bleibt. Eine manuelle Pause endet bereits beim Abstecken.",
+    "wb2_openwb_pro_unplug_offer" => "Verhalten der openWB Pro 2 nach dem Abstecken. Die Box behält sonst ihren letzten Sollstrom, und ein Auto lädt beim nächsten Anstecken sofort los, bevor die Regelung entscheidet. Sicherheitsvariante (Standard): Nach dem bestätigten Abstecken sendet E3DC-Control einmalig 0 A; beim Anstecken startet nichts, bis die Regelung freigibt. Schneller Start: einmalig 6 A; das Auto startet beim Anstecken sofort (auch aus Akku oder Netz) und zunächst ohne Zuteilung – Hausanschluss und eine zweite ladende Wallbox berücksichtigt erst die Regelung, sobald sie übernimmt. In „Aus“, bei Sperre oder unklaren Messwerten wird nichts gesendet; der Auftrag wartet, solange die Box getrennt bleibt. Eine manuelle Pause endet bereits beim Abstecken.",
     "wb_pcc_phase_basis"     => "Messbasis 1p-Deckel openWB Pro: Woraus der einphasige Stromdeckel der openWB Pro oberhalb von 20 A berechnet wird. Standard: Netzbezug je Phase vom E3DC-Wurzelzähler geteilt durch die vom Wechselrichter gemessene Phasenspannung (sonst 230 V) plus gemessener Wallbox-Strom. „Aus“ hält fest 20 A. Für mehr als 20 A müssen eine einphasige Obergrenze über 20 A („openWB Pro 1p Max.“ der Wallbox) und die Hausabsicherung ausdrücklich eingetragen, die Netzphase der Wallbox zugeordnet und diese Zuordnung von E3DC-Control beim Laden automatisch bestätigt sein („Zuordnung bestätigt“ im Dashboard). Fehlen frische Messwerte (10 s), gilt sofort wieder 20 A.",
     "wb_pcc_power_factor_margin" => "Leistungsfaktor-Reserve Fremdlast: Sicherheitsfaktor für den Anteil des Netzbezugs, der nicht von der Wallbox stammt (Haus, Wärmepumpe, zweite Wallbox): dessen Strom wird durch diesen Faktor geteilt, weil aus Wirkleistung und Spannung kein Blindstrom sichtbar ist. 0,9 = 11 % Aufschlag; 1,0 nur bei rein ohmschen Lasten. Der Wallbox-Anteil wird als echter Strom von der openWB Pro gemessen und braucht keinen Aufschlag.",
     "grid_pcc_imbalance_max_a" => "Schieflast-Wächter am Netzpunkt (A), nur openWB Pro: Höchste zulässige Differenz der Bezugsströme zwischen der Wallbox-Phase und der am wenigsten belasteten Phase am Hausanschluss; Einspeisung zählt als 0 A (20 A ≙ 4,6 kVA, übliche Netzbetreiber-Vorgabe). Das E3DC entlädt und speist in der Regel gleichmäßig über alle drei Phasen: Dann sinkt der Bezug der Wallbox-Phase, und der Deckel steigt nachts auf etwa 28–29 A, tagsüber je nach Einspeisung bis zur eingestellten 1p-Obergrenze. Ohne jeden Ausgleich (leerer Akku, keine PV) bleibt er bei 20 A; unter 20 A senkt der Wächter nie. Wer einphasig strikt 20 A einhalten muss, lässt die 1p-Obergrenze der openWB Pro leer. Nur nach Rücksprache mit dem Netzbetreiber erhöhen.",
@@ -1436,7 +1445,7 @@ function e3dc_config_auto_install_rules() {
         'heatpump' => [
             'label' => 'Wärmepumpen Manager',
             'service' => 'energy_manager',
-            'config_keys' => ['luxtronik', 'wp_type', 'luxtronik_ip', 'idm_ip', 'stiebel_isg_ip', 'dimplex_ip', 'shelly_sg_ip', 'shelly_pause_ip'],
+            'config_keys' => ['luxtronik', 'wp_type', 'luxtronik_ip', 'idm_ip', 'stiebel_isg_ip', 'dimplex_ip', 'shelly_sg_ip', 'shelly_pause_ip', 'stiebel_isg_sg_ready_write'],
             'when' => ['all' => [['type' => 'enabled', 'key' => 'luxtronik'], ['any' => [$wpLiveAny, $wpSgReadyAny]]]],
         ],
         'lux_live' => [
@@ -4442,7 +4451,7 @@ if ($configEditorRequestMethod === 'POST') {
 $groups = [
     "V4 Smart Home (Regelung & KI)" => [
         "cheap_grid_heatpump_enable", "heat_policy_runtime_enable", "price_boost_enable", "heat_price_boost_scope", "heat_price_boost_windows", "price_limit", "price_hard_limit", "price_pause_limit", "price_min_duration", "price_max_daily",
-        "luxtronik", "wp_type", "wp_source_type", "idm_ip", "idm_port", "idm_e_total", "luxtronik_ip",
+        "luxtronik", "wp_type", "wp_source_type", "wp_page_preview_enable", "wp_buffer_sensor", "idm_ip", "idm_port", "idm_e_total", "luxtronik_ip",
         "heizstab", "heizstab_type", "heizstab_ip", "heizstab_port", "heizstab_max_w", "shelly_heiz_ip", "shelly_heiz_w", "hs_min_surplus_w", "hs_min_soc", "hs_auto_mode",
         "climate_enable", "climate_name", "climate_meter_ip", "climate_meter_type", "climate_meter_phase", "climate_min_power_w", "climate_poll_s", "climate_history_enable", "climate_history_interval_s", "climate_forecast_enable",
         "climate_control_enable", "climate_control_provider", "climate_control_mode", "climate_control_poll_s", "climate_toshiba_cloud_enable", "climate_toshiba_username", "climate_toshiba_password", "climate_toshiba_device_ids", "climate_day_temp_c", "climate_night_temp_c", "climate_night_start", "climate_night_end", "climate_night_eco_enable", "climate_night_quiet_enable", "climate_high_power_enable",
@@ -4451,6 +4460,7 @@ $groups = [
         "stiebel_isg_standby_w", "stiebel_isg_max_hz", "stiebel_isg_hz_power_map", "stiebel_isg_scrape_hz_enable",
         "stiebel_isg_web_user", "stiebel_isg_web_password",
         "stiebel_isg_power_meter_enable", "stiebel_isg_power_meter_ip", "stiebel_isg_power_meter_type",
+        "stiebel_isg_sg_ready_write",
         "dimplex_ip", "dimplex_port", "dimplex_unit_id", "dimplex_wpm_software", "dimplex_sg_register", "dimplex_modbus_zero_based",
         "dimplex_outdoor_register", "dimplex_dhw_register", "dimplex_operating_mode_register",
         "dimplex_return_register", "dimplex_flow_register", "dimplex_return_setpoint_register", "dimplex_dhw_setpoint_register",
@@ -4479,6 +4489,7 @@ $groups = [
         "grid_max_amps", "grid_max_amps_l1", "grid_max_amps_l2", "grid_max_amps_l3",
         "grid_wallbox_reserve_amps", "grid_wallbox_reserve_amps_l1", "grid_wallbox_reserve_amps_l2", "grid_wallbox_reserve_amps_l3",
         "wb1_grid_phase", "wb2_grid_phase", "wb1_openwb_pro_1p_max_amp", "wb2_openwb_pro_1p_max_amp",
+        "wb1_openwb_pro_unplug_offer", "wb2_openwb_pro_unplug_offer",
         "wb_pcc_phase_basis", "wb_pcc_power_factor_margin", "grid_pcc_imbalance_max_a",
         "wb_surplus_target_grid_w", "wb_surplus_noise_w", "phase_transition_safety_margin_w", "heatpump_start_settle_s",
         "wb_curve_pv_only_house_reserve_w",
@@ -4486,6 +4497,7 @@ $groups = [
         "wb_restart_delay_s", "wb_min_charge_time_s", "wb_cloud_stop_delay_s", "wb_phase_change_hold_s",
         "wb_phase_down_delay_s", "wb_phase_up_forecast_hold_s", "wb_phase_up_symmetry_enable", "wb_phase_up_export_wh",
         "wb_pv_only_release_hold_s", "wb_pv_only_hold_stale_guard_s",
+        "wb_grid_import_settle_s",
         "wb1_restart_delay_s", "wb1_min_charge_time_s", "wb1_cloud_stop_delay_s", "wb1_phase_change_hold_s",
         "wb2_restart_delay_s", "wb2_min_charge_time_s", "wb2_cloud_stop_delay_s", "wb2_phase_change_hold_s",
         "smart_wbhour_enable", "car_capacity", "car_target_unit", "car_target_kwh", "car_target_soc", "car_max_soc_si", "car_charge_power",
@@ -6534,6 +6546,24 @@ async function readConfirmedConfigJson(response) {
                                 </div>
                             </div>
                             <?php endif; ?>
+                            <div class="col-12 mt-2">
+                                <div class="form-check form-switch m-0">
+                                    <input type="hidden" name="values[wp_page_preview_enable]" value="0">
+                                    <input class="form-check-input" type="checkbox" name="values[wp_page_preview_enable]" value="1" id="conf_wp_page_preview_enable" <?= $isTrue('wp_page_preview_enable') ? 'checked' : '' ?>>
+                                    <label class="form-check-label ms-2 config-label" for="conf_wp_page_preview_enable" data-tooltip="<?= htmlspecialchars($tooltipMap['wp_page_preview_enable'] ?? '') ?>">Neue Wärmepumpen-Ansicht (Vorschau) <span class="badge text-bg-warning ms-1">Experimentell</span></label>
+                                    <?= $configValidationMarker('wp_page_preview_enable') ?>
+                                </div>
+                            </div>
+                            <div class="col-12 mt-2">
+                                <?php $wpBufferSensor = strtolower((string)($val('wp_buffer_sensor') ?: 'none')); ?>
+                                <label class="config-label text-info" for="conf_wp_buffer_sensor" data-tooltip="<?= htmlspecialchars($tooltipMap['wp_buffer_sensor'] ?? '') ?>">Pufferfühler (neue Ansicht)</label>
+                                <select class="form-select config-input" name="values[wp_buffer_sensor]" id="conf_wp_buffer_sensor">
+                                    <option value="none" <?= in_array($wpBufferSensor, ['luxtronik_ruecklauf_extern', 'stiebel_puffer'], true) ? '' : 'selected' ?>>Keiner / kein Pufferspeicher</option>
+                                    <option value="luxtronik_ruecklauf_extern" <?= ($wpBufferSensor === 'luxtronik_ruecklauf_extern') ? 'selected' : '' ?>>Externer Rücklauf der Luxtronik (Ruecklauf_Extern)</option>
+                                    <option value="stiebel_puffer" <?= ($wpBufferSensor === 'stiebel_puffer') ? 'selected' : '' ?>>Pufferfühler der Stiebel-ISG</option>
+                                </select>
+                                <?= $configValidationMarker('wp_buffer_sensor') ?>
+                            </div>
                             <?php if ($wp_type_val === '1'): ?>
                                 <div class="col-12 mt-2">
                                     <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['idm_ip'] ?? '') ?>">IDM IP-Adresse</label>
@@ -6683,6 +6713,18 @@ async function readConfirmedConfigJson(response) {
                                             <option value="<?= htmlspecialchars($optValue) ?>" <?= $stiebelMeterType === $optValue ? 'selected' : '' ?>><?= htmlspecialchars($optLabel) ?></option>
                                         <?php endforeach; ?>
                                     </select>
+                                </div>
+                                <div class="col-12 mt-2">
+                                    <label class="config-label text-warning fw-bold"><i class="fas fa-flask me-1"></i>SG Ready schreiben (experimentell)</label>
+                                    <div class="text-muted small">Standard aus. Schreibt nur SG-Ready-Eingang 1 (4002) bei Zustandswechseln der zentralen Entscheidung. Voraussetzungen: SG Ready im WPM aktiviert, SG-Ready-Eingang = Modbus, Sicherheitstemperaturbegrenzer im Heizungsvorlauf, keine zweite SG-Ready-Steuerung. Ein eingetragener Shelly-SG-Ready-/EVU-Kontakt hat Vorrang.</div>
+                                </div>
+                                <div class="col-12 col-md-4">
+                                    <label class="config-label text-warning" data-tooltip="<?= htmlspecialchars($tooltipMap['stiebel_isg_sg_ready_write'] ?? '') ?>">SG Ready schreiben</label>
+                                    <select name="values[stiebel_isg_sg_ready_write]" class="form-select config-input">
+                                        <option value="0" <?= $val('stiebel_isg_sg_ready_write') !== '1' ? 'selected' : '' ?>>Aus (nur lesen)</option>
+                                        <option value="1" <?= $val('stiebel_isg_sg_ready_write') === '1' ? 'selected' : '' ?>>Ein (experimentell)</option>
+                                    </select>
+                                    <?= $configValidationMarker('stiebel_isg_sg_ready_write') ?>
                                 </div>
                             <?php elseif ($wp_type_val === '5'): ?>
                                 <div class="col-12 mt-2">
@@ -8354,6 +8396,14 @@ async function readConfirmedConfigJson(response) {
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_openwb_pro_1p_max_amp'] ?? '') ?>">WB1 openWB Pro 1p Max. (A)</label>
                                 <input type="number" min="6" max="32" step="0.5" name="values[wb1_openwb_pro_1p_max_amp]" class="form-control config-input" value="<?= $val('wb1_openwb_pro_1p_max_amp') ?>" placeholder="leer = sicher 20 A">
                             </div>
+                            <div class="col-6 col-lg-3" data-wallbox-column="1">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_openwb_pro_unplug_offer'] ?? '') ?>">WB1 openWB Pro nach dem Abstecken</label>
+                                <select name="values[wb1_openwb_pro_unplug_offer]" class="form-select config-input">
+                                    <option value="safe" <?= $rawVal('wb1_openwb_pro_unplug_offer') !== 'fast_start' ? 'selected' : '' ?>>Nach dem Abstecken: Sicherheitsvariante (0 A)</option>
+                                    <option value="fast_start" <?= $rawVal('wb1_openwb_pro_unplug_offer') === 'fast_start' ? 'selected' : '' ?>>Nach dem Abstecken: Schneller Start (6 A)</option>
+                                </select>
+                                <?= $configValidationMarker('wb1_openwb_pro_unplug_offer') ?>
+                            </div>
                             <div class="col-12" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>><h6 class="text-muted small fw-bold mt-2 mb-0">Wallbox 2</h6></div>
                             <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
                                 <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_max_amp'] ?? '') ?>">WB2 Max. Ladestrom (A)</label>
@@ -8380,6 +8430,14 @@ async function readConfirmedConfigJson(response) {
                             <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_openwb_pro_1p_max_amp'] ?? '') ?>">WB2 openWB Pro 1p Max. (A)</label>
                                 <input type="number" min="6" max="32" step="0.5" name="values[wb2_openwb_pro_1p_max_amp]" class="form-control config-input" value="<?= $val('wb2_openwb_pro_1p_max_amp') ?>" placeholder="leer = sicher 20 A">
+                            </div>
+                            <div class="col-6 col-lg-3" data-wallbox-column="2" <?= $hasSecondWallbox ? '' : 'hidden' ?>>
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_openwb_pro_unplug_offer'] ?? '') ?>">WB2 openWB Pro nach dem Abstecken</label>
+                                <select name="values[wb2_openwb_pro_unplug_offer]" class="form-select config-input">
+                                    <option value="safe" <?= $rawVal('wb2_openwb_pro_unplug_offer') !== 'fast_start' ? 'selected' : '' ?>>Nach dem Abstecken: Sicherheitsvariante (0 A)</option>
+                                    <option value="fast_start" <?= $rawVal('wb2_openwb_pro_unplug_offer') === 'fast_start' ? 'selected' : '' ?>>Nach dem Abstecken: Schneller Start (6 A)</option>
+                                </select>
+                                <?= $configValidationMarker('wb2_openwb_pro_unplug_offer') ?>
                             </div>
                         </div>
                     </details>
@@ -8484,6 +8542,12 @@ async function readConfirmedConfigJson(response) {
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_pv_only_hold_stale_guard_s'] ?? '') ?>">PV-only Halt-Gnadenfrist (s)</label>
                                 <input type="number" min="10" max="300" step="5" name="values[wb_pv_only_hold_stale_guard_s]" class="form-control config-input" value="<?= $val('wb_pv_only_hold_stale_guard_s') ?>" placeholder="<?= $defaults['wb_pv_only_hold_stale_guard_s'] ?>">
                                 <?= $configValidationMarker('wb_pv_only_hold_stale_guard_s') ?>
+                            </div>
+                            <?php /* Einschwingfrist des Defizitreglers nach neuem Netzbezug (0 = aus). */ ?>
+                            <div class="col-6 col-lg-3">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_grid_import_settle_s'] ?? '') ?>">Einschwingfrist Netzbezug (s)</label>
+                                <input type="number" min="0" max="30" step="1" name="values[wb_grid_import_settle_s]" class="form-control config-input" value="<?= $val('wb_grid_import_settle_s') ?>" placeholder="<?= $defaults['wb_grid_import_settle_s'] ?>">
+                                <?= $configValidationMarker('wb_grid_import_settle_s') ?>
                             </div>
                             <div class="col-12">
                                 <div class="config-flow-help rounded-3 p-3">

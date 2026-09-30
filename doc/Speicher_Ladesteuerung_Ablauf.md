@@ -168,7 +168,7 @@ nicht wieder aufgenommen. Technisch wird der Schalter als
 bindet die Übernahme mit `storage_regulation_changed_ts` an die aktuelle
 Bedienaktion. Ein Dienststopp allein ersetzt diese geordnete Abschaltung nicht.
 
-> **Stand:** v5.5.1
+> **Stand:** v5.5.2
 >
 > **Neu in 5.4.5a:** Ein frisch beobachteter openWB-Fahrzeug-SoC kann mit
 > Quelle und Alter rein lesend erscheinen, wenn er zur aktuellen Stecksession
@@ -534,6 +534,41 @@ bei jeder kleinen Schwankung des Messrahmens neu:
   PV-only-Entladegrenze der Wallbox, der Start vor der Kurve bei hohem Bedarf
   und harte Lademodi. Die Entscheidungshistorie zählt die Schreibvorgänge je
   Pfad (`write_brake`).
+- Jeder gesendete `POWER_SETTINGS`-Schreibvorgang wird im Log des
+  Speicherreglers gezählt, auch wenn ihn erst der nächste Live-Readback
+  bestätigt oder er fehlschlägt. Ein Wechsel in die Grenzklasse „Entladen
+  0 W“ (Entladung gesperrt) oder aus ihr heraus steht immer mit den Sollwerten
+  in einer eigenen Zeile („RSCP POWER_SETTINGS: Grenzklasse A -> B …“), auch
+  ein kurzer. Andere Wechsel der Grenzklasse (Grenzen aus; Laden 0 W oder
+  begrenzt; Entladen begrenzt oder frei) gegenüber der zuletzt protokollierten
+  Klasse bekommen höchstens alle 10 s eine eigene Zeile, also höchstens sechs
+  je Minute; ein so zurückgestellter Wechsel steht spätestens in der nächsten
+  Sammelzeile („…, Grenzklasse A -> B“). Alle übrigen Schreibvorgänge fasst
+  eine Sammelzeile zusammen
+  („RSCP POWER_SETTINGS: N SET seit HH:MM:SS …, letzter Sollwert …“),
+  spätestens 60 s nach dem ersten noch nicht protokollierten Schreibvorgang
+  und beim Beenden des Speicherreglers. Bei 13–17 Schreibvorgängen je Minute
+  (etwa Kurvenladung bei laufender Wallbox) sind das eine Sammelzeile je
+  Minute plus die Klassenwechsel; nicht schützende Änderungen des Laderahmens
+  schreibt die Regelung ohnehin höchstens alle 30 s. Fehler und unbestätigte
+  SET-Antworten eines gesendeten Schreibvorgangs haben eigene Warn- und
+  Fehlerzeilen mit der RSCP-Antwort des E3DC („RSCP-Antwort …“), die die
+  Dämpfung wiederholter Meldungen nicht zurückhält; gleichlautende
+  Wiederholungen derselben Ursache (gleiche Meldung, gleiche RSCP-Antwort)
+  erscheinen höchstens einmal je Minute, die übrigen zählt die Sammelzeile
+  („… gleichlautende Fehler/Warnungen ohne eigene Zeile“). Ein nicht gesendeter Versuch zählt
+  nicht als Schreibvorgang und bleibt der normalen Dämpfung unterworfen. Die
+  Diagnose `rscp_power_settings` zeigt `set_log_pending` und
+  `set_log_summary_lines`.
+- Die PV-only-Entladegrenze der Wallbox gilt nur, solange eine Wallbox
+  tatsächlich lädt: ein ab 500 W sofort, ebenso bei ungültiger, veralteter
+  oder unvollständiger Messung; aus erst, wenn jeder gesteckte Ladepunkt 45 s
+  ohne Unterbrechung gültig und frisch unter 300 W misst (Zustand
+  `wallbox_pv_only_discharge_cap_latch`). Sie folgt dem Hausbedarf; neu
+  geschrieben wird sie erst ab einer Änderung von 200 W (Totband, Zustand
+  `wallbox_pv_only_discharge_deadband`). Eine Senkung durch eine harte Grenze
+  wirkt sofort; für nur beobachtete oder extern geführte Wallboxen gilt das
+  Totband nicht.
 
 Die Grenze „höchstens alle 30 s“ gilt nur für nicht schützende Änderungen.
 Schützende Absenkungen, Freigaben bei Netzbezug, die in beide Richtungen
@@ -558,9 +593,10 @@ erhöht diesen Laderahmen nicht. Fehlt der frische Split, bleiben diese
 PV-basierten Ladepfade mit 0 W fail-closed.
 
 Der Manager setzt dafür einen `MAX_CHARGE_POWER`-Rahmen über
-`EMS_REQ_SET_POWER_SETTINGS`. Für diese Einstellungs-Schnittstelle liegt kein
-belastbarer Nachweis einer ausschließlich flüchtigen Speicherung vor. Sie ist
-nicht mit der temporären Leistungsvorgabe `EMS_REQ_SET_POWER` gleichzusetzen.
+`EMS_REQ_SET_POWER_SETTINGS`. Die E3DC setzt diese Einstellung bei einem
+Neustart zurück; die Regelung schreibt sie trotzdem nur bei
+echter Änderung. Sie ist nicht mit der temporären Leistungsvorgabe
+`EMS_REQ_SET_POWER` gleichzusetzen.
 E3/DC bleibt in AUTO und die Entladung für wechselnden Hausverbrauch
 bleibt offen. Die Funktion ist deshalb DC-first, aber keine physikalische
 Garantie für einen ausschließlich internen DC/DC-Energiepfad. Preis- und
@@ -671,6 +707,55 @@ Schieflast-, Hausanschluss- und Deckelgrenzen setzt der Wallbox-Manager
 anschließend je Ladepunkt; den einphasigen Deckel mit Schieflast-Wächter
 gibt es dabei nur an der openWB Pro.
 
+Die Leistung einer externen Wallbox und der E3DC-Hauswert stammen aus
+verschiedenen Abfragen; der Hauswert enthält die externe Wallbox. Aus beiden
+bildet der Speicherregler den Hausanteil ohne Wallbox und vergleicht ihn mit
+dem letzten schlüssigen Probenpaar. Meldet die Wallbox in einer einzelnen
+Probe weniger Leistung je Ampere oder weniger genutzte Phasen, ohne dass der
+Hauswert um denselben Betrag fällt, hält die Budgetbildung den vom Hauswert
+nicht bestätigten Teil bis zur Folgeprobe; das Wallbox-Budget sinkt erst,
+wenn die Folgeprobe den Einbruch bestätigt. Keine Haltung gibt es bei einem
+vom Hauswert bestätigten Einbruch, bei Netzbezug (ab 100 W), wenn der Wallbox
+Manager den ausgegebenen oder die Wallbox den bestätigten Ladestrom gesenkt
+hat (der Deckel `cap_amp` allein zählt nicht), bei geändertem Phasenziel,
+während und bis 10 s nach einem Phasenwechsel, bei ungültiger Messung, ohne
+vergleichbaren Hauswert (etwa an der E3DC-Wallbox) und bei mehr als 10 s
+Abstand zur Vorprobe. Fällt umgekehrt der Hauswert bis 10 s nach einer
+Stromabsenkung, bevor die Wallboxprobe folgt, senkt der Speicherregler den
+Wallboxwert um den Teil, den die Absenkung erklärt (Ampere × 230 V ×
+Phasen); so stammen Wallboxwert und E3DC-Rest aus demselben Probenpaar, und
+kein Budget oder Haltezonen-Rahmen zählt die Leistung doppelt. Ein fallender
+Hauswert ohne passende Absenkung (etwa ein Kochfeld schaltet ab) bleibt
+unkorrigiert. Zwei gleichartige Folgeproben mit neuem Hausanteil gelten als
+echte Hauslaständerung. Absenkungen werden je Ladepunkt geprüft, damit eine
+gleichzeitige Anhebung an einem anderen Ladepunkt sie nicht verdeckt; fehlt
+einem ladenden Ladepunkt die Kennung oder ist sie doppelt, gilt der Beleg aus
+der Summe aller Ladepunkte. Diagnose: `wallbox_measurement_dip_confirmation`
+im Speicherzustand.
+
+In `PV + Akku bis Untergrenze` und in `Sofort bis Preislimit` ohne Preis- oder
+Netzfenster gilt direkt über `wbminsoc` die Haltezone
+(`doc/V4_Konfiguration_und_Regelung.md`, Akkustützung, Punkt 5), nicht in
+`Akku bis Abfahrt`:
+Das Restbudget ist dort PV minus alle laufenden Verbraucher ohne Abzug des
+Kurvenbedarfs, der Stütz- und Startrahmen aus dem Akku entfällt, und die
+laufende Wallbox wird höchstens mit ihrem batterieneutralen PV-Rahmen
+gehalten; kurze Schwankungen überbrückt das Wolken-Kontingent. Den
+Laderahmen des Speichers verändert die Haltezone nicht. Der Vertrag
+`wallbox_wbminsoc_hold_zone` im Wallbox-Rahmen nennt das PV-Budget der
+Wallboxgruppe im Band (`budget_w`, gültig solange `active` gilt und `ts`
+höchstens `max_age_s` = 15 s alt ist); der Wallbox Manager regelt im Band
+einschließlich der Untergrenze danach und rechnet dort kein eigenes Budget.
+Diagnose: `wallbox_wbminsoc_hold_zone` im Budget.
+
+Setzt die Entscheidung eines Zyklus die Akkustützung der Wallbox – in der
+Haltezone, in der PV-only-Klasse unter dem Kurvenkorridor oder nach einer
+Anhebung von `wbminsoc` während der Ladung, jeweils nicht autorisiert –,
+stehen Freigabe und Grund (`battery_support_authorized`,
+`battery_support_reason`) im selben Zyklus im veröffentlichten Wallbox-Rahmen.
+Ohne solche Setzung fehlen beide Felder; der Wallbox Manager nutzt dann seine
+eigene Kurvenklasse.
+
 Wärmepumpenleistung wird aus `energy_decision_latest.json` übernommen und in den
 Livewerten als `WP_Power` geführt. Wenn der Hausverbrauch die WP bereits enthält,
 wird `Home_Power_Raw` behalten und `Home_Power` bereinigt. Dadurch erkennt der
@@ -761,7 +846,7 @@ Storage Manager.
 
 - Beim Begrenzen und Halten bleibt E3/DC in AUTO; die Regelung setzt einen
   Lade- oder Entladerahmen und fordert keine Netzeinspeisung an. Für dessen
-  Speicherung über `POWER_SETTINGS` gilt die Einschränkung aus Abschnitt 3.1.
+  Schreibweise über `POWER_SETTINGS` gilt Abschnitt 3.1.
 - Sicherheitsabstand, Leistungshysterese, SoC-Hysterese und
   Freigabe-Entprellung verhindern Flattern.
 - Der Lastspitzenpuffer liegt oberhalb der physischen Notstromreserve.

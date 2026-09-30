@@ -37,6 +37,12 @@ class WallboxRuntimeState:
     min_current_import_last_ts: Dict[int, float] = field(default_factory=dict)
     group_deficit_state: Dict[str, Any] = field(default_factory=dict)
     group_deficit_binding: Dict[str, Any] = field(default_factory=dict)
+    # Bezugsepisode am Netzpunkt (Einschwingfrist); überdauert Neuanfänge
+    # der Defizitkaskade, weil der Bezug eine Gruppengröße ist.
+    group_deficit_import_episode: Dict[str, Any] = field(default_factory=dict)
+    # Ununterbrochener Netzbezug je gültiger Probe für den Phasenabstieg im
+    # Startfenster; eine bezugsfreie Probe setzt ihn zurück.
+    start_window_import_run: Dict[str, Any] = field(default_factory=dict)
 
     predump_wb_gate_open: bool = False
     predump_wb_gate_start_ts: float = 0.0

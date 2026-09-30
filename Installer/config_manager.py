@@ -359,6 +359,20 @@ V4_BLOCK_WALLBOX = {
     'wb_openwb_zero_budget_hold_s',
     # Freigabe-Hysterese + Gnadenfrist des PV-only-Laufhalts.
     'wb_pv_only_release_hold_s', 'wb_pv_only_hold_stale_guard_s',
+    # Einschwingfrist des Defizitreglers nach neuem Netzbezug (0 = aus, 0 … 30 s);
+    # Editor und Validator. Ohne Inventar-Eintrag entfernte cleanup_v4_config()
+    # den Schlüssel bei jedem Docker-Start.
+    'wb_grid_import_settle_s',
+    # Nur Inventar (kein Editor/Validator). Gelesen in wallbox_manager.py
+    # (Wh-Konto des Mindesthalts: Netztoleranz, Schwelle, Leck, Zeitschritt,
+    # Entprellung; wbminSoC-Hysterese, Neustart-Abstand, Haltezeit des
+    # Untergrenzen-Abstiegs, Phasenbestätigung). Die Doku nennt sie als
+    # Stellschrauben; ohne Inventar-Eintrag entfernt cleanup_v4_config() sie.
+    'wb_min_current_import_tolerance_w', 'wb_min_current_import_stop_wh',
+    'wb_min_current_import_release_w', 'wb_min_current_import_max_step_s',
+    'wb_min_current_import_debounce_s',
+    'wb_soc_hysterese_pct', 'wb_target_restart_above_wbminsoc_pct',
+    'wb_floor_pv_only_phase_down_hold_s', 'wb_phase_confirm_timeout_s',
     # Nur Inventar (kein Editor/Validator). Gelesen in
     # wallbox_manager.py (Wh-Stützkontingent unter der Kurve, Prognose-Stopp-
     # Defizit, Haltezeit nach der Schnellphase); ohne Inventar-Eintrag entfernt
@@ -400,12 +414,15 @@ V4_BLOCK_WALLBOX = {
     'wb1_obc_max_power_kw', 'wb1_obc_max_phases',
     'wb1_grid_phase', 'wb1_grid_phase_rotation',
     'wb1_openwb_pro_1p_max_amp',
+    # Angebot der openWB Pro nach dem Abstecken (safe = 0 A, fast_start = 6 A).
+    'wb1_openwb_pro_unplug_offer',
     'wb2_mode', 'wb2_observe_storage_policy',
     'wb2_car_id', 'wb2_capacity', 'wb2_target_unit', 'wb2_target_kwh', 'wb2_target_soc',
     'wb2_charge_power', 'wb2_max_soc_si',
     'wb2_obc_max_power_kw', 'wb2_obc_max_phases',
     'wb2_grid_phase', 'wb2_grid_phase_rotation',
     'wb2_openwb_pro_1p_max_amp',
+    'wb2_openwb_pro_unplug_offer',
     'smart_wbhour_enable', 'wbcostpowers',
     # Globaler Fahrzeug-Rückfall, wenn wb{n}_* fehlt; gepflegt im Config-Editor
     # unter „Fahrzeug und Ladeziel“.
@@ -418,7 +435,7 @@ V4_BLOCK_WALLBOX = {
 
 # --- Block 7: Wärmepumpe / Energie-Manager ---
 V4_BLOCK_HEATPUMP = {
-    'wp_type', 'wp_source_type', 'luxtronik', 'luxtronik_ip',
+    'wp_type', 'wp_source_type', 'wp_page_preview_enable', 'wp_buffer_sensor', 'luxtronik', 'luxtronik_ip',
     'luxtronik_pause_setpoint_c',
     'idm_ip', 'idm_port', 'idm_e_total', 'idm_cooling_boost_min_at',
     'idm_pv_surplus_enable', 'idm_pv_surplus_max_kw', 'idm_pv_surplus_min_kw',
@@ -494,6 +511,7 @@ V4_BLOCK_HEATPUMP = {
     'stiebel_isg_power_meter_enable',
     'stiebel_isg_power_meter_ip',
     'stiebel_isg_power_meter_type',
+    'stiebel_isg_sg_ready_write',  # Experimentell: SG-Ready-Eingang 1 per Modbus schreiben (Standard 0)
     # Dimplex WPM Touch / NWPM (wp_type=5)
     'dimplex_ip',
     'dimplex_port',
@@ -1239,7 +1257,11 @@ def check_config_duplicates():
             if '=' in stripped:
                 key = stripped.split('=', 1)[0].strip().lower()
                 if key in seen:
-                    print(f'  [!] Duplikat entfernt: {stripped}')
+                    if key in {'e3dc_user', 'mqtt_hub_user', 'wb_user', 'wb2_user', 'stiebel_isg_web_user'}:
+                        value_state = 'gesetzt' if stripped.split('=', 1)[1].strip() else 'fehlt'
+                        print(f'  [!] Duplikat entfernt: {key} = {value_state}')
+                    else:
+                        print(f'  [!] Duplikat entfernt: {stripped}')
                     removed += 1
                     continue
                 seen.add(key)
@@ -1278,7 +1300,11 @@ def _migrate_luxtronik_config():
             key_lower = k.lower()
             if key_lower in V4_ALL_KEYS:
                 v4[key_lower] = str(v)
-                print(f'  [OK] Migriert: {key_lower} = {v}')
+                if key_lower in {'e3dc_user', 'mqtt_hub_user', 'wb_user', 'wb2_user', 'stiebel_isg_web_user'}:
+                    value_state = 'gesetzt' if str(v).strip() else 'fehlt'
+                    print(f'  [OK] Migriert: {key_lower} = {value_state}')
+                else:
+                    print(f'  [OK] Migriert: {key_lower} = {v}')
 
         _save_v4(_sort_by_blocks(v4))
         os.rename(lux_path, lux_path + '.migrated')

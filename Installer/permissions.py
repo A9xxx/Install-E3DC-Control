@@ -1953,6 +1953,7 @@ WEB_PROGRAM_FALLBACK_FILES = (
     "sw.js",
     "vitals.php",
     "waermepumpe.php",
+    "waermepumpe_vorschau.php",
     "wallbox_transaction.php",
     "webhook.php",
     "webpush_api.php",
@@ -2038,6 +2039,7 @@ FILE_DEFINITIONS = [
     {"path": "/var/www/html/send_daily_telegram.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/send_status_telegram.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/waermepumpe.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    {"path": "/var/www/html/waermepumpe_vorschau.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/e3dc_paths.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
     {"path": "/var/www/html/sw.js", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
     {"path": "/var/www/html/webpush_api.php", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": False, "executable": False},
@@ -2050,6 +2052,8 @@ FILE_DEFINITIONS = [
     {"path": "/var/www/html/data/morning_boost_state.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/data/external_pv_topology.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/data/e3dc_stats.db", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    {"path": "/var/www/html/data/battery_vitals_history.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    {"path": "/var/www/html/data/battery_vitals_trigger_state.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/ramdisk/pv_forecast_diagnostic_summary.json", "mode": "644", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     # Wallbox-Session-Helferdateien: PHP/www-data und Python-Dienste lesen/schreiben gemeinsam.
     {"path": "/var/www/html/tmp/car_charge_session.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
@@ -2336,8 +2340,16 @@ def _normalize_permission_tree_fd(
     excluded_top_level_prefixes=(),
     reject_unsafe_entries=False,
     expected_root_identity=None,
+    tolerate_vanished_entries=False,
 ):
     """Projiziert Baumrechte fd-relativ, nofollow-, mount- und hardlinksicher.
+
+    ``tolerate_vanished_entries`` ist nur für Laufzeitflächen gedacht, in die
+    Dienste laufend atomar schreiben (Zwischendatei, dann Umbenennen). Ein
+    Eintrag, der zwischen Auflisten, Öffnen und Nachkontrolle verschwindet
+    oder unter demselben Namen durch einen neuen Inode ersetzt wird, wird dort
+    übersprungen statt die ganze Projektion abzubrechen; verändert
+    wurde dann nichts oder nur der bereits per Deskriptor gebundene Inode.
 
     ``contract(relative, metadata, is_directory)`` liefert ``(uid, gid, mode)``.
     Ein einzelner Wert ``None`` erhält die betreffende Metadatenkomponente; ein
@@ -2391,6 +2403,7 @@ def _normalize_permission_tree_fd(
         os.close(root_parent_fd)
         raise RuntimeError("Gebundene Rechtewurzel driftete beim Öffnen")
     skipped = []
+    vanished = []
     excluded = frozenset(str(item) for item in excluded_top_level)
     excluded_prefixes = tuple(str(item) for item in excluded_top_level_prefixes)
     rebound_root = -1
@@ -2405,49 +2418,77 @@ def _normalize_permission_tree_fd(
             stat.S_IMODE(metadata.st_mode) if mode is None else int(mode),
         )
 
+    def vanished_entry(path):
+        if not tolerate_vanished_entries:
+            return False
+        vanished.append(path)
+        return True
+
     def verify_named(parent_fd, name, descriptor, *, uid, gid, mode, kind):
         secured = os.fstat(descriptor)
-        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        try:
+            named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            if vanished_entry(name):
+                return
+            raise
         if (
-            (secured.st_dev, secured.st_ino) != (named.st_dev, named.st_ino)
-            or secured.st_uid != uid
+            secured.st_uid != uid
             or secured.st_gid != gid
             or stat.S_IMODE(secured.st_mode) != mode
         ):
             raise RuntimeError(f"{kind} blieb nach der Rechteprojektion nicht gebunden: {name}")
+        if (secured.st_dev, secured.st_ino) != (named.st_dev, named.st_ino):
+            # Ein Dienst hat den Namen inzwischen atomar durch einen neuen Inode
+            # ersetzt; verändert wurde nur der per Deskriptor gebundene alte.
+            if vanished_entry(name):
+                return
+            raise RuntimeError(f"{kind} blieb nach der Rechteprojektion nicht gebunden: {name}")
 
     def normalize_regular(parent_fd, name, relative, metadata, mount_id):
-        descriptor = os.open(
-            name,
-            os.O_RDONLY | nofollow | cloexec,
-            dir_fd=parent_fd,
-        )
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | nofollow | cloexec,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            if vanished_entry(os.path.join(root, *relative)):
+                return
+            raise
         try:
             current = os.fstat(descriptor)
+            identity_drift = (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino)
             if (
                 not stat.S_ISREG(current.st_mode)
-                or (current.st_dev, current.st_ino)
-                != (metadata.st_dev, metadata.st_ino)
                 or _permission_mount_id(descriptor) != mount_id
+                or (identity_drift and not vanished_entry(os.path.join(root, *relative)))
             ):
                 raise RuntimeError(
                     f"Rechtedatei wechselte oder liegt auf einem verschachtelten Mount: "
                     f"{os.path.join(root, *relative)}"
                 )
+            if identity_drift:
+                return
             desired = desired_values(current, contract(relative, current, False))
             if desired is None:
                 return
             uid, gid, mode = desired
             if current.st_nlink > 1:
-                _copy_bound_permission_file(
-                    parent_fd,
-                    name,
-                    descriptor,
-                    uid=uid,
-                    gid=gid,
-                    mode=mode,
-                    expected_mount_id=mount_id,
-                )
+                try:
+                    _copy_bound_permission_file(
+                        parent_fd,
+                        name,
+                        descriptor,
+                        uid=uid,
+                        gid=gid,
+                        mode=mode,
+                        expected_mount_id=mount_id,
+                    )
+                except FileNotFoundError:
+                    if vanished_entry(os.path.join(root, *relative)):
+                        return
+                    raise
                 return
             os.fchown(descriptor, uid, gid)
             os.fchmod(descriptor, mode)
@@ -2464,23 +2505,30 @@ def _normalize_permission_tree_fd(
             os.close(descriptor)
 
     def normalize_directory(parent_fd, name, relative, metadata, mount_id):
-        descriptor = os.open(
-            name,
-            os.O_RDONLY | nofollow | directory | cloexec,
-            dir_fd=parent_fd,
-        )
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | nofollow | directory | cloexec,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            if vanished_entry(os.path.join(root, *relative)):
+                return
+            raise
         try:
             current = os.fstat(descriptor)
+            identity_drift = (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino)
             if (
                 not stat.S_ISDIR(current.st_mode)
-                or (current.st_dev, current.st_ino)
-                != (metadata.st_dev, metadata.st_ino)
                 or _permission_mount_id(descriptor) != mount_id
+                or (identity_drift and not vanished_entry(os.path.join(root, *relative)))
             ):
                 raise RuntimeError(
                     f"Rechteverzeichnis wechselte oder liegt auf einem verschachtelten Mount: "
                     f"{os.path.join(root, *relative)}"
                 )
+            if identity_drift:
+                return
             walk(descriptor, relative, mount_id)
             desired = desired_values(current, contract(relative, current, True))
             if desired is None:
@@ -2507,7 +2555,12 @@ def _normalize_permission_tree_fd(
             ):
                 continue
             child_relative = (*relative, name)
-            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            try:
+                metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                if vanished_entry(os.path.join(root, *child_relative)):
+                    continue
+                raise
             if stat.S_ISDIR(metadata.st_mode):
                 normalize_directory(parent_fd, name, child_relative, metadata, mount_id)
             elif stat.S_ISREG(metadata.st_mode):
@@ -2581,7 +2634,15 @@ def _normalize_permission_tree_fd(
             len(skipped),
             ", ".join(skipped[:8]),
         )
-    return {"changed_surface": root, "skipped": tuple(skipped)}
+    if vanished:
+        # Einzelne Treffer sind bei laufenden Diensten normal; eine Häufung deutet
+        # auf einen dauerhaft schreibenden Fremdprozess und bleibt sichtbar.
+        (perm_logger.warning if len(vanished) >= 20 else perm_logger.info)(
+            "Rechteprojektion übersprang %d während der Prüfung verschwundene oder ersetzte Laufzeiteinträge: %s",
+            len(vanished),
+            ", ".join(vanished[:8]),
+        )
+    return {"changed_surface": root, "skipped": tuple(skipped), "vanished": tuple(vanished)}
 
 
 def _web_runtime_permission_contract(top_name, install_uid, www_uid, www_gid, config):
@@ -2761,6 +2822,7 @@ def _normalize_web_runtime_permissions(web_root="/var/www/html", config=None):
                     int(opened.st_dev),
                     int(opened.st_ino),
                 ),
+                tolerate_vanished_entries=True,
             )
     finally:
         os.close(root_fd)

@@ -6,6 +6,60 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.5.2] – 2026-09-30
+
+### Wallbox
+
+- Ein gemeinsamer Strombeschluss je Regelzyklus und Ladepunkt gilt jetzt auch für schnelle Netzbegrenzung, Keepalive und Startwiederholung. Ein fälliger Grid-Wächter reserviert seine Obergrenze vor der normalen Regelung; er senkt ausschließlich gemessen ladende Wallboxen mit einem Angebot über 6 A auf 6 A, erhöht keinen Strom und startet keine Ladung.
+- openWB Pro: Wiederanlauf nach einem Phasenwechsel und Start-Weckimpuls greifen wieder über den gemeinsamen Befehlsweg. Der neue Schlüssel `wb<n>_openwb_pro_unplug_offer` bestimmt je Ladepunkt das einmalige Angebot nach erkanntem Abstecken: `safe` (Standard, auch bei ungültigem Wert) setzt 0 A; `fast_start` setzt 6 A für einen schnelleren Start beim nächsten Anstecken. Danach übernimmt die normale Regelung; Nutzer-`Aus` bleibt maßgeblich.
+- Die Defizitkaskade führt einen erforderlichen Phasenabstieg auch im Startfenster vollständig aus. Ob der Speicher das Startfenster stützen kann, ergibt sich aus seiner wirksamen Entladereichweite, Hausverbrauch und PV-Leistung; unbekannte Speicherdaten geben keine Stützung frei.
+- `wb_grid_import_settle_s` (Standard 10 s, 0 = aus, höchstens 30 s) gibt dem Speicher nach neuem Netzbezug und einer Stromanhebung Zeit zum Ausgleichen. Das gilt nur innerhalb seiner belegten Reichweite; Hausanschlussgrenzen, Nutzer-`Aus`, Notstromreserve und fehlende Stützungsfreigabe wirken sofort.
+- Bei einzelnen ungültigen Liveproben bleibt der zuletzt ausgeführte Strom höchstens 10 s nach der letzten gültigen Probe stehen, je Ladepunkt insgesamt höchstens 10 s in 60 s und nur mit geeignetem vorherigem Messbeleg. Es gibt dabei keine Anhebung; harte Schutzgrenzen wirken sofort.
+- In `PV + Akku bis Untergrenze` und `Sofort bis Preislimit` ohne Preis-/Netzfenster verwendet die Haltezone an `wbminsoc` den veröffentlichten PV-Rahmen des Speicherreglers. Unter der Untergrenze entsteht daraus keine neue Akkustützung. Die Abrundung auf zulässige Stromstufen berücksichtigt kleine numerische Abweichungen.
+- Die Steckeranzeige leitet eine Verriegelung nur noch aus einem tatsächlich gemeldeten Verriegelungsbit ab; ein gestecktes Kabel allein zeigt kein geschlossenes Schloss.
+
+### Fahrzeug-SoC
+
+- Die Hochrechnung läuft innerhalb derselben bestätigten Stecksession auch mit älterem Cloudanker weiter. Bis 20 Prozentpunkte über dem bestätigten Fahrzeugwert darf sie regeln; darüber bleibt sie als „geschätzt, unbestätigt“ reine Anzeige. Eine fehlende Bestätigung durch den Wallbox-Dienst nach fünf Minuten sperrt die Regelwirkung ebenfalls.
+- Neuere Cloudwerte werden am Messzeitpunkt verankert und gegen die seitdem geladene Energie geprüft. Widersprüchliche Korrekturen sperren die Schätzung der Stecksession. Eine nicht ausreichend eingrenzbare Lücke im Zählerverlauf bleibt reine Anzeige (`soc_anchor_history_incomplete`), statt ein Ladeziel freizugeben.
+
+### Speicher
+
+- Die Stützungsfreigabe der Wallbox (`battery_support_authorized`, `battery_support_reason`) steht bei einer ausdrücklichen Entscheidung im selben Zyklus im veröffentlichten Wallbox-Rahmen. Haus- und Wallboxverbrauch werden anhand zeitlich zusammengehöriger Messungen abgeglichen, damit einzelne verzögerte Messwerte kein doppeltes Budget erzeugen.
+- Die PV-only-Entladebegrenzung erhält eine Zustandsverriegelung mit 500-W-Einschaltgrenze und einem bestätigten Leerlauf aller gesteckten Ladepunkte unter 300 W über 45 s zum Lösen. Ein Totband von 200 W beruhigt die Nachführung; harte Begrenzungen wirken sofort, ungültige Messwerte belegen keinen Leerlauf.
+- Eine Wärmepumpen-PV-Freigabe lässt den bestehenden Speicherausgang unverändert. Sie erzeugt keinen eigenen `IDLE`-/`DISCH`-Befehl und keine zusätzliche Entladegrenze.
+- Die Vitals-Seite zeigt einen monatlichen Batterie-Vitalverlauf mit SoH, Zyklen, Kapazität, Temperaturen und Zellspannungsspreizung. Bei vollständiger Tageshistorie kommt die Lade-/Entladeenergie des Vormonats hinzu. Die Aufzeichnung unter `data/battery_vitals_history.json` ist rein diagnostisch, auf 240 Monatsstände begrenzt und hat keine Regelwirkung; fehlende Werte bleiben `null` mit Qualitätsgrund.
+
+### Wärmepumpe
+
+- Im Messwertbetrieb beendet ein Verdichter, der wegen der Anlagenhysterese noch nicht startet, den PV-Boost nicht mehr über die allgemeine Nachfrageprüfung. Ein gesetzter Sollwert gilt weiterhin nicht als Nachweis eines Verdichterlaufs.
+- Der Luxtronik-Warmwasser-Komforttimer stellt die Grundstellung ohne positive Boost-Haltezeit ein. Am SG-Ready-Ausgang läuft eine Timer-Nachfrage weiterhin über den zentralen Startweg mit Budget, Signalhalt und Wiedereinschaltsperre.
+- Kurze E3DC-Datenlücken brechen laufende Aufträge nicht sofort ab: automatische PV-, Preis- und Pre-Dump-Aufträge werden bis zu 45 s, Nutzeraufträge und der Warmwasser-Timer bis zu 300 s überbrückt. Währenddessen startet kein neuer Auftrag und kein Sollwert steigt. Unbekannte Lückendauer und unabhängige Schutzgründe erlauben keine verlängerte Freigabe.
+- Die Wiedereinschaltsperre `wp_restart_block_min` (Standard 20 min) zählt ab gemessenem Verdichterstillstand; die zusätzliche Sperre nach einer Rücknahme bleibt bestehen, maßgeblich ist das spätere Ende. Ohne messbaren Stillstand verwendet die Regelung die vorhandenen Rücknahme- und Stillstandsbelege konservativ.
+- `manual_boost_min_soc` (Standard 25 %) ist die Startschwelle für den manuellen Boost. Ein späteres Unterschreiten beendet ihn regulär nach Mindestlaufzeit und Signalhalt, nicht sofort; die unabhängige Sicherheitsabschaltung unter `min_soc` minus 5 Prozentpunkten bleibt wirksam. iDM, Dimplex und SG Ready folgen denselben Regeln für Datenlücken und manuellen Boost.
+- Stiebel ISG kann mit `stiebel_isg_sg_ready_write = 1` experimentell SG-Ready-Eingang 1 schreiben (Standard `0`, aus). Der Ausgang folgt der zentralen Entscheidung, schreibt bei Zustandswechseln und liest zurück. Ein konfigurierter Shelly-SG-/EVU-Kontakt hat Vorrang. Voraussetzungen, Grenzen bei Verbindungsverlust und Testanleitung stehen in der [Stiebel-Dokumentation](doc/Stiebel_Eltron_ISG.md).
+- Shelly-SG-Relais an Stiebel werden anhand ihres tatsächlichen Relaiszustands bewertet; eigener Heizbetrieb der Wärmepumpe gilt nicht als fremder SG-Befehl. Wiederholtes fremdes Einschalten wird diagnostiziert und nicht fortlaufend überschrieben.
+- „Warmwasser sofort“ benötigt an SG-Kontakten und iDM keinen PV-Überschuss und keine positive Budgethöhe, aber weiterhin ein frisches Speicher-Budget und die bestehenden Start- und Schutzfreigaben. Nutzer-`Aus` räumt zugehörige Anforderungsmerker auf; unterbrochene Befehle zeigen ihren Haltegrund.
+- Warmwasser-Befehle außerhalb von „Warmwasser sofort“ brechen bei Nicht-Luxtronik-Wärmepumpen (iDM, Dimplex, Shelly-SG) den Regelzyklus nicht mehr wegen einer unbelegten internen Variable ab.
+
+### Webportal
+
+- Neue experimentelle Wärmepumpenansicht mit Anlagenbild aus Messwerten, Mobilansicht und gemerkter Ansicht. `wp_page_preview_enable = 1` schaltet sie frei (Standard `0`, aus); die Bedienaktionen bleiben dieselben. `wp_buffer_sensor` (Standard `none`) wählt optional einen Pufferfühler ausschließlich für die Anzeige. Die [Ansichten-Dokumentation](doc/Frontend_Ansichten.md) enthält eine kurze Testanleitung.
+- Der Zwischenspeicher der Hausanzeige ist für die HA-Synchronisierung lesbar.
+
+### Diagnose
+
+- Der Live-Dienst schreibt den E3DC-Anmeldenamen nicht mehr ins Log; Host und Port bleiben sichtbar. Auch die Duplikatbereinigung und die Migration alter Luxtronik-Konfigurationen maskieren Anmeldenamen. Die RSCP-Diagnose blendet Authentifizierungsdaten und den Schlüssel aus.
+- `luxtronik.json` enthält den Haltegrund je Wärmepumpenkanal, Haltegrund und Haltentscheidung des PV-Boosts (`heatpump_pv_hold_reason`, `heatpump_pv_hold_decision`) sowie die zuletzt angenommene Rücknahme des Boost-Signals (`heatpump_pv_last_signal_release`).
+- Das Speicherprotokoll zählt jeden gesendeten `POWER_SETTINGS`-SET und fasst wiederholte Ausgaben zusammen. Eine Sammelzeile erscheint spätestens nach 60 s; Wechsel in oder aus „Entladen 0 W“ bleiben einzeln sichtbar, andere Grenzklassenwechsel erhalten höchstens alle 10 s eine eigene Zeile.
+
+### Update
+
+- Die Gesundheitsprüfung des Containers wertet einen normalen Zustandswechsel laufender Prozesse nicht mehr als Fehler. Auf langsamen Systemen brach das Update über den Host-Helfer dadurch bisher gelegentlich ab.
+- Die Rechte-Reparatur überspringt zwischenzeitlich verschwundene oder ersetzte Laufzeitdateien, statt deswegen die gesamte Reparatur abzubrechen.
+- Aufbewahrte Belege früherer abgebrochener Updates werden verständlich gemeldet.
+- Installierte Dienste aus dem Dienstkatalog werden beim Update an das aktive venv gebunden. Ein Hinweis zum manuellen Löschen eines alten venv erscheint erst, wenn keine Dienstdefinition mehr darauf verweist.
+
 ## [5.5.1] – 2026-09-28
 
 ### Wallbox

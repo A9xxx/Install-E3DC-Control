@@ -73,6 +73,14 @@ function fmtYears($value) {
     if ($value === null || $value === '') return 'nicht belastbar';
     return number_format((float)$value, 1, ',', '.') . ' Jahre';
 }
+$vitalsHistory = null;
+$vitalsHistoryPath = '/var/www/html/data/battery_vitals_history.json';
+if (is_readable($vitalsHistoryPath)) {
+    $decodedHistory = json_decode((string)@file_get_contents($vitalsHistoryPath), true);
+    if (is_array($decodedHistory) && is_array($decodedHistory['months'] ?? null)) {
+        $vitalsHistory = $decodedHistory['months'];
+    }
+}
 
 function prognosisDateFromYears($years, $baseTs = null) {
     if ($years === null || $years === '') return null;
@@ -613,6 +621,14 @@ function saveVitalsPdf() {
 
             <?php endif; ?>
         </div>
+
+        <?php if ($vitalsHistory): ?>
+        <div class="alert alert-info mb-4" role="status">
+            <i class="fas fa-calendar-alt me-1"></i>
+            Verlauf seit <?= htmlspecialchars((string)($vitalsHistory[0]['month'] ?? 'unbekannt')) ?>,
+            <?= count($vitalsHistory) ?> Monatswerte. Die Aufzeichnung dient nur der Diagnose und hat keine Regelwirkung.
+        </div>
+        <?php endif; ?>
 
         <?php if ($vitals): ?>
         <div class="glass-card mb-4 fade-in" style="animation-delay: 0.2s;">

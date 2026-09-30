@@ -4489,7 +4489,7 @@ if __name__ == "__main__":
             sys.exit(1)
 
     port = int(port)
-    print(f"\nHost: {host}:{port}  User: {user}")
+    print(f"\nHost: {host}:{port}  Benutzer: {'gesetzt' if user else 'fehlt'}")
     if args.loops == 0:
         print(f"[Daemon] Endlosschleife, Intervall {args.interval}s")
     elif args.loops > 1:

@@ -29,15 +29,12 @@ $wpType = (int)$conf['wp_type'];
 // der Herstellertyp sagt nichts über die Quelle.
 $wpSourceType = e3dcNormalizeHeatSourceType($conf['wp_source_type'] ?? 'auto');
 $pageContext = $seite ?? 'waermepumpe';
-$hasNativeHeatpump = isHeatpumpEnabledConfig($conf);
-$hasHeaterConfig = isHeaterEnabledConfig($conf);
-$isChargingOnly = ($pageContext === 'charging')
-    || ($wpType < 0 && !$hasNativeHeatpump && !$hasHeaterConfig && (string)$conf['luxtronik'] === '0');
-$isHeaterPage = !$isChargingOnly && ($wpType === 2 || (!$hasNativeHeatpump && $hasHeaterConfig));
-if (!$isChargingOnly && $wpType === 6 && $hasHeaterConfig) {
-    // Beim E3DC-Leistungsmesser bleibt eine konfigurierte Heizstab-Seite wie bisher sichtbar.
-    $isHeaterPage = true;
-}
+// Seitenkontext (Wärmepumpe, Heizstab, nur Laden) und Angebot der neuen Ansicht: eine Quelle in helpers.php
+$wpPageCtx = e3dcWpPageContext($conf, $pageContext);
+$hasNativeHeatpump = $wpPageCtx['has_native'];
+$hasHeaterConfig = $wpPageCtx['has_heater'];
+$isChargingOnly = $wpPageCtx['charging_only'];
+$isHeaterPage = $wpPageCtx['heater_page'];
 
 $ramdiskFile = '/var/www/html/ramdisk/luxtronik.json';
 $stiebelRamdiskFile = '/var/www/html/ramdisk/stiebel_isg.json';
@@ -438,6 +435,7 @@ if (isset($_POST['manual_boost']) && $wpType != 4) {
         );
         if (!empty($boostResult['success'])) {
             $manualBoostMessage = successMessage($action === 'on' ? 'Boost-Auftrag gespeichert.' : 'Boost-Stopp gespeichert.');
+            e3dcWpViewRecordOutcome($action === 'on' ? 'boost_on' : 'boost_off'); // nur Rückmeldung für die neue Ansicht
         } else {
             $reason = !empty($boostResult['timed_out'])
                 ? 'Timeout'
@@ -470,6 +468,7 @@ if (isset($_POST['manual_ww']) && $wpType != 4) {
                 ? 'Manuelle Warmwasser-Anforderung wurde sicher gespeichert.'
                 : 'Manuelle Warmwasser-Anforderung wurde sicher beendet.'
         );
+        e3dcWpViewRecordOutcome($action === 'on' ? 'ww_on' : 'ww_off'); // nur Rückmeldung für die neue Ansicht
     } else {
         http_response_code(500);
         $manualWwMessage = errorMessage(
@@ -546,6 +545,9 @@ if (isset($_POST['toggle_auto_mode'])) {
             $restartDetails . ' Die gespeicherte Einstellung bleibt erhalten; bitte den Dienststatus prüfen und den Neustart erneut auslösen.'
         );
         exit;
+    }
+    if ($new_mode === 0 || $new_mode === 1) {
+        e3dcWpViewRecordOutcome($new_mode === 1 ? 'auto_on' : 'auto_off'); // nur Rückmeldung für die neue Ansicht
     }
     echo "<script>window.location.href = window.location.href;</script>";
     exit;
@@ -853,7 +855,7 @@ if ($isChargingOnly) {
             </div>
         <?php endif; ?>
         <div class="d-flex justify-content-between align-items-center mb-3">
-            <h5 class="card-title text-info fw-bold m-0"><i class="fas <?= $wpIcon ?> me-2"></i><?= $cardTitle ?></h5>
+            <h5 class="card-title text-info fw-bold m-0"><i class="fas <?= $wpIcon ?> me-2"></i><?= $cardTitle ?><?php if ($wpPageCtx['preview_offered']): ?> <a href="<?= e3dcWpViewEntrypoint() ?>?seite=waermepumpe&amp;wp_view=neu" class="btn btn-sm btn-outline-info ms-2">Neue Ansicht (Vorschau)</a><?php endif; ?></h5>
             <div>
                 <?php if($displaySuccess): ?>
                     <span class="badge bg-success" style="cursor:pointer;" onclick="showDiagnoseLog('wp_raw')" title="Rohdaten anzeigen"><?= $isChargingOnly ? 'Bereit' : 'Verbunden' ?></span>

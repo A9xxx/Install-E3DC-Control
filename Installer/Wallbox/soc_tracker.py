@@ -30,6 +30,53 @@ TRACKER_CHECKPOINT_IDLE_HEARTBEAT_S = 900.0
 TRACKER_STATUS_GAP_MAX_S = 1800.0
 TRACKER_METER_RESET_TOLERANCE_WH = 100.0
 TRACKER_SESSION_START_TOLERANCE_S = 5.0
+HISTORY_START_RULE_LIMIT_PP = 0.5
+HISTORY_START_UNKNOWN_MAX_POWER_W = 22000.0
+# Früherer Diagnosegrund einer nach acht Stunden nur noch angezeigten Schätzung.
+# Seit der Anstiegsgrenze (SESSION_ESTIMATE_RISE_LIMIT_PP) nicht mehr erzeugt,
+# bleibt aber für gespeicherte Altzustände bekannt.
+SOC_ANCHOR_EXPIRED_REASON = "soc_anchor_expired"
+DISPLAY_ONLY_ESTIMATE_KEYS = ("estimate_unconfirmed_reason", "soc_display_only")
+# Sitzungsgebundene Fortschreibung eines Cloud-SoC: Innerhalb derselben, von der
+# Wallbox durchgehend bestätigten Stecksession zählt nicht das Ankeralter, sondern
+# der Anstieg seit dem letzten bestätigten Fahrzeugwert. Bis zu dieser Grenze
+# bleibt die Fortschreibung regelwirksam, darüber nur Anzeige („geschätzt,
+# unbestätigt“), bis ein neuerer Fahrzeugwert den Anker korrigiert.
+SESSION_ESTIMATE_CONTRACT = "vehicle_soc_session_estimate_v1"
+SESSION_ESTIMATE_RISE_LIMIT_PP = 20.0
+# Verbraucher nutzen eine Sitzungsschätzung nur, solange der laufende Tracker sie
+# bestätigt; ein angehaltener Tracker entwertet sie nach dieser Frist.
+SESSION_ESTIMATE_CONFIRM_MAX_AGE_S = 300
+SOC_ESTIMATE_RISE_LIMIT_REASON = "soc_estimate_rise_limit"
+SOC_ANCHOR_HISTORY_INCOMPLETE_REASON = "soc_anchor_history_incomplete"
+SESSION_ESTIMATE_KEYS = (
+    "soc_session_contract",
+    "soc_session_confirmed_ts",
+    "soc_session_max_age_s",
+    "soc_session_rise_pp",
+    "soc_session_rise_limit_pp",
+)
+SESSION_ESTIMATE_FIELD_SUFFIXES = (
+    "session_contract",
+    "session_confirmed_ts",
+    "session_max_age_s",
+)
+# Ein Cloud-SoC ohne belastbaren Messzeitpunkt im Fahrzeug verankert nichts.
+CLOUD_SAMPLE_TIME_UNKNOWN_REASON = "cloud_soc_sample_time_unknown"
+# Verlauf des Energiezählers je Stecksession: ein Stützpunkt je 100 Wh. Zwischen
+# zwei Stützpunkten liegt der wahre Zählerstand immer zwischen deren Werten; der
+# Fehler einer Interpolation bleibt so unter 100 Wh plus einem Regelzyklus.
+METER_HISTORY_SCHEMA = "vehicle_soc_meter_history_v1"
+METER_HISTORY_STEP_WH = 100.0
+METER_HISTORY_MAX_POINTS = 1200
+# Plausibilität einer Korrektur ohne Cloud-Steckermeldung: In einer gesteckten
+# Session sinkt der SoC nicht (Toleranz für ganzzahlige Cloudwerte und
+# Messung), und er steigt höchstens um die seit dem Anker gezählte Energie bei
+# 100 % Wirkungsgrad und bis zu 20 % kleinerer Nutzkapazität als im Profil.
+SESSION_CORRECTION_SOC_DROP_TOLERANCE_PP = 3.0
+SESSION_CORRECTION_SOC_RISE_TOLERANCE_PP = 3.0
+SESSION_CORRECTION_MIN_CAPACITY_SHARE = 0.8
+SESSION_SOC_CONTRADICTION_REASON = "cloud_soc_contradicts_session"
 TRACKER_CHECKPOINT_SEMANTIC_KEYS = (
     "vehicle_key",
     "car_id",
@@ -226,6 +273,197 @@ def vehicle_soc_age_contract(source, config=None):
     }
 
 
+def vehicle_soc_session_contract_state(record, source, now=None, prefix="soc"):
+    """Zustand des Sitzungsschätzvertrags eines Datensatzes.
+
+    ``absent``: kein Vertrag erklärt oder Quelle keine Fortschreibung; dann gilt
+    der Altersvertrag der Quelle. ``valid``: Fortschreibung eines Cloud-Ankers,
+    die der laufende Tracker frisch bestätigt. ``invalid``: erklärter, aber
+    unvollständiger, fremder oder nicht mehr bestätigter Vertrag.
+    """
+
+    item = record if isinstance(record, dict) else {}
+    keys = [f"{prefix}_{suffix}" for suffix in SESSION_ESTIMATE_FIELD_SUFFIXES]
+    if not any(key in item for key in keys):
+        return "absent"
+    contract = vehicle_soc_source_contract(source)
+    if contract is None or not contract["derived"]:
+        return "absent"
+    if (
+        contract["base_source"] not in VEHICLE_CLOUD_SOC_SOURCES
+        or item.get(keys[0]) != SESSION_ESTIMATE_CONTRACT
+    ):
+        return "invalid"
+    raw_max_age = item.get(keys[2])
+    if (
+        isinstance(raw_max_age, bool)
+        or not isinstance(raw_max_age, (int, float))
+        or float(raw_max_age) != float(SESSION_ESTIMATE_CONFIRM_MAX_AGE_S)
+    ):
+        return "invalid"
+    confirmed_ts = _timestamp(item.get(keys[1]), 0.0)
+    now_value = time.time() if now is None else _safe_float(now, 0.0)
+    if (
+        not math.isfinite(confirmed_ts)
+        or not math.isfinite(now_value)
+        or confirmed_ts <= 0.0
+        or now_value <= 0.0
+        or confirmed_ts > now_value + 300.0
+        or now_value - confirmed_ts > SESSION_ESTIMATE_CONFIRM_MAX_AGE_S
+    ):
+        return "invalid"
+    return "valid"
+
+
+def vehicle_soc_rule_age_valid(record, source, source_ts, now=None, config=None, prefix="soc"):
+    """Kanonische Altersprüfung regelwirksamer Fahrzeug-SoCs für alle Verbraucher.
+
+    Eine sitzungsgebundene Fortschreibung eines Cloud-Ankers gilt, solange der
+    Tracker sie bestätigt; das Alter ihres Ankers zählt dort nicht. Alle übrigen
+    Quellen folgen ihrem Altersvertrag ab dem Quellzeitpunkt.
+    """
+
+    source_value = _timestamp(source_ts, 0.0)
+    now_value = time.time() if now is None else _safe_float(now, 0.0)
+    if (
+        not math.isfinite(source_value)
+        or not math.isfinite(now_value)
+        or source_value <= 0.0
+        or now_value <= 0.0
+        or source_value > now_value + 60.0
+    ):
+        return False
+    state = vehicle_soc_session_contract_state(record, source, now=now_value, prefix=prefix)
+    if state == "valid":
+        confirmed_ts = _timestamp(
+            (record or {}).get(f"{prefix}_session_confirmed_ts"), 0.0
+        )
+        return source_value <= confirmed_ts + 300.0
+    if state == "invalid":
+        return False
+    max_age_s = vehicle_soc_max_age_s(source, config)
+    return bool(max_age_s > 0.0 and now_value - source_value <= max_age_s)
+
+
+def _history_start_max_power_w(config, status, wb_id, *, openwb_pro=False):
+    """Konservative Ladeleistungsgrenze für eine Lücke im Zählerverlauf."""
+
+    cfg = config if isinstance(config, dict) else {}
+    try:
+        cid = int(wb_id)
+    except (TypeError, ValueError):
+        cid = 1
+    # Gleiche Schlüsselreihenfolge und Begrenzung wie die letzte Treiberkante
+    # (drivers._configured_max_current_amp): erster gesetzter Wert, auf 6–32 A begrenzt.
+    raw = None
+    for key in (
+        f"wb{cid}_max_amp", f"wb{cid}_maxladestrom",
+        "wbmaxladestrom", "wb_max_amp",
+    ):
+        value = cfg.get(key)
+        if value is not None and str(value).strip() != "":
+            raw = value
+            break
+    maximum_amp = None
+    if raw is not None:
+        try:
+            candidate = float(raw)
+        except (TypeError, ValueError):
+            candidate = None
+        if candidate is not None and math.isfinite(candidate):
+            maximum_amp = max(6.0, min(32.0, candidate))
+    if maximum_amp is None:
+        if not openwb_pro:
+            return HISTORY_START_UNKNOWN_MAX_POWER_W
+        # Der Pro-Treiber begrenzt ohne explizite Konfiguration auf 16 A.
+        maximum_amp = 16.0
+    # In der Lücke kann eine Phasenumschaltung liegen; die aktuelle Phasenzahl
+    # ist deshalb keine Obergrenze. Konservativ dreiphasig.
+    return 3.0 * maximum_amp * 230.0
+
+
+def _meter_wh_at_sample(points, sample_ts, now, current_wh, *,
+                        session_started_ts=0.0, session_scoped=False,
+                        capacity_kwh=None, max_power_w=None):
+    """Zählerstand zum Messzeitpunkt eines Fahrzeugwerts.
+
+    Liefert ``(Wh, Grundlage)``. ``sample_time``: aus dem Zählerverlauf dieser
+    Stecksession; ``session_start``: Messung vor Beginn der Stecksession, der
+    Sessionzähler stand dort bei 0; ``history_start``: Messung vor dem ersten
+    bekannten Stützpunkt; ``history_start_bounded``: dieselbe Lücke, deren
+    maximale Energie aber höchstens 0,5 Prozentpunkte der Fahrzeugkapazität
+    beträgt; ``current``: kein Verlauf.
+    """
+
+    current = _safe_float(current_wh, -1.0)
+    if current_wh is None or not math.isfinite(current) or current < 0.0:
+        return current_wh, "current"
+    sample = _timestamp(sample_ts, 0.0)
+    now_value = _safe_float(now, 0.0)
+    if sample <= 0.0 or not math.isfinite(sample) or not math.isfinite(now_value):
+        return current, "current"
+    if sample >= now_value:
+        return current, "sample_time"
+    started = _safe_float(session_started_ts, 0.0)
+    if (
+        session_scoped
+        and started > 0.0
+        and sample + TRACKER_SESSION_START_TOLERANCE_S <= started
+    ):
+        return 0.0, "session_start"
+    series = []
+    for point in points or []:
+        try:
+            point_ts = float(point[0])
+            point_wh = float(point[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if (
+            math.isfinite(point_ts)
+            and math.isfinite(point_wh)
+            and 0.0 < point_ts < now_value
+            and 0.0 <= point_wh <= current + 0.1
+        ):
+            series.append((point_ts, point_wh))
+    series.sort()
+    series.append((now_value, current))
+    first_ts, first_wh = series[0]
+    if sample < first_ts:
+        capacity = _safe_float(capacity_kwh, 0.0)
+        maximum = _safe_float(max_power_w, 0.0)
+        if capacity > 0.0 and maximum > 0.0:
+            gap_pp = (
+                (first_ts - sample) * maximum / 3600.0
+                / (capacity * 1000.0) * 100.0
+            )
+            if gap_pp <= HISTORY_START_RULE_LIMIT_PP:
+                return first_wh, "history_start_bounded"
+        return first_wh, "history_start"
+    for (t0, w0), (t1, w1) in zip(series, series[1:]):
+        if t0 <= sample <= t1:
+            if t1 <= t0:
+                return max(w0, w1), "sample_time"
+            share = (sample - t0) / (t1 - t0)
+            return w0 + (max(w0, w1) - w0) * share, "sample_time"
+    return current, "current"
+
+
+def _cloud_sample_time_unknown(vehicle):
+    """Ein vertrauter Cloud-SoC ohne Messzeitpunkt im Fahrzeug."""
+
+    if not isinstance(vehicle, dict):
+        return False
+    source = str(vehicle.get("soc_source") or vehicle.get("source") or "").strip().lower()
+    raw_soc = vehicle.get("soc", vehicle.get("battery_soc"))
+    if isinstance(raw_soc, bool) or source not in VEHICLE_CLOUD_SOC_SOURCES:
+        return False
+    soc = _safe_float(raw_soc, -1.0)
+    if not math.isfinite(soc) or soc < 0.0 or soc > 100.0:
+        return False
+    source_ts = _timestamp(vehicle.get("soc_source_ts"), 0.0)
+    return not (math.isfinite(source_ts) and source_ts > 0.0)
+
+
 def _vehicle_soc_rule_sample(vehicle, config=None, now=None):
     """Akzeptiert nur explizite Fahrzeugquelle, Quellzeit und Freigabe."""
     if (
@@ -357,8 +595,15 @@ def _tracker_anchor_state_valid(
     wb_id=None,
     vehicle_key=None,
     meter_estimation=False,
+    session_continuation=False,
 ):
-    """Prüft einen gespeicherten Trackeranker ohne Zeit-/Wertimputation."""
+    """Prüft einen gespeicherten Trackeranker ohne Zeit-/Wertimputation.
+
+    ``session_continuation`` hebt ausschließlich die Altersgrenze eines
+    Cloud-Zählerankers auf. Der Aufrufer hat dieselbe, von der Wallbox
+    bestätigte Stecksession, die Zählerkontinuität und die Profilbindung
+    bereits geprüft; die Regelwirkung begrenzt dann der Anstieg seit dem Anker.
+    """
 
     if not isinstance(state, dict):
         return False
@@ -399,7 +644,14 @@ def _tracker_anchor_state_valid(
         and math.isfinite(now_value)
         and now_value > 0.0
         and source_ts <= now_value + 300.0
-        and now_value - source_ts <= max_age_s
+        and (
+            now_value - source_ts <= max_age_s
+            or (
+                session_continuation
+                and meter_estimation
+                and source_text in VEHICLE_CLOUD_SOC_SOURCES
+            )
+        )
         and (
             state.get("soc_rule_confirmed") is True
             or (
@@ -1083,9 +1335,26 @@ def _openwb_pro_same_session_sample(
 
 
 def _openwb_pro_tracker_session_sample(state, wb_id, profile, profile_aliases,
-                                     plug_session_id, meter_wh, now, config):
-    """Setze nur einen bereits bestätigten Cloud-Zähleranker derselben Session fort."""
+                                     plug_session_id, meter_wh, now, config,
+                                     diagnostics=None):
+    """Setze nur einen bereits bestätigten Cloud-Zähleranker derselben Session fort.
+
+    Innerhalb derselben, von der Wallbox bestätigten Stecksession endet die
+    Fortschreibung nicht an der Schätzfrist. Ob sie regelwirksam bleibt,
+    entscheidet der Anstieg seit dem Anker (``SESSION_ESTIMATE_RISE_LIMIT_PP``),
+    nicht sein Alter.
+    """
     if not isinstance(state, dict):
+        return None
+    if (
+        plug_session_id
+        and state.get("soc_session_contradiction") == plug_session_id
+    ):
+        # Ein unplausibler Cloudwert hat die Fahrzeugzuordnung dieser Session in
+        # Frage gestellt. Erst ein Wert mit Cloud-Steckermeldung oder eine neue
+        # Stecksession verankert wieder.
+        if diagnostics is not None:
+            diagnostics["retained_refused"] = SESSION_SOC_CONTRADICTION_REASON
         return None
     if (
         state.get("anchor_source") not in VEHICLE_CLOUD_SOC_SOURCES
@@ -1097,6 +1366,7 @@ def _openwb_pro_tracker_session_sample(state, wb_id, profile, profile_aliases,
         or not _tracker_anchor_state_valid(
             state, now=now, config=config, wb_id=wb_id,
             vehicle_key=profile.get("id"), meter_estimation=True,
+            session_continuation=True,
         )
     ):
         return None
@@ -1107,8 +1377,12 @@ def _openwb_pro_tracker_session_sample(state, wb_id, profile, profile_aliases,
         not aliases or not aliases.issubset(profile_aliases)
         or not math.isfinite(anchor_wh) or anchor_wh < 0.0
         or not math.isfinite(last_wh) or last_wh < anchor_wh
-        or meter_wh + 0.1 < last_wh
     ):
+        return None
+    if meter_wh + 0.1 < last_wh:
+        # Ein rückwärts laufender Sessionzähler belegt keine Kontinuität.
+        if diagnostics is not None:
+            diagnostics["retained_refused"] = "session_meter_discontinuous"
         return None
     return {
         "soc": state["anchor_soc"],
@@ -1122,6 +1396,7 @@ def _openwb_pro_tracker_session_sample(state, wb_id, profile, profile_aliases,
         "soc_profile_bound": True,
         "soc_rule_confirmed": True,
         "anchor_meter_wh": anchor_wh,
+        "anchor_meter_basis": str(state.get("anchor_meter_basis") or ""),
     }
 
 
@@ -1142,9 +1417,54 @@ def _openwb_pro_status_anchor_sample(status, profile_aliases, config, now):
     )
 
 
+def _session_correction_soc_bounds(anchor, meter_wh):
+    """Physikalisch mögliche SoC-Spanne einer Korrektur in derselben Stecksession.
+
+    Gesteckt sinkt der SoC nicht; er steigt höchstens um die seit dem Anker
+    gezählte Energie. Ohne Rechenkapazität gibt es keine belastbare Spanne.
+    """
+    anchor = anchor if isinstance(anchor, dict) else {}
+    anchor_soc = _safe_float(anchor.get("soc"), -1.0)
+    anchor_wh = _safe_float(anchor.get("anchor_meter_wh"), -1.0)
+    capacity = _safe_float(anchor.get("capacity_kwh"), 0.0)
+    current_wh = _safe_float(meter_wh, -1.0)
+    if (
+        not all(math.isfinite(value) for value in (anchor_soc, anchor_wh, capacity, current_wh))
+        or not 0.0 <= anchor_soc <= 100.0
+        or anchor_wh < 0.0
+        or current_wh < anchor_wh
+        or capacity <= 0.0
+    ):
+        return None
+    max_rise_pp = (
+        (current_wh - anchor_wh) / 1000.0
+        / (capacity * SESSION_CORRECTION_MIN_CAPACITY_SHARE) * 100.0
+    )
+    return (
+        max(0.0, anchor_soc - SESSION_CORRECTION_SOC_DROP_TOLERANCE_PP),
+        min(100.0, anchor_soc + max_rise_pp + SESSION_CORRECTION_SOC_RISE_TOLERANCE_PP),
+    )
+
+
 def _openwb_pro_live_soc_candidates(config, wb_id, selected_id, profile_aliases, now,
-                                   diagnostics=None):
-    """Prüfe vorhandene Livewerte identisch für Ankerwahl und Anforderungssperre."""
+                                   diagnostics=None, *, session_anchor_ts=0.0,
+                                   session_started_ts=0.0, session_anchor=None,
+                                   session_meter_wh=None, session_diagnostics=None):
+    """Prüfe vorhandene Livewerte identisch für Ankerwahl und Anforderungssperre.
+
+    Trägt dieselbe, von der Wallbox bestätigte Stecksession bereits einen
+    bestätigten Cloudanker (``session_anchor``), darf ein neuerer Wert
+    desselben Profils ihn auch dann korrigieren, wenn die Cloud den Stecker
+    nicht als gesteckt meldet. Der Wert muss aus dieser Session stammen, neuer
+    als der Anker sein und physikalisch zur Session passen; ein Widerspruch
+    landet in ``session_diagnostics``. Eine Erstverankerung bleibt an
+    ``is_plugged_in=True`` gebunden.
+    """
+    session_correction = bool(
+        _safe_float(session_anchor_ts, 0.0) > 0.0
+        and _safe_float(session_started_ts, 0.0) > 0.0
+        and isinstance(session_anchor, dict)
+    )
     candidates = []
     profiles = [car for car in _load_saved_cars() if isinstance(car, dict)]
     selected_profiles = [car for car in profiles if _matches_vehicle(car, selected_id)]
@@ -1169,7 +1489,8 @@ def _openwb_pro_live_soc_candidates(config, wb_id, selected_id, profile_aliases,
             if "is_plugged_in" in vehicle
             else vehicle.get("plugged")
         )
-        if plugged_value is not True:
+        cloud_unplugged = plugged_value is not True
+        if cloud_unplugged and not session_correction:
             continue
         raw_vehicle_slot = vehicle.get("wb_slot")
         if isinstance(raw_vehicle_slot, bool):
@@ -1211,9 +1532,43 @@ def _openwb_pro_live_soc_candidates(config, wb_id, selected_id, profile_aliases,
         )
         if strong_live_aliases and not strong_live_aliases.issubset(profile_aliases):
             continue
-        truth_sample = _vehicle_soc_rule_sample(vehicle, config=config, now=now)
+        truth_record = vehicle
+        if cloud_unplugged:
+            # Die Wallbox bestätigt die laufende Session; ein Cloud-Steckerwert
+            # widerspricht ihr nicht. Alle übrigen Vetos bleiben wirksam.
+            truth_record = {
+                key: value
+                for key, value in vehicle.items()
+                if key not in ("plug_state", "plugged", "is_plugged_in")
+            }
+        truth_sample = _vehicle_soc_rule_sample(truth_record, config=config, now=now)
         if truth_sample is None:
+            if diagnostics is not None and _cloud_sample_time_unknown(vehicle):
+                # Ohne Messzeitpunkt im Fahrzeug lässt sich die seither geladene
+                # Energie nicht bestimmen: keine Fortschreibung aus diesem Wert.
+                diagnostics["cloud_sample_time_unknown"] = True
             continue
+        if cloud_unplugged and (
+            str(truth_sample["source"]).strip().lower() not in VEHICLE_CLOUD_SOC_SOURCES
+            or truth_sample["source_ts"] + TRACKER_SESSION_START_TOLERANCE_S
+            < _safe_float(session_started_ts, 0.0)
+            or truth_sample["source_ts"] <= _safe_float(session_anchor_ts, 0.0) + 1.0
+        ):
+            continue
+        if cloud_unplugged:
+            bounds = _session_correction_soc_bounds(session_anchor, session_meter_wh)
+            if bounds is None:
+                continue
+            if not bounds[0] <= truth_sample["soc"] <= bounds[1]:
+                # Gesteckt sinkt der SoC nicht und steigt nicht über das seit
+                # dem Anker Ladbare: Die Zuordnung dieser Session ist fraglich.
+                if session_diagnostics is not None:
+                    session_diagnostics["soc_contradiction"] = {
+                        "soc": truth_sample["soc"],
+                        "min_soc": round(bounds[0], 1),
+                        "max_soc": round(bounds[1], 1),
+                    }
+                continue
         candidates.append((
             vehicle,
             truth_sample["soc"],
@@ -1228,8 +1583,17 @@ def _openwb_pro_live_soc_candidates(config, wb_id, selected_id, profile_aliases,
     return candidates
 
 
+def _binding_failure(diagnostics, detail):
+    """Hält den ersten konkreten Grund einer gescheiterten Pro-Bindung fest."""
+
+    if diagnostics is not None:
+        diagnostics.setdefault("binding_failure", str(detail or ""))
+    return None
+
+
 def _openwb_pro_profile_binding(config, wb_id, status, selected_id, now=None,
-                               tracker_state=None, diagnostics=None):
+                               tracker_state=None, diagnostics=None,
+                               meter_history=None):
     """Liefere eine fail-closed Profil-/Live-SoC-Bindung für openWB Pro.
 
     Die openWB Pro liefert nicht auf jeder Anlage eine nutzbare Fahrzeug-ID.
@@ -1238,6 +1602,9 @@ def _openwb_pro_profile_binding(config, wb_id, status, selected_id, now=None,
     Stecksession oder genau ein frischer Live-Datensatz über einen Profilalias
     gebunden ist. Das Ergebnis bleibt bewusst nur profilgebunden und behauptet
     keine von der Pro gemeldete stabile Identität.
+
+    Ein neuer Cloudanker wird am Zählerstand seines Messzeitpunkts im Fahrzeug
+    verankert (``meter_history``), nicht am Zählerstand des Abrufs.
     """
 
     now = time.time() if now is None else float(now)
@@ -1246,36 +1613,37 @@ def _openwb_pro_profile_binding(config, wb_id, status, selected_id, now=None,
         status.get("driver_status_valid") is not True
         or _contract_flag_active(status.get("driver_status_stale"))
         or _contract_flag_active(status.get("driver_status_degraded"))
-        or status.get("plug_state") is not True
     ):
-        return None
+        return _binding_failure(diagnostics, "driver_status_invalid")
+    if status.get("plug_state") is not True:
+        return _binding_failure(diagnostics, "wallbox_not_plugged")
     if not _fresh_timestamp(
         status.get("driver_status_last_sample_ts"),
         now,
         OPENWB_PRO_STATUS_MAX_AGE_S,
     ):
-        return None
+        return _binding_failure(diagnostics, "driver_status_stale")
     plug_session_id = str(status.get("plug_session_id") or "").strip()
     if not plug_session_id:
-        return None
+        return _binding_failure(diagnostics, "plug_session_missing")
     plug_session_started_ts = _plug_session_started_ts(plug_session_id, now)
     meter_wh = _openwb_pro_session_meter_wh(status)
     if not plug_session_started_ts or meter_wh is None:
-        return None
+        return _binding_failure(diagnostics, "plug_session_missing")
 
     saved_car = _unique_saved_profile(selected_id)
     if not saved_car:
-        return None
+        return _binding_failure(diagnostics, "profile_not_unique")
     profile_aliases = _compact_aliases(saved_car)
     if not profile_aliases:
-        return None
+        return _binding_failure(diagnostics, "profile_not_unique")
 
     # Eine aktuelle oder erhaltene explizite Pro-ID darf dem Profil nie
     # widersprechen. Eine leere ID ist erlaubt und begründet diesen Fallback.
     for key in LIVE_STATUS_ID_KEYS:
         live_id = _compact_id(status.get(key))
         if live_id and live_id not in profile_aliases:
-            return None
+            return _binding_failure(diagnostics, "profile_identity_conflict")
 
     profile = resolve_openwb_pro_profile(config, wb_id)
     session_sample = _openwb_pro_same_session_sample(
@@ -1287,9 +1655,11 @@ def _openwb_pro_profile_binding(config, wb_id, status, selected_id, now=None,
         meter_wh,
         now,
     )
+    retained_diagnostics = {}
     retained_sample = _openwb_pro_tracker_session_sample(
         tracker_state, wb_id, profile, profile_aliases,
         plug_session_id, meter_wh, now, config,
+        diagnostics=retained_diagnostics,
     )
     fallback_samples = [sample for sample in (session_sample, retained_sample) if sample]
     fallback_sample = max(fallback_samples, key=lambda sample: sample["ts"]) if fallback_samples else None
@@ -1299,10 +1669,25 @@ def _openwb_pro_profile_binding(config, wb_id, status, selected_id, now=None,
         _timestamp((fallback_sample or {}).get("ts"), 0.0),
     )
 
+    session_diagnostics = {}
     candidates = _openwb_pro_live_soc_candidates(
         config, wb_id, selected_id, profile_aliases, now,
         diagnostics=diagnostics,
+        session_anchor_ts=_timestamp((retained_sample or {}).get("ts"), 0.0),
+        session_started_ts=plug_session_started_ts,
+        session_anchor=retained_sample,
+        session_meter_wh=meter_wh,
+        session_diagnostics=session_diagnostics,
     )
+    if session_diagnostics.get("soc_contradiction"):
+        # Fail-closed wie eine widersprüchliche Fahrzeugzuordnung: weder die
+        # Korrektur noch die bisherige Fortschreibung dieser Session gelten.
+        if diagnostics is not None:
+            diagnostics["soc_contradiction"] = dict(
+                session_diagnostics["soc_contradiction"],
+                plug_session_id=plug_session_id,
+            )
+        return _binding_failure(diagnostics, SESSION_SOC_CONTRADICTION_REASON)
     if len(candidates) > 1:
         # Auch gleiche Doppelwerte sind kein eindeutiger neuer Beleg. Ein
         # bereits geprüfter Sitzungsanker bleibt davon unabhängig gültig.
@@ -1322,9 +1707,24 @@ def _openwb_pro_profile_binding(config, wb_id, status, selected_id, now=None,
             "sample": fallback_sample, "profile": profile,
             "plug_session_id": plug_session_id,
             "meter_wh": meter_wh, "meter_source": "session_kwh",
+            # Ein Cloud-Zähleranker derselben, von der Wallbox bestätigten
+            # Stecksession läuft ohne Altersgrenze weiter; seine Regelwirkung
+            # begrenzt der Anstieg seit dem Anker.
+            "session_bound": bool(
+                fallback_sample is retained_sample
+                and str(retained_sample.get("source") or "") in VEHICLE_CLOUD_SOC_SOURCES
+            ),
         }
     if len(candidates) != 1:
-        return None
+        if (diagnostics or {}).get("reason") == "cloud_soc_ambiguous":
+            detail = "cloud_soc_ambiguous"
+        elif retained_diagnostics.get("retained_refused"):
+            detail = retained_diagnostics["retained_refused"]
+        elif (diagnostics or {}).get("cloud_sample_time_unknown") is True:
+            detail = CLOUD_SAMPLE_TIME_UNKNOWN_REASON
+        else:
+            detail = "no_session_anchor"
+        return _binding_failure(diagnostics, detail)
 
     vehicle, soc, source, sample_ts = candidates[0]
     live_vehicle_id = ""
@@ -1333,6 +1733,18 @@ def _openwb_pro_profile_binding(config, wb_id, status, selected_id, now=None,
         if probe and _compact_id(probe) in profile_aliases:
             live_vehicle_id = probe
             break
+    # Verankerung zum Messzeitpunkt im Fahrzeug: Die seitdem geladene Energie
+    # (Differenz des Sessionzählers ab diesem Zeitpunkt) wird dazugerechnet.
+    # Frühere Energie derselben Stecksession wird nicht addiert.
+    anchor_meter_wh, anchor_meter_basis = _meter_wh_at_sample(
+        meter_history, sample_ts, now, meter_wh,
+        session_started_ts=plug_session_started_ts,
+        session_scoped=True,
+        capacity_kwh=profile.get("capacity_kwh"),
+        max_power_w=_history_start_max_power_w(
+            config, status, wb_id, openwb_pro=True,
+        ),
+    )
     sample = {
         "soc": _clamp_percent(soc),
         "ts": sample_ts,
@@ -1345,9 +1757,8 @@ def _openwb_pro_profile_binding(config, wb_id, status, selected_id, now=None,
         "capacity_kwh": _safe_float(profile.get("capacity_kwh"), 0.0),
         "profile_id": profile.get("id") or str(selected_id or "").strip(),
         "soc_profile_bound": True,
-        # Ein Cloud-SoC ist eine aktuelle Verankerung. Frühere Energie aus
-        # derselben Stecksession darf nicht nachträglich addiert werden.
-        "anchor_meter_wh": meter_wh,
+        "anchor_meter_wh": anchor_meter_wh,
+        "anchor_meter_basis": anchor_meter_basis,
         "soc_rule_confirmed": True,
     }
     return {
@@ -1356,6 +1767,7 @@ def _openwb_pro_profile_binding(config, wb_id, status, selected_id, now=None,
         "plug_session_id": plug_session_id,
         "meter_wh": meter_wh,
         "meter_source": "session_kwh",
+        "session_bound": str(source or "").strip().lower() in VEHICLE_CLOUD_SOC_SOURCES,
     }
 
 
@@ -1477,6 +1889,19 @@ def _tracker_status_gap_reason(status):
             or "wb_status_invalid"
         )
     return ""
+
+
+def _measured_plug_values(status):
+    """Gemessener Steck-/Ladezustand oder ``None`` ohne gültige Wallboxmessung."""
+
+    if (
+        not isinstance(status, dict)
+        or not status
+        or status.get("driver_status_valid") is False
+        or _tracker_status_gap_reason(status)
+    ):
+        return None
+    return _status_connected(status), _status_power_w(status) > 500.0
 
 
 def _status_session_start_ts(status):
@@ -1654,10 +2079,102 @@ def _persist_tracker_checkpoint(wb_id, state, runtime_state, *, now_ts=None, for
     return True
 
 
+def _meter_history_path(wb_id):
+    return os.path.join(RAMDISK_DIR, f"vehicle_soc_meter_history_wb{int(wb_id)}.json")
+
+
 class VehicleSocTracker:
     def __init__(self):
         self._states = {}
         self._checkpoint_runtime = {}
+        self._meter_histories = {}
+        self._anchor_detail = {}
+
+    def _load_meter_history(self, wb_id):
+        key = int(wb_id)
+        if key not in self._meter_histories:
+            data = _read_json(_meter_history_path(key), None)
+            if (
+                not isinstance(data, dict)
+                or data.get("schema_version") != METER_HISTORY_SCHEMA
+                or not isinstance(data.get("points"), list)
+            ):
+                data = {}
+            self._meter_histories[key] = data
+        return self._meter_histories[key]
+
+    def _save_meter_history(self, wb_id, history):
+        key = int(wb_id)
+        self._meter_histories[key] = dict(history or {})
+        payload = dict(self._meter_histories[key])
+        payload["schema_version"] = METER_HISTORY_SCHEMA
+        payload["wb"] = key
+        _write_json_atomic(_meter_history_path(key), payload)
+
+    def _meter_history_points(self, wb_id, session_key, meter_source):
+        """Stützpunkte nur derselben Stecksession und derselben Zählerquelle."""
+
+        history = self._load_meter_history(wb_id)
+        if (
+            not session_key
+            or history.get("session_key") != session_key
+            or history.get("meter_source") != meter_source
+        ):
+            return []
+        return list(history.get("points") or [])
+
+    def _record_meter_sample(self, wb_id, status, now, is_openwb_pro):
+        """Merkt sich den Energiezähler der laufenden Stecksession.
+
+        Nur gültige Wallboxdaten schreiben; eine Datenlücke verwirft nichts. Ein
+        gültig gemeldeter Abzug, eine neue Stecksession, eine andere Zählerquelle
+        oder ein Zählerrücksprung beginnen einen neuen Verlauf.
+        """
+
+        if not isinstance(status, dict) or _tracker_status_gap_reason(status):
+            return
+        if is_openwb_pro and (
+            status.get("driver_status_valid") is not True
+            or not _fresh_timestamp(
+                status.get("driver_status_last_sample_ts"), now, OPENWB_PRO_STATUS_MAX_AGE_S,
+            )
+        ):
+            return
+        history = self._load_meter_history(wb_id)
+        connected = (
+            status.get("plug_state") is True if is_openwb_pro else _status_connected(status)
+        )
+        if not connected:
+            if history.get("points"):
+                self._save_meter_history(wb_id, {})
+            return
+        if is_openwb_pro:
+            meter_wh, meter_source = _openwb_pro_session_meter_wh(status), "session_kwh"
+            session_key = str(status.get("plug_session_id") or "").strip()
+        else:
+            meter_wh, meter_source = _status_meter_wh(status)
+            start_ts = _status_session_start_ts(status)
+            session_key = f"start:{int(start_ts)}" if start_ts > 0.0 else "connected"
+        if meter_wh is None or not session_key:
+            return
+        meter_value = _safe_float(meter_wh, -1.0)
+        if not math.isfinite(meter_value) or meter_value < 0.0:
+            return
+        points = self._meter_history_points(wb_id, session_key, meter_source)
+        if points and meter_value + TRACKER_METER_RESET_TOLERANCE_WH < _safe_float(points[-1][1], 0.0):
+            points = []
+        if points and meter_value - _safe_float(points[-1][1], 0.0) < METER_HISTORY_STEP_WH:
+            return
+        points.append([round(float(now), 1), round(meter_value, 1)])
+        if len(points) > METER_HISTORY_MAX_POINTS:
+            # Älteste Hälfte ausdünnen: der Fehler wächst nur für alte Zeitpunkte.
+            half = len(points) // 2
+            points = points[:half:2] + points[half:]
+        self._save_meter_history(wb_id, {
+            "session_key": session_key,
+            "meter_source": meter_source,
+            "points": points,
+        })
 
     def _load_state(self, wb_id):
         key = int(wb_id)
@@ -1846,6 +2363,8 @@ class VehicleSocTracker:
                 continue
             sample = _vehicle_soc_rule_sample(vehicle, config=config, now=now)
             if sample is None:
+                if _cloud_sample_time_unknown(vehicle):
+                    self._anchor_detail[int(wb_id)] = CLOUD_SAMPLE_TIME_UNKNOWN_REASON
                 return None
             return {
                 "soc": sample["soc"],
@@ -1932,6 +2451,10 @@ class VehicleSocTracker:
         selected_id = str(config.get(f"wb{wb_id}_car_id") or "").strip()
         if selected_id.lower() in NO_VEHICLE_IDS:
             selected_id = ""
+        self._anchor_detail.pop(wb_id, None)
+        # Der Zählerverlauf entsteht unabhängig von einem Anker, damit ein
+        # später abgerufener Fahrzeugwert an seinem Messzeitpunkt ansetzt.
+        self._record_meter_sample(wb_id, status, now, is_openwb_pro)
         binding_diagnostics = {}
         if is_openwb_pro and status.get("car_soc_invalid_reason") == "cloud_soc_ambiguous":
             status.pop("car_soc_invalid_reason", None)
@@ -1944,6 +2467,11 @@ class VehicleSocTracker:
                 now=now,
                 tracker_state=self._load_state(wb_id),
                 diagnostics=binding_diagnostics,
+                meter_history=self._meter_history_points(
+                    wb_id,
+                    str(status.get("plug_session_id") or "").strip(),
+                    "session_kwh",
+                ),
             )
             if is_openwb_pro
             else None
@@ -1965,7 +2493,8 @@ class VehicleSocTracker:
             if _openwb_pro_direct_soc_fresh(status, now=now):
                 if source_status == "openwb_pro_raw" or not newer_cloud:
                     self._mark_tracker_not_current(
-                        wb_id, "openwb_pro_direct_soc_authoritative", now
+                        wb_id, "openwb_pro_direct_soc_authoritative", now,
+                        status=status,
                     )
                     return None
             else:
@@ -1979,13 +2508,27 @@ class VehicleSocTracker:
                         "car_soc_source_ts": None, "car_soc_raw_ts": None,
                         "car_soc_invalid_reason": "cloud_soc_ambiguous",
                     })
+                failure_detail = str(binding_diagnostics.get("binding_failure") or "")
+                if binding_diagnostics.get("soc_contradiction"):
+                    self._latch_session_contradiction(
+                        wb_id, binding_diagnostics["soc_contradiction"], now,
+                    )
                 self._invalidate_profile_fallback(
                     wb_id,
                     connected=_status_connected(status),
                     reason="profile_binding_invalid",
+                    # Eine entwertete SoC-Bindung beweist kein Ladeende. Ohne
+                    # gültigen Treiberstatus bleibt der bisherige Wert stehen.
+                    charging=(
+                        None
+                        if _tracker_status_gap_reason(status)
+                        else _status_power_w(status) > 500.0
+                    ),
+                    detail=failure_detail,
                 )
                 self._mark_tracker_not_current(
-                    wb_id, "profile_binding_invalid", now
+                    wb_id, "profile_binding_invalid", now, detail=failure_detail,
+                    status=status,
                 )
                 return None
             sample = profile_binding["sample"]
@@ -2010,8 +2553,21 @@ class VehicleSocTracker:
         consumption = _safe_float(profile.get("consumption_kwh_100km"), 0.0)
         if not is_openwb_pro and sample and _safe_float(sample.get("capacity_kwh"), 0.0) > 0:
             capacity = _safe_float(sample.get("capacity_kwh"), capacity)
+        # Cloud-Zähleranker derselben, von der Wallbox bestätigten Stecksession:
+        # Das Ankeralter begrenzt die Fortschreibung nicht; regelwirksam bleibt
+        # sie bis SESSION_ESTIMATE_RISE_LIMIT_PP über dem Anker.
+        session_continuation = bool(
+            is_openwb_pro
+            and profile_binding
+            and profile_binding.get("session_bound") is True
+        )
 
         state = self._load_state(wb_id)
+        previous_not_current_reason = (
+            str(state.get("tracker_not_current_reason") or "")
+            if state.get("tracker_current") is False
+            else ""
+        )
         connected = _status_connected(status)
         charging = _status_power_w(status) > 500.0
         if profile_binding:
@@ -2062,6 +2618,7 @@ class VehicleSocTracker:
             wb_id=wb_id,
             vehicle_key=vehicle_key,
             meter_estimation=is_openwb_pro and profile_binding is not None,
+            session_continuation=session_continuation,
         )
         if state_anchor_valid and connected and not is_openwb_pro:
             _repair_confirmed_manual_profile_binding(state, selected_id, wb_id)
@@ -2082,6 +2639,32 @@ class VehicleSocTracker:
             return None
 
         if needs_anchor and sample:
+            previous_state = state
+            if sample.get("anchor_meter_wh") is not None:
+                anchor_meter_wh = _safe_float(sample.get("anchor_meter_wh"), meter_wh)
+                anchor_meter_basis = str(sample.get("anchor_meter_basis") or "")
+            elif (
+                str(sample.get("source") or "").strip().lower() in VEHICLE_CLOUD_SOC_SOURCES
+                and meter_wh is not None
+            ):
+                # Cloudwert am Zählerstand seines Messzeitpunkts verankern.
+                history_start_ts = _status_session_start_ts(status)
+                anchor_meter_wh, anchor_meter_basis = _meter_wh_at_sample(
+                    self._meter_history_points(
+                        wb_id,
+                        f"start:{int(history_start_ts)}" if history_start_ts > 0.0 else "connected",
+                        meter_source,
+                    ),
+                    sample.get("ts"), now, meter_wh,
+                    session_started_ts=history_start_ts,
+                    session_scoped=meter_source == "session_kwh",
+                    capacity_kwh=capacity,
+                    max_power_w=_history_start_max_power_w(
+                        config, status, wb_id, openwb_pro=is_openwb_pro,
+                    ),
+                )
+            else:
+                anchor_meter_wh, anchor_meter_basis = meter_wh, "current"
             state = {
                 "wb": wb_id,
                 "vehicle_key": vehicle_key,
@@ -2091,11 +2674,8 @@ class VehicleSocTracker:
                 "anchor_soc": _clamp_percent(sample.get("soc")),
                 "anchor_sample_ts": _timestamp(sample.get("ts"), 0.0),
                 "anchor_source": str(sample.get("source") or ""),
-                "anchor_meter_wh": (
-                    _safe_float(sample.get("anchor_meter_wh"), meter_wh)
-                    if sample.get("anchor_meter_wh") is not None
-                    else meter_wh
-                ),
+                "anchor_meter_wh": anchor_meter_wh,
+                "anchor_meter_basis": anchor_meter_basis,
                 "last_meter_wh": meter_wh,
                 "meter_source": meter_source,
                 "power_integrated_wh": 0.0,
@@ -2108,8 +2688,14 @@ class VehicleSocTracker:
                 "soc_rule_confirmed": sample.get("soc_rule_confirmed") is True,
                 "plug_session_id": plug_session_id,
             }
+            if is_openwb_pro:
+                self._log_session_reanchor(wb_id, previous_state, state)
         elif not state_anchor_valid:
-            self._mark_tracker_not_current(wb_id, "anchor_invalid", now)
+            self._mark_tracker_not_current(
+                wb_id, "anchor_invalid", now,
+                detail=self._anchor_detail.get(wb_id, ""),
+                status=status,
+            )
             return None
 
         if not _tracker_anchor_state_valid(
@@ -2119,13 +2705,16 @@ class VehicleSocTracker:
             wb_id=wb_id,
             vehicle_key=vehicle_key,
             meter_estimation=is_openwb_pro and profile_binding is not None,
+            session_continuation=session_continuation,
         ):
             return None
 
         # Ein kompatibler Legacy-Manuellanker ohne Feld wurde oben nur nach
         # vollständiger Quellen-, Zeit-, Werte- und Veto-Prüfung akzeptiert.
-        # Ab hier wird der interne Zustand auf den typisierten Vertrag gehoben;
-        # Maschinenquellen gelangen ohne ``is True`` nie an diese Stelle.
+        # Bei Fortschreibung bleibt ein Cloud-Anker vor dem ersten bekannten
+        # Stützpunkt nur Anzeige, wenn die unbekannte Vorenergie mehr als
+        # 0,5 Prozentpunkte betragen kann oder die Kapazität unbekannt ist.
+        history_incomplete = state.get("anchor_meter_basis") == "history_start"
         state["soc_rule_confirmed"] = True
 
         if self._session_anchor_expired(state, now, meter_wh):
@@ -2140,7 +2729,9 @@ class VehicleSocTracker:
                 state, now=now, config=config, wb_id=wb_id,
                 vehicle_key=vehicle_key, meter_estimation=False,
             ):
-                self._mark_tracker_not_current(wb_id, "profile_capacity_unknown", now)
+                self._mark_tracker_not_current(
+                    wb_id, "profile_capacity_unknown", now, status=status,
+                )
                 return None
 
         last_update = _timestamp(state.get("last_update_ts"), now)
@@ -2175,17 +2766,85 @@ class VehicleSocTracker:
         state["tracker_current"] = True
         state.pop("tracker_not_current_reason", None)
         state.pop("tracker_not_current_since", None)
+        state.pop("tracker_not_current_detail", None)
+        state.pop("plug_values_stale", None)
+        state.pop("plug_values_ts", None)
+        estimated_soc = None
+        if raw_cloud_only:
+            estimated_soc = _clamp_percent(state.get("anchor_soc"))
+        elif capacity > 0:
+            estimated_soc = _clamp_percent(
+                _safe_float(state.get("anchor_soc"), 0.0)
+                + (delivered_wh / 1000.0) * efficiency / capacity * 100.0
+            )
+        anchor_soc_value = _clamp_percent(state.get("anchor_soc"))
+        rise_pp = (
+            max(0.0, estimated_soc - anchor_soc_value)
+            if estimated_soc is not None
+            else 0.0
+        )
+        # Ohne Cloudkorrektur ist die Fortschreibung nur bis zur Anstiegsgrenze
+        # regelwirksam; darüber bleibt sie Anzeige („geschätzt, unbestätigt“).
+        rise_limited = bool(
+            session_continuation
+            and not raw_cloud_only
+            and estimated_soc is not None
+            and rise_pp > SESSION_ESTIMATE_RISE_LIMIT_PP
+        )
+        # Ein frischer, unverändert ausgegebener Cloud-Rohwert benötigt keinen
+        # vollständigen Energieverlauf. Erst die Fortschreibung ist davon abhängig.
+        fresh_cloud_raw = bool(
+            state.get("anchor_source") in VEHICLE_CLOUD_SOC_SOURCES
+            and delivered_wh == 0.0
+            and float(now) - _timestamp(state.get("anchor_sample_ts"), 0.0)
+            <= vehicle_soc_max_age_s(state.get("anchor_source"), config)
+        )
+        history_incomplete = history_incomplete and not fresh_cloud_raw
+        display_only = rise_limited or history_incomplete
+        display_only_reason = (
+            SOC_ANCHOR_HISTORY_INCOMPLETE_REASON
+            if history_incomplete else SOC_ESTIMATE_RISE_LIMIT_REASON
+        )
+        if display_only:
+            if state.get("display_only_since") is None:
+                state["display_only_since"] = now
+                state["display_only_reason"] = display_only_reason
+                logger.info(
+                    "[WB%d] Fahrzeug-SoC-Tracker: Schätzung liegt %.1f Pp über dem letzten "
+                    "bestätigten Fahrzeugwert (Grenze %.0f Pp, %s). Sie läuft in derselben "
+                    "Stecksession als unbestätigte Anzeige weiter; Ziel-SoC und Planung "
+                    "warten auf einen neueren Fahrzeugwert.",
+                    wb_id,
+                    rise_pp,
+                    SESSION_ESTIMATE_RISE_LIMIT_PP,
+                    display_only_reason,
+                )
+        else:
+            state.pop("display_only_since", None)
+            state.pop("display_only_reason", None)
         self._save_state(wb_id, state)
+        if previous_not_current_reason and previous_not_current_reason != "status_gap":
+            logger.info(
+                "[WB%d] Fahrzeug-SoC-Tracker: Schätzung läuft wieder (zuvor: %s).",
+                wb_id, previous_not_current_reason,
+            )
 
-        if capacity <= 0 and not raw_cloud_only:
+        if estimated_soc is None:
             return None
 
-        estimated_soc = _clamp_percent(state.get("anchor_soc")) if raw_cloud_only else _clamp_percent(
-            _safe_float(state.get("anchor_soc"), 0.0) + (delivered_wh / 1000.0) * efficiency / capacity * 100.0
-        )
         raw_source = str(state.get("anchor_source") or "")
-        source = f"{ESTIMATED_PREFIX}_from_{raw_source}" if delivered_wh > 20.0 else raw_source
         anchor_sample_ts = _timestamp(state.get("anchor_sample_ts"), 0.0)
+        # Ein Rohwert bleibt nur innerhalb seiner eigenen Frist ein Rohwert. Eine
+        # sitzungsgebundene Fortschreibung jenseits davon ist eine Schätzung,
+        # auch wenn seit dem Anker noch keine Energie geflossen ist.
+        raw_age_expired = bool(
+            float(now) - anchor_sample_ts > vehicle_soc_max_age_s(raw_source, config)
+        )
+        derived_source = bool(
+            delivered_wh > 20.0
+            or (session_continuation and not raw_cloud_only and raw_age_expired)
+        )
+        source = f"{ESTIMATED_PREFIX}_from_{raw_source}" if derived_source else raw_source
         age_contract = vehicle_soc_age_contract(source, config)
         if age_contract is None:
             return None
@@ -2195,6 +2854,7 @@ class VehicleSocTracker:
             "soc_rule_confirmed": (
                 state.get("soc_rule_confirmed") is True
                 and _is_confirmed_soc_source(raw_source)
+                and not display_only
             ),
             "raw_soc": round(_safe_float(state.get("anchor_soc"), estimated_soc), 1),
             "raw_source": raw_source,
@@ -2240,6 +2900,24 @@ class VehicleSocTracker:
         }
         if is_openwb_pro:
             result["capacity_reason"] = profile.get("capacity_reason")
+        if session_continuation and derived_source:
+            # Sitzungsvertrag: Verbraucher werten statt des Ankeralters die
+            # laufende Bestätigung dieser Stecksession durch den Tracker aus.
+            result.update({
+                "soc_session_contract": SESSION_ESTIMATE_CONTRACT,
+                "soc_session_confirmed_ts": int(now),
+                "soc_session_max_age_s": SESSION_ESTIMATE_CONFIRM_MAX_AGE_S,
+                "soc_session_rise_pp": round(rise_pp, 1),
+                "soc_session_rise_limit_pp": SESSION_ESTIMATE_RISE_LIMIT_PP,
+            })
+        if state.get("anchor_meter_basis"):
+            result["anchor_meter_basis"] = str(state.get("anchor_meter_basis"))
+        if display_only:
+            # Nur Anzeige („geschätzt, unbestätigt“): Ziel-SoC, `Auto voll`
+            # und Planung bleiben bis zu einem neueren Fahrzeugwert geschlossen.
+            result["estimate_unconfirmed"] = True
+            result["estimate_unconfirmed_reason"] = display_only_reason
+            result["soc_display_only"] = True
         if (
             state.get("meter_source") == "session_kwh"
             and state.get("anchor_meter_wh") is not None
@@ -2298,27 +2976,134 @@ class VehicleSocTracker:
             closed["closed_reason"] = str(reason)
         return closed
 
-    def _mark_tracker_not_current(self, wb_id, reason, now):
+    def _mark_tracker_not_current(self, wb_id, reason, now, detail="", status=None):
         """Kennzeichnet einen nicht mehr fortgeschriebenen Trackerzustand.
 
         Der Zustand bleibt als Diagnose erhalten, trägt aber ausdrücklich
         ``tracker_current=False`` samt Grund und Zeitpunkt, statt mit altem
-        ``last_update_ts`` wie ein laufender Tracker auszusehen.
+        ``last_update_ts`` wie ein laufender Tracker auszusehen. ``detail``
+        nennt den konkreten Auslöser, etwa ``no_session_anchor``.
+
+        ``connected``/``charging`` folgen dabei der aktuellen gültigen
+        Wallboxmessung. Ohne gültige Messung werden sie nicht fortgeschrieben,
+        sondern ausdrücklich als veraltet markiert (``plug_values_stale``).
         """
 
         state = self._load_state(wb_id)
-        if not state or state.get("session_closed") is True:
+        if state.get("session_closed") is True:
             return
-        if (
+        detail = str(detail or "")
+        if not state:
+            if detail != CLOUD_SAMPLE_TIME_UNKNOWN_REASON:
+                return
+            # Noch kein Anker: Ein Cloudwert ohne Messzeitpunkt bleibt trotzdem
+            # als Grund in der Diagnose sichtbar, ohne einen Anker vorzutäuschen.
+            state = {"wb": int(wb_id)}
+        same_reason = bool(
             state.get("tracker_current") is False
             and state.get("tracker_not_current_reason") == reason
-        ):
+        )
+        same_detail = str(state.get("tracker_not_current_detail") or "") == detail
+        plug_values = _measured_plug_values(status)
+        if plug_values is None:
+            plug_changes = {"plug_values_stale": True}
+        else:
+            plug_changes = {
+                "connected": plug_values[0],
+                "charging": plug_values[1],
+                "plug_values_stale": False,
+            }
+        plug_unchanged = all(
+            bool(state.get(key, False)) == value for key, value in plug_changes.items()
+        )
+        if same_reason and same_detail and plug_unchanged:
             return
         marked = dict(state)
         marked["tracker_current"] = False
         marked["tracker_not_current_reason"] = str(reason or "")
-        marked["tracker_not_current_since"] = now
+        marked["tracker_not_current_since"] = (
+            state.get("tracker_not_current_since", now) if same_reason else now
+        )
+        if detail:
+            marked["tracker_not_current_detail"] = detail
+        else:
+            marked.pop("tracker_not_current_detail", None)
+        marked.update(plug_changes)
+        if plug_values is not None:
+            marked["plug_values_ts"] = now
         self._save_state(wb_id, marked)
+        if same_reason and same_detail:
+            return
+        logger.info(
+            "[WB%d] Fahrzeug-SoC-Tracker: Schätzung wird nicht fortgeschrieben (%s%s).",
+            int(wb_id), reason, f": {detail}" if detail else "",
+        )
+
+    def _latch_session_contradiction(self, wb_id, contradiction, now):
+        """Sperrt die Fortschreibung dieser Stecksession nach einem unplausiblen Cloudwert."""
+
+        state = self._load_state(wb_id)
+        plug_session_id = str((contradiction or {}).get("plug_session_id") or "")
+        if (
+            not state
+            or not plug_session_id
+            or state.get("plug_session_id") != plug_session_id
+            or state.get("soc_session_contradiction") == plug_session_id
+        ):
+            return
+        state["soc_session_contradiction"] = plug_session_id
+        state["soc_session_contradiction_since"] = now
+        self._save_state(wb_id, state)
+        logger.warning(
+            "[WB%d] Fahrzeug-SoC-Tracker: Cloudwert %.1f %% ohne Cloud-Steckermeldung passt "
+            "nicht zur laufenden Stecksession (möglich %.1f–%.1f %%). Korrektur verworfen, "
+            "Schätzung dieser Stecksession gesperrt bis zu einem Cloudwert mit Steckermeldung "
+            "oder einer neuen Stecksession.",
+            int(wb_id),
+            _safe_float(contradiction.get("soc"), -1.0),
+            _safe_float(contradiction.get("min_soc"), -1.0),
+            _safe_float(contradiction.get("max_soc"), -1.0),
+        )
+
+    def _log_session_reanchor(self, wb_id, previous, current):
+        """Protokolliert eine Ankerkorrektur innerhalb derselben Stecksession.
+
+        Die Abweichung zwischen alter Schätzung und neuem Fahrzeugwert ist der
+        Beleg für die Drift der Fortschreibung.
+        """
+
+        try:
+            if (
+                not isinstance(previous, dict)
+                or not previous.get("plug_session_id")
+                or previous.get("plug_session_id") != current.get("plug_session_id")
+                or previous.get("anchor_soc") is None
+                or _timestamp(current.get("anchor_sample_ts"), 0.0)
+                <= _timestamp(previous.get("anchor_sample_ts"), 0.0) + 1.0
+            ):
+                return
+            capacity = _safe_float(previous.get("capacity_kwh"), 0.0)
+            efficiency = _safe_float(previous.get("efficiency"), 0.90)
+            delta_wh = max(
+                0.0,
+                _safe_float(current.get("anchor_meter_wh"), 0.0)
+                - _safe_float(previous.get("anchor_meter_wh"), 0.0),
+            )
+            previous_soc = _safe_float(previous.get("anchor_soc"), 0.0)
+            if capacity > 0.0:
+                previous_soc += (delta_wh / 1000.0) * efficiency / capacity * 100.0
+            previous_soc = _clamp_percent(previous_soc)
+            new_soc = _clamp_percent(current.get("anchor_soc"))
+            logger.info(
+                "[WB%d] Fahrzeug-SoC-Tracker: neuerer Fahrzeugwert %.1f %% ersetzt den "
+                "Anker derselben Stecksession (Schätzung zuvor %.1f %%, Abweichung "
+                "%+.1f Pp nach %.2f kWh seit dem alten Anker%s).",
+                int(wb_id), new_soc, previous_soc, new_soc - previous_soc,
+                delta_wh / 1000.0,
+                "; vorher nur Anzeige" if previous.get("display_only_since") is not None else "",
+            )
+        except Exception as exc:
+            logger.debug("SoC-Tracker: Ankerprotokoll nicht möglich: %s", exc)
 
     def _hold_session_for_status_gap(self, wb_id, state, now, reason):
         """Hält eine offene Session während ungültiger Treiberdaten an."""
@@ -2403,6 +3188,8 @@ class VehicleSocTracker:
             state_ts = _timestamp((state or {}).get("anchor_sample_ts"), 0.0)
             source = str(data.get("source") or "")
             if source.startswith(ESTIMATED_PREFIX) or data_ts <= state_ts + 1.0:
+                for key in DISPLAY_ONLY_ESTIMATE_KEYS + SESSION_ESTIMATE_KEYS:
+                    data.pop(key, None)
                 data.update({
                     "source": f"{ESTIMATED_PREFIX}_{reason}_expired",
                     "soc_rule_confirmed": False,
@@ -2420,8 +3207,13 @@ class VehicleSocTracker:
             int(wb_id), reason, f"; {detail}" if detail else "",
         )
 
-    def _invalidate_profile_fallback(self, wb_id, connected, reason):
-        """Sperre eine nicht mehr belastbar gebundene Pro-/Profil-Schätzung."""
+    def _invalidate_profile_fallback(self, wb_id, connected, reason, charging=None,
+                                     detail=""):
+        """Sperre eine nicht mehr belastbar gebundene Pro-/Profil-Schätzung.
+
+        ``charging`` ist der gemessene Ladezustand der Wallbox. Die Entwertung
+        des SoC beweist kein Ladeende; ``None`` lässt den bisherigen Wert stehen.
+        """
 
         data = _read_manual_soc(wb_id, None)
         if not isinstance(data, dict):
@@ -2432,16 +3224,25 @@ class VehicleSocTracker:
             and data.get("soc_profile_bound") is not True
         ):
             return
+        for key in (
+            ("estimate_unconfirmed", "profile_binding_detail")
+            + DISPLAY_ONLY_ESTIMATE_KEYS
+            + SESSION_ESTIMATE_KEYS
+        ):
+            data.pop(key, None)
         data.update({
             "source": f"{ESTIMATED_PREFIX}_{str(reason or 'invalid')}",
             "soc_rule_confirmed": False,
             "plugged": bool(connected),
-            "charging": False,
             "is_interpolated": False,
             "estimate_expired": True,
             "soc_profile_binding_invalid": True,
             "ts": int(time.time()),
         })
+        if charging is not None:
+            data["charging"] = bool(charging)
+        if detail:
+            data["profile_binding_detail"] = str(detail)
         self._write_manual_soc(wb_id, data)
 
     def _mark_manual_unplugged(self, wb_id, state):
@@ -2468,7 +3269,7 @@ class VehicleSocTracker:
             "session_closed": True,
             "ts": int(time.time()),
         })
-        for key in UNPLUGGED_ESTIMATE_KEYS:
+        for key in UNPLUGGED_ESTIMATE_KEYS + DISPLAY_ONLY_ESTIMATE_KEYS + SESSION_ESTIMATE_KEYS:
             data.pop(key, None)
         if estimate:
             # Der letzte Schätzwert der Session bleibt als unbestätigte Anzeige

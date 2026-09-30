@@ -52,6 +52,27 @@ RSCP_POWER_SETTINGS_TOLERANCE_W = 50
 # und zwar nur für ein wertgleiches Ziel.
 RSCP_POWER_SETTINGS_OWN_PROOF_MAX_AGE_S = 4.5
 RSCP_POWER_SETTINGS_OWN_PROOF_SOURCE = "own_set_verification"
+# Protokoll der POWER_SETTINGS-Schreibvorgänge: Jeder gesendete SET wird
+# gezählt. Eine Sammelzeile mit Zähler und letztem Sollwert erscheint
+# spätestens 60 s nach dem ersten noch nicht protokollierten SET, solange SETs
+# laufen, und beim Beenden der Sitzung; jeder Wechsel der Grenzklasse (Grenzen
+# aus, Laden 0 W/begrenzt, Entladen 0 W/begrenzt/frei) gegenüber der zuletzt
+# protokollierten Klasse bekommt eine eigene Zeile, auch ein kurzer Wechsel auf
+# Entladen 0 W. Nicht schützende Änderungen des Laderahmens schreibt die
+# Regelung höchstens alle 30 s; bei 13–17 SET/min ergeben
+# damit 1 Sammelzeile je Minute plus die Klassenwechsel statt 13–17
+# Einzelzeilen. Die Zeilen umgehen die Dämpfung wiederholter INFO-Zeilen
+# (QuietInfoFilter), weil jede Zeile einen eigenen Zählerstand trägt.
+# Protokollmenge: Ein Wechsel in die Klasse „Entladen 0 W“ (Entladung
+# gesperrt) oder aus ihr heraus bekommt immer eine eigene Zeile; andere
+# Klassenwechsel höchstens eine eigene Zeile je 10 s, der Rest zählt in der
+# Sammelzeile. Gleichlautende eigene Fehler- oder Warnzeilen gesendeter SETs
+# (dieselbe Ursache) erscheinen höchstens einmal je Minute; die übrigen zählen
+# in der Sammelzeile. Gezählt wird jeder gesendete SET.
+RSCP_POWER_SETTINGS_LOG_SUMMARY_S = 60.0
+RSCP_POWER_SETTINGS_CLASS_LINE_MIN_S = 10.0
+RSCP_POWER_SETTINGS_REPEAT_LINE_S = 60.0
+RSCP_POWER_SETTINGS_ZERO_DISCHARGE_CLASS = "Entladen 0 W"
 RSCP_SEND_RECEIPT_CONTRACT_VERSION = 1
 # Protokoll der E3DC-Antwort auf den Einzeltag EMS_REQ_SET_MAX_CHARGE_POWER
 # (0x01000101) auf oberster Ebene. Reine Beobachtung: Befehl, Zeitpunkt und
@@ -270,6 +291,19 @@ class BattCtrl:
         self._settings_own_verified: Optional[Dict[str, Any]] = None
         self._settings_own_proof_suppressed = 0
         self._last_power_settings_wire_receipt: Dict[str, Any] = {}
+        self._settings_log_window_start_monotonic = 0.0
+        self._settings_log_window_start_wall = 0.0
+        self._settings_log_window_sets = 0
+        self._settings_log_window_unreported = 0
+        self._settings_log_window_class_lines = 0
+        self._settings_log_last_class: Optional[str] = None
+        self._settings_log_pending_class: Optional[str] = None
+        self._settings_log_last_class_line_monotonic: Optional[float] = None
+        self._settings_log_repeat_lines: Dict[str, float] = {}
+        self._settings_log_window_repeats = 0
+        self._settings_log_last_target: Optional[Dict[str, Any]] = None
+        self._settings_log_last_state = ""
+        self._settings_log_summary_lines = 0
         self._last_set_power_receipt: Dict[str, Any] = {}
         self._single_tag_diag: Dict[str, Any] = {
             "schema": RSCP_SINGLE_TAG_DIAG_SCHEMA,
@@ -405,6 +439,27 @@ class BattCtrl:
                 return None
             codes.append(code)
         return codes
+
+    @staticmethod
+    def _power_settings_response_code_text(response: Any) -> str:
+        """Rohe SET-Antwort je Feld für Protokoll und Wiederholungssignatur."""
+        container = find_tag(response, RscpTag.EMS_SET_POWER_SETTINGS)
+        if not isinstance(container, dict):
+            return "keine"
+        if container.get("type") == RscpType.Error:
+            return "Fehler %s" % container.get("value")
+        values = container.get("value")
+        if not isinstance(values, list) or not values:
+            return "leer"
+        parts = []
+        for item in values:
+            if not isinstance(item, dict):
+                parts.append("?")
+            elif item.get("type") == RscpType.Error:
+                parts.append("Fehler %s" % item.get("value"))
+            else:
+                parts.append(str(item.get("value")))
+        return ",".join(parts)
 
     def _read_power_settings(self) -> Optional[Dict[str, Any]]:
         self._settings_get_requests += 1
@@ -547,6 +602,9 @@ class BattCtrl:
             "reason": "request_returned",
         })
         response_codes = self._power_settings_response_codes(response)
+        self._last_power_settings_wire_receipt["response_code_text"] = (
+            self._power_settings_response_code_text(response)
+        )
         self._last_power_settings_wire_receipt["acknowledged"] = (
             True
             if isinstance(response_codes, list) and len(response_codes) >= 4
@@ -694,9 +752,197 @@ class BattCtrl:
         })
         return True
 
+    @staticmethod
+    def _power_settings_log_clock() -> Tuple[float, float]:
+        return time.monotonic(), time.time()
+
+    def _power_settings_limit_class(self, target: Dict[str, Any]) -> str:
+        """Grenzklasse eines POWER_SETTINGS-Ziels für das Protokoll."""
+        if not bool(target.get("limits_used")):
+            return "Grenzen aus"
+        charge_w = max(0, safe_int(target.get("max_charge_w"), 0))
+        discharge_w = max(0, safe_int(target.get("max_discharge_w"), 0))
+        charge_class = "Laden 0 W" if charge_w <= 0 else "Laden begrenzt"
+        if discharge_w <= 0:
+            discharge_class = "Entladen 0 W"
+        elif discharge_w >= max(0, int(self._auto_discharge_cap) - RSCP_POWER_SETTINGS_TOLERANCE_W):
+            discharge_class = "Entladen frei"
+        else:
+            discharge_class = "Entladen begrenzt"
+        return "%s, %s" % (charge_class, discharge_class)
+
+    @staticmethod
+    def _power_settings_target_text(target: Dict[str, Any]) -> str:
+        return "limits=%s max_charge=%dW max_discharge=%dW discharge_start=%dW" % (
+            "on" if bool(target.get("limits_used")) else "off",
+            max(0, safe_int(target.get("max_charge_w"), 0)),
+            max(0, safe_int(target.get("max_discharge_w"), 0)),
+            max(0, safe_int(target.get("discharge_start_w"), 0)),
+        )
+
+    def _emit_power_settings_summary(self, now_monotonic: float) -> bool:
+        if (
+            self._settings_log_window_unreported <= 0
+            and self._settings_log_window_repeats <= 0
+        ) or not isinstance(self._settings_log_last_target, dict):
+            return False
+        since_text = time.strftime(
+            "%H:%M:%S",
+            time.localtime(self._settings_log_window_start_wall or time.time()),
+        )
+        repeat_text = (
+            ", %d gleichlautende Fehler/Warnungen ohne eigene Zeile" % self._settings_log_window_repeats
+            if self._settings_log_window_repeats > 0
+            else ""
+        )
+        # Ein wegen der 10-s-Grenze unterdrückter Klassenwechsel erscheint
+        # spätestens hier und gilt danach als protokolliert.
+        class_text = ""
+        pending_class = self._settings_log_pending_class
+        if pending_class and pending_class != self._settings_log_last_class:
+            class_text = ", Grenzklasse %s -> %s" % (
+                self._settings_log_last_class or "unbekannt",
+                pending_class,
+            )
+            self._settings_log_last_class = pending_class
+            self._settings_log_last_class_line_monotonic = now_monotonic
+        self._settings_log_pending_class = None
+        log.info(
+            "RSCP POWER_SETTINGS: %d SET seit %s (davon %d mit eigener Zeile%s), "
+            "letzter Sollwert %s (%s)%s",
+            self._settings_log_window_sets,
+            since_text,
+            self._settings_log_window_sets - self._settings_log_window_unreported,
+            repeat_text,
+            self._power_settings_target_text(self._settings_log_last_target),
+            self._settings_log_last_state or "gesendet",
+            class_text,
+            extra={"e3dc_no_throttle": True},
+        )
+        self._settings_log_summary_lines += 1
+        self._reset_power_settings_log_window()
+        return True
+
+    def _reset_power_settings_log_window(self) -> None:
+        self._settings_log_window_sets = 0
+        self._settings_log_window_unreported = 0
+        self._settings_log_window_repeats = 0
+        self._settings_log_window_class_lines = 0
+        self._settings_log_window_start_monotonic = 0.0
+        self._settings_log_window_start_wall = 0.0
+
+    def flush_power_settings_set_log(self, *, force: bool = False) -> bool:
+        """Gibt die fällige Sammelzeile aus; der Manager ruft das je Zyklus auf."""
+        now_monotonic, _now_wall = self._power_settings_log_clock()
+        if self._settings_log_window_sets <= 0:
+            return False
+        if not force and (
+            now_monotonic - self._settings_log_window_start_monotonic
+            < RSCP_POWER_SETTINGS_LOG_SUMMARY_S
+        ):
+            return False
+        if self._emit_power_settings_summary(now_monotonic):
+            return True
+        self._reset_power_settings_log_window()
+        return False
+
+    def _note_power_settings_set(
+        self,
+        target: Dict[str, Any],
+        state: str,
+        *,
+        own_line: bool = False,
+        summary_only: bool = False,
+        repeat_suppressed: bool = False,
+    ) -> None:
+        """Zählt einen gesendeten POWER_SETTINGS-SET für das Protokoll.
+
+        ``own_line``: Der SET steht bereits in einer eigenen Warn- oder
+        Fehlerzeile mit seinen Sollwerten. ``summary_only``: Seine gleichlautende
+        Fehlerzeile entfällt als Wiederholung; er zählt nur in der Sammelzeile
+        (ohne Klassenzeile, die Klasse eines Fehlversuchs gilt nicht als
+        protokolliert). ``repeat_suppressed``: Seine gleichlautende Warnung
+        entfällt als Wiederholung; sie zählt in der Sammelzeile, der SET selbst
+        wie ein gewöhnlicher. Eine Klassenzeile vergleicht mit der zuletzt
+        protokollierten Grenzklasse. Ein Wechsel in „Entladen 0 W“ oder aus ihr
+        heraus bekommt immer eine Zeile, andere Wechsel höchstens eine je
+        ``RSCP_POWER_SETTINGS_CLASS_LINE_MIN_S``; ein unterdrückter Wechsel
+        steht spätestens in der nächsten Sammelzeile.
+        """
+        now_monotonic, now_wall = self._power_settings_log_clock()
+        if (
+            self._settings_log_window_sets > 0
+            and now_monotonic - self._settings_log_window_start_monotonic
+            >= RSCP_POWER_SETTINGS_LOG_SUMMARY_S
+        ):
+            if not self._emit_power_settings_summary(now_monotonic):
+                # Alle SETs des alten Fensters standen schon in eigenen Zeilen.
+                self._reset_power_settings_log_window()
+        if self._settings_log_window_sets <= 0:
+            self._settings_log_window_start_monotonic = now_monotonic
+            self._settings_log_window_start_wall = now_wall
+        self._settings_log_window_sets += 1
+        self._settings_log_last_target = dict(target)
+        self._settings_log_last_state = str(state or "gesendet")
+        if repeat_suppressed:
+            self._settings_log_window_repeats += 1
+        limit_class = self._power_settings_limit_class(target)
+        logged_class = self._settings_log_last_class
+        if own_line:
+            return
+        if summary_only:
+            self._settings_log_window_unreported += 1
+            self._settings_log_window_repeats += 1
+            return
+        if limit_class != logged_class:
+            zero_edge = bool(
+                logged_class is None
+                or limit_class.endswith(RSCP_POWER_SETTINGS_ZERO_DISCHARGE_CLASS)
+                != logged_class.endswith(RSCP_POWER_SETTINGS_ZERO_DISCHARGE_CLASS)
+            )
+            last_line = self._settings_log_last_class_line_monotonic
+            line_due = bool(
+                zero_edge
+                or last_line is None
+                or now_monotonic - last_line >= RSCP_POWER_SETTINGS_CLASS_LINE_MIN_S
+                or now_monotonic < last_line
+            )
+            if line_due:
+                log.info(
+                    "RSCP POWER_SETTINGS: Grenzklasse %s -> %s, %s (%s)",
+                    logged_class or "unbekannt",
+                    limit_class,
+                    self._power_settings_target_text(target),
+                    self._settings_log_last_state,
+                    extra={"e3dc_no_throttle": True},
+                )
+                self._settings_log_last_class = limit_class
+                self._settings_log_pending_class = None
+                self._settings_log_last_class_line_monotonic = now_monotonic
+                self._settings_log_window_class_lines += 1
+                return
+            self._settings_log_pending_class = limit_class
+        else:
+            self._settings_log_pending_class = None
+        self._settings_log_window_unreported += 1
+
+    def _power_settings_repeat_line_due(self, signature: str) -> bool:
+        """Gleichlautende eigene Zeile derselben Ursache höchstens einmal je Minute."""
+        now_monotonic, _now_wall = self._power_settings_log_clock()
+        last = self._settings_log_repeat_lines.get(signature)
+        if (
+            last is not None
+            and 0.0 <= now_monotonic - last < RSCP_POWER_SETTINGS_REPEAT_LINE_S
+        ):
+            return False
+        self._settings_log_repeat_lines[signature] = now_monotonic
+        return True
+
     def power_settings_diagnostics(self) -> Dict[str, Any]:
         diag = dict(self._power_settings_diag)
         diag["set_requests"] = self._settings_set_requests
+        diag["set_log_pending"] = self._settings_log_window_unreported
+        diag["set_log_summary_lines"] = self._settings_log_summary_lines
         diag["get_requests"] = self._settings_get_requests
         diag["suppressed_unchanged"] = self._settings_suppressed
         diag["own_proof_suppressed"] = self._settings_own_proof_suppressed
@@ -1088,6 +1334,13 @@ class BattCtrl:
                 bounded_zero_w=bounded_zero_w,
             ):
                 if str(self._power_settings_diag.get("status") or "").startswith("pending_readback"):
+                    # Der SET ist gesendet; bestätigt wird er erst über den
+                    # nächsten kanonischen Live-Readback. Auch dieser
+                    # Schreibvorgang zählt im Protokoll.
+                    self._note_power_settings_set(
+                        target,
+                        "gesendet, Bestätigung per Rücklesen ausstehend",
+                    )
                     return False
                 status = str(self._power_settings_diag.get("status") or "")
                 if status == "set_response_invalid_readback_missing":
@@ -1100,25 +1353,85 @@ class BattCtrl:
                     )
                 raise RuntimeError("POWER_SETTINGS-Readback stimmt nicht mit der Vorgabe überein")
             if self._power_settings_diag.get("status") == "confirmed_from_get_ack_unknown":
-                log.warning(
-                    "RSCP POWER_SETTINGS: SET-Antwort unbekannt; kanonischer GET bestätigt "
-                    "limits=%s max_charge=%dW max_discharge=%dW discharge_start=%dW",
-                    "on" if limits_used else "off",
-                    charge_w,
-                    discharge_w,
-                    discharge_start_w,
+                # Eigene Zeile eines gesendeten SET: nie dämpfen, sonst stünde
+                # der Schreibvorgang bis zu einer Stunde nur im Zähler. Dieselbe
+                # Ursache (gleiche RSCP-Antwort) erscheint höchstens einmal je
+                # Minute; weitere SETs zählen wie gewöhnliche (Klassen- oder
+                # Sammelzeile), ihre Warnung im Wiederholungszähler.
+                answer_text = str(
+                    (self._last_power_settings_wire_receipt or {}).get("response_code_text")
+                    or "keine"
                 )
+                if self._power_settings_repeat_line_due("ack_unknown:%s" % answer_text):
+                    log.warning(
+                        "RSCP POWER_SETTINGS: SET-Antwort unbekannt (RSCP-Antwort %s); kanonischer GET bestätigt "
+                        "limits=%s max_charge=%dW max_discharge=%dW discharge_start=%dW",
+                        answer_text,
+                        "on" if limits_used else "off",
+                        charge_w,
+                        discharge_w,
+                        discharge_start_w,
+                        extra={"e3dc_no_throttle": True},
+                    )
+                    self._note_power_settings_set(target, "bestätigt per GET", own_line=True)
+                else:
+                    self._note_power_settings_set(
+                        target,
+                        "bestätigt per GET",
+                        repeat_suppressed=True,
+                    )
             else:
-                log.info(
-                    "RSCP POWER_SETTINGS: limits=%s max_charge=%dW max_discharge=%dW discharge_start=%dW",
-                    "on" if limits_used else "off",
-                    charge_w,
-                    discharge_w,
-                    discharge_start_w,
-                )
+                self._note_power_settings_set(target, "bestätigt")
             return True
         except Exception as exc:
-            log.error("RSCP power_settings: %s", exc)
+            receipt = (
+                self._last_power_settings_wire_receipt
+                if isinstance(self._last_power_settings_wire_receipt, dict)
+                else {}
+            )
+            if receipt.get("issued") is True:
+                wire_state = "gesendet"
+            elif receipt.get("attempted") is True:
+                wire_state = "Versand unklar"
+            else:
+                wire_state = "nicht gesendet"
+            wire_touched = bool(receipt.get("issued") is True or receipt.get("attempted") is True)
+            answer_text = (
+                str(receipt.get("response_code_text") or "keine")
+                if receipt.get("response_returned") is True
+                else ""
+            )
+            # Ging der SET auf die Leitung, ist diese Zeile sein einziger
+            # Protokolleintrag und wird nie gedämpft; eine gleichlautende
+            # Wiederholung derselben Ursache (gleicher Text, gleiche
+            # RSCP-Antwort) erscheint höchstens einmal je Minute und zählt
+            # sonst in der Sammelzeile. Ein nicht gesendeter Versuch bleibt der
+            # normalen Fehlerdämpfung unterworfen und zählt nicht als SET.
+            own_error_line = bool(
+                not wire_touched
+                or self._power_settings_repeat_line_due(
+                    "error:%s:%s:%s" % (wire_state, answer_text, str(exc))
+                )
+            )
+            if own_error_line:
+                log.error(
+                    "RSCP power_settings: %s%s (limits=%s max_charge=%dW max_discharge=%dW discharge_start=%dW, %s)",
+                    exc,
+                    "; RSCP-Antwort %s" % answer_text if answer_text else "",
+                    "on" if limits_used else "off",
+                    charge_w,
+                    discharge_w,
+                    discharge_start_w,
+                    wire_state,
+                    extra={"e3dc_no_throttle": wire_touched},
+                )
+            if wire_touched:
+                self._note_power_settings_set(
+                    target,
+                    wire_state,
+                    own_line=own_error_line,
+                    summary_only=not own_error_line,
+                )
             self._clear_confirmed_power_settings()
             self._settings_retry_after_monotonic = time.monotonic() + RSCP_POWER_SETTINGS_RETRY_S
             self.close()
@@ -1622,8 +1935,14 @@ class BattCtrl:
         Haltedauer über Geräte- oder Hostneustarts. Deshalb wird hier weder
         AUTO noch ``POWER_LIMITS_USED=false`` geschrieben. Der Nachfolger muss
         den kanonischen GET-Readback vor seinem ersten Schreibintent bestätigen.
+        Noch nicht protokollierte POWER_SETTINGS-Schreibvorgänge gibt die
+        Sammelzeile dabei einmal aus.
         """
 
+        try:
+            self.flush_power_settings_set_log(force=True)
+        except Exception as exc:  # noqa: BLE001 - Protokoll darf die Übergabe nie stören
+            log.debug("POWER_SETTINGS-Sammelzeile beim Beenden übersprungen: %s", exc)
         self.close()
 
     def close(self) -> None:

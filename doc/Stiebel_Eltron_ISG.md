@@ -5,6 +5,9 @@ Diese Dokumentation beschreibt die Stiebel-Eltron-Anbindung ab E3DC-Control
 Read-only-Live-Treiber gebaut. Er liest Werte aus dem ISG/WPM aus und speist
 sie in die bestehende Wärmepumpen-Anzeige ein. Aktive SG-Ready- oder
 Temperatur-Schreibzugriffe sind in diesem Live-Dienst nicht enthalten.
+Der Wärmepumpen-Manager kann zusätzlich, experimentell und standardmäßig
+ausgeschaltet, den SG-Ready-Eingang 1 des ISG schreiben; siehe
+[SG Ready schreiben (experimentell)](#sg-ready-schreiben-experimentell).
 
 ## Funktionsumfang
 
@@ -39,6 +42,11 @@ Das ist Absicht. Die Heizung ist kritische Infrastruktur, und viele
 Temperaturparameter werden im Regler dauerhaft gespeichert. Aktive
 Schreiblogik muss deshalb getrennt vom Live-Treiber, mit Watchdog und nur nach
 bewusster Nutzerfreigabe getestet werden.
+
+Der einzige Schreibweg ist der experimentelle SG-Ready-Ausgang im
+Wärmepumpen-Manager. Er schreibt ausschließlich Register `4002`
+(SG-Ready-Eingang 1) mit dem Wert `0` oder `1` und nur, wenn der Schalter
+**SG Ready schreiben** eingeschaltet ist.
 
 ## Voraussetzungen
 
@@ -94,6 +102,7 @@ gedacht. Nutzer müssen sie normalerweise nicht direkt anfassen:
 | Externer Leistungsmesser | `stiebel_isg_power_meter_enable` | Nutzt einen Shelly read-only als bevorzugte elektrische WP-Leistung. |
 | Zähler-IP | `stiebel_isg_power_meter_ip` | IP-Adresse des Shelly-Leistungsmessers. |
 | Zählertyp | `stiebel_isg_power_meter_type` | `auto`, `shelly_3em`, `shelly_plug` oder `shelly_pm`. |
+| SG Ready schreiben | `stiebel_isg_sg_ready_write` | Experimentell, Standard `0`. `1` lässt den Wärmepumpen-Manager SG-Ready-Eingang 1 (`4002`) schreiben. |
 
 ## Bare-Metal-Betrieb
 
@@ -184,6 +193,7 @@ Quelle: `https://www.stiebel-eltron.de/toolbox/content/docs/anleitungen/installa
 | FC04 Input | `6128` | `6127` | Verdichterleistung in Prozent, falls Firmware/Register vorhanden |
 | FC03 Holding | `1501..1511` | `1500..1510` | Betriebsart und Soll-/Komfortparameter, read-only im Live-Dienst |
 | FC03 Holding | `4001..4003` | `4000..4002` | SG-Ready-Schalter/Eingaenge, read-only im Live-Dienst |
+| FC06 Holding | `4002` | `4001` | Nur der experimentelle SG-Ready-Ausgang des Wärmepumpen-Managers, Wert `0` oder `1` |
 
 Wichtige Einzelwerte:
 
@@ -201,11 +211,13 @@ Wichtige Einzelwerte:
 Nicht jede ISG-/Firmware-Version liefert alle Register. Fehlende optionale
 Werte werden ausgelassen oder als unbekannt behandelt.
 
-Der Betriebsstatus `2501` ist ein Bitfeld. Der Live-Dienst wertet daraus unter
-anderem `B3` Heizen, `B4` Warmwasser, `B5` Verdichter läuft, `B6` Sommerbetrieb
-und `B7` Kühlbetrieb aus. Zusätzlich wird das optionale Statusregister `2520`
-als Kühlhinweis genutzt. Damit wird ein reiner Kühlstatus wie `128` als
-`Kühlen` angezeigt und nicht mehr pauschal als `Heizen` oder `Verdichter ein`.
+Der Betriebsstatus `2501` ist ein Bitfeld mit der Zählung ab `B0`. Der
+Live-Dienst wertet daraus laut Herstellerdoku `B4` Heizen, `B5` Warmwasser,
+`B6` Verdichter läuft, `B7` Sommerbetrieb und `B8` Kühlbetrieb aus; `B3`
+meldet dort NHZ-Stufen und wird nicht als Heizen gelesen. Zusätzlich wird das
+optionale Statusregister `2520` als Kühlhinweis genutzt. Damit wird ein reiner
+Kühlstatus als `Kühlen` angezeigt und nicht pauschal als `Heizen` oder
+`Verdichter ein`.
 Wenn der Kühlhinweis gesetzt ist, aber der Verdichter nicht läuft, wird das als
 passive Kühlung angezeigt. Warmwasserbetrieb plus Kühlhinweis erscheint als
 `WW + passive Kühlung`. Eine elektrische Neben-/Pumpenleistung ist dabei nur
@@ -269,7 +281,7 @@ summiert L1+L2+L3, wenn alle drei Phasen plausibel lesbar sind.
 | Sekundäre Wärmepumpe 5 | `6868` | `6869` | `6870` | `6867` |
 | System-/Sammeladresse | `36118` | `36119` | `36120` | `36117` |
 
-Auf Ursis ISG Plus sind diese Register aktuell nicht freigeschaltet
+Auf manchen ISG Plus sind diese Register nicht freigeschaltet
 (`Modbus exception 2`). Das ist kein Fehler im Treiber; dann faellt E3DC-Control
 automatisch auf Verdichterstatus, Prozent/Hz, Shelly oder Nennwerte zurück.
 
@@ -315,8 +327,268 @@ Der Live-Dienst liest die Betriebsart aus Doku-Register `1501` (Codeadresse
 | `5` | Warmwasserbetrieb |
 
 SG-Ready-Informationen werden gelesen und im Dashboard angezeigt. Die aktive
-SG-Ready-Regelung ist nicht Teil dieses Live-Dienstes. Für spätere aktive
-Regelung gilt: erst Vor-Ort-Test, dann Watchdog, dann Opt-in.
+SG-Ready-Ansteuerung ist nicht Teil dieses Live-Dienstes, sondern ein
+experimenteller Ausgang des Wärmepumpen-Managers (nächster Abschnitt).
+
+## SG Ready schreiben (experimentell)
+
+Der Wärmepumpen-Manager (`energy_manager`) kann den SG-Ready-Eingang 1 des ISG
+per Modbus TCP schreiben. Die Funktion ist experimentell und standardmäßig aus.
+Sie ist ein weiterer Ausgang hinter derselben zentralen Entscheidung, die auch
+einen Shelly-SG-Ready-Kontakt schaltet. PV-Überschuss, Preis- und
+Pre-Dump-Freigaben, Wiedereinschaltsperre ab Verdichterstillstand,
+Mindestlaufzeit, Signalhalt, Sicherheitsabschaltung und die Toleranz bei
+E3DC-Datenlücken gelten unverändert. Der Ausgang hat keine eigene Regellogik.
+
+### Voraussetzungen
+
+- Wärmepumpen-Typ **Stiebel Eltron ISG / WPM**, **WP-/Verbrauchslogging
+  aktivieren** eingeschaltet und die ISG-Adresse eingetragen.
+- Im WPM: `SG READY AKTIVIERT = EIN` und `SG-READY EINGANG = MODBUS`. Die
+  erhöhten Werte für den SG-Ready-Zustand 3 unter `EINSTELLUNGEN /
+  ENERGIEMANAGEMENT` konservativ wählen.
+- Ein Sicherheitstemperaturbegrenzer im Heizungsvorlauf. Stiebel verlangt ihn
+  für SG Ready, weil Heizungswasser mit hoher Vorlauftemperatur in den
+  Heizkreis gelangen kann.
+- Keine zweite SG-Ready-Steuerung parallel, etwa FHEM, Home Assistant oder
+  Kontakte an den SG-Ready-Klemmen. Ist in E3DC-Control ein
+  Shelly-SG-Ready- oder EVU-Kontakt eingetragen, hat dieser Vorrang und das
+  ISG wird nicht beschrieben.
+- **Automatik darf Geräte steuern** ist eingeschaltet.
+- Im Config-Editor bei Stiebel **SG Ready schreiben** auf **Ein
+  (experimentell)** stellen und danach den Wärmepumpen-Manager neu starten
+  (Bare Metal: `sudo systemctl restart energy_manager`, Docker: Container neu
+  starten).
+
+### Verhalten
+
+| Zentrale Entscheidung | Eingang 1 (`4002`) | erwarteter Betriebszustand (`5001`) |
+| --- | ---: | ---: |
+| Normalbetrieb, Pause, Nutzer-Aus, Sicherheitsabschaltung, Ende der Datenlücken-Toleranz | `0` | `2` |
+| PV-Überschuss, Preis-/Boost-Freigabe oder Warmwasser sofort | `1` | `3` |
+
+- Geschrieben wird ausschließlich Register `4002` (Codeadresse `4001`) mit
+  FC06 und dem Wert `0` oder `1`. Der Funktionsschalter `4001` und Eingang 2
+  (`4003`) werden nur gelesen. Blockschreiben und alle anderen Register,
+  insbesondere `1501` bis `1521`, sind gesperrt. Die Zustände 1 (Sperre) und
+  4 (Maximalwerte) steuert E3DC-Control nie an.
+- Geschrieben wird nur bei einem Wechsel, nie zyklisch. Nach jedem Schreiben
+  liest der Manager `4002` und `5001` zurück.
+- Bestätigt das Rücklesen ein geschriebenes `1` nicht, bleibt der Eingang als
+  eigen, aber unbestätigt markiert, und der Manager schreibt vorerst keine
+  weitere `1`, er liest nur. Diese Sperre endet, sobald die zentrale
+  Entscheidung Normalbetrieb verlangt oder seit 150 Sekunden keine Freigabe mehr
+  verlangt hat; eine spätere Freigabe darf dann wieder einmal schreiben.
+  Verlangt die Entscheidung die Freigabe weiter, folgt nach 15 Minuten Sperre
+  genau ein neuer Schreibversuch; bleibt auch er unbestätigt, beginnt eine neue
+  Sperre. Als eigen gilt der unbestätigte Eingang nur innerhalb von
+  150 Sekunden nach dem eigenen Schreibvorgang. Zeigt eine Leserunde in dieser
+  Zeit `1`, übernimmt die nächste Freigabe der Entscheidung den Eingang ohne
+  neuen Schreibvorgang; verlangt die Entscheidung seit 150 Sekunden keine
+  Freigabe mehr, nimmt der Manager ihn zurück. Ein unbestätigtes `1` gilt
+  innerhalb von 150 Sekunden nach dem eigenen Schreibvorgang nie als fremd.
+  Danach endet der Anspruch; ein später gelesenes `1` gilt als fremd (siehe
+  „Fremder Schreiber“). Nach einem Neustart gilt dasselbe Fenster ab dem im
+  Merker gespeicherten Schreibzeitpunkt.
+- Als abgewiesen gilt ein Schreibvorgang nur, wenn das ISG das FC06 selbst mit
+  einer Modbus-Exception beantwortet. Scheitert erst das Rücklesen danach, gilt
+  das geschriebene `1` als unbestätigt eigen (wie oben), eine Rücknahme bleibt
+  offen.
+- Übernimmt das ISG eine Rücknahme auf `0` nicht, wiederholt der Manager sie
+  im Abstand von 15 Sekunden, nach drei unbestätigten Versuchen nur noch alle
+  15 Minuten, und warnt einmal. Gelesen wird weiter. Schaltet der Nutzer die
+  Automatik oder den Schreibschalter aus, folgt der erste Versuch sofort.
+- Steht `4001` auf `0`, gibt es keine Freigabe; die Diagnose meldet „SG Ready
+  im WPM nicht aktiviert“. Ist Eingang 2 gesetzt, schreibt der Manager keine
+  `1`, weil daraus Zustand 4 entstünde. Wird Eingang 2 gesetzt, während der
+  eigene Eingang 1 aktiv ist, nimmt der Manager den eigenen Eingang zurück.
+- E3DC-Control nimmt nur einen Eingang zurück, den es selbst gesetzt hat. Das
+  hält ein Merker in `/var/www/html/data/stiebel_sg_ready_state.json` fest; er
+  wird nur bei einem Eigentumswechsel geschrieben. Der Merker ist an die
+  Reglerkennung (`5002`) und die Geräteadresse (Unit-ID) gebunden, die
+  IP-Adresse dient nur als Hinweis: Wechselt das ISG die Adresse, etwa per
+  DHCP, erkennt der Manager den eigenen Eingang weiter. Die Reglerkennung
+  bezeichnet den Reglertyp (zum Beispiel `449` für WPMsystem), kein einzelnes
+  Gerät. Weicht sie beim Start vom Merker ab, bleibt der Merker offen, bis zwei
+  aufeinanderfolgende Lesungen denselben Wert liefern; erst dann gilt ein
+  gesetzter Eingang als fremd. Kommen nach 15 Minuten oder zehn abweichenden
+  Lesungen keine zwei gleichen zustande, gilt der Merker ebenfalls als
+  abweichend; die Diagnose meldet dann einen Konflikt. Liefert das ISG keinen Reglertyp, zählt die
+  unveränderte Adresse. Beim Start, beim sauberen
+  Beenden und nach dem Ausschalten des Schalters oder der Automatik setzt der
+  Manager den eigenen Eingang auf `0`. Nach der Wiederkehr eines nicht
+  erreichbaren ISG prüft er den eigenen Eingang und setzt ihn auf `0`, wenn
+  die zentrale Entscheidung keine Freigabe mehr verlangt.
+- Ausfall und Hochlauf des ISG: An einem ISG plus stand Eingang 1 nach einem
+  Stromausfall des ISG wieder auf `0` und `5001` auf `2`; der Eingang ist dort
+  also flüchtig. Solange das ISG ausfällt oder hochfährt (bis es alle Werte
+  liefert, dauerte es dort fast 10 Minuten), hält der WPM den zuletzt
+  gesetzten Zustand; E3DC-Control kann ihn in dieser Zeit nicht zurücksetzen.
+  Liefert das ISG unvollständige Werte (`5001` nicht `1` bis `4`,
+  Reglertyp `0` oder Ersatzwert `0x8000`), schreibt der Manager keine `1` und
+  bewertet keinen Eingang als fremd. Danach gilt ein auf `0` gefallener eigener
+  Eingang nicht als fremdes Rücksetzen: Verlangt die Entscheidung weiter eine
+  Freigabe, setzt der Manager ihn einmal neu. Bleiben die Werte länger als
+  15 Minuten unvollständig, erscheint eine Warnung. Meldet ein ISG den
+  Reglertyp dauerhaft als `0`, während `4002` und `5001` gültig sind, nimmt der
+  Manager einen eigenen gesetzten Eingang trotzdem zurück.
+- Fremder Schreiber: Steht `4002` auf `1`, ohne dass E3DC-Control es gesetzt
+  hat, bleibt der Wert unverändert, und die Diagnose meldet einen Konflikt.
+  Setzt jemand den eigenen Eingang auf `0` zurück, schreibt E3DC-Control in
+  derselben Freigabe-Episode nicht dagegen an. Wieder geschrieben wird erst,
+  nachdem die zentrale Entscheidung Normalbetrieb verlangt oder seit
+  150 Sekunden keine Freigabe mehr verlangt hat, und frühestens 15 Minuten nach
+  dem fremden Rücksetzen; wiederholt es sich, verdoppelt sich diese Wartezeit
+  bis höchstens 2 Stunden. Das Ende der Episode setzt sie nicht zurück, erst
+  2 Stunden ohne fremdes Rücksetzen. Ausgenommen ist der Rückfall auf `0` nach
+  Ausfall oder Hochlauf des ISG.
+- Die Heiz- und Warmwasseraktivität, die der Live-Dienst aus `2501` liest, ist
+  Eigenbetrieb des WPM und kein Hinweis auf eine fremde SG-Ready-Freigabe. Für
+  den ISG-Ausgang zählen allein `4002` und `5001`, für einen Shelly-SG-Ready-
+  oder EVU-Kontakt an einer Stiebel-Anlage allein der gelesene Relaiszustand:
+  Steht der SG-Kontakt laut Rücklesen auf Ein, ohne dass eine Freigabe, eine
+  Pause, ein manueller Boost oder Warmwasser sofort aktiv ist, schaltet der
+  Manager nach 60 Sekunden ohne Befehl ausschließlich den SG-Kontakt aus; ein
+  EVU-/Pause-Kontakt bleibt unberührt. Steht das Relais danach ohne eigenen
+  Befehl wieder auf Ein, folgt nach dem zweiten erfolglosen Ausschalten keines
+  mehr; die Diagnose (`shelly_sg_relay_guard`) meldet dann einen fremden
+  Schreiber am SG-Relais. Bestätigt der Shelly das Ausschalten zweimal nicht,
+  schaltet der Manager ebenfalls nicht weiter und meldet das. Bei
+  ausgeschalteter Automatik schaltet der Manager nicht, er warnt nur; mit dem
+  Wiedereinschalten der Automatik ist dieser Hinweis erledigt.
+- Ist das ISG nicht erreichbar oder weist es einen Zugriff mit einer
+  Modbus-Exception ab, gibt es keine Freigabe; ein neuer Versuch folgt
+  frühestens nach 15 Sekunden. Das Log unterscheidet „nicht erreichbar“, „hat
+  abgewiesen“ (Exception auf den Schreibbefehl) und „FC06 quittiert,
+  Rücklesen abgewiesen“ (Wirkung unbekannt).
+- Die Diagnose zählt die Schreibvorgänge je Tag. Ab 24 am Tag erscheint eine
+  Warnung, die nichts sperrt.
+
+### Schaltfenster und Taktschutz
+
+Der Ausgang schaltet nur, wenn die zentrale Entscheidung wechselt. Wie lange
+eine Freigabe mindestens steht, bestimmen dieselben Einstellungen wie beim
+Shelly-SG-Ready-Kontakt:
+
+| Einstellung | Wirkung | Standard |
+| --- | --- | ---: |
+| Signalhalt (fest) | Eine gesetzte Freigabe steht mindestens so lange. | 10 min |
+| `stop_delay_minutes` | So lange muss die PV-Deckung fehlen, bevor eine PV-Freigabe endet. | 10 min |
+| `wp_min_runtime_min` | Mindestlaufzeit ab gemessenem Verdichterstart; eine PV-Freigabe endet wegen fehlender Deckung frühestens danach. | 30 min |
+| `wp_restart_block_min` | Wiedereinschaltsperre ab gemessenem Verdichterstillstand. | 20 min |
+
+Ist das Temperaturziel erreicht, endet die Freigabe frühestens nach dem Signalhalt.
+Der Warmwasser-Timer schaltet den SG-Ready-Ausgang (ISG oder Shelly-Kontakt)
+nicht selbst: Seine Nachfrage startet über denselben zentralen Startweg mit
+Wiedereinschaltsperre, Signalhalt und Budget und endet über dieselbe
+Rücknahme.
+„Warmwasser sofort“ startet am SG-Ready-Ausgang (ISG oder Shelly-Kontakt)
+ohne PV-Überschuss und unabhängig von der Budgethöhe über denselben zentralen
+Startweg. Wie der PV- und Preis-Boost braucht er aber ein frisches Budget des
+Storage Managers; fehlt es, wartet der Befehl (Log: `storage_budget_stale`).
+Wie bei einer Luxtronik-Anlage braucht der Start eingeschaltete Automatik,
+keinen manuellen Wärmepumpen-Boost, gültige E3DC-Livedaten, ein gültiges
+Warmwasser-Ist unter dem Ziel und keine Sicherheitsabschaltung (Speicher unter
+Mindest-SoC minus 5 %, Netzbezug über 2500 W, Hardware- oder Quellenschutz). Im Notstrom- oder
+Inselbetrieb und während der Speicher die Notstromreserve hält, startet und
+hält der Knopf nicht. Es gelten die Wiedereinschaltsperre ab
+Verdichterstillstand und, wie beim manuellen Wärmepumpen-Boost, nach jeder
+Rücknahme eine Sperre von mindestens 10 Minuten bzw. `wp_restart_block_min`,
+auch wenn der Verdichter nicht lief. Eine laufende eigene Preis- oder PV-Pause
+übernimmt der Befehl, eine neue beginnt während des Befehls nicht. Eine fremde
+Sperre, etwa ein von außen ausgeschalteter Pause-Kontakt am Shelly, überschreibt
+er nicht; die Diagnose meldet sie. Der Befehl endet frühestens nach dem
+Signalhalt von 10 Minuten (eine Mindestlaufzeit gilt dafür nicht), wenn die
+eingestellte Dauer abläuft, der Nutzer ihn stoppt oder das Warmwasser das Ziel
+erreicht hat; mit dem erreichten Ziel ist der Befehl erledigt (ein
+Warmwasser-Zyklus je Befehl), auch wenn inzwischen ein Pre-Dump das Signal
+hält. Hardware- oder Quellenschutz und Nutzer-Aus beenden ihn. Die übrigen
+Sicherheitsabschaltungen, eine E3DC-Datenlücke und ein seit mehr als 5 Minuten
+nicht mehr frisches Speicher-Budget unterbrechen ihn nur: Solange die Dauer
+läuft, startet er nach der Sperre neu.
+Bei SG Ready bewirkt der Knopf den verstärkten Betrieb der ganzen Anlage
+(Zustand 3); das Warmwasser regelt der WPM selbst.
+Sicherheitsabschaltung, Nutzer-Aus und das Ende der Datenlücken-Toleranz
+wirken unabhängig von diesen Zeiten. Wer statt häufiger Wechsel längere
+Fenster von etwa ein bis zwei Stunden möchte, erhöht `wp_min_runtime_min`
+(zum Beispiel auf 60 bis 120) und bei Bedarf `wp_restart_block_min`. Dann läuft
+die Wärmepumpe bei nachlassender PV entsprechend länger aus Speicher oder Netz
+weiter. Eine eigene Fensterlogik gibt es nicht.
+
+### Diagnose
+
+`/var/www/html/ramdisk/luxtronik.json` enthält den Block `stiebel_sg_ready`
+ohne Adressen und Zugangsdaten, unter anderem:
+
+| Feld | Bedeutung |
+| --- | --- |
+| `target_input1` | Soll von Eingang 1 aus der zentralen Entscheidung |
+| `input1` | gelesener Eingang 1 (`4002`) |
+| `operating_state` | gelesener Betriebszustand (`5001`) |
+| `sg_ready_switch` | gelesener Funktionsschalter (`4001`) |
+| `input2` | gelesener Eingang 2 (`4003`) |
+| `last_write_ts`, `writes_today` | letzter Schreibzeitpunkt, Schreibvorgänge heute |
+| `reason`, `reason_text` | Grund des letzten Ergebnisses |
+| `conflict` | fremder Schreiber erkannt, Art und Zeitpunkt |
+| `own_input`, `own_input_confirmed` | eigener Eingang gesetzt, durch Rücklesen bestätigt |
+| `unconfirmed_write_latched` | unbestätigtes `1`; neuer Schreibversuch erst nach Normalbetrieb, nach dem Ende der Freigabeanforderung oder nach 15 Minuten |
+| `release_pending`, `release_backoff_active` | Rücknahme offen; nach mehreren unbestätigten Versuchen läuft die Wartezeit |
+| `writes_warning` | ab 24 Schreibvorgängen am Tag |
+| `isg_reachable`, `isg_ready` | ISG erreichbar, liefert vollständige SG-Ready-Werte |
+| `owner_identity` | Bindung des Merkers: `controller_id`, `address`, `pending` oder `mismatch` |
+
+Ist der Schalter aus, steht dort `active: false` mit dem Grund.
+
+### Kurze Testanleitung
+
+1. Schalter aus lassen und in `/var/www/html/ramdisk/stiebel_isg.json`
+   prüfen: `stiebel_sg_ready_switch` = `1`, `stiebel_sg_ready_input1` = `0`,
+   `stiebel_sg_ready_input2` = `0`, `stiebel_sg_ready_state` = `2`.
+   `stiebel_controller_id` sollte einen Reglertyp aus der Herstellerdoku
+   liefern (zum Beispiel `449` für WPMsystem); das bestätigt auch den
+   Adressversatz.
+2. Schalter einschalten, den Wärmepumpen-Manager neu starten und im Block
+   `stiebel_sg_ready` prüfen: `active` = `true`, `writes_today` = `0`.
+3. Bei PV-Überschuss mit laufender Wärmefreigabe: `input1` = `1`,
+   `operating_state` = `3`; die Zeit bis zur Umschaltung notieren.
+4. Nach dem Ende der Freigabe: `input1` = `0`, `operating_state` = `2`.
+5. Neustart-Test: Während `input1` = `1` den Wärmepumpen-Manager neu starten.
+   Spätestens nach dem Start muss `input1` wieder `0` sein.
+6. Optional: Während `input1` = `1` das ISG kurz stromlos machen. Während des
+   Hochlaufs zeigt der Block `isg_ready` = `false` und `writes_today` bleibt
+   gleich; danach `input1` und `operating_state` notieren.
+7. Bei Problemen erwarteten und gelesenen Zustand, den betroffenen
+   Testschritt und die beobachtete Verzögerung nennen. Ein **Diagnosepaket
+   aus der Installationszentrale** beifügen und vor dem Teilen prüfen; darin
+   ist insbesondere der Block `stiebel_sg_ready` aus `luxtronik.json` relevant.
+
+### Grenzen
+
+- Die Herstellerdoku sagt nichts dazu, ob die SG-Ready-Register flüchtig oder
+  dauerhaft gespeichert werden und ob es einen Watchdog gibt. An einem ISG plus
+  war Eingang 1 nach einem Stromausfall des ISG wieder `0` (flüchtig). Ob das
+  für jede ISG-Variante gilt und was ein Neustart des WPM allein bewirkt, ist
+  nicht belegt.
+- Einen Rückfall bei Verbindungsverlust gibt es nicht: Fällt der Host oder das
+  Netz aus, während Eingang 1 auf `1` steht, bleibt Zustand 3 bestehen, bis der
+  Wärmepumpen-Manager wieder läuft. Während Ausfall und Hochlauf des ISG hält
+  der WPM den zuletzt gesetzten Zustand. In beiden Fällen heizt die Wärmepumpe
+  bis zu den im WPM hinterlegten erhöhten Werten, auch mit Netzstrom.
+- `5001` folgte an einem ISG plus dem Schreiben von `4002` praktisch sofort.
+  Dokumentiert ist das Zeitverhalten nicht.
+- Die englische Fassung der Herstellerdoku nennt für `4001` vertauschte
+  Werte. E3DC-Control folgt der deutschen Fassung (`1` = EIN).
+- Die Reglerkennung `5002` unterscheidet Reglertypen, keine einzelnen Geräte.
+  Zwei ISG desselben Typs mit derselben Unit-ID kann der Merker nach einem
+  Adresswechsel nicht auseinanderhalten.
+- Im HA-Betrieb liegt der Merker in `data/` und wird mit den übrigen Daten zur
+  anderen Instanz synchronisiert, standardmäßig stündlich
+  (`ha_sync_interval`). Übernimmt die andere Instanz, nimmt sie einen Eingang
+  zurück, den der zuletzt übertragene Merker als eigen ausweist. Wurde der
+  Eingang erst nach der letzten Synchronisation gesetzt, meldet sie ihn als
+  fremd und lässt ihn stehen. Die erste Instanz nimmt ihn beim nächsten Start
+  zurück, sofern ihr eigener Merker dann noch vorliegt und sie schreiben darf.
+  Andernfalls bleibt der Eingang stehen und wird als fremd gemeldet.
 
 ## Troubleshooting
 

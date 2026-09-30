@@ -921,11 +921,24 @@ function vehicleSocDisplayInfo(vehicle, decimals = 1) {
     const sourceAge = meta.age_s !== undefined && meta.age_s !== null
         ? Number(meta.age_s)
         : (sourceTs > 0 ? Math.max(0, Date.now() / 1000 - sourceTs) : null);
-    const qualifier = sourceClass === 'estimated'
-        ? 'geschätzt'
-        : (sourceClass === 'manual' ? 'manuell' : (sourceClass === 'cloud' ? 'Cloud' : 'gemessen'));
+    // Fortschreibung: regelwirksam „~NN % (geschätzt)“, in der laufenden
+    // Stecksession nur angezeigt „~NN % geschätzt, unbestätigt“.
+    const estimateState = sourceClass === 'estimated' && !stale
+        ? String(meta.estimate_state || '').toLowerCase()
+        : '';
+    const estimateConfirmed = estimateState === 'confirmed';
+    const estimateUnconfirmed = estimateState === 'unconfirmed';
+    const qualifier = estimateConfirmed
+        ? '(geschätzt)'
+        : (estimateUnconfirmed
+            ? 'geschätzt, unbestätigt'
+            : (sourceClass === 'estimated'
+                ? 'geschätzt'
+                : (sourceClass === 'manual' ? 'manuell' : (sourceClass === 'cloud' ? 'Cloud' : 'gemessen'))));
     const digits = Math.max(0, Math.min(2, parseInt(decimals, 10) || 0));
-    const valueText = value.toLocaleString('de-DE', {minimumFractionDigits: digits, maximumFractionDigits: digits}) + ' %';
+    const valueText = (estimateConfirmed || estimateUnconfirmed)
+        ? `~${Math.round(value).toLocaleString('de-DE')} %`
+        : value.toLocaleString('de-DE', {minimumFractionDigits: digits, maximumFractionDigits: digits}) + ' %';
     let standText = '';
     if (sourceTs > 0) {
         const d = new Date(sourceTs * 1000);
@@ -934,7 +947,11 @@ function vehicleSocDisplayInfo(vehicle, decimals = 1) {
     }
     const ageText = vehicleSocAgeText(sourceAge);
     const fullText = `${valueText} ${qualifier}${standText ? `, ${standText}` : ''}${ageText ? ` (${ageText})` : ''}`;
-    return {known: true, value, valueText, qualifier, standText, ageText, fullText, stale, sourceClass, transportClass, sourceTs};
+    const estimateWarning = estimateUnconfirmed
+        ? 'Schätzwert ohne neuen Fahrzeugwert mehr als 20 Prozentpunkte über dem letzten bestätigten Stand; steuert weder Ziel-SoC noch Ladeende'
+        : '';
+    return {known: true, value, valueText, qualifier, standText, ageText, fullText, stale, sourceClass, transportClass, sourceTs,
+        estimateState, estimateWarning};
 }
 
 function vehicleSourceSyncDisplayInfo(socInfo, cloudRefresh = null) {
@@ -960,6 +977,49 @@ function vehicleSocKnown(vehicle) {
 function wallboxObservationUnknown(data, id) {
     const observation = data?.[`${id}_observation`];
     return data?.[id] === null || data?.[id] === undefined || (!!observation && observation.valid !== true);
+}
+
+// Stecker-/Schloss-Symbol einer Wallbox. Meldet die Wallbox ein Verriegelungsbit,
+// gibt es drei Zustände: kein Fahrzeug (kein Symbol), gesteckt und nicht verriegelt
+// (offenes Schloss), verriegelt (gelbes Schloss). Ohne Verriegelungsbit (null)
+// zeigt nur ein gestecktes Fahrzeug ein gelbes Stecker-Symbol, ohne Aussage zur
+// Verriegelung. Bei ungültigem Statusvertrag entsteht kein neues Symbol.
+function wallboxLockIndicatorState(data, prefix, configured = true) {
+    if (!configured || !data || typeof data !== 'object') return null;
+    const observation = data[`${prefix}_observation`];
+    if (data[`${prefix}_status_valid`] === false
+        || (observation && typeof observation === 'object' && observation.valid !== true)) {
+        return null;
+    }
+    const locked = data[`${prefix}_locked`];
+    const lockedMeasured = data[`${prefix}_locked_source`] === 'measured';
+    if (lockedMeasured && locked === true) {
+        return {icon: 'fa-lock', color: '#ffc107', textClass: 'text-warning', title: 'Fahrzeug verriegelt'};
+    }
+    if (data[`${prefix}_plug`] !== true) return null;
+    if (lockedMeasured && locked === false) {
+        return {icon: 'fa-lock-open', color: '#adb5bd', textClass: 'text-secondary', title: 'Fahrzeug gesteckt, nicht verriegelt'};
+    }
+    if (!lockedMeasured) {
+        return {icon: 'fa-plug', color: '#ffc107', textClass: 'text-warning', title: 'Fahrzeug gesteckt (Wallbox meldet keine Verriegelung)'};
+    }
+    return null;
+}
+
+function applyWallboxLockIndicator(element, state, useTextClass = false) {
+    if (!element || !element.length) return;
+    element.removeClass('fa-lock fa-lock-open fa-plug');
+    if (useTextClass) element.removeClass('text-warning text-secondary');
+    if (!state) {
+        element.addClass('fa-lock');
+        if (useTextClass) element.addClass('text-warning');
+        element.removeAttr('title').removeAttr('aria-label').hide();
+        return;
+    }
+    element.addClass(state.icon);
+    if (useTextClass) element.addClass(state.textClass);
+    else element.css('color', state.color);
+    element.attr('title', state.title).attr('aria-label', state.title).show();
 }
 
 function wallboxPrimaryVehicleActive(data, id, power, locked) {
@@ -1219,11 +1279,13 @@ function updateVehicleWidgets(data) {
         let activeV1 = bySlot(1) || null;
         let activeV2 = bySlot(2) || null;
 
+        // Ohne Verriegelungsbit (openWB Pro) ist wb2_locked null; gesteckt belegt allein wb2_plug.
+        const wb2VehiclePresent = data.wb2_plug === true || data.wb2_locked === true;
         if (!activeV1 && data.wb_plug === true) activeV1 = slotFallback(1) || unslottedPlugged.shift() || null;
-        if (!activeV2 && data.wb2_locked === true) activeV2 = slotFallback(2) || unslottedPlugged.shift() || null;
+        if (!activeV2 && wb2VehiclePresent) activeV2 = slotFallback(2) || unslottedPlugged.shift() || null;
 
         const isGuest1 = data.wb_plug === true && !activeV1;
-        const isGuest2 = data.wb2_locked === true && !activeV2;
+        const isGuest2 = wb2VehiclePresent && !activeV2;
 
         const escapeBadgeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, ch => ({
             '&': '&amp;',
@@ -1258,9 +1320,11 @@ function updateVehicleWidgets(data) {
                     const socInfo = vehicleSocDisplayInfo(activeV, 0);
                     const socKnown = socInfo.known;
                     const soctxt = socKnown ? `${socInfo.valueText} ${socInfo.qualifier}` : '--';
+                    const socIsSessionEstimate = socKnown
+                        && (socInfo.estimateState === 'confirmed' || socInfo.estimateState === 'unconfirmed');
                     const badgeParts = [];
                     if (dispName) badgeParts.push(`<strong>${escapeBadgeHtml(dispName)}</strong>`);
-                    badgeParts.push(`${escapeBadgeHtml(soctxt)} SoC`);
+                    badgeParts.push(socIsSessionEstimate ? escapeBadgeHtml(soctxt) : `${escapeBadgeHtml(soctxt)} SoC`);
                     const titleParts = [];
                     if (activeV.name) titleParts.push(String(activeV.name).trim());
                     titleParts.push(socKnown ? socInfo.fullText : 'Fahrzeug-SoC nicht verfügbar');
@@ -1273,6 +1337,7 @@ function updateVehicleWidgets(data) {
                         ? `Fahrzeug-SoC veraltet${socInfo.ageText ? ` (${socInfo.ageText})` : '; Quellzeit fehlt'}`
                         : '';
                     const badgeWarningDetail = staleSocDetail
+                        || (socKnown && socInfo.estimateWarning ? socInfo.estimateWarning : '')
                         || (activeBluelinkRefreshInfo && activeBluelinkRefreshInfo.warning
                             ? activeBluelinkRefreshInfo.detail
                             : '');
@@ -6670,10 +6735,11 @@ function updateModernDashboardActivity(data, values) {
     const hsPower = num(values && values.hsVal);
     const climatePower = num(values && values.climateVal);
     const wb1Present = data && (data.wb_plug === true || data.wb_plug === 1 || data.wb_plug === '1');
-    const wb2Locked = data && (data.wb2_locked === true || data.wb2_locked === 1 || data.wb2_locked === '1');
+    const wb2Present = data && (data.wb2_plug === true || data.wb2_plug === 1 || data.wb2_plug === '1'
+        || data.wb2_locked === true || data.wb2_locked === 1 || data.wb2_locked === '1');
     const wpSgReadyVisible = heatSgReadyPresentation(data).visible;
     setModernCardState('card-wb-wrapper', {active: Math.abs(wb1Power) > 50 || wb1Present, present: wb1Configured});
-    setModernCardState('card-wb2-wrapper', {active: Math.abs(wb2Power) > 50 || wb2Locked, present: wb2Configured});
+    setModernCardState('card-wb2-wrapper', {active: Math.abs(wb2Power) > 50 || wb2Present, present: wb2Configured});
     setModernCardState('card-wp-wrapper', {active: wpPower >= 100 || wpSgReadyVisible, present: true});
     setModernCardState('card-climate-wrapper', {
         active: climatePower > 50,
@@ -12384,14 +12450,12 @@ function processLiveData(data) {
 
             if (power > 0) {
                 wbIcon.removeClass('bg-secondary text-secondary bg-warning text-warning bg-success text-success').addClass('bg-info text-info pulsating');
-                if (isLocked) wbLockOverlay.show(); else wbLockOverlay.hide();
             } else if (power < 0) {
                 wbIcon.removeClass('bg-secondary text-secondary bg-warning text-warning bg-info text-info').addClass('bg-success text-success pulsating');
-                if (isLocked) wbLockOverlay.show(); else wbLockOverlay.hide();
             } else {
                 wbIcon.removeClass('bg-info text-info bg-warning text-warning bg-success text-success pulsating').addClass('bg-secondary text-secondary');
-                if (isLocked) wbLockOverlay.show(); else wbLockOverlay.hide();
             }
+            applyWallboxLockIndicator(wbLockOverlay, wallboxLockIndicatorState(data, id), true);
 
             let activePhases = 0;
             if (p1 > 10) activePhases++; if (p2 > 10) activePhases++; if (p3 > 10) activePhases++;
@@ -12943,8 +13007,8 @@ function processLiveData(data) {
         $('#flow-line-grid, #flow-dot-grid').attr('stroke', gridStat.hex);
         applyFlowSelectorColor('.node-climate', getFlowColor('climate', '#38bdf8'));
         $('#flow-line-climate, #flow-dot-climate').attr('stroke', getFlowColor('climate', '#38bdf8'));
-        if (wb1Configured && data.wb_locked === true) { $('#f-wb-lock').show(); } else { $('#f-wb-lock').hide(); }
-        if (wb2Configured && data.wb2_locked === true) { $('#f-wb2-lock').show(); } else { $('#f-wb2-lock').hide(); }
+        applyWallboxLockIndicator($('#f-wb-lock'), wallboxLockIndicatorState(data, 'wb', wb1Configured));
+        applyWallboxLockIndicator($('#f-wb2-lock'), wallboxLockIndicatorState(data, 'wb2', wb2Configured));
 
         updateFlow('flow-dot-pv', pvFlow.mainPvW, false);
         updateFlow('flow-dot-external-pv', pvFlow.externalPvW, false);
@@ -13101,7 +13165,7 @@ function processMobileData(data) {
         if (wb1Configured && data.wb_session_kwh != null && (data.wb_session_kwh > 0 || data.wb_plug === true)) $('#f-val-wb-session').text(data.wb_session_kwh.toLocaleString('de-DE', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' kWh').show();
         else $('#f-val-wb-session').hide();
 
-        if (wb2Configured && data.wb2_session_kwh != null && (data.wb2_session_kwh > 0 || data.wb2_locked === true)) $('#f-val-wb2-session').text(data.wb2_session_kwh.toLocaleString('de-DE', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' kWh').show();
+        if (wb2Configured && data.wb2_session_kwh != null && (data.wb2_session_kwh > 0 || data.wb2_plug === true || data.wb2_locked === true)) $('#f-val-wb2-session').text(data.wb2_session_kwh.toLocaleString('de-DE', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' kWh').show();
         else $('#f-val-wb2-session').hide();
 
         updateVehicleWidgets(data);
@@ -13159,8 +13223,8 @@ function processMobileData(data) {
         $('#flow-line-grid, #flow-dot-grid').attr('stroke', gridStat.hex);
         applyFlowSelectorColor('.node-climate', getFlowColor('climate', '#38bdf8'));
         $('#flow-line-climate, #flow-dot-climate').attr('stroke', getFlowColor('climate', '#38bdf8'));
-        if (wb1Configured && data.wb_locked === true) { $('#f-wb-lock').show(); } else { $('#f-wb-lock').hide(); }
-        if (wb2Configured && data.wb2_locked === true) { $('#f-wb2-lock').show(); } else { $('#f-wb2-lock').hide(); }
+        applyWallboxLockIndicator($('#f-wb-lock'), wallboxLockIndicatorState(data, 'wb', wb1Configured));
+        applyWallboxLockIndicator($('#f-wb2-lock'), wallboxLockIndicatorState(data, 'wb2', wb2Configured));
 
         updateFlow('flow-dot-pv', pvFlow.mainPvW, false); updateFlow('flow-dot-external-pv', pvFlow.externalPvW, false); updateFlow('flow-dot-home', h, false);
         updateFlow('flow-dot-generation', flowAggregates.generationW, false); updateFlow('flow-dot-consumption', flowAggregates.consumptionW, false);

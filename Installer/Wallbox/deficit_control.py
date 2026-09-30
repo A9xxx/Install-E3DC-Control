@@ -432,6 +432,10 @@ def step_group_deficit(
     floor_direct_minimum_entry_confirm_s: Any = 20.0,
     floor_direct_minimum_phase_down: bool = False,
     floor_direct_minimum_immediate_by_wb: Optional[Mapping[Any, Any]] = None,
+    grid_import_settle_s: Any = 0.0,
+    grid_import_settle_max_w: Any = None,
+    grid_import_settle_bypass_reason: str = "",
+    grid_import_episode: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Fortschreiben von genau einem PCC-Defizitkonto und einer Kaskade.
 
@@ -500,6 +504,24 @@ def step_group_deficit(
     aktuellen Besitzers fortgeschrieben. Ein Besitzer ohne Direktabsenkung,
     ein Stop und eine stehende Wallbox beenden die Episode dieser Wallbox
     samt Zeitstempeln.
+
+    Einschwingfrist (``grid_import_settle_s``, 0 = aus): Neuer Netzbezug –
+    nach einer eigenen Anhebung oder bei einer kurzen Lastspitze – wird vom
+    Speicher erst nach seiner Reaktionszeit ausgeglichen. Die sofortige
+    proportionale Absenkung wartet deshalb, bis der Bezug seit Beginn der
+    Bezugsepisode ``grid_import_settle_s`` ansteht. Die Episode endet erst,
+    wenn ebenso lange kein Bezug mehr gemessen wurde; kurze Pausen verlängern
+    die Frist nicht. Das Netzkonto zählt währenddessen weiter; erreicht es
+    seine Schwelle, endet die Frist sofort. Ohne bekannte Speicherreichweite
+    (``grid_import_settle_max_w`` fehlt), bei Bezug darüber oder an einer
+    harten Grenze (``grid_import_settle_bypass_reason``, etwa Hausanschluss)
+    gilt keine Frist. Die Frist wirkt nur oberhalb des Mindeststroms; Stufen
+    am Mindeststrom folgen wie bisher dem Wh-Konto. Die Bezugsepisode ist eine
+    Gruppengröße am Netzpunkt: Beginnt die Kaskade neu (leeres Konto), führt
+    ``grid_import_episode`` (``since_ts``, ``quiet_since_ts``, ``updated_ts``)
+    eine laufende Episode fort, sofern zwischen ihrer letzten Fortschreibung
+    und diesem Sample höchstens ``max(max_dt_s, grid_import_settle_s)``
+    liegen; ein anhaltender Bezug erhält so keine neue Frist.
     """
 
     previous = _validated_previous(previous_state)
@@ -656,6 +678,56 @@ def step_group_deficit(
         and budget_overrun >= 0.0
     )
     grid_deficit = max(0.0, float(pcc_value) - tolerance)
+    # Einschwingfrist der sofortigen Absenkung: Beginn der Bezugsepisode und
+    # Beginn der Ruhe danach. Die Episode endet erst nach einer vollen Frist
+    # ohne Bezug, damit wiederholte kurze Spitzen die Frist nicht neu starten.
+    settle_s = _positive(
+        grid_import_settle_s,
+        name="grid_import_settle_s",
+        allow_zero=True,
+    )
+    settle_max = _finite(grid_import_settle_max_w)
+    import_since = _finite(ledger.get("grid_import_since_ts"))
+    import_quiet_since = _finite(ledger.get("grid_import_quiet_since_ts"))
+    carried = grid_import_episode if isinstance(grid_import_episode, Mapping) else {}
+    carried_updated = _finite(carried.get("updated_ts"))
+    if (
+        "grid_import_since_ts" not in ledger
+        and carried_updated is not None
+        and 0.0 <= float(timestamp) - carried_updated <= max(max_dt, settle_s) + 1e-9
+    ):
+        # Neu begonnene Kaskade: laufende Bezugsepisode fortführen.
+        import_since = _finite(carried.get("since_ts"))
+        import_quiet_since = _finite(carried.get("quiet_since_ts"))
+    if grid_deficit > 0.0:
+        import_quiet_since = None
+        if import_since is None or import_since > float(timestamp):
+            import_since = float(timestamp)
+    elif import_since is not None:
+        if import_quiet_since is None or import_quiet_since > float(timestamp):
+            import_quiet_since = float(timestamp)
+        if float(timestamp) - import_quiet_since + 1e-9 >= settle_s:
+            import_since = None
+            import_quiet_since = None
+    import_age_s = (
+        float(timestamp) - import_since if import_since is not None else None
+    )
+    if settle_s <= 0.0:
+        settle_blocker = "disabled"
+    elif str(grid_import_settle_bypass_reason or "").strip():
+        settle_blocker = str(grid_import_settle_bypass_reason).strip()
+    elif settle_max is None or settle_max <= 0.0:
+        settle_blocker = "storage_reach_unknown"
+    elif float(pcc_value) > settle_max:
+        settle_blocker = "import_above_storage_reach"
+    else:
+        settle_blocker = ""
+    settle_wait = bool(
+        not settle_blocker
+        and grid_deficit > 0.0
+        and import_age_s is not None
+        and import_age_s + 1e-9 < settle_s
+    )
     # Ruhezustand des Budgetkontos.
     # Ein Export am Netzpunkt bei ladendem oder ruhendem Speicher ist der
     # physikalische Gegenbeleg zu einer Budgetüberziehung: es fehlt nichts.
@@ -888,6 +960,20 @@ def step_group_deficit(
         "export_rest_since_ts": export_rest_since,
         "export_rest_active": bool(budget_rest),
         "export_rest_contract_valid": bool(export_rest_contract_valid is True),
+        # Einschwingfrist der sofortigen Absenkung (Diagnose).
+        "grid_import_since_ts": import_since,
+        "grid_import_quiet_since_ts": import_quiet_since,
+        "grid_import_settle_s": round(settle_s, 3),
+        "grid_import_settle_max_w": (
+            round(settle_max, 1) if settle_max is not None else None
+        ),
+        "grid_import_settle_wait": settle_wait,
+        "grid_import_settle_blocker": settle_blocker,
+        "grid_import_settle_remaining_s": (
+            round(max(0.0, settle_s - import_age_s), 3)
+            if settle_wait and import_age_s is not None
+            else 0.0
+        ),
         "sample_valid": True,
         "sample_fresh": True,
         "dt_s": round(dt_s, 6),
@@ -994,6 +1080,36 @@ def step_group_deficit(
                 ledger=ledger,
                 cascade=cascade,
                 action=action,
+            )
+        if budget_rest and not phase_switch_failed:
+            # Die Defizitepisode ist abgeschlossen: Einspeisung bei ladendem
+            # oder ruhendem Akku, stabil über ``export_rest_min_s``. Ein noch
+            # nicht angelaufener Phasenabstieg verfällt, statt bis zum
+            # Pending-Timeout (oder nach einem Startfenster) bei Einspeisung
+            # nachzulaufen. Das Konto beginnt neu; eine zugesagte, aber nicht
+            # begonnene Reservierung gibt der Aufrufer frei.
+            cascade.update({
+                "marginal_wb_id": wb_id,
+                "topology": topology,
+                "stage": physical_stage,
+                "generation": int(cascade.get("generation", 0) or 0) + 1,
+                "phase_down_requested": False,
+                "phase_down_requested_sample_ts": None,
+                "phase_pending_age_s": round(pending_age_s, 6),
+                "reason": "phase_pending_ended_export_rest",
+            })
+            _reset_bucket(ledger, reason="phase_pending_export_rest")
+            return _result(
+                snapshot_id=sid,
+                sample_ts=timestamp,
+                wb_id=wb_id,
+                ledger=ledger,
+                cascade=cascade,
+                action=_hold_action(
+                    wb_id,
+                    "phase_pending_ended_export_rest",
+                    stage=physical_stage,
+                ),
             )
         pending_terminal = bool(
             phase_switch_failed or pending_age_s + 1e-9 >= pending_timeout
@@ -1295,6 +1411,27 @@ def step_group_deficit(
         )
 
     if grid_deficit > 0.0 and current > minimum + 1e-6:
+        if settle_wait and not threshold_reached:
+            # Der Speicher gleicht den neuen Bezug innerhalb seiner
+            # Reaktionszeit aus; eine Absenkung jetzt würde nach dem Ausgleich
+            # Einspeisung und die nächste Anhebung auslösen (Pendeln).
+            cascade["reason"] = "grid_import_settle"
+            action = _hold_action(
+                wb_id,
+                "grid_import_settle",
+                stage=stage,
+            )
+            action["grid_import_settle_remaining_s"] = ledger.get(
+                "grid_import_settle_remaining_s"
+            )
+            return _result(
+                snapshot_id=sid,
+                sample_ts=timestamp,
+                wb_id=wb_id,
+                ledger=ledger,
+                cascade=cascade,
+                action=action,
+            )
         watts_per_amp = voltage * phases
         proportional_drop = _round_up_to_step(grid_deficit / watts_per_amp, step)
         target = max(minimum, _round_down_to_step(current - proportional_drop, step))
@@ -1498,6 +1635,102 @@ def step_group_deficit(
     )
 
 
+def raise_settle_contract(
+    *,
+    target_amp: Any,
+    base_amp: Any,
+    running: bool,
+    now_ts: Any,
+    last_raise_ts: Any,
+    settle_s: Any,
+    max_step_a: Any = 2.0,
+    current_step_amp: Any = 1.0,
+    grid_import_w: Any = None,
+    import_tolerance_w: Any = 200.0,
+    import_episode_active: bool = False,
+    live_valid: bool = False,
+    bypass: bool = False,
+) -> Dict[str, Any]:
+    """Anhebung einer laufenden Ladung erst nach Beruhigung, in kleinen Stufen.
+
+    Gegenstück zur Einschwingfrist des Defizitreglers: Eine Anhebung zieht
+    zusätzliche Leistung, die der Speicher erst nach seiner Reaktionszeit
+    ausgleicht. Die nächste Anhebung folgt deshalb erst, wenn seit der letzten
+    ausgeführten Anhebung ``settle_s`` vergangen sind, kein Netzbezug über der
+    Toleranz gemessen wird und keine Bezugsepisode des Defizitreglers offen
+    ist; sie beträgt höchstens ``max_step_a`` über dem zuletzt gesetzten
+    Strom. Fehlen gültige Live-Daten, wird nicht angehoben. Absenkungen, ein
+    Start aus dem Stillstand und freigegebene Netz-/Preisfenster (``bypass``)
+    bleiben unberührt.
+    """
+
+    def _num(value: Any, default: float) -> float:
+        number = _finite(value)
+        return float(default) if number is None else float(number)
+
+    step = max(0.1, min(16.0, _num(current_step_amp, 1.0)))
+    target = max(0.0, _num(target_amp, 0.0))
+    base = max(0.0, _num(base_amp, 0.0))
+    settle = max(0.0, _num(settle_s, 0.0))
+    max_step = max(step, _num(max_step_a, 2.0))
+    now = _num(now_ts, 0.0)
+    last = _finite(last_raise_ts)
+    since_raise_s = (now - float(last)) if last is not None and last > 0.0 else None
+    grid = _finite(grid_import_w)
+    tolerance = max(0.0, _num(import_tolerance_w, 200.0))
+    result: Dict[str, Any] = {
+        "contract": "wallbox_raise_settle_v1",
+        "target_amp": round(target, 3),
+        "base_amp": round(base, 3),
+        "applied_amp": round(target, 3),
+        "limited": False,
+        "reason": "",
+        "settle_s": round(settle, 3),
+        "max_step_a": round(max_step, 3),
+        "since_last_raise_s": (
+            round(since_raise_s, 3) if since_raise_s is not None else None
+        ),
+    }
+    if target <= base + step * 0.5:
+        result["reason"] = "no_raise"
+        return result
+    if bypass:
+        result["reason"] = "bypass"
+        return result
+    if settle <= 0.0:
+        result["reason"] = "disabled"
+        return result
+    if not running or base <= 0.0:
+        result["reason"] = "not_running"
+        return result
+    hold_reason = ""
+    if not live_valid or grid is None:
+        hold_reason = "live_invalid"
+    elif grid > tolerance:
+        hold_reason = "grid_import"
+    elif import_episode_active:
+        hold_reason = "import_episode_open"
+    elif since_raise_s is not None and since_raise_s + 1e-9 < settle:
+        hold_reason = "settle_wait"
+    if hold_reason:
+        result.update({
+            "applied_amp": round(base, 3),
+            "limited": True,
+            "reason": hold_reason,
+        })
+        return result
+    ceiling = _round_down_to_step(base + max_step, step)
+    applied = min(target, ceiling)
+    if applied <= base + 1e-9:
+        applied = min(target, base + step)
+    result.update({
+        "applied_amp": round(applied, 3),
+        "limited": bool(applied + 1e-9 < target),
+        "reason": "raise_step" if applied + 1e-9 < target else "raise",
+    })
+    return result
+
+
 __all__ = [
     "ACTION_CURRENT_DOWN",
     "ACTION_HOLD",
@@ -1515,5 +1748,6 @@ __all__ = [
     "TOPOLOGY_FIXED_THREE",
     "TOPOLOGY_SWITCHABLE",
     "action_for_wb",
+    "raise_settle_contract",
     "step_group_deficit",
 ]

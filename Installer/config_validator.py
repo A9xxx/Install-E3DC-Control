@@ -826,6 +826,88 @@ def validate_ext_inverter_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any
     return entries
 
 
+_WP_BUFFER_SENSORS = {
+    "none": None,
+    "luxtronik_ruecklauf_extern": 0,
+    "stiebel_puffer": 4,
+}
+
+
+def validate_heatpump_display_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Beratende Prüfung des Pufferfühlers der neuen WP-Ansicht (nur Anzeige, keine Regelwirkung)."""
+    if not _has_user_value(cfg, "wp_buffer_sensor"):
+        return {}
+    raw = str(cfg.get("wp_buffer_sensor")).strip().lower()
+    wp_type = int(safe_float(cfg.get("wp_type"), -1.0))
+    if raw not in _WP_BUFFER_SENSORS:
+        severity = "warning"
+        effective = "none"
+        message = "Unbekannter Pufferfühler; die Ansicht zeigt keinen Pufferspeicher. Erlaubt: keiner, externer Rücklauf der Luxtronik oder Pufferfühler der Stiebel-ISG."
+    elif _WP_BUFFER_SENSORS[raw] is not None and _WP_BUFFER_SENSORS[raw] != wp_type:
+        severity = "warning"
+        effective = raw
+        message = "Der gewählte Pufferfühler passt nicht zum Wärmepumpen-Typ; die Ansicht zeigt den Puffer ohne Wert („--“)."
+    else:
+        severity = "ok"
+        effective = raw
+        message = "Pufferfühler für die Anzeige der neuen Wärmepumpen-Ansicht."
+    return {
+        "wp_buffer_sensor": _entry(
+            key="wp_buffer_sensor", label="WP-Ansicht: Pufferfühler", unit="",
+            configured=cfg.get("wp_buffer_sensor"), live_value=None, live_key=None,
+            effective=effective, source="user" if severity == "ok" else "invalid",
+            severity=severity, message=message,
+        )
+    }
+
+
+def _address_configured(cfg: Dict[str, Any], key: str) -> bool:
+    return str(cfg.get(key, "") or "").strip().lower() not in {"", "0", "0.0.0.0", "none", "null"}
+
+
+def validate_stiebel_sg_ready_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Beratende Prüfung des experimentellen SG-Ready-Ausgangs über das Stiebel-ISG.
+
+    Keine Sperre: Der Energy Manager prüft dieselben Bedingungen zur Laufzeit
+    und schreibt ohne sie nichts. Die Meldung erklärt nur, warum der Schalter
+    wirkt oder nicht wirkt.
+    """
+    if not _is_enabled(cfg, "stiebel_isg_sg_ready_write"):
+        return {}
+    wp_type = int(safe_float(cfg.get("wp_type"), -1.0))
+    severity = "warning"
+    effective = 0
+    if wp_type != 4:
+        message = "Wirkt nur beim Wärmepumpen-Typ Stiebel Eltron ISG / WPM; es wird nichts geschrieben."
+    elif not _is_enabled(cfg, "luxtronik"):
+        message = "WP-/Verbrauchslogging ist aus; der SG-Ready-Ausgang bleibt inaktiv."
+    elif not _address_configured(cfg, "stiebel_isg_ip"):
+        message = "ISG-Adresse fehlt; der SG-Ready-Ausgang bleibt inaktiv."
+    elif _address_configured(cfg, "shelly_sg_ip") or _address_configured(cfg, "shelly_pause_ip"):
+        message = (
+            "Ein Shelly-SG-Ready- oder EVU-Kontakt ist eingetragen und behält Vorrang. "
+            "Das ISG wird nicht beschrieben; nur eine SG-Ready-Steuerung darf aktiv sein."
+        )
+    elif str(cfg.get("auto_mode", "1")).strip().lower() in {"0", "false", "off", "aus", "nein"}:
+        message = "„Automatik darf Geräte steuern“ ist aus; der SG-Ready-Ausgang schreibt dann nicht."
+    else:
+        severity = "ok"
+        effective = 1
+        message = (
+            "Experimentell: Der Wärmepumpen-Manager schreibt bei Zustandswechseln der zentralen "
+            "Entscheidung nur SG-Ready-Eingang 1 (4002). Voraussetzungen im WPM: SG Ready aktiviert, "
+            "SG-Ready-Eingang = Modbus, Sicherheitstemperaturbegrenzer im Heizungsvorlauf, keine "
+            "zweite SG-Ready-Steuerung. Wirksam nach Neustart des Wärmepumpen-Managers."
+        )
+    return {
+        "stiebel_isg_sg_ready_write": _entry(
+            key="stiebel_isg_sg_ready_write", label="Stiebel: SG Ready schreiben (experimentell)", unit="",
+            configured=cfg.get("stiebel_isg_sg_ready_write"), live_value=None, live_key=None,
+            effective=effective, source="user", severity=severity, message=message,
+        )
+    }
+
+
 def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Liefert die beratende Prüfung der Speicherkonfiguration.
 
@@ -843,6 +925,8 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     wallbox: Dict[str, Dict[str, Any]] = {}
     consumer: Dict[str, Dict[str, Any]] = {}
     consumer.update(validate_heatpump_pv_config(cfg))
+    consumer.update(validate_heatpump_display_config(cfg))
+    consumer.update(validate_stiebel_sg_ready_config(cfg))
     price: Dict[str, Dict[str, Any]] = {}
     forecast = validate_solcast_config(cfg)
     forecast.update(validate_pv_forecast_topology_config(cfg))
@@ -1959,6 +2043,37 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             severity=severity,
             message=message,
         )
+        # Angebot der openWB Pro nach dem Abstecken; ungültig gilt „safe“.
+        unplug_key = f"wb{charger_id}_openwb_pro_unplug_offer"
+        unplug_user = _has_user_value(cfg, unplug_key)
+        unplug_raw = str(cfg.get(unplug_key) or "").strip().lower()
+        unplug_valid = unplug_raw in ("safe", "fast_start")
+        unplug_effective = unplug_raw if unplug_valid else "safe"
+        wallbox[unplug_key] = _entry(
+            key=unplug_key,
+            label=f"WB{charger_id} openWB Pro nach dem Abstecken",
+            unit="",
+            configured=unplug_raw if unplug_user else None,
+            live_value=None,
+            live_key=None,
+            effective=unplug_effective,
+            source=(
+                "user" if unplug_user and unplug_valid
+                else ("invalid" if unplug_user else "default")
+            ),
+            severity="warning" if unplug_user and not unplug_valid else "ok",
+            message=(
+                "Nach dem Abstecken einmalig 6 A: das Fahrzeug startet beim "
+                "Anstecken sofort, danach regelt die normale Logik."
+                if unplug_effective == "fast_start"
+                else (
+                    "Ungültiger Wert; wirksam ist die Sicherheitsvariante (0 A)."
+                    if unplug_user and not unplug_valid
+                    else "Nach dem Abstecken einmalig 0 A: beim Anstecken "
+                    "startet nichts, bevor die Regelung entscheidet."
+                )
+            ),
+        )
 
     native_wallbox_active = _is_enabled(cfg, "wb_native_enable")
     wallbox["wallbox_phase_budget"] = _entry(
@@ -2292,6 +2407,53 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         source="user" if pv_only_stale_guard_configured is not None else "default",
         severity=pv_only_stale_guard_severity,
         message=pv_only_stale_guard_message,
+    )
+
+    # Einschwingfrist des Defizitreglers nach neuem Netzbezug
+    # (wallbox_manager._wallbox_grid_import_settle_s klemmt auf 0 … 30 s).
+    settle_configured = (
+        safe_float(cfg.get("wb_grid_import_settle_s"), 10.0)
+        if _has_user_value(cfg, "wb_grid_import_settle_s")
+        else None
+    )
+    settle_requested = settle_configured if settle_configured is not None else 10.0
+    if not math.isfinite(settle_requested):
+        settle_requested = 10.0
+    settle_effective = min(30.0, max(0.0, settle_requested))
+    settle_severity = "ok"
+    settle_message = (
+        "Einschwingfrist nach neuem Netzbezug: Der Speicher gleicht eine Laständerung erst nach einigen "
+        "Sekunden aus. Solange der Bezug kürzer ansteht und in der Reichweite des Speichers liegt, senkt "
+        "die Wallbox nicht ab. Hausanschluss je Phase, Nutzer-Aus und Bezug über der Speicherreichweite "
+        "wirken sofort."
+    )
+    if settle_configured is not None and not 0.0 <= settle_configured <= 30.0:
+        settle_severity = "warning"
+        settle_message = (
+            "Die Einschwingfrist liegt außerhalb 0 bis 30s und wird auf diesen Bereich begrenzt."
+        )
+    elif settle_configured is not None and settle_effective <= 0.0:
+        settle_message = (
+            "Einschwingfrist aus: Der Defizitregler senkt bei jedem Netzbezug sofort ab (bisheriges "
+            "Verhalten). Kurze Lastspitzen können dann zu Absenkung und erneuter Anhebung führen."
+        )
+    elif settle_configured is not None and settle_effective < 5.0:
+        settle_severity = "warning"
+        settle_message = (
+            "Die Einschwingfrist ist kürzer als die Reaktionszeit des Speichers (etwa 5 bis 8s); die Wallbox "
+            "kann dann Lastspitzen nachregeln, die der Speicher selbst ausgleicht."
+        )
+    wallbox["wb_grid_import_settle_s"] = _entry(
+        key="wb_grid_import_settle_s",
+        label="Einschwingfrist Netzbezug",
+        unit="s",
+        configured=settle_configured,
+        live_value=None,
+        live_key=None,
+        effective=settle_effective,
+        source="user" if settle_configured is not None else "default",
+        severity=settle_severity,
+        message=settle_message,
     )
 
     valid_priority = ["heatpump", "wallbox", "heater"]

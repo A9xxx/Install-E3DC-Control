@@ -35,8 +35,10 @@ try:
     from .config_secret_permissions import apply_config_secret_permissions
     from .Wallbox.soc_tracker import (
         CONFIRMED_MANUAL_SOC_SOURCES,
+        SESSION_ESTIMATE_KEYS,
         vehicle_soc_source_trusted,
         vehicle_soc_max_age_s,
+        vehicle_soc_rule_age_valid,
     )
     from .tariff_schedule import (
         tariff_type as configured_tariff_type,
@@ -54,8 +56,10 @@ except ImportError:  # Aufruf als Script-Modul direkt aus dem Installer-Verzeich
     from config_secret_permissions import apply_config_secret_permissions
     from Wallbox.soc_tracker import (
         CONFIRMED_MANUAL_SOC_SOURCES,
+        SESSION_ESTIMATE_KEYS,
         vehicle_soc_source_trusted,
         vehicle_soc_max_age_s,
+        vehicle_soc_rule_age_valid,
     )
     from tariff_schedule import (
         tariff_type as configured_tariff_type,
@@ -416,6 +420,7 @@ def _vehicle_soc_rule_sample(
         or "soc_source_ts" not in vehicle
     ):
         return None
+    explicit_max_age = max_age_s is not None
     if max_age_s is None:
         max_age_s = vehicle_soc_max_age_s(source, config)
     if isinstance(vehicle.get("soc_source_ts"), bool):
@@ -433,7 +438,14 @@ def _vehicle_soc_rule_sample(
     if (not math.isfinite(soc) or not math.isfinite(source_ts)
         or not math.isfinite(age_s) or not math.isfinite(max_age_s)
         or soc < 0.0 or soc > 100.0 or source_ts <= 0.0
-        or age_s < -300.0 or age_s > max(0.0, max_age_s)):
+        or age_s < -300.0):
+        return None
+    # Kanonische Altersregel: eine sitzungsgebundene Cloud-Fortschreibung gilt,
+    # solange der Tracker sie bestätigt; sonst der Altersvertrag der Quelle.
+    if explicit_max_age:
+        if age_s > max(0.0, max_age_s):
+            return None
+    elif not vehicle_soc_rule_age_valid(vehicle, source, source_ts, now=now, config=config):
         return None
     return {"soc": soc, "source": source, "source_ts": source_ts, "age_s": age_s}
 
@@ -522,6 +534,9 @@ def _manual_soc_rule_sample(
         "soc_source_ts": source_ts,
         "soc_rule_confirmed": True,
     }
+    for key in SESSION_ESTIMATE_KEYS:
+        if key in data:
+            normalized[key] = data[key]
     return _vehicle_soc_rule_sample(normalized, now=now, config=config)
 
 

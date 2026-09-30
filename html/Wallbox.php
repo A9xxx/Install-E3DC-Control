@@ -802,13 +802,7 @@ function wallboxPageLiveVehicleSocUsable($vehicle, $config = [], $now = null) {
     $now = is_numeric($now) ? (float)$now : (float)time();
     if ($sourceTs <= 0.0 || $sourceTs > $now + 300.0) return false;
     $cloudFreshnessS = e3dcVehicleSocCloudFreshnessSeconds($config);
-    $maxAgeS = e3dcVehicleSocPayloadMaxAgeSeconds(
-        $vehicle,
-        $source,
-        $cloudFreshnessS
-    );
-    if ($maxAgeS === null) return false;
-    return ($now - $sourceTs) <= $maxAgeS;
+    return e3dcVehicleSocRuleAgeValid($vehicle, $source, $sourceTs, $now, $cloudFreshnessS);
 }
 
 function getLiveCloudVehiclesForWallbox($config = []) {
@@ -846,13 +840,7 @@ function wallboxPageSocRuleConfirmed($source, $ruleConfirmed = null, $sourceTs =
     $now = is_numeric($now) ? (float)$now : (float)time();
     if ($sourceTs <= 0.0 || $sourceTs > $now + 300.0) return false;
     $cloudFreshnessS = e3dcVehicleSocCloudFreshnessSeconds($config);
-    $maxAgeS = e3dcVehicleSocPayloadMaxAgeSeconds(
-        $agePayload,
-        $source,
-        $cloudFreshnessS
-    );
-    if ($maxAgeS === null) return false;
-    return ($now - $sourceTs) <= $maxAgeS;
+    return e3dcVehicleSocRuleAgeValid($agePayload, $source, $sourceTs, $now, $cloudFreshnessS);
 }
 
 function getDetectedOpenwbVehiclesForWallbox($savedCars, $config = []) {

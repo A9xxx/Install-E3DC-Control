@@ -33,6 +33,108 @@ def number(value):
     return float(value) if type(value) in (int, float) and math.isfinite(value) else None
 
 
+# Toleranz fehlender oder ungültiger E3DC-Livedaten, bevor ein laufender
+# Auftrag zurückgenommen wird. Nutzeraufträge (WW-Sofort, Boost-Knopf, Timer)
+# halten fünf Minuten, budgetgebundene Automatik (PV, Preis, Pre-Dump) so lange
+# wie die Speicherzusage. Während der Lücke gibt es keinen neuen Start und
+# keine Anhebung; Nutzer-Aus, Hardware-/Quellenschutz, Uhrstörung und eine
+# Lücke der Wärmepumpen-Statusdaten wirken weiterhin sofort.
+E3DC_GAP_USER_TOLERANCE_S = 300.0
+E3DC_GAP_AUTO_TOLERANCE_S = 45.0
+
+
+def e3dc_live_gap_update(previous, *, valid, clock_sample):
+    """Verfolgt eine Lücke der E3DC-Livedaten ab dem ersten ungültigen Zyklus.
+
+    Ein gültiger Zyklus beendet die Lücke. Ohne einen in diesem Prozess
+    gesehenen gültigen Zyklus ist ihr Beginn unbekannt: ``elapsed_s`` ist dann
+    ``None`` und gilt als überschrittene Toleranz. Ein Neustart des Energy
+    Managers mitten in einer Lücke schenkt so keine Toleranz. Eine ungültige
+    oder rückwärts laufende Uhr macht die Dauer ebenfalls unbekannt.
+    """
+    previous = previous if isinstance(previous, dict) else {}
+    sample = clock_sample if isinstance(clock_sample, dict) else {}
+    mono = number(sample.get("monotonic_ts"))
+    wall = number(sample.get("wall_ts"))
+    boot = sample.get("boot_id")
+    if valid is True:
+        return {"valid": True, "seen_valid": True, "since_mono": None,
+                "since_ts": None, "boot_id": boot, "elapsed_s": 0.0}
+    seen = previous.get("seen_valid") is True
+    clock_ok = bool(sample.get("valid") is True and mono is not None)
+    if previous.get("valid") is False:
+        since = number(previous.get("since_mono"))
+        since_ts = number(previous.get("since_ts"))
+        if previous.get("boot_id") != boot:
+            since = None
+    else:
+        since = mono if seen and clock_ok else None
+        since_ts = wall
+    elapsed = None
+    if since is not None and clock_ok and mono >= since:
+        elapsed = mono - since
+    else:
+        since = None
+    return {"valid": False, "seen_valid": seen, "since_mono": since,
+            "since_ts": since_ts, "boot_id": boot, "elapsed_s": elapsed}
+
+
+def restart_anchor_ts(command_stop_ts, *, observation_valid, compressor_stop_ts):
+    """Anker der Wiedereinschaltsperre für alle Startwege.
+
+    Mit gültiger Verdichterbeobachtung zählt der gemessene Verdichterstillstand.
+    Ist sie ungültig oder in diesem Prozess noch kein Stillstand gemessen, gilt
+    konservativ der spätere Zeitpunkt aus Rücknahme-Quittung und letztem
+    bekanntem Stillstand.
+    """
+    command = number(command_stop_ts) or 0.0
+    measured = number(compressor_stop_ts) or 0.0
+    if observation_valid is True and measured > 0.0:
+        return measured
+    return max(command, measured)
+
+
+def restored_stop_ts(value, *, now_ts):
+    """Zeitstempel eines Stillstands aus dem Restart-Zustand.
+
+    Übernommen wird nur eine endliche Zahl größer 0. Ein Wert aus der Zukunft,
+    etwa nach einem Uhrsprung, gilt als jetzt, damit eine Wiedereinschaltsperre
+    nie verkürzt wird. Sonst 0.0 (unbekannt).
+    """
+    value = number(value)
+    now = number(now_ts)
+    if value is None or value <= 0.0 or now is None:
+        return 0.0
+    return min(value, now)
+
+
+def restored_restart_anchor_ts(saved, *, now_ts):
+    """Anker der Wiedereinschaltsperre nach einem Neustart, bis ein Stillstand gemessen ist.
+
+    Ein gespeicherter Stillstand ist in diesem Prozess nicht selbst gemessen und
+    zählt deshalb nur zusammen mit der Rücknahme-Quittung: maßgeblich ist der
+    spätere Zeitpunkt. Lief der Verdichter beim Speichern (gemeldeter Lauf oder
+    Start nach dem letzten Stillstand), lag der Stillstand frühestens beim
+    Speicherzeitpunkt; ohne lesbaren Speicherzeitpunkt gilt jetzt. Die Sperre
+    wird so gegenüber der Rücknahme-Quittung nie verkürzt.
+    """
+    saved = saved if isinstance(saved, dict) else {}
+    now = number(now_ts)
+    if now is None:
+        return 0.0
+    command = restored_stop_ts(saved.get("wp_last_pv_boost_stop_ts"), now_ts=now)
+    stop = restored_stop_ts(saved.get("wp_compressor_last_stop_ts"), now_ts=now)
+    start = restored_stop_ts(saved.get("wp_compressor_last_start_ts"), now_ts=now)
+    anchor = max(command, stop)
+    if saved.get("wp_compressor_running") is True or start > stop:
+        try:
+            saved_ts = restored_stop_ts(datetime.fromisoformat(str(saved.get("ts"))).timestamp(), now_ts=now)
+        except (TypeError, ValueError, OverflowError, OSError):
+            saved_ts = 0.0
+        anchor = max(anchor, saved_ts or now)
+    return anchor
+
+
 def channel_observations(status):
     """Nur unverfälschte Kanalwerte; ein ungültiger Nachbarkanal sperrt nicht mit."""
     status = status if isinstance(status, dict) else {}
@@ -213,8 +315,19 @@ class LuxtronikChannelController:
                     or blocks.intersection({"manual_source_temperature_stop", "manual_low_soc_stop",
                                             "pre_control_independent_safety_stop", "independent_safety_stop"}))
         protection_reason = str(pv_output.get("protection_reason") or pv_demand.get("protection_reason") or "")
-        if protection_reason not in ("", "user_off"):
+        # Eine abgelaufene E3DC-Datenlücke meldet der PV-Vertrag nur für seinen
+        # eigenen Auftrag. Je Kanal gilt unten die Toleranz seines Besitzers.
+        e3dc_scoped = bool(protection_reason == "invalid_control_data"
+                           and pv_output.get("protection_scope") == "e3dc_live_gap")
+        if protection_reason not in ("", "user_off") and not e3dc_scoped:
             hard = True
+        gap = ctx.get("e3dc_live_gap") if isinstance(ctx.get("e3dc_live_gap"), dict) else {}
+        e3dc_gap = gap.get("valid") is False
+        gap_elapsed = number(gap.get("elapsed_s")) if e3dc_gap else None
+
+        def gap_tolerance(state):
+            owner_class = state["owner"] if state["possible_effect"] else None
+            return E3DC_GAP_USER_TOLERANCE_S if owner_class == "manual" else E3DC_GAP_AUTO_TOLERANCE_S
         status_fresh = bool((ctx.get("wp_status") or {}).get("valid") is True
                             and (ctx.get("wp_status") or {}).get("source_fresh") is True)
         if not status_fresh or self.clock_fault:
@@ -235,6 +348,8 @@ class LuxtronikChannelController:
             "predump": bool(ctx.get("predump_heatpump_active")),
             "manual": manual_on or ww_active,
         }
+        pv_live = bool((pv_output.get("start") or pv_output.get("keep")) and not pv_output.get("withdraw"))
+        live_request = {}
         for name, state in self.checkpoint["channels"].items():
             current_request = owner_live.get(state["owner"])
             if state["owner"] == "manual":
@@ -242,6 +357,9 @@ class LuxtronikChannelController:
                 current_request = (bool(ctx.get("WW_TIMER_ENABLE"))
                                    and number(ctx.get("ww_timer_target_c")) == state["target_c"]
                                    if timer_owned else manual_on or (name == "ww" and ww_active))
+            live_request[name] = bool(
+                pv_live and ((pv_output.get("channels") or {}).get(name) or {}).get("active")
+                if state["owner"] == "pv" else current_request)
             if state["possible_effect"] and state["owner"] != "pv" and current_request:
                 if not str(state["request_id"]).startswith("timer:") or desired[name] is None:
                     desired[name] = self._desired(state["owner"], name, state["target_c"], identity=state)
@@ -265,6 +383,21 @@ class LuxtronikChannelController:
                 for oldkey in list(self.pending_offers):
                     if oldkey[1] == offer["channel"] and oldkey[0] in ("price", "predump"):
                         del self.pending_offers[oldkey]
+        # Sperrt der Boost-Mindest-SoC den Start, endet der manuelle Boost
+        # regulär oder ist sein Auftrag abgelaufen, startet ein vorgemerktes
+        # manuelles Angebot keinen Kanal, auf dem der Boost nicht schon läuft.
+        if blocks.intersection({"manual_low_soc_start_blocked", "manual_low_soc_release",
+                                "manual_command_expired"}):
+            def manual_boost_running(channel):
+                own = self.checkpoint["channels"][channel]
+                return bool(own["possible_effect"] and own["owner"] == "manual"
+                            and str(own["request_id"]).startswith("manual:"))
+            for key in [key for key in self.pending_offers
+                        if key[0] == "manual" and not manual_boost_running(key[1])]:
+                del self.pending_offers[key]
+            offers = [offer for offer in offers
+                      if not (offer["owner"] == "manual" and offer["mode"] == 1
+                              and not manual_boost_running(offer["channel"]))]
         offers = list(self.pending_offers.values()) + offers
         priority = {"pv": 0, "predump": 1, "price": 2, "manual": 3}
         def rank(value):
@@ -284,8 +417,9 @@ class LuxtronikChannelController:
                 if offer["mode"] == 0 and desired[name] and desired[name]["owner"] == "pv":
                     desired[name] = None
                 continue
-            if source == "timer" and (ww_pending or ww_active or (
-                    desired[name] is not None and rank(desired[name]) >= 0)):
+            # Der Komforttimer ist eine Grundstellung, kein positiver Auftrag.
+            # Seine Absicht wird unten durch denselben Kanalausgang angewendet.
+            if source == "timer":
                 continue
             if offer["mode"] == 1:
                 if desired[name] is None or priority[owner] >= rank(desired[name]):
@@ -295,7 +429,8 @@ class LuxtronikChannelController:
                 desired[name] = None
         # WW-Sofort hat Vorrang vor HZ; sein bloßes Dateiflag ist jedoch keine
         # Vollmacht zur Übernahme eines fremden SHI-Sollwerts.
-        if manual_on and not blocks.intersection({"manual_command_expired", "manual_source_temperature_stop", "manual_low_soc_stop"}):
+        if manual_on and not blocks.intersection({"manual_command_expired", "manual_source_temperature_stop", "manual_low_soc_stop",
+                                                  "manual_low_soc_start_blocked", "manual_low_soc_release"}):
             if ctx.get("wp_write_allowed") and not any(offer["owner"] == "manual" for offer in offers):
                 if number(ctx.get("at_mittel")) is not None and number(ctx.get("HEIZGRENZE_TEMP")) is not None:
                     summer = ctx["at_mittel"] > ctx["HEIZGRENZE_TEMP"]
@@ -339,13 +474,34 @@ class LuxtronikChannelController:
                              and now - last_start < minimum_run)
         signal_hold = bool((ctx.get("heatpump_positive_signal_window") or {}).get("minimum_signal_hold_active"))
         actions = []
+        hold = {}
+        gap_withdraw_at = {}
         for name in CHANNELS:
             state = self.checkpoint["channels"][name]
+            # Eine E3DC-Datenlücke nimmt einen laufenden Kanal erst nach der
+            # Toleranz seines Besitzers zurück; eine unbekannte Dauer zählt als
+            # abgelaufen. Ein Kanal ohne mögliche eigene Wirkung hat nichts
+            # zurückzunehmen. Während der Lücke gibt es keinen neuen Start und
+            # keine Anhebung.
+            gap_expired = bool(e3dc_gap and state["possible_effect"]
+                               and (gap_elapsed is None or gap_elapsed >= gap_tolerance(state)))
+            channel_hard = bool(hard or gap_expired)
+            if channel_hard:
+                desired[name] = None
+            elif e3dc_gap and desired[name] is not None:
+                same_running = bool(state["possible_effect"] and all(
+                    state[key] == desired[name][key] for key in ("owner", "request_id", "revision", "target_c")))
+                if not same_running:
+                    desired[name] = (self._desired(state["owner"], name, state["target_c"], identity=state)
+                                     if state["possible_effect"] and live_request.get(name) else None)
+                    hold[name] = {"reason": "e3dc_live_gap", "until_ts": None}
+            if e3dc_gap and not channel_hard and state["possible_effect"]:
+                gap_withdraw_at[name] = now + max(0.0, gap_tolerance(state) - (gap_elapsed or 0.0))
             # Das vor jedem Connect gelesene Nutzerflag schützt eine bereits
             # belegte, außerhalb dieses Automaten liegende WW-Einstellung.
             observed_mode = raw_mode(observations[name]["raw_mode"])
             user_channel_pending = bool(name == "ww" and ww_pending and state["owner"] != "manual")
-            if (user_channel_pending and automatic and not user_off and not hard
+            if (user_channel_pending and automatic and not user_off and not channel_hard
                     and (not observations[name]["valid"] or observed_mode is None)):
                 actions.append({"channel": "ww", "outcome": "user_request_waits_for_ownership_readback"})
                 continue
@@ -361,19 +517,57 @@ class LuxtronikChannelController:
             if (ctx.get("heatpump_channel_stop_allowed") or {}).get(name) is False:
                 stop_allowed = False
             if desired[name] and not state["possible_effect"]:
-                last_stop = number(ctx.get("wp_last_pv_boost_stop_ts")) or 0.0
-                takt_wait = bool(ctx.get("WP_TAKT_PROTECT") and last_stop > 0 and now < last_stop + restart_hold)
+                # Die Wiedereinschaltsperre zählt ab dem gemessenen
+                # Verdichterstillstand, für alle Startwege gleich.
+                anchor = restart_anchor_ts(
+                    ctx.get("wp_last_pv_boost_stop_ts"),
+                    observation_valid=ctx.get("wp_compressor_observation_valid"),
+                    compressor_stop_ts=ctx.get("wp_compressor_last_stop_ts"))
+                takt_until = anchor + restart_hold
+                takt_wait = bool(ctx.get("WP_TAKT_PROTECT") and anchor > 0 and now < takt_until)
+                waits = [(takt_until, "restart_block")] if takt_wait else []
+                if state["stop_until"] > now:
+                    waits.append((state["stop_until"], "stop_until"))
+                if waits:
+                    until, reason = max(waits)
+                    hold[name] = {"reason": reason, "until_ts": until}
                 if (not ctx.get("wp_write_allowed") or takt_wait or self.clock_fault):
                     desired[name] = None
+            baseline = number(ctx.get("WW_ECO")) if name == "ww" else None
+            if name == "ww" and ctx.get("WW_TIMER_ENABLE") and automatic and not user_off and not channel_hard:
+                baseline = number(ctx.get("ww_timer_target_c"))
+            timer_offer = self.pending_offers.get(("timer", "ww")) if name == "ww" else None
+            previous_baseline = state["baseline_target_c"]
+            if previous_baseline is None:
+                previous_baseline = number(ctx.get("WW_ECO"))
+            observed_target = number(observations[name].get("target_c"))
+            timer_idle = bool(
+                timer_offer and desired[name] is None and not state["possible_effect"]
+                and state["state"] in ("frei", "fremd", "aufgegeben") and not state["alarm"]
+                and not ww_pending and not ww_active and not any(owner_live.values())
+                and automatic and not user_off and not channel_hard and not e3dc_gap
+                and ctx.get("wp_write_allowed") and stop_allowed
+                and observations[name]["valid"] and observed_mode in (0, 1)
+                and observed_target is not None
+                and baseline is not None and timer_offer["target_c"] == baseline
+                and (observed_mode != 1 or observed_target != baseline))
+            if (name == "ww" and not state["possible_effect"] and not timer_idle
+                    and state["state"] in ("frei", "fremd", "aufgegeben") and ctx.get("WW_TIMER_ENABLE")
+                    and automatic and not user_off and not channel_hard):
+                # Bis zur ausführbaren Timer-Absicht bleibt die zuletzt bekannte
+                # Grundstellung die Besitzreferenz, auch am Fensterwechsel.
+                baseline = previous_baseline
             old = copy.deepcopy(self.checkpoint)
             self.checkpoint, action = advance(
                 self.checkpoint, name, now_s=now, observation=observations[name],
                 desired=desired[name], stop_allowed=bool(stop_allowed),
-                automatic_enabled=bool(automatic and not user_off), protection=bool(hard),
-                user_hold_s=restart_hold, signal_hold_s=600.0,
-                manual_owned=bool(manual_owned and automatic and not user_off and not hard),
-                baseline_target_c=number(ctx.get("WW_ECO")) if name == "ww" else None,
+                automatic_enabled=bool(automatic and not user_off), protection=bool(channel_hard),
+                user_hold_s=0.0 if timer_idle else restart_hold, signal_hold_s=600.0,
+                manual_owned=bool(manual_owned and automatic and not user_off and not channel_hard),
+                baseline_target_c=baseline,
                 stop_reason=("user_off" if user_off else (protection_reason or "hard_protection") if hard else
+                             "invalid_control_data" if channel_hard else
+                             "timer_target" if timer_idle else
                              "policy_release" if desired[name] is None and any(
                                  offer["channel"] == name and offer["mode"] == 0
                                  for offer in offers) else None),
@@ -381,13 +575,18 @@ class LuxtronikChannelController:
             self.persisted = self._persist()
             if action is None:
                 continue
-            if action["kind"] == "start" and not self.persisted:
+            if (action["kind"] == "start" or timer_idle) and not self.persisted:
                 # Kein IO, also weder Transportnote noch behauptete mögliche
                 # neue Wirkung. Ein Folgelauf muss den Intent erneut sichern.
                 self.checkpoint = old
                 actions.append({"action": action, "outcome": "intent_not_durable"})
                 continue
             outcome = wp.dispatch_channel_action(action)
+            if (name == "ww" and outcome == "written" and timer_offer
+                    and action["mode"] == 1 and action["target_c"] == timer_offer["target_c"]):
+                # Nach erfolgreichem Anwenden entscheidet wieder die bestehende
+                # Mismatch-/Heartbeat-Logik über eine neue Timerabsicht.
+                self.pending_offers.pop(("timer", "ww"), None)
             completed_clock = getattr(wp, "last_channel_transport_sample", None)
             if isinstance(completed_clock, dict):
                 now = self._time(completed_clock)
@@ -411,7 +610,12 @@ class LuxtronikChannelController:
             self.persisted = self._persist()
             actions.append({"action": action, "outcome": outcome})
         wp.channel_intents = []
+        # Diagnose: Grund und Ende einer Zurückhaltung je Kanal sowie der
+        # Rücknahmezeitpunkt laufender Aufträge während einer E3DC-Datenlücke.
         self.last_result = {"checkpoint": copy.deepcopy(self.checkpoint), "actions": actions,
                             "desired": desired, "checkpoint_durable": self.persisted,
-                            "load_status": self.load_status, "clock_fault": self.clock_fault}
+                            "load_status": self.load_status, "clock_fault": self.clock_fault,
+                            "hold": hold,
+                            "e3dc_gap": {"active": e3dc_gap, "elapsed_s": gap_elapsed,
+                                         "withdraw_at_ts": gap_withdraw_at}}
         return copy.deepcopy(self.last_result)

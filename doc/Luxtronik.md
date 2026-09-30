@@ -4,7 +4,7 @@
 > Dieses System unterstützt mehrere native Integrationen:
 > 1. **Luxtronik 2.0 / 2.1** (Diese Datei)
 > 2. **[IDM Wärmepumpen (Modbus-TCP)](IDM_Integration.md)**
-> 3. **[Stiebel Eltron ISG / WPM (read-only Live-Daten)](Stiebel_Eltron_ISG.md)**
+> 3. **[Stiebel Eltron ISG / WPM (Live-Daten, experimenteller SG-Ready-Ausgang)](Stiebel_Eltron_ISG.md)**
 
 Dieses Modul erweitert **E3DC-Control** um eine intelligente Steuerung für Wärmepumpen mit **Luxtronik 2.0 / 2.1** Regler (z.B. Alpha Innotec, Novelan). Es nutzt freigegebenes Budget aus Storage Manager, Pre-Dump oder Preislogik, um Warmwasser oder Heizung gezielt anzuheben ("Boost") und so Energie thermisch zu speichern.
 
@@ -95,6 +95,11 @@ Verarbeitungszeit; danach wird der Sollwert genau einmal erneut gesetzt und
 bei erneutem Verlust der Befehl mit Grund beendet. Die Seite zeigt
 „WW-Sofort aktiv bis HH:MM“ beziehungsweise den Endegrund; das Protokoll des
 Wärmepumpen-Managers enthält je Start, Ende und Abbruch eine Zeile.
+Hält eine Sperre den Befehl zurück, etwa die Wiedereinschaltsperre nach einer
+Rücknahme, bleibt er angefordert und meldet sich als „unterbrochen, Neustart ab
+HH:MM“; das Protokoll enthält dazu je Unterbrechung eine Zeile. Endet die
+Sperre erst mit oder nach dem Befehl, lautet die Meldung „kein Neustart vor
+Ablauf des Befehls“.
 Ist die Wärmepumpen-Automatik ausgeschaltet oder ein manueller
 Wärmepumpen-Boost aktiv, wird der Befehl nicht ausgeführt; die Seite zeigt dann
 „WW-Sofort angefordert“, bis die Automatik wieder übernimmt oder die Dauer
@@ -129,6 +134,45 @@ Nach einem Schutzentzug gilt eine Wiedereinschaltsperre von mindestens zehn
 Minuten. Nach zwei Entzügen aus demselben Geräteschutzgrund bleibt der
 PV-Boost bis zum nächsten Tag gesperrt; der Grund wird angezeigt.
 Automatik-Aus startet ebenfalls die konfigurierte Wiedereinschaltsperre.
+
+Die Wiedereinschaltsperre (`wp_restart_block_min`) zählt ab dem gemessenen
+Verdichterstillstand, nicht ab der Rücknahme des Sollwerts. Das gilt für
+PV-, Preis- und Nutzeraufträge gleich. Ist der Verdichterzustand nicht
+messbar, zählt sie ab dem späteren Zeitpunkt aus bestätigter Rücknahme und
+letztem bekanntem Stillstand. Nach einem Neustart des Energy Managers zählt
+sie, bis wieder ein Stillstand gemessen ist, ab dem spätesten bekannten
+Zeitpunkt aus Rücknahme und gespeichertem Stillstand; lief der Verdichter beim
+Speichern, frühestens ab dem Speicherzeitpunkt. Zusätzlich sperrt jede Rücknahme den
+Kanal ab ihrem Zeitpunkt für `wp_restart_block_min`, nach einem Schutzentzug
+für mindestens zehn Minuten. Ein neuer Start wartet bis zum späteren der
+beiden Enden.
+
+### Aussetzer der E3DC-Livedaten
+
+Fehlen die E3DC-Livedaten oder sind sie ungültig (Datei fehlt, älter als
+15 Sekunden oder ohne gültigen RSCP-/Netzpunktvertrag), nimmt der Energy
+Manager einen laufenden Auftrag nicht sofort zurück:
+
+- Nutzeraufträge (**1x WARM WASSER**, manueller Boost) und der
+  Warmwasser-Timer laufen bis zu fünf Minuten weiter.
+- Automatische Aufträge aus freigegebenem Budget (PV-Überschuss, Preis,
+  Pre-Dump) laufen bis zu 45 Sekunden weiter, so lange wie die Zusage der
+  Speicherregelung gilt.
+
+Die Frist beginnt mit dem ersten ungültigen Zyklus; ein gültiger Zyklus
+beendet sie. Während der Lücke startet kein neuer Auftrag, und kein Sollwert
+wird angehoben. Nach Ablauf der Frist wird der Auftrag wie bei jedem
+Schutzentzug zurückgenommen (Grund `invalid_control_data`, danach gilt die
+Wiedereinschaltsperre). Nach einem Neustart des Energy Managers oder dem Ende
+eines Standbys als HA-Slave gilt die Frist erst wieder, wenn einmal gültige
+Daten vorlagen; ein Neustart mitten in einer Lücke verlängert sie nicht.
+Sofort wirken weiterhin: „Automatik darf steuern“ aus, Hardware- und
+Quellenschutz, eine gestörte Uhr und fehlende oder veraltete Statusdaten der
+Luxtronik selbst; für sie gilt keine Frist. Die unabhängige
+Sicherheitsabschaltung (Ladestand unter `min_soc` minus 5 Prozentpunkte oder
+mehr als 2.500 W Netzbezug) greift sofort, sobald gültige Daten sie belegen;
+ein fehlender Ladestand zählt nicht als 0 %. Die Fehlermeldung im Protokoll nennt den Grund: Datei fehlt, Alter in
+Sekunden oder ungültiger Vertrag.
 
 ### Netzboost (experimentell)
 
@@ -201,6 +245,7 @@ Die Bearbeitung erfolgt am einfachsten über das **Web-Interface** (Config Edito
 | `luxtronik_ip` | IP-Adresse der Wärmepumpe im lokalen Netzwerk. | `0.0.0.0` (nicht konfiguriert) |
 | `grid_start_limit` | Startschwelle in Watt; **negativ** bedeutet Einspeisung. Die zentrale Verteilung berücksichtigt Verbraucherprioritäten. Kein Ersatz für die maximale elektrische Geräteaufnahme. | `-3500` |
 | `min_soc` | Mindest-Ladestand der Hausbatterie für neue Boost-Starts. Die physische Notstromreserve wird zusätzlich geschützt. | `80` |
+| `manual_boost_min_soc` | Mindest-Ladestand der Hausbatterie für den Start eines manuellen Boosts. Sinkt er während eines laufenden Boosts darunter, endet der Boost regulär nach Mindestlaufzeit und Signalhaltezeit; unter `min_soc` minus 5 Prozentpunkte greift die sofortige Sicherheitsabschaltung. Ein Start setzt deshalb einen Ladestand von mindestens `manual_boost_min_soc` und mindestens `min_soc` minus 5 Prozentpunkte voraus. Das reguläre Ende kann nur eintreten, wenn `manual_boost_min_soc` über `min_soc` minus 5 Prozentpunkte liegt; sonst beendet die Sicherheitsabschaltung den Boost vorher. Ein fehlender Ladestand zählt nicht als 0 %. | `25` |
 | `heizgrenze_temp` | Außentemperatur-Grenze in °C zwischen Sommer- und Winterbetrieb. | `10.0` |
 | `wws` | Warmwasser-Sollwert im Boost-Modus im Sommer. | `50.0` |
 | `www` | Warmwasser-Sollwert im Boost-Modus im Winter. | `48.0` |
@@ -247,7 +292,7 @@ Vorreservierung bei.
 | `wp_pv_grid_max_w` | Erlaubte Netz-Überbrückungsleistung in W. `0` sperrt diese Quelle. | `0` |
 | `wp_pv_grid_limit_wh` | Netzenergie für PV-Überbrückung in den jeweils letzten 24 Stunden. `0` sperrt diese Quelle. | `0` |
 | `wp_min_runtime_min` | Geschützte Verdichterlaufzeit ab bestätigtem physischem Start. | `30` |
-| `wp_restart_block_min` | Wiedereinschaltsperre nach bestätigtem Verdichterstopp. Nach der schutzbedingten Rücknahme eines ausgespielten PV-Auftrags gilt sie ebenfalls, dann mindestens 10 Minuten, auch bei `0`. | `20` |
+| `wp_restart_block_min` | Wiedereinschaltsperre ab dem gemessenen Verdichterstillstand, für alle Startwege gleich; nach einem Neustart bis zum nächsten gemessenen Stillstand ab dem spätesten bekannten Zeitpunkt aus Rücknahme und gespeichertem Stillstand; ohne messbaren Verdichterzustand ab dem späteren Zeitpunkt aus Rücknahme und letztem bekanntem Stillstand. Zusätzlich sperrt jede Rücknahme den Kanal ab ihrem Zeitpunkt für diese Dauer, nach einem Schutzentzug mindestens 10 Minuten, auch bei `0`. Maßgeblich ist das spätere Ende. | `20` |
 | `pv_boost_delay` | Dauer der stabilen PV-Startqualifikation vor einer verbindlichen Startzuteilung in Sekunden. | `30` |
 | `wp_pv_reaction_s` | Reaktionsfrist für Messung, Kommunikation und wirksame Lastanpassung in Sekunden. | `30` |
 | `wp_pv_start_wait_s` | Wartefrist auf den tatsächlichen Verdichterstart; mindestens 600 Sekunden. So lange bleibt die Startleistung reserviert, danach geht sie an die nachrangigen Verbraucher. | `600` |

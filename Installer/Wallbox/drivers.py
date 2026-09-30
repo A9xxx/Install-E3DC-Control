@@ -6063,6 +6063,40 @@ class OpenWBProCharger(WallboxDriver):
     # im Bereich 20–30 s. 25 s bleibt innerhalb dieses Herstellerfensters.
     HEARTBEAT_LEASE_REFRESH_MAX_S = 25.0
 
+    # Frische des letzten connect.php-Readbacks im Treiberzustand. Der
+    # Manager normalisiert nur seine Rückgabekopie (_observation_status); die
+    # Pro-Ausgangsprüfungen (Wiederanlauf nach phasetarget, Start-Wake-up,
+    # set_phases) lesen dagegen ``self.state``. Nur ein gültiger
+    # connect.php-GET belegt die Frische; jede andere Lesefläche und jeder
+    # Lesefehler entfernt sie, damit kein alter Beleg einen späteren Fehler
+    # überdauert. Entfernen statt ``False``: Die SECC-Rückfallkopie bleibt
+    # für die Managernormalisierung unverändert.
+    CONNECT_READBACK_FRESHNESS_KEYS = (
+        "driver_status_valid", "driver_status_stale", "driver_status_degraded",
+        "driver_status_age_s", "driver_status_reason",
+        "driver_status_last_ok_ts", "driver_status_last_sample_ts",
+    )
+    # Die Frische im Treiberzustand altert nicht von selbst; ein Leser, der
+    # sich auf sie stützt, bindet sie zusätzlich an das Alter des letzten
+    # gültigen Readbacks (Manager-Zyklus 2 s, Statusfrische 10 s).
+    CONNECT_READBACK_MAX_AGE_S = 10.0
+
+    def _record_connect_readback_freshness(self, fresh):
+        if not fresh:
+            for key in self.CONNECT_READBACK_FRESHNESS_KEYS:
+                self.state.pop(key, None)
+            return
+        now_ts = int(time.time())
+        self.state.update({
+            "driver_status_valid": True,
+            "driver_status_stale": False,
+            "driver_status_degraded": False,
+            "driver_status_age_s": 0.0,
+            "driver_status_reason": "fresh",
+            "driver_status_last_ok_ts": now_ts,
+            "driver_status_last_sample_ts": now_ts,
+        })
+
     def __init__(self, ip, wb_id=1, config=None):
         super().__init__(ip, wb_id)
         self.config = config or {}
@@ -7343,6 +7377,10 @@ class OpenWBProCharger(WallboxDriver):
                 audit_allowed=False,
             ):
                 return False
+            if isinstance(payload, dict) and "ampere" in payload:
+                # Zähler nur für tatsächlich ausgelöste Sollstrom-POSTs
+                # (Gerätekontakt, auch wenn die Antwort danach scheitert).
+                self._ampere_wire_seq = int(getattr(self, "_ampere_wire_seq", 0) or 0) + 1
             response = _requests.post(self.status_url, data=payload, timeout=5)
             response.raise_for_status()
             return True
@@ -8027,6 +8065,8 @@ class OpenWBProCharger(WallboxDriver):
         self._write_openwb_pro_status()
 
     def _secc_observation_status(self, data, source):
+        # Die SECC-Diagnosefläche ist kein connect.php-Readback.
+        self._record_connect_readback_freshness(False)
         port = data.get("port0", data)
         if not isinstance(port, dict) or not port:
             return None
@@ -8070,6 +8110,8 @@ class OpenWBProCharger(WallboxDriver):
         Antwort bleibt deshalb für die Übergabe strikt unbestätigt.
         """
 
+        # Erst ein vollständig übernommener gültiger GET belegt neue Frische.
+        self._record_connect_readback_freshness(False)
         data = self._get_json(self.status_url)
         connect_valid, connect_error = self._valid_connect_status_payload(data)
         if connect_valid:
@@ -8079,6 +8121,7 @@ class OpenWBProCharger(WallboxDriver):
                 # Diagnose, Fehler und Nicht-JSON-Antworten zählen nicht.
                 self._last_heartbeat_lease_refresh_ts = time.time()
             self._update_from_connect_status(data)
+            self._record_connect_readback_freshness(True)
             values = _observation_channels(
                 power=data.get("power_all"), powers=data.get("powers"), currents=data.get("currents"),
                 # Istphasen ausschließlich aus vollständigen Stromkanälen dieser Antwort.
@@ -8203,10 +8246,16 @@ class OpenWBProCharger(WallboxDriver):
             reported_target = int(float(self.state.get("phases_target", 0) or 0))
         except (TypeError, ValueError):
             reported_target = 0
+        try:
+            readback_age_s = now - float(self.state.get("driver_status_last_ok_ts"))
+        except (TypeError, ValueError):
+            readback_age_s = float("inf")
         fresh_target_readback = bool(
             self.state.get("driver_status_valid") is True
             and self.state.get("driver_status_stale") is not True
             and self.state.get("driver_status_degraded") is not True
+            and self.state.get("driver_status_glitch") is not True
+            and -1.0 <= readback_age_s <= self.CONNECT_READBACK_MAX_AGE_S
             and reported_target == phases
         )
         if fresh_target_readback and not bool(require_wire_receipt):

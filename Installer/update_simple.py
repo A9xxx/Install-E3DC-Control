@@ -1838,6 +1838,159 @@ def _select_stale_release_venvs(
     return stale, legacy
 
 
+SYSTEMD_UNIT_DIR = Path("/etc/systemd/system")
+_UNIT_FILE_MAX_BYTES = 65536
+
+
+def _rebind_catalog_units_to_active_venv(
+    active_python: Path,
+    units: Iterable[str],
+    *,
+    unit_dir: Path | None = None,
+) -> list[str]:
+    """Bindet installierte Katalog-Units mit Alt-venv-Interpreter an das aktive venv.
+
+    Gedacht für Units, die der Updater nicht neu rendert, etwa deaktivierte und
+    inaktive. Geändert wird ausschließlich der Interpreterpfad in den
+    ``Exec*``-Zeilen; Aktivierung, Laufzustand, Rechte, übrige Zeilen und
+    Drop-ins bleiben unberührt. Fehlt der Interpreter im aktiven venv, bleibt
+    die Unit unverändert und die Warnung nennt sie. Ein Fehler ergibt nie
+    einen Updateabbruch.
+    """
+
+    warnings: list[str] = []
+    unit_dir = SYSTEMD_UNIT_DIR if unit_dir is None else unit_dir
+    active_venv = Path(os.path.abspath(active_python)).parent.parent
+    pattern = re.compile(
+        re.escape(str(active_venv.parent))
+        + r"/(?P<venv>\.venv_e3dc|venv_e3dc_release_[a-z0-9_]{1,80}(?:_[1-9][0-9]?)?)"
+        + r"/bin/(?P<python>python[0-9.]*)(?=[\s\"']|$)"
+    )
+    for raw_unit in sorted({_normalize_unit(unit) for unit in units}):
+        path = unit_dir / raw_unit
+        try:
+            metadata = path.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_size > _UNIT_FILE_MAX_BYTES
+            ):
+                continue
+            payload = path.read_bytes()
+            lines = payload.decode("utf-8").splitlines(keepends=True)
+            rebound: set[str] = set()
+            unresolved: set[str] = set()
+
+            def bind(match: re.Match[str]) -> str:
+                old_name = match.group("venv")
+                if old_name == active_venv.name:
+                    return match.group(0)
+                target = active_venv / "bin" / match.group("python")
+                if not target.is_file():
+                    unresolved.add(old_name)
+                    return match.group(0)
+                rebound.add(old_name)
+                return str(target)
+
+            rendered = [
+                pattern.sub(bind, line)
+                if line.lstrip().startswith("Exec") and "=" in line
+                else line
+                for line in lines
+            ]
+            if rebound:
+                _atomic_write_file(
+                    path,
+                    "".join(rendered).encode("utf-8"),
+                    uid=metadata.st_uid,
+                    gid=metadata.st_gid,
+                    mode=stat.S_IMODE(metadata.st_mode),
+                )
+                print(
+                    f"[OK] Die Unit {raw_unit} zeigte noch auf die Python-Umgebung "
+                    f"{', '.join(sorted(rebound))} und nutzt jetzt {active_venv.name}; "
+                    "Aktivierung und Laufzustand blieben unverändert.",
+                    flush=True,
+                )
+            if unresolved:
+                warnings.append(
+                    f"Die Unit {raw_unit} zeigt noch auf die Python-Umgebung "
+                    f"{', '.join(sorted(unresolved))}; der Interpreter fehlt in "
+                    f"{active_venv.name}, sie wurde nicht umgebunden."
+                )
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            detail = str(exc).strip() or exc.__class__.__name__
+            warnings.append(
+                f"Die Unit {raw_unit} konnte nicht auf die aktive Python-Umgebung "
+                f"umgebunden werden: {detail}"
+            )
+    return warnings
+
+
+def _units_referencing_venv(
+    venv: Path,
+    *,
+    unit_dir: Path | None = None,
+) -> list[str]:
+    """Nennt systemd-Units (samt Drop-ins), deren Exec-/Umgebungszeilen ein venv nennen.
+
+    Kommentare zählen nicht. Ist etwas nicht lesbar, steht es mit Hinweis in der
+    Liste, damit ein venv im Zweifel nicht als ungenutzt gemeldet wird.
+    """
+
+    unit_dir = SYSTEMD_UNIT_DIR if unit_dir is None else unit_dir
+    needle = str(Path(os.path.abspath(venv))) + "/"
+    found: set[str] = set()
+    try:
+        names = sorted(os.listdir(unit_dir))
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return [f"{unit_dir} (nicht lesbar)"]
+
+    def scan(path: Path, unit: str) -> None:
+        try:
+            metadata = path.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size > _UNIT_FILE_MAX_BYTES
+            ):
+                return
+            text = path.read_bytes().decode("utf-8", errors="replace")
+        except FileNotFoundError:
+            return
+        except OSError:
+            found.add(f"{unit} (nicht lesbar)")
+            return
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped and stripped[0] not in "#;" and needle in stripped:
+                found.add(unit)
+                return
+
+    for name in names:
+        path = unit_dir / name
+        if name.endswith(".service"):
+            scan(path, name)
+        elif name.endswith(".service.d"):
+            try:
+                if not stat.S_ISDIR(path.lstat().st_mode):
+                    continue
+                dropins = sorted(os.listdir(path))
+            except FileNotFoundError:
+                continue
+            except OSError:
+                found.add(f"{name[:-2]} (Drop-ins nicht lesbar)")
+                continue
+            for dropin in dropins:
+                if dropin.endswith(".conf"):
+                    scan(path / dropin, name[:-2])
+    return sorted(found)
+
+
 def _prune_stale_release_venvs(
     install_user: str,
     active_venv: Path,
@@ -1900,6 +2053,16 @@ def _prune_stale_release_venvs(
                     f"werden; sie kann manuell gelöscht werden: rm -rf {shlex.quote(str(venv))}"
                 )
         for venv in legacy:
+            users = _units_referencing_venv(venv)
+            if users:
+                print(
+                    f"[HINWEIS] Das Alt-venv {venv} wird noch von {', '.join(users)} "
+                    "genutzt und bleibt erhalten; diese Units konnten nicht sicher "
+                    "auf die aktive Python-Umgebung umgebunden werden. Entferne das "
+                    "Alt-venv erst, wenn keine Unit mehr darauf zeigt.",
+                    flush=True,
+                )
+                continue
             print(
                 f"[HINWEIS] Das Alt-venv {venv} wird nicht mehr verwendet und kann manuell "
                 f"entfernt werden: rm -rf {shlex.quote(str(venv))}",
@@ -2921,6 +3084,15 @@ def _retry_backup_retention_after_confirmed_start(
             "Backup-Limit-Lauf meldete einen Bereinigungsfehler. Das aktuelle "
             "Vollbackup bleibt geschützt."
         )
+    try:
+        from Installer.backup_retention import update_evidence_hint
+
+        evidence_hint = update_evidence_hint(retention)
+    except Exception:
+        evidence_hint = None
+    if evidence_hint:
+        print(f"[INFO] {evidence_hint}", flush=True)
+
     if retention.get("limit_satisfied") is True and not warnings:
         print(
             "[OK] Backup-Limit nach bestätigtem Dienststart angewendet.",
@@ -6731,6 +6903,19 @@ def _repair_units_and_permissions(
                 ),
                 service_prestate.masked,
                 prepared_npm_units,
+            )
+        )
+        # Deaktivierte, inaktive Katalog-Units rendert der Updater nicht neu;
+        # ihr Interpreter soll trotzdem nicht auf ein Alt-venv zeigen.
+        masked_catalog = {_normalize_unit(unit) for unit in service_prestate.masked}
+        warnings.extend(
+            _rebind_catalog_units_to_active_venv(
+                venv_python,
+                (
+                    unit
+                    for unit in service_prestate.catalog_present
+                    if _normalize_unit(unit) not in masked_catalog
+                ),
             )
         )
     _assert_named_directory_binding(target_binding)

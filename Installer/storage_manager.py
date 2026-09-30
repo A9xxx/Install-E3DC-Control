@@ -56,6 +56,7 @@ from Wallbox.modes import (  # noqa: E402
 )
 from Wallbox import phase_transition as wallbox_phase_transition_policy  # noqa: E402
 from Wallbox import start_hold as wallbox_start_hold_policy  # noqa: E402
+from Wallbox import decision as wallbox_decision  # noqa: E402
 import consumer_priority  # noqa: E402
 import heatpump_pv_contract as heatpump_pv_policy  # noqa: E402
 import heatpump_pv_state as heatpump_pv_checkpoint  # noqa: E402
@@ -362,6 +363,40 @@ WALLBOX_CURVE_PV_ONLY_DISCHARGE_STATES = OBSERVE_RESERVE_RELEASE_AUTO_STATES | {
     "parallel_auto",
     "parallel_grid_relief_auto",
 }
+# Die Entladegrenze der PV-only-Klasse gilt nur bei tatsächlich ladender
+# Wallbox. Gesteckt allein ist keine Last; eine ungültige, veraltete oder
+# unvollständige Messung hebt die Grenze nie auf (fehlende Daten sind keine
+# Freigabe). Ein-/Aus-Kante mit Hysterese und Zeitbedingung gegen Flattern:
+# - Ein ab 500 W sofort. 500 W liegt über Standby- und Pilotlast gesteckter
+#   Fahrzeuge (der Native-Snapshot zählt erst ab 250 W als laufend) und
+#   unter der kleinsten echten Ladeleistung (1p 6 A ≈ 1380 W). Das ist nur
+#   die feste Untergrenze des Freilauf-Nachweises realer Last
+#   (``controlled_wallbox_real_power_active``); dessen Standardschwelle ist
+#   1380 W (``storage_wallbox_real_power_min_w``), also nicht dieselbe Schwelle.
+# - Aus erst, wenn die gültige Messung jedes gesteckten Ladepunkts 45 s ohne
+#   Unterbrechung unter 300 W liegt. 200 W Abstand zur Ein-Kante liegen über
+#   dem Messrauschen der Wallboxzähler; 45 s überbrücken Einzelproben mit 0 W
+#   und kurze Ladepausen (CP-Unterbrechung, Phasenwechsel) und sind länger als
+#   der 30-s-Mindestabstand nicht schützender Schreibvorgänge. Energie: Bleibt
+#   die Grenze nach dem Ladeende 45 s stehen, deckt sie in Stufe 2 weiter den
+#   Hausbedarf plus Reserve, in Stufe 1 mindestens 1500 W; Netzbezug entsteht
+#   nur für Hauslast darüber (bei 3 kW Haus höchstens rund 19 Wh). Ein Flattern
+#   kostete dagegen je Wechsel einen POWER_SETTINGS-Schreibvorgang.
+WALLBOX_CURVE_PV_ONLY_DISCHARGE_REAL_MIN_W = 500.0
+WALLBOX_CURVE_PV_ONLY_DISCHARGE_IDLE_MAX_W = 300.0
+WALLBOX_CURVE_PV_ONLY_DISCHARGE_IDLE_HOLD_S = 45.0
+# Frische der Leerlaufbelege (fünf E3DC-Livezyklen); ältere Proben belegen
+# keinen Leerlauf.
+WALLBOX_CURVE_PV_ONLY_DISCHARGE_EVIDENCE_MAX_AGE_S = 15.0
+# Größere Lücke zum Vorzyklus: keine durchgehende Beobachtung, neu bewerten.
+WALLBOX_CURVE_PV_ONLY_DISCHARGE_LATCH_MAX_GAP_S = 10.0
+WALLBOX_CURVE_PV_ONLY_DISCHARGE_LATCH_SCHEMA = "wallbox_pv_only_discharge_cap_latch_v1"
+# Totband der Entladegrenze in Stufe 1 und 2:
+# Nachführen erst ab 200 W Änderung, derselbe Wert wie das Totband der
+# Schreibbremse des Laderahmens. Senkungen aus einer harten Grenze wirken sofort.
+WALLBOX_CURVE_PV_ONLY_DISCHARGE_DEADBAND_W = 200
+WALLBOX_CURVE_PV_ONLY_DISCHARGE_DEADBAND_MAX_GAP_S = 30.0
+WALLBOX_CURVE_PV_ONLY_DISCHARGE_DEADBAND_SCHEMA = "wallbox_pv_only_discharge_deadband_v1"
 POST_FINAL_PV_STORE_AUTO_RELEASE_STATES = {
     "parallel_curve_auto_hold",
     "parallel_curve_auto_no_surplus",
@@ -21818,6 +21853,675 @@ def wallbox_possible_power(cfg: Dict[str, Any], wb_intent: Dict[str, Any], wb_na
     return int(possible)
 
 
+WALLBOX_MEASUREMENT_DIP_SCHEMA = "wallbox_measurement_dip_confirmation_v2"
+# Höchstabstand zur Vorprobe (fünf Speicherzyklen). Bei größerer Lücke gilt
+# die aktuelle Probe ohne Bestätigung.
+WALLBOX_MEASUREMENT_DIP_MAX_GAP_S = 10.0
+# Abgleich Wallboxprobe gegen E3DC-Hauswert: Abweichungen unter dieser
+# Toleranz (rund 1,3 A einphasig) gelten als Messrauschen oder
+# Hauslastschwankung; gehalten oder korrigiert wird erst darüber.
+WALLBOX_MEASUREMENT_DIP_PAIR_TOLERANCE_W = 300
+# Kleinste Absenkung des ausgegebenen oder bestätigten Stroms, die als
+# Absenkung durch den Wallbox Manager zählt (Rundung der Treiberwerte).
+WALLBOX_MEASUREMENT_DIP_AMP_TOLERANCE_A = 0.05
+# Nachlaufkorrektur nur in diesem Fenster nach einer Stromabsenkung: Das
+# Fahrzeug folgt in wenigen Sekunden, E3DC- und Wallboxprobe zeigen den
+# Abfall bis zu einen Abfragetakt versetzt. Ohne vorherige Absenkung ist ein
+# fallender Hauswert eine Hauslaständerung (etwa Kochfeld aus), keine
+# nachlaufende Wallboxprobe.
+WALLBOX_MEASUREMENT_DIP_LAG_WINDOW_S = 10.0
+
+
+def _finite_non_negative_or_none(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    return max(0.0, number)
+
+
+def wallbox_output_current_evidence(wb_native: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Ausgegebener und bestätigter Strom sowie wirksame Phasenzahl der ladenden Ladepunkte.
+
+    Der Deckel ``cap_amp`` des Wallbox-Intents ist nur die Obergrenze; eine
+    Direktabsenkung des Wallbox Managers kann darunter liegen. Maßgeblich sind
+    je gestecktem, ladendem Ladepunkt der zuletzt ausgegebene Sollstrom
+    (``current_set_amp``) und der von der Wallbox bestätigte Strom
+    (``status_amp``); fehlt einer, gilt der angezeigte Strom ``amp``.
+    Das Phasenziel der Wallbox (``phase_contract.target_phases``) ist der
+    Beleg für einen Phasenwechsel; sein Wechsel ist kein Messfehler. Die
+    gemessene oder daraus abgeleitete Zahl genutzter Phasen zählt dafür
+    bewusst nicht, weil gerade sie in einer Einzelprobe einbrechen kann.
+    ``boxes`` führt Strom und Phasenzahl je Ladepunkt, damit eine Absenkung an
+    einem Ladepunkt nicht durch eine Anhebung an einem anderen verdeckt wird;
+    die Phasenzahl dort ist das Phasenziel, ersatzweise die gemessene Zahl
+    genutzter Phasen, sonst unbekannt. Fehlt einem ladenden Ladepunkt die
+    Kennung oder ist sie doppelt, ist keine Zuordnung je Ladepunkt möglich
+    (``boxes_valid`` False, ``boxes`` leer): Es gilt der Summenbeleg, und die
+    Phasenziele zählen als Summe unter einem gemeinsamen Schlüssel.
+    """
+
+    details = (wb_native or {}).get("wb_details")
+    output_total = 0.0
+    confirmed_total = 0.0
+    phases: Dict[str, int] = {}
+    boxes: Dict[str, Dict[str, Any]] = {}
+    known = False
+    ids_valid = True
+    seen_ids = set()
+    target_sum = 0
+    if isinstance(details, list):
+        for detail in details:
+            if not isinstance(detail, dict) or detail.get("plug") is not True:
+                continue
+            if not (detail.get("charging") is True or _wallbox_detail_power_w(detail) > 250.0):
+                continue
+            shown = _finite_non_negative_or_none(detail.get("amp"))
+            output = _finite_non_negative_or_none(detail.get("current_set_amp"))
+            confirmed = _finite_non_negative_or_none(detail.get("status_amp"))
+            output = shown if output is None else output
+            confirmed = shown if confirmed is None else confirmed
+            if output is None and confirmed is None:
+                continue
+            known = True
+            box_output = output if output is not None else float(confirmed or 0.0)
+            box_confirmed = confirmed if confirmed is not None else float(output or 0.0)
+            output_total += box_output
+            confirmed_total += box_confirmed
+            raw_id = detail.get("id")
+            box_key = "" if raw_id is None or isinstance(raw_id, bool) else str(raw_id).strip()
+            if not box_key or box_key in seen_ids:
+                ids_valid = False
+            seen_ids.add(box_key)
+            phase_contract = detail.get("phase_contract") if isinstance(detail.get("phase_contract"), dict) else {}
+            target_phases = safe_int(phase_contract.get("target_phases"), 0)
+            if target_phases > 0:
+                phases[box_key] = target_phases
+                target_sum += target_phases
+            measured_phases = safe_int(detail.get("phases_in_use"), 0)
+            box_phases = (
+                target_phases
+                if target_phases in (1, 2, 3)
+                else (measured_phases if measured_phases in (1, 2, 3) else None)
+            )
+            boxes[box_key] = {
+                "output_amp": round(box_output, 2),
+                "confirmed_amp": round(box_confirmed, 2),
+                "phases": box_phases,
+            }
+    if not ids_valid:
+        # Ohne eindeutige Kennung je Ladepunkt: Summenbeleg statt einer vom
+        # Listenrang abhängigen Zuordnung.
+        boxes = {}
+        phases = {"summe": target_sum} if target_sum > 0 else {}
+    return {
+        "known": known,
+        "output_amp": round(output_total, 2),
+        "confirmed_amp": round(confirmed_total, 2),
+        "effective_phases": phases,
+        "boxes": boxes,
+        "boxes_valid": bool(known and ids_valid),
+    }
+
+
+def _wallbox_dip_box_amps(value: Any) -> Dict[str, Dict[str, Any]]:
+    """Strom und Phasenzahl je Ladepunkt in normierter Form (leer bei Fehlen)."""
+
+    result: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(value, dict):
+        return result
+    for key, entry in value.items():
+        if not isinstance(entry, dict):
+            continue
+        output = _finite_non_negative_or_none(entry.get("output_amp"))
+        confirmed = _finite_non_negative_or_none(entry.get("confirmed_amp"))
+        if output is None and confirmed is None:
+            continue
+        phases = safe_int(entry.get("phases"), 0)
+        result[str(key)] = {
+            "output_amp": round(output if output is not None else float(confirmed or 0.0), 2),
+            "confirmed_amp": round(confirmed if confirmed is not None else float(output or 0.0), 2),
+            "phases": phases if phases in (1, 2, 3) else None,
+        }
+    return result
+
+
+def wallbox_measurement_dip_confirmation(
+    previous: Optional[Dict[str, Any]],
+    *,
+    now_s: float,
+    wallbox_w: float,
+    possible_w: int,
+    measurement_valid: bool,
+    grid_import_w: int,
+    setpoint_amp: float,
+    phase_transition_active: bool,
+    confirmed_amp: Optional[float] = None,
+    effective_phases: Optional[Dict[str, Any]] = None,
+    home_w: Optional[float] = None,
+    pair_wallbox_w: Optional[float] = None,
+    box_amps: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Zwei-Proben-Bestätigung für Einbrüche einzelner Wallbox-Messproben.
+
+    Die Wallboxleistung einer externen Wallbox (zum Beispiel openWB Pro) und
+    der E3DC-Hauswert stammen aus verschiedenen Abfragen; der Hauswert enthält
+    die externe Wallbox. Aus beiden ergibt sich der Hausanteil ohne Wallbox
+    (``house_w`` = Hauswert − Wallboxprobe). Er wird gegen einen Bezugswert
+    aus dem letzten schlüssigen Probenpaar geprüft (``house_ref_w``):
+
+    - Fällt die Wallboxprobe, ohne dass der Hauswert um denselben Betrag fällt
+      (der Hausanteil springt scheinbar hoch), ist das ein Messfehler oder eine
+      vorauseilende Probe: Nur der vom Hauswert nicht bestätigte Teil
+      (``unconfirmed_dip_w``, höchstens der Einbruch selbst) wird bis zur
+      Folgeprobe gehalten. Ein vom Hauswert bestätigter Einbruch wirkt sofort.
+    - Fällt der Hauswert bis 10 s nach einer Stromabsenkung, ohne dass die
+      Wallboxprobe folgt (die Wallboxprobe läuft hinterher, der Hausanteil
+      fällt scheinbar), wird der Wallboxwert um diesen Teil gesenkt
+      (``lag_correction_w``), höchstens um den Anteil, den die Absenkung
+      erklärt (Ampere × 230 V × Phasen) und die Wallboxprobe noch nicht zeigt.
+      Mit ``box_amps`` (Strom und Phasenzahl je Ladepunkt aus
+      ``wallbox_output_current_evidence``) zählt jede Absenkung je Ladepunkt
+      mit dessen tatsächlicher Phasenzahl; eine gleichzeitige Anhebung an einem
+      anderen Ladepunkt verdeckt sie nicht. Nur ohne bekannte Phasenzahl gilt
+      3 (die größte Absenkung, der Rahmen fällt damit eher zu klein aus).
+      So stammen Wallboxwert und E3DC-Rest aus demselben Probenpaar, und kein
+      aus beiden gebildeter Rahmen zählt eine Leistung doppelt. Diese
+      Korrektur senkt nur. Ohne passende Absenkung ist ein fallender Hauswert
+      eine Hauslaständerung (etwa Kochfeld aus) und bleibt unkorrigiert.
+    - Zwei gleichartige Folgeproben mit neuem Hausanteil sind eine echte
+      Laständerung im Haus; der Bezugswert folgt dann.
+
+    Keine Haltung, wenn Netzbezug ansteht, eine der beiden Proben ungültig
+    ist, die Vorprobe zu alt ist, der Hauswert fehlt oder nicht vergleichbar
+    ist (``home_w`` ``None``, etwa bei der E3DC-Wallbox, deren Leistung aus
+    derselben E3DC-Abfrage stammt), der Wallbox Manager den ausgegebenen oder
+    die Wallbox den bestätigten Strom gesenkt hat (``setpoint_amp``
+    beziehungsweise ``confirmed_amp``; der Deckel ``cap_amp`` genügt dafür
+    nicht), sich die wirksame Phasenzahl geändert hat oder ein Phasenwechsel
+    läuft. Harte Grenzen (Notstromreserve, Nutzer-Aus, Hausanschluss) wirken
+    über ihre eigenen Pfade unverändert.
+    """
+
+    prev = previous if isinstance(previous, dict) else {}
+    now_value = safe_float(now_s, 0.0)
+    tolerance_w = WALLBOX_MEASUREMENT_DIP_PAIR_TOLERANCE_W
+    raw_wallbox_w = max(0, int(round(safe_float(wallbox_w, 0.0))))
+    raw_possible_w = max(0, safe_int(possible_w, 0))
+    setpoint = max(0.0, safe_float(setpoint_amp, 0.0))
+    confirmed = (
+        max(0.0, safe_float(confirmed_amp, setpoint))
+        if confirmed_amp is not None
+        else setpoint
+    )
+    phases_now = {
+        str(key): safe_int(value, 0)
+        for key, value in (effective_phases.items() if isinstance(effective_phases, dict) else [])
+        if safe_int(value, 0) > 0
+    }
+    home_value_raw = _finite_non_negative_or_none(home_w)
+    home_value = int(round(home_value_raw)) if home_value_raw is not None else None
+    pair_raw_w = (
+        max(0, int(round(safe_float(pair_wallbox_w, float(raw_wallbox_w)))))
+        if pair_wallbox_w is not None
+        else raw_wallbox_w
+    )
+    prev_ts = safe_float(prev.get("ts"), 0.0)
+    gap_s = now_value - prev_ts if prev_ts > 0.0 else -1.0
+    continuous = bool(0.0 < gap_s <= WALLBOX_MEASUREMENT_DIP_MAX_GAP_S)
+    import_w = max(0, safe_int(grid_import_w, 0))
+    prev_setpoint = max(0.0, safe_float(prev.get("setpoint_amp"), 0.0))
+    prev_confirmed = max(0.0, safe_float(prev.get("confirmed_amp"), prev_setpoint))
+    boxes_now = _wallbox_dip_box_amps(box_amps)
+    prev_boxes = _wallbox_dip_box_amps(prev.get("box_amps")) if continuous else {}
+    per_box = bool(box_amps is not None and prev_boxes)
+    if per_box:
+        # Je Ladepunkt: Eine Absenkung an einem Ladepunkt zählt, auch wenn ein
+        # anderer gleichzeitig anhebt. Ein nicht mehr ladender Ladepunkt gilt
+        # als auf 0 A abgesenkt.
+        box_lowered = {
+            key: bool(
+                safe_float((boxes_now.get(key) or {}).get("output_amp"), 0.0)
+                < safe_float(prev_box.get("output_amp"), 0.0) - WALLBOX_MEASUREMENT_DIP_AMP_TOLERANCE_A
+                or safe_float((boxes_now.get(key) or {}).get("confirmed_amp"), 0.0)
+                < safe_float(prev_box.get("confirmed_amp"), 0.0) - WALLBOX_MEASUREMENT_DIP_AMP_TOLERANCE_A
+            )
+            for key, prev_box in prev_boxes.items()
+        }
+        setpoint_lowered = any(box_lowered.values())
+    else:
+        box_lowered = {}
+        setpoint_lowered = bool(
+            setpoint < prev_setpoint - WALLBOX_MEASUREMENT_DIP_AMP_TOLERANCE_A
+            or confirmed < prev_confirmed - WALLBOX_MEASUREMENT_DIP_AMP_TOLERANCE_A
+        )
+    prev_phases = prev.get("effective_phases") if isinstance(prev.get("effective_phases"), dict) else {}
+    phase_change = any(
+        key in prev_phases and safe_int(prev_phases.get(key), 0) > 0 and safe_int(prev_phases.get(key), 0) != value
+        for key, value in phases_now.items()
+    )
+    both_valid = bool(measurement_valid is True and prev.get("measurement_valid") is True)
+    comparable_now = bool(measurement_valid is True and home_value is not None)
+    house_now_w = home_value - pair_raw_w if comparable_now and home_value is not None else None
+    prev_ref_raw = prev.get("house_ref_w")
+    prev_ref_w = (
+        safe_int(prev_ref_raw, 0)
+        if isinstance(prev_ref_raw, (int, float)) and not isinstance(prev_ref_raw, bool)
+        else None
+    )
+    prev_house_raw = prev.get("house_w")
+    prev_house_w = (
+        safe_int(prev_house_raw, 0)
+        if isinstance(prev_house_raw, (int, float)) and not isinstance(prev_house_raw, bool)
+        else None
+    )
+    reference_valid = bool(
+        continuous and both_valid and house_now_w is not None and prev_ref_w is not None
+    )
+    deviation_w = int(house_now_w - prev_ref_w) if reference_valid else 0
+    pair_inconsistent = bool(reference_valid and abs(deviation_w) >= tolerance_w)
+    house_level_confirmed = False
+    if (
+        pair_inconsistent
+        and prev.get("pair_inconsistent") is True
+        and prev_house_w is not None
+        and house_now_w is not None
+        and abs(house_now_w - prev_house_w) < tolerance_w
+    ):
+        # Zwei gleichartige Folgeproben: echte Laständerung im Haus.
+        pair_inconsistent = False
+        house_level_confirmed = True
+        deviation_w = 0
+    if house_now_w is None:
+        house_ref_w = None
+    elif reference_valid and pair_inconsistent:
+        house_ref_w = prev_ref_w
+    else:
+        house_ref_w = house_now_w
+    prev_wallbox_w = max(0, safe_int(prev.get("wallbox_raw_w"), 0))
+    prev_pair_w = max(0, safe_int(prev.get("pair_wallbox_raw_w"), prev_wallbox_w))
+    prev_possible_w = max(0, safe_int(prev.get("possible_raw_w"), 0))
+    pair_drop_w = prev_pair_w - pair_raw_w if continuous else 0
+    # Die erste Probe nach dem Ende einer Phasenreservierung zeigt die neue
+    # Phasenzahl; ein Einbruch bis 10 s danach ist kein Messfehler.
+    prev_transition_ts = safe_float(prev.get("phase_transition_ts"), 0.0) if continuous else 0.0
+    phase_transition_ts = now_value if phase_transition_active else prev_transition_ts
+    phase_transition_recent = bool(
+        not phase_transition_active
+        and phase_transition_ts > 0.0
+        and 0.0 <= now_value - phase_transition_ts <= WALLBOX_MEASUREMENT_DIP_LAG_WINDOW_S
+    )
+    eligible = bool(
+        continuous
+        and both_valid
+        and import_w < CURVE_FRAME_WRITE_BRAKE_GRID_IMPORT_W
+        and not phase_transition_active
+        and not phase_transition_recent
+    )
+    hold_basis = bool(eligible and reference_valid and not phase_change)
+    unconfirmed_dip_w = min(max(0, deviation_w), max(0, pair_drop_w)) if hold_basis else 0
+    home_confirms_drop = bool(
+        reference_valid and pair_drop_w >= tolerance_w and deviation_w < tolerance_w
+    )
+    wallbox_held = bool(
+        hold_basis
+        and not setpoint_lowered
+        and pair_drop_w >= tolerance_w
+        and unconfirmed_dip_w >= tolerance_w
+    )
+    possible_held = bool(hold_basis and prev_possible_w > raw_possible_w and not home_confirms_drop)
+    # Nachlauf der Wallboxprobe: Nur so viel, wie eine Stromabsenkung der
+    # letzten 10 s erklärt und die Wallboxprobe noch nicht zeigt. Ein
+    # fallender Hauswert ohne passende Absenkung (etwa Kochfeld aus) bleibt
+    # unkorrigiert.
+    prev_lowered_ts = safe_float(prev.get("setpoint_lowered_ts"), 0.0) if continuous else 0.0
+    prev_window_open = bool(
+        prev_lowered_ts > 0.0
+        and 0.0 <= now_value - prev_lowered_ts <= WALLBOX_MEASUREMENT_DIP_LAG_WINDOW_S
+    )
+    prev_box_ref = prev.get("box_lowering_ref_amp") if isinstance(prev.get("box_lowering_ref_amp"), dict) else {}
+    box_lowering_ref: Dict[str, float] = {}
+    if setpoint_lowered:
+        setpoint_lowered_ts = now_value
+        lowering_ref_amp = (
+            max(prev_setpoint, safe_float(prev.get("lowering_ref_amp"), 0.0))
+            if prev_window_open
+            else prev_setpoint
+        )
+        lowering_pair_w = (
+            max(0, safe_int(prev.get("lowering_pair_w"), prev_pair_w))
+            if prev_window_open
+            else prev_pair_w
+        )
+        if per_box:
+            for key, prev_box in prev_boxes.items():
+                prev_output = max(0.0, safe_float(prev_box.get("output_amp"), 0.0))
+                box_lowering_ref[key] = (
+                    max(prev_output, safe_float(prev_box_ref.get(key), 0.0))
+                    if prev_window_open
+                    else prev_output
+                )
+    elif prev_window_open:
+        setpoint_lowered_ts = prev_lowered_ts
+        lowering_ref_amp = max(0.0, safe_float(prev.get("lowering_ref_amp"), 0.0))
+        lowering_pair_w = max(0, safe_int(prev.get("lowering_pair_w"), 0))
+        if box_amps is not None:
+            box_lowering_ref = {
+                str(key): max(0.0, safe_float(value, 0.0)) for key, value in prev_box_ref.items()
+            }
+    else:
+        setpoint_lowered_ts = 0.0
+        lowering_ref_amp = 0.0
+        lowering_pair_w = 0
+    if setpoint_lowered_ts <= 0.0:
+        lowering_amp_w = 0.0
+    elif box_lowering_ref:
+        # Je Ladepunkt mit seiner tatsächlichen Phasenzahl; eine Anhebung an
+        # einem anderen Ladepunkt hebt die Absenkung nicht auf.
+        lowering_amp_w = 0.0
+        for key, ref_amp in box_lowering_ref.items():
+            box_now = boxes_now.get(key) or {}
+            box_phases = safe_int(box_now.get("phases"), 0) or safe_int(
+                (prev_boxes.get(key) or {}).get("phases"), 0
+            )
+            box_phases = box_phases if box_phases in (1, 2, 3) else 3
+            lowering_amp_w += (
+                max(0.0, ref_amp - max(0.0, safe_float(box_now.get("output_amp"), 0.0)))
+                * 230.0
+                * box_phases
+            )
+    else:
+        lowering_phases = max([value for value in phases_now.values() if value in (1, 2, 3)] or [3])
+        lowering_amp_w = max(0.0, lowering_ref_amp - setpoint) * 230.0 * lowering_phases
+    lowering_explained_w = max(
+        0,
+        int(round(lowering_amp_w)) - max(0, lowering_pair_w - pair_raw_w),
+    ) if setpoint_lowered_ts > 0.0 else 0
+    lag_correction_w = (
+        min(-deviation_w, pair_raw_w, lowering_explained_w)
+        if reference_valid and not wallbox_held and deviation_w <= -tolerance_w
+        else 0
+    )
+    if lag_correction_w < tolerance_w:
+        lag_correction_w = 0
+    wallbox_value_w = max(
+        0,
+        raw_wallbox_w + (unconfirmed_dip_w if wallbox_held else 0) - lag_correction_w,
+    )
+    raw_drop_w = prev_wallbox_w - raw_wallbox_w if continuous else 0
+    reason = "confirmed"
+    if not continuous:
+        reason = "no_previous_sample"
+    elif not both_valid:
+        reason = "measurement_invalid"
+    elif import_w >= CURVE_FRAME_WRITE_BRAKE_GRID_IMPORT_W:
+        reason = "grid_import"
+    elif phase_transition_active:
+        reason = "phase_transition"
+    elif phase_transition_recent:
+        reason = "phase_transition_recent"
+    elif phase_change:
+        reason = "phase_change"
+    elif wallbox_held or possible_held:
+        reason = "single_sample_dip_held"
+    elif lag_correction_w > 0:
+        reason = "pair_lag_corrected"
+    elif raw_drop_w >= tolerance_w or pair_drop_w >= tolerance_w:
+        if not reference_valid:
+            reason = "pair_not_comparable"
+        elif setpoint_lowered:
+            reason = "setpoint_lowered"
+        elif home_confirms_drop:
+            reason = "home_confirms_drop"
+    elif house_level_confirmed:
+        reason = "house_level_confirmed"
+    return {
+        "schema": WALLBOX_MEASUREMENT_DIP_SCHEMA,
+        "ts": round(now_value, 3),
+        "measurement_valid": bool(measurement_valid is True),
+        "setpoint_amp": round(setpoint, 2),
+        "confirmed_amp": round(confirmed, 2),
+        "effective_phases": phases_now,
+        "home_w": home_value,
+        "house_w": house_now_w,
+        "house_ref_w": house_ref_w,
+        "house_deviation_w": deviation_w,
+        "pair_inconsistent": pair_inconsistent,
+        "wallbox_raw_w": raw_wallbox_w,
+        "pair_wallbox_raw_w": pair_raw_w,
+        "possible_raw_w": raw_possible_w,
+        "wallbox_w": wallbox_value_w,
+        "frame_wallbox_w": wallbox_value_w,
+        "possible_w": prev_possible_w if possible_held else raw_possible_w,
+        "wallbox_held": wallbox_held,
+        "possible_held": possible_held,
+        "grid_import_w": import_w,
+        "pair_drop_w": pair_drop_w,
+        "unconfirmed_dip_w": unconfirmed_dip_w if wallbox_held else 0,
+        "lag_correction_w": lag_correction_w,
+        "setpoint_lowered": setpoint_lowered,
+        "setpoint_lowered_ts": round(setpoint_lowered_ts, 3) if setpoint_lowered_ts > 0.0 else 0.0,
+        "lowering_ref_amp": round(lowering_ref_amp, 2),
+        "lowering_pair_w": int(lowering_pair_w),
+        "lowering_explained_w": int(lowering_explained_w),
+        "box_amps": boxes_now,
+        "box_lowering_ref_amp": {key: round(value, 2) for key, value in box_lowering_ref.items()},
+        "phase_transition_ts": round(phase_transition_ts, 3) if phase_transition_ts > 0.0 else 0.0,
+        "reason": reason,
+    }
+
+
+def wallbox_pv_only_discharge_evidence(
+    live: Dict[str, Any],
+    wb_native: Optional[Dict[str, Any]],
+    *,
+    now_s: float,
+    max_age_s: float = WALLBOX_CURVE_PV_ONLY_DISCHARGE_EVIDENCE_MAX_AGE_S,
+    expect_plugged: bool = False,
+) -> Dict[str, Any]:
+    """Messbeleg für die Ein-/Aus-Kante der PV-only-Entladegrenze.
+
+    Gültig nur mit frischer, vollständiger Wallboxmessung: Der Summenbeleg aus
+    ``wallbox_actual_power_snapshot`` muss gültig und vollständig sein
+    (``native_details_complete``), und jeder gesteckte, ladende oder Leistung
+    meldende Ladepunkt braucht einen eigenen frischen, gültigen, plausiblen
+    Status. Der Multi-Snapshot des Wallbox Managers trägt die Statusflags nur
+    je Ladepunkt, nicht auf Wurzelebene; ein ungültiger Ladepunkt darf deshalb
+    nicht über eine Wurzel ohne Flags als Leerlauf durchgehen. Meldet der
+    Wallbox-Intent ein gestecktes Fahrzeug (``expect_plugged``), muss der
+    Snapshot mindestens einen solchen Ladepunkt enthalten. Ohne gültigen
+    Beleg gilt die Wallbox als ladend (fehlende Daten sind keine Freigabe).
+    """
+
+    snapshot = wallbox_actual_power_snapshot(
+        live,
+        wb_native,
+        now_s=now_s,
+        max_age_s=max_age_s,
+        require_fresh_evidence=True,
+    )
+    details = (wb_native or {}).get("wb_details")
+    reason = "valid"
+    valid = bool(
+        snapshot.get("measurement_valid") is True
+        and snapshot.get("native_details_complete") is True
+    )
+    if not valid:
+        reason = "measurement_invalid_or_incomplete"
+    detail_sum_w = 0.0
+    relevant = 0
+    if not isinstance(details, list) or not details:
+        valid = False
+        reason = "details_missing"
+    else:
+        for detail in details:
+            if not isinstance(detail, dict):
+                valid = False
+                reason = "detail_malformed"
+                continue
+            power_w = _wallbox_detail_power_w(detail)
+            if not (
+                detail.get("plug") is True
+                or detail.get("charging") is True
+                or power_w > 250.0
+            ):
+                continue
+            relevant += 1
+            if not _wallbox_status_sample_fresh(detail, now_s=now_s, max_age_s=max_age_s):
+                valid = False
+                reason = "plugged_detail_invalid_or_stale"
+                continue
+            detail_sum_w += power_w
+        if valid and expect_plugged and relevant <= 0:
+            valid = False
+            reason = "plugged_detail_missing"
+    power_w = max(safe_float(snapshot.get("power_w"), 0.0), detail_sum_w) if valid else None
+    return {
+        "valid": valid,
+        "power_w": round(power_w, 1) if power_w is not None else None,
+        "relevant_details": relevant,
+        "native_details_complete": snapshot.get("native_details_complete") is True,
+        "source": str(snapshot.get("source") or "unknown"),
+        "reason": reason,
+    }
+
+
+def wallbox_pv_only_discharge_cap_latch(
+    previous: Optional[Dict[str, Any]],
+    *,
+    evidence: Dict[str, Any],
+    now_s: float,
+) -> Dict[str, Any]:
+    """Ein-/Aus-Zustand „Wallbox lädt“ für die PV-only-Entladegrenze.
+
+    Ein: sofort, sobald kein gültiger Beleg unter 500 W vorliegt (Ladung ab
+    500 W oder fehlende, veraltete, unvollständige Messung). Aus: erst, wenn
+    der gültige Beleg 45 s ohne Unterbrechung unter 300 W liegt; jede Probe
+    ab 300 W und jeder ungültige Beleg startet die Zeit neu. Ohne
+    durchgehenden Vorzustand (erster Zyklus, Lücke über 10 s) entscheidet die
+    aktuelle Probe mit der Ein-Kante. Der Zustand beschreibt nur die Last;
+    ob die Grenze gilt, entscheidet zusätzlich die PV-only-Klasse.
+    """
+
+    prev = previous if isinstance(previous, dict) else {}
+    if prev.get("schema") != WALLBOX_CURVE_PV_ONLY_DISCHARGE_LATCH_SCHEMA:
+        prev = {}
+    now_value = safe_float(now_s, 0.0)
+    prev_ts = safe_float(prev.get("ts"), 0.0)
+    gap_s = now_value - prev_ts if prev_ts > 0.0 else -1.0
+    continuous = bool(0.0 < gap_s <= WALLBOX_CURVE_PV_ONLY_DISCHARGE_LATCH_MAX_GAP_S)
+    valid = evidence.get("valid") is True if isinstance(evidence, dict) else False
+    power_w = safe_float((evidence or {}).get("power_w"), 0.0) if valid else None
+    below_on = bool(valid and power_w is not None and power_w < WALLBOX_CURVE_PV_ONLY_DISCHARGE_REAL_MIN_W)
+    below_off = bool(valid and power_w is not None and power_w < WALLBOX_CURVE_PV_ONLY_DISCHARGE_IDLE_MAX_W)
+    idle_since = 0.0
+    if continuous and prev.get("active") is True:
+        if below_off:
+            idle_since = safe_float(prev.get("idle_since"), 0.0)
+            if idle_since <= 0.0 or idle_since > now_value:
+                idle_since = now_value
+            active = bool(now_value - idle_since < WALLBOX_CURVE_PV_ONLY_DISCHARGE_IDLE_HOLD_S)
+        else:
+            active = True
+    else:
+        # Aus oder ohne durchgehenden Vorzustand: Ein-Kante 500 W.
+        active = not below_on
+    if not active:
+        idle_since = 0.0
+    if not valid:
+        reason = "evidence_invalid"
+    elif not active:
+        reason = "idle_confirmed"
+    elif below_off:
+        reason = "idle_pending"
+    elif below_on:
+        reason = "between_thresholds"
+    else:
+        reason = "charging"
+    return {
+        "schema": WALLBOX_CURVE_PV_ONLY_DISCHARGE_LATCH_SCHEMA,
+        "active": bool(active),
+        "reason": reason,
+        "evidence_valid": valid,
+        "evidence_reason": str((evidence or {}).get("reason") or ""),
+        "power_w": round(power_w, 1) if power_w is not None else None,
+        "idle_since": round(idle_since, 3) if idle_since > 0.0 else 0.0,
+        "idle_s": round(max(0.0, now_value - idle_since), 1) if idle_since > 0.0 else 0.0,
+        "on_w": int(WALLBOX_CURVE_PV_ONLY_DISCHARGE_REAL_MIN_W),
+        "off_w": int(WALLBOX_CURVE_PV_ONLY_DISCHARGE_IDLE_MAX_W),
+        "off_hold_s": WALLBOX_CURVE_PV_ONLY_DISCHARGE_IDLE_HOLD_S,
+        "ts": round(now_value, 3),
+    }
+
+
+def wallbox_pv_only_discharge_deadband(
+    previous: Optional[Dict[str, Any]],
+    *,
+    active: bool,
+    final_w: int,
+    target_w: Optional[int],
+    hard_limit_w: int,
+    sent_previous_w: Optional[int],
+    now_s: float,
+) -> Dict[str, Any]:
+    """Totband der PV-only-Entladegrenze (Stufe 1 und 2): Nachführen ab 200 W.
+
+    ``target_w`` ist der nachgeführte Wert aus Hausgrundlast (Stufe 1)
+    beziehungsweise Haus-PV-Defizit plus Reserve (Stufe 2). Weicht er weniger
+    als 200 W von der zuletzt ausgegebenen Grenze ab, bleibt diese stehen;
+    dann entsteht kein POWER_SETTINGS-Schreibvorgang. Das gilt nur fürs
+    Nachführen. Liegt die Entscheidung unter dem Nachführwert, weil eine
+    andere, harte Grenze greift (zum Beispiel Entladegrenze 0 W eines
+    Schutz- oder Haltezustands oder eine gesunkene Gerätegrenze), wirkt sie
+    sofort. Die gehaltene Grenze liegt nie über der Gerätegrenze. Hat eine
+    nachgelagerte Schicht die zuletzt ausgegebene Grenze ersetzt
+    (``sent_previous_w`` weicht ab), beginnt das Totband neu.
+    """
+
+    prev = previous if isinstance(previous, dict) else {}
+    if prev.get("schema") != WALLBOX_CURVE_PV_ONLY_DISCHARGE_DEADBAND_SCHEMA:
+        prev = {}
+    now_value = safe_float(now_s, 0.0)
+    prev_ts = safe_float(prev.get("ts"), 0.0)
+    gap_s = now_value - prev_ts if prev_ts > 0.0 else -1.0
+    continuous = bool(0.0 < gap_s <= WALLBOX_CURVE_PV_ONLY_DISCHARGE_DEADBAND_MAX_GAP_S)
+    final_value = max(0, safe_int(final_w, 0))
+    target_value = None if target_w is None else max(0, safe_int(target_w, 0))
+    hard_value = max(0, safe_int(hard_limit_w, 0))
+    prev_output = (
+        max(0, safe_int(prev.get("output_w"), 0))
+        if continuous and prev.get("active") is True and prev.get("output_w") is not None
+        else None
+    )
+    output_w = final_value
+    if active is not True:
+        phase = "inactive"
+    elif target_value is None or final_value != target_value:
+        phase = "bound_by_other_limit"
+    elif prev_output is None:
+        phase = "first_output"
+    elif sent_previous_w is None or max(0, safe_int(sent_previous_w, -1)) != prev_output:
+        phase = "resync_output_changed"
+    elif prev_output > hard_value:
+        phase = "hard_limit"
+    elif abs(final_value - prev_output) < WALLBOX_CURVE_PV_ONLY_DISCHARGE_DEADBAND_W:
+        phase = "deadband_hold"
+        output_w = prev_output
+    else:
+        phase = "tracking"
+    return {
+        "schema": WALLBOX_CURVE_PV_ONLY_DISCHARGE_DEADBAND_SCHEMA,
+        "active": bool(active is True),
+        "phase": phase,
+        "target_w": target_value,
+        "candidate_w": final_value,
+        "output_w": int(output_w),
+        "deadband_w": WALLBOX_CURVE_PV_ONLY_DISCHARGE_DEADBAND_W,
+        "ts": round(now_value, 3),
+    }
+
+
 def wallbox_consumer_online(
     wb_native: Dict[str, Any],
     *,
@@ -22262,11 +22966,11 @@ def apply_heatpump_pv_bridge_decision(
     grant: Dict[str, Any], source: Dict[str, Any], *,
     wallbox_w: int, max_charge_w: int, max_discharge_w: int,
 ) -> Dict[str, Any]:
-    """Bindet WP-Unterstützung ausschließlich an den flüchtigen SET_POWER-Pfad.
+    """Kennzeichnet eine gültige WP-PV-Freigabe, ohne den Speicherausgang zu ändern.
 
-    PV wird gemäß derselben Quellenzuordnung genau einmal berücksichtigt.
-    Auch ein entfallender Akkuanteil begrenzt die physische Entladevorgabe;
-    eine offene AUTO-Freigabe ist dafür kein gleichwertiger Ausgang.
+    Der bestehende Speicherausgang (E3DC-AUTO bzw. der Rahmen des führenden
+    Owners) bleibt unverändert und gilt als Quelle der Freigabe. Es entsteht
+    weder ein IDLE- noch ein DISCH-Ausgang noch eine zusätzliche Entladegrenze.
     """
     result = dict(decision)
     state = heatpump_pv_policy.validate_heatpump_pv_state(grant.get("state"))
@@ -22291,118 +22995,17 @@ def apply_heatpump_pv_bridge_decision(
         and not storage_protection_path_contract(result).get("active")
     ):
         return result
-    assigned = source.get("source_assignments_w")
-    if not isinstance(assigned, dict) or any(
-        not isinstance(assigned.get(name), dict)
-        for name in ("house", "heatpump", "wallbox", "heater")
-    ):
-        return result
-    actual_wp_w = max(0, safe_int(live.get("WP_Power"), 0))
-    wp_pv_w = max(0, safe_int(assigned["heatpump"].get("pv"), 0))
-    wp_deficit_w = max(0, actual_wp_w - wp_pv_w)
-    response_wh = max(0.0, safe_float(source.get(
-        "battery_auto_response_wh" if measured_control else "battery_response_required_wh"), 0.0))
-    response_w = max(0.0, safe_float(source.get(
-        "battery_auto_response_w" if measured_control else "battery_response_required_w"), 0.0))
-    protected_energy_overrun = bool(
-        measured_control and state.get("compressor_running") is True
-        and grant.get("hold_required") is True
-        and safe_float(grant.get("compressor_protected_remaining_s"), 0.0) > 0.0
-        and pv_config["battery_limit_wh"] > 0.0 and pv_config["battery_max_w"] > 0.0
-    )
-    response_backed = bool(
-        response_wh > 0.0
-        and safe_float(state.get("battery_reserved_wh"), 0.0) >= response_wh
-        and (protected_energy_overrun
-             or safe_float(grant.get("battery_remaining_wh"), 0.0) >= response_wh)
-        and safe_float(source.get("battery_available_wh"), 0.0) >= response_wh
-        and safe_float(source.get("battery_available_w"), 0.0) >= response_w
-    )
-    if new_start:
-        result["heatpump_pv_start_source_binding_required"] = True
-    if response_backed and (
-        source.get("battery_isolation_required") is False if measured_control
-        else wp_deficit_w == 0
-    ):
-        # Die vollständig erlaubte AUTO-Antwort bleibt im Messwertbetrieb
-        # dieselbe schnelle Quelle, die bereits das Restbudget trägt. Ein
-        # nachträglicher fester Ausgang würde diese Reaktionszusage aufheben.
-        # Im bisherigen Reservierungsbetrieb bleibt der reine PV-Fall erhalten.
-        result["heatpump_pv_response_buffer_backed"] = True
-        return result
-    support_w = min(
-        max(0, safe_int(grant.get("battery_available_w"), 0)),
-        max(0, safe_int(source.get("battery_available_w"), 0)),
-        max(0, int(max_discharge_w)), wp_deficit_w,
-    )
-    # Laufende fremde Quellenrechte werden nicht als WP-Hilfe umetikettiert.
-    # Haus/Heizstab behalten höchstens den bestehenden normalen Entladerahmen;
-    # WB-Hilfe bleibt zusätzlich an den bereits geprüften eigenen Sourcecap gebunden.
-    prior_auto = result.get("auto_limit") if isinstance(result.get("auto_limit"), dict) else {}
-    prior_mode = safe_int(result.get("mode"), -1)
-    prior_limit = (
-        max(0, safe_int(prior_auto.get("max_discharge_w"), 0))
-        if prior_mode == MODE_AUTO and prior_auto.get("enabled") is True
-        else max_discharge_w if prior_mode == MODE_AUTO
-        else max(0, safe_int(result.get("val"), 0)) if prior_mode == MODE_DISCH
-        else 0
-    )
-    other_deficits = {
-        consumer: max(0, safe_int(assigned[consumer].get("battery"), 0))
-        + max(0, safe_int(assigned[consumer].get("grid"), 0))
-        for consumer in ("house", "wallbox", "heater")
-    }
-    other_deficits["wallbox"] = min(
-        other_deficits["wallbox"],
-        max(0, safe_int(source.get("wallbox_battery_authorized_w"), 0)),
-    )
-    non_wp_w = min(prior_limit, sum(other_deficits.values()))
-    discharge_w = min(max(0, int(max_discharge_w)), non_wp_w + support_w)
-    if prior_mode == MODE_AUTO and prior_auto.get("enabled") is True:
-        # Ein Wallbox- oder Kurven-Owner hält bereits einen EMS-Rahmen mit
-        # Ladegrenze. Die WP-Quellenbindung wird als Entladegrenze in diesen
-        # Rahmen gelegt, statt den Owner durch einen flüchtigen IDLE-/DISCH-
-        # Ausgang zu verdrängen (Folge: IDLE-Zyklen mit Wallbox-Budget 0 W
-        # trotz Export, Wärmeauftrag nie freigegeben).
-        merged_limit = dict(prior_auto)
-        merged_limit["max_discharge_w"] = int(min(
-            max(0, safe_int(prior_auto.get("max_discharge_w"), 0)), discharge_w,
-        ))
-        result.pop("heatpump_pv_set_power_only", None)
-        result.update({
-            "auto_limit": merged_limit,
-            "heatpump_pv_isolation_cap_w": int(discharge_w),
-            "heatpump_pv_bridge_dispatch_w": support_w,
-            "heatpump_pv_non_wp_discharge_w": non_wp_w,
-            "house_heatpump_discharge_cap_w": discharge_w,
-        })
-        return result
-    # Ein fester WP-Ausgang darf keinen fremden harten Besitzer übernehmen.
-    # Bereits aktive AUTO-Rahmen werden oben ausschließlich verschärft.
-    if _phase5_owner_safety_veto_contract(
-        result, storage_decision_path_contract(result),
-    ).get("veto"):
-        return result
-    result["heatpump_pv_bridge_fallback"] = {
-        key: copy.deepcopy(decision[key])
-        for key in HEATPUMP_PV_OUTPUT_KEYS if key in decision
-    }
+    # Keine Speicher-Isolation für die Wärmepumpe.
+    # Ein fester IDLE-Ausgang sperrte auch das Laden: PV-Überschuss ging ins Netz,
+    # obwohl der Akku hinter der Ladekurve lag. Eine Entladegrenze nähme Haus und
+    # Wallbox die Akkustützung. Die Wärmepumpe läuft wie jeder andere Verbraucher
+    # im bestehenden Speicherausgang; ihre PV-Freigabe endet über die eigene
+    # Defizit- und Mindestlaufzeitlogik. Die offene AUTO-Antwort gilt als Quelle.
+    result.pop("heatpump_pv_start_source_binding_required", None)
     result.pop("heatpump_pv_isolation_cap_w", None)
-    result.update({
-        "state": "heatpump_pv_source_bound",
-        "priority": "heatpump_pv",
-        "protected": True,
-        "reason": "Gebundene WP-Quellenbegrenzung aus gültiger Speicherzusage.",
-        "mode": MODE_DISCH if discharge_w > 0 else MODE_IDLE,
-        "val": discharge_w,
-        "auto_limit": {},
-        "heatpump_pv_set_power_only": True,
-        "heatpump_pv_bridge_dispatch_w": support_w,
-        "heatpump_pv_non_wp_discharge_w": non_wp_w,
-        "house_heatpump_discharge_cap_w": discharge_w,
-    })
+    result["heatpump_pv_response_buffer_backed"] = True
+    result["heatpump_pv_source_binding"] = "storage_output_unchanged"
     return result
-
 
 # Wärmeaufträge, die um dieselbe Quelle wie der PV-Pfad konkurrieren.
 # WW-Timer-Klassen fehlen bewusst: sie sind Normalbetrieb ohne Speicherfreigabe.
@@ -29357,6 +29960,62 @@ def decide_next_cycle(
         and wb_native.get("driver_status_degraded") is not True
         and wb_native.get("driver_status_glitch") is not True
     )
+    # Einzelproben-Einbruch der Wallboxmessung (Leistung je Ampere oder
+    # Phasenzahl): Das Wallbox-Budget sinkt erst mit der bestätigenden
+    # Folgeprobe, und nur, wenn der E3DC-Hauswert den Einbruch nicht schon
+    # bestätigt. Wirkt nur auf die Budgetbildung (möglicher Wallboxrahmen,
+    # gemessene Wallboxlast, Haltezonen-Rahmen), nicht auf Schutzpfade.
+    # Vergleichbar ist nur der Teil einer externen Wallbox, den der
+    # E3DC-Hauswert enthält; die E3DC-Wallbox stammt aus derselben Abfrage.
+    wallbox_output_current = wallbox_output_current_evidence(wb_native)
+    wallbox_pair_comparable = bool(
+        wallbox_power_source == "wallbox_native"
+        and home_includes_wallbox
+        and _live_numeric_present(live, "Home_Power")
+        and bool(live_plausibility.get("home_valid", True))
+    )
+    wallbox_measurement_dip = wallbox_measurement_dip_confirmation(
+        previous_state.get("wallbox_measurement_dip_confirmation"),
+        now_s=now_s,
+        wallbox_w=wallbox_w,
+        possible_w=wb_possible_w,
+        measurement_valid=bool(
+            controlled_wb_measurement_valid
+            and wb_budget_context.wallbox_power_known
+            and wb_intent_fresh
+        ),
+        grid_import_w=max(grid_w, grid_ema_w),
+        # Ausgegebener beziehungsweise bestätigter Strom, nicht der Deckel.
+        setpoint_amp=(
+            safe_float(wallbox_output_current.get("output_amp"), 0.0)
+            if wallbox_output_current.get("known") is True
+            else (
+                safe_float(wb_intent.get("cap_amp", wb_intent.get("set_amp")), 0.0)
+                if wb_intent_fresh
+                else 0.0
+            )
+        ),
+        confirmed_amp=(
+            safe_float(wallbox_output_current.get("confirmed_amp"), 0.0)
+            if wallbox_output_current.get("known") is True
+            else None
+        ),
+        effective_phases=wallbox_output_current.get("effective_phases"),
+        box_amps=(
+            wallbox_output_current.get("boxes")
+            if wallbox_output_current.get("known") is True
+            and wallbox_output_current.get("boxes_valid") is True
+            else None
+        ),
+        home_w=home_w if wallbox_pair_comparable else None,
+        pair_wallbox_w=(
+            max(0.0, native_wallbox_w - live_wallbox_w)
+            if wallbox_pair_comparable
+            else None
+        ),
+        phase_transition_active=bool(wallbox_phase_transition.get("active")),
+    )
+    wb_possible_w = max(0, safe_int(wallbox_measurement_dip.get("possible_w"), wb_possible_w))
     controlled_wb_real_power_active = controlled_wallbox_real_power_active(
         cfg,
         wb_intent,
@@ -29371,6 +30030,33 @@ def decide_next_cycle(
         wb_intent_fresh=wb_intent_fresh,
         real_power_active=controlled_wb_real_power_active,
         measurement_valid=controlled_wb_measurement_valid,
+    )
+    # Die Entladegrenze der PV-only-Klasse (Stufe 1 und 2) setzt eine tatsächlich
+    # ladende Wallbox voraus. Aufgehoben wird sie nur mit Beleg je gestecktem
+    # Ladepunkt (gültig, frisch, vollständig) unter 300 W über 45 s; ein ab
+    # 500 W sofort. Fehlende Wallboxdaten sind keine Freigabe der
+    # Akkuentladung für die Wallbox. Das PV-only-Budget bleibt davon unberührt.
+    wallbox_pv_only_discharge_evidence_snapshot = wallbox_pv_only_discharge_evidence(
+        live,
+        wb_native,
+        now_s=now_s,
+        expect_plugged=bool(
+            wb_intent_fresh
+            and (
+                wb_intent.get("connected")
+                or wb_intent.get("plugged")
+                or wb_intent.get("charging_active")
+            )
+        ),
+    )
+    wallbox_pv_only_discharge_latch = wallbox_pv_only_discharge_cap_latch(
+        previous_state.get("wallbox_pv_only_discharge_cap_latch"),
+        evidence=wallbox_pv_only_discharge_evidence_snapshot,
+        now_s=now_s,
+    )
+    wallbox_curve_pv_only_discharge_cap_active = bool(
+        wallbox_curve_pv_only_active
+        and wallbox_pv_only_discharge_latch.get("active") is True
     )
     observe_reserve_release = observe_wallbox_reserve_release_context(
         cfg,
@@ -30662,8 +31348,9 @@ def decide_next_cycle(
                 )
                 or (
                     # Unter dem Kurvenkorridor ohne Kontingent braucht auch der
-                    # Neutral-/Netzentlastungszustand die Entladegrenze.
-                    wallbox_curve_pv_only_active
+                    # Neutral-/Netzentlastungszustand die Entladegrenze, aber
+                    # nur bei tatsächlich ladender Wallbox.
+                    wallbox_curve_pv_only_discharge_cap_active
                     and str(decision.get("state") or "") in (
                         {"parallel_auto", "parallel_grid_relief_auto"} | AUTO_LIMIT_STATES
                     )
@@ -30675,8 +31362,12 @@ def decide_next_cycle(
             auto_limit_charge_w = max(0, min(max_charge_w, val))
             auto_limit_discharge_w = max_discharge_w
             auto_limit_reason = "Kurvenladung als E3DC-AUTO mit EMS-Ladegrenze"
-            if wallbox_curve_pv_only_active:
+            if wallbox_curve_pv_only_discharge_cap_active:
                 auto_limit_discharge_w = max(0, min(auto_limit_discharge_w, wallbox_curve_house_baseline_w))
+                # Nachführwert der Stufe 1 für das Totband; nur wenn er am
+                # Ende die Entladegrenze bestimmt, darf das Totband halten.
+                if wallbox_curve_house_baseline_w < max_discharge_w:
+                    decision["wallbox_curve_pv_only_discharge_target_w"] = int(auto_limit_discharge_w)
                 auto_limit_reason = (
                     "Unter dem Kurvenkorridor: Entladegrenze %dW für die Hausgrundlast; "
                     "Wallbox nur aus PV-Überschuss" % auto_limit_discharge_w
@@ -31712,7 +32403,7 @@ def decide_next_cycle(
         observe_only=not curve_frame_normal_regulation,
         phase5_field_active=curve_frame_phase5_field_active,
         dc_first_enabled=cfg_bool(cfg, "storage_dc_first_charge_limit_enable", False),
-        pv_only_active=wallbox_curve_pv_only_active,
+        pv_only_active=wallbox_curve_pv_only_discharge_cap_active,
         release_equivalent_w=curve_frame_release_equivalent_w,
     )
     if observe_reserve_release_active:
@@ -32051,7 +32742,13 @@ def decide_next_cycle(
     observed_wallbox_commitment_w = (
         reserve_wallbox_w
         if ep_reserve_hold_active
-        else max(0, int(round(wallbox_w)))
+        else max(
+            0,
+            safe_int(
+                wallbox_measurement_dip.get("wallbox_w"),
+                int(round(wallbox_w)),
+            ),
+        )
     )
     current_wallbox_commitment_w = (
         observed_wallbox_commitment_w
@@ -32312,7 +33009,8 @@ def decide_next_cycle(
                 else {}
             )
             if (
-                _pv_only_auto_limit.get("enabled") is True
+                wallbox_curve_pv_only_discharge_cap_active
+                and _pv_only_auto_limit.get("enabled") is True
                 and _pv_only_auto_limit.get("release") is not True
                 and safe_int(decision.get("mode"), MODE_AUTO) == MODE_AUTO
                 and state in WALLBOX_CURVE_PV_ONLY_DISCHARGE_STATES
@@ -32359,14 +33057,29 @@ def decide_next_cycle(
                     + _pv_only_heatpump_w
                 )
                 _pv_only_house_deficit_w = max(0, _pv_only_house_w - raw_pv_w)
+                _pv_only_pre_discharge_w = safe_int(_pv_only_auto_limit.get("max_discharge_w"), max_discharge_w)
+                _pv_only_tracking_w = _pv_only_house_deficit_w + _pv_only_house_reserve_w
                 _pv_only_discharge_cap_w = max(
                     0,
                     min(
-                        safe_int(_pv_only_auto_limit.get("max_discharge_w"), max_discharge_w),
+                        _pv_only_pre_discharge_w,
                         max_discharge_w,
-                        _pv_only_house_deficit_w + _pv_only_house_reserve_w,
+                        _pv_only_tracking_w,
                     ),
                 )
+                # Nachführwert für das Totband: Stufe 2 selbst oder der
+                # übernommene Stufe-1-Wert. Bestimmt eine andere Grenze den
+                # Wert (Gerätegrenze, 0 W eines Haltezustands), gibt es kein
+                # Totband; sie wirkt sofort.
+                _pv_only_stage1_target_w = decision.get("wallbox_curve_pv_only_discharge_target_w")
+                if _pv_only_discharge_cap_w == _pv_only_tracking_w or (
+                    _pv_only_stage1_target_w is not None
+                    and _pv_only_discharge_cap_w == safe_int(_pv_only_stage1_target_w, -1)
+                    and _pv_only_pre_discharge_w == _pv_only_discharge_cap_w
+                ):
+                    decision["wallbox_curve_pv_only_discharge_target_w"] = int(_pv_only_discharge_cap_w)
+                else:
+                    decision.pop("wallbox_curve_pv_only_discharge_target_w", None)
                 decision["auto_limit"] = dict(
                     _pv_only_auto_limit,
                     max_discharge_w=int(_pv_only_discharge_cap_w),
@@ -32378,6 +33091,59 @@ def decide_next_cycle(
                     )[:220],
                 )
                 decision["house_heatpump_discharge_cap_w"] = int(_pv_only_discharge_cap_w)
+
+    # Totband der PV-only-Entladegrenze (Stufe 1 und 2):
+    # Nachführen erst ab 200 W Änderung, damit ein schwankendes
+    # Haus-PV-Defizit keinen POWER_SETTINGS-Schreibvorgang je Zyklus auslöst.
+    # Schutzgründe (Notstromreserve, geschützte Zustände, Gerätegrenze, 0 W
+    # eines Haltezustands) laufen ohne Totband. Für extern geführte oder nur
+    # beobachtete Wallboxen ist die Entladegrenze die einzige Stellgröße; dort
+    # gilt kein Totband, die Grenze folgt ungedämpft.
+    _pv_only_deadband_limit = (
+        decision.get("auto_limit") if isinstance(decision.get("auto_limit"), dict) else {}
+    )
+    _pv_only_previous_limit = (
+        previous_state.get("auto_limit") if isinstance(previous_state.get("auto_limit"), dict) else {}
+    )
+    wallbox_pv_only_discharge_deadband_state = wallbox_pv_only_discharge_deadband(
+        previous_state.get("wallbox_pv_only_discharge_deadband"),
+        active=bool(
+            wallbox_curve_pv_only_discharge_cap_active
+            and _pv_only_deadband_limit.get("enabled") is True
+            and _pv_only_deadband_limit.get("release") is not True
+            and safe_int(decision.get("mode"), MODE_AUTO) == MODE_AUTO
+            and not bool(decision.get("protected"))
+            and not ep_reserve_hold_active
+            and not external_wallbox_manager_active
+        ),
+        final_w=safe_int(_pv_only_deadband_limit.get("max_discharge_w"), max_discharge_w),
+        target_w=(
+            safe_int(decision.get("wallbox_curve_pv_only_discharge_target_w"), 0)
+            if decision.get("wallbox_curve_pv_only_discharge_target_w") is not None
+            else None
+        ),
+        hard_limit_w=max_discharge_w,
+        sent_previous_w=(
+            safe_int(_pv_only_previous_limit.get("max_discharge_w"), -1)
+            if _pv_only_previous_limit.get("enabled") is True
+            and _pv_only_previous_limit.get("release") is not True
+            else None
+        ),
+        now_s=now_s,
+    )
+    if wallbox_pv_only_discharge_deadband_state.get("phase") == "deadband_hold":
+        _pv_only_held_w = safe_int(wallbox_pv_only_discharge_deadband_state.get("output_w"), 0)
+        decision["auto_limit"] = dict(
+            _pv_only_deadband_limit,
+            max_discharge_w=int(_pv_only_held_w),
+            reason=(
+                str(_pv_only_deadband_limit.get("reason") or "")
+                + "; Totband: Entladegrenze %dW gehalten (Nachführwert %dW)"
+                % (_pv_only_held_w, safe_int(wallbox_pv_only_discharge_deadband_state.get("candidate_w"), 0))
+            )[:220],
+        )
+        if decision.get("house_heatpump_discharge_cap_w") is not None:
+            decision["house_heatpump_discharge_cap_w"] = int(_pv_only_held_w)
 
     if ep_reserve_hold_active:
         phase_grant_wallbox_commitment_w = (
@@ -32393,6 +33159,100 @@ def decide_next_cycle(
         )
     else:
         phase_grant_wallbox_commitment_w = current_wallbox_commitment_w
+
+    # Haltezone an wbminSoC (Modi mit Akkuladen bis zur Untergrenze): Im Band
+    # Untergrenze ≤ SoC < Untergrenze + Neustart-Abstand bekommt die Wallbox den
+    # batterieneutralen PV-Rahmen. Der Speicher stützt nicht (kein Stütz- oder
+    # Startrahmen aus dem Akku) und lädt nicht vorrangig (kein Abzug des
+    # Kurvenbedarfs vom Restbudget); er lädt, was die Wallbox nicht abnimmt.
+    # Das Wolken-Wh-Kontingent hält die laufende Wallboxleistung bei kurzen
+    # Schwankungen, solange die Akkuentladung sie tatsächlich tragen darf.
+    # Unter dem Band bleibt die Kurvenregel, darüber die Stützung bis zur
+    # Untergrenze. Die Entladegrenze der PV-only-Klasse bleibt unverändert.
+    _hold_zone_previous_budget = (
+        previous_state.get("budget")
+        if isinstance(previous_state.get("budget"), dict)
+        else {}
+    )
+    wbminsoc_hold_zone = wallbox_decision.wbminsoc_hold_zone_contract(
+        # Modusmenge der Wallbox-Seite (Direktabsenkung an der Untergrenze):
+        # ``Akku bis Abfahrt`` hat keine Haltezone.
+        mode=wb_mode,
+        eligible=bool(
+            wb_intent_fresh
+            and wb_car_present
+            and normalize_wb_mode(wb_mode) in wallbox_decision.WBMINSOC_HOLD_ZONE_MODES
+            and wb_intent.get("battery_departure_active") is not True
+            and safe_int(wb_intent.get("wb_control_mode"), 0) == CONTROL_TARGET
+            and state.startswith("parallel_")
+            and state not in AUTO_LIMIT_REQUIRED_STATES
+            and not state.startswith("peak_shaving_")
+            and not bool(decision.get("protected"))
+            and not bool(decision.get("force_wallbox_stop"))
+            and decision.get("predump_active") is not True
+            and not ep_reserve_hold_active
+            and not external_wallbox_manager_active
+            and not wb_intent_bev_full_blocked
+            and wb_intent.get("manual_pause") is not True
+            and wb_intent.get("wbminsoc_runtime_raise_active") is not True
+            and not bool(wb_intent.get("price_opt_active"))
+            and not bool(wb_intent.get("scheduled_slot_active"))
+            and not bool(wb_intent.get("price_boost_active"))
+            and not bool(wb_intent.get("predump_wallbox_active"))
+            and not live_stale
+            and not live_sample_invalid
+            and not soc_unrealistic
+        ),
+        soc=soc,
+        floor_soc=wb_intent.get("effective_wb_floor_soc", wb_intent.get("wbminsoc")),
+        soc_hysteresis_pct=wb_intent.get(
+            "wb_soc_hysterese_pct",
+            cfg.get("wb_soc_hysterese_pct", cfg.get("wb_hysterese_pct")),
+        ),
+        restart_above_pct=cfg.get("wb_target_restart_above_wbminsoc_pct", 2.0),
+        # Wallboxwert aus demselben Probenpaar wie der E3DC-Rest
+        # (``wallbox_measurement_dip_confirmation``): Der Rahmen zählt keine
+        # Leistung doppelt, wenn eine der beiden Proben hinterherläuft.
+        wallbox_w=observed_wallbox_commitment_w,
+        wallbox_measurement_valid=bool(
+            controlled_wb_measurement_valid
+            and wb_budget_context.wallbox_power_known
+        ),
+        residual_w=pv_after_fixed_signed_w,
+        battery_w=bat_w,
+        support_wh_limit=wallbox_decision.curve_floor_support_wh_limit(
+            cfg.get("wb_curve_floor_support_wh"),
+            cfg.get("speichergroesse"),
+        ),
+        # Begrenzt die PV-only-Entladegrenze den Akku auf das Haus, kann er
+        # die Wallbox nicht überbrücken; dann gilt nur der aktuelle Rahmen.
+        bridge_allowed=not wallbox_curve_pv_only_discharge_cap_active,
+        previous=_hold_zone_previous_budget.get("wallbox_wbminsoc_hold_zone"),
+        now_s=now_s,
+    )
+    if wbminsoc_hold_zone.get("active") is True:
+        _hold_zone_frame_w = max(0, safe_int(wbminsoc_hold_zone.get("hold_frame_w"), 0))
+        # Restbudget ohne Vorrang des Kurvenbedarfs: PV minus alle laufenden
+        # Verbraucher; die laufende Wallbox zählt der Verbrauchervertrag dazu.
+        # Die physische Wechselrichter-Obergrenze gilt weiter.
+        budget_w = max(0, safe_int(wbminsoc_hold_zone.get("residual_w"), 0))
+        if max_controllable_ceiling_w > 0 and live_home_w > 0 and not cfg.get("_test_mock_bypass"):
+            budget_w = min(budget_w, max_controllable_ceiling_w)
+        wallbox_exclusive_start_support_w = min(
+            wallbox_exclusive_start_support_w,
+            _hold_zone_frame_w,
+        )
+        # Laufende Wallbox: gehalten wird höchstens der (bei kurzer Schwankung
+        # aus dem Kontingent überbrückte) batterieneutrale Rahmen, nie eine
+        # vorher aus dem Akku gestützte höhere Leistung.
+        wallbox_running_hold_support_w = (
+            min(observed_wallbox_commitment_w, _hold_zone_frame_w)
+            if wbminsoc_hold_zone.get("wallbox_charging") is True
+            else 0
+        )
+        decision["battery_support_authorized"] = False
+        decision["battery_support_reason"] = "wbminsoc_hold_zone"
+        decision["wbminsoc_hold_zone_active"] = True
     phase_transition_grants = wallbox_phase_transition_policy.arbitrate_grants(
         wallbox_phase_transition.get("reservations", []),
         available_w=(
@@ -32459,9 +33319,10 @@ def decide_next_cycle(
         0,
         safe_int(phase_transition_grants.get("flexible_budget_after_commitments_w"), budget_w),
     )
-    if wallbox_curve_pv_only_active:
+    if wallbox_curve_pv_only_active and wbminsoc_hold_zone.get("active") is not True:
         # Die Verbraucherzuteilung entsteht aus diesem Rahmen; unter dem
-        # Kurvenkorridor ohne Kontingent bleibt er beim PV-Überschuss.
+        # Kurvenkorridor ohne Kontingent bleibt er beim PV-Überschuss. In der
+        # Haltezone gilt dagegen der Rest aus PV minus allen Verbrauchern.
         flexible_consumer_budget_w = min(flexible_consumer_budget_w, wallbox_curve_pv_only_budget_w)
     start_hold_active = bool(wallbox_start_hold_grants.get("active"))
     start_hold_required_w = max(
@@ -32752,6 +33613,7 @@ def decide_next_cycle(
     budget = {
         "heatpump_pv_contract": copy.deepcopy(consumer_budget_contract.get("heatpump_pv_contract") or {}),
         "budget_w": budget_w,
+        "wallbox_wbminsoc_hold_zone": wbminsoc_hold_zone,
         "predump_discharge_contract": predump_discharge_contract,
         "predump_discharge_allocations_w": dict(predump_discharge_allocations_w),
         "predump_discharge_add_w": int(predump_discharge_add_w),
@@ -33784,6 +34646,14 @@ def decide_next_cycle(
             ),
         },
     }
+    # Ein Entscheider: Setzt die Entscheidung dieses Zyklus die Akkustützung
+    # der Wallbox (Freigabe und Grund, etwa PV-only-Klasse, Haltezone oder
+    # wbminSoC-Anhebung), steht sie im selben Zyklusrahmen und damit im
+    # veröffentlichten Wallbox-Rahmen. Ohne Setzung fehlen beide Felder; die
+    # Wallbox nutzt dann ihre eigene Kurvenklasse.
+    for _support_key in ("battery_support_authorized", "battery_support_reason"):
+        if _support_key in decision:
+            budget[_support_key] = decision[_support_key]
     peak_budget_context = (
         decision.get("peak_shaving")
         if isinstance(decision.get("peak_shaving"), dict)
@@ -34736,6 +35606,9 @@ def decide_next_cycle(
         "home_feedback_guard": decision.get("home_feedback_guard") if isinstance(decision.get("home_feedback_guard"), dict) else None,
         "last_wb_active_ts": now_s if wb_car_present else previous_state.get("last_wb_active_ts", 0),
         "last_wb_possible_power_w": wb_possible_w or previous_state.get("last_wb_possible_power_w", 0),
+        "wallbox_measurement_dip_confirmation": wallbox_measurement_dip,
+        "wallbox_pv_only_discharge_cap_latch": wallbox_pv_only_discharge_latch,
+        "wallbox_pv_only_discharge_deadband": wallbox_pv_only_discharge_deadband_state,
         "last_auto_ts": (
             (
                 safe_float(previous_state.get("last_auto_ts"), 0.0)
@@ -37304,6 +38177,7 @@ _WB_BUDGET_CONTROL_KEYS = {
     "flexible_budget_after_commitments_w",
     "wb_storage_cap_w", "wb_storage_extra_w", "wallbox_curve_reserve_w",
     "battery_support_authorized", "battery_support_reason", "wallbox_curve_pv_only_budget_w",
+    "wallbox_wbminsoc_hold_zone",
     "wallbox_curve_reserve_target_w", "wallbox_curve_reserve_step_w",
     "wallbox_curve_min_w", "wallbox_curve_phases",
     "wallbox_curve_export_catchup_active", "wallbox_curve_export_catchup_w",
@@ -45730,6 +46604,14 @@ def execute_rscp_cycle(
     payload["rscp_set_power_auto_suppressed"] = bool(
         rscp_contract.get("set_power_auto_suppressed")
     )
+    # Fällige Sammelzeile der POWER_SETTINGS-Schreibvorgänge je Zyklus
+    # ausgeben, auch wenn in diesem Zyklus kein SET mehr folgt.
+    _flush_set_log = getattr(ctrl, "flush_power_settings_set_log", None)
+    if callable(_flush_set_log):
+        try:
+            _flush_set_log()
+        except Exception as exc:  # noqa: BLE001 - Protokoll darf den Zyklus nie stören
+            log.debug("POWER_SETTINGS-Sammelzeile übersprungen: %s", exc)
     payload["rscp_power_settings_reconciled"] = ctrl.reconcile_power_settings(
         payload,
         fresh=bool(

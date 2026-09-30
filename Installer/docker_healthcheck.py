@@ -401,15 +401,7 @@ def _process_snapshot() -> tuple[dict, ...]:
                 ) from exc
             if len(payload) > MAX_CMDLINE_BYTES:
                 raise RuntimeError(f"Prozesskommando für PID {entry.name} ist zu groß")
-            if (
-                state_before,
-                parent_pid,
-                start_time,
-            ) != (
-                state_after,
-                parent_after,
-                start_after,
-            ) or security_before != security_after:
+            if start_time != start_after or security_before != security_after:
                 raise RuntimeError(f"Prozess PID {entry.name} driftete im Snapshot")
             argv = tuple(
                 token.decode("utf-8", errors="replace")
@@ -419,9 +411,9 @@ def _process_snapshot() -> tuple[dict, ...]:
             processes.append(
                 {
                     "pid": int(entry.name),
-                    "ppid": parent_pid,
+                    "ppid": parent_after,
                     "start_time": start_time,
-                    "state": state_before,
+                    "state": state_after,
                     "argv": argv,
                     "security": security_before,
                 }

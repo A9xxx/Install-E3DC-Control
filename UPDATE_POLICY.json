@@ -1,9 +1,9 @@
 {
-  "version": "5.5.1",
+  "version": "5.5.2",
   "min_version": "4.0.0",
-  "stable_release": "v5.5.1",
-  "release_date": "2026-09-28",
-  "description": "v5.5.1 - Wallbox-Phasenreservierung und -Hochschaltung, Wärmepumpen-Kanalbesitz und experimenteller Netzboost, pseudonymisiertes Diagnosepaket",
+  "stable_release": "v5.5.2",
+  "release_date": "2026-09-30",
+  "description": "v5.5.2 - Wallbox-Regelung, Fahrzeug-SoC, Batterie-Vitalverlauf, Wärmepumpen und Updatepflege",
   "update_strategy": "backup_replace_restart_v1",
   "installer_requires": "python3",
   "sanitized_republication": false,

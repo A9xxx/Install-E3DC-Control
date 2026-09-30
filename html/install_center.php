@@ -2793,6 +2793,19 @@ function installCenterDiagnosticCandidates() {
         ];
     }
     $auxMigrationPath = '/var/www/html/data/direct_marketing_aux_inverter_shelly_migration.json';
+    $batteryVitalsHistoryPath = '/var/www/html/data/battery_vitals_history.json';
+    if (is_file($batteryVitalsHistoryPath)) {
+        $items[] = [
+            'id' => 'data:battery_vitals_history.json',
+            'label' => 'Batterie-Vitalverlauf',
+            'kind' => 'data',
+            'path' => $batteryVitalsHistoryPath,
+            'size' => @filesize($batteryVitalsHistoryPath) ?: 0,
+            'bundle_size' => min(@filesize($batteryVitalsHistoryPath) ?: 0, 500000),
+            'default' => false,
+            'privacy' => 'Monatswerte nur nach Schrank- und Modulindex; keine Seriennummern, MAC-Adressen oder Namen.'
+        ];
+    }
     if (is_file($auxMigrationPath)) {
         $items[] = [
             'id' => 'data:direct_marketing_aux_inverter_shelly_migration.json',

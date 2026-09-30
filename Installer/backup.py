@@ -22,6 +22,7 @@ from .backup_retention import (
     WEB_INSTALLER_BACKUP_KEEP_COUNT,
     delete_verified_backup_family,
     prune_install_backups,
+    update_evidence_hint,
 )
 from .backup_integrity import (
     BackupIntegrityError,
@@ -708,6 +709,9 @@ def _backup_current_version_v2(
             )
             if not retention.get("success"):
                 raise BackupIntegrityError("Backup-Retention ist fehlgeschlagen.")
+            evidence_hint = update_evidence_hint(retention)
+            if evidence_hint:
+                _info_backup(evidence_hint)
             if not retention.get("limit_satisfied", True):
                 update_retention = retention.get("update_backups")
                 web_retention = retention.get("web_installer_backups")
@@ -1612,6 +1616,9 @@ def apply_backup_limit():
                     skipped_quiesced
                 )
             )
+    evidence_hint = update_evidence_hint(retention)
+    if evidence_hint:
+        print(f"ℹ {evidence_hint}")
     if retention.get("blocked"):
         print("⚠ Es wurden keine weiteren Backups rotiert.")
     elif not retention.get("success", True):

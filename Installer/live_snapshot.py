@@ -617,8 +617,20 @@ def read_runtime_live_snapshot(
     web_snapshot_max_age_s: float = 180.0,
     require_control_valid: bool = False,
     include_web_projection: bool = False,
+    diagnostics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Liefert einen frischen RAM-Disk-Snapshot ohne HTTP-/PHP-Rückkopplung."""
+    """Liefert einen frischen RAM-Disk-Snapshot ohne HTTP-/PHP-Rückkopplung.
+
+    ``diagnostics`` (optional) erhält bei einem leeren Ergebnis den Grund:
+    ``missing`` (Datei fehlt), ``stale`` mit ``age_s``, ``unreadable``,
+    ``incomplete`` (Kernwerte fehlen) oder ``control_invalid`` mit den
+    Gültigkeitsflags des RSCP-/Netzpunktvertrags.
+    """
+
+    def note(reason: str, **details: Any) -> None:
+        if isinstance(diagnostics, dict):
+            diagnostics.clear()
+            diagnostics.update({"reason": reason, **details})
 
     native, native_meta = read_bound_json_object(
         live_path,
@@ -627,14 +639,27 @@ def read_runtime_live_snapshot(
         copy_data=False,
     )
     if not native_meta.get("valid"):
+        age_s = _finite_number(native_meta.get("age_s"))
+        if age_s is not None and age_s > max(0.0, float(live_max_age_s)):
+            note("stale", age_s=age_s, max_age_s=float(live_max_age_s))
+        elif not os.path.lexists(live_path):
+            note("missing")
+        else:
+            note("unreadable", source_reason=native_meta.get("reason"))
         return {}
     projected = project_native_live(
         native,
         source_age_s=native_meta.get("age_s"),
     )
     if not projected:
+        note("incomplete")
         return {}
     if require_control_valid and projected.get("native_control_valid") is not True:
+        note(
+            "control_invalid",
+            rscp_sample_valid=projected.get("rscp_sample_valid") is True,
+            grid_power_valid=projected.get("grid_power_valid") is True,
+        )
         return {}
 
     if include_web_projection:

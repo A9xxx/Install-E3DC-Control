@@ -1852,7 +1852,7 @@ def test_connection(host: str, port: int, portal_user: str,
 
     # Key + Cipher
     key = rscp_password.encode('latin-1')[:32].ljust(32, b'\xff')
-    print(f"[DEBUG] RSCP-Key (hex): {key.hex()}")
+    print(f"[DEBUG] RSCP-Key: {'gesetzt' if key else 'fehlt'}")
     cipher = RscpCipher(key)
 
     # Auth-Frame bauen
@@ -1864,7 +1864,7 @@ def test_connection(host: str, port: int, portal_user: str,
     frame    = _build_frame(payload)
     encrypted = cipher.encrypt(frame)
 
-    print(f"[DEBUG] Payload:     {payload.hex()}")
+    print(f"[DEBUG] Auth-Payload: {len(payload)} Bytes (Zugangsdaten ausgeblendet)")
     print(f"[DEBUG] Frame[0:18]: {frame[0:18].hex()} (Header)")
     print(f"[DEBUG] Frame Gesamt: {len(frame)} Bytes")
     print(f"[DEBUG] Verschl. Gesamt: {len(encrypted)} Bytes")

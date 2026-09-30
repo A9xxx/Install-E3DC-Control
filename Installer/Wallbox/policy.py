@@ -281,6 +281,11 @@ class EnergyPolicyInput:
     predump_discharge_add_w: Optional[float] = None
     predump_discharge_contract_valid: bool = True
     grid_funded_wallbox_authorized: bool = False
+    # Haltezone an wbminSoC: veröffentlichter Rahmen des Speichers (W) oder
+    # None; ``bridging`` = der Speicher überbrückt gerade aus dem
+    # Wolkenkontingent (gehaltene Leistung).
+    wbminsoc_hold_zone_frame_w: Optional[float] = None
+    wbminsoc_hold_zone_bridging: bool = False
 
 
 def _identity_bound_wallbox_source_budget(
@@ -877,16 +882,33 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
         ctx.controlled_wallbox_wbminsoc_pause
         or controlled_floor_pv_only_active
     )
-    if controlled_floor_guard_mode_active:
+    # Haltezone an wbminSoC: Im Band einschließlich der Untergrenze ist der
+    # veröffentlichte Rahmen des Speichers das PV-Budget. Kein eigenes Budget,
+    # kein Taper, keine eigene Akkustützung; Netz-, Preis-, Boost- und
+    # Pre-Dump-Fenster behalten ihre eigenen Regeln.
+    hold_zone_frame_w: Optional[float] = None
+    if ctx.wbminsoc_hold_zone_frame_w is not None:
+        _hold_zone_value = _safe_float(ctx.wbminsoc_hold_zone_frame_w, -1.0)
+        if math.isfinite(_hold_zone_value) and _hold_zone_value >= 0.0:
+            hold_zone_frame_w = _hold_zone_value
+    hold_zone_active = bool(
+        hold_zone_frame_w is not None
+        and mode in (9, 10)
+        and not (
+            grid_funded_budget_authority_active
+            or ctx.price_boost_wallbox_active
+            or ctx.price_optimizing_active
+            or ctx.effective_allow_grid
+            or ctx.grid_unlocked_all_controllable
+            or ctx.predump_wallbox_active
+        )
+    )
+
+    def _floor_battery_guard_limit(limit_w: float) -> float:
+        """Akkuwächter der Untergrenze: senkt bei Akkuentladung über der Schwelle."""
+
+        nonlocal controlled_floor_battery_discharge_w, controlled_floor_battery_guard_active
         floor_phase_count = phases
-        floor_min_w = 6.0 * 230.0 * floor_phase_count
-        controlled_floor_netpoint_limit_w = max(0.0, allowed_w)
-        if controlled_floor_pv_only_active:
-            pv_only_limit_w = max(0.0, _safe_float(ctx.pv_surplus_ex_wb_w, 0.0))
-            controlled_floor_netpoint_limit_w = min(
-                controlled_floor_netpoint_limit_w,
-                pv_only_limit_w,
-            )
         controlled_floor_battery_discharge_w = max(0.0, -_safe_float(ctx.battery_power_raw, 0.0))
         floor_discharge_threshold_w = max(
             500.0,
@@ -902,11 +924,43 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
                 floor_down_step_w,
                 min(3.0 * 230.0 * floor_phase_count, floor_excess_w * 0.5),
             )
-            controlled_floor_netpoint_limit_w = min(
-                controlled_floor_netpoint_limit_w,
+            limit_w = min(
+                limit_w,
                 max(0.0, wb_actual - floor_down_step_w),
             )
             controlled_floor_battery_guard_active = True
+        return limit_w
+
+    if hold_zone_active:
+        floor_min_w = 6.0 * 230.0 * phases
+        controlled_floor_netpoint_limit_w = min(max(0.0, float(hold_zone_frame_w or 0.0)), max_phys_wb_w)
+        if controlled_floor_guard_mode_active and not bool(ctx.wbminsoc_hold_zone_bridging):
+            # An der Untergrenze wirkt der Akkuwächter weiter, aber nicht
+            # gegen eine Überbrückung aus dem Wolkenkontingent des Speichers.
+            controlled_floor_netpoint_limit_w = _floor_battery_guard_limit(
+                controlled_floor_netpoint_limit_w
+            )
+        allowed_w = max(0.0, controlled_floor_netpoint_limit_w)
+        display_wb_budget_curve_w = min(
+            display_wb_budget_curve_w,
+            max(0.0, allowed_w - floor_min_w),
+        )
+        if allowed_w < max(0.0, floor_min_w - 250.0):
+            curve_wb_relief_active = False
+            forecast_auto_relief_active = False
+    elif controlled_floor_guard_mode_active:
+        floor_phase_count = phases
+        floor_min_w = 6.0 * 230.0 * floor_phase_count
+        controlled_floor_netpoint_limit_w = max(0.0, allowed_w)
+        if controlled_floor_pv_only_active:
+            pv_only_limit_w = max(0.0, _safe_float(ctx.pv_surplus_ex_wb_w, 0.0))
+            controlled_floor_netpoint_limit_w = min(
+                controlled_floor_netpoint_limit_w,
+                pv_only_limit_w,
+            )
+        controlled_floor_netpoint_limit_w = _floor_battery_guard_limit(
+            controlled_floor_netpoint_limit_w
+        )
         allowed_w = max(0.0, controlled_floor_netpoint_limit_w)
         display_wb_budget_curve_w = min(
             display_wb_budget_curve_w,
@@ -1215,6 +1269,7 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
         "mode5_pv_surplus_active": bool(mode5_pv_surplus_active),
         "max_phys_wb_w": max(0.0, float(max_phys_wb_w)),
         "controlled_floor_battery_guard_active": bool(controlled_floor_battery_guard_active),
+        "wbminsoc_hold_zone_active": bool(hold_zone_active),
         "controlled_floor_battery_discharge_w": max(0.0, float(controlled_floor_battery_discharge_w)),
         "controlled_floor_netpoint_limit_w": max(0.0, float(controlled_floor_netpoint_limit_w)),
         "curve_wb_relief_active": bool(curve_wb_relief_active),

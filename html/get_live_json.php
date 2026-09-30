@@ -970,6 +970,138 @@ function liveApplyE3dcMultiHomeRelationFromConfig(&$data, $confData) {
     }
 }
 
+/**
+ * Hausverbrauchsanzeige aus zeitgleichen Werten bei Fremd-Wallboxen.
+ *
+ * Der E3DC-Hauswert (Frame mit Ende `_ts`, Dauer `_elapsed`) enthält die Last
+ * einer Fremd-Wallbox; abgezogen wird deren Leistung aus einer eigenen Messung
+ * (`sample_ts`). Ein neuer Anzeigewert entsteht nur, wenn die Wallboxleistung
+ * über den ganzen Frame belegt gleich war: letzte Leistungsänderung mindestens
+ * zwei Sekunden vor dem Framebeginn und eine Wallboxmessung nach dem Frameende.
+ * Sonst gilt der letzte zeitgleiche Wert (höchstens $maxHoldS alt). Reine Anzeige.
+ *
+ * $wbSamples: [Slot => ['valid' => bool, 'sample_ts' => int, 'power_w' => float]]
+ * Rückgabe: ['home' => float|null, 'state' => synchronous|held|unsynchronized, 'cache' => array]
+ */
+function liveExternalWallboxHomeSync($frameTs, $frameElapsed, $wbSamples, $currentHome, $cache, $now, $maxHoldS = 60) {
+    $number = static function ($value) {
+        return (is_int($value) || is_float($value) || (is_string($value) && is_numeric($value)))
+            && is_finite((float)$value) ? (float)$value : null;
+    };
+    $cache = is_array($cache) && ($cache['schema'] ?? null) === 'home_display_sync_v1'
+        ? $cache
+        : ['schema' => 'home_display_sync_v1', 'slots' => [], 'synced' => null];
+    if (!is_array($cache['slots'] ?? null)) $cache['slots'] = [];
+    $frameTs = $number($frameTs);
+    $frameElapsed = max(0.0, (float)($number($frameElapsed) ?? 0.0));
+    $currentHome = $number($currentHome);
+    $now = (float)($number($now) ?? time());
+    $synchronous = $frameTs !== null && $frameTs > 0.0 && $currentHome !== null;
+    foreach ((is_array($wbSamples) ? $wbSamples : []) as $slot => $sample) {
+        $slotKey = (string)$slot;
+        $sampleTs = is_array($sample) ? $number($sample['sample_ts'] ?? null) : null;
+        $power = is_array($sample) ? $number($sample['power_w'] ?? null) : null;
+        if (!is_array($sample) || ($sample['valid'] ?? null) !== true
+            || $sampleTs === null || $sampleTs <= 0.0 || $power === null) {
+            $synchronous = false;
+            continue;
+        }
+        $power = max(0.0, $power);
+        $previous = is_array($cache['slots'][$slotKey] ?? null) ? $cache['slots'][$slotKey] : null;
+        $previousPower = $previous !== null ? $number($previous['power_w'] ?? null) : null;
+        $tolerance = max(50.0, 0.03 * max($power, (float)($previousPower ?? 0.0)));
+        if ($previous === null || $previousPower === null || abs($power - $previousPower) > $tolerance) {
+            $cache['slots'][$slotKey] = ['power_w' => round($power, 1), 'change_ts' => $sampleTs, 'sample_ts' => $sampleTs];
+        } else {
+            $cache['slots'][$slotKey]['sample_ts'] = max((float)($number($previous['sample_ts'] ?? null) ?? 0.0), $sampleTs);
+        }
+        $slotState = $cache['slots'][$slotKey];
+        if (!$synchronous) continue;
+        if ((float)$slotState['sample_ts'] < $frameTs + 1.0
+            || ($frameTs - $frameElapsed) < (float)$slotState['change_ts'] + 2.0) {
+            $synchronous = false;
+        }
+    }
+    if ($synchronous) {
+        $cache['synced'] = ['home' => round($currentHome), 'frame_ts' => $frameTs, 'saved_ts' => $now];
+        return ['home' => round($currentHome), 'state' => 'synchronous', 'cache' => $cache];
+    }
+    $synced = is_array($cache['synced'] ?? null) ? $cache['synced'] : null;
+    $syncedHome = $synced !== null ? $number($synced['home'] ?? null) : null;
+    $syncedFrameTs = $synced !== null ? $number($synced['frame_ts'] ?? null) : null;
+    if ($syncedHome !== null && $syncedFrameTs !== null
+        && ($now - $syncedFrameTs) <= $maxHoldS && ($now - $syncedFrameTs) >= -5.0) {
+        return ['home' => $syncedHome, 'state' => 'held', 'cache' => $cache];
+    }
+    return ['home' => $currentHome, 'state' => 'unsynchronized', 'cache' => $cache];
+}
+
+function liveApplyExternalWallboxHomeSync(&$data, $liveData, $nativeWb, $cacheFile = '/var/www/html/ramdisk/home_display_sync.json') {
+    $slots = [];
+    if (!empty($data['is_external_wb'])) $slots[1] = 'wb';
+    if (!empty($data['is_external_wb2'])) $slots[2] = 'wb2';
+    if (!$slots || !is_array($liveData) || !isset($data['home']) || !is_numeric($data['home'])) {
+        $data['home_sync_state'] = 'not_applicable';
+        return;
+    }
+    $samples = [];
+    foreach ($slots as $slot => $prefix) {
+        $detail = null;
+        foreach ((is_array($nativeWb) ? ($nativeWb['wb_details'] ?? []) : []) as $candidate) {
+            if (is_array($candidate) && (int)($candidate['id'] ?? 0) === $slot) $detail = $candidate;
+        }
+        $observation = is_array($detail['observation'] ?? null) ? $detail['observation'] : [];
+        $values = is_array($observation['values'] ?? null) ? $observation['values'] : [];
+        $samples[$slot] = [
+            'valid' => ($observation['schema_version'] ?? null) === 'wallbox_observation_v1'
+                && ($observation['valid'] ?? null) === true,
+            'sample_ts' => $observation['sample_ts'] ?? null,
+            'power_w' => $values['power_w'] ?? null,
+        ];
+    }
+    $lock = @fopen($cacheFile . '.lock', 'c');
+    if ($lock === false || !@flock($lock, LOCK_EX)) {
+        if (is_resource($lock)) @fclose($lock);
+        $data['home_sync_state'] = 'unsynchronized';
+        return;
+    }
+    $oldBytes = is_readable($cacheFile) ? @file_get_contents($cacheFile) : false;
+    $cache = null;
+    if (is_string($oldBytes) && $oldBytes !== '') {
+        $decoded = json_decode($oldBytes, true);
+        if (is_array($decoded)) $cache = $decoded;
+    }
+    $result = liveExternalWallboxHomeSync(
+        $liveData['_ts'] ?? null,
+        $liveData['_elapsed'] ?? null,
+        $samples,
+        $data['home'],
+        $cache,
+        microtime(true)
+    );
+    $data['home_sync_state'] = $result['state'];
+    if ($result['home'] !== null) {
+        if ($result['state'] === 'held') $data['home_source'] = 'held_until_synchronous_frame';
+        $data['home'] = $result['home'];
+    }
+    $newBytes = json_encode($result['cache']);
+    if (is_string($newBytes) && $newBytes !== $oldBytes) {
+        $dir = dirname($cacheFile);
+        $tmp = @tempnam($dir, basename($cacheFile) . '.tmp.');
+        if (is_string($tmp)) {
+            // tempnam legt 0600 an; die HA-Synchronisierung liest die Ramdisk als Installationsnutzer.
+            @chmod($tmp, 0644);
+            $written = @file_put_contents($tmp, $newBytes);
+            if ($written === strlen($newBytes)) {
+                @rename($tmp, $cacheFile);
+            }
+            if (is_file($tmp)) @unlink($tmp);
+        }
+    }
+    @flock($lock, LOCK_UN);
+    @fclose($lock);
+}
+
 function stabilizeCleanHomePower(&$data) {
     $pv = isset($data['pv']) && is_numeric($data['pv']) ? (float)$data['pv'] : 0.0;
     $grid = isset($data['grid']) && is_numeric($data['grid']) ? (float)$data['grid'] : 0.0;
@@ -1605,14 +1737,8 @@ function wallboxVehicleSocRuleUsable($vehicle, $cloudFreshnessS = 900) {
         array_key_exists('soc_rule_confirmed', $vehicle)
     )) return false;
     $sourceTs = vehicleSocRecordTimestamp($vehicle);
-    $maxAgeS = e3dcVehicleSocPayloadMaxAgeSeconds(
-        $vehicle,
-        $source,
-        $cloudFreshnessS
-    );
     return $sourceTs !== null
-        && $maxAgeS !== null
-        && (time() - $sourceTs) <= $maxAgeS;
+        && e3dcVehicleSocRuleAgeValid($vehicle, $source, $sourceTs, time(), $cloudFreshnessS);
 }
 
 // Kompatibilitätsname: "confirmed" bezeichnet historisch ausschließlich die
@@ -1694,12 +1820,7 @@ function wallboxSocTruthConfirmed($source, $ruleConfirmed, $sourceTs, $now = nul
     $anchorTs = vehicleSocTimestamp($sourceTs, $now);
     if ($anchorTs === null) return false;
     $source = strtolower(trim((string)$source));
-    $maxAgeS = e3dcVehicleSocPayloadMaxAgeSeconds(
-        $agePayload,
-        $source,
-        $cloudFreshnessS
-    );
-    return $maxAgeS !== null && ($now - $anchorTs) <= $maxAgeS;
+    return e3dcVehicleSocRuleAgeValid($agePayload, $source, $anchorTs, $now, $cloudFreshnessS);
 }
 
 function vehicleSocPercentValue($value) {
@@ -1909,7 +2030,15 @@ function vehicleSocTruthMeta($vehicle, $now = null, $cloudFreshnessS = 900) {
     );
     $declaredContractInvalid = e3dcVehicleSocPayloadDeclaresAgeContract($vehicle)
         && $payloadMaxAgeS === null;
-    if (($trustedSource && $ageS === null)
+    // Eine sitzungsgebundene Cloud-Fortschreibung altert nicht mit ihrem Anker,
+    // solange der Tracker sie in derselben Stecksession bestätigt.
+    $sessionState = e3dcVehicleSocSessionContractState($vehicle, $originalSource, $now);
+    if ($sessionState === 'valid') {
+        if (($trustedSource && $ageS === null) || $declaredContractInvalid) {
+            $stale = true;
+        }
+    } elseif ($sessionState === 'invalid'
+        || ($trustedSource && $ageS === null)
         || $declaredContractInvalid
         || ($payloadMaxAgeS !== null && $ageS !== null && $ageS > $payloadMaxAgeS)
         || (($sourceClass === 'cloud' || $mqttAnchored) && !$producerAnchorExplicit)
@@ -1936,6 +2065,18 @@ function vehicleSocTruthMeta($vehicle, $now = null, $cloudFreshnessS = 900) {
         && (!(($sourceClass === 'cloud') || $mqttAnchored)
             || ($explicitProducerRule && $producerAnchorExplicit))
         && wallboxVehicleSocRuleUsable($vehicle, $cloudFreshnessS);
+    // Anzeigezustand einer Fortschreibung: regelwirksam („~NN % (geschätzt)“)
+    // oder in der laufenden Stecksession nur angezeigt („geschätzt, unbestätigt“).
+    $estimateState = null;
+    if ($sourceClass === 'estimated' && $displayUsable && !$stale) {
+        if ($ruleUsable) {
+            $estimateState = 'confirmed';
+        } elseif ($displayOnly
+            && ($vehicle['soc_estimate_unconfirmed'] ?? null) === true
+            && $sessionState === 'valid') {
+            $estimateState = 'unconfirmed';
+        }
+    }
 
     return [
         'value' => $displayUsable ? $value : null,
@@ -1950,6 +2091,10 @@ function vehicleSocTruthMeta($vehicle, $now = null, $cloudFreshnessS = 900) {
         'stale' => $stale,
         'display_usable' => $displayUsable,
         'rule_usable' => $ruleUsable,
+        'estimate_state' => $estimateState,
+        'estimate_reason' => $estimateState === 'unconfirmed'
+            ? (trim((string)($vehicle['soc_estimate_reason'] ?? '')) ?: null)
+            : null,
     ];
 }
 
@@ -2088,6 +2233,38 @@ function vehicleSocUnpluggedEstimateDisplay($manual, $now = null, $maxAgeS = 604
         $display['range_km'] = (int)round((float)$manual['range_km']);
     }
     return $display;
+}
+
+function e3dcLiveSessionEstimateKeys() {
+    return [
+        'soc_session_contract', 'soc_session_confirmed_ts', 'soc_session_max_age_s',
+        'soc_session_rise_pp', 'soc_session_rise_limit_pp',
+    ];
+}
+
+/**
+ * Fortschreibung derselben, von der Wallbox bestätigten Stecksession, die ohne
+ * neueren Fahrzeugwert über der Anstiegsgrenze liegt: Der Tracker bestätigt sie
+ * weiter, gibt sie aber nur zur Anzeige („geschätzt, unbestätigt“) frei.
+ */
+function liveSessionEstimateDisplayOnly($manual, $source, $sourceTs, $now = null) {
+    if (!is_array($manual)) return false;
+    $now = is_numeric($now) ? (int)$now : time();
+    if (($manual['soc_display_only'] ?? null) !== true
+        || ($manual['estimate_unconfirmed'] ?? null) !== true
+        || ($manual['soc_rule_confirmed'] ?? null) === true
+        || ($manual['plugged'] ?? null) !== true) {
+        return false;
+    }
+    $source = strtolower(trim((string)$source));
+    if (strpos($source, 'wallbox_estimated_from_') !== 0
+        || !wallboxSocSourceTrusted($source)
+        || vehicleSocExplicitVetoed($manual, true, false)
+        || vehicleSocPercentValue($manual['soc'] ?? null) === null
+        || vehicleSocTimestamp($sourceTs, $now) === null) {
+        return false;
+    }
+    return e3dcVehicleSocSessionContractState($manual, $source, $now) === 'valid';
 }
 
 function saveVehicleSocDisplayCache($file, $vehicles, $existingCache = [], $maxAgeS = 604800) {
@@ -2576,6 +2753,7 @@ function liveApplyWallboxObservationProjection(&$data, $native, $enabled, $confi
             $data[$prefix . $suffix] = $value;
             if ($value === null) $missing[] = $field;
         }
+        $data[$prefix . '_locked_source'] = is_bool($values['locked'] ?? null) ? 'measured' : null;
         // Alle öffentlichen Ist-Aliase folgen derselben aktuellen Messung.
         $data[$prefix . '_phases_actual'] = $data[$prefix . '_phases'];
         $phaseSource = $observation['phases_source'] ?? 'unknown';
@@ -2897,8 +3075,26 @@ function mergeVehicleRecords($base, $incoming, $cloudFreshnessS = 900) {
             && ($baseContract['base_source'] ?? '') === ($incomingContract['source'] ?? '')
             && ($merged['soc_profile_bound'] ?? null) === true
             && ($merged['is_interpolated'] ?? null) === true;
+        // Eine nur angezeigte Fortschreibung derselben Stecksession enthält die
+        // seit ihrem Cloudanker geladene Energie. Sie ersetzt den nicht mehr
+        // regelwirksamen Rohwert derselben Quelle mit gleichem oder älterem Stand.
+        $unconfirmedContinuesCloud = static function ($estimate, $cloud, $estimateContract, $cloudContract, $estimateTs, $cloudTs) {
+            return ($estimate['soc_estimate_unconfirmed'] ?? null) === true
+                && ($estimate['soc_display_only'] ?? null) === true
+                && ($estimateContract['derived'] ?? false) === true
+                && ($cloudContract['kind'] ?? '') === 'cloud'
+                && ($estimateContract['base_source'] ?? '') === ($cloudContract['source'] ?? '')
+                && $estimateTs !== null && $cloudTs !== null && $estimateTs >= $cloudTs
+                && liveBoolValue($estimate['is_plugged_in'] ?? false);
+        };
+        $incomingUnconfirmedContinues = $incomingTruthRank === 1 && $baseTruthRank === 1
+            && $unconfirmedContinuesCloud($incoming, $merged, $incomingContract, $baseContract, $incomingTs, $baseTs);
+        $baseUnconfirmedContinues = $incomingTruthRank === 1 && $baseTruthRank === 1
+            && $unconfirmedContinuesCloud($merged, $incoming, $baseContract, $incomingContract, $baseTs, $incomingTs);
         if ($incomingTruthRank !== $baseTruthRank) {
             $incomingSocWins = $incomingTruthRank > $baseTruthRank;
+        } elseif ($incomingUnconfirmedContinues || $baseUnconfirmedContinues) {
+            $incomingSocWins = $incomingUnconfirmedContinues;
         } elseif ($incomingDirectPro || $baseDirectPro) {
             $incomingSocWins = $incomingDirectPro;
         } elseif ($incomingContinuesCloud || $baseContinuesCloud) {
@@ -2935,7 +3131,9 @@ function mergeVehicleRecords($base, $incoming, $cloudFreshnessS = 900) {
             'soc_cache_ts', 'soc_source_ts', 'raw_soc_ts', 'is_interpolated',
             'soc_age_contract', 'soc_age_contract_source', 'soc_max_age_s',
             'driver_status_stale', 'driver_status_valid', 'soc_profile_bound',
-            'soc_display_only',
+            'soc_display_only', 'soc_estimate_unconfirmed', 'soc_estimate_reason',
+            'soc_session_contract', 'soc_session_confirmed_ts', 'soc_session_max_age_s',
+            'soc_session_rise_pp', 'soc_session_rise_limit_pp',
             'soc_observed_retained', 'soc_observed_received_ts',
             'last_updated_at',
         ] as $key) {
@@ -3130,6 +3328,8 @@ $data = [
     'bat1_v' => 0, 'bat1_a' => 0,
     'wb_status' => '',
     'wb_locked' => null,
+    'wb_locked_source' => null,
+    'wb2_locked_source' => null,
     'wb_plug' => null,
     'wb_charging' => null,
     'wb_status_valid' => false,
@@ -5729,6 +5929,9 @@ if (is_array($liveData) && isset($liveData['PV_Power'])) {
                     $openwbData['locked'] ?? $openwbData['lock_state'] ?? $openwbData['plug_locked'] ?? null,
                     $data['wb_plug']
                 );
+                $data['wb_locked_source'] = isset($openwbData['locked'])
+                    || isset($openwbData['lock_state'])
+                    || isset($openwbData['plug_locked']) ? 'measured' : 'synthesized';
                 $data['wb_session_kwh']     = round((float)($openwbData['session_kwh'] ?? 0), 2);
                 $wbDaily = normalizeOpenwbDailyKwh(
                     1,
@@ -5839,6 +6042,7 @@ if (is_array($liveData) && isset($liveData['PV_Power'])) {
                 if (is_bool($carConnectedRaw)) {
                     $data['wb_plug'] = $carConnectedRaw;
                     $data['wb_locked'] = $carConnectedRaw;
+                    $data['wb_locked_source'] = 'synthesized';
                 }
                 if (isset($wbLiveSession['power_w'])) {
                     $nativePwr = abs((float)$wbLiveSession['power_w']);
@@ -6010,10 +6214,12 @@ if (is_array($liveData) && isset($liveData['PV_Power'])) {
         if ($nativeAlgValid) {
             $data['wb_plug'] = (bool)$liveData['wb_plugged'];
             $data['wb_locked'] = (bool)$liveData['wb_locked'];
+            $data['wb_locked_source'] = 'measured';
             $data['wb_charging'] = (bool)$liveData['wb_charging'];
         } elseif (array_key_exists('wb_status_valid', $liveData)) {
             $data['wb_plug'] = null;
             $data['wb_locked'] = null;
+            $data['wb_locked_source'] = null;
             $data['wb_charging'] = null;
         }
         $data['wb_mode'] = (int)($liveData['wb_mode'] ?? ($data['wb_mode'] ?? 0));
@@ -6791,12 +6997,14 @@ if ($wbNativeEnable && ($wbConfigured || $wb2Configured) && file_exists($wbNativ
             if ($nativeWb1StatusInvalid) {
                 $data['wb_plug'] = false;
                 $data['wb_locked'] = false;
+                $data['wb_locked_source'] = null;
                 $data['wb_charging'] = false;
             } else {
                 $data['wb_plug'] = array_key_exists('plug', $nativeWb1) ? (bool)$nativeWb1['plug'] : null;
                 $data['wb_locked'] = array_key_exists('plug_locked', $nativeWb1)
                     ? (bool)$nativeWb1['plug_locked']
                     : ($data['wb_locked'] ?? $data['wb_plug']);
+                $data['wb_locked_source'] = array_key_exists('plug_locked', $nativeWb1) ? 'measured' : 'synthesized';
                 $data['wb_charging'] = array_key_exists('charging', $nativeWb1) ? (bool)$nativeWb1['charging'] : null;
             }
             if (array_key_exists('manual_pause', $nativeWb1)) {
@@ -6834,12 +7042,14 @@ if ($wbNativeEnable && ($wbConfigured || $wb2Configured) && file_exists($wbNativ
             if ($nativeWb2StatusInvalid) {
                 $data['wb2_plug'] = false;
                 $data['wb2_locked'] = false;
+                $data['wb2_locked_source'] = null;
                 $data['wb2_charging'] = false;
             } else {
                 $data['wb2_plug'] = array_key_exists('plug', $nativeWb2) ? (bool)$nativeWb2['plug'] : null;
                 $data['wb2_locked'] = array_key_exists('plug_locked', $nativeWb2)
                     ? (bool)$nativeWb2['plug_locked']
                     : (!empty($nativeWb2['plug']) || (($nativeWb2['state'] ?? '') !== 'Idle'));
+                $data['wb2_locked_source'] = array_key_exists('plug_locked', $nativeWb2) ? 'measured' : 'synthesized';
                 $data['wb2_charging'] = !empty($nativeWb2['charging']) || (($nativeWb2['state'] ?? '') === 'Lade');
             }
             if (array_key_exists('manual_pause', $nativeWb2)) {
@@ -7156,6 +7366,9 @@ if (($wb2NativeType === 'openwb' || $wb2NativeType === 'openwb_pro')
             $openwbData2['locked'] ?? $openwbData2['lock_state'] ?? $openwbData2['plug_locked'] ?? null,
             $data['wb2_plug']
         );
+        $data['wb2_locked_source'] = isset($openwbData2['locked'])
+            || isset($openwbData2['lock_state'])
+            || isset($openwbData2['plug_locked']) ? 'measured' : 'synthesized';
         $data['wb2_session_kwh'] = round((float)($openwbData2['session_kwh'] ?? 0), 2);
         $data['wb2_charging'] = (bool)($openwbData2['charge_state'] ?? false) || $owb2Power > 50;
         $wb2Daily = normalizeOpenwbDailyKwh(
@@ -7386,11 +7599,14 @@ if (abs((float)($data['wb'] ?? 0)) > 500 && !empty($data['wb_plug']) && ($data['
 // verriegelt und ladend bleiben getrennt.
 if (empty($data['wb_status_valid']) && (!isset($data['wb_locked']) || $data['is_external_wb'])) {
     $data['wb_locked'] = (abs($data['wb']) > 50);
+    if (($data['wb_locked_source'] ?? null) !== 'measured') $data['wb_locked_source'] = 'synthesized';
 }
 if (isset($data['wb2_plug']) || isset($data['wb2_charging'])) {
     $data['wb2_locked'] = !empty($data['wb2_plug']) || !empty($data['wb2_charging']) || abs($data['wb2']) > 50;
+    if (($data['wb2_locked_source'] ?? null) !== 'measured') $data['wb2_locked_source'] = 'synthesized';
 } elseif (!isset($data['wb2_locked']) || $data['wb2_locked'] === null || $data['is_external_wb2']) {
     $data['wb2_locked'] = (abs($data['wb2']) > 50);
+    if (($data['wb2_locked_source'] ?? null) !== 'measured') $data['wb2_locked_source'] = 'synthesized';
 }
 
 // Ein frisches wallbox_native.json belegt nur die Dateifrische. Sobald der
@@ -7405,6 +7621,7 @@ $nativeWb1StatusInvalid = $nativeWb1StatusInvalid || (
 if ($nativeWb1StatusInvalid) {
     $data['wb_plug'] = false;
     $data['wb_locked'] = false;
+    $data['wb_locked_source'] = null;
     $data['wb_charging'] = false;
     if ((int)($data['active_wb_id'] ?? 0) === 1) {
         unset($data['active_wb_id'], $data['active_wb_phases']);
@@ -7413,6 +7630,7 @@ if ($nativeWb1StatusInvalid) {
 if ($nativeWb2StatusInvalid) {
     $data['wb2_plug'] = false;
     $data['wb2_locked'] = false;
+    $data['wb2_locked_source'] = null;
     $data['wb2_charging'] = false;
     if ((int)($data['active_wb_id'] ?? 0) === 2) {
         unset($data['active_wb_id'], $data['active_wb_phases']);
@@ -7798,6 +8016,7 @@ if ($mqttHaInboundEnabled && file_exists($mqttHaInboundFile) && (time() - filemt
             if ($haVal !== null) {
                 $data[$prefix . '_plug'] = $haBool($haVal);
                 $data[$prefix . '_locked'] = $data[$prefix . '_plug'];
+                $data[$prefix . '_locked_source'] = 'synthesized';
             }
             $haVal = $getHaValue($haWb, 'charging');
             if ($haVal !== null) {
@@ -7839,6 +8058,8 @@ if ($mqttHaAppliedConsumer) {
 }
 
 liveApplyE3dcMultiHomeRelationFromConfig($data, $confData);
+// Anzeige: E3DC-Hauswert und Fremd-Wallboxleistung nur aus zeitgleichen Messungen verrechnen.
+liveApplyExternalWallboxHomeSync($data, $liveData ?? null, $nativeWb ?? null);
 stabilizeCleanHomePower($data);
 
 // Live-History: letzte 48 Stunden in Ramdisk schreiben (ohne price min/max/slots, mit Haus ohne WP)
@@ -8480,6 +8701,34 @@ if (!empty($savedCars)) {
                     $sc['is_interpolated'] = !empty($mD['is_interpolated']) || strpos((string)($mD['source'] ?? ''), 'estimated') !== false;
                     if (!empty($mD['range_km'])) $sc['range_km'] = (float)$mD['range_km'];
                     if (!empty($mD['consumption_kwh_100km'])) $sc['consumption_kwh_100km'] = (float)$mD['consumption_kwh_100km'];
+                    $sc['last_updated_at'] = (int)($mD['ts'] ?? time());
+                    $sc['soc_source_ts'] = $manualSourceTs;
+                    $sc['wb_slot'] = $manualSlot;
+                    $sc['is_plugged_in'] = true;
+                    $sc['is_charging'] = !empty($mD['charging']);
+                    foreach (e3dcLiveSessionEstimateKeys() as $sessionKey) {
+                        if (array_key_exists($sessionKey, $mD)) $sc[$sessionKey] = $mD[$sessionKey];
+                    }
+                } elseif ($mD && $manualProfileId !== null && $manualProfileId === ($sc['id'] ?? '')
+                    && wallboxSlotLooksConnected($data, $manualSlot)
+                    && liveSessionEstimateDisplayOnly($mD, $manualSource, $manualSourceTs)) {
+                    // Fortschreibung derselben Stecksession über der Anstiegsgrenze:
+                    // nur Anzeige („geschätzt, unbestätigt“), nie Regelwert.
+                    $sc['soc'] = $mD['soc'];
+                    $sc['soc_source'] = $manualSource;
+                    $sc['soc_rule_confirmed'] = false;
+                    $sc['soc_display_only'] = true;
+                    $sc['soc_estimate_unconfirmed'] = true;
+                    $sc['soc_estimate_reason'] = (string)($mD['estimate_unconfirmed_reason'] ?? '');
+                    $sc['soc_age_contract'] = $mD['soc_age_contract'] ?? null;
+                    $sc['soc_age_contract_source'] = $mD['soc_age_contract_source'] ?? null;
+                    $sc['soc_max_age_s'] = $mD['soc_max_age_s'] ?? null;
+                    foreach (e3dcLiveSessionEstimateKeys() as $sessionKey) {
+                        if (array_key_exists($sessionKey, $mD)) $sc[$sessionKey] = $mD[$sessionKey];
+                    }
+                    $sc['soc_profile_bound'] = ($mD['soc_profile_bound'] ?? null) === true;
+                    $sc['is_interpolated'] = true;
+                    if (!empty($mD['range_km'])) $sc['range_km'] = (float)$mD['range_km'];
                     $sc['last_updated_at'] = (int)($mD['ts'] ?? time());
                     $sc['soc_source_ts'] = $manualSourceTs;
                     $sc['wb_slot'] = $manualSlot;

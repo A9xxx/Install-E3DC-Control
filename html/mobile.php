@@ -23,6 +23,14 @@ handleRunUpdate();
 handleDailyStats();
 handleForceSocUpdate();
 handleSystemLog();
+// Bewusstes Umschalten der Wärmepumpen-Ansicht (?wp_view=neu|alt): Cookie setzen und weiterleiten
+if (function_exists('e3dcWpViewHandleRequest')) {
+    e3dcWpViewHandleRequest();
+}
+// POST aus der neuen Wärmepumpen-Ansicht: Ausgabe puffern, damit ein erfolgreicher Knopf per 303 zurückführt
+if (function_exists('e3dcWpViewBeginPostCapture')) {
+    e3dcWpViewBeginPostCapture();
+}
 
 // Logik einbinden (Config, Forecast, Preise)
 require_once 'logic.php';
@@ -100,8 +108,27 @@ if ($seite === 'charging') {
 $isDocker = e3dcIsDockerEnvironment();
 
 $protectedPages = ['config', 'wallbox', 'waermepumpe'];
+// Neue Wärmepumpen-Ansicht (Vorschau): gleiche Anmeldepflicht wie die bisherige Seite.
+$protectedPages[] = 'waermepumpe_vorschau';
+$wpvAjaxRequest = isset($_GET['ajax']) && $_GET['ajax'] == '1' && $seite === 'waermepumpe_vorschau';
 if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
+    if ($wpvAjaxRequest) {
+        requireWebAuth(true);
+    }
     $seite = 'lock';
+}
+
+// Gewählte Wärmepumpen-Ansicht (Cookie e3dc_wp_view): seite=waermepumpe zeigt die neue Ansicht nur bei
+// lesendem Aufruf, Cookie neu, eingeschaltetem Schalter und echter Wärmepumpe; sonst die bisherige Seite.
+$wpUsePreview = $seite === 'waermepumpe'
+    && function_exists('e3dcWpViewUsePreview')
+    && !empty($wpEnabled)
+    && e3dcWpViewUsePreview($_c ?? []);
+
+// Lesende Aktualisierung der neuen Ansicht: nur der Kartenausschnitt, ohne Seitenrahmen
+if ($wpvAjaxRequest && $seite === 'waermepumpe_vorschau') {
+    require_once 'waermepumpe_vorschau.php';
+    exit;
 }
 ?>
 <!DOCTYPE html>
@@ -813,7 +840,7 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
                     <i class="fas fa-car text-info me-3 text-center" style="width: 20px; font-size: 1.1rem;"></i> Fahrzeug Info
                 </a>
                 <?php if ($wpEnabled || $hsEnabled): ?>
-                <a href="mobile.php?seite=waermepumpe" class="list-group-item list-group-item-action bg-transparent text-body border-secondary py-3 <?= $seite=='waermepumpe'?'fw-bold text-danger active-style':'' ?>">
+                <a href="mobile.php?seite=waermepumpe" class="list-group-item list-group-item-action bg-transparent text-body border-secondary py-3 <?= ($seite=='waermepumpe' || $seite=='waermepumpe_vorschau')?'fw-bold text-danger active-style':'' ?>">
                     <i class="fas <?= $wpEnabled ? 'fa-fire text-danger' : 'fa-fire-burner text-warning' ?> me-3 text-center" style="width: 20px; font-size: 1.1rem;"></i> <?= $wpEnabled ? 'Wärmepumpe' : 'Heizstab' ?>
                 </a>
                 <?php endif; ?>
@@ -1430,7 +1457,14 @@ if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
         <?php endif; ?>
 
         <?php include 'config_editor.php'; ?>
-    <?php elseif ($seite === 'waermepumpe' && ($wpEnabled || $hsEnabled)): ?>
+    <?php elseif (($seite === 'waermepumpe_vorschau' || $wpUsePreview) && $wpEnabled && cfgBool(($_c ?? [])['wp_page_preview_enable'] ?? false, false)): ?>
+        <div class="mb-3 d-flex flex-wrap gap-2">
+            <a href="mobile.php" class="btn btn-outline-secondary btn-sm"><i class="fas fa-arrow-left me-2"></i>Zurück zum Dashboard</a>
+            <a href="mobile.php?seite=waermepumpe&amp;wp_view=alt" class="btn btn-outline-info btn-sm"><i class="fas fa-arrow-left me-2"></i>Zur bisherigen Ansicht</a>
+        </div>
+        <?php $wpvFlash = function_exists('e3dcWpViewTakeFlash') ? e3dcWpViewTakeFlash() : null; ?>
+        <?php include 'waermepumpe_vorschau.php'; ?>
+    <?php elseif ($seite === 'waermepumpe' && !$wpUsePreview && ($wpEnabled || $hsEnabled)): ?>
         <?php include 'waermepumpe.php'; ?>
     <?php elseif ($seite == 'history'): ?>
         <?php include 'history.php'; ?>

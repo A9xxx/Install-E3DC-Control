@@ -112,7 +112,10 @@ Die einfache Wallbox-Ansicht reduziert die Bedienung auf drei Entscheidungen:
   Ein frisch beobachteter openWB-Wert kann ab 5.4.5a mit Quelle und Alter als
   reine Anzeige erscheinen, wenn aktuelle Stecksession oder Fahrzeugprofil
   eindeutig passen. Er öffnet weder Planung noch Hardwarebefehl; andere
-  unbestätigte Werte bleiben als `-- SoC` sichtbar.
+  unbestätigte Werte bleiben als `-- SoC` sichtbar. Eine Fortschreibung aus
+  einem Cloudwert derselben Stecksession erscheint als „~NN % (geschätzt)“,
+  solange sie regelwirksam ist, und darüber als „~NN % geschätzt, unbestätigt“
+  mit Warnsymbol.
 
 Die Bedeutungen sind:
 
@@ -158,3 +161,30 @@ Die Ansicht ist bewusst browserlokal:
 - Es gibt keine versteckte globale Anlagenumschaltung nur durch UI-Navigation.
 
 Die eigentliche Anlagenlogik hängt ausschließlich an den gespeicherten Config-Werten, nicht an der sichtbaren Ansicht.
+## Batterie-Vitalverlauf
+
+Der periodische Storage-Simulator prüft höchstens einmal täglich, ob der rein diagnostische Monatsstand je Schrank und Modul unter `data/battery_vitals_history.json` bereits vorhanden ist. Nur die nach bestehendem HA-Vertrag schreibberechtigte Instanz startet die zeitlich begrenzte Aufzeichnung; die Vitals-Seite liest den Verlauf lediglich. Enthalten sind SoH, Zyklen, Kapazitätsangaben, Temperaturgrenzen und Zellspannungsspreizung sowie – nur bei vollständiger Tageshistorie – die Lade- und Entladeenergie des Vormonats. Fehlende Werte bleiben `null` und erhalten einen Qualitätsgrund. Die Historie beeinflusst keine Regelentscheidung und wird auf 240 Monatsstände begrenzt.
+
+
+## Neue Wärmepumpenansicht (experimentell)
+
+`wp_page_preview_enable` ist standardmäßig `0` (aus). Die neue Ansicht zeigt
+Anlagenbild und Betriebszustand aus Messwerten, auch auf Mobilgeräten. Die
+Ansichtswahl wird gemerkt; Boost, Warmwasser und Automatik verwenden dieselben
+Bedienaktionen wie die bisherige Seite. `wp_buffer_sensor` steht standardmäßig
+auf `none`; ein bewusst gewählter Pufferfühler beeinflusst nur die Anzeige.
+
+### Kurze Testanleitung
+
+1. Im Config-Editor unter Wärmepumpe **Neue Wärmepumpen-Ansicht (Vorschau)**
+   einschalten (`wp_page_preview_enable = 1`) und speichern. Auf der
+   Wärmepumpenseite **Neue Ansicht (Vorschau)** öffnen.
+2. Temperaturen, Leistungswerte und Verdichterstatus mit der bisherigen
+   Ansicht vergleichen. Fehlende Messwerte müssen als unbekannt erscheinen;
+   ein Sollwert oder eine Freigabe allein belegt keinen Verdichterlauf.
+   Die Ansicht auch auf einem Mobilgerät öffnen und nach erneutem Seitenaufruf
+   die gemerkte Ansicht prüfen.
+3. Bei Problemen zur bisherigen Ansicht wechseln oder den Schalter auf `0`
+   setzen. Betroffene Ansicht, erwartetes und beobachtetes Verhalten nennen
+   und ein **Diagnosepaket aus der Installationszentrale** beifügen; das Paket
+   vor dem Teilen prüfen.

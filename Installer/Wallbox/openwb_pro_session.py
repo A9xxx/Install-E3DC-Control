@@ -374,6 +374,11 @@ START_WINDOW_STALE_ABORT_FRAMES = 2
 # Übernahme eines stehenden Angebots nur bis
 # clamp (keine +2-A-Toleranz mehr) – darüber Startbefehl clamp bzw. regulating.
 START_WINDOW_ADOPT_TOLERANCE_A = 0.0
+# Ein eigener Befehl an eine laufende Ladung gilt bis zu dieser Toleranz über
+# dem stehenden Angebot noch als „nicht darüber“ (kein Start); mehr als diese
+# Toleranz darunter ist eine eigene Absenkung. Die Hälfte der kleinsten
+# Stromstufe (0,1 A der openWB Pro) trennt Messrauschen von einer Stufe.
+START_WINDOW_RUNNING_COMMAND_TOLERANCE_A = 0.05
 START_WINDOW_CYCLES_MAX = 3
 START_WINDOW_HLC_FACTOR = 2.0
 START_WINDOW_BUDGET_COHERENCE_FRAMES = 2
@@ -1072,6 +1077,223 @@ def start_disconnect_candidate_step(
         "candidate": candidate,
         "confirmed": confirmed,
     }
+
+
+# Verhalten nach dem Abstecken (Geräteeigenschaft je openWB Pro).
+# ``connect.php`` ist pegelgesteuert: Die Box behält nach dem Abstecken ihren
+# letzten Sollstrom. Nach einer bestätigten Trennung setzt der Manager genau
+# einmal ein definiertes Stehangebot: ``safe`` 0 A (nichts startet beim
+# Anstecken), ``fast_start`` 6 A (das Fahrzeug startet sofort, danach übernimmt
+# die normale Regelung das stehende Angebot).
+UNPLUG_OFFER_CONFIG_KEY_TEMPLATE = "wb{wb_id}_openwb_pro_unplug_offer"
+UNPLUG_OFFER_MODE_SAFE = "safe"
+UNPLUG_OFFER_MODE_FAST_START = "fast_start"
+UNPLUG_OFFER_TARGET_AMP = {
+    UNPLUG_OFFER_MODE_SAFE: 0.0,
+    UNPLUG_OFFER_MODE_FAST_START: 6.0,
+}
+UNPLUG_OFFER_CONTRACT = "openwb_pro_unplug_offer_v1"
+# Ein Befehl und höchstens zwei Wiederholungen je bestätigtem Sessionende.
+UNPLUG_OFFER_MAX_SENDS = 3
+UNPLUG_OFFER_RETRY_AFTER_S = 20.0
+UNPLUG_OFFER_READBACK_TOLERANCE_A = 0.25
+# Höchstens etwa ein Regelzyklus: ältere Samples sind kein Beleg.
+UNPLUG_OFFER_STATUS_MAX_AGE_S = 10.0
+UNPLUG_OFFER_ACTIVE_STAGES = ("pending", "await_readback")
+
+
+def unplug_offer_mode(
+    config: Optional[Dict[str, Any]] = None,
+    wb_id: Any = 0,
+) -> str:
+    """Konfigurierter Modus; fehlend oder ungültig gilt ``safe``."""
+
+    cfg = config if isinstance(config, dict) else {}
+    raw = str(
+        cfg.get(UNPLUG_OFFER_CONFIG_KEY_TEMPLATE.format(wb_id=_safe_int(wb_id, 0)))
+        or ""
+    ).strip().lower()
+    if raw in UNPLUG_OFFER_TARGET_AMP:
+        return raw
+    return UNPLUG_OFFER_MODE_SAFE
+
+
+def new_unplug_offer(
+    mode: Any,
+    *,
+    session_id: Any = "",
+    now_ts: Any = 0,
+) -> Dict[str, Any]:
+    """Offener Auftrag nach bestätigter Trennung, ohne Geräte-I/O."""
+
+    mode_value = str(mode or "").strip().lower()
+    if mode_value not in UNPLUG_OFFER_TARGET_AMP:
+        mode_value = UNPLUG_OFFER_MODE_SAFE
+    return {
+        "contract": UNPLUG_OFFER_CONTRACT,
+        "mode": mode_value,
+        "target_amp": UNPLUG_OFFER_TARGET_AMP[mode_value],
+        "session_id": str(session_id or ""),
+        "created_ts": _safe_float(now_ts, 0.0),
+        "stage": "pending",
+        "sends": 0,
+        "sent": False,
+        "sent_ts": 0.0,
+        "confirmed": False,
+        "confirmed_ts": 0.0,
+        "reported_amp": None,
+        "reason": "disconnect_confirmed",
+    }
+
+
+def unplug_offer_readback(
+    status: Optional[Dict[str, Any]] = None,
+    *,
+    now_ts: Any = 0,
+) -> Dict[str, Any]:
+    """Frischer, ausdrücklicher Steck- und Angebotszustand der Box.
+
+    Ein Angebot gilt nur als bekannt, wenn der Treiber es aus einem
+    erfolgreichen ``connect.php``-GET bestätigt (``offered_current_confirmed``).
+    Fehlende, veraltete oder ungültige Daten liefern ``fresh``/``offer_known``
+    ``False`` und sind nie eine Freigabe.
+    """
+
+    st = status if isinstance(status, dict) else {}
+    now_value = _safe_float(now_ts, 0.0)
+    sample_ts = max(
+        _safe_float(st.get("driver_status_last_sample_ts"), 0.0),
+        _safe_float(st.get("driver_status_last_ok_ts"), 0.0),
+    )
+    age_s = now_value - sample_ts if sample_ts > 0.0 else float("inf")
+    fresh = bool(
+        _fresh_valid_status(st)
+        and st.get("driver_status_stale") is False
+        and sample_ts > 0.0
+        and -2.0 <= age_s <= UNPLUG_OFFER_STATUS_MAX_AGE_S
+    )
+    offered = st.get("offered_current_raw")
+    offer_known = bool(
+        fresh
+        and st.get("offered_current_confirmed") is True
+        and isinstance(offered, (int, float))
+        and not isinstance(offered, bool)
+        and math.isfinite(float(offered))
+        and float(offered) >= 0.0
+    )
+    connection = _explicit_connection_state(st) if fresh else None
+    # Dieselben strengen Belege wie die Trennungsbestätigung: Schloss,
+    # Rohstecker und Fahrzeugcode widersprechen nicht, und es fließt real
+    # nichts (Ladeflag, Leistung, Phasenströme). Ein beibehaltenes
+    # Sollangebot ist dabei keine Aktivität.
+    disconnect_uncontested = bool(
+        connection is False
+        and _disconnect_evidence_uncontested(st)
+        and _explicit_disconnected_physical_idle(st)
+    )
+    return {
+        "fresh": fresh,
+        "connection": connection,
+        "disconnect_uncontested": disconnect_uncontested,
+        "offer_known": offer_known,
+        "offered_amp": float(offered) if offer_known else None,
+        "sample_ts": sample_ts,
+        "age_s": age_s if math.isfinite(age_s) else None,
+    }
+
+
+def unplug_offer_step_contract(
+    offer: Optional[Dict[str, Any]] = None,
+    status: Optional[Dict[str, Any]] = None,
+    *,
+    now_ts: Any = 0,
+    output_blocker: str = "",
+) -> Dict[str, Any]:
+    """Entscheidet den nächsten Schritt des Abstecken-Angebots, ohne I/O.
+
+    Aktionen: ``none`` (kein offener Auftrag), ``wait`` (nichts senden),
+    ``send`` (genau ein Strombefehl auf das Ziel), sowie die Endzustände
+    ``confirm``, ``superseded`` und ``exhausted``. Gesendet wird nur bei
+    frischem, ausdrücklich getrenntem Status, bekanntem Box-Angebot, das vom
+    Ziel abweicht, ohne Ausgangssperre und höchstens ``UNPLUG_OFFER_MAX_SENDS``
+    mal je Sessionende.
+    """
+
+    item = dict(offer) if isinstance(offer, dict) else {}
+    now_value = _safe_float(now_ts, 0.0)
+    result = {
+        "contract": UNPLUG_OFFER_CONTRACT + ":step",
+        "action": "none",
+        "reason": "inactive",
+        "offer": item,
+    }
+    stage = str(item.get("stage") or "")
+    if stage not in UNPLUG_OFFER_ACTIVE_STAGES:
+        return result
+    target = _safe_float(item.get("target_amp"), -1.0)
+    if target not in UNPLUG_OFFER_TARGET_AMP.values():
+        item.update({"stage": "invalid", "reason": "target_invalid"})
+        result.update({"action": "exhausted", "reason": "target_invalid"})
+        return result
+    readback = unplug_offer_readback(status, now_ts=now_value)
+    item["last_check_ts"] = now_value
+    result["readback"] = readback
+
+    def _wait(reason: str) -> Dict[str, Any]:
+        item["reason"] = reason
+        result.update({"action": "wait", "reason": reason})
+        return result
+
+    if not readback["fresh"]:
+        return _wait("status_not_fresh")
+    if readback["connection"] is True:
+        # Ein neues Anstecken beendet den Auftrag; die normale Regelung
+        # übernimmt ab hier, ohne dass das Abstecken-Angebot noch wirkt.
+        item.update({"stage": "superseded", "reason": "vehicle_plugged"})
+        result.update({"action": "superseded", "reason": "vehicle_plugged"})
+        return result
+    if readback["connection"] is not False:
+        return _wait("connection_state_unknown")
+    if not readback["disconnect_uncontested"]:
+        # Widerspruch (Leistung, Ladeflag, Phasenströme, Schloss oder
+        # Fahrzeugcode): weder senden noch bestätigen, kein Versuch verbraucht.
+        return _wait("disconnect_evidence_contested")
+    if not readback["offer_known"]:
+        return _wait("offer_readback_unknown")
+    sends = max(0, _safe_int(item.get("sends"), 0))
+    sent_ts = _safe_float(item.get("sent_ts"), 0.0)
+    if sends > 0 and readback["sample_ts"] <= sent_ts:
+        return _wait("await_fresh_readback")
+    reported = float(readback["offered_amp"])
+    item["reported_amp"] = reported
+    if abs(reported - target) <= UNPLUG_OFFER_READBACK_TOLERANCE_A:
+        reason = "readback_matches_target" if sends > 0 else "already_at_target"
+        item.update({
+            "stage": "confirmed",
+            "confirmed": True,
+            "confirmed_ts": now_value,
+            "reason": reason,
+        })
+        result.update({"action": "confirm", "reason": reason})
+        return result
+    if sends >= UNPLUG_OFFER_MAX_SENDS:
+        item.update({"stage": "unconfirmed", "reason": "readback_mismatch_after_retries"})
+        result.update({
+            "action": "exhausted",
+            "reason": "readback_mismatch_after_retries",
+        })
+        return result
+    if sends > 0 and now_value - sent_ts < UNPLUG_OFFER_RETRY_AFTER_S:
+        return _wait("retry_interval")
+    blocker = str(output_blocker or "")
+    if blocker:
+        return _wait(blocker)
+    result.update({
+        "action": "send",
+        "reason": "readback_differs_from_target" if sends == 0 else "readback_mismatch_retry",
+        "target_amp": target,
+    })
+    return result
 
 
 def start_reconnect_confirmation_contract(
@@ -3021,6 +3243,17 @@ def start_window_contract(
     slot_active = bool(inp.get("slot_active", False))
     command_ts = _safe_float(inp.get("command_ts"), 0.0)
     command_amp = _safe_float(inp.get("command_amp"), 0.0)
+    # Belege des Managers zum eigenen Befehl (Receipt): force_state des
+    # Befehls, Laufbeleg (frischer Status vor dem Befehl zeigte echte Ladung)
+    # und Absenkbeleg (zusätzlich lag der Befehl unter dem damaligen Angebot).
+    command_force_state = inp.get("command_force_state")
+    command_explicit_start = bool(
+        command_force_state is not None and _safe_float(command_force_state, 0.0) == 2.0
+    )
+    command_running_before = bool(inp.get("command_running_before", False))
+    command_running_reduction = bool(
+        command_running_before and inp.get("command_running_reduction", False)
+    )
     # Netzleistung (positiv = Bezug) für den Wh-Deckel; None = kein gültiger Wert.
     grid_raw = inp.get("grid_w")
     grid_w = _safe_float(grid_raw, 0.0) if grid_raw is not None else None
@@ -3138,6 +3371,31 @@ def start_window_contract(
     new_command = bool(
         command_ts > _safe_float(w.get("command_seen_ts"), 0.0)
         and command_amp >= 6.0
+    )
+    # Eigener Befehl an eine laufende Ladung: Das Fahrzeug lud laut Laufbeleg
+    # schon vor dem Befehl, lädt weiter (frischer Frame > 500 W) am stehenden
+    # Box-Angebot, der Befehl ist kein ausdrücklicher Start (force_state 2)
+    # und liegt ab 6 A nicht über diesem Angebot (Toleranz 0,05 A). Das ist
+    # kein Start; ein Start aus dem Leerlauf mit schnellem Readback und jede
+    # Anhebung bleiben Startbefehle. Liegt der Befehl darunter, oder belegt
+    # der Manager beim Befehl eine Absenkung (Receipt, auch wenn das Gerät sie
+    # bis zu diesem Frame schon zurückmeldet), ist es eine eigene Absenkung:
+    # Die laufende Ladung liegt über dem Budget. Jede Stufe zählt, auch die
+    # 0,1-A-Schritte der Defizitkaskade.
+    running_charge_command = bool(
+        new_command
+        and offer_seen
+        and confirm_now
+        and command_running_before
+        and not command_explicit_start
+        and command_amp <= offered_rb + START_WINDOW_RUNNING_COMMAND_TOLERANCE_A
+    )
+    running_charge_reduced = bool(
+        running_charge_command
+        and (
+            command_amp < offered_rb - START_WINDOW_RUNNING_COMMAND_TOLERANCE_A
+            or command_running_reduction
+        )
     )
 
     # Harte Kanten
@@ -3265,6 +3523,17 @@ def start_window_contract(
         w["last_change_ts"] = 0.0
         if _safe_float(w.get("cycle_anchor_ts"), 0.0) <= 0.0:
             w["cycle_anchor_ts"] = now
+        if running_charge_command:
+            # Der eigene Befehl an die laufende Ladung ist mit der Übernahme
+            # verbraucht und zählt später nicht als neuer Befehl.
+            w["command_seen_ts"] = command_ts
+        if running_charge_reduced:
+            # Die eigene Absenkung belegt, dass die laufende Ladung über dem
+            # Budget liegt: regulating wie oben, der Befehl ist verbraucht.
+            w["offer_amp"] = float(command_amp)
+            w["command_seen_ts"] = command_ts
+            goto(START_WINDOW_STATE_REGULATING, "running_charge_reduced")
+            return
         covered = bool(
             clamp_amp >= 6.0
             and offered_rb <= min(float(deckel_amp), clamp_amp + START_WINDOW_ADOPT_TOLERANCE_A)
@@ -3352,6 +3621,11 @@ def start_window_contract(
 
     if state == START_WINDOW_STATE_BUDGET_WAIT:
         if running_charge_adoptable:
+            adopt_running_charge("running_charge_adopted")
+        elif running_charge_command:
+            # Ein eigener Befehl an die laufende Ladung, der nicht über ihrem
+            # Angebot liegt, wird schon im ersten Frame übernommen; er ist kein
+            # start_command_issued. Eine Absenkung geht dabei auf regulating.
             adopt_running_charge("running_charge_adopted")
         elif new_command:
             adopt_command("start_command_issued", count_reemit=False)

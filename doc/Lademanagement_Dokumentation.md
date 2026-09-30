@@ -190,6 +190,22 @@ Pre-Dump, Quell-Erholung und Ladekurve werden allein vom Storage Manager
 geführt. Nach einem Neustart wird eine aktive Entladung nur aus einer frischen,
 sichtbaren Pre-Dump- oder Kurvenentscheidung wieder freigegeben.
 
+Netzbezug beim Laden begrenzen der Defizitregler des Wallbox Managers und als
+letzte Stufe der Grid-Wächter (anhaltend mehr als 500 W für 45 s: ladende
+Wallboxen über 6 A auf 6 A). Kurze Lastspitzen und den Bezug direkt nach einer
+Anhebung überlässt die Wallbox für die Einschwingfrist dem Hausspeicher, soweit
+er sie im Rahmen seiner wirksamen Entladegrenze ausgleichen kann; in der
+PV-only-Klasse, an der Notstromreserve und ohne gültigen
+Leistungseinstellungsbereich der Livewerte (Reichweite unbekannt) senkt sie
+sofort ab.
+Einzelheiten stehen in `Native_Wallbox.md`, Abschnitt „Netzbezug beim Laden:
+Einschwingfrist, Anhebung und Grid-Wächter“. Eine einzelne ungültige
+Liveprobe stoppt keine laufende Ladung: Der zuletzt ausgeführte Strom bleibt
+höchstens 10 s nach der letzten gültigen Probe stehen (je Wallbox höchstens
+10 s in 60 s), sofern diese Probe keinen Netzbezug zeigte; harte Grenzen wie
+Nutzer-`Aus`, Notstromreserve und Hausanschluss wirken sofort (Abschnitt
+„Ungültige Liveprobe: kurzer Halt“).
+
 ---
 
 ## 10. Lokale Verbrauchsprognose

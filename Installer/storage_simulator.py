@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import sys
 import json
 import copy
 import hashlib
@@ -10,6 +11,7 @@ import math
 import logging
 import queue
 import stat
+import subprocess
 import threading
 from datetime import datetime, timedelta
 
@@ -125,6 +127,155 @@ STORAGE_MANAGER_STATE_FILE = os.path.join(RAMDISK_DIR, "storage_manager_state.js
 WB_INTENT_FILE = os.path.join(RAMDISK_DIR, "wallbox_storage_intent.json")
 HISTORY_DIR = "/var/www/html/data/history_backups"
 EMERGENCY_CURVE_FILE = os.path.join(RAMDISK_DIR, "storage_emergency_curve.json")
+BATTERY_VITALS_HISTORY_FILE = "/var/www/html/data/battery_vitals_history.json"
+BATTERY_VITALS_TRIGGER_STATE_FILE = "/var/www/html/data/battery_vitals_trigger_state.json"
+BATTERY_VITALS_TIMEOUT_S = 90.0
+
+_BATTERY_VITALS_TRIGGER_LOCK = threading.Lock()
+_BATTERY_VITALS_LAST_CHECK_DATE = None
+
+
+def _battery_vitals_month_present(path, month):
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except (OSError, ValueError):
+        return False
+    months = payload.get("months") if isinstance(payload, dict) else None
+    return bool(
+        isinstance(months, list)
+        and any(isinstance(item, dict) and item.get("month") == month for item in months)
+    )
+
+
+def _battery_vitals_checked_today(path, day):
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+        return isinstance(payload, dict) and payload.get("last_check_date") == day
+    except (OSError, ValueError):
+        return False
+
+
+def _mark_battery_vitals_checked(path, day):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    temporary = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump(
+                {"schema": "battery_vitals_trigger_state_v1", "last_check_date": day},
+                stream,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _monitor_battery_vitals_process(process, timeout_s):
+    try:
+        process.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        logger.warning("Batterie-Vitalverlauf: Tagesversuch nach Zeitgrenze beendet.")
+
+
+def trigger_battery_vitals_history(
+    *,
+    now=None,
+    state_path=BATTERY_VITALS_TRIGGER_STATE_FILE,
+    history_path=BATTERY_VITALS_HISTORY_FILE,
+    admission_fn=None,
+    popen_fn=None,
+    thread_factory=None,
+):
+    """Startet höchstens einen nicht blockierenden Aufzeichnungsversuch je Tag."""
+
+    global _BATTERY_VITALS_LAST_CHECK_DATE
+    current = now or datetime.now().astimezone()
+    day = current.strftime("%Y-%m-%d")
+    month = current.strftime("%Y-%m")
+    with _BATTERY_VITALS_TRIGGER_LOCK:
+        if _BATTERY_VITALS_LAST_CHECK_DATE == day or _battery_vitals_checked_today(state_path, day):
+            return False
+        _BATTERY_VITALS_LAST_CHECK_DATE = day
+        try:
+            _mark_battery_vitals_checked(state_path, day)
+        except OSError as exc:
+            logger.warning(
+                "Batterie-Vitalverlauf: Tagesstatus nicht geschrieben (%s).",
+                type(exc).__name__,
+            )
+            return False
+
+        if _battery_vitals_month_present(history_path, month):
+            return False
+        try:
+            if admission_fn is None:
+                try:
+                    from .ha_writer_admission import evaluate_writer_admission
+                except ImportError:
+                    from ha_writer_admission import evaluate_writer_admission
+                admission_fn = evaluate_writer_admission
+            admission = admission_fn()
+        except Exception as exc:
+            logger.warning(
+                "Batterie-Vitalverlauf: keine Schreiberzulassung (%s).",
+                type(exc).__name__,
+            )
+            return False
+        if not isinstance(admission, dict) or admission.get("allowed") is not True:
+            return False
+
+        command = [
+            sys.executable,
+            "-B",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "vital_stats.py"),
+            "--once",
+            "--record-history",
+        ]
+        try:
+            process = (popen_fn or subprocess.Popen)(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Batterie-Vitalverlauf: Tagesversuch nicht gestartet (%s).",
+                type(exc).__name__,
+            )
+            return False
+        try:
+            monitor = (thread_factory or threading.Thread)(
+                target=_monitor_battery_vitals_process,
+                args=(process, BATTERY_VITALS_TIMEOUT_S),
+                name="battery-vitals-history",
+                daemon=True,
+            )
+            monitor.start()
+        except Exception as exc:
+            # Ohne Überwachung keine Zeitgrenze: Prozess beenden, Planzyklus läuft weiter.
+            try:
+                process.kill()
+            except Exception:
+                pass
+            logger.warning(
+                "Batterie-Vitalverlauf: Überwachung nicht gestartet (%s), Tagesversuch beendet.",
+                type(exc).__name__,
+            )
+            return False
+        logger.info("Batterie-Vitalverlauf: Tagesversuch gestartet.")
+        return True
 
 
 def _predump_deadline_ts(
@@ -9252,6 +9403,7 @@ def run_service():
     sim = StorageSimulator()
     last_input_signature = _storage_plan_input_signature()
     while True:
+        trigger_battery_vitals_history()
         last_input_signature = _generate_plan_bound_to_inputs(sim)
 
         if _storage_plan_requires_immediate_replan(sim):

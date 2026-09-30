@@ -107,6 +107,7 @@
 !/Installer/__init__.py
 !/Installer/aux_inverter_contract.py
 !/Installer/backup.py
+!/Installer/battery_vitals_history.py
 !/Installer/backup_integrity.py
 !/Installer/backup_retention.py
 !/Installer/bluelink_client.py
@@ -399,6 +400,7 @@
 !/html/sw.js
 !/html/vitals.php
 !/html/waermepumpe.php
+!/html/waermepumpe_vorschau.php
 !/html/wallbox_transaction.php
 !/html/webhook.php
 !/html/webpush_api.php

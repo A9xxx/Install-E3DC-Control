@@ -246,6 +246,79 @@ function e3dcVehicleSocPayloadMaxAgeSeconds($payload, $expectedSource, $cloudFre
 }
 
 /**
+ * Sitzungsgebundene Fortschreibung eines Cloud-SoC (Vertrag
+ * vehicle_soc_session_estimate_v1). In derselben, von der Wallbox bestätigten
+ * Stecksession zählt nicht das Alter des Ankers, sondern die laufende
+ * Bestätigung des Fahrzeug-SoC-Trackers. Spiegel von
+ * vehicle_soc_session_contract_state() in Installer/Wallbox/soc_tracker.py.
+ *
+ * Rückgabe: 'absent' (kein Vertrag oder keine Fortschreibung; dann gilt der
+ * Altersvertrag der Quelle), 'valid' (frisch bestätigt) oder 'invalid'.
+ */
+function e3dcVehicleSocSessionContractPrefix($payload) {
+    if (!is_array($payload)) return null;
+    foreach (['car_soc', 'soc'] as $prefix) {
+        foreach (['_session_contract', '_session_confirmed_ts', '_session_max_age_s'] as $suffix) {
+            if (array_key_exists($prefix . $suffix, $payload)) return $prefix;
+        }
+    }
+    return null;
+}
+
+function e3dcVehicleSocSessionConfirmedTs($payload) {
+    $prefix = e3dcVehicleSocSessionContractPrefix($payload);
+    if ($prefix === null) return null;
+    $raw = $payload[$prefix . '_session_confirmed_ts'] ?? null;
+    if (is_bool($raw) || !is_numeric($raw)) return null;
+    $value = (float)$raw;
+    if (!is_finite($value) || $value <= 0.0) return null;
+    return $value > 100000000000.0 ? $value / 1000.0 : $value;
+}
+
+function e3dcVehicleSocSessionContractState($payload, $source, $now = null) {
+    $prefix = e3dcVehicleSocSessionContractPrefix($payload);
+    if ($prefix === null) return 'absent';
+    $contract = e3dcVehicleSocSourceContract($source);
+    if (!is_array($contract) || empty($contract['derived'])) return 'absent';
+    $base = e3dcVehicleSocSourceContract($contract['base_source']);
+    if (!is_array($base) || $base['kind'] !== 'cloud') return 'invalid';
+    if (($payload[$prefix . '_session_contract'] ?? null) !== 'vehicle_soc_session_estimate_v1') {
+        return 'invalid';
+    }
+    $maxAge = $payload[$prefix . '_session_max_age_s'] ?? null;
+    if ((!is_int($maxAge) && !is_float($maxAge)) || (float)$maxAge !== 300.0) return 'invalid';
+    $confirmedTs = e3dcVehicleSocSessionConfirmedTs($payload);
+    $now = is_numeric($now) ? (float)$now : (float)time();
+    if ($confirmedTs === null
+        || $confirmedTs > $now + 300.0
+        || ($now - $confirmedTs) > 300.0) {
+        return 'invalid';
+    }
+    return 'valid';
+}
+
+/**
+ * Kanonische Altersprüfung regelwirksamer Fahrzeug-SoCs (Spiegel von
+ * vehicle_soc_rule_age_valid()): Sitzungsfortschreibung nach Trackerbestätigung,
+ * alle übrigen Quellen nach ihrem Altersvertrag ab dem Quellzeitpunkt.
+ */
+function e3dcVehicleSocRuleAgeValid($payload, $source, $sourceTs, $now = null, $cloudFreshnessS = 900) {
+    if (is_bool($sourceTs) || !is_numeric($sourceTs)) return false;
+    $sourceTs = (float)$sourceTs;
+    if ($sourceTs > 100000000000.0) $sourceTs /= 1000.0;
+    if (!is_finite($sourceTs) || $sourceTs <= 0.0) return false;
+    $now = is_numeric($now) ? (float)$now : (float)time();
+    if (!is_finite($now) || $now <= 0.0 || $sourceTs > $now + 60.0) return false;
+    $state = e3dcVehicleSocSessionContractState($payload, $source, $now);
+    if ($state === 'valid') {
+        return $sourceTs <= e3dcVehicleSocSessionConfirmedTs($payload) + 300.0;
+    }
+    if ($state === 'invalid') return false;
+    $maxAgeS = e3dcVehicleSocPayloadMaxAgeSeconds($payload, $source, $cloudFreshnessS);
+    return $maxAgeS !== null && ($now - $sourceTs) <= $maxAgeS;
+}
+
+/**
  * Validiert eine Netzfrequenz-Messung als strikt typisierten, frischen Wert.
  *
  * Ein numerischer String ist kein Messwertvertrag. Der Aufrufer muss die
@@ -2754,6 +2827,224 @@ function getContextPageUrl($seite, $params = []) {
 
     $query = array_merge(['seite' => $seite], $params);
     return $entrypoint . '?' . http_build_query($query);
+}
+
+// ==================== WÄRMEPUMPEN-ANSICHT (NEU/ALT) ====================
+// Reine Darstellungswahl: Cookie e3dc_wp_view = neu|alt. Sie schaltet keine Funktion, keinen Endpunkt
+// und keine Aktion. Die neue Ansicht erscheint nur, wenn der Schalter wp_page_preview_enable an ist.
+
+/**
+ * Zieldatei der aktuellen Oberfläche für Wärmepumpen-Verweise: nur index.php oder mobile.php,
+ * alles andere fällt auf index.php zurück.
+ */
+function e3dcWpViewEntrypoint($scriptName = null) {
+    if ($scriptName === null) {
+        $scriptName = $_SERVER['SCRIPT_NAME'] ?? '';
+    }
+    if (!is_string($scriptName)) {
+        return 'index.php';
+    }
+    $script = basename(str_replace('\\', '/', $scriptName));
+    return in_array($script, ['index.php', 'mobile.php'], true) ? $script : 'index.php';
+}
+
+/** Gültiger Wert einer Ansichtswahl (neu|alt) oder null. Alles andere ist ungültig. */
+function e3dcWpViewNormalize($value) {
+    return (is_string($value) && ($value === 'neu' || $value === 'alt')) ? $value : null;
+}
+
+/** Zuletzt gewählte Ansicht aus dem Cookie; ohne gültigen Cookie gilt die bisherige Ansicht. */
+function e3dcWpViewFromCookie($cookies = null) {
+    if ($cookies === null) {
+        $cookies = $_COOKIE;
+    }
+    $value = is_array($cookies) ? ($cookies['e3dc_wp_view'] ?? null) : null;
+    return e3dcWpViewNormalize($value) ?? 'alt';
+}
+
+/**
+ * Wärmepumpen-Seitenkontext aus der Konfiguration; einzige Quelle für waermepumpe.php und die Routen.
+ * preview_offered: Die neue Ansicht darf angeboten werden (echte Wärmepumpe, keine Heizstab- und keine
+ * Nur-Laden-Seite, Schalter wp_page_preview_enable an).
+ */
+function e3dcWpPageContext($conf, $pageContext = 'waermepumpe') {
+    $conf = is_array($conf) ? $conf : [];
+    $conf['luxtronik'] = $conf['luxtronik'] ?? 0;
+    $conf['wp_type'] = $conf['wp_type'] ?? -1;
+    $wpType = (int)$conf['wp_type'];
+    $hasNative = isHeatpumpEnabledConfig($conf);
+    $hasHeater = isHeaterEnabledConfig($conf);
+    $isChargingOnly = ($pageContext === 'charging')
+        || ($wpType < 0 && !$hasNative && !$hasHeater && (string)$conf['luxtronik'] === '0');
+    $isHeaterPage = !$isChargingOnly && ($wpType === 2 || (!$hasNative && $hasHeater));
+    if (!$isChargingOnly && $wpType === 6 && $hasHeater) {
+        // Beim E3DC-Leistungsmesser bleibt eine konfigurierte Heizstab-Seite wie bisher sichtbar.
+        $isHeaterPage = true;
+    }
+    return [
+        'has_native' => $hasNative,
+        'has_heater' => $hasHeater,
+        'charging_only' => $isChargingOnly,
+        'heater_page' => $isHeaterPage,
+        'preview_offered' => $hasNative && !$isHeaterPage && !$isChargingOnly
+            && cfgBool($conf['wp_page_preview_enable'] ?? false, false),
+    ];
+}
+
+/**
+ * Zeigt seite=waermepumpe die neue Ansicht? Nur bei lesendem Aufruf, Cookie neu und angebotener
+ * neuer Ansicht. POST-Aufrufe erreichen immer die Handler der bisherigen Seite.
+ */
+function e3dcWpViewUsePreview($conf, $cookies = null, $method = null) {
+    if ($method === null) {
+        $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+    }
+    $method = strtoupper((string)$method);
+    if ($method !== 'GET' && $method !== 'HEAD') {
+        return false;
+    }
+    if (e3dcWpViewFromCookie($cookies) !== 'neu') {
+        return false;
+    }
+    return e3dcWpPageContext($conf)['preview_offered'];
+}
+
+function e3dcWpViewIsHttps($server = null) {
+    if ($server === null) {
+        $server = $_SERVER;
+    }
+    $https = strtolower((string)($server['HTTPS'] ?? ''));
+    if ($https !== '' && $https !== 'off') {
+        return true;
+    }
+    if ((string)($server['SERVER_PORT'] ?? '') === '443') {
+        return true;
+    }
+    return strtolower((string)($server['HTTP_X_FORWARDED_PROTO'] ?? '')) === 'https';
+}
+
+/** Rücksprung-URL nach dem Umschalten: gleiche Oberfläche, gleiche Parameter ohne wp_view. */
+function e3dcWpViewRedirectUrl($scriptName, $get) {
+    $query = is_array($get) ? $get : [];
+    unset($query['wp_view']);
+    return e3dcWpViewEntrypoint($scriptName) . ($query ? '?' . http_build_query($query) : '');
+}
+
+/**
+ * Bewusstes Umschalten (?wp_view=neu|alt): Cookie setzen und ohne den Parameter weiterleiten.
+ * Ungültige Werte werden ignoriert. Muss vor jeder Ausgabe laufen.
+ */
+function e3dcWpViewHandleRequest() {
+    if (strtoupper((string)($_SERVER['REQUEST_METHOD'] ?? 'GET')) !== 'GET') {
+        return;
+    }
+    $requested = e3dcWpViewNormalize($_GET['wp_view'] ?? null);
+    if ($requested === null || headers_sent()) {
+        return;
+    }
+    $expires = time() + 31536000;
+    $secure = e3dcWpViewIsHttps();
+    if (PHP_VERSION_ID >= 70300) {
+        setcookie('e3dc_wp_view', $requested, [
+            'expires' => $expires,
+            'path' => '/',
+            'secure' => $secure,
+            'httponly' => true,
+            'samesite' => 'Lax',
+        ]);
+    } else {
+        setcookie('e3dc_wp_view', $requested, $expires, '/; samesite=Lax', '', $secure, true);
+    }
+    header('Location: ' . e3dcWpViewRedirectUrl($_SERVER['SCRIPT_NAME'] ?? '', $_GET));
+    exit;
+}
+
+// ---- Knöpfe der neuen Ansicht: Post/Redirect/Get mit Rückmeldung -------------------------
+// Die Handler in waermepumpe.php bleiben die einzige Logik (Anmeldung, CSRF, Skriptaufrufe). Kam der POST aus
+// der neuen Ansicht (verstecktes Feld wpv_origin=neu, Cookie neu, Ansicht angeboten), wird die Seitenausgabe
+// gepuffert. Meldet ein Handler einen Erfolg (e3dcWpViewRecordOutcome), verwirft die Abschlussfunktion die
+// Ausgabe der bisherigen Seite und antwortet mit 303 auf <Oberfläche>?seite=waermepumpe; die Rückmeldung steht
+// als fester Schlüssel in der Session und wird einmal aus der festen Textzuordnung angezeigt. Jeder Fehler
+// (kein Schlüssel gemeldet) bleibt bei der bisherigen Ausgabe des Handlers. Ein vom Handler gesetzter Fehlerstatus
+// (500, 403) wird dabei erst wirksam, weil die Ausgabe gepuffert ist; ohne Puffer war er nach dem Seitenkopf wirkungslos.
+
+/** Feste Zuordnung Schlüssel zu Rückmeldetext; es gibt nur Erfolge. Kein Text stammt aus Anfragedaten. */
+function e3dcWpViewOutcomeTexts() {
+    return [
+        'boost_on' => 'Boost-Auftrag gespeichert.',
+        'boost_off' => 'Boost-Stopp gespeichert.',
+        'ww_on' => 'Manuelle Warmwasser-Anforderung wurde sicher gespeichert.',
+        'ww_off' => 'Manuelle Warmwasser-Anforderung wurde sicher beendet.',
+        'auto_on' => 'Automatik eingeschaltet: Einstellung gespeichert, Energy-Manager neu gestartet.',
+        'auto_off' => 'Automatik ausgeschaltet: Einstellung gespeichert, Energy-Manager neu gestartet.',
+    ];
+}
+
+/** Ein Handler meldet einen Erfolg; unbekannte Schlüssel werden ignoriert. */
+function e3dcWpViewRecordOutcome($key) {
+    if (is_string($key) && isset(e3dcWpViewOutcomeTexts()[$key])) {
+        $GLOBALS['e3dcWpViewOutcome'] = $key;
+    }
+}
+
+/** Puffert die Seitenausgabe, wenn der POST aus der neuen Ansicht kommt. Liefert true, wenn gepuffert wird. */
+function e3dcWpViewBeginPostCapture() {
+    if (strtoupper((string)($_SERVER['REQUEST_METHOD'] ?? 'GET')) !== 'POST') {
+        return false;
+    }
+    if (($_POST['wpv_origin'] ?? null) !== 'neu' || ($_GET['seite'] ?? null) !== 'waermepumpe') {
+        return false;
+    }
+    if (e3dcWpViewFromCookie() !== 'neu' || headers_sent()) {
+        return false;
+    }
+    $loaded = loadE3dcConfig();
+    $conf = (is_array($loaded) && empty($loaded['error']) && is_array($loaded['config'] ?? null)) ? $loaded['config'] : [];
+    if (!e3dcWpPageContext($conf)['preview_offered']) {
+        return false;
+    }
+    ob_start();
+    register_shutdown_function('e3dcWpViewFinishPostCapture', e3dcWpViewEntrypoint($_SERVER['SCRIPT_NAME'] ?? ''));
+    return true;
+}
+
+/** Abschluss der gepufferten Anfrage: bei gemeldetem Erfolg 303 in die neue Ansicht, sonst bisheriges Verhalten. */
+function e3dcWpViewFinishPostCapture($entrypoint) {
+    $key = $GLOBALS['e3dcWpViewOutcome'] ?? null;
+    if (!is_string($key) || !isset(e3dcWpViewOutcomeTexts()[$key])) {
+        return;
+    }
+    $error = error_get_last();
+    if (is_array($error) && in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR, E_RECOVERABLE_ERROR], true)) {
+        return;
+    }
+    if (headers_sent()) {
+        return;
+    }
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        $_SESSION['e3dc_wpv_flash'] = ['key' => $key, 'ts' => time()];
+        session_write_close();
+    }
+    while (ob_get_level() > 0) {
+        ob_end_clean();
+    }
+    header('Location: ' . e3dcWpViewEntrypoint($entrypoint) . '?seite=waermepumpe', true, 303);
+}
+
+/** Einmalige Rückmeldung nach dem Redirect (Text aus der festen Zuordnung, höchstens 120 s alt) oder null. */
+function e3dcWpViewTakeFlash($now = null) {
+    if (session_status() !== PHP_SESSION_ACTIVE || !isset($_SESSION['e3dc_wpv_flash'])) {
+        return null;
+    }
+    $flash = $_SESSION['e3dc_wpv_flash'];
+    unset($_SESSION['e3dc_wpv_flash']);
+    $texts = e3dcWpViewOutcomeTexts();
+    $now = ($now === null) ? time() : (int)$now;
+    if (!is_array($flash) || !is_string($flash['key'] ?? null) || !isset($texts[$flash['key']])
+        || !is_int($flash['ts'] ?? null) || $now - $flash['ts'] > 120 || $flash['ts'] - $now > 5) {
+        return null;
+    }
+    return $texts[$flash['key']];
 }
 
 /**

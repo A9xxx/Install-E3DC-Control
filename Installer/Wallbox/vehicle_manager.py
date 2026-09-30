@@ -19,6 +19,44 @@ from .modes import MODE_OFF, normalize_wb_mode
 VehicleSocTracker = wallbox_soc_tracker.VehicleSocTracker
 
 
+def _transport_session_estimate_contract(status, soc_info):
+    """Überträgt den Sitzungsvertrag der Fortschreibung in den Wallboxstatus.
+
+    Fehlt er in der aktuellen Trackerausgabe, werden alte Statusfelder entfernt,
+    damit kein früherer Zyklus eine Bestätigung vortäuscht. Eine nur angezeigte
+    Schätzung trägt ihren Grund in ``car_soc_rule_reason``.
+    """
+
+    if not isinstance(status, dict):
+        return
+    info = soc_info if isinstance(soc_info, dict) else {}
+    for key in wallbox_soc_tracker.SESSION_ESTIMATE_KEYS:
+        target = "car_" + key
+        if key in info:
+            status[target] = info[key]
+        else:
+            status.pop(target, None)
+    if info.get("soc_display_only") is True:
+        status["car_soc_rule_reason"] = str(info.get("estimate_unconfirmed_reason") or "")
+    else:
+        status.pop("car_soc_rule_reason", None)
+
+
+def _withdraw_stale_tracker_soc_rule(status):
+    """Ohne aktuelle Trackerausgabe bleibt kein früherer Trackerwert regelwirksam.
+
+    Cloudwerte und deren Fortschreibung gelangen nur über den Tracker in den
+    Wallboxstatus. Liefert er in diesem Zyklus nichts, gilt ein solcher Wert
+    nicht mehr als bestätigt; eigene Treiberwerte bleiben unberührt.
+    """
+
+    if not isinstance(status, dict) or status.get("car_soc_rule_confirmed") is not True:
+        return
+    contract = wallbox_soc_tracker.vehicle_soc_source_contract(status.get("car_soc_source"))
+    if contract is not None and (contract["derived"] or contract["kind"] == "cloud"):
+        status["car_soc_rule_confirmed"] = False
+
+
 def request_missing_openwb_cloud_soc(wb_id, config, status, soc_info=None, now=None):
     """Fordere fehlenden SoC einmal pro Stecksession beim Cloud-Dienst an.
 
@@ -53,6 +91,9 @@ def request_missing_openwb_cloud_soc(wb_id, config, status, soc_info=None, now=N
         )
         or wallbox_soc_tracker._openwb_pro_direct_soc_fresh(status, now=now)
         or (isinstance(soc_info, dict) and soc_info.get("soc_rule_confirmed") is True)
+        # Eine Verlaufslücke ist kein Anlass, das Fahrzeug erneut abzufragen.
+        or (isinstance(soc_info, dict) and soc_info.get("estimate_unconfirmed_reason")
+            == wallbox_soc_tracker.SOC_ANCHOR_HISTORY_INCOMPLETE_REASON)
     ):
         return False
     session_id = str(status.get("plug_session_id") or "").strip()
@@ -437,6 +478,8 @@ class VehicleManager:
         if str(charger_class or "") == "OpenWBProCharger":
             request_missing_openwb_cloud_soc(wb_id, config, status, soc_info=soc_info)
         if not soc_info:
+            _transport_session_estimate_contract(status, None)
+            _withdraw_stale_tracker_soc_rule(status)
             if (invalid_total_range or invalid_charged_range) and write_status is not None:
                 try:
                     write_status()
@@ -468,6 +511,9 @@ class VehicleManager:
         status["car_soc_age_contract"] = age_contract.get("schema_version")
         status["car_soc_age_contract_source"] = age_contract.get("source")
         status["car_soc_max_age_s"] = age_contract.get("max_age_s")
+        # Sitzungsvertrag der Fortschreibung unverändert mitführen; ohne ihn gilt
+        # ausschließlich der Altersvertrag der Quelle.
+        _transport_session_estimate_contract(status, soc_info)
         # Profil-/Cloud-/SoC-Zuordnung bleibt ein eigener Diagnosebereich.
         # Sie darf die vom Treiber gelieferte aktuelle Stecksession-ID nicht
         # ersetzen und damit keinen OBC-Hardcap aktivieren.

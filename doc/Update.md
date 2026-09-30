@@ -5,25 +5,13 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.5.1`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.5.2`. Das Dashboard startet ausschließlich
 den argumentlosen, root-eigenen Systemjob. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
 
-5.5.1 verbessert an der openWB Pro und am E3DC-Direktvertrag die
-Phasenreservierung und den bestätigten Wiederanlauf der Hochschaltung 1p→3p,
-ergänzt ein optionales 10-Minuten-Fenster für einen früheren 3p-Start, nimmt
-bei der Luxtronik einen laufenden PV-Boost nach „Automatik darf steuern“ aus
-geordnet zurück, ergänzt einen experimentellen Netzboost bei Negativpreisen,
-pseudonymisiert
-Kennungen im Diagnosepaket der Installationszentrale und lässt die API
-zusätzlich den Header `Authorization: Bearer` annehmen. Das Update läuft wie
-gewohnt über **System Update** bzw. das [Docker-Update](#docker-update); eine
-Konfigurationsänderung ist nicht nötig, da alle neuen Schalter standardmäßig
-aus sind. Einzelheiten stehen in den [Release Notes](../RELEASE_NOTES.md). Für
-ein Update von 5.4.x gelten zusätzlich die weiter unten stehenden Hinweise zu
-5.5.0a und 5.5.0.
+5.5.2 beruhigt die Wallbox-Regelung, führt die Fahrzeug-SoC-Hochrechnung innerhalb derselben Stecksession fort und ergänzt den monatlichen Batterie-Vitalverlauf. Wärmepumpenaufträge überbrücken kurze Datenlücken; PV-Sollwerte und Warmwasser-Timer werden zuverlässiger gehalten. Die neue Wärmepumpenansicht und der Stiebel-ISG-SG-Ready-Ausgang sind experimentell und standardmäßig aus. Das Update benötigt keine Konfigurationsänderung. Einzelheiten stehen in den [Release Notes](../RELEASE_NOTES.md). Für ein Update von 5.4.x gelten zusätzlich die Hinweise zu 5.5.0a und 5.5.0 weiter unten.
 
 5.5.0a ist ein Sicherheitsupdate für die Web-PIN: Die Sperre nach
 Fehlversuchen gilt jetzt auch für den API-Zugriff per Header. Das Update läuft

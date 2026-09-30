@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import stat
 import time
 import uuid
@@ -87,6 +88,19 @@ _QUIESCED_OVERLAY_NAME_RE = re.compile(
     r"\.([A-Za-z0-9][A-Za-z0-9._-]{0,254})\.quiesced-([0-9a-f]{64})\Z"
 )
 _PRUNE_QUARANTINE_NAME_RE = re.compile(r"\.e3dc-prune-[0-9a-f]{32}\Z")
+# Belegordner eines abgebrochenen früheren Updates: Der Updater archiviert dort
+# nur alte Sperr- und Recovery-Dateien, bevor er ihre Systemwirkung entfernt.
+_UPDATE_EVIDENCE_NAME_RE = re.compile(
+    r"\.([A-Za-z0-9][A-Za-z0-9._-]{0,254})\.legacy-update-state\Z"
+)
+_UPDATE_EVIDENCE_FILE_RES = (
+    re.compile(r"var__lib__e3dc-update-safety__[A-Za-z0-9._-]{1,200}\Z"),
+    re.compile(
+        r"etc__systemd__system__[A-Za-z0-9@:._-]{1,200}\.d__"
+        r"00-e3dc-recovery-bootblock\.conf\Z"
+    ),
+)
+_UPDATE_EVIDENCE_MAX_FILES = 64
 _PRUNE_RESUME_RECEIPT_NAME_RE = re.compile(
     r"(\.e3dc-prune-[0-9a-f]{32})\.resume\.json\Z"
 )
@@ -2477,6 +2491,111 @@ def _blocked_backup_prune_result(
     }
 
 
+def _update_evidence_owner_uid() -> int:
+    """Eigentümer, dem ein Updatebeleg-Ordner gehören muss (root)."""
+
+    return 0
+
+
+def _inspect_update_evidence_directory(root_descriptor: int, name: str) -> int:
+    """Prüft einen Updatebeleg-Ordner und liefert die Zahl seiner Dateien.
+
+    Erlaubt sind nur ein root-eigenes, nicht für andere beschreibbares
+    Verzeichnis und darin ausschließlich reguläre, root-eigene Dateien der
+    vom Updater vergebenen Namensform. Jede Abweichung wirft
+    ``BackupIntegrityError``; der Ordner bleibt dann „nicht klassifizierbar“.
+    """
+
+    owner = _update_evidence_owner_uid()
+    metadata = os.stat(name, dir_fd=root_descriptor, follow_symlinks=False)
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise BackupIntegrityError("Updatebeleg ist kein echtes Verzeichnis")
+    mount_contract = _bind_directory_mount_contract(
+        root_descriptor,
+        name,
+        expected_dev=metadata.st_dev,
+        expected_ino=metadata.st_ino,
+    )
+    descriptor = os.open(
+        name,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=root_descriptor,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise BackupIntegrityError("Updatebeleg wurde beim Öffnen ausgetauscht")
+        if opened.st_uid != owner or stat.S_IMODE(opened.st_mode) & 0o022:
+            raise BackupIntegrityError("Updatebeleg gehört nicht root oder ist beschreibbar")
+        entries = sorted(os.listdir(descriptor))
+        if len(entries) > _UPDATE_EVIDENCE_MAX_FILES:
+            raise BackupIntegrityError("Updatebeleg enthält unerwartet viele Einträge")
+        for entry in entries:
+            if not any(pattern.fullmatch(entry) for pattern in _UPDATE_EVIDENCE_FILE_RES):
+                raise BackupIntegrityError(
+                    "Updatebeleg enthält eine unbekannte Datei: " + entry
+                )
+            entry_metadata = os.stat(entry, dir_fd=descriptor, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(entry_metadata.st_mode)
+                or entry_metadata.st_nlink != 1
+                or entry_metadata.st_uid != owner
+                or stat.S_IMODE(entry_metadata.st_mode) & 0o022
+            ):
+                raise BackupIntegrityError(
+                    "Updatebeleg enthält keine echte root-eigene Datei: " + entry
+                )
+    finally:
+        os.close(descriptor)
+    _bind_directory_mount_contract(
+        root_descriptor,
+        name,
+        expected_dev=mount_contract.dev,
+        expected_ino=mount_contract.ino,
+        expected_parent_mount_id=mount_contract.parent_mount_id,
+        expected_entry_mount_id=mount_contract.entry_mount_id,
+    )
+    return len(entries)
+
+
+def update_evidence_hint(retention: Any) -> Optional[str]:
+    """Verständlicher Einzeiler zu Belegen früherer abgebrochener Updates.
+
+    Liefert ``None``, wenn keine Belegordner erkannt wurden. Gelöscht wird
+    nichts; der Befehl ist ein Angebot an den Betreiber.
+    """
+
+    if not isinstance(retention, dict):
+        return None
+    payload = retention.get("update_backups")
+    if not isinstance(payload, dict):
+        return None
+    paths = sorted(
+        {
+            str(item.get("path"))
+            for item in (payload.get("update_evidence") or [])
+            if isinstance(item, dict) and item.get("path")
+        }
+    )
+    if not paths:
+        return None
+    shown = ", ".join(paths)
+    quoted = " ".join(shlex.quote(path) for path in paths)
+    count = len(paths)
+    subject = (
+        "1 Beleg eines früheren abgebrochenen Updates"
+        if count == 1
+        else f"{count} Belege früherer abgebrochener Updates"
+    )
+    return (
+        f"{subject} (ohne Wirkung) unter {shown} – bei Bedarf löschbar: "
+        f"sudo rm -rf {quoted}"
+    )
+
+
 def _prune_backup_dir_locked(
     backup_root: PathValue,
     keep_count: int,
@@ -2527,6 +2646,7 @@ def _prune_backup_dir_locked(
         "kept": [],
         "skipped": [],
         "unclassified": [],
+        "update_evidence": [],
         "dry_run": bool(dry_run),
     }
 
@@ -2790,6 +2910,32 @@ def _prune_backup_dir_locked(
                             str(exc),
                         )
                     continue
+            evidence_match = _UPDATE_EVIDENCE_NAME_RE.fullmatch(name)
+            if (
+                evidence_match is not None
+                and candidate not in recognized_paths
+                and not protected
+                and evidence_match.group(1) not in {ROOT_MARKER_NAME, "web_installer"}
+                and not evidence_match.group(1).startswith(".e3dc-prune-")
+            ):
+                # Belege eines früheren abgebrochenen Updates haben keine
+                # Systemwirkung und sind keine Backup-Familie. Sie bleiben
+                # unangetastet; das Löschen ist Sache des Betreibers.
+                try:
+                    evidence_files = _inspect_update_evidence_directory(
+                        root_descriptor,
+                        name,
+                    )
+                except Exception as exc:
+                    record_unclassified(candidate, "nicht verifiziert", str(exc))
+                else:
+                    result["update_evidence"].append(
+                        {"path": str(candidate), "files": evidence_files}
+                    )
+                    result["skipped"].append(
+                        {"path": str(candidate), "reason": "Updatebeleg"}
+                    )
+                continue
             if candidate in recognized_paths:
                 try:
                     metadata = os.stat(

@@ -16,6 +16,12 @@ import grp
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 from rscp_client import fetch_battery_vitals
+try:
+    from battery_vitals_history import record_monthly
+    _HISTORY_IMPORT_ERROR = None
+except Exception as exc:
+    record_monthly = None
+    _HISTORY_IMPORT_ERROR = type(exc).__name__
 
 
 def _set_www_data_shared(path, mode):
@@ -69,15 +75,31 @@ def resolve_credentials():
 
     return E3DC_IP, E3DC_PORT, E3DC_USER, E3DC_PASSWORD, AES_PASSWORD
 
-def collect_system_data() -> Dict[str, Any]:
+def collect_system_data(record_history=False) -> Dict[str, Any]:
     host, port, user, pw, rscp_pw = resolve_credentials()
     if not (host and user and pw and rscp_pw):
         return {"error": "Fehlende lokale RSCP-Verbindungsdaten in der E3DC-Konfiguration"}
     
     try:
-        return fetch_battery_vitals(host, port, user, pw, rscp_pw)
+        data = fetch_battery_vitals(host, port, user, pw, rscp_pw)
     except Exception as e:
         return {"error": f"RSCP Verbindungsfehler: {str(e)}"}
+
+    if record_history:
+        if record_monthly is None:
+            data["history_recording"] = {
+                "written": False,
+                "reason": f"RECORDING_FAILED:{_HISTORY_IMPORT_ERROR or 'ImportError'}",
+            }
+        else:
+            try:
+                data["history_recording"] = record_monthly(data)
+            except Exception as exc:
+                data["history_recording"] = {
+                    "written": False,
+                    "reason": f"RECORDING_FAILED:{type(exc).__name__}",
+                }
+    return data
 
 def handle_socket_request():
     """Erlaubt via UNIX-Socket /tmp/e3dc_vital_socket das antriggern des Skripts wie eba's Daemon."""
@@ -111,6 +133,7 @@ def handle_socket_request():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--once', action='store_true', help="Nur einmal Daten holen und als JSON ausgeben")
+    parser.add_argument('--record-history', action='store_true', help="Monatlichen Diagnosepunkt aufzeichnen")
     parser.add_argument('--socket', action='store_true', help="Als Socket-Server laufen")
     args = parser.parse_args()
 
@@ -127,5 +150,5 @@ if __name__ == "__main__":
         handle_socket_request()
     else:
         # Standard: Nur einmal ausführen und ausgeben
-        data = collect_system_data()
+        data = collect_system_data(record_history=args.record_history)
         print(json.dumps(data, indent=4, ensure_ascii=False))

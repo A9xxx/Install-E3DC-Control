@@ -35,6 +35,10 @@ e3dcCallHandlerIfAvailable('handleDailyStats');
 e3dcCallHandlerIfAvailable('handleForceSocUpdate');
 e3dcCallHandlerIfAvailable('handleTestPmIndex');
 e3dcCallHandlerIfAvailable('handleSystemLog');
+// Bewusstes Umschalten der Wärmepumpen-Ansicht (?wp_view=neu|alt): Cookie setzen und weiterleiten
+e3dcCallHandlerIfAvailable('e3dcWpViewHandleRequest');
+// POST aus der neuen Wärmepumpen-Ansicht: Ausgabe puffern, damit ein erfolgreicher Knopf per 303 zurückführt
+e3dcCallHandlerIfAvailable('e3dcWpViewBeginPostCapture');
 
 // Zero-Touch Onboarding Check
 if (!file_exists('/var/www/html/data/e3dc_v4.json')) {
@@ -80,6 +84,8 @@ if ($seite === 'charging') {
 $isDocker = e3dcIsDockerEnvironment();
 $nativeWallboxStatusEnabled = hasNativeWallboxStatusConfig($_c ?? []);
 $protectedPages = ['config', 'wallbox', 'waermepumpe', 'klima'];
+// Neue Wärmepumpen-Ansicht (Vorschau): gleiche Anmeldepflicht wie die bisherige Seite.
+$protectedPages[] = 'waermepumpe_vorschau';
 
 if (in_array($seite, $protectedPages, true) && !isWebAuthenticated()) {
     if (isset($_GET['ajax']) && $_GET['ajax'] == '1') {
@@ -87,6 +93,13 @@ if (in_array($seite, $protectedPages, true) && !isWebAuthenticated()) {
     }
     $seite = 'lock';
 }
+
+// Gewählte Wärmepumpen-Ansicht (Cookie e3dc_wp_view): seite=waermepumpe zeigt die neue Ansicht nur bei
+// lesendem Aufruf, Cookie neu, eingeschaltetem Schalter und echter Wärmepumpe; sonst die bisherige Seite.
+$wpUsePreview = $seite === 'waermepumpe'
+    && function_exists('e3dcWpViewUsePreview')
+    && !empty($wpEnabled)
+    && e3dcWpViewUsePreview($_c ?? []);
 
 // Clean AJAX interception before any HTML headers are sent
 if (isset($_GET['ajax']) && $_GET['ajax'] == '1') {
@@ -2386,13 +2399,24 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     <?php include 'fahrzeug.php'; ?>
                 </div>
             </div>
-        <?php elseif ($seite === 'waermepumpe' && ($wpEnabled || $hsEnabled)): ?>
+        <?php elseif ($seite === 'waermepumpe' && !$wpUsePreview && ($wpEnabled || $hsEnabled)): ?>
             <div class="row justify-content-center">
                 <div class="col-12 col-lg-10 col-xl-8">
                     <div class="mb-3">
                         <a href="index.php" class="btn btn-outline-secondary btn-sm"><i class="fas fa-arrow-left me-2"></i>Zurück zum Dashboard</a>
                     </div>
                     <?php include 'waermepumpe.php'; ?>
+                </div>
+            </div>
+        <?php elseif (($seite === 'waermepumpe_vorschau' || $wpUsePreview) && $wpEnabled && cfgBool(($_c ?? [])['wp_page_preview_enable'] ?? false, false)): ?>
+            <div class="row justify-content-center">
+                <div class="col-12 col-xxl-10">
+                    <div class="mb-3">
+                        <a href="index.php" class="btn btn-outline-secondary btn-sm"><i class="fas fa-arrow-left me-2"></i>Zurück zum Dashboard</a>
+                        <a href="index.php?seite=waermepumpe&amp;wp_view=alt" class="btn btn-outline-info btn-sm ms-2"><i class="fas fa-arrow-left me-2"></i>Zur bisherigen Ansicht</a>
+                    </div>
+                    <?php $wpvFlash = function_exists('e3dcWpViewTakeFlash') ? e3dcWpViewTakeFlash() : null; ?>
+                    <?php include 'waermepumpe_vorschau.php'; ?>
                 </div>
             </div>
         <?php elseif ($seite === 'klima'): ?>

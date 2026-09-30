@@ -5826,6 +5826,280 @@ def curve_floor_support_wh_limit(
     return max(floor, capacity_wh * max(0.0, _safe_float(share, 0.005)))
 
 
+WBMINSOC_HOLD_ZONE_SCHEMA = "wallbox_wbminsoc_hold_zone_v2"
+# Dieselbe Rücksetzzeit wie beim Wh-Kontingent unter dem Korridor.
+WBMINSOC_HOLD_ZONE_RESET_S = 60.0
+# Längster Zeitschritt, den das Kontingent in einem Zyklus zählt.
+WBMINSOC_HOLD_ZONE_MAX_STEP_S = 30.0
+# Tatsächlich ladende Wallbox: dieselbe feste Untergrenze wie die Ein-Kante
+# der PV-only-Entladegrenze der Speicherseite.
+WBMINSOC_HOLD_ZONE_CHARGING_MIN_W = 500.0
+# Messtoleranz der Akkustützung, wie beim Akku-Wh-Konto des Mindesthalts.
+WBMINSOC_HOLD_ZONE_SUPPORT_TOLERANCE_W = 100.0
+# Modi mit Haltezone: dieselben Besitzermodi wie die Direktabsenkung an der
+# Untergrenze (``PV + Akku bis Untergrenze`` und ``Sofort bis Preislimit``
+# ohne Preis- oder Netzfenster). ``Akku bis Abfahrt`` behält seinen eigenen
+# Stop an der Untergrenze und hat keine Haltezone.
+WBMINSOC_HOLD_ZONE_MODES = WBMINSOC_FLOOR_DIRECT_MINIMUM_MODES
+# Höchstalter des veröffentlichten Vertrags für die Wallbox-Seite; dieselbe
+# Frische wie das Wallbox-Budget (``wb_pv_budget.json`` frisch unter 15 s).
+WBMINSOC_HOLD_ZONE_MAX_AGE_S = 15.0
+
+
+def wbminsoc_hold_zone_band(
+    *,
+    soc: Any,
+    floor_soc: Any,
+    soc_hysteresis_pct: Any = None,
+    restart_above_pct: Any = None,
+    inside_before: Any = False,
+) -> Dict[str, Any]:
+    """Haltezone im wbminSoC-Band: Untergrenze ≤ SoC < Untergrenze + Abstand.
+
+    Der Abstand ist derselbe, ab dem das wbminSoC-Tor in den Modi mit
+    Akkuladen bis zur Untergrenze die Stützung wieder freigibt: der größere
+    Wert aus ``wb_soc_hysterese_pct`` (auf 0,1–2,0 Prozentpunkte begrenzt wie
+    im Wallbox Manager, Standard 0,7) und
+    ``wb_target_restart_above_wbminsoc_pct`` (Standard 2). Fehlt SoC oder
+    Untergrenze, gibt es kein Band (keine Haltezone, das bisherige Verhalten
+    bleibt).
+
+    Obere Kante mit Hysterese: Wer schon in der Haltezone ist
+    (``inside_before``), verlässt sie nach oben erst ab Abstand plus
+    ``wb_soc_hysterese_pct``. Der E3DC meldet den SoC in ganzen Prozent; ohne
+    diese Hysterese würde ein SoC nahe der Rundungsgrenze die Wallbox im
+    Minutentakt zwischen PV-Rahmen und Stützung wechseln lassen. Nach oben
+    kommt der SoC in der Haltezone nur mit echtem PV-Überschuss, den die
+    Wallbox nicht abnimmt.
+    """
+
+    soc_value = _safe_float(soc, float("nan"))
+    floor_value = _safe_float(floor_soc, float("nan"))
+    hysteresis = _safe_float(soc_hysteresis_pct, 0.7)
+    if not math.isfinite(hysteresis):
+        hysteresis = 0.7
+    hysteresis = max(0.1, min(2.0, hysteresis))
+    restart = _safe_float(restart_above_pct, 2.0)
+    if not math.isfinite(restart) or restart < 0.0:
+        restart = 2.0
+    width = max(hysteresis, restart)
+    valid = bool(
+        math.isfinite(soc_value)
+        and math.isfinite(floor_value)
+        and floor_value > 0.0
+        and 0.0 <= soc_value <= 100.0
+    )
+    exit_width = width + (hysteresis if inside_before is True else 0.0)
+    in_band = bool(valid and floor_value <= soc_value < floor_value + exit_width)
+    return {
+        "valid": valid,
+        "in_band": in_band,
+        "soc": round(soc_value, 2) if math.isfinite(soc_value) else None,
+        "floor_soc": round(floor_value, 2) if math.isfinite(floor_value) else None,
+        "band_high_soc": round(floor_value + width, 2) if math.isfinite(floor_value) else None,
+        "exit_high_soc": round(floor_value + exit_width, 2) if math.isfinite(floor_value) else None,
+        "width_pct": round(width, 2),
+    }
+
+
+def wbminsoc_hold_zone_contract(
+    *,
+    eligible: Any = False,
+    soc: Any = None,
+    floor_soc: Any = None,
+    soc_hysteresis_pct: Any = None,
+    restart_above_pct: Any = None,
+    wallbox_w: Any = 0.0,
+    wallbox_measurement_valid: Any = False,
+    residual_w: Any = 0.0,
+    battery_w: Any = 0.0,
+    support_wh_limit: Any = 0.0,
+    bridge_allowed: Any = True,
+    previous: Optional[Dict[str, Any]] = None,
+    now_s: Any = 0.0,
+    mode: Any = None,
+    frame_wallbox_w: Any = None,
+) -> Dict[str, Any]:
+    """Haltezone an wbminSoC für die Modi mit Akkuladen bis zur Untergrenze.
+
+    Im Band (``wbminsoc_hold_zone_band``) stützt der Speicher die Wallbox
+    nicht und lädt auch nicht vorrangig: Die Wallbox bekommt den
+    batterieneutralen PV-Rahmen ``frame_w`` – ihre laufende Leistung plus den
+    vorzeichenbehafteten Rest aus PV minus Haus, Wärmepumpe, Heizstab und
+    Wallboxen (``residual_w``) –, der Speicher lädt nur, was die Wallbox nicht
+    abnimmt. Wallboxwert und Rest stammen aus demselben Probenpaar: Die
+    Speicherseite übergibt dafür ``frame_wallbox_w`` (Wallboxwert, den der
+    E3DC-Hauswert im Rest enthält); ohne Angabe gilt ``wallbox_w``.
+
+    ``mode`` ist der öffentliche Modus der geregelten Wallbox; die Haltezone
+    gilt nur in ``WBMINSOC_HOLD_ZONE_MODES``. Ohne Angabe prüft der Vertrag den
+    Modus nicht (der Aufrufer hat ihn in ``eligible`` gebunden).
+
+    Der Vertrag ist für die Wallbox-Seite veröffentlicht: Solange ``active``
+    gilt und er frisch ist (``ts`` höchstens ``max_age_s`` alt), ist
+    ``budget_w`` das batterieneutrale PV-Budget der Wallboxgruppe im Band,
+    einschließlich der Untergrenze und unabhängig vom wbminSoC-Tor; die
+    Wallbox-Seite rechnet dort kein eigenes PV-Budget.
+
+    Kurze Schwankungen, etwa Lastspitzen eines Kochfelds oder eine Wolke,
+    überbrückt das Wolken-Wh-Kontingent (``wb_curve_floor_support_wh``): War
+    die Wallbox im Vorzyklus vom PV-Rahmen gedeckt (oder wurde sie schon
+    überbrückt) und fällt der Rahmen jetzt unter ihre laufende Leistung, bleibt
+    diese Leistung gehalten (``hold_frame_w``), solange Kontingent übrig ist
+    und der Speicher die Wallbox tatsächlich tragen darf (``bridge_allowed``).
+    Gehalten wird nie mehr als die laufende Leistung. Beim Eintritt in die
+    Haltezone gilt der batterieneutrale Rahmen; eine vorher gestützte höhere
+    Wallboxleistung wird also nicht gehalten.
+
+    Gezählt wird die Akkuentladung, die die Wallbox bezieht, abzüglich 100 W
+    Messtoleranz (wie beim Akku-Wh-Konto des Mindesthalts). Das Kontingent
+    beginnt wieder bei null, wenn 60 s lang keine Akkustützung der Wallbox
+    anlag, die Haltezone verlassen war oder keine Wallbox lud.
+
+    Unter der Untergrenze bleibt es beim Verhalten von ``PV-Kurve ruhig``
+    (Ladekurve hat Vorrang), darüber bei der Stützung bis zur Untergrenze.
+    ``eligible`` bindet Modus, Regelpfad ohne Netz-, Preis-, Boost- und
+    Pre-Dump-Fenster sowie gültige Daten; ohne diese Bindung ist die Haltezone
+    aus. Der Vertrag ist ein reiner Rahmen: Strom, Phasen und Stop entscheidet
+    weiterhin der Wallbox Manager.
+    """
+
+    prev = previous if isinstance(previous, dict) else {}
+    now_value = _safe_float(now_s, 0.0)
+    last_ts = _safe_float(prev.get("ts"), 0.0)
+    continuous = bool(
+        last_ts > 0.0
+        and 0.0 < now_value - last_ts <= WBMINSOC_HOLD_ZONE_MAX_STEP_S
+    )
+    previous_active = bool(prev.get("active") is True and continuous)
+    # Die Bandzugehörigkeit (obere Hysterese) hängt nur am SoC. Ein einzelner
+    # nicht zulässiger Zyklus (etwa ein kurz veralteter Wallbox-Intent) löscht
+    # sie deshalb nicht; ältere Vorzustände kennen nur ``active``.
+    previous_inside = bool(
+        continuous
+        and (
+            prev.get("band_inside") is True
+            if "band_inside" in prev
+            else prev.get("active") is True
+        )
+    )
+    band = wbminsoc_hold_zone_band(
+        soc=soc,
+        floor_soc=floor_soc,
+        soc_hysteresis_pct=soc_hysteresis_pct,
+        restart_above_pct=restart_above_pct,
+        inside_before=previous_inside,
+    )
+    mode_value = None if mode is None else normalize_wb_mode(mode)
+    mode_allowed = bool(mode_value is None or mode_value in WBMINSOC_HOLD_ZONE_MODES)
+    active = bool(eligible is True and mode_allowed and band["in_band"])
+    wallbox_value = max(0.0, _safe_float(wallbox_w, 0.0))
+    frame_wallbox_value = (
+        wallbox_value
+        if frame_wallbox_w is None
+        else max(0.0, _safe_float(frame_wallbox_w, wallbox_value))
+    )
+    if not math.isfinite(frame_wallbox_value):
+        frame_wallbox_value = wallbox_value
+    residual = _safe_float(residual_w, 0.0)
+    if not math.isfinite(residual):
+        residual = 0.0
+    battery = _safe_float(battery_w, 0.0)
+    if not math.isfinite(battery):
+        battery = 0.0
+    wallbox_charging = bool(
+        wallbox_measurement_valid is True
+        and wallbox_value >= WBMINSOC_HOLD_ZONE_CHARGING_MIN_W
+    )
+    limit = max(0.0, _safe_float(support_wh_limit, 0.0))
+    dt_s = (
+        min(WBMINSOC_HOLD_ZONE_MAX_STEP_S, max(0.0, now_value - last_ts))
+        if last_ts > 0.0
+        else 0.0
+    )
+    used = max(0.0, _safe_float(prev.get("support_wh_used"), 0.0))
+    idle_since = _safe_float(prev.get("idle_since"), 0.0)
+    supported_w = 0.0
+    if active and wallbox_charging:
+        supported_w = max(
+            0.0,
+            min(max(0.0, -battery), wallbox_value) - WBMINSOC_HOLD_ZONE_SUPPORT_TOLERANCE_W,
+        )
+        used += supported_w * dt_s / 3600.0
+    if supported_w > 0.0:
+        idle_since = 0.0
+    elif idle_since <= 0.0:
+        idle_since = now_value
+    elif now_value - idle_since >= WBMINSOC_HOLD_ZONE_RESET_S:
+        used = 0.0
+    remaining = max(0.0, limit - used)
+    frame_w = max(0.0, frame_wallbox_value + residual)
+    # Die Wallbox war im Vorzyklus vom PV-Rahmen gedeckt oder wurde bereits
+    # überbrückt; nur dann ist ein Einbruch des Rahmens eine kurze Schwankung.
+    previous_covered = bool(
+        previous_active
+        and (
+            prev.get("bridging") is True
+            or _safe_float(prev.get("wallbox_w"), 0.0)
+            <= _safe_float(prev.get("frame_w"), 0.0) + WBMINSOC_HOLD_ZONE_SUPPORT_TOLERANCE_W
+        )
+    )
+    bridging = bool(
+        active
+        and wallbox_charging
+        and bridge_allowed is True
+        and previous_covered
+        and remaining > 0.0
+        and frame_w < wallbox_value - WBMINSOC_HOLD_ZONE_SUPPORT_TOLERANCE_W
+    )
+    hold_frame_w = wallbox_value if bridging else frame_w
+    if not band["valid"]:
+        reason = "soc_or_floor_unknown"
+    elif not mode_allowed:
+        reason = "mode_without_hold_zone"
+    elif eligible is not True:
+        reason = "not_eligible"
+    elif not band["in_band"]:
+        reason = "outside_band"
+    elif bridging:
+        reason = "hold_zone_contingent_bridge"
+    else:
+        reason = "hold_zone_pv_frame"
+    return {
+        "schema": WBMINSOC_HOLD_ZONE_SCHEMA,
+        "producer": "storage_manager",
+        "active": active,
+        "reason": reason,
+        # Veröffentlichtes PV-Budget der Wallboxgruppe im Band (nur gültig,
+        # solange ``active`` gilt und ``ts`` höchstens ``max_age_s`` alt ist).
+        "budget_w": int(round(hold_frame_w)) if active else 0,
+        "budget_valid": bool(active),
+        "max_age_s": WBMINSOC_HOLD_ZONE_MAX_AGE_S,
+        "mode": mode_value,
+        "modes": list(WBMINSOC_HOLD_ZONE_MODES),
+        "gate_independent": True,
+        "floor_soc": band.get("floor_soc"),
+        "soc": band.get("soc"),
+        "band": band,
+        "band_inside": bool(band["in_band"]),
+        "frame_w": int(round(frame_w)),
+        "hold_frame_w": int(round(hold_frame_w)),
+        "residual_w": int(round(max(0.0, residual))),
+        "residual_signed_w": int(round(residual)),
+        "wallbox_w": int(round(wallbox_value)),
+        "frame_wallbox_w": int(round(frame_wallbox_value)),
+        "wallbox_charging": wallbox_charging,
+        "bridging": bridging,
+        "bridge_allowed": bool(bridge_allowed is True),
+        "supported_w": int(round(supported_w)),
+        "support_wh_used": round(used, 1),
+        "support_wh_limit": round(limit, 1),
+        "support_wh_remaining": round(remaining, 1),
+        "idle_since": round(idle_since, 3) if idle_since > 0.0 else 0.0,
+        "ts": round(now_value, 3),
+    }
+
+
 def openwb_mode9_pv_phase_down_required(
     *,
     openwb_phase_capable: bool,

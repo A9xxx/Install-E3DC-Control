@@ -56,11 +56,52 @@ kein Beleg einer laufenden Ladung; maßgeblich sind die tatsächlichen
 Phasenströme und die gemessene Ladeleistung. Aus 0 W allein lässt sich weder
 ein erreichtes Fahrzeugziel noch ein Fehler sicher ableiten.
 
-Ein gültiger Anker darf innerhalb derselben Sitzung bis zur bestehenden
-Acht-Stunden-Grenze fortgeführt werden, auch wenn der Roh-Cloudwert für eine
-neue Verankerung inzwischen zu alt wäre. Abstecken, ein zurückgesetzter
-Ladezähler oder eine widersprüchliche Fahrzeugzuordnung erlauben keine
-unveränderte Übernahme in eine neue Sitzung. Liefert die openWB Pro einen
+Ein Cloud-SoC wird am Zeitpunkt seiner Messung im Fahrzeug verankert, nicht
+am Zeitpunkt des Abrufs. Die seit dieser Messung gezählte Ladeenergie (Anstieg
+des Sessionzählers ab diesem Zeitpunkt) wird dazugerechnet. Dafür merkt sich
+E3DC-Control während der Stecksession den Verlauf des Energiezählers. Liegt die
+Messung vor Beginn der Stecksession, zählt die ganze Sessionenergie dazu. Liegt
+sie vor dem ersten bekannten Zählerstand (etwa nach einem Neustart des
+Systems), wird vorsichtig ab dem frühesten bekannten Stand gerechnet; die Diagnose
+nennt dann `history_start`. Ein Cloudwert ohne Messzeitpunkt verankert nichts;
+die Diagnose nennt dafür `cloud_soc_sample_time_unknown`.
+
+Ein gültiger Anker wird innerhalb derselben, von der Wallbox bestätigten
+Stecksession fortgeführt, auch wenn der Roh-Cloudwert für eine neue
+Verankerung inzwischen zu alt wäre. Das Alter des Ankers begrenzt die
+Regelwirkung nicht: Bis 20 Prozentpunkte über dem letzten bestätigten
+Fahrzeugwert darf die Hochrechnung Ziel-SoC, `Auto voll` und die Ladeplanung
+steuern, auch nach mehr als acht Stunden. Darüber wird der Wert weiter
+gerechnet, als „geschätzt, unbestätigt“ gekennzeichnet und steuert nichts mehr;
+Regelung und Planung erhalten dann keinen Fahrzeug-SoC. Die Diagnose nennt
+dafür den Grund `soc_estimate_rise_limit`. Verbraucher nutzen eine solche
+Fortschreibung nur, solange der laufende Wallbox-Dienst sie bestätigt; bleibt
+die Bestätigung länger als fünf Minuten aus, gilt der Wert nicht mehr.
+
+Die Weboberfläche zeigt eine regelwirksame Fortschreibung als „~NN %
+(geschätzt)“ und eine nur angezeigte als „~NN % geschätzt, unbestätigt“ mit
+Warnsymbol.
+
+Ein neuerer Cloudwert desselben Fahrzeugs aus dem regulären
+Hintergrundabruf ersetzt den Anker und gibt die Regelung wieder frei. In einer
+laufenden Stecksession gilt das auch dann, wenn die Cloud das Ladekabel nicht
+als gesteckt meldet; für den Steckzustand ist die Wallbox maßgeblich. Ein
+solcher Wert muss aber zur laufenden Session passen: Gesteckt sinkt der SoC
+nicht (wenige Prozentpunkte Toleranz für Rundung) und steigt höchstens um die
+seit dem Anker gezählte Ladeenergie. Widerspricht er, verwirft E3DC-Control
+die Korrektur und sperrt die Schätzung dieser Stecksession, bis ein Cloudwert
+mit Steckermeldung oder eine neue Stecksession vorliegt. Die erste
+Verankerung einer Stecksession verlangt weiterhin, dass die Cloud das Fahrzeug
+als angesteckt meldet. Für die Korrektur wird kein zusätzlicher Weckabruf
+gestellt.
+
+Abstecken, ein zurückgesetzter Ladezähler oder eine widersprüchliche
+Fahrzeugzuordnung beenden die Fortschreibung und den Zählerverlauf; eine neue
+Sitzung übernimmt keinen alten Anker. Das Abstecken muss die Wallbox dafür erkennen: Wird ein
+Fahrzeug ohne eigenen SoC über das Ladekabel und ohne Fahrzeugkennung
+abgesteckt und wieder angesteckt, während der Wallbox-Dienst nicht läuft, und
+läuft der Ladezähler dabei weiter, erkennt E3DC-Control das nicht immer als
+neue Stecksession. Liefert die openWB Pro einen
 frischen, bestätigten Geräte-SoC, verwendet die Wallboxregelung diesen direkt
 und baut keinen zusätzlichen Cloud-Schätzanker auf.
 

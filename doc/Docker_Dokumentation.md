@@ -2,8 +2,8 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.5.2`. Die Tags `latest`, `v5.5.2` und
-`5.5.2` bezeichnen denselben Stable-Stand.
+Der aktuelle Stable-Stand ist `v5.5.3`. Die Tags `latest`, `v5.5.3` und
+`5.5.3` bezeichnen denselben Stable-Stand.
 
 **Updates im Überblick:** Der Knopf **System Update** in der Weboberfläche und
 das **Auto-Update** im Config-Editor geben dem optionalen Watchtower-Dienst das
@@ -131,14 +131,14 @@ installieren, anschließend das Ziel ausdrücklich wählen:
 
 ```bash
 curl -q -fsS --proto '=https' --tlsv1.2 \
-  -o ./docker_compose_update-5.5.2.py \
-  https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control/v5.5.2/Installer/docker_compose_update.py
+  -o ./docker_compose_update-5.5.3.py \
+  https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control/v5.5.3/Installer/docker_compose_update.py
 if [ ! -d ./Installer ]; then
   sudo install -d -m 0755 ./Installer
 fi
-sudo install -m 0644 ./docker_compose_update-5.5.2.py ./Installer/docker_compose_update.py
+sudo install -m 0644 ./docker_compose_update-5.5.3.py ./Installer/docker_compose_update.py
 sudo python3 ./Installer/docker_compose_update.py \
-  --compose-dir . --sudo --image-tag v5.5.2
+  --compose-dir . --sudo --image-tag v5.5.3
 ```
 
 Der aktuelle Helfer akzeptiert die gebundene gestoppte Altinstanz, ergänzt bei
@@ -692,7 +692,7 @@ Ohne ausdrücklichen Tag verwendet der Helfer das Image des ausgewählten Dienst
 Die mitgelieferte variable Zeile folgt ohne `E3DC_IMAGE_TAG` dem geprüften Stable-Tag
 `latest`. Ein vorhandener fester Tag bleibt absichtlich bestehen.
 
-`--image-tag v5.5.2` funktioniert auch bei einer fest eingetragenen OMV-Imagezeile.
+`--image-tag v5.5.3` funktioniert auch bei einer fest eingetragenen OMV-Imagezeile.
 Der Helfer schreibt diese Auswahl dauerhaft nur in das `image:`-Feld des
 Zieldienstes. Die `.env` und das Image anderer E3DC-Dienste bleiben unverändert.
 Bei einem gescheiterten Update wird die vorherige Zeile im Rahmen des verifizierten
@@ -714,7 +714,7 @@ sudo docker compose config --images e3dc-control
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.5.2` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.5.3` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash
@@ -999,7 +999,7 @@ Port, etwa `E3DC_PUBLISH_BIND=192.0.2.20` und `E3DC_PUBLISH_PORT=8085`.
 Verwende denselben Compose-Ordner und Projektnamen. Sichere vorher die
 funktionierende `docker-compose.yml` als `docker-compose.host.bak`, die
 vorhandene `.env` und die persistenten Daten. Halte den aktuell eingesetzten
-versionierten Runtime-Image-Tag für den Rückweg fest, beispielsweise `v5.5.2`.
+versionierten Runtime-Image-Tag für den Rückweg fest, beispielsweise `v5.5.3`.
 Ein älterer Root-Tag eignet sich nicht für diesen ersten Netzwerk-Rückweg.
 Prüfe eine administrativ zugängliche Kopie der aktuellen
 Konfiguration, ohne ihren Inhalt auszugeben:
@@ -1330,9 +1330,9 @@ ihre Weboberfläche nennt höchstens die Host-Befehle.
    beschrieben: die unveränderte mitgelieferte Datei ersetzen; eine vom
    Installer erzeugte Datei mit `./data`- und `./logs`-Ordnern sowie OMV- und
    eigene Dateien nicht ersetzen, sondern die Änderungen übertragen.
-2. Einen festen Pin in `.env` gegebenenfalls bewusst auf `v5.5.2` ändern.
-   Wer noch kein Watchtower-Token hat (`grep E3DC_WATCHTOWER_API_TOKEN .env`
-   zeigt keinen Eintrag), trägt es jetzt mit dem zweiten Befehl aus
+2. Einen festen Pin in `.env` gegebenenfalls bewusst auf `v5.5.3` ändern.
+   Wer noch kein Watchtower-Token hat (`grep -c '^E3DC_WATCHTOWER_API_TOKEN=.' .env`
+   zählt nicht leere Einträge, ohne das Token auszugeben; `0` bedeutet kein Eintrag), trägt es jetzt mit dem zweiten Befehl aus
    „Watchtower einmalig freischalten“ in `.env` ein. Dann erstellt der
    nächste Schritt den Container gleich mit Token, und eine zweite
    Neuerstellung entfällt.
@@ -1400,8 +1400,13 @@ nur innerhalb des von Compose projizierten Tags. Er bindet das gezogene Image
 vor dem Start an sha256-ID und OCI-Version. `--wait` akzeptiert den Kandidaten
 erst nach dem imagegebundenen Healthcheck; zwei identische Snapshots binden
 zusätzlich Container-ID, Image-ID, Restart-Zähler, Startzeit, Dienstsatz und
-Laufzeit-`VERSION`. Ein laufender Watchtower wird vorher gestoppt, damit kein
-zweiter Supervisor denselben Container gleichzeitig ersetzt.
+Laufzeit-`VERSION`. Kann ein laufender Watchtower denselben Container ersetzen,
+bricht der Helfer ab. Diesen Watchtower vor dem Helferaufruf selbst stoppen
+(zum Beispiel `sudo docker compose --profile auto-update stop watchtower`).
+Der Helfer stoppt Watchtower nicht selbst; unabhängige Zusatzdienste bleiben erhalten.
+Nach erfolgreichem Helferlauf oder bestätigtem Rückfall den zuvor gestoppten Watchtower
+wieder starten: `sudo docker compose --profile auto-update up -d watchtower`.
+Bei eigenen Projekten dieselben Projekt- und Dateiauswahlargumente verwenden.
 
 Ein vorhandener Container in einer von Docker bestätigten Neustartphase
 (`restarting`) muss vor dem Update nicht manuell gestoppt werden. Der Helfer
@@ -1586,3 +1591,66 @@ Wachsen dort Live- oder Verlaufsdaten, einfach weiterlaufen lassen. Bleibt das
 Training nach mehreren Tagen weiter bei `0 Datensaetze`, prüfe zuerst, ob dein
 Docker-Volume bzw. Host-Mount für `/var/www/html/data` wirklich dauerhaft
 erhalten bleibt.
+
+### Watchtower-Umgebung in eigenen Compose-Dateien
+
+Der Host-Helfer ergänzt ausschließlich fehlende `E3DC_WATCHTOWER_API_URL`- und
+`E3DC_WATCHTOWER_API_TOKEN`-Einträge im E3DC-Dienst. Voraussetzung ist ein eindeutig
+erkennbarer Watchtower im selben Compose-Projekt mit aktiver Update-HTTP-API und
+einer erreichbaren Netzzuordnung wie in den Vorlagen. Im Hostnetz verwendet er
+Loopback mit `${E3DC_WATCHTOWER_API_PORT:-18080}`, im gemeinsamen Bridge-Netz den Dienstnamen und API-Port.
+Die Referenz wird nur übernommen, wenn ihre Auflösung zum Watchtower-Port passt.
+Sonst wird der tatsächlich konfigurierte Port verwendet; bei unklarer Zuordnung
+bleibt die optionale Ergänzung mit Hinweis aus. Fehler dieser Ergänzung verhindern
+weder die übrigen nötigen Anpassungen noch einen angeforderten Image-Pin.
+Bei gemeinsamer Portreferenz wirkt eine spätere Änderung in `.env` auf beide Dienste.
+Das Token wird ausschließlich als `${E3DC_WATCHTOWER_API_TOKEN}` aus `.env` referenziert.
+Es muss dort nicht leer eingetragen und vom Watchtower übernommen sein. Die im
+Abschnitt zur Auto-Update-Einrichtung beschriebene Token-Erzeugung bleibt erforderlich.
+Zur Prüfung nur die Anzahl ausgeben: `grep -c '^E3DC_WATCHTOWER_API_TOKEN=.' .env`;
+ein Treffer ersetzt nicht die Prüfung einer leeren oder nur aus Anführungszeichen
+bestehenden Zuweisung. Tokenwerte nicht in Supportausgaben kopieren.
+
+Vorhandene Einträge bleiben erhalten, auch eigene URLs und leere Werte. Bei einem
+leeren Eintrag gibt es einen Hinweis; die automatische Ergänzung bleibt dann aus.
+Die optionale Vorlagenreferenz `${E3DC_WATCHTOWER_API_TOKEN:-}` zählt nicht als
+leerer Eintrag. Eine vollständige, unveränderte Vorlage ohne Token erzeugt keinen
+wiederkehrenden Hinweis. Ohne Watchtower-Dienst erscheint ebenfalls kein Hinweis.
+Ohne passenden lokalen Dienst, bei externer Watchtower-Instanz, fehlendem Token oder
+mehrdeutiger Dateizuordnung wird die Watchtower-Umgebung nicht verändert. Die URL
+und Tokenreferenz dann anhand der tatsächlich verwendeten Topologie selbst einrichten.
+Listen- und Mappingform sowie ein fehlender `environment:`-Block werden unterstützt.
+YAML-Vererbung, mehrzeilige Werte und nicht leere Flussnotation werden mit Hinweis
+unverändert belassen. Ein erneuter Lauf erzeugt keine weiteren Einträge.
+
+Bei mehreren `-f` wird die Datei mit der eindeutigen Image-Definition des E3DC-Dienstes
+verwendet; Schlüssel aus allen ausgewählten Dateien werden berücksichtigt. Ohne
+Image-Definition muss genau eine Datei den Dienst nennen. Mehrere mögliche
+Definitionsdateien erfordern eine manuelle Zuordnung. Andere erforderliche
+Wartungsschritte des Host-Helfers bleiben von diesem Hinweis unberührt.
+
+Vor dem atomaren Ersatz legt der Helfer neben der bearbeiteten Datei eine Sicherung
+`<Compose-Dateiname>.e3dc-backup-<Zufallskennung>` an und nennt deren Pfad. Rechte und
+Eigentümer bleiben erhalten. Er prüft den Kandidaten und danach die gespeicherte
+Compose-Konfiguration. Scheitert die Nachprüfung, stellt er die Ausgangsbytes wieder
+her. Zum manuellen Rückweg die genannte Sicherung über die betroffene Compose-Datei
+zurückkopieren und mit denselben Projekt- und `-f`-Argumenten `docker compose config
+--quiet` prüfen. Das setzt die Datei zurück; ein laufender Container übernimmt
+Umgebungsänderungen erst beim erneuten Erstellen über den dokumentierten Host-Helfer.
+Die Sicherung bis zum bestätigten erfolgreichen Update behalten.
+
+Für ältere Installationen siehe auch [Übergang von 5.4.x auf 5.5.0](#übergang-von-54x-auf-550)
+und [Watchtower einmalig freischalten](#watchtower-einmalig-freischalten).
+Vorlagen bis 5.4.6d enthielten einen Watchtower ohne HTTP-API. Das alte Label
+`${E3DC_WATCHTOWER_ENABLE:-false}` lässt den Update-Knopf ohne entsprechende
+Umstellung wirkungslos. Die fehlenden Umgebungswerte allein reichen dafür nicht.
+Ein vorhandener fremder Watchtower, etwa `containrrr/watchtower` für andere
+Container, kann bleiben, wenn E3DC-Control dort über `WATCHTOWER_DISABLE_CONTAINERS`
+ausgeschlossen wird. Dafür den tatsächlichen Containernamen verwenden.
+
+Dieser Ausschluss erlaubt den Weiterbetrieb für andere Container. Der Host-Helfer
+verlangt dennoch, dass ein laufender konkurrierender Watchtower während seines
+Laufs pausiert; er wertet diesen Ausschluss derzeit nicht als Ausnahme aus.
+Vor dem Helferlauf `sudo docker stop <Watchtower-Containername>` ausführen und
+nach dessen Abschluss mit `sudo docker start <Watchtower-Containername>` wieder
+starten. Den tatsächlichen Namen der fremden Watchtower-Instanz einsetzen.

@@ -55,18 +55,40 @@ def clean_value(val_str):
 def extract_values_and_map_ids(items, result_dict, parent_name=""):
     """Liest die initiale Seite aus und baut das ID-zu-Name Gedächtnis auf."""
     global ID_TO_NAME
+    # Vor der Bereinigung nach Rohwert/Einheit unterscheiden: 1 % ist kein „Ein“.
+    # Beide Reihenfolgen sind möglich; IDs binden anschließend den Refresh.
+    grouped = {}
     for item in items:
+        name = item.get("name", "").replace(":", "").strip()
+        if name and item.get("value") is not None:
+            grouped.setdefault(name, []).append(item["value"])
+    for index, item in enumerate(items):
         name = item.get("name", "").replace(":", "").strip()
         value = item.get("value")
         item_id = item.get("id")
         sub_items = item.get("items")
         
-        # NEU: Kollisionen bei gleichen Namen verhindern!
         dict_key = name
+        raw_value = value.strip() if isinstance(value, str) else ""
+        peers = grouped.get(name, [])
+        if raw_value.endswith("%") and (len(peers) > 1 or name in ("ZUP", "Ventil.-BOSUP")):
+            # Auch ohne Ein/Aus-Eintrag darf ein Prozentwert nicht dessen Namen übernehmen.
+            dict_key = f"{name} %"
+        elif len(peers) > 1 and raw_value not in ("Ein", "Aus") and any(
+                isinstance(peer, str) and peer.strip() in ("Ein", "Aus") for peer in peers):
+            dict_key = f"{name} [{item_id or index + 1}]"
         if name in ["Heizung", "Warmwasser", "Gesamt", "Schwimmbad"] and parent_name in ["Wärmemenge", "Leistungsaufnahme"]:
             dict_key = f"{parent_name}_{name}"
             
         if name and value is not None:
+            # Auch weitere gleichartige Einträge bleiben getrennt statt sich zu überschreiben.
+            if dict_key in result_dict:
+                unique_key = f"{dict_key} [{item_id or index + 1}]"
+                suffix = 2
+                while unique_key in result_dict:
+                    unique_key = f"{dict_key} [{item_id or index + 1}-{suffix}]"
+                    suffix += 1
+                dict_key = unique_key
             result_dict[dict_key] = clean_value(value)
             if item_id:
                 ID_TO_NAME[item_id] = dict_key  # Merkt sich z.B. "0xbc70d4" -> "Wärmemenge_Gesamt"

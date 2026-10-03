@@ -1,14 +1,14 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.5.2</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.5.3</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.5.2**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.5.3**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
 
-5.5.2 beruhigt die Wallbox-Regelung, führt die Fahrzeug-SoC-Hochrechnung innerhalb derselben Stecksession fort und ergänzt den monatlichen Batterie-Vitalverlauf. Wärmepumpenaufträge überbrücken kurze Datenlücken; PV-Sollwerte und Warmwasser-Timer werden zuverlässiger gehalten. Die neue Wärmepumpenansicht und der Stiebel-ISG-SG-Ready-Ausgang sind experimentell und standardmäßig aus. Das Update benötigt keine Konfigurationsänderung. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
+5.5.3 korrigiert die Zeitbasis der E3/DC-Historie und die Tagesbilanz, behebt eine dauerhaft gesperrte Wärmepumpen-Startfreigabe bei Stiebel ISG mit SG-Ready und gibt der Lastspitzenkappung Vorrang vor dem Tarif-Halt. Neu sind das experimentelle Tariffenster-Heizen (Standard Aus), eine Wärmepumpen-Vorschau mit Pumpensignalen und Hover-Texte für alle Felder im Config-Editor. Das Update benötigt keine Konfigurationsänderung. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
 
 5.5.0a ist ein Sicherheitsupdate für die Web-PIN: Die Sperre nach Fehlversuchen gilt jetzt auch für den API-Zugriff per Header und lässt sich weder über einen wechselnden User-Agent noch über parallele Anfragen umgehen. Empfohlen wird eine Web-PIN mit mindestens 6 Zeichen; Einzelheiten stehen in der [API-Dokumentation](doc/API_Documentation.md).
 
@@ -48,7 +48,7 @@ sondern eine eindeutige Auswahl verlangt.
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
 
-> **Neu in 5.5.2:** Gemeinsamer Strombeschluss je Wallbox, robuster Wiederanlauf der openWB Pro, fortgeführte Fahrzeug-SoC-Hochrechnung, monatlicher Batterie-Vitalverlauf und zuverlässigere Wärmepumpenaufträge. Neue Wärmepumpenansicht und Stiebel-SG-Ready-Ausgang sind experimentell und standardmäßig aus. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
+> **Neu in 5.5.3:** Korrigierte Zeitbasis der E3/DC-Historie und Tagesbilanz je Kalendertag, behobene Stiebel-ISG-Startfreigabe, Vorrang der Lastspitzenkappung vor dem Tarif-Halt, experimentelles Tariffenster-Heizen (Standard Aus), Wärmepumpen-Vorschau mit Pumpensignalen und Hover-Texte im ganzen Config-Editor. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
 
 > **Neu in 5.5.0a:** Sicherheitskorrektur der Web-PIN. Die Sperre nach Fehlversuchen gilt auch für den API-Zugriff per Header (`X-API-PIN`), hängt nur noch von der Client-Adresse ab (IPv4-Adresse bzw. IPv6-/64-Netz) und zählt Fehlversuche auch bei parallelen Anfragen vollständig. `CF-Connecting-IP` wird nur bei einem lokal angebundenen Tunnel berücksichtigt. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
 
@@ -531,7 +531,7 @@ sudo docker compose logs --tail=80 e3dc-control
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin oder Rückfall wird
-> `E3DC_IMAGE_TAG=v5.5.2` in `.env` gesetzt und `sudo docker compose up -d`
+> `E3DC_IMAGE_TAG=v5.5.3` in `.env` gesetzt und `sudo docker compose up -d`
 > ausgeführt. `config --images` zeigt vor dem Pull das tatsächlich gewählte
 > Image.
 

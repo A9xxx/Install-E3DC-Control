@@ -218,6 +218,24 @@
                 `RMSE: ${fmt(finiteMetric('quadratische_fehlerwurzel_wh'))} Wh/15 min. Skill gegen Tagespersistenz: ${fmt(finiteMetric('persistenz_skill_score_pct'))} % bei ${fmt(diagnostic.persistence_compared_slots, 0)} Ertragsfenstern; positiv bedeutet besser.`,
                 'Gesamtvergleich: je Fenster die letzte vorher archivierte Ausgabe; die Vorläufe sind gemischt. UTC-Ertragstage können unvollständig sein.'
             ];
+            const timeCheck = diagnostic.history_time_plausibility;
+            if (timeCheck?.schema_version === 'pv_history_time_plausibility_v1'
+                && timeCheck.decision_use_allowed === false && timeCheck.status === 'warning'
+                && timeCheck.reason === 'repeated_yield_below_horizon') {
+                lines.unshift(`Warnung: E3/DC-Ist-Ertrag liegt an ${fmt(timeCheck.suspicious_days, 0)} UTC-Tagen in mehr als drei Viertelstunden über 50 Wh, obwohl die Sonnenhöhe unter −1° liegt. Zeitbasis und Zuordnung der Historie prüfen; daraus folgt keine automatische Zeitkorrektur.`);
+                if (statusElement) {
+                    statusElement.textContent = 'Zeitbezug prüfen';
+                    statusElement.className = 'badge text-bg-warning';
+                }
+            }
+            const backfill = diagnostic.history_backfill;
+            if (backfill?.schema_version === 'pv_history_backfill_v1' && backfill.decision_use_allowed === false) {
+                lines.push(`E3/DC-Historie mit korrigierter Zeitbasis: ${fmt(backfill.completed_days, 0)} UTC-Tage nachgelesen, ${fmt(backfill.pending_days, 0)} offen, ${fmt(backfill.unavailable_days, 0)} nicht vollständig in Viertelstunden verfügbar.`);
+            }
+            const legacyCheck = diagnostic.history_time_plausibility_legacy;
+            if (legacyCheck?.status === 'warning' && legacyCheck.decision_use_allowed === false) {
+                lines.push('Die alte Historienrevision enthält Ertrag bei unplausiblem Sonnenstand. Sie bleibt als Evidenz erhalten und ist aus Kennzahlen und Kalibrierung ausgeschlossen.');
+            }
             const details = diagnostic.diagnostic_details;
             if (details && details.schema_version === 'pv_forecast_diagnostic_details_v1' && details.decision_use_allowed === false) {
                 const date = value => Number(value) > 0 ? new Date(Number(value) * 1000).toLocaleString('de-DE', { timeZone: 'UTC' }) + ' UTC' : '–';

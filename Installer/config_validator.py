@@ -19,9 +19,21 @@ import time
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 try:
-    from .heatpump_pv_contract import heatpump_pv_config as _heatpump_pv_config
+    from .heatpump_pv_contract import (
+        heatpump_pv_config as _heatpump_pv_config,
+        heatpump_start_semantics, heatpump_idle_threshold_w,
+        HEATPUMP_START_SEMANTICS_SG_READY,
+        heatpump_start_reservation_duration_s,
+    )
+    from .consumer_priority import CONSUMER_MIN_W
 except ImportError:  # pragma: no cover - direkter Skriptaufruf
-    from heatpump_pv_contract import heatpump_pv_config as _heatpump_pv_config
+    from heatpump_pv_contract import (
+        heatpump_pv_config as _heatpump_pv_config,
+        heatpump_start_semantics, heatpump_idle_threshold_w,
+        HEATPUMP_START_SEMANTICS_SG_READY,
+        heatpump_start_reservation_duration_s,
+    )
+    from consumer_priority import CONSUMER_MIN_W
 
 try:
     from reserve import live_ep_reserve_details
@@ -834,31 +846,52 @@ _WP_BUFFER_SENSORS = {
 
 
 def validate_heatpump_display_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """Beratende Prüfung des Pufferfühlers der neuen WP-Ansicht (nur Anzeige, keine Regelwirkung)."""
-    if not _has_user_value(cfg, "wp_buffer_sensor"):
-        return {}
-    raw = str(cfg.get("wp_buffer_sensor")).strip().lower()
+    """Beratende Prüfung der neuen WP-Ansicht (nur Anzeige, keine Regelwirkung)."""
+    entries = {}
     wp_type = int(safe_float(cfg.get("wp_type"), -1.0))
-    if raw not in _WP_BUFFER_SENSORS:
-        severity = "warning"
-        effective = "none"
-        message = "Unbekannter Pufferfühler; die Ansicht zeigt keinen Pufferspeicher. Erlaubt: keiner, externer Rücklauf der Luxtronik oder Pufferfühler der Stiebel-ISG."
-    elif _WP_BUFFER_SENSORS[raw] is not None and _WP_BUFFER_SENSORS[raw] != wp_type:
-        severity = "warning"
-        effective = raw
-        message = "Der gewählte Pufferfühler passt nicht zum Wärmepumpen-Typ; die Ansicht zeigt den Puffer ohne Wert („--“)."
-    else:
-        severity = "ok"
-        effective = raw
-        message = "Pufferfühler für die Anzeige der neuen Wärmepumpen-Ansicht."
-    return {
-        "wp_buffer_sensor": _entry(
-            key="wp_buffer_sensor", label="WP-Ansicht: Pufferfühler", unit="",
-            configured=cfg.get("wp_buffer_sensor"), live_value=None, live_key=None,
+    if _has_user_value(cfg, "wp_buffer_sensor"):
+        raw = str(cfg.get("wp_buffer_sensor")).strip().lower()
+        if raw not in _WP_BUFFER_SENSORS:
+            severity = "warning"
+            effective = "none"
+            message = "Unbekannter Pufferfühler; die Ansicht zeigt keinen Pufferspeicher. Erlaubt: keiner, externer Rücklauf der Luxtronik oder Pufferfühler der Stiebel-ISG."
+        elif _WP_BUFFER_SENSORS[raw] is not None and _WP_BUFFER_SENSORS[raw] != wp_type:
+            severity = "warning"
+            effective = raw
+            message = "Der gewählte Pufferfühler passt nicht zum Wärmepumpen-Typ; die Ansicht zeigt den Puffer ohne Wert („--“)."
+        else:
+            severity = "ok"
+            effective = raw
+            message = "Pufferfühler für die Anzeige der neuen Wärmepumpen-Ansicht."
+        entries.update({
+            "wp_buffer_sensor": _entry(
+                key="wp_buffer_sensor", label="WP-Ansicht: Pufferfühler", unit="",
+                configured=cfg.get("wp_buffer_sensor"), live_value=None, live_key=None,
+                effective=effective, source="user" if severity == "ok" else "invalid",
+                severity=severity, message=message,
+            )
+        })
+    if _has_user_value(cfg, "wp_heating_circuit_pump"):
+        raw = str(cfg.get("wp_heating_circuit_pump")).strip().lower()
+        if raw not in {"hup", "fup1", "zup", "none"}:
+            severity = "warning"
+            effective = None
+            message = "Unbekanntes Heizkreispumpensignal; der Heizkreiszustand bleibt in der Ansicht unbekannt. Erlaubt: HUP, FUP 1, ZUP oder Kein Pumpensignal."
+        elif wp_type != 0 and raw != "none":
+            severity = "warning"
+            effective = "none"
+            message = "Das Heizkreispumpensignal ist nur für Luxtronik wählbar; bei diesem Wärmepumpen-Typ bleibt die bisherige Anzeige erhalten."
+        else:
+            severity = "ok"
+            effective = raw
+            message = "Heizkreispumpensignal für die Anzeige der neuen Wärmepumpen-Ansicht; keine Regelwirkung."
+        entries["wp_heating_circuit_pump"] = _entry(
+            key="wp_heating_circuit_pump", label="WP-Ansicht: Heizkreispumpe", unit="",
+            configured=cfg.get("wp_heating_circuit_pump"), live_value=None, live_key=None,
             effective=effective, source="user" if severity == "ok" else "invalid",
             severity=severity, message=message,
         )
-    }
+    return entries
 
 
 def _address_configured(cfg: Dict[str, Any], key: str) -> bool:
@@ -908,6 +941,43 @@ def validate_stiebel_sg_ready_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str,
     }
 
 
+def validate_heatpump_start_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Beratende Startgrenzen; keine zusätzliche Betriebsfreigabe oder Sperre."""
+    if not _is_enabled(cfg, "luxtronik"):
+        return {}
+    minimum = CONSUMER_MIN_W["heatpump"]
+    start = abs(safe_float(cfg.get("grid_start_limit"), -3500.0))
+    delay = safe_float(cfg.get("pv_boost_delay"), 30.0)
+    sg_ready = heatpump_start_semantics(cfg) == HEATPUMP_START_SEMANTICS_SG_READY
+    duration = heatpump_start_reservation_duration_s(dict(cfg, pv_boost_delay=0))
+    entries = {}
+    for key, label, unit, value, warning, message in (
+        ("grid_start_limit", "WP-Startgrenze", "W", start, start < minimum,
+         f"Der Betrag ist die benötigte Freigabe aus dem freien Verbraucherbudget nach Akkuladung. "
+         f"Die Zuteilung benötigt mindestens {minimum} W; ein kleinerer Betrag ermöglicht keinen Start. "
+         "Die Einspeisung am Netzpunkt ist nicht der Vergleichswert."),
+        ("pv_boost_delay", "WP-Startverzögerung", "s", delay, delay >= duration,
+         f"Die Startverzögerung erreicht ab {duration:g} s das normale Reservierungsfenster dieser Startart. "
+         + ("Bei SG Ready wird das Fenster auf mindestens Verzögerung plus 120 s erweitert; "
+            "lange Verzögerungen binden entsprechend lange Verbraucherbudget."
+            if sg_ready else "Direkte Sollwertangebote behalten ihre kurze Budgetreservierung; die Verzögerung bitte prüfen.")),
+    ):
+        entries[key] = _entry(key=key, label=label, unit=unit, configured=cfg.get(key),
+            live_value=None, live_key=None, effective=value, source="user",
+            severity="warning" if warning else "ok", message=message)
+    if str(cfg.get("wp_type", "")).strip() == "4":
+        standby = safe_float(cfg.get("stiebel_isg_standby_w"), 35.0)
+        entries["stiebel_isg_standby_w"] = _entry(
+            key="stiebel_isg_standby_w", label="Stiebel Standby", unit="W",
+            configured=cfg.get("stiebel_isg_standby_w"), live_value=None, live_key=None,
+            effective=heatpump_idle_threshold_w(cfg), source="user",
+            severity="warning" if not 0 <= standby <= 75 else "ok",
+            message="Leerlaufgrenze: Standby plus 25 W Messspielraum, mindestens 50 und höchstens 100 W. "
+                    "Nur frische Leistungsdaten, ein bestätigter stehender Verdichter und eine zurückgenommene "
+                    "Startfreigabe erlauben das Entsperren. Standard 35 W ergibt eine Grenze von 60 W.")
+    return entries
+
+
 def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Liefert die beratende Prüfung der Speicherkonfiguration.
 
@@ -927,6 +997,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     consumer.update(validate_heatpump_pv_config(cfg))
     consumer.update(validate_heatpump_display_config(cfg))
     consumer.update(validate_stiebel_sg_ready_config(cfg))
+    consumer.update(validate_heatpump_start_config(cfg))
     price: Dict[str, Dict[str, Any]] = {}
     forecast = validate_solcast_config(cfg)
     forecast.update(validate_pv_forecast_topology_config(cfg))
@@ -2556,7 +2627,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         "both": "both",
     }
     heat_price_scope_raw = str(
-        cfg.get("heat_price_boost_scope", "both") or "both"
+        cfg.get("heat_price_boost_scope", "both")
     ).strip().lower()
     heat_price_scope_valid = heat_price_scope_raw in heat_price_scope_aliases
     heat_price_scope = heat_price_scope_aliases.get(heat_price_scope_raw)
@@ -2880,7 +2951,6 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     heat_price_pilot_ready = bool(
         heat_price_boost_requested
         and heat_price_scope_valid
-        and heat_price_windows_valid
         and cheap_grid_supported
         and _is_enabled(cfg, "luxtronik")
         and safe_float(cfg.get("wp_type"), -1.0) == 0
@@ -2915,7 +2985,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
                 if heat_price_pilot_ready else
                 "Experimenteller Testbetrieb gesperrt: Benötigt Luxtronik mit Automatik, "
                 "gemeinsame Wärmeplanung, echten Börsentarif, beide Negativpreisfreigaben "
-                "sowie gültiges Wärmeziel und Zeitfenster. Allgemeine günstige "
+                "sowie eine aktuelle Speicherzusage. Allgemeine günstige "
                 "Preisfenster bleiben ohne Steuerwirkung."
             )
         ),
@@ -2943,7 +3013,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             else "ok"
         ),
         message=(
-            "Ungültiger Scope: Die Preisverschiebung bleibt fail-closed."
+            "Ungültiges Wärmeziel; Tarif- und Negativpreis-Boost sind gesperrt."
             if not heat_price_scope_valid
             else (
                 "Zielauswahl ist plausibel; sie erzeugt ohne vollständigen "
@@ -2962,25 +3032,14 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         ),
         live_value=None,
         live_key=None,
-        effective=heat_price_windows_raw if heat_price_windows_valid else None,
+        effective=None,
         source=(
             "user"
             if _has_user_value(cfg, "heat_price_boost_windows")
             else "default"
         ),
-        severity=(
-            "warning"
-            if heat_price_boost_requested and not heat_price_windows_valid
-            else "ok"
-        ),
-        message=(
-            "Ungültige Zeitfenster: Die Preisverschiebung bleibt fail-closed."
-            if not heat_price_windows_valid
-            else (
-                "Leer bedeutet ganztägiger Candidate; gültige Zeitfenster "
-                "begrenzen nur die Shadow-Auswertung."
-            )
-        ),
+        severity="ok",
+        message="Gespeicherte Altfenster sind ohne Wirkung auf den Negativpreis-Boost.",
     )
     for key, label, value in (
         ("price_limit", "Boost-Preislimit", price_limit),

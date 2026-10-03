@@ -2,7 +2,7 @@
 
 Diese Anleitung fasst die schnellsten Schritte zusammen, um E3DC-Control auf einem frischen Raspberry Pi OS (oder ähnlichem Debian-System) zu installieren.
 
-Aktueller Stable-Stand: `v5.5.2`.
+Aktueller Stable-Stand: `v5.5.3`.
 
 5.4.5f korrigiert das Speichern der Konfiguration mit übernommenen
 Docker-Datenvolumes und berücksichtigt erkannte Neustartphasen beim Update.
@@ -441,10 +441,13 @@ sudo python3 ./Installer/docker_compose_update.py --compose-dir . --sudo
 Der Helfer zieht das gewählte Image ausdrücklich, bindet Image-ID und
 Produktversion, wartet auf den Image-Healthcheck und verlangt zwei identische
 gesunde Folgesnapshots. Scheitert ein Schritt nach dem Kandidatenstart, stoppt
-er den Kandidaten wieder und bestätigt dessen Stillstand. Ein laufender
-Watchtower wird vorher gestoppt
-(`sudo docker compose --profile auto-update stop watchtower`); bei einem
-parallel aktiven Watchtower bricht der Helfer ab.
+er den Kandidaten wieder und bestätigt dessen Stillstand. Einen laufenden
+Watchtower, der denselben Container ersetzen kann, vor dem Helferaufruf selbst
+stoppen (`sudo docker compose --profile auto-update stop watchtower`).
+Der Helfer stoppt Watchtower nicht selbst und bricht bei dieser Konkurrenz ab.
+Nach erfolgreichem Helferlauf oder bestätigtem Rückfall den zuvor gestoppten Watchtower
+mit `sudo docker compose --profile auto-update up -d watchtower` wieder starten
+(bei eigenen Projekten mit denselben Projekt- und Dateiauswahlargumenten).
 
 Danach ist das System über die IP des Docker-Hosts erreichbar. Eine frische
 Konfiguration wird im Config-Editor eingerichtet.
@@ -519,7 +522,7 @@ Hauptcontainer auch bei laufendem Watchtower ausgenommen. Einzelheiten stehen
 in der [Docker-Dokumentation](Docker_Dokumentation.md), Abschnitt „Updates:
 Weboberfläche, Host und Watchtower“.
 
-**Docker-Rückfall von v5.5.2 auf den veröffentlichten Docker-Rollback-Root:**
+**Docker-Rückfall von v5.5.3 auf den veröffentlichten Docker-Rollback-Root:**
 
 Der aktuelle Host-Updater ist für die private Rückmigration zwingend. Aus
 Bridge zuerst dieselbe aktuelle Runtime-Version im Hostprofil neu aufbauen
@@ -617,3 +620,12 @@ Auf Bare Metal kannst Du den Installer nach der Installation über `bash "$E3DC_
   systemctl is-active e3dc-live e3dc-storage-manager e3dc-wallbox-manager apache2
   journalctl -u e3dc-live -n 80 --no-pager
   ```
+
+### Fehlende Watchtower-Umgebung
+
+Der Host-Helfer ergänzt fehlende API-Umgebung nur bei einem eindeutig zugeordneten
+lokalen Watchtower und nicht leerem Token in `.env`. Vorhandene Werte bleiben
+unverändert. Vor dem Schreiben entsteht eine Sicherung neben der Compose-Datei;
+bei fehlgeschlagener Nachprüfung wird der Ausgangsstand wiederhergestellt.
+Einrichtung, Grenzen bei externem Watchtower und mehreren Dateien sowie den
+manuellen Rückweg beschreibt [Watchtower-Umgebung in eigenen Compose-Dateien](Docker_Dokumentation.md#watchtower-umgebung-in-eigenen-compose-dateien).

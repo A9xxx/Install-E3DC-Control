@@ -58,6 +58,11 @@
 !/Installer/Heat/intent.py
 !/Installer/Heat/policy.py
 !/Installer/Heat/price_boost.py
+!/Installer/Heat/tariff_shift.py
+!/Installer/Heat/tariff_runtime.py
+!/Installer/Heat/tariff_storage.py
+!/Installer/Heat/plan_forecast.py
+!/html/heat_tariff_diagnostics.php
 !/Installer/Storage/__init__.py
 !/Installer/Storage/charge_curve.py
 !/Installer/Storage/common.py

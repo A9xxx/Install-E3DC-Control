@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover - HA owner leases require POSIX flock
     fcntl = None
 
 try:
+    from Installer import config_secret_permissions as _config_secret_permissions
     from Installer.config_secret_permissions import (
         config_secret_dir_mode,
         config_secret_dir_mode_text,
@@ -36,6 +37,7 @@ try:
     from Installer.quiet_logging import install_quiet_info_filter
     from Installer.ha_writer_admission import instance_role_anchor_matches
 except ImportError:
+    import config_secret_permissions as _config_secret_permissions
     from config_secret_permissions import (
         config_secret_dir_mode,
         config_secret_dir_mode_text,
@@ -187,26 +189,6 @@ HA_LOCAL_CONFIG_KEYS = {
     "home_dir",
     "venv_name",
     "venv_path",
-}
-SECRET_CONFIG_KEY_PARTS = (
-    "password",
-    "passwd",
-    "passwort",
-    "token",
-    "secret",
-    "api_key",
-    "apikey",
-    "aes",
-    "private",
-)
-SECRET_CONFIG_EXACT_KEYS = {
-    "rscp_pw",
-    "rscp_password",
-    "telegram_chat_id",
-    "web_pin",
-    # Bluelink-Konto (E-Mail) und PIN bleiben lokal; das Passwort greift über "password".
-    "bluelink_user",
-    "bluelink_pin",
 }
 
 
@@ -950,14 +932,11 @@ def _repair_mode5_user_start_legacy_parent(
 
 def is_secret_config_key(key):
     """Erkennt Config-Schlüssel, deren Werte nicht zwischen HA-Knoten wandern."""
-    normalized = str(key or "").strip().lower()
-    if not normalized:
-        return False
-    if normalized in SECRET_CONFIG_EXACT_KEYS:
-        return True
-    if normalized.endswith("_pass") or normalized == "pass":
-        return True
-    return any(part in normalized for part in SECRET_CONFIG_KEY_PARTS)
+    # Quelle ist config_secret_permissions. Hat ein laufender Alt-Updater
+    # dieses Modul noch in der alten Generation geladen, gilt jeder Schlüssel
+    # als geheim: dann wandert nichts, statt Zugangsdaten durchzulassen.
+    checker = getattr(_config_secret_permissions, "is_secret_config_key", None)
+    return True if checker is None else bool(checker(key))
 
 def ha_sync_config_payload(config_data):
     """Liefert die Master-Config ohne lokale Zugangsdaten für HA-Sync-Artefakte."""

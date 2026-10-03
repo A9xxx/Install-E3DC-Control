@@ -93,7 +93,7 @@ gedacht. Nutzer müssen sie normalerweise nicht direkt anfassen:
 | HZ Leistung (W) | `stiebel_isg_power_heating_w` | Nenn-/Schätzleistung in Watt für Heizbetrieb. |
 | WW Leistung (W) | `stiebel_isg_power_dhw_w` | Nenn-/Schätzleistung in Watt für Warmwasser. |
 | COP Schätzung | `stiebel_isg_cop_estimate` | Faktor für die angezeigte thermische Momentanleistung, wenn das ISG keine echte Wärmeleistung liefert. |
-| Standby (W) | `stiebel_isg_standby_w` | Standby-Leistung der WP-Steuerung in Watt. |
+| Standby (W) | `stiebel_isg_standby_w` | Standby-Leistung der WP-Steuerung in Watt. Die Leerlaufgrenze beträgt diesen Wert plus 25 W Messspielraum, mindestens 50 und höchstens 100 W. Standard 35 W ergibt 60 W. |
 | Max Hz | `stiebel_isg_max_hz` | Maximal angenommene Verdichterfrequenz für lineare Hz-Schätzung. |
 | Hz/Watt Kennlinie | `stiebel_isg_hz_power_map` | Optionale Kennlinie, z.B. `0:35,15:400,30:850,60:1800`. |
 | Hz aus Web | `stiebel_isg_scrape_hz_enable` | Optionales Lesen der ISG-Prozessdaten-Seite, Standard `Nein`; nach drei Timeouts pausiert der Dienst 30 Minuten. |
@@ -654,3 +654,23 @@ sudo python3 ./Installer/docker_compose_update.py \
 Wenn der Code selbst neu ist, den Host-Helfer ohne `--recreate-current`
 aufrufen; dadurch wird das gewählte GHCR-Image vor dem Start ausdrücklich
 gezogen und geprüft.
+
+### Startfreigabe und Leerlauf
+
+Bei aktivem SG-Ready-Schreiben gilt ein Startfenster von mindestens 150 Sekunden.
+Es deckt die durchgehende Startverzögerung `pv_boost_delay` und danach mindestens
+120 Sekunden für die Anlaufsperre des Dienstes, Schreiben und Verdichterannahme ab. Eine längere Verzögerung
+verlängert das Fenster; ab 150 Sekunden warnt die Konfigurationsprüfung vor der
+langen Budgetbindung. Die Wärmepumpe entscheidet weiterhin selbst über den Start.
+
+Der Betrag von `grid_start_limit` wird mit dem freien Verbraucherbudget nach der
+Akkuladung verglichen, nicht mit der Einspeisung am Netzpunkt. Die Zuteilung
+benötigt mindestens 1500 W. Kleinere Beträge erzeugen eine beratende Warnung.
+
+Nach einer ungenutzten Freigabe kann eine neue Anfrage frühestens 60 Sekunden nach
+deren Ende und nach der Wiederholsperre entstehen: Der Ausgang muss frisch als
+zurückgenommen bestätigt sein, der Verdichter nachweislich stehen und die frische
+Leistung unter der Leerlaufgrenze liegen. Eine interne Bereitschaftsmeldung löst
+die Sperre, ohne einen zusätzlichen Gerätebefehl auszulösen. Fehlende oder alte
+Leistungsdaten gelten nie als Leerlauf. Automatik-Aus, Schutzgrenzen,
+Mindestlaufzeit und Wiedereinschaltsperre behalten Vorrang.

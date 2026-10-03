@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.5.2 Stable</span>
+            <span class="badge bg-success text-light">v5.5.3 Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.5.2</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.5.3</code> in <code>.env</code> gesetzt.</p>
                 <p><strong>Update-Knopf und Auto-Update:</strong> Der Container tauscht sein Image nicht selbst. Läuft das Compose-Profil <code>auto-update</code> (Watchtower-Fork <code>ghcr.io/nicholas-fedor/watchtower</code>), gibt der Knopf <strong>System Update</strong> Watchtower über dessen lokale HTTP-API das Signal: Watchtower lädt das Image, erstellt den Container neu, und die Oberfläche lädt nach dem Start neu. Mit <strong>Auto-Update</strong> im Config-Editor passiert dasselbe täglich zur eingestellten Uhrzeit; Watchtower selbst pollt nicht. Gibt es kein neues Image, passiert nichts.</p>
                 <p>Einmalige Freischaltung auf dem Docker-Host im Compose-Ordner (Token für beide Dienste in <code>.env</code>, Container mit Token neu erstellen, Watchtower starten):</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
@@ -223,6 +223,17 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                     </ol>
                 </div>
             </div>
+        </div>
+
+        <h4 class="mb-4 text-accent">Stable 5.5.3: Zeitbasis der Historie, Stiebel-ISG-Startfreigabe und Tariffenster-Heizen</h4>
+        <div class="col-12 faq-item" data-tags="5.5.3 stable prognose historie zeitbasis tagesbilanz statistik wärmepumpe stiebel isg sg ready startfreigabe tariffenster lastspitzenkappung vorschau pumpensignale update">
+            <div class="card bg-card border-0 shadow-sm"><div class="card-body">
+                <h5 class="card-title">Was bringt Stable-Release 5.5.3?</h5>
+                <p>Die E3/DC-Historie lag bisher um eine bzw. zwei Stunden zu spät; sie wird jetzt in lokaler Gerätezeit angefragt, und die Prognosediagnose liest ältere Tage automatisch nach. Die Tagesbilanz für Haus, Netz und Akku umfasst jetzt den Kalendertag. Tageswerte ab dem Update können deshalb von früheren abweichen.</p>
+                <p>Bei Stiebel ISG mit SG-Ready-Schreiben lief die Startfreigabe der Wärmepumpe bisher ab, bevor geschrieben wurde, und blieb gesperrt. Das ist behoben. Liegt <code>grid_start_limit</code> unter 1500 W Betrag, warnt die Konfigurationsprüfung.</p>
+                <p>Das Tariffenster-Heizen ist experimentell und standardmäßig aus (<code>heat_tariff_shift_mode</code>). Eine aktive Lastspitzenkappung hat Vorrang vor dem Tarif-Halt. Die Wärmepumpen-Vorschau zeigt Pumpensignale und Durchfluss; <code>wp_heating_circuit_pump</code> wählt das Heizkreispumpensignal. Alle Felder im Config-Editor haben Hover-Texte.</p>
+                <p>Das Update läuft über <strong>System Update</strong> beziehungsweise den dokumentierten Docker-Updateweg; eine Konfigurationsänderung ist nicht nötig.</p>
+            </div></div>
         </div>
 
         <h4 class="mb-4 text-accent">Stable 5.5.2: Wallbox-Regelung, Batterie-Vitalverlauf und Wärmepumpen</h4>
@@ -1242,7 +1253,7 @@ Was korrigiert das Stable-Release 5.4.1d?
                 </div>
                 <div class="faq-answer">
                     <p><strong>Aus / autonom:</strong> ist NGNA. E3DC-Control beobachtet die Wallbox, sendet aber keine laufenden Ladebefehle. Nur ein bewusster Wechsel auf <code>Aus</code> in der Wallbox-WebUI gibt die Wallbox einmalig auf ihre Grundeinstellung frei.</p>
-                    <p><strong>PV-Kurve ruhig:</strong> lädt entlang der Speicher-Ladekurve mit Hysterese. Kurze Wolken und Lastwechsel werden geglättet, damit die Wallbox nicht taktet. Eine bereits laufende Ladung darf dafür kurzzeitig eine auf 75&nbsp;Wh begrenzte Batteriestützung nutzen; ein Kaltstart oder Phasenwechsel wird nicht aus dem Hausspeicher finanziert. Der Modus <strong>PV + Akku</strong> bleibt davon getrennt.</p>
+                    <p><strong>PV-Kurve ruhig:</strong> lädt entlang der Speicher-Ladekurve mit Hysterese. Kurze Wolken und Lastwechsel werden geglättet, damit die Wallbox nicht taktet. Eine laufende Ladung darf ein Wolken-Kontingent nutzen (automatisch 0,5&nbsp;% der Speicherkapazität, mindestens 50&nbsp;Wh, oder der konfigurierte Wert). Nur in diesem Modus folgt unter dem Kurvenkorridor am Ende des Kontingents einmalig PV-Laden, ein aus PV gedeckter Phasenabstieg oder Stop. Bis zur bestätigten Wirkung stützt der Speicher noch höchstens 30&nbsp;s. Danach gelten wieder die normalen Zeit- und Energiewächter. Ein übernommener Schnellstart der Wallbox verbraucht dasselbe Kontingent, sofern keine ausdrückliche Stützungsfreigabe oder gebundene Startreservierung für eine real ladende Wallbox vorliegt. Ein Kaltstart wird nicht aus diesem Kontingent finanziert. Der Modus <strong>PV + Akku</strong> bleibt davon getrennt.</p>
                     <p><strong>Kurze Anzeige von 0&nbsp;kW:</strong> Wird ein einzelner unplausibler Messwertsatz aus Sicherheitsgründen verworfen, kann das Wallboxbudget kurz 0&nbsp;kW anzeigen. Das ist nicht automatisch ein Ladeabbruch. Mit dem nächsten gültigen Messwertsatz wird neu geregelt; wiederholte Nullwerte sind dagegen ein Diagnosehinweis.</p>
                     <p><strong>Grundladung stabil:</strong> hält bewusst eine 6A-Grundladung, solange wbminSoC beziehungsweise das Speicherziel erreichbar bleibt. Das ist die Anti-Flatter-Variante für empfindliche Fahrzeuge und Wallboxen.</p>
                     <p><strong>PV + Akku bis Untergrenze:</strong> das Auto darf PV und Hausakku bis zur Hausakku-Reserve nutzen. Bis zu dieser Untergrenze lädt das Auto normal; Netz bleibt aus. Wenn die Wallbox mehr Leistung will, stützt der Akku darunter nur Hausverbrauch und Wärmepumpe.</p>
@@ -1357,6 +1368,7 @@ WB1 hat Ladevorgang physisch abgebrochen (Versuch 1/3)!</pre>
                         <li><strong><code>bat_usable_kwh</code>, <code>bat1_usable_kwh</code> ...:</strong> Einzelne Schrankwerte. Bei Speichererweiterungen darf <code>bat_usable_kwh</code> nicht als Gesamtsystem gelesen werden.</li>
                     </ul>
                     <p>Ab <strong>v5.1.x</strong> zeigt der Konfigurations-Editor bevorzugt <code>bat_total_usable_kwh</code> als prim&auml;ren Wert ("nutzbar") an. Vitals nutzt ebenfalls die Schrank-/Pack-Summe und bleibt die beste Detailansicht.</p>
+                    <p>Falls der Speicher keine gültigen SoH-Werte je Modul meldet, zeigt Vitals den BMS-Wert ASOC als gekennzeichnete Näherung je Schrank. Der daraus gebildete kapazitätsgewichtete Gesamtwert und die Verschleißprognose werden ebenfalls als Näherung gekennzeichnet. Daraus entstehen keine Werte für einzelne Module und keine Pack-Risikobewertung. Der Monatsverlauf speichert Quelle und Qualität der neuen Schrankwerte. Die Näherung ersetzt keinen Kapazitätstest.</p>
                     <p><strong>Was sollte ich als <code>speichergroesse</code> konfigurieren?</strong><br>
                     Die zur Anlage passende nutzbare Herstellerangabe als Referenz. Vitals zeigt diese Konfiguration getrennt von BMS-Spezifikation, FCC und USABLE. Die aus Ah mit angenommener Modulspannung berechneten BMS-Werte sind keine belegte Brutto- oder Neuzustandskapazität. Die SOH-Schätzung verwendet nur die konfigurierte Referenz; BMS-Nutzwerte werden nicht nochmals mit SOH multipliziert. Fehlende Werte bleiben unbekannt.</p>
                 </div>

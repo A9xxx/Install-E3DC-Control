@@ -149,7 +149,7 @@ def status_phase_count(status):
 def planned_reservation_power_w(
     *, observed_before_w=0.0, restart_amp=6.0, target_phases=1,
     effective_w_per_amp=0.0, current_step_amp=1.0, safety_reserve_w=None,
-    max_power_w=0.0,
+    max_power_w=0.0, from_phases=0,
 ):
     """Liefert die Wiederanlaufleistung einschließlich Mess- und Latenzreserve."""
 
@@ -167,7 +167,9 @@ def planned_reservation_power_w(
         if safety_reserve_w is None
         else max(0.0, _float(safety_reserve_w, 0.0))
     )
-    requested = max(max(0.0, _float(observed_before_w, 0.0)), restart) + reserve
+    # Beim Abstieg fällt die alte Last vor dem Wiederanlauf weg.
+    before = 0.0 if 0 < phases < _int(from_phases, 0) else max(0.0, _float(observed_before_w, 0.0))
+    requested = max(before, restart) + reserve
     maximum = max(0.0, _float(max_power_w, 0.0))
     if maximum > 0.0:
         requested = min(requested, maximum)
@@ -191,6 +193,7 @@ def begin_reservation(
     w_per_amp = _float(effective_w_per_amp, 0.0) or 230.0 * target
     requested_w = planned_reservation_power_w(
         observed_before_w=observed_before_w,
+        from_phases=from_phases,
         restart_amp=restart_amp,
         target_phases=target,
         effective_w_per_amp=w_per_amp,

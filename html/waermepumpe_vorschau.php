@@ -30,6 +30,32 @@ function wpv_num($value): ?float
     return is_finite($number) ? $number : null;
 }
 
+/** Luxtronik-Anzeigewert aus der Producer-Datei; Manager-Zeitstempel ersetzen ihre Frische nicht. */
+function wpv_lux_signal(array $live, string $key, int $now, string $kind = 'Ausgang', bool $binary = true, ?float $maximum = null): array
+{
+    $source = 'Luxtronik-' . $kind . ' ' . $key;
+    $ts = wpv_num($live['ts'] ?? null);
+    $value = null;
+    $status = 'ok';
+    if ($live && ($ts === null || $ts <= 0 || floor($ts) > $now)) {
+        $status = 'stale'; $reason = 'kein gültiger Zeitstempel';
+    } elseif ($live && $now - $ts > 120) {
+        $status = 'stale'; $reason = 'älter als 120 Sekunden';
+    } elseif (!array_key_exists($key, $live)) {
+        $status = 'missing'; $reason = 'Signal fehlt';
+    } else {
+        $value = wpv_num($live[$key]);
+        if ($value === null || ($binary ? ($value !== 0.0 && $value !== 1.0) : ($value < 0 || ($maximum !== null && $value > $maximum)))) {
+            $value = null;
+            $status = 'invalid';
+            $reason = $binary ? 'kein gültiger Ein/Aus-Wert' : ($maximum === null ? 'kein gültiger nichtnegativer Messwert' : 'kein gültiger Messwert von 0 bis ' . wpv_fmt($maximum, 0));
+        } else {
+            $reason = $binary ? ($value === 1.0 ? 'Ein' : 'Aus') : wpv_fmt($value, 0);
+        }
+    }
+    return ['v' => $value, 'status' => $status, 'why' => $source . ': ' . $reason];
+}
+
 /** Erster numerischer Wert aus einer Liste von Feldnamen. */
 function wpv_pick(array $data, array $keys): ?float
 {
@@ -281,6 +307,8 @@ function wpv_collect_inputs(array $conf, array $opts = []): array
         'wp_type' => $wpType,
         'json' => $json,
         'data_age_s' => $ageS,
+        // Pumpen separat an die originale Websocket-Datei binden, nicht an die Manager-Dateizeit.
+        'heating_circuit_live' => ($wpType === 0) ? wpv_read_json($liveFile) : null,
         'data_mtime' => ($dataMtime !== false) ? (int)$dataMtime : null,
         'stiebel_status' => $stiebelStatus,
         'history_wp_w' => $historyWpW,
@@ -326,6 +354,13 @@ function wpv_build_state(array $conf, array $in): array
     ];
     $manufacturer = $manufacturers[$wpType] ?? 'Wärmepumpe';
 
+    $luxLive = ($wpType === 0 && is_array($in['heating_circuit_live'] ?? null)) ? $in['heating_circuit_live'] : [];
+    $bup = wpv_lux_signal($luxLive, 'BUP', $now);
+    $bosup = wpv_lux_signal($luxLive, 'Ventil.-BOSUP', $now);
+    $zip = wpv_lux_signal($luxLive, 'ZIP', $now);
+    $evu = wpv_lux_signal($luxLive, 'EVU', $now, 'Eingang');
+    $flow = wpv_lux_signal($luxLive, 'Durchfluss', $now, 'Messwert', false);
+
     // --- Verdichter und Betriebsart ---------------------------------------------------------
     $stage = ($wpType === 0 && is_array($json['luxtronik_operating_stage'] ?? null)) ? $json['luxtronik_operating_stage'] : null;
     $stageOk = is_array($stage) && ($stage['status'] ?? '') === 'OK';
@@ -348,7 +383,9 @@ function wpv_build_state(array $conf, array $in): array
         $modeText = [0 => 'Heizen', 1 => 'Warmwasser', 2 => 'Schwimmbad', 3 => 'E-Sperre', 4 => 'Abtauen', 5 => 'Standby'][(int)$d['Betriebsart']] ?? '';
     }
     $textMode = wpv_mode_from_text($modeText);
-    if (!$success) $mode = 'unbekannt';
+    // Ein frischer Sperreingang hat Vorrang. EVU Ein hebt eine ausdrückliche Text-Sperre nicht auf.
+    if ($wpType === 0 && $evu['v'] === 0.0) $mode = 'evu';
+    elseif (!$success) $mode = 'unbekannt';
     elseif ($textMode === 'evu') $mode = 'evu';
     elseif ($textMode === 'abtauen') $mode = 'abtauen';
     elseif ($running === true) $mode = in_array($textMode, ['heizen', 'ww', 'kühlen'], true) ? $textMode : 'läuft';
@@ -484,16 +521,75 @@ function wpv_build_state(array $conf, array $in): array
 
     // --- Bewegung nur bei belegtem Zustand -------------------------------------------------------
     $compressorOn = ($running === true) && $mode !== 'evu';
+    // Ohne gewähltes Signal bleibt die bisherige Ableitung ohne Puffer erhalten.
+    // Mit Puffer ist der Heizkreis unabhängig vom Primärstrang und vom Verdichter.
+    $pump = ($wpType === 0) ? strtolower(trim((string)($conf['wp_heating_circuit_pump'] ?? 'hup'))) : 'none';
+    $pumpKeys = ['hup' => 'HUP', 'fup1' => 'FUP 1', 'zup' => 'ZUP'];
+    $hkActive = (!$hasBuffer && $running !== null && $success) ? ($compressorOn && $mode === 'heizen') : null;
+    $hkWhy = $hasBuffer ? 'Mit Pufferspeicher ist der Heizkreiszustand ohne eigenes Pumpensignal nicht belegt' : (($running === null || !$success) ? $why('Verdichterzustand nicht belegt') : 'Aus Verdichter und Betriebsart Heizen abgeleitet');
+    if ($pump !== 'none') {
+        $hkActive = null;
+        $pumpKey = $pumpKeys[$pump] ?? null;
+        $pumpLive = is_array($in['heating_circuit_live'] ?? null) ? $in['heating_circuit_live'] : [];
+        $pumpTs = wpv_num($pumpLive['ts'] ?? null);
+        if ($pumpKey === null) {
+            $hkWhy = 'Ungültige Auswahl für das Heizkreispumpensignal';
+        } elseif (!array_key_exists($pumpKey, $pumpLive)) {
+            $hkWhy = 'Heizkreispumpensignal ' . $pumpKey . ' fehlt';
+        } elseif ($pumpTs === null || $pumpTs <= 0 || floor($pumpTs) > $now) {
+            $hkWhy = 'Heizkreispumpensignal ' . $pumpKey . ': kein gültiger Zeitstempel';
+        } elseif ($now - $pumpTs > 120) {
+            // Gleiche Frischegrenze wie im Energy Manager für native WP-Livedaten.
+            $hkWhy = 'Heizkreispumpensignal ' . $pumpKey . ' ist älter als 120 Sekunden';
+        } else {
+            $pumpValue = wpv_num($pumpLive[$pumpKey]);
+            if ($pumpValue !== 0.0 && $pumpValue !== 1.0) {
+                $hkWhy = 'Heizkreispumpensignal ' . $pumpKey . ': kein gültiger Ein/Aus-Wert';
+            } else {
+                $hkActive = $pumpValue === 1.0;
+                $hkWhy = 'Heizkreispumpensignal ' . $pumpKey . ': ' . ($hkActive ? 'Ein' : 'Aus') . ' (keine Durchflussmessung)';
+            }
+        }
+    }
+    $wwFlow = $compressorOn && $mode === 'ww';
+    $sourceFlow = $compressorOn;
+    $wwWhy = 'Aus Verdichter und Betriebsart Warmwasser abgeleitet' . ($wwFlow ? '' : '; kein belegter Warmwasserbetrieb, deshalb ruhig');
+    $sourceWhy = 'Aus Verdichtermeldung abgeleitet' . ($sourceFlow ? '' : '; Verdichterlauf nicht belegt oder Sperre, deshalb ruhig');
+    $circWhy = '';
+    if ($wpType === 0) {
+        if ($bup['v'] !== null) {
+            $wwFlow = $bup['v'] === 1.0;
+            $wwWhy = $bup['why'] . ($wwFlow ? '; Warmwasser-Strang aktiv' : '; Warmwasser-Strang ruhig' . ($textMode === 'ww' ? ', auch bei Betriebszustand Warmwasser' : ''));
+        } else {
+            if ($bup['status'] === 'stale') { $wwFlow = false; $wwWhy = 'Daten nicht frisch, deshalb ruhig'; }
+            $wwWhy = $bup['why'] . '; ' . $wwWhy;
+        }
+        if ($bosup['v'] !== null) {
+            $sourceFlow = $bosup['v'] === 1.0;
+            $sourceWhy = $bosup['why'] . ($sourceFlow ? '; Wärmequellen-Strang aktiv' : '; Wärmequellen-Strang ruhig');
+        } else {
+            if ($bosup['status'] === 'stale') { $sourceFlow = false; $sourceWhy = 'Daten nicht frisch, deshalb ruhig'; }
+            $sourceWhy = $bosup['why'] . '; ' . $sourceWhy;
+        }
+        $percent = wpv_lux_signal($luxLive, 'Ventil.-BOSUP %', $now, 'Ausgang', false, 100.0);
+        if ($percent['v'] !== null) {
+            $sourceWhy .= '; ' . ($source === 'air' ? 'Ventilator ' : 'Pumpe ') . wpv_fmt($percent['v'], 0, ' %')
+                . ' (Quelle: Luxtronik-Ausgang Ventil.-BOSUP %, nur Zusatzinfo)';
+        } elseif ($percent['status'] === 'invalid') {
+            $sourceWhy .= '; ' . $percent['why'];
+        }
+        $circWhy = $zip['why'] . '; ' . ($zip['v'] === 1.0 ? 'Zirkulation läuft' : ($zip['v'] === 0.0 ? 'Zirkulation aus' : 'Zirkulationszustand unbekannt'));
+        $wwWhy .= '; ' . $circWhy;
+        $flow['why'] .= '; l/h am Primärstrang, nur Zahlenanzeige; keine Freigabe der Flussanimation';
+    }
     $flags = [
-        'src' => $compressorOn,
+        'src' => $sourceFlow,
         'wp' => $compressorOn,
         'hz' => $compressorOn && $mode === 'heizen',
-        'ww' => $compressorOn && $mode === 'ww',
-        // Mit Puffer fördert eine eigene Heizkreispumpe; ihr Signal ist nicht belegt, deshalb ruhig.
-        'hk' => !$hasBuffer && $compressorOn && $mode === 'heizen',
+        'ww' => $wwFlow,
+        'hk' => $hkActive === true,
     ];
-    $hkText = 'Fußboden · ' . (($hasBuffer || $running === null || !$success) ? '--' : ($flags['hk'] ? 'aktiv' : 'aus'));
-    $hkWhy = $hasBuffer ? 'Mit Pufferspeicher ist die Heizkreispumpe nicht gemessen' : (($running === null || !$success) ? $why('Verdichterzustand nicht belegt') : 'Aus Verdichter und Betriebsart Heizen abgeleitet');
+    $hkText = 'Fußboden · ' . ($hkActive === null ? '--' : ($flags['hk'] ? 'aktiv' : 'aus'));
 
     // --- Statusleiste ------------------------------------------------------------------------------
     $modeMeta = [
@@ -508,6 +604,12 @@ function wpv_build_state(array $conf, array $in): array
     ][$mode];
     $statusText = $modeMeta[3];
     $statusTitle = $success ? ('Quelle: ' . $runningWhy . ($modeText !== '' ? ' · Betriebszustand: ' . $modeText : '')) : $noData;
+    if ($wpType === 0) {
+        $statusTitle .= ' · ' . $evu['why'];
+        if ($evu['v'] === 0.0) $statusTitle .= '; Aus = Sperrzeit, Vorrang vor der Betriebsart';
+        elseif ($textMode === 'evu') $statusTitle .= '; ausdrückliche Sperrmeldung im Betriebszustand bleibt maßgeblich';
+        elseif ($evu['v'] === null) $statusTitle .= '; daraus keine EVU-Sperre abgeleitet';
+    }
     if ($stageOk && $running === false && trim((string)($stage['label'] ?? '')) !== '' && !in_array($mode, ['evu', 'abtauen'], true)) {
         $statusText = trim((string)$stage['label']);
     }
@@ -600,6 +702,9 @@ function wpv_build_state(array $conf, array $in): array
         'buffer' => ['present' => $hasBuffer, 'sensor' => $bufferSensor, 'label' => $bufferLabel] + $val($buffer, $bufferWhy),
         'hk_text' => $hkText,
         'hk_why' => $hkWhy,
+        'flow_why' => ['ww' => $wwWhy, 'src' => $sourceWhy, 'wp' => ($wpType === 0 ? $flow['why'] . '; ' : '') . 'Bewegung aus Verdichter und Betriebsart abgeleitet'],
+        'circ_why' => $circWhy,
+        'flow_lph' => $flow,
         'v' => [
             'aussen' => $val($aussen, $why('Kein Außenfühler im Datensatz')),
             'mittel' => $val($mittel, $why('Keine gemittelte Außentemperatur im Datensatz')),
@@ -723,6 +828,7 @@ function wpv_render(array $s): string
     foreach (wpv_pipes() as [$group, $kind, $flag, $path]) {
         if (empty($visible[$group])) continue;
         $g = '<g class="pipe-g' . (!empty($flags[$flag]) ? ' on' : '') . '" data-pipe="' . $group . '-' . $flag . '">'
+            . (isset($s['flow_why'][$flag]) ? '<title>' . wpv_h($s['flow_why'][$flag]) . '</title>' : '')
             . '<path class="pipe ' . $kind . '" d="' . $path . '"/><path class="flow" d="' . $path . '"/></g>';
         if ($group === 'coil') $coil .= $g; else $pipes .= $g;
     }
@@ -739,7 +845,7 @@ function wpv_render(array $s): string
     $srcText = $s['source_single']
         ? $f1($v['src_ein'], ' °C')
         : 'ein ' . $f1($v['src_ein']) . ' → aus ' . $f1($v['src_aus']) . (($v['src_ein']['v'] ?? $v['src_aus']['v']) === null ? '' : ' °C');
-    $srcWhy = trim($v['src_ein']['why'] . ' ' . $v['src_aus']['why']);
+    $srcWhy = trim($v['src_ein']['why'] . ' ' . $v['src_aus']['why'] . ' ' . $s['flow_why']['src']);
     if ($running === true && $v['src_ein']['v'] !== null && $v['src_aus']['v'] !== null) {
         $srcSub = 'Spreizung ' . wpv_fmt($v['src_ein']['v'] - $v['src_aus']['v'], 1, ' K');
     } elseif ($running === false) {
@@ -1085,6 +1191,9 @@ function wpv_render(array $s): string
 
     <!-- Rohrleitungen: Vorlauf rot, Rücklauf blau, Quelle türkis/blau -->
     <g id="wpvPipes"><?= $pipes ?></g>
+    <?php if ($s['wp_type'] === 0 && $s['flow_lph']['v'] !== null): ?>
+    <?= wpv_svg_text('id="wpvFlow" class="c-sub" x="714" y="342" text-anchor="middle"', wpv_fmt($s['flow_lph']['v'], 0, ' l/h'), $s['flow_lph']['why']) ?>
+    <?php endif; ?>
 
     <!-- Geräte -->
     <g id="wpvEquipment">
@@ -1103,12 +1212,13 @@ function wpv_render(array $s): string
         <?php endif; ?>
       </g>
       <g id="wpvValve" class="valve">
-        <title>Umschaltventil: Stellung aus der Betriebsart abgeleitet, nicht gemessen</title>
+        <title><?= wpv_h('Umschaltventil: Stellung aus der Betriebsart abgeleitet, nicht gemessen · Warmwasser-Strang: ' . $s['flow_why']['ww']) ?></title>
         <polygon points="710,294 710,306 722,300"<?= $flags['wp'] ? ' class="on"' : '' ?>/>
         <polygon points="734,294 734,306 722,300"<?= $flags['ww'] ? ' class="on"' : '' ?>/>
         <polygon points="716,288 728,288 722,300"<?= $flags['hz'] ? ' class="on"' : '' ?>/>
       </g>
       <g id="wpvWwTank">
+        <title><?= wpv_h($s['flow_why']['ww']) ?></title>
         <rect class="tank" x="748" y="250" width="60" height="130" rx="14" fill="url(#wpvGradWW)"/>
         <text class="tank-lbl" x="778" y="266" text-anchor="middle">Warmwasser</text>
         <?= wpv_svg_text('class="tank-val" x="778" y="288" text-anchor="middle"', $f1($ww, ' °C'), $ww['why']) ?>
@@ -1194,7 +1304,7 @@ function wpv_render(array $s): string
     <span class="wpv-badge <?= wpv_h($meta[1]) ?>" title="<?= wpv_h($s['status_title']) ?>"><?= wpv_h($s['status_text']) ?></span>
     <span class="pill">Verdichter <b<?= $v['hz_ist']['why'] !== '' ? ' title="' . wpv_h($v['hz_ist']['why']) . '"' : '' ?>><?= wpv_h($hzIst) ?></b> · Soll <b<?= $v['hz_soll']['why'] !== '' ? ' title="' . wpv_h($v['hz_soll']['why']) . '"' : '' ?>><?= wpv_h($hzSoll) ?></b></span>
     <?php if ($s['ww_window'] !== null): ?><span class="pill" title="<?= $s['ww_window']['active'] ? 'gerade im Fenster' : 'gerade außerhalb' ?>">Warmwasser-Fenster <?= wpv_h($s['ww_window']['text']) ?></span><?php endif; ?>
-    <?php if ($s['circ_window'] !== null): ?><span class="pill" title="Zeitfenster der Zirkulation (Konfiguration)">Zirkulation <?= wpv_h($s['circ_window']['text']) ?></span><?php endif; ?>
+    <?php if ($s['circ_window'] !== null): ?><span class="pill" title="<?= wpv_h('Zeitfenster der Zirkulation (Konfiguration)' . ($s['circ_why'] !== '' ? ' · ' . $s['circ_why'] : '')) ?>">Zirkulation <?= wpv_h($s['circ_window']['text']) ?></span><?php endif; ?>
     <?php foreach ($s['extra_badges'] as [$cls, $text, $title]): ?><span class="wpv-badge <?= wpv_h($cls) ?>" title="<?= wpv_h($title) ?>"><?= wpv_h($text) ?></span><?php endforeach; ?>
   </div>
 

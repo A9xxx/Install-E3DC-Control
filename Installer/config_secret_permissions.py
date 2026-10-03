@@ -15,6 +15,39 @@ except ImportError:  # pragma: no cover - Windows tests fake these modules elsew
     pwd = None
 
 
+SECRET_CONFIG_KEY_PARTS = (
+    "password",
+    "passwd",
+    "passwort",
+    "token",
+    "secret",
+    "api_key",
+    "apikey",
+    "aes",
+    "private",
+)
+SECRET_CONFIG_EXACT_KEYS = {
+    "rscp_pw",
+    "rscp_password",
+    "telegram_chat_id",
+    "web_pin",
+    # Bluelink-Konto (E-Mail) und PIN bleiben lokal; das Passwort greift über "password".
+    "bluelink_user",
+    "bluelink_pin",
+}
+
+
+def is_secret_config_key(key):
+    """Erkennt Config-Schlüssel, deren Werte nicht zwischen HA-Knoten wandern."""
+    normalized = str(key or "").strip().lower()
+    if not normalized:
+        return False
+    if normalized in SECRET_CONFIG_EXACT_KEYS:
+        return True
+    if normalized.endswith("_pass") or normalized == "pass":
+        return True
+    return any(part in normalized for part in SECRET_CONFIG_KEY_PARTS)
+
 CONFIG_SECRET_PROTECTION_MODE_KEY = "config_secret_protection_mode"
 STANDARD_MODE = "standard"
 COMPATIBILITY_MODE = "compatibility"

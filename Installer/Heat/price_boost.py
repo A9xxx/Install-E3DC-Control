@@ -56,7 +56,7 @@ def _nonnegative_number(value):
 
 
 def normalize_scope(value):
-    raw = str(value or "both").strip().lower()
+    raw = str(value).strip().lower()
     aliases = {
         "heat": "heating",
         "heizen": "heating",
@@ -66,7 +66,7 @@ def normalize_scope(value):
         "beide": "both",
     }
     normalized = aliases.get(raw, raw)
-    return normalized if normalized in VALID_SCOPES else "both"
+    return normalized if normalized in VALID_SCOPES else None
 
 
 def parse_allowed_windows(value):
@@ -198,7 +198,6 @@ def configured_contract(
     negative_price_enabled = bool(
         capability["controllable"]
         and spot_market
-        and window_allowed
         and _enabled(config.get("cheap_grid_boost_enable"), False)
         and _enabled(config.get("cheap_grid_heatpump_enable"), False)
     )
@@ -267,3 +266,38 @@ def negative_price_runtime_allowed(
         and math.isfinite(price_ct)
         and price_ct < 0.0
     )
+
+
+def boost_outdoor_temperature(value):
+    """Gültiger Mitteltemperaturwert ohne Ersatz durch Momentantemperatur."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        value = float(value)
+        return value if math.isfinite(value) and -60 <= value <= 60 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def heating_boost_allowed(config, outside, *, running=False):
+    """Mittlere Außentemperatur: Start unter Grenze, Rücknahme 1 K darüber.
+
+    Das Band verhindert Flattern der zusätzlichen HZ-Anforderung; bestehender
+    Kanal- und Verdichterschutz bleibt wirksam. WW benötigt diesen Wert nicht.
+    """
+    def finite(value):
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            value = float(value)
+            return value if math.isfinite(value) else None
+        except (ValueError, TypeError):
+            return None
+    temperature = boost_outdoor_temperature(outside)
+    if temperature is None:
+        return False
+    raw = config.get('heat_grid_boost_max_outdoor_c', 10)
+    if raw == '':
+        return True
+    limit = finite(raw)
+    return limit is not None and temperature < limit + (1.0 if running else 0.0)

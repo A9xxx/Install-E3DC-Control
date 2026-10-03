@@ -5,13 +5,13 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.5.2`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.5.3`. Das Dashboard startet ausschließlich
 den argumentlosen, root-eigenen Systemjob. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
 
-5.5.2 beruhigt die Wallbox-Regelung, führt die Fahrzeug-SoC-Hochrechnung innerhalb derselben Stecksession fort und ergänzt den monatlichen Batterie-Vitalverlauf. Wärmepumpenaufträge überbrücken kurze Datenlücken; PV-Sollwerte und Warmwasser-Timer werden zuverlässiger gehalten. Die neue Wärmepumpenansicht und der Stiebel-ISG-SG-Ready-Ausgang sind experimentell und standardmäßig aus. Das Update benötigt keine Konfigurationsänderung. Einzelheiten stehen in den [Release Notes](../RELEASE_NOTES.md). Für ein Update von 5.4.x gelten zusätzlich die Hinweise zu 5.5.0a und 5.5.0 weiter unten.
+5.5.3 korrigiert die Zeitbasis der E3/DC-Historie und die Tagesbilanz, behebt eine dauerhaft gesperrte Wärmepumpen-Startfreigabe bei Stiebel ISG mit SG-Ready und gibt der Lastspitzenkappung Vorrang vor dem Tarif-Halt. Neu sind das experimentelle Tariffenster-Heizen (Standard Aus), eine Wärmepumpen-Vorschau mit Pumpensignalen und Hover-Texte für alle Felder im Config-Editor. Das Update benötigt keine Konfigurationsänderung. Einzelheiten stehen in den [Release Notes](../RELEASE_NOTES.md). Für ein Update von 5.4.x gelten zusätzlich die Hinweise zu 5.5.0a und 5.5.0 weiter unten.
 
 5.5.0a ist ein Sicherheitsupdate für die Web-PIN: Die Sperre nach
 Fehlversuchen gilt jetzt auch für den API-Zugriff per Header. Das Update läuft

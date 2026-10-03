@@ -103,9 +103,23 @@ def _pack_record(cabinet: dict[str, Any], pack: dict[str, Any]) -> dict[str, Any
 def build_month_record(vitals: dict[str, Any], now: dt.datetime, db_path: str,
                        previous_packs: dict[tuple[Any, Any], dict[str, Any]] | None = None) -> dict[str, Any]:
     packs = []
+    cabinets = []
     for cabinet in vitals.get("cabinets", []) if isinstance(vitals, dict) else []:
         if not isinstance(cabinet, dict):
             continue
+        if isinstance(cabinet.get("index"), int):
+            soh = _number(cabinet.get("soh_avg"), positive=True)
+            if soh is not None and soh > 110:
+                soh = None
+            approximate = bool(cabinet.get("soh_approx")) and soh is not None
+            cabinets.append({
+                "cabinet": cabinet["index"],
+                "soh_avg": soh,
+                "soh_source": ("BAT_ASOC" if approximate else "BAT_DCB_SOH") if soh is not None else None,
+                "soh_approx": approximate,
+                "soh_quality": ("approximate" if approximate else "measured") if soh is not None else "unavailable",
+                "soh_reason": ("BAT_ASOC_APPROX" if approximate else "BAT_DCB_SOH") if soh is not None else "SOH_NOT_AVAILABLE",
+            })
         for pack in cabinet.get("packs", []):
             if isinstance(pack, dict) and isinstance(cabinet.get("index"), int) and isinstance(pack.get("index"), int):
                 sample = dict(pack)
@@ -120,6 +134,7 @@ def build_month_record(vitals: dict[str, Any], now: dt.datetime, db_path: str,
         "reason": None if packs and all(pack["valid"] for pack in packs) else ("NO_PACKS" if not packs else "PACK_DATA_INVALID"),
         "previous_month_energy": _monthly_energy(db_path, now),
         "packs": packs,
+        "cabinets": cabinets,
     }
 
 

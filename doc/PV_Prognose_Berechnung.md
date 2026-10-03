@@ -72,14 +72,74 @@ reine Betriebsdiagnose und standardmäßig ausgeschaltet:
 - Ein Slot wird frühestens 60 Minuten nach seinem Ende ausgewertet. Dadurch
   werden noch nicht abgeschlossene oder noch nachlaufende Historienwerte nicht
   vorschnell bewertet.
-- Zeitgrenzen werden als UTC-Zeitstempel gespeichert. Sommer- und
-  Winterzeitwechsel erzeugen dadurch weder doppelte noch fehlende
-  15-Minuten-Slots.
+- Zeitgrenzen werden als echte UTC-Zeitstempel gespeichert. Die lokale
+  Gerätezeit wird für jede Anfrage mit `Europe/Berlin` umgerechnet,
+  unabhängig von der Systemzeitzone. Viertelstunden-Anfragen werden vor
+  Zeitumstellungen geteilt. Die übersprungene lokale Frühjahrsstunde wird
+  nicht angefragt. Beide Ausprägungen der doppelten Herbststunde bleiben
+  unbestätigt: Diese acht Viertelstunden bleiben `null`, sind ungültig und
+  tragen den Grund `dst_local_hour_unverified`. Die UTC-Slotfolge bleibt
+  eindeutig; vollständige gültige Messdaten für diesen Herbsttag gibt es
+  deshalb nicht.
 - Fehlende oder ungültige Werte bleiben `null`. Eine echte gemessene
   Nullerzeugung bleibt dagegen ein gültiger Messwert.
 - Die zusammengefasste Auswertung entsteht höchstens einmal täglich. Das
   Webportal liest ausschließlich eine kleine, atomar veröffentlichte
   Zusammenfassung und niemals die private Rohdatenbank.
+
+### Zeitbasis der E3/DC-Historie
+
+Die E3/DC-Tageshistorie verwendet eine lokale Zeitachse: Der Anfragebeginn
+entspricht der UTC-Epoche zuzüglich des für diesen Zeitpunkt geltenden
+Versatzes in `Europe/Berlin`. Die Viertelstunden werden nach dem Lesen wieder
+mit ihrem echten UTC-Beginn gespeichert.
+
+Die korrigierte Quellenrevision heißt `e3dc_db_history_day_15m_v2`.
+Kennzahlen, Vorlaufvergleiche, Tagesauswertungen und diagnostische
+Kalibrierpaare verwenden ausschließlich diese Revision. Die bisherige Revision
+bleibt unverändert gespeichert und wird nicht als korrigierter Messwert
+ausgegeben. Tagesberichte der bisherigen Revision werden beim Wechsel neu
+berechnet.
+
+Bei eingeschalteter Prognosediagnose liest der Diagnoseprozess ältere UTC-Tage
+ohne neue Revision nach. Er bearbeitet höchstens zwei Tage innerhalb rollender
+15 Minuten, behält seinen Fortschritt über Neustarts und ergänzt ausschließlich
+die Evidenzdatenbank. Bestehende Datenbanken erhalten die benötigte
+Nachlesetabelle automatisch; vorhandene Messzeilen und deren
+Unveränderlichkeitsschutz bleiben erhalten. Für 90 offene UTC-Tage dauert das
+Nachlesen mindestens elf Stunden.
+
+Tage ohne vollständige Viertelstundenauflösung werden als nicht verfügbar
+vermerkt. Nach acht fehlgeschlagenen Leseversuchen je UTC-Tag bleibt ein Tag
+mit `history_transport_retry_limit` nicht verfügbar. Eine fehlende oder
+ungültige RSCP-Zugangskonfiguration verbraucht keine Leseversuche; die
+Diagnose nennt den Grund. Alte Messzeilen werden weder umgeschrieben noch
+durch nachgelesene Werte ersetzt. Die Aufbewahrungsfrist von 90 UTC-Tagen
+bleibt bestehen.
+
+Nachgelesene Beobachtungen tragen als Erfassungszeit die tatsächliche
+Nachlesezeit. Für diese Zeiträume bleibt der Vergleich mit der Tagespersistenz
+deshalb leer; Abweichungs- und Richtungskennzahlen werden dagegen berechnet.
+
+Der Plausibilitätswächter prüft gültige E3/DC-Viertelstunden gegen die
+Sonnenhöhe in der Slotmitte. Er warnt bei mehr als drei Slots eines UTC-Tags
+mit jeweils mehr als 50 Wh und einer Sonnenhöhe unter −1°. Neue und alte
+Revision werden getrennt geprüft. Der Hinweis ändert weder Zeitstempel noch
+Regelungsbefehle.
+
+Die Tagesbilanz für PV, Haus, Netz und Akku beginnt auf der lokalen
+Gerätezeitachse um Mitternacht und umfasst an normalen Tagen 24 Stunden. An
+Tagen mit 23 oder 25 Stunden werden die Geräte-Tageswerte nicht verwendet
+(`null`, Grund `dst_day_unverified`); dann gelten die vorhandenen
+statistischen Rückfallwege. Die stündliche Archivreparatur behält
+gespeicherte PV-, Netz- und Akkuenergien, wenn keine gültigen Tageszähler
+vorliegen, und berechnet Autarkie und Eigenverbrauch nur aus gültigen Werten
+neu. Fehlen die Zeitzonendaten für `Europe/Berlin`, wird die Tagesbilanz mit
+`history_timezone_unavailable` ungültig; der Live-Dienst läuft weiter.
+
+Während des Nachlesens können die alle 15 Sekunden erfassten Proben des
+Zusatzwechselrichters verzögert werden. Abstände über 45 Sekunden gehen nicht
+in die Energieintegration ein.
 
 Die Diagnose verwendet bewusst verständliche, projekteigene Bezeichnungen:
 

@@ -515,9 +515,9 @@ DECISION_HISTORY_PREFIX = "storage_decision_history_"
 EMS_REACTION_LATEST_F = os.path.join(RAMDISK, "ems_reaction_latest.json")
 EMS_REACTION_HISTORY_PREFIX = "ems_reaction_history_"
 
-CANONICAL_HEATPUMP_START_LEASE_S = 150.0
-HEATPUMP_START_SEMANTICS_SG_READY = "sg_ready_delayed_start"
-HEATPUMP_START_SEMANTICS_DIRECT = "direct_setpoint"
+CANONICAL_HEATPUMP_START_LEASE_S = heatpump_pv_policy.HEATPUMP_SG_READY_START_RESERVATION_S
+HEATPUMP_START_SEMANTICS_SG_READY = heatpump_pv_policy.HEATPUMP_START_SEMANTICS_SG_READY
+HEATPUMP_START_SEMANTICS_DIRECT = heatpump_pv_policy.HEATPUMP_START_SEMANTICS_DIRECT
 CONSUMER_BUDGET_RUNTIME_STATE_SCHEMA = "storage_consumer_budget_runtime_state_v1"
 STORAGE_CURVE_CAP_HANDOVER_SCHEMA = "storage_curve_cap_handover_v1"
 STORAGE_CURVE_CAP_HANDOVER_PRODUCER = "storage_manager"
@@ -900,19 +900,8 @@ def _contract_bool(value: Any) -> bool:
 
 
 def heatpump_start_semantics(cfg: Dict[str, Any]) -> str:
-    """Typisiert die Budget-Startreserve unabhängig vom Hardwaretreiber.
-
-    SG-Ready-/Relaispfade dürfen wegen der verzögerten Verdichterannahme
-    150 Sekunden reservieren. Direkte Luxtronik-/iDM-Setpoints erhalten nur
-    die kurze generische Startlease; ihr Sollwert bleibt beim Aktor bestehen.
-    """
-
-    source = cfg if isinstance(cfg, dict) else {}
-    wp_type = str(source.get("wp_type", "")).strip()
-    shelly_sg_ip = str(source.get("shelly_sg_ip", "")).strip()
-    if wp_type in ("3", "5") or shelly_sg_ip not in ("", "0.0.0.0"):
-        return HEATPUMP_START_SEMANTICS_SG_READY
-    return HEATPUMP_START_SEMANTICS_DIRECT
+    """Gemeinsame Ausgangssemantik für Speicher- und Wärmepumpen-Manager."""
+    return heatpump_pv_policy.heatpump_start_semantics(cfg)
 
 
 def consumer_priority_runon_guard(
@@ -22678,6 +22667,13 @@ def validated_wallbox_phase_probe_request(
     }
 
 
+def curve_effective_target_soc(cfg, plan, target_soc=None):
+    """Gemeinsames Ladeziel für Kurvenregelung und Prognosehalt."""
+    values = [plan.get(k) for k in ("effective_target_soc", "planning_target_soc", "target_soc")]
+    values.extend((target_soc, cfg.get("storage_target_soc")))
+    return max(safe_float(v, -1.0) if v is not None else -1.0 for v in values)
+
+
 def heatpump_pv_source_contract(
     cfg: Dict[str, Any], live: Dict[str, Any], decision: Dict[str, Any], *,
     now_s: float, evidence_valid: bool, max_discharge_w: int,
@@ -22685,6 +22681,8 @@ def heatpump_pv_source_contract(
     wallbox_power_known: bool, heatpump_w: int, heater_w: int,
     battery_floor_soc: float,
     heatpump_bridge_committed: bool = False,
+    plan: Optional[Dict[str, Any]] = None,
+    target_soc: Optional[float] = None,
     wallbox_status: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Ordnet gemessene Quellen einmal zu und begrenzt WP-Überbrückung.
@@ -22765,6 +22763,10 @@ def heatpump_pv_source_contract(
     battery_w = number(live.get("Battery_Power") if "Battery_Power" in live else live.get("Bat_Power"))
     grid_w = number(live.get("Grid_Power"))
     soc = number(live.get("SOC"))
+    # Die Netz-/Akkubilanz bleibt auch ohne die Aufteilung Haus/WP gültig.
+    balance_fresh = bool(evidence_valid and sample_ts is not None
+                         and 0.0 <= now_s - sample_ts <= 10.0
+                         and grid_w is not None and battery_w is not None)
     fresh = bool(
         evidence_valid and sample_ts is not None
         and 0.0 <= now_s - sample_ts <= 10.0
@@ -22798,7 +22800,8 @@ def heatpump_pv_source_contract(
     # keine null Watt Unterstützung und dürfen keine neue Freigabe erzeugen.
     fresh = bool(fresh and unassigned_w <= 250.0)
     protection_reason = ""
-    if not fresh:
+    if not fresh and not (balance_fresh and
+            heatpump_pv_policy.heatpump_pv_config(cfg).get("control_mode") == "measured"):
         protection_reason = "heatpump_source_evidence_invalid"
     elif decision.get("safety_veto") is True:
         safety_state = str(decision.get("state") or "")
@@ -22809,6 +22812,8 @@ def heatpump_pv_source_contract(
         )
     elif decision.get("protected") is True and not heatpump_bridge_committed:
         protection_reason = "storage_protected"
+    elif not fresh:
+        protection_reason = "heatpump_source_evidence_invalid"
 
     # Akkuenergie ohne bestätigte Kapazität oder explizites Anlagenprofil wird
     # nicht aus einem Default geschätzt. Die WP darf geschützte Reserven und
@@ -22908,8 +22913,46 @@ def heatpump_pv_source_contract(
         and auto_response_w > 0.0
         and min(battery_available_wh, pv_config["battery_limit_wh"]) >= auto_response_wh
     )
+    # Der Netzpunkt enthält Haus, WP, Heizstab und externe Wallbox bereits.
+    # Nur der noch nicht erfüllte Ladeauftrag wird vom Export abgezogen.
+    charge_target = number(decision.get("storage_req_w", 0))
+    if auto_limit_enabled:
+        charge_cap = number(decision_auto_limit.get("max_charge_w"))
+        charge_target = (max(charge_target, charge_cap)
+                         if charge_target is not None and charge_cap is not None else None)
+    measured_pv_offer = (max(0.0, -grid_w - max(0.0, charge_target - battery_w))
+                         if balance_fresh and charge_target is not None else None)
+    try:
+        # Keine ungültige Rohmessung durch einen numerischen Rückfall verdecken.
+        forecast_numbers = [live.get(k) for k in ("SOC", "bat_full_cap_kwh", "battery_capacity_kwh")]
+        forecast_numbers.extend((cfg.get("speichergroesse"), cfg.get("storage_target_soc"), target_soc))
+        if any(not math.isfinite(float(v)) for v in forecast_numbers if v is not None):
+            raise ValueError("Nicht endliche Prognoseeingabe")
+        curve_forecast = heatpump_pv_policy.curve_forecast_hold_contract(
+            plan, now_s=now_s, horizon_end_s=curve_release_ts_s(plan or {}),
+            soc=live.get("SOC", live.get("Battery_SoC")), capacity_kwh=capacity_kwh,
+            power_w=max(pv_config["max_power_w"], pv_config["start_power_w"],
+                        max(0, heatpump_w)), config=pv_config,
+            max_charge_w=configured_charge_limit_w(cfg, live, now_s=now_s),
+            target_soc=curve_effective_target_soc(cfg, plan or {}, target_soc))
+    except Exception as exc:
+        # Prognosefehler dürfen den Speicherzyklus samt Schutzgrenzen nie abbrechen.
+        curve_forecast = dict(valid=False, covers=False, reason="curve_forecast_error",
+                              error_type=type(exc).__name__, pv_cover_kwh=None,
+                              battery_need_kwh=None, boost_need_kwh=None,
+                              heat_need_kwh=None, reserve_kwh=None, pv_method=None)
     return {
         "schema": "heatpump_pv_source_v1",
+        "balance_fresh": balance_fresh,
+        "curve_forecast": curve_forecast,
+        "measured_pv_offer_w": measured_pv_offer,
+        "measured_pv_deficit_w": (max(0.0, grid_w + max(0.0, charge_target - battery_w))
+                                  if measured_pv_offer is not None else None),
+        "measured_pv_offer_reason": "measured_export_after_curve" if measured_pv_offer is not None else "balance_or_curve_unknown",
+        "wallbox_measured_w": max(0, int(wallbox_w))
+        if balance_fresh and effective_wallbox_known else None,
+        "balance_grid_w": grid_w if balance_fresh else None,
+        "balance_battery_w": battery_w if balance_fresh else None,
         "control_mode": pv_config.get("control_mode", "reserved"),
         "fresh": fresh,
         "sample_ts": sample_ts or 0.0,
@@ -23349,12 +23392,13 @@ def build_flexible_consumer_budget_contract(
             and live.get("Heatpump_Power_Known") is True
             and heatpump_observed_w >= heatpump_compressor_fallback_w
         )
+    heatpump_idle_w = heatpump_pv_policy.heatpump_idle_threshold_w(cfg)
     heatpump_pump_prerun = bool(
         heatpump_accounting_possible
         and heatpump_evidence_fresh
         and live.get("Heatpump_Power_Known") is True
         and not heatpump_compressor_confirmed
-        and 50 <= heatpump_observed_w < CONSUMER_MIN_W["heatpump"]
+        and heatpump_idle_w <= heatpump_observed_w < CONSUMER_MIN_W["heatpump"]
     )
     heatpump_withdrawal_ts = live.get("Heatpump_Withdrawal_TS")
     heatpump_withdrawal_ts_fresh = bool(
@@ -23368,7 +23412,7 @@ def build_flexible_consumer_budget_contract(
         and heatpump_withdrawal_ts_fresh
         and not heatpump_compressor_confirmed
         and not heatpump_pump_prerun
-        and heatpump_observed_w < 50
+        and heatpump_observed_w < heatpump_idle_w
     )
     heatpump_signal_readback_ts = live.get("Heatpump_Signal_Readback_TS")
     heatpump_signal_readback_fresh = bool(
@@ -23641,11 +23685,7 @@ def build_flexible_consumer_budget_contract(
             safe_float(cfg.get("consumer_start_lease_duration_s"), 25.0),
         ),
     )
-    heatpump_lease_duration_s = (
-        CANONICAL_HEATPUMP_START_LEASE_S
-        if heatpump_start_semantics_value == HEATPUMP_START_SEMANTICS_SG_READY
-        else short_lease_duration_s
-    )
+    heatpump_lease_duration_s = heatpump_pv_policy.heatpump_start_reservation_duration_s(cfg)
     lease_retry_s = min(
         120.0,
         max(
@@ -24409,6 +24449,19 @@ def build_flexible_consumer_budget_contract(
         and not phase_transition_active and wallbox_reserved_w <= 0
         and wallbox_start_hold_w <= 0 and wallbox_exclusive_start_support_w <= 0
     )
+    # Für die PV-Halteentscheidung zählt bei WP-Vorrang der gesamte
+    # Überschuss einschließlich einer laufenden Wallbox. Deren Haltebudget
+    # ist keine physische PV-Unterdeckung der vorrangigen Wärmepumpe.
+    pv_heatpump_priority = bool(pv_wallbox_reclaimable or (
+        heatpump_pv_path and heatpump_pv_policy.heatpump_pv_config(cfg)["control_mode"] == "measured"
+        and configured_order.index("heatpump") < configured_order.index("wallbox")
+        and wallbox_command_eligible and wallbox_online and wallbox_power_evidence_fresh
+        and not phase_transition_active and wallbox_exclusive_start_support_w <= 0))
+    # Die Quellenbindung kennt den Messpunkt: E3DC separat, externe Boxen im
+    # Netzpunkt/Haus. Angebote und Altwerte dürfen die WP nicht qualifizieren.
+    pv_source["deficit_wallbox_reclaim_w"] = (
+        pv_source.get("wallbox_measured_w") if pv_heatpump_priority else None
+    )
     if heatpump_pv_accounting_active:
         if available_is_residual_after_running and not phase_transition_active:
             pv_shared_frame_w = max(0, int(signed_residual_w)
@@ -24422,7 +24475,7 @@ def build_flexible_consumer_budget_contract(
             if phase_transition_active and heatpump_running:
                 pv_shared_frame_w += max(0, int(heatpump_commitment_w))
         other_claim_w = measured_acceptance_w["heater"]
-        if not pv_wallbox_reclaimable:
+        if not pv_heatpump_priority:
             other_claim_w += max(
                 measured_acceptance_w["wallbox"], int(wallbox_reserved_w),
                 int(wallbox_start_hold_w),
@@ -24432,6 +24485,17 @@ def build_flexible_consumer_budget_contract(
                 else 0,
             )
         pv_source["prospective_capacity_w"] = max(0, pv_shared_frame_w - other_claim_w)
+        measured_offer = heatpump_pv_policy._number(pv_source.get("measured_pv_offer_w"))
+        if (heatpump_pv_policy.heatpump_pv_config(cfg)["control_mode"] == "measured"
+                and pv_source.get("balance_fresh") is True and measured_offer is not None):
+            # Nur gemessene Last zurücknehmen, die im Netzpunkt schon enthalten
+            # ist. Keine Start-, Halte- oder Ersatzleistung reservieren.
+            pv_source["prospective_capacity_w"] = (
+                max(0.0, measured_offer - safe_float(pv_source.get("measured_pv_deficit_w"), 0.0)
+                + (heatpump_observed_w if heatpump_evidence_fresh
+                   and live.get("Heatpump_Power_Known") is True else 0)
+                + (max(0, safe_int(pv_source.get("wallbox_measured_w"), 0))
+                   if pv_heatpump_priority else 0)))
         pv_source["shared_capacity_w"] = pv_source["prospective_capacity_w"]
         if not cfg_bool(cfg, "auto_mode", True):
             pv_source["protection_reason"] = "user_off"
@@ -24450,10 +24514,18 @@ def build_flexible_consumer_budget_contract(
         if not heatpump_command_eligible or not heatpump_new_start_allowed:
             pv_request_contract["start_candidate"] = False
             pv_request_contract.setdefault("blockers", []).append("heatpump_start_not_eligible")
-            if not (pv_request_contract.get("state") or {}).get("active_command"):
+            if (not (pv_request_contract.get("state") or {}).get("active_command")
+                    and pv_request_contract.get("control_mode") != "measured"):
                 pv_request_contract["request_w"] = measured_acceptance_w["heatpump"]
         heatpump_cap_w = max(heatpump_cap_w, safe_int(pv_request_contract.get("max_power_w"), 0),
                             safe_int(pv_request_contract.get("request_w"), 0))
+
+    pv_measurement_gap = bool(
+        heatpump_pv_path and pv_request_contract.get("control_mode") == "measured"
+        and pv_request_contract.get("power_accounting_source") != "measured"
+        and not pv_request_contract.get("protection_reason")
+        and not pv_request_contract.get("start_reservation_active")
+    )
 
     heatpump_demand_ready = bool(
         heatpump_command_eligible
@@ -24611,8 +24683,24 @@ def build_flexible_consumer_budget_contract(
         for consumer in ("heatpump", "wallbox", "heater")
     }
     fresh_running_commitments_w = dict(measured_acceptance_w)
+    wp_separate = str(cfg.get("storage_home_wp_split", "auto") or "auto").strip().lower() in (
+        "0", "false", "no", "off", "separate", "excluded", "home_excludes_wp",
+    )
+    gap_reasons = (
+        "stale_acceptance_recovery_hold",
+        "acceptance_recovery_timebase_evidence_limit",
+        "acceptance_readback_timeout_evidence_limit",
+        "acceptance_readback_evidence_limit",
+    )
     recovery_accounting_w = {
-        consumer: max(
+        # Messlücken eingebetteter Lasten stecken bereits im gemessenen Rest.
+        # Frische Nullwerte behalten ihre Abfallentprellung; getrennte Lasten
+        # behalten ihre Reserve, weil deren Messlücke den Rest vergrößert.
+        consumer: 0 if (
+            available_is_residual_after_running
+            and (consumer == "heater" or consumer == "heatpump" and not wp_separate)
+            and acceptance_state[consumer].get("hold_reason") in gap_reasons
+        ) else max(
             0,
             running_commitments_w[consumer]
             - fresh_running_commitments_w[consumer],
@@ -24647,6 +24735,10 @@ def build_flexible_consumer_budget_contract(
         )
         for consumer in ("heatpump", "wallbox", "heater")
     }
+    if pv_measurement_gap and not wp_separate:
+        # Ohne WP-Messung steckt die Aufnahme bereits im Hausverbrauch.
+        # Keine zusätzliche Recovery-Reserve für dieselbe Leistung abziehen.
+        noncommand_accounting_w["heatpump"] = 0
     noncommand_accounting_reserve_requested_w = sum(
         noncommand_accounting_w.values()
     )
@@ -25002,7 +25094,7 @@ def build_flexible_consumer_budget_contract(
         }
         priority_front = (
             ("wallbox",)
-            if wallbox_start_hold_w > 0
+            if (wallbox_start_hold_w > 0 and not pv_heatpump_priority)
             or wallbox_exclusive_start_support_w > 0
             or wallbox_idle_heatpump_start_priority_active
             else ()
@@ -25485,8 +25577,14 @@ def build_flexible_consumer_budget_contract(
             wp_runon_s=priority_runon_s_from_config(cfg),
             wp_runon_active_override=bool(priority_runon.get("active")),
             priority_front=priority_front,
-            reclaimable_active=("wallbox",) if pv_wallbox_reclaimable
-                and pv_request_contract.get("start_candidate") is True else (),
+            # Im Messwertbetrieb gilt der WP-Vorrang auch während der
+            # Versandreservierung und bei laufender WP. Der Wallbox Manager
+            # setzt das verbleibende Budget mit seinen Halte-/Schaltregeln um.
+            reclaimable_active=("wallbox",) if (
+                pv_wallbox_reclaimable and pv_request_contract.get("start_candidate") is True
+                or pv_heatpump_priority and pv_request_contract.get("control_mode") == "measured"
+                and not pv_measurement_gap
+            ) else (),
             heatpump_exclusive_budget_w=heatpump_exclusive_source_w,
         )
 
@@ -26440,13 +26538,27 @@ def build_flexible_consumer_budget_contract(
             clock_sample=pv_clock,
             # Bei WP-Vorrang senkt die Reservierung das Wallbox-Ziel; die Wallbox
             # regelt parallel nach, der Sollwert wartet nicht auf sie.
-            handoff_required=not pv_wallbox_reclaimable,
+            handoff_required=not pv_heatpump_priority,
         )
         pv_grant["allocation_owned"] = heatpump_pv_path
         if not heatpump_pv_path:
             pv_grant.update({"command_authorized": False, "hold_required": False,
                              "withdrawal_required": False, "protection_reason": "",
                              "reason": "accounting_only_other_heat_demand"})
+        # Reine Diagnose: keine dieser Größen fließt in die Zuteilung zurück.
+        home = heatpump_pv_policy._number(live.get("Home_Power_Raw", live.get("Home_Power")))
+        baseline = heatpump_pv_policy._number(cfg.get("wb_curve_house_baseline_min_w"))
+        includes_wb = live.get("Wallbox_Home_Includes")
+        estimate_valid = bool(evidence_valid and live.get("Home_Power_Valid") is True
+                              and wallbox_power_evidence_fresh and home is not None
+                              and baseline is not None and type(includes_wb) is bool)
+        pv_grant["heatpump_power_estimate_from_house_w"] = (
+            max(0.0, home - (max(0, wallbox_current_w) if includes_wb else 0) - baseline)
+            if estimate_valid else None)
+        pv_grant["heatpump_power_estimate_from_house_source"] = "e3dc_house_minus_wallbox_minus_configured_baseline"
+        pv_grant["heatpump_power_estimate_from_house_valid"] = estimate_valid
+        pv_grant["heatpump_power_estimate_from_house_reason"] = (
+            "diagnostic_only" if estimate_valid else "house_wallbox_topology_or_baseline_unknown")
         contract["heatpump_pv_contract"] = pv_grant
         contract["heatpump_pv_source"] = pv_source
         if heatpump_pv_path:
@@ -26863,7 +26975,7 @@ def physical_controllable_power_ceiling_contract(
 
     live_hp_w = (
         max(0, safe_int(live.get("Heatpump_Power", 0), 0))
-        if heatpump_running
+        if heatpump_running and str(cfg.get("wp_type", "")).strip() != "6"
         else 0
     )
     live_heater_w = max(0, safe_int(live.get("Heizstab_Power", 0), 0))
@@ -26917,11 +27029,16 @@ def _raw_total_load_from_balance_w(live: Dict[str, Any]) -> Optional[float]:
 
 def house_power_excluding_wallbox_w(live: Dict[str, Any], wallbox_w: float) -> float:
     home_w = max(0.0, safe_float(live.get("Home_Power"), 0.0))
-    if not bool(live.get("Wallbox_Home_Includes")):
-        return home_w
-
     wallbox_w = max(0.0, safe_float(wallbox_w, 0.0))
-    direct_home_w = max(0.0, home_w - wallbox_w)
+    separate_e3dc_w = max(0.0, safe_float(live.get("Wallbox_Live_Power"), 0.0))
+    if bool(live.get("Wallbox_Home_Includes")):
+        embedded_w = wallbox_w
+    elif live.get("Wallbox_Power_Source") == "wallbox_native" and separate_e3dc_w > 50.0:
+        # Nur der externe Anteil steckt im Haus; E3DC misst seine Box separat.
+        embedded_w = max(0.0, wallbox_w - separate_e3dc_w)
+    else:
+        return home_w
+    direct_home_w = max(0.0, home_w - embedded_w)
     raw_total_w = _raw_total_load_from_balance_w(live)
     if raw_total_w is None:
         return direct_home_w
@@ -30356,13 +30473,7 @@ def decide_next_cycle(
                 or (adaptive_latest_charge_start_ts > 0.0 and now_s >= adaptive_latest_charge_start_ts)
             )
         raw_evening_release = bool(release_ts_s > 0 and now_s >= release_ts_s)
-        effective_target_soc = max(
-            safe_float(plan.get("effective_target_soc"), -1.0),
-            safe_float(plan.get("planning_target_soc"), -1.0),
-            safe_float(plan.get("target_soc"), -1.0),
-            safe_float(target_soc, -1.0) if target_soc is not None else -1.0,
-            safe_float(cfg.get("storage_target_soc"), -1.0),
-        )
+        effective_target_soc = curve_effective_target_soc(cfg, plan, target_soc)
         shortfall_catchup_margin_pct = max(
             0.1,
             safe_float(cfg.get("storage_curve_shortfall_catchup_margin_pct"), 0.5),
@@ -33433,7 +33544,7 @@ def decide_next_cycle(
         previous_heatpump_pv.get("state"),
     )
     heatpump_sources = heatpump_pv_source_contract(
-        cfg, live, decision, now_s=now_s,
+        cfg, live, decision, now_s=now_s, plan=plan, target_soc=target_soc,
         evidence_valid=consumer_source_evidence_valid,
         max_discharge_w=max_discharge_w,
         non_controllable_house_w=non_controllable_house_w,
@@ -36960,7 +37071,7 @@ def _consumer_runtime_start_leases(value: Any) -> Optional[Dict[str, Any]]:
             if (
                 duration_s is None
                 or not (
-                    abs(duration_s - CANONICAL_HEATPUMP_START_LEASE_S) <= 0.001
+                    duration_s >= CANONICAL_HEATPUMP_START_LEASE_S
                     or 5.0 <= duration_s <= 60.0
                 )
             ):
@@ -37052,10 +37163,7 @@ def _consumer_budget_runtime_projection(
         and (
             (
                 heatpump_semantics == HEATPUMP_START_SEMANTICS_SG_READY
-                and abs(
-                    heatpump_duration_s - CANONICAL_HEATPUMP_START_LEASE_S
-                )
-                <= 0.001
+                and heatpump_duration_s >= CANONICAL_HEATPUMP_START_LEASE_S
             )
             or (
                 heatpump_semantics == HEATPUMP_START_SEMANTICS_DIRECT
@@ -37438,6 +37546,17 @@ def finalize_heatpump_pv_output_owner(
         or source.get("fresh") is not True or source_ts is None
         or not 0.0 <= now_s - source_ts <= 10.0
     )
+    if (changed and not output_hard_veto
+            and grant.get("control_mode") == "measured"
+            and before_arbitration.get("heatpump_pv_source_binding") == "storage_output_unchanged"
+            and safe_int(result.get("mode"), -1) == MODE_AUTO
+            and safe_int(before_arbitration.get("mode"), -1) == MODE_AUTO
+            and not storage_protection_path_contract(result, plan).get("active")
+            and (result.get("auto_limit") or {}).get("max_discharge_w")
+                == (before_arbitration.get("auto_limit") or {}).get("max_discharge_w")):
+        # Die Kurvenladung darf weiter nachführen. Ein PV-Angebot besitzt
+        # keinen Speicherausgang und bindet keinen früheren Ladewert fest.
+        changed = False
     hard_veto = bool(output_hard_veto or grant.get("protection_reason"))
     source_isolation = bool(
         heatpump_pv_policy.heatpump_pv_config(cfg).get("control_mode") == "measured"
@@ -37646,6 +37765,26 @@ def terminal_consumer_budget_runtime_state(
         persisted_state,
         saved_ts=saved_ts,
     )
+
+
+def apply_heat_tariff_storage(cfg, live, payload, energy_decision, previous_state, *, now, reserve_pct):
+    """Optionaler Tarifvertrag am alleinigen Speicherausgang, bei Fehler ohne Eingriff."""
+    if cfg.get("heat_tariff_shift_mode", "off") == "off":
+        return payload
+    try:
+        from Heat.tariff_storage import apply as apply_tariff_storage
+        decision = energy_decision.get("decision") or {}
+        return apply_tariff_storage(
+            cfg, live, payload, decision.get("heat_tariff_shift"),
+            now=now, reserve_pct=reserve_pct, previous_state=previous_state,
+            min_interval_s=CURVE_FRAME_WRITE_BRAKE_MIN_INTERVAL_S,
+            deadband_w=CURVE_FRAME_WRITE_BRAKE_DEADBAND_W)
+    except Exception:  # Fehler im Zusatzpfad ändern weder Budget noch Speicherkommando.
+        result = copy.deepcopy(payload)
+        result["heat_tariff_shift"] = {
+            "ts": now, "mode": "off", "safety_free": False, "active": False,
+            "hold_w": None, "reason": "tariff_storage_unavailable"}
+        return result
 
 
 def write_state(payload: Dict[str, Any], plan: Dict[str, Any]) -> None:
@@ -38139,6 +38278,8 @@ def write_state(payload: Dict[str, Any], plan: Dict[str, Any]) -> None:
         "service": "storage_manager",
         "ladekurve": build_ladekurve_meta(plan),
     }
+    if isinstance(payload.get("heat_tariff_shift"), dict):
+        state["heat_tariff_shift"] = copy.deepcopy(payload["heat_tariff_shift"])
     atomic_write_on_change(STATE_F, state, indent=2)
 
 
@@ -47585,6 +47726,9 @@ def main() -> None:
             cfg, plan, heatpump_source_bound_payload, payload, now_s=time.time(),
         )
         payload = finalize_wallbox_fixed_start_output(payload)
+        payload = apply_heat_tariff_storage(
+            cfg, live, payload, energy_decision, previous_state,
+            now=start, reserve_pct=ep_reserve_soc(cfg, live))
         # Phase 5 und die unmittelbare Quellenprüfung liegen absichtlich vor
         # dem einzigen RSCP-Ausgang. Die veröffentlichte Anzeige muss deshalb
         # den finalen Hardwarevertrag und nicht die frühere Vorentscheidung

@@ -128,11 +128,16 @@ def _raw_total_load_from_balance_w(live: Dict[str, Any]) -> Optional[float]:
 
 def house_power_excluding_wallbox_w(live: Dict[str, Any], wallbox_w: float) -> float:
     home_w = max(0.0, safe_float(live.get("Home_Power"), 0.0))
-    if not bool(live.get("Wallbox_Home_Includes")):
-        return home_w
-
     wallbox_w = max(0.0, safe_float(wallbox_w, 0.0))
-    direct_home_w = max(0.0, home_w - wallbox_w)
+    separate_e3dc_w = max(0.0, safe_float(live.get("Wallbox_Live_Power"), 0.0))
+    if bool(live.get("Wallbox_Home_Includes")):
+        embedded_w = wallbox_w
+    elif live.get("Wallbox_Power_Source") == "wallbox_native" and separate_e3dc_w > 50.0:
+        # Nur der externe Anteil steckt im Haus; E3DC misst seine Box separat.
+        embedded_w = max(0.0, wallbox_w - separate_e3dc_w)
+    else:
+        return home_w
+    direct_home_w = max(0.0, home_w - embedded_w)
     raw_total_w = _raw_total_load_from_balance_w(live)
     if raw_total_w is None:
         return direct_home_w

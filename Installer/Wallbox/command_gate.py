@@ -104,10 +104,16 @@ def set_storage_power_budget_hard_block(
     active: bool,
     *,
     reason: str = "storage_power_budget_readback_blocked",
+    budget_validated: bool = False,
 ) -> None:
     """Bindet das Storage-Wattbudget-Veto direkt an den Wallboxtreiber."""
     if charger is None:
         return
+    if budget_validated:
+        charger._storage_power_budget_pending = False
+    if getattr(charger, "_storage_power_budget_pending", False) and not active:
+        active = True
+        reason = "wallbox_budget_unknown"
     blocked = bool(active)
     setattr(charger, _STORAGE_HARD_BLOCK_ATTR, blocked)
     setattr(
@@ -746,6 +752,45 @@ def _storage_hard_block_allows_grid_watchdog_clamp(
     )
 
 
+@contextlib.contextmanager
+def unplug_offer_budget_scope(charger, *, target_amp, eligible):
+    """Bindet die Budgetausnahme kurzlebig an den geprüften Angebotsausgang.
+
+    Die Policy bleibt im Manager. Der Treiber prüft bei jeder I/O-Kante
+    erneut die Autorität und akzeptiert nur den exakten Stromwert samt
+    notwendiger Heartbeat-Vorstufe; niemals Phase oder Ladefreigabe.
+    """
+    previous = getattr(charger, "_command_gate_unplug_offer_scope", None)
+    charger._command_gate_unplug_offer_scope = (target_amp, eligible)
+    try:
+        yield
+    finally:
+        charger._command_gate_unplug_offer_scope = previous
+
+
+def _storage_hard_block_allows_unplug_offer(charger, action, payload):
+    scope = getattr(charger, "_command_gate_unplug_offer_scope", None)
+    if not isinstance(scope, tuple) or len(scope) != 2 or not callable(scope[1]):
+        return False
+    if getattr(charger, _STORAGE_HARD_BLOCK_REASON_ATTR, "") not in (
+        "authorized_wallbox_budget_below_minimum", "wallbox_budget_unknown",
+    ):
+        return False
+    if not scope[1]():
+        return False
+    name = str(action or "").strip().lower()
+    data = payload if isinstance(payload, dict) else {}
+    if _openwb_pro_heartbeat_enable_prestep(name, data):
+        return True
+    if name not in (
+        "openwb_pro_set_amp_and_state", "openwb_pro_post_control",
+        "openwb_pro_post_control_wire",
+    ):
+        return False
+    target = _group_deficit_downward_target_from_action(charger, name, data)
+    return target is not None and target > 0.0 and target == scope[0]
+
+
 def _storage_hard_block_allows_output(
     *,
     charger: Any,
@@ -764,6 +809,8 @@ def _storage_hard_block_allows_output(
 
     if _is_typed_emergency_output(charger, name, data):
         return True
+    # Die Budgetsperre verhindert Starts und Anhebungen. Typisierte
+    # Absenkungen bleiben auch vor dem ersten gültigen Budget erlaubt.
     if _storage_hard_block_allows_group_deficit_downward(
         charger=charger,
         action=name,
@@ -1420,8 +1467,12 @@ def allow_command(
         getattr(charger, _STORAGE_HARD_BLOCK_REASON_ATTR, "")
         or "storage_power_budget_readback_blocked"
     )
+    unplug_offer_budget_exempt = _storage_hard_block_allows_unplug_offer(
+        charger, action, payload,
+    )
     storage_output_allowed = bool(
-        not storage_blocked
+        unplug_offer_budget_exempt
+        or not storage_blocked
         or _storage_hard_block_allows_output(
             charger=charger,
             action=action,
@@ -1433,7 +1484,7 @@ def allow_command(
     charger._command_gate_storage_status = {
         "active": storage_blocked,
         "allowed": storage_output_allowed,
-        "reason": storage_reason,
+        "reason": "unplug_offer_budget_exempt" if unplug_offer_budget_exempt else storage_reason,
         "action": str(action or ""),
         "ts": time.time(),
     }

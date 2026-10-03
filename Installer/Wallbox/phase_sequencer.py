@@ -118,7 +118,8 @@ def begin_phase_transition_reservation(
     ``restart_amp_authoritative`` meldet, dass der Aufrufer den tatsächlichen
     Wiederanlaufstrom je Zielphase kennt (openWB Pro 1p→3p: normativ 6 A).
     Dann gilt ``restart_amp`` statt des laufenden Stroms der alten Phasenzahl;
-    die bisherige Leistung bleibt über ``observed_before_w`` reserviert.
+    beim Aufstieg bleibt die bisherige Leistung über ``observed_before_w``
+    reserviert. Beim Abstieg zählt nur die Wiederanlaufleistung der Zielphase.
     """
 
     data = state if isinstance(state, dict) else {}
@@ -291,6 +292,16 @@ class PhaseSwitchSequencer:
             cp_payload=effective_cp_payload,
             clock_sample=clock_sample,
         )
+        if (
+            str(reason or "") == "group_deficit_phase_down"
+            and _safe_int(target_phases, 0) == 1
+            and isinstance(contract.get("sequence"), dict)
+        ):
+            # Kontingent-Ende kann oberhalb 6 A eintreten. Reserviert wird
+            # der konfigurierte Mindeststrom; der kanonische Startpfad der
+            # openWB Pro gibt derzeit trotzdem 6 A aus. Erst danach folgt
+            # die weitere Rampe dem neuen PV-Budget.
+            contract["sequence"]["hold_amp"] = float(_MIN_CHARGE_CURRENT_A)
         self._state["_openwb_pro_phase_sequence_contract"] = deepcopy(contract)
         self._pending = deepcopy(contract)
         self._pending_config = deepcopy(cfg)

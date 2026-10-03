@@ -5035,7 +5035,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                             let energyTitle = '';
                             const floorSupport = data.curve_floor_support && typeof data.curve_floor_support === 'object' ? data.curve_floor_support : {};
                             const phaseEnergy = wb.phase_energy_policy && typeof wb.phase_energy_policy === 'object' ? wb.phase_energy_policy : {};
-                            if (floorSupport.active === true && ampRow && ampRow.realCharging) {
+                            if (floorSupport.active === true && ['floor_contingent', 'pv_only'].includes(String(floorSupport.class || '')) && ampRow && ampRow.realCharging) {
                                 const whUsed = Math.round(parseFloat(floorSupport.wh_used || 0));
                                 const whLimit = Math.round(parseFloat(floorSupport.wh_limit || 0));
                                 const floorPvOnly = String(floorSupport.class || '') === 'pv_only';

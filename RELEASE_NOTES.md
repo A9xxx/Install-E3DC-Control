@@ -1,3 +1,53 @@
+# E3DC-Control v5.5.3
+
+5.5.3 korrigiert die Zeitbasis der E3/DC-Historie und die Tagesbilanz, behebt eine dauerhaft gesperrte Wärmepumpen-Startfreigabe bei Stiebel ISG mit SG-Ready und gibt der Lastspitzenkappung Vorrang vor dem Tarif-Halt. Neu sind das experimentelle Tariffenster-Heizen (Standard Aus), ein messwertgeführter PV-Boost ohne Startreservierung, eine Wärmepumpen-Vorschau mit Pumpensignalen und Hover-Texte für alle Felder des Config-Editors. Das Update benötigt keine zwingende Konfigurationsänderung.
+
+## Wallbox
+
+- In `PV-Kurve ruhig` gilt unter dem Kurvenkorridor ein Wolken-Kontingent. Am Kontingentende folgt im selben Zyklus einmalig Weiterladen aus PV, ein getragener 1p-Abstieg oder Stop; der Speicher stützt bis zur Bestätigung höchstens 30 s.
+- Nach einem Kaskadenabstieg von 3p auf 1p startet die openWB Pro mit dem konfigurierten Mindeststrom statt fest mit 6 A.
+- Stammt der externe Hausverbrauchsanteil aus einem Altwert, startet keine externe Wallbox und erhöht weder Strom noch Phasenzahl; Absenkungen und Schutzabschaltungen wirken sofort.
+
+## Speicher
+
+- Batterie-Vitals nutzt bei fehlendem Modul-SoH den BMS-Wert `BAT_ASOC` als gekennzeichnete Näherung je Schrank.
+- Verbraucherleistungen zählen in Budget und Bilanz genau einmal, auch in gemischten Installationen mit E3/DC- und externen Wallboxen.
+- Eine aktive Lastspitzenkappung hat Vorrang vor dem Tarif-Halt: Sie kappt Viertelstundenspitzen mit dem Akku auch während eines Boosts und sperrt den Tarifstart nicht.
+
+## Wärmepumpe
+
+- Tariffenster-Heizen (experimentell, Standard Aus) verschiebt bei Octopus Heat belegte Wärmebedarfe in günstige Zeitfenster; Schattenbetrieb ohne Steuerbefehl ist möglich.
+- `heat_price_boost_scope` gilt für Tarif- und Negativpreis-Boost, `heat_grid_boost_max_outdoor_c` begrenzt Heizungs-Boosts nach Außentemperatur.
+- Im Luxtronik-Messwertbetrieb reserviert der PV-Boost keine feste Leistung; ein gehaltener Boost darf bei Kurvenbedarf weiterlaufen, wenn die Restprognose Akkuziel und Wärme deckt.
+- Die Warmwasser-Grundstellung folgt dem Timer auch während E3DC-Datenlücken; Ferien- oder Frostschutzmodus der Wärmepumpe sperrt neue Boosts.
+- **Stiebel ISG mit SG-Ready-Schreiben:** Die Startfreigabe lief bisher ab, bevor geschrieben wurde, und blieb danach gesperrt. Jetzt gelten mindestens 150 s Startfenster, und nach einer abgelaufenen Freigabe wird wieder entsperrt.
+- `grid_start_limit` unter 1500 W Betrag wird nie erreicht; die Konfigurationsprüfung warnt jetzt davor.
+
+## Prognose und Statistik
+
+- Die E3/DC-Historie lag bisher um eine bzw. zwei Stunden zu spät. Sie wird jetzt in lokaler Gerätezeit angefragt; ältere Tage liest die Prognosediagnose automatisch nach.
+- Die Tagesbilanz für Haus, Netz und Akku umfasst jetzt den Kalendertag (bisher in der Sommerzeit 22 bis 22 Uhr). Tageswerte ab dem Update können deshalb von früheren abweichen.
+
+## Webportal und Diagnose
+
+- Wärmepumpen-Vorschau mit Pumpensignalen (HUP, BUP, BOSUP, ZIP, EVU) und Durchfluss; `wp_heating_circuit_pump` wählt das Heizkreispumpensignal.
+- Hover-Texte für alle Felder im Config-Editor.
+- `heat_tariff_diagnostics.php` liefert einen lesenden Tagesexport für das Tariffenster-Heizen.
+
+## Updatehinweise
+
+- **Bare Metal:** Das Update wie gewohnt über **System Update** in der Weboberfläche starten. Nach erfolgreichem Update die Seite neu laden.
+- **Docker:** Mit eingerichtetem Watchtower über **System Update**, sonst auf dem Host im bestehenden Compose-Ordner mit `sudo docker compose pull` und `sudo docker compose up -d` aktualisieren. Einen festen Pin in `.env` bewusst auf `E3DC_IMAGE_TAG=v5.5.3` ändern. Einen laufenden Watchtower vor einem manuellen Helferaufruf pausieren (`sudo docker compose --profile auto-update stop watchtower`) und danach wieder starten.
+- **Konfiguration:** Tariffenster-Heizen bleibt standardmäßig aus (`heat_tariff_shift_mode = off`). Neue Schlüssel werden mit sicheren Standards vorbelegt.
+- **Auswertungen:** In `waermepumpe.json` und den Luxtronik-Archivzeilen enthalten `ZUP` und `Ventil.-BOSUP` ab dieser Version den Ein/Aus-Wert; der Prozentwert steht unter `ZUP %` bzw. `Ventil.-BOSUP %`.
+- **Von 5.4.x:** Zusätzlich gelten die Hinweise von 5.5.0 und 5.5.2 weiter unten. Details stehen in [doc/Update.md](doc/Update.md).
+
+## Rückfall
+
+Die freigegebenen Rückfallziele bleiben unverändert. Für Docker gilt der in der Update-Policy ausgewiesene Docker-Rollback-Root; auf Bare Metal bleibt ein verifiziertes Datei-Backup der sichere Rückweg. Vor einem Rückfall die [Rückfall-Dokumentation](doc/Rollback.md) lesen.
+
+---
+
 # E3DC-Control v5.5.2
 
 5.5.2 beruhigt die Wallbox-Regelung, führt die Fahrzeug-SoC-Hochrechnung innerhalb derselben Stecksession fort und ergänzt den monatlichen Batterie-Vitalverlauf. Wärmepumpenaufträge überbrücken kurze Datenlücken; PV-Sollwerte und Warmwasser-Timer werden zuverlässiger gehalten. Die neue Wärmepumpenansicht und der Stiebel-ISG-SG-Ready-Ausgang sind experimentell und standardmäßig aus. Das Update benötigt keine Konfigurationsänderung.

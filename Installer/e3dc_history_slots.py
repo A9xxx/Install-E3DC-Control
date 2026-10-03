@@ -10,6 +10,8 @@ keine Dateien.
 from __future__ import annotations
 
 import math
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import time
 from typing import Any
 
@@ -20,7 +22,9 @@ except ImportError:  # pragma: no cover - Paketimport
 
 
 HISTORY_SLOT_SCHEMA = "e3dc_history_slot_v1"
-HISTORY_SOURCE_CONTRACT = "e3dc_db_history_day_15m_v1"
+HISTORY_TIMEZONE = ZoneInfo("Europe/Berlin")
+LEGACY_HISTORY_SOURCE_CONTRACT = "e3dc_db_history_day_15m_v1"
+HISTORY_SOURCE_CONTRACT = "e3dc_db_history_day_15m_v2"
 HISTORY_INTERVAL_S = 15 * 60
 HISTORY_SETTLING_DELAY_S = 60 * 60
 HISTORY_DEFAULT_SLOT_COUNT = 16
@@ -39,6 +43,28 @@ def _container(tag: int, children: list[dict[str, Any]]) -> dict[str, Any]:
     return {"tag": tag, "type": RscpType.Container, "value": children}
 
 
+def utc_to_local_epoch(timestamp_s: int) -> int:
+    """Gerätezeit: lokale Uhrzeit als Sekunden auf einer nominellen UTC-Achse."""
+    offset = datetime.fromtimestamp(timestamp_s, HISTORY_TIMEZONE).utcoffset()
+    return int(timestamp_s) + int(offset.total_seconds())
+
+
+def local_epoch_to_utc(timestamp_s: int) -> int | None:
+    """Nur eindeutig existierende Ortszeiten zuordnen; Lücke/fold bleiben offen."""
+    naive = datetime.fromtimestamp(timestamp_s, timezone.utc).replace(tzinfo=None)
+    candidates = set()
+    for fold in (0, 1):
+        candidate = int(naive.replace(tzinfo=HISTORY_TIMEZONE, fold=fold).timestamp())
+        if datetime.fromtimestamp(candidate, HISTORY_TIMEZONE).replace(tzinfo=None) == naive:
+            candidates.add(candidate)
+    return candidates.pop() if len(candidates) == 1 else None
+
+
+def _slot_time_verified(start: int) -> bool:
+    return all(local_epoch_to_utc(utc_to_local_epoch(ts)) == ts
+               for ts in (start, start + HISTORY_INTERVAL_S - 1))
+
+
 def build_history_request(time_start_utc_s: int, slot_count: int) -> list[dict[str, Any]]:
     """Baut genau eine read-only Tageshistorienanfrage für 15-Minuten-Slots."""
 
@@ -48,11 +74,16 @@ def build_history_request(time_start_utc_s: int, slot_count: int) -> list[dict[s
         raise ValueError("time_start_utc_s muss ein ausgerichteter positiver UTC-Slotstart sein")
     if count < 1 or count > HISTORY_MAX_SLOT_COUNT:
         raise ValueError(f"slot_count muss zwischen 1 und {HISTORY_MAX_SLOT_COUNT} liegen")
+    if not all(_slot_time_verified(start + i * HISTORY_INTERVAL_S) for i in range(count)):
+        raise ValueError("dst_local_hour_unverified")
+    last = start + count * HISTORY_INTERVAL_S - 1
+    if utc_to_local_epoch(start) - start != utc_to_local_epoch(last) - last:
+        raise ValueError("history_request_crosses_dst")
     return [
         _container(
             RscpTag.DB_REQ_HISTORY_DATA_DAY,
             [
-                _uint64(RscpTag.DB_REQ_HISTORY_TIME_START, start),
+                _uint64(RscpTag.DB_REQ_HISTORY_TIME_START, utc_to_local_epoch(start)),
                 _uint64(RscpTag.DB_REQ_HISTORY_TIME_INTERVAL, HISTORY_INTERVAL_S),
                 _uint64(RscpTag.DB_REQ_HISTORY_TIME_SPAN, count * HISTORY_INTERVAL_S),
             ],
@@ -154,7 +185,13 @@ def parse_history_response(
 
     start = int(time_start_utc_s)
     count = int(slot_count)
-    build_history_request(start, count)  # gemeinsame Eingabevalidierung
+    try:
+        build_history_request(start, count)  # gemeinsame Eingabevalidierung
+    except ValueError as exc:
+        if str(exc) not in {"dst_local_hour_unverified", "history_request_crosses_dst"}:
+            raise
+        return [_missing_slot(start + i * HISTORY_INTERVAL_S, "dst_local_hour_unverified")
+                for i in range(count)]
     root = find_tag(response or [], RscpTag.DB_HISTORY_DATA_DAY)
     if not isinstance(root, dict):
         return [
@@ -231,7 +268,12 @@ def parse_history_response(
 
     slots: list[dict[str, Any]] = []
     for graph_index in range(1, count + 1):
-        slot_start = start + (graph_index - 1) * HISTORY_INTERVAL_S
+        local_start = utc_to_local_epoch(start) + (graph_index - 1) * HISTORY_INTERVAL_S
+        slot_start = local_epoch_to_utc(local_start)
+        if slot_start is None:
+            slots.append(_missing_slot(start + (graph_index - 1) * HISTORY_INTERVAL_S,
+                                       "dst_local_hour_unverified"))
+            continue
         item = indexed.get(graph_index)
         children = item.get("value") if isinstance(item, dict) else None
         if not isinstance(children, list):
@@ -280,6 +322,37 @@ def parse_history_response(
     return slots
 
 
+def read_history_slots(connection: Any, *, time_start_utc_s: int,
+                       slot_count: int) -> list[dict[str, Any]]:
+    """Liest höchstens einen UTC-Tag in Blöcken ohne Zeitumstellung.
+
+    Die fehlende lokale Frühjahrsstunde hat keinen UTC-Slot und wird nie
+    angefragt. Beide Ausprägungen der Herbststunde bleiben ungültig.
+    """
+    start, count = int(time_start_utc_s), int(slot_count)
+    if start < 0 or start % HISTORY_INTERVAL_S or not 1 <= count <= 96:
+        raise ValueError("history_range_invalid")
+    slots = []
+    index = 0
+    while index < count:
+        first = start + index * HISTORY_INTERVAL_S
+        if not _slot_time_verified(first):
+            slots.append(_missing_slot(first, "dst_local_hour_unverified"))
+            index += 1
+            continue
+        size = 1
+        offset = utc_to_local_epoch(first) - first
+        while size < min(HISTORY_MAX_SLOT_COUNT, count - index):
+            next_start = first + size * HISTORY_INTERVAL_S
+            if not _slot_time_verified(next_start) or utc_to_local_epoch(next_start) - next_start != offset:
+                break
+            size += 1
+        response = connection.request(build_history_request(first, size))
+        slots.extend(parse_history_response(response, time_start_utc_s=first, slot_count=size))
+        index += size
+    return slots
+
+
 def read_recent_closed_slots(
     connection: Any,
     *,
@@ -294,10 +367,6 @@ def read_recent_closed_slots(
     eligible_end = ((now_s - delay_s) // HISTORY_INTERVAL_S) * HISTORY_INTERVAL_S
     count = int(slot_count)
     start = eligible_end - count * HISTORY_INTERVAL_S
-    request = build_history_request(start, count)
-    response = connection.request(request)
-    return parse_history_response(
-        response,
-        time_start_utc_s=start,
-        slot_count=count,
-    )
+    if not 1 <= count <= HISTORY_MAX_SLOT_COUNT:
+        raise ValueError("history_slot_count_invalid")
+    return read_history_slots(connection, time_start_utc_s=start, slot_count=count)

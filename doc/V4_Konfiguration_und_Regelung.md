@@ -333,22 +333,64 @@ Schranken gilt die folgende Rangfolge:
      Wallbox nur mit einem kleinen Energiekontingent stützen, um Wolkenlücken am
      Mindeststrom zu überbrücken. Das Kontingent ist `wb_curve_floor_support_wh`
      (0 oder leer = automatisch 0,5 % der Speicherkapazität `speichergroesse`,
-     mindestens 50 Wh; ein Handwert gilt absolut, nie unter 50 Wh). Ist es
-     aufgebraucht, gilt PV-only (Klasse `pv_only`), und die reguläre
-     Halte-, Phasen- und Stop-Politik übernimmt. Eine laufende Wallbox, deren
-     Zuteilung unter den Mindeststrom fällt, wird in dieser Klasse sofort auf
-     den Mindeststrom gesetzt statt am Iststrom gehalten; der Stop bleibt an
-     den Wh-Wächter gebunden. Das Kontingent beginnt erst wieder bei null, wenn
-     der Speicher 60 s lang nicht mehr unter dem Korridor lag oder keine
-     Wallbox lädt.
+     mindestens 50 Wh; ein Handwert gilt absolut, nie unter 50 Wh).
+     Diese Kontingentregel gilt nur in `PV-Kurve ruhig` unter dem Korridor.
+     Die Modi mit Akkuladen bis zur Untergrenze behalten den Pfad aus Punkt 5.
+     Unter dem Korridor steuert genau dieses Kontingent die Speicherklasse,
+     die Wallboxaktion und die Anzeige. An seinem Ende folgt im selben Zyklus
+     genau eine Entscheidung je Kontingent, unabhängig vom bisherigen Ladestrom
+     (Aktionsgrund `curve_floor_contingent_end`):
+     - Trägt das batterieneutrale PV-Budget die Mindestleistung der aktuellen
+       Phasenzahl (konfigurierter Mindeststrom, Standard 6 A, · 230 V · Phasen), lädt die Wallbox weiter aus PV;
+       ein höherer Strom wird auf das PV-Budget abgesenkt.
+     - Andernfalls folgt ein Abstieg von 3p auf 1p nur bei verfügbarem
+       Phasenausgang, freier Phasensperre und genügend PV für den Wiederanlauf samt Messreserve
+       (an der openWB Pro bei 6 A und 0,1-A-Schritten 1530 W).
+     - In allen anderen Fällen, auch bei unbekanntem, ungültigem oder
+       veraltetem PV-Budget, folgt Stop. Der Wiederanlauf folgt Punkt 4.
+     Maßgeblich ist das batterieneutrale Gruppen-PV abzüglich der realen
+     Leistung anderer Wallboxen, ohne Klemme durch die Slot-Zuteilung.
+     Bei frischem Status wird die reale Leistung jeder anderen Wallbox abgezogen.
+     Ohne frischen Status macht eine zuletzt ladende Box (mindestens 500 W
+     oder Status „charging“, letzte gültige Probe höchstens zehn Minuten alt)
+     den Rahmen unbekannt. Eine zuletzt nicht ladende, seit Dienststart nie
+     gesehene oder seit mehr als zehn Minuten ohne gültigen Status gebliebene
+     Fremdbox zählt für dieses Budget mit 0 W; die PV-only-Grenze und
+     das Netzkonto bleiben wirksam. Die eigene letzte gültige Probe darf bis
+     zu 15 s alt sein. Ein Stop bei unbekanntem Budget nennt den Statusgrund
+     im Journal.
+     Während der Brücke wird die gewählte Aktion fortgeschrieben, nicht neu
+     entschieden. Danach gelten wieder Netz- und Budgetkonto, Einschwingfrist,
+     Fast-Grid und Wh-Wächter. Ein erschöpftes Kontingent löst keine weitere
+     Absenkung, keinen weiteren Phasenwechsel und keinen weiteren Stop aus.
+     Die Speicherstützung bleibt bis zur frischen Bestätigung unter 500 W
+     erhalten; dies bestätigt auch den 0-A-Schritt eines Phasenabstiegs.
+     Spätestens 30 s nach dem Kontingent-Ende gilt dennoch die PV-only-Grenze,
+     falls die Wallbox nicht folgt. Trägt PV die aktuelle Mindestladung,
+     gilt PV-only sofort. Harte Schutzgrenzen behalten Vorrang.
+     Das Kontingent zählt nicht bei ausdrücklich erlaubter Stützung:
+     offenem wbminSoC-Tor in den Modi mit Akkuladen bis zur Untergrenze,
+     Grundladung, Netz-, Preis-, Pre-Dump-, Direktvermarktungs- oder
+     Prognosefreigabe sowie einer gebundenen Startreservierung des Speichers
+     für eine real ladende Wallbox. Diese Ausnahmen ändern nur Zählung und
+     Anzeige, nicht die bestehende Stützungsfreigabe, Klasse oder deren Grund.
+     Es beginnt nach 60 s ohne geltende Korridorregel oder ohne Ladung wieder
+     bei null. Das gilt auch nach 60 s ausdrücklich erlaubter Stützung.
 4. **Akku-Wh-Konto im laufenden Mindesthalt.** Der gemeinsame
    Defizitregler, der eine laufende Wallbox bis zum Mindeststrom reduziert und
    dort hält, führt für die marginale Wallbox in `PV-Kurve ruhig` ein drittes
    Energiekonto. Es zählt den Anteil der Speicherentladung, der tatsächlich in
    die Wallbox fließt: min(Entladung, Wallbox-Ist − PV-Rest) abzüglich 100 W
    Toleranz, mit dem Leck `wb_min_current_import_release_w` (Standard 80 W).
-   Schwelle ist dasselbe Kontingent wie unter Punkt 3; die Korridorlage spielt
-   für dieses Konto keine Rolle. Es gilt nur ohne Netz-, Preis-, Pre-Dump-,
+   Schwelle ist dasselbe Kontingent wie unter Punkt 3. In und über dem
+   Korridor bleibt dieses Konto unverändert. Unter dem Korridor gilt allein
+   der Kontingentstand aus Punkt 3, ohne zweite Zählung mit Toleranz und Leck;
+   nur seine einmalige Aktionswahl am Ende ersetzt dort die Stufenfolge
+   Strom, Phase, Stop. Mit der Endentscheidung beginnt das Akkukonto wieder
+   bei null. Nach Ende der Brücke zählt es wieder mit 100 W Toleranz und
+   80 W Leck als zeitlicher Rückhalt gegen weitere Akkuentladung.
+   Netz- und Budgetkonto bleiben wirksam; die Endentscheidung bleibt einmalig.
+   Es gilt nur ohne Netz-, Preis-, Pre-Dump-,
    Direktvermarktungs- oder Prognose-Akkufreigabe und ohne Startreservierung
    der Speicherseite; in `Grundladung stabil` und den Modi mit Akkuladen bis
    zur Untergrenze ist die Stützung ausdrücklich gewollt und wird nicht
@@ -369,8 +411,39 @@ Schranken gilt die folgende Rangfolge:
    herunter und stoppt zuletzt (Aktionsgrund `battery_support_threshold`,
    Journal „Akku-Wh-Zähler x/y Wh … → Stop“). Der Phasenabstieg läuft als
    vollständige Sequenz (0 A, Phasenziel, Wiederanlauf auf der Zielphase).
-   Endet die Defizitepisode, bevor er angelaufen ist (Einspeisung bei ladendem
-   oder ruhendem Speicher, stabil 30 s), verfällt er, das Konto beginnt neu,
+   Ein Abstieg reserviert nur die Wiederanlaufleistung der Zielphase samt
+   Reserve; beim Aufstieg bleibt auch die bisherige Last reserviert.
+   Beginnt ein angeforderter Kaskadenabstieg binnen 30 s keinen Ausgang,
+   folgt nur bei fortbestehendem Defizit ein Stop: Netzbezug über der
+   Toleranz oder eine gezählte Akku-Komponente mit erreichter Akkuschwelle.
+   Ein PV-Rahmen unter dem
+   aktuellen Minimum zählt dafür nur ohne erlaubte Akkustützung: nach dem
+   Kontingent unter dem Korridor in `PV-Kurve ruhig` oder bei geschlossenem
+   wbminSoC-Tor. Bei erlaubter Stützung ist Netzbezug innerhalb der Toleranz
+   kein Stopgrund. Eine reine Budgetüberziehung ohne diesen Stopgrund lässt
+   den unbegonnenen Abstieg nach 30 s verfallen. Die Reservierung wird frei,
+   das Konto beginnt bei null; erst nach erneutem Kontodurchlauf kann derselbe
+   Abstieg wieder angefordert werden. Nach einem Kaskadenabstieg auf eine
+   Phase startet die openWB Pro mit dem konfigurierten Mindeststrom der
+   jeweiligen Wallbox. Derselbe Strom liegt der gebundenen
+   Wiederanlaufreservierung zugrunde. Werte unter dem Geräteminimum werden auf
+   das Geräteminimum angehoben, Werte über der Gerätehöchstgrenze begrenzt.
+   Aktuelle Stromgrenzen, Budget, Hausanschluss und Reservierung müssen diesen
+   Strom vollständig tragen; andernfalls wartet der Wiederanlauf und startet
+   nicht mit einem niedrigeren Ersatzwert. Fehlt der Konfigurationswert oder
+   ist er ungültig, gilt der bisherige Rückfall auf 6 A. Der Status der
+   Phasenreservierung nennt den Wiederanlaufstrom (`restart_amp`), seine
+   Quelle (`restart_amp_source`: `configured_min`, `device_min` oder
+   `fallback_6a`) und den Grund (`restart_amp_reason`). Nach bestätigtem
+   Wiederanlauf folgt die normale Stromrampe. Startfenster und Re-Emit, Stop-
+   und Aus-Vetos sowie das Schnellstart-Angebot nach dem Abstecken behalten
+   ihre bestehenden Regeln.
+   Für eine
+   begonnene Sequenz gilt weiterhin die Bestätigungsfrist von standardmäßig
+   240 s (`wb_phase_confirm_timeout_s`).
+   Ist das Ende der Defizitepisode bestätigt (Einspeisung bei ladendem oder
+   ruhendem Speicher, stabil 30 s), auch nach Ablauf der Ausgangsfrist,
+   verfällt der noch nicht angelaufene Auftrag, das Konto beginnt neu,
    und eine schon zugesagte Phasenreservierung wird ohne Ausgang freigegeben.
    Schaltet der Nutzer vor dem Phasenziel auf `Aus`, endet die Sequenz
    ebenso ohne weiteren Ausgang; nach der Rückkehr gilt keine alte
@@ -391,7 +464,10 @@ Schranken gilt die folgende Rangfolge:
    ungültige Live-Daten setzen die Zeit zurück, eine einzelne Wolkenlücke
    startet nicht. Netz-/Preisfenster, Nutzer-`Aus` oder ein ausdrücklicher
    Start heben die Wartezeit auf. Der erste Start nach dem Anstecken bleibt
-   unverändert.
+   unverändert. Solange dieses Wiederanlauftor bewaffnet und blockiert ist,
+   legt die Policy für eine stehende Wallbox keine neue Phasenreservierung an.
+   Erst nach Freigabe beginnt eine erforderliche Phasenvorbereitung; deren
+   Sequenz und Wiedereinschaltverzögerung kommen zur Wartezeit hinzu.
 5. **`wbminsoc`.** `wbminsoc` begrenzt ausschließlich die Akkustützung, nie das
    PV-Laden. Liegt der SoC morgens unter `wbminsoc` und es wird eingespeist,
    lädt die Wallbox aus PV-Überschuss; im Korridor wird geladen wie unter
@@ -406,7 +482,7 @@ Schranken gilt die folgende Rangfolge:
    Ist es offen, stützt der Speicher die Wallbox unabhängig von der
    Korridorlage (Grund `wbminsoc_floor_open`); der Speicher lädt dabei weiter
    nach der Ladekurve. Unterhalb von `wbminsoc` verhalten sich diese Modi wie
-   `PV-Kurve ruhig`.
+   `PV-Kurve ruhig`, jedoch ohne das Wolken-Kontingent aus Punkt 3.
    **Haltezone.** Zwischen `wbminsoc` und `wbminsoc` plus dem
    Neustart-Abstand (der größere Wert aus `wb_soc_hysterese_pct` und
    `wb_target_restart_above_wbminsoc_pct`, Standard 2 Prozentpunkte) hält
@@ -478,7 +554,8 @@ Schranken gilt die folgende Rangfolge:
    gesetzt, bevor das Konto durchläuft. Besteht Netzbezug, baut die Kaskade
    zuerst diesen ab. Läuft an einer anderen Wallbox gerade ein Phasenwechsel
    oder Stop der Kaskade, wartet die Absenkung dessen Ende ab (höchstens
-   `wb_phase_confirm_timeout_s`, Standard 240 s).
+   `wb_phase_confirm_timeout_s`, Standard 240 s für eine begonnene Sequenz;
+   ohne begonnenen Ausgang bei fortbestehendem Defizit höchstens 30 s).
    Die Absenkung geschieht sofort, wenn für diese Wallbox kein PV anliegt
    (nachts oder eigene Zuteilung 0 W) oder das Gruppen-PV-Budget unbekannt
    ist. Liegt noch Gruppen-PV an (Dämmerung, Wolke) – auch wenn die eigene
@@ -530,7 +607,11 @@ Schranken gilt die folgende Rangfolge:
    Pre-Dump, Preisfenster und `Sofort bis Preislimit` behalten ihre Regeln.
 8. **Anzeige.** Das Dashboard zeigt im Wallbox-Slot das Kontingent als
    „Akku x/y Wh“ (Stützung an der Korridor-Untergrenze) beziehungsweise
-   „PV-only x/y Wh“ (Kontingent aufgebraucht, Wallbox nur aus PV-Überschuss);
+   „PV-only x/y Wh“ (Kontingent aufgebraucht, Wallbox nur aus PV-Überschuss).
+   Die Kachel erscheint nur, solange die Korridorregel tatsächlich gilt und
+   geladen wird; bei ausdrücklich erlaubter Stützung bleibt sie verborgen.
+   Während der höchstens 30 s langen Stützung bis zur Wirkung bleibt die
+   Akku-Klasse sichtbar, auch wenn das Kontingent bereits verbraucht ist;
    der Zustand des Defizitreglers steht in `wb_deficit_counter` und je Wallbox
    in `group_deficit_battery_support` der Entscheidungsdatei.
 
@@ -569,12 +650,26 @@ Schranken gilt die folgende Rangfolge:
   übrigen Schutzgrenzen eingehalten sind. Daraus folgt weder eine pauschale
   PV-Ladesperre noch ein abgesenktes Speicher-Kurvenziel.
 - Wärmepumpe und Wallbox: Die Priorität berücksichtigt die tatsächliche
-  Aufnahme, die Startreserve und den geschützten Verdichterbetrieb. Nicht
-  angenommene freigegebene Leistung kann die Wallbox erhalten.
+  Aufnahme und den geschützten Verdichterbetrieb. Eine Startreserve gilt nur
+  im reservierten Betrieb; der messwertgeführte PV-Boost reserviert nichts.
+  Nicht angenommene freigegebene Leistung kann die Wallbox erhalten.
   Mindestlaufzeiten werden nur durch benannte Schutzfälle verkürzt; ein
   gewöhnlicher Budget- oder Prioritätswechsel genügt nicht. Es gelten die
   gerätespezifischen elektrischen Leistungsprofile, keine erfundenen
   Solltemperaturen.
+- Bei Vorrang der Wärmepumpe zählt für den Defizittimer eines bereits
+  ausgespielten PV-Boosts auch die aktuell gemessene Leistung nachrangiger
+  Wallboxen. Die Bewertung rechnet diese Last einmal aus der gemessenen Netz-
+  und Akkubilanz heraus: zuerst wird der Netzbezug entlastet, anschließend
+  jede gemessene Akkuentladung bis zur verbleibenden gemessenen
+  Wallboxleistung. Ein Defizit liegt erst vor, wenn ohne diese Wallboxlast
+  noch Netzbezug oder Akkuentladung über dem bestehenden Toleranzband bliebe.
+  Starts behalten ihre bisherige Qualifikation. Nimmt die Wärmepumpe Strom
+  auf, verteilt der bestehende Verbraucherregler die Leistung neu und
+  begrenzt die nachrangige Wallbox; die Defizitbewertung sendet keinen
+  zusätzlichen Wallbox-Befehl. Bestehende Quellen-, Kontingent- und
+  Schutzgrenzen gelten weiter. Bei Vorrang der Wallbox bleibt die bisherige
+  Bewertung bestehen.
 - `Sofort bis Preislimit`: Das Netzpreislimit (`wallbox_price_limit_ct`,
   Rückfall `dvcarlimit`) gilt nur für diesen Modus. Die normale Ladeplanung wird
   nicht durch das globale Preislimit blockiert.
@@ -618,6 +713,16 @@ Aktueller Stand:
   Aufholbedarf,
 - abends wird nicht mehr zwanghaft auf die Kurve entladen, weil das Haus den
   Speicher ohnehin natürlich nutzt.
+
+Jede Verbraucherleistung zählt in Budget und Bilanz genau einmal. Eine
+E3DC-Wallbox wird vom E3DC getrennt vom Hausverbrauch gemessen; externe
+Wallboxen stecken im Hausverbrauch. In einer gemischten Messung wird deshalb
+nur der externe Anteil aus dem Hauswert entfernt. Die Wärmepumpe mit
+E3DC-Leistungsmesser (WP-Typ 6) ist in der aufbereiteten Hausleistung bereits
+herausgerechnet und wird am allgemeinen Leistungsdeckel nicht nochmals
+abgezogen. Fehlende Einzelmessungen eingebetteter Lasten erzeugen keinen
+zusätzlichen Verbrauchsabzug. Die kurze Entprellung eines frisch gemessenen
+Leistungsabfalls bleibt erhalten.
 
 Wenn E3DC-Control diese Ladekurve führt, sollte das wetterbasierte Laden im
 E3/DC-Hauskraftwerk deaktiviert sein. Die E3/DC-Funktion ist ein eigener
@@ -701,6 +806,23 @@ Wichtige Schutzlogik:
   20 A. Anhebung +1 A je Regelschritt, Absenkung sofort. Details:
   `doc/Native_Wallbox.md`, Abschnitt „Einphasiger Stromdeckel aus
   Netzphasenmessung“.
+- openWB Pro, schneller Ladestart: Nach bestätigtem Abstecken stellt die
+  Einstellung „Nach dem Abstecken: Schneller Start (6 A)“ einmalig das konfigurierte Angebot von
+  6 A her. Das gilt unabhängig vom PV-Budget, denn eine leere Box zieht
+  keine Ladeleistung. Ein bereits passendes Angebot löst keinen Befehl aus;
+  fehlt die Bestätigung, bleiben die begrenzten Readback-Wiederholungen aktiv.
+  Nutzer-`Aus`, Notstromreserve, Hausanschluss- und Hardwareschutz gelten
+  weiterhin. Nach dem Anstecken übernimmt die Regelung eine bereits laufende
+  Ladung; Akku-Wh-Kontingent und Defizitkaskade begrenzen sie wie üblich.
+  Das kann ohne ausreichendes Budget kurze Ladefenster und zusätzliche
+  Schützschaltungen verursachen und ist eine bewusste Komfortwahl.
+  Die Alternative „Sicherheitsvariante (0 A)“ lässt die Box ohne positives Angebot stehen:
+  Laden beginnt erst bei ausreichendem Budget. Nach einem Managerneustart
+  bleiben bis zum ersten gültigen Budget Starts und Anhebungen gesperrt.
+  Typisierte Absenkungen, Stops, Schutz-Null und Not-Aus bleiben erlaubt.
+  Allein das oben beschriebene Angebot an die frisch bestätigte leere Box
+  ist von der reinen Budgetsperre ausgenommen. Erzwungener Stop, Pre-Dump-Halt,
+  Laufzeitsperre und Budget-Timeout sperren auch dieses Angebot.
 - openWB Pro Startfenster: Nach dem Anstecken bietet der
   Manager 6 A an, übernimmt ein stehendes Angebot der Box und hält das
   Angebot `openwb_pro_start_hold_s` (Standard 180 s) ohne 0 A und ohne
@@ -784,6 +906,145 @@ Wichtige Schutzlogik:
 
 ## Wärmepumpen
 
+Im Luxtronik-Messwertbetrieb (`wp_pv_control_mode=measured`) bietet der
+Energy Manager den PV-Boost bei qualifiziertem Überschuss an. Die Startkante
+benötigt die WP-Startleistung plus das bestehende 500-W-Schaltband. Bei Vorrang
+„WP vor Wallbox“ zählt auch der Überschuss, den die Wallbox gerade verbraucht;
+ihr Haltebudget erzeugt kein künstliches PV-Defizit. Ein aktiver Wallbox-Start-Halt
+sperrt trotzdem neue WP-Starts. Beginnt er erst nach dem Versand, bleibt der
+gemessene WP-Verbrauch im Budget sichtbar.
+
+Der PV-Boost reserviert keine Leistung und keine Energie, auch nicht beim
+Versand. Die Voraussetzung ist die frische E3DC-Bilanz: Einspeisung abzüglich
+des noch nicht erfüllten Kurvenladebedarfs. Bereits gemessene Akkuladung und
+Verbraucher werden nicht nochmals abgezogen. Die geplante Akkuladung behält
+Vorrang. Beim Halten eines gesendeten Boosts, auch vor dem Verdichterstart, darf der momentane
+Kurvenbedarf zurückstehen, wenn P10 (ersatzweise 70 % von P50 oder 70 % der
+frischen Punktprognose) bis zum heutigen Ladeende nach Haus und Wallbox den
+restlichen Akkubedarf am wirksamen Kurvenziel und die Wärme deckt. Haus und
+Wallbox gehen mit P50 oder ihrer gültigen Punktprognose ohne Abschlag ein, der
+Wärmebedarf wird nicht zusätzlich von der PV-Deckung abgezogen. Je Abschnitt
+zählt höchstens die Leistung, die Akku (laut bestehender Ladegrenze) und
+Wärmepumpe zusammen aufnehmen können. Eine noch nicht erneuerte Plandatei gilt
+dafür bis höchstens fünf Minuten nach ihrem Slotende; die maximale Planalterung
+von 30 Minuten bleibt. Für diese Halteprüfung zählt die gemessene
+Akkuladung genau einmal zum verfügbaren PV-Rahmen; eine Entladung bleibt
+über die bestehende 200-W-Bandprüfung ausgeschlossen.
+Ohne temperaturgebundene Restlaufschätzung gilt für den Boost eine volle
+Mindestlaufzeit mit mindestens der konfigurierten Start-/Maximalleistung;
+eine höhere Wärmeprognose ersetzt diesen Ansatz, sie wird nicht addiert.
+Zusätzlich bleiben 10 % des Gesamtbedarfs, mindestens 0,5 kWh, sowie die
+WP-Energie für die Wolkenüberbrückung (höchstens 300 s) als Reserve.
+Ein einzelner deckender Messpunkt setzt die Defizitfrist nicht zurück;
+dazu sind mindestens 60 s durchgehende Deckung nötig.
+Fehlende, veraltete oder unplausible Prognosen lassen den Kurvenvorrang bestehen.
+Echter Netzbezug oder Akkuentladung für die WP bleibt ein Rücknahmegrund nach
+der Wolkenüberbrückung. Mindestlaufzeit und Schutzzeiten bleiben vorrangig.
+Die Ausnahme gibt keinen neuen Start frei und ändert keinen Speicher-Ausgang.
+Der Haltegrund `measured_pv_offer_held_forecast_covers_curve` und
+`curve_forecast` zeigen Entscheidung und Rechengrößen.
+Der Storage Manager zählt die gemessene WP-Aufnahme genau einmal;
+ohne Aufnahme bleibt das Budget für andere Verbraucher verfügbar.
+`wp_pv_start_wait_s` bleibt im Messwertbetrieb eine Diagnosefrist und beendet
+weder das Sollwertangebot noch eine Reservierung. Fehlende oder veraltete
+Messwerte behandelt der folgende Abschnitt.
+
+Der gesendete Sollwert bleibt bei ausreichendem Überschuss stehen, auch wenn
+der Verdichter nicht startet oder die Zieltemperatur erreicht wird. Die Anlage
+entscheidet ihren Verdichterstart selbst. Ein bereits erreichtes Boost-Ziel
+öffnet keinen neuen Auftrag. Erst anhaltendes PV-Defizit über
+`wp_pv_boost_release_s`, Schutz, Nutzer-Aus, ein Besitzerwechsel oder das Ende
+der bestehenden Freigabe beendet den Boost. Mindestlaufzeit und
+Wiedereinschaltsperre bleiben wirksam. Der normale WW-Timer ist die
+Rückkehrstellung, kein konkurrierender Boost-Besitzer.
+
+Bei `ww_circ_boost=1` übersteuert der Boost den normalen Zirkulationszeitplan
+nur während frisch bestätigter Warmwasserbereitung mit laufendem Verdichter.
+Die Einschaltung wartet 10 Sekunden auf einen stabilen Nachweis. Bei frisch
+bestätigtem Ende gilt sofort wieder der normale Zeitplan. Fehlt lediglich eine
+frische Rücklesung, bleibt die bereits eingeschaltete Boost-Zirkulation noch
+höchstens 30 Sekunden bestehen. Wiederholte Leselücken verlängern diese Frist
+nicht. Ein gehaltener Boost-Sollwert allein startet keine Zirkulation.
+
+### Fehlende Leistungsmessung der Wärmepumpe
+
+Im Messwertbetrieb steckt die tatsächliche WP-Leistung bei fehlender separater
+WP-Messung bereits im gemessenen Hausverbrauch und in der E3DC-Bilanz. Es geht
+nur die Aufteilung zwischen Haus und Wärmepumpe verloren. Ein alter WP-Wert
+oder ein geschätzter Anteil aus dem Hausverbrauch wird nicht zusätzlich vom
+Verbraucherbudget abgezogen.
+
+Die Wallbox erhält den Rahmen aus der gemessenen Bilanz. Startfenster,
+Hysteresen, Rampen sowie Netz- und Akkuwächter gelten weiterhin. Es gibt keine
+Startreservierung für den PV-Boost. Der Storage Manager verteilt Leistung,
+der Wallbox Manager entscheidet über Strom, Phasen und Stop.
+
+Ohne gültige WP-Leistungsmessung wird kein neuer Boost gestartet. Ein bereits
+gesendeter Boost kann bei frischen, gültigen Netz- und Akkuwerten bestehen
+bleiben. Anhaltender Netzbezug oder Akkuentladung oberhalb des bestehenden
+200-W-Defizitbands lässt den Defizittimer weiterlaufen. Nach
+`wp_pv_boost_release_s` wird die Rücknahme angefordert; die bestehenden
+Signalhalte- und Mindestlaufzeitregeln bestimmen weiterhin ihre Ausführung.
+Fehlen auch gültige Bilanzdaten, bleibt die bestehende Schutzlogik wirksam.
+
+Dieselbe Prioritätsregel gilt bei fehlender WP-Einzelmessung, solange Netz-
+und Akkubilanz sowie die zurückgerechnete Wallboxleistung frisch und gültig
+sind. Ein Sollstrom, Startangebot oder Altwert ersetzt keine gemessene
+Wallboxleistung. Ist die Wärmepumpe bereits im Hausverbrauch enthalten, wird
+für ihre Messlücke keine zusätzliche alte Verbraucherleistung vom Restbudget
+abgezogen. Liegt ihre Messung außerhalb des Hausverbrauchs, bleibt die
+erforderliche Rückhaltereserve erhalten.
+
+Der letzte gültige WP-Leistungswert wird mit Quelle und ursprünglichem Alter
+höchstens 300 Sekunden beziehungsweise bis zur kürzeren Defizitfrist angezeigt.
+Er beeinflusst die Budgetverteilung nicht. Ein aus Hausverbrauch, bekanntem
+Wallboxanteil und konfigurierter Grundlast gebildeter Näherungswert dient
+ebenfalls ausschließlich der Diagnose. Unbekannte Messwerte bleiben `null`
+mit Begründung. Reservierter Betrieb und Schutzpfade bleiben unverändert.
+
+Der Luxtronik-Warmwasser-Timer wirkt wie ein eingebauter WP-Timer:
+Bei aktiviertem Timer gilt im Zeitfenster `ww_normal`, außerhalb `ww_eco`.
+Bei ausgeschaltetem Timer gilt ganztägig `ww_eco` als Voreinstellung.
+Dieser Grund-Sollwert bleibt auch bei niedrigem SoC, Notstromreserve,
+Nutzer-`Aus` und wirtschaftlichen Sperren erhalten. Geschrieben wird nur bei
+Änderung oder abweichender gültiger Rücklesung.
+
+Auch während einer E3DC-Datenlücke folgt der Warmwasser-Grundwert dem
+Timerfenster. Voraussetzung ist eine frische, gültige Rücklesung der
+Wärmepumpe; ohne sie wird nichts geschrieben, und die Diagnose meldet
+`ww_baseline_suppressed_reason=e3dc_live_gap`. Eine in der Lücke geschriebene
+Grundstellung zeigt `ww_baseline_written_in_gap=true`. Ferien- und
+Frostschutzmodus, Uhrprüfung, Takt- und Schreibschutz sowie Hardware- und
+Wärmequellenschutz bleiben wirksam; kommt ein Wert nicht an, gelten die
+normalen Wiederholungsabstände, Versuchsgrenzen und Alarme.
+
+Ein PV-Boost setzt seinen höheren Sollwert darüber, solange seine
+Voraussetzungen erfüllt sind. Entfällt eine Voraussetzung, auch bei
+Nutzer-`Aus` oder erreichter Notstromreserve, wird ein in diesem Boost
+nachweislich laufender Verdichter bis `wp_min_runtime_min` gehalten.
+Danach gilt sofort der Grund-Sollwert der aktuellen Uhrzeit. Läuft der
+Verdichter nicht, fehlt ein gültiger Laufbeleg oder ist die Mindestlaufzeit
+bereits erfüllt, erfolgt die Rücknahme sofort. EVU-/Fremdsperren sind kein
+Haltegrund. Hardware- und Hausanschlussschutz behalten Vorrang.
+Die Wiedereinschaltsperre und die Regelung des Heizkanals bleiben bestehen.
+
+Der an der Wärmepumpe gewählte Ferien-, Urlaubs- oder Frostschutzmodus hat
+Vorrang. E3DC-Control startet darin keine neuen Boosts und schreibt keine
+Timer- oder Eco-Grundstellung auf Kanäle ohne eigene Wirkung. Ein bereits
+eigener Warmwasser-Boost wird auf den letzten gültig gelesenen Sollwert vor
+dem Boostversand zurückgenommen. Dieser Wert wird mit dem Startauftrag
+gesichert und bleibt auch nach einem Neustart des Energy Managers erhalten.
+Ist er unbekannt, wird der gültige Wert `ww_eco` verwendet; fehlt auch dieser,
+erfolgt keine Schreibung, und die Diagnose meldet das fehlende Rückkehrziel.
+Läuft der Verdichter noch innerhalb von `wp_min_runtime_min`, bleibt der
+eigene Boost bis zum Fristende bestehen; fehlende Statusdaten und harte
+Schutzbedingungen erlauben keine Verlängerung. Entspricht eine frische
+Rücklesung bereits dem Rückkehrziel, entfällt der Schreibbefehl. Nach dem
+Verlassen des Modus gilt wieder die Warmwasser-Grundstellung. Die Diagnose
+`heatpump_channel_dispatch` nennt `ww_baseline_suppressed_reason=wp_holiday_mode`
+sowie `ww_boost_return_target_c` und `ww_boost_return_source`
+(`pre_boost_readback`, `ww_eco_fallback` oder `none`).
+
 Luxtronik, IDM, Stiebel/ISG, SG-Ready und Heizstab arbeiten nicht als
 Nebenregler am Speicher vorbei. Sie erhalten Budget, Freigabe und
 Mindestlaufzeiten aus dem Energy Manager beziehungsweise dem Storage Manager.
@@ -794,14 +1055,18 @@ Zustandswechseln und nimmt nur den selbst gesetzten Eingang zurück; Einzelheite
 stehen in `doc/Stiebel_Eltron_ISG.md`.
 
 Fehlende E3DC-Livedaten sind keine Freigabe: Während einer Datenlücke startet
-kein neuer Wärmepumpenauftrag, und kein Sollwert wird angehoben. Ein bereits
+kein neuer Wärmepumpenauftrag, und kein Boost-Sollwert wird angehoben. Die feste
+Warmwasser-Grundstellung folgt weiter dem Timerfenster (siehe oben). Ein bereits
 laufender Luxtronik-Auftrag und ein laufender manueller Boost jeder anderen
 Wärmepumpe (iDM, Dimplex, SG-Ready) werden erst nach einer begrenzten Frist
 zurückgenommen, damit ein einzelner Aussetzer keinen Verdichter abbricht und
 keine Wiedereinschaltsperre auslöst: Nutzeraufträge und der
-Warmwasser-Timer nach fünf Minuten, automatische Aufträge aus freigegebenem
+budgetgebundene Timer-Aufträge anderer Wärmepumpen nach fünf Minuten,
+automatische Aufträge aus freigegebenem
 Budget nach 45 Sekunden. Der Nutzerauftrag selbst bleibt dabei bestehen.
-Nutzer-Aus, Hardware- und Quellenschutz wirken sofort. Die unabhängige
+Für den Luxtronik-WW-Grundwert und die Rücknahme seines PV-Boosts gelten die
+oben beschriebenen Timer- und Mindestlaufzeitregeln. Für die übrigen
+Aufträge wirken Nutzer-Aus, Hardware- und Quellenschutz sofort. Die unabhängige
 Sicherheitsabschaltung (Ladestand unter `min_soc` minus 5 Prozentpunkte oder
 mehr als 2.500 W Netzbezug) nimmt auch einen laufenden manuellen Boost jeder
 Wärmepumpe sofort zurück; der Auftrag bleibt bestehen. Dasselbe gilt bei iDM,
@@ -846,6 +1111,44 @@ geführt und aus dem Hausverbrauch bereinigt, wenn der Zähler sie dort bereits
 enthält. Ob das der Fall ist, steuert `storage_home_wp_split` (siehe
 Wallbox-Regelung, Schutzlogik).
 
+### Tariffenster und Negativpreis-Netzboost
+
+Tariffenster-Heizen ist eine eigene, standardmäßig ausgeschaltete Luxtronik-
+Funktion. Im Schattenbetrieb entsteht nur Diagnose. Aktiv darf sie bei belegtem
+Wärmerestbedarf und frischer Speicherfreigabe günstige Octopus-Heat-Zeiten nutzen.
+Fehlt `heat_tariff_shift_windows`, gelten 02:00–06:00 und 12:00–16:00 als
+Laufzeitstandard. Ausdrücklich leere oder ungültige Fenster sperren. Frühere
+Negativpreisfenster werden nicht übernommen. Die normalen Komforttimer bleiben
+Grundstellung; hohe Preise sperren sie nicht.
+
+Das Wärmeziel `heat_price_boost_scope` gilt für Tarif- und Negativpreis-Boost:
+nur WW, nur Heizung oder beides. Ungültige Werte sperren beide Pfade.
+Im Tariffenster gilt WW-Vorrang. `price_min_duration` ist die Mindest-Angebotszeit
+für neue Starts im verbleibenden Fenster. Ein laufender Boost endet dadurch
+nicht vorzeitig. `price_max_daily` begrenzt weiterhin die Tages-Auftragszeit.
+
+Der Negativpreis-Netzboost arbeitet ausschließlich mit aktueller expliziter
+Negativpreisfreigabe. Er hat keine konfigurierbaren Zeitfenster und ignoriert
+`heat_price_boost_windows`, erhält aber dessen gespeicherten Wert. Im Sommer
+bietet er nur WW an, sofern das Wärmeziel WW erlaubt. Im Winter bietet er
+WW und/oder Heizung im Rahmen des Wärmeziels an. Mindest-Angebotszeit und Tarif-
+Tagesmaximum wirken hier nicht und bleiben beim Tarifwechsel gespeichert.
+
+Für beide Funktionen startet HZ nur unter der mittleren Außentemperaturgrenze
+`heat_grid_boost_max_outdoor_c` (Standard 10 °C, leer ohne Grenze). Ein laufendes
+HZ-Angebot bleibt bis 1 K darüber freigegeben, um Flattern zu verhindern. Die
+bestehende Heizgrenze bleibt zusätzlich wirksam. Fehlende oder ungültige
+Mitteltemperatur sperrt HZ; Warmwasser bleibt ausgenommen. Der Installer fügt
+weder diese Grenze noch die Fenster in bestehende Konfigurationen ein.
+
+Der Akku-Halt nutzt ausschließlich frisch gemessene WP-Leistung im vorhandenen
+AUTO-Vertrag. Die übrige Hauslast darf der Akku weiter versorgen, auch wenn die
+WP 0 W misst. Verbraucher werden in Bilanz und Budget genau einmal gezählt.
+Nutzer-Aus, Notstromreserve, Quellen- und Hausanschlussgrenzen bleiben vorrangig.
+Der lesende Tagesexport `heat_tariff_diagnostics.php` liefert ausschließlich
+freigegebene Diagnosefelder. Details stehen in [Luxtronik](Luxtronik.md).
+
+
 ## Preislogik
 
 Der netzdienliche Eco-Modus und der Negativpreis-/Preis-Boost sind Opt-in-Pfade.
@@ -863,3 +1166,6 @@ data/e3dc_v4.json
 
 Nur Migrations-, Rollback- und Legacy-Abschnitte sollen `e3dc.config.txt` als
 aktive Datei nennen.
+
+Die Außentemperaturgrenze betrifft ausschließlich HZ-Boost-Angebote.
+PV-, Preis- und Hochpreis-Pausen mit abgesenktem Sollwert bleiben davon unberührt.

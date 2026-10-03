@@ -125,6 +125,11 @@ RUN find -P /app/pi/Install -xdev -type d -exec chmod 0755 -- {} + && \
     test -f /app/pi/Install/Installer/direct_marketing_actions.py && \
     test -f /app/pi/Install/Installer/docker_healthcheck.py && \
     test -f /app/pi/Install/Installer/ha_writer_admission.py && \
+    test -f /app/pi/Install/Installer/Heat/tariff_shift.py && \
+    test -f /app/pi/Install/Installer/Heat/tariff_runtime.py && \
+    test -f /app/pi/Install/Installer/Heat/tariff_storage.py && \
+    test -f /app/pi/Install/Installer/Heat/plan_forecast.py && \
+    test -f /app/pi/Install/html/heat_tariff_diagnostics.php && \
     test -f /app/pi/Install/Installer/battery_vitals_history.py && \
     test -f /app/pi/Install/Installer/probe_pm.py && \
     test -f /app/pi/Install/Installer/secure_file_transaction.py && \

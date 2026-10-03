@@ -2512,7 +2512,7 @@ function loadPvForecastDiagnosticEvidence($currentTopologyRevision, $diagnostics
         'decision_use_allowed' => false,
     ];
     $observationQuality = [
-        'observation_source_contract' => 'e3dc_db_history_day_15m_v1',
+        'observation_source_contract' => 'e3dc_db_history_day_15m_v2',
         'curtailment_exclusion_status' => 'EVIDENCE_LIMIT',
         'inverter_clipping_exclusion_status' => 'EVIDENCE_LIMIT',
         'external_shutdown_exclusion_status' => 'EVIDENCE_LIMIT',
@@ -2524,7 +2524,7 @@ function loadPvForecastDiagnosticEvidence($currentTopologyRevision, $diagnostics
             'signal' => 'pv_e3dc_dc',
             'status' => 'sammelt_evidenz',
             'forecast_source_contract' => 'resource_forecast_ensemble_v1',
-            'observation_source_contract' => 'e3dc_db_history_day_15m_v1',
+            'observation_source_contract' => 'e3dc_db_history_day_15m_v2',
             'reason' => 'noch_keine_vergleichspaare',
         ],
         [
@@ -2789,7 +2789,7 @@ function loadPvForecastDiagnosticEvidence($currentTopologyRevision, $diagnostics
             || ($payload['probabilistic_evidence']['status'] ?? '') !== 'EVIDENCE_LIMIT'
             || ($payload['probabilistic_evidence']['decision_use_allowed'] ?? null) !== false
             || !is_array($payload['observation_quality'] ?? null)
-            || ($payload['observation_quality']['observation_source_contract'] ?? '') !== 'e3dc_db_history_day_15m_v1'
+            || ($payload['observation_quality']['observation_source_contract'] ?? '') !== 'e3dc_db_history_day_15m_v2'
             || ($payload['observation_quality']['curtailment_exclusion_status'] ?? '') !== $observationQuality['curtailment_exclusion_status']
             || ($payload['observation_quality']['inverter_clipping_exclusion_status'] ?? '') !== $observationQuality['inverter_clipping_exclusion_status']
             || ($payload['observation_quality']['external_shutdown_exclusion_status'] ?? '') !== $observationQuality['external_shutdown_exclusion_status']
@@ -3023,6 +3023,9 @@ function loadPvForecastDiagnosticEvidence($currentTopologyRevision, $diagnostics
             'probabilistic_evidence' => $probabilisticEvidence,
             'observation_quality' => $observationQuality,
             'source_diagnostics' => $sourceDiagnostics,
+            'history_time_plausibility' => forecastHistoryTimePlausibilityProjection($payload['history_time_plausibility'] ?? null),
+            'history_time_plausibility_legacy' => forecastHistoryTimePlausibilityProjection($payload['history_time_plausibility_legacy'] ?? null),
+            'history_backfill' => forecastHistoryBackfillProjection($payload['history_backfill'] ?? null),
             'diagnostic_details' => $projectedDetails,
             'quality_progress' => forecastQualityProgressProjection($payload['quality_progress'] ?? null,
                 $expectedRevision, $expectedMethodRevision, null,
@@ -3085,6 +3088,31 @@ function forecastQualityProgressProjection($raw, $topology, $method, $now = null
         'topology_revision' => $topology, 'method_revision' => $method,
         'observation_binding_revision' => $raw['observation_binding_revision'],
         'source_quality' => $details['source_quality']];
+}
+
+function forecastHistoryBackfillProjection($raw) {
+    if (!is_array($raw) || ($raw['schema_version'] ?? '') !== 'pv_history_backfill_v1'
+        || ($raw['decision_use_allowed'] ?? null) !== false) return null;
+    $keys = ['completed_days', 'pending_days', 'unavailable_days'];
+    foreach ($keys as $key) {
+        if (!is_int($raw[$key] ?? null) || $raw[$key] < 0) return null;
+    }
+    return array_intersect_key($raw, array_flip(array_merge(['schema_version', 'decision_use_allowed'], $keys)));
+}
+
+function forecastHistoryTimePlausibilityProjection($raw) {
+    if (!is_array($raw) || ($raw['schema_version'] ?? '') !== 'pv_history_time_plausibility_v1'
+        || ($raw['decision_use_allowed'] ?? null) !== false
+        || !in_array($raw['status'] ?? '', ['ok', 'warning', 'unavailable'], true)
+        || !in_array($raw['reason'] ?? '', ['ok', 'repeated_yield_below_horizon',
+            'location_missing_or_invalid', 'topology_revision_invalid', 'history_unavailable',
+            'history_missing_or_invalid'], true)) return null;
+    $result = array_intersect_key($raw, array_flip(['schema_version', 'status', 'reason', 'decision_use_allowed']));
+    foreach (['checked_slots', 'suspicious_slots', 'suspicious_days', 'max_suspicious_slots_per_day'] as $key) {
+        $value = $raw[$key] ?? null;
+        $result[$key] = is_int($value) && $value >= 0 ? $value : null;
+    }
+    return $result;
 }
 
 function forecastDiagnosticDetailsProjection($raw) {

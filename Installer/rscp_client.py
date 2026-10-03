@@ -1531,6 +1531,8 @@ def fetch_battery_vitals(host: str, port: int, portal_user: str,
                 find_tag(bd, RscpTag.BAT_ASOC),
                 'BAT_ASOC',
             )
+            if asoc is not None and (not math.isfinite(asoc) or not 0 < asoc <= 110):
+                asoc = None
             cycles = find_tag_value(bd, RscpTag.BAT_CHARGE_CYCLES)
             t_max = find_tag_value(bd, RscpTag.BAT_MAX_DCB_CELL_TEMPERATURE)
             t_min = find_tag_value(bd, RscpTag.BAT_MIN_DCB_CELL_TEMPERATURE)
@@ -1609,9 +1611,10 @@ def fetch_battery_vitals(host: str, port: int, portal_user: str,
             cab = {
                 'index': cab_idx,
                 'count': dcb_count,
-                # BAT_ASOC ist kein belastbarer Pack-SOH. Der Schrank-SOH wird nach
-                # dem DCB-Loop aus echten Pack-SOH-Werten berechnet.
-                'asoc': round(float(asoc), 2) if asoc is not None else None,
+                # BAT_ASOC ist kein Pack-SOH, kann aber den Schrank-SOH annähern.
+                # Vergleiche mit Pack-Mittelwerten zeigen ähnliche Werte; echte
+                # Pack-Werte haben Vorrang. Kapazitätsangaben ersetzen keinen SOH.
+                'asoc': asoc,
                 'soh_avg': None,
                 'soh_reason': 'SOH_NOT_AVAILABLE',
                 'cycles': int(cycles) if cycles is not None else None,
@@ -1759,6 +1762,12 @@ def fetch_battery_vitals(host: str, port: int, portal_user: str,
                     cab['voltage_spread_max'] = round(max(voltage_spreads), 3)
                 if temp_spreads:
                     cab['temp_spread_max'] = round(max(temp_spreads), 1)
+
+            if cab['soh_avg'] is None and asoc is not None:
+                cab['soh_avg'] = asoc
+                cab['soh_reason'] = 'BAT_ASOC_APPROX'
+                cab['soh_approx'] = True
+                cab['soh_source'] = 'BAT_ASOC'
 
             result['cabinets'].append(cab)
 

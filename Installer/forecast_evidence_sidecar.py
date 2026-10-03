@@ -20,6 +20,12 @@ try:
         EvidenceLimitError,
         append_summary_if_due,
         current_quality_progress,
+        history_time_plausibility,
+        LEGACY_HISTORY_SOURCE_CONTRACT,
+        claim_history_backfill_days,
+        finish_history_backfill_day,
+        fail_history_backfill_day,
+        history_backfill_progress,
         archive_forecast_snapshot,
         database,
         enforce_retention,
@@ -32,7 +38,7 @@ try:
         unavailable_summary,
         unavailable_summary_with_retained_continuity,
     )
-    from e3dc_history_slots import HISTORY_DEFAULT_SLOT_COUNT, read_recent_closed_slots
+    from e3dc_history_slots import HISTORY_DEFAULT_SLOT_COUNT, read_recent_closed_slots, read_history_slots
     from Forecast.pv_forecast_diagnostic_details import ExternalEnergyAccumulator
     from rscp_client import RscpConnection
 except ImportError:  # pragma: no cover - Paketimport
@@ -43,6 +49,12 @@ except ImportError:  # pragma: no cover - Paketimport
         EvidenceLimitError,
         append_summary_if_due,
         current_quality_progress,
+        history_time_plausibility,
+        LEGACY_HISTORY_SOURCE_CONTRACT,
+        claim_history_backfill_days,
+        finish_history_backfill_day,
+        fail_history_backfill_day,
+        history_backfill_progress,
         archive_forecast_snapshot,
         database,
         enforce_retention,
@@ -58,6 +70,7 @@ except ImportError:  # pragma: no cover - Paketimport
     from Installer.e3dc_history_slots import (
         HISTORY_DEFAULT_SLOT_COUNT,
         read_recent_closed_slots,
+        read_history_slots,
     )
     from Installer.rscp_client import RscpConnection
     from Installer.Forecast.pv_forecast_diagnostic_details import ExternalEnergyAccumulator
@@ -191,6 +204,17 @@ def read_history(config: dict[str, Any], *, now_utc_s: int) -> list[dict[str, An
         connection.close()
 
 
+def read_history_day(config: dict[str, Any], day_utc_s: int) -> list[dict[str, Any]]:
+    host, port, user, password, aes_password = _rscp_config(config)
+    connection = RscpConnection(host, port, aes_password)
+    try:
+        connection.connect()
+        connection.authenticate(user, password)
+        return read_history_slots(connection, time_start_utc_s=day_utc_s, slot_count=96)
+    finally:
+        connection.close()
+
+
 def run_cycle(
     *,
     config_path: str = CONFIG_PATH,
@@ -264,6 +288,28 @@ def run_cycle(
                 history_status = "history_unavailable"
                 history_result = {"inserted": 0, "reason": str(exc)}
                 logger.warning("E3/DC-Historie derzeit nicht verfügbar: %s", exc)
+            try:
+                _rscp_config(config)
+            except ValueError as exc:
+                history_result["backfill_reason"] = _typed_reason(exc, "rscp_config_invalid")
+                backfill_days = []
+            else:
+                backfill_days = claim_history_backfill_days(
+                    now_utc_s=now_s, database_path=database_path)
+            for day_s, day_revision in backfill_days:
+                try:
+                    backfill_slots = read_history_day(config, day_s)
+                except Exception:
+                    # Die Drossel und die Fehlergrenze gelten auch nach Neustart.
+                    fail_history_backfill_day(day_s, day_revision, database_path=database_path)
+                    logger.warning("Nachlesen der E3/DC-Historie vorübergehend nicht möglich.")
+                else:
+                    try:
+                        finish_history_backfill_day(day_s, day_revision, backfill_slots,
+                            now_utc_s=now_s, database_path=database_path)
+                    except Exception:
+                        # Der offene Tag wird unter derselben Drossel erneut versucht.
+                        logger.warning("Nachgelesene E3/DC-Historie konnte noch nicht abgeschlossen werden.")
             summary = append_summary_if_due(
                 topology_revision=revision,
                 now_utc_s=now_s,
@@ -283,6 +329,12 @@ def run_cycle(
     # Nur die RAM-Veröffentlichung ergänzen; archivierte Tagesberichte behalten
     # ihre ursprünglichen Kennzahlen, Zeitstände und unveränderlichen Datensätze.
     summary = dict(summary)
+    summary["history_time_plausibility"] = history_time_plausibility(
+        config, revision, now_utc_s=now_s, database_path=database_path)
+    summary["history_time_plausibility_legacy"] = history_time_plausibility(
+        config, revision, now_utc_s=now_s, database_path=database_path,
+        source_contract=LEGACY_HISTORY_SOURCE_CONTRACT)
+    summary["history_backfill"] = history_backfill_progress(database_path=database_path)
     summary["quality_progress"] = current_quality_progress(
         summary, config, now_utc_s=now_s, database_path=database_path)
     publish_summary_json(summary, summary_path=summary_path)

@@ -45,10 +45,10 @@ Heizung und Warmwasser besitzen getrennt zugeordnete Aufträge und
 Rückmeldungen. Ein berechtigter Warmwasser-Timer verriegelt deshalb keinen
 neuen Heizungsauftrag. Die PV-Sollwerte stehen für den Boost-Zeitraum; den
 Verdichterstart entscheidet die Anlage mit ihrer eigenen Hysterese
-(`wp_pv_hz_hysteresis_k`, `wp_pv_ww_hysteresis_k`). Die Startleistung ist nur
-für `wp_pv_start_wait_s` reserviert: Läuft der Verdichter bis dahin nicht an,
-geht die Reservierung an die nachrangigen Verbraucher, der Sollwert bleibt
-stehen, und ab dem gemessenen Verdichterstart bindet wieder die Istaufnahme.
+(`wp_pv_hz_hysteresis_k`, `wp_pv_ww_hysteresis_k`). Im Messwertbetrieb wird keine
+Startleistung reserviert. `wp_pv_start_wait_s` dient nur der Diagnose; der
+Sollwert bleibt bei ausreichender PV-Deckung stehen. Erst die gemessene
+Istaufnahme bindet Leistung im Verbraucherbudget.
 Ein nie ausgespielter Auftrag wird erst nach der Wiedereinschaltsperre erneut
 angeboten. Ein bestätigter Sollwert allein beweist keinen Verdichterlauf.
 Nimmt eine Schutzfunktion einen bereits ausgespielten PV-Auftrag zurück, zum
@@ -243,7 +243,7 @@ Die Bearbeitung erfolgt am einfachsten über das **Web-Interface** (Config Edito
 | Parameter | Beschreibung | Standard |
 | :--- | :--- | :--- |
 | `luxtronik_ip` | IP-Adresse der Wärmepumpe im lokalen Netzwerk. | `0.0.0.0` (nicht konfiguriert) |
-| `grid_start_limit` | Startschwelle in Watt; **negativ** bedeutet Einspeisung. Die zentrale Verteilung berücksichtigt Verbraucherprioritäten. Kein Ersatz für die maximale elektrische Geräteaufnahme. | `-3500` |
+| `grid_start_limit` | Negativ eintragen (Einspeisung). Für die Zuteilung zählt der Betrag der benötigten Freigabe aus dem freien Verbraucherbudget nach Akkuladung, nicht die Einspeisung am Netzpunkt. Die PV-Pause nutzt hingegen das Vorzeichen: Ihr laufender Ende-Timer wird bei Netzleistung über `grid_start_limit + 500 W` zurückgesetzt. Bei `+4500` erst über 5000 W Netzbezug, bei `-4500` sobald die Einspeisung unter 4000 W fällt. Die Zuteilung benötigt mindestens 1500 W. Ein kleinerer Betrag ermöglicht keinen Start. Verbraucherprioritäten gelten weiterhin. Kein Ersatz für die maximale elektrische Geräteaufnahme. | `-3500` |
 | `min_soc` | Mindest-Ladestand der Hausbatterie für neue Boost-Starts. Die physische Notstromreserve wird zusätzlich geschützt. | `80` |
 | `manual_boost_min_soc` | Mindest-Ladestand der Hausbatterie für den Start eines manuellen Boosts. Sinkt er während eines laufenden Boosts darunter, endet der Boost regulär nach Mindestlaufzeit und Signalhaltezeit; unter `min_soc` minus 5 Prozentpunkte greift die sofortige Sicherheitsabschaltung. Ein Start setzt deshalb einen Ladestand von mindestens `manual_boost_min_soc` und mindestens `min_soc` minus 5 Prozentpunkte voraus. Das reguläre Ende kann nur eintreten, wenn `manual_boost_min_soc` über `min_soc` minus 5 Prozentpunkte liegt; sonst beendet die Sicherheitsabschaltung den Boost vorher. Ein fehlender Ladestand zählt nicht als 0 %. | `25` |
 | `heizgrenze_temp` | Außentemperatur-Grenze in °C zwischen Sommer- und Winterbetrieb. | `10.0` |
@@ -295,11 +295,11 @@ Vorreservierung bei.
 | `wp_restart_block_min` | Wiedereinschaltsperre ab dem gemessenen Verdichterstillstand, für alle Startwege gleich; nach einem Neustart bis zum nächsten gemessenen Stillstand ab dem spätesten bekannten Zeitpunkt aus Rücknahme und gespeichertem Stillstand; ohne messbaren Verdichterzustand ab dem späteren Zeitpunkt aus Rücknahme und letztem bekanntem Stillstand. Zusätzlich sperrt jede Rücknahme den Kanal ab ihrem Zeitpunkt für diese Dauer, nach einem Schutzentzug mindestens 10 Minuten, auch bei `0`. Maßgeblich ist das spätere Ende. | `20` |
 | `pv_boost_delay` | Dauer der stabilen PV-Startqualifikation vor einer verbindlichen Startzuteilung in Sekunden. | `30` |
 | `wp_pv_reaction_s` | Reaktionsfrist für Messung, Kommunikation und wirksame Lastanpassung in Sekunden. | `30` |
-| `wp_pv_start_wait_s` | Wartefrist auf den tatsächlichen Verdichterstart; mindestens 600 Sekunden. So lange bleibt die Startleistung reserviert, danach geht sie an die nachrangigen Verbraucher. | `600` |
+| `wp_pv_start_wait_s` | Diagnosefrist für den tatsächlichen Verdichterstart; mindestens 600 Sekunden. Im Messwertbetrieb keine Startreservierung und kein Entzug des gehaltenen Sollwerts durch Fristablauf. | `600` |
 | `wp_pv_handoff_timeout_s` | Frist für die bestätigte Übergabe von Wallboxleistung in Sekunden; nur bei Wallbox-Vorrang eine Vorbedingung des Sollwerts. | `120` |
 | `wp_pv_hz_hysteresis_k` | Schalthysterese der Anlage für die Heizung in Kelvin; Heizbedarf gilt ab Rücklauf unter PV-Sollwert minus Hysterese. | `3.5` |
 | `wp_pv_ww_hysteresis_k` | Schalthysterese der Anlage für Warmwasser in Kelvin. | `8` |
-| `wp_pv_boost_release_s` | Wolkenüberbrückung des PV-Boosts: So lange darf die PV-Deckung unter der Startleistung liegen, bevor die Sollwerte zurückgenommen werden. Verdichterstopp oder erreichte Temperatur beenden den Boost nicht. | `300` |
+| `wp_pv_boost_release_s` | Wolkenüberbrückung des PV-Boosts: Ohne Verdichterlauf muss die PV-Deckung die Startleistung tragen. Bei laufendem Verdichter genügt die Deckung ohne Netzbezug und Kurvendefizit. Beim Halten eines gesendeten Boosts, auch vor dem Verdichterstart, darf das Kurvendefizit entfallen, wenn die vorsichtige Restprognose Akkuziel und Wärmebedarf einschließlich Reserve deckt. Die Reserve umfasst auch die WP-Energie für die Überbrückung (höchstens 300 s). Erst 60 s durchgehende Deckung setzen die Defizitfrist zurück. Fehlt die jeweilige Voraussetzung länger als diese Frist, wird die Rücknahme angefordert; die Mindestlaufzeit bleibt wirksam. Verdichterstopp oder erreichte Temperatur beenden den Boost nicht. | `300` |
 
 Der elektrische Profilwert ist keine thermische Heizleistung. Er beschreibt
 die WP-Messgrenze einschließlich dort erfasster Pumpen und möglicher
@@ -500,6 +500,43 @@ Geräteupdate hinzugekommene oder geänderte Messwerte.
 beschreibt nur die Sollwertvorgabe. Ein Eco-Sollwert bei stehendem Verdichter
 und ohne Geräteanforderung wird daher als Standby angezeigt.
 
+### Anzeige der Wärmepumpen-Vorschau
+
+Die Vorschau zeigt die Stränge nach den gemeldeten Pumpenausgängen der
+Luxtronik. Die Ausgänge belegen das gemeldete Pumpensignal, keine gemessene
+Förderleistung. Die Anzeige ändert keine Regelung und sendet keine
+Gerätebefehle.
+
+- **Heizkreis:** Im Config-Editor wählt „Heizkreispumpe (neue Ansicht)“
+  (`wp_heating_circuit_pump`) den passenden Ausgang: HUP (Standard), FUP 1, ZUP
+  oder „Kein Pumpensignal“. Mit Pufferspeicher und ohne Signal bleibt der
+  Heizkreis ruhig; ohne Puffer gilt bei „Kein Pumpensignal“ die bisherige
+  Ableitung aus Verdichter und Heizbetrieb. Ungültige Handeinträge erzeugen
+  eine beratende Warnung.
+- **Warmwasser:** Der Strang folgt BUP. Aus hält ihn ruhig, auch wenn der
+  Betriebszustand „Warmwasser“ meldet.
+- **Wärmequelle:** Der Strang (bei Luft-Wärmepumpen der Ventilator) folgt
+  Ventil.-BOSUP. Dessen Prozentwert erscheint nur im Hover-Text und muss
+  zwischen 0 und 100 liegen.
+- **Zirkulation:** ZIP Ein erscheint als „Zirkulation läuft“ im Hover-Text.
+- **EVU:** Ein frisches EVU-Aus bedeutet Sperrzeit und hat in der Anzeige
+  Vorrang vor Heizen, Warmwasser oder Abtauen. Ohne gültigen Eingang wird keine
+  Sperre abgeleitet.
+- **Durchfluss:** erscheint als Zahl in l/h am Primärstrang und schaltet keine
+  Animation.
+
+Die Signale stammen aus `waermepumpe.json` und gelten höchstens 120 Sekunden ab
+deren Zeitstempel. Veraltete oder ungültige Signale halten die betroffenen
+Animationen ruhig; der Hover-Text nennt den Grund. Bei anderen Herstellern
+bleibt die bisherige Anzeige erhalten.
+
+Doppelte Ausgangsnamen bleiben getrennt: `ZUP` und `Ventil.-BOSUP` enthalten
+den Ein/Aus-Wert, `ZUP %` und `Ventil.-BOSUP %` den Prozentwert. **Hinweis für
+Auswertungen älterer Archivzeilen:** Bis zu dieser Version stand bei
+gleichnamigen Prozentkanälen der Prozentwert unter `ZUP` bzw.
+`Ventil.-BOSUP`. Fehlt der Ein/Aus-Eintrag, bleibt der Wert unbekannt; der
+Prozentkanal ist kein Ersatz.
+
 ### Quell-Erholung
 Der Pausenmodus wird fachlich als **Quell-Erholung** geführt. Eine Pause soll
 die Wärmepumpe nicht beliebig abschalten, sondern Quelle, Gebäude und
@@ -628,3 +665,164 @@ erzeugt weder zusätzliche Sollwerte noch zusätzliche FC06-Schreibbefehle.
 ### Warmwasser-Sollwerte des Software-Timers
 
 Bei aktiviertem Software-Timer gilt innerhalb des Zeitfensters der Normal-Sollwert und außerhalb der Eco-Sollwert. Der Timer hält seinen Sollwert auch nach Erreichen der Temperatur aufrecht; die Wärmepumpe entscheidet mit ihrer eigenen Regelung über den Verdichterbetrieb. Ein freigegebener Boost kann den Sollwert vorübergehend anheben. Anschließend gilt wieder der zum Zeitfenster passende Timer-Sollwert. Eine Absenkung wartet bei einem noch laufenden Warmwasserzyklus auf dessen bestätigtes Ende; Schutzabschaltungen bleiben vorrangig.
+
+
+## Tariffenster-Heizen (experimentell)
+
+Tariffenster-Heizen ergänzt die gemeinsame Wärmeplanung für Luxtronik. Standard
+ist **Aus**. **Schatten** zeigt die Entscheidung ohne Tarif-Schreibauftrag und ohne
+Akku-Halt. **Aktiv** darf einen belegten Wärmebedarf in günstige Octopus-Heat-
+Fenster verschieben. Automatik und gemeinsame Wärmeplanung müssen eingeschaltet
+sein. Die normale Komfortregelung bleibt zuständig; teure Zeiten werden nicht
+gesperrt. Der Negativpreis-Netzboost bleibt eine getrennte Funktion.
+
+Die erlaubten günstigen Zeitfenster werden im Config-Editor festgelegt:
+`HH:MM-HH:MM`, eine Zeile je Fenster, in Europe/Berlin. Die Vorbelegung für
+Octopus Heat lautet `02:00-06:00` und `12:00-16:00`. Über Mitternacht ist möglich.
+Bei Sommerzeit entfällt die übersprungene Stunde, bei Winterzeit zählen beide
+wiederholten Stunden. Die Zeiten müssen zum gebuchten günstigen Tarif passen;
+der Konfigurationseintrag legt die Freigabe fest. Leere oder ungültige Fenster
+sperren das Tariffenster-Heizen. Preise müssen vollständig konfiguriert sein;
+der günstige Preis muss unter Basis- und Hochpreis liegen.
+Fehlt der Eintrag, gilt die Octopus-Vorbelegung ausschließlich als Laufzeit-
+und Editorstandard. Der Installer schreibt sie nicht in Bestandskonfigurationen.
+Bisherige Negativpreisfenster werden nicht übernommen. Ein ausdrücklich leerer
+Eintrag bleibt leer und sperrt. Das aktiviert die Funktion nicht.
+
+Der Editor zeigt für Octopus Heat den Tariffenster-Block, für Börsenpreistarife
+mit Negativpreis-Slots den Negativpreis-Block. Spezialtarife und fehlende Tarife
+zeigen keinen dieser Blöcke. Das Wärmeziel steht in beiden passenden Blöcken,
+Mindest-Angebotszeit und Tagesmaximum nur im Tariffenster-Block. Verborgene Werte bleiben beim Speichern erhalten.
+Der Negativpreis-Boost hat keine eigenen Zeitfenster. Der bisherige Wert
+`heat_price_boost_windows` bleibt gespeichert, wird dort aber nicht ausgewertet.
+Das Wärmeziel gilt auch beim Negativpreis-Boost: Im Sommer nur WW, sofern
+freigegeben; im Winter WW und/oder Heizung gemäß Wärmeziel. Ungültige Ziele
+sperren Tarif- und Negativpreis-Boost.
+Die mittlere Außentemperatur und die vorhandene Heizgrenze bestimmen die Saison.
+
+Gespeicherte Tarifaufträge können auch von älteren Versionen als Preisauftrag
+sicher zurückgenommen werden. Nach deren Speicherung wird beim erneuten Update
+kein veralteter Tarifbesitz wiederhergestellt.
+
+Die Planung verwendet die vorsichtige PV-Prognose P10, ersatzweise 70 % von P50
+oder 70 % der frischen Punktprognose. Hausgrundlast, Wallbox und Wärme gehen mit
+P50 oder ihrer gültigen Punktprognose ohne Abschlag ein, jeweils genau einmal.
+Eine noch nicht erneuerte Plandatei gilt bis höchstens fünf Minuten nach ihrem
+Slotende; die maximale Planalterung von 30 Minuten bleibt. Ein Fehler im
+optionalen Prognoseleser macht gültige E3DC-Livedaten nicht ungültig.
+Bis zum nächsten prognostizierten Abschnitt mit verbleibendem PV-Überschuss wird
+der erwartete elektrische Wärmebedarf ermittelt. Der Überschuss dieses Abschnitts
+wird angerechnet. Ohne einen solchen Abschnitt gilt höchstens ein 24-Stunden-
+Horizont. Nur die fehlende Energiemenge kommt für einen Tarifauftrag infrage.
+Fehlen frische, zusammengehörende Prognosedaten, bleibt der Tarifstart gesperrt.
+Diese Prognose ersetzt keine Komfort- oder Frostschutzregelung.
+
+Das Wärmeziel erlaubt nur WW, nur Heizung oder beides. Bei beidem hat
+Warmwasser Vorrang. Es verwendet das vorhandene WW-Boost-Ziel der Saison. Die Planung berücksichtigt die letzten acht vollständig beobachteten,
+am Sollwert abgeschlossenen WW-Läufe. Ab drei Läufen gilt deren oberes Quartil.
+Bis dahin gilt der einstellbare Vorlauf von 90 Minuten; dieser vorsichtige
+Ausgangswert ist an die tatsächliche Anlage anzupassen. Zusätzlich bleiben zehn
+Minuten Reserve vor Fensterende. Wenn anschließend Heizen nötig ist, beginnt WW
+um die Mindestdauer früher, damit dafür Zeit bleibt. Ein verspäteter WW-Start,
+bei dem die erwartete Dauer nicht mehr passt, ist gesperrt. Eine tatsächliche
+Fertigstellung kann die Prognose nicht garantieren.
+
+Heizen folgt erst nach der bestätigten WW-Rücknahme und nutzt das vorhandene
+Heizungs-Boost-Ziel. Die bestehende Sommergrenze gilt: oberhalb der Heizgrenze
+gibt es keinen Heizungsboost. Es wird keine zusätzliche Temperatur-Anhebung
+konfiguriert. Mindestdauer und Tagesmaximum verwenden die bestehenden Felder
+`price_min_duration` (Standard 60 Minuten) und `price_max_daily` (180 Minuten).
+Die Mindestdauer ist die Mindest-Angebotszeit: Ein neuer Boost startet nur, wenn
+mindestens diese Zeit im aktuellen Fenster bleibt. Ein laufender Boost wird
+wegen kürzer werdender Restzeit nicht beendet. Das Tagesmaximum bleibt eine
+Obergrenze für die gesamte Tarif-Auftragszeit. Beide Felder wirken nicht beim
+Negativpreis-Boost.
+
+Für HZ-Angebote beider Netz-/Tarifboost-Funktionen gilt zusätzlich
+`heat_grid_boost_max_outdoor_c`: Standard 10 °C, leer ohne Temperaturgrenze.
+Maßgeblich ist die mittlere Außentemperatur der Heizgrenze. Ein neuer HZ-Boost
+startet unterhalb der Grenze, ein laufendes HZ-Angebot bleibt bis 1 K darüber
+freigegeben. Dieses Hystereseband verhindert Flattern um die Grenze; vorhandene
+Mindestlaufzeiten und Schutzvorgaben bleiben wirksam. Bei fehlender oder
+ungültiger mittlerer Außentemperatur startet kein HZ-Boost, auch bei leerer Grenze.
+Warmwasser ist ausgenommen. Fehlende neue Werte gelten als Laufzeitstandard und
+werden durch die Installer-Startdefaults nicht nachträglich persistiert.
+Der normale WW-Timer bleibt die Grundstellung. Schutzbedingungen, Nutzer-Aus,
+Ferienmodus, Quellentemperatur, Notstromreserve, Hausanschluss und
+Wiedereinschaltsperre haben Vorrang.
+
+Der Speicher kann im aktiven Auftrag seine Entladung für die frisch gemessene
+WP-Leistung begrenzen. Der Tarifboost hängt nicht von der Lastspitzenkappung ab
+und benötigt keinen freien Kopfraum. Bei aktiver Kappung kappt der Akku
+Viertelstundenspitzen auch während des Boosts. Er fordert durch den Tarif-Halt
+kein zusätzliches Akku-Netzladen an. Fehlt die
+Einzelmessung, bleibt die E3/DC-Bilanz maßgeblich; es wird kein Ersatzwert für den
+Akku-Halt angesetzt. Ein passender PV-Boost kann das identische, bestätigte
+Tarifziel ohne erneute Sollwertschreibung übernehmen.
+
+### Einstellungen
+
+| Einstellung | Bedeutung |
+| --- | --- |
+| `heat_tariff_shift_mode` | `off`, `shadow` oder `active`; Standard `off` |
+| `heat_tariff_shift_windows` | Erlaubte günstige Zeitfenster; leer oder ungültig sperrt |
+| `heat_tariff_shift_ww_lead_min` | WW-Vorlauf ohne belastbare Historie; Standard 90 Minuten |
+| `heat_price_boost_scope` | Wärmeziel für Tarif- und Negativpreis-Boost: WW, Heizung oder beides |
+| `heat_grid_boost_max_outdoor_c` | Mittlere Außentemperaturgrenze für HZ; Standard 10 °C, leer ohne Grenze |
+| `price_min_duration` | Mindest-Angebotszeit eines neuen Tarifauftrags |
+| `price_max_daily` | Maximale Tarif-Auftragszeit pro lokalem Kalendertag |
+
+### Schattenbetrieb prüfen
+
+1. Im Bereich **Wärmepumpe: Netzstrom und Preissteuerung** den eigenen Block
+   **Tariffenster-Heizen (experimentell)** öffnen und **Schatten** wählen.
+2. Preise, erlaubte Zeiten, Mindestdauer, Tagesmaximum und WW-Vorlauf prüfen.
+3. Mindestens einen sonnigen und einen trüben Tag einschließlich Nacht- und
+   Mittagsfenster beobachten. Der Schattenbetrieb selbst startet keinen Boost.
+4. Den **Tagesexport** über `heat_tariff_diagnostics.php` im selben Block herunterladen. Er enthält Entscheidung,
+   Sperrgründe, Ziel, Startzeit, PV-Bewertung und Restbudget ohne Anlagenkennungen.
+5. Bei einer Abweichung Datum, Uhrzeit, gewählten Modus, beobachtete Temperatur
+   und den Tagesexport melden. Erwarteten Start und tatsächlichen Verdichterlauf
+   getrennt beschreiben. Ein angezeigtes Sollziel beweist keinen Verdichterlauf.
+
+Bei fehlenden Daten oder einer angezeigten Sperre zunächst den Grund prüfen.
+Der Wechsel auf Aktiv ersetzt diese Prüfung nicht. Nach Änderungen an den
+Prognosen oder Gerätebedingungen ist ein erneuter Schattenvergleich sinnvoll.
+
+Die **Lastspitzenkappung** (`peak_shaving_enable`) begrenzt den Netzbezug über
+das Viertelstundenintervall mit dem Akku. Ihre aktuelle Entladeforderung hat
+Vorrang vor dem Tarif-Halt, begrenzt durch die bestehende Kappungs- und
+Hardwaregrenze. Ein fehlender oder zu kleiner Kopfraum sperrt den Tarifstart
+nicht. Fehlt der aktuelle Kappungskontext bei eingeschalteter Kappung, entfällt
+der Tarif-Halt; der bestehende Speichervertrag bleibt erhalten. Es gibt keine
+zusätzliche Leistungsobergrenze für die Wärmepumpe.
+Ist die Kappung selbst der geschützte Speicherbesitzer, bleibt der Tarifboost
+freigegeben; nur der Tarif-Halt entfällt (`peak_shaving_owner`). Andere
+geschützte Speicherbesitzer sperren weiterhin neue Tarifaufträge. Eine reine
+Speicherbelegung beendet einen laufenden Auftrag erst nach dem bestehenden
+Mindestlaufzeitschutz; Notstrom, Reserve, Nutzer-Aus und Sicherheitsvetos
+bleiben sofort wirksam.
+Der Kappungskontext gehört zur selben Live-Stichprobe, ist höchstens zehn
+Sekunden alt und gehört zum Viertelstundenintervall dieser Stichprobe. Ein
+Zyklus unmittelbar nach der Intervallgrenze verwendet daher noch denselben
+frischen Kontext, bis die erste Stichprobe des neuen Intervalls vorliegt.
+Die Restzeit wird ebenfalls aus der Stichprobe bestimmt und beträgt mindestens
+eine Sekunde. Die Anhebung beachtet zusätzlich bestehende Entladegrenzen, den bilanzierten Bezug und die
+über die Intervallrestzeit verfügbare Energie oberhalb der physischen Reserve.
+
+Der Halt ist eine Begrenzung der zulässigen Entladeleistung im bestehenden
+AUTO-Vertrag, keine Garantie eines physisch ruhenden Akkus. Die übrige Hauslast
+darf weiterhin aus dem Akku versorgt werden. Er benötigt einen frischen Auftrag
+und eine frische WP-Messung; bei fehlendem Auftrag, Messlücke oder Fensterende
+entfällt ausschließlich diese zusätzliche Begrenzung. Vorhandene Schutzgrenzen
+bleiben erhalten. Änderungen der Tarifgrenze verwenden das 200-W-Totband und
+die 30-s-Schreibbremse. Eine für die Kappung nötige Anhebung wirkt sofort,
+auch innerhalb dieser Bremse und des Totbands. Der Vertrag zeigt die
+berücksichtigte Kappungsforderung als `peak_priority_w` und bei einer Anhebung
+den Grund `peak_shaving_priority`. Bei gemessenen 0 W wird die bisherige Entladegrenze
+nicht abgesenkt, darf für zusätzliche Hauslast jedoch steigen. Strengere
+Schutzgrenzen bleiben maßgeblich; Lasten werden nicht zusätzlich abgezogen.
+Ein Neustart erteilt ohne erneut gültige Belege keine Freigabe.
+
+Die Außentemperaturgrenze betrifft ausschließlich HZ-Boost-Angebote.
+PV-, Preis- und Hochpreis-Pausen mit abgesenktem Sollwert bleiben davon unberührt.

@@ -397,7 +397,7 @@ def calculate_details(connection, topology_revision, method_revision, now_s):
     latest = {r["slot_start_utc_s"]: r for r in rows}
     actual = {}
     for row in connection.execute("""SELECT * FROM observed_slots
-            WHERE topology_revision=? AND source_contract='e3dc_db_history_day_15m_v1'
+            WHERE topology_revision=? AND source_contract='e3dc_db_history_day_15m_v2'
             AND slot_start_utc_s>=? AND slot_end_utc_s<=?
             ORDER BY valid, observed_at_utc_s, observation_id""", (topology_revision, cutoff, end)):
         actual[row["slot_start_utc_s"]] = row["actual_e3dc_dc_energy_wh"] if row["valid"] else None

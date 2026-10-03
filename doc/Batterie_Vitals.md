@@ -61,3 +61,19 @@ Logs liegen unter:
 ```text
 /var/www/html/logs/
 ```
+
+## SOH-Quelle und Näherung
+
+Echte Modulwerte aus `BAT_DCB_SOH` haben Vorrang. Fehlen sie vollständig in einem
+Schrank, kann dessen BMS-Wert `BAT_ASOC` als gekennzeichnete SOH-Näherung dienen
+(endlich, größer als 0 und höchstens 110 %). Daraus entstehen keine Modulwerte,
+kein schwächster Pack und keine SOH-Spreizung. Die Diagnose-Ampel bewertet nur
+vorhandene Pack-Werte. System-SOH und Durchschnitt bleiben kapazitätsgewichtet
+und werden bei Beteiligung einer Näherung ebenfalls gekennzeichnet.
+
+Die Verschleißprognose nennt bei ASOC ausdrücklich die Schrank-Näherung als Basis;
+Mindestzyklen und Mindestalter gelten weiterhin. Kapazitätsangaben sind kein
+Ersatz für SOH. Im Monatsverlauf enthält `cabinets` den Schrankwert,
+`soh_source`, `soh_approx`, `soh_quality` und `soh_reason`. `packs` behält echte
+Modulwerte bzw. `null` mit Grund. Alte Monatsstände ohne diese Zusatzfelder
+bleiben lesbar; ihre Quellenqualität wird nicht nachträglich behauptet.

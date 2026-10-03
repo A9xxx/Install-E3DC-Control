@@ -417,7 +417,7 @@ function installCenterModuleConfigFields($moduleKey) {
             installCenterConfigField('wp_type', 'Wärmepumpen-Typ', 'select', $wpTypes),
             installCenterConfigField('idm_ip', 'IDM IP-Adresse', 'text', [], '', false, '192.0.2.61'),
             installCenterConfigField('idm_port', 'IDM Modbus-Port', 'number', [], '', false, '502'),
-            installCenterConfigField('idm_e_total', 'IDM Energiezähler-Offset', 'number'),
+            installCenterConfigField('idm_e_total', 'IDM Stromzählerstand in kWh für die Gesamt-JAZ', 'number'),
         ],
         'stiebel_live' => [
             installCenterConfigField('luxtronik', 'WP-/Verbrauchslogging', 'select', $bool),

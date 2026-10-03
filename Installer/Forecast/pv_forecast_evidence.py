@@ -48,7 +48,8 @@ LEGACY_SUMMARY_SCHEMAS = {
 }
 CONTINUITY_SCHEMA = "pv_forecast_evidence_continuity_v1"
 OPERATION_MODE = "read_only_diagnostic"
-HISTORY_SOURCE_CONTRACT = "e3dc_db_history_day_15m_v1"
+LEGACY_HISTORY_SOURCE_CONTRACT = "e3dc_db_history_day_15m_v1"
+HISTORY_SOURCE_CONTRACT = "e3dc_db_history_day_15m_v2"
 FORECAST_SOURCE_CONTRACT = "resource_forecast_ensemble_v1"
 FORECAST_SIGNAL_CONTRACT = "pv_e3dc_dc"
 FORECAST_VALUE_STAGE = "displayed_postprocessed"
@@ -572,6 +573,17 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
             observed_at_utc_s INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS history_backfill_days (
+            day_utc_s INTEGER NOT NULL,
+            topology_revision TEXT NOT NULL,
+            source_contract TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('pending', 'completed', 'unavailable')),
+            reason TEXT NOT NULL,
+            last_attempt_utc_s INTEGER,
+            transport_failures INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(day_utc_s, topology_revision, source_contract)
+        );
+
         CREATE TABLE IF NOT EXISTS diagnostic_summaries (
             summary_id TEXT PRIMARY KEY,
             topology_revision TEXT NOT NULL,
@@ -604,6 +616,10 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
                 observed_at_utc_s DESC,
                 observation_id DESC
             );
+        CREATE INDEX IF NOT EXISTS idx_history_backfill_attempt
+            ON history_backfill_days(last_attempt_utc_s);
+        CREATE INDEX IF NOT EXISTS idx_history_backfill_pending
+            ON history_backfill_days(source_contract, status, last_attempt_utc_s, day_utc_s);
         CREATE INDEX IF NOT EXISTS idx_summary_revision_time
             ON diagnostic_summaries(topology_revision, calculated_at_utc_s);
 
@@ -627,6 +643,10 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
         BEGIN SELECT RAISE(ABORT, 'diagnostic_summaries are immutable'); END;
         """
     )
+    # Vorhandene Nachlese-Aufträge behalten Zustand und Zeitanker.
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(history_backfill_days)")}
+    if "transport_failures" not in columns:
+        connection.execute("ALTER TABLE history_backfill_days ADD COLUMN transport_failures INTEGER NOT NULL DEFAULT 0")
     initialize_tables(connection)
     schema_row = connection.execute(
         "SELECT value FROM evidence_meta WHERE key = 'schema_version'"
@@ -667,6 +687,9 @@ def _schema_is_ready(connection: sqlite3.Connection) -> bool:
         "forecast_issue_contracts",
         "observed_slots",
         "diagnostic_summaries",
+        "history_backfill_days",
+        "idx_history_backfill_attempt",
+        "idx_history_backfill_pending",
         "idx_forecast_provenance_time",
         "idx_forecast_contract_revision_time",
         "idx_observed_summary_rank",
@@ -690,6 +713,9 @@ def _schema_is_ready(connection: sqlite3.Connection) -> bool:
                 'forecast_issue_contracts',
                 'observed_slots',
                 'diagnostic_summaries',
+                'history_backfill_days',
+                'idx_history_backfill_attempt',
+                'idx_history_backfill_pending',
                 'idx_forecast_provenance_time',
                 'idx_forecast_contract_revision_time',
                 'idx_observed_summary_rank',
@@ -703,7 +729,9 @@ def _schema_is_ready(connection: sqlite3.Connection) -> bool:
             """
         ).fetchall()
     }
-    return required_objects == present and tables_ready(connection)
+    return (required_objects == present and tables_ready(connection)
+            and "transport_failures" in {row[1] for row in connection.execute(
+                "PRAGMA table_info(history_backfill_days)")})
 
 
 def _database_is_busy(exc: BaseException) -> bool:
@@ -1215,6 +1243,88 @@ def store_history_observations(
             )
             inserted += max(0, int(cursor.rowcount))
     return {"inserted": inserted, "topology_revision": revision}
+
+
+def claim_history_backfill_days(*, now_utc_s, database_path=EVIDENCE_DB_PATH):
+    """Fehlende Revision nachlesen: höchstens zwei Tage je 900 s, auch nach Neustart."""
+    now_s = int(now_utc_s)
+    with database(database_path, write=True) as connection:
+        # Teilweise vorhandene neue Tage ebenfalls vervollständigen. Ein einmal
+        # angelegter Auftrag bleibt bis zum Abschluss erhalten, auch nach Abbruch.
+        connection.execute("""INSERT OR IGNORE INTO history_backfill_days
+            (day_utc_s, topology_revision, source_contract, status, reason)
+            SELECT DISTINCT (old.slot_start_utc_s / 86400) * 86400,
+                old.topology_revision, ?, 'pending', 'revision_changed'
+            FROM observed_slots old WHERE old.source_contract=?
+                AND (old.slot_start_utc_s / 86400 + 1) * 86400 <= ?
+                AND NOT EXISTS (SELECT 1 FROM observed_slots fresh
+                    WHERE fresh.topology_revision=old.topology_revision
+                    AND fresh.source_contract=?
+                    AND fresh.slot_start_utc_s=old.slot_start_utc_s)
+            """, (HISTORY_SOURCE_CONTRACT, LEGACY_HISTORY_SOURCE_CONTRACT,
+                  now_s - MIN_EVALUATION_DELAY_S, HISTORY_SOURCE_CONTRACT))
+        attempts = connection.execute("""SELECT COUNT(*) FROM history_backfill_days
+            WHERE last_attempt_utc_s > ?""", (now_s - 900,)).fetchone()[0]
+        budget = max(0, 2 - attempts)
+        days = connection.execute("""SELECT day_utc_s, topology_revision FROM history_backfill_days
+            WHERE source_contract=? AND status='pending'
+                AND (last_attempt_utc_s IS NULL OR last_attempt_utc_s <= ?)
+            ORDER BY last_attempt_utc_s IS NOT NULL, last_attempt_utc_s, day_utc_s, topology_revision
+            LIMIT ?""", (HISTORY_SOURCE_CONTRACT, now_s - 900, budget)).fetchall()
+        for day in days:
+            connection.execute("""UPDATE history_backfill_days SET last_attempt_utc_s=?
+                WHERE day_utc_s=? AND topology_revision=? AND source_contract=?""",
+                (now_s, day[0], day[1], HISTORY_SOURCE_CONTRACT))
+        return [(row[0], row[1]) for row in days]
+
+
+def finish_history_backfill_day(day_utc_s, topology_revision, slots, *,
+                               now_utc_s, database_path=EVIDENCE_DB_PATH):
+    """Beobachtungen unveränderlich ergänzen; fehlende Auflösung dauerhaft merken."""
+    result = store_history_observations(slots, topology_revision=topology_revision,
+        observed_at_utc_s=now_utc_s, database_path=database_path)
+    expected = list(range(day_utc_s, day_utc_s + 86400, 900))
+    complete = ([s.get('slot_start_utc_s') for s in slots] == expected and all(
+        s.get('source_contract') == HISTORY_SOURCE_CONTRACT and
+        (s.get('valid') is True and s.get('history_contract_valid') is True
+         or s.get('reason') == 'dst_local_hour_unverified') for s in slots))
+    status = 'completed' if complete else 'unavailable'
+    with database(database_path, write=True) as connection:
+        connection.execute("""UPDATE history_backfill_days SET status=?, reason=?
+            WHERE day_utc_s=? AND topology_revision=? AND source_contract=?""",
+            (status, 'ok' if complete else 'history_15m_unavailable', day_utc_s,
+             topology_revision, HISTORY_SOURCE_CONTRACT))
+    return {**result, 'status': status}
+
+
+def fail_history_backfill_day(day_utc_s, topology_revision, *, database_path=EVIDENCE_DB_PATH):
+    """Transportfehler je Tag und Revision nach acht Versuchen dauerhaft begrenzen."""
+    with database(database_path, write=True) as connection:
+        connection.execute("""UPDATE history_backfill_days
+            SET transport_failures=transport_failures+1,
+                status=CASE WHEN transport_failures+1 >= 8 THEN 'unavailable' ELSE 'pending' END,
+                reason=CASE WHEN transport_failures+1 >= 8
+                    THEN 'history_transport_retry_limit' ELSE 'history_transport_error' END
+            WHERE day_utc_s=? AND topology_revision=? AND source_contract=? AND status='pending'""",
+            (day_utc_s, topology_revision, HISTORY_SOURCE_CONTRACT))
+
+
+def history_backfill_progress(*, database_path=EVIDENCE_DB_PATH):
+    with database(database_path) as connection:
+        counts = dict(connection.execute("""SELECT status, COUNT(*) FROM history_backfill_days
+            WHERE source_contract=? GROUP BY status""", (HISTORY_SOURCE_CONTRACT,)))
+    return {'schema_version': 'pv_history_backfill_v1', 'decision_use_allowed': False,
+        'completed_days': counts.get('completed', 0), 'pending_days': counts.get('pending', 0),
+        'unavailable_days': counts.get('unavailable', 0)}
+
+
+def sanitize_history_backfill(value):
+    if not isinstance(value, dict) or value.get('schema_version') != 'pv_history_backfill_v1' or value.get('decision_use_allowed') is not False:
+        return None
+    keys = ('completed_days', 'pending_days', 'unavailable_days')
+    if any(type(value.get(key)) is not int or value[key] < 0 for key in keys):
+        return None
+    return {key: value[key] for key in ('schema_version', 'decision_use_allowed') + keys}
 
 
 def enforce_retention(
@@ -2383,6 +2493,7 @@ def append_summary_if_due(
             if (
                 isinstance(latest_payload, dict)
                 and latest_payload.get("schema_version") == SUMMARY_SCHEMA
+                and (latest_payload.get("observation_quality") or {}).get("observation_source_contract") == HISTORY_SOURCE_CONTRACT
                 and isinstance(latest_payload.get("diagnostic_details"), dict)
                 and isinstance(latest_payload.get("forecast_issue_contract"), dict)
                 and latest_payload["forecast_issue_contract"].get("issue_id")
@@ -2407,6 +2518,92 @@ def append_summary_if_due(
             (summary_id, revision, now_s, _canonical_json(payload)),
         )
         return payload
+
+
+
+def _solar_elevation_utc(timestamp_s, latitude, longitude):
+    """NOAA-Näherung in Grad; ausschließlich für den Diagnosehinweis."""
+    from datetime import datetime, timezone
+    date = datetime.fromtimestamp(timestamp_s, timezone.utc)
+    hour = date.hour + date.minute / 60 + date.second / 3600
+    gamma = 2 * math.pi / 365 * (date.timetuple().tm_yday - 1 + (hour - 12) / 24)
+    equation = 229.18 * (0.000075 + 0.001868 * math.cos(gamma) - 0.032077 * math.sin(gamma)
+        - 0.014615 * math.cos(2 * gamma) - 0.040849 * math.sin(2 * gamma))
+    declination = (0.006918 - 0.399912 * math.cos(gamma) + 0.070257 * math.sin(gamma)
+        - 0.006758 * math.cos(2 * gamma) + 0.000907 * math.sin(2 * gamma)
+        - 0.002697 * math.cos(3 * gamma) + 0.00148 * math.sin(3 * gamma))
+    angle = math.radians((hour * 60 + equation + 4 * longitude) / 4 - 180)
+    latitude = math.radians(latitude)
+    cosine = math.sin(latitude) * math.sin(declination) + math.cos(latitude) * math.cos(declination) * math.cos(angle)
+    return 90 - math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
+
+
+def history_time_plausibility(config, topology_revision, *, now_utc_s, database_path=EVIDENCE_DB_PATH, source_contract=HISTORY_SOURCE_CONTRACT):
+    """Meldet wiederholten Nacht-Ertrag, ohne Zeitstempel oder Regelung zu ändern."""
+    result = {"schema_version": "pv_history_time_plausibility_v1", "decision_use_allowed": False,
+        "status": "unavailable", "reason": "location_missing_or_invalid",
+        "checked_slots": None, "suspicious_slots": None, "suspicious_days": None,
+        "max_suspicious_slots_per_day": None}
+    try:
+        if any(isinstance(config.get(key), bool) for key in ("hoehe", "laenge")):
+            return result
+        latitude, longitude = float(config.get("hoehe")), float(config.get("laenge"))
+        if not math.isfinite(latitude) or not math.isfinite(longitude) or not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+            return result
+    except (TypeError, ValueError):
+        return result
+    if _valid_revision(topology_revision) is None:
+        result["reason"] = "topology_revision_invalid"
+        return result
+    now_s = int(now_utc_s)
+    result["reason"] = "history_unavailable"
+    try:
+        with database(database_path, write=False) as connection:
+            # Dieselbe Quellenrevision, Topologie und Auswahl gültiger Werte wie
+            # beim Kennzahlvergleich. Wiederholte Abrufe zählen nicht mehrfach.
+            rows = connection.execute("""SELECT slot_start_utc_s, actual_e3dc_dc_energy_wh
+                FROM observed_slots WHERE topology_revision=? AND source_contract=?
+                AND valid=1 AND slot_start_utc_s>=? AND slot_end_utc_s<=?
+                ORDER BY observed_at_utc_s, observation_id""", (topology_revision,
+                    source_contract, now_s - 90 * 86400, now_s - MIN_EVALUATION_DELAY_S))
+            values = {row[0]: row[1] for row in rows}
+        days = {}
+        checked = 0
+        for start, raw in values.items():
+            energy = _finite_optional(raw, nonnegative=True)
+            if energy is None:
+                continue
+            checked += 1
+            # Slotmitte vermeidet eine einseitige Zuordnung zum Beginn/Ende.
+            if energy > 50 and _solar_elevation_utc(start + 450, latitude, longitude) < -1:
+                day = start // 86400
+                days[day] = days.get(day, 0) + 1
+        if not checked:
+            result["reason"] = "history_missing_or_invalid"
+            return result
+        suspicious_days = sum(count > 3 for count in days.values())
+        result.update(status="warning" if suspicious_days else "ok",
+            reason="repeated_yield_below_horizon" if suspicious_days else "ok",
+            checked_slots=checked, suspicious_slots=sum(days.values()), suspicious_days=suspicious_days,
+            max_suspicious_slots_per_day=max(days.values(), default=0))
+    except (OSError, sqlite3.Error, ValueError, TypeError, EvidenceLimitError):
+        pass
+    return result
+
+
+def sanitize_history_time_plausibility(value):
+    """Keine Standorte oder freien Texte in die öffentliche Projektion übernehmen."""
+    if not isinstance(value, dict) or value.get("schema_version") != "pv_history_time_plausibility_v1" or value.get("decision_use_allowed") is not False:
+        return None
+    reasons = {"ok", "repeated_yield_below_horizon", "location_missing_or_invalid",
+        "topology_revision_invalid", "history_unavailable", "history_missing_or_invalid"}
+    if value.get("reason") not in reasons or value.get("status") not in {"ok", "warning", "unavailable"}:
+        return None
+    result = {key: value[key] for key in ("schema_version", "status", "reason", "decision_use_allowed")}
+    for key in ("checked_slots", "suspicious_slots", "suspicious_days", "max_suspicious_slots_per_day"):
+        number = value.get(key)
+        result[key] = number if type(number) is int and number >= 0 else None
+    return result
 
 
 def current_quality_progress(summary, config, *, now_utc_s, database_path=EVIDENCE_DB_PATH):
@@ -2778,6 +2975,9 @@ def _sanitized_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "diagnostic_details": sanitize_details(payload.get("diagnostic_details")),
         "quality_progress": sanitize_quality_progress(payload.get("quality_progress"), topology_revision,
             issue_contract.get("method_revision")),
+        "history_time_plausibility": sanitize_history_time_plausibility(payload.get("history_time_plausibility")),
+        "history_time_plausibility_legacy": sanitize_history_time_plausibility(payload.get("history_time_plausibility_legacy")),
+        "history_backfill": sanitize_history_backfill(payload.get("history_backfill")),
         "metrics": sanitized_metrics,
         "labels": dict(DIAGNOSTIC_LABELS),
     }

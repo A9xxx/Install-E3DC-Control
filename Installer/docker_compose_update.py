@@ -660,7 +660,8 @@ class DockerCli:
 
     def compose(self, arguments: list[str], *, timeout: int = COMMAND_TIMEOUT_S,
                 capture: bool = True, compose_file: Path | None = None) -> subprocess.CompletedProcess[str]:
-        files = (*self.compose_files[:-1], compose_file or self.compose_file)
+        files = tuple((compose_file or self.compose_file) if path == self.compose_file else path
+                      for path in self.compose_files)
         options = ["compose", "--project-directory", str(self.compose_dir)]
         if self.project_name:
             options.extend(["--project-name", self.project_name])
@@ -879,15 +880,105 @@ def _require_same_snapshot(
         raise DockerUpdateError(f"{name} driftete während der Compose-Migration.")
 
 
+def _compose_secret_key(key: str) -> bool:
+    # Der Host-Helfer wird auch einzeln heruntergeladen. Dieselben Schlüssel wie
+    # is_secret_config_key, ohne eine weitere lokale Installer-Datei vorauszusetzen.
+    key = str(key).strip().lower()
+    return (key in {"rscp_pw", "rscp_password", "telegram_chat_id", "web_pin",
+                    "bluelink_user", "bluelink_pin", "pass"}
+            or key.endswith(("_pass", "_key", "_pin"))
+            or any(part in key for part in ("password", "passwd", "passwort", "token",
+                                           "secret", "api_key", "apikey", "aes", "private")))
+
+
+def _compose_secret_values(value: Any) -> set[str]:
+    result = set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if _compose_secret_key(key) and isinstance(item, (str, int, float)) and str(item):
+                result.add(str(item))
+            result.update(_compose_secret_values(item))
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, str) and "=" in item:
+                key, content = item.split("=", 1)
+                if _compose_secret_key(key) and content:
+                    result.add(content)
+            result.update(_compose_secret_values(item))
+    return result
+
+
+def _compose_diagnostic(cli: DockerCli, diagnostic: Any) -> str:
+    text = diagnostic.decode("utf-8", errors="replace") if isinstance(diagnostic, bytes) else str(diagnostic or "")
+    values = set(getattr(cli, "_compose_secrets", set()))
+    # Auch beim ersten fehlgeschlagenen config-Aufruf sind .env-Werte bekannt.
+    directory = getattr(cli, "compose_dir", None)
+    if directory is not None:
+        try:
+            snapshot = _snapshot_compose_path(Path(directory) / ".env", required=False, limit=MAX_ENV_BYTES)
+            env_text = (snapshot or {}).get("data", b"").decode("utf-8", errors="replace")
+            for line in env_text.splitlines():
+                match = re.match(r"^\s*(?:export\s+)?([\w]+)\s*=\s*(.*)$", line)
+                if match and _compose_secret_key(match[1]):
+                    raw = match[2].strip()
+                    values.add(raw)
+                    if raw.startswith(("'", '\"')):
+                        values.add(raw[1:].split(raw[0], 1)[0])
+                    else:
+                        values.add(re.split(r"\s+#", raw, maxsplit=1)[0].strip())
+        except (OSError, DockerUpdateError):
+            # Unlesbare Werte nicht raten; Schlüsselpositionen bleiben maskiert.
+            pass
+    # Compose zerlegt etwa Hostports an Doppelpunkten und gibt nur Teilstücke aus.
+    values.update(part for value in tuple(values) for part in re.split(r"[:/=,]", value)
+                  if len(part) >= 4)
+    # Werte auch mitten in Fehlermeldungen und JSON-escaped ersetzen.
+    variants = {variant for value in values if value
+                for variant in (value, json.dumps(value, ensure_ascii=False)[1:-1],
+                                json.dumps(value)[1:-1]) if variant}
+    if variants:
+        text = re.sub("|".join(re.escape(v) for v in sorted(variants, key=len, reverse=True)), "[MASKIERT]", text)
+    # Noch nicht projizierte Geheimnisse anhand ihrer Zuweisungsposition schützen.
+    assignment = r'''(?P<key>[A-Za-z_][A-Za-z0-9_]*)(?P<sep>["']?\s*[:=]\s*)(?P<value>"[^"\n]*"|'[^'\n]*'|[^\s,;]+)'''
+    text = re.sub(assignment, lambda m: m["key"] + m["sep"] + "[MASKIERT]"
+                  if _compose_secret_key(m["key"]) else m[0], text)
+    # Mapping-Diagnosen nennen den Schlüssel getrennt vom fehlerhaften Wert.
+    lines = text.splitlines()
+    secret_value_pending = False
+    for index, line in enumerate(lines):
+        position = re.search(r"environment\.([A-Za-z_][A-Za-z0-9_]*)\.?", line)
+        if position:
+            secret_value_pending = _compose_secret_key(position[1])
+        elif secret_value_pending and line.strip():
+            if line.strip() == "You may need to escape any $ with another $.":
+                continue
+            lines[index] = "[MASKIERT]"
+            secret_value_pending = False
+    text = "\n".join(lines)
+    # Zugangsdaten sind auch unter beliebigen, nicht geheimen Schlüsseln geheim.
+    text = re.sub(r"([A-Za-z][A-Za-z0-9+.-]*://)[^\s]*@", r"\1[MASKIERT]@", text)
+    return text.strip() or "Docker Compose lieferte keine Fehlerbeschreibung."
+
+
 def _compose_projection(cli: DockerCli, compose_file: Path) -> dict[str, Any]:
-    output = _require_success(cli.compose(["--profile", "*", "config", "--format", "json"], compose_file=compose_file),
-                              "Semantische Compose-Projektion")
+    try:
+        result = cli.compose(["--profile", "*", "config", "--format", "json"], compose_file=compose_file)
+    except (DockerUpdateError, subprocess.SubprocessError, OSError) as exc:
+        detail = _compose_diagnostic(cli, getattr(exc, "stderr", None) or str(exc))
+        raise DockerUpdateError("Compose-Konfiguration nicht prüfbar: " + detail
+                                + " Nächster Schritt: Compose-Einrichtung anhand der Docker-Dokumentation prüfen.") from None
+    if result.returncode != 0:
+        detail = _compose_diagnostic(cli, result.stderr or result.stdout)
+        raise DockerUpdateError("Compose-Konfiguration ungültig: " + detail
+                                + " Nächster Schritt: Compose-Einrichtung anhand der Docker-Dokumentation prüfen.")
+    output = result.stdout
     try:
         value = json.loads(output)
     except (TypeError, ValueError) as exc:
         raise DockerUpdateError("Compose-Projektion ist kein gültiges JSON.") from exc
     if not isinstance(value, dict) or not isinstance(value.get("services"), dict) or not value.get("name"):
         raise DockerUpdateError("Compose muss einen benannten Projektstand mit Diensten projizieren.")
+    cli._compose_secrets = set(getattr(cli, "_compose_secrets", set())) | _compose_secret_values(value)
     return value
 
 
@@ -1413,6 +1504,7 @@ def _validate_e3dc_container_binding(
     *,
     require_role: bool,
     expected_container_id: str | None = None,
+    expected_security_opt: list[str] | None = None,
 ) -> None:
     ids = _target_container_ids(cli)
     if expected_container_id is not None and ids != (expected_container_id,):
@@ -1422,6 +1514,7 @@ def _validate_e3dc_container_binding(
     if not ids:
         return
     info = _inspect_container(cli, ids[0])
+    _require_security_opt(info, expected_security_opt)
     labels = ((info.get("Config") or {}).get("Labels") or {})
     config_files = [
         os.path.realpath(part.strip())
@@ -2400,7 +2493,8 @@ def _custom_compose_candidate(data: bytes, projection: dict[str, Any], service_n
             _start, end = _service_span(lines, service_name); lines[end:end] = ["    volumes:", *entries]
         if not any(_active_yaml_lines(line) == ("volumes:",) for line in lines): lines.append("volumes:")
         for name, _target in additions: _ensure_top_volume(lines, name)
-    return ("\n".join(lines) + "\n").encode("utf-8")
+    newline = "\r\n" if b"\r\n" in data else "\n"
+    return (newline.join(lines) + newline).encode("utf-8")
 
 
 def _validate_custom_delta(before: dict[str, Any], after: dict[str, Any], service_name: str, *, hostname: str = "") -> None:
@@ -2452,7 +2546,246 @@ def _required_target_hostname(cli: DockerCli, projection: dict[str, Any]) -> str
     return re.sub(r"[^A-Za-z0-9.-]", "-", cli.project_name + "-" + cli.service_name)[:63].strip("-.")
 
 
-def _prepare_compose_contract(cli: DockerCli) -> dict[str, Any]:
+WATCHTOWER_API_KEYS = ("E3DC_WATCHTOWER_API_URL", "E3DC_WATCHTOWER_API_TOKEN")
+
+
+def _watchtower_notice(reason: str, step: str = "URL und Tokenreferenz anhand der tatsächlich verwendeten Topologie prüfen.") -> None:
+    print("Hinweis: Watchtower-Umgebung nicht ergänzt: " + reason
+          + " Nächster Schritt: " + step
+          + " Siehe doc/Docker_Dokumentation.md, Abschnitt ‚Watchtower-Umgebung in eigenen Compose-Dateien‘.", flush=True)
+
+
+def _watchtower_source(data: bytes, service_name: str) -> dict[str, Any] | None:
+    """Lokalisiert einfache Block-YAML, ohne fremde Bytes neu zu formatieren."""
+    lines = data.decode("utf-8").splitlines(keepends=True)
+    active = []
+    for index, raw in enumerate(lines):
+        visible = _active_yaml_lines(raw)
+        if not visible:
+            continue
+        line = visible[0]
+        active.append((index, len(line) - len(line.lstrip()), line.strip()))
+    def invalid(line):
+        return ValueError(f"YAML-Schreibweise bei Dienst {service_name}, Zeile {line + 1}")
+    def key(value):
+        match = re.fullmatch(r'''(?:([\w.-]+)|"([\w.-]+)"|'([\w.-]+)')\s*:\s*(.*)''', value)
+        return (next(x for x in match.groups()[:3] if x is not None), match[4]) if match else (None, None)
+    tops = [i for i, (_, indent, text) in enumerate(active) if indent == 0 and key(text)[0] == "services"]
+    if len(tops) != 1:
+        return None
+    start = tops[0]
+    scope = []
+    for row in active[start + 1:]:
+        if row[1] == 0:
+            break
+        scope.append(row)
+    if not scope:
+        return None
+    service_indent = min(row[1] for row in scope)
+    matches = [i for i, row in enumerate(scope) if row[1] == service_indent and key(row[2])[0] == service_name]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise invalid(scope[matches[0]][0])
+    pos = matches[0]; head = scope[pos]
+    if key(head[2])[1]:
+        raise invalid(head[0])
+    end = len(lines)
+    for row in active:
+        if row[0] > head[0] and row[1] <= service_indent:
+            end = row[0]; break
+    children = [row for row in scope[pos + 1:] if row[0] < end]
+    # Fremde Dienste und unbenutzte Anker außerhalb dieses Dienstes sind erlaubt.
+    for index, _, text in children:
+        if re.search(r"(^|\s)[&*!]|<<\s*:|^\s*[\[{]", text):
+            raise invalid(index)
+    field_indent = min((row[1] for row in children), default=service_indent + 2)
+    fields = [row for row in children if row[1] == field_indent and key(row[2])[0] is not None]
+    envs = [row for row in fields if key(row[2])[0] == "environment"]
+    if len(envs) > 1:
+        raise invalid(envs[0][0])
+    keys = set(); empty = set(); optional = set(); style = "mapping"; insertion = end; entry_indent = field_indent + 2
+    if envs:
+        env = envs[0]
+        if key(env[2])[1] not in ("", "{}", "[]"):
+            raise invalid(env[0])
+        style = "list" if key(env[2])[1] == "[]" else "mapping"
+        insertion = next((row[0] for row in fields if row[0] > env[0]), end)
+        entries = [row for row in children if env[0] < row[0] < insertion]
+        if entries:
+            entry_indent = entries[0][1]
+            style = "list" if entries[0][2].startswith("- ") else "mapping"
+        for index, indent, text in entries:
+            if indent != entry_indent:
+                raise invalid(index)
+            if style == "list":
+                if not text.startswith("- "):
+                    raise invalid(index)
+                item = text[2:].strip()
+                if item[:1] in ("'", '"') and item[-1:] == item[:1]:
+                    item = item[1:-1]
+                name, sep, value = item.partition("=")
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                    raise invalid(index)
+            else:
+                name, value = key(text)
+                if name is None:
+                    raise invalid(index)
+            keys.add(name)
+            if value.strip("\"'") == "${E3DC_WATCHTOWER_API_TOKEN:-}":
+                optional.add(name)
+            if value in ("", "''", '""', "null", "~"):
+                empty.add(name)
+    return dict(lines=lines, end=end, field_indent=field_indent, env=envs[0] if envs else None,
+                insertion=insertion, entry_indent=entry_indent, style=style, keys=keys, empty=empty, optional=optional,
+                image=any(key(row[2])[0] == "image" for row in fields))
+
+
+def _known_watchtower_image(image: Any) -> bool:
+    image = str(image or "").split("@", 1)[0]
+    repo = image.rsplit(":", 1)[0] if ":" in image.rsplit("/", 1)[-1] else image
+    return repo in KNOWN_WATCHTOWER_REPOSITORIES
+
+
+def _watchtower_environment_plan(inputs: dict[str, Any], projection: dict[str, Any],
+                                service_name: str, env_snapshot: dict[str, Any] | None, *, reference: bool = True) -> tuple[str, dict[str, str]]:
+    """Ergänzt nur eindeutig fehlende Schlüssel einer lokalen Vorlagentopologie."""
+    services = projection.get("services") or {}
+    service = services[service_name]
+    environment = service.get("environment") or {}
+    if not any(name != service_name and _known_watchtower_image(item.get("image"))
+               for name, item in services.items()):
+        return "", {}
+    try:
+        sources = {path: parsed for path, snap in inputs.items()
+                   if (parsed := _watchtower_source(snap["data"], service_name)) is not None}
+    except UnicodeError:
+        _watchtower_notice(f"Die Compose-Datei für Dienst {service_name} ist nicht als UTF-8 lesbar.",
+                          "Die Kodierung der Compose-Datei prüfen; die übrige Vorbereitung läuft weiter.")
+        return "", {}
+    except ValueError as exc:
+        _watchtower_notice(str(exc), "Die genannte Dienstdefinition in eindeutige YAML-Blockform bringen.")
+        return "", {}
+    present = set(environment)
+    empty = {key for key in WATCHTOWER_API_KEYS if key in environment and not environment[key]}
+    optional = set().union(*(source["optional"] for source in sources.values()))
+    empty.difference_update(optional)
+    for source in sources.values():
+        present.update(source["keys"]); empty.update(source["empty"] & set(WATCHTOWER_API_KEYS))
+    missing = [key for key in WATCHTOWER_API_KEYS if key not in present]
+    if empty:
+        _watchtower_notice("Ein vorhandener leerer Eintrag bleibt unverändert.", "Den leeren URL- oder Tokeneintrag bewusst ausfüllen oder entfernen.")
+        return "", {}
+    if not missing:
+        return "", {}
+    candidates = []
+    for name, watch in services.items():
+        image = str(watch.get("image") or "").split("@", 1)[0]
+        repo = image.rsplit(":", 1)[0] if ":" in image.rsplit("/", 1)[-1] else image
+        env = watch.get("environment") or {}
+        if name == service_name or repo not in KNOWN_WATCHTOWER_REPOSITORIES:
+            continue
+        if "update" not in str(env.get("WATCHTOWER_HTTP_API_ENDPOINTS") or "").split(","):
+            continue
+        # Eigene Kommandozeilen können API-Port oder Bindadresse überschreiben.
+        if watch.get("command") or watch.get("entrypoint"):
+            continue
+        port = str(env.get("WATCHTOWER_HTTP_API_PORT") or "")
+        if not port.isdecimal() or not 1 <= int(port) <= 65535:
+            continue
+        host = str(env.get("WATCHTOWER_HTTP_API_HOST") or "0.0.0.0")
+        if service.get("network_mode") == watch.get("network_mode") == "host" and host == "127.0.0.1":
+            url = "http://127.0.0.1:${E3DC_WATCHTOWER_API_PORT:-18080}" if reference else "http://127.0.0.1:" + port
+        elif (not service.get("network_mode") and not watch.get("network_mode")
+              and set(service.get("networks") or {}) & set(watch.get("networks") or {})
+              and host == "0.0.0.0" and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name)):
+            url = "http://" + name + ":" + port
+        else:
+            continue
+        candidates.append((url, env.get("WATCHTOWER_HTTP_API_TOKEN")))
+    if len(candidates) != 1:
+        _watchtower_notice("Kein eindeutig erreichbarer Watchtower-Dienst mit aktiver HTTP-API und gültigem Port nach Vorlage im Projekt.")
+        return "", {}
+    # Die lokale .env muss einen eigenen nicht leeren Wert enthalten. Komplexe
+    # Interpolation wird nicht geraten; die spätere Compose-Projektion prüft sie.
+    token_lines = re.findall(rb"(?m)^\s*(?:export\s+)?E3DC_WATCHTOWER_API_TOKEN\s*=\s*([^\r\n]*)", (env_snapshot or {}).get("data", b""))
+    token = token_lines[0].strip() if len(token_lines) == 1 else b""
+    if token.startswith((b"'", b'"')):
+        quote = token[:1]; closing = token.find(quote, 1)
+        tail = token[closing + 1:].strip() if closing > 0 else b"invalid"
+        token = token[1:closing] if closing > 0 and (not tail or tail.startswith(b"#")) else b""
+    else:
+        token = re.split(rb"\s+#", token, maxsplit=1)[0].strip()
+    token_text = token.decode("utf-8")
+    if not token or token.startswith(b"#") or b"$" in token or token_text != candidates[0][1]:
+        _watchtower_notice("In .env fehlt ein eindeutig nicht leeres API-Token oder die API übernimmt es nicht.", "Token in .env und Übernahme durch Watchtower prüfen; siehe ‚Watchtower einmalig freischalten‘.")
+        return "", {}
+    owners = [path for path, source in sources.items() if source["image"]]
+    if not owners and len(sources) == 1:
+        owners = list(sources)
+    if len(owners) != 1:
+        _watchtower_notice("Mehrere Dateien definieren den E3DC-Dienst; die Zieldatei ist mehrdeutig.", "Die E3DC-Definitionen der ausgewählten Compose-Dateien eindeutig zuordnen.")
+        return "", {}
+    values = {WATCHTOWER_API_KEYS[0]: candidates[0][0], WATCHTOWER_API_KEYS[1]: "${E3DC_WATCHTOWER_API_TOKEN}"}
+    return owners[0], {key: values[key] for key in missing}
+
+
+def _with_watchtower_environment(data: bytes, service_name: str, additions: dict[str, str]) -> bytes:
+    if not additions:
+        return data
+    source = _watchtower_source(data, service_name)
+    if source is None:
+        raise DockerUpdateError("Der E3DC-Dienst fehlt in der gebundenen Compose-Datei.")
+    lines = source["lines"]
+    newline = "\r\n" if any(line.endswith("\r\n") for line in lines) else "\n"
+    env = source["env"]
+    if env and env[2].endswith(("{}", "[]")):
+        # Nur die leere Klammer entfernen; Kommentar und Zeilenende bleiben erhalten.
+        lines[env[0]] = re.sub(r"(?<=:)\s*(?:\{\}|\[\])", "", lines[env[0]], count=1)
+    inserted = []
+    if not env:
+        inserted.append(" " * source["field_indent"] + "environment:" + newline)
+    for key, value in additions.items():
+        if key in source["keys"]:
+            continue
+        entry = "- " + key + "=" + value if source["style"] == "list" else key + ": " + value
+        inserted.append(" " * source["entry_indent"] + entry + newline)
+    position = source["insertion"]
+    if position and not lines[position - 1].endswith(("\n", "\r")):
+        lines[position - 1] += newline
+    lines[position:position] = inserted
+    return "".join(lines).encode("utf-8")
+
+
+def _validate_watchtower_delta(before: dict[str, Any], after: dict[str, Any], service_name: str,
+                               additions: dict[str, str]) -> dict[str, Any]:
+    """Prüft aufgelöste Werte, entfernt nur die erlaubte Ergänzung für den Altprüfer."""
+    cleaned = json.loads(json.dumps(after))
+    env = cleaned["services"][service_name].get("environment") or {}
+    for key, value in additions.items():
+        if key in (before["services"][service_name].get("environment") or {}):
+            raise DockerUpdateError("Ein vorhandener Watchtower-Eintrag darf nicht ersetzt werden.")
+        if key == WATCHTOWER_API_KEYS[1]:
+            tokens = [(item.get("environment") or {}).get("WATCHTOWER_HTTP_API_TOKEN")
+                      for item in after["services"].values()]
+            if not env.get(key) or env[key] not in tokens:
+                raise DockerUpdateError("Die Watchtower-Tokenreferenz ist nicht konsistent aufgelöst.")
+        else:
+            if value == "http://127.0.0.1:${E3DC_WATCHTOWER_API_PORT:-18080}":
+                urls = ["http://127.0.0.1:" + str((item.get("environment") or {}).get("WATCHTOWER_HTTP_API_PORT") or "")
+                        for item in before["services"].values() if _known_watchtower_image(item.get("image"))]
+                valid = env.get(key) in urls
+            else:
+                valid = env.get(key) == value
+            if not valid:
+                raise DockerUpdateError("Die Watchtower-URL ist nicht konsistent aufgelöst.")
+        env.pop(key)
+    if not env:
+        cleaned["services"][service_name].pop("environment", None)
+    return cleaned
+
+
+def _prepare_compose_contract(cli: DockerCli, *, include_watchtower: bool = True) -> dict[str, Any]:
     _validate_directory_chain(cli.compose_dir)
     # -f ist ausdrücklich gebunden; alternative Dateinamen und vorhandene Overrides
     # sind keine Gefahr. Nur tatsächlich ausgewählte Dateien werden verwendet.
@@ -2465,8 +2798,43 @@ def _prepare_compose_contract(cli: DockerCli) -> dict[str, Any]:
     _stop_update_watchtower(cli, before)
     _validate_e3dc_container_binding(cli, before, require_role=_projection_has_role(before, service_name))
     source = inputs[str(cli.compose_file)]
+    original_compose_file = cli.compose_file
+    watchtower_path, watchtower_additions = "", {}
+    if include_watchtower:
+        try:
+            watchtower_path, watchtower_additions = _watchtower_environment_plan(inputs, before, service_name, env_snapshot)
+        except UnicodeError:
+            _watchtower_notice("Die .env-Datei enthält ein API-Token ohne gültige UTF-8-Kodierung; Watchtower-Ergänzung ausgelassen.",
+                              "Die UTF-8-Kodierung der .env-Datei prüfen.")
+        except Exception:
+            _watchtower_notice("Die optionale Planung ist fehlgeschlagen; die übrige Vorbereitung läuft weiter.")
+    if watchtower_path:
+        cli.compose_file = Path(watchtower_path)
+    source = inputs[str(cli.compose_file)]
     hostname = _required_target_hostname(cli, before)
-    candidate_data = _custom_compose_candidate(source["data"], before, service_name, getattr(cli, "requested_image", ""), hostname=hostname)
+    try:
+        candidate_data = _custom_compose_candidate(source["data"], before, service_name, getattr(cli, "requested_image", ""), hostname=hostname)
+    except Exception:
+        if not watchtower_additions or cli.compose_file == original_compose_file:
+            raise
+        # Die optionale Dateiwahl darf die Pflichtvorbereitung nicht verhindern.
+        # Vor dem neuen Lauf müssen sämtliche gebundenen Eingaben gleich sein.
+        for path, snapshot in inputs.items():
+            _require_compose_path(Path(path), snapshot, limit=MAX_COMPOSE_BYTES)
+        _require_compose_path(env_path, env_snapshot, limit=MAX_ENV_BYTES)
+        _watchtower_notice("Die für Watchtower gewählte Definitionsdatei kann nicht um die Pflichtfelder ergänzt werden.",
+                          "Die YAML-Schreibweise dieser Datei prüfen; die Pflichtvorbereitung läuft auf der ursprünglich gewählten Datei weiter.")
+        cli.compose_file = original_compose_file
+        return _prepare_compose_contract(cli, include_watchtower=False)
+    required_data = candidate_data
+    try:
+        if watchtower_additions:
+            candidate_data = _with_watchtower_environment(candidate_data, service_name, watchtower_additions)
+    except Exception:
+        _watchtower_notice("Die Umgebung des E3DC-Dienstes kann nicht eindeutig als YAML ergänzt werden; Watchtower-Ergänzung ausgelassen.",
+                          "Die YAML-Schreibweise des E3DC-Dienstes prüfen; die übrige Vorbereitung läuft weiter.")
+        cli.compose_file = original_compose_file
+        return _prepare_compose_contract(cli, include_watchtower=False)
     contract = {"state": "current", "topology": "custom_compose", "compose": source,
                 "preimage": source, "inputs": inputs, "env": env_snapshot,
                 "projection": before, "pre_projection": before}
@@ -2479,11 +2847,29 @@ def _prepare_compose_contract(cli: DockerCli) -> dict[str, Any]:
     try:
         candidate_name, candidate_path = _write_candidate(fd, cli.compose_file.parent, candidate_data, source)
         projected = _compose_projection(cli, candidate_path)
-        _validate_custom_delta(before, projected, service_name, hostname=hostname)
+        url_key = WATCHTOWER_API_KEYS[0]
+        if watchtower_additions.get(url_key) == "http://127.0.0.1:${E3DC_WATCHTOWER_API_PORT:-18080}":
+            _, literal_additions = _watchtower_environment_plan(inputs, before, service_name, env_snapshot, reference=False)
+            actual_url = (projected["services"][service_name].get("environment") or {}).get(url_key)
+            if actual_url != literal_additions.get(url_key):
+                watchtower_additions = literal_additions
+                candidate_data = _with_watchtower_environment(required_data, service_name, watchtower_additions)
+                os.unlink(candidate_name, dir_fd=fd)
+                candidate_name = ""
+                candidate_name, candidate_path = _write_candidate(fd, cli.compose_file.parent, candidate_data, source)
+                projected = _compose_projection(cli, candidate_path)
+        delta_projection = _validate_watchtower_delta(before, projected, service_name, watchtower_additions)
+        _validate_custom_delta(before, delta_projection, service_name, hostname=hostname)
         for path, snapshot in inputs.items(): _require_compose_path(Path(path), snapshot, limit=MAX_COMPOSE_BYTES)
         _require_compose_path(env_path, env_snapshot, limit=MAX_ENV_BYTES)
         if _compose_projection(cli, cli.compose_file) != before:
             raise DockerUpdateError("Die Compose-Projektion wurde während der Vorbereitung geändert.")
+        if watchtower_additions:
+            backup_name, _ = _write_candidate(fd, cli.compose_file.parent, source["data"], source)
+            backup_path = cli.compose_file.with_name(cli.compose_file.name + ".e3dc-backup-" + secrets.token_hex(8))
+            os.rename(backup_name, backup_path.name, src_dir_fd=fd, dst_dir_fd=fd)
+            os.fsync(fd)
+            print(f"✓ Compose-Sicherung: {backup_path}", flush=True)
         replaced = _replace_candidate(fd, candidate_name, candidate_data, source)
         candidate_name = ""
         try:
@@ -2491,10 +2877,27 @@ def _prepare_compose_contract(cli: DockerCli) -> dict[str, Any]:
                 raise DockerUpdateError("Der gespeicherte Compose-Stand entspricht nicht dem geprüften Kandidaten.")
         except BaseException:
             _restore_compose_preimage(fd, cli.compose_file.parent, source, expected_current_data=candidate_data)
+            restored = _snapshot_compose_path(cli.compose_file, required=True, limit=MAX_COMPOSE_BYTES)
+            if restored["data"] != source["data"] or restored["stat"][2:5] != source["stat"][2:5]:
+                raise DockerUpdateError("Die Compose-Rücksetzung konnte nicht bestätigt werden.")
+            inputs[str(cli.compose_file)] = restored
             raise
         contract.update(state="migrated", compose=replaced, projection=projected)
         print(f"✓ Nur erforderliche Felder von {cli.project_name}/{service_name} ergänzt; Datenpfade und Zusatzdienste erhalten.", flush=True)
         return contract
+    except Exception as exc:
+        if not watchtower_additions:
+            raise
+        # Nur nach bestätigter Rücksetzung erneut vorbereiten. Drift und ein
+        # fehlgeschlagener Restore bleiben echte Fehler der Update-Sicherheit.
+        for path, snapshot in inputs.items():
+            _require_compose_path(Path(path), snapshot, limit=MAX_COMPOSE_BYTES)
+        _require_compose_path(env_path, env_snapshot, limit=MAX_ENV_BYTES)
+        _watchtower_notice("Die optionale Compose-Prüfung ist fehlgeschlagen; Ausgangsstand bestätigt. "
+                          + _compose_diagnostic(cli, str(exc)).split(" Nächster Schritt:", 1)[0],
+                          "Watchtower-Konfiguration prüfen; die übrige Vorbereitung läuft ohne diese Ergänzung weiter.")
+        cli.compose_file = original_compose_file
+        return _prepare_compose_contract(cli, include_watchtower=False)
     finally:
         if candidate_name:
             try: os.unlink(candidate_name, dir_fd=fd)
@@ -2646,6 +3049,30 @@ def _previous_image_reference(cli: DockerCli, container: dict[str, Any]) -> str:
     return sorted(set(candidates), key=lambda tag: (tag.endswith(":latest"), tag))[0]
 
 
+def _saved_security_opt(value: Any, projection: dict[str, Any] | None = None,
+                        service: str = SERVICE_NAME) -> list[str] | None:
+    """Nur eine vollständige Liste aus Docker inspect als Sicherung verwenden."""
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item.strip() or "\x00" in item
+        or "\n" in item or "\r" in item for item in value
+    ):
+        return None
+    for item in value:
+        key, separator, setting = item.replace(":", "=", 1).partition("=")
+        if key == "seccomp" and separator and setting not in ("unconfined", "builtin"):
+            return None
+    projected = (((projection or {}).get("services") or {}).get(service) or {}).get("security_opt") or []
+    if "systempaths=unconfined" in projected or "systempaths:unconfined" in projected:
+        return None
+    return list(value)
+
+
+def _require_security_opt(info: dict[str, Any], expected: Any) -> None:
+    saved = _saved_security_opt(expected)
+    if saved is not None and ((info.get("HostConfig") or {}).get("SecurityOpt") if (info.get("HostConfig") or {}).get("SecurityOpt") is not None else []) != saved:
+        raise DockerUpdateError("Die SecurityOpt des Containers widersprechen der gesicherten Rückfallbindung.")
+
+
 def _capture_previous_runtime(
     cli: DockerCli,
     projection: dict[str, Any],
@@ -2690,6 +3117,12 @@ def _capture_previous_runtime(
                 raise DockerUpdateError("Altimage und laufende Altversion widersprechen sich.")
             runtime_version_verified = True
     after = _e3dc_stop_authority(cli, container_id)
+    host_config = before.get("HostConfig") or {}
+    security_opt = _saved_security_opt(
+        [] if host_config.get("SecurityOpt") is None else host_config["SecurityOpt"],
+        projection, getattr(cli, "service_name", SERVICE_NAME),
+    ) if "SecurityOpt" in host_config else None
+    _require_security_opt(after, security_opt)
     identity_keys = lambda info: (
         str(info.get("Id") or ""),
         str(info.get("Image") or ""),
@@ -2724,6 +3157,7 @@ def _capture_previous_runtime(
         "hostname": str((before.get("Config") or {}).get("Hostname") or ""),
         "contract": contract,
         "runtime_version_verified": runtime_version_verified,
+        "security_opt": security_opt,
     }
 
 
@@ -3092,6 +3526,121 @@ def _reverse_private_runtime(
     print("✓ Private Volumes sind offline für den Root-Rückfall vorbereitet und geprüft.", flush=True)
 
 
+def _compose_with_security_opt(data: bytes, options: list[str], service: str) -> bytes:
+    # Laufzeitwerte sind bereits aufgelöst; Compose darf Dollarzeichen nicht erneut expandieren.
+    options = [option.replace("$", "$$") for option in options]
+    try:
+        document = json.loads(data)
+    except (UnicodeError, ValueError):
+        document = None
+    if isinstance(document, dict):
+        target = (document.get("services") or {}).get(service)
+        if target is None:
+            return data
+        target["security_opt"] = options
+        return (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    lines = _yaml_lines_for_semantic_migration(data)
+    try:
+        _start, end = _service_span(lines, service)
+    except DockerUpdateError:
+        return data
+    span = _service_field_span(lines, service, "security_opt")
+    if span:
+        field = lines[span[0]].split(":", 1)[1].strip()
+        if field and not field.startswith("#"):
+            # Nur vollständige JSON-Flusslisten sind im Zeileneditor eindeutig.
+            try:
+                inline = json.loads(field)
+            except ValueError as exc:
+                raise DockerUpdateError("security_opt verwendet eine Flussliste oder einen Anker, die nicht sicher bearbeitbar sind.") from exc
+            if not isinstance(inline, list):
+                raise DockerUpdateError("security_opt ist keine sicher bearbeitbare Liste.")
+        for line in lines[span[0] + 1:span[1]]:
+            active = _active_yaml_lines(line)
+            if active and not re.fullmatch(r"      - [^&*!]+", active[0]):
+                raise DockerUpdateError("security_opt verwendet keine sicher bearbeitbare Blockliste.")
+    if any(re.search(r"(?:^|\s)(?:<<:|[&*][A-Za-z0-9_])", line) for line in lines):
+        raise DockerUpdateError("Compose-Anker sind nicht sicher bearbeitbar.")
+    # Die Ergänzung erfolgt ausschließlich in der letzten ausgewählten Datei.
+    rendered = ["    security_opt: " + json.dumps(options, ensure_ascii=False)]
+    if span:
+        lines[span[0]:span[1]] = rendered
+    else:
+        lines[end:end] = rendered
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _rollback_security_opt(cli: DockerCli, pinned_data: bytes, previous: dict[str, Any],
+                           compose_contract: dict[str, Any]) -> tuple[bytes, list[str] | None, str]:
+    service = getattr(cli, "service_name", SERVICE_NAME)
+    projection = compose_contract.get("pre_projection") or compose_contract.get("projection") or {}
+    options = _saved_security_opt(previous.get("security_opt"), projection, service)
+    if options is None:
+        print("Hinweis: SecurityOpt-Sicherung fehlt, ist ungültig oder nicht wiederherstellbar; bisheriger Rückfallweg.", file=sys.stderr)
+        return pinned_data, None, ""
+    projected = ((projection.get("services") or {}).get(service) or {}).get("security_opt")
+    if options == ([] if projected is None else projected):
+        return pinned_data, options, ""
+    try:
+        for path in getattr(cli, "compose_files", (cli.compose_file,)):
+            if path == cli.compose_file:
+                continue
+            data = compose_contract["inputs"][str(path)]["data"]
+            # Zuerst nur nach dem Dienstnamen suchen; fremde Dienste nicht mit dem
+            # strengen Zeileneditor prüfen (etwa Kommentare mit Tabulatoren).
+            try:
+                text = data.decode("utf-8")
+            except UnicodeError as exc:
+                raise DockerUpdateError("Ein früherer Compose-Eingang ist nicht sicher lesbar.") from exc
+            if not re.search(r"(?:^|[\s{,])[\"']?" + re.escape(service) + r"[\"']?\s*:", text, re.M):
+                if not re.search(r"(?:^|\s)(?:<<:|[&*][A-Za-z0-9_])", text):
+                    continue
+                raise DockerUpdateError("Ein früherer Compose-Eingang verwendet Anker.")
+            # Konservativ über die ganze Datei prüfen: Einrückung, Quotierung und
+            # geerbte Listen dürfen keine zweite SecurityOpt-Liste entstehen lassen.
+            if re.search(r"[\"']?(?:security_opt|extends|<<)[\"']?\s*:", text) or re.search(r"[&*][A-Za-z0-9_]", text):
+                raise DockerUpdateError("Eine frühere Compose-Datei definiert security_opt oder verwendet Vererbung/Anker.")
+            try:
+                document = json.loads(data)
+            except ValueError:
+                document = None
+            if not isinstance(document, dict):
+                _yaml_lines_for_semantic_migration(data)
+        if re.search(rb"[\"']?(?:extends|<<)[\"']?\s*:", pinned_data):
+            raise DockerUpdateError("Die letzte Compose-Datei verwendet Vererbung.")
+        replacement = _compose_with_security_opt(pinned_data, options, service)
+        if replacement == pinned_data:
+            raise DockerUpdateError("Die SecurityOpt-Anpassung hat die Compose-Datei nicht verändert.")
+    except DockerUpdateError as exc:
+        print(f"Hinweis: {exc} Bisheriger Rückfallweg ohne SecurityOpt-Anpassung.", file=sys.stderr)
+        return pinned_data, None, ""
+    note = (" Hinweis: Die Compose-Datei ist zurückgesetzt; Datei und Container weichen in security_opt ab. "
+            "Ein späteres manuelles docker compose up -d übernimmt die Werte der Datei.")
+    nnp_enabled = {"no-new-privileges", "no-new-privileges:true", "no-new-privileges=true"}
+    if any(option in nnp_enabled for option in options) and not any(option in nnp_enabled for option in (projected or [])):
+        note += " Das kann auf alten Kerneln ohne no-new-privileges-Anpassung der Compose-Datei erneut scheitern."
+    return replacement, options, note
+
+
+def _restore_rollback_compose(cli: DockerCli, pinned: dict[str, Any], restored: dict[str, Any]) -> None:
+    try:
+        _replace_active_compose_data(cli, expected_data=pinned["data"],
+                                     replacement_data=restored["data"], metadata_source=restored)
+    except BaseException as exc:
+        unchanged = False
+        try:
+            unchanged = cli.compose_file.read_bytes() == restored["data"]
+            state = "bereits zurückgesetzt" if unchanged else "weiterhin verändert (möglicherweise temporäre image-/hostname-/security_opt-Zeilen)"
+        except OSError:
+            state = "nicht als zurückgesetzt bestätigt (Datei nicht lesbar)"
+        next_step = ("den Containerzustand prüfen." if unchanged else
+                     "diese Datei anhand der eigenen Compose-Sicherung prüfen und wiederherstellen.")
+        raise CandidateStopError(
+            f"Compose-Datei {cli.compose_file}: Rücksetzung fehlgeschlagen; Zustand: {state}. "
+            f"Das Original war nur im Arbeitsspeicher gesichert. Nächster Schritt: {next_step}"
+        ) from exc
+
+
 def _rollback_previous_runtime(
     cli: DockerCli,
     compose_contract: dict[str, Any],
@@ -3131,6 +3680,7 @@ def _rollback_previous_runtime(
 
     old_image_id = str(old_contract.get("image_id") or "")
     pinned_data = _compose_with_image(restored["data"], old_image_id, getattr(cli, "service_name", SERVICE_NAME), hostname=str(previous.get("hostname") or ""))
+    pinned_data, security_opt, security_note = _rollback_security_opt(cli, pinned_data, previous, compose_contract)
     pinned = _replace_active_compose_data(
         cli,
         expected_data=restored["data"],
@@ -3161,27 +3711,31 @@ def _rollback_previous_runtime(
             )
             _require_success(up_result, "Start des gebundenen Altcontainers")
             verification = _verify_candidate(cli, pinned_contract)
+            if security_opt is not None:
+                _validate_e3dc_container_binding(
+                    cli, compose_contract.get("pre_projection") or {}, require_role=False,
+                    expected_security_opt=security_opt)
             _restore_old_image_reference(cli, old_contract)
         except BaseException as exc:
             start_error = exc
         finally:
-            try:
-                _replace_active_compose_data(
-                    cli,
-                    expected_data=pinned["data"],
-                    replacement_data=restored["data"],
-                    metadata_source=restored,
-                )
-            except BaseException as restore_exc:
-                raise CandidateStopError(
-                    "Der Altcontainer-Rückfall konnte die originale Compose-Datei nicht "
-                    f"wiederherstellen: {restore_exc}"
-                ) from restore_exc
+            _restore_rollback_compose(cli, pinned, restored)
         if start_error is not None:
             raise CandidateStopError(
                 f"Der gebundene Altcontainer konnte nicht wieder gestartet werden: {start_error}"
             ) from start_error
         second = _verify_candidate(cli, pinned_contract)
+        if security_opt is not None:
+            _validate_e3dc_container_binding(
+                cli, compose_contract.get("pre_projection") or {}, require_role=False,
+                expected_security_opt=security_opt)
+        return {
+            "restored": True,
+            "previous_running": True,
+            "version": old_contract.get("version") or "",
+            "verification": second or verification or {},
+            "security_opt_note": security_note,
+        }
     except BaseException as rollback_exc:
         try:
             _stop_candidate(
@@ -3197,12 +3751,6 @@ def _rollback_previous_runtime(
         raise CandidateStopError(
             f"{rollback_exc}; der fehlgeschlagene Rückfallcontainer ist bestätigt gestoppt."
         ) from rollback_exc
-    return {
-        "restored": True,
-        "previous_running": True,
-        "version": old_contract.get("version") or "",
-        "verification": second or verification or {},
-    }
 
 
 def _restore_prestart_state(
@@ -3238,7 +3786,9 @@ def _require_previous_runtime_unchanged(
         cli,
         projection,
         require_role=_projection_has_role(projection, getattr(cli, "service_name", SERVICE_NAME)),
+        expected_security_opt=_saved_security_opt(previous.get("security_opt")),
     )
+    _require_security_opt(info, previous.get("security_opt"))
     if (
         str(info.get("Image") or "")
         != str((previous.get("contract") or {}).get("image_id") or "")
@@ -3692,6 +4242,7 @@ def update_container(args: argparse.Namespace) -> dict[str, Any]:
             raise DockerUpdateError(
                 f"{exc}; [ROLLBACK_OK] die vorherige Compose-Datei und "
                 f"Altversion {version} laufen wieder verifiziert.{drift_note}"
+                f"{rollback.get('security_opt_note') or ''}"
             ) from exc
         try:
             if previous is None:

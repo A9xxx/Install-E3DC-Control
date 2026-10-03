@@ -13,7 +13,7 @@ from datetime import date
 
 SCHEMA = "heatpump_channel_checkpoint_v1"
 CHANNELS = ("hz", "ww")
-OWNERS = ("pv", "price", "predump", "manual")
+OWNERS = ("pv", "price", "predump", "manual", "tariff")
 STATES = ("frei", "vorbereitet", "gesendet", "eigen_aktiv",
           "ruecknahme_offen", "ruecknahme_gesendet", "fremd", "aufgegeben")
 RETRY_S = 60.0
@@ -49,7 +49,7 @@ def _channel():
         "clock_fault": False, "possible_effect": False,
         "transport_uncertain": False, "protection_latched": False,
         "generation": 0, "inflight": None, "diagnostic": None,
-        "stop_reason": None, "baseline_target_c": None,
+        "stop_reason": None, "baseline_target_c": None, "pre_boost_target_c": None,
         "start_attempts": 0, "start_attempt_ts": None, "alarm": False,
         "protection_counted": False,
     }
@@ -123,10 +123,16 @@ def validate_checkpoint(value):
         return {}
     if daily["blocked"] != any(count >= 2 for count in daily["counts"].values()):
         return {}
-    additions = {"baseline_target_c": None, "start_attempts": 0,
+    additions = {"baseline_target_c": None, "pre_boost_target_c": None, "start_attempts": 0,
                  "start_attempt_ts": None, "alarm": False, "protection_counted": False}
     for channel, state in value["channels"].items():
         if isinstance(state, dict):
+            # Frühere Dateien enthielten den flüchtigen Ferienanker. Nur einen
+            # gültigen Altwert verwerfen; nach Neustart beginnt die Entprellung neu.
+            holiday = state.pop("holiday_since_ts", None)
+            if holiday is not None and (not _number(holiday, minimum=0.000001)
+                                        or holiday > value["updated_ts"]):
+                return {}
             legacy = "baseline_target_c" not in state
             # Alte WW-Modus-0-Rücknahmen sind kein Beleg für den jetzt
             # verlangten Timer-Grundzustand; sie werden begrenzt neu geprüft.
@@ -166,6 +172,9 @@ def validate_checkpoint(value):
                 return {}
         if (state["baseline_target_c"] is not None and (
                 not _number(state["baseline_target_c"]) or state["baseline_target_c"] > 100)):
+            return {}
+        if (state["pre_boost_target_c"] is not None and (
+                not _number(state["pre_boost_target_c"]) or state["pre_boost_target_c"] > 100)):
             return {}
         if (type(state["start_attempts"]) is not int
                 or not 0 <= state["start_attempts"] <= MAX_ATTEMPTS):
@@ -249,6 +258,25 @@ def _clear_effect(state, diagnostic):
         state["next_attempt_ts"] = 0.0
 
 
+def suspend_ineffective_withdrawal(checkpoint, channel, *, now_s, holiday_since_ts=None):
+    """Beendet eine wirkungslose Rücknahme erst nach stabil beobachteten Ferien.
+
+    Bis zum Ablauf eines Retry-Abstands bleiben Budget und Frist unverändert.
+    Ferien unterdrücken IO sofort; ein einzelner Ferienimpuls beendet keinen
+    fehlgeschlagenen Auftrag. Quittungen bleiben auch beim Abschluss erhalten.
+    """
+    if channel not in CHANNELS:
+        raise ValueError("invalid_channel")
+    result = _copy(checkpoint, now_s)
+    state = result["channels"][channel]
+    if not state["possible_effect"] and state["state"] in (
+            "ruecknahme_offen", "ruecknahme_gesendet"):
+        if (not state["clock_fault"] and _number(holiday_since_ts, minimum=0.000001)
+                and now_s - holiday_since_ts >= RETRY_S):
+            _clear_effect(state, "wp_holiday_mode")
+    return result
+
+
 def _foreign(state, sample_ts, reason):
     state.update({"state": "fremd", "possible_effect": False, "inflight": None,
                   "foreign_ts": sample_ts, "diagnostic": reason})
@@ -330,7 +358,7 @@ def _abandon(state, now_s, reason):
 def advance(checkpoint, channel, *, now_s, observation=None, desired=None,
             stop_reason=None, stop_allowed=True, automatic_enabled=True,
             protection=False, user_hold_s=0, signal_hold_s=600, manual_owned=False,
-            baseline_target_c=None):
+            baseline_target_c=None, release_on_baseline_readback=False):
     """Verarbeitet einen Kanal und liefert höchstens eine ausführbare Aktion.
 
     ``baseline_target_c`` ist die konfigurierte WW-Timer-Untergrenze.
@@ -347,7 +375,7 @@ def advance(checkpoint, channel, *, now_s, observation=None, desired=None,
     if channel not in CHANNELS:
         raise ValueError("invalid_channel")
     if (any(type(value) is not bool for value in (
-            stop_allowed, automatic_enabled, protection, manual_owned))
+            stop_allowed, automatic_enabled, protection, manual_owned, release_on_baseline_readback))
             or not _number(user_hold_s) or not _number(signal_hold_s)
             or (baseline_target_c is not None and (not _number(baseline_target_c)
                                                    or baseline_target_c > 100))
@@ -356,6 +384,8 @@ def advance(checkpoint, channel, *, now_s, observation=None, desired=None,
         raise ValueError("invalid_policy_input")
     result = _copy(checkpoint, now_s)
     state = result["channels"][channel]
+    if state["diagnostic"] == "wp_holiday_mode":
+        state["diagnostic"] = None
     if baseline_target_c is not None:
         state["baseline_target_c"] = float(baseline_target_c)
     # Bei rückwärts laufender Uhr keine neue Freigabe und keinen Zeitbeleg
@@ -377,6 +407,12 @@ def advance(checkpoint, channel, *, now_s, observation=None, desired=None,
         return result, None
     wanted = (_identity(desired) and desired.get("valid") is True
               and desired.get("grant") is True)
+    # Ein bestätigter Tarifauftrag geht ohne neue Hardwarekante an PV über.
+    if (wanted and state["owner"] == "tariff" and desired["owner"] == "pv"
+            and state["state"] == "eigen_aktiv" and not protection and automatic_enabled
+            and state["withdraw_requested_ts"] is None and not stop_reason
+            and state["target_c"] == desired["target_c"]):
+        state.update({key: desired[key] for key in ("owner", "request_id", "revision")})
     same = bool(wanted and all(state[key] == desired[key] for key in (
         "owner", "request_id", "revision", "target_c")))
     stopping = bool(not automatic_enabled or protection or stop_reason or not same)
@@ -392,7 +428,22 @@ def advance(checkpoint, channel, *, now_s, observation=None, desired=None,
         stopping, reason = True, "start_unconfirmed"
     explicit_stop = bool(not automatic_enabled or protection or stop_reason)
     off_edge = was_enabled and not automatic_enabled
-    withdrawal_needed = bool(state["possible_effect"] or (explicit_stop and (
+    # Eine bereits bestätigte WW-Grundstellung braucht auch bei Nutzer-Aus
+    # keinen identischen Schreibbefehl. Ein eigener Boost wird weiter quittiert.
+    baseline_observed = bool(channel == "ww" and mode is not None and _baseline_matches(
+        state, channel, mode, (observation or {}).get("target_c")))
+    return_target_observed = bool(baseline_observed or (
+        channel == "ww" and mode == 0 and state["baseline_target_c"] is not None
+        and _number((observation or {}).get("target_c"))
+        and abs(observation["target_c"] - state["baseline_target_c"]) <= 0.1))
+    if (release_on_baseline_readback and return_target_observed and state["possible_effect"]
+            and stopping and (stop_allowed or not automatic_enabled or protection or start_failed)):
+        # Im Ferienmodus genügt die frische Rücklesung des Rückkehrziels.
+        # Keine identische Schreibung und keine erfundene Transportquittung.
+        _clear_effect(state, "boost_return_readback_confirmed")
+        state["stop_reason"] = reason
+        return result, None
+    withdrawal_needed = bool(state["possible_effect"] or (explicit_stop and not baseline_observed and (
         off_edge or state["state"] != "frei" or state["withdraw_ack_ts"] is None
         or (mode is not None and not _baseline_matches(
             state, channel, mode, (observation or {}).get("target_c"))))))

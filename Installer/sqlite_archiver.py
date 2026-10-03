@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import json
+import math
 import sqlite3
 import os
 import stat
@@ -360,7 +361,9 @@ def _history_lines_for_date(day):
                     rows.append(row)
         except Exception:
             continue
-    rows.sort(key=lambda r: str(r.get("ts", "")))
+    # Doppelte Ortsstunden nach ihrem tatsächlichen Zeitpunkt ordnen.
+    rows.sort(key=lambda r: (_parse_history_ts(r).timestamp()
+                            if _parse_history_ts(r) is not None else float("-inf")))
     return rows
 
 def _parse_history_ts(row):
@@ -576,6 +579,14 @@ def _history_exact_source(row, key):
             return source
     return ""
 
+def _valid_daily_energy(value):
+    """Fehlende, nicht endliche oder negative Tagesenergie bleibt unbekannt."""
+    if isinstance(value, bool):
+        return None
+    value = _float_value(value, float("nan"))
+    return value if math.isfinite(value) and 0.0 <= value < 2000.0 else None
+
+
 def _exact_baselines_from_history(rows):
     keys = [
         "e_pv", "e_grid_in", "e_grid_out", "e_bat_in", "e_bat_out",
@@ -606,8 +617,8 @@ def _exact_baselines_from_history(rows):
                 continue
             if key not in row:
                 continue
-            val = _float_value(row.get(key), -1.0)
-            if val < 0.0 or val >= 2000.0:
+            val = _valid_daily_energy(row.get(key))
+            if val is None:
                 continue
             if key not in first:
                 if val <= 0.0:
@@ -628,25 +639,41 @@ def _exact_baselines_from_history(rows):
 
 def _final_exact_and_sources_from_history(rows):
     final = {
-        "e_pv": 0.0, "e_grid_in": 0.0, "e_grid_out": 0.0,
-        "e_bat_in": 0.0, "e_bat_out": 0.0, "e_home": 0.0,
-        "e_wb": 0.0, "e_wb2": 0.0, "e_wp": 0.0, "e_climate": 0.0,
+        "e_pv": None, "e_grid_in": None, "e_grid_out": None,
+        "e_bat_in": None, "e_bat_out": None, "e_home": None,
+        "e_wb": None, "e_wb2": None, "e_wp": None, "e_climate": None,
     }
-    sources = {key: "" for key in final}
+    sources = {key: "exact_counter_missing_or_invalid" for key in final}
     baselines = _exact_baselines_from_history(rows)
+    last_seen = {}
+    latest = max((dt.timestamp() for row in rows
+                  if (dt := _parse_history_ts(row)) is not None), default=None)
     for row in rows:
         for key in final:
             if key not in row:
                 continue
-            val = _float_value(row.get(key), -1.0)
-            if val < 0.0 or val >= 2000.0:
+            val = _valid_daily_energy(row.get(key))
+            if val is None:
                 continue
+            dt = _parse_history_ts(row)
+            if dt is not None:
+                last_seen[key] = dt
             baseline = baselines.get(key, 0.0)
             if baseline > 0.0:
-                val = max(0.0, val - baseline)
-            if final[key] == 0.0 or val > final[key] or (final[key] - val > 5.0):
+                # Ein unveränderter Mitternachtsrest bestätigt keine heutige Null.
+                if val <= baseline:
+                    if final[key] is None:
+                        sources[key] = "midnight_counter_unconfirmed"
+                    continue
+                val -= baseline
+            if final[key] is None or val > final[key] or (final[key] - val > 5.0):
                 final[key] = val
                 sources[key] = _history_exact_source(row, key)
+    for key, dt in last_seen.items():
+        midnight = dt.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        if dt.timestamp() - midnight <= 300.0 and latest is not None and latest > midnight + 300.0:
+            final[key] = None
+            sources[key] = "midnight_counter_unconfirmed"
     return final, sources
 
 def _final_exact_from_history(rows):
@@ -699,39 +726,37 @@ def repair_recent_daily_stats(days=2, today=None, conn=None):
             continue
         exact, exact_sources = _final_exact_and_sources_from_history(rows)
         integrated = _integrated_energy_from_history(rows)
-        if keep_integrated_pv_total_for_external_ac(integrated.get("pv", 0.0), integrated.get("pv_dc", 0.0), exact["e_pv"]):
-            pv = integrated.get("pv", 0.0)
-            pv_source = "integrated_total_with_external_ac"
-        else:
-            pv = exact["e_pv"] if exact["e_pv"] > 0 else integrated.get("pv", 0.0)
-            pv_source = "exact_e3dc_counter" if exact["e_pv"] > 0 else "power_integral"
-        grid_in = exact["e_grid_in"]
-        grid_out = exact["e_grid_out"]
-        bat_in = exact["e_bat_in"]
-        bat_out = exact["e_bat_out"]
-        wb = exact["e_wb"] if exact["e_wb"] > 0 else integrated["wb"]
-        wb2 = exact["e_wb2"] if exact["e_wb2"] > 0 else integrated["wb2"]
-        if exact["e_wb"] > 0:
-            wb, _wb_sanity = _sanitize_wallbox_exact_counter(exact["e_wb"], integrated["wb"], exact_sources.get("e_wb", ""))
-            if wb is None:
-                wb = integrated["wb"]
-        if exact["e_wb2"] > 0:
-            wb2, _wb2_sanity = _sanitize_wallbox_exact_counter(exact["e_wb2"], integrated["wb2"], exact_sources.get("e_wb2", ""))
-            if wb2 is None:
-                wb2 = integrated["wb2"]
-        wp = exact["e_wp"] if exact["e_wp"] > 0 else integrated["wp"]
-        climate = exact["e_climate"] if exact["e_climate"] > 0 else integrated["climate"]
-        home = exact["e_home"] if exact["e_home"] > 0 else integrated["home"]
-        if exact["e_home"] > 0:
-            home = _clean_exact_home_energy(exact["e_home"], wb, wb2, wp, climate)
-        if pv <= 0 and grid_in <= 0 and grid_out <= 0 and home <= 0:
-            continue
         old = cursor.execute(
-            "SELECT home_consumption, wb_consumption, wb2_consumption, wp_consumption, climate_consumption FROM daily_stats WHERE date=?",
-            (day_s,),
+            "SELECT home_consumption, wb_consumption, wb2_consumption, wp_consumption, "
+            "climate_consumption, pv_yield, grid_in, grid_out, bat_in, bat_out, autarky, self_con "
+            "FROM daily_stats WHERE date=?", (day_s,),
         ).fetchone()
         if old is None:
             continue
+        # Ohne bestätigten Zähler bleiben die gespeicherten Energieflüsse erhalten.
+        pv = old[5] if exact["e_pv"] is None else round(exact["e_pv"], 3)
+        if exact["e_pv"] is not None and keep_integrated_pv_total_for_external_ac(
+                integrated.get("pv", 0.0), integrated.get("pv_dc", 0.0), exact["e_pv"]):
+            pv = round(integrated["pv"], 3)
+        grid_in = old[6] if exact["e_grid_in"] is None else round(exact["e_grid_in"], 3)
+        grid_out = old[7] if exact["e_grid_out"] is None else round(exact["e_grid_out"], 3)
+        bat_in = old[8] if exact["e_bat_in"] is None else round(exact["e_bat_in"], 3)
+        bat_out = old[9] if exact["e_bat_out"] is None else round(exact["e_bat_out"], 3)
+        wb = exact["e_wb"] if (exact["e_wb"] is not None and exact["e_wb"] > 0) else integrated["wb"]
+        wb2 = exact["e_wb2"] if (exact["e_wb2"] is not None and exact["e_wb2"] > 0) else integrated["wb2"]
+        if (exact["e_wb"] is not None and exact["e_wb"] > 0):
+            wb, _wb_sanity = _sanitize_wallbox_exact_counter(exact["e_wb"], integrated["wb"], exact_sources.get("e_wb", ""))
+            if wb is None:
+                wb = integrated["wb"]
+        if (exact["e_wb2"] is not None and exact["e_wb2"] > 0):
+            wb2, _wb2_sanity = _sanitize_wallbox_exact_counter(exact["e_wb2"], integrated["wb2"], exact_sources.get("e_wb2", ""))
+            if wb2 is None:
+                wb2 = integrated["wb2"]
+        wp = exact["e_wp"] if (exact["e_wp"] is not None and exact["e_wp"] > 0) else integrated["wp"]
+        climate = exact["e_climate"] if (exact["e_climate"] is not None and exact["e_climate"] > 0) else integrated["climate"]
+        home = exact["e_home"] if (exact["e_home"] is not None and exact["e_home"] > 0) else integrated["home"]
+        if (exact["e_home"] is not None and exact["e_home"] > 0):
+            home = _clean_exact_home_energy(exact["e_home"], wb, wb2, wp, climate)
         old_home = _float_value(old[0], 0.0)
         old_wb = _float_value(old[1], 0.0)
         old_wb2 = _float_value(old[2], 0.0)
@@ -745,16 +770,14 @@ def repair_recent_daily_stats(days=2, today=None, conn=None):
             and abs(old_climate - climate) < 0.05
         ):
             continue
-        pv = export_backed_pv_total(
-            pv,
-            grid_out,
-            bat_out,
-            exact_counter_present=exact["e_pv"] > 0,
-            source=pv_source,
-        )
-        total_consumption = max(0.001, home + wb + wb2 + wp + climate)
-        autarky = round(max(0.0, min(100.0, ((total_consumption - grid_in) / total_consumption) * 100.0)), 1)
-        self_con = round(max(0.0, min(100.0, ((max(0.001, pv) - grid_out) / max(0.001, pv)) * 100.0)), 1)
+        total_consumption = home + wb + wb2 + wp + climate
+        autarky, self_con = old[10], old[11]
+        if (_valid_daily_energy(total_consumption) is not None and total_consumption > 0
+                and _valid_daily_energy(grid_in) is not None):
+            autarky = round(max(0.0, min(100.0, ((total_consumption - grid_in) / total_consumption) * 100.0)), 1)
+        if (_valid_daily_energy(pv) is not None and pv > 0
+                and _valid_daily_energy(grid_out) is not None):
+            self_con = round(max(0.0, min(100.0, ((pv - grid_out) / pv) * 100.0)), 1)
         cursor.execute(
             """
             UPDATE daily_stats
@@ -773,8 +796,8 @@ def repair_recent_daily_stats(days=2, today=None, conn=None):
              WHERE date=?
             """,
             (
-                round(pv, 3), round(home, 3), round(grid_in, 3), round(grid_out, 3),
-                round(bat_in, 3), round(bat_out, 3), round(wb, 3), round(wb2, 3),
+                pv, round(home, 3), grid_in, grid_out,
+                bat_in, bat_out, round(wb, 3), round(wb2, 3),
                 round(wp, 3), round(climate, 3), autarky, self_con, day_s,
             ),
         )

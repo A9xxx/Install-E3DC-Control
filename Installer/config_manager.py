@@ -26,6 +26,7 @@ from .installer_config import (
     get_install_user,
     load_config,
 )
+from . import config_secret_permissions as _config_secret_permissions
 from .config_secret_permissions import apply_config_secret_permissions, config_secret_dir_mode_text, config_secret_file_mode_text
 from .logging_manager import get_or_create_logger, log_task_completed, log_error, log_warning
 from .aux_inverter_contract import (
@@ -41,6 +42,13 @@ V4_CONFIG_FILE = '/var/www/html/data/e3dc_v4.json'
 GREEN = '\033[92m'
 RED   = '\033[91m'
 RESET = '\033[0m'
+
+
+def _is_secret_config_key(key):
+    # Ein laufender Alt-Updater kann config_secret_permissions noch in der
+    # alten Generation geladen haben; dann bleibt jeder Wert maskiert.
+    checker = getattr(_config_secret_permissions, 'is_secret_config_key', None)
+    return True if checker is None else bool(checker(key))
 
 # =============================================================================
 # V4-SCHLÜSSEL-INVENTAR (kanonische Liste aller gültigen Konfigurationsschlüssel)
@@ -302,6 +310,7 @@ V4_BLOCK_STORAGE = {
 # --- Block 5: Preis-/KI-Logik ---
 V4_BLOCK_INTELLIGENCE = {
     'super_intelligence_enable', 'super_intelligence_deadline',
+    'heat_tariff_shift_mode', 'heat_tariff_shift_windows', 'heat_tariff_shift_ww_lead_min', 'heat_grid_boost_max_outdoor_c',
     'price_boost_enable', 'heat_price_boost_scope',
     'heat_price_boost_windows', 'price_limit', 'price_hard_limit',
     'price_pause_limit', 'price_min_duration', 'price_max_daily',
@@ -435,7 +444,7 @@ V4_BLOCK_WALLBOX = {
 
 # --- Block 7: Wärmepumpe / Energie-Manager ---
 V4_BLOCK_HEATPUMP = {
-    'wp_type', 'wp_source_type', 'wp_page_preview_enable', 'wp_buffer_sensor', 'luxtronik', 'luxtronik_ip',
+    'wp_type', 'wp_source_type', 'wp_page_preview_enable', 'wp_buffer_sensor', 'wp_heating_circuit_pump', 'luxtronik', 'luxtronik_ip',
     'luxtronik_pause_setpoint_c',
     'idm_ip', 'idm_port', 'idm_e_total', 'idm_cooling_boost_min_at',
     'idm_pv_surplus_enable', 'idm_pv_surplus_max_kw', 'idm_pv_surplus_min_kw',
@@ -1257,7 +1266,7 @@ def check_config_duplicates():
             if '=' in stripped:
                 key = stripped.split('=', 1)[0].strip().lower()
                 if key in seen:
-                    if key in {'e3dc_user', 'mqtt_hub_user', 'wb_user', 'wb2_user', 'stiebel_isg_web_user'}:
+                    if _is_secret_config_key(key) or key.endswith(('_user', '_username', '_login', '_vin')):
                         value_state = 'gesetzt' if stripped.split('=', 1)[1].strip() else 'fehlt'
                         print(f'  [!] Duplikat entfernt: {key} = {value_state}')
                     else:
@@ -1300,7 +1309,7 @@ def _migrate_luxtronik_config():
             key_lower = k.lower()
             if key_lower in V4_ALL_KEYS:
                 v4[key_lower] = str(v)
-                if key_lower in {'e3dc_user', 'mqtt_hub_user', 'wb_user', 'wb2_user', 'stiebel_isg_web_user'}:
+                if _is_secret_config_key(key_lower) or key_lower.endswith(('_user', '_username', '_login', '_vin')):
                     value_state = 'gesetzt' if str(v).strip() else 'fehlt'
                     print(f'  [OK] Migriert: {key_lower} = {value_state}')
                 else:

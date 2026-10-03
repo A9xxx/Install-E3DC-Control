@@ -142,6 +142,8 @@ $weightedSohSum = 0;
 $maxCycles = 0;
 $capacityWeightedSohSum = 0;
 $capacityWeightKwh = 0;
+$avgSohApprox = false;
+$hasSohApprox = false;
 $minSoh = null;
 $maxSoh = null;
 $worstPack = null;
@@ -151,10 +153,16 @@ $diagnosticHints = [];
 
 if ($vitals && !empty($vitals['cabinets'])) {
     foreach ($vitals['cabinets'] as $cab) {
+       if (!empty($cab['soh_approx'])) {
+           $hasSohApprox = true;
+           // Ohne Pack-SOH bleiben die gemeldeten Schrank-Zyklen nutzbar.
+           $maxCycles = max($maxCycles, (int)($cab['cycles'] ?? 0));
+       }
        $cabCapacityKwh = ((float)($cab['usable_wh'] ?? $cab['specified_wh'] ?? 0)) / 1000.0;
        if ($cabCapacityKwh > 0 && isset($cab['soh_avg']) && $cab['soh_avg'] !== null) {
            $capacityWeightedSohSum += $cabCapacityKwh * (float)$cab['soh_avg'];
            $capacityWeightKwh += $cabCapacityKwh;
+           $avgSohApprox = $avgSohApprox || !empty($cab['soh_approx']);
        }
        foreach($cab['packs'] as $pack) {
            if (!isset($pack['soh'])) continue;
@@ -195,6 +203,10 @@ $overallLevel = sohRiskLevel($minSoh);
 if (driftRiskLevel($maxVoltageSpread) === 'critical') $overallLevel = 'critical';
 elseif ($overallLevel !== 'critical' && driftRiskLevel($maxVoltageSpread) === 'warn') $overallLevel = 'warn';
 [$overallColor, $overallText] = vitalRiskClass($overallLevel);
+if ($minSoh === null && $maxVoltageSpread === null) {
+    $overallColor = 'secondary';
+    $overallText = 'Nicht bewertbar';
+}
 
 if ($minSoh !== null && $minSoh < 80) {
     $diagnosticHints[] = "Ein Batterie-Pack liegt unter 80% SOH. Das ist ein belastbarer Anlass, die Werte zu dokumentieren und beim Support anzufragen.";
@@ -207,8 +219,11 @@ if ($maxVoltageSpread !== null && $maxVoltageSpread > 0.050) {
 if ($sohSpread !== null && $sohSpread > 5.0) {
     $diagnosticHints[] = "Die SOH-Spreizung zwischen den Packs ist deutlich. Einzelpack-Ansicht ist hier wichtiger als der Durchschnitt.";
 }
-if ($avgSoh === null) {
-    $diagnosticHints[] = "Es wurden keine belastbaren Pack-SOH-Werte gelesen. Die Seite zeigt dann keine Verschleissprognose, damit kein falscher Batteriezustand entsteht.";
+if ($avgSoh === null && !$hasSohApprox) {
+    $diagnosticHints[] = "Es wurden keine belastbaren Pack-SOH-Werte gelesen. Die Seite zeigt dann keine Verschleißprognose, damit kein falscher Batteriezustand entsteht.";
+}
+if ($hasSohApprox) {
+    $diagnosticHints[] = "Für Schränke mit Näherung liegen keine belastbaren Werte je Modul vor; angezeigt wird die BMS-Näherung je Schrank (ASOC). Die Diagnose-Ampel bewertet diese Näherung nicht.";
 }
 $cyclesPerYear = $systemAgeYears > 0 ? $maxCycles / $systemAgeYears : 0;
 // SOH nur einmal auf die konfigurierte nutzbare Neuzustandsreferenz anwenden.
@@ -236,6 +251,7 @@ if ($vitals && !empty($vitals['cabinets'])) {
             $cabinetsData[] = [
                 'index' => $cab['index'],
                 'soh' => $c_soh,
+                'soh_approx' => !empty($cab['soh_approx']),
                 'cycles' => $c_cycles,
                 'age' => $c_age,
                 'v_per_100' => $v_per_cycle * 100,
@@ -386,7 +402,7 @@ function saveVitalsPdf() {
                                 <i class="fas fa-shield-alt text-<?= $overallColor ?> fs-2"></i>
                             </div>
                             <p class="small text-body-secondary mb-0 mt-2">
-                                Bewertet wird der schwächste Pack, nicht nur der Durchschnitt. Das ist für Supportfälle aussagekräftiger.
+                                Die Ampel bewertet ausschließlich vorhandene Pack-Werte. Schrank-Näherungen erlauben keine Aussage über den schwächsten Pack; fehlende Pack-Werte bleiben unbewertet.
                             </p>
                         </div>
                     </div>
@@ -420,7 +436,7 @@ function saveVitalsPdf() {
                             </div>
                             <div class="d-flex justify-content-between small text-body-secondary">
                                 <span>System-SOH</span>
-                                <span><?= fmtVital($avgSoh, 1, ' %') ?> (<?= htmlspecialchars($avgSohMethod) ?>)</span>
+                                <span><?= $avgSohApprox ? '≈ ' : '' ?><?= fmtVital($avgSoh, 1, ' %') ?> (<?= htmlspecialchars($avgSohMethod) ?><?= $avgSohApprox ? ', Näherung' : '' ?>)</span>
                             </div>
                             <div class="d-flex justify-content-between small text-body-secondary">
                                 <span>Max. Zelldrift</span>
@@ -453,8 +469,11 @@ function saveVitalsPdf() {
                                 <i class="fas fa-car-battery text-success me-2"></i> Batterie-Schrank <?= $cab['index'] ?>
                                 <small class="text-body-secondary ms-2">(<?= $cab['count'] ?> Packs)</small>
                             </h5>
-                            <span class="badge rounded-pill bg-secondary fs-6">SOH Gesamt: <?= isset($cab['soh_avg']) && $cab['soh_avg'] !== null ? fmtVital($cab['soh_avg'], 1, ' %') : 'nicht belastbar' ?></span>
+                            <span class="badge rounded-pill bg-secondary fs-6">SOH <?= !empty($cab['soh_approx']) ? '≈' : 'Gesamt:' ?> <?= isset($cab['soh_avg']) && $cab['soh_avg'] !== null ? fmtVital($cab['soh_avg'], 1, ' %') : 'nicht belastbar' ?></span>
                         </div>
+                        <?php if (!empty($cab['soh_approx'])): ?>
+                            <p class="px-3 pt-3 mb-0">Näherung je Schrank, BMS-Wert ASOC; keine Werte je Modul.</p>
+                        <?php endif; ?>
                         <?php if (!empty($cab['usable_wh']) || !empty($cab['specified_wh'])): ?>
                             <div class="px-3 pt-3">
                                 <div class="small text-body-secondary d-flex flex-wrap gap-3">
@@ -483,7 +502,7 @@ function saveVitalsPdf() {
                                     $packTempMaxCell = $pack['temp_max_cell'] ?? null;
                                     $packCellVoltages = is_array($pack['cell_voltages'] ?? null) ? $pack['cell_voltages'] : [];
                                     $packCellTemps = is_array($pack['cell_temperatures'] ?? null) ? $pack['cell_temperatures'] : [];
-                                    [$sohColor, $sohText] = vitalRiskClass(sohRiskLevel($packSoh));
+                                    [$sohColor, $sohText] = $packSoh === null ? ['secondary', 'Nicht verfügbar'] : vitalRiskClass(sohRiskLevel($packSoh));
                                     [$driftColor, $driftText] = vitalRiskClass(driftRiskLevel($packVoltageSpread));
                                     $packModalId = 'packModal_'.$cab['index'].'_'.$pack['index'];
                                     
@@ -497,7 +516,7 @@ function saveVitalsPdf() {
                                             
                                             <div class="card-header border-bottom d-flex justify-content-between align-items-center pt-3">
                                                 <strong>Pack <?= $pack['index'] ?></strong>
-                                                <span class="badge bg-<?= $sohColor ?> fw-bold px-2 py-1 fs-6 shadow-sm"><?= fmtVital($packSoh, 1, ' %') ?> SOH</span>
+                                                <span class="badge bg-<?= $sohColor ?> fw-bold px-2 py-1 fs-6 shadow-sm"><?= $packSoh !== null ? fmtVital($packSoh, 1, ' %').' SOH' : 'Kein Modulwert' ?></span>
                                             </div>
                                             
                                             <div class="card-body p-3">
@@ -553,10 +572,12 @@ function saveVitalsPdf() {
                                                 <div class="modal-body">
                                                     <div class="alert alert-<?= $sohColor ?> py-2 mb-3">
                                                         <strong>SOH-Status:</strong> <?= htmlspecialchars($sohText) ?>.
-                                                        Der SOH-Wert kommt direkt aus dem BMS/DCB und wird hier nicht hochgerechnet.
+                                                        <?= $packSoh !== null ? 'Der SOH-Wert kommt direkt aus dem BMS/DCB und wird hier nicht hochgerechnet.' : 'Für dieses Modul liegt kein belastbarer SOH-Wert vor.' ?>
                                                     </div>
                                                     <div class="row g-2 small">
+                                                        <?php if ($packSoh !== null): ?>
                                                         <div class="col-6">SOH</div><div class="col-6 text-end fw-bold"><?= fmtVital($packSoh, 1, ' %') ?></div>
+                                                        <?php endif; ?>
                                                         <div class="col-6">Zyklen</div><div class="col-6 text-end fw-bold"><?= $packCycles !== null ? number_format((int)$packCycles, 0, ',', '.') : 'N/A' ?></div>
                                                         <div class="col-6">Temperatur min/max</div><div class="col-6 text-end fw-bold"><?= fmtVital($pack['temp_min'] ?? null, 1, ' °C') ?> / <?= fmtVital($pack['temp_max'] ?? null, 1, ' °C') ?></div>
                                                         <div class="col-6">Temperaturspreizung</div><div class="col-6 text-end fw-bold"><?= fmtVital($packTempSpread, 1, ' °C') ?></div>
@@ -657,7 +678,7 @@ function saveVitalsPdf() {
                             </p>
                             <?php if ($avgSoh !== null): ?>
                             <div class="progress mt-4 bg-dark-subtle shadow-sm" style="height: 24px; border-radius: 12px; font-size: 0.9rem;">
-                                <div class="progress-bar bg-info text-dark fw-bold" role="progressbar" style="width: <?= max(0, min(100, $avgSoh)) ?>%;">Durchschnitts-SOH <?= number_format($avgSoh, 1, ',', '.') ?>%</div>
+                                <div class="progress-bar bg-info text-dark fw-bold" role="progressbar" style="width: <?= max(0, min(100, $avgSoh)) ?>%;">Durchschnitts-SOH <?= $avgSohApprox ? '≈ ' : '' ?><?= number_format($avgSoh, 1, ',', '.') ?>%<?= $avgSohApprox ? ' (Näherung)' : '' ?></div>
                             </div>
                             <?php endif; ?>
                         </div>
@@ -674,11 +695,14 @@ function saveVitalsPdf() {
                             <div class="row g-4">
                                 <!-- Degradations-Metriken (Pro Schrank) -->
                                 <div class="col-12 col-lg-5">
+                                    <?php if ($cData['soh_approx']): ?>
+                                    <p class="fw-bold">Prognose auf Basis der Schrank-Näherung (BMS-Wert ASOC).</p>
+                                    <?php endif; ?>
                                     <h6 class="text-body-secondary text-uppercase fw-bold mb-3"><i class="fas fa-microscope text-danger me-2"></i>Verschleiß Analyse</h6>
                                     
                                     <div class="d-flex justify-content-between align-items-center border-bottom pb-2 mb-2">
                                         <span class="text-muted small">Aktueller SOH</span>
-                                        <strong class="text-body"><?= number_format($cData['soh'], 1, ',', '.') ?> %</strong>
+                                        <strong class="text-body"><?= $cData['soh_approx'] ? '≈ ' : '' ?><?= number_format($cData['soh'], 1, ',', '.') ?> %</strong>
                                     </div>
                                     <div class="d-flex justify-content-between align-items-center border-bottom pb-2 mb-2">
                                         <span class="text-muted small">Verschleiß pro 100 Zyklen</span>
@@ -700,7 +724,7 @@ function saveVitalsPdf() {
                                     </div>
                                     <div class="small text-body-secondary mt-2">
                                         Prognosebasis:
-                                        <?= $cData['projection_reliable'] ? '<span class="text-success fw-bold">belastbar</span>' : '<span class="text-warning fw-bold">noch unscharf</span>' ?>
+                                        <?= $cData['soh_approx'] ? '<span class="text-warning fw-bold">Näherung</span>' : ($cData['projection_reliable'] ? '<span class="text-success fw-bold">belastbar</span>' : '<span class="text-warning fw-bold">noch unscharf</span>') ?>
                                         (linear aus SoH und Zyklen, keine Herstellergarantie-Aussage).
                                     </div>
                                 </div>

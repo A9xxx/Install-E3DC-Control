@@ -5370,6 +5370,7 @@ DEFICIT_RESTART_BUDGET_STABLE_MAX_GAP_S = 30.0
 # Stop-Gruende der Kaskade (Netz-, Budget- und Akku-Wh-Konto), die den
 # Vertrag bewaffnen; alle drei sind Budget-Defizite derselben Stecksession.
 DEFICIT_RESTART_CASCADE_STOP_REASONS = (
+    "curve_floor_contingent_end",
     "battery_support_threshold",
     "minimum_current_energy_reached",
     "phase_cooldown_minimum_grid_stop",
@@ -5378,6 +5379,7 @@ DEFICIT_RESTART_CASCADE_STOP_REASONS = (
 # (phase_down_failed_<grid|battery>_stop, phase_down_timeout_<grid|battery>_stop)
 # sind dieselben Budget-Defizite der Kaskade und armieren den Vertrag ebenfalls.
 DEFICIT_RESTART_CASCADE_STOP_REASON_PREFIXES = (
+    "phase_down_no_output_",
     "phase_down_failed_",
     "phase_down_timeout_",
 )

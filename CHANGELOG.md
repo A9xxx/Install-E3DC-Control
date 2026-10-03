@@ -6,6 +6,52 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.5.3] – 2026-10-04
+
+### Wallbox
+
+- In `PV-Kurve ruhig` gilt unter dem Kurvenkorridor ein Wolken-Kontingent (automatisch 0,5 % der Speicherkapazität, mindestens 50 Wh, oder Handwert). Am Kontingentende folgt im selben Zyklus einmalig Weiterladen aus PV, ein getragener 1p-Abstieg oder Stop; der Speicher stützt bis zur Bestätigung höchstens 30 s. Bei ausdrücklich erlaubter Stützung zählt das Kontingent nicht.
+- Nach einem Kaskadenabstieg von 3p auf 1p startet die openWB Pro mit dem konfigurierten Mindeststrom statt fest mit 6 A. Ein nicht begonnener Abstieg verfällt nach 30 s ohne fortbestehendes Netz- oder Akkudefizit, die Phasenreservierung wird freigegeben.
+- Stammt der externe Hausverbrauchsanteil aus einem Altwert oder ersatzweise aus einer Statusdatei, startet keine externe Wallbox und erhöht weder Ladestrom noch Phasenzahl. Stromabsenkungen, Phasenabstiege und Schutzabschaltungen bleiben sofort wirksam.
+
+### Speicher
+
+- Batterie-Vitals nutzt den BMS-Wert `BAT_ASOC` als gekennzeichnete SoH-Näherung je Schrank, wenn Modul-SoH-Werte fehlen. System-SoH und Verschleißprognose werden als Näherung ausgewiesen; der Monatsverlauf speichert Schrankwert, Qualität und Quelle.
+- Verbraucherleistungen zählen in Budget und Bilanz genau einmal. In gemischten Installationen mit E3/DC- und externen Wallboxen wird nur der im Hausverbrauch enthaltene externe Anteil herausgerechnet; fehlende Messwerte erzeugen keinen zusätzlichen Abzug.
+- Im aktiven Tariffenster-Auftrag kann der Speicher seine Entladung für die gemessene Wärmepumpenleistung begrenzen (Tarif-Halt). Eine aktive Lastspitzenkappung (`peak_shaving_enable`) hat Vorrang: Sie kappt Viertelstundenspitzen mit dem Akku auch während eines Boosts und sperrt den Tarifstart nicht.
+
+### Wärmepumpe
+
+- Tariffenster-Heizen (experimentell, Standard Aus): `heat_tariff_shift_mode` (`off`, `shadow`, `active`) verschiebt bei Octopus Heat belegte Wärmebedarfe in günstige Zeitfenster (`heat_tariff_shift_windows`). Im Schattenbetrieb entsteht nur eine Diagnoseauswertung ohne Steuerbefehl.
+- `heat_price_boost_scope` (Warmwasser, Heizung oder beides) gilt einheitlich für Tarif- und Negativpreis-Boost. `heat_grid_boost_max_outdoor_c` (Standard 10 °C, leer = ohne Grenze) begrenzt Heizungs-Boosts mit 1 K Hysterese; der Negativpreis-Boost nutzt keine Zeitfenster mehr.
+- Im Luxtronik-Messwertbetrieb reserviert der PV-Boost keine feste Leistung oder Energie. Ein gehaltener Boost darf bei Speicher-Kurvenbedarf weiterlaufen, wenn die Restprognose Akkuziel und Wärme deckt.
+- Die Warmwasser-Grundstellung folgt dem Timerfenster auch während E3DC-Datenlücken, sofern eine frische Rücklesung der Wärmepumpe vorliegt. Ein an der Wärmepumpe aktivierter Ferien- oder Frostschutzmodus sperrt neue Boosts und setzt laufende Warmwasser-Boosts auf das Ziel vor dem Boost zurück.
+- `ww_circ_boost = 1` schaltet die Zirkulationspumpe beim Boost nur während bestätigter Warmwasserbereitung mit laufendem Verdichter ein.
+- Fehlt eine eigene Leistungsmessung der Wärmepumpe, steckt deren Verbrauch im gemessenen Hausverbrauch; es wird kein Altwert zusätzlich abgezogen. Ohne Leistungsmessung startet kein neuer Boost.
+- Stiebel ISG mit SG-Ready-Schreiben: Die Startfreigabe lief bisher ab, bevor der Energy Manager schreiben konnte, und blieb danach gesperrt. Speicher- und Energy Manager verwenden jetzt dieselbe Startsemantik mit mindestens 150 s (bzw. `pv_boost_delay` plus 120 s). Nach einer abgelaufenen Freigabe wird für alle Typen wieder entsperrt; die Leerlaufgrenze folgt `stiebel_isg_standby_w`.
+- `grid_start_limit` vergleicht den Betrag mit dem freien Verbraucherbudget nach der Akkuladung. Liegt er unter der Mindestleistung der Wärmepumpe von 1500 W, warnt die Konfigurationsprüfung.
+
+### Prognose und Statistik
+
+- Die E3/DC-Tageshistorie wird in lokaler Gerätezeit (`Europe/Berlin`) angefragt und mit echten UTC-Zeitstempeln gespeichert. Bisher lagen die Viertelstunden um eine bzw. zwei Stunden zu spät. Bei eingeschalteter Prognosediagnose werden ältere Tage unter der neuen Quellenrevision automatisch nachgelesen; alte Messzeilen bleiben unverändert.
+- Ein Plausibilitätswächter meldet Tage mit mehr als drei Viertelstunden über 50 Wh bei einer Sonnenhöhe unter −1°.
+- Die Tagesbilanz für Haus, Netz und Akku umfasst jetzt den lokalen Kalendertag; bisher lief sie in der Sommerzeit von 22 bis 22 Uhr. Tageswerte ab dem Update können deshalb von früheren abweichen. An Umstellungstagen werden die Geräte-Tageswerte nicht verwendet, und die stündliche Archivreparatur setzt fehlende Zählerwerte nicht mehr auf 0.
+
+### Webportal
+
+- Die Wärmepumpen-Vorschau zeigt die Pumpensignale HUP, BUP, BOSUP, ZIP, EVU und den Durchfluss. `wp_heating_circuit_pump` (Standard `hup`) wählt das Heizkreispumpensignal. Doppelte Ausgangsnamen bleiben getrennt: `ZUP` und `Ventil.-BOSUP` enthalten Ein/Aus, `… %` den Prozentwert.
+- Der Config-Editor hat Hover-Texte für alle Felder; die Empfehlung für die Web-PIN ist wieder enthalten.
+
+### Diagnose
+
+- `heat_tariff_diagnostics.php` stellt einen lesenden Tagesexport für das Tariffenster-Heizen bereit, mit Entscheidungen, Sperrgründen, Prognosen und Restbudgets ohne Identifikationsmerkmale.
+- Konfigurationsausgaben und Protokolle maskieren Passwörter, Tokens, Anmeldenamen und Fahrgestellnummern.
+
+### Update
+
+- Der Docker-Host-Helfer ergänzt fehlende Watchtower-Einträge (`E3DC_WATCHTOWER_API_URL`, `E3DC_WATCHTOWER_API_TOKEN`) im E3DC-Dienst, wenn ein lokaler Watchtower mit HTTP-API und Token in `.env` vorliegt. Ein laufender Watchtower, der denselben Container ersetzen kann, muss vor dem Helferaufruf gestoppt werden.
+- Der Docker-Rückfall stellt gesicherte Container-Sicherheitsoptionen (`security_opt`) nur bei tatsächlicher Abweichung und nur in der maßgeblichen Compose-Datei wieder her.
+
 ## [5.5.2] – 2026-09-30
 
 ### Wallbox

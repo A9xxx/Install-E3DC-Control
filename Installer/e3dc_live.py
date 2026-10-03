@@ -29,6 +29,9 @@ import math
 import gzip
 import hashlib
 import signal
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
 
 LIVE_DATA_PATH = "/var/www/html/ramdisk/live_data_py.json"
 LIVE_LAST_VALID_PATH = "/var/www/html/ramdisk/live_data_last_valid.json"
@@ -482,8 +485,7 @@ def _optional_float_in_container(item):
 
 
 def _today_midnight_ts():
-    from datetime import datetime
-    now = datetime.now()
+    now = datetime.now(ZoneInfo("Europe/Berlin"))
     return int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
 
@@ -762,17 +764,36 @@ def get_ems_config(conn):
     }
 
 
-def get_db_history(conn):
+def get_db_history(conn, *, day=None):
     """Tageserträge über DB-History (Uint64-Zeitstempel, KEIN Timestamp-Typ!)."""
     print("  -> DB-History Tagesbilanz ...")
-    midnight = _today_midnight_ts()
-    print(f"     Mitternacht-TS={midnight}  ({time.strftime('%Y-%m-%d %H:%M', time.localtime(midnight))})")
+    def unavailable(reason, midnight=None):
+        values = {"_db_midnight_ts": midnight, "_db_sum_ok": False,
+                  "Ext_PV_Energy_kWh": None}
+        for key in ("PV_Energy", "Grid_In_Energy", "Grid_Out_Energy",
+                    "Bat_In_Energy", "Bat_Out_Energy", "Home_Energy", "Wallbox_Energy"):
+            values.update({key+"_kWh": None, key+"_Valid": False, key+"_Source": reason})
+        return values
 
-    # Versuch 1: INTERVAL=86400 (Tages-Bucket)
+    try:
+        history_timezone = ZoneInfo("Europe/Berlin")
+        midnight = (_today_midnight_ts() if day is None else
+                    int(datetime.combine(day, datetime.min.time(), history_timezone).timestamp()))
+        local_midnight = datetime.fromtimestamp(midnight, history_timezone)
+    except ZoneInfoNotFoundError:
+        return unavailable("history_timezone_unavailable")
+    span_s = int((local_midnight + timedelta(days=1)).timestamp()) - midnight
+    # Tages-Summen für 23/25 Stunden sind am Gerät noch nicht belegt.
+    if span_s != 86400:
+        return unavailable("dst_day_unverified", midnight)
+    history_start = midnight + int(local_midnight.utcoffset().total_seconds())
+    print(f"     Tagesbeginn={local_midnight:%Y-%m-%d}, Spanne={span_s} s")
+
+    # Start auf der lokalen Gerätezeitachse; Dauer zwischen echten Mitternächten.
     resp = conn.request([_container(RscpTag.DB_REQ_HISTORY_DATA_DAY, [
-        _uint64(RscpTag.DB_REQ_HISTORY_TIME_START,    midnight),
+        _uint64(RscpTag.DB_REQ_HISTORY_TIME_START,    history_start),
         _uint64(RscpTag.DB_REQ_HISTORY_TIME_INTERVAL, 86400),
-        _uint64(RscpTag.DB_REQ_HISTORY_TIME_SPAN,     86400),
+        _uint64(RscpTag.DB_REQ_HISTORY_TIME_SPAN,     span_s),
     ])])
 
     hist = find_tag(resp, RscpTag.DB_HISTORY_DATA_DAY)

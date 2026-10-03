@@ -408,6 +408,7 @@ def step_group_deficit(
     battery_support_w: Any = None,
     battery_contract_valid: bool = False,
     battery_threshold_wh: Any = None,
+    curve_floor_end: Optional[Mapping[str, Any]] = None,
     export_rest_contract_valid: bool = False,
     battery_not_discharging: bool = False,
     export_margin_w: Any = 200.0,
@@ -760,10 +761,18 @@ def step_group_deficit(
     # Live-/PV-Daten explizit; ohne Vertrag bleibt das Konto unbekannt und
     # eingefroren, nie 0 W. Schwelle ist das Kurven-Kontingent, nicht die
     # Netz-Wh-Schwelle.
+    floor_end = curve_floor_end if isinstance(curve_floor_end, Mapping) else {}
+    floor_applicable = floor_end.get("applicable") is True
+    floor_exhausted = bool(floor_applicable and floor_end.get("exhausted") is True)
+    end_ts = _finite(floor_end.get("end_ts"))
+    floor_event = bool(floor_exhausted and floor_end.get("handled") is not True
+                       and end_ts is not None
+                       and cascade.get("curve_floor_end_handled_ts") != end_ts)
     battery_value = _finite(battery_support_w)
     battery_threshold_value = _finite(battery_threshold_wh)
     battery_contract = bool(
         battery_contract_valid is True
+        and not (floor_event or (floor_applicable and floor_end.get("bridge_active") is True))
         and battery_value is not None
         and battery_value >= 0.0
         and battery_threshold_value is not None
@@ -1008,6 +1017,24 @@ def step_group_deficit(
         ),
     })
 
+    if floor_applicable and not floor_exhausted:
+        # Vor dem Endereignis gehört der Stand zum gemeinsamen Kontingent.
+        floor_used = _finite(floor_end.get("used_wh"))
+        floor_limit = _finite(floor_end.get("limit_wh"))
+        if floor_used is not None and floor_limit is not None and floor_limit > 0:
+            ledger.update(battery_bucket_wh=floor_used, battery_threshold_wh=floor_limit)
+            if floor_event:
+                ledger.update(counted_component="battery", bucket_component="battery", bucket_wh=floor_used,
+                              threshold_reached=True, reason="curve_floor_contingent_end")
+
+    if floor_event:
+        ledger.update(battery_bucket_wh=0.0,
+                      battery_threshold_wh=_finite(floor_end.get("limit_wh")) or battery_threshold,
+                      last_action_bucket_wh=_finite(floor_end.get("used_wh")) or 0.0,
+                      counted_component="battery",
+                      bucket_component="battery", bucket_wh=0.0,
+                      threshold_reached=True, reason="curve_floor_contingent_end")
+
     if floor_direct_minimum_immediate_by_wb is not None:
         # Untergrenzen-Episoden aller Wallboxen in jedem gültigen Zyklus
         # fortschreiben, auch während Phasen- oder Stopbestätigung.
@@ -1026,6 +1053,9 @@ def step_group_deficit(
         and old_stage == STAGE_PHASE_DOWN_PENDING
         and cascade.get("phase_down_requested", False)
     )
+
+    if pending_phase and floor_event and not phase_switch_sequence_active:
+        pending_phase = False
 
     if pending_phase:
         pending_since = _finite(
@@ -1059,6 +1089,22 @@ def step_group_deficit(
                 ),
             )
         if phase_switch_sequence_active:
+            cascade["phase_output_started"] = True
+        pending_pv = _finite(floor_end.get("pv_budget_w"))
+        deficit_persists = bool(
+            grid_deficit > 0.0
+            or (counted_component == "battery" and threshold_reached)
+            or (float(pcc_value) >= 0.0 and (
+                direct_candidate
+                or (floor_exhausted and (pending_pv is None
+                    or pending_pv < minimum * voltage * phases))
+            ))
+        )
+        no_output_timeout = bool(
+            not cascade.get("phase_output_started") and pending_age_s >= 30.0
+            and deficit_persists
+        )
+        if phase_switch_sequence_active and pending_age_s < pending_timeout:
             cascade.update({
                 "marginal_wb_id": wb_id,
                 "topology": topology,
@@ -1111,8 +1157,35 @@ def step_group_deficit(
                     stage=physical_stage,
                 ),
             )
+        if (
+            not cascade.get("phase_output_started")
+            and not phase_switch_failed
+            and pending_age_s >= 30.0
+            and not deficit_persists
+            and counted_component == "authorized_budget"
+        ):
+            # Reine Budgetüberziehung rechtfertigt ohne Netzbezug und ohne
+            # erschöpftes Akkukonto keinen Stop. Die unbegonnene Reservierung
+            # verfällt; vor dem nächsten Wunsch muss das Konto neu durchlaufen.
+            reason = "phase_down_no_output_budget_expired"
+            cascade.update({
+                "marginal_wb_id": wb_id,
+                "topology": topology,
+                "stage": physical_stage,
+                "generation": int(cascade.get("generation", 0) or 0) + 1,
+                "phase_down_requested": False,
+                "phase_down_requested_sample_ts": None,
+                "phase_pending_age_s": round(pending_age_s, 6),
+                "reason": reason,
+            })
+            _reset_bucket(ledger, reason=reason)
+            return _result(
+                snapshot_id=sid, sample_ts=timestamp, wb_id=wb_id,
+                ledger=ledger, cascade=cascade,
+                action=_hold_action(wb_id, reason, stage=physical_stage),
+            )
         pending_terminal = bool(
-            phase_switch_failed or pending_age_s + 1e-9 >= pending_timeout
+            no_output_timeout or phase_switch_failed or pending_age_s + 1e-9 >= pending_timeout
         )
         if pending_terminal:
             # wbminSoC-Untergrenze: Bleibt der Phasenwechsel der Episode
@@ -1130,10 +1203,19 @@ def step_group_deficit(
                 grid_deficit > 0.0
                 or counted_component == "battery"
                 or floor_pending_stop
+                or no_output_timeout
+                or (floor_applicable and deficit_persists)
             ) and current > 1e-6:
                 # Art folgt der gewaehlten Komponente.
                 if counted_component == "grid":
                     _pending_kind = "grid"
+                elif floor_pending_stop:
+                    _pending_kind = "wbminsoc_floor"
+                elif no_output_timeout:
+                    _pending_kind = (
+                        "budget" if counted_component == "authorized_budget" else
+                        "battery" if counted_component == "battery" or floor_applicable else "budget"
+                    )
                 elif counted_component == "battery" or not floor_pending_stop:
                     _pending_kind = "battery"
                 else:
@@ -1147,7 +1229,9 @@ def step_group_deficit(
                     "phase_down_requested_sample_ts": None,
                     "phase_pending_age_s": round(pending_age_s, 6),
                     "reason": (
-                        "phase_down_failed_%s_stop" % _pending_kind
+                        "phase_down_no_output_%s_stop" % _pending_kind
+                        if no_output_timeout
+                        else "phase_down_failed_%s_stop" % _pending_kind
                         if phase_switch_failed
                         else "phase_down_timeout_%s_stop" % _pending_kind
                     ),
@@ -1239,6 +1323,33 @@ def step_group_deficit(
                 stage=STAGE_STOP_PENDING,
             ),
         )
+
+    if floor_event and current > 0.0:
+        pv = _finite(floor_end.get("pv_budget_w"))
+        carried = bool(pv is not None and pv >= minimum * voltage * phases)
+        down_w = _finite(floor_end.get("phase_down_required_w"))
+        down = bool(not carried and phases == 3 and topology == TOPOLOGY_SWITCHABLE
+                    and floor_end.get("phase_down_surface") is True
+                    and cooldown <= 0.0 and pv is not None and down_w is not None
+                    and pv >= down_w)
+        if carried:
+            target = max(minimum, _round_down_to_step(pv / (voltage * phases), step))
+            kind = ACTION_CURRENT_DOWN if target < current - 1e-6 else ACTION_HOLD
+            next_stage = _stage_for_physics(phases, min(current, target), minimum)
+        else:
+            target = 0.0
+            kind = ACTION_PHASE_DOWN if down else ACTION_STOP
+            next_stage = STAGE_PHASE_DOWN_PENDING if down else STAGE_STOP_PENDING
+        cascade["curve_floor_end_handled_ts"] = end_ts
+        cascade.update(marginal_wb_id=wb_id, topology=topology, stage=next_stage,
+                       generation=int(cascade.get("generation", 0) or 0) + 1,
+                       phase_down_requested=down,
+                       phase_down_requested_sample_ts=float(timestamp) if down else None,
+                       phase_output_started=False, reason="curve_floor_contingent_end")
+        action = _action(kind, wb_id, "curve_floor_contingent_end", stage=next_stage,
+                         **({"target_phases": 1} if down else {"target_amp": target}))
+        return _result(snapshot_id=sid, sample_ts=timestamp, wb_id=wb_id,
+                       ledger=ledger, cascade=cascade, action=action)
 
     if owner_changed or topology_changed:
         # Die Untergrenzen-Episoden laufen je Wallbox weiter; ein je Zyklus
@@ -1510,6 +1621,7 @@ def step_group_deficit(
                     "generation": int(cascade.get("generation", 0) or 0) + 1,
                     "phase_down_requested": True,
                     "phase_down_requested_sample_ts": float(timestamp),
+                    "phase_output_started": bool(phase_switch_sequence_active),
                     "phase_pending_age_s": 0.0,
                     "reason": "existing_phase_sequence_observed",
                 })
@@ -1562,6 +1674,7 @@ def step_group_deficit(
                 "generation": int(cascade.get("generation", 0) or 0) + 1,
                 "phase_down_requested": True,
                 "phase_down_requested_sample_ts": float(timestamp),
+                "phase_output_started": bool(phase_switch_sequence_active),
                 "phase_pending_age_s": 0.0,
                 "reason": (
                     "wbminsoc_floor_direct_minimum_phase_down"

@@ -475,6 +475,7 @@ START_WINDOW_SOFT_STOP_REASON_PREFIXES = (
     "predump_",
     "hold_target_below_minimum",
     "group_deficit",
+    "phase_down_no_output_",
     "native_battery_drain_zero_budget",
     "battery_departure_floor",
 )

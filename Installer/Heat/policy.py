@@ -545,3 +545,9 @@ def decide_heat_policy(ctx: HeatPolicyInput) -> HeatPolicyDecision:
         )
 
     return _decision(ctx, TARGET_NORMAL, SG_READY_NORMAL, 0, "Waiting for Heat Boost Eligibility", "idle")
+
+
+def decide_tariff_shift(config, evidence, state, *, now):
+    """Zusätzlicher Tarifintent der gemeinsamen Wärmeplanung."""
+    from .tariff_shift import decide
+    return decide(config, evidence, state, now=now)

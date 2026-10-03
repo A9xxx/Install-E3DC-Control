@@ -22,6 +22,7 @@ CONFIG_FILE = os.path.join(os.path.dirname(__file__), "installer_config.json")
 WEB_CONFIG_FILE = "/var/www/html/data/e3dc_v4.json"
 LEGACY_WEB_CONFIG_FILE = "/var/www/html/e3dc_paths.json"
 WEB_CONFIG_START_DEFAULTS = {
+    "heat_tariff_shift_mode": "off", "heat_tariff_shift_ww_lead_min": 90,
     "server_ip": "",
     "server_port": "5033",
     "e3dc_user": "",
@@ -40,6 +41,8 @@ WEB_CONFIG_START_DEFAULTS = {
 def apply_web_config_start_defaults(data, *, first_install=False):
     """Fill first-start defaults that must exist before the Web-UI is saved."""
     result = dict(data or {})
+    result.setdefault("heat_tariff_shift_mode", "off")
+    result.setdefault("heat_tariff_shift_ww_lead_min", 90)
     for key, default in WEB_CONFIG_START_DEFAULTS.items():
         value = result.get(key)
         if key not in result or value is None or value == "":

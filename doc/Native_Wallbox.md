@@ -1092,6 +1092,17 @@ Wallbox-Manager führt deshalb je Stecksession ein Startfenster
 - Hauswert: die frische Ladeleistung von openWB/openWB Pro/go-e wird
   immer vom Hauswert abgezogen (Deadband 100 W, Stale-Halt 30 s), unabhängig
   von einer E3DC-Wallbox. Das Speicherbudget bleibt bindend.
+  Während der externe Hausanteil aus einem Altwert stammt, darf keine
+  Wallbox starten oder ihren Strom beziehungsweise ihre Phasenzahl erhöhen.
+  Stromabsenkungen, Phasenabsenkungen mit belegter Ausgangsphasenzahl,
+  Stopps und die Schutzwächter bleiben wirksam. Die Sperre gilt nur für den
+  Altwert einer konfigurierten externen Wallbox; reine E3DC-Anlagen
+  einschließlich Multi Connect erhalten dadurch keine zusätzliche
+  Anhebesperre. Die lokale E3DC-Steuerungsübernahme bleibt möglich, damit
+  auch im direkten Preis-, Netz- und Floor-Pfad sofort abgesenkt werden kann.
+  Die Sperre gilt ebenfalls, wenn die Hauskorrektur für eine externe Wallbox
+  ersatzweise eine Leistung aus einer noch jungen Statusdatei verwendet: Das
+  Dateialter allein belegt keine frische Einzelmessung.
 - „Ladung beendet“ entsteht nur noch bei `exhausted` mit frischem SoC ≥ Ziel
   oder über den Ladeende-Vertrag nach bestätigter Ladung; sonst zeigt die
   Session „Start abgelehnt – Wiederholung hh:mm (Zyklus n/3)“.

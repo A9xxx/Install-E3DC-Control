@@ -119,7 +119,8 @@ def _unique_object(pairs):
 
 
 def _read_checkpoint(directory_fd, *, basename=CHECKPOINT_BASENAME,
-                     schema=CHECKPOINT_SCHEMA, validator=validate_heatpump_pv_state):
+                     schema=CHECKPOINT_SCHEMA, validator=validate_heatpump_pv_state,
+                     restore_fn=None):
     descriptor = os.open(basename, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
                          dir_fd=directory_fd)
     try:
@@ -146,6 +147,8 @@ def _read_checkpoint(directory_fd, *, basename=CHECKPOINT_BASENAME,
         if envelope.get("saved_ts") is None:
             raise HeatpumpCheckpointError("checkpoint_timestamp_missing")
         _now(envelope.get("saved_ts"))
+        if restore_fn is not None:
+            state = restore_fn(state, envelope)
         return state, (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size)
     finally:
         os.close(descriptor)
@@ -194,7 +197,8 @@ def persist_heatpump_pv_checkpoint(state, *, directory=None, now_s=None, force=F
 def _persist_checkpoint(state, *, directory=None, now_s=None, force=False,
                         basename=CHECKPOINT_BASENAME, schema=CHECKPOINT_SCHEMA,
                         validator=validate_heatpump_pv_state, signature_fn=_transition_signature,
-                        quarantine_required=True, heartbeat_s=CHECKPOINT_HEARTBEAT_S):
+                        quarantine_required=True, heartbeat_s=CHECKPOINT_HEARTBEAT_S,
+                        envelope_fn=None, restore_fn=None):
     descriptor = None
     temporary = None
     try:
@@ -205,7 +209,8 @@ def _persist_checkpoint(state, *, directory=None, now_s=None, force=False,
         path, descriptor = _open_private_directory(directory)
         existing_token = None
         try:
-            existing, existing_token = _read_checkpoint(descriptor, basename=basename, schema=schema, validator=validator)
+            existing, existing_token = _read_checkpoint(descriptor, basename=basename, schema=schema, validator=validator,
+                                                       restore_fn=restore_fn)
         except (OSError, RuntimeError, ValueError, TypeError, AttributeError, KeyError):
             # Der erste haltbare Zustand nach Datenverlust muss ausdrücklich
             # dessen Rekonsiliation bewahren; ein normaler neuer Topf ist gesperrt.
@@ -233,6 +238,8 @@ def _persist_checkpoint(state, *, directory=None, now_s=None, force=False,
             return True
         envelope = {"schema": schema, "saved_ts": current,
                     "sha256": hashlib.sha256(_canonical(validated)).hexdigest(), "state": validated}
+        if envelope_fn is not None:
+            envelope = envelope_fn(envelope)
         payload = _canonical(envelope)
         if len(payload) > MAX_CHECKPOINT_BYTES:
             return False
@@ -247,7 +254,8 @@ def _persist_checkpoint(state, *, directory=None, now_s=None, force=False,
         os.replace(temporary, basename, src_dir_fd=descriptor, dst_dir_fd=descriptor)
         temporary = None
         os.fsync(descriptor)
-        persisted, token = _read_checkpoint(descriptor, basename=basename, schema=schema, validator=validator)
+        persisted, token = _read_checkpoint(descriptor, basename=basename, schema=schema, validator=validator,
+                                                       restore_fn=restore_fn)
         if _canonical(persisted) != _canonical(validated):
             return False
         _LAST_DURABLE[cache_key] = {"signature": signature, "token": token, "saved_ts": current,
@@ -338,6 +346,62 @@ def _channel_checkpoint_validator(value):
     return validate_checkpoint(value)
 
 
+def _channel_checkpoint_envelope(envelope):
+    # Alte Leser erlauben Zusätze in der Hülle, aber nicht in den Kanälen.
+    # Ein alter Writer entfernt den Zusatz bei seiner nächsten Speicherung.
+    envelope = copy.deepcopy(envelope)
+    targets = {name: state.pop("pre_boost_target_c")
+               for name, state in envelope["state"]["channels"].items()}
+    tariff_channels = []
+    for name, state in envelope["state"]["channels"].items():
+        if state["owner"] == "tariff":
+            state["owner"] = "price"
+            tariff_channels.append(name)
+    envelope["sha256"] = hashlib.sha256(_canonical(envelope["state"])).hexdigest()
+    if tariff_channels:
+        payload = {"state_sha256": envelope["sha256"], "channels": tariff_channels}
+        envelope["channel_tariff_owners"] = {
+            **payload, "sha256": hashlib.sha256(_canonical(payload)).hexdigest()}
+    # Der vollständige Zustand bindet insbesondere Auftrag, Revision und Generation.
+    extra = {"state_sha256": envelope["sha256"], "targets": targets}
+    envelope["channel_return_targets"] = {
+        **extra, "sha256": hashlib.sha256(_canonical(extra)).hexdigest()}
+    return envelope
+
+
+def _channel_checkpoint_restore(state, envelope):
+    # Nur der exakt gebundene Zusatz stellt den Tarifbesitzer wieder her.
+    # Nach Speicherung durch einen alten Writer bleibt dessen price-Rücknahme maßgeblich.
+    extra = envelope.get("channel_tariff_owners")
+    if isinstance(extra, dict) and set(extra) == {"state_sha256", "channels", "sha256"}:
+        payload = {key: extra[key] for key in ("state_sha256", "channels")}
+        channels = extra["channels"]
+        if (extra["state_sha256"] == envelope["sha256"]
+                and extra["sha256"] == hashlib.sha256(_canonical(payload)).hexdigest()
+                and isinstance(channels, list) and channels
+                and all(type(name) is str and name in state["channels"] for name in channels)
+                and len(channels) == len(set(channels))
+                and all(state["channels"][name]["owner"] == "price" for name in channels)):
+            restored = copy.deepcopy(state)
+            for name in channels:
+                restored["channels"][name]["owner"] = "tariff"
+            state = _channel_checkpoint_validator(restored) or state
+    extra = envelope.get("channel_return_targets")
+    if not isinstance(extra, dict) or set(extra) != {"state_sha256", "targets", "sha256"}:
+        return state
+    payload = {key: extra[key] for key in ("state_sha256", "targets")}
+    if (extra["state_sha256"] != envelope["sha256"]
+            or extra["sha256"] != hashlib.sha256(_canonical(payload)).hexdigest()
+            or not isinstance(extra["targets"], dict)
+            or set(extra["targets"]) != set(state["channels"])):
+        return state
+    restored = copy.deepcopy(state)
+    for name, target in extra["targets"].items():
+        restored["channels"][name]["pre_boost_target_c"] = target
+    # Ungültige Zusatzdaten geben kein Besitzrecht und keinen Ersatzwert vor.
+    return _channel_checkpoint_validator(restored) or state
+
+
 def load_heatpump_channel_checkpoint(*, directory=None):
     """Fehlend und unlesbar bleiben verschieden; keine implizite Besitzfreigabe.
 
@@ -352,6 +416,7 @@ def load_heatpump_channel_checkpoint(*, directory=None):
         value, _ = _read_checkpoint(
             descriptor, basename=CHANNEL_CHECKPOINT_BASENAME,
             schema=CHANNEL_CHECKPOINT_SCHEMA, validator=_channel_checkpoint_validator,
+            restore_fn=_channel_checkpoint_restore,
         )
         return {"status": "valid", "checkpoint": value, "reason": ""}
     except FileNotFoundError:
@@ -387,4 +452,5 @@ def persist_heatpump_channel_checkpoint(checkpoint, *, directory=None, now_s=Non
         validator=_channel_checkpoint_validator,
         signature_fn=_channel_checkpoint_signature,
         quarantine_required=False, heartbeat_s=CHECKPOINT_HEARTBEAT_S,
+        envelope_fn=_channel_checkpoint_envelope, restore_fn=_channel_checkpoint_restore,
     )

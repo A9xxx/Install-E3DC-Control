@@ -6018,7 +6018,10 @@ function e3dcDockerHostUpdateMessage() {
     return "Docker-Installation erkannt. Watchtower ist nicht eingerichtet, deshalb stößt der Container den Imagewechsel nicht selbst an.\n"
          . "Auf dem Docker-Host im Verzeichnis Deiner Compose-Konfiguration ausführen:\n\n"
          . e3dcDockerHostUpdateCommandText()
-         . "\n\nOder einmalig Watchtower freischalten; danach startet dieser Knopf Updates selbst und der Config-Editor bietet Auto-Update:\n\n"
+         . "\n\nOder einmalig Watchtower freischalten; danach startet dieser Knopf Updates selbst und der Config-Editor bietet Auto-Update.\n\n"
+         . "Bei eigenen oder älteren Compose-Dateien müssen E3DC_WATCHTOWER_API_URL und E3DC_WATCHTOWER_API_TOKEN unter environment: an den E3DC-Container übergeben werden; das Token allein in .env reicht nicht.\n"
+         . "Eine feste Image-Zeile (image: …:vX, auch durch --image-tag vX) verhindert neuere Releases über Watchtower.\n\n"
+         . "Auf dem Docker-Host einmalig freischalten:\n\n"
          . e3dcDockerWatchtowerSetupCommandText();
 }
 

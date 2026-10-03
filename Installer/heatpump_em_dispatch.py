@@ -11,18 +11,20 @@ from datetime import datetime
 
 try:
     from . import control_time
+    from .Heat.price_boost import heating_boost_allowed, boost_outdoor_temperature
     from .heatpump_channel_owner import (
-        CHANNELS, advance, migrate_legacy, note_transport, raw_mode,
-        resume_checkpoint, validate_checkpoint,
+        CHANNELS, READBACK_AGE_S, advance, migrate_legacy, note_transport, raw_mode,
+        resume_checkpoint, validate_checkpoint, suspend_ineffective_withdrawal,
     )
     from .heatpump_pv_state import (
         load_heatpump_channel_checkpoint, persist_heatpump_channel_checkpoint,
     )
 except ImportError:
     import control_time
+    from Heat.price_boost import heating_boost_allowed, boost_outdoor_temperature
     from heatpump_channel_owner import (
-        CHANNELS, advance, migrate_legacy, note_transport, raw_mode,
-        resume_checkpoint, validate_checkpoint,
+        CHANNELS, READBACK_AGE_S, advance, migrate_legacy, note_transport, raw_mode,
+        resume_checkpoint, validate_checkpoint, suspend_ineffective_withdrawal,
     )
     from heatpump_pv_state import (
         load_heatpump_channel_checkpoint, persist_heatpump_channel_checkpoint,
@@ -180,7 +182,9 @@ class LuxtronikChannelController:
         self.clock_fault = not bool(self.clock.get("valid"))
         self.requests = {}
         self.pending_offers = {}
+        self.holiday_since_ts = {}
         self.last_result = {}
+        self.last_observed_ww_target_c = None
         self.persisted = self._persist()
 
     def _persist(self):
@@ -297,6 +301,16 @@ class LuxtronikChannelController:
         if day["day"] is None or today > day["day"]:
             day.update({"day": today, "counts": {}, "last_event": None, "blocked": False})
         observations = channel_observations(ctx.get("wp_status"))
+        # Die bestehende Moduserkennung in main() wertet die gemeldeten
+        # Heizungs-/WW-Modi aus; SHI-Modus 0 allein bedeutet keine Ferien.
+        wp_holiday = ctx.get("wp_is_vacation") is True
+        ww_observation = observations["ww"]
+        sample_ts = number(ww_observation.get("sample_ts"))
+        if (not self.checkpoint["channels"]["ww"]["possible_effect"]
+                and ww_observation["valid"] and sample_ts is not None
+                and 0 <= now - sample_ts <= 45.0
+                and ww_observation["target_c"] is not None):
+            self.last_observed_ww_target_c = ww_observation["target_c"]
         offers = list(getattr(wp, "channel_intents", []))
         desired = {name: None for name in CHANNELS}
         automatic = ctx.get("AUTO_MODE") == 1
@@ -330,6 +344,13 @@ class LuxtronikChannelController:
             return E3DC_GAP_USER_TOLERANCE_S if owner_class == "manual" else E3DC_GAP_AUTO_TOLERANCE_S
         status_fresh = bool((ctx.get("wp_status") or {}).get("valid") is True
                             and (ctx.get("wp_status") or {}).get("source_fresh") is True)
+        ww_baseline_readback_fresh = bool(
+            status_fresh and ww_observation["valid"] and sample_ts is not None
+            and 0 <= now - sample_ts <= READBACK_AGE_S
+            and raw_mode(ww_observation["raw_mode"]) is not None
+            and ww_observation["target_c"] is not None
+            and (self.checkpoint["channels"]["ww"]["last_sample_ts"] is None
+                 or sample_ts > self.checkpoint["channels"]["ww"]["last_sample_ts"]))
         if not status_fresh or self.clock_fault:
             hard = True
         # Die vorhandene Policy entscheidet, ob Angebote fachlich zulässig sind.
@@ -423,10 +444,32 @@ class LuxtronikChannelController:
                 continue
             if offer["mode"] == 1:
                 if desired[name] is None or priority[owner] >= rank(desired[name]):
-                    desired[name] = self._desired(owner, name, offer["target_c"], purpose=source)
+                    desired[name] = self._desired(owner, name, offer["target_c"], purpose=offer.get("purpose") or source)
             elif desired[name] and ((source == "timer" and rank(desired[name]) < 0)
                                     or (source != "timer" and rank(desired[name]) <= priority[owner])):
                 desired[name] = None
+        tariff = ctx.get("heat_tariff_shift") or {}
+        if tariff.get("commands_allowed") is True and tariff.get("target") in CHANNELS:
+            target = tariff["target"]
+            # Geschützte und höher priorisierte Aufträge behalten ihren Kanal.
+            others = [s for s in self.checkpoint["channels"].values()
+                      if s["possible_effect"] and s["owner"] != "tariff"]
+            pending_peer = any(v["possible_effect"] for k, v in self.checkpoint["channels"].items() if k != target)
+            if not others and not pending_peer and not any(desired.values()):
+                desired[target] = self._desired("tariff", target, tariff.get("target_c"), identity=tariff)
+        # Die Außentemperatur begrenzt HZ-Boosts, nicht explizite Pausen.
+        # Der Zweck bleibt im Auftrag auch über Rücklesung und Neustart erhalten.
+        if (desired['hz'] and desired['hz']['owner'] == 'price'
+                and not str(desired['hz']['request_id']).startswith('price_pause:')
+                and str((ctx.get('current_config') or {}).get('price_boost_enable', 0)).lower() in ('1', 'true', 'on')):
+            outside = boost_outdoor_temperature((ctx.get('wp_data') or {}).get('Aussentemp_Mittel'))
+            heating_limit = number(ctx.get('HEIZGRENZE_TEMP'))
+            own = self.checkpoint['channels']['hz']
+            running = (own['owner'] == 'price' and own['possible_effect']
+                       and not str(own['request_id']).startswith('price_pause:'))
+            if (outside is None or heating_limit is None or outside > heating_limit
+                    or not heating_boost_allowed(ctx.get('current_config') or {}, outside, running=running)):
+                desired['hz'] = None
         # WW-Sofort hat Vorrang vor HZ; sein bloßes Dateiflag ist jedoch keine
         # Vollmacht zur Übernahme eines fremden SHI-Sollwerts.
         if manual_on and not blocks.intersection({"manual_command_expired", "manual_source_temperature_stop", "manual_low_soc_stop",
@@ -461,7 +504,7 @@ class LuxtronikChannelController:
             for name in CHANNELS:
                 if desired[name] and desired[name]["owner"] == "pv":
                     desired[name] = None
-        if user_off or not automatic or hard:
+        if user_off or not automatic or hard or wp_holiday:
             desired = {name: None for name in CHANNELS}
         if pv_output.get("withdraw"):
             for name in CHANNELS:
@@ -473,11 +516,44 @@ class LuxtronikChannelController:
         physical_hold = bool(ctx.get("WP_TAKT_PROTECT") and last_start > 0
                              and now - last_start < minimum_run)
         signal_hold = bool((ctx.get("heatpump_positive_signal_window") or {}).get("minimum_signal_hold_active"))
+        return_target = number(self.checkpoint["channels"]["ww"].get("pre_boost_target_c"))
+        return_source = "pre_boost_readback"
+        if return_target is None or not 0 <= return_target <= 100:
+            return_target = number(ctx.get("WW_ECO"))
+            return_source = "ww_eco_fallback"
+        if return_target is None or not 0 <= return_target <= 100:
+            return_target, return_source = None, "none"
         actions = []
         hold = {}
         gap_withdraw_at = {}
+        ww_baseline_written_in_gap = False
         for name in CHANNELS:
             state = self.checkpoint["channels"][name]
+            if (wp_holiday and not state["possible_effect"] and state["state"] in (
+                    "ruecknahme_offen", "ruecknahme_gesendet")):
+                self.holiday_since_ts.setdefault(name, max(now, self.checkpoint["updated_ts"]))
+            else:
+                self.holiday_since_ts.pop(name, None)
+            if (wp_holiday or e3dc_gap) and not state["possible_effect"]:
+                # Ferien lassen wirkungslose Kanäle unangetastet. In einer
+                # E3DC-Lücke darf nur die WW-Grundstellung mit frischer
+                # WP-Rücklesung weiter über den normalen Schreibschutz laufen.
+                if wp_holiday:
+                    self.checkpoint = suspend_ineffective_withdrawal(
+                        self.checkpoint, name, now_s=now,
+                        holiday_since_ts=self.holiday_since_ts.get(name))
+                    self.persisted = self._persist()
+                if not wp_holiday and desired[name] is not None:
+                    # Ein neuer Auftrag wartet sichtbar auf gültige E3DC-Daten.
+                    desired[name] = None
+                    hold[name] = {"reason": "e3dc_live_gap", "until_ts": None}
+                if wp_holiday:
+                    continue
+                if name == "ww":
+                    if not ww_baseline_readback_fresh or self.clock_fault:
+                        continue
+                elif state["state"] not in ("ruecknahme_offen", "ruecknahme_gesendet"):
+                    continue
             # Eine E3DC-Datenlücke nimmt einen laufenden Kanal erst nach der
             # Toleranz seines Besitzers zurück; eine unbekannte Dauer zählt als
             # abgelaufen. Ein Kanal ohne mögliche eigene Wirkung hat nichts
@@ -485,7 +561,17 @@ class LuxtronikChannelController:
             # keine Anhebung.
             gap_expired = bool(e3dc_gap and state["possible_effect"]
                                and (gap_elapsed is None or gap_elapsed >= gap_tolerance(state)))
-            channel_hard = bool(hard or gap_expired)
+            # Speicherbelegung allein erhält den bestehenden Mindestlaufzeitschutz.
+            # Schutzvetos und die eigene Datenlückentoleranz bleiben vorrangig.
+            tariff_hard = bool(state["owner"] == "tariff" and (
+                tariff.get("mode") != "active" or tariff.get("storage_safety_veto") is True
+                or any(reason.endswith("_missing_or_blocked")
+                for reason in tariff.get("blockers", [])
+                if reason != "restart_free_missing_or_blocked"
+                and not (reason == "storage_free_missing_or_blocked" and not e3dc_gap)
+                and not (e3dc_gap and reason in (
+                    "data_fresh_missing_or_blocked", "storage_free_missing_or_blocked")))))
+            channel_hard = bool(hard or gap_expired or tariff_hard)
             if channel_hard:
                 desired[name] = None
             elif e3dc_gap and desired[name] is not None:
@@ -533,45 +619,98 @@ class LuxtronikChannelController:
                     hold[name] = {"reason": reason, "until_ts": until}
                 if (not ctx.get("wp_write_allowed") or takt_wait or self.clock_fault):
                     desired[name] = None
+            # Der WW-Grundwert gilt wie ein eingebauter Timer unabhängig vom
+            # Boost. Nur dessen eigene, physisch belegte Laufzeit schützt eine
+            # Rücknahme; ein bloßes Signal oder ein alter Startzeitpunkt nicht.
+            ww_pv_owned = bool(name == "ww" and (state["owner"] in ("pv", "tariff") or wp_holiday)
+                               and state["possible_effect"])
+            boost_left_s = 0.0
+            # Die Laufzeit entscheidet erst bei entfallener Voraussetzung
+            # über die Rücknahme, nicht während eines weiter gültigen Angebots.
+            if ww_pv_owned and (channel_hard or desired[name] is None
+                    or any(desired[name][key] != state[key] for key in ("owner", "target_c"))):
+                sent = number(state.get("sent_ts"))
+                started = number(ctx.get("wp_compressor_last_start_ts"))
+                operating = (ctx.get("wp_data") or {}).get(
+                    "Betriebsart", (ctx.get("wp_status") or {}).get("Betriebsart"))
+                # Betriebsart 3 ist die normalisierte EVU-/Fremdsperre.
+                grid_power = number(ctx.get("grid"))
+                hardware_block = bool(
+                    operating == 3 or self.clock_fault or not status_fresh or gap_expired
+                    or ctx.get("heatpump_signal_typed_protection_stop")
+                    or protection_reason not in ("", "user_off", "emergency_reserve")
+                    or blocks.intersection({"manual_source_temperature_stop"})
+                    or (grid_power is not None and grid_power > 2500.0)
+                    or (grid_power is None and blocks.intersection({
+                        "pre_control_independent_safety_stop", "independent_safety_stop"})))
+                if (not hardware_block and not (state["owner"] == "tariff" and (channel_hard or user_off or not automatic)) and ctx.get("WP_TAKT_PROTECT")
+                        and ctx.get("wp_compressor_observation_valid") is True
+                        and ctx.get("wp_compressor_running_now") is True
+                        and sent is not None and started is not None
+                        and 0 < started <= now and sent <= now):
+                    boost_left_s = max(0.0, minimum_run - (now - max(sent, started)))
+                stop_allowed = boost_left_s <= 0.0
+                if not stop_allowed:
+                    # Nur den bereits eigenen WW-Auftrag halten. HZ und neue
+                    # Starts behalten sämtliche bisherigen Schutzschranken.
+                    pv_transfer = bool(state["owner"] == "tariff" and desired[name]
+                                       and desired[name]["owner"] == "pv"
+                                       and desired[name]["target_c"] == state["target_c"])
+                    if not pv_transfer:
+                        desired[name] = self._desired(state["owner"], name, state["target_c"], identity=state)
+                    channel_hard = False
+                    hold[name] = {"reason": "boost_min_runtime_hold",
+                                  "until_ts": now + boost_left_s,
+                                  "remaining_s": boost_left_s}
             baseline = number(ctx.get("WW_ECO")) if name == "ww" else None
-            if name == "ww" and ctx.get("WW_TIMER_ENABLE") and automatic and not user_off and not channel_hard:
+            if name == "ww" and ctx.get("WW_TIMER_ENABLE"):
                 baseline = number(ctx.get("ww_timer_target_c"))
             timer_offer = self.pending_offers.get(("timer", "ww")) if name == "ww" else None
-            previous_baseline = state["baseline_target_c"]
-            if previous_baseline is None:
-                previous_baseline = number(ctx.get("WW_ECO"))
             observed_target = number(observations[name].get("target_c"))
             timer_idle = bool(
-                timer_offer and desired[name] is None and not state["possible_effect"]
+                name == "ww" and desired[name] is None and not state["possible_effect"]
                 and state["state"] in ("frei", "fremd", "aufgegeben") and not state["alarm"]
                 and not ww_pending and not ww_active and not any(owner_live.values())
-                and automatic and not user_off and not channel_hard and not e3dc_gap
-                and ctx.get("wp_write_allowed") and stop_allowed
-                and observations[name]["valid"] and observed_mode in (0, 1)
-                and observed_target is not None
-                and baseline is not None and timer_offer["target_c"] == baseline
-                and (observed_mode != 1 or observed_target != baseline))
-            if (name == "ww" and not state["possible_effect"] and not timer_idle
-                    and state["state"] in ("frei", "fremd", "aufgegeben") and ctx.get("WW_TIMER_ENABLE")
-                    and automatic and not user_off and not channel_hard):
-                # Bis zur ausführbaren Timer-Absicht bleibt die zuletzt bekannte
-                # Grundstellung die Besitzreferenz, auch am Fensterwechsel.
-                baseline = previous_baseline
+                and (ctx.get("wp_write_allowed") or user_off or not automatic or channel_hard)
+                and (state["withdraw_ack_ts"] is None or now - state["withdraw_ack_ts"] >= 15.0)
+                and not self.clock_fault and observations[name]["valid"]
+                and observed_mode in (0, 1) and observed_target is not None
+                and baseline is not None
+                and (observed_mode != 1 or abs(observed_target - baseline) > 0.5))
+            if (name == "ww" and desired[name] and not state["possible_effect"]
+                    and observed_mode == 1 and observed_target is not None
+                    and state["baseline_target_c"] is not None
+                    and abs(observed_target - state["baseline_target_c"]) <= 0.1):
+                # Ein Fensterwechsel darf die bisher bestätigte Grundstellung
+                # nicht in Fremdbesitz verwandeln und den Booststart sperren.
+                baseline = state["baseline_target_c"]
+            if wp_holiday and name == "ww":
+                # Der Boostwert selbst ist kein Rückkehrziel. Der vor dem
+                # Versand gesicherte Wert bleibt über Neustarts erhalten.
+                baseline = return_target
+                if baseline is None:
+                    hold[name] = {"reason": "ww_boost_return_target_missing", "until_ts": None}
+                    continue
             old = copy.deepcopy(self.checkpoint)
             self.checkpoint, action = advance(
                 self.checkpoint, name, now_s=now, observation=observations[name],
                 desired=desired[name], stop_allowed=bool(stop_allowed),
-                automatic_enabled=bool(automatic and not user_off), protection=bool(channel_hard),
+                automatic_enabled=bool((automatic and not user_off) or boost_left_s > 0), protection=bool(channel_hard),
                 user_hold_s=0.0 if timer_idle else restart_hold, signal_hold_s=600.0,
                 manual_owned=bool(manual_owned and automatic and not user_off and not channel_hard),
                 baseline_target_c=baseline,
-                stop_reason=("user_off" if user_off else (protection_reason or "hard_protection") if hard else
+                release_on_baseline_readback=bool(wp_holiday and name == "ww"),
+                stop_reason=(None if boost_left_s > 0 else "user_off" if user_off else (protection_reason or "hard_protection") if hard else
                              "invalid_control_data" if channel_hard else
                              "timer_target" if timer_idle else
                              "policy_release" if desired[name] is None and any(
                                  offer["channel"] == name and offer["mode"] == 0
                                  for offer in offers) else None),
             )
+            if (name == "ww" and action is not None and action["kind"] == "start"
+                    and not old["channels"][name]["possible_effect"]):
+                # Zusammen mit dem Startintent haltbar sichern, bevor IO läuft.
+                self.checkpoint["channels"][name]["pre_boost_target_c"] = self.last_observed_ww_target_c
             self.persisted = self._persist()
             if action is None:
                 continue
@@ -582,6 +721,9 @@ class LuxtronikChannelController:
                 actions.append({"action": action, "outcome": "intent_not_durable"})
                 continue
             outcome = wp.dispatch_channel_action(action)
+            if (e3dc_gap and name == "ww" and not old["channels"][name]["possible_effect"]
+                    and action["kind"] == "withdraw" and outcome == "written"):
+                ww_baseline_written_in_gap = True
             if (name == "ww" and outcome == "written" and timer_offer
                     and action["mode"] == 1 and action["target_c"] == timer_offer["target_c"]):
                 # Nach erfolgreichem Anwenden entscheidet wieder die bestehende
@@ -616,6 +758,15 @@ class LuxtronikChannelController:
                             "desired": desired, "checkpoint_durable": self.persisted,
                             "load_status": self.load_status, "clock_fault": self.clock_fault,
                             "hold": hold,
+                            "ww_boost_return_target_c": return_target,
+                            "ww_boost_return_source": return_source,
+                            "ww_baseline_suppressed_reason": ("wp_holiday_mode" if wp_holiday else
+                                "e3dc_live_gap" if e3dc_gap and not ww_baseline_readback_fresh else None),
+                            "ww_baseline_written_in_gap": ww_baseline_written_in_gap,
+                            "ww_baseline_target_c": (number(ctx.get("ww_timer_target_c"))
+                                if ctx.get("WW_TIMER_ENABLE") else number(ctx.get("WW_ECO"))),
+                            "ww_boost_active": bool(self.checkpoint["channels"]["ww"]["owner"] == "pv"
+                                and self.checkpoint["channels"]["ww"]["possible_effect"]),
                             "e3dc_gap": {"active": e3dc_gap, "elapsed_s": gap_elapsed,
                                          "withdraw_at_ts": gap_withdraw_at}}
         return copy.deepcopy(self.last_result)

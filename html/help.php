@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.5.3 Stable</span>
+            <span class="badge bg-success text-light">v5.5.3a Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.5.3</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.5.3a</code> in <code>.env</code> gesetzt.</p>
                 <p><strong>Update-Knopf und Auto-Update:</strong> Der Container tauscht sein Image nicht selbst. Läuft das Compose-Profil <code>auto-update</code> (Watchtower-Fork <code>ghcr.io/nicholas-fedor/watchtower</code>), gibt der Knopf <strong>System Update</strong> Watchtower über dessen lokale HTTP-API das Signal: Watchtower lädt das Image, erstellt den Container neu, und die Oberfläche lädt nach dem Start neu. Mit <strong>Auto-Update</strong> im Config-Editor passiert dasselbe täglich zur eingestellten Uhrzeit; Watchtower selbst pollt nicht. Gibt es kein neues Image, passiert nichts.</p>
                 <p>Einmalige Freischaltung auf dem Docker-Host im Compose-Ordner (Token für beide Dienste in <code>.env</code>, Container mit Token neu erstellen, Watchtower starten):</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
@@ -223,6 +223,15 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                     </ol>
                 </div>
             </div>
+        </div>
+
+        <h4 class="mb-4 text-accent">Stable 5.5.3a: Docker-Neustart mit Wärmepumpen-Steuerung</h4>
+        <div class="col-12 faq-item" data-tags="5.5.3a stable docker neustart restart reboot container wärmepumpe private laufzeitdaten migriert ems-worker gestoppt update">
+            <div class="card bg-card border-0 shadow-sm"><div class="card-body">
+                <h5 class="card-title">Was bringt Stable-Release 5.5.3a?</h5>
+                <p>In Docker-Installationen mit Wärmepumpen-Steuerung blieben nach einem Neustart desselben Containers (zum Beispiel nach einem Neustart des Rechners) die Regeldienste gestoppt. Im Log stand „Private Laufzeitdaten konnten nicht sicher migriert werden“. Ursache war, dass die Startprüfung die Zustandsdateien der Wärmepumpen-Steuerung nicht kannte. Das ist behoben; unbekannte Dateien sperren weiter und werden jetzt mit Namen gemeldet.</p>
+                <p><strong>Update:</strong> Wie gewohnt über <strong>System Update</strong> bzw. das Docker-Update; eine Konfigurationsänderung ist nicht nötig. Läuft der Container bereits in dieser Schleife, auf dem Host <code>sudo docker compose pull</code> und danach <code>sudo docker compose up -d</code> ausführen. Bare-Metal-Installationen sind nicht betroffen. Wallbox-, Speicher-, Wärmepumpen- und Hardwarelogik entsprechen unverändert 5.5.3.</p>
+            </div></div>
         </div>
 
         <h4 class="mb-4 text-accent">Stable 5.5.3: Zeitbasis der Historie, Stiebel-ISG-Startfreigabe und Tariffenster-Heizen</h4>

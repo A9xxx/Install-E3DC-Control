@@ -1,9 +1,9 @@
 {
-  "version": "5.5.3",
+  "version": "5.5.3a",
   "min_version": "4.0.0",
-  "stable_release": "v5.5.3",
-  "release_date": "2026-10-04",
-  "description": "v5.5.3 - Zeitbasis der E3DC-Historie, Stiebel-ISG-Startfreigabe, Tariffenster-Heizen (experimentell) und Wärmepumpen-Vorschau",
+  "stable_release": "v5.5.3a",
+  "release_date": "2026-10-05",
+  "description": "v5.5.3a - Korrekturupdate: Docker-Neustart mit Wärmepumpen-Steuerung",
   "update_strategy": "backup_replace_restart_v1",
   "installer_requires": "python3",
   "sanitized_republication": false,

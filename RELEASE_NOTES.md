@@ -1,3 +1,42 @@
+# E3DC-Control v5.5.3a
+
+E3DC-Control 5.5.3a ist ein Korrekturupdate für Docker-Installationen mit
+Wärmepumpen-Steuerung. Wallbox-, Speicher-, Wärmepumpen- und Hardwarelogik
+entsprechen unverändert 5.5.3.
+
+## Korrektur
+
+- **Neustart desselben Containers:** Nach einem Neustart des Rechners, nach
+  `docker compose restart` oder nach `docker compose up -d` auf einen
+  bestehenden Container blieben die Regeldienste gestoppt. Im Log stand
+  „Private Laufzeitdaten konnten nicht sicher migriert werden“. Ursache: Die
+  Startprüfung kannte die Zustandsdateien der Wärmepumpen-Steuerung im privaten
+  Steuerordner nicht. Sie lässt jetzt genau diese drei Dateien samt ihrer
+  temporären Dateien zu, mit bis zu 1 MiB je Datei. Die Zustände bleiben beim
+  Neustart erhalten.
+- **Verständliche Meldung:** Andere unbekannte Einträge sperren weiterhin den
+  Start der Regeldienste. Die Meldung nennt jetzt die Art des Speichers und den
+  Dateinamen, zum Beispiel
+  `private_store_unknown_entry kind=control name=…`.
+
+## Updatehinweise
+
+- **Docker:** Wie gewohnt über den Knopf **System Update** (mit eingerichtetem
+  Watchtower) oder auf dem Host mit `sudo docker compose pull` und
+  `sudo docker compose up -d`. Läuft der Container bereits in der oben
+  beschriebenen Schleife, ist die Weboberfläche nicht erreichbar; dann die
+  beiden Befehle auf dem Host ausführen. Ein fester Pin in `.env` wird bewusst
+  auf `v5.5.3a` geändert.
+- **Bare Metal:** Nicht betroffen. Das Update kann wie gewohnt über
+  **System Update** eingespielt werden; eine Konfigurationsänderung ist nicht
+  nötig.
+- **Von 5.5.2 oder älter:** Das Update führt direkt auf 5.5.3a. Dafür gelten
+  die Updatehinweise von 5.5.3 weiter unten.
+- **Rückfall:** Ein Rückfall auf 5.5.3 oder älter hebt diese Korrektur wieder
+  auf.
+
+---
+
 # E3DC-Control v5.5.3
 
 5.5.3 korrigiert die Zeitbasis der E3/DC-Historie und die Tagesbilanz, behebt eine dauerhaft gesperrte Wärmepumpen-Startfreigabe bei Stiebel ISG mit SG-Ready und gibt der Lastspitzenkappung Vorrang vor dem Tarif-Halt. Neu sind das experimentelle Tariffenster-Heizen (Standard Aus), ein messwertgeführter PV-Boost ohne Startreservierung, eine Wärmepumpen-Vorschau mit Pumpensignalen und Hover-Texte für alle Felder des Config-Editors. Das Update benötigt keine zwingende Konfigurationsänderung.

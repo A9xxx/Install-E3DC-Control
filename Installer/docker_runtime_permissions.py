@@ -49,6 +49,20 @@ _ML_TEMP = r"\.(?:ml_model-[0-9a-f]{64}\.pkl|ml_model\.manifest\.json)\.tmp\.[1-
 _CONTROL_NAME = r"wallbox_openwb_pro_control_lease(?:_wb(?:[1-9]|[1-5][0-9]|6[0-4]))?\.json"
 
 
+# Gespiegelt aus heatpump_pv_state; der Regressionstest bindet Namen und Limit.
+# Der Starthelfer bleibt dadurch unabhängig vom Import des WP-Schreibers.
+_HEATPUMP_NAMES = frozenset({
+    "heatpump_pv_energy_state.json", "heatpump_pv_command_state.json",
+    "heatpump_channel_owners.json",
+})
+_HEATPUMP_TEMP = r"\.heatpump-pv-[0-9a-f]{32}\.tmp"
+MAX_HEATPUMP_BYTES = 1024 * 1024
+
+
+def _heatpump_allowed(name: str) -> bool:
+    return name in _HEATPUMP_NAMES or bool(re.fullmatch(_HEATPUMP_TEMP, name))
+
+
 class PrivateRuntimeError(RuntimeError):
     """Ein privater Pfad lässt sich nicht eindeutig und sicher binden."""
 
@@ -113,9 +127,10 @@ def _regular_allowed(name: str, kind: str) -> bool:
             "pv_forecast_evidence.db", "pv_forecast_evidence.db-wal",
             "pv_forecast_evidence.db-shm", "pv_forecast_evidence.db-journal", "writer.lock",
         }
-    if kind == "control":
+    if kind in {"control", "legacy-control"}:
         return bool(
-            re.fullmatch(_CONTROL_NAME + r"(?:\.lock)?", name)
+            (kind == "control" and _heatpump_allowed(name))
+            or re.fullmatch(_CONTROL_NAME + r"(?:\.lock)?", name)
             or re.fullmatch(r"\." + _CONTROL_NAME + r"\.[0-9a-f]{16}\.tmp", name)
         )
     if kind == "quarantine":
@@ -219,7 +234,7 @@ def _bind_store(path: Path, kind: str, *, parent: int | None = None, require_mou
         mount_id = _mount_id(descriptor)
         if require_mount and mount_id == _mount_id(parent_fd):
             _fail("private_store_volume_mount_missing")
-        if kind == "control" and mount_id != _mount_id(parent_fd):
+        if kind in {"control", "legacy-control"} and mount_id != _mount_id(parent_fd):
             _fail("private_control_state_foreign_mount")
         bound = BoundStore(path, kind, parent_fd, descriptor, opened, mount_id)
         total_size = 0
@@ -230,9 +245,14 @@ def _bind_store(path: Path, kind: str, *, parent: int | None = None, require_mou
                     _fail("private_archive_foreign_mount")
                 continue
             if not _regular_allowed(name, kind):
-                _fail("private_store_unknown_entry")
+                safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:64]
+                _fail(f"private_store_unknown_entry kind={kind} name={safe_name}")
             metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-            size_limit = MAX_DATABASE_BYTES if kind == "forecast" else 32 * 1024 if kind == "control" else MAX_MODEL_BYTES
+            size_limit = (
+                MAX_DATABASE_BYTES if kind == "forecast" else
+                MAX_HEATPUMP_BYTES if kind == "control" and _heatpump_allowed(name) else
+                32 * 1024 if kind in {"control", "legacy-control"} else MAX_MODEL_BYTES
+            )
             if (
                 not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
                 or metadata.st_uid not in {0, RUNTIME_UID}
@@ -438,9 +458,9 @@ def _bind_control_plan(action: str) -> ControlPlan:
     source = destination = None
     try:
         if os.path.lexists(source_path):
-            source = _bind_store(source_path, "control")
+            source = _bind_store(source_path, "control" if source_path == target else "legacy-control")
         if os.path.lexists(destination_path):
-            destination = _bind_store(destination_path, "control")
+            destination = _bind_store(destination_path, "control" if destination_path == target else "legacy-control")
         else:
             # Der Elternpfad des Altziels existiert immer; der neue Runtime-
             # Parent wurde oben entweder gebunden oder als fehlend belegt.
@@ -471,7 +491,9 @@ def _apply_control_plan(plan: ControlPlan) -> None:
             _fail("private_control_state_missing")
         _apply_store(plan.destination, plan.action)
         if plan.source is not None and plan.source.files:
-            _fail("private_control_source_not_empty")
+            if plan.action != "check-root" or any(not _heatpump_allowed(item.name) for item in plan.source.files):
+                _fail("private_control_source_not_empty")
+            _apply_store(plan.source, plan.action)
         return
     if plan.action == "rollback-root" and plan.source is None:
         return
@@ -479,7 +501,7 @@ def _apply_control_plan(plan: ControlPlan) -> None:
         if plan.action == "migrate" and not plan.runtime_parent_exists:
             _make_root_directory(Path(CONTROL_STATE_ROOT), 0o755, must_create=True)
         _make_root_directory(plan.destination_path, 0o700, must_create=True)
-        plan.destination = _bind_store(plan.destination_path, "control")
+        plan.destination = _bind_store(plan.destination_path, "control" if plan.action == "migrate" else "legacy-control")
     if plan.source is not None:
         if plan.source.mount_id != plan.destination.mount_id:
             _fail("private_control_state_cross_mount")
@@ -487,7 +509,12 @@ def _apply_control_plan(plan: ControlPlan) -> None:
     _set_directory_owner(plan.destination, 0, 0)
     if plan.source is not None:
         for item in list(plan.source.files):
+            # WP-Zustände gehören nur zum Runtime-Pfad, auch beim Rückweg.
+            if plan.action == "rollback-root" and _heatpump_allowed(item.name):
+                continue
             _move_file(plan.source, plan.destination, item, item.name)
+        if plan.action == "rollback-root":
+            _apply_store(plan.source, plan.action)
     _apply_store(plan.destination, plan.action)
 
 

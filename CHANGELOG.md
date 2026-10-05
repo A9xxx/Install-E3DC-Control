@@ -6,6 +6,12 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.5.3a] – 2026-10-05
+
+### Docker
+
+- Nach einem Neustart desselben Containers (Neustart des Rechners, `docker compose restart` oder `docker compose up -d` auf einen bestehenden Container) blieben die EMS-Dienste gestoppt, sobald die Wärmepumpen-Steuerung ihren Zustand im privaten Steuerordner abgelegt hatte (`private_store_unknown_entry`). Die Startprüfung kennt jetzt die drei Zustandsdateien der Wärmepumpen-Steuerung samt ihrer temporären Dateien und erlaubt für sie bis 1 MiB. Unbekannte Einträge sperren weiterhin; die Meldung nennt jetzt Art des Speichers und Dateinamen. Beim Rückweg zum Root-Betrieb bleiben die Wärmepumpen-Zustände im Laufzeitordner.
+
 ## [5.5.3] – 2026-10-04
 
 ### Wallbox

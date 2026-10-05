@@ -5,11 +5,21 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.5.3`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.5.3a`. Das Dashboard startet ausschließlich
 den argumentlosen, root-eigenen Systemjob. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
+
+5.5.3a ist ein Korrekturupdate für Docker-Installationen mit
+Wärmepumpen-Steuerung: Nach einem Neustart desselben Containers blieben die
+Regeldienste gestoppt. Das Update läuft wie gewohnt über **System Update** bzw.
+das [Docker-Update](#docker-update); eine Konfigurationsänderung ist nicht
+nötig. Startet der Container bereits in einer Schleife mit „Private
+Laufzeitdaten konnten nicht sicher migriert werden“, auf dem Host
+`sudo docker compose pull` und danach `sudo docker compose up -d` ausführen.
+Einzelheiten stehen in den [Release Notes](../RELEASE_NOTES.md). Für ein Update
+von 5.5.2 oder älter gelten zusätzlich die folgenden Hinweise zu 5.5.3.
 
 5.5.3 korrigiert die Zeitbasis der E3/DC-Historie und die Tagesbilanz, behebt eine dauerhaft gesperrte Wärmepumpen-Startfreigabe bei Stiebel ISG mit SG-Ready und gibt der Lastspitzenkappung Vorrang vor dem Tarif-Halt. Neu sind das experimentelle Tariffenster-Heizen (Standard Aus), eine Wärmepumpen-Vorschau mit Pumpensignalen und Hover-Texte für alle Felder im Config-Editor. Das Update benötigt keine Konfigurationsänderung. Einzelheiten stehen in den [Release Notes](../RELEASE_NOTES.md). Für ein Update von 5.4.x gelten zusätzlich die Hinweise zu 5.5.0a und 5.5.0 weiter unten.
 

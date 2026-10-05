@@ -2,8 +2,8 @@
 
 Veröffentlichte Images entstehen ausschließlich aus einem versionierten stabilen Release-Tag. `latest` verweist damit auf die zuletzt veröffentlichte stabile Version.
 
-Der aktuelle Stable-Stand ist `v5.5.3`. Die Tags `latest`, `v5.5.3` und
-`5.5.3` bezeichnen denselben Stable-Stand.
+Der aktuelle Stable-Stand ist `v5.5.3a`. Die Tags `latest`, `v5.5.3a` und
+`5.5.3a` bezeichnen denselben Stable-Stand.
 
 **Updates im Überblick:** Der Knopf **System Update** in der Weboberfläche und
 das **Auto-Update** im Config-Editor geben dem optionalen Watchtower-Dienst das
@@ -131,14 +131,14 @@ installieren, anschließend das Ziel ausdrücklich wählen:
 
 ```bash
 curl -q -fsS --proto '=https' --tlsv1.2 \
-  -o ./docker_compose_update-5.5.3.py \
-  https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control/v5.5.3/Installer/docker_compose_update.py
+  -o ./docker_compose_update-5.5.3a.py \
+  https://raw.githubusercontent.com/A9xxx/Install-E3DC-Control/v5.5.3a/Installer/docker_compose_update.py
 if [ ! -d ./Installer ]; then
   sudo install -d -m 0755 ./Installer
 fi
-sudo install -m 0644 ./docker_compose_update-5.5.3.py ./Installer/docker_compose_update.py
+sudo install -m 0644 ./docker_compose_update-5.5.3a.py ./Installer/docker_compose_update.py
 sudo python3 ./Installer/docker_compose_update.py \
-  --compose-dir . --sudo --image-tag v5.5.3
+  --compose-dir . --sudo --image-tag v5.5.3a
 ```
 
 Der aktuelle Helfer akzeptiert die gebundene gestoppte Altinstanz, ergänzt bei
@@ -692,7 +692,7 @@ Ohne ausdrücklichen Tag verwendet der Helfer das Image des ausgewählten Dienst
 Die mitgelieferte variable Zeile folgt ohne `E3DC_IMAGE_TAG` dem geprüften Stable-Tag
 `latest`. Ein vorhandener fester Tag bleibt absichtlich bestehen.
 
-`--image-tag v5.5.3` funktioniert auch bei einer fest eingetragenen OMV-Imagezeile.
+`--image-tag v5.5.3a` funktioniert auch bei einer fest eingetragenen OMV-Imagezeile.
 Der Helfer schreibt diese Auswahl dauerhaft nur in das `image:`-Feld des
 Zieldienstes. Die `.env` und das Image anderer E3DC-Dienste bleiben unverändert.
 Bei einem gescheiterten Update wird die vorherige Zeile im Rahmen des verifizierten
@@ -714,7 +714,7 @@ sudo docker compose config --images e3dc-control
 
 Gezielte Rückfallversion:
 
-Den Stable-Container `v5.5.3` auf den veröffentlichten Rollback-Root
+Den Stable-Container `v5.5.3a` auf den veröffentlichten Rollback-Root
 `v5.3.2b` zurücksetzen:
 
 ```bash
@@ -999,7 +999,7 @@ Port, etwa `E3DC_PUBLISH_BIND=192.0.2.20` und `E3DC_PUBLISH_PORT=8085`.
 Verwende denselben Compose-Ordner und Projektnamen. Sichere vorher die
 funktionierende `docker-compose.yml` als `docker-compose.host.bak`, die
 vorhandene `.env` und die persistenten Daten. Halte den aktuell eingesetzten
-versionierten Runtime-Image-Tag für den Rückweg fest, beispielsweise `v5.5.3`.
+versionierten Runtime-Image-Tag für den Rückweg fest, beispielsweise `v5.5.3a`.
 Ein älterer Root-Tag eignet sich nicht für diesen ersten Netzwerk-Rückweg.
 Prüfe eine administrativ zugängliche Kopie der aktuellen
 Konfiguration, ohne ihren Inhalt auszugeben:
@@ -1151,6 +1151,19 @@ zustandserhaltender Prozessneustart. Führe solche Wartungsarbeiten bei
 beendeter Fahrzeugladung und ohne laufende Phasen-/Steuerübergabe aus und
 prüfe den Wiederanlauf. Eine Persistenz dieses privaten Steuerzustands über
 Container-Recreates hinaus ist damit nicht zugesichert.
+
+Auch die drei WP-Zustandsdateien (`heatpump_pv_energy_state.json`,
+`heatpump_pv_command_state.json`, `heatpump_channel_owners.json`) liegen im
+privaten Laufzeitordner und bleiben beim Neustart desselben Containers erhalten.
+Zulässige temporäre Dateien des WP-Schreibers verhindern den Neustart ebenfalls
+nicht. Beim Rückweg zum Root-Betrieb bleiben WP-Dateien im Laufzeitordner;
+sie werden nicht in den bisherigen Steuerordner übertragen.
+
+Meldet der Start `private_store_unknown_entry kind=control name=…`, enthält der
+private Steuerordner einen nicht zugelassenen Eintrag. `kind` nennt die Art des
+Speichers, `name` den auf 64 Zeichen begrenzten Dateinamen mit ersetzten
+Sonderzeichen. Die EMS-Dienste bleiben zur Sicherheit gestoppt. Prüfe den
+genannten Eintrag und seine Herkunft; lösche private Zustände nicht pauschal.
 
 Folgende Python-Dienste startet die `entrypoint.sh`. Persistente Dienstlogs liegen unter `/var/www/html/logs/`; Einträge mit „Docker-Engine-Log“ erscheinen in `docker compose logs`:
 
@@ -1330,7 +1343,7 @@ ihre Weboberfläche nennt höchstens die Host-Befehle.
    beschrieben: die unveränderte mitgelieferte Datei ersetzen; eine vom
    Installer erzeugte Datei mit `./data`- und `./logs`-Ordnern sowie OMV- und
    eigene Dateien nicht ersetzen, sondern die Änderungen übertragen.
-2. Einen festen Pin in `.env` gegebenenfalls bewusst auf `v5.5.3` ändern.
+2. Einen festen Pin in `.env` gegebenenfalls bewusst auf `v5.5.3a` ändern.
    Wer noch kein Watchtower-Token hat (`grep -c '^E3DC_WATCHTOWER_API_TOKEN=.' .env`
    zählt nicht leere Einträge, ohne das Token auszugeben; `0` bedeutet kein Eintrag), trägt es jetzt mit dem zweiten Befehl aus
    „Watchtower einmalig freischalten“ in `.env` ein. Dann erstellt der

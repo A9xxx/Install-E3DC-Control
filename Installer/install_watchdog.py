@@ -1371,8 +1371,40 @@ class WatchdogBundleInstaller:
             )
         self._run(["/usr/bin/bash", "-n", str(candidates["notify"])])
         self._run(["/usr/bin/bash", "-n", str(candidates["guard"])])
-        self._run(["/usr/bin/systemd-analyze", "verify", str(candidates["service"])])
+        self._verify_service_candidate(candidates["service"])
         return candidates
+
+    def _verify_service_candidate(self, candidate: Path) -> None:
+        """Prüft die Kandidaten-Unit, bevor die eigenen Skripte installiert sind.
+
+        Ab systemd 257 (Debian 13) meldet ``systemd-analyze verify`` ein noch
+        nicht vorhandenes ExecStart-Programm als Fehler. Bei der Erstinstallation
+        liegt das Guard-Skript erst nach dieser Prüfung an seinem Platz; genau
+        dieser eine Befund ist dann zulässig. Die systemd-Transaktion prüft die
+        Unit nach der Dateiinstallation erneut vollständig.
+        """
+        result = self._run(
+            ["/usr/bin/systemd-analyze", "verify", str(candidate)],
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+        guard = str(self.paths.guard)
+        expected = f"Command {guard} is not executable: No such file or directory"
+        findings = [
+            line.strip()
+            for line in f"{result.stderr}\n{result.stdout}".splitlines()
+            if line.strip()
+        ]
+        if (
+            findings
+            and not os.path.lexists(guard)
+            and all(line.endswith(expected) for line in findings)
+        ):
+            return
+        raise WatchdogTransitionError(
+            f"systemd-analyze scheiterte mit Exitcode {result.returncode}"
+        )
 
     def _capture_snapshot(self, target: Path, tx_dir: Path, index: int) -> _FileSnapshot:
         self._validate_target(target)

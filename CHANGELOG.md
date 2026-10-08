@@ -6,6 +6,17 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.5.3b] – 2026-10-09
+
+### Installation
+
+- Neuinstallation auf Bare Metal: Die Einrichtung von Web-Wrapper und sudoers verlangte seit 5.4.5 einen bereits installierten Stable-Updater; eine Neuinstallation brach deshalb in Schritt 1 ab. Bei einer Neuinstallation werden Wrapper und sudoers jetzt einmalig aus dem geklonten Stand eingerichtet, gebunden an dessen Git-Commit und nur, solange keine dieser Dateien und keine E3DC-eigene sudoers-Zeile existiert. Sind sie bereits byte-gleich vorhanden, bleibt alles unverändert; sonst gilt weiter die Prüfung über den Stable-Updater.
+- Debian 13 (Raspberry Pi OS Trixie) setzt für normale Benutzer umask 0002. Vor Schritt 1 verlieren die von Git geführten Programmdateien das Gruppen- und Fremdschreibrecht; Befehle als Installationsbenutzer (venv, Python-Pakete) laufen mit umask 022, ein zu offenes venv wird bereinigt. Rechte werden dabei nur entzogen, nie erweitert.
+- systemd 252 (Debian 12): Meldet `systemctl is-enabled` einen nicht vorhandenen Dienst nur als „Failed to get unit file state … No such file or directory“, gilt er als nicht vorhanden; vorher brach die Watchdog-Einrichtung auf Bookworm ab.
+- systemd 257: Fehlt bei einem nicht vorhandenen Dienst nur `ExecStart`, gilt das wie früher als leer. Ein noch nicht geladener Dienst darf ausschließlich den byte-genau geprüften RAM-Disk-Drop-in besitzen. Die Watchdog-Einrichtung akzeptiert vor der Installation ihres Guard-Skripts genau den Befund „Command … is not executable“ für dieses Skript; die vollständige Prüfung folgt nach der Installation.
+- Webportal: Die Laufzeitschutzprobe akzeptiert HTTP 404 für die Ordner `data`, `logs`, `ramdisk`, `tmp` und `history_backups` nur, solange der Ordner nicht existiert.
+- Erneuter Installationslauf: Ein in den Installer-Metadaten gespeichertes, aber noch nicht angelegtes venv gilt als „noch kein venv“ statt als Fehler.
+
 ## [5.5.3a] – 2026-10-05
 
 ### Docker

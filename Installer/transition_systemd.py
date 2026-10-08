@@ -332,6 +332,15 @@ class SystemdTransitionManager:
         value = self._first_state_line(result)
         if not value and result.returncode in {1, 4, 5}:
             value = "not-found"
+        # systemd bis Version 252 (Debian 12) meldet eine nicht vorhandene Unit
+        # nur auf stderr; neuere Versionen geben „not-found“ aus.
+        if (
+            result.returncode in {1, 4, 5}
+            and not str(result.stdout or "").strip()
+            and value
+            == f"failed to get unit file state for {unit_name.lower()}: no such file or directory"
+        ):
+            value = "not-found"
         if value not in SUPPORTED_ENABLED_STATES:
             raise UnitSafetyError(f"unsupported is-enabled state for {unit_name}")
         return value

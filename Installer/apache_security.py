@@ -48,6 +48,14 @@ LEGACY_HISTORY_PROBE_URL = (
     "http://127.0.0.1/history_backups/.e3dc-security-probe"
 )
 LEGACY_HISTORY_PATH = Path("/var/www/html/history_backups")
+# Ordnerproben, für die HTTP 404 nur bei tatsächlich fehlendem Ordner zulässig ist.
+RUNTIME_PROBE_DIRECTORIES = {
+    "http://127.0.0.1/data/.e3dc-security-probe": Path("/var/www/html/data"),
+    "http://127.0.0.1/logs/.e3dc-security-probe": Path("/var/www/html/logs"),
+    "http://127.0.0.1/ramdisk/.e3dc-security-probe": Path("/var/www/html/ramdisk"),
+    "http://127.0.0.1/tmp/.e3dc-security-probe": Path("/var/www/html/tmp"),
+    LEGACY_HISTORY_PROBE_URL: LEGACY_HISTORY_PATH,
+}
 
 
 def _regular_file_bytes(
@@ -480,15 +488,17 @@ def apache_runtime_paths_protected() -> bool:
             exc.close()
         except (OSError, urllib.error.URLError, ValueError):
             return False
+        probe_directory = RUNTIME_PROBE_DIRECTORIES.get(url)
         if (
-            url == LEGACY_HISTORY_PROBE_URL
+            probe_directory is not None
             and status == 404
-            and not os.path.lexists(LEGACY_HISTORY_PATH)
+            and not os.path.lexists(probe_directory)
         ):
-            # Auf aktuellen Installationen existiert dieser historische
-            # DocumentRoot-Pfad nicht mehr. Ein echtes HTTP 404 belegt dann,
-            # dass gegenwärtig keine Datei ausgeliefert wird; sobald der Pfad
-            # existiert, bleibt ausschließlich HTTP 403 zulässig.
+            # Fehlt der Laufzeitordner (historischer history_backups-Pfad auf
+            # aktuellen Installationen; logs, ramdisk und tmp bei einer
+            # Erstinstallation vor ihren eigenen Schritten), belegt ein echtes
+            # HTTP 404, dass dort gegenwärtig nichts ausgeliefert wird. Sobald
+            # der Ordner existiert, bleibt ausschließlich HTTP 403 zulässig.
             continue
         if status != 403:
             return False

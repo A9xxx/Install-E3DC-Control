@@ -1,14 +1,14 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.5.3a</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.5.3b</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.5.3a**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.5.3b**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
 
-5.5.3a ist ein Korrekturupdate für Docker-Installationen mit Wärmepumpen-Steuerung: Nach einem Neustart desselben Containers, zum Beispiel nach einem Neustart des Rechners, blieben die Regeldienste gestoppt, weil die Startprüfung die Zustandsdateien der Wärmepumpen-Steuerung nicht kannte. Das ist behoben. Bare-Metal-Installationen sind nicht betroffen. Das Update läuft wie gewohnt über **System Update** bzw. das Docker-Update; eine Konfigurationsänderung ist nicht nötig.
+5.5.3b ist ein Korrekturupdate für die Neuinstallation auf Bare Metal: Eine Neuinstallation nach der Anleitung brach bei der Einrichtung der Systemrechte ab, unter Raspberry Pi OS Trixie (Debian 13) zusätzlich schon bei den Systempaketen. Das ist behoben, und ein abgebrochener Installationsversuch lässt sich mit derselben Anleitung fortsetzen. Bestehende Installationen aktualisieren wie gewohnt über **System Update** bzw. das Docker-Update; eine Konfigurationsänderung ist nicht nötig.
 
 Gegenüber 5.5.2 bringt das Update außerdem die Neuerungen von 5.5.3: 5.5.3 korrigiert die Zeitbasis der E3/DC-Historie und die Tagesbilanz, behebt eine dauerhaft gesperrte Wärmepumpen-Startfreigabe bei Stiebel ISG mit SG-Ready und gibt der Lastspitzenkappung Vorrang vor dem Tarif-Halt. Neu sind das experimentelle Tariffenster-Heizen (Standard Aus), eine Wärmepumpen-Vorschau mit Pumpensignalen und Hover-Texte für alle Felder im Config-Editor. Das Update benötigt keine Konfigurationsänderung. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
 
@@ -50,7 +50,7 @@ sondern eine eindeutige Auswahl verlangt.
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
 
-> **Neu in 5.5.3a:** Docker-Container mit Wärmepumpen-Steuerung starten nach einem Neustart wieder mit allen Regeldiensten. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
+> **Neu in 5.5.3b:** Die Neuinstallation auf Raspberry Pi OS Bookworm und Trixie läuft wieder durch. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
 
 > **Neu in 5.5.3:** Korrigierte Zeitbasis der E3/DC-Historie und Tagesbilanz je Kalendertag, behobene Stiebel-ISG-Startfreigabe, Vorrang der Lastspitzenkappung vor dem Tarif-Halt, experimentelles Tariffenster-Heizen (Standard Aus), Wärmepumpen-Vorschau mit Pumpensignalen und Hover-Texte im ganzen Config-Editor. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
 
@@ -535,7 +535,7 @@ sudo docker compose logs --tail=80 e3dc-control
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin oder Rückfall wird
-> `E3DC_IMAGE_TAG=v5.5.3a` in `.env` gesetzt und `sudo docker compose up -d`
+> `E3DC_IMAGE_TAG=v5.5.3b` in `.env` gesetzt und `sudo docker compose up -d`
 > ausgeführt. `config --images` zeigt vor dem Pull das tatsächlich gewählte
 > Image.
 

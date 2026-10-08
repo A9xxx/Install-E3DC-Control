@@ -672,12 +672,59 @@ PYTHON_PACKAGES = [
 
 
 def _command_argv_as_user(argv, install_user):
-    """Bindet eine Argumentliste ohne Shell an den Installationsbenutzer."""
+    """Bindet eine Argumentliste ohne Shell an den Installationsbenutzer.
+
+    Debian 13 setzt über pam_umask für normale Benutzer umask 0002, auch in
+    einer sudo-Sitzung. Dateien des Installationsbenutzers (venv, Pakete)
+    entstehen deshalb ausdrücklich mit umask 022; die Argumente bleiben
+    unverändert und werden nicht von einer Shell ausgewertet.
+    """
     account = pwd.getpwnam(str(install_user))
     command = [str(item) for item in argv]
     if os.geteuid() == account.pw_uid:
         return command
-    return ["sudo", "-H", "-u", account.pw_name, "--", *command]
+    return [
+        "sudo", "-H", "-u", account.pw_name, "--",
+        "/bin/sh", "-c", 'umask 022 && exec "$@"', "e3dc-umask",
+        *command,
+    ]
+
+
+def strip_group_other_write(path, owner_uid):
+    """Entfernt Gruppen- und Fremdschreibrecht von einer Datei oder einem Ordner.
+
+    Nur reguläre Dateien und Ordner im Besitz von ``owner_uid``; Symlinks und
+    fremde Einträge bleiben unberührt. Liefert True, wenn geändert wurde.
+    """
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    if metadata.st_uid != owner_uid or not (
+        stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)
+    ):
+        return False
+    if not stat.S_IMODE(metadata.st_mode) & 0o022:
+        return False
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    if stat.S_ISDIR(metadata.st_mode):
+        flags |= getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(str(path), flags)
+    except OSError:
+        return False
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino, opened.st_uid) != (
+            metadata.st_dev,
+            metadata.st_ino,
+            owner_uid,
+        ):
+            return False
+        os.fchmod(descriptor, stat.S_IMODE(opened.st_mode) & ~0o022)
+        return True
+    finally:
+        os.close(descriptor)
 
 
 def _validated_venv_name(value):
@@ -1229,6 +1276,21 @@ def setup_venv(show_header=False, requested_venv_name=None):
     else:
         print("✓ venv existiert bereits.")
 
+    # Ein unter umask 0002 entstandenes venv (Debian 13, abgebrochene
+    # Erstinstallation) wäre für die Gruppe schreibbar. Das Recht wird nur
+    # entzogen, nie erweitert; die Vertrauensprüfung danach bleibt unverändert.
+    try:
+        venv_owner = pwd.getpwnam(str(install_user)).pw_uid
+        repaired = 0
+        for current, _dirnames, filenames in os.walk(venv_path, followlinks=False):
+            for target in (current, *(os.path.join(current, name) for name in filenames)):
+                if strip_group_other_write(target, venv_owner):
+                    repaired += 1
+        if repaired:
+            print(f"✓ Schreibrechte im venv bereinigt: {repaired} Einträge ohne Gruppen- und Fremdschreibrecht.")
+    except Exception as exc:
+        print(f"  [!] Schreibrechte im venv nicht geprüft: {exc}")
+
     try:
         require_bound_venv_runtime(
             install_user=install_user,
@@ -1369,8 +1431,14 @@ def cleanup_legacy_python_packages(use_venv=True):
     print("  ✓ Veraltete Pakete entfernt (Speicherplatz freigegeben).")
 
 
-def install_system_packages(use_venv=True):
-    """Installiert alle notwendigen Systempakete."""
+def install_system_packages(use_venv=True, first_install=False):
+    """Installiert alle notwendigen Systempakete.
+
+    ``first_install`` kommt nur aus der Installation über das Konsolenmenü
+    (Zustand „frisch“ oder „unvollständig“). Es erlaubt die einmalige
+    Ersteinrichtung von Wrapper und sudoers aus dem geklonten Stand, solange
+    noch keine privilegierte E3DC-Datei existiert.
+    """
     print("\n=== Systempakete installieren ===\n")
     system_logger.info("Starte Installation der System- und Python-Pakete.")
 
@@ -1438,7 +1506,7 @@ def install_system_packages(use_venv=True):
             return False
 
     # Wrapper & Sudoers für Web-UI Task Manager einrichten
-    setup_service_wrapper()
+    setup_service_wrapper(first_install=first_install)
 
     print("\n✓ Systempakete vollständig installiert.\n")
     system_logger.info("Installation der Pakete abgeschlossen.")
@@ -1446,7 +1514,7 @@ def install_system_packages(use_venv=True):
     return True
 
 
-def setup_service_wrapper():
+def setup_service_wrapper(first_install=False):
     """Delegiert Wrapper und sudoers an den zentralen fail-closed Reparaturpfad."""
     print("→ Richte Web-UI Service Wrapper ein...")
     from . import web_installer
@@ -1455,7 +1523,10 @@ def setup_service_wrapper():
         print("  ✓ Docker: kein systemd-/sudoers-Wrapper erforderlich.")
         return True
 
-    result = web_installer.repair_permissions(repair_runtime=False)
+    if first_install:
+        result = web_installer.repair_permissions_first_install()
+    else:
+        result = web_installer.repair_permissions(repair_runtime=False)
     if not result.get("success"):
         message = result.get("message") or "Wrapper-/sudoers-Reparatur fehlgeschlagen."
         system_logger.error("Zentrale Wrapper-/sudoers-Reparatur fehlgeschlagen: %s", result)
@@ -2180,6 +2251,14 @@ def _systemd_show_contract(unit, *, allow_incomplete_optional_not_found=False):
             raise RuntimeError(f"systemd-Show-Vertrag von {unit} ist widersprüchlich")
         values[key] = value
     incomplete_optional_not_found = False
+    if (
+        expected - set(values) == {"ExecStart"}
+        and values.get("LoadState", "").lower() == "not-found"
+    ):
+        # systemd ab Version 257 (Debian 13) gibt ExecStart für eine nicht
+        # vorhandene Unit nicht mehr aus; ältere Versionen meldeten es leer.
+        # Die Prüfungen auf inaktiv und fehlende Fragmente bleiben unverändert.
+        values["ExecStart"] = ""
     if set(values) != expected:
         absent_values = {
             "UnitFileState": values.get("UnitFileState", ""),
@@ -3144,7 +3223,18 @@ def _allowed_unit_dropin_preimages(
         if directory_descriptor is not None:
             os.close(directory_descriptor)
         os.close(parent_descriptor)
-    if (ramdisk_path in preimages) != (ramdisk_path in named_dropins):
+    # systemd ab Version 257 (Debian 13) meldet für eine noch nicht vorhandene
+    # Unit keine Drop-ins, auch wenn der RAM-Disk-Drop-in schon liegt (er
+    # entsteht bei der Erstinstallation vor der Unit). Sein Inhalt ist oben
+    # byte-genau geprüft; ohne Unit ist er wirkungslos.
+    loaded_dropins_unreported = (
+        str(state.get("load_state") or "").lower() == "not-found"
+        and not named_dropins
+    )
+    if (
+        (ramdisk_path in preimages) != (ramdisk_path in named_dropins)
+        and not loaded_dropins_unreported
+    ):
         raise RuntimeError(
             f"On-Disk- und geladener Drop-in-Vertrag von {unit} weichen ab"
         )
@@ -3198,7 +3288,25 @@ def capture_systemd_service_bundle(
             expected_recovery_dropins=expected_for_unit,
             inert_preimages_out=inert_dropin_preimages,
         )
-        if preimage is None and (named_dropins or dropin_preimages):
+        # Bei der Erstinstallation legt der RAM-Disk-Schritt den freigegebenen
+        # Drop-in an, bevor die Unit entsteht. Nur dieser byte-genau geprüfte
+        # Drop-in ist ohne Hauptunit zulässig; jeder andere bleibt ein Abbruch.
+        ramdisk_dropin_path = os.path.join(
+            "/etc/systemd/system",
+            unit + ".d",
+            _RAMDISK_DROPIN_NAME,
+        )
+        only_bound_ramdisk_dropin = (
+            set(dropin_preimages) == {ramdisk_dropin_path}
+            and named_dropins <= {ramdisk_dropin_path}
+            and not inert_dropin_preimages
+            and state["load_state"] == "not-found"
+        )
+        if (
+            preimage is None
+            and (named_dropins or dropin_preimages)
+            and not only_bound_ramdisk_dropin
+        ):
             raise RuntimeError(
                 f"{unit} besitzt ohne gebundene Hauptunit einen Drop-in"
             )

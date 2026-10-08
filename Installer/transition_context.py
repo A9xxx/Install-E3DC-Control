@@ -366,7 +366,19 @@ def get_transition_context(
             raise TransitionContextError("Venv-Metadaten sind widersprüchlich")
         venv_path = ""
         venv_python = ""
-        if venv_values:
+        # Eine abgebrochene Erstinstallation speichert den venv-Pfad, bevor
+        # SCHRITT 1 das venv anlegt. Fehlt der gespeicherte Pfad vollständig,
+        # gilt wie ohne Metadaten „noch kein venv“, damit ein erneuter Lauf
+        # die Installation fortsetzen kann. Ausdrücklich übergebene Pfade,
+        # Symlinks und Dateien an dieser Stelle bleiben Fehler.
+        pending_venv = bool(
+            venv_values
+            and not explicit_venv_path
+            and not bootstrap_venv
+            and Path(str(venv_values[0])).is_absolute()
+            and not os.path.lexists(str(venv_values[0]))
+        )
+        if venv_values and not pending_venv:
             venv = _real_directory(venv_values[0], "Venv-Verzeichnis")
             if not venv_directory_chain_is_trusted(account_home_path, venv, account):
                 raise TransitionContextError("Venv-Pfad ist nicht vertrauenswürdig")

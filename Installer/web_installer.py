@@ -5037,6 +5037,157 @@ def permissions_check() -> dict[str, Any]:
     }
 
 
+def _first_install_state_already_bound(findings: dict[str, Any]) -> dict[str, Any] | None:
+    """Erkennt Wrapper, Launcher und sudoers exakt im Stand des aktuellen Klons.
+
+    Liefert ein Erfolgsergebnis ohne Schreibaktion oder ``None``, sobald auch
+    nur eine Fläche abweicht, eine Altzeile existiert oder etwas nicht lesbar ist.
+    """
+    try:
+        if (
+            findings.get("repairable_lines")
+            or findings.get("legacy_lines")
+            or any(not item.get("readable", True) for item in findings.get("files", []))
+        ):
+            return None
+        wrappers = wrapper_integrity_preview()
+        launcher = service_launcher_integrity_preview()
+        head, canonical = _git_head_wrapper_bytes(INSTALL_ROOT)
+        if (
+            not wrappers.get("success")
+            or not launcher.get("success")
+            or launcher.get("head") != head
+            or wrappers.get("head") != head
+        ):
+            return None
+        expected_web_launcher = _render_web_update_launcher(
+            canonical["Installer/web_update_launcher.sh"],
+            root=INSTALL_ROOT,
+            user=install_user(),
+        )
+        if not web_update_launcher_integrity_preview(
+            expected_payload=expected_web_launcher,
+        ).get("success"):
+            return None
+        metadata = os.lstat(SUDOERS_FILE)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o440
+            or SUDOERS_FILE.read_bytes() != desired_sudoers_content().encode("utf-8")
+        ):
+            return None
+    except Exception:
+        return None
+    return {
+        "success": True,
+        "unchanged": True,
+        "message": "Wrapper und sudoers entsprechen bereits exakt diesem Stand.",
+        "wrapper_integrity": {"head": head},
+        "first_install_commit": head,
+    }
+
+
+def repair_permissions_first_install() -> dict[str, Any]:
+    """Richtet Wrapper und sudoers bei der Erstinstallation einmalig ein.
+
+    Bei einer Erstinstallation gibt es noch keinen root-eigenen Stable-Updater,
+    der die privilegierten Dateien bestätigen könnte. Der Installer läuft in
+    diesem Schritt ohnehin mit Root-Rechten aus genau diesem geklonten Stand.
+    Deshalb wird hier der lokale Git-HEAD als Quelle gebunden, aber nur,
+    solange keine privilegierte E3DC-Datei und keine E3DC-eigene sudoers-Zeile
+    existiert. In jedem anderen Fall gilt unverändert ``repair_permissions``
+    mit der Pflicht zum verifizierten Stable-Updater.
+    """
+    if is_docker():
+        return repair_permissions(repair_runtime=False)
+    try:
+        findings = sudoers_file_findings()
+        privileged_paths = {SERVICE_WRAPPER, WEB_UPDATE_LAUNCHER, SUDOERS_FILE}
+        privileged_paths.update(
+            Path(str(item.get("file") or ""))
+            for item in findings.get("repairable_lines", [])
+            if str(item.get("file") or "")
+        )
+        preimages = [
+            _capture_file_preimage(path)
+            for path in sorted(privileged_paths, key=lambda item: str(item))
+        ]
+    except Exception as exc:
+        return {
+            "success": False,
+            "reason_code": "first_install_state_unreadable",
+            "message": (
+                "Ersteinrichtung von Wrapper und sudoers abgebrochen: Der "
+                f"Ausgangszustand ist nicht sicher lesbar ({exc}). Es wurde nichts geändert."
+            ),
+        }
+    existing_e3dc_entries = bool(
+        any(item.get("existed") for item in preimages)
+        or any(not item.get("readable", True) for item in findings.get("files", []))
+        or findings.get("repairable_lines")
+        or findings.get("managed_direct_lines")
+        or findings.get("e3dc_systemctl_lines")
+        or findings.get("legacy_lines")
+    )
+    if existing_e3dc_entries:
+        # Ein erneuter Lauf nach einem späteren Abbruch findet die Dateien der
+        # früheren Erstinstallation vor. Entsprechen sie byte-genau dem Stand
+        # aus diesem Klon, ist nichts zu tun. Sonst behalten vorhandene
+        # privilegierte Dateien die Pflicht zum verifizierten Stable-Updater.
+        unchanged = _first_install_state_already_bound(findings)
+        if unchanged is not None:
+            return unchanged
+        return repair_permissions(repair_runtime=False)
+
+    root = Path(INSTALL_ROOT)
+    head = ""
+    detail = "ungültige HEAD-Antwort"
+    try:
+        head_result = run_isolated_git(
+            root,
+            "rev-parse",
+            "--verify",
+            "HEAD^{commit}",
+            run_as_user=repository_git_reader_user(root),
+            timeout=10,
+        )
+        head = bytes(head_result.stdout or b"").decode("ascii", errors="replace").strip().lower()
+        if head_result.returncode != 0:
+            detail = bytes(head_result.stderr or b"").decode("utf-8", errors="replace").strip() or detail
+            head = ""
+    except Exception as exc:
+        detail = str(exc)
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
+        return {
+            "success": False,
+            "reason_code": "first_install_git_head_missing",
+            "message": (
+                "Ersteinrichtung von Wrapper und sudoers abgebrochen: Der "
+                f"Installationsordner {root} ist kein lesbarer Git-Klon ({detail}). "
+                "Bitte das Repository neu klonen und die Installation erneut starten. "
+                "Es wurde nichts geändert."
+            ),
+        }
+
+    previous = os.environ.get(EXPECTED_RELEASE_COMMIT_ENV)
+    os.environ[EXPECTED_RELEASE_COMMIT_ENV] = head
+    try:
+        result = repair_permissions(
+            repair_runtime=False,
+            bound_privileged_preimages=preimages,
+        )
+    finally:
+        if previous is None:
+            os.environ.pop(EXPECTED_RELEASE_COMMIT_ENV, None)
+        else:
+            os.environ[EXPECTED_RELEASE_COMMIT_ENV] = previous
+    result = dict(result)
+    result["first_install_commit"] = head
+    return result
+
+
 def repair_permissions(
     *,
     repair_runtime: bool = False,

@@ -5,11 +5,18 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.5.3a`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.5.3b`. Das Dashboard startet ausschließlich
 den argumentlosen, root-eigenen Systemjob. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
+
+5.5.3b ist ein Korrekturupdate für die Neuinstallation auf Bare Metal (Bookworm
+und Trixie). Bestehende Installationen aktualisieren wie gewohnt über
+**System Update** bzw. das [Docker-Update](#docker-update); eine
+Konfigurationsänderung ist nicht nötig. Einzelheiten stehen in den
+[Release Notes](../RELEASE_NOTES.md). Für ein Update von 5.5.3 oder älter gelten
+zusätzlich die folgenden Hinweise zu 5.5.3a.
 
 5.5.3a ist ein Korrekturupdate für Docker-Installationen mit
 Wärmepumpen-Steuerung: Nach einem Neustart desselben Containers blieben die

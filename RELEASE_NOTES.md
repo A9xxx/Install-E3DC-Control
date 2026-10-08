@@ -1,3 +1,53 @@
+# E3DC-Control v5.5.3b
+
+E3DC-Control 5.5.3b ist ein Korrekturupdate für die Neuinstallation auf
+Bare Metal. Wallbox-, Speicher-, Wärmepumpen- und Hardwarelogik entsprechen
+unverändert 5.5.3a.
+
+## Korrekturen
+
+- **Neuinstallation brach bei den Systemrechten ab:** Seit 5.4.5 verlangte die
+  Einrichtung von Web-Wrapper und sudoers einen bereits installierten
+  Stable-Updater, den es bei einer Neuinstallation noch nicht gibt. Die
+  Installation endete in Schritt 1 mit „Der root-eigene Stable-Updater ist
+  nicht sicher nutzbar“. Bei einer Neuinstallation werden Wrapper und sudoers
+  jetzt einmalig aus dem geklonten Stand eingerichtet, solange noch keine
+  dieser Dateien existiert. Bestehende Installationen behalten die Prüfung
+  über den Stable-Updater.
+- **Raspberry Pi OS Trixie (Debian 13):** Trixie legt neue Dateien
+  gruppenbeschreibbar an. Die Schutzprüfungen lehnten den geklonten Ordner
+  deshalb ab („Apache-Schutz für Daten-, Log-, Ramdisk- und Temp-Pfade konnte
+  nicht aktiviert werden“). Der Installer entzieht den Programmdateien und dem
+  Python-venv jetzt das Gruppen- und Fremdschreibrecht und legt Dateien des
+  Installationsbenutzers mit sicheren Rechten an.
+- **Watchdog auf Bookworm:** systemd 252 (Debian 12) meldet einen noch nicht
+  eingerichteten Dienst anders als neuere Versionen; die Watchdog-Einrichtung
+  brach daran ab. Das ist behoben.
+- **systemd 257 (Debian 13):** Für noch nicht eingerichtete Dienste meldet
+  systemd 257 weniger Angaben. Die Dienstprüfung und die Watchdog-Einrichtung
+  werten das jetzt richtig aus, ohne die übrigen Prüfungen abzuschwächen.
+- **Webportal bei der Neuinstallation:** Die Schutzprobe für Laufzeitordner
+  akzeptiert für einen noch nicht angelegten Ordner eine fehlende Seite (HTTP
+  404). Sobald ein Ordner existiert, gilt weiterhin ausschließlich „Zugriff
+  verweigert“ (HTTP 403).
+- **Erneuter Versuch nach einem Abbruch:** Ein abgebrochener
+  Installationsversuch lässt sich mit derselben Anleitung erneut starten und
+  wird fortgesetzt.
+
+## Updatehinweise
+
+- **Bestehende Installationen:** Wie gewohnt über **System Update** bzw. das
+  Docker-Update; eine Konfigurationsänderung ist nicht nötig. Ein fester Pin in
+  `.env` wird bewusst auf `v5.5.3b` geändert.
+- **Abgebrochene Neuinstallation:** Im Installationsordner `git pull` ausführen
+  und die Installation mit `bash ./e3dc-setup` erneut starten.
+- **Von 5.5.3 oder älter:** Das Update führt direkt auf 5.5.3b. Dafür gelten
+  die Updatehinweise von 5.5.3a und 5.5.3 weiter unten.
+- **Rückfall:** Ein Rückfall auf 5.5.3a oder älter hebt diese Korrekturen
+  wieder auf; laufende Installationen sind davon nicht betroffen.
+
+---
+
 # E3DC-Control v5.5.3a
 
 E3DC-Control 5.5.3a ist ein Korrekturupdate für Docker-Installationen mit

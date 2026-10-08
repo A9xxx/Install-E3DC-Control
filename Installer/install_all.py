@@ -951,6 +951,62 @@ def _publish_webportal_transaction(authority):
         print("  [OK] Experimentelle App-Vorschau sicher aus dem Webroot entfernt.")
     return True
 
+def _remove_group_other_write_from_product_tree(install_path, install_user):
+    """Entfernt Gruppen- und Fremdschreibrecht von versionierten Programmdateien.
+
+    Debian 13 (Trixie) setzt für normale Benutzer umask 0002; ein git clone ist
+    dann gruppenbeschreibbar. Apache-Schutz, Backup, Notfall-Release und Ramdisk
+    lehnen solche Quellen zu Recht ab. Betroffen sind nur von Git geführte
+    Dateien, ihre Ordner bis zum Installationsordner und dieser selbst, jeweils
+    nur im Besitz des Installationsbenutzers. Inhalte und Eigentümer bleiben
+    unverändert; Symlinks und fremde Einträge werden nicht berührt.
+    """
+    from pathlib import Path
+    from .git_commit_reader import repository_git_reader_user, run_isolated_git
+
+    root = Path(str(install_path)).resolve()
+    try:
+        install_uid = pwd.getpwnam(str(install_user)).pw_uid
+        listing = run_isolated_git(
+            root,
+            "ls-files",
+            "-z",
+            run_as_user=repository_git_reader_user(root),
+            timeout=60,
+        )
+    except Exception as exc:
+        print(f"  [!] Schreibrechte im Programmordner nicht geprüft: {exc}")
+        return 0
+    if listing.returncode != 0:
+        print("  [!] Schreibrechte im Programmordner nicht geprüft: Git-Dateiliste nicht lesbar.")
+        return 0
+
+    paths = {root}
+    for raw in bytes(listing.stdout or b"").split(b"\0"):
+        if not raw:
+            continue
+        relative = Path(os.fsdecode(raw))
+        if relative.is_absolute() or ".." in relative.parts:
+            continue
+        current = root / relative
+        paths.add(current)
+        parent = current.parent
+        while parent != root and root in parent.parents:
+            paths.add(parent)
+            parent = parent.parent
+
+    from .utils import strip_group_other_write
+
+    changed = sum(
+        1 for path in sorted(paths) if strip_group_other_write(path, install_uid)
+    )
+    if changed:
+        print(
+            f"✓ Schreibrechte im Programmordner bereinigt: {changed} Einträge "
+            "ohne Gruppen- und Fremdschreibrecht."
+        )
+    return changed
+
 def install_all_main(headless=False, *, bind_first_install_role=False):
     """Komplette Installation mit korrekter Reihenfolge."""
     install_user = get_install_user()
@@ -1128,6 +1184,10 @@ def install_all_main(headless=False, *, bind_first_install_role=False):
     print("  CACHE-BEREINIGUNG")
     print("=" * 60 + "\n")
     cleanup_pycache(authority["install_path"])
+    _remove_group_other_write_from_product_tree(
+        authority["install_path"],
+        authority["install_user"],
+    )
 
     # Logging für diese "Alles installieren"-Sitzung initialisieren
     setup_installation_loggers()
@@ -1137,7 +1197,9 @@ def install_all_main(headless=False, *, bind_first_install_role=False):
     # SCHRITT 1: Systempakete
     # =========================================================
     print("\n" + "=" * 60)
-    if not safe_execute_task("SCHRITT 1/12: Systempakete installieren", install_system_packages, use_venv=True):
+    # first_install: Wrapper und sudoers dürfen nur entstehen, solange keine
+    # privilegierte E3DC-Datei existiert (siehe repair_permissions_first_install).
+    if not safe_execute_task("SCHRITT 1/12: Systempakete installieren", install_system_packages, use_venv=True, first_install=True):
         failed_steps.append("Systempakete")
         print("✗ Installation abgebrochen: Ohne vollständige Paket- und Apache-Basis werden keine Web-, Konfigurations- oder Dienstschritte ausgeführt.")
         print_installation_summary()

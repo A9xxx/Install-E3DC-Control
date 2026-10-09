@@ -1,3 +1,34 @@
+# E3DC-Control v5.5.3c
+
+E3DC-Control 5.5.3c ist ein Korrekturupdate für die Einrichtung des Energy
+Managers (Wärmepumpe, SG-Ready, Heizstab) bei einer Neuinstallation auf Bare
+Metal. Wallbox-, Speicher-, Wärmepumpen- und Hardwarelogik entsprechen
+unverändert 5.5.3b.
+
+## Korrekturen
+
+- **Energy Manager ließ sich nicht einrichten:** Beim Einrichten des Energy
+  Managers brach der Installer mit „Pflichtpfad ist nicht eindeutig
+  systemd-tauglich: …/bin/python3“ ab. Der Python-Interpreter einer normalen
+  Programmumgebung (venv) ist eine Verknüpfung; deren Ziel wird an anderer
+  Stelle bereits geprüft. Die Einrichtung akzeptiert ihn jetzt. Die
+  Programmdateien der Dienste dürfen weiterhin keine Verknüpfung sein.
+  Bereits laufende Energy-Manager-Installationen waren nicht betroffen.
+
+## Updatehinweise
+
+- **Bestehende Installationen:** Wie gewohnt über **System Update** bzw. das
+  Docker-Update; eine Konfigurationsänderung ist nicht nötig. Ein fester Pin in
+  `.env` wird bewusst auf `v5.5.3c` geändert.
+- **Neuinstallation, bei der der Energy Manager abbrach:** Die übrige
+  Installation ist vollständig. Im Webportal über **System Update** auf 5.5.3c
+  aktualisieren, danach im Installationsordner `bash ./e3dc-setup` starten und
+  im Expertenmenü den Energy Manager erneut einrichten.
+- **Von 5.5.3a oder älter:** Das Update führt direkt auf 5.5.3c. Dafür gelten
+  die Updatehinweise von 5.5.3b und älter weiter unten.
+
+---
+
 # E3DC-Control v5.5.3b
 
 E3DC-Control 5.5.3b ist ein Korrekturupdate für die Neuinstallation auf

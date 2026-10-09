@@ -1,9 +1,9 @@
 {
-  "version": "5.5.3b",
+  "version": "5.5.3c",
   "min_version": "4.0.0",
-  "stable_release": "v5.5.3b",
+  "stable_release": "v5.5.3c",
   "release_date": "2026-10-09",
-  "description": "v5.5.3b - Korrekturupdate: Neuinstallation auf Bookworm und Trixie",
+  "description": "v5.5.3c - Korrekturupdate: Energy Manager bei der Neuinstallation",
   "update_strategy": "backup_replace_restart_v1",
   "installer_requires": "python3",
   "sanitized_republication": false,

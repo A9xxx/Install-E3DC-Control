@@ -705,13 +705,15 @@ def setup_service(
     ):
         print("✗ Installationsbenutzer ist für eine systemd-Unit nicht eindeutig.")
         return False
+    # Der venv-Interpreter ist in einem normalen venv ein Symlink; dessen Kette hat
+    # require_bound_venv_runtime bereits geprüft. Skriptpfade bleiben ohne Symlink.
     for executable_path in (python_bin, *(spec[2] for spec in service_specs)):
         if (
             not os.path.isabs(executable_path)
             or os.path.normpath(executable_path) != executable_path
             or any(character.isspace() for character in executable_path)
             or not os.path.isfile(executable_path)
-            or os.path.islink(executable_path)
+            or (executable_path != python_bin and os.path.islink(executable_path))
         ):
             print(f"✗ Pflichtpfad ist nicht eindeutig systemd-tauglich: {executable_path}")
             return False

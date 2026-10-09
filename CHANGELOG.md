@@ -6,6 +6,12 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.5.3c] – 2026-10-09
+
+### Installation
+
+- Energy Manager (Wärmepumpe, SG-Ready, Heizstab): Die Einrichtung verwarf den Python-Interpreter des Programm-venv, weil er eine Verknüpfung ist, und brach mit „Pflichtpfad ist nicht eindeutig systemd-tauglich“ ab. In einem normalen venv ist der Interpreter immer eine Verknüpfung; deren Kette prüft die venv-Bindung bereits (Eigentümer, Schreibrechte, Ausführbarkeit, venv-Prefix). Die Einrichtung akzeptiert den Interpreter jetzt; die Skriptpfade der Dienste bleiben ohne Verknüpfung. Betroffen waren Neueinrichtungen; laufende Installationen nicht.
+
 ## [5.5.3b] – 2026-10-09
 
 ### Installation

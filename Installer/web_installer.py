@@ -13,6 +13,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
+import io
 import os
 import pwd
 import re
@@ -22,7 +24,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -50,6 +52,11 @@ def _reject_privileged_web_invocation() -> None:
 
 
 _reject_privileged_web_invocation()
+
+try:
+    from .shelly_relay_owner import shelly_relay_conflict, SHELLY_OWNER_WARNING
+except ImportError:
+    from shelly_relay_owner import shelly_relay_conflict, SHELLY_OWNER_WARNING
 
 try:
     from .backup_retention import (
@@ -80,7 +87,8 @@ try:
         repository_git_reader_user,
         run_isolated_git,
     )
-    from .utils import MANAGER_LOCK_TMPFILES_CONFIG, ensure_manager_lock_namespace
+    from .utils import (MANAGER_LOCK_TMPFILES_CONFIG, ensure_manager_lock_namespace,
+                        _command_argv_as_user, pip_install, require_bound_venv_runtime, resolve_venv_target)
     from .emergency_release import PERSISTENT_EMERGENCY_LATCH_PATH
 except ImportError:  # pragma: no cover - direct script execution fallback
     from backup_retention import (
@@ -117,7 +125,8 @@ except ImportError:  # pragma: no cover - direct script execution fallback
         repository_git_reader_user,
         run_isolated_git,
     )
-    from Installer.utils import MANAGER_LOCK_TMPFILES_CONFIG, ensure_manager_lock_namespace
+    from Installer.utils import (MANAGER_LOCK_TMPFILES_CONFIG, ensure_manager_lock_namespace,
+                       _command_argv_as_user, pip_install, require_bound_venv_runtime, resolve_venv_target)
     from Installer.emergency_release import PERSISTENT_EMERGENCY_LATCH_PATH
 
 
@@ -136,11 +145,39 @@ SESSION_FILES = (
 )
 
 PYTHON_IMPORT_PACKAGES = {
-    "mqtt": (("paho.mqtt.client", "python3-paho-mqtt"),),
+    "mqtt": (("paho.mqtt.client", "paho-mqtt"),),
 }
 
 CONFIG_FIELD_LABELS = {
+    "server_ip": "E3DC IP-Adresse",
+    "server_port": "RSCP-Port",
+    "e3dc_user": "E3DC Benutzer",
+    "e3dc_password": "E3DC Portal-Passwort",
+    "forecast1": "PV-Fläche 1",
+    "telegram_token": "Bot Token",
+    "telegram_chat_id": "Chat ID",
+    "telegram_device_name": "Gerätename",
+    "telegram_status_enable": "Statusmeldungen",
+    "telegram_status_time": "Statuszeit",
+    "telegram_stats_enable": "Tägliche Statistik",
+    "telegram_stats_time": "Tageszeit",
+    "telegram_weekly_enable": "Wöchentliche Statistik",
+    "telegram_weekly_time": "Wochenzeit",
+    "telegram_weekly_day": "Wochentag",
     "luxtronik": "WP-/Verbrauchslogging aktiv",
+    "forecast_diagnostics_enable": "PV-Prognosediagnose",
+    "wb_native_enable": "Wallbox-Regelung aktiv",
+    "luxtronik_ip": "Luxtronik IP",
+    "idm_ip": "IDM IP",
+    "stiebel_isg_ip": "Stiebel ISG IP",
+    "dimplex_ip": "Dimplex IP",
+    "heizstab_ip": "Heizstab IP",
+    "shelly_heiz_ip": "Shelly-Heizverbraucher IP-Adresse",
+    "heizstab_ip oder shelly_heiz_ip": "Heizstab IP oder Shelly-Heizverbraucher IP-Adresse",
+    "shelly_3em_ip": "Shelly Pro3EM IP",
+    "shelly_sg_ip": "SG-Ready Shelly IP (Boost)",
+    "shelly_pause_ip": "EVU-Pause Shelly IP (Sperre)",
+    "auto_mode": "Automatik darf steuern",
     "wp_type": "Wärmepumpen-Typ",
     "wp_type=Luxtronik": "Wärmepumpen-Typ = Luxtronik",
     "wp_type=IDM": "Wärmepumpen-Typ = IDM",
@@ -422,7 +459,25 @@ def _service_launcher_root_contract_payload_valid(payload: bytes) -> bool:
 
 
 def _git_head_wrapper_bytes(repo_root: Path) -> tuple[str, dict[str, bytes]]:
-    """Liest die freigegebenen Wrapperbytes direkt aus dem lokalen Git-HEAD."""
+    """Modulaufträge verwenden den Root-Snapshot; administrative CLI bleibt Git-gebunden."""
+    state = globals().get("_MODULE_LAUNCHER_STATE")
+    if state is not None:
+        from . import module_installer
+        from .installer_config import _bound_download_bootstrap_authority
+        contract = state["contract"]
+        authority = _bound_download_bootstrap_authority()
+        if (os.geteuid() != 0 or authority is None
+                or Path(authority[0]) != Path(contract["install_root"])
+                or Path(authority[1]) != Path(contract["code_root"])
+                or Path(repo_root) != Path(contract["install_root"])):
+            raise RuntimeError("Modul-Wrapperprüfung besitzt keine Root-Snapshotbindung")
+        canonical = {}
+        for relative in WRAPPER_RELATIVE_PATHS:
+            payload = module_installer._root_bytes(Path(contract["code_root"]) / relative, mode=0o444)
+            if module_installer.digest(payload) != contract["files"].get(relative):
+                raise RuntimeError("Wrapper-Snapshot weicht vom gebundenen Release ab")
+            canonical[relative] = payload
+        return contract["commit"], canonical
     root = Path(repo_root)
     reader_user = repository_git_reader_user(root)
     try:
@@ -729,11 +784,13 @@ def _capture_file_preimage(path: Path) -> dict[str, Any]:
     }
 
 
-def _bind_transaction_output(preimage: dict[str, Any]) -> None:
+def _bind_transaction_output(preimage: dict[str, Any], *, expected_payload: bytes | None = None) -> None:
     """Bindet ein von dieser Transaktion neu erzeugtes Objekt für den Rücklauf."""
     current = _capture_file_preimage(Path(str(preimage["path"])))
     if not current.get("existed"):
         raise RuntimeError(f"Transaktionsausgabe fehlt nach dem Schreiben: {preimage['path']}")
+    if expected_payload is not None and current.get("payload") != expected_payload:
+        raise RuntimeError(f"Transaktionsausgabe stimmt nicht mit der Projektion überein: {preimage['path']}")
     preimage["transaction_identity"] = {
         "dev": current.get("dev"),
         "ino": current.get("ino"),
@@ -1897,6 +1954,63 @@ def validate_bound_preimage_snapshot(
     }
 
 
+def module_inspection_request(function):
+    from functools import wraps
+    @wraps(function)
+    def request(*args, **kwargs):
+        try:
+            from . import module_installer
+        except ImportError:
+            from Installer import module_installer
+        with module_installer.inspection_scope():
+            return function(*args, **kwargs)
+    return request
+
+
+def module_launcher_integrity_preview() -> dict[str, Any]:
+    try:
+        from . import module_installer
+    except ImportError:
+        from Installer import module_installer
+    state = globals().get("_MODULE_LAUNCHER_STATE") or module_installer.inspect()
+    return {key: value for key, value in state.items() if key != "contract"}
+
+
+def module_launcher_sudoers_lines() -> list[str]:
+    try:
+        from . import module_installer
+    except ImportError:
+        from Installer import module_installer
+    state = globals().get("_MODULE_LAUNCHER_STATE") or module_installer.inspect()
+    return module_installer.sudoers_lines(state["contract"]) if state.get("success") else []
+
+
+def install_module_launcher_from_commit(commit: str) -> dict[str, Any]:
+    """Projiziert den gesamten privilegierten Python-Code aus den gebundenen Blobs."""
+    try:
+        from . import module_installer
+    except ImportError:
+        from Installer import module_installer
+    entries = read_commit_entries(
+        INSTALL_ROOT, commit, ("Installer", "VERSION", "installer_main.py"),
+        required_paths=("Installer/module_installer.py", "Installer/service_catalog.py", "VERSION", "installer_main.py"),
+        run_as_user=repository_git_reader_user(INSTALL_ROOT),
+        maximum_files=600, maximum_file_bytes=8 * 1024 * 1024,
+        maximum_total_bytes=64 * 1024 * 1024,
+    )
+    if module_installer.digest(Path(module_installer.__file__).read_bytes().replace(b"\r\n", b"\n")) != module_installer.digest(entries["Installer/module_installer.py"][0]):
+        raise RuntimeError("Modul-Launcherquelle weicht vom gebundenen Commit ab")
+    modules = {m.key: {"unit": m.service_unit} for m in iter_modules() if m.optional and m.service_unit
+               and m.key not in module_installer.EXCLUDED_MODULES
+               and m.service_unit not in module_installer.EXCLUDED_UNITS}
+    # Der Katalog darf die root-eigene Positivliste nur im freigegebenen Stand erzeugen.
+    if (INSTALLER_DIR / "service_catalog.py").read_bytes().replace(b"\r\n", b"\n") != entries["Installer/service_catalog.py"][0]:
+        raise RuntimeError("Dienstkatalog weicht vom gebundenen Commit ab")
+    from .installer_config import get_venv_name
+    return module_installer.provision(entries, commit, INSTALL_ROOT, install_user(), modules,
+                                      venv_name=get_venv_name())
+
+
 def desired_www_data_sudoers_lines() -> list[str]:
     service_lines = [
         (
@@ -1923,6 +2037,7 @@ def desired_www_data_sudoers_lines() -> list[str]:
         f'www-data ALL=(root) NOPASSWD: {WEB_UPDATE_LAUNCHER} --check-local-drift-json',
         f'www-data ALL=(root) NOPASSWD: {WEB_UPDATE_LAUNCHER} --confirm-local-drift',
         *runtime_permissions_lines,
+        *module_launcher_sudoers_lines(),
     ]
 
 
@@ -1980,12 +2095,12 @@ def sudoers_file_preview() -> dict[str, Any]:
     }
 
 
-def _classify_sudoers_line(path: Path | None, line: str) -> dict[str, bool]:
+def _classify_sudoers_line(path: Path | None, line: str, *, desired_lines=None) -> dict[str, bool]:
     """Trennt E3DC-eigene sudoers-Zeilen von fremden Dienstfreigaben."""
 
     normalized = str(line or "").strip()
     lowered = normalized.lower()
-    allowed_wrapper = normalized in desired_sudoers_lines()
+    allowed_wrapper = normalized in (desired_sudoers_lines() if desired_lines is None else desired_lines)
     direct_web = "www-data" in lowered and "nopasswd:" in lowered and not allowed_wrapper
     direct_systemctl = "systemctl" in lowered and not allowed_wrapper
     legacy = "e3dc.service" in lowered
@@ -2038,6 +2153,7 @@ def _unique_sudoers_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def sudoers_file_findings() -> dict[str, Any]:
     """Scannt sudoers und bindet nur E3DC-eigene Zeilen an Reparaturen."""
 
+    desired_lines = set(desired_sudoers_lines())
     files: list[dict[str, Any]] = []
     direct_web_lines: list[dict[str, Any]] = []
     direct_systemctl_lines: list[dict[str, Any]] = []
@@ -2090,7 +2206,7 @@ def sudoers_file_findings() -> dict[str, Any]:
             if not line or line.startswith("#"):
                 continue
             item = {"file": str(path), "line_no": line_no, "line": line}
-            classification = _classify_sudoers_line(path, line)
+            classification = _classify_sudoers_line(path, line, desired_lines=desired_lines)
             item["scope"] = (
                 "e3dc"
                 if classification["e3dc_owned"]
@@ -2205,7 +2321,7 @@ def log(message: str) -> None:
 def write_status(payload: dict[str, Any]) -> None:
     ensure_dirs()
     payload = {
-        "updated_at": utc_now(),
+        "updated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         **payload,
     }
     tmp = STATUS_FILE.with_suffix(".json.tmp")
@@ -2280,10 +2396,20 @@ def normalize_missing_unit_step(step: dict[str, Any]) -> dict[str, Any]:
 
 
 def python_executable() -> str:
-    for candidate in (Path("/opt/venv/bin/python3"), Path("/usr/bin/python3")):
-        if candidate.exists():
-            return str(candidate)
-    return "python3"
+    """Bindet Units und Importprüfung an dieselbe vertrauenswürdige Laufzeit."""
+    if is_docker():
+        candidate = Path("/opt/venv/bin/python3")
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            raise RuntimeError("Container-venv fehlt oder ist nicht ausführbar")
+        return str(candidate)
+    user = install_user()
+    try:
+        name, path = resolve_venv_target(user)
+        return require_bound_venv_runtime(
+            install_user=user, venv_name=name, venv_path=path,
+        )["python"]
+    except Exception as exc:
+        raise RuntimeError(f"Gebundenes Python-venv ist nicht verwendbar: {exc}") from exc
 
 
 def sanitize_system_user(value: Any) -> str | None:
@@ -2296,7 +2422,13 @@ def sanitize_system_user(value: Any) -> str | None:
 
 
 def install_user() -> str:
-    """Return the user that should own and run generated module services."""
+    """Bindet die Dienstrolle im privilegierten Snapshot an den root-eigenen Vertrag."""
+    if os.geteuid() == 0 and os.environ.get("E3DC_BOOTSTRAP_ROOT"):
+        try:
+            from .installer_config import get_install_user
+        except ImportError:
+            from Installer.installer_config import get_install_user
+        return get_install_user()
     for paths_file in (CONFIG_FILE, WEB_ROOT / "e3dc_paths.json"):
         try:
             paths = json.loads(paths_file.read_text(encoding="utf-8"))
@@ -2376,6 +2508,9 @@ def module_config_missing(module_key: str, cfg: dict[str, Any], required_keys: t
         key for key in required_keys if cfg.get(key) in (None, "", [])
     ]
 
+    if module_key == "forecast_evidence" and cfg_text(cfg, "forecast_diagnostics_enable", "0").lower() not in {"1", "true", "yes", "on", "ein"}:
+        missing.append("forecast_diagnostics_enable")
+
     if module_key == "wallbox":
         if not cfg_enabled(cfg, "wb_native_enable"):
             missing.append("wb_native_enable")
@@ -2385,6 +2520,8 @@ def module_config_missing(module_key: str, cfg: dict[str, Any], required_keys: t
             missing.append("wbmode=0 (Legacy-C++ Wallbox aus)")
 
     elif module_key == "heatpump":
+        if cfg_text(cfg, "wp_type", "0") == "6" and not has_shelly_sgready_config(cfg):
+            return []
         if not cfg_enabled(cfg, "luxtronik"):
             missing.append("luxtronik")
         wp_type = cfg_text(cfg, "wp_type", "0")
@@ -2455,6 +2592,9 @@ def module_config_missing(module_key: str, cfg: dict[str, Any], required_keys: t
 
 def module_dependency_keys(module_key: str, cfg: dict[str, Any], base_dependencies: tuple[str, ...]) -> tuple[str, ...]:
     dependencies = list(base_dependencies)
+    module = get_module(module_key)
+    if module is not None and module.optional and not is_docker() and "live" not in dependencies:
+        dependencies.insert(0, "live")
     if module_key == "heatpump":
         wp_type = cfg_text(cfg, "wp_type", "0")
         if wp_type == "0":
@@ -2584,12 +2724,43 @@ def module_conflict_reasons(module_key: str, cfg: dict[str, Any], docker: bool |
 
 def load_last_status() -> dict[str, Any] | None:
     try:
-        return json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+        from . import module_installer
+    except ImportError:
+        from Installer import module_installer
+    candidates = []
+    error = None
+    try:
+        module_status = json.loads(module_installer._root_bytes(module_installer.STATUS, mode=0o644, maximum=1024 * 1024))
+        if isinstance(module_status, dict):
+            candidates.append({"state": module_status.get("state"), "updated_at": module_status.get("updated_at"),
+                               "job": {"action": {"install": "install_module", "remove": "remove_module", "enable": "enable_service"}.get(module_status.get("action")), "module": module_status.get("module")},
+                               "result": module_status, "via_module_launcher": True})
+    except (OSError, ValueError, module_installer.ModuleError):
+        pass
+    try:
+        status = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+        if isinstance(status, dict):
+            candidates.append(status)
     except FileNotFoundError:
-        return None
+        pass
     except Exception as exc:
-        return {"error": str(exc)}
+        error = {"error": str(exc)}
 
+    def timestamp(status):
+        value = status.get("updated_at")
+        try:
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                stamp = float(value)
+            elif isinstance(value, str):
+                stamp = datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            else:
+                return float("-inf")
+            return stamp if math.isfinite(stamp) else float("-inf")
+        except (ValueError, OverflowError, OSError):
+            return float("-inf")
+
+    # Bei gleicher oder ungültiger Zeit bleibt der root-eigene Eintrag vorrangig.
+    return max(candidates, key=timestamp) if candidates else error
 
 def is_docker() -> bool:
     if Path("/.dockerenv").exists():
@@ -2597,13 +2768,15 @@ def is_docker() -> bool:
     return str(os.environ.get("E3DC_CONTAINER_MODE") or "").strip().lower() in {"1", "true", "yes"}
 
 
+@module_inspection_request
 def installer_status() -> dict[str, Any]:
     last_job = load_last_status()
+    module_ready = bool(module_launcher_integrity_preview().get("success") and not is_docker())
     lock_active = LOCK_FILE.exists()
     return {
         "success": True,
-        "write_actions_enabled": WRITE_ACTIONS_ENABLED,
-        "write_mode": "freigeschaltet" if WRITE_ACTIONS_ENABLED else "gesperrt",
+        "write_actions_enabled": module_ready,
+        "write_mode": "Launcher bereit" if module_ready else "Launcher gesperrt",
         "docker": is_docker(),
         "install_root": str(INSTALL_ROOT),
         "web_root": str(WEB_ROOT),
@@ -2615,9 +2788,8 @@ def installer_status() -> dict[str, Any]:
         "read_actions": sorted(READ_ONLY_ACTIONS),
         "write_actions": WRITE_ACTION_NAMES,
         "message": (
-            "Web-Installer läuft im sicheren Lesemodus."
-            if not WRITE_ACTIONS_ENABLED
-            else "Web-Installer-Schreibaktionen sind explizit freigeschaltet."
+            "Optionale Module verwenden den geprüften Modul-Launcher."
+            if module_ready else "Moduländerungen benötigen einen geprüften Modul-Launcher; Freigabeprüfung öffnen."
         ),
     }
 
@@ -2738,6 +2910,7 @@ def parse_effective_www_data_sudoers(
     }
 
 
+@module_inspection_request
 def sudoers_context() -> dict[str, Any]:
     sudoers_chunks = []
     sudoers_sources = []
@@ -2848,8 +3021,9 @@ def sudoers_context() -> dict[str, Any]:
     effective_managed_systemctl: list[str] = []
     effective_external_systemctl: list[str] = []
     effective_legacy: list[str] = []
+    desired_lines = set(desired_sudoers_lines())
     for line in active_lines:
-        classification = _classify_sudoers_line(None, line)
+        classification = _classify_sudoers_line(None, line, desired_lines=desired_lines)
         if classification["direct_systemctl"]:
             if classification["e3dc_related"]:
                 effective_managed_systemctl.append(line)
@@ -2915,6 +3089,7 @@ def sudoers_context() -> dict[str, Any]:
     }
 
 
+@module_inspection_request
 def write_readiness(
     ignore_active_lock: bool = False,
     *,
@@ -2996,10 +3171,10 @@ def write_readiness(
             ),
         },
         {
-            "label": "Schreibmodus",
+            "label": "Web-Schreibsperre (Testvariable)",
             "ok": not WRITE_ACTIONS_ENABLED,
             "hard": False,
-            "status": "gesperrt" if not WRITE_ACTIONS_ENABLED else "freigeschaltet",
+            "status": "aktiv" if not WRITE_ACTIONS_ENABLED else "aufgehoben",
             "issue": None if not WRITE_ACTIONS_ENABLED else "nur für bewusst freigegebene Tests aktiv lassen",
         },
         {
@@ -3013,7 +3188,7 @@ def write_readiness(
         web_update_wrapper,
         installer_wrapper,
         {
-            "label": "Wrapperintegrität gegen lokalen Git-HEAD",
+            "label": "Wrapperintegrität gegen Root-Snapshot" if globals().get("_MODULE_LAUNCHER_STATE") else "Wrapperintegrität gegen lokalen Git-HEAD",
             "ok": wrapper_integrity_ok,
             "hard": administrative_checks_hard,
             "status": (
@@ -3133,32 +3308,38 @@ def write_readiness(
     ]
     hard_blockers = [item for item in checks if item.get("hard") and not item.get("ok")]
     service_wrapper_ready = not hard_blockers and not is_docker()
+    module_launcher = module_launcher_integrity_preview() if not is_docker() else {
+        "success": False, "reason_code": "docker",
+        "message": "Docker-Module werden über Konfiguration und Container-Neustart eingerichtet.",
+    }
+    module_web_ready = bool(module_launcher.get("success") and service_wrapper_ready)
     return {
         "success": True,
-        "write_actions_enabled": WRITE_ACTIONS_ENABLED,
-        "privileged_installer_web_enabled": False,
+        "write_actions_enabled": module_web_ready,
+        "privileged_installer_web_enabled": module_web_ready,
         "verification_scope": verification_scope,
         "administrative_context_proven": administrative_context_proven,
         "web_update_launcher_ready": bool(web_update_launcher.get("success") and service_wrapper_ready),
         "service_wrapper_ready": service_wrapper_ready,
-        "ready_for_manual_enable": False,
-        "can_write_now": False,
-        "summary": (
+        "ready_for_manual_enable": module_web_ready,
+        "can_write_now": module_web_ready,
+        "module_launcher": module_launcher,
+        "summary": "Optionale Module verwenden den geprüften Modul-Launcher; Dienststeuerung und Self-Update bleiben getrennt." if module_web_ready else (
             "Breite privilegierte Installer-Webaktionen bleiben fail-closed gesperrt. "
             "Dienststeuerung und Self-Update besitzen getrennte root-eigene Launcher."
         ),
         "checks": checks,
         "hard_blocker_count": len(hard_blockers),
         "hard_blockers": hard_blockers,
-        "allowed_write_actions": [],
+        "allowed_write_actions": ["install_module", "remove_module"] if module_web_ready else [],
         "release_steps": [
             "Alte installer_wrapper.sh- und direkte installer_main.py-Freigaben aus sudoers entfernen",
             "Service-Wrapper und seine feste Aktions-/Unit-Allowlist getrennt prüfen",
             "Argumentlosen Update-Dispatcher root-eigen und pfadgebunden installieren",
             "Veröffentlichten Ziel-Bootstrap root-privat laden und im Systemjob starten",
-            "Installation, Rechte-Reparatur und Rückfall weiterhin nur administrativ ausführen",
+            "Globale Rechte-Reparatur und Rückfall weiterhin administrativ ausführen",
         ],
-        "next_step": "Nur das Self-Update darf über den engen Launcher starten; alle anderen Installer-Webjobs bleiben gesperrt.",
+        "next_step": "Optionale Module können über den geprüften Modul-Launcher installiert und entfernt werden." if module_web_ready else module_launcher.get("message", "Freigabeprüfung in der Installationszentrale prüfen."),
     }
 
 
@@ -3241,6 +3422,7 @@ def write_permission_plan() -> dict[str, Any]:
     }
 
 
+@module_inspection_request
 def backup_plan(module_key: str | None = None) -> dict[str, Any]:
     """Read-only-Backup- und Rückfallplan vor späteren Schreibaufträgen."""
     modules = [get_module(module_key)] if module_key else list(iter_modules())
@@ -3280,6 +3462,8 @@ def backup_plan(module_key: str | None = None) -> dict[str, Any]:
         WEB_UPDATE_LAUNCHER,
         RUNTIME_PERMISSIONS_LAUNCHER,
         RUNTIME_PERMISSIONS_CONTRACT,
+        Path("/usr/local/sbin/e3dc-module-installer"),
+        Path("/etc/e3dc-control/module_installer_contract.json"),
         INSTALLER_WRAPPER,
     ]
     sudoers_findings = sudoers_file_findings()
@@ -3354,7 +3538,7 @@ def backup_plan(module_key: str | None = None) -> dict[str, Any]:
         ],
         "safety_rules": [
             "Dieser Plan liest nur; er erstellt noch kein Backup.",
-            "Echte Backups dürfen nur über den Installer-Wrapper entstehen.",
+            "Echte Backups entstehen nur im root-kontrollierten Modul-Launcher vor Installieren und Entfernen.",
             "Der Backup-Root bleibt administrativ geschützt; der Read-only-Plan öffnet ihn nicht und listet keine Inhalte auf.",
             "Backup-Snapshots liegen außerhalb des Webroots.",
             "Freie Pfade aus der WebUI bleiben verboten.",
@@ -3368,7 +3552,12 @@ def create_backup_snapshot(action: str, module_key: str | None = None) -> dict[s
     safe_action = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in action) or "job"
     safe_module = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in (module_key or "system"))
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    collection_root = default_backup_root(INSTALL_ROOT) / "web_installer"
+    try:
+        collection_root = default_backup_root(INSTALL_ROOT) / "web_installer"
+    except (BackupIntegrityError, OSError) as exc:
+        return {"success": False, "root": None, "reason": "backup_root_unusable",
+                "message": "Backup-Ablage ist nicht verwendbar. Marker, Rechte und Verzeichnis prüfen.", "detail": str(exc),
+                "copied": [], "skipped": [], "plan": None}
     backup_root = collection_root / f"{timestamp}-{safe_action}-{safe_module}"
     plan = backup_plan(module_key)
     copied: list[dict[str, Any]] = []
@@ -3393,7 +3582,9 @@ def create_backup_snapshot(action: str, module_key: str | None = None) -> dict[s
         return {
             "success": False,
             "root": str(backup_root),
-            "message": f"Backup-Verzeichnis konnte nicht angelegt werden: {exc}",
+            "reason": "backup_write_failed",
+            "message": "Backup-Verzeichnis konnte nicht angelegt werden. Einzelheiten stehen im Installationsprotokoll.",
+            "detail": str(exc),
             "copied": copied,
             "skipped": skipped,
             "plan": plan,
@@ -3650,6 +3841,8 @@ def validate_config(module_key: str | None = None) -> dict[str, Any]:
             "display_name": module.display_name,
             "ok": not missing,
             "missing_keys": missing,
+            "warnings": ([SHELLY_OWNER_WARNING] if module.key in {"heizstab", "heatpump"}
+                         and shelly_relay_conflict(cfg) else []),
             "missing_labels": config_field_labels(missing),
             "config_keys": module.config_keys,
             "config_key_labels": config_field_labels(module.config_keys),
@@ -3678,6 +3871,28 @@ def diagnose_module(module_key: str | None = None) -> dict[str, Any]:
             "enabled": alive["fresh"] and config_matches,
             "raw": "docker-file-check" if config_matches else "docker-file-check-config-mismatch",
         }
+        if docker and not module.alive_file:
+            try:
+                from . import docker_healthcheck
+            except ImportError:
+                import docker_healthcheck
+            # Vorhandenen Container-Dienstsatz und dessen argv-Prüfung verwenden.
+            mapped = bool(module.script and (
+                module.script in docker_healthcheck.REQUIRED_PROCESSES
+                or any(module.script == item[0] for item in docker_healthcheck.OPTIONAL_PROCESSES.values())
+            ))
+            active = False
+            raw = "docker-process-check"
+            if mapped:
+                try:
+                    matches = docker_healthcheck._matching_processes(
+                        docker_healthcheck._process_snapshot(), module.script
+                    )
+                    active = any(item["state"] in docker_healthcheck.HEALTHY_PROCESS_STATES for item in matches)
+                except (OSError, RuntimeError, ValueError):
+                    raw = "docker-process-check-unavailable"
+            systemd = {"exists": mapped, "active": active and config_matches,
+                       "enabled": mapped, "raw": raw}
         config = validate_config(module.key).get(module.key, {})
         journal = read_journal_preview(module.service_unit)
         journal_unhealthy = journal_unhealthy_reason(journal)
@@ -3719,6 +3934,7 @@ def module_dry_run(module_key: str | None = None) -> dict[str, Any]:
             dep_diag = diagnose_module(dep).get(dep, {})
             dependency_states[dep] = {
                 "healthy": dep_diag.get("healthy", False),
+                "exists": (dep_diag.get("systemd") or {}).get("exists", False),
                 "active": (dep_diag.get("systemd") or {}).get("active", False),
                 "config_ok": (dep_diag.get("config") or {}).get("ok", True),
             }
@@ -3746,8 +3962,8 @@ def module_dry_run(module_key: str | None = None) -> dict[str, Any]:
         if module.script and not script_exists:
             blocked_reasons.append("Python-/Node-Script fehlt")
         for dep, state in dependency_states.items():
-            if not state["healthy"]:
-                blocked_reasons.append(f"Abhängigkeit nicht gesund: {dep}")
+            if not state["exists"] or not state["active"]:
+                blocked_reasons.append(f"Abhängigkeit nicht installiert oder inaktiv: {get_module(dep).display_name if get_module(dep) else dep}")
 
         blocked_reasons.extend(module_conflict_reasons(module.key, cfg, docker))
 
@@ -3759,6 +3975,11 @@ def module_dry_run(module_key: str | None = None) -> dict[str, Any]:
             "alive": alive,
             "config": config,
             "dependencies": dependency_states,
+            "warnings": [
+                f"Abhängigkeit meldet noch keine gesunden Laufzeitdaten: {get_module(dep).display_name if get_module(dep) else dep}"
+                for dep, state in dependency_states.items()
+                if state["exists"] and state["active"] and not state["healthy"]
+            ],
             "planned_steps": planned_steps,
             "would_change": False,
             "write_actions_enabled": WRITE_ACTIONS_ENABLED,
@@ -3769,6 +3990,10 @@ def module_dry_run(module_key: str | None = None) -> dict[str, Any]:
 
 
 def module_install_dry_run(module_key: str | None = None) -> dict[str, Any]:
+    try:
+        from . import module_installer
+    except ImportError:
+        from Installer import module_installer
     modules = [get_module(module_key)] if module_key else list(iter_modules())
     docker = is_docker()
     cfg = load_config()
@@ -3801,13 +4026,16 @@ def module_install_dry_run(module_key: str | None = None) -> dict[str, Any]:
             dep_diag = diagnose_module(dep).get(dep, {})
             dep_state = {
                 "healthy": dep_diag.get("healthy", False),
+                "exists": (dep_diag.get("systemd") or {}).get("exists", False),
                 "active": (dep_diag.get("systemd") or {}).get("active", False),
                 "config_ok": (dep_diag.get("config") or {}).get("ok", True),
             }
             dependency_states[dep] = dep_state
-            if not dep_state["healthy"]:
-                blocked_reasons.append(f"Abhängigkeit nicht gesund: {dep}")
+            if not dep_state["exists"] or not dep_state["active"]:
+                blocked_reasons.append(f"Abhängigkeit nicht installiert oder inaktiv: {get_module(dep).display_name if get_module(dep) else dep}")
 
+        if module.key == "heatpump" and cfg_text(cfg, "wp_type", "0") == "6" and not has_shelly_sgready_config(cfg):
+            blocked_reasons.append("Für den E3DC-Leistungsmesser (PM) ist der Wärmepumpen-Manager nicht erforderlich.")
         if config.get("ok") is False:
             missing = ", ".join(config.get("missing_labels") or config.get("missing_keys", []))
             blocked_reasons.append(f"Konfiguration unvollständig: {missing}")
@@ -3818,12 +4046,25 @@ def module_install_dry_run(module_key: str | None = None) -> dict[str, Any]:
         if not module.service_unit:
             blocked_reasons.append("Kein systemd-Dienst im Katalog hinterlegt")
 
+        if runner == "npm" and not docker:
+            missing_tools = [name for name in ("node", "npm", "avahi-publish-service") if shutil.which(name) is None]
+            if missing_tools:
+                blocked_reasons.append("Matter-Vorbereitung fehlt: " + ", ".join(missing_tools)
+                                       + ". Konsole 45 ausführen.")
         blocked_reasons.extend(module_conflict_reasons(module.key, cfg, docker))
+        system_update_only = module.key in module_installer.EXCLUDED_MODULES or module.service_unit in module_installer.EXCLUDED_UNITS
+        if system_update_only and not systemd.get("exists"):
+            if module.key in {"ha", "shadow"}:
+                note = ("Einrichtung über Konsole 49" if module.key == "ha"
+                        else "Kein geführter Weg; Rolle über das Systemupdate")
+                blocked_reasons.append(note + "; nur Bare Metal." if docker else note + ".")
+            else:
+                blocked_reasons.append("Dieses Modul wird ausschließlich über das Systemupdate eingerichtet.")
 
         missing_or_inactive = not systemd.get("exists") or not systemd.get("enabled") or not systemd.get("active")
         if missing_or_inactive and not module.optional:
-            blocked_reasons.append("Kernmodule sind in dieser Stufe nicht über die WebUI installierbar.")
-        would_change = bool(missing_or_inactive and not blocked_reasons)
+            blocked_reasons.append("Kern-Dienst über Konsole 1) Installation / Update einrichten; im Docker den Container neu starten.")
+        would_change = bool(not systemd.get("exists") and not blocked_reasons)
         python_dependency_packages = tuple(pkg for _, pkg in PYTHON_IMPORT_PACKAGES.get(module.key, ()))
 
         if docker:
@@ -3871,6 +4112,14 @@ def module_install_dry_run(module_key: str | None = None) -> dict[str, Any]:
                 "can_install_when_writes_enabled": False,
                 "reasons": ["Keine Installation nötig"],
             }
+        elif module.optional and systemd.get("exists") and not docker:
+            readiness = {
+                "state": "inactive",
+                "label": "Installiert, nicht aktiv",
+                "message": "Dienst ist installiert; Start und Autostart können über die Dienststeuerung aktiviert werden.",
+                "can_install_when_writes_enabled": False,
+                "reasons": [],
+            }
         elif docker:
             readiness = {
                 "state": "docker_pending",
@@ -3883,10 +4132,12 @@ def module_install_dry_run(module_key: str | None = None) -> dict[str, Any]:
             readiness = {
                 "state": "ready",
                 "label": "Bereit für Installation",
-                "message": "Dieses Modul wäre installierbar, sobald der Schreibmodus bewusst freigeschaltet wird.",
+                "message": "Voraussetzungen erfüllt; Installation möglich.",
                 "can_install_when_writes_enabled": True,
                 "reasons": [],
             }
+
+        readiness["warnings"] = config.get("warnings", [])
 
         install_plan = {
             "before": [
@@ -3945,7 +4196,7 @@ def module_install_dry_run(module_key: str | None = None) -> dict[str, Any]:
                 "Service-Name und Script-Pfad kommen nur aus dem Katalog.",
                 "Freie Shell-Befehle und freie Dateipfade bleiben verboten.",
                 "Der alte C++ Dienst e3dc.service ist kein erlaubtes WebUI-Installationsziel.",
-                "Schreibmodus muss explizit freigeschaltet sein; dieser Dry-Run schreibt nichts.",
+                "Modulinstallationen laufen über den geprüften Modul-Launcher; diese Prüfung schreibt nichts.",
             ],
             "affected": {
                 "service": module.service_unit,
@@ -3965,6 +4216,7 @@ def module_install_dry_run(module_key: str | None = None) -> dict[str, Any]:
             "docker": docker,
             "write_actions_enabled": WRITE_ACTIONS_ENABLED,
             "would_change": would_change,
+            "system_update_only": system_update_only,
             "backup_root_status": backup_root_status,
             "summary": "Installations-Dry-Run: keine Änderungen am System ausgeführt.",
             "service": {
@@ -3981,6 +4233,11 @@ def module_install_dry_run(module_key: str | None = None) -> dict[str, Any]:
             "alive": alive,
             "config": config,
             "dependencies": dependency_states,
+            "warnings": [
+                f"Abhängigkeit meldet noch keine gesunden Laufzeitdaten: {get_module(dep).display_name if get_module(dep) else dep}"
+                for dep, state in dependency_states.items()
+                if state["exists"] and state["active"] and not state["healthy"]
+            ],
             "required_files": [
                 item for item in [
                     str(script_path) if script_path else None,
@@ -4115,60 +4372,35 @@ WantedBy=multi-user.target
 
 
 def ensure_module_runtime_files(module: Any) -> dict[str, Any]:
-    """Create runtime directories/log files with service-writable permissions."""
-    steps: list[dict[str, Any]] = []
-    ok = True
-    user = install_user()
-
-    def safe_chown(path: Path) -> dict[str, Any]:
-        if os.name != "posix":
-            return {"ok": True, "skipped": True, "reason": "nicht-posix"}
-        try:
-            shutil.chown(path, user=user, group="www-data")
-            return {"ok": True}
-        except Exception as exc:
-            return {"ok": False, "error": str(exc)}
-
-    def ensure_dir(path: Path, mode: int = 0o775) -> dict[str, Any]:
-        try:
-            path.mkdir(parents=True, exist_ok=True)
-            os.chmod(path, mode)
-            owner = safe_chown(path)
-            return {"path": str(path), "ok": bool(owner.get("ok")), "owner": owner}
-        except Exception as exc:
-            return {"path": str(path), "ok": False, "error": str(exc)}
-
-    log_path = Path(module.log_file) if module.log_file else LOG_DIR / f"{module.key}.log"
+    """Bereitet Runtimepfade ohne Symlink-/Hardlink-Folgen über den Dateivertrag vor."""
     try:
-        resolved = log_path.resolve()
-        logs_root = LOG_DIR.resolve()
-        if logs_root not in (resolved, *resolved.parents):
-            step = {"step": "prepare_log", "ok": False, "path": str(log_path), "error": "Logpfad liegt außerhalb des erlaubten Log-Verzeichnisses"}
+        from .secure_file_transaction import ensure_bound_directory, atomic_write_bound_file, set_bound_file_metadata
+    except ImportError:
+        from Installer.secure_file_transaction import ensure_bound_directory, atomic_write_bound_file, set_bound_file_metadata
+    import grp
+    user = install_user()
+    uid = pwd.getpwnam(user).pw_uid
+    gid = grp.getgrnam("www-data").gr_gid
+    steps = []
+    try:
+        log_path = Path(module.log_file) if module.log_file else LOG_DIR / f"{module.key}.log"
+        if LOG_DIR not in log_path.parents:
+            raise RuntimeError("Logpfad liegt außerhalb des erlaubten Log-Verzeichnisses")
+        ensure_bound_directory(log_path.parent, uid=uid, gid=gid, mode=0o775)
+        if os.path.lexists(log_path):
+            set_bound_file_metadata(log_path, uid=uid, gid=gid, mode=0o664, max_bytes=MAX_BACKUP_FILE_BYTES)
         else:
-            dir_step = ensure_dir(log_path.parent)
-            log_path.touch(exist_ok=True)
-            os.chmod(log_path, 0o664)
-            owner = safe_chown(log_path)
-            step = {
-                "step": "prepare_log",
-                "ok": bool(dir_step.get("ok") and owner.get("ok")),
-                "path": str(log_path),
-                "directory": dir_step,
-                "owner": owner,
-            }
+            atomic_write_bound_file(log_path, b"", uid=uid, gid=gid, mode=0o664, staging_root="/var/www")
+        steps.append({"step": "prepare_log", "ok": True})
+        if module.alive_file:
+            parent = Path(module.alive_file).parent
+            if parent != RAMDISK_DIR:
+                raise RuntimeError("Alive-Pfad liegt außerhalb der erlaubten Ramdisk")
+            ensure_bound_directory(parent, uid=uid, gid=gid, mode=0o775)
+            steps.append({"step": "prepare_alive_dir", "ok": True})
+        return {"step": "prepare_runtime_files", "ok": True, "steps": steps}
     except Exception as exc:
-        step = {"step": "prepare_log", "ok": False, "path": str(log_path), "error": str(exc)}
-    steps.append(step)
-    ok = ok and bool(step.get("ok"))
-
-    if module.alive_file:
-        alive_parent = Path(module.alive_file).parent
-        alive_step = ensure_dir(alive_parent, 0o775)
-        alive_step["step"] = "prepare_alive_dir"
-        steps.append(alive_step)
-        ok = ok and bool(alive_step.get("ok"))
-
-    return {"step": "prepare_runtime_files", "ok": ok, "steps": steps}
+        return {"step": "prepare_runtime_files", "ok": False, "error": str(exc), "steps": steps}
 
 
 def prepare_module_runner(module: Any) -> dict[str, Any]:
@@ -4197,7 +4429,8 @@ def prepare_module_runner(module: Any) -> dict[str, Any]:
             "error": f"package-lock.json fehlt: {package_lock}",
         }
     npm = npm_executable()
-    node_check = run_cmd(["node", "--version"], timeout=15)
+    node_check = run_cmd(_command_argv_as_user(["node", "--version"], install_user())
+                         if not is_docker() else ["node", "--version"], timeout=15)
     node_match = re.fullmatch(
         r"v([0-9]+)(?:\.[0-9]+){1,2}",
         str(node_check.get("stdout") or "").strip(),
@@ -4215,7 +4448,8 @@ def prepare_module_runner(module: Any) -> dict[str, Any]:
             "error": "Matter.js benötigt Node.js 18 oder neuer",
             "node_check": node_check,
         }
-    npm_check = run_cmd([npm, "--version"], timeout=15)
+    npm_check = run_cmd(_command_argv_as_user([npm, "--version"], install_user())
+                        if not is_docker() else [npm, "--version"], timeout=15)
     if not npm_check.get("ok"):
         return {
             "step": "prepare_runner",
@@ -4226,7 +4460,7 @@ def prepare_module_runner(module: Any) -> dict[str, Any]:
             "npm_check": npm_check,
         }
     install = run_cmd(
-        [npm, "ci", "--omit=dev", "--ignore-scripts"],
+        _command_argv_as_user([npm, "ci", "--omit=dev", "--ignore-scripts"], install_user()) if not is_docker() else [npm, "ci", "--omit=dev", "--ignore-scripts"],
         timeout=180,
         cwd=workdir,
     )
@@ -4244,52 +4478,30 @@ def prepare_module_runner(module: Any) -> dict[str, Any]:
 
 
 def prepare_python_module_dependencies(module: Any) -> dict[str, Any]:
-    """Install small apt-backed Python dependencies needed by optional modules."""
-    deps = PYTHON_IMPORT_PACKAGES.get(str(module.key), ())
-    if not deps:
+    """Prüft und ergänzt optionale Python-Pakete ausschließlich im gebundenen venv."""
+    if module_runner_label(module) != "python":
         return {"step": "prepare_python_dependencies", "ok": True, "skipped": True, "module": module.key}
-
+    try:
+        python = python_executable()
+    except Exception as exc:
+        return {"step": "prepare_python_dependencies", "ok": False, "module": module.key, "error": str(exc)}
+    user = install_user()
     steps: list[dict[str, Any]] = []
-    ok = True
-    python = python_executable()
-    for import_name, apt_package in deps:
-        check = run_cmd([python, "-c", f"import {import_name}"], timeout=15)
+    for import_name, package in PYTHON_IMPORT_PACKAGES.get(str(module.key), ()):
+        argv = [python, "-I", "-c", f"import {import_name}"]
+        command = argv if is_docker() else _command_argv_as_user(argv, user)
+        check = run_cmd(command, timeout=30)
         if check.get("ok"):
-            steps.append({
-                "import": import_name,
-                "apt_package": apt_package,
-                "ok": True,
-                "already_available": True,
-            })
+            steps.append({"import": import_name, "package": package, "ok": True, "already_available": True})
             continue
-
-        install = run_cmd(["apt-get", "install", "-y", apt_package], timeout=180)
-        if not install.get("ok"):
-            update = run_cmd(["apt-get", "update"], timeout=180)
-            install_retry = run_cmd(["apt-get", "install", "-y", apt_package], timeout=180)
-            install = {
-                **install_retry,
-                "first_attempt": install,
-                "apt_update": update,
-            }
-        recheck = run_cmd([python, "-c", f"import {import_name}"], timeout=15)
-        step_ok = bool(install.get("ok") and recheck.get("ok"))
-        ok = ok and step_ok
-        steps.append({
-            "import": import_name,
-            "apt_package": apt_package,
-            "ok": step_ok,
-            "install": install,
-            "recheck": recheck,
-        })
-
-    return {
-        "step": "prepare_python_dependencies",
-        "ok": ok,
-        "module": module.key,
-        "python": python,
-        "steps": steps,
-    }
+        pip_output = io.StringIO()
+        with redirect_stdout(pip_output):
+            installed = pip_install(package, venv_path=str(Path(python).parent.parent), user=user, require_venv=True)
+        recheck = run_cmd(command, timeout=30)
+        steps.append({"import": import_name, "package": package, "ok": bool(installed and recheck.get("ok")),
+                      "install": {"ok": bool(installed), "output": pip_output.getvalue()}, "recheck": recheck})
+    return {"step": "prepare_python_dependencies", "ok": all(step["ok"] for step in steps),
+            "module": module.key, "python": python, "steps": steps}
 
 
 def verify_service_stable(module: Any, timeout_s: int = 12, min_runtime_s: int = 3) -> dict[str, Any]:
@@ -4412,7 +4624,7 @@ def install_module(module_key: str | None = None) -> dict[str, Any]:
         return {
             "success": False,
             "module": module.public_dict(),
-            "blocked_reasons": ["Kernmodule sind in dieser Stufe nicht über die WebUI installierbar."],
+            "blocked_reasons": ["Kern-Dienst über Konsole 1) Installation / Update einrichten; im Docker den Container neu starten."],
             "message": "Installation abgebrochen: Core-Module bleiben für echte WebUI-Jobs gesperrt.",
         }
     if is_docker():
@@ -4447,6 +4659,7 @@ def install_module(module_key: str | None = None) -> dict[str, Any]:
             "success": False,
             "module": module.public_dict(),
             "blocked_reasons": blockers,
+            "dependencies": dry.get("dependencies", {}),
             "message": "Installation abgebrochen: zuerst die Blocker beseitigen.",
         }
 
@@ -4465,6 +4678,12 @@ def install_module(module_key: str | None = None) -> dict[str, Any]:
         }
 
     target = Path("/etc/systemd/system") / module.service_unit
+    try:
+        from .secure_file_transaction import snapshot_bound_file
+    except ImportError:
+        from Installer.secure_file_transaction import snapshot_bound_file
+    unit_preimage = snapshot_bound_file(target, allow_missing=True, expected_uid=0, expected_gid=0,
+                                        max_bytes=MAX_BACKUP_FILE_BYTES)
     unit_content = render_systemd_unit(module, script_path)
     backup_snapshot = create_backup_snapshot("install_module", module.key)
     if not backup_snapshot.get("success"):
@@ -4474,6 +4693,17 @@ def install_module(module_key: str | None = None) -> dict[str, Any]:
             "message": "Installation abgebrochen: Backup-Snapshot konnte nicht angelegt werden.",
             "backup_snapshot": backup_snapshot,
         }
+    dependencies = prepare_python_module_dependencies(module)
+    if not dependencies.get("ok"):
+        return {"success": False, "module": module.public_dict(), "steps": [dependencies],
+                "backup_snapshot": backup_snapshot,
+                "message": "Installation abgebrochen: Python-Abhängigkeiten im gebundenen venv sind nicht verfügbar."}
+    runner = prepare_module_runner(module)
+    if not runner.get("ok"):
+        return {"success": False, "module": module.public_dict(), "steps": [dependencies, runner],
+                "backup_snapshot": backup_snapshot,
+                "blocked_reasons": ["Matter-Vorbereitung fehlgeschlagen. Konsole 45 ausführen."],
+                "message": "Installation abgebrochen: Matter-Vorbereitung fehlgeschlagen. Konsole 45 ausführen."}
     backup_path = None
     if target.exists():
         existing = target.read_text(encoding="utf-8", errors="replace")
@@ -4481,14 +4711,22 @@ def install_module(module_key: str | None = None) -> dict[str, Any]:
             backup_path = target.with_name(f"{target.name}.bak-webinstaller-{int(time.time())}")
             backup_path.write_text(existing, encoding="utf-8")
 
-    target.write_text(unit_content, encoding="utf-8")
-    os.chmod(target, 0o644)
+    try:
+        from .secure_file_transaction import atomic_write_bound_file
+    except ImportError:
+        from Installer.secure_file_transaction import atomic_write_bound_file
+    atomic_write_bound_file(target, unit_content.encode("utf-8"), uid=0, gid=0, mode=0o644,
+                            staging_root="/etc/systemd", expected_snapshot=unit_preimage)
 
+    runtime = ensure_module_runtime_files(module)
+    if not runtime.get("ok"):
+        return {"success": False, "steps": [{"step": "write_unit", "ok": True}, runtime], "backup_snapshot": backup_snapshot,
+                "message": "Laufzeitdateien konnten nicht sicher vorbereitet werden. Die Unit bleibt eingerichtet und kann über „Entfernen“ zurückgebaut werden."}
     steps = [
         {"step": "write_unit", "ok": True, "target": str(target), "backup": str(backup_path) if backup_path else None},
-        ensure_module_runtime_files(module),
-        prepare_python_module_dependencies(module),
-        prepare_module_runner(module),
+        runtime,
+        dependencies,
+        runner,
         {"step": "daemon_reload", **run_cmd(["systemctl", "daemon-reload"], timeout=20)},
         {"step": "enable", **run_cmd(["systemctl", "enable", module.service_unit], timeout=20)},
         {"step": "restart", **run_cmd(["systemctl", "restart", module.service_unit], timeout=20)},
@@ -4503,7 +4741,7 @@ def install_module(module_key: str | None = None) -> dict[str, Any]:
         "steps": steps,
         "diagnosis": post_diag,
         "backup_snapshot": backup_snapshot,
-        "message": "Modulinstallation abgeschlossen und Dienst stabil." if ok else "Modulinstallation wurde ausgeführt, aber Start/Nachlaufprüfung meldet Fehler.",
+        "message": "Modulinstallation abgeschlossen und Dienst stabil." if ok else "Modulinstallation wurde ausgeführt, aber Start/Nachlaufprüfung meldet Fehler. Die Unit bleibt eingerichtet und kann über „Entfernen“ zurückgebaut werden.",
     }
 
 
@@ -5054,7 +5292,9 @@ def _first_install_state_already_bound(findings: dict[str, Any]) -> dict[str, An
         launcher = service_launcher_integrity_preview()
         head, canonical = _git_head_wrapper_bytes(INSTALL_ROOT)
         if (
-            not wrappers.get("success")
+            not runtime_permissions_repair_integrity_preview().get("success")
+            or not module_launcher_integrity_preview().get("success")
+            or not wrappers.get("success")
             or not launcher.get("success")
             or launcher.get("head") != head
             or wrappers.get("head") != head
@@ -5089,6 +5329,31 @@ def _first_install_state_already_bound(findings: dict[str, Any]) -> dict[str, An
     }
 
 
+def project_first_install_runtime_permissions(commit: str, user: str, *, on_projected=None) -> None:
+    """Verwendet die Updateprojektion mit den Blobs des Erstinstallationsstands."""
+    from Installer.update_simple import project_runtime_permissions_launcher, _release_web_program_contract
+    entries = read_commit_entries(
+        INSTALL_ROOT, commit, (), include_all=True,
+        required_paths=("Installer/runtime_permissions_repair.py",),
+        run_as_user=repository_git_reader_user(INSTALL_ROOT),
+    )
+    # Laufzeitdateien und lokale Ergänzungen sind keine Produktinventarquelle.
+    with tempfile.TemporaryDirectory(prefix="e3dc-first-install-release-") as directory:
+        source = Path(directory)
+        for relative, (payload, mode) in entries.items():
+            if mode == 0o120000:
+                continue
+            target = source / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(payload)
+        web_files, web_directories = _release_web_program_contract(source)
+        project_runtime_permissions_launcher(
+            source, INSTALL_ROOT, user, load_config(),
+            web_program_files=web_files, web_program_directories=web_directories,
+            on_projected=on_projected,
+        )
+
+
 def repair_permissions_first_install() -> dict[str, Any]:
     """Richtet Wrapper und sudoers bei der Erstinstallation einmalig ein.
 
@@ -5104,7 +5369,10 @@ def repair_permissions_first_install() -> dict[str, Any]:
         return repair_permissions(repair_runtime=False)
     try:
         findings = sudoers_file_findings()
-        privileged_paths = {SERVICE_WRAPPER, WEB_UPDATE_LAUNCHER, SUDOERS_FILE}
+        privileged_paths = {SERVICE_WRAPPER, WEB_UPDATE_LAUNCHER, SUDOERS_FILE,
+                            RUNTIME_PERMISSIONS_LAUNCHER, RUNTIME_PERMISSIONS_CONTRACT,
+                            Path("/usr/local/sbin/e3dc-module-installer"),
+                            Path("/etc/e3dc-control/module_installer_contract.json")}
         privileged_paths.update(
             Path(str(item.get("file") or ""))
             for item in findings.get("repairable_lines", [])
@@ -5239,13 +5507,13 @@ def repair_permissions(
             "reason_code": reason_code,
             "message": (
                 "Privilegierte Launcher und sudoers bleiben unverändert: "
-                "Lokales Git ist keine Stable-Autorität. Starte die vollständige "
-                "Systemreparatur über den verifizierten Stable-Updater."
+                "Lokales Git ist keine Stable-Autorität. Die vollständige "
+                "Systemreparatur über den verifizierten Stable-Updater starten."
                 if reason_code == "stable_repair_required"
                 else
                 "Privilegierte Launcher und sudoers bleiben unverändert: Der "
-                "root-eigene Stable-Updater ist nicht sicher nutzbar. Installiere "
-                "zuerst den veröffentlichten Ein-Datei-Bootstrap."
+                "root-eigene Stable-Updater ist nicht sicher nutzbar. Bitte "
+                "zuerst den veröffentlichten Ein-Datei-Bootstrap installieren."
             ),
             "stable_launcher": stable_launcher,
             "readiness": readiness,
@@ -5299,6 +5567,9 @@ def repair_permissions(
             privileged_paths = {
                 SERVICE_WRAPPER,
                 WEB_UPDATE_LAUNCHER,
+                RUNTIME_PERMISSIONS_LAUNCHER, RUNTIME_PERMISSIONS_CONTRACT,
+                Path("/usr/local/sbin/e3dc-module-installer"),
+                Path("/etc/e3dc-control/module_installer_contract.json"),
                 *sudoers_paths,
             }
             if bound_privileged_preimages is None:
@@ -5324,6 +5595,10 @@ def repair_permissions(
             launcher_preimages = [
                 privileged_by_path[str(SERVICE_WRAPPER)],
                 privileged_by_path[str(WEB_UPDATE_LAUNCHER)],
+                privileged_by_path["/usr/local/sbin/e3dc-module-installer"],
+                privileged_by_path["/etc/e3dc-control/module_installer_contract.json"],
+                privileged_by_path[str(RUNTIME_PERMISSIONS_LAUNCHER)],
+                privileged_by_path[str(RUNTIME_PERMISSIONS_CONTRACT)],
             ]
             sudoers_preimages = [
                 privileged_by_path[str(path)]
@@ -5500,6 +5775,19 @@ def repair_permissions(
                 "Root-eigener Web-Update-Launcher bestand das Endgate nicht"
             )
 
+        install_module_launcher_from_commit(rebound_head)
+        # Jede erfolgreiche Ausgabe vor dem nächsten Writer oder Endgate binden.
+        for preimage in launcher_preimages[2:4]:
+            _bind_transaction_output(preimage)
+        def bind_runtime_output(path: Path, payload: bytes) -> None:
+            _bind_transaction_output(launcher_by_path[str(path)], expected_payload=payload)
+        project_first_install_runtime_permissions(rebound_head, user, on_projected=bind_runtime_output)
+        permissions_launcher = runtime_permissions_repair_integrity_preview()
+        steps.append({"step": "install_runtime_permissions_launcher",
+                      "ok": bool(permissions_launcher.get("success"))})
+        if not permissions_launcher.get("success"):
+            raise RuntimeError("Root-eigener Rechte-Launcher bestand das Endgate nicht")
+        target_payload = desired_sudoers_content().encode("utf-8")
         sudoers_by_path = {str(item["path"]): item for item in sudoers_preimages}
         target_preimage = sudoers_by_path[str(SUDOERS_FILE)]
         _assert_preimage_unchanged(target_preimage)
@@ -5744,7 +6032,11 @@ def execute_job(job: dict[str, Any]) -> dict[str, Any]:
             }
 
     if normalized_action == "catalog":
-        return {"success": True, "modules": {m.key: m.public_dict() for m in iter_modules()}}
+        cfg = load_config()
+        return {"success": True, "modules": {
+            m.key: dict(m.public_dict(), setup_dependencies=list(
+                module_dependency_keys(m.key, cfg, tuple(m.dependencies))))
+            for m in iter_modules()}}
     if normalized_action == "installer_status":
         return installer_status()
     if normalized_action == "job_status":

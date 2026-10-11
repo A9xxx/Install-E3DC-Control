@@ -39,8 +39,9 @@ def number(value):
 # Auftrag zurückgenommen wird. Nutzeraufträge (WW-Sofort, Boost-Knopf, Timer)
 # halten fünf Minuten, budgetgebundene Automatik (PV, Preis, Pre-Dump) so lange
 # wie die Speicherzusage. Während der Lücke gibt es keinen neuen Start und
-# keine Anhebung; Nutzer-Aus, Hardware-/Quellenschutz, Uhrstörung und eine
-# Lücke der Wärmepumpen-Statusdaten wirken weiterhin sofort.
+# keine Anhebung. Hardware-/Quellenschutz und Uhrstörung wirken sofort.
+# Bei PV-/Tarif-Aufträgen schützt der Mindestlauf auch bei Nutzer-Aus; eine
+# Luxtronik-Beobachtungslücke erhält diesen Halt höchstens 60 Sekunden.
 E3DC_GAP_USER_TOLERANCE_S = 300.0
 E3DC_GAP_AUTO_TOLERANCE_S = 45.0
 
@@ -185,6 +186,7 @@ class LuxtronikChannelController:
         self.holiday_since_ts = {}
         self.last_result = {}
         self.last_observed_ww_target_c = None
+        self.runtime_observation = {}
         self.persisted = self._persist()
 
     def _persist(self):
@@ -325,7 +327,8 @@ class LuxtronikChannelController:
         ww_pending = bool(ctx.get("manual_ww_requested_before_io"))
         ww_active = bool(ww_state.get("active") or ww_state.get("pending"))
         blocks = set(ctx.get("heatpump_positive_output_block_reasons") or [])
-        hard = bool(ctx.get("heatpump_signal_typed_protection_stop")
+        island_veto = ctx.get("heatpump_emergency_veto") == "emergency_power"
+        hard = bool(island_veto or ctx.get("heatpump_signal_typed_protection_stop")
                     or blocks.intersection({"manual_source_temperature_stop", "manual_low_soc_stop",
                                             "pre_control_independent_safety_stop", "independent_safety_stop"}))
         protection_reason = str(pv_output.get("protection_reason") or pv_demand.get("protection_reason") or "")
@@ -344,6 +347,22 @@ class LuxtronikChannelController:
             return E3DC_GAP_USER_TOLERANCE_S if owner_class == "manual" else E3DC_GAP_AUTO_TOLERANCE_S
         status_fresh = bool((ctx.get("wp_status") or {}).get("valid") is True
                             and (ctx.get("wp_status") or {}).get("source_fresh") is True)
+        # Ausschließlich eine neue, gültige Geräteprobe erneuert den Beleg.
+        # Wiederholtes Lesen derselben Datei verschiebt die 60-s-Grenze nicht.
+        source_ts = number((ctx.get("wp_status") or {}).get("source_ts"))
+        runtime_current = bool(status_fresh and source_ts is not None
+                               and 0 <= now - source_ts <= 45.0
+                               and ctx.get("wp_compressor_observation_valid") is True)
+        if runtime_current:
+            self.runtime_observation = {
+                "ts": source_ts, "running": ctx.get("wp_compressor_running_now") is True,
+                "started": number(ctx.get("wp_compressor_last_start_ts"))}
+        last_runtime_ts = number(self.runtime_observation.get("ts"))
+        runtime_gap_hold = bool(not runtime_current and last_runtime_ts is not None
+                                and 0 <= now - last_runtime_ts <= 60.0
+                                and self.runtime_observation.get("running") is True)
+        wp_gap_scoped = bool(protection_reason == "invalid_control_data"
+                             and pv_output.get("protection_scope") == "luxtronik_observation_gap")
         ww_baseline_readback_fresh = bool(
             status_fresh and ww_observation["valid"] and sample_ts is not None
             and 0 <= now - sample_ts <= READBACK_AGE_S
@@ -420,6 +439,24 @@ class LuxtronikChannelController:
                       if not (offer["owner"] == "manual" and offer["mode"] == 1
                               and not manual_boost_running(offer["channel"]))]
         offers = list(self.pending_offers.values()) + offers
+        # Die Freigabe einer Pause gehört dieser Pause, nicht dem laufenden
+        # PV-Auftrag. Auch am Pausenende bleibt dessen eigener Kanal bestehen.
+        offers = [offer for offer in offers if not (
+            offer["owner"] == "price" and offer["mode"] == 0
+            and offer.get("purpose") == "price_pause"
+            and pv_output.get("keep") is True
+            and self.checkpoint["channels"][offer["channel"]]["owner"] == "pv")]
+        if pv_output.get("pause_waits_for_pv_end") is True:
+            offers = [offer for offer in offers if not (
+                (offer["owner"] == "price" and offer.get("purpose") in ("price_pause", "pv_pause")
+                 or offer["owner"] == "release" and offer["mode"] == 0)
+                and self.checkpoint["channels"][offer["channel"]]["owner"] == "pv")]
+        if pv_output.get("request_withdrawal_debounced") is True:
+            # Eine reine Pausenlücke entzieht den bestehenden PV-Kanal erst
+            # nach der Entprellung. Positive fremde Besitzer bleiben vorrangig.
+            offers = [offer for offer in offers if not (offer["mode"] == 0
+                and offer["owner"] in ("price", "release", "pv")
+                and self.checkpoint["channels"][offer["channel"]]["owner"] == "pv")]
         priority = {"pv": 0, "predump": 1, "price": 2, "manual": 3}
         def rank(value):
             return -1 if str(value.get("request_id")).startswith("timer:") else priority[value["owner"]]
@@ -610,7 +647,10 @@ class LuxtronikChannelController:
                     observation_valid=ctx.get("wp_compressor_observation_valid"),
                     compressor_stop_ts=ctx.get("wp_compressor_last_stop_ts"))
                 takt_until = anchor + restart_hold
-                takt_wait = bool(ctx.get("WP_TAKT_PROTECT") and anchor > 0 and now < takt_until)
+                ww_takeover = bool(name == "ww" and desired[name]["owner"] == "pv"
+                    and pv_demand.get("ww_takeover") is True and runtime_current
+                    and ctx.get("wp_compressor_running_now") is True)
+                takt_wait = bool(not ww_takeover and ctx.get("WP_TAKT_PROTECT") and anchor > 0 and now < takt_until)
                 waits = [(takt_until, "restart_block")] if takt_wait else []
                 if state["stop_until"] > now:
                     waits.append((state["stop_until"], "stop_until"))
@@ -622,37 +662,60 @@ class LuxtronikChannelController:
             # Der WW-Grundwert gilt wie ein eingebauter Timer unabhängig vom
             # Boost. Nur dessen eigene, physisch belegte Laufzeit schützt eine
             # Rücknahme; ein bloßes Signal oder ein alter Startzeitpunkt nicht.
-            ww_pv_owned = bool(name == "ww" and (state["owner"] in ("pv", "tariff") or wp_holiday)
-                               and state["possible_effect"])
+            runtime_owned = bool(state["possible_effect"] and (
+                name == "ww" and (state["owner"] in ("pv", "tariff") or wp_holiday)
+                or name == "hz" and state["owner"] == "tariff"
+                or name == "hz" and state["owner"] == "pv"
+                and (not runtime_current or protection_reason in ("bridge_source_disabled", "user_off", "emergency_reserve")
+                     or user_off or not automatic
+                     or desired[name] and desired[name]["owner"] == "price"
+                     and str(desired[name].get("request_id") or "").startswith(("price_pause:", "pv_pause:"))
+                     or pv_output.get("pause_requires_stop"))))
             boost_left_s = 0.0
             # Die Laufzeit entscheidet erst bei entfallener Voraussetzung
             # über die Rücknahme, nicht während eines weiter gültigen Angebots.
-            if ww_pv_owned and (channel_hard or desired[name] is None
+            if runtime_owned and (channel_hard or desired[name] is None
                     or any(desired[name][key] != state[key] for key in ("owner", "target_c"))):
                 sent = number(state.get("sent_ts"))
-                started = number(ctx.get("wp_compressor_last_start_ts"))
+                started = (number(self.runtime_observation.get("started")) if runtime_gap_hold
+                           else number(ctx.get("wp_compressor_last_start_ts")))
+                tariff_hold = (ctx.get("heat_tariff_storage_hold") or {}).get(name) or {}
+                hold_ts = number(tariff_hold.get("ts"))
+                soc = number(ctx.get("soc"))
+                minimum_soc = number(ctx.get("MIN_SOC"))
+                tariff_soc_hold = bool(state["owner"] == "tariff"
+                    and tariff_hold.get("request_id") == state["request_id"]
+                    and tariff_hold.get("revision") == state["revision"]
+                    and hold_ts is not None and 0 <= now - hold_ts <= 10.0
+                    and ctx.get("e3dc_valid") is True and soc is not None and minimum_soc is not None
+                    and 0 < soc < max(5.0, minimum_soc - 5.0))
                 operating = (ctx.get("wp_data") or {}).get(
                     "Betriebsart", (ctx.get("wp_status") or {}).get("Betriebsart"))
                 # Betriebsart 3 ist die normalisierte EVU-/Fremdsperre.
-                grid_power = number(ctx.get("grid"))
                 hardware_block = bool(
-                    operating == 3 or self.clock_fault or not status_fresh or gap_expired
+                    island_veto or operating == 3 or self.clock_fault
+                    or not (runtime_current or runtime_gap_hold) or gap_expired
                     or ctx.get("heatpump_signal_typed_protection_stop")
-                    or protection_reason not in ("", "user_off", "emergency_reserve")
+                    or (protection_reason not in ("", "user_off", "emergency_reserve", "bridge_source_disabled")
+                        and not (wp_gap_scoped and runtime_gap_hold))
+                    or (state["owner"] == "tariff" and (tariff.get("storage_safety_veto") is True
+                        or any(reason in tariff.get("blockers", []) for reason in (
+                            "device_free_missing_or_blocked", "source_free_missing_or_blocked",
+                            "emergency_free_missing_or_blocked", "reserve_free_missing_or_blocked"))))
                     or blocks.intersection({"manual_source_temperature_stop"})
-                    or (grid_power is not None and grid_power > 2500.0)
-                    or (grid_power is None and blocks.intersection({
-                        "pre_control_independent_safety_stop", "independent_safety_stop"})))
-                if (not hardware_block and not (state["owner"] == "tariff" and (channel_hard or user_off or not automatic)) and ctx.get("WP_TAKT_PROTECT")
-                        and ctx.get("wp_compressor_observation_valid") is True
-                        and ctx.get("wp_compressor_running_now") is True
+                    or ctx.get("heatpump_grid_safety_stop") is True
+                    or (blocks.intersection({
+                        "pre_control_independent_safety_stop", "independent_safety_stop"}) and not tariff_soc_hold))
+                if (not hardware_block and ctx.get("WP_TAKT_PROTECT")
+                        and (runtime_current and ctx.get("wp_compressor_running_now") is True or runtime_gap_hold)
                         and sent is not None and started is not None
                         and 0 < started <= now and sent <= now):
                     boost_left_s = max(0.0, minimum_run - (now - max(sent, started)))
                 stop_allowed = boost_left_s <= 0.0
                 if not stop_allowed:
-                    # Nur den bereits eigenen WW-Auftrag halten. HZ und neue
-                    # Starts behalten sämtliche bisherigen Schutzschranken.
+                    # Nur den bereits eigenen Auftrag halten. Bei gesperrter
+                    # Brücke gilt der Verdichterschutz auch für den PV-HZ-Kanal.
+                    # Fremde Besitzer und neue Starts erhalten keine Freigabe.
                     pv_transfer = bool(state["owner"] == "tariff" and desired[name]
                                        and desired[name]["owner"] == "pv"
                                        and desired[name]["target_c"] == state["target_c"])

@@ -9,7 +9,8 @@ Pre-Dump ist kein normales Nachtziel und kein Ersatz für den Morgenpuffer:
 - `storage_predump_min_soc`: tiefste erlaubte Reserve für aktives
   Vorab-Entladen.
 - `storage_morning_soc`: gewünschte Startreserve am Kurvenbeginn.
-- `target_soc`: Tagesziel zum Freilauf, meist nahe 95 Prozent.
+- `storage_target_soc` (Config-Editor: „Tagesziel (%)“): Tagesziel zum Freilauf,
+  Standard 90 Prozent.
 
 ## Grundregel
 
@@ -73,8 +74,10 @@ Pre-Dump-Ziel = Pre-Dump-Bedarf + kleiner Regelpuffer, begrenzt durch Pre-Dump-M
 
 Der Rohdruck ist also nur die potenziell gefährdete Energie. Er wird erst dann
 zum aktiven Dump-Bedarf, wenn er nicht mehr in den sicheren Speicherplatz bis
-zum Ziel-SoC passt. Als sichere Verbraucher zählen Hauslast und nur solche
-WP-/Wallbox-/Lastpfade, die die Prognose bewusst als verlässlich behandeln darf.
+zum Ziel-SoC passt. Als sichere Verbraucher rechnet das Druckmodell mit einer festen
+Mindest-Hauslast von 300 Watt; Lastspitzen aus Prognose oder Messung zählen nicht.
+Die prognostizierte Wärmepumpenleistung zählt nur dann als sichere Senke, wenn
+`predump_trust_heatpump_forecast_as_sink` eingeschaltet ist (Standard: aus).
 
 Grenzbeispiel mit genug Headroom:
 
@@ -139,6 +142,21 @@ Verbraucher erst später sinnvoll gestartet werden kann, wird der Start so weit
 wie möglich nach hinten geschoben, solange das Ziel rechnerisch noch erreichbar
 bleibt.
 
+## Wiedereintrittssperre
+
+Endet eine laufende Vorab-Entladung, sperrt das System eine neue Vorab-Entladung
+für `predump_reopen_block_s` (Standard 900 Sekunden). Das verhindert, dass der
+SoC an der Zielkante durch Rundung flattert und die Vorab-Entladung ständig neu
+anläuft. Als Zielkante gilt das Pre-Dump-Ziel; lief ein Verbraucher mit Landeband,
+gilt dessen Unterkante.
+
+Die Sperre endet vorzeitig, wenn der SoC über die Zielkante plus Wiedereintrittsabstand
+steigt (`predump_reopen_soc_margin_pct`; Standard: Trajektorien-Hysterese
+`pd_traj_hyst` von 0,7 Prozentpunkten plus 1,0 Prozentpunkte, mindestens aber
+0,8 Prozentpunkte) oder wenn sich das Pre-Dump-Ziel um mehr als 0,7 Prozentpunkte
+ändert (`predump_reopen_target_change_pct`). Ein Wert von 0 für
+`predump_reopen_block_s` schaltet die Sperre ab.
+
 ## Verbraucherbudget
 
 Freigegebene Verbraucher wie Wallbox, Wärmepumpe oder Heizstab können
@@ -162,6 +180,28 @@ Aktuell gilt:
 Eine prognostizierte Wärmepumpe wird nicht als garantierter Verbraucher
 angenommen. Gerade im Sommer läuft häufig nur Warmwasser, und der tatsächliche
 Bedarf kann wegfallen.
+
+### Landeband für laufende Verbraucher
+
+Die Vorab-Entladung endet normalerweise am Pre-Dump-Ziel zuzüglich der
+Trajektorien-Hysterese (`pd_traj_hyst`). Ist unter „Pre-Dump: freigegebene
+Verbraucher“ mindestens ein Verbraucher (Wallbox, Wärmepumpe, Heizstab)
+freigegeben und läuft er bereits (Last von mindestens 250 Watt,
+`predump_consumer_active_w`, oder Verbraucherbetrieb im Zyklus davor), darf er bis
+zu einer Unterkante unterhalb des Ziels weiterlaufen. Sie liegt höchstens
+0,5 Prozentpunkte beziehungsweise 300 Wh unter dem Ziel
+(`predump_consumer_landing_under_pct`, `predump_consumer_landing_under_wh`; es
+gilt der kleinere Wert). Das Pre-Dump-Minimum und die Notstromreserve bleiben
+harter Boden: Die Unterkante liegt nie darunter.
+
+## Netzschutz während Pre-Dump
+
+Während Pre-Dump verhindert ein Netzschutz vermeidbaren Netzbezug. Misst das System
+mehr Netzbezug als den Totbereich `predump_pause_grid_guard_w` (Standard 120 Watt;
+0 entfernt den Totbereich), fordert es mindestens den Netzbezug oberhalb des
+Totbereichs plus 350 Watt als Entladeleistung an, höchstens bis zur maximalen
+Entladeleistung. Der Totbereich pausiert Pre-Dump nicht. `predump_grid_guard_w`
+stammt vom früheren Pre-Dump-Regler und wird im aktuellen Regler nicht ausgewertet.
 
 ## Abregelschutz: Netz-Dump ist integriert
 

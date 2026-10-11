@@ -5,6 +5,12 @@ if (!defined('VIEW_MODE')) {
 if (session_status() === PHP_SESSION_NONE) { session_start(); }
 require_once 'helpers.php';
 handleWebLogin();
+$seite = $_GET['seite'] ?? 'live';
+// Die Anmeldung ist bereits gültig: direkt zur Startseite weiterleiten.
+if ($seite === 'lock' && isWebAuthenticated()) {
+    header('Location: mobile.php');
+    exit;
+}
 sendNoCacheHeaders();
 handleVersionCheck(__FILE__);
 handleUpdatePreparation();
@@ -47,13 +53,13 @@ if (isset($_POST['save_lux_global'])) {
         echo errorMessage(
             'Luxtronik-Einstellung nicht gespeichert',
             'Die bestehende Konfiguration blieb unverändert; der Dienst wurde nicht neu gestartet. '
-            . 'Bitte führe im Installationscenter einmal „Rechte reparieren“ aus und versuche es erneut.'
+            . 'Im Installationscenter einmal „Rechte reparieren“ ausführen und erneut versuchen.'
         );
         exit;
     }
     if (!e3dcRemoveConfigCacheFailClosed('/var/www/html/ramdisk/e3dc_config_cache.json')) {
         http_response_code(500);
-        echo errorMessage('Luxtronik-Einstellung gespeichert, Cache nicht entfernt', 'Der Dienst wurde nicht neu gestartet. Bitte führe „Rechte reparieren“ aus.');
+        echo errorMessage('Luxtronik-Einstellung gespeichert, Cache nicht entfernt', 'Der Dienst wurde nicht neu gestartet. „Rechte reparieren“ ausführen.');
         exit;
     }
     $restart = e3dcRestartEnergyManagerFromWeb($paths);
@@ -101,7 +107,6 @@ if ($staticData) {
     echo "<!-- Static Data Loaded from: " . htmlspecialchars($staticData['source']) . " -->";
 }
 
-$seite = $_GET['seite'] ?? 'live';
 if ($seite === 'charging') {
     $seite = !empty($wbEnabled) ? 'wallbox' : 'live';
 }
@@ -110,6 +115,8 @@ $isDocker = e3dcIsDockerEnvironment();
 $protectedPages = ['config', 'wallbox', 'waermepumpe'];
 // Neue Wärmepumpen-Ansicht (Vorschau): gleiche Anmeldepflicht wie die bisherige Seite.
 $protectedPages[] = 'waermepumpe_vorschau';
+$protectedPages[] = 'matter';
+$protectedPages[] = 'vitals';
 $wpvAjaxRequest = isset($_GET['ajax']) && $_GET['ajax'] == '1' && $seite === 'waermepumpe_vorschau';
 if (in_array($seite, $protectedPages) && !isWebAuthenticated()) {
     if ($wpvAjaxRequest) {
@@ -1393,15 +1400,16 @@ if ($wpvAjaxRequest && $seite === 'waermepumpe_vorschau') {
             <div class="card-content p-3">
                 <i class="fas fa-lock text-warning mb-3" style="font-size: 3rem;"></i>
                 <h4 class="fw-bold mb-3">Geschützter Bereich</h4>
-                <p class="text-muted small mb-4">Bitte gib deine PIN ein, um die Steuerung zu entsperren.</p>
+                <p class="text-muted small mb-4">Die PIN eingeben, um die Steuerung zu entsperren.</p>
                 <?php if (isset($_SESSION['login_error'])): ?>
-                    <div class="alert alert-danger py-2 small"><?= htmlspecialchars($_SESSION['login_error_message'] ?? 'Falsche PIN. Bitte versuche es erneut.') ?></div>
+                    <div class="alert alert-danger py-2 small"><?= htmlspecialchars($_SESSION['login_error_message'] ?? 'Falsche PIN. Erneut versuchen.') ?></div>
                     <?php unset($_SESSION['login_error']); ?>
                     <?php unset($_SESSION['login_error_message']); ?>
                 <?php endif; ?>
                 <form method="post" action="">
                     <?= e3dcCsrfInput() ?>
                     <input type="hidden" name="action" value="web_login">
+                            <input type="hidden" name="login_return" value="<?= htmlspecialchars(e3dcWebLoginReturnTarget(), ENT_QUOTES, 'UTF-8') ?>">
                     <div class="mb-4">
                         <input type="password" name="pin" class="form-control form-control-lg text-center fw-bold bg-body-secondary text-body border-secondary" placeholder="****" autofocus required style="letter-spacing: 0.5em;">
                     </div>
@@ -1828,6 +1836,11 @@ placeMobileStatsPanel();
 // Solar wird mit defer geladen. Der Live-Transport startet genau einmal, nachdem
 // processMobileData vollständig bereitsteht; frühe Pakete können so nicht verloren gehen.
 function startMobileLiveTransportOnce() {
+            if (typeof document.querySelector === 'function'
+                && document.querySelector('input[name="action"][value="web_login"]')) {
+                window.E3DC_LIVE_AUTH_BLOCKED = true;
+                return false;
+            }
     if (mobileLiveTransportStarted) return true;
     if (typeof window.processMobileData !== 'function') return false;
     mobileLiveTransportStarted = true;

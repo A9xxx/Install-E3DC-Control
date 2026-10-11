@@ -1,9 +1,9 @@
 {
-  "version": "5.5.3c",
+  "version": "5.5.4",
   "min_version": "4.0.0",
-  "stable_release": "v5.5.3c",
-  "release_date": "2026-10-09",
-  "description": "v5.5.3c - Korrekturupdate: Energy Manager bei der Neuinstallation",
+  "stable_release": "v5.5.4",
+  "release_date": "2026-10-12",
+  "description": "v5.5.4 - Installationszentrale, Wallbox- und Wärmepumpenregelung, Tagesstatistik nach Bilanz",
   "update_strategy": "backup_replace_restart_v1",
   "installer_requires": "python3",
   "sanitized_republication": false,
@@ -100,6 +100,7 @@
     "websocket-client",
     "websockets",
     "pymodbus",
+    "pyserial",
     "pywebpush",
     "pycryptodome"
   ]

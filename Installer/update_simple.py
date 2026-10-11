@@ -31,7 +31,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 from urllib.parse import urlparse
 
 
@@ -6660,6 +6660,73 @@ def _canonical_shell_literal(value: str) -> bytes:
     return ("'" + value.replace("'", "'\"'\"'") + "'").encode("utf-8")
 
 
+def project_runtime_permissions_launcher(
+    release_root: Path, target_root: Path, install_user: str, config: dict, *,
+    web_program_files: tuple[str, ...], web_program_directories: tuple[str, ...],
+    on_projected: Callable[[Path, bytes], None] | None = None,
+    prepared_payloads: tuple[bytes, bytes] | None = None,
+) -> None:
+    """Projiziert den Rechte-Launcher bei Erstinstallation und Update identisch."""
+    for parent in sorted({RUNTIME_PERMISSIONS_LAUNCHER.parent,
+                          RUNTIME_PERMISSIONS_CONTRACT.parent}, key=lambda path: len(path.parts)):
+        if os.path.lexists(parent):
+            metadata = parent.lstat()
+            if parent.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+                raise RuntimeError(f"Launcher-Elternpfad ist kein echtes Verzeichnis: {parent}")
+        else:
+            parent.mkdir(mode=0o755, parents=True)
+        os.chown(parent, 0, 0)
+        os.chmod(parent, 0o755)
+    if prepared_payloads is None:
+        permissions_payload = _release_python_script(
+            release_root / "Installer/runtime_permissions_repair.py",
+            label="Rechte-Launcher",
+        )
+        permissions_contract_payload = _runtime_permissions_contract_payload(
+            release_root,
+            target_root,
+            install_user,
+            config,
+            web_program_files=web_program_files,
+            web_program_directories=web_program_directories,
+        )
+    else:
+        permissions_payload, permissions_contract_payload = prepared_payloads
+
+    _atomic_write_file(
+        RUNTIME_PERMISSIONS_LAUNCHER,
+        permissions_payload,
+        uid=0,
+        gid=0,
+        mode=0o755,
+    )
+    if on_projected is not None:
+        on_projected(RUNTIME_PERMISSIONS_LAUNCHER, permissions_payload)
+    _atomic_write_file(
+        RUNTIME_PERMISSIONS_CONTRACT,
+        permissions_contract_payload,
+        uid=0,
+        gid=0,
+        mode=0o644,
+    )
+    if on_projected is not None:
+        on_projected(RUNTIME_PERMISSIONS_CONTRACT, permissions_contract_payload)
+    for path, mode, label in (
+        (RUNTIME_PERMISSIONS_LAUNCHER, 0o755, "Rechte-Launcher"),
+        (RUNTIME_PERMISSIONS_CONTRACT, 0o644, "Rechtevertrag"),
+    ):
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) != mode
+        ):
+            raise RuntimeError(f"{label} blieb nach der Installation unsicher")
+
+
+
 def _install_privileged_entrypoints(
     release_root: Path,
     target_root: Path,
@@ -6670,6 +6737,21 @@ def _install_privileged_entrypoints(
     web_program_directories: tuple[str, ...],
 ) -> list[str]:
     """Installiert Launcher und sudoers direkt aus dem Ziel-Release, nie aus Nutzer-Git."""
+
+    permissions_payload = _release_python_script(
+        release_root / "Installer/runtime_permissions_repair.py",
+        label="Rechte-Launcher",
+    )
+    permissions_contract_payload = _runtime_permissions_contract_payload(
+        release_root,
+        target_root,
+        install_user,
+        config,
+        web_program_files=web_program_files,
+        web_program_directories=web_program_directories,
+    )
+
+    permissions_payloads = (permissions_payload, permissions_contract_payload)
 
     warnings: list[str] = []
     entrypoint_parents = tuple(
@@ -6716,18 +6798,6 @@ def _install_privileged_entrypoints(
         user_marker,
         _canonical_shell_literal(install_user),
     )
-    permissions_payload = _release_python_script(
-        release_root / "Installer/runtime_permissions_repair.py",
-        label="Rechte-Launcher",
-    )
-    permissions_contract_payload = _runtime_permissions_contract_payload(
-        release_root,
-        target_root,
-        install_user,
-        config,
-        web_program_files=web_program_files,
-        web_program_directories=web_program_directories,
-    )
 
     for path, payload, label in (
         (SERVICE_WRAPPER, service_payload, "Service-Launcher"),
@@ -6747,35 +6817,39 @@ def _install_privileged_entrypoints(
         ):
             raise RuntimeError(f"{label} blieb nach der automatischen Rechtereparatur unsicher")
 
-    _atomic_write_file(
-        RUNTIME_PERMISSIONS_LAUNCHER,
-        permissions_payload,
-        uid=0,
-        gid=0,
-        mode=0o755,
+    project_runtime_permissions_launcher(
+        release_root, target_root, install_user, config,
+        web_program_files=web_program_files, web_program_directories=web_program_directories,
+        prepared_payloads=permissions_payloads,
     )
-    _atomic_write_file(
-        RUNTIME_PERMISSIONS_CONTRACT,
-        permissions_contract_payload,
-        uid=0,
-        gid=0,
-        mode=0o644,
-    )
-    for path, mode, label in (
-        (RUNTIME_PERMISSIONS_LAUNCHER, 0o755, "Rechte-Launcher"),
-        (RUNTIME_PERMISSIONS_CONTRACT, 0o644, "Rechtevertrag"),
-    ):
-        metadata = path.lstat()
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_nlink != 1
-            or metadata.st_uid != 0
-            or metadata.st_gid != 0
-            or stat.S_IMODE(metadata.st_mode) != mode
-        ):
-            raise RuntimeError(f"{label} blieb nach der Installation unsicher")
 
-    from Installer.service_catalog import allowed_services
+    from Installer import module_installer
+    from Installer.service_catalog import allowed_services, iter_modules
+    release_commit = str(os.environ.get("E3DC_RELEASE_EXPECTED_COMMIT") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", release_commit):
+        # Der Download-Checkout ist die geprüfte Releasequelle, niemals das Nutzer-Git.
+        from Installer.git_commit_reader import run_isolated_git
+        release_head = run_isolated_git(release_root, "rev-parse", "--verify", "HEAD^{commit}", timeout=15)
+        release_commit = bytes(release_head.stdout or b"").decode("ascii", errors="replace").strip()
+        if release_head.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", release_commit):
+            raise RuntimeError("Modul-Launcher benötigt den freigegebenen Zielcommit")
+    # Ausschließlich Commit-Blobs der bereits geprüften, root-privaten Releasequelle.
+    from Installer.git_commit_reader import read_commit_entries
+    module_entries = read_commit_entries(
+        release_root, release_commit, ("Installer", "VERSION", "installer_main.py"),
+        required_paths=("Installer/module_installer.py", "Installer/service_catalog.py", "VERSION", "installer_main.py"),
+        maximum_files=600, maximum_file_bytes=8 * 1024 * 1024,
+        maximum_total_bytes=64 * 1024 * 1024,
+    )
+    module_contract = module_installer.provision(
+        module_entries, release_commit, target_root, install_user,
+        {m.key: {"unit": m.service_unit} for m in iter_modules() if m.optional and m.service_unit
+         and m.key not in module_installer.EXCLUDED_MODULES
+         and m.service_unit not in set(ROLE_SERVICE_BY_MODE.values())},
+        venv_name=_configured_venv_name(config),
+    )
+
+    warnings.extend(module_contract.get("warnings", []))
 
     wrapper_services = tuple(
         re.findall(
@@ -6812,6 +6886,7 @@ def _install_privileged_entrypoints(
             "",
         )
     )
+    sudoers_lines[-1:-1] = module_installer.sudoers_lines(module_contract)
     sudoers_payload = "\n".join(sudoers_lines).encode("utf-8")
     visudo = Path("/usr/sbin/visudo")
     if not visudo.is_file() or not os.access(visudo, os.X_OK):

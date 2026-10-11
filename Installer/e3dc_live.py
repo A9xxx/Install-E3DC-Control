@@ -1666,8 +1666,32 @@ def get_system_info(conn):
             watts, valid = _typed_int_tag(values, RscpTag.EMS_SYS_SPEC_VALUE_INT)
             if valid and watts > 0:
                 nominal = watts
+    limits = {}
+    observed_at = time.time()
+    for name, key in (
+        ("maxChargePower", "device_max_charge_power_w"),
+        ("maxDischargePower", "device_max_discharge_power_w"),
+        ("recommendedMinChargeLimit", "device_recommended_min_charge_power_w"),
+        ("recommendedMinDischargeLimit", "device_recommended_min_discharge_power_w"),
+    ):
+        watts = None
+        for item in specs.get("value", []) if isinstance(specs, dict) and specs.get("type") == RscpType.Container and isinstance(specs.get("value"), list) else []:
+            if not isinstance(item, dict) or item.get("tag") != RscpTag.EMS_SYS_SPEC or item.get("type") != RscpType.Container:
+                continue
+            values = item.get("value")
+            if isinstance(values, list) and find_tag_value(values, RscpTag.EMS_SYS_SPEC_NAME) == name:
+                value, valid = _typed_int_tag(values, RscpTag.EMS_SYS_SPEC_VALUE_INT)
+                value_item = find_tag(values, RscpTag.EMS_SYS_SPEC_VALUE_INT)
+                integer_types = (RscpType.Char8, RscpType.UChar8, RscpType.Int16, RscpType.Uint16,
+                                 RscpType.Int32, RscpType.Uint32, RscpType.Int64, RscpType.Uint64)
+                minimum_w = 300 if key.startswith("device_max_") else 1
+                if valid and value_item.get("type") in integer_types and value >= minimum_w:
+                    watts = value
+        limits.update({key: watts, key + "_valid": watts is not None,
+                       key + "_source": "rscp_sys_specs_" + name if watts is not None else "rscp_missing_or_invalid",
+                       key + "_observed_at_s": observed_at if watts is not None else None})
     # Eigener Name: Nennleistung ist weder ein aktives Leistungslimit noch DC-Max.
-    return {"serial_number": sn, "sw_release": rel,
+    return {**limits, "serial_number": sn, "sw_release": rel,
             "e3dc_ac_nominal_power_w": nominal,
             "e3dc_ac_nominal_power_valid": nominal is not None,
             "e3dc_ac_nominal_power_source": "rscp_sys_specs_maxAcPower" if nominal is not None else "rscp_missing_or_invalid",

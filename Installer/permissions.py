@@ -2107,6 +2107,7 @@ FILE_DEFINITIONS = [
     {"path": "/var/www/html/ramdisk/native_wallbox_schedule.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/ramdisk/external_wb.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/ramdisk/value_filter.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
+    {"path": "/var/www/html/ramdisk/mqtt_hub_status.json", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     {"path": "/var/www/html/logs/e3dc_mqtt_hub.log", "mode": "664", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": False},
     # Heizstab / Shelly Manager (wp_type=2) & RSCP Live-Dienst
     {"path": f"{INSTALLER_DIR}/heizstab_manager.py", "mode": "755", "owner": INSTALL_USER, "group": "www-data", "optional": True, "executable": True},

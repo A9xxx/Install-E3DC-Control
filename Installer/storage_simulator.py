@@ -877,6 +877,7 @@ def read_market_window_reference(path=None, now_s=None):
             return None
         return {
             "window_end_ts": window_end_ms,
+            **({"tariff_revision": state["tariff_revision"]} if "tariff_revision" in state else {}),
             "ref_ct": ref_ct,
             "bound_ts": bound_ms,
             "tariff": str(state.get("tariff") or ""),
@@ -2296,7 +2297,7 @@ class StorageSimulator:
         projected_start_soc = None
         for slot in sorted(timeline_slots or [], key=lambda s: _sf(s.get("ts", 0.0), 0.0)):
             if _sf(slot.get("ts", 0.0), 0.0) >= start_ts:
-                projected_start_soc = _sf(slot.get("soc", fallback), fallback)
+                projected_start_soc = _sf(slot.get("soc_start", slot.get("soc", fallback)), fallback)
                 break
         if projected_start_soc is None:
             projected_start_soc = fallback
@@ -2951,40 +2952,12 @@ class StorageSimulator:
     def _observe_wallbox_storage_policy_requested(self, intent, mode):
         if mode != MODE_OFF:
             return False
-        reason = str((intent or {}).get("reason") or "").strip().lower()
-        request = str((intent or {}).get("battery_request") or "").strip().lower()
-        if reason in ("no_vehicle_connected", "manual_pause", "bev_full_blocked") or request == "release":
-            return False
-        if not bool(
-            (intent or {}).get("active")
-            or (intent or {}).get("car_active")
-            or (intent or {}).get("charging_active")
-            or (intent or {}).get("connected")
-            or (intent or {}).get("plugged")
-            or abs(self._safe_float((intent or {}).get("wb_power_w"), 0.0)) > 500.0
-        ):
-            return False
-        raw_policy = (intent or {}).get("observe_storage_policy")
-        if raw_policy is None:
-            wb_id = int(self._safe_float((intent or {}).get("wb_id", (intent or {}).get("charger_id", 1)), 1))
-            for key in (
-                f"wb{wb_id}_observe_storage_policy",
-                f"wb{wb_id}_storage_observe_policy",
-                "wb_observe_storage_policy",
-            ):
-                if key in self.v4_config:
-                    raw_policy = self.v4_config.get(key)
-                    break
-        if raw_policy is None:
-            for wb_id in (1, 2):
-                if normalize_wb_mode(self.v4_config.get(f"wb{wb_id}_mode", MODE_OFF)) != MODE_OFF:
-                    continue
-                for key in (f"wb{wb_id}_observe_storage_policy", f"wb{wb_id}_storage_observe_policy"):
-                    if key in self.v4_config:
-                        raw_policy = self.v4_config.get(key)
-                        break
-                if raw_policy is not None:
-                    break
+        wb_id = int(self._safe_float((intent or {}).get("wb_id", (intent or {}).get("charger_id", 1)), 1))
+        raw_policy = next((str(value).strip() for value in (
+            (intent or {}).get("observe_storage_policy"),
+            self.v4_config.get(f"wb{wb_id}_observe_storage_policy"),
+            self.v4_config.get(f"wb{wb_id}_storage_observe_policy"),
+            self.v4_config.get("wb_observe_storage_policy")) if str(value or "").strip()), "")
         return str(raw_policy or "").strip().lower() in (
             "reserve",
             "pv_battery",
@@ -2999,34 +2972,237 @@ class StorageSimulator:
         )
 
     def _wallbox_target_curve_soc(self, default_target_soc):
-        """Liest den aktiven wbminSoC-Boden fuer die Wallbox, ohne das Speicherziel zu aendern."""
+        """Liest passende Ladepunkte; Statusausfälle sind kein Absteckbeleg."""
         try:
-            if not os.path.exists(WB_INTENT_FILE):
-                return None, {}
             age_s = time.time() - os.path.getmtime(WB_INTENT_FILE)
-            if age_s > 60:
-                return None, {"stale_s": round(age_s, 1)}
-            with open(WB_INTENT_FILE, "r", encoding="utf-8") as f:
-                intent = json.load(f)
-            mode = normalize_wb_mode(intent.get("wb_mode_active", 0))
-            observe_storage_floor = self._observe_wallbox_storage_policy_requested(intent, mode)
-            if mode != MODE_TARGET and not observe_storage_floor:
+            if age_s > 60 or age_s < -60:
+                return None, {"stale_s": round(age_s, 1), "unavailable": True}
+            with open(WB_INTENT_FILE, "r", encoding="utf-8") as handle:
+                intent = json.load(handle)
+            if not isinstance(intent, dict):
+                return None, {"unavailable": True}
+            rows = intent.get("car_energy_needs")
+            legacy = not isinstance(rows, list)
+            rows = [intent] if legacy else rows
+            cars, stopped, uncertain = [], False, False
+            for row in rows:
+                if not isinstance(row, dict):
+                    uncertain = True
+                    continue
+                mode = normalize_wb_mode(row.get("wb_mode_active", 0))
+                if not (mode == MODE_TARGET or self._observe_wallbox_storage_policy_requested(row, mode)):
+                    continue
+                if (row.get("manual_pause") or row.get("bev_full_blocked")
+                        or row.get("connected") is False
+                        or row.get("reason") in ("manual_pause", "bev_full_blocked")):
+                    stopped = True
+                    continue
+                if (not legacy and "connected" in row and row.get("connected") is None) or not bool(row.get("active", row.get("car_active", False))):
+                    uncertain = True
+                    continue
+                cars.append(row)
+            intent = dict(intent, wallbox_target_cars=cars,
+                          confirmed_inactive=bool(stopped and not cars and not uncertain),
+                          unavailable=bool(uncertain and not cars),
+                          legacy_vehicle_needs=legacy)
+            if not cars:
                 return None, intent
-            if not bool(intent.get("active", intent.get("car_active", False))):
-                return None, intent
-            external_owner = bool(
-                intent.get("external_wallbox_manager")
-                or intent.get("openwb_primary_observe_only")
-                or intent.get("autonomous_wallbox")
-                or observe_storage_floor
-            )
-            if not external_owner:
-                return None, intent
-            raw_floor = intent.get("effective_wb_floor_soc", intent.get("wbminsoc", self.v4_config.get("wbminsoc", default_target_soc)))
-            target = max(5.0, min(100.0, self._safe_float(raw_floor, default_target_soc)))
-            return target, intent
-        except Exception as exc:
-            return None, {"error": str(exc)}
+            raw_floor = intent.get("effective_wb_floor_soc", intent.get("wbminsoc", self.v4_config.get("wbminsoc")))
+            target = float(raw_floor)
+            if isinstance(raw_floor, bool) or not math.isfinite(target) or not 0 <= target <= 100:
+                return None, dict(intent, error="wbminsoc_invalid")
+            return max(5.0, target), intent
+        except (OSError, ValueError, TypeError) as exc:
+            return None, {"unavailable": True, "error": type(exc).__name__}
+
+    def _wallbox_curve_target_decision(self, normal_soc, floor_soc, intent,
+                                      current_soc, timeline, start_ms, day_ms, now_s):
+        """Vergleicht Akku und Fahrzeuge, ohne die Slotbilanz zu verändern."""
+        def number(raw):
+            try:
+                value = float(raw)
+                return value if not isinstance(raw, bool) and math.isfinite(value) and value >= 0 else None
+            except (TypeError, ValueError):
+                return None
+
+        previous = {}
+        try:
+            with open(OUTPUT_FILE, "r", encoding="utf-8") as handle:
+                previous = json.load(handle).get("wallbox_curve_target_state", {})
+            if not (isinstance(previous, dict)
+                    and previous.get("schema_version") == "wallbox_curve_target_v1"
+                    and previous.get("day_start_ts_ms") == day_ms
+                    and previous.get("config_target_soc") == normal_soc
+                    and previous.get("decision") in ("normal", "wbminsoc")
+                    and 0 < float(previous.get("since_ts", 0)) <= now_s
+                    and (floor_soc is None or previous.get("floor_soc") == floor_soc)):
+                previous = {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            previous = {}
+        if floor_soc is None and intent.get("unavailable") and previous:
+            floor_soc = previous.get("floor_soc")
+        applicable = floor_soc is not None and floor_soc < normal_soc - 0.1
+        meta = {
+            "schema_version": "wallbox_curve_target_v1", "applicable": applicable,
+            "day_start_ts_ms": day_ms, "config_target_soc": normal_soc,
+            "floor_soc": floor_soc, "current_soc": current_soc,
+            "battery_need_wh": None, "battery_need_source": "capacity_and_live_soc",
+            "car_energy_need_wh": None, "car_energy_need_source": "no_eligible_vehicle",
+            "car_energy_known_wh": None, "cars": [], "future_surplus_wh": None,
+            "battery_future_surplus_wh": None,
+            "future_surplus_source": "curve_day_slots_device_limited",
+            "needed_wh": None, "needed_with_margin_wh": None, "pv_sufficient": None,
+        }
+        decision, reason = "normal", "no_eligible_vehicle"
+        known_wh, unknown, unknown_charging = 0.0, False, False
+        limits = []
+        required_vehicles = 0
+        for row in intent.get("wallbox_target_cars", []):
+            need = number(row.get("car_energy_need_wh"))
+            unknown = unknown or need is None
+            if need is not None:
+                known_wh += need
+            # Nur der Erzeuger mit gültiger Messung darf unbekannten Bedarf
+            # aktivieren. Ein altes Format oder ein gestecktes Auto genügt nicht.
+            measured = row.get("car_power_valid") is True and row.get("car_charging_measured") is True
+            episode = row.get("car_plug_session_id")
+            previous_car = next((car for car in previous.get("cars", [])
+                                 if car.get("wb_id") == row.get("wb_id")
+                                 and episode and car.get("car_plug_session_id") == episode), {})
+            confirmed_ts = number(row.get("car_charging_confirmed_ts"))
+            if confirmed_ts is None and measured and number(row.get("car_power_w")) is not None and number(row.get("car_power_w")) >= 500:
+                # Ältere Erzeuger dürfen nur mit einer aktuellen Messung beginnen.
+                confirmed_ts = now_s
+            last_measurement = number(row.get("car_charging_last_valid_ts"))
+            measurement_fresh = row.get("car_power_valid") is True or (
+                last_measurement is not None and 0 <= now_s-last_measurement <= 600.0)
+            confirmed_charge = bool(measurement_fresh and confirmed_ts is not None
+                and day_ms <= confirmed_ts*1000 <= now_s*1000
+                and (row.get("car_charging_confirmed_in_session") is True or measured))
+            if "car_charging_confirmed_in_session" not in row and not measured and previous_car:
+                confirmed_ts = number(previous_car.get("car_charging_confirmed_ts"))
+                confirmed_charge = bool(measurement_fresh and confirmed_ts is not None
+                    and day_ms <= confirmed_ts*1000 <= now_s*1000
+                    and previous_car.get("charging_confirmed") is True)
+            unknown_charging = unknown_charging or (need is None and confirmed_charge)
+            minimum, maximum = number(row.get("car_min_charge_w")), number(row.get("car_max_charge_w"))
+            required = (need is None and confirmed_charge) or (need is not None and need > 0)
+            if required:
+                required_vehicles += 1
+            if minimum is not None and maximum is not None and 0 < minimum <= maximum and required:
+                limits.append((minimum, maximum, need, len(meta["cars"])))
+            meta["cars"].append({"wb_id": row.get("wb_id"), "car_energy_need_wh": need, "charging_confirmed": confirmed_charge,
+                "car_energy_need_source": row.get("car_energy_need_source") or "intent_energy_need_missing",
+                "car_plug_session_id": episode, "car_charging_confirmed_ts": confirmed_ts,
+                "car_min_charge_w": minimum, "car_max_charge_w": maximum,
+                "car_charging_measured": measured})
+        meta["car_min_charge_w"] = min((v[0] for v in limits), default=None)
+        meta["car_charge_limits_valid"] = bool(limits) and len(limits) == required_vehicles
+        car_energy_used = {index: 0.0 for _, _, _, index in limits}
+        total, surplus, battery_surplus, car_surplus, battery = None, 0.0, 0.0, 0.0, 0.0
+        if applicable:
+            from planned_loads import planned_windows_from_config, planned_load_w_at
+            windows, _ = planned_windows_from_config(self.v4_config)
+            external = [window for window in windows if window.kind == "external_wallbox"] if known_wh > 0 or unknown_charging else []
+            restored_wh = 0.0
+            try:
+                for slot in timeline:
+                    ts = float(slot["ts"])
+                    if not max(start_ms, day_ms) <= ts < day_ms + 86400000:
+                        continue
+                    restored_w, _ = planned_load_w_at(external, datetime.fromtimestamp(ts / 1000.0))
+                    # Diese Last ist im Slot bereits abgezogen und im Bedarf
+                    # enthalten. Genau einmal zur Vergleichsenergie zurückgeben.
+                    restored_w = min(float(restored_w), _slot_planned_load_w(slot))
+                    available = float(slot["surplus_w"]) + restored_w
+                    if not math.isfinite(available):
+                        raise ValueError("Ungültige Slotleistung")
+                    available = max(0.0, available)
+                    restored_wh += restored_w * 0.25
+                    battery_surplus += min(self.max_charge_w, available) * 0.25
+                    # Mindestleistung je Fahrzeug aus demselben Restangebot
+                    # buchen; bei ungenügendem Angebot keine Teil-Ladung erfinden.
+                    remaining, usable, car_accepted = available, 0.0, 0.0
+                    for minimum, maximum, need, index in sorted(limits, key=lambda item: (item[0], item[3])):
+                        if remaining >= minimum:
+                            accepted = min(maximum, remaining)
+                            usable += accepted
+                            if need is not None:
+                                # Ein Fahrzeug mit kleinem Bedarf kann nicht
+                                # den Bedarf einer anderen Wallbox übernehmen.
+                                accepted = min(accepted, max(0.0, need*1.10-car_energy_used[index])*4.0)
+                            car_energy_used[index] += accepted*0.25
+                            car_accepted += accepted
+                            remaining -= accepted
+                    car_surplus += min(available, car_accepted) * 0.25
+                    surplus += min(available, self.max_charge_w + usable) * 0.25
+                for _, _, _, index in limits:
+                    meta["cars"][index]["car_future_surplus_wh"] = round(car_energy_used[index], 3)
+                vehicle_reach_110 = meta["car_charge_limits_valid"] and all(
+                    need is None or car_energy_used[index] >= round(need*1.10, 3)
+                    for _, _, need, index in limits)
+                vehicle_reach_100 = meta["car_charge_limits_valid"] and all(
+                    need is None or car_energy_used[index] >= need for _, _, need, index in limits)
+                battery = self.capacity_wh * max(0.0, normal_soc-current_soc) / 100.0
+                total = battery + known_wh
+                meta.update(battery_need_wh=round(battery, 3), future_surplus_wh=round(surplus, 3),
+                    battery_future_surplus_wh=round(battery_surplus, 3), car_future_surplus_wh=round(car_surplus, 3), external_wallbox_restored_wh=round(restored_wh, 3),
+                    car_energy_known_wh=round(known_wh, 3), car_energy_need_wh=None if unknown else round(known_wh, 3),
+                    car_energy_need_source="incomplete_vehicle_needs" if unknown else "sum_active_vehicle_needs",
+                    needed_wh=None if unknown else round(total, 3),
+                    needed_with_margin_wh=None if unknown else round(total*1.10, 3),
+                    pv_sufficient=bool(total is not None and surplus >= round(total*1.10, 3) and battery_surplus >= round(battery*1.10, 3) and car_surplus >= round(known_wh*1.10, 3) and vehicle_reach_110))
+                # Ein unbekanntes, nicht ladendes Fahrzeug wird für die
+                # Zielwahl nicht mitgezählt und verdeckt keinen bekannten Bedarf.
+                if unknown_charging or (unknown and known_wh == 0):
+                    decision, reason = ("wbminsoc", "energy_need_unknown_charging") if unknown_charging else ("normal", "unknown_vehicle_not_charging")
+                    if intent.get("legacy_vehicle_needs"):
+                        reason = "intent_schema_without_vehicle_needs"
+                elif known_wh == 0:
+                    decision, reason = "normal", "no_vehicle_energy_need"
+                elif meta["car_charge_limits_valid"] and car_surplus == 0:
+                    decision, reason = "normal", "vehicle_cannot_use_pv"
+                elif previous.get("decision") == "normal" and surplus >= total and battery_surplus >= battery and car_surplus >= known_wh and vehicle_reach_100:
+                    decision, reason = "normal", "normal_hysteresis_100_percent"
+                elif meta["pv_sufficient"]:
+                    decision, reason = "normal", "pv_covers_battery_and_cars_110_percent"
+                else:
+                    decision, reason = "wbminsoc", "pv_insufficient_for_battery_and_cars"
+                if meta["car_charge_limits_valid"] and car_surplus == 0 and (known_wh > 0 or unknown_charging):
+                    decision, reason = "normal", "vehicle_cannot_use_pv"
+            except (ValueError, TypeError, KeyError):
+                decision, reason = "normal", "surplus_or_battery_need_invalid"
+        if unknown:
+            meta["known_vehicle_pv_sufficient"] = meta["pv_sufficient"]
+            meta["pv_sufficient"] = None
+        last_valid = number(previous.get("last_valid_intent_ts", previous.get("since_ts")))
+        if not intent.get("unavailable"):
+            last_valid = now_s
+        urgent_normal = bool(intent.get("confirmed_inactive") or current_soc >= normal_soc-0.2)
+        # Ein Poll Toleranz verhindert bei Slotjitter einen zusätzlichen Halt
+        # von fast 15 Minuten. Der Zeitstempel bleibt über Neustarts erhalten.
+        if (previous and applicable and not urgent_normal and reason not in ("no_vehicle_energy_need", "vehicle_cannot_use_pv", "unknown_vehicle_not_charging")
+                and decision != previous["decision"]
+                and now_s-float(previous["since_ts"]) < SIM_INTERVAL_S-SIM_INPUT_POLL_S):
+            decision, reason = previous["decision"], "minimum_hold_15_minutes"
+        if intent.get("unavailable"):
+            if previous and last_valid is not None and 0 <= now_s-last_valid <= 600:
+                decision, reason = previous["decision"], "intent_last_valid_hold"
+            else:
+                decision, reason = "normal", "intent_hold_expired"
+        curve_end = number(intent.get("curve_end_ts")) or number(previous.get("curve_end_ts"))
+        if curve_end and now_s*1000 >= curve_end and not urgent_normal:
+            decision = previous.get("decision", "normal")
+            reason = "curve_day_finished_frozen"
+        if urgent_normal:
+            decision = "normal"
+            reason = "normal_target_reached" if current_soc >= normal_soc-0.2 else "vehicle_confirmed_inactive"
+        since = float(previous["since_ts"]) if previous and decision == previous["decision"] else now_s
+        meta.update(decision=decision, reason=reason, since_ts=since,
+                    hold_until_ts=since+SIM_INTERVAL_S, last_valid_intent_ts=last_valid,
+                    curve_end_ts=curve_end,
+                    active_target_soc=floor_soc if decision == "wbminsoc" else normal_soc)
+        return meta
 
     def __init__(self):
         self.v4_config = self._load_v4_config()
@@ -3093,6 +3269,10 @@ class StorageSimulator:
         WICHTIG: Config-Werte (speichergroesse, maximumladeleistung) haben VORRANG!
         Live-Werte werden nur als Fallback verwendet wenn Config-Wert = 0/fehlt.
         """
+        self.v4_config = self._load_v4_config()
+        self.curve_target_mode = self._curve_target_mode_from_config(self.v4_config)
+        self.target_soc = (100.0 if self.curve_target_mode == "forecast_100" else
+                           self._safe_float(self.v4_config.get("storage_target_soc", 90.0), 90.0))
         if not os.path.exists(LIVE_DATA_FILE): return
         try:
             # Config jedes Mal neu laden damit Aenderungen sofort wirken
@@ -5287,6 +5467,16 @@ class StorageSimulator:
 
         # --- 1. Zeitstrahl ab voller Stunde aufbauen (15 Minuten Raster) ---
         now = datetime.now()
+        simulation_now_ms = now.timestamp() * 1000
+
+        def remaining_h(slot, until_ts=None):
+            """Nur den Zukunftsanteil eines Viertelstunden-Slots bilanzieren."""
+            slot_start = float(slot["ts"])
+            slot_end = slot_start + 900000
+            if until_ts is not None:
+                slot_end = min(slot_end, float(until_ts))
+            return max(0.0, (slot_end - max(slot_start, simulation_now_ms)) / 3600000.0)
+
         # Start: aktuelle volle Stunde
         start_dt = now.replace(minute=0, second=0, microsecond=0)
         # Ende: immer bis Ende des 3. Tages (=3 volle Folgetage)
@@ -5616,65 +5806,59 @@ class StorageSimulator:
             except Exception:
                 return ""
 
+        _curve_end_guard_min = max(
+            30.0,
+            min(120.0, self._safe_float(self.v4_config.get("storage_curve_end_guard_min", 45.0), 45.0)),
+        )
+        LADEENDE_OFFSET_MS = int(_curve_end_guard_min * 60 * 1000)
         if forecast_only_curve:
             self.target_soc = 100.0
         config_target_soc = float(self.target_soc)
         planning_target_soc = config_target_soc
-        wallbox_target_soc, wallbox_target_intent = (
-            (None, {"storage_curve_target_mode": "forecast_100"})
-            if forecast_only_curve
-            else self._wallbox_target_curve_soc(config_target_soc)
+        wallbox_target_soc, wallbox_target_intent = self._wallbox_target_curve_soc(config_target_soc)
+        wallbox_floor_soc_active = bool(
+            wallbox_target_soc is not None and wallbox_target_soc < config_target_soc - 0.1
         )
-        wallbox_floor_soc_active = (
-            (not forecast_only_curve)
-            and wallbox_target_soc is not None
-            and wallbox_target_soc < config_target_soc - 0.1
+        # Tagesabschluss wie bei der späteren Kurventagwahl; ein bereits
+        # veröffentlichter Endanker hat Vorrang vor einer verkürzten Prognose.
+        _d1_pv_slots = [p for p in pv_tl if midnight_today <= p["start_timestamp"] < midnight_today + 86400000
+                        and p.get("predicted_kwh", p.get("pv_estimate", 0))*1000.0 > 100]
+        if _d1_pv_slots:
+            _d1_start = _d1_pv_slots[0]["start_timestamp"]
+            if _d1_start > midnight_today + 28800000:
+                _d1_start = midnight_today + 25200000
+            wallbox_target_intent["curve_end_ts"] = max(
+                _d1_start + 3600000,
+                _d1_pv_slots[-1]["start_timestamp"] - LADEENDE_OFFSET_MS)
+        try:
+            with open(OUTPUT_FILE, "r", encoding="utf-8") as handle:
+                _d1_previous_plan = json.load(handle)
+            if _d1_previous_plan.get("target_curve_meta", {}).get("curve_day_start_ts") == midnight_today:
+                wallbox_target_intent["curve_end_ts"] = _d1_previous_plan.get("ladeende_ts") or wallbox_target_intent.get("curve_end_ts")
+        except (OSError, ValueError, TypeError):
+            pass
+        _config_target_reach_meta = self._wallbox_curve_target_decision(
+            config_target_soc, wallbox_target_soc, wallbox_target_intent,
+            float(current_soc), timeline, now.replace(minute=(now.minute // 15)*15, second=0, microsecond=0).timestamp()*1000, midnight_today, now.timestamp(),
         )
-        _config_target_reachable = True
-        _config_target_reach_meta = {}
-        if wallbox_floor_soc_active:
-            try:
-                today_end_ms = midnight_today + 86400000
-                future_today_slots = [
-                    s for s in timeline
-                    if float(s.get("ts", 0)) >= start_ms and float(s.get("ts", 0)) < today_end_ms
-                ]
-                future_surplus_wh = sum(
-                    min(float(self.max_charge_w), max(0.0, float(s.get("surplus_w", 0.0)))) * 0.25
-                    for s in future_today_slots
-                )
-                need_wh = self.capacity_wh * max(0.0, config_target_soc - float(current_soc)) / 100.0
-                needed_with_margin_wh = need_wh * 1.10
-                _config_target_reachable = (
-                    float(current_soc) >= config_target_soc - 0.2
-                    or future_surplus_wh >= needed_with_margin_wh
-                )
-                _config_target_reach_meta = {
-                    "future_surplus_wh": round(future_surplus_wh, 0),
-                    "needed_wh": round(need_wh, 0),
-                    "needed_with_margin_wh": round(needed_with_margin_wh, 0),
-                    "config_target_soc": round(config_target_soc, 1),
-                    "current_soc": round(float(current_soc), 1),
-                }
-            except Exception as _reach_err:
-                _config_target_reachable = True
-                _config_target_reach_meta = {"error": str(_reach_err)}
-        wallbox_target_soc_active = bool(wallbox_floor_soc_active and not _config_target_reachable)
-        if wallbox_floor_soc_active:
-            if wallbox_target_soc_active:
-                planning_target_soc = wallbox_target_soc
-                self.target_soc = wallbox_target_soc
-                logger.info(
-                    "Wallbox-Rückfallziel aktiv: Tagesziel %.1f%% laut Restprognose nicht erreichbar; "
-                    "Kurve endet bei der Hausakku-Reserve %.1f%%."
-                    % (config_target_soc, wallbox_target_soc)
-                )
-            else:
-                logger.info(
-                    "Wallbox-Speicherboden aktiv: Hausakku-Reserve %.1f%% begrenzt die Wallbox-Stütze; "
-                    "Speicher-Tagesziel %.1f%% bleibt erreichbar und aktiv."
-                    % (wallbox_target_soc, config_target_soc)
-                )
+        _config_target_reachable = _config_target_reach_meta["decision"] == "normal"
+        wallbox_target_soc = _config_target_reach_meta.get("floor_soc")
+        wallbox_floor_soc_active = bool(wallbox_target_soc is not None and wallbox_target_soc < config_target_soc - 0.1)
+        _d1_day_finished = bool(wallbox_target_intent.get("curve_end_ts")
+                                and wallbox_target_intent["curve_end_ts"] <= now.timestamp()*1000 + 5*60000)
+        wallbox_target_soc_active = bool(wallbox_floor_soc_active and not _config_target_reachable and not _d1_day_finished)
+        if _d1_day_finished:
+            _config_target_reach_meta.update(decision="normal", reason="curve_day_finished", active_target_soc=config_target_soc)
+        pv_curve_target_soc = (_config_target_reach_meta["active_target_soc"] if wallbox_target_soc_active else config_target_soc)
+        if wallbox_target_soc_active:
+            wallbox_target_soc = _config_target_reach_meta["active_target_soc"]
+            planning_target_soc = wallbox_target_soc
+            logger.info(
+                "Wallbox-Rückfallziel aktiv: normales Abendziel %.1f%%, Fahrzeugbedarf %s Wh; "
+                "Kurve endet bei der Hausakku-Reserve %.1f%% (%s).",
+                config_target_soc, _config_target_reach_meta["car_energy_need_wh"],
+                wallbox_target_soc, _config_target_reach_meta["reason"],
+            )
         weather_reserve_active = False
         weather_reserve_need_wh = 0.0
         try:
@@ -5708,7 +5892,6 @@ class StorageSimulator:
             self.target_soc = config_target_soc
             if wallbox_target_soc_active:
                 planning_target_soc = wallbox_target_soc
-                self.target_soc = wallbox_target_soc
 
         # Hilfsfunktion für Vorwärts-Projektion des SoC zum Tagesbeginn
         def project_soc(start_soc, until_ts):
@@ -5716,7 +5899,7 @@ class StorageSimulator:
             for s in timeline:
                 if s["ts"] >= until_ts: break
                 cw = s.get("target_charge_w", s["charge_w"])
-                psoc += ((cw * 0.25) / self.capacity_wh) * 100.0
+                psoc += ((cw * remaining_h(s, until_ts)) / self.capacity_wh) * 100.0
                 psoc = max(0, min(100, psoc))
             return psoc
 
@@ -5730,7 +5913,7 @@ class StorageSimulator:
                 if slot["ts"] >= day_end_ms: break
                 if slot["ts"] >= day_ms:
                     if slot["pv_w"] > 100: sunset_ts = slot["ts"]
-                    if self.export_limit_w > 0 and slot["surplus_w"] > self.export_limit_w:
+                    if remaining_h(slot) > 0 and self.export_limit_w > 0 and slot["surplus_w"] > self.export_limit_w:
                         peaking_slots.append(slot)
 
             if sunset_ts == 0: continue
@@ -5743,9 +5926,11 @@ class StorageSimulator:
             temp_soc = current_soc if day_ms == midnight_today else project_soc(current_soc, day_ms)
             min_soc_today = temp_soc
             for s in day_slots:
+                if remaining_h(s) <= 0:
+                    continue
                 if s["pv_w"] > 50: break # Sonne geht auf, Tiefpunkt erreicht
                 # Wir rechnen den Verbrauch ab
-                discharge_wh = (s["home_w"] + s["wp_w"] + s.get("climate_w", 0) + _slot_planned_load_w(s)) * 0.25
+                discharge_wh = (s["home_w"] + s["wp_w"] + s.get("climate_w", 0) + _slot_planned_load_w(s)) * remaining_h(s)
                 temp_soc -= (discharge_wh / self.capacity_wh) * 100.0
                 temp_soc = max(0, temp_soc)
                 if temp_soc < min_soc_today: min_soc_today = temp_soc
@@ -5766,7 +5951,7 @@ class StorageSimulator:
 
                 # Wenn wir im Peak laden, tracken wir das bereits
                 slot["target_charge_w"] = charge_power
-                peak_charge_wh += (charge_power * 0.25)
+                peak_charge_wh += charge_power * remaining_h(slot)
                 # Surplus wurde schon bedient
                 slot["surplus_w"] -= charge_power
 
@@ -5780,18 +5965,18 @@ class StorageSimulator:
                     if slot["ts"] >= day_ms:
                         # Sicherheits-Puffer: Wir tun so, als wäre der Sonnenuntergang 1,5 Stunden früher!
                         if slot["ts"] > (sunset_ts - 5400000): break
-                        if slot.get("is_peak"): continue
+                        if slot.get("is_peak") or remaining_h(slot) <= 0: continue
                         if slot["surplus_w"] > 0:
                             chargeable_slots.append(slot)
 
                 if chargeable_slots:
-                    slots_left = len(chargeable_slots)
+                    hours_left = sum(remaining_h(slot) for slot in chargeable_slots)
                     # KRITISCH: Mindest-Lade-Leistung die sicherstellt, dass required_wh
                     # in den verfuegbaren Slots tatsaechlich erreicht wird.
                     # Ohne dies drosselt die Avg-Berechnung zu stark bei großem PV-Surplus
                     # (z.B. 14.7kWp mit 94kWh Tag: remaining_surplus >> required_wh*1.5 immer True,
                     # avg_w bleibt bei 63W statt 342W -> Max SoC nie ueber 86%)
-                    min_charge_w = (remaining_wh / (slots_left * 0.25)) if slots_left > 0 else 0
+                    min_charge_w = (remaining_wh / hours_left) if hours_left > 0 else 0
 
                     for i, slot in enumerate(chargeable_slots):
                         if remaining_wh <= 0:
@@ -5799,7 +5984,7 @@ class StorageSimulator:
                             continue
 
                         # Vorausblick: Wie viel Überschuss Energie (Wh) erwartet uns heute noch INSGESAMT?
-                        remaining_surplus_wh = sum(s["surplus_w"] * 0.25 for s in chargeable_slots[i:])
+                        remaining_surplus_wh = sum(s["surplus_w"] * remaining_h(s) for s in chargeable_slots[i:])
 
                         # Wenn der gesamte noch kommende Sonnenüberschuss eh nur noch knapp reicht
                         # (mit 50% Puffer für Wolken-Sicherheit), dann nehmen wir alles!
@@ -5808,24 +5993,28 @@ class StorageSimulator:
                         else:
                             # Glaetten und drosseln - aber MINIMUM nicht unterschreiten!
                             # min_charge_w stellt sicher dass Ziel-SoC erreichbar bleibt.
-                            avg_w_required = remaining_wh / (slots_left * 0.25)
-                            target = max(min_charge_w, min(avg_w_required, slot["surplus_w"]))
+                            avg_w_required = remaining_wh / hours_left
+                            target = min(slot["surplus_w"], max(min_charge_w, avg_w_required))
 
                         target = min(target, self.max_charge_w)
                         slot["target_charge_w"] = target
 
-                        remaining_wh -= (target * 0.25)
-                        # min_charge_w dynamisch anpassen wenn remaining_wh sinkt
-                        if slots_left > 1:
-                            min_charge_w = (remaining_wh / ((slots_left - 1) * 0.25)) if slots_left > 1 else 0
-                        slots_left -= 1
+                        remaining_wh -= target * remaining_h(slot)
+                        hours_left = max(0.0, hours_left - remaining_h(slot))
+                        # Der laufende Slot trägt nur seine verbleibende Dauer bei.
+                        min_charge_w = remaining_wh / hours_left if hours_left > 0 else 0
 
 
         # --- 4. Simulation von SoC anwenden ---
         sim_soc = current_soc
-        for idx, slot in enumerate(timeline):
-            if idx == 0:
+        for slot in timeline:
+            slot["soc_start"] = sim_soc
+            slot_hours = remaining_h(slot)
+            if slot_hours <= 0:
+                slot["target_charge_w"] = 0
+                slot["charge_w"] = 0
                 slot["soc"] = sim_soc
+                continue
 
             if "target_charge_w" in slot:
                 slot["charge_w"] = slot["target_charge_w"]
@@ -5838,21 +6027,20 @@ class StorageSimulator:
                 actual_charge_w = 0
 
             # SoC-Update testen
-            energy_wh = actual_charge_w * 0.25
+            energy_wh = actual_charge_w * slot_hours
             next_soc = sim_soc + (energy_wh / self.capacity_wh) * 100.0
 
             # Hatten wir Überladung im Frame?
             if next_soc > 100:
-                actual_charge_w = ((100.0 - sim_soc) / 100.0) * self.capacity_wh * 4.0
+                actual_charge_w = ((100.0 - sim_soc) / 100.0) * self.capacity_wh / slot_hours
                 next_soc = 100.0
             elif next_soc < 0:
-                actual_charge_w = ((0.0 - sim_soc) / 100.0) * self.capacity_wh * 4.0
+                actual_charge_w = ((0.0 - sim_soc) / 100.0) * self.capacity_wh / slot_hours
                 next_soc = 0.0
 
             slot["charge_w"] = actual_charge_w
             sim_soc = next_soc
-            if idx > 0:
-                slot["soc"] = sim_soc
+            slot["soc"] = sim_soc
 
         # --- 5. Active Eco-Dumping (PV-Abregelungs-Praevention) ---
         # DUMP-LOCK v4.4.6: Persistentes Tages-Flag verhindert Re-Dumping bei Simulator-Neustart.
@@ -6092,7 +6280,7 @@ class StorageSimulator:
                 start_soc_day = current_soc
             else:
                 start_soc_day = next(
-                    (s.get("soc", current_soc) for s in timeline if s["ts"] >= day_ms),
+                    (s.get("soc_start", s.get("soc", current_soc)) for s in timeline if s["ts"] >= day_ms),
                     current_soc
                 )
 
@@ -6192,6 +6380,9 @@ class StorageSimulator:
             raw_clipping_pressure_wh = 0.0
             unavoidable_clipping_wh = 0.0
             for s in day_slots:
+                slot_hours = remaining_h(s)
+                if slot_hours <= 0:
+                    continue
                 wp_sink_w = s.get("wp_w", 0) if trust_wp_forecast_sink else 0
                 # Pre-Dump must reserve space against PV pressure. Forecast or
                 # live-derived home spikes are not guaranteed sinks here.
@@ -6221,11 +6412,11 @@ class StorageSimulator:
                 if preventable_pressure_w > 0.0 and first_pressure_ts is None:
                     first_pressure_ts = s["ts"]
                     soc_at_first_pressure = hw_soc
-                raw_clipping_pressure_wh += preventable_pressure_w * 0.25
-                unavoidable_clipping_wh += unavoidable_pressure_w * 0.25
+                raw_clipping_pressure_wh += preventable_pressure_w * slot_hours
+                unavoidable_clipping_wh += unavoidable_pressure_w * slot_hours
                 hw_surplus = s["pv_w"] - home_sink_w - wp_sink_w
                 hw_charge = min(hw_surplus, self.max_charge_w) if hw_surplus > 0 else max(hw_surplus, -self.max_discharge_w)
-                hw_soc = max(0.0, min(100.0, hw_soc + (hw_charge * 0.25 / self.capacity_wh) * 100.0))
+                hw_soc = max(0.0, min(100.0, hw_soc + (hw_charge * slot_hours / self.capacity_wh) * 100.0))
                 if hw_soc >= 99.5 and battery_full_ts is None:
                     battery_full_ts = s["ts"]
 
@@ -6478,11 +6669,6 @@ class StorageSimulator:
         # 200-W-Restlicht, sondern der letzte nutzbare Überschuss, damit kleine
         # Speicher das Abendziel nicht erst in einer optimistischen Abendfahne
         # erreichen sollen.
-        _curve_end_guard_min = max(
-            30.0,
-            min(120.0, self._safe_float(self.v4_config.get("storage_curve_end_guard_min", 45.0), 45.0)),
-        )
-        LADEENDE_OFFSET_MS = int(_curve_end_guard_min * 60 * 1000)
         _default_relevant_surplus_w = max(500.0, min(900.0, float(self.max_charge_w) * 0.12))
         _curve_relevant_surplus_w = max(
             200.0,
@@ -6577,6 +6763,14 @@ class StorageSimulator:
                     "Sollkurven-Tag: %s gewählt, weil der aktuelle PV-Tag abgeschlossen ist."
                     % selected_day_label
                 )
+
+            if selected_day_offset > 0:
+                wallbox_target_soc_active = False
+                planning_target_soc = float(self.target_soc)
+                _config_target_reach_meta.update(applicable=False, decision="normal",
+                    reason="next_curve_day", active_target_soc=planning_target_soc)
+            _config_target_reach_meta["selected_curve_day_start_ts_ms"] = today_0_ms
+            pv_curve_target_soc = planning_target_soc
 
             # Alle Timeline-Slots fuer den gewaehlten Kurventag (aus der berechneten Simulation)
             today_slots_tl = [s for s in timeline if today_0_ms <= s['ts'] < today_end_ms]
@@ -6825,7 +7019,7 @@ class StorageSimulator:
                     _slot_anchor_found = False
                     for s in today_slots_tl:
                         if s['ts'] >= pv_start_ts:
-                            morning_soc_tl = s.get('soc', current_soc)
+                            morning_soc_tl = s.get('soc_start', s.get('soc', current_soc))
                             _slot_anchor_found = True
                             break
                     if (
@@ -6951,7 +7145,7 @@ class StorageSimulator:
                     if forecast_only_curve:
                         logger.info(
                             f"Forecast-only-Kurve: Start-SoC {morning_soc_tl:.1f}%% "
-                            "ohne Morgenpuffer, Zwischenziele oder Tagesziel-Anker; Ziel=100% bis Freilauf."
+                            f"ohne Morgenpuffer oder Zwischenziele; Ziel={pv_curve_target_soc:.1f}% bis Freilauf."
                         )
                     elif self.morning_soc > 0:
                         _old_morning_soc_tl = float(morning_soc_tl)
@@ -7194,7 +7388,7 @@ class StorageSimulator:
                     today_0_ms,
                     today_end_ms,
                     _timeline_start_ts,
-                    self.target_soc,
+                    pv_curve_target_soc,
                     _raw_intermediate_anchors,
                     ANCHOR_STEP_MS,
                 )
@@ -7238,7 +7432,7 @@ class StorageSimulator:
                             for s in today_slots_tl
                             if morning_anchor_ts <= float(s['ts']) < float(curve_end_ts)
                         )
-                        needed_wh = max(0.0, (float(self.target_soc) - _morning_anchor_soc) * (self.capacity_wh / 100.0))
+                        needed_wh = max(0.0, (float(pv_curve_target_soc) - _morning_anchor_soc) * (self.capacity_wh / 100.0))
                         if future_wh >= needed_wh * 0.95:
                             _timeline_start_ts = morning_anchor_ts
                             if morning_soc_tl < _morning_anchor_soc - 0.1:
@@ -7276,7 +7470,7 @@ class StorageSimulator:
                         # Nur sinnvolle Zwischenziele erzwingen: nicht unter Start
                         # und nicht ueber dem Tagesziel.
                         _anchor_soc = min(
-                            float(self.target_soc),
+                            float(pv_curve_target_soc),
                             max(float(_prev_anchor_soc), _candidate_soc),
                         )
                         _anchor = {
@@ -7354,16 +7548,18 @@ class StorageSimulator:
                 curve_path_points = (
                     [{"ts": int(_timeline_start_ts), "soc": float(morning_soc_tl)}]
                     + [dict(a) for a in intermediate_anchors]
-                    + [{"ts": int(curve_end_ts), "soc": float(self.target_soc)}]
+                    + [{"ts": int(curve_end_ts), "soc": float(pv_curve_target_soc)}]
                 )
 
-                def _soc_at_ts(until_ts):
+                def _soc_at_ts(until_ts, target_soc=None, path_points=None):
                     """Soll-SoC bei until_ts; optional mit festen Zwischenzielen."""
+                    target_soc = pv_curve_target_soc if target_soc is None else target_soc
+                    path_points = curve_path_points if path_points is None else path_points
                     if intermediate_anchors:
                         _until = float(until_ts)
-                        for _idx in range(len(curve_path_points) - 1):
-                            _p0 = curve_path_points[_idx]
-                            _p1 = curve_path_points[_idx + 1]
+                        for _idx in range(len(path_points) - 1):
+                            _p0 = path_points[_idx]
+                            _p1 = path_points[_idx + 1]
                             if _until <= float(_p1["ts"]):
                                 return _segment_soc(
                                     float(_p0["ts"]),
@@ -7372,7 +7568,7 @@ class StorageSimulator:
                                     float(_p1["soc"]),
                                     _until,
                                 )
-                        return float(self.target_soc)
+                        return float(target_soc)
 
                     # Ohne Zwischenziel: Wetter/ML-Ladeintegral ueber das ganze PV-Fenster.
                     planned_wh = sum(
@@ -7387,17 +7583,17 @@ class StorageSimulator:
                         if float(s['ts']) < float(curve_end_ts)
                     )
 
-                    needed_wh = (float(self.target_soc) - float(morning_soc_tl)) * (self.capacity_wh / 100.0)
+                    needed_wh = (float(target_soc) - float(morning_soc_tl)) * (self.capacity_wh / 100.0)
 
                     if total_planned_wh > needed_wh and total_planned_wh > 0:
                         # Geplante Energie ist groesser als Bedarf -> Kurve ueber den Tag strecken.
                         fraction = planned_wh / total_planned_wh
-                        gain = fraction * (float(self.target_soc) - float(morning_soc_tl))
+                        gain = fraction * (float(target_soc) - float(morning_soc_tl))
                     else:
                         # Prognose reicht knapp/nicht -> alles laden was nach Wetter/ML kommt.
                         gain = (planned_wh / self.capacity_wh) * 100.0 if self.capacity_wh > 0 else 0.0
 
-                    return min(float(self.target_soc), float(morning_soc_tl) + gain)
+                    return min(float(target_soc), float(morning_soc_tl) + gain)
 
                 def _apply_user_curve_anchors(anchors):
                     """Fuegt konfigurierte Zwischenziele in die Kurve ein."""
@@ -7458,7 +7654,7 @@ class StorageSimulator:
                     anchors.append({
                         "ts":     int(curve_end_ts),
                         "t":      datetime.fromtimestamp(curve_end_ts / 1000).strftime("%H:%M"),
-                        "soc":    round(self.target_soc, 2),
+                        "soc":    round(pv_curve_target_soc, 2),
                         "frozen": False
                     })
                     # Erster Anker: morning_soc_tl als fixierter Startpunkt
@@ -7753,7 +7949,7 @@ class StorageSimulator:
                     )
 
                 if curve_anchors:
-                    curve_anchors[-1]["soc"] = round(float(self.target_soc), 2)
+                    curve_anchors[-1]["soc"] = round(float(pv_curve_target_soc), 2)
                     curve_anchors[-1]["t"] = datetime.fromtimestamp(
                         float(curve_anchors[-1]["ts"]) / 1000
                     ).strftime("%H:%M")
@@ -7775,20 +7971,42 @@ class StorageSimulator:
                     except Exception:
                         pass
                 if curve_anchors:
-                    storm_guard, curve_anchors, storm_grid_charge = self._storm_guard_plan(
+                    _storm_input_anchors = [dict(anchor) for anchor in curve_anchors]
+                    if wallbox_target_soc_active:
+                        _storm_path = [{"ts": int(_timeline_start_ts), "soc": float(morning_soc_tl)}]
+                        for _anchor in intermediate_anchors:
+                            _storm_path.append(dict(_anchor, soc=min(float(self.target_soc),
+                                max(float(_storm_path[-1]["soc"]), float(_anchor["configured_soc"])))))
+                        _storm_path.append({"ts": int(curve_end_ts), "soc": float(self.target_soc)})
+                        for _anchor in _storm_input_anchors:
+                            _anchor["soc"] = round(_soc_at_ts(_anchor["ts"], self.target_soc, _storm_path), 2)
+                        _storm_input_anchors[0]["soc"] = round(float(morning_soc_tl), 2)
+                        _storm_input_anchors[-1]["soc"] = round(float(self.target_soc), 2)
+                    storm_guard, _storm_result_anchors, storm_grid_charge = self._storm_guard_plan(
                         today_slots_tl,
-                        curve_anchors,
+                        _storm_input_anchors,
                         current_soc,
                         now_ms,
                         _timeline_start_ts,
                         curve_end_ts,
                 )
+                    if wallbox_target_soc_active:
+                        _storm_points = {anchor["ts"]: anchor for anchor in _storm_result_anchors if anchor.get("storm_guard")}
+                        if storm_guard.get("control_active"):
+                            for _point in _storm_points.values():
+                                if not _point.get("frozen") or float(storm_guard.get("precharge_ts", 0)) <= now_ms+60000:
+                                    _point["soc"] = max(float(_point["soc"]), float(storm_guard["target_soc"]))
+                        curve_anchors = [_storm_points.pop(anchor["ts"], anchor) for anchor in curve_anchors]
+                        curve_anchors.extend(_storm_points.values())
+                        curve_anchors.sort(key=lambda anchor: anchor["ts"])
+                    else:
+                        curve_anchors = _storm_result_anchors
                 tail_target_smoothing_points = 0
                 if curve_anchors:
                     tail_target_smoothing_points = self._smooth_tail_target_anchors(
                         curve_anchors,
                         now_ms,
-                        self.target_soc,
+                        max(pv_curve_target_soc, float(storm_guard.get("target_soc") or 0) if wallbox_target_soc_active and storm_guard.get("control_active") else 0),
                         current_soc,
                         frontload_factor=_curve_tail_frontload_factor,
                     )
@@ -7801,7 +8019,7 @@ class StorageSimulator:
                     _anchor_floor_diag = self._protect_curve_points_against_floor(
                         curve_anchors,
                         published_curve_floor_points,
-                        self.target_soc,
+                        max(pv_curve_target_soc, float(storm_guard.get("target_soc") or 0) if wallbox_target_soc_active and storm_guard.get("control_active") else 0),
                     )
                     if _anchor_floor_diag.get("points_clamped"):
                         published_curve_anchor_clamps += int(_anchor_floor_diag["points_clamped"])
@@ -7835,7 +8053,7 @@ class StorageSimulator:
                     "target_mode": "forecast_100" if forecast_only_curve else "anchored",
                     "forecast_only_target_active": bool(forecast_only_curve),
                     "forecast_only_no_user_anchors": bool(forecast_only_curve),
-                    "forecast_only_target_soc": 100.0 if forecast_only_curve else 0.0,
+                    "forecast_only_target_soc": float(planning_target_soc) if forecast_only_curve else 0.0,
                     "curve_day_label": selected_day_label,
                     "curve_day_offset": selected_day_offset,
                     "curve_day_start_ts": int(today_0_ms),
@@ -7942,7 +8160,7 @@ class StorageSimulator:
                     target_curve_meta.update({
                         "wallbox_target_soc_active": True,
                         "wallbox_target_soc": round(float(wallbox_target_soc), 1),
-                        "wallbox_target_reason": "PV + Akku bis Untergrenze: Tagesziel laut Restprognose nicht erreichbar, Rückfall auf Hausakku-Reserve",
+                        "wallbox_target_reason": "PV + Akku bis Untergrenze: gemeinsames Abendziel für Hausakku und Fahrzeug nicht belegt erreichbar; Rückfall mit Hysterese auf Hausakku-Reserve",
                     })
 
                 # --- target_timeline aus Ankern interpolieren (15-Min-Slots) ---
@@ -7958,13 +8176,13 @@ class StorageSimulator:
                         while ts < int(a1["ts"]):
                             frac = (ts - int(a0["ts"])) / dur_ms
                             soc  = a0["soc"] + (a1["soc"] - a0["soc"]) * frac
-                            target_timeline.append({"ts": ts, "soc": round(min(soc, self.target_soc), 2)})
+                            target_timeline.append({"ts": ts, "soc": round(min(soc, max(pv_curve_target_soc, float(storm_guard.get("target_soc") or 0) if wallbox_target_soc_active and storm_guard.get("control_active") else 0)), 2)})
                             ts += 900000  # 15-Min-Slots
                     # Letzten Anker anhaengen (= curve_end_ts = Freilauf = target_soc)
-                    target_timeline.append({"ts": int(curve_anchors[-1]["ts"]), "soc": round(self.target_soc, 2)})
+                    target_timeline.append({"ts": int(curve_anchors[-1]["ts"]), "soc": round(max(pv_curve_target_soc, float(curve_anchors[-1]["soc"])), 2)})
                     # Nach Freilauf: 2 Ankerpunkte (+15min, +60min) fuer Chart-Darstellung
                     for extra_ms in [900000, 3600000]:
-                        target_timeline.append({"ts": int(curve_anchors[-1]["ts"]) + extra_ms, "soc": round(self.target_soc, 2)})
+                        target_timeline.append({"ts": int(curve_anchors[-1]["ts"]) + extra_ms, "soc": round(max(pv_curve_target_soc, float(curve_anchors[-1]["soc"])), 2)})
 
                 # --- Historische Punkte voranstellen ---
                 # Problem: today_slots_tl startet ab jetzt (14:00), nicht ab 07:00.
@@ -8123,7 +8341,14 @@ class StorageSimulator:
         # Ausgangspunkt. Ein Morgenanker würde bereits geladene Energie
         # nochmals als Restbedarf zählen und die Reichweite verfälschen.
         reach_start_soc = float(current_soc)
-        required_wh_for_target = self.capacity_wh * max(0.0, (self.target_soc - reach_start_soc)) / 100.0
+        reach_target_soc = float(pv_curve_target_soc if wallbox_target_soc_active else self.target_soc)
+        _config_target_reach_meta["active_target_soc"] = round(reach_target_soc, 1)
+        normal_required_wh = self.capacity_wh * max(0.0, (self.target_soc-reach_start_soc)) / 100.0
+        normal_target_can_reach = bool(current_soc >= self.target_soc-0.2 or (
+            not _target_reach_dc_only and (
+                (_target_reach_source_evidence_complete and today_chargeable_surplus_wh >= normal_required_wh*1.1)
+                or max_soc_today >= self.target_soc-0.2)))
+        required_wh_for_target = self.capacity_wh * max(0.0, (reach_target_soc - reach_start_soc)) / 100.0
         # Erreichbar wenn Surplus >= Bedarf (mit 10% Sicherheitsmarge fuer Verluste).
         # Die Diagnose trennt die Gruende bewusst: Bei bereits erreichtem Ziel darf
         # kein irrefuehrender Rest-Surplus-Vergleich geloggt werden.
@@ -8132,11 +8357,11 @@ class StorageSimulator:
             _target_reach_source_evidence_complete
             and today_chargeable_surplus_wh >= physical_needed_wh
         )
-        target_already_reached = current_soc >= (self.target_soc - 0.2)
+        target_already_reached = current_soc >= (reach_target_soc - 0.2)
         # Auch die simulierte SoC-Kurve einbeziehen (als zweites Kriterium).
         # Hier gilt das echte Tagesziel; die 95%-Toleranz gehoert nicht in die
         # Erreichbarkeits-Aussage, sonst sieht ein 86%-Tag bei 90% Ziel "erreichbar" aus.
-        can_reach_target_sim = (max_soc_today >= (self.target_soc - 0.2))
+        can_reach_target_sim = (max_soc_today >= (reach_target_soc - 0.2))
         # Die Gesamtsimulation darf bei DC-first keinen externen AC-Anteil als
         # Ladeerreichbarkeit zurückschmuggeln. Ohne DC-first bleibt der
         # historische Simulationsweg aus Kompatibilitätsgründen erhalten.
@@ -8174,7 +8399,7 @@ class StorageSimulator:
             )
         elif not can_reach_target:
             logger.info(
-                f"Prognose: Ziel-SoC {self.target_soc:.0f}%% nicht erreichbar "
+                f"Prognose: Ziel-SoC {reach_target_soc:.0f}%% nicht erreichbar "
                 f"(max_sim {max_soc_today:.1f}%%, Rest-Surplus {today_chargeable_surplus_wh:.0f}Wh "
                 f"< Bedarf {physical_needed_wh:.0f}Wh inkl. Reserve). Discharge-Sperre aktiv."
             )
@@ -8189,7 +8414,7 @@ class StorageSimulator:
             else:
                 reach_reason = f"Simulation erreicht {max_soc_today:.1f}%%"
             logger.info(
-                f"Prognose: Ziel-SoC {self.target_soc:.0f}%% erreichbar "
+                f"Prognose: Ziel-SoC {reach_target_soc:.0f}%% erreichbar "
                 f"(max_sim {max_soc_today:.1f}%%, Rest-Surplus {today_chargeable_surplus_wh:.0f}Wh, "
                 f"Kurvenbedarf {required_wh_for_target:.0f}Wh). Grund: {reach_reason}."
             )
@@ -8197,9 +8422,9 @@ class StorageSimulator:
         # Das Tagesziel aus der Config bleibt fachlich fix. Die Simulation darf
         # nur bewerten, ob dieses Ziel erreichbar ist. max_reachable_soc ist
         # Diagnose/Anzeige, aber kein neues Regelziel fuer iFc.
-        effective_target_soc = float(self.target_soc)
+        effective_target_soc = float(reach_target_soc)
         if can_reach_target:
-            max_reachable_soc = round(float(self.target_soc), 1)
+            max_reachable_soc = round(float(reach_target_soc), 1)
         elif (
             _target_reach_dc_only
             and _target_reach_decision_evidence_complete
@@ -8214,7 +8439,7 @@ class StorageSimulator:
             max_reachable_soc = round(
                 max(
                     float(current_soc),
-                    min(float(self.target_soc), float(source_limited_soc)),
+                    min(float(reach_target_soc), float(source_limited_soc)),
                 ),
                 1,
             )
@@ -8223,7 +8448,7 @@ class StorageSimulator:
             # Punktprognose kein erreichbarer Zukunfts-SoC behauptet.
             max_reachable_soc = round(float(current_soc), 1)
         else:
-            max_reachable_soc = round(max(float(current_soc), min(float(self.target_soc), float(max_soc_today))), 1)
+            max_reachable_soc = round(max(float(current_soc), min(float(reach_target_soc), float(max_soc_today))), 1)
         if target_already_reached:
             target_reach_state = "reachable"
         elif _target_reach_dc_only and not _target_reach_decision_use_allowed:
@@ -8390,7 +8615,7 @@ class StorageSimulator:
             and target_timeline
         ):
             if max_reachable_soc < float(self.target_soc) - 0.2:
-                target_curve_meta["effective_target_soc"] = float(self.target_soc)
+                target_curve_meta["effective_target_soc"] = float(reach_target_soc)
                 target_curve_meta["max_reachable_soc"] = max_reachable_soc
                 target_curve_meta["target_capped_unreachable"] = True
                 target_curve_meta["target_capped_reason"] = (
@@ -8446,7 +8671,7 @@ class StorageSimulator:
             _timeline_floor_diag = self._protect_curve_points_against_floor(
                 target_timeline,
                 published_curve_floor_points,
-                self.target_soc,
+                max(pv_curve_target_soc, float(storm_guard.get("target_soc") or 0) if wallbox_target_soc_active and storm_guard.get("control_active") else 0),
             )
             if _timeline_floor_diag.get("points_clamped"):
                 published_curve_timeline_clamps += int(_timeline_floor_diag["points_clamped"])
@@ -8466,12 +8691,79 @@ class StorageSimulator:
                     )
                 )
 
+        if target_timeline and storm_guard.get("control_active"):
+            _storm_end = float(storm_guard.get("end_ts") or 0)
+            _storm_target = max(pv_curve_target_soc, float(storm_guard.get("target_soc") or 0))
+            for _points in (target_timeline, curve_anchors):
+                for _point in _points:
+                    _cap = (_storm_target if wallbox_target_soc_active and float(_point["ts"]) < _storm_end
+                            else (pv_curve_target_soc if wallbox_target_soc_active else self.target_soc))
+                    _point["soc"] = round(min(float(_point["soc"]), _cap), 2)
+            if wallbox_target_soc_active and _storm_end > now.timestamp()*1000:
+                target_timeline = [p for p in target_timeline if float(p["ts"]) != _storm_end]
+                target_timeline.append({"ts": _storm_end, "soc": round(pv_curve_target_soc, 2)})
+                target_timeline.sort(key=lambda p: p["ts"])
+
+        if target_timeline:
+            try:
+                with open(OUTPUT_FILE, "r", encoding="utf-8") as handle:
+                    _old_curve_plan = json.load(handle)
+                _old_meta = _old_curve_plan.get("target_curve_meta", {})
+                _old_state = _old_curve_plan.get("wallbox_curve_target_state", {})
+                _now_curve_ms = now.timestamp()*1000.0
+                _transition = _old_meta.get("wallbox_target_transition") or {}
+                _same_day = _old_meta.get("curve_day_start_ts") == reach_day_start_ms
+                _decision_changed = (_old_state.get("decision") in ("normal", "wbminsoc")
+                    and _old_state.get("decision") != _config_target_reach_meta["decision"]
+                    and (_old_state.get("applicable") or _config_target_reach_meta.get("applicable")))
+                # Der Zustand enthält einen Versatz, niemals eine alte Prognose.
+                # Höchstens eine Stunde Übergang; Folgeläufe verwenden die neue Kurve.
+                if _same_day and not storm_guard.get("control_active"):
+                    _step_pct = self.max_charge_w*0.25/max(1.0, self.capacity_wh)*100.0
+                    _old_now = self._curve_soc_at_points(_old_curve_plan.get("target_timeline") or [], _now_curve_ms)
+                    _new_now = self._curve_soc_at_points(target_timeline, _now_curve_ms)
+                    _compatible = (abs(float(_old_curve_plan.get("planning_target_soc", -1000))-planning_target_soc) <= 0.5
+                        and abs(float(_old_curve_plan.get("physical_reserve_soc", -1000))-_ep_reserve_floor_soc) <= 0.01
+                        and abs(float(_old_curve_plan.get("pv_curve_target_soc", _old_state.get("active_target_soc", -1000)))-pv_curve_target_soc) <= 0.5)
+                    if _decision_changed and _old_now is not None and _new_now is not None:
+                        _bridge = max(_old_now-_step_pct, min(_old_now+_step_pct, _new_now))
+                        _shift = _bridge-_new_now
+                        _end_ms = min(float(curve_end_ts or target_timeline[-1]["ts"]), _now_curve_ms+3600000.0)
+                        _transition = {"start_ts_ms": _now_curve_ms, "offset_soc": _shift,
+                            "end_ts_ms": _end_ms, "decision": _config_target_reach_meta["decision"],
+                            "decay_soc_per_ms": abs(_shift)/max(1.0, _end_ms-_now_curve_ms)}
+                    elif not (_compatible and _transition.get("decision") == _config_target_reach_meta["decision"]
+                              and float(_transition.get("start_ts_ms", 0)) <= _now_curve_ms < min(float(_transition.get("end_ts_ms", 0)), float(_transition.get("start_ts_ms", 0))+3600000.0)):
+                        _transition = {}
+                    if _transition and _new_now is not None:
+                        _start = float(_transition["start_ts_ms"])
+                        _end = min(float(_transition["end_ts_ms"]), _start+3600000.0)
+                        _offset = float(_transition["offset_soc"])
+                        def _shift_at(ts):
+                            return _offset*max(0.0, min(1.0, (_end-ts)/max(1.0, _end-_start)))
+                        _candidate_now = _new_now+_shift_at(_now_curve_ms)
+                        _bridge = max(_old_now-_step_pct, min(_old_now+_step_pct, _candidate_now))
+                        _forecast_shift = _bridge-_candidate_now
+                        for _points in (target_timeline, curve_anchors):
+                            for _point in _points:
+                                _ts = float(_point["ts"])
+                                if _ts >= _now_curve_ms and not _point.get("frozen"):
+                                    _extra = _forecast_shift*max(0.0, (_end-_ts)/max(1.0, _end-_now_curve_ms))
+                                    _point["soc"] = round(max(_ep_reserve_floor_soc, min(100.0, float(_point["soc"])+_shift_at(_ts)+_extra)), 2)
+                        target_timeline = [point for point in target_timeline if float(point["ts"]) != _now_curve_ms]
+                        target_timeline.append({"ts": _now_curve_ms, "soc": round(max(_ep_reserve_floor_soc, _bridge), 2)})
+                        target_timeline.sort(key=lambda point: point["ts"])
+                        target_curve_meta["wallbox_target_transition"] = _transition
+                        target_curve_meta["wallbox_target_transition_max_step_pct"] = round(_step_pct, 3)
+            except (OSError, ValueError, TypeError, KeyError):
+                pass
+
         if target_timeline:
             published_curve_floor_points = self._normalise_curve_points(
                 target_timeline,
                 reach_day_start_ms,
                 reach_day_end_ms,
-                planning_target_soc,
+                max(planning_target_soc, float(storm_guard.get("target_soc") or 0) if wallbox_target_soc_active and storm_guard.get("control_active") else 0),
             )
             if not published_curve_floor_active and published_curve_floor_points:
                 published_curve_floor_source = "current_target_timeline"
@@ -8649,7 +8941,7 @@ class StorageSimulator:
                         _manual_soc_anchor,
                         now_ms=time.time() * 1000.0,
                         current_soc=current_soc,
-                        target_soc=self.target_soc,
+                        target_soc=reach_target_soc,
                         capacity_wh=self.capacity_wh,
                         forecast_surplus_wh=today_chargeable_surplus_wh,
                         can_reach_target=can_reach_target,
@@ -8678,7 +8970,7 @@ class StorageSimulator:
                 logger.warning("Adaptiver Headroom konnte nicht berechnet werden: %s" % _adaptive_err)
 
         ladeende_ts_export = None
-        ladeende_soc_export = round(float(self.target_soc), 1)
+        ladeende_soc_export = round(float(pv_curve_target_soc), 1)
         try:
             if curve_anchors:
                 ladeende_ts_export = int(float(curve_anchors[-1].get("ts", curve_end_ts or 0)))
@@ -8935,6 +9227,7 @@ class StorageSimulator:
 
             _storage_plan_payload = {
                 "ts":              now.isoformat(),
+                "simulation_start_ts_ms": simulation_now_ms,
                 "battery_capacity": self.capacity_wh,
                 "bat_cap_kwh":     round(self.capacity_kwh, 2),
                 "max_charge_w":    round(float(self.max_charge_w), 0),
@@ -9024,12 +9317,19 @@ class StorageSimulator:
                 "current_soc":      round(float(current_soc), 3),
                 "target_soc":      round(config_target_soc, 1),
                 "planning_target_soc": round(planning_target_soc, 1),
+                "pv_curve_target_soc": round(pv_curve_target_soc, 1),
+                "active_target_soc": round(reach_target_soc, 1),
+                "wallbox_car_min_charge_w": _config_target_reach_meta.get("car_min_charge_w"),
+                "wallbox_car_charge_limits_valid": _config_target_reach_meta.get("car_charge_limits_valid", False),
+                "normal_target_soc": round(float(self.target_soc), 1),
+                "normal_target_can_reach": normal_target_can_reach,
                 "wallbox_target_soc_active": bool(wallbox_target_soc_active),
                 "wallbox_target_soc": round(float(wallbox_target_soc), 1) if wallbox_target_soc is not None else None,
                 "wallbox_floor_soc_active": bool(wallbox_floor_soc_active),
                 "wallbox_floor_soc": round(float(wallbox_target_soc), 1) if wallbox_target_soc is not None else None,
                 "wallbox_config_target_reachable": bool(_config_target_reachable),
                 "wallbox_config_target_reach": _config_target_reach_meta,
+                "wallbox_curve_target_state": _config_target_reach_meta,
                 "weather_reserve_active": weather_reserve_active,
                 "weather_reserve_need_wh": round(weather_reserve_need_wh, 0),
                 "effective_target_soc": round(effective_target_soc, 1),
@@ -9398,13 +9698,46 @@ def _storage_plan_requires_immediate_replan(sim, now_s=None):
     return bool(valid_until_ms > 0 and now_ms >= valid_until_ms)
 
 
+def _storage_plan_wallbox_signature():
+    """Nur geeignete Ladepunkte und kWh-Stufen lösen eine neue Planung aus."""
+    try:
+        with open(WB_INTENT_FILE, "r", encoding="utf-8") as handle:
+            intent = json.load(handle)
+        rows = intent.get("car_energy_needs", [intent])
+        signature = []
+        for row in rows:
+            mode = normalize_wb_mode(row.get("wb_mode_active", 0))
+            policy = str(row.get("observe_storage_policy") or "").lower()
+            if mode != MODE_TARGET and not (mode == MODE_OFF and policy in ("reserve", "pv_battery", "battery", "akku", "wbminsoc", "floor", "1", "true", "yes", "on")):
+                continue
+            if row.get("connected") is False or row.get("manual_pause") or row.get("bev_full_blocked"):
+                continue
+            raw = row.get("car_energy_need_wh")
+            known = not isinstance(raw, bool) and isinstance(raw, (float, int)) and math.isfinite(raw) and raw >= 0
+            signature.append((str(row.get("wb_id", "")), bool(row.get("active", row.get("car_active"))),
+                              known, int(raw//1000) if known else None,
+                              bool(row.get("car_power_valid") is True and row.get("car_charging_measured") is True) if not known else None,
+                              row.get("car_plug_session_id"), row.get("car_charging_confirmed_in_session") if not known else None))
+        return tuple(sorted(signature))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def _storage_plan_wallbox_replan_due(previous, current, last_plan_s, now_s):
+    return current is not None and current != previous and now_s-last_plan_s >= 60.0
+
+
 def run_service():
     logger.info("Starte E3DC Storage Simulator Service (V4)...")
     sim = StorageSimulator()
     last_input_signature = _storage_plan_input_signature()
     while True:
         trigger_battery_vitals_history()
+        last_wallbox_signature = _storage_plan_wallbox_signature()
         last_input_signature = _generate_plan_bound_to_inputs(sim)
+        pending_wallbox_signature = None
+        pending_wallbox_since_s = None
+        last_wallbox_plan_s = time.time()
 
         if _storage_plan_requires_immediate_replan(sim):
             logger.warning(
@@ -9422,6 +9755,16 @@ def run_service():
         now_s = time.time()
         deadline = (int(now_s // SIM_INTERVAL_S) + 1) * SIM_INTERVAL_S + 0.05
         while time.time() < deadline:
+            current_wallbox_signature = _storage_plan_wallbox_signature()
+            if current_wallbox_signature != pending_wallbox_signature:
+                pending_wallbox_signature = current_wallbox_signature
+                pending_wallbox_since_s = time.time()
+            if (_storage_plan_wallbox_replan_due(last_wallbox_signature, current_wallbox_signature,
+                                                last_wallbox_plan_s, time.time())
+                    and pending_wallbox_since_s is not None
+                    and time.time()-pending_wallbox_since_s >= 60.0):
+                logger.info("Fahrzeugbedarf geändert - plane nach Entprellung neu.")
+                break
             current_signature = _storage_plan_input_signature()
             if current_signature != last_input_signature:
                 logger.info("Storage-Plan Eingangsdaten geändert - plane zeitnah neu.")

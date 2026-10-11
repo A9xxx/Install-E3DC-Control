@@ -12,7 +12,7 @@ $csvPath = '/var/www/html/data/wb_sessions.csv';
 echo "<h2>E3DC-Control Wallbox History Repair</h2>";
 
 if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
-    echo "<p>Dieses Reparaturwerkzeug ändert die Langzeit-Datenbank. Bitte starte die Korrektur bewusst per POST.</p>";
+    echo "<p>Dieses Reparaturwerkzeug ändert die Langzeit-Datenbank. Die Korrektur bewusst über das Formular starten.</p>";
     echo "<form method='post'>";
     echo e3dcCsrfInput();
     echo "<input type='hidden' name='confirm_repair_wb_history' value='1'>";
@@ -132,7 +132,7 @@ if (file_exists($statsFile)) {
     if (empty($cacheRemoval['success'])) {
         http_response_code(500);
         echo "<h3 style='color:#d97706'>Daten korrigiert, Live-Cache nicht entfernt</h3>";
-        echo "<p>Die Datenbankänderung ist gespeichert. Bitte führe im Installationscenter „Rechte reparieren“ aus und lade die Langzeitansicht danach neu.</p>";
+        echo "<p>Die Datenbankänderung ist gespeichert. Im Installationscenter „Rechte reparieren“ ausführen und die Langzeitansicht danach neu laden.</p>";
         echo "<p><a href='index.php?seite=langzeit'>Zurück zur Langzeit-Auswertung -&gt;</a></p>";
         exit;
     }

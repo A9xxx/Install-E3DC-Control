@@ -9,6 +9,8 @@ import { StorageManager, StorageBackendDisk } from "@project-chip/matter-node.js
 import { loadOrCreateCommissioningCredentials } from "./commissioning_credentials.js";
 
 const PAIRING_FILE = "/var/www/html/ramdisk/matter_pairing.json";
+const STATUS_FILE = "/var/www/html/ramdisk/matter_bridge_status.json";
+let lastStatusWriteMs = null;
 const LIVE_DATA_FILE = "/var/www/html/ramdisk/live_data_py.json";
 const WALLBOX_DATA_FILE = "/var/www/html/ramdisk/wallbox_native.json";
 const MAX_LIVE_BYTES = 4 * 1024 * 1024;
@@ -152,6 +154,22 @@ function readMatterLiveSnapshot() {
         );
     }
     return { pv, grid, bat: battery, home_raw: home, soc, wb: wallbox };
+}
+
+function writeMatterStatus(isCommissioned) {
+    const now = Date.now();
+    if (lastStatusWriteMs !== null && now >= lastStatusWriteMs && now - lastStatusWriteMs < 60000) return;
+    const tmp = `${STATUS_FILE}.${process.pid}.tmp`;
+    try {
+        fs.writeFileSync(tmp, JSON.stringify({schema: "e3dc_matter_bridge_status_v1", timestamp: now / 1000,
+            isCommissioned: Boolean(isCommissioned)}), {encoding: "utf-8", mode: 0o640});
+        fs.renameSync(tmp, STATUS_FILE);
+        fs.chmodSync(STATUS_FILE, 0o640);
+        lastStatusWriteMs = now;
+    } catch (error) {
+        try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) {}
+        console.error("Matter-Dienststatus konnte nicht lokal gespeichert werden.");
+    }
 }
 
 function writePairingData(data) {
@@ -305,6 +323,7 @@ async function main() {
     // LIVE POLLING — Alle 5 Sekunden E3DC Daten holen & Schalter updaten
     // =====================================================================
     setInterval(() => {
+        writeMatterStatus(commissioningServer.isCommissioned());
         if (!commissioningServer.isCommissioned()) return;
         const data = readMatterLiveSnapshot();
         if (!data) {

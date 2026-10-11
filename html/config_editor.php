@@ -3,6 +3,7 @@ if (session_status() === PHP_SESSION_NONE) {
     session_start();
 }
 require_once __DIR__ . '/helpers.php';
+require_once __DIR__ . '/module_install_jobs.php';
 require_once __DIR__ . '/eeg_tariff_tables.php';
 
 $configEditorRequestMethod = strtoupper((string)($_SERVER['REQUEST_METHOD'] ?? 'GET'));
@@ -281,6 +282,8 @@ $v4_config_file_path = '/var/www/html/data/e3dc_v4.json';
 clearstatcache(true, $v4_config_file_path);
 $is_writable = is_writable($v4_config_file_path);
 $message = '';
+$configImportAutoInstallCandidates = [];
+$configSavedAutoInstallCandidates = [];
 if (!$is_writable && $configEditorRequestMethod === 'POST') {
     $perms = @file_exists($v4_config_file_path) ? substr(sprintf('%o', fileperms($v4_config_file_path)), -4) : 'NE';
     $message = "<div class='alert alert-danger py-2 border-0 mb-3 mx-2'>⚠ Fehler: Keine Schreibrechte auf <code>$v4_config_file_path</code> (Perms: $perms). Bitte am Pi im Installer Punkt 2 (Rechte prüfen) ausführen!</div>";
@@ -368,6 +371,7 @@ $defaults = [
     "abregel_min_charge_w" => "300",
 
     // Tarif & Preise
+    "cost_accounting_quarterhour_enable" => "0",
     "stromtarif_typ" => "static", "strompreis_basis" => "25.0", "strompreis_cheap" => "18.0", "strompreis_uht" => "32.0", "strompreis_spezial" => "00:00 25.0", "grid_friendly_mode" => "1", "tariff_provider" => "smard", "tibber_api_token" => "", "tibber_home_id" => "", "entsoe_api_token" => "",
     "peak_shaving_enable" => "0", "peak_shaving_grid_import_limit_w" => "10000",
     "peak_shaving_reserve_soc_pct" => "30", "peak_shaving_max_discharge_w" => "0",
@@ -557,6 +561,7 @@ $defaults = [
 ];
 
 $tooltips = [
+    "cost_accounting_quarterhour_enable" => "Experimentelle Kostenhistorie mit festgeschriebenen Viertelstundenpreisen. Standard aus; erst ab Einschalten wird archiviert. Ältere Tage werden einmalig und schrittweise im Hintergrund nachberechnet. Kein Dienstneustart nötig.",
     "luxtronik_ip" => "Netzwerkadresse der Luxtronik-Steuerung. Vorgabe: nicht eingerichtet. Leer oder 0 ist keine nutzbare Geräteadresse; für die Verbindung eine erreichbare Adresse eintragen.",
     "idm_ip" => "IP-Adresse der iDM-Wärmepumpe für die Modbus-Verbindung. 0.0.0.0 = IP nicht konfiguriert.",
     "idm_port" => "TCP-Port für die iDM-Modbus-Verbindung. Standard: 502; leer oder ungültig fällt im Lesedienst auf 502 zurück. 0 wird nicht als Abschalter behandelt und ist kein nutzbarer Zielport.",
@@ -640,11 +645,11 @@ $tooltips = [
 
     // Speicher (Rückfallwerte)
     "speichergroesse"        => "Nutzbare Kapazität des Batteriespeichers in kWh (z.B. 15). Wird als Fallback genutzt wenn RSCP keinen Wert liefert.",
-    "maximumladeleistung"    => "Maximale Lade-Grenzleistung in Watt (z.B. 12500). Der storage_manager begrenzt darauf bei aktivem PV-Laden.",
-    "maximaleentladeleistung" => "Maximale Entladeleistung des Speichers in Watt (z.B. 11000). Limitiert die Entladung beim manuellen Override (Entladen-Button) und beim Auto-Discharge (Eco-Dump).",
+    "maximumladeleistung"    => "Maximale Ladeleistung in Watt. Liegt die Eingabe über der gültigen Gerätegrenze oder ist sie leer, 0 oder kleiner als 300 W, wird die Gerätegrenze mit Hinweis verwendet. Eine bewusste Drosselung ab 300 W bleibt erhalten; eine E3DC-Mindestempfehlung ist nur ein Hinweis.",
+    "maximaleentladeleistung" => "Maximale Entladeleistung in Watt. Liegt die Eingabe über der gültigen Gerätegrenze oder ist sie leer, 0 oder kleiner als 300 W, wird die Gerätegrenze mit Hinweis verwendet. Eine bewusste Drosselung ab 300 W bleibt erhalten. Notstromsperre und dynamische Grenzen gelten weiterhin.",
     "ep_reserve_pct"         => "Fallback-Notstromreserve in %. Wenn E3DC die Reserve in Wh liefert, wird sie auf die gesamte Speicherkapazität normalisiert. Dieser Wert greift nur, wenn RSCP keine Reserve liefert oder als zusätzlicher konservativer Boden.",
     "einspeiselimit"         => "Einspeisebegrenzung in kW (z.B. 7.0). Der Abregelschutz nutzt diesen Wert als Ziel-Netzpunkt, sofern er unter dem per RSCP gemeldeten E3DC-Derating liegt.",
-    "storage_curve_target_mode" => "Zielkurven-Modus. Ankerkurve nutzt Morgen-Puffer, Zwischenziele und Tagesziel wie bisher. Prognose auf 100% berechnet die Speicher-Zielkurve allein aus PV- und Verbrauchsprognose bis 100% am Freilauf; Schutzpfade, Pre-Dump und Abregelreserve bleiben aktiv.",
+    "storage_curve_target_mode" => "Zielkurven-Modus. Ankerkurve nutzt Morgen-Puffer, Zwischenziele und Tagesziel wie bisher. Prognose auf 100% berechnet die Speicher-Zielkurve allein aus PV- und Verbrauchsprognose bis zum Tagesziel am Freilauf. Normal sind 100%; bei aktivem PV + Akku und unzureichender gemeinsamer PV-Deckung kann die heutige PV-Kurve bei wbminSoC enden. Bedarf 0 senkt nichts, unbekannter Bedarf zählt nach bestätigter Ladung weiter, nur am selben Kurventag und in derselben Steck-Episode; nach 60 Minuten unter 300 W bei ausreichendem PV- und Stromangebot endet dieser Beleg. Für alle Wallboxen gelten mögliche bzw. konfigurierte Phasen und mindestens der konfigurierte Mindeststrom (mindestens 6 A), bei gemeldetem Gerätewert der höhere. Der Ladebeleg schaltet ab 500 W ein, nach 45 s unter 300 W aus. Folgetage und Netzladeziele bleiben normal; Schutzpfade, Pre-Dump und Abregelreserve bleiben aktiv.",
     "storage_curve_sliding_horizon_enable" => "Optionaler erweiterter Modus: erlaubt dem 100%-Prognosepfad, die Ladung über einen gleitenden Prognosehorizont zu entspannen, wenn Vertrauen, Zielerreichbarkeit und Abregeldruck sicher sind. Nur bei Zielkurven-Modus 'Prognose auf 100%' aktivierbar.",
     "storage_forecast100_late_full_guard_enable" => "Nur im Zielkurven-Modus 'Prognose auf 100%'. An (Standard): 100 % werden erst kurz vor dem PV-Ende geplant, aber nur mit Grund – Einspeiselimit unter der erwarteten PV-Spitze, Abregeldruck in der Prognose, Direktvermarktung aktiv oder Pre-Dump geplant. So bleibt Platz für Spitzen, die sonst abgeregelt würden. Ein einmal eingetretener Grund gilt bis zum Ende des Tages. Ohne Grund endet die Kurve am letzten nutzbaren Überschuss minus Kurvenende-Puffer: Überschuss geht mittags in den Speicher statt ins Netz, und Wolken am Nachmittag gefährden das Ziel weniger. Aus: nie spätes Kurvenende.",
     "storage_curve_end_guard_min" => "Puffer in Minuten zwischen Kurvenende und dem letzten nutzbaren PV-Überschuss (Prognose auf 100% mit Grund: vor dem PV-Ende). Größer = Speicher früher voll und mehr Reserve gegen Wolken und Prognosefehler, kleiner = später voll. Bereich 30–120, Standard 45.",
@@ -999,13 +1004,13 @@ $tooltips = [
     "grid_start_limit"       => "Der Betrag legt das benötigte freie Verbraucherbudget nach Akkuladung fest, nicht die Einspeisung am Netzpunkt. Negativ eintragen: -4500 steht für 4500 W benötigtes Budget. Das Vorzeichen bleibt für die PV-Pause wichtig: Deren laufender Ende-Timer wird bei Netzleistung über Start-Grenze plus 500 W zurückgesetzt. Bei +4500 geschieht das erst über 5000 W Netzbezug, bei -4500 sobald die Einspeisung unter 4000 W fällt. Die Zuteilung benötigt mindestens 1500 W; mit kleinerem Betrag startet die WP nicht. Verbraucherprioritäten gelten weiterhin.",
     "pv_boost_delay"         => "Durchgehende Freigabe vor dem PV-Boost in Sekunden; schützt vor kurzen Wolkenlücken. Standard: 30 s. SG Ready reserviert mindestens 150 s, bei langen Verzögerungen mindestens Verzögerung plus 120 s. Ab dem normalen Reservierungsfenster weist die Konfigurationsprüfung auf die lange Budgetbindung hin.",
     "stop_delay_minutes"     => "Minuten nach denen der Boost gestoppt wird wenn das Limit unterschritten bleibt. Standard: 10 Min.",
-    "wp_min_runtime_min"     => "Luxtronik: Schutzzeit ab bestätigtem Verdichterstart. Nur benannte Schutzfunktionen wie Nutzer-Aus, Gerätestörung, Notstromreserve oder Hausanschlussgrenze dürfen sie verkürzen; gewöhnlicher Netzbezug und Budgetwechsel nicht. Die Wärmepumpe darf ihren Takt selbst beenden.",
+    "wp_min_runtime_min"     => "Mindestlaufzeiten schützen vor kurzen Verdichtertakten; nur benannte Schutzfälle verkürzen sie. Bei Luxtronik im Messwertbetrieb gilt der Schutz auch beim Wh-Kontingentende und bei Unterstützung auf 0. Nutzer-Aus und Notstromreserve nehmen den PV-Auftrag zurück, die Mindestlaufzeit läuft für Heizung und Warmwasser zu Ende. Inselbetrieb, Hausanschlussgrenze, Gerätefehler und SoC-Sicherheitsabschaltung wirken sofort. Der Netzstopp verlangt 30 Sekunden zusammenhängend frischen WP-Netzanteil über 2.500 W, höchstens Netzbezug minus 200 W. Ohne frische WP-Einzelmessung (fehlend, ungültig oder älter als 45 Sekunden) zählt der gesamte Netzbezug abzüglich 200 W. Die Frist beträgt auch dann 30 Sekunden zusammenhängend mit frischen Netzwerten; ein Wechsel der Messgrundlage beginnt sie neu. Die Wärmepumpe darf selbst stoppen.",
     "wp_restart_block_min"   => "Wiedereinschaltsperre nach einem PV-Boost-Stopp in Minuten. Glättet Wolkenwechsel und verhindert Start/Stop-Pendeln.",
-    "wp_pv_control_mode"    => "Messwertgeführt: Startwert für die Qualifikation, danach Istaufnahme und Wh-Wächter. Eine geschützte Mindestlaufzeit kann positive Wh-Kontingente überschreiten. Vollständige Vorreservierung erhält das bisherige Verhalten. Die Umstellung verändert keine Quellenfreigaben.",
-    "wp_pv_start_power_w"   => "Typische elektrische Startaufnahme für die Überschussqualifikation. 0 übernimmt die bestehende Start-Grenze. Nach dem Start entscheidet die Istaufnahme. Ein manueller Wert ist eine Betriebsschätzung, keine elektrische Geräteobergrenze.",
+    "wp_pv_control_mode"    => "Messwertgeführt: Der Startwert prüft die PV-Deckung, danach zählen Istaufnahme und Wh-Kontingente. Bei erreichter Zieltemperatur bleibt der PV-Sollwert bestehen; die Anlage stoppt selbst. Mindestlaufhalt gilt für das Kontingentende und Unterstützung auf 0, nicht pauschal für unabhängige Abschaltpfade. Vorreservierung behält ihr bisheriges Verhalten.",
+    "wp_pv_start_power_w"   => "Typische elektrische Startaufnahme für die Überschussqualifikation. 0 übernimmt die bestehende Start-Grenze. Läuft bei Luxtronik bereits eine frisch bestätigte, PV-gedeckte Warmwasserbereitung, zählt Einspeisung plus gemessene WP-Leistung genau einmal; Startpuffer und Wiedereinschaltsperre entfallen für diese Übernahme. Nach dem Start entscheidet die Istaufnahme. Ein manueller Wert ist eine Betriebsschätzung, keine elektrische Geräteobergrenze.",
     "wp_pv_max_power_w"      => "Elektrischer Profilwert innerhalb der WP-Messgrenze, einschließlich dort erfasster Pumpen und möglicher Zusatzheizung. Kein pauschaler Dauerbedarf. In der messwertgeführten Regelung bedeutet 0: unbekannt. Dort werden Messabweichungen bis zum größeren Wert aus 100 W und 5 % toleriert; der gesamte Istverbrauch wird gezählt. Das ist eine Plausibilitätstoleranz, keine Erhöhung von Hardware- oder Quellengrenzen. Die vollständige Vorreservierung benötigt einen belegten Maximalwert.",
-    "wp_pv_battery_limit_wh" => "Akku-Wh-Wächter innerhalb der letzten 24 Stunden. Messwertgeführt wird beim Erreichen der zusätzliche Boost nach der geschützten Laufzeit beendet; Verbrauch und mögliche Überschreitung werden weitergezählt. 0 sperrt die Quelle. Vollständige Vorreservierung behält die bisherige Bedeutung.",
-    "wp_pv_grid_limit_wh"    => "Netz-Wh-Wächter innerhalb der letzten 24 Stunden. Messwertgeführt wird beim Erreichen der zusätzliche Boost nach der geschützten Laufzeit beendet; Verbrauch und mögliche Überschreitung werden weitergezählt. 0 sperrt die Quelle. Spätere Einspeisung erstattet keine verbrauchten Wh.",
+    "wp_pv_battery_limit_wh" => "Akku-Wh-Kontingent für die letzten 24 Stunden. Verbraucht: keine weitere Akkuunterstützung, PV-Boost bei PV-Deckung weiter. Dieses Kontingent beendet den Boost nicht. 0 sperrt die Unterstützung. Im Messwertbetrieb bleibt ein laufender Verdichter auch bei 0 bis zum Ende der Mindestlaufzeit geschützt; unabhängige Schutzabschaltungen bleiben bestehen.",
+    "wp_pv_grid_limit_wh"    => "Netz-Wh-Kontingent für die letzten 24 Stunden. Für das Boost-Ende zählt gemessener WP-Netzbezug, höchstens der gesamte Netzbezug abzüglich 200 W Toleranz. Geschätzte Werte aus Messlücken sperren nur die Unterstützung. Ende frühestens nach Mindestlaufzeit und zehn Minuten Sollwerthalt. Kein Tagesmaximum: Neue PV-Starts bleiben mit zusätzlich 500 W PV-Puffer erlaubt. 0 sperrt die Unterstützung; Mindestlaufhalt bleibt im Messwertbetrieb bestehen. Unabhängige Schutzabschaltungen bleiben erhalten.",
     "wp_pv_battery_max_w"    => "Maximale für die WP erlaubte Akku-Überbrückungsleistung. Tatsächliche Speichergrenzen, Notstromreserve und andere gebundene Verbraucher gelten zusätzlich. 0 = keine Akkuüberbrückung.",
     "wp_pv_grid_max_w"       => "Maximale für die WP erlaubte Netz-Überbrückungsleistung. Hausanschlussgrenzen gelten zusätzlich. Leistung in W und Energiekontingent in Wh müssen beide ausreichen. 0 = keine Netzüberbrückung.",
     "wp_pv_reaction_s"       => "Für das Geräteprofil anzusetzende Reaktionsfrist einschließlich Messalter, Steuerung und wirksamer Lastanpassung. Standard 30 Sekunden ist eine Planungsannahme und muss zur Anlage passen; keine garantierte Herstellergrenze.",
@@ -1015,7 +1020,7 @@ $tooltips = [
     "wp_pv_boost_release_s"  => "Wolkenüberbrückung des PV-Boosts (Sekunden, Standard 300, mindestens 30). Der Boost steht wie eine SG-Ready-Freigabe: Ohne Verdichterlauf muss die PV-Deckung die Startleistung tragen. Bei laufendem Verdichter genügt die Deckung ohne Netzbezug und Kurvendefizit. Fehlt die jeweilige Voraussetzung länger als diese Frist, wird die Rücknahme angefordert; die Mindestlaufzeit bleibt wirksam. Schutzfunktionen haben Vorrang. Ein Verdichterstopp oder eine erreichte Temperatur beenden den Boost nicht – die Anlage regelt intern.",
     "wp_pv_handoff_timeout_s" => "Wartefrist auf die tatsächlich gesunkene Wallboxleistung vor dem WP-Startauftrag (Sekunden, Standard 120). Gilt nur bei Wallbox-Vorrang; bei Wärmepumpen-Vorrang wird der Sollwert sofort gesetzt und die Wallbox regelt parallel auf ihr gesenktes Ziel. Diese Frist beginnt vor der gesonderten Prüfung des gesendeten WP-Befehls.",
     "min_soc"                => "Minimaler Batterie-SoC (%) unter dem der WP-Boost nie gestartet wird. Dient dem Notreserve-Schutz.",
-    "heizgrenze_temp"        => "Außentemperatur (°C) unter der Heizungs-Boost aktiviert wird. Standard: 10°C.",
+    "heizgrenze_temp"        => "Mittlere Außentemperatur für die Sommer-/Winter-Umschaltung bei Luxtronik und iDM. Standard: 10 °C. Bei SG-Ready sperrt die Heizgrenze die Freigabe nicht: Es zählt der Bedarf aus gültiger, frischer Warmwasser- oder Rücklauftemperatur. Ohne Temperaturdaten keine automatische Freigabe.",
     "wws"                    => "Warmwasser-Solltemperatur Sommer (°C). Luxtronik/IDM: Register-Sollwert für Software-Thermostat.",
     "www"                    => "Warmwasser-Solltemperatur Winter (°C).",
     "hz"                     => "Heizungs-Rücklauf Solltemperatur Winter (°C).",
@@ -1429,44 +1434,8 @@ function e3dc_cfg_enabled($data, $key, $default = false) {
     return in_array($value, ['1', 'true', 'yes', 'on', 'ja', 'ein'], true);
 }
 
-function e3dc_service_unit_name($service) {
-    $unit = trim((string)$service);
-    if ($unit === '') return '';
-    if (!preg_match('/^[A-Za-z0-9_.@-]+(?:\.service)?$/', $unit)) return '';
-    if (!str_ends_with($unit, '.service')) $unit .= '.service';
-    return $unit;
-}
-
-function e3dc_service_unit_exists($service) {
-    $unit = e3dc_service_unit_name($service);
-    if ($unit === '') return false;
-    foreach (['/etc/systemd/system', '/lib/systemd/system', '/usr/lib/systemd/system'] as $dir) {
-        if (is_file($dir . '/' . $unit)) return true;
-    }
-    return false;
-}
-
-function e3dc_service_unit_state($service) {
-    $unit = e3dc_service_unit_name($service);
-    $exists = e3dc_service_unit_exists($unit);
-    $activeRaw = '';
-    $enabledRaw = '';
-    if ($unit !== '') {
-        $activeRaw = trim((string)@shell_exec('/bin/systemctl is-active ' . escapeshellarg($unit) . ' 2>/dev/null'));
-        $enabledRaw = trim((string)@shell_exec('/bin/systemctl is-enabled ' . escapeshellarg($unit) . ' 2>/dev/null'));
-    }
-    return [
-        'unit' => $unit,
-        'exists' => $exists,
-        'active' => ($activeRaw === 'active'),
-        'enabled' => in_array($enabledRaw, ['enabled', 'static'], true),
-        'raw' => $activeRaw !== '' ? $activeRaw : ($exists ? 'inactive' : 'missing'),
-        'enabled_raw' => $enabledRaw,
-    ];
-}
-
 function e3dc_config_auto_install_is_docker() {
-    return file_exists('/.dockerenv') || is_dir('/app/pi/Install');
+    return e3dcIsDockerEnvironment() || is_dir('/app/pi/Install');
 }
 
 function e3dc_config_auto_install_rules() {
@@ -1559,12 +1528,14 @@ function e3dc_config_auto_install_rules() {
             'when' => ['all' => [['type' => 'enabled', 'key' => 'climate_control_enable']]],
         ],
         'ha' => [
+            'system_update_only' => true,
             'label' => 'HA Master/Slave',
             'service' => 'e3dc-ha',
             'config_keys' => ['ha_mode'],
             'when' => ['all' => [['type' => 'in', 'key' => 'ha_mode', 'values' => ['master', 'slave']]]],
         ],
         'shadow' => [
+            'system_update_only' => true,
             'label' => 'Shadow-Simulation',
             'service' => 'e3dc-shadow-sync',
             'config_keys' => ['ha_mode'],
@@ -1720,6 +1691,7 @@ function e3dc_config_auto_install_known_modules() {
             'service' => $rule['service'] ?? '',
             'config_keys' => $rule['config_keys'] ?? [],
             'when' => $rule['when'] ?? [],
+            'system_update_only' => !empty($rule['system_update_only']),
         ];
     }
     return $known;
@@ -1790,44 +1762,33 @@ function e3dc_config_auto_install_action_label($action) {
     return $labels[$action] ?? (string)$action;
 }
 
-function e3dc_run_config_auto_install_job($module, $label, $action = 'install_module') {
-    if (!preg_match('/^[A-Za-z0-9_.-]+$/', (string)$module)) {
-        return ['ok' => false, 'module' => $module, 'label' => $label, 'action' => $action, 'message' => 'ungültiger Modul-Key'];
-    }
-    $allowedActions = ['install_module', 'enable_service', 'start_service', 'restart_service'];
-    if (!in_array($action, $allowedActions, true)) {
-        return ['ok' => false, 'module' => $module, 'label' => $label, 'action' => $action, 'message' => 'ungültige Auto-Install-Aktion'];
-    }
-    if ((string)$module === 'forecast_evidence') {
-        $activation = e3dcActivateForecastEvidenceService();
-        return [
-            'ok' => !empty($activation['success']),
-            'module' => $module,
-            'label' => $label,
-            'action' => $action,
-            'message' => (string)($activation['message'] ?? 'Aktivierung der PV-Prognosediagnose fehlgeschlagen.'),
-            'forecast_evidence_activation' => $activation,
-        ];
-    }
-    if (e3dc_config_auto_install_is_docker()) {
-        return ['ok' => false, 'module' => $module, 'label' => $label, 'action' => $action, 'message' => 'Docker-Installation: keine sudo-/systemd-Installation aus der Config. Config speichern und Container neu starten, damit entrypoint.sh die Dienste startet.'];
-    }
-    return [
-        'ok' => false,
-        'module' => $module,
-        'label' => $label,
-        'action' => $action,
-        'privileged_installer_web_enabled' => false,
-        'message' => 'Konfiguration wurde gespeichert. Die automatische privilegierte Dienständerung ist bis zu einem eigenen engen Launcher deaktiviert; bitte den Dienst administrativ installieren, aktivieren oder neu starten.',
-    ];
+function e3dc_config_create_setup_plan($baseline, $confirmedModules, $includeUnchangedMissing = false) {
+    $raw = e3dcReadRegularFileBound('/var/www/html/data/e3dc_v4.json');
+    $saved = is_string($raw) ? json_decode($raw, true) : null;
+    if (!is_array($saved)) return null;
+    $catalog = null;
+    $candidates = e3dc_config_auto_install_missing_candidates($saved, $baseline, $includeUnchangedMissing, $catalog);
+    // Die angezeigte Browserliste kann den frisch berechneten Umfang nur einschränken.
+    $confirmed = is_array($confirmedModules) ? array_filter($confirmedModules, 'is_string') : [];
+    $candidates = array_intersect_key($candidates, array_fill_keys($confirmed, true));
+    return e3dc_setup_create_plan($candidates, hash('sha256', $raw), $catalog);
 }
 
-function e3dc_config_auto_install_missing_candidates($data, $oldData = null) {
+function e3dc_config_setup_unavailable_message($candidates) {
+    foreach ($candidates as $info) {
+        if (!empty($info['system_update_only'])) return 'Einrichtungsplan nicht verfügbar. Einrichtung über Konsole 49 bzw. das Systemupdate; weitere Module in der Installationszentrale einzeln einrichten.';
+    }
+    return 'Einrichtungsplan nicht verfügbar. Module in der Installationszentrale einzeln einrichten.';
+}
+
+function e3dc_config_auto_install_missing_candidates($data, $oldData = null, $includeUnchangedMissing = false, &$catalogOut = null) {
     if (e3dc_config_auto_install_is_docker()) return [];
     $candidates = [];
+    // Der Katalog ist ein eigener Prozess; er wird erst geladen, wenn ein Modul Aufträge hat.
+    $catalog = null;
     foreach (e3dc_config_auto_install_known_modules() as $module => $info) {
         $changed = e3dc_config_auto_install_config_changed($data, $oldData, $info['config_keys'] ?? []);
-        if (!$changed) continue;
+        if (!$changed && !$includeUnchangedMissing) continue;
         if (!e3dc_config_auto_rule_matches($data, $info['when'] ?? [])) continue;
         $service = $info['service'] ?? '';
         $state = e3dc_service_unit_state($service);
@@ -1835,6 +1796,7 @@ function e3dc_config_auto_install_missing_candidates($data, $oldData = null) {
         if ($service === '' || empty($state['exists'])) {
             $jobs[] = 'install_module';
         } else {
+            if (!$changed && in_array($state['enabled_raw'] ?? '', ['disabled', 'masked', 'masked-runtime'], true)) continue;
             if (empty($state['enabled'])) $jobs[] = 'enable_service';
             if (empty($state['active'])) {
                 $jobs[] = 'start_service';
@@ -1843,35 +1805,19 @@ function e3dc_config_auto_install_missing_candidates($data, $oldData = null) {
             }
         }
         if (!empty($jobs)) {
-            $info['jobs'] = array_values(array_unique($jobs));
+            $info['jobs'] = $jobs;
             $info['state'] = $state;
             $info['config_changed'] = $changed;
+            if ($catalog === null) $catalog = $catalogOut = e3dc_setup_catalog();
+            if (isset($catalog[$module])) {
+                $info['jobs'] = e3dc_setup_service_jobs($info, $catalog[$module]);
+                if (!$info['jobs']) continue;
+            }
+            $info['action_label'] = implode(', ', array_map('e3dc_config_auto_install_action_label', $info['jobs']));
             $candidates[$module] = $info;
         }
     }
     return $candidates;
-}
-
-function e3dc_config_auto_install_missing_services($data, $oldData = null) {
-    $results = [];
-    foreach (e3dc_config_auto_install_missing_candidates($data, $oldData) as $module => $info) {
-        $moduleOk = true;
-        $messages = [];
-        foreach ((array)($info['jobs'] ?? ['install_module']) as $action) {
-            $result = e3dc_run_config_auto_install_job($module, $info['label'] ?? $module, $action);
-            $moduleOk = $moduleOk && !empty($result['ok']);
-            $messages[] = e3dc_config_auto_install_action_label($action) . ': ' . ($result['message'] ?? 'keine Ausgabe');
-            if (empty($result['ok'])) break;
-        }
-        $results[] = [
-            'ok' => $moduleOk,
-            'module' => $module,
-            'label' => $info['label'] ?? $module,
-            'jobs' => $info['jobs'] ?? ['install_module'],
-            'message' => implode('; ', $messages),
-        ];
-    }
-    return $results;
 }
 
 function e3dc_config_secret_mode($data = null) {
@@ -3854,6 +3800,18 @@ if ($configEditorRequestMethod === 'POST') {
                 . htmlspecialchars((string)($telegramResult['message'] ?? 'unbekannter Fehler'))
                 . " Die Konfiguration wurde nicht verändert.</div>";
         }
+    } elseif (($_POST['config_action'] ?? '') === 'apply_import_modules') {
+        requireWebAuth(true);
+        $baseline = $_SESSION['e3dc_import_module_baseline'] ?? null;
+        $includeUnchanged = !empty($_SESSION['e3dc_import_module_include_unchanged']);
+        unset($_SESSION['e3dc_import_module_baseline'], $_SESSION['e3dc_import_module_include_unchanged']);
+        $token = is_array($baseline)
+            ? e3dc_config_create_setup_plan($baseline, $_POST['import_modules'] ?? [], $includeUnchanged) : null;
+        if ($token !== null) e3dc_setup_redirect($token);
+        $savedData = e3dc_read_existing_v4_json($v4_config_file_path);
+        $candidates = is_array($baseline) && is_array($savedData)
+            ? e3dc_config_auto_install_missing_candidates($savedData, $baseline, $includeUnchanged) : [];
+        $message = "<div class='alert alert-info'>" . htmlspecialchars(e3dc_config_setup_unavailable_message($candidates)) . '</div>';
     } elseif (($_POST['config_action'] ?? '') === 'upload_config') {
         requireWebAuth(false);
         $upload = $_FILES['config_upload_file'] ?? null;
@@ -3918,6 +3876,9 @@ if ($configEditorRequestMethod === 'POST') {
                 } elseif (($mutation['status'] ?? '') === 'config_too_large') {
                     $message = "<div class='alert alert-danger'>" . e3dc_config_size_message() . '</div>';
                 } elseif ($outcome === 'no_changes') {
+                    $configImportAutoInstallCandidates = e3dc_config_auto_install_missing_candidates($current_data, $current_data, true);
+                    $_SESSION['e3dc_import_module_baseline'] = $current_data;
+                $_SESSION['e3dc_import_module_include_unchanged'] = true;
                     $message = "<div class='alert alert-info py-2 border-0 mb-3 mx-2'>Die Datei enthält keine Änderungen für diese Anlage; es wurde nichts geändert. " . (string)($mutation['ha_finding'] ?? '') . (string)($mutation['ha_role_note'] ?? '') . "</div>";
                 } elseif ($outcome === 'success') {
                     $count = e3dc_config_import_value_count($import_data, $secretStats, $redactedExport);
@@ -3928,6 +3889,12 @@ if ($configEditorRequestMethod === 'POST') {
                     $messageClass = ($retentionWarning === '' && $missingSecrets === 0 && !str_contains($roleNote, 'gesperrt') && !str_contains($roleNote, 'zwei Anlagen')) ? 'alert-success' : 'alert-warning';
                     $secretNote = e3dc_config_import_secret_note($secretStats, !empty($mutation['local_shadow']));
                     $message = "<div class='alert $messageClass py-2 border-0 mb-3 mx-2 animate__animated animate__fadeIn'>Konfiguration importiert ($count Werte). Lokale Installationspfade wurden beibehalten. HA-Rolle und Peer dieser Anlage wurden beibehalten.$secretNote Backup wurde bestätigt. $finding$roleNote$retentionWarning</div>";
+                    $boundImported = e3dc_read_existing_v4_json($v4_config_file_path);
+                    if (is_array($boundImported)) {
+                        $configImportAutoInstallCandidates = e3dc_config_auto_install_missing_candidates($boundImported, $current_data, true);
+                        $_SESSION['e3dc_import_module_baseline'] = $current_data;
+                $_SESSION['e3dc_import_module_include_unchanged'] = true;
+                    }
                     $config = readConfig($v4_config_file_path);
                     unset($config['stop']);
                 } else {
@@ -4407,6 +4374,16 @@ if ($configEditorRequestMethod === 'POST') {
         $config_cache_invalidation_failed = false;
         $config_state_unknown = false;
         $config_mutation_status = 'not_started';
+        if (array_key_exists('ha_mode', $posted_values)) {
+            $anchorRole = e3dc_config_ha_role_anchor_mode();
+            $currentRole = $anchorRole ?? (e3dc_config_ha_role_text($old_v4_data['ha_mode'] ?? 'off') ?: 'off');
+            $postedRole = is_scalar($posted_values['ha_mode'])
+                ? e3dc_config_ha_role_text($posted_values['ha_mode']) : null;
+            if ($postedRole !== $currentRole) {
+                $config_validation_failed = true;
+                $guard_warnings[] = 'Rollenwechsel nur über Konsole 49';
+            }
+        }
         if (!$config_load_failed && !$config_validation_failed) {
             $mutation = e3dcMutateV4ConfigDetailed(
                 static function($boundCurrent) use ($v4_data) {
@@ -4432,21 +4409,25 @@ if ($configEditorRequestMethod === 'POST') {
 
         if ($success) {
             $autoInstallConfirmed = in_array(strtolower(trim((string)($_POST['config_auto_install_confirmed'] ?? '0'))), ['1', 'true', 'yes', 'on'], true);
-            $autoInstallCandidates = e3dc_config_auto_install_missing_candidates($v4_data, $old_v4_data);
+            $savedData = e3dc_read_existing_v4_json($v4_config_file_path);
+            $autoInstallCandidates = is_array($savedData)
+                ? e3dc_config_auto_install_missing_candidates($savedData, $old_v4_data) : [];
             $auto_install_failed = false;
+            if (e3dc_config_auto_install_is_docker() && is_array($savedData)) {
+                $changedDockerModules = array_filter(e3dc_configured_service_auto_installs($savedData),
+                    static fn($info) => e3dc_config_auto_install_config_changed($savedData, $old_v4_data, $info['config_keys'] ?? []));
+                if ($changedDockerModules) $guard_warnings[] = 'Docker-Dienste nach dem Speichern über Docker Compose einrichten und Container neu starten.';
+            }
             if (!empty($autoInstallCandidates) && $autoInstallConfirmed) {
-                foreach (e3dc_config_auto_install_missing_services($v4_data, $old_v4_data) as $autoInstall) {
-                    $label = $autoInstall['label'] ?? ($autoInstall['module'] ?? 'Modul');
-                    if (!empty($autoInstall['ok'])) {
-                        $guard_warnings[] = $label . ' wurde nach deiner Bestätigung automatisch installiert, aktiviert oder neu gestartet, weil die zugehörige Konfiguration aktiv ist.';
-                    } else {
-                        $auto_install_failed = true;
-                        $guard_warnings[] = $label . ' ist konfiguriert, konnte aber nicht automatisch installiert, aktiviert oder neu gestartet werden: ' . ($autoInstall['message'] ?? 'unbekannter Fehler') . '. Bitte Installationszentrale prüfen.';
-                    }
-                }
+                $token = e3dc_config_create_setup_plan($old_v4_data, $_POST['config_auto_install_modules'] ?? []);
+                if ($token !== null) e3dc_setup_redirect($token);
+                $guard_warnings[] = e3dc_config_setup_unavailable_message($autoInstallCandidates);
             } elseif (!empty($autoInstallCandidates)) {
+                $configSavedAutoInstallCandidates = $autoInstallCandidates;
                 $labels = array_map(function($info) { return (string)($info['label'] ?? 'Modul'); }, $autoInstallCandidates);
-                $guard_warnings[] = 'Konfiguration gespeichert; folgende Dienste wurden noch nicht installiert, gestartet oder neu gestartet, weil die Bestätigung fehlt: ' . implode(', ', $labels) . '. Beim nächsten Speichern bestätigen oder die Installationszentrale nutzen.';
+                $guard_warnings[] = 'Konfiguration gespeichert; folgende Dienste wurden noch nicht installiert, gestartet oder neu gestartet: ' . implode(', ', $labels) . '. In der Installationszentrale einrichten.';
+                $_SESSION['e3dc_import_module_baseline'] = $old_v4_data;
+                $_SESSION['e3dc_import_module_include_unchanged'] = false;
             }
             $extra = '';
             if (!empty($guard_warnings)) {
@@ -4636,6 +4617,7 @@ $groups = [
         "abregel_puffer_w", "abregel_hysterese_w", "abregel_min_charge_w"
     ],
     "Tarif & Strompreise" => [
+        "cost_accounting_quarterhour_enable",
         "stromtarif_typ", "strompreis_basis", "strompreis_cheap", "strompreis_uht", "strompreis_spezial", "grid_friendly_mode", "tariff_provider", "tibber_api_token", "tibber_home_id", "entsoe_api_token", "awattar", "awmwst", "awnebenkosten", "awreserve", "awsimulation",
         "peak_shaving_enable", "peak_shaving_grid_import_limit_w", "peak_shaving_reserve_soc_pct", "peak_shaving_max_discharge_w",
         "peak_shaving_grid_recharge_enable", "peak_shaving_recharge_max_w", "peak_shaving_control_margin_w",
@@ -4959,7 +4941,7 @@ function renderHeatpumpPvReservationStatus($entry, $runtime = null): string {
             <?php $funded = (float)$calculation['missing_wh'] <= 0.000001; ?>
             <p class="small fw-bold <?= $funded ? 'text-success' : 'text-warning' ?> mb-2"><?= $funded ? 'Für den zuletzt geprüften Stand ist der kurze Reaktionspuffer rechnerisch gedeckt.' : 'Für den zuletzt geprüften Stand fehlt noch Deckung des kurzen Reaktionspuffers.' ?></p>
             <div class="small mb-2">Reaktionspuffer: <strong><?= $fmt($calculation['required_wh'], 1) ?> Wh</strong> · Mit den Quellen abdeckbar: <strong><?= $fmt($calculation['available_wh'], 1) ?> Wh</strong> · Fehlbetrag: <strong><?= $fmt($calculation['missing_wh'], 1) ?> Wh</strong></div>
-            <p class="small mb-2">Im Lauf bestimmt die gemessene Aufnahme das Budget. Der Wh-Wächter zählt nur die Überbrückung aus Akku und Netz. Ein erreichtes Kontingent merkt das Boost-Ende nach der geschützten Laufzeit vor; der Verbrauch bis dahin kann das Kontingent überschreiten.</p>
+            <p class="small mb-2">Im Lauf bestimmt die gemessene Aufnahme das Budget. Verbrauchte Wh-Kontingente sperren die jeweilige Brücke; der Boost läuft mit PV weiter. Nur ein verbrauchtes positives Netzkontingent mit weiterem gemessenem WP-Netzbezug über 200 W merkt das Ende vor. Im Messwertbetrieb schützt die Mindestlaufzeit beim Kontingentende und bei Unterstützung auf 0. Der Netzstopp greift bei mehr als 2.500 W WP-Netzanteil (ohne frische WP-Einzelmessung: gesamter Netzbezug abzüglich 200 W) über 30 Sekunden mit frischen Daten; Hausanschlussgrenzen wirken sofort.</p>
             <details class="small mb-2">
                 <summary>Startwert und kurze Reaktionsabdeckung</summary>
                 <div>Startwert: <?= $fmt($calculation['start_power_w'] ?? 0) ?> W. Reaktionsabdeckung: <?= $fmt($calculation['reservation_power_w'] ?? 0) ?> W × <?= $fmt($calculation['duration_s']) ?> s ÷ 3.600 = <?= $fmt($calculation['required_wh'], 1) ?> Wh.</div>
@@ -4982,7 +4964,7 @@ function renderHeatpumpPvReservationStatus($entry, $runtime = null): string {
         <?php if ($measured): ?>
         <div class="border-top pt-2 mt-2" data-wp-pv-runtime>
             <?php if (is_array($runtime)): ?>
-            <h6 class="small fw-bold">Wh-Wächterstand beim Laden der Seite</h6>
+            <h6 class="small fw-bold">Wh-Kontingente beim Laden der Seite</h6>
             <p class="small text-muted mb-1">Messzeit: <?= htmlspecialchars(date('d.m.Y H:i:s T', (int)$runtime['sample_ts'])) ?>. Für einen neuen Stand die Seite neu laden.</p>
             <?php foreach (['battery' => 'Hausakku', 'grid' => 'Stromnetz'] as $source => $label): ?>
             <p class="small mb-1"><?= htmlspecialchars($label) ?>: <?= $fmt($runtime['window_' . $source . '_used_wh'], 1) ?> Wh verbraucht · <?= $fmt($runtime[$source . '_remaining_wh'], 1) ?> Wh verbleibend · <?= $fmt($runtime[$source . '_overrun_wh'], 1) ?> Wh über dem Kontingent.</p>
@@ -4992,8 +4974,22 @@ function renderHeatpumpPvReservationStatus($entry, $runtime = null): string {
             <?php if (!is_bool($reactionReserve) && is_numeric($reactionReserve) && is_finite((float)$reactionReserve) && (float)$reactionReserve > 0): ?>
             <p class="small mb-1">Zusätzlich gebundene Leistungsreserve: <?= $fmt($reactionReserve) ?> W. Die sofort verfügbare Quellenreaktion deckt einen möglichen WP-Leistungssprung noch nicht vollständig; dadurch bleibt weniger Restleistung für nachrangige Verbraucher.</p>
             <?php endif; ?>
-            <?php if (($runtime['energy_guard_pending'] ?? false) === true): ?><p class="small text-warning fw-bold mb-1">Wh-Wächter erreicht: Boost-Ende nach der geschützten Laufzeit vorgemerkt.</p><?php endif; ?>
-            <?php else: ?><p class="small text-muted mb-1">Kein frischer Wächterstand verfügbar. Verbrauch und verbleibende Schutzzeit werden nicht als null angenommen.</p><?php endif; ?>
+            <?php
+            $activePv = ($runtime['command_outstanding'] ?? false) === true || ($runtime['cycle_owned'] ?? false) === true;
+            $exhausted = false; $disabled = false;
+            foreach (['grid', 'battery'] as $source) {
+                $limit = $runtime[$source . '_limit_wh'] ?? null;
+                $remaining = $runtime[$source . '_remaining_wh'] ?? null;
+                if (!is_bool($limit) && is_numeric($limit) && is_finite((float)$limit)) {
+                    $disabled = $disabled || (float)$limit === 0.0;
+                    $exhausted = $exhausted || ((float)$limit > 0.0 && !is_bool($remaining)
+                        && is_numeric($remaining) && is_finite((float)$remaining) && (float)$remaining <= 0.0);
+                }
+            }
+            ?>
+            <?php if ($activePv && $exhausted): ?><p class="small text-warning fw-bold mb-1">Ein positives Wh-Kontingent ist verbraucht. Akku: keine weitere Akkuunterstützung; bei PV-Deckung läuft der Boost weiter. Netz: bei weiterem gemessenem WP-Netzbezug endet der Boost nach der Mindestlaufzeit, gegebenenfalls nach dem belegten Wallbox-Warten. Unabhängige Schutzabschaltungen bleiben bestehen.</p><?php endif; ?>
+            <?php if ($disabled): ?><p class="small text-muted mb-1">Ein Kontingent ist auf 0 gestellt: Aus dieser Quelle ist keine Unterstützung freigegeben. Das ist keine Meldung über verbrauchte Energie.</p><?php endif; ?>
+            <?php else: ?><p class="small text-muted mb-1">Kein frischer Stand der Wh-Kontingente verfügbar. Verbrauch und verbleibende Schutzzeit werden nicht als null angenommen.</p><?php endif; ?>
         </div>
         <?php endif; ?>
         <p class="small text-muted mb-0">Normale Heizung und Warmwasserbereitung bleiben unabhängig.</p>
@@ -6576,6 +6572,14 @@ async function readConfirmedConfigJson(response) {
             </summary>
             <div class="p-3">
 
+                <?php if (!$isLuxEnabled && $wp_type_val !== '2'): ?>
+                <div class="row g-2 mb-3" id="independentHeaterSettings">
+                    <div class="col-12"><strong>Heizstab / Zusatzverbraucher</strong><div class="small text-muted">Die Einrichtung benötigt kein WP-/Verbrauchslogging. Die Gerätefreigaben bleiben separat eingestellt.</div></div>
+                    <div class="col-md-4"><label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['heizstab'] ?? '') ?>">Heizstab aktiv</label><select name="values[heizstab]" class="form-select config-input"><option value="0" <?= $isTrue('heizstab') ? '' : 'selected' ?>>Aus</option><option value="1" <?= $isTrue('heizstab') ? 'selected' : '' ?>>Ein</option></select></div>
+                    <div class="col-md-4"><label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['heizstab_ip'] ?? '') ?>">Heizstab IP-Adresse</label><input name="values[heizstab_ip]" class="form-control config-input" value="<?= $val('heizstab_ip') ?>"></div>
+                    <div class="col-md-4"><label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['shelly_heiz_ip'] ?? '') ?>">Shelly-Heizverbraucher IP-Adresse</label><input name="values[shelly_heiz_ip]" class="form-control config-input" value="<?= $val('shelly_heiz_ip') ?>"></div>
+                </div>
+                <?php endif; ?>
                 <h6 class="text-muted small fw-bold mt-1 mb-2 border-bottom pb-1">Allgemeine Einstellungen</h6>
                 <div class="row g-2 mb-3">
                     <div class="col-md-6">
@@ -6599,7 +6603,7 @@ async function readConfirmedConfigJson(response) {
                                     : "Aus: keine Smart-Home-Erfassung und keine WP-Schaltbefehle.") ?>
                         </div>
                     </div>
-                    <?php if ($isLuxEnabled): ?>
+                    <?php if ($isLuxEnabled || $wp_type_val === '2'): ?>
                     <div class="col-md-6">
                         <div class="row g-2">
                             <div class="col-12">
@@ -7504,13 +7508,13 @@ async function readConfirmedConfigJson(response) {
                     <h6 class="small fw-bold mb-2">Luxtronik: PV-Automatik und Wolkenüberbrückung</h6>
                     <label class="config-label" for="conf_wp_pv_control_mode" data-tooltip="<?= htmlspecialchars($tooltipMap['wp_pv_control_mode'] ?? '') ?>">Betriebsart der PV-Regelung</label>
                     <select class="form-select config-input mb-2" id="conf_wp_pv_control_mode" name="values[wp_pv_control_mode]">
-                        <option value="measured" <?= $val('wp_pv_control_mode') === 'measured' ? 'selected' : '' ?>>Messwertgeführt: Istaufnahme und Wh-Wächter (empfohlen)</option>
+                        <option value="measured" <?= $val('wp_pv_control_mode') === 'measured' ? 'selected' : '' ?>>Messwertgeführt: Istaufnahme und Wh-Kontingente (empfohlen)</option>
                         <option value="reserved" <?= $val('wp_pv_control_mode') === 'reserved' ? 'selected' : '' ?>>Vollständige Vorreservierung (bisheriges Verhalten)</option>
                         <?php if (!in_array($val('wp_pv_control_mode'), ['measured', 'reserved'], true)): ?>
                         <option value="<?= $val('wp_pv_control_mode') ?>" selected>Ungültige gespeicherte Betriebsart – bitte auswählen</option>
                         <?php endif; ?>
                     </select>
-                    <p class="small text-muted mb-2" data-wp-mode-description>Vorhandene Werte bleiben erhalten. Messwertgeführt zählt die tatsächliche Überbrückung. Ein erreichter Wh-Wächter beendet den zusätzlichen Boost nach der geschützten Mindestlaufzeit; der Verbrauch bis dahin wird weitergezählt. Ausgeschlossene Quellen und Hardwaregrenzen bleiben vorrangig.</p>
+                    <p class="small text-muted mb-2" data-wp-mode-description>Vorhandene Werte bleiben erhalten. Messwertgeführt zählt die tatsächliche Überbrückung. Verbrauchte Wh-Kontingente sperren die Brücke. Bei PV-Deckung bleibt der Boost stehen. Im Messwertbetrieb schützt die Mindestlaufzeit beim Kontingentende und bei Unterstützung auf 0. Der Netzstopp greift bei mehr als 2.500 W WP-Netzanteil (ohne frische WP-Einzelmessung: gesamter Netzbezug abzüglich 200 W) über 30 Sekunden mit frischen Daten; Hausanschlussgrenzen wirken sofort. Eine Quelle auf 0 erlaubt keine zusätzliche Unterstützung.</p>
                     <div class="rounded bg-body-tertiary p-3 my-2" data-wp-measured-only <?= $val('wp_pv_control_mode') === 'measured' ? '' : 'hidden' ?>>
                         <label for="wpPvBridgePreset" class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['ui_wp_bridge_preset'] ?? '') ?>">Wolkenüberbrückung voreinstellen</label>
                         <?php
@@ -8942,12 +8946,13 @@ async function readConfirmedConfigJson(response) {
                                 <div class="row g-2">
                                     <div class="col-12">
                                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['ha_mode'] ?? '') ?>">Rolle</label>
-                                        <select class="form-select config-input" name="values[ha_mode]" onchange="if(this.value !== 'slave' && '<?= $isSlave ?>') { alert('Bitte speichere die Konfiguration, um die schreibgeschützten Felder für diese Rolle freizuschalten.'); }">
+                                        <select class="form-select config-input" name="values[ha_mode]" disabled aria-describedby="haRoleChangeHint">
                                             <option value="off" <?= ($haMode === 'off') ? 'selected' : '' ?>>Deaktiviert (Off)</option>
                                             <option value="master" <?= ($haMode === 'master') ? 'selected' : '' ?>>Master (Aktiv)</option>
                                             <option value="slave" <?= ($haMode === 'slave') ? 'selected' : '' ?>>Slave (Standby / Backup)</option>
                                             <option value="shadow" <?= ($haMode === 'shadow') ? 'selected' : '' ?>>Shadow (Simulation / Read-only)</option>
                                         </select>
+                                        <div id="haRoleChangeHint" class="small text-muted">Rollenwechsel nur über Konsole 49</div>
                                     </div>
                                     <div class="col-12">
                                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['ha_peer_ip'] ?? '') ?>">Partner-IP (Peer)</label>
@@ -9118,6 +9123,14 @@ async function readConfirmedConfigJson(response) {
                     <i class="fas fa-bolt me-1 text-warning"></i> E3DC-Control berücksichtigt Deinen Tarif bei Speicher-, Wallbox- und Wärmeplanung. Schutzgrenzen und Deine ausdrücklichen Freigaben haben immer Vorrang.
                 </div>
 
+                <div class="mb-3">
+                    <label class="config-label" for="conf_cost_accounting_quarterhour_enable" data-tooltip="<?= htmlspecialchars($tooltipMap['cost_accounting_quarterhour_enable'] ?? '') ?>">Kostenansicht je Viertelstunde (experimentell)</label>
+                    <select class="form-select config-input" name="values[cost_accounting_quarterhour_enable]" id="conf_cost_accounting_quarterhour_enable">
+                        <option value="0" <?= $val('cost_accounting_quarterhour_enable') !== '1' ? 'selected' : '' ?>>Aus (Standard)</option>
+                        <option value="1" <?= $val('cost_accounting_quarterhour_enable') === '1' ? 'selected' : '' ?>>Ein</option>
+                    </select>
+                    <div class="small text-muted">Speichert Preise ab dem Einschalten. Im Verlauf stehen Viertelstunden, Stunden und Tage zur Auswahl. Alte Werte bleiben bei Tarifwechsel erhalten. Der 30-Tage-Rückblick wird ausdrücklich über die Statistikwartung gestartet. Kein Dienstneustart erforderlich.</div>
+                </div>
                 <div class="row g-3 mb-3 border-bottom pb-3">
                     <div class="col-md-3">
                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['stromtarif_typ'] ?? '') ?>">Abrechnungs-Typ</label>
@@ -9156,6 +9169,7 @@ async function readConfirmedConfigJson(response) {
                     <div class="col-md-6" id="opt_price_special" style="display: <?= $showSpecialPrices ? 'block' : 'none' ?>;">
                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['strompreis_spezial'] ?? '') ?>">Spezialtarif-Zeitpreise</label>
                         <textarea name="values[strompreis_spezial]" class="form-control config-input" rows="3" placeholder="00:00 20&#10;04:00 40&#10;18:00 32"><?= htmlspecialchars($val('strompreis_spezial')) ?></textarea>
+                        <?= $configValidationMarker('strompreis_spezial') ?>
                         <div class="form-text text-muted small mt-1">Je Zeile oder mit Komma/Semikolon: Startzeit und Arbeitspreis in ct/kWh. Der Preis gilt bis zum nächsten Eintrag.</div>
                     </div>
                 </div>
@@ -13580,7 +13594,7 @@ async function readConfirmedConfigJson(response) {
                 <i class="fas fa-chevron-down"></i>
             </summary>
             <div class="p-3 border-top border-secondary-subtle">
-                <div class="alert alert-secondary small py-2 mb-3 mx-1"><i class="fas fa-info-circle me-1"></i><strong>Tipp:</strong> Lasse Felder leer, wenn du sie nicht benötigst. Sie werden dann automatisch aus der Datei gelöscht, um sie übersichtlich zu halten!</div>
+                <div class="alert alert-secondary small py-2 mb-3 mx-1"><i class="fas fa-info-circle me-1"></i><strong>Tipp:</strong> Nicht benötigte Felder leer lassen. Sie werden dann automatisch aus der Datei gelöscht, um sie übersichtlich zu halten!</div>
                 <?php foreach ($a9x_groups as $title) { $renderGroup($title, $groups[$title]); } ?>
             </div>
         </details>
@@ -13695,8 +13709,9 @@ async function readConfirmedConfigJson(response) {
             </div>
             <div class="modal-body p-4">
                 <p class="small text-muted mb-3">
-                    Diese Konfiguration aktiviert Funktionen, deren Dienst fehlt, gestoppt/deaktiviert ist oder wegen geänderter Einstellungen neu gestartet werden muss. Nach deiner Bestätigung aktualisiert die Installationszentrale die betroffenen Dienste automatisch.
+                    Diese Konfiguration aktiviert Funktionen, deren Dienst fehlt, gestoppt/deaktiviert ist oder wegen geänderter Einstellungen neu gestartet werden muss. Nach der Bestätigung richtet die Installationszentrale die betroffenen Dienste automatisch ein.
                 </p>
+                <div class="small text-muted mb-2" id="configAutoInstallPreviewNote">Vorschau vor dem Speichern. Der Einrichtungsplan wird mit dem gespeicherten Stand neu berechnet.</div>
                 <ul class="small mb-3" id="configAutoInstallList"></ul>
                 <div class="alert alert-warning border-0 small mb-0">
                     Bitte nur bestätigen, wenn die Geräte korrekt eingetragen sind und keine parallele Fremdsteuerung dieselbe Funktion übernimmt.
@@ -13704,7 +13719,7 @@ async function readConfirmedConfigJson(response) {
             </div>
             <div class="modal-footer border-secondary">
                 <button type="button" class="btn btn-secondary" id="configAutoInstallSkipButton">Nur speichern</button>
-                <button type="button" class="btn btn-info text-dark fw-bold" id="configAutoInstallConfirmButton">Speichern und Dienste aktualisieren</button>
+                <button type="button" class="btn btn-info text-dark fw-bold" id="configAutoInstallConfirmButton">Speichern und in der Installationszentrale einrichten</button>
             </div>
         </div>
     </div>
@@ -13814,6 +13829,7 @@ foreach (e3dc_config_auto_install_known_modules() as $module => $info) {
         'state' => $state,
         'config_keys' => $info['config_keys'] ?? [],
         'when' => $info['when'] ?? [],
+        'system_update_only' => !empty($info['system_update_only']),
     ];
     foreach ((array)($info['config_keys'] ?? []) as $key) {
         $configAutoInstallKeys[] = (string)$key;
@@ -13826,6 +13842,25 @@ foreach (array_unique($configAutoInstallKeys) as $key) {
 ?>
 const CONFIG_AUTO_INSTALL_MODULES = <?= json_encode($configAutoInstallCatalog, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT) ?>;
 const CONFIG_AUTO_INSTALL_BASELINE = <?= json_encode($configAutoInstallBaseline, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT) ?>;
+</script>
+<script>
+const CONFIG_IMPORT_AUTO_INSTALL = <?= json_encode($configImportAutoInstallCandidates ?: $configSavedAutoInstallCandidates, JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT) ?>;
+document.addEventListener('DOMContentLoaded', () => {
+    const candidates = Object.entries(CONFIG_IMPORT_AUTO_INSTALL || {}).map(([module, meta]) => ({module, label: meta.label || module, service: meta.service || '', reason: meta.action_label || configAutoInstallReason({...meta, installed: Boolean(meta.state?.exists), active: Boolean(meta.state?.active), enabled: Boolean(meta.state?.enabled)}, Boolean(meta.config_changed))}));
+    if (!candidates.length) return;
+    showConfigAutoInstallModal(candidates, () => {
+        const form = document.createElement('form');
+        form.method = 'POST';
+        const add = (name, value) => {
+            const input = document.createElement('input');
+            input.type = 'hidden'; input.name = name; input.value = value; form.appendChild(input);
+        };
+        add('config_action', 'apply_import_modules');
+        for (const item of candidates) add('import_modules[]', item.module);
+        add('csrf_token', <?= json_encode(e3dcCsrfToken(), JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT) ?>);
+        document.body.appendChild(form); form.submit();
+    }, () => {}, false);
+});
 const CONFIG_AUTO_INSTALL_DOCKER = <?= e3dc_config_auto_install_is_docker() ? 'true' : 'false' ?>;
 const CONFIG_SETTING_REQUIREMENTS = <?= json_encode($configSettingRequirements, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT) ?>;
 const CONFIG_REQUIREMENT_BASELINE = <?= json_encode($configRequirementBaseline, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT) ?>;
@@ -14027,7 +14062,7 @@ function initHeatpumpPvControls() {
         box.querySelectorAll('[data-wp-measured-only]').forEach(element => { element.hidden = !measured; });
         const description = box.querySelector('[data-wp-mode-description]');
         if (description) description.textContent = measured
-            ? 'Nach dem Start zählt die Istaufnahme. Ein erreichter Wh-Wächter beendet den zusätzlichen Boost nach der geschützten Mindestlaufzeit; Verbrauch und Überschreitung werden weitergezählt. 0 bei einer Quelle bleibt eine Sperre.'
+            ? 'Nach dem Start zählt die Istaufnahme. Verbrauchte Wh-Kontingente sperren die Brücke; der Boost läuft mit PV weiter. Nur weiter bestehender gemessener WP-Netzbezug kann nach verbrauchtem positivem Netzkontingent das Ende auslösen. Im Messwertbetrieb schützt die Mindestlaufzeit beim Kontingentende und bei Unterstützung auf 0. Der Netzstopp greift bei mehr als 2.500 W WP-Netzanteil (ohne frische WP-Einzelmessung: gesamter Netzbezug abzüglich 200 W) über 30 Sekunden mit frischen Daten; Hausanschlussgrenzen wirken sofort. 0 sperrt die Unterstützung aus dieser Quelle.'
             : 'Die vollständige Vorreservierung behält die bisherigen Quellen- und Energiezusagen. Der Wechsel zu „Messwertgeführt“ erhält die eingetragenen Werte, erlaubt aber einen gezählten Wh-Überlauf zum Schutz der Mindestlaufzeit.';
         const values = presetValues();
         if (!preview) return;
@@ -14132,13 +14167,15 @@ function collectConfigAutoInstallModules(form) {
     return selected;
 }
 
-function showConfigAutoInstallModal(modules, submitWithInstall, submitWithoutInstall) {
+function showConfigAutoInstallModal(modules, submitWithInstall, submitWithoutInstall, preview = true) {
+    const note = document.getElementById('configAutoInstallPreviewNote');
+    if (note) note.textContent = preview ? 'Vorschau vor dem Speichern. Der Einrichtungsplan wird mit dem gespeicherten Stand neu berechnet.' : 'Dienstzustände nach dem Speichern; vor der Einrichtung nochmals prüfen.';
     const modalEl = document.getElementById('configAutoInstallModal');
     const listEl = document.getElementById('configAutoInstallList');
     const confirmBtn = document.getElementById('configAutoInstallConfirmButton');
     const skipBtn = document.getElementById('configAutoInstallSkipButton');
     if (!modalEl || !listEl || !confirmBtn || !skipBtn || !window.bootstrap) {
-        const lines = modules.map((item) => `- ${item.label}${item.reason ? ` (${item.reason})` : ''}`).join('\n');
+        const lines = modules.map((item) => `- ${item.label}${CONFIG_AUTO_INSTALL_MODULES[item.module]?.system_update_only ? ' (Hinweis: Einrichtung über Konsole 49 bzw. das Systemupdate)' : (item.reason ? ` (${item.reason})` : '')}`).join('\n');
         if (window.confirm(`Folgende Dienste müssen installiert, aktiviert, gestartet oder neu gestartet werden:\n${lines}\n\nJetzt aktualisieren?`)) {
             submitWithInstall();
         } else {
@@ -14154,7 +14191,7 @@ function showConfigAutoInstallModal(modules, submitWithInstall, submitWithoutIns
         const service = String(item.service || '').replace(/[&<>"']/g, (c) => ({
             '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
         }[c]));
-        const reason = String(item.reason || '').replace(/[&<>"']/g, (c) => ({
+        const reason = String(CONFIG_AUTO_INSTALL_MODULES[item.module]?.system_update_only ? 'Hinweis: Einrichtung über Konsole 49 bzw. das Systemupdate; hier wird kein Modulauftrag ausgeführt.' : (item.reason || '')).replace(/[&<>"']/g, (c) => ({
             '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
         }[c]));
         return `<li><strong>${label}</strong>${service ? ` <span class="text-muted">(${service})</span>` : ''}${reason ? ` <span class="text-info">- ${reason}</span>` : ''}</li>`;
@@ -14195,6 +14232,12 @@ function submitConfigEditorForm(form, nativeSubmit) {
             showConfigAutoInstallModal(
                 missingModules,
                 () => {
+                    form.querySelectorAll('[name="config_auto_install_modules[]"]').forEach(input => input.remove());
+                    for (const item of missingModules) {
+                        const input = document.createElement('input');
+                        input.type = 'hidden'; input.name = 'config_auto_install_modules[]'; input.value = item.module;
+                        form.appendChild(input);
+                    }
                     confirmInput.value = '1';
                     submitNative();
                 },
@@ -15301,8 +15344,15 @@ function storageCurvePreviewInput(key) {
 function storageCurvePreviewNumber(key, fallback) {
     const el = storageCurvePreviewInput(key);
     if (!el) return fallback;
-    const value = Number(String(el.value || '').trim().replace(',', '.'));
+    const raw = String(el.value ?? '').trim();
+    const value = Number(raw.replace(',', '.'));
     return Number.isFinite(value) ? value : fallback;
+}
+
+function marketPathPreviewNumber(key, fallback) {
+    const el = storageCurvePreviewInput(key);
+    if (el && String(el.value ?? '').trim() === '') return fallback;
+    return storageCurvePreviewNumber(key, fallback);
 }
 
 function storageCurvePreviewFieldValue(key, fallback = '') {
@@ -15430,29 +15480,37 @@ function marketChargeProfileValue() {
     return Object.prototype.hasOwnProperty.call(MARKET_CHARGE_PROFILE_PRESETS, raw) ? raw : 'economic';
 }
 
+function marketSpecialTariffStages() {
+    const raw = storageCurvePreviewFieldValue('strompreis_spezial', '').trim();
+    if (!raw) return null;
+    const re = /(^|[^\d])([0-2]?\d)(?:[:.](\d{1,2}))?\s+(-?\d+(?:[,.]\d+)?)/g;
+    const entries = new Map();
+    for (const m of raw.matchAll(re)) {
+        const hour = Number(m[2]), minute = Number(m[3] || 0);
+        const price = Number(m[4].replace(',', '.'));
+        if (hour > 23 || minute > 59 || !Number.isFinite(price)) return null;
+        const start = hour * 60 + minute;
+        if (entries.has(start) && entries.get(start) !== price) return null;
+        entries.set(start, price);
+    }
+    if (!entries.size || raw.replace(re, '$1').replace(/[\s;,]/g, '') !== '') return null;
+    return Array.from(entries).sort((a, b) => a[0] - b[0]);
+}
+
 function marketTariffMeanPriceCt() {
     // Octopus Heat: feste Fenster 02–06 h und 12–16 h günstig (8 h), 18–21 h teuer (3 h), sonst Basis (13 h).
     const tariffInput = document.querySelector('[name="values[stromtarif_typ]"]');
     const tariff = String(tariffInput ? tariffInput.value : 'static').trim().toLowerCase();
-    const basis = Math.max(0, storageCurvePreviewNumber('strompreis_basis', 25));
+    const basis = marketPathPreviewNumber('strompreis_basis', null);
     if (tariff === 'octopus_heat') {
-        const cheap = Math.max(0, storageCurvePreviewNumber('strompreis_cheap', basis));
-        const uht = Math.max(0, storageCurvePreviewNumber('strompreis_uht', Math.max(basis, cheap)));
+        const cheap = marketPathPreviewNumber('strompreis_cheap', null);
+        const uht = marketPathPreviewNumber('strompreis_uht', null);
+        if ([basis, cheap, uht].some(value => value === null)) return null;
         return Math.round(((cheap * 8) + (basis * 13) + (uht * 3)) / 24 * 10) / 10;
     }
     if (['special', 'spezial', 'special_tariff'].includes(tariff)) {
-        // Spezialtarif: Tagesplan 'HH[:MM] Preis' – zeitgewichteter Mittelwert über 24 h.
-        const raw = String(storageCurvePreviewFieldValue('strompreis_spezial', '') || '');
-        const entries = [];
-        const re = /(?:^|[^\d])([0-2]?\d)(?:[:.](\d{1,2}))?\s+(-?\d+(?:[,.]\d+)?)/g;
-        let m;
-        while ((m = re.exec(raw)) !== null) {
-            const minute = (Number(m[1]) % 24) * 60 + Number(m[2] || 0);
-            const price = Number(String(m[3]).replace(',', '.'));
-            if (Number.isFinite(price)) entries.push([minute, price]);
-        }
-        if (!entries.length) return null;
-        entries.sort((a, b) => a[0] - b[0]);
+        const entries = marketSpecialTariffStages();
+        if (!entries) return null;
         let total = 0;
         for (let i = 0; i < entries.length; i++) {
             const start = entries[i][0];
@@ -15554,48 +15612,53 @@ function updateMarketPathPreview() {
         && !lowAction && !normalAction && !highAction
     ) return;
 
-    const directEfficiency = storageCurvePreviewNumber('direct_marketing_roundtrip_efficiency_pct', 85);
+    const directEfficiency = marketPathPreviewNumber('direct_marketing_roundtrip_efficiency_pct', 85);
     const efficiency = storageCurvePreviewClamp(
-        storageCurvePreviewNumber('market_roundtrip_efficiency_pct', directEfficiency),
+        marketPathPreviewNumber('market_roundtrip_efficiency_pct', directEfficiency),
         1,
         100
     );
-    const directDegradation = storageCurvePreviewNumber('direct_marketing_degradation_ct_per_kwh', 4);
-    const degradation = Math.max(0, storageCurvePreviewNumber('market_degradation_ct_per_kwh', directDegradation));
+    const directDegradation = marketPathPreviewNumber('direct_marketing_degradation_ct_per_kwh', 4);
+    const degradation = Math.max(0, marketPathPreviewNumber('market_degradation_ct_per_kwh', directDegradation));
     // Marge/Sicherheit aus der Preset-Tabelle (nicht aus den Feldern, außer custom).
     const chargeProfile = marketChargeProfileValue();
     const chargePreset = MARKET_CHARGE_PROFILE_PRESETS[chargeProfile];
     const safety = chargePreset.safety === null
-        ? storageCurvePreviewClamp(storageCurvePreviewNumber('market_safety_correction_ct_per_kwh', 0), -10, 50)
+        ? storageCurvePreviewClamp(marketPathPreviewNumber('market_safety_correction_ct_per_kwh', 0), -10, 50)
         : chargePreset.safety;
     const margin = chargePreset.margin === null
-        ? Math.max(0, storageCurvePreviewNumber('market_min_margin_pct', 10))
+        ? Math.max(0, marketPathPreviewNumber('market_min_margin_pct', 10))
         : chargePreset.margin;
     const isComfortProfile = chargeProfile === 'comfort';
     const autarkyFirst = !isComfortProfile;
-    const comfortMaxSoc = storageCurvePreviewClamp(storageCurvePreviewNumber('cheap_grid_battery_max_soc', 80), 0, 100);
-    const configuredPriceLimit = storageCurvePreviewNumber('market_price_limit_ct', 0);
+    const comfortMaxSoc = storageCurvePreviewClamp(marketPathPreviewNumber('cheap_grid_battery_max_soc', 80), 0, 100);
+    const configuredPriceLimit = marketPathPreviewNumber('market_price_limit_ct', 0);
     const tariffMeanPrice = marketTariffMeanPriceCt();
     const comfortPriceLimit = configuredPriceLimit > 0 ? configuredPriceLimit : tariffMeanPrice;
-    const autarkyLowSoc = storageCurvePreviewClamp(storageCurvePreviewNumber('market_autarky_low_soc_pct', 20), 0, 100);
-    const autarkyBufferWh = Math.max(0, storageCurvePreviewNumber('market_autarky_horizon_buffer_wh', 500));
+    const autarkyLowSoc = storageCurvePreviewClamp(marketPathPreviewNumber('market_autarky_low_soc_pct', 20), 0, 100);
+    const autarkyBufferWh = Math.max(0, marketPathPreviewNumber('market_autarky_horizon_buffer_wh', 500));
     const safetyPrefix = safety > 0 ? '+ ' : (safety < 0 ? '- ' : '± ');
     const tariffInput = document.querySelector('[name="values[stromtarif_typ]"]');
     const tariff = String(tariffInput ? tariffInput.value : 'static').trim().toLowerCase();
-    const basis = Math.max(0, storageCurvePreviewNumber('strompreis_basis', 25));
-    const cheap = Math.max(0, storageCurvePreviewNumber('strompreis_cheap', basis));
-    const special = Math.max(0, storageCurvePreviewNumber('strompreis_spezial', cheap));
-    const uht = Math.max(0, storageCurvePreviewNumber('strompreis_uht', Math.max(basis, cheap)));
-    const lowPrice = tariff === 'special' || tariff === 'spezial' || tariff === 'special_tariff' ? special : cheap;
+    const specialTariff = ['special', 'spezial', 'special_tariff'].includes(tariff);
+    const stages = specialTariff ? marketSpecialTariffStages() : null;
+    const stagePrices = stages ? Array.from(new Set(stages.map(entry => entry[1]))).sort((a, b) => a - b) : [];
+    const basis = specialTariff ? (stagePrices[1] ?? stagePrices[0] ?? null) : marketPathPreviewNumber('strompreis_basis', null);
+    const cheap = specialTariff ? (stagePrices[0] ?? null) : marketPathPreviewNumber('strompreis_cheap', null);
+    const uht = specialTariff ? (stagePrices[stagePrices.length - 1] ?? null) : marketPathPreviewNumber('strompreis_uht', null);
+    const lowPrice = cheap;
     const factor = 100 / efficiency;
-    const marginFactor = 1 + (margin / 100);
-    const lowThreshold = Math.max(0, ((lowPrice * factor) + degradation + safety) * marginFactor);
-    const normalThreshold = Math.max(0, ((basis * factor) + degradation + safety) * marginFactor);
+    const spreadMin = ['balanced', 'comfort'].includes(chargeProfile) ? 0 : Math.max(0, marketPathPreviewNumber('market_profit_hold_ct_per_kwh', marketPathPreviewNumber('direct_marketing_profit_hold_ct_per_kwh', 0.5)));
+    const lowCost = lowPrice === null ? null : (lowPrice * factor) + degradation + safety;
+    const lowThreshold = lowCost === null ? null : lowCost + Math.max(spreadMin, Math.max(1, Math.abs(lowCost)) * margin / 100);
+    const normalCost = basis === null ? null : (basis * factor) + degradation + safety;
+    const normalThreshold = normalCost === null ? null : normalCost + Math.max(spreadMin, Math.max(1, Math.abs(normalCost)) * margin / 100);
     const lowHoldThreshold = Math.max(0, lowPrice + safety);
     const normalHoldThreshold = Math.max(0, basis + safety);
-    const laterFixedReference = Math.max(lowPrice, basis, uht);
-    const lowCanGridChargeAtHigh = laterFixedReference >= lowThreshold;
-    const normalCanBuyAtHigh = uht >= normalThreshold;
+    const pricesKnown = [lowPrice, basis, uht].every(value => value !== null);
+    const laterFixedReference = pricesKnown ? Math.max(lowPrice, basis, uht) : null;
+    const lowCanGridChargeAtHigh = pricesKnown && laterFixedReference >= lowThreshold;
+    const normalCanBuyAtHigh = pricesKnown && laterFixedReference >= normalThreshold;
 
     const autarkyText = autarkyFirst
         ? `PV-autark zuerst blockiert den normalen Marktpfad, solange Speicher plus erwartete PV den Horizont mit ${marketPathPreviewFormat(autarkyBufferWh, 0)} Wh Puffer decken; Ausnahme ab ${marketPathPreviewFormat(autarkyLowSoc, 1)} % SOC. `
@@ -15636,6 +15699,36 @@ function updateMarketPathPreview() {
         if (lowLabel) lowLabel.textContent = isOctopus ? 'LT / günstig' : 'Spezial / günstig';
         if (normalLabel) normalLabel.textContent = isOctopus ? 'Normalpreis' : 'Normalfenster';
         if (highLabel) highLabel.textContent = isOctopus ? 'Teuer / später' : 'Vergleich später';
+        if (!pricesKnown || lowPrice === laterFixedReference) {
+            const detail = !pricesKnown
+                ? 'Tarifpreise nicht gesetzt oder Tagesplan ungültig: kein Netzladen.'
+                : 'Einheitlicher Tarifpreis: kein günstiges Preisfenster.';
+            if (lowAction) lowAction.textContent = 'kein Netzladen';
+            if (normalAction) normalAction.textContent = 'kein Netzladen';
+            if (lowDetail) lowDetail.textContent = detail;
+            if (normalDetail) normalDetail.textContent = detail;
+            if (highDetail) highDetail.textContent = pricesKnown ? `Tarifpreis ${marketPathPreviewFormat(lowPrice, 1)} ct/kWh.` : 'Späterer Bezug nicht gesetzt.';
+            return;
+        }
+        if (highDetail) highDetail.textContent = `Späterer Bezug: höchste Tarifstufe ${marketPathPreviewFormat(laterFixedReference, 1)} ct/kWh im wiederkehrenden Tagesplan.`;
+        if (isSpecial && normalLabel) normalLabel.textContent = stagePrices.length > 2 ? 'Zwischenstufe' : 'Teure Stufe';
+        // Jede Zwischenstufe wird gegen die höchste spätere Stufe bewertet.
+        if (isSpecial && stagePrices.length > 3) {
+            if (normalLabel) normalLabel.textContent = 'Zwischenstufen';
+            const intermediateDetails = stagePrices.slice(1, -1).map(price => {
+                const cost = price * factor + degradation + safety;
+                const threshold = cost + Math.max(spreadMin, Math.max(1, Math.abs(cost)) * margin / 100);
+                const canCharge = isComfortProfile
+                    ? comfortPriceLimit !== null && price <= comfortPriceLimit + 0.001
+                    : laterFixedReference >= threshold;
+                const detail = isComfortProfile
+                    ? `Preislimit ${comfortPriceLimit === null ? '?' : marketPathPreviewFormat(comfortPriceLimit, 1)} ct/kWh`
+                    : `Schwelle ${marketPathPreviewFormat(threshold, 1)} ct/kWh`;
+                return `${marketPathPreviewFormat(price, 1)} ct/kWh: ${canCharge ? 'Netzladen möglich' : 'kein Netzladen'} (${detail})`;
+            });
+            if (normalAction) normalAction.textContent = 'je Tarifsegment';
+            if (normalDetail) normalDetail.textContent = intermediateDetails.join('; ') + '. Freigaben bleiben maßgeblich. Wirtschaftlich und ausgeglichen benötigen Prognosebedarf; Komfort lädt bis zum Ziel am Segmentende.';
+        }
         if (isComfortProfile) {
             // Komfort: Laden im Preisfenster (Slots <= Limit) bis zum Ziel am Fensterende, kein Defizit nötig.
             const limitKnown = comfortPriceLimit !== null;
@@ -15647,8 +15740,8 @@ function updateMarketPathPreview() {
                     ? `Laden im Preisfenster ≤ ${marketPathPreviewFormat(comfortPriceLimit, 1)} ct/kWh bis min(Ladeziel, Speicher max. ${marketPathPreviewFormat(comfortMaxSoc, 0)} %) zum Fensterende; PV zuerst, kein Prognosedefizit nötig.`
                     : (limitKnown ? `${marketPathPreviewFormat(lowPrice, 1)} > ${marketPathPreviewFormat(comfortPriceLimit, 1)} ct/kWh: kein Laden – Limit liegt unter dem günstigsten Tarifpreis.` : 'Preislimit unbekannt: kein Laden.');
             }
-            if (normalAction) normalAction.textContent = normalInWindow ? 'laden bis Ziel' : 'halten';
-            if (normalDetail) {
+            if (!(isSpecial && stagePrices.length > 3) && normalAction) normalAction.textContent = normalInWindow ? 'laden bis Ziel' : 'halten';
+            if (!(isSpecial && stagePrices.length > 3) && normalDetail) {
                 normalDetail.textContent = normalInWindow
                     ? `${marketPathPreviewFormat(basis, 1)} ≤ ${marketPathPreviewFormat(comfortPriceLimit, 1)} ct/kWh: Laden auch zu Normalpreis-Stunden (Limit prüfen).`
                     : `${marketPathPreviewFormat(basis, 1)} > ${limitKnown ? marketPathPreviewFormat(comfortPriceLimit, 1) : '?'} ct/kWh: kein Laden. Halten, wenn späterer Bezug > ${marketPathPreviewFormat(normalHoldThreshold, 1)} ct/kWh.`;
@@ -15661,11 +15754,11 @@ function updateMarketPathPreview() {
                 ? `Halten, wenn späterer Bezug > ${marketPathPreviewFormat(lowHoldThreshold, 1)} ct/kWh. Netzladen, wenn späterer Bezug > ${marketPathPreviewFormat(lowThreshold, 1)} ct/kWh und Prognosedefizit.`
                 : `Halten, wenn späterer Bezug > ${marketPathPreviewFormat(lowHoldThreshold, 1)} ct/kWh. Kein Netzladen: max. späterer Bezug ${marketPathPreviewFormat(laterFixedReference, 1)} ct/kWh < Schwelle ${marketPathPreviewFormat(lowThreshold, 1)} ct/kWh.`;
         }
-        if (normalAction) normalAction.textContent = normalCanBuyAtHigh ? 'halten / laden' : 'halten';
-        if (normalDetail) {
+        if (!(isSpecial && stagePrices.length > 3) && normalAction) normalAction.textContent = normalCanBuyAtHigh ? 'halten / laden' : 'halten';
+        if (!(isSpecial && stagePrices.length > 3) && normalDetail) {
             normalDetail.textContent = normalCanBuyAtHigh
                 ? `Halten, wenn späterer Bezug > ${marketPathPreviewFormat(normalHoldThreshold, 1)} ct/kWh. Netzladen, wenn späterer Bezug > ${marketPathPreviewFormat(normalThreshold, 1)} ct/kWh.`
-                : `Halten, wenn späterer Bezug > ${marketPathPreviewFormat(normalHoldThreshold, 1)} ct/kWh. Kein Netzladen: UHT ${marketPathPreviewFormat(uht, 1)} ct/kWh < Schwelle ${marketPathPreviewFormat(normalThreshold, 1)} ct/kWh.`;
+                : `Halten, wenn späterer Bezug > ${marketPathPreviewFormat(normalHoldThreshold, 1)} ct/kWh. Kein Netzladen: späterer Bezug ${marketPathPreviewFormat(laterFixedReference, 1)} ct/kWh < Schwelle ${marketPathPreviewFormat(normalThreshold, 1)} ct/kWh.`;
         }
         return;
     }

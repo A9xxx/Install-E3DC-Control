@@ -1,4 +1,5 @@
 import json
+import re
 import hashlib
 import os
 import pwd
@@ -1088,6 +1089,11 @@ def get_venv_name():
     """Liest den venv-Namen nur aus dem lokalen, nicht web-schreibbaren Anker."""
 
     default = ".venv_e3dc"
+    if os.environ.get("E3DC_MODULE_VENV_NAME") and _bound_download_bootstrap_authority() is not None:
+        name = str(os.environ["E3DC_MODULE_VENV_NAME"]).strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or name in {".", ".."}:
+            raise RuntimeError("Gebundener Bootstrap-venv-Name ist ungültig")
+        return name
     data, snapshot = _read_json_snapshot_nofollow(
         CONFIG_FILE,
         allow_missing=True,

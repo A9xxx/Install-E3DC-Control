@@ -142,7 +142,10 @@ def house_power_excluding_wallbox_w(live: Dict[str, Any], wallbox_w: float) -> f
     if raw_total_w is None:
         return direct_home_w
 
-    raw_home_w = max(0.0, raw_total_w - wallbox_w)
+    # Die Bilanz enthält die im Lesepfad bereits herausgerechnete WP noch.
+    # Auch der Rückfall muss dieselbe Hausbasis ohne diesen Anteil liefern.
+    split_wp_w = max(0.0, safe_float(live.get("WP_Power"), 0.0)) if live.get("Home_Includes_WP") is True else 0.0
+    raw_home_w = max(0.0, raw_total_w - wallbox_w - split_wp_w)
     if direct_home_w > 250.0:
         return direct_home_w
     if raw_home_w <= 0.0:
@@ -186,22 +189,25 @@ def smooth_house_heatpump_discharge_cap_w(
     return max(0, min(current_cap_w, prev_cap_w + step_w))
 
 
+def house_heatpump_load_w(live: Dict[str, Any], wallbox_w: float) -> float:
+    """Haus einschließlich WP, ohne Wallbox; Heizstab und Klima bleiben im Haus.
+
+    Der Verbraucher-Lesepfad liefert Home_Power ohne WP (herausgerechnet
+    oder separat gemessen). Zusatzleistung ist keine weitere WP-Messung.
+    """
+    home_w = house_power_excluding_wallbox_w(live, wallbox_w)
+    wp_w = max(0.0, safe_float(live.get("WP_Power", live.get("Heatpump_Power")), 0.0))
+    return home_w + wp_w
+
+
 def house_heatpump_discharge_cap_w(
     live: Dict[str, Any],
     wallbox_w: float,
     max_discharge_w: int,
 ) -> int:
-    """Allow only the PV-uncovered house/heat-pump deficit, excluding wallbox load."""
+    """Entladung nur für das ungedeckte Haus samt WP, ohne Wallboxlast."""
     pv_w = max(0, safe_int(live.get("PV_Power"), 0))
-    home_w = max(0, int(round(house_power_excluding_wallbox_w(live, wallbox_w))))
-    wp_w = max(
-        0,
-        safe_int(
-            live.get("WP_Power", live.get("heizstab_power", live.get("Heizstab_Power"))),
-            0,
-        ),
-    )
-    deficit_w = max(0, home_w + wp_w - pv_w)
+    deficit_w = max(0, int(round(house_heatpump_load_w(live, wallbox_w))) - pv_w)
     return max(0, min(max_discharge_w, deficit_w))
 
 
@@ -1400,7 +1406,13 @@ def stabilize_predump_request(
     pv_w = max(0, safe_int(live.get("PV_Power"), 0))
     grid_w = safe_int(live.get("Grid_Power"), 0)
     grid_ema_w = safe_int(live.get("Grid_EMA_W", grid_w), grid_w)
-    home_w = max(0, safe_int(live.get("Home_Power"), 0))
+    wallbox_w = int(abs(safe_float(live.get("Wallbox_Power"), 0.0)))
+    # Nur die freigegebene Wallbox wird separat ergänzt. Ihr eingebetteter
+    # Anteil muss vorher aus dem Hauswert entfernt werden.
+    home_w = (
+        max(0, int(round(house_power_excluding_wallbox_w(live, wallbox_w))))
+        if allow.get("wallbox") else max(0, safe_int(live.get("Home_Power"), 0))
+    )
     battery_discharge_w = max(0, -safe_int(live.get("Battery_Power"), 0))
     guarded_home_w, home_guard = predump_guarded_home_load_w(
         cfg,
@@ -1411,14 +1423,10 @@ def stabilize_predump_request(
         battery_discharge_w=battery_discharge_w,
     )
     wp_w = max(0, safe_int(live.get("WP_Power", live.get("Heatpump_Power")), 0))
-    wallbox_w = int(abs(safe_float(live.get("Wallbox_Power"), 0.0)))
-    heater_w = max(0, safe_int(live.get("heizstab_power", live.get("Heizstab_Power")), 0))
-
     local_load_w = guarded_home_w + wp_w
     if allow.get("wallbox"):
         local_load_w += wallbox_w
-    if allow.get("heater"):
-        local_load_w += heater_w
+    # Heizstab, Klima und weitere Hauslasten sind bereits im Hauswert enthalten.
 
     natural_discharge_w = max(0, local_load_w - pv_w)
     grid_deadband_w = max(0, safe_int(cfg.get("predump_pause_grid_guard_w"), 120))

@@ -1,6 +1,7 @@
 <?php
 // get_live_json.php
 require_once 'helpers.php';
+require_once __DIR__ . '/heatpump_season.php';
 
 function liveCloseSessionLock() {
     if (session_status() === PHP_SESSION_ACTIVE) {
@@ -270,7 +271,8 @@ if (
 ) {
     liveCloseSessionLock();
     $dayStartMsRaw = $_GET['day_start_ms'] ?? null;
-    if (!is_numeric($dayStartMsRaw)) {
+    $dayStartMs = e3dcTimestampMs($dayStartMsRaw);
+    if ($dayStartMs === null) {
         http_response_code(400);
         echo json_encode([
             'success' => false,
@@ -280,7 +282,6 @@ if (
         exit;
     }
 
-    $dayStartMs = (int)round((float)$dayStartMsRaw);
     $dayStartS = (int)floor($dayStartMs / 1000);
     // Der nächste lokale Kalendertag kann bei einer Zeitumstellung 23 oder
     // 25 Stunden entfernt liegen. Ein starres 24-h-Fenster würde dabei
@@ -3404,7 +3405,7 @@ function liveTrajectoryCanonicalize($value) {
 }
 
 function liveTrajectoryCanonicalJson($value) {
-    return json_encode(
+    return e3dcTimestampCanonicalJson(
         liveTrajectoryCanonicalize($value),
         JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION
     );
@@ -3428,7 +3429,7 @@ function livePlanCanonicalizePreservingObjects($value) {
 }
 
 function livePlanCanonicalJsonPreservingObjects($value) {
-    return json_encode(
+    return e3dcTimestampCanonicalJson(
         livePlanCanonicalizePreservingObjects($value),
         JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION
     );
@@ -3440,11 +3441,12 @@ function liveStorageSha256Identity($value) {
 }
 
 function liveStorageFiniteNumber($value) {
-    if (is_bool($value) || $value === null) return null;
-    if (is_string($value) && trim($value) === '') return null;
-    if (!is_numeric($value)) return null;
-    $number = (float)$value;
-    return is_finite($number) ? $number : null;
+    return e3dcFiniteNumber($value);
+}
+
+function liveStorageTimestampMs($value) {
+    $number = e3dcTimestampMs($value);
+    return $number === null ? null : (float)$number;
 }
 
 function liveStorageProjectedEndSoc($plan, $lastProjectedSoc) {
@@ -3498,8 +3500,8 @@ function liveStorageCanonicalDisplayDay($plan, $timezoneName = 'Europe/Berlin', 
             $axisInvalid = true;
             continue;
         }
-        $startTsMs = liveStorageFiniteNumber($slot['start_ts_ms'] ?? null);
-        $endTsMs = liveStorageFiniteNumber($slot['end_ts_ms'] ?? null);
+        $startTsMs = liveStorageTimestampMs($slot['start_ts_ms'] ?? null);
+        $endTsMs = liveStorageTimestampMs($slot['end_ts_ms'] ?? null);
         $slotId = $slot['slot_id'] ?? null;
         if ($startTsMs === null
             || $startTsMs <= 0
@@ -3630,8 +3632,8 @@ function liveStorageStateCurveBinding($plan, $state, $displayDay) {
     if (!$curveBound || (!$topLevelBound && $statePlanId !== null && $statePlanId !== '')) {
         return $pending;
     }
-    $curveDayStart = liveStorageFiniteNumber($curve['day_start_ts'] ?? null);
-    $expectedDayStart = liveStorageFiniteNumber($displayDay['display_day_start_ts_ms'] ?? null);
+    $curveDayStart = liveStorageTimestampMs($curve['day_start_ts'] ?? null);
+    $expectedDayStart = liveStorageTimestampMs($displayDay['display_day_start_ts_ms'] ?? null);
     if ($curveDayStart === null || $expectedDayStart === null
         || abs($curveDayStart - $expectedDayStart) > 1.0) {
         return $pending;
@@ -3689,9 +3691,9 @@ function liveStorageSimCurveContract($plan, $displayDay, $stateBinding) {
     $canonicalPoints = [];
     foreach ($plan['slots'] as $slot) {
         if (!is_array($slot)) continue;
-        $startTsMs = liveStorageFiniteNumber($slot['start_ts_ms'] ?? null);
+        $startTsMs = liveStorageTimestampMs($slot['start_ts_ms'] ?? null);
         if ($startTsMs === null || $startTsMs < $dayStartMs || $startTsMs >= $dayEndMs) continue;
-        $endTsMs = liveStorageFiniteNumber($slot['end_ts_ms'] ?? null);
+        $endTsMs = liveStorageTimestampMs($slot['end_ts_ms'] ?? null);
         $slotId = $slot['slot_id'] ?? null;
         if (!liveStorageSha256Identity($slotId)
             || $endTsMs === null
@@ -3706,10 +3708,15 @@ function liveStorageSimCurveContract($plan, $displayDay, $stateBinding) {
             'end_ts_ms' => $endTsMs,
         ];
         $projection = is_array($slot['projection'] ?? null) ? $slot['projection'] : [];
-        $soc = liveStorageFiniteNumber($projection['soc_pct'] ?? null);
+        $soc = liveStorageFiniteNumber($projection['soc_start_pct'] ?? $projection['soc_pct'] ?? null);
         if ($soc === null || $soc < 0.0 || $soc > 100.0) continue;
         $canonicalPoints[$slotId] = [
             'soc' => $soc,
+            'soc_start' => liveStorageFiniteNumber($projection['soc_start_pct'] ?? null),
+            'soc_end' => liveStorageFiniteNumber($projection['soc_pct'] ?? null),
+            'simulation_start_ts' => function_exists('liveStorageTimestampMs')
+                    ? liveStorageTimestampMs($projection['simulation_start_ts_ms'] ?? null)
+                    : liveStorageFiniteNumber($projection['simulation_start_ts_ms'] ?? null),
             'source' => 'canonical_projection',
         ];
     }
@@ -3732,7 +3739,7 @@ function liveStorageSimCurveContract($plan, $displayDay, $stateBinding) {
     $legacyTimeline = is_array($plan['timeline'] ?? null) ? $plan['timeline'] : [];
     foreach ($legacyTimeline as $point) {
         if (!is_array($point)) continue;
-        $tsMs = liveStorageFiniteNumber($point['ts'] ?? null);
+        $tsMs = liveStorageTimestampMs($point['ts'] ?? null);
         if ($tsMs === null || $tsMs < $dayStartMs || $tsMs >= $dayEndMs) continue;
         $slotId = $point['slot_id'] ?? null;
         $soc = liveStorageFiniteNumber($point['soc'] ?? null);
@@ -3812,8 +3819,8 @@ function liveDirectMarketingActionBindingValid($plan, $projection, $action, $pla
     $actionId = (string)($projection['direct_marketing_plan_action_id'] ?? '');
     $actionLineageId = (string)($projection['direct_marketing_plan_action_lineage_id'] ?? '');
     $windowId = trim((string)($projection['direct_marketing_window_id'] ?? ''));
-    $windowStart = (int)($projection['direct_marketing_window_start_ts_ms'] ?? 0);
-    $windowEnd = (int)($projection['direct_marketing_window_end_ts_ms'] ?? 0);
+    $windowStart = e3dcTimestampMs($projection['direct_marketing_window_start_ts_ms'] ?? 0);
+    $windowEnd = e3dcTimestampMs($projection['direct_marketing_window_end_ts_ms'] ?? 0);
     $segmentId = trim((string)($projection['direct_marketing_plan_segment_id'] ?? ''));
     $horizon = is_array($projection['direct_marketing_action_horizon_contract'] ?? null)
         ? $projection['direct_marketing_action_horizon_contract'] : [];
@@ -3847,15 +3854,15 @@ function liveDirectMarketingActionBindingValid($plan, $projection, $action, $pla
         || ($horizon['complete'] ?? null) !== true
         || ($horizon['block_reason_code'] ?? null) !== null
         || ($horizon['window_source'] ?? '') !== 'canonical_direct_marketing_plan_projection'
-        || (int)($horizon['slot_start_ts_ms'] ?? 0) !== $slotStart
-        || (int)($horizon['slot_end_ts_ms'] ?? 0) !== $slotEnd
-        || (int)($horizon['window_start_ts_ms'] ?? 0) !== $windowStart
-        || (int)($horizon['window_end_ts_ms'] ?? 0) !== $windowEnd
-        || (int)($decisionHorizon['start_ts_ms'] ?? 0) !== $validFrom
-        || (int)($decisionHorizon['end_ts_ms'] ?? 0) < $windowEnd
-        || (int)($decisionHorizon['end_ts_ms'] ?? 0) > $horizonEnd
-        || (int)($horizon['bound_horizon_start_ts_ms'] ?? 0) !== (int)($decisionHorizon['start_ts_ms'] ?? 0)
-        || (int)($horizon['bound_horizon_end_ts_ms'] ?? 0) !== (int)($decisionHorizon['end_ts_ms'] ?? 0)) {
+        || e3dcTimestampMs($horizon['slot_start_ts_ms'] ?? 0) !== $slotStart
+        || e3dcTimestampMs($horizon['slot_end_ts_ms'] ?? 0) !== $slotEnd
+        || e3dcTimestampMs($horizon['window_start_ts_ms'] ?? 0) !== $windowStart
+        || e3dcTimestampMs($horizon['window_end_ts_ms'] ?? 0) !== $windowEnd
+        || e3dcTimestampMs($decisionHorizon['start_ts_ms'] ?? 0) !== $validFrom
+        || e3dcTimestampMs($decisionHorizon['end_ts_ms'] ?? 0) < $windowEnd
+        || e3dcTimestampMs($decisionHorizon['end_ts_ms'] ?? 0) > $horizonEnd
+        || e3dcTimestampMs($horizon['bound_horizon_start_ts_ms'] ?? 0) !== e3dcTimestampMs($decisionHorizon['start_ts_ms'] ?? 0)
+        || e3dcTimestampMs($horizon['bound_horizon_end_ts_ms'] ?? 0) !== e3dcTimestampMs($decisionHorizon['end_ts_ms'] ?? 0)) {
         return false;
     }
     if (($roles['schema_version'] ?? '') !== 'direct_marketing_action_roles_v1'
@@ -3866,16 +3873,16 @@ function liveDirectMarketingActionBindingValid($plan, $projection, $action, $pla
         || ($roles['plan_executable_action'] ?? '') !== $action
         || ($roles['effective_action'] ?? null) !== null
         || ($roles['runtime_effect_claim_allowed'] ?? null) !== false
-        || (int)($roles['slot_start_ts_ms'] ?? 0) !== $slotStart
-        || (int)($roles['slot_end_ts_ms'] ?? 0) !== $slotEnd) {
+        || e3dcTimestampMs($roles['slot_start_ts_ms'] ?? 0) !== $slotStart
+        || e3dcTimestampMs($roles['slot_end_ts_ms'] ?? 0) !== $slotEnd) {
         return false;
     }
     $matches = [];
     foreach (($direct['windows'] ?? []) as $window) {
         if (!is_array($window)
             || (string)($window['action'] ?? '') !== $sourceAction
-            || (int)($window['start_ts'] ?? 0) !== $windowStart
-            || (int)($window['end_ts'] ?? 0) !== $windowEnd) {
+            || e3dcTimestampMs($window['start_ts'] ?? 0) !== $windowStart
+            || e3dcTimestampMs($window['end_ts'] ?? 0) !== $windowEnd) {
             continue;
         }
         $sourceWindowId = trim((string)(
@@ -3968,13 +3975,13 @@ function liveDirectMarketingActionBindingValid($plan, $projection, $action, $pla
             || ($startGate['action'] ?? '') !== $sourceAction
             || ($startGate['window_id'] ?? '') !== $windowId
             || ($startGate['business_window_id'] ?? '') !== $windowId
-            || (int)($startGate['origin_start_ts'] ?? 0) !== $windowStart
-            || (int)($startGate['end_ts'] ?? 0) !== $windowEnd
+            || e3dcTimestampMs($startGate['origin_start_ts'] ?? 0) !== $windowStart
+            || e3dcTimestampMs($startGate['end_ts'] ?? 0) !== $windowEnd
             || ($startGate['accounting_contract'] ?? '') !== 'START_ONLY_NO_REMAINING_WINDOW_REAPPLICATION'
             || ($business['schema'] ?? '') !== 'direct_marketing_export_business_binding_v1'
             || ($business['action'] ?? '') !== $sourceAction
-            || (int)($business['origin_start_ts'] ?? 0) !== $windowStart
-            || (int)($business['end_ts'] ?? 0) !== $windowEnd
+            || e3dcTimestampMs($business['origin_start_ts'] ?? 0) !== $windowStart
+            || e3dcTimestampMs($business['end_ts'] ?? 0) !== $windowEnd
             || preg_match('/^sha256:[0-9a-f]{64}$/', $businessRevision) !== 1
             || !hash_equals($businessRevision, $expectedBusinessRevision)
             || ($startGate['business_contract_sha256'] ?? null) !== $businessRevision
@@ -4025,8 +4032,8 @@ function liveDirectMarketingActionBindingValid($plan, $projection, $action, $pla
             || ($lineage['previous_generation_id'] ?? null) !== $expectedPreviousId
             || ($lineage['action'] ?? '') !== $sourceAction
             || ($lineage['window_id'] ?? '') !== $windowId
-            || (int)($lineage['origin_start_ts'] ?? 0) !== $windowStart
-            || (int)($lineage['end_ts'] ?? 0) !== $windowEnd
+            || e3dcTimestampMs($lineage['origin_start_ts'] ?? 0) !== $windowStart
+            || e3dcTimestampMs($lineage['end_ts'] ?? 0) !== $windowEnd
             || !is_array($reasons) || count($reasons) === 0 || $reasons !== $sortedReasons
             || ($projection['direct_marketing_gate_lineage_id'] ?? null) !== $expectedLineageId
             || ($projection['direct_marketing_gate_generation'] ?? null) !== $generation
@@ -4078,8 +4085,8 @@ function liveHeadroomProjectionEvidence($plan) {
     $calculated = is_string($encoded) ? 'sha256:' . hash('sha256', $encoded) : '';
     if (($source['schema'] ?? '') !== 'direct_marketing_headroom_projection_plan_v1'
         || ($source['energy_basis'] ?? '') !== 'stored_battery_energy_delta_before_discharge_loss_v1'
-        || !is_int($generatedAt) || $generatedAt <= 0
-        || $generatedAt !== (int)($direct['created_ts'] ?? 0)
+        || !e3dcTimestampMsValid($generatedAt) || $generatedAt <= 0
+        || $generatedAt !== e3dcTimestampMs($direct['created_ts'] ?? 0)
         || !$finite($source['effective_duration_s'] ?? null) || (float)$source['effective_duration_s'] < 0.0
         || ($source['projection_only'] ?? null) !== true
         || ($source['executable'] ?? null) !== false
@@ -4122,14 +4129,14 @@ function liveHeadroomProjectionEvidence($plan) {
             || ($group['projection_horizon_contract'] ?? '') !== 'ordered_unique_slots_non_contiguous_allowed_v1'
             || preg_match('/^headroom-window:[0-9a-f]{64}$/', (string)($group['window_id'] ?? '')) !== 1
             || preg_match('/^headroom-segment:[0-9a-f]{64}$/', (string)($group['segment_id'] ?? '')) !== 1
-            || !is_int($group['window_start_ts'] ?? null) || !is_int($group['window_end_ts'] ?? null)
-            || (int)$group['window_end_ts'] <= (int)$group['window_start_ts']
-            || !is_int($group['effective_start_ts'] ?? null) || !is_int($group['effective_end_ts'] ?? null)
-            || (int)$group['effective_start_ts'] < (int)$group['window_start_ts']
-            || (int)$group['effective_end_ts'] > (int)$group['window_end_ts']
-            || (int)$group['effective_end_ts'] <= (int)$group['effective_start_ts']
+            || !e3dcTimestampMsValid($group['window_start_ts'] ?? null) || !e3dcTimestampMsValid($group['window_end_ts'] ?? null)
+            || e3dcTimestampMs($group['window_end_ts']) <= e3dcTimestampMs($group['window_start_ts'])
+            || !e3dcTimestampMsValid($group['effective_start_ts'] ?? null) || !e3dcTimestampMsValid($group['effective_end_ts'] ?? null)
+            || e3dcTimestampMs($group['effective_start_ts']) < e3dcTimestampMs($group['window_start_ts'])
+            || e3dcTimestampMs($group['effective_end_ts']) > e3dcTimestampMs($group['window_end_ts'])
+            || e3dcTimestampMs($group['effective_end_ts']) <= e3dcTimestampMs($group['effective_start_ts'])
             || !$finite($group['effective_duration_s'] ?? null) || (float)$group['effective_duration_s'] <= 0.0
-            || (float)$group['effective_duration_s'] > ((int)$group['effective_end_ts'] - (int)$group['effective_start_ts']) / 1000.0 + 0.000001
+            || (float)$group['effective_duration_s'] > (e3dcTimestampMs($group['effective_end_ts']) - e3dcTimestampMs($group['effective_start_ts'])) / 1000.0 + 0.000001
             || !$finite($group['reserve_floor_soc_pct'] ?? null) || (float)$group['reserve_floor_soc_pct'] < 0.0 || (float)$group['reserve_floor_soc_pct'] > 100.0
             || !$finite($group['target_soc_pct'] ?? null) || (float)$group['target_soc_pct'] < (float)$group['reserve_floor_soc_pct'] || (float)$group['target_soc_pct'] > 100.0
             || !$finite($group['protected_reserve_wh'] ?? null) || (float)$group['protected_reserve_wh'] < 0.0
@@ -4138,9 +4145,9 @@ function liveHeadroomProjectionEvidence($plan) {
             || !$finite($group['headroom_required_wh'] ?? null) || (float)$group['headroom_required_wh'] < 0.0
             || !$finite($group['headroom_free_before_wh'] ?? null) || (float)$group['headroom_free_before_wh'] < 0.0
             || !$finite($group['forecast_absorption_wh'] ?? null) || (float)$group['forecast_absorption_wh'] < 0.0
-            || !is_int($group['next_charge_start_ts'] ?? null) || !is_int($group['next_charge_end_ts'] ?? null)
-            || (int)$group['next_charge_start_ts'] < (int)$group['window_end_ts']
-            || (int)$group['next_charge_end_ts'] <= (int)$group['next_charge_start_ts']) {
+            || !e3dcTimestampMsValid($group['next_charge_start_ts'] ?? null) || !e3dcTimestampMsValid($group['next_charge_end_ts'] ?? null)
+            || e3dcTimestampMs($group['next_charge_start_ts']) < e3dcTimestampMs($group['window_end_ts'])
+            || e3dcTimestampMs($group['next_charge_end_ts']) <= e3dcTimestampMs($group['next_charge_start_ts'])) {
             return $invalid('DIRECT_MARKETING_HEADROOM_PROJECTION_GROUP_INVALID');
         }
         foreach ($slotIds as $slotId) if (!is_string($slotId) || preg_match('/^headroom-slot:[0-9a-f]{64}$/', $slotId) !== 1) return $invalid('DIRECT_MARKETING_HEADROOM_PROJECTION_GROUP_INVALID');
@@ -4165,13 +4172,13 @@ function liveHeadroomProjectionEvidence($plan) {
         $energyWh = $slot['headroom_export_slot_energy_wh'] ?? null;
         $effectiveStart = $slot['effective_start_ts'] ?? null;
         $effectiveDurationS = $slot['effective_duration_s'] ?? null;
-        $boundsKey = is_int($start) && is_int($end) ? $start . ':' . $end : '';
+        $boundsKey = e3dcTimestampMsValid($start) && e3dcTimestampMsValid($end) ? e3dcTimestampMsKey($start) . ':' . e3dcTimestampMsKey($end) : '';
         if (($slot['energy_basis'] ?? '') !== 'stored_battery_energy_delta_before_discharge_loss_v1'
             || preg_match('/^headroom-slot:[0-9a-f]{64}$/', $slotId) !== 1
             || ($slot['projection_id'] ?? null) !== $slotId
             || !isset($groupsById[$budgetId]) || $boundsKey === '' || isset($slotsByBounds[$boundsKey])
-            || !is_int($start) || !is_int($end) || $end - $start !== 900000
-            || !is_int($effectiveStart) || $effectiveStart !== max($start, $generatedAt) || $effectiveStart >= $end
+            || !e3dcTimestampMsValid($start) || !e3dcTimestampMsValid($end) || (float)($end - $start) !== 900000.0
+            || !e3dcTimestampMsValid($effectiveStart) || $effectiveStart !== max($start, $generatedAt) || $effectiveStart >= $end
             || !$finite($effectiveDurationS) || (float)$effectiveDurationS <= 0.0 || (float)$effectiveDurationS > 900.0
             || abs((float)$effectiveDurationS - (($end - $effectiveStart) / 1000.0)) > 0.000001
             || ($previousEnd !== null && $start < $previousEnd)
@@ -4186,9 +4193,9 @@ function liveHeadroomProjectionEvidence($plan) {
             || ($slot['projection_horizon_contract'] ?? '') !== 'ordered_unique_slots_non_contiguous_allowed_v1'
             || preg_match('/^headroom-window:[0-9a-f]{64}$/', (string)($slot['window_id'] ?? '')) !== 1
             || preg_match('/^headroom-segment:[0-9a-f]{64}$/', (string)($slot['segment_id'] ?? '')) !== 1
-            || !is_int($slot['window_start_ts'] ?? null) || !is_int($slot['window_end_ts'] ?? null)
-            || (int)$slot['window_end_ts'] <= (int)$slot['window_start_ts']
-            || $start < (int)$slot['window_start_ts'] || $end > (int)$slot['window_end_ts']
+            || !e3dcTimestampMsValid($slot['window_start_ts'] ?? null) || !e3dcTimestampMsValid($slot['window_end_ts'] ?? null)
+            || e3dcTimestampMs($slot['window_end_ts']) <= e3dcTimestampMs($slot['window_start_ts'])
+            || $start < e3dcTimestampMs($slot['window_start_ts']) || $end > e3dcTimestampMs($slot['window_end_ts'])
             || !is_int($powerW) || $powerW <= 0
             || !$finite($energyWh) || abs((float)$energyWh - ((float)$powerW * (float)$effectiveDurationS / 3600.0)) > 0.000501
             || !$finite($slot['headroom_export_budget_wh'] ?? null) || (float)$slot['headroom_export_budget_wh'] + 0.001 < (float)$energyWh
@@ -4200,8 +4207,8 @@ function liveHeadroomProjectionEvidence($plan) {
             || !$finite($slot['headroom_required_wh'] ?? null) || (float)$slot['headroom_required_wh'] < 0.0
             || !$finite($slot['headroom_free_before_wh'] ?? null) || (float)$slot['headroom_free_before_wh'] < 0.0
             || !$finite($slot['forecast_absorption_wh'] ?? null) || (float)$slot['forecast_absorption_wh'] < 0.0
-            || !is_int($slot['next_charge_start_ts'] ?? null) || !is_int($slot['next_charge_end_ts'] ?? null)
-            || (int)$slot['next_charge_start_ts'] < $end || (int)$slot['next_charge_end_ts'] <= (int)$slot['next_charge_start_ts']) {
+            || !e3dcTimestampMsValid($slot['next_charge_start_ts'] ?? null) || !e3dcTimestampMsValid($slot['next_charge_end_ts'] ?? null)
+            || e3dcTimestampMs($slot['next_charge_start_ts']) < $end || e3dcTimestampMs($slot['next_charge_end_ts']) <= e3dcTimestampMs($slot['next_charge_start_ts'])) {
             return $invalid('DIRECT_MARKETING_HEADROOM_PROJECTION_SLOT_INVALID');
         }
         $group = $groupsById[$budgetId];
@@ -4274,13 +4281,13 @@ function liveHeadroomProjectionEvidence($plan) {
         $boundSlots = array_values(array_filter($source['slots'], static function($slot) use ($budgetId) {
             return is_array($slot) && ($slot['headroom_export_budget_id'] ?? null) === $budgetId;
         }));
-        $boundStarts = array_map(static function($slot) { return (int)$slot['start_ts']; }, $boundSlots);
-        $boundEnds = array_map(static function($slot) { return (int)$slot['end_ts']; }, $boundSlots);
+        $boundStarts = array_map(static function($slot) { return e3dcTimestampMs($slot['start_ts']); }, $boundSlots);
+        $boundEnds = array_map(static function($slot) { return e3dcTimestampMs($slot['end_ts']); }, $boundSlots);
         if (count($boundSlots) === 0
-            || min($boundStarts) !== (int)$group['window_start_ts']
-            || max($boundEnds) !== (int)$group['window_end_ts']
-            || min(array_map(static function($slot) { return (int)$slot['effective_start_ts']; }, $boundSlots)) !== (int)$group['effective_start_ts']
-            || max($boundEnds) !== (int)$group['effective_end_ts']
+            || min($boundStarts) !== e3dcTimestampMs($group['window_start_ts'])
+            || max($boundEnds) !== e3dcTimestampMs($group['window_end_ts'])
+            || min(array_map(static function($slot) { return e3dcTimestampMs($slot['effective_start_ts']); }, $boundSlots)) !== e3dcTimestampMs($group['effective_start_ts'])
+            || max($boundEnds) !== e3dcTimestampMs($group['effective_end_ts'])
             || abs(array_sum(array_map(static function($slot) { return (float)$slot['effective_duration_s']; }, $boundSlots)) - (float)$group['effective_duration_s']) > 0.000001) {
             return $invalid('DIRECT_MARKETING_HEADROOM_PROJECTION_WINDOW_BINDING_INVALID');
         }
@@ -4292,8 +4299,8 @@ function liveHeadroomProjectionEvidence($plan) {
             return $invalid('DIRECT_MARKETING_HEADROOM_PROJECTION_EFFECTIVE_HORIZON_INVALID');
         }
     } else {
-        $effectiveStarts = array_map(static function($slot) { return (int)$slot['effective_start_ts']; }, $source['slots']);
-        $effectiveEnds = array_map(static function($slot) { return (int)$slot['end_ts']; }, $source['slots']);
+        $effectiveStarts = array_map(static function($slot) { return e3dcTimestampMs($slot['effective_start_ts']); }, $source['slots']);
+        $effectiveEnds = array_map(static function($slot) { return e3dcTimestampMs($slot['end_ts']); }, $source['slots']);
         $effectiveDuration = array_sum(array_map(static function($slot) { return (float)$slot['effective_duration_s']; }, $source['slots']));
         if (($source['effective_start_ts'] ?? null) !== min($effectiveStarts)
             || ($source['effective_end_ts'] ?? null) !== max($effectiveEnds)
@@ -4510,13 +4517,13 @@ function liveTrajectoryValidationReason($plan, $source, $canonicalPlan) {
         return 'DIRECT_MARKETING_TRAJECTORY_REVISION_MISMATCH';
     }
     $durationMs = (int)round(((float)($source['slot_duration_s'] ?? 0)) * 1000.0);
-    $validFromMs = (int)($source['valid_from_ts_ms'] ?? 0);
-    $horizonEndMs = (int)($source['horizon_end_ts_ms'] ?? 0);
+    $validFromMs = e3dcTimestampMs($source['valid_from_ts_ms'] ?? 0);
+    $horizonEndMs = e3dcTimestampMs($source['horizon_end_ts_ms'] ?? 0);
     if ($durationMs <= 0 || $validFromMs <= 0 || $horizonEndMs <= $validFromMs) {
         return 'DIRECT_MARKETING_TRAJECTORY_HORIZON_INVALID';
     }
     $planSlots = array_values(array_filter($plan['slots'], function($slot) use ($validFromMs) {
-        return is_array($slot) && (int)($slot['start_ts_ms'] ?? 0) >= $validFromMs;
+        return is_array($slot) && e3dcTimestampMs($slot['start_ts_ms'] ?? 0) >= $validFromMs;
     }));
     if (count($planSlots) !== count($source['slots'])) return 'DIRECT_MARKETING_TRAJECTORY_SLOT_COUNT_MISMATCH';
     $capacityWh = (float)($source['meta']['capacity_wh'] ?? 0);
@@ -4534,12 +4541,12 @@ function liveTrajectoryValidationReason($plan, $source, $canonicalPlan) {
     foreach ($source['slots'] as $index => $slot) {
         $planSlot = $planSlots[$index] ?? null;
         if (!is_array($slot) || !is_array($planSlot)) return 'DIRECT_MARKETING_TRAJECTORY_SLOT_INVALID';
-        $start = (int)($slot['start_ts_ms'] ?? 0);
-        $end = (int)($slot['end_ts_ms'] ?? 0);
+        $start = e3dcTimestampMs($slot['start_ts_ms'] ?? 0);
+        $end = e3dcTimestampMs($slot['end_ts_ms'] ?? 0);
         if (($slot['slot_id'] ?? null) !== ($planSlot['slot_id'] ?? null)
-            || $start !== (int)($planSlot['start_ts_ms'] ?? 0)
-            || $end !== (int)($planSlot['end_ts_ms'] ?? 0)
-            || $end - $start !== $durationMs
+            || $start !== e3dcTimestampMs($planSlot['start_ts_ms'] ?? 0)
+            || $end !== e3dcTimestampMs($planSlot['end_ts_ms'] ?? 0)
+            || (float)($end - $start) !== (float)$durationMs
             || ($previousEnd !== null && $start !== $previousEnd)) {
             return 'DIRECT_MARKETING_TRAJECTORY_SLOT_BINDING_MISMATCH';
         }
@@ -4583,11 +4590,11 @@ function liveTrajectoryValidationReason($plan, $source, $canonicalPlan) {
         $action = strtoupper((string)($slot['action'] ?? ''));
         $projection = is_array($planSlot['projection'] ?? null) ? $planSlot['projection'] : [];
         $provenance = is_array($slot['provenance'] ?? null) ? $slot['provenance'] : [];
-        $boundsKey = $start . ':' . $end;
+        $boundsKey = e3dcTimestampMsKey($start) . ':' . e3dcTimestampMsKey($end);
         $headroomSource = $headroomEvidence['slots_by_bounds'][$boundsKey] ?? null;
         $socProjectionContract = (string)($provenance['soc_projection_contract'] ?? '');
         $planSoc = is_array($planSlot['soc_pct'] ?? null) ? $planSlot['soc_pct'] : [];
-        $directCreatedTs = (int)($plan['direct_marketing']['created_ts'] ?? 0);
+        $directCreatedTs = e3dcTimestampMs($plan['direct_marketing']['created_ts'] ?? 0);
         $standardPassthrough = $socProjectionContract === 'canonical_standard_soc_passthrough_v1';
         $standardPassthroughValid = $standardPassthrough
             && $action === 'PASSIVE_NORMAL'
@@ -4603,18 +4610,18 @@ function liveTrajectoryValidationReason($plan, $source, $canonicalPlan) {
         $standardTransition = $socProjectionContract === 'canonical_standard_transition_rebased_v1';
         $transitionAnchorTs = $provenance['integration_anchor_ts_ms'] ?? null;
         $transitionDurationS = $provenance['integration_duration_s'] ?? null;
-        $currentTransition = $start === (int)($plan['valid_from_ts_ms'] ?? 0);
+        $currentTransition = $start === e3dcTimestampMs($plan['valid_from_ts_ms'] ?? 0);
         $expectedTransitionAnchorTs = $currentTransition
             ? ($plan['generated_at_ts_ms'] ?? null)
             : $start;
-        $expectedTransitionDurationS = is_int($expectedTransitionAnchorTs)
+        $expectedTransitionDurationS = e3dcTimestampMsValid($expectedTransitionAnchorTs)
             ? ($end - $expectedTransitionAnchorTs) / 1000.0
             : null;
         $standardTransitionDurationValid =
             ($provenance['integration_duration_contract'] ?? null)
                 === 'canonical_standard_transition_duration_v1'
-            && is_int($transitionAnchorTs)
-            && is_int($expectedTransitionAnchorTs)
+            && e3dcTimestampMsValid($transitionAnchorTs)
+            && e3dcTimestampMsValid($expectedTransitionAnchorTs)
             && $transitionAnchorTs === $expectedTransitionAnchorTs
             && $start <= $transitionAnchorTs && $transitionAnchorTs < $end
             && (is_int($transitionDurationS) || is_float($transitionDurationS))
@@ -4787,7 +4794,7 @@ function liveTrajectoryValidationReason($plan, $source, $canonicalPlan) {
             : ($standardTransitionValid
                 ? (float)$transitionDurationS
                 : ($operatingProjection
-                    ? ($end - max($start, (int)($plan['generated_at_ts_ms'] ?? $start))) / 1000.0
+                    ? ($end - max($start, e3dcTimestampMs($plan['generated_at_ts_ms'] ?? $start))) / 1000.0
                     : $durationMs / 1000.0));
         if (!is_finite($integrationDurationS) || $integrationDurationS <= 0.0
             || $integrationDurationS > $durationMs / 1000.0 + 0.001) {
@@ -4839,7 +4846,7 @@ function liveTrajectoryValidationReason($plan, $source, $canonicalPlan) {
             && ($delegation['action'] ?? null) === 'PV_STORE'
             && ($delegation['pv_store_source_contract'] ?? null) === 'E3DC_DC'
             && ($delegation['no_grid_charge'] ?? null) === true
-            && (int)($delegation['valid_until_ts_ms'] ?? 0) >= $end
+            && e3dcTimestampMs($delegation['valid_until_ts_ms'] ?? 0) >= $end
             && is_numeric($delegation['max_curve_charge_w'] ?? null)
             && (float)$delegation['max_curve_charge_w'] > 0.0;
         if (($selection['selected'] ?? null) === true && $delegation !== null) {
@@ -5060,10 +5067,10 @@ function liveDirectMarketingSelectedActionFallbackForDisplay($plan, $enabled, $c
         || ($binding['plan_material_revision'] ?? null) !== $planId
         || ($binding['raw_plan_sha256'] ?? null) !== $planArtifactRevision
         || (int)($binding['raw_plan_size'] ?? -1) !== strlen($planRawJson)
-        || (int)($binding['generated_at_ts_ms'] ?? 0) !== (int)($plan['generated_at_ts_ms'] ?? 0)
-        || (int)($binding['valid_from_ts_ms'] ?? 0) !== (int)($plan['valid_from_ts_ms'] ?? 0)
-        || (int)($binding['valid_until_ts_ms'] ?? 0) !== (int)($plan['valid_until_ts_ms'] ?? 0)
-        || (int)($binding['horizon_end_ts_ms'] ?? 0) !== (int)($plan['horizon_end_ts_ms'] ?? 0)
+        || e3dcTimestampMs($binding['generated_at_ts_ms'] ?? 0) !== e3dcTimestampMs($plan['generated_at_ts_ms'] ?? 0)
+        || e3dcTimestampMs($binding['valid_from_ts_ms'] ?? 0) !== e3dcTimestampMs($plan['valid_from_ts_ms'] ?? 0)
+        || e3dcTimestampMs($binding['valid_until_ts_ms'] ?? 0) !== e3dcTimestampMs($plan['valid_until_ts_ms'] ?? 0)
+        || e3dcTimestampMs($binding['horizon_end_ts_ms'] ?? 0) !== e3dcTimestampMs($plan['horizon_end_ts_ms'] ?? 0)
         || (int)($binding['slot_duration_s'] ?? 0) !== (int)($plan['slot_duration_s'] ?? 0)
         || ($binding['input_revisions_revision'] ?? null) !== $inputRevisionsRevision) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_PLAN_BINDING_INVALID');
     $trajectory = is_array($plan['direct_marketing_trajectory'] ?? null) ? $plan['direct_marketing_trajectory'] : null;
@@ -5079,11 +5086,11 @@ function liveDirectMarketingSelectedActionFallbackForDisplay($plan, $enabled, $c
             && ($trajectoryMeta['candidate_effect'] ?? null) === false
             && ($trajectoryMeta['shadow_effect'] ?? null) === false
             && ($trajectoryMeta['runtime_authorization_separate'] ?? null) === true);
-    if (!is_array($trajectory) || ($trajectory['schema_version'] ?? '') !== 'direct_marketing_trajectory_v1' || ($trajectory['active'] ?? null) !== true || ($trajectory['complete'] ?? null) !== false || !in_array($trajectoryStatus, ['TRAJECTORY_AXIS_EVIDENCE_LIMIT', 'PASSIVE_POLICY_BINDING_MISSING'], true) || !$passivePolicyBindingMetaValid || ($trajectory['reason_code'] ?? null) !== null || !is_array($trajectory['slots'] ?? null) || count($trajectory['slots']) !== 0 || ($trajectory['plan_id'] ?? null) !== $planId || preg_match('/^sha256:[0-9a-f]{64}$/', $trajectoryRevision) !== 1 || !hash_equals($trajectoryRevision, $trajectoryCalculated) || (int)($trajectory['generated_at_ts_ms'] ?? 0) !== (int)($plan['generated_at_ts_ms'] ?? 0) || (int)($trajectory['valid_from_ts_ms'] ?? 0) !== (int)($plan['valid_from_ts_ms'] ?? 0) || (int)($trajectory['horizon_end_ts_ms'] ?? 0) !== (int)($plan['horizon_end_ts_ms'] ?? 0) || (int)($trajectory['slot_duration_s'] ?? 0) !== (int)($plan['slot_duration_s'] ?? 0) || liveTrajectoryCanonicalJson($trajectory['input_revisions'] ?? null) !== liveTrajectoryCanonicalJson($plan['input_revisions'] ?? null) || ($binding['trajectory_revision'] ?? null) !== $trajectoryRevision) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_TRAJECTORY_NOT_AXIS_LIMITED');
+    if (!is_array($trajectory) || ($trajectory['schema_version'] ?? '') !== 'direct_marketing_trajectory_v1' || ($trajectory['active'] ?? null) !== true || ($trajectory['complete'] ?? null) !== false || !in_array($trajectoryStatus, ['TRAJECTORY_AXIS_EVIDENCE_LIMIT', 'PASSIVE_POLICY_BINDING_MISSING'], true) || !$passivePolicyBindingMetaValid || ($trajectory['reason_code'] ?? null) !== null || !is_array($trajectory['slots'] ?? null) || count($trajectory['slots']) !== 0 || ($trajectory['plan_id'] ?? null) !== $planId || preg_match('/^sha256:[0-9a-f]{64}$/', $trajectoryRevision) !== 1 || !hash_equals($trajectoryRevision, $trajectoryCalculated) || e3dcTimestampMs($trajectory['generated_at_ts_ms'] ?? 0) !== e3dcTimestampMs($plan['generated_at_ts_ms'] ?? 0) || e3dcTimestampMs($trajectory['valid_from_ts_ms'] ?? 0) !== e3dcTimestampMs($plan['valid_from_ts_ms'] ?? 0) || e3dcTimestampMs($trajectory['horizon_end_ts_ms'] ?? 0) !== e3dcTimestampMs($plan['horizon_end_ts_ms'] ?? 0) || (int)($trajectory['slot_duration_s'] ?? 0) !== (int)($plan['slot_duration_s'] ?? 0) || liveTrajectoryCanonicalJson($trajectory['input_revisions'] ?? null) !== liveTrajectoryCanonicalJson($plan['input_revisions'] ?? null) || ($binding['trajectory_revision'] ?? null) !== $trajectoryRevision) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_TRAJECTORY_NOT_AXIS_LIMITED');
     $durationS = (int)($plan['slot_duration_s'] ?? 0);
     $durationMs = $durationS * 1000;
-    $validFromMs = (int)($plan['valid_from_ts_ms'] ?? 0);
-    $horizonEndMs = (int)($plan['horizon_end_ts_ms'] ?? 0);
+    $validFromMs = e3dcTimestampMs($plan['valid_from_ts_ms'] ?? 0);
+    $horizonEndMs = e3dcTimestampMs($plan['horizon_end_ts_ms'] ?? 0);
     if (($projection['schema_version'] ?? '') !== 'direct_marketing_selected_action_fallback_v1'
         || ($projection['active'] ?? null) !== true
         || ($projection['complete'] ?? null) !== true
@@ -5096,10 +5103,10 @@ function liveDirectMarketingSelectedActionFallbackForDisplay($plan, $enabled, $c
         || ($projection['reason_code'] ?? null) !== null
         || ($projection['plan_id'] ?? null) !== $planId
         || ($projection['plan_material_revision'] ?? null) !== $planId
-        || (int)($projection['generated_at_ts_ms'] ?? 0) !== (int)($plan['generated_at_ts_ms'] ?? 0)
-        || (int)($projection['valid_from_ts_ms'] ?? 0) !== $validFromMs
-        || (int)($projection['valid_until_ts_ms'] ?? 0) !== (int)($plan['valid_until_ts_ms'] ?? 0)
-        || (int)($projection['horizon_end_ts_ms'] ?? 0) !== $horizonEndMs
+        || e3dcTimestampMs($projection['generated_at_ts_ms'] ?? 0) !== e3dcTimestampMs($plan['generated_at_ts_ms'] ?? 0)
+        || e3dcTimestampMs($projection['valid_from_ts_ms'] ?? 0) !== $validFromMs
+        || e3dcTimestampMs($projection['valid_until_ts_ms'] ?? 0) !== e3dcTimestampMs($plan['valid_until_ts_ms'] ?? 0)
+        || e3dcTimestampMs($projection['horizon_end_ts_ms'] ?? 0) !== $horizonEndMs
         || (int)($projection['slot_duration_s'] ?? 0) !== $durationS
         || liveTrajectoryCanonicalJson($projection['input_revisions'] ?? null) !== liveTrajectoryCanonicalJson($inputRevisions)
         || ($projection['input_revisions_revision'] ?? null) !== $inputRevisionsRevision
@@ -5111,7 +5118,7 @@ function liveDirectMarketingSelectedActionFallbackForDisplay($plan, $enabled, $c
     $sourceSlots = [];
     foreach (($plan['slots'] ?? []) as $sourceSlot) {
         if (!is_array($sourceSlot)) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_SLOT_INVALID');
-        if ((int)($sourceSlot['end_ts_ms'] ?? 0) > $validFromMs) $sourceSlots[] = $sourceSlot;
+        if (e3dcTimestampMs($sourceSlot['end_ts_ms'] ?? 0) > $validFromMs) $sourceSlots[] = $sourceSlot;
     }
     if (count($sourceSlots) !== count($projection['slots'])) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_SLOT_BINDING_INVALID');
     $slotAxis = [];
@@ -5130,7 +5137,7 @@ function liveDirectMarketingSelectedActionFallbackForDisplay($plan, $enabled, $c
         $number = (float)$value;
         if (!is_finite($number) || $number <= 0.0) return 0;
         if ($number < 100000000000.0) $number *= 1000.0;
-        return (int)round($number);
+        return e3dcTimestampMs($number);
     };
     $directPlan = is_array($plan['direct_marketing'] ?? null) ? $plan['direct_marketing'] : [];
     $previousEnd = null;
@@ -5141,10 +5148,10 @@ function liveDirectMarketingSelectedActionFallbackForDisplay($plan, $enabled, $c
         if ($slotKeys !== $slotKeysExpected) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_SLOT_INVALID');
         $sourceSlot = $sourceSlots[$index];
         $slotId = (string)($slot['slot_id'] ?? '');
-        $start = (int)($slot['start_ts_ms'] ?? 0);
-        $end = (int)($slot['end_ts_ms'] ?? 0);
+        $start = e3dcTimestampMs($slot['start_ts_ms'] ?? 0);
+        $end = e3dcTimestampMs($slot['end_ts_ms'] ?? 0);
         $expectedSlotId = 'sha256:' . hash('sha256', liveTrajectoryCanonicalJson(['plan_id' => $planId, 'start_ts_ms' => $start, 'end_ts_ms' => $end]));
-        if (!hash_equals($expectedSlotId, $slotId) || $end - $start !== $durationMs || ($previousEnd === null && $start !== $validFromMs) || ($previousEnd !== null && $start !== $previousEnd) || (string)($sourceSlot['slot_id'] ?? '') !== $slotId || (int)($sourceSlot['start_ts_ms'] ?? 0) !== $start || (int)($sourceSlot['end_ts_ms'] ?? 0) !== $end) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_SLOT_BINDING_INVALID');
+        if (!hash_equals($expectedSlotId, $slotId) || (float)($end - $start) !== (float)$durationMs || ($previousEnd === null && $start !== $validFromMs) || ($previousEnd !== null && $start !== $previousEnd) || (string)($sourceSlot['slot_id'] ?? '') !== $slotId || e3dcTimestampMs($sourceSlot['start_ts_ms'] ?? 0) !== $start || e3dcTimestampMs($sourceSlot['end_ts_ms'] ?? 0) !== $end) return $limited('DIRECT_MARKETING_ACTION_PROJECTION_SLOT_BINDING_INVALID');
         $sourceProjection = is_array($sourceSlot['projection'] ?? null) ? $sourceSlot['projection'] : [];
         $sourceSelected = ($sourceProjection['direct_marketing_selected'] ?? null) === true;
         $sourceExecutable = ($sourceProjection['direct_marketing_plan_executable'] ?? null) === true;
@@ -5172,8 +5179,8 @@ function liveDirectMarketingSelectedActionFallbackForDisplay($plan, $enabled, $c
             foreach (($directPlan['windows'] ?? []) as $sourceWindow) {
                 if (!is_array($sourceWindow)
                     || (string)($sourceWindow['action'] ?? '') !== (string)($slot['source_action'] ?? '')
-                    || $toTsMs($sourceWindow['start_ts'] ?? null) !== (int)($slot['window_start_ts_ms'] ?? 0)
-                    || $toTsMs($sourceWindow['end_ts'] ?? null) !== (int)($slot['window_end_ts_ms'] ?? 0)) continue;
+                    || $toTsMs($sourceWindow['start_ts'] ?? null) !== e3dcTimestampMs($slot['window_start_ts_ms'] ?? 0)
+                    || $toTsMs($sourceWindow['end_ts'] ?? null) !== e3dcTimestampMs($slot['window_end_ts_ms'] ?? 0)) continue;
                 $sourceWindowId = trim((string)(
                     $action === 'ECONOMIC_EXPORT'
                         ? ($sourceWindow['export_plateau_id'] ?? '')
@@ -5949,6 +5956,18 @@ if (is_array($liveData) && isset($liveData['PV_Power'])) {
                 $data['wb_source']          = 'openwb_native';
                 $data['wb_chargepoint_name'] = $openwbData['chargepoint_name'] ?? '';
                 $data['wb_state_text'] = $openwbData['state_text'] ?? '';
+                // Nur Anzeige: keine Eingabe in die Wallbox-Regelung.
+                foreach ([
+                    'openwb_bat_mode', 'openwb_bat_mode_topic', 'openwb_bat_mode_ts',
+                    'openwb_extern', 'openwb_software_version', 'openwb_switch_off_delay_s',
+                    'openwb_chargemode', 'openwb_status_reason',
+                ] as $displayKey) {
+                    $data['wb_' . $displayKey] = $openwbData[$displayKey] ?? null;
+                }
+                $data['wb_openwb_state_text'] = $openwbData['state_text'] ?? '';
+                $data['wb_openwb_state_text_ts'] = $openwbData['state_text_ts'] ?? null;
+                $data['wb_openwb_status_ts'] = $openwbData['ts'] ?? null;
+                $data['wb_openwb_control_mode'] = $confData['config']['wb1_mode'] ?? null;
                 $data['wb_fault_text'] = $openwbData['fault_text'] ?? '';
                 $data['wb_phases']          = (int)($openwbData['phases_in_use'] ?? 0);
                 $data['wb_phases_actual']   = (int)($openwbData['phases_actual'] ?? 0);
@@ -6288,6 +6307,9 @@ $heatManagerSource = null;
 
 // wp_type=6 (E3DC-Leistungsmesser) hat keine Herstellerdatei; alte luxtronik.json- oder
 // waermepumpe.json-Reste dürfen den PM-Wert nicht überschreiben.
+$wpSeasonDecision = e3dcWpSeasonDecision();
+$data = array_replace($data, e3dcWpSeason([], $confData['config'] ?? [], $wpConfigured ? $wpSeasonDecision : []));
+
 if ($wpConfigured && $wpTypeCfg !== 3 && $wpTypeCfg !== 6) {
     if ($wpTypeCfg === 4) {
         // Stiebel darf nur aus einem frischen, erfolgreichen und eindeutig
@@ -6404,13 +6426,7 @@ if ($wpSourceIsFresh) {
             }
             $data['wp_zuluft_temp'] = $outTemp;
             $data['Außentemperatur'] = $outTemp;
-            $heatLimit = $confData['config']['heizgrenze_temp'] ?? null;
-            if ($heatLimit !== null && is_numeric($heatLimit)) {
-                $data['wp_heating_limit_temp'] = (float)$heatLimit;
-                $data['wp_season_temp'] = (float)$outTemp;
-                $data['wp_season'] = ((float)$outTemp < (float)$heatLimit) ? 'winter' : 'summer';
-                $data['wp_season_label'] = ($data['wp_season'] === 'winter') ? 'Winter' : 'Sommer';
-            }
+            $data = array_replace($data, e3dcWpSeason($wpJson, $confData['config'] ?? [], $wpSeasonDecision));
 
             $wpBoostOwner = (string)($luxState['heatpump_boost_owner'] ?? 'none');
             $data['wp_boost_owner'] = $wpBoostOwner;
@@ -6668,30 +6684,7 @@ if ($wpSourceIsFresh) {
                 $data['wp_mode_text'] = 'Standby';
                 $coolingActive = false;
             }
-            $heatLimit = $wpVal(['Heizgrenze_Temperatur', 'Heizgrenze', 'Heizgrenze_Temp']);
-            if ($heatLimit === null || $heatLimit === '') {
-                $heatLimit = $confData['config']['heizgrenze_temp'] ?? null;
-            }
-            $seasonTemp = $wpVal([
-                'Aussentemperatur_Mittel', 'Aussentemp_Mittel', 'Gemittelte Außentemperatur',
-                'Gemittelte Aussentemperatur', 'Mitteltemperatur',
-                'Aussentemperatur', 'Aussentemp', 'Zuluft'
-            ]);
-            if ($seasonTemp === null) {
-                foreach ($wpData as $k => $v) {
-                    $lk = strtolower((string)$k);
-                    if ((strpos($lk, 'aussen') !== false || strpos($lk, 'zuluft') !== false) && strpos($lk, 'temp') !== false) {
-                        $seasonTemp = $v;
-                        break;
-                    }
-                }
-            }
-            if ($heatLimit !== null && $seasonTemp !== null && is_numeric($heatLimit) && is_numeric($seasonTemp)) {
-                $data['wp_heating_limit_temp'] = (float)$heatLimit;
-                $data['wp_season_temp'] = (float)$seasonTemp;
-                $data['wp_season'] = ((float)$seasonTemp < (float)$heatLimit) ? 'winter' : 'summer';
-                $data['wp_season_label'] = ($data['wp_season'] === 'winter') ? 'Winter' : 'Sommer';
-            }
+            $data = array_replace($data, e3dcWpSeason($wpData, $confData['config'] ?? [], $wpSeasonDecision));
             if ($wwIst !== null) $data['wp_ww_temp'] = (float)$wwIst;
             if ($wwSoll !== null) $data['wp_ww_soll'] = (float)$wwSoll;
             if ($rlIst !== null) $data['wp_rl_temp'] = (float)$rlIst;
@@ -7387,6 +7380,18 @@ if (($wb2NativeType === 'openwb' || $wb2NativeType === 'openwb_pro')
         $data['wb2_source'] = 'openwb_native';
         $data['wb2_chargepoint_name'] = $openwbData2['chargepoint_name'] ?? '';
         $data['wb2_state_text'] = $openwbData2['state_text'] ?? '';
+        // Nur Anzeige: keine Eingabe in die Wallbox-Regelung.
+        foreach ([
+            'openwb_bat_mode', 'openwb_bat_mode_topic', 'openwb_bat_mode_ts',
+            'openwb_extern', 'openwb_software_version', 'openwb_switch_off_delay_s',
+            'openwb_chargemode', 'openwb_status_reason',
+        ] as $displayKey) {
+            $data['wb2_' . $displayKey] = $openwbData2[$displayKey] ?? null;
+        }
+        $data['wb2_openwb_state_text'] = $openwbData2['state_text'] ?? '';
+        $data['wb2_openwb_state_text_ts'] = $openwbData2['state_text_ts'] ?? null;
+        $data['wb2_openwb_status_ts'] = $openwbData2['ts'] ?? null;
+        $data['wb2_openwb_control_mode'] = $confData['config']['wb2_mode'] ?? null;
         $data['wb2_fault_text'] = $openwbData2['fault_text'] ?? '';
         $data['wb2_mode'] = $data['wb2_chargemode'];
         $data['wb2_phases'] = (int)($openwbData2['phases_in_use'] ?? 0);
@@ -8181,6 +8186,16 @@ if ($validData && $historySampleValid && (time() - $lastWrite) >= 60 && !$isStan
         'Heizleistung Ist' => $data['Heizleistung Ist'] ?? 0,
         'Leistungsaufnahme' => $data['Leistungsaufnahme'] ?? 0,
     ];
+    // Preise und Tarifstand gehören zur Messzeit, auch bei späterem Anbieterwechsel.
+    if ((string)($confData['config']['cost_accounting_quarterhour_enable'] ?? '0') === '1') {
+        try {
+            require_once __DIR__ . '/cost_accounting.php';
+            $historyLine['cost_prices'] = e3dcCostPriceSnapshot($confData['config'], $data,
+                strtotime($historyLine['ts']), !empty($useV4EcoScore) && is_array($ecoScores ?? null) ? $ecoScores : []);
+        } catch (Throwable $error) {
+            error_log('Kostenpreisaufnahme übersprungen: ' . $error->getMessage());
+        }
+    }
     // Zusatzwechselrichter-Spalten nur bei konfigurierter Direktlesung (ältere Zeilen bleiben lesbar).
     if (isset($data['ext_inverter']) && is_array($data['ext_inverter']) && !empty($data['ext_inverter']['enabled'])) {
         foreach (liveExtInverterHistoryFields($data['ext_inverter']) as $extHistoryKey => $extHistoryValue) {
@@ -9207,6 +9222,7 @@ $storageDisplayDayEnd = null;
 $storageDisplayDayLabel = 'Heute';
 $storageAuthoritativeSnapshotLoaded = false;
 $storState = null;
+$data['storage_corridor_now'] = null;
 $storStateFile = $isShadowMode
     ? '/var/www/html/ramdisk/shadow_master_storage_manager_state.json'
     : '/var/www/html/ramdisk/storage_manager_state.json';
@@ -9218,6 +9234,23 @@ if (
     $storState = @json_decode(file_get_contents($storStateFile), true);
     if ($storState) {
         $storageAuthoritativeSnapshotLoaded = !empty($storState['state']);
+        // Korridorlage ausschließlich aus dem Entscheider, ohne Plan-Rückfall.
+        $corridorNow = $storState['corridor_now'] ?? null;
+        if (is_array($corridorNow)) {
+            $data['storage_corridor_now'] = $corridorNow;
+            $corridorTs = liveStorageFiniteNumber($corridorNow['ts'] ?? null);
+            $corridorUntil = liveStorageFiniteNumber($corridorNow['valid_until_ts'] ?? null);
+            $corridorServerNow = microtime(true);
+            $data['storage_corridor_now']['age_s'] = $corridorTs === null
+                ? null : max(0.0, $corridorServerNow - $corridorTs);
+            $data['storage_corridor_now']['remaining_valid_s'] = $corridorUntil === null
+                ? null : max(0.0, $corridorUntil - $corridorServerNow);
+            if ($corridorTs === null || $corridorUntil === null
+                || $corridorTs > time() + 5 || $corridorUntil < time()) {
+                $data['storage_corridor_now']['valid'] = false;
+                $data['storage_corridor_now']['reason'] = 'manager_state_stale';
+            }
+        }
         // Betriebsphase des Speicher-Managers ("Freilauf", "Sanftes Laden", ...)
         if (!empty($storState['phase'])) {
             $data['storage_phase'] = $storState['phase'];
@@ -9684,10 +9717,8 @@ if ($storagePlanFresh) {
         $runtimePhase5Lifecycle = is_array($runtimePhase5['request_lifecycle'] ?? null)
             ? $runtimePhase5['request_lifecycle']
             : [];
-        $runtimeTsMs = is_numeric($runtime['runtime_generated_at_ts_ms'] ?? null)
-            ? (int)$runtime['runtime_generated_at_ts_ms']
-            : 0;
-        $nowMs = (int)round(microtime(true) * 1000);
+        $runtimeTsMs = e3dcTimestampMs($runtime['runtime_generated_at_ts_ms'] ?? null);
+        $nowMs = e3dcTimestampMs(round(microtime(true) * 1000));
         $runtimeAgeMs = $nowMs - $runtimeTsMs;
         $lifecycleBound = true;
         foreach (['selected', 'executable', 'commands_allowed'] as $key) {
@@ -9768,13 +9799,13 @@ if ($storagePlanFresh) {
                 break;
             }
         }
-        $slotStartMs = is_array($effectiveSlot) ? (int)($effectiveSlot['start_ts_ms'] ?? 0) : 0;
-        $slotEndMs = is_array($effectiveSlot) ? (int)($effectiveSlot['end_ts_ms'] ?? 0) : 0;
-        $windowStartMs = (int)($effectiveBinding['window_start_ts_ms'] ?? 0);
-        $windowEndMs = (int)($effectiveBinding['window_end_ts_ms'] ?? 0);
+        $slotStartMs = is_array($effectiveSlot) ? e3dcTimestampMs($effectiveSlot['start_ts_ms'] ?? 0) : 0;
+        $slotEndMs = is_array($effectiveSlot) ? e3dcTimestampMs($effectiveSlot['end_ts_ms'] ?? 0) : 0;
+        $windowStartMs = e3dcTimestampMs($effectiveBinding['window_start_ts_ms'] ?? 0);
+        $windowEndMs = e3dcTimestampMs($effectiveBinding['window_end_ts_ms'] ?? 0);
         $timeBindingValid = $slotStartMs > 0 && $slotEndMs > $slotStartMs
-            && (int)($effectiveBinding['slot_start_ts_ms'] ?? 0) === $slotStartMs
-            && (int)($effectiveBinding['slot_end_ts_ms'] ?? 0) === $slotEndMs
+            && e3dcTimestampMs($effectiveBinding['slot_start_ts_ms'] ?? 0) === $slotStartMs
+            && e3dcTimestampMs($effectiveBinding['slot_end_ts_ms'] ?? 0) === $slotEndMs
             && $slotStartMs <= $runtimeTsMs && $runtimeTsMs < $slotEndMs
             && $slotStartMs <= $nowMs && $nowMs < $slotEndMs
             && $windowStartMs > 0 && $windowEndMs > $windowStartMs
@@ -9894,7 +9925,7 @@ if ($storagePlanFresh) {
         foreach ($dispatchSlots as $slot) {
             if (!is_array($slot)) continue;
             // Millisekunden bleiben auch unter 32-Bit-PHP unverengt.
-            $tsMs = liveStorageFiniteNumber($slot['start_ts_ms'] ?? null);
+            $tsMs = liveStorageTimestampMs($slot['start_ts_ms'] ?? null);
             if ($tsMs === null) continue;
             $ts = (int)floor($tsMs / 1000.0);
             if ($ts < $today0 || $ts >= $today1) continue;
@@ -9945,10 +9976,13 @@ if ($storagePlanFresh) {
             if ($boundSimPoint === null) continue;
             $simCurve[] = [
                 'ts' => $tsMs,
-                'end_ts' => liveStorageFiniteNumber($slot['end_ts_ms'] ?? null),
+                'end_ts' => liveStorageTimestampMs($slot['end_ts_ms'] ?? null),
                 'plan_id' => $storPlan['plan_id'],
                 'slot_id' => $slotId,
                 'soc' => $soc !== null ? round($soc, 1) : null,
+                'soc_start' => $boundSimPoint['soc_start'] ?? null,
+                'soc_end' => $boundSimPoint['soc_end'] ?? null,
+                'simulation_start_ts' => $boundSimPoint['simulation_start_ts'] ?? null,
                 'projection_source' => $boundSimPoint['source'] ?? null,
                 'pv_w' => (int)round((float)($projection['pv_w'] ?? 0)),
                 'direct_marketing_slot_projection_w' => isset($projection['battery_w'])
@@ -10462,15 +10496,15 @@ if (file_exists($priceBoostPlanFile) && (time() - filemtime($priceBoostPlanFile)
     if ($pbPlan && is_array($pbPlan)) {
         $nowMs = time() * 1000;
         $activeWin = (isset($pbPlan['active_window']) && is_array($pbPlan['active_window'])) ? $pbPlan['active_window'] : null;
-        $activeStart = (int)($activeWin['start_timestamp'] ?? 0);
-        $activeEnd = (int)($activeWin['end_timestamp'] ?? 0);
-        $boostActiveNow = !empty($pbPlan['active']) && $activeStart <= $nowMs && $nowMs < $activeEnd;
+        $activeStart = e3dcTimestampMs($activeWin['start_timestamp'] ?? null);
+        $activeEnd = e3dcTimestampMs($activeWin['end_timestamp'] ?? null);
+        $boostActiveNow = !empty($pbPlan['active']) && $activeStart !== null && $activeEnd !== null && $activeStart <= $nowMs && $nowMs < $activeEnd;
         $data['cheap_grid_boost_enabled'] = !empty($pbPlan['enabled']);
         $data['cheap_grid_boost_active'] = $boostActiveNow;
         $data['cheap_grid_boost_allow'] = (isset($pbPlan['allow']) && is_array($pbPlan['allow'])) ? $pbPlan['allow'] : [];
         $data['cheap_grid_boost_window'] = $boostActiveNow ? $activeWin : null;
         foreach (($pbPlan['windows'] ?? []) as $win) {
-            $end = (int)($win['end_timestamp'] ?? 0);
+            $end = e3dcTimestampMs($win['end_timestamp'] ?? null);
             if ($end > $nowMs) {
                 $data['cheap_grid_boost_next_window'] = $win;
                 break;

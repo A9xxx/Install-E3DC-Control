@@ -92,6 +92,7 @@ V4_BLOCK_PV = {
 
 # --- Block 3: Energiepreise & Tarife ---
 V4_BLOCK_TARIFF = {
+    'cost_accounting_quarterhour_enable',
     'awattar', 'awmwst', 'awnebenkosten', 'awreserve', 'awsimulation',
     'strompreis_basis', 'strompreis_cheap', 'strompreis_uht', 'strompreis_spezial',
     'stromtarif_typ', 'tariff_provider', 'tibber_api_token', 'tibber_home_id',

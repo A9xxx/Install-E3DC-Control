@@ -159,7 +159,7 @@ class LiveDataSnapshot:
             heatpump_w=safe_int(
                 _first_number(
                     normalized,
-                    ("WP_Power", "heizstab_power", "Heizstab_Power"),
+                    ("WP_Power", "Heatpump_Power"),
                     0.0,
                 )
             ),

@@ -273,12 +273,18 @@ class BattCtrl:
         self._charge_cap = -1
         self._discharge_cap = -1
         self._auto_discharge_cap = 12000
+        self._configured_charge_cap_w = None
+        self._configured_discharge_cap_w = None
         self._settings_charge_cap = -1
         self._settings_discharge_cap = -1
         self._settings_discharge_start = -1
         self._settings_limits_used: Optional[bool] = None
         self._settings_retry_after_monotonic = 0.0
+        self._settings_rejections = {}
+        self._settings_rejection_count = 0
+        self._settings_last_response_codes = None
         self._settings_pending_target: Optional[Dict[str, Any]] = None
+        self._settings_pending_rejection_recorded = False
         self._settings_pending_bounded_zero_w = 0
         self._settings_pending_started_monotonic = 0.0
         self._settings_pending_deadline_monotonic = 0.0
@@ -325,6 +331,11 @@ class BattCtrl:
             "status": "not_requested",
             "confirmed": False,
         }
+
+    def set_configured_power_limits(self, charge_w: int, discharge_w: int) -> None:
+        """Vom einzigen Entscheider berechnete Obergrenzen für alle Übersetzungen."""
+        self._configured_charge_cap_w = max(0, int(charge_w))
+        self._configured_discharge_cap_w = max(0, int(discharge_w))
 
     def set_auto_discharge_cap(self, val: int) -> None:
         val = max(300, int(val or 0))
@@ -461,6 +472,22 @@ class BattCtrl:
                 parts.append(str(item.get("value")))
         return ",".join(parts)
 
+    @staticmethod
+    def _power_settings_response_rejected(response: Any) -> bool:
+        """Nur ein vom Gerät beantworteter Fehler ist eine Ablehnung."""
+        container = find_tag(response, RscpTag.EMS_SET_POWER_SETTINGS)
+        if not isinstance(container, dict):
+            return False
+        if container.get("type") == RscpType.Error:
+            return True
+        values = container.get("value")
+        return bool(isinstance(values, list) and any(
+            isinstance(item, dict) and (
+                item.get("type") == RscpType.Error
+                or (type(item.get("value")) is int and item["value"] not in (0, 1))
+            ) for item in values
+        ))
+
     def _read_power_settings(self) -> Optional[Dict[str, Any]]:
         self._settings_get_requests += 1
         response = self._c.request([{
@@ -505,7 +532,7 @@ class BattCtrl:
         self._charge_cap = int(readback["max_charge_w"])
         self._discharge_cap = int(readback["max_discharge_w"])
         self._clear_pending_power_settings()
-        self._settings_retry_after_monotonic = 0.0
+        self._clear_confirmed_rejections(readback)
 
     @staticmethod
     def _power_settings_readback_matches(
@@ -602,9 +629,11 @@ class BattCtrl:
             "reason": "request_returned",
         })
         response_codes = self._power_settings_response_codes(response)
+        self._last_power_settings_wire_receipt["rejected"] = self._power_settings_response_rejected(response)
         self._last_power_settings_wire_receipt["response_code_text"] = (
             self._power_settings_response_code_text(response)
         )
+        self._last_power_settings_wire_receipt["response_codes"] = response_codes
         self._last_power_settings_wire_receipt["acknowledged"] = (
             True
             if isinstance(response_codes, list) and len(response_codes) >= 4
@@ -691,16 +720,7 @@ class BattCtrl:
             if attempt == 0:
                 time.sleep(0.05)
         if not readback_matches:
-            now_monotonic = time.monotonic()
-            self._settings_pending_target = dict(requested)
-            self._settings_pending_bounded_zero_w = max(0, int(bounded_zero_w))
-            self._settings_pending_started_monotonic = now_monotonic
-            self._settings_pending_deadline_monotonic = (
-                now_monotonic + RSCP_POWER_SETTINGS_READBACK_GRACE_S
-            )
-            self._settings_pending_started_ts = int(time.time())
-            self._settings_pending_response_codes = list(response_codes)
-            self._settings_retry_after_monotonic = 0.0
+            self._begin_pending_power_settings(requested, bounded_zero_w, response_codes)
             self._power_settings_diag = {
                 "schema": "rscp_power_settings_v1",
                 "contract_version": RSCP_POWER_SETTINGS_CONTRACT_VERSION,
@@ -938,8 +958,71 @@ class BattCtrl:
         self._settings_log_repeat_lines[signature] = now_monotonic
         return True
 
+    @staticmethod
+    def _rejection_key(target, bounded_zero_w=0):
+        return (target["limits_used"], target["max_charge_w"], target["max_discharge_w"],
+                target["discharge_start_w"], bounded_zero_w)
+
+    def _matching_rejection_key(self, target, bounded_zero_w=0):
+        """Fester Zielanker im vorhandenen Readback-Fenster; 0-W-Klassen bleiben getrennt."""
+        candidate = self._rejection_key(target, bounded_zero_w)
+        if candidate in self._settings_rejections:
+            return candidate
+        for key in self._settings_rejections:
+            if (key[0] is candidate[0] and key[4] == candidate[4]
+                    and (key[1] == 0) == (candidate[1] == 0)
+                    and (key[2] == 0) == (candidate[2] == 0)
+                    and all(abs(key[i] - candidate[i]) < RSCP_POWER_SETTINGS_TOLERANCE_W
+                            for i in (1, 2, 3))):
+                return key
+        return candidate
+
+    def _clear_confirmed_rejections(self, readback):
+        for key in list(self._settings_rejections):
+            if self._power_settings_readback_matches(readback, key[1], key[2], key[3], key[0], key[4]):
+                del self._settings_rejections[key]
+        if not self._settings_rejections:
+            self._settings_retry_after_monotonic = 0.0
+
+    def _note_settings_rejection(self, target, bounded_zero_w=0):
+        key = self._matching_rejection_key(target, bounded_zero_w)
+        count = self._settings_rejections.get(key, {}).get("count", 0) + 1
+        protective = target["limits_used"] and target["max_discharge_w"] == 0
+        delay = RSCP_POWER_SETTINGS_RETRY_S if protective else min(300.0, 30.0 * 2 ** min(count - 1, 4))
+        deadline = time.monotonic() + delay
+        if key not in self._settings_rejections and len(self._settings_rejections) >= 64:
+            del self._settings_rejections[next(iter(self._settings_rejections))]
+        self._settings_rejections[key] = {"count": count, "deadline": deadline}
+        self._settings_rejection_count += 1
+        self._settings_last_response_codes = self._power_settings_diag.get("response_codes") or self._last_power_settings_wire_receipt.get("response_code_text")
+        self._settings_retry_after_monotonic = deadline
+
+    def _note_settings_transport_failure(self, target, bounded_zero_w=0):
+        """Ohne beantwortete Ablehnung bleibt der bisherige feste Wiederholabstand."""
+        key = self._matching_rejection_key(target, bounded_zero_w)
+        count = self._settings_rejections.get(key, {}).get("count", 0)
+        if key not in self._settings_rejections and len(self._settings_rejections) >= 64:
+            del self._settings_rejections[next(iter(self._settings_rejections))]
+        deadline = time.monotonic() + RSCP_POWER_SETTINGS_RETRY_S
+        self._settings_rejections[key] = {"count": count, "deadline": deadline}
+        self._settings_retry_after_monotonic = deadline
+
+    def _begin_pending_power_settings(self, target, bounded_zero_w=0, response_codes=None):
+        now = time.monotonic()
+        self._settings_pending_target = dict(target)
+        self._settings_pending_rejection_recorded = False
+        self._settings_pending_bounded_zero_w = max(0, int(bounded_zero_w))
+        self._settings_pending_started_monotonic = now
+        self._settings_pending_deadline_monotonic = now + RSCP_POWER_SETTINGS_READBACK_GRACE_S
+        self._settings_pending_started_ts = int(time.time())
+        self._settings_pending_response_codes = list(response_codes or [])
+        self._settings_retry_after_monotonic = 0.0
+
     def power_settings_diagnostics(self) -> Dict[str, Any]:
         diag = dict(self._power_settings_diag)
+        diag["rejection_count"] = self._settings_rejection_count
+        diag["last_response_codes"] = self._settings_last_response_codes
+        diag["next_allowed_attempt_at_s"] = time.time() + max(0.0, self._settings_retry_after_monotonic - time.monotonic())
         diag["set_requests"] = self._settings_set_requests
         diag["set_log_pending"] = self._settings_log_window_unreported
         diag["set_log_summary_lines"] = self._settings_log_summary_lines
@@ -958,6 +1041,7 @@ class BattCtrl:
 
     def _clear_pending_power_settings(self) -> None:
         self._settings_pending_target = None
+        self._settings_pending_rejection_recorded = False
         self._settings_pending_bounded_zero_w = 0
         self._settings_pending_started_monotonic = 0.0
         self._settings_pending_deadline_monotonic = 0.0
@@ -1076,7 +1160,7 @@ class BattCtrl:
                 self._settings_discharge_start = int(readback["discharge_start_w"])
                 self._charge_cap = int(readback["max_charge_w"])
                 self._discharge_cap = int(readback["max_discharge_w"])
-                self._settings_retry_after_monotonic = 0.0
+                self._clear_confirmed_rejections(readback)
                 self._clear_pending_power_settings()
                 self._power_settings_diag = {
                     "schema": "rscp_power_settings_v1",
@@ -1084,7 +1168,7 @@ class BattCtrl:
                     "status": "confirmed_from_live_readback",
                     "stage": "live_reconciliation",
                     "confirmed": True,
-                    "acknowledged": True,
+                    "acknowledged": True if len(response_codes) >= 4 else None,
                     "requested": pending,
                     "response_codes": response_codes,
                     "readback": readback,
@@ -1105,7 +1189,7 @@ class BattCtrl:
                     **self._power_settings_diag,
                     "status": "pending_readback",
                     "confirmed": False,
-                    "acknowledged": True,
+                    "acknowledged": True if len(self._settings_pending_response_codes or []) >= 4 else None,
                     "requested": pending,
                     "readback": readback,
                     "readback_source": "canonical_live",
@@ -1114,13 +1198,14 @@ class BattCtrl:
                     "ts": int(reconcile_time_s),
                 }
                 return False
-            if self._settings_retry_after_monotonic <= 0.0:
-                self._settings_retry_after_monotonic = now_monotonic + RSCP_POWER_SETTINGS_RETRY_S
+            if not self._settings_pending_rejection_recorded:
+                self._note_settings_rejection(pending, bounded_zero_w)
+                self._settings_pending_rejection_recorded = True
             self._power_settings_diag = {
                 **self._power_settings_diag,
                 "status": "readback_mismatch",
                 "confirmed": False,
-                "acknowledged": True,
+                "acknowledged": True if len(self._settings_pending_response_codes or []) >= 4 else None,
                 "requested": pending,
                 "readback": readback,
                 "readback_source": "canonical_live",
@@ -1136,7 +1221,7 @@ class BattCtrl:
         self._settings_discharge_start = int(discharge_start_w)
         self._charge_cap = int(charge_w)
         self._discharge_cap = int(discharge_w)
-        self._settings_retry_after_monotonic = 0.0
+        self._clear_confirmed_rejections(readback)
         self._power_settings_diag = {
             "schema": "rscp_power_settings_v1",
             "contract_version": RSCP_POWER_SETTINGS_CONTRACT_VERSION,
@@ -1161,6 +1246,10 @@ class BattCtrl:
     ) -> bool:
         charge_w = max(0, int(charge_w or 0))
         discharge_w = max(0, int(discharge_w or 0))
+        if self._configured_charge_cap_w is not None:
+            charge_w = min(charge_w, self._configured_charge_cap_w)
+        if self._configured_discharge_cap_w is not None:
+            discharge_w = min(discharge_w, self._configured_discharge_cap_w)
         discharge_start_w = max(0, int(discharge_start_w or 0))
         limits_used = bool(limits_used)
         bounded_zero_w = max(0, int(bounded_zero_w or 0)) if limits_used and charge_w == 0 else 0
@@ -1170,6 +1259,12 @@ class BattCtrl:
             discharge_start_w,
             limits_used,
         )
+        rejection = self._settings_rejections.get(self._matching_rejection_key(target, bounded_zero_w))
+        self._settings_retry_after_monotonic = rejection["deadline"] if rejection else 0.0
+        if rejection and time.monotonic() < rejection["deadline"]:
+            self._power_settings_diag = {**self._power_settings_diag, "status": "retry_backoff",
+                                         "confirmed": False, "requested": target, "ts": int(time.time())}
+            return False
         own_proof = self._settings_own_verified
         # Der Nachweis gilt nur für ein wertgleiches Ziel. Ein nur innerhalb der
         # Toleranz gleiches Ziel läuft wie bisher gegen den frischen Abgleich;
@@ -1433,7 +1528,20 @@ class BattCtrl:
                     summary_only=not own_error_line,
                 )
             self._clear_confirmed_power_settings()
-            self._settings_retry_after_monotonic = time.monotonic() + RSCP_POWER_SETTINGS_RETRY_S
+            if receipt.get("rejected") is True:
+                self._note_settings_rejection(target, bounded_zero_w)
+            elif receipt.get("response_returned") is True:
+                # SET beantwortet, Wirkung unbekannt: erst nach der Readbackfrist zählen.
+                self._begin_pending_power_settings(
+                    target, bounded_zero_w, receipt.get("response_codes")
+                )
+                self._power_settings_diag = {
+                    **self._power_settings_diag, "status": "pending_readback_missing",
+                    "confirmed": False, "requested": target,
+                    "acknowledged": receipt.get("acknowledged"), "ts": int(time.time()),
+                }
+            else:
+                self._note_settings_transport_failure(target, bounded_zero_w)
             self.close()
             return False
 
@@ -1708,6 +1816,10 @@ class BattCtrl:
             raise ValueError("Flüchtige Leistungsvorgaben benötigen ganzzahlige Werte")
         mode = int(mode)
         val = max(0, int(val))
+        if mode in (MODE_CHRG, MODE_GRID) and self._configured_charge_cap_w is not None:
+            val = min(val, self._configured_charge_cap_w)
+        elif mode == MODE_DISCH and self._configured_discharge_cap_w is not None:
+            val = min(val, self._configured_discharge_cap_w)
         def _auto_limit_int(key: str, default: int) -> int:
             if not isinstance(auto_limit, dict) or key not in auto_limit:
                 return int(default)

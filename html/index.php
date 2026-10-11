@@ -55,13 +55,13 @@ if (isset($_POST['save_lux_global'])) {
         http_response_code(500);
         echo errorMessage(
             'Luxtronik-Einstellung nicht gespeichert',
-            'Die bestehende Konfiguration blieb unverändert; der Dienst wurde nicht neu gestartet. Bitte führe im Installationscenter „Rechte reparieren“ aus.'
+            'Die bestehende Konfiguration blieb unverändert; der Dienst wurde nicht neu gestartet. Im Installationscenter „Rechte reparieren“ ausführen.'
         );
         exit;
     }
     if (!e3dcRemoveConfigCacheFailClosed('/var/www/html/ramdisk/e3dc_config_cache.json')) {
         http_response_code(500);
-        echo errorMessage('Luxtronik-Einstellung gespeichert, Cache nicht entfernt', 'Der Dienst wurde nicht neu gestartet. Bitte führe „Rechte reparieren“ aus.');
+        echo errorMessage('Luxtronik-Einstellung gespeichert, Cache nicht entfernt', 'Der Dienst wurde nicht neu gestartet. „Rechte reparieren“ ausführen.');
         exit;
     }
     $restart = e3dcRestartEnergyManagerFromWeb(getInstallPaths());
@@ -86,12 +86,20 @@ $nativeWallboxStatusEnabled = hasNativeWallboxStatusConfig($_c ?? []);
 $protectedPages = ['config', 'wallbox', 'waermepumpe', 'klima'];
 // Neue Wärmepumpen-Ansicht (Vorschau): gleiche Anmeldepflicht wie die bisherige Seite.
 $protectedPages[] = 'waermepumpe_vorschau';
+$protectedPages[] = 'matter';
+$protectedPages[] = 'vitals';
 
 if (in_array($seite, $protectedPages, true) && !isWebAuthenticated()) {
     if (isset($_GET['ajax']) && $_GET['ajax'] == '1') {
         requireWebAuth(true);
     }
     $seite = 'lock';
+}
+
+// Die Anmeldung ist bereits gültig: direkt zur Startseite weiterleiten.
+if ($seite === 'lock' && isWebAuthenticated()) {
+    header('Location: index.php');
+    exit;
 }
 
 // Gewählte Wärmepumpen-Ansicht (Cookie e3dc_wp_view): seite=waermepumpe zeigt die neue Ansicht nur bei
@@ -1697,6 +1705,18 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                             </button>
                         </div>
                     </div>
+                    <?php
+                    $costHistoryConfig = loadE3dcConfig();
+                    $costHistoryEnabled = (string)($costHistoryConfig['config']['cost_accounting_quarterhour_enable'] ?? '0') === '1';
+                    if ($costHistoryEnabled): ?>
+                    <div id="costHistorySwitch" class="px-3 pb-2 d-none" role="group" aria-label="Strompreis und Kosten">
+                        <button id="costDiagramButton" type="button" class="btn btn-sm btn-outline-secondary active" aria-pressed="true" onclick="switchCostHistoryView(false)">Diagramm</button>
+                        <button id="costHistoryButton" type="button" class="btn btn-sm btn-outline-secondary" aria-pressed="false" onclick="switchCostHistoryView(true)">Kostenhistorie (experimentell)</button>
+                    </div>
+                    <div class="px-3 pb-3" id="desktopCostHistory" hidden>
+                        <?php include __DIR__ . '/cost_history_view.php'; ?>
+                    </div>
+                    <?php endif; ?>
                     <div id="diagramDetails" class="px-3 pb-2 text-info small fw-bold" style="display:none;"></div>
                     <div id="forecast-kwh-summary" class="forecast-summary px-3 pb-2 text-info small fw-bold" style="display:none;"></div>
                     <div id="pv-forecast-diagnostic-card" class="mx-3 mb-2 rounded border border-secondary-subtle bg-body-tertiary px-3 py-2 small" style="display:none !important;" hidden>
@@ -1820,7 +1840,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                             <div class="col-md-2 text-center">
                                 <h6 class="text-muted small text-uppercase fw-bold mb-2">CO₂ Bilanz</h6>
                                 <div class="d-flex flex-column align-items-center justify-content-center" style="height: 140px;">
-                                    <div id="co2-tree" style="font-size: 2.5rem; line-height: 1; transition: all 0.5s ease;" title="Der Baum wächst mit deiner Autarkie!">🌱</div>
+                                    <div id="co2-tree" style="font-size: 2.5rem; line-height: 1; transition: all 0.5s ease;" title="Der Baum wächst mit dem Autarkiegrad!">🌱</div>
                                     <div class="mt-1">
                                         <span id="stat-co2-value" class="fw-bold text-success" style="font-size: 1.2rem;">--</span>
                                         <span class="text-muted" style="font-size: 0.7rem;"> kg</span>
@@ -2286,7 +2306,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                     </span>
                                 </div>
                                 <div class="mt-2 pt-1 border-top border-secondary border-opacity-10 d-flex justify-content-between align-items-center">
-                                    <span class="text-muted" style="font-size:0.7rem;"><span id="stat-regler-soll-label">Jetzt</span>: Soll <span id="stat-regler-soll-now" class="text-info fw-bold">--%</span></span>
+                                    <span class="text-muted" style="font-size:0.7rem;"><span id="stat-regler-soll-label">Jetzt</span>: <span id="stat-regler-soll-now" class="text-info fw-bold">--%</span></span>
                                     <span id="stat-regler-meta" class="text-muted" style="font-size:0.7rem;"></span>
                                 </div>
                                 <div class="mt-1 d-flex justify-content-between align-items-center gap-2" style="font-size:0.68rem;">
@@ -2363,15 +2383,16 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     <div class="card-body p-4 text-center">
                         <i class="fas fa-lock text-warning mb-3" style="font-size: 3rem;"></i>
                         <h4 class="fw-bold mb-3">Geschützter Bereich</h4>
-                        <p class="text-muted small mb-4">Bitte gib deine PIN ein, um die Steuerung und Konfiguration zu entsperren.</p>
+                        <p class="text-muted small mb-4">Die PIN eingeben, um Steuerung und Konfiguration zu entsperren.</p>
                         <?php if (isset($_SESSION['login_error'])): ?>
-                            <div class="alert alert-danger py-2 small"><?= htmlspecialchars($_SESSION['login_error_message'] ?? 'Falsche PIN. Bitte versuche es erneut.') ?></div>
+                            <div class="alert alert-danger py-2 small"><?= htmlspecialchars($_SESSION['login_error_message'] ?? 'Falsche PIN. Erneut versuchen.') ?></div>
                             <?php unset($_SESSION['login_error']); ?>
                             <?php unset($_SESSION['login_error_message']); ?>
                         <?php endif; ?>
                         <form method="post" action="">
                             <?= e3dcCsrfInput() ?>
                             <input type="hidden" name="action" value="web_login">
+                            <input type="hidden" name="login_return" value="<?= htmlspecialchars(e3dcWebLoginReturnTarget(), ENT_QUOTES, 'UTF-8') ?>">
                             <div class="mb-4">
                                 <input type="password" name="pin" class="form-control form-control-lg text-center fw-bold bg-body-secondary text-body border-secondary" placeholder="****" autofocus required style="letter-spacing: 0.5em;">
                             </div>
@@ -3479,6 +3500,10 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 }
             })();
 
+            const corridorNow = storageCorridorNow(data);
+            $('#stat-regler-soll-label').text('Jetzt');
+            $('#stat-regler-soll-now, #head-re').text(corridorNow.label);
+            $('#head-re-wrap').attr('title', corridorNow.label);
             if (data.ladekurve) {
                 const lk = data.ladekurve;
                 const dayLabel = (lk.day_label || (window._storagePlanMeta && window._storagePlanMeta.display_day_label) || 'Heute');
@@ -3486,7 +3511,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 const fmtSoc = v => (v !== null && v !== undefined && !isNaN(parseFloat(v))) ? parseFloat(v).toFixed(1) + '%' : '--';
                 $('#stat-regler-day, #sc-modal-day').text(dayLabel);
                 $('#stat-regler-rb-label').text('Prognosestart:');
-                $('#stat-regler-soll-label').text(isFutureDay ? 'Morgenpuffer' : 'Jetzt');
+                $('#stat-regler-soll-label').text('Jetzt');
 
                 // Phase-Badge
                 if (data.storage_phase) {
@@ -3524,49 +3549,11 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 $('#stat-regler-le-time').text(frT);
                 $('#stat-regler-le-soc').text(frSoc !== null ? fmtSoc(frSoc) : '');
 
-                // Header-Info (kompakt im Energiefluss, nur XL-Desktop)
-                const headerNowMs = Date.now();
-                const interpHeaderCurveSoc = (curve, ts) => {
-                    if (!Array.isArray(curve) || curve.length === 0) return null;
-                    if (ts <= curve[0].ts) return curve[0].soc;
-                    if (ts >= curve[curve.length - 1].ts) return curve[curve.length - 1].soc;
-                    for (let i = 0; i < curve.length - 1; i++) {
-                        if (ts >= curve[i].ts && ts <= curve[i + 1].ts) {
-                            const duration = Math.max(1, curve[i + 1].ts - curve[i].ts);
-                            const frac = (ts - curve[i].ts) / duration;
-                            return curve[i].soc + (curve[i + 1].soc - curve[i].soc) * frac;
-                        }
-                    }
-                    return null;
-                };
-                const headerControlSoc = data.storage_curve_control_soc != null && !isNaN(parseFloat(data.storage_curve_control_soc))
-                    ? parseFloat(data.storage_curve_control_soc)
-                    : null;
-                const headerRawSoc = data.soc != null && !isNaN(parseFloat(data.soc)) ? parseFloat(data.soc) : null;
-                const headerSoc = headerControlSoc !== null ? headerControlSoc : headerRawSoc;
-                const headerFloorNow = interpHeaderCurveSoc(window._storageSocMinCurve || [], headerNowMs);
-                const headerTargetNow = interpHeaderCurveSoc(window._storageSollCurve || [], headerNowMs);
-                const headerCeilingNow = interpHeaderCurveSoc(window._storageSocCeilingCurve || [], headerNowMs);
-                let headerTargetLabel = '--';
-                let headerTargetTitle = 'Aktives Regelziel';
-                let headerTargetIcon = 'fas fa-bullseye text-info opacity-75';
-                if (headerSoc !== null && headerFloorNow !== null && headerSoc < headerFloorNow - 0.3) {
-                    headerTargetLabel = 'Unterkante ' + headerFloorNow.toFixed(0) + '%';
-                    headerTargetTitle = 'Aktives Regelziel: Speicher liegt unter der Zielkorridor-Unterkante.\nRegel-SoC: ' + headerSoc.toFixed(1) + '%\nUnterkante jetzt: ' + headerFloorNow.toFixed(1) + '%\nDer Tagespfad bleibt der Rahmen; im Ladekurven-Detail ist die Sollkurve sichtbar.';
-                    headerTargetIcon = 'fas fa-bullseye text-success opacity-75';
-                } else if (headerSoc !== null && headerCeilingNow !== null && headerSoc > headerCeilingNow + 0.3) {
-                    headerTargetLabel = 'Oberkante ' + headerCeilingNow.toFixed(0) + '%';
-                    headerTargetTitle = 'Aktives Regelziel: Speicher liegt über der Zielkorridor-Oberkante.\nRegel-SoC: ' + headerSoc.toFixed(1) + '%\nOberkante jetzt: ' + headerCeilingNow.toFixed(1) + '%';
-                    headerTargetIcon = 'fas fa-bullseye text-warning opacity-75';
-                } else if (headerTargetNow !== null) {
-                    headerTargetLabel = 'Sollkurve ' + headerTargetNow.toFixed(0) + '%';
-                    headerTargetTitle = 'Aktives Regelziel: Sollkurve im Zielkorridor.\n' + (headerSoc !== null ? 'Regel-SoC: ' + headerSoc.toFixed(1) + '%\n' : '') + 'Sollkurve jetzt: ' + headerTargetNow.toFixed(1) + '%';
-                    headerTargetIcon = 'fas fa-route text-info opacity-75';
-                } else if (hasRealPeak) {
-                    headerTargetLabel = pkT + (pkSoc !== null && !pkPast ? ' (' + parseFloat(pkSoc).toFixed(0) + '%)' : '');
-                    headerTargetTitle = peakIsLive ? 'PV-Spitze bisher' : 'PV-Höchstleistung laut Prognose';
-                    headerTargetIcon = 'fas fa-stop text-warning opacity-75';
-                }
+                // Alle Jetzt-Anzeigen verwenden die Korridorlage des Speicher-Managers.
+                const headerTarget = corridorNow;
+                const headerTargetLabel = headerTarget.label;
+                const headerTargetTitle = headerTarget.label;
+                const headerTargetIcon = 'fas fa-bullseye ' + headerTarget.colorClass + ' opacity-75';
                 $('#header-regler-plan').removeClass('d-none').addClass('d-none d-xl-flex');
                 $('#head-rb').text(dayLabel + ' ' + lsT + (lsSoc !== null && lsT !== 'Aktiv' ? ' (' + parseFloat(lsSoc).toFixed(0) + '%)' : ''));
                 $('#head-re').text(headerTargetLabel);
@@ -3574,23 +3561,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 $('#head-re-icon').attr('class', headerTargetIcon);
                 $('#head-le').text(frT + (frSoc !== null ? ' (' + parseFloat(frSoc).toFixed(0) + '%)' : ''));
 
-                // Soll-SoC jetzt (interpoliert) + Meta in der Kachel-Fusszeile
-                const nowMs = headerNowMs;
                 const sollCurve = window._storageSollCurve || [];
-                let sollNow = null;
-                for (let i = 0; i < sollCurve.length - 1; i++) {
-                    if (nowMs >= sollCurve[i].ts && nowMs <= sollCurve[i+1].ts) {
-                        const frac = (nowMs - sollCurve[i].ts) / (sollCurve[i+1].ts - sollCurve[i].ts);
-                        sollNow = sollCurve[i].soc + (sollCurve[i+1].soc - sollCurve[i].soc) * frac;
-                        break;
-                    }
-                }
-                if (sollNow === null && sollCurve.length > 0) {
-                    if (nowMs < sollCurve[0].ts) sollNow = sollCurve[0].soc;
-                    else sollNow = sollCurve[sollCurve.length-1].soc;
-                }
-                if (sollNow !== null) $('#stat-regler-soll-now').text(fmtSoc(sollNow));
-                else if (isFutureDay && lsSoc !== null) $('#stat-regler-soll-now').text(fmtSoc(lsSoc));
 
                 const emsChargeRaw = data.ems_max_charge_power_w != null ? data.ems_max_charge_power_w : data.storage_max_charge_w;
                 const emsDischargeRaw = data.ems_max_discharge_power_w != null ? data.ems_max_discharge_power_w : data.storage_max_discharge_w;
@@ -3817,6 +3788,11 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
         // Solar wird mit defer geladen. Erst nach dessen vollständiger Ausführung darf
         // der erste Live-Transport Daten an processLiveData übergeben.
         function startDesktopLiveTransportOnce() {
+            if (typeof document.querySelector === 'function'
+                && document.querySelector('input[name="action"][value="web_login"]')) {
+                window.E3DC_LIVE_AUTH_BLOCKED = true;
+                return false;
+            }
             if (desktopLiveTransportStarted) return true;
             if (typeof window.processLiveData !== 'function') return false;
             desktopLiveTransportStarted = true;

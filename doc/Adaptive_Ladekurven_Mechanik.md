@@ -1,7 +1,5 @@
 # Adaptive Ladekurven-Mechanik
 
-> **Stand:** V5.2.2a, aktualisiert am 2026-06-16
-
 Diese Datei erklärt die Idee hinter der adaptiven Speicher-Ladekurve in
 einfacher Sprache. Die technische Detailbeschreibung steht in
 [Ladekurve_Berechnung.md](Ladekurve_Berechnung.md).

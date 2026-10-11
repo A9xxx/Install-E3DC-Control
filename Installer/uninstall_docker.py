@@ -34,8 +34,18 @@ def uninstall_docker_routine():
     # 1. Docker Container stoppen und löschen
     print("\n→ Beende und lösche Docker-Container...")
     # Nutze subprocess, damit der Stoppvorgang im Terminal sichtbar ist
-    subprocess.run("sudo docker compose down", cwd=docker_dir, shell=True)
-    print("  ✓ Container entfernt.")
+    try:
+        stopped = subprocess.run("sudo docker compose down", cwd=docker_dir, shell=True)
+        containers_stopped = stopped.returncode == 0
+    except OSError:
+        containers_stopped = False
+    if not containers_stopped:
+        print("  ⚠ Container ließen sich nicht sauber beenden.")
+        if input("Container ließen sich nicht sauber beenden – trotzdem fortfahren? (j/n): ").strip().lower() != "j":
+            print("Abbruch. Daten und Host-Dienste wurden nicht verändert.")
+            return None
+    else:
+        print("  ✓ Container entfernt.")
 
     # 2. Daten migrieren
     print("\n→ Kopiere Daten zurück auf das lokale System...")
@@ -46,7 +56,7 @@ def uninstall_docker_routine():
         # Zuerst alles nach /var/www/html/data kopieren
         run_command(f"sudo cp -r {data_dir}/* {host_web_data}/ 2>/dev/null")
         
-        # Dann Configs und Archive (*.txt, *.dat) zurück in den C++ Ordner schieben
+        # Dann Configs und Archive (*.txt, *.dat) zurück in den Installationsordner schieben
         run_command(f"sudo mv {host_web_data}/*.txt {install_path}/ 2>/dev/null")
         run_command(f"sudo mv {host_web_data}/*.dat {install_path}/ 2>/dev/null")
         print("  ✓ Daten erfolgreich migriert.")
@@ -62,23 +72,28 @@ def uninstall_docker_routine():
     # 4. Lokale Dienste wiederherstellen
     print("\n→ Reaktiviere lokale Host-Dienste...")
     run_command("sudo systemctl enable apache2 && sudo systemctl start apache2")
-    run_command("sudo systemctl enable e3dc && sudo systemctl start e3dc")
     run_command("sudo systemctl enable e3dc-notifier && sudo systemctl start e3dc-notifier")
-    print("  ✓ Grunddienste (Apache, E3DC, Notifier) gestartet.")
+    print("  ✓ Grunddienste (Apache, Notifier) gestartet.")
 
     # 5. Rechte-Wizard ausführen (Rechte setzen & weitere Dienste dynamisch starten)
     print("\n→ Führe finale Rechte- und Service-Prüfung aus...")
     try:
         from .permissions import run_permissions_wizard
-        run_permissions_wizard(headless=True)
+        if run_permissions_wizard(headless=True) is not True:
+            print("  ✗ Rückwechsel unvollständig. Rechte und Dienste über 3) Rechte prüfen & korrigieren oder 1) Installation / Update prüfen.")
+            return False
     except Exception as e:
-        print(f"  ⚠ Fehler bei der Rechte-Reparatur: {e}")
+        print(f"  ✗ Fehler bei der Rechte-Reparatur: {e}")
+        return False
 
     print("\n" + "="*60)
     print("✓ RÜCKWECHSEL ERFOLGREICH!")
     print("="*60)
     print("Das System läuft nun wieder nativ (Bare-Metal) auf deinem Host.")
-    print("Die Docker-Container wurden entfernt und deine Live-Daten wiederhergestellt.")
+    if containers_stopped:
+        print("Die Docker-Container wurden entfernt und die Live-Daten wiederhergestellt.")
+    else:
+        print("Die Live-Daten wurden zurückgeführt. Den Zustand der Docker-Container bitte gesondert prüfen.")
     log_task_completed("Docker Uninstall & Revert")
 
 register_command("32", "🐳 Docker auflösen & zum lokalen System zurückkehren", uninstall_docker_routine, sort_order=32)

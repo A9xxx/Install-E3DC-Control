@@ -43,6 +43,7 @@ PREDUMP_CONSUMER_PLAN_FILE = "/var/www/html/ramdisk/predump_consumer_plan.json"
 AVAILABILITY_TOPIC_SUFFIX = "status/availability"
 INBOUND_MAX_AGE_S = 180
 MAIN_CONNECTION_GENERATION = 0
+MQTT_HUB_STATUS_FILE = os.path.join(RAMDISK_DIR, "mqtt_hub_status.json")
 
 def setup_logging():
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -142,6 +143,7 @@ def write_json_atomic(path, payload, ensure_ascii=False):
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=ensure_ascii)
+        os.chmod(tmp, 0o664)
         os.replace(tmp, path)
     finally:
         try:
@@ -149,6 +151,21 @@ def write_json_atomic(path, payload, ensure_ascii=False):
                 os.remove(tmp)
         except OSError:
             pass
+
+
+def write_mqtt_hub_status(client, wb_client, wb2_client):
+    """Schreibt nur Lebenszeichen und Verbindungszustände, ohne Broker- oder Kontodaten."""
+    connections = {}
+    for name, connection in (("main", client), ("wallbox1", wb_client), ("wallbox2", wb2_client)):
+        try:
+            connections[name] = {"connected": bool(connection.is_connected()), "reason": None} if connection is not None else {"connected": None, "reason": "Kein Client verfügbar"}
+        except Exception:
+            connections[name] = {"connected": None, "reason": "Verbindungszustand nicht lesbar"}
+    try:
+        write_json_atomic(MQTT_HUB_STATUS_FILE, {"updated_at": time.time(), "connections": connections})
+    except Exception:
+        # Die Diagnoseausgabe darf den MQTT-Hauptzyklus nicht unterbrechen.
+        logger.debug("MQTT-Lebenszeichen konnte nicht geschrieben werden.")
 
 
 @contextmanager
@@ -1145,6 +1162,7 @@ def main():
     last_individual = {}
     live_source_available = None
     observed_connection_generation = -1
+    next_status_at = 0.0
     while True:
         if not _mqtt_context_valid(refresh=True):
             _write_disabled_mqtt_state()
@@ -1245,6 +1263,10 @@ def main():
                 live_source_available = False
                 last_data = ""
                 logger.debug(f"MQTT Live-Publish pausiert: {e}")
+        now_monotonic = time.monotonic()
+        if now_monotonic >= next_status_at:
+            write_mqtt_hub_status(client, wb_client, wb2_client)
+            next_status_at = now_monotonic + 30.0
         time.sleep(2)
 
 if __name__ == "__main__":

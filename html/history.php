@@ -4,6 +4,8 @@
    ===================================================================== */
 $paths = getInstallPaths();
 $backups = getHistoryBackupFiles();
+$costHistoryConfig = loadE3dcConfig();
+$costHistoryEnabled = (string)($costHistoryConfig['config']['cost_accounting_quarterhour_enable'] ?? '0') === '1';
 
 // Automatisches Update beim Laden der Seite wurde entfernt. Update nur noch manuell per Button.
 ?>
@@ -39,6 +41,9 @@ $backups = getHistoryBackupFiles();
             <option value="bat">Batterie Details</option>
             <option value="grid">Netz Details (Phasen)</option>
             <option value="price">Strompreis & Kosten</option>
+            <?php if ($costHistoryEnabled): ?>
+            <option value="costs">Kostenhistorie (experimentell)</option>
+            <?php endif; ?>
             <?php if ($wbEnabled): ?>
             <option value="wb">Wallbox Details</option>
             <?php endif; ?>
@@ -62,7 +67,10 @@ $backups = getHistoryBackupFiles();
     </div>
 </div>
 
-<div class="ratio ratio-1x1 w-100 position-relative" style="min-height: 400px; max-height: 70vh; border-radius: 8px; overflow: hidden; border: 1px solid var(--border-card);">
+<?php if ($costHistoryEnabled): ?>
+<?php include __DIR__ . '/cost_history_view.php'; ?>
+<?php endif; ?>
+<div id="historyPowerPanel" class="ratio ratio-1x1 w-100 position-relative" style="min-height: 400px; max-height: 70vh; border-radius: 8px; overflow: hidden; border: 1px solid var(--border-card);">
     <!-- Live JS Chart Overlay -->
     <div id="liveChartContainer" class="w-100 h-100 position-absolute top-0 start-0 p-2" style="background-color: var(--bg-card); z-index: 10;">
         <canvas id="liveChartCanvas"></canvas>
@@ -126,6 +134,13 @@ $backups = getHistoryBackupFiles();
     btn.addEventListener('click', triggerUpdate);
 
     function triggerUpdate(){
+        var costPanel = document.getElementById('costHistoryPanel');
+        var costView = currentView === 'costs' && costPanel;
+        if (costPanel) costPanel.classList.toggle('d-none', !costView);
+        document.getElementById('historyPowerPanel').classList.toggle('d-none', !!costView);
+        filterGroup.classList.toggle('d-none', !!costView || !!currentFile);
+        archiveSelect.parentElement.parentElement.classList.toggle('d-none', !!costView);
+        if (costView) { loadCostHistory(); return; }
         btn.disabled = true;
         archiveSelect.disabled = true;
         viewSelect.disabled = true;

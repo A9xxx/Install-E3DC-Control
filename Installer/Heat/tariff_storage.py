@@ -1,15 +1,40 @@
-"""Speichervertrag des Tariffenster-Auftrags; keine Lastreservierung."""
+"""Speichervertrag für Tariffenster und WP-Netzboost; keine Lastreservierung."""
 import copy
 import math
 from .tariff_shift import number, enabled, tariff_window
 
 
+def grid_boost_active(config, signal, now):
+    """Aktiven Netzboost aus dem frischen Entscheidungsdatensatz übernehmen."""
+    signal = signal if isinstance(signal, dict) else {}
+    decision = signal.get('decision')
+    decision = decision if isinstance(decision, dict) else {}
+    policy = decision.get('heat_policy')
+    policy = policy if isinstance(policy, dict) else {}
+    ts = number(signal.get('ts'))
+    # Der Policy-Besitzer und der aktive Marktauftrag sind getrennte Felder.
+    # Eine bloße Preisabsicht oder Heizstab-Freigabe besitzt den WP-Halt nicht.
+    return bool(enabled(config.get('price_boost_enable'))
+                and ts is not None and 0 <= now - ts <= 45
+                and decision.get('price_action') == 'BOOST'
+                and decision.get('price_boost_active') is True
+                and decision.get('market_plan_heatpump_active') is True
+                and decision.get('heatpump_boost_owner') == 'market_plan_heatpump'
+                and policy.get('owner') == 'heatpump_grid_boost'
+                and policy.get('target_state') == 'BOOST'
+                and policy.get('runtime_enabled') is True)
+
+
 def apply(config, live, payload, request, *, now, reserve_pct, previous_state=None,
-          min_interval_s=30.0, deadband_w=200):
+          min_interval_s=30.0, deadband_w=200, grid_boost_signal=None):
     result = copy.deepcopy(payload)
-    if config.get('heat_tariff_shift_mode', 'off') not in ('shadow', 'active'):
+    boost_active = grid_boost_active(config, grid_boost_signal, now)
+    if not boost_active and config.get('heat_tariff_shift_mode', 'off') not in ('shadow', 'active'):
         return result
     request = request if isinstance(request, dict) else {}
+    if boost_active:
+        # Gleicher Halt und gleiche Schreibbremse, unabhängig vom Tarifmodus.
+        request = {'active': True, 'intent_revision': 'heatpump_grid_boost'}
     ts = number(live.get('_ts'))
     soc, reserve = number(live.get('SOC')), number(reserve_pct)
     grid = number(live.get('Grid_Power'))
@@ -37,7 +62,7 @@ def apply(config, live, payload, request, *, now, reserve_pct, previous_state=No
                 and not result.get('heatpump_pv_set_power_only') and not result.get('wallbox_fixed_start_set_power_only')
                 and result.get('mode') == 0 and (not result.get('protected') or peak_owner)
                 and not result.get('hard_mode_guard_errors')
-                and enabled(config.get('auto_mode')) and str(config.get('wp_type')) == '0'
+                and enabled(config.get('auto_mode')) and (boost_active or str(config.get('wp_type')) == '0')
                 and enabled(config.get('heat_policy_runtime_enable')))
     contract = {'ts': now, 'safety_free': safe, 'intent_revision': request.get('intent_revision'),
                 'hold_w': None, 'peak_priority_w': None, 'active': False, 'reason': 'safety_or_source_blocked' if not safe else 'no_active_request'}
@@ -50,10 +75,10 @@ def apply(config, live, payload, request, *, now, reserve_pct, previous_state=No
         return result
     request_ts = number(request.get('ts'))
     window = tariff_window(config, now)
-    eligible = bool(safe and config.get('heat_tariff_shift_mode') == 'active'
+    eligible = bool(safe and (boost_active or (config.get('heat_tariff_shift_mode') == 'active'
                     and request.get('mode') == 'active' and (request.get('would_start') is True or request.get('active') is True)
                     and request_ts is not None and 0 <= now - request_ts <= 30
-                    and window['valid'] and (request.get('window') or {}).get('revision') == window['revision'])
+                    and window['valid'] and (request.get('window') or {}).get('revision') == window['revision'])))
     if not eligible:
         return result
     # Die Wärmepumpe steckt bereits in der Netz-/Akkubilanz. Ihre gemessene
@@ -148,7 +173,8 @@ def apply(config, live, payload, request, *, now, reserve_pct, previous_state=No
     if not reusable or bound != previous_cap:
         changed_ts = now
     auto.update(enabled=True, release=False, max_charge_w=int(charge), max_discharge_w=int(bound),
-                discharge_start_w=0, heartbeat_s=2., reason='Tariffenster: gemessene WP-Leistung aus dem Netz')
+                discharge_start_w=0, heartbeat_s=2., reason=('Netzboost: gemessene WP-Leistung aus dem Netz' if boost_active
+                        else 'Tariffenster: gemessene WP-Leistung aus dem Netz'))
     result['auto_limit'] = auto
     contract.update(active=True, discharge_cap_w=auto['max_discharge_w'], changed_ts=changed_ts)
     return result

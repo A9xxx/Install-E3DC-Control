@@ -10,6 +10,10 @@ werden jedoch in der WebUI deutlich angezeigt.
 from __future__ import annotations
 
 import ipaddress
+try:
+    from .shelly_relay_owner import shelly_relay_conflict, SHELLY_OWNER_WARNING
+except ImportError:
+    from shelly_relay_owner import shelly_relay_conflict, SHELLY_OWNER_WARNING
 import json
 import math
 import os
@@ -54,11 +58,13 @@ except Exception:  # pragma: no cover - direct script execution fallback
     from aux_inverter_contract import effective_contract as _aux_inverter_contract  # type: ignore
 try:
     from .tariff_schedule import (
+        recurring_tariff_stages,
         supports_heat_price_boost,
         supports_spot_market_prices,
     )
 except Exception:  # pragma: no cover - direct script execution fallback
     from tariff_schedule import (  # type: ignore
+        recurring_tariff_stages,
         supports_heat_price_boost,
         supports_spot_market_prices,
     )
@@ -997,6 +1003,12 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     consumer.update(validate_heatpump_pv_config(cfg))
     consumer.update(validate_heatpump_display_config(cfg))
     consumer.update(validate_stiebel_sg_ready_config(cfg))
+    if shelly_relay_conflict(cfg):
+        consumer["shelly_3em_relay_id"] = _entry(
+            key="shelly_3em_relay_id", label="Shelly-Relais: doppelte Zuordnung", unit="",
+            configured=cfg.get("shelly_3em_relay_id"), live_value=None, live_key=None,
+            effective=None, source="user", severity="warning", message=SHELLY_OWNER_WARNING,
+        )
     consumer.update(validate_heatpump_start_config(cfg))
     price: Dict[str, Dict[str, Any]] = {}
     forecast = validate_solcast_config(cfg)
@@ -1058,6 +1070,30 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             severity=severity,
             message=message,
         )
+
+    # Gemeinsame Laufzeitgrenze; der Import erfolgt erst nach Modulinitialisierung.
+    try:
+        from .Storage.power_limits import effective_power_limit_cfg
+    except ImportError:
+        from Storage.power_limits import effective_power_limit_cfg
+    limits = effective_power_limit_cfg(cfg, live)["_power_limit_diagnostics"]
+    for direction, key, label in (("charge", "maximumladeleistung", "Max. Laden (W)"),
+                                  ("discharge", "maximaleentladeleistung", "Max. Entladen (W)")):
+        prefix = "power_limit_" + direction
+        device_key = "device_max_" + direction + "_power_w"
+        entry = storage[key]
+        entry["label"] = label
+        if limits[device_key + "_valid"]:
+            entry["effective"] = limits[prefix + "_effective_w"]
+            entry["source"] = limits[prefix + "_source"]
+            entry["rscp"] = limits[device_key]
+            entry["rscp_key"] = device_key
+        hint = limits[prefix + "_hint"]
+        if hint and hint != "device_limit_unknown":
+            entry["severity"] = "warning"
+            entry["message"] = label + ": " + hint
+        elif hint == "device_limit_unknown":
+            entry["device_limit_status"] = hint
 
     capacity_cfg = safe_float(cfg.get("speichergroesse"), float("nan")) if _has_user_value(cfg, "speichergroesse") else None
     capacity_live, capacity_live_key = _capacity_live_value(live)
@@ -2947,6 +2983,40 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             if octopus_bad_order else "Preisfeld ist plausibel."
         ),
     )
+    fixed_stages = recurring_tariff_stages(cfg)
+    if fixed_stages is not None and not fixed_stages["valid"]:
+        if tariff == "octopus_heat":
+            field_labels = {
+                "strompreis_basis": "Arbeitspreis (ct/kWh)",
+                "strompreis_cheap": "Günstig (LT)",
+                "strompreis_uht": "Extrem Teuer (UHT)",
+            }
+            for key, label in field_labels.items():
+                raw = cfg.get(key)
+                try:
+                    value = float(str(raw).strip().replace(",", "."))
+                except (TypeError, ValueError):
+                    value = float("nan")
+                if math.isfinite(value):
+                    continue
+                reason = "Pflichtfeld nicht gesetzt" if raw is None or str(raw).strip() == "" else "Preis ist keine endliche Zahl"
+                price[key] = _entry(
+                    key=key, label=label, unit="ct/kWh", configured=raw,
+                    live_value=None, live_key=None, effective=None, source="invalid",
+                    severity="warning",
+                    message=f"{label}: {reason}. Preis-Netzladen erhält ohne vollständige Octopus-Stufen keine Freigabe. Die Eingabe bleibt erhalten.",
+                )
+        else:
+            reason = {
+                "fixed_tariff_stages_missing": "Tagesplan nicht gesetzt",
+                "fixed_tariff_stages_conflicting": "widersprüchliche Preise für dieselbe Startzeit",
+            }.get(fixed_stages["reason"], "ungültige Startzeit oder Preisangabe; nur Startzeit und Zahl ohne Freitext oder ct-Suffix zulässig")
+            price["strompreis_spezial"] = _entry(
+                key="strompreis_spezial", label="Spezialtarif-Zeitpreise", unit="ct/kWh",
+                configured=cfg.get("strompreis_spezial"), live_value=None, live_key=None,
+                effective=None, source="invalid", severity="warning",
+                message=f"Spezialtarif-Zeitpreise: {reason}. Preis-Netzladen erhält keine Freigabe. Format beispielsweise 00:00 16,71 und 05:00 26,7. Die Eingabe bleibt erhalten.",
+            )
     price_order_warning = price_limit > price_pause
     heat_price_pilot_ready = bool(
         heat_price_boost_requested

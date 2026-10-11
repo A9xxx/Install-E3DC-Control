@@ -1,7 +1,5 @@
 # Börsenpreis-Optimierung und Preis-Boost
 
-> **Stand:** V5.2.4e, aktualisiert am 2026-06-23
-
 Diese Dokumentation trennt bewusst zwei Dinge, die in der Praxis oft vermischt
 werden:
 
@@ -30,9 +28,11 @@ ziehen wollen:
 - Wärmepumpe oder Heizstab freigeben,
 - vorher Speicherplatz lassen, wenn später günstiger Netzstrom erwartet wird.
 
-Die Preisgrenze beschreibt den maximal erlaubten Nutzerpreis für diesen
-Boost-Pfad. Beispiel: `0 ct/kWh` bedeutet, dass der Boost erst bei
-Null- oder Negativpreis aktiv wird.
+Die Preisgrenze (`cheap_grid_price_limit_ct`, im Config-Editor „Preisgrenze
+(Legacy)“) kann die Freigabe nur verschärfen: Der Boost wird nur bei negativem
+Abrechnungspreis aktiv, also unter 0 ct/kWh. `0` bedeutet „jeder negative
+Preis“; ein negativer Wert verlangt mindestens diesen Preis (zum Beispiel `-2`
+erst ab −2 ct/kWh). Positive Werte öffnen den Boost nicht.
 
 Dieser Block ist nicht die allgemeine Antwort auf unbekannte hohe Hauslasten.
 Er arbeitet nur mit freigegebenen Verbrauchern und klarer Preisgrenze.
@@ -43,21 +43,28 @@ kommenden Bedarf decken, bleibt die normale Ladekurve führend. Der Preis-Boost
 wird erst aktiv, wenn daraus ein plausibler, freigegebener Lade- oder
 Halteauftrag entsteht.
 
-## 3. Preis-Reserve / Mindest-Preisvorteil
+## 3. Preis-Mindestmarge / Mindest-Preisvorteil
 
-Die bisherige Bezeichnung `Preis-Reserve (%)` meint technisch eher eine
-Preis-Toleranz beziehungsweise einen Mindest-Preisvorteil. Der Wert verhindert,
-dass das System wegen winziger Preisdifferenzen unnötige Ladezyklen erzeugt.
+Die **Preis-Mindestmarge** (`market_min_margin_pct`) ist der Mindest-Preisvorteil,
+den eine Netzladung des Speichers nach Wirkungsgrad, Akkukosten und
+Sicherheitskorrektur bringen muss. Der Wert verhindert, dass das System wegen
+winziger Preisdifferenzen unnötige Ladezyklen erzeugt.
 
 Faustregel:
 
-- um 15 Prozent deckt typische Lade-/Entladeverluste und kleine Preisunsicherheiten ab,
+- 10 Prozent (Standard und Vorgabe des Ladeprofils „Wirtschaftlich“) decken
+  typische Lade-/Entladeverluste und kleine Preisunsicherheiten ab,
 - höhere Werte bevorzugen nur die wirklich günstigsten Stunden,
-- niedrigere Werte reagieren aggressiver auf kleinere Preisunterschiede.
+- niedrigere Werte reagieren aggressiver auf kleinere Preisunterschiede; die
+  Profile „Ausgeglichen“ und „Komfort“ setzen 0 Prozent.
 
-Für Octopus-Heat- oder EPEX-Nutzer ist dieser Wert die Stellgröße dafür, ob nur
-der günstigste Bereich genutzt wird oder auch angrenzende Stunden mitlaufen
-dürfen.
+Das Feld ist nur im Ladeprofil „Eigene Einstellungen“ frei; die übrigen Profile
+setzen es fest (Abschnitt 5, „Ladeprofil“). Für Octopus-Heat- oder EPEX-Nutzer
+ist dieser Wert zugleich die Preistoleranz dafür, ob nur der günstigste Bereich
+genutzt wird oder auch angrenzende Stunden als Folgefenster mitlaufen dürfen.
+
+Das ältere Feld **Preis-Reserve (%)** (`awreserve`) wird von den aktuellen
+Reglern und vom Webportal nicht ausgewertet.
 
 ## 4. Was die Preislogik nicht errät
 
@@ -102,8 +109,12 @@ Netzladen trotz Einspeisung beginnt erst ab diesem Zeitpunkt. Ist das Ziel
 erreicht (Hysterese 1 SoC-Punkt, `market_target_hysteresis_pct`; kleinere Werte
 werden auf 1 angehoben), wird im selben Fenster nicht erneut aus dem Netz
 geladen: Der Speicher bleibt bis zum Fensterende entladegesperrt, PV lädt
-weiter. Für den Marktpfad freigegebene Verbraucher (Wallbox, Wärmepumpe)
-bleiben bis zum Fensterende freigegeben.
+weiter. Für den Marktpfad freigegebene Verbraucher (Wallbox über
+`market_wallbox_enable`, nur für Ladepunkte in `Sofort bis Preislimit`;
+Heizstab über `market_heater_enable`) bleiben bis zum Fensterende
+freigegeben. Die Wärmepumpe gibt der normale Marktpfad nicht frei; sie
+behält ihre Prognose-, PV- und Pre-Dump-Führung mit Taktschutz. Nur der
+Negativpreis-Boost (Abschnitt 2) kann sie gesondert freigeben.
 
 Der Netzladebedarf wird zeitgerichtet bestimmt: Er reicht nur bis zum nächsten
 nutzbaren günstigen Preisfenster (gleicher Tarifpreis oder höchstens um die
@@ -150,6 +161,25 @@ Ladevolumen. Reicht das Ziel bis 100 %, weil der Bedarf bis zum nächsten
 Fenster groß ist, kann danach PV eingespeist werden – das ist physikalisch
 unvermeidbar. Solange der Speicher im Fenster gehalten wird, bezieht das Haus
 seinen Verbrauch zum günstigen Preis aus dem Netz statt aus dem Speicher.
+
+Bei Spezialtarifen mit Tagesplan und bei Octopus Heat werden günstige
+Fenster aus den vollständig konfigurierten Tarifstufen bestimmt. Bei zwei
+Stufen ist nur die untere günstig; Zwischenstufen zählen nur dann dazu, wenn
+der Abstand zur höchsten späteren Stufe Wirkungsgrad, Akkukosten,
+Sicherheitskorrektur und Mindestmarge deckt. Ein einheitlicher Tarif erzeugt
+kein künstliches Preisfenster. Fehlende, ungültige oder widersprüchliche
+Stufen geben keine Netzladung frei. Fensterende und Referenzpreis bleiben
+innerhalb des Tarifsegments gebunden; eine Tarifänderung bindet die Referenz
+neu. Prognosebedarf, Zielhysterese und Schutzgrenzen gelten weiterhin.
+Börsentarife und die Verkaufspreisbewertung der Direktvermarktung behalten
+ihre eigene Klassifikation. Die Entscheidungsvorschau liest beim Spezialtarif
+den Tagesplan; leere Preisfelder gelten als nicht gesetzt. Alle Zwischenstufen
+werden in der Vorschau einzeln bewertet. Ungültige Spezialtarif-Zeitpreise
+oder fehlende Octopus-Pflichtpreise erzeugen eine beratende Warnung beim
+betroffenen Feld; die Eingaben bleiben erhalten. Im Komfortprofil beendet
+jeder Preiswechsel das bisherige Tarifsegment, auch wenn die nächste Stufe
+noch unter dem Preislimit liegt. Dort wird ein eigener Ladejob mit neuem
+Fensterende und eigenem Referenzpreis berechnet; das Komfortziel bleibt gleich.
 
 ### Ladeprofil
 
@@ -232,6 +262,7 @@ Relevante Dateien:
 | `eco_score.json` | Nutzerpreis, Marktpreis, Eco-Score |
 | `price_boost_plan.json` | erkannte Boost-Fenster |
 | `storage_manager_state.json` | aktueller Preis-/Speicherzustand |
+| `storage_plan.json` | Speicherplan des Storage Simulators mit Marktplan (`market_plan`), Netzladejob und Fensterdiagnose (`grid_charge_window_fill`) |
 | Wallbox-Entscheidungen | Preisfreigabe, Ladeplan, Netzfreigabe |
 
 Wenn ein System bei günstigem Preis nicht lädt, zuerst prüfen:

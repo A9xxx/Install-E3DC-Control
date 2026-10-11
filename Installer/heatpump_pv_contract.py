@@ -14,6 +14,12 @@ import math
 # Aus der bestehenden PV-Startlogik im Energy Manager: 500 W Schaltabstand.
 # Gemeinsame Startkante für Qualifikation und Freigabe, kein Dauerabzug.
 PV_START_MARGIN_W = 500.0
+GRID_MEASUREMENT_BAND_W = 200.0
+REQUEST_WITHDRAWAL_DEBOUNCE_S = 45.0
+# Bestehende WP-Reaktionszeit (wp_pv_reaction_s, Standard 30 s).
+# Die unabhängige Netzschranke erhält diese feste, zusammenhängende Frist.
+GRID_STOP_DEBOUNCE_S = 30.0
+GRID_STOP_THRESHOLD_W = 2500.0
 
 DEMAND_SCHEMA = "heatpump_pv_demand_v1"
 STATE_SCHEMA = "heatpump_pv_state_v1"
@@ -58,6 +64,88 @@ def _clock(value, state):
     if previous.get("boot_id") != boot or old_mono is None or mono < old_mono:
         return wall, state.get("last_ts", wall), current, True
     return wall, state.get("last_ts", wall) + mono - old_mono, current, False
+
+
+def heatpump_grid_stop(previous, observation, source, *, clock_sample, config):
+    """Frischer Netzbezug mit Entprellung; Hausanschluss wirkt sofort.
+
+    Der Zustand ist flüchtig. Lücke, Zeitrücksprung oder Neustart verdienen die
+    Frist neu. Wiederlesen derselben Proben erzeugt keine zusätzlichen Sekunden.
+    Ohne frische WP-Einzelmessung zählt der Gesamtbezug abzüglich Messband.
+    Ein Wechsel dieser Grundlage beginnt die Frist neu.
+    """
+    prev, obs, src, cfg = map(_dict, (previous, observation, source, config))
+    clock = _dict(clock_sample)
+    wall = _number(clock.get("wall_ts"))
+    mono = _number(clock.get("monotonic_ts"))
+    grid = _number(src.get("grid_w"), minimum=-math.inf)
+    power = _number(obs.get("power_w"))
+    grid_ts, wp_ts = _number(src.get("sample_ts")), _number(obs.get("sample_ts"))
+    grid_fresh = bool(wall is not None and src.get("fresh") is True
+        and grid_ts is not None and 0 <= wall - grid_ts <= 15.0 and grid is not None)
+    wp_fresh = bool(wall is not None and obs.get("fresh") is True and power is not None
+        and wp_ts is not None and 0 <= wall - wp_ts <= 45.0)
+    house = False
+    if grid_fresh:
+        amps = _number(cfg.get("grid_max_amps"))
+        reserve = _number(cfg.get("grid_max_reserve_amp"), 2.0)
+        if amps is not None and amps > 0:
+            house = grid >= max(0.0, amps - reserve) * 230.0 * 3.0
+        # Dieselben vorhandenen Netzphasen und konfigurierten Grenzen.
+        # Fehlende Phasen bleiben unbekannt; sie werden nicht als 0 eingesetzt.
+        for phase in (1, 2, 3):
+            limit = _number(cfg.get("grid_max_amps_l" + str(phase)), amps)
+            phase_w = _number(src.get("grid_p" + str(phase)), minimum=-math.inf)
+            if limit is not None and limit > 0 and phase_w is not None:
+                house = house or phase_w >= max(0.0, limit - reserve) * 230.0
+    basis = "wp_share" if wp_fresh else "grid_total"
+    counted = max(0.0, grid - GRID_MEASUREMENT_BAND_W) if grid_fresh else None
+    if grid_fresh and wp_fresh:
+        counted = min(power, counted)
+    clock_ok = bool(clock.get("valid") is True and mono is not None and clock.get("boot_id"))
+    high = bool(grid_fresh and counted > GRID_STOP_THRESHOLD_W and clock_ok)
+    continuous = bool(high and prev.get("high") is True
+        and prev.get("basis") == basis
+        and prev.get("boot_id") == clock.get("boot_id")
+        and 0 <= mono - prev.get("last_mono", mono - 16.0) <= 15.0
+        and grid_ts >= prev.get("grid_ts", grid_ts)
+        and (not wp_fresh or wp_ts >= prev.get("wp_ts", wp_ts)))
+    since = prev["since_mono"] if continuous else mono
+    grid_since = prev["grid_since"] if continuous else grid_ts
+    wp_since = (prev["wp_since"] if continuous else wp_ts) if wp_fresh else None
+    elapsed = max(0.0, min(mono - since, grid_ts - grid_since)) if high else 0.0
+    if high and wp_fresh:
+        elapsed = min(elapsed, max(0.0, wp_ts - wp_since))
+    debounced = bool(high and elapsed >= GRID_STOP_DEBOUNCE_S)
+    return dict(stop=bool(house or debounced), house_connection_limit=bool(house),
+        grid_stop=debounced, valid=grid_fresh, basis=basis, counted_w=counted, elapsed_s=elapsed,
+        reason="house_connection_limit" if house
+            else ("wp_grid_import_sustained" if wp_fresh
+                  else "grid_import_sustained_without_wp_measurement") if debounced
+            else "grid_measurement_missing_or_stale" if not grid_fresh else "grid_import_debounce" if high else "below_grid_threshold",
+        high=high, since_mono=since, last_mono=mono, grid_since=grid_since,
+        wp_since=wp_since, grid_ts=grid_ts, wp_ts=wp_ts, boot_id=clock.get("boot_id"))
+
+
+def heatpump_ww_pv_takeover(observation, source, *, now_s):
+    """Übernahme einer bereits PV-gedeckten WW-Bereitung ohne neuen Start."""
+    obs, src = _dict(observation), _dict(source)
+    power = _number(obs.get("power_w"))
+    grid = _number(src.get("balance_grid_w"), minimum=-math.inf)
+    battery = _number(src.get("balance_battery_w"), minimum=-math.inf)
+    fresh = bool(obs.get("fresh") is True and _fresh(obs, now_s, 45.0)
+        and src.get("fresh") is True and src.get("balance_fresh") is True
+        and _fresh(src, now_s, 10.0))
+    covered = bool(fresh and power is not None and power > 0
+        and obs.get("compressor_running") is True and obs.get("ww_running") is True
+        and grid is not None and grid <= GRID_MEASUREMENT_BAND_W
+        and battery is not None and battery >= 0.0)
+    # Die WP steckt bereits im Netzsaldo: genau einmal zurücknehmen. Kein
+    # Sollwert, Altwert oder zweiter Verbraucherabzug ersetzt diese Messung.
+    budget = max(0.0, -grid) + power if covered else None
+    return dict(eligible=covered, start_budget_w=budget,
+        power_w=power if fresh else None,
+        reason="running_ww_pv_covered" if covered else "normal_start_required")
 
 
 WW_WITHDRAWAL_SCOPE_SCHEMA = "heatpump_ww_release_withdrawal_scope_v1"
@@ -257,6 +345,10 @@ def heatpump_pv_config(cfg):
         "boost_release_s": max(30.0, _number(cfg.get("wp_pv_boost_release_s"), 300.0)),
         "freshness_s": 45.0,
         "window_s": 86400.0,
+        "wallbox_grid_stop_wh": max(5.0, min(40.0, _number(cfg.get("wb_min_current_import_stop_wh"), 40.0))),
+        "wallbox_grid_band_w": max(0.0, _number(cfg.get("wb_min_current_import_tolerance_w"), 200.0, minimum=-math.inf)),
+        "wallbox_grid_leak_w": max(0.0, _number(cfg.get("wb_min_current_import_release_w"), 80.0, minimum=-math.inf)),
+        "wallbox_confirm_s": max(30.0, _number(cfg.get("wb_phase_confirm_timeout_s"), 240.0)),
         "battery_limit_wh": _number(cfg.get("wp_pv_battery_limit_wh"), 0.0),
         "grid_limit_wh": _number(cfg.get("wp_pv_grid_limit_wh"), 0.0),
         "battery_max_w": _number(cfg.get("wp_pv_battery_max_w"), 0.0),
@@ -374,6 +466,12 @@ def validate_heatpump_pv_state(state):
             return {}
         for key in ("until_s", "battery_wh", "grid_wh"):
             entry[key] = _number(entry[key])
+        for key in ("battery_measured_wh", "grid_measured_wh"):
+            if key in entry:
+                value = _number(entry[key])
+                if value is None or value > entry[key.replace("_measured", "")] + 1e-6:
+                    return {}
+                entry[key] = value
         if entry["until_s"] < last:
             return {}
         last = entry["until_s"]
@@ -393,17 +491,19 @@ def validate_heatpump_pv_state(state):
         return {}
     if "withdrawal_reason" in result and not isinstance(result["withdrawal_reason"], str):
         return {}
-    for key in ("reservation_started_ts", "start_reservation_released_ts", "pv_unqualified_since_s", "pv_covered_since_s"):
+    for key in ("request_withdrawn_since_s", "request_returned_since_s", "first_withdrawal_ts", "withdrawal_healed_ts", "wallbox_grid_defer_since_s", "reservation_started_ts", "start_reservation_released_ts", "pv_unqualified_since_s", "pv_covered_since_s"):
         if key in result and result[key] is not None:
             if _number(result[key]) is None:
                 return {}
             result[key] = _number(result[key])
     if "start_reservation_released" in result and type(result["start_reservation_released"]) is not bool:
         return {}
-    for key in ("last_valid_power_w", "last_valid_power_ts", "last_allocated_w"):
+    for key in ("last_grid_measured_w", "last_battery_measured_w", "wallbox_grid_defer_wh", "last_valid_power_w", "last_valid_power_ts", "last_allocated_w"):
         if key in result and result[key] is not None and _number(result[key]) is None:
             return {}
     if "handoff_required" in result and type(result["handoff_required"]) is not bool:
+        return {}
+    if "withdrawal_identity" in result and _identity(result["withdrawal_identity"]) is None:
         return {}
     return result
 
@@ -432,7 +532,8 @@ def _empty_state(now, maximum):
     }
 
 
-def _record_energy(state, now, battery_wh, grid_wh, window_s):
+def _record_energy(state, now, battery_wh, grid_wh, window_s, *,
+                   battery_measured_wh=0.0, grid_measured_wh=0.0):
     for source, increment in (("battery", battery_wh), ("grid", grid_wh)):
         state[source + "_used_wh"] += increment
         state[source + "_reserved_wh"] = max(0.0, state[source + "_reserved_wh"] - increment)
@@ -445,6 +546,9 @@ def _record_energy(state, now, battery_wh, grid_wh, window_s):
             entries[-1]["grid_wh"] += grid_wh
         else:
             entries.append({"until_s": until, "battery_wh": battery_wh, "grid_wh": grid_wh})
+        for name, increment in (("battery", battery_measured_wh), ("grid", grid_measured_wh)):
+            key = name + "_measured_wh"
+            entries[-1][key] = entries[-1].get(key, 0.0) + min(increment, battery_wh if name == "battery" else grid_wh)
     state["energy_window"] = entries
 
 
@@ -540,6 +644,84 @@ def curve_forecast_hold_contract(plan, *, now_s, horizon_end_s, soc, capacity_kw
             "target_soc": target, "soc": current_soc, "capacity_kwh": capacity}
 
 
+def _wallbox_grid_wait(state, evidence, *, wall, now, cfg, enabled, grid_onset=False):
+    """Begrenztes Warten je Ladepunkt; nur ein bestätigtes Ende erneuert die Episode.
+
+    Der Anzeigevertrag exportiert keine interne Kontogeneration. Die lokale
+    Generation zählt deshalb ausschließlich frisch belegte Ladeenden. Weder
+    ein neuer WP-Auftrag noch eine Beleglücke oder ein Phasenwechsel setzt sie zurück.
+    """
+    episodes = _dict(state.get("wallbox_grid_episodes"))
+    state["wallbox_grid_episodes"] = episodes
+    fresh = _fresh(evidence, wall, _number(cfg.get("freshness_s"), 45.0))
+    if fresh:
+        for item in evidence.get("ended_owners") or []:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("owner_wb_id"))
+            episode = _dict(episodes.get(key))
+            stamp = _number(item.get("sample_ts"))
+            if (episode and not episode.get("ended") and stamp is not None
+                    and stamp > _number(episode.get("last_positive_wall_s"), math.inf)):
+                episode["ended"] = True
+                episode["end_wall_s"] = stamp
+    owner = evidence.get("owner_wb_id") if fresh else None
+    key = str(owner) if owner is not None else str(state.get("wallbox_grid_last_owner"))
+    episode = _dict(episodes.get(key))
+    positive = bool(fresh and owner is not None and (
+        evidence.get("active") is True or grid_onset and evidence.get("onset_ready") is True))
+    if positive:
+        if not episode or episode.get("ended"):
+            generation = int(_number(episode.get("generation"), 0.0)) + 1
+            episode = {"owner_wb_id": owner, "generation": generation, "ended": False,
+                       "since_s": now, "account_stage": "", "last_used_wh": 0.0,
+                       "progress_wh": 0.0, "last_progress_s": now}
+            episodes[key] = episode
+        state["wallbox_grid_last_owner"] = owner
+        episode["last_positive_wall_s"] = _number(evidence.get("sample_ts"), wall)
+        stage = str(evidence.get("stage") or "")
+        used = _number(evidence.get("used_wh"))
+        threshold = _number(cfg.get("wallbox_grid_stop_wh"), 40.0)
+        # Fortschritt folgt dem echten Konto; keine zweite Netzenergiebuchung.
+        account_stage = "three_phase" if stage in ("three_phase_min_watch", "phase_down_pending") else "one_phase"
+        changed_stage = account_stage != episode.get("account_stage")
+        if changed_stage or used is not None and used > _number(episode.get("last_used_wh"), 0.0):
+            if used is not None:
+                delta = used if changed_stage else max(0.0, used - _number(episode.get("last_used_wh"), 0.0))
+                episode["progress_wh"] = min(2.0 * threshold,
+                    _number(episode.get("progress_wh"), 0.0) + delta)
+            episode["last_progress_s"] = now
+        episode["account_stage"] = account_stage
+        episode["last_used_wh"] = used
+        pending = stage in ("phase_down_pending", "stop_pending")
+        confirm_s = _number(cfg.get("wallbox_confirm_s"), 240.0)
+        rate = _number(evidence.get("deficit_w"))
+        rate = max(0.0, rate - _number(cfg.get("wallbox_grid_leak_w"), 80.0)) if rate is not None else None
+        left = max(0.0, threshold - used) if used is not None else threshold
+        if pending:
+            duration = confirm_s
+        elif rate is not None and rate > 0:
+            duration = left * 3600.0 / rate + confirm_s
+        else:
+            duration = 60.0
+        episode["progress_deadline_s"] = _number(episode.get("last_progress_s"), now) + duration
+    since = _number(episode.get("since_s"))
+    last = _number(episode.get("last_positive_wall_s"))
+    # Ein frischer Ausschluss oder eine Stufe über Mindeststrom beendet den
+    # Nachlauf; reine Lücken belegen weder Ende noch eine neue Generation.
+    excluded = bool(fresh and evidence.get("eligible") is False)
+    recent = bool(last is not None and 0 <= wall - last <= 60.0)
+    bounded = bool(since is not None and 0 <= now - since < 1800.0
+                   and now <= _number(episode.get("progress_deadline_s"), now))
+    waiting = bool(enabled and episode and not episode.get("ended")
+                   and not excluded and recent and bounded)
+    state["wallbox_grid_defer_since_s"] = since
+    state["wallbox_grid_defer_wh"] = _number(episode.get("progress_wh"), 0.0)
+    reason = ("Wallbox im Netzhalt" if waiting else
+              "Wallbox-Rückstellungsgrenze erreicht" if episode and not bounded else "")
+    return waiting, reason
+
+
 def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock_sample, config):
     """Vor der Verteilung: einen WP-Verbraucher und getrennte Energieansprüche bilden.
 
@@ -558,6 +740,11 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
     corrupt = bool(previous) and not restored
     wall, now, current_clock, clock_uncertain = _clock(clock_sample, restored)
     state = restored or _empty_state(now, maximum)
+    # Alte Checkpoints haben noch keinen eigenen Identitätsanker der Vormerkung.
+    # Vor dem unten erlaubten Sollwertwechsel an den bisherigen Auftrag binden.
+    if (state.get("withdrawal_pending") and state.get("withdrawal_reason") == "request_withdrawn"
+            and "withdrawal_identity" not in state):
+        state["withdrawal_identity"] = {"request_id": state["request_id"], "revision": state["revision"]}
     if measured:
         # Übernommene Reservierungen sind keine tatsächlich verbrauchte Energie.
         state["battery_reserved_wh"] = state["grid_reserved_wh"] = 0.0
@@ -647,11 +834,50 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
     balance_battery = _number(source.get("balance_battery_w"), minimum=-math.inf)
     balance_fresh = bool(source.get("balance_fresh") is True and _fresh(source, wall, 10.0)
                          and balance_grid is not None and balance_battery is not None)
+    takeover = heatpump_ww_pv_takeover(observation, source, now_s=wall)
+    takeover_active = bool(measured and takeover["eligible"] and not state["cycle_owned"]
+        and _dict(_dict(demand.get("channels")).get("ww")).get("active") is True
+        and not _dict(_dict(demand.get("channels")).get("hz")).get("active"))
+    if takeover_active:
+        start_power = observed_w
     # Rechteckintegration mit dem vorigen belegten Quellenwert; Ausfälle sind
     # ausdrücklich keine kostenlose Energie und dürfen keinen neuen Topf öffnen.
     gap = bool(source.get("restart") is True or dt > ttl or not source_fresh or clock_uncertain)
+    short_source_gap = bool(not source_fresh and dt <= ttl
+                            and source.get("restart") is not True and not clock_uncertain)
+    measured_interval = bool(measured and active_before and not gap and clock_ok
+                             and measured_observation_valid and balance_fresh)
+    wb = _dict(demand.get("wallbox_grid_hold"))
+    wb_fresh = _fresh(wb, wall, _number(cfg.get("freshness_s"), 45.0))
+    episode = _dict(_dict(state.get("wallbox_grid_episodes")).get(
+        str(state.get("wallbox_grid_last_owner"))))
+    last_positive = _number(episode.get("last_positive_wall_s"))
+    # Das Leistungsband für die Wallbox bleibt 200 W. Nur die Netzbuchung
+    # übernimmt während ihres belegten Mindesthalts Toleranz plus Leck.
+    wb_minimum_hold = bool(
+        wb_fresh and (wb.get("active") is True or wb.get("onset_ready") is True)
+        or state.get("wallbox_waiting_previous") and not episode.get("ended")
+        and not (wb_fresh and wb.get("eligible") is False)
+        and last_positive is not None and 0 <= wall - last_positive <= 60.0)
+    grid_band_w = (max(GRID_MEASUREMENT_BAND_W,
+                       _number(cfg.get("wallbox_grid_band_w"), 200.0)
+                       + _number(cfg.get("wallbox_grid_leak_w"), 80.0))
+                   if wb_minimum_hold else GRID_MEASUREMENT_BAND_W)
+    grid_counted_w = (min(_number(source.get("grid_actual_w"), 0.0), observed_w,
+                         max(0.0, balance_grid - grid_band_w))
+                      if measured_interval else None)
+    battery_counted_w = (min(_number(source.get("battery_actual_w"), 0.0), observed_w,
+                            max(0.0, -balance_battery)) if measured_interval else None)
+    grid_measured_delta = (_number(state.get("last_grid_measured_w"), 0.0) * dt / 3600.0
+                           if measured_interval else 0.0)
+    battery_measured_delta = (_number(state.get("last_battery_measured_w"), 0.0) * dt / 3600.0
+                              if measured_interval else 0.0)
     battery_delta = state["last_battery_w"] * dt / 3600.0
     grid_delta = state["last_grid_w"] * dt / 3600.0
+    state["measurement_gap_charged"] = False
+    state["measurement_gap_battery_wh"] = 0.0
+    state["measurement_gap_grid_wh"] = 0.0
+    state["measurement_gap_reason"] = "no_gap"
     if gap and active_before:
         battery_bound = min(maximum or state["max_power_w"], _number(cfg.get("battery_max_w"), 0.0))
         grid_bound = min(maximum or state["max_power_w"], _number(cfg.get("grid_max_w"), 0.0))
@@ -669,10 +895,45 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
             # werden. Kontingente bis zur Klärung konservativ vollständig belasten.
             battery_delta = max(battery_delta, _number(cfg.get("battery_limit_wh"), 0.0))
             grid_delta = max(grid_delta, _number(cfg.get("grid_limit_wh"), 0.0))
-        state["measurement_gap_charged"] = True
+        gap_reason = "unknown_wp_power_conservative"
+        if measured and measured_observation_valid and short_source_gap:
+            # Eine gültige WP-Messung begrenzt auch bei fehlendem Quellenanteil
+            # die Buchung. Die WP steckt bereits in der gemessenen Bilanz.
+            battery_bound = min(battery_bound, observed_w)
+            grid_bound = min(grid_bound, observed_w)
+            if balance_fresh:
+                battery_bound = min(battery_bound, max(0.0, -balance_battery))
+                grid_bound = min(grid_bound, max(0.0, balance_grid))
+                gap_reason = "measured_wp_and_balance"
+            else:
+                gap_reason = "measured_wp_balance_missing"
+            # Beide Quellen zusammen dürfen dieselbe WP-Aufnahme nur einmal buchen.
+            grid_bound = min(grid_bound, max(0.0, observed_w - battery_bound))
+            battery_delta = battery_bound * dt / 3600.0
+            grid_delta = grid_bound * dt / 3600.0
+            if (balance_fresh and not source.get("restart") and dt <= ttl
+                    and not source_fresh):
+                gap_reason = "source_gap_wp_and_balance_valid"
+        elif clock_uncertain:
+            gap_reason = "clock_epoch_unconfirmed"
+        elif source.get("restart") is True:
+            gap_reason = "restart_interval_unmeasured"
+        elif dt > ttl:
+            gap_reason = "long_interval_unmeasured"
+        state["measurement_gap_charged"] = bool(battery_delta or grid_delta)
+        state["measurement_gap_battery_wh"] = battery_delta
+        state["measurement_gap_grid_wh"] = grid_delta
+        state["measurement_gap_reason"] = gap_reason
     _record_energy(state, max(now, state["last_ts"]), battery_delta, grid_delta,
-                   _number(cfg.get("window_s"), 86400.0))
+                   _number(cfg.get("window_s"), 86400.0),
+                   battery_measured_wh=battery_measured_delta, grid_measured_wh=grid_measured_delta)
+    compressor_stopped = bool(physical is False and state["compressor_running"] is True)
+    if measured and compressor_stopped and state["active_command"]:
+        state["stop_recheck_since_s"] = now
+        state["stop_recheck_wall_s"] = wall
     if physical is True:
+        state.pop("stop_recheck_since_s", None)
+        state.pop("stop_recheck_wall_s", None)
         if state["running_since_s"] is None:
             state["running_since_s"] = now
     elif physical is False:
@@ -691,8 +952,6 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
         state["active_command"] = False
         state["signal_withdrawn"] = True
         state["withdrawal_pending"] = False
-        if measured:
-            state["withdrawal_reason"] = ""
         state["issued_ts"] = None
         state["offered_ts"] = None
         if physical is False:
@@ -735,9 +994,13 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
         for name in ("battery", "grid")
     }
     if measured and state["cycle_owned"] and not protection:
-        if any(not source_enabled[name] and (
-            state[name + "_reserved_wh"] > 0 or state["last_" + name + "_w"] > 0
-        ) for name in ("battery", "grid")):
+        # Die Akkusperre bleibt unverändert. Für das Netz zählt nur der
+        # aktuelle gültige WP-Anteil oberhalb desselben Messbandes.
+        battery_disabled = bool(not source_enabled["battery"] and (
+            state["battery_reserved_wh"] > 0 or state["last_battery_w"] > 0))
+        grid_disabled = bool(not source_enabled["grid"] and grid_counted_w is not None
+                             and grid_counted_w > 0)
+        if battery_disabled or grid_disabled:
             protection = "bridge_source_disabled"
     if protection:
         blockers.append(protection)
@@ -791,6 +1054,18 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
             and physical_surplus and uncurved_capacity >= required
             and forecast.get("valid") is True and forecast.get("covers") is True)
         qualified = qualified or forecast_hold
+    standing_qualified = bool(measured and qualified and physical is False and measured_observation_valid)
+    stop_recheck = False
+    stop_since = _number(state.get("stop_recheck_since_s"))
+    if measured and stop_since is not None and physical is False:
+        # Erst die folgende frische Bilanz kann die entfallene WP-Last belegen.
+        # Die kurze Wartefrist endet absolut nach 30 s; Schutz bleibt sofort.
+        post_stop_sample = bool(balance_fresh and measured_observation_valid
+            and _number(source.get("sample_ts"), 0.0) > _number(state.get("stop_recheck_wall_s"), wall))
+        stop_recheck = bool(not standing_qualified and not post_stop_sample and now - stop_since < 30.0)
+        if standing_qualified or post_stop_sample or now - stop_since >= 30.0:
+            state.pop("stop_recheck_since_s", None)
+            state.pop("stop_recheck_wall_s", None)
     if measured and state["active_command"]:
         # Ein kurzer deckender Messpunkt verjüngt keine laufende Defizitfrist.
         if qualified:
@@ -803,6 +1078,8 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
             state["pv_covered_since_s"] = None
     else:
         state["pv_covered_since_s"] = None
+    if standing_qualified and (compressor_stopped or stop_since is not None):
+        qualified = True
     if not qualified:
         blockers.append("pv_not_qualified")
     restart_remaining = max(0.0, state["last_stop_s"] + _number(cfg.get("restart_delay_s"), 1200.0) - now) if state["last_stop_s"] is not None else 0.0
@@ -822,6 +1099,8 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
                 state["battery_reserved_wh"] = state["grid_reserved_wh"] = 0.0
     window_battery = sum(e["battery_wh"] for e in state["energy_window"])
     window_grid = sum(e["grid_wh"] for e in state["energy_window"])
+    window_grid_measured = sum(e.get("grid_measured_wh", 0.0) for e in state["energy_window"])
+    window_battery_measured = sum(e.get("battery_measured_wh", 0.0) for e in state["energy_window"])
     battery_remaining = max(0.0, _number(cfg.get("battery_limit_wh"), 0.0) - window_battery)
     grid_remaining = max(0.0, _number(cfg.get("grid_limit_wh"), 0.0) - window_grid)
     battery_cap = min(_number(cfg.get("battery_max_w"), 0.0), _number(source.get("battery_available_w"), 0.0)) if source_fresh else 0.0
@@ -854,6 +1133,15 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
         blockers.append("battery_response_reserve_unfunded")
     if reserve is None and not state["active_command"]:
         blockers.append("minimum_runtime_energy_unfunded")
+    # Ein verbrauchtes gemessenes Netzkontingent sperrt keinen neuen PV-Start.
+    # Es verlangt zusätzlich das vorhandene 500-W-Startband, ohne Budgetabzug.
+    start_margin_w = PV_START_MARGIN_W * (2.0 if measured and _number(cfg.get("grid_limit_wh"), 0.0) > 0
+        and window_grid_measured >= _number(cfg.get("grid_limit_wh"), 0.0) else 1.0)
+    if takeover_active:
+        start_margin_w = 0.0
+    if (measured and not state["cycle_owned"] and start_margin_w > PV_START_MARGIN_W
+            and _number(source.get("prospective_capacity_w"), 0.0) < start_power + start_margin_w):
+        blockers.append("pv_start_margin_after_grid_exhaustion")
     # Ein PV-Sollwertangebot reserviert weder Leistung noch Energie.
     # Alte Reservierungen werden abgeräumt; die Verbrauchskonten bleiben erhalten.
     released = bool(measured and state["active_command"])
@@ -867,6 +1155,13 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
     if start_candidate:
         state["request_id"], state["revision"] = identity
         state["battery_reserved_wh"], state["grid_reserved_wh"] = reserve
+        state.pop("first_withdrawal_reason", None)
+        state.pop("first_withdrawal_sources", None)
+        state["withdrawal_reason"] = ""
+        state["request_withdrawn_since_s"] = None
+        for key in ("withdrawal_identity", "request_returned_since_s", "first_withdrawal_ts",
+                    "first_withdrawal_class", "first_withdrawal_cause", "withdrawal_healed_ts"):
+            state.pop(key, None)
         if measured:
             state["energy_guard_pending"] = False
             state["energy_guard_sources"] = []
@@ -879,38 +1174,151 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
     command_expired = bool(state["issued_ts"] is not None and command.get("confirmed") is not True
                            and not state["signal_withdrawn"]
                            and now - state["issued_ts"] >= _number(cfg.get("command_timeout_s"), 25.0))
+    wallbox_deferred = False
+    wallbox_defer_reason = ""
+    request_debounced = False
     if measured:
-        exhausted = [name for name, left in (("battery", battery_remaining), ("grid", grid_remaining))
-                     if source_enabled[name] and left <= 1e-6 and (
-                         state["last_" + name + "_w"] > 0 or state[name + "_reserved_wh"] > 0
-                         or (battery_delta if name == "battery" else grid_delta) > 0)]
-        if state["cycle_owned"] and exhausted:
-            state["energy_guard_pending"] = True
-            state["energy_guard_sources"] = sorted(set(state.get("energy_guard_sources", [])) | set(exhausted))
-        # Nur der Wolkenrückzug darf durch erneut stabilen Überschuss entfallen.
-        # Ein Kontingentende, Gerätestopp oder bereits ausgegebener Entzug bleibt bestehen.
-        # Eine abgelaufene Startwartefrist entzieht den Sollwert nicht mehr; sie
-        # gibt nur die Startreservierung frei (start_reservation_released).
+        # Ein einzelner Wert im Rauschband löscht keine Vormerkung. Das
+        # schützt Checkpoints vor Schreibfluten; ein belegter Stopp löscht sofort.
+        exhausted = [name for name, used, counted in (
+            ("battery", window_battery_measured, battery_counted_w),
+            ("grid", window_grid_measured, grid_counted_w))
+            if source_enabled[name] and used >= _number(cfg.get(name + "_limit_wh"), 0.0)
+            and counted is not None and counted > 0]
+        clear_since = _dict(state.get("energy_guard_clear_since_s"))
+        held_sources = set(state.get("energy_guard_sources") or [])
+        for name in ("battery", "grid"):
+            if not state["cycle_owned"] or physical is False or not source_enabled[name]:
+                held_sources.discard(name)
+                clear_since.pop(name, None)
+            elif name in exhausted:
+                held_sources.add(name)
+                clear_since.pop(name, None)
+            elif measured_observation_valid and measured_interval:
+                since = _number(clear_since.get(name), now)
+                clear_since[name] = since
+                if now - since >= 60.0:
+                    held_sources.discard(name)
+            else:
+                # Ungültige Proben belegen keine durchgehende Erholung.
+                clear_since.pop(name, None)
+        exhausted = [name for name in ("battery", "grid") if name in held_sources]
+        state["energy_guard_clear_since_s"] = clear_since
+        state["energy_guard_pending"] = bool(exhausted)
+        state["energy_guard_sources"] = exhausted
+        # Der gehaltene Marker beruhigt die Persistenz, ist aber kein
+        # Nachweis für Netzbezug im aktuellen gültigen Messintervall.
+        grid_exhausted = bool(state["active_command"] and physical is True
+                              and "grid" in exhausted and grid_counted_w is not None
+                              and grid_counted_w > 0)
+        grid_only_disabled = bool(protection == "bridge_source_disabled"
+            and not source_enabled["grid"]
+            and (not source_fresh or _number(source.get("battery_actual_w"), 0.0) <= 0)
+            and state["last_battery_w"] <= 0 and state["battery_reserved_wh"] <= 0)
+        # Erlaubte Akkustützung ändert den Mindestlaufhalt bei gesperrter
+        # Netzbrücke nicht. Wallbox-Warten gilt weiter nur bei reinem Netzanteil.
+        grid_disabled_reason = bool(protection == "bridge_source_disabled"
+            and not source_enabled["grid"]
+            and (source_enabled["battery"] or grid_only_disabled))
+        wait_protection = bool(protection and not grid_only_disabled)
+        # Eine kurze Quellenlücke eröffnet keine Episode. Ein bereits
+        # belegtes Warten behält den vorhandenen, begrenzten Nachlauf.
+        wait_source = bool(source_fresh and balance_fresh
+                           or state.get("wallbox_waiting_previous") and dt <= ttl
+                           and not source.get("restart") and not clock_uncertain)
+        wallbox_deferred, wallbox_defer_reason = _wallbox_grid_wait(
+            state, wb if source_fresh and balance_fresh else dict(wb, active=False, onset_ready=False),
+            wall=wall, now=now, cfg=cfg,
+            enabled=bool(state["active_command"] and demand_fresh and clock_ok
+                and wait_source and not wait_protection),
+            grid_onset=bool(measured_interval and balance_grid > grid_band_w))
+        if wallbox_deferred and state.get("wallbox_waiting_previous"):
+            if state.get("pv_unqualified_since_s") is not None:
+                state["pv_unqualified_since_s"] += dt
+        state["wallbox_waiting_previous"] = wallbox_deferred
+        # Ein fremder Besitzer erhält keine Entprellung. Fehlende Klassifikation
+        # alter Bedarfsdateien gilt als gewöhnliches Anforderungsende.
+        withdrawal_class = demand.get("withdrawal_class", "debounced")
+        if not requested and withdrawal_class == "debounced" and state["active_command"]:
+            if state.get("request_withdrawn_since_s") is None:
+                state["request_withdrawn_since_s"] = now
+            request_debounced = now - state["request_withdrawn_since_s"] < REQUEST_WITHDRAWAL_DEBOUNCE_S
+        else:
+            state["request_withdrawn_since_s"] = None
         terminal_reason = protection or ("command_unconfirmed" if command_expired else "")
-        terminal_reason = terminal_reason or ("request_withdrawn" if not requested else "")
-        if state.get("energy_guard_pending"):
-            terminal_reason = terminal_reason or "energy_guard_exhausted"
+        if not requested and not request_debounced:
+            terminal_reason = terminal_reason or "request_withdrawn"
+        if grid_exhausted and not wallbox_deferred:
+            terminal_reason = terminal_reason or "wp_grid_energy_exhausted"
+        pending_reason = state.get("withdrawal_reason", "")
+        # Eine kurze Besitzer- oder Schutzlücke heilt erst nach durchgehend
+        # gültiger Rückkehr desselben Auftrags. Ein bereits begonnener Entzug
+        # bleibt endgültig; Schutz und unbekannte Daten verdienen keine Zeit.
+        returning_request = bool(state["withdrawal_pending"]
+            and pending_reason == "request_withdrawn"
+            and state.get("withdrawal_class") in ("owner_change", "protection")
+            and requested and withdrawal_class == "debounced"
+            and identity == _identity(state.get("withdrawal_identity"))
+            and not protection and demand.get("protection_reason") not in HARD_PROTECTIONS
+            and not command.get("withdrawal_requested") and not command.get("withdrawal_confirmed")
+            and not state["signal_withdrawn"] and state["active_command"]
+            and data_fresh and measured_observation_valid and source_fresh and clock_ok and not corrupt
+            and cfg.get("valid") is True and bound_command
+            and not state.get("uncertain_state"))
+        if returning_request:
+            if state.get("request_returned_since_s") is None or dt > ttl:
+                state["request_returned_since_s"] = now
+        else:
+            state["request_returned_since_s"] = None
+        request_healed = bool(returning_request
+            and now - state["request_returned_since_s"] >= REQUEST_WITHDRAWAL_DEBOUNCE_S)
+        cancel_pending = bool(not state["signal_withdrawn"]
+            and not command.get("withdrawal_requested")
+            and not command.get("withdrawal_confirmed") and (
+            (pending_reason == "request_withdrawn" and requested
+             and (state.get("withdrawal_class", "debounced") == "debounced" or request_healed))
+            or (pending_reason == "command_unconfirmed" and command.get("confirmed") is True)
+            # Alte Vormerkungen dürfen bei gültiger Erholung entfallen,
+            # auch wenn nach einer Pause noch kein Messintervall vorliegt.
+            or (pending_reason == "energy_guard_exhausted"
+                and measured_observation_valid and not grid_exhausted)
+            or (pending_reason == "wp_grid_energy_exhausted"
+                and measured_interval and "grid" not in exhausted)
+            or (pending_reason == "pv_unqualified" and (qualified or compressor_stopped and standing_qualified))
+            or (pending_reason == "wp_grid_energy_exhausted" and wallbox_deferred)
+            or (pending_reason == "bridge_source_disabled" and measured_interval
+                and not protection)))
+        if cancel_pending:
+            if request_healed:
+                state["withdrawal_healed_ts"] = wall
+            state["request_returned_since_s"] = None
+            state.pop("withdrawal_identity", None)
+            state["withdrawal_pending"] = False
+            state["withdrawal_reason"] = ""
+            state.pop("first_withdrawal_reason", None)
+            state.pop("first_withdrawal_sources", None)
         if terminal_reason and state["active_command"]:
+            if terminal_reason == "request_withdrawn" and "withdrawal_identity" not in state:
+                state["withdrawal_identity"] = {"request_id": state["request_id"], "revision": state["revision"]}
+            if not requested and withdrawal_class != "debounced" and state.get("first_withdrawal_ts") is None:
+                state["first_withdrawal_ts"] = wall
+                state["first_withdrawal_class"] = withdrawal_class
+                state["first_withdrawal_cause"] = demand.get("withdrawal_cause") or terminal_reason
             state["withdrawal_pending"] = True
             state["withdrawal_reason"] = terminal_reason
-        elif state["active_command"] and not qualified and not state["withdrawal_pending"]:
-            # Wolkenüberbrückung – erst nach boost_release_s ohne
-            # PV-Deckung wird der Sollwert zurückgenommen.
+            if (terminal_reason != "request_withdrawn" or pending_reason != "request_withdrawn"
+                    or state.get("withdrawal_class") not in ("owner_change", "protection")):
+                state["withdrawal_class"] = withdrawal_class
+        # Die Wolkenfrist läuft auch unter einer Vormerkung weiter und wird
+        # beim Verdichterstopp nicht verjüngt. Ein Messglitch erzeugt kein Ende.
+        if state["active_command"] and not qualified and not request_debounced and not wallbox_deferred:
             unqualified_since = _number(state.get("pv_unqualified_since_s"))
             if unqualified_since is None:
                 state["pv_unqualified_since_s"] = now
-            elif now - unqualified_since >= _number(cfg.get("boost_release_s"), 300.0):
+            elif (now - unqualified_since >= _number(cfg.get("boost_release_s"), 300.0)
+                  and not state["withdrawal_pending"]):
                 state["withdrawal_pending"] = True
                 state["withdrawal_reason"] = "pv_unqualified"
-        elif (state["active_command"] and qualified and not command.get("withdrawal_requested")
-              and state.get("withdrawal_reason") == "pv_unqualified"):
-            state["withdrawal_pending"] = False
-            state["withdrawal_reason"] = ""
         if qualified or not state["active_command"]:
             state["pv_unqualified_since_s"] = None
     else:
@@ -919,8 +1327,21 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
         if state["active_command"] and (not qualified or battery_remaining + grid_remaining <= 0):
             # Eine normale Optimierungsgrenze ist kein vorzeitiger Schutzabbruch.
             state["withdrawal_pending"] = True
-    hold_required = bool(state["cycle_owned"] and protected > 0 and not protection)
-    withdrawal_required = bool(state["withdrawal_pending"] and (protected <= 0 or protection))
+    hold_required = bool(state["cycle_owned"] and protected > 0
+                         and (not protection or measured and grid_disabled_reason))
+    withdrawal_required = bool(state["withdrawal_pending"] and (protected <= 0 or protection)
+        and not (stop_recheck and not protection and state.get("withdrawal_reason") == "pv_unqualified")
+        and not (measured and state.get("withdrawal_reason") == "wp_grid_energy_exhausted"
+                 and not grid_exhausted)
+        and not (measured and state.get("withdrawal_reason") == "bridge_source_disabled"
+                 and (not protection or grid_disabled_reason
+                      and (protected > 0 or grid_counted_w is None or grid_counted_w <= 0)))
+        and not (wallbox_deferred and not wait_protection and state.get("withdrawal_reason") in (
+            "pv_unqualified", "wp_grid_energy_exhausted", "bridge_source_disabled")))
+    if withdrawal_required and not state.get("first_withdrawal_reason"):
+        state["first_withdrawal_reason"] = state.get("withdrawal_reason") or protection or "withdrawal_required"
+        state["first_withdrawal_sources"] = (list(state.get("energy_guard_sources") or [])
+            if state["first_withdrawal_reason"] in ("energy_guard_exhausted", "wp_grid_energy_exhausted") else [])
     # Ein einzelner Quellentopf darf nicht vorzeitig leergefahren werden, während
     # nur die Summenenergie ausreichend wäre. Die mögliche Leistung folgt auch
     # aus seiner Energie für die noch zugesagte Schutz- und Reaktionsdauer.
@@ -933,9 +1354,9 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
             # Ein normales Kontingent ist im Messwertbetrieb kein harter
             # Verdichterabbruch. Die Quelle muss ausdrücklich erlaubt bleiben;
             # reale Akkuenergie und sämtliche W-Grenzen gelten unverändert.
-            if source_enabled["battery"]:
+            if source_enabled["battery"] and (not measured_observation_valid or battery_remaining > 1e-6):
                 battery_energy = _number(source.get("battery_available_wh"), 0.0)
-            if source_enabled["grid"]:
+            if source_enabled["grid"] and (not measured_observation_valid or grid_remaining > 1e-6):
                 grid_energy = grid_cap * energy_horizon / 3600.0
     battery_cap = min(battery_cap, battery_energy * 3600.0 / energy_horizon)
     grid_cap = min(grid_cap, grid_energy * 3600.0 / energy_horizon)
@@ -976,8 +1397,13 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
     if state["cycle_owned"] and source_fresh:
         state["last_battery_w"] = min(_number(source.get("battery_actual_w"), 0.0), actual)
         state["last_grid_w"] = min(_number(source.get("grid_actual_w"), 0.0), max(0.0, actual - state["last_battery_w"]))
+    elif measured and state["cycle_owned"] and short_source_gap and measured_observation_valid:
+        state["last_battery_w"] = battery_bound
+        state["last_grid_w"] = grid_bound
     else:
         state["last_battery_w"] = state["last_grid_w"] = 0.0
+    state["last_grid_measured_w"] = grid_counted_w or 0.0
+    state["last_battery_measured_w"] = battery_counted_w or 0.0
     state["last_ts"] = max(now, state["last_ts"])
     if current_clock is not None:
         state["clock"] = current_clock
@@ -992,14 +1418,18 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
         "schema": CONTRACT_SCHEMA, "sample_ts": wall,
         "control_mode": "measured" if measured else "reserved",
         "curve_forecast_hold": forecast_hold, "curve_forecast": copy.deepcopy(forecast),
-        "start_power_w": start_power,
+        "start_power_w": start_power, "start_margin_w": start_margin_w,
+        "ww_takeover": takeover_active,
+        "ww_takeover_budget_w": takeover["start_budget_w"] if takeover_active else None,
+        "grid_limit_wh": cfg.get("grid_limit_wh"), "battery_limit_wh": cfg.get("battery_limit_wh"),
+        "stop_recheck_pending": stop_recheck,
         "power_accounting_w": accounted_power,
         "power_accounting_source": power_source,
         "power_accounting_age_s": power_age,
         "power_hold_s": power_hold_s,
         # Nur die WP-Leistung fehlt: kein neuer Start, aber auch kein Entzug
         # des vorhandenen Sollwerts durch den Kommunikationswächter.
-        "measurement_gap_control_valid": bool(measured and not measured_observation_valid
+        "measurement_gap_control_valid": bool(measured and (not measured_observation_valid or not source_fresh)
             and cfg.get("valid") and demand_fresh and balance_fresh and clock_ok
             and not corrupt and not state.get("uncertain_state") and not protection),
         "reserve_duration_s": reserve_duration,
@@ -1025,7 +1455,30 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
         "battery_overrun_wh": max(0.0, window_battery - _number(cfg.get("battery_limit_wh"), 0.0)),
         "grid_overrun_wh": max(0.0, window_grid - _number(cfg.get("grid_limit_wh"), 0.0)),
         "energy_guard_pending": bool(state.get("energy_guard_pending")),
+        "window_grid_measured_wh": window_grid_measured,
+        "window_grid_unmeasured_wh": max(0.0, window_grid - window_grid_measured),
+        "window_battery_measured_wh": window_battery_measured,
+        "window_battery_unmeasured_wh": max(0.0, window_battery - window_battery_measured),
+        "grid_counted_w": grid_counted_w,
+        "battery_counted_w": battery_counted_w,
+        "grid_measurement_band_w": grid_band_w,
+        "grid_withdrawal_deferred": wallbox_deferred,
+        "grid_withdrawal_defer_reason": wallbox_defer_reason,
+        "wallbox_grid_defer_wh": _number(state.get("wallbox_grid_defer_wh"), 0.0),
+        "request_withdrawal_debounced": request_debounced,
+        "minimum_runtime_reason": "Mindestlaufzeit schützt den Verdichter" if remaining > 0 else "",
         "withdrawal_reason": state.get("withdrawal_reason", ""),
+        "first_withdrawal_ts": state.get("first_withdrawal_ts"),
+        "first_withdrawal_class": state.get("first_withdrawal_class", ""),
+        "first_withdrawal_cause": state.get("first_withdrawal_cause", ""),
+        "withdrawal_healed_ts": state.get("withdrawal_healed_ts"),
+        "first_withdrawal_reason": state.get("first_withdrawal_reason", ""),
+        "first_withdrawal_sources": list(state.get("first_withdrawal_sources") or []),
+        "energy_guard_sources": list(state.get("energy_guard_sources") or []),
+        "measurement_gap_charged": state["measurement_gap_charged"],
+        "measurement_gap_battery_wh": state["measurement_gap_battery_wh"],
+        "measurement_gap_grid_wh": state["measurement_gap_grid_wh"],
+        "measurement_gap_reason": state["measurement_gap_reason"],
         "battery_response_required_wh": battery_response_wh,
         "battery_response_required_w": battery_response_w,
         "quarantine_remaining_s": state.get("quarantine_remaining_s", 0.0),
@@ -1064,7 +1517,9 @@ def bind_heatpump_pv_grant(request_contract, *, allocated_w, shared_funded_w,
         # Freigabe aus dem vorrangigen PV-Rahmen, ohne Vorabreservierung.
         # Das bestehende 500-W-PV-Schaltband schützt die neue Startkante;
         # Überbrückungsquellen ersetzen die PV-Startdeckung nicht.
-        funded = funded and _number(result.get("prospective_capacity_w"), 0.0) >= _number(result.get("start_power_w"), 0.0) + PV_START_MARGIN_W
+        start_capacity = (result.get("ww_takeover_budget_w") if result.get("ww_takeover")
+                          else result.get("prospective_capacity_w"))
+        funded = funded and _number(start_capacity, 0.0) >= _number(result.get("start_power_w"), 0.0) + _number(result.get("start_margin_w"), PV_START_MARGIN_W)
     # Bei Wärmepumpen-Vorrang ist die Wallbox-Absenkung keine Vorbedingung des
     # Sollwerts: Die Reservierung senkt das Wallbox-Ziel, die Wallbox regelt parallel
     # nach, die Anlage startet nach eigener Hysterese.

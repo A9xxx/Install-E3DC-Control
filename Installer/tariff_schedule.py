@@ -8,6 +8,9 @@ Börsenpreise.
 """
 
 import re
+import math
+import hashlib
+import json
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -98,6 +101,57 @@ def parse_special_tariff_schedule(raw):
         entries[hour * 60 + minute] = price
 
     return sorted(entries.items(), key=lambda item: item[0])
+
+
+def recurring_tariff_stages(config):
+    """Validiert die vollständigen festen Tarifstufen ohne Ersatzpreise.
+
+    Der bestehende Preisleser bleibt für Anzeigen und andere Verbraucher erhalten.
+    Diese Bindung schützt die marktseitige Fensterklassifikation.
+    """
+    config = config or {}
+    tariff = tariff_type(config)
+    if tariff not in {"octopus_heat", "special", "spezial", "special_tariff"}:
+        return None
+    def invalid(reason):
+        return {"valid": False, "reason": reason, "stages": None, "revision": None}
+    if tariff == "octopus_heat":
+        prices = []
+        for key in ("strompreis_basis", "strompreis_cheap", "strompreis_uht"):
+            raw = config.get(key)
+            try:
+                price = float(str(raw).strip().replace(",", "."))
+            except (TypeError, ValueError):
+                return invalid("fixed_tariff_stage_missing_or_invalid")
+            if not math.isfinite(price):
+                return invalid("fixed_tariff_stage_nonfinite")
+            prices.append(price)
+        basis, cheap, high = prices
+        stages = [(0, basis), (120, cheap), (360, basis),
+                  (720, cheap), (960, basis), (1080, high), (1260, basis)]
+    else:
+        text = str(config.get("strompreis_spezial") or "").strip()
+        if not text:
+            return invalid("fixed_tariff_stages_missing")
+        pattern = re.compile(r"(?<!\d)([0-2]?\d)(?:[:.](\d{1,2}))?\s+(-?\d+(?:[,.]\d+)?)")
+        entries = {}
+        matches = list(pattern.finditer(text))
+        if not matches or pattern.sub("", text).strip(" \t\r\n;,"):
+            return invalid("fixed_tariff_schedule_invalid")
+        for match in matches:
+            hour, minute = int(match[1]), int(match[2] or 0)
+            price = float(match[3].replace(",", "."))
+            if hour > 23 or minute > 59 or not math.isfinite(price):
+                return invalid("fixed_tariff_schedule_invalid")
+            start = hour * 60 + minute
+            if start in entries and entries[start] != price:
+                return invalid("fixed_tariff_stages_conflicting")
+            entries[start] = price
+        stages = sorted(entries.items())
+    revision = hashlib.sha256(json.dumps([tariff, stages], separators=(",", ":")).encode()).hexdigest()
+    return {"valid": True, "reason": "fixed_tariff_stages_valid",
+            "stages": stages, "revision": revision,
+            "prices": sorted(set(price for _, price in stages))}
 
 
 def special_tariff_price_for_datetime(raw, value, default_price):

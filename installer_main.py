@@ -81,6 +81,7 @@ def _dispatch_background_update():
             f"{UPDATE_DISPATCHER}",
             file=sys.stderr,
         )
+        print("Nächster Schritt: Die Datei e3dc-update-bootstrap aus dem Release kopieren und sudo /bin/sh ./e3dc-update-bootstrap ausführen.", file=sys.stderr)
         raise SystemExit(127)
     print("→ Übergebe das Update an den root-eigenen Hintergrund-Dispatcher …")
     sys.stdout.flush()

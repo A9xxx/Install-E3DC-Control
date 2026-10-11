@@ -44,6 +44,7 @@ if [[ ! -f /.dockerenv ]]; then
         fi
         if [[ ! -x "$UPDATE_DISPATCHER" ]]; then
             echo "Update abgebrochen: Der root-eigene Update-Dispatcher fehlt: $UPDATE_DISPATCHER" >&2
+            echo "Nächster Schritt: Die Datei e3dc-update-bootstrap aus dem Release kopieren und sudo /bin/sh ./e3dc-update-bootstrap ausführen." >&2
             exit 127
         fi
         if (( EUID != 0 )); then

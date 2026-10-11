@@ -168,175 +168,15 @@ nicht wieder aufgenommen. Technisch wird der Schalter als
 bindet die Übernahme mit `storage_regulation_changed_ts` an die aktuelle
 Bedienaktion. Ein Dienststopp allein ersetzt diese geordnete Abschaltung nicht.
 
-> **Stand:** v5.5.3c
->
-> **Neu in 5.4.5a:** Ein frisch beobachteter openWB-Fahrzeug-SoC kann mit
-> Quelle und Alter rein lesend erscheinen, wenn er zur aktuellen Stecksession
-> oder zu einem eindeutig passenden Fahrzeugprofil gehört. Die Beobachtung
-> bestätigt keinen Regel-SoC und öffnet weder Ziel-SoC, `Auto voll`, Planung
-> noch Hardwareausgang. Dafür gelten weiterhin die getrennten bestätigten
-> Session- und Fahrzeugverträge.
->
-> **Neu in 5.4.5:** Ein zentraler Wattvertrag bindet die je Wallbox
-> finanzierte Quelle, das physische Stromquant und den finalen Aktorauftrag.
-> Echter Netzbezug wird pro frischem Netzpunkt-Snapshot gruppenweit genau
-> einmal in den Wh-Wächter übernommen; ohne Netzbezug kann nur eine frisch
-> belegte Überschreitung des autorisierten Wallboxbudgets zählen. Die
-> Abregelung folgt Stromstärke, gegebenenfalls Phasenwechsel und erst zuletzt
-> Stopp. Treiber übersetzen den finalen Auftrag, treffen aber keine eigene
-> Lade- oder Speicherentscheidung. Eine fehlende oder veraltete Messung
-> erzeugt weder Zusatzbudget noch eine erfundene Leistung.
->
-> **Neu in 5.4.4i:** Ein manuell gespeicherter Fahrzeug-SoC bleibt an echten
-> Aktionszeitpunkt, genau ein Profil sowie aktuellen Wallbox- und Steckkontext
-> gebunden; die reine Lesekorrektur erzeugt keinen Hardwarebefehl. In
-> `PV-Kurve ruhig` hält eine laufende Ladung bei kleinem Leistungsdefizit den
-> physischen Mindeststrom, bis der bestehende Energiezähler den konfigurierten
-> Wh-Rahmen erreicht. Eindeutiger Netzbezug und harte Schutzgrenzen bleiben
-> vorrangig. Eine zentrale
-> Prioritäts- oder Schutz-Null versiegelt den Strom- und
-> Phasenausgang für den Zyklus. EFY-Herstellerautonomie, direkt
-> kommandierbare Phasen und elektrische Phasenreserve bleiben getrennt; eine
-> physisch bestätigte einphasige EFY-Umschaltung wird nicht behauptet.
-> Nachgelagerte Legacy- oder Treiberrampen begrenzen ein bereits zentral
-> entschiedenes Ziel nicht erneut. Eine Erhöhung bleibt an frischen
-> Gerätezustand, verfügbares Budget und Schutzgrenzen gebunden. Reale flexible
-> Verbraucherlast, gebundener Startvorgang und bloßer Startwunsch werden
-> getrennt bilanziert, damit eine inaktive Wärmepumpe nicht dauerhaft
-> Wallboxbudget reserviert.
->
-> **Neu in 5.4.4g:** Fahrzeug-SoC wird in Planner, Tracker, Manager und
-> Weboberfläche an die echte Quelle, deren Ereigniszeit sowie Fahrzeug-,
-> Wallbox-, Steck- und Profilidentität gebunden. Eine unvollständige oder rein
-> beschreibende Direktvermarktungstrajektorie verdrängt die Standard-PV-,
-> Standard-SoC- und kWh-Prognose nicht. E3/DC-only verwendet Erzeugung eines
-> Zusatzwechselrichters ohne ausdrücklich freigegebene AC-Speicherroute nicht
-> als internen DC-Laderahmen. Diese Anzeige- und Bindungskorrekturen öffnen
-> keinen zusätzlichen Hardwarebefehl.
->
-> **Neu in 5.4.4f:** Im Modus `PV-Kurve ruhig` wird belegter physischer
-> PV-Überschuss bereits vor der sanften Anfahrrampe berücksichtigt. Speicher-,
-> Wallbox-, Hausanschluss-, Fahrzeug- und Hardwaregrenzen bleiben wirksam; es
-> entsteht weder eine Netzladefreigabe noch eine zusätzliche
-> Batterieentladefreigabe. Die Weboberfläche unterscheidet fehlende,
-> unvollständige oder planfremde SoC-Prognosen und zeigt eine ersetzende
-> Direktvermarktungsaktion als geplant, angefordert oder bestätigt wirksam.
-> Der separat belegte batterieneutrale PV-Anteil wird dabei nicht erneut durch
-> einen bereits von der Speicheraufnahme beeinflussten Netzpunktwert
-> verkleinert. Eine zentral freigegebene einphasige Ladung fällt dadurch nicht
-> allein wegen dieses zusätzlichen Filters wieder unter ihre Mindestleistung.
-> Wird ein einzelner unplausibler Messwertsatz aus Sicherheitsgründen
-> verworfen, kann das Wallboxbudget kurz `0 kW` anzeigen. Das ist nicht
-> automatisch ein Ladeabbruch; mit dem nächsten gültigen Messwertsatz wird neu
-> geregelt. Wiederholte Nullwerte bleiben ein Diagnosehinweis.
->
-> **Hinweis zu 5.4.4e:** Dieses Release korrigiert ausschließlich den
-> Webupdate- und Rücklaufpfad für die produktive RAM-Disk. Speicherentscheidung,
-> Direktvermarktung, Wallbox- und Wärmepumpenbudgets, RSCP-Ausgang und
-> Hardwaregrenzen entsprechen unverändert 5.4.4d.
->
-> **Neu in 5.4.4d:** Das gemeinsame Wallboxziel wird in allen von E3DC-Control
-> geführten Lademodi durch die konfigurierte Hausabsicherung abzüglich
-> Wallbox-Reserve begrenzt. In `Aus / autonom` muss dieselbe Grenze in der
-> Wallbox beziehungsweise im Ladeprofil hinterlegt sein, weil E3DC-Control
-> dort nach der Übergabe keine Strombefehle mehr sendet.
-> Optionale Grenz- und Reservewerte je Phase werden phasenbezogen angewendet;
-> bei unbekannter einphasiger Zuordnung gilt der ungünstigste Fall. Die Reserve
-> bildet den statisch konfigurierten Abstand für andere Verbraucher. Für den
-> Gruppen-Phasenclamp bleibt eine aus Wirkleistung durch `P/230` abgeleitete
-> Stromangabe rein diagnostisch; nur der einphasige Deckel der openWB Pro
-> nutzt den Bezug je Netzphase aus dem E3DC-Wurzelzähler geteilt durch die
-> Wechselrichter-Spannung als freigegebene Messbasis (siehe
-> `doc/Native_Wallbox.md`). Das Speicherbudget bleibt für die Wallbox bindend;
-> die eigene, im Hauswert nachlaufende Ladeleistung kann es für einige Zyklen
-> einbrechen lassen, weil die Speicherseite die Wallboxleistung erst mit dem
-> nächsten Messrahmen aus dem Hauswert herausrechnet. Das Startfenster des
-> Wallbox-Managers hält das Stromangebot der openWB Pro über solche Einbrüche
-> hinweg (kein 0 A aus Budgetgründen im Fenster).
-> Fehlt `grid_max_amps` oder ist der Wert leer, gelten 35 A je Phase. Der
-> Standard 35 A gilt nur für den Skalarpfad (3p-Gruppenbudget); die einphasige
-> Freigabe > 20 A an einer openWB Pro verlangt eine ausdrücklich eingetragene
-> Hausabsicherung. Mehrere
-> Ladepunkte teilen diesen Phasenrahmen ohne pauschale Gleichteilung. Ein
-> gebundenes einphasiges Fahrzeugprofil bestimmt die reale Lastphase; ohne
-> Fahrzeugbeleg bleibt die feste Wallboxtopologie maßgeblich.
-> Wird `wbminsoc` während der Ladung über den aktuellen Speicher-SoC angehoben,
-> endet die Akku-Unterstützung im selben Zyklus. Nur das batterieneutrale
-> PV-Budget darf die Ladung weiterführen; unterhalb der phasenabhängigen
-> Mindestleistung wird gestoppt. Start-Holds dürfen einen Fehlbetrag nur dann
-> ergänzen, wenn er vollständig durch verringerte Speicherladung oder eine
-> ausdrückliche Batterie-Freigabe finanziert ist.
->
-> **Hinweis zu 5.4.4c:** Dieses Release korrigiert ausschließlich den Update-
-> und Reparaturpfad. Speicherentscheidung, Direktvermarktung, Wallbox- und
-> Wärmepumpenbudgets, RSCP-Ausgang und Hardwaregrenzen entsprechen unverändert
-> 5.4.4b.
->
-> **Neu in 5.4.4b:** Im Sonnenmodus bleibt der batterieneutrale
-> PV-Überschuss ein unantastbarer Wallbox-Mindestrahmen. Das Storage-Budget
-> autorisiert ausschließlich darüber hinausgehende Leistung; Pre-Dump liefert
-> diese Batterieentladung als typisierten, frischen
-> `predump_discharge_add_contract_v1`, damit PV-Anteil und Entladezusatz nicht
-> doppelt gezählt werden. Bei aktiver Wallbox bindet die parallele
-> Speicherführung den AUTO-Laderahmen an `iFc`, ohne die Entladestützung zu
-> sperren. Die Verbraucherpriorität weist einen nicht vollständig finanzierbaren
-> Wärmepumpen-Startwunsch samt tatsächlichem nachrangigem Empfänger aus.
->
-> **Neu in 5.4.4:** Bei aktiver Direktvermarktung wird genau ein effektiver
-> Speicherplan aus Plan, Slot, Aktion, Zeitfenster, Owner und bestätigtem
-> Phase-5-Lebenszyklus angezeigt. Ausstehende oder widersprüchliche Wirkung
-> leert klassische Zielkurve, Leistung und Erreichbarkeitsbehauptung. Der
-> WB-Entladungsschutz verlangt zugleich frische gemessene Fahrzeuglast;
-> Netzladen der Wallbox benötigt eine eigene aktuelle Freigabe. Weder Anzeige
-> noch Wallboxfreigabe erzeugen einen zweiten RSCP-Ausgang.
->
-> **Hinweis:** 5.4.3p korrigiert ausschließlich den Eigentümer der vom
-> Download-Bootstrap neu erzeugten Git-Metadaten. Speicherentscheidung,
-> Direktvermarktung, RSCP-Ausgang und Hardwaregrenzen bleiben gegenüber
-> 5.4.3o unverändert.
->
-> **Hinweis:** 5.4.3o bindet den sicheren passiven
-> Direktvermarktungs-Ladeblock auch bei einem bewusst kandidatlosen Planslot
-> ausschließlich an Plan, Slot, DV-Owner und den tatsächlich übersetzten
-> 0-W-Ausgang. Der Kandidat bleibt diagnostisch; Laden, Entladen,
-> RSCP-Ausgang und Hardwaregrenzen erhalten keine zusätzliche Autorität.
->
-> **Hinweis:** 5.4.3n korrigiert ausschließlich den Metadatenvertrag des
-> kanonischen Rollenankers im privilegierten Backup- und Recoverypfad.
-> Speicherentscheidung, Direktvermarktung, RSCP-Ausgang und Hardwaregrenzen
-> bleiben gegenüber 5.4.3m unverändert.
->
-> **Hinweis:** 5.4.3m härtet den versiegelten normalen Ziel-Updater, dessen
-> Notifier-/Recovery-Drop-in-Vertrag und den openWB-Pro-Phasenautomaten. Eine
-> reine Wallbox-Budgetreservierung startet keinen Phasen-Cooldown; eine alte
-> Ausgangsgeneration wird vor einem neuen Storage-Grant ausgewertet. Der neue
-> Sofortauftrag erzeugt selbst weder ein Budget noch einen Hardwareausgang.
-> Speicherentscheidung, RSCP-Ausgang und Hardwaregrenzen bleiben gegenüber
-> 5.4.3l unverändert.
->
-> **Hinweis:** 5.4.3l härtet ausschließlich den updater-eigenen Git-Rückweg,
-> die eng freigegebene Migration einer historischen Storage-Manager-Unit und
-> den Startschutz nach einem synchron erkannten Recoveryfehler. Das betrifft
-> den systemd- und Dateivertrag des Updates, nicht die fachliche
-> Speicherregelung. Speicherentscheidungen, RSCP-Ausgänge und
-> Hardwaregrenzen entsprechen unverändert 5.4.3k.
->
-> **Neu in 5.4.3:** Speicherreserve, Sollkurve, Direktvermarktung und
-> Verbraucherbudgets bleiben getrennt. Ein gemeinsamer Ownervertrag bindet die
-> finale Speicherentscheidung bis zum Hardwareausgang; fehlende, veraltete
-> oder widersprüchliche Rückmeldungen öffnen keinen zusätzlichen Lade- oder
-> Entladerahmen. Plan, freigegebene Aktion und tatsächliche Wirkung werden
-> getrennt dargestellt.
->
-> **Hinweis:** 5.4.2d ändert ausschließlich den Update- und
-> Wiederherstellungspfad. Speicherentscheidungen und Hardwareausgänge
-> entsprechen unverändert 5.4.2c.
+> **Stand:** v5.5.4
 >
 > **Dateien:** `Installer/storage_simulator.py`,
 > `Installer/storage_manager.py`, `Installer/storage_parallel_regulator.py`
 >
 > **Dienste:** `e3dc-storage-simulator.service`,
 > `e3dc-storage-manager.service`
+>
+> Die Änderungshistorie steht im `CHANGELOG.md`.
 
 ## Überblick
 
@@ -473,9 +313,16 @@ Die Ladekurve führt den Speicher entlang der Prognose. Der Manager berechnet:
 - verfügbare PV-/Exportreserve.
 - harte Abregel- oder Wechselrichtergrenzen.
 
-Der Aufholbedarf wird geglättet und nahe der Kurve gedämpft. Dadurch soll der
+An und über der Kurve wird der Aufholbedarf geglättet und gedämpft. Dadurch soll der
 Speicher ruhig entlang der Kurve laden, statt in Sägezähnen zwischen 0 W und
 Vollgas zu springen.
+
+Unterhalb der Untergrenze des Korridors bzw. hinter der Kurve bei Plänen
+ohne Korridor setzt E3DC-Control keine EMS-Ladegrenze; E3DC nimmt
+verfügbaren PV-Überschuss frei auf. Die Freigabe folgt der bestehenden
+Kurvenhysterese; ein unerreichbares Ziel oder ein Abendziel-Rückstand
+allein hebt die Ladegrenze nicht auf. Innerhalb des Korridors und darüber
+bleiben Dämpfung und Ladegrenzen wirksam.
 
 Die echte Regelgröße ist ein geglätteter `curve_control_soc`, der den
 Batteriefluss integriert. Der Roh-SoC bleibt die Wahrheit, aber das Regelsignal
@@ -761,6 +608,85 @@ Livewerten als `WP_Power` geführt. Wenn der Hausverbrauch die WP bereits enthä
 wird `Home_Power_Raw` behalten und `Home_Power` bereinigt. Dadurch erkennt der
 Storage Manager Pre-Dump- und Kurvenlasten, ohne die Wärmepumpe doppelt zu
 zählen.
+
+### Wallbox-Budget, Netzbezug und Ausgang
+
+Ein zentraler Wattvertrag bindet die je Wallbox finanzierte Quelle, das
+physische Stromquant und den finalen Aktorauftrag. Echter Netzbezug wird pro
+frischem Netzpunkt-Snapshot gruppenweit genau einmal in den Wh-Wächter
+übernommen; ohne Netzbezug kann nur eine frisch belegte Überschreitung des
+autorisierten Wallboxbudgets zählen. Die Abregelung folgt Stromstärke,
+gegebenenfalls Phasenwechsel und erst zuletzt Stopp. Treiber übersetzen den
+finalen Auftrag, treffen aber keine eigene Lade- oder Speicherentscheidung.
+Eine fehlende oder veraltete Messung erzeugt weder Zusatzbudget noch eine
+erfundene Leistung.
+
+Eine zentrale Prioritäts- oder Schutz-Null versiegelt den Strom- und
+Phasenausgang für den Zyklus. EFY-Herstellerautonomie, direkt kommandierbare
+Phasen und elektrische Phasenreserve bleiben getrennt; eine physisch bestätigte
+einphasige EFY-Umschaltung wird nicht behauptet. Nachgelagerte Legacy- oder
+Treiberrampen begrenzen ein bereits zentral entschiedenes Ziel nicht erneut.
+Eine Erhöhung bleibt an frischen Gerätezustand, verfügbares Budget und
+Schutzgrenzen gebunden. Reale flexible Verbraucherlast, gebundener Startvorgang
+und bloßer Startwunsch werden getrennt bilanziert, damit eine inaktive
+Wärmepumpe nicht dauerhaft Wallboxbudget reserviert.
+
+Wird ein einzelner unplausibler Messwertsatz aus Sicherheitsgründen verworfen,
+kann das Wallboxbudget kurz `0 kW` anzeigen. Das ist nicht automatisch ein
+Ladeabbruch; mit dem nächsten gültigen Messwertsatz wird neu geregelt.
+Wiederholte Nullwerte bleiben ein Diagnosehinweis.
+
+### Hausanschluss und Wallbox-Budget
+
+Das gemeinsame Wallboxziel wird in allen von E3DC-Control geführten Lademodi
+durch die konfigurierte Hausabsicherung abzüglich Wallbox-Reserve begrenzt.
+In `Aus / autonom` muss dieselbe Grenze in der Wallbox beziehungsweise im
+Ladeprofil hinterlegt sein, weil E3DC-Control dort nach der Übergabe keine
+Strombefehle mehr sendet. Optionale Grenz- und Reservewerte je Phase werden
+phasenbezogen angewendet; bei unbekannter einphasiger Zuordnung gilt der
+ungünstigste Fall. Die Reserve bildet den statisch konfigurierten Abstand für
+andere Verbraucher. Für den Gruppen-Phasenclamp bleibt eine aus Wirkleistung
+durch `P/230` abgeleitete Stromangabe rein diagnostisch; nur der einphasige
+Deckel der openWB Pro nutzt den Bezug je Netzphase aus dem E3DC-Wurzelzähler
+geteilt durch die Wechselrichter-Spannung als freigegebene Messbasis (siehe
+`doc/Native_Wallbox.md`). Das Speicherbudget bleibt für die Wallbox bindend;
+die eigene, im Hauswert nachlaufende Ladeleistung kann es für einige Zyklen
+einbrechen lassen, weil die Speicherseite die Wallboxleistung erst mit dem
+nächsten Messrahmen aus dem Hauswert herausrechnet. Das Startfenster des
+Wallbox-Managers hält das Stromangebot der openWB Pro über solche Einbrüche
+hinweg (kein 0 A aus Budgetgründen im Fenster).
+
+Fehlt `grid_max_amps` oder ist der Wert leer, gelten 35 A je Phase. Der
+Standard 35 A gilt nur für den Skalarpfad (3p-Gruppenbudget); die einphasige
+Freigabe > 20 A an einer openWB Pro verlangt eine ausdrücklich eingetragene Hausabsicherung.
+Mehrere Ladepunkte teilen diesen Phasenrahmen ohne pauschale Gleichteilung. Ein
+gebundenes einphasiges Fahrzeugprofil bestimmt die reale Lastphase; ohne
+Fahrzeugbeleg bleibt die feste Wallboxtopologie maßgeblich.
+
+Wird `wbminsoc` während der Ladung über den aktuellen Speicher-SoC angehoben,
+endet die Akku-Unterstützung im selben Zyklus. Nur das batterieneutrale
+PV-Budget darf die Ladung weiterführen; unterhalb der phasenabhängigen
+Mindestleistung wird gestoppt. Start-Holds dürfen einen Fehlbetrag nur dann
+ergänzen, wenn er vollständig durch verringerte Speicherladung oder eine
+ausdrückliche Batterie-Freigabe finanziert ist.
+
+### Pre-Dump, Direktvermarktung und Zusatzwechselrichter
+
+Im Sonnenmodus bleibt der batterieneutrale PV-Überschuss ein unantastbarer
+Wallbox-Mindestrahmen. Das Storage-Budget autorisiert ausschließlich darüber
+hinausgehende Leistung; Pre-Dump liefert diese Batterieentladung als
+typisierten, frischen `predump_discharge_add_contract_v1`, damit PV-Anteil und
+Entladezusatz nicht doppelt gezählt werden. Die Verbraucherpriorität weist einen
+nicht vollständig finanzierbaren Wärmepumpen-Startwunsch samt tatsächlichem
+nachrangigem Empfänger aus.
+
+Eine unvollständige oder rein beschreibende Direktvermarktungstrajektorie
+verdrängt die Standard-PV-, Standard-SoC- und kWh-Prognose nicht. E3/DC-only
+verwendet Erzeugung eines Zusatzwechselrichters ohne ausdrücklich freigegebene
+AC-Speicherroute nicht als internen DC-Laderahmen. Bei aktiver
+Direktvermarktung verlangt der WB-Entladungsschutz zugleich frische gemessene
+Fahrzeuglast; Netzladen der Wallbox benötigt eine eigene aktuelle Freigabe.
+Weder Anzeige noch Wallboxfreigabe erzeugen einen zweiten RSCP-Ausgang.
 
 ## 5. Pre-Dump
 

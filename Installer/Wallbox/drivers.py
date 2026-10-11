@@ -21,6 +21,7 @@ import requests as _requests
 
 from .config import logger, RAMDISK_DIR
 from . import command_gate
+from .storage_intent import wallbox_type_is_e3dc
 from .soc_tracker import (
     vehicle_soc_source_trusted, resolve_openwb_pro_profile,
     openwb_pro_sample_matches_profile,
@@ -1023,6 +1024,14 @@ class OpenWBCharger(WallboxDriver):
             f"[WB{self.wb_id}]   Steuerpfad   : "
             f"{control_path}"
         )
+        self.state.update(dict.fromkeys((
+            "openwb_bat_mode", "openwb_bat_mode_topic", "openwb_bat_mode_ts",
+            "openwb_extern", "openwb_software_version", "openwb_switch_off_delay_s",
+            "openwb_chargemode", "state_text_ts",
+        )))
+        self.state["openwb_status_reason"] = dict.fromkeys(
+            self._OPENWB_DISPLAY_TOPICS.values(), "not_received"
+        )
         self.mqtt_client = None
         self._mqtt_subscribed_topics = set()
         legacy_mqtt = str(
@@ -1319,6 +1328,52 @@ class OpenWBCharger(WallboxDriver):
         value = cls._float_value(payload.get("range"), 0.0)
         return value, True
 
+    # Diese Konfiguration wird ausschließlich für Anzeige und Beratung gelesen.
+    _OPENWB_DISPLAY_TOPICS = {
+        "openWB/general/chargemode_config/pv_charging/bat_mode": "openwb_bat_mode",
+        "openWB/general/chargemode_config/bat/mode": "openwb_bat_mode",
+        "openWB/general/extern": "openwb_extern",
+        "openWB/system/version": "openwb_software_version",
+        "openWB/general/chargemode_config/pv_charging/switch_off_delay": "openwb_switch_off_delay_s",
+        "openWB/general/chargemode_config/surplus/vehicle/switch_off_delay": "openwb_switch_off_delay_s",
+    }
+
+    def _read_openwb_display_topic(self, topic, payload):
+        key = self._OPENWB_DISPLAY_TOPICS.get(topic)
+        if key is None:
+            return False
+        try:
+            value = json.loads(payload)
+        except (ValueError, TypeError):
+            value = payload
+        if key == "openwb_bat_mode":
+            value = value if isinstance(value, str) and value in (
+                "ev_mode", "bat_mode", "min_soc_bat_mode"
+            ) else None
+            self.state["openwb_bat_mode_topic"] = topic
+            # Empfangszeit der Konfiguration, kein Messzeitpunkt der openWB.
+            self.state["openwb_bat_mode_ts"] = int(time.time())
+        elif key == "openwb_extern":
+            if isinstance(value, str) and value in ("true", "false"):
+                value = value == "true"
+            value = value if isinstance(value, bool) else None
+        elif key == "openwb_switch_off_delay_s":
+            try:
+                value = None if isinstance(value, bool) else float(value)
+                if value is not None and (not math.isfinite(value) or value < 0):
+                    value = None
+            except (ValueError, TypeError):
+                value = None
+        elif key == "openwb_software_version":
+            value = value.strip() if isinstance(value, str) else None
+            if not value or not re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:[-+][A-Za-z0-9.]+)?", value):
+                value = None
+        self.state[key] = value
+        self.state.setdefault("openwb_status_reason", {})[key] = (
+            "received" if value is not None else "missing_or_invalid"
+        )
+        return True
+
     def _mqtt_subscription_topics(self):
         topics = [
             f"{self.native_prefix}/connected_vehicle/soc",
@@ -1343,6 +1398,7 @@ class OpenWBCharger(WallboxDriver):
                 f"{self.simpleapi_prefix}/chargemode",
                 f"openWB/chargepoint{self.cp_suffix}/config",
             ])
+        topics.extend(self._OPENWB_DISPLAY_TOPICS)
         return topics
 
     def _sync_mqtt_subscriptions(self, client, *, reconnect=False):
@@ -1389,6 +1445,11 @@ class OpenWBCharger(WallboxDriver):
         reason_code = args[-2] if len(args) >= 2 else (args[0] if args else None)
         rc_text = str(reason_code if reason_code is not None else "")
         self.state["mqtt_connected"] = False
+        for key in self._OPENWB_DISPLAY_TOPICS.values():
+            self.state[key] = None
+            self.state.setdefault("openwb_status_reason", {})[key] = "disconnected"
+        self.state["openwb_bat_mode_topic"] = None
+        self.state["openwb_bat_mode_ts"] = None
         self.state["mqtt_reconnect_backoff_s"] = 2
         self.state["mqtt_reconnect_backoff_max_s"] = 60
         logger.warning(
@@ -1400,6 +1461,8 @@ class OpenWBCharger(WallboxDriver):
         try:
             topic       = msg.topic
             payload_str = msg.payload.decode('utf-8').strip()
+            if self._read_openwb_display_topic(topic, payload_str):
+                return
             if not payload_str:
                 return
 
@@ -1821,6 +1884,23 @@ class OpenWBCharger(WallboxDriver):
                 audit_allowed=False,
             ):
                 return False
+            import urllib.parse
+            mode = urllib.parse.parse_qs(post_data).get("set_chargemode", [None])[0]
+            if self.primary_mode_enabled and mode in ("stop", "pv", "instant"):
+                self._primary_mode_command_restore()
+                previous = self.state.get("primary_mode_command") or {}
+                previous_mode = previous.get("previous_mode")
+                if previous.get("active") is True:
+                    previous_mode = (previous.get("mode") if previous.get("confirmed_ts") is not None
+                                     else previous_mode or previous.get("mode"))
+                self.state["primary_mode_command"] = {
+                    "mode": mode, "ts": time.time(), "confirmed_ts": None,
+                    "active": True, "endpoint": self._primary_mode_endpoint,
+                    "previous_mode": previous_mode,
+                }
+                # Ein Timeout kann nach Annahme eintreten. Den tatsächlich
+                # zugelassenen Sendeversuch schon vor der Rückmeldung sichern.
+                self.write_openwb_status(command_only=True)
             with urllib.request.urlopen(req, timeout=5) as ctx:
                 resp = ctx.read().decode('utf-8', errors='replace')
             if '"success":true' in resp:
@@ -1855,6 +1935,47 @@ class OpenWBCharger(WallboxDriver):
         """Ladepunktnummer für die openWB simpleAPI."""
         return str(self.cp_id) if self.cp_id != "" else "auto"
 
+    def _primary_mode_command_restore(self):
+        """Nur den eigenen, an diesen HTTP-Ladepunkt gebundenen Sendebeleg laden."""
+        if getattr(self, "_primary_mode_command_loaded", False):
+            return
+        self._primary_mode_command_loaded = True
+        self._primary_mode_endpoint = hashlib.sha256(
+            (str(self.http_api_url) + "|" + str(self.cp_id)).encode("utf-8")
+        ).hexdigest()
+        try:
+            path = os.path.join(RAMDISK_DIR, f"openwb_data_wb{self.wb_id}.json")
+            with open(path, "r", encoding="utf-8") as handle:
+                old = json.load(handle).get("primary_mode_command")
+            if (isinstance(old, dict) and old.get("endpoint") == self._primary_mode_endpoint
+                    and old.get("mode") in ("pv", "instant", "stop")
+                    and 0 < float(old.get("ts", 0)) <= time.time()):
+                self.state["primary_mode_command"] = dict(old)
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+
+    def _primary_mode_observe(self, value, observed_ts):
+        """HTTP-Rückmeldung getrennt von MQTT-Cache und optimistischem Sollwert."""
+        self._primary_mode_command_restore()
+        mode = str(value or "").strip().strip('"').lower()
+        mode = {"pv_charging": "pv", "instant_charging": "instant", "stopped": "stop"}.get(mode, mode)
+        valid = mode in ("stop", "pv", "instant", "standby")
+        self.state["primary_mode_observation"] = {
+            "mode": mode if valid else None, "ts": observed_ts,
+            "valid": valid, "reason": "http_readback" if valid else "mode_missing_or_unknown",
+        }
+        command = self.state.get("primary_mode_command")
+        if (isinstance(command, dict) and valid
+                and mode != command.get("previous_mode")):
+            command.pop("previous_mode", None)
+        if isinstance(command, dict) and command.get("active") is True:
+            if valid and observed_ts >= float(command.get("ts", 0)):
+                if mode == command.get("mode"):
+                    command["confirmed_ts"] = observed_ts
+                elif (command.get("confirmed_ts") is not None
+                        or observed_ts - float(command.get("ts", 0)) > 30):
+                    command["active"] = False
+
     def _primary_set_chargemode(self, mode: str) -> bool:
         """Schaltet openWB Software im Primary-Betrieb auf PV/Sofort/Stop."""
         import urllib.parse
@@ -1872,6 +1993,7 @@ class OpenWBCharger(WallboxDriver):
             "set_chargemode": mode,
             "chargepoint_nr": self._openwb_chargepoint_nr(),
         })
+        self._primary_mode_command_restore()
         ok = self._http_post(post_data)
         if ok:
             self.state["chargemode_str"] = mode
@@ -3025,7 +3147,10 @@ class OpenWBCharger(WallboxDriver):
             # erhaltene Session-ID reichen dafür nicht.
             "vehicle_identity_current": bool(stable_vehicle_identity_current),
             "stable_vehicle_identity_current": bool(stable_vehicle_identity_current),
-            "state_text": self._text_value(cp_data.get("state_str"), self.state.get("state_text", "")),
+            "state_text": self._text_value(cp_data.get("state_str"), "") if isinstance(cp_data.get("state_str"), str) else "",
+            "state_text_ts": int(time.time()) if isinstance(cp_data.get("state_str"), str) and cp_data["state_str"].strip() else None,
+            # Getrennt von intern gesetzten Sollmodi: nur die HTTP-Rückmeldung.
+            "openwb_chargemode": self._text_value(cp_data.get("chargemode"), "") if isinstance(cp_data.get("chargemode"), str) else None,
             "fault_text": self._text_value(cp_data.get("fault_str"), self.state.get("fault_text", "")),
             "fault_state": int(self._float_value(cp_data.get("fault_state"), self.state.get("fault_state", 0))),
             "manual_lock": self._bool_value(cp_data.get("manual_lock"), self.state.get("manual_lock", False)),
@@ -3040,10 +3165,12 @@ class OpenWBCharger(WallboxDriver):
             "rfid_tag": (live_rfid_tag or self.state.get("rfid_tag")) if effective_plug_state else None,
             "car_range": self.state.get("car_range", 0.0),
         })
+        if self.primary_mode_enabled:
+            self._primary_mode_observe(cp_data.get("chargemode"), time.time())
         self.write_openwb_status()
         return True
 
-    def write_openwb_status(self):
+    def write_openwb_status(self, *, command_only=False):
         """Schreibt aktuellen openWB-Status als JSON in die Ramdisk."""
         out_file  = os.path.join(RAMDISK_DIR, f"openwb_data_wb{self.wb_id}.json")
         out_alias = os.path.join(RAMDISK_DIR, "openwb_data.json") if self.wb_id == 1 else None
@@ -3099,11 +3226,22 @@ class OpenWBCharger(WallboxDriver):
             'daily_imported_wh': round(self.state['daily_imported_wh'], 0),
             'imported_total_wh': round(self.state['imported_total_wh'], 0),
             'chargemode':        self.state['chargemode_str'],
+            'primary_mode_command': self.state.get('primary_mode_command'),
+            'primary_mode_observation': self.state.get('primary_mode_observation'),
             'chargepoint_name':  self.state.get('chargepoint_name', ''),
             'charge_template_name': self.state.get('charge_template_name', ''),
             'vehicle_identity_current': bool(self.state.get('vehicle_identity_current', False)),
             'stable_vehicle_identity_current': bool(self.state.get('stable_vehicle_identity_current', False)),
             'state_text':        self.state.get('state_text', ''),
+            'state_text_ts':     self.state.get('state_text_ts'),
+            'openwb_chargemode': self.state.get('openwb_chargemode'),
+            'openwb_bat_mode': self.state.get('openwb_bat_mode'),
+            'openwb_bat_mode_topic': self.state.get('openwb_bat_mode_topic'),
+            'openwb_bat_mode_ts': self.state.get('openwb_bat_mode_ts'),
+            'openwb_extern': self.state.get('openwb_extern'),
+            'openwb_software_version': self.state.get('openwb_software_version'),
+            'openwb_switch_off_delay_s': self.state.get('openwb_switch_off_delay_s'),
+            'openwb_status_reason': dict(self.state.get('openwb_status_reason', {})),
             'fault_text':        self.state.get('fault_text', ''),
             'fault_state':       self.state.get('fault_state', 0),
             'manual_lock':       bool(self.state.get('manual_lock', False)),
@@ -3155,8 +3293,21 @@ class OpenWBCharger(WallboxDriver):
             'car_capacity_kwh':  self.state.get('car_capacity_kwh', 0.0),
             'car_consumption_kwh_100km': self.state.get('car_consumption_kwh_100km', 0.0),
         }
+        if command_only:
+            # Ein Sendeversuch erneuert weder Messwerte noch deren Zeitstempel.
+            try:
+                with open(out_file, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+                if not isinstance(payload, dict):
+                    raise ValueError("Kein Statusobjekt")
+            except (OSError, ValueError):
+                payload = {"wb_id": self.wb_id, "cp_id": self.cp_id, "ts": None,
+                           "driver_status_valid": False,
+                           "driver_status_reason": "command_without_status"}
+            payload["primary_mode_command"] = self.state.get("primary_mode_command")
         try:
             tmp = out_file + '.tmp'
+
             with open(tmp, 'w') as f:
                 json.dump(payload, f)
             os.replace(tmp, out_file)
@@ -8376,12 +8527,7 @@ def create_charger(wb_type, ip, wb_id, config=None):
     wb_type = str(wb_type).strip().lower()
     if not wb_type or wb_type in DISABLED_WALLBOX_TYPES:
         return None
-    native_types = (
-        "native", "e3dc", "e3dc_easy", "e3dc_easy_connect", "e3dc_legacy",
-        "e3dc_efy", "e3dc_auto", "e3dc_multi", "e3dc_multi_connect",
-        "e3dc_multi_connect_ii",
-    )
-    if not ip and wb_type not in ("dummy", *native_types):
+    if not ip and wb_type != "dummy" and not wallbox_type_is_e3dc(wb_type):
         return None
     config = dict(config or {})
     config["_e3dc_configured_type"] = wb_type
@@ -8391,10 +8537,7 @@ def create_charger(wb_type, ip, wb_id, config=None):
         return _bind_configured_driver_limits(OpenWBCharger(ip, wb_id, config), config, wb_id)
     if wb_type in ("openwb_pro", "openwb-pro", "openwbpro"):
         return _bind_configured_driver_limits(OpenWBProCharger(ip, wb_id, config), config, wb_id)
-    if wb_type in (
-        "e3dc_auto", "e3dc_efy", "e3dc_easy", "e3dc_easy_connect",
-        "e3dc_multi", "e3dc_multi_connect", "e3dc_multi_connect_ii",
-    ):
+    if wallbox_type_is_e3dc(wb_type) and wb_type not in ("native", "e3dc", "e3dc_legacy"):
         return _bind_configured_driver_limits(
             E3DCMultiConnectCharger(ip, wb_id, config),
             config,

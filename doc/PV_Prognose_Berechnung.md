@@ -210,6 +210,8 @@ nicht zu einer belegten P50-Prognose.
 
 ## Datenschutzgerechte Diagnose
 
+Die PV-Prognosediagnose wird über den gleichnamigen Schalter in der Modul-Konfiguration oder im Config-Editor ausgeschaltet; der Dienst beendet sich danach selbst.
+
 Für Supportfälle das redigierte Diagnosepaket der Installationszentrale
 verwenden. Vor der Weitergabe insbesondere Standort, Anlagenkennungen,
 Zugangsdaten, lokale Adressen und reale Messreihen prüfen. Rohe

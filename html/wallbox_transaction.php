@@ -849,7 +849,7 @@ function e3dcWbTxModeRequestBytes(array $snapshot, $wbId, $newMode, $oldMode, $k
     } elseif ($kind === 'user') {
         $data[$key] = [
             'ts' => time(), 'source' => 'Wallbox.php', 'reason' => 'mode2_user_switch_pv',
-            'target_mode' => '2', 'previous_mode' => (string)$oldMode,
+            'target_mode' => (string)$newMode, 'previous_mode' => (string)$oldMode,
         ];
     } elseif ($kind === 'mode5_start') {
         if (!empty($data)) {
@@ -1218,7 +1218,7 @@ function e3dcWallboxPlanTransaction(array $updates, array $options = []) {
             if ($newMode === '0' && $oldMode !== '0') {
                 $requestKind = 'default';
                 $requestTarget = $ramdisk . '/wallbox_default_release_request.json';
-            } elseif ($newMode === '2' && $oldMode !== '2') {
+            } elseif (in_array($newMode, ['2', '4'], true) && $oldMode !== $newMode) {
                 $requestKind = 'user';
                 $requestTarget = $ramdisk . '/wallbox_user_mode_request.json';
             } elseif (

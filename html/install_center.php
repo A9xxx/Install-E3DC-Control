@@ -1,5 +1,6 @@
 <?php
 require_once __DIR__ . '/helpers.php';
+require_once __DIR__ . '/module_install_jobs.php';
 sendNoCacheHeaders();
 requireWebAuth(false);
 
@@ -142,47 +143,17 @@ function runInstallerJob($action, $module = null, $viaWrapper = false) {
 }
 
 function runInstallerWriteJob($action, $module = null) {
-    $allowed = ['repair_permissions', 'install_module', 'remove_module'];
-    if (!in_array($action, $allowed, true)) {
-        return [
-            'success' => false,
-            'write_blocked' => true,
-            'error' => 'Schreibender Job ist in dieser Stufe nicht erlaubt'
-        ];
+    if ($action === 'repair_permissions') {
+        return ['success' => false, 'write_blocked' => true,
+                'message' => 'Globale Rechte-Reparatur verwendet den bestehenden Rechte-Launcher. Der Modul-Launcher ändert ausschließlich optionale Module.'];
     }
-    if ($action === 'repair_permissions' && $module !== null && $module !== '') {
-        return [
-            'success' => false,
-            'write_blocked' => true,
-            'error' => 'Globale Rechte-Reparatur erwartet kein Modul'
-        ];
+    $actions = ['install_module' => 'install', 'remove_module' => 'remove'];
+    if (!is_string($action) || !isset($actions[$action])) {
+        return ['success' => false, 'write_blocked' => true, 'message' => 'Ungültige Modul-Schreibaktion.'];
     }
-    if ($action === 'install_module' || $action === 'remove_module') {
-        if ($module === null || $module === '') {
-            return [
-                'success' => false,
-                'write_blocked' => true,
-                'error' => 'Modul-Schreibaktion erwartet einen Modul-Key'
-            ];
-        }
-        if (!preg_match('/^[a-z0-9_]+$/', $module)) {
-            return [
-                'success' => false,
-                'write_blocked' => true,
-                'error' => 'Ungültiger Modul-Key'
-            ];
-        }
-    }
-    return [
-        'success' => false,
-        'write_blocked' => true,
-        'privileged_installer_web_enabled' => false,
-        'action' => $action,
-        'module' => ($module !== null && $module !== '') ? $module : null,
-        'error' => 'Privilegierte Installer-Webjobs sind aus Sicherheitsgründen deaktiviert.',
-        'message' => 'Der alte gemeinsame Ramdisk-/sudo-Pfad wird nicht mehr verwendet. Bitte diese administrative Änderung bis zu einem eigenen engen Launcher per Konsole ausführen.',
-    ];
+    return e3dc_run_module_launcher($actions[$action], $module);
 }
+
 
 function inspectRuntimePermissionsLauncher() {
     $specs = [
@@ -250,7 +221,7 @@ function runRuntimePermissionsRepair($checkOnly = false, $confirmationToken = ''
         return [
             'success' => false,
             'error_code' => 'confirmation_token_invalid',
-            'message' => 'Die Dateilistenfreigabe ist ungültig. Bitte starte die Rechtereparatur erneut.',
+            'message' => 'Die Dateilistenfreigabe ist ungültig. Bitte die Rechtereparatur erneut starten.',
         ];
     }
     $argv = [
@@ -329,7 +300,8 @@ function installCenterModuleConfigFields($moduleKey) {
         ['value' => '2', 'label' => 'Heizstab / Shelly'],
         ['value' => '3', 'label' => 'Shelly Pro3EM ohne native WP'],
         ['value' => '4', 'label' => 'Stiebel Eltron ISG / WPM'],
-        ['value' => '5', 'label' => 'Dimplex WPM Touch / NWPM']
+        ['value' => '5', 'label' => 'Dimplex WPM Touch / NWPM'],
+        ['value' => '6', 'label' => 'E3DC Leistungsmesser (PM)']
     ];
     $relayOptions = [
         ['value' => '-1', 'label' => '-1 = nur messen'],
@@ -354,12 +326,15 @@ function installCenterModuleConfigFields($moduleKey) {
         'live' => [
             installCenterConfigField('server_ip', 'E3DC IP-Adresse', 'text', [], '', false, '192.0.2.50'),
             installCenterConfigField('server_port', 'RSCP Port', 'number', [], '', false, '5033'),
-            installCenterConfigField('e3dc_user', 'E3DC Benutzer'),
+            installCenterConfigField('e3dc_user', 'E3DC Benutzer', 'password', [], 'Leer lassen = unverändert.', true),
             installCenterConfigField('e3dc_password', 'E3DC Passwort', 'password', [], 'Leer lassen = unverändert.', true),
             installCenterConfigField('aes_password', 'AES Passwort', 'password', [], 'Leer lassen = unverändert.', true),
         ],
+        'forecast_evidence' => [
+            installCenterConfigField('forecast_diagnostics_enable', 'PV-Prognosediagnose', 'select', $bool, 'Ein = lokale Prognosediagnose einschalten; Aus = Dienst beendet sich selbst.'),
+        ],
         'weather' => [
-            installCenterConfigField('forecast1', 'Forecast Solar API-Key / Quelle', 'text'),
+            installCenterConfigField('forecast1', 'PV-Fläche 1', 'text', [], "PV-Anlage 1: Neigung/Azimuth/kWp, z.B. '40/-50/15.4'. Azimuth: Süd=0, Ost=-90, West=+90.", false, '35/0/10.0'),
         ],
         'wallbox' => [
             installCenterConfigField('wb_native_enable', 'Native Wallbox-Regelung', 'select', $bool),
@@ -389,7 +364,6 @@ function installCenterModuleConfigFields($moduleKey) {
         'heatpump' => array_merge($commonHeatPump, [
             installCenterConfigField('luxtronik_ip', 'Luxtronik IP-Adresse', 'text', [], '', false, '192.0.2.60'),
             installCenterConfigField('idm_ip', 'IDM IP-Adresse', 'text', [], '', false, '192.0.2.61'),
-            installCenterConfigField('idm_port', 'IDM Modbus-Port', 'number', [], '', false, '502'),
             installCenterConfigField('stiebel_isg_ip', 'Stiebel ISG IP-Adresse', 'text', [], '', false, '192.0.2.70'),
             installCenterConfigField('stiebel_isg_port', 'Stiebel Modbus-Port', 'number', [], '', false, '502'),
             installCenterConfigField('stiebel_isg_power_meter_enable', 'Stiebel Leistungsmesser', 'select', $bool),
@@ -398,14 +372,6 @@ function installCenterModuleConfigFields($moduleKey) {
             installCenterConfigField('dimplex_port', 'Dimplex Modbus-Port', 'number', [], '', false, '502'),
             installCenterConfigField('dimplex_wpm_software', 'Dimplex WPM Software', 'text', [], '', false, 'auto / M3.21'),
             installCenterConfigField('dimplex_sg_register', 'Dimplex SG Register', 'number', [], '', false, '5167'),
-            installCenterConfigField('shelly_3em_ip', 'Shelly Pro3EM IP', 'text', [], '', false, '192.0.2.90'),
-            installCenterConfigField('shelly_3em_relay_id', 'Shelly Relais-ID', 'select', $relayOptions),
-            installCenterConfigField('shelly_3em_enable', 'PV-Auto-Steuerung', 'select', [
-                ['value' => '0', 'label' => 'Nur messen'],
-                ['value' => '1', 'label' => 'PV-Auto schalten']
-            ]),
-            installCenterConfigField('shelly_3em_wp_min_w', 'WP Mindestleistung (W)', 'number', [], '', false, '1000'),
-            installCenterConfigField('shelly_3em_wp_max_w', 'WP Nennleistung (W)', 'number', [], '', false, '3000'),
         ]),
         'lux_live' => [
             installCenterConfigField('luxtronik', 'WP-/Verbrauchslogging', 'select', $bool),
@@ -458,6 +424,15 @@ function installCenterModuleConfigFields($moduleKey) {
             installCenterConfigField('dimplex_temp_scale', 'Temperatur-Skalierung', 'text', [], '', false, 'auto'),
         ],
         'heizstab' => [
+            installCenterConfigField('wp_type', 'Wärmepumpen-Typ', 'select', $wpTypes),
+            installCenterConfigField('shelly_3em_ip', 'Shelly Pro3EM IP', 'text', [], '', false, '192.0.2.90'),
+            installCenterConfigField('shelly_3em_relay_id', 'Shelly Relais-ID', 'select', $relayOptions),
+            installCenterConfigField('shelly_3em_enable', 'PV-Auto-Steuerung', 'select', [
+                ['value' => '0', 'label' => 'Nur messen'],
+                ['value' => '1', 'label' => 'PV-Auto schalten']
+            ]),
+            installCenterConfigField('shelly_3em_wp_min_w', 'WP Mindestleistung (W)', 'number', [], '', false, '1000'),
+            installCenterConfigField('shelly_3em_wp_max_w', 'WP Nennleistung (W)', 'number', [], '', false, '3000'),
             installCenterConfigField('heizstab', 'Heizstab/BWWP aktiv', 'select', $bool),
             installCenterConfigField('heizstab_ip', 'my-PV / Heizstab IP', 'text', [], '', false, '192.0.2.81'),
             installCenterConfigField('heizstab_port', 'Modbus-Port', 'number', [], '', false, '502'),
@@ -505,8 +480,8 @@ function installCenterModuleConfigFields($moduleKey) {
                 ['value' => 'schedule', 'label' => 'Zeitprofil'],
             ]),
             installCenterConfigField('climate_toshiba_cloud_enable', 'Toshiba Cloud lesen', 'select', $bool, 'Read-only-Lesepfad für Temperaturen, Sollwert und Modus. Steuerbefehle bleiben gesperrt.'),
-            installCenterConfigField('climate_toshiba_username', 'Toshiba Benutzer', 'text'),
-            installCenterConfigField('climate_toshiba_password', 'Toshiba Passwort', 'password'),
+            installCenterConfigField('climate_toshiba_username', 'Toshiba Benutzer', 'password', [], 'Leer lassen = unverändert.', true),
+            installCenterConfigField('climate_toshiba_password', 'Toshiba Passwort', 'password', [], 'Leer lassen = unverändert.', true),
             installCenterConfigField('climate_toshiba_device_ids', 'Toshiba Geräteauswahl', 'text', [], '', false, 'Oben, Unten'),
             installCenterConfigField('climate_day_temp_c', 'Tag-Temperatur °C', 'number', [], '', false, '24.0'),
             installCenterConfigField('climate_night_temp_c', 'Nacht-Temperatur °C', 'number', [], '', false, '26.0'),
@@ -517,7 +492,7 @@ function installCenterModuleConfigFields($moduleKey) {
             installCenterConfigField('climate_high_power_enable', 'High Power tagsüber', 'select', $bool),
         ],
         'ha' => [
-            installCenterConfigField('ha_mode', 'Cluster-Rolle', 'select', $haModes),
+            array_merge(installCenterConfigField('ha_mode', 'Cluster-Rolle', 'select', $haModes, 'Rollenwechsel nur über Konsole 49'), ['disabled' => true]),
             installCenterConfigField('ha_peer_ip', 'Partner-IP'),
             installCenterConfigField('ha_sync_interval', 'Sync-Intervall (Min)', 'number'),
             installCenterConfigField('ha_fail_timeout', 'Failover Timeout (Min)', 'number'),
@@ -525,7 +500,7 @@ function installCenterModuleConfigFields($moduleKey) {
             installCenterConfigField('ha_auto_failover', 'Auto-Failover', 'select', $bool),
         ],
         'shadow' => [
-            installCenterConfigField('ha_mode', 'Cluster-Rolle', 'select', $haModes),
+            array_merge(installCenterConfigField('ha_mode', 'Cluster-Rolle', 'select', $haModes, 'Rollenwechsel nur über Konsole 49'), ['disabled' => true]),
             installCenterConfigField('shadow_master_url', 'Shadow Master URL', 'text', [], '', false, 'http://192.168.1.10'),
             installCenterConfigField('shadow_snapshot_token', 'Shadow Snapshot Token', 'password', [], 'Exakt 64 Hex-Zeichen; auf Master und Shadow identisch. Leer lassen = unverändert.', true, '64 Hex-Zeichen'),
             installCenterConfigField('shadow_master_ip', 'Shadow Master IP', 'text', [], 'Fallback, wenn keine URL gesetzt ist.', false, '192.168.1.10'),
@@ -539,7 +514,7 @@ function installCenterModuleConfigFields($moduleKey) {
         ],
         'bluelink' => [
             // Benutzer/Passwort-Login statt Refresh-Token.
-            installCenterConfigField('bluelink_user', 'Benutzer (E-Mail)', 'text', [], 'E-Mail des Hyundai/Kia-Kontos.'),
+            installCenterConfigField('bluelink_user', 'Benutzer (E-Mail)', 'password', [], 'E-Mail des Hyundai/Kia-Kontos. Leer lassen = unverändert.', true),
             installCenterConfigField('bluelink_password', 'Passwort', 'password', [], 'Leer lassen = unverändert.', true),
             installCenterConfigField('bluelink_pin', 'PIN (optional)', 'password', [], 'Nur Ziffern; leer lassen = unverändert.', true),
             installCenterConfigField('bluelink_brand', 'Marke', 'select', [
@@ -553,7 +528,7 @@ function installCenterModuleConfigFields($moduleKey) {
         ],
         'notifier' => [
             installCenterConfigField('telegram_token', 'Telegram Bot Token', 'password', [], 'Leer lassen = unverändert.', true),
-            installCenterConfigField('telegram_chat_id', 'Telegram Chat-ID'),
+            installCenterConfigField('telegram_chat_id', 'Telegram Chat-ID', 'password', [], 'Leer lassen = unverändert.', true),
             installCenterConfigField('telegram_device_name', 'Gerätename'),
             installCenterConfigField('telegram_status_enable', 'Täglicher Statusbericht', 'select', $bool),
             installCenterConfigField('telegram_status_time', 'Status-Uhrzeit', 'time'),
@@ -575,7 +550,7 @@ function installCenterModuleConfigFields($moduleKey) {
             installCenterConfigField('mqtt_hub_ip', 'MQTT Broker IP', 'text', [], '', false, '127.0.0.1'),
             installCenterConfigField('mqtt_hub_port', 'MQTT Port', 'number', [], '', false, '1883'),
             installCenterConfigField('mqtt_hub_topic', 'Basis-Topic', 'text', [], '', false, 'e3dc'),
-            installCenterConfigField('mqtt_hub_user', 'MQTT Benutzer'),
+            installCenterConfigField('mqtt_hub_user', 'MQTT Benutzer', 'password', [], 'Leer lassen = unverändert.', true),
             installCenterConfigField('mqtt_hub_pass', 'MQTT Passwort', 'password', [], 'Leer lassen = unverändert.', true),
             installCenterConfigField('mqtt_hub_sub_soc_topic', 'SoC-Topic Fahrzeug 1'),
             installCenterConfigField('mqtt_hub_sub_soc_name', 'Name Fahrzeug 1'),
@@ -609,6 +584,7 @@ function installCenterConfigHasAddress($config, $key) {
 
 function installCenterNativeWpLockType($config) {
     $wpType = installCenterConfigScalar($config, 'wp_type', '');
+    if ($wpType === '6') return null; // Gespeicherte PM-Auswahl trotz alter nativer Adressen erhalten.
     $hasIdm = installCenterConfigHasAddress($config, 'idm_ip');
     $hasLux = installCenterConfigHasAddress($config, 'luxtronik_ip');
     $hasStiebel = installCenterConfigHasAddress($config, 'stiebel_isg_ip');
@@ -632,7 +608,7 @@ function installCenterGuardWpTypeUpdates($config, $updates) {
     $current = installCenterConfigScalar($config, 'wp_type', '-1');
     $requested = (string)$updates['wp_type'];
     $nativeLock = installCenterNativeWpLockType($config);
-    $safeCurrent = in_array($current, ['-1', '0', '1', '3', '4', '5'], true) ? $current : ($nativeLock ?? '-1');
+    $safeCurrent = in_array($current, ['-1', '0', '1', '3', '4', '5', '6'], true) ? $current : ($nativeLock ?? '-1');
 
     if ($requested === '-1') {
         return [$updates, $warnings];
@@ -710,7 +686,14 @@ function installCenterBuildModuleConfigPayload($moduleKey) {
         $hasValue = array_key_exists($key, $config) && (string)$config[$key] !== '';
         $field['has_value'] = $hasValue;
         $field['value'] = !empty($field['secret']) ? '' : (string)($config[$key] ?? '');
-        $field = installCenterDecorateConfigField($field, $config);
+        $storedValue = $field['value'];
+        $allowedValues = array_map(fn($opt) => (string)($opt['value'] ?? ''), $field['options'] ?? []);
+        if (($field['type'] ?? '') === 'select' && $hasValue && !in_array($storedValue, $allowedValues, true)) {
+            array_unshift($field['options'], ['value' => $storedValue, 'label' => 'Unbekannter gespeicherter Wert (' . $storedValue . ') – Auswahl prüfen']);
+            $field['help'] = trim(($field['help'] ?? '') . ' Vor dem Speichern eine unterstützte Auswahl treffen.');
+        } else {
+            $field = installCenterDecorateConfigField($field, $config);
+        }
         if ($legacyWb2Missing) {
             array_unshift($field['options'], [
                 'value' => '__legacy_missing__',
@@ -741,7 +724,10 @@ function installCenterNormalizeConfigValue($field, $value) {
     if ($type === 'select') {
         $allowed = array_map(fn($opt) => (string)($opt['value'] ?? ''), $field['options'] ?? []);
         $value = (string)$value;
-        return in_array($value, $allowed, true) ? $value : ($allowed[0] ?? '');
+        if (!in_array($value, $allowed, true)) {
+            throw new InvalidArgumentException('Unbekannte Auswahl für ' . ($field['label'] ?? 'das Feld') . '; Konfiguration wurde nicht geändert.');
+        }
+        return $value;
     }
     $value = is_string($value) ? trim($value) : $value;
     if ($type === 'number' && $value !== '' && is_numeric($value)) {
@@ -810,6 +796,14 @@ function installCenterSaveModuleConfig($moduleKey, $postedValues) {
         return ['success' => false, 'error' => 'Konfiguration konnte nicht geladen werden'];
     }
     $config = $loaded['config'] ?? [];
+    if (array_key_exists('ha_mode', $postedValues)) {
+        $currentRole = strtolower(trim((string)($config['ha_mode'] ?? 'off'))) ?: 'off';
+        $postedRole = is_scalar($postedValues['ha_mode'])
+            ? strtolower(trim((string)$postedValues['ha_mode'])) : null;
+        if ($postedRole !== $currentRole) {
+            return ['success' => false, 'error' => 'Rollenwechsel nur über Konsole 49'];
+        }
+    }
     $postedValues = installCenterPreserveMissingWb2Type($postedValues, $config);
     $updates = [];
     $shadowDefaults = [
@@ -841,7 +835,11 @@ function installCenterSaveModuleConfig($moduleKey, $postedValues) {
         if ($key === 'shadow_snapshot_token') {
             $raw = strtolower(trim((string)$raw));
         }
-        $updates[$key] = installCenterNormalizeConfigValue($field, $raw);
+        try {
+            $updates[$key] = installCenterNormalizeConfigValue($field, $raw);
+        } catch (InvalidArgumentException $exc) {
+            return ['success' => false, 'error' => $exc->getMessage()];
+        }
     }
     [$updates, $guardWarnings] = installCenterGuardWpTypeUpdates($config, $updates);
     if (!$updates) {
@@ -2616,6 +2614,8 @@ function installCenterVersionMetadata() {
         'runtime' => [
             'docker_detected' => is_file('/.dockerenv') || getenv('E3DC_WEB_PORT') !== false || getenv('E3DC_WEB_BIND') !== false,
             'php_version' => PHP_VERSION,
+            'php_int_size' => PHP_INT_SIZE,
+            'machine_architecture' => php_uname('m'),
         ],
         'privacy_note' => 'Versions- und Git-Metadaten enthalten keine Zugangsdaten und keine Remote-URL.',
     ];
@@ -3349,6 +3349,8 @@ function installCenterReadRedactedFile($path, $maxBytes = 90000) {
 function installCenterDiagnosticReadLimit($id) {
     if (str_starts_with($id, 'log:')) return 90000;
     if (str_starts_with($id, 'ramdisk:')) return 250000;
+    if ($id === 'data:battery_vitals_history.json') return 500000;
+    if (str_starts_with($id, 'data:')) return 90000;
     return 90000;
 }
 
@@ -3577,6 +3579,11 @@ function installCenterDiagnosticItemPayloadRaw($id, $context = []) {
         $payload['meta']['id'] = $id;
         return $payload;
     }
+    if (str_starts_with($id, 'data:')) {
+        $payload = installCenterReadDiagnosticFile('/var/www/html/data/' . basename(substr($id, 5)), $archiveName, installCenterDiagnosticReadLimit($id));
+        $payload['meta']['id'] = $id;
+        return $payload;
+    }
     return null;
 }
 
@@ -3618,6 +3625,7 @@ function installCenterDiagnosticArchiveName($id) {
     if ($id === 'status:direct_marketing') return 'status/direct_marketing_diagnosis.json';
     if (str_starts_with($id, 'log:')) return 'logs/' . basename(substr($id, 4));
     if (str_starts_with($id, 'ramdisk:')) return 'ramdisk/' . basename(substr($id, 8));
+    if (str_starts_with($id, 'data:')) return 'data/' . basename(substr($id, 5));
     return null;
 }
 
@@ -3811,7 +3819,10 @@ function installCenterStreamDiagnosticBundle($selectedIds, $options = []) {
     $fileManifest = [$readmePayload['meta'], $versionPayload['meta']];
     foreach ($selectedIds as $id) {
         $payload = installCenterDiagnosticItemPayload($id, $incident);
-        if (!is_array($payload) || empty($payload['name']) || !array_key_exists('data', $payload)) continue;
+        if (!is_array($payload) || empty($payload['name']) || !array_key_exists('data', $payload)) {
+            $fileManifest[] = ['id' => $id, 'available' => false, 'status' => 'nicht verfügbar', 'error' => 'Keine lesbare Diagnose-Nutzlast verfügbar.'];
+            continue;
+        }
         $appendEntry(['name' => (string)$payload['name'], 'data' => (string)$payload['data'], 'meta' => $payload['meta'] ?? []]);
         if (isset($payload['meta']) && is_array($payload['meta'])) {
             $fileManifest[] = $payload['meta'];
@@ -3926,6 +3937,25 @@ if (isset($_GET['action']) && $_GET['action'] === 'diagnostic_bundle') {
     ]);
 }
 
+if (in_array($_GET['action'] ?? '', ['setup_plan_start', 'setup_plan_step', 'setup_plan_retry'], true)) {
+    header('Content-Type: application/json; charset=utf-8');
+    $action = substr($_GET['action'], strlen('setup_plan_'));
+    echo json_encode(e3dc_setup_plan_action($action, $_POST['setup_token'] ?? ''), JSON_UNESCAPED_UNICODE);
+    exit;
+}
+$setupPlan = isset($_GET['setup_token']) ? e3dc_setup_read_plan($_GET['setup_token']) : null;
+// Ohne Link (etwa über das Menü) erscheint ein begonnener, unfertiger Plan dieser Sitzung.
+$sessionSetupPlan = $_SESSION['e3dc_setup_plan'] ?? null;
+if ($setupPlan === null && is_array($sessionSetupPlan) && !empty($sessionSetupPlan['started']) && empty($sessionSetupPlan['complete'])) {
+    $setupPlan = e3dc_setup_read_plan((string)($sessionSetupPlan['token'] ?? ''));
+    if (empty($setupPlan['success'])) $setupPlan = null;
+}
+// Liegt der letzte Schritt mehr als 30 Minuten zurück, läuft der Plan erst nach „Einrichtung fortsetzen“ weiter.
+if (!empty($setupPlan['success'])) {
+    $setupPlan['stale'] = !empty($setupPlan['plan']['started']) && empty($setupPlan['plan']['complete'])
+        && time() - (int)($setupPlan['plan']['last_activity'] ?? 0) > 1800;
+}
+
 if (isset($_GET['action']) && $_GET['action'] === 'catalog') {
     requireWebAuth(true);
     header('Content-Type: application/json; charset=utf-8');
@@ -3974,6 +4004,13 @@ if (isset($_GET['action']) && $_GET['action'] === 'run_wrapper_job') {
         exit;
     }
     echo json_encode(runInstallerJob($_POST['job_action'] ?? '', $_POST['module'] ?? null, true), JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+if (isset($_GET['action']) && $_GET['action'] === 'module_job_status') {
+    requireWebAuth(true);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(e3dc_module_job_status($_GET['run_id'] ?? ''), JSON_UNESCAPED_UNICODE);
     exit;
 }
 
@@ -4264,6 +4301,16 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_runtime_permissions_rep
         <button class="btn btn-outline-info rounded-pill" onclick="loadInstallCenter()"><i class="fas fa-rotate me-1"></i> Aktualisieren</button>
     </div>
 
+    <?php if ($setupPlan !== null): ?>
+    <section class="card mb-3 p-3" id="configSetupPlan">
+        <h2 class="h5">Einrichtung aus der Konfiguration</h2>
+        <ol id="configSetupSteps"></ol>
+        <div id="configSetupSummary" role="status"></div>
+        <button type="button" class="btn btn-outline-info mt-2 d-none" id="configSetupRetry">Erneut versuchen</button>
+        <button type="button" class="btn btn-outline-info mt-2 d-none" id="configSetupContinue">Einrichtung fortsetzen</button>
+    </section>
+    <?php endif; ?>
+
     <div class="security-note mb-3">
         <div class="fw-bold"><i class="fas fa-shield-halved me-2"></i>Sicherheitsmodell</div>
         <div class="small mt-1">
@@ -4278,14 +4325,14 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_runtime_permissions_rep
         „Nur Rechte prüfen“ ist read-only. „Rechte reparieren“ korrigiert nur die Metadaten bekannter Pfade – ohne Backup,
         Update oder Dienstneustart. „System reparieren“ bleibt getrennt und startet den vollständigen Stable-Abgleich.
         Nutzerbeschreibbarer Installer-Code erhält keine sudo-Freigabe.
-        Core-Dienste bleiben gegen Deinstallation geschützt.
+        Core-Dienste bleiben gegen Start, Stop und Deinstallation geschützt; erlaubt sind Neustart und Diagnose.
     </div>
 
     <div class="utility-bar">
         <button class="btn btn-outline-info rounded-pill" onclick="runGlobalAction('permissions_check')">
             <i class="fas fa-shield-halved me-1"></i> Nur Rechte prüfen (keine Änderung)
         </button>
-        <button class="btn btn-outline-warning rounded-pill" onclick="runPermissionRepairUpdate()">
+        <button id="systemRepairButton" class="btn btn-outline-warning rounded-pill" onclick="runPermissionRepairUpdate()" <?php if (e3dcIsDockerEnvironment()) echo 'disabled'; ?>>
             <i class="fas fa-tools me-1"></i> System reparieren (Backup + Stable-Abgleich)
         </button>
         <button class="btn btn-outline-secondary rounded-pill" onclick="runGlobalAction('write_readiness')">
@@ -4296,9 +4343,6 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_runtime_permissions_rep
         </button>
         <button class="btn btn-outline-secondary rounded-pill" onclick="runGlobalJob('write_permission_plan')">
             <i class="fas fa-clipboard-list me-1"></i> Freigabe-Job
-        </button>
-        <button class="btn btn-outline-secondary rounded-pill" disabled title="Privilegierte Installer-Webjobs sind deaktiviert">
-            <i class="fas fa-lock me-1"></i> Wrapper-Webzugang gesperrt
         </button>
         <button class="btn btn-outline-info rounded-pill" onclick="runGlobalAction('backup_plan')">
             <i class="fas fa-box-archive me-1"></i> Backup-Plan
@@ -4318,8 +4362,14 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_runtime_permissions_rep
         <button class="btn btn-outline-primary rounded-pill" onclick="runGlobalAction('job_status')">
             <i class="fas fa-clipboard-list me-1"></i> Job-Status
         </button>
-        <span class="text-secondary small">Prüfaktionen lesen nur. Die enge Rechtereparatur ändert ausschließlich Besitzer, Gruppe und Modus bekannter Pfade. Systemreparatur und Update bleiben getrennte Systemjobs.</span>
+        <span class="text-secondary small">Prüfaktionen lesen nur. Die enge Rechtereparatur ändert ausschließlich Besitzer, Gruppe und Modus bekannter Pfade. Privilegierte Installer-Webjobs sind dauerhaft deaktiviert; Module laufen über den Modul-Launcher.</span>
     </div>
+
+    <?php if (e3dcIsDockerEnvironment()): ?>
+    <div id="systemRepairHint" class="text-secondary small mb-3" style="white-space: pre-wrap"><?php echo htmlspecialchars(e3dcDockerSystemRepairHint(), ENT_QUOTES, 'UTF-8'); ?></div>
+    <?php else: ?>
+    <div id="systemRepairHint" class="text-secondary small mb-3" style="white-space: pre-wrap" hidden></div>
+    <?php endif; ?>
 
     <div id="installerStatus" class="installer-status skeleton">
         <div class="text-secondary">Lade Installer-Status...</div>
@@ -4370,9 +4420,10 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_runtime_permissions_rep
             <div class="rule-calm-control">
                 <label for="ruleCalmScopeSelect">Zeitraum</label>
                 <select id="ruleCalmScopeSelect" class="form-select form-select-sm">
-                    <option value="manager_restart" selected>Aktueller Prozess (empfohlen)</option>
-                    <option value="latest">Historie: neueste Records</option>
+                    <option value="manager_restart" <?= e3dcIsDockerEnvironment() ? '' : 'selected' ?>>Aktueller Prozess (empfohlen)</option>
+                    <option value="latest" <?= e3dcIsDockerEnvironment() ? 'selected' : '' ?>>Historie: neueste Records</option>
                 </select>
+                <div id="ruleCalmDockerHint" class="text-secondary small" <?php if (!e3dcIsDockerEnvironment()) echo 'hidden'; ?>>Im Docker wird automatisch die Historie ausgewertet; eine Prozessgrenze über systemd ist nicht verfügbar.</div>
             </div>
             <div class="rule-calm-control">
                 <label>Dienste</label>
@@ -4385,6 +4436,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_runtime_permissions_rep
             </div>
             <div class="rule-calm-control">
                 <label for="ruleCalmMinGapSelect">Musterabstand</label>
+                <div class="text-secondary small">Speicher-Owner/State/Contract: mindestens 600 s.</div>
                 <select id="ruleCalmMinGapSelect" class="form-select form-select-sm">
                     <option value="60">60 Sekunden</option>
                     <option value="180" selected>180 Sekunden</option>
@@ -4405,7 +4457,11 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_runtime_permissions_rep
         <div id="ruleCalmAnalysisResult" class="text-secondary small mt-2" aria-live="polite">Noch nicht geprüft.</div>
     </section>
 
-    <div id="moduleRoot" class="skeleton">
+    <?php $pinConfig = loadE3dcConfig(); if (is_array($pinConfig) && isset($pinConfig['config']) && (string)($pinConfig['config']['web_pin'] ?? '') === ''): ?>
+<div class="alert alert-warning">Ohne Web-PIN kann jeder Rechner im Heimnetz Modulaktionen auslösen. Die Web-PIN kann im <a href="index.php?seite=config">Konfigurationseditor</a> eingerichtet werden.</div>
+<?php endif; ?>
+<?= e3dc_module_jobs_script() ?>
+<div id="moduleRoot" class="skeleton">
         <div class="module-grid">
             <div class="module-card"><div class="text-secondary">Lade Modulkatalog...</div></div>
         </div>
@@ -4580,6 +4636,7 @@ function renderModuleReadiness(installBlock) {
     const labels = {
         ready: 'Installation möglich',
         installed: 'Fertig eingerichtet',
+        inactive: 'Installiert, nicht aktiv',
         blocked: 'Blockiert',
         docker_pending: 'Docker-Ablauf nötig',
         unknown: 'Installationsstatus unklar'
@@ -4587,22 +4644,26 @@ function renderModuleReadiness(installBlock) {
     const icons = {
         ready: 'fa-circle-check ok',
         installed: 'fa-circle-check text-primary',
+        inactive: 'fa-circle-pause warn',
         blocked: 'fa-circle-xmark bad',
         docker_pending: 'fa-box warn',
         unknown: 'fa-circle-info text-info'
     };
     const messages = {
-        ready: 'Mit späterer Schreibfreigabe installierbar.',
+        ready: 'Voraussetzungen erfüllt; Installation möglich.',
         installed: 'Dienst ist vorhanden und braucht keine Installation.',
+        inactive: 'Dienst ist installiert; Start und Autostart über die Dienststeuerung aktivieren.',
         blocked: 'Bitte erst Konfiguration oder Dateien prüfen.',
         docker_pending: 'Docker: Config speichern und Container neu starten.',
         unknown: 'Bitte Details prüfen.'
     };
-    const reason = (readiness.reasons || installBlock.blocked_reasons || [])[0];
+    const reasons = readiness.reasons || installBlock.blocked_reasons || [];
+    const reason = reasons[0];
+    const more = reasons.length > 1 ? ` (+${reasons.length - 1} weitere)` : '';
     return `
         <div class="module-readiness ${esc(state)}">
             <strong><i class="fas ${icons[state] || icons.unknown} me-1"></i>${esc(labels[state] || labels.unknown)}</strong>
-            <span class="text-secondary">${esc(reason || readiness.message || messages[state] || messages.unknown)}</span>
+            <span class="text-secondary">${esc(reason || readiness.message || messages[state] || messages.unknown)}${esc(more)}</span>
         </div>
     `;
 }
@@ -4663,7 +4724,7 @@ function renderConfigInput(field) {
             const disabled = opt.disabled ? 'disabled' : '';
             return `<option value="${esc(optValue)}" ${optValue === value ? 'selected' : ''} ${disabled}>${esc(opt.label || optValue)}</option>`;
         }).join('');
-        return `<select class="form-select" name="values[${esc(key)}]">${options}</select>`;
+        return `<select class="form-select" name="values[${esc(key)}]"${field.disabled ? ' disabled' : ''}>${options}</select>`;
     }
     const inputType = type === 'password' ? 'password' : (type === 'time' ? 'time' : (type === 'number' ? 'number' : 'text'));
     const step = type === 'number' ? ' step="any"' : '';
@@ -4681,7 +4742,7 @@ function renderConfigEditor(payload) {
             <label for="cfg_${esc(field.key)}">${esc(field.label || field.key)}</label>
             ${renderConfigInput(field)}
             <div class="config-edit-help">
-                <span class="small-code">${esc(field.key)}</span>${field.help ? ` - ${esc(field.help)}` : ''}
+                ${field.key === 'forecast_diagnostics_enable' ? esc(field.help || '') : `<span class="small-code">${esc(field.key)}</span>${field.help ? ` - ${esc(field.help)}` : ''}`}
             </div>
         </div>
     `).join('');
@@ -4785,11 +4846,11 @@ function showConfigModal(moduleKey) {
     body.innerHTML = `
         <div>${esc(module.description || 'Diese Variablen bedingen, ob das Modul sinnvoll installiert oder gestartet werden kann.')}</div>
         ${missingHtml}
+        ${(config.warnings || []).map(message => `<div class="warn mt-2"><i class="fas fa-triangle-exclamation me-1"></i>${esc(message)}</div>`).join('')}
         ${requiredHtml}
         ${focusHtml}
         <div class="text-secondary small mt-3">
-            Du kannst die freigegebenen Modulwerte direkt hier setzen. Tokens und Passwörter werden nicht angezeigt;
-            leere Secret-Felder bleiben beim Speichern unverändert.
+            Die freigegebenen Modulwerte lassen sich direkt hier setzen. Zugangsdaten werden nicht angezeigt. Leer lassen = unverändert.
         </div>
         <div id="configModalEditor"></div>
     `;
@@ -4907,7 +4968,7 @@ function renderDiagnosticManifest(payload) {
         <div class="privacy-box">
             <strong><i class="fas fa-user-shield text-info me-1"></i>Datenschutz</strong>
             <div class="small mt-1">${esc(payload.privacy_note || 'Das Paket wird lokal erzeugt und automatisch bereinigt.')}</div>
-            <div class="small mt-1">Empfehlung: Paket vor dem Versenden einmal öffnen. LAN-IPs, Dienstnamen und technische Zustände bleiben absichtlich enthalten, weil sie bei der Fehlersuche helfen.</div>
+            <div class="small mt-1">Empfehlung: Paket vor dem Versenden einmal öffnen. LAN-IPs werden pseudonymisiert. Pseudonymisierte Kennungen, Dienstnamen und technische Zustände bleiben enthalten, weil sie bei der Fehlersuche helfen.</div>
         </div>
         <div class="row g-2 mt-2 align-items-end">
             <div class="col-md-7">
@@ -5020,6 +5081,10 @@ async function downloadDiagnosticBundle() {
     }
 }
 
+function moduleUsesSystemUpdate(installBlock) {
+    return Boolean(installBlock && installBlock.system_update_only);
+}
+
 function moduleHasConfigBlocker(installBlock) {
     const readiness = installBlock && installBlock.readiness ? installBlock.readiness : {};
     const reasons = readiness.reasons || (installBlock && installBlock.blocked_reasons) || [];
@@ -5033,14 +5098,19 @@ function renderModuleNextAction(module, installBlock) {
     if (state === 'installed') {
         return '<button class="btn btn-sm btn-outline-primary" disabled><i class="fas fa-check me-1"></i>Fertig</button>';
     }
-    if (state === 'ready') {
+    if (installBlock && installBlock.readiness && installBlock.readiness.state && state === 'ready' && !moduleUsesSystemUpdate(installBlock)) {
         return `
-            <button class="btn btn-sm btn-outline-primary" title="Sicheren Ramdisk-Job testen, noch ohne echte Installation" onclick="runModuleJob('${esc(module.key)}','install_module_dry_run')"><i class="fas fa-clipboard-check me-1"></i>Job-Test</button>
+            <button class="btn btn-sm btn-success" onclick="runModuleWriteJob('${esc(module.key)}','install_module')"><i class="fas fa-download me-1"></i>Installieren</button>
+            <button class="btn btn-sm btn-outline-primary" title="Ramdisk-Jobpfad ohne Systemänderung prüfen" onclick="runModuleJob('${esc(module.key)}','install_module_dry_run')"><i class="fas fa-clipboard-check me-1"></i>Job-Test</button>
             <button class="btn btn-sm btn-outline-success" title="Zeigt Voraussetzungen und den sicheren Installationsbedarf ohne Systemänderung" onclick="runModuleAction('${esc(module.key)}','install_module_dry_run')"><i class="fas fa-box-open me-1"></i>Installationsdetails</button>
         `;
     }
     if (state === 'blocked' && hasConfigBlocker && module.config_keys && module.config_keys.length) {
-        return renderConfigButton(module, installBlock.config || {}, 'btn btn-sm btn-outline-warning', 'Einrichten');
+        const configButton = renderConfigButton(module, installBlock.config || {}, 'btn btn-sm btn-outline-warning', 'Einrichten');
+        const reasons = readiness.reasons || installBlock.blocked_reasons || [];
+        const blockersButton = reasons.length > 1
+            ? `<button class="btn btn-sm btn-outline-warning" onclick="runModuleAction('${esc(module.key)}','install_module_dry_run')"><i class="fas fa-triangle-exclamation me-1"></i>Blocker anzeigen</button>` : '';
+        return configButton + blockersButton;
     }
     if (state === 'blocked') {
         return `<button class="btn btn-sm btn-outline-warning" onclick="runModuleAction('${esc(module.key)}','install_module_dry_run')"><i class="fas fa-triangle-exclamation me-1"></i>Blocker anzeigen</button>`;
@@ -5051,9 +5121,13 @@ function renderModuleNextAction(module, installBlock) {
     return `<button class="btn btn-sm btn-outline-secondary" onclick="runModuleAction('${esc(module.key)}','install_module_dry_run')"><i class="fas fa-circle-info me-1"></i>Details</button>`;
 }
 
-function renderModuleQuickServiceAction(unit, state, isCore, canService) {
+function renderModuleQuickServiceAction(unit, state, isCore, canService, isDocker = false) {
+    if (unit === 'e3dc-forecast-evidence.service' && isDocker) {
+        return '<span class="badge text-bg-secondary" title="Konfiguration speichern; die Prognosediagnose startet beim nächsten Containerstart">Containerstart</span>';
+    }
     if (!canService || !state.installed) return '';
     if (unit === 'e3dc-forecast-evidence.service') {
+        if (!state.cfgOk) return '';
         if (state.active && state.enabledKnown && state.enabledRaw === 'enabled') {
             return `<button class="btn btn-sm btn-outline-primary" disabled><i class="fas fa-circle-check me-1"></i>Dauerhaft aktiv</button>`;
         }
@@ -5081,21 +5155,21 @@ function renderModule(module, serviceInfo, diagnosis, installBlock = null) {
     const startDisabled = isForecastEvidenceUnit
         ? 'disabled title="Bitte ausschließlich Aktivieren & starten verwenden"'
         : (isCore
-        ? 'disabled title="Kernmodule werden hier nur diagnostiziert oder neu gestartet"'
+        ? (state.installed ? 'disabled title="Kernmodule werden hier nur diagnostiziert oder neu gestartet"' : 'disabled title="Kern-Dienst fehlt: Konsole 1) Installation / Update ausführen; im Docker den Container neu starten"')
         : (!canService
             ? 'disabled title="Dienststeuerung für dieses Modul nicht vorgesehen"'
             : (!state.installed
-                ? 'disabled title="Dienst fehlt noch: erst Installations-Check oder Job-Test ausführen"'
+                ? (isCore ? 'disabled title="Kern-Dienst fehlt: Konsole 1) Installation / Update ausführen; im Docker den Container neu starten"' : 'disabled title="Dienst fehlt noch: erst Installations-Check oder Job-Test ausführen"')
                 : (state.active ? 'disabled title="Dienst läuft bereits"' : ''))));
     const restartDisabled = isForecastEvidenceUnit
         ? 'disabled title="Die Prognosediagnose wird nur über den gebundenen Aktivierungspfad geändert"'
         : (!canService
         ? 'disabled title="Dienststeuerung für dieses Modul nicht vorgesehen"'
         : (!state.installed
-            ? 'disabled title="Dienst fehlt noch: erst Installations-Check oder Job-Test ausführen"'
+            ? (isCore ? 'disabled title="Kern-Dienst fehlt: Konsole 1) Installation / Update ausführen; im Docker den Container neu starten"' : 'disabled title="Dienst fehlt noch: erst Installations-Check oder Job-Test ausführen"')
             : (isCore ? '' : (state.active ? '' : 'disabled title="Dienst ist inaktiv: bitte Start verwenden"'))));
     const stopDisabled = isForecastEvidenceUnit
-        ? 'disabled title="Die Prognosediagnose wird nur über den gebundenen Aktivierungspfad geändert"'
+        ? 'disabled title="Ausschalten über den Schalter PV-Prognosediagnose in der Modul-Konfiguration oder im Config-Editor; der Dienst beendet sich dann selbst"'
         : (isCore
         ? 'disabled title="Kernmodule werden hier nicht gestoppt"'
         : (!canService
@@ -5105,7 +5179,7 @@ function renderModule(module, serviceInfo, diagnosis, installBlock = null) {
                 : (state.active ? '' : 'disabled title="Dienst läuft nicht"'))));
     const hasConfigBlocker = moduleHasConfigBlocker(installBlock);
     const configLink = renderConfigButton(module, config, 'btn btn-sm btn-outline-info', 'Modul-Config');
-    const quickServiceAction = renderModuleQuickServiceAction(unit, state, isCore, canService);
+    const quickServiceAction = renderModuleQuickServiceAction(unit, state, isCore, canService, Boolean((serviceInfo && serviceInfo.is_docker) || (diagnosis && diagnosis.docker)));
     const configQuickLink = (!state.cfgOk && !hasConfigBlocker)
         ? renderConfigButton(module, config, 'btn btn-sm btn-outline-warning', 'Einrichten')
         : '';
@@ -5140,6 +5214,7 @@ function renderModule(module, serviceInfo, diagnosis, installBlock = null) {
                     <span class="text-secondary">${configKeyText.length ? esc(configKeyText.join(', ')) : 'keine Pflichtfelder'}</span>
                 </div>
             </div>
+            ${(config.warnings || []).map(message => `<div class="warn mt-2">${esc(message)}</div>`).join('')}
             ${renderModuleReadiness(installBlock)}
             <div class="primary-actions">
                 <button class="btn btn-sm btn-outline-light" title="Öffnet Status, Config, Log- und Journal-Vorschau für dieses Modul" onclick="showModuleDiagnosis('${esc(module.key)}')"><i class="fas fa-stethoscope me-1"></i> Diagnose</button>
@@ -5147,6 +5222,7 @@ function renderModule(module, serviceInfo, diagnosis, installBlock = null) {
                 ${quickServiceAction}
                 ${configQuickLink}
             </div>
+            ${installBlock && installBlock.readiness && installBlock.readiness.state && module.optional && state.installed && !moduleUsesSystemUpdate(installBlock) ? `<button class="btn btn-sm btn-outline-danger" onclick="runModuleWriteJob('${esc(module.key)}','remove_module')">Entfernen</button>` : ''}
             <details class="advanced-actions">
                 <summary><i class="fas fa-screwdriver-wrench me-1"></i>Expertenaktionen</summary>
                 <div class="module-actions">
@@ -5448,7 +5524,7 @@ function renderRuleCalmAnalysis(data) {
         Number(effectiveGaps.storage_owner || 0),
         Number(effectiveGaps.storage_state || 0)
     );
-    const gapText = `Musterabstand ${data.min_gap_s || 180}s${ownerGap > Number(data.min_gap_s || 180) ? ` · Contract/Owner/State ${ownerGap}s` : ''}`;
+    const gapText = `Musterabstand ${data.min_gap_s || 180}s · Contract/Owner/State ${ownerGap}s`;
     const title = historical ? 'Historische Regelruhe-Diagnose' : 'Aktuelle Regelruhe-Diagnose';
     return `
         <div class="result-title"><i class="fas fa-wave-square ${findingClass}"></i>${esc(title)} <span>Regelruhe ${ruleCalmStatusBadge(controlDisplay)}</span> <span>Datenqualität ${ruleCalmDataQualityBadge(qualityDisplay)}</span>${historical ? ' <span class="badge text-bg-secondary">historisch</span>' : ''}</div>
@@ -5540,9 +5616,14 @@ async function runRuleCalmAnalysis() {
             const res = await fetch('rule_calm_analysis.php?action=analyze_upload', {method: 'POST', body: form, cache: 'no-store'});
             data = await res.json();
         } else {
-            const params = new URLSearchParams({action: 'analyze', min_gap_s: minGap, limit: '1200', scope});
-            services.forEach(service => params.append('service[]', service));
-            data = await loadJson(`rule_calm_analysis.php?${params.toString()}`);
+            const form = new FormData();
+            form.append('csrf_token', installCenterCsrfToken);
+            form.append('min_gap_s', minGap);
+            form.append('limit', '1200');
+            form.append('scope', scope);
+            services.forEach(service => form.append('service[]', service));
+            const res = await fetch('rule_calm_analysis.php?action=analyze', {method: 'POST', body: form, cache: 'no-store'});
+            data = await res.json();
         }
         if (box) box.innerHTML = renderRuleCalmAnalysis(data);
     } catch (err) {
@@ -5633,6 +5714,7 @@ function renderDiagnosisSummary(block) {
         <div class="result-tile mt-2">
             <div class="result-title mb-1"><i class="fas ${icon}"></i>${esc(title)}</div>
             <div>${message}</div>
+            ${(config.warnings || []).map(warning => `<div class="warn mt-2">${esc(warning)}</div>`).join('')}
             <div class="text-secondary small mt-2"><strong>Nächster Schritt:</strong> ${next}</div>
         </div>
     `;
@@ -5691,7 +5773,7 @@ function renderJobModalStatus(data) {
         </div>
         ${readinessHtml}
         ${installPlanHtml}
-        <div class="text-secondary small mt-2">Dieser Test nutzt denselben Ramdisk-Jobpfad wie spätere echte Installationen, bleibt aber read-only.</div>
+        <div class="text-secondary small mt-2">Dieser Test prüft den Ramdisk-Jobpfad und bleibt read-only; Modulinstallationen laufen über den Modul-Launcher.</div>
     `;
 }
 
@@ -5799,7 +5881,17 @@ function actionLabel(action) {
     return labels[action] || action || 'kein Job';
 }
 
+let installCenterDocker = <?php echo e3dcIsDockerEnvironment() ? 'true' : 'false'; ?>;
+const installCenterDockerRepairHint = <?php echo json_encode(e3dcDockerSystemRepairHint(), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_UNICODE); ?>;
+
 function renderInstallerStatus(data) {
+    if (data && data.success !== false) {
+        installCenterDocker = data.docker === true;
+        const button = document.getElementById('systemRepairButton');
+        const hint = document.getElementById('systemRepairHint');
+        if (button) { button.disabled = installCenterDocker; button.title = installCenterDocker ? installCenterDockerRepairHint : ''; }
+        if (hint) { hint.hidden = !installCenterDocker; hint.textContent = installCenterDocker ? installCenterDockerRepairHint : ''; }
+    }
     if (!data || data.success === false) {
         return `<div class="installer-status-head"><strong class="bad"><i class="fas fa-triangle-exclamation me-1"></i>Installer-Status nicht lesbar</strong></div><div class="text-secondary small mt-2">${esc(data && (data.error || data.message) || 'Keine Antwort')}</div>`;
     }
@@ -5817,10 +5909,10 @@ function renderInstallerStatus(data) {
             <div>
                 <strong><i class="fas fa-gauge-high text-info me-1"></i>Installer-Status</strong>
                 <div class="text-secondary small">${esc(data.message || 'Bereit.')} ${running ? '<span class="ms-1"><i class="fas fa-spinner fa-spin"></i> Job läuft...</span>' : ''}</div>
-                <div class="text-secondary small">Letzter Job wird nur durch Job-Test oder spätere echte Installer-Jobs aktualisiert.</div>
+                <div class="text-secondary small">Letzter Job: Job-Test im Ramdisk-Jobpfad oder Modulauftrag des Modul-Launchers.</div>
             </div>
             <div class="installer-status-badges">
-                ${boolBadge(writeEnabled, 'Schreibmodus frei', 'Schreibmodus gesperrt', true)}
+                ${boolBadge(writeEnabled, 'Launcher bereit', 'Launcher gesperrt', true)}
                 ${boolBadge(Boolean(data.docker), 'Docker', 'Bare-Metal', true)}
                 ${boolBadge(!data.lock_active, 'kein Lock', 'Job-Lock aktiv', true)}
             </div>
@@ -5862,6 +5954,7 @@ function renderReadiness(readiness) {
     const icon = {
         ready: 'fa-circle-check ok',
         installed: 'fa-circle-check ok',
+        inactive: 'fa-circle-pause warn',
         blocked: 'fa-triangle-exclamation warn',
         docker_pending: 'fa-box warn'
     }[state] || 'fa-circle-info text-info';
@@ -5870,7 +5963,8 @@ function renderReadiness(readiness) {
         <div class="mt-3 result-tile">
             <div class="result-title mb-1"><i class="fas ${icon}"></i>${esc(readiness.label || 'Freigabeprüfung')}</div>
             <div>${esc(readiness.message || '')}</div>
-            <div class="mt-2">${boolBadge(Boolean(readiness.can_install_when_writes_enabled), 'mit Schreibfreigabe installierbar', 'nicht installierbar', true)}</div>
+            ${(readiness.warnings || []).map(message => `<div class="warn mt-2">${esc(message)}</div>`).join('')}
+            <div class="mt-2">${boolBadge(Boolean(readiness.can_install_when_writes_enabled), 'installierbar', 'nicht installierbar', true)}</div>
             ${reasons ? `<ul class="result-list">${reasons}</ul>` : ''}
         </div>
     `;
@@ -5883,6 +5977,7 @@ function renderReadinessOverview(data) {
     const labels = {
         ready: 'bereit',
         installed: 'fertig',
+        inactive: 'Installiert, nicht aktiv',
         blocked: 'blockiert',
         docker_pending: 'Docker',
         unknown: 'unklar'
@@ -5890,6 +5985,7 @@ function renderReadinessOverview(data) {
     const icons = {
         ready: 'fa-circle-check ok',
         installed: 'fa-circle-check ok',
+        inactive: 'fa-circle-pause warn',
         blocked: 'fa-circle-xmark bad',
         docker_pending: 'fa-box warn',
         unknown: 'fa-circle-info text-info'
@@ -5897,6 +5993,7 @@ function renderReadinessOverview(data) {
     const badgeClasses = {
         ready: 'text-bg-success',
         installed: 'text-bg-primary',
+        inactive: 'text-bg-warning',
         blocked: 'text-bg-danger',
         docker_pending: 'text-bg-warning',
         unknown: 'text-bg-secondary'
@@ -5921,6 +6018,7 @@ function renderReadinessOverview(data) {
         const service = (block.service && (block.service.unit || block.service.service_unit)) || module.service_unit || '';
         const installBadge = (() => {
             if (state === 'installed') return '<span class="badge text-bg-primary ms-1">fertig eingerichtet</span>';
+            if (state === 'inactive') return '<span class="badge text-bg-warning ms-1">Installiert, nicht aktiv</span>';
             if (state === 'blocked') return '<span class="badge text-bg-danger ms-1">erst Blocker beheben</span>';
             if (state === 'docker_pending') return '<span class="badge text-bg-warning ms-1">Docker-Sonderfall</span>';
             if (block.would_change) return '<span class="badge text-bg-info ms-1">Installation möglich</span>';
@@ -5928,9 +6026,10 @@ function renderReadinessOverview(data) {
         })();
         const installAllowedText = (() => {
             if (state === 'installed') return '<span class="badge text-bg-primary">bereits installiert</span>';
+            if (state === 'inactive') return '<span class="badge text-bg-warning">keine Installation nötig</span>';
             if (state === 'blocked') return '<span class="badge text-bg-danger">nicht installierbar</span>';
             if (state === 'docker_pending') return '<span class="badge text-bg-warning">Docker-Ablauf nötig</span>';
-            return boolBadge(canInstall, 'installierbar mit Schreibfreigabe', 'nicht direkt installierbar', true);
+            return boolBadge(canInstall, 'installierbar', 'nicht direkt installierbar', true);
         })();
         return `
             <div class="result-tile">
@@ -6061,7 +6160,7 @@ function renderPermissionsResult(data, action) {
     const systemRepairCommand = data.system_repair_command || '';
     const instruction = data.repair_instruction || data.repair_message || '';
     const repairButton = repairableCount > 0 && repairAvailable
-        ? `<div class="mt-3"><button class="btn btn-warning rounded-pill" type="button" onclick="runRuntimePermissionsRepair()"><i class="fas fa-screwdriver-wrench me-1"></i> Rechte reparieren</button><div class="text-secondary small mt-2">Releasegleiche Einträge werden sofort repariert. Lokal geänderte Dateien werden vollständig angezeigt und erst nach Deiner exakten Bestätigung berücksichtigt; ihr Inhalt bleibt unverändert.</div></div>`
+        ? `<div class="mt-3"><button class="btn btn-warning rounded-pill" type="button" onclick="runRuntimePermissionsRepair()"><i class="fas fa-screwdriver-wrench me-1"></i> Rechte reparieren</button><div class="text-secondary small mt-2">Releasegleiche Einträge werden sofort repariert. Lokal geänderte Dateien werden vollständig angezeigt und erst nach exakter Bestätigung berücksichtigt; ihr Inhalt bleibt unverändert.</div></div>`
         : containerModel && (containerRestartCount > 0 || imageRequiredCount > 0)
             ? `<div class="warn mt-3">Im Container setzt der Startvorgang die Rechte der Laufzeitpfade; einen Rechte-Launcher gibt es dort nicht. Bitte den Container auf dem Docker-Host neu starten und danach erneut prüfen. Befunde am Produktbaum oder Laufzeitkonto erfordern ein neues Image.</div>`
         : repairableCount > 0
@@ -6133,7 +6232,7 @@ function renderReadinessResult(data) {
         <div class="result-title"><i class="fas ${ready ? 'fa-circle-check ok' : 'fa-triangle-exclamation warn'}"></i>Freigabe-Check</div>
         <div class="text-secondary small">${esc(data.summary || 'Freigabe geprüft.')}</div>
         <div class="result-grid">
-            <div class="result-tile"><strong>Schreibmodus</strong>${boolBadge(Boolean(data.write_actions_enabled), 'freigeschaltet', 'gesperrt', true)}</div>
+            <div class="result-tile"><strong>Modul-Launcher</strong>${boolBadge(Boolean(data.write_actions_enabled), 'Launcher bereit', 'Launcher gesperrt', true)}</div>
             <div class="result-tile"><strong>Freigabe bereit</strong>${boolBadge(ready, 'vorbereitet', 'nicht bereit', true)}</div>
             <div class="result-tile"><strong>Harte Blocker</strong>${boolBadge(hardBlockers === 0, 'keine', hardBlockers + ' Blocker', true)}</div>
         </div>
@@ -6536,7 +6635,7 @@ async function readPermissionRepairDriftPreflight() {
     const text = await response.text();
     let data = null;
     try { data = JSON.parse(text); } catch (_error) {}
-    if (!response.ok || !data || data.success !== true) {
+    if (!response.ok || !data || (data.success !== true && data.running !== true)) {
         throw new Error((data && data.message) || text || `HTTP ${response.status}`);
     }
     return data;
@@ -6650,7 +6749,7 @@ function pollPermissionRepairUpdate(runBinding = null, startedAt = Date.now(), m
         stop();
         renderPermissionRepairUpdate({
             title: 'Statusbeobachtung nach ' + Math.round(maxDurationMs / 60000) + ' Minuten beendet',
-            detail: 'Für diesen Auftrag ist kein abschließendes Ergebnis bestätigt. Diese Anzeige beendet keinen Systemjob. Prüfe das Update-Protokoll und den Anlagenstatus.',
+            detail: 'Für diesen Auftrag ist kein abschließendes Ergebnis bestätigt. Diese Anzeige beendet keinen Systemjob. Update-Protokoll und Anlagenstatus prüfen.',
             warning: true, phase: lastPhase
         }, lastOutput);
         return true;
@@ -6667,14 +6766,14 @@ function pollPermissionRepairUpdate(runBinding = null, startedAt = Date.now(), m
                 stop();
                 renderPermissionRepairUpdate({
                     title: 'Status gehört zu einem anderen Auftrag',
-                    detail: 'Der Abschluss dieser Systemreparatur wird deshalb nicht aus fremden Daten abgeleitet. Prüfe das Update-Protokoll.',
+                    detail: 'Der Abschluss dieser Systemreparatur wird deshalb nicht aus fremden Daten abgeleitet. Update-Protokoll prüfen.',
                     warning: true, phase: lastPhase
                 }, lastOutput);
                 return;
             }
             if (!runState.bound) {
                 renderPermissionRepairUpdate({
-                    title: 'Warte auf eindeutige Auftragskennung',
+                    title: 'Warten auf eindeutige Auftragskennung',
                     detail: 'Für diesen Auftrag liegt noch kein zugeordneter Status vor. Ein alter Abschluss wird nicht übernommen; der Status wird erneut abgefragt.',
                     warning: true, phase: lastPhase
                 }, lastOutput);
@@ -6787,7 +6886,7 @@ async function runRuntimePermissionsRepair() {
             if (result.confirmation_required !== true
                 || driftCount < 1
                 || !/^[0-9a-f]{64}$/.test(token)) {
-                throw new Error('Die lokale Dateilistenbindung ist unvollständig. Bitte starte die Rechtereparatur erneut.');
+                throw new Error('Die lokale Dateilistenbindung ist unvollständig. Bitte die Rechtereparatur erneut starten.');
             }
             const alreadyChanged = Number(result.changed || 0);
             const question = `${driftCount} bekannte Datei(en) wurden lokal geändert und stimmen nicht mit dem veröffentlichten Release überein.\n\nReleasegleiche Einträge wurden bereits repariert (${alreadyChanged} Metadatenänderung(en)). Die folgenden lokalen Inhalte blieben unangetastet:\n\n${driftFiles.join('\n')}\n\nSoll die Rechtereparatur ausschließlich Besitzer, Gruppe und Modus genau dieser vollständig aufgelisteten Dateien setzen? Ihre Inhalte bleiben unverändert.`;
@@ -6845,6 +6944,10 @@ async function runPermissionRepairUpdate() {
 }
 
 async function startPermissionRepairUpdate() {
+    if (installCenterDocker) {
+        document.getElementById('actionLog').textContent = installCenterDockerRepairHint;
+        return;
+    }
     if (!confirm('Vollständige Systemreparatur starten?\n\nDies ist kein reiner Rechtecheck: Der Systemjob erstellt ein verifiziertes Backup, gleicht alle Produktdateien mit dem veröffentlichten Stable-Stand ab, setzt die Rechte neu und startet die Dienste neu. Dabei kann dieselbe Version erneut installiert werden.')) return;
     const log = document.getElementById('actionLog');
     showJobModal(
@@ -6858,6 +6961,14 @@ async function startPermissionRepairUpdate() {
     let baseline = {available: false, runId: null, running: false};
     try {
         const drift = await readPermissionRepairDriftPreflight();
+        if (drift.running === true) {
+            const html = `<div class="text-secondary" style="white-space: pre-wrap">${esc((drift.message || 'Ein Systemjob läuft bereits.') + '\nStatus wird übernommen.')}</div>`;
+            log.innerHTML = html;
+            const modalBody = document.getElementById('jobModalBody');
+            if (modalBody) modalBody.innerHTML = html;
+            pollPermissionRepairUpdate(createPermissionRepairRunBinding(baseline, drift.run_id), Date.now());
+            return;
+        }
         const driftItems = Array.isArray(drift.content_drift) ? drift.content_drift : [];
         const driftCount = Number(drift.content_drift_count || 0);
         if (driftCount !== driftItems.length) {
@@ -6893,7 +7004,7 @@ async function startPermissionRepairUpdate() {
             body.append('confirmation_token', '');
         }
     } catch (err) {
-        const html = `<div class="bad">Systemreparatur wurde vor Backup und Dienständerung sicher abgebrochen: ${esc(err.message || err)}</div>`;
+        const html = `<div class="bad" style="white-space: pre-wrap">Systemreparatur wurde vor Backup und Dienständerung sicher abgebrochen: ${esc(err.message || err)}</div>`;
         log.innerHTML = html;
         const modalBody = document.getElementById('jobModalBody');
         if (modalBody) modalBody.innerHTML = html;
@@ -6912,7 +7023,7 @@ async function startPermissionRepairUpdate() {
         try { data = JSON.parse(text); } catch (_error) {}
         if (data && data.success === false) {
             pendingObservation.clear();
-            const html = `<div class="bad">Systemreparatur wurde nicht gestartet: ${esc(data.message || text || `HTTP ${response.status}`)}</div>`;
+            const html = `<div class="bad" style="white-space: pre-wrap">Systemreparatur wurde nicht gestartet: ${esc(data.message || text || `HTTP ${response.status}`)}</div>`;
             log.innerHTML = html;
             const modalBody = document.getElementById('jobModalBody');
             if (modalBody) modalBody.innerHTML = html;
@@ -6926,7 +7037,7 @@ async function startPermissionRepairUpdate() {
             pollPermissionRepairUpdate(createPermissionRepairRunBinding(baseline), startedAt);
             return;
         }
-        const html = `<div class="result-title"><i class="fas fa-spinner fa-spin warn"></i>Systemjob gestartet</div><div class="text-secondary small mt-2">${esc(data.message || 'Backup, Rechteprojektion und Systemabgleich laufen im Hintergrund.')}</div>`;
+        const html = `<div class="result-title"><i class="fas fa-spinner fa-spin warn"></i>Systemjob gestartet</div><div class="text-secondary small mt-2" style="white-space: pre-wrap">${esc(data.message || 'Backup, Rechteprojektion und Systemabgleich laufen im Hintergrund.')}</div>`;
         log.innerHTML = html;
         const modalBody = document.getElementById('jobModalBody');
         if (modalBody) modalBody.innerHTML = html;
@@ -6963,6 +7074,25 @@ async function runGlobalAction(action) {
         log.innerHTML = errHtml;
         const modalBody = document.getElementById('jobModalBody');
         if (modalBody) modalBody.innerHTML = errHtml;
+    }
+}
+
+async function runModuleWriteJob(moduleKey, action) {
+    const log = document.getElementById('actionLog');
+    const form = new FormData();
+    form.append('job_action', action); form.append('module', moduleKey);
+    form.append('csrf_token', installCenterCsrfToken);
+    log.textContent = 'Modulauftrag wird gestartet...';
+    try {
+        const response = await fetch('install_center.php?action=run_wrapper_write_job', {method: 'POST', body: form});
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        let result = await response.json();
+        result = await e3dcWaitModuleJob(result, status => {log.textContent = status.message || 'Modulauftrag läuft...';});
+        log.textContent = result.message || 'Kein bestätigtes Ergebnis.';
+        if (result.blocked_reasons) log.textContent += ' ' + result.blocked_reasons.join(' ');
+        await loadInstallCenter();
+    } catch (error) {
+        log.textContent = error.message;
     }
 }
 
@@ -7035,6 +7165,18 @@ async function runGlobalJob(action, viaWrapper = false) {
     }
 }
 
+let ruleCalmDockerDefaultApplied = <?php echo e3dcIsDockerEnvironment() ? 'true' : 'false'; ?>;
+function applyRuleCalmDockerDefault(status) {
+    if (!status || !status.docker) return;
+    const scope = document.getElementById('ruleCalmScopeSelect');
+    if (scope && !ruleCalmDockerDefaultApplied) {
+        scope.value = 'latest';
+        ruleCalmDockerDefaultApplied = true;
+    }
+    const hint = document.getElementById('ruleCalmDockerHint');
+    if (hint) hint.hidden = false;
+}
+
 async function refreshInstallerStatusOnly() {
     if (installerStatusRefreshActive) return;
     installerStatusRefreshActive = true;
@@ -7042,6 +7184,7 @@ async function refreshInstallerStatusOnly() {
     try {
         const status = await loadJson('install_center.php?action=installer_status');
         installerBox.innerHTML = renderInstallerStatus(status);
+        applyRuleCalmDockerDefault(status);
         installerBox.classList.remove('skeleton');
     } catch (err) {
         installerBox.innerHTML = `<div class="bad"><i class="fas fa-triangle-exclamation me-1"></i>Installer-Status konnte nicht geladen werden: ${esc(err.message)}</div>`;
@@ -7073,6 +7216,7 @@ async function loadInstallCenter() {
             loadJson('install_center.php?action=install_module_dry_run').catch(() => ({install_dry_run: {}}))
         ]);
         installerBox.innerHTML = renderInstallerStatus(status);
+        applyRuleCalmDockerDefault(status);
         const modules = catalog.modules || {};
         const diag = diagnosis.diagnosis || {};
         const serviceMap = services.services || {};
@@ -7113,7 +7257,12 @@ async function controlService(service, action) {
         restart: 'neu starten',
         activate_forecast_evidence: 'dauerhaft aktivieren und starten'
     };
-    if (!confirm(`Dienst ${service} wirklich ${labels[action] || action}?`)) return;
+    const stopConsequences = {
+        'e3dc-wallbox-manager.service': 'Die Ladung wird beim Stoppen nicht gezielt beendet: E3DC im Direktbetrieb erhält seine Gerätesteuerung zurück, sonst bleibt der letzte Ladezustand ohne weitere Regelung bestehen.',
+        'energy_manager.service': 'Beim Stoppen wird der eigene Stiebel-SG-Ready-Eingang freigegeben; andere zuletzt gesetzte Wärmepumpen-Sollwerte bleiben ohne weitere Regelung bestehen.'
+    };
+    const consequence = action === 'stop' ? stopConsequences[service] : '';
+    if (!confirm(`${consequence ? consequence + '\n\n' : ''}Dienst ${service} wirklich ${labels[action] || action}?`)) return;
     const log = document.getElementById('actionLog');
     log.textContent = `Sende ${action} für ${service}...`;
     const body = new FormData();
@@ -7167,5 +7316,71 @@ document.addEventListener('DOMContentLoaded', () => {
     window.setInterval(loadInstallCenterPvForecastDiagnostics, 15000);
 });
 </script>
+
+<script>
+const configSetupInitial = <?= json_encode($setupPlan, JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT) ?>;
+function renderConfigSetup(result) {
+    const summary = document.getElementById('configSetupSummary');
+    const steps = document.getElementById('configSetupSteps');
+    const retry = document.getElementById('configSetupRetry');
+    if (!summary) return;
+    summary.textContent = result.message || result.plan?.message || 'Einrichtung ausstehend.';
+    steps.replaceChildren();
+    for (const step of result.plan?.steps || []) {
+        const row = document.createElement('li');
+        const labels = {pending: 'Ausstehend', waiting: 'Warten', running: 'Läuft', done: 'Abgeschlossen', failed: 'Fehlgeschlagen', blocked: 'Blockiert', skipped: 'Übersprungen'};
+        row.textContent = step.label + ': ' + (labels[step.state] || step.state) + ' – ' + step.message;
+        steps.appendChild(row);
+    }
+    retry.classList.toggle('d-none', !(result.success && result.plan?.complete && result.plan.steps.some(step => ['failed', 'blocked', 'skipped'].includes(step.state))));
+    document.getElementById('configSetupContinue')?.classList.toggle('d-none', !result.stale);
+}
+let configSetupBusy = false;
+async function runConfigSetup(retry = false, resume = false) {
+    if (configSetupBusy || !configSetupInitial?.success) return;
+    configSetupBusy = true;
+    const button = document.getElementById('configSetupRetry');
+    button.disabled = true;
+    try {
+        const call = async (action) => {
+            const form = new FormData();
+            form.append('csrf_token', installCenterCsrfToken);
+            form.append('setup_token', configSetupInitial.plan.token);
+            // Nur der Klick auf „Einrichtung fortsetzen“ darf einen alten Plan wieder anstoßen.
+            if (resume) { form.append('resume', '1'); resume = false; }
+            const response = await fetch('install_center.php?action=setup_plan_' + action,
+                {method: 'POST', body: form, credentials: 'same-origin', cache: 'no-store'});
+            if (!response.ok) throw new Error('Einrichtungsstatus nicht verfügbar: HTTP ' + response.status);
+            return response.json();
+        };
+        let result = await call(retry ? 'retry' : (configSetupInitial.plan.started ? 'step' : 'start'));
+        renderConfigSetup(result);
+        while (result.success && !result.plan.complete) {
+            result = await call('step');
+            renderConfigSetup(result);
+            if (result.plan?.steps.some(step => step.state === 'waiting')) await new Promise(resolve => setTimeout(resolve, 5000));
+            else if (result.plan?.steps.some(step => step.state === 'running')) await new Promise(resolve => setTimeout(resolve, 1500));
+        }
+        await loadInstallCenter();
+    } catch (error) {
+        document.getElementById('configSetupSummary').textContent = error.message + ' Status prüfen; laufenden Auftrag nicht erneut starten.';
+    } finally {
+        configSetupBusy = false; button.disabled = false;
+    }
+}
+document.addEventListener('DOMContentLoaded', () => {
+    if (!configSetupInitial) return;
+    renderConfigSetup(configSetupInitial);
+    document.getElementById('configSetupRetry').addEventListener('click', () => runConfigSetup(true));
+    const resume = document.getElementById('configSetupContinue');
+    resume.addEventListener('click', () => { resume.classList.add('d-none'); runConfigSetup(false, true); });
+    if (configSetupInitial.success && !configSetupInitial.plan.complete) {
+        if (configSetupInitial.stale) {
+            document.getElementById('configSetupSummary').textContent = 'Einrichtung angehalten: Der letzte Schritt liegt mehr als 30 Minuten zurück. Zum Weitermachen „Einrichtung fortsetzen“ wählen.';
+        } else runConfigSetup();
+    }
+});
+</script>
+
 </body>
 </html>

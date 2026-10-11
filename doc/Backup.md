@@ -48,7 +48,19 @@ Vorhandene Quellen werden vollständig und ohne Dateiendungsfilter erfasst:
 - Matter-Kopplungsdaten, Lernprofile, Manual-Locks und weitere Zustandsdaten;
 - Web-Programmdateien und Web-Daten;
 - `/var/lib/e3dc-control` und `/etc/e3dc-control`;
-- alle katalogisierten systemd-Units sowie Watchdog- und Boot-Notify-Skripte.
+- alle katalogisierten systemd-Units samt ihren Drop-in-Verzeichnissen
+  (`<Dienst>.service.d` unter `/etc/systemd/system`) sowie Watchdog- und
+  Boot-Notify-Skripte;
+- die vier Starter `/usr/local/sbin/e3dc-service-control`,
+  `/usr/local/sbin/e3dc-web-update-launcher`,
+  `/usr/local/sbin/e3dc-module-installer` und
+  `/usr/local/sbin/e3dc-runtime-permissions-repair`;
+- die Sudoers-Datei `/etc/sudoers.d/020_e3dc_services`;
+- die HA-Laufzeitdateien unter `/usr/local/lib/e3dc-control-ha`;
+- die Apache-Sicherheitskonfiguration
+  `/etc/apache2/conf-available/e3dc-control-security.conf` und die
+  tmpfiles-Konfiguration der Manager-Sperren
+  `/etc/tmpfiles.d/e3dc-control-locks.conf`.
 
 Direkt im Installationswurzelverzeichnis werden verborgene lokale
 Arbeitsbereiche ausgelassen, deren Name auf `_local`, `_backup` oder
@@ -126,12 +138,30 @@ bash "$E3DC_INSTALL_PATH/e3dc-setup"
 
 Wähle **`6) Backup erstellen / verwalten`**.
 
+Das Untermenü „Backup-Verwaltung“ bietet vier Punkte:
+
+- `1 = Vollständiges Backup erstellen` legt einen neuen verifizierten
+  Sicherungspunkt an.
+- `2 = Backup wiederherstellen` listet die vorhandenen verifizierten
+  Sicherungspunkte zur Auswahl und startet danach den Rollback-Ablauf.
+- `3 = Backup löschen` entfernt den gewählten Sicherungspunkt nach Bestätigung
+  mit `ja`, einschließlich einer zugehörigen ruhenden Daten-Nachsicherung.
+- `4 = Backup-Limit jetzt anwenden` wendet die Aufbewahrungsgrenzen (maximal drei
+  System-Backup-Familien und drei Web-Installer-Sicherungen) sofort an und meldet,
+  wie viele alte Sicherungen entfernt wurden.
+
 ## Konfigurationsstände und Tageshistorien
 
 Zusätzlich zu den vollständigen Update-Sicherungen führt das Webportal kleine
 Konfigurationsstände und detaillierte Tageshistorien. Für diese Daten gelten
 eigene Grenzen:
 
+- Das Webportal legt vor jeder Speicherung, die die Konfiguration tatsächlich
+  ändert, automatisch einen Konfigurationsstand unter
+  `/var/www/html/data/config_backups` an. Dasselbe gilt vor einem Import
+  („Upload“, im Rollback-Dialog als „Vor Import“ gekennzeichnet), vor einem
+  Rollback („Vor Rollback“) und vor dem Anlegen oder Löschen zusätzlicher
+  Parameter. Der Dialog „Konfigurations-Rollback“ listet diese Stände zur Auswahl.
 - Die neuesten 20 eindeutig als automatisch erzeugt erkannten
   Konfigurationsstände bleiben erhalten. Ältere automatische Stände werden
   anhand des Datums im Dateinamen bereinigt; ein durch Update oder Restore
@@ -141,8 +171,15 @@ eigene Grenzen:
   Hinweis an.
 - Mit **„Dauerhaft lokal sichern“** angelegte Konfigurationsstände werden nicht
   automatisch gelöscht. Dasselbe gilt für Migrationssicherungen, unbekannte
-  Altnamen, Links und nicht sicher gebundene Dateien. Redigierte und rohe
-  Downloads liegen außerhalb dieser lokalen Rotation.
+  Altnamen, Links und nicht sicher gebundene Dateien.
+- Unter „System-Werkzeuge“, Karte „Konfigurationssicherung“ stehen zwei Downloads:
+  „Einstellungen ohne Zugangsdaten“ entfernt Passwörter, Tokens, Standort und
+  RSCP-Zugangsdaten, enthält aber weiterhin IP-Adressen und Gerätekennungen und
+  ist nicht zum Teilen gedacht; für Forum und Support dient das Diagnosepaket der
+  Installationszentrale. „Raw Download“ enthält alle Zugangsdaten, ist nur mit
+  gesetzter Web-PIN verfügbar („Raw Download gesperrt“, solange keine PIN gesetzt
+  ist) und verlangt eine Bestätigung. Beide Downloads liegen außerhalb dieser
+  lokalen Rotation.
 - Detaillierte Tagesdateien bleiben für 30 Kalendertage direkt auswählbar.
   Ein neu angelegtes Tagesarchiv wird ohne Überschreiben veröffentlicht. Ist
   der Tag bereits vorhanden, bleibt ein identischer oder vollständigerer

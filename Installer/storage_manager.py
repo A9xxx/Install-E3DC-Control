@@ -34,6 +34,10 @@ for _path in (REPO_ROOT, SCRIPT_DIR):
     if _path and _path not in sys.path:
         sys.path.insert(0, _path)
 
+from Wallbox.storage_intent import (  # noqa: E402
+    measured_charge_state, storage_curve_d1_active,
+    storage_curve_can_reach_target, wallbox_type_is_e3dc,
+)
 from rscp_client import RscpConnection, RscpTag, RscpType  # noqa: E402
 from storage_parallel_regulator import (  # noqa: E402
     EMS_POWER_SETTINGS_NONZERO_MIN_W,
@@ -46,6 +50,7 @@ from storage_parallel_regulator import (  # noqa: E402
 )
 from Wallbox.modes import (  # noqa: E402
     CONTROL_TARGET,
+    controller_mode,
     MODE_BATTERY_DEPARTURE,
     MODE_CURVE,
     MODE_OFF,
@@ -60,6 +65,14 @@ from Wallbox import decision as wallbox_decision  # noqa: E402
 import consumer_priority  # noqa: E402
 import heatpump_pv_contract as heatpump_pv_policy  # noqa: E402
 import heatpump_pv_state as heatpump_pv_checkpoint  # noqa: E402
+from Storage.power_limits import (  # noqa: E402
+    _configured_power_limit_w,
+    _rscp_power_limit_w,
+    _fresh_rscp_charge_limits_w,
+    _legacy_configured_charge_limit_w,
+    _legacy_configured_discharge_limit_w,
+    effective_power_limit_cfg,
+)
 from Storage.regulation_switch import (  # noqa: E402
     StorageRegulationSwitch,
     read_storage_regulation_config,
@@ -217,6 +230,9 @@ except ModuleNotFoundError:
 try:
     from Installer.Storage.predump import (  # noqa: E402
         augment_predump_consumer_live,
+        house_heatpump_discharge_cap_w,
+        house_heatpump_load_w,
+        house_power_excluding_wallbox_w,
         hard_predump_grid_limit_w,
         predump_actual_consumer_load_w,
         predump_allow_flags,
@@ -244,6 +260,9 @@ try:
 except ModuleNotFoundError:
     from Storage.predump import (  # type: ignore  # noqa: E402
         augment_predump_consumer_live,
+        house_heatpump_discharge_cap_w,
+        house_heatpump_load_w,
+        house_power_excluding_wallbox_w,
         hard_predump_grid_limit_w,
         predump_actual_consumer_load_w,
         predump_allow_flags,
@@ -3147,130 +3166,14 @@ def storage_decision_path_contract(
     }
 
 
-def _configured_power_limit_w(cfg: Dict[str, Any], key: str) -> int:
-    if key not in cfg:
-        return 0
-    value = safe_int(cfg.get(key), 0)
-    return value if value >= 300 else 0
 
 
-def _rscp_power_limit_w(live: Dict[str, Any], *keys: str) -> int:
-    for key in keys:
-        value = abs(safe_int(live.get(key), 0))
-        if value >= 300:
-            return value
-    return 0
 
 
-def _fresh_rscp_charge_limits_w(
-    cfg: Dict[str, Any],
-    live: Dict[str, Any],
-    *,
-    now_s: Optional[float] = None,
-) -> List[int]:
-    """Liefert ausschließlich frische, typisierte RSCP-Ladegrenzen.
-
-    ``EMS_USER_CHARGE_LIMIT`` und ``EMS_BAT_CHARGE_LIMIT`` sind Obergrenzen.
-    Sie dürfen einen konfigurierten Sollwert deshalb nur absenken, niemals
-    anheben. Bei aktiven ``EMS_POWER_SETTINGS`` kann E3/DC den flüchtigen
-    Lade-Cap jedoch auch in ``EMS_USER_CHARGE_LIMIT`` spiegeln. Nur wenn
-    frischer USER- und MAX_CHARGE-Readback innerhalb des etablierten
-    50-W-Fensters übereinstimmen und eine explizite Konfigurationsgrenze
-    existiert, wird dieser rückgekoppelte Wert verworfen. Jede abweichende
-    USER-Grenze sowie die typisierte Batteriegrenze bleiben wirksam.
-    """
-
-    if (
-        live.get("RSCP_Sample_Valid") is not True
-        or live.get("Power_Decision_Usable") is not True
-    ):
-        return []
-    raw_ts = live.get("_ts")
-    if (
-        not isinstance(raw_ts, (int, float))
-        or isinstance(raw_ts, bool)
-        or not math.isfinite(float(raw_ts))
-        or float(raw_ts) <= 0.0
-    ):
-        return []
-    now_value = time.time() if now_s is None else float(now_s)
-    max_age_s = max(
-        1.0,
-        min(30.0, safe_float(cfg.get("storage_live_stale_guard_s"), 10.0)),
-    )
-    age_s = now_value - float(raw_ts)
-    if not math.isfinite(age_s) or age_s < -5.0 or age_s > max_age_s:
-        return []
-
-    configured_charge_limit_w = _configured_power_limit_w(
-        cfg,
-        "maximumladeleistung",
-    )
-    user_charge_limit_w = live.get("user_charge_limit_w")
-    ems_max_charge_power_w = live.get("ems_max_charge_power_w")
-    user_limit_reflects_dynamic_cap = bool(
-        configured_charge_limit_w >= 300
-        and live.get("ems_power_settings_read") is True
-        and live.get("ems_power_settings_valid") is True
-        and live.get("power_limits_active") is True
-        and isinstance(user_charge_limit_w, int)
-        and not isinstance(user_charge_limit_w, bool)
-        and user_charge_limit_w >= 300
-        and isinstance(ems_max_charge_power_w, int)
-        and not isinstance(ems_max_charge_power_w, bool)
-        and ems_max_charge_power_w >= 0
-        and abs(user_charge_limit_w - ems_max_charge_power_w) < 50
-    )
-    limits: List[int] = []
-    for key in ("user_charge_limit_w", "bat_charge_limit_w"):
-        if user_limit_reflects_dynamic_cap and key == "user_charge_limit_w":
-            continue
-        value = live.get(key)
-        if (
-            isinstance(value, int)
-            and not isinstance(value, bool)
-            and value >= 300
-        ):
-            limits.append(int(value))
-    return limits
 
 
-def configured_charge_limit_w(
-    cfg: Dict[str, Any],
-    live: Optional[Dict[str, Any]] = None,
-    *,
-    now_s: Optional[float] = None,
-) -> int:
-    live = live or {}
-    configured_limit_w = _configured_power_limit_w(cfg, "maximumladeleistung")
-    fresh_rscp_limits_w = _fresh_rscp_charge_limits_w(
-        cfg,
-        live,
-        now_s=now_s,
-    )
-    if fresh_rscp_limits_w:
-        hardware_limit_w = min(fresh_rscp_limits_w)
-        return min(configured_limit_w, hardware_limit_w) if configured_limit_w else hardware_limit_w
-    return configured_limit_w or 12000
 
 
-def configured_discharge_limit_w(
-    cfg: Dict[str, Any],
-    live: Optional[Dict[str, Any]] = None,
-    fallback_charge_w: Optional[int] = None,
-) -> int:
-    live = live or {}
-    user_limit_w = _configured_power_limit_w(cfg, "maximaleentladeleistung")
-    if user_limit_w:
-        return user_limit_w
-    rscp_limit_w = _rscp_power_limit_w(
-        live,
-        "user_discharge_limit_w",
-        "bat_discharge_limit_w",
-    )
-    if rscp_limit_w:
-        return rscp_limit_w
-    return max(300, int(fallback_charge_w or configured_charge_limit_w(cfg, live)))
 
 
 def configured_kw_or_w(value: Any) -> int:
@@ -3415,14 +3318,35 @@ def direct_marketing_export_control_w(
 
 
 
-def effective_power_limit_cfg(cfg: Dict[str, Any], live: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    live = live or {}
-    result = dict(cfg or {})
-    charge_w = configured_charge_limit_w(result, live)
-    discharge_w = configured_discharge_limit_w(result, live, charge_w)
-    result["maximumladeleistung"] = charge_w
-    result["maximaleentladeleistung"] = discharge_w
-    return result
+
+
+def bind_configured_power_limits(ctrl, cfg, live, *, now_s=None):
+    """Bindet auch explizite Freigabe und Fehler-Rückfall an dieselbe Grenze."""
+    limits = effective_power_limit_cfg(cfg, live, now_s=now_s)
+    setter = getattr(ctrl, "set_configured_power_limits", None)
+    if callable(setter):
+        setter(limits["maximumladeleistung"], limits["maximaleentladeleistung"])
+    return limits
+
+
+def configured_charge_limit_w(cfg, live=None, *, now_s=None):
+    return effective_power_limit_cfg(cfg, live, now_s=now_s)["maximumladeleistung"]
+
+
+def configured_discharge_limit_w(cfg, live=None, fallback_charge_w=None):
+    return effective_power_limit_cfg(cfg, live, fallback_charge_w=fallback_charge_w)["maximaleentladeleistung"]
+
+
+def power_limit_state(cfg, live, previous_state, *, now_s=None):
+    diagnostics = effective_power_limit_cfg(cfg, live, now_s=now_s)["_power_limit_diagnostics"]
+    for direction in ("charge", "discharge"):
+        prefix = "power_limit_" + direction
+        keys = (prefix + "_effective_w", prefix + "_source", prefix + "_hint")
+        if tuple(diagnostics.get(k) for k in keys) != tuple((previous_state or {}).get(k) for k in keys):
+            if diagnostics[prefix + "_hint"] or (previous_state or {}).get(prefix + "_hint"):
+                log.info("%s: %s (wirksam %d W)", "Max. Laden (W)" if direction == "charge" else "Max. Entladen (W)",
+                         diagnostics[prefix + "_hint"] or "Nutzereingabe ist aktiv.", diagnostics[prefix + "_effective_w"])
+    return diagnostics
 
 
 def load_cfg(path: str = V4_CFG) -> Dict[str, Any]:
@@ -8925,6 +8849,149 @@ def charge_acceptance_diagnostic_contract(
     }
 
 
+def storage_regulation_now(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Beschreibt den bestehenden Ausgangsvertrag, ohne eine Policy zu entscheiden."""
+    result = {"kind": "unknown", "label": "Regelart unbekannt", "valid": False,
+              "source": "storage_manager.final_output", "reason": "output_not_bound"}
+    transaction = payload.get("rscp_request_transaction") or {}
+    if (not isinstance(transaction, dict)
+            or transaction.get("send_called") is not True
+            or transaction.get("output_complete") is not True
+            or transaction.get("partial") is True
+            or transaction.get("acknowledged") is False
+            or payload.get("suppress_rscp_output") is True
+            or payload.get("storage_regulation_enabled") is False
+            or payload.get("live_sample_valid") is not True
+            or payload.get("live_stale") or payload.get("live_sample_invalid")):
+        return result
+    mode = payload.get("mode")
+    state = str(payload.get("state") or "")
+    if isinstance(mode, bool) or mode not in (MODE_AUTO, MODE_IDLE, MODE_GRID, MODE_CHRG, MODE_DISCH) or not state:
+        return result
+    limit = payload.get("auto_limit") or {}
+    if not isinstance(limit, dict):
+        return result
+    steps = transaction.get("substeps") or {}
+    power = steps.get("set_power") or {}
+    settings = steps.get("power_settings") or {}
+    target = settings.get("target") or {}
+    if power and (power.get("mode") != mode or power.get("value_w") != payload.get("val")):
+        result["reason"] = "output_target_changed"
+        return result
+    if settings and settings.get("confirmed") is not True:
+        return result
+    limited = limit.get("enabled") is True and limit.get("release") is not True
+    if limited:
+        if any(isinstance(limit.get(key), bool) or not isinstance(limit.get(key), (int, float))
+               or not math.isfinite(limit[key]) or limit[key] < 0
+               for key in ("max_charge_w", "max_discharge_w")):
+            return result
+        if (not settings or target.get("limits_used") is not True
+                or target.get("max_charge_w") != limit.get("max_charge_w")
+                or target.get("max_discharge_w") != limit.get("max_discharge_w")):
+            result["reason"] = "output_limits_changed"
+            return result
+    elif mode == MODE_AUTO and (not settings or target.get("limits_used") is not False):
+        # AUTO allein belegt keinen Freilauf: alte EMS-Grenzen könnten noch gelten.
+        return result
+    # protected schützt auch fachliche Eigentümer vor Übersteuerung. Deren
+    # konkrete Bezeichnung bleibt erhalten; ein Sicherheitsveto geht vor.
+    if "protected" in payload and not isinstance(payload["protected"], bool):
+        return result
+    protected = payload.get("protected") is True
+    if "protected" not in payload:
+        protected = state in {"emergency_power", "ep_reserve_discharge_hold",
+                              "ep_reserve_floor_hold", "parallel_emergency_auto",
+                              "hard_mode_guard_auto", "storm_guard_grid", "storm_guard_grid_wait"}
+    if protected and (payload.get("safety_veto") is True or payload.get("priority") == "safety"):
+        kind, label = "protection", "Notstrom-/Schutzfall"
+    elif state.startswith("pre_discharge"):
+        kind, label = "limited", "Vorab-Entladung"
+    elif state.startswith("direct_marketing"):
+        kind, label = "limited", "Direktvermarktung"
+    elif state.startswith("manual_override"):
+        kind, label = "limited", "Manuelle Vorgabe"
+    elif protected:
+        kind, label = "protection", "Notstrom-/Schutzfall"
+    elif mode == MODE_GRID and safe_float(payload.get("val"), 0.0) > 0.0:
+        kind, label = "grid_charge", "Laden aus dem Netz"
+    elif "price_hold" in state or state in {"market_discharge_hold", "market_grid_done_hold"}:
+        kind, label = "hold", "Preis-Halt"
+    elif "reserve_hold" in state:
+        kind, label = "hold", "Reserve-Halt"
+    elif limited and state in {"parallel_wb_auto", "wallbox_wbminsoc_runtime_raise_hold",
+                               "parallel_night_floor_hold", "parallel_planned_load_hold"}:
+        kind, label = "limited", "Entladesperre"
+    elif (limited or mode in (MODE_CHRG, MODE_DISCH)) and state.startswith(("parallel_curve_", "curve_")):
+        kind, label = "curve", "Kurvenführung"
+    elif limited or mode in (MODE_CHRG, MODE_DISCH):
+        kind, label = "limited", "Grenze aktiv"
+    elif mode == MODE_IDLE:
+        kind, label = "hold", "Halt"
+    elif mode == MODE_AUTO:
+        kind, label = "free", "E3DC regelt frei"
+    else:
+        return result
+    result.update(kind=kind, label=label, valid=True, reason=state)
+    return result
+
+
+def storage_corridor_now(payload: Dict[str, Any], now_s: float, plan_id=None) -> Dict[str, Any]:
+    """Veröffentlicht die Korridorlage derselben Entscheidung ohne neues Regelziel."""
+    def pct(value):
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) and 0.0 <= number <= 100.0 else None
+
+    floor = pct(payload.get("adaptive_soc_floor"))
+    ceiling = pct(payload.get("adaptive_soc_ceiling"))
+    soc = pct(payload.get("soc"))
+    relation = payload.get("adaptive_curve_relation")
+    valid = bool(
+        floor is not None and ceiling is not None and ceiling >= floor
+        and soc is not None
+        and relation in {"inside_band", "below_floor", "above_ceiling"}
+        and payload.get("live_sample_valid") is True
+        and not payload.get("live_stale") and not payload.get("live_sample_invalid")
+    )
+    return {
+        "regulation": storage_regulation_now(payload),
+        "floor_soc": floor,
+        "ceiling_soc": ceiling,
+        "relation": relation if valid else "no_curve",
+        "control_soc": (floor if relation == "below_floor" else ceiling)
+        if valid and relation != "inside_band" else None,
+        "source": "storage_manager.adaptive_curve_context",
+        "ts": float(now_s),
+        "valid_until_ts": float(now_s) + 120.0,
+        "valid": valid,
+        "reason": "ok" if valid else "curve_or_live_data_unavailable",
+        "plan_id": plan_id,
+    }
+
+
+def storage_corridor_text(status: Dict[str, Any]) -> str:
+    regulation = status.get("regulation") or {}
+    label = regulation.get("label", "Regelart unbekannt")
+    if not status.get("valid"):
+        return "Kein Regelziel verfügbar" + (" · " + label if regulation.get("valid") else "")
+    def pct(value):
+        return f"{math.floor(value * 10.0 + 0.5) / 10.0:.1f}".rstrip("0").rstrip(".").replace(".", ",")
+    floor, ceiling = status.get("floor_soc"), status.get("ceiling_soc")
+    if status.get("relation") == "inside_band":
+        position = f"Korridor {pct(floor)}–{pct(ceiling)} %"
+    elif status.get("relation") == "below_floor":
+        position = (f"Regelziel {pct(floor)} % (Unterkante)" if regulation.get("kind") == "curve"
+                    else f"Unterkante {pct(floor)} %")
+    else:
+        position = f"Obergrenze {pct(ceiling)} %"
+    return position + " · " + label
+
+
 def build_display(payload: Dict[str, Any], *, now_s: Optional[float] = None) -> Dict[str, str]:
     state = str(payload.get("state") or "parallel_auto")
     soc = safe_float(payload.get("soc"), 0.0)
@@ -9238,6 +9305,7 @@ def build_display(payload: Dict[str, Any], *, now_s: Optional[float] = None) -> 
         elif (
             "Kurve fordert Ladung" in raw_reason
             or "AUTO-Haltezeit" in raw_reason
+            or bool(shadow_inputs.get("curve_pv_free_active"))
         ):
             reason = raw_reason
         else:
@@ -9366,8 +9434,9 @@ def build_display(payload: Dict[str, Any], *, now_s: Optional[float] = None) -> 
             )
     elif state == "parallel_curve_auto_no_surplus":
         reason = (
-            f"SoC {soc:.1f}% liegt zur Kurve {curve_txt} im freien AUTO-Band. "
-            "E3DC führt; die Regelung wartet auf echten PV-Überschuss oder Schutzbedarf."
+            f"SoC {soc:.1f}%: "
+            + storage_corridor_text(payload.get("corridor_now") or storage_corridor_now(payload, now_s or time.time()))
+            + ". Die Regelung wartet auf echten PV-Überschuss oder Schutzbedarf."
         )
     elif state == "parallel_headroom_discharge":
         discharge_w = safe_int(payload.get("headroom_discharge_w", payload.get("val")), 0)
@@ -17241,7 +17310,7 @@ def market_economics_decision(
     soc = safe_float(live.get("SOC"), 0.0)
     target_soc = safe_float(
         reserve.get("target_soc_pct"),
-        safe_float(plan.get("planning_target_soc", plan.get("target_soc")), 95.0),
+        safe_float(plan.get("normal_target_soc", plan.get("planning_target_soc", plan.get("target_soc"))), 95.0),
     )
     if action == "grid_charge":
         target_soc = safe_float(forecast.get("grid_charge_target_soc_pct"), target_soc)
@@ -19113,7 +19182,8 @@ def price_storage_hold_requested(
             or safe_int(wb_intent.get("cap_amp", wb_intent.get("set_amp")), 0) > 0
         )
     )
-    unmanaged = not regulated_by_us
+    observed = observed_wallbox_storage_policy(cfg, wb_intent, wb_mode) is not None
+    unmanaged = not regulated_by_us and not observed
     controlled_floor_request = bool(
         intent_fresh
         and regulated_by_us
@@ -19150,7 +19220,7 @@ def price_storage_hold_requested(
         or storm_active
     )
     price_hold_requested = bool(
-        request == "hold_discharge"
+        (request == "hold_discharge" and not observed)
         or wb_intent.get("scheduled_slot_active")
         or wb_intent.get("price_boost_active")
         or wb_intent.get("price_plan_storage_protect")
@@ -19231,7 +19301,7 @@ def controlled_wallbox_auto_freerun_requested(
     measurement_valid: bool = True,
 ) -> bool:
     if wb_intent_fresh is None:
-        wb_intent_fresh = bool(wb_intent) and now_s - safe_float(wb_intent.get("ts"), 0.0) <= 60.0
+        wb_intent_fresh = bool(wb_intent) and 0 <= now_s - safe_float(wb_intent.get("ts"), 0.0) <= 60.0
     if not wb_intent_fresh or wb_mode == MODE_OFF:
         return False
 
@@ -19940,7 +20010,12 @@ def _observe_wallbox_storage_policy_value(
     *,
     allow_inactive: bool = False,
 ) -> str:
-    """Liefert die exakte Speicherpolicy für eine Wallbox im Beobachtungsmodus."""
+    """Liefert die Speicherpolitik einer beobachteten Wallbox."""
+    if (
+        wb_intent.get("openwb_primary_pv_mode_active") is True
+        or wb_intent.get("openwb_primary_observe_only") is True
+    ) and wb_mode in (MODE_CURVE, MODE_TARGET):
+        return "reserve" if wb_mode == MODE_TARGET else "curve"
     if wb_mode != MODE_OFF:
         return ""
     reason = str(wb_intent.get("reason") or "").strip().lower()
@@ -20014,6 +20089,286 @@ def _observe_wallbox_curve_floor_guard_requested(
     ) == "curve"
 
 
+def observed_wallbox_storage_points(cfg, wb_intent, *, for_discharge_cap=False):
+    """Bindet Beobachtung und Politik an den einzelnen konfigurierten Ladepunkt."""
+    if not wb_intent or str(wb_intent.get("reason") or "") in (
+        "wallbox_no_configured_charger", "wallbox_native_disabled",
+        "ha_writer_admission_blocked",
+    ) or ("wb_native_enable" in cfg and not cfg_bool(cfg, "wb_native_enable", False)):
+        return []
+    points = wb_intent.get("wallbox_storage_points")
+    if not isinstance(points, list):
+        # Übergang vom bisherigen Intent: die Primary-IDs bleiben maßgeblich.
+        ids = wb_intent.get("openwb_primary_pv_mode_ids") or [
+            safe_int(wb_intent.get("wb_id", wb_intent.get("charger_id", 1)), 1)
+        ]
+        points = [dict(wb_intent, id=cid,
+                       mode=wb_intent.get("wb_mode_active", cfg.get(f"wb{cid}_mode", 0)),
+                       role="primary" if wallbox_intent_external_manager(wb_intent) else "controlled")
+                  for cid in ids]
+    result = []
+    observed_ids = set()
+    for raw in points:
+        if not isinstance(raw, dict) or raw.get("configured") is False or raw.get("enabled") is False:
+            continue
+        cid = safe_int(raw.get("id"), 0)
+        if cid <= 0 or raw.get("writer_allowed") is False:
+            continue
+        if cid in observed_ids:
+            continue
+        if "wb_native_type" in cfg:
+            type_key = "wb_native_type" if cid == 1 else "wb_native_type2" if cid == 2 else None
+            configured_type = str(cfg.get(type_key) or "").strip().lower() if type_key else ""
+            if not configured_type and cid == 2 and raw.get("type") == "openwb" and raw.get("configured") is True:
+                configured_type = "openwb"
+            if configured_type in ("", "none", "off", "disabled", "0", "false", "aus", "no", "nein", "deaktiviert", "keine", "keine_wallbox", "no_wallbox", "-1"):
+                continue
+        mode = normalize_wb_mode(raw.get("mode", cfg.get(f"wb{cid}_mode", 0)))
+        window_active = any(raw.get(key) for key in (
+            "grid_allowed", "price_opt_active", "scheduled_slot_active", "price_boost_active",
+            "price_plan_storage_protect", "battery_departure_active",
+            "predump_wallbox_active", "predump_active",
+        ))
+        if window_active and not for_discharge_cap:
+            continue
+        if raw.get("role") == "primary" and mode in (MODE_CURVE, MODE_TARGET):
+            policy = "reserve" if mode == MODE_TARGET else "curve"
+        elif mode == MODE_OFF:
+            policy = next((str(value).strip().lower() for value in (
+                raw.get("observe_storage_policy"), cfg.get(f"wb{cid}_observe_storage_policy"),
+                cfg.get(f"wb{cid}_storage_observe_policy"), cfg.get("wb_observe_storage_policy"))
+                if str(value or "").strip()), "")
+            if policy in ("reserve", "pv_battery", "battery", "akku", "wbminsoc", "floor", "1", "true", "yes", "on"):
+                policy = "reserve"
+            if policy not in ("curve", "reserve"):
+                continue
+        else:
+            continue
+        result.append(dict(raw, id=cid, mode=mode, policy=policy, window_active=window_active))
+        observed_ids.add(cid)
+    return result
+
+
+def observed_wallbox_storage_policy(cfg, wb_intent, wb_mode):
+    """Ein Batterie-Request ändert die beobachtete Rolle nicht."""
+    points = observed_wallbox_storage_points(cfg, wb_intent)
+    if not points:
+        return None
+    return "curve" if any(p["policy"] == "curve" for p in points) else "reserve"
+
+
+def observed_wallbox_controlled_intent(wb_intent, observed_ids):
+    """Erhält den Regelauftrag der übrigen Ladepunkte einer Mischanlage."""
+    points = wb_intent.get("wallbox_storage_points")
+    if not observed_ids:
+        return wb_intent
+    if not isinstance(points, list):
+        return {}
+    controlled = [p for p in points if isinstance(p, dict)
+                  and p.get("id") not in observed_ids and normalize_wb_mode(p.get("mode", 0)) != MODE_OFF]
+    if not controlled:
+        return {}
+    result = dict(wb_intent)
+    result.update(wallbox_storage_points=controlled, external_wallbox_manager=False,
+                  openwb_primary_observe_only=False, openwb_primary_pv_mode_active=False,
+                  openwb_primary_pv_mode_ids=[])
+    result["wb_mode_active"] = max(controlled, key=lambda p: {5: 50, 4: 40, 3: 30, 2: 20}.get(p.get("mode"), 0))["mode"]
+    result["wb_control_mode"] = controller_mode(result["wb_mode_active"])
+    for key in ("active", "car_active", "charging_active", "grid_allowed", "price_opt_active",
+                "scheduled_slot_active", "price_boost_active", "predump_wallbox_active"):
+        result[key] = any(p.get(key) for p in controlled)
+    result["wb_power_w"] = sum(max(0.0, safe_float(p.get("power_w"), 0.0)) for p in controlled)
+    return result
+
+
+def observed_wallbox_discharge_context(cfg, live, wb_intent, wb_native, now_s,
+                                        max_discharge_w, previous_state):
+    """Trennt bestätigte Abnahme, Messdeckel und Haus-/WP-Schutz bei Messlücken."""
+    previous = previous_state.get("observed_wallbox_discharge") or {}
+    enabled = "wb_native_enable" not in cfg or cfg_bool(cfg, "wb_native_enable", False)
+    fresh = bool(wb_intent) and 0 <= now_s-safe_float(wb_intent.get("ts"), 0) <= 60
+    intent = wb_intent if fresh else {}
+    points = observed_wallbox_storage_points(cfg, intent, for_discharge_cap=True) if intent else []
+    if not intent and enabled:
+        # Altstände tragen ausschließlich Identität, Rolle und Politik weiter.
+        points = [{k: p[k] for k in ("id", "mode", "policy", "role", "type", "car_plug_session_id") if k in p}
+                  for p in previous.get("points", []) if isinstance(p, dict)]
+    if not intent and not points and enabled:
+        # Beim Dienststart fehlt auch der Vorzustand. Die explizite Politik
+        # bleibt aus der Konfiguration bekannt, der Steckzustand unbekannt.
+        configured = [dict(id=cid, mode=cfg.get(f"wb{cid}_mode", 0), role="controlled")
+                      for cid in (1, 2)]
+        points = observed_wallbox_storage_points(cfg, {"wallbox_storage_points": configured},
+                                                 for_discharge_cap=True)
+    result = {"policy": None, "discharge_cap_latch_active": False, "cap_w": None,
+              "points": points, "latches": {}, "power_w": 0.0, "reason": "not_observed", "ts": now_s}
+    if not enabled:
+        return result
+    rows = {safe_int(row.get("wb_id"), 0): row for row in intent.get("car_energy_needs", []) if isinstance(row, dict)}
+    details = {safe_int(d.get("id"), 0): d for d in wb_native.get("wb_details", []) if isinstance(d, dict)}
+    cap_points = list(points)
+    # Geregelte Ladepunkte erhalten bei Messlücken denselben Haus-/WP-Schutz.
+    # Sie werden dadurch nicht zu beobachteten Punkten für die Budgetaufteilung.
+    known_ids = {p["id"] for p in cap_points}
+    raw_points = intent.get("wallbox_storage_points")
+    if not isinstance(raw_points, list):
+        raw_points = [dict(id=cid, mode=row.get("wb_mode_active", cfg.get(f"wb{cid}_mode", 0)),
+                           role="controlled") for cid, row in rows.items()]
+    if not intent:
+        raw_points = list(previous.get("gap_points", []))
+        if not raw_points:
+            raw_points = [dict(id=cid, mode=cfg.get(f"wb{cid}_mode", 0), role="controlled")
+                          for cid, key in ((1, "wb_native_type"), (2, "wb_native_type2"))
+                          if str(cfg.get(key) or "").strip().lower() not in ("", "none", "off", "aus", "disabled", "0", "false", "no", "nein", "deaktiviert", "keine", "keine_wallbox", "no_wallbox", "-1")]
+    gap_points = []
+    for raw in raw_points:
+        if not isinstance(raw, dict) or raw.get("enabled") is False or raw.get("writer_allowed") is False:
+            continue
+        cid = safe_int(raw.get("id"), 0)
+        mode = normalize_wb_mode(raw.get("mode", 0))
+        if cid <= 0 or cid in known_ids or mode not in (MODE_CURVE, MODE_TARGET):
+            continue
+        if any(raw.get(k) for k in ("grid_allowed", "price_opt_active", "scheduled_slot_active", "predump_wallbox_active")):
+            continue
+        point = dict(raw, id=cid, mode=mode, policy="reserve" if mode == MODE_TARGET else "curve", gap_only=True)
+        cap_points.append(point)
+        gap_points.append({k: point[k] for k in ("id", "mode", "policy", "role") if k in point})
+    result["gap_points"] = gap_points
+    if not cap_points:
+        return result
+    result["policy"] = "curve" if any(p["policy"] == "curve" for p in cap_points) else "reserve"
+    baseline_w = max(max(300, safe_int(cfg.get("wb_curve_house_baseline_min_w"), 1500)),
+                     safe_int(intent.get("house_baseline_w", previous.get("house_baseline_w")), 0)+200)
+    result["house_baseline_w"] = intent.get("house_baseline_w", previous.get("house_baseline_w"))
+    live_fresh = 0 <= now_s-safe_float(live.get("_ts"), 0) <= 15
+    wp_raw = live.get("WP_Power")
+    wp_valid = (live_fresh and type(wp_raw) in (int, float) and math.isfinite(wp_raw)
+                and wp_raw >= 0 and live.get("WP_Power_Valid") is not False)
+    wp_ts = now_s if wp_valid else previous.get("wp_valid_ts")
+    wp_w = float(wp_raw) if wp_valid else (safe_float(previous.get("wp_w"), 0)
+        if wp_ts is not None and 0 <= now_s-wp_ts <= 600 else None)
+    result.update(wp_w=wp_w, wp_valid_ts=wp_ts,
+                  wp_reason="measured" if wp_valid else "last_valid" if wp_w is not None else "wp_power_unknown")
+    blocked_w, unknown, caps_needed = 0.0, False, False
+    for point in cap_points:
+        cid = str(point["id"])
+        row = rows.get(point["id"])
+        detail = details.get(point["id"], {})
+        prev = (previous.get("latches") or {}).get(cid, {})
+        episode = row.get("car_plug_session_id") if row else None
+        if episode and episode != prev.get("car_plug_session_id", episode):
+            prev = {}
+        disconnected = bool(row is not None and row.get("connected") is False)
+        if row is not None:
+            raw_w = row.get("car_power_w")
+            sample_ts = row.get("car_charging_last_valid_ts", intent.get("ts"))
+            valid = (fresh and row.get("car_power_valid") is True and sample_ts is not None
+                     and 0 <= now_s-safe_float(sample_ts, 0) <= 15)
+        else:
+            raw_w = detail.get("power_w")
+            valid = fresh and live_fresh and _wallbox_status_sample_fresh(detail, now_s=now_s, max_age_s=15)
+        valid = bool(valid and not disconnected and type(raw_w) in (int, float)
+                     and math.isfinite(raw_w) and raw_w >= 0)
+        power_w = float(raw_w) if valid else None
+        latch = wallbox_pv_only_discharge_cap_latch(prev,
+            evidence={"valid": valid, "power_w": power_w, "disconnected": disconnected},
+            now_s=now_s, invalid_starts=False, gap_hold_s=600.0)
+        latch["car_plug_session_id"] = episode or prev.get("car_plug_session_id")
+        result["latches"][cid] = latch
+        result["discharge_cap_latch_active"] |= latch["active"]
+        if not point.get("gap_only") and not point.get("window_active"):
+            if valid and result["power_w"] is not None:
+                result["power_w"] += power_w
+            else:
+                result["power_w"] = None
+        local_intent = dict(intent, wb_mode_active=point["mode"], wb_id=point["id"],
+                            observe_storage_policy=point["policy"], battery_request="none",
+                            openwb_primary_pv_mode_active=point.get("role") == "primary")
+        release = observe_wallbox_reserve_release_context(cfg, live, local_intent, point["mode"],
+            {"observe_wallbox_storage_policy": point["policy"],
+             "observe_wallbox_reserve_release_active": prev.get("reserve_release", True)})
+        latch["reserve_release"] = bool(release.get("active"))
+        result["release"] = release
+        need = (not disconnected and (not valid or latch["active"])
+                and (point["policy"] == "curve" or not release.get("active")))
+        if point.get("gap_only") and valid:
+            need = False
+        caps_needed |= need
+        unknown |= need and not valid
+        if need and valid:
+            point_type = point.get("type") or cfg.get("wb_native_type" if point["id"] == 1 else "wb_native_type2", "")
+            is_e3dc = wallbox_type_is_e3dc(point_type) or (
+                not point_type and not live.get("Wallbox_Home_Includes")
+                and safe_float(live.get("Wallbox_Power"), 0) > 0
+                and safe_float(wb_native.get("total_power_w"), 0) <= safe_float(live.get("Wallbox_Power"), 0)+1)
+            if not is_e3dc:
+                blocked_w += power_w
+    # Bestätigtes Abstecken entfernt auch die Rollenübernahme bei späterem Ausfall.
+    result["points"] = [p for p in points if rows.get(p["id"], {}).get("connected") is not False]
+    result["gap_points"] = [p for p in gap_points if rows.get(p["id"], {}).get("connected") is not False]
+    result["last_valid_cap_w"] = previous.get("last_valid_cap_w")
+    result["last_valid_cap_ts"] = previous.get("last_valid_cap_ts")
+    if not caps_needed:
+        result["reason"] = "idle_or_above_reserve_floor"
+        return result
+    if unknown:
+        last_ts = previous.get("last_valid_cap_ts")
+        last_cap = (safe_float(previous.get("last_valid_cap_w"), 0)
+                    if last_ts is not None and 0 <= now_s-last_ts <= 600 else 0)
+        cap_w = min(max_discharge_w, max(baseline_w+safe_float(wp_w, 0), last_cap))
+        result["reason"] = "wallbox_state_gap_house_heatpump"
+    else:
+        measured = wallbox_actual_power_snapshot(live, wb_native)
+        total_w = max(0.0, safe_float(measured.get("power_w"), 0))
+        live_w = max(0.0, safe_float(measured.get("live_w"), 0))
+        embedded_w = (total_w if measured.get("home_includes_wallbox") else
+                      max(0.0, total_w-live_w) if measured.get("source") == "wallbox_native" else 0.0)
+        cap_live = live_with_wallbox_native_balance(dict(live), wb_native)
+        cap_live.update(Wallbox_Home_Includes=bool(measured.get("home_includes_wallbox")),
+                        Wallbox_Power_Source=measured.get("source"), Wallbox_Live_Power=live_w)
+        house_w = house_power_excluding_wallbox_w(cap_live, total_w)
+        cap_live["Home_Power"] = house_w+max(0.0, embedded_w-blocked_w)
+        cap_live["Wallbox_Home_Includes"] = False
+        cap_live["Wallbox_Power_Source"] = "house_without_blocked_wallbox"
+        cap_w = house_heatpump_discharge_cap_w(cap_live, 0, max_discharge_w)
+        result.update(reason="house_heatpump_deficit", last_valid_cap_w=cap_w, last_valid_cap_ts=now_s)
+        previous_cap = previous.get("cap_w")
+        if previous_cap is not None and cap_w > previous_cap:
+            hold_band = max(300, safe_int(cfg.get("storage_wbminsoc_house_cap_hold_band_w"), 800))
+            step = max(300, safe_int(cfg.get("storage_wbminsoc_house_cap_step_w"), 1000))
+            last_raise = safe_float(previous.get("last_raise_ts"), 0)
+            pending = previous.get("raise_pending_since")
+            pending = now_s if pending is None else pending
+            result["raise_pending_since"] = pending
+            if now_s-last_raise < 30 or (cap_w-previous_cap <= hold_band and now_s-pending < 30):
+                cap_w = previous_cap
+            else:
+                cap_w = min(cap_w, previous_cap+step)
+                result.update(last_raise_ts=now_s, raise_pending_since=None)
+    result.setdefault("last_raise_ts", previous.get("last_raise_ts", now_s))
+    result["cap_w"] = cap_w
+    return result
+
+def apply_observed_wallbox_discharge_cap(cfg, decision, context, max_charge_w, max_discharge_w):
+    """Überlagert den fertigen Rahmen ausschließlich mit dem strengeren Deckel."""
+    cap_w = context.get("cap_w")
+    if (cap_w is None or decision.get("protected") or decision.get("predump_active")
+            or str(decision.get("state") or "").startswith("peak_shaving_")
+            or safe_int(decision.get("mode"), MODE_AUTO) != MODE_AUTO):
+        return decision
+    limit = dict(decision.get("auto_limit") or {})
+    active = limit.get("enabled") and not limit.get("release")
+    charge_w = limit.get("max_charge_w", max_charge_w) if active else max_charge_w
+    discharge_w = limit.get("max_discharge_w", max_discharge_w) if active else max_discharge_w
+    reason = "Beobachtete Wallbox: Entladung nur für Haus/WP-Defizit"
+    limit.update(enabled=True, release=False, max_charge_w=charge_w,
+                 max_discharge_w=min(discharge_w, cap_w), discharge_start_w=0,
+                 heartbeat_s=auto_limit_heartbeat_s(cfg), reason=reason)
+    decision.update(auto_limit=limit, house_heatpump_discharge_cap_w=cap_w,
+                    external_wallbox_curve_storage_protect=True)
+    return decision
+
+
 def observe_wallbox_reserve_release_context(
     cfg: Dict[str, Any],
     live: Dict[str, Any],
@@ -20047,6 +20402,10 @@ def observe_wallbox_reserve_release_context(
         "unmanaged_wallbox_wbminsoc_hold",
         "wallbox_wbminsoc_curve_charge",
     )
+    previous_hold = bool(previous_hold or (
+        previous_state.get("observe_wallbox_storage_policy") == "reserve"
+        and previous_state.get("observe_wallbox_reserve_release_active") is False
+    ))
     release_floor = floor_soc + (hysteresis_pct if previous_hold else 0.0)
     active = bool(soc > release_floor + 0.05)
     return {
@@ -20090,6 +20449,12 @@ def unmanaged_wallbox_wbminsoc_hold_decision(
     previous_hold_grace = bool(previous_hold and previous_state_age_s <= owner_grace_s)
     intent_fresh = bool(wb_intent) and now_s - safe_float(wb_intent.get("ts"), 0.0) <= 90.0
     wb_mode = normalize_wb_mode(wb_intent.get("wb_mode_active", cfg.get("wb1_mode", 0)))
+    if observed_wallbox_storage_policy(cfg, wb_intent, wb_mode) is not None:
+        observed_ids = {p["id"] for p in observed_wallbox_storage_points(cfg, wb_intent)}
+        wb_intent = observed_wallbox_controlled_intent(wb_intent, observed_ids)
+        if not wb_intent:
+            return None
+        wb_mode = normalize_wb_mode(wb_intent.get("wb_mode_active", 0))
     request = str(wb_intent.get("battery_request", "") or "").strip().lower()
     external_manager = wallbox_intent_external_manager(wb_intent)
     openwb_primary_pv_mode = bool(wb_intent.get("openwb_primary_pv_mode_active"))
@@ -20576,341 +20941,6 @@ def unmanaged_wallbox_wbminsoc_hold_decision(
         "wbminsoc_previous_state_age_s": previous_state_age_s,
         "wbminsoc_effective_pv_charge_threshold_w": effective_pv_charge_threshold_w,
     }
-
-
-def openwb_primary_pv_curve_charge_decision(
-    cfg: Dict[str, Any],
-    live: Dict[str, Any],
-    plan: Dict[str, Any],
-    wb_intent: Dict[str, Any],
-    wb_native: Optional[Dict[str, Any]],
-    now_s: float,
-    max_charge_w: int,
-    previous_state: Optional[Dict[str, Any]] = None,
-) -> Optional[Dict[str, Any]]:
-    wb_native = wb_native or {}
-    now_value = safe_float(now_s, 0.0)
-    intent_ts = safe_float(wb_intent.get("ts"), 0.0)
-    intent_fresh = bool(
-        wb_intent
-        and math.isfinite(now_value)
-        and intent_ts > 0.0
-        and now_value >= intent_ts
-        and now_value - intent_ts <= 90.0
-    )
-    live_ts = safe_float(live.get("_ts"), 0.0)
-    live_max_age_s = safe_float(cfg.get("storage_live_stale_guard_s"), 10.0)
-    if not math.isfinite(live_max_age_s) or live_max_age_s <= 0.0:
-        live_max_age_s = 10.0
-    live_max_age_s = min(30.0, live_max_age_s)
-    live_fresh = bool(
-        live_ts > 0.0
-        and now_value >= live_ts
-        and now_value - live_ts <= live_max_age_s
-    )
-    wb_mode = normalize_wb_mode(
-        wb_intent.get("wb_mode_active", cfg.get("wb1_mode", 0))
-    )
-    if not (
-        intent_fresh
-        and live_fresh
-        and wb_mode == MODE_CURVE
-        and wb_intent.get("external_wallbox_manager") is True
-        and wb_intent.get("openwb_primary_observe_only") is True
-        and wb_intent.get("openwb_primary_pv_mode_active") is True
-    ):
-        return None
-    if safe_int(wb_intent.get("wb_control_mode"), 0) == CONTROL_TARGET:
-        return None
-    if (
-        str(wb_intent.get("battery_request") or "").strip().lower() != "none"
-        or bool(wb_intent.get("price_opt_active"))
-        or bool(wb_intent.get("scheduled_slot_active"))
-        or bool(wb_intent.get("price_boost_active"))
-        or bool(wb_intent.get("price_plan_storage_protect"))
-        or bool(wb_intent.get("battery_departure_active"))
-    ):
-        return None
-
-    primary_evidence = _external_openwb_primary_power_evidence(
-        wb_intent,
-        wb_native,
-        now_s=now_value,
-        max_age_s=live_max_age_s,
-    )
-    if primary_evidence.get("valid") is not True:
-        return None
-    wallbox_w = safe_float(primary_evidence.get("power_w"), 0.0)
-    if wallbox_w <= 0.0:
-        return None
-
-    soc = safe_float(live.get("SOC"), 0.0)
-    curve_soc, _target_soc, _target_ts = current_curve(
-        plan,
-        now_s,
-        allow_before_start=safe_float(live.get("PV_Power"), 0.0) > 250.0,
-    )
-    floor_soc = safe_float(
-        wb_intent.get("effective_wb_floor_soc", wb_intent.get("wbminsoc", cfg.get("wbminsoc"))),
-        0.0,
-    )
-    if floor_soc > 0.0 and soc < floor_soc:
-        curve_soc = max(float(curve_soc), floor_soc) if curve_soc is not None else floor_soc
-    if curve_soc is None:
-        return None
-
-    previous_state = previous_state or {}
-    previous_name = str(previous_state.get("state") or "")
-    previous_charge = previous_name == "wallbox_wbminsoc_curve_charge"
-    curve_gap_pct = max(0.0, float(curve_soc) - soc)
-    enter_gap_pct = max(0.1, safe_float(cfg.get("storage_openwb_primary_pv_charge_enter_gap_pct"), 0.25))
-    keep_gap_pct = max(0.05, safe_float(cfg.get("storage_openwb_primary_pv_charge_keep_gap_pct"), 0.12))
-    if curve_gap_pct < (keep_gap_pct if previous_charge else enter_gap_pct):
-        return None
-
-    live_with_wallbox = dict(live)
-    live_with_wallbox["Home_Power"] = max(
-        0.0,
-        safe_float(live.get("Home_Power"), 0.0) - wallbox_w,
-    )
-    live_with_wallbox["Wallbox_Power"] = wallbox_w
-    live_with_wallbox["Wallbox_Power_Source"] = "openwb_primary_id_bound_wb_details"
-    live_with_wallbox["Wallbox_Live_Power"] = wallbox_w
-    live_with_wallbox["Wallbox_Home_Includes"] = False
-
-    pv_house_surplus_w = pv_surplus_after_house_heatpump_w(live_with_wallbox, 0.0)
-    if pv_house_surplus_w <= 0:
-        return None
-    grid_tolerance_w = max(
-        0,
-        safe_int(cfg.get("storage_openwb_primary_pv_charge_grid_tolerance_w", cfg.get("storage_wbminsoc_pv_charge_grid_tolerance_w")), 150),
-    )
-    min_charge_w = max(
-        300,
-        safe_int(cfg.get("storage_openwb_primary_pv_charge_min_w", cfg.get("storage_wbminsoc_pv_charge_enter_w")), 500),
-    )
-    step_up_w = max(100, safe_int(cfg.get("storage_openwb_primary_pv_charge_step_up_w"), 300))
-    step_down_w = max(step_up_w, safe_int(cfg.get("storage_openwb_primary_pv_charge_step_down_w"), 1000))
-    target_charge_w = max(0, min(max_charge_w, pv_house_surplus_w))
-    if target_charge_w < min_charge_w and not previous_charge:
-        return None
-
-    grid_power_w = safe_float(live_with_wallbox.get("Grid_Power"), 0.0)
-    grid_import_w = max(0, int(round(grid_power_w)))
-    grid_export_w = max(0, int(round(-grid_power_w)))
-    current_battery_charge_w = max(0, safe_int(live_with_wallbox.get("Battery_Power"), 0))
-    previous_val_w = max(0, safe_int(previous_state.get("val"), 0)) if previous_charge else 0
-    base_charge_w = max(current_battery_charge_w, previous_val_w)
-    if grid_import_w > grid_tolerance_w:
-        charge_w = max(0, min(base_charge_w, current_battery_charge_w) - max(step_down_w, grid_import_w - grid_tolerance_w))
-    else:
-        charge_w = min(target_charge_w, base_charge_w + step_up_w + grid_export_w)
-        if not previous_charge and target_charge_w >= min_charge_w:
-            charge_w = max(charge_w, min_charge_w)
-    if charge_w < min_charge_w:
-        return None
-
-    curve_txt = "%.1f%%" % float(curve_soc)
-    reason = (
-        "openWB Primary PV: Speicher führt die Ladekurve aktiv mit CHRG %dW "
-        "(SoC %.1f%%, Kurve %s, PV nach Haus/WP %dW). "
-        "openWB bleibt im PV-Modus und erhält nur den verbleibenden Überschuss."
-    ) % (charge_w, soc, curve_txt, pv_house_surplus_w)
-    return {
-        "state": "wallbox_wbminsoc_curve_charge",
-        "mode": MODE_CHRG,
-        "val": charge_w,
-        "priority": "safety",
-        "reason": reason,
-        "protected": True,
-        "storage_req_w": charge_w,
-        "budget_w": 0,
-        "openwb_primary_pv_curve_charge": True,
-        "unmanaged_wallbox_wbminsoc_hold": True,
-        "house_heatpump_discharge_cap_w": 0,
-        "planned_grid_pv_charge_w": charge_w,
-        "planned_grid_pv_surplus_w": target_charge_w,
-        "pv_house_surplus_w": pv_house_surplus_w,
-        "wallbox_power_w": wallbox_w,
-        "wallbox_power_source": "openwb_primary_id_bound_wb_details",
-        "wallbox_home_includes": False,
-        "external_openwb_primary_ids": list(primary_evidence.get("primary_ids") or []),
-        "wbminsoc_grid_import_w": grid_import_w,
-        "wbminsoc_grid_export_w": grid_export_w,
-        "wbminsoc_pv_after_observed_wallbox_w": int(
-            round(max(0.0, pv_house_surplus_w - wallbox_w))
-        ),
-        "wbminsoc_netpoint_charge_headroom_w": int(
-            round(
-                max(
-                    0.0,
-                    current_battery_charge_w
-                    + grid_export_w
-                    - max(0, grid_import_w - grid_tolerance_w),
-                )
-            )
-        ),
-        "wbminsoc_pv_charge_grid_tolerance_w": grid_tolerance_w,
-        "wbminsoc_pv_charge_enter_w": min_charge_w,
-        "wbminsoc_pv_charge_keep_w": min_charge_w,
-        "wbminsoc_effective_pv_charge_threshold_w": min_charge_w,
-        "curve_soc": curve_soc,
-        "wbminsoc_hold_hysteresis_pct": 0.0,
-        "wbminsoc_owner_grace_active": previous_charge,
-    }
-
-
-def openwb_primary_pv_discharge_cap_decision(
-    cfg: Dict[str, Any],
-    live: Dict[str, Any],
-    wb_intent: Dict[str, Any],
-    wb_native: Optional[Dict[str, Any]],
-    now_s: float,
-    max_charge_w: int,
-    max_discharge_w: int,
-    previous_state: Optional[Dict[str, Any]] = None,
-) -> Optional[Dict[str, Any]]:
-    wb_native = wb_native or {}
-    now_value = safe_float(now_s, 0.0)
-    intent_ts = safe_float(wb_intent.get("ts"), 0.0)
-    intent_fresh = bool(
-        wb_intent
-        and math.isfinite(now_value)
-        and intent_ts > 0.0
-        and now_value >= intent_ts
-        and now_value - intent_ts <= 90.0
-    )
-    live_ts = safe_float(live.get("_ts"), 0.0)
-    live_max_age_s = safe_float(cfg.get("storage_live_stale_guard_s"), 10.0)
-    if not math.isfinite(live_max_age_s) or live_max_age_s <= 0.0:
-        live_max_age_s = 10.0
-    live_max_age_s = min(30.0, live_max_age_s)
-    live_fresh = bool(
-        live_ts > 0.0
-        and now_value >= live_ts
-        and now_value - live_ts <= live_max_age_s
-    )
-    if not (
-        intent_fresh
-        and live_fresh
-        and wb_intent.get("external_wallbox_manager") is True
-        and wb_intent.get("openwb_primary_observe_only") is True
-        and wb_intent.get("openwb_primary_pv_mode_active") is True
-    ):
-        return None
-
-    wb_mode = normalize_wb_mode(wb_intent.get("wb_mode_active", cfg.get("wb1_mode", 0)))
-    if wb_mode not in (MODE_CURVE, MODE_TARGET):
-        return None
-    if (
-        str(wb_intent.get("battery_request") or "").strip().lower() != "none"
-        or bool(wb_intent.get("price_opt_active"))
-        or bool(wb_intent.get("scheduled_slot_active"))
-        or bool(wb_intent.get("price_boost_active"))
-        or bool(wb_intent.get("price_plan_storage_protect"))
-        or bool(wb_intent.get("battery_departure_active"))
-    ):
-        return None
-
-    control_mode = safe_int(wb_intent.get("wb_control_mode"), 0)
-    gate_open = bool(wb_intent.get("wbminsoc_gate_open", True))
-    if wb_mode == MODE_TARGET and control_mode == CONTROL_TARGET and gate_open:
-        return None
-
-    primary_evidence = _external_openwb_primary_power_evidence(
-        wb_intent,
-        wb_native,
-        now_s=now_value,
-        max_age_s=live_max_age_s,
-    )
-    if primary_evidence.get("valid") is not True:
-        return None
-    wallbox_w = safe_float(primary_evidence.get("power_w"), 0.0)
-    if wallbox_w <= 0.0:
-        return None
-
-    live_with_wallbox = dict(live)
-    live_with_wallbox["Home_Power"] = max(
-        0.0,
-        safe_float(live.get("Home_Power"), 0.0) - wallbox_w,
-    )
-    live_with_wallbox["Wallbox_Power"] = wallbox_w
-    live_with_wallbox["Wallbox_Power_Source"] = "openwb_primary_id_bound_wb_details"
-    live_with_wallbox["Wallbox_Live_Power"] = wallbox_w
-    live_with_wallbox["Wallbox_Home_Includes"] = False
-    house_wp_cap_w = house_heatpump_discharge_cap_w(
-        live_with_wallbox,
-        0.0,
-        max_discharge_w,
-    )
-    house_wp_cap_w = smooth_house_heatpump_discharge_cap_w(cfg, house_wp_cap_w, previous_state)
-
-    if wb_mode == MODE_TARGET and control_mode == CONTROL_TARGET:
-        reason = (
-            "openWB Primary PV+Akku: wbminSoC-Tor geschlossen; "
-            "openWB regelt PV-Laden, E3DC-AUTO stützt nur Haus/WP-Defizit bis %dW"
-        ) % house_wp_cap_w
-    else:
-        reason = (
-            "openWB Primary PV: openWB regelt PV-Laden selbst; "
-            "E3DC-AUTO bleibt aktiv, Speicherentladung ist auf Haus/WP-Defizit bis %dW begrenzt"
-        ) % house_wp_cap_w
-
-    return {
-        "state": "parallel_wb_auto",
-        "mode": MODE_AUTO,
-        "val": max_charge_w,
-        "priority": "wallbox",
-        "reason": reason,
-        "protected": True,
-        "storage_req_w": 0,
-        "budget_w": 0,
-        "openwb_primary_pv_discharge_cap": True,
-        "house_heatpump_discharge_cap_w": house_wp_cap_w,
-        "wallbox_power_w": wallbox_w,
-        "wallbox_power_source": "openwb_primary_id_bound_wb_details",
-        "external_openwb_primary_ids": list(primary_evidence.get("primary_ids") or []),
-        "auto_limit": discharge_cap_auto_limit(cfg, max_charge_w, house_wp_cap_w, reason),
-    }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def curve_control_soc_estimate(
@@ -22381,6 +22411,8 @@ def wallbox_pv_only_discharge_cap_latch(
     *,
     evidence: Dict[str, Any],
     now_s: float,
+    invalid_starts: bool = True,
+    gap_hold_s: float = 600.0,
 ) -> Dict[str, Any]:
     """Ein-/Aus-Zustand „Wallbox lädt“ für die PV-only-Entladegrenze.
 
@@ -22393,6 +22425,12 @@ def wallbox_pv_only_discharge_cap_latch(
     ob die Grenze gilt, entscheidet zusätzlich die PV-only-Klasse.
     """
 
+    if not invalid_starts:
+        result = measured_charge_state(previous,
+            power_w=evidence.get("power_w") if evidence.get("valid") is True else None,
+            now_s=now_s, disconnected=evidence.get("disconnected") is True,
+            gap_hold_s=gap_hold_s)
+        return dict(result, schema=WALLBOX_CURVE_PV_ONLY_DISCHARGE_LATCH_SCHEMA)
     prev = previous if isinstance(previous, dict) else {}
     if prev.get("schema") != WALLBOX_CURVE_PV_ONLY_DISCHARGE_LATCH_SCHEMA:
         prev = {}
@@ -22669,6 +22707,13 @@ def validated_wallbox_phase_probe_request(
 
 def curve_effective_target_soc(cfg, plan, target_soc=None):
     """Gemeinsames Ladeziel für Kurvenregelung und Prognosehalt."""
+    state = plan.get("wallbox_curve_target_state")
+    if (plan.get("wallbox_target_soc_active") is True and isinstance(state, dict)
+            and state.get("decision") == "wbminsoc"):
+        for key in ("active_target_soc", "planning_target_soc"):
+            value = plan.get(key)
+            if type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 100:
+                return float(value)
     values = [plan.get(k) for k in ("effective_target_soc", "planning_target_soc", "target_soc")]
     values.extend((target_soc, cfg.get("storage_target_soc")))
     return max(safe_float(v, -1.0) if v is not None else -1.0 for v in values)
@@ -22934,7 +22979,9 @@ def heatpump_pv_source_contract(
             power_w=max(pv_config["max_power_w"], pv_config["start_power_w"],
                         max(0, heatpump_w)), config=pv_config,
             max_charge_w=configured_charge_limit_w(cfg, live, now_s=now_s),
-            target_soc=curve_effective_target_soc(cfg, plan or {}, target_soc))
+            target_soc=(plan or {}).get("normal_target_soc", curve_effective_target_soc(cfg, {
+                **(plan or {}), "wallbox_target_soc_active": False,
+            }, target_soc)))
     except Exception as exc:
         # Prognosefehler dürfen den Speicherzyklus samt Schutzgrenzen nie abbrechen.
         curve_forecast = dict(valid=False, covers=False, reason="curve_forecast_error",
@@ -27015,42 +27062,6 @@ def live_with_wallbox_native_balance(live: Dict[str, Any], wb_native: Optional[D
     return enriched
 
 
-def _raw_total_load_from_balance_w(live: Dict[str, Any]) -> Optional[float]:
-    has_grid = "Wallbox_Grid_Power_Raw" in live
-    has_bat = "Wallbox_Battery_Power_Raw" in live
-    if not has_grid and not has_bat:
-        return None
-    pv_w = max(0.0, safe_float(live.get("PV_Power"), 0.0))
-    grid_w = safe_float(live.get("Wallbox_Grid_Power_Raw"), safe_float(live.get("Grid_Power"), 0.0))
-    bat_w = safe_float(live.get("Wallbox_Battery_Power_Raw"), safe_float(live.get("Battery_Power"), 0.0))
-    total_w = pv_w + max(grid_w, 0.0) + max(-bat_w, 0.0) - max(-grid_w, 0.0) - max(bat_w, 0.0)
-    return max(0.0, total_w)
-
-
-def house_power_excluding_wallbox_w(live: Dict[str, Any], wallbox_w: float) -> float:
-    home_w = max(0.0, safe_float(live.get("Home_Power"), 0.0))
-    wallbox_w = max(0.0, safe_float(wallbox_w, 0.0))
-    separate_e3dc_w = max(0.0, safe_float(live.get("Wallbox_Live_Power"), 0.0))
-    if bool(live.get("Wallbox_Home_Includes")):
-        embedded_w = wallbox_w
-    elif live.get("Wallbox_Power_Source") == "wallbox_native" and separate_e3dc_w > 50.0:
-        # Nur der externe Anteil steckt im Haus; E3DC misst seine Box separat.
-        embedded_w = max(0.0, wallbox_w - separate_e3dc_w)
-    else:
-        return home_w
-    direct_home_w = max(0.0, home_w - embedded_w)
-    raw_total_w = _raw_total_load_from_balance_w(live)
-    if raw_total_w is None:
-        return direct_home_w
-
-    raw_home_w = max(0.0, raw_total_w - wallbox_w)
-    if direct_home_w > 250.0:
-        return direct_home_w
-    if raw_home_w <= 0.0:
-        return direct_home_w
-    return raw_home_w
-
-
 def smooth_house_heatpump_discharge_cap_w(
     cfg: Dict[str, Any],
     current_cap_w: int,
@@ -27087,37 +27098,10 @@ def smooth_house_heatpump_discharge_cap_w(
     return max(0, min(current_cap_w, prev_cap_w + step_w))
 
 
-def house_heatpump_discharge_cap_w(
-    live: Dict[str, Any],
-    wallbox_w: float,
-    max_discharge_w: int,
-) -> int:
-    """Allow only the PV-uncovered house/heat-pump deficit, excluding wallbox load."""
-    pv_w = max(0, safe_int(live.get("PV_Power"), 0))
-    home_w = max(0, int(round(house_power_excluding_wallbox_w(live, wallbox_w))))
-    wp_w = max(
-        0,
-        safe_int(
-            live.get("WP_Power", live.get("heizstab_power", live.get("Heizstab_Power"))),
-            0,
-        ),
-    )
-    deficit_w = max(0, home_w + wp_w - pv_w)
-    return max(0, min(max_discharge_w, deficit_w))
-
-
 def pv_surplus_after_house_heatpump_w(live: Dict[str, Any], wallbox_w: float) -> int:
     """Return PV surplus after house and heat pump, excluding wallbox load."""
     pv_w = max(0.0, safe_float(live.get("PV_Power"), 0.0))
-    home_w = house_power_excluding_wallbox_w(live, wallbox_w)
-    wp_w = max(
-        0.0,
-        safe_float(
-            live.get("WP_Power", live.get("Heatpump_Power", live.get("heizstab_power", 0.0))),
-            0.0,
-        ),
-    )
-    return max(0, int(round(pv_w - home_w - wp_w)))
+    return max(0, int(round(pv_w - house_heatpump_load_w(live, wallbox_w))))
 
 
 def wallbox_curve_reserve_budget(
@@ -28879,7 +28863,7 @@ def protected_decision(
     storm_grid_active = storm_grid_charge_active(plan, int(now_s * 1000.0))
     if storm_grid_active:
         grid_plan = storm_grid
-        target_soc = safe_float(grid_plan.get("target_soc"), safe_float(plan.get("planning_target_soc"), 95.0))
+        target_soc = safe_float(grid_plan.get("target_soc"), safe_float(plan.get("normal_target_soc", plan.get("planning_target_soc")), 95.0))
         hysteresis = max(0.1, safe_float(grid_plan.get("hysteresis_pct"), 0.5))
         charge_w = max(300, min(max_charge_w, safe_int(grid_plan.get("charge_w"), max_charge_w)))
         room_w = grid_charge_room_w(cfg, live)
@@ -28914,7 +28898,7 @@ def protected_decision(
     awattar_mode = safe_int(plan.get("awattar_mode"), 1)
     cheap_grid_active = cheap_grid_charge_active(plan, int(now_s * 1000.0))
     if awattar_mode == 2 and cheap_grid_active:
-        target_soc = safe_float(cheap.get("target_soc"), safe_float(plan.get("planning_target_soc"), 95.0))
+        target_soc = safe_float(cheap.get("target_soc"), safe_float(plan.get("normal_target_soc", plan.get("planning_target_soc")), 95.0))
         hysteresis = max(0.1, safe_float(cheap.get("hysteresis_pct"), 0.5))
         charge_w = max(300, min(max_charge_w, safe_int(cheap.get("charge_w"), max_charge_w)))
         room_w = grid_charge_room_w(cfg, live)
@@ -29042,19 +29026,6 @@ def protected_decision(
     if predump_floor_hold is not None and not predump_floor_reached:
         return predump_floor_hold
 
-    openwb_primary_pv_charge = openwb_primary_pv_curve_charge_decision(
-        cfg,
-        live,
-        plan,
-        wb_intent,
-        wb_native,
-        now_s,
-        max_charge_w,
-        previous_state,
-    )
-    if openwb_primary_pv_charge is not None:
-        return openwb_primary_pv_charge
-
     unmanaged_wb_floor_hold = unmanaged_wallbox_wbminsoc_hold_decision(
         cfg,
         live,
@@ -29068,19 +29039,6 @@ def protected_decision(
     )
     if unmanaged_wb_floor_hold is not None:
         return unmanaged_wb_floor_hold
-
-    openwb_primary_pv_cap = openwb_primary_pv_discharge_cap_decision(
-        cfg,
-        live,
-        wb_intent,
-        wb_native,
-        now_s,
-        max_charge_w,
-        max_discharge_w,
-        previous_state,
-    )
-    if openwb_primary_pv_cap is not None:
-        return openwb_primary_pv_cap
 
     floor_intent_fresh = bool(wb_intent) and now_s - safe_float(wb_intent.get("ts"), 0.0) <= 90.0
     floor_wb_mode = normalize_wb_mode(wb_intent.get("wb_mode_active", cfg.get("wb1_mode", 0)))
@@ -29953,6 +29911,104 @@ def storage_observation_payload(
     }
 
 
+def d1_corridor_residual_context(plan, live, intent, previous_state, now_s,
+                                  adaptive, max_charge_w, *, protected=False):
+    """Freigabe des gemessenen, vom Fahrzeug nicht nutzbaren Korridorrests."""
+    result = {"schema": "d1_corridor_residual_v1", "active": False, "reason": "not_d1",
+              "rest_w": None, "threshold_w": None, "below_since_ts": None,
+              "limit_w": 0, "ts": now_s}
+    if not storage_curve_d1_active(plan):
+        return result
+    if (adaptive.get("relation") != "inside_band" or adaptive.get("ceiling_soc") is None
+            or safe_float(live.get("SOC"), 101) >= adaptive["ceiling_soc"]):
+        result["reason"] = "not_inside_band"
+        return result
+    if (protected or adaptive.get("headroom_reserve_active")
+            or any(intent.get(k) for k in ("predump_active", "predump_wallbox_active", "scheduled_slot_active",
+                                           "price_opt_active", "price_boost_active", "grid_allowed"))):
+        result["reason"] = "protection"
+        return result
+    if not intent or not 0 <= now_s-safe_float(intent.get("ts"), 0) <= 60:
+        result["reason"] = "car_state_unknown"
+        return result
+    rows = intent.get("car_energy_needs")
+    rows = [r for r in rows if isinstance(r, dict) and r.get("connected") is not False
+            and not r.get("manual_pause") and not r.get("bev_full_blocked")] if isinstance(rows, list) else []
+    def positive(v):
+        return type(v) in (int, float) and math.isfinite(v) and v > 0
+    minimum = plan.get("wallbox_car_min_charge_w")
+    if not rows or plan.get("wallbox_car_charge_limits_valid") is not True or not positive(minimum):
+        result["reason"] = "charge_limits_unknown"
+        return result
+    for row in rows:
+        if not positive(row.get("car_min_charge_w")):
+            result["reason"] = "charge_limits_unknown"
+            return result
+        sample_ts = row.get("car_charging_last_valid_ts", intent.get("ts"))
+        power = row.get("car_power_w")
+        if (row.get("connected") is not True or row.get("car_power_valid") is not True
+                or type(power) not in (int, float) or not math.isfinite(power) or power < 0
+                or sample_ts is None or not 0 <= now_s-safe_float(sample_ts, 0) <= 15):
+            result["reason"] = "car_state_unknown"
+            return result
+    # Frische veröffentlichte Fahrzeuggrenzen begrenzen einen älteren Planwert.
+    minimum = min([minimum]+[row["car_min_charge_w"] for row in rows])
+    result["threshold_w"] = minimum
+    # Netz > 0 ist Bezug, Akku > 0 ist Laden. Alle Lasten zählen bereits einmal.
+    grid = live.get("Grid_Power")
+    battery = live.get("Bat_Power", live.get("Battery_Power"))
+    if not all(type(v) in (int, float) and math.isfinite(v) for v in (grid, battery)):
+        result["reason"] = "measurement_gap"
+        return result
+    rest_w = max(0.0, battery-grid)
+    result["rest_w"] = rest_w
+    charging = [row for row in rows if row.get("car_charging_measured") is True]
+    if any(row.get("car_wants_more") is True for row in rows) or intent.get("d1_corridor_release_requested") is True:
+        result["reason"] = "wallbox_requests_surplus"
+        return result
+    case = "below_minimum"
+    if charging:
+        for row in rows:
+            maximum = row.get("car_max_charge_w")
+            target, max_amp = row.get("car_current_target_a"), row.get("car_max_current_a")
+            at_max = (positive(maximum) and row["car_power_w"] >= maximum-200) or (
+                positive(target) and positive(max_amp) and target >= max_amp)
+            if row.get("car_charging_measured") is not True or not at_max:
+                result["reason"] = "car_charging_below_maximum"
+                return result
+        case = "at_maximum"
+    previous = previous_state.get("d1_corridor_residual") or {}
+    continuous = 0 < now_s-safe_float(previous.get("ts"), 0) <= 10
+    active = bool(continuous and previous.get("active") and previous.get("case") == case)
+    previous_limit = previous_state.get("auto_limit") or {}
+    previous_age = now_s-safe_float(previous_state.get("ts"), 0)
+    continuing = (0 <= previous_age <= 10 and battery > 0
+                  and str(previous_state.get("state") or "") in (
+                      "parallel_curve_auto_charge", "parallel_curve_charge", "parallel_curve_charge_cap")
+                  and (not previous_limit or previous_limit.get("release") is True
+                       or safe_float(previous_limit.get("max_charge_w"), 0) > 0))
+    entry = rest_w >= 200 if case == "at_maximum" else 0 < rest_w <= minimum-200
+    since = previous.get("below_since_ts") if continuous and previous.get("case") == case else None
+    if entry:
+        since = now_s if since is None else since
+        active = active or continuing or now_s-since >= 60
+    else:
+        since = None
+    # Austritt wie Eintritt: 60 s zusammenhängende gültige Proben.
+    # Eine einzelne Lastspitze nimmt nur das aktuelle Ladeangebot zurück.
+    empty_since = previous.get("empty_since_ts") if continuous else None
+    if active and rest_w <= 0:
+        empty_since = now_s if empty_since is None else empty_since
+        active = now_s-empty_since < 60
+    else:
+        empty_since = None
+    result.update(case=case, below_since_ts=since, empty_since_ts=empty_since,
+                  active=bool(active), reason="active" if active else "entry_pending")
+    if result["active"]:
+        result["limit_w"] = int(min(max_charge_w, rest_w))
+    return result
+
+
 def decide_next_cycle(
     cfg: Dict[str, Any],
     live: Dict[str, Any],
@@ -30002,7 +30058,7 @@ def decide_next_cycle(
     live_stale = bool(live_stale_guard_s > 0.0 and live_age_s > live_stale_guard_s)
     soc_jump_guard = soc_jump_guard_context(cfg, live, previous_state, now_s)
     soc_unrealistic = bool(soc_jump_guard.get("invalid"))
-    wb_intent_fresh = bool(wb_intent) and now_s - safe_float(wb_intent.get("ts"), 0.0) <= 60.0
+    wb_intent_fresh = bool(wb_intent) and 0 <= now_s - safe_float(wb_intent.get("ts"), 0.0) <= 60.0
     # Akkustützung nach Korridorlage: Meldet der Wallbox-Manager „unter dem
     # Kurvenkorridor, Kontingent aufgebraucht“, bekommt die Wallbox nur den
     # PV-Überschuss und der E3DC-AUTO-Freilauf darf sie nicht aus dem Akku
@@ -30010,7 +30066,9 @@ def decide_next_cycle(
     wallbox_curve_pv_only_active = bool(
         wb_intent_fresh
         and wb_intent.get("battery_support_authorized") is False
-        and str(wb_intent.get("battery_support_reason") or "") == "curve_below_target_pv_only"
+        and str(wb_intent.get("battery_support_reason") or "") in (
+            "curve_below_target_pv_only", "curve_relation_missing_pv_only",
+        )
         and bool(
             wb_intent.get("active")
             or wb_intent.get("charging_active")
@@ -30044,9 +30102,27 @@ def decide_next_cycle(
         and safe_float(wb_intent.get("wb_power_w"), 0.0) <= 250.0
     )
     wb_mode = normalize_wb_mode(wb_intent.get("wb_mode_active", cfg.get("wb1_mode", 0)))
+    observed_discharge = observed_wallbox_discharge_context(
+        cfg, live, wb_intent if wb_intent_fresh else {}, wb_native, now_s, max_discharge_w, previous_state,
+    )
+    observed_points = [p for p in observed_discharge.get("points", []) if not p.get("window_active")]
+    observed_policy = ("curve" if any(p["policy"] == "curve" for p in observed_points) else "reserve") if observed_points else None
+    observed_wallbox = observed_policy is not None
+    observed_ids = {p["id"] for p in observed_points}
+    controlled_intent = observed_wallbox_controlled_intent(wb_intent, observed_ids)
+    controlled_native = dict(wb_native)
+    if observed_ids:
+        controlled_native.pop("wb_possible_power_w", None)
+        controlled_native.pop("wb_max_amp", None)
+        controlled_native.pop("wb_global_max_amp", None)
+        controlled_native["wb_details"] = [d for d in wb_native.get("wb_details", [])
+                                           if d.get("id") not in observed_ids]
+    observed_power_w = max(0.0, safe_float(observed_discharge.get("power_w"), 0.0))
+    only_observed_wallbox = observed_wallbox and not controlled_intent
+    wallbox_curve_pv_only_active = wallbox_curve_pv_only_active and not only_observed_wallbox
     external_wallbox_manager_active = bool(
         wb_intent_fresh
-        and wallbox_intent_external_manager(wb_intent)
+        and (only_observed_wallbox or wallbox_intent_external_manager(controlled_intent))
     )
     wb_budget_context = build_wallbox_budget_context(
         cfg,
@@ -30066,11 +30142,24 @@ def decide_next_cycle(
     native_wallbox_w = wb_budget_context.native_wallbox_w
     home_includes_wallbox = wb_budget_context.home_includes_wallbox
     live_with_wallbox = wb_budget_context.live_with_wallbox
-    wb_car_present = wb_budget_context.wb_car_present
+    wb_car_present = (wb_budget_context.wb_car_present if not observed_wallbox else bool(
+        wb_intent_fresh and controlled_intent
+        and (controlled_intent.get("active") or controlled_intent.get("car_active"))
+    ))
     wb_possible_w = wb_budget_context.wb_possible_w
     pv_after_fixed_signed_w = wb_budget_context.pv_after_fixed_signed_w
     pv_after_fixed_w = wb_budget_context.pv_after_fixed_w
     base_wb_budget_w = wb_budget_context.base_wb_budget_w
+    if observed_wallbox and observed_discharge.get("power_w") is None:
+        # Eine fehlende Einzelmessung entfernt keine Last aus dem gemessenen
+        # Hausverbrauch. Die Differenz dient nur dessen Buchungsaufteilung.
+        controlled_measured_w = sum(max(0.0, safe_float(d.get("power_w"), 0.0))
+                                    for d in controlled_native.get("wb_details", []))
+        observed_power_w = max(0.0, wallbox_w - controlled_measured_w)
+    controlled_wallbox_w = max(0.0, wallbox_w - observed_power_w) if not only_observed_wallbox else 0.0
+    if observed_wallbox:
+        base_wb_budget_w = base_wb_budget_w if wb_car_present else 0
+        wb_possible_w = wallbox_possible_power(cfg, controlled_intent, controlled_native) if controlled_intent else 0
     controlled_wb_measurement_valid = bool(
         wb_native.get("driver_status_valid") is not False
         and wb_native.get("driver_status_stale") is not True
@@ -30135,12 +30224,13 @@ def decide_next_cycle(
     wb_possible_w = max(0, safe_int(wallbox_measurement_dip.get("possible_w"), wb_possible_w))
     controlled_wb_real_power_active = controlled_wallbox_real_power_active(
         cfg,
-        wb_intent,
-        wallbox_w,
+        controlled_intent,
+        controlled_wallbox_w,
         now_s,
         wb_intent_fresh=wb_intent_fresh,
         measurement_valid=controlled_wb_measurement_valid,
     )
+    controlled_wb_real_power_active = controlled_wb_real_power_active and not only_observed_wallbox
     controlled_wb_start_pending = controlled_wallbox_start_pending(
         wb_intent,
         wb_mode,
@@ -30182,7 +30272,7 @@ def decide_next_cycle(
         wb_mode,
         previous_state,
     )
-    observe_reserve_release_active = bool(observe_reserve_release.get("active"))
+    observe_reserve_release_active = bool(observe_reserve_release.get("active")) and not observed_wallbox
     active_state = {}
     adaptive_curve = {}
     adaptive_curve_active = False
@@ -30415,6 +30505,7 @@ def decide_next_cycle(
             )
         curve_frame_memory_state = curve_frame_write_brake_memory_state(previous_state)
         decision = None
+    d1_corridor = {"active": False, "reason": "protection", "limit_w": 0, "ts": now_s}
     curve_frame_normal_regulation = decision is None
     if decision is None:
         pv_curve_before_start = bool(pv_w > 250)
@@ -30426,6 +30517,9 @@ def decide_next_cycle(
             lookahead_h=curve_lookahead_h,
             allow_before_start=pv_curve_before_start,
         )
+        d1_corridor = d1_corridor_residual_context(plan, live, wb_intent, previous_state,
+            now_s, adaptive_curve, max_charge_w,
+            protected=live_stale or live_sample_invalid or soc_unrealistic)
         adaptive_curve_active = bool(adaptive_curve.get("active"))
         adaptive_curve_relation = str(adaptive_curve.get("relation") or "")
         adaptive_floor_soc = adaptive_curve.get("floor_soc")
@@ -30445,7 +30539,8 @@ def decide_next_cycle(
         target_ts = adaptive_curve.get("target_ts")
         storage_kwh = max(1.0, safe_float(cfg.get("speichergroesse"), safe_float(live.get("bat_full_cap_kwh"), 10.0)))
         curve_control_soc = curve_control_soc_estimate(soc, bat_w, storage_kwh, previous_state, now_s, cfg)
-        can_reach_target = bool(plan.get("can_reach_target", True))
+        can_reach_target = storage_curve_can_reach_target(plan)
+        normal_target_can_reach = bool(plan.get("normal_target_can_reach", plan.get("can_reach_target", True)))
         awattar_mode = safe_int(plan.get("awattar_mode"), 1)
         release_ts_s = curve_release_ts_s(plan)
         latest_clamp = latest_charge_start_clamp_context(
@@ -30751,7 +30846,7 @@ def decide_next_cycle(
             and awattar_mode != 0
             and target_soc is not None
             and target_ts is not None
-            and (can_reach_target or shortfall_pv_catchup_active)
+            and (normal_target_can_reach or (shortfall_pv_catchup_active and not storage_curve_d1_active(plan)))
             and not evening_release
             and not post_final_pv_store_auto_release
             and not (planned_load.get("active") and planned_load.get("confirmed"))
@@ -30961,10 +31056,8 @@ def decide_next_cycle(
             "home_ema_w": max(
                 0,
                 int(round(
-                    house_power_excluding_wallbox_w(
-                        live_with_wallbox,
-                        wallbox_w,
-                    )
+                    (house_power_excluding_wallbox_w(live_with_wallbox, wallbox_w) + observed_power_w)
+                    if observed_wallbox else house_power_excluding_wallbox_w(live_with_wallbox, wallbox_w)
                 )),
             ),
             "live_sample_valid": bool(live_plausibility.get("sample_valid", True)),
@@ -31196,7 +31289,7 @@ def decide_next_cycle(
                 "Home_Power_Delta": safe_int(live_plausibility.get("home_delta_w"), 0),
                 "WP_Power": wp_w,
                 "Battery_Power": bat_w,
-                "Wallbox_Power": wallbox_w,
+                "Wallbox_Power": controlled_wallbox_w,
                 "Wallbox_Home_Includes": home_includes_wallbox,
                 "Wallbox_Power_Source": wallbox_power_source,
                 "Wallbox_Live_Power": live_wallbox_w,
@@ -31217,7 +31310,7 @@ def decide_next_cycle(
             },
             plan=plan,
             wb_budget=wb_budget_in,
-            wb_intent=wb_intent if wb_intent_fresh else {},
+            wb_intent=controlled_intent if wb_intent_fresh else {},
         )
         parallel = payload["parallel"]
         mode = safe_int(parallel.get("mode"), MODE_AUTO)
@@ -31683,6 +31776,11 @@ def decide_next_cycle(
                     decision["val"] = max_charge_w
 
 
+                elif d1_corridor.get("active"):
+                    auto_limit_charge_w = d1_corridor["limit_w"]
+                    auto_limit_enabled, auto_limit_release = True, False
+                    auto_limit_reason = "Nicht nutzbarer Fahrzeugüberschuss bis zur Korridorobergrenze"
+                    decision["val"] = auto_limit_charge_w
                 elif not hold_offer_active:
                     previous_auto_limit = (
 
@@ -32212,7 +32310,7 @@ def decide_next_cycle(
                             pv_after_fixed_w - target_corridor_reserve_w,
                             pv_after_fixed_w,
                         )
-                    if external_wallbox_manager_active:
+                    if external_wallbox_manager_active and not observed_wallbox:
                         auto_limit_discharge_w = house_heatpump_discharge_cap_w(
                             live_with_wallbox,
                             wallbox_w,
@@ -32239,7 +32337,7 @@ def decide_next_cycle(
                     )
                     auto_limit_enabled = True
                     auto_limit_release = False
-                    if external_wallbox_manager_active:
+                    if external_wallbox_manager_active and not observed_wallbox:
                         auto_limit_discharge_w = house_heatpump_discharge_cap_w(
                             live_with_wallbox,
                             wallbox_w,
@@ -32254,13 +32352,13 @@ def decide_next_cycle(
                         decision["house_heatpump_discharge_cap_w"] = auto_limit_discharge_w
                     elif curve_mode_ifc_guidance_active:
                         auto_limit_discharge_w = max_discharge_w
-                    if external_wallbox_manager_active:
+                    if external_wallbox_manager_active and not observed_wallbox:
                         decision["external_wallbox_curve_storage_protect"] = True
                     decision["val"] = auto_limit_charge_w
                     auto_limit_reason = (
                         "Wallbox-AUTO: Speicher bleibt auf iFc-Führung begrenzt"
                     )
-                    if external_wallbox_manager_active:
+                    if external_wallbox_manager_active and not observed_wallbox:
                         auto_limit_reason += (
                             "; Ladekurve hat Vorrang, Entladegrenze Haus/WP-Defizit "
                             f"{auto_limit_discharge_w}W"
@@ -32584,6 +32682,16 @@ def decide_next_cycle(
         # Sekundäre Schutzprioritäten bewerten den endgültigen Marktvertrag,
         # nicht den ausschließlich für die Ladegrenze berechneten Kandidaten.
         decision = apply_peak_shaving_secondary_candidate(decision, peak_shaving_evaluation)
+    decision["d1_corridor_residual"] = d1_corridor
+    decision["observed_wallbox_discharge"] = observed_discharge
+    if observed_discharge.get("policy") and not (live_stale or live_sample_invalid or soc_unrealistic):
+        decision = apply_observed_wallbox_discharge_cap(
+            cfg, decision, observed_discharge, max_charge_w, max_discharge_w,
+        )
+        decision["observe_wallbox_storage_policy"] = observed_policy
+        decision["observe_wallbox_reserve_release_active"] = bool(observe_reserve_release.get("active"))
+        decision["observe_wallbox_reserve_floor_soc"] = observe_reserve_release.get("floor_soc")
+        decision["observe_wallbox_reserve_release_floor_soc"] = observe_reserve_release.get("release_floor_soc")
     decision = enforce_hard_mode_guard(
         cfg,
         live_with_wallbox,
@@ -33058,11 +33166,11 @@ def decide_next_cycle(
         budget_w = min(budget_w, max_controllable_ceiling_w)
 
     if wallbox_curve_pv_only_active:
-        # Unter dem Kurvenkorridor ohne Kontingent: nur PV-Überschuss für die Wallbox.
+        # Unter dem Korridor ohne Kontingent oder bei unbekannter Lage: nur PV.
         budget_w = min(budget_w, wallbox_curve_pv_only_budget_w)
         wallbox_exclusive_start_support_w = min(wallbox_exclusive_start_support_w, wallbox_curve_pv_only_budget_w)
         decision["battery_support_authorized"] = False
-        decision["battery_support_reason"] = "curve_below_target_pv_only"
+        decision["battery_support_reason"] = str(wb_intent["battery_support_reason"])
         decision["wallbox_curve_pv_only_budget_w"] = wallbox_curve_pv_only_budget_w
         # Trotz dieser Klemme konnte
         # der Akku die laufenden Wallboxen unter der
@@ -33859,6 +33967,11 @@ def decide_next_cycle(
         "wallbox_curve_export_catchup_w": max(0, safe_int(decision.get("wallbox_curve_export_catchup_w"), 0)),
         "external_wallbox_curve_storage_protect": bool(decision.get("external_wallbox_curve_storage_protect")),
         "wallbox_curve_discharge_protect": bool(decision.get("wallbox_curve_discharge_protect")),
+        "d1_corridor_residual": decision.get("d1_corridor_residual", {}),
+        "d1_corridor_charge_w": (max(0, bat_w)
+            if decision.get("d1_corridor_residual", {}).get("active")
+            and safe_int((decision.get("auto_limit") or {}).get("max_charge_w"), 0) > 0 else 0),
+        "observed_wallbox_discharge": decision.get("observed_wallbox_discharge", {}),
         "observe_wallbox_storage_policy": decision.get("observe_wallbox_storage_policy"),
         "observe_wallbox_reserve_release_active": bool(decision.get("observe_wallbox_reserve_release_active")),
         "observe_wallbox_reserve_floor_soc": decision.get("observe_wallbox_reserve_floor_soc"),
@@ -35014,6 +35127,7 @@ def decide_next_cycle(
         "soc_jump_guard": soc_jump_guard if soc_unrealistic else None,
         "last_valid_soc": soc_jump_guard.get("last_valid_soc", soc),
         "last_valid_soc_ts": soc_jump_guard.get("last_valid_soc_ts", now_s),
+        **power_limit_state(cfg, live, previous_state, now_s=now_s),
         "ems_power_limits_active": bool(live.get("power_limits_active")) if "power_limits_active" in live else None,
         "ems_power_settings_read": live.get("ems_power_settings_read") is True,
         "ems_power_settings_valid": live.get("ems_power_settings_valid") is True,
@@ -35136,6 +35250,11 @@ def decide_next_cycle(
         "wallbox_curve_reserve_step_w": max(0, safe_int(decision.get("wallbox_curve_reserve_step_w"), 0)),
         "external_wallbox_curve_storage_protect": bool(decision.get("external_wallbox_curve_storage_protect")),
         "wallbox_curve_discharge_protect": bool(decision.get("wallbox_curve_discharge_protect")),
+        "d1_corridor_residual": decision.get("d1_corridor_residual", {}),
+        "d1_corridor_charge_w": (max(0, bat_w)
+            if decision.get("d1_corridor_residual", {}).get("active")
+            and safe_int((decision.get("auto_limit") or {}).get("max_charge_w"), 0) > 0 else 0),
+        "observed_wallbox_discharge": decision.get("observed_wallbox_discharge", {}),
         "observe_wallbox_storage_policy": decision.get("observe_wallbox_storage_policy"),
         "observe_wallbox_reserve_release_active": bool(decision.get("observe_wallbox_reserve_release_active")),
         "observe_wallbox_reserve_floor_soc": decision.get("observe_wallbox_reserve_floor_soc"),
@@ -35755,6 +35874,7 @@ def decide_next_cycle(
         previous_state,
         now_s=now_s,
     )
+    payload["corridor_now"] = storage_corridor_now(payload, now_s, plan.get("plan_id"))
     display = build_display(payload)
     payload.update(display)
     budget.update({
@@ -37768,15 +37888,18 @@ def terminal_consumer_budget_runtime_state(
 
 
 def apply_heat_tariff_storage(cfg, live, payload, energy_decision, previous_state, *, now, reserve_pct):
-    """Optionaler Tarifvertrag am alleinigen Speicherausgang, bei Fehler ohne Eingriff."""
-    if cfg.get("heat_tariff_shift_mode", "off") == "off":
+    """Tarif-/Netzboost-Halt am alleinigen Speicherausgang, bei Fehler ohne Eingriff."""
+    if (cfg.get("heat_tariff_shift_mode", "off") == "off"
+            and not cfg_bool(cfg, "price_boost_enable", False)):
         return payload
     try:
         from Heat.tariff_storage import apply as apply_tariff_storage
-        decision = energy_decision.get("decision") or {}
+        decision = energy_decision.get("decision")
+        decision = decision if isinstance(decision, dict) else {}
         return apply_tariff_storage(
             cfg, live, payload, decision.get("heat_tariff_shift"),
             now=now, reserve_pct=reserve_pct, previous_state=previous_state,
+            grid_boost_signal=energy_decision,
             min_interval_s=CURVE_FRAME_WRITE_BRAKE_MIN_INTERVAL_S,
             deadband_w=CURVE_FRAME_WRITE_BRAKE_DEADBAND_W)
     except Exception:  # Fehler im Zusatzpfad ändern weder Budget noch Speicherkommando.
@@ -37790,6 +37913,8 @@ def apply_heat_tariff_storage(cfg, live, payload, energy_decision, previous_stat
 def write_state(payload: Dict[str, Any], plan: Dict[str, Any]) -> None:
     payload = apply_wallbox_ifc_safe_projection(payload)
     state_ts = int(time.time())
+    payload["corridor_now"] = storage_corridor_now(payload, state_ts, plan.get("plan_id"))
+    payload.update(build_display(payload, now_s=state_ts))
     prior_persisted_state = read_json_file(STATE_F)
     curve_cap_handover = terminal_storage_curve_cap_handover_state(
         payload,
@@ -37801,6 +37926,9 @@ def write_state(payload: Dict[str, Any], plan: Dict[str, Any]) -> None:
     state = {
         "storage_regulation": copy.deepcopy(payload.get("storage_regulation")),
         "storage_plan_id": plan.get("plan_id"),
+        "corridor_now": copy.deepcopy(payload.get("corridor_now"))
+        if isinstance(payload.get("corridor_now"), dict)
+        else storage_corridor_now(payload, state_ts, plan.get("plan_id")),
         "state": payload["state"],
         "reason": payload["reason"],
         "manager_title": payload.get("manager_title", "Speicher-Regelung"),
@@ -38644,6 +38772,8 @@ def _wb_budget_control_payload(
         for key in _WB_BUDGET_ENERGY_SCORE_KEYS
         if key in energy_score
     }
+    control["d1_corridor_charge_w"] = budget.get("d1_corridor_charge_w", 0)
+    control["d1_corridor_residual"] = budget.get("d1_corridor_residual", {})
     control["schema_version"] = "wb_pv_budget_control_v2"
     control["diagnostic_surface"] = os.path.basename(WB_DIAGNOSTIC_F)
     control["ts"] = safe_int(budget.get("ts"), int(time.time()))
@@ -38925,6 +39055,7 @@ def write_safe_start_state(
         "ts": state_ts,
         "service": "storage_manager",
         "safe_start": True,
+        "corridor_now": storage_corridor_now({}, state_ts),
     }
     payload.update(build_display(payload))
     payload["storage_dispatch_runtime"] = build_runtime_overlay(
@@ -46721,6 +46852,22 @@ def execute_rscp_cycle(
     ownership: Optional[StorageManagerOwnership] = None,
 ) -> Dict[str, Any]:
     """Bindet Live-Readback, Soll und Ausgang in genau einem Managerzyklus."""
+    for direction, modes in (("charge", (MODE_CHRG, MODE_GRID)), ("discharge", (MODE_DISCH,))):
+        cap = payload.get("power_limit_" + direction + "_effective_w")
+        if type(cap) is int and cap > 0:
+            key = "max_" + direction + "_w"
+            if type(payload.get(key)) is int:
+                payload[key] = min(payload[key], cap)
+            if payload.get("mode") in modes:
+                payload["val"] = min(max(0, safe_int(payload.get("val"), 0)), cap)
+            auto = payload.get("auto_limit")
+            if isinstance(auto, dict) and type(auto.get(key)) is int:
+                auto[key] = min(auto[key], cap)
+    bind_limits = getattr(ctrl, "set_configured_power_limits", None)
+    charge_cap = payload.get("power_limit_charge_effective_w")
+    discharge_cap = payload.get("power_limit_discharge_effective_w")
+    if callable(bind_limits) and type(charge_cap) is int and type(discharge_cap) is int:
+        bind_limits(charge_cap, discharge_cap)
     payload_auto_limit = payload.get("auto_limit") if isinstance(payload.get("auto_limit"), dict) else {}
     ctrl.set_auto_discharge_cap(safe_int(payload.get("max_discharge_w"), 0))
     rscp_contract = rscp_command_contract(
@@ -47430,6 +47577,7 @@ def main() -> None:
                 cfg, live, read_json_file(WB_INTENT_F, max_age_s=90),
                 read_json_file(WB_NATIVE_F, max_age_s=90), previous_state, start,
             )
+            payload.update(power_limit_state(cfg, live, previous_state, now_s=start))
             payload["storage_regulation"] = dict(regulation_switch.status)
             payload["ha_writer_admission"] = ha_admission
             # Publish pending before the one release opportunity. A crash or
@@ -47442,6 +47590,7 @@ def main() -> None:
                     if (ctrl is not None and ownership.successor_confirmed and not _stop
                             and evaluate_writer_admission().get("allowed") is True
                             and read_storage_regulation_enabled(V4_CFG) is False):
+                        bind_configured_power_limits(ctrl, cfg, live, now_s=start)
                         receipt = ctrl.release_power_limits_explicit()
                         reason = ""
                 except Exception as exc:
@@ -47672,11 +47821,12 @@ def main() -> None:
                         and read_storage_regulation_enabled(V4_CFG) is True
                         and evaluate_writer_admission().get("allowed") is True
                     ):
+                        fallback_limits = bind_configured_power_limits(ctrl, cfg, live)
                         ctrl.send(
                             MODE_AUTO,
-                            max(0, safe_int(cfg.get("maximumladeleistung"), 12000)),
+                            fallback_limits["maximumladeleistung"],
                             force=True,
-                            discharge_cap_w=max(0, safe_int(cfg.get("maximaleentladeleistung"), 12000)),
+                            discharge_cap_w=fallback_limits["maximaleentladeleistung"],
                             auto_limit={},
                         )
                         log.error("Regelzyklus-Fallback: E3DC-AUTO-Freilauf ohne EMS-Grenzen gesendet")

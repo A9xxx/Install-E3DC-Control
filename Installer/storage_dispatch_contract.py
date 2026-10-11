@@ -548,6 +548,15 @@ def _parse_generated_ts_ms(value: Any, fallback_ms: int) -> int:
         return fallback_ms
 
 
+def _plan_generated_ts_ms(plan: Dict[str, Any], fallback_ms: int) -> int:
+    """Epochzeit hat Vorrang; alte Pläne behalten den bisherigen Zeitparser."""
+    for key in ("simulation_start_ts_ms", "generated_at_ts_ms"):
+        parsed = _to_ts_ms(plan.get(key))
+        if parsed and parsed > 0:
+            return parsed
+    return _parse_generated_ts_ms(plan.get("ts"), fallback_ms)
+
+
 def _utc_iso(ts_ms: int) -> str:
     value = dt.datetime.fromtimestamp(ts_ms / 1000.0, tz=dt.timezone.utc)
     return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -1042,7 +1051,7 @@ def _build_slot(
     )
     grid_w = total_load_w + charge_w - pv_w
     soc_end = _safe_float(row.get("soc"), previous_soc)
-    soc_start = previous_soc if previous_soc is not None else soc_end
+    soc_start = _safe_float(row.get("soc_start"), previous_soc if previous_soc is not None else soc_end)
     curves = curve_points or {}
     floor_soc = _curve_soc_at_points(curves["floor"], start_ms) if "floor" in curves else _curve_soc_at(plan.get("soc_min_curve") or [], start_ms)
     floor_source = "soc_min_curve" if floor_soc is not None else None
@@ -1059,6 +1068,13 @@ def _build_slot(
     )
     price = _price_contract(row, window)
     slot_hours = SLOT_DURATION_S / 3600.0
+    integration_start_ms = start_ms
+    if row.get("soc_start") is not None:
+        # Neue Zeilen bilanzieren ab dem Planzeitpunkt. Alte Pläne behalten
+        # ihre bisherige Slotkonvention und bleiben weiterhin lesbar.
+        generated_ms = _plan_generated_ts_ms(plan, start_ms)
+        integration_start_ms = min(end_ms, max(start_ms, generated_ms))
+        slot_hours = (end_ms - integration_start_ms) / 3600000.0
     import_w = max(0.0, grid_w)
     export_w = max(0.0, -grid_w)
     planned_charge_w = max(0.0, charge_w)
@@ -1247,6 +1263,9 @@ def _build_slot(
         "battery_w": round(charge_w, 3),
         "grid_w": round(grid_w, 3),
         "soc_pct": _round_or_none(soc_end, 3),
+        "soc_start_pct": _round_or_none(row.get("soc_start"), 3),
+        "simulation_start_ts_ms": integration_start_ms,
+        "simulation_duration_s": round(slot_hours * 3600.0, 3),
         "target_soc_pct": target_soc,
         "predump_candidate_w": round(predump_candidate_w, 3),
         "predump_executable_w": 0.0,
@@ -1310,6 +1329,8 @@ def _build_slot(
             if quantiles_available
             else "deterministic_point_without_quantile_claim"
         ),
+        "simulation_start_ts_ms": integration_start_ms,
+        "simulation_duration_s": round(slot_hours * 3600.0, 3),
         "soc_pct": {
             "start": _round_or_none(soc_start, 3),
             "end": _round_or_none(soc_end, 3),
@@ -7527,7 +7548,7 @@ def build_canonical_dispatch_plan(
     if not timeline:
         raise ValueError("canonical_plan_timeline_missing")
     first_ts_ms = _to_ts_ms(timeline[0].get("ts"))
-    generated_ms = _parse_generated_ts_ms(source.get("ts"), first_ts_ms)
+    generated_ms = _plan_generated_ts_ms(source, first_ts_ms)
     direct = source.get("direct_marketing") if isinstance(source.get("direct_marketing"), dict) else {}
     windows = direct.get("windows") if isinstance(direct.get("windows"), list) else []
     curves = {

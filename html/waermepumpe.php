@@ -1,4 +1,5 @@
 <?php
+require_once __DIR__ . '/heatpump_season.php';
 // waermepumpe.php - Optimierte Anzeige mit Wärmequelle und Soll-Werten
 
 if (!isset($base_path) || !isset($paths)) {
@@ -487,7 +488,7 @@ if (isset($_POST['toggle_auto_mode'])) {
         echo errorMessage(
             'Wärmepumpen-Automatik nicht gespeichert',
             'Die bestehende Konfiguration blieb unverändert; der Dienst wurde nicht neu gestartet. '
-            . 'Bitte führe im Installationscenter einmal „Rechte reparieren“ aus und versuche es erneut.'
+            . 'Im Installationscenter einmal „Rechte reparieren“ ausführen und erneut versuchen.'
         );
         exit;
     }
@@ -497,7 +498,7 @@ if (isset($_POST['toggle_auto_mode'])) {
         http_response_code(500);
         echo errorMessage(
             'Automatik gespeichert, Konfigurationscache nicht entfernt',
-            'Der Dienst wurde nicht neu gestartet. Bitte führe im Installationscenter „Rechte reparieren“ aus und starte den Dienst danach erneut.'
+            'Der Dienst wurde nicht neu gestartet. Im Installationscenter „Rechte reparieren“ ausführen und den Dienst danach erneut starten.'
         );
         exit;
     }
@@ -730,7 +731,7 @@ if (isset($_POST['toggle_hs_auto'])) {
                 ? 'Der Speichervorgang wurde vor dem Schreiben abgebrochen; die bestehende Konfiguration blieb unverändert. '
                 : 'Die Konfigurationsänderung konnte nicht sicher bestätigt werden. ')
             . 'Fehlercode: ' . $saveStatus . '. '
-            . 'Bitte führe im Installationscenter zuerst „Nur Rechte prüfen“ und bei einem bestätigten Rechtefehler „System reparieren“ aus.'
+            . 'Im Installationscenter zuerst „Nur Rechte prüfen“ und bei einem bestätigten Rechtefehler „System reparieren“ ausführen.'
         );
         exit;
     }
@@ -738,7 +739,7 @@ if (isset($_POST['toggle_hs_auto'])) {
         http_response_code(500);
         echo errorMessage(
             'Heizstab-Automatik gespeichert, Konfigurationscache nicht entfernt',
-            'Bitte führe im Installationscenter „Rechte reparieren“ aus und lade die Seite danach erneut.'
+            'Im Installationscenter „Rechte reparieren“ ausführen und die Seite danach erneut laden.'
         );
         exit;
     }
@@ -750,7 +751,9 @@ if (isset($_POST['toggle_hs_auto'])) {
 if (isset($_POST['hs_manual_full']) || isset($_POST['hs_manual_auto'])) {
     requireWebAuth(false);
     e3dcRequireCsrfToken(false);
-    if (isset($_POST['hs_manual_full'])) {
+    if (isset($_POST['hs_manual_full']) && !cfgBool($conf['auto_mode'] ?? '1', true)) {
+        $hsManualResult = ['success' => false, 'http_status' => 409, 'message' => 'Globale Automatik aus – Vollgas gesperrt.'];
+    } elseif (isset($_POST['hs_manual_full'])) {
         $ttlHours = 2;
         $payload = [
             'mode' => 'full',
@@ -773,7 +776,7 @@ if (isset($_POST['hs_manual_full']) || isset($_POST['hs_manual_auto'])) {
                 : 'Heizstab-Vollleistung wurde sicher beendet; die Automatik übernimmt.'
         );
     } else {
-        http_response_code(500);
+        http_response_code((int)($hsManualResult['http_status'] ?? 500));
         $hsManualMessage = errorMessage(
             'Heizstab-Anforderung nicht geändert',
             (string)($hsManualResult['message'] ?? 'Die Zustandsdatei konnte nicht sicher geändert werden.')
@@ -894,7 +897,7 @@ if ($isChargingOnly) {
             $hsMode      = $hsData['hs_mode'] ?? 'unknown';
             $hsReason    = $hsData['hs_reason'] ?? '--';
             $hsSurplus   = (int)($hsData['surplus_w'] ?? 0);
-            $hsSoc       = (float)($hsData['soc'] ?? 0);
+            $hsSoc       = isset($hsData['soc']) && is_numeric($hsData['soc']) ? (float)$hsData['soc'] : null;
             $hsAutoOn    = ($hsMode === 'pv_auto');
             $hsAutoConf  = array_key_exists('hs_auto_mode', $conf)
                 ? cfgBool($conf['hs_auto_mode'], false)
@@ -911,15 +914,35 @@ if ($isChargingOnly) {
                 <?= $hsManualMessage ?>
             <?php endif; ?>
 
+            <?php if (!empty($hsData['elwa_timeout_unconfirmed'])): ?>
+                <div class="alert alert-warning py-2 small">
+                    <?= htmlspecialchars((string)($hsData['elwa_timeout_warning'] ?? 'Gerätetimeout (Register 1004) nicht bestätigt – Heizstab läuft ohne geräteseitige Zeitgrenze'), ENT_QUOTES, 'UTF-8') ?>
+                </div>
+            <?php endif; ?>
+
             <?php if (!$hsServiceRunning): ?>
                 <div class="alert alert-warning py-2 small">
                     <i class="fas fa-exclamation-triangle me-2"></i>
                     <strong>e3dc-heizstab</strong> Dienst ist nicht aktiv.
                     Bitte deployen und: <code>sudo systemctl enable --now e3dc-heizstab</code>
                 </div>
+            <?php elseif (!$hsSuccess && is_array($hsData) &&
+                (trim((string)($hsData['hs_reason'] ?? '')) !== '' || trim((string)($hsData['error'] ?? '')) !== '')): ?>
+                <div class="alert alert-warning py-2 small">
+                    <i class="fas fa-exclamation-triangle me-2"></i>
+                    <?php if (!empty($hsData['modbus_offline']) && isset($hsData['elwa_next_retry_ts'])):
+                        $hsRetrySeconds = max(0, (int)ceil((float)$hsData['elwa_next_retry_ts'] - microtime(true))); ?>
+                        <?= htmlspecialchars('ELWA antwortet nicht – nächster Versuch in ' . $hsRetrySeconds . ' s', ENT_QUOTES, 'UTF-8') ?>
+                    <?php else: ?>
+                        <?= htmlspecialchars(trim((string)($hsData['hs_reason'] ?? '')) !== '' ? (string)$hsData['hs_reason'] : (string)($hsData['error'] ?? ''), ENT_QUOTES, 'UTF-8') ?>
+                    <?php endif; ?>
+                    <?php if (!empty($hsData['modbus_diagnostic'])): ?>
+                        <div><?= htmlspecialchars((string)$hsData['modbus_diagnostic'], ENT_QUOTES, 'UTF-8') ?></div>
+                    <?php endif; ?>
+                </div>
             <?php elseif (!$hsSuccess): ?>
                 <div class="alert alert-info py-2 small">
-                    <i class="fas fa-spinner fa-spin me-2"></i> Warte auf Daten vom heizstab_manager...
+                    <i class="fas fa-spinner fa-spin me-2"></i> Warte auf Daten vom Heizstab-Dienst…
                 </div>
             <?php else: ?>
 
@@ -957,7 +980,7 @@ if ($isChargingOnly) {
                     <div class="col text-center">
                         <div class="p-2 bg-body-tertiary rounded border h-100 d-flex flex-column justify-content-center">
                             <div class="small text-muted"><i class="fas fa-battery-half me-1"></i>Speicher</div>
-                            <div class="fw-bold"><?= number_format($hsSoc, 0) ?> %</div>
+                            <div class="fw-bold"><?= $hsSoc === null ? 'unbekannt' : number_format($hsSoc, 0) . ' %' ?></div>
                         </div>
                     </div>
                 </div>
@@ -1043,7 +1066,7 @@ if ($isChargingOnly) {
                             <?php endif; ?>
 
                             <?php if ($manualFullActive): ?>
-                                <span class="badge bg-warning text-dark"><i class="fas fa-bolt me-1"></i>Manuell Vollgas<?= $manualUntil ? ' bis ' . htmlspecialchars($manualUntil) : '' ?></span>
+                                <span class="badge bg-warning text-dark"><i class="fas fa-bolt me-1"></i><?= $hsMode === 'global_off' || !cfgBool($conf['auto_mode'] ?? '1', true) ? 'Handanforderung wird nicht ausgeführt' : 'Manuell Vollgas' ?><?= $manualUntil ? ' bis ' . htmlspecialchars($manualUntil) : '' ?></span>
                             <?php endif; ?>
 
                             <?php if (!empty($conf['shelly_heiz_ip']) && $conf['shelly_heiz_ip'] !== '0.0.0.0' && $shellyOn): ?>
@@ -1076,8 +1099,8 @@ if ($isChargingOnly) {
                     <div class="col-6">
                         <div class="p-2 bg-body-tertiary rounded border text-center">
                             <div class="small text-muted mb-1"><i class="fas fa-clock me-1"></i>Modbus-Timeout</div>
-                            <span class="badge bg-success opacity-75" title="Register 1004: Modbus-Timeout (sollte 60s sein)">
-                                60 s
+                            <span class="badge <?= !empty($hsData['elwa_timeout_unconfirmed']) ? 'bg-warning text-dark' : 'bg-success opacity-75' ?>" title="Register 1004: Modbus-Timeout">
+                                <?= !empty($hsData['elwa_timeout_unconfirmed']) ? 'nicht bestätigt' : '60 s' ?>
                             </span>
                         </div>
                     </div>
@@ -1104,6 +1127,10 @@ if ($isChargingOnly) {
                             <button type="submit" name="hs_manual_auto" value="1" class="btn btn-outline-info btn-sm w-100 fw-bold">
                                 <i class="fas fa-rotate-left me-1"></i> Vollgas aus / Auto
                             </button>
+                        <?php elseif ($hsMode === 'global_off' || !cfgBool($conf['auto_mode'] ?? '1', true)): ?>
+                            <span class="btn btn-secondary btn-sm w-100 disabled" aria-disabled="true">
+                                Globale Automatik aus – Vollgas gesperrt
+                            </span>
                         <?php else: ?>
                             <button type="submit" name="hs_manual_full" value="1" class="btn btn-outline-warning btn-sm w-100 fw-bold">
                                 <i class="fas fa-bolt me-1"></i> Vollgas 2h
@@ -1205,7 +1232,7 @@ if ($isChargingOnly) {
                     <form method="post">
                         <?= e3dcCsrfInput() ?>
                         <?php if ($autoMode == 1): ?>
-                            <button type="submit" name="toggle_auto_mode" value="0" class="btn btn-outline-success btn-sm h-100 fw-bold" title="PV Überschuss-Automatik abschalten">
+                            <button type="submit" name="toggle_auto_mode" value="0" class="btn btn-outline-success btn-sm h-100 fw-bold" title="Klick schaltet die Automatik sofort aus. Bei Luxtronik-Direktanbindung läuft ein gerade laufender Verdichter bei PV- und Tarif-Aufträgen zum Schutz der Wärmepumpe seine Mindestlaufzeit zu Ende.">
                                 <i class="fas fa-check-circle me-1"></i> AUTO
                             </button>
                         <?php else: ?>
@@ -1234,31 +1261,17 @@ if ($isChargingOnly) {
                             <div class="small text-muted">Außen <span class="fw-normal">(Ist/Mittel)</span></div>
                             <?php
                                 $a_ist = $data['Außentemperatur'] ?? ($data['Aussentemp'] ?? null);
-                                // Dieselben Quellen wie im Dashboard; ohne Heizgrenze keine Saison behaupten.
-                                $season_value = function ($keys) use ($data) {
-                                    foreach ($keys as $key) {
-                                        if (isset($data[$key]) && $data[$key] !== '' && $data[$key] !== '---') return $data[$key];
-                                    }
-                                    return null;
-                                };
-                                $a_mittel_raw = $season_value([
-                                    'Aussentemperatur_Mittel', 'Aussentemp_Mittel', 'Gemittelte Außentemperatur',
-                                    'Gemittelte Aussentemperatur', 'Mitteltemperatur', 'Außentemperatur_Mittel', 'Aussen_Mittel'
-                                ]);
-                                $season_raw = $a_mittel_raw ?? ($data['wp_season_temp'] ?? $a_ist);
-                                $a_mittel = is_numeric($season_raw) ? floatval($season_raw) : null;
-                                $hg_raw = $season_value(['Heizgrenze_Temperatur', 'Heizgrenze', 'Heizgrenze_Temp'])
-                                    ?? ($conf['heizgrenze_temp'] ?? null);
-                                $hg = is_numeric($hg_raw) ? floatval($hg_raw) : null;
-                                $ist_sommer = ($a_mittel !== null && $hg !== null && $a_mittel >= $hg);
-                                $ist_winter = ($a_mittel !== null && $hg !== null && $a_mittel < $hg);
+                                $seasonFields = e3dcWpSeason($data, $conf, e3dcWpSeasonDecision());
+                                $a_mittel_raw = $seasonFields['wp_season_temperature_source'] === 'mittel' ? $seasonFields['wp_season_temp'] : null;
+                                $ist_sommer = $seasonFields['wp_season'] === 'summer';
+                                $ist_winter = $seasonFields['wp_season'] === 'winter';
                             ?>
                             <div class="fw-bold"><?= fmtVal($a_ist, '°C') ?>
                                 <span class="text-muted small fw-normal">/ <?= fmtVal($a_mittel_raw, '°C') ?></span>
                                 <?php if ($ist_sommer): ?>
-                                    <span class="badge bg-warning text-dark border border-warning" style="font-size:0.55rem; vertical-align: middle;">SOMMER</span>
+                                    <span class="badge bg-warning text-dark border border-warning" style="font-size:0.55rem; vertical-align: middle;" title="<?= htmlspecialchars($seasonFields['wp_season_hint'], ENT_QUOTES, 'UTF-8') ?>">SOMMER</span>
                                 <?php elseif ($ist_winter): ?>
-                                    <span class="badge bg-info text-dark border border-info" style="font-size:0.55rem; vertical-align: middle;">WINTER</span>
+                                    <span class="badge bg-info text-dark border border-info" style="font-size:0.55rem; vertical-align: middle;" title="<?= htmlspecialchars($seasonFields['wp_season_hint'], ENT_QUOTES, 'UTF-8') ?>">WINTER</span>
                                 <?php endif; ?>
                             </div>
                         </div>

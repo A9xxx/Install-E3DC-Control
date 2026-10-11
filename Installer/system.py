@@ -24,6 +24,7 @@ PYTHON_PACKAGES = [
     "websocket-client",     # Luxtronik WebSocket (lux_live.py)
     "websockets",           # e3dc_websocket.py server
     "pymodbus",             # Modbus-TCP (energy_manager, idm_live)
+    "pyserial",             # pymodbus ab 3.16 braucht es schon beim Import
     "hyundai_kia_connect_api", # Bluelink / Fahrzeug SoC
     "pywebpush",            # Web-Push Notifications (braucht rustc/cargo!)
     "py3rijndael"           # RSCP AES Verschluesselung (rscp_client.py)

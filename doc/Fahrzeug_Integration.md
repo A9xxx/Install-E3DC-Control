@@ -12,7 +12,7 @@ erst dann, wenn er aus einer bestätigten Quelle kommt:
 
 - Wallbox/openWB/openWB Pro liefert den SoC selbst,
 - Bluelink oder MQTT liefert einen plausiblen Fahrzeug-SoC,
-- der Nutzer setzt den aktuellen SoC bewusst über **SoC setzen**.
+- der Nutzer trägt den aktuellen SoC bewusst im Feld **Start-SoC** ein und bestätigt mit **Setzen**.
 
 Unbestätigte Werte aus alten Sessions, gespeicherten Profilen oder der
 Einfachansicht werden nicht als Regelbasis übernommen und normalerweise als
@@ -122,18 +122,18 @@ Wenn du ein Fahrzeug von Hyundai oder Kia besitzt, bietet das System einen eigen
 
 **Einrichtung (Zugangsdaten hinterlegen):**
 1. Installiere den Dienst über den Installer-Menüpunkt **43 (Hyundai/Kia SoC-Abfrage (Bluelink))**; er richtet die Python-Abhängigkeit und den Dienst `e3dc-bluelink` ein. Im Installer werden keine Zugangsdaten abgefragt.
-2. Öffne im Web-Dashboard den **Config-Editor**, Gruppe **Fahrzeug Integration (Bluelink)**, und trage ein:
-   * `bluelink_user`: die E-Mail-Adresse deines Hyundai-/Kia-Kontos,
-   * `bluelink_password`: das Passwort des Kontos (Passwortfeld, wird lokal gespeichert),
-   * `bluelink_pin`: die PIN des Kontos – optional, nur Ziffern, nur wenn das Konto eine PIN verlangt,
-   * `bluelink_brand`: `hyundai` oder `kia`.
+2. Im Web-Dashboard den **Config-Editor** öffnen, in der Gruppe **Wallbox & Fahrzeug** den Abschnitt **Fahrzeug Integration (Bluelink)** aufrufen und eintragen:
+   * `bluelink_user` (Feld **Benutzer (E-Mail)**): die E-Mail-Adresse des Hyundai-/Kia-Kontos,
+   * `bluelink_password` (Feld **Passwort**): das Passwort des Kontos (Passwortfeld, wird lokal gespeichert),
+   * `bluelink_pin` (Feld **PIN**): die PIN des Kontos – optional, nur Ziffern, nur wenn das Konto eine PIN verlangt,
+   * `bluelink_brand` (Feld **Marke**): `hyundai` oder `kia`.
 3. Speichern. Der Dienst meldet sich beim nächsten Abruf an; die Anmeldung wird im Prozess gehalten und nur bei Ablauf erneuert, nicht bei jedem Intervall neu ausgeführt. Benutzer und Passwort sind beide erforderlich: Fehlt eines davon, meldet sich der Dienst nicht an und ruft keinen SoC ab; die Schaltfläche „Fahrzeug aufwecken“ wird nicht angeboten, und beim Anstecken an einer openWB Pro wird kein automatischer Abruf beauftragt. Unter Docker startet der Container den Dienst erst, wenn beide Angaben gesetzt sind; nach dem Speichern den Container einmal neu starten.
 
-Alternativ findest du dieselben Felder auf der Seite **Wallbox** in der Karte **Fahrzeug Cloud-Integration**.
+Alternativ stehen dieselben Felder auf der Seite **Wallbox** in der Karte **Fahrzeug Cloud-Integration (Auto SoC)** zur Verfügung.
 
 **Weitere Einstellungen:**
 * `bluelink_vin` (Fahrgestellnummer): eintragen, wenn mehrere Fahrzeuge im Konto sind, damit das richtige Fahrzeug verwendet wird.
-* `bluelink_interval` (Abfrage-Intervall in Minuten): Wir empfehlen **15 bis 30 Minuten**, um die 12V-Batterie des Autos nicht unnötig durch ständiges Aufwecken zu entladen und die Abfragelimits des Herstellers einzuhalten.
+* `bluelink_interval` (Abfrage-Intervall in Minuten, Standard 15, kleinster Wert 5): Empfohlen sind **15 bis 30 Minuten**, um die Abfragelimits des Herstellers einzuhalten und das Fahrzeug nicht unnötig zu belasten. Das reguläre Intervall ruft nur den zwischengespeicherten Fahrzeugstatus der Hersteller-Cloud ab und weckt das Auto nicht auf. Ein Aufwecken erfolgt nur auf Anforderung (Schaltfläche „Fahrzeug aufwecken“) oder automatisch beim Anstecken an einer openWB Pro.
 * `bluelink_car_name`: Anzeigename im Dashboard.
 
 **Wenn die Anmeldung fehlschlägt:**
@@ -158,9 +158,9 @@ Wenn du EVCC bereits nutzt, kann dieses System den Auto-SoC an E3DC-Control send
      broker: DEINE_E3DC_PI_IP:1883
      topic: evcc
    ```
-2. Öffne den **Config-Editor** im E3DC Web-Dashboard.
-3. Gehe zur Gruppe **Smart Home MQTT-Hub**.
-4. Trage bei `mqtt_hub_sub_soc_topic` das korrekte Topic deines Autos ein.
+2. Den **Config-Editor** im E3DC Web-Dashboard öffnen.
+3. In der Gruppe **Schnittstellen & MQTT** den Bereich **Fahrzeug-SoC per MQTT** aufrufen.
+4. Im Feld **SoC-Topic Fahrzeug 1** (`mqtt_hub_sub_soc_topic`) das korrekte Topic des Autos eintragen.
    *(Beispiel: `evcc/vehicles/db:4/soc` oder `evcc/loadpoints/1/vehicleSoc`)*
 
 Wichtig: `evcc/loadpoints/1/chargePower` ist die Ladeleistung der Wallbox und gehört in den Bereich **Wallbox-Leistung per MQTT** (`wb_topic`), nicht in das SoC-Feld.
@@ -173,7 +173,7 @@ Wenn dein Auto bereits in Home Assistant integriert ist, kannst du eine einfache
 **Einrichtung:**
 1. Erstelle in HA eine Automation, die bei Änderung des Auto-Sensors (`sensor.mein_auto_battery_level`) auslöst.
 2. Sende als Aktion den neuen Zustand (als Zahl) an ein frei wählbares MQTT-Topic (z.B. `e3dc/set/car_soc`).
-3. Trage genau dieses Topic in deinem E3DC Web-Dashboard im Config Editor unter `mqtt_hub_sub_soc_topic` ein.
+3. Genau dieses Topic im Config-Editor in der Gruppe **Schnittstellen & MQTT**, Bereich **Fahrzeug-SoC per MQTT**, im Feld **SoC-Topic Fahrzeug 1** (`mqtt_hub_sub_soc_topic`) eintragen.
 
 ---
 
@@ -182,9 +182,9 @@ Wenn dein Fahrzeug über keine App oder offene Cloud-Schnittstelle verfügt, kan
 
 **Einrichtung & Ablauf:**
 1. Wechsle im Dashboard-Menü auf **Wallbox**.
-2. Oben in **Fahrzeugzuordnung** wählst du pro Wallbox das passende Fahrzeug. Die Auswahl wird automatisch gespeichert; ein separater Button für die Zuordnung ist nicht mehr nötig.
-3. Bevor oder während du das Fahrzeug ansteckst, liest du den aktuellen Ladestand in Prozent (%) im Auto ab, wählst dein Fahrzeugprofil und trägst den SoC bei der passenden Wallbox ein. Klicke dann auf **SoC setzen**.
-4. **Magie:** Das Dashboard speichert diesen Wert. Der im Hintergrund laufende *Energy Manager* registriert, wie viel Energie (kWh) exakt in das Auto fließt, und **kalkuliert (interpoliert) den SoC in Echtzeit automatisch mit!**
+2. In der Karte **Fahrzeugzuordnung & Profile** auf der Seite **Wallbox** wird pro Wallbox im Feld **Fahrzeug** das passende Fahrzeug gewählt. Die Auswahl wird automatisch gespeichert; ein separater Button für die Zuordnung ist nicht nötig.
+3. Der aktuelle Ladestand wird vor oder während des Ansteckens in Prozent (%) im Auto abgelesen. In der Karte wird das Fahrzeugprofil gewählt und der Wert bei der passenden Wallbox im Feld **Start-SoC** eingetragen; **Setzen** speichert ihn.
+4. **Fortschreibung:** Das Dashboard speichert diesen Wert. Der im Hintergrund laufende *Wallbox Manager* zählt mit, wie viel Energie (kWh) in das Auto fließt, und **schreibt den SoC daraus automatisch fort**.
 5. Im Dashboard siehst du den errechneten SoC (inkl. 2 Nachkommastellen) mit dem Zusatz `(Manuell)` sowie die dynamische Restladezeit.
 6. **Aufgeräumte UI:** In der Fahrzeug-Detailansicht werden für diese manuell berechneten Autos automatisch alle irrelevaten Cloud-Werte (wie 12V Batterie, GPS Standort, Türen & Klappen) komplett ausgeblendet.
 
@@ -194,5 +194,5 @@ Wenn dein Fahrzeug über keine App oder offene Cloud-Schnittstelle verfügt, kan
 Das System ist für den Betrieb mehrerer Fahrzeuge optimiert. Wenn du z. B. zwei Fahrzeuge über MQTT (`mqtt_hub_sub_soc_topic` und `mqtt_hub_sub_soc_topic_2`) anbindest:
 *   **DUAL-WALLBOX UI:** Im Dashboard (Seitenleiste und Energiefluss-Diagramm) ordnet das System nun das erste angesteckte Fahrzeug optisch vollautomatisch der "Wallbox 1" zu und das zweite der "Wallbox 2" – perfekt für das Monitoring paralleler Ladevorgänge.
 *   **DASHBOARD-TABS:** Das System erkennt die verschiedenen Fahrzeuge (`bluelink_vin` oder MQTT-Topics) und erstellt automatisch für jedes Auto einen eigenen Reiter (Tab) in der Detailansicht.
-*   **WALLBOX-ZUORDNUNG:** Im Hauptmenüpunkt "Wallbox" kannst du oben in einer eigenen Karte exakt konfigurieren, welches Fahrzeug an Wallbox 1 oder 2 lädt. Die Auswahl wird sofort gespeichert und ist besonders wichtig für Wallboxen ohne eigene Fahrzeugerkennung.
-*   **AUTOMATISCHE PLANUNG:** Änderungen am Ladeziel, die du direkt in der App deines Autos machst, werden vom System zeitnah erkannt und lokal synchronisiert.
+*   **WALLBOX-ZUORDNUNG:** Im Hauptmenüpunkt "Wallbox" lässt sich in der Karte **Fahrzeugzuordnung & Profile** exakt festlegen, welches Fahrzeug an Wallbox 1 oder 2 lädt. Die Auswahl wird sofort gespeichert und ist besonders wichtig für Wallboxen ohne eigene Fahrzeugerkennung.
+*   **LADELIMIT DES FAHRZEUGS:** Das im Fahrzeug eingestellte Ladelimit liest das System bei jedem Cloud-Abruf aus. Es verändert das Ladeziel der Wallbox nicht automatisch: Die Wallbox-Regelung folgt dem Ladeziel der Wallbox (Feld **Ziel %** in der Karte **Fahrzeugzuordnung & Profile**, `wb1_target_soc` bzw. `wb2_target_soc`). Für die berechnete Restladezeit gilt der kleinere der beiden Werte. Beim Auswählen eines Fahrzeugs wird **Ziel %** mit dessen Ziel-SoC vorbelegt.

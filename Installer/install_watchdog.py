@@ -188,7 +188,7 @@ def detect_default_gateway():
     return ""
 
 def get_current_config():
-    """Liest bestehende Konfiguration aus boot_notify.sh aus."""
+    """Liest Telegram-Vorhandensein aus der Konfiguration und Routerdaten aus dem Wächter."""
     config = {
         "TOKEN": "",
         "CHAT_ID": "",
@@ -196,18 +196,16 @@ def get_current_config():
         "ROUTER_IP": detect_default_gateway(),
         "MONITOR_FILE": ""
     }
-    if os.path.exists(NOTIFY_PATH):
-        try:
-            with open(NOTIFY_PATH, "r") as f:
-                content = f.read()
-                t = re.search(r'TOKEN="([^"]*)"', content)
-                c = re.search(r'CHAT_ID="([^"]*)"', content)
-                d = re.search(r'DEVICE_NAME="([^"]*)"', content)
-                if t: config["TOKEN"] = t.group(1)
-                if c: config["CHAT_ID"] = c.group(1)
-                if d: config["DEVICE_NAME"] = d.group(1)
-        except Exception:
-            pass
+    try:
+        from .installer_config import WEB_CONFIG_FILE
+        with open(WEB_CONFIG_FILE, "r", encoding="utf-8") as handle:
+            stored = json.load(handle)
+        if isinstance(stored, dict):
+            config["TOKEN"] = bool(str(stored.get("telegram_token") or "").strip())
+            config["CHAT_ID"] = bool(str(stored.get("telegram_chat_id") or "").strip())
+            config["DEVICE_NAME"] = str(stored.get("telegram_device_name") or "E3DC-Control")
+    except (OSError, ValueError):
+        pass
 
     if os.path.exists(GUARD_PATH):
         try:
@@ -2195,16 +2193,16 @@ def setup_watchdog_menu():
     except Exception as exc:
         print(f"Watchdog-Installation sicher abgebrochen: {exc}")
         return False
-    print("\n=== PV-Wächter & Telegram Setup ===")
+    print("\n=== PV-Wächter (Watchdog) einrichten / reparieren ===")
     current = get_current_config()
     is_installed = os.path.exists(NOTIFY_PATH)
     if is_installed:
         print("✓ Watchdog ist bereits installiert.")
         print(f"  Aktueller Name: {current['DEVICE_NAME']}")
         print(f"  Router-IP: {current['ROUTER_IP']}")
-        print(f"  Telegram: {'Aktiv' if current['TOKEN'] else 'Inaktiv'}")
+        print(f"  Telegram: {'Aktiv' if current['TOKEN'] and current['CHAT_ID'] else 'Inaktiv'}")
         print("\n1. Komplett neu installieren / reparieren")
-        print("2. Router-IP ändern")
+        print("2. Router-IP ändern und Notifier-/Watchdog-Bundle neu installieren")
         print("3. Abbrechen")
         choice = input("Auswahl: ").strip()
         if choice == "3":
@@ -2270,4 +2268,4 @@ if __name__ == "__main__":
     setup_watchdog_menu()
 
 
-register_command("15", "Watchdog & Telegram konfigurieren", setup_watchdog_menu, sort_order=150)
+register_command("15", "PV-Wächter (Watchdog) einrichten / reparieren", setup_watchdog_menu, sort_order=150)

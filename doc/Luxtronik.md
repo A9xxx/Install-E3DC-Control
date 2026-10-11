@@ -28,7 +28,7 @@ Dieses Modul erweitert **E3DC-Control** um eine intelligente Steuerung für Wär
 ### PV-Boost nach einem Update
 
 Für den automatischen Luxtronik-PV-Boost (`wp_type=0`) gibt es zwei
-Betriebsarten. **Messwertgeführt mit Wh-Wächtern** verwendet eine plausible
+Betriebsarten. **Messwertgeführt mit Wh-Kontingenten** verwendet eine plausible
 Startleistung und danach die gemessene Aufnahme. **Vollständige
 Vorreservierung** erhält die bisherige strenge Energiezusage. Bestehende
 Konfigurationen bleiben beim Update in ihrer bisherigen Betriebsart. Der
@@ -68,7 +68,107 @@ PV-Deckung bestätigt, stehen die Sollwerte (Winter Heizung und Warmwasser, Somm
 Warmwasser), bis die PV-Deckung länger als `wp_pv_boost_release_s` fehlt oder
 eine Schutzfunktion greift; im reservierten Betrieb startet ihn ein thermischer
 Bedarf nach Anlagenhysterese. Die Luxtronik regelt Verdichterstart und -stopp
-intern; E3DC-Control greift nicht mehr ein.
+intern; E3DC-Control hält das Angebot bis zu den unten beschriebenen Rücknahmebedingungen.
+
+Im Luxtronik-Messwertbetrieb bleibt der PV-Sollwert auch nach Erreichen des
+Ziels stehen, solange die PV-Voraussetzungen erfüllt sind. Die Wärmepumpe
+stoppt ihren Verdichter selbst. Eine beim Lauf vorgemerkte fehlende Deckung
+wird beim Verdichterstopp erneut geprüft; das 24-Stunden-Konto bleibt erhalten.
+Kurze Anforderungsunterbrechungen ohne anderen Kanalbesitzer werden 45 Sekunden
+entprellt. Besitzerwechsel, Nutzer-Aus und benannte Schutzfunktionen bleiben wirksam.
+
+Für das Netzende zählt nur der gemessene WP-Netzanteil, höchstens der Netzbezug
+abzüglich 200 W. Lückenbuchungen, Neustartintervalle, unsichere Uhr und alte
+Buchungen ohne Messherkunft schließen nur die Brücke; sie beenden keinen Auftrag.
+Bei kurzen Quellenlücken begrenzen gültige WP- und Bilanzmessungen die Buchung.
+Bei Neustart oder langer Lücke bleibt die konservative Buchung erhalten.
+Die WP-Leistung zählt in der Bilanz genau einmal. Ein erschöpftes Akku-
+Wh-Kontingent sperrt die Akkubrücke, beendet den Boost aber nicht selbst.
+Ein verbrauchtes positives Netz-Wh-Kontingent merkt bei weiterem echten
+WP-Netzbezug die Rücknahme vor.
+
+**Im Messwertbetrieb schützt die Mindestlaufzeit den Verdichter beim Ende
+des Wh-Kontingents und auch bei gesperrter Unterstützung aus Netz oder Akku
+(0 W oder 0 Wh).** Das positive Netzkontingent beendet frühestens nach dieser
+Laufzeit und der zehnminütigen Haltezeit des Sollwerts. Das ist keine pauschale
+Zusage für alle Abschaltpfade. Inselbetrieb, Hausanschlussgrenze, Gerätefehler und die SoC-Sicherheitsabschaltung
+wirken sofort. Der Netzstopp verlangt 30 Sekunden zusammenhängend frischen
+WP-Netzanteil über 2.500 W, begrenzt auf min(WP-Leistung, Netzbezug minus 200 W). Ohne frische WP-Einzelmessung (fehlend, ungültig oder älter als 45 Sekunden) zählt der gesamte Netzbezug abzüglich 200 W. Die Frist beträgt auch dann 30 Sekunden zusammenhängend mit frischen Netzwerten; ein Wechsel der Messgrundlage beginnt sie neu. Nutzer-Aus
+und Notstromreserve nehmen den PV-Auftrag zurück; ein laufender Verdichter
+beendet seine Mindestlaufzeit, für Heizung und Warmwasser gleich. An der
+Notstromreserve sperrt der Speicher die Entladung; die Restlaufzeit kommt aus
+dem Netz. Die SoC-Sicherheitsabschaltung gilt auch bei Preis- und Negativpreis-Boosts. Tarif-Aufträge
+mit aktivem Tarif-Halt behalten die Mindestlaufzeit. Der Speicherregler muss dazu
+im aktuellen Zyklus nachweislich die Entladung um die gemessene WP-Leistung
+begrenzen. Bei fehlendem oder veraltetem Beleg und bei Vorrang der
+Lastspitzenkappung wirkt der SoC-Schutz sofort.
+
+Nutzer-Aus nimmt auch Tarif-Aufträge zurück. Bei Luxtronik-Direktanbindung
+behält ein laufender Verdichter für Warmwasser und Heizung seine Mindestlaufzeit,
+auch nach dem durch „AUTO AUS“ ausgelösten Dienstneustart. Fehlt der aktuelle
+Gerätestatus oder die Verdichterbeobachtung, bleibt der Mindestlaufhalt für
+PV- und Tarif-Aufträge höchstens 60 Sekunden ab der letzten gültigen Beobachtung
+bestehen. Wiederholte Abfragen verlängern die Frist nicht; eine neue gültige Probe
+erneuert den Beleg. Danach wird der Auftrag zurückgenommen. Gerätefehler,
+EVU-Sperre, Inselbetrieb, Hausanschlussgrenze und Uhrfehler wirken weiterhin sofort.
+
+
+Bei Netzbezug wartet die WP auf eine von E3DC-Control abschaltbare Wallbox,
+während diese am Mindeststrom lädt oder einen Phasenwechsel bzw. Stopp bestätigt.
+Das gilt unabhängig von der Verbraucherrangfolge, auch bei Netzunterstützung auf 0.
+Ein gesperrter Akkuanteil wird dadurch nicht freigegeben. Die Wolkenfrist der WP ruht
+während dieses Wartens. Ein fehlender Beleg wird höchstens 60 Sekunden überbrückt;
+ein bestätigter Ladestopp beendet das Warten mit der nächsten frischen Statusprobe.
+Die Frist folgt dem Fortschritt des Wallbox-Netzkontos, endet aber spätestens
+nach 30 Minuten je Ladevorgang, vom Beginn bis zum belegten Ladeende.
+Nur ein belegtes Ladeende erlaubt eine neue Frist desselben Ladepunkts. Ein Phasenwechsel oder ein neuer WP-Auftrag setzt
+die Frist nicht zurück. Zwei Ladepunkte werden getrennt verfolgt.
+Die Wallbox-Schwelle ist auf höchstens 40 Wh begrenzt. Für ihr Netzkonto gelten
+die eingestellte Netzbezugstoleranz und die laufende Verringerung des Kontostands
+(Standard: 200 W Toleranz und Verringerung entsprechend 80 W). Während des
+belegten Wallbox-Mindesthalts zählt auch die WP erst oberhalb ihrer Summe,
+standardmäßig 280 W, mindestens jedoch 200 W. Kleiner Netzbezug darunter wird
+auch bei einer Netzunterstützung von 0 W/0 Wh nicht gezählt.
+Ohne diesen Mindesthalt gilt für die WP weiterhin das 200-W-Band.
+Als Ladung gilt eine Wallbox-Aufnahme über 200 W, unabhängig von der Netztoleranz.
+Wallboxen mit eigener Ladeentscheidung (etwa openWB als Hauptregler) sowie
+Sofort-, Netz- und Preisladung begründen kein
+Warten; Standby zählt nicht als Ladung. Die WP zählt ihren zugeordneten Anteil
+währenddessen weiter. Fehlt eine Einzelmessung, entsteht kein gemessenes
+Netzende; ohne gültigen Wallbox-Beleg gelten Bilanz und normale Wolkenfrist.
+
+Bei Luxtronik im Messwertbetrieb kann der PV-Boost eine bereits laufende
+Warmwasserbereitung übernehmen und ihr Ziel anheben. Voraussetzung sind eine
+frische Verdichterbeobachtung im Betriebszustand Warmwasser, gemessener
+Netzbezug höchstens 200 W und keine Akkuentladung. Das Startbudget ist
+Einspeisung plus aktuelle gemessene WP-Leistung, genau einmal gezählt.
+Da kein neuer Verdichterstart erfolgt, gelten für diese Übernahme weder
+Startpuffer noch Wiedereinschaltsperre. Danach gelten Mindestlaufzeit,
+Wallbox-Vorrang beim Netzende und das gemessene Netzkonto unverändert.
+Bei Heizbetrieb oder fehlenden frischen Daten gilt die normale Startprüfung.
+Eine unterbrochene oder veraltete Messreihe setzt die 30-s-Netzfrist zurück;
+fehlende Werte werden nicht als 0 W verwendet.
+
+Ein verbrauchtes gemessenes Netzkontingent ist keine Tagesobergrenze und keine
+Startsperre. Ein neuer PV-Start braucht dann zusätzlich 500 W Überschuss zum
+normalen Startpuffer von 500 W: bei 3.500 W Startleistung also mindestens 4.500 W.
+Das verlangt mehr PV-Deckung, reserviert aber keine zusätzliche Last. Ein
+erneuter selbstständiger Start der Wärmepumpe bei weiter stehendem PV-Sollwert
+erhält die volle Mindestlaufzeit. Bei 2 kW und 30 Minuten können so je Lauf bis
+zu 1 kWh zusätzlicher Netzbezug entstehen.
+Preis- und Prognosepausen warten bei einem PV-gedeckten Boost bis zum Auftragsende;
+ihr eigenes Ende nimmt den PV-Sollwert nicht zurück. Wird im Pausenzyklus ein
+WP-Netzanteil oberhalb der Zählschwelle gemessen, endet der Boost nach seiner
+Mindestlaufzeit.
+Positive Anforderungen wie Warmwasser sofort, manueller Boost, Preis-Boost und
+Pre-Dump behalten ihren Vorrang.
+
+Kanäle und Ziele bleiben an den laufenden Auftrag gebunden. Ein Saisonwechsel
+und geänderte PV-Ziele gelten ab dem nächsten Auftrag; zum Beenden die Automatik ausschalten. Ein laufender Verdichter beendet
+zum Schutz der Wärmepumpe noch seine Mindestlaufzeit, auch beim Dienstneustart. Ein Komfort-Timer mit mindestens dem PV-WW-Ziel
+übernimmt den WW-Kanal mit einer Sollwertschreibung. In der Historie stehen
+Rücknahmegrund, gemessene und nicht gemessene Wh, der gezählte Netzanteil,
+das Band, „Wallbox im Netzhalt“ und „Mindestlaufzeit schützt den Verdichter“.
 
 ### Warmwasser sofort (Nutzerbefehl)
 
@@ -166,11 +266,13 @@ Schutzentzug zurückgenommen (Grund `invalid_control_data`, danach gilt die
 Wiedereinschaltsperre). Nach einem Neustart des Energy Managers oder dem Ende
 eines Standbys als HA-Slave gilt die Frist erst wieder, wenn einmal gültige
 Daten vorlagen; ein Neustart mitten in einer Lücke verlängert sie nicht.
-Sofort wirken weiterhin: „Automatik darf steuern“ aus, Hardware- und
-Quellenschutz, eine gestörte Uhr und fehlende oder veraltete Statusdaten der
-Luxtronik selbst; für sie gilt keine Frist. Die unabhängige
+Nutzer-Aus und Notstromreserve nehmen den PV-Auftrag zurück; der laufende
+Verdichter behält seine Mindestlaufzeit. Eine gesperrte Quelle verhindert
+weitere Unterstützung. Inselbetrieb, Hausanschlussgrenze, Gerätefehler, eine
+gestörte Uhr und fehlende oder veraltete Luxtronik-Statusdaten wirken sofort. Die unabhängige
 Sicherheitsabschaltung (Ladestand unter `min_soc` minus 5 Prozentpunkte oder
-mehr als 2.500 W Netzbezug) greift sofort, sobald gültige Daten sie belegen;
+30 Sekunden zusammenhängend frischer WP-Netzanteil (ohne frische WP-Einzelmessung: gesamter Netzbezug abzüglich 200 W) über 2.500 W) greift,
+sobald gültige Daten sie belegen; der SoC-Teil wirkt sofort;
 ein fehlender Ladestand zählt nicht als 0 %. Die Fehlermeldung im Protokoll nennt den Grund: Datei fehlt, Alter in
 Sekunden oder ungültiger Vertrag.
 
@@ -255,7 +357,7 @@ Die Bearbeitung erfolgt am einfachsten über das **Web-Interface** (Config Edito
 ### PV-Automatik und Überbrückung
 
 Für die normale Einrichtung genügt die Wahl **Messwertgeführt mit
-Wh-Wächtern**. Danach die erlaubten Quellen auswählen und eine
+Wh-Kontingenten**. Danach die erlaubten Quellen auswählen und eine
 **Voreinstellung übernehmen**. Die Vorschau nennt vorab alle vier Werte,
 die übernommen werden. Erst das Speichern aktiviert die Änderungen.
 Das Öffnen der Seite, ein Betriebsartwechsel oder die Auswahl einer
@@ -284,7 +386,7 @@ Vorreservierung bei.
 
 | Parameter | Bedeutung | Standard |
 | :--- | :--- | :--- |
-| `wp_pv_control_mode` | `measured`: Istaufnahme und Wh-Wächter; `reserved`: vollständige Vorreservierung. | `reserved` |
+| `wp_pv_control_mode` | `measured`: Istaufnahme und Wh-Kontingente; `reserved`: vollständige Vorreservierung. | `reserved` |
 | `wp_pv_start_power_w` | Erwartete elektrische Startleistung. `0` übernimmt den Betrag von `grid_start_limit`, ersatzweise 3.500 W; ein positiver Profilwert begrenzt den Startwert. | `0` |
 | `wp_pv_max_power_w` | Elektrischer Profilwert innerhalb der WP-Messgrenze. Im Messwertbetrieb optional; `0` bedeutet unbekannt. Bei Vorreservierung ist ein belegter Maximalwert erforderlich. | `0` |
 | `wp_pv_battery_max_w` | Erlaubte Akku-Überbrückungsleistung in W. `0` sperrt diese Quelle. | `0` |
@@ -319,7 +421,7 @@ Start auf genügend freie Leistung; auch während des Betriebs kann weniger
 Restleistung für die Wallbox verfügbar sein. Der Regler ändert dafür keine
 permanenten E3DC-Leistungseinstellungen.
 
-#### Messwertgeführt mit Wh-Wächtern
+#### Messwertgeführt mit Wh-Kontingenten
 
 Vor dem Start muss ausreichend Überschuss für den Startwert qualifiziert
 sein. Eine ausgeschaltete WP mit 0 W Aufnahme begründet keinen kostenlosen
@@ -349,16 +451,22 @@ PV-Ausfall über die gesamte Mindestlaufzeit aus Akku und Netz zu versorgen.
 Nach dem bestätigten Start bestimmt die tatsächliche Aufnahme das laufende
 Budget. Beispielsweise verbleiben bei 2.000 W verfügbarer Leistung und
 1.500 W WP-Aufnahme 500 W für nachrangige Verbraucher, soweit Quellenreaktion
-und übrige Schutzgrenzen dies erlauben. Die Wh-Wächter zählen nur die
-zugeordnete tatsächliche Akku- und Netzüberbrückung: 300 W für zehn Minuten
-sind 50 Wh. Erwartete Leistung wird nicht als gemessener Verbrauch gebucht.
+und übrige Schutzgrenzen dies erlauben. Die Wh-Kontingente führen die
+zugeordnete Akku- und Netzüberbrückung sowie gesondert erkennbare konservative
+Lückenbuchungen: 300 W für zehn Minuten sind 50 Wh. Der zusätzliche gemessene
+Anteil enthält nur belegte Entnahme; erwartete Leistung ist kein Messwert.
 
-Erreicht ein positiver Wh-Wächter sein Kontingent, wird das Ende des
-zusätzlichen Boosts vorgemerkt. Während der bestätigten Mindestlaufzeit
-bleibt die erlaubte Überbrückung bestehen; Verbrauch und Überschreitung
-werden weitergezählt. Anschließend wird die PV-Anhebung zurückgenommen.
-Nutzer-Aus, eine gesperrte Quelle (`0 W` oder `0 Wh`) sowie harte Geräte-,
-Reserve-, Daten- und Leistungsgrenzen haben Vorrang. Ein fehlender bestätigter
+Im Messwertbetrieb schließt ein verbrauchtes Wh-Kontingent die betreffende
+Brücke. Nur gemessener, weiter bestehender WP-Netzbezug kann bei verbrauchtem
+positivem Netzkontingent das Ende nach Mindestlaufzeit und zehn Minuten Sollwerthalt auslösen;
+das Akkukonto beendet nichts. Bei PV-Deckung bleibt das Sollwertangebot stehen.
+Im Reservierungsbetrieb bleibt das bisherige Verhalten erhalten: Erreicht ein
+positives Wh-Kontingent seine Grenze, wird das Boost-Ende vorgemerkt und nach
+der geschützten Laufzeit ausgeführt. Die Wärmepumpe darf ihren Takt selbst beenden.
+Eine gesperrte Quelle (`0 W` oder `0 Wh`) erlaubt keine Unterstützung; ein
+laufender Verdichter behält im Messwertbetrieb trotzdem seinen Mindestlaufhalt.
+Die bestehenden Nutzer-, Geräte-, Reserve-, Daten- und Leistungsgrenzen bleiben
+unverändert. Insbesondere bleibt der entprellte Netzstopp über 2.500 W WP-Netzanteil (ohne frische WP-Einzelmessung: gesamter Netzbezug abzüglich 200 W) unabhängig. Ein fehlender bestätigter
 Verdichterstart begründet keine unbegrenzte Verlängerung der Energiezusage.
 
 Kommt nach einer Wolke ausreichend Überschuss zurück, kann eine allein
@@ -388,7 +496,7 @@ Nach einer Eingabeänderung wird die bisherige Aussage als noch nicht
 aktualisiert gekennzeichnet. Nach dem Speichern die erneute Prüfung durch
 die laufende Regelung abwarten und die Seite neu laden.
 
-Im Messwertbetrieb ergänzt ein beim Laden frischer Wächterstand den
+Im Messwertbetrieb ergänzt ein beim Laden frischer Stand der Wh-Kontingente den
 Verbrauch, das Restkontingent, einen möglichen Überlauf und die verbleibende
 Verdichterschutzzeit. Ohne frische, gültige Daten erscheinen keine erfundenen
 Nullwerte. Für einen neuen Stand die Seite neu laden.
@@ -432,7 +540,7 @@ Das Skript läuft als Systemd-Service (`energy_manager`) im Hintergrund.
     *   Bei WP-Vorrang erhält nutzbarer Wärmebedarf zuerst eine abgesicherte Freigabe; der Sollwert wartet nicht auf die Wallbox-Absenkung. Die Wallbox nutzt den tatsächlich nicht angenommenen Rest und passt ihren Ladestrom an. Führt die Wallbox den Speicherausgang (Ladegrenze), wird die Quellenbindung der WP als Entladegrenze in diesen Rahmen gelegt statt ihn durch einen IDLE-Ausgang zu verdrängen.
     *   Bei Wallbox-Vorrang beginnen neue optionale WP-Starts aus dem verbleibenden Rahmen. Ein bereits geschützter Verdichter behält seine gebundene Deckung.
     *   Fällt der Überschuss weg, tragen erlaubte Akku-/Netzquellen den geschützten Übergang. Die Rücknahme wartet auf das Ende der Mindestlaufzeit und der noch wirksamen Signalhaltezeit.
-    *   Nur benannte Schutzfunktionen, etwa Nutzer-Aus, Gerätestörung, Notstromreserve, Hausanschlussgrenze oder eine harte Quellenenergiegrenze, dürfen die Schutzzeit verkürzen. Gewöhnlicher Netzbezug, ein Budgetwechsel oder eine wirtschaftliche Priorität sind kein solcher Schutzfall.
+    *   Wh-Kontingentende und Unterstützung auf 0 beenden im Messwertbetrieb erst nach der Mindestlaufzeit. Nutzer-Aus und Notstromreserve nehmen den Auftrag zurück, während die Mindestlaufzeit zu Ende läuft. Inselbetrieb, Hausanschlussgrenze, Gerätefehler und SoC-Sicherheitsabschaltung bleiben sofort wirksam. Der Netzstopp verlangt 30 Sekunden zusammenhängend frischen WP-Netzanteil (ohne frische WP-Einzelmessung: gesamter Netzbezug abzüglich 200 W) über 2.500 W (siehe „Messwertgeführter PV-Boost“).
 
 Heizung und Warmwasser teilen sich denselben Verdichter und werden elektrisch
 nur einmal bilanziert. Ein zulässiges normales Warmwasser-Zeitfenster benötigt
@@ -565,6 +673,24 @@ können die Pause vorzeitig beenden. Danach verhindert eine
 Wiedereinschaltsperre, dass dieselbe Prognosekante sofort eine neue Pause
 startet.
 
+Im Messwertbetrieb endet eine Quell-Erholung, wenn der vorhandene PV-Vertrag
+die WP-Startleistung samt Startreserve über die normale Qualifizierungszeit
+deckt und die gültige Prognose genug Energie für Speicherziel und Wärme meldet.
+Die Freigabe nennt die Prognoseepisode im Entscheidungsdatensatz. Solange
+diese Deckung besteht, beginnt für dieselbe Episode keine neue Pause; fällt
+sie weg, gilt die bestehende Abkühlzeit vor einer erneuten Pause. Änderungen
+der Prognosehöhe oder des Spitzenzeitpunkts beginnen bei durchgängiger
+gültiger Deckung keine neue Qualifizierung. Ein einzelnes Messbild entzieht
+einen bestehenden PV-Auftrag nicht: Quell-Erholung nutzt die vorhandene
+zeitliche Rücknahmebestätigung. Schutzfälle und Nutzer-Aus wirken sofort.
+
+Ohne gültige Prognose oder ausreichenden gemessenen PV-Rahmen bleibt die
+bisherige Pausenregel bestehen. Geplante Netz-, Preis-, Tarif- und
+Pre-Dump-Fenster sowie „Warmwasser sofort“ behalten ihre bisherigen Regeln.
+Nutzer-Aus, Notstrom, harter Quellenschutz, Verdichter-Mindestlaufzeit und
+Wiedereinschaltsperre haben weiter Vorrang. Die WP-Leistung ist im
+Vertragsrahmen bereits berücksichtigt und wird nicht ein zweites Mal abgezogen.
+
 Bei Luxtronik wird diese Pause als `Mode 1 = Setpoint` mit einem abgesenkten,
 konfigurierbaren Rücklauf-Sollwert umgesetzt. `Mode 0` beendet nur die externe
 SHI-Beeinflussung und übergibt die Entscheidung wieder an die interne
@@ -597,17 +723,25 @@ Die Dateien befinden sich unter `$E3DC_INSTALL_PATH/Installer/luxtronik/`:
 *   `energy_manager.py`: Das Haupt-Steuerungsskript (Python).
 *   `luxtronik.py`: Hilfsdatei für die Modbus-Kommunikation.
 *   `set_manual_boost.py`: Skript für manuelle Web-Befehle.
+*   `lux_live.py`: Live-Modul (Dienst `e3dc-lux-live`), liest die Livewerte ohne Schaltlogik.
+
+Die gemeinsamen Wärmepumpen-Module liegen unter `$E3DC_INSTALL_PATH/Installer/`:
+*   `heatpump_em_dispatch.py`: ein gemeinsamer Ausgang des Energy Managers für beide SHI-Kanäle.
+*   `heatpump_channel_owner.py`: Auftrag und Rücknahme je SHI-Kanal.
+*   `heatpump_pv_contract.py` und `heatpump_pv_state.py`: PV-Wärmevertrag und WP-Energiekonto, ohne eigenen Hardwareausgang.
 
 Temporäre Daten (für das Web-Interface) liegen in der RAM-Disk:
 *   `/var/www/html/ramdisk/luxtronik.json`: Aktueller Status (JSON).
+*   `/var/www/html/ramdisk/waermepumpe.json`: Betriebsstatus der Wärmepumpe für die WebUI.
 *   `/var/www/html/ramdisk/manual_boost.flag`: Marker für manuellen Boost.
+*   `/var/www/html/ramdisk/manual_ww_boost.flag`: Marker für „Warmwasser sofort“.
 
 ---
 
 ## 7. Troubleshooting
 
 ### Dienst läuft nicht?
-Prüfe den Status über den Installer (Menüpunkt 21) oder direkt:
+Status über den Installer (Hauptmenü 2) Systemstatus anzeigen) oder direkt prüfen:
 ```bash
 sudo systemctl status energy_manager
 ```
@@ -826,3 +960,9 @@ Ein Neustart erteilt ohne erneut gültige Belege keine Freigabe.
 
 Die Außentemperaturgrenze betrifft ausschließlich HZ-Boost-Angebote.
 PV-, Preis- und Hochpreis-Pausen mit abgesenktem Sollwert bleiben davon unberührt.
+
+### Saisonanzeige
+
+Sommer, wenn der Mittelwert über der Heizgrenze liegt; bei Gleichstand Winter.
+Dashboard, Wärmepumpenseite und Vorschau zeigen vorrangig die Saisonentscheidung des Energy Managers mit den dazugehörigen Temperaturen, etwa „gemittelt 15,0 °C, Heizgrenze 15 °C“.
+Ist die Entscheidung älter als 15 Minuten oder ungültig, berechnet die Anzeige die Saison mit derselben Regel aus den Wärmepumpendaten und der konfigurierten Heizgrenze. Der Mittelwert hat Vorrang; fehlt er, wird der vorhandene Momentanwert verwendet und als „Außen“ bezeichnet. Ohne gültige Temperatur oder Heizgrenze bleibt das Saisonabzeichen ausgeblendet. Die Regelung bleibt unverändert.

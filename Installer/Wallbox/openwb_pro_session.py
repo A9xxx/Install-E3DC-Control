@@ -2952,6 +2952,8 @@ def vehicle_offer_hold_contract(
     start_offer_age_s: Any = None,
     start_grace_s: Any = 0.0,
     window_active: bool = False,
+    source_budget_ready: bool = False,
+    source_budget_tolerance_active: bool = False,
 ) -> Dict[str, Any]:
     """Hält ein Mindestangebot ohne Abnahme statt eines vorübergehenden 0 A.
 
@@ -2971,7 +2973,9 @@ def vehicle_offer_hold_contract(
     Bestätigung brach ab, und das nächste Neuangebot ließ das Fahrzeug gegen
     den Nutzerstopp wieder anlaufen.
 
-    Ein Angebot an ein nicht ziehendes Fahrzeug kostet nichts. Solange in
+    Auch ein ruhendes Fahrzeug kann das Angebot selbst wieder annehmen. Nur
+    ausreichendes Quellenbudget oder dessen kurze Ausfalltoleranz erlauben das
+    Halten bei Fahrzeug-Ladeende. Solange in
     derselben Stecksession ein Ladeende geprüft wird, ein geparkter Beleg
     vorliegt oder Bereitschaft besteht, ersetzt dieser Vertrag jeden
     vorübergehenden Policy-Nullausgang (lösbare Ankergründe) durch das Halten
@@ -3025,6 +3029,9 @@ def vehicle_offer_hold_contract(
     start_grace = bool(grace > 0.0 and 0.0 <= age < grace)
     if not (vehicle_end or start_grace or bool(window_active)):
         return no_hold("no_vehicle_end_evidence")
+    if (vehicle_end and not (start_grace or bool(window_active))
+            and not (source_budget_ready or source_budget_tolerance_active)):
+        return no_hold("vehicle_offer_budget_wait")
     result["hold"] = True
     result["hold_amp"] = offered
     result["reason"] = (

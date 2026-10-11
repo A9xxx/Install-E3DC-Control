@@ -2054,7 +2054,7 @@ function storageBaseTrajectoryEvidence(rawBase, planId, status = null) {
     return {
         state: 'complete',
         reasonCode: null,
-        soc: normalized
+        soc: storageSimulationCurvePoints(rawBase).map(point => ({ts: point.ts, soc: point.soc, slotId: point.slot_id}))
     };
 }
 
@@ -2284,6 +2284,9 @@ function storageCurveBundleAssessment(data, planId) {
 }
 
 function cacheStorageCurveData(data) {
+    if (data && Object.prototype.hasOwnProperty.call(data, 'storage_corridor_now')) {
+        window._storageCorridorReceivedAt = typeof performance !== 'undefined' ? performance.now() : null;
+    }
     if (!data || typeof data !== 'object') return;
     const previousData = window._storageLiveData && typeof window._storageLiveData === 'object'
         ? window._storageLiveData
@@ -2424,7 +2427,7 @@ function cacheStorageCurveData(data) {
     else if (!Array.isArray(window._storageSocMinCurve)) window._storageSocMinCurve = [];
     if (Array.isArray(mergedData.storage_soc_ceiling_curve)) window._storageSocCeilingCurve = mergedData.storage_soc_ceiling_curve;
     else if (!Array.isArray(window._storageSocCeilingCurve)) window._storageSocCeilingCurve = [];
-    if (Array.isArray(mergedData.storage_sim_curve)) window._storageSimCurve = mergedData.storage_sim_curve;
+    if (Array.isArray(mergedData.storage_sim_curve)) window._storageSimCurve = storageSimulationCurvePoints(mergedData.storage_sim_curve);
     else if (!Array.isArray(window._storageSimCurve)) window._storageSimCurve = [];
     window._storageSimCurveStatus = mergedData.storage_sim_curve_status
         && typeof mergedData.storage_sim_curve_status === 'object'
@@ -2462,6 +2465,10 @@ function cacheStorageCurveData(data) {
         window._storageControlSoc = parseFloat(mergedData.storage_curve_control_soc);
     }
     renderStorageCurveSparkline(mergedData);
+    const modal = document.getElementById('storageCurveModal');
+    if (modal && modal.classList.contains('show')) {
+        _renderStorageCurveChart(_storageCurvePendingSocPoints);
+    }
 }
 
 function downsampleStorageSparkline(points, maxPoints = 48) {
@@ -6169,31 +6176,10 @@ function updateMobileStorageStrip(data) {
         ? storageDisplay.badge
         : (limitsActive ? 'EMS aktiv' : 'EMS frei'));
     setMobileStorageText('m-storage-title', storageDisplay.label);
-    if (directMarketingHold) {
-        setMobileStorageText('m-storage-soll', '', false);
-    } else if (eveningRelease) {
-        setMobileStorageText('m-storage-soll', 'Freilauf');
-    } else if (activeTarget.mode === 'floor_catchup' || activeTarget.mode === 'ceiling_hold') {
-        setMobileStorageText('m-storage-soll', 'Regelziel');
-    } else if (adaptiveActive && Number.isFinite(adaptiveFloorSoc) && Number.isFinite(adaptiveCeilingSoc)) {
-        setMobileStorageText('m-storage-soll', 'Band ' + mobileStoragePct(adaptiveFloorSoc, 0) + '-' + mobileStoragePct(adaptiveCeilingSoc, 0));
-    } else {
-        setMobileStorageText('m-storage-soll', 'Soll ' + mobileStoragePct(targetSoc, 0));
-    }
-
-    if (directMarketingHold) {
-        setMobileStorageText('m-storage-curve', storageDisplay.detail);
-    } else if (eveningRelease) {
-        setMobileStorageText('m-storage-curve', 'Freilauf erreicht');
-    } else if (activeTarget.mode === 'floor_catchup' || activeTarget.mode === 'ceiling_hold') {
-        setMobileStorageText('m-storage-curve', activeTarget.label);
-    } else if (adaptiveActive && Number.isFinite(adaptiveFloorSoc) && Number.isFinite(adaptiveCeilingSoc)) {
-        setMobileStorageText('m-storage-curve', 'Korridor ' + mobileStoragePct(adaptiveFloorSoc, 1) + ' -> ' + mobileStoragePct(adaptiveCeilingSoc, 1));
-    } else if (curveNow != null || targetSoc != null) {
-        setMobileStorageText('m-storage-curve', 'Kurve ' + mobileStoragePct(curveNow) + ' -> ' + mobileStoragePct(targetSoc));
-    } else {
-        setMobileStorageText('m-storage-curve', 'Kurve --');
-    }
+    setMobileStorageText('m-storage-soll', 'Jetzt');
+    setMobileStorageText('m-storage-curve', [storageCorridorNow(data).label,
+        directMarketingHold ? storageDisplay.detail : (eveningRelease ? 'Freilauf erreicht' : '')]
+        .filter(Boolean).join(' · '));
     const chargeAcceptanceDiagnostic = data.storage_charge_acceptance_diagnostic
         && typeof data.storage_charge_acceptance_diagnostic === 'object'
         ? data.storage_charge_acceptance_diagnostic
@@ -6202,9 +6188,7 @@ function updateMobileStorageStrip(data) {
         && chargeAcceptanceDiagnostic.active === true
         && chargeAcceptanceDiagnostic.control_effect === false
         && chargeAcceptanceDiagnostic.display_text === 'Ladeannahme begrenzt – Ursache unklar';
-    if (chargeAcceptanceActive && !directMarketingHold) {
-        setMobileStorageText('m-storage-curve', chargeAcceptanceDiagnostic.display_text);
-    }
+
     const requestParts = [];
     if (chargeAcceptanceActive) requestParts.push(chargeAcceptanceDiagnostic.display_text);
     if (abregelActive && abregelW !== null && Math.abs(abregelW) > 0) requestParts.push('Abregel ' + mobileStoragePower(abregelW));
@@ -7349,8 +7333,16 @@ function e3dcHandleLiveAuthFailure(error) {
     const reason = String(payload.error || payload.reason || payload.message || '').trim();
     if (status !== 401 && status !== 403) return false;
     if (reason === 'PIN erforderlich') {
+        const alreadyRedirected = window.E3DC_LIVE_AUTH_REDIRECT_ATTEMPTED === true;
         window.E3DC_LIVE_AUTH_BLOCKED = true;
-        window.location.replace(e3dcActionUrl('seite=lock'));
+        const loginFormVisible = typeof document !== 'undefined'
+            && typeof document.querySelector === 'function'
+            && document.querySelector('input[name="action"][value="web_login"]');
+        const lockPage = new URL(window.location.href).searchParams.get('seite') === 'lock';
+        if (!alreadyRedirected && !loginFormVisible && !lockPage) {
+            window.E3DC_LIVE_AUTH_REDIRECT_ATTEMPTED = true;
+            window.location.replace(e3dcActionUrl('seite=lock'));
+        }
         return true;
     }
     if (reason !== 'CSRF-Token ungültig') return false;
@@ -7732,6 +7724,11 @@ async function startInstallerUpdate(btnId = 'btn-update-installer', purpose = 'u
                 {}
             );
             const preflight = await e3dcParseJsonResponse(response, 'Update-Inhaltsprüfung');
+            if (preflight && preflight.running === true) {
+                if (btn) { btn.innerHTML = origText; btn.disabled = false; }
+                alert(preflight.message || 'Ein Systemjob läuft bereits. Bitte warten; Status prüfen mit: systemctl status --no-pager e3dc-web-update.service');
+                return;
+            }
             if (!preflight || preflight.success !== true) {
                 throw new Error((preflight && preflight.message) || 'Lokale Inhalte konnten nicht geprüft werden.');
             }
@@ -8680,6 +8677,9 @@ function switchChartMode(mode, view = 'normal') {
     // Den bisherigen Aktualisierungstakt sofort beenden. Antworten älterer
     // Diagramm-Anfragen dürfen den neu gewählten Modus nicht überschreiben.
     activateJsChartMode(mode);
+    const costSwitch = document.getElementById('costHistorySwitch');
+    if (costSwitch) costSwitch.classList.toggle('d-none', mode !== 'price');
+    if (typeof window.switchCostHistoryView === 'function') window.switchCostHistoryView(false, false);
 
     // Setze chart-mode Flag auf dem Body element für CSS Scoping (z.B. header-regler-plan)
     document.body.setAttribute('data-chart-mode', mode);
@@ -9201,6 +9201,12 @@ function liveGridPhaseValues(data) {
 function liveGridPhaseCompactText(data) {
     const values = liveGridPhaseValues(data);
     return values ? `${Math.round(values[0])} | ${Math.round(values[1])} | ${Math.round(values[2])} W` : '';
+}
+
+// Phasenleistungen in der Live-Zeile als ganze Watt; fehlende Werte als „–“.
+function livePhaseWattText(value) {
+    const n = e3dcFiniteNumberOrNull(value);
+    return n === null ? '–' : String(Math.round(n));
 }
 
 function liveGridPhaseLabeledText(data, separator = ' | ') {
@@ -9788,9 +9794,14 @@ let activeJsChartMode = '';
 let jsChartRequestGeneration = 0;
 
 function chartTimestampMs(value) {
-    let timestamp = Number(value);
-    if (!Number.isFinite(timestamp) || timestamp <= 0) return null;
-    if (timestamp < 100000000000) timestamp *= 1000;
+    let timestamp = (typeof value === 'number' || (typeof value === 'string' && value.trim() !== ''))
+        ? Number(value) : Number.NaN;
+    // Sekunden und Millisekunden müssen im unterstützten Kalenderbereich liegen.
+    if (Number.isFinite(timestamp) && timestamp >= 946684800 && timestamp <= 2147483647) timestamp *= 1000;
+    if (!Number.isSafeInteger(timestamp) || timestamp < 946684800000 || timestamp > 4102444800000) {
+        if (typeof console !== 'undefined') console.warn('Ungültiger Diagrammzeitstempel: Achsenpunkt ausgelassen.');
+        return null;
+    }
     return timestamp;
 }
 
@@ -10919,6 +10930,68 @@ function loadJsForecastChart(file = '') {
 }
 
 
+// Hinweisfelder bleiben am oberen Rand auf der vom Zeiger abgewandten Seite.
+function chartTooltipAwayFromPointer(elements, eventPosition) {
+    const chart = this.chart;
+    const area = chart.chartArea;
+    const left = Math.max(8, area.left);
+    const right = Math.max(left, Math.min(chart.width - 8, area.right));
+    const pointerX = eventPosition && Number.isFinite(eventPosition.x)
+        ? eventPosition.x : (left + right) / 2;
+    const width = right - left;
+    const fieldWidth = this._size ? this._size.width : (this.width || 0);
+    const threshold = Math.min(width / 2, Math.max(width * 0.2, fieldWidth + 16));
+    let onRight = chart.$tooltipOnRight;
+    // Pro Diagramm merken; erst bei Annäherung an das Hinweisfeld wechseln.
+    if (typeof onRight !== 'boolean' || threshold >= width / 2) {
+        onRight = pointerX < (left + right) / 2;
+    } else if (onRight ? pointerX >= right - threshold : pointerX <= left + threshold) {
+        onRight = !onRight;
+    }
+    return {x: onRight ? right : left,
+        y: Math.max(8, Math.min(chart.height - 8, area.top)),
+        xAlign: onRight ? 'right' : 'left', yAlign: 'top'};
+}
+
+function chartTooltipPlacement() {
+    Chart.Tooltip.positioners.awayFromPointer = chartTooltipAwayFromPointer;
+    return {position: 'awayFromPointer', caretSize: 0, caretPadding: 8,
+        external: ({tooltip}) => {
+            if (!tooltip.getActiveElements().length) return;
+            // Chart.js kennt die neue Feldbreite erst nach dem Positionierer-Aufruf.
+            const position = chartTooltipAwayFromPointer.call(tooltip, [], tooltip._eventPosition);
+            tooltip.chart.$tooltipOnRight = position.xAlign === 'right';
+            if (position.x !== tooltip.getProps(['caretX'], true).caretX) tooltip.update(false);
+        }};
+}
+
+function chartTooltipLines(context, text) {
+    // Lange Reihenbezeichnungen auch auf schmalen Touch-Displays lesbar umbrechen.
+    const ctx = context.chart.ctx;
+    const maxWidth = Math.max(24, context.chart.width - 48);
+    ctx.save();
+    ctx.font = Chart.helpers.toFont(Chart.defaults.font).string;
+    const lines = [];
+    let line = '';
+    for (const word of String(text).split(/\s+/)) {
+        const candidate = line ? `${line} ${word}` : word;
+        if (line && ctx.measureText(candidate).width > maxWidth) {
+            lines.push(line);
+            line = '';
+        }
+        for (const char of (line ? ' ' : '') + word) {
+            if (line && ctx.measureText(line + char).width > maxWidth) {
+                lines.push(line);
+                line = '';
+            }
+            line += char;
+        }
+    }
+    if (line) lines.push(line);
+    ctx.restore();
+    return lines;
+}
+
 function loadJsHybridChart(hours, file = null) {
     const requestGeneration = beginJsChartRequest('hybrid');
     currentLiveHours = hours;
@@ -10956,8 +11029,8 @@ function loadJsHybridChart(hours, file = null) {
     let urlLive = 'get_chart_data.php?hours=' + pastHours;
     if (file) urlLive += '&file=' + encodeURIComponent(file);
 
-    let urlFore = 'get_forecast_data.php';
-    if (file) urlFore += '?file=' + encodeURIComponent(file);
+    let urlFore = 'get_forecast_data.php?history_prices=1';
+    if (file) urlFore += '&file=' + encodeURIComponent(file);
 
     Promise.all([
         fetch(urlLive).then(r => r.json()),
@@ -11077,8 +11150,9 @@ function loadJsHybridChart(hours, file = null) {
             if (hasPrice) price.push(rounded('price', 2));
             dv_grid.push(rounded('dv_grid'));
             weatherPotential.push(null);
-            directMarketingMarketPrice.push(null);
-            directMarketingMarketNetSell.push(null);
+            const priceIndex = forecastByAbsSlot[slotMin];
+            directMarketingMarketPrice.push(directMarketing ? valueAt(forecastData.market_price, priceIndex) : null);
+            directMarketingMarketNetSell.push(directMarketing ? valueAt(forecastData.direct_marketing_market_net_sell_ct, priceIndex) : null);
 
             // History (Live-Daten) mit vergangenen Wetter-Prognosen auffüllen
             let m1 = null, m2 = null, m3 = null, ens = null;
@@ -11308,8 +11382,9 @@ function loadJsHybridChart(hours, file = null) {
                 ? (measured ? 'Messwert' : (directMarketing && ['PV betrieblich verfügbar', 'Batterie', 'Netz', 'DV-SoC-Prognose'].includes(sourceLabel) ? 'DV-Plan' : 'Prognose')) : '';
             return ` ${cleanLabel}: ${value} ${unit}${sourceNote ? ` · ${sourceNote}` : ''}`;
         };
-        const hybridTooltip = {filter: hybridTooltipFilter,
-            callbacks: {title: hybridTooltipTitle, label: hybridTooltipLabel}};
+        const hybridTooltip = {...chartTooltipPlacement(), filter: hybridTooltipFilter,
+            callbacks: {title: hybridTooltipTitle,
+                label: ctx => chartTooltipLines(ctx, hybridTooltipLabel(ctx))}};
 
         if (liveLineChart) {
             liveLineChart.resetZoom();
@@ -11449,12 +11524,13 @@ function loadJsPriceChart(hours, file = null) {
         const priceXScale = priceTimeContext.xScale;
         labels = priceTimeContext.labels;
         const priceTooltip = {
+            ...chartTooltipPlacement(),
             filter: item => !!item.dataset.label && !item.dataset.label.includes('__HIDDEN__'),
             callbacks: {
                 title: priceTimeContext.tooltipTitle,
-                label: ctx => ctx.dataset.label === 'Strompreis (ct/kWh)'
+                label: ctx => chartTooltipLines(ctx, ctx.dataset.label === 'Strompreis (ct/kWh)'
                     ? electricityPriceTooltipLabel(ctx, ecoScore)
-                    : ` ${ctx.dataset.label}: ${chartRawY(ctx)}`
+                    : ` ${ctx.dataset.label}: ${chartRawY(ctx)}`)
             }
         };
 
@@ -12017,49 +12093,77 @@ function bindDashboardWallboxPauseButtons() {
 function triggerWallboxForceStart(wbIdx) {
     wbIdx = String(wbIdx || '1');
     const btn = $(`[data-dashboard-wb-force-start="${wbIdx}"]`);
+    if (btn.prop('disabled')) return;
     const icon = btn.find('i');
+    const statusId = 'wb-force-start-status-' + wbIdx;
+    let status = $('#' + statusId);
+    if (!status.length) {
+        status = $('<span>').attr('id', statusId).attr('role', 'status')
+            .attr('aria-live', 'polite').addClass('small text-muted ms-2');
+        btn.after(status);
+    }
+    const processingMessage = 'Startanforderung wird verarbeitet';
+    const timeoutMessage = 'Die Startanforderung wurde innerhalb von 60 Sekunden nicht bestätigt. Sie bleibt höchstens 60 Sekunden erhalten. Bitte erneut starten.';
+    const deadline = Date.now() + 60000;
     icon.attr('class', 'fas fa-spinner fa-spin');
-    btn.prop('disabled', true);
-    const formData = new FormData();
-    formData.append('trigger_wb_force_start_ajax', '1');
-    formData.append('wb_id', wbIdx);
-    formData.append('csrf_token', String(window.E3DC_CSRF_TOKEN || ''));
-    fetch('Wallbox.php', {
-        method: 'POST',
-        headers: {
-            'X-Requested-With': 'XMLHttpRequest',
-            'X-CSRF-Token': String(window.E3DC_CSRF_TOKEN || '')
-        },
-        body: formData
-    })
-        .then(res => {
-            return res.text().then(text => {
-                let payload = null;
-                try {
-                    payload = JSON.parse(text);
-                } catch (_) {
-                    payload = null;
-                }
-                if (!res.ok || !payload || payload.ok !== true) {
-                    const detail = payload && (payload.message || payload.error || payload.code);
-                    throw new Error(detail ? String(detail) : `Wallbox-Sofortstart fehlgeschlagen (HTTP ${res.status}).`);
-                }
-                return payload;
-            });
-        })
-        .then(payload => {
-            if (!payload || payload.ok !== true) {
-                throw new Error((payload && (payload.message || payload.error)) || 'Wallbox-Sofortstart wurde abgelehnt.');
+    btn.prop('disabled', true).attr('title', processingMessage);
+    status.text(processingMessage);
+
+    const post = (action, requestId) => {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return Promise.resolve(null);
+        const formData = new FormData();
+        formData.append(action, '1');
+        formData.append('wb_id', wbIdx);
+        if (requestId) formData.append('request_id', requestId);
+        formData.append('csrf_token', String(window.E3DC_CSRF_TOKEN || ''));
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), remaining);
+        return fetch('Wallbox.php', {
+            method: 'POST',
+            headers: {
+                'X-Requested-With': 'XMLHttpRequest',
+                'X-CSRF-Token': String(window.E3DC_CSRF_TOKEN || '')
+            },
+            body: formData,
+            signal: controller.signal
+        }).then(res => res.text().then(text => {
+            let payload = null;
+            try { payload = JSON.parse(text); } catch (_) { /* Ungültige Antwort bleibt ein Fehler. */ }
+            if (!res.ok || !payload || (payload.code !== 'force_start_pending' && payload.ok !== true)) {
+                const detail = payload && (payload.message || payload.error || payload.code);
+                throw new Error(detail ? String(detail) : `Wallbox-Start fehlgeschlagen (HTTP ${res.status}).`);
             }
-            icon.attr('class', 'fas fa-check text-success');
-            setTimeout(() => {
-                icon.attr('class', 'fas fa-play');
-                btn.prop('disabled', false);
-            }, 2500);
+            return payload;
+        })).catch(err => {
+            if (controller.signal.aborted) return null;
+            throw err;
+        }).finally(() => clearTimeout(timer));
+    };
+    const waitForResult = payload => {
+        if (!payload || payload.code !== 'force_start_pending') return payload;
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return null;
+        return new Promise(resolve => setTimeout(resolve, Math.min(1000, remaining)))
+            .then(() => post('get_wb_force_start_status_ajax', payload.request_id))
+            .then(waitForResult);
+    };
+    return post('trigger_wb_force_start_ajax')
+        .then(waitForResult)
+        .then(payload => {
+            const message = payload ? String(payload.message || 'Startanforderung angenommen') : timeoutMessage;
+            icon.attr('class', payload ? 'fas fa-check text-success' : 'fas fa-clock text-warning');
+            btn.attr('title', message);
+            status.text(message);
         })
         .catch(err => {
+            const message = err && err.message ? err.message : 'Wallbox-Start ist fehlgeschlagen.';
             icon.attr('class', 'fas fa-exclamation-triangle text-danger');
-            alert(err && err.message ? err.message : 'Wallbox-Sofortstart ist fehlgeschlagen.');
+            btn.attr('title', message);
+            status.text(message);
+            alert(message);
+        })
+        .finally(() => {
             setTimeout(() => {
                 icon.attr('class', 'fas fa-play');
                 btn.prop('disabled', false);
@@ -12393,10 +12497,10 @@ function processLiveData(data) {
             } else if (data.grid_pm_available === false) {
                 details += `<div style="white-space:nowrap; font-size:0.8rem; opacity:0.8; margin-bottom:3px;">Netzphasen nicht verfügbar</div>`;
             }
-            if (data.ac0_w !== undefined) details += `<div style="white-space:nowrap; font-size:0.8rem; opacity:0.8;">WR: ${data.ac0_w} | ${data.ac1_w} | ${data.ac2_w} W</div>`;
+            if (data.ac0_w !== undefined) details += `<div style="white-space:nowrap; font-size:0.8rem; opacity:0.8;">WR: ${livePhaseWattText(data.ac0_w)} | ${livePhaseWattText(data.ac1_w)} | ${livePhaseWattText(data.ac2_w)} W</div>`;
             $('#grid-details').html(details).show();
         } else { $('#grid-details').hide(); }
-        if (data.wb_p1 !== undefined && (data.wb_p1 > 0 || data.wb_p2 > 0 || data.wb_p3 > 0) && data.wb > 0) $('#wb-details').html(`L1: ${data.wb_p1 ?? '–'}W | L2: ${data.wb_p2 ?? '–'}W | L3: ${data.wb_p3 ?? '–'}W`).show(); else $('#wb-details').hide();
+        if (data.wb_p1 !== undefined && (data.wb_p1 > 0 || data.wb_p2 > 0 || data.wb_p3 > 0) && data.wb > 0) $('#wb-details').html(`L1: ${livePhaseWattText(data.wb_p1)}W | L2: ${livePhaseWattText(data.wb_p2)}W | L3: ${livePhaseWattText(data.wb_p3)}W`).show(); else $('#wb-details').hide();
 
         if (data.bat_v !== undefined) {
             let batDet = `K1: ${data.bat_v}V | ${data.bat_a}A`;
@@ -12709,7 +12813,7 @@ function processLiveData(data) {
                 .addClass(isWinter ? 'bg-primary text-white' : 'bg-info text-dark')
                 .html(`<i class="fas ${isWinter ? 'fa-snowflake' : 'fa-sun'}"></i> ${data.wp_season_label}`);
             if (data.wp_season_temp != null && data.wp_heating_limit_temp != null) {
-                wpSeasonBadge.attr('title', `Außen ${Number(data.wp_season_temp).toFixed(1)}C / Heizgrenze ${Number(data.wp_heating_limit_temp).toFixed(1)}C`);
+                wpSeasonBadge.attr('title', data.wp_season_hint || `gemittelt ${Number(data.wp_season_temp).toFixed(1).replace('.', ',')} °C, Heizgrenze ${Number(data.wp_heating_limit_temp).toFixed(1).replace('.', ',')} °C`);
             }
         } else {
             wpSeasonBadge.hide();
@@ -12856,12 +12960,12 @@ function processLiveData(data) {
                 content = phaseText ? `Netz: ${data.grid}W (${phaseText})` : `Netz: ${data.grid}W`;
                 if (data.ac0_w !== undefined) {
                     const wrTotal = (data.ac0_w || 0) + (data.ac1_w || 0) + (data.ac2_w || 0);
-                    content += ` | WR: ${wrTotal}W (L1: ${data.ac0_w} | L2: ${data.ac1_w} | L3: ${data.ac2_w})`;
+                    content += ` | WR: ${Math.round(wrTotal)}W (L1: ${livePhaseWattText(data.ac0_w)} | L2: ${livePhaseWattText(data.ac1_w)} | L3: ${livePhaseWattText(data.ac2_w)})`;
                 }
             } else if (CURRENT_VIEW === 'wb') {
-                if (data.wb_p1 !== undefined) content = `WB 1: ${data.wb_p1 ?? '–'}W | ${data.wb_p2 ?? '–'}W | ${data.wb_p3 ?? '–'}W`;
+                if (data.wb_p1 !== undefined) content = `WB 1: ${livePhaseWattText(data.wb_p1)}W | ${livePhaseWattText(data.wb_p2)}W | ${livePhaseWattText(data.wb_p3)}W`;
             } else if (CURRENT_VIEW === 'wb2') {
-                if (data.wb2_p1 !== undefined) content = `WB 2: ${data.wb2_p1 ?? '–'}W | ${data.wb2_p2 ?? '–'}W | ${data.wb2_p3 ?? '–'}W`;
+                if (data.wb2_p1 !== undefined) content = `WB 2: ${livePhaseWattText(data.wb2_p1)}W | ${livePhaseWattText(data.wb2_p2)}W | ${livePhaseWattText(data.wb2_p3)}W`;
             } else if (CURRENT_VIEW === 'hs') {
                 const hsActual = data.hs_power || 0;
                 const hsReq = data.hs_requested_w || data.hs_target_w || 0;
@@ -13408,9 +13512,9 @@ function processMobileData(data) {
         if (detailsEl && diagContainer && diagContainer.style.display !== 'none' && (typeof CURRENT_VIEW !== 'undefined' && CURRENT_VIEW !== 'price')) {
             let content = '';
             if (CURRENT_VIEW === 'pv') { const pvBreakdownText = livePvBreakdownHtml(data); content = pvBreakdownText ? `Gesamt: ${data.pv}W | ${pvBreakdownText}` : `Gesamt: ${data.pv}W`; }
-            else if (CURRENT_VIEW === 'grid') { const phaseText = liveGridPhaseLabeledText(data); content = phaseText ? `Netz: ${data.grid}W (${phaseText})` : `Netz: ${data.grid}W`; if (data.ac0_w !== undefined) { const wrTotal = (data.ac0_w || 0) + (data.ac1_w || 0) + (data.ac2_w || 0); content += `<br>WR: ${wrTotal}W (L1: ${data.ac0_w} | L2: ${data.ac1_w} | L3: ${data.ac2_w})`; } }
-            else if (CURRENT_VIEW === 'wb') { if (data.wb_p1 !== undefined) content = `WB 1 L1: ${data.wb_p1 ?? '–'}W | L2: ${data.wb_p2 ?? '–'}W | L3: ${data.wb_p3 ?? '–'}W`; }
-            else if (CURRENT_VIEW === 'wb2') { if (data.wb2_p1 !== undefined) content = `WB 2 L1: ${data.wb2_p1 ?? '–'}W | L2: ${data.wb2_p2 ?? '–'}W | L3: ${data.wb2_p3 ?? '–'}W`; }
+            else if (CURRENT_VIEW === 'grid') { const phaseText = liveGridPhaseLabeledText(data); content = phaseText ? `Netz: ${data.grid}W (${phaseText})` : `Netz: ${data.grid}W`; if (data.ac0_w !== undefined) { const wrTotal = (data.ac0_w || 0) + (data.ac1_w || 0) + (data.ac2_w || 0); content += `<br>WR: ${Math.round(wrTotal)}W (L1: ${livePhaseWattText(data.ac0_w)} | L2: ${livePhaseWattText(data.ac1_w)} | L3: ${livePhaseWattText(data.ac2_w)})`; } }
+            else if (CURRENT_VIEW === 'wb') { if (data.wb_p1 !== undefined) content = `WB 1 L1: ${livePhaseWattText(data.wb_p1)}W | L2: ${livePhaseWattText(data.wb_p2)}W | L3: ${livePhaseWattText(data.wb_p3)}W`; }
+            else if (CURRENT_VIEW === 'wb2') { if (data.wb2_p1 !== undefined) content = `WB 2 L1: ${livePhaseWattText(data.wb2_p1)}W | L2: ${livePhaseWattText(data.wb2_p2)}W | L3: ${livePhaseWattText(data.wb2_p3)}W`; }
             else if (CURRENT_VIEW === 'hs') { const hsActual = data.hs_power || 0; const hsReq = data.hs_requested_w || data.hs_target_w || 0; content = `Heizstab Ist: ${hsActual}W`; if (hsReq > 0 && Math.abs(hsReq - hsActual) > 20) content += ` | Anforderung: ${hsReq}W`; if (data.elwa_water_temp_c != null) content += ` | Wasser: ${Number(data.elwa_water_temp_c).toFixed(1)}°C`; if (data.elwa_status) content += ` | Status: ${data.elwa_status}`; }
             else if (CURRENT_VIEW === 'climate') { const climateActual = data.climate_power_w || data.climate || 0; content = `Klima: ${climateActual}W`; if (data.climate_daily_kwh != null) content += ` | Heute: ${Number(data.climate_daily_kwh).toFixed(3)} kWh`; if (data.climate_source) content += ` | Quelle: ${data.climate_source}`; if (data.climate_phase) content += ` | Phase: ${String(data.climate_phase).toUpperCase()}`; }
             else if (CURRENT_VIEW === 'wp') { if (data.wp !== undefined) { content = `WP-Leistung: ${data.wp}W`; let ww = data.wp_ww_temp || (data.data && data.data.Warmwasser_Ist); let rl = data.wp_rl_temp || (data.data && data.data.Ruecklauf_Ist); let vl = data.wp_vl_temp || (data.data && data.data.Vorlauf_Ist); let khl = data.wp_kaelte_temp || (data.data && (data.data.Kaeltespeicher_Ist || data.data['Kältespeicher_Ist'])); if (ww) content += ` | WW: ${ww.toFixed(1)}°C`; if (rl) content += ` | RL: ${rl.toFixed(1)}°C`; if (vl) content += ` | VL: ${vl.toFixed(1)}°C`; if (khl) content += ` | Kältespeicher: ${khl.toFixed(1)}°C`; } }
@@ -13701,66 +13805,68 @@ function _storageCurveInterp(curve, ts) {
     return null;
 }
 
+function storageCorridorNow(data = window._storageLiveData || {}) {
+    const cached = window._storageLiveData || {};
+    const status = Object.prototype.hasOwnProperty.call(data, 'storage_corridor_now')
+        ? data.storage_corridor_now : cached.storage_corridor_now;
+    const unknown = {mode: 'none', label: 'Kein Regelziel verfügbar', colorClass: 'text-muted',
+        floor: null, ceiling: null, target: null, valid: false};
+    const finite = value => typeof value === 'number' && Number.isFinite(value);
+    // Serveralter und monotone Abrufdauer verwenden keine absolute Browseruhr.
+    const elapsed = typeof performance !== 'undefined' && window._storageCorridorReceivedAt != null
+        ? Math.max(0, (performance.now() - window._storageCorridorReceivedAt) / 1000) : 0;
+    if (!status || !finite(status.age_s) || !finite(status.remaining_valid_s)
+        || status.age_s < 0 || status.age_s + elapsed > 120 || status.remaining_valid_s < elapsed) return unknown;
+    const regulation = status.regulation || {};
+    const known = regulation.valid === true && regulation.source === 'storage_manager.final_output'
+        && ['free', 'curve', 'hold', 'grid_charge', 'protection', 'limited'].includes(regulation.kind)
+        && typeof regulation.label === 'string' && regulation.label.trim().length > 0
+        && regulation.label.length <= 80 && !/[<>\x00-\x1f\x7f]/.test(regulation.label);
+    // Die Bezeichnung kommt vom Speicher-Manager; hier wird nur angezeigt.
+    const regulationLabel = known ? regulation.label : 'Regelart unbekannt';
+    if (status.valid !== true || status.source !== 'storage_manager.adaptive_curve_context'
+        || !finite(status.floor_soc) || !finite(status.ceiling_soc)
+        || status.floor_soc < 0 || status.ceiling_soc > 100 || status.floor_soc > status.ceiling_soc) {
+        return {...unknown, label: unknown.label + (known ? ' · ' + regulationLabel : '')};
+    }
+    const pct = value => (Math.round(value * 10) / 10).toLocaleString('de-DE', {maximumFractionDigits: 1});
+    const result = {floor: status.floor_soc, ceiling: status.ceiling_soc, target: null, valid: true,
+        colorClass: 'text-info', mode: 'inside_band', label: ''};
+    if (status.relation === 'inside_band' && status.control_soc === null) {
+        result.label = `Korridor ${pct(result.floor)}–${pct(result.ceiling)} %`;
+    } else if (status.relation === 'below_floor' && finite(status.control_soc)
+        && Math.abs(status.control_soc - result.floor) < 0.001) {
+        result.mode = known && regulation.kind === 'curve' ? 'floor_catchup' : 'below_floor';
+        result.target = result.mode === 'floor_catchup' ? status.control_soc : null;
+        result.colorClass = 'text-success';
+        result.label = result.target !== null ? `Regelziel ${pct(result.floor)} % (Unterkante)`
+            : `Unterkante ${pct(result.floor)} %`;
+    } else if (status.relation === 'above_ceiling' && finite(status.control_soc)
+        && Math.abs(status.control_soc - result.ceiling) < 0.001) {
+        result.mode = 'ceiling_hold'; result.target = regulation.kind === 'curve' ? status.control_soc : null;
+        result.colorClass = 'text-warning';
+        result.label = `Obergrenze ${pct(result.ceiling)} %`;
+    } else return unknown;
+    result.label += ' · ' + regulationLabel;
+    return result;
+}
+
 function _storageActiveCurveTarget(meta, socNow = null, ts = Date.now()) {
-    const floor = _storageCurveInterp(window._storageSocMinCurve || [], ts);
-    const target = _storageCurveInterp(window._storageSollCurve || [], ts);
-    const ceiling = _storageCurveInterp(window._storageSocCeilingCurve || [], ts);
-    const soc = socNow !== null && socNow !== undefined && !isNaN(parseFloat(socNow))
-        ? parseFloat(socNow)
-        : null;
-    if (soc !== null && floor !== null && soc < floor - 0.3) {
-        return {
-            mode: 'floor_catchup',
-            label: `Unterkante ${_fmtStoragePct(floor)}`,
-            colorClass: 'text-success',
-            floor,
-            target,
-            ceiling,
-            soc
-        };
-    }
-    if (soc !== null && ceiling !== null && soc > ceiling + 0.3) {
-        return {
-            mode: 'ceiling_hold',
-            label: `Oberkante ${_fmtStoragePct(ceiling)}`,
-            colorClass: 'text-warning',
-            floor,
-            target,
-            ceiling,
-            soc
-        };
-    }
-    if (target !== null) {
-        return {
-            mode: 'target_curve',
-            label: `Sollkurve ${_fmtStoragePct(target)}`,
-            colorClass: 'text-info',
-            floor,
-            target,
-            ceiling,
-            soc
-        };
-    }
-    if (floor !== null) {
-        return {
-            mode: 'floor',
-            label: `Unterkante ${_fmtStoragePct(floor)}`,
-            colorClass: 'text-success',
-            floor,
-            target,
-            ceiling,
-            soc
-        };
-    }
-    return {
-        mode: 'none',
-        label: '--',
-        colorClass: 'text-muted',
-        floor,
-        target,
-        ceiling,
-        soc
-    };
+    return storageCorridorNow(window._storageLiveData || {}, ts);
+}
+
+function storageSimulationCurvePoints(curve) {
+    const points = new Map();
+    (Array.isArray(curve) ? curve : []).forEach(row => {
+        if (!row || !Number.isFinite(row.ts) || !Number.isFinite(row.soc)) return;
+        points.set(row.ts, {...row});
+        if (Number.isFinite(row.soc_start) && Number.isFinite(row.soc_end)
+            && Number.isFinite(row.simulation_start_ts) && Number.isFinite(row.end_ts)) {
+            points.set(row.simulation_start_ts, {...row, ts: row.simulation_start_ts, soc: row.soc_start});
+            points.set(row.end_ts, {...row, ts: row.end_ts, soc: row.soc_end});
+        }
+    });
+    return Array.from(points.values()).sort((a, b) => a.ts - b.ts);
 }
 
 function _setStorageActiveTargetBadge(activeTarget) {
@@ -14083,21 +14189,9 @@ function _renderStorageCurveExplanation(meta, reason) {
         {icon:'fa-wave-square', color:'#38bdf8', title:'Kurvenform', text:qText}
     ];
 
-    if (activeTarget.mode === 'floor_catchup') {
-        rows.unshift({
-            icon:'fa-crosshairs',
-            color:'#22c55e',
-            title:'Aktives Regelziel',
-            text:`Ist-SoC ${_fmtStoragePct(activeTarget.soc)} liegt unter der aktuellen Unterkante ${_fmtStoragePct(activeTarget.floor)}. Deshalb lädt die Regelung zuerst ruhig in den Zielkorridor zurück; die blaue Tageskurve bleibt die Orientierung.`
-        });
-    } else if (activeTarget.mode === 'ceiling_hold') {
-        rows.unshift({
-            icon:'fa-crosshairs',
-            color:'#f97316',
-            title:'Aktives Regelziel',
-            text:`Ist-SoC ${_fmtStoragePct(activeTarget.soc)} liegt oberhalb der Oberkante ${_fmtStoragePct(activeTarget.ceiling)}. Die Regelung hält Speicherplatz frei, solange kein Abregelschutz Vorrang hat.`
-        });
-    }
+    rows.unshift({
+        icon:'fa-crosshairs', color:'#a78bfa', title:'Korridorlage jetzt', text:activeTarget.label
+    });
 
     if (hasAdaptiveBand) {
         rows.splice(1, 0, {
@@ -14370,7 +14464,11 @@ function _renderStorageCurveChart(socPoints) {
         // Wir verwenden *ausschließlich* das feste 15-Minuten-Raster für die X-Achse!
         // Das verhindert, dass hochfrequente Daten (z.B. jede Minute ein Live-Wert)
         // die kategoriale X-Achse verzerren und den restlichen Tag zusammenquetschen.
-        const sortedTs = fixedGrid;
+        const sortedTs = Array.from(new Set([
+            ...fixedGrid,
+            ...simCurve.map(point => point.ts).filter(ts => ts >= fixedGrid[0] && ts <= fixedGrid[fixedGrid.length - 1]),
+            ...(nowMs >= fixedGrid[0] && nowMs <= fixedGrid[fixedGrid.length - 1] ? [nowMs] : [])
+        ])).sort((a, b) => a - b);
         const timeContext = buildCompactChartTimeContext(sortedTs, [], gridColor, tickColor, isDark, 7);
 
         // Hilfsfunktion: Interpoliere Wert bei gegebenem Timestamp
@@ -14460,16 +14558,14 @@ function _renderStorageCurveChart(socPoints) {
         const directMarketingSoc = directMarketingSocProjectionForTimestamps(dvView, sortedTs);
         const useDirectMarketingSoc = dvView.active === true;
 
-        // Jetzt-Linie: Index des ersten Timestamps >= nowMs
-        const nowIdx = (nowMs >= sortedTs[0] && nowMs <= sortedTs[sortedTs.length - 1])
-            ? sortedTs.findIndex(ts => ts >= nowMs)
-            : -1;
+        const nowInRange = nowMs >= sortedTs[0] && nowMs <= sortedTs[sortedTs.length - 1];
+        const currentSocData = nowInRange && chartLiveSoc !== null
+            ? [{x: nowMs, y: chartLiveSoc}] : [];
+        const corridorNowData = !nowInRange || !activeTarget.valid ? []
+            : activeTarget.target !== null ? [{x: nowMs, y: activeTarget.target}]
+            : [{x: nowMs, y: activeTarget.floor}, {x: nowMs, y: activeTarget.ceiling}];
 
-        const currentSocData = sortedTs.map((ts, index) => (
-            index === nowIdx && chartLiveSoc !== null ? chartLiveSoc : null
-        ));
-
-        _storageCurveChartInstance = new Chart(canvas, {
+        const chartConfig = {
             type: 'line',
             data: {
                 labels: timeContext.labels,
@@ -14539,7 +14635,7 @@ function _renderStorageCurveChart(socPoints) {
                         hidden: false,
                         yAxisID: 'ySoc',
                     },
-                    ...(chartLiveSoc !== null && nowIdx >= 0 ? [{
+                    ...(chartLiveSoc !== null && nowInRange ? [{
                         label: 'Aktueller SoC (Messwert)',
                         data: currentSocData,
                         showLine: false,
@@ -14550,6 +14646,16 @@ function _renderStorageCurveChart(socPoints) {
                         pointStyle: 'circle',
                         yAxisID: 'ySoc',
                     }] : []),
+                    {
+                        label: activeTarget.label,
+                        data: corridorNowData,
+                        showLine: activeTarget.mode === 'inside_band',
+                        borderColor: '#a78bfa',
+                        backgroundColor: '#a78bfa',
+                        borderWidth: 3,
+                        pointRadius: 5,
+                        yAxisID: 'ySoc',
+                    },
                     {
                         label: 'IST-SoC',
                         data: istData,
@@ -14651,30 +14757,36 @@ function _renderStorageCurveChart(socPoints) {
                     },
                     tooltip: {
                         callbacks: {
-                            title: timeContext.tooltipTitle,
+                            title: items => items.length
+                                ? new Date(items[0].parsed.x).toLocaleTimeString('de-DE', {hour: '2-digit', minute: '2-digit', second: '2-digit'}) : '', 
                             label: ctx => {
                                 const label = ctx.dataset && ctx.dataset.label ? ctx.dataset.label : '';
-                                if (label === 'Soll-SoC') return 'Soll: ' + (ctx.raw !== null ? ctx.raw.toFixed(1) + '%' : '--');
-                                if (label === 'Aktives Regelziel') return 'Aktives Regelziel: ' + (ctx.raw !== null ? ctx.raw.toFixed(1) + '%' : '--');
-                                if (label === 'Unterkante') return 'Unterkante: ' + (ctx.raw !== null ? ctx.raw.toFixed(1) + '%' : '--');
-                                if (label === 'Oberkante') return 'Oberkante: ' + (ctx.raw !== null ? ctx.raw.toFixed(1) + '%' : '--');
-                                if (label === 'Standard-SoC-Prognose') return label + ': ' + (ctx.raw !== null ? ctx.raw.toFixed(1) + '%' : '--');
-                                if (label === 'DV-SoC-Prognose') return 'DV-SoC: ' + (ctx.raw !== null ? ctx.raw.toFixed(1) + '%' : '--');
-                                if (label === 'Aktueller SoC (Messwert)') return 'Aktueller SoC: ' + (ctx.raw !== null ? ctx.raw.toFixed(1) + '%' : '--');
-                                if (label === 'IST-SoC') return 'IST:  ' + (ctx.raw !== null ? ctx.raw.toFixed(1) + '%' : '--');
-                                if (label === 'PV-Prognose (kW)') return 'PV:   ' + (ctx.raw !== null ? ctx.raw.toFixed(2) + ' kW' : '--');
-                                if (label === 'DV: PV speichern (Plan)') return 'DV PV speichern: ' + (ctx.raw !== null ? Number(ctx.raw).toFixed(2) + ' kW' : '--');
-                                if (label === 'DV: Wirtschaftl. Export (Plan)') return 'DV Export: ' + (ctx.raw !== null ? Number(ctx.raw).toFixed(2) + ' kW' : '--');
-                                if (label === 'DV: Headroom-Export (Prognose, keine Ausführung)') return 'DV Headroom-Prognose: ' + (ctx.raw !== null ? Number(ctx.raw).toFixed(2) + ' kW · keine Ausführung' : '--');
+                                if (label === 'Soll-SoC') return 'Soll: ' + (ctx.parsed.y !== null ? ctx.parsed.y.toFixed(1) + '%' : '--');
+                                if (label === 'Aktives Regelziel') return 'Aktives Regelziel: ' + (ctx.parsed.y !== null ? ctx.parsed.y.toFixed(1) + '%' : '--');
+                                if (label === 'Unterkante') return 'Unterkante: ' + (ctx.parsed.y !== null ? ctx.parsed.y.toFixed(1) + '%' : '--');
+                                if (label === 'Oberkante') return 'Oberkante: ' + (ctx.parsed.y !== null ? ctx.parsed.y.toFixed(1) + '%' : '--');
+                                if (label === 'Standard-SoC-Prognose') return label + ': ' + (ctx.parsed.y !== null ? ctx.parsed.y.toFixed(1) + '%' : '--');
+                                if (label === 'DV-SoC-Prognose') return 'DV-SoC: ' + (ctx.parsed.y !== null ? ctx.parsed.y.toFixed(1) + '%' : '--');
+                                if (label === 'Aktueller SoC (Messwert)') return 'Aktueller SoC: ' + (ctx.parsed.y !== null ? ctx.parsed.y.toFixed(1) + '%' : '--');
+                                if (label === 'IST-SoC') return 'IST:  ' + (ctx.parsed.y !== null ? ctx.parsed.y.toFixed(1) + '%' : '--');
+                                if (label === 'PV-Prognose (kW)') return 'PV:   ' + (ctx.parsed.y !== null ? ctx.parsed.y.toFixed(2) + ' kW' : '--');
+                                if (label === 'DV: PV speichern (Plan)') return 'DV PV speichern: ' + (ctx.parsed.y !== null ? Number(ctx.parsed.y).toFixed(2) + ' kW' : '--');
+                                if (label === 'DV: Wirtschaftl. Export (Plan)') return 'DV Export: ' + (ctx.parsed.y !== null ? Number(ctx.parsed.y).toFixed(2) + ' kW' : '--');
+                                if (label === 'DV: Headroom-Export (Prognose, keine Ausführung)') return 'DV Headroom-Prognose: ' + (ctx.parsed.y !== null ? Number(ctx.parsed.y).toFixed(2) + ' kW · keine Ausführung' : '--');
                                 if (label === 'DV: Laden gesperrt / Halten') return 'DV: Laden gesperrt / Halten';
-                                if (label === 'Zwischenziel') return 'Zwischenziel: ' + (ctx.raw !== null ? ctx.raw.toFixed(1) + '%' : '--');
+                                if (label === 'Zwischenziel') return 'Zwischenziel: ' + (ctx.parsed.y !== null ? ctx.parsed.y.toFixed(1) + '%' : '--');
                                 return '';
                             }
                         }
                     }
                 },
                 scales: {
-                    x: timeContext.xScale,
+                    x: {
+                        type: 'linear', min: sortedTs[0], max: sortedTs[sortedTs.length - 1],
+                        grid: {color: gridColor},
+                        ticks: {color: tickColor, stepSize: 3 * 3600000,
+                            callback: ts => new Date(ts).toLocaleTimeString('de-DE', {hour: '2-digit', minute: '2-digit'})}
+                    },
                     ySoc: {
                         type: 'linear',
                         position: 'left',
@@ -14705,10 +14817,8 @@ function _renderStorageCurveChart(socPoints) {
                 // Vertikale "Jetzt"-Linie
                 id: 'nowLine',
                 afterDraw: chart => {
-                    if (nowIdx < 0) return;
-                    const meta = chart.getDatasetMeta(0);
-                    if (!meta.data[nowIdx]) return;
-                    const x = meta.data[nowIdx].x;
+                    if (!nowInRange) return;
+                    const x = chart.scales.x.getPixelForValue(Date.now());
                     const ctx = chart.ctx;
                     const yAxis = chart.scales.ySoc;
                     ctx.save();
@@ -14725,7 +14835,12 @@ function _renderStorageCurveChart(socPoints) {
                     ctx.restore();
                 }
             }]
+        };
+        chartConfig.data.datasets.forEach(dataset => {
+            dataset.data = dataset.data.map((value, index) =>
+                value && typeof value === 'object' ? value : {x: sortedTs[index], y: value});
         });
+        _storageCurveChartInstance = new Chart(canvas, chartConfig);
     }
 
     // Chart.js laden falls nicht vorhanden

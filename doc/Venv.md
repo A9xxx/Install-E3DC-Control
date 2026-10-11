@@ -6,7 +6,7 @@ fester Benutzer- oder Home-Pfad wird nicht vorausgesetzt.
 
 ## Betrieb
 
-- Systemd-Units verwenden automatisch den zur Installation gehörenden Interpreter.
+- Systemd-Units verwenden den zur Installation gehörenden Interpreter. Nach einer Änderung des venv-Namens laufen Dienste weiter mit dem bisherigen Interpreter: zuerst **Installation / Update** ausführen und erst danach den alten Ordner löschen.
 - Die Weboberfläche liest den validierten Pfad aus `/var/www/html/e3dc_paths.json`.
 - Die Umgebung muss im normalen Dienstbetrieb nicht manuell aktiviert werden.
 - Modell-, Matter- und Betriebsdaten liegen nicht im flüchtigen Python-Paketverzeichnis.

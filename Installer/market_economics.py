@@ -11,9 +11,9 @@ import time
 from datetime import datetime
 
 try:
-    from .tariff_schedule import supports_spot_market_prices
+    from .tariff_schedule import supports_spot_market_prices, recurring_tariff_stages, configured_billing_price_for_timestamp
 except ImportError:  # pragma: no cover - direkter Skriptstart
-    from tariff_schedule import supports_spot_market_prices
+    from tariff_schedule import supports_spot_market_prices, recurring_tariff_stages, configured_billing_price_for_timestamp
 
 
 SLOT_MS = 15 * 60 * 1000
@@ -249,6 +249,8 @@ def _low_price_window(annotated, current_idx, slot_allowed=None, low_key="is_low
             break
         if not (slot.get(low_key) or slot.get("is_negative_billing")):
             break
+        if current.get("tariff_revision") and abs(slot["billing_ct"] - current["billing_ct"]) > 0.001:
+            break
         if safe_float(slot.get("ts"), 0.0) > safe_float(annotated[end_idx].get("end_ts"), 0.0) + 1000.0:
             break
         end_idx += 1
@@ -290,6 +292,8 @@ def _window_reference_billing_ct(
             break
         if not (prev.get(low_key) or prev.get("is_negative_billing")):
             break
+        if annotated[current_idx].get("tariff_revision") and abs(prev["billing_ct"] - current_ct) > 0.001:
+            break
         if safe_float(annotated[start_idx].get("ts"), 0.0) > safe_float(prev.get("end_ts"), 0.0) + 1000.0:
             break
         start_idx -= 1
@@ -311,7 +315,7 @@ def _window_reference_billing_ct(
 WINDOW_REFERENCE_CLOCK_TOLERANCE_MS = 60 * 1000
 
 
-def _window_reference_state(state, window_end_ts, now_ms, tariff, low_key):
+def _window_reference_state(state, window_end_ts, now_ms, tariff, low_key, tariff_revision=None):
     """Gebundene Fensterreferenz des letzten Plans (plan['window_reference'],
     vom Simulator aus storage_plan.json zurückgereicht) wiederverwenden – nur bei gleicher Fensteridentität
     (Fensterende), gleichem Tarif und Fensterschlüssel (is_low/is_comfort), Bindung > 0, nicht in der Zukunft
@@ -335,6 +339,8 @@ def _window_reference_state(state, window_end_ts, now_ms, tariff, low_key):
         return None
     if str(state.get("tariff") or "") != str(tariff or "") or str(state.get("low_key") or "") != str(low_key or ""):
         return None
+    if tariff_revision is not None and state.get("tariff_revision") != tariff_revision:
+        return None
     return {"ref_ct": ref_ct, "bound_ts": bound_ts, "slots": max(0, slots)}
 
 
@@ -349,6 +355,8 @@ def _window_reference_past_annotated(
     billing_price_required=False,
     comfort_profile=False,
     price_limit_ct=None,
+    fixed_tariff=None,
+    config=None,
 ):
     """Slots der ungekürzten Zeitleiste VOR dem ersten Planslot (vom Trim
     ts < now − 1 Slot verworfen), höchstens HORIZON_MS zurück, aufsteigend sortiert und mit den Preisschwellen dieses
@@ -378,6 +386,7 @@ def _window_reference_past_annotated(
         low_cut_ct,
         high_cut_ct,
         billing_price_required=billing_price_required,
+        fixed_tariff=fixed_tariff, config=config,
     )
     for slot in past:
         slot["is_comfort"] = bool(
@@ -1159,6 +1168,31 @@ def _slot_price_quality(slot, billing_price_required=False):
     }
 
 
+def _grid_price_profit_ok(price_ct, benefit_ct, efficiency, degradation, safety, spread_min, margin_min):
+    cost = price_ct / max(0.01, efficiency) + degradation + safety
+    spread = benefit_ct - cost
+    margin = spread / max(1.0, abs(cost)) * 100.0
+    return spread >= spread_min and margin >= margin_min
+
+
+def _fixed_tariff_low(billing_ct, binding, config):
+    prices = binding["prices"]
+    if len(prices) < 2 or billing_ct >= prices[-1] - 0.001:
+        return False
+    if billing_ct <= prices[0] + 0.001:
+        return True
+    # Zwischenstufen müssen den gleichen Kostenabstand wie Netzladen tragen.
+    profile = market_charge_profile_contract(config)
+    efficiency = _clamp(_configured_float(config, "market_roundtrip_efficiency_pct",
+        "direct_marketing_roundtrip_efficiency_pct", DEFAULT_ROUNDTRIP_EFFICIENCY_PCT), 1.0, 100.0) / 100.0
+    degradation = max(0.0, _configured_float(config, "market_degradation_ct_per_kwh",
+        "direct_marketing_degradation_ct_per_kwh", DEFAULT_DEGRADATION_CT_PER_KWH))
+    return _grid_price_profit_ok(billing_ct, prices[-1], efficiency, degradation,
+        _clamp(safe_float(profile.get("safety_ct"), 0.0), -10.0, 50.0),
+        max(0.0, safe_float(profile.get("profit_hold_ct"), DEFAULT_PROFIT_HOLD_CT_PER_KWH)),
+        max(0.0, safe_float(profile.get("min_margin_pct"), DEFAULT_MIN_MARGIN_PCT)))
+
+
 def _annotate_slots(
     raw_slots,
     min_billing_ct,
@@ -1166,6 +1200,8 @@ def _annotate_slots(
     low_cut_ct,
     high_cut_ct,
     billing_price_required=False,
+    fixed_tariff=None,
+    config=None,
 ):
     annotated = []
     for slot in raw_slots:
@@ -1175,6 +1211,24 @@ def _annotate_slots(
             slot,
             billing_price_required=billing_price_required,
         )
+        fixed_reason = None
+        if fixed_tariff is not None:
+            if not fixed_tariff.get("valid"):
+                fixed_reason = fixed_tariff["reason"]
+            else:
+                raw_billing = slot.get("billing_price_ct")
+                if raw_billing is None:
+                    raw_billing = slot.get("billing_price")
+                fixed_billing = _finite_float(raw_billing, None)
+                expected = configured_billing_price_for_timestamp(config, ts / 1000.0)
+                if fixed_billing is None:
+                    fixed_reason = "fixed_tariff_billing_missing_or_invalid"
+                elif (not any(abs(fixed_billing - price) <= 0.001 for price in fixed_tariff["prices"])
+                        or expected is None or abs(fixed_billing - expected) > 0.001):
+                    fixed_reason = "fixed_tariff_billing_conflicting"
+            if fixed_reason:
+                price_quality["complete"] = False
+                price_quality["reasons"].append(fixed_reason)
         price_complete = bool(price_quality.get("complete"))
         if price_complete:
             market_ct = _market_ct(slot)
@@ -1191,14 +1245,12 @@ def _annotate_slots(
         load_w = home_w + wp_w + _planned_load_w(slot)
         deficit_wh = max(0.0, load_w - pv_w) * hours
         surplus_wh = max(0.0, pv_w - load_w) * hours
-        is_low = bool(
-            price_complete
-            and (billing_ct <= low_cut_ct + 0.001 or score >= 75.0)
-        )
-        is_high = bool(
-            price_complete
-            and (billing_ct >= high_cut_ct - 0.001 or score <= 25.0)
-        )
+        if fixed_tariff is not None:
+            is_low = _fixed_tariff_low(billing_ct, fixed_tariff, config) if price_complete else None
+            is_high = bool(len(fixed_tariff["prices"]) > 1 and billing_ct >= fixed_tariff["prices"][-1] - 0.001) if price_complete else None
+        else:
+            is_low = bool(price_complete and (billing_ct <= low_cut_ct + 0.001 or score >= 75.0))
+            is_high = bool(price_complete and (billing_ct >= high_cut_ct - 0.001 or score <= 25.0))
         energy_quality = _slot_energy_quality(slot)
         annotated.append({
             "ts": ts,
@@ -1212,6 +1264,9 @@ def _annotate_slots(
             "surplus_wh": surplus_wh,
             "is_negative_billing": bool(price_complete and billing_ct < 0.0),
             "is_negative_market": bool(price_complete and market_ct < 0.0),
+            **({"tariff_revision": fixed_tariff.get("revision"),
+                "fixed_tariff_stage_reason": fixed_reason or ("fixed_tariff_uniform" if len(fixed_tariff["prices"]) < 2 else "fixed_tariff_stages_valid"),
+                "fixed_tariff_variable": bool(price_complete and len(fixed_tariff["prices"]) > 1)} if fixed_tariff is not None else {}),
             "is_low": is_low,
             "is_high": is_high,
             "energy_inputs_complete": bool(energy_quality.get("complete")),
@@ -1604,7 +1659,8 @@ def _future_need(
                 window_deficit_wh += slot["deficit_wh"]
             # Gutschrift-Qualifikation über den Preisvergleich (Fensterreferenz +
             # Toleranz) und vollständige Preisdaten, nicht über das Quantil is_low (kippt mit dem wandernden Prefix);
-            # im Komfort-Profil zusätzlich das je Plan gebundene Preislimit (require_low_key).
+            # Bei festen Tarifen muss die Stufe zusätzlich tatsächlich günstig sein;
+            # im Komfort-Profil gilt das je Plan gebundene Preislimit (require_low_key).
             cheap_slot = bool(
                 credit_cfg
                 and not in_window
@@ -2027,7 +2083,7 @@ def _economic_state(
         )
         grid_profit_ok = bool(negative_profit_ok or comfort_price_ok)
     else:
-        grid_profit_ok = bool(negative_profit_ok or (grid_spread_ct >= profit_hold_ct and grid_margin_pct >= min_margin_pct))
+        grid_profit_ok = bool(negative_profit_ok or _grid_price_profit_ok(current_billing_ct, future_benefit_ct, efficiency, degradation, safety_correction, profit_hold_ct, min_margin_pct))
 
     # Holding the battery is not grid-charging: no additional storage cycle is
     # created, so roundtrip efficiency and battery wear do not belong here.
@@ -2053,7 +2109,7 @@ def _economic_state(
         "min_margin_pct": round(min_margin_pct, 1),
         "profit_hold_ct_per_kwh": round(profit_hold_ct, 2),
         "margin_hold_pct": round(margin_hold_pct, 1),
-        "current_billing_ct": round(current_billing_ct, 2),
+        "current_billing_ct": round(current_billing_ct, 2) if current.get("price_inputs_complete") or "fixed_tariff_stage_reason" not in current else None,
         "future_benefit_ct": round(future_benefit_ct, 2),
         "effective_grid_charge_cost_ct": round(effective_charge_cost_ct, 2),
         "effective_hold_cost_ct": round(effective_hold_cost_ct, 2),
@@ -2525,6 +2581,10 @@ def build_market_economics_plan(
         max_billing_ct = 0.0
         low_cut_ct = 0.0
         high_cut_ct = 0.0
+    fixed_tariff = recurring_tariff_stages(config) if billing_price_required else None
+    if fixed_tariff is not None:
+        low_cut_ct = fixed_tariff["prices"][0] if fixed_tariff.get("valid") else None
+        high_cut_ct = fixed_tariff["prices"][-1] if fixed_tariff.get("valid") else None
     annotated = _annotate_slots(
         raw_slots,
         min_billing_ct,
@@ -2532,6 +2592,7 @@ def build_market_economics_plan(
         low_cut_ct,
         high_cut_ct,
         billing_price_required=billing_price_required,
+        fixed_tariff=fixed_tariff, config=config,
     )
     current_idx = _current_index(annotated, now_ms)
     if current_idx < 0:
@@ -2563,6 +2624,7 @@ def build_market_economics_plan(
     for slot in annotated:
         slot["is_comfort"] = bool(
             comfort_profile
+            and (fixed_tariff is None or slot.get("fixed_tariff_variable") is True)
             and plan_price_limit_ct is not None
             and bool(slot.get("price_inputs_complete"))
             and safe_float(slot.get("billing_ct"), 0.0) <= safe_float(plan_price_limit_ct, 0.0) + 0.001
@@ -2666,7 +2728,8 @@ def build_market_economics_plan(
     credit_reference_bound_ts = int(now_ms)
     credit_reference_stats = {"slots": 0, "past_slots": 0}
     held_reference = (
-        _window_reference_state(window_reference, int(grid_charge_window["end_ts"]), now_ms, tariff, grid_low_key)
+        _window_reference_state(window_reference, int(grid_charge_window["end_ts"]), now_ms, tariff, grid_low_key,
+            tariff_revision=fixed_tariff.get("revision") if fixed_tariff is not None else None)
         if grid_charge_window
         else None
     )
@@ -2681,6 +2744,7 @@ def build_market_economics_plan(
                 timeline, annotated, now_ms, min_billing_ct, max_billing_ct, low_cut_ct, high_cut_ct,
                 billing_price_required=billing_price_required, comfort_profile=comfort_profile,
                 price_limit_ct=plan_price_limit_ct,
+                fixed_tariff=fixed_tariff, config=config,
             )
             if grid_charge_window
             else []
@@ -2696,6 +2760,7 @@ def build_market_economics_plan(
     if grid_charge_window:
         window_reference_out = {
             "window_end_ts": int(grid_charge_window["end_ts"]),
+            **({"tariff_revision": fixed_tariff.get("revision")} if fixed_tariff is not None else {}),
             "ref_ct": round(safe_float(credit_reference_ct, 0.0), 4),
             "bound_ts": int(credit_reference_bound_ts),
             "source": credit_reference_source,
@@ -2720,7 +2785,7 @@ def build_market_economics_plan(
         cut_window_end_ts_ms=int(grid_charge_window["end_ts"]) if grid_charge_window else None,
         future_cheap_credit={
             "low_key": grid_low_key,
-            "require_low_key": bool(comfort_profile),
+            "require_low_key": bool(comfort_profile or fixed_tariff is not None),
             "charge_power_w": planning_charge_power_w,
             "current_billing_ct": safe_float(current.get("billing_ct"), 0.0),
             "reference_billing_ct": safe_float(credit_reference_ct, 0.0),
@@ -3223,9 +3288,11 @@ def build_market_economics_plan(
             if current_price_complete
             else None
         ),
-        "is_low": bool(current["is_low"]),
+        "is_low": current["is_low"],
+        **({"fixed_tariff_stage_reason": current.get("fixed_tariff_stage_reason"),
+            "tariff_revision": current.get("tariff_revision")} if fixed_tariff is not None else {}),
         "is_comfort": bool(current.get("is_comfort")),
-        "is_high": bool(current["is_high"]),
+        "is_high": current["is_high"],
         "is_negative_billing": bool(current["is_negative_billing"]),
         "deficit_wh": round(current["deficit_wh"], 0),
         "surplus_wh": round(current["surplus_wh"], 0),

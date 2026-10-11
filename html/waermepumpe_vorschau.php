@@ -1,4 +1,5 @@
 <?php
+require_once __DIR__ . '/heatpump_season.php';
 /**
  * waermepumpe_vorschau.php – neue Ansicht der Wärmepumpe mit Anlagenbild (Vorschau, experimentell).
  *
@@ -316,6 +317,7 @@ function wpv_collect_inputs(array $conf, array $opts = []): array
         'flag_manual_boost' => is_file($rd . '/manual_boost.flag') || is_file($dd . '/morning_boost_state.json'),
         'flag_manual_ww' => is_file($rd . '/manual_ww_boost.flag'),
         'weather_alerts' => wpv_read_json($rd . '/weather_alerts.json'),
+        'season_decision' => e3dcWpSeasonDecision($rd . '/energy_decision_latest.json'),
     ];
 }
 
@@ -396,9 +398,10 @@ function wpv_build_state(array $conf, array $in): array
     $aussen = wpv_pick($d, ['Außentemperatur', 'Aussentemp']);
     $mittel = wpv_pick($d, ['Aussentemperatur_Mittel', 'Aussentemp_Mittel', 'Gemittelte Außentemperatur',
         'Gemittelte Aussentemperatur', 'Mitteltemperatur', 'Außentemperatur_Mittel', 'Aussen_Mittel']);
-    $seasonBase = $mittel ?? wpv_num($d['wp_season_temp'] ?? null) ?? $aussen;
-    $heizgrenze = wpv_pick($d, ['Heizgrenze_Temperatur', 'Heizgrenze', 'Heizgrenze_Temp']) ?? wpv_num($conf['heizgrenze_temp'] ?? null);
-    $season = ($seasonBase !== null && $heizgrenze !== null) ? ($seasonBase < $heizgrenze ? 'winter' : 'sommer') : null;
+    $seasonFields = e3dcWpSeason($d, $conf, $in['season_decision'] ?? [], $now);
+    $mittel = $seasonFields['wp_season_temperature_source'] === 'mittel' ? $seasonFields['wp_season_temp'] : null;
+    $heizgrenze = $seasonFields['wp_heating_limit_temp'];
+    $season = $seasonFields['wp_season'] === '' ? null : ($seasonFields['wp_season'] === 'summer' ? 'sommer' : 'winter');
 
     $vl = wpv_pick($d, ['Vorlauf_Ist', 'Vorlauf']);
     $vlSoll = ($wpType === 1) ? wpv_pick($d, ['Vorlauf_Soll', 'Vorlauf-Soll']) : null;
@@ -698,6 +701,8 @@ function wpv_build_state(array $conf, array $in): array
         'flags' => $flags,
         'flow_dur' => $flowDur,
         'season' => $season,
+        'season_hint' => $seasonFields['wp_season_hint'],
+        'season_source' => $seasonFields['wp_season_source'],
         'heizgrenze' => $heizgrenze,
         'buffer' => ['present' => $hasBuffer, 'sensor' => $bufferSensor, 'label' => $bufferLabel] + $val($buffer, $bufferWhy),
         'hk_text' => $hkText,
@@ -1064,7 +1069,7 @@ function wpv_render(array $s): string
       <?php if ($s['auto_mode'] === 0): ?>
       <button type="submit" name="toggle_auto_mode" value="1" class="act muted" title="PV-Überschuss-Automatik einschalten">⏸ Automatik aus</button>
       <?php else: ?>
-      <button type="submit" name="toggle_auto_mode" value="0" class="act ok" title="PV-Überschuss-Automatik abschalten">✓ Automatik</button>
+      <button type="submit" name="toggle_auto_mode" value="0" class="act ok" title="Klick schaltet die Automatik sofort aus. Bei Luxtronik-Direktanbindung läuft ein gerade laufender Verdichter bei PV- und Tarif-Aufträgen zum Schutz der Wärmepumpe seine Mindestlaufzeit zu Ende.">✓ Automatik</button>
       <?php endif; ?>
     </form>
   </div>
@@ -1257,7 +1262,7 @@ function wpv_render(array $s): string
         <?= wpv_svg_text('class="c-val" x="58" y="45"', $f1($v['aussen'], ' °C'), $v['aussen']['why']) ?>
         <?= wpv_svg_text('class="c-sub" x="146" y="45"', 'Ø ' . $f1($v['mittel'], ' °C'), $v['mittel']['why']) ?>
         <?php if ($s['season'] !== null): ?>
-        <g class="season<?= $s['season'] === 'sommer' ? ' sommer' : '' ?>" transform="translate(204 12)"><title><?= wpv_h('Gemittelte Außentemperatur gegen die Heizgrenze ' . wpv_fmt($s['heizgrenze'], 1, ' °C')) ?></title><rect width="48" height="18" rx="9"/><text x="24" y="13" text-anchor="middle"><?= $s['season'] === 'sommer' ? 'Sommer' : 'Winter' ?></text></g>
+        <g class="season<?= $s['season'] === 'sommer' ? ' sommer' : '' ?>" transform="translate(204 12)"><title><?= wpv_h($s['season_hint']) ?></title><rect width="48" height="18" rx="9"/><text x="24" y="13" text-anchor="middle"><?= $s['season'] === 'sommer' ? 'Sommer' : 'Winter' ?></text></g>
         <?php endif; ?>
       </g>
       <g class="chip opt" transform="translate(984 16)">

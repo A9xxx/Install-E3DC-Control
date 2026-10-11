@@ -5034,7 +5034,8 @@ def curve_battery_support_contract(
     if (
         bool(floor_mode)
         and wbminsoc_gate_open is False
-        and result.get("authorized") is True
+        and (result.get("authorized") is True
+             or result.get("reason") == "curve_relation_missing_pv_only")
     ):
         result.update(
             authorized=False,
@@ -5096,7 +5097,10 @@ def _curve_battery_support_by_relation(
             return result
         result.update(authorized=False, reason="curve_below_target_pv_only", budget_class="pv_only")
         return result
-    # no_curve / unknown / leer: die Kurve schränkt nichts ein.
+    # Nur eine ausdrücklich nicht vorhandene Kurve gibt die Stützung frei.
+    # Fehlende oder unbekannte Korridorlagen sind keine Freigabe.
+    if rel != "no_curve":
+        result.update(authorized=False, reason="curve_relation_missing_pv_only", budget_class="pv_only")
     return result
 
 

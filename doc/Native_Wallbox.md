@@ -12,8 +12,8 @@ Aktor, Anti-Flattern, Akkustützung nach Korridorlage) stehen in
 
 * **Multi-Wallbox:** WB1 und WB2 werden getrennt gelesen, angezeigt und
   budgetiert.
-* **Klare Nutzer-Modi:** `Aus`, `PV-Kurve ruhig`, `Grundladung stabil`,
-  `PV + Akku bis Untergrenze` und `Sofort bis Preislimit`.
+* **Klare Nutzer-Modi:** `Aus / autonom`, `PV-Kurve ruhig`, `Grundladung stabil`,
+  `PV + Akku bis Untergrenze`, `Sofort bis Preislimit` und `Akku bis Abfahrt`.
 * **Geplantes Netzladen:** Slotladen funktioniert in allen aktiven Modi und
   ignoriert das Wallbox-Preislimit, weil die Preislogik bereits in der
   Slot-Auswahl steckt. Im Modus `Aus` ist geplantes Laden gesperrt.
@@ -47,7 +47,7 @@ Aktor, Anti-Flattern, Akkustützung nach Korridorlage) stehen in
 | `Aus` | NGNA: E3DC-Control beobachtet nur. Eine Standardfreigabe wird nur einmalig nach bewusstem Wechsel auf `Aus` in der WebUI gesendet. |
 | `PV-Kurve ruhig` | Lädt entlang der Speicher-Ladekurve mit Hysterese. Der Hausspeicher behält Vorrang, wenn die Prognose knapper wird. |
 | `Grundladung stabil` | Hält eine ruhige Grundladung, solange das Speicherziel laut Planung erreichbar bleibt. |
-| `PV + Akku bis Untergrenze` | Nutzt PV und oberhalb der Hausakku-Untergrenze zusätzlich den Speicher. Die unten beschriebene begrenzte Phasenerkennung darf kurz Netzleistung überbrücken. Ist die Untergrenze erreicht und trägt das PV-Budget dieser Wallbox die Mindestleistung der aktuellen Phasenzahl nicht, wird eine laufende Ladung bei dieser Phasenzahl auf den Mindeststrom gesetzt (ohne PV sofort, bei noch anliegendem PV nach 20 s Bestätigung) und nach einem Durchlauf des Wh-Kontos gestoppt; eine dreiphasig ladende openWB Pro wechselt stattdessen auf 1p, wenn das PV-Budget das 1p-Minimum trägt. Laden mehrere Wallboxen, wird diese Wallbox ohne Netzbezug zuerst abgesenkt, sofern sie selbst über ihrer Zuteilung lädt; deckt ihre Zuteilung die tatsächliche Ladeleistung, lädt sie weiter. Netzbezug und ein laufender Phasenwechsel einer anderen Wallbox haben Vorrang. |
+| `PV + Akku bis Untergrenze` | Nutzt PV und oberhalb der Hausakku-Untergrenze zusätzlich den Speicher. Reicht die PV unter den Speicher- und belegten Fahrzeug-Leistungsgrenzen nicht für Akku und geeignete Fahrzeuge, endet die heutige PV-Kurve bei wbminSoC, auch bei Prognose auf 100%. Bedarf 0 lässt das normale Ziel bestehen; unbekannter Bedarf zählt nach bestätigter Ladung weiter, nur am selben Kurventag und in derselben Steck-Episode; nach 60 Minuten unter 300 W bei ausreichendem PV- und Stromangebot endet dieser Beleg. Unterbrechungen bis zwei Minuten pausieren die Uhr; längere setzen sie zurück. Das gilt für alle Wallboxen (geregelt und beobachtet), in Aus nur mit „Nur beobachten, Speicher oberhalb Hausreserve freigegeben“. Zur normalen Kurve ab 110 %, zurück unter 100 %; jede Wahl hält etwa 15 Minuten. Bestätigtes Abstecken und Pause wirken ab dem nächsten Planlauf; relevante Änderungen lösen nach 60 Sekunden stabilem Zustand neu aus. Folgetage und Netzladeziele bleiben normal. Details stehen in `Ladekurve_Berechnung.md`, Abschnitt „Abendziel bei PV + Akku“. Die unten beschriebene begrenzte Phasenerkennung darf kurz Netzleistung überbrücken. Ist die Untergrenze erreicht und trägt das PV-Budget dieser Wallbox die Mindestleistung der aktuellen Phasenzahl nicht, wird eine laufende Ladung bei dieser Phasenzahl auf den Mindeststrom gesetzt (ohne PV sofort, bei noch anliegendem PV nach 20 s Bestätigung) und nach einem Durchlauf des Wh-Kontos gestoppt; eine dreiphasig ladende openWB Pro wechselt stattdessen auf 1p, wenn das PV-Budget das 1p-Minimum trägt. Laden mehrere Wallboxen, wird diese Wallbox ohne Netzbezug zuerst abgesenkt, sofern sie selbst über ihrer Zuteilung lädt; deckt ihre Zuteilung die tatsächliche Ladeleistung, lädt sie weiter. Netzbezug und ein laufender Phasenwechsel einer anderen Wallbox haben Vorrang. |
 | `Sofort bis Preislimit` | Netzladen nur, wenn der aktuelle Preis unter dem Wallbox-Preislimit liegt. Ohne Preis- oder Netzfenster gilt an der Hausakku-Untergrenze dieselbe Absenkung wie in `PV + Akku bis Untergrenze`. |
 | `Akku bis Abfahrt` | Lädt im Freigabefenster vor der Abfahrtszeit aus PV und Hausspeicher bis zur Hausakku-Untergrenze `wbminsoc`; Netzladen bleibt gesperrt. Gestoppt wird bei erreichter Abfahrtszeit, vollem Fahrzeug oder erreichter Untergrenze. Abfahrtszeit `wb<n>_battery_departure_time` (Standard `06:30`), Fenster `wb<n>_battery_departure_window_h` (Standard 3 h, 1–36 h). |
 
@@ -360,16 +360,21 @@ Leistungsgrenzen bleiben unverändert.
 ## Konfiguration
 
 Neue Systeme werden im Config-Editor in `data/e3dc_v4.json` konfiguriert.
+Die Installationszentrale bietet „Installieren“ erst an, wenn der Schalter
+„Native Wallbox-Regelung“ (`wb_native_enable=1`) im Config-Editor aktiviert ist.
 Wichtige Felder:
 
 ```ini
 wb_native_enable = 1
-wb_native_type = e3dc|openwb|openwb_pro|goe|none
+wb_native_type = e3dc_auto   # Standard. Werte wie in der Auswahlliste „Wallbox 1 Modell / API“ des Config-Editors:
+                             # none | go-e | openwb | openwb_pro | e3dc_auto | e3dc_efy | e3dc_easy_connect | e3dc_multi | e3dc | dummy
+                             # (goe wird als go-e verstanden)
+wb_native_type2 = none       # zweite Wallbox, gleiche Werte; none oder leer = keine zweite Wallbox
 wb_native_ip = 192.0.2.50
 wb_native_mode = 0|1|2   # Dual-Wallbox-Priorität: 0=beide, 1=WB1, 2=WB2
-wb1_mode = 0|2|3|4|5
-wb2_mode = 0|2|3|4|5
-wbminsoc = 50
+wb1_mode = 0|2|3|4|5|12
+wb2_mode = 0|2|3|4|5|12
+wbminsoc = 70
 wbmaxladestrom = 16
 wb1_max_amp = 16
 wb2_max_amp = 16
@@ -383,9 +388,9 @@ wb_openwb_start_cp_retries = 3   # openWB Pro: 1..3, Standard 3; ungültig -> 3 
 openwb_pro_start_hold_s = 180    # openWB Pro Startfenster: 60..600 s, ungültig -> 180
 openwb_pro_start_retry_cycle_s = 300  # openWB Pro Start-Wiederholzyklus: 180..1200 s, ungültig -> 300
 openwb_pro_start_cp_grace_s = 60 # openWB Pro CP-Karenz: Untergrenze 60 s (Fahrzeugprofil verkürzt nicht), max 600
-wb_openwb_start_retry_s = 45     # openWB Pro: wirksam max(60, Wert); praktisch wirkungslos, der Zyklus entscheidet
-openwb_pro_start_reject_timeout_s = 120  # openWB Pro: wird gelesen, ohne Wirkung auf den Latch (SoC entscheidet)
-openwb_pro_start_grace_s = 60    # openWB Pro: Fallback für Alt-Aufrufer des Angebots-Halts; im Startfenster ohne Wirkung
+wb_openwb_start_retry_s = 45     # openWB/openWB Pro: Mindestabstand für Start-Wiederholungen; wirksam mindestens 30 s, im Weckschritt des Pro-Startfensters mindestens 60 s. Den Wiederholzyklus des Startfensters bestimmt openwb_pro_start_retry_cycle_s.
+openwb_pro_start_reject_timeout_s = 120  # openWB Pro: Mindestalter eines unbeantworteten Startangebots (wirksam mindestens 60 s); der Start-Reject-Latch verlangt zusätzlich eine vollständige Start-Episode und frischen SoC am Ziel.
+openwb_pro_start_grace_s = 60    # openWB Pro: Annahmefrist eines frischen Startangebots; in dieser Zeit erzeugt ein Budget-Einbruch kein 0 A. Im haltenden Startfenster ohne zusätzliche Wirkung.
 ```
 
 Eine alte `e3dc.config.txt` ist nur noch Migration und Legacy-Fallback. Neue
@@ -660,8 +665,34 @@ Primary/Secondary-Annahme sichtbar, statt still weiter Befehle zu senden.
 | **Nur Messwerte aus evcc/openWB** | Keine Steuerfreigabe nötig; nur MQTT-Leistungstopic bereitstellen. | Observe-only per MQTT-Leistungstopic | Keine Steuerbefehle; Leistung wird für Dashboard, Historie und Hausverbrauchsbereinigung genutzt. |
 
 Bei `openWB Primary` gibt es deshalb zwei bewusst benannte Rollen: **Primary
-PV-geführt** heißt, openWB bleibt im PV-Modus und E3DC-Control führt nur den
-Speicherrahmen anhand der gemessenen Wallboxleistung. **Primary-Direktpfad**
+PV-geführt** heißt, openWB führt den Ladepunkt; E3DC-Control hält den normalen
+Speicher-Laderahmen und begrenzt bei laufender Ladung nur die Entladeseite.
+In `PV-Kurve ruhig` versorgt der Akku höchstens das Haus-/WP-Defizit. In
+`PV + Akku bis Untergrenze` ist die Entladung oberhalb von `wbminsoc` frei,
+am Boden gilt wieder der Haus-/WP-Deckel. Die Untergrenze hebt die Kurve nicht
+zusätzlich an. Das aktive Planziel und der normale Kurvenregler bestimmen
+die Speicherladung.
+
+Empfohlen ist auf der openWB die Ladepriorität **Speicher**, damit ihre
+Überschussregelung die Speicherladung nach Ladekurve berücksichtigt. Bei
+Ladepriorität **Fahrzeuge** zählt die openWB auch die Speicherladung als
+verfügbaren Überschuss. Jede Speicherentladung zieht sie grundsätzlich vom
+Überschuss ab: Akkustrom für das Auto in `PV + Akku` muss deshalb zusätzlich
+in der openWB selbst erlaubt sein. Die Entladefreigabe von E3DC-Control allein
+erzwingt keine Fahrzeugladung.
+
+Ein bewusster Wechsel in E3DC-Control auf `PV-Kurve ruhig` oder `PV + Akku bis
+Untergrenze` setzt die openWB einmal auf PV. Eine direkt an der openWB gewählte
+Einstellung `Sofort` oder `Stop` bleibt danach auch über einen Manager-Neustart
+bestehen; der Speicher folgt weiter dem E3DC-Control-Modus. Einen selbst
+vorher gesendeten Stop oder Sofortauftrag nimmt E3DC-Control nur mit einem
+gespeicherten Eigenbefehl-Beleg zurück. Er bleibt bei Neustart und
+Konfigurationsänderung höchstens sieben Tage erhalten. In `Aus` erfolgt
+keine Modusrücknahme. Meldet die openWB einen anderen Modus,
+entfällt die Rücknahme. Eine Handpause sendet einmal Stop; beim Aufheben
+erfolgt die Rücknahme über denselben Beleg. Scheitert ein bewusster
+PV-Moduswechsel, wird er höchstens alle 30 Sekunden für fünf Minuten
+wiederholt. **Primary-Direktpfad**
 heißt, E3DC-Control setzt Strom über den dokumentierten openWB-Sofortladen-Strom
 `chargecurrent`; openWB zeigt dann Sofortladen und Sofortladen-Limits wie
 Ziel-SoC oder Energiemenge können die Ladung beenden. Wer eine aktive
@@ -690,18 +721,58 @@ Pfad bewährt:
   Sie bleibt an dieselbe Stecksession gebunden und übersteht einen Neustart
   des Managers. Sie bedeutet weder einen bestätigten Fahrzeug-SoC von 100 %
   noch dauerhaft geschlossene Leistungsschütze.
-* **Budgetabhängige Bereitschaft:** Fehlt das Budget für die gehaltenen Phasen,
-  setzt die Regelung `ampere=0`. Bei erneut ausreichendem Budget bietet sie
-  den Mindeststrom nach den bestehenden Wiederanlauf- und Schutzfristen wieder
-  an. Es entsteht keine dauerhafte Fahrzeug-Ladeende-Sperre. `6 A` an drei
+* **Budgetabhängige Bereitschaft:** Entscheidend ist das Quellenbudget des
+  aktiven Modus für die frischen, von der Box zurückgemeldeten Phasen.
+  Weichen Phasenvertrag und gespeicherte Ladeendephase ab, gilt der größere
+  Leistungsbedarf. Ein auf 0 W
+  gefallener Ladepunktrahmen nach einem Fahrzeug-App-Stopp ersetzt diese
+  Messung nicht: Bei weiter ausreichender Quelle bleibt das Angebot stehen.
+  Das PV-Budget folgt der bestehenden Bilanz aus Netzpunkt und Wallboxlast,
+  ohne Akkuentladung als PV zu verbuchen. Die externe Wallbox steckt im
+  gemessenen Hausverbrauch; ihre Leistung wird nicht zusätzlich abgezogen.
+  Netz und Akku zählen nur mit den Freigaben und Grenzen des aktiven Modus.
+  In „PV-Kurve ruhig“ zählt das Akku-Wolkenkontingent nicht als
+  Bereitschaftsquelle. Bei mehreren Ladepunkten muss jeder Status frisch und
+  gültig sein. Bereits verteilte Leistung zählt auch vor der tatsächlichen
+  Ladeannahme als reserviert. Istleistung und Zuteilung derselben Box werden
+  einmal berücksichtigt, der höhere Wert gilt. Das Mindestangebot erhält
+  nur den danach freien Anteil des Quellenbudgets; das gilt auch bei
+  freigegebener Netz- oder Akkuladung. Ruhende Angebote werden nach der
+  bestehenden Verbraucherpriorität reserviert. Ein kurzer Statusausfall
+  eines anderen Ladepunkts hält ausschließlich ein zuvor gedecktes,
+  frisch bestätigtes Angebot unverändert, bis 45 Sekunden nach dem letzten
+  gültigen Quellenbeleg. Er erlaubt weder Anheben noch Neuangebot; danach
+  gilt 0 A. Der eigene Status und die Liveprobe müssen gültig bleiben. Gruppen- und
+  Hausanschlussgrenzen gelten auch während der Toleranz sofort.
+  Ein nur kurz veralteter Budgetdatensatz (15 bis unter 45 Sekunden) hält
+  ausschließlich ein zuvor gedecktes, bereits stehendes Angebot unverändert.
+  Er erlaubt weder eine Anhebung noch ein neues Angebot. Ab 45 Sekunden,
+  bei ungültigen Live-Daten oder einer harten Schutzgrenze folgt 0 A.
+  Ein kurzer Budgeteinbruch lässt das Angebot für `openwb_pro_start_hold_s`
+  stehen (Standard 180 s, gültig 60–600 s; bei HLC oder unbekannter
+  Signalisierung gilt der vorhandene Faktor 2). Danach setzt die Regelung
+  einmal `ampere=0` und bleibt ohne weitere Befehle, solange der Zustand
+  unverändert ist. Nutzer- und Schutzgrenzen wirken weiterhin sofort.
+  Bei erneut ausreichendem Budget bietet sie
+  nach den bestehenden Wiederanlauf- und Schutzfristen den Mindeststrom mit
+  einem Strombefehl an, ohne Startfenster-Wiederholung, Weckimpuls,
+  CP-Unterbrechung oder Phasenwechsel. Es entsteht keine dauerhafte
+  Fahrzeug-Ladeende-Sperre. `6 A` an drei
   Phasen benötigen rund `4,14 kW`; eine Nullmessung wird nicht als einphasiges
   Fahrzeug behandelt. Nach einem Stop der Defizit-Kaskade (Netz- oder
   Akku-Wh-Konto) in derselben Stecksession bietet die Regelung den Mindeststrom
   erst wieder an, wenn das PV-Budget die Mindestleistung der erwarteten
   Phasenzahl `wb_pv_only_release_hold_s` (Standard 120 s) lang durchgehend
-  deckt; eine einzelne Wolkenlücke startet nicht. Eigene
+  deckt; eine einzelne Wolkenlücke startet nicht. Dieser Bereitschaftspfad
+  setzt Fahrzeug-Ladeende-Evidenz derselben Stecksession voraus. Ein
+  Kaskadenstopp während normaler Ladung ohne solche Evidenz kehrt über den
+  dokumentierten Weg „Wiederanlauf als Einladung“ mit Startfenster und
+  bestehenden Wiederhol- und Weckfristen zurück.
+  Die Budgetrückkehr der Bereitschaft wird wie ihr Halten am Quellenbudget
+  gemessen, auch wenn der Ladepunktrahmen weiterhin 0 W beträgt. Eigene
   Ziel-SoC-/Energiemengen- und Abfahrtsgrenzen, Nutzerpause und
   Schutzvorgaben behalten Vorrang. `Aus` bleibt beobachtend.
+  Beim Eintritt in die Bereitschaft endet ein alter Startfensterkern.
   Sobald echte Ladeleistung bestätigt wird, übernimmt die normale Regelung.
   Bei der Pro ist `ampere=0` bereits der Stopbefehl; ein zusätzlicher
   CP-Reset wird für die Budgetpause nicht gesendet.
@@ -1346,15 +1417,45 @@ liest Leistung und Status, bereinigt den Hausverbrauch und kann mit bewusst
 aktiviertem `openWB Primary` nur den openWB-eigenen Modus wechseln:
 
 ```text
-Normal/Rückgabe -> set_chargemode=pv
+Moduswechsel / eigener Auftrag beendet -> set_chargemode=pv
 Aktiver Eingriff -> chargecurrent=<Ampere>, set_chargemode=instant
 Schutz/Stop      -> set_chargemode=stop
 ```
+
+In den PV-Modi setzt E3DC-Control PV nur einmal beim bewussten Moduswechsel
+oder bei der Rücknahme eines eigenen Stop-/Sofortauftrags. Eine Nutzerwahl an
+der openWB bleibt bestehen. Der Speicher hält seinen Kurvenrahmen; seine
+Entladegrenze schützt in `PV-Kurve ruhig` Haus und Wärmepumpe und gibt in
+`PV + Akku` oberhalb von `wbminsoc` Akkustützung frei. Die Ladepriorität
+**Speicher** auf der openWB berücksichtigt die Ladekurve. Akkustrom für das
+Auto muss die openWB selbst erlauben, da sie Speicherentladung vom Überschuss
+abzieht. Für volle Stromregelung durch E3DC-Control ist die openWB Software
+als **Secondary** einzurichten.
 
 Dieser Pfad ist ein Opt-in und kein automatischer Default. Besonders bei einer
 extern eingebundenen openWB Pro ist er nicht als Pro-Fernsteuerung gedacht. Wenn
 E3DC-Control die Pro wirklich führen soll, die Pro direkt als
 `openWB Pro (connect.php)` konfigurieren.
+
+Die openWB-Karte zeigt den von openWB gemeldeten Lademodus und ihre
+Statusmeldung mit dem Alter seit dem letzten Lesen. Fehlende Statusmeldungen
+bleiben leer. Steht E3DC-Control auf „PV-Kurve ruhig“ oder „PV + Akku“ und meldet
+die openWB „Sofort“ oder „Stop“, wird die Wahl an der openWB sichtbar ausgewiesen.
+Die Anzeige ist keine zusätzliche Ladefreigabe und sendet keine Befehle.
+
+Unter „Ladepriorität und openWB-Details“ stehen die gelesene Ladepriorität,
+Softwareversion und Abschaltverzögerung, soweit verfügbar. Die Empfangszeit der
+Ladepriorität ist kein Änderungszeitpunkt: MQTT kann gespeicherte Konfiguration
+nach einer Verbindung erneut liefern. Unbekannte Werte werden nicht geschätzt.
+
+Als Primary mit Ladepriorität „Fahrzeuge“ zählt die openWB auch die Leistung,
+mit der der Hausakku lädt, als Überschuss für das Auto. In „PV-Kurve ruhig“ und
+„PV + Akku“ erscheint deshalb ein beratender Hinweis: Die Ladekurve des Akkus
+kann so nicht gehalten werden. Empfehlung: In den Einstellungen der openWB die
+Ladepriorität „Speicher“ wählen. Bei „Nach SoC des Speichers“ weist die Karte auf
+die eigenen SoC-Schwellen der openWB hin. Bei unbekannter Ladepriorität gibt es
+keine Warnung. E3DC-Control liest diese Einstellung ausschließlich und schreibt
+sie niemals; die Hinweise sperren nichts und ändern die Regelung nicht.
 
 ### openWB Software 2.x als Secondary
 
@@ -1477,3 +1578,45 @@ Freigabe aus.
 | `wb_pv_budget.json Lesefehler überbrückt (…)` | Lesezugriff traf den atomaren Austausch; der letzte gültige Stand zählt weiter. | Keine; nur die Häufigkeit ist ein Hinweis auf stark ausgelastete SD-Karte/CPU. |
 | `wb_pv_budget.json nicht lesbar und kein gültiger Vorstand` | Datei seit Prozessstart nie gültig gelesen. | Ramdisk und Storage Manager prüfen. |
 | `Plan verbraucht` / `Ladeplanung auf 0 gesetzt` | Manueller Ladeplan ohne Wiederholung ist abgearbeitet. | Bei täglichem Bedarf „Täglich wiederholen“ einschalten. |
+
+Der Eigenbefehl-Beleg bleibt auch über Ab- und Wiederanstecken erhalten,
+höchstens sieben Tage und solange die openWB den eigenen Modus meldet.
+Eine leere, beschädigte oder schemafremde Belegdatei wird mit Warnung in
+Quarantäne verschoben. Ohne gültigen Beleg erfolgt kein Eingriff; andere
+Ladepunkte werden dadurch nicht gesperrt. Die Rücknahme auf PV erfolgt
+auch ohne Fahrzeug, aber niemals im Modus `Aus`. Bestätigtes PV oder eine fremde Moduswahl beendet den
+Beleg; die persistente Datei wird nur bei Änderungen geschrieben.
+
+Die Korridorrest- und Messlückenregeln stehen im Abschnitt „Abendziel bei
+PV + Akku“ in [Ladekurve_Berechnung.md](Ladekurve_Berechnung.md).
+
+
+## Startknopf und Wiederanlauf nach Kaskaden-Stop
+
+Der Startknopf erhält den gewählten Lademodus und betrifft die ausgewählte
+Wallbox. Bei „Aus / autonom“ entsteht kein Startbefehl. Ein angenommener
+Start löst eigene Ladeende-, Untergrenzen- und Kaskadenanker derselben
+Stecksession. Nach Kontingent-Ende oder gescheitertem Phasenabstieg gilt
+derselbe Vertrag. Fremde oder geschützte Stopps bleiben erhalten.
+
+Ein bewusster Wechsel auf „PV + Akku bis Untergrenze“ oder „Akku bis Abfahrt“
+löst die Wiederanlaufsperre einmalig. „Sofort bis Preislimit“ löst sie nur
+mit tatsächlicher Akku- oder Netzfreigabe. „PV-Kurve ruhig“ und „Grundladung
+stabil“ lösen sie nicht. Ein neuer Kaskaden-Stop eröffnet eine neue Episode.
+Wh-Konten, Untergrenzen, Messwertgültigkeit und Hardware-Schutzfristen
+gelten weiter. Die Startflanke bleibt mindestens 60 Sekunden und mindestens
+bis zum wirksamen Start-/Stop-Abstand des Geräteprofils zuzüglich eines
+Regelzyklus verfügbar; sie verkürzt die Schutzfrist nicht.
+
+Die Oberfläche unterscheidet gespeicherte, angenommene und abgelehnte
+Startanforderungen. Eine Ablehnung nennt ihren Grund und verbraucht die
+Anforderung nicht. Eine noch ausstehende Prüfung wird als solche gemeldet.
+Die Anforderung wird höchstens 60 Sekunden aufbewahrt. Das Dashboard
+fragt während dieser Zeit begrenzt nach und zeigt das Ergebnis. Eine Annahme
+bestätigt die Entsperrung, nicht bereits die physische Fahrzeugladung.
+Das globale Abbruchflag der automatischen SoC-Planung bleibt beim Einzelstart
+erhalten. Sofortladen wird für die jeweilige Wallbox über den Modus
+„Sofort bis Preislimit“ gewählt; die andere Wallbox bleibt unverändert.
+Die Konfigurationsvariablen `wbhour`, `wb_sofort`, `wbvon` und `wbbis` bleiben
+für die Ladeplanung verfügbar. Veraltete Direktsteuerungsformulare ändern
+keine Einstellungen.

@@ -10,21 +10,27 @@ Das System ist modular aufgebaut und kann in zwei Hauptkonfigurationen genutzt w
 
 ### a) Nur Ladeplanung (Wallbox)
 *   **Zielgruppe:** Anwender, die **keine steuerbare Wärmepumpe** (Luxtronik) besitzen, aber die intelligente Ladeplanung über ihre Wallbox (E3DC, openWB/openWB Pro oder go-e) nutzen möchten.
-*   **Installation:** Wählen Sie im Installer-Menü unter "Erweiterungen" den Punkt **"Intelligentes Lademanagement installieren/konfigurieren"**.
+*   **Installation:** Im Installer den Hauptmenüpunkt **7) Expertenmenü** öffnen und unter „Erweiterungen & Smart Home“ den Punkt **42) Native Wallbox Manager** ausführen. Danach im Config-Editor die Wallbox-Regelung einschalten: Einfache Ansicht, Abschnitt „Wallbox“, Schalter **Wallbox-Regelung aktiv** und Auswahl **Wallbox 1** (Erweiterte Ansicht: Gruppe „Wallbox & Fahrzeug“, Schalter **Native Python-Regelung aktivieren**, Auswahl **Wallbox 1 Modell / API**).
 *   **Funktion:** In diesem Modus werden nur die Wallbox-bezogenen Steuerungsoptionen aktiviert.
 
 ### b) Energy Manager (Wallbox & Wärmepumpe)
 *   **Zielgruppe:** Anwender, die neben der Wallbox auch eine smarte Wärmepumpe (Luxtronik nativ ODER SG-Ready via Shelly) besitzen.
-*   **Installation:** Wählen Sie im Installer-Menü unter "Erweiterungen" den Punkt **"Energy Manager installieren (Wärmepumpe & Lademanagement)"**.
-*   **Funktion:** In diesem Modus können Sie flexibel wählen, ob die Entladung über die Wallbox oder die Wärmepumpe (oder beides als Fallback) erfolgen soll.
+*   **Installation:** Im **Expertenmenü** unter „Erweiterungen & Smart Home“ den Punkt **41) Energy Manager** ausführen; die Wallbox-Regelung wie unter a) im Config-Editor einschalten.
+*   **Funktion:** Der Energy Manager führt die Wärmepumpe als Aktor. Welche Verbraucher eine geplante Vorab-Entladung (Pre-Dump) nutzen dürfen, wird im Config-Editor unter „Pre-Dump: freigegebene Verbraucher“ festgelegt (Abschnitt 3).
 
 Die Einstellungen für beide Modi finden Sie im Web-Interface im **Config Editor**.
 
 ---
 
-## 2. Feature: Intelligenter Morgen-Boost
+## 2. Legacy: Intelligenter Morgen-Boost
 
-Dies ist die Standard-Funktion für die prognosebasierte Entladung.
+> **Hinweis:** Der Morgen-Boost ist abgelöst. Die prognosebasierte Vorab-Entladung
+> übernimmt Pre-Dump im Storage Manager (Abschnitt 3 und `Pre_Dump.md`). Der
+> Schlüssel `morning_boost_enable` wird vom Energy Manager nur noch gelesen, um
+> einen Hinweis ins Log zu schreiben; der Config-Editor bietet dafür kein Feld
+> mehr an. Die folgende Beschreibung dokumentiert das frühere Verhalten.
+
+Dies war die frühere Funktion für die prognosebasierte Entladung.
 
 ### Das Ziel
 Der Speicher soll bis zu einer definierten **Ziel-Zeit** (z.B. 08:00 Uhr) auf einen einstellbaren **Ziel-SoC** (z.B. 20%) entladen werden.
@@ -122,7 +128,7 @@ zusätzlicher Regelkreis neben dem Storage Manager.
 
 ## 6. Feature: Universal SG-Ready & EVU-Sperre
 Der Energy Manager ist nicht mehr auf Luxtronik-Anlagen beschränkt. Über die Konfigurations-Parameter `shelly_sg_ip` und `shelly_pause_ip` können Sie einfache WLAN-Shelly-Relais an die Steuerungskontakte jeder handelsüblichen Wärmepumpe anschließen.
-*   **SG-Ready (Boost):** Das System schließt den Kontakt bei PV-Überschuss oder günstigen Preisen, woraufhin die WP die Temperatur anhebt.
+*   **SG-Ready (Boost):** Das System schließt den Kontakt bei einer zentralen Freigabe. Die Heizgrenze sperrt diese nicht: Für den automatischen Start zählt eine gültige, frische Warmwasser- oder Rücklauftemperatur unter ihrem Maximum abzüglich Totzone. Ohne gültige Temperaturdaten gibt es keine automatische Freigabe. Die Wärmepumpe entscheidet selbst über den Anlauf; Zieltemperaturen werden über den Kontakt nicht übertragen.
 *   **EVU-Sperre (Pause):** Das System unterbricht den (normalerweise geschlossenen) Kontakt, um die Wärmepumpe in die Prognose-Pause ("Aushungern") zu schicken oder bei extrem hohen Strompreisen abzuschalten.
 
 ---
@@ -136,7 +142,7 @@ Dieses Feature hebt die klassische "Lade für X Stunden" Logik auf ein völlig n
 *   **Fahrzeug-Vorlagen Speichern (Gast-Fahrzeuge):** Für Autos ohne Cloud-Anbindung können im Lade-Menü bequeme Profile (zum Beispiel "Kleinwagen 36 kWh", "Kombi 77 kWh") samt Kapazität und typischer Ladeleistung gespeichert werden. Das System berechnet Ladezeiten und Restreichweite dann auto-spezifisch, selbst für reine "Gast-Fahrzeuge"!
 *   **Die Berechnung:** Hast du einen Ziel-SoC (z.B. 80%) im Config-Editor hinterlegt, berechnet der Energy Manager anhand der konfigurierten Batteriekapazität (z.B. 72 kWh) präzise die noch fehlende Energiemenge.
 *   **Verlust-Kalkulation:** Das System schlägt automatisch **10 % Ladeverluste** auf den Bedarf auf.
-*   **Die Ausführung & Anzeige:** Anhand der dynamischen Ladeleistung (z.B. 11 kW) wandelt das System die benötigten kWh in volle Lade-Stunden um, die auch im Dashboard direkt als **Restladezeit** (*"Voll: 3:30h"*) grafisch visualisiert werden. Dieser Wert wird zudem automatisch für die Preis-Logiken genutzt, sodass das E3DC Kernprogramm sofort die günstigsten Nachtstunden für die Ladung bucht.
+*   **Die Ausführung & Anzeige:** Anhand der dynamischen Ladeleistung (z.B. 11 kW) wandelt das System die benötigten kWh in volle Lade-Stunden um, die auch im Dashboard direkt als **Restladezeit** (*"Voll: 3:30h"*) grafisch visualisiert werden. Ist für die Wallbox „Fertig bis“ mit Dauer aus dem Fahrzeug-SoC aktiv (`wb<n>_smart_wbhour_enable = 1`), nutzt der Wallbox-Manager diese Dauer, um die günstigsten Lade-Slots bis zur Zielzeit zu planen; außerhalb der Slots laden PV und Speicher.
 
 Sobald das Auto den gewünschten Ziel-SoC erreicht hat, werden geplante
 Ladefenster und Pre-Dump-Freigaben für dieses Fahrzeug ausgesetzt, um es nicht
@@ -152,7 +158,7 @@ unbestätigte Werte bleiben `-- SoC`. Normales Laden nach PV, Preisfenster,
 Budget oder kWh-Ziel bleibt weiterhin möglich.
 
 ### Multi-EV & Multi-Wallbox Support (Flotten-Management)
-Das System ist vollständig "Flotten-tauglich" und unterstützt ab Version 3.8.7.2 den parallelen Betrieb von mehreren Fahrzeugen und Ladestellen:
+Das System unterstützt den parallelen Betrieb von mehreren Fahrzeugen und Ladestellen:
 
 *   **Intelligente Fahrzeug-Erkennung:** Wenn du mehrere Autos hast (z. B. über einen Hyundai-Account mit zwei Fahrzeugen oder per MQTT via EVCC), baut das Dashboard automatisch für jedes Auto einen eigenen Karteireiter auf. Der Energy Manager prüft minütlich alle registrierten Fahrzeuge. Sobald ein Auto als "angesteckt" (Connected) gemeldet wird, aktiviert das System **automatisch** die für dieses Fahrzeug hinterlegten Parameter (Batteriekapazität, individuelles Ladeziel/Target-SoC) für die weitere Ladeplanung.
 *   **Duale Wallbox-Visualisierung:** Neben der Haupt-Wallbox (E3DC) kann eine zweite, externe Ladestelle (z. B. go-e, openWB via MQTT oder Shelly) eingebunden werden. Diese wird im Dashboard als eigene Kachel "Wallbox 2" geführt und im Energiefluss-Diagramm separat dargestellt.
@@ -162,12 +168,12 @@ Das System ist vollständig "Flotten-tauglich" und unterstützt ab Version 3.8.7
 ### Native Wallbox Steuerung
 Das alte Wallbox-Management wurde durch den nativen **Python Wallbox Manager** ersetzt. Die sichtbaren Nutzer-Modi sind:
 
-* **Aus:** NGNA. E3DC-Control lädt nicht und sendet keine laufenden Wallbox-Befehle. Nur beim bewussten Wechsel auf `Aus` in der WebUI wird einmalig die Grundeinstellung freigegeben.
-* **PV-Kurve ruhig:** Ruhiges Laden entlang der Speicher-Ladekurve.
-* **Grundladung stabil:** 1p/3p-Grundladung, solange der Hausspeicher `wbminSoc` laut Planung noch erreichen kann.
-* **PV + Akku bis Untergrenze:** Das Auto darf PV plus Hausspeicher oberhalb der Hausakku-Untergrenze nutzen; unterhalb der Grenze stützt der Speicher nur Hausverbrauch und Wärmepumpe, Netz bleibt außen vor.
-* **Sofort bis Preislimit:** Sofortiges Netzladen nur, wenn der aktuelle Preis unter dem Wallbox-Preislimit liegt.
-* **Akku bis Abfahrt:** Lädt im Freigabefenster vor der Abfahrtszeit aus PV und Hausspeicher bis zur Hausakku-Untergrenze `wbminSoc`; Netzladen bleibt gesperrt. Gestoppt wird bei erreichter Abfahrtszeit, vollem Fahrzeug oder erreichter Untergrenze.
+* **Aus:** NGNA: keine aktive E3DC-Control-Ladung und keine laufenden Steuerbefehle. Nur beim bewussten Wechsel auf `Aus` in der WebUI wird einmalig die Wallbox-Grundeinstellung freigegeben. Geplantes Netzladen bleibt gesperrt.
+* **PV-Kurve ruhig:** Laden entlang der Speicher-Ladekurve mit Hysterese; Speicherziel hat Vorrang.
+* **Grundladung stabil:** Wie PV-Kurve ruhig, aber mit stabiler 1p/3p-Grundladung, solange `wbminSoc` laut Planung erreichbar bleibt.
+* **PV + Akku bis Untergrenze:** Das Auto darf PV plus Hausspeicher oberhalb der Hausakku-Untergrenze nutzen; der Speicher lädt dabei weiter nach der Ladekurve. Unterhalb der Grenze lädt das Auto wie in `PV-Kurve ruhig` nur aus PV-Überschuss, der Speicher stützt nur Hausverbrauch und Wärmepumpe, Netz bleibt außen vor.
+* **Sofort bis Preislimit:** Sofortiges Netzladen, solange der aktuelle Preis das Wallbox-Preislimit erfüllt.
+* **Akku bis Abfahrt:** Lädt im Freigabefenster vor der Abfahrtszeit aus PV und Hausspeicher bis zur Hausakku-Untergrenze `wbminsoc`; Netzladen bleibt gesperrt. Gestoppt wird bei erreichter Abfahrtszeit, vollem Fahrzeug oder erreichter Untergrenze (`wb<n>_battery_departure_time`, `wb<n>_battery_departure_window_h`).
 
 Geplantes Netzladen per Zeitfenster/Slot ist davon getrennt: Es darf in allen aktiven Modi laden und ignoriert das globale Wallbox-Preislimit, weil die günstigsten Stunden bereits bei der Slotplanung ausgewählt werden. Im Modus **Aus** bleibt geplantes Laden gesperrt.
 
@@ -217,3 +223,34 @@ in `Verbrauchsprognose_Dokumentation.md` beschrieben.
 
 ## 11. System-Autonomie (Survival Mode)
 **Inselnetz-Schutz:** Fällt das öffentliche Stromnetz aus, schaltet der Energy Manager sofort in den "Survival Mode". Alle Großverbraucher (wie Wärmepumpen-Boost oder das Laden des Autos) werden hart abgeworfen. Das System regelt extrem defensiv, um die Energie im Hausakku maximal lange für kritische Infrastruktur (Kühlschrank, Router) zu erhalten.
+
+
+## Startknopf und Wiederanlauf nach Kaskaden-Stop
+
+Der Startknopf erhält den gewählten Lademodus und betrifft die ausgewählte
+Wallbox. Bei „Aus / autonom“ entsteht kein Startbefehl. Ein angenommener
+Start löst eigene Ladeende-, Untergrenzen- und Kaskadenanker derselben
+Stecksession. Nach Kontingent-Ende oder gescheitertem Phasenabstieg gilt
+derselbe Vertrag. Fremde oder geschützte Stopps bleiben erhalten.
+
+Ein bewusster Wechsel auf „PV + Akku bis Untergrenze“ oder „Akku bis Abfahrt“
+löst die Wiederanlaufsperre einmalig. „Sofort bis Preislimit“ löst sie nur
+mit tatsächlicher Akku- oder Netzfreigabe. „PV-Kurve ruhig“ und „Grundladung
+stabil“ lösen sie nicht. Ein neuer Kaskaden-Stop eröffnet eine neue Episode.
+Wh-Konten, Untergrenzen, Messwertgültigkeit und Hardware-Schutzfristen
+gelten weiter. Die Startflanke bleibt mindestens 60 Sekunden und mindestens
+bis zum wirksamen Start-/Stop-Abstand des Geräteprofils zuzüglich eines
+Regelzyklus verfügbar; sie verkürzt die Schutzfrist nicht.
+
+Die Oberfläche unterscheidet gespeicherte, angenommene und abgelehnte
+Startanforderungen. Eine Ablehnung nennt ihren Grund und verbraucht die
+Anforderung nicht. Eine noch ausstehende Prüfung wird als solche gemeldet.
+Die Anforderung wird höchstens 60 Sekunden aufbewahrt. Das Dashboard
+fragt während dieser Zeit begrenzt nach und zeigt das Ergebnis. Eine Annahme
+bestätigt die Entsperrung, nicht bereits die physische Fahrzeugladung.
+Das globale Abbruchflag der automatischen SoC-Planung bleibt beim Einzelstart
+erhalten. Sofortladen wird für die jeweilige Wallbox über den Modus
+„Sofort bis Preislimit“ gewählt; die andere Wallbox bleibt unverändert.
+Die Konfigurationsvariablen `wbhour`, `wb_sofort`, `wbvon` und `wbbis` bleiben
+für die Ladeplanung verfügbar. Veraltete Direktsteuerungsformulare ändern
+keine Einstellungen.

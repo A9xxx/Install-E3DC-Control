@@ -1,3 +1,84 @@
+# E3DC-Control v5.5.4
+
+5.5.4 bringt die Installationszentrale auf Bare Metal wieder in Betrieb: Module werden per Klick installiert und entfernt, die Dienste laufen mit dem Python-venv der Installation, und Karten, Dialoge und Konsolenmenüs sind gegen den tatsächlichen Stand geprüft. Die Speicherführung bei beobachteten Wallboxen und das Abendziel in `PV + Akku bis Untergrenze` sind neu geordnet, der Startknopf ändert den Lademodus nicht mehr, ein an der openWB gesetzter Stop gilt, und die openWB-Pro-Bereitschaft nach Ladeende hält nur noch mit Budget. Der PV-Boost der Wärmepumpe wird gehalten statt getaktet, das globale „Automatik darf steuern“ wirkt auch auf den Heizstab, die Lade- und Entladegrenzen folgen den Gerätegrenzen, unterhalb der Korridor-Untergrenze lädt der Speicher frei, und der Hausverbrauch der Tagesstatistik kommt aus der Energiebilanz. Neu und experimentell (Standard aus) ist eine Kostenhistorie je Viertelstunde. Dazu kommen Korrekturen für 32-Bit-Systeme, die Web-PIN-Sperrseite und eine „Jetzt“-Anzeige aus einer Quelle. Das Update benötigt keine zwingende Konfigurationsänderung.
+
+## Installation und Installationszentrale
+
+- Module werden auf Bare Metal wieder per Klick installiert und entfernt, über einen festen, root-eigenen Launcher mit Freigabeliste, Backup-Snapshot und zeitlich begrenztem Auftrag. Nach einem Raw-Import werden die Auto-Install-Regeln ausgewertet; „Blockiert“ erscheint nur mit Grund. Ohne Web-PIN gibt es einen Hinweis, keine Sperre. In Docker verweist die Oberfläche auf den Compose-Weg.
+- Nach dem Speichern im Config-Editor richtet die Installationszentrale die betroffenen Dienste selbst ein: nur bestätigte, geänderte Module, Abhängigkeiten zuerst, Zustand und Grund je Schritt, Fortsetzen nach dem Neuladen und „Erneut versuchen“ nur für gescheiterte Schritte. Die Erstinstallation richtet die Rechte-Reparatur gleich mit ein. `pyserial` wird mit `pymodbus` installiert; ohne es startete der Heizstab-Dienst auf frischen Installationen nicht.
+- Optionale Python-Dienste laufen mit dem Python-venv der Installation; ein Modul darf starten, sobald der Kerndienst installiert und aktiv ist.
+- Karten zeigen den tatsächlichen Zustand: „Installiert, nicht aktiv“ statt „Installieren“, alle Blockergründe, Beschriftungen statt Schlüssel, kein „Installieren“ für Hochverfügbarkeit, Shadow und PV-Prognosediagnose; die HA-Rolle ist nur über Konsole 49 änderbar. Der MQTT-Hub und die Matter-Bridge melden ein Lebenszeichen, damit sie in Docker nicht fälschlich als „inaktiv“ erscheinen.
+- Modul-Konfiguration ohne sichtbare Zugangsdaten, Wärmepumpentyp 6, Heizstab-Dialog mit Shelly-3EM-Feldern, PV-Prognosekarte mit Schalter „PV-Prognosediagnose“. Diagnosepaket und Backup-Status geben keine Pfade oder Geheimnisse preis.
+- Konsole: Wärmepumpentyp und Adressen landen in der aktiven Konfiguration; Konsole 41 bietet alle Typen wie der Config-Editor und stoppt nur ausgeschlossene Dienste; Konsole 45 führt `npm ci` als Installationsbenutzer aus; Konsole 48 schreibt MQTT-Zugangsdaten nur noch in die aktive Konfiguration; die Vollentfernung läuft auch ohne Docker durch, entfernt den Rollenanker und fragt vor eingreifenden Optionen zurück; der Notfallmodus respektiert Hochverfügbarkeits-Standby und Shadow.
+- Der WebSocket-Dienst ist Pflichtdienst; Karte und Dokumentation sagen, dass die Weboberfläche ihn derzeit nicht nutzt.
+
+## Wallbox
+
+- Beobachtete Wallboxen (openWB 2.x als Primary, `Aus`) wirken nur noch auf die Entladeseite des Speichers; die Ladekurve bleibt beim normalen Kurvenregler, `wbminsoc` hebt sie in `PV-Kurve ruhig` nicht an.
+- openWB 2.x: Ladepriorität und eigener Lademodus werden gelesen, angezeigt und beratend bewertet, nie geschrieben. Ein an der openWB gesetzter Stop gilt als Nutzerpause bis zum Abstecken oder zur nächsten Wahl; ein dort gewähltes „Sofort“ bleibt stehen.
+- `PV + Akku bis Untergrenze`: Reicht die PV nicht für Akku und Fahrzeug, endet die heutige Ladekurve bei `wbminsoc` statt beim normalen Abendziel, für alle Wallboxen.
+- openWB Pro: Bestätigtes Abstecken beendet den Lückendeckel des Speichers. Ohne bekannte Korridorlage gibt es in `PV-Kurve ruhig` keine Akkustützung.
+- Der Startknopf hebt Sperren auf und weckt das Fahrzeug, ändert aber den Lademodus nicht mehr; Schutzstopps bleiben; bei `Aus` sendet er keinen Befehl. Ein Wechsel in einen Modus mit Akkustützung hebt die Wiederanlaufsperre nach einem Kaskaden-Stop auf. Die Karte „Ladedauer (Stunden)“ der alten Wallbox-Ansicht ist entfernt.
+- openWB Pro hält das Mindestangebot nach Fahrzeug-Ladeende nur noch mit ausreichendem Budget; ohne Budget folgt einmal 0 A, bei Rückkehr ein einzelner Strombefehl ohne Weckimpuls oder Phasenwechsel. Kurze Datenlücken halten ein stehendes Angebot höchstens 45 s, heben es aber nie an. Bei mehreren Wallboxen wird die fremde Verpflichtung genau einmal abgezogen. Der schnelle Start nach dem Abstecken bleibt.
+
+## Speicher und Tarif
+
+- Lade- und Entladegrenze folgen dem Gerätemaximum des Speichers; höhere oder unplausible Konfigurationswerte werden ersetzt und in der Konfigurationsprüfung gemeldet. Abgelehnte Leistungsvorgaben werden nicht mehr in jedem Zyklus wiederholt.
+- Unterhalb der Korridor-Untergrenze setzt der Speicher keine Ladegrenze mehr unter den PV-Überschuss; E3DC lädt frei, mit Hysterese an der Untergrenze. Innerhalb des Korridors bleibt die Ladegrenze mit Abstand.
+- Der Tarif-Halt gilt auch beim Netzboost der Wärmepumpe: Der Speicher deckt dann nur den Hausrest ohne Wärmepumpe.
+- Feste Tarife mit kurzem günstigem Fenster: „günstig“ kommt aus den Tarifstufen; das Netzladen bleibt an das Fenster gebunden und lädt bis Ziel oder Fensterende. Die Vorschau im Config-Editor liest den Tagesplan.
+- Der Planer rechnet ab dem aktuellen Zeitpunkt; vergangene Viertelstunden zählen nicht mehr als künftige Ladung. Vier Doppelzählungen im Speicherregler und im Diagramm sind behoben.
+
+## Wärmepumpe und Heizstab
+
+- Ist die Wärmepumpe nicht erreichbar, läuft der Energy Manager ohne Logik-Ausnahme weiter: ohne gültige Daten keine neue Freigabe, Mindestlaufzeiten bleiben.
+- Der PV-Boost im Messwertbetrieb hält, solange die Voraussetzungen bestehen: keine fiktiven Lückenbuchungen, kein Takt, kein Ende bei erreichtem Ziel oder Saisonwechsel; nur der gemessene Netzanteil der Wärmepumpe zählt. Die Mindestlaufzeit bleibt als Hardwareschutz; `Aus` nimmt den Auftrag zurück, der Verdichter läuft seine Mindestlaufzeit zu Ende.
+- Der Netzbezug-Stopp greift nur bei anhaltendem, der Wärmepumpe zugeordnetem Bezug (30 s über 2.500 W); ohne Einzelmessung zählt der gesamte Netzbezug abzüglich 200 W. Die Hausanschlussgrenze wirkt sofort.
+- Tarif-Aufträge enden im Tarif-Halt nicht durch den SoC-Schutz innerhalb der Mindestlaufzeit; fehlende Luxtronik-Daten verlängern den Mindestlaufhalt um 60 s.
+- SG-Ready: Die Heizgrenze sperrt die Freigabe nicht mehr; Warmwasser und Rücklauf werden unabhängig geprüft, ohne gültige Temperatur gibt es kein Signal.
+- Die Quell-Erholung bremst einen PV-Boost nicht mehr bei deutlicher Einspeisung mit Prognosedeckung; geplante Fenster behalten sie.
+- Saisonanzeige und Regelung zeigen dieselbe Saison; eine Rücknahme-Vormerkung aus einer einzelnen Lücke heilt, wenn die Anforderung zurückkehrt.
+- Heizstab: Das globale „Automatik darf steuern“ wirkt auch auf Heizstab, ELWA, Shelly-Heizlüfter und das Wärmepumpen-Relais; ein beim Start eingeschaltet vorgefundenes eigenes Relais läuft seine Mindestlaufzeit zu Ende. Die ELWA wird je Zyklus über eine Verbindung angesprochen, die Zeitgrenze höchstens stündlich neu geschrieben, die Karte nennt Grund und nächsten Versuch statt eines Spinners. Zeigen Heizstab-Dienst und Energy Manager auf dasselbe Shelly-Relais, warnen Config-Editor und Installationszentrale; geschaltet wird wie bisher.
+
+## Statistik, Kosten und Anzeige
+
+- Der Hausverbrauch der Tagesstatistik stammt aus der Energiebilanz abzüglich jedes gemessenen Verbrauchers genau einmal. Tageswerte ab dem Update können deshalb von früheren abweichen; die letzten 30 Tage lassen sich mit einem Wartungsbefehl nachberechnen (Trockenlauf, Backup, Rückweg).
+- Kostenhistorie je Viertelstunde (experimentell, Standard aus): festgeschriebene Preise, Akku-Mischpreis, Zeitraum Tag/Woche/Monat/Jahr mit Kalender, Zeile „Gesamt seit …“, CSV-Export; einmalige automatische Ergänzung der letzten 30 Tage nach dem Einschalten.
+- Hybriddiagramm: Hinweisfeld abseits des Zeigers, Marktpreis der Direktvermarktung auch für vergangene Viertelstunden; saubere Preisflanken bei vergangenen Zeiträumen.
+- 32-Bit-Systeme: Zeitachse der SoC-Prognose, Planbindung, Direktvermarktungs-Prüfungen und Kostenabrechnung sind korrigiert.
+- Web-PIN: Die Sperrseite lädt nicht mehr ständig neu; nach der Anmeldung geht es auf die angeforderte Seite zurück, nur innerhalb der Anwendung; Matter- und Systemmetrik-Seiten zeigen die Sperrseite statt einer abgebrochenen Seite.
+- „Jetzt“ auf Karte, Diagramm, Mobil und Kopfzeile kommt aus einer Quelle und nennt Korridorlage und tatsächliche Regelart; „E3DC regelt frei“ erscheint nur bei tatsächlich freier Regelung.
+- Regelruhe-Diagnose per POST mit CSRF-Schutz, Docker-Vorauswahl „neuester Lauf“, ZIP bis 30 MB; Oberflächentexte ohne Du-Form.
+
+## Updatehinweise
+
+- **Bare Metal:** Das Update wie gewohnt über **System Update** in der Weboberfläche starten; danach die Seite neu laden. Der Modul-Launcher der Installationszentrale wird dabei eingerichtet.
+- **Docker:** Mit eingerichtetem Watchtower über **System Update**, sonst auf dem Host im bestehenden Compose-Ordner mit `sudo docker compose pull` und `sudo docker compose up -d` aktualisieren. Einen festen Pin in `.env` bewusst auf `E3DC_IMAGE_TAG=v5.5.4` ändern. Die Modul-Installation per Klick gibt es in Docker nicht; die Oberfläche verweist auf den Compose-Weg.
+- **Konfiguration:** Keine zwingende Änderung. Die Kostenhistorie bleibt standardmäßig aus (Schalter „Kostenansicht je Viertelstunde“ im Config-Editor unter Tarif & Strompreise). Liegt die konfigurierte Lade- oder Entladeleistung über dem Gerätemaximum des Speichers oder unter 300 W, gilt der Gerätewert; die Konfigurationsprüfung weist darauf hin.
+- **Heizstab:** Steht „Automatik darf steuern“ auf Aus, sendet der Heizstab-Dienst ab diesem Update keine Schaltbefehle mehr an Heizstab, ELWA, Shelly-Heizlüfter oder das Wärmepumpen-Relais; bisher schaltete er trotz globalem Aus. Wer den Heizstab weiter automatisch betreiben möchte, lässt die Automatik eingeschaltet oder prüft die lokale Einstellung „PV-Auto“ des Heizstabs.
+- **Statistik:** Der Hausverbrauch der Tagesstatistik wird ab dem Update nach der Energiebilanz berechnet. Vergangene Tage bleiben unverändert, bis der Wartungsbefehl aus `doc/Statistik_Wartung.md` ausgeführt wird (Standard ist ein Trockenlauf).
+- **Wallbox:** Der Startknopf ändert den Lademodus nicht mehr. Wer bisher den Startknopf zum Moduswechsel genutzt hat, wählt den Modus auf der Wallbox-Seite. Die Karte „Ladedauer (Stunden)“ der alten Ansicht entfällt. Die openWB-Pro-Bereitschaft nach Fahrzeug-Ladeende hält nur noch mit Budget.
+- **Wärmepumpe:** `Aus` nimmt den Auftrag sofort zurück, ein laufender Verdichter behält seine Mindestlaufzeit (Hardwareschutz).
+- **Konsole:** Konsole 48 schreibt MQTT-Zugangsdaten nur noch in die aktive Konfiguration; bestehende Einträge in der Altdatei bleiben erhalten. Der WebSocket-Dienst bleibt installiert und ist Pflichtdienst, auch wenn die Weboberfläche ihn derzeit nicht nutzt.
+- **Von 5.5.3c oder älter:** Das Update führt direkt auf 5.5.4. Dafür gelten die Updatehinweise von 5.5.3c, 5.5.3b, 5.5.3a und 5.5.3 weiter unten.
+
+## Bekannte Grenzen
+
+- Die Kostenhistorie ist experimentell: Der Erlös bei Direktvermarktung ist eine gekennzeichnete Näherung, alte Minutenhistorien enthalten keine historischen Marktpreise, und der Ressourcenbedarf auf kleinen Systemen (Raspberry Pi mit SD-Karte) ist noch nicht im Feld gemessen. Rückmeldungen dazu sind willkommen.
+- Die Modul-Installation per Klick ist auf Bare Metal eingerichtet; Docker verwendet weiter den Compose-Weg.
+- Hinter einem TLS-Proxy mit Pfadpräfix fällt der Rücksprung nach der PIN-Anmeldung auf das Dashboard zurück.
+- Ein an der openWB gesetzter Stop wird nur als Nutzerpause erkannt, wenn der Statuswechsel innerhalb von 10 s beobachtet wird; bei längeren Abfragezyklen erscheint „Herkunft unbekannt“.
+- Die Gerätegrenzen des Speichers aus den Systemdaten sind erst auf wenigen Anlagen und Firmwareständen bestätigt; ohne gültige Systemdaten gilt die Konfiguration wie bisher.
+- Bei gleicher Shelly-Adresse und gleichem Relais für Heizstab-Dienst und Energy Manager gibt es nur eine Warnung; eine Besitzregel folgt in einer späteren Version.
+- Innerhalb des Korridors bleibt die bisherige Ladegrenze mit Abstand; nur unterhalb der Untergrenze lädt der Speicher frei.
+- Der WebSocket-Dienst wird von der Weboberfläche derzeit nicht genutzt; ob er entfällt oder wieder genutzt wird, ist offen.
+
+## Rückfall
+
+Die freigegebenen Rückfallziele bleiben unverändert. Für Docker gilt der in der Update-Policy ausgewiesene Docker-Rollback-Root; auf Bare Metal bleibt ein verifiziertes Datei-Backup der sichere Rückweg. Vor einem Rückfall die [Rückfall-Dokumentation](doc/Rollback.md) lesen. Ein Rückfall auf 5.5.3c oder älter stellt den bisherigen Hausverbrauch der Tagesstatistik nicht automatisch wieder her; die Wartungsbefehle haben einen eigenen Rückweg.
+
+---
+
 # E3DC-Control v5.5.3c
 
 E3DC-Control 5.5.3c ist ein Korrekturupdate für die Einrichtung des Energy

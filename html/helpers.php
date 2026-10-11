@@ -10,6 +10,60 @@ if (PHP_SAPI !== 'cli' && session_status() === PHP_SESSION_NONE) {
 date_default_timezone_set('Europe/Berlin');
 require_once __DIR__ . '/retention.php';
 
+/** Liest eine endliche Zahl; Bool, leere und fehlende Werte bleiben unbekannt. */
+function e3dcFiniteNumber($value) {
+    if (is_bool($value) || $value === null) return null;
+    if (is_string($value) && trim($value) === '') return null;
+    if (!is_numeric($value)) return null;
+    $number = (float)$value;
+    return is_finite($number) ? $number : null;
+}
+
+/** Unix-Millisekunden müssen ganzzahlig und als JavaScript-Datum darstellbar sein. */
+function e3dcTimestampMs($value) {
+    $number = e3dcFiniteNumber($value);
+    if ($number === null || $number < 100000000000.0
+        || $number > 8640000000000000.0 || floor($number) !== $number) return null;
+    return PHP_INT_SIZE >= 8 ? (int)$number : $number;
+}
+
+/** JSON-Verträge erlauben Zahlen, keine numerischen Strings oder Booleans. */
+function e3dcTimestampMsValid($value) {
+    return (is_int($value) || is_float($value)) && e3dcTimestampMs($value) !== null;
+}
+
+/** Das Präfix verhindert auch die automatische Umwandlung numerischer Array-Schlüssel. */
+function e3dcTimestampMsKey($value) {
+    $number = e3dcTimestampMs($value);
+    return $number === null ? null : sprintf('ms:%.0f', $number);
+}
+
+/** Rasterung ohne intdiv, Modulo oder Verengung eines absoluten Zeitstempels. */
+function e3dcTimestampMsFloor($value, $stepMs = 900000) {
+    $number = e3dcTimestampMs($value);
+    $step = e3dcFiniteNumber($stepMs);
+    if ($number === null || $step === null || $step <= 0 || floor($step) !== $step) return null;
+    return e3dcTimestampMs(floor($number / $step) * $step);
+}
+
+/**
+ * Python schreibt Millisekunden als JSON-Ganzzahlen. Unter 32 Bit werden diese
+ * beim Lesen zu Floats. Für die bestehenden Revisionen bleibt ihr Zahlentoken
+ * ganzzahlig; echte Gleitkomma-Messwerte behalten JSON_PRESERVE_ZERO_FRACTION.
+ */
+function e3dcTimestampCanonicalJson($value, $flags) {
+    $encoded = json_encode($value, $flags);
+    if (PHP_INT_SIZE >= 8 || !is_string($encoded)) return $encoded;
+    return preg_replace_callback(
+        '/(?<!\\\\)("(?:ts|[A-Za-z0-9_]+_(?:ts|ts_ms|timestamp))"\\s*:\\s*)([0-9]+)\\.0(?=[,}])/',
+        static function($match) {
+            return e3dcTimestampMsValid((float)$match[2]) ? $match[1] . $match[2] : $match[0];
+        },
+        $encoded
+    );
+}
+
+
 if (!defined('WEB_AUTH_FAILURE_LIMIT')) {
     define('WEB_AUTH_FAILURE_LIMIT', 5);
 }
@@ -840,6 +894,49 @@ function e3dcRequirePostMutation($isAjax = true) {
     e3dcRequireCsrfToken($isAjax);
 }
 
+/** Rücksprung ausschließlich auf bekannte Ansichten der eigenen Anwendung. */
+function e3dcWebLoginTarget($target) {
+    if (!is_string($target) || $target === '' || preg_match('/[\x00-\x20\x7f\\\\]/', rawurldecode($target))) {
+        return null;
+    }
+    $url = parse_url($target);
+    if (!is_array($url) || isset($url['user']) || isset($url['pass'])) return null;
+    if (isset($url['host']) || isset($url['scheme']) || str_starts_with($target, '//')) {
+        $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+        $origin = parse_url($scheme . '://' . ($_SERVER['HTTP_HOST'] ?? ''));
+        if (!is_array($origin) || !isset($url['host']) || !isset($url['scheme'])
+            || strtolower($url['scheme']) !== $scheme
+            || strcasecmp($url['host'], $origin['host'] ?? '') !== 0
+            || ($url['port'] ?? ($scheme === 'https' ? 443 : 80)) !== ($origin['port'] ?? ($scheme === 'https' ? 443 : 80))) {
+            return null;
+        }
+    }
+    $script = $_SERVER['SCRIPT_NAME'] ?? '/index.php';
+    $entrypoint = basename($script) === 'mobile.php' ? 'mobile.php' : 'index.php';
+    $path = $url['path'] ?? '';
+    $directory = rtrim(dirname($script), '/');
+    if ($path === '') $path = $entrypoint;
+    if (!in_array($path, ['index.php', 'mobile.php', $directory . '/index.php', $directory . '/mobile.php'], true)) return null;
+    $entrypoint = basename($path);
+    parse_str($url['query'] ?? '', $query);
+    $page = $query['seite'] ?? ($entrypoint === 'mobile.php' ? 'live' : 'dashboard');
+    $pages = $entrypoint === 'mobile.php'
+        ? ['live', 'forecast', 'hybrid', 'matter', 'fahrzeug', 'wallbox', 'vitals', 'config', 'waermepumpe', 'waermepumpe_vorschau', 'history', 'langzeit', 'charging']
+        : ['dashboard', 'matter', 'fahrzeug', 'wallbox', 'vitals', 'config', 'waermepumpe', 'waermepumpe_vorschau', 'klima', 'langzeit', 'charging'];
+    if (!is_string($page) || !in_array($page, $pages, true)) return null;
+    // Aktionsparameter gehören nicht in einen Rücksprung nach der Anmeldung.
+    $params = isset($query['seite']) ? ['seite' => $page] : [];
+    return $entrypoint . ($params ? '?' . http_build_query($params) : '');
+}
+
+/** Das angeforderte Ziel bleibt auch bei einer falschen PIN im Formular erhalten. */
+function e3dcWebLoginReturnTarget() {
+    return e3dcWebLoginTarget($_GET['login_return'] ?? null)
+        ?? e3dcWebLoginTarget($_SERVER['REQUEST_URI'] ?? null)
+        ?? e3dcWebLoginTarget($_SERVER['HTTP_REFERER'] ?? null)
+        ?? getContextPageUrl('dashboard');
+}
+
 function handleWebLogin() {
     if (isset($_POST['action']) && $_POST['action'] === 'web_login') {
         e3dcRequireCsrfToken(false);
@@ -858,12 +955,19 @@ function handleWebLogin() {
             $lockRemaining = (int)$decision['lock_remaining'];
             $_SESSION['login_error'] = true;
             if ($lockRemaining > 0) {
-                $_SESSION['login_error_message'] = 'Zu viele falsche PIN-Versuche. Bitte warte ' . ceil($lockRemaining / 60) . ' Minuten.';
+                $_SESSION['login_error_message'] = 'Zu viele falsche PIN-Versuche. Zugriff für ' . ceil($lockRemaining / 60) . ' Minuten gesperrt.';
             } else {
                 unset($_SESSION['login_error_message']);
             }
         }
-        header('Location: ' . ($_SERVER['HTTP_REFERER'] ?? getContextPageUrl('dashboard')));
+        $returnTarget = e3dcWebLoginTarget($_POST['login_return'] ?? null)
+            ?? e3dcWebLoginTarget($_SERVER['HTTP_REFERER'] ?? null)
+            ?? getContextPageUrl('dashboard');
+        if ($decision['authenticated'] === true) {
+            header('Location: ' . $returnTarget);
+        } else {
+            header('Location: ' . getContextPageUrl('lock', ['login_return' => $returnTarget]));
+        }
         exit;
     }
     if (isset($_POST['action']) && $_POST['action'] === 'web_logout') {
@@ -2431,7 +2535,7 @@ function checkFileAccess($path, $operation = 'read') {
         return errorMessage(
             "Leseberechtigung fehlt",
             "Die Datei <code>" . htmlspecialchars($path) . "</code> kann nicht gelesen werden. " .
-            "Bitte prüfen Sie die Dateiberechtigungen (chmod 755 oder 644)."
+            "Die Dateiberechtigungen prüfen (chmod 755 oder 644)."
         );
     }
 
@@ -2442,7 +2546,7 @@ function checkFileAccess($path, $operation = 'read') {
         return errorMessage(
             "Schreibberechtigung fehlt",
             "Die Datei <code>" . htmlspecialchars($path) . "</code> kann nicht geschrieben werden. " .
-            "Bitte prüfen Sie die Dateiberechtigungen. Eltern-Verzeichnis schreibbar: " . $isParentWritable
+            "Die Dateiberechtigungen prüfen. Eltern-Verzeichnis schreibbar: " . $isParentWritable
         );
     }
 
@@ -2825,6 +2929,8 @@ function getContextPageUrl($seite, $params = []) {
     $script = basename($_SERVER['PHP_SELF'] ?? 'index.php');
     $entrypoint = ($script === 'mobile.php') ? 'mobile.php' : 'index.php';
 
+    if ($seite === 'dashboard' && !$params) return $entrypoint;
+    if ($seite === 'dashboard' && $entrypoint === 'mobile.php') $seite = 'live';
     $query = array_merge(['seite' => $seite], $params);
     return $entrypoint . '?' . http_build_query($query);
 }
@@ -2976,7 +3082,7 @@ function e3dcWpViewOutcomeTexts() {
         'ww_on' => 'Manuelle Warmwasser-Anforderung wurde sicher gespeichert.',
         'ww_off' => 'Manuelle Warmwasser-Anforderung wurde sicher beendet.',
         'auto_on' => 'Automatik eingeschaltet: Einstellung gespeichert, Energy-Manager neu gestartet.',
-        'auto_off' => 'Automatik ausgeschaltet: Einstellung gespeichert, Energy-Manager neu gestartet.',
+        'auto_off' => 'Die Automatik ist sofort aus. Bei Luxtronik-Direktanbindung läuft ein gerade laufender Verdichter bei PV- und Tarif-Aufträgen zum Schutz der Wärmepumpe seine Mindestlaufzeit zu Ende.',
     ];
 }
 
@@ -6016,7 +6122,7 @@ function e3dcDockerWatchtowerSetupCommandText() {
 
 function e3dcDockerHostUpdateMessage() {
     return "Docker-Installation erkannt. Watchtower ist nicht eingerichtet, deshalb stößt der Container den Imagewechsel nicht selbst an.\n"
-         . "Auf dem Docker-Host im Verzeichnis Deiner Compose-Konfiguration ausführen:\n\n"
+         . "Auf dem Docker-Host im Verzeichnis der Compose-Konfiguration ausführen:\n\n"
          . e3dcDockerHostUpdateCommandText()
          . "\n\nOder einmalig Watchtower freischalten; danach startet dieser Knopf Updates selbst und der Config-Editor bietet Auto-Update.\n\n"
          . "Bei eigenen oder älteren Compose-Dateien müssen E3DC_WATCHTOWER_API_URL und E3DC_WATCHTOWER_API_TOKEN unter environment: an den E3DC-Container übergeben werden; das Token allein in .env reicht nicht.\n"
@@ -7082,6 +7188,10 @@ function e3dcReadSelfUpdateRunId() {
         : null;
 }
 
+function e3dcDockerSystemRepairHint() {
+    return "Die Systemreparatur gibt es im Docker-Betrieb nicht: Produktdateien und Rechte kommen unverändert aus dem Image. Bei Problemen den Container neu erstellen:\n\n" . e3dcDockerHostUpdateCommandText();
+}
+
 function e3dcCheckCanonicalWebUpdateDrift() {
     if (e3dcIsDockerEnvironment()) {
         return [
@@ -7119,6 +7229,11 @@ function e3dcCheckCanonicalWebUpdateDrift() {
         180.0,
         ['max_output_bytes' => 1024 * 1024]
     );
+    if ((int)($process['exit_code'] ?? 1) === 75) {
+        return ['success' => false, 'running' => true,
+                'run_id' => e3dcReadSelfUpdateRunId(),
+                'message' => 'Ein Systemjob läuft bereits. Bitte warten; Status prüfen mit: systemctl status --no-pager e3dc-web-update.service'];
+    }
     $decoded = json_decode(trim((string)($process['stdout'] ?? '')), true);
     if (empty($process['success'])
         || (int)($process['exit_code'] ?? 1) !== 0
@@ -7149,7 +7264,7 @@ function e3dcStartCanonicalWebUpdateJob(
             return [
                 'success' => false,
                 'docker' => true,
-                'message' => "Die Systemreparatur gibt es im Docker-Betrieb nicht: Produktdateien und Rechte kommen unverändert aus dem Image. Bei Problemen den Container neu erstellen:\n\n" . e3dcDockerHostUpdateCommandText(),
+                'message' => e3dcDockerSystemRepairHint(),
                 'commands' => e3dcDockerHostUpdateCommandText(),
             ];
         }
@@ -7161,7 +7276,7 @@ function e3dcStartCanonicalWebUpdateJob(
             'success' => false,
             'message' => 'Der root-eigene Web-Update-Launcher ist nicht sicher gebunden ('
                 . (string)($launcherInspection['status'] ?? 'unbekannt')
-                . "). Lösung: Führe einmalig diesen Befehl aus:\n"
+                . "). Lösung: Diesen Befehl einmalig ausführen:\n"
                 . e3dcCommunityBootstrapCommand(),
         ];
     }
@@ -7172,7 +7287,7 @@ function e3dcStartCanonicalWebUpdateJob(
         if (!preg_match('/^[0-9a-f]{64}$/D', $confirmationToken)) {
             return [
                 'success' => false,
-                'message' => 'Die gebundene Dateilistenfreigabe ist ungültig. Bitte führe die Nur-Lese-Prüfung erneut aus.',
+                'message' => 'Die gebundene Dateilistenfreigabe ist ungültig. Bitte die Nur-Lese-Prüfung erneut ausführen.',
             ];
         }
     } elseif ($confirmationToken !== '') {
@@ -7214,7 +7329,7 @@ function e3dcStartCanonicalWebUpdateJob(
             ? ($outputText ?: $startedMessage)
             : 'Der enge Web-Update-Launcher konnte nicht gestartet werden: '
                 . (($errorText ?: $outputText) ?: 'keine Detailausgabe')
-                . "\n\nLösung: Führe einmalig diesen Befehl aus:\n"
+                . "\n\nLösung: Diesen Befehl einmalig ausführen:\n"
                 . e3dcCommunityBootstrapCommand(),
     ];
 }
@@ -7678,6 +7793,150 @@ function e3dcResetMatterPairing() {
         'service_preserved_inactive' => $inactive,
         'storage_quarantined' => $quarantined,
     ];
+}
+
+function e3dc_service_unit_name($service) {
+    $unit = trim((string)$service);
+    if ($unit === '') return '';
+    if (!preg_match('/^[A-Za-z0-9_.@-]+(?:\.service)?$/', $unit)) return '';
+    if (!str_ends_with($unit, '.service')) $unit .= '.service';
+    return $unit;
+}
+
+function e3dc_service_unit_exists($service) {
+    $unit = e3dc_service_unit_name($service);
+    if ($unit === '') return false;
+    foreach (['/etc/systemd/system', '/lib/systemd/system', '/usr/lib/systemd/system'] as $dir) {
+        if (is_file($dir . '/' . $unit)) return true;
+    }
+    return false;
+}
+
+function e3dc_service_unit_state($service) {
+    $unit = e3dc_service_unit_name($service);
+    $exists = e3dc_service_unit_exists($unit);
+    $activeRaw = '';
+    $enabledRaw = '';
+    if ($unit !== '') {
+        $activeRaw = e3dcSystemdServiceProperty('is-active', $unit);
+        $enabledRaw = e3dcSystemdServiceProperty('is-enabled', $unit);
+    }
+    return [
+        'unit' => $unit,
+        'exists' => $exists,
+        'active' => ($activeRaw === 'active'),
+        'enabled' => in_array($enabledRaw, ['enabled', 'static'], true),
+        'raw' => $activeRaw !== '' ? $activeRaw : ($exists ? 'inactive' : 'missing'),
+        'enabled_raw' => $enabledRaw,
+    ];
+}
+
+function loadServiceCatalogForControl($install_path) {
+    $installer_path = rtrim($install_path, '/') . '/Installer';
+    $catalog_py = $installer_path . '/service_catalog.py';
+    $python = file_exists('/opt/venv/bin/python3') ? '/opt/venv/bin/python3' : '/usr/bin/python3';
+    if (!file_exists($catalog_py)) {
+        return ['services' => [], 'alive' => []];
+    }
+    $process = e3dcRunArgvProcess([$python, '-B', $catalog_py], 10.0, ['max_output_bytes' => 1024 * 1024]);
+    $raw = !empty($process['success']) ? ($process['stdout'] ?? '') : '';
+    $catalog = json_decode($raw ?: '', true);
+    if (!is_array($catalog)) {
+        return ['services' => [], 'alive' => []];
+    }
+    $services = [];
+    $alive = [];
+    foreach ($catalog as $key => $module) {
+        $unit = $module['service_unit'] ?? '';
+        if ($unit === '') continue;
+        $services[$unit] = [
+            'name' => $module['display_name'] ?? $key,
+            'group' => ($module['group'] ?? '') === 'core' ? 'core' : 'ext',
+            'optional' => !empty($module['optional']),
+            'desc' => $module['description'] ?? '',
+            'module_key' => $key,
+        ];
+        if (!empty($module['alive_file'])) {
+            $alive[$unit] = [
+                $module['alive_file'],
+                intval($module['alive_max_age_s'] ?? 120),
+            ];
+        }
+    }
+    return ['services' => $services, 'alive' => $alive];
+}
+
+// Dienstkarten und Einrichtungsplan verwenden dieselben Schutz- und Bestätigungsregeln.
+function e3dcServiceActionGuard($action, $service, $allowed_services) {
+    if (!isset($allowed_services[$service])) return ['success' => false, 'error' => 'Unerlaubter Dienst',
+        'message' => $allowed_services ? 'Unerlaubter Dienst.' : 'Dienstkatalog nicht verfügbar.'];
+    $service_info = $allowed_services[$service];
+    $is_core_service = (($service_info['group'] ?? '') === 'core') && empty($service_info['optional']);
+    if ($is_core_service && !in_array($action, ['restart'], true)) {
+        return [
+            "success" => false,
+            "error_code" => "core_action_blocked",
+            "error" => "Kern-Dienst geschützt.",
+            "message" => "Core-Dienste dürfen in der Installationszentrale nur neu gestartet und diagnostiziert werden.",
+            "hint" => "Bitte Neustart oder Diagnose verwenden. Stop, Start, Enable, Disable und Rückbau bleiben für Core-Dienste gesperrt.",
+            "service" => $service,
+        ];
+    }
+
+    return null;
+}
+
+function e3dcControlSystemdService($action, $service, $allowed_services = null) {
+    $paths = getInstallPaths();
+    if (empty($paths['valid'])) return ['success' => false, 'message' => $paths['error'] ?? 'Installationskontext fehlt.'];
+    if ($allowed_services === null) {
+        $catalog = loadServiceCatalogForControl($paths['install_path']);
+        $allowed_services = $catalog['services'];
+    }
+    $guard = e3dcServiceActionGuard($action, $service, $allowed_services);
+    if ($guard !== null) return $guard;
+    $state = e3dc_service_unit_state($service);
+    if (!$state['exists'] && in_array($action, ['start', 'restart', 'enable'], true)) {
+        $name = $allowed_services[$service]['name'];
+        $is_core_service = (($allowed_services[$service]['group'] ?? '') === 'core') && empty($allowed_services[$service]['optional']);
+        $hint = $is_core_service ? 'Kerndienst ist nicht eingerichtet. Über das Systemupdate wiederherstellen.'
+            : 'Den Dienst zuerst in der Installationszentrale installieren.';
+        // Karte und Plan zeigen nur die Meldung, deshalb steht der Hinweis auch dort.
+        return ['success' => false, 'error_code' => 'unit_missing', 'error' => 'Dienst ist noch nicht installiert.',
+            'message' => $name . ' ist im Katalog bekannt, aber die systemd-Service-Datei fehlt noch. ' . $hint,
+            'hint' => $hint,
+            'service' => $service, 'status' => 'missing', 'enabled' => false];
+    }
+    if (($action === 'start' && $state['active']) || ($action === 'stop' && !$state['active'])) {
+        return ['success' => true, 'noop' => true, 'service' => $service,
+            'message' => $action === 'start' ? 'Dienst läuft bereits. Start ist nicht nötig.' : 'Dienst ist bereits gestoppt. Stop ist nicht nötig.',
+            'status' => $state['raw'], 'enabled' => $state['enabled']];
+    }
+    $wrapper_result = e3dcRunServiceWrapperAction($action, [$service]);
+    $output = trim((string)($wrapper_result['output'] ?? ''));
+    // Die Fortschrittszeile des Wrappers bleibt Diagnose (output) und ist nie Teil der Meldung.
+    $errors = [];
+    foreach (preg_split('/\r?\n/', implode("\n", (array)($wrapper_result['errors'] ?? []))) as $line) {
+        // Bei ungültigem UTF-8 liefert preg_replace null; dann bleibt die Zeile unverändert.
+        $line = trim(preg_replace('/Führe systemctl \S+ \S+ aus\.\.\.$/u', '', $line) ?? $line);
+        if ($line !== '' && !in_array($line, $errors, true)) $errors[] = $line;
+    }
+    if ($errors && !array_filter($errors, function($line) { return !preg_match('/\(rc=-?\d+\):$/', $line); })) {
+        $errors[] = 'Dienstaktion fehlgeschlagen.';
+    }
+    // Start und Neustart erst nach kurzem Nachlauf bestätigen.
+    if (in_array($action, ['start', 'restart'], true)) sleep(2);
+    $after = e3dc_service_unit_state($service);
+    $success = !empty($wrapper_result['success']);
+    if (in_array($action, ['start', 'restart'], true)) $success = $success && $after['active'];
+    elseif ($action === 'stop') $success = $success && !$after['active'];
+    elseif ($action === 'enable') $success = $success && $after['enabled'];
+    elseif ($action === 'disable') $success = $success && !$after['enabled'];
+    return ['success' => $success, 'output' => $output, 'status' => $after['raw'], 'enabled' => $after['enabled'],
+        'message' => $success ? 'Dienstaktion abgeschlossen.' : (empty($wrapper_result['success'])
+            ? ($errors ? implode("\n", $errors) : ($output !== '' ? $output : 'Dienstaktion fehlgeschlagen.'))
+            : 'Dienstaktion wurde ausgeführt, aber der erwartete Zielzustand wurde nicht erreicht. Status: '
+                . (in_array($action, ['enable', 'disable'], true) && ($after['enabled_raw'] ?? '') !== '' ? $after['enabled_raw'] : $after['raw']) . '.')];
 }
 
 function e3dcRunServiceWrapperAction($action, array $services) {
@@ -8186,6 +8445,14 @@ function e3dcActivateForecastEvidenceService() {
         return $baseFailure(
             'forecast_evidence_docker_blocked',
             'Im Docker-Betrieb wird die Prognosediagnose ausschließlich über den Containerstart aktiviert.'
+        );
+    }
+    $loaded = loadE3dcConfig();
+    $switch = strtolower(trim((string)($loaded['config']['forecast_diagnostics_enable'] ?? '0')));
+    if (!empty($loaded['error']) || !in_array($switch, ['1', 'true', 'yes', 'on', 'ein'], true)) {
+        return $baseFailure(
+            'forecast_evidence_config_disabled',
+            'PV-Prognosediagnose ist ausgeschaltet. Zuerst den Schalter „PV-Prognosediagnose“ in der Modul-Konfiguration oder im Config-Editor einschalten und speichern.'
         );
     }
     if (!e3dcForecastEvidenceUnitExists()) {
@@ -10254,8 +10521,8 @@ function applyExactWallboxDailyCounter(&$dailyStats, $wallboxNo, $exactKwh, $sou
     ));
     $sanity = null;
     $effectiveKwh = e3dcSanitizeWallboxExactCounter($exactKwh, $current, $source, $sanity);
-    if ($effectiveKwh === null) return;
-    if ($effectiveKwh <= 0.001 && $current <= 0.001) return;
+    if ($effectiveKwh === null || ($sanity['action'] ?? '') === 'reject_without_integral') return;
+    if ($effectiveKwh <= 0.001 && $current <= 0.001 && isset($stats[$totalKey])) return;
 
     if ($current > 0.001) {
         $factor = $effectiveKwh / $current;
@@ -10273,7 +10540,76 @@ function applyExactWallboxDailyCounter(&$dailyStats, $wallboxNo, $exactKwh, $sou
         $stats[$batKey] = 0;
     }
 
+    if (($dailyStats['sources']['home_energy_source'] ?? '') === 'energy_balance'
+        && isset($stats['total_home_kwh']) && is_numeric($stats['total_home_kwh'])) {
+        $oldHome = (float)$stats['total_home_kwh'];
+        $newHome = $oldHome - ($effectiveKwh - $current);
+        if ($newHome >= -0.05) {
+            $newHome = max(0.0, $newHome);
+            $factorHome = $oldHome > 0.001 ? $newHome / $oldHome : 0.0;
+            foreach (['pv', 'grid', 'bat', 'pv_external', 'pv_e3dc'] as $homeSource) {
+                foreach (['kwh', 'pct'] as $suffix) {
+                    $homeKey = $homeSource . '_home_' . $suffix;
+                    if (isset($stats[$homeKey])) $stats[$homeKey] = round($stats[$homeKey] * $factorHome, 2);
+                }
+            }
+            if ($oldHome <= 0.001 && $newHome > 0.0) $stats['pv_home_kwh'] = round($newHome, 2);
+            $stats['total_home_kwh'] = round($newHome, 2);
+            foreach (['home', 'save_home'] as $costKey) {
+                if (isset($dailyStats['costs'][$costKey])) $dailyStats['costs'][$costKey] = round($dailyStats['costs'][$costKey] * $factorHome, 2);
+            }
+        } else {
+            $stats['total_home_kwh'] = null;
+            foreach (['pv', 'grid', 'bat', 'pv_external', 'pv_e3dc'] as $homeSource) {
+                $stats[$homeSource . '_home_kwh'] = null;
+                $stats[$homeSource . '_home_pct'] = null;
+            }
+            $dailyStats['costs']['home'] = null;
+            $dailyStats['costs']['save_home'] = null;
+            $dailyStats['sources']['home_energy_source'] = 'energy_balance_negative';
+        }
+    }
+
     $stats[$totalKey] = round($effectiveKwh, 2);
+    if (isset($dailyStats['sources']['home_energy_source'])) {
+        $dailyStats['sources'][$key . '_energy_source'] = 'daily_counter';
+        $dailyStats['sources']['home_includes_unmeasured_consumers'] = array_values(array_diff(
+            $dailyStats['sources']['home_includes_unmeasured_consumers'] ?? [], [$key]
+        ));
+        if ($effectiveKwh <= 0.0) {
+            $dailyStats['costs'][$key] = 0.0;
+            $dailyStats['costs']['save_' . $key] = 0.0;
+        }
+    }
+
+    if (($dailyStats['sources']['home_energy_source'] ?? '') === 'energy_balance') {
+        $flows = $stats;
+        foreach (['pv', 'grid_in', 'grid_out', 'bat_in', 'bat_out'] as $flowKey) {
+            $flows['total_' . $flowKey] = $stats['total_' . $flowKey . '_kwh'];
+        }
+        foreach (['total', 'home', 'bat', 'wb', 'wb2', 'wp', 'climate'] as $costKey) {
+            $flows['cost_' . $costKey] = 100.0 * ($dailyStats['costs'][$costKey] ?? 0.0);
+            if ($costKey !== 'bat') $flows['save_' . $costKey] = 100.0 * ($dailyStats['costs']['save_' . $costKey] ?? 0.0);
+        }
+        e3dcReconcileDailyEnergyFlows($flows, $stats['total_home_kwh']);
+        e3dcFinalizePvSourceDestinations($flows);
+        foreach ($flows as $flowKey => $value) {
+            if (isset($stats[$flowKey])) $stats[$flowKey] = round($value, 2);
+        }
+        foreach (['total', 'home', 'bat', 'wb', 'wb2', 'wp', 'climate'] as $costKey) {
+            if (isset($dailyStats['costs'][$costKey])) $dailyStats['costs'][$costKey] = round($flows['cost_' . $costKey] / 100.0, 2);
+            if (isset($dailyStats['costs']['save_' . $costKey])) $dailyStats['costs']['save_' . $costKey] = round(($flows['save_' . $costKey] ?? 0.0) / 100.0, 2);
+        }
+        foreach (['pv' => 'pv', 'grid' => 'grid_in', 'bat' => 'bat_out', 'pv_external' => 'pv_external', 'pv_e3dc' => 'pv_e3dc'] as $flowSource => $totalSource) {
+            $denominator = max(0.001, $flows['total_' . $totalSource] ?? $stats[$totalSource . '_kwh'] ?? 0.0);
+            foreach (['home', 'bat', 'wb', 'wb2', 'wp', 'climate', 'grid'] as $destination) {
+                $valueKey = $flowSource . '_' . $destination . '_kwh';
+                $percentKey = $flowSource . '_' . $destination . '_pct';
+                if (isset($stats[$valueKey]) && array_key_exists($percentKey, $stats)) $stats[$percentKey] = round(100.0 * $stats[$valueKey] / $denominator);
+            }
+        }
+    }
+
 
     $totalPv = max(0.001, (float)($stats['total_pv_kwh'] ?? 0));
     $totalGrid = max(0.001, (float)($stats['total_grid_in_kwh'] ?? 0));
@@ -10288,7 +10624,7 @@ function applyExactWallboxDailyCounter(&$dailyStats, $wallboxNo, $exactKwh, $sou
 	        (float)($stats['total_wb2_kwh'] ?? 0) +
 	        (float)($stats['total_wp_kwh'] ?? 0) +
 	        (float)($stats['total_climate_kwh'] ?? 0);
-    if ($totalCons > 0.001) {
+    if ($totalCons > 0.001 && ($dailyStats['sources']['home_energy_source'] ?? '') !== 'energy_balance_negative') {
         $gridIn = (float)($stats['total_grid_in_kwh'] ?? 0);
         $dailyStats['autarky_day'] = round(max(0, min(100, (($totalCons - $gridIn) / $totalCons) * 100)), 1);
     }
@@ -10565,6 +10901,208 @@ function e3dcFinalizePvSourceDestinations(&$stats) {
     e3dcFitPvSourceDestinations($stats, 'e3dc', 'pv_e3dc_kwh', $available);
 }
 
+/**
+ * Tagesbilanz aus bestätigten Zählern bzw. lückenlosen Leistungsintegralen.
+ * Der Hauszähler hat je Anlage andere Messpunkte und ist hier keine Quelle.
+ * „wp“ enthält im Verlauf bereits den Heizstab; „hs“ ist nur sein Teilwert.
+ */
+function e3dcDailyBalanceInputs($historyLines, $activeDate, $options = []) {
+    $keys = ['pv', 'grid_in', 'grid_out', 'bat_in', 'bat_out', 'wb', 'wb2', 'wp', 'climate'];
+    $exactKeys = array_map(function($key) { return 'e_' . $key; }, $keys);
+    $baselines = e3dcDailyExactBaselines($historyLines, $activeDate, $exactKeys, $options);
+    $exact = array_fill_keys($keys, null);
+    $exactSource = array_fill_keys($keys, '');
+    $exactAt = array_fill_keys($keys, null);
+    $integral = array_fill_keys($keys, 0.0);
+    $complete = array_fill_keys($keys, true);
+    $previous = null;
+    $intervals = 0;
+    $externalPv = false;
+    $lastTs = null;
+    $heaterIntegral = 0.0;
+    $heaterComplete = true;
+    foreach ($historyLines as $line) {
+        $row = json_decode($line, true);
+        if (!is_array($row) || !isset($row['ts']) || substr($row['ts'], 0, 10) !== $activeDate) continue;
+        $ts = strtotime($row['ts']);
+        if ($ts === false) continue;
+        $lastTs = $ts;
+        $externalPv = $externalPv || !empty($row['pv_external_topology_present'])
+            || e3dcHistoryNumber($row, 'pv_external_w', 0.0) > 0.0;
+        $power = [];
+        foreach ($keys as $key) {
+            $powerKey = $key === 'pv' && array_key_exists('pv_total_w', $row) ? 'pv_total_w' : $key;
+            if (strpos($key, 'grid_') === 0) $powerKey = 'grid';
+            if (strpos($key, 'bat_') === 0) $powerKey = 'bat';
+            $value = e3dcHistoryNumber($row, $powerKey, null);
+            if (array_key_exists('rscp_sample_valid', $row) && !$row['rscp_sample_valid']) $value = null;
+            if (strpos($key, 'grid_') === 0 && array_key_exists('grid_power_valid', $row) && !$row['grid_power_valid']) $value = null;
+            if (array_key_exists($key . '_power_valid', $row) && !$row[$key . '_power_valid']) $value = null;
+            if ($key === 'pv' && !empty($row['pv_external_topology_present'])
+                && array_key_exists('pv_external_power_valid', $row) && !$row['pv_external_power_valid']) $value = null;
+            if ($value !== null && !is_finite($value)) $value = null;
+            if ($value !== null) {
+                if (in_array($key, ['grid_out', 'bat_out'], true)) $value = -$value;
+                $value = max(0.0, $value);
+            }
+            $power[$key] = $value;
+            $counterKey = 'e_' . $key;
+            $counter = e3dcHistoryNumber($row, $counterKey, null);
+            if (array_key_exists('rscp_sample_valid', $row) && !$row['rscp_sample_valid']) $counter = null;
+            if (array_key_exists($counterKey . '_valid', $row) && !$row[$counterKey . '_valid']) $counter = null;
+            if ($counter === null || !is_finite($counter) || $counter < 0.0 || $counter >= 2000.0) continue;
+            $baseline = $baselines[$counterKey] ?? 0.0;
+            // Ein unveränderter Altwert nach Mitternacht bestätigt keine Null.
+            if ($baseline > 0.0 && $counter <= $baseline) continue;
+            $counter = max(0.0, $counter - $baseline);
+            $exactAt[$key] = $ts;
+            if ($exact[$key] === null || $counter === 0.0 || $counter > $exact[$key] || $exact[$key] - $counter > 5.0) {
+                $exact[$key] = $counter;
+                $exactSource[$key] = e3dcWallboxExactSourceFromHistoryRow($row, $counterKey);
+            }
+        }
+        $power['hs'] = e3dcHistoryNumber($row, 'hs', null);
+        if ($previous !== null) {
+            $dt = $ts - $previous['ts'];
+            if ($dt > 0) $intervals++;
+            if ($dt > 0 && $dt < 3600 && $power['hs'] !== null && $previous['power']['hs'] !== null) {
+                $heaterIntegral += max(0.0, ($power['hs'] + $previous['power']['hs']) / 2.0) * $dt / 3600000.0;
+            } else {
+                $heaterComplete = false;
+            }
+            foreach ($keys as $key) {
+                if ($dt <= 0 || $dt >= 3600 || $power[$key] === null || $previous['power'][$key] === null) {
+                    $complete[$key] = false;
+                    continue;
+                }
+                $integral[$key] += ($power[$key] + $previous['power'][$key]) / 2.0 * $dt / 3600000.0;
+            }
+        }
+        $previous = ['ts' => $ts, 'power' => $power];
+    }
+    $values = [];
+    $sources = [];
+    foreach ($keys as $key) {
+        $measured = $intervals > 0 && $complete[$key];
+        $counter = $exact[$key];
+        if ($exactAt[$key] !== null && $lastTs - $exactAt[$key] >= 3600) $counter = null;
+        // Zusatz-PV ist in e_pv je nach vorhandenen DB-PM-Zählern enthalten.
+        // Das Gesamtleistungsintegral ist eindeutig; niemals blind addieren.
+        if ($key === 'pv' && $externalPv) {
+            $values[$key] = $measured ? $integral[$key] : null;
+            $sources[$key] = $measured ? 'integrated_total_with_external_ac' : 'external_pv_integral_incomplete';
+            continue;
+        }
+        if (in_array($key, ['wb', 'wb2'], true) && $counter !== null) {
+            $sanity = null;
+            $counter = e3dcSanitizeWallboxExactCounter($counter, $integral[$key], $exactSource[$key], $sanity);
+            if (($sanity['action'] ?? '') === 'reject_without_integral') $counter = null;
+        }
+        // Ältere Verläufe führen nicht verfügbare Zähler als konstante Null.
+        // Ein vorhandenes positives Integral bleibt dann die Messquelle.
+        if ($counter !== null && ($counter > 0.0 || !$measured || $integral[$key] <= 0.0)) {
+            // Der WP-Tageszähler enthält den separat gemessenen Heizstab nicht.
+            $values[$key] = $counter + (($key === 'wp' && $heaterComplete) ? $heaterIntegral : 0.0);
+            $sources[$key] = $key === 'pv' ? 'exact_e3dc_counter' : 'daily_counter';
+        } elseif ($measured) {
+            $values[$key] = $integral[$key];
+            $sources[$key] = 'power_integral';
+        } else {
+            $values[$key] = null;
+            $sources[$key] = 'measurement_missing_or_incomplete';
+        }
+    }
+    return ['values' => $values, 'sources' => $sources, 'integral_complete' => $complete];
+}
+
+function e3dcApplyDailyConsumerEnergy(&$stats, $key, $energy) {
+    $split = ['pv_' . $key . '_kwh', 'grid_' . $key . '_kwh', 'bat_' . $key . '_kwh'];
+    $sum = array_sum(array_map(function($name) use ($stats) { return $stats[$name] ?? 0.0; }, $split));
+    $fields = array_merge($split, ['cost_' . $key, 'save_' . $key]);
+    if ($energy === null || $energy <= 0.0) {
+        foreach ($fields as $name) $stats[$name] = 0.0;
+    } else {
+        e3dcApplyExactEnergySplit($stats, $energy, $sum, $fields, 'pv_' . $key . '_kwh');
+    }
+}
+
+/** Quellen und Verbraucher auf dieselbe Tagesbilanz begrenzen. */
+function e3dcReconcileDailyEnergyFlows(&$stats, $homeEnergy) {
+    if ($homeEnergy === null) return;
+    $sources = ['pv' => $stats['total_pv'], 'grid' => $stats['total_grid_in'], 'bat' => $stats['total_bat_out']];
+    $loads = ['home', 'wb', 'wb2', 'wp', 'climate'];
+    $oldGrid = [];
+    $oldSelf = [];
+    foreach (array_merge($loads, ['bat']) as $key) {
+        $oldGrid[$key] = $stats['grid_' . $key . '_kwh'];
+        if ($key !== 'bat') $oldSelf[$key] = $stats['pv_' . $key . '_kwh'] + $stats['bat_' . $key . '_kwh'];
+    }
+    // Einspeisung stammt aus PV/Akku; Ladung aus PV/Netz. Die Zähler können
+    // auch Energie während einer Lücke enthalten, die im Integral noch fehlt.
+    $export = $stats['total_grid_out'];
+    $charge = $stats['total_bat_in'];
+    $pvExportMin = max(0.0, $export - $sources['bat']);
+    $pvChargeMin = max(0.0, $charge - $sources['grid']);
+    if ($pvExportMin + $pvChargeMin > $sources['pv'] + 0.05) return;
+    $stats['pv_grid_kwh'] = min($export, max($pvExportMin, min($stats['pv_grid_kwh'], $sources['pv'] - $pvChargeMin)));
+    $stats['bat_grid_kwh'] = max(0.0, $export - $stats['pv_grid_kwh']);
+    $stats['pv_bat_kwh'] = min($charge, max($pvChargeMin, min($stats['pv_bat_kwh'], $sources['pv'] - $stats['pv_grid_kwh'])));
+    $stats['grid_bat_kwh'] = max(0.0, $charge - $stats['pv_bat_kwh']);
+    $available = [
+        'pv' => max(0.0, $sources['pv'] - $stats['pv_grid_kwh'] - $stats['pv_bat_kwh']),
+        'grid' => max(0.0, $sources['grid'] - $stats['grid_bat_kwh']),
+        'bat' => max(0.0, $sources['bat'] - $stats['bat_grid_kwh']),
+    ];
+    $missing = array_fill_keys(['wb', 'wb2', 'wp', 'climate'], 0.0);
+    // Überbelegte Quellen begrenzen, dabei die Verbrauchermengen erhalten.
+    foreach ($available as $source => $capacity) {
+        $used = 0.0;
+        foreach ($missing as $key => $_) $used += $stats[$source . '_' . $key . '_kwh'];
+        $factor = $used > $capacity && $used > 0.0 ? $capacity / $used : 1.0;
+        foreach ($missing as $key => $_) {
+            $field = $source . '_' . $key . '_kwh';
+            $before = $stats[$field];
+            $stats[$field] *= $factor;
+            $missing[$key] += $before - $stats[$field];
+        }
+        $available[$source] = max(0.0, $capacity - $used * $factor);
+    }
+    foreach ($missing as $key => $energy) {
+        $room = array_sum($available);
+        if ($room <= 0.0) continue;
+        foreach ($available as $source => $capacity) {
+            $addition = min($capacity, $energy * $capacity / $room);
+            $stats[$source . '_' . $key . '_kwh'] += $addition;
+            $available[$source] -= $addition;
+        }
+    }
+    foreach ($available as $source => $energy) $stats[$source . '_home_kwh'] = $energy;
+    // Belegte Intervallpreise bleiben gewichtet erhalten. Für verschobene
+    // Anteile ohne Preiszuordnung dient der vorhandene Tagesmischpreis.
+    $averagePrice = $sources['grid'] > 0.001 ? $stats['cost_total'] / $sources['grid'] : 0.0;
+    $costSum = 0.0;
+    foreach (array_merge($loads, ['bat']) as $key) {
+        $energy = $stats['grid_' . $key . '_kwh'];
+        $stats['cost_' . $key] = $oldGrid[$key] > 0.001
+            ? $stats['cost_' . $key] * $energy / $oldGrid[$key]
+            : $energy * $averagePrice;
+        $costSum += $stats['cost_' . $key];
+    }
+    if (abs($costSum) > 0.000001) {
+        foreach (array_merge($loads, ['bat']) as $key) $stats['cost_' . $key] *= $stats['cost_total'] / $costSum;
+    } elseif ($sources['grid'] > 0.001) {
+        foreach (array_merge($loads, ['bat']) as $key) $stats['cost_' . $key] = $stats['grid_' . $key . '_kwh'] * $averagePrice;
+    }
+    $stats['save_total'] = 0.0;
+    foreach ($loads as $key) {
+        $energy = $stats['pv_' . $key . '_kwh'] + $stats['bat_' . $key . '_kwh'];
+        $stats['save_' . $key] = $oldSelf[$key] > 0.001
+            ? $stats['save_' . $key] * $energy / $oldSelf[$key]
+            : $energy * $averagePrice;
+        $stats['save_total'] += $stats['save_' . $key];
+    }
+}
+
 function calculateDailyEnergyStats($historyLines, $options = []) {
     $lastTs = null;
     $lastRow = null;
@@ -10580,6 +11118,8 @@ function calculateDailyEnergyStats($historyLines, $options = []) {
         }
     }
     if (!$activeDate) $activeDate = date('Y-m-d');
+
+    $balance = e3dcDailyBalanceInputs($historyLines, $activeDate, $options);
 
     $stats = [
         'pv_home_kwh' => 0, 'pv_bat_kwh' => 0, 'pv_wb_kwh' => 0, 'pv_wb2_kwh' => 0, 'pv_wp_kwh' => 0, 'pv_climate_kwh' => 0, 'pv_grid_kwh' => 0,
@@ -10626,7 +11166,7 @@ function calculateDailyEnergyStats($historyLines, $options = []) {
                 }
 
                 // Mittelwerte für das Intervall
-                $pv = max(0, (($d['pv'] ?? 0) + ($lastRow['pv'] ?? 0)) / 2);
+                $pv = max(0, (e3dcHistoryNumber($d, 'pv_total_w', e3dcHistoryNumber($d, 'pv', 0.0)) + e3dcHistoryNumber($lastRow, 'pv_total_w', e3dcHistoryNumber($lastRow, 'pv', 0.0))) / 2);
                 $pvExternalNow = isset($d['pv_external_w']) && is_numeric($d['pv_external_w']) ? (float)$d['pv_external_w'] : null;
                 $pvExternalPrev = isset($lastRow['pv_external_w']) && is_numeric($lastRow['pv_external_w']) ? (float)$lastRow['pv_external_w'] : null;
                 if ($pvExternalNow !== null || $pvExternalPrev !== null) {
@@ -10639,13 +11179,16 @@ function calculateDailyEnergyStats($historyLines, $options = []) {
                 $dcNow = max(0, (float)($d['dc0_w'] ?? 0) + (float)($d['dc1_w'] ?? 0));
                 $dcPrev = max(0, (float)($lastRow['dc0_w'] ?? 0) + (float)($lastRow['dc1_w'] ?? 0));
                 $pvDc = max(0, ($dcNow + $dcPrev) / 2);
-                $grid = (($d['grid'] ?? 0) + ($lastRow['grid'] ?? 0)) / 2;
-                $bat = (($d['bat'] ?? 0) + ($lastRow['bat'] ?? 0)) / 2;
+                $grid = (e3dcHistoryNumber($d, 'grid', 0.0) + e3dcHistoryNumber($lastRow, 'grid', 0.0)) / 2;
+                $bat = (e3dcHistoryNumber($d, 'bat', 0.0) + e3dcHistoryNumber($lastRow, 'bat', 0.0)) / 2;
                 $home = max(0, (e3dcCleanHistoryHomePower($d) + e3dcCleanHistoryHomePower($lastRow)) / 2);
-                $wb = max(0, (($d['wb'] ?? 0) + ($lastRow['wb'] ?? 0)) / 2);
-                $wb2 = max(0, (($d['wb2'] ?? 0) + ($lastRow['wb2'] ?? 0)) / 2);
-                $wp = max(0, (($d['wp'] ?? 0) + ($lastRow['wp'] ?? 0)) / 2);
-                $climate = max(0, (($d['climate'] ?? 0) + ($lastRow['climate'] ?? 0)) / 2);
+                $wb = max(0, (e3dcHistoryNumber($d, 'wb', 0.0) + e3dcHistoryNumber($lastRow, 'wb', 0.0)) / 2);
+                $wb2 = max(0, (e3dcHistoryNumber($d, 'wb2', 0.0) + e3dcHistoryNumber($lastRow, 'wb2', 0.0)) / 2);
+                $wp = max(0, (e3dcHistoryNumber($d, 'wp', 0.0) + e3dcHistoryNumber($lastRow, 'wp', 0.0)) / 2);
+                $climate = max(0, (e3dcHistoryNumber($d, 'climate', 0.0) + e3dcHistoryNumber($lastRow, 'climate', 0.0)) / 2);
+
+                // Gesamtbilanz enthält beide Wallbox-Messpunkte und alle Lasten.
+                $home = max(0.0, $pv + $grid - $bat - $wb - $wb2 - $wp - $climate);
 
                 $grid_in = max(0, $grid); $grid_out = max(0, -$grid);
                 $bat_in = max(0, $bat);
@@ -10793,7 +11336,7 @@ function calculateDailyEnergyStats($historyLines, $options = []) {
         if (!$d || !isset($d['ts']) || strpos($d['ts'], $activeDate) !== 0) continue;
 
         foreach (array_keys($finalExact) as $k) {
-            if (isset($d[$k])) {
+            if (isset($d[$k]) && is_numeric($d[$k])) {
                 $val = (float)$d[$k];
 
                 // Schutz gegen massive RSCP-Glitches (z.B. 0xFFFFFFFF Fehler = 4294967 kWh).
@@ -10820,11 +11363,15 @@ function calculateDailyEnergyStats($historyLines, $options = []) {
     }
 
     // --- EXAKTE ZÄHLER (C++) ANWENDEN & VERTEILUNGEN SKALIEREN ---
+    $integratedExternalPv = $stats['pv_external_kwh'];
+    $integratedE3dcPv = $stats['pv_e3dc_kwh'];
     $integratedPvTotal = (float)($stats['total_pv'] ?? 0.0);
     $integratedDcPvTotal = (float)($stats['total_pv_dc'] ?? 0.0);
     if ($finalExact['e_pv'] > 0.001) {
         $stats['pv_exact_counter_present'] = true;
-        if (e3dcKeepIntegratedPvTotalForExternalAc($integratedPvTotal, $integratedDcPvTotal, $finalExact['e_pv'])) {
+        if ($balance['values']['pv'] !== null && e3dcKeepIntegratedPvTotalForExternalAc($integratedPvTotal, $integratedDcPvTotal, $finalExact['e_pv'])) {
+            $balance['values']['pv'] = $balance['integral_complete']['pv'] ? $integratedPvTotal : null;
+            $balance['sources']['pv'] = $balance['integral_complete']['pv'] ? 'integrated_total_with_external_ac' : 'external_pv_integral_incomplete';
             $stats['pv_total_source'] = 'integrated_total_with_external_ac';
             $stats['pv_total_integrated_kwh'] = round($integratedPvTotal, 3);
             $stats['pv_e3dc_exact_kwh'] = round($finalExact['e_pv'], 3);
@@ -10892,37 +11439,42 @@ function calculateDailyEnergyStats($historyLines, $options = []) {
         $climateSum = $stats['pv_climate_kwh'] + $stats['grid_climate_kwh'] + $stats['bat_climate_kwh'];
         e3dcApplyExactEnergySplit($stats, $finalExact['e_climate'], $climateSum, ['pv_climate_kwh', 'grid_climate_kwh', 'bat_climate_kwh', 'cost_climate', 'save_climate'], null);
     }
-    // RSCP Home_Energy_kWh ist ein Brutto-Hauszähler. Für Langzeit muss "Haus"
-    // ohne separat ausgewiesene Wallboxen und Wärmepumpe gespeichert werden.
-    $cleanExactHome = $finalExact['e_home'];
-    if ($cleanExactHome > 0) {
-        $wbEnergyForHome = $finalExact['e_wb'] > 0
-            ? $finalExact['e_wb']
-            : ($stats['pv_wb_kwh'] + $stats['grid_wb_kwh'] + $stats['bat_wb_kwh']);
-        $wb2EnergyForHome = $finalExact['e_wb2'] > 0
-            ? $finalExact['e_wb2']
-            : ($stats['pv_wb2_kwh'] + $stats['grid_wb2_kwh'] + $stats['bat_wb2_kwh']);
-        $wpEnergyForHome = $finalExact['e_wp'] > 0
-            ? $finalExact['e_wp']
-            : ($stats['pv_wp_kwh'] + $stats['grid_wp_kwh'] + $stats['bat_wp_kwh']);
-        $climateEnergyForHome = $finalExact['e_climate'] > 0
-            ? $finalExact['e_climate']
-            : ($stats['pv_climate_kwh'] + $stats['grid_climate_kwh'] + $stats['bat_climate_kwh']);
-        $cleanExactHome = e3dcCleanExactHomeEnergy(
-            $cleanExactHome,
-            $wbEnergyForHome,
-            $wb2EnergyForHome,
-            $wpEnergyForHome,
-            $climateEnergyForHome
-        );
+    // Bestätigte Quellen statt anlagenabhängiger Bereinigung von e_home.
+    foreach (['pv', 'grid_in', 'grid_out', 'bat_in', 'bat_out'] as $key) {
+        if ($balance['values'][$key] !== null) $stats['total_' . $key] = $balance['values'][$key];
     }
-    $stats['total_home'] = e3dcApplyExactEnergySplit(
-        $stats,
-        $cleanExactHome,
-        ($stats['pv_home_kwh'] + $stats['grid_home_kwh'] + $stats['bat_home_kwh']),
-        ['pv_home_kwh', 'grid_home_kwh', 'bat_home_kwh', 'cost_home', 'save_home'],
-        'pv_home_kwh'
-    );
+    $stats['pv_total_source'] = $balance['sources']['pv'];
+    if ($balance['sources']['pv'] === 'integrated_total_with_external_ac' && $integratedExternalPv > 0.0) {
+        $stats['pv_external_kwh'] = $integratedExternalPv;
+        $stats['pv_e3dc_kwh'] = $integratedE3dcPv;
+    }
+    $cleanExactHome = 0.0;
+    $homeReason = 'energy_balance';
+    foreach (['pv' => 1, 'grid_in' => 1, 'grid_out' => -1, 'bat_out' => 1, 'bat_in' => -1] as $key => $sign) {
+        if ($balance['values'][$key] === null) {
+            $cleanExactHome = null;
+            $homeReason = 'balance_source_missing_' . $key;
+            break;
+        }
+        $cleanExactHome += $sign * $balance['values'][$key];
+    }
+    foreach (['wb', 'wb2', 'wp', 'climate'] as $key) {
+        $energy = $balance['values'][$key];
+        e3dcApplyDailyConsumerEnergy($stats, $key, $energy);
+        if ($cleanExactHome !== null && $energy !== null) $cleanExactHome -= $energy;
+    }
+    if ($cleanExactHome !== null && max(0.0, $stats['total_grid_out'] - $stats['total_bat_out'])
+        + max(0.0, $stats['total_bat_in'] - $stats['total_grid_in']) > $stats['total_pv'] + 0.05) {
+        $cleanExactHome = null;
+        $homeReason = 'energy_balance_inconsistent_sources';
+    }
+    if ($cleanExactHome !== null && $cleanExactHome < -0.05) {
+        $cleanExactHome = null;
+        $homeReason = 'energy_balance_negative';
+    }
+    if ($cleanExactHome !== null) $cleanExactHome = max(0.0, $cleanExactHome);
+    e3dcApplyDailyConsumerEnergy($stats, 'home', $cleanExactHome);
+    $stats['total_home'] = $cleanExactHome;
 
     // Exakte Verbraucherzähler können einzelne Zeilen nachträglich skalieren.
     // Danach muss jede Quellenkarte wieder auf ihre echte Quellenenergie passen:
@@ -10963,18 +11515,12 @@ function calculateDailyEnergyStats($historyLines, $options = []) {
     );
     e3dcNormalizeGridExportSources($stats);
 
-    // Alle Quellen-Normalisierungen können einzelne Verbraucheranteile wieder
-    // hochskalieren. Der bereinigte exakte Hauszähler bleibt als letzte harte
-    // Tagesgröße für "Haus ohne Wallbox/Wärmepumpe/Klima" führend.
-    if ($cleanExactHome > 0) {
-        e3dcApplyExactEnergySplit(
-            $stats,
-            $cleanExactHome,
-            ($stats['pv_home_kwh'] + $stats['grid_home_kwh'] + $stats['bat_home_kwh']),
-            ['pv_home_kwh', 'grid_home_kwh', 'bat_home_kwh', 'cost_home', 'save_home'],
-            'pv_home_kwh'
-        );
+    // Quellenkorrekturen dürfen die gemessenen Verbrauchermengen nicht ändern.
+    foreach (['wb', 'wb2', 'wp', 'climate'] as $key) {
+        e3dcApplyDailyConsumerEnergy($stats, $key, $balance['values'][$key]);
     }
+    e3dcApplyDailyConsumerEnergy($stats, 'home', $cleanExactHome);
+    e3dcReconcileDailyEnergyFlows($stats, $cleanExactHome);
 
     // AC-seitig ist die Herkunft einzelner Elektronen nicht messbar. Die
     // Quellenziele bleiben deshalb eine bilanzielle Intervallzuordnung und
@@ -11099,6 +11645,55 @@ function calculateDailyEnergyStats($historyLines, $options = []) {
         if ((float)$baseline > 0.0) {
             if (!isset($res['sources']) || !is_array($res['sources'])) $res['sources'] = [];
             $res['sources']["{$k}_midnight_baseline_kwh"] = round((float)$baseline, 3);
+        }
+    }
+    $res['sources']['home_energy_source'] = $homeReason;
+    $res['sources']['home_includes_unmeasured_consumers'] = [];
+    foreach (['home' => $cleanExactHome] + array_intersect_key($balance['values'], array_flip(['wb', 'wb2', 'wp', 'climate'])) as $key => $energy) {
+        if ($key !== 'home') {
+            $res['sources'][$key . '_energy_source'] = $balance['sources'][$key];
+            if ($energy === null) $res['sources']['home_includes_unmeasured_consumers'][] = $key;
+        }
+        if ($energy !== null) continue;
+        $res['stats']['total_' . $key . '_kwh'] = null;
+        foreach (['pv', 'grid', 'bat', 'pv_external', 'pv_e3dc'] as $source) {
+            $res['stats'][$source . '_' . $key . '_kwh'] = null;
+            $res['stats'][$source . '_' . $key . '_pct'] = null;
+        }
+        $res['costs'][$key] = null;
+        $res['costs']['save_' . $key] = null;
+    }
+    foreach (['pv', 'grid_in', 'grid_out', 'bat_in', 'bat_out'] as $key) {
+        $res['sources'][$key . '_energy_source'] = $balance['sources'][$key];
+        if ($balance['values'][$key] === null) $res['stats']['total_' . $key . '_kwh'] = null;
+    }
+    if ($balance['values']['pv'] === null) $res['pv_today_kwh'] = null;
+    if ($cleanExactHome === null) $res['autarky_day'] = null;
+    if ($stats['count_price'] === 0) {
+        $res['sources']['price_energy_source'] = 'interval_price_missing';
+        $res['costs']['avg_price'] = null;
+        if ($stats['total_grid_in'] > 0.0) $res['costs']['total'] = null;
+        if ($stats['total_pv'] + $stats['total_bat_out'] > 0.0) $res['costs']['save_total'] = null;
+        foreach (['home', 'bat', 'wb', 'wb2', 'wp', 'climate'] as $key) {
+            if ($stats['grid_' . $key . '_kwh'] > 0.0) $res['costs'][$key] = null;
+            if ($key !== 'bat' && $stats['pv_' . $key . '_kwh'] + $stats['bat_' . $key . '_kwh'] > 0.0) $res['costs']['save_' . $key] = null;
+        }
+    }
+
+    // Die Kostenrechnung benötigt ungerundete Energiemengen aus derselben Bilanz.
+    if (!empty($options['unrounded_energy'])) {
+        foreach (['pv', 'grid_in', 'grid_out', 'bat_in', 'bat_out'] as $key) {
+            $res['stats']['total_' . $key . '_kwh'] = $balance['values'][$key];
+        }
+        foreach (['home' => $cleanExactHome] + array_intersect_key($balance['values'], array_flip(['wb', 'wb2', 'wp', 'climate'])) as $key => $value) {
+            $res['stats']['total_' . $key . '_kwh'] = $value;
+            foreach (['pv', 'grid', 'bat'] as $source) {
+                $field = $source . '_' . $key . '_kwh';
+                $res['stats'][$field] = $value === null ? null : $stats[$field];
+            }
+        }
+        foreach (['pv_bat_kwh', 'grid_bat_kwh'] as $field) {
+            $res['stats'][$field] = $cleanExactHome === null ? null : $stats[$field];
         }
     }
     return $res;

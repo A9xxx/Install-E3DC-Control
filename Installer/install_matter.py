@@ -6,11 +6,13 @@ import time
 
 from .utils import (
     MATTER_SYSTEM_PACKAGES,
+    _command_argv_as_user,
     command_exists,
     install_apt_package_transaction,
     run_command,
 )
 from .installer_config import get_install_path, get_install_user
+from .web_installer import npm_executable
 from .logging_manager import get_or_create_logger, log_task_completed, log_error
 
 INSTALL_PATH = get_install_path()
@@ -53,6 +55,11 @@ def install_matter_bridge(headless=False):
         print(f"✗ Matter-Laufzeitprogramme fehlen: {', '.join(missing_commands)}")
         return False
 
+    npm = npm_executable()
+    if not os.path.isabs(npm) or not os.path.isfile(npm) or not os.access(npm, os.X_OK):
+        print("✗ npm fehlt unter /usr/bin/npm und /usr/local/bin/npm; Matter-Einrichtung abgebrochen.")
+        return False
+
     node_version = run_command("node --version")
     node_match = re.fullmatch(
         r"v([0-9]+)(?:\.[0-9]+){1,2}",
@@ -67,7 +74,7 @@ def install_matter_bridge(headless=False):
         return False
 
     print("→ Installiere hashgebundene NPM-Pakete (npm ci)...")
-    npm_result = run_command("npm ci --omit=dev --ignore-scripts", cwd=matter_dir)
+    npm_result = run_command(_command_argv_as_user([npm, "ci", "--omit=dev", "--ignore-scripts"], install_user), cwd=matter_dir, use_shell=False, timeout=600)
     if not npm_result.get("success"):
         print("✗ Matter-Abhängigkeiten konnten nicht aus der Lockdatei installiert werden.")
         return False
@@ -108,7 +115,7 @@ Type=simple
 User={install_user}
 Group=www-data
 WorkingDirectory={matter_dir}
-ExecStart=/usr/bin/npm run start
+ExecStart={npm} run start
 Restart=always
 RestartSec=10
 StandardOutput=journal

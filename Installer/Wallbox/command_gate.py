@@ -807,6 +807,21 @@ def _storage_hard_block_allows_output(
         default_release and release_type == _USER_OFF_RELEASE_TYPE
     )
 
+    # Die beobachtete Primary braucht kein Strombudget für die belegte
+    # Rückgabe an ihre eigene PV-Regelung. Unbekannte Budgets und harte
+    # Schutzsperren bleiben auch für diesen einzelnen Modusbefehl wirksam.
+    primary_pv_handoff = bool(
+        default_release
+        and getattr(charger, "primary_mode_enabled", False)
+        and (getattr(charger, "_command_gate_context", None) or {}).get("observe_only")
+        and getattr(charger, "_command_gate_release_reason", "")
+            in ("openwb_primary_pv_mode", "mode2_user_switch_pv")
+        and getattr(charger, _STORAGE_HARD_BLOCK_REASON_ATTR, "")
+            in ("manual_pause", "authorized_wallbox_budget_below_minimum")
+        and not getattr(charger, "_storage_power_budget_pending", False)
+    )
+    if primary_pv_handoff and name == "openwb_set_pv_mode":
+        return True
     if _is_typed_emergency_output(charger, name, data):
         return True
     # Die Budgetsperre verhindert Starts und Anhebungen. Typisierte
@@ -879,7 +894,7 @@ def _storage_hard_block_allows_output(
         if set(values) != {"set_chargemode", "chargepoint_nr"}:
             return False
         mode = values.get("set_chargemode")
-        return bool(mode == ["stop"] or (user_off_handoff and mode == ["pv"]))
+        return bool(mode == ["stop"] or ((user_off_handoff or primary_pv_handoff) and mode == ["pv"]))
     if name.startswith("openwb_http_v1_post"):
         topic = str(data.get("topic") or "").strip().lower()
         return topic.endswith("/data/set_current") and _number_is_zero(data.get("message"))

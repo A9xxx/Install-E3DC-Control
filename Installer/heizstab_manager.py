@@ -18,7 +18,7 @@ Architektur:
 - Liest WP-Leistung via Shelly Pro3EM (wp_type=3, Gen2 RPC)
 - Schaltet WP-Relais via Shelly Pro3EM (wp_type=3, optional)
 - Schreibt Status in /var/www/html/ramdisk/heizstab_data.json
-- Keine Dauerverbindungen! Modbus-Socket nach jedem Zugriff SOFORT schließen.
+- Eine Modbus-Verbindung je ELWA-Zyklus; danach Socket sicher schließen.
 
 Konfiguration in e3dc_v4.json:
     wp_type         = 0/1/3             (Luxtronik/IDM/Shelly-3EM-WP)
@@ -55,9 +55,19 @@ import os
 import sys
 import json
 import math
+import inspect
+from contextlib import contextmanager
+from contextvars import ContextVar
+from importlib.metadata import version, PackageNotFoundError
 import time
+from threading import Event
 import urllib.request
 import urllib.error
+
+try:
+    from Installer.shelly_relay_owner import shelly_relay_conflict, SHELLY_OWNER_WARNING
+except ModuleNotFoundError:
+    from shelly_relay_owner import shelly_relay_conflict, SHELLY_OWNER_WARNING
 
 _INSTALLER_DIR = os.path.dirname(os.path.abspath(__file__))
 _INSTALL_ROOT = os.path.dirname(_INSTALLER_DIR)
@@ -111,12 +121,136 @@ except ImportError:
         MODBUS_OK = False
         print("[!] pymodbus nicht installiert - Heizstab Modbus deaktiviert")
 
-# pymodbus API-Versionen:
-#   2.x  -> unit=1
-#   3.0-3.12 -> slave=1
-#   3.13+    -> device_id=1
-# Auto-Detect via inspect schlaegt fehl (*args/**kwargs),
-# daher dreistufiges try/except in den Modbus-Funktionen.
+_MODBUS_API_CACHE = None
+
+
+def modbus_compatibility():
+    """Prüft die benötigte Client-API ohne Gerätezugriff oder Paketänderung."""
+    global _MODBUS_API_CACHE
+    cache_key = (globals().get("ModbusTcpClient"), MODBUS_OK, version)
+    if _MODBUS_API_CACHE is not None and _MODBUS_API_CACHE[0] == cache_key:
+        return dict(_MODBUS_API_CACHE[1])
+    result = _probe_modbus_compatibility()
+    _MODBUS_API_CACHE = (cache_key, result)
+    return dict(result)
+
+
+def _probe_modbus_compatibility():
+    try:
+        installed = version("pymodbus")
+    except PackageNotFoundError:
+        installed = None
+    result = {"version": installed, "compatible": False, "device_parameter": None,
+              "reason": "pymodbus ist nicht installiert"}
+    if not MODBUS_OK:
+        return result
+    try:
+        read = inspect.signature(ModbusTcpClient.read_holding_registers).parameters
+        write = inspect.signature(ModbusTcpClient.write_register).parameters
+        for key in ("device_id", "slave", "unit"):
+            if key in read and key in write:
+                result.update(compatible=True, device_parameter=key, reason="Client-API geprüft")
+                return result
+        # 2.x nimmt unit ausschließlich über **kwargs entgegen. Ein unbekanntes
+        # device_id würde dort still ignoriert und könnte die falsche Unit nutzen.
+        if all(any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+               for params in (read, write)):
+            # Ohne Metadaten beginnt der Rückfall mit unit: 2.x ignoriert
+            # unbekannte Schlüssel still. Hüllen moderner APIs reichen einen
+            # unpassenden Schlüssel per TypeError an den gezielten Rückfall weiter.
+            key = "unit"
+            try:
+                major, minor = (int(x) for x in installed.split(".")[:2])
+                if major == 3:
+                    key = "device_id" if minor >= 10 else "slave"
+            except (AttributeError, TypeError, ValueError):
+                pass
+            result.update(compatible=True, device_parameter=key,
+                          reason="Client-API über gezielten Schlüsselwort-Rückfall")
+            return result
+        result["reason"] = "pymodbus-Client-API nicht unterstützt; Gerätezugriff ausgesetzt"
+    except (AttributeError, TypeError, ValueError, NameError):
+        result["reason"] = "pymodbus-Client-API nicht prüfbar; Gerätezugriff ausgesetzt"
+    return result
+
+
+_MODBUS_CYCLE = ContextVar("heizstab_modbus_cycle", default=None)
+_HEATER_CYCLE_STATE = ContextVar("heizstab_cycle_state", default=None)
+
+
+class _ModbusSession:
+    """Öffnet verzögert genau einmal; ein Fehler bleibt bis Zyklusende geschlossen."""
+    def __init__(self, ip, port):
+        self.ip, self.port = str(ip), int(port)
+        self.client = None
+        self.attempted = False
+        self.failed = False
+        self.write_unconfirmed = False
+        self.write_reason = ""
+        self.api = None
+
+    def get_client(self):
+        if not MODBUS_OK or self.failed:
+            return None
+        if not self.attempted:
+            self.attempted = True
+            self.api = modbus_compatibility()
+            if not self.api["compatible"]:
+                self.failed = True
+                print(f"  [!] Modbus {self.ip}:{self.port}: " + self.api["reason"])
+                return None
+            self.client = ModbusTcpClient(self.ip, port=self.port, timeout=4)
+            if not self.client.connect():
+                self.failed = True
+                print(f"  [!] Modbus Verbindung zu {self.ip}:{self.port} fehlgeschlagen")
+                return None
+        return self.client
+
+    def close(self):
+        if self.client is not None:
+            self.client.close()
+
+
+@contextmanager
+def _modbus_session(ip, port):
+    current = _MODBUS_CYCLE.get()
+    shared = current is not None and (current.ip, current.port) == (str(ip), int(port))
+    session = current if shared else _ModbusSession(ip, port)
+    try:
+        yield session
+    finally:
+        if not shared:
+            session.close()
+
+
+def _modbus_call(session, method, *args, **kwargs):
+    if method == "write_register" and session.write_unconfirmed and int(args[1]) > 0:
+        return None
+    client = session.get_client()
+    if client is None:
+        return None
+    if method == "write_register" and int(args[0]) == 1004:
+        # Erst der autorisierte Geräteaufruf verbraucht den Stundenversuch.
+        _elwa_timeout_attempts[session.ip] = time.monotonic()
+    # Bei unbekannter Paketversion können alte Hüllen unpassende Schlüssel
+    # still ignorieren. Alle drei bekannten Aliase tragen deshalb dieselbe
+    # Geräteadresse; strikte APIs fallen anschließend auf Einzelaufrufe zurück.
+    if session.api["version"] is None and session.api["device_parameter"] == "unit":
+        try:
+            return getattr(client, method)(*args, **kwargs, unit=1, slave=1, device_id=1)
+        except TypeError:
+            pass
+    # Der geprüfte Parameter kommt zuerst. Die bisherigen Rückfälle bleiben
+    # für kompatible Client-Hüllen erhalten, ohne 2.x mit device_id anzusprechen.
+    keys = [session.api["device_parameter"]]
+    keys.extend(k for k in ("device_id", "slave", "unit") if k not in keys)
+    for key in keys:
+        try:
+            return getattr(client, method)(*args, **kwargs, **{key: 1})
+        except TypeError:
+            if key == keys[-1]:
+                raise
+
 
 # ---------------------------------------------------------------------------
 # Pfade
@@ -205,9 +339,16 @@ def _authorize_heater_output(
 
 def _invoke_actuator(func, *args, safety_gate=None):
     """Erhält bestehende Aufrufsignaturen und erlaubt die explizite Gate-Übergabe."""
-    if safety_gate is None:
-        return func(*args)
-    return func(*args, safety_gate=safety_gate)
+    result = func(*args) if safety_gate is None else func(*args, safety_gate=safety_gate)
+    state = _HEATER_CYCLE_STATE.get()
+    if result and state is not None:
+        if func in (elwa_set_power, heizstab_set_power):
+            state["heater_owned_modbus"] = bool(args[2] > 0)
+        elif func is shelly_set_state:
+            state["heater_owned_shelly"] = bool(args[1])
+        elif func is shelly_3em_set_relay:
+            state["s3em_owned"] = bool(args[2])
+    return result
 
 
 def _with_actuator_safety_status(status, safety_gate=None):
@@ -240,6 +381,7 @@ def load_config():
         "heizstab_max_w":       "3000",
         "shelly_heiz_ip":       "0.0.0.0",
         "shelly_heiz_w":        "1500",
+        "auto_mode":            "1",
         "hs_auto_mode":         "1",
         "hs_min_surplus_w":     "500",
         "hs_min_soc":           "20",
@@ -251,6 +393,8 @@ def load_config():
         "shelly_3em_wp_min_w":  "1000",
         "shelly_3em_wp_max_w":  "3000",
         "shelly_3em_enable":    "0",
+        "shelly_sg_ip":         "",
+        "shelly_pause_ip":      "",
         "wp_min_runtime_min":    "30",
         "wp_restart_block_min":  "20",
         "heat_policy_runtime_enable": "0",
@@ -336,7 +480,8 @@ def optional_live_float(data, *keys):
 def read_live():
     """
     Liest aktuelle Leistungswerte aus live_data_py.json (Python RSCP).
-    Gibt Nullwerte zurueck wenn Datei fehlt oder aelter als 30s (Dienst tot).
+    Kennzeichnet fehlenden oder ungültigen SoC separat. Die Rechenwerte
+    bleiben für den bisherigen Regelpfad erhalten.
     """
     if os.path.exists(LIVE_PY_FILE):
         if time.time() - os.path.getmtime(LIVE_PY_FILE) <= 30:
@@ -347,13 +492,16 @@ def read_live():
                         "pv_w":   float(data.get("PV_Power", 0)),
                         "grid_w": float(data.get("Grid_Power", 0)),
                         "soc":    float(data.get("SOC", 0)),
+                        "soc_valid": (optional_live_float(data, "SOC") is not None
+                                      and 0 <= float(data["SOC"]) <= 100),
                         "price_ct": optional_live_float(data, "price_ct", "billing_price_ct"),
                         "heater_temp_c": optional_live_float(data, "heater_temp_c"),
                         "source": "live_data_py.json",
                     }
             except Exception:
                 pass
-    return {"pv_w": 0, "grid_w": 0, "soc": 0, "price_ct": None, "heater_temp_c": None, "source": "none"}
+    return {"pv_w": 0, "grid_w": 0, "soc": 0, "soc_valid": False,
+            "price_ct": None, "heater_temp_c": None, "source": "none"}
 
 
 # ---------------------------------------------------------------------------
@@ -379,54 +527,37 @@ ELWA_HEATING_CODES = {1, 2, 4}
 
 
 def _modbus_read_regs(ip, port, start, count=1):
-    """Liest count Register ab start. Gibt Liste oder None zurueck. Socket wird IMMER geschlossen."""
-    if not MODBUS_OK:
-        return None
-    client = ModbusTcpClient(ip, port=int(port), timeout=4)
-    try:
-        if not client.connect():
-            print(f"  [!] Modbus Verbindung zu {ip}:{port} fehlgeschlagen")
-            return None
-        # pymodbus 3.13+: device_id=  |  3.0-3.12: slave=  |  2.x: unit=
+    """Liest Register auf der Zyklusverbindung oder einer einzelnen Verbindung."""
+    with _modbus_session(ip, port) as session:
         try:
-            result = client.read_holding_registers(start, count=count, device_id=1)
-        except TypeError:
-            try:
-                result = client.read_holding_registers(start, count=count, slave=1)
-            except TypeError:
-                result = client.read_holding_registers(start, count=count, unit=1)
-        if hasattr(result, 'registers') and result.registers:
-            return result.registers
+            result = _modbus_call(session, "read_holding_registers", start, count=count)
+            if (result is not None and not (hasattr(result, "isError") and result.isError())
+                    and len(getattr(result, "registers", [])) == count):
+                return result.registers
+            session.failed = True
+        except Exception as e:
+            session.failed = True
+            print(f"  [!] Modbus-Lesen {ip}:{port} (Register {start}): {e}")
         return None
-    except Exception as e:
-        print(f"  [!] Modbus Lesen ({ip} Reg {start}): {e}")
-        return None
-    finally:
-        client.close()
 
 
 def _modbus_write_reg_raw(ip, port, register, value):
-    """Schreibt einen Wert in ein Holding-Register. Socket wird IMMER geschlossen."""
-    if not MODBUS_OK:
-        return False
-    client = ModbusTcpClient(ip, port=int(port), timeout=4)
-    try:
-        if not client.connect():
-            return False
-        # pymodbus 3.13+: device_id=  |  3.0-3.12: slave=  |  2.x: unit=
+    """Schreibt auf derselben Verbindung; Fehler geben keine weitere Freigabe."""
+    with _modbus_session(ip, port) as session:
         try:
-            result = client.write_register(register, int(max(0, value)), device_id=1)
-        except TypeError:
-            try:
-                result = client.write_register(register, int(max(0, value)), slave=1)
-            except TypeError:
-                result = client.write_register(register, int(max(0, value)), unit=1)
-        return bool(result is not None and not (hasattr(result, "isError") and result.isError()))
-    except Exception as e:
-        print(f"  [!] Modbus Schreiben ({ip} Reg {register}={value}): {e}")
-        return False
-    finally:
-        client.close()
+            result = _modbus_call(session, "write_register", register, int(max(0, value)))
+            ok = bool(result is not None and not (hasattr(result, "isError") and result.isError()))
+            if not ok:
+                if result is not None and getattr(result, "exception_code", None) is not None:
+                    session.write_unconfirmed = True
+                    session.write_reason = "Modbus-Schreibbefehl vom Gerät abgelehnt"
+                elif result is not None or not session.write_unconfirmed or int(max(0, value)) == 0:
+                    session.failed = True
+            return ok
+        except Exception as e:
+            session.failed = True
+            print(f"  [!] Modbus-Schreiben {ip}:{port} (Register {register}): {e}")
+            return False
 
 
 # --- Generic Heizstab (bisheriges Verhalten) ---
@@ -463,7 +594,12 @@ def _modbus_write_confirmed(
     if not _modbus_write_reg_raw(ip, port, register, value):
         return False
     readback = _modbus_read_regs(ip, port, register, count=1)
-    return bool(readback and int(readback[0]) == int(max(0, value)))
+    confirmed = bool(readback and int(readback[0]) == int(max(0, value)))
+    session = _MODBUS_CYCLE.get()
+    if not confirmed and session is not None and readback is not None:
+        session.write_unconfirmed = True
+        print(f"  [!] Modbus {ip}:{port}: Register {register} – Schreibbestätigung abweichend")
+    return confirmed
 
 
 def heizstab_set_power(ip, port, power_w, safety_gate=None):
@@ -482,28 +618,38 @@ def heizstab_set_power(ip, port, power_w, safety_gate=None):
 
 # --- myPV AC ELWA-E ---
 
-_elwa_timeout_set = {}  # {ip: True} - Timeout einmalig gesetzt
+_elwa_timeout_set = {}  # Bestätigung je IP und Prozess.
+_elwa_timeout_attempts = {}  # Letzter Versuch je IP, monotone Prozesszeit.
 
 
 def elwa_ensure_timeout(ip, port, timeout_s=60, safety_gate=None):
-    """
-    Setzt Modbus-Timeout einmalig auf 60s (Register 1004).
-    Schreibt selten um EEPROM-Verschleiss zu vermeiden (nur beim ersten Zyklus).
+    """Schreibt Register 1004 nach Fehlern höchstens stündlich, bestätigt einmal.
+
+    Ein unbestätigter Gerätetimeout sperrt keine Sollwerte in Register 1000.
+    Der bestehende Socket bleibt gemeinsam; ein Sollwert-Transportfehler wird
+    weiterhin vom normalen Schreibpfad erkannt und mit Backoff gemeldet.
     """
     if _elwa_timeout_set.get(ip):
-        return
-    ok = _modbus_write_confirmed(
-        ip,
-        port,
-        1004,
-        timeout_s,
-        driver_key=f"transport:modbus-tcp:{ip}:{port}",
-        safety_gate=safety_gate,
-        safe_release=False,
-    )
+        return True
+    now = time.monotonic()
+    previous = _elwa_timeout_attempts.get(ip)
+    if previous is not None and now - previous < 3600:
+        return False
+    session = _MODBUS_CYCLE.get()
+    prior = (session.failed, session.write_unconfirmed, session.write_reason) if session else None
+    try:
+        ok = _modbus_write_confirmed(
+            ip, port, 1004, timeout_s,
+            driver_key=f"transport:modbus-tcp:{ip}:{port}",
+            safety_gate=safety_gate, safe_release=False,
+        )
+    finally:
+        if session is not None:
+            session.failed, session.write_unconfirmed, session.write_reason = prior
     if ok:
         print(f"  [ELWA] Modbus Timeout auf {timeout_s}s gesetzt (Register 1004)")
         _elwa_timeout_set[ip] = True
+    return bool(ok)
 
 
 def elwa_read_status(ip, port):
@@ -1745,14 +1891,70 @@ def read_manual_override():
         return None
 
 
+def global_auto_enabled(cfg):
+    """Nur ausdrückliches Aus sperrt; fehlende/ungültige Altwerte bleiben an."""
+    raw = str(cfg.get("auto_mode", "1")).strip().lower()
+    return raw not in ("0", "false", "no", "off", "nein", "aus")
+
+
+def _elwa_offline_status(status, state):
+    retry = max(1, int(math.ceil(float(state.get("elwa_backoff_until", 0)) - time.time())))
+    status.update(success=False, modbus_offline=True, elwa_retry_in_s=retry,
+                  elwa_next_retry_ts=state.get("elwa_backoff_until"),
+                  elwa_status="Offline / Modbus nicht erreichbar")
+    status["modbus_reason"] = f"ELWA antwortet nicht – nächster Versuch in {retry} s"
+    if status.get("hs_mode") != "global_off":
+        status["hs_reason"] = status["modbus_reason"]
+
+
 def control_cycle(cfg, live, hs_state, safety_gate=None):
+    """Bindet ELWA-Lesen, bestätigte Schreibvorgänge und Abschluss an einen Socket."""
+    hs_state.setdefault("s3em_owned", bool(hs_state.get("s3em_on", False)))
+    is_elwa = str(cfg.get("heizstab_type", "generic")).strip().lower() == "mypv_elwa"
+    endpoint = str(cfg.get("heizstab_ip", "0.0.0.0")).strip()
+    session = (_ModbusSession(endpoint, cfg.get("heizstab_port", 502))
+               if is_elwa and endpoint not in ("", "0.0.0.0") else None)
+    token = _MODBUS_CYCLE.set(session)
+    state_token = _HEATER_CYCLE_STATE.set(hs_state)
+    try:
+        status = _control_cycle(cfg, live, hs_state, safety_gate=safety_gate)
+        if session is not None and session.failed and float(hs_state.get("elwa_backoff_until", 0)) <= time.time():
+            failures = int(hs_state.get("elwa_fail_count", 0)) + 1
+            hs_state["elwa_fail_count"] = failures
+            hs_state["elwa_backoff_until"] = time.time() + min(300, max(30, 30 * failures))
+            _elwa_offline_status(status, hs_state)
+        if session is not None and session.write_unconfirmed and not session.failed:
+            status.update(success=False, modbus_write_unconfirmed=True)
+            status["modbus_write_reason"] = session.write_reason or "Modbus-Schreiben nicht bestätigt – Rücklesewert weicht ab"
+            if status.get("hs_mode") != "global_off":
+                status["hs_reason"] = status["modbus_write_reason"]
+        if is_elwa and endpoint in _elwa_timeout_attempts and not _elwa_timeout_set.get(endpoint):
+            status["elwa_timeout_unconfirmed"] = True
+            status["elwa_timeout_warning"] = ("Gerätetimeout (Register 1004) nicht bestätigt – "
+                                              "Heizstab läuft ohne geräteseitige Zeitgrenze")
+        # Der Hinweis verändert weder Schaltbefehle noch bestehende Fehlergründe.
+        status["wp_relay_warning"] = SHELLY_OWNER_WARNING if shelly_relay_conflict(cfg) else None
+        status["pymodbus"] = modbus_compatibility()
+        if endpoint not in ("", "0.0.0.0") and not status["pymodbus"]["compatible"]:
+            status["modbus_diagnostic"] = status["pymodbus"]["reason"]
+        return status
+    finally:
+        try:
+            if session is not None:
+                session.close()
+        finally:
+            _MODBUS_CYCLE.reset(token)
+            _HEATER_CYCLE_STATE.reset(state_token)
+
+
+def _control_cycle(cfg, live, hs_state, safety_gate=None):
     """
     Haupt-Regelzyklus: entscheidet ob und mit wieviel Leistung aktiviert wird.
     Unterstuetzt heizstab_type = generic (Standard) und mypv_elwa (myPV AC ELWA-E).
     hs_state: persistenter Zustand zwischen Zyklen {'is_on': bool, 'current_w': float}
     Gibt ein Status-Dict zurueck das in heizstab_data.json landet.
     """
-    global_auto   = str(cfg.get("auto_mode", "1")).lower() in ("1", "true", "yes")
+    global_auto   = global_auto_enabled(cfg)
     local_auto    = cfg_bool(cfg, "hs_auto_mode", True)
     auto_mode     = global_auto and local_auto
     heat_policy_runtime_enabled = cfg_bool(cfg, "heat_policy_runtime_enable", False)
@@ -1850,7 +2052,8 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
         "surplus_w":        round(surplus_w),
         "grid_surplus_w":   round(netpoint_surplus_w),
         "pv_w":             round(pv_w),
-        "soc":              soc,
+        "soc":              soc if live.get("soc_valid", True) else None,
+        "soc_valid":        live.get("soc_valid", True),
         "live_source":      live.get("source", "none"),
         "process_success":  True,
         "success":          True,
@@ -1913,7 +2116,7 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
             status["success"] = False
             status["modbus_offline"] = True
             status["elwa_status"] = "Offline / Modbus nicht erreichbar"
-            status["hs_reason"] = f"ELWA Modbus nicht erreichbar - neuer Versuch in {_retry_s}s"
+            _elwa_offline_status(status, hs_state)
 
     modbus_power_w = None
     modbus_observed_ts = None
@@ -1925,7 +2128,6 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
     if has_hs and MODBUS_OK and elwa_modbus_available:
         if is_elwa:
             # myPV AC ELWA-E: Timeout einmalig setzen + Status-Block lesen
-            _invoke_actuator(elwa_ensure_timeout, hs_ip, hs_port, safety_gate=safety_gate)
             elwa_data = elwa_read_status(hs_ip, hs_port)
             modbus_observed_ts = time.time()
             if elwa_data:
@@ -1939,6 +2141,8 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
                 status["elwa_status_code"]  = elwa_data["status_code"]
                 status["elwa_status"]       = elwa_data["status_text"]
                 elwa_status_code = elwa_data["status_code"]
+                if global_auto:
+                    _invoke_actuator(elwa_ensure_timeout, hs_ip, hs_port, safety_gate=safety_gate)
                 print(f"  [ELWA] Status={elwa_data['status_text']} "
                       f"Soll={elwa_data['setpoint_w']}W "
                       f"Ist={elwa_data['actual_w']}W "
@@ -1954,7 +2158,7 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
                 status["success"] = False
                 status["modbus_offline"] = True
                 status["elwa_status"] = "Offline / Modbus nicht erreichbar"
-                status["hs_reason"] = f"ELWA Modbus keine Antwort - Retry in {_backoff_s}s"
+                _elwa_offline_status(status, hs_state)
                 print(f"  [ELWA] Keine Daten von {hs_ip}:{hs_port}")
         else:
             # Generic: Register 1014 = Istleistung
@@ -2019,6 +2223,12 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
             s3_relay_state,
             now_ts=s3_observed_ts,
         )
+        # Nur der erste erfolgreiche Readback übernimmt einen beim Start
+        # vorgefundenen Lauf. Spätere externe Einschaltungen bleiben Messung.
+        if type(s3_relay_state) is bool and not hs_state.get("s3em_startup_checked", False):
+            hs_state["s3em_startup_checked"] = True
+            if s3_enable and s3_relay >= 0 and s3_relay_state:
+                hs_state["s3em_owned"] = True
         s3_wallbox_transition = wallbox_phase_transition_active(
             now_ts=s3_observed_ts,
             budget_snapshot=consumer_budget_snapshot,
@@ -2028,6 +2238,81 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
             s3_actuator_context_reason,
         ) = heat_actuator_context_readiness(safety_gate)
         refresh_shelly_3em_provider(s3_observed_ts)
+
+    # Die Neustartprüfung endet beim ersten erfolgreichen Lesen, auch
+    # während Automatik an. Ein späterer Fremdsollwert begründet keinen Besitz.
+    if hs_configured and not is_elwa and not hs_state.get("heater_startup_checked", False):
+        target = _modbus_read_regs(hs_ip, hs_port, 1000, count=1) if MODBUS_OK else None
+        if target is not None:
+            hs_state["heater_startup_checked"] = True
+            if target[0] > 0:
+                hs_state["heater_owned_modbus"] = True
+
+    if not global_auto:
+        # Beobachten bleibt erlaubt. Nur eigene bestätigte Ausgänge werden
+        # zurückgenommen; ein späterer Fremdsollwert wird nicht bekämpft.
+        status["hs_mode"] = "global_off"
+        status["hs_reason"] = "Globale Automatik aus – nur Messung"
+        manual = read_manual_override()
+        if manual and manual.get("mode") == "full":
+            status["hs_manual_override"] = manual
+            status["hs_manual_ignored"] = True
+            status["hs_manual_reason"] = "Globale Automatik aus – Handanforderung wird nicht ausgeführt"
+            status["hs_reason"] = status["hs_manual_reason"]
+        release_ok = True
+        legacy_owned = bool(hs_state.get("is_on") or float(hs_state.get("current_w", 0) or 0) > 0)
+        if hs_configured and hs_state.get("heater_owned_modbus", legacy_owned):
+            if MODBUS_OK and elwa_modbus_available:
+                release_ok = bool(_invoke_actuator(
+                    elwa_set_power if is_elwa else heizstab_set_power,
+                    hs_ip, hs_port, 0, safety_gate=safety_gate)) and release_ok
+            else:
+                release_ok = False
+        if sh_configured and hs_state.get("heater_owned_shelly", legacy_owned):
+            release_ok = bool(_invoke_actuator(shelly_set_state, sh_ip, False,
+                                               safety_gate=safety_gate)) and release_ok
+        if release_ok:
+            hs_state["is_on"] = False
+            hs_state["current_w"] = 0
+            hs_state["heater_auto_off_confirmed"] = True
+        else:
+            status["success"] = False
+            status["hs_reason"] = "Globale Automatik aus – eigene Heizstab-Rücknahme nicht bestätigt"
+        # Der Pro3EM beweist Lastannahme, keinen separaten Verdichterzustand.
+        # Bei unbekanntem Einschaltalter beginnt der vorhandene konservative
+        # Mindestlaufhalt. Aus gibt keinen neuen Start und keine Verlängerung frei.
+        relay_owned = hs_state.get("s3em_owned", False)
+        if has_s3em and s3_enable and s3_relay >= 0 and relay_owned:
+            now_ts = time.time()
+            last_on = float(hs_state.get("s3em_last_on_ts", 0) or 0)
+            if last_on <= 0:
+                last_on = now_ts
+                hs_state["s3em_last_on_ts"] = last_on
+            remaining = max(0.0, s3_min_runtime_s - (now_ts - last_on))
+            confirmed_off = status.get("wp_relay_readback_valid") is True and status.get("wp_relay_readback_on") is False
+            if confirmed_off:
+                hs_state["s3em_owned"] = False
+                hs_state["s3em_auto_off_confirmed"] = True
+            elif remaining > 0 and not (live.get("soc_valid", True) and not soc_ok):
+                status["wp_takt_protect_active"] = True
+                status["wp_min_runtime_remaining_s"] = round(remaining)
+                if release_ok:
+                    status["hs_reason"] = f"Globale Automatik aus – WP-Mindestlaufzeit noch {remaining/60:.1f} Min"
+            elif _invoke_actuator(shelly_3em_set_relay, s3_ip, s3_relay, False, safety_gate=safety_gate):
+                if release_ok and live.get("soc_valid", True) and not soc_ok:
+                    status["hs_reason"] = "Globale Automatik aus – WP-SoC-Sicherheitsabschaltung"
+                hs_state["s3em_on"] = False
+                hs_state["s3em_auto_off_confirmed"] = True
+                hs_state["s3em_last_off_ts"] = now_ts
+                update_shelly_3em_relay_evidence(status, False, now_ts=now_ts,
+                    source="shelly_3em_switch_set_confirmed_readback")
+            else:
+                status["success"] = False
+                status["hs_reason"] = "Globale Automatik aus – WP-Relais-Rücknahme nicht bestätigt"
+            refresh_shelly_3em_provider()
+        if is_elwa and status.get("modbus_offline"):
+            _elwa_offline_status(status, hs_state)
+        return _with_actuator_safety_status(status, safety_gate)
 
     if not heater_module_enabled:
         status["hs_mode"] = "disabled"
@@ -2311,49 +2596,7 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
             status["hs_reason"] = "Auto AUS fehlgeschlagen: Safe-Readback nicht bestätigt"
             hs_state["heater_auto_off_confirmed"] = False
 
-        if not global_auto and has_s3em and s3_enable and s3_relay >= 0:
-            s3_confirmed_off = bool(
-                status.get("wp_relay_readback_valid") is True
-                and status.get("wp_relay_readback_on") is False
-            )
-            s3_release_needed = bool(
-                not s3_confirmed_off
-                and (
-                    hs_state.get("s3em_on")
-                    or not hs_state.get("s3em_auto_off_confirmed", False)
-                )
-            )
-            s3_release_ok = True
-            if s3_release_needed:
-                s3_release_ok = _invoke_actuator(
-                    shelly_3em_set_relay,
-                    s3_ip,
-                    s3_relay,
-                    False,
-                    safety_gate=safety_gate,
-                )
-            if s3_release_ok:
-                hs_state["s3em_on"] = False
-                hs_state["s3em_auto_off_confirmed"] = True
-                status["wp_relay_on"] = False
-                if s3_release_needed:
-                    s3_release_ts = time.time()
-                    hs_state["s3em_last_off_ts"] = s3_release_ts
-                    update_shelly_3em_relay_evidence(
-                        status,
-                        False,
-                        now_ts=s3_release_ts,
-                        source="shelly_3em_switch_set_confirmed_readback",
-                    )
-                    status["wp_relay_runtime_evidence"] = (
-                        "commanded_off_confirmed_readback"
-                    )
-            else:
-                status["success"] = False
-                status["hs_reason"] = "Globale Automatik AUS: WP-Relais nicht sicher bestätigt"
-                hs_state["s3em_auto_off_confirmed"] = False
-            refresh_shelly_3em_provider()
-        elif s3_relay_auto_mode:
+        if s3_relay_auto_mode:
             hs_state["s3em_auto_off_confirmed"] = False
 
         # Nutzer-Aus bleibt für den Heizstab ein hartes Veto. Nur die explizit
@@ -2799,25 +3042,39 @@ def main():
           f"Shelly: {sh_ip} | "
           f"Auto-Modus: {'an' if cfg_bool(cfg, 'hs_auto_mode', True) else 'aus'}")
 
+    hs_state = {"is_on": False, "current_w": 0}
+
     # SIGTERM-Handler: Heizstab und Shelly beim Dienst-Stop auf 0/AUS setzen.
     # WICHTIG fuer Generic-Heizstab (Register 1000): hat keinen Modbus-Timeout!
     # Der myPV ELWA-E schaltet nach 60s (Register 1004) selbst ab, aber Generic nicht.
     import signal as _signal
     _hs_stop = False
+    _stop_event = Event()
     def _handle_stop(sig, frame):
         nonlocal _hs_stop
         _hs_stop = True
-        print(f"[{time.strftime('%H:%M:%S')}] SIGTERM: Heizstab und Shelly werden abgeschaltet...")
+        _stop_event.set()
+
+    def _release_on_stop():
+        # Erst nach Abschluss des Regelzyklus: eigene Verbindung und keine
+        # verschränkten Modbus-Transaktionen im Signal-Handler.
+        print(f"[{time.strftime('%H:%M:%S')}] Dienststopp: Heizstab und Shelly werden abgeschaltet…")
         release_ok = True
         _hs = cfg.get("heizstab_ip", "0.0.0.0").strip()
         _sh = cfg.get("shelly_heiz_ip", "0.0.0.0").strip()
         _ht = str(cfg.get("heizstab_type", "generic")).strip().lower()
-        if _hs not in ("", "0.0.0.0") and MODBUS_OK:
+        if _hs not in ("", "0.0.0.0") and MODBUS_OK and (global_auto_enabled(cfg) or hs_state.get("heater_owned_modbus", False)):
             try:
-                if _ht == "mypv_elwa":
-                    heater_off_ok = elwa_set_power(_hs, cfg.get("heizstab_port", "502"), 0)
-                else:
-                    heater_off_ok = heizstab_set_power(_hs, cfg.get("heizstab_port", "502"), 0)
+                stop_session = _ModbusSession(_hs, cfg.get("heizstab_port", "502"))
+                stop_token = _MODBUS_CYCLE.set(stop_session)
+                try:
+                    set_power = elwa_set_power if _ht == "mypv_elwa" else heizstab_set_power
+                    heater_off_ok = set_power(_hs, cfg.get("heizstab_port", "502"), 0)
+                finally:
+                    try:
+                        stop_session.close()
+                    finally:
+                        _MODBUS_CYCLE.reset(stop_token)
                 release_ok = heater_off_ok and release_ok
                 if heater_off_ok:
                     print(f"  Heizstab {_hs} -> 0W gesetzt und bestätigt")
@@ -2826,7 +3083,7 @@ def main():
             except Exception as e:
                 release_ok = False
                 print(f"  [!] Heizstab Stop-Fehler: {e}")
-        if _sh not in ("", "0.0.0.0"):
+        if _sh not in ("", "0.0.0.0") and (global_auto_enabled(cfg) or hs_state.get("heater_owned_shelly", False)):
             try:
                 shelly_off_ok = shelly_set_state(_sh, False)
                 release_ok = shelly_off_ok and release_ok
@@ -2852,22 +3109,17 @@ def main():
 
     # Startup-Delay: ELWA-Modbus braucht Zeit zur Erholung nach Neustart
     print(f"  Warte {STARTUP_DELAY}s (ELWA Modbus Erholung nach Neustart)...")
-    for _ in range(STARTUP_DELAY):
-        if _hs_stop:
-            return
-        time.sleep(1)
+    _stop_event.wait(STARTUP_DELAY)
 
     # Persistenter Zustand fuer Hysterese (lebt nur im Arbeitsspeicher, kein JSON)
-    hs_state = {'is_on': False, 'current_w': 0}
     conn_err_count = 0  # Zaehlt aufeinanderfolgende Connection-Fehler
 
     loop = 0
     while not _hs_stop:
         loop += 1
         try:
-            # Config jede 6. Runde neu laden (ca. jede 90s bei POLL_INTERVAL=15)
-            if loop % 6 == 1:
-                cfg = load_config()
+            # Nutzer-Aus muss bereits im nächsten Regelzyklus wirksam sein.
+            cfg = load_config()
 
             live = read_live()
             print(f"\n[{time.strftime('%H:%M:%S')}] PV={live['pv_w']:.0f}W "
@@ -2893,10 +3145,7 @@ def main():
             })
             hs_state['is_on'] = False
             hs_state['current_w'] = 0
-            for _ in range(wait):
-                if _hs_stop:
-                    return
-                time.sleep(1)
+            _stop_event.wait(wait)
             continue
 
         except Exception as e:
@@ -2911,7 +3160,10 @@ def main():
                 "source_fresh": False,
             })
 
-        time.sleep(POLL_INTERVAL)
+        if not _hs_stop:
+            _stop_event.wait(POLL_INTERVAL)
+
+    _release_on_stop()
 
 
 if __name__ == "__main__":

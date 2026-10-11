@@ -1,6 +1,6 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.5.3c
+Dokumentation Stand: 5.5.4
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
@@ -353,7 +353,8 @@ gebündelt eingerichtet; der Paket-Schritt startet den WebSocket-Dienst nicht
 vorzeitig.
 
 Eine vollständige Bare-Metal-Installation besitzt anschließend diese sieben
-Pflichtdienste:
+Pflichtdienste. Diese Liste entspricht den Pflichtmodulen des Service-Katalogs
+und `INSTALL_CENTER_CORE_SERVICES` des Updaters:
 
 - `e3dc-live`
 - `e3dc-epex-manager`
@@ -416,8 +417,8 @@ verwendet den alten `installer_main.py`-Updatepfad nicht. Details stehen in
 | `2) Systemstatus anzeigen` | Read-only Übersicht für Dienste, Pfade und Konfiguration. |
 | `3) Rechte prüfen & korrigieren` | Prüft und repariert ausschließlich den Rechtevertrag; kein Vollbackup, kein Releasewechsel und kein Neustart der Regelungsdienste. Inhaltlich lokal geänderte Produktdateien werden vor der Metadatenkorrektur einzeln zur Bestätigung angezeigt. |
 | `4) Notfallmodus / System reparieren` | Gebündelte Reparatur einer beschädigten Installation. |
-| `5) Policygebundener Programm-Rückfall` | Rückfall auf einen ausdrücklich für Bare Metal freigegebenen Stable-Stand; `v5.3.2b` ist dafür nicht freigegeben. |
-| `6) Backup erstellen / verwalten` | Verifizierte Sicherungen erstellen, prüfen oder wiederherstellen. |
+| `5) Rollback auf freigegebenes Stable-Release` | Rückfall auf einen ausdrücklich für Bare Metal freigegebenen Stable-Stand; `v5.3.2b` ist dafür nicht freigegeben. |
+| `6) Backup erstellen / verwalten` | Verifizierte Sicherungen erstellen, wiederherstellen, löschen oder das Limit anwenden. |
 | `7) Expertenmenü` | Docker, Energy Manager, Wallbox, MQTT, HA, Matter und weitere Module. |
 | `8) Systempakete vorbereiten` | Paketbasis und Python-Umgebung für die Installation vorbereiten. |
 | `9) Deinstallation` | E3DC-Control kontrolliert entfernen. |

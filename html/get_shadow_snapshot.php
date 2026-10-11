@@ -932,6 +932,30 @@ function e3dcShadowSnapshotStorageState($source): array
     $projection = e3dcShadowSnapshotTypedScalars($source, $numeric, $booleans, $codes);
 
     $sourceMap = e3dcShadowSnapshotObjectMap($source);
+    $corridorSource = e3dcShadowSnapshotObjectMap($sourceMap['corridor_now'] ?? null);
+    $corridor = e3dcShadowSnapshotTypedScalars(
+        $corridorSource,
+        ['floor_soc', 'ceiling_soc', 'control_soc', 'ts', 'valid_until_ts'],
+        ['valid'],
+        ['source', 'relation', 'reason', 'plan_id']
+    );
+    if ($corridor) {
+        // Im Band ist null der ausdrückliche Vertrag: kein aktives SoC-Ziel.
+        if (array_key_exists('control_soc', $corridorSource)
+            && $corridorSource['control_soc'] === null) $corridor['control_soc'] = null;
+        $regulation = e3dcShadowSnapshotTypedScalars(
+            $corridorSource['regulation'] ?? null, [], ['valid'], ['kind', 'source', 'reason']
+        );
+        $regulationSource = e3dcShadowSnapshotObjectMap($corridorSource['regulation'] ?? null);
+        $label = $regulationSource['label'] ?? null;
+        // Nur begrenzten Klartext transportieren, keine eigene Bezeichnungslogik.
+        if (is_string($label) && trim($label) !== '' && strlen($label) <= 160
+            && !preg_match('/[<>\x00-\x1f\x7f]/', $label)) {
+            $regulation['label'] = $label;
+        }
+        $corridor['regulation'] = $regulation;
+        $projection['corridor_now'] = $corridor;
+    }
     $headroom = e3dcShadowSnapshotTypedScalars(
         $sourceMap['headroom_execution'] ?? null,
         ['residual_wh', 'target_soc', 'hard_floor_soc'],

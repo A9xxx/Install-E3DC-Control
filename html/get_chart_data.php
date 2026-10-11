@@ -109,6 +109,7 @@ $totalLines = count($lines);
 $bucketSize = 900; // 15 Minuten in Sekunden (900s)
 
 $buckets = [];
+$pricePeriods = [];
 
 $ecoScoreFile = '/var/www/html/ramdisk/eco_score.json';
 $ecoScores = [];
@@ -179,6 +180,16 @@ foreach ($lines as $line) {
     if (!$d || !isset($d['ts'])) continue;
 
     $ts = strtotime($d['ts']);
+    // Preise nach ihrer echten Viertelstunde sammeln, unabhängig von der Leistungsbündelung.
+    $historyPrice = e3dc_chart_optional_float($d['price_ct'] ?? null);
+    if ($ts !== false && $historyPrice !== null) {
+        $pricePeriod = (int)(floor($ts / $bucketSize) * $bucketSize);
+        if (!isset($pricePeriods[$pricePeriod])) {
+            $pricePeriods[$pricePeriod] = ['sum' => 0.0, 'count' => 0];
+        }
+        $pricePeriods[$pricePeriod]['sum'] += $historyPrice;
+        $pricePeriods[$pricePeriod]['count']++;
+    }
     if ($ts < $cutoff) continue;
     
     // Finde den passenden Luxtronik-Eintrag (nächstgelegener Zeitstempel)
@@ -204,7 +215,7 @@ foreach ($lines as $line) {
     if (!isset($buckets[$tsRounded])) {
         $buckets[$tsRounded] = [
             'count' => 0, 'pv' => 0, 'home_raw' => 0, 'home' => 0, 'bat' => 0, 
-            'grid' => 0, 'wb' => 0, 'wb2' => 0, 'wp' => 0, 'hs' => 0, 'climate' => 0, 'soc' => 0, 'price' => 0,
+            'grid' => 0, 'wb' => 0, 'wb2' => 0, 'wp' => 0, 'hs' => 0, 'climate' => 0, 'soc' => 0,
             'pv_total_w' => 0, 'pv_e3dc_w' => 0, 'pv_external_w' => 0,
             'dc0_w' => 0, 'dc1_w' => 0, 'grid_p1' => 0, 'grid_p2' => 0, 'grid_p3' => 0, 'grid_p_cnt' => 0,
             'ac_total' => 0, 'wb_p1' => 0, 'wb_p2' => 0, 'wb_p3' => 0,
@@ -212,7 +223,7 @@ foreach ($lines as $line) {
             'bat_v' => 0, 'bat_a' => 0, 'bat1_v' => 0, 'bat1_a' => 0,
             'wp_vl' => 0, 'wp_rl' => 0, 'wp_ww' => 0, 'wp_at' => 0, 'wp_kaelte' => 0,
             'wp_kaelte_soll' => 0, 'wp_freq' => 0,
-            'p_cnt' => 0, 'b1_cnt' => 0, 'wp_cnt' => 0, 'wp_kaelte_cnt' => 0, 'wp_kaelte_soll_cnt' => 0,
+            'b1_cnt' => 0, 'wp_cnt' => 0, 'wp_kaelte_cnt' => 0, 'wp_kaelte_soll_cnt' => 0,
             'eco_score' => 0, 'eco_cnt' => 0
         ];
         foreach ($extInverterChartColumns as $extCol => $_extKey) { $buckets[$tsRounded][$extCol] = 0; $buckets[$tsRounded][$extCol . '_cnt'] = 0; }
@@ -238,6 +249,8 @@ foreach ($lines as $line) {
     $climate = max(0, is_numeric($climate) ? (float)$climate : 0);
     $wb = isset($d['wb']) ? $d['wb'] : 0;
     $wb2 = isset($d['wb2']) ? $d['wb2'] : 0;
+    // Die History-Spalte wp enthält den Heizstab; hs ist nur dessen Diagnoseanteil.
+    $heatPowerForHome = max(0, $wp, $hs);
     if ($wpTypeCfg === 2) {
         $wp = 0;
     }
@@ -248,7 +261,7 @@ foreach ($lines as $line) {
     if (!empty($d['is_external_wb2']) || (($d['wb2_source'] ?? '') === 'mqtt_ha')) {
         $externalWbLoad += max(0, $wb2);
     }
-    $b['home'] += max(0, $homeRaw - $wp - $hs - $climate - $externalWbLoad);
+    $b['home'] += max(0, $homeRaw - $heatPowerForHome - $climate - $externalWbLoad);
     
     $b['bat'] += isset($d['bat']) ? $d['bat'] : 0;
     $b['grid'] += isset($d['grid']) ? $d['grid'] : 0;
@@ -259,7 +272,6 @@ foreach ($lines as $line) {
     $b['climate'] += $climate;
     $b['soc'] += isset($d['soc']) ? $d['soc'] : 0;
     
-    if (isset($d['price_ct'])) { $b['price'] += $d['price_ct']; $b['p_cnt']++; }
     if (isset($d['optimization_score'])) { $b['eco_score'] += $d['optimization_score']; $b['eco_cnt']++; }
     
     $b['dc0_w'] += isset($d['dc0_w']) ? $d['dc0_w'] : 0;
@@ -374,7 +386,9 @@ foreach ($buckets as $ts => $b) {
     $data['soc'][] = round($b['soc'] / $c, 1);
     
     $slotPrice = e3dc_chart_price_for_ts_ms($ecoScores, $ts * 1000);
-    $data['price'][] = $slotPrice !== null ? $slotPrice : ($b['p_cnt'] > 0 ? round($b['price'] / $b['p_cnt'], 2) : null);
+    $pricePeriod = (int)(floor($ts / $bucketSize) * $bucketSize);
+    $periodPrices = $pricePeriods[$pricePeriod] ?? null;
+    $data['price'][] = $slotPrice !== null ? $slotPrice : ($periodPrices !== null ? round($periodPrices['sum'] / $periodPrices['count'], 2) : null);
     $data['eco_score'][] = $b['eco_cnt'] > 0 ? round($b['eco_score'] / $b['eco_cnt']) : null;
     
     $data['dc0_w'][] = round($b['dc0_w'] / $c);

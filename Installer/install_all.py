@@ -1452,6 +1452,7 @@ def install_all_main(headless=False, *, bind_first_install_role=False):
             "Energy Manager einrichten",
             lambda: install_luxtronik_menu(
                 headless=headless,
+                skip_missing_type=headless,
                 explicit_install_path=authority["install_path"],
                 explicit_install_user=authority["install_user"],
                 explicit_venv_path=authority["venv_path"],

@@ -2,6 +2,14 @@
 # -*- coding: utf-8 -*-
 
 import json
+from contextlib import closing
+import argparse
+import hashlib
+import shlex
+import subprocess
+import tempfile
+import time
+from zoneinfo import ZoneInfo
 import math
 import sqlite3
 import os
@@ -23,6 +31,11 @@ try:
         sys.stdout.reconfigure(encoding='utf-8')
 except Exception:
     pass
+
+try:
+    from . import cost_accounting
+except ImportError:
+    import cost_accounting
 
 DB_DIR = "/var/www/html/data"
 DB_PATH = os.path.join(DB_DIR, "e3dc_stats.db")
@@ -105,7 +118,7 @@ def get_install_path():
 
 def init_db():
     os.makedirs(DB_DIR, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     cursor = conn.cursor()
     # Erstelle die Tabelle für die Tageswerte, falls sie nicht existiert
     cursor.execute('''
@@ -150,180 +163,127 @@ def init_db():
     conn.commit()
     return conn
 
+# Die Berechnung bleibt in helpers.php; Python übernimmt nur Speicherung und Wartung.
+DAILY_STATS_HELPER = "/var/www/html/daily_stats_cli.php"
+MAINTENANCE_COLUMNS = (
+    'home_consumption', 'pv_yield', 'grid_in', 'grid_out', 'bat_in', 'bat_out',
+    'wb_consumption', 'wb2_consumption', 'wp_consumption', 'climate_consumption',
+    'pv_e3dc', 'pv_external', 'pv_source_rest', 'pv_grid', 'bat_grid',
+    'pv_balance_rest', 'bat_balance_rest', 'balance_unknown_rest',
+    'cost_total', 'cost_home', 'cost_bat', 'cost_wb', 'cost_wb2', 'cost_wp',
+    'cost_climate', 'autarky', 'self_con',
+)
+
+
+def calculate_history_stats(rows):
+    """Dieselbe Berechnung wie die historische Tagesansicht, ohne HTTP-Zugriff."""
+    result = subprocess.run(
+        ['php', DAILY_STATS_HELPER],
+        input=''.join(json.dumps(row, allow_nan=False) + '\n' for row in rows),
+        capture_output=True, text=True, timeout=60, check=True,
+    )
+    data = json.loads(result.stdout)
+    if not isinstance(data, dict) or data.get('sources', {}).get('home_energy_source') is None:
+        raise ValueError('Web-Bilanzberechnung fehlt oder liefert ungültige Daten')
+    return data
+
+
+def _nullable_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def _daily_values(data):
+    """Feldzuordnung ohne Ersatz fehlender Messungen oder Kosten durch Null."""
+    stats, costs = data['stats'], data.get('costs', {})
+    values = {column: _nullable_number(stats.get(key)) for column, key in {
+        'home_consumption': 'total_home_kwh', 'grid_in': 'total_grid_in_kwh',
+        'grid_out': 'total_grid_out_kwh', 'bat_in': 'total_bat_in_kwh',
+        'bat_out': 'total_bat_out_kwh', 'wb_consumption': 'total_wb_kwh',
+        'wb2_consumption': 'total_wb2_kwh', 'wp_consumption': 'total_wp_kwh',
+        'climate_consumption': 'total_climate_kwh', 'pv_e3dc': 'pv_e3dc_kwh',
+        'pv_external': 'pv_external_kwh', 'pv_source_rest': 'pv_source_rest_kwh',
+        'pv_grid': 'pv_grid_kwh', 'bat_grid': 'bat_grid_kwh',
+    }.items()}
+    values.update(pv_yield=_nullable_number(data.get('pv_today_kwh')),
+                  autarky=_nullable_number(data.get('autarky_day')),
+                  self_con=_nullable_number(data.get('selfcon_day')))
+    for key in ('total', 'home', 'bat', 'wb', 'wb2', 'wp', 'climate'):
+        values['cost_' + key] = _nullable_number(costs.get(key))
+    # Bilanzreste nur aus vollständig bekannten Flüssen bestimmen.
+    def rest(total, keys):
+        parts = [_nullable_number(stats.get(key)) for key in keys]
+        return (round(max(0.0, total - sum(parts)), 3)
+                if total is not None and all(part is not None for part in parts) else None)
+    values['pv_balance_rest'] = rest(values['pv_yield'],
+        ['pv_' + key + '_kwh' for key in ('home', 'wb', 'wb2', 'wp', 'climate', 'bat', 'grid')])
+    values['bat_balance_rest'] = rest(values['bat_out'],
+        ['bat_' + key + '_kwh' for key in ('home', 'wb', 'wb2', 'wp', 'climate', 'grid')])
+    known = [values[key] for key in ('pv_yield', 'grid_in', 'bat_out', 'home_consumption',
+        'wb_consumption', 'wb2_consumption', 'wp_consumption', 'climate_consumption',
+        'grid_out', 'bat_in', 'pv_balance_rest', 'bat_balance_rest')]
+    values['balance_unknown_rest'] = (round(max(0.0, sum(known[:3]) - sum(known[3:])), 3)
+                                      if all(v is not None for v in known) else None)
+    saved = data.get('saved', {})
+    for col, key in (('saved_u', 'total_today_kwh'), ('saved_td', 'derating_today_kwh'),
+                     ('saved_wb', 'inverter_today_kwh')):
+        if key in saved or col in data:
+            values[col] = _nullable_number(saved.get(key, data.get(col)))
+    return values
+
+
 def archive_today(conn=None):
-    if not os.path.exists(JSON_PATH):
-        return 0
-
+    """Archiviert ausschließlich den laufenden Tag mit der gemeinsamen Webbilanz."""
+    today = datetime.date.today()
+    rows = _history_lines_for_date(today)
+    cached = {}
     try:
-        with open(JSON_PATH, 'r') as f:
-            data = json.load(f)
-    except Exception:
-        return 0
-
-    stats = data.get('stats', {})
-    costs = data.get('costs', {})
-    today = datetime.date.today().isoformat() # Format: YYYY-MM-DD
-
-    pv_yield = float(data.get('pv_today_kwh', 0.0) or 0.0)
-    autarky = float(data.get('autarky_day', 0.0) or 0.0)
-    self_con = float(data.get('selfcon_day', 0.0) or 0.0)
-
-    # Detaillierte Energieverteilung aufaddieren.
-    # WICHTIG: total_home_kwh muss grid_home_kwh BEREITS ENTHALTEN (pv+bat+grid -> Home).
-    # Aeltere Systeme oder C++-Quellen koennen hier nur den selbstversorgten Anteil liefern.
-    # Plausibilitaetspruefung: Wenn die Energiefluss-Summe groesser ist, verwenden wir sie.
-    _pv_h   = float(stats.get('pv_home_kwh',   0.0) or 0.0)
-    _grid_h = float(stats.get('grid_home_kwh', 0.0) or 0.0)
-    _bat_h  = float(stats.get('bat_home_kwh',  0.0) or 0.0)
-    _total_h = float(stats.get('total_home_kwh') or 0.0)
-    _flow_h  = _pv_h + _grid_h + _bat_h  # Summe der Einzelfluesse
-
-    if _flow_h > 0.1:
-        # Einzelfluesse vorhanden -> pruefe ob total schon grid enthaelt
-        if (_total_h + 0.5) < _flow_h and _grid_h > 0.5:
-            # total ist deutlich kleiner als Summe -> grid_home fehlt im total
-            home_consumption = round(_flow_h, 3)
-            print(f"  [FIX] home_consumption: total={_total_h:.2f} < flow={_flow_h:.2f} -> grid_home={_grid_h:.2f} fehlte, verwende Summe.")
-        else:
-            home_consumption = round(max(_total_h, _flow_h), 3)
+        if datetime.date.fromtimestamp(os.path.getmtime(JSON_PATH)) == today:
+            with open(JSON_PATH, encoding='utf-8') as stream:
+                cached = json.load(stream)
+    except (OSError, ValueError):
+        pass
+    if not isinstance(cached, dict):
+        cached = {}
+    if len(rows) >= 2:
+        data = calculate_history_stats(rows)
+        # Zusatzstatistik stammt weiterhin aus dem Tageserzeuger.
+        for key in ('saved', 'saved_u', 'saved_td', 'saved_wb'):
+            if key in cached:
+                data[key] = cached[key]
+    elif cached.get('sources', {}).get('home_energy_source'):
+        data = cached
     else:
-        # Keine Einzelfluesse (Python RSCP): total_home_kwh direkt verwenden
-        home_consumption = round(_total_h, 3)
-
-    wb_consumption  = float(stats.get('total_wb_kwh')  or (float(stats.get('pv_wb_kwh',  0.0) or 0.0) + float(stats.get('grid_wb_kwh',  0.0) or 0.0) + float(stats.get('bat_wb_kwh',  0.0) or 0.0)))
-    wb2_consumption = float(stats.get('total_wb2_kwh') or (float(stats.get('pv_wb2_kwh', 0.0) or 0.0) + float(stats.get('grid_wb2_kwh', 0.0) or 0.0) + float(stats.get('bat_wb2_kwh', 0.0) or 0.0)))
-    wp_consumption  = float(stats.get('total_wp_kwh')  or (float(stats.get('pv_wp_kwh',  0.0) or 0.0) + float(stats.get('grid_wp_kwh',  0.0) or 0.0) + float(stats.get('bat_wp_kwh',  0.0) or 0.0)))
-    climate_consumption = float(stats.get('total_climate_kwh') or (float(stats.get('pv_climate_kwh', 0.0) or 0.0) + float(stats.get('grid_climate_kwh', 0.0) or 0.0) + float(stats.get('bat_climate_kwh', 0.0) or 0.0)))
-
-    grid_in  = float(stats.get('total_grid_in_kwh', 0.0) or 0.0)
-    grid_out = float(stats.get('total_grid_out_kwh') or stats.get('pv_grid_kwh', 0.0) or 0.0)
-    bat_in   = float(stats.get('pv_bat_kwh', 0.0) or 0.0) + float(stats.get('grid_bat_kwh', 0.0) or 0.0)
-    bat_out  = float(stats.get('total_bat_out_kwh', 0.0) or 0.0)
-    pv_e3dc = float(stats.get('pv_e3dc_kwh', 0.0) or 0.0)
-    pv_external = float(stats.get('pv_external_kwh', 0.0) or 0.0)
-    pv_source_rest = float(stats.get('pv_source_rest_kwh', 0.0) or 0.0)
-    pv_grid = float(stats.get('pv_grid_kwh', 0.0) or 0.0)
-    bat_grid = float(stats.get('bat_grid_kwh', 0.0) or 0.0)
-    sources = data.get('sources', {}) if isinstance(data.get('sources', {}), dict) else {}
-    pv_yield = export_backed_pv_total(
-        pv_yield,
-        grid_out,
-        bat_out,
-        exact_counter_present=bool(sources.get('pv_e3dc_exact_kwh')),
-        source=sources.get('pv_total_source', ''),
-    )
-    if pv_yield > 0.0:
-        self_con = round(max(0.0, min(100.0, ((pv_yield - grid_out) / max(0.001, pv_yield)) * 100.0)), 1)
-
-    def _stats_sum(keys):
-        total = 0.0
-        for key in keys:
-            total += float(stats.get(key, 0.0) or 0.0)
-        return total
-
-    pv_balance_rest = max(0.0, pv_yield - _stats_sum([
-        'pv_home_kwh', 'pv_wb_kwh', 'pv_wb2_kwh', 'pv_wp_kwh',
-        'pv_climate_kwh', 'pv_bat_kwh', 'pv_grid_kwh',
-    ]))
-    bat_balance_rest = max(0.0, bat_out - _stats_sum([
-        'bat_home_kwh', 'bat_wb_kwh', 'bat_wb2_kwh', 'bat_wp_kwh', 'bat_climate_kwh', 'bat_grid_kwh',
-    ]))
-    known_use_for_balance = (
-        home_consumption + wb_consumption + wb2_consumption + wp_consumption
-        + climate_consumption + grid_out + bat_in
-    )
-    total_balance_rest = max(0.0, (pv_yield + grid_in + bat_out) - known_use_for_balance)
-    balance_unknown_rest = max(0.0, total_balance_rest - pv_balance_rest - bat_balance_rest)
-
-    # Autarkie-Fallback: Falls E3DC keinen Wert meldet, selbst berechnen
-    if autarky == 0.0 and home_consumption > 0.1:
-        autarky = round(max(0.0, min(100.0, (1 - grid_in / home_consumption) * 100)), 1)
-
-    # Reale Kosten erfassen
-    cost_total = float(costs.get('total', 0.0) or 0.0)
-    cost_home = float(costs.get('home', 0.0) or 0.0)
-    cost_bat = float(costs.get('bat', 0.0) or 0.0)
-    cost_wb = float(costs.get('wb', 0.0) or 0.0)
-    cost_wb2 = float(costs.get('wb2', 0.0) or 0.0)
-    cost_wp = float(costs.get('wp', 0.0) or 0.0)
-    cost_climate = float(costs.get('climate', 0.0) or 0.0)
-
-    # Peak-Shaving Daten auslesen.
-    # Neue Quelle ist daily_stats.json/live_data_py.json. Die alte peak_live.json
-    # darf nur noch als frischer Legacy-Fallback dienen, sonst bleiben dort alte
-    # Nullwerte kleben und die Langzeitgrafik zeigt "Peak Gerettet 0 kWh".
-    saved = data.get('saved', {}) if isinstance(data.get('saved', {}), dict) else {}
-    saved_td = float(saved.get('derating_today_kwh', data.get('saved_td', 0.0)) or 0.0)
-    saved_wb = float(saved.get('inverter_today_kwh', data.get('saved_wb', 0.0)) or 0.0)
-    saved_u = float(saved.get('total_today_kwh', data.get('saved_u', 0.0)) or 0.0)
-    if saved_u <= 0.0001:
-        saved_u = saved_td + saved_wb
-
-    live_file = "/var/www/html/ramdisk/live_data_py.json"
-    if saved_u <= 0.0001 and os.path.exists(live_file):
-        try:
-            with open(live_file, 'r') as f:
-                live_data = json.load(f)
-                saved_td = float(live_data.get('saved_derating_today_kwh', 0.0) or 0.0)
-                saved_wb = float(live_data.get('saved_inverter_today_kwh', 0.0) or 0.0)
-                saved_u = saved_td + saved_wb
-        except Exception:
-            pass
-
-    peak_file = "/var/www/html/ramdisk/peak_live.json"
-    if saved_u <= 0.0001 and os.path.exists(peak_file):
-        try:
-            with open(peak_file, 'r') as f:
-                peak_data = json.load(f)
-                peak_ts = float(peak_data.get('ts', 0) or 0)
-                peak_day = datetime.date.fromtimestamp(peak_ts).isoformat() if peak_ts > 0 else ''
-                if peak_day == today:
-                    saved_td = float(peak_data.get('saved_today', 0.0) or 0.0)
-                    saved_wb = float(peak_data.get('saved_wb', 0.0) or 0.0)
-                    saved_u = float(peak_data.get('saved_u', 0.0) or 0.0)
-                    if saved_u <= 0.0001:
-                        saved_u = saved_td + saved_wb
-        except Exception:
-            pass
-
-    # Sanity check: Nur speichern, wenn E3DC heute wirklich Werte geliefert hat
-    if pv_yield == 0 and home_consumption == 0:
+        print('Archiv unverändert: keine aktuelle Webbilanz oder Tageshistorie.')
         return 0
-
+    values = _daily_values(data)
+    if values['home_consumption'] is None:
+        print('Archiv: Hausverbrauch unbekannt: ' + str(data['sources']['home_energy_source']))
     owns_connection = conn is None
     db_conn = init_db() if owns_connection else conn
-    columns = (
-        'date', 'pv_yield', 'home_consumption', 'grid_in', 'grid_out',
-        'bat_in', 'bat_out', 'wb_consumption', 'wb2_consumption',
-        'wp_consumption', 'climate_consumption', 'autarky', 'self_con',
-        'cost_total', 'cost_home', 'cost_bat', 'cost_wb', 'cost_wb2',
-        'cost_wp', 'cost_climate', 'pv_balance_rest', 'bat_balance_rest',
-        'balance_unknown_rest', 'saved_u', 'saved_td', 'saved_wb',
-        'pv_e3dc', 'pv_external', 'pv_source_rest', 'pv_grid', 'bat_grid',
-    )
-    values = (
-        today, pv_yield, home_consumption, grid_in, grid_out, bat_in, bat_out,
-        wb_consumption, wb2_consumption, wp_consumption, climate_consumption,
-        autarky, self_con, cost_total, cost_home, cost_bat, cost_wb, cost_wb2,
-        cost_wp, cost_climate, pv_balance_rest, bat_balance_rest,
-        balance_unknown_rest, saved_u, saved_td, saved_wb, pv_e3dc,
-        pv_external, pv_source_rest, pv_grid, bat_grid,
-    )
-    changed = _upsert_changed(
-        db_conn.cursor(),
-        'daily_stats',
-        'date',
-        columns,
-        values,
-    )
-    if owns_connection:
-        db_conn.commit()
-        db_conn.close()
-
-    # Rechte für PHP/Webserver, aber ohne stündlich identische chmod-Aufrufe.
+    try:
+        if owns_connection:
+            db_conn.execute('BEGIN IMMEDIATE')
+        columns = ('date', *values)
+        changed = _upsert_changed(db_conn.cursor(), 'daily_stats', 'date', columns,
+                                  (today.isoformat(), *values.values()))
+        if owns_connection:
+            db_conn.commit()
+    finally:
+        if owns_connection:
+            db_conn.close()
     _ensure_mode_if_needed(DB_PATH, 0o664)
     _ensure_mode_if_needed(DB_DIR, config_secret_dir_mode())
     return int(changed)
+
+
+def repair_recent_daily_stats(days=1, today=None, conn=None):
+    """Kompatibler Einstieg: vergangene Tage nur über die explizite Wartung ändern."""
+    if today is not None and today != datetime.date.today():
+        return 0
+    return archive_today(conn=conn)
+
 
 def _float_value(value, default=0.0):
     try:
@@ -706,108 +666,6 @@ def _integrated_energy_from_history(rows):
         last = row
     return totals
 
-def repair_recent_daily_stats(days=2, today=None, conn=None):
-    """Repair recent SQLite day rows from exact counters in live_history/backups.
-
-    This catches stale rows written before the current longterm calculation was
-    fixed. It intentionally only touches the latest days where raw history is
-    still available.
-    """
-    today = today or datetime.date.today()
-    owns_connection = conn is None
-    db_conn = init_db() if owns_connection else conn
-    cursor = db_conn.cursor()
-    repaired = 0
-    for offset in range(max(1, int(days))):
-        day = today - datetime.timedelta(days=offset)
-        day_s = day.isoformat()
-        rows = _history_lines_for_date(day)
-        if len(rows) < 2:
-            continue
-        exact, exact_sources = _final_exact_and_sources_from_history(rows)
-        integrated = _integrated_energy_from_history(rows)
-        old = cursor.execute(
-            "SELECT home_consumption, wb_consumption, wb2_consumption, wp_consumption, "
-            "climate_consumption, pv_yield, grid_in, grid_out, bat_in, bat_out, autarky, self_con "
-            "FROM daily_stats WHERE date=?", (day_s,),
-        ).fetchone()
-        if old is None:
-            continue
-        # Ohne bestätigten Zähler bleiben die gespeicherten Energieflüsse erhalten.
-        pv = old[5] if exact["e_pv"] is None else round(exact["e_pv"], 3)
-        if exact["e_pv"] is not None and keep_integrated_pv_total_for_external_ac(
-                integrated.get("pv", 0.0), integrated.get("pv_dc", 0.0), exact["e_pv"]):
-            pv = round(integrated["pv"], 3)
-        grid_in = old[6] if exact["e_grid_in"] is None else round(exact["e_grid_in"], 3)
-        grid_out = old[7] if exact["e_grid_out"] is None else round(exact["e_grid_out"], 3)
-        bat_in = old[8] if exact["e_bat_in"] is None else round(exact["e_bat_in"], 3)
-        bat_out = old[9] if exact["e_bat_out"] is None else round(exact["e_bat_out"], 3)
-        wb = exact["e_wb"] if (exact["e_wb"] is not None and exact["e_wb"] > 0) else integrated["wb"]
-        wb2 = exact["e_wb2"] if (exact["e_wb2"] is not None and exact["e_wb2"] > 0) else integrated["wb2"]
-        if (exact["e_wb"] is not None and exact["e_wb"] > 0):
-            wb, _wb_sanity = _sanitize_wallbox_exact_counter(exact["e_wb"], integrated["wb"], exact_sources.get("e_wb", ""))
-            if wb is None:
-                wb = integrated["wb"]
-        if (exact["e_wb2"] is not None and exact["e_wb2"] > 0):
-            wb2, _wb2_sanity = _sanitize_wallbox_exact_counter(exact["e_wb2"], integrated["wb2"], exact_sources.get("e_wb2", ""))
-            if wb2 is None:
-                wb2 = integrated["wb2"]
-        wp = exact["e_wp"] if (exact["e_wp"] is not None and exact["e_wp"] > 0) else integrated["wp"]
-        climate = exact["e_climate"] if (exact["e_climate"] is not None and exact["e_climate"] > 0) else integrated["climate"]
-        home = exact["e_home"] if (exact["e_home"] is not None and exact["e_home"] > 0) else integrated["home"]
-        if (exact["e_home"] is not None and exact["e_home"] > 0):
-            home = _clean_exact_home_energy(exact["e_home"], wb, wb2, wp, climate)
-        old_home = _float_value(old[0], 0.0)
-        old_wb = _float_value(old[1], 0.0)
-        old_wb2 = _float_value(old[2], 0.0)
-        old_wp = _float_value(old[3], 0.0)
-        old_climate = _float_value(old[4], 0.0)
-        if (
-            abs(old_home - home) < 0.05
-            and abs(old_wb - wb) < 0.05
-            and abs(old_wb2 - wb2) < 0.05
-            and abs(old_wp - wp) < 0.05
-            and abs(old_climate - climate) < 0.05
-        ):
-            continue
-        total_consumption = home + wb + wb2 + wp + climate
-        autarky, self_con = old[10], old[11]
-        if (_valid_daily_energy(total_consumption) is not None and total_consumption > 0
-                and _valid_daily_energy(grid_in) is not None):
-            autarky = round(max(0.0, min(100.0, ((total_consumption - grid_in) / total_consumption) * 100.0)), 1)
-        if (_valid_daily_energy(pv) is not None and pv > 0
-                and _valid_daily_energy(grid_out) is not None):
-            self_con = round(max(0.0, min(100.0, ((pv - grid_out) / pv) * 100.0)), 1)
-        cursor.execute(
-            """
-            UPDATE daily_stats
-               SET pv_yield=?,
-                   home_consumption=?,
-                   grid_in=?,
-                   grid_out=?,
-                   bat_in=?,
-                   bat_out=?,
-	                   wb_consumption=?,
-	                   wb2_consumption=?,
-	                   wp_consumption=?,
-	                   climate_consumption=?,
-	                   autarky=?,
-	                   self_con=?
-             WHERE date=?
-            """,
-            (
-                pv, round(home, 3), grid_in, grid_out,
-                bat_in, bat_out, round(wb, 3), round(wb2, 3),
-                round(wp, 3), round(climate, 3), autarky, self_con, day_s,
-            ),
-        )
-        repaired += 1
-        print(f"  [FIX] daily_stats {day_s}: Hausverbrauch {old_home:.2f} -> {home:.2f} kWh aus History/RSCP korrigiert.")
-    if owns_connection:
-        db_conn.commit()
-        db_conn.close()
-    return repaired
-
 def repair_wallbox_exact_counter_rollout_once(days=30, today=None):
     """Run the broader wallbox counter repair once after this rollout."""
     marker = os.path.join(DB_DIR, ".wallbox_exact_counter_sanity_20260623.done")
@@ -887,16 +745,25 @@ def archive_ml_data(conn=None):
 
 def run_hourly_archive():
     """Bündelt reguläre Stundenwerte in einer gemeinsamen SQLite-Transaktion."""
-    repair_wallbox_exact_counter_rollout_once(days=30)
     conn = init_db()
     try:
+        conn.execute('BEGIN IMMEDIATE')
         archive_today(conn=conn)
-        repair_recent_daily_stats(days=2, conn=conn)
         archive_ml_data(conn=conn)
         conn.commit()
     except Exception:
         conn.rollback()
         raise
+    else:
+        # Optionale Kostenfehler dürfen das festgeschriebene Kernarchiv nicht berühren.
+        try:
+            cost_accounting.archive_costs(conn, Path(DB_DIR).parent)
+        except Exception as exc:
+            print(f"  [WARN] Kostenhistorie übersprungen ({type(exc).__name__}): {exc}")
+        try:
+            cost_accounting.automatic_backfill(sys.modules[__name__], conn)
+        except Exception as exc:
+            print(f"  [WARN] Nachberechnung übersprungen ({type(exc).__name__}): {exc}")
     finally:
         conn.close()
 
@@ -932,9 +799,240 @@ def backfill_ml_data():
     conn.close()
     print(f"\nBackfill erfolgreich! Insgesamt {total_count} 15-Minuten-Datensätze geladen.")
 
-if __name__ == "__main__":
-    if "--backfill" in sys.argv:
-        print("Starte Historien-Import (Backfill) für Machine Learning...")
-        backfill_ml_data()
-    else:
-        run_hourly_archive()
+def _read_complete_backup(day):
+    """Vollständigkeit anhand Erzeugerformat, Tagesrändern und Intervallabdeckung."""
+    path = Path(HISTORY_BACKUP_DIR) / ('history_' + day.isoformat() + '.txt')
+    if not path.is_file():
+        return None, 'Sicherung fehlt'
+    try:
+        raw = path.read_bytes()
+        rows = [json.loads(line) for line in raw.decode('utf-8').splitlines() if line.strip()]
+        if len(rows) < 2:
+            return None, 'Sicherung unvollständig: weniger als zwei Messpunkte'
+        zone = ZoneInfo('Europe/Berlin')
+        start = datetime.datetime.combine(day, datetime.time(), zone).timestamp()
+        end = datetime.datetime.combine(day + datetime.timedelta(days=1), datetime.time(), zone).timestamp()
+        stamps = []
+        for row in rows:
+            stamp = _parse_history_ts(row)
+            if stamp is None:
+                raise ValueError('ungültiger Zeitstempel')
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=zone)
+            if stamp.astimezone(zone).date() != day:
+                raise ValueError('fremder Kalendertag')
+            stamps.append(stamp.timestamp())
+        if stamps[0] - start > 300 or end - stamps[-1] > 300:
+            return None, 'Sicherung unvollständig: Tagesanfang oder Tagesende fehlt'
+        if any(not 0 < b - a < 3600 for a, b in zip(stamps, stamps[1:])):
+            return None, 'Sicherung unvollständig: Zeitlücke oder ungeordnete Messpunkte'
+        return rows, None
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        return None, 'Sicherung ungültig: ' + str(exc)
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _readonly_database(path):
+    return sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True, timeout=30)
+
+
+def _verified_statistics_backup(changes, *, cost_only=False, deadline=None):
+    """Konsistentes SQLite-Backup, vor der ersten Änderung dauerhaft geprüft."""
+    if cost_only:
+        return cost_accounting._verified_cost_backup(sys.modules[__name__], deadline=deadline)
+    directory = Path(DB_DIR) / 'statistics_backups'
+    directory.mkdir(mode=0o770, exist_ok=True)
+    backup = Path(tempfile.mkdtemp(prefix='tagesbilanz-', dir=directory))
+    os.chmod(backup, 0o770)
+    snapshot = backup / 'e3dc_stats.db'
+    deadline = time.monotonic() + 30
+    def progress(_status, _remaining, _total):
+        if time.monotonic() > deadline:
+            raise TimeoutError('SQLite-Backup überschreitet 30 Sekunden')
+    # Die Wartungsverbindung hält BEGIN IMMEDIATE; die zweite Verbindung liest
+    # den unveränderten, konsistenten Stand einschließlich eines vorhandenen WAL.
+    with closing(_readonly_database(DB_PATH)) as source, closing(sqlite3.connect(snapshot)) as destination:
+        source.backup(destination, pages=256, progress=progress, sleep=0.05)
+        if destination.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
+            raise RuntimeError('SQLite-Backup ist nicht konsistent')
+        for change in changes:
+            columns = tuple(change['vorher'])
+            row = destination.execute('SELECT ' + ', '.join(columns) +
+                ' FROM daily_stats WHERE date=?', (change['tag'],)).fetchone()
+            if row != tuple(change['vorher'].values()):
+                raise RuntimeError('SQLite-Backup stimmt nicht mit dem Ausgangsstand überein')
+    os.chmod(snapshot, 0o660)
+    with snapshot.open('rb') as stream:
+        os.fsync(stream.fileno())
+    manifest = {'format': 'tagesbilanz_backup_v1', 'sha256': _sha256_file(snapshot),
+                'datenbank': str(Path(DB_PATH).resolve()), 'tage': changes}
+    manifest_path = backup / 'backup.json'
+    with manifest_path.open('x', encoding='utf-8') as stream:
+        json.dump(manifest, stream, ensure_ascii=False, indent=2, allow_nan=False)
+        stream.write('\n')
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chmod(manifest_path, 0o660)
+    for folder in (backup, directory):
+        descriptor = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    if _sha256_file(snapshot) != manifest['sha256']:
+        raise RuntimeError('Prüfsumme des SQLite-Backups stimmt nicht')
+    return backup
+
+
+def recalculate_statistics(*, apply=False, days=30, today=None):
+    """Explizite Wartung für höchstens 30 abgeschlossene Tage, niemals beim Start."""
+    if not 1 <= days <= 30:
+        raise ValueError('Erlaubt sind 1 bis 30 Tage')
+    today = today or datetime.datetime.now(ZoneInfo('Europe/Berlin')).date()
+    report = {'modus': 'anwenden' if apply else 'trockenlauf', 'tage': [],
+              'geändert': 0, 'backup': None, 'rückweg': None}
+    if not Path(DB_PATH).is_file():
+        raise FileNotFoundError('Statistikdatenbank fehlt: ' + DB_PATH)
+    conn = sqlite3.connect(Path(DB_PATH).resolve().as_uri() + '?mode=rw', uri=True, timeout=30) if apply else _readonly_database(DB_PATH)
+    try:
+        # Vorhandene SQLite-Sperre statt einer unabhängigen Sperrdatei.
+        conn.execute('BEGIN IMMEDIATE' if apply else 'BEGIN')
+        columns = ', '.join(MAINTENANCE_COLUMNS)
+        changes = []
+        for offset in range(1, days + 1):
+            day = today - datetime.timedelta(days=offset)
+            entry = {'tag': day.isoformat()}
+            report['tage'].append(entry)
+            old = conn.execute('SELECT ' + columns + ' FROM daily_stats WHERE date=?',
+                               (day.isoformat(),)).fetchone()
+            rows, reason = _read_complete_backup(day)
+            if reason or old is None:
+                entry.update(status='übersprungen', grund=reason or 'Statistikzeile fehlt')
+                continue
+            data = calculate_history_stats(rows)
+            values = _daily_values(data)
+            if values['home_consumption'] is None:
+                entry.update(status='übersprungen', grund=data['sources']['home_energy_source'])
+                continue
+            before = dict(zip(MAINTENANCE_COLUMNS, old))
+            after = {key: values[key] for key in MAINTENANCE_COLUMNS}
+            entry.update(vorher=before, nachher=after,
+                         differenz={key: round(after[key] - before[key], 6)
+                             if before[key] is not None and after[key] is not None else None
+                             for key in MAINTENANCE_COLUMNS},
+                         quellen=data['sources'])
+            if before == after:
+                entry['status'] = 'unverändert'
+                continue
+            entry['status'] = 'geplant'
+            changes.append(entry)
+        if apply and changes:
+            backup = _verified_statistics_backup(changes)
+            report['backup'] = str(backup)
+            report['rückweg'] = shlex.join([sys.executable, '-B', str(Path(__file__).resolve()),
+                '--wiederherstellen', str(backup), '--web-root', str(Path(DB_DIR).parent)])
+            for change in changes:
+                assignments = ', '.join(key + '=?' for key in MAINTENANCE_COLUMNS)
+                conn.execute('UPDATE daily_stats SET ' + assignments + ' WHERE date=?',
+                    (*change['nachher'].values(), change['tag']))
+            conn.commit()
+            for change in changes:
+                change['status'] = 'geändert'
+            report['geändert'] = len(changes)
+        else:
+            conn.rollback()
+    finally:
+        conn.close()
+    return report
+
+
+def restore_statistics(backup):
+    """Setzt betroffene Spalten transaktional zurück; spätere andere Daten bleiben."""
+    backup = Path(backup)
+    manifest = json.loads((backup / 'backup.json').read_text(encoding='utf-8'))
+    snapshot = backup / 'e3dc_stats.db'
+    if manifest.get('format') != 'tagesbilanz_backup_v1' or _sha256_file(snapshot) != manifest.get('sha256'):
+        raise ValueError('Backupformat oder Prüfsumme ungültig')
+    if manifest.get('datenbank') != str(Path(DB_PATH).resolve()):
+        raise ValueError('Backup gehört zu einer anderen Statistikdatenbank')
+    conn = sqlite3.connect(Path(DB_PATH).resolve().as_uri() + '?mode=rw', uri=True, timeout=30)
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        pending = []
+        with closing(_readonly_database(snapshot)) as source:
+            if source.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
+                raise ValueError('Backup ist nicht konsistent')
+            for change in manifest['tage']:
+                columns = tuple(change['vorher'])
+                if columns != MAINTENANCE_COLUMNS:
+                    raise ValueError('Backup enthält unerwartete Spalten')
+                query = 'SELECT ' + ', '.join(columns) + ' FROM daily_stats WHERE date=?'
+                before = source.execute(query, (change['tag'],)).fetchone()
+                if before != tuple(change['vorher'].values()):
+                    raise ValueError('Backupwerte und Beschreibung weichen ab')
+                current = conn.execute(query, (change['tag'],)).fetchone()
+                if current == before:
+                    continue
+                if current != tuple(change['nachher'].values()):
+                    raise ValueError('Tageswerte inzwischen verändert: ' + change['tag'])
+                pending.append((change['tag'], before))
+        for day, before in pending:
+            conn.execute('UPDATE daily_stats SET ' + ', '.join(key + '=?' for key in MAINTENANCE_COLUMNS)
+                         + ' WHERE date=?', (*before, day))
+        conn.commit()
+        return {'wiederhergestellt': len(pending), 'backup': str(backup)}
+    finally:
+        conn.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Tagesarchiv und ausdrücklich aufgerufene Statistikwartung')
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument('--kosten-nachberechnen', action='store_true', help='Kosten der letzten 30 Tage ergänzen')
+    action.add_argument('--kosten-wiederherstellen', metavar='BACKUP')
+    action.add_argument('--nachberechnen', action='store_true', help='Letzte 30 abgeschlossene Tage prüfen')
+    action.add_argument('--wiederherstellen', metavar='BACKUP')
+    action.add_argument('--backfill', action='store_true', help='Bestehender ML-Historienimport')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--trockenlauf', action='store_true', help='Standard bei --nachberechnen; schreibt nichts')
+    mode.add_argument('--anwenden', action='store_true', help='Nach verifiziertem Backup anwenden')
+    parser.add_argument('--web-root', default='/var/www/html', help='Web-Verzeichnis der laufenden Instanz')
+    args = parser.parse_args()
+    if (args.anwenden or args.trockenlauf) and not (args.nachberechnen or args.kosten_nachberechnen):
+        parser.error('--anwenden/--trockenlauf benötigen --nachberechnen oder --kosten-nachberechnen')
+    global DB_DIR, DB_PATH, JSON_PATH, HISTORY_PATH, HISTORY_BACKUP_DIR, DAILY_STATS_HELPER
+    root = Path(args.web_root).resolve()
+    DB_DIR, DB_PATH = str(root / 'data'), str(root / 'data/e3dc_stats.db')
+    JSON_PATH, HISTORY_PATH = str(root / 'ramdisk/daily_stats.json'), str(root / 'ramdisk/live_history.txt')
+    HISTORY_BACKUP_DIR, DAILY_STATS_HELPER = str(root / 'data/history_backups'), str(root / 'daily_stats_cli.php')
+    try:
+        if args.kosten_nachberechnen:
+            result = cost_accounting.maintain(sys.modules[__name__], apply=args.anwenden)
+        elif args.kosten_wiederherstellen:
+            result = cost_accounting.restore(sys.modules[__name__], args.kosten_wiederherstellen)
+        elif args.nachberechnen:
+            result = recalculate_statistics(apply=args.anwenden)
+        elif args.wiederherstellen:
+            result = restore_statistics(args.wiederherstellen)
+        elif args.backfill:
+            backfill_ml_data()
+            return 0
+        else:
+            run_hourly_archive()
+            return 0
+        print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
+        return 0
+    except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as exc:
+        print('Statistik unverändert oder Transaktion zurückgerollt: ' + str(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

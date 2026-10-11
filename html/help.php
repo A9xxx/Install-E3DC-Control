@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.5.3c Stable</span>
+            <span class="badge bg-success text-light">v5.5.4 Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.5.3c</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.5.4</code> in <code>.env</code> gesetzt.</p>
                 <p><strong>Update-Knopf und Auto-Update:</strong> Der Container tauscht sein Image nicht selbst. Läuft das Compose-Profil <code>auto-update</code> (Watchtower-Fork <code>ghcr.io/nicholas-fedor/watchtower</code>), gibt der Knopf <strong>System Update</strong> Watchtower über dessen lokale HTTP-API das Signal: Watchtower lädt das Image, erstellt den Container neu, und die Oberfläche lädt nach dem Start neu. Mit <strong>Auto-Update</strong> im Config-Editor passiert dasselbe täglich zur eingestellten Uhrzeit; Watchtower selbst pollt nicht. Gibt es kein neues Image, passiert nichts.</p>
                 <p>Einmalige Freischaltung auf dem Docker-Host im Compose-Ordner (Token für beide Dienste in <code>.env</code>, Container mit Token neu erstellen, Watchtower starten):</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
@@ -194,7 +194,9 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                     </h5>
                     <p><strong>openWB Primary bleibt der Modus, in dem openWB den Ladepunkt selbst führt.</strong> E3DC-Control liest Leistung und Status aus und führt damit den Speicherrahmen.</p>
                     <ul>
-                        <li><strong>Primary PV-geführt:</strong> openWB bleibt im PV-Modus, führt Ladepunkt, PV-Logik und Phasen; E3DC-Control beobachtet die Wallboxleistung und führt den Hausspeicher. In PV und PV + Akku sendet E3DC-Control keine Strom-, Stop- oder Watchdog-Vorgaben an openWB Primary.</li>
+                        <li><strong>Primary PV-geführt:</strong> openWB führt Ladepunkt, PV-Logik und Phasen. Der Speicher folgt seinem normalen Laderahmen. Bei laufender Ladung begrenzt E3DC-Control die Entladung in „PV-Kurve ruhig“ auf das Haus-/WP-Defizit; in „PV + Akku“ ist sie oberhalb von <code>wbminsoc</code> frei. Die Untergrenze hebt die Kurve nicht zusätzlich an. Das aktive Planziel führt die Ladung über den normalen Kurvenregler.</li>
+                        <li><strong>Ladepriorität:</strong> Auf der openWB wird „Speicher“ empfohlen, damit sie die Speicherladung nach Ladekurve berücksichtigt. Akkustrom fürs Auto muss die openWB selbst erlauben: Sie zieht Speicherentladung grundsätzlich vom Überschuss ab. Volle Stromregelung durch E3DC-Control erfordert die openWB als Secondary.</li>
+                        <li><strong>Moduswechsel:</strong> Der bewusste Wechsel in E3DC-Control auf „PV-Kurve ruhig“ oder „PV + Akku“ setzt die openWB einmal auf PV. Ein dort selbst gewähltes „Sofort“ oder „Stop“ bleibt auch nach einem Manager-Neustart bestehen. Eigene Stop- oder Sofortaufträge werden mit einem gespeicherten Beleg einmal zurückgenommen, auch nach einem Neustart. Eine andere Moduswahl an der openWB beendet diesen Beleg. Eine Handpause sendet einmal Stop und wird beim Aufheben auf demselben Weg zurückgenommen.</li>
                         <li><strong>Primary-Direktpfad:</strong> Wenn E3DC-Control in Primary aktiv Strom vorgibt, nutzt openWB den dokumentierten Sofortladen-Strom <code>chargecurrent</code>. openWB zeigt dann Sofortladen.</li>
                         <li><strong>Netzladen/Ladefenster:</strong> E3DC-Control darf Start, Stop und Stromstärke vorgeben, erzwingt aber keine Phasenumschaltung. Wenn trotz hoher Vorgabe nur 1-phasige Leistung ankommt, erscheint eine Diagnosewarnung <code>Primary 1p</code>.</li>
                         <li><strong>Wichtig:</strong> openWB-Sofortladen-Limits wie Ziel-SoC oder Energiemenge bleiben im Primary-Direktpfad wirksam und können die Ladung beenden.</li>
@@ -223,6 +225,16 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                     </ol>
                 </div>
             </div>
+        </div>
+
+        <h4 class="mb-4 text-accent">Stable 5.5.4: Installationszentrale, Wallbox, Wärmepumpe, Statistik</h4>
+        <div class="col-12 faq-item" data-tags="5.5.4 stable installationszentrale modul launcher venv konsole wallbox startknopf openwb stop bereitschaft abendziel wbminsoc wärmepumpe pv-boost heizstab elwa automatik tarif-halt leistungsgrenzen korridor untergrenze tagesstatistik hausverbrauch kostenhistorie 32 bit web-pin sperrseite websocket update">
+            <div class="card bg-card border-0 shadow-sm"><div class="card-body">
+                <h5 class="card-title">Was bringt Stable-Release 5.5.4?</h5>
+                <p>Die Installationszentrale installiert und entfernt Module auf Bare Metal wieder per Klick; die Dienste laufen mit dem Python-venv der Installation, Karten und Konsolenmenüs zeigen den tatsächlichen Zustand. Der Startknopf der Wallbox ändert den Lademodus nicht mehr, ein an der openWB gesetzter Stop gilt als Nutzerpause, die openWB-Pro-Bereitschaft nach Ladeende hält nur mit Budget, und in „PV + Akku bis Untergrenze“ endet die Ladekurve bei der Untergrenze, wenn die PV nicht für Akku und Fahrzeug reicht. Der PV-Boost der Wärmepumpe wird gehalten statt getaktet; <code>Aus</code> nimmt den Auftrag zurück, der Verdichter läuft seine Mindestlaufzeit zu Ende. Das globale „Automatik darf steuern“ wirkt jetzt auch auf den Heizstab.</p>
+                <p>Die Lade- und Entladegrenze des Speichers folgen dem Gerätemaximum, unterhalb der Korridor-Untergrenze lädt der Speicher frei, und der Hausverbrauch der Tagesstatistik kommt aus der Energiebilanz (Nachberechnung der letzten 30 Tage per Wartungsbefehl). Neu und experimentell ist die Kostenhistorie je Viertelstunde (Standard aus). Dazu kommen Korrekturen für 32-Bit-Systeme, die Web-PIN-Sperrseite und die „Jetzt“-Anzeige.</p>
+                <p><strong>Update:</strong> Wie gewohnt über <strong>System Update</strong> bzw. das Docker-Update; eine Konfigurationsänderung ist nicht nötig. Tageswerte des Hausverbrauchs können ab dem Update von früheren abweichen; bei globalem „Automatik aus“ schaltet der Heizstab-Dienst nicht mehr.</p>
+            </div></div>
         </div>
 
         <h4 class="mb-4 text-accent">Stable 5.5.3c: Energy Manager bei der Neuinstallation</h4>
@@ -1168,21 +1180,20 @@ Was korrigiert das Stable-Release 5.4.1d?
 
         <h4 class="mb-4 text-accent"><i class="fas fa-charging-station me-2"></i>Wallbox & Laden</h4>
 
-        <!-- Native Wallbox Manager -->
-        <div class="col-12 faq-item" data-tags="wallbox native python manager wbmode go-e openwb mqtt multi laden">
+        <!-- Wallbox-Regelung aktivieren -->
+        <div class="col-12 faq-item" data-tags="wallbox native python manager wbmode go-e openwb e3dc aktivieren multi laden">
             <div class="faq-card">
                 <div class="faq-question">
                     <div>
                         <span class="tag">Wallbox</span>
-                        Wie aktiviere ich den "Native Wallbox Manager" (go-e) und warum ist wbmode=0 extrem wichtig?
+                        Wie aktiviere ich die Wallbox-Regelung?
                     </div>
                     <i class="fas fa-chevron-down"></i>
                 </div>
                 <div class="faq-answer">
-                    <p>Seit v3.8.8 bietet E3DC-Control einen <strong>eigenständigen (nativen) Python Wallbox Manager</strong>. Dieser ermöglicht Multi-Wallbox-Laden (2 Ladepunkte) mit einer Vorrang-Regelung (z.B. WB1 zuerst, Rest an WB2) und entkoppelt die Ladelogik komplett von der veralteten C++ Steuerung.</p>
-                    <p>Damit sich die alte C++ Steuerung und der neue Python Manager nicht gegenseitig stören (Flapping), <strong>MUSS</strong> zwingend in der Konfiguration die klassische Wallbox-Steuerung deaktiviert werden!</p>
-                    <pre>wbmode = 0</pre>
-                    <p>Ist dies gesetzt, können Sie in der neuen Sektion <em>"Native Wallbox Regelung"</em> im Konfigurations-Editor die IP-Adressen und den gewünschten Prioritäts-Modus einstellen.</p>
+                    <p>Die Wallbox-Regelung ist ein eigenständiger Python-Dienst (Wallbox-Manager). Er regelt bis zu zwei Ladepunkte mit einer gemeinsamen Budget- und Schutzlogik und ersetzt die interne Steuerung von E3DC- und Fremdwallboxen.</p>
+                    <p>Einschalten im Konfigurations-Editor: In der <strong>Einfachen Ansicht</strong> im Abschnitt <em>Wallbox</em> den Schalter <strong>Wallbox-Regelung aktiv</strong> setzen und unter <strong>Wallbox 1</strong> die eigene Wallbox aus der Liste wählen; ein zweiter Ladepunkt wird unter <strong>Wallbox 2</strong> gewählt. In der <strong>Erweiterten Ansicht</strong> heißt derselbe Schalter in der Gruppe <em>Wallbox &amp; Fahrzeug</em> <strong>Native Python-Regelung aktivieren</strong>, die Auswahlliste <strong>Wallbox 1 Modell / API</strong>; ein zweiter Ladepunkt kommt über <strong>Zweite Wallbox hinzufügen</strong> dazu. Voreingestellt ist <em>E3/DC-Wallbox automatisch</em>.</p>
+                    <p>Eine Einstellung <code>wbmode</code> gibt es im Konfigurations-Editor nicht mehr. Steht in einer alten Konfiguration noch <code>wbmode</code> ungleich 0 oder <code>wallbox = 1</code>, zeigt die Installationszentrale den Wallbox-Dienst als unvollständig konfiguriert und nennt die offene Voraussetzung (Legacy-C++ Wallbox aus); erst nach dem Zurücksetzen gilt der Dienst als vollständig konfiguriert.</p>
                 </div>
             </div>
         </div>
@@ -1283,8 +1294,9 @@ Was korrigiert das Stable-Release 5.4.1d?
                     <p><strong>PV-Kurve ruhig:</strong> lädt entlang der Speicher-Ladekurve mit Hysterese. Kurze Wolken und Lastwechsel werden geglättet, damit die Wallbox nicht taktet. Eine laufende Ladung darf ein Wolken-Kontingent nutzen (automatisch 0,5&nbsp;% der Speicherkapazität, mindestens 50&nbsp;Wh, oder der konfigurierte Wert). Nur in diesem Modus folgt unter dem Kurvenkorridor am Ende des Kontingents einmalig PV-Laden, ein aus PV gedeckter Phasenabstieg oder Stop. Bis zur bestätigten Wirkung stützt der Speicher noch höchstens 30&nbsp;s. Danach gelten wieder die normalen Zeit- und Energiewächter. Ein übernommener Schnellstart der Wallbox verbraucht dasselbe Kontingent, sofern keine ausdrückliche Stützungsfreigabe oder gebundene Startreservierung für eine real ladende Wallbox vorliegt. Ein Kaltstart wird nicht aus diesem Kontingent finanziert. Der Modus <strong>PV + Akku</strong> bleibt davon getrennt.</p>
                     <p><strong>Kurze Anzeige von 0&nbsp;kW:</strong> Wird ein einzelner unplausibler Messwertsatz aus Sicherheitsgründen verworfen, kann das Wallboxbudget kurz 0&nbsp;kW anzeigen. Das ist nicht automatisch ein Ladeabbruch. Mit dem nächsten gültigen Messwertsatz wird neu geregelt; wiederholte Nullwerte sind dagegen ein Diagnosehinweis.</p>
                     <p><strong>Grundladung stabil:</strong> hält bewusst eine 6A-Grundladung, solange wbminSoC beziehungsweise das Speicherziel erreichbar bleibt. Das ist die Anti-Flatter-Variante für empfindliche Fahrzeuge und Wallboxen.</p>
-                    <p><strong>PV + Akku bis Untergrenze:</strong> das Auto darf PV und Hausakku bis zur Hausakku-Reserve nutzen. Bis zu dieser Untergrenze lädt das Auto normal; Netz bleibt aus. Wenn die Wallbox mehr Leistung will, stützt der Akku darunter nur Hausverbrauch und Wärmepumpe.</p>
+                    <p><strong>PV + Akku bis Untergrenze:</strong> Das Auto darf PV und Hausakku bis zur Hausakku-Reserve nutzen. Diese Untergrenze ist das Feld <strong>Haus-Priorität (Batterie-Reserve SoC %)</strong> im Konfigurations-Editor (Gruppe <em>Wallbox &amp; Fahrzeug</em>, Bereich <em>Regelung: PV-Überschuss und Hausakku</em>; Standard 70&nbsp;%). Bis zu dieser Untergrenze lädt das Auto aus PV und Hausakku; darunter bekommt es nur echten PV-Überschuss, Netz bleibt aus. Wenn die Wallbox mehr Leistung will, stützt der Akku darunter nur Hausverbrauch und Wärmepumpe. Die Notstromreserve ist davon unabhängig und immer geschützt: Ein Wert unterhalb der wirksamen Notstromreserve wird vom Konfigurationsprüfer abgewiesen. Reicht die PV unter den Speicher- und belegten Fahrzeug-Leistungsgrenzen nicht für Akku und geeignete Fahrzeuge, endet die heutige Speicher-PV-Kurve bei wbminSoC. Das gilt auch bei „Prognose auf 100%“. Fahrzeugbedarf 0 belässt das normale Ziel; unbekannter Bedarf zählt nach bestätigter Ladung weiter, nur am selben Kurventag und in derselben Steck-Episode; nach 60 Minuten unter 300 W bei ausreichendem PV- und Stromangebot endet dieser Beleg. Unterbrechungen bis zwei Minuten pausieren die Uhr; längere setzen sie zurück. Zur normalen Kurve geht es ab 110 % Deckung, zurück unter 100 %, mit etwa 15 Minuten Halt. Pause und bestätigtes Abstecken wirken ab dem nächsten Planlauf; relevante Änderungen lösen nach 60 Sekunden stabilem Zustand neu aus. Folgetage und Netzladeziele bleiben unverändert. Während des Rückfallziels bleibt die Schlechtwetterreserve aus. Das gilt für alle Wallboxen (geregelt und beobachtet), in Aus nur mit „Nur beobachten, Speicher oberhalb Hausreserve freigegeben“.</p>
                     <p><strong>Sofort bis Preislimit:</strong> startet sofort mit PV und Speicher. Netzstrom wird nur genutzt, wenn der aktuelle Preis unter dem eingestellten Wallbox-Preislimit liegt. Damit wird kein Auto versehentlich zu extremen Preisen geladen.</p>
+                    <p><strong>Akku bis Abfahrt:</strong> startet im Startfenster vor der eingestellten Abfahrtszeit und lädt mit PV und Hausakku bis zur Haus-Priorität (Batterie-Reserve SoC %). Netzladen bleibt gesperrt. Gestoppt wird bei Abfahrt, vollem Fahrzeug oder erreichter Untergrenze. <strong>Abfahrt</strong> (Standard 06:30) und <strong>Startfenster vor Abfahrt</strong> (Standard 3&nbsp;h, 1 bis 36&nbsp;h) werden je Wallbox auf der Wallbox-Seite eingestellt.</p>
                 </div>
             </div>
         </div>
@@ -1761,7 +1773,7 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                 </div>
                 <div class="faq-answer">
                     Der <strong>Smart Home MQTT-Hub</strong> sendet alle Live-Daten (PV, Batterie, Haus, Grid) an Ihren Broker.
-                    <p>Standard-Präfix ist <code>e3dc/</code>. In Home Assistant können Sie diese via MQTT-Integration abonnieren. Beispiel-Topic für den Hausverbrauch: <code>e3dc/live/home_w</code>. Das Dashboard nutzt den WebSocket ausschließlich über den gleichursprünglichen Webserver-Pfad <code>/ws</code>; ein direkter LAN-Port ist nicht erforderlich.</p>
+                    <p>Standard-Präfix ist <code>e3dc/</code>. In Home Assistant können Sie diese via MQTT-Integration abonnieren. Beispiel-Topic für den Hausverbrauch: <code>e3dc/live/home_w</code>. Die Weboberfläche aktualisiert ihre Daten über regelmäßige HTTP-Abfragen; den installierten WebSocket-Dienst nutzt sie derzeit nicht.</p>
                 </div>
             </div>
         </div>
@@ -1846,13 +1858,13 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                 <div class="faq-question">
                     <div>
                         <span class="tag">System</span>
-                        Der "Netz"-Wert im Dashboard zeigt Einspeisung, obwohl ich Strom beziehe (Pfeile falsch)?
+                        Die Phasenwerte (L1–L3) des Wurzelzählers haben das falsche Vorzeichen?
                     </div>
                     <i class="fas fa-chevron-down"></i>
                 </div>
                 <div class="faq-answer">
-                    <p>In seltenen Fällen ist der E3DC-Wurzelzähler im Haus physikalisch falsch herum verdrahtet ("invertiert"), was dazu führt, dass E3DC positive statt negative Watt-Werte beim Bezug sendet.</p>
-                    <p>Lösung: Aktivieren Sie im Konfigurations-Editor (Sektion: E3DC System & Auth) den Haken <strong>"Software Invertierung" (Wurzelzähler invertiert)</strong>. Dies dreht das Vorzeichen im UI dynamisch um.</p>
+                    <p>In seltenen Fällen ist der E3DC-Wurzelzähler (Leistungsmesser) im Haus physikalisch falsch herum verdrahtet ("invertiert"); dann zeigen seine Phasenwerte L1–L3 beim Bezug positive statt negative Watt-Werte.</p>
+                    <p>Lösung: Im Konfigurations-Editor in der Gruppe <em>E3DC System-Verbindung</em>, Bereich <em>Phasendiagnose</em>, das Feld <strong>Phasen invertieren</strong> auf <strong>Ja</strong> stellen. Das dreht nur die optionale Phasendiagnose des Leistungsmessers. Der Netzpunkt, mit dem geregelt und der im Dashboard als „Netz“ angezeigt wird, kommt direkt aus dem E3DC-Energiemanagement und wird nicht invertiert.</p>
                 </div>
             </div>
         </div>
@@ -1963,9 +1975,7 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                     <ul>
                         <li><strong>RSCP nicht aktiviert:</strong> Im E3DC-Portal unter <em>Mein E3DC &gt; RSCP</em> muss der Zugang aktiv sein und ein AES-Passwort gesetzt werden.</li>
                         <li><strong>Falsche Zugangsdaten:</strong> Prüfen Sie in der Config <code>e3dc_user</code>, <code>e3dc_password</code>, <code>server_ip</code> und <code>aes_password</code>.</li>
-                        <li><strong>RSCPGui fehlt:</strong> Das Diagnose-Paket wurde möglicherweise nicht installiert. Führen Sie im Installer Schritt 1 (Systempakete) erneut aus oder klonen Sie es manuell:</li>
                     </ul>
-                    <pre>git clone https://github.com/rxhan/RSCPGui.git ~/RSCPGui</pre>
                 </div>
             </div>
         </div>
@@ -2001,7 +2011,7 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                 <div class="faq-answer">
                     <p>Dies ist ein bekanntes Verhalten bei bestimmten E3DC-Firmwareversionen (z.B. P10_2025). Die Firmware verpackt Zelltemperaturen in einem zusätzlichen, verschachtelten <code>BAT_DATA</code>-Container, statt sie flach zurückzugeben.</p>
                     <p>Zusätzlich enthält diese Firmware-Version einen Bug, bei dem <strong>Zellspannungswerte (~3.85V)</strong> fälschlicherweise in die Temperaturliste eingemischt und leere Sensoren als <strong>0.0°C</strong> aufgefüllt werden. Das Dashboard filtert beides automatisch heraus.</p>
-                    <p>Falls die Werte trotzdem nicht erscheinen: Stellen Sie sicher, dass die neueste Version von <code>vital_stats.py</code> auf dem System läuft (ab v3.8.8.6).</p>
+                    <p>Falls die Werte trotzdem nicht erscheinen: Das System über <strong>System Update</strong> auf den aktuellen Stand bringen.</p>
                 </div>
             </div>
         </div>

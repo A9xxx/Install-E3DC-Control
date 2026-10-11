@@ -1108,7 +1108,7 @@ function ruleCalmBuildForumSummary($summary, $violations, $context) {
     $owner_gaps = [];
     foreach (['storage_contract_owner', 'storage_owner', 'storage_state'] as $name) {
         $gap = (int)($effective_gaps[$name] ?? 0);
-        if ($gap > $default_gap_s) {
+        if ($gap > 0) {
             $owner_gaps[] = $gap;
         }
     }
@@ -1452,12 +1452,14 @@ if ($action !== 'analyze') {
     ruleCalmError('Unbekannte Diagnose-Aktion');
 }
 
+e3dcRequirePostMutation(true);
+
 $services = ruleCalmRequestedServices();
 $limit = ruleCalmRequestedLimit();
 $scope = ruleCalmRequestedScope();
 $scope_context = ruleCalmCurrentScopeContext($scope, $services);
 if ($scope === 'manager_restart' && ($scope_context['cutoff_ts'] ?? null) === null) {
-    ruleCalmError('Die aktuelle Prozessgrenze konnte nicht ermittelt werden; historische Records werden nicht ersatzweise als aktuell bewertet.');
+    ruleCalmError('Die aktuelle Prozessgrenze konnte nicht ermittelt werden; historische Records werden nicht ersatzweise als aktuell bewertet. Zeitraum auf „Historie: neueste Records“ umstellen.');
 }
 [$input_path, $source_label, $input_kind, $source_files, $record_windows, $record_summary, $scope_context] = ruleCalmPrepareCurrentInput($services, $limit, $scope_context);
 ruleCalmRun($input_path, $source_label, $input_kind, $services, $source_files, $record_windows, $record_summary, $scope_context);

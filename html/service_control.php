@@ -22,39 +22,17 @@ $install_path = rtrim($paths['install_path'], '/');
 // Privilegierte Dienstaktionen laufen ausschließlich über den root-eigenen Launcher.
 $wrapper_path = e3dcFindServiceWrapper();
 
-function loadServiceCatalogForControl($install_path) {
-    $installer_path = rtrim($install_path, '/') . '/Installer';
-    $catalog_py = $installer_path . '/service_catalog.py';
+function dockerServiceProcessStatusForControl($install_path, $script) {
     $python = file_exists('/opt/venv/bin/python3') ? '/opt/venv/bin/python3' : '/usr/bin/python3';
-    if (!file_exists($catalog_py)) {
-        return ['services' => [], 'alive' => []];
-    }
-    $cmd = escapeshellarg($python) . ' ' . escapeshellarg($catalog_py) . ' 2>/dev/null';
-    $raw = shell_exec($cmd);
-    $catalog = json_decode($raw ?: '', true);
-    if (!is_array($catalog)) {
-        return ['services' => [], 'alive' => []];
-    }
-    $services = [];
-    $alive = [];
-    foreach ($catalog as $key => $module) {
-        $unit = $module['service_unit'] ?? '';
-        if ($unit === '') continue;
-        $services[$unit] = [
-            'name' => $module['display_name'] ?? $key,
-            'group' => ($module['group'] ?? '') === 'core' ? 'core' : 'ext',
-            'optional' => !empty($module['optional']),
-            'desc' => $module['description'] ?? '',
-            'module_key' => $key,
-        ];
-        if (!empty($module['alive_file'])) {
-            $alive[$unit] = [
-                $module['alive_file'],
-                intval($module['alive_max_age_s'] ?? 120),
-            ];
-        }
-    }
-    return ['services' => $services, 'alive' => $alive];
+    $code = 'import os,sys; sys.path.insert(0, sys.argv[1]); import docker_healthcheck as d; '
+        . 'name=sys.argv[2]; mapped=name in d.REQUIRED_PROCESSES or any(name==item[0] for item in d.OPTIONAL_PROCESSES.values()); '
+        . 'matches=d._matching_processes(tuple(p for p in d._process_snapshot() if p["pid"]!=os.getpid()),name) if mapped else (); '
+        . 'print("active" if any(item["state"] in d.HEALTHY_PROCESS_STATES for item in matches) else "inactive")';
+    $result = e3dcRunArgvProcess([$python, '-B', '-c', $code, rtrim($install_path, '/') . '/Installer', $script],
+        3.0, ['max_output_bytes' => 4096]);
+    $state = trim((string)($result['stdout'] ?? ''));
+    return ['available' => !empty($result['success']) && in_array($state, ['active', 'inactive'], true),
+            'active' => !empty($result['success']) && $state === 'active'];
 }
 
 function serviceUnitExistsForControl($service) {
@@ -69,28 +47,28 @@ function serviceUnitExistsForControl($service) {
 // Fallback-Liste, falls der neue zentrale Katalog noch nicht verfuegbar ist.
 $fallback_allowed_services = [
     "e3dc-live.service" => ["name" => "E3DC Live Data (RSCP)", "group" => "core", "desc" => "Liest sekündlich alle Live-Daten vom E3DC-Speicher über das RSCP-Protokoll aus."],
-    "e3dc-epex-manager.service" => ["name" => "Markt- & Strompreise", "group" => "core", "desc" => "Aktualisiert dynamische Strompreisanbieter (Tibber, aWATTar, Octopus, etc.)."],
-    "e3dc-weather-manager.service" => ["name" => "PV Prognose & ML", "group" => "core", "desc" => "Bezieht tagesaktuelle Solardaten und berechnet den Vorhersage-Algorithmus inkl. ML-Modell."],
-    "e3dc-storage-simulator.service" => ["name" => "Batterie-Simulator", "group" => "core", "desc" => "Plant vorausschauend Speicher-Entladungen basierend auf Preisen und dynamischen Prognosen."],
-    "e3dc-storage-manager.service" => ["name" => "V4 Speicher-Algorithmus", "group" => "core", "desc" => "Erzwingt Lade/Entlade-Korridore auf E3DC-Ebene (V4 Brain Limiter)."],
-    "e3dc-websocket.service" => ["name" => "WebUI Live-Animationen", "group" => "core", "desc" => "Liefert WebSockets für das flüssige Live-Dashboard in Echtzeit-Ansicht (V4 UI)."],
+    "e3dc-epex-manager.service" => ["name" => "Markt- und Strompreise", "group" => "core", "desc" => "Aktualisiert dynamische Strompreisanbieter (Tibber, aWATTar, Octopus, etc.)."],
+    "e3dc-weather-manager.service" => ["name" => "PV-Prognose und ML", "group" => "core", "desc" => "Bezieht tagesaktuelle Solardaten und berechnet den Vorhersage-Algorithmus inkl. ML-Modell."],
+    "e3dc-storage-simulator.service" => ["name" => "Storage Simulator", "group" => "core", "desc" => "Plant vorausschauend Speicher-Entladungen basierend auf Preisen und dynamischen Prognosen."],
+    "e3dc-storage-manager.service" => ["name" => "Storage Manager", "group" => "core", "desc" => "Erzwingt Lade/Entlade-Korridore auf E3DC-Ebene (V4 Brain Limiter)."],
+    "e3dc-websocket.service" => ["name" => "WebUI Live-Animationen", "group" => "core", "desc" => "WebSocket-Pflichtdienst; die Weboberfläche nutzt derzeit HTTP-Abfragen und verwendet ihn noch nicht."],
 
-    "e3dc-wallbox-manager.service" => ["name" => "Wallbox Steuerung", "group" => "ext", "desc" => "Native Ladungssteuerung für externe Wallboxen inkl. Phasenanschluss-Regelung."],
-    "energy_manager.service" => ["name" => "Wärmepumpe Manager", "group" => "ext", "desc" => "PV-Boost und smarte Überschuss-Verschiebung für SG-Ready Wärmepumpen."],
-    "e3dc-lux-live.service" => ["name" => "Luxtronik Daten", "group" => "ext", "desc" => "WebSocket-Überwachung der Alpha-Innotec / Novelan Wärmepumpen (Live State)."],
-    "e3dc-idm-live.service" => ["name" => "IDM Wärmepumpen Daten", "group" => "ext", "desc" => "Modbus-Anbindung zum Abrufen von Sensor-Werten intelligenter IDM-Wärmepumpen."],
-    "e3dc-stiebel-live.service" => ["name" => "Stiebel ISG Live", "group" => "ext", "desc" => "Read-only Modbus-/Prozessdaten für Stiebel-Eltron ISG/WPM."],
-    "e3dc-dimplex-live.service" => ["name" => "Dimplex WPM Live", "group" => "ext", "desc" => "Read-only Modbus-Livewerte für Dimplex WPM Touch / NWPM."],
-    "e3dc-heizstab.service" => ["name" => "Heizstab Logger", "group" => "ext", "desc" => "Speichert Verbrauchs-Bilanzen autarker Heizstäbe/Shellys."],
-    "e3dc-climate-live.service" => ["name" => "Klimaanlage Live", "group" => "ext", "desc" => "Liest Klimaanlagenverbrauch über einen eigenen Shelly-Zähler read-only."],
-    "e3dc-climate-control.service" => ["name" => "Klimaanlage Regel-Vorbereitung", "group" => "ext", "desc" => "Schreibt Toshiba-Zeitprofil und Regelstatus ohne aktive Kommandos."],
-    "e3dc-forecast-evidence.service" => ["name" => "PV-Prognosediagnose", "group" => "ext", "desc" => "Vergleicht Prognose und abgeschlossene E3/DC-DC-Historienslots rein diagnostisch."],
-    "e3dc-ha.service" => ["name" => "Home Assistant Bridge", "group" => "ext", "desc" => "Stellt ausfallsichere Redundanz für gekoppelte HA-Installationen (Cluster Mode) her."],
-    "e3dc-matter-bridge.service" => ["name" => "Apple Home / Matter", "group" => "ext", "desc" => "Stellt drei lokale read-only Statusschalter ohne Anlagenbefehle für Matter bereit."],
-    "e3dc-bluelink.service" => ["name" => "Hyundai/Kia Bluelink", "group" => "ext", "desc" => "Fragt Fahrzeug-SoC von Hyundai/Kia für das automatische Lade-Planungs Profil ab."],
-    "e3dc-notifier.service" => ["name" => "Push & Telegram Meldungen", "group" => "ext", "desc" => "Ereignisgesteuerte und periodische Nachrichten an verknüpfte Endgeräte/Chatbots."],
-    "e3dc-mqtt-hub.service" => ["name" => "MQTT Hub", "group" => "ext", "desc" => "Verteilt E3DC-Control Werte per MQTT."],
-    "e3dc-shadow-sync.service" => ["name" => "Shadow-Simulation", "group" => "ext", "desc" => "Liest Master-Livedaten read-only und simuliert lokale Entscheidungen ohne Steuerbefehle."]
+    "e3dc-wallbox-manager.service" => ["name" => "Wallbox Manager", "group" => "consumers", "desc" => "Native Ladungssteuerung für externe Wallboxen inkl. Phasenanschluss-Regelung."],
+    "energy_manager.service" => ["name" => "Wärmepumpe Manager", "group" => "consumers", "desc" => "PV-Boost und smarte Überschuss-Verschiebung für SG-Ready Wärmepumpen."],
+    "e3dc-lux-live.service" => ["name" => "Luxtronik Live", "group" => "consumers", "desc" => "WebSocket-Überwachung der Alpha-Innotec / Novelan Wärmepumpen (Live State)."],
+    "e3dc-idm-live.service" => ["name" => "IDM Live", "group" => "consumers", "desc" => "Modbus-Anbindung zum Abrufen von Sensor-Werten intelligenter IDM-Wärmepumpen."],
+    "e3dc-stiebel-live.service" => ["name" => "Stiebel ISG Live", "group" => "consumers", "desc" => "Read-only Modbus-/Prozessdaten für Stiebel-Eltron ISG/WPM."],
+    "e3dc-dimplex-live.service" => ["name" => "Dimplex WPM Live", "group" => "consumers", "desc" => "Read-only Modbus-Livewerte für Dimplex WPM Touch / NWPM."],
+    "e3dc-heizstab.service" => ["name" => "Heizstab / Shelly", "group" => "consumers", "desc" => "Speichert Verbrauchs-Bilanzen autarker Heizstäbe/Shellys."],
+    "e3dc-climate-live.service" => ["name" => "Klimaanlage Live", "group" => "consumers", "desc" => "Liest Klimaanlagenverbrauch über einen eigenen Shelly-Zähler read-only."],
+    "e3dc-climate-control.service" => ["name" => "Klimaanlage Status", "group" => "consumers", "desc" => "Schreibt Toshiba-Zeitprofil und Regelstatus ohne aktive Kommandos."],
+    "e3dc-forecast-evidence.service" => ["name" => "PV-Prognosediagnose", "group" => "core", "desc" => "Vergleicht Prognose und abgeschlossene E3/DC-DC-Historienslots rein diagnostisch."],
+    "e3dc-ha.service" => ["name" => "HA Master/Slave", "group" => "system", "desc" => "Stellt ausfallsichere Redundanz für gekoppelte HA-Installationen (Cluster Mode) her."],
+    "e3dc-matter-bridge.service" => ["name" => "Matter Bridge", "group" => "integrations", "desc" => "Stellt drei lokale read-only Statusschalter ohne Anlagenbefehle für Matter bereit."],
+    "e3dc-bluelink.service" => ["name" => "Hyundai/Kia Bluelink", "group" => "integrations", "desc" => "Fragt Fahrzeug-SoC von Hyundai/Kia für das automatische Lade-Planungs Profil ab."],
+    "e3dc-notifier.service" => ["name" => "Zeitplanung und Langzeit-Archiv", "group" => "core", "desc" => "Ereignisgesteuerte und periodische Nachrichten an verknüpfte Endgeräte/Chatbots."],
+    "e3dc-mqtt-hub.service" => ["name" => "MQTT Hub", "group" => "integrations", "desc" => "Verteilt E3DC-Control Werte per MQTT."],
+    "e3dc-shadow-sync.service" => ["name" => "Shadow-Simulation", "group" => "system", "desc" => "Liest Master-Livedaten read-only und simuliert lokale Entscheidungen ohne Steuerbefehle."]
 ];
 
 $fallback_core_locked = [
@@ -99,6 +77,8 @@ $fallback_core_locked = [
     "e3dc-weather-manager.service",
     "e3dc-storage-simulator.service",
     "e3dc-storage-manager.service",
+    "e3dc-notifier.service",
+    "e3dc-websocket.service",
 ];
 foreach ($fallback_allowed_services as $fallback_unit => &$fallback_info) {
     $fallback_info['optional'] = !in_array($fallback_unit, $fallback_core_locked, true);
@@ -124,13 +104,12 @@ $is_docker = file_exists('/.dockerenv') ||
 $docker_alive_files = [
     "e3dc-live.service"             => ["/var/www/html/ramdisk/live_data_py.json",          30],
     "e3dc-epex-manager.service"     => ["/var/www/html/ramdisk/epex_daten.json",            3700],
-    "e3dc-weather-manager.service"  => ["/var/www/html/ramdisk/pv_forecast.json",           7200],
-    "e3dc-storage-simulator.service"=> ["/var/www/html/ramdisk/storage_plan.json",          900],
+    "e3dc-weather-manager.service"  => ["/var/www/html/ramdisk/pv_forecast.json",           9000],
+    "e3dc-storage-simulator.service"=> ["/var/www/html/ramdisk/storage_plan.json",         1200],
     "e3dc-storage-manager.service"  => ["/var/www/html/ramdisk/storage_manager_state.json", 300],
-    "e3dc-websocket.service"        => ["/var/www/html/ramdisk/live_data_py.json",          30],
     "e3dc-wallbox-manager.service"  => ["/var/www/html/ramdisk/wallbox_native.json",        120],
-    "energy_manager.service"        => ["/var/www/html/ramdisk/waermepumpe.json",           120],
-    "e3dc-lux-live.service"         => ["/var/www/html/ramdisk/luxtronik.json",             120],
+    "energy_manager.service"        => ["/var/www/html/ramdisk/luxtronik.json",           120],
+    "e3dc-lux-live.service"         => ["/var/www/html/ramdisk/waermepumpe.json",             120],
     "e3dc-idm-live.service"         => ["/var/www/html/ramdisk/waermepumpe.json",           120],
     "e3dc-stiebel-live.service"     => ["/var/www/html/ramdisk/stiebel_isg.json",           120],
     "e3dc-dimplex-live.service"     => ["/var/www/html/ramdisk/dimplex_wpm.json",           120],
@@ -139,15 +118,39 @@ $docker_alive_files = [
     "e3dc-climate-control.service"  => ["/var/www/html/ramdisk/climate_control.json",       180],
     "e3dc-forecast-evidence.service"=> ["/var/www/html/ramdisk/pv_forecast_diagnostic_summary.json", 3600],
     "e3dc-ha.service"               => ["/var/www/html/ramdisk/ha_status.json",             120],
-    "e3dc-matter-bridge.service"    => ["/var/www/html/ramdisk/matter_pairing.json",        300],
-    "e3dc-bluelink.service"         => ["/var/www/html/ramdisk/vehicles.json",              600],
+    "e3dc-matter-bridge.service"    => ["/var/www/html/ramdisk/matter_bridge_status.json",  120],
+    "e3dc-bluelink.service"         => ["/var/www/html/ramdisk/vehicles.json",             1800],
     "e3dc-notifier.service"         => ["/var/www/html/logs/notification_manager.log",      3700],
-    "e3dc-mqtt-hub.service"         => ["/var/www/html/logs/e3dc_mqtt_hub.log",             3700],
+    "e3dc-mqtt-hub.service"         => ["/var/www/html/ramdisk/mqtt_hub_status.json",          120],
     "e3dc-shadow-sync.service"      => ["/var/www/html/ramdisk/shadow_sync_status.json",    30],
 ];
 if (!empty($catalog_control['alive'])) {
     $docker_alive_files = array_merge($docker_alive_files, $catalog_control['alive']);
 }
+
+// Mapping: Service-Name -> [Python-Skript relativ zu /app/pi/Install/Installer, Log-Datei]
+$docker_service_map = [
+    "e3dc-live.service"              => ["e3dc_live.py --write --loops 0 --interval 3", "e3dc_live.log"],
+    "e3dc-epex-manager.service"      => ["epex_manager.py",                             "epex_manager.log"],
+    "e3dc-weather-manager.service"   => ["Forecast/pv_forecast_service.py",             "pv_forecast.log"],
+    "e3dc-storage-simulator.service" => ["storage_simulator.py",                        "storage_simulator.log"],
+    "e3dc-storage-manager.service"   => ["storage_manager.py",                          "storage_manager.log"],
+    "e3dc-websocket.service"         => ["e3dc_websocket.py",                           "e3dc_websocket.log"],
+    "e3dc-wallbox-manager.service"   => ["wallbox_manager.py",                          "wallbox_manager.log"],
+    "energy_manager.service"         => ["luxtronik/energy_manager.py",                 "energy_manager.log"],
+    "e3dc-lux-live.service"          => ["luxtronik/lux_live.py",                       "lux_live.log"],
+    "e3dc-idm-live.service"          => ["idm/idm_live.py",                             "idm_live.log"],
+    "e3dc-stiebel-live.service"      => ["stiebel/stiebel_live.py",                     "stiebel_live.log"],
+    "e3dc-dimplex-live.service"      => ["dimplex/dimplex_live.py",                     "dimplex_live.log"],
+    "e3dc-climate-live.service"       => ["climate_live.py", "climate_live.log"],
+    "e3dc-climate-control.service"    => ["climate_control.py", "climate_control.log"],
+    "e3dc-heizstab.service"          => ["heizstab_manager.py",                         "heizstab_manager.log"],
+    "e3dc-ha.service"                => ["ha_manager.py",                               "ha_manager.log"],
+    "e3dc-matter-bridge.service"     => ["npm run start",                               "matter_bridge.log", "npm", "matter", "matter_bridge.js"],
+    "e3dc-bluelink.service"          => ["bluelink_client.py",                          "bluelink_client.log"],
+    "e3dc-notifier.service"          => ["notification_manager.py",                     "notification_manager.log"],
+    "e3dc-mqtt-hub.service"          => ["e3dc_mqtt_hub.py",                            "e3dc_mqtt_hub.log"],
+];
 
 if ($action === 'status_all') {
     $result = [];
@@ -199,12 +202,20 @@ if ($action === 'status_all') {
                     $active = true;
                 }
             }
-            $exists  = $active;
+            $exists  = isset($docker_service_map[$srv]) || $active;
             $failed  = false;
             $enabled = $active;
             $enabled_known = false;
             $enabled_raw = $active ? 'container-active' : 'container-inactive';
             $raw_status = $active ? 'active (docker)' : 'inactive (docker)';
+            if (!$alive_info && isset($docker_service_map[$srv])) {
+                $process = dockerServiceProcessStatusForControl($install_path, $docker_service_map[$srv][0]);
+                $active = $process['active'];
+                $enabled = $active;
+                $enabled_raw = $active ? 'container-active' : 'container-inactive';
+                $raw_status = !$process['available'] ? 'unknown (docker-process-check-unavailable)'
+                    : ($active ? 'active (docker-process-check)' : 'inactive (docker-process-check)');
+            }
         }
 
         $result[$srv] = [
@@ -233,17 +244,9 @@ if ($isServiceMutation) {
         exit;
     }
 
-    $service_info = $allowed_services[$service] ?? [];
-    $is_core_service = (($service_info['group'] ?? '') === 'core') && empty($service_info['optional']);
-    if ($is_core_service && !in_array($action, ['restart'], true)) {
-        echo json_encode([
-            "success" => false,
-            "error_code" => "core_action_blocked",
-            "error" => "Kern-Dienst geschützt.",
-            "message" => "Core-Dienste dürfen in der Installationszentrale nur neu gestartet und diagnostiziert werden.",
-            "hint" => "Bitte Neustart oder Diagnose verwenden. Stop, Start, Enable, Disable und Rückbau bleiben für Core-Dienste gesperrt.",
-            "service" => $service,
-        ]);
+    $guard = e3dcServiceActionGuard($action, $service, $allowed_services);
+    if ($guard !== null) {
+        echo json_encode($guard, JSON_UNESCAPED_UNICODE);
         exit;
     }
 
@@ -279,27 +282,7 @@ if ($isServiceMutation) {
 
     if ($is_docker_action) {
         // Docker: kein systemctl vorhanden — direkte Prozess-Steuerung via pkill + nohup
-        // Mapping: Service-Name -> [Python-Skript relativ zu /app/pi/Install/Installer, Log-Datei]
-        $docker_service_map = [
-            "e3dc-live.service"              => ["e3dc_live.py --write --loops 0 --interval 3", "e3dc_live.log"],
-            "e3dc-epex-manager.service"      => ["epex_manager.py",                             "epex_manager.log"],
-            "e3dc-weather-manager.service"   => ["Forecast/pv_forecast_service.py",             "pv_forecast.log"],
-            "e3dc-storage-simulator.service" => ["storage_simulator.py",                        "storage_simulator.log"],
-            "e3dc-storage-manager.service"   => ["storage_manager.py",                          "storage_manager.log"],
-            "e3dc-websocket.service"         => ["e3dc_websocket.py",                           "e3dc_websocket.log"],
-            "e3dc-wallbox-manager.service"   => ["wallbox_manager.py",                          "wallbox_manager.log"],
-            "energy_manager.service"         => ["luxtronik/energy_manager.py",                 "energy_manager.log"],
-            "e3dc-lux-live.service"          => ["luxtronik/lux_live.py",                       "lux_live.log"],
-            "e3dc-idm-live.service"          => ["idm/idm_live.py",                             "idm_live.log"],
-            "e3dc-stiebel-live.service"      => ["stiebel/stiebel_live.py",                     "stiebel_live.log"],
-            "e3dc-dimplex-live.service"      => ["dimplex/dimplex_live.py",                     "dimplex_live.log"],
-            "e3dc-heizstab.service"          => ["heizstab_manager.py",                         "heizstab_manager.log"],
-            "e3dc-ha.service"                => ["ha_manager.py",                               "ha_manager.log"],
-            "e3dc-matter-bridge.service"     => ["npm run start",                               "matter_bridge.log", "npm", "matter", "matter_bridge.js"],
-            "e3dc-bluelink.service"          => ["bluelink_client.py",                          "bluelink_client.log"],
-            "e3dc-notifier.service"          => ["notification_manager.py",                     "notification_manager.log"],
-            "e3dc-mqtt-hub.service"          => ["e3dc_mqtt_hub.py",                            "e3dc_mqtt_hub.log"],
-        ];
+
 
         if (!isset($docker_service_map[$service])) {
             echo json_encode(["success" => false, "error" => "Kein Docker-Mapping für diesen Dienst"]);
@@ -406,86 +389,7 @@ if ($isServiceMutation) {
         exit;
     }
 
-    // Bare-Metal: Fehlende Units laienverstaendlich melden, bevor systemctl roh scheitert.
-    if (!$is_docker_action && !serviceUnitExistsForControl($service) && in_array($action, ['start', 'restart', 'enable'])) {
-        $module_name = $allowed_services[$service]['name'] ?? $service;
-        echo json_encode([
-            "success" => false,
-            "error_code" => "unit_missing",
-            "error" => "Dienst ist noch nicht installiert.",
-            "message" => "$module_name ist im Katalog bekannt, aber die systemd-Service-Datei fehlt noch.",
-            "hint" => "Bitte zuerst den Installations-Dry-Run bzw. Job-Test prüfen. Echte Installation bleibt bis zur separaten Freigabe gesperrt.",
-            "service" => $service,
-            "status" => "missing",
-            "enabled" => false,
-        ]);
-        exit;
-    }
-
-    if (!$is_docker_action && serviceUnitExistsForControl($service)) {
-        $current_active = e3dcSystemdServiceProperty('is-active', $service) === 'active';
-        if ($action === 'start' && $current_active) {
-            echo json_encode([
-                "success" => true,
-                "noop" => true,
-                "message" => "Dienst läuft bereits. Start ist nicht nötig.",
-                "service" => $service,
-                "status" => "active",
-                "enabled" => e3dcSystemdServiceProperty('is-enabled', $service) === 'enabled',
-            ]);
-            exit;
-        }
-        if ($action === 'stop' && !$current_active) {
-            echo json_encode([
-                "success" => true,
-                "noop" => true,
-                "message" => "Dienst ist bereits gestoppt. Stop ist nicht nötig.",
-                "service" => $service,
-                "status" => "inactive",
-                "enabled" => e3dcSystemdServiceProperty('is-enabled', $service) === 'enabled',
-            ]);
-            exit;
-        }
-    }
-
-    // Bare-Metal: nur der Wrapper im validierten Release-Root ist erlaubt.
-    if ($wrapper_path === '') {
-        http_response_code(503);
-        echo json_encode(['success' => false, 'error' => 'Service-Wrapper im Installationspfad nicht gefunden.']);
-        exit;
-    }
-    $wrapper_result = e3dcRunServiceWrapperAction($action, [$service]);
-    $output = (string)($wrapper_result['output'] ?? '');
-    if (!empty($wrapper_result['errors'])) {
-        $output = trim($output . "\n" . implode("\n", $wrapper_result['errors']));
-    }
-
-    // Nach Ausführung Status direkt prüfen
-    $active_output = e3dcSystemdServiceProperty('is-active', $service);
-    $enabled_output = e3dcSystemdServiceProperty('is-enabled', $service);
-
-    $action_success = !empty($wrapper_result['success']);
-    if (in_array($action, ['start', 'restart'], true)) {
-        $action_success = $action_success && ($active_output === 'active');
-    } elseif ($action === 'stop') {
-        $action_success = $action_success && ($active_output !== 'active');
-    } elseif ($action === 'enable') {
-        $action_success = $action_success
-            && ($enabled_output === 'enabled' || $enabled_output === 'static');
-    } elseif ($action === 'disable') {
-        $action_success = $action_success
-            && !($enabled_output === 'enabled' || $enabled_output === 'static');
-    }
-
-    echo json_encode([
-        "success" => $action_success,
-        "output"  => $output,
-        "status"  => $active_output,
-        "enabled" => ($enabled_output === 'enabled' || $enabled_output === 'static'),
-        "message" => $action_success
-            ? "Dienstaktion abgeschlossen."
-            : "Dienstaktion wurde ausgeführt, aber der erwartete Zielzustand wurde nicht erreicht."
-    ]);
+    echo json_encode(e3dcControlSystemdService($action, $service, $allowed_services), JSON_UNESCAPED_UNICODE);
     exit;
 }
 

@@ -51,7 +51,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 ENV E3DC_CONTAINER_MODE=1
 ENV E3DC_CONTAINER_INSTALL_USER=root
 RUN pip3 install --upgrade pip wheel setuptools && \
-    pip3 install --prefer-binary paho-mqtt requests websocket-client websockets luxtronik hyundai_kia_connect_api pywebpush pycryptodome pymodbus
+    pip3 install --prefer-binary paho-mqtt requests websocket-client websockets luxtronik hyundai_kia_connect_api pywebpush pycryptodome pymodbus pyserial
 
 # Feste Laufzeitidentität; Installation und unveränderlicher Produktcode bleiben Root.
 # Rechtemodell im Container: Produktcode root:root ohne Gruppen-/Weltschreibbit,
@@ -109,6 +109,7 @@ RUN find -P /app/pi/Install -xdev -type d -exec chmod 0755 -- {} + && \
         /app/pi/Install/Installer/web_update_launcher.sh && \
     find -P /app/pi/Install/Installer -xdev -type f -name "*.py" -exec chmod 0755 -- {} + && \
     test -f /app/pi/Install/Installer/matter/package-lock.json && \
+    test -f /app/pi/Install/Installer/Storage/power_limits.py && \
     test -f /app/pi/Install/Installer/apache/e3dc-control-security.conf && \
     test -f /app/pi/Install/Installer/apache/e3dc-control-access-log.conf && \
     test -f /app/pi/Install/Installer/Storage/process_singleton.py && \
@@ -130,9 +131,18 @@ RUN find -P /app/pi/Install -xdev -type d -exec chmod 0755 -- {} + && \
     test -f /app/pi/Install/Installer/Heat/tariff_storage.py && \
     test -f /app/pi/Install/Installer/Heat/plan_forecast.py && \
     test -f /app/pi/Install/html/heat_tariff_diagnostics.php && \
+    test -f /app/pi/Install/Installer/cost_accounting.py && \
+    test -f /app/pi/Install/html/cost_accounting.php && \
+    test -f /app/pi/Install/html/cost_accounting_cli.php && \
+    test -f /app/pi/Install/html/cost_history.js && \
+    test -f /app/pi/Install/html/cost_history_view.php && \
+    test -f /app/pi/Install/html/daily_stats_cli.php && \
+    test -f /app/pi/Install/html/get_cost_history.php && \
+    test -f /app/pi/Install/html/heatpump_season.php && \
     test -f /app/pi/Install/Installer/battery_vitals_history.py && \
     test -f /app/pi/Install/Installer/probe_pm.py && \
     test -f /app/pi/Install/Installer/secure_file_transaction.py && \
+    test -f /app/pi/Install/Installer/shelly_relay_owner.py && \
     test -f /app/pi/Install/Installer/storage_owner_paths.py && \
     test -f /app/pi/Install/Installer/update_legacy_safety.py && \
     test -f /app/pi/Install/Installer/update_offline_preflight.py && \
@@ -182,3 +192,6 @@ HEALTHCHECK --interval=5s --timeout=5s --start-period=120s --retries=36 \
     CMD ["/opt/venv/bin/python3", "-I", "-B", "/usr/local/bin/e3dc-docker-healthcheck"]
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+
+# Die Quellen sind im Image vorhanden; privilegierte Launcher bleiben Bare-Metal vorbehalten.
+RUN test -f /app/pi/Install/Installer/module_installer.py && test -f /app/pi/Install/html/module_install_jobs.php

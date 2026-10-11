@@ -3,8 +3,6 @@
 > **Quellcode:** `Installer/storage_simulator.py` (Berechnung) ·
 > `Installer/storage_manager.py` und `Installer/storage_parallel_regulator.py`
 > (Regelung)
->
-> **Stand:** V5.2.2a, aktualisiert am 2026-06-16
 
 Die Ladekurve ist eine regelungsnahe Soll-SoC-Kurve für den laufenden Tag. Sie
 ist keine Garantie für den späteren realen SoC, sondern die Führungsgröße, an
@@ -25,6 +23,28 @@ PV-Prognose - erwarteter Hausverbrauch - bekannte Verbraucher
 Der Manager vergleicht den echten beziehungsweise geglätteten SoC mit dieser
 Kurve und setzt bevorzugt nur EMS-Leistungsgrenzen im E3DC-AUTO-Betrieb.
 
+## Zeitbezug von Simulation und Korridoranzeige
+
+Die Zeitachse des Plans beginnt weiterhin an der vollen Stunde. Vergangene
+Viertelstunden werden nicht erneut bilanziert: Ihre Start- und Endwerte
+entsprechen dem gemessenen SoC beim Planlauf. Der laufende Slot wird nur ab
+diesem Zeitpunkt gerechnet. Ladeverteilung, Nacht-Tiefpunkt, Tagesprojektion
+und Pre-Dump-Hardwaresimulation verwenden dieselbe verbleibende Dauer.
+`timeline[].soc_start` bezeichnet den Start der jeweiligen Fortschreibung,
+`timeline[].soc` deren Ende. Bestehende Pläne ohne Startwert bleiben lesbar.
+Die Anzeige ordnet beide Werte dem tatsächlichen Zeitpunkt zu.
+
+„Jetzt“ zeigt die je Zyklus veröffentlichte Korridorlage und tatsächliche
+Regelart des Speicher-Managers. Im Band wird der Korridor angezeigt,
+darunter die Unterkante und darüber die Obergrenze. Die Unterkante ist
+nur bei aktiver Kurvenführung ein Regelziel. Innerhalb des Bands ist der
+Ist-SoC kein Zielwert. „E3DC regelt frei“ erscheint nur bei tatsächlich
+freigegebenen EMS-Grenzen. Ein Preis- oder Reserve-Halt, Netzladen und
+Schutzfall werden anhand des finalen Ausgangs benannt. Fehlt dessen
+Nachweis, bleibt die Regelart unbekannt. Ohne gültige, frische Managerdaten
+erscheint „Kein Regelziel verfügbar“. Die Sollkurve bleibt eine eigene
+Diagrammlinie.
+
 ## 2. Simulator: Plan und Anker
 
 Der `storage_simulator.py` läuft zyklisch und schreibt `storage_plan.json` in
@@ -41,6 +61,130 @@ die Ramdisk. Wichtige Inhalte:
   `adaptive_headroom_required_wh`, `adaptive_headroom_buffer_wh`,
   `headroom_reserve_pressure_wh`, `headroom_reserve_source`,
   `curtailment_pressure_wh`).
+
+### Abendziel bei PV + Akku
+
+Für alle Wallboxen (geregelt und beobachtet) gilt dieselbe Zielwahl:
+In `PV + Akku bis Untergrenze` sowie in `Aus` mit der Auswahl
+„Nur beobachten, Speicher oberhalb Hausreserve freigegeben“ prüft der
+Planer Akku, Fahrzeug und Gesamtbedarf getrennt. Mit „Nur beobachten, Speicher folgt Ladekurve“ bleibt das normale Abendziel unverändert.
+
+Der Akku-Anteil ist auf seine Ladeleistung begrenzt. Fahrzeugenergie zählt
+nur in Slots, deren Überschuss die Fahrzeug-Mindestleistung erreicht.
+Jedes Fahrzeug wird einzeln gegen seinen Bedarf geprüft; ein kleines
+Ladeziel kann die fehlende Lademöglichkeit eines anderen Autos nicht decken.
+Bei aktivem Rückfallziel nimmt der Speicher im Kurvenkorridor Überschuss
+auf, den das Fahrzeug nicht nutzen kann: unter seiner kleinsten gültigen
+Mindestleistung oder als Rest, wenn alle ladenden Fahrzeuge ihre Höchstleistung
+erreichen. Dafür muss die frische Fahrzeugleistung höchstens 200 W unter der
+gültigen Höchstleistung liegen oder das Stromziel am Höchststrom stehen.
+Aus dem Null-Halt beginnt die Ladung nach 60 Sekunden durchgehend gültigem
+Rest mindestens 200 W unter dem Fahrzeugminimum beziehungsweise mindestens
+200 W Rest bei Höchstleistung. Im Zwischenband bleibt der bisherige Zustand;
+ungültige Proben oder Lücken setzen die Eintrittszeit zurück. Eine bereits
+laufende Akkuladung aus einem höchstens 10 Sekunden alten Vorzyklus setzt
+sich ohne neue Wartezeit fort. Die Ladegrenze ist das kleinere von Geräte-
+Maximalleistung und gemessenem Rest, ohne Begrenzung durch die Kurvensteigung.
+Ladegrenzen unter 300 W werden wie sonst auf 0 W geklemmt. Eine Lastspitze
+beendet den Zustand erst nach 60 Sekunden durchgehend fehlendem Rest;
+das aktuelle Ladeangebot wird sofort auf den gemessenen Rest begrenzt.
+An `soc_ceiling_curve` endet diese Ausnahme hart; dort gilt die normale Kurve.
+Der bestehende Abregel-/Einspeiseschutz und AUTO-Freilauf bleiben wirksam.
+Hausanschluss-/Einspeisereserve, Abendfreigabe, Halt vor Kurvenstart, Pre-Dump,
+Preis-/Slotfenster und Schutzzustände haben Vorrang. Innerhalb dieser Grenzen
+geht der Korridorrest dem gleitenden Prognosehorizont und Landungshalten vor.
+Der Rest ist der gemessene Saldo `max(0, Akkuladung − Netzbezug)`, mit
+negativem Netzbezug bei Einspeisung und negativer Akkuladung bei Entladung.
+Haus, Wärmepumpe und jede Wallbox zählen dabei genau einmal.
+Die Halteprognose der Wärmepumpe berücksichtigt weiterhin das normale
+Speicherziel; das abgesenkte Fahrzeugziel schafft keine zusätzliche Wärmefreigabe.
+Der Wallbox Manager berücksichtigt die veröffentlichte Korridorladung bei
+seiner eigenen Startprüfung genau einmal: Der Speicher veröffentlicht den
+Rest aus einem gemeinsamen Netz-/Akkuprobenpaar. Rest und gefilterter
+Exportraum werden alternativ verwendet, niemals addiert.
+Sobald er starten oder höher regeln
+will, gibt der Speicher frei. Strom, Phasen und Stop entscheidet die Wallboxregelung.
+Kann keines der geeigneten Fahrzeuge an irgendeinem Zeitpunkt aus PV laden,
+gilt die normale Kurve (`vehicle_cannot_use_pv`). Unbekannte Leistungsgrenzen
+sind kein Beleg fehlender PV-Lademöglichkeit.
+
+Die Leistungsgrenzen verwenden mögliche Phasen sowie Geräte- und
+Fahrzeuggrenzen. Der Mindeststrom ist mindestens 6 A, mindestens der
+konfigurierte Wert und bei gemeldetem Gerätewert der höhere. Die Herkunft
+von Mindeststrom, Höchststrom und Phasen wird getrennt ausgewiesen.
+Nennwerte sind keine Messung. Fehlen Grenzen, vergrößert das Fahrzeug
+den nutzbaren PV-Anteil nicht. Phasenstufen werden für die Prognose als
+Leistungsbereich angenähert; der Gerätepfad prüft die ausführbare Stufe.
+Nur die Bedarfsbilanz beginnt am aktuellen 15-Minuten-Slot; der übrige
+Planerzeitstrahl beginnt an der vollen Stunde. Fahrzeugbedarf und geplante
+Lasten der Art `external_wallbox` zählen genau einmal. Eine geplante
+Wallboxlast wird im Vergleich bei aktivem Fahrzeugbedarf oder bestätigter
+Ladung mit unbekanntem Bedarf zurückgebucht, ohne Zuordnung zu einer
+bestimmten Wallbox und ohne Änderung der Slotbilanz.
+
+Reicht die PV nicht für Akku und Fahrzeug, endet die heutige PV-Kurve bei
+der Hausakku-Untergrenze (`effective_wb_floor_soc`), auch bei „Prognose auf
+100%“. Bekannter Nullbedarf lässt das normale Ziel bestehen. Der Bedarf
+stammt aus bestätigtem SoC, Ziel und Fahrzeugkapazität oder dem restlichen
+kWh-Sitzungsziel einschließlich Ladeverlusten. Ein unbekanntes eigenes
+openWB-Ziel wird nicht als E3DC-Control-Ziel angenommen.
+
+Der Messbeleg schaltet ab 500 W ein und nach 45 Sekunden gültig unter
+300 W aus; genau 300 bis unter 500 W halten den bisherigen Zustand.
+Eine Messlücke hält ihn höchstens 600 Sekunden. Unterbrechungen setzen den
+45-Sekunden-Timer zurück; negative Leistung bleibt ungültig, niemals 0 W.
+Der getrennte Beleg „Auto hat geladen“ hält bei unbekanntem Bedarf das
+Rückfallziel nur am Tag der letzten Bestätigung ab 500 W und nur innerhalb
+derselben Steck-Episode. Er endet bei Pause, Vollmeldung, bestätigtem Abstecken oder
+nach 60 Minuten gültig unter 300 W, während genügend PV-Überschuss und ein
+Stromangebot mindestens in Höhe des Fahrzeugminimums vorhanden sind.
+Kurze Wolken, fehlendes Angebot, ungültige Proben und einzelne unbestätigte
+Absteckmeldungen bis einschließlich zwei Minuten halten die Verfallsuhr nur an;
+sie zählen nicht als Angebotszeit. Eine längere Unterbrechung setzt sie zurück.
+Das Angebot verwendet den vorhandenen geglätteten Netzwert. Normale Akkuladung
+ist kein Fahrzeugangebot: Für diese Uhr zählen Einspeisung und belegter
+Mindeststrom. Ohne belegte Leistungsgrenzen oder Stromangebot läuft die Uhr
+nicht; der Diagnosegrund bleibt sichtbar. Der Tagesbeleg liegt im Dienstspeicher
+und benötigt nach dessen Neustart eine neue Bestätigung ab 500 W.
+Bei Messlücken gilt für die Zielwahl höchstens die 600-Sekunden-Überbrückung.
+Der getrennte Entladeschutz gilt bei gestecktem oder unbekannt gestecktem Auto,
+geregelt wie beobachtet: Der Lückendeckel ist der höhere Wert aus Hausgrundlast
+plus Wärmepumpe und dem letzten gültigen Defizitdeckel, höchstens 600 Sekunden
+alt. Danach gilt nur Grundlast plus Wärmepumpe. Fehlende Daten setzen ihn nie
+auf 0 W. Weder Hausmessung inklusive Wallbox noch ein Wallbox-Ersatzwert wird
+zusätzlich gebucht. Bestätigtes Abstecken beendet den Schutz dieses Ladepunkts.
+
+Zur normalen Kurve geht es ab 110 % Deckung aller drei Energieprüfungen,
+zurück unter 100 %. Jede Wahl hält etwa 15 Minuten (30 Sekunden Toleranz
+für den Planlauftakt). Entfallener Ladebeleg, fehlende PV-Lademöglichkeit,
+Pause und bestätigtes Abstecken lassen die normale Wahl sofort zu.
+Der Übergang nutzt die frisch berechnete Kurve mit einem gespeicherten
+abklingenden Versatz, höchstens eine Stunde. Prognoseänderungen wirken
+weiter; der Sprung je Planlauf bleibt auf eine maximale 15-Minuten-Ladung
+begrenzt. Eine bloße Unwetterwarnung beendet die Überbrückung nicht; ein aktiver
+Unwettereingriff, ein geändertes Ziel oder eine geänderte Reserve beenden sie.
+Auch Entscheidungswechsel, Tageswechsel und Ablauf der Stunde beenden den
+Übergang. Die Begrenzung gilt am aktuellen Kurvenpunkt; die Rampe danach
+kann steiler sein, am Kurventagesende gilt unmittelbar das normale Ziel.
+Eine relevante Intent-Änderung muss 60 Sekunden stabil bleiben.
+
+Bei aktivem Rückfallziel darf die Unwetter-Vorladung die PV-Zielkurve bis
+zum höheren Unwetterziel anheben, einschließlich des Endankers, aber nur
+bis zum Warnende. Danach gilt wieder das PV-Ziel. Ohne aktives Rückfallziel
+bleibt die Unwetterkurve auf das normale Speicherziel begrenzt.
+
+`active_target_soc` und `can_reach_target` beziehen sich auf das wirksame
+PV-Kurvenziel. `normal_target_soc` und `normal_target_can_reach` beschreiben
+das normale Speicherziel separat. Pre-Dump und Preis-Netzladen behalten
+ihr normales Ziel. Unwetter-Vorladeanker werden nicht auf das Rückfallziel
+begrenzt. Bei aktivem Rückfallziel bleibt die Schlechtwetterreserve aus;
+nach Kurvenende und für die Folgetagskurve gilt sie wieder. Der Folgetag
+veröffentlicht eine normale Zielwahl. Notstromreserve, Nutzer-Aus und
+andere Schutzgrenzen behalten Vorrang.
+
+Im Plan nennen `wallbox_curve_target_state` und `wallbox_config_target_reach`
+Entscheidung, Grund, Restüberschuss, Akku- und Fahrzeugbedarf samt Quellen
+sowie aktives Ziel und Haltezeit. Fehlende Bedarfe stehen als `null` mit Grund.
 
 ### Einfrieren und Glätten
 

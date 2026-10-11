@@ -1,16 +1,16 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.5.3c</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.5.4</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.5.3c**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.5.4**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+
+5.5.4 bringt die Installationszentrale auf Bare Metal wieder in Betrieb (Module per Klick, Dienste im Python-venv, geprüfte Karten und Konsolenmenüs), ordnet Speicherführung und Abendziel bei Wallboxen neu, hält den PV-Boost der Wärmepumpe, lässt das globale „Automatik darf steuern“ auch auf den Heizstab wirken, bindet die Lade- und Entladegrenzen an die Gerätegrenzen und berechnet den Hausverbrauch der Tagesstatistik aus der Energiebilanz. Neu und experimentell (Standard aus) ist eine Kostenhistorie je Viertelstunde. Bestehende Installationen aktualisieren wie gewohnt über **System Update** bzw. das Docker-Update; eine Konfigurationsänderung ist nicht nötig.
 
 5.5.3c ist ein Korrekturupdate: Bei einer Neuinstallation ließ sich der Energy Manager (Wärmepumpe, SG-Ready, Heizstab) nicht einrichten. Das ist behoben. Bestehende Installationen aktualisieren wie gewohnt über **System Update** bzw. das Docker-Update; eine Konfigurationsänderung ist nicht nötig.
-
-Gegenüber 5.5.2 bringt das Update außerdem die Neuerungen von 5.5.3: 5.5.3 korrigiert die Zeitbasis der E3/DC-Historie und die Tagesbilanz, behebt eine dauerhaft gesperrte Wärmepumpen-Startfreigabe bei Stiebel ISG mit SG-Ready und gibt der Lastspitzenkappung Vorrang vor dem Tarif-Halt. Neu sind das experimentelle Tariffenster-Heizen (Standard Aus), eine Wärmepumpen-Vorschau mit Pumpensignalen und Hover-Texte für alle Felder im Config-Editor. Das Update benötigt keine Konfigurationsänderung. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
 
 5.5.0a ist ein Sicherheitsupdate für die Web-PIN: Die Sperre nach Fehlversuchen gilt jetzt auch für den API-Zugriff per Header und lässt sich weder über einen wechselnden User-Agent noch über parallele Anfragen umgehen. Empfohlen wird eine Web-PIN mit mindestens 6 Zeichen; Einzelheiten stehen in der [API-Dokumentation](doc/API_Documentation.md).
 
@@ -49,6 +49,8 @@ sondern eine eindeutige Auswahl verlangt.
 > **Config-Schutz:** Standardinstallationen speichern `data/e3dc_v4.json` und lokale Config-Backups mit `660` für Install-User und `www-data`, damit WebUI und Dienste weiter automatisch starten, die Datei aber nicht mehr weltlesbar ist. Der normale Config-Download „Einstellungen ohne Zugangsdaten“ enthält keine Zugangsdaten, aber weiterhin IP-Adressen und Gerätekennungen und ist nicht zum Teilen gedacht; der Raw-Download enthält Zugangsdaten und wird nur angeboten, wenn eine Web-PIN gesetzt ist. Der Kompatibilitätsmodus (`664`) ist nur für eigene externe Leser gedacht. Import, Rollback und normales Speichern im Config-Editor prüfen die fertig zusammengeführte JSON-Datei auf höchstens 64 KiB; eine bestandene Rollenprüfung beweist keinen laufenden Regelbetrieb. Für HA-Sicherungen und Ersatzhardware gilt [Rolle und Rollenanker](doc/High_Availability_Dokumentation.md#rolle-und-rollenanker).
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
+
+> **Neu in 5.5.4:** Installationszentrale mit Modul-Installation per Klick, Startknopf ohne Moduswechsel, Stop an der openWB gilt, openWB-Pro-Bereitschaft nur mit Budget, gehaltener Wärmepumpen-PV-Boost, globales „Automatik aus“ auch für den Heizstab, Lade-/Entladegrenzen an den Gerätegrenzen, freies Laden unterhalb der Korridor-Untergrenze, Hausverbrauch der Tagesstatistik aus der Energiebilanz, experimentelle Kostenhistorie (Standard aus), Korrekturen für 32-Bit-Systeme und die Web-PIN-Sperrseite. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
 
 > **Neu in 5.5.3c:** Der Energy Manager lässt sich bei einer Neuinstallation wieder einrichten. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
 
@@ -246,7 +248,7 @@ Das Konsolenmenü ist bewusst klein gehalten:
 2) Systemstatus anzeigen
 3) Rechte prüfen & korrigieren
 4) Notfallmodus / System reparieren
-5) Policygebundener Programm-Rückfall (falls für Bare Metal freigegeben)
+5) Rollback auf freigegebenes Stable-Release
 6) Backup erstellen / verwalten
 7) Expertenmenü
 8) Systempakete vorbereiten
@@ -261,6 +263,7 @@ Das Expertenmenü ist in 10er-Blöcke sortiert:
 ```text
 Kernsystem & Update
   14) Rollback (Datei-Backup)
+  15) PV-Wächter (Watchdog) einrichten / reparieren
 Umgebung & Python
   21) Python venv neu aufbauen (Reparatur)
   22) Python venv Namen ändern
@@ -268,7 +271,15 @@ Docker Migration & Verwaltung
   31) Zu Docker wechseln (Auto-Install & Migration)
   32) Docker auflösen & zum lokalen System zurückkehren
 Erweiterungen & Smart Home
-  41) Energy Manager
+  41) Energy Manager (Wärmepumpe, Heizstab & Lademanagement)
+  42) Native Wallbox Manager (E3DC, openWB, go-e)
+  43) Hyundai/Kia SoC-Abfrage (Bluelink)
+  44) Benachrichtigungs-Dienst einrichten
+  45) Smart Home Matter Bridge
+  46) openWB MQTT Integration
+  47) Lokalen MQTT-Broker (Mosquitto)
+  48) Smart Home MQTT-Hub (HA/ioBroker)
+  49) High Availability (Cluster)
 ```
 
 ---
@@ -535,7 +546,7 @@ sudo docker compose logs --tail=80 e3dc-control
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin oder Rückfall wird
-> `E3DC_IMAGE_TAG=v5.5.3c` in `.env` gesetzt und `sudo docker compose up -d`
+> `E3DC_IMAGE_TAG=v5.5.4` in `.env` gesetzt und `sudo docker compose up -d`
 > ausgeführt. `config --images` zeigt vor dem Pull das tatsächlich gewählte
 > Image.
 
@@ -577,4 +588,4 @@ entfernt.
 
 Der Installer dient gleichzeitig als dein zentrales Wartungstool. Starte ihn jederzeit erneut mit `bash "$E3DC_INSTALL_PATH/e3dc-setup"`, um Updates einzuspielen, Berechtigungen zu reparieren, Modbus-Geräte nachzuinstallieren oder Backups zu verwalten.
 
-Für automatisierte Abläufe gibt es den Headless-Modus: `bash "$E3DC_INSTALL_PATH/e3dc-setup" --unattended`
+Für automatisierte Abläufe stehen die Headless-Einstiege `bash "$E3DC_INSTALL_PATH/e3dc-setup" --update-e3dc`, `--fix-permissions` und `--check` zur Verfügung. `--unattended` allein führt nur die Vorprüfungen aus.

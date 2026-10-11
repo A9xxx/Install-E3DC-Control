@@ -213,10 +213,8 @@ def setup_openwb_mqtt():
         print("\n" + "="*50)
         print("✓ openWB MQTT Integration erfolgreich eingerichtet!")
         print("="*50 + "\n")
-        print("Naechste Schritte:")
-        print("1. Starte den wallbox_manager neu: sudo systemctl restart e3dc-wallbox-manager")
-        print("2. Die Wallbox-Daten werden jetzt ueber MQTT gelesen")
-        print("3. Ueberpruefen Sie die Logs fuer moegliche Fehler\n")
+        print("Nächster Schritt: MQTT-Hub über Konsole 48 oder die Installationszentrale einrichten; bei bestehendem Hub sudo systemctl restart e3dc-mqtt-hub ausführen.")
+        print("Der MQTT-Hub liest die Wallbox-Leistung; dies richtet keine native openWB-Steuerung ein.\n")
         log_task_completed("openWB MQTT Integration")
     else:
         print("\n[!] Fehler beim Speichern der Konfiguration!")

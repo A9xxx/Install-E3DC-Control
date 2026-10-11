@@ -44,55 +44,14 @@ Wenn das funktioniert — alles bereit.
 
 ## Schritt 2 — Dienst prüfen / installieren
 
-Verbinde dich per SSH mit dem Pi:
-
-```bash
-ssh pi@192.0.2.36
-```
-
-Prüfe ob der Heizstab-Dienst bereits existiert:
-
-```bash
-sudo systemctl status e3dc-heizstab.service
-```
-
-**Falls der Dienst fehlt** (Fehlermeldung "not found"):
-
-```bash
-# Service-Datei anlegen
-sudo nano /etc/systemd/system/e3dc-heizstab.service
-```
-
-Inhalt einfügen (Strg+Shift+V):
-
-```ini
-[Unit]
-Description=E3DC Heizstab / Shelly-3EM WP Manager
-After=network.target e3dc-live.service
-Wants=e3dc-live.service
-
-[Service]
-Type=simple
-User=pi
-WorkingDirectory=<INSTALL_PATH>/Installer
-ExecStart=<VENV_PATH>/bin/python3 <INSTALL_PATH>/Installer/heizstab_manager.py
-Restart=always
-RestartSec=15
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Speichern mit Strg+O, Enter, Strg+X.
-
-Dienst registrieren:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable e3dc-heizstab.service
-```
+Den Dienststatus über **Hauptmenü 2) Systemstatus anzeigen** prüfen.
+Fehlt der Dienst, zunächst die Konfiguration aus Schritt 3 speichern.
+Danach in der **Installationszentrale → Heizstab / Shelly → Installieren**
+die verwaltete Unit mit passendem Python-venv, Gruppenrechten und gemeinsamem
+Manager-Lock einrichten. Alternativ **Konsole 41) Energy Manager** öffnen und
+**3) Shelly Pro3EM (WP ohne native Anbindung)** auswählen. Die Unit wird durch
+diesen Installationsweg erstellt; eine manuell angelegte Service-Datei ist
+nicht erforderlich.
 
 ---
 
@@ -110,7 +69,7 @@ Dort im Abschnitt **Wärmepumpen Typ**:
 | **Automatik darf Geräte steuern** | Für reines Messen optional; zum Schalten einschalten |
 | **Relais-ID** | `-1` = nur messen / `0` = Relais 0 schalten |
 | **PV-Auto-Steuerung** | `0 = Nur messen` oder `1 = PV-Auto (Schalten)` |
-| **WP Mindestleistung (W)** | z.B. `1500` (Einschaltschwelle: ab wieviel W Überschuss darf die WP starten) |
+| **WP Mindestleistung (W)** | Standard `1000`, z.B. `1500` für eine größere WP. Ab dieser gemessenen WP-Leistung gilt die WP als laufend; das Relais schaltet ein, wenn das der WP zugewiesene Budget diesen Wert, mindestens aber 1500 W, erreicht |
 | **WP Nennleistung (W)** | z.B. `3000` (laut Typenschild deiner WP) |
 | **Mindest-SOC (%)** | z.B. `20` (Batterie-Reserve: WP startet nicht wenn SOC darunter) |
 
@@ -143,6 +102,25 @@ Die Pro3EM-Messung läuft auch dann, wenn **Automatik darf Geräte steuern**
 ausgeschaltet ist. Schaltbefehle werden erst gesendet, wenn zusätzlich eine
 Relais-ID ab `0`, `PV-Auto = 1` und die Automatik freigegeben sind.
 
+Bei globalem „Automatik aus“ werden keine neuen Relaisstarts angefordert.
+Ein zugeordnetes Relais, das beim ersten erfolgreichen Readback nach
+Dienststart eingeschaltet vorgefunden wird, gilt als eigener laufender
+Auftrag. Seine Mindestlaufzeit beginnt bei unbekanntem Einschaltalter ab
+dieser Beobachtung. Nach Ablauf wird es genau einmal bestätigt ausgeschaltet.
+Ein später extern eingeschaltetes Relais bleibt bei globalem Aus reine
+Messung. Vom Dienst selbst eingeschaltete Relais bleiben eigene Aufträge.
+Fehlende oder veraltete Livedaten mit unbekanntem SoC verkürzen die
+Mindestlaufzeit nicht; ein gemessener SoC unter `hs_min_soc` bewirkt sofort
+die Sicherheitsabschaltung.
+
+Bei einer myPV AC ELWA-E sperrt ein unbestätigter Gerätetimeout in Register
+1004 die Sollwertsteuerung nicht. Die Heizstabkarte warnt dann vor der
+fehlenden geräteseitigen Zeitgrenze. Fehlgeschlagene Timeout-Schreibversuche
+werden höchstens stündlich wiederholt; nach Bestätigung erfolgt kein weiterer
+Schreibversuch innerhalb desselben Dienstprozesses. Eine 0-W-Rücknahme bleibt
+auch nach einem abgelehnten oder unbestätigten Schreibbefehl erlaubt.
+
+
 Dann Dienst starten und Live-Log beobachten:
 
 ```bash
@@ -150,12 +128,16 @@ sudo systemctl start e3dc-heizstab.service
 sudo journalctl -u e3dc-heizstab.service -f --no-pager
 ```
 
-Du solltest alle 15 Sekunden eine Zeile sehen wie:
+Alle 15 Sekunden erscheinen Zeilen wie:
 
 ```
 [10:23:45] PV=4500W Grid=-1200W SOC=72%
-  [3EM] WP=2300W (A:780W B:760W C:760W) [LAEUFT]
+  [3EM] WP=2300W (A:780W B:760W C:760W) [LASTANNAHME]
 ```
+
+`[LASTANNAHME]` erscheint, wenn die gemessene Leistung die WP Mindestleistung
+erreicht; liegt sie darunter (etwa Pumpenvorlauf oder Standby), steht
+`[STAND/PUMPENVORLAUF]`.
 
 Das bestätigt: Shelly Pro3EM wird korrekt ausgelesen.
 
@@ -169,17 +151,21 @@ Relevante Felder:
 
 ```json
 {
-  "wp_power_w":   2300.0,    <- Gesamtleistung WP (alle 3 Phasen)
+  "wp_power_w":   2300.0,    <- Gesamtleistung WP (alle 3 Phasen); null, wenn die Messung nicht verfügbar ist
   "wp_phase_a_w": 780.0,     <- Phase A
   "wp_phase_b_w": 760.0,     <- Phase B
   "wp_phase_c_w": 760.0,     <- Phase C
-  "wp_is_running": true,     <- true wenn >= 30% der Mindestleistung
+  "wp_is_running": true,     <- true ab 100 % der WP Mindestleistung (Lastannahme)
   "wp_relay_on":  false,     <- Relaisstatus
   "wp_takt_protect_active": false, <- Mindestlaufzeit/Wiedereinschaltsperre aktiv
   "surplus_w":    1200.0,    <- Verfügbarer PV-Überschuss
   "soc":          72.0       <- Aktueller Batterie-SoC
 }
 ```
+
+Liegt die gemessene Leistung über 0 W, aber unter der WP Mindestleistung, ist
+`wp_is_running` false; das System wertet das als Pumpenvorlauf oder Standby
+(`wp_acceptance_stage` = `pump_prelude_or_standby`).
 
 ---
 
@@ -212,27 +198,44 @@ Ab 5.1.8b nutzt das Pro3EM-Relais die allgemeinen Wärmepumpen-Taktschutzwerte
 Relais deshalb bis zur Mindestlaufzeit und blockieren direkte Neustarts nach
 einem Stop; SoC-Schutz und manuelles/Auto-Aus bleiben harte Stopps.
 
-Wenn Überschuss wegbricht oder SOC zu niedrig:
+Wenn das zugewiesene WP-Budget wegfällt oder der SOC zu niedrig ist:
 
 ```
-  [3EM] -> WP Relais 0 AUSgeschaltet (Überschuss zu gering (800W < 1000W))
+  [3EM] -> WP Relais 0 AUSgeschaltet (kein zugewiesenes WP-Budget (0W))
+  [3EM] -> WP Relais 0 AUSgeschaltet (SOC zu niedrig (15% < 20.0%))
 ```
 
 ### Schaltlogik im Detail
 
-```
-Einschalten:  PV-Überschuss >= WP-Mindestleistung UND SOC >= Mindest-SOC
-Ausschalten:  PV-Überschuss <  (Mindest-Überschuss - 500W Hysterese)
-              ODER SOC < Mindest-SOC
+Das Relais folgt dem Budget, das die zentrale Verbraucherverteilung der
+Wärmepumpe zuweist, nicht dem rohen PV-Überschuss.
 
-Hysterese:    500W Totband verhindert schnelles Ein/Aus-Takten bei schwankender PV
+```
+Einschalten:  zugewiesenes WP-Budget >= Startminimum UND SOC >= Mindest-SOC
+              UND keine Wiedereinschaltsperre UND kein aktiver Wallbox-Übergang
+Ausschalten:  zugewiesenes WP-Budget fällt auf 0 W ODER SOC < Mindest-SOC
+              (bei Budget 0 erst nach Ablauf der Mindestlaufzeit,
+              der SOC-Schutz stoppt sofort)
+
+Startminimum: WP Mindestleistung, mindestens jedoch 1500 W
 ```
 
-**Beispiel** mit Mindestleistung=1500W:
+Ein lokales Totband gibt es für das Relais nicht mehr. Kurze Wolkenkanten fängt
+die Mindestlaufzeit (`wp_min_runtime_min`, Standard 30 Minuten) ab, direktes
+Neutakten nach einem Stop die Wiedereinschaltsperre (`wp_restart_block_min`,
+Standard 20 Minuten).
+
+**Beispiel** mit WP Mindestleistung = 1500 W:
 ```
-Einschalten ab:  1500W Überschuss
-Ausschalten bei: 1500 - 500 = 1000W Überschuss (erst dann geht Relais aus)
+Einschalten ab:  1500 W zugewiesenem WP-Budget
+Ausschalten bei: 0 W zugewiesenem WP-Budget (nach der Mindestlaufzeit)
 ```
+
+**Wallbox-Phasenwechsel:** Meldet die zentrale Verbraucherverteilung einen aktiven
+Wallbox-Phasen- oder Stromübergang, stoppt das System eine laufende Wärmepumpe
+deswegen nicht (Anzeige „WP läuft weiter: Wallbox-Übergang darf sie nicht
+stoppen“) und startet eine stehende in dieser Zeit nicht. Der SOC-Schutz bleibt
+davon unberührt.
 
 ---
 
@@ -291,7 +294,7 @@ curl -X POST http://192.0.2.163/rpc/Switch.Set \
 |---|---|---|
 | `wp_type nicht 2 oder 3 - inaktiv` | wp_type noch auf 0 | Im Web-UI wp_type=3 setzen und speichern |
 | `shelly_3em_ip fehlt` | IP nicht konfiguriert | shelly_3em_ip eintragen |
-| `[3EM] WP=0W [STAND]` | Shelly nicht erreichbar | IP prüfen, Shelly im Browser öffnen |
+| `[!] Shelly Pro3EM <IP> Lesefehler: …` | Shelly nicht erreichbar (Zeitüberschreitung 3 s) | IP prüfen, Shelly im Browser öffnen; bis dahin gilt die WP-Leistung als unbekannt (`wp_power_w` ist `null`), nicht als 0 W |
 | WP schaltet nie ein | Überschuss reicht nicht | WP-Mindestleistung prüfen (zu hoch?) |
 | WP taktet schnell ein/aus | Mindestleistung knapp am Überschuss oder Taktschutz zu kurz | Mindestleistung leicht erhöhen und `wp_min_runtime_min`/`wp_restart_block_min` prüfen |
 | Relais schaltet nicht | relay_id=-1 oder enable=0 | relay_id=0 und enable=1 setzen |
@@ -308,3 +311,21 @@ curl -X POST http://192.0.2.163/rpc/Switch.Set \
 > bevor du das automatische Schalten aktivierst.
 > Eine WP darf nicht beliebig oft ein- und ausgeschaltet werden
 > (Kompressor-Schutz beachten — mindestens 3-5 Minuten Pause).
+
+
+### Gemeinsames Relais mit SG-Ready oder EVU-Kontakt
+
+Zeigen die aktive Pro3EM-Relaissteuerung und ein Shelly-Kontakt des Energy
+Managers auf dieselbe Adresse und dasselbe Relais, erscheint dieser Hinweis:
+„Beide Dienste können dasselbe Shelly-Relais schalten. Eine der beiden
+Zuordnungen sollte entfernt werden.“ Die Warnung ist beratend; die
+Konfiguration kann gespeichert werden. Sie verändert das Schaltverhalten
+keines Dienstes. Für dieses Relais sollte nur eine Zuordnung verwendet
+werden, damit keine widersprüchlichen Schaltbefehle entstehen.
+
+Hostnamen werden unabhängig von Groß-/Kleinschreibung und Leerzeichen
+verglichen; ein fehlender HTTP-Port entspricht Port 80. Verschiedene Relais
+bleiben unabhängig. Die bestehenden SG-Ready- und EVU-Ausgänge verwenden
+fest Relais 0. Eine unlesbare Pro3EM-Relais-ID wird wie -1 behandelt
+(nur Messung) und erzeugt keine Konfliktwarnung. Ein unbekannter Port bei
+gleichem Host bleibt ein möglicher Konflikt.

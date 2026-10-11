@@ -24,6 +24,13 @@ $base_path = !empty($paths['valid'])
     : '/var/www/html/data/.invalid-install-context/';
 $config_file = $base_path . 'e3dc.config.txt';
 $message = '';
+// Veraltete Direktsteuerungsformulare dürfen keine Einstellung mehr ändern.
+$retiredDurationPost = ($_POST['quick_action'] ?? '') !== 'force_start'
+    && (isset($_POST['zwei']) || in_array($_POST['quick_action'] ?? '', ['start_now', 'clear_times'], true));
+if ($retiredDurationPost) {
+    $_POST = [];
+    $message = '<div class="alert alert-info">Dieses Formular ist nicht mehr verfügbar. Es wurde nichts geändert. Sofortladen wird für die jeweilige Wallbox über den Lademodus „Sofort bis Preislimit“ gewählt.</div>';
+}
 if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST' && empty($paths['valid'])) {
     http_response_code(503);
     echo errorMessage('Wallbox-Aktion nicht ausgeführt', getInstallContextDiagnostic());
@@ -1161,11 +1168,19 @@ if (isset($_POST['save_wb_manual_pause_ajax'])) {
     exit;
 }
 
-if (isset($_POST['trigger_wb_force_start_ajax'])) {
-    $wbId = max(1, min(2, (int)($_POST['wb_id'] ?? 1)));
+function wallboxForceStartAction($wbId, $wallboxConfig) {
+    $startMode = normalizeWallboxModeValue($wallboxConfig["wb{$wbId}_mode"]
+        ?? ((int)($wallboxConfig['wb_native_mode'] ?? 0) > 2 ? $wallboxConfig['wb_native_mode'] : '0'));
+    if ($startMode === '0') {
+        error_log(sprintf('WB%d Startanforderung abgelehnt: Grund=wallbox_off, Session=unbekannt.', $wbId));
+        return [
+            'ok' => false, 'code' => 'wallbox_off', 'wb' => $wbId, 'mode' => $startMode,
+            'configuration_committed' => false, 'request_confirmed' => false,
+            'message' => 'Wallbox steht auf Aus – bitte zuerst einen Lademodus wählen',
+        ];
+    }
     $nativeUpdates = [
         "wb{$wbId}_manual_pause" => '0',
-        "wb{$wbId}_mode" => '1',
     ];
     $tx = e3dcWallboxPlanTransaction($nativeUpdates, [
         // Der explizite Sofortstart ist ein sitzungsgebundener Managerauftrag
@@ -1173,21 +1188,21 @@ if (isset($_POST['trigger_wb_force_start_ajax'])) {
         // byteidentisch; insbesondere darf WB2 keinen globalen Legacy-Plan
         // für WB1 mit `wbhour=99` erzwingen.
         'operation' => 'preserve',
-        'abort_flag' => 'remove',
+        // Das Bestandsflag pausiert beide automatischen SoC-Planungen.
+        // Der Einzelstart ist davon unabhängig und lässt es erhalten.
+        'abort_flag' => 'preserve',
     ]);
-    header('Content-Type: application/json; charset=utf-8');
     if (empty($tx['success'])) {
         $txCode = preg_replace('/[^a-z0-9_\-]/i', '', (string)($tx['code'] ?? 'transaction_failed')) ?: 'transaction_failed';
         http_response_code(in_array($txCode, ['lock_busy', 'concurrent_change'], true) ? 409 : 500);
-        echo json_encode([
+        return [
             'ok' => false,
             'code' => $txCode,
             'wb' => $wbId,
             'configuration_committed' => false,
             'request_confirmed' => false,
             'message' => (string)($tx['message'] ?? 'Die Wallbox-Konfiguration konnte nicht bestätigt werden.'),
-        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-        exit;
+        ];
     }
 
     $requestResult = wallboxPublishForceStartRequest($wbId);
@@ -1196,7 +1211,7 @@ if (isset($_POST['trigger_wb_force_start_ajax'])) {
         // 207 hält den typisierten Teilstatus für den bestehenden Dashboard-
         // Client lesbar; `ok: false` verhindert trotzdem jede grüne Meldung.
         http_response_code(207);
-        echo json_encode([
+        return [
             'ok' => false,
             'code' => 'force_start_partial',
             'request_code' => $requestCode,
@@ -1205,21 +1220,63 @@ if (isset($_POST['trigger_wb_force_start_ajax'])) {
             'request_confirmed' => false,
             'message' => 'Die Wallbox-Grundfreigabe wurde gespeichert, aber die zusätzliche Sofort-Anforderung nicht bestätigt. Die Aktion wird deshalb nicht als erfolgreich gemeldet. '
                 . (string)($requestResult['message'] ?? 'Bitte Dateirechte der Ramdisk prüfen und den Status neu laden.'),
-        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-        exit;
+        ];
     }
 
-    echo json_encode([
-        'ok' => true,
-        'code' => 'force_start_committed',
-        'wb' => $wbId,
-        'mode' => '1',
-        'configuration_committed' => true,
-        'request_confirmed' => true,
-        'request_id' => $requestResult['request_id'],
-        'request_ts' => $requestResult['timestamp'],
-        'message' => 'Sofortladen ist gespeichert und die Wallbox-Anforderung wurde bestätigt.',
-    ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    // Die gespeicherte Anfrage ist noch keine Annahme durch den Manager.
+    // Höchstens fünf Sekunden warten; die Datei wird ohne Schreibsperre gelesen.
+    if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
+    $deadline = microtime(true) + 5.0;
+    do {
+        $result = wallboxForceStartStatus($wbId, $requestResult['request_id']);
+        if ($result['code'] !== 'force_start_pending') break;
+        usleep(50000);
+    } while (microtime(true) < $deadline);
+    return array_merge($result, [
+        'mode' => $startMode, 'configuration_committed' => true,
+        'request_confirmed' => true, 'request_ts' => $requestResult['timestamp'],
+    ]);
+}
+
+function wallboxForceStartStatus($wbId, $requestId) {
+    $requests = json_decode((string)@file_get_contents('/var/www/html/ramdisk/wallbox_user_mode_request.json'), true);
+    $request = is_array($requests) ? ($requests[(string)$wbId] ?? null) : null;
+    $result = is_array($request) && hash_equals((string)$requestId, (string)($request['request_id'] ?? ''))
+        ? ($request['result'] ?? null) : null;
+    $accepted = is_array($result) && ($result['accepted'] ?? null) === true;
+    $reason = is_array($result) ? (string)($result['reason'] ?? '') : '';
+    $messages = [
+        'wallbox_off' => 'Wallbox steht auf Aus – bitte zuerst einen Lademodus wählen',
+        'foreign_or_protected_zero_anchor' => 'Start abgelehnt: Ein geschützter oder fremder Stopp ist aktiv. Die Anforderung bleibt erhalten, höchstens 60 Sekunden ab dem Absenden.',
+        'state_commit_failed' => 'Start abgelehnt: Der Ladezustand konnte nicht sicher gespeichert werden. Die Anforderung bleibt erhalten, höchstens 60 Sekunden ab dem Absenden.',
+    ];
+    return [
+        'ok' => $accepted, 'accepted' => $accepted, 'wb' => $wbId,
+        'request_id' => (string)$requestId,
+        'code' => $accepted ? 'force_start_accepted' : (is_array($result) ? 'force_start_rejected' : 'force_start_pending'),
+        'reason' => $reason,
+        'message' => $accepted
+            ? 'Startanforderung angenommen. Der gewählte Lademodus und die Schutzgrenzen gelten weiter.'
+            : ($messages[$reason] ?? (is_array($result)
+                ? 'Start abgelehnt. Die Anforderung bleibt erhalten, höchstens 60 Sekunden ab dem Absenden.'
+                : 'Startanforderung wird verarbeitet. Die Anforderung bleibt für die Prüfung höchstens 60 Sekunden erhalten.')),
+    ];
+}
+
+if (isset($_POST['get_wb_force_start_status_ajax'])) {
+    $wbId = max(1, min(2, (int)($_POST['wb_id'] ?? 1)));
+    if (session_status() === PHP_SESSION_ACTIVE) session_write_close();
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(wallboxForceStartStatus($wbId, (string)($_POST['request_id'] ?? '')),
+                     JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    exit;
+}
+
+if (isset($_POST['trigger_wb_force_start_ajax'])) {
+    $wbId = max(1, min(2, (int)($_POST['wb_id'] ?? 1)));
+    $result = wallboxForceStartAction($wbId, $confData['config'] ?? []);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode($result, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     exit;
 }
 
@@ -1907,7 +1964,7 @@ if (isset($_POST['update_custom_car_cp'])) {
     if ($targetIndex === null) {
         $message = errorMessage('CP-Wakeup nicht gespeichert', 'Das ausgewählte Fahrzeugprofil wurde nicht gefunden.');
     } elseif (!in_array($cpMode, ['required', 'not_required'], true)) {
-        $message = errorMessage('CP-Wakeup nicht gespeichert', 'Bitte wähle erforderlich oder nicht erforderlich.');
+        $message = errorMessage('CP-Wakeup nicht gespeichert', 'Erforderlich oder nicht erforderlich auswählen.');
     } else {
         // Nur den CP-Vertrag ändern; alle anderen Profilwerte bleiben exakt
         // erhalten. Der kanonische Transaktionspfad prüft die Ausgangsrevision.
@@ -1944,7 +2001,7 @@ if (isset($_POST['update_custom_car_phases'])) {
     if ($targetIndex === null) {
         $message = errorMessage('Phasenzahl nicht gespeichert', 'Das ausgewählte Fahrzeugprofil wurde nicht gefunden.');
     } elseif (!in_array($phases, [1, 2, 3], true)) {
-        $message = errorMessage('Phasenzahl nicht gespeichert', 'Bitte wähle 1, 2 oder 3 Phasen.');
+        $message = errorMessage('Phasenzahl nicht gespeichert', '1, 2 oder 3 Phasen auswählen.');
     } else {
         $cars[$targetIndex]['max_phases'] = $phases;
         $cars[$targetIndex]['phases'] = $phases;
@@ -2020,7 +2077,7 @@ if (isset($_POST['save_cloud_integration'])) {
         if (e3dcIsDockerEnvironment()) {
             $message = errorMessage(
                 'Cloud-Integration gespeichert, Neustart nicht bestätigt',
-                'Die neue Konfiguration ist gespeichert. Bitte starte den Docker-Container einmal neu; erst danach ist die Bluelink-Übernahme bestätigt.'
+                'Die neue Konfiguration ist gespeichert. Den Docker-Container einmal neu starten; erst danach ist die Bluelink-Übernahme bestätigt.'
             );
         } else {
             $restart = e3dcRunServiceWrapperAction('restart', ['e3dc-bluelink']);
@@ -2080,9 +2137,6 @@ function getTieredPrices($base_path) {
 }
 
 // $wallbox_file wurde bereits oben aus der Config ermittelt
-
-$alleZeilen = [];
-$zeile = '1';
 
 function parseWallboxConfigValues($filePath) {
     $result = [
@@ -2646,110 +2700,16 @@ foreach ($powerOptions as $key => $_) {
 $chargingSlots = 0;
 $tieredPricesFallback = getTieredPrices($base_path);
 
-// --- POST HANDLER MUSS HIER SEIN, DAMIT SCHEDULER VOR DEM LESEN DES JSONS LÄUFT ---
-if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
-    // Frühzeitig ermitteln, ob der native Modus aktiv ist (für die Handler-Logik benötigt)
-    $isNativeEnabledEarly = in_array(strtolower(trim($wallboxConfig['wb_native_enable'] ?? '0')), ['1', 'true', 'yes']);
-    $abort_flag = '/var/www/html/ramdisk/native_schedule_aborted.flag';
-
-    $quickAction = null;
-    if (isset($_POST['quick_action'])) {
-        $quickAction = $_POST['quick_action'];
-        if ($quickAction === 'start_now' || $quickAction === 'force_start') {
-            $_POST['zwei'] = '99';
-        } elseif ($quickAction === 'clear_times') {
-            $_POST['zwei'] = '0';
-        }
-    }
-
-    if (isset($_POST['zwei'])) {
-        $neueDauer = trim((string)$_POST['zwei']);
-        $neueDauerInt = (int)$neueDauer;
-
-        if (!is_numeric($neueDauer) || $neueDauerInt < 0 || ($neueDauerInt > 24 && $neueDauerInt < 99) || $neueDauerInt > 99) {
-            $message = errorMessage('Ungültige Eingabe', 'Die Ladedauer muss zwischen 0 und 24 Stunden oder 99 = unbegrenzt liegen.');
-        } elseif ($isNativeEnabledEarly) {
-            // NATIVE MODUS: Schreibe NIEMALS in e3dc.wallbox.txt!
-            // Stattdessen: wbhour in config.txt setzen -> wallbox_manager übernimmt
-            $wbhourVal = ($neueDauerInt === 99) ? '99' : (string)$neueDauerInt;
-            // wb_sofort=1 NUR bei Max/start_now (Sofortladen ohne Zeitfenster).
-            // Beim normalen Speichern des Schiebereglers gilt wb_sofort=0; die Zeitsteuerung berücksichtigt wbvon/wbbis.
-            $ecoMode = isset($_POST['wb_native_eco'])
-                ? (($_POST['wb_native_eco'] === '1') ? '1' : '0')
-                : ($wallboxConfig['wb_native_eco'] ?? '0');
-            $nativeUpdates = [
-                'wbhour'       => $wbhourVal,
-                'wb_sofort'    => ($quickAction === 'start_now' || $quickAction === 'force_start') ? '1' : '0',
-                'wb_native_eco'=> $ecoMode,
-                'wb1_mode'     => ($quickAction === 'force_start') ? '1' : '5',
-                'wb2_mode'     => ($quickAction === 'force_start') ? '1' : '5',
-            ];
-            if ($quickAction === 'force_start') {
-                $nativeUpdates['wbvon'] = date('H:00');
-            } elseif ($quickAction === 'start_now') {
-                // Sofortladen: wbvon auf aktuelle Stunde setzen, damit sofort geplant wird.
-                // Netzbezug bleibt trotzdem an die Wallbox-Preisgrenze gekoppelt.
-                $nativeUpdates['wbvon'] = date('H:00');
-                $nativeUpdates['wb1_mode'] = '5';
-                $nativeUpdates['wb2_mode'] = '5';
-            } elseif ($quickAction === 'clear_times') {
-                $nativeUpdates['wbvon'] = 'now';
-                $nativeUpdates['wbbis'] = '00:00';
-                $nativeUpdates['wb_sofort'] = '0';
-                $nativeUpdates['smart_wbhour_enable'] = '0';
-                $nativeUpdates['wb1_plan_hours'] = '0';
-                $nativeUpdates['wb1_wbvon'] = 'now';
-                $nativeUpdates['wb1_wbbis'] = '00:00';
-                $nativeUpdates['wb1_smart_wbhour_enable'] = '0';
-                $nativeUpdates['wb2_plan_hours'] = '0';
-                $nativeUpdates['wb2_wbvon'] = 'now';
-                $nativeUpdates['wb2_wbbis'] = '00:00';
-                $nativeUpdates['wb2_smart_wbhour_enable'] = '0';
-            }
-            $tx = e3dcWallboxPlanTransaction($nativeUpdates, [
-                'operation' => $neueDauerInt > 0 ? 'plan' : 'clear',
-                'abort_flag' => $neueDauerInt > 0 ? 'remove' : 'create',
-            ]);
-            if (!empty($tx['success'])) {
-                // Abbruchflag löschen: Der Benutzer hat explizit eine Ladedauer gesetzt.
-                // Das Abbruchflag ist Bestandteil derselben Dateitransaktion.
-                if ($quickAction === 'force_start') {
-                    $requestResult = wallboxPublishForceStartRequest([1, 2]);
-                    if (!empty($requestResult['success'])) {
-                        $message = successMessage('Sofortladen ist gespeichert und die Wallbox-Anforderungen wurden bestätigt.');
-                    } else {
-                        $message = errorMessage(
-                            'Sofortladen nur teilweise gespeichert',
-                            'Die Konfiguration wurde gespeichert, aber die Startanforderung nicht bestätigt. Bitte erneut versuchen. '
-                                . (string)($requestResult['message'] ?? '')
-                        );
-                    }
-                } elseif ($quickAction === 'start_now') {
-                    $message = successMessage('Sofortladen (Max) aktiviert. wallbox_manager startet die Ladung.');
-                } elseif ($quickAction === 'clear_times') {
-                    $message = successMessage('Laden gestoppt (wbhour=0).');
-                } else {
-                    $wbvonShow = $wallboxConfig['wbvon'] ?? '00:00';
-                    $whenLabel = ($wbvonShow === '00:00') ? 'jederzeit (günstigste Stunden)' : 'ab ' . $wbvonShow . ' Uhr';
-                    $message = successMessage('Ladedauer (' . $neueDauerInt . 'h) gespeichert. Laden ' . $whenLabel . '.');
-                }
-
-                if (false) {
-                    $message = errorMessage('Einstellung gespeichert, Neuberechnung blockiert', getInstallContextDiagnostic() ?: 'Der validierte Wallbox-Planer ist nicht verfügbar.');
-                }
-
-                $wallboxConfig = parseWallboxConfigValues($config_file);
-            } else {
-                $message = errorMessage('Schreibfehler', 'config.txt konnte nicht geschrieben werden.');
-            }
-        } else {
-            // LEGACY-WALLBOX-STEUERUNG STILLGELEGT: Dieser Webpfad schreibt
-            // niemals e3dc.wallbox.txt und meldet keinen ausgeführten Aktorbefehl.
-            $message = errorMessage(
-                'Alter Wallbox-Steuerpfad stillgelegt',
-                'Die direkte Steuerung über e3dc.wallbox.txt wird nicht mehr unterstützt. Aktiviere die native Wallbox-Steuerung; es wurde kein Start-/Stop-Befehl gesendet.'
-            );
-        }
+// Der Startknopf erhält den Modus und betrifft nur die ausgewählte Wallbox.
+if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && ($_POST['quick_action'] ?? '') === 'force_start') {
+    $wbId = max(1, min(2, (int)($_POST['wb_id'] ?? 1)));
+    $result = wallboxForceStartAction($wbId, $wallboxConfig);
+    if ($result['code'] === 'force_start_pending') {
+        $message = '<div class="alert alert-info">' . htmlspecialchars((string)$result['message'], ENT_QUOTES, 'UTF-8') . '</div>';
+    } else {
+        $message = !empty($result['ok'])
+            ? successMessage((string)$result['message'])
+            : errorMessage('Wallbox-Start nicht bestätigt', (string)$result['message']);
     }
 }
 
@@ -2969,17 +2929,6 @@ if (file_exists('/var/www/html/ramdisk/native_wallbox_schedule.json') && is_read
             }
         }
     }
-
-if (file_exists($wallbox_file)) {
-    $readCheck = checkFileAccess($wallbox_file, 'read');
-    if ($readCheck === true) {
-        $alleZeilen = file($wallbox_file, FILE_IGNORE_NEW_LINES);
-    }
-}
-
-if (count($alleZeilen) > 0) {
-    $zeile = $alleZeilen[0];
-}
 
 $formAction = getContextPageUrl('wallbox');
 $nowMinutes = (int)date('G') * 60 + (int)date('i');
@@ -3762,6 +3711,16 @@ if ($hasWb2) {
                             <?php endif; ?>
                             Quelle: <span class="fw-bold text-body"><?= htmlspecialchars($row['source'] ?: '--') ?></span>
                             <?php if (!$row['fresh']): ?><br><span class="text-warning">Noch keine frischen openWB-Livedaten.</span><?php endif; ?>
+                            <?php if ($row['type'] === 'openwb'): ?>
+                            <div class="mt-2" data-openwb-observation="<?= (int)$row['wb'] ?>" aria-live="polite">
+                                <div data-openwb-state></div>
+                                <div data-openwb-mode></div>
+                                <div class="alert alert-warning mt-2 mb-2 py-2" data-openwb-warning hidden></div>
+                                <details class="mt-1"><summary>Ladepriorität und openWB-Details</summary>
+                                    <div data-openwb-details>Ladepriorität unbekannt</div>
+                                </details>
+                            </div>
+                            <?php endif; ?>
                         </div>
                     </div>
                 </div>
@@ -4397,49 +4356,6 @@ if ($hasWb2) {
     if (!$isNativeEnabled):
     ?>
     <div class="row g-4 mb-4">
-        <!-- Direktsteuerung -->
-        <div class="col-12 col-lg-6">
-            <div class="card shadow-sm h-100" style="border-radius: 16px;">
-                <div class="card-body p-3">
-                    <h6 class="card-title text-warning fw-bold mb-3"><i class="fas fa-bolt me-2"></i>Direktsteuerung (Sofort)</h6>
-
-                    <form action="<?= htmlspecialchars($formAction) ?>" method="post">
-                        <?= e3dcCsrfInput() ?>
-                        <div class="mb-3">
-                            <label class="form-label text-muted small fw-bold d-flex justify-content-between mb-1">
-                                <span>Ladedauer (Stunden)</span>
-                                <span id="zweiVal" class="badge <?= trim($zeile) == '99' ? 'bg-primary' : 'bg-secondary' ?> text-white">
-                                    <?= trim($zeile) == '99' ? 'Dauerhaft (99 h)' : htmlspecialchars(trim($zeile)) . ' h' ?>
-                                </span>
-                            </label>
-                            <input type="hidden" name="zwei" id="zweiHidden" value="<?= htmlspecialchars(trim($zeile)) ?>">
-                            <input type="range" class="form-range"
-                                value="<?= trim($zeile) == '99' ? '24' : htmlspecialchars(trim($zeile)) ?>" min="0" max="24" step="1"
-                                oninput="document.getElementById('zweiHidden').value = this.value; document.getElementById('zweiVal').innerText = this.value + ' h'; document.getElementById('zweiVal').className = 'badge bg-secondary text-white';">
-                            <div class="form-text text-muted small">Max (99) Dauerhaft / 0 = Stop/Löschen</div>
-                        </div>
-
-                        <div class="row g-2 mb-3">
-                            <div class="col-6">
-                                <button type="submit" name="quick_action" value="clear_times" class="btn btn-outline-danger w-100 btn-sm py-2 border-2 fw-bold rounded-pill">
-                                    <i class="fas fa-stop"></i> Stop (0)
-                                </button>
-                            </div>
-                            <div class="col-6">
-                                <button type="submit" name="quick_action" value="start_now" class="btn btn-outline-warning w-100 btn-sm py-2 border-2 fw-bold rounded-pill">
-                                    <i class="fas fa-bolt"></i> Max (99)
-                                </button>
-                            </div>
-                        </div>
-
-                        <button type="submit" class="btn btn-outline-warning w-100 rounded-pill fw-bold border-2">
-                            ✓ Ladedauer speichern
-                        </button>
-                    </form>
-                </div>
-            </div>
-        </div>
-
         <!-- Automatik Steuerung -->
         <div class="col-12 col-lg-6">
             <div class="card shadow-sm h-100" style="border-radius: 16px;">
@@ -4992,7 +4908,7 @@ if ($hasWb2) {
     <div class="card shadow-sm mb-4 border-warning" style="border-radius: 16px;">
         <div class="card-body p-3">
             <h6 class="card-title text-warning fw-bold mb-2"><i class="fas fa-user-plus me-2"></i>Unbekanntes Fahrzeug erkannt</h6>
-            <p class="small text-muted mb-3">Die Wallbox liefert eine Fahrzeugkennung, die noch keiner Vorlage zugeordnet ist. Du kannst sie neu anlegen oder mit einem vorhandenen Bluelink-/Cloud-Fahrzeug verknüpfen.</p>
+            <p class="small text-muted mb-3">Die Wallbox liefert eine Fahrzeugkennung, die noch keiner Vorlage zugeordnet ist. Die Fahrzeugkennung neu anlegen oder mit einem vorhandenen Bluelink-/Cloud-Fahrzeug verknüpfen.</p>
             <?php foreach ($unknown_openwb_vehicles as $det): ?>
                 <?php
                     $detWb = (int)($det['wb'] ?? 1);
@@ -5268,7 +5184,7 @@ if ($hasWb2) {
             <div class="card shadow-sm h-100" style="border-radius: 16px;">
                 <div class="card-body p-3">
                     <h6 class="card-title text-info fw-bold mb-3"><i class="fas fa-cloud me-2"></i>Fahrzeug Cloud-Integration (Auto SoC)</h6>
-                    <p class="small text-muted mb-3">Verbinde dein Fahrzeug (Hyundai / Kia Bluelink), um den Echtzeit-Ladezustand (SoC) und Batterie-Infos automatisch abzurufen.</p>
+                    <p class="small text-muted mb-3">Das Fahrzeug (Hyundai / Kia Bluelink) verbinden, um den Echtzeit-Ladezustand (SoC) und Batterie-Infos automatisch abzurufen.</p>
 
                     <form action="<?= htmlspecialchars($formAction) ?>" method="post">
                         <?= e3dcCsrfInput() ?>
@@ -6099,11 +6015,62 @@ function wallboxPlanChanged(data) {
     return false;
 }
 
+function openwbObservationView(data, wb, now = Date.now() / 1000) {
+    const prefix = wb === 2 ? 'wb2_' : 'wb_';
+    const read = key => data[prefix + 'openwb_' + key];
+    const clean = value => typeof value === 'string'
+        ? Array.from(value.replace(/<[^>]*>/g, '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim()).slice(0, 240).join('') : '';
+    const age = value => value !== null && value !== undefined && Number.isFinite(Number(value)) && Number(value) > 0 && now >= Number(value)
+        ? Math.floor(now - Number(value)) : null;
+    const runtimeAge = age(read('status_ts'));
+    const fresh = runtimeAge !== null && runtimeAge < 30;
+    const priority = fresh ? read('bat_mode') : null;
+    const priorities = {ev_mode: 'Fahrzeuge', bat_mode: 'Speicher', min_soc_bat_mode: 'Nach SoC des Speichers'};
+    const primary = fresh && read('extern') === false;
+    const curveMode = ['2', '4'].includes(String(read('control_mode')));
+    let warning = '';
+    if (primary && curveMode) {
+        if (priority === 'ev_mode') {
+            warning = 'Die openWB steht auf Ladepriorität „Fahrzeuge“. Sie rechnet die Leistung, mit der der Hausakku lädt, als Überschuss für das Auto; E3DC-Control kann die Ladekurve des Akkus so nicht halten. Empfehlung: In den Einstellungen der openWB die Ladepriorität „Speicher“ wählen.';
+        } else if (priority === 'min_soc_bat_mode') {
+            warning = 'Die openWB verteilt den Überschuss nach ihren SoC-Schwellen für den Hausakku. Diese Schwellen können von der Ladekurve in E3DC-Control abweichen.';
+        }
+    }
+    const modes = {instant: 'Sofort', instant_charging: 'Sofort', stop: 'Stop', pv: 'PV', pv_charging: 'PV', eco: 'Eco', eco_charging: 'Eco', target: 'Zielladen', scheduled_charging: 'Zielladen'};
+    const reportedMode = fresh ? modes[read('chargemode')] : null;
+    let mode = reportedMode ? 'openWB-Lademodus: ' + reportedMode : 'openWB-Lademodus unbekannt';
+    if (primary && curveMode && ['Sofort', 'Stop'].includes(reportedMode)) {
+        mode += ' – an der openWB gewählt; E3DC-Control steht auf ' + (String(read('control_mode')) === '2' ? 'PV-Kurve ruhig' : 'PV + Akku') + '.';
+    }
+    const stateText = clean(read('state_text'));
+    const stateAge = age(read('state_text_ts'));
+    const state = stateText ? 'openWB: ' + stateText + (stateAge === null ? ' (Alter unbekannt)' : ' (vor ' + stateAge + ' s gelesen)') : '';
+    const details = [priorities[priority] ? 'Ladepriorität: ' + priorities[priority] : 'Ladepriorität unbekannt'];
+    if (fresh && read('software_version')) details.push('Software: ' + clean(read('software_version')));
+    if (fresh && typeof read('switch_off_delay_s') === 'number' && Number.isFinite(read('switch_off_delay_s')) && read('switch_off_delay_s') >= 0) details.push('Abschaltverzögerung: ' + read('switch_off_delay_s') + ' s');
+    const configAge = age(read('bat_mode_ts'));
+    if (fresh && configAge !== null) details.push('Ladepriorität vor ' + configAge + ' s empfangen (gespeicherte MQTT-Konfiguration möglich)');
+    return {state, mode, warning, details: details.join(' · ')};
+}
+
+function updateOpenwbObservation(data) {
+    document.querySelectorAll('[data-openwb-observation]').forEach(card => {
+        const view = openwbObservationView(data, Number(card.dataset.openwbObservation));
+        for (const key of ['state', 'mode', 'warning', 'details']) {
+            const element = card.querySelector('[data-openwb-' + key + ']');
+            if (!element) continue;
+            element.textContent = view[key];
+            if (key === 'warning') element.hidden = view[key] === '';
+        }
+    });
+}
+
 function consumeWallboxLiveData(data, source = 'global') {
     if (!data || typeof data !== 'object') return;
     if (source === 'global') wallboxLastGlobalLiveMs = Date.now();
     if (wallboxPlanChanged(data)) return;
     updateWallboxLiveStatus(data);
+    updateOpenwbObservation(data);
     updateUIFromLiveData(data);
 }
 
@@ -6296,7 +6263,8 @@ function syncWallboxPauseFromLiveData(data) {
         if (!(item.key in data)) return;
         const pending = document.querySelector('[data-wallbox-pause-button][data-wb-id="' + item.wb + '"]:disabled');
         if (pending) return;
-        setWallboxPauseUi(item.wb, wallboxPauseValue(data[item.key]), false);
+        const reasonKey = item.wb === '2' ? 'wb2_state_reason' : 'wb_state_reason';
+        setWallboxPauseUi(item.wb, wallboxPauseValue(data[item.key]), false, data[reasonKey] || '');
     });
 }
 
@@ -6569,7 +6537,7 @@ function updateWbModeHelp(wbIdx) {
     if (observeStorageBox) observeStorageBox.classList.toggle('d-none', String(modeSelect.value) !== '0');
 }
 
-function setWallboxPauseUi(wbIdx, paused, pending = false) {
+function setWallboxPauseUi(wbIdx, paused, pending = false, reason = "") {
     document.querySelectorAll('[data-wallbox-pause-button][data-wb-id="' + wbIdx + '"]').forEach(button => {
         button.dataset.paused = paused ? '1' : '0';
         button.classList.toggle('btn-warning', paused);
@@ -6585,7 +6553,10 @@ function setWallboxPauseUi(wbIdx, paused, pending = false) {
     document.querySelectorAll('.wallbox-simple-card input[name="simple_wb_id"][value="' + wbIdx + '"]').forEach(input => {
         const form = input.closest('.wallbox-simple-card');
         const badge = form ? form.querySelector('[data-wallbox-pause-badge]') : null;
-        if (badge) badge.classList.toggle('d-none', !paused);
+        if (badge) {
+            badge.classList.toggle('d-none', !paused);
+            badge.textContent = reason === 'Stop an der openWB' ? reason : 'Manuell pausiert';
+        }
     });
 }
 

@@ -188,6 +188,8 @@ APACHE_SECURITY_CONF_ENABLED = (
     "/etc/apache2/conf-enabled/e3dc-control-security.conf"
 )
 ROOT_RECOVERY_FILE_CONTRACTS = (
+    ("/usr/local/sbin/e3dc-module-installer", 0o755, 512 * 1024),
+    ("/etc/e3dc-control/module_installer_contract.json", 0o644, 1024 * 1024),
     ("/usr/local/sbin/e3dc-service-control", 0o755, 64 * 1024),
     ("/usr/local/sbin/e3dc-web-update-launcher", 0o755, 64 * 1024),
     (
@@ -259,7 +261,7 @@ MATTER_ONLY_APT_PACKAGES = frozenset({
 })
 APPROVED_PIP_PACKAGES = frozenset({
     "paho-mqtt", "requests", "hyundai_kia_connect_api", "websocket-client",
-    "websockets", "pymodbus", "pywebpush", "pycryptodome",
+    "websockets", "pymodbus", "pyserial", "pywebpush", "pycryptodome",
 })
 MANAGED_VENV_APT_POLICY_KEY = "managed_venv_apt_packages"
 APPROVED_MANAGED_VENV_APT_PACKAGES = frozenset({"python3-venv"})

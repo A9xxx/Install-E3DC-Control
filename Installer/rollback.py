@@ -41,7 +41,7 @@ def git_commit_exists(repo_dir: str, commit_hash: str) -> bool:
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        log_warning("rollback", f"Commit-Pruefung fehlgeschlagen: {exc}")
+        log_warning("rollback", f"Commit-Prüfung fehlgeschlagen: {exc}")
         return False
     return result.returncode == 0 and result.stdout.strip() == "commit"
 
@@ -156,12 +156,12 @@ def _restore_safety_backup(safety_backup: str, state, *, restore_helpers=None) -
 def rollback(backup_dir, *, confirmed: bool = False) -> bool:
     """Restore one verified manifest backup with full safety rollback and hard gates."""
     if os.path.exists("/.dockerenv"):
-        print("[!] Datei-Rollback ist im Container nicht vorgesehen; nutze ein verifiziertes Image-Digest.")
+        print("[!] Datei-Rollback ist im Docker-Container nicht verfügbar. Der Programmstand wird auf dem Docker-Host gewechselt (siehe doc/Rollback.md).")
         return False
     if not confirmed:
         answer = input(f"Backup {os.path.basename(backup_dir)} wirklich wiederherstellen? (ja/nein): ").strip().lower()
         if answer != "ja":
-            print("[i] Rollback abgebrochen.")
+            print(f"[i] Rollback abgebrochen. Gewählte Sicherung: {backup_dir}. Nächster Schritt: Hauptmenü 6 → 2 öffnen.")
             return True
 
     try:
@@ -170,7 +170,7 @@ def rollback(backup_dir, *, confirmed: bool = False) -> bool:
         restore_helpers = _bind_current_restore_helpers()
         state = _capture_transition_state()
     except Exception as exc:
-        print(f"[!] HA-/Shadow-Preflight fehlgeschlagen: {exc}")
+        print(f"[!] HA-/Shadow-Preflight fehlgeschlagen: {exc}. Dienste unverändert; Sicherheits-Backup noch nicht erstellt. Gewählte Sicherung: {backup_dir}. Nächster Schritt: Hauptmenü 2) Systemstatus anzeigen öffnen.")
         return False
 
     print("[->] Erstelle verifiziertes Sicherheits-Backup...")
@@ -185,10 +185,10 @@ def rollback(backup_dir, *, confirmed: bool = False) -> bool:
         safety_backup = None
         rollback_logger.error(f"Sicherheits-Backup fehlgeschlagen: {exc}")
     if not safety_backup:
-        print("[!] Sicherheits-Backup fehlt; Rollback abgebrochen.")
+        print(f"[!] Sicherheits-Backup fehlt; Rollback abgebrochen, Dienste unverändert. Gewählte Sicherung: {backup_dir}. Nächster Schritt: Hauptmenü 6 → 1 für ein verifiziertes Backup öffnen.")
         return False
     if not hard_stop_e3dc():
-        print("[!] Sichere Aktorruhe konnte nicht nachgewiesen werden.")
+        print(f"[!] Sichere Aktorruhe konnte nicht nachgewiesen werden; Dienstzustand ungeklärt. Sicherheits-Backup: {safety_backup}. Nächster Schritt: Hauptmenü 2) Systemstatus anzeigen öffnen.")
         return False
 
     try:
@@ -206,16 +206,16 @@ def rollback(backup_dir, *, confirmed: bool = False) -> bool:
             hard_stop_e3dc()
             raise RuntimeError("Boot-Sanity-Gate fehlgeschlagen")
     except Exception as exc:
-        print(f"[!] Backup-Rollback fehlgeschlagen: {exc}")
+        print(f"[!] Backup-Rollback fehlgeschlagen: {exc}. Sicherheits-Backup: {safety_backup}.")
         rollback_logger.error(f"Backup-Rollback fehlgeschlagen: {exc}")
         if _restore_safety_backup(
             safety_backup,
             state,
             restore_helpers=restore_helpers,
         ):
-            print("[OK] Ausgangszustand aus Sicherheits-Backup wiederhergestellt.")
+            print(f"[OK] Ausgangszustand aus Sicherheits-Backup {safety_backup} wiederhergestellt. Nächster Schritt: Hauptmenü 2) Systemstatus anzeigen öffnen.")
         else:
-            print("[!] Ausgangszustand nicht beweisbar; Writer bleiben gestoppt.")
+            print(f"[!] Ausgangszustand nicht beweisbar; Writer bleiben gestoppt. Sicherheits-Backup: {safety_backup}. Nächster Schritt: Hauptmenü 6 → 2 mit dieser Sicherung öffnen.")
         return False
 
     print("[OK] Verifizierter Backup-Rollback abgeschlossen.")
@@ -232,22 +232,28 @@ def get_last_commits(limit=20):
         mapping = _rollback_release_map(INSTALL_PATH)
     except Exception as exc:
         rollback_logger.error(f"Rollback-Policy konnte nicht gelesen werden: {exc}")
+        print(f"[!] Rückfall-Policy konnte nicht gelesen werden: {exc}")
         return None
-    return [(sha, tag) for tag, sha in mapping.items()] or None
+    return [(sha, tag) for tag, sha in mapping.items()]
 
 
 def choose_commit():
     """Choose a SHA-bound release tag; raw commit selection no longer exists."""
     releases = get_last_commits()
-    if not releases:
-        print("[i] Keine freigegebene Rueckfallversion vorhanden.")
+    if releases is None:
+        print("[!] Rückfall-Policy nicht lesbar; die Freigaben konnten nicht geprüft werden. "
+              "Nächster Schritt: Hauptmenü 6 → 2 für ein verifiziertes Datei-Backup öffnen.")
         return None
-    print("\n=== Freigegebene Stable-Rueckfallversionen ===\n")
+    if not releases:
+        print("[i] Für Bare Metal ist derzeit keine Rückfallversion freigegeben. "
+              "Rückweg: Hauptmenü 6 → 2 (verifiziertes Datei-Backup wiederherstellen).")
+        return None
+    print("\n=== Freigegebene Stable-Rückfallversionen ===\n")
     for index, (sha, tag) in enumerate(releases, start=1):
         print(f"  {index:2d}: {tag} ({sha[:12]})")
-    choice = input("Welche Rueckfallversion installieren? (0=Abbrechen): ").strip()
+    choice = input("Welche Rückfallversion installieren? (0=Abbrechen): ").strip()
     if not choice.isdigit() or int(choice) < 0 or int(choice) > len(releases):
-        print("[!] Ungueltige Auswahl.")
+        print("[!] Ungültige Auswahl.")
         return None
     if int(choice) == 0:
         return None
@@ -269,28 +275,28 @@ def rollback_to_release_tag(tag: str, expected_sha: str | None = None) -> bool:
 def rollback_to_commit(commit_hash: str):
     """Arbitrary commits are forbidden; callers must select a policy release tag."""
     del commit_hash
-    print("[!] Freie Commit-Rollbacks sind deaktiviert; waehle eine freigegebene Stable-Version.")
+    print("[!] Freie Commit-Rollbacks sind deaktiviert; bitte eine freigegebene Stable-Version wählen.")
     return False
 
 
 def rollback_to_commit_hash():
-    print("[!] Freie Commit-Hashes sind deaktiviert; nutze das Stable-Release-Menue.")
+    print("[!] Freie Commit-Hashes sind deaktiviert; bitte das Stable-Release-Menü öffnen.")
     return False
 
 
 def rollback_menu():
     backup_dir = choose_backup_version()
     if backup_dir:
-        rollback(backup_dir)
+        return rollback(backup_dir)
 
 
 def rollback_commit_menu():
     selected = choose_commit()
     if selected:
         tag, sha = selected
-        answer = input(f"Rueckfall auf {tag} ({sha[:12]})? (j/n): ").strip().lower()
+        answer = input(f"Rückfall auf {tag} ({sha[:12]})? (j/n): ").strip().lower()
         if answer == "j":
-            rollback_to_release_tag(tag, sha)
+            return rollback_to_release_tag(tag, sha)
 
 
 if not os.path.exists("/.dockerenv"):

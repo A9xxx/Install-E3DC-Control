@@ -432,6 +432,12 @@ def _persistent_sources(
             allow_live_drift=options.tolerate_replaceable_entries,
         ),
         PersistentSource(
+            "module-installer-launcher",
+            Path("/usr/local/sbin/e3dc-module-installer"),
+            unsafe_entry_policy=replaceable_policy,
+            allow_live_drift=options.tolerate_replaceable_entries,
+        ),
+        PersistentSource(
             "runtime-permissions-launcher",
             Path("/usr/local/sbin/e3dc-runtime-permissions-repair"),
             unsafe_entry_policy=replaceable_policy,
@@ -552,6 +558,7 @@ def _restore_allowlist(install_path=None):
             Path("/usr/local/sbin/e3dc-service-control"),
             Path("/usr/local/sbin/e3dc-web-update-launcher"),
             Path("/usr/local/sbin/e3dc-runtime-permissions-repair"),
+            Path("/usr/local/sbin/e3dc-module-installer"),
             Path("/etc/sudoers.d/020_e3dc_services"),
             APACHE_SECURITY_CONFIG,
             MANAGER_LOCK_TMPFILES_CONFIG,
@@ -1502,8 +1509,8 @@ def restore_backup(backup_path, install_path=None, confirmed=False):
     try:
         verify_backup(backup_path, expected_kind=SYSTEM_BACKUP_KIND)
     except BackupIntegrityError as exc:
-        print(f"[!] Backup ist unvollstaendig oder nicht lesbar: {exc}")
-        backup_logger.error(f"Backup-Integritaetspruefung fehlgeschlagen: {exc}")
+        print(f"[!] Backup ist unvollständig oder nicht lesbar: {exc}")
+        backup_logger.error(f"Backup-Integritätsprüfung fehlgeschlagen: {exc}")
         return False
 
     if not confirmed:
@@ -1539,11 +1546,11 @@ def delete_backup():
         print(f"✗ Ungültiges Backup: {exc}\n")
         return False
 
-    print(f"\n⚠ Willst du wirklich das Backup {os.path.basename(backup_path)} löschen?")
+    print(f"\n⚠ Backup {os.path.basename(backup_path)} wirklich löschen?")
     confirm = input("Ja/Nein [n]: ").strip().lower()
     if confirm != "ja":
-        print("✗ Abgebrochen.\n")
-        return False
+        print("Abgebrochen.\n")
+        return None
 
     try:
         deleted = delete_verified_backup_family(
@@ -1666,16 +1673,16 @@ def backup_menu():
     choice = input("Auswahl: ").strip()
 
     if choice == "1":
-        backup_full()
+        return backup_full()
     elif choice == "2":
         backup_path = choose_backup_version()
         if backup_path:
             from .rollback import rollback
-            rollback(backup_path)
+            return rollback(backup_path)
     elif choice == "3":
-        delete_backup()
+        return delete_backup()
     elif choice == "4":
-        apply_backup_limit()
+        return apply_backup_limit()
     else:
         print("✗ Ungültige Auswahl.\n")
 

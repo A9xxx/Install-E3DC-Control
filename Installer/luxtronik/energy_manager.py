@@ -54,11 +54,15 @@ try:
     from Installer import control_time
     from Installer.heatpump_pv_contract import (
         stiebel_sg_ready_output_contract,
+        heatpump_start_semantics,
+        HEATPUMP_START_SEMANTICS_SG_READY,
         heatpump_start_reservation_duration_s as _heatpump_start_reservation_duration_s,
         heatpump_idle_threshold_w,
         HEATPUMP_SG_READY_START_RESERVATION_S,
         HEATPUMP_DIRECT_START_RESERVATION_S,
         heatpump_pv_config,
+        heatpump_grid_stop,
+        heatpump_ww_pv_takeover,
         qualify_heatpump_pv_demand,
         ww_release_withdrawal_scope_contract,
         ww_circulation_boost_contract,
@@ -101,11 +105,15 @@ except ModuleNotFoundError:
     import control_time
     from heatpump_pv_contract import (
         stiebel_sg_ready_output_contract,
+        heatpump_start_semantics,
+        HEATPUMP_START_SEMANTICS_SG_READY,
         heatpump_start_reservation_duration_s as _heatpump_start_reservation_duration_s,
         heatpump_idle_threshold_w,
         HEATPUMP_SG_READY_START_RESERVATION_S,
         HEATPUMP_DIRECT_START_RESERVATION_S,
         heatpump_pv_config,
+        heatpump_grid_stop,
+        heatpump_ww_pv_takeover,
         qualify_heatpump_pv_demand,
         ww_release_withdrawal_scope_contract,
         ww_circulation_boost_contract,
@@ -5628,6 +5636,74 @@ def luxtronik_pv_boost_active(*, measured, boost_latched, season_hz, season_ww,
     return bool(thermal_hz or thermal_ww)
 
 
+def read_wallbox_grid_hold(now_s, path="/var/www/html/ramdisk/wallbox_native.json", config=None):
+    """Prüft Erzeugerzeit am Lesen; danach bindet die Frische an diesen Bedarf."""
+    result = {"active": False, "sample_ts": None, "eligible": None,
+              "reason": "wallbox_grid_evidence_missing", "ended_owners": []}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            native = json.load(handle)
+        cfg = heatpump_pv_config(config or {})
+        band = 200.0  # Standby-Leistung, unabhängig von der Netzbezugstoleranz.
+        counter = native.get("wb_deficit_counter") or {}
+        stamp = _luxtronik_pv_number(counter.get("sample_ts"))
+        owner = counter.get("owner_wb_id")
+        stage = str(counter.get("stage") or "")
+        pending = stage in ("phase_down_pending", "stop_pending")
+        details = [d for d in native.get("wb_details", []) if isinstance(d, dict)]
+        def fresh_detail(detail):
+            sample = _luxtronik_pv_number(detail.get("driver_status_last_sample_ts"))
+            return bool(sample is not None and 0 <= now_s - sample <= 10.0
+                        and detail.get("driver_status_valid") is True
+                        and not any(detail.get(k) is True for k in (
+                            "driver_status_stale", "driver_status_degraded", "driver_status_glitch")))
+        # Auch wenn das Netzkonto nach dem Stop schon verschwunden ist, enthält
+        # die Statusdatei noch den frischen physischen Abschluss je Ladepunkt.
+        for detail in details:
+            power = _luxtronik_pv_number(detail.get("power_w"))
+            transition = bool((detail.get("phase_transition_reservation") or {}).get("active") is True
+                or any(detail.get(key) is True for key in (
+                    "cp_interrupt_isactive", "phase_switch_in_progress", "phase_switching", "phase_change_active"))
+                or detail.get("phase_transition_active") is True
+                or detail.get("openwb_pro_session_phase_wait_active") is True
+                or detail.get("id") == owner and stage == "phase_down_pending")
+            stopped = bool(detail.get("plug") is False or (
+                detail.get("charging") is False and detail.get("charge_truth") == "not_charging"
+                and power is not None and power <= band and not transition))
+            if fresh_detail(detail) and stopped:
+                result["ended_owners"].append({"owner_wb_id": detail.get("id"),
+                    "sample_ts": detail.get("driver_status_last_sample_ts")})
+        result["sample_ts"] = now_s
+        selected = [d for d in details if d.get("id") == owner]
+        if len(selected) != 1 or stamp is None or not 0 <= now_s - stamp <= 10.0:
+            return result
+        detail = selected[0]
+        power = _luxtronik_pv_number(detail.get("power_w"))
+        excluded = counter.get("excluded_reasons") or {}
+        eligible = bool(counter.get("schema_version") == "wallbox_deficit_counter_display_v1"
+            and counter.get("valid") is True and counter.get("binding_ready") is True
+            and owner in (counter.get("candidate_ids") or [])
+            and not excluded.get(str(owner)) and not excluded.get(owner)
+            and stage in ("three_phase_min_watch", "one_phase_min_watch", "phase_down_pending", "stop_pending"))
+        # Eine kurze fehlende Bindung ist noch kein frischer Ausschluss.
+        explicit_exclusion = bool(excluded.get(str(owner)) or excluded.get(owner)
+            or stage in ("three_phase_current", "one_phase_current"))
+        active = bool(eligible and fresh_detail(detail)
+            and not any(item["owner_wb_id"] == owner for item in result["ended_owners"]) and (
+            pending or counter.get("component") == "grid" and counter.get("accumulating") is True
+            and power is not None and power > band))
+        onset_ready = bool(eligible and fresh_detail(detail) and power is not None and power > band
+            and not any(item["owner_wb_id"] == owner for item in result["ended_owners"]))
+        result.update(active=active, onset_ready=onset_ready, owner_wb_id=owner, stage=stage, power_w=power,
+            source_sample_ts=stamp, used_wh=_luxtronik_pv_number(counter.get("used_wh")),
+            deficit_w=_luxtronik_pv_number(counter.get("deficit_w")),
+            eligible=False if explicit_exclusion else True if eligible else None,
+            reason="Wallbox im Netzhalt" if active else "wallbox_not_in_grid_hold")
+        return result
+    except (OSError, ValueError, TypeError, AttributeError):
+        return result
+
+
 def luxtronik_pv_contract_cycle(ctx, previous, *, clock_sample):
     """Kanalbedarf und Rückmeldung; die Quellen- und Laufzeitbindung besitzt Storage."""
     ctx = ctx if isinstance(ctx, dict) else {}
@@ -5645,6 +5721,10 @@ def luxtronik_pv_contract_cycle(ctx, previous, *, clock_sample):
         "compressor_running": (bool(ctx.get("wp_compressor_running_now"))
                                if fresh and ctx.get("wp_compressor_observation_valid") else None),
         "power_w": heatpump_power_observation(data, status)[0] if fresh else None,
+        "ww_running": bool(fresh and ctx.get("wp_compressor_observation_valid")
+            and ctx.get("wp_compressor_running_now")
+            and _safe_int(data.get("Betriebsart", status.get("Betriebsart")), -1) == 1
+            and not luxtronik_ww_runtime_state(status, data).get("other_domain_evidence")),
         "hz_mode": status.get("SHI_HZ_Mode_Raw") if "SHI_Source_valid" in status else status.get("SHI_HZ_Mode"),
         "hz_target_c": _luxtronik_pv_number(status.get("HZ_Setpoint_Raw") if "SHI_Source_valid" in status else status.get("HZ_Setpoint")),
         "ww_mode": status.get("SHI_WW_Mode_Raw") if "SHI_Source_valid" in status else status.get("SHI_WW_Mode"),
@@ -5808,19 +5888,43 @@ def luxtronik_pv_contract_cycle(ctx, previous, *, clock_sample):
                           if source_valid and grant.get("request_id") == control_identity.get("request_id")
                           and grant.get("revision") == control_identity.get("revision")
                           and grant.get("protection_reason") in HARD_PROTECTIONS else "")
+    # Die Quelle bleibt im Speicher gesperrt. Nur ihre PV-Kanalrücknahme
+    # wartet bei reinem Netzanteil auf die belegte Wallbox-Abschaltung.
+    if (storage_protection == "bridge_source_disabled"
+            and (grant.get("grid_withdrawal_deferred") is True
+                 or grant.get("hold_required") is True and not grant.get("withdrawal_required"))):
+        storage_protection = ""
     output_protection = protection or storage_protection
     # Begründet allein die abgelaufene E3DC-Lücke den Schutz, gilt er nur für
     # den PV-Auftrag; andere Kanäle behalten die Toleranz ihres Besitzers.
     protection_scope = ("e3dc_live_gap" if protection == "invalid_control_data" and fresh
                         and not control_data_invalid and not state.get("intent_quarantined")
                         and not storage_protection else "")
+    if (protection == "invalid_control_data" and not fresh and not e3dc_expired
+            and not control_data_invalid and not state.get("intent_quarantined")
+            and not storage_protection):
+        protection_scope = "luxtronik_observation_gap"
     competing_owner = bool(ctx.get("manual_ww_active") or ctx.get("price_boost_active")
                            or ctx.get("price_heatpump_start_requested")
                            or ctx.get("predump_heatpump_active")
-                           or ctx.get("pre_pause_active") or ctx.get("pv_pause_active")
                            or (ctx.get("manual_boost_command") or {}).get("valid"))
-    pending_pause = bool(ctx.get("price_action") in ("PAUSE", "PAUSE_HIGH_PRICE")
-                         or ctx.get("source_recovery_pause_eligible"))
+    ordinary_pause = bool(ctx.get("pre_pause_active") or ctx.get("pv_pause_active")
+                          or ctx.get("price_action") in ("PAUSE", "PAUSE_HIGH_PRICE"))
+    grid_counted = _luxtronik_pv_number(grant.get("grid_counted_w")) if fresh_control else None
+    if ordinary_pause and command_outstanding and grid_counted is not None and grid_counted > 0:
+        state["pause_grid_stop_request"] = command.get("request_id")
+    pause_grid_stop = bool(command_outstanding and command.get("request_id")
+        and state.get("pause_grid_stop_request") == command.get("request_id"))
+    pv_effect = bool(isinstance(controller, LuxtronikChannelController) and any(
+        ch.get("owner") == "pv" and ch.get("possible_effect")
+        for ch in controller.checkpoint["channels"].values()))
+    pause_waits = bool(ordinary_pause and cfg.get("control_mode") == "measured"
+        and command_outstanding and pv_effect and not pause_grid_stop
+        and not competing_owner and not output_protection
+        and not ctx.get("source_recovery_pause_eligible"))
+    pending_pause = bool(not pause_waits and (ctx.get("pre_pause_active") or ctx.get("pv_pause_active")
+                         or ctx.get("price_action") in ("PAUSE", "PAUSE_HIGH_PRICE")
+                         or ctx.get("source_recovery_pause_eligible")))
     # Der Luxtronik-PV-Pfad erhält seine Freigabe ausschließlich aus der
     # identitätsgebundenen Speicherzusage unten. Ein Preis-Shadow-Gate darf
     # diese bestehende Freigabe weder ersetzen noch zusätzlich sperren.
@@ -5852,7 +5956,13 @@ def luxtronik_pv_contract_cycle(ctx, previous, *, clock_sample):
     # Startbedarf angefordert – die PV-Deckung entscheidet im Storage Manager,
     # den Verdichterstart die Anlage; die Startreservierung ist befristet. Der
     # reservierte Betrieb behält den thermischen Auslöser nach Anlagenhysterese.
-    season_hz = bool(allowed and not summer and outside is not None
+    live = ctx.get("e3dc") if ctx.get("e3dc_valid") and isinstance(ctx.get("e3dc"), dict) else {}
+    takeover = heatpump_ww_pv_takeover(observation,
+        dict(fresh=bool(live), balance_fresh=bool(live), sample_ts=live.get("_ts"),
+             balance_grid_w=live.get("grid"), balance_battery_w=live.get("bat")), now_s=now_s)
+    ww_takeover = bool(cfg.get("control_mode") == "measured" and takeover["eligible"]
+        and not command_outstanding and allowed)
+    season_hz = bool(not ww_takeover and allowed and not summer and outside is not None
                      and heating_limit is not None and baseline is not None)
     season_ww = bool(allowed and not (comfort["active"] and comfort["target_c"] is not None
                                       and ww_target is not None and comfort["target_c"] >= ww_target))
@@ -5870,6 +5980,20 @@ def luxtronik_pv_contract_cycle(ctx, previous, *, clock_sample):
         "hz": {"active": bool(season_hz and boost_active), "target_c": hz_target},
         "ww": {"active": bool(season_ww and boost_active), "target_c": ww_target},
     }
+    command_ww_target = _luxtronik_pv_number((command_channels.get("ww") or {}).get("target_c"))
+    timer_takeover = bool(command_outstanding and comfort["active"]
+        and comfort["target_c"] is not None
+        and (command_channels.get("ww") or {}).get("active")
+        and command_ww_target is not None and comfort["target_c"] >= command_ww_target)
+    if command_outstanding and allowed and command_channels:
+        # Saison und Ziele sind an den laufenden Auftrag gebunden. Änderungen
+        # gelten ab dem nächsten Auftrag; Pendeln um die Heizgrenze entzieht
+        # weder einen PV-gedeckten Verdichterlauf noch das Sollwertangebot.
+        channels = {name: copy.deepcopy(command_channels.get(name) or
+                    {"active": False, "target_c": channels[name]["target_c"]})
+                    for name in ("hz", "ww")}
+        if timer_takeover:
+            channels["ww"]["active"] = False
     thermal_requested = any(channel["active"] for channel in channels.values())
     requested = thermal_requested
     if (command.get("withdrawal_confirmed") and not was_withdrawal_confirmed
@@ -5907,8 +6031,31 @@ def luxtronik_pv_contract_cycle(ctx, previous, *, clock_sample):
                    "confirmed": False, "withdrawal_confirmed": False, "channels": {}}
     elif channels != old_channels and not command_outstanding and not retiring:
         state["revision"] = int(state.get("revision", 0)) + 1
+    # Quell-Erholung ist Optimierung. Ihr Entzug durchläuft die vorhandene
+    # Zeit-/Energiebestätigung; Schutz und Nutzer-Aus bleiben sofort wirksam.
+    withdrawal_class = ("protection" if protection or pv_day_blocked else "owner_change"
+        if competing_owner or timer_takeover else "debounced")
+    debounce = False
+    if measured_boost and command_outstanding and not requested and withdrawal_class == "debounced":
+        anchor = state.get("request_withdrawn_clock") or {}
+        elapsed = clock_sample["monotonic_ts"] - float(anchor.get("monotonic_ts", clock_sample["monotonic_ts"]))
+        if not anchor:
+            state["request_withdrawn_clock"] = copy.deepcopy(clock_sample)
+        debounce = bool(clock_sample.get("valid") and 0 <= elapsed < 45.0
+                        and (not anchor or anchor.get("boot_id") == clock_sample.get("boot_id")))
+    else:
+        state.pop("request_withdrawn_clock", None)
     demand = {
-        "schema": "heatpump_pv_demand_v1", "sample_ts": now_s,
+        "schema": "heatpump_pv_demand_v1",
+        "withdrawal_class": withdrawal_class,
+        "withdrawal_cause": (protection or ("pv_day" if pv_day_blocked else
+            "source_recovery" if ctx.get("source_recovery_pause_eligible") else
+            "manual_ww" if ctx.get("manual_ww_active") else
+            "price_heatpump" if ctx.get("price_boost_active") or ctx.get("price_heatpump_start_requested") else
+            "predump_heatpump" if ctx.get("predump_heatpump_active") else
+            "manual_boost" if (ctx.get("manual_boost_command") or {}).get("valid") else
+            "comfort_ww" if timer_takeover else "")) if not requested else "",
+        "wallbox_grid_hold": copy.deepcopy(ctx.get("wallbox_grid_hold") or {}), "sample_ts": now_s,
         "request_id": state["request_id"], "revision": state.get("revision", 0),
         "requested": requested, "qualified": False, "channels": channels,
         "comfort_ww": comfort, "observation": observation, "command": command,
@@ -5926,14 +6073,21 @@ def luxtronik_pv_contract_cycle(ctx, previous, *, clock_sample):
                     ([] if baseline is not None or summer else ["normal_heating_target_missing"]) +
                     ([] if cfg["valid"] else ["electrical_profile_missing_or_invalid"]),
     }
+    demand["ww_takeover"] = ww_takeover
+    demand["ww_takeover_budget_w"] = takeover["start_budget_w"] if ww_takeover else None
     old_qualification = state.get("qualification") or {}
     if state.get("boot_id") != clock_sample.get("boot_id") or not clock_sample.get("valid"):
         old_qualification = {}
+    release = ctx.get("source_recovery_release") or {}
+    if release.get("active") and not command_outstanding and not pending_pause:
+        old_qualification = {**(release.get("qualification") or {}),
+                             "request_id": demand["request_id"], "revision": demand["revision"]}
     qualification = qualify_heatpump_pv_demand(
         old_qualification,
-        {**demand, "request_w": demand["request_w"] + PV_START_MARGIN_W}
+        {**demand, "request_w": demand["request_w"] + (0.0 if ww_takeover else
+            (_luxtronik_pv_number(grant.get("start_margin_w")) or PV_START_MARGIN_W))}
         if measured_boost and not command_outstanding else demand,
-        grant.get("prospective_capacity_w", 0) if source_valid else 0,
+        (takeover["start_budget_w"] if ww_takeover else grant.get("prospective_capacity_w", 0)) if source_valid else 0,
         now_s=clock_sample["monotonic_ts"], delay_s=cfg["qualification_s"],
     )
     demand["qualified"] = bool(qualification["qualified"] and cfg["valid"] and not protection)
@@ -5941,27 +6095,78 @@ def luxtronik_pv_contract_cycle(ctx, previous, *, clock_sample):
                  and grant.get("request_id") == demand["request_id"]
                  and grant.get("revision") == demand["revision"])
     bound = bool(identity_bound and grant.get("valid") is True)
-    start = bool(bound and grant.get("command_authorized") is True
+    released_pause_pending = bool(release.get("active")
+        and isinstance(controller, LuxtronikChannelController)
+        and any(channel.get("possible_effect") and channel.get("owner") == "price"
+                and str(channel.get("request_id") or "").startswith("price_pause:")
+                for channel in controller.checkpoint["channels"].values()))
+    # Erst die Pausenrücknahme bestätigen; ein neuer PV-Signalhalt darf
+    # den bisherigen Pausenkanal nicht erneut in seiner Haltezeit binden.
+    start = bool(not released_pause_pending and bound and grant.get("command_authorized") is True
                  and demand["qualified"] and not command_outstanding and not output_protection
                  and not e3dc_missing)
-    withdraw = bool(command_outstanding and (output_protection or (identity_bound and grant.get("withdrawal_required"))))
+    # Nur eine vom Energy Manager begründete Rücknahme bleibt klebend.
+    # Ein einzelner Kanalfehler darf den gesamten PV-Auftrag nicht
+    # abschließen und dadurch neue Schreibversuche ermöglichen.
+    withdraw = bool(command_outstanding and (command.get("withdrawal_requested") is True
+        and state.get("first_withdrawal_reason")
+        or output_protection or pause_grid_stop or (identity_bound and grant.get("withdrawal_required"))))
     if withdraw:
         command["withdrawal_requested"] = True
+        if not state.get("first_withdrawal_reason"):
+            state["first_withdrawal_reason"] = (output_protection or (
+                grant.get("first_withdrawal_reason") or grant.get("withdrawal_reason")
+                or grant.get("reason") if identity_bound else "") or "withdrawal_required")
+            state["first_withdrawal_sources"] = (list(grant.get("first_withdrawal_sources")
+                or grant.get("energy_guard_sources") or []) if identity_bound
+                and state["first_withdrawal_reason"] in ("energy_guard_exhausted", "wp_grid_energy_exhausted") else [])
+    if start:
+        state.pop("first_withdrawal_reason", None)
+        state.pop("first_withdrawal_sources", None)
+    # Diagnose ergänzt den bestehenden Historieneintrag, ohne Regelwirkung.
+    demand["pv_energy_diagnostics"] = {
+        key: copy.deepcopy(grant.get(key)) if identity_bound else None
+        for key in ("window_battery_used_wh", "window_grid_used_wh",
+                    "battery_remaining_wh", "grid_remaining_wh",
+                    "measurement_gap_charged", "measurement_gap_battery_wh",
+                    "measurement_gap_grid_wh", "measurement_gap_reason",
+                    "window_grid_measured_wh", "window_grid_unmeasured_wh",
+                    "window_battery_measured_wh", "window_battery_unmeasured_wh",
+                    "grid_counted_w", "grid_measurement_band_w",
+                    "grid_withdrawal_deferred", "grid_withdrawal_defer_reason",
+                    "minimum_runtime_reason", "first_withdrawal_ts",
+                    "first_withdrawal_class", "first_withdrawal_cause", "withdrawal_healed_ts")
+    }
+    gap_event = state.get("measurement_gap_event") or {}
+    if gap_event.get("request_id") != demand["request_id"] or retiring and withdrawal_ack:
+        gap_event = {}
+    if identity_bound and not (retiring and withdrawal_ack) and grant.get("measurement_gap_charged") and not gap_event:
+        gap_event = {"request_id": demand["request_id"],
+                     "reason": grant.get("measurement_gap_reason")}
+    state["measurement_gap_event"] = gap_event
+    demand["pv_energy_diagnostics"]["measurement_gap_event"] = copy.deepcopy(gap_event)
+    demand["first_withdrawal_reason"] = state.get("first_withdrawal_reason", "")
+    demand["first_withdrawal_sources"] = list(state.get("first_withdrawal_sources") or [])
     keep = bool(command_outstanding and not withdraw)
     # Halten ist keine neue Startkante: bei unbekanntem Grant nur den vorhandenen
     # Sollwert unangetastet lassen. Eine externe Rücknahme wird niemals restauriert.
     output = {"start": start, "keep": keep, "withdraw": withdraw,
+              "request_withdrawal_debounced": bool(debounce and keep),
+              "pause_waits_for_pv_end": bool(pause_waits and keep),
+              "pause_requires_stop": pause_grid_stop,
               "bound": bound, "reason": output_protection or grant.get("reason", "grant_missing"),
               "curve_forecast_hold": bool(bound and grant.get("curve_forecast_hold")),
               "curve_forecast": copy.deepcopy(grant.get("curve_forecast")) if bound else None,
               "protection_reason": output_protection,
+              "withdrawal_reason": state.get("first_withdrawal_reason", ""),
+              "withdrawal_sources": list(state.get("first_withdrawal_sources") or []),
               "protection_scope": protection_scope,
               "channels": copy.deepcopy(channels if start else command_channels),
               "command_outstanding": command_outstanding,
               "hold_required": bool(bound and grant.get("hold_required")),
               "competing_owner": bool(ctx.get("manual_ww_active")
                                       or ctx.get("price_boost_active")
-                                      or ctx.get("pre_pause_active") or ctx.get("pv_pause_active")
+                                      or ((ctx.get("pre_pause_active") or ctx.get("pv_pause_active")) and not pause_waits)
                                       or (ctx.get("manual_boost_command") or {}).get("valid"))}
     persisted_command = command
     if retiring and withdrawal_ack:
@@ -5969,6 +6174,34 @@ def luxtronik_pv_contract_cycle(ctx, previous, *, clock_sample):
     state.update({"channels": channels, "requested": requested, "command": persisted_command,
                   "qualification": qualification, "boot_id": clock_sample.get("boot_id")})
     return state, demand, output
+
+
+def luxtronik_pv_withdrawal_text(output):
+    """Ersten belegten Rücknahmegrund allgemeinverständlich protokollieren."""
+    reason = output.get("withdrawal_reason") or output.get("reason") or "withdrawal_required"
+    if reason == "energy_guard_exhausted":
+        names = {"battery": "Akku", "grid": "Netz"}
+        sources = "/".join(names[name] for name in output.get("withdrawal_sources", []) if name in names)
+        text = "Netzkontingent der Wärmepumpe aufgebraucht" if "grid" in output.get("withdrawal_sources", []) else "Wh-Kontingent der Wärmepumpe aufgebraucht"
+    else:
+        text = {
+            "wp_grid_energy_exhausted": "Netzkontingent der Wärmepumpe verbraucht; Mindestlaufzeit schützt den Verdichter",
+            "bms_limit": "Batteriemanagement begrenzt die Stützung",
+            "electrical_profile_exceeded": "Elektrische Leistungsgrenze der Wärmepumpe überschritten",
+            "hard_battery_energy_limit": "Harte Grenze der Akkuenergie erreicht",
+            "hard_grid_energy_limit": "Harte Grenze der Netzenergie erreicht",
+            "bridge_source_disabled": "Benötigte Akku- oder Netzbrücke ausgeschaltet",
+            "pv_unqualified": "PV-Deckung länger als die Überbrückungszeit nicht ausreichend",
+            "request_withdrawn": "Wärmeanforderung beendet",
+            "command_unconfirmed": "Sollwertübernahme nicht bestätigt",
+            "invalid_control_data": "Steuerdaten fehlen oder sind ungültig",
+            "user_off": "Automatik vom Nutzer ausgeschaltet",
+            "heat_source_limit": "Schutz der Wärmequelle aktiv",
+            "hardware_fault": "Geräteschutz aktiv",
+            "emergency_reserve": "Notstromreserve schützt den Speicher",
+            "house_connection_limit": "Hausanschlussgrenze erreicht",
+        }.get(reason, "Rücknahme durch die PV-Regelung")
+    return "PV-Freigabe zurückgezogen: %s (%s)" % (text, reason)
 
 
 def luxtronik_pv_prepare_output(state, demand, output, *, now_s):
@@ -6183,6 +6416,7 @@ def heatpump_budget_request_readiness(ctx):
             source.get("HEIZGRENZE_TEMP", 10.0),
             source.get("CONF_WWS", 50.0),
             source.get("CONF_HZ", 32.0),
+            wp_status=wp_status,
         )
     if not temperature.get("temperature_valid"):
         blockers.append("heatpump_temperature_invalid")
@@ -6656,7 +6890,78 @@ def energy_history_critical_events(record):
     }
     if any(holds.values()):
         events.append({"event": "hold", **holds})
+    pv = heatpump.get("pv_contract") or {}
+    diagnostics = pv.get("pv_energy_diagnostics") or {}
+    gap_event = diagnostics.get("measurement_gap_event") or {}
+    if gap_event or ("measurement_gap_event" not in diagnostics and diagnostics.get("measurement_gap_charged")):
+        events.append({"event": "heatpump_pv_gap_charge",
+                       "request_id": pv.get("request_id"),
+                       "measurement_gap_reason": gap_event.get("reason", diagnostics.get("measurement_gap_reason"))})
+    if pv.get("first_withdrawal_reason"):
+        events.append({"event": "heatpump_pv_withdrawal",
+                       "request_id": pv.get("request_id"),
+                       "reason": pv["first_withdrawal_reason"],
+                       "sources": pv.get("first_withdrawal_sources", [])})
     return events
+
+
+def read_heat_tariff_storage_hold(config, checkpoint, *, now):
+    """Bindet den Tarif-Halt an Eigenauftrag, frischen Speicherzyklus und Rücklesung.
+
+    Ein Aktivflag allein genügt nicht: Kappung und Schreibbremse können die
+    Entladegrenze über den Hausbedarf ohne Wärmepumpe anheben. Dieser Leser
+    verändert weder Speichergrenzen noch Verbraucherbudget.
+    """
+    holds = {}
+    if config.get("heat_tariff_shift_mode") != "active":
+        return holds
+    try:
+        from Heat.tariff_shift import revision, tariff_window
+        with open(os.path.join(os.path.dirname(RAMDISK_FILE), "storage_manager_state.json"), "r", encoding="utf-8") as stream:
+            storage = json.load(stream)
+        grant = storage.get("heat_tariff_shift") or {}
+        limit = storage.get("auto_limit") or {}
+        proof = storage.get("rscp_power_settings") or {}
+        requested = proof.get("requested") or {}
+        readback = proof.get("readback") or {}
+        stamp = _luxtronik_pv_number(grant.get("ts"))
+        published = _luxtronik_pv_number(storage.get("ts"))
+        observed = _luxtronik_pv_number(proof.get("readback_cycle_ts", proof.get("ts")))
+        measured = _luxtronik_pv_number(grant.get("hold_w"))
+        cap = _luxtronik_pv_number(grant.get("discharge_cap_w"))
+        grid = _luxtronik_pv_number(storage.get("grid_w"))
+        battery = _luxtronik_pv_number(storage.get("bat_w"))
+        actual_cap = _luxtronik_pv_number(readback.get("max_discharge_w"))
+        if (storage.get("service") != "storage_manager" or storage.get("mode") != 0
+                or any(ts is None or not 0 <= now - ts <= 10.0 for ts in (stamp, published, observed))
+                or not -1.0 <= published - stamp <= 10.0
+                or grant.get("active") is not True or grant.get("safety_free") is not True
+                or grant.get("safety_veto") is not False
+                or grant.get("reason") != "measured_heatpump_hold"
+                or measured is None or measured <= 0 or cap is None or cap < 0
+                or grid is None or battery is None or actual_cap is None or actual_cap < 0
+                or limit.get("enabled") is not True or limit.get("release") is not False
+                or _luxtronik_pv_number(limit.get("max_discharge_w")) != cap
+                or proof.get("schema") != "rscp_power_settings_v1" or proof.get("confirmed") is not True
+                or requested.get("limits_used") is not True or readback.get("limits_used") is not True
+                or _luxtronik_pv_number(requested.get("max_discharge_w")) != cap
+                or cap > max(0.0, grid - battery - measured)
+                or actual_cap > max(0.0, grid - battery - measured)):
+            return holds
+        window = tariff_window(config, now)
+        if not window.get("valid"):
+            return holds
+        for name, state in (checkpoint.get("channels") or {}).items():
+            if name not in ("hz", "ww") or state.get("owner") != "tariff" or state.get("possible_effect") is not True:
+                continue
+            identity = revision({"request_id": state.get("request_id"), "target": name,
+                                 "target_c": state.get("target_c"), "window": window})
+            if grant.get("intent_revision") == identity:
+                holds[name] = {"request_id": state["request_id"], "revision": state["revision"],
+                               "ts": stamp, "hold_w": measured, "discharge_cap_w": cap}
+    except (OSError, ValueError, TypeError, AttributeError, ImportError):
+        return {}
+    return holds
 
 
 def run_heat_tariff_cycle(config, ctx, checkpoint, runtime, *, now):
@@ -6667,7 +6972,18 @@ def run_heat_tariff_cycle(config, ctx, checkpoint, runtime, *, now):
         if runtime is None:
             from Heat.tariff_runtime import TariffShiftRuntime
             runtime = TariffShiftRuntime()
-        return runtime, runtime.cycle(ctx, checkpoint, now=now)
+        decision = runtime.cycle(ctx, checkpoint, now=now)
+        owned = [(name, state) for name, state in (checkpoint.get("channels") or {}).items()
+                 if state.get("owner") == "tariff" and state.get("possible_effect") is True]
+        if len(owned) == 1 and decision.get("active") is True and decision.get("commands_allowed") is not True:
+            # Der Startwunsch endet sofort. Während der Rücknahme bleibt der
+            # tatsächlich gehaltene Auftrag für den Speicher identifizierbar.
+            from Heat.tariff_shift import revision
+            name, state = owned[0]
+            decision.update(request_id=state["request_id"], target=name, target_c=state["target_c"])
+            decision["intent_revision"] = revision({key: decision[key]
+                for key in ("request_id", "target", "target_c", "window")})
+        return runtime, decision
     except Exception:  # Der optionale Pfad darf die normale Wärmeversorgung nicht abbrechen.
         return None, {"schema": "heat_tariff_shift_v1", "mode": "off", "ts": now,
                       "would_start": False, "commands_allowed": False, "active": False,
@@ -6738,9 +7054,16 @@ def write_energy_decision_history(record, config):
     except Exception as exc:
         logger.debug("Energy-Decision History konnte nicht geschrieben werden: %s", exc)
 
-def heatpump_boost_targets_reached(wp_data, at_mittel, heizgrenze_temp, conf_wws, conf_www, conf_hz):
-    """Return True only when the active boost target is clearly satisfied."""
+def heatpump_boost_targets_reached(wp_data, at_mittel, heizgrenze_temp, conf_wws, conf_www, conf_hz,
+                                   *, config=None, wp_status=None):
+    """Meldet das Zielende anhand der gültigen Temperaturkanäle."""
     data = wp_data or {}
+    if heatpump_start_semantics(config) == HEATPUMP_START_SEMANTICS_SG_READY:
+        temperatures = _heatpump_sg_ready_temperatures(data, wp_status)
+        targets = {"ww": _safe_float(conf_www, 48.0), "hz": _safe_float(conf_hz, 32.0)}
+        return bool(temperatures) and all(
+            value >= targets[channel] - 0.2 for channel, value in temperatures.items()
+        )
     if _safe_float(at_mittel, 20.0) > _safe_float(heizgrenze_temp, 10.0):
         ww_target = _safe_float(conf_wws, 50.0)
         ww_ist = data.get("Warmwasser_Ist", data.get("Warmwasser-Ist"))
@@ -7691,6 +8014,29 @@ def heatpump_budget_withdrawal_readback(ctx, now_ts=None):
     }
 
 
+def heatpump_season_diagnostic(ctx):
+    """Veröffentlicht die Saisonwerte der Regelung, ohne deren Entscheidung zu ändern."""
+    data = ctx.get("wp_data") if isinstance(ctx.get("wp_data"), dict) else {}
+    config = ctx.get("current_config") if isinstance(ctx.get("current_config"), dict) else {}
+    outside = _luxtronik_pv_number(ctx.get("at_mittel"))
+    limit = _luxtronik_pv_number(ctx.get("HEIZGRENZE_TEMP"))
+    mean = _luxtronik_pv_number(data.get("Aussentemp_Mittel"))
+    measured = mean if mean is not None else _luxtronik_pv_number(data.get("Aussentemp"))
+    valid = bool(
+        ctx.get("wp_live_fresh") and outside is not None and measured is not None
+        and outside == measured and limit is not None
+        and _luxtronik_pv_number(config.get("heizgrenze_temp")) is not None
+    )
+    return {
+        "season": ("summer" if outside > limit else "winter") if valid else None,
+        "season_at_mittel_c": outside if valid else None,
+        "season_heating_limit_c": limit if valid else None,
+        "season_valid": valid,
+        "season_temperature_source": ("mittel" if mean is not None else "momentan") if valid else None,
+        "season_reason": None if valid else "temperature_or_heating_limit_missing_or_stale",
+    }
+
+
 def build_energy_decision_record(ctx):
     """Build one Energy-R5 record with safe defaults for missing heat pumps."""
     ctx = ctx or {}
@@ -7842,6 +8188,7 @@ def build_energy_decision_record(ctx):
             "source_recovery_pause_blocks_boost": bool(source_recovery_pause_blocks_boost),
             "source_recovery_heat_budget_override": bool(source_recovery_heat_budget_override),
             "source_recovery_release_reason": ctx.get("source_recovery_release_reason", ""),
+            "source_recovery_release": copy.deepcopy(ctx.get("source_recovery_release") or {}),
             "source_recovery_history_allowed": bool(ctx.get("source_recovery_history_allowed", False)),
             "source_recovery_history_reason": ctx.get("source_recovery_history_reason", ""),
             "source_recovery_compressor_off_before_s": ctx.get("source_recovery_compressor_off_before_s"),
@@ -7959,6 +8306,7 @@ def build_energy_decision_record(ctx):
             ),
             "at_c": _safe_float(ctx.get("at", 0.0), 0.0),
             "at_mittel_c": _safe_float(ctx.get("at_mittel", ctx.get("at", 0.0)), 0.0),
+            **heatpump_season_diagnostic(ctx),
             "wq_aus_c": _safe_float(ctx.get("wq_aus", 0.0), 0.0),
             "hz_mode": wp_status.get("HZ_Mode"),
             "ww_mode": wp_status.get("WW_Mode"),
@@ -8181,6 +8529,107 @@ def source_recovery_pause_latch(heatpump_pause_request, pause_active, context, c
         "context": next_context,
     }
 
+def source_recovery_pv_release_state(ctx, previous, *, clock_sample):
+    """Qualifiziert die Quellenfreigabe am vorhandenen, gemessenen PV-Vertrag.
+
+    Die Startleistung steckt bereits im Vertragsrahmen. Eine laufende WP
+    wird deshalb hier weder nochmals abgezogen noch nochmals hinzugezählt.
+    Die Episode hält die Freigabe, solange ihre Deckung unverändert gilt.
+    """
+    previous = previous if isinstance(previous, dict) else {}
+    def payload(value):
+        return value if isinstance(value, dict) else {}
+    request = payload(ctx.get("heatpump_pause_request"))
+    budget = payload(ctx.get("wb_budget_data"))
+    grant = payload(budget.get("heatpump_pv_contract"))
+    forecast = payload(grant.get("curve_forecast"))
+    cfg = heatpump_pv_config(ctx.get("current_config") or {})
+    now_s = clock_sample["wall_ts"]
+    source, projection = select_storage_primary_budget(budget, now_ts=now_s)
+    stamp = _luxtronik_pv_number(grant.get("sample_ts"))
+    status = ctx.get("wp_status") or {}
+    source_ts = _luxtronik_pv_number(status.get("source_ts"))
+    edge = request.get("forecast_edge_id")
+    edge = edge if isinstance(edge, str) and edge else None
+    owner = getattr(ctx.get("heat_policy_decision"), "owner", None)
+    target = getattr(ctx.get("heat_policy_decision"), "target_state", None)
+    source_temp = _luxtronik_pv_number(ctx.get("wq_aus"))
+    source_limit = _luxtronik_pv_number(ctx.get("WQ_MIN_TEMP"))
+    tariff_planned = False
+    config = payload(ctx.get("current_config"))
+    if config.get("heat_tariff_shift_mode") == "active":
+        try:
+            try:
+                from Heat.tariff_shift import tariff_window
+            except ImportError:
+                from Installer.Heat.tariff_shift import tariff_window
+            tariff_planned = tariff_window(config, now_s).get("valid") is True
+        except (ImportError, TypeError, ValueError):
+            tariff_planned = True
+    recovery_pause = bool(ctx.get("pv_pause_active")
+                          and ctx.get("pv_pause_owner") == "source_recovery_heatpump")
+    checkpoint = payload(getattr(ctx.get("heatpump_channel_controller"), "checkpoint", None))
+    price_channels = [channel for channel in payload(checkpoint.get("channels")).values()
+                      if isinstance(channel, dict) and channel.get("possible_effect")
+                      and channel.get("owner") in ("price", "predump")]
+    recovery_pause = bool(recovery_pause or (previous.get("active") and price_channels
+        and all(str(channel.get("request_id") or "").startswith("price_pause:")
+                for channel in price_channels)))
+    # Auch der Pausenkanal hat den technischen Besitzer „price“. Das ist
+    # noch kein geplantes Wärmefenster.
+    planned = bool((ctx.get("price_boost_active") and not recovery_pause)
+        or ctx.get("price_heatpump_start_requested")
+        or ctx.get("heat_price_boost_candidate_requested") or ctx.get("predump_heatpump_active")
+        or payload(ctx.get("market_heatpump_release")).get("allowed") is True
+        or ctx.get("manual_ww_active") or ctx.get("manual_ww_requested_before_io")
+        or (ctx.get("manual_ww_sofort_state") or {}).get("active")
+        or (ctx.get("manual_boost_command") or {}).get("valid")
+        or target in (heat_policy.TARGET_BOOST, heat_policy.TARGET_PRE_DUMP)
+        or tariff_planned or payload(ctx.get("heat_tariff_shift")).get("active"))
+    protected = bool(ctx.get("AUTO_MODE") != 1 or ctx.get("heatpump_emergency_veto")
+        or (source_temp is not None and source_limit is not None and source_temp < source_limit)
+        or owner in ("source_protection", "hardware_protection")
+        or grant.get("protection_reason")
+        or any(reason in ("manual_user_off", "manual_source_temperature_stop",
+                          "pre_control_independent_safety_stop")
+               for reason in (ctx.get("heatpump_positive_output_block_reasons") or [])))
+    valid = bool(cfg.get("valid") and cfg.get("control_mode") == "measured"
+        and grant.get("control_mode") == "measured"
+        and projection is not None and source.get("accepted") is True
+        and grant.get("schema") == "heatpump_pv_contract_v1" and grant.get("valid") is True
+        and stamp is not None and 0 <= now_s - stamp <= 45
+        and ctx.get("e3dc_valid") and status.get("valid") is True
+        and status.get("source_fresh") is True and source_ts is not None
+        and 0 <= now_s - source_ts <= 45 and clock_sample.get("valid") is True)
+    forecast_covers = bool(forecast.get("valid") is True and forecast.get("covers") is True)
+    capacity = _luxtronik_pv_number(grant.get("prospective_capacity_w"))
+    start = _luxtronik_pv_number(cfg.get("start_power_w"))
+    margin = _luxtronik_pv_number(grant.get("start_margin_w"))
+    required = start + margin if start is not None and margin is not None and margin >= 0 else None
+    surplus_covers = bool(capacity is not None and required is not None and required > 0
+                          and capacity >= required)
+    covered = bool(valid and forecast_covers and surplus_covers and not planned and not protected
+        and edge and request.get("owner") == "source_recovery_heatpump"
+        and request.get("active") is True
+        and _safe_float(request.get("expires_ts"), 0.0) >= now_s - 5)
+    old_qualification = previous.get("qualification") or {}
+    if previous.get("boot_id") != clock_sample.get("boot_id"):
+        old_qualification = {}
+    # Prognosehöhe und verschobener Spitzenzeitpunkt sind Messwerte, keine
+    # neue Bedarfskante. Nur durchgängige gültige Deckung verdient Startzeit.
+    qualification = qualify_heatpump_pv_demand(old_qualification,
+        {"request_id": "source_recovery_heatpump", "revision": 0, "requested": covered, "request_w": required},
+        capacity, now_s=clock_sample["monotonic_ts"], delay_s=cfg["qualification_s"])
+    same_episode = bool(covered and previous.get("active") is True
+                        and previous.get("boot_id") == clock_sample.get("boot_id"))
+    eligible = bool(covered and (qualification["qualified"] or same_episode))
+    return {"active": False, "eligible": eligible, "forecast_edge_id": edge,
+            "reason": "PV-Überschuss wird als Wärme genutzt" if eligible else "",
+            "qualification": qualification, "boot_id": clock_sample.get("boot_id"),
+            "forecast_covers": forecast_covers, "surplus_covers": surplus_covers,
+            "contract_valid": valid, "planned_window": planned, "protected": protected}
+
+
 def source_recovery_heat_override_state(
     *,
     source_recovery_pause_allowed,
@@ -8193,6 +8642,7 @@ def source_recovery_heat_override_state(
     heat_policy_decision=None,
     ww_cycle_started_ts=0.0,
     manual_ww_sofort_active=False,
+    measured_pv_release=False,
     now_ts=None,
 ):
     """Entscheidet, ob nutzbares Wärmebudget eine Quellen-Erholungspause beendet.
@@ -8242,6 +8692,9 @@ def source_recovery_heat_override_state(
         elif policy_pv_budget:
             override = True
             release_reason = "PV-Wärmebudget ist durch die Heat Policy freigegeben"
+        elif measured_pv_release and owner not in ("source_protection", "hardware_protection"):
+            override = True
+            release_reason = "PV-Überschuss wird als Wärme genutzt"
         elif heat_policy_decision is None and budget_ready:
             override = True
             release_reason = "PV-Wärmebudget ist vor Policy-Bewertung verfügbar"
@@ -8276,7 +8729,7 @@ def release_heatpump_pause(wp, wp_type, pause_owner, ww_temp):
         return False
     if pause_owner == "source_recovery_heatpump" and _safe_int(wp_type, -1) == 0:
         return bool(request_heatpump_channel(wp, "hz", 0, None, owner="price"))
-    return bool(request_heatpump_boost(wp, 0, None, 0, ww_temp, owner="price"))
+    return bool(request_heatpump_boost(wp, 0, None, 0, ww_temp, owner="price", purpose="price_pause"))
 
 def _heat_config_value(config, keys, default=None):
     for key in keys:
@@ -8285,8 +8738,46 @@ def _heat_config_value(config, keys, default=None):
             return value
     return default
 
-def _heat_policy_temperature_context(config, wp_data, at_mittel, heizgrenze_temp, conf_wws, conf_hz):
+def _heatpump_sg_ready_temperatures(wp_data, wp_status):
+    """Nur frische, endliche Isttemperaturen; ein fehlender Kanal zählt nicht."""
+    status = wp_status if isinstance(wp_status, dict) else {}
+    fresh = heatpump_native_source_freshness(status.get("source_ts"))
+    if (status.get("valid") is not True or status.get("source_fresh") is not True
+            or fresh["source_fresh"] is not True):
+        return {}
     data = wp_data if isinstance(wp_data, dict) else {}
+    values = {
+        "ww": data.get("Warmwasser_Ist", data.get("Warmwasser-Ist")),
+        "hz": data.get("Ruecklauf_Ist", data.get("Rücklauf", data.get("Ruecklauf"))),
+    }
+    return {channel: float(value) for channel, value in values.items()
+            if not isinstance(value, bool) and isinstance(value, (int, float))
+            and math.isfinite(float(value))}
+
+
+def _heat_policy_temperature_context(config, wp_data, at_mittel, heizgrenze_temp, conf_wws, conf_hz,
+                                     *, wp_status=None):
+    data = wp_data if isinstance(wp_data, dict) else {}
+    if heatpump_start_semantics(config) == HEATPUMP_START_SEMANTICS_SG_READY:
+        temperatures = _heatpump_sg_ready_temperatures(data, wp_status)
+        channels = []
+        for channel, actual in temperatures.items():
+            target = conf_wws if channel == "ww" else conf_hz
+            channels.append({
+                "temperature_valid": True,
+                "temperature_c": actual,
+                "temperature_min_c": _safe_float(_heat_config_value(
+                    config, ("heat_policy_" + channel + "_min_c",), target), target),
+                "temperature_max_c": _safe_float(_heat_config_value(
+                    config, ("heat_policy_" + channel + "_max_c",), target + 3.0), target + 3.0),
+            })
+        # Der größte Abstand unter dem Maximum bildet den Bedarf aus WW ODER HZ
+        # im bestehenden einkanaligen Policy-Vertrag ab, unabhängig von der Saison.
+        return min(channels, key=lambda c: c["temperature_c"] - c["temperature_max_c"]) if channels else {
+            "temperature_valid": False, "temperature_c": None,
+            "temperature_min_c": None, "temperature_max_c": None,
+            "temperature_reason": "missing_or_stale_temperatures",
+        }
     summer_mode = _safe_float(at_mittel, 20.0) > _safe_float(heizgrenze_temp, 10.0)
     if summer_mode:
         raw_temp = data.get("Warmwasser_Ist", data.get("Warmwasser-Ist"))
@@ -9361,7 +9852,8 @@ def build_heatpump_policy_decision(
 ):
     """Translate Energy-Manager state into the central heat policy contract."""
 
-    temp_ctx = _heat_policy_temperature_context(config, wp_data, at_mittel, heizgrenze_temp, conf_wws, conf_hz)
+    temp_ctx = _heat_policy_temperature_context(config, wp_data, at_mittel, heizgrenze_temp, conf_wws, conf_hz,
+                                                wp_status=wp_status)
     if forecast_result is None:
         forecast_result = heat_forecast.predict_wp_energy_need_kwh(
             forecast_temp_c=_safe_float(at_mittel, 8.0),
@@ -9632,6 +10124,10 @@ def cleanup_legacy_energy_state_file(path=LEGACY_ENERGY_STATE_FILE):
 
 
 ENERGY_RESTART_CHECKPOINT_KEYS = (
+    "wp_compressor_observation_valid",
+    "wp_compressor_running",
+    "wp_compressor_last_start_ts",
+    "wp_compressor_last_stop_ts",
     "heatpump_pv_state",
     "heatpump_pv_transition",
     "daily_boost_counter",
@@ -9665,7 +10161,12 @@ ENERGY_RESTART_CHECKPOINT_KEYS = (
     "heat_price_block_started_ts",
     "heat_policy_boost_delivered_kwh",
 )
+# Beobachtungsgültigkeit und momentaner Laufwert bleiben im Payload
+# und im erzwungenen Neustartcheckpoint. Nur die gemessenen Start-/Stoppanker
+# erzeugen eine Laufwechselkante; Messlücken allein schreiben nicht erneut.
 ENERGY_RESTART_SEMANTIC_KEYS = (
+    "wp_compressor_last_start_ts",
+    "wp_compressor_last_stop_ts",
     "heatpump_pv_transition",
     "daily_boost_counter",
     "last_notstrom_status",
@@ -10655,6 +11156,7 @@ def main():
     pv_pause_start_time = None
     pv_pause_owner = "none"
     source_recovery_pause_context = {}
+    source_recovery_release = {}
     pre_pause_active = False
     deficit_start_time = None
     last_day = datetime.now().day
@@ -10688,6 +11190,8 @@ def main():
     manual_ww_write_failures = 0
     manual_ww_sofort_interrupt_logged = ""
     wp_compressor_was_running = None
+    wp_compressor_restored_start_ts = 0.0
+    wp_compressor_restored_until_ts = 0.0
     wp_compressor_running_now = False
     wp_compressor_observation_valid = False
     wp_compressor_last_start_ts = 0.0
@@ -10821,6 +11325,7 @@ def main():
     heatpump_pv_contract = {}
     heatpump_pv_output = {}
     heatpump_pv_last_signal_release = None
+    heatpump_grid_stop_state = {}
     restored_state_source = ""
     if previous_state:
         try:
@@ -10832,6 +11337,18 @@ def main():
             last_pv_boost_time = saved.get('last_pv_boost_time', 0)
             last_wp_command_time = _safe_float(saved.get('last_wp_command_time', last_wp_command_time), last_wp_command_time)
             wp_last_pv_boost_start_ts = saved.get('wp_last_pv_boost_start_ts', 0.0)
+            saved_run_start = _luxtronik_pv_number(saved.get("wp_compressor_last_start_ts"))
+            saved_run_stop = _luxtronik_pv_number(saved.get("wp_compressor_last_stop_ts"))
+            if (saved.get("wp_compressor_observation_valid") is True
+                    and saved.get("wp_compressor_running") is True
+                    and 0 <= previous_state.get("age_s", 999999) <= 45.0
+                    and saved_run_start is not None and 0 < saved_run_start <= time.time()
+                    and (saved_run_stop is None or saved_run_stop < saved_run_start)):
+                # Das Ausschalten der Automatik startet diesen Dienst neu.
+                # Der nächste frische Gerätestatus muss den Lauf bestätigen;
+                # erst dann gilt der erhaltene Anker für die Restlaufzeit.
+                wp_compressor_restored_start_ts = saved_run_start
+                wp_compressor_restored_until_ts = time.time() + max(0.0, 45.0 - previous_state.get("age_s", 999999))
             # Bis zum ersten selbst gemessenen Stillstand zählt die Sperre ab dem
             # spätesten bekannten Zeitpunkt aus Rücknahme-Quittung und gespeichertem
             # Stillstand (lief der Verdichter beim Speichern: ab Speicherzeitpunkt).
@@ -11076,7 +11593,11 @@ def main():
         heat_policy_runtime_enabled = False
         manual_ww_active = False
         ww_timer_window_active = False
+        # Fehlende WP-Daten eröffnen weder Warmwasser- noch Kühlfreigaben.
+        is_ww_timer_running = False
         ww_timer_target_c = None
+        cooling_boost_allowed = False
+        cooling_boost_mode = 0
         heatpump_budget_demand_class = "none"
         heatpump_budget_demand_target_c = None
         heatpump_positive_output_blocked_this_cycle = False
@@ -11189,6 +11710,9 @@ def main():
             heatpump_start_reservation_max_s = heatpump_start_reservation_duration_s(
                 wp_type, shelly_sg_ip, sg_ready_output=isinstance(wp, StiebelIsgSgReady),
                 config=current_config,
+            )
+            sg_ready_temperature_control = (
+                heatpump_start_semantics(current_config) == HEATPUMP_START_SEMANTICS_SG_READY
             )
             STOP_DELAY_MINUTES = get_cfg_int(current_config, 'stop_delay_minutes', 10)
             WP_MIN_RUNTIME_MIN = get_cfg_value(current_config, 'wp_min_runtime_min', 30.0)
@@ -11805,11 +12329,12 @@ def main():
                         )
 
                     wp_compressor_observation_valid = bool(
-                        wp_data.get('Status_Waermepumpe_Bitmask') is not None
+                        (wp_status.get('physical_valid') is True
+                         and wp_data.get('Status_Waermepumpe_Bitmask') is not None)
                         or (
                             wp_live_fresh
                             and any(
-                                key in wp_data
+                                wp_data.get(key) is not None
                                 for key in ('Verdichter_Ein', 'Verdichter', 'Verdichter 1', 'Leistung_Verdichter_W')
                             )
                         )
@@ -11818,7 +12343,11 @@ def main():
                         wp_compressor_running_now = heatpump_compressor_running(wp_data, wp_status)
                         compressor_transition_ts = time.time()
                         if wp_compressor_running_now and wp_compressor_was_running is not True:
-                            wp_compressor_last_start_ts = compressor_transition_ts
+                            wp_compressor_last_start_ts = (
+                                wp_compressor_restored_start_ts
+                                if wp_compressor_restored_start_ts > 0
+                                and compressor_transition_ts <= wp_compressor_restored_until_ts
+                                else compressor_transition_ts)
                         elif not wp_compressor_running_now and wp_compressor_was_running is True:
                             wp_compressor_last_stop_ts = compressor_transition_ts
                             wp_compressor_last_run_s = max(
@@ -11826,6 +12355,10 @@ def main():
                                 compressor_transition_ts - wp_compressor_last_start_ts,
                             )
                             wp_compressor_history_valid = wp_compressor_last_start_ts > 0.0
+                        # Erst der frische Status bestätigt den übernommenen Lauf.
+                        # Ein beim Neustart gestoppter Verdichter erzeugt keinen
+                        # erfundenen neuen Stoppzeitpunkt.
+                        wp_compressor_restored_start_ts = 0.0
                         wp_compressor_was_running = wp_compressor_running_now
                         if (
                             wp_compressor_running_now
@@ -13367,6 +13900,19 @@ def main():
                         )
             # --- Ende Fahrzeug & SoC management ---
             luxtronik_pv_direct = bool(wp_type == 0 and isinstance(wp, SafeLuxtronik))
+            wallbox_grid_hold = read_wallbox_grid_hold(time.time(), config=current_config) if luxtronik_pv_direct else {}
+
+            _grid_live = e3dc if e3dc_valid and isinstance(e3dc, dict) else {}
+            heatpump_grid_stop_state = heatpump_grid_stop(
+                heatpump_grid_stop_state,
+                dict(fresh=wp_status.get("valid") is True and wp_status.get("source_fresh") is True,
+                     sample_ts=wp_status.get("source_ts"),
+                     power_w=heatpump_power_observation(wp_data, wp_status)[0]),
+                dict(fresh=e3dc_valid, sample_ts=_grid_live.get("_ts"),
+                     grid_w=_grid_live.get("grid"),
+                     **{key: _grid_live.get(key) for key in ("grid_p1", "grid_p2", "grid_p3")}),
+                clock_sample=control_time.sample(), config=current_config)
+            heatpump_grid_safety_stop = heatpump_grid_stop_state["stop"]
 
             if (
                 (
@@ -13375,20 +13921,21 @@ def main():
                     and _safe_float(soc, 0.0)
                     < max(5.0, _safe_float(MIN_SOC, 80.0) - 5.0)
                 )
-                or _safe_float(grid, 0.0) > 2500.0
+                or heatpump_grid_safety_stop
             ):
                 heatpump_positive_output_blocked_this_cycle = True
                 heatpump_positive_output_block_reasons.append(
                     "pre_control_independent_safety_stop"
                 )
-            # Notstrom-/Inselbetrieb und Notstromreserve: Der PV- und Preis-Boost sind
-            # über das zentrale Budget gebunden, das der Storage Manager dann sperrt.
-            # Die Nutzerbefehle ohne Budget (manueller Direkt-Boost, Warmwasser
-            # sofort) prüfen denselben Zustand: kein Start und kein Halten.
+            # Inselbetrieb beendet auch einen bereits laufenden PV-Kanal.
+            # An der Notstromreserve sperrt der Speicher die Entladung;
+            # der PV-Verdichter behält seine Mindestlaufzeit aus dem Netz.
             heatpump_user_boost_emergency_veto = heatpump_emergency_power_veto(
                 storage_state_name if budget_is_fresh else "",
                 e3dc.get("notstrom_status") if e3dc_valid and isinstance(e3dc, dict) else None,
             )
+
+            heatpump_emergency_veto = heatpump_user_boost_emergency_veto
 
             # Manueller Boost Check: vor dem ersten SHI-Connect gebunden.
             if not (manual_boost_command.get("valid") and manual_boost_command.get("action") == "on"):
@@ -13642,6 +14189,8 @@ def main():
                             elif (time.time() - last_wp_command_time) > 30:
                                 if manual_direct_gap_action == "hold":
                                     manual_boost_args = tuple(manual_direct_boost["args"])
+                                elif sg_ready_temperature_control:
+                                    manual_boost_args = (1, CONF_HZ, 1, CONF_WWW)
                                 elif at_mittel > HEIZGRENZE_TEMP:
                                     if wp_type == 1:
                                         manual_boost_args = (
@@ -13674,6 +14223,27 @@ def main():
                                 wp.keep_alive(force_open=True)
                 except Exception as e: logger.error(f"Fehler Manual-Boost: {e}")
 
+            # Marktfenster vor der Quellenentscheidung frisch aus dem bestehenden Vertrag lesen.
+            market_heatpump_release = market_plan_allows("heatpump", current_config)
+            previous_source_recovery_release = source_recovery_release
+            source_recovery_release_failed = False
+            try:
+                source_recovery_release = source_recovery_pv_release_state(
+                    locals(), previous_source_recovery_release, clock_sample=control_time.sample())
+            except Exception:
+                # Ein fehlerhafter Entscheider gibt in diesem Zyklus keinen neuen Befehl frei.
+                wp_write_allowed = False
+                source_recovery_release_failed = True
+                source_recovery_release = {"active": False, "eligible": False,
+                    "reason": "PV-Quellenfreigabe fehlgeschlagen", "forecast_edge_id": None,
+                    "qualification": {}, "contract_valid": False}
+                logger.exception("PV-Quellenfreigabe fehlgeschlagen; Gerätebefehle in diesem Zyklus gesperrt")
+            if source_recovery_release["eligible"] and previous_source_recovery_release.get("active"):
+                price_boost_active = False  # Die freigegebene Quell-Pause ist kein Preisboost.
+            if previous_source_recovery_release.get("active") and not source_recovery_release["eligible"]:
+                pv_pause_blocked_until = max(pv_pause_blocked_until, time.time() +
+                    source_recovery_release_cooldown_s(heatpump_pause_request, PV_BOOST_DELAY))
+
             # Beobachtung und Nutzer-Aus werden auch außerhalb des Automatik-
             # Zweigs veröffentlicht. Der früh gebundene Auftrag schützt vor
             # konkurrierenden alten Pause-/Preis-Ausgängen desselben Zyklus.
@@ -13691,8 +14261,8 @@ def main():
 
             # --- HAUPT REGELUNG (Wärmepumpe) ---
             if not os.path.exists(FLAG_FILE) and AUTO_MODE == 0 and boost_active and wp:
-                # PV-Automatik wurde ausgeschaltet, aber ein Boost ist noch aktiv -> Hart beenden!
-                # Wir ignorieren hier wp_write_allowed, da ein globaler Ausschaltbefehl sofort wirken muss.
+                # Die Automatik endet sofort. Der Luxtronik-Kanalautomat
+                # schützt die verbleibende Laufzeit des laufenden Verdichters.
                 logger.info("PV-Automatik deaktiviert: Beende aktiven PV-Boost.")
                 heatpump_positive_output_blocked_this_cycle = True
                 heatpump_positive_output_block_reasons.append(
@@ -13785,23 +14355,25 @@ def main():
                             min_soc=MIN_SOC,
                             ww_cycle_started_ts=wp_last_ww_cycle_start_ts,
                             manual_ww_sofort_active=manual_ww_sofort_priority_active,
+                            measured_pv_release=source_recovery_release["eligible"],
                             now_ts=time.time(),
                         )
                     else:
                         source_recovery_pre_policy_state = {
                             "override": bool(
-                                manual_ww_sofort_priority_active
+                                (manual_ww_sofort_priority_active or source_recovery_release["eligible"])
                                 and (source_recovery_pause_allowed or source_recovery_pause_active)
                             ),
                             "budget_ready": False,
                             "release_reason": (
                                 MANUAL_WW_SOFORT_SOURCE_RECOVERY_PRIORITY_TEXT
                                 if manual_ww_sofort_priority_active
-                                else ""
+                                else source_recovery_release["reason"]
                             ),
                             "blocks_boost": bool(
                                 (source_recovery_pause_allowed or source_recovery_pause_active)
                                 and not manual_ww_sofort_priority_active
+                                and not source_recovery_release["eligible"]
                             ),
                             "ww_cycle_min_runtime_remaining_s": 0.0,
                         }
@@ -14031,7 +14603,8 @@ def main():
                     ):
                         source_recovery_was_owner = pv_pause_owner == "source_recovery_heatpump"
                         pause_release_succeeded = False
-                        if wp_write_allowed and automatic_heat_actuation_allowed:
+                        if wp_write_allowed and (automatic_heat_actuation_allowed or
+                                source_recovery_was_owner and source_recovery_release["eligible"]):
                             pause_release_succeeded = release_heatpump_pause(
                                 wp,
                                 wp_type,
@@ -14075,6 +14648,11 @@ def main():
                         pv_pause_owner = "none"
                         source_recovery_pause_context = {}
 
+                    source_recovery_release["active"] = bool(
+                        source_recovery_release["eligible"] and not pv_pause_active)
+                    if source_recovery_release["active"]:
+                        price_boost_active = False
+
                     # PREIS BOOST
                     heat_energy_now_ts = time.time()
                     observed_price_wp_power_w, observed_price_power_known, _observed_price_accepting = heatpump_power_observation(
@@ -14091,7 +14669,8 @@ def main():
                     estimated_cop = 3.5
                     predump_heatpump_raw_active = predump_allows("heatpump")
                     predump_heatpump_targets_reached = heatpump_boost_targets_reached(
-                        wp_data, at_mittel, HEIZGRENZE_TEMP, CONF_WWS, CONF_WWW, CONF_HZ
+                        wp_data, at_mittel, HEIZGRENZE_TEMP, CONF_WWS, CONF_WWW, CONF_HZ,
+                        config=current_config, wp_status=wp_status,
                     )
                     predump_heatpump_protect_block = bool(wq_aus < WQ_MIN_TEMP)
                     predump_heatpump_hold_active = bool(predump_heatpump_hold_until and time.time() < predump_heatpump_hold_until)
@@ -14108,7 +14687,6 @@ def main():
                     # den getrennten, zentral gebundenen Negativpreis- oder
                     # Pre-Dump-Verträgen stammen.
 
-                    market_heatpump_release = market_plan_allows("heatpump", current_config)
                     market_heatpump_requested = (
                         heatpump_negative_price_release_requested(
                             market_heatpump_release
@@ -14286,6 +14864,7 @@ def main():
                             heat_policy_decision=heat_policy_decision,
                             ww_cycle_started_ts=wp_last_ww_cycle_start_ts,
                             manual_ww_sofort_active=manual_ww_sofort_priority_active,
+                            measured_pv_release=source_recovery_release["eligible"],
                             now_ts=time.time(),
                         )
                         source_recovery_heat_budget_override = bool(source_recovery_policy_state.get("override"))
@@ -14582,6 +15161,7 @@ def main():
                         HEIZGRENZE_TEMP,
                         CONF_WWS,
                         CONF_HZ,
+                        wp_status=wp_status,
                     )
                     pv_temperature_demand = bool(
                         wp_temperature_evidence_fresh
@@ -14984,7 +15564,7 @@ def main():
                                 _safe_float(MIN_SOC, 80.0) - 5.0,
                             )
                         )
-                        or _safe_float(grid, 0.0) > 2500.0
+                        or heatpump_grid_safety_stop
                         or heatpump_signal_typed_protection_stop
                     )
                     heatpump_positive_actuator_permission = (
@@ -15250,7 +15830,7 @@ def main():
                                 # manuellen Direkt-Boost: frühestens nach max(10 min,
                                 # Wiedereinschaltsperre) ab jetzt, auch ohne gemessenen
                                 # Verdichterlauf (sonst flattert der Kontakt, etwa bei
-                                # Netzbezug um 2500 W).
+                                # anhaltender WP-Netzbezug über 2500 W).
                                 manual_direct_restart_floor_ts = max(
                                     manual_direct_restart_floor_ts,
                                     time.time() + max(
@@ -15272,6 +15852,8 @@ def main():
                                 if manual_ww_gap_stop
                                 else "Speicher-Budget länger als die Toleranz nicht frisch"
                                 if manual_ww_budget_stop
+                                else luxtronik_pv_withdrawal_text(heatpump_pv_output)
+                                if heatpump_pv_output.get("withdraw")
                                 else "fachliche Nachfrage im aktuellen Zyklus beendet",
                                 "unverändert, normaler Timer besitzt den Auftrag"
                                 if _ww_withdrawal_scope.get("touch_ww") is False
@@ -15393,7 +15975,11 @@ def main():
                                 elif current_price > 0:
                                     last_push_awattar_sent = False
 
-                                if market_heatpump_active:
+                                if sg_ready_temperature_control:
+                                    success_w = request_heatpump_boost(
+                                        wp, 1, CONF_HZ, 1, CONF_WWW, wp_data=wp_data,
+                                        owner=("predump" if predump_heatpump_active else "price"))
+                                elif market_heatpump_active:
                                     price_target_modes = heat_price_boost.boost_target_modes(
                                         current_config.get("heat_price_boost_scope", "both"),
                                         separate_targets=True,
@@ -15514,7 +16100,7 @@ def main():
                             e3dc_valid
                             and soc > 0
                             and soc < max(5, MIN_SOC - 5)
-                        ) or grid > 2500 or heatpump_signal_typed_protection_stop
+                        ) or heatpump_grid_safety_stop or heatpump_signal_typed_protection_stop
                         if price_boost_active and not predump_heatpump_active:
                             price_heatpump_stop_block_remaining_s = heatpump_takt_stop_block(
                                 WP_TAKT_PROTECT,
@@ -15605,7 +16191,9 @@ def main():
                             and not heatpump_positive_output_blocked_this_cycle
                             and (time.time() - last_wp_command_time) > 25
                         ):
-                            if at_mittel > HEIZGRENZE_TEMP: request_heatpump_boost(wp, 0, None, 1, CONF_WWS, cooling_boost_mode, CONF_KHL, wp_data=wp_data, owner="release")
+                            if sg_ready_temperature_control:
+                                request_heatpump_boost(wp, 1, CONF_HZ, 1, CONF_WWW, wp_data=wp_data, owner="pv")
+                            elif at_mittel > HEIZGRENZE_TEMP: request_heatpump_boost(wp, 0, None, 1, CONF_WWS, cooling_boost_mode, CONF_KHL, wp_data=wp_data, owner="release")
                             else: request_heatpump_boost(wp, 1, CONF_HZ, 1, CONF_WWW, wp_data=wp_data, owner="pv")
                             last_wp_command_time = time.time()
 
@@ -15622,7 +16210,7 @@ def main():
                         )
                         independent_safety_stop = bool(
                             (e3dc_valid and soc > 0 and soc < max(5, MIN_SOC - 5))
-                            or grid > 2500
+                            or heatpump_grid_safety_stop
                             or heatpump_signal_typed_protection_stop
                         )
                         running_heatpump_underfunded = (
@@ -15712,7 +16300,7 @@ def main():
                                     min_runtime_left_s = (WP_MIN_RUNTIME_MIN * 60) - (time.time() - wp_last_pv_boost_start_ts)
                                 emergency_stop = (
                                     (e3dc_valid and soc > 0 and soc < max(5, MIN_SOC - 5))
-                                    or grid > 2500
+                                    or heatpump_grid_safety_stop
                                     or heatpump_signal_typed_protection_stop
                                 )
                                 if (
@@ -15761,7 +16349,7 @@ def main():
                     # Tore des Luxtronik-Wegs: Automatik an und kein manueller WP-Boost
                     # (sonst läuft dieser Block nicht), Schreibfreigabe, gültige
                     # E3DC-Livedaten, keine unabhängige Sicherheits-/Herstellerschranke
-                    # (SoC unter Mindest-SoC − 5 %, Netzbezug über 2500 W, Hardware-/
+                    # (SoC unter Mindest-SoC − 5 %, anhaltender WP-Netzbezug über 2500 W, Hardware-/
                     # Quellenschutz), kein Notstrom-/Inselbetrieb und keine Notstrom-
                     # reserve, kein Nutzer-Aus, die Wiedereinschaltsperre ab
                     # Verdichterstillstand und wie beim manuellen Direkt-Boost die
@@ -16036,7 +16624,9 @@ def main():
                                 pv_boost_pending_start = now
                             elif (now - pv_boost_pending_start).total_seconds() > PV_BOOST_DELAY:
                                 if wp_write_allowed:
-                                    if at_mittel > HEIZGRENZE_TEMP:
+                                    if sg_ready_temperature_control:
+                                        boost_args = (1, CONF_HZ, 1, CONF_WWW, 0, None, wp_data)
+                                    elif at_mittel > HEIZGRENZE_TEMP:
                                         if wp_type == 1 and not cooling_boost_allowed and (time.time() - last_idm_cooling_gate_log_time) > 300:
                                             logger.info(f"iDM Kühl-Boost bleibt aus: Außentemperatur {_safe_float(at_mittel, 0.0):.1f}°C < Kühlgrenze {_safe_float(IDM_COOLING_BOOST_MIN_AT, 23.0):.1f}°C.")
                                             last_idm_cooling_gate_log_time = time.time()
@@ -16640,7 +17230,7 @@ def main():
                         ww_cycle_abort_allowed = bool(
                             pv_ww_contract_withdrawal or
                             (e3dc_valid and _safe_float(soc, 0.0) > 0 and _safe_float(soc, 0.0) < max(5.0, _safe_float(MIN_SOC, 80.0) - 5.0))
-                            or (_safe_float(grid, 0.0) > 2500.0 and _safe_float(soc, 0.0) <= _safe_float(MIN_SOC, 80.0))
+                            or (heatpump_grid_safety_stop and _safe_float(soc, 0.0) <= _safe_float(MIN_SOC, 80.0))
                             or heatpump_ww_price_stop_allowed(
                                 price_action,
                                 wp_last_ww_cycle_start_ts,
@@ -16780,7 +17370,7 @@ def main():
                             ww_off_abort_allowed = bool(
                                 pv_ww_contract_withdrawal or
                                 (e3dc_valid and _safe_float(soc, 0.0) > 0 and _safe_float(soc, 0.0) < max(5.0, _safe_float(MIN_SOC, 80.0) - 5.0))
-                                or (_safe_float(grid, 0.0) > 2500.0 and _safe_float(soc, 0.0) <= _safe_float(MIN_SOC, 80.0))
+                                or (heatpump_grid_safety_stop and _safe_float(soc, 0.0) <= _safe_float(MIN_SOC, 80.0))
                                 or heatpump_ww_price_stop_allowed(
                                     price_action,
                                     wp_last_ww_cycle_start_ts,
@@ -17088,6 +17678,8 @@ def main():
                 heat_tariff_runtime, heat_tariff_shift = run_heat_tariff_cycle(
                     current_config, locals(), heatpump_channel_controller.checkpoint,
                     locals().get("heat_tariff_runtime"), now=time.time())
+                heat_tariff_storage_hold = read_heat_tariff_storage_hold(
+                    current_config, heatpump_channel_controller.checkpoint, now=time.time())
                 _channel_ww = heatpump_channel_controller.checkpoint["channels"]["ww"]
                 _channel_ww_guard = heatpump_ww_cycle_min_runtime_guard(
                     0, None, wp_status, wp_data,
@@ -17097,8 +17689,21 @@ def main():
                     physical_running=bool(luxtronik_ww_runtime_contract.get("ww_running")),
                 )
                 heatpump_channel_stop_allowed = {"ww": not _channel_ww_guard["hold_active"]}
-                heatpump_channel_dispatch = heatpump_channel_controller.cycle(
-                    locals(), wp, clock_sample=control_time.sample())
+                # Ein Entscheidungsfehler erzeugt weder neue Starts noch normale Entzüge.
+                # Nutzer-Aus und unabhängige Schutzfälle gehen weiter über den Einzelentscheider.
+                release_fault_holds_output = bool(source_recovery_release_failed and AUTO_MODE == 1
+                    and not heatpump_emergency_veto
+                    and not heatpump_pv_output.get("protection_reason")
+                    and not any(reason in ("manual_user_off", "manual_source_temperature_stop",
+                                           "pre_control_independent_safety_stop")
+                                for reason in heatpump_positive_output_block_reasons))
+                if release_fault_holds_output:
+                    wp.channel_intents = []
+                    heatpump_channel_dispatch = {"actions": [], "hold": {},
+                        "reason": "source_recovery_release_fault"}
+                else:
+                    heatpump_channel_dispatch = heatpump_channel_controller.cycle(
+                        locals(), wp, clock_sample=control_time.sample())
                 heatpump_pv_state["command"] = heatpump_channel_controller.pv_command(
                     heatpump_pv_state.get("command"))
                 heatpump_pv_contract["command"] = copy.deepcopy(heatpump_pv_state["command"])
@@ -17296,6 +17901,7 @@ def main():
                 "heatpump_pv_transition": heatpump_pv_transition,
                 "heatpump_pv_contract": copy.deepcopy(heatpump_pv_contract),
                 "heatpump_pv_hold_reason": heatpump_pv_hold_reason,
+                "heatpump_grid_stop": copy.deepcopy(heatpump_grid_stop_state),
                 "heatpump_pv_hold_decision": copy.deepcopy(heatpump_pv_hold_decision),
                 "heatpump_pv_last_signal_release": copy.deepcopy(heatpump_pv_last_signal_release),
                 "ts": now.isoformat(), "data": wp_data, "status": wp_status,
@@ -17397,6 +18003,7 @@ def main():
                 "source_recovery_heat_budget_override": source_recovery_heat_budget_override,
                 "source_recovery_budget_ready": source_recovery_budget_ready,
                 "source_recovery_release_reason": source_recovery_release_reason,
+                "source_recovery_release": copy.deepcopy(source_recovery_release),
                 "source_recovery_history_allowed": source_recovery_history_allowed,
                 "source_recovery_history_reason": source_recovery_history_reason,
                 "source_recovery_compressor_off_before_s": source_recovery_compressor_off_before_s,
@@ -17640,6 +18247,7 @@ def main():
                     "source_recovery_pause_blocks_boost": bool(source_recovery_pause_blocks_boost),
                     "source_recovery_heat_budget_override": bool(source_recovery_heat_budget_override),
                     "source_recovery_release_reason": source_recovery_release_reason,
+                    "source_recovery_release": copy.deepcopy(source_recovery_release),
                     "storage_manager_owns_energy": bool(storage_manager_owns_energy),
                     "energy_autonomy_allowed": bool(energy_autonomy_allowed),
                     "local_autonomy_blocked": local_autonomy_blocked,

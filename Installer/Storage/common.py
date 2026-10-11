@@ -4,8 +4,7 @@
 
 from __future__ import annotations
 
-import math
-from typing import Any
+from .power_limits import safe_float, safe_int
 
 try:
     from Installer.storage_parallel_regulator import (
@@ -25,23 +24,8 @@ except ModuleNotFoundError:
     )
 
 
-def safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        if value is None:
-            return float(default)
-        if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
-            return float(default)
-        text = str(value).strip().replace(",", ".")
-        if text == "" or text.lower() in ("none", "null", "nan", "inf", "infinity"):
-            return float(default)
-        result = float(text)
-        return result if math.isfinite(result) else float(default)
-    except Exception:
-        return float(default)
 
 
-def safe_int(value: Any, default: int = 0) -> int:
-    return int(round(safe_float(value, default)))
 
 
 def mode_label(mode: int) -> str:

@@ -39,7 +39,7 @@ Die Datei `mobile.php` dient als zentrale, mobil-optimierte Oberfläche zur Übe
 *   **Globales Auge-Icon (Clean UI):** In der Kopfleiste gibt es ein Auge-Icon ("Details umschalten"). Damit lassen sich detaillierte technische Parameter (wie String-Spannungen der PV, Phasen/Modus der Wallbox, Verdichter-Temperaturen der Wärmepumpe) global ein- oder ausblenden. Die Wahl wird dauerhaft im Browser gespeichert (`localStorage`).
 *   **Intelligentes Ausblenden:** Elemente mit nicht vorhandenen Werten (z.B. Phasen bei Fremd-Wallboxen via Shelly/MQTT) werden vollautomatisch ausgeblendet, anstatt `0` anzuzeigen. Dynamische Warnfarben (Orange/Rot) weisen zudem auf kritische Batterie-SoCs nahe der Reserve hin.
 *   **Performance:** Das Dashboard nutzt minifiziertes JavaScript (`solar.min.js`) und asynchrones Skript-Laden (`defer`). Dies eliminiert "Render-Blocking" und sorgt für unmittelbaren Seitenaufbau, auch im Mobilfunknetz.
-*   **Sicherheit (PIN-Schutz):** Das Web-Interface kann optional durch eine PIN (`web_pin`) gesichert werden. Das Live-Dashboard bleibt für jeden einsehbar (Read-Only), während kritische Steuerungs-Ansichten (Konfiguration, Wallbox) gesperrt bleiben.
+*   **Sicherheit (PIN-Schutz):** Das Web-Interface kann optional durch eine PIN (`web_pin`) gesichert werden. Das Live-Dashboard bleibt für jeden einsehbar (Read-Only), während geschützte Ansichten (Konfiguration, Wallbox, Wärmepumpe einschließlich Vorschau, Klima, Matter und Systemmetriken) gesperrt bleiben.
 
 ## Technische Details
 

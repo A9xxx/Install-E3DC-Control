@@ -15,6 +15,10 @@ import logging
 import math
 import os
 import time
+try:
+    from Wallbox.storage_intent import storage_curve_can_reach_target
+except ImportError:  # Paketimport durch Analysewerkzeuge
+    from .Wallbox.storage_intent import storage_curve_can_reach_target
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1729,7 +1733,8 @@ class ParallelStorageRegulator:
         headroom_discharge_cooldown_active = headroom_discharge_cooldown_remaining_s > 0.0
         last_auto_ts = _safe_float(active_state.get("last_auto_ts"), 0.0)
         auto_hold_age_s = max(0.0, now_s - last_auto_ts) if last_auto_ts > 0 else 999999.0
-        can_reach_target = bool(plan.get("can_reach_target", True))
+        can_reach_target = storage_curve_can_reach_target(plan)
+        reach_false = storage_curve_can_reach_target(plan, default=None) is False
         max_reachable_soc = _safe_float(plan.get("max_reachable_soc"), -1.0)
         adaptive_curve = _adaptive_curve_context(plan, now_s * 1000.0, soc, allow_before_start=pv_w > 250)
         curve_soc = adaptive_curve.get("curve_soc")
@@ -2681,6 +2686,24 @@ class ParallelStorageRegulator:
             or (wb_internal_owner_allowed and wb_intent_active)
         )
         shortfall_pv_catchup_active = bool(_truthy(active_state.get("shortfall_pv_catchup_active")))
+        # Die bestehende Freigabehysterese trennt den Rückstand von der
+        # Kurvenkante. Vor der Kurve und bei DC-first bleiben die bestehenden
+        # Rahmen samt Dämpfung unverändert zuständig.
+        curve_pv_free_active = bool(
+            adaptive_curve_relation == "below_floor"
+            and pv_w > 250
+            and grid_ema_w < self.grid_relief_enter_w
+            and not curve_soft_charge_active
+            and not _truthy(plan.get("wallbox_target_soc_active"))
+            and not wb_current_owner_evidence_active
+            and not (wb_internal_owner_allowed and wb_intent_car_present and wb_budget_w > 0)
+            and not _cfg_bool(self.cfg, "storage_dc_first_charge_limit_enable", False)
+            and (
+                (curve_gap_pct is not None
+                 and curve_gap_pct > self.curve_auto_hold_release_below_pct)
+                or (previous_parallel_state == "parallel_auto" and curve_guard_active)
+            )
+        )
         forecast_curve_landing_hold_active = bool(
             _truthy(active_state.get("forecast_curve_landing_hold_active"))
         )
@@ -3052,6 +3075,7 @@ class ParallelStorageRegulator:
             "max_reachable_soc": None if max_reachable_soc < 0.0 else round(max_reachable_soc, 2),
             "forecast_shortfall_pv_release_active": forecast_shortfall_pv_release_active,
             "shortfall_pv_catchup_active": shortfall_pv_catchup_active,
+            "curve_pv_free_active": curve_pv_free_active,
             "shortfall_target_soc": active_state.get("shortfall_target_soc"),
             "shortfall_target_gap_pct": active_state.get("shortfall_target_gap_pct"),
             "shortfall_real_surplus_w": active_state.get("shortfall_real_surplus_w"),
@@ -3533,6 +3557,23 @@ class ParallelStorageRegulator:
                 "Freilauf erreicht: EMS-Grenzen freigeben, E3DC übernimmt Rest-PV und Nachtversorgung",
                 "default",
             )
+        elif curve_pv_free_active:
+            self.price_house_discharge_w = 0
+            curve_pv_free_reason = (
+                "Unter der Kurvenuntergrenze: keine EMS-Ladegrenze; "
+                "E3DC nimmt verfügbaren PV-Überschuss frei auf"
+            )
+            if shortfall_pv_catchup_active:
+                curve_pv_free_reason += " (Abendziel-Rückstand)"
+            elif reach_false:
+                curve_pv_free_reason += " (Kurvenziel nicht erreichbar)"
+            decision = choose(
+                "parallel_auto",
+                MODE_AUTO,
+                self.max_charge_w,
+                curve_pv_free_reason,
+                "forecast_shortfall" if shortfall_pv_catchup_active or reach_false else "curve",
+            )
         elif forecast_shortfall_pv_release_active:
             self.price_house_discharge_w = 0
             decision = choose(
@@ -3798,6 +3839,8 @@ class ParallelStorageRegulator:
                 curve_charge_servo_block_reason = "previous_stale"
             elif decision.state not in curve_charge_servo_allowed_states:
                 curve_charge_servo_block_reason = "candidate_not_eligible"
+            elif curve_pv_free_active:
+                curve_charge_servo_block_reason = "pv_free"
             elif decision.priority not in {"curve", "default"}:
                 curve_charge_servo_block_reason = "priority_protected"
             elif (
@@ -4058,7 +4101,8 @@ class ParallelStorageRegulator:
             previous_parallel_state == "parallel_curve_auto_hold"
             and not forecast_curve_below_floor
             and decision.state == "parallel_auto"
-            and decision.priority == "default"
+            and (decision.priority == "default"
+                 or (curve_pv_free_active and not reach_false and decision.priority == "curve"))
             and previous_parallel_age_s < 600
             and pv_w > 250
             and grid_ema_w < self.grid_relief_enter_w
@@ -4147,6 +4191,7 @@ class ParallelStorageRegulator:
                 "max_reachable_soc": None if max_reachable_soc < 0.0 else round(max_reachable_soc, 2),
                 "forecast_shortfall_pv_release_active": forecast_shortfall_pv_release_active,
                 "shortfall_pv_catchup_active": shortfall_pv_catchup_active,
+                "curve_pv_free_active": curve_pv_free_active,
                 "shortfall_target_soc": active_state.get("shortfall_target_soc"),
             "shortfall_target_gap_pct": active_state.get("shortfall_target_gap_pct"),
             "shortfall_real_surplus_w": active_state.get("shortfall_real_surplus_w"),

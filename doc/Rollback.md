@@ -16,6 +16,29 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
+## Rückfall von 5.5.4 auf 5.5.3c
+
+**Docker:** Auf dem Host in `.env` `E3DC_IMAGE_TAG=v5.5.3c` setzen und
+`sudo docker compose up -d` ausführen. Beim Start bereinigt 5.5.3c die
+Konfiguration und entfernt dabei den in 5.5.4 neuen Schalter
+„Kostenansicht je Viertelstunde“. Die vorher angelegte Sicherung unter
+`data/config_backups/` enthält ihn weiterhin; nach einer erneuten
+Aktualisierung auf 5.5.4 den Schalter im Config-Editor unter
+Tarif & Strompreise wieder einschalten.
+
+**Bare Metal:** Der Rückweg ist das beim Update angelegte verifizierte Backup
+(siehe „Betriebsdaten wiederherstellen“). Es stellt Programmstand und
+Konfiguration von vor dem Update wieder her; nach dem Update geänderte
+Einstellungen sind darin nicht enthalten.
+
+**Daten:** Die Tabellen der Kostenhistorie bleiben in der Statistikdatenbank;
+5.5.3c ignoriert sie. Tage, die 5.5.4 mit dem Hausverbrauch nach der
+Energiebilanz archiviert hat, bleiben erhalten; ab dem Rückfall archiviert
+5.5.3c neue Tage wieder nach dem bisherigen Verfahren. Wurde unter 5.5.4 die
+Nachberechnung der Tagesstatistik angewendet und soll sie zurückgenommen
+werden, den Rückweg aus `doc/Statistik_Wartung.md` vor dem Rückfall
+ausführen; 5.5.3c kennt diesen Befehl nicht.
+
 ## Rückfall von 5.5.0 auf 5.4.x
 
 **Docker:** Ein Rückfall auf 5.4.6d erfolgt auf dem Host mit
@@ -278,7 +301,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand ist `v5.5.3c`.
+Der aktuelle Stable-Stand ist `v5.5.4`.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

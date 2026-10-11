@@ -10,29 +10,29 @@ Der Schreibvorgang erfolgt **atomar** (durch Schreiben in eine `.tmp` Datei und 
 ---
 
 ## 2. Echtzeit-Dashboard (WebSockets)
-Das Webportal empfängt Änderungen über den WebSocket-Dienst. Dadurch bleiben
-auch mehrere geöffnete Geräte ohne enges HTTP-Polling aktuell.
+Das Webportal liest Änderungen derzeit über regelmäßige HTTP-Abfragen. Der
+WebSocket-Dienst ist installiert; die Weboberfläche nutzt ihn derzeit nicht.
 
 ### Der WebSocket Daemon (`e3dc_websocket.py`)
 Dieser Python-Dienst (als Systemd `e3dc-websocket.service` eingerichtet) wartet
 ausschließlich auf der lokalen Loopback-Adresse `127.0.0.1:8765`. Browser
 greifen weder bei einer nativen Installation noch im Docker-Betrieb direkt auf
-diesen internen Port zu. Sobald ein Client das Dashboard öffnet, streamt der
-Dienst Änderungen im JSON-File verzögerungsfrei an das Dashboard.
-Das Dashboard kann dadurch extrem flüssige Ladeanimationen im Takt von unter einer Sekunde berechnen.
+diesen internen Port zu. Der Dienst ist als Pflichtdienst installiert; die
+Weboberfläche nutzt ihn derzeit nicht und aktualisiert ihre Daten durch
+regelmäßige HTTP-Abfragen.
 
 ### Apache Reverse Proxy (Der Cloudflare-Trick)
 Da moderne Webbrowser unsichere Verbindungen (`ws://`) blockieren, wenn die
 Webseite über SSL (`https://`, z. B. via Cloudflare Tunnel) geladen wird,
 konfiguriert der Installer den Apache-Webserver automatisch als Reverse Proxy.
 
-Der Browser verwendet am gleichen Host und Port wie das Dashboard den Pfad
-`/ws`. Apache tunnelt diesen Verkehr intern an `127.0.0.1:8765` weiter. Damit
+Für WebSocket-Clients steht am gleichen Host und Port wie das Dashboard der
+Pfad `/ws` bereit. Apache tunnelt diesen Verkehr intern an `127.0.0.1:8765` weiter. Damit
 bleibt der Python-Port selbst im LAN geschlossen; TLS und die externe
 Erreichbarkeit enden am Webserver.
 
 **Installation:**
-Der Dienst wird vollautomatisch mit dem Befehl "Systempakete installieren" (Menüpunkt 3) im Installer aktiviert.
+Der Dienst wird über Hauptmenü **1) Installation / Update** eingerichtet und aktiviert.
 
 ---
 

@@ -66,6 +66,7 @@
 !/Installer/Storage/__init__.py
 !/Installer/Storage/charge_curve.py
 !/Installer/Storage/common.py
+!/Installer/Storage/power_limits.py
 !/Installer/Storage/peak_shaving.py
 !/Installer/Storage/predump.py
 !/Installer/Storage/process_singleton.py
@@ -129,6 +130,7 @@
 !/Installer/control_command_guard.py
 !/Installer/control_safety.py
 !/Installer/core.py
+!/Installer/cost_accounting.py
 !/Installer/create_config.py
 !/Installer/data_models.py
 !/Installer/decision_history.py
@@ -301,6 +303,7 @@
 !/doc/Installer.md
 !/doc/Installer_Dokumentation.md
 !/doc/Verbrauchsprognose_Dokumentation.md
+!/doc/Kostenhistorie.md
 !/doc/Ladekurve_Berechnung.md
 !/doc/Lademanagement_Dokumentation.md
 !/doc/Luxtronik.md
@@ -317,6 +320,7 @@
 !/doc/Smart_Home_Matter.md
 !/doc/Smart_Home_Mqtt_Websockets.md
 !/doc/Speicher_Ladesteuerung_Ablauf.md
+!/doc/Statistik_Wartung.md
 !/doc/Stiebel_Eltron_ISG.md
 !/doc/Unwetterwaechter.md
 !/doc/Update.md
@@ -365,15 +369,22 @@
 !/html/assets/vendor/jquery/jquery-3.6.0.min.js
 !/html/backup_history.php
 !/html/config_editor.php
+!/html/cost_accounting.php
+!/html/cost_accounting_cli.php
+!/html/cost_history.js
+!/html/cost_history_view.php
+!/html/daily_stats_cli.php
 !/html/eeg_tariff_tables.php
 !/html/fahrzeug.php
 !/html/favicon.ico
 !/html/get_chart_data.php
+!/html/get_cost_history.php
 !/html/get_forecast_data.php
 !/html/get_live_json.php
 !/html/get_shadow_snapshot.php
 !/html/help.php
 !/html/helpers.php
+!/html/heatpump_season.php
 !/html/retention.php
 !/html/history.php
 !/html/index.html
@@ -428,3 +439,7 @@
 !/E3DC-Slave/power_limits.py
 !/E3DC-Slave/config.example.json
 !/E3DC-Slave/README.md
+
+!/Installer/module_installer.py
+!/html/module_install_jobs.php
+!/Installer/shelly_relay_owner.py

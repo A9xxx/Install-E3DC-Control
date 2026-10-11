@@ -1,4 +1,7 @@
 import os
+import json
+import errno
+from pathlib import Path
 import pwd
 import shlex
 import stat
@@ -94,6 +97,10 @@ def _service_is_proven_not_enabled(service_name):
 def _remove_managed_docker_container():
     """Stoppt den einzigen Produktcontainer und beweist danach seine Abwesenheit."""
 
+    if shutil.which("docker") is None:
+        print("  ℹ Docker-CLI fehlt; kein Docker-Schritt erforderlich.")
+        return True
+
     inspect = run_command(
         "sudo docker inspect -f '{{.State.Running}}' e3dc-control",
         timeout=30,
@@ -149,15 +156,18 @@ def remove_cron_pattern(pattern):
 
         if result['success']:
             lines = result['stdout'].splitlines()
-            # Behalte Zeilen, die das Pattern NICHT enthalten
-            new_lines = [l for l in lines if pattern not in l and l.strip()]
+            if not any(pattern in line for line in lines):
+                return None
+            # Andere Cronjobs einschließlich Leerzeilen erhalten.
+            new_lines = [line for line in lines if pattern not in line]
 
             # Wenn sich die Anzahl geändert hat, schreiben wir neu
             if len(lines) != len(new_lines):
                 new_cron = "\n".join(new_lines) + "\n"
                 if not new_lines:
                      # Wenn leer, crontab entfernen
-                     run_command(f"sudo -u {install_user} crontab -r", timeout=5)
+                     result = run_command(f"sudo -u {install_user} crontab -r", timeout=5)
+                     return bool(result and result.get("success"))
                 else:
                     process = subprocess.Popen(
                         ["sudo", "-u", install_user, "crontab", "-"],
@@ -165,7 +175,9 @@ def remove_cron_pattern(pattern):
                         text=True
                     )
                     process.communicate(input=new_cron, timeout=10)
-                return True
+                    return process.returncode == 0
+        elif "no crontab for " in str(result.get("stderr") or "").lower():
+            return None
     except Exception as e:
         log_warning("uninstall", f"Fehler beim Entfernen von Cron-Pattern '{pattern}': {e}")
     return False
@@ -328,7 +340,7 @@ def remove_apache_runtime_path_protection():
     return APACHE_SECURITY_REMOVED
 
 
-def remove_manager_lock_boot_contract():
+def remove_manager_lock_boot_contract(*, check_only=False):
     """Entfernt nur den eindeutig produktverwalteten tmpfiles-Bootvertrag.
 
     Die Lockdateien unter ``/run`` bleiben bis zum nächsten Neustart bestehen.
@@ -362,6 +374,9 @@ def remove_manager_lock_boot_contract():
             "und wurde nicht verändert.",
         )
         return False
+
+    if check_only:
+        return True
 
     removed = run_command("sudo rm -f -- " + shlex.quote(path), timeout=30)
     if not removed.get("success") or os.path.lexists(path):
@@ -461,7 +476,7 @@ def _managed_emergency_start_veto_file(
             os.close(descriptor)
 
 
-def remove_inactive_emergency_start_veto(*, expected_uid=0, expected_gid=0):
+def remove_inactive_emergency_start_veto(*, expected_uid=0, expected_gid=0, check_only=False):
     """Entfernt den root-eigenen Startschutz nur ohne aktiven Incident.
 
     Ein vorhandener Latch ist langlebiger Sicherheitszustand und bleibt samt
@@ -501,6 +516,8 @@ def remove_inactive_emergency_start_veto(*, expected_uid=0, expected_gid=0):
                 f"Startschutz gebunden werden: {exc}",
             )
             return EMERGENCY_START_VETO_FAILED
+        if check_only:
+            return EMERGENCY_START_VETO_RETAINED
         reloaded = run_command("sudo systemctl daemon-reload", timeout=30)
         if not isinstance(reloaded, dict) or not reloaded.get("success"):
             log_warning(
@@ -532,6 +549,9 @@ def remove_inactive_emergency_start_veto(*, expected_uid=0, expected_gid=0):
 
         if not bindings:
             return EMERGENCY_START_VETO_ABSENT
+
+        if check_only:
+            return EMERGENCY_START_VETO_RETAINED
 
         # Unmittelbar vor dem gebundenen Unlink gewinnt ein neuer Incident.
         if emergency_latch_present():
@@ -696,9 +716,13 @@ def uninstall_ramdisk():
         print("  ✓ get_live.sh gelöscht")
 
     # Cronjobs
-    remove_cron_pattern("get_live.sh")
-    remove_cron_pattern("get_live_json.php")
-    print("  ✓ Cronjobs bereinigt")
+    cron_results = [remove_cron_pattern(pattern) for pattern in ("get_live.sh", "get_live_json.php")]
+    if any(result is False for result in cron_results):
+        print("  ⚠ Cron-Bereinigung nicht vollständig bestätigt; Fehler beim Lesen oder Schreiben.")
+    elif any(result is True for result in cron_results):
+        print("  ✓ Cronjobs bereinigt")
+    else:
+        print("  ℹ keine Legacy-Cronjobs vorhanden")
 
     uninstall_logger.info("RAM-Disk deinstalliert.")
     log_task_completed("Deinstallation (RAM-Disk)")
@@ -721,12 +745,20 @@ def uninstall_diagramm():
         ("/usr/local/sbin/e3dc-web-update-launcher", "root-eigener Web-Update-Launcher"),
         ("/usr/local/sbin/e3dc-runtime-permissions-repair", "root-eigener Rechte-Launcher"),
         ("/etc/e3dc-control/runtime_permissions_contract.json", "root-eigener Rechtevertrag"),
+        ("/usr/local/sbin/e3dc-module-installer", "root-eigener Modul-Launcher"),
+        ("/etc/e3dc-control/module_installer_contract.json", "root-eigener Modulvertrag"),
     ]
     for path, label in managed_privilege_files:
         if os.path.lexists(path):
             os.remove(path)
             print(f"  ✓ {label} entfernt")
 
+    module_code_root = "/etc/e3dc-control/module-installer"
+    if os.path.lexists(module_code_root):
+        if os.path.islink(module_code_root):
+            os.unlink(module_code_root)
+        else:
+            shutil.rmtree(module_code_root)
     apache_security_cleanup = remove_apache_runtime_path_protection()
 
     # Python Skripte im Install-Ordner
@@ -740,9 +772,10 @@ def uninstall_diagramm():
     log_task_completed("Deinstallation (Diagramm)")
     return apache_security_cleanup
 
-def uninstall_service():
+def uninstall_service(*, check_only=False):
     """Entfernt E3DC Systemd Service und Zusatz-Dienste."""
-    print("\n→ Entferne E3DC-Control und Zusatz-Dienste…")
+    if not check_only:
+        print("\n→ Entferne E3DC-Control und Zusatz-Dienste…")
     install_user = get_install_user()
 
     # Stop & Disable aller E3DC-bezogenen Dienste
@@ -751,6 +784,7 @@ def uninstall_service():
         "energy_manager",
         "e3dc-lux-live",
         "e3dc-ha",
+        "e3dc-shadow-sync",
         "e3dc-notifier",
         "e3dc-websocket",
         "e3dc-mqtt-hub",
@@ -776,6 +810,28 @@ def uninstall_service():
         service for service in quiesce_order if _service_unit_exists(service)
     )
 
+    unit_preimages = []
+    for srv in services_to_remove:
+        srv_file = f"/etc/systemd/system/{srv}.service"
+        if not os.path.lexists(srv_file):
+            continue
+        info = os.lstat(srv_file)
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+        ):
+            log_warning("uninstall", f"Unsicherer Unit-Eintrag bleibt erhalten: {srv_file}")
+            return False
+        unit_preimages.append((srv, srv_file, info.st_dev, info.st_ino))
+
+    if remove_manager_lock_boot_contract(check_only=True) is not True:
+        return False
+    if remove_inactive_emergency_start_veto(check_only=True) == EMERGENCY_START_VETO_FAILED:
+        return False
+    if check_only:
+        return True
+
     # Phase 1: erst alle Supervisoren und Writer stilllegen. Vor diesem
     # vollständigen Nachweis wird keine einzige Unit-Datei entfernt.
     for srv in existing_services:
@@ -798,21 +854,6 @@ def uninstall_service():
         if not _service_is_proven_inactive(writer):
             log_warning("uninstall", f"Hardware-Writer bleibt aktiv: {writer}")
             return False
-
-    unit_preimages = []
-    for srv in services_to_remove:
-        srv_file = f"/etc/systemd/system/{srv}.service"
-        if not os.path.lexists(srv_file):
-            continue
-        info = os.lstat(srv_file)
-        if (
-            stat.S_ISLNK(info.st_mode)
-            or not stat.S_ISREG(info.st_mode)
-            or info.st_nlink != 1
-        ):
-            log_warning("uninstall", f"Unsicherer Unit-Eintrag bleibt erhalten: {srv_file}")
-            return False
-        unit_preimages.append((srv, srv_file, info.st_dev, info.st_ino))
 
     # Phase 2: nur die zuvor gebundenen Unit-Inodes entfernen.
     for srv, srv_file, expected_dev, expected_ino in unit_preimages:
@@ -894,7 +935,7 @@ def uninstall_system_packages():
     log_task_completed("Deinstallation (System-Pakete)")
 
 
-def uninstall_venv():
+def uninstall_venv(*, check_only=False):
     """Entfernt das Python Virtual Environment."""
     try:
         install_user = get_install_user()
@@ -916,7 +957,8 @@ def uninstall_venv():
         return False
     venv_path = normalized_venv
 
-    print(f"\n→ Entferne Python venv ({venv_path})…")
+    if not check_only:
+        print(f"\n→ Entferne Python venv ({venv_path})…")
 
     if os.path.lexists(venv_path):
         try:
@@ -927,6 +969,8 @@ def uninstall_venv():
                 or before.st_uid != account.pw_uid
             ):
                 raise RuntimeError("venv ist kein benutzereigenes echtes Verzeichnis")
+            if check_only:
+                return True
             current = os.lstat(venv_path)
             if (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
                 raise RuntimeError("venv wechselte vor der Löschung")
@@ -948,7 +992,97 @@ def uninstall_venv():
     else:
         print("  ℹ️  Kein venv gefunden.")
 
+    if check_only:
+        return True
     log_task_completed("Deinstallation (venv)")
+    return True
+
+
+INSTANCE_ROLE_PATH = Path("/etc/e3dc-control/instance_role.json")
+
+
+def _bind_instance_role():
+    """Bindet den root-eigenen Rollenanker vor jeder Dienststilllegung."""
+    if not os.path.lexists(INSTANCE_ROLE_PATH):
+        return None
+    parent_fd = os.open(INSTANCE_ROLE_PATH.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    descriptor = None
+    try:
+        parent = os.fstat(parent_fd)
+        if parent.st_uid != 0 or parent.st_mode & 0o022:
+            raise RuntimeError("Rollenanker-Verzeichnis ist nicht root-eigen und schreibgeschützt")
+        descriptor = os.open(INSTANCE_ROLE_PATH.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1 or info.st_mode & 0o022 or info.st_size > 65536:
+            raise RuntimeError("Rollenanker besitzt unsichere Metadaten")
+        content = os.read(descriptor, 65537)
+        data = json.loads(content.decode("utf-8"))
+        role = data.get("mode") if isinstance(data, dict) else None
+        if role not in {"off", "master", "slave", "shadow"}:
+            raise RuntimeError("Rollenanker enthält keine gültige Rolle")
+        identity = (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        named = os.stat(INSTANCE_ROLE_PATH.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (named.st_dev, named.st_ino) != identity[:2]:
+            raise RuntimeError("Rollenanker wechselte beim Binden")
+        return {"parent_fd": parent_fd, "descriptor": descriptor, "identity": identity,
+                "parent_identity": (parent.st_dev, parent.st_ino), "role": role}
+    except Exception:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent_fd)
+        raise
+
+
+def _remove_bound_instance_role(binding):
+    """Entfernt nur den vor der Stilllegung gebundenen Anker ohne laufenden Writer."""
+    if binding is None:
+        return True
+    if not all(_service_is_proven_inactive(name) for name in HARDWARE_WRITER_SERVICE_NAMES):
+        raise RuntimeError("Ein Writer ist aktiv; Rollenanker bleibt erhalten")
+    info = os.stat(INSTANCE_ROLE_PATH.name, dir_fd=binding["parent_fd"], follow_symlinks=False)
+    identity = (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    parent = os.lstat(INSTANCE_ROLE_PATH.parent)
+    if identity != binding["identity"] or (parent.st_dev, parent.st_ino) != binding["parent_identity"]:
+        raise RuntimeError("Rollenanker oder Verzeichnis wechselte; Entfernung abgebrochen")
+    os.unlink(INSTANCE_ROLE_PATH.name, dir_fd=binding["parent_fd"])
+    print("  ✓ Rollenanker entfernt: /etc/e3dc-control/instance_role.json")
+    _remove_empty_instance_role_parent(binding)
+    return True
+
+
+def _remove_empty_instance_role_parent(binding):
+    """Räumt nur das gebundene Verzeichnis ab, wenn keine anderen Dateien bleiben."""
+    if binding is None or not os.path.lexists(INSTANCE_ROLE_PATH.parent):
+        return True
+    parent = os.lstat(INSTANCE_ROLE_PATH.parent)
+    if (parent.st_dev, parent.st_ino) != binding["parent_identity"]:
+        raise RuntimeError("Rollenanker-Verzeichnis wechselte; Bereinigung abgebrochen")
+    try:
+        os.rmdir(INSTANCE_ROLE_PATH.parent)
+    except OSError as exc:
+        if exc.errno != errno.ENOTEMPTY:
+            raise
+    return True
+
+
+def _preflight_full_removal():
+    """Prüft erkennbare Abbruchgründe, bevor ein Dienst gestoppt wird."""
+    if uninstall_venv(check_only=True) is not True or uninstall_service(check_only=True) is not True:
+        return False
+    watchdog_unit = "/etc/systemd/system/piguard.service"
+    if os.path.lexists(watchdog_unit):
+        info = os.lstat(watchdog_unit)
+        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_nlink != 1:
+            log_warning("uninstall", "Unsichere Watchdog-Unit bleibt erhalten.")
+            return False
+    if not _apache_security_entries_safe_for_removal():
+        log_warning("uninstall", "Unsicherer Apache-Laufzeitpfadschutz bleibt erhalten.")
+        return False
+    if os.path.lexists(str(CONF_DESTINATION)) or os.path.lexists(str(CONF_ENABLED)):
+        checked = run_command("sudo /usr/sbin/apache2ctl configtest", timeout=30)
+        if not isinstance(checked, dict) or not checked.get("success"):
+            log_warning("uninstall", "Apache-Konfiguration ist vor der Vollentfernung ungültig.")
+            return False
     return True
 
 
@@ -962,9 +1096,39 @@ def uninstall_full():
         return
 
     delete_data = False
-    if input("\nMöchten Sie auch alle gesicherten Verlaufsdaten und Backups (Data-Ordner) dauerhaft löschen? (j/n): ").strip().lower() == "j":
+    if input("\nAuch Verlaufsdaten und Web-Backups unter /var/www/html dauerhaft löschen? (j/n): ").strip().lower() == "j":
         delete_data = True
 
+    binding = None
+    try:
+        try:
+            binding = _bind_instance_role()
+        except Exception as exc:
+            print(f"✗ Deinstallation vor jeder Änderung abgebrochen: {exc}. "
+                  f"Datei {INSTANCE_ROLE_PATH} prüfen; Vollentfernung danach erneut starten.")
+            return False
+        if binding and binding["role"] != "off":
+            print(f"  ℹ Rolle {binding['role']}: Vollentfernung löst die lokale Rollenbindung nach der Writer-Stilllegung.")
+        if _preflight_full_removal() is not True:
+            print("✗ Vorprüfung fehlgeschlagen; Dienste und Units bleiben erhalten.")
+            return False
+        print("\n→ Beende und entferne Docker Container (falls vorhanden)…")
+        if not _remove_managed_docker_container():
+            print("  ✗ Docker-Container ist nicht beweisbar gestoppt und entfernt.")
+            return False
+        print("  ✓ Docker-Schritt abgeschlossen")
+
+        return _uninstall_full_after_preflight(delete_data, binding)
+    except Exception as exc:
+        print(f"✗ Deinstallation abgebrochen: {exc}")
+        return False
+    finally:
+        if binding:
+            os.close(binding["descriptor"])
+            os.close(binding["parent_fd"])
+
+
+def _uninstall_full_after_preflight(delete_data, binding):
     # Reihenfolge optimiert:
     if uninstall_watchdog() is not True:
         print("\n✗ Deinstallation abgebrochen: Watchdog/Supervisor blieb offen.\n")
@@ -977,19 +1141,22 @@ def uninstall_full():
         )
         return False
 
-    print("\n→ Beende und entferne Docker Container (falls vorhanden)…")
-    if not _remove_managed_docker_container():
-        print("  ✗ Docker-Container ist nicht beweisbar gestoppt und entfernt.")
-        return False
-    print("  ✓ Docker Container 'e3dc-control' entfernt")
+    role_cleanup_pending = False
+    try:
+        _remove_bound_instance_role(binding)
+    except (RuntimeError, OSError) as exc:
+        role_cleanup_pending = True
+        print(f"  ⚠ Rollenanker-Bereinigung nicht abgeschlossen: {exc}. "
+              f"Datei {INSTANCE_ROLE_PATH} nach Abschluss prüfen.")
 
     uninstall_ramdisk()
 
     # Webportal ohne Nachfrage entfernen (Data-Ordner ausnehmen, falls er nicht gelöscht werden soll)
     print("\n→ Entferne Webportal…")
     if not delete_data:
-        # Lösche alles außer den data Ordner (z.B. history_backups, *.txt) im Webverzeichnis
-        run_command("sudo find /var/www/html/ -mindepth 1 -maxdepth 1 ! -name 'data' ! -name 'history_backups' -exec rm -rf {} +", timeout=20)
+        # Dieselben persistenten Dateien schützen wie der Apache-Laufzeitpfadschutz.
+        exclusions = " ".join("! -name " + shlex.quote(os.path.basename(path)) for path in APACHE_PROTECTED_WEBROOT_PATHS)
+        run_command("sudo find /var/www/html/ -mindepth 1 -maxdepth 1 " + exclusions + " -exec rm -rf {} +", timeout=20)
         print("  ✓ Webverzeichnis geleert (Daten/Backups wurden behalten!)")
     else:
         run_command("sudo rm -rf /var/www/html/*", timeout=20)
@@ -1004,6 +1171,14 @@ def uninstall_full():
     if apache_security_cleanup == APACHE_SECURITY_FAILED:
         print("\n✗ Deinstallation wegen offenem Apache-Sicherheitsvertrag abgebrochen.\n")
         return False
+    # Die spätere Diagramm-Bereinigung entfernt auch den Modul-Installer im Rollenordner.
+    if not role_cleanup_pending:
+        try:
+            _remove_empty_instance_role_parent(binding)
+        except (RuntimeError, OSError) as exc:
+            role_cleanup_pending = True
+            print(f"  ⚠ Rollenverzeichnis-Bereinigung nicht abgeschlossen: {exc}. "
+                  f"Verzeichnis {INSTANCE_ROLE_PATH.parent} nach Abschluss prüfen.")
     if uninstall_venv() is not True:
         print("\n✗ Deinstallation wegen unsicherem oder nicht löschbarem venv abgebrochen.\n")
         return False
@@ -1021,6 +1196,8 @@ def uninstall_full():
             shutil.rmtree(INSTALL_PATH, ignore_errors=True)
             print("  ✓ Installationsordner gelöscht")
 
+    if role_cleanup_pending:
+        print(f"  ℹ Rollenbindung nicht vollständig entfernt: {INSTANCE_ROLE_PATH}")
     if apache_security_cleanup == APACHE_SECURITY_RETAINED:
         print(
             "\n✓ Deinstallation abgeschlossen. Der Apache-Laufzeitpfadschutz "
@@ -1045,12 +1222,18 @@ def uninstall_menu():
 
     choice = input("Auswahl: ").strip()
 
-    if choice == "1": uninstall_full()
-    elif choice == "2": uninstall_watchdog()
-    elif choice == "3": uninstall_ramdisk()
-    elif choice == "4": uninstall_diagramm()
-    elif choice == "5": uninstall_service()
-    elif choice == "6": uninstall_venv()
+    if choice in {"2", "3", "4", "5", "6"}:
+        prompt = ("Alle Regler werden gestoppt und ihre Units entfernt. Fortfahren? (j/N): "
+                  if choice == "5" else "Gewählte Komponenten wirklich entfernen? (j/N): ")
+        if input(prompt).strip().lower() != "j":
+            print("Abbruch; Komponenten bleiben erhalten.")
+            return None
+    if choice == "1": return uninstall_full()
+    elif choice == "2": return uninstall_watchdog()
+    elif choice == "3": return uninstall_ramdisk()
+    elif choice == "4": return uninstall_diagramm()
+    elif choice == "5": return uninstall_service()
+    elif choice == "6": return uninstall_venv()
     else: print("Abbruch.")
 
 register_command("29", "Deinstallation", uninstall_menu, sort_order=29)

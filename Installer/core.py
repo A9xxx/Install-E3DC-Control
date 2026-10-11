@@ -45,7 +45,7 @@ MAIN_MENU_SLOTS = [
     ("2", "20", "Systemstatus anzeigen"),
     ("3", "24", "Rechte prüfen & korrigieren"),
     ("4", "99", "Notfallmodus / System reparieren"),
-    ("5", "12", "Rollback auf Git-Stand"),
+    ("5", "12", "Rollback auf freigegebenes Stable-Release"),
     ("6", "13", "Backup erstellen / verwalten"),
     ("7", None, "Expertenmenü"),
     ("8", "25", "Systempakete vorbereiten"),

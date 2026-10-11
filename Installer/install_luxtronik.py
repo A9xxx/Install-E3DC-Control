@@ -3,6 +3,7 @@ import json
 import hashlib
 import shlex
 
+from .config_secret_permissions import config_secret_file_mode
 from .core import register_command
 from .utils import (
     MANAGER_LOCK_TMPFILES_CONFIG,
@@ -34,6 +35,11 @@ from .secure_file_transaction import (
 LUX_SCRIPT_NAME = "energy_manager.py"
 SERVICE_NAME = "energy_manager"
 SYSTEMD_UNIT_ROOT = "/etc/systemd/system"
+V4_CONFIG_PATH = "/var/www/html/data/e3dc_v4.json"
+_OWN_SERVICE_NAMES = frozenset({
+    "energy_manager", "e3dc-heizstab", "wp-manager", "e3dc-lux-live",
+    "e3dc-idm-live", "e3dc-stiebel-live", "e3dc-dimplex-live",
+})
 LEGACY_SERVICE_NAME = "wp-manager"
 _MAX_CONFIG_BYTES = 4 * 1024 * 1024
 _MAX_UNIT_BYTES = 1024 * 1024
@@ -91,7 +97,7 @@ def _service_unit_exists(service_name):
 def _query_service_state(service_name):
     result = run_command(
         "LC_ALL=C systemctl show --no-pager "
-        "--property=LoadState --property=ActiveState --property=UnitFileState "
+        "--property=LoadState --property=ActiveState --property=SubState --property=UnitFileState "
         + shlex.quote(service_name),
         timeout=15,
     )
@@ -124,14 +130,36 @@ def _query_service_state(service_name):
     enabled_state = values.get("UnitFileState") or "not-found"
     if load_state not in {"loaded", "not-found", "masked"}:
         raise RuntimeError(f"Unklarer LoadState für {service_name}: {load_state}")
-    if active_state not in {"active", "inactive", "failed"}:
-        raise RuntimeError(f"Unklarer ActiveState für {service_name}: {active_state}")
+    auto_restart = (
+        service_name in _OWN_SERVICE_NAMES and load_state == "loaded"
+        and active_state == "activating" and values.get("SubState") == "auto-restart"
+    )
+    if active_state not in {"active", "inactive", "failed"} and not auto_restart:
+        raise RuntimeError(
+            f"Unklarer ActiveState für {service_name}: {active_state}. "
+            "Dienstzustand vor erneuter Einrichtung administrativ prüfen."
+        )
     return {
         "load_state": load_state,
         "active_state": active_state,
-        "was_active": active_state == "active",
+        "was_active": active_state == "active" or auto_restart,
         "enabled_state": enabled_state,
     }
+
+
+def _reset_replaced_failed_service(service_name, replaced_names):
+    """Bereinigt nur eigene ersetzte Units, bevor der Rückweg gebunden wird."""
+    if service_name not in _OWN_SERVICE_NAMES or service_name not in replaced_names:
+        raise RuntimeError(f"Failed-Zustand eines nicht ersetzten Dienstes bleibt erhalten: {service_name}")
+    result = run_command("sudo systemctl reset-failed " + shlex.quote(service_name), timeout=15)
+    state = _query_service_state(service_name)
+    if not result.get("success") or state.get("active_state") != "inactive":
+        raise RuntimeError(
+            f"Failed-Zustand von {service_name} konnte nicht bereinigt werden. "
+            "Dienstzustand vor erneuter Einrichtung administrativ prüfen."
+        )
+    print(f"→ Fehlgeschlagenen eigenen Dienst bereinigt: {service_name}; Rückweg ab inaktivem Zustand.")
+    return state
 
 
 def _stop_service_confirmed(service_name, state=None):
@@ -223,6 +251,20 @@ def _start_service_confirmed(service_name):
         )
     if _query_service_state(service_name).get("active_state") != "active":
         raise RuntimeError(f"{service_name} ist nach dem Start nicht aktiv")
+
+
+def _restore_service_running_state(service_name, previous):
+    """Restauriert auch die zuvor beabsichtigte eigene Neustartschleife."""
+    if previous.get("active_state") != "activating":
+        return _start_service_confirmed(service_name)
+    result = run_command("sudo systemctl start " + shlex.quote(service_name), timeout=30)
+    after = _query_service_state(service_name)
+    if after.get("active_state") not in {"active", "activating"}:
+        raise RuntimeError(
+            f"Neustartzustand von {service_name} konnte nicht restauriert werden: "
+            + format_command_failure(result)
+        )
+    return True
 
 
 def _unit_path(service_name):
@@ -355,7 +397,7 @@ def install_dependencies(wp_type=0, *, install_user=None, explicit_venv_path=Non
 
     packages = ["requests"]
     if wp_type in (1, 2, 4, 5):
-        packages.append("pymodbus")
+        packages.extend(["pymodbus", "pyserial"])
     if wp_type == 0:
         packages.append("luxtronik")
     for package in packages:
@@ -520,7 +562,7 @@ def setup_script(wp_type=0, *, install_user=None, explicit_install_path=None):
     if not _lock_product_code_permissions(lux_dir, install_user, "Energy Manager"):
         return False
 
-    if wp_type == 2:
+    if wp_type in {2, 3}:
         heater_script = os.path.join(
             _installer_dir(explicit_install_path),
             "heizstab_manager.py",
@@ -553,7 +595,7 @@ def configure_luxtronik(wp_type=0, headless=False, *, explicit_install_path=None
     """Erfasst die Sollwerte; geschrieben werden sie erst in der Unit-Transaktion."""
     print("\n=== Energy Manager (Wärmepumpe & Lademanagement) ===\n")
 
-    if wp_type not in {-1, 0, 1, 2, 4, 5}:
+    if wp_type not in {-1, 0, 1, 2, 3, 4, 5, 6}:
         print(f"✗ Nicht unterstützter Wärmepumpentyp: {wp_type}")
         return False
 
@@ -565,25 +607,38 @@ def configure_luxtronik(wp_type=0, headless=False, *, explicit_install_path=None
         os.path.dirname(_installer_dir(explicit_install_path)),
         "e3dc.config.txt",
     )
-    if not os.path.lexists(config_file):
+    if not os.path.lexists(config_file) and not os.path.lexists(V4_CONFIG_PATH):
         print(f"✗ Anlagenkonfiguration fehlt: {config_file}")
         return False
 
     replacements = {
         "wp_type": f"wp_type = {wp_type}",
-        "auto_mode": "auto_mode = 1",
     }
+    if wp_type == 2:
+        # Heizstab ist ein Zusatzverbraucher; der vorhandene WP-Typ bleibt erhalten.
+        replacements.pop("wp_type")
+        replacements["heizstab"] = "heizstab = 1"
+    if wp_type in {0, 1, 4, 5}:
+        replacements["luxtronik"] = "luxtronik = 1"
     if not headless:
-        if wp_type == 1:
-            idm_ip = input("\nWie lautet die IP-Adresse deiner IDM Wärmepumpe?: ").strip()
+        if wp_type == 3:
+            meter_ip = input("\nIP-Adresse des Shelly Pro3EM: ").strip()
+            if meter_ip:
+                replacements["shelly_3em_ip"] = f"shelly_3em_ip = {meter_ip}"
+        elif wp_type == 0:
+            lux_ip = input("\nIP-Adresse der Luxtronik-Wärmepumpe: ").strip()
+            if lux_ip:
+                replacements["luxtronik_ip"] = f"luxtronik_ip = {lux_ip}"
+        elif wp_type == 1:
+            idm_ip = input("\nIP-Adresse der IDM-Wärmepumpe: ").strip()
             if idm_ip:
                 replacements["idm_ip"] = f"idm_ip = {idm_ip}"
         elif wp_type == 4:
-            stiebel_ip = input("\nWie lautet die IP-Adresse deines Stiebel Eltron ISG?: ").strip()
+            stiebel_ip = input("\nWie lautet die IP-Adresse des Stiebel Eltron ISG?: ").strip()
             if stiebel_ip:
                 replacements["stiebel_isg_ip"] = f"stiebel_isg_ip = {stiebel_ip}"
         elif wp_type == 5:
-            dimplex_ip = input("\nWie lautet die IP-Adresse deiner Dimplex WPM Touch / NWPM?: ").strip()
+            dimplex_ip = input("\nWie lautet die IP-Adresse der Dimplex WPM Touch / NWPM?: ").strip()
             if dimplex_ip:
                 replacements["dimplex_ip"] = f"dimplex_ip = {dimplex_ip}"
         elif wp_type == 2:
@@ -591,9 +646,11 @@ def configure_luxtronik(wp_type=0, headless=False, *, explicit_install_path=None
             sh_ip = input("IP-Adresse des Shelly-Heizlüfters HTTP [0.0.0.0]: ").strip() or "0.0.0.0"
             replacements["heizstab_ip"] = f"heizstab_ip = {hs_ip}"
             replacements["shelly_heiz_ip"] = f"shelly_heiz_ip = {sh_ip}"
+            if hs_ip not in {"", "0.0.0.0"} or sh_ip not in {"", "0.0.0.0"}:
+                replacements["heizstab"] = "heizstab = 1"
 
     if not headless:
-        input("Drücke Enter um fortzufahren...")
+        input("Zum Fortfahren Enter drücken...")
     return replacements
 
 def cleanup_old_service():
@@ -613,7 +670,7 @@ def setup_service(
     """Projiziert Config, Units und Dienstzustände als eine Transaktion."""
 
     print("\n→ Richte Services ein…")
-    if wp_type not in {-1, 0, 1, 2, 4, 5}:
+    if wp_type not in {-1, 0, 1, 2, 3, 4, 5, 6}:
         print(f"✗ Nicht unterstützter Wärmepumpentyp: {wp_type}")
         return False
 
@@ -635,6 +692,18 @@ def setup_service(
         )["python"]
     except Exception as exc:
         print(f"✗ Gebundener venv-Laufzeitvertrag fehlt: {exc}")
+        return False
+
+    try:
+        selection_snapshot = read_bound_regular_file(
+            V4_CONFIG_PATH, expected_uid=install_uid, expected_gid=www_gid,
+            max_bytes=_MAX_CONFIG_BYTES,
+        )
+        selected_config = json.loads(selection_snapshot["payload"].decode("utf-8-sig"))
+        if not isinstance(selected_config, dict):
+            raise ValueError("V4-Konfiguration ist kein Objekt")
+    except Exception as exc:
+        print(f"✗ Konfiguration vor der Dienstauswahl nicht sicher lesbar: {exc}")
         return False
 
     live_services = {
@@ -661,7 +730,7 @@ def setup_service(
     }
     all_live_names = tuple(item[0] for item in live_services.values())
     manager_script = os.path.join(installer_dir, "luxtronik", "energy_manager.py")
-    if wp_type == 2:
+    if wp_type in {2, 3}:
         service_specs = [
             (
                 "e3dc-heizstab",
@@ -671,8 +740,7 @@ def setup_service(
                 (),
             )
         ]
-        conflicting_services = (SERVICE_NAME, *all_live_names)
-    elif wp_type < 0:
+    elif wp_type in {-1, 6}:
         service_specs = [
             (
                 SERVICE_NAME,
@@ -682,7 +750,6 @@ def setup_service(
                 (),
             )
         ]
-        conflicting_services = (*all_live_names, "e3dc-heizstab")
     else:
         live_name, live_description, live_script = live_services[wp_type]
         service_specs = [
@@ -695,9 +762,6 @@ def setup_service(
                 (f"{live_name}.service",),
             ),
         ]
-        conflicting_services = tuple(
-            name for name in (*all_live_names, "e3dc-heizstab") if name != live_name
-        )
 
     if not install_user or any(
         character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
@@ -719,8 +783,15 @@ def setup_service(
             return False
 
     replacements = dict(config_updates or {})
-    replacements.setdefault("wp_type", f"wp_type = {wp_type}")
-    replacements.setdefault("auto_mode", "auto_mode = 1")
+    if wp_type == 2:
+        replacements.pop("wp_type", None)
+        replacements.setdefault("heizstab", "heizstab = 1")
+    else:
+        replacements.setdefault("wp_type", f"wp_type = {wp_type}")
+    from .web_installer import heat_source_allowed_companions, has_shelly_sgready_config
+    if wp_type in {0, 1, 4, 5} or (wp_type in {-1, 6} and has_shelly_sgready_config(selected_config)):
+        replacements.setdefault("luxtronik", "luxtronik = 1")
+
     for key, replacement in replacements.items():
         if (
             not key
@@ -734,6 +805,22 @@ def setup_service(
         ):
             print(f"✗ Ungültige Konfigurationsprojektion für {key!r}.")
             return False
+
+    projected_config = dict(selected_config)
+    for key, assignment in replacements.items():
+        projected_config[key] = assignment.partition("=")[2].strip().strip('"').strip("'")
+    modules_by_service = {
+        SERVICE_NAME: "heatpump", "e3dc-heizstab": "heizstab",
+        "e3dc-lux-live": "lux_live", "e3dc-idm-live": "idm_live",
+        "e3dc-stiebel-live": "stiebel_live", "e3dc-dimplex-live": "dimplex_live",
+    }
+    selected_module = "heizstab" if wp_type in {2, 3} else "heatpump"
+    allowed = heat_source_allowed_companions(selected_module, projected_config)
+    selected_services = {spec[0] for spec in service_specs}
+    conflicting_services = tuple(
+        name for name, module in modules_by_service.items()
+        if name not in selected_services and module not in allowed
+    )
 
     unit_payloads = {}
     for service_name, description, script_path, restart_sec, after_units in service_specs:
@@ -784,6 +871,10 @@ WantedBy=multi-user.target
         os.path.dirname(installer_dir),
         "e3dc.config.txt",
     )
+    v4_preimage = None
+    v4_committed = None
+    v4_payload = None
+    v4_mode = None
     config_preimage = None
     config_committed = None
     config_payload = None
@@ -799,6 +890,7 @@ WantedBy=multi-user.target
             try:
                 config_preimage = snapshot_bound_file(
                     config_path,
+                    allow_missing=True,
                     expected_uid=install_uid,
                     max_bytes=_MAX_CONFIG_BYTES,
                 )
@@ -806,10 +898,24 @@ WantedBy=multi-user.target
                     raise RuntimeError(
                         "Anlagenkonfiguration ist gruppen- oder weltbeschreibbar"
                     )
-                config_payload = render_assignment_updates(
-                    config_preimage["payload"],
-                    replacements,
+                if config_preimage.get("exists"):
+                    config_payload = render_assignment_updates(config_preimage["payload"], replacements)
+                v4_preimage = read_bound_regular_file(
+                    V4_CONFIG_PATH, expected_uid=install_uid, expected_gid=www_gid,
+                    max_bytes=_MAX_CONFIG_BYTES,
                 )
+                if not snapshots_match(selection_snapshot, v4_preimage):
+                    raise RuntimeError("Konfiguration wechselte seit der Dienstauswahl; Einrichtung erneut starten.")
+                v4 = json.loads(v4_preimage["payload"].decode("utf-8-sig"))
+                if not isinstance(v4, dict):
+                    raise RuntimeError("V4-Konfiguration ist kein Objekt; Konfiguration im Config Editor prüfen.")
+                v4_mode = config_secret_file_mode(v4)
+                if int(v4_preimage["mode"]) & ~v4_mode:
+                    raise RuntimeError("V4-Konfiguration verletzt den Dateirechtevertrag des Config Editors.")
+                for key, assignment in replacements.items():
+                    value = assignment.partition("=")[2].strip().strip('"').strip("'")
+                    v4[key] = int(value) if key in {"wp_type", "auto_mode", "heizstab", "luxtronik"} else value
+                v4_payload = (json.dumps(v4, ensure_ascii=False, indent=4) + "\n").encode("utf-8")
                 service_prestates = {
                     name: _query_service_state(name)
                     for name in all_names
@@ -819,11 +925,6 @@ WantedBy=multi-user.target
                     for name, state in service_prestates.items()
                     if state.get("active_state") == "failed"
                 )
-                if failed_prestates:
-                    raise RuntimeError(
-                        "Failed-Prestates sind nicht exakt restaurierbar: "
-                        + ", ".join(failed_prestates)
-                    )
                 unrestorable = {
                     name: service_prestates[name]["enabled_state"]
                     for name in all_names
@@ -847,6 +948,15 @@ WantedBy=multi-user.target
                     name: _snapshot_unit(name)
                     for name in (*selected_names, LEGACY_SERVICE_NAME)
                 }
+                replaced_names = all_names
+                for name in failed_prestates:
+                    if name not in replaced_names or name not in _OWN_SERVICE_NAMES:
+                        raise RuntimeError(
+                            f"Failed-Zustand von {name} bleibt erhalten; "
+                            "Dienst vor erneuter Einrichtung administrativ prüfen."
+                        )
+                for name in failed_prestates:
+                    service_prestates[name] = _reset_replaced_failed_service(name, replaced_names)
                 transaction_started = True
 
                 # Zuerst alle bisherigen Entscheider, anschließend deren Live-Quellen.
@@ -863,14 +973,15 @@ WantedBy=multi-user.target
                     service_prestates[LEGACY_SERVICE_NAME],
                 )
 
-                config_committed = atomic_write_bound_file(
-                    config_path,
-                    config_payload,
-                    uid=install_uid,
-                    gid=www_gid,
-                    mode=0o640,
-                    expected_snapshot=config_preimage,
+                v4_committed = atomic_write_bound_file(
+                    V4_CONFIG_PATH, v4_payload, uid=install_uid, gid=www_gid,
+                    mode=v4_mode, expected_snapshot=v4_preimage,
                 )
+                if config_payload is not None:
+                    config_committed = atomic_write_bound_file(
+                        config_path, config_payload, uid=install_uid, gid=www_gid,
+                        mode=0o640, expected_snapshot=config_preimage,
+                    )
                 for name in selected_names:
                     unit_committed[name] = atomic_write_bound_file(
                         _unit_path(name),
@@ -914,7 +1025,7 @@ WantedBy=multi-user.target
                 for name in dict.fromkeys((*conflicting_services, LEGACY_SERVICE_NAME)):
                     final_state = _query_service_state(name)
                     if (
-                        final_state.get("active_state") == "active"
+                        final_state.get("active_state") in {"active", "activating"}
                         or final_state.get("enabled_state")
                         in {"enabled", "enabled-runtime"}
                     ):
@@ -934,7 +1045,7 @@ WantedBy=multi-user.target
                         if name not in service_prestates:
                             continue
                         try:
-                            if _query_service_state(name).get("active_state") == "active":
+                            if _query_service_state(name).get("active_state") not in {"inactive", "failed"}:
                                 decision_stopped = False
                         except Exception as rollback_exc:
                             decision_stopped = False
@@ -947,6 +1058,13 @@ WantedBy=multi-user.target
                                 _disable_if_enabled(name, current_state)
                             except Exception as rollback_exc:
                                 rollback_errors.append(f"Disable {name}: {rollback_exc}")
+                        try:
+                            _restore_changed_file(
+                                v4_preimage, v4_committed, v4_payload,
+                                install_uid, www_gid, v4_mode,
+                            )
+                        except Exception as rollback_exc:
+                            rollback_errors.append(f"V4-Config: {rollback_exc}")
                         try:
                             _restore_changed_file(
                                 config_preimage,
@@ -1004,7 +1122,7 @@ WantedBy=multi-user.target
                                     if name in decision_writers and rollback_errors:
                                         continue
                                     try:
-                                        _start_service_confirmed(name)
+                                        _restore_service_running_state(name, service_prestates[name])
                                     except Exception as rollback_exc:
                                         rollback_errors.append(f"Start {name}: {rollback_exc}")
                     else:
@@ -1040,6 +1158,7 @@ WantedBy=multi-user.target
 def install_luxtronik_menu(
     headless=False,
     *,
+    skip_missing_type=False,
     explicit_install_path=None,
     explicit_install_user=None,
     explicit_venv_path=None,
@@ -1065,41 +1184,52 @@ def install_luxtronik_menu(
         print(f"✗ Energy-Manager-Kontext ist nicht vertrauenswürdig: {exc}")
         return False
     
-    wp_type = -1
+    labels = {
+        -1: "Keine Wärmepumpe / deaktiviert",
+        0: "Luxtronik",
+        1: "IDM Navigator 2.0",
+        2: "Heizstab / Shelly-Heizlüfter",
+        3: "Shelly Pro3EM (WP ohne native Anbindung)",
+        4: "Stiebel Eltron ISG / WPM",
+        5: "Dimplex WPM Touch / NWPM",
+        6: "E3DC Leistungsmesser (PM)",
+    }
     if headless:
         try:
             snapshot = read_bound_regular_file(
-                "/var/www/html/data/e3dc_v4.json",
-                expected_uid=get_user_ids(bound_user)[0],
-                expected_gid=get_www_data_gid(),
-                max_bytes=_MAX_CONFIG_BYTES,
+                V4_CONFIG_PATH, expected_uid=get_user_ids(bound_user)[0],
+                expected_gid=get_www_data_gid(), max_bytes=_MAX_CONFIG_BYTES,
             )
             v4 = json.loads(snapshot["payload"].decode("utf-8-sig"))
-            if not isinstance(v4, dict) or "wp_type" not in v4:
-                raise ValueError("wp_type fehlt in der V4-Konfiguration")
-            wp_type = int(v4.get("wp_type", -1))
+            if not isinstance(v4, dict):
+                raise ValueError("Konfiguration ist kein JSON-Objekt")
+            if "wp_type" not in v4:
+                if skip_missing_type:
+                    print("ℹ Wärmepumpen-Schritt übersprungen: wp_type fehlt in der Konfiguration; "
+                          "die Komplettinstallation wird fortgesetzt.")
+                    return True
+                raise ValueError("Wärmepumpentyp fehlt")
+            wp_type = int(v4["wp_type"])
         except Exception as exc:
-            print(f"✗ Wärmepumpentyp ist im Headless-Modus nicht sicher lesbar: {exc}")
+            print(f"✗ Wärmepumpentyp nicht sicher lesbar: {exc}. "
+                  "Typ in der Konfiguration (Config Editor) setzen oder Konsole 41 interaktiv starten.")
             return False
         print(f"→ Headless-Modus: wp_type = {wp_type} aus Konfiguration gelesen.")
     else:
-        print("Welche Wärmepumpe möchtest du anbinden?")
-        print("-1) Keine Wärmepumpe (nur Smart Charging / Wallbox)")
-        print("0) Luxtronik 2.0 (Alpha Innotec, Novelan, etc.) via WebSocket")
-        print("1) IDM (AERO, TERRA) via Modbus-TCP")
-        print("2) Heizstab / Shelly Manager (Modbus-TCP & Shelly Plug)")
-        print("4) Stiebel Eltron ISG / WPM via Modbus-TCP (read-only live)")
-        print("5) Dimplex WPM Touch / NWPM via Modbus-TCP")
-        wp_choice = input("\nAuswahl (Standard -1): ")
-        if wp_choice == "-1": wp_type = -1
-        elif wp_choice == "0": wp_type = 0
-        elif wp_choice == "1": wp_type = 1
-        elif wp_choice == "2": wp_type = 2
-        elif wp_choice == "4": wp_type = 4
-        elif wp_choice == "5": wp_type = 5
-
-    if wp_type not in {-1, 0, 1, 2, 4, 5}:
-        print(f"✗ Ungültige Wärmepumpenauswahl: {wp_type}")
+        print("Wärmepumpentyp für die Einrichtung auswählen:")
+        for value, label in labels.items():
+            print(f"{value}) {label}")
+        wp_choice = input("\nAuswahl (Enter = Abbrechen, bisherigen Typ behalten): ").strip()
+        if not wp_choice:
+            print("→ Einrichtung abgebrochen; bisheriger Wärmepumpentyp bleibt erhalten.")
+            return None
+        try:
+            wp_type = int(wp_choice)
+        except ValueError:
+            print("✗ Ungültige Wärmepumpenauswahl; Typ im Config Editor prüfen.")
+            return False
+    if wp_type not in labels:
+        print(f"✗ Ungültige Wärmepumpenauswahl: {wp_type}; Typ im Config Editor prüfen.")
         return False
 
     # Cache-Bereinigung
@@ -1145,19 +1275,7 @@ def install_luxtronik_menu(
         print("✗ Energy-Manager-Installation abgebrochen: Transaktion fehlgeschlagen.")
         return False
 
-    if wp_type == 4:
-        label = "Stiebel"
-    elif wp_type == 5:
-        label = "Dimplex"
-    elif wp_type == 1:
-        label = "IDM"
-    elif wp_type == 2:
-        label = "Heizstab/Shelly"
-    elif wp_type == -1:
-        label = "Smart Charging"
-    else:
-        label = "Luxtronik"
-    log_task_completed(f"Energy Manager Installation ({label})")
+    log_task_completed(f"Energy Manager Installation ({labels[wp_type]})")
     return True
 
-register_command("41", "Energy Manager (Luxtronik/IDM Wärmepumpe & Lademanagement)", install_luxtronik_menu, sort_order=41)
+register_command("41", "Energy Manager (Wärmepumpe, Heizstab & Lademanagement)", install_luxtronik_menu, sort_order=41)

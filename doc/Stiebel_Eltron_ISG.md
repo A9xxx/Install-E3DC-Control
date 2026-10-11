@@ -340,6 +340,14 @@ Pre-Dump-Freigaben, Wiedereinschaltsperre ab Verdichterstillstand,
 Mindestlaufzeit, Signalhalt, Sicherheitsabschaltung und die Toleranz bei
 E3DC-Datenlücken gelten unverändert. Der Ausgang hat keine eigene Regellogik.
 
+Die Heizgrenze sperrt die SG-Ready-Freigabe nicht. Für den automatischen
+Start genügt eine gültige, frische Warmwasser- oder Rücklauftemperatur unter
+ihrem Maximum abzüglich Totzone. Fehlt ein Kanal, zählt nur der vorhandene;
+ohne gültige Temperaturdaten gibt es keine automatische Freigabe. Das
+Temperaturziel gilt erst als erreicht, wenn alle gültigen Kanäle ihr Ziel
+erreicht haben. Die Zieltemperaturen werden nicht ins ISG geschrieben;
+die Wärmepumpe regelt den SG-Ready-Betrieb intern.
+
 ### Voraussetzungen
 
 - Wärmepumpen-Typ **Stiebel Eltron ISG / WPM**, **WP-/Verbrauchslogging

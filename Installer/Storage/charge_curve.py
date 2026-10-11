@@ -721,6 +721,8 @@ def build_ladekurve_meta(plan: Dict[str, Any]) -> Dict[str, Any]:
             canonical_sim_tl.append({
                 "ts": start_ts_ms,
                 "soc": soc,
+                **({"soc_start": projection["soc_start_pct"]}
+                   if projection.get("soc_start_pct") is not None else {}),
                 "pv_w": safe_float(projection.get("pv_w"), 0.0),
             })
         if len(canonical_sim_tl) < 2:
@@ -892,11 +894,11 @@ def build_ladekurve_meta(plan: Dict[str, Any]) -> Dict[str, Any]:
             sim_points,
             key=lambda item: abs(safe_float(item.get("ts"), 0.0) - ts),
         )
-        return safe_float(nearest.get("soc"), fallback)
+        return safe_float(nearest.get("soc_start", nearest.get("soc")), fallback)
 
     first_ts, first_soc = (
         safe_float(sim_points[0].get("ts"), 0.0),
-        safe_float(sim_points[0].get("soc"), 0.0),
+        safe_float(sim_points[0].get("soc_start", sim_points[0].get("soc")), 0.0),
     )
     last_ts, last_soc = (
         safe_float(sim_points[-1].get("ts"), 0.0),

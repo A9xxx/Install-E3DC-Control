@@ -33,7 +33,7 @@ def change_venv_name():
 
     print(f"\n✓ venv-Bindung atomar auf '{new_name}' umgestellt.")
     print(f"Hinweis: Der alte Ordner '{current_name}' wurde nicht gelöscht.")
-    print("Du kannst ihn nach einer separaten Prüfung manuell entfernen.")
+    print("Die Dienste laufen weiter mit dem bisherigen Interpreter. Zuerst 1) Installation / Update ausführen, damit die Units das neue venv verwenden; erst danach den alten Ordner löschen.")
     return True
 
 register_command("22", "Python venv Namen ändern", change_venv_name, sort_order=22, category=CAT_ENV)

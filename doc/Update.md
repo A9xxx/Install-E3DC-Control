@@ -5,11 +5,23 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.5.3c`. Das Dashboard startet ausschließlich
-den argumentlosen, root-eigenen Systemjob. Dieser installiert den neuesten
+Der aktuelle Stable-Stand ist `v5.5.4`. Das Dashboard startet ausschließlich
+den root-eigenen Systemjob ohne freie Argumente. Die einzige Ausnahme ist
+die tokengebundene Driftfreigabe. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
+
+5.5.4 ist ein Funktions- und Korrekturupdate (Installationszentrale, Wallbox-
+und Wärmepumpenregelung, Heizstab, Tagesstatistik nach Energiebilanz,
+experimentelle Kostenhistorie). Bestehende Installationen aktualisieren wie
+gewohnt über **System Update** bzw. das [Docker-Update](#docker-update); eine
+Konfigurationsänderung ist nicht nötig. Der Hausverbrauch der Tagesstatistik
+wird ab dem Update nach der Energiebilanz berechnet; die Nachberechnung
+vergangener Tage steht in `Statistik_Wartung.md`. Steht „Automatik darf steuern“
+auf Aus, schaltet der Heizstab-Dienst nicht mehr. Einzelheiten stehen in den
+[Release Notes](../RELEASE_NOTES.md). Für ein Update von 5.5.3b oder älter
+gelten zusätzlich die folgenden Hinweise zu 5.5.3c.
 
 5.5.3c ist ein Korrekturupdate für die Einrichtung des Energy Managers bei einer
 Neuinstallation. Bestehende Installationen aktualisieren wie gewohnt über

@@ -103,6 +103,7 @@ if [ "$ACTION" = "update_e3dc" ]; then
     fi
     if [ ! -x "$UPDATE_DISPATCHER" ]; then
         echo "Root-eigener Update-Dispatcher fehlt: $UPDATE_DISPATCHER" >&2
+        echo "Nächster Schritt: Die Datei e3dc-update-bootstrap aus dem Release kopieren und sudo /bin/sh ./e3dc-update-bootstrap ausführen." >&2
         exit 127
     fi
     exec "$UPDATE_DISPATCHER"

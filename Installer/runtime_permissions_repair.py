@@ -371,7 +371,7 @@ def _open_pending_directory(*, create: bool) -> int:
         if not create:
             raise RepairError(
                 "confirmation_missing",
-                "Die Dateilistenfreigabe fehlt; starte die Rechtereparatur erneut",
+                "Die Dateilistenfreigabe fehlt; die Rechtereparatur erneut starten",
             ) from exc
         try:
             os.mkdir(namespace, 0o755)
@@ -422,7 +422,7 @@ def _open_pending_directory(*, create: bool) -> int:
             if not create:
                 raise RepairError(
                     "confirmation_missing",
-                    "Die Dateilistenfreigabe fehlt; starte die Rechtereparatur erneut",
+                    "Die Dateilistenfreigabe fehlt; die Rechtereparatur erneut starten",
                 ) from exc
             try:
                 os.mkdir(PENDING_DIRECTORY.name, 0o700, dir_fd=namespace_fd)
@@ -601,7 +601,7 @@ def _read_pending_record() -> tuple[dict[str, Any], int]:
         except FileNotFoundError as exc:
             raise RepairError(
                 "confirmation_missing",
-                "Die Dateilistenfreigabe fehlt oder wurde bereits verwendet; starte die Rechtereparatur erneut",
+                "Die Dateilistenfreigabe fehlt oder wurde bereits verwendet; die Rechtereparatur erneut starten",
             ) from exc
         before = os.fstat(descriptor)
         named = os.stat(
@@ -701,18 +701,18 @@ def _validate_pending_record(
     ):
         raise RepairError(
             "confirmation_stale",
-            "Die Dateilistenfreigabe ist abgelaufen oder nicht mehr gebunden; starte die Rechtereparatur erneut",
+            "Die Dateilistenfreigabe ist abgelaufen oder nicht mehr gebunden; die Rechtereparatur erneut starten",
         )
     if len(token) != 64 or any(character not in "0123456789abcdef" for character in token):
         raise RepairError(
             "confirmation_token_invalid",
-            "Die Dateilistenfreigabe ist ungültig; starte die Rechtereparatur bei Bedarf erneut",
+            "Die Dateilistenfreigabe ist ungültig; die Rechtereparatur bei Bedarf erneut starten",
         )
     supplied_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
     if not hmac.compare_digest(token_hash, supplied_hash):
         raise RepairError(
             "confirmation_token_invalid",
-            "Die Dateilistenfreigabe ist ungültig; starte die Rechtereparatur bei Bedarf erneut",
+            "Die Dateilistenfreigabe ist ungültig; die Rechtereparatur bei Bedarf erneut starten",
         )
 
 
@@ -1177,18 +1177,18 @@ def _confirm_content_drift(
                 continue
             raise RepairError(
                 "confirmation_snapshot_changed",
-                f"Datei fehlt seit dem ersten Lauf: {path}; starte die Rechtereparatur erneut",
+                f"Datei fehlt seit dem ersten Lauf: {path}; die Rechtereparatur erneut starten",
             )
         try:
             if saved.get("state") == "missing":
                 raise RepairError(
                     "confirmation_snapshot_changed",
-                    f"Datei kam seit dem ersten Lauf hinzu: {path}; starte die Rechtereparatur erneut",
+                    f"Datei kam seit dem ersten Lauf hinzu: {path}; die Rechtereparatur erneut starten",
                 )
             if _stat_fingerprint(metadata) != saved.get("fingerprint"):
                 raise RepairError(
                     "confirmation_snapshot_changed",
-                    f"Datei änderte sich seit dem ersten Lauf: {path}; starte die Rechtereparatur erneut",
+                    f"Datei änderte sich seit dem ersten Lauf: {path}; die Rechtereparatur erneut starten",
                 )
             if saved.get("state") == "drift":
                 observed_hash = str(saved.get("observed_sha256") or "")
@@ -1201,7 +1201,7 @@ def _confirm_content_drift(
                 ):
                     raise RepairError(
                         "confirmation_snapshot_changed",
-                        f"Lokale Inhaltsabweichung änderte sich: {path}; starte die Rechtereparatur erneut",
+                        f"Lokale Inhaltsabweichung änderte sich: {path}; die Rechtereparatur erneut starten",
                     )
         finally:
             os.close(descriptor)
@@ -1217,7 +1217,7 @@ def _confirm_content_drift(
             if _stat_fingerprint(metadata) != saved.get("fingerprint"):
                 raise RepairError(
                     "confirmation_snapshot_changed",
-                    f"Datei driftete unmittelbar vor der Reparatur: {path}; starte die Rechtereparatur erneut",
+                    f"Datei driftete unmittelbar vor der Reparatur: {path}; die Rechtereparatur erneut starten",
                 )
             if _set_metadata(descriptor, entry):
                 changed += 1

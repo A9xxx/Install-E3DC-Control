@@ -110,16 +110,16 @@ def show_system_status():
     if e3dc_srv["status"] == "not_installed":
         # In V4 ist das der Normalfall - kein Fehler!
         print("  [i] Service 'e3dc' (C++ Legacy): Nicht installiert (V4 Normal)")
-        print("      RSCP-Kommunikation laeuft nativ ueber e3dc-live (Python).")
+        print("      RSCP-Kommunikation läuft nativ über e3dc-live (Python).")
     elif is_docker:
         if not e3dc_srv["active"]:
-            print(f"{GREEN}[OK]{RESET} Service Status: Inaktiv (Korrekt fuer Docker-Modus)")
+            print(f"{GREEN}[OK]{RESET} Service Status: Inaktiv (Korrekt für Docker-Modus)")
         else:
-            print(f"{RED}[!]{RESET}  Service Status: Aktiv (FEHLER: Lokaler Dienst laeuft trotz Docker!)")
+            print(f"{RED}[!]{RESET}  Service Status: Aktiv (FEHLER: Lokaler Dienst läuft trotz Docker!)")
             issues_found.append("docker_host_conflict")
     elif is_standby:
         if not e3dc_srv["active"]:
-            print(f"{GREEN}[OK]{RESET} Service Status: Inaktiv (Korrekt fuer {standby_label} im Standby)")
+            print(f"{GREEN}[OK]{RESET} Service Status: Inaktiv (Korrekt für {standby_label} im Standby)")
         else:
             print(f"{RED}[!]{RESET}  Service Status: Aktiv (FEHLER: Sollte im Standby gestoppt sein!)")
             issues_found.append("ha_running_in_standby")
@@ -280,7 +280,7 @@ def show_system_status():
     if not_srv["status"] == "not_installed":
         print("⚪ Service 'e3dc-notifier': Nicht installiert")
     else:
-        if ha_mode == "shadow" and print_standby_service_status(not_srv, "notifier_running_in_standby"):
+        if print_standby_service_status(not_srv, "notifier_running_in_standby"):
             pass
         else:
             status_icon = f"{GREEN}✓{RESET}" if not_srv["active"] else f"{RED}✗{RESET}"
@@ -293,7 +293,9 @@ def show_system_status():
     ws_srv = check_service_details("e3dc-websocket")
 
     if ws_srv["status"] == "not_installed":
-        print("⚪ Service 'e3dc-websocket': Nicht installiert")
+        print("⚪ Pflichtdienst 'e3dc-websocket': Nicht installiert")
+        if not is_docker and not is_standby:
+            issues_found.append("websocket_failed")
     else:
         if print_standby_service_status(ws_srv, "websocket_running_in_standby"):
             pass
@@ -309,7 +311,7 @@ def show_system_status():
 
             print(f"{status_icon} Service Status: {'Aktiv (running)' if ws_srv['active'] else 'Inaktiv'}")
             print(f"{enabled_icon} Autostart:     {'Aktiviert (enabled)' if ws_srv['enabled'] else 'Deaktiviert (disabled)'}")
-            if not ws_srv["active"] and ws_srv["enabled"]:
+            if not ws_srv["active"]:
                  issues_found.append("websocket_failed")
 
     # 2g. MQTT Hub
@@ -430,6 +432,34 @@ def show_system_status():
                 print("  " + "-" * 40)
                 issues_found.append("storage_failed")
 
+    # Speicherregler: reine Diagnose, auch ein deaktivierter Regler ist ein Befund.
+    print("\n--- Storage Manager (Speicherregler) ---")
+    manager_srv = check_service_details("e3dc-storage-manager")
+    if manager_srv["status"] == "not_installed":
+        print("⚪ Service 'e3dc-storage-manager': Nicht installiert")
+        if not is_docker and not is_standby:
+            issues_found.append("storage_manager_missing")
+    elif print_standby_service_status(manager_srv, "storage_manager_running_in_standby"):
+        pass
+    elif is_docker:
+        if manager_srv["active"]:
+            print(f"{RED}[!]{RESET} Storage Manager: Host-Unit läuft trotz Docker-Modus.")
+            issues_found.append("docker_host_conflict")
+        else:
+            print("ℹ Storage Manager läuft im Container; Host-Unit bleibt inaktiv.")
+    else:
+        status_icon = f"{GREEN}✓{RESET}" if manager_srv["active"] else f"{RED}✗{RESET}"
+        enabled_icon = f"{GREEN}✓{RESET}" if manager_srv["enabled"] else f"{RED}✗{RESET}"
+        print(f"{status_icon} Service Status: {'Aktiv (running)' if manager_srv['active'] else 'Inaktiv'}")
+        print(f"{enabled_icon} Autostart: {'Aktiviert (enabled)' if manager_srv['enabled'] else 'Deaktiviert (disabled)'}")
+        if not manager_srv["active"]:
+            issues_found.append("storage_manager_failed")
+            if manager_srv["enabled"]:
+                print("  Diagnose-Logs (Letzte 10 Zeilen):")
+                for line in manager_srv["log"].splitlines():
+                    if line.strip():
+                        print(f"    {line}")
+
     # 2l. Mosquitto
     print("\n--- Lokaler MQTT Broker (Mosquitto) ---")
     mq_srv = check_service_details("mosquitto")
@@ -475,8 +505,7 @@ def show_system_status():
     live_srv = check_service_details("e3dc-live")
     if live_srv["status"] == "not_installed":
         print("  Service 'e3dc-live': Nicht installiert")
-        print("  Tipp: sudo cp ~/Install/Installer/e3dc-live.service /etc/systemd/system/")
-        print("        sudo systemctl enable --now e3dc-live")
+        print("  Einrichtung über Hauptmenü 1) Installation / Update.")
     else:
         if print_standby_service_status(live_srv, "rscp_live_running_in_standby"):
             pass
@@ -496,7 +525,7 @@ def show_system_status():
                     issues_found.append("rscp_live_stale")
             else:
                 if live_srv["active"]:
-                    print(f"  {RED}[!]{RESET}  live_data_py.json: FEHLT (Dienst laeuft aber schreibt nicht)")
+                    print(f"  {RED}[!]{RESET}  live_data_py.json: FEHLT (Dienst läuft aber schreibt nicht)")
                     issues_found.append("rscp_live_no_data")
             if not live_srv["active"] and live_srv["enabled"]:
                 issues_found.append("rscp_live_failed")
@@ -518,13 +547,13 @@ def show_system_status():
         except Exception: pass
 
     # 2n. Heizstab / Shelly Manager (wp_type=2) oder Shelly Pro3EM WP-Monitoring (wp_type=3)
-    # Beide Typen laufen ueber e3dc-heizstab/heizstab_manager.py.
+    # Beide Typen laufen über e3dc-heizstab/heizstab_manager.py.
     hs_srv = check_service_details("e3dc-heizstab")
     if wp_type in (2, 3):
         print(f"\n--- Heizstab / Shelly Manager (wp_type={wp_type}) ---")
         if hs_srv["status"] == "not_installed":
             print("  Service 'e3dc-heizstab': Nicht installiert")
-            print("  Tipp: sudo systemctl enable --now e3dc-heizstab")
+            print("  Einrichtung über die Installationszentrale oder Konsole 41.")
         else:
             if print_standby_service_status(hs_srv, "heizstab_running_in_standby"):
                 pass
@@ -549,7 +578,7 @@ def show_system_status():
         print("\n--- Klimaanlage Live ---")
         if climate_srv["status"] == "not_installed":
             print("  Service 'e3dc-climate-live': Nicht installiert")
-            print("  Tipp: sudo systemctl enable --now e3dc-climate-live")
+            print("  Einrichtung über die Installationszentrale.")
         elif print_standby_service_status(climate_srv, "climate_live_running_in_standby"):
             pass
         else:
@@ -572,7 +601,7 @@ def show_system_status():
         print("\n--- Klimaanlage Regel-Vorbereitung ---")
         if climate_control_srv["status"] == "not_installed":
             print("  Service 'e3dc-climate-control': Nicht installiert")
-            print("  Tipp: sudo systemctl enable --now e3dc-climate-control")
+            print("  Einrichtung über die Installationszentrale.")
         elif print_standby_service_status(climate_control_srv, "climate_control_running_in_standby"):
             pass
         else:
@@ -654,8 +683,7 @@ def show_system_status():
         print("\n=== 💡 Lösungsvorschläge ===")
         if "v4_legacy_conflict" in issues_found:
             print("• KRITISCHER KONFLIKT: C++ Legacy und Python V4 Modus laufen gleichzeitig!")
-            print("  Behebe dies sofort mit: sudo systemctl stop e3dc e3dc-websocket")
-            print("  und: sudo systemctl disable e3dc e3dc-websocket")
+            print("  Altdienst stilllegen: sudo systemctl disable --now e3dc")
         if "docker_host_conflict" in issues_found:
             print("• Docker Konflikt: Es laufen noch alte, lokale Dienste!")
             print("  Behebe dies mit: sudo systemctl stop e3dc e3dc-websocket")
@@ -663,20 +691,14 @@ def show_system_status():
         if "internet" in issues_found:
             print("• Internet: Prüfe Netzwerkkabel/WLAN und Router. Prüfe DNS-Einstellungen.")
 
-        if "e3dc_not_running" in issues_found or "e3dc_service_failed" in issues_found:
-            print("• E3DC C++ (Legacy) Fehler: In V4 wird e3dc-live (Python RSCP) genutzt.")
-            print("  Prüfe: sudo systemctl status e3dc-live")
-            print("  Neustart: sudo systemctl restart e3dc-live")
-            print("  Oder nutze Menuepunkt '99' (Notfall-Modus).")
-
         if "watchdog_failed" in issues_found:
-            print("• Watchdog Fehler: Nutze Menüpunkt '15' (Watchdog konfigurieren) zur Reparatur.")
+            print("• Watchdog Fehler: Nutze Expertenmenü, Punkt '15' (PV-Wächter einrichten / reparieren) zur Reparatur.")
 
         if "disk_full" in issues_found:
             print("• Speicher voll: Lösche alte Logs oder Backups (z.B. in /var/www/html/tmp/).")
 
         if "ramdisk_missing" in issues_found:
-            print("• RAM-Disk fehlt: Nutze Menüpunkt '14' (RAM-Disk einrichten).")
+            print("• RAM-Disk fehlt: Die Einrichtung erfolgt über '1' (Installation / Update).")
 
         if "luxtronik_failed" in issues_found:
             print("• Luxtronik Fehler: Prüfe 'journalctl -u energy_manager -e' oder die config.lux.json.")
@@ -693,21 +715,26 @@ def show_system_status():
             print("• WebSocket Fehler: Der Push-Server läuft nicht. Prüfe Logs mit 'journalctl -u e3dc-websocket -e'.")
         if "apache_issue" in issues_found:
             print("• Apache Webserver: Der Webserver ist inaktiv oder der Autostart ist deaktiviert.")
-            print("  Behebung: Nutze Menüpunkt '2' (Rechte & Webportal reparieren) zur Re-Aktivierung.")
+            print("  Behebung: Menüpunkt '3' (Rechte prüfen & korrigieren) zur Re-Aktivierung verwenden.")
         if "matter_bridge_failed" in issues_found:
-            print("• Matter Bridge Fehler: Der Node.js Daemon stürzt ab. Prüfe die Logs mit 'journalctl -u e3dc-matter-bridge -e'.")
+            print("• Matter Bridge Fehler: Der Node.js Daemon ist inaktiv. Prüfe die Logs mit 'journalctl -u e3dc-matter-bridge -e'.")
         if "wb_native_data_missing" in issues_found:
              print("• Native Wallbox Fehler: Der Dienst läuft, aber liefert keine Daten.")
              print("  Prüfe die Logs mit: journalctl -u e3dc-wallbox-manager -e")
              print("  Oder versuche einen Neustart: sudo systemctl restart e3dc-wallbox-manager")
         if "epex_failed" in issues_found:
-             print("• EPEX Manager Fehler: Der Börsenpreis-Fetcher stürzt ab.")
+             print("• EPEX Manager Fehler: Der Börsenpreis-Fetcher ist inaktiv.")
              print("  Prüfe die Logs mit: journalctl -u e3dc-epex-manager -e")
         if "weather_failed" in issues_found:
-             print("• Wetter Forecast Fehler: Der PV-Prognose Dienst stürzt ab.")
+             print("• Wetter Forecast Fehler: Der PV-Prognose Dienst ist inaktiv.")
              print("  Prüfe die Logs mit: journalctl -u e3dc-weather-manager -e")
+        if "storage_manager_missing" in issues_found:
+             print("• Storage Manager fehlt: Hauptmenü 1) Installation / Update ausführen.")
+        if "storage_manager_failed" in issues_found:
+             print("• Storage Manager ist inaktiv; die Speicherregelung läuft nicht.")
+             print("  Nächster Schritt: journalctl -u e3dc-storage-manager -n 50 --no-pager")
         if "storage_failed" in issues_found:
-             print("• Storage Simulator Fehler: Die V4 KI Batterieplanung stürzt ab.")
+             print("• Storage Simulator Fehler: Die V4 KI Batterieplanung ist inaktiv.")
              print("  Prüfe die Logs mit: journalctl -u e3dc-storage-simulator -e")
     else:
         print(f"\n{GREEN}✓{RESET} Keine offensichtlichen Probleme gefunden.")

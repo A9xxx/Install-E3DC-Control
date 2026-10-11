@@ -9,8 +9,8 @@ SCRIPT_NAME = "wallbox_manager.py"
 def setup_wallbox_service(headless=False, *, start_service=True):
     """Richtet den Systemd Service für den nativen Python Wallbox Manager ein."""
     print("\n=== Native Wallbox Regelung Setup ===\n")
-    print("Dieser Schritt installiert den Hintergrunddienst für Drittanbieter Wallboxen (Go-E, etc.).")
-    print("Hinweis: Vergiss nicht, wb_native_enable=1 in der E3DC-Config (Web UI) zu setzen!\n")
+    print("Dieser Schritt installiert den Hintergrunddienst für native Wallboxen (E3DC, openWB, go-e und weitere unterstützte Typen).")
+    print("Voraussetzung: Native Wallbox-Regelung im Config Editor aktivieren (wb_native_enable=1).\n")
 
     print(f"→ Erstelle Systemd Service '{SERVICE_NAME}' über den kanonischen Unit-Helper…")
     try:
@@ -37,6 +37,6 @@ def setup_wallbox_service(headless=False, *, start_service=True):
         return False
     finally:
         if not headless:
-            input("\nDrücke Enter um ins Hauptmenü zurückzukehren...")
+            input("\nZum Zurückkehren ins Hauptmenü Enter drücken...")
 
-register_command("42", "Native Wallbox Manager (z.B. Go-E Charger)", setup_wallbox_service, sort_order=42)
+register_command("42", "Native Wallbox Manager (E3DC, openWB, go-e)", setup_wallbox_service, sort_order=42)

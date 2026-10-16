@@ -187,6 +187,7 @@ CONFIG_FIELD_LABELS = {
     "shelly_sg_ip oder shelly_pause_ip": "SG-Ready Shelly IP",
     "climate_enable": "Klimaanlage aktiv",
     "climate_meter_ip": "Klimaanlagen-Zähler IP",
+    "climate_meter2_ip": "Zweiter Klimaanlagen-Zähler IP",
     "climate_control_enable": "Klimaanlage Regel-Vorbereitung aktiv",
     "climate_control_provider": "Klimaanlagen-Regelprovider",
     "climate_control_mode": "Klimaanlagen-Regelmodus",
@@ -1455,18 +1456,53 @@ def root_service_launcher_integrity_preview() -> dict[str, Any]:
     }
 
 
+def module_contract_service_launcher_preview() -> dict[str, Any] | None:
+    """Prüft denselben installierten Root-Vertrag wie das PHP-Diensttor."""
+    try:
+        from . import module_installer as contract_reader
+    except ImportError:
+        import module_installer as contract_reader
+    contract_path = contract_reader.CONTRACT
+    try:
+        contract_reader._root_directory(contract_path.parent)
+        contract_path.lstat()
+    except FileNotFoundError:
+        return None
+    except (OSError, contract_reader.ModuleError):
+        return {"success": False, "status": "contract_unreadable"}
+    try:
+        raw = contract_reader._root_bytes(contract_path, mode=0o644, maximum=1024 * 1024)
+        contract = json.loads(raw, object_pairs_hook=contract_reader._unique_object)
+        expected = contract.get("files", {}).get("Installer/service_wrapper.sh")
+        if (contract.get("schema") != "e3dc_module_installer_v1"
+                or not isinstance(contract.get("commit"), str)
+                or not re.fullmatch(r"[0-9a-f]{40}", contract["commit"])
+                or contract.get("install_root") != str(INSTALL_ROOT)
+                or not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected)):
+            raise ValueError("Ungültiger Modul-Vertrag")
+        payload = contract_reader._root_bytes(SERVICE_WRAPPER, mode=0o755)
+        success = (hashlib.sha256(payload).hexdigest() == expected
+                   and payload.startswith(b"#!/bin/bash\n") and b"\r" not in payload)
+        return {"success": success, "path": str(SERVICE_WRAPPER),
+                "status": "ok" if success else "contract_content_drift",
+                "verification_scope": "module_installer_contract", "head": contract["commit"],
+                "commit_proven": True}
+    except (OSError, ValueError, TypeError, AttributeError, contract_reader.ModuleError) as exc:
+        return {"success": False, "path": str(SERVICE_WRAPPER), "status": "contract_invalid",
+                "error": str(exc), "verification_scope": "module_installer_contract"}
+
+
 def service_launcher_integrity_preview() -> dict[str, Any]:
-    """Prüft administrativ Git-exakt, im Webkontext den lokalen Root-Vertrag."""
+    """Prüft vorrangig den Modul-Vertrag, bei Altinstallationen wie bisher."""
+
+    contract_preview = module_contract_service_launcher_preview()
+    if contract_preview is not None:
+        return contract_preview
 
     try:
         head, canonical = _git_head_wrapper_bytes(INSTALL_ROOT)
         payload = canonical["Installer/service_wrapper.sh"]
     except Exception as exc:
-        if not _caller_can_verify_release_git():
-            fallback = root_service_launcher_integrity_preview()
-            fallback["git_status"] = "administrative_only"
-            fallback["git_error"] = str(exc)
-            return fallback
         return {
             "success": False,
             "path": str(SERVICE_WRAPPER),
@@ -2520,7 +2556,7 @@ def module_config_missing(module_key: str, cfg: dict[str, Any], required_keys: t
             missing.append("wbmode=0 (Legacy-C++ Wallbox aus)")
 
     elif module_key == "heatpump":
-        if cfg_text(cfg, "wp_type", "0") == "6" and not has_shelly_sgready_config(cfg):
+        if cfg_text(cfg, "wp_type", "0") in {"6", "7"} and not has_shelly_sgready_config(cfg):
             return []
         if not cfg_enabled(cfg, "luxtronik"):
             missing.append("luxtronik")
@@ -4034,8 +4070,10 @@ def module_install_dry_run(module_key: str | None = None) -> dict[str, Any]:
             if not dep_state["exists"] or not dep_state["active"]:
                 blocked_reasons.append(f"Abhängigkeit nicht installiert oder inaktiv: {get_module(dep).display_name if get_module(dep) else dep}")
 
-        if module.key == "heatpump" and cfg_text(cfg, "wp_type", "0") == "6" and not has_shelly_sgready_config(cfg):
-            blocked_reasons.append("Für den E3DC-Leistungsmesser (PM) ist der Wärmepumpen-Manager nicht erforderlich.")
+        if module.key == "heatpump" and cfg_text(cfg, "wp_type", "0") in {"6", "7"} and not has_shelly_sgready_config(cfg):
+            blocked_reasons.append("Für die MQTT-Anzeige ist der Wärmepumpen-Manager nicht erforderlich."
+                                   if cfg_text(cfg, "wp_type", "0") == "7" else
+                                   "Für den E3DC-Leistungsmesser (PM) ist der Wärmepumpen-Manager nicht erforderlich.")
         if config.get("ok") is False:
             missing = ", ".join(config.get("missing_labels") or config.get("missing_keys", []))
             blocked_reasons.append(f"Konfiguration unvollständig: {missing}")

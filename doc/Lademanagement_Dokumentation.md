@@ -169,9 +169,9 @@ Das System unterstützt den parallelen Betrieb von mehreren Fahrzeugen und Lades
 Das alte Wallbox-Management wurde durch den nativen **Python Wallbox Manager** ersetzt. Die sichtbaren Nutzer-Modi sind:
 
 * **Aus:** NGNA: keine aktive E3DC-Control-Ladung und keine laufenden Steuerbefehle. Nur beim bewussten Wechsel auf `Aus` in der WebUI wird einmalig die Wallbox-Grundeinstellung freigegeben. Geplantes Netzladen bleibt gesperrt.
-* **PV-Kurve ruhig:** Laden entlang der Speicher-Ladekurve mit Hysterese; Speicherziel hat Vorrang.
+* **PV-Kurve ruhig:** Laden aus PV-Überschuss entlang der Speicher-Ladekurve mit Hysterese; über oder im Kurvenkorridor stützt der Hausspeicher nur im Rahmen des Wolken-Kontingents. Unter dem Korridor erhält die Wallbox bei ausgeschalteter zentraler PV-Aufteilung den reinen PV-Überschuss. Mit experimenteller zentraler PV-Aufteilung reserviert der Speicher zuerst seinen Kurvenbedarf; die Wallbox erhält den absoluten Rest.
 * **Grundladung stabil:** Wie PV-Kurve ruhig, aber mit stabiler 1p/3p-Grundladung, solange `wbminSoc` laut Planung erreichbar bleibt.
-* **PV + Akku bis Untergrenze:** Das Auto darf PV plus Hausspeicher oberhalb der Hausakku-Untergrenze nutzen; der Speicher lädt dabei weiter nach der Ladekurve. Unterhalb der Grenze lädt das Auto wie in `PV-Kurve ruhig` nur aus PV-Überschuss, der Speicher stützt nur Hausverbrauch und Wärmepumpe, Netz bleibt außen vor.
+* **PV + Akku bis Untergrenze:** Das Auto darf PV plus Hausspeicher oberhalb der Hausakku-Untergrenze nutzen; oberhalb der Haltezone bleibt die bisherige Speicherfreigabe. Mit experimenteller zentraler PV-Aufteilung führt unterhalb der Haltezone bei geschlossenem Tor der Kurvenbedarf den Akkuanteil. Unterhalb der Grenze lädt das Auto wie in `PV-Kurve ruhig` nur aus PV-Überschuss, der Speicher stützt nur Hausverbrauch und Wärmepumpe, Netz bleibt außen vor.
 * **Sofort bis Preislimit:** Sofortiges Netzladen, solange der aktuelle Preis das Wallbox-Preislimit erfüllt.
 * **Akku bis Abfahrt:** Lädt im Freigabefenster vor der Abfahrtszeit aus PV und Hausspeicher bis zur Hausakku-Untergrenze `wbminsoc`; Netzladen bleibt gesperrt. Gestoppt wird bei erreichter Abfahrtszeit, vollem Fahrzeug oder erreichter Untergrenze (`wb<n>_battery_departure_time`, `wb<n>_battery_departure_window_h`).
 
@@ -254,3 +254,33 @@ erhalten. Sofortladen wird für die jeweilige Wallbox über den Modus
 Die Konfigurationsvariablen `wbhour`, `wb_sofort`, `wbvon` und `wbbis` bleiben
 für die Ladeplanung verfügbar. Veraltete Direktsteuerungsformulare ändern
 keine Einstellungen.
+
+## Experimentelle zentrale PV-Aufteilung
+
+`storage_central_pv_split_enable` ist standardmäßig aus. Eingeschaltet
+reserviert der Speicher zuerst seinen Kurvenbedarf; jeder geregelte Ladepunkt
+erhält seinen Anteil des verbleibenden Gruppenrahmens genau einmal. Einspeisung
+und laufende Eigenleistung vergrößern diesen Einzelrahmen nicht.
+
+Eine real ladende Wallbox hält ihren bestätigten Mindeststrom bis zur Grenze
+des Kontos „Kurvenrückstand“ (wie Wolken-Kontingent: 0,5 % der Kapazität,
+mindestens 50 Wh). Danach folgt 1p nur bei ausführbarer Sequenz, freier
+Phasensperre und gedecktem 1p-Wiederanlauf samt Reserve; sonst direkt Stop.
+Nach bestätigtem Wechsel und realem Wiederanlauf beginnt die 1p-Stufe bei null.
+Ein weiterer Kontodurchlauf endet im Stop. Ein unbekannter Rahmen friert Konto
+und Rücksetzuhr ein und löst keine Regelaktion aus. Nach Dienstneustart bleibt
+ein erschöpftes Konto erschöpft. Nach 60 Sekunden gültig belegtem Ende der
+Anwendbarkeit oder Ladung beginnt das Konto neu.
+
+Nach Stop startet die Wallbox erst bei stabilem Einzelrahmen über Startminimum
+plus max(230 W, 10 %); die vorhandene Stabilitätszeit beträgt standardmäßig
+120 Sekunden. Nutzer-Aus, Ladefensterende, Notstromreserve, Hausanschluss,
+Profilpause und ausdrücklich freigegebene Starts behalten Vorrang.
+
+Zum Prüfen auf einem eigenen System in „PV-Kurve ruhig“ einschalten,
+bei frischen Daten eine Wolke und anschließende Sonne beobachten. Im
+Diagnose-Export nennt `curve_backlog` je Ladepunkt `used_wh`, `limit_wh`,
+`stage`, `last_action` und `reason`; `central_frame.frame_w` ist der Einzelrahmen.
+Mindeststrom, Eigenleistung, Ist-Phasen, Akkuladung und Netzleistung gemeinsam
+prüfen. Bei unerwartetem Netzbezug oder wiederholtem Schalten ausschalten und
+Diagnose sichern.

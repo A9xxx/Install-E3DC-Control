@@ -20,8 +20,10 @@ from pathlib import Path
 
 try:
     from .config_secret_permissions import config_secret_dir_mode
+    from .climate_live import HISTORY_RETENTION_DAYS
 except ImportError:  # Direkter Aufruf durch Scheduler oder Konsole.
     from config_secret_permissions import config_secret_dir_mode
+    from climate_live import HISTORY_RETENTION_DAYS
 
 # Standard-Ausgabe auf UTF-8 erzwingen (verhindert UnicodeEncodeError z.B. bei cron oder SSH ohne Locale)
 try:
@@ -48,7 +50,7 @@ DAILY_STATS_MIGRATION_COLUMNS = (
     'wb2_consumption', 'cost_wb2', 'climate_consumption', 'cost_climate',
     'pv_balance_rest', 'bat_balance_rest', 'balance_unknown_rest',
     'saved_u', 'saved_td', 'saved_wb', 'pv_e3dc', 'pv_external',
-    'pv_source_rest', 'pv_grid', 'bat_grid',
+    'pv_source_rest', 'pv_grid', 'bat_grid', 'house_includes_unknown_wallbox',
 )
 
 
@@ -175,10 +177,10 @@ MAINTENANCE_COLUMNS = (
 )
 
 
-def calculate_history_stats(rows):
+def calculate_history_stats(rows, now=None):
     """Dieselbe Berechnung wie die historische Tagesansicht, ohne HTTP-Zugriff."""
     result = subprocess.run(
-        ['php', DAILY_STATS_HELPER],
+        ['php', DAILY_STATS_HELPER] + (['--now', str(float(now))] if now is not None else []),
         input=''.join(json.dumps(row, allow_nan=False) + '\n' for row in rows),
         capture_output=True, text=True, timeout=60, check=True,
     )
@@ -197,6 +199,7 @@ def _nullable_number(value):
 def _daily_values(data):
     """Feldzuordnung ohne Ersatz fehlender Messungen oder Kosten durch Null."""
     stats, costs = data['stats'], data.get('costs', {})
+    # Nur die Aufteilungsqualität speichern; alle Energiemengen bleiben erhalten.
     values = {column: _nullable_number(stats.get(key)) for column, key in {
         'home_consumption': 'total_home_kwh', 'grid_in': 'total_grid_in_kwh',
         'grid_out': 'total_grid_out_kwh', 'bat_in': 'total_bat_in_kwh',
@@ -225,17 +228,166 @@ def _daily_values(data):
         'grid_out', 'bat_in', 'pv_balance_rest', 'bat_balance_rest')]
     values['balance_unknown_rest'] = (round(max(0.0, sum(known[:3]) - sum(known[3:])), 3)
                                       if all(v is not None for v in known) else None)
+    values['house_includes_unknown_wallbox'] = int(bool(data.get('house_includes_unknown_wallbox')))
     saved = data.get('saved', {})
     for col, key in (('saved_u', 'total_today_kwh'), ('saved_td', 'derating_today_kwh'),
                      ('saved_wb', 'inverter_today_kwh')):
         if key in saved or col in data:
             values[col] = _nullable_number(saved.get(key, data.get(col)))
+    if isinstance(data.get('climate_meters'), list) and data['climate_meters']:
+        values['climate_meters'] = json.dumps(data['climate_meters'], ensure_ascii=False, allow_nan=False)
     return values
 
 
-def archive_today(conn=None):
-    """Archiviert ausschließlich den laufenden Tag mit der gemeinsamen Webbilanz."""
-    today = datetime.date.today()
+
+def _store_climate_breakdown(conn, day, entries):
+    """Migriert erst bei einer bestätigten Einzelenergie; vorhandene Qualität speichern."""
+    if not entries:
+        return 0
+    has_column = 'climate_meters' in {row[1] for row in conn.execute("PRAGMA table_info(daily_stats)")}
+    confirmed = any(_nullable_number(entry.get('daily_kwh')) is not None
+                    and entry['daily_kwh'] >= 0 for entry in entries if isinstance(entry, dict))
+    if not has_column:
+        if not confirmed:
+            return 0
+        conn.execute("ALTER TABLE daily_stats ADD COLUMN climate_meters TEXT")
+    payload = json.dumps(entries, ensure_ascii=False, allow_nan=False)
+    columns, values = ('date', 'climate_meters'), (day.isoformat(), payload)
+    if conn.execute('SELECT 1 FROM daily_stats WHERE date=?', (day.isoformat(),)).fetchone() is None:
+        # Ohne Summenbilanz bleiben die übrigen Größen unbekannt, auch wenn das
+        # Altschema für einzelne Spalten noch DEFAULT 0 definiert.
+        unknown = tuple(row[1] for row in conn.execute("PRAGMA table_info(daily_stats)")
+                        if row[1] not in columns)
+        columns += unknown
+        values += (None,) * len(unknown)
+    return int(_upsert_changed(conn.cursor(), 'daily_stats', 'date', columns, values))
+
+
+def _climate_history_signature(path, live, now):
+    """Bindet Rohdatei und lesbaren Tagespuffer, ohne Messdaten zu speichern."""
+    try:
+        info = path.stat()
+        raw = [info.st_size, info.st_mtime_ns]
+    except FileNotFoundError:
+        raw = None
+    except OSError:
+        return None  # Unlesbarer Zustand ist kein unveränderter Bestand.
+    if live is None:
+        return None
+    buffered = None
+    if str(live.get('ts_iso', ''))[:10] == path.stem:
+        # Der PHP-Leser ergänzt diesen RAM-Satz. Seine Frischegrenze muss
+        # auch ohne neue Erzeugerbytes eine erneute Auswertung erlauben.
+        stamp = _nullable_number(live.get('ts'))
+        fresh = stamp is not None and 0 <= now - stamp <= 120
+        buffered = [hashlib.sha256(json.dumps(live, sort_keys=True,
+                        ensure_ascii=False).encode('utf-8')).hexdigest(), fresh]
+    return json.dumps([raw, buffered], separators=(',', ':'))
+
+
+def _climate_readable_buffer():
+    # Der eigentliche Append-/Retry-Puffer liegt ausschließlich im privaten
+    # Prozessspeicher. Lesbar ist nur der vom PHP-Leser verwendete RAM-Satz.
+    try:
+        live = json.loads(Path('/var/www/html/ramdisk/climate_load.json').read_bytes())
+        return live if isinstance(live, dict) else None
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        return None
+
+
+def _close_previous_climate_day(conn, today, now):
+    """Offene Messtage nachholen; ausschließlich ihre Einzelaufteilung schreiben."""
+    cutoff = today - datetime.timedelta(days=HISTORY_RETENTION_DAYS)
+    saved = {}
+    if 'climate_meters' in {row[1] for row in conn.execute("PRAGMA table_info(daily_stats)")}:
+        for day_text, payload in conn.execute(
+                'SELECT date, climate_meters FROM daily_stats WHERE date < ? AND climate_meters IS NOT NULL',
+                (today.isoformat(),)):
+            entries = json.loads(payload) if payload else []
+            if entries:
+                saved[datetime.date.fromisoformat(day_text)] = entries
+    history = {}
+    for path in Path('/var/www/html/data/climate_history').glob('????-??-??.jsonl'):
+        try:
+            day = datetime.date.fromisoformat(path.stem)
+        except ValueError:
+            continue
+        if day < today and path.is_file():
+            history[day] = path
+    signatures = {}
+    if saved or history:
+        # Eigene Metadatentabelle: Tagesbilanz und Einzelwerte bleiben bytegleich.
+        conn.execute('CREATE TABLE IF NOT EXISTS climate_archive_attempts '
+                     '(date TEXT PRIMARY KEY, signature TEXT NOT NULL)')
+        signatures = dict(conn.execute('SELECT date, signature FROM climate_archive_attempts'))
+        conn.execute('DELETE FROM climate_archive_attempts WHERE date < ?', (cutoff.isoformat(),))
+    live = _climate_readable_buffer()
+    changed = 0
+    for day in sorted(saved.keys() | history.keys()):
+        previous = saved.get(day, [])
+        expired = day < cutoff
+        # Alte unvollständige Verriegelungen innerhalb der Aufbewahrung dürfen
+        # erneut geprüft werden. Vollständige und abgelaufene Tage bleiben fest.
+        if previous and all(entry.get('day_closed') and (entry.get('complete') or expired)
+                            for entry in previous):
+            continue
+        day_path = Path('/var/www/html/data/climate_history') / (day.isoformat() + '.jsonl')
+        signature = _climate_history_signature(day_path, live, now)
+        if not expired and signature is not None and signatures.get(day.isoformat()) == signature:
+            continue
+        entries = []
+        if not expired and day_path.is_file():
+            result = subprocess.run(
+                ['php', DAILY_STATS_HELPER, '--climate-day', day.isoformat(), '--now', str(float(now))],
+                input='', capture_output=True, text=True, timeout=60, check=True,
+            )
+            entries = json.loads(result.stdout)
+            if not isinstance(entries, list):
+                raise ValueError('Klima-Tagesabschluss liefert ungültige Daten')
+        old_by_id = {entry['identity']: entry for entry in previous}
+        merged = {}
+        for entry in entries:
+            identity = entry['identity']
+            old = old_by_id.get(identity)
+            if old and old.get('complete') and old.get('day_closed'):
+                merged[identity] = old
+                continue
+            energy = _nullable_number(entry.get('daily_kwh'))
+            old_energy = _nullable_number(old.get('daily_kwh')) if old else None
+            # Ein gekürzter oder zeitweise nicht lesbarer Erzeugerbestand darf
+            # bestätigte Teilenergie nicht verringern. Belegte Unterbrechungen
+            # und Zählerresets behalten dagegen ihren unbekannten Wert samt Grund.
+            broken = entry.get('reason') in ('counter_reset', 'removed_midday', 'interrupted_day')
+            if old_energy is not None and not broken and (energy is None or energy < old_energy):
+                entry = dict(old, complete=False, reason=entry.get('reason') or 'end_missing')
+            entry['day_closed'] = bool(entry.get('complete'))
+            merged[identity] = entry
+        for identity, old in old_by_id.items():
+            if identity not in merged:
+                entry = dict(old)
+                if not (entry.get('complete') and entry.get('day_closed')):
+                    entry['complete'] = False
+                    entry['reason'] = entry.get('reason') or 'end_missing'
+                    entry['day_closed'] = expired
+                merged[identity] = entry
+        # Keine Messung: keine erfundene Tagesaufteilung. Fehlende Erzeugerdaten
+        # lassen bekannte Teilstände bis zum Ablauf offen.
+        changed += _store_climate_breakdown(conn, day, list(merged.values()))
+        # Vor dem Lesen gebunden: Ein konkurrierender Flush wird spätestens
+        # beim nächsten Stundenlauf erkannt; Fehler speichern keinen Versuch.
+        if not expired and signature is not None:
+            conn.execute('INSERT INTO climate_archive_attempts (date, signature) VALUES (?, ?) '
+                         'ON CONFLICT(date) DO UPDATE SET signature=excluded.signature',
+                         (day.isoformat(), signature))
+    return changed
+
+
+def archive_today(conn=None, now=None):
+    """Archiviert die laufende Webbilanz und ergänzt die Einzelaufteilung offener Messtage."""
+    current_now = time.time() if now is None else float(now)
+    today = datetime.date.today() if now is None else datetime.date.fromtimestamp(now)
     rows = _history_lines_for_date(today)
     cached = {}
     try:
@@ -247,7 +399,7 @@ def archive_today(conn=None):
     if not isinstance(cached, dict):
         cached = {}
     if len(rows) >= 2:
-        data = calculate_history_stats(rows)
+        data = calculate_history_stats(rows, now=now) if now is not None else calculate_history_stats(rows)
         # Zusatzstatistik stammt weiterhin aus dem Tageserzeuger.
         for key in ('saved', 'saved_u', 'saved_td', 'saved_wb'):
             if key in cached:
@@ -255,19 +407,25 @@ def archive_today(conn=None):
     elif cached.get('sources', {}).get('home_energy_source'):
         data = cached
     else:
-        print('Archiv unverändert: keine aktuelle Webbilanz oder Tageshistorie.')
-        return 0
-    values = _daily_values(data)
-    if values['home_consumption'] is None:
+        print('Archiv: keine aktuelle Webbilanz oder Tageshistorie.')
+        data = None
+    values = _daily_values(data) if data is not None else {}
+    if values and values['home_consumption'] is None:
         print('Archiv: Hausverbrauch unbekannt: ' + str(data['sources']['home_energy_source']))
     owns_connection = conn is None
     db_conn = init_db() if owns_connection else conn
     try:
         if owns_connection:
             db_conn.execute('BEGIN IMMEDIATE')
-        columns = ('date', *values)
-        changed = _upsert_changed(db_conn.cursor(), 'daily_stats', 'date', columns,
-                                  (today.isoformat(), *values.values()))
+        previous_changed = _close_previous_climate_day(db_conn, today, current_now)
+        current_changed = False
+        entries = json.loads(values.pop('climate_meters')) if 'climate_meters' in values else []
+        if values:
+            columns = ('date', *values)
+            current_changed = _upsert_changed(db_conn.cursor(), 'daily_stats', 'date', columns,
+                                              (today.isoformat(), *values.values()))
+        split_changed = _store_climate_breakdown(db_conn, today, entries)
+        changed = previous_changed + int(current_changed or split_changed)
         if owns_connection:
             db_conn.commit()
     finally:

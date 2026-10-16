@@ -30,8 +30,50 @@
                 : 'badge text-bg-secondary';
         }
 
-        const metrics = diagnostic.metrics && typeof diagnostic.metrics === 'object'
-            ? diagnostic.metrics
+        const continuity = diagnostic.evidence_continuity;
+        const previous = continuity?.previous_report;
+        const revisionValid = value => /^sha256:[0-9a-f]{64}$/.test(value || '');
+        const previousValid = previous?.schema_version === 'pv_forecast_previous_report_v1'
+            && previous.available === true && previous.decision_use_allowed === false
+            && ['pv_forecast_diagnostic_summary_v2', 'pv_forecast_diagnostic_summary_v3', 'pv_forecast_diagnostic_summary_v4'].includes(previous.summary_schema)
+            && previous.summary_schema === continuity?.previous_summary_schema
+            && (previous.summary_schema !== 'pv_forecast_diagnostic_summary_v4' || revisionValid(previous.method_revision))
+            && previous.topology_revision === diagnostic.topology_revision
+            && revisionValid(previous.topology_revision)
+            && (previous.method_revision === null || revisionValid(previous.method_revision))
+            && continuity?.retained === true
+            && previous.method_revision === continuity.previous_method_revision
+            && ['eligible_forecast_slots', 'compared_slots', 'yield_relevant_slots', 'yield_relevant_days',
+                'calculated_at_utc_s', 'evaluation_start_utc_s', 'evaluation_end_utc_s']
+                .every(key => Number.isInteger(previous[key]) && previous[key] >= 0)
+            && previous.compared_slots > 0
+            && previous.compared_slots === continuity.previous_compared_slots
+            && previous.yield_relevant_days <= previous.yield_relevant_slots
+            && previous.yield_relevant_slots <= previous.compared_slots
+            && previous.compared_slots <= previous.eligible_forecast_slots
+            && previous.evaluation_start_utc_s < previous.evaluation_end_utc_s
+            && previous.evaluation_end_utc_s <= previous.calculated_at_utc_s
+            && previous.calculated_at_utc_s <= Math.floor(Date.now() / 1000) + 300
+            && previous.metrics && typeof previous.metrics === 'object'
+            && ['trefferabweichung_wh', 'richtungsversatz_wh', 'quadratische_fehlerwurzel_wh',
+                'persistenz_skill_score_pct', 'energiegewichtete_gesamtabweichung_pct', 'vergleichsabdeckung_pct']
+                .every(key => {
+                    const value = previous.metrics[key];
+                    if ((value === null || value === undefined) && (['persistenz_skill_score_pct', 'energiegewichtete_gesamtabweichung_pct'].includes(key)
+                        || (key === 'quadratische_fehlerwurzel_wh' && previous.summary_schema !== 'pv_forecast_diagnostic_summary_v4'))) return true;
+                    return typeof value === 'number' && Number.isFinite(value)
+                        && (['richtungsversatz_wh', 'persistenz_skill_score_pct'].includes(key) || value >= 0)
+                        && (key !== 'vergleichsabdeckung_pct' || value <= 100);
+                });
+        const showPrevious = Number(diagnostic.compared_slots) === 0 && previousValid;
+        const displayedMetrics = showPrevious ? previous.metrics : diagnostic.metrics;
+        const utcDate = value => Number.isInteger(value) && value > 0
+            ? new Date(value * 1000).toLocaleString('de-DE', { timeZone: 'UTC' }) + ' UTC' : 'unbekannt';
+        const priorLabel = showPrevious
+            ? `Stand bis ${utcDate(previous.evaluation_end_utc_s)}, neue Methode seit ${utcDate(continuity.current_method_since_utc_s)}.` : '';
+        if (showPrevious && statusElement) statusElement.textContent = 'Früherer Diagnosestand';
+        const metrics = displayedMetrics && typeof displayedMetrics === 'object'
+            ? displayedMetrics
             : {};
         const finiteMetric = key => {
             if (metrics[key] === null || metrics[key] === undefined || metrics[key] === '') {
@@ -84,7 +126,7 @@
         if (sampleElement) {
             sampleElement.textContent = comparedSlots > 0
                 ? `${comparedSlots.toLocaleString('de-DE')} verglichene 15-Minuten-Fenster einschließlich Nacht · davon ${relevantSlots.toLocaleString('de-DE')} Ertragsfenster · ${relevantDays.toLocaleString('de-DE')} UTC-Tage mit Ertrag`
-                : 'Noch keine vergleichbaren Fenster';
+                : showPrevious ? `${priorLabel} Früherer Bericht: ${previous.compared_slots.toLocaleString('de-DE')} verglichene Fenster; aktuelle Methode: 0.` : 'Noch keine vergleichbaren Fenster';
         }
 
         const valueContract = diagnostic.forecast_value_contract
@@ -214,10 +256,18 @@
                 ? '–' : Number(value).toLocaleString('de-DE', { maximumFractionDigits: digits });
             const lines = [
                 'Ertragsfenster: Ist oder Prognose mindestens 25 Wh. Positiver Richtungsversatz bedeutet mehr Ist-Ertrag als vorhergesagt; negativ bedeutet weniger.',
-                `WAPE = Summe absoluter Fehler / verglichene Ist-Energie. Abdeckung vorhandener Prognosen: ${fmt(diagnostic.compared_slots, 0)} / ${fmt(diagnostic.eligible_forecast_slots, 0)}; fehlende Prognoseausgaben sind darin nicht enthalten.`,
-                `RMSE: ${fmt(finiteMetric('quadratische_fehlerwurzel_wh'))} Wh/15 min. Skill gegen Tagespersistenz: ${fmt(finiteMetric('persistenz_skill_score_pct'))} % bei ${fmt(diagnostic.persistence_compared_slots, 0)} Ertragsfenstern; positiv bedeutet besser.`,
+                `WAPE = Summe absoluter Fehler / verglichene Ist-Energie. ${showPrevious ? "Aktuelle Methode: " : ""}Abdeckung vorhandener Prognosen: ${fmt(diagnostic.compared_slots, 0)} / ${fmt(diagnostic.eligible_forecast_slots, 0)}; fehlende Prognoseausgaben sind darin nicht enthalten.`,
+                showPrevious
+                    ? `Früherer Bericht: RMSE ${fmt(finiteMetric('quadratische_fehlerwurzel_wh'))} Wh/15 min. Skill gegen Tagespersistenz ${fmt(finiteMetric('persistenz_skill_score_pct'))} %; positiv bedeutet besser.`
+                    : `RMSE: ${fmt(finiteMetric('quadratische_fehlerwurzel_wh'))} Wh/15 min. Skill gegen Tagespersistenz: ${fmt(finiteMetric('persistenz_skill_score_pct'))} % bei ${fmt(diagnostic.persistence_compared_slots, 0)} Ertragsfenstern; positiv bedeutet besser.`,
                 'Gesamtvergleich: je Fenster die letzte vorher archivierte Ausgabe; die Vorläufe sind gemischt. UTC-Ertragstage können unvollständig sein.'
             ];
+            if (showPrevious) {
+                lines.unshift(`${priorLabel} Zeitraum ${utcDate(previous.evaluation_start_utc_s)} bis ${utcDate(previous.evaluation_end_utc_s)}. Frühere Methodenrevision: ${previous.method_revision || 'nicht belegt'}. Die Kennzahlen oben stammen aus diesem getrennten Bericht; aktuelle Fallzahlen und Vorläufe bleiben beim neuen Methodenstand.`);
+            }
+            if (continuity?.merged_into_current_metrics === true) {
+                lines.unshift(`Wertegleiche Methodenstände verbunden: ${Array.isArray(continuity.merged_method_revisions) ? continuity.merged_method_revisions.length : 0} belegte frühere Revisionen derselben Topologie.`);
+            }
             const timeCheck = diagnostic.history_time_plausibility;
             if (timeCheck?.schema_version === 'pv_history_time_plausibility_v1'
                 && timeCheck.decision_use_allowed === false && timeCheck.status === 'warning'
@@ -275,6 +325,31 @@
                 }
             } else {
                 lines.push('Zeitraum, eingefrorene Tagesausgaben und getrennte Modellstufen sind in dieser älteren Zusammenfassung noch nicht enthalten.');
+            }
+            const archive = diagnostic.entity_archive;
+            if (archive?.schema_version === 'pv_entity_archive_v1' && archive.decision_use_allowed === false) {
+                lines.push('Einzelprognosen und MPPT werden ausschließlich zur Diagnose archiviert; das Archiv beeinflusst die Regelung nicht. Anzeige als begrenzter Auszug.');
+                const date = value => Number(value) > 0 ? new Date(Number(value) * 1000).toLocaleString('de-DE', { timeZone: 'UTC' }) + ' UTC' : 'unbekannt';
+                const freshness = { fresh: 'frisch bei Ausgabe', source_missing: 'Quelle fehlt', time_missing: 'Quellenzeit fehlt', time_future: 'Quellenzeit liegt in der Zukunft', ttl_exceeded: 'Frist bei Ausgabe überschritten', unknown: 'Frischebeleg unbekannt' };
+                const ghiQuality = { ok: 'vorhanden', source_missing: 'Einzelquelle fehlt', not_provided: 'Quelle liefert hier kein horizontales GHI', support_missing: 'mindestens eine Interpolationsstütze fehlt', unknown: 'Quellenbeleg unbekannt' };
+                const entityReasons = { ok: 'Wert vorhanden', target_missing: 'mindestens eine Leistungsstütze fehlt', source_stale: 'Quelle bei Ausgabe nicht frisch', entity_source_missing: 'Einzelquelle fehlt', binding_changed: 'Quellenzuordnung passt nicht', diagnostic_error: 'Diagnosewert nicht verfügbar', diagnostic_budget: 'Archivbudget erschöpft', invalid_sample: 'Diagnosewert ungültig' };
+                const selection = { daylight_value: 'gültiger Tageslichtwert', no_valid_daylight_value: 'kein gültiger Tageslichtwert vorhanden', provenance_unknown: 'Tageslichtbeleg im Altbestand unbekannt', unknown: 'Auswahlbeleg unbekannt' };
+                for (const item of archive.entities || []) {
+                    const clarity = item.daylight === false || item.clarity_reason === 'sun_below_limit'
+                        ? 'nicht anwendbar unter der Modellgrenze oder nachts' : fmt(item.clarity, 3);
+                    lines.push(`${item.entity} ${item.model}, ${(item.groups || []).map(g => g.group || 'Zuordnung unbekannt').join(', ') || 'Zuordnung unbekannt'}: Zielzeit ${date(item.target)}, Ausgabezeit ${date(item.issued_at)}; ${item.historical ? 'historischer Archivstand; ' : ''}${selection[item.selection_reason] || selection.unknown}. Rohwert ${fmt(item.raw_wh)} Wh, Ensemblebeitrag ${fmt(item.contribution_wh)} Wh; ${entityReasons[item.reason] || 'Wertgrund im Altbestand unbekannt'}.`);
+                    lines.push(`Frische bei Ausgabe: ${freshness[item.freshness_reason] || freshness.unknown}; Basis ${item.source_time_basis === 'response_capture' ? 'Erfassung der Anbieterantwort' : 'unbekannt'}, Quellenzeit ${date(item.source_at)}, Bezugszeit ${date(item.evaluated_at)}, Frist ${fmt(item.ttl_s, 0)} s. Horizontales GHI ${fmt(item.ghi)} W/m² (${ghiQuality[item.ghi_reason] || ghiQuality.unknown}). Prognostizierte Klarheit ${clarity} (${item.clarity_reason}).`);
+                }
+                lines.push(`MPPT-Auszug: gewähltes Viertelstundenfenster ${date(archive.observation_window_start)} bis ${date(archive.observation_window_end)}; je Tracker eine Messreihe.`);
+                for (const item of archive.observations || []) {
+                    lines.push(`${item.tracker}: ${fmt(item.energy_wh)} Wh, Abdeckung ${fmt(item.covered_seconds, 0)}/900 s; ${item.reason}. Verschiedene Proben ${fmt(item.samples, 0)}, Lücken ${fmt(item.gaps, 0)}, ungültige Proben ${fmt(item.invalid_samples, 0)}, Neustart im Fenster ${item.restart ? 'ja' : 'nein'}; größter integrierter Abstand ${fmt(item.max_gap_s)} s, Quellenalter bei letzter Probe ${fmt(item.source_age_s)} s, letzte Quellenzeit ${date(item.last_source_at)}. Unvollständige Energie bleibt unbekannt. Spannung ${fmt(item.voltage_mean)} V, Strom ${fmt(item.current_mean)} A. Trackerqualität und Flächenbindung unbekannt. Beobachtete Klarheit der anderen Gruppe ${fmt(item.observed_clarity, 3)} (${item.clarity_reason}).`);
+                }
+                if (archive.budget) {
+                    lines.push(`Einzelarchiv: höchstens ${fmt(archive.budget.retention_days, 0)} Tage, ${fmt(archive.budget.used_bytes / 1048576, 1)} von ${fmt(archive.budget.reserved_bytes / 1048576, 0)} MiB. Wegen Platzmangel verworfen: ${fmt(archive.budget.dropped_values, 0)} Einzelwerte und ${fmt(archive.budget.dropped_observations, 0)} Messfenster.`);
+                }
+                if (archive.status !== 'ok') lines.push('Einzelarchiv: ' + archive.status);
+            } else if (diagnostic.entity_archive_reason) {
+                lines.push('Einzelarchiv derzeit nicht verfügbar: ' + diagnostic.entity_archive_reason);
             }
             explanation.textContent = lines.join('\n');
             explanation.style.whiteSpace = 'pre-line';

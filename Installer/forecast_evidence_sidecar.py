@@ -85,6 +85,11 @@ CYCLE_INTERVAL_S = 15 * 60
 LOCAL_SAMPLE_INTERVAL_S = 15
 LIVE_PATH = "/var/www/html/ramdisk/live_data_py.json"
 
+try:
+    from Forecast import pv_entity_archive
+except ImportError:
+    from Installer.Forecast import pv_entity_archive
+
 logger = logging.getLogger("E3DCForecastEvidence")
 logging.basicConfig(
     level=logging.INFO,
@@ -224,6 +229,7 @@ def run_cycle(
     summary_path: str = SUMMARY_JSON_PATH,
     now_utc_s: int | None = None,
     external_observations: list[dict[str, Any]] | None = None,
+    entity_observations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     now_s = int(time.time() if now_utc_s is None else now_utc_s)
     try:
@@ -262,13 +268,21 @@ def run_cycle(
         publish_summary_json(payload, summary_path=summary_path)
         return {"status": "unavailable", "reason": reason, "control_effect": False}
 
+    # Eigene Datei, identische Producer-Ausgabe; kein Eingriff in Regelleser.
+    try:
+        entity_payload, _entity_stat = _bounded_json_file(
+            pv_entity_archive.diagnostic_path(forecast_path), max_bytes=pv_entity_archive.MAX_ISSUE_BYTES)
+        evidence_slots = pv_entity_archive.attach_diagnostic(forecast_slots, entity_payload)
+    except Exception:
+        evidence_slots = pv_entity_archive.attach_diagnostic(forecast_slots, None)
+
     history_status = "stored"
     try:
         with single_writer_lock(lock_path):
             initialize_database(database_path)
             enforce_retention(now_utc_s=now_s, database_path=database_path)
             archive_result = archive_forecast_snapshot(
-                forecast_slots,
+                evidence_slots,
                 forecast_issue_contract=forecast_issue_contract,
                 published_at_utc_s=published_at_utc_s,
                 captured_at_utc_s=now_s,
@@ -276,6 +290,9 @@ def run_cycle(
             )
             with database(database_path, write=True) as connection:
                 external_inserted = store_external(connection, external_observations or [])
+                entity_observation_result = pv_entity_archive.store_observations(connection, entity_observations or [])
+                if entity_observation_result["budget_dropped"]:
+                    logger.warning("Diagnosebudget erschöpft: %d MPPT-/Referenzfenster entfallen.", entity_observation_result["budget_dropped"])
             try:
                 history_slots = read_history(config, now_utc_s=now_s)
                 history_result = store_history_observations(
@@ -337,6 +354,16 @@ def run_cycle(
     summary["history_backfill"] = history_backfill_progress(database_path=database_path)
     summary["quality_progress"] = current_quality_progress(
         summary, config, now_utc_s=now_s, database_path=database_path)
+    entity_status = 'ok'
+    try:
+        with database(database_path) as connection:
+            summary["entity_archive"] = pv_entity_archive.public_excerpt(connection, revision)
+        summary["entity_archive_reason"] = None
+    except Exception:
+        summary["entity_archive"] = None
+        summary["entity_archive_reason"] = 'diagnostic_error'
+        entity_status = 'unavailable'
+        logger.warning("PV-Einzelarchiv derzeit nicht verfügbar.")
     publish_summary_json(summary, summary_path=summary_path)
     return {
         "status": "ok",
@@ -344,6 +371,8 @@ def run_cycle(
         "archive": archive_result,
         "history": history_result,
         "external_observations_inserted": external_inserted,
+        "entity_observations": entity_observation_result,
+        "entity_archive_status": entity_status,
         "topology_revision": revision,
         "control_effect": False,
     }
@@ -358,6 +387,8 @@ def main() -> int:
     args = parser.parse_args()
     interval_s = max(CYCLE_INTERVAL_S, int(args.interval))
     accumulator = ExternalEnergyAccumulator()
+    entity_accumulator = pv_entity_archive.MpptAccumulator()
+    pending_entities = []
     pending_external: list[dict[str, Any]] = []
     next_cycle = 0.0
     forecast_identity = None
@@ -379,10 +410,14 @@ def main() -> int:
                         forecast_identity = identity
                     live, _stat = _bounded_json_file(LIVE_PATH, max_bytes=MAX_CONFIG_BYTES)
                     accumulator.observe(live, current_revision, now_s, config=config)
+                    entity_accumulator.observe(live, current_revision, now_s, config=config)
                 except Exception:
                     # Eine fehlende, veraltete oder ungültige Probe öffnet eine Lücke.
                     accumulator.observe({}, None, now_s)
+                    entity_accumulator.observe({}, current_revision, now_s, config=config)
                 pending_external.extend(accumulator.closed(now_s))
+                pending_entities.extend(entity_accumulator.closed(now_s))
+                pending_entities = pending_entities[-576:]
                 # Bei längerem Ausfall keine unbegrenzte RAM-Warteschlange aufbauen.
                 if len(pending_external) > 192:
                     logger.warning(
@@ -394,12 +429,14 @@ def main() -> int:
                 time.sleep(LOCAL_SAMPLE_INTERVAL_S)
                 continue
             try:
-                result = run_cycle(external_observations=pending_external)
+                result = (run_cycle(external_observations=pending_external, entity_observations=pending_entities)
+                          if pending_entities else run_cycle(external_observations=pending_external))
             finally:
                 # Auch unerwartete Fehler dürfen keine schnellen RSCP-/Disk-Retries auslösen.
                 next_cycle = time.monotonic() + interval_s
             if result.get("status") == "ok":
                 pending_external.clear()
+                pending_entities.clear()
             status = str(result.get("status") or "unknown")
             if status == "disabled":
                 logger.info("PV-Prognosediagnose ist ausgeschaltet.")
@@ -418,8 +455,14 @@ def main() -> int:
             return 2
         except Exception as exc:
             logger.error("Diagnosezyklus fehlgeschlagen: %s", exc)
+            try:
+                publish_summary_json(unavailable_summary(None, "diagnostic_error"))
+            except Exception:
+                pass
+            if args.once:
+                return 2
         if args.once:
-            return 0
+            return 0 if result.get("status") == "ok" and result.get("entity_archive_status", "ok") == "ok" else 2
         time.sleep(LOCAL_SAMPLE_INTERVAL_S if not args.once else interval_s)
 
 

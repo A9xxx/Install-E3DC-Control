@@ -2945,6 +2945,9 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
                 status["hs_reason"] = "WP nur Messung - keine Relaissteuerung"
             refresh_shelly_3em_provider()
 
+    # Bereitschaft gehört zur frischen Messung, auch wenn der Sollwert
+    # in diesem Zyklus geändert wurde. Zuerst die Istprojektion abschließen.
+    _with_actuator_safety_status(status, safety_gate)
     heater_acceptance_ready = bool(
         auto_mode
         and heater_module_enabled
@@ -2955,13 +2958,20 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
         and not bool(status.get("actor_writes_blocked"))
         and (not is_elwa or elwa_can_accept_power(elwa_status_code))
     )
+    # Ein frisch bestätigter Heizstab darf seinen zentralen Wattrahmen
+    # zurücknehmen. Die getrennte WP-Relais-Mindestlaufzeit bleibt geschützt.
+    status["budget_running_reclaimable"] = bool(
+        heater_acceptance_ready and status.get("hs_actual_w", 0) > 0
+        and status.get("hs_actual_w") == sum(sample.get("power_w", 0)
+            for sample in (status.get("hs_provider_measurements") or {}).values())
+    )
     status["budget_start_ready"] = heater_acceptance_ready
     status["budget_start_request_w"] = (
         int(max(hs_max_w if has_hs else 0, sh_nominal_w if has_sh else 0))
         if heater_acceptance_ready
         else 0
     )
-    return _with_actuator_safety_status(status, safety_gate)
+    return status
 
 
 # ---------------------------------------------------------------------------

@@ -240,7 +240,7 @@ MODULES: dict[str, ServiceModule] = {
             "Keine Doppelsteuerung: Luxtronik Live, IDM Live und direkter Manager müssen zum gewählten WP-Typ passen.",
             "Luxtronik Live, IDM Live, Stiebel ISG Live oder Dimplex WPM Live passend zum WP-Typ zuerst installieren und prüfen.",
             "Bei nur messender Shelly-Pro3EM-Konfiguration nicht den direkten Wärmepumpen Manager starten.",
-            "Bei SG-Ready per Shelly 1 reicht wp_type=-1 plus shelly_sg_ip oder shelly_pause_ip.",
+            "Bei SG-Ready per Shelly 1 reicht wp_type=-1 oder wp_type=7 plus shelly_sg_ip oder shelly_pause_ip. Typ 7 allein benötigt keinen Wärmepumpen-Manager.",
         ),
         optional=True,
         actions=READ_ACTIONS + SERVICE_ACTIONS,
@@ -346,6 +346,7 @@ MODULES: dict[str, ServiceModule] = {
         config_keys=(
             "climate_enable", "climate_name", "climate_meter_ip", "climate_meter_type",
             "climate_meter_phase", "climate_min_power_w", "climate_poll_s",
+            "climate_meter2_name", "climate_meter2_ip", "climate_meter2_type", "climate_meter2_phase",
             "climate_history_enable", "climate_history_interval_s", "climate_forecast_enable",
         ),
         install_notes=(
@@ -480,7 +481,7 @@ MODULES: dict[str, ServiceModule] = {
         alive_file="/var/www/html/ramdisk/mqtt_hub_status.json",
         alive_max_age_s=120,
         log_file="/var/www/html/logs/e3dc_mqtt_hub.log",
-        config_keys=("mqtt_hub_ip", "mqtt_hub_port", "mqtt_hub_topic"),
+        config_keys=("mqtt_hub_ip", "mqtt_hub_port", "mqtt_hub_topic", "mqtt_hub_repeat_interval_s", "wp_power_topic"),
         required_config_keys=(),
         install_notes=("Installiert paho-mqtt bei Bedarf im gebundenen Python-venv, damit der Dienst direkt starten kann.",),
         optional=True,

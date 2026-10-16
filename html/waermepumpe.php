@@ -26,6 +26,15 @@ $conf['auto_mode'] = $conf['auto_mode'] ?? 1;
 $conf['wp_type'] = $conf['wp_type'] ?? -1;
 
 $wpType = (int)$conf['wp_type'];
+if ($wpType === 7 && ($seite ?? 'waermepumpe') !== 'heizstab') {
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'GET' && ($_SERVER['REQUEST_METHOD'] ?? '') !== 'HEAD') {
+        http_response_code(403);
+        echo 'MQTT-Wärmepumpe: nur Anzeige.';
+        return;
+    }
+    echo e3dcRenderMqttHeatpump(e3dcMqttHeatpumpFields($conf));
+    return;
+}
 // Wärmequelle aus der Konfiguration (Luft, Sole, Grundwasser, Direktverdampfung, unbekannt);
 // der Herstellertyp sagt nichts über die Quelle.
 $wpSourceType = e3dcNormalizeHeatSourceType($conf['wp_source_type'] ?? 'auto');
@@ -320,7 +329,7 @@ $configMtime = file_exists($configFile) ? date("d.m. H:i:s", filemtime($configFi
 $pyMtime = file_exists($luxInstallDir . 'energy_manager.py') ? date("d.m. H:i:s", filemtime($luxInstallDir . 'energy_manager.py')) : '--';
 
 // WP-Verbrauchslogik: präziser Messwert oder Live-Ersatzwert
-$wp_power_w = 0;
+$wp_power_w = ($wpType === 4) ? null : 0;
 $wp_source = 'live';
 
 if (isset($data['Leistung_Verdichter_W']) || isset($data['Leistungsaufnahme'])) {
@@ -328,10 +337,10 @@ if (isset($data['Leistung_Verdichter_W']) || isset($data['Leistungsaufnahme'])) 
 
     // Bei Stiebel darf Neben-/Pumpenleistung sichtbar bleiben; sie ist nur kein aktiver Verdichterbetrieb.
     if ($wpType != 4 && empty($data['Verdichter_Ein']) && empty($data['Verdichter'])) {
-        $wp_power_w = 0;
+        $wp_power_w = ($wpType === 4) ? null : 0;
     }
     $wp_source = 'modbus';
-} elseif ($wpType !== 6) {
+} elseif ($wpType !== 6 && $wpType !== 4) {
     // Beim E3DC-Leistungsmesser zeigt die Messansicht den PM-Wert direkt.
     $historyFileLive = '/var/www/html/ramdisk/live_history.txt';
     if (file_exists($historyFileLive)) {
@@ -345,8 +354,10 @@ if (isset($data['Leistung_Verdichter_W']) || isset($data['Leistungsaufnahme'])) 
     }
 }
 
+$stiebelCompressorKnown = ($wpType !== 4) || (($json['quality']['compressor']['valid'] ?? null) === true);
+if ($wpType === 4 && ($json['quality']['power']['valid'] ?? null) !== true) $wp_power_w = null;
 $cop = 0;
-$heiz_kw = floatval($data['Leistung_Heiz_kW'] ?? $data['Heizleistung Ist'] ?? 0);
+$heiz_kw = ($wpType === 4 && !isset($data['Leistung_Heiz_kW'])) ? null : floatval($data['Leistung_Heiz_kW'] ?? $data['Heizleistung Ist'] ?? 0);
 $heiz_kw_estimated = !empty($data['stiebel_heat_power_estimated']) || !empty($data['dimplex_heat_power_estimated']) || !empty($data['wp_heat_power_estimated']);
 $heiz_kw_estimate_title = '';
 if ($heiz_kw_estimated) {
@@ -1331,7 +1342,7 @@ if ($isChargingOnly) {
                     <div class="col-6 col-md-3">
                         <div class="p-2 bg-body-tertiary rounded border text-center h-100 d-flex flex-column justify-content-center">
                             <div class="small text-muted">Verbrauch</div>
-                            <div class="fw-bold text-warning"><?= number_format($wp_power_w / 1000, 2, ',', '.') ?> kW</div>
+                            <div class="fw-bold text-warning"><?= $wp_power_w === null ? 'unbekannt' : ((!empty($data['stiebel_power_estimated']) ? 'ca. ' : '') . number_format($wp_power_w / 1000, 2, ',', '.') . ' kW') ?></div>
                         </div>
                     </div>
                     <div class="col-6 col-md-3">
@@ -1382,6 +1393,8 @@ if ($isChargingOnly) {
                                         <i class="fas fa-circle-question me-1"></i>Status nicht belegt
                                     </span>
                                 <?php endif; ?>
+                            <?php elseif(!$stiebelCompressorKnown): ?>
+                                <span class="badge bg-secondary">Verdichter unbekannt</span>
                             <?php elseif(!empty($data['stiebel_passive_cooling_active']) || !empty($data['Passive_Kuehlung_Aktiv']) || !empty($data['Passive_Kühlung_Aktiv'])): ?>
                                 <span class="badge bg-primary" title="Passive Kühlung ohne Verdichter">
                                     <i class="fas fa-snowflake me-1"></i> Passive Kühlung
@@ -1540,7 +1553,7 @@ if ($isChargingOnly) {
                     </div>
                     <div class="col-6 col-md-3">
                         <div class="p-2 bg-body-tertiary rounded border text-center h-100">
-                            <div class="small text-muted">Verdichter</div>
+                            <div class="small text-muted">Verdichterdrehzahl</div>
                             <div class="fw-bold"><?= fmtVal($data['stiebel_compressor_hz'] ?? null, ' Hz') ?> <span class="text-muted small">/ <?= fmtVal($data['stiebel_compressor_percent'] ?? null, ' %') ?></span></div>
                         </div>
                     </div>

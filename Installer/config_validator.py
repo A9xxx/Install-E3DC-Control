@@ -11,6 +11,11 @@ from __future__ import annotations
 
 import ipaddress
 try:
+    from data_models import parse_mqtt_vehicle_allowlist, mqtt_vehicle_record_allowed
+except ImportError:
+    from Installer.data_models import parse_mqtt_vehicle_allowlist, mqtt_vehicle_record_allowed
+
+try:
     from .shelly_relay_owner import shelly_relay_conflict, SHELLY_OWNER_WARNING
 except ImportError:
     from shelly_relay_owner import shelly_relay_conflict, SHELLY_OWNER_WARNING
@@ -984,6 +989,51 @@ def validate_heatpump_start_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str, A
     return entries
 
 
+def validate_climate_meter_config(cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Bei überlappenden Messzielen warnen; keine Aktivierung oder Sperre."""
+    if not (_is_enabled(cfg, "climate_enable") or str(cfg.get("climate_enable", "")).strip().lower() == "ja") or not _address_configured(cfg, "climate_meter2_ip"):
+        return {}
+    ip1 = str(cfg.get("climate_meter_ip", "")).strip().lower()
+    ip2 = str(cfg.get("climate_meter2_ip", "")).strip().lower()
+    if not ip1 or ip1 != ip2:
+        return {}
+    try:
+        from .climate_live import normalize_meter_type, normalize_phase, normalize_shelly_em_gen1_channel
+    except ImportError:
+        from climate_live import normalize_meter_type, normalize_phase, normalize_shelly_em_gen1_channel
+    def targets(prefix):
+        kind = normalize_meter_type(cfg.get(prefix + "type", "shelly_pro3em"))
+        phase = cfg.get(prefix + "phase", "c")
+        if kind == "shelly_em_mini_gen4":
+            return {"em1:0"}
+        if kind == "shelly_pm_mini":
+            return {"pm1:0"}
+        if kind == "shelly_pro3em":
+            phase = normalize_phase(phase)
+            return {"em:0:" + p for p in (("a", "b", "c") if phase == "total" else (phase,))}
+        if kind == "shelly_em_gen1":
+            try:
+                channel = normalize_shelly_em_gen1_channel(phase)
+            except ValueError:
+                return {"unknown"}
+            return {"emeter:" + p for p in (("channel0", "channel1") if channel == "total" else (channel,))}
+        return {"unknown"}
+    a, b = targets("climate_meter_"), targets("climate_meter2_")
+    if not (a & b) and "unknown" not in a | b:
+        return {}
+    return {"climate_meter2_ip": _entry(
+        key="climate_meter2_ip", label="Klima: Messziele prüfen", unit="",
+        configured=cfg.get("climate_meter2_ip"), live_value=None, live_key=None,
+        effective=None, source="user", severity="warning",
+        message="Beide Klima-Zähler verwenden dieselbe Adresse mit gleichen, überlappenden oder automatisch erkannten Kanälen. Messziele prüfen, um Doppelzählung zu vermeiden.",
+    )}
+
+
+try:
+    from .Storage import backup_hold
+except ImportError:
+    from Storage import backup_hold
+
 def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Liefert die beratende Prüfung der Speicherkonfiguration.
 
@@ -1000,6 +1050,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     storage: Dict[str, Dict[str, Any]] = {}
     wallbox: Dict[str, Dict[str, Any]] = {}
     consumer: Dict[str, Dict[str, Any]] = {}
+    consumer.update(validate_climate_meter_config(cfg))
     consumer.update(validate_heatpump_pv_config(cfg))
     consumer.update(validate_heatpump_display_config(cfg))
     consumer.update(validate_stiebel_sg_ready_config(cfg))
@@ -1011,7 +1062,17 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         )
     consumer.update(validate_heatpump_start_config(cfg))
     price: Dict[str, Dict[str, Any]] = {}
-    forecast = validate_solcast_config(cfg)
+    cap = safe_float(cfg.get("ml_home_daily_cap_kwh"), 24.0)
+    cap_warning = cap < 8 or cap > 80
+    forecast = {"ml_home_daily_cap_kwh": _entry(
+        key="ml_home_daily_cap_kwh", label="Haus-Tagesreferenz für ML", unit="kWh",
+        configured=cfg.get("ml_home_daily_cap_kwh"), live_value=None, live_key=None,
+        effective=cap, source="user" if _has_user_value(cfg, "ml_home_daily_cap_kwh") else "default",
+        severity="warning" if cap_warning else "info",
+        message="Obergrenze der Referenzbasis für die Haus-Plausibilitätsprüfung, keine Grenze der ausgegebenen Prognose."
+                + (" Werte unter 8 oder über 80 kWh bitte auf Plausibilität prüfen." if cap_warning else ""),
+    )}
+    forecast.update(validate_solcast_config(cfg))
     forecast.update(validate_pv_forecast_topology_config(cfg))
     forecast.update(validate_ext_inverter_config(cfg))
 
@@ -2368,6 +2429,28 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         message=home_wp_split_message,
     )
 
+    backup = backup_hold.config_contract(cfg)
+    backup_labels = ('Notstrom-Vorhaltung (Aus/Beobachten/Halten)', 'Notstrom-Vorhalt am Abend',
+        'Bezugszeit', 'Versorgung mindestens bis', 'Reserve-Netzladen (bei Halten)', 'Reservepreisgrenze')
+    for key, label in zip(backup_hold.KEYS, backup_labels):
+        effective = backup['values'][key]
+        if key == 'storage_backup_hold_enable':
+            effective = (backup['mode'] if backup['mode'] == 2 else backup['enabled']) if backup['valid'] else False
+        storage[key] = _entry(key=key, label=label, unit='kWh' if key.endswith('energy_kwh') else ('ct/kWh' if key.endswith('limit_ct') else '-'),
+            configured=cfg.get(key), live_value=None, live_key=None, effective=effective,
+            source='user' if _has_user_value(cfg, key) else 'default',
+            severity='info' if backup['valid'] else 'warning',
+            message=('Halten; nachts mehr Netzbezug möglich. Reserve-Netzladen kostet den Bezugspreis.' if backup['mode'] == 2 else 'Nur Beobachtung; Verluste und Notstromfähigkeit der Anlage prüft E3DC-Control nicht.')
+                if backup['valid'] else 'Beobachtung ungültig: ' + backup_hold.reason_text(';'.join(backup['reasons'])))
+
+    storage["storage_central_pv_split_enable"] = _entry(
+        key="storage_central_pv_split_enable",
+        label="Zentrale PV-Aufteilung Akku/Wallbox (experimentell)", unit="-",
+        configured=cfg.get("storage_central_pv_split_enable"), live_value=None, live_key=None,
+        effective=_is_enabled(cfg, "storage_central_pv_split_enable"), source="user" if _has_user_value(cfg, "storage_central_pv_split_enable") else "default",
+        severity="info", message="Experimentell, Standard aus. Der Kurvenbedarf führt den Akkuanteil; Strom, Phasen und Stop bleiben beim Wallbox Manager.",
+    )
+
     openwb_pro_phase_wait_configured = (
         safe_float(cfg.get("openwb_pro_phase_wait_s"), 480.0)
         if _has_user_value(cfg, "openwb_pro_phase_wait_s")
@@ -2567,7 +2650,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
     order_raw = str(cfg.get("consumer_priority_order", "heatpump,wallbox,heater")).strip()
     order = [part.strip().lower() for part in order_raw.split(",") if part.strip()]
     active_consumers = []
-    if _is_enabled(cfg, "luxtronik") or safe_float(cfg.get("wp_type"), -1.0) >= 0:
+    if _is_enabled(cfg, "luxtronik") or (safe_float(cfg.get("wp_type"), -1.0) >= 0 and safe_float(cfg.get("wp_type"), -1.0) != 7):
         active_consumers.append("heatpump")
     if _is_enabled(cfg, "wb_native_enable"):
         active_consumers.append("wallbox")
@@ -3146,6 +3229,56 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             message=message,
         )
 
+    # Speicherparameter sind profilunabhängig und verändern keine Nutzereingaben.
+    for key, label, unit, default, fallback, low, high in (
+        ("market_degradation_ct_per_kwh", "Akkuverschleiß", "ct/kWh", 4.0,
+         "direct_marketing_degradation_ct_per_kwh", 0.0, None),
+        ("market_roundtrip_efficiency_pct", "Speicher-Wirkungsgrad", "%", 85.0,
+         "direct_marketing_roundtrip_efficiency_pct", 1.0, 100.0),
+        ("market_grid_charge_min_job_wh", "Mindestmenge je Netzladeauftrag", "Wh", 0.0,
+         None, 0.0, None),
+        ("market_grid_charge_min_job_pct", "Kapazitätsanteil der Mindestmenge", "%", 5.0,
+         None, 0.0, 100.0),
+    ):
+        selected = key if _has_user_value(cfg, key) else (
+            fallback if fallback and _has_user_value(cfg, fallback) else None
+        )
+        value, finite = _configured_finite_number(cfg, selected, default) if selected else (default, True)
+        effective = max(low, safe_float(value, default))
+        if high is not None:
+            effective = min(high, effective)
+        source = "user" if selected == key else ("legacy_direct_marketing" if selected else "default")
+        origin = "Eigener Wert" if selected == key else ("Direktvermarktung" if selected else "Standard")
+        severity = "ok"
+        message = "%s: %s %s. Bleibt bei jedem Profilwechsel unverändert." % (origin, _fmt_de(effective, 2), unit)
+        if not finite:
+            severity = "warning"
+            if not math.isfinite(value):
+                effective = None
+                message = "Keine endliche Zahl; wirksamer Wert nicht verfügbar. Eingabe bleibt gespeichert."
+            else:
+                message = "Keine gültige Zahl; die Planung verwendet den Standard %s %s. Eingabe bleibt gespeichert." % (_fmt_de(default, 2), unit)
+        elif value < low or (high is not None and value > high):
+            severity = "warning"
+            message = "Wert außerhalb des sinnvollen Bereichs; die Planung begrenzt ihn auf %s %s. Eingabe bleibt gespeichert." % (_fmt_de(effective, 2), unit)
+        elif key == "market_roundtrip_efficiency_pct" and value < 50.0:
+            severity = "warning"
+            message = "Sehr niedriger Speicher-Wirkungsgrad: Netzladen benötigt einen großen späteren Preisabstand."
+        elif key == "market_degradation_ct_per_kwh" and value > 20.0:
+            severity = "warning"
+            message = "Hoher Akkuverschleiß-Aufschlag: wirtschaftliches Netzladen wird selten lohnend."
+        elif key == "market_grid_charge_min_job_wh" and value > capacity_effective * 1000.0:
+            severity = "warning"
+            message = "Mindestmenge größer als die Speicherkapazität: kleine Netzladeaufträge werden voraussichtlich vollständig unterdrückt."
+        if key in ("market_grid_charge_min_job_wh", "market_grid_charge_min_job_pct"):
+            message += " Standard: 5 % der nutzbaren Kapazität ohne festen Sockel (Wh-Wert 0). Mindestmenge = max(Wh-Wert, Kapazität × Prozent/100), bezogen auf die Netzenergie je Auftrag. Nur beide Werte 0 heben das Minimum auf."
+        price[key] = _entry(
+            key=key, label=label, unit=unit,
+            configured=cfg.get(key) if _has_user_value(cfg, key) else None,
+            live_value=None, live_key=None, effective=effective, source=source,
+            severity=severity, message=message,
+        )
+
     # Ladeprofil und Komfort-Preislimit bewerten (vor Marge/Sicherheit).
     price["market_charge_profile"] = _entry(
         key="market_charge_profile",
@@ -3179,13 +3312,25 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         if market_price_limit > 0.0:
             limit_message = "Preisfenster: Slots ≤ %s ct/kWh." % _fmt_de(market_price_limit, 1)
             if tariff in ("octopus_heat", "special", "spezial", "special_tariff"):
-                tariff_prices = [cheap, basis, uht] if tariff == "octopus_heat" else [basis]
-                if market_price_limit + 0.001 < min(tariff_prices):
+                # Spezialtarif: Vergleich mit den Preisen des Tagesplans; der Arbeitspreis ist dort
+                # ausgeblendet. Ein ungültiger Plan hat oben schon eine eigene Warnung.
+                if tariff == "octopus_heat":
+                    tariff_prices = [cheap, basis, uht]
+                elif fixed_stages is not None and fixed_stages.get("valid"):
+                    tariff_prices = list(fixed_stages.get("prices") or [])
+                else:
+                    tariff_prices = []
+                    limit_severity = "info"
+                    limit_message = "Preisfenster gilt erst mit gültigem Tagesplan (Spezialtarif-Zeitpreise)."
+                if tariff_prices and market_price_limit + 0.001 < min(tariff_prices):
                     limit_severity = "warning"
                     limit_message = "Komfort lädt nie: Limit %s ct liegt unter dem günstigsten Tarifpreis %s ct." % (_fmt_de(market_price_limit, 1), _fmt_de(min(tariff_prices), 2))
-                elif market_price_limit + 0.001 >= basis:
+                elif tariff == "octopus_heat" and market_price_limit + 0.001 >= basis:
                     limit_severity = "warning"
                     limit_message = "Komfort lädt auch zu Normalpreis-Stunden (Limit %s ≥ Basis %s ct)." % (_fmt_de(market_price_limit, 1), _fmt_de(basis, 2))
+                elif tariff != "octopus_heat" and tariff_prices and market_price_limit + 0.001 >= max(tariff_prices):
+                    limit_severity = "warning"
+                    limit_message = "Komfort lädt zu allen Tarifzeiten (Limit %s ≥ höchster Tarifpreis %s ct)." % (_fmt_de(market_price_limit, 1), _fmt_de(max(tariff_prices), 2))
             else:
                 limit_message = "Fester Wert %s ct/kWh; ohne Wert gilt der Mittelpreis des gebundenen Preishorizonts." % _fmt_de(market_price_limit, 1)
         else:
@@ -4619,6 +4764,71 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
             if not bluelink_brand_valid
             else "Marke des Herstellerkontos (Hyundai Bluelink oder Kia Connect)."
         ),
+    )
+
+    mqtt_configured = (
+        str(cfg.get("mqtt_hub_ip") or "").strip().lower() not in ("", "127.0.0.1", "localhost", "::1")
+        or any(_has_user_value(cfg, key) for key in (
+            "mqtt_hub_sub_soc_topic", "mqtt_hub_sub_soc_topic_2", "wp_power_topic", "wb_topic", "wb2_topic",
+        ))
+    )
+    if mqtt_configured:
+        repeat_raw = cfg.get("mqtt_hub_repeat_interval_s", "0")
+        try:
+            repeat_value = int(str(repeat_raw).strip())
+            repeat_valid = repeat_value >= 0
+        except (TypeError, ValueError):
+            repeat_value, repeat_valid = 0, False
+        repeat_effective = min(3600, max(10, repeat_value)) if repeat_value > 0 else 0
+        repeat_warning = not repeat_valid or 0 < repeat_value < 10 or repeat_value > 3600
+        repeat_message = "0 = aus; Wiederholung nur bei gültigen Live-Daten."
+        if not repeat_valid:
+            repeat_message = "Ganze, nicht negative Sekunden erforderlich; Wiederholung ist aus."
+        elif 0 < repeat_value < 10:
+            repeat_message = "Mindestabstand 10 s; wirksam sind 10 s."
+        elif repeat_value > 3600:
+            repeat_message = "Höchstabstand 3600 s; wirksam sind 3600 s."
+        consumer["mqtt_hub_repeat_interval_s"] = _entry(
+            key="mqtt_hub_repeat_interval_s", label="MQTT-Werte zyklisch wiederholen", unit="s",
+            configured=repeat_raw, live_value=None, live_key=None, effective=repeat_effective,
+            source="user" if _has_user_value(cfg, "mqtt_hub_repeat_interval_s") else "default",
+            severity="warning" if repeat_warning else "ok", message=repeat_message,
+        )
+
+    names, valid = parse_mqtt_vehicle_allowlist(cfg.get("mqtt_vehicle_allowlist"))
+    consumer["mqtt_vehicle_allowlist"] = _entry(
+        key="mqtt_vehicle_allowlist", label="MQTT-Fahrzeug-Freigabeliste", unit="-",
+        configured="[maskiert]" if names is not None else "", live_value=None, live_key=None,
+        effective="offen" if names is None else "begrenzt" if valid else "gesperrt",
+        source="default" if names is None else "user", severity="ok" if valid else "warning",
+        message=("Exakte kommagetrennte NAME-Segmente ohne Wildcards; nur generische MQTT-Fahrzeuge."
+                 if valid else "Ungültige Freigabeliste: generische MQTT-Fahrzeuge sind gesperrt."),
+    )
+    wp_topic = str(cfg.get("wp_power_topic") or "").strip()
+    base = str(cfg.get("mqtt_hub_topic") or "e3dc").strip().strip('/') or 'e3dc'
+    fixed_power = {f"{base}/in/heatpump/power_w", f"{base}/in/heatpump/electric_w"}
+    other_topics = {str(cfg.get(key) or "").strip() for key in (
+        "mqtt_hub_sub_soc_topic", "mqtt_hub_sub_soc_topic_2", "wb_topic", "wb2_topic")}
+    inbound_keys = {
+        "heatpump": {"power_w", "electric_w", "state", "mode", "ww_temp", "ww_target_temp", "flow_temp", "return_temp", "outside_temp", "heat_kw", "boost_active"},
+        "heater": {"power_w", "water_temp", "target_temp", "state", "mode"},
+        "house": {"extra_power_w"},
+    }
+    for device in ("wallbox", "wallbox1", "wallbox2", "wb", "wb1", "wb2", "wallbox_1", "wallbox_2"):
+        inbound_keys[device] = {"power_w", "plugged", "charging", "soc", "range_km"}
+    parts = wp_topic[len(base) + 4:].strip('/').split('/') if wp_topic.startswith(f"{base}/in/") else []
+    inbound_conflict = len(parts) >= 2 and parts[-1] in inbound_keys.get(parts[0], set()) and wp_topic not in fixed_power
+    conflict = bool(wp_topic and (wp_topic in other_topics or inbound_conflict
+        or wp_topic.startswith((f"{base}/vehicle/", f"{base}/ha/", f"{base}/status/"))
+        or wp_topic == f"{base}/live"))
+    invalid = any(char in wp_topic for char in ('#', '+', '\x00')) or len(wp_topic.encode('utf-8')) > 65535
+    consumer["wp_power_topic"] = _entry(
+        key="wp_power_topic", label="WP-Leistungs-Topic", unit="-", configured=wp_topic,
+        live_value=None, live_key=None, effective=wp_topic or "Feste WP-Leistungseingänge",
+        source="user" if wp_topic else "default", severity="warning" if invalid or conflict else "ok",
+        message=("Exaktes MQTT-Topic ohne Wildcards erforderlich; keine automatische Ersatzquelle." if invalid
+            else "Topic kollidiert mit einem anderen Funktionstopic; bitte ein eigenes Leistungs-Topic wählen." if conflict
+            else "Rohe endliche Zahl in W am zentralen Broker; Dienstneustart über den Einrichtungsplan. Eine HA-Entity-ID ist kein MQTT-Topic."),
     )
 
     warnings = _warning_count(storage, wallbox, consumer, price, forecast)

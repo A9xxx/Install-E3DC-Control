@@ -49,6 +49,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "climate_control_provider": "toshiba_cloud",
     "climate_control_mode": "off",
     "climate_control_poll_s": "60",
+    "climate_poll_s": "15",
+    "climate_meter2_ip": "",
     "climate_toshiba_cloud_enable": "0",
     "climate_toshiba_username": "",
     "climate_toshiba_password": "",
@@ -737,8 +739,37 @@ def build_control_status(
         else:
             reason = "toshiba_adapter_not_implemented"
 
+    has_meter_list = isinstance(climate_load.get("meters"), list)
+    meter2_ip = cfg_text(cfg, "climate_meter2_ip").lower()
+    dual_meter = has_meter_list or meter2_ip not in {"", "0", "0.0.0.0", "none", "null"}
+    if has_meter_list:
+        climate_load = next((m for m in climate_load["meters"] if isinstance(m, dict) and m.get("id") == "meter1"), {})
     power_w = _safe_float(climate_load.get("power_w", climate_load.get("climate_power_w")), 0.0)
     load_age_s = max(0.0, now - _safe_float(climate_load.get("ts"), now))
+    meter_power_valid = True
+    meter_reason = ""
+    if dual_meter:
+        # Auch beim Schemaübergang ausschließlich die frische Primärmessung verwenden.
+        value = climate_load.get("power_w", climate_load.get("climate_power_w"))
+        stamp = climate_load.get("ts")
+        valid_stamp = bool(isinstance(stamp, (int, float)) and not isinstance(stamp, bool)
+                           and math.isfinite(stamp) and 0 < stamp <= now)
+        load_age_s = now - stamp if valid_stamp else None
+        max_age_s = max(30, min(120, 3 * max(5, _safe_float(cfg.get("climate_poll_s"), 15))))
+        valid_value = bool(isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value))
+        valid_flag = climate_load.get("power_valid", climate_load.get("measurement_valid", False))
+        meter_power_valid = bool(valid_value and valid_flag and climate_load.get("online")
+                                 and load_age_s is not None and load_age_s <= max_age_s)
+        if not meter_power_valid:
+            power_w = None
+            if not climate_load:
+                meter_reason = "missing"
+            elif not valid_stamp:
+                meter_reason = "timestamp_invalid"
+            elif load_age_s > max_age_s:
+                meter_reason = "stale"
+            else:
+                meter_reason = str(climate_load.get("reason") or "power_invalid")
 
     devices: list[dict[str, Any]] = []
     cloud_connected = False
@@ -855,14 +886,17 @@ def build_control_status(
         "ac_mode": ac_mode,
         "fan": fan,
         "schedule": schedule,
-        "climate_power_w": round(max(0.0, power_w), 1),
-        "climate_active": bool(climate_load.get("active", power_w > 50.0)),
-        "climate_meter_online": bool(climate_load.get("online", False)),
-        "climate_load_age_s": round(load_age_s, 1),
+        "climate_power_w": round(max(0.0, power_w), 1) if power_w is not None else None,
+        "climate_active": bool(climate_load.get("active", (power_w or 0) > 50.0)) and (not dual_meter or meter_power_valid),
+        "climate_meter_online": bool(climate_load.get("online", False)) and (not dual_meter or meter_power_valid),
+        "climate_load_age_s": round(load_age_s, 1) if load_age_s is not None else None,
         "ts": int(now),
         "ts_iso": datetime.fromtimestamp(now).isoformat(timespec="seconds"),
         "note": "Toshiba Cloud read-only; Kommandos bleiben gesperrt." if cloud_connected else "Vorbereitung ohne aktive Toshiba-Kommandos",
     }
+    if dual_meter:
+        status["climate_power_valid"] = meter_power_valid
+        status["climate_meter_reason"] = meter_reason
     return status
 
 

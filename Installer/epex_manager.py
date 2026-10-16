@@ -32,6 +32,8 @@ try:
         configured_billing_price_for_timestamp,
         parse_special_tariff_schedule as _parse_special_tariff_schedule,
         recurring_tariff_slots,
+        recurring_tariff_stages,
+        uses_configured_schedule_tariff,
         special_tariff_price_for_datetime,
         supports_spot_market_prices,
         TARIFF_TIMEZONE_NAME,
@@ -42,6 +44,8 @@ except ImportError:  # pragma: no cover - package-less compatibility
         configured_billing_price_for_timestamp,
         parse_special_tariff_schedule as _parse_special_tariff_schedule,
         recurring_tariff_slots,
+        recurring_tariff_stages,
+        uses_configured_schedule_tariff,
         special_tariff_price_for_datetime,
         supports_spot_market_prices,
         TARIFF_TIMEZONE_NAME,
@@ -264,7 +268,7 @@ def publish_market_state(config, data, safety_gate=None, cache_write=True, sourc
     if not context_valid:
         return False, [], publish_disabled_market_state(config, context_reason), context_reason
     if not price_data_has_future_slots(data, min_horizon_s=900):
-        if configured_tariff_type(config) == "octopus_heat":
+        if uses_configured_schedule_tariff(config):
             return publish_configured_tariff_state(config, safety_gate=safety_gate)
         reason = "price_data_missing_or_stale"
         return False, [], publish_disabled_market_state(config, reason), reason
@@ -305,12 +309,17 @@ def publish_market_state(config, data, safety_gate=None, cache_write=True, sourc
 
 
 def publish_configured_tariff_state(config, safety_gate=None):
-    """Veröffentlicht die lokale Octopus-Heat-Tarifachse ohne Börsenpreis."""
+    """Veröffentlicht gültige lokal konfigurierte Tarifstufen ohne Börsenpreis."""
     context_valid, context_reason = _evaluate_market_safety_gate(config, safety_gate)
     if not context_valid:
         return False, [], publish_disabled_market_state(config, context_reason), context_reason
-    if configured_tariff_type(config) != "octopus_heat":
+    if not uses_configured_schedule_tariff(config):
         reason = "configured_tariff_axis_unavailable"
+        return False, [], publish_disabled_market_state(config, reason), reason
+
+    stages = recurring_tariff_stages(config)
+    if stages is None or not stages.get("valid", False):
+        reason = "configured_tariff_stages_invalid"
         return False, [], publish_disabled_market_state(config, reason), reason
 
     now_ms = int(time.time() * 1000)
@@ -441,7 +450,7 @@ def recover_or_disable_market(config, safety_gate=None):
             return True
     elif restore_cached_prices(config, safety_gate=safety_gate):
         return True
-    if configured_tariff_type(config) == "octopus_heat":
+    if uses_configured_schedule_tariff(config):
         published, _scores, _plan, _reason = publish_configured_tariff_state(
             config,
             safety_gate=safety_gate,
@@ -1416,7 +1425,7 @@ def generate_price_boost_plan(price_data, eco_scores, config):
         if interval_start > 0 and interval_end > interval_start:
             market_intervals.append((interval_start, interval_end, market_value))
 
-    if stromtarif_typ == "octopus_heat":
+    if uses_configured_schedule_tariff(config):
         plan_slots = recurring_tariff_slots(config, now_ms=now_ms)
     else:
         plan_slots = list(price_data or [])
@@ -1442,7 +1451,7 @@ def generate_price_boost_plan(price_data, eco_scores, config):
         billing_raw = score.get("billing_price")
         if billing_raw is None:
             billing_raw = raw.get("billing_price_ct")
-        if billing_raw is None and stromtarif_typ == "octopus_heat":
+        if billing_raw is None and uses_configured_schedule_tariff(config):
             billing_raw = configured_billing_price_for_timestamp(config, now_ts=st / 1000.0)
         if billing_raw is None and market_price is not None:
             billing_raw = market_price / 10.0
@@ -1517,8 +1526,8 @@ def generate_price_boost_plan(price_data, eco_scores, config):
         "enabled": enabled,
         "supported": supported_tariff,
         "unsupported_reason": "" if supported_tariff else "Negativpreis-Boost ist nur für echte Börsenpreistarife verfügbar",
-        "tariff_axis": "configured_recurring" if stromtarif_typ == "octopus_heat" else "market",
-        "timezone": TARIFF_TIMEZONE_NAME if stromtarif_typ == "octopus_heat" else None,
+        "tariff_axis": "configured_recurring" if uses_configured_schedule_tariff(config) else "market",
+        "timezone": TARIFF_TIMEZONE_NAME if uses_configured_schedule_tariff(config) else None,
         "active": active_window is not None,
         "price_limit_ct": price_limit_ct,
         "min_duration_min": min_duration_min,

@@ -24,7 +24,7 @@ DEVICE_ADDRESS_KEYS = (
     "server_ip", "wb_native_ip", "wb_native_ip2", "wb_ip", "wb2_ip",
     "luxtronik_ip", "idm_ip", "stiebel_isg_ip", "dimplex_ip",
     "shelly_sg_ip", "shelly_pause_ip", "heizstab_ip", "shelly_heiz_ip",
-    "shelly_3em_ip", "shelly_wb_ip", "shelly_wb2_ip", "climate_meter_ip",
+    "shelly_3em_ip", "shelly_wb_ip", "shelly_wb2_ip", "climate_meter_ip", "climate_meter2_ip",
     "shelly0v10v_ip", "direct_marketing_aux_inverter_shelly_ip",
 )
 EMPTY_ADDRESSES = {"", "0", "0.0.0.0", "none", "null", "false"}

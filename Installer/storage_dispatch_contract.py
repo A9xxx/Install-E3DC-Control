@@ -3918,6 +3918,7 @@ def _headroom_projection_canonical_authority_marker_present(
         "input_revisions",
         "intermediate_anchors",
         "market_plan",
+        "market_quality",
         "planned_loads",
         "planner",
         "pv_topology",
@@ -7851,8 +7852,27 @@ def build_canonical_dispatch_plan(
         "fallback_reason_code": shadow.get("fallback_reason_code"),
         "commands_allowed": False,
     }
+    # Nur diese kompakte Zusammenfassung belegt die Eingangsqualität und ein
+    # bewusstes Halteende. Der Legacyteil bleibt für ältere Leser erhalten.
+    market = source.get("market_plan") if isinstance(source.get("market_plan"), dict) else {}
+    forecast = market.get("forecast") if isinstance(market.get("forecast"), dict) else {}
+    prices = market.get("price_quality") if isinstance(market.get("price_quality"), dict) else {}
+    if isinstance(source.get("market_plan"), dict):
+        canonical["market_quality"] = {
+            "schema_version": "market_plan_quality_v1",
+            "energy_horizon_complete": forecast.get("energy_horizon_complete") if type(forecast.get("energy_horizon_complete")) is bool else None,
+            "current_price_complete": prices.get("current_price_complete") if type(prices.get("current_price_complete")) is bool else None,
+            "price_horizon_complete": prices.get("price_horizon_complete") if type(prices.get("price_horizon_complete")) is bool else None,
+            "blocked_reasons": copy.deepcopy(market.get("blocked_reasons")) if isinstance(market.get("blocked_reasons"), list) else None,
+            "active_contract_absent": "active_contract" in market and market["active_contract"] is None,
+        }
     plan_id = revision_hash(_plan_material(canonical))
     canonical["plan_id"] = plan_id
+    if "market_quality" in canonical:
+        canonical["market_quality_binding"] = revision_hash({
+            "plan_id": plan_id,
+            "market_quality": canonical["market_quality"],
+        })
     for slot in canonical["slots"]:
         slot["slot_id"] = revision_hash({
             "plan_id": plan_id,
@@ -7906,6 +7926,21 @@ def build_canonical_dispatch_plan(
         # aufrufenden Simulator vor dem atomaren JSON-Write entfernt werden.
         result["_dv_shadow_history_payload"] = dv_shadow_full
     return result
+
+
+def market_quality_binding_valid(plan: Dict[str, Any]) -> bool:
+    """Die Zusatzqualität separat prüfen; die v1-Planidentität bleibt erhalten."""
+    quality = plan.get("market_quality")
+    binding = plan.get("market_quality_binding")
+    if (not isinstance(quality, dict)
+            or quality.get("schema_version") != "market_plan_quality_v1"
+            or not isinstance(binding, str)):
+        return False
+    try:
+        expected = revision_hash({"plan_id": plan.get("plan_id"), "market_quality": quality})
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return binding == expected
 
 
 def validate_canonical_plan_static(plan: Dict[str, Any]) -> Dict[str, Any]:
@@ -10250,8 +10285,24 @@ def load_validated_canonical_plan_snapshot(
     *,
     max_age_s: Optional[float] = 1800,
     max_bytes: int = _PLAN_SNAPSHOT_MAX_BYTES,
+    diagnostic: Optional[Dict[str, Any]] = None,
 ) -> Optional[ValidatedCanonicalPlanSnapshot]:
     """Lädt genau eine stabile Dateigeneration; alte Revisionen sind kein Fallback."""
+
+    def failed(reason: str):
+        if diagnostic is not None:
+            diagnostic.clear()
+            diagnostic.update({"valid": False, "reason": reason})
+        return None
+
+    def accepted(snapshot):
+        if diagnostic is not None:
+            diagnostic.clear()
+            diagnostic.update({"valid": True, "reason": None,
+                               "plan_id": snapshot.get("plan_id"),
+                               "generated_at_ts_ms": snapshot.get("generated_at_ts_ms"),
+                               "source_sha256": snapshot.source_sha256})
+        return snapshot
 
     normalized = os.path.abspath(os.fspath(path))
     try:
@@ -10270,13 +10321,17 @@ def load_validated_canonical_plan_snapshot(
                 for cache_key, cached_plan in list(_PLAN_SNAPSHOT_CACHE.items()):
                     if cached_plan.source_path == normalized:
                         _PLAN_SNAPSHOT_CACHE.pop(cache_key, None)
-            return None
+            return failed(
+                "PLAN_SOURCE_NOT_REGULAR" if not stat.S_ISREG(current.st_mode)
+                else "PLAN_SOURCE_EMPTY" if current.st_size <= 0
+                else "PLAN_SOURCE_TOO_LARGE" if current.st_size > int(max_bytes)
+                else "PLAN_SOURCE_STALE")
     except (OSError, TypeError, ValueError):
         with _PLAN_SNAPSHOT_LOCK:
             for cache_key, cached_plan in list(_PLAN_SNAPSHOT_CACHE.items()):
                 if cached_plan.source_path == normalized:
                     _PLAN_SNAPSHOT_CACHE.pop(cache_key, None)
-        return None
+        return failed("PLAN_SOURCE_MISSING_OR_UNREADABLE")
 
     # Ein unveränderter, bereits vollständig validierter Dateistand benötigt
     # weder einen erneuten Mehr-MiB-Read noch einen neuen SHA-256-Lauf. Zwei
@@ -10301,7 +10356,7 @@ def load_validated_canonical_plan_snapshot(
                 and stat.S_ISREG(verified.st_mode)
                 and _plan_file_generation(verified) == generation
             ):
-                return cached
+                return accepted(cached)
         if cached is not None:
             for cache_key, cached_plan in list(_PLAN_SNAPSHOT_CACHE.items()):
                 if cached_plan is cached:
@@ -10312,7 +10367,7 @@ def load_validated_canonical_plan_snapshot(
         descriptor = os.open(normalized, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode) or before.st_size <= 0 or before.st_size > int(max_bytes):
-            return None
+            return failed("PLAN_SOURCE_INVALID_SIZE_OR_TYPE")
         source = bytearray()
         while len(source) <= int(max_bytes):
             chunk = os.read(descriptor, min(1024 * 1024, int(max_bytes) - len(source) + 1))
@@ -10322,18 +10377,18 @@ def load_validated_canonical_plan_snapshot(
         after = os.fstat(descriptor)
         generation = _plan_file_generation(before)
         if len(source) > int(max_bytes) or generation != _plan_file_generation(after) or len(source) != after.st_size:
-            return None
+            return failed("PLAN_SOURCE_GENERATION_MISMATCH")
     except (OSError, TypeError, ValueError):
-        return None
+        return failed("PLAN_SOURCE_UNREADABLE")
     finally:
         if descriptor >= 0:
             os.close(descriptor)
     try:
         current = os.stat(normalized, follow_symlinks=False)
         if generation != _plan_file_generation(current):
-            return None
+            return failed("PLAN_SOURCE_GENERATION_MISMATCH")
         if max_age_s is not None and time.time() - current.st_mtime > max(0.0, float(max_age_s)):
-            return None
+            return failed("PLAN_SOURCE_STALE")
         digest = hashlib.sha256(source).hexdigest()
         key = (normalized, generation, digest)
         with _PLAN_SNAPSHOT_LOCK:
@@ -10349,12 +10404,12 @@ def load_validated_canonical_plan_snapshot(
                     and _plan_file_generation(cached_final) == generation
                 ):
                     _PLAN_SNAPSHOT_CACHE.move_to_end(key)
-                    return cached
+                    return accepted(cached)
                 _PLAN_SNAPSHOT_CACHE.pop(key, None)
             parsed = json.loads(source.decode("utf-8"), parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
             static = validate_canonical_plan_static(parsed)
             if static.get("valid") is not True:
-                return None
+                return failed(str(static.get("block_reason_code") or "PLAN_SCHEMA_INVALID"))
             snapshot = ValidatedCanonicalPlanSnapshot(
                 parsed,
                 static_validation=static,
@@ -10364,13 +10419,13 @@ def load_validated_canonical_plan_snapshot(
             )
             final = os.stat(normalized, follow_symlinks=False)
             if generation != _plan_file_generation(final):
-                return None
+                return failed("PLAN_SOURCE_GENERATION_MISMATCH")
             _PLAN_SNAPSHOT_CACHE[key] = snapshot
             while len(_PLAN_SNAPSHOT_CACHE) > _PLAN_SNAPSHOT_CACHE_LIMIT:
                 _PLAN_SNAPSHOT_CACHE.popitem(last=False)
-            return snapshot
+            return accepted(snapshot)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
-        return None
+        return failed("PLAN_JSON_OR_SOURCE_INVALID")
 
 
 def validate_canonical_plan(
@@ -10421,6 +10476,7 @@ def validate_canonical_plan(
     result = {
         "valid": True,
         "block_reason_code": None,
+        "market_quality_bound": market_quality_binding_valid(plan),
         "plan_id": plan_id,
         "slot_id": slot.get("slot_id"),
         "slot": slot,

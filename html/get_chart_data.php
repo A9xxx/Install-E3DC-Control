@@ -223,7 +223,8 @@ foreach ($lines as $line) {
             'bat_v' => 0, 'bat_a' => 0, 'bat1_v' => 0, 'bat1_a' => 0,
             'wp_vl' => 0, 'wp_rl' => 0, 'wp_ww' => 0, 'wp_at' => 0, 'wp_kaelte' => 0,
             'wp_kaelte_soll' => 0, 'wp_freq' => 0,
-            'b1_cnt' => 0, 'wp_cnt' => 0, 'wp_kaelte_cnt' => 0, 'wp_kaelte_soll_cnt' => 0,
+            'wp_vl_cnt' => 0, 'wp_rl_cnt' => 0, 'wp_ww_cnt' => 0, 'wp_at_cnt' => 0, 'wp_freq_cnt' => 0,
+            'b1_cnt' => 0, 'wp_cnt' => 0, 'wp_power_cnt' => 0, 'wp_kaelte_cnt' => 0, 'wp_kaelte_soll_cnt' => 0,
             'eco_score' => 0, 'eco_cnt' => 0
         ];
         foreach ($extInverterChartColumns as $extCol => $_extKey) { $buckets[$tsRounded][$extCol] = 0; $buckets[$tsRounded][$extCol . '_cnt'] = 0; }
@@ -243,16 +244,35 @@ foreach ($lines as $line) {
     $b['pv_external_w'] += $pvExternal;
     
     $homeRaw = isset($d['home_raw']) ? $d['home_raw'] : (isset($d['home']) ? $d['home'] : 0);
-    $wp = isset($d['wp']) ? $d['wp'] : 0;
+    $wp = e3dc_chart_optional_float($d['wp'] ?? null);
+    if (array_key_exists('wp_power_valid', $d) && $d['wp_power_valid'] === false) $wp = null;
     $hs = isset($d['hs']) ? $d['hs'] : (isset($d['hs_power']) ? $d['hs_power'] : 0);
     $climate = isset($d['climate']) ? $d['climate'] : (isset($d['climate_power_w']) ? $d['climate_power_w'] : 0);
+    $climateUnknown = array_key_exists('climate_power_valid', $d) && (!$d['climate_power_valid']
+        || !isset($d['climate']) || !is_numeric($d['climate']) || !is_finite((float)$d['climate']));
     $climate = max(0, is_numeric($climate) ? (float)$climate : 0);
+    if ($climateUnknown) $b['climate_unknown'] = true;
+    if (isset($d['climate_meters'])) {
+        $b['climate_dual'] = true;
+        foreach ($d['climate_meters'] as $m) {
+            $id = $m['id'] ?? '';
+            if (!in_array($id, ['meter1', 'meter2'], true)) continue;
+            if (!isset($b['climate_meters'][$id])) $b['climate_meters'][$id] = ['name' => $m['name'], 'sum' => 0, 'count' => 0, 'valid' => true];
+            $item = &$b['climate_meters'][$id];
+            $item['count']++;
+            $item['valid'] = $item['valid'] && !empty($m['power_valid']) && isset($m['power_w']) && is_numeric($m['power_w']);
+            $item['sum'] += $m['power_w'] ?? 0;
+            $item['daily_kwh'] = $m['daily_kwh'] ?? null;
+            $item['energy_valid'] = !empty($m['energy_valid']);
+            unset($item);
+        }
+    }
     $wb = isset($d['wb']) ? $d['wb'] : 0;
     $wb2 = isset($d['wb2']) ? $d['wb2'] : 0;
     // Die History-Spalte wp enthält den Heizstab; hs ist nur dessen Diagnoseanteil.
     $heatPowerForHome = max(0, $wp, $hs);
     if ($wpTypeCfg === 2) {
-        $wp = 0;
+        $wp = $wp !== null ? 0 : null;
     }
     $externalWbLoad = 0;
     if (!empty($d['is_external_wb']) || (($d['wb_source'] ?? '') === 'mqtt_ha')) {
@@ -267,7 +287,7 @@ foreach ($lines as $line) {
     $b['grid'] += isset($d['grid']) ? $d['grid'] : 0;
     $b['wb'] += $wb;
     $b['wb2'] += $wb2;
-    $b['wp'] += $wp;
+    if ($wp !== null) { $b['wp'] += $wp; $b['wp_power_cnt']++; }
     $b['hs'] += $hs;
     $b['climate'] += $climate;
     $b['soc'] += isset($d['soc']) ? $d['soc'] : 0;
@@ -328,13 +348,12 @@ foreach ($lines as $line) {
         $ww = isset($lastLd['Warmwasser_Ist']) ? $lastLd['Warmwasser_Ist'] : (isset($lastLd['Warmwasser-Ist']) ? $lastLd['Warmwasser-Ist'] : null);
         $at = isset($lastLd['Aussentemp']) ? $lastLd['Aussentemp'] : (isset($lastLd['Außentemperatur']) ? $lastLd['Außentemperatur'] : null);
         
-        if ($vl !== null || $rl !== null || $ww !== null || $at !== null) {
-            $b['wp_vl'] += $vl ?: 0;
-            $b['wp_rl'] += $rl ?: 0;
-            $b['wp_ww'] += $ww ?: 0;
-            $b['wp_at'] += $at ?: 0;
-            $b['wp_freq'] += isset($lastLd['Freq_Ist']) ? $lastLd['Freq_Ist'] : 0;
-            $b['wp_cnt']++;
+        foreach (['wp_vl' => $vl, 'wp_rl' => $rl, 'wp_ww' => $ww, 'wp_at' => $at,
+                  'wp_freq' => $lastLd['Freq_Ist'] ?? null] as $key => $value) {
+            if ($value !== null && is_numeric($value) && is_finite((float)$value)) {
+                $b[$key] += (float)$value;
+                $b[$key . '_cnt']++;
+            }
         }
 
         if ($khl === null) {
@@ -367,6 +386,9 @@ foreach ($lines as $line) {
 
 ksort($buckets);
 
+$climateDualHistory = false;
+foreach ($buckets as $b) if (!empty($b['climate_dual'])) $climateDualHistory = true;
+if ($climateDualHistory) $data['climate_meters'] = [];
 foreach ($buckets as $ts => $b) {
     $c = $b['count'];
     $data['labels'][] = date('H:i', $ts);
@@ -380,9 +402,20 @@ foreach ($buckets as $ts => $b) {
     $data['grid'][] = round($b['grid'] / $c);
     $data['wb'][] = round($b['wb'] / $c);
     $data['wb2'][] = round($b['wb2'] / $c);
-    $data['wp'][] = round($b['wp'] / $c);
+    $data['wp'][] = $b['wp_power_cnt'] > 0 ? round($b['wp'] / $b['wp_power_cnt']) : null;
     $data['hs'][] = round($b['hs'] / $c);
-    $data['climate'][] = round($b['climate'] / $c);
+    $data['climate'][] = !empty($b['climate_unknown']) ? null : round($b['climate'] / $c);
+    if ($climateDualHistory) {
+        $parts = [];
+        foreach (($b['climate_meters'] ?? []) as $id => $m) {
+            $valid = $m['valid'] && $m['count'] === $c;
+            $parts[] = ['id' => $id, 'name' => $m['name'], 'power_w' => $valid ? round($m['sum'] / $c) : null,
+                'power_valid' => $valid, 'daily_kwh' => $m['daily_kwh'], 'energy_valid' => $m['energy_valid']];
+        }
+        $data['climate_meters'][] = $parts;
+        $data['climate_split_complete'][] = empty($b['climate_unknown']);
+    }
+
     $data['soc'][] = round($b['soc'] / $c, 1);
     
     $slotPrice = e3dc_chart_price_for_ts_ms($ecoScores, $ts * 1000);
@@ -409,13 +442,13 @@ foreach ($buckets as $ts => $b) {
     $data['bat1_v'][] = $b['b1_cnt'] > 0 ? round($b['bat1_v'] / $b['b1_cnt'], 1) : null;
     $data['bat1_a'][] = $b['b1_cnt'] > 0 ? round($b['bat1_a'] / $b['b1_cnt'], 1) : null;
     
-    $data['wp_vl'][] = $b['wp_cnt'] > 0 ? round($b['wp_vl'] / $b['wp_cnt'], 1) : null;
-    $data['wp_rl'][] = $b['wp_cnt'] > 0 ? round($b['wp_rl'] / $b['wp_cnt'], 1) : null;
-    $data['wp_ww'][] = $b['wp_cnt'] > 0 ? round($b['wp_ww'] / $b['wp_cnt'], 1) : null;
-    $data['wp_at'][] = $b['wp_cnt'] > 0 ? round($b['wp_at'] / $b['wp_cnt'], 1) : null;
+    $data['wp_vl'][] = $b['wp_vl_cnt'] > 0 ? round($b['wp_vl'] / $b['wp_vl_cnt'], 1) : null;
+    $data['wp_rl'][] = $b['wp_rl_cnt'] > 0 ? round($b['wp_rl'] / $b['wp_rl_cnt'], 1) : null;
+    $data['wp_ww'][] = $b['wp_ww_cnt'] > 0 ? round($b['wp_ww'] / $b['wp_ww_cnt'], 1) : null;
+    $data['wp_at'][] = $b['wp_at_cnt'] > 0 ? round($b['wp_at'] / $b['wp_at_cnt'], 1) : null;
     $data['wp_kaelte'][] = $b['wp_kaelte_cnt'] > 0 ? round($b['wp_kaelte'] / $b['wp_kaelte_cnt'], 1) : null;
     $data['wp_kaelte_soll'][] = $b['wp_kaelte_soll_cnt'] > 0 ? round($b['wp_kaelte_soll'] / $b['wp_kaelte_soll_cnt'], 1) : null;
-    $data['wp_freq'][] = $b['wp_cnt'] > 0 ? round($b['wp_freq'] / $b['wp_cnt'], 1) : null;
+    $data['wp_freq'][] = $b['wp_freq_cnt'] > 0 ? round($b['wp_freq'] / $b['wp_freq_cnt'], 1) : null;
     foreach ($extInverterChartColumns as $extCol => $_extKey) {
         $data[$extCol][] = $b[$extCol . '_cnt'] > 0 ? round($b[$extCol] / $b[$extCol . '_cnt']) : null;
     }

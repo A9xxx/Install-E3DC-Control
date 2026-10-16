@@ -3,6 +3,9 @@ require_once __DIR__ . '/helpers.php';
 sendNoCacheHeaders();
 header('Content-Type: application/json; charset=utf-8');
 
+$processJsonFlags = 0;
+if (defined('JSON_INVALID_UTF8_SUBSTITUTE')) $processJsonFlags |= JSON_INVALID_UTF8_SUBSTITUTE;
+
 $action = (string)($_GET['action'] ?? $_POST['action'] ?? '');
 $serviceMutationActions = ['start', 'stop', 'restart', 'enable', 'disable', 'activate_forecast_evidence'];
 $isServiceMutation = in_array($action, $serviceMutationActions, true);
@@ -233,7 +236,7 @@ if ($action === 'status_all') {
             'is_docker'  => $is_docker,
         ];
     }
-    echo json_encode(["success" => true, "services" => $result, "is_docker" => $is_docker]);
+    echo json_encode(["success" => true, "services" => $result, "is_docker" => $is_docker], $processJsonFlags);
     exit;
 }
 
@@ -261,7 +264,7 @@ if ($isServiceMutation) {
             ]);
             exit;
         }
-        echo json_encode(e3dcActivateForecastEvidenceService(), JSON_UNESCAPED_UNICODE);
+        echo json_encode(e3dcActivateForecastEvidenceService(), JSON_UNESCAPED_UNICODE | $processJsonFlags);
         exit;
     }
 
@@ -385,11 +388,11 @@ if ($isServiceMutation) {
             "message" => $action_success
                 ? "Docker-Dienstaktion abgeschlossen."
                 : "Docker-Dienstaktion wurde ausgeführt, aber der erwartete Zielzustand wurde nicht erreicht.",
-        ]);
+        ], $processJsonFlags);
         exit;
     }
 
-    echo json_encode(e3dcControlSystemdService($action, $service, $allowed_services), JSON_UNESCAPED_UNICODE);
+    echo json_encode(e3dcControlSystemdService($action, $service, $allowed_services), JSON_UNESCAPED_UNICODE | $processJsonFlags);
     exit;
 }
 

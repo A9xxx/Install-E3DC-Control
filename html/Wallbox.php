@@ -3712,10 +3712,11 @@ if ($hasWb2) {
                             Quelle: <span class="fw-bold text-body"><?= htmlspecialchars($row['source'] ?: '--') ?></span>
                             <?php if (!$row['fresh']): ?><br><span class="text-warning">Noch keine frischen openWB-Livedaten.</span><?php endif; ?>
                             <?php if ($row['type'] === 'openwb'): ?>
-                            <div class="mt-2" data-openwb-observation="<?= (int)$row['wb'] ?>" aria-live="polite">
+                            <div class="mt-2" data-openwb-observation="<?= (int)$row['wb'] ?>">
                                 <div data-openwb-state></div>
                                 <div data-openwb-mode></div>
-                                <div class="alert alert-warning mt-2 mb-2 py-2" data-openwb-warning hidden></div>
+                                <div class="alert alert-warning mt-2 mb-2 py-2" data-openwb-warning aria-live="polite" hidden></div>
+                                <div class="alert alert-warning mt-2 mb-2 py-2" data-openwb-profile-warning aria-live="polite" hidden></div>
                                 <details class="mt-1"><summary>Ladepriorität und openWB-Details</summary>
                                     <div data-openwb-details>Ladepriorität unbekannt</div>
                                 </details>
@@ -6015,14 +6016,14 @@ function wallboxPlanChanged(data) {
     return false;
 }
 
-function openwbObservationView(data, wb, now = Date.now() / 1000) {
+function openwbObservationView(data, wb) {
     const prefix = wb === 2 ? 'wb2_' : 'wb_';
     const read = key => data[prefix + 'openwb_' + key];
     const clean = value => typeof value === 'string'
         ? Array.from(value.replace(/<[^>]*>/g, '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim()).slice(0, 240).join('') : '';
-    const age = value => value !== null && value !== undefined && Number.isFinite(Number(value)) && Number(value) > 0 && now >= Number(value)
-        ? Math.floor(now - Number(value)) : null;
-    const runtimeAge = age(read('status_ts'));
+    const age = value => typeof value === 'number' && Number.isFinite(value) && value >= 0
+        ? Math.floor(value) : null;
+    const runtimeAge = age(read('status_age_s'));
     const fresh = runtimeAge !== null && runtimeAge < 30;
     const priority = fresh ? read('bat_mode') : null;
     const priorities = {ev_mode: 'Fahrzeuge', bat_mode: 'Speicher', min_soc_bat_mode: 'Nach SoC des Speichers'};
@@ -6036,26 +6037,76 @@ function openwbObservationView(data, wb, now = Date.now() / 1000) {
             warning = 'Die openWB verteilt den Überschuss nach ihren SoC-Schwellen für den Hausakku. Diese Schwellen können von der Ladekurve in E3DC-Control abweichen.';
         }
     }
+    // Beratung ausschließlich aus der effektiven Rolle und eigenen Frischebelegen.
+    const hintPrimary = read('hint_runtime_valid') === true
+        && data[prefix + 'effective_role'] === 'primary' && data[prefix + 'role_mismatch'] === false;
+    const hintFields = ['bat_mode', 'bat_min_soc', 'bat_max_soc', 'bat_power_discharge', 'bat_power_discharge_active'];
+    const batteryFresh = hintFields.every(key => read(key + '_hint_valid') === true);
+    const minSoc = read('bat_min_soc'), maxSoc = read('bat_max_soc'), discharge = read('bat_power_discharge');
+    let batteryWarning = '';
+    if (hintPrimary && String(read('control_mode')) === '2' && batteryFresh
+        && read('bat_mode') === 'min_soc_bat_mode' && read('bat_power_discharge_active') === true
+        && typeof minSoc === 'number' && Number.isFinite(minSoc) && minSoc >= 0
+        && typeof maxSoc === 'number' && Number.isFinite(maxSoc) && maxSoc <= 100 && minSoc <= maxSoc
+        && typeof discharge === 'number' && Number.isFinite(discharge) && discharge > 0) {
+        batteryWarning = 'Die openWB ist so eingestellt, dass sie ab ' + maxSoc + ' % Speicherstand bis zu '
+            + discharge.toLocaleString('de-DE') + ' W Akkustrom für das Fahrzeug einrechnen kann'
+            + ' (nach Erreichen dieser Schwelle bis ' + minSoc + ' %). Im Modus „PV-Kurve ruhig“ gibt E3DC-Control'
+            + ' den Akku nicht für das Fahrzeug frei; dadurch kann Netzbezug entstehen. Abhilfe: In der openWB'
+            + ' die Ladepriorität „Speicher“ wählen. Wenn Akkustützung gewünscht ist, kommt hier „PV + Akku bis Untergrenze“'
+            + ' infrage; Untergrenze und bestehende Schutzgrenzen haben weiterhin Vorrang.';
+        warning = batteryWarning;
+    }
+    const profile = read('profile_observation');
+    const profileWarning = hintPrimary && read('control_mode') !== null && String(read('control_mode')) !== '0'
+        && profile && profile.valid === true && typeof profile.episode === 'string'
+        && /^[a-f0-9]{32}$/.test(profile.episode)
+        && ['scheduled_charging', 'instant_charging'].includes(profile.chargemode)
+        ? 'Die openWB kann nach diesem Ladeprofil selbstständig laden. E3DC-Control stellt beim bewussten Moduswechsel'
+          + ' oder bei der Rücknahme eigener Stopp- bzw. Sofortaufträge auf PV um.' : '';
     const modes = {instant: 'Sofort', instant_charging: 'Sofort', stop: 'Stop', pv: 'PV', pv_charging: 'PV', eco: 'Eco', eco_charging: 'Eco', target: 'Zielladen', scheduled_charging: 'Zielladen'};
     const reportedMode = fresh ? modes[read('chargemode')] : null;
     let mode = reportedMode ? 'openWB-Lademodus: ' + reportedMode : 'openWB-Lademodus unbekannt';
     if (primary && curveMode && ['Sofort', 'Stop'].includes(reportedMode)) {
-        mode += ' – an der openWB gewählt; E3DC-Control steht auf ' + (String(read('control_mode')) === '2' ? 'PV-Kurve ruhig' : 'PV + Akku') + '.';
+        mode = 'Die openWB meldet den Lademodus „' + reportedMode + '“; E3DC-Control steht auf „' + (String(read('control_mode')) === '2' ? 'PV-Kurve ruhig' : 'PV + Akku bis Untergrenze') + '“.';
     }
     const stateText = clean(read('state_text'));
-    const stateAge = age(read('state_text_ts'));
+    const stateAge = age(read('state_text_age_s'));
     const state = stateText ? 'openWB: ' + stateText + (stateAge === null ? ' (Alter unbekannt)' : ' (vor ' + stateAge + ' s gelesen)') : '';
     const details = [priorities[priority] ? 'Ladepriorität: ' + priorities[priority] : 'Ladepriorität unbekannt'];
     if (fresh && read('software_version')) details.push('Software: ' + clean(read('software_version')));
     if (fresh && typeof read('switch_off_delay_s') === 'number' && Number.isFinite(read('switch_off_delay_s')) && read('switch_off_delay_s') >= 0) details.push('Abschaltverzögerung: ' + read('switch_off_delay_s') + ' s');
-    const configAge = age(read('bat_mode_ts'));
-    if (fresh && configAge !== null) details.push('Ladepriorität vor ' + configAge + ' s empfangen (gespeicherte MQTT-Konfiguration möglich)');
-    return {state, mode, warning, details: details.join(' · ')};
+    const configAge = age(read('bat_mode_age_s'));
+    if (fresh && configAge !== null) details.push('Ladepriorität vor ' + configAge + ' s empfangen (kann ein gespeicherter Stand sein)');
+    if (batteryWarning) details.push(batteryWarning);
+    if (profile && modes[profile.chargemode]) details.push('Ladeprofil der openWB: ' + modes[profile.chargemode]);
+    const measurement = data[wb === 2 ? 'wb2_observation' : 'wb_observation'];
+    if (measurement && measurement.hint) warning = measurement.hint;
+    return {state, mode, warning, details: details.join(' · '), profileWarning,
+        profileEpisode: profileWarning ? profile.episode : null};
 }
 
 function updateOpenwbObservation(data) {
     document.querySelectorAll('[data-openwb-observation]').forEach(card => {
         const view = openwbObservationView(data, Number(card.dataset.openwbObservation));
+        const profileElement = card.querySelector('[data-openwb-profile-warning]');
+        let show = false;
+        if (profileElement) {
+            const storageKey = 'openwb-profile-hint-' + card.dataset.openwbObservation;
+            // Nur eine zufällige Episodenmarke speichern, keine Fahrzeug-/Profilkennung.
+            if (view.profileWarning) {
+                try {
+                    show = card.dataset.openwbProfileEpisode === view.profileEpisode
+                        || sessionStorage.getItem(storageKey) !== view.profileEpisode;
+                    sessionStorage.setItem(storageKey, view.profileEpisode);
+                } catch (_) { show = false; }
+            }
+            card.dataset.openwbProfileEpisode = show ? view.profileEpisode : '';
+            const profileText = show ? view.profileWarning : '';
+            if (profileElement.textContent !== profileText) profileElement.textContent = profileText;
+            profileElement.hidden = !show;
+        }
+        if (show && view.profileWarning) view.details += ' · ' + view.profileWarning;
         for (const key of ['state', 'mode', 'warning', 'details']) {
             const element = card.querySelector('[data-openwb-' + key + ']');
             if (!element) continue;

@@ -16,6 +16,73 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
+## Rückfall von 5.5.5 auf 5.5.4
+
+**Docker:** Auf dem Host in `.env` `E3DC_IMAGE_TAG=v5.5.4` setzen und
+`sudo docker compose up -d` ausführen; die vorhandenen Daten-Volumes bleiben
+erhalten. Beim Start bereinigt 5.5.4 die Konfiguration und entfernt die in
+5.5.5 neuen Einstellungen. Die vorher angelegte Sicherung unter
+`data/config_backups/` enthält sie weiterhin. Automatische
+Konfigurationssicherungen werden auf die 20 neuesten begrenzt; die benötigte
+Sicherung deshalb rechtzeitig außerhalb dieses Ordners aufbewahren. Nach einer
+erneuten Aktualisierung auf 5.5.5 die zuvor verwendeten Werte im Config-Editor
+wieder einstellen:
+
+- „Notstrom-Vorhaltung“, „Notstrom-Vorhalt am Abend (kWh Speicherinhalt)“,
+  „Bezugszeit (Ortszeit)“, „Versorgung mindestens bis (bestätigte Ortszeit)“,
+  „Reserve-Netzladen (bei Halten)“ und „Höchster Bezugspreis (ct/kWh)“;
+- „Zentrale PV-Aufteilung Akku/Wallbox (experimentell)“;
+- „Name Anlage 2“, „Zweiter Shelly-Zähler IP“, „Phase / Kanal“ und
+  „Zählertyp Anlage 2“ der zweiten Klimaanlage;
+- „Haus-Tagesreferenz für ML (kWh)“ und „Bisheriges ML-Training verwenden“;
+- „Werte zyklisch wiederholen (s)“, „WP-Leistungs-Topic (optional)“ und
+  „MQTT-Fahrzeug-Freigabeliste (optional)“;
+- „openWB Benutzer“ und „openWB Passwort“ je Wallbox; die Zertifikatsbindung
+  über „Zertifikat prüfen und bestätigen“ erneut herstellen, ein
+  Konfigurationsimport ersetzt diese lokale Bestätigung nicht;
+- „Akkuverschleiß“, „Speicher-Wirkungsgrad“, „Mindestmenge je
+  Netzladeauftrag“ und „Kapazitätsanteil der Mindestmenge“.
+
+Nicht zuvor verwendete Optionen müssen nicht eingeschaltet werden.
+
+**openWB mit Benutzerverwaltung:** 5.5.4 kennt den angemeldeten HTTPS- und
+MQTT-Lesezugang von 5.5.5 nicht und liest den Status über die bisherige
+unverschlüsselte Schnittstelle. Ist an der openWB die Benutzerverwaltung oder
+HTTPS-Zwang aktiv, fällt die Anbindung einschließlich Status- und
+Fahrzeugdaten unter 5.5.4 aus. Soll der bisherige Zugang wieder genutzt
+werden, Benutzerverwaltung und HTTPS-Zwang vor dem Rückfall an der openWB
+abschalten. Eine direkt angebundene openWB Pro nutzt einen eigenen Treiber und
+ist davon nicht betroffen.
+
+**Bare Metal:** Der Rückweg ist das beim Update angelegte verifizierte Backup
+(siehe „Betriebsdaten wiederherstellen“). Es stellt Programmstand,
+Konfiguration und die darin gesicherten Betriebsdaten von vor dem Update
+wieder her; nach dem Update geänderte Einstellungen und hinzugekommene
+Statistik- und Diagnosedaten sind darin nicht enthalten und vorher gesondert zu
+sichern. Der private ML-Store ist vom Update-Backup ausgenommen; ein früheres
+ML-Modell stellt es deshalb nicht wieder her.
+
+**Daten:** Beim Docker-Imagewechsel bleiben Statistikdatenbank,
+Klima-Historie, Prognosediagnose und ML-Store in ihren Volumes erhalten;
+5.5.4 ignoriert die neuen Spalten und Tabellen. Neue
+Klima-Messungen verwenden wieder nur den ersten Zähler, die Aufteilung auf zwei
+Anlagen wird nicht fortgeführt, und unbekannte Klima-Werte können wieder als 0
+erscheinen. Die Archive je PV-Fläche und MPPT wertet 5.5.4 nicht aus; die
+normale Löschung alter Prognoserohdaten läuft weiter. Ein unter 5.5.5
+trainiertes ML-Modell lädt 5.5.4 weiter; erst ein neues Training nutzt wieder
+das Verfahren von 5.5.4.
+
+Der „Marktverlauf“ ist eine Ergänzung des Speicherplans ohne eigenes Archiv;
+5.5.4 ersetzt den Plan beim nächsten Planlauf. Die Netzladeplanung verwendet
+unter 5.5.4 wieder 1500 Wh festen Sockel und 5 % Kapazitätsanteil als
+Mindestmenge, 5.5.5 ohne eigene Werte 0 Wh und 5 %. „Notstrom-Vorhaltung“ und
+„Reserve-Netzladen (bei Halten)“ gibt es unter 5.5.4 nicht; die bisherige
+Notstromreserve bleibt davon unberührt. Die Auswahl „MQTT-Wärmepumpe (nur
+Anzeige)“ kennt 5.5.4 nicht; bei ihrer Verwendung vor dem Rückfall einen
+unter 5.5.4 vorhandenen Wärmepumpentyp auswählen.
+
+**Dienste:** 5.5.5 führt keine neuen Dienste oder systemd-Units ein.
+
 ## Rückfall von 5.5.4 auf 5.5.3c
 
 **Docker:** Auf dem Host in `.env` `E3DC_IMAGE_TAG=v5.5.3c` setzen und
@@ -301,7 +368,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand ist `v5.5.4`.
+Der aktuelle Stable-Stand ist `v5.5.5`.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

@@ -66,8 +66,9 @@ def wallbox_type_is_e3dc(value):
     return str(value or "").strip().lower().replace("-", "_").replace(" ", "_") in E3DC_WALLBOX_TYPES
 
 
-def measured_charge_state(previous, *, power_w, now_s, disconnected=False, gap_hold_s=600.0):
-    """Gemeinsamer Messbeleg: 500 W ein, 45 s unter 300 W aus, Lücken begrenzt."""
+def measured_charge_state(previous, *, power_w, now_s, disconnected=False, gap_hold_s=600.0,
+                          reset_on_gap=False):
+    """Gemeinsamer Messbeleg; externe Ausfälle löschen den Beleg ohne Nachhaltezeit."""
     previous = previous if isinstance(previous, dict) else {}
     valid = type(power_w) in (int, float) and math.isfinite(power_w) and power_w >= 0
     power = float(power_w) if valid else None
@@ -83,7 +84,10 @@ def measured_charge_state(previous, *, power_w, now_s, disconnected=False, gap_h
         active, idle_since, last_valid = False, None, None
     elif power is None:
         idle_since = None
-        active = bool(active and last_valid is not None and 0 <= now_s-last_valid <= gap_hold_s)
+        active = bool(not reset_on_gap and active and last_valid is not None
+                      and 0 <= now_s-last_valid <= gap_hold_s)
+        if reset_on_gap:
+            last_valid = None
     else:
         last_valid = now_s
         if power >= 500.0:

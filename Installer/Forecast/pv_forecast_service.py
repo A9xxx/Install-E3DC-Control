@@ -25,6 +25,7 @@ if INSTALLER_DIR not in sys.path:
     sys.path.insert(0, INSTALLER_DIR)
 
 from Forecast.pv_forecast_diagnostic_details import build_stage_metadata, provider_resource_samples
+from Forecast import pv_entity_archive as entity_archive
 
 from pv_forecast_topology import (
     RESOURCE_PROJECTION_ABS_TOLERANCE_W,
@@ -653,20 +654,11 @@ def _sha256_revision(value):
     return "sha256:" + hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
 
 
-def _source_file_revision(path):
-    """Bindet die Forecast-Methode an den tatsächlich laufenden Quelltext."""
-
-    try:
-        with open(path, "rb") as handle:
-            return "sha256:" + hashlib.sha256(handle.read()).hexdigest()
-    except (OSError, ValueError):
-        return None
+# Fachlicher Methodenstand; reine Diagnoseänderungen beginnen keine neue Kohorte.
+from Forecast.pv_forecast_method import FORECAST_METHOD_REVISION
 
 
-FORECAST_METHOD_REVISION = _source_file_revision(__file__)
-
-
-def _atomic_write_json(path, payload):
+def _atomic_write_json(path, payload, *, encoder=None):
     """Publiziert JSON im Zielverzeichnis atomar und erhält den Dateimodus."""
 
     directory = os.path.dirname(os.path.abspath(path))
@@ -677,7 +669,7 @@ def _atomic_write_json(path, payload):
         target_mode = os.stat(path, follow_symlinks=False).st_mode & 0o777
     except FileNotFoundError:
         target_mode = 0o644
-    encoded = json.dumps(
+    encoded = encoder(payload) if encoder is not None else json.dumps(
         payload,
         ensure_ascii=False,
         indent=2,
@@ -801,7 +793,8 @@ def build_forecast_issue_contract(
     postprocessing_revision = _sha256_revision({
         "schema_version": "pv_forecast_postprocessed_payload_v1",
         "value_stage": FORECAST_VALUE_STAGE,
-        "slots": slots,
+        "slots": [{key: value for key, value in slot.items()
+                   if key != "pv_diagnostic_entities"} for slot in slots],
     }) if slots else None
     target_slots_revision = _sha256_revision(target_slots) if target_slots else None
 
@@ -1815,6 +1808,26 @@ class EnsemblePVForecaster:
             "split_usable": False,
         }
 
+    def _diagnostic_operation(self, model_id, operation, *args):
+        """Ein Zusatzfehler ist kein Anbieterfehler und verändert keine Prognose."""
+        try:
+            return operation(*args)
+        except Exception:
+            if not isinstance(getattr(self, '_diagnostic_errors', None), dict):
+                self._diagnostic_errors = {}
+            self._diagnostic_errors[model_id] = 'diagnostic_error'
+            return None
+
+    def _record_diagnostic_entities(self, model_id, entities):
+        diagnostic = self._diagnostic_operation(model_id, entity_archive.cache_payload,
+                                               self, model_id, [e for e in entities if e is not None])
+        if not isinstance(getattr(self, '_diagnostic_entity_data', None), dict):
+            self._diagnostic_entity_data = {}
+        if getattr(self, '_diagnostic_errors', {}).get(model_id):
+            diagnostic = {'schema_version': entity_archive.SCHEMA, 'reason': 'diagnostic_error',
+                          'entities': [], 'source_at_utc_s': None}
+        self._diagnostic_entity_data[model_id] = diagnostic
+
     def _record_model_resource_data(self, model_id, resource_data):
         if not isinstance(getattr(self, "_model_resource_data", None), dict):
             self._model_resource_data = {}
@@ -1838,6 +1851,9 @@ class EnsemblePVForecaster:
         import time as _t
         if data:  # Nur bei echten Daten cachen, nicht bei leeren Ergebnissen
             entry = {'ts': _t.time(), 'data': data}
+            diagnostic = getattr(self, '_diagnostic_entity_data', {}).get(model_id)
+            if diagnostic is not None:
+                entry['diagnostic_entities'] = diagnostic
             resource_data = getattr(self, "_model_resource_data", {}).get(model_id, {})
             resource_compatible, resource_reason = (
                 self._model_resource_payload_state(resource_data, data)
@@ -2266,10 +2282,16 @@ class EnsemblePVForecaster:
         """Holt Prognose von Forecast.Solar (Standard in der PV Community)"""
         parsed_model_total = {}
         parsed_resource_total = {}
+        diagnostic_entities = []
+        if not isinstance(getattr(self, '_diagnostic_errors', None), dict):
+            self._diagnostic_errors = {}
+        self._diagnostic_errors.pop("m1", None)
         successful_fetches = 0
         failure_classes = []
 
         for idx, roof in enumerate(self.roofs):
+            entity = self._diagnostic_operation("m1", entity_archive.roof_entity, roof, "m1", idx)
+            diagnostic_entities.append(entity)
             resource_key = str(roof.get("resource_key") or f"FC{idx + 1}")
             parsed_resource = parsed_resource_total.setdefault(resource_key, {})
             # API Erwartet Azimuth: 0=Süd, -90=Ost
@@ -2289,6 +2311,7 @@ class EnsemblePVForecaster:
                         unix_h = int(dt.replace(minute=0, second=0).timestamp())
                         # Speichere als kWh fuer diese Stunde (Key IMMER int!)
                         kwh = float(watts) / 1000.0
+                        self._diagnostic_operation("m1", entity_archive.capture_value, entity, unix_h, kwh)
                         if unix_h in parsed_model_total:
                             parsed_model_total[unix_h] += kwh
                         else:
@@ -2301,6 +2324,7 @@ class EnsemblePVForecaster:
 
         if successful_fetches == len(self.roofs) and parsed_model_total:
             self._local_model_failure_classes.pop("m1", None)
+            self._record_diagnostic_entities("m1", diagnostic_entities)
             self._record_model_resource_data("m1", parsed_resource_total)
             return parsed_model_total
         self._local_model_failure_classes["m1"] = self._dominant_failure_class(
@@ -2322,11 +2346,17 @@ class EnsemblePVForecaster:
 
         parsed_model_total = {}
         parsed_resource_total = {}
+        diagnostic_entities = []
+        if not isinstance(getattr(self, '_diagnostic_errors', None), dict):
+            self._diagnostic_errors = {}
+        self._diagnostic_errors.pop("m2", None)
         weather_by_ts = {}
         successful_fetches = 0
         failure_classes = []
 
         for idx, roof in enumerate(self.roofs):
+            entity = self._diagnostic_operation("m2", entity_archive.roof_entity, roof, "m2", idx)
+            diagnostic_entities.append(entity)
             resource_key = str(roof.get("resource_key") or f"FC{idx + 1}")
             parsed_resource = parsed_resource_total.setdefault(resource_key, {})
             # Open-Meteo nutzt dieselbe Solar-Konvention wie Forecast.Solar:
@@ -2336,7 +2366,7 @@ class EnsemblePVForecaster:
             url = (
                 f"https://api.open-meteo.com/v1/forecast"
                 f"?latitude={self.lat}&longitude={self.lon}"
-                f"&hourly=global_tilted_irradiance,temperature_2m"
+                f"&hourly=global_tilted_irradiance,temperature_2m,shortwave_radiation"
                 f"&tilt={roof['tilt']}&azimuth={om_azimuth}"
                 f"&timezone=Europe%2FBerlin&models=best_match,icon_d2,ecmwf_ifs025&forecast_days=4"
             )
@@ -2382,6 +2412,10 @@ class EnsemblePVForecaster:
                         # kWp * (GlobalTiltedIrradiance / 1000) * Performance Ratio (0.85 für geneigte Flächen realistischer)
                         est_kwh = (blended_rad / 1000.0) * roof['kwp'] * 0.85
 
+                        self._diagnostic_operation("m2", entity_archive.capture_radiation,
+                            entity, unix_h, est_kwh, rad_best, i, v_icon, v_ecmwf, v_best)
+                        self._diagnostic_operation("m2", entity_archive.capture_ghi,
+                            entity, data["hourly"], i, unix_h)
                         if unix_h in parsed_model_total:
                             parsed_model_total[unix_h] += est_kwh
                         else:
@@ -2418,6 +2452,7 @@ class EnsemblePVForecaster:
 
         if successful_fetches == len(self.roofs) and parsed_model_total:
             self._local_model_failure_classes.pop("m2", None)
+            self._record_diagnostic_entities("m2", diagnostic_entities)
             self._record_model_resource_data("m2", parsed_resource_total)
             return parsed_model_total
         self._local_model_failure_classes["m2"] = self._dominant_failure_class(
@@ -2452,6 +2487,10 @@ class EnsemblePVForecaster:
 
         parsed_model_total = {}
         parsed_resource_total = {}
+        diagnostic_entities = []
+        if not isinstance(getattr(self, '_diagnostic_errors', None), dict):
+            self._diagnostic_errors = {}
+        self._diagnostic_errors.pop("m3", None)
         successful_fetches = 0
         failed_labels = []
         failure_classes = []
@@ -2488,6 +2527,9 @@ class EnsemblePVForecaster:
                         parsed_site[unix_h] = parsed_site.get(unix_h, 0.0) + est_kw * 0.5
                     if not parsed_site:
                         raise ValueError("forecast_empty")
+                    entity = self._diagnostic_operation("m3", entity_archive.site_entity, site)
+                    self._diagnostic_operation("m3", entity_archive.capture_series, entity, parsed_site)
+                    diagnostic_entities.append(entity)
                     for unix_h, value in parsed_site.items():
                         parsed_model_total[unix_h] = parsed_model_total.get(unix_h, 0.0) + value
                     allocations = [
@@ -2521,6 +2563,7 @@ class EnsemblePVForecaster:
                 logger.error(f"Fehler bei Model 3 ({label}): {type(error).__name__}")
 
         if successful_fetches == len(self.solcast_configured_sites):
+            self._record_diagnostic_entities("m3", diagnostic_entities)
             self._record_model_resource_data("m3", parsed_resource_total)
             self.solcast_status = self._solcast_status("complete_fresh", successful=successful_fetches)
             logger.info(
@@ -2643,6 +2686,7 @@ class EnsemblePVForecaster:
         m3 = self._resolve_solcast_model()
 
         ensemble_forecast = []
+        diagnostic_slots = {}
 
         # Vereine alle vorkommenden Zeitstempel
         # KRITISCH: JSON-Cache-Keys sind STRINGS! -> immer int() casten!
@@ -2882,6 +2926,13 @@ class EnsemblePVForecaster:
                     )
                 except Exception:
                     diagnostic_provider_resources = {}
+                try:
+                    diagnostic_entities = entity_archive.slot_payload(
+                        self, hr, adjacent_hr, .25 if q in (0, 3) else .10, start_s)
+                except Exception:
+                    diagnostic_entities = {"schema_version": entity_archive.SCHEMA,
+                        "decision_use_allowed": False, "entities": [], "status": "diagnostic_error"}
+                diagnostic_slots[start_ms] = diagnostic_entities
                 ensemble_forecast.append({
                     "start_timestamp": start_ms,
                     "end_timestamp": start_ms + (900 * 1000),
@@ -3117,6 +3168,13 @@ class EnsemblePVForecaster:
             }
             # Rueckwaertskompatibel: Als flache Liste speichern (wie bisher gelesen)
             _atomic_write_json(FORECAST_OUTPUT, ensemble_forecast)
+            # Eigene Diagnoseausgabe; bestehende Prognoseleser erhalten dieselben Felder.
+            try:
+                diagnostic_output = entity_archive.pack_diagnostic(ensemble_forecast, diagnostic_slots)
+                _atomic_write_json(entity_archive.diagnostic_path(FORECAST_OUTPUT), diagnostic_output,
+                                   encoder=entity_archive.encode_diagnostic)
+            except Exception:
+                logger.warning("PV-Einzelreihen derzeit nicht verfügbar; Prognose ist veröffentlicht.")
             # Zusaetzlich Metadaten in separate Datei (fuer Dashboard/Debug)
             meta_path = FORECAST_OUTPUT.replace('.json', '_meta.json')
             # Lade aktuellen Bias-Status fuer Meta-Ausgabe

@@ -316,7 +316,7 @@ if (file_exists($dbPath)) {
         $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 
         // --- Auto-Migration: Neue Kosten-Spalten anlegen falls sie fehlen ---
-        $newCols = ['cost_total', 'cost_home', 'cost_bat', 'cost_wb', 'cost_wp', 'wb2_consumption', 'cost_wb2', 'climate_consumption', 'cost_climate', 'pv_balance_rest', 'bat_balance_rest', 'balance_unknown_rest', 'saved_u', 'saved_td', 'saved_wb', 'pv_e3dc', 'pv_external', 'pv_source_rest', 'pv_grid', 'bat_grid'];
+        $newCols = ['cost_total', 'cost_home', 'cost_bat', 'cost_wb', 'cost_wp', 'wb2_consumption', 'cost_wb2', 'climate_consumption', 'cost_climate', 'pv_balance_rest', 'bat_balance_rest', 'balance_unknown_rest', 'saved_u', 'saved_td', 'saved_wb', 'pv_e3dc', 'pv_external', 'pv_source_rest', 'pv_grid', 'bat_grid', 'house_includes_unknown_wallbox'];
         foreach ($newCols as $col) {
             try { $db->exec("ALTER TABLE daily_stats ADD COLUMN $col REAL DEFAULT 0"); } catch (Exception $e) { }
         }
@@ -336,6 +336,7 @@ if (file_exists($dbPath)) {
             d.date as day,
             d.pv_yield as pv,
             d.home_consumption as home,
+            COALESCE(d.house_includes_unknown_wallbox,0) as house_includes_unknown_wallbox,
             d.grid_in as grid_in,
             d.grid_out as grid_out,
             d.bat_in as bat_in,
@@ -384,6 +385,7 @@ if (file_exists($dbPath)) {
                 $foundToday = false;
                 foreach ($dailyData as &$row) {
                     if ($row['day'] === $todayStr) {
+                        $row['house_includes_unknown_wallbox'] = !empty($liveStats['house_includes_unknown_wallbox']);
                         $row['home'] = $liveStats['stats']['total_home_kwh'] ?? $row['home'];
                         $row['pv']   = $liveStats['stats']['total_pv_kwh'] ?? $row['pv'];
                         // Externer Generator (BHKW, 2. PV-Anlage etc.) separat mitmischen
@@ -446,6 +448,7 @@ if (file_exists($dbPath)) {
                         'day'      => $todayStr,
                         'pv'       => $liveStats['stats']['total_pv_kwh']      ?? 0,
                         'ext_pv'   => $liveStats['stats']['total_ext_pv_kwh']  ?? 0,
+                        'house_includes_unknown_wallbox' => !empty($liveStats['house_includes_unknown_wallbox']),
                         'home'     => $liveStats['stats']['total_home_kwh']    ?? 0,
                         'wb1'      => $liveStats['stats']['total_wb_kwh']      ?? 0,
                         'wb2'      => $liveStats['stats']['total_wb2_kwh']     ?? 0,
@@ -503,6 +506,7 @@ if (file_exists($dbPath)) {
             SUM(pv_yield) as pv,
             SUM(CASE WHEN COALESCE(grid_out, 0) > 0.5 AND COALESCE(grid_out, 0) > COALESCE(pv_yield, 0) + 0.5 AND COALESCE(grid_out, 0) > MAX(1.0, COALESCE(bat_out, 0) * 1.5) THEN COALESCE(pv_yield, 0) + COALESCE(grid_out, 0) ELSE COALESCE(pv_yield, 0) END) as pv_total,
             SUM(home_consumption) as home,
+            MAX(COALESCE(house_includes_unknown_wallbox,0)) as house_includes_unknown_wallbox,
             SUM(grid_in) as grid_in,
             SUM(grid_out) as grid_out,
             SUM(bat_in) as bat_in,
@@ -548,6 +552,7 @@ if (file_exists($dbPath)) {
             SUM(pv_yield) as pv,
             SUM(CASE WHEN COALESCE(grid_out, 0) > 0.5 AND COALESCE(grid_out, 0) > COALESCE(pv_yield, 0) + 0.5 AND COALESCE(grid_out, 0) > MAX(1.0, COALESCE(bat_out, 0) * 1.5) THEN COALESCE(pv_yield, 0) + COALESCE(grid_out, 0) ELSE COALESCE(pv_yield, 0) END) as pv_total,
             SUM(home_consumption) as home,
+            MAX(COALESCE(house_includes_unknown_wallbox,0)) as house_includes_unknown_wallbox,
             SUM(grid_in) as grid_in,
             SUM(grid_out) as grid_out,
             SUM(bat_in) as bat_in,
@@ -587,6 +592,16 @@ if (file_exists($dbPath)) {
         $stmtYear = $db->query($queryYear);
         $yearlyData = $stmtYear->fetchAll(PDO::FETCH_ASSOC);
 
+        foreach (['dailyData' => ['day', 10], 'dailyDataDesc' => ['day', 10], 'monthlyData' => ['month', 7], 'yearlyData' => ['year', 4]] as $list => [$key, $length]) {
+            foreach ($$list as &$row) {
+                $row['climate_meters'] = e3dcClimateStatsBreakdown($db, (string)$row[$key], $length);
+                if ($length === 10 && $row[$key] === date('Y-m-d')) {
+                    $current = e3dcClimateDailyBreakdown($row[$key]);
+                    if ($current) $row['climate_meters'] = $current;
+                }
+            }
+            unset($row);
+        }
         lzAddPvTotalFieldsToRows($dailyData);
         lzAddPvTotalFieldsToRows($dailyDataDesc);
         lzAddPvTotalFieldsToRows($monthlyData);
@@ -961,6 +976,7 @@ function lzFlowColor(key, fallback) {
 }
 const wpEnabled = <?= $wpEnabled ? 'true' : 'false' ?>;
 const climateEnabled = <?= $climateEnabled ? 'true' : 'false' ?>;
+const climateBreakdownEnabled = <?= e3dcClimateHasSecondMeter($lzV4Config) ? 'true' : 'false' ?>;
 let currentViewMode = 'day';
 
 function lzEegActive() {
@@ -1241,6 +1257,27 @@ document.addEventListener("DOMContentLoaded", function() {
         lzBalanceResizeTimer = window.setTimeout(() => window.renderLangzeitBalance(), 120);
     }, {passive: true});
 
+    function lzClimateBreakdownHtml(d) {
+        if (!climateBreakdownEnabled) return '';
+        const esc = value => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+        const meters = Array.isArray(d.climate_meters) ? d.climate_meters : [];
+        const reasons = {partial_day:'angebrochener Messtag', partial_period:'Zeitraum teilweise erfasst', counter_reset:'Zähler zurückgesetzt', removed_midday:'Zähler entfernt', interrupted_day:'Messung unterbrochen', energy_missing:'Einzelmessung fehlt', stale:'Messung veraltet'};
+        let html = '';
+        if (meters.length < 2 || meters.some(m => !m.complete || m.daily_kwh === null)) {
+            html += '<div class="small text-body-secondary">Klima gesamt, Aufteilung unvollständig</div>';
+        }
+        const entries = [...meters];
+        for (const slot of [1,2]) {
+            if (!entries.some(m => Number(m.slot) === slot)) entries.push({slot, name:'Anlage '+slot, daily_kwh:null, reason:'energy_missing'});
+        }
+        for (const m of entries) {
+            const value = m.daily_kwh === null || m.daily_kwh === undefined ? 'unbekannt' : lzKwh(Number(m.daily_kwh));
+            const reason = m.reason ? ' ('+esc(reasons[m.reason] || 'Einzelmessung nicht vollständig')+')' : '';
+            html += '<div class="small text-body-secondary">davon Anlage '+esc(m.slot)+' · '+esc(m.name)+': '+value+reason+'</div>';
+        }
+        return html;
+    }
+
     function renderLangzeitDetailTable(rows) {
         const tbody = document.getElementById('lz-detail-body');
         const note = document.getElementById('lz-detail-limit-note');
@@ -1259,9 +1296,9 @@ document.addEventListener("DOMContentLoaded", function() {
             tr.innerHTML = `
                 <td class="fw-bold text-start">${lzPeriodLabel(d)}</td>
                 <td>${lzKwh(lzNum(d, 'pv_total') || lzNum(d, 'pv'))}</td>
-	                <td>${lzKwh(lzNum(d, 'home'))}</td>
+	                <td>${lzKwh(lzNum(d, 'home'))}${d.house_includes_unknown_wallbox ? '<div class="small text-warning">Haus inkl. Wallbox (unbekannt)</div>' : ''}</td>
 	                <td>${lzKwh(lzNum(d, 'wp'))}</td>
-	                <td>${lzKwh(lzNum(d, 'climate'))}</td>
+	                <td>${lzKwh(lzNum(d, 'climate'))}${lzClimateBreakdownHtml(d)}</td>
 	                <td>${lzKwh(lzNum(d, 'wb1') || Math.max(0, lzNum(d, 'wb') - lzNum(d, 'wb2')))}</td>
                 <td>${lzKwh(lzNum(d, 'wb2'))}</td>
                 <td>${lzKwh(lzNum(d, 'grid_in'))}</td>

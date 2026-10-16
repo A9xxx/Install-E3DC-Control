@@ -57,14 +57,15 @@ def _fingerprint(meta):
             meta.st_nlink, meta.st_size, meta.st_mtime_ns, meta.st_ctime_ns)
 
 
-def _root_directory(path, *, create=False, mode=0o755):
+def _root_directory(path, *, create=False, mode=0o755, snapshot=None):
     """Prüft jede Elternkomponente; folgt keinem Symlink."""
     path = Path(path)
     if not path.is_absolute() or ".." in path.parts:
         raise ModuleError("path_unsafe", "Systempfad ist nicht eindeutig gebunden.")
     current = Path("/")
-    for part in path.parts[1:]:
-        current /= part
+    for part in ("", *path.parts[1:]):
+        if part:
+            current /= part
         if create and not os.path.lexists(current):
             current.mkdir(mode=mode if current == path else 0o755)
         meta = current.lstat()
@@ -73,12 +74,16 @@ def _root_directory(path, *, create=False, mode=0o755):
         if (not stat.S_ISDIR(meta.st_mode) or meta.st_uid != 0 or meta.st_gid != 0
                 or (stat.S_IMODE(meta.st_mode) & 0o022 and not shared_lock_root_safe)):
             raise ModuleError("path_unsafe", "Systemverzeichnis ist nicht root-kontrolliert.")
+        if snapshot is not None:
+            snapshot.append((str(current), meta.st_dev, meta.st_ino, meta.st_mode,
+                             meta.st_uid, meta.st_gid))
     return path
 
 
 def _root_bytes(path, *, mode=None, maximum=MAX_BYTES):
     path = Path(path)
-    _root_directory(path.parent)
+    parents_before = []
+    _root_directory(path.parent, snapshot=parents_before)
     before = path.lstat()
     # Ausschließlich der vom Systemupdate projizierte Rollenanker ist weblesbar.
     role_anchor = path == Path("/etc/e3dc-control/instance_role.json")
@@ -108,6 +113,10 @@ def _root_bytes(path, *, mode=None, maximum=MAX_BYTES):
             or _fingerprint(opened) != _fingerprint(after)
             or _fingerprint(after) != _fingerprint(path.lstat())):
         raise ModuleError("file_drift", "Root-eigene Datei änderte sich beim Lesen.")
+    parents_after = []
+    _root_directory(path.parent, snapshot=parents_after)
+    if parents_before != parents_after:
+        raise ModuleError("file_drift", "Elternverzeichnis änderte sich beim Lesen.")
     return b"".join(chunks)
 
 
@@ -127,9 +136,20 @@ def _validate_contract(contract):
     return contract
 
 
+def _unique_object(pairs):
+    """Jede JSON-Objektebene muss eindeutige Schlüssel besitzen."""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Doppelter JSON-Schlüssel im Modulvertrag.")
+        result[key] = value
+    return result
+
+
 def read_contract():
     try:
-        contract = json.loads(_root_bytes(CONTRACT, mode=0o644, maximum=1024 * 1024))
+        contract = json.loads(_root_bytes(CONTRACT, mode=0o644, maximum=1024 * 1024),
+                              object_pairs_hook=_unique_object)
     except (ValueError, UnicodeError) as exc:
         raise ModuleError("contract_invalid", "Modulvertrag ist nicht lesbar.") from exc
     return _validate_contract(contract)

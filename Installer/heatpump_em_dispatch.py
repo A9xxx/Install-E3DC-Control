@@ -82,6 +82,47 @@ def e3dc_live_gap_update(previous, *, valid, clock_sample):
             "since_ts": since_ts, "boot_id": boot, "elapsed_s": elapsed}
 
 
+def soc_runtime_episode(previous, *, signal_started_ts, compressor_started_ts,
+                        min_runtime_min, now_ts, runtime_class="general",
+                        restored=False, configured_runtimes=None):
+    """Bindet die Laufzeit an einen Signalstart und den belegten Verdichterstart.
+
+    Ein Besitzerwechsel ändert keine Frist. Der erste Verdichterbeleg ergänzt
+    die Episode; erst ein weiterer belegter Start eröffnet eine neue Episode.
+    Ohne Signalbeleg entsteht weder eine Episode noch eine Verdichterlaufzeit.
+    Beim Neustart begrenzen gespeicherte Dauer und aktuelle Klassenkonfiguration
+    gemeinsam den Halt. Ungültiger Bestand gewährt nur den belegten Signalhalt.
+    """
+    now = number(now_ts)
+    signal = number(signal_started_ts)
+    started = number(compressor_started_ts)
+    duration = number(min_runtime_min)
+    if now is None or signal is None or not 0 < signal <= now:
+        return {}
+    started = started if started is not None and 0 < started <= now else None
+    previous = previous if isinstance(previous, dict) else {}
+    old_signal = number(previous.get("signal_started_ts"))
+    old_start = number(previous.get("compressor_started_ts"))
+    old_duration = number(previous.get("min_runtime_min"))
+    valid = bool(old_signal == signal and old_duration is not None and old_duration >= 0
+                 and (old_start is None or 0 < old_start <= now))
+    old_class = previous.get("runtime_class")
+    if restored:
+        configured = number((configured_runtimes or {}).get(old_class)) if type(old_class) is str else None
+        valid = bool(valid and old_class in ("predump", "general")
+                     and configured is not None and configured >= 0
+                     and (previous.get("compressor_started_ts") is None or old_start is not None))
+        # Ein Checkpoint ist kein Startbeleg. Defekter Bestand darf nicht durch
+        # die aktuelle Besitzerklasse eine neue Verdichterlaufzeit erhalten.
+        old_duration = min(old_duration, configured) if valid else 0.0
+        duration = old_duration
+    new_start = bool(valid and not restored and started is not None and old_start is not None and started != old_start)
+    return {"signal_started_ts": signal,
+            "compressor_started_ts": started if started is not None else old_start if valid else None,
+            "min_runtime_min": old_duration if valid and not new_start else max(0.0, duration or 0.0),
+            "runtime_class": old_class if valid and not new_start and old_class in ("predump", "general") else runtime_class}
+
+
 def restart_anchor_ts(command_stop_ts, *, observation_valid, compressor_stop_ts):
     """Anker der Wiedereinschaltsperre für alle Startwege.
 
@@ -150,6 +191,8 @@ def channel_observations(status):
         "sample_ts": number(status.get("SHI_Source_ts")),
         "raw_mode": status.get("SHI_%s_Mode_Raw" % name.upper()),
         "target_c": target(name),
+        "query_ts": number(status.get("SHI_Query_ts")),
+        "source": status.get("SHI_Readback_source"),
     } for name in CHANNELS}
 
 
@@ -187,6 +230,7 @@ class LuxtronikChannelController:
         self.last_result = {}
         self.last_observed_ww_target_c = None
         self.runtime_observation = {}
+        self.soc_runtime_episodes = {}
         self.persisted = self._persist()
 
     def _persist(self):
@@ -212,6 +256,7 @@ class LuxtronikChannelController:
 
     def pv_command(self, previous=None):
         """Projiziert allein belegte Kanalzustände auf den bestehenden Speichervertrag."""
+        status = getattr(self, "_pv_readback_status", None)
         previous = previous if isinstance(previous, dict) else {}
         channels = self.checkpoint["channels"]
         active = [value for value in channels.values()
@@ -240,9 +285,22 @@ class LuxtronikChannelController:
             state = channels.get(name) or {}
             if name in matching:
                 terminal = bool(not state["possible_effect"] and state["state"] in ("frei", "fremd"))
+                old_completion = (result.get("channel_completion") or {}).get(name) or {}
+                readback_ts = None
+                if terminal and state["diagnostic"] == "withdrawal_readback_confirmed":
+                    # Die erste bestätigte Rücknahme bleibt zeitlich fest.
+                    # Ein späterer Status und ein Altcheckpoint ohne Beleg
+                    # dürfen sie nicht rückwirkend als frisch ausgeben.
+                    readback_ts = (number(old_completion.get("withdraw_readback_ts"))
+                                   if old_completion.get("terminal") is True
+                                   else state["last_sample_ts"])
                 completion[name] = {"state": state["state"], "terminal": terminal,
                                     "reason": state["diagnostic"],
-                                    "withdraw_ack_ts": state["withdraw_ack_ts"]}
+                                    "request_id": state["request_id"], "revision": state["revision"],
+                                    "prepared_ts": state["prepared_ts"], "issued_ts": state["sent_ts"],
+                                    "withdraw_requested_ts": state["withdraw_requested_ts"],
+                                    "withdraw_ack_ts": state["withdraw_ack_ts"],
+                                    "withdraw_readback_ts": readback_ts}
             else:
                 newer_owner = bool(old_anchor is not None and state.get("prepared_ts") is not None
                                    and state["prepared_ts"] > old_anchor
@@ -278,6 +336,26 @@ class LuxtronikChannelController:
             "withdrawal_confirmed": all(value["terminal"] for value in completion.values()),
             "channel_completion": completion,
         })
+        # Die frühere Rücklesezeit wird nicht ergänzt. Nur die neue Abfrage
+        # samt dauerhaftem Kanalcheckpoint wird als Reparaturbeleg exportiert.
+        if (status is not None and result.get("withdrawal_confirmed") is True
+                and any(value.get("withdraw_readback_ts") is None for value in completion.values())
+                and not result.get("historical_repair")):
+            result["historical_repair"] = {
+                # probe_wall_s ist die Auswertung; query_ts und sample_ts
+                # halten Abfragebeginn und Antwort getrennt fest.
+                "probe_wall_s": self.now_s,
+                "observations": channel_observations(status),
+                "checkpoint": copy.deepcopy(self.checkpoint),
+                "load_status": self.load_status, "durable": self.persisted,
+                "clock_fault": self.clock_fault,
+            }
+            try:
+                from .heatpump_pv_contract import heatpump_pv_terminal_completion
+            except ImportError:
+                from heatpump_pv_contract import heatpump_pv_terminal_completion
+            if heatpump_pv_terminal_completion(result, wall_s=self.now_s) is None:
+                result.pop("historical_repair")
         return result
 
     def _desired(self, owner, channel, target, *, identity=None, grant=True, purpose=""):
@@ -297,6 +375,7 @@ class LuxtronikChannelController:
                 "valid": True, "grant": bool(grant)}
 
     def cycle(self, ctx, wp, *, clock_sample=None):
+        self._pv_readback_status = copy.deepcopy(ctx.get("wp_status") or {})
         now = self._time(clock_sample or control_time.sample())
         day = self.checkpoint["pv_day_protection"]
         today = datetime.fromtimestamp(now).date().isoformat()
@@ -328,7 +407,8 @@ class LuxtronikChannelController:
         ww_active = bool(ww_state.get("active") or ww_state.get("pending"))
         blocks = set(ctx.get("heatpump_positive_output_block_reasons") or [])
         island_veto = ctx.get("heatpump_emergency_veto") == "emergency_power"
-        hard = bool(island_veto or ctx.get("heatpump_signal_typed_protection_stop")
+        operating_mode = (ctx.get("wp_data") or {}).get("Betriebsart", (ctx.get("wp_status") or {}).get("Betriebsart"))
+        hard = bool(island_veto or operating_mode == 3 or ctx.get("heatpump_signal_typed_protection_stop")
                     or blocks.intersection({"manual_source_temperature_stop", "manual_low_soc_stop",
                                             "pre_control_independent_safety_stop", "independent_safety_stop"}))
         protection_reason = str(pv_output.get("protection_reason") or pv_demand.get("protection_reason") or "")
@@ -359,8 +439,10 @@ class LuxtronikChannelController:
                 "started": number(ctx.get("wp_compressor_last_start_ts"))}
         last_runtime_ts = number(self.runtime_observation.get("ts"))
         runtime_gap_hold = bool(not runtime_current and last_runtime_ts is not None
-                                and 0 <= now - last_runtime_ts <= 60.0
+                                and 0 <= now - last_runtime_ts < 60.0
                                 and self.runtime_observation.get("running") is True)
+        producer_gap_scoped = bool(protection_reason == "invalid_control_data"
+                                   and pv_output.get("protection_scope") == "producer_budget_gap")
         wp_gap_scoped = bool(protection_reason == "invalid_control_data"
                              and pv_output.get("protection_scope") == "luxtronik_observation_gap")
         ww_baseline_readback_fresh = bool(
@@ -553,6 +635,14 @@ class LuxtronikChannelController:
         physical_hold = bool(ctx.get("WP_TAKT_PROTECT") and last_start > 0
                              and now - last_start < minimum_run)
         signal_hold = bool((ctx.get("heatpump_positive_signal_window") or {}).get("minimum_signal_hold_active"))
+        soc_state = ctx.get("heatpump_soc_state") or {}
+        soc = number(soc_state.get("soc", ctx.get("soc")))
+        minimum_soc = number(ctx.get("MIN_SOC"))
+        soc_valid = soc is not None and 0 <= soc <= 100 and soc_state.get("soc_valid", True)
+        soc_start_allowed = bool(soc_valid and minimum_soc is not None and soc >= minimum_soc)
+        soc_low = bool(ctx.get("e3dc_valid") is True and soc_valid and minimum_soc is not None
+                       and soc < max(5.0, minimum_soc - 5.0))
+
         return_target = number(self.checkpoint["channels"]["ww"].get("pre_boost_target_c"))
         return_source = "pre_boost_readback"
         if return_target is None or not 0 <= return_target <= 100:
@@ -666,29 +756,40 @@ class LuxtronikChannelController:
                 name == "ww" and (state["owner"] in ("pv", "tariff") or wp_holiday)
                 or name == "hz" and state["owner"] == "tariff"
                 or name == "hz" and state["owner"] == "pv"
-                and (not runtime_current or protection_reason in ("bridge_source_disabled", "user_off", "emergency_reserve")
+                and (not runtime_current or producer_gap_scoped
+                     or protection_reason in ("bridge_source_disabled", "user_off", "emergency_reserve")
                      or user_off or not automatic
                      or desired[name] and desired[name]["owner"] == "price"
                      and str(desired[name].get("request_id") or "").startswith(("price_pause:", "pv_pause:"))
                      or pv_output.get("pause_requires_stop"))))
+            episodes = ctx.get("heatpump_soc_runtime_episodes")
+            if not isinstance(episodes, dict):
+                episodes = self.soc_runtime_episodes
+            episode = soc_runtime_episode(
+                episodes.get(name), signal_started_ts=state["sent_ts"] if state["possible_effect"] else None,
+                compressor_started_ts=ctx.get("wp_compressor_last_start_ts"),
+                min_runtime_min=(ctx.get("PREDUMP_HEATPUMP_MIN_RUNTIME_MIN", minimum_run / 60.0)
+                    if state["owner"] == "predump"
+                    and ctx.get("heatpump_positive_signal_demand_class") != "ww_immediate_manual"
+                    else minimum_run / 60.0), now_ts=now,
+                runtime_class="predump" if state["owner"] == "predump"
+                    and ctx.get("heatpump_positive_signal_demand_class") != "ww_immediate_manual" else "general",
+                restored=ctx.get("heatpump_soc_runtime_episodes_restored", False),
+                configured_runtimes={"predump": ctx.get("PREDUMP_HEATPUMP_MIN_RUNTIME_MIN"),
+                                     "general": ctx.get("WP_MIN_RUNTIME_MIN")})
+            episodes[name] = episode
+            # Nur das SoC-Ende verwendet die ursprüngliche Episodenfrist;
+            # andere Rücknahmen behalten ihre bisherige Laufzeitsemantik.
+            channel_minimum_run = (episode.get("min_runtime_min", minimum_run / 60.0) * 60.0
+                                   if soc_low else minimum_run)
             boost_left_s = 0.0
             # Die Laufzeit entscheidet erst bei entfallener Voraussetzung
             # über die Rücknahme, nicht während eines weiter gültigen Angebots.
-            if runtime_owned and (channel_hard or desired[name] is None
+            if runtime_owned and (soc_low or channel_hard or desired[name] is None
                     or any(desired[name][key] != state[key] for key in ("owner", "target_c"))):
                 sent = number(state.get("sent_ts"))
                 started = (number(self.runtime_observation.get("started")) if runtime_gap_hold
                            else number(ctx.get("wp_compressor_last_start_ts")))
-                tariff_hold = (ctx.get("heat_tariff_storage_hold") or {}).get(name) or {}
-                hold_ts = number(tariff_hold.get("ts"))
-                soc = number(ctx.get("soc"))
-                minimum_soc = number(ctx.get("MIN_SOC"))
-                tariff_soc_hold = bool(state["owner"] == "tariff"
-                    and tariff_hold.get("request_id") == state["request_id"]
-                    and tariff_hold.get("revision") == state["revision"]
-                    and hold_ts is not None and 0 <= now - hold_ts <= 10.0
-                    and ctx.get("e3dc_valid") is True and soc is not None and minimum_soc is not None
-                    and 0 < soc < max(5.0, minimum_soc - 5.0))
                 operating = (ctx.get("wp_data") or {}).get(
                     "Betriebsart", (ctx.get("wp_status") or {}).get("Betriebsart"))
                 # Betriebsart 3 ist die normalisierte EVU-/Fremdsperre.
@@ -697,7 +798,7 @@ class LuxtronikChannelController:
                     or not (runtime_current or runtime_gap_hold) or gap_expired
                     or ctx.get("heatpump_signal_typed_protection_stop")
                     or (protection_reason not in ("", "user_off", "emergency_reserve", "bridge_source_disabled")
-                        and not (wp_gap_scoped and runtime_gap_hold))
+                        and not (wp_gap_scoped and runtime_gap_hold or producer_gap_scoped))
                     or (state["owner"] == "tariff" and (tariff.get("storage_safety_veto") is True
                         or any(reason in tariff.get("blockers", []) for reason in (
                             "device_free_missing_or_blocked", "source_free_missing_or_blocked",
@@ -705,13 +806,23 @@ class LuxtronikChannelController:
                     or blocks.intersection({"manual_source_temperature_stop"})
                     or ctx.get("heatpump_grid_safety_stop") is True
                     or (blocks.intersection({
-                        "pre_control_independent_safety_stop", "independent_safety_stop"}) and not tariff_soc_hold))
+                        "pre_control_independent_safety_stop", "independent_safety_stop"})))
                 if (not hardware_block and ctx.get("WP_TAKT_PROTECT")
                         and (runtime_current and ctx.get("wp_compressor_running_now") is True or runtime_gap_hold)
                         and sent is not None and started is not None
                         and 0 < started <= now and sent <= now):
-                    boost_left_s = max(0.0, minimum_run - (now - max(sent, started)))
-                stop_allowed = boost_left_s <= 0.0
+                    boost_left_s = max(0.0, channel_minimum_run - (now - (started if soc_low else max(sent, started))))
+                ww_cycle_hold = bool(
+                    name == "ww" and not soc_low and not hardware_block and automatic and not user_off
+                    and protection_reason != "emergency_reserve"
+                    and (ctx.get("heatpump_channel_stop_allowed") or {}).get("ww") is False
+                )
+                # Ohne Zusage gilt ausschließlich der eigene belegte Resthalt,
+                # einschließlich Signalhalt; er erzeugt weder Start noch Budget.
+                producer_signal_hold = bool(producer_gap_scoped and not hardware_block
+                    and (runtime_current and ctx.get("wp_compressor_running_now") is True or runtime_gap_hold)
+                    and (own_signal_hold or signal_hold))
+                stop_allowed = boost_left_s <= 0.0 and not ww_cycle_hold and not producer_signal_hold
                 if not stop_allowed:
                     # Nur den bereits eigenen Auftrag halten. Bei gesperrter
                     # Brücke gilt der Verdichterschutz auch für den PV-HZ-Kanal.
@@ -722,9 +833,38 @@ class LuxtronikChannelController:
                     if not pv_transfer:
                         desired[name] = self._desired(state["owner"], name, state["target_c"], identity=state)
                     channel_hard = False
-                    hold[name] = {"reason": "boost_min_runtime_hold",
-                                  "until_ts": now + boost_left_s,
-                                  "remaining_s": boost_left_s}
+                    hold[name] = {"reason": "ww_cycle_min_runtime_hold" if ww_cycle_hold else "boost_min_runtime_hold",
+                                  "until_ts": None if ww_cycle_hold else now + boost_left_s,
+                                  "remaining_s": None if ww_cycle_hold else boost_left_s}
+            # Automatische Zusatzfreigaben beginnen erst ab Min SoC. Bereits
+            # eigene Kanäle werden unter der Stoppschwelle nur bis zu ihren
+            # belegten Fristen gehalten; alle übrigen Schutzteile bleiben vorrangig.
+            if (desired[name] and not state["possible_effect"]
+                    and (soc_low or desired[name]["owner"] in ("pv", "price", "tariff", "timer") and not soc_start_allowed)):
+                desired[name] = None
+                hold[name] = {"reason": "automatic_soc_start_blocked", "until_ts": None}
+            soc_withdrawal = False
+            if soc_low and state["possible_effect"] and (ctx.get("WP_TAKT_PROTECT") or soc > 0):
+                soc_start = started if runtime_owned else last_start
+                soc_running = bool(runtime_current and ctx.get("wp_compressor_running_now") is True or runtime_gap_hold)
+                soc_runtime_left = (max(0.0, channel_minimum_run - (now - soc_start))
+                    if ctx.get("WP_TAKT_PROTECT") and soc_running and soc_start is not None and 0 < soc_start <= now else 0.0)
+                signal_left = max(0.0, 600.0 - (now - state["sent_ts"])) if own_signal_hold else 0.0
+                soc_left = max(soc_runtime_left, signal_left)
+                soc_hard = bool(channel_hard or (hardware_block if runtime_owned else False)
+                                or island_veto or self.clock_fault
+                                or ctx.get("heatpump_grid_safety_stop") is True
+                                or ctx.get("heatpump_signal_typed_protection_stop"))
+                soc_hold = bool(ctx.get("WP_TAKT_PROTECT") and soc_left > 0.0 and not soc_hard)
+                if soc_hold:
+                    desired[name] = self._desired(state["owner"], name, state["target_c"], identity=state)
+                    stop_allowed = False
+                    hold[name] = {"reason": "soc_minimum_hold", "until_ts": now + soc_left, "remaining_s": soc_left}
+                else:
+                    desired[name] = None
+                    stop_allowed = True
+                    soc_withdrawal = not soc_hard
+                    channel_hard = True
             baseline = number(ctx.get("WW_ECO")) if name == "ww" else None
             if name == "ww" and ctx.get("WW_TIMER_ENABLE"):
                 baseline = number(ctx.get("ww_timer_target_c"))
@@ -739,6 +879,7 @@ class LuxtronikChannelController:
                 and not self.clock_fault and observations[name]["valid"]
                 and observed_mode in (0, 1) and observed_target is not None
                 and baseline is not None
+                and (soc_start_allowed and not soc_low or observed_mode == 1 and baseline <= observed_target)
                 and (observed_mode != 1 or abs(observed_target - baseline) > 0.5))
             if (name == "ww" and desired[name] and not state["possible_effect"]
                     and observed_mode == 1 and observed_target is not None
@@ -764,6 +905,7 @@ class LuxtronikChannelController:
                 baseline_target_c=baseline,
                 release_on_baseline_readback=bool(wp_holiday and name == "ww"),
                 stop_reason=(None if boost_left_s > 0 else "user_off" if user_off else (protection_reason or "hard_protection") if hard else
+                             "soc_below_stop_threshold" if soc_withdrawal else
                              "invalid_control_data" if channel_hard else
                              "timer_target" if timer_idle else
                              "policy_release" if desired[name] is None and any(
@@ -796,6 +938,15 @@ class LuxtronikChannelController:
             if isinstance(completed_clock, dict):
                 now = self._time(completed_clock)
             self.checkpoint = note_transport(self.checkpoint, action, now_s=now, outcome=outcome)
+            current = self.checkpoint["channels"][name]
+            if current["possible_effect"] and current["sent_ts"] is not None:
+                # Erst der Transportbeleg bindet eine neue Signalepisode.
+                episodes[name] = soc_runtime_episode(
+                    episodes.get(name), signal_started_ts=current["sent_ts"],
+                    compressor_started_ts=ctx.get("wp_compressor_last_start_ts"),
+                    min_runtime_min=(ctx.get("PREDUMP_HEATPUMP_MIN_RUNTIME_MIN", minimum_run / 60.0)
+                        if current["owner"] == "predump" else minimum_run / 60.0), now_ts=now,
+                    runtime_class="predump" if current["owner"] == "predump" else "general")
             # Ein Entzug zählt kanalübergreifend einmal pro PV-Auftrag/Ursache.
             # Verbindungsfehler und Wiederholungen sind keine neue Schutzkante.
             prior = old["channels"][name]

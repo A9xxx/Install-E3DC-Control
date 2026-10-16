@@ -28,6 +28,11 @@ try:
 except ImportError:  # pragma: no cover - Paketimport
     from Installer.live_snapshot import read_runtime_live_snapshot
 
+try:
+    from data_models import parse_mqtt_vehicle_allowlist, mqtt_vehicle_record_allowed
+except ImportError:
+    from Installer.data_models import parse_mqtt_vehicle_allowlist, mqtt_vehicle_record_allowed
+
 # Pfade
 LOG_DIR = "/var/www/html/logs"
 RAMDISK_DIR = "/var/www/html/ramdisk"
@@ -44,6 +49,13 @@ AVAILABILITY_TOPIC_SUFFIX = "status/availability"
 INBOUND_MAX_AGE_S = 180
 MAIN_CONNECTION_GENERATION = 0
 MQTT_HUB_STATUS_FILE = os.path.join(RAMDISK_DIR, "mqtt_hub_status.json")
+VEHICLE_INPUT_STATUS = {"rejected": 0, "reason": None}
+
+
+def _reject_vehicle_input(reason):
+    VEHICLE_INPUT_STATUS["rejected"] += 1
+    VEHICLE_INPUT_STATUS["reason"] = reason
+
 
 def setup_logging():
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -153,8 +165,8 @@ def write_json_atomic(path, payload, ensure_ascii=False):
             pass
 
 
-def write_mqtt_hub_status(client, wb_client, wb2_client):
-    """Schreibt nur Lebenszeichen und Verbindungszustände, ohne Broker- oder Kontodaten."""
+def write_mqtt_hub_status(client, wb_client, wb2_client, repeat_status=None):
+    """Schreibt Lebenszeichen, Verbindungen und Wiederholung, ohne Kontodaten."""
     connections = {}
     for name, connection in (("main", client), ("wallbox1", wb_client), ("wallbox2", wb2_client)):
         try:
@@ -162,7 +174,10 @@ def write_mqtt_hub_status(client, wb_client, wb2_client):
         except Exception:
             connections[name] = {"connected": None, "reason": "Verbindungszustand nicht lesbar"}
     try:
-        write_json_atomic(MQTT_HUB_STATUS_FILE, {"updated_at": time.time(), "connections": connections})
+        write_json_atomic(MQTT_HUB_STATUS_FILE, {
+            "updated_at": time.time(), "connections": connections, **(repeat_status or {}),
+            "vehicle_input": dict(VEHICLE_INPUT_STATUS),
+        })
     except Exception:
         # Die Diagnoseausgabe darf den MQTT-Hauptzyklus nicht unterbrechen.
         logger.debug("MQTT-Lebenszeichen konnte nicht geschrieben werden.")
@@ -414,20 +429,128 @@ def topic_safe(name):
     safe = re.sub(r"[^A-Za-z0-9_-]+", "_", str(name).strip().lower())
     return safe.strip("_") or "value"
 
+def mqtt_repeat_interval_s(value):
+    """Begrenzt ganze Sekunden; ungültige oder negative Werte deaktivieren."""
+    try:
+        interval = int(str(value).strip())
+    except (TypeError, ValueError):
+        return 0
+    return min(3600, max(10, interval)) if interval > 0 else 0
+
+
+def effective_price_releases(plan):
+    """Prüft Preisfreigaben am aktuellen Fensterrand, auch bei älteren Plänen."""
+    if not as_bool(plan.get("enabled")) or not is_current_window_active(plan):
+        return {}
+    if plan.get("tariff_axis") == "configured_recurring":
+        allow = plan.get("allow")
+        return allow if isinstance(allow, dict) else {}
+    if not as_bool(plan.get("active")):
+        return {}
+    releases = plan.get("consumer_releases")
+    if isinstance(releases, dict):
+        return releases
+    allow = plan.get("allow")
+    return allow if isinstance(allow, dict) else {}
+
+
+WINDOW_STATE_KEYS = ("cheap_price_active", "predump_active", "abregel_active")
+
+
+BUDGET_STATE_KEYS = (
+    "free_for_consumers_w", "wallbox_budget_w",
+    "wallbox_allowed", "heatpump_allowed", "heater_allowed",
+)
+
+
+def read_mqtt_budget():
+    """Bindet die Frische an die gelesenen Bytes und deren Inhaltszeit."""
+    budget, meta = _read_json_cached(WB_BUDGET_FILE, max_age_s=60, with_meta=True)
+    if not budget or not meta.get("usable"):
+        return {}, True
+    now = time.time()
+    age = max(0.0, now - (meta.get("source_ts") or 0))
+    try:
+        stamp = float(budget.get("ts"))
+        # Positive Unix-Sekunden bis jetzt; ungültige Zukunfts-/Millisekundenwerte
+        # liefern keine plausible Inhaltszeit, die mtime bleibt maßgeblich.
+        if not isinstance(budget.get("ts"), bool) and math.isfinite(stamp) and 0 < stamp <= now:
+            age = max(age, now - stamp)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return (budget, False) if age <= 60 else ({}, True)
+
+
+def mqtt_budget_state(state, budget):
+    """Eine Quelle für Budgetwerte und Freigaben auf allen MQTT-Sendewegen."""
+    result = dict(state)
+    score = budget.get("energy_score")
+    score = score if isinstance(score, dict) else {}
+    free_w = first_number(score, ("free_for_limbs_w",), first_number(budget, ("budget_w",), 0))
+    wallbox_w = first_number(budget, ("budget_w",), free_w)
+    predump = as_bool(budget.get("predump_active"))
+    allow = budget.get("predump_allow")
+    allow = allow if isinstance(allow, dict) else {}
+    result.update({
+        "free_for_consumers_w": as_int(free_w),
+        "wallbox_budget_w": as_int(wallbox_w),
+        "wallbox_allowed": bool(budget) and (
+            wallbox_w >= 300 or budget.get("state") in ("run", "ok", "abregelschutz")
+            or (predump and as_bool(budget.get("predump_allow_wallbox", allow.get("wallbox"))))
+        ),
+        "heatpump_allowed": bool(budget) and (
+            free_w >= 500 or as_bool(budget.get("heatpump_boost_permission_active"))
+            or (predump and as_bool(budget.get("predump_allow_heatpump", allow.get("heatpump"))))
+        ),
+        "heater_allowed": bool(budget) and (
+            free_w >= 500
+            or (predump and as_bool(budget.get("predump_allow_heater", allow.get("heater"))))
+        ),
+    })
+    return result
+
+
+def valid_window_bounds(window):
+    if not isinstance(window, dict):
+        return None
+    try:
+        start_raw, end_raw = window["start_timestamp"], window["end_timestamp"]
+        if isinstance(start_raw, bool) or isinstance(end_raw, bool):
+            return None
+        start, end = int(start_raw), int(end_raw)
+        return (start, end) if 0 < start < end else None
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def valid_price_plan(plan):
+    # Der Erzeuger verwendet kein Schema-Tag: Pflichtfelder bilden das Planschema.
+    if not isinstance(plan, dict) or not all(isinstance(plan.get(key), bool) for key in ("enabled", "active")):
+        return False
+    windows = plan.get("windows")
+    active_window = plan.get("active_window")
+    if windows is None:
+        return valid_window_bounds(active_window) is not None
+    if not isinstance(windows, list) or any(valid_window_bounds(win) is None for win in windows):
+        return False
+    return active_window is None or valid_window_bounds(active_window) is not None
+
+
 def is_current_window_active(plan):
     try:
         if not isinstance(plan, dict):
             return False
         now_ms = int(time.time() * 1000)
         for win in plan.get("windows", []) or []:
-            if int(win.get("start_timestamp", 0) or 0) <= now_ms <= int(win.get("end_timestamp", 0) or 0):
+            bounds = valid_window_bounds(win)
+            if bounds and bounds[0] <= now_ms < bounds[1]:
                 return True
-        active = plan.get("active_window") or {}
-        if active:
-            return int(active.get("start_timestamp", 0) or 0) <= now_ms <= int(active.get("end_timestamp", 0) or 0)
+        bounds = valid_window_bounds(plan.get("active_window"))
+        return bool(bounds and bounds[0] <= now_ms < bounds[1])
     except Exception:
         return False
-    return False
+
+
 
 def update_inbound_telemetry(device, key, value, source_topic):
     if not _mqtt_context_valid(refresh=True):
@@ -480,6 +603,15 @@ def update_inbound_telemetry(device, key, value, source_topic):
         logger.info(f"MQTT Eingangs-Topic ohne endlichen Messwert ignoriert: {source_topic}")
         return False
 
+    if device == "heatpump" and key in {"power_w", "electric_w"}:
+        try:
+            value = float(value) if not isinstance(value, bool) else None
+        except (TypeError, ValueError):
+            value = None
+        if value is None or not math.isfinite(value):
+            logger.info("MQTT WP-Leistung ohne endlichen Messwert ignoriert")
+            return False
+
     data = read_json_file(HA_INBOUND_FILE)
     if not data:
         data = {"ts": int(time.time()), "sources": {}}
@@ -502,6 +634,57 @@ def update_inbound_telemetry(device, key, value, source_topic):
     except Exception as e:
         logger.error(f"Fehler beim Schreiben von mqtt_ha_inbound.json: {e}")
         return False
+
+def bind_heatpump_power_source(cfg):
+    """Entfernt vor der ersten Nachricht Werte einer abgelösten Leistungsquelle."""
+    data = read_json_file(HA_INBOUND_FILE)
+    sources = data.get("sources", {}) if isinstance(data, dict) else {}
+    source = sources.get("heatpump", {}) if isinstance(sources, dict) else {}
+    if not isinstance(source, dict):
+        return
+    configured = str(cfg.get("wp_power_topic") or "").strip()
+    base = str(cfg.get("mqtt_hub_topic") or "e3dc").strip().strip('/') or 'e3dc'
+    changed = False
+    for key in ("power_w", "electric_w"):
+        expected = configured if configured and key == "power_w" else f"{base}/in/heatpump/{key}"
+        origin = source.get("_topics", {}).get(key)
+        if key in source and ((configured and key == "electric_w" and str(cfg.get("wp_type", "")).strip() != "7")
+                or (origin != expected and (configured or origin is not None))):
+            source.pop(key, None)
+            for metadata in ("_updated", "_topics"):
+                source.get(metadata, {}).pop(key, None)
+            changed = True
+    if changed:
+        write_json_atomic(HA_INBOUND_FILE, data, ensure_ascii=False)
+
+
+def heatpump_inbound_power(source, cfg):
+    """Bindet die Leistung an ihre konfigurierte Quelle und Feldzeit."""
+    configured = str(cfg.get("wp_power_topic") or "").strip()
+    base = str(cfg.get("mqtt_hub_topic") or "e3dc").strip().strip('/') or 'e3dc'
+    for key in (("power_w",) if configured else ("power_w", "electric_w")):
+        expected = configured or f"{base}/in/heatpump/{key}"
+        origin = source.get("_topics", {}).get(key)
+        if origin != expected and (configured or origin is not None):
+            continue
+        stamp = source.get("_updated", {}).get(key, source.get("ts"))
+        if configured and stamp is None:
+            continue
+        if str(cfg.get("wp_type", "")).strip() == "7":
+            # Die reine Anzeige braucht Herkunft und Feldzeit auch bei festen Topics.
+            strict_stamp = finite_float(source.get("_updated", {}).get(key), None)
+            if (origin != expected or strict_stamp is None
+                    or not 0 <= time.time() - strict_stamp < INBOUND_MAX_AGE_S):
+                continue
+        if stamp is not None and time.time() - as_float(stamp) >= INBOUND_MAX_AGE_S:
+            continue
+        value = finite_float(source.get(key), None)
+        if value is not None:
+            if str(cfg.get("wp_type", "")).strip() == "7" and value < 0:
+                continue
+            return max(0.0, value)
+    return None
+
 
 def handle_inbound_telemetry(base_topic, topic, payload, enabled=True):
     if not _mqtt_context_valid(refresh=True):
@@ -535,7 +718,86 @@ def mqtt_home_power_w(live):
         0,
     )
 
-def build_ha_state(live, cfg=None):
+def heatpump_ha_power(live, source, cfg):
+    """Wählt eine gebundene Messquelle statt des Maximums fremder Projektionen."""
+    configured = str(cfg.get("wp_power_topic") or "").strip()
+    wp_type = str(cfg.get("wp_type", "0")).strip()
+    if wp_type == "7":
+        # Die Anzeigequelle existiert schon vor der ersten Nachricht. Es gibt
+        # keinen Hersteller-/Snapshot-Ersatz und keinen Kein-Gerät-Nullwert.
+        if not as_bool(cfg.get("mqtt_ha_inbound_enable", "1")):
+            return None
+        try:
+            file_age = time.time() - os.path.getmtime(HA_INBOUND_FILE)
+        except OSError:
+            return None
+        if not 0 <= file_age < INBOUND_MAX_AGE_S:
+            return None
+        return heatpump_inbound_power(source, cfg)
+    # Alte Erzeuger haben kein Herkunftsfeld. Ohne eigenes Topic bleibt ihr
+    # Gerätevertrag nutzbar; beim PM belegen Gültigkeit und Quelle die Herkunft.
+    legacy = None
+    if "wp_power_binding" not in live:
+        legacy_pm = (wp_type == "6" and live.get("wp_power_valid") is True
+                     and str(live.get("wp_power_source") or "").startswith("e3dc_pm"))
+        if not configured or legacy_pm:
+            legacy = finite_float(first_value(live, ("wp", "WP_Power", "wp_electric_w"), None), None)
+        if wp_type == "6":
+            return max(0.0, legacy) if legacy_pm and legacy is not None else None
+    binding = live.get("wp_power_binding")
+    binding = binding if isinstance(binding, dict) else {}
+    origin = binding.get("source")
+    value = finite_float(binding.get("power_w"), None)
+    stamp = finite_float(binding.get("field_ts"), None)
+    file_stamp = finite_float(binding.get("file_ts"), None)
+    now = time.time()
+    fresh = (binding.get("valid") is True and value is not None
+             and stamp is not None and file_stamp is not None
+             and 0 <= now - stamp < INBOUND_MAX_AGE_S
+             and 0 <= now - file_stamp < INBOUND_MAX_AGE_S)
+    # Ein ausgewählter PM bekommt keinen Ersatz aus einer anderen Quelle.
+    if wp_type == "6":
+        return max(0.0, value) if fresh and origin == "e3dc_pm" else None
+    if fresh and origin in {"e3dc_pm", "luxtronik_live", "stiebel_live",
+                            "idm_live", "dimplex_live", "shelly_live", "native_live"}:
+        return max(0.0, value)
+    # Kein Gerät und kein Leistungseingang bedeutet den bekannten Wert 0 W.
+    address = {"0": "luxtronik_ip", "1": "idm_ip", "4": "stiebel_isg_ip", "5": "dimplex_ip"}
+    enabled = (as_bool(cfg.get("luxtronik", "0"))
+               or ("luxtronik" not in cfg and bool(str(cfg.get(address.get(wp_type, "")) or "").strip())))
+    device = (wp_type == "6" or (wp_type in address and enabled)
+              or (wp_type == "3" and (enabled or bool(str(cfg.get("shelly_3em_ip") or "").strip()))))
+    inbound_enabled = as_bool(cfg.get("mqtt_ha_inbound_enable", "1"))
+    direct = heatpump_inbound_power(source, cfg) if inbound_enabled else None
+    if legacy is not None and device:
+        return max(0.0, legacy, direct or 0.0)
+    if not device and not configured and origin != "mqtt_ha" and not any(key in source for key in ("power_w", "electric_w")):
+        # Ein veralteter fester MQTT-Eingang bleibt eine fehlende konfigurierte
+        # Messquelle. Seine Bytes dienen hier nur zur Erkennung, nie als Wert.
+        record = read_json_file(HA_INBOUND_FILE) if inbound_enabled else {}
+        sources = record.get("sources", {})
+        old_source = sources.get("heatpump", {}) if isinstance(sources, dict) else {}
+        if not isinstance(old_source, dict) or not any(key in old_source for key in ("power_w", "electric_w")):
+            return 0.0
+    if not inbound_enabled:
+        return None
+    base = str(cfg.get("mqtt_hub_topic") or "e3dc").strip().strip('/') or 'e3dc'
+    keys = ("power_w",) if configured else ("power_w", "electric_w")
+    topics = {configured or f"{base}/in/heatpump/{key}" for key in keys}
+    if fresh and origin == "mqtt_ha" and binding.get("topic") in topics:
+        # Auch ein noch frischer Snapshot darf keine jüngere Feldmessung ersetzen.
+        updated = source.get("_updated", {})
+        origins = source.get("_topics", {})
+        newest = max((as_float(updated.get(key, source.get("ts")), 0)
+                      for key in keys if key in source
+                      and origins.get(key, configured or f"{base}/in/heatpump/{key}") in topics),
+                     default=0)
+        if stamp >= newest:
+            return max(0.0, value)
+    return direct
+
+
+def build_ha_state(live, cfg=None, budget_context=None):
     if not _mqtt_context_valid(refresh=True):
         _write_disabled_mqtt_state()
         return {
@@ -586,7 +848,7 @@ def build_ha_state(live, cfg=None):
     wb2_w = max(wb2_w, first_number(inbound_wb2, ("power_w",), 0))
     wallbox_w = max(0, wb1_w) + max(0, wb2_w)
     wallbox_w = max(wallbox_w, first_number(inbound_wb, ("power_w",), 0))
-    wp_w = max(first_number(live, ("wp", "WP_Power", "wp_electric_w"), 0), first_number(inbound_wp, ("power_w", "electric_w"), 0))
+    wp_w = heatpump_ha_power(live, inbound_wp, cfg)
     heater_w = max(first_number(live, ("hs_power", "Heizstab_Power", "heizstab_power"), 0), first_number(inbound_heater, ("power_w",), 0))
     price_ct = first_number(live, ("price_ct", "strompreis_ct", "price"), 0)
     if home_w <= 0 and first_number(inbound_house, ("extra_power_w",), 0) > 0:
@@ -615,9 +877,19 @@ def build_ha_state(live, cfg=None):
         or as_bool(first_value(predump_plan, ("active",), False))
     )
     abregel_active = storage_mode == "abregelschutz" or "ABREGELSCHUTZ" in storage_reason.upper()
-    cheap_price_active = as_bool(first_value(live, ("cheap_grid_boost_active",), False)) or is_current_window_active(price_boost)
+    cheap_price_active = (
+        as_bool(price_boost.get("enabled"))
+        and (price_boost.get("tariff_axis") == "configured_recurring"
+             or as_bool(price_boost.get("active")))
+        and is_current_window_active(price_boost)
+    ) if valid_price_plan(price_boost) else (
+        as_bool(live.get("cheap_grid_boost_active"))
+        and is_current_window_active({
+            "active_window": live.get("cheap_grid_boost_window") or live.get("active_window")
+        })
+    )
 
-    price_allow = price_boost.get("allow", {}) if isinstance(price_boost.get("allow"), dict) else {}
+    price_allow = effective_price_releases(price_boost)
     predump_allow = predump_plan.get("allow", {}) if isinstance(predump_plan.get("allow"), dict) else {}
     wb_state = str(first_value(live, ("wb_budget_state",), first_value(wb_budget, ("state",), "")) or "")
 
@@ -689,7 +961,8 @@ def build_ha_state(live, cfg=None):
         "wallbox_charging": wallbox_charging,
         "wallbox_allowed": wallbox_allowed,
         "wallbox_budget_w": as_int(free_for_limbs_w),
-        "heatpump_w": as_int(wp_w),
+        "heatpump_w": as_int(wp_w) if wp_w is not None else None,
+        "heatpump_power_reason": None if wp_w is not None else "Keine frische Leistung einer gebundenen Quelle",
         "heatpump_allowed": heatpump_allowed,
         "heater_w": as_int(heater_w),
         "heater_allowed": heater_allowed,
@@ -715,6 +988,9 @@ def build_ha_state(live, cfg=None):
         "heater_water_temp": first_value(live, ("elwa_water_temp_c", "hs_water_temp_c"), first_value(inbound_heater, ("water_temp",), first_value(heizstab, ("elwa_water_temp_c",), None))),
         "mqtt_inbound_fresh": bool(inbound),
     }
+    if mqtt_repeat_interval_s(cfg.get("mqtt_hub_repeat_interval_s", "0")):
+        budget, _ = budget_context if budget_context is not None else read_mqtt_budget()
+        state = mqtt_budget_state(state, budget)
     return state
 
 def read_config():
@@ -871,12 +1147,17 @@ def on_connect(client, userdata, flags, reason_code, properties=None):
             "(u.a. wallbox/power_w, wallbox2/power_w)" % base_topic
         )
 
+        wp_power_topic = userdata.get('wp_power_topic', '')
+        if wp_power_topic:
+            client.subscribe(wp_power_topic)
+            logger.info("WP-Leistungs-Topic abonniert; bei reiner MQTT-Anzeige bleibt electric_w ein separater COP-Eingang")
+
         # Fallback für ein spezifisches, in der Config definiertes Topic (z.B. EVCC direkt)
         for key in ['sub_topic', 'sub_topic2']:
             st = userdata.get(key, '')
             if st:
                 client.subscribe(st)
-                logger.info(f"Abonniere SoC Topic auf Broker: {st}")
+                logger.info("Abonniere SoC Topic auf Broker (konfigurierter Eingang)")
     else:
         logger.error(f"MQTT Verbindungsfehler, RC: {reason_code}")
 
@@ -885,6 +1166,38 @@ def on_message(client, userdata, msg):
         _write_disabled_mqtt_state()
         return
     topic = msg.topic
+    base_topic = userdata.get('base_topic', 'e3dc')
+    sub_topic = userdata.get('sub_topic', '')
+    sub_topic2 = userdata.get('sub_topic2', '')
+    allowed, valid = parse_mqtt_vehicle_allowlist(read_config().get("mqtt_vehicle_allowlist"))
+    # Ohne Liste bleibt die generische Zuordnung vor den dedizierten Topics.
+    # Mit Liste behält ein dediziertes Topic auch bei Überlappung seinen Namen.
+    dedicated = bool(allowed is not None and topic and topic in (sub_topic, sub_topic2))
+    match = re.fullmatch(rf"{re.escape(base_topic)}/vehicle/([^/]+)/([^/]+)", topic)
+    generic = bool(match and not dedicated)
+    if generic:
+        if not valid or (allowed is not None and match.group(1) not in allowed):
+            _reject_vehicle_input("invalid_allowlist" if not valid else "not_allowed")
+            return
+    wp_power_topic = str(userdata.get('wp_power_topic') or '').strip()
+    base_topic = userdata.get('base_topic', 'e3dc')
+    # Exaktes Routing vor /in/: auch ein dort liegendes eigenes Topic ersetzt beide Aliase.
+    if wp_power_topic and topic == wp_power_topic:
+        if userdata.get('inbound_enable', True):
+            try:
+                value = float(msg.payload.decode('utf-8').strip())
+            except (ValueError, UnicodeError):
+                value = None
+            if value is not None and math.isfinite(value):
+                update_inbound_telemetry('heatpump', 'power_w', value, topic)
+            else:
+                logger.info("MQTT WP-Leistung ohne endlichen Messwert ignoriert")
+        return
+    if wp_power_topic and (topic == f"{base_topic}/in/heatpump/power_w"
+            or (topic == f"{base_topic}/in/heatpump/electric_w"
+                and str(read_config().get("wp_type", "")).strip() != "7")):
+        logger.debug("Fester WP-Leistungseingang ersetzt, Nachricht ignoriert")
+        return
     try:
         payload = msg.payload.decode('utf-8').strip()
     except:
@@ -893,7 +1206,7 @@ def on_message(client, userdata, msg):
     try:
         val = float(payload)
         if not math.isfinite(val):
-            logger.info(f"MQTT Topic mit NaN/Inf ignoriert: {topic}")
+            logger.info("MQTT Topic mit NaN/Inf ignoriert")
             return
     except:
         if payload.lower() in ['true', 'on', '1']: val = True
@@ -909,7 +1222,7 @@ def on_message(client, userdata, msg):
 
     # Format: e3dc/vehicle/tesla/soc
     match = re.match(rf"^{re.escape(base_topic)}/vehicle/([^/]+)/([^/]+)$", topic)
-    if match:
+    if match and not dedicated:
         v_id = match.group(1)
         attr = match.group(2).lower()
     elif sub_topic and topic == sub_topic:
@@ -945,6 +1258,14 @@ def on_message(client, userdata, msg):
                 (v for v in vehicles if isinstance(v, dict) and v.get("id") == v_id),
                 None,
             )
+            if generic and allowed is not None and target_v and (
+                target_v.get("mqtt_vehicle_origin") == "dedicated"
+                or str(target_v.get("soc_source") or target_v.get("source") or "").lower()
+                not in ("", "mqtt", "mqtt_retained", "legacy_vehicle_unknown")
+            ):
+                # Gemeinsame IDs verleihen einem Eingang keine fremde Schreibhoheit.
+                _reject_vehicle_input("source_conflict")
+                return
             if not target_v:
                 target_v = {
                     "id": v_id,
@@ -954,6 +1275,7 @@ def on_message(client, userdata, msg):
                 vehicles.append(target_v)
 
             now_ts = int(time.time())
+            previous_source = target_v.get("soc_source_ts"), target_v.get("soc_source")
             _apply_vehicle_telemetry(
                 target_v,
                 internal_attr,
@@ -961,6 +1283,13 @@ def on_message(client, userdata, msg):
                 now_ts,
                 retained=bool(getattr(msg, "retain", False)),
             )
+
+            # Retained darf die Herkunft eines unveränderten SoC nicht umetikettieren.
+            legacy_overlap = allowed is None and bool(topic and topic in (sub_topic, sub_topic2)) and bool(match)
+            if not legacy_overlap and ((internal_attr == "soc" and (not bool(getattr(msg, "retain", False)) or previous_source != (
+                    target_v.get("soc_source_ts"), target_v.get("soc_source")))) or not target_v.get("soc_source")):
+                target_v["mqtt_vehicle_origin"] = "generic" if generic else "dedicated"
+                target_v["mqtt_vehicle_id"] = v_id
 
             if internal_attr == "soc" and "name" not in target_v:
                 target_v["name"] = v_id.capitalize()
@@ -970,7 +1299,7 @@ def on_message(client, userdata, msg):
             os.makedirs(RAMDISK_DIR, exist_ok=True)
             write_json_atomic(VEHICLES_JSON_FILE, old_data)
     except Exception as e:
-        logger.error(f"Fehler beim Schreiben der vehicles.json: {e}")
+        logger.error("Fehler beim Schreiben der vehicles.json")
 
 def on_wb_message(client, userdata, msg):
     if not _mqtt_context_valid(refresh=True):
@@ -1061,6 +1390,9 @@ def main():
     sub_topic2 = cfg.get('mqtt_hub_sub_soc_topic_2', '')
     sub_topic_name2 = cfg.get('mqtt_hub_sub_soc_name_2', 'Mqtt_car2')
     inbound_enable = as_bool(cfg.get('mqtt_ha_inbound_enable', '1'))
+    wp_power_topic = str(cfg.get('wp_power_topic') or '').strip()
+    bind_heatpump_power_source(cfg)
+    repeat_interval = mqtt_repeat_interval_s(cfg.get('mqtt_hub_repeat_interval_s', 0))
 
     wb_ip = cfg.get('wb_ip', '')
     wb_topic = cfg.get('wb_topic', '')
@@ -1086,7 +1418,7 @@ def main():
             return None
         logger.info(f"Verbinde zu MQTT Broker auf {broker_ip}:{broker_port}...")
         mqtt_client = create_mqtt_client()
-        mqtt_client.user_data_set({'base_topic': base_topic, 'sub_topic': sub_topic, 'sub_topic2': sub_topic2, 'sub_topic_name': sub_topic_name, 'sub_topic_name2': sub_topic_name2, 'inbound_enable': inbound_enable})
+        mqtt_client.user_data_set({'base_topic': base_topic, 'sub_topic': sub_topic, 'sub_topic2': sub_topic2, 'sub_topic_name': sub_topic_name, 'sub_topic_name2': sub_topic_name2, 'inbound_enable': inbound_enable, 'wp_power_topic': wp_power_topic})
         mqtt_client.on_connect = on_connect
         mqtt_client.on_message = on_message
         mqtt_client.will_set(f"{base_topic}/{AVAILABILITY_TOPIC_SUFFIX}", "offline", qos=1, retain=True)
@@ -1163,6 +1495,16 @@ def main():
     live_source_available = None
     observed_connection_generation = -1
     next_status_at = 0.0
+    last_sent = {}
+    last_ha_sent = None
+    last_suppressed_at = None
+    repeat_status = {
+        "repeat_interval_s": repeat_interval,
+        "repeats_sent": 0,
+        "repeats_suppressed_stale": 0,
+        "repeats_budget_stale": 0,
+        "last_repeat_ts": None,
+    }
     while True:
         if not _mqtt_context_valid(refresh=True):
             _write_disabled_mqtt_state()
@@ -1202,6 +1544,11 @@ def main():
                     require_control_valid=True,
                     include_web_projection=True,
                 )
+                cycle_now = time.monotonic()
+                repeat_due = bool(repeat_interval and (
+                    (last_ha_sent is not None and cycle_now - last_ha_sent >= repeat_interval)
+                    or any(cycle_now - sent >= repeat_interval for sent in last_sent.values())
+                ))
                 if not live_json:
                     if live_source_available is not False:
                         publish_raw(
@@ -1212,6 +1559,10 @@ def main():
                         )
                     live_source_available = False
                     last_data = ""
+                    if repeat_due and (last_suppressed_at is None
+                                       or cycle_now - last_suppressed_at >= repeat_interval):
+                        repeat_status["repeats_suppressed_stale"] += 1
+                        last_suppressed_at = cycle_now
                 else:
                     if live_source_available is not True:
                         publish_raw(
@@ -1222,15 +1573,20 @@ def main():
                         )
                         last_data = ""
                     live_source_available = True
+                    last_suppressed_at = None
                     new_data = json.dumps(
                         live_json,
                         ensure_ascii=False,
                         allow_nan=False,
                         separators=(",", ":"),
                     )
-                    if new_data != last_data:
+                    live_changed = new_data != last_data
+                    if live_changed:
                         publish_raw(client, f"{base_topic}/live", new_data, retain=False)
-                        ha_state = build_ha_state(live_json, cfg)
+                    # Zeitfenster laufen auch bei unveränderten Live-Bytes ab.
+                    if live_source_available:
+                        budget_context = read_mqtt_budget() if repeat_interval else ({}, False)
+                        ha_state = build_ha_state(live_json, cfg, budget_context)
                         ha_state_json = json.dumps(
                             ha_state,
                             ensure_ascii=False,
@@ -1238,17 +1594,61 @@ def main():
                             sort_keys=True,
                             separators=(",", ":"),
                         )
-                        if ha_state_json != last_ha_state:
-                            publish_json(client, f"{base_topic}/ha/state", ha_state, retain=True)
+                        repeated_state = ha_state
+                        budget_stale = budget_context[1]
+                        sent_repeats = 0
+                        budget_repeat = False
+                        budget_changed = bool(repeat_interval) and any(
+                            last_individual.get(key) != (ha_state[key], budget_stale)
+                            for key in BUDGET_STATE_KEYS
+                        )
+                        window_changed = any(
+                            last_individual.get(key) != ha_state.get(key)
+                            for key in WINDOW_STATE_KEYS
+                        )
+                        state_changed = (live_changed and ha_state_json != last_ha_state) or budget_changed or window_changed
+                        state_due = bool(repeat_interval and last_ha_sent is not None
+                                         and cycle_now - last_ha_sent >= repeat_interval)
+                        if state_changed or state_due:
+                            payload = ha_state if state_changed else repeated_state
+                            publish_json(client, f"{base_topic}/ha/state", payload, retain=True)
                             last_ha_state = ha_state_json
+                            last_ha_sent = cycle_now
+                            if not state_changed:
+                                sent_repeats += 1
+                                budget_repeat = True
 
-                            for key, value in ha_state.items():
-                                if isinstance(value, (dict, list)):
-                                    continue
-                                if last_individual.get(key) != value:
-                                    publish_raw(client, f"{base_topic}/ha/{topic_safe(key)}", str(value), retain=True)
-                                    last_individual[key] = value
-                        last_data = new_data
+                        for key, raw_value in ha_state.items():
+                            if isinstance(raw_value, (dict, list)):
+                                continue
+                            # Auch die Rückkehr eines unveränderten 0-W-Budgets
+                            # ist eine Änderung seiner Gültigkeit.
+                            value = (raw_value, budget_stale) if repeat_interval and key in BUDGET_STATE_KEYS else raw_value
+                            changed = (live_changed or key in WINDOW_STATE_KEYS or (repeat_interval and key in BUDGET_STATE_KEYS)) and last_individual.get(key) != value
+                            due = bool(repeat_interval and key in last_sent
+                                       and cycle_now - last_sent[key] >= repeat_interval)
+                            if key == "heatpump_w" and key not in last_individual:
+                                changed = True
+                            if changed or due:
+                                sent_value = raw_value
+                                scalar_payload = str(sent_value)
+                                publish_raw(client, f"{base_topic}/ha/{topic_safe(key)}", scalar_payload, retain=True)
+                                # Der Filter bindet Wert und Budgetgültigkeit;
+                                # Wiederholungen ändern diese Signatur nicht.
+                                last_individual[key] = value
+                                last_sent[key] = cycle_now
+                                if not changed:
+                                    sent_repeats += 1
+                                    budget_repeat |= key in (
+                                        "free_for_consumers_w", "wallbox_budget_w",
+                                        "wallbox_allowed", "heatpump_allowed", "heater_allowed",
+                                    )
+                        if sent_repeats:
+                            repeat_status["repeats_sent"] += sent_repeats
+                            repeat_status["last_repeat_ts"] = time.time()
+                            if budget_stale and budget_repeat:
+                                repeat_status["repeats_budget_stale"] += 1
+                    last_data = new_data
             except Exception as e:
                 if live_source_available is not False:
                     try:
@@ -1265,7 +1665,7 @@ def main():
                 logger.debug(f"MQTT Live-Publish pausiert: {e}")
         now_monotonic = time.monotonic()
         if now_monotonic >= next_status_at:
-            write_mqtt_hub_status(client, wb_client, wb2_client)
+            write_mqtt_hub_status(client, wb_client, wb2_client, repeat_status)
             next_status_at = now_monotonic + 30.0
         time.sleep(2)
 

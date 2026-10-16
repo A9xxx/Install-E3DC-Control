@@ -10,6 +10,10 @@ import json
 import math
 from collections import Counter
 try:
+    from . import pv_entity_archive as entity_archive
+except ImportError:
+    import pv_entity_archive as entity_archive
+try:
     from . import pv_observation_quality as observation_quality
 except ImportError:  # Direkter Diagnoseaufruf ohne Paketkontext.
     import pv_observation_quality as observation_quality
@@ -109,6 +113,7 @@ def build_stage_metadata(slot, topology, raw_resources, provider_resources, para
 
 
 def initialize_tables(connection):
+    entity_archive.initialize_tables(connection)
     connection.executescript("""
         CREATE TABLE IF NOT EXISTS forecast_diagnostic_slots (
             issue_id TEXT NOT NULL REFERENCES forecast_issues(issue_id) ON DELETE CASCADE,
@@ -151,10 +156,20 @@ def tables_ready(connection):
     expected = {"forecast_diagnostic_slots", "forecast_external_observations",
                 "forecast_diagnostic_slots_no_update", "forecast_external_observations_no_update",
                 "forecast_diagnostic_parameters", "forecast_diagnostic_parameters_no_update"}
-    return expected.issubset({r[0] for r in connection.execute("SELECT name FROM sqlite_master")})
+    return (entity_archive.tables_ready(connection) and
+            expected.issubset({r[0] for r in connection.execute("SELECT name FROM sqlite_master")}))
 
 
 def archive_details(connection, issue_id, slots):
+    connection.execute('SAVEPOINT entity_diagnostic')
+    try:
+        entity_archive.archive(connection, issue_id, slots)
+    except Exception:
+        connection.execute('ROLLBACK TO entity_diagnostic')
+        connection.execute('INSERT OR IGNORE INTO pv_entity_issues(issue_id,status) VALUES(?,?)',
+                           (issue_id, 'diagnostic_error'))
+    finally:
+        connection.execute('RELEASE entity_diagnostic')
     for slot in slots:
         start, end = number(slot.get("start_timestamp")), number(slot.get("end_timestamp"))
         if start is None or end is None or start % 900000 or end - start != 900000:
@@ -371,6 +386,12 @@ def error_metrics(pairs):
             "wape_pct": round(sum(map(abs, errors)) / actual_sum * 100, 3) if actual_sum > 0 else None}
 
 
+try:
+    from .pv_forecast_method import evaluation_method_revisions
+except ImportError:
+    from pv_forecast_method import evaluation_method_revisions
+
+
 def calculate_details(connection, topology_revision, method_revision, now_s):
     """Wertet ausschließlich aktuelle Methode/Topologie und vorherige Ausgaben aus."""
     cutoff, end = now_s - 90 * 86400, now_s - 3600
@@ -382,7 +403,7 @@ def calculate_details(connection, topology_revision, method_revision, now_s):
         JOIN forecast_issue_contracts c USING(issue_id)
         JOIN forecast_issue_provenance p USING(issue_id)
         LEFT JOIN forecast_slots f USING(issue_id,slot_start_utc_s)
-        WHERE c.topology_revision=? AND c.method_revision=?
+        WHERE c.topology_revision=? AND c.method_revision IN (SELECT value FROM json_each(?))
           AND c.producer_issue_time_status='complete'
           AND c.method_revision_status='complete'
           AND c.postprocessing_revision_status='complete'
@@ -393,7 +414,7 @@ def calculate_details(connection, topology_revision, method_revision, now_s):
           AND p.captured_at_utc_s<=d.slot_start_utc_s
           AND d.slot_start_utc_s-c.producer_issued_at_utc_s<259200
         ORDER BY c.producer_issued_at_utc_s, d.issue_id
-    """, (topology_revision, method_revision, cutoff, end)).fetchall()
+    """, (topology_revision, json.dumps(evaluation_method_revisions(method_revision)), cutoff, end)).fetchall()
     latest = {r["slot_start_utc_s"]: r for r in rows}
     actual = {}
     for row in connection.execute("""SELECT * FROM observed_slots

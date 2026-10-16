@@ -2081,8 +2081,29 @@ WATCHDOG_REBIND_TIMEOUT_SECONDS = 300
 WATCHDOG_REBIND_OK_PREFIX = "E3DC_WATCHDOG_REBIND_OK "
 WATCHDOG_MENU_HINT = (
     "Neu binden: e3dc-setup, Menü 15 „Watchdog & Telegram konfigurieren“ → "
-    "„Komplett neu installieren / reparieren“."
+    "„1. Komplett neu installieren / reparieren“."
 )
+def _watchdog_rebind_failure_detail(error, installation_root):
+    """Innere Ursache ohne Zugangsdaten oder fremde absolute Pfade melden."""
+    seen = set()
+    while isinstance(error, BaseException) and id(error) not in seen:
+        seen.add(id(error))
+        cause = error.__cause__ or (None if error.__suppress_context__ else error.__context__)
+        if cause is None or id(cause) in seen:
+            break
+        error = cause
+    detail = str(error).strip() or type(error).__name__
+    detail = re.sub(r"(?i)\b(?:https?|mqtts?)://[^\s]+", "[Verbindung]", detail)
+    detail = re.sub(r"(?i)\b(password|passwd|token|secret|api[_-]?key|authorization)\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+                    r"\1=[entfernt]", detail)
+    root = str(Path(installation_root)).rstrip("/")
+    def safe_path(match):
+        value = match.group(0)
+        return "." + value[len(root):] if value.startswith(root + "/") else "[Pfad]"
+    detail = re.sub(r"(?<![\w.])/(?:[^\s\"'<>;,):\]]+)", safe_path, detail)
+    return " ".join(detail.split())[:300]
+
+
 # Läuft in einem eigenen Root-Prozess mit leerer Umgebung aus dem ersetzten
 # Produktbaum: derselbe transaktionale Weg wie Menü 15, ohne Notifier. Router-IP
 # und Überwachungsdatei bleiben die bisher installierten Werte.
@@ -2102,7 +2123,8 @@ _WATCHDOG_REBIND_CHILD = (
     "        explicit_venv_path=venv,\n"
     "    )\n"
     "except Exception as exc:\n"
-    "    print(type(exc).__name__ + ': ' + (str(exc).strip() or '-'), file=sys.stderr)\n"
+    "    from Installer.update_simple import _watchdog_rebind_failure_detail\n"
+    "    print(_watchdog_rebind_failure_detail(exc, root), file=sys.stderr)\n"
     "    raise SystemExit(1)\n"
     "print('" + WATCHDOG_REBIND_OK_PREFIX + "' + str(sha))\n"
 )
@@ -2150,14 +2172,14 @@ def _run_watchdog_bundle_installer(
     except subprocess.TimeoutExpired:
         return False, f"Zeitüberschreitung nach {WATCHDOG_REBIND_TIMEOUT_SECONDS} s"
     except OSError as exc:
-        return False, str(exc).strip() or exc.__class__.__name__
+        return False, _watchdog_rebind_failure_detail(exc, target_root)
     lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
     ok_lines = [line for line in lines if line.startswith(WATCHDOG_REBIND_OK_PREFIX)]
     if result.returncode == 0 and ok_lines:
         return True, ok_lines[-1][len(WATCHDOG_REBIND_OK_PREFIX):].strip()
     errors = [line.strip() for line in (result.stderr or "").splitlines() if line.strip()]
     detail = errors[-1] if errors else f"Exit {result.returncode}"
-    return False, detail[:300]
+    return False, _watchdog_rebind_failure_detail(detail, target_root)
 
 
 def _rebind_watchdog_after_venv_change(
@@ -2169,37 +2191,34 @@ def _rebind_watchdog_after_venv_change(
     *,
     enabled_before: Iterable[str],
 ) -> tuple[list[str], frozenset[Path]]:
-    """Bindet piguard nach bestätigtem Start an das neue aktive venv.
+    """Heilt ein veraltetes Bündel nach dem bestätigten Kernstart transaktional.
 
-    Nur wenn piguard vor dem Update aktiv und beim Systemstart aktiviert war,
-    vom Updater wieder gestartet wurde und das Watchdog-Bündel ein anderes venv
-    bindet. Der Installer aktiviert die Unit dauerhaft; eine bewusst
-    deaktivierte Unit bleibt deshalb unverändert, und die venv-Bereinigung
-    behält ihr gebundenes venv. Ein Fehlschlag ist eine Warnung: Die neue
-    Version bleibt, und das bisher gebundene venv wird als zweites Ergebnis
-    zurückgegeben, damit die venv-Bereinigung es behält.
+    Aktivierte, auch fehlgeschlagene oder inaktive Units werden geprüft.
+    Nutzer-Aus bleibt erhalten. Bei Fehlern warnt das Update und schützt die
+    bisher gebundenen venvs vor der Bereinigung.
     """
 
     warnings: list[str] = []
-    if (
-        WATCHDOG_UNIT not in set(active_before)
-        or WATCHDOG_UNIT not in set(enabled_before)
-        or WATCHDOG_UNIT not in set(started_services)
-    ):
+    if WATCHDOG_UNIT not in set(enabled_before):
         return warnings, frozenset()
     previous: frozenset[Path] = frozenset()
     active = Path(os.path.abspath(Path(venv_python).parent.parent))
     try:
+        if not _service_exists(WATCHDOG_UNIT) or _service_enable_state(WATCHDOG_UNIT) == "disabled":
+            return warnings, frozenset()
         home = Path(os.path.abspath(pwd.getpwnam(str(install_user)).pw_dir))
         bound = _watchdog_bound_venvs(home)
-        # Unlesbare Bindung: Die venv-Bereinigung unterbleibt ohnehin und warnt.
-        if not bound or bound == {active}:
+        checked = _run(
+            ["/usr/bin/sha256sum", "--check", "--strict", str(WATCHDOG_MANIFEST_PATH)],
+            timeout=20,
+        )
+        if bound == {active} and checked.returncode == 0:
             return warnings, frozenset()
-        previous = frozenset(bound - {active})
+        previous = frozenset((bound or set()) - {active})
         names = ", ".join(str(path) for path in sorted(previous))
         print(
-            f"[INFO] Watchdog (piguard) nutzt noch {names}; er wird an die neue "
-            f"Python-Umgebung {active} gebunden …",
+            f"[REPARIEREN] Watchdog (piguard): Prüfsummenliste oder venv-Bindung "
+            f"passt nicht (bisher: {names or 'nicht eindeutig'}); neu binden an {active} …",
             flush=True,
         )
         installed, detail = _run_watchdog_bundle_installer(
@@ -2213,6 +2232,8 @@ def _rebind_watchdog_after_venv_change(
                 installed, detail = False, "piguard ist nach der Neubindung nicht aktiv"
             elif _watchdog_bound_venvs(home) != {active}:
                 installed, detail = False, "die Hashliste des Watchdogs bindet nicht das neue venv"
+            elif _run(["/usr/bin/sha256sum", "--check", "--strict", str(WATCHDOG_MANIFEST_PATH)], timeout=20).returncode != 0:
+                installed, detail = False, "die Prüfsummenliste passt nach der Neubindung nicht"
         if installed:
             print(
                 f"[OK] Watchdog (piguard) an die Python-Umgebung {active} gebunden "
@@ -2226,9 +2247,10 @@ def _rebind_watchdog_after_venv_change(
         state = "aktiv" if _service_active(WATCHDOG_UNIT) else "nicht aktiv"
     except Exception:
         state = "unbekannt"
+    detail = _watchdog_rebind_failure_detail(detail, target_root)
     warnings.append(
-        "Der Watchdog (piguard) konnte nicht an die neue Python-Umgebung "
-        f"{active} gebunden werden: {detail}. Die neue Version bleibt aktiv; die "
+        "Der Watchdog (piguard) konnte nicht an die aktive Python-Umgebung "
+        f"gebunden werden: {detail}. Die neue Version bleibt aktiv; die "
         f"bisher gebundene Python-Umgebung bleibt erhalten. piguard ist derzeit {state}. "
         + WATCHDOG_MENU_HINT
     )

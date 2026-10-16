@@ -13,9 +13,9 @@ import time
 import uuid
 
 try:
-    from .heatpump_pv_contract import validate_heatpump_pv_state
+    from .heatpump_pv_contract import validate_heatpump_pv_state, heatpump_pv_time_probe_plausible, heatpump_pv_closed_terminal
 except ImportError:
-    from heatpump_pv_contract import validate_heatpump_pv_state
+    from heatpump_pv_contract import validate_heatpump_pv_state, heatpump_pv_time_probe_plausible, heatpump_pv_closed_terminal
 
 
 CHECKPOINT_BASENAME = "heatpump_pv_energy_state.json"
@@ -45,6 +45,68 @@ def _quarantine(reason, now_s):
     return {"schema": "heatpump_pv_checkpoint_quarantine_v1",
             "quarantined": True, "checkpoint_reason": reason,
             "checkpoint_observed_ts": now_s}
+
+
+def heatpump_pv_time_confirmation(clock_sample):
+    """Nur der timesyncd-Marker des laufenden Bare-Metal-Boots bestätigt Zeit.
+
+    Ein persistenter Epochenschätzer oder Container-Wanduhr allein genügt nicht.
+    Andere Zeitdienste bleiben ohne diesen Nachweis unbestätigt.
+    """
+    probe = copy.deepcopy(clock_sample)
+    probe.update(wall_confirmed=False, time_confirmation_source="clock_unconfirmed",
+                 time_confirmation_scope="bare_metal")
+    try:
+        if os.path.exists("/.dockerenv"):
+            probe["time_confirmation_scope"] = "docker_legacy"
+            return probe
+        wall = probe.get("wall_ts", probe.get("wall_s"))
+        mono = probe.get("monotonic_ts", probe.get("monotonic_s"))
+        if (probe.get("valid") is not True or type(wall) not in (int, float)
+                or not math.isfinite(wall) or wall < 1577836800
+                or type(mono) not in (int, float) or not math.isfinite(mono) or mono < 0
+                or probe.get("boot_id") in (None, "", "unknown")):
+            return probe
+        marker = os.stat("/run/systemd/timesync/synchronized", follow_symlinks=False)
+        with open("/proc/stat", encoding="ascii") as stream:
+            boot_wall = next(float(line.split()[1]) for line in stream if line.startswith("btime "))
+        if (not stat.S_ISREG(marker.st_mode) or marker.st_uid != 0
+                or not math.isfinite(boot_wall) or not boot_wall < marker.st_mtime <= wall):
+            return probe
+        probe.update(boot_wall_s=boot_wall,
+                     time_confirmation_marker_wall_s=marker.st_mtime)
+        if not heatpump_pv_time_probe_plausible(probe):
+            probe["time_confirmation_source"] = "clock_implausible"
+            return probe
+        probe.update(wall_confirmed=True, time_confirmation_source="systemd_timesyncd_current_boot")
+    except (OSError, ValueError, TypeError, StopIteration, IndexError):
+        pass
+    return probe
+
+
+def heatpump_pv_gap_intent_uncertain(*, anchor_wall_s, directory=None, now_s=None, account_state=None):
+    """Liest die vorhandenen privaten Intents; kein gespeicherter Ausgang wird ausgeführt."""
+    command = load_heatpump_pv_command_checkpoint(directory=directory, now_s=now_s)
+    if command:
+        if not validate_heatpump_pv_command(command):
+            return True
+        closed_before = bool(heatpump_pv_closed_terminal(account_state, command, wall_s=anchor_wall_s)
+            and not account_state.get("cycle_owned") and not account_state.get("active_command")
+            and not (account_state.get("closed_command") or {}).get("protection_unknown"))
+        if not closed_before and (command.get("withdrawal_confirmed") is not True
+                or command["prepared_ts"] > anchor_wall_s):
+            return True
+    channel = load_heatpump_channel_checkpoint(directory=directory)
+    if channel["status"] == "untrusted":
+        return True
+    if channel["status"] == "valid":
+        for value in channel["checkpoint"]["channels"].values():
+            if value.get("owner") == "pv" and (
+                    value.get("possible_effect") or value.get("transport_uncertain")
+                    or value.get("state") in ("vorbereitet", "gesendet", "ruecknahme_offen", "ruecknahme_gesendet")
+                    or (value.get("prepared_ts") or 0) > anchor_wall_s):
+                return True
+    return False
 
 
 def _default_directory():
@@ -160,7 +222,9 @@ def load_heatpump_pv_checkpoint(*, directory=None, now_s=None):
     descriptor = None
     try:
         _, descriptor = _open_private_directory(directory)
-        state, _ = _read_checkpoint(descriptor)
+        state, _ = _read_checkpoint(descriptor, restore_fn=lambda value, envelope: {
+            **value, "checkpoint_saved_ts": envelope["saved_ts"],
+        })
         return copy.deepcopy(state)
     except FileNotFoundError:
         return _quarantine("checkpoint_missing", current)
@@ -178,7 +242,7 @@ def _transition_signature(state):
             "withdrawal_pending", "running_since_s", "last_stop_s", "issued_ts", "offered_ts",
             "max_power_w", "uncertain_state",
             "energy_guard_pending", "energy_guard_sources", "withdrawal_reason",
-            "quarantine_reason", "compressor_running")
+            "quarantine_reason", "compressor_running", "energy_recovery", "closed_command")
     value = {key: state.get(key) for key in keys}
     value["clock_boot_id"] = (state.get("clock") or {}).get("boot_id")
     return hashlib.sha256(_canonical(value)).hexdigest()

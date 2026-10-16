@@ -747,12 +747,19 @@ def _backup_current_version_v2(
                         "Bindung erneut."
                     )
                 elif unclassified_count:
-                    detail = (
-                        f"{unclassified_count} nicht sicher klassifizierbare "
-                        "Altbestände bleiben unverändert außerhalb der "
-                        "verifizierten Rotation; sie zählen nicht als verifizierte "
-                        "Backup-Familien."
-                    )
+                    if unclassified_count == 1:
+                        detail = (
+                            "1 nicht sicher klassifizierbarer Altbestand bleibt "
+                            "unverändert außerhalb der verifizierten Rotation; "
+                            "er zählt nicht als verifizierte Backup-Familie."
+                        )
+                    else:
+                        detail = (
+                            f"{unclassified_count} nicht sicher klassifizierbare "
+                            "Altbestände bleiben unverändert außerhalb der "
+                            "verifizierten Rotation; sie zählen nicht als verifizierte "
+                            "Backup-Familien."
+                        )
                 else:
                     detail = (
                         "Die sichere Bereinigung ist noch nicht vollständig "

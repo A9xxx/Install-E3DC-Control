@@ -1488,14 +1488,14 @@ class WatchdogBundleInstaller:
         ):
             raise WatchdogTransitionError("Watchdog-Ziel änderte sich nach dem Snapshot")
 
-    def _query_active(self) -> str:
+    def _query_active(self, *, normalize_failed=True) -> str:
         result = self._run(["/usr/bin/systemctl", "is-active", WATCHDOG_SERVICE], check=False)
         value = next((line.strip().lower() for line in result.stdout.splitlines() if line.strip()), "")
         if value == "active" and result.returncode == 0:
             return "active"
-        if value in {"inactive", "unknown", "not-found"} and result.returncode in {3, 4, 5}:
-            return "inactive"
-        if not value and result.returncode in {3, 4, 5}:
+        if value == "failed" and result.returncode == 3:
+            return "inactive" if normalize_failed else "failed"
+        if value in {"inactive", "not-found"} and result.returncode in {3, 4, 5}:
             return "inactive"
         raise WatchdogTransitionError("Piguard-Aktivzustand ist nicht eindeutig")
 
@@ -1892,6 +1892,9 @@ class WatchdogBundleInstaller:
                 "Korrelierte Watchdog-Installation darf nicht quiesced bleiben"
             )
         bundle = self.render_bundle(context, router_ips, monitor_file)
+        # Unklare Zustände vor Journal, Kandidaten und Live-Dateien abweisen.
+        # Im Lock wird der Vorzustand für den Übergang erneut gebunden.
+        self._query_active()
         with self._locked():
             self.systemd.recover_incomplete()
             self._recover_incomplete_locked()
@@ -1915,7 +1918,8 @@ class WatchdogBundleInstaller:
                 ]
                 snapshots_by_target = {snapshot.target: snapshot for snapshot in snapshots}
                 record["files"] = [snapshot.as_dict() for snapshot in snapshots]
-                record["previous_active"] = self._query_active()
+                previous = self._query_active(normalize_failed=False)
+                record["previous_active"] = "inactive" if previous == "failed" else previous
                 record["state"] = "in_progress"
                 self._advance(tx_dir, record, "snapshots_captured")
 
@@ -1952,6 +1956,10 @@ class WatchdogBundleInstaller:
                     )
                     return self._verify_live(bundle, context) and desired_state_ok
 
+                if start_service and previous == "failed":
+                    # Auch ein gestoppter fehlgeschlagener Dienst kann sein
+                    # Startlimit behalten. Erst nach dem Bündelaustausch lösen.
+                    self._run(["/usr/bin/systemctl", "reset-failed", WATCHDOG_SERVICE])
                 systemd_called = True
                 result = self.systemd.install_unit(
                     self.paths.service,

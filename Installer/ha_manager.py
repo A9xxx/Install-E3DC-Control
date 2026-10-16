@@ -1195,6 +1195,7 @@ def rsync_data(target_ip, push=True, owner_lease=None, peer_state_getter=query_p
     base_args = [
         "/usr/bin/sudo", "-u", user, "/usr/bin/rsync", "-au",
         "--exclude", "*.tmp",
+        "--exclude", "*.tmp.*",
         "--exclude", "*.flag",
         "--exclude", "*_status.json",
         "--exclude", "*_cache.json",
@@ -1258,13 +1259,46 @@ def rsync_data(target_ip, push=True, owner_lease=None, peer_state_getter=query_p
         txt_src = [_rsync_remote(user, target_ip, f"{INSTALL_PATH}/e3dc.strompreise.txt")]
     txt_dst = _rsync_remote(user, target_ip, f"{INSTALL_PATH}/") if push else f"{INSTALL_PATH}/"
 
+    sync_complete = True
+
+    def run_sync(argv):
+        vanished = []
+        for attempt in range(2):
+            try:
+                subprocess.run(
+                    argv, timeout=45, check=True, stderr=subprocess.PIPE, text=True,
+                    env=dict(os.environ, LC_ALL="C"),
+                )
+                # Ein Verzeichnis-Retry allein bemerkt dauerhaft fehlende Dateien nicht.
+                if vanished:
+                    source = argv[-2].rsplit(":", 1)[-1].rstrip("/")
+                    for path in vanished:
+                        local_path = path if push else os.path.join(argv[-1], os.path.relpath(path, source))
+                        if not os.path.isfile(local_path):
+                            logger.warning("HA rsync: Sync unvollständig; zuvor verschwundene Datei fehlt nach Wiederholung.")
+                            return False
+                return True
+            except subprocess.CalledProcessError as exc:
+                if exc.returncode != 24:
+                    raise
+                # Verschwundene Quelldateien ändern weder Rolle noch Lease.
+                logger.warning(
+                    "HA rsync: Exit 24, Quelldateien während der Übertragung verschwunden; %s",
+                    "Teilübertragung wird einmal sofort wiederholt." if attempt == 0 else
+                    "Sync unvollständig nach Wiederholung; nächster regulärer Sync versucht es erneut.",
+                )
+                for line in (exc.stderr or "").splitlines():
+                    if line.startswith('file has vanished: "') and line.endswith('"'):
+                        vanished.append(line[len('file has vanished: "'):-1])
+        return False
+
     try:
-        subprocess.run(ramdisk_args + [rd_src, rd_dst], timeout=45, check=True)
-        subprocess.run(data_args + [data_src, data_dst], timeout=45, check=True)
+        sync_complete = run_sync(ramdisk_args + [rd_src, rd_dst]) and sync_complete
+        sync_complete = run_sync(data_args + [data_src, data_dst]) and sync_complete
         if dat_src:
-            subprocess.run(optional_args + dat_src + [dat_dst], timeout=45, check=True)
+            sync_complete = run_sync(optional_args + dat_src + [dat_dst]) and sync_complete
         if txt_src:
-            subprocess.run(optional_args + txt_src + [txt_dst], timeout=45, check=True)
+            sync_complete = run_sync(optional_args + txt_src + [txt_dst]) and sync_complete
 
         # Rechte der geholten Daten in der Ramdisk und Data anpassen (bei Pull)
         if not push:
@@ -1352,7 +1386,8 @@ def rsync_data(target_ip, push=True, owner_lease=None, peer_state_getter=query_p
                 )
                 return False
 
-        return True
+        # None bezeichnet einen unvollständigen Sync, False einen Fehler bzw. eine Sperre.
+        return True if sync_complete else None
     except Exception as e:
         logger.error(f"Rsync Fehler: {e}")
         return False
@@ -1910,8 +1945,11 @@ def main_loop():
                         logger.error("HA config sync preparation failed: %s", exc)
             if time.time() - last_sync > sync_interval:
                 if peer_online:
-                    if rsync_data(peer_ip, push=True, owner_lease=owner_lease):
+                    sync_result = rsync_data(peer_ip, push=True, owner_lease=owner_lease)
+                    if sync_result:
                         last_sync = time.time()
+                    elif sync_result is None:
+                        logger.warning("HA backup sync unvollständig; letzter vollständiger Erfolgszeitpunkt bleibt unverändert.")
                     else:
                         logger.warning("HA backup sync blocked by ambiguous peer/owner state.")
                 else:

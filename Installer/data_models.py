@@ -14,6 +14,54 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
 
 
+def parse_mqtt_vehicle_allowlist(raw):
+    """None = offen, leere Menge = ungültig/geschlossen; Segmente bleiben exakt."""
+    if raw is None or raw == "":
+        return None, True
+    if not isinstance(raw, str):
+        return frozenset(), False
+    if not raw.strip(" \t\r\n\v\f"):
+        return None, True
+    names = [name.strip(" \t\r\n\v\f") for name in raw.split(",")]
+    try:
+        valid = all(name and not any(c in name for c in "/#+")
+                    and not any(ord(c) < 32 or ord(c) == 127 for c in name)
+                    and len(name.encode("utf-8")) <= 65535 for name in names)
+    except UnicodeError:
+        valid = False
+    return (frozenset(names), True) if valid else (frozenset(), False)
+
+
+def mqtt_vehicle_record_allowed(record, config=None):
+    """Entwertet nur generische MQTT-Werte, einschließlich alter Fortschreibungen."""
+    config = config if isinstance(config, dict) else {}
+    allowed, valid = parse_mqtt_vehicle_allowlist(config.get("mqtt_vehicle_allowlist"))
+    if allowed is None:
+        return True
+    record = record if isinstance(record, dict) else {}
+    # Dieselben Leerzeichen wie im Listenparser und im PHP-Leser (mqttVehicleRecordAllowed).
+    def first_text(*keys):
+        return next((record[key].strip(" \t\r\n\v\f") for key in keys
+                     if isinstance(record.get(key), str) and record[key].strip(" \t\r\n\v\f")), "")
+
+    source = first_text("soc_source", "source", "anchor_source").lower()
+    if source == "vehicle_cached_last_confirmed":
+        source = str(record.get("soc_source_previous") or "").strip(" \t\r\n\v\f").lower()
+    mqtt_source = source in ("mqtt", "mqtt_retained", "wallbox_estimated_from_mqtt",
+                             "wallbox_estimated_from_mqtt_retained")
+    origin = record.get("mqtt_vehicle_origin")
+    if not mqtt_source and not (not source and origin == "generic"):
+        return True
+    if origin == "dedicated":
+        return True
+    name = first_text("mqtt_vehicle_id", "id", "car_id")
+    if origin != "generic":
+        # Der Altproduzent speicherte weder Topic noch Eingangsart.
+        # Erst eine neue Nachricht belegt die dedizierte oder generische Herkunft.
+        return False
+    return bool(valid and name and name in allowed)
+
+
 def safe_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None:

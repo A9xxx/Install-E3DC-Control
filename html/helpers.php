@@ -99,6 +99,94 @@ function sendNoCacheHeaders() {
  * Erzeugt einen Cache-Busting-Pfad für statische Dateien (JS/CSS) basierend auf dem Änderungsdatum.
  * Sucht automatisch nach einer .min Version, falls vorhanden.
  */
+
+/** Zwei Klima-Messpunkte getrennt prüfen; unbekannte Beiträge nicht ersetzen. */
+function e3dcClimateHasSecondMeter($cfg) {
+    $ip = strtolower(trim((string)($cfg['climate_meter2_ip'] ?? '')));
+    return cfgBool($cfg['climate_enable'] ?? false, false) && !in_array($ip, ['', '0', '0.0.0.0', 'none', 'null'], true);
+}
+
+function e3dcClimateLoadProjection($load, $cfg, $now = null) {
+    if (!e3dcClimateHasSecondMeter($cfg)) return $load;
+    $now = $now ?? microtime(true);
+    // Eine frische Einzählerdatei beim Übergang weiterhin als Zähler 1 lesen.
+    // Der unveränderte Gesamtwert darf nicht als Messung von Zähler 2 gelten.
+    if (!isset($load['meters']) && !empty($load['enabled']) && ($load['source'] ?? '') !== 'climate_sum') {
+        $first = $load;
+        $first['id'] = 'meter1';
+        $first['power_valid'] = !empty($first['online']) && !empty($first['measurement_valid'])
+            && isset($first['power_w']) && is_numeric($first['power_w']) && is_finite((float)$first['power_w']);
+        $first['energy_valid'] = !empty($first['online']) && empty($first['daily_baseline_error'])
+            && isset($first['daily_kwh'], $first['energy_total_kwh']) && is_numeric($first['daily_kwh'])
+            && is_numeric($first['energy_total_kwh']) && is_finite((float)$first['daily_kwh']) && is_finite((float)$first['energy_total_kwh'])
+            && (float)$first['daily_kwh'] >= 0 && (float)$first['energy_total_kwh'] >= 0;
+        $first['energy_date'] = date('Y-m-d', (int)($first['ts'] ?? 0));
+        $load['meters'] = [$first];
+    }
+    $maxAge = max(30, min(120, 3 * max(5, (int)($cfg['climate_poll_s'] ?? 15))));
+    $meters = [];
+    foreach (['meter1', 'meter2'] as $index => $id) {
+        $m = [];
+        foreach (($load['meters'] ?? []) as $candidate) {
+            if (is_array($candidate) && ($candidate['id'] ?? '') === $id) { $m = $candidate; break; }
+        }
+        $m['id'] = $id;
+        $m['name'] = (string)($m['name'] ?? ($cfg[$index === 0 ? 'climate_name' : 'climate_meter2_name'] ?? ('Klimaanlage ' . ($index + 1))));
+        $age = isset($m['ts']) && is_numeric($m['ts']) && is_finite((float)$m['ts']) && (float)$m['ts'] > 0
+            ? max(0, $now - (float)$m['ts']) : null;
+        $fresh = $age !== null && $age <= $maxAge;
+        $m['age_s'] = $age === null ? null : round($age, 1);
+        $m['power_valid'] = $fresh && !empty($m['online']) && !empty($m['power_valid'])
+            && isset($m['power_w']) && is_numeric($m['power_w']) && is_finite((float)$m['power_w']);
+        $m['energy_valid'] = $fresh && (!isset($m['energy_date']) || $m['energy_date'] === date('Y-m-d', (int)$now))
+            && !empty($m['online']) && !empty($m['energy_valid'])
+            && isset($m['daily_kwh'], $m['energy_total_kwh']) && is_numeric($m['daily_kwh'])
+            && is_numeric($m['energy_total_kwh']) && is_finite((float)$m['daily_kwh']) && is_finite((float)$m['energy_total_kwh'])
+            && (float)$m['daily_kwh'] >= 0 && (float)$m['energy_total_kwh'] >= 0;
+        if (!$m['power_valid']) {
+            $m['power_w'] = null;
+            $m['active'] = false;
+            $m['reason'] = $age !== null && !$fresh ? 'stale' : (($m['reason'] ?? '') ?: 'missing');
+        }
+        if (!$m['energy_valid']) {
+            $m['daily_kwh'] = null;
+            $m['energy_total_kwh'] = null;
+            $m['energy_reason'] = $age !== null && !$fresh ? 'stale' : (isset($m['energy_date']) && $m['energy_date'] !== date('Y-m-d', (int)$now) ? 'day_changed' : (($m['energy_reason'] ?? '') ?: 'energy_missing'));
+        }
+        $m['measurement_valid'] = $m['power_valid'];
+        $m['online'] = $fresh && !empty($m['online']);
+        $meters[] = $m;
+    }
+    $powerValid = $meters[0]['power_valid'] && $meters[1]['power_valid'];
+    $energyValid = $meters[0]['energy_valid'] && $meters[1]['energy_valid'];
+    // Überlauf der Summe und die Gültigkeit des Messdienstes bis zur Anzeige erhalten.
+    $powerSumInvalid = ($load['reason'] ?? '') === 'sum_nonfinite'
+        || ($powerValid && !is_finite(array_sum(array_column($meters, 'power_w'))));
+    $energySumInvalid = ($load['energy_reason'] ?? '') === 'sum_nonfinite'
+        || ($energyValid && (!is_finite(array_sum(array_column($meters, 'daily_kwh')))
+            || !is_finite(array_sum(array_column($meters, 'energy_total_kwh')))));
+    $powerValid = $powerValid && !$powerSumInvalid;
+    $energyValid = $energyValid && !$energySumInvalid;
+    $load['enabled'] = true;
+    $load['name'] = 'Klima';
+    $load['source'] = 'climate_sum';
+    $load['meters'] = $meters;
+    $load['power_valid'] = $load['measurement_valid'] = $powerValid;
+    $load['energy_valid'] = $energyValid;
+    $load['online'] = $meters[0]['online'] && $meters[1]['online'];
+    $load['power_w'] = $powerValid ? array_sum(array_column($meters, 'power_w')) : null;
+    $load['daily_kwh'] = $energyValid ? array_sum(array_column($meters, 'daily_kwh')) : null;
+    $load['energy_total_kwh'] = $energyValid ? array_sum(array_column($meters, 'energy_total_kwh')) : null;
+    $load['active'] = $powerValid && $load['power_w'] >= (float)($cfg['climate_min_power_w'] ?? 50);
+    $load['reason'] = $powerSumInvalid ? 'sum_nonfinite' : '';
+    $load['energy_reason'] = $energySumInvalid ? 'sum_nonfinite' : '';
+    foreach ($meters as $m) {
+        if (!$m['power_valid'] && $load['reason'] === '') $load['reason'] = $m['id'] . '_' . ($m['reason'] ?: 'missing');
+        if (!$m['energy_valid'] && $load['energy_reason'] === '') $load['energy_reason'] = $m['id'] . '_' . ($m['energy_reason'] ?: 'energy_missing');
+    }
+    return $load;
+}
+
 function getAssetUrl($filePath) {
     $fullPath = __DIR__ . '/' . ltrim($filePath, '/');
 
@@ -2973,6 +3061,18 @@ function e3dcWpViewFromCookie($cookies = null) {
  * preview_offered: Die neue Ansicht darf angeboten werden (echte Wärmepumpe, keine Heizstab- und keine
  * Nur-Laden-Seite, Schalter wp_page_preview_enable an).
  */
+
+/** Die MQTT-Detailansichten nehmen keine Steueraufträge entgegen. */
+function e3dcGuardMqttHeatpumpRequest(): void {
+    if (!in_array($_GET['seite'] ?? '', ['waermepumpe', 'waermepumpe_vorschau'], true)
+        || in_array($_SERVER['REQUEST_METHOD'] ?? 'GET', ['GET', 'HEAD'], true)) return;
+    $result = loadE3dcConfig();
+    if (getHeatpumpTypeConfig($result['config'] ?? []) !== 7) return;
+    http_response_code(403);
+    echo 'MQTT-Wärmepumpe: nur Anzeige.';
+    exit;
+}
+
 function e3dcWpPageContext($conf, $pageContext = 'waermepumpe') {
     $conf = is_array($conf) ? $conf : [];
     $conf['luxtronik'] = $conf['luxtronik'] ?? 0;
@@ -3769,7 +3869,13 @@ function loadE3dcConfig($basePath = null) {
 
     // Der Spiegel liegt in tmpfs und wird nur bei einer echten Änderung
     // erneuert. Er bleibt reine Projektion und niemals Auth-Autorität.
-    $cacheBody = json_encode(['mtime' => (string)$v4_mtime, 'config' => $config]);
+    // openWB-Konten und lokale Zertifikatsfreigaben gehören ausschließlich in
+    // die geschützte Konfiguration, niemals in den Ramdisk-Spiegel.
+    $cacheConfig = $config;
+    foreach (array_keys($cacheConfig) as $key) {
+        if (preg_match('/^wb[12]_openwb_(username|password|tls_binding)$/', $key)) unset($cacheConfig[$key]);
+    }
+    $cacheBody = json_encode(['mtime' => (string)$v4_mtime, 'config' => $cacheConfig]);
     if (!e3dcWriteConfigCacheSecurely($cacheFile, $cacheBody, $v4Data)) {
         $result = ['error' => errorMessage('Konfigurationsschutz', 'Der lokale Konfigurationscache konnte nicht sicher veröffentlicht oder entfernt werden.'), 'config' => []];
         $requestMemo[$memoGeneration] = $result;
@@ -5401,6 +5507,7 @@ function isHeatpumpEnabledConfig($cfg) {
         return cfgBool($cfg['luxtronik'] ?? null, false)
             || (!array_key_exists('luxtronik', $cfg) && cfgHasAddress($cfg['dimplex_ip'] ?? ''));
     }
+    if ($wpType === 7) return true; // MQTT-Anzeige auch vor der ersten Nachricht.
     if ($wpType === 6) {
         // E3DC-Leistungsmesser: keine Adresse nötig. Der Live-Dienst und der
         // Storage Manager lesen den PM allein anhand von wp_type=6.
@@ -5867,6 +5974,136 @@ function e3dcSelectFreshManufacturerPayload(
     return $result;
 }
 
+
+/** Feldvertrag für die reine MQTT-Anzeige. Keine Geräteabfrage und keine Steuerfreigabe. */
+function e3dcMqttHeatpumpFields(array $cfg, string $file = '/var/www/html/ramdisk/mqtt_ha_inbound.json', ?int $now = null): array {
+    $now = $now ?? time();
+    $base = trim(trim((string)($cfg['mqtt_hub_topic'] ?? 'e3dc')), '/') ?: 'e3dc';
+    $custom = trim((string)($cfg['wp_power_topic'] ?? ''));
+    $record = is_file($file) ? @json_decode((string)@file_get_contents($file), true) : null;
+    $mtime = is_file($file) ? @filemtime($file) : false;
+    $fileAge = $mtime !== false ? $now - $mtime : null;
+    $source = is_array($record['sources']['heatpump'] ?? null) ? $record['sources']['heatpump'] : [];
+    $globalReason = !cfgBool($cfg['mqtt_ha_inbound_enable'] ?? '1', true) ? 'MQTT-Eingang deaktiviert'
+        : (!is_array($record) ? 'MQTT-Eingangsdatei fehlt oder ist ungültig'
+        : (!e3dcPayloadContextValid($record) ? 'MQTT-Eingang nicht freigegeben'
+        : ($fileAge === null || $fileAge < 0 || $fileAge >= 180 ? 'MQTT-Eingangsdatei nicht frisch' : null)));
+    $fields = [];
+    foreach (['power_w', 'electric_w', 'heat_kw', 'state', 'mode', 'boost_active', 'ww_temp', 'ww_target_temp', 'flow_temp', 'return_temp', 'outside_temp'] as $key) {
+        $expected = $custom !== '' && $key === 'power_w' ? $custom : $base . '/in/heatpump/' . $key;
+        // Die Summenquelle liefert keinen elektrischen Einzelwert für den COP.
+        $input = $key;
+        $stamp = $source['_updated'][$input] ?? null;
+        $stampValid = !is_bool($stamp) && is_numeric($stamp) && is_finite((float)$stamp) && (float)$stamp > 0;
+        $age = $stampValid ? $now - (float)$stamp : null;
+        $reason = $globalReason;
+        if ($reason === null && !array_key_exists($input, $source)) $reason = $custom !== '' && $key === 'electric_w'
+            ? 'Nur Summenleistung übermittelt' : 'Messwert fehlt';
+        if ($reason === null && ($source['_topics'][$input] ?? null) !== $expected) $reason = 'Andere oder unbekannte MQTT-Quelle';
+        if ($reason === null && ($age === null || $age < 0 || $age >= 180)) $reason = 'Feld nicht frisch';
+        $value = $source[$input] ?? null;
+        if ($reason === null) {
+            if ($key === 'state' || $key === 'mode') {
+                if ((!is_string($value) && !is_int($value) && !is_float($value)) || trim((string)$value) === ''
+                    || in_array(strtolower(trim((string)$value)), ['unavailable','unknown','none','null','nan','inf','infinity'], true)) $reason = 'Ungültiger Textwert';
+                else $value = (string)$value;
+            } elseif ($key === 'boost_active') {
+                if (is_bool($value)) { /* gültiges false bleibt false */ }
+                elseif (is_scalar($value) && in_array(strtolower(trim((string)$value)), ['0','false','off','no','1','true','on','yes'], true)) {
+                    $value = in_array(strtolower(trim((string)$value)), ['1','true','on','yes'], true);
+                } else $reason = 'Ungültiger Ein/Aus-Wert';
+            } else {
+                if (is_bool($value) || !is_numeric($value) || !is_finite((float)$value)) $reason = 'Ungültiger Messwert';
+                else {
+                    $value = (float)$value;
+                    if (in_array($key, ['power_w','electric_w','heat_kw'], true) && $value < 0) $reason = 'Negative Leistung';
+                }
+            }
+        }
+        $fields[$key] = ['value' => $reason === null ? $value : null, 'valid' => $reason === null,
+            'reason' => $reason, 'ts' => $stampValid ? (float)$stamp : null, 'age_s' => $age,
+            'file_age_s' => $fileAge, 'source' => 'mqtt_ha', 'topic' => $expected];
+    }
+    // power_w hat für die Leistungsanzeige Vorrang, electric_w bleibt eigener COP-Eingang.
+    $power = $custom !== '' || $fields['power_w']['valid'] ? $fields['power_w'] : $fields['electric_w'];
+    $heat = $fields['heat_kw']; $electric = $fields['electric_w'];
+    $cop = $heat['valid'] && $electric['valid'] && $electric['value'] > 0
+        ? $heat['value'] * 1000 / $electric['value'] : null;
+    if ($cop !== null && !is_finite($cop)) $cop = null;
+    $fields['cop'] = ['value' => $cop, 'valid' => $cop !== null,
+        'reason' => $cop !== null ? null : 'Frische Heizleistung und elektrische Leistung > 0 erforderlich',
+        'age_s' => $heat['age_s'] !== null && $electric['age_s'] !== null ? max($heat['age_s'], $electric['age_s']) : null,
+        'file_age_s' => $fileAge, 'source' => 'mqtt_ha', 'topic' => null];
+    return ['type' => 7, 'fields' => $fields, 'power' => $power];
+}
+
+/** Identische Darstellung für beide Detailansichten, ohne Schreib- oder Bedienelemente. */
+function e3dcRenderMqttHeatpump(array $contract): string {
+    $h = static function($text) { return htmlspecialchars((string)$text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); };
+    $labels = ['power_w' => ['Leistung', ' W'], 'electric_w' => ['Elektrische Leistung', ' W'],
+        'heat_kw' => ['Heizleistung', ' kW'], 'cop' => ['COP', ''], 'state' => ['Status', ''], 'mode' => ['Modus', ''],
+        'ww_temp' => ['Warmwasser Ist', ' °C'], 'ww_target_temp' => ['Warmwasser Soll', ' °C'],
+        'flow_temp' => ['Vorlauf', ' °C'], 'return_temp' => ['Rücklauf', ' °C'],
+        'outside_temp' => ['Außentemperatur', ' °C'], 'boost_active' => ['Boost', '']];
+    $html = '<section class="card mqtt-heatpump"><div class="card-body"><h2>MQTT-Wärmepumpe (nur Anzeige)</h2>'
+        . '<p>Steuerung weiter über SG-Ready/Shelly bzw. extern.</p><div class="table-responsive"><table class="table"><thead><tr><th>Wert</th><th>Messung</th><th>Alter</th><th>Herkunft / Hinweis</th></tr></thead><tbody>';
+    foreach ($labels as $key => [$label, $unit]) {
+        $field = $key === 'power_w' ? $contract['power'] : $contract['fields'][$key];
+        $v = $field['value'];
+        $text = $v === null ? 'unbekannt' : (is_bool($v) ? ($v ? 'Ein' : 'Aus') : ((is_int($v) || is_float($v)) ? number_format((float)$v, $key === 'cop' ? 2 : 1, ',', '.') : (string)$v) . $unit);
+        $age = $field['age_s'] === null ? 'unbekannt' : (string)(int)$field['age_s'] . ' s';
+        $hint = ($field['topic'] ?? 'MQTT: Heizleistung / elektrische Leistung') . ($field['reason'] ? ' · ' . $field['reason'] : '');
+        $html .= '<tr data-mqtt-field="' . $h($key) . '"><th>' . $h($label) . '</th><td data-mqtt-value>' . $h($text) . '</td><td data-mqtt-age>' . $h($age) . '</td><td data-mqtt-source>' . $h($hint) . '</td></tr>';
+    }
+    return $html . '</tbody></table></div></div></section>';
+}
+
+/** Nur Typ 7 projizieren; Bestandsprovider behalten ihren eigenen Vertrag. */
+function e3dcApplyMqttHeatpump(array &$data, array $cfg, ?int $now = null): void {
+    $c = e3dcMqttHeatpumpFields($cfg, '/var/www/html/ramdisk/mqtt_ha_inbound.json', $now);
+    $data['wp_mqtt'] = $c;
+    $power = $c['power'];
+    $data['wp'] = $power['value'];
+    $data['wp_power_valid'] = $power['valid'];
+    $data['wp_power_reason'] = $power['reason'];
+    $data['wp_source'] = 'mqtt_ha';
+    $data['wp_power_estimated'] = false;
+    $data['home_includes_wp'] = !$power['valid'];
+    $data['mqtt_wp_power_w'] = $power['value'];
+    $data['mqtt_wp_power_reason'] = $power['reason'];
+    $data['wp_power_binding'] = ['source' => 'mqtt_ha', 'valid' => $power['valid'], 'power_w' => $power['value'],
+        'topic' => $power['topic'], 'field_ts' => $power['ts'], 'file_ts' => $power['file_age_s'] !== null ? ($now ?? time()) - $power['file_age_s'] : null];
+    foreach (['electric_w'=>'wp_electric_w','heat_kw'=>'wp_heat_kw','ww_temp'=>'wp_ww_temp',
+        'ww_target_temp'=>'wp_ww_soll','flow_temp'=>'wp_vl_temp','return_temp'=>'wp_rl_temp',
+        'outside_temp'=>'wp_zuluft_temp','state'=>'wp_state_text','mode'=>'wp_mode_text',
+        'boost_active'=>'wp_boost_active','cop'=>'wp_cop'] as $key => $dest) $data[$dest] = $c['fields'][$key]['value'];
+    $data['wp_mode'] = null;
+    $data['wp_compressor_observation_valid'] = false;
+    $data['wp_live_source'] = 'mqtt_ha';
+    $data['wp_live_fresh'] = $power['valid'];
+    $data['Leistungsaufnahme'] = $data['wp_electric_w'] !== null ? $data['wp_electric_w'] / 1000 : null;
+    $data['Heizleistung Ist'] = $data['wp_heat_kw'];
+    $data['Außentemperatur'] = $data['wp_zuluft_temp'];
+}
+
+function e3dcMqttHeatpumpPowerValue($source, $cfg, $maxAgeSeconds = 180) {
+    if (!is_array($source)) return null;
+    $configured = trim((string)($cfg['wp_power_topic'] ?? ''));
+    $base = trim(trim((string)($cfg['mqtt_hub_topic'] ?? 'e3dc')), '/') ?: 'e3dc';
+    foreach ($configured !== '' ? ['power_w'] : ['power_w', 'electric_w'] as $key) {
+        $expected = $configured !== '' ? $configured : $base . '/in/heatpump/' . $key;
+        $origin = $source['_topics'][$key] ?? null;
+        // Alte Dateien ohne _topics bleiben nur bei leerer eigener Quelle zulässig.
+        if ($origin !== $expected && ($configured !== '' || $origin !== null)) continue;
+        $stamp = $source['_updated'][$key] ?? $source['ts'] ?? null;
+        if ($configured !== '' && $stamp === null) continue;
+        if ($stamp !== null && (time() - (int)$stamp) >= $maxAgeSeconds) continue;
+        $value = $source[$key] ?? null;
+        if (is_numeric($value) && is_finite((float)$value)) return max(0, (float)$value);
+    }
+    return null;
+}
+
 function hasFreshMqttHeatpumpInbound($cfg = null, $maxAgeSeconds = 180) {
     if (is_array($cfg) && !cfgBool($cfg['mqtt_ha_inbound_enable'] ?? '1', true)) {
         return false;
@@ -5891,7 +6128,9 @@ function hasFreshMqttHeatpumpInbound($cfg = null, $maxAgeSeconds = 180) {
         return false;
     }
 
-    foreach (['power_w', 'electric_w', 'ww_temp', 'ww_target_temp', 'flow_temp', 'return_temp', 'outside_temp', 'heat_kw', 'mode', 'boost_active'] as $key) {
+    if (e3dcMqttHeatpumpPowerValue($heatpump, $cfg, max(30, (int)$maxAgeSeconds)) !== null) return true;
+
+    foreach (['ww_temp', 'ww_target_temp', 'flow_temp', 'return_temp', 'outside_temp', 'heat_kw', 'mode', 'boost_active'] as $key) {
         if (array_key_exists($key, $heatpump) && $heatpump[$key] !== '' && $heatpump[$key] !== null) {
             return true;
         }
@@ -6499,6 +6738,138 @@ function e3dcInspectInstallerWrapper($wrapper) {
     return $result;
 }
 
+function e3dcServiceWrapperContract($repoDir) {
+    $path = '/etc/e3dc-control/module_installer_contract.json';
+    // Eltern von außen nach innen prüfen: Unlesbarkeit ist kein Altbestand.
+    $parents = [];
+    $parent = dirname($path);
+    while (true) {
+        $parents[] = $parent;
+        if ($parent === '/') break;
+        $parent = dirname($parent);
+    }
+    $parentState = [];
+    $parentKeys = ['dev', 'ino', 'mode', 'uid', 'gid'];
+    $parentsStable = static function () use (&$parentState, $parentKeys) {
+        foreach ($parentState as $directory => $before) {
+            clearstatcache(true, $directory);
+            $after = @lstat($directory);
+            foreach ($parentKeys as $key) {
+                if (!is_array($after) || $before[$key] !== $after[$key]) return false;
+            }
+        }
+        return true;
+    };
+    // PHP liefert zu lstat kein errno: Nur eine stabile, sichere und lesbare
+    // Elternkette plus fehlender Verzeichniseintrag belegt Abwesenheit.
+    $absenceStatus = static function ($candidate) use (&$parentState, $parentsStable) {
+        $directory = dirname($candidate);
+        if (!isset($parentState[$directory]) || !is_readable($directory)
+            || !is_executable($directory)) return 'contract_unreadable';
+        $entries = @scandir($directory);
+        if (!is_array($entries) || in_array(basename($candidate), $entries, true)) {
+            return 'contract_unreadable';
+        }
+        if (!$parentsStable()) return 'contract_read_drift';
+        // Abwesenheit erst am Ende bestätigen: Ein neuer Eintrag ändert die
+        // gebundenen Elternmetadaten nicht zwingend.
+        clearstatcache(true, $candidate);
+        $named = @lstat($candidate);
+        $entries = @scandir($directory);
+        if (!is_array($entries)) return 'contract_unreadable';
+        if ($named !== false || in_array(basename($candidate), $entries, true)) return 'present';
+        return 'missing';
+    };
+    foreach (array_reverse($parents) as $parent) {
+        clearstatcache(true, $parent);
+        $meta = @lstat($parent);
+        if ($meta === false) {
+            $status = $absenceStatus($parent);
+            if ($status !== 'present') return ['status' => $status];
+            clearstatcache(true, $parent);
+            $meta = @lstat($parent);
+            if ($meta === false) return ['status' => 'contract_unreadable'];
+        }
+        if (($meta['mode'] & 0170000) !== 0040000
+            || $meta['uid'] !== 0 || $meta['gid'] !== 0 || ($meta['mode'] & 0022) !== 0) {
+            return ['status' => 'contract_unsafe_path'];
+        }
+        if (!is_executable($parent)) return ['status' => 'contract_unreadable'];
+        $parentState[$parent] = $meta;
+    }
+    clearstatcache(true, $path);
+    $before = @lstat($path);
+    if ($before === false) {
+        $status = $absenceStatus($path);
+        if ($status !== 'present') return ['status' => $status];
+        clearstatcache(true, $path);
+        $before = @lstat($path);
+        if ($before === false) return ['status' => 'contract_unreadable'];
+    }
+    if (($before['mode'] & 0170000) !== 0100000 || $before['nlink'] !== 1
+        || $before['uid'] !== 0 || $before['gid'] !== 0 || ($before['mode'] & 07777) !== 0644
+        || $before['size'] <= 0 || $before['size'] > 1048576) {
+        return ['status' => 'contract_unsafe_file'];
+    }
+    $handle = @fopen($path, 'rb');
+    if ($handle === false) return ['status' => 'contract_unreadable'];
+    $opened = @fstat($handle);
+    $bytes = @stream_get_contents($handle, 1048577);
+    $after = @fstat($handle);
+    @fclose($handle);
+    clearstatcache(true, $path);
+    $named = @lstat($path);
+    foreach (['dev', 'ino', 'mode', 'nlink', 'uid', 'gid', 'size', 'mtime', 'ctime'] as $key) {
+        if (!is_array($opened) || !is_array($after) || !is_array($named)
+            || $before[$key] !== $opened[$key] || $opened[$key] !== $after[$key]
+            || $after[$key] !== $named[$key]) return ['status' => 'contract_read_drift'];
+    }
+    if (!$parentsStable()) return ['status' => 'contract_read_drift'];
+    $contract = is_string($bytes) && strlen($bytes) <= 1048576 ? json_decode($bytes, true) : null;
+    // Nach erfolgreicher Syntaxprüfung echte JSON-Token durchlaufen. String-
+    // Escapes und Unicode-Schlüssel werden mit dem JSON-Decoder aufgelöst;
+    // Satzzeichen in Stringwerten beeinflussen den Objektstapel nicht.
+    if (is_array($contract)) {
+        $objects = [];
+        $length = strlen($bytes);
+        for ($i = 0; $i < $length; $i++) {
+            $token = $bytes[$i];
+            if ($token === '"') {
+                $start = $i++;
+                while ($i < $length) {
+                    if ($bytes[$i] === '\\') { $i += 2; continue; }
+                    if ($bytes[$i] === '"') break;
+                    $i++;
+                }
+                $top = count($objects) - 1;
+                if ($top >= 0 && $objects[$top]['key']) {
+                    $key = "\0" . json_decode(substr($bytes, $start, $i - $start + 1));
+                    if (isset($objects[$top]['seen'][$key])) return ['status' => 'contract_invalid'];
+                    $objects[$top]['seen'][$key] = true;
+                    $objects[$top]['key'] = false;
+                }
+            } elseif ($token === '{' || $token === '[') {
+                $objects[] = ['object' => $token === '{', 'key' => $token === '{', 'seen' => []];
+            } elseif ($token === '}' || $token === ']') {
+                array_pop($objects);
+            } elseif ($token === ',' && count($objects) > 0) {
+                $top = count($objects) - 1;
+                $objects[$top]['key'] = $objects[$top]['object'];
+            }
+        }
+    }
+    if (!is_array($contract) || ($contract['schema'] ?? null) !== 'e3dc_module_installer_v1'
+        || !is_string($contract['commit'] ?? null) || !preg_match('/^[0-9a-f]{40}$/D', $contract['commit'])
+        || ($contract['install_root'] ?? null) !== $repoDir
+        || !is_array($contract['files'] ?? null)
+        || !is_string($contract['files']['Installer/service_wrapper.sh'] ?? null)
+        || !preg_match('/^[0-9a-f]{64}$/D', $contract['files']['Installer/service_wrapper.sh'])) {
+        return ['status' => 'contract_invalid'];
+    }
+    return ['status' => 'ok', 'sha256' => $contract['files']['Installer/service_wrapper.sh'],
+        'commit' => $contract['commit']];
+}
+
 function e3dcInspectServiceWrapper($wrapper) {
     $wrapper = (string)$wrapper;
     $result = [
@@ -6560,10 +6931,18 @@ function e3dcInspectServiceWrapper($wrapper) {
         return $result;
     }
 
-    $head = e3dcResolveGitObjectId($repoDir, 'HEAD^{commit}');
-    $blob = $head ? e3dcResolveGitObjectId($repoDir, $head . ':Installer/service_wrapper.sh') : null;
-    if ($head === null || $blob === null) {
-        $result['status'] = 'head_unbound';
+    $contract = e3dcServiceWrapperContract($repoDir);
+    $head = null;
+    $blob = null;
+    if ($contract['status'] === 'missing') {
+        $head = e3dcResolveGitObjectId($repoDir, 'HEAD^{commit}');
+        $blob = $head ? e3dcResolveGitObjectId($repoDir, $head . ':Installer/service_wrapper.sh') : null;
+        if ($head === null || $blob === null) {
+            $result['status'] = 'head_unbound';
+            return $result;
+        }
+    } elseif ($contract['status'] !== 'ok') {
+        $result['status'] = $contract['status'];
         return $result;
     }
 
@@ -6576,6 +6955,7 @@ function e3dcInspectServiceWrapper($wrapper) {
     $actual = (string)@stream_get_contents($handle);
     $openedAfter = @fstat($handle);
     @fclose($handle);
+    clearstatcache(true, $wrapper);
     $pathAfter = @lstat($wrapper);
     foreach (['dev', 'ino', 'mode', 'nlink', 'uid', 'gid', 'size', 'mtime', 'ctime'] as $key) {
         if (!is_array($openedBefore)
@@ -6590,16 +6970,20 @@ function e3dcInspectServiceWrapper($wrapper) {
     }
 
     $actualBlob = sha1('blob ' . strlen($actual) . "\0" . $actual);
-    if (!hash_equals($blob, $actualBlob)
+    $digestMatches = $contract['status'] === 'ok'
+        ? hash_equals($contract['sha256'], hash('sha256', $actual))
+        : hash_equals($blob, $actualBlob);
+    if (!$digestMatches
         || substr($actual, 0, 12) !== "#!/bin/bash\n"
         || strpos($actual, "\r") !== false) {
-        $result['status'] = 'content_drift';
+        $result['status'] = $contract['status'] === 'ok' ? 'contract_content_drift' : 'content_drift';
         return $result;
     }
 
     $result['ok'] = true;
     $result['status'] = 'ok';
     $result['head'] = $head;
+    $result['contract_commit'] = $contract['commit'] ?? null;
     $result['actual_sha256'] = hash('sha256', $actual);
     $result['dev'] = (int)$metadata['dev'];
     $result['ino'] = (int)$metadata['ino'];
@@ -7500,15 +7884,27 @@ function e3dcSystemdServiceStatus($service) {
     return $status !== '' ? $status : 'unknown';
 }
 
-function e3dcFindServiceWrapper() {
+function e3dcFindServiceWrapper(&$status = null) {
     $wrapperCandidates = ['/usr/local/sbin/e3dc-service-control'];
     foreach ($wrapperCandidates as $candidate) {
         $inspection = e3dcInspectServiceWrapper($candidate);
+        $status = (string)($inspection['status'] ?? 'unknown');
+        if (empty($inspection['ok'])) error_log('Service-Wrapper gesperrt: ' . $status);
         if (!empty($inspection['ok'])) {
             return $candidate;
         }
     }
     return null;
+}
+
+function e3dcServiceWrapperFailureMessage($status) {
+    if (in_array($status, ['content_drift', 'contract_content_drift', 'head_unbound'], true)) {
+        return 'Service-Wrapper passt nicht zum installierten Release. „System reparieren (Backup + Stable-Abgleich)“ ausführen.';
+    }
+    if (str_starts_with((string)$status, 'contract_')) {
+        return 'Root-eigener Modul-Vertrag fehlt oder ist ungültig. „System reparieren (Backup + Stable-Abgleich)“ ausführen.';
+    }
+    return 'Service-Wrapper fehlt oder ist nicht sicher prüfbar. „System reparieren (Backup + Stable-Abgleich)“ ausführen.';
 }
 
 function e3dcDockerMatterResetGuardReady() {
@@ -7950,13 +8346,14 @@ function e3dcRunServiceWrapperAction($action, array $services) {
         ];
     }
 
-    $serviceWrapper = e3dcFindServiceWrapper();
+    $serviceWrapper = e3dcFindServiceWrapper($wrapperStatus);
     if (!$serviceWrapper) {
         return [
             'success' => false,
             'changed' => [],
             'ignored' => [],
-            'errors' => ['Service-Wrapper nicht gefunden. Bitte Rechte-Reparatur ausführen.'],
+            'errors' => [e3dcServiceWrapperFailureMessage($wrapperStatus)],
+            'reason_code' => $wrapperStatus,
         ];
     }
 
@@ -8001,7 +8398,7 @@ function e3dcRunServiceWrapperAction($action, array $services) {
             $ignored[] = $service;
         } else {
             $detail = $text !== '' ? $text : (string)($process['error'] ?? 'unbekannter Fehler');
-            if (!empty($process['timed_out'])) $detail = 'Timeout: ' . $detail;
+            if (!empty($process['timed_out'])) $detail = 'Zeitüberschreitung: ' . $detail;
             if ((int)($process['signal'] ?? 0) > 0) $detail = 'Signal ' . (int)$process['signal'] . ': ' . $detail;
             $errors[] = $service . ' (rc=' . $code . '): ' . $detail;
         }
@@ -8554,12 +8951,13 @@ function handleServiceRestart() {
         $serviceWrapper = null;
         if (!file_exists('/.dockerenv')) {
             // Vor jeder Zustandsänderung an Release-Root, Owner, Mode, Inode
-            // und Git-HEAD binden.
-            $serviceWrapper = e3dcFindServiceWrapper();
+            // und den root-eigenen Modul-Vertrag binden.
+            $serviceWrapper = e3dcFindServiceWrapper($wrapperStatus);
             if (!$serviceWrapper) {
                 echo json_encode([
                     'success' => false,
-                    'message' => 'Service-Wrapper nicht gefunden. Bitte Rechte-Reparatur ausführen.'
+                    'message' => e3dcServiceWrapperFailureMessage($wrapperStatus),
+                    'reason_code' => $wrapperStatus
                 ]);
                 exit;
             }
@@ -8763,17 +9161,19 @@ function handleServiceRestart() {
             $restarted = $restartResult['changed'] ?? [];
             $ignored = $restartResult['ignored'] ?? [];
             $errors = $restartResult['errors'] ?? [];
+            $flags = 0;
+            if (defined('JSON_INVALID_UTF8_SUBSTITUTE')) $flags |= JSON_INVALID_UTF8_SUBSTITUTE;
 
             if (!$errors) {
                 echo json_encode([
                     'success' => true,
                     'message' => 'Dienste neu gestartet: ' . implode(', ', $restarted)
-                ]);
+                ], $flags);
             } else {
                 echo json_encode([
                     'success' => false,
                     'message' => "Fehler beim Neustart:\n" . implode("\n", $errors)
-                ]);
+                ], $flags);
             }
         }
         exit;
@@ -11103,10 +11503,166 @@ function e3dcReconcileDailyEnergyFlows(&$stats, $homeEnergy) {
     }
 }
 
+/** Tagesaufteilung aus der Messhistorie, niemals aus der alten Gesamtsumme. */
+function e3dcClimateDailyBreakdown($day, $options = []) {
+    $rows = [];
+    $now = (float)($options['now'] ?? time());
+    $path = '/var/www/html/data/climate_history/' . $day . '.jsonl';
+    try { $lines = is_readable($path) ? (@file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: []) : []; }
+    catch (Throwable $error) { $lines = []; }
+    foreach ($lines as $line) {
+        $row = json_decode($line, true);
+        if (is_array($row) && substr((string)($row['ts'] ?? ''), 0, 10) === $day) $rows[] = $row;
+    }
+    $livePath = '/var/www/html/ramdisk/climate_load.json';
+    try { $live = is_readable($livePath) ? @json_decode((string)@file_get_contents($livePath), true) : null; }
+    catch (Throwable $error) { $live = null; }
+    if (is_array($live) && substr((string)($live['ts_iso'] ?? ''), 0, 10) === $day) {
+        $live['_live_age'] = $now - (float)($live['ts'] ?? 0);
+        $live['ts_epoch'] = $live['ts'] ?? null;
+        $live['ts'] = $live['ts_iso'];
+        $live['meter_samples'] = is_array($live['meters'] ?? null) ? $live['meters'] : [$live];
+        $rows[] = $live;
+    }
+    // Neue Zeilen nach dem tatsächlichen Zeitpunkt ordnen. Althistorien ohne
+    // Epoch behalten die bestätigte Erzeugerreihenfolge, auch bei Winterzeit.
+    $anchored = !empty($rows);
+    foreach ($rows as $row) $anchored = $anchored && is_numeric($row['ts_epoch'] ?? null);
+    if ($anchored) usort($rows, static fn($a, $b) => (float)$a['ts_epoch'] <=> (float)$b['ts_epoch']);
+    $end = min($now, (float)strtotime($day . ' +1 day'));
+    $meters = [];
+    $seen = [];
+    $lastHistoryEpoch = null;
+    foreach ($rows as $row) {
+        $epoch = is_numeric($row['ts_epoch'] ?? null) ? (float)$row['ts_epoch'] : strtotime((string)$row['ts']);
+        if ($epoch === false || $epoch > $end) continue;
+        if (isset($row['_live_age']) && $lastHistoryEpoch !== null && $epoch < $lastHistoryEpoch) continue;
+        if (!isset($row['_live_age'])) $lastHistoryEpoch = $epoch;
+        $samples = $row['meter_samples'] ?? $row['meters'] ?? [];
+        // Fehlende Metadaten alter Zeilen sind kein Beleg einer Entfernung.
+        $configurationKnown = array_key_exists('meter_samples', $row) || array_key_exists('meters', $row);
+        if (!is_array($samples)) continue;
+        $present = [];
+        foreach ($samples as $index => $m) {
+            if (!is_array($m) || empty($m['ip']) || empty($m['phase']) || ($m['source'] ?? '') === 'disabled') continue;
+            // Zähleradresse und Messkanal bilden die Identität, der Anzeigename gehört nicht dazu.
+            $id = hash('sha256', strtolower(trim($m['ip'])) . ':' . $m['phase']);
+            $present[$id] = true;
+            $value = $m['daily_kwh'] ?? null;
+            $valid = is_numeric($value) && is_finite((float)$value) && (float)$value >= 0
+                && ($m['energy_valid'] ?? !empty($m['online'])) && empty($m['daily_baseline_error'])
+                && (!isset($row['_live_age']) || ($row['_live_age'] >= 0 && $row['_live_age'] <= 120))
+                && (empty($m['energy_date']) || $m['energy_date'] === $day);
+            if (!isset($meters[$id])) {
+                $meters[$id] = ['identity' => $id, 'slot' => $index + 1, 'name' => (string)($m['name'] ?? ('Anlage ' . ($index + 1))),
+                    'daily_kwh' => null, 'reason' => '', 'complete' => true, 'first_ts' => $row['ts'], 'last_ts' => $row['ts']];
+                // Ein angebrochener Messtag ist eine bekannte Teilmenge, kein vollständiger Tageswert.
+                if (substr($row['ts'], 11, 8) > '00:02:00') $meters[$id]['reason'] = 'partial_day';
+            }
+            $entry =& $meters[$id];
+            $baseline = $m['energy_baseline_kwh'] ?? null;
+            if ($valid && isset($seen[$id]) && ((float)$value + 0.001 < $seen[$id]['value']
+                || (is_numeric($baseline) && is_numeric($seen[$id]['baseline']) && abs((float)$baseline - $seen[$id]['baseline']) > 0.001))) {
+                $entry['reason'] = 'counter_reset';
+            }
+            if (!empty($entry['removed'])) $entry['reason'] = 'interrupted_day';
+            $entry['name'] = (string)($m['name'] ?? $entry['name']);
+            $entry['slot'] = $index + 1;
+            $entry['last_ts'] = $row['ts'];
+            $entry['_last_epoch'] = $epoch;
+            $broken = in_array($entry['reason'], ['counter_reset', 'removed_midday', 'interrupted_day'], true);
+            $entry['daily_kwh'] = $valid && !$broken ? (float)$value : null;
+            if (!$valid && !$broken) $entry['reason'] = isset($row['_live_age']) && $row['_live_age'] > 120 ? 'stale' : ((string)($m['energy_reason'] ?? '') ?: 'energy_missing');
+            elseif ($valid && !$broken && !in_array($entry['reason'], ['partial_day'], true)) {
+                $entry['reason'] = substr($entry['first_ts'], 11, 8) > '00:02:00' ? 'partial_day' : '';
+            }
+            $entry['complete'] = $entry['daily_kwh'] !== null && $entry['reason'] === '';
+            if ($valid) $seen[$id] = ['value' => (float)$value, 'baseline' => $baseline];
+            unset($entry);
+        }
+        foreach ($meters as $id => &$entry) {
+            if (!isset($present[$id]) && $configurationKnown) {
+                $entry['removed'] = true;
+                $entry['daily_kwh'] = null;
+                $entry['complete'] = false;
+                $entry['reason'] = 'removed_midday';
+            }
+        }
+        unset($entry);
+    }
+    foreach ($meters as &$entry) {
+        // Ein bestätigter Teilstand ist keine Bestätigung des aktuellen bzw.
+        // abschließenden Tagesstands. Die bekannte Teilenergie bleibt erhalten.
+        $age = $end - (float)($entry['_last_epoch'] ?? 0);
+        if ($entry['daily_kwh'] !== null && ($age < 0 || $age > 120)) {
+            $entry['complete'] = false;
+            $entry['reason'] = 'end_missing';
+        }
+        unset($entry['_last_epoch']);
+    }
+    unset($entry);
+    return array_values($meters);
+}
+
+/** Monate und Jahre ausschließlich aus der dauerhaften Tagesablage bilden. */
+function e3dcClimateStatsBreakdown($db, $period, $length) {
+    if (!in_array($length, [4, 7, 10], true)) return [];
+    try {
+        $stmt = $db->prepare('SELECT date, climate_meters FROM daily_stats WHERE substr(date, 1, ?) = ? ORDER BY date');
+        $stmt->execute([$length, $period]);
+        $days = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    } catch (Exception $e) { return []; } // Alte DB bis zum ersten Archiver-Zyklus lesbar.
+    $decodeDay = static function($day) {
+        $entries = json_decode($day['climate_meters'] ?? 'null', true) ?: [];
+        // Eine laufend bestätigte Messung ist erst nach dem Abschlussbeleg ein
+        // vollständiger vergangener Tag; auch ältere gespeicherte Teilstände.
+        if (($day['date'] ?? '') < date('Y-m-d')) {
+            foreach ($entries as &$entry) {
+                if (empty($entry['day_closed'])) {
+                    $entry['complete'] = false;
+                    if (empty($entry['reason'])) $entry['reason'] = 'end_missing';
+                }
+            }
+            unset($entry);
+        }
+        return $entries;
+    };
+    if ($length === 10) return $decodeDay($days[0] ?? []);
+    $result = [];
+    foreach ($days as $day) {
+        foreach ($decodeDay($day) as $m) {
+            if (!is_array($m) || empty($m['identity'])) continue;
+            $id = $m['identity'];
+            if (!isset($result[$id])) $result[$id] = $m + ['recorded_days' => 0];
+            else {
+                $entry =& $result[$id];
+                $entry['daily_kwh'] = $entry['daily_kwh'] !== null && ($m['daily_kwh'] ?? null) !== null
+                    ? $entry['daily_kwh'] + $m['daily_kwh'] : null;
+                $entry['complete'] = $entry['complete'] && !empty($m['complete']);
+                if (!empty($m['reason'])) $entry['reason'] = $m['reason'];
+                $entry['name'] = $m['name'];
+                $entry['last_ts'] = $m['last_ts'];
+                unset($entry);
+            }
+            $result[$id]['recorded_days']++;
+        }
+    }
+    foreach ($result as &$m) {
+        if ($m['recorded_days'] < count($days)) {
+            $m['complete'] = false;
+            if (empty($m['reason']) || $m['reason'] === 'end_missing') $m['reason'] = 'partial_period';
+        }
+    }
+    unset($m);
+    return array_values($result);
+}
+
 function calculateDailyEnergyStats($historyLines, $options = []) {
     $lastTs = null;
     $lastRow = null;
     $activeDate = null;
+    $unknownWallbox = false;
+    $unknownWallboxReasons = [];
 
     // Wir lesen das Datum aus dem aktuellsten Eintrag (ganz unten),
     // damit bei der 48h-Historie der heutige Tag gewertet wird.
@@ -11143,6 +11699,12 @@ function calculateDailyEnergyStats($historyLines, $options = []) {
         $d = json_decode($ln, true);
         if (!$d || !isset($d['ts']) || strpos($d['ts'], $activeDate) !== 0) continue;
 
+        if (!empty($d['house_includes_unknown_wallbox'])) {
+            $unknownWallbox = true;
+            foreach (($d['house_unknown_wallbox_reasons'] ?? []) as $reason) {
+                if (is_string($reason)) $unknownWallboxReasons[$reason] = true;
+            }
+        }
         $ts = strtotime($d['ts']);
         if ($lastTs !== null) {
             $dt = $ts - $lastTs; // in Sekunden
@@ -11647,6 +12209,9 @@ function calculateDailyEnergyStats($historyLines, $options = []) {
             $res['sources']["{$k}_midnight_baseline_kwh"] = round((float)$baseline, 3);
         }
     }
+    $res['house_includes_unknown_wallbox'] = $unknownWallbox;
+    $res['house_unknown_wallbox_reasons'] = array_keys($unknownWallboxReasons);
+    $res['house_consumption_label'] = $unknownWallbox ? 'Haus inkl. Wallbox (unbekannt)' : 'Hausverbrauch';
     $res['sources']['home_energy_source'] = $homeReason;
     $res['sources']['home_includes_unmeasured_consumers'] = [];
     foreach (['home' => $cleanExactHome] + array_intersect_key($balance['values'], array_flip(['wb', 'wb2', 'wp', 'climate'])) as $key => $energy) {
@@ -11696,6 +12261,8 @@ function calculateDailyEnergyStats($historyLines, $options = []) {
             $res['stats'][$field] = $cleanExactHome === null ? null : $stats[$field];
         }
     }
+    // Kostenintervalle brauchen ausschließlich die bestehende Summenbilanz.
+    if (empty($options['unrounded_energy'])) $res['climate_meters'] = e3dcClimateDailyBreakdown($activeDate, $options);
     return $res;
 }
 
@@ -12104,4 +12671,238 @@ function renderFooterVersion() {
     return '';
 }
 
-?>
+// Anzeigevertrag: nur prüfen und durchreichen; keine Marktentscheidung und
+// keine Energieintegration. Der Ist-Abgleich interpoliert vorhandene Punkte.
+function e3dcMarketSocTrajectoryForDisplay($plan, $live, $nowMs = null) {
+    $nowMs = $nowMs ?? microtime(true) * 1000.0;
+    $plan = is_array($plan) ? $plan : [];
+    $t = is_array($plan['market_soc_trajectory'] ?? null) ? $plan['market_soc_trajectory'] : [];
+    $fallback = [
+        'schema_version' => 'market_soc_trajectory_v1', 'complete' => false,
+        'reason_code' => 'market_plan_unavailable', 'plan_id' => $plan['plan_id'] ?? null,
+        'source' => 'storage_simulator:selected_market_contract',
+        'commands_allowed' => false, 'slots' => [], 'selected_actions' => [],
+    ];
+    $fail = function($reason) use ($fallback) { $fallback['reason_code'] = $reason; return $fallback; };
+    $finite = function($v) { return (is_int($v) || is_float($v)) && is_finite((float)$v); };
+    if (!empty($plan['direct_marketing']['enabled']) || !empty($plan['direct_marketing']['active'])
+        || in_array($plan['direct_marketing']['mode'] ?? null, ['safe', 'eco', 'eco_plus', 'arbitrage'], true)
+        || !empty($plan['direct_marketing_enabled']) || !empty($live['direct_marketing_enabled'])) return $fail('dv_active');
+    if (($t['schema_version'] ?? null) !== 'market_soc_trajectory_v1') return $fallback;
+    if (($plan['schema_version'] ?? null) !== 'storage_dispatch_plan_v1') return $fail('market_plan_binding_invalid');
+    if (($t['complete'] ?? null) !== true) {
+        $reason = $t['reason_code'] ?? 'market_plan_unavailable';
+        // Nur den Aktionsmangel umbegründen; Datenfehler behalten ihren Vorrang.
+        if ($reason === 'no_market_actions'
+            && (!empty($plan['cheap_grid_charge']['active']) || !empty($plan['storm_grid_charge']['active']))) {
+            $reason = 'storage_override_active';
+        }
+        return $fail($reason);
+    }
+    if (($t['plan_id'] ?? null) !== ($plan['plan_id'] ?? null)
+        || !preg_match('/^sha256:[a-f0-9]{64}$/D', (string)($t['plan_id'] ?? ''))
+        || ($t['commands_allowed'] ?? null) !== false) return $fail('market_plan_binding_invalid');
+    $numberKeys = ['valid_from_ts_ms', 'valid_until_ts_ms', 'integration_start_ts_ms', 'horizon_end_ts_ms',
+        'anchor_ts_ms', 'anchor_soc_pct', 'battery_capacity_wh', 'reserve_soc_pct', 'charge_efficiency', 'max_charge_w', 'max_discharge_w'];
+    foreach ($numberKeys as $key) if (!$finite($t[$key] ?? null)) return $fail('market_projection_input_invalid');
+    foreach (['valid_from_ts_ms', 'valid_until_ts_ms', 'horizon_end_ts_ms'] as $key)
+        if (($t[$key] ?? null) != ($plan[$key] ?? null)) return $fail('market_plan_binding_invalid');
+    if (($t['valid_from'] ?? null) !== ($plan['valid_from'] ?? null)
+        || ($t['valid_until'] ?? null) !== ($plan['valid_until'] ?? null)
+        || strtotime($t['valid_from']) * 1000 != $t['valid_from_ts_ms']
+        || strtotime($t['valid_until']) * 1000 != $t['valid_until_ts_ms']) return $fail('market_plan_binding_invalid');
+    if ($nowMs < $t['valid_from_ts_ms'] || $nowMs >= $t['valid_until_ts_ms']) return $fail('market_plan_expired');
+    if (!$finite($plan['generated_at_ts_ms'] ?? null)
+        || $nowMs - $plan['generated_at_ts_ms'] > 900000 || $plan['generated_at_ts_ms'] > $nowMs + 1000) return $fail('market_plan_stale');
+    $capacity = $t['battery_capacity_wh']; $reserve = $t['reserve_soc_pct']; $eta = $t['charge_efficiency'];
+    if ($capacity <= 0 || $reserve < 0 || $reserve > 100 || $eta <= 0 || $eta > 1
+        || min($t['max_charge_w'], $t['max_discharge_w']) < 0
+        || $capacity != ($plan['battery_capacity'] ?? null) || $reserve != ($plan['physical_reserve_soc'] ?? null)
+        || $t['max_charge_w'] != ($plan['max_charge_w'] ?? null) || $t['max_discharge_w'] != ($plan['max_discharge_w'] ?? null)
+        || !$finite($plan['simulation_start_ts_ms'] ?? null) || $t['integration_start_ts_ms'] != floor($plan['simulation_start_ts_ms'])
+        || abs($t['anchor_soc_pct'] - ($plan['current_soc'] ?? -1000)) > 0.001
+        || $t['anchor_ts_ms'] > $t['integration_start_ts_ms']
+        || $t['anchor_ts_ms'] < $t['integration_start_ts_ms'] - 300000) return $fail('market_projection_limits_invalid');
+    $market = $plan['market_plan'] ?? null;
+    if (!is_array($market)) return $fail('market_contract_invalid');
+    if (($market['enabled'] ?? null) !== true) return $fail('plan_disabled');
+    if (($market['commands_allowed'] ?? null) !== true) return $fail('commands_not_allowed');
+    if (($market['controller_owner'] ?? null) !== 'storage_manager') return $fail('controller_owner_mismatch');
+    if (!is_string($market['plan_owner'] ?? null)
+        || strpos($market['plan_owner'], 'market_economics:') !== 0) return $fail('plan_owner_mismatch');
+    if (!$finite($market['owner_contract_version'] ?? null)
+        || $market['owner_contract_version'] != 1) return $fail('contract_version_mismatch');
+    // PLAN_STALE_GRACE_MS / OWNER_CONTRACT_VERSION aus market_economics.py:
+    // 20 s nur für den Plan; das end_ts des aktiven Vertrags bleibt strikt.
+    if (!$finite($market['valid_until_ts'] ?? null) || $market['valid_until_ts'] <= 0
+        || $market['valid_until_ts'] + 20000 < $nowMs) return $fail('plan_expired');
+    $contract = $market['active_contract'] ?? null;
+    if (!is_array($contract) || !is_array($contract['released_consumers'] ?? null)) return $fail('market_contract_invalid');
+    if ($contract['released_consumers'] && array_keys($contract['released_consumers'])
+        !== range(0, count($contract['released_consumers']) - 1)) return $fail('market_contract_invalid');
+    foreach ($contract['released_consumers'] as $consumer)
+        if (!is_string($consumer)) return $fail('market_contract_invalid');
+    foreach ([[$market, ['consumer_policy', 'economics']], [$contract, ['forecast']]] as $entry)
+        foreach ($entry[1] as $key)
+            if (array_key_exists($key, $entry[0]) && !is_array($entry[0][$key])) return $fail('market_contract_invalid');
+    $forecast = $contract['forecast'] ?? [];
+    foreach (['price_action_contracts', 'grid_charge_job', 'late_fill'] as $key)
+        if (array_key_exists($key, $forecast) && !is_array($forecast[$key])) return $fail('market_contract_invalid');
+    foreach ($forecast['price_action_contracts'] ?? [] as $value)
+        if (!is_array($value)) return $fail('market_contract_invalid');
+    $late = $forecast['late_fill'] ?? [];
+    foreach (['active', 'wait_active'] as $key)
+        if (array_key_exists($key, $late) && !is_bool($late[$key])) return $fail('market_contract_invalid');
+    foreach ([$market['created_ts'] ?? null, $contract['start_ts'] ?? null, $contract['end_ts'] ?? null] as $v)
+        if (!$finite($v)) return $fail('market_contract_invalid');
+    if ($nowMs < $contract['start_ts'] || $nowMs >= $contract['end_ts']) return $fail('market_contract_inactive');
+    $sourceAction = $contract['action'] ?? null;
+    if (($market['active'] ?? null) !== true
+        || !in_array('storage', $contract['released_consumers'], true)
+        || !in_array($sourceAction, ['hold_discharge', 'grid_charge'], true)
+        || ($contract['forecast']['price_action_contracts'][$sourceAction]['complete'] ?? null) !== true) return $fail('market_contract_invalid');
+    $policyKey = $sourceAction === 'hold_discharge' ? 'storage_hold' : 'storage_grid_charge';
+    if (($market['consumer_policy'][$policyKey] ?? null) !== true) return $fail('market_action_disabled');
+    if (!empty($plan['cheap_grid_charge']['active']) || !empty($plan['storm_grid_charge']['active'])) return $fail('storage_override_active');
+    foreach ([$market['created_ts'] ?? null, $contract['start_ts'] ?? null, $contract['end_ts'] ?? null] as $v)
+        if (!$finite($v)) return $fail('market_contract_invalid');
+    $identity = [$t['plan_id'], $sourceAction, sprintf('%.6F', $market['created_ts']),
+        sprintf('%.6F', $contract['start_ts']), sprintf('%.6F', $contract['end_ts'])];
+    $contractId = 'sha256:' . hash('sha256', implode('|', $identity));
+    $selected = $t['selected_actions'] ?? null;
+    if (!is_array($selected) || !$selected || count($selected) > 2) return $fail('market_selection_invalid');
+    $job = $forecast['grid_charge_job'] ?? [];
+    if ($sourceAction === 'grid_charge') {
+        foreach ([$job['window_end_ts'] ?? null, $market['economics']['roundtrip_efficiency_pct'] ?? null,
+                $forecast['grid_charge_target_soc_pct'] ?? null] as $v)
+            if (!$finite($v)) return $fail('market_contract_invalid');
+        if ($forecast['grid_charge_target_soc_pct'] < $t['anchor_soc_pct']
+            || $forecast['grid_charge_target_soc_pct'] > 100) return $fail('market_contract_invalid');
+    }
+    if (!empty($late['active']) && !empty($late['wait_active'])
+        && !$finite($late['latest_start_ts'] ?? null)) return $fail('market_contract_invalid');
+    $late = $contract['forecast']['late_fill'] ?? [];
+    $expectedOrigins = $sourceAction === 'hold_discharge' ? ['hold_discharge']
+        : (!empty($late['active']) && !empty($late['wait_active']) ? ['selected_grid_wait', 'grid_charge'] : ['grid_charge']);
+    if (array_column($selected, 'origin') !== $expectedOrigins) return $fail('market_selection_invalid');
+    if ($sourceAction === 'grid_charge' && (($job['active'] ?? null) !== true
+        || ($contract['forecast']['grid_charge_job_basis'] ?? null) !== 'executable'
+        || !$finite($job['planned_charge_w'] ?? null) || $job['planned_charge_w'] < 300
+        || !$finite($job['job_grid_wh'] ?? null) || $job['job_grid_wh'] <= 0
+        || abs($eta * 100 - ($market['economics']['roundtrip_efficiency_pct'] ?? -100)) > 0.001)) return $fail('grid_charge_not_selected');
+    foreach ($selected as $a) {
+        foreach (['start_ts_ms', 'end_ts_ms', 'power_w'] as $key) if (!$finite($a[$key] ?? null)) return $fail('market_selection_invalid');
+        if (($a['contract_id'] ?? null) !== $contractId
+            || $a['start_ts_ms'] < max($t['integration_start_ts_ms'], $contract['start_ts'] ?? PHP_INT_MAX)
+            || $a['end_ts_ms'] > ($contract['end_ts'] ?? 0) || $a['start_ts_ms'] >= $a['end_ts_ms']) return $fail('market_selection_invalid');
+        if (($a['action'] ?? null) === 'grid_charge') {
+            $expectedStart = max($t['integration_start_ts_ms'], $contract['start_ts'],
+                !empty($late['active']) && !empty($late['wait_active']) ? ($late['latest_start_ts'] ?? PHP_INT_MAX) : 0);
+            if ($sourceAction !== 'grid_charge' || ($a['origin'] ?? null) !== 'grid_charge'
+                || $a['start_ts_ms'] != $expectedStart || $a['power_w'] != $job['planned_charge_w']
+                || $a['end_ts_ms'] != min($contract['end_ts'], $job['window_end_ts'] ?? 0)) return $fail('market_selection_invalid');
+        } elseif (($a['action'] ?? null) === 'hold_economic') {
+            if (($market['consumer_policy']['storage_hold'] ?? null) !== true || $a['power_w'] != 0) return $fail('market_selection_invalid');
+            $holdEnd = $sourceAction === 'hold_discharge' ? $contract['end_ts'] : ($late['latest_start_ts'] ?? 0);
+            if (($a['origin'] ?? null) !== ($sourceAction === 'hold_discharge' ? 'hold_discharge' : 'selected_grid_wait')
+                || ($sourceAction === 'grid_charge' && (empty($late['active']) || empty($late['wait_active'])))
+                || $a['start_ts_ms'] != max($t['integration_start_ts_ms'], $contract['start_ts'])
+                || $a['end_ts_ms'] != $holdEnd) return $fail('market_selection_invalid');
+        } else return $fail('market_selection_invalid');
+    }
+    $baseSlots = [];
+    if (!is_array($plan['slots'] ?? null)) return $fail('market_projection_slot_id_invalid');
+    foreach ($plan['slots'] as $s) {
+        if (!is_array($s) || !is_string($s['slot_id'] ?? null) || $s['slot_id'] === '')
+            return $fail('market_projection_slot_id_invalid');
+        $baseSlots[$s['slot_id']] = $s;
+    }
+    $slots = $t['slots'] ?? null;
+    if (!is_array($slots) || !$slots || count($slots) > 600) return $fail('market_projection_endpoint_missing');
+    $material = [$t['plan_id']];
+    foreach ($numberKeys as $key) $material[] = sprintf('%.6F', $t[$key]);
+    $expected = $t['integration_start_ts_ms']; $previousSoc = $t['anchor_soc_pct']; $gridWh = 0.0;
+    foreach ($slots as $s) {
+        if (!is_array($s) || !is_string($s['slot_id'] ?? null) || $s['slot_id'] === '')
+            return $fail('market_projection_slot_id_invalid');
+        foreach (['start_ts_ms', 'end_ts_ms', 'soc_start_pct', 'soc_end_pct', 'power_w', 'grid_charge_w', 'base_power_w', 'reserve_soc_pct'] as $key)
+            if (!$finite($s[$key] ?? null)) return $fail('market_projection_input_invalid');
+        $base = $baseSlots[$s['slot_id']] ?? null;
+        if (!$base || $s['start_ts_ms'] < $base['start_ts_ms'] || $s['end_ts_ms'] > $base['end_ts_ms']
+            || $s['start_ts_ms'] !== $expected || $s['end_ts_ms'] <= $s['start_ts_ms']
+            || abs($s['soc_start_pct'] - $previousSoc) > 0.001) return $fail('market_projection_continuity_invalid');
+        if ($s['reserve_soc_pct'] != $reserve || min($s['soc_start_pct'], $s['soc_end_pct']) < $reserve - 0.001
+            || max($s['soc_start_pct'], $s['soc_end_pct']) > 100.001) return $fail('market_projection_reserve_invalid');
+        $hours = ($s['end_ts_ms'] - $s['start_ts_ms']) / 3600000.0;
+        if (abs(($s['soc_end_pct'] - $s['soc_start_pct']) * $capacity / 100 - $s['power_w'] * $hours) > 0.01
+            || $s['power_w'] > $t['max_charge_w'] + 0.01 || $s['power_w'] < -$t['max_discharge_w'] - 0.01
+            || $s['grid_charge_w'] < 0 || $s['grid_charge_w'] > $t['max_charge_w'] + 0.01) return $fail('market_projection_physics_invalid');
+        $chosen = null;
+        foreach ($selected as $a) if ($a['start_ts_ms'] <= $s['start_ts_ms'] && $s['start_ts_ms'] < $a['end_ts_ms']) $chosen = $a;
+        if (($s['action'] ?? null) !== ($chosen['action'] ?? 'none')
+            || ($s['origin'] ?? null) !== ($chosen['origin'] ?? 'baseline')
+            || ($s['contract_id'] ?? null) !== ($chosen['contract_id'] ?? null)
+            || ($chosen && $s['end_ts_ms'] > $chosen['end_ts_ms'])
+            || ($s['action'] === 'hold_economic' && ($s['power_w'] < -0.01 || $s['grid_charge_w'] != 0))
+            || ($s['action'] !== 'grid_charge' && $s['grid_charge_w'] != 0)
+            || ($s['action'] === 'grid_charge' && ($s['grid_charge_w'] > $chosen['power_w'] + 0.01
+                || $s['power_w'] + 0.01 < $s['grid_charge_w'] * $eta))) return $fail('market_projection_action_invalid');
+        $gridWh += $s['grid_charge_w'] * $hours;
+        foreach (['slot_id', 'action', 'origin', 'contract_id'] as $key) $material[] = (string)($s[$key] ?? '');
+        foreach (['start_ts_ms', 'end_ts_ms', 'soc_start_pct', 'soc_end_pct', 'power_w', 'grid_charge_w', 'base_power_w', 'reserve_soc_pct'] as $key)
+            $material[] = sprintf('%.6F', $s[$key]);
+        $expected = $s['end_ts_ms']; $previousSoc = $s['soc_end_pct'];
+    }
+    if ($expected != $t['horizon_end_ts_ms']) return $fail('market_projection_endpoint_missing');
+    if ($sourceAction === 'grid_charge' && $gridWh > $job['job_grid_wh'] + 0.01) return $fail('market_projection_energy_invalid');
+    if (($t['trajectory_revision'] ?? null) !== 'sha256:' . hash('sha256', implode('|', $material))) return $fail('market_projection_revision_invalid');
+    if (!is_array($live)) return $fail('live_soc_missing');
+    $soc = array_key_exists('SOC', $live) ? $live['SOC'] : ($live['soc'] ?? null);
+    if ($soc === null) return $fail('live_soc_missing');
+    if (!$finite($soc)) return $fail('live_soc_invalid');
+    if ($soc < 0 || $soc > 100 || ($live['RSCP_Sample_Valid'] ?? true) === false) return $fail('live_soc_invalid');
+    if (!$finite($live['_ts'] ?? null)) return $fail('live_soc_timestamp_missing');
+    $sampleMs = $live['_ts'] > 10000000000 ? $live['_ts'] : $live['_ts'] * 1000;
+    if ($nowMs - $sampleMs > 300000 || $sampleMs > $nowMs + 1000) return $fail('live_soc_stale');
+    $projected = null;
+    if (abs($sampleMs - $t['anchor_ts_ms']) < 1) $projected = $t['anchor_soc_pct'];
+    else foreach ($slots as $s) if ($s['start_ts_ms'] <= $sampleMs && $sampleMs <= $s['end_ts_ms']) {
+        $fraction = ($sampleMs - $s['start_ts_ms']) / ($s['end_ts_ms'] - $s['start_ts_ms']);
+        $projected = $s['soc_start_pct'] + ($s['soc_end_pct'] - $s['soc_start_pct']) * $fraction;
+        break;
+    }
+    if ($projected === null) return $fail('live_soc_outside_trajectory');
+    // Drei Prozentpunkte erlauben Messauflösung und kurze Prognoseabweichung.
+    if (abs($soc - $projected) > 3.0) return $fail('live_soc_mismatch');
+    $t['live_soc_check'] = ['source_ts_ms' => $sampleMs, 'actual_soc_pct' => $soc,
+        'projected_soc_pct' => $projected, 'tolerance_pct' => 3.0, 'max_age_s' => 300];
+    return $t;
+}
+
+
+// Exakte Konfigurationsschlüssel aus Fahrzeug-, Wallbox- und MQTT-Blöcken.
+// Positions- und Kilometerfelder umfassen zusätzlich bekannte Altbestände.
+function e3dcVehicleConfigPrivacyKind($key) {
+    static $kinds = [
+        'mqtt_vehicle_allowlist' => 'vehicle_list',
+        'wb1_car_id' => 'vehicle', 'wb2_car_id' => 'vehicle',
+        'bluelink_vin' => 'vehicle', 'bluelink_car_name' => 'vehicle',
+        'car_id' => 'vehicle', 'car_name' => 'vehicle',
+        'vehicle_id' => 'vehicle', 'vehicle_name' => 'vehicle', 'vin' => 'vehicle',
+        'mqtt_hub_sub_soc_name' => 'vehicle', 'mqtt_hub_sub_soc_name_2' => 'vehicle',
+        'mqtt_hub_sub_soc_topic' => 'vehicle_topic', 'mqtt_hub_sub_soc_topic_2' => 'vehicle_topic',
+        'wb_topic' => 'vehicle_topic', 'wb2_topic' => 'vehicle_topic',
+        'wb1_topic_prefix' => 'vehicle_topic', 'wb2_topic_prefix' => 'vehicle_topic',
+        'car_lat' => 'private', 'car_lon' => 'private', 'car_lng' => 'private',
+        'car_long' => 'private', 'car_latitude' => 'private', 'car_longitude' => 'private',
+        'vehicle_lat' => 'private', 'vehicle_lon' => 'private', 'vehicle_lng' => 'private',
+        'vehicle_latitude' => 'private', 'vehicle_longitude' => 'private',
+        'latitude' => 'private', 'longitude' => 'private', 'hoehe' => 'private', 'laenge' => 'private',
+        'car_odometer' => 'private', 'car_mileage' => 'private', 'car_kilometerstand' => 'private',
+        'vehicle_odometer' => 'private', 'vehicle_mileage' => 'private',
+        'vehicle_kilometerstand' => 'private',
+        'odometer' => 'private', 'mileage' => 'private', 'kilometerstand' => 'private',
+    ];
+    return $kinds[strtolower((string)$key)] ?? null;
+}
+

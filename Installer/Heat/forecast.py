@@ -114,6 +114,8 @@ def _timeline_window_energy_kwh(
     coverage_s = 0.0
     temp_values: List[float] = []
     slot_count = 0
+    wp_quality = set()
+    temp_sources = set()
 
     for slot in timeline or []:
         if not isinstance(slot, dict):
@@ -132,6 +134,10 @@ def _timeline_window_energy_kwh(
         energy_kwh += avg_kw * overlap_s / 3600.0
         coverage_s += overlap_s
         slot_count += 1
+        if slot.get("wp_quality"):
+            wp_quality.add(str(slot["wp_quality"]))
+        if slot.get("forecast_temp_source"):
+            temp_sources.add(str(slot["forecast_temp_source"]))
         if slot.get("forecast_temp_c") is not None:
             temp_values.append(_safe_float(slot.get("forecast_temp_c"), 0.0))
 
@@ -146,7 +152,8 @@ def _timeline_window_energy_kwh(
         horizon_h=horizon_h,
         coverage_h=coverage_s / 3600.0,
         forecast_temp_c=temp,
-        details={"slots": slot_count},
+        details={"slots": slot_count, "wp_quality": sorted(wp_quality),
+                 "forecast_temp_sources": sorted(temp_sources)},
     )
 
 

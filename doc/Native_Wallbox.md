@@ -45,7 +45,7 @@ Aktor, Anti-Flattern, Akkustützung nach Korridorlage) stehen in
 | Modus | Zweck |
 |---|---|
 | `Aus` | NGNA: E3DC-Control beobachtet nur. Eine Standardfreigabe wird nur einmalig nach bewusstem Wechsel auf `Aus` in der WebUI gesendet. |
-| `PV-Kurve ruhig` | Lädt entlang der Speicher-Ladekurve mit Hysterese. Der Hausspeicher behält Vorrang, wenn die Prognose knapper wird. |
+| `PV-Kurve ruhig` | Lädt aus PV-Überschuss entlang der Speicher-Ladekurve mit Hysterese. Der Hausspeicher ist keine Ladequelle für das Fahrzeug; über oder im Kurvenkorridor stützt er nur im Rahmen des Wolken-Kontingents. Unter dem Korridor erhält die Wallbox bei ausgeschalteter zentraler PV-Aufteilung den reinen PV-Überschuss; mit der experimentellen zentralen PV-Aufteilung („Kurve zuerst“) wird der Kurvenbedarf des Speichers zuerst abgezogen. Details stehen in `V4_Konfiguration_und_Regelung.md`, Abschnitt „Akkustützung der Wallbox in `PV-Kurve ruhig` nach Korridorlage“. |
 | `Grundladung stabil` | Hält eine ruhige Grundladung, solange das Speicherziel laut Planung erreichbar bleibt. |
 | `PV + Akku bis Untergrenze` | Nutzt PV und oberhalb der Hausakku-Untergrenze zusätzlich den Speicher. Reicht die PV unter den Speicher- und belegten Fahrzeug-Leistungsgrenzen nicht für Akku und geeignete Fahrzeuge, endet die heutige PV-Kurve bei wbminSoC, auch bei Prognose auf 100%. Bedarf 0 lässt das normale Ziel bestehen; unbekannter Bedarf zählt nach bestätigter Ladung weiter, nur am selben Kurventag und in derselben Steck-Episode; nach 60 Minuten unter 300 W bei ausreichendem PV- und Stromangebot endet dieser Beleg. Unterbrechungen bis zwei Minuten pausieren die Uhr; längere setzen sie zurück. Das gilt für alle Wallboxen (geregelt und beobachtet), in Aus nur mit „Nur beobachten, Speicher oberhalb Hausreserve freigegeben“. Zur normalen Kurve ab 110 %, zurück unter 100 %; jede Wahl hält etwa 15 Minuten. Bestätigtes Abstecken und Pause wirken ab dem nächsten Planlauf; relevante Änderungen lösen nach 60 Sekunden stabilem Zustand neu aus. Folgetage und Netzladeziele bleiben normal. Details stehen in `Ladekurve_Berechnung.md`, Abschnitt „Abendziel bei PV + Akku“. Die unten beschriebene begrenzte Phasenerkennung darf kurz Netzleistung überbrücken. Ist die Untergrenze erreicht und trägt das PV-Budget dieser Wallbox die Mindestleistung der aktuellen Phasenzahl nicht, wird eine laufende Ladung bei dieser Phasenzahl auf den Mindeststrom gesetzt (ohne PV sofort, bei noch anliegendem PV nach 20 s Bestätigung) und nach einem Durchlauf des Wh-Kontos gestoppt; eine dreiphasig ladende openWB Pro wechselt stattdessen auf 1p, wenn das PV-Budget das 1p-Minimum trägt. Laden mehrere Wallboxen, wird diese Wallbox ohne Netzbezug zuerst abgesenkt, sofern sie selbst über ihrer Zuteilung lädt; deckt ihre Zuteilung die tatsächliche Ladeleistung, lädt sie weiter. Netzbezug und ein laufender Phasenwechsel einer anderen Wallbox haben Vorrang. |
 | `Sofort bis Preislimit` | Netzladen nur, wenn der aktuelle Preis unter dem Wallbox-Preislimit liegt. Ohne Preis- oder Netzfenster gilt an der Hausakku-Untergrenze dieselbe Absenkung wie in `PV + Akku bis Untergrenze`. |
@@ -1439,23 +1439,56 @@ E3DC-Control die Pro wirklich führen soll, die Pro direkt als
 
 Die openWB-Karte zeigt den von openWB gemeldeten Lademodus und ihre
 Statusmeldung mit dem Alter seit dem letzten Lesen. Fehlende Statusmeldungen
-bleiben leer. Steht E3DC-Control auf „PV-Kurve ruhig“ oder „PV + Akku“ und meldet
-die openWB „Sofort“ oder „Stop“, wird die Wahl an der openWB sichtbar ausgewiesen.
+bleiben leer. Steht E3DC-Control auf „PV-Kurve ruhig“ oder „PV + Akku bis Untergrenze“
+und meldet die openWB „Sofort“ oder „Stop“, zeigt die Karte beide Modi nebeneinander.
+Aus der Rückmeldung lässt sich nicht ableiten, wer den Modus gewählt hat:
+Auch E3DC-Control kann im Primary-Betrieb „Stop“ oder „Sofort“ setzen.
+Bei ausgefallener Statusabfrage bleibt der gemeldete Lademodus unbekannt.
 Die Anzeige ist keine zusätzliche Ladefreigabe und sendet keine Befehle.
 
 Unter „Ladepriorität und openWB-Details“ stehen die gelesene Ladepriorität,
 Softwareversion und Abschaltverzögerung, soweit verfügbar. Die Empfangszeit der
-Ladepriorität ist kein Änderungszeitpunkt: MQTT kann gespeicherte Konfiguration
-nach einer Verbindung erneut liefern. Unbekannte Werte werden nicht geschätzt.
+Ladepriorität ist kein Änderungszeitpunkt: Nach einer Verbindung kann ein
+gespeicherter Stand erneut geliefert werden. Unbekannte Werte werden nicht geschätzt.
 
 Als Primary mit Ladepriorität „Fahrzeuge“ zählt die openWB auch die Leistung,
 mit der der Hausakku lädt, als Überschuss für das Auto. In „PV-Kurve ruhig“ und
-„PV + Akku“ erscheint deshalb ein beratender Hinweis: Die Ladekurve des Akkus
+„PV + Akku bis Untergrenze“ erscheint deshalb ein beratender Hinweis: Die Ladekurve des Akkus
 kann so nicht gehalten werden. Empfehlung: In den Einstellungen der openWB die
 Ladepriorität „Speicher“ wählen. Bei „Nach SoC des Speichers“ weist die Karte auf
 die eigenen SoC-Schwellen der openWB hin. Bei unbekannter Ladepriorität gibt es
 keine Warnung. E3DC-Control liest diese Einstellung ausschließlich und schreibt
 sie niemals; die Hinweise sperren nichts und ändern die Regelung nicht.
+
+Bei belegter Primary-Rolle und „PV-Kurve ruhig“ ergänzt die Karte einen Hinweis,
+wenn die openWB „Nach SoC des Speichers“ sowie eine aktivierte Fahrzeugentladung
+mit positiver Leistung meldet. Die obere SoC-Schwelle eröffnet die Entladung;
+nach Erreichen dieser Schwelle kann sie bis zur unteren SoC-Schwelle gelten.
+Die Karte nennt beide Schwellen und die konfigurierte Leistung, keine gemessene
+Entladung. Empfehlung: Ladepriorität „Speicher“. Bei gewünschter Akkustützung
+kommt „PV + Akku bis Untergrenze“ infrage; Untergrenze und Schutzgrenzen gelten weiter.
+
+Meldet das aktuell gebundene Ladeprofil „Sofort“ oder „Zielladen“, erscheint bei
+einer frisch beobachteten, stabilen Ansteckepisode einmal ein Hinweis auf die
+selbstständige Ladung der Primary-openWB. E3DC-Control stellt beim bewussten
+Moduswechsel oder bei der Rücknahme eigener Stopp- bzw. Sofortaufträge auf PV um.
+Reload und Reconnect erzeugen keine neue Episode. Beim Dienststart mit bereits
+gestecktem Fahrzeug wird kein Anstecken angenommen. „Aus“, fehlende Daten,
+Profil-/Fahrzeugwechsel und veraltete Daten entfernen den Hinweis.
+
+Die Hinweise stehen auch unter „Ladepriorität und openWB-Details“. Der Profilhinweis
+wird beim Reload gemeinsam mit dem Warnkasten unterdrückt; das Ladeprofil kann dort
+weiterhin neutral als Zustand erscheinen.
+
+Messwerte müssen jünger als 30 Sekunden sein. Einstellungen und Fahrzeugzuordnung
+zählen als aktueller Stand, wenn sie innerhalb der ununterbrochenen MQTT-Sitzung
+empfangen wurden und vollständig sowie widerspruchsfrei sind. Gespeicherte
+Wiederzustellungen zählen ebenfalls; ein Sitzungsabbruch verwirft den Stand bis zur
+Wiederzustellung. Zusätzlich muss ein vom openWB-Regelkern nach jeder Berechnung
+erzeugter Wert jünger als 30 Sekunden sein. Die Erreichbarkeit des Brokers allein
+genügt nicht. Beim Anstecken zählt auch der bereits davor empfangene aktuelle Stand.
+Neuanstecken desselben Fahrzeugs mit unverändertem Profil beginnt eine neue Episode.
+Ältere openWB-Versionen ohne die benannten Themen liefern keinen solchen Hinweis.
 
 ### openWB Software 2.x als Secondary
 
@@ -1569,7 +1602,7 @@ Freigabe aus.
 | Meldung | Bedeutung | Handlung |
 |---|---|---|
 | `WB1 START: 0A -> 6A` / `Deckel: 6A -> 32A` | Freigabe gesendet, Stromdeckel gesetzt. | Keine; echtes Laden zeigt erst der Status „Lädt“ mit Leistung. |
-| `E3DC-Startimpuls wiederholt: 32A bei 0W` | Freigabe steht, das Fahrzeug nimmt keinen Strom an. | Fahrzeug schläft oder hat die Session beendet; E3DC kennt keinen CP-Interrupt über RSCP, meist hilft nur Neustecken. |
+| `Strombefehl wiederholt: 32A bei 0W` | Freigabe steht, das Fahrzeug nimmt keinen Strom an. | Fahrzeug schläft oder hat die Session beendet; E3DC kennt keinen CP-Interrupt über RSCP, meist hilft nur Neustecken. |
 | `Netzladefenster beendet: Wallbox gestoppt` | Geplanter Slot vorbei, Stop-Toggle gesendet. | Keine. |
 | `Netzladefenster beendet: Fahrzeug hat im Fenster nicht geladen …` | Freigabe stand, es wurde nie geladen; Freigabe auf Mindeststrom ohne Toggle zurückgenommen. | Keine; ein schlafendes Fahrzeug wird nicht angestoßen. |
 | `Flankengate: stop_toggle_downgraded` | Stop angefordert, aber ohne belegtes Laden wird kein Toggle gesendet. | Keine; Diagnosehinweis. |

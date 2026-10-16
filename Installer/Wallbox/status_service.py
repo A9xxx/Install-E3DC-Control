@@ -5,6 +5,7 @@ import time
 
 
 STATUS_DIAGNOSTIC_KEYS = (
+    'openwb_mqtt_field_age_s', 'openwb_mqtt_field_received_ts', 'openwb_mqtt_field_reason', 'openwb_mqtt_status_reason', 'openwb_status_fallback_reason', 'openwb_simpleapi_status_ts',
     "driver_status_valid", "driver_status_stale", "driver_status_degraded",
     "driver_status_age_s", "driver_status_reason", "driver_status_last_ok_ts",
     "driver_status_last_sample_ts", "driver_status_source", "driver_status_plausible",
@@ -215,8 +216,40 @@ class StatusService:
             if not fresh or key in missing:
                 values[key] = None
         absent = [key for key, value in values.items() if value is None]
+        hint = ""
+        if not fresh or values["power_w"] is None:
+            hint = "Wallbox ohne Daten – Regelung wie ohne Wallbox. Verbindung bzw. Sicherung der Wallbox prüfen. Externe Last bei Bedarf im Config-Editor unter „Tarif & Strompreise“ → „Geplante Lastfenster“ absichern."
+            if _native_status_present(sample):
+                hint = "Die Wallbox kann derzeit nicht gelesen werden. Deshalb wird keine Akkustützung für das Fahrzeug freigegeben."
+            reason_code = str(sample.get("driver_status_reason") or "").lower()
+            # Nur bekannte Gründe übersetzen, niemals URLs oder Rohexceptionen anzeigen.
+            # Die openWB-Transportgründe (openwb_transport.MESSAGES) zuerst, weil sie eindeutiger sind.
+            if any(code in reason_code for code in ("pin_changed", "target_changed")):
+                hint += " Ursache: Zertifikat bzw. Ziel der Wallbox geändert; Zertifikat im Wallbox-Abschnitt erneut prüfen und bestätigen."
+            elif any(code in reason_code for code in ("auth_rejected", "acl_missing")):
+                hint += " Ursache: Anmeldung abgelehnt oder Leserechte fehlen."
+            elif "cleartext_credentials" in reason_code:
+                hint += " Ursache: Zugangsdaten benötigen HTTPS."
+            elif "redirect_rejected" in reason_code:
+                hint += " Ursache: Unsichere Weiterleitung zurückgewiesen."
+            elif "address_invalid" in reason_code:
+                hint += " Ursache: Wallbox-Adresse ungültig."
+            elif "mqtt_waiting" in reason_code:
+                hint += " Ursache: MQTT verbunden, aber noch keine bestätigten Lesedaten."
+            elif any(code in reason_code for code in ("certificate", "cert_verify", "tls_pin", "tls_untrusted", "tls_required", "ssl")):
+                hint += " Ursache: Zertifikat nicht bestätigt oder ungültig."
+            elif "openwb_mqtt_stale" in reason_code:
+                hint += " Ursache: MQTT-Messwerte fehlen oder sind veraltet."
+            elif any(code in reason_code for code in ("timeout", "timed_out")):
+                hint += " Ursache: Zeitüberschreitung."
+            elif "connection_refused" in reason_code:
+                hint += " Ursache: Verbindung abgelehnt."
+            elif any(code in reason_code for code in ("unavailable", "http_error")):
+                hint += " Ursache: Wallbox nicht erreichbar."
         return {
-            "schema_version": "wallbox_observation_v1", "valid": fresh,
+            "schema_version": "wallbox_observation_v1", "valid": fresh, "hint": hint,
+            "data_outage": {"active": bool(hint) and not _native_status_present(sample), "since_ts": number("wallbox_data_outage_since_ts"),
+                            "regulation": "Regelung wie ohne Wallbox" if hint and not _native_status_present(sample) else None},
             "source": str(sample.get("driver_status_source") or sample.get("wb_status_source") or "driver_readback"),
             "reason": str(sample.get("driver_status_reason") or "status_unavailable") if not fresh else ("partial_measurement" if absent else "fresh"),
             "sample_ts": number("driver_status_last_ok_ts"),
@@ -260,6 +293,14 @@ class StatusService:
     def status_or_stale(self, c_data, raw_status, *, now_ts=None, stale_guard_s=45.0):
         now_value = time.time() if now_ts is None else float(now_ts)
         box = c_data if isinstance(c_data, dict) else {}
+        if raw_status is None:
+            # Ein Transportfehler liefert keinen Messwert. Sein neutraler Grund
+            # muss dennoch durch den bestehenden Manager-Export gelangen.
+            driver_state = getattr(box.get("charger"), "state", {})
+            reason = driver_state.get("driver_status_reason") if isinstance(driver_state, dict) else None
+            if isinstance(reason, str) and reason.startswith("openwb_"):
+                raw_status = {key: driver_state[key] for key in self.diagnostic_keys if key in driver_state}
+                raw_status.update(driver_status_valid=False, driver_status_reason=reason)
         raw_invalid = bool(isinstance(raw_status, dict) and (
             raw_status.get("driver_status_valid") is False
             or raw_status.get("driver_status_stale") is True
@@ -279,6 +320,14 @@ class StatusService:
                 "driver_status_last_sample_ts": int(now_value),
                 "driver_status_last_ok_ts": int(now_value),
             })
+            values = raw_status.get("observation_values")
+            power = values.get("power_w") if isinstance(values, dict) else raw_status.get("real_power_w", raw_status.get("power_w"))
+            power_valid = type(power) in (int, float) and math.isfinite(power) and power >= 0
+            if power_valid:
+                box.pop("_wallbox_data_outage_since_ts", None)
+            else:
+                box.setdefault("_wallbox_data_outage_since_ts", now_value)
+            raw_status["wallbox_data_outage_since_ts"] = box.get("_wallbox_data_outage_since_ts")
             box["_status_last_ok_ts"] = now_value
             box["_status_last_fail_ts"] = 0.0
             box["_status_stale_logged"] = False
@@ -287,12 +336,14 @@ class StatusService:
         if isinstance(raw_status, dict):
             box["_last_invalid_status"] = dict(raw_status)
 
+        since = box.setdefault("_wallbox_data_outage_since_ts", now_value)
         last_ok_ts = float(box.get("_status_last_ok_ts", 0.0) or 0.0)
         last_status = box.get("last_valid")
         age_s = now_value - last_ok_ts if last_ok_ts > 0.0 else 999999.0
         box["_status_last_fail_ts"] = now_value
         if isinstance(last_status, dict) and age_s <= float(stale_guard_s):
             status = dict(last_status)
+            status["wallbox_data_outage_since_ts"] = since
             status.update({
                 "driver_status_valid": False, "driver_status_degraded": True,
                 "driver_status_stale": False, "driver_status_age_s": round(float(age_s), 1),
@@ -304,7 +355,7 @@ class StatusService:
                 "driver_status_last_sample_ts": int(now_value),
                 "driver_status_last_ok_ts": int(last_ok_ts),
             })
-            for key in ("driver_status_plausible", "driver_status_glitch", "driver_status_glitch_reason", "driver_status_last_good_ts"):
+            for key in ('openwb_mqtt_field_age_s', 'openwb_mqtt_field_received_ts', 'openwb_mqtt_field_reason', 'openwb_mqtt_status_reason', 'openwb_status_fallback_reason', 'openwb_simpleapi_status_ts') + ("driver_status_source", "driver_status_plausible", "driver_status_glitch", "driver_status_glitch_reason", "driver_status_last_good_ts"):
                 if isinstance(raw_status, dict) and key in raw_status:
                     status[key] = raw_status[key]
             _invalidate_native_status(
@@ -329,4 +380,9 @@ class StatusService:
             or (raw_status or {}).get("driver_status_reason")
             or "status_timeout"
         )
-        return self.safe_stale_status(box, now_ts=now_value, age_s=age_s, reason=str(stale_reason))
+        stale = self.safe_stale_status(box, now_ts=now_value, age_s=age_s, reason=str(stale_reason))
+        for key in ('openwb_mqtt_field_age_s', 'openwb_mqtt_field_received_ts', 'openwb_mqtt_field_reason', 'openwb_mqtt_status_reason', 'openwb_status_fallback_reason', 'openwb_simpleapi_status_ts') + ("driver_status_source",):
+            if isinstance(raw_status, dict) and key in raw_status:
+                stale[key] = raw_status[key]
+        stale["wallbox_data_outage_since_ts"] = since
+        return stale

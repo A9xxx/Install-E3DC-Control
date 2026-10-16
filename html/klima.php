@@ -85,6 +85,12 @@ function e3dcClimateInfoRow($label, $value, $muted = false) {
 
 function e3dcClimateReasonLabel($reason) {
     $map = [
+        'power_missing' => 'Leistung unbekannt',
+        'energy_missing' => 'Energie unbekannt',
+        'missing' => 'Messpunkt nicht erreichbar',
+        'stale' => 'Messwert veraltet',
+        'day_changed' => 'Neue Tagesenergie abwarten',
+        'baseline_write_failed' => 'Energiebasis nicht gespeichert',
         'disabled' => 'Regelung deaktiviert',
         'mode_off' => 'Modus Aus',
         'local_adapter_not_available' => 'Lokaler Adapter noch nicht verfügbar',
@@ -111,6 +117,7 @@ function e3dcClimateFirst($data, $keys) {
 $confResult = loadE3dcConfig();
 $cfg = empty($confResult['error']) ? ($confResult['config'] ?? []) : [];
 $climateLoad = e3dcClimateReadJson('/var/www/html/ramdisk/climate_load.json');
+$climateLoad = e3dcClimateLoadProjection($climateLoad, $cfg);
 $climateControl = e3dcClimateReadJson('/var/www/html/ramdisk/climate_control.json');
 $schedule = is_array($climateControl['schedule'] ?? null) ? $climateControl['schedule'] : [];
 
@@ -206,15 +213,35 @@ if (isset($climateControl['devices']) && is_array($climateControl['devices'])) {
                         </h6>
                         <div class="display-6 fw-bold mb-1"><?= e3dcClimateEsc(e3dcClimateFmtW($climateLoad['power_w'] ?? null)) ?></div>
                         <div class="small mb-3 <?= $isActive ? 'text-success' : 'text-muted' ?>">
-                            <?= $isActive ? 'Klimaanlage läuft' : 'kein relevanter Klimaverbrauch' ?>
+                            <?= isset($climateLoad['power_valid']) && !$climateLoad['power_valid'] ? 'unbekannt · Haus inkl. Klima' : ($isActive ? 'Klimaanlage läuft' : 'kein relevanter Klimaverbrauch') ?>
                         </div>
                         <?= e3dcClimateInfoRow('Heute', e3dcClimateEsc(e3dcClimateFmtKwh($climateLoad['daily_kwh'] ?? null))) ?>
                         <?= e3dcClimateInfoRow('Gesamtzähler', e3dcClimateEsc(e3dcClimateFmtKwh($climateLoad['energy_total_kwh'] ?? null))) ?>
+                        <?php if (!isset($climateLoad['meters'])): ?>
                         <?= e3dcClimateInfoRow('Quelle', e3dcClimateEsc($climateLoad['source'] ?? e3dcClimateCfg($cfg, 'climate_meter_type', ''))) ?>
                         <?= e3dcClimateInfoRow('Zähler-IP', e3dcClimateEsc($climateLoad['ip'] ?? e3dcClimateCfg($cfg, 'climate_meter_ip', ''))) ?>
                         <?= e3dcClimateInfoRow('Phase/Kanal', e3dcClimateEsc(($climateLoad['phase'] ?? e3dcClimateCfg($cfg, 'climate_meter_phase', '')) . ' / ' . ($climateLoad['meter_channel'] ?? '--'))) ?>
                         <?= e3dcClimateInfoRow('Strom / Spannung', e3dcClimateEsc(($climateLoad['current_a'] ?? '--') . ' A / ' . ($climateLoad['voltage_v'] ?? '--') . ' V')) ?>
                         <?= e3dcClimateInfoRow('Leistungsfaktor', e3dcClimateEsc($climateLoad['pf'] ?? '--')) ?>
+                        <?php endif; ?>
+                        <?php if (isset($climateLoad['meters'])): ?>
+                            <div class="mt-3" id="climate-meter-breakdown">
+                                <?php foreach ($climateLoad['meters'] as $meter): ?>
+                                    <div class="border-top pt-2 mt-2">
+                                        <strong><?= e3dcClimateEsc($meter['name']) ?></strong>
+                                        <?= e3dcClimateInfoRow('Leistung', e3dcClimateEsc($meter['power_valid'] ? e3dcClimateFmtW($meter['power_w']) : 'unbekannt')) ?>
+                                        <?= e3dcClimateInfoRow('Heute', e3dcClimateEsc($meter['energy_valid'] ? e3dcClimateFmtKwh($meter['daily_kwh']) : 'unbekannt')) ?>
+                                        <?= e3dcClimateInfoRow('Gesamtzähler', e3dcClimateEsc($meter['energy_valid'] ? e3dcClimateFmtKwh($meter['energy_total_kwh']) : 'unbekannt')) ?>
+                                        <?= e3dcClimateInfoRow('Quelle / Phase / Kanal', e3dcClimateEsc(($meter['source'] ?? '--') . ' / ' . ($meter['phase'] ?? '--') . ' / ' . ($meter['meter_channel'] ?? '--'))) ?>
+                                        <?= e3dcClimateInfoRow('Zähler-IP', e3dcClimateEsc($meter['ip'] ?? '--')) ?>
+                                        <?= e3dcClimateInfoRow('Strom / Spannung', e3dcClimateEsc(($meter['current_a'] ?? '--') . ' A / ' . ($meter['voltage_v'] ?? '--') . ' V')) ?>
+                                        <?= e3dcClimateInfoRow('Leistungsfaktor / Frequenz', e3dcClimateEsc(($meter['pf'] ?? '--') . ' / ' . ($meter['freq_hz'] ?? '--') . ' Hz')) ?>
+                                        <?= e3dcClimateInfoRow('Messalter', e3dcClimateEsc($meter['age_s'] === null ? 'unbekannt' : $meter['age_s'] . ' s')) ?>
+                                        <?= e3dcClimateInfoRow('Messstatus', e3dcClimateEsc(e3dcClimateReasonLabel(($meter['reason'] ?? '') ?: (($meter['energy_reason'] ?? '') ?: 'gültig')))) ?>
+                                    </div>
+                                <?php endforeach; ?>
+                            </div>
+                        <?php endif; ?>
                         <?= e3dcClimateInfoRow('Messalter', e3dcClimateEsc($loadAgeLabel)) ?>
                         <?= e3dcClimateInfoRow('Dienst', e3dcClimateEsc($serviceStatus)) ?>
                     </div>

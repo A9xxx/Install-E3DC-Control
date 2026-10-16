@@ -5,6 +5,9 @@ if (!defined('VIEW_MODE')) {
 if (session_status() === PHP_SESSION_NONE) { session_start(); }
 require_once 'helpers.php';
 handleWebLogin();
+if (function_exists('e3dcGuardMqttHeatpumpRequest')) {
+    e3dcGuardMqttHeatpumpRequest();
+}
 $seite = $_GET['seite'] ?? 'live';
 // Die Anmeldung ist bereits gültig: direkt zur Startseite weiterleiten.
 if ($seite === 'lock' && isWebAuthenticated()) {
@@ -151,6 +154,13 @@ if ($wpvAjaxRequest && $seite === 'waermepumpe_vorschau') {
     <script src="assets/vendor/chartjs-plugin-zoom/chartjs-plugin-zoom.min.js"></script>
 
     <style>
+        .wallbox-data-outage { opacity: 1 !important; outline: 3px solid #f59e0b !important; outline-offset: 2px; animation: wallbox-data-outage-pulse 1.4s ease-in-out infinite; }
+        .wallbox-data-outage, .wallbox-data-outage .card, .wallbox-data-outage .card-body, .wallbox-data-outage-message { background: #fff3cd !important; color: #664d03 !important; }
+        .wallbox-data-outage-message { display: block; padding: .5rem; border-radius: .5rem; white-space: normal; font-size: .8rem; }
+        .wallbox-data-outage-message[hidden] { display: none !important; }
+        @keyframes wallbox-data-outage-pulse { 50% { outline-color: #dc2626; box-shadow: 0 0 14px #f59e0b; } }
+        @media (prefers-reduced-motion: reduce) { .wallbox-data-outage { animation: none !important; } }
+
         :root {
             --bg-body: #0b0e14; --text-body: #f8fafc;
             --bg-card: #1a1f29; --border-card: #2d3748;
@@ -315,6 +325,12 @@ if ($wpvAjaxRequest && $seite === 'waermepumpe_vorschau') {
         .external-wr-lock-btn[aria-pressed="true"] { background: #dc3545; border-color: #dc3545; color: #fff; }
         .flow-node .price-tag { position: absolute; bottom: -20px; background: var(--bg-nav); padding: 2px 6px; border-radius: 8px; font-size: 0.7rem; font-weight: bold; border: 1px solid var(--border-card); white-space: nowrap; }
         .flow-hover-panel { position: absolute; z-index: 45; display: none; min-width: 210px; max-width: min(280px, calc(100% - 20px)); padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border-card); background: rgba(15, 23, 42, 0.94); color: #f8fafc; box-shadow: 0 14px 34px rgba(0,0,0,0.32); pointer-events: none; text-align: left; font-size: 0.76rem; line-height: 1.25; backdrop-filter: blur(12px); }
+        #m-ring-climate-row[role="button"] { cursor: pointer; }
+        #m-ring-climate-row[role="button"]:focus-visible { outline: 2px solid var(--text-main); outline-offset: 3px; }
+        #m-ring-climate-meters { padding: 6px 8px; border-radius: 6px; background: var(--bg-card); color: var(--text-main); }
+        [data-bs-theme="light"] .flow-hover-panel { background: rgba(255,255,255,0.96); color: #0f172a; border-color: rgba(100,116,139,0.28); box-shadow: 0 14px 34px rgba(15,23,42,0.18); }
+        [data-bs-theme="light"] .flow-hover-meta, [data-bs-theme="light"] .flow-hover-note { color: #475569; }
+        [data-bs-theme="light"] .flow-hover-now { color: #0369a1; }
         .flow-hover-panel.is-visible { display: block; }
         .flow-hover-title { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; font-weight: 800; margin-bottom: 6px; }
         .flow-hover-now { color: #38bdf8; white-space: nowrap; }
@@ -808,7 +824,14 @@ if ($wpvAjaxRequest && $seite === 'waermepumpe_vorschau') {
             .energy-ring-legend-group { padding: 6px 9px; }
         }
 
-    </style>
+    
+        body #f-val-car-soc.soc-stale, body #f-val-car-soc2.soc-stale,
+        body #val-car-soc.soc-stale, body #val-car-soc2.soc-stale {
+            color: var(--bs-warning-text-emphasis, #b58100) !important;
+            border-color: var(--bs-warning, #ffc107) !important;
+            background-color: var(--bs-warning-bg-subtle, #fff3cd) !important;
+        }
+</style>
     <link rel="stylesheet" href="assets/vendor/fontawesome/css/all.min.css">
     <link rel="stylesheet" href="assets/vendor/bootstrap-icons/bootstrap-icons.min.css">
 </head>
@@ -970,6 +993,7 @@ if ($wpvAjaxRequest && $seite === 'waermepumpe_vorschau') {
                 <span class="mobile-storage-anchor"><span>Freilauf</span><b id="m-storage-release">--</b></span>
             </div>
             <div class="mobile-storage-reason" id="m-storage-reason">--</div>
+            <div class="mobile-storage-reason" id="m-storage-market-quality" style="display:none;"></div>
         </div>
 
         <?php /* Kompaktkarte Zusatzwechselrichter (Direktlesung), nur bei konfigurierter Lesung; nur Anzeige */ ?>
@@ -998,6 +1022,8 @@ if ($wpvAjaxRequest && $seite === 'waermepumpe_vorschau') {
             </button>
         </div>
 
+        <div id="m-wallbox-outage-1" class="mb-3 rounded-3" hidden><span id="m-wallbox-outage-badge-1" class="badge text-bg-warning m-2">Wallbox 1 ohne Daten</span></div>
+        <div id="m-wallbox-outage-2" class="mb-3 rounded-3" hidden><span id="m-wallbox-outage-badge-2" class="badge text-bg-warning m-2">Wallbox 2 ohne Daten</span></div>
         <div id="m-flow-wrapper" class="position-relative mb-2">
             <div id="m-flow-classic-view" class="mobile-flow-view">
                 <?= renderEnergyFlow('mobile') ?>
@@ -1049,6 +1075,7 @@ if ($wpvAjaxRequest && $seite === 'waermepumpe_vorschau') {
                                 <div class="energy-ring-row energy-ring-home" id="m-ring-home-row"><i class="fas fa-home"></i><span id="m-ring-home-text">--</span></div>
                                 <div class="energy-ring-row ring-wp-text" id="m-ring-wp-row"><i class="fas fa-fire"></i><span id="m-ring-wp-text">--</span></div>
                                 <div class="energy-ring-row ring-climate-text" id="m-ring-climate-row"><i class="fas fa-snowflake"></i><span id="m-ring-climate-text">--</span></div>
+                                <div id="m-ring-climate-meters" class="small" hidden></div>
                                 <div class="energy-ring-row ring-wb-text" id="m-ring-wb-row"><i class="fas fa-charging-station"></i><span id="m-ring-wb-text">--</span></div>
                                 <div class="energy-ring-row ring-wb2-text" id="m-ring-wb2-row"><i class="fas fa-charging-station"></i><span id="m-ring-wb2-text">--</span></div>
                             </div>
@@ -1131,7 +1158,7 @@ if ($wpvAjaxRequest && $seite === 'waermepumpe_vorschau') {
 	                    <div class="d-flex justify-content-between small text-muted"><span>Zusatz-WR:</span> <span id="m-stat-pv-external" class="fw-bold text-body">-- kWh (--%)</span></div>
 	                    <div class="d-flex justify-content-between small text-muted mb-1" id="m-stat-pv-source-rest-row" style="display:none;"><span>Quellenrest:</span> <span id="m-stat-pv-source-rest" class="fw-bold text-body">-- kWh (--%)</span></div>
 	                    <div class="small text-muted fw-bold mt-1">Verwendung</div>
-	                    <div class="d-flex justify-content-between small text-muted"><span>Haus:</span> <span id="m-stat-pv-home" class="fw-bold text-body">-- kWh (--%)</span></div>
+	                    <div class="d-flex justify-content-between small text-muted"><span data-house-daily-label>Haus:</span> <span id="m-stat-pv-home" class="fw-bold text-body">-- kWh (--%)</span></div>
                     <div class="d-flex justify-content-between small text-muted"><span>Batterie:</span> <span id="m-stat-pv-bat" class="fw-bold text-body">-- kWh (--%)</span></div>
                     <?php if ($wb1Enabled): ?>
                     <div class="d-flex justify-content-between small text-muted"><span><?= $wb2Enabled ? 'Wallbox 1:' : 'Wallbox:' ?></span> <span id="m-stat-pv-wb" class="fw-bold text-body">-- kWh (--%)</span></div>
@@ -1149,7 +1176,7 @@ if ($wpvAjaxRequest && $seite === 'waermepumpe_vorschau') {
                         <div class="label text-success m-0"><i class="fas fa-battery-full me-1"></i> Batterie (Entladung)</div>
                         <span id="m-stat-bat-total" class="badge bg-success">-- kWh</span>
                     </div>
-                    <div class="d-flex justify-content-between small text-muted"><span>Haus:</span> <span id="m-stat-bat-home" class="fw-bold text-body">-- kWh (--%)</span></div>
+                    <div class="d-flex justify-content-between small text-muted"><span data-house-daily-label>Haus:</span> <span id="m-stat-bat-home" class="fw-bold text-body">-- kWh (--%)</span></div>
                     <?php if ($wb1Enabled): ?>
                     <div class="d-flex justify-content-between small text-muted"><span><?= $wb2Enabled ? 'Wallbox 1:' : 'Wallbox:' ?></span> <span id="m-stat-bat-wb" class="fw-bold text-body">-- kWh (--%)</span></div>
                     <?php endif; ?>
@@ -1166,7 +1193,7 @@ if ($wpvAjaxRequest && $seite === 'waermepumpe_vorschau') {
                         <div class="label text-danger m-0"><i class="fas fa-network-wired me-1"></i> Netzbezug</div>
                         <span id="m-stat-grid-total" class="badge bg-danger">-- kWh</span>
                     </div>
-                    <div class="d-flex justify-content-between small text-muted"><span>Haus:</span> <span id="m-stat-grid-home" class="fw-bold text-body">-- kWh (--%)</span></div>
+                    <div class="d-flex justify-content-between small text-muted"><span data-house-daily-label>Haus:</span> <span id="m-stat-grid-home" class="fw-bold text-body">-- kWh (--%)</span></div>
                     <div class="d-flex justify-content-between small text-muted"><span>Batterie:</span> <span id="m-stat-grid-bat" class="fw-bold text-body">-- kWh (--%)</span></div>
                     <?php if ($wb1Enabled): ?>
                     <div class="d-flex justify-content-between small text-muted"><span><?= $wb2Enabled ? 'Wallbox 1:' : 'Wallbox:' ?></span> <span id="m-stat-grid-wb" class="fw-bold text-body">-- kWh (--%)</span></div>

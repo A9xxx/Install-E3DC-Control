@@ -12,6 +12,7 @@ if (!function_exists('e3dcCallHandlerIfAvailable')) {
 // During a self-update, index.php and helpers.php can briefly be from different
 // revisions. Optional action handlers must therefore be guarded.
 e3dcCallHandlerIfAvailable('handleWebLogin');
+e3dcCallHandlerIfAvailable('e3dcGuardMqttHeatpumpRequest');
 e3dcCallHandlerIfAvailable('sendNoCacheHeaders'); // ← Das zwingt den Browser, das HTML immer frisch zu laden
 if (function_exists('handleVersionCheck')) {
     handleVersionCheck(__FILE__);
@@ -139,6 +140,13 @@ if (isset($_GET['ajax']) && $_GET['ajax'] == '1') {
     <script src="assets/vendor/hammerjs/hammer.min.js"></script>
     <script src="assets/vendor/chartjs-plugin-zoom/chartjs-plugin-zoom.min.js"></script>
     <style>
+        .wallbox-data-outage { opacity: 1 !important; outline: 3px solid #f59e0b !important; outline-offset: 2px; animation: wallbox-data-outage-pulse 1.4s ease-in-out infinite; }
+        .wallbox-data-outage, .wallbox-data-outage .card, .wallbox-data-outage .card-body, .wallbox-data-outage-message { background: #fff3cd !important; color: #664d03 !important; }
+        .wallbox-data-outage-message { display: block; padding: .5rem; border-radius: .5rem; white-space: normal; font-size: .8rem; }
+        .wallbox-data-outage-message[hidden] { display: none !important; }
+        @keyframes wallbox-data-outage-pulse { 50% { outline-color: #dc2626; box-shadow: 0 0 14px #f59e0b; } }
+        @media (prefers-reduced-motion: reduce) { .wallbox-data-outage { animation: none !important; } }
+
         /* Dark Mode Defaults (Bootstrap handles most via data-bs-theme="dark") */
         [data-bs-theme="dark"] body { background-color: #121212; color: #e0e0e0; }
         [data-bs-theme="dark"] .card { background-color: #1e1e1e; border-color: #333; box-shadow: 0 4px 10px rgba(0,0,0,0.3); }
@@ -1279,7 +1287,16 @@ if (isset($_GET['ajax']) && $_GET['ajax'] == '1') {
         body:not([data-chart-mode="flow"]) #header-regler-plan {
             display: none !important;
         }
-    </style>
+    
+        body #val-car-soc.soc-stale, body #val-car-soc2.soc-stale,
+        body #f-val-car-soc.soc-stale, body #f-val-car-soc2.soc-stale,
+        body.frontend-modern:not(.detail-compact) #right-column-cards .dashboard-wallbox-badge.modern-active .wallbox-car-badge.soc-stale,
+        body.frontend-modern:not(.detail-compact) #right-column-cards .dashboard-consumer-badge .wallbox-car-badge.soc-stale {
+            color: var(--bs-warning-text-emphasis, #b58100) !important;
+            border-color: var(--bs-warning, #ffc107) !important;
+            background-color: var(--bs-warning-bg-subtle, #fff3cd) !important;
+        }
+</style>
 </head>
 <?php
 $confData = loadE3dcConfig();
@@ -1444,6 +1461,8 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                         <span class="badge rounded-pill" style="display:none; font-size:0.65rem; background:rgba(245,158,11,0.15); color:#f59e0b;" id="storage-forecast-badge">--</span>
                     </div>
                     <div class="text-muted text-truncate mt-1" style="font-size:0.7rem;" id="wb-stor-reason" title="">--</div>
+                    <div class="small text-muted mt-1" id="wb-stor-backup-observation" style="display:none;"></div>
+                    <div class="text-muted mt-1" style="display:none; font-size:0.7rem;" id="wb-stor-market-quality"></div>
                     <div id="wb-stor-dv-status" class="mt-1 d-flex align-items-center gap-2" style="display:none; font-size:0.68rem;">
                         <span class="fw-bold text-success"><i class="fas fa-scale-balanced me-1"></i>DV</span>
                         <span id="wb-stor-dv-badge" class="badge rounded-pill bg-secondary bg-opacity-25 text-secondary">--</span>
@@ -1601,7 +1620,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                                 <div id="home-peak-detail" style="display:none;" class="small text-muted mt-1 tile-detail"><i class="fas fa-arrow-down text-success opacity-75"></i> <span id="val-home-min" class="fw-bold">--</span> &bull; <i class="fas fa-arrow-up text-danger opacity-75"></i> <span id="val-home-max" class="fw-bold">--</span></div>
                             </div>
                             <div class="text-end text-muted d-flex flex-column gap-1" style="line-height: 1;">
-                                <div class="badge bg-body-tertiary text-body border border-secondary-subtle tile-kwh-badge" title="Hausverbrauch heute"><i class="fas fa-home text-info me-1"></i><span id="home-today">-- kWh</span></div>
+                                <div class="badge bg-body-tertiary text-body border border-secondary-subtle tile-kwh-badge" title="Hausverbrauch heute"><i class="fas fa-home text-info me-1"></i><span id="home-today">-- kWh</span><span data-house-daily-label class="small ms-1">Hausverbrauch</span></div>
                                 <div class="badge bg-body-tertiary text-body border border-secondary-subtle" title="Autarkie (Live / Heute)"><i class="fas fa-leaf text-success me-1"></i><span id="val-autarky-live">--%</span> <span class="text-muted fw-normal">| <span id="val-autarky-day">--%</span></span></div>
                                 <div class="badge bg-body-tertiary text-body border border-secondary-subtle" title="Eigenverbrauch (Heute)"><i class="fas fa-recycle text-warning me-1"></i><span id="val-selfcon-day">--%</span></div>
                             </div>
@@ -1719,7 +1738,7 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     <?php endif; ?>
                     <div id="diagramDetails" class="px-3 pb-2 text-info small fw-bold" style="display:none;"></div>
                     <div id="forecast-kwh-summary" class="forecast-summary px-3 pb-2 text-info small fw-bold" style="display:none;"></div>
-                    <div id="pv-forecast-diagnostic-card" class="mx-3 mb-2 rounded border border-secondary-subtle bg-body-tertiary px-3 py-2 small" style="display:none !important;" hidden>
+                    <div id="pv-forecast-diagnostic-card" class="mx-3 mb-2 rounded border border-secondary-subtle bg-body-tertiary px-3 py-2 small" hidden>
                         <div class="d-flex flex-wrap align-items-center justify-content-between gap-2">
                             <span class="fw-bold"><i class="fas fa-chart-bar text-info me-1"></i>PV-Prognosediagnose</span>
                             <span id="pv-forecast-diagnostic-status" class="badge text-bg-secondary">Noch keine Auswertung</span>
@@ -3009,6 +3028,13 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 // Storage-Seite
                 const storStateEl = document.getElementById('wb-stor-state');
                 const storReasonEl = document.getElementById('wb-stor-reason');
+                const backupObservationEl = document.getElementById('wb-stor-backup-observation');
+                if (backupObservationEl) {
+                    const backupText = typeof storageBackupObservationText === 'function' ? storageBackupObservationText(data) : '';
+                    backupObservationEl.textContent = backupText;
+                    backupObservationEl.style.display = backupText ? '' : 'none';
+                }
+
                 const storSollSocEl = document.getElementById('wb-stor-soll-soc');
                 const storIfcEl = document.getElementById('wb-stor-ifc');
                 const storCurveEl = document.getElementById('wb-stor-curve');
@@ -3081,6 +3107,9 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                 if (storReasonEl && storageOperational && storageOperational.holdActive) {
                     storReasonEl.textContent = storageOperational.detail;
                     storReasonEl.title = storageOperational.badge;
+                } else if (storReasonEl && data.storage_market_control_text) {
+                    storReasonEl.textContent = formatStorageReasonInline(data.storage_market_control_text);
+                    storReasonEl.title = data.storage_market_control_text;
                 } else if (storReasonEl && weatherReserveActive) {
                     storReasonEl.textContent = weatherReserveText;
                     storReasonEl.title = storagePlanMeta.weather_reserve_reason || storageCurveMeta.weather_reserve_reason || weatherReserveText;
@@ -3104,6 +3133,12 @@ $initialChartView = strtolower(trim((string)($_GET['view'] ?? '')));
                     const r = data.storage_reason || '--';
                     storReasonEl.textContent = formatStorageReasonInline(r);
                     storReasonEl.title = r;
+                }
+                const marketQualityEl = document.getElementById('wb-stor-market-quality');
+                if (marketQualityEl) {
+                    const marketQualityText = storageMarketPlanQualityText(data);
+                    marketQualityEl.textContent = marketQualityText;
+                    marketQualityEl.style.display = marketQualityText ? '' : 'none';
                 }
                 if (storSollSocEl) {
                     const eveningReleaseActive = String(data.storage_state || '').toLowerCase() === 'parallel_evening_release';

@@ -48,6 +48,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "climate_meter_ip": "0.0.0.0",
     "climate_meter_type": "shelly_pro3em",
     "climate_meter_phase": "c",
+    "climate_meter2_name": "Klimaanlage 2",
+    "climate_meter2_ip": "0.0.0.0",
+    "climate_meter2_type": "shelly_pro3em",
+    "climate_meter2_phase": "c",
     "climate_min_power_w": "50",
     "climate_poll_s": "15",
     "climate_history_enable": "1",
@@ -281,7 +285,7 @@ def _build_meter_status(
     source: str,
     phase: str,
     now_ts: float | None,
-    raw_power_w: float,
+    raw_power_w: float | None,
     apparent_va: float | None,
     current_a: float | None,
     voltage_v: float | None,
@@ -293,6 +297,14 @@ def _build_meter_status(
 ) -> dict[str, Any]:
     ts = float(now_ts if now_ts is not None else time.time())
     min_power_w = max(0, _safe_int(cfg.get("climate_min_power_w"), 50))
+    dual = bool(cfg.get("_climate_dual"))
+    valid_power = _finite_number_or_none(raw_power_w) is not None
+    if dual and not valid_power:
+        raw_power_w = 0.0
+    if dual:
+        energy_wh = _finite_number_or_none(energy_wh)
+        if energy_wh is not None and energy_wh < 0:
+            energy_wh = None
     power_w = max(0.0, raw_power_w)
     energy_kwh = (float(energy_wh) / 1000.0) if energy_wh is not None else None
     cloud, wifi, sys_block = _shelly_context(payload)
@@ -332,6 +344,24 @@ def _build_meter_status(
     }
     if extra:
         status.update(extra)
+    if dual:
+        status.update(power_valid=valid_power, energy_valid=energy_wh is not None,
+                      measurement_valid=valid_power, reason="" if valid_power else "power_missing",
+                      energy_reason="" if energy_wh is not None else "energy_missing")
+        if not valid_power:
+            status.update(power_w=None, raw_power_w=None, active=False)
+        # Nicht addierbare Diagnosewerte bleiben nur am jeweiligen Zähler.
+        for key in ("current_a", "voltage_v", "pf", "freq_hz", "apparent_power_va"):
+            status[key] = _finite_number_or_none(status.get(key))
+        def finite_json(value):
+            if isinstance(value, float) and not math.isfinite(value):
+                return None
+            if isinstance(value, dict):
+                return {key: finite_json(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [finite_json(item) for item in value]
+            return value
+        status = finite_json(status)
     return status
 
 
@@ -372,6 +402,11 @@ def parse_shelly_pro3em_status(payload: dict[str, Any], cfg: dict[str, Any] | No
         freq_hz = selected["freq_hz"]
         energy_wh = selected["energy_total_wh"]
 
+    if cfg.get("_climate_dual"):
+        raw_power_w = _finite_number_or_none(em.get("total_act_power" if phase == "total" else f"{phase}_act_power"))
+        if phase == "total" and raw_power_w is None and "total_act_power" not in em:
+            values = [_finite_number_or_none(em.get(f"{p}_act_power")) for p in ("a", "b", "c")]
+            raw_power_w = sum(values) if all(v is not None for v in values) else None
     return _build_meter_status(
         payload,
         cfg,
@@ -431,7 +466,7 @@ def _finite_number_or_none(value: Any) -> float | None:
     return parsed
 
 
-def _parse_shelly_em_gen1_channel(payload: dict[str, Any], index: int) -> dict[str, Any]:
+def _parse_shelly_em_gen1_channel(payload: dict[str, Any], index: int, *, strict_power: bool = True) -> dict[str, Any]:
     emeters = payload.get("emeters")
     if not isinstance(emeters, list) or index >= len(emeters):
         raise ValueError(f"Shelly EM Gen1 enthält keinen emeters[{index}] Kanal")
@@ -441,7 +476,7 @@ def _parse_shelly_em_gen1_channel(payload: dict[str, Any], index: int) -> dict[s
     if emeter.get("is_valid") is not True:
         raise ValueError(f"Shelly EM Gen1 emeters[{index}] ist nicht gültig")
     power_w = _finite_number_or_none(emeter.get("power"))
-    if power_w is None:
+    if power_w is None and strict_power:
         raise ValueError(f"Shelly EM Gen1 emeters[{index}] enthält keine gültige Leistung")
     return {
         "index": index,
@@ -460,8 +495,8 @@ def parse_shelly_em_gen1_status(payload: dict[str, Any], cfg: dict[str, Any] | N
     channel = normalize_shelly_em_gen1_channel(cfg_text(cfg, "climate_meter_phase", ""))
 
     indices = (0, 1) if channel == "total" else (0 if channel == "channel0" else 1,)
-    channels = [_parse_shelly_em_gen1_channel(payload, index) for index in indices]
-    raw_power_w = sum(float(item["power_w_raw"]) for item in channels)
+    channels = [_parse_shelly_em_gen1_channel(payload, index, strict_power=not cfg.get("_climate_dual")) for index in indices]
+    raw_power_w = sum(float(item["power_w_raw"]) for item in channels) if all(item["power_w_raw"] is not None for item in channels) else None
 
     energy_values = [item["energy_total_wh"] for item in channels]
     energy_wh = sum(float(value) for value in energy_values) if all(value is not None for value in energy_values) else None
@@ -506,7 +541,7 @@ def parse_shelly_em_mini_gen4_status(payload: dict[str, Any], cfg: dict[str, Any
         source="shelly_em_mini_gen4",
         phase=normalize_phase(cfg_text(cfg, "climate_meter_phase", "single")),
         now_ts=now_ts,
-        raw_power_w=_safe_float(em.get("act_power"), 0.0),
+        raw_power_w=(_finite_number_or_none(em.get("act_power")) if cfg.get("_climate_dual") else _safe_float(em.get("act_power"), 0.0)),
         apparent_va=_safe_float_or_none(em.get("aprt_power")),
         current_a=_safe_float_or_none(em.get("current")),
         voltage_v=_safe_float_or_none(em.get("voltage")),
@@ -538,7 +573,7 @@ def parse_shelly_pm_mini_status(payload: dict[str, Any], cfg: dict[str, Any] | N
         source="shelly_pm_mini",
         phase=normalize_phase(cfg_text(cfg, "climate_meter_phase", "single")),
         now_ts=now_ts,
-        raw_power_w=_safe_float(pm.get("apower"), 0.0),
+        raw_power_w=(_finite_number_or_none(pm.get("apower")) if cfg.get("_climate_dual") else _safe_float(pm.get("apower"), 0.0)),
         apparent_va=None,
         current_a=_safe_float_or_none(pm.get("current")),
         voltage_v=_safe_float_or_none(pm.get("voltage")),
@@ -1223,6 +1258,24 @@ def append_history(
             "source": status.get("source"),
             "name": status.get("name"),
         }
+        # Identität und Baseline nur in der Messhistorie ergänzen; Live-Vertrag bleibt erhalten.
+        samples = status.get("meters") if isinstance(status.get("meters"), list) else [status]
+        row["meter_samples"] = [{key: meter.get(key) for key in (
+            "id", "source", "ip", "phase", "name", "daily_kwh", "energy_total_kwh",
+            "energy_baseline_kwh", "energy_valid", "energy_reason", "energy_date",
+            "daily_baseline_error", "ts", "enabled", "online",
+        )} for meter in samples if valid_ip_config(meter.get("ip"))]
+        if (row["meter_samples"] or isinstance(status.get("meters"), list) or status.get("source") == "disabled"
+                or ("climate_meter_ip" in cfg and not valid_ip_config(cfg.get("climate_meter_ip"))
+                    and not valid_ip_config(cfg.get("climate_meter2_ip")))):
+            # Epoch bleibt auch in der doppelten Ortsstunde eindeutig. Eine leere
+            # Zählerliste belegt eine entfernte Konfiguration, keine Messlücke.
+            row["ts_epoch"] = now_ts
+        else:
+            row.pop("meter_samples")
+        if isinstance(status.get("meters"), list):
+            for key in ("meters", "power_valid", "energy_valid", "reason", "energy_reason"):
+                row[key] = status.get(key)
         runtime_state.setdefault("history_pending", []).append({
             "day": datetime.fromtimestamp(now_ts).strftime("%Y-%m-%d"),
             "line": json.dumps(row, ensure_ascii=False, sort_keys=True),
@@ -1274,7 +1327,7 @@ def _history_has_unflushed_data(runtime_state: dict[str, Any]) -> bool:
     )
 
 
-def collect_status(cfg: dict[str, Any]) -> dict[str, Any]:
+def _collect_meter_status(cfg: dict[str, Any]) -> dict[str, Any]:
     if not cfg_bool(cfg, "climate_enable", False):
         return disabled_status(cfg)
     ip = cfg_text(cfg, "climate_meter_ip", "")
@@ -1301,7 +1354,80 @@ def collect_status(cfg: dict[str, Any]) -> dict[str, Any]:
     else:
         payload = read_shelly_status(ip)
     status = parse_shelly_status(payload, cfg)
-    return update_daily_energy(status)
+    if cfg.get("_climate_dual") and not status.get("energy_valid"):
+        return status
+    # Den zur Laufzeit gebundenen Pfad verwenden (auch bei einem Dienstneustart).
+    if cfg.get("_climate_dual"):
+        status["energy_date"] = datetime.fromtimestamp(status["ts"]).strftime("%Y-%m-%d")
+    status = update_daily_energy(status, BASELINE_FILE)
+    if cfg.get("_climate_dual") and status.get("daily_baseline_error"):
+        status.update(daily_kwh=None, energy_valid=False, energy_reason="baseline_write_failed")
+    return status
+
+
+def collect_status(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Einzelmessung unverändert; zwei Messungen unabhängig lesen und validieren."""
+    if not valid_ip_config(cfg.get("climate_meter2_ip")) or not cfg_bool(cfg, "climate_enable"):
+        return _collect_meter_status(cfg)
+    meters = []
+    for index in (1, 2):
+        meter_cfg = dict(cfg, _climate_dual=True)
+        if index == 2:
+            for suffix in ("ip", "type", "phase"):
+                meter_cfg["climate_meter_" + suffix] = cfg.get("climate_meter2_" + suffix, DEFAULT_CONFIG["climate_meter2_" + suffix])
+            meter_cfg["climate_name"] = cfg_text(cfg, "climate_meter2_name", "Klimaanlage 2") or "Klimaanlage 2"
+        started = time.time()
+        try:
+            meter = _collect_meter_status(meter_cfg)
+        except Exception as exc:
+            # Ein fehlerhafter Zähler verhindert keine Messung des anderen.
+            meter = error_status(meter_cfg, type(exc).__name__)
+        meter["id"] = f"meter{index}"
+        meter["ts"] = int(started)
+        meter["ts_iso"] = datetime.fromtimestamp(started).isoformat(timespec="seconds")
+        meters.append(meter)
+    now = time.time()
+    max_age = max(30, min(120, 3 * _safe_int(cfg.get("climate_poll_s"), 15, min_value=5, max_value=300)))
+    for meter in meters:
+        meter["age_s"] = round(max(0.0, now - meter["ts"]), 1)
+        fresh = meter["age_s"] <= max_age
+        meter["power_valid"] = bool(fresh and meter.get("online") and meter.get("measurement_valid") and _finite_number_or_none(meter.get("power_w")) is not None)
+        same_day = meter.get("energy_date") == datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+        meter["energy_valid"] = bool(fresh and same_day and meter.get("online") and meter.get("energy_valid") and _finite_number_or_none(meter.get("daily_kwh")) is not None)
+        if not meter["power_valid"]:
+            meter.update(power_w=None, raw_power_w=None, measurement_valid=False, active=False)
+            meter["reason"] = "stale" if not fresh else (meter.get("reason") or "missing")
+        if not meter["energy_valid"]:
+            meter.update(daily_kwh=None, energy_total_wh=None, energy_total_kwh=None)
+            meter["energy_reason"] = "stale" if not fresh else ("day_changed" if not same_day and meter.get("energy_date") else (meter.get("energy_reason") or "energy_missing"))
+    power_valid = all(m["power_valid"] for m in meters)
+    energy_valid = all(m["energy_valid"] for m in meters)
+    power_sums = {key: _finite_number_or_none(sum(m[key] for m in meters)) if power_valid else None
+                  for key in ("power_w", "raw_power_w")}
+    energy_sums = {key: _finite_number_or_none(sum(m[key] for m in meters)) if energy_valid else None
+                   for key in ("daily_kwh", "energy_total_kwh", "energy_total_wh")}
+    power_sum_invalid = power_valid and any(value is None for value in power_sums.values())
+    energy_sum_invalid = energy_valid and any(value is None for value in energy_sums.values())
+    power_valid = bool(power_valid and not power_sum_invalid)
+    energy_valid = bool(energy_valid and not energy_sum_invalid)
+    result = dict(meters[0])
+    result.pop("id", None)
+    # Top-Level ist die Summe. Elektrische Diagnosefelder sind nicht addierbar.
+    for key in ("ip", "phase", "meter_channel", "current_a", "voltage_v", "pf", "freq_hz", "apparent_power_va", "phases", "channels", "wifi_ip", "shelly_uptime_s", "cloud_connected", "energy_baseline_kwh", "meter_status_source", "energy_status_source", "energy_status_error", "daily_baseline_error", "reactive_power_var", "energy_returned_wh", "output"):
+        result.pop(key, None)
+    result.update(name="Klima", source="climate_sum", meters=meters,
+                  success=power_valid, online=all(m.get("online") for m in meters),
+                  ts=int(now), ts_iso=datetime.fromtimestamp(now).isoformat(timespec="seconds"),
+                  age_s=max(m["age_s"] for m in meters), diagnostic_meter_id="meter1",
+                  power_valid=power_valid, measurement_valid=power_valid, energy_valid=energy_valid,
+                  reason="sum_nonfinite" if power_sum_invalid else next((m["id"] + "_" + m["reason"] for m in meters if not m["power_valid"]), ""),
+                  energy_reason="sum_nonfinite" if energy_sum_invalid else next((m["id"] + "_" + m["energy_reason"] for m in meters if not m["energy_valid"]), ""))
+    for key, value in power_sums.items():
+        result[key] = round(value, 3) if power_valid else None
+    for key, value in energy_sums.items():
+        result[key] = round(value, 6) if energy_valid else None
+    result["active"] = bool(power_valid and result["power_w"] >= result["min_power_w"])
+    return result
 
 
 def run_once(config_path: Path = CONFIG_FILE, output_path: Path = RAMDISK_FILE, runtime_state: dict[str, Any] | None = None) -> dict[str, Any]:

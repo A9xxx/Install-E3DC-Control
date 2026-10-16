@@ -88,6 +88,7 @@ V4_BLOCK_PV = {
     'pv_external_ac_observation_mode',
     'forecast_diagnostics_enable',
     'ml_home_cap_kw',   # Max. Hausverbrauch im ML-Training (kW) – verhindert WB-Artefakte
+    'ml_home_daily_cap_kwh', 'ml_training_legacy_source',
 }
 
 # --- Block 3: Energiepreise & Tarife ---
@@ -122,6 +123,8 @@ V4_BLOCK_TARIFF = {
     # Ladeprofil (economic|balanced|comfort|custom) und Komfort-Preislimit.
     'market_charge_profile', 'market_price_limit_ct',
     'market_min_margin_pct', 'market_safety_correction_ct_per_kwh',
+    'market_degradation_ct_per_kwh', 'market_roundtrip_efficiency_pct',
+    'market_grid_charge_min_job_wh', 'market_grid_charge_min_job_pct',
     'market_autarky_first_enable', 'market_autarky_low_soc_pct',
     'market_autarky_horizon_buffer_wh',
     'market_target_hysteresis_pct', 'market_owner_dwell_s',
@@ -267,6 +270,8 @@ V4_BLOCK_STORAGE = {
     'storage_parallel_wb_hold_s', 'storage_parallel_auto_hold_s',
     'storage_parallel_wb_auto_grid_abort_w', 'storage_parallel_grid_relief_enter_w',
     'storage_curve_mode_wallbox_discharge_protect',
+    'storage_backup_hold_enable', 'storage_backup_energy_kwh', 'storage_backup_reference_time', 'storage_backup_until_time', 'storage_backup_grid_charge_enable', 'storage_backup_grid_price_limit_ct',
+    'storage_central_pv_split_enable', 'storage_central_pv_split_gate_hold_s',
     # Akkustützung nach Korridorlage: Mindest-
     # Hausgrundlast der Vor-Klemme und Messreserve der PV-only-Entladeklemme.
     # Beide liest storage_manager.py; ohne Inventar-Eintrag entfernte
@@ -485,6 +490,10 @@ V4_BLOCK_HEATPUMP = {
     'climate_meter_ip',
     'climate_meter_type',
     'climate_meter_phase',
+    'climate_meter2_name',
+    'climate_meter2_ip',
+    'climate_meter2_type',
+    'climate_meter2_phase',
     'climate_min_power_w',
     'climate_poll_s',
     'climate_history_enable',
@@ -577,10 +586,12 @@ V4_BLOCK_HA = {
     'shadow_fetch_timeout_s', 'shadow_snapshot_max_age_s',
     'shadow_snapshot_token',
     'mqtt_hub_ip', 'mqtt_hub_port', 'mqtt_hub_user', 'mqtt_hub_pass',
-    'mqtt_hub_topic',
+    'mqtt_hub_topic', 'mqtt_hub_repeat_interval_s', 'wp_power_topic', 'mqtt_vehicle_allowlist',
     'mqtt_hub_sub_soc_topic', 'mqtt_hub_sub_soc_name',
     'mqtt_hub_sub_soc_topic_2', 'mqtt_hub_sub_soc_name_2',
     # Direkter externer Wallbox-MQTT-Messwert, z.B. evcc/loadpoints/1/chargePower.
+    'wb1_openwb_username', 'wb1_openwb_password', 'wb1_openwb_tls_binding',
+    'wb2_openwb_username', 'wb2_openwb_password', 'wb2_openwb_tls_binding',
     'wb_ip', 'wb_topic', 'wb_user', 'wb_pass',
     'wb2_ip', 'wb2_topic', 'wb2_user', 'wb2_pass',
     'mqtt_ha_inbound_enable', 'mqtt_ha_inbound_history_enable',

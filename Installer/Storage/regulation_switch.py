@@ -96,3 +96,37 @@ class StorageRegulationSwitch:
             return self.enabled is True and float(manual.get("ts", 0)) > max(request_ts, self.resumed_at)
         except (ValueError, TypeError):
             return False
+
+
+def central_pv_split_scope(cfg, intent, mode, soc, now_s):
+    """Nur Kurvenmodi, ohne Haltezone und ohne gesonderte Quellenfreigabe."""
+    if str(cfg.get("storage_central_pv_split_enable", "0")).lower() not in ("1", "true", "yes", "on"):
+        return False
+    if str(cfg.get("storage_curve_mode_wallbox_discharge_protect", "1")).strip().lower() not in ("1", "true", "yes", "on"):
+        return False
+    try:
+        from Wallbox.modes import MODE_CURVE, MODE_TARGET, MODE_PRICE, normalize_wb_mode
+    except ImportError:
+        from ..Wallbox.modes import MODE_CURVE, MODE_TARGET, MODE_PRICE, normalize_wb_mode
+    import math
+    def number(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value) if math.isfinite(value) else None
+    mode = normalize_wb_mode(intent.get("wb_mode_active", mode))
+    ts = number(intent.get("ts"))
+    if ts is None or not 0 <= now_s - ts <= 60:
+        return False
+    if any(intent.get(key) for key in (
+        "external_wallbox_manager", "autonomous_wallbox", "price_opt_active",
+        "scheduled_slot_active", "price_boost_active", "battery_departure_active",
+        "predump_wallbox_active", "price_plan_storage_protect", "manual_pause",
+        "bev_full_blocked",
+    )):
+        return False
+    if mode == MODE_CURVE:
+        return True
+    if mode not in (MODE_TARGET, MODE_PRICE) or intent.get("wbminsoc_gate_open") is True:
+        return False
+    floor = number(intent.get("effective_wb_floor_soc", intent.get("wbminsoc")))
+    return floor is None or soc < floor

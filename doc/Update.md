@@ -5,12 +5,21 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.5.4`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.5.5`. Das Dashboard startet ausschließlich
 den root-eigenen Systemjob ohne freie Argumente. Die einzige Ausnahme ist
 die tokengebundene Driftfreigabe. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
+
+5.5.5 ist ein Funktions- und Korrekturupdate (Lastprognose aus dem Verlauf,
+Wallbox- und Wärmepumpenregelung, openWB mit Benutzerkonto, MQTT-Wärmepumpe,
+zwei Klima-Messpunkte). Bestehende Installationen aktualisieren wie gewohnt über
+**System Update** bzw. das [Docker-Update](#docker-update); eine
+Konfigurationsänderung ist nicht nötig. Neue experimentelle Funktionen bleiben
+ausgeschaltet. Die Lastprognose wird beim nächsten Prognoselauf mit dem neuen
+Verfahren trainiert. Der bisherige E3DC-WebSocket-Dienst wird mit Version 5.5.6
+entfernt. Einzelheiten stehen in den [Release Notes](../RELEASE_NOTES.md).
 
 5.5.4 ist ein Funktions- und Korrekturupdate (Installationszentrale, Wallbox-
 und Wärmepumpenregelung, Heizstab, Tagesstatistik nach Energiebilanz,

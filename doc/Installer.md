@@ -1,6 +1,6 @@
 # E3DC-Control Installer
 
-Dokumentation Stand: 5.5.4
+Dokumentation Stand: 5.5.5
 
 Der Installer verwaltet Bare-Metal-Installation, Update, Rechte, Dienste,
 Backup, Rollback und optionale Produktmodule. Er ermittelt Benutzer, Home,
@@ -417,7 +417,7 @@ verwendet den alten `installer_main.py`-Updatepfad nicht. Details stehen in
 | `2) Systemstatus anzeigen` | Read-only Übersicht für Dienste, Pfade und Konfiguration. |
 | `3) Rechte prüfen & korrigieren` | Prüft und repariert ausschließlich den Rechtevertrag; kein Vollbackup, kein Releasewechsel und kein Neustart der Regelungsdienste. Inhaltlich lokal geänderte Produktdateien werden vor der Metadatenkorrektur einzeln zur Bestätigung angezeigt. |
 | `4) Notfallmodus / System reparieren` | Gebündelte Reparatur einer beschädigten Installation. |
-| `5) Rollback auf freigegebenes Stable-Release` | Rückfall auf einen ausdrücklich für Bare Metal freigegebenen Stable-Stand; `v5.3.2b` ist dafür nicht freigegeben. |
+| `5) Rollback auf freigegebenes Stable-Release` | Rückfall auf einen in `UPDATE_POLICY.json` für Bare Metal freigegebenen Stable-Stand; ist keiner freigegeben, verweist der Menüpunkt auf das verifizierte Datei-Backup (Hauptmenü 6 → 2). |
 | `6) Backup erstellen / verwalten` | Verifizierte Sicherungen erstellen, wiederherstellen, löschen oder das Limit anwenden. |
 | `7) Expertenmenü` | Docker, Energy Manager, Wallbox, MQTT, HA, Matter und weitere Module. |
 | `8) Systempakete vorbereiten` | Paketbasis und Python-Umgebung für die Installation vorbereiten. |

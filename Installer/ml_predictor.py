@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import sqlite3
+import math
 import os
 import sys
 import json
@@ -15,6 +16,7 @@ import hashlib
 import re
 import statistics
 from contextlib import contextmanager
+from zoneinfo import ZoneInfo
 
 try:
     import fcntl
@@ -47,6 +49,7 @@ MODEL_DIR = os.environ.get("E3DC_ML_MODEL_DIR", "/var/lib/e3dc-control/ml")
 MODEL_PATH = os.path.join(MODEL_DIR, "ml_model.pkl")
 LEGACY_MODEL_PATH = "/var/www/html/data/ml_model.pkl"
 PREDICTION_PATH = "/var/www/html/ramdisk/ml_prediction.json"
+TRAINING_ATTEMPT_PATH = "/var/www/html/ramdisk/ml_training_attempt.json"
 V4_CONFIG_FILE = "/var/www/html/data/e3dc_v4.json"
 ML_CONSUMPTION_EVAL_PATH = "/var/www/html/logs/ml_consumption_eval.json"
 ML_DAILY_FORECAST_MIN_COVERAGE_SLOTS = 80
@@ -60,6 +63,9 @@ _MODEL_FILE_RE = re.compile(r"^ml_model-([0-9a-f]{64})\.pkl$")
 ML_PREDICTION_SCHEMA_VERSION = 2
 ML_EMPIRICAL_MIN_SAMPLES = 48
 ML_EMPIRICAL_RECENT_DAYS = 56
+ML_TRAINING_DAYS = 30
+ML_TEMPERATURE_MIN_COVERAGE = 0.80
+_LAST_TRAINING_DIAGNOSTICS = {}
 
 
 def _set_shared_web_file(path, mode=0o664):
@@ -395,7 +401,7 @@ def _ml_model_lock(path, exclusive=False, create_directory=False):
         os.close(dir_fd)
 
 
-def _read_verified_ml_payload(path):
+def _read_verified_ml_payload(path, with_identity=False):
     with _ml_model_lock(path, exclusive=False) as (dir_fd, owner_uid, _owner_gid):
         manifest_bytes = _read_secure_regular_file(
             dir_fd, _ml_manifest_name(path), owner_uid, 64 * 1024
@@ -419,6 +425,8 @@ def _read_verified_ml_payload(path):
         actual_hash = hashlib.sha256(payload).hexdigest()
         if not secrets.compare_digest(actual_hash, expected_hash):
             raise ValueError("ML-Modellhash stimmt nicht mit dem Manifest ueberein")
+        if with_identity:
+            return payload, manifest, hashlib.sha256(manifest_bytes).hexdigest()
         return payload, manifest
 
 
@@ -465,12 +473,12 @@ def _write_ml_model_safely(path, models):
         raise PermissionError(security_error)
 
 
-def _load_ml_model_safely(path):
-    payload, _manifest = _read_verified_ml_payload(path)
+def _load_ml_model_safely(path, with_identity=False):
+    payload, _manifest, identity = _read_verified_ml_payload(path, with_identity=True)
     models = pickle.loads(payload)
     if not isinstance(models, dict) or "home" not in models or "wp" not in models:
         raise ValueError("ML-Modell hat kein erwartetes Format")
-    return models
+    return (models, identity) if with_identity else models
 
 
 def ml_model_is_ready(path=MODEL_PATH):
@@ -514,6 +522,23 @@ def _ensure_ml_training_table(conn):
             grid_kwh_cum REAL
         )
     ''')
+    columns = {row[1] for row in conn.execute('PRAGMA table_info(ml_training_data)')}
+    if 'house_includes_unknown_wallbox' not in columns:
+        conn.execute('ALTER TABLE ml_training_data ADD COLUMN house_includes_unknown_wallbox INTEGER DEFAULT 0')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_ml_training_quality ON ml_training_data(date, house_includes_unknown_wallbox, time_gmt)')
+
+
+def _ml_training_rows(conn):
+    _ensure_ml_training_table(conn)
+    conn.commit()
+    # Altdaten anderer Erzeuger im selben Viertelstundenfenster bleiben ebenfalls
+    # vom Hauslernen ausgeschlossen; ihre gespeicherten Zähler bleiben erhalten.
+    return conn.execute("""SELECT d.date, d.time_gmt, d.home_kwh_cum, d.wp_kwh_cum, d.temp_c,
+        (COALESCE(d.house_includes_unknown_wallbox,0) OR EXISTS (
+            SELECT 1 FROM ml_training_data q WHERE q.date=d.date
+              AND q.house_includes_unknown_wallbox=1
+              AND q.time_gmt BETWEEN d.time_gmt-0.25 AND d.time_gmt+0.25))
+        FROM ml_training_data d ORDER BY d.date, d.time_gmt""").fetchall()
 
 
 def _as_float(value, default=0.0):
@@ -583,6 +608,7 @@ def _seed_ml_training_from_live_history(min_rows=50, refresh=False):
     last_by_day = {}
     totals_by_day = {}
     slot_rows = {}
+    slot_unknown = {}
 
     try:
         with open(LIVE_HISTORY_PATH, "r", encoding="utf-8", errors="ignore") as f:
@@ -618,6 +644,9 @@ def _seed_ml_training_from_live_history(min_rows=50, refresh=False):
                     entry.get("Aussentemp", entry.get("Aussentemperatur", entry.get("forecast_temp_c"))),
                     8.5
                 )
+                slot_unknown[record_id] = bool(slot_unknown.get(record_id)
+                    or entry.get("house_includes_unknown_wallbox")
+                    or (prev or {}).get("house_includes_unknown_wallbox"))
                 slot_rows[record_id] = (
                     record_id,
                     day,
@@ -628,10 +657,12 @@ def _seed_ml_training_from_live_history(min_rows=50, refresh=False):
                     round(totals["wp"], 5),
                     temp_c,
                     round(totals["grid"], 5),
+                    int(slot_unknown[record_id]),
                 )
 
                 last_by_day[day] = {
                     "dt": dt,
+                    "house_includes_unknown_wallbox": bool(entry.get("house_includes_unknown_wallbox")),
                     "home_w": _as_float(entry.get("home", entry.get("home_raw")), 0.0),
                     "wp_w": _as_float(entry.get("wp"), 0.0),
                     "grid_w": _as_float(entry.get("grid"), 0.0),
@@ -647,8 +678,8 @@ def _seed_ml_training_from_live_history(min_rows=50, refresh=False):
 
     c.executemany('''
         INSERT OR REPLACE INTO ml_training_data
-        (id, date, time_gmt, pv_prog_pct, pv_real_pct, home_kwh_cum, wp_kwh_cum, temp_c, grid_kwh_cum)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, date, time_gmt, pv_prog_pct, pv_real_pct, home_kwh_cum, wp_kwh_cum, temp_c, grid_kwh_cum, house_includes_unknown_wallbox)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', list(slot_rows.values()))
     conn.commit()
     try:
@@ -805,6 +836,10 @@ def _iter_climate_history_samples(max_files=45):
                         temp = _extract_outdoor_temp(row, lux_index=lux_index, dt=dt)
                         if temp is None:
                             continue
+                        if "power_valid" in row:
+                            power = _as_float(row.get("power_w"), None)
+                            if not row["power_valid"] or power is None or not math.isfinite(power):
+                                continue
                         rows.append({
                             "dt": dt,
                             "temp_c": float(temp),
@@ -829,6 +864,10 @@ def _iter_climate_history_samples(max_files=45):
                     dt = _parse_live_ts(row.get("ts"))
                     if dt is None:
                         continue
+                    if "climate_power_valid" in row:
+                        power = _as_float(row.get("climate", row.get("climate_power_w")), None)
+                        if not row["climate_power_valid"] or power is None or not math.isfinite(power):
+                            continue
                     power_w = max(0.0, _as_float(row.get("climate", row.get("climate_power_w")), 0.0))
                     if power_w <= 0.0 and "climate_active" not in row:
                         continue
@@ -1058,10 +1097,12 @@ def _recent_home_consumption_baseline(days=14):
         }
         wb2_expr = "wb2_consumption" if "wb2_consumption" in cols else "0"
         climate_expr = "climate_consumption" if "climate_consumption" in cols else "0"
+        quality_expr = "COALESCE(house_includes_unknown_wallbox, 0)" if "house_includes_unknown_wallbox" in cols else "0"
         c.execute(f"""
             SELECT home_consumption, wb_consumption, {wb2_expr}, wp_consumption, {climate_expr}
             FROM daily_stats
             WHERE date < date('now') AND home_consumption > 0.5
+              AND {quality_expr} = 0
             ORDER BY date DESC
             LIMIT ?
         """, (days,))
@@ -1262,11 +1303,12 @@ def _update_consumption_accuracy_log(timeline):
             }
             wb2_expr = "COALESCE(wb2_consumption, 0)" if "wb2_consumption" in cols else "0"
             climate_expr = "COALESCE(climate_consumption, 0)" if "climate_consumption" in cols else "0"
+            quality_expr = "COALESCE(house_includes_unknown_wallbox, 0)" if "house_includes_unknown_wallbox" in cols else "0"
             c.execute(f"""
                 SELECT date, home_consumption, wp_consumption,
                        COALESCE(wb_consumption, 0), {wb2_expr}, {climate_expr}
                 FROM daily_stats
-                WHERE date >= date('now', '-21 days')
+                WHERE date >= date('now', '-21 days') AND {quality_expr} = 0
                 ORDER BY date ASC
             """)
             for day, home, wp, wb1, wb2, climate in c.fetchall():
@@ -1318,7 +1360,209 @@ def _update_consumption_accuracy_log(timeline):
     _write_consumption_eval_log(eval_log)
     return eval_log
 
+def _legacy_training_enabled():
+    return _truthy(_load_v4_config_dict().get("ml_training_legacy_source"), False)
+
+
+def _measured_outdoor_temp(row):
+    # Prognosetemperaturen und alte DB-Ersatzwerte belegen keine Messung.
+    for key in ("Aussentemp", "Aussentemperatur", "Außentemperatur"):
+        value = _as_float(row.get(key), None)
+        if value is not None and math.isfinite(value) and -60.0 <= value <= 60.0:
+            return value
+    return None
+
+
+def _climate_temperature_index(start_day, end_day):
+    """Nur tatsächlich gespeicherte Außentemperaturen, keine Rückprojektion."""
+    sums = {}
+    for offset in range((end_day - start_day).days + 1):
+        day = start_day + datetime.timedelta(days=offset)
+        path = os.path.join(CLIMATE_HISTORY_DIR, day.isoformat() + ".jsonl")
+        try:
+            with open(path, encoding="utf-8") as stream:
+                for line in stream:
+                    try:
+                        row = json.loads(line)
+                        dt = _parse_live_ts(row.get("ts"))
+                        value = _measured_outdoor_temp(row)
+                        if dt is None or value is None:
+                            continue
+                        dt = dt.replace(tzinfo=ZoneInfo("Europe/Berlin")) if dt.tzinfo is None else dt.astimezone(ZoneInfo("Europe/Berlin"))
+                        if dt.date() != day:
+                            continue
+                        key = (day.isoformat(), dt.hour)
+                        total, count = sums.get(key, (0.0, 0))
+                        sums[key] = (total + value, count + 1)
+                    except (ValueError, TypeError, AttributeError):
+                        continue
+        except (OSError, UnicodeError):
+            continue
+    return {key: total / count for key, (total, count) in sums.items()}
+
+
+def _history_training_day(path, day, complete, diagnostics=None):
+    """Integriert minutenweise wie der Seed; hält nur die tatsächlich gemessenen Tagesslots.
+
+    Tagesränder und Ordnung entsprechen _read_complete_backup. Intervalle über
+    15 Minuten werden wie beim Seed nicht hochgerechnet. Ein Slot braucht
+    mindestens 95 % gemessene Zeit; unbekannte Wallboxwerte sperren den Slot.
+    """
+    zone = ZoneInfo("Europe/Berlin")
+    start = datetime.datetime.combine(day, datetime.time(), zone).timestamp()
+    end = datetime.datetime.combine(day + datetime.timedelta(days=1), datetime.time(), zone).timestamp()
+    slots = {}
+    previous = None
+    first = last = None
+    try:
+        with open(path, encoding="utf-8") as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                dt = _parse_live_ts(row.get("ts"))
+                if dt is None:
+                    raise ValueError("Zeitstempel fehlt")
+                dt = dt.replace(tzinfo=zone) if dt.tzinfo is None else dt.astimezone(zone)
+                if dt.date() != day:
+                    if complete:
+                        raise ValueError("Fremder Kalendertag")
+                    continue
+                stamp = dt.timestamp()
+                if first is None:
+                    first = stamp
+                if last is not None and (stamp <= last or (complete and stamp - last >= 3600)):
+                    raise ValueError("Zeitlücke oder ungeordnete Messpunkte")
+                last = stamp
+                if previous is not None:
+                    prev_dt, prev = previous
+                    seconds = stamp - prev_dt.timestamp()
+                    if 0 < seconds <= 900:
+                        home = _as_float(prev.get("home"), None)
+                        if home is None and diagnostics is not None:
+                            diagnostics["home_missing"] = diagnostics.get("home_missing", 0) + 1
+                        wp = _as_float(prev.get("wp"), None)
+                        valid = (home is not None and wp is not None
+                                 and math.isfinite(home) and math.isfinite(wp)
+                                 and 0 <= home < 30000 and 0 <= wp < 20000)
+                        unknown = bool(prev.get("house_includes_unknown_wallbox") or row.get("house_includes_unknown_wallbox"))
+                        temp = _measured_outdoor_temp(prev)
+                        cursor = prev_dt.timestamp()
+                        while cursor < stamp:
+                            local = datetime.datetime.fromtimestamp(cursor, zone)
+                            slot_key = int(cursor // 900)
+                            # Epoch-Rechnung bleibt auch bei der Zeitumstellung monoton.
+                            boundary = cursor + (15 - local.minute % 15) * 60 - local.second - local.microsecond / 1e6
+                            duration = min(stamp, boundary) - cursor
+                            slot = slots.setdefault(slot_key, dict(seconds=0.0, home=0.0, wp=0.0, temp=0.0, temp_seconds=0.0, invalid=False))
+                            slot["seconds"] += duration
+                            slot["invalid"] |= unknown or not valid
+                            if valid:
+                                slot["home"] += home * duration
+                                slot["wp"] += wp * duration
+                            if temp is not None:
+                                slot["temp"] += temp * duration
+                                slot["temp_seconds"] += duration
+                            cursor += duration
+                previous = (dt, row)
+        if first is None or (complete and (first - start > 300 or end - last > 300)):
+            return [], "Tagesanfang oder Tagesende fehlt"
+    except (OSError, ValueError, TypeError, AttributeError, OverflowError):
+        return [], "Sicherung fehlt oder ist ungültig"
+    samples = []
+    cap = _load_ml_home_cap()
+    for slot_key, slot in sorted(slots.items()):
+        if slot["invalid"] or not 855 <= slot["seconds"] <= 900:
+            continue
+        temp = slot["temp"] / slot["temp_seconds"] if slot["temp_seconds"] >= slot["seconds"] * 0.95 else None
+        local = datetime.datetime.fromtimestamp(slot_key * 900, zone)
+        samples.append(dict(day=day, hour=local.hour + local.minute / 60.0,
+                            slot_timestamp=slot_key * 900,
+                            home_kw=min(cap, slot["home"] / slot["seconds"] / 1000.0),
+                            wp_kw=slot["wp"] / slot["seconds"] / 1000.0,
+                            temp_c=temp, temp_source="history_measurement" if temp is not None else None))
+    return samples, None
+
+
+def _load_history_training_data(lux_index=None):
+    global _LAST_TRAINING_DIAGNOSTICS
+    today = datetime.datetime.now().date()
+    first = today - datetime.timedelta(days=ML_TRAINING_DAYS)
+    # history_backups liegt neben der RAM-Disk, nicht neben einer abweichenden DB.
+    history_dir = os.path.join(os.path.dirname(os.path.dirname(LIVE_HISTORY_PATH)), "data", "history_backups")
+    samples = []
+    excluded_days = {}
+    excluded_intervals = {}
+    for offset in range(ML_TRAINING_DAYS):
+        day = first + datetime.timedelta(days=offset)
+        rows, reason = _history_training_day(os.path.join(history_dir, "history_" + day.isoformat() + ".txt"), day, True, excluded_intervals)
+        samples.extend(rows)
+        if reason:
+            excluded_days[day.isoformat()] = reason
+    current, _reason = _history_training_day(LIVE_HISTORY_PATH, today, False, excluded_intervals)
+    samples.extend(current)
+    lux_index = _build_luxtronik_temp_index(first, today) if lux_index is None else lux_index
+    climate_index = _climate_temperature_index(first, today)
+    for sample in samples:
+        key = (sample["day"].isoformat(), int(sample["hour"]))
+        if sample["temp_c"] is None:
+            for source, index in (("luxtronik_archive", lux_index), ("climate_history", climate_index)):
+                value = _as_float(index.get(key), None)
+                if value is not None and math.isfinite(value) and -60 <= value <= 60:
+                    sample["temp_c"], sample["temp_source"] = value, source
+                    break
+    measured = [sample for sample in samples if sample["temp_c"] is not None]
+    coverage = len(measured) / len(samples) if samples else 0.0
+    weekdays = sorted({sample["day"].weekday() for sample in samples})
+    temperature_enabled = (coverage >= ML_TEMPERATURE_MIN_COVERAGE
+                           and {s["day"].weekday() for s in measured} == set(weekdays)
+                           and len({round(s["temp_c"], 1) for s in measured}) > 1)
+    used = measured if temperature_enabled else samples
+    sources = sorted({s["temp_source"] for s in measured})
+    hour_means = {}
+    for hour in range(24):
+        values = [row for row in measured if int(row["hour"]) == hour]
+        if values:
+            hour_means[str(hour)] = {
+                "mean_c": sum(row["temp_c"] for row in values) / len(values),
+                "count": len(values), "source": "measured_training_values",
+                "sources": sorted({row["temp_source"] for row in values}),
+            }
+    _LAST_TRAINING_DIAGNOSTICS = {
+        "source": "history_backups_and_current_day", "legacy_source": False,
+        "window_start": first.isoformat(), "window_end": today.isoformat(),
+        "lookback_days": ML_TRAINING_DAYS,
+        "weekdays": sorted({s["day"].weekday() for s in used}),
+        "sample_count": len(used), "excluded_days": excluded_days,
+        "excluded_intervals": excluded_intervals,
+        "temperature": {"enabled": temperature_enabled, "sources": sources,
+                        "coverage": round(coverage, 4), "minimum_coverage": ML_TEMPERATURE_MIN_COVERAGE,
+                        "measured_samples": len(measured), "candidate_samples": len(samples),
+                        "hour_means": hour_means,
+                        "overall_mean_c": sum(row["temp_c"] for row in measured) / len(measured) if measured else None,
+                        "overall_count": len(measured), "overall_source": "measured_training_values",
+                        "reason": "measured" if temperature_enabled else "coverage_or_variation_insufficient"},
+    }
+    if len(used) < 50:
+        print(f"Nicht genug gültige Trainingsintervalle: {len(used)} (benötigt: 50).")
+        return None, None
+    X = [[s["hour"], s["day"].weekday(), s["day"].month] + ([s["temp_c"]] if temperature_enabled else []) for s in used]
+    return np.array(X), (np.array([s["home_kw"] for s in used]), np.array([s["wp_kw"] for s in used]))
+
+
 def load_training_data():
+    if _legacy_training_enabled():
+        return _load_legacy_training_data()
+    return _load_history_training_data()
+
+
+def load_training_data_enriched(lux_index):
+    if _legacy_training_enabled():
+        return _load_legacy_training_data_enriched(lux_index)
+    return _load_history_training_data(lux_index)
+
+
+def _load_legacy_training_data():
     if not os.path.exists(DB_PATH): return None, None
 
     conn = sqlite3.connect(DB_PATH)
@@ -1336,8 +1580,7 @@ def load_training_data():
 
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT date, time_gmt, home_kwh_cum, wp_kwh_cum, temp_c FROM ml_training_data ORDER BY date, time_gmt")
-    rows = c.fetchall()
+    rows = _ml_training_rows(conn)
     conn.close()
 
     if len(rows) < 50:
@@ -1346,16 +1589,17 @@ def load_training_data():
 
     X = []; y_home = []; y_wp = []
     last_date = None; last_home_cum = 0; last_wp_cum = 0; last_time_gmt = 0
+    last_unknown = False
 
     for row in rows:
-        date_str, time_gmt, home_cum, wp_cum, temp_c = row
+        date_str, time_gmt, home_cum, wp_cum, temp_c, unknown = row
         try:
             dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
             day_of_week = dt.weekday() # 0 = Mo, 6 = So
             month = dt.month
         except: continue
 
-        if last_date == date_str:
+        if last_date == date_str and not unknown and not last_unknown:
             time_diff = time_gmt - last_time_gmt
             if time_diff < 0: time_diff += 24.0 # Sollte durch ORDER BY nicht passieren
 
@@ -1379,11 +1623,12 @@ def load_training_data():
                     y_wp.append(wp_kw)
 
         last_date = date_str; last_home_cum = home_cum; last_wp_cum = wp_cum; last_time_gmt = time_gmt
+        last_unknown = bool(unknown)
 
     return np.array(X), (np.array(y_home), np.array(y_wp))
 
 
-def load_training_data_enriched(lux_index):
+def _load_legacy_training_data_enriched(lux_index):
     """Wie load_training_data(), ersetzt aber temp_c durch gemessene Luxtronik-Aussentemperatur
     aus dem uebergebenen Index {(date_str, hour): avg_temp_c}.
     Fuer Zeitslots ohne Archivwert bleibt der DB-Wert erhalten.
@@ -1392,8 +1637,7 @@ def load_training_data_enriched(lux_index):
 
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT date, time_gmt, home_kwh_cum, wp_kwh_cum, temp_c FROM ml_training_data ORDER BY date, time_gmt")
-    rows = c.fetchall()
+    rows = _ml_training_rows(conn)
     conn.close()
 
     if len(rows) < 50:
@@ -1401,16 +1645,17 @@ def load_training_data_enriched(lux_index):
 
     X = []; y_home = []; y_wp = []
     last_date = None; last_home_cum = 0; last_wp_cum = 0; last_time_gmt = 0
+    last_unknown = False
 
     for row in rows:
-        date_str, time_gmt, home_cum, wp_cum, temp_c_db = row
+        date_str, time_gmt, home_cum, wp_cum, temp_c_db, unknown = row
         try:
             dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
             day_of_week = dt.weekday()
             month = dt.month
         except: continue
 
-        if last_date == date_str:
+        if last_date == date_str and not unknown and not last_unknown:
             time_diff = time_gmt - last_time_gmt
             if time_diff < 0: time_diff += 24.0
 
@@ -1435,13 +1680,14 @@ def load_training_data_enriched(lux_index):
                     y_wp.append(wp_kw)
 
         last_date = date_str; last_home_cum = home_cum; last_wp_cum = wp_cum; last_time_gmt = time_gmt
+        last_unknown = bool(unknown)
 
     if len(X) < 50:
         return None, None
     return np.array(X), (np.array(y_home), np.array(y_wp))
 
 
-def _build_luxtronik_temp_index():
+def _build_luxtronik_temp_index(start_day=None, end_day=None):
     """Liest alle verfuegbaren Luxtronik-Archivdateien und baut einen
     Stunden-Index {(date_str, hour_int): avg_temp_c} auf.
     Unterstuetzt:
@@ -1467,7 +1713,9 @@ def _build_luxtronik_temp_index():
             # luxtronik_2026-04-11.json -> Datum extrahieren
             try:
                 date_str = fname[len("luxtronik_"):-len(".json")]  # "YYYY-MM-DD"
-                datetime.datetime.strptime(date_str, "%Y-%m-%d")   # Format-Check
+                archive_day = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+                if start_day is not None and not start_day <= archive_day <= end_day:
+                    continue
             except Exception:
                 continue
             fpath = os.path.join(archive_dir, fname)
@@ -1489,7 +1737,7 @@ def _build_luxtronik_temp_index():
                                 temp = data[key]
                                 break
                         if temp is None:
-                            temp = obj.get("Aussentemp") or obj.get("Aussentemperatur")
+                            temp = _measured_outdoor_temp(obj) if start_day is not None else (obj.get("Aussentemp") or obj.get("Aussentemperatur"))
                         if temp is None:
                             continue
                         # Uhrzeit aus Timestamp
@@ -1497,11 +1745,17 @@ def _build_luxtronik_temp_index():
                         if isinstance(ts, str):
                             try:
                                 dt = datetime.datetime.fromisoformat(ts)
+                                if start_day is not None:
+                                    dt = dt.replace(tzinfo=ZoneInfo("Europe/Berlin")) if dt.tzinfo is None else dt.astimezone(ZoneInfo("Europe/Berlin"))
+                                    if dt.date().isoformat() != date_str:
+                                        continue
                                 _add(date_str, dt.hour, temp)
                             except Exception:
                                 pass
                         elif isinstance(ts, (int, float)) and ts > 1e9:
-                            dt = datetime.datetime.fromtimestamp(ts)
+                            dt = datetime.datetime.fromtimestamp(ts, ZoneInfo("Europe/Berlin")) if start_day is not None else datetime.datetime.fromtimestamp(ts)
+                            if start_day is not None and dt.date().isoformat() != date_str:
+                                continue
                             _add(date_str, dt.hour, temp)
             except Exception:
                 pass
@@ -1524,8 +1778,12 @@ def _build_luxtronik_temp_index():
                     temp = data[key]
                     break
             if temp is None:
-                temp = obj.get("Aussentemp") or obj.get("Aussentemperatur")
+                temp = _measured_outdoor_temp(obj) if start_day is not None else (obj.get("Aussentemp") or obj.get("Aussentemperatur"))
             if temp is not None:
+                if start_day is not None:
+                    measured_at = _parse_live_ts(obj.get("ts"))
+                    if measured_at is None or abs(measured_at.timestamp() - datetime.datetime.now().timestamp()) > 300:
+                        continue
                 now_h = datetime.datetime.now().hour
                 _add(today_str, now_h, temp)
         except Exception:
@@ -1575,13 +1833,7 @@ def _load_empirical_consumption_profile(now=None):
         if not table:
             conn.close()
             return None
-        rows = conn.execute(
-            """
-            SELECT date, time_gmt, home_kwh_cum, wp_kwh_cum, temp_c
-            FROM ml_training_data
-            ORDER BY date, time_gmt
-            """
-        ).fetchall()
+        rows = _ml_training_rows(conn)
         conn.close()
     except Exception as exc:
         print(f"Historisches Verbrauchsprofil konnte nicht gelesen werden: {exc}")
@@ -1601,7 +1853,7 @@ def _load_empirical_consumption_profile(now=None):
     samples = []
     previous = None
 
-    for date_str, time_gmt, home_cum, wp_cum, temp_c in rows:
+    for date_str, time_gmt, home_cum, wp_cum, temp_c, unknown in rows:
         try:
             day = datetime.datetime.strptime(str(date_str), "%Y-%m-%d").date()
             hour_value = float(time_gmt)
@@ -1612,7 +1864,7 @@ def _load_empirical_consumption_profile(now=None):
             continue
         if day < recent_start:
             continue
-        if previous is not None and previous["day"] == day:
+        if previous is not None and previous["day"] == day and not unknown and not previous.get("unknown"):
             delta_h = hour_value - previous["hour"]
             if delta_h < 0.0:
                 delta_h += 24.0
@@ -1634,6 +1886,7 @@ def _load_empirical_consumption_profile(now=None):
             "hour": hour_value,
             "home": home_value,
             "wp": wp_value,
+            "unknown": bool(unknown),
         }
 
     if len(samples) < ML_EMPIRICAL_MIN_SAMPLES:
@@ -1736,6 +1989,132 @@ def _empirical_power_for_slot(profile, target_ts, slot_temp, cfg):
     }
 
 
+def _training_temperature(models, hour):
+    """Verwendet nur im hashgeschützten Payload gebundene Messmittel."""
+    temperature = models.get("training_diagnostics", {}).get("temperature", {})
+    hourly = temperature.get("hour_means")
+    entry = hourly.get(str(hour), {}) if isinstance(hourly, dict) else {}
+    value = _as_float(entry.get("mean_c"), None) if isinstance(entry, dict) else None
+    if value is not None and math.isfinite(value) and -60 <= value <= 60:
+        return value, "training_hour_mean"
+    value = _as_float(temperature.get("overall_mean_c"), None)
+    if value is not None and math.isfinite(value) and -60 <= value <= 60:
+        return value, "training_overall_mean"
+    return None, None
+
+
+def _read_training_attempt():
+    """Begrenzter, nicht blockierender Leser für den flüchtigen Versuchszustand."""
+    fd = None
+    try:
+        fd = os.open(TRAINING_ATTEMPT_PATH, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return {}, True
+        if info.st_size > 4096:
+            return {}, False
+        raw = os.read(fd, 4097)
+        if len(raw) > 4096:
+            return {}, False
+        candidate = json.loads(raw)
+        if (not isinstance(candidate, dict)
+                or not {"last_attempt", "result"} <= candidate.keys()
+                or candidate.keys() - {"last_attempt", "result", "model_identity"}):
+            return {}, False
+        stamp = candidate["last_attempt"]
+        if (type(stamp) not in (int, float) or not math.isfinite(stamp)
+                or candidate["result"] not in ("running", "failed")):
+            return {}, False
+        identity = candidate.get("model_identity", "")
+        if not isinstance(identity, str) or len(identity) > 128:
+            return {}, False
+        return candidate, False
+    except (OSError, ValueError, TypeError, UnicodeError, OverflowError):
+        try:
+            return {}, not stat.S_ISREG(os.lstat(TRAINING_ATTEMPT_PATH).st_mode)
+        except OSError:
+            return {}, False
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _attempt_path_unusable():
+    try:
+        return not stat.S_ISREG(os.lstat(TRAINING_ATTEMPT_PATH).st_mode)
+    except FileNotFoundError:
+        return False
+
+
+def _write_training_attempt(state):
+    # Spezialdateien bleiben erhalten, auch wenn Training erlaubt ist.
+    if _attempt_path_unusable():
+        return False
+    parent = os.path.dirname(TRAINING_ATTEMPT_PATH)
+    os.makedirs(parent, exist_ok=True)
+    temporary = os.path.join(parent, ".ml_training_attempt." + secrets.token_hex(8))
+    fd = None
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            fd = None
+            os.fchmod(out.fileno(), 0o644)
+            json.dump(state, out, allow_nan=False)
+            out.write("\n")
+            out.flush()
+            os.fsync(out.fileno())
+        if _attempt_path_unusable():
+            return False
+        os.replace(temporary, TRAINING_ATTEMPT_PATH)
+        return True
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+
+
+def _training_attempt(now, reserve=False, result=None, model_identity=None):
+    """Modellidentität, Prüfung und Reservierung teilen dieselbe Modellsperre.
+
+    Die RAM-Disk überdauert keinen Neustart; danach ist ein Versuch erlaubt.
+    Ein Prozessabbruch hinterlässt bis dahin den atomaren running-Zustand.
+    """
+    stamp = now.timestamp()
+    with _ml_model_lock(MODEL_PATH, exclusive=True, create_directory=True) as (dir_fd, uid, _gid):
+        if reserve and model_identity is not None:
+            current = hashlib.sha256(_read_secure_regular_file(
+                dir_fd, _ml_manifest_name(MODEL_PATH), uid, 64 * 1024)).hexdigest()
+            if current != model_identity:
+                return {"last_attempt": None, "result": None, "next_earliest_attempt": None,
+                        "allowed": False, "model_changed": True}
+        state, unusable = _read_training_attempt()
+        if state and state["last_attempt"] > stamp + 300:
+            state = {}
+        allowed = not state or stamp >= state["last_attempt"] + 6 * 3600
+        if reserve and allowed:
+            state = {"last_attempt": stamp, "result": "running"}
+            if model_identity is not None:
+                state["model_identity"] = model_identity
+        elif result is not None and state:
+            state["result"] = result
+        if not unusable and ((reserve and allowed) or (result is not None and state)):
+            unusable = not _write_training_attempt(state)
+        return {"last_attempt": state.get("last_attempt"), "result": state.get("result"),
+                "model_identity": state.get("model_identity"),
+                "next_earliest_attempt": state["last_attempt"] + 6 * 3600 if state else None,
+                "allowed": allowed, "attempt_state_unusable": unusable}
+
+
+def _clear_training_attempt():
+    with _ml_model_lock(MODEL_PATH, exclusive=True):
+        if not _attempt_path_unusable():
+            try:
+                os.unlink(TRAINING_ATTEMPT_PATH)
+            except FileNotFoundError:
+                pass
+
+
 def train_model():
     if not HAS_SKLEARN:
         print("FEHLER: scikit-learn ist nicht installiert. Bitte fuehre im Installer Punkt 3 aus.")
@@ -1747,26 +2126,28 @@ def train_model():
         print(legacy_notice)
 
     print("Lade und bereite historische Daten auf...")
-    res = load_training_data()
+    # Die Quellenwahl bleibt für diesen Trainingslauf fest gebunden.
+    legacy_source = _legacy_training_enabled()
+    res = _load_legacy_training_data() if legacy_source else _load_history_training_data()
     if res[0] is None:
         _activate_conservative_ml_fallback("noch keine ausreichenden Trainingsdaten")
         return False
 
     X, (y_home, y_wp) = res
 
-    # --- Temperaturen aus Luxtronik-Archiv anreichern (wenn vorhanden) ---
-    # Dadurch lernt das Modell echte Aussentemperaturen statt einen gemeinsamen Fallback-Wert.
-    # Nutzer ohne WP haben kein Archiv -> Index bleibt leer -> temp_c aus DB bleibt unveraendert.
-    print("Baue Luxtronik-Temperaturindex auf (kann einen Moment dauern)...")
-    lux_index = _build_luxtronik_temp_index()
-    if lux_index:
-        print(f"  Luxtronik-Index: {len(lux_index)} Stunden-Slots aus Archiv geladen.")
-        X_enriched, res_e = load_training_data_enriched(lux_index)
-        if X_enriched is not None and len(X_enriched) > 0:
-            X, y_home, y_wp = X_enriched, res_e[0], res_e[1]
-            print(f"  Temperatur-Anreicherung: {len(X)} Datensaetze mit echten Luxtronik-Aussentemps.")
+    if legacy_source:
+        lux_index = _build_luxtronik_temp_index()
+        if lux_index:
+            X_enriched, res_e = _load_legacy_training_data_enriched(lux_index)
+            if X_enriched is not None and len(X_enriched) > 0:
+                X, y_home, y_wp = X_enriched, res_e[0], res_e[1]
+        training = {"legacy_source": True, "source": "legacy_database_and_ramdisk",
+                    "window_start": None, "window_end": None, "lookback_days": None,
+                    "window_reason": "legacy_source_without_bound_window", "sample_count": len(X),
+                    "weekdays": sorted({int(row[1]) for row in X}),
+                    "temperature": {"enabled": True, "sources": ["legacy_database"], "coverage": None}}
     else:
-        print("  Kein Luxtronik-Archiv gefunden - nutze temp_c aus Datenbank (Fallback).")
+        training = dict(_LAST_TRAINING_DIAGNOSTICS)
 
     print(f"Trainiere Machine Learning Modell mit {len(X)} Datensaetzen...")
 
@@ -1780,24 +2161,30 @@ def train_model():
     try:
         _write_ml_model_safely(
             MODEL_PATH,
-            {'home': model_home, 'wp': model_wp, 'trained_at': datetime.datetime.now().isoformat()},
+            {'home': model_home, 'wp': model_wp, 'trained_at': datetime.datetime.now().isoformat(),
+             'training_diagnostics': training},
         )
     except Exception as exc:
         print(f"FEHLER: ML-Modell konnte nicht sicher gespeichert werden: {exc}")
         _activate_conservative_ml_fallback("sicheres Modell konnte nicht veroeffentlicht werden")
         return False
 
+    # Erst nach sicherer Veröffentlichung, auch beim expliziten --train.
+    _clear_training_attempt()
     print(f"[OK] ML-Modell erfolgreich trainiert ({MODEL_PATH}).", flush=True)
     return True
 
 def predict_today():
     now = datetime.datetime.now()
+    legacy_source = _legacy_training_enabled()
     forecast_mode = "verified_ml_model"
     model_ready = False
     model_reason = ""
     model_home = None
     model_wp = None
     empirical_profile = None
+    models = {}
+    retraining = {"last_attempt": None, "result": None, "next_earliest_attempt": None}
 
     # Das signierte Modell bleibt die führende Quelle. Fehlt sklearn oder ist
     # das Modell/Manifest nicht vertrauenswürdig, wird niemals ein Legacy-
@@ -1811,10 +2198,50 @@ def predict_today():
         model_reason = "kein_vertrauenswuerdiges_modell"
     else:
         try:
-            models = _load_ml_model_safely(MODEL_PATH)
+            for refresh in range(2):
+                models, model_identity = _load_ml_model_safely(MODEL_PATH, with_identity=True)
+                training = models.get('training_diagnostics', {})
+                mode_changed = bool(training.get('legacy_source', True)) != legacy_source
+                partial_week = (not legacy_source and (not training or
+                                (set(training.get('weekdays', [])) != set(range(7))
+                                 and str(models.get('trained_at', ''))[:10] != now.date().isoformat())))
+                temperature = training.get("temperature", {})
+                incomplete_temperature = (not legacy_source and temperature.get("enabled", True)
+                                          and not isinstance(temperature.get("hour_means"), dict))
+                retraining = _training_attempt(now)
+                if not (mode_changed or partial_week or incomplete_temperature):
+                    model_reason = ""
+                    break
+                print("ML-Training: Quellenwechsel oder unvollständige Trainingsdiagnose.")
+                retraining = _training_attempt(now, reserve=True, model_identity=model_identity)
+                model_reason = "neutraining_ausstehend"
+                if retraining.get("model_changed"):
+                    # Höchstens einmal neu laden und den Bedarf erneut prüfen.
+                    continue
+                if retraining["allowed"]:
+                    try:
+                        trained = train_model()
+                    except Exception as exc:
+                        print(f"ML-Nachtraining fehlgeschlagen: {type(exc).__name__}")
+                        trained = False
+                    if trained:
+                        models = _load_ml_model_safely(MODEL_PATH)
+                        unusable = retraining.get("attempt_state_unusable", False)
+                        retraining = {"last_attempt": now.timestamp(), "result": "success",
+                                      "next_earliest_attempt": None, "attempt_state_unusable": unusable}
+                        model_reason = ""
+                    else:
+                        retraining = _training_attempt(now, result="failed")
+                break
             model_home = models['home']
             model_wp = models['wp']
             model_ready = True
+            temperature = models.get("training_diagnostics", {}).get("temperature", {})
+            uses_temperature = temperature.get("enabled", True)
+            if (not legacy_source and uses_temperature
+                    and any(_training_temperature(models, hour)[0] is None for hour in range(24))):
+                model_ready = False
+                model_reason = "temperature_means_missing"
         except Exception as exc:
             model_reason = f"modellpruefung_fehlgeschlagen:{type(exc).__name__}"
             print(f"FEHLER: ML-Modell wird aus Sicherheitsgründen nicht geladen: {exc}")
@@ -1882,12 +2309,18 @@ def predict_today():
             with open(weather_path, "r") as f:
                 wdata = json.load(f)
             for ts_str, slot in wdata.get("hourly", {}).items():
-                weather_hourly[int(ts_str)] = slot["temp_c"]
+                value = _as_float(slot.get("temp_c"), None) if isinstance(slot, dict) else None
+                try:
+                    stamp = int(ts_str)
+                except (ValueError, TypeError):
+                    continue
+                if value is not None and math.isfinite(value) and -60 <= value <= 60:
+                    weather_hourly[stamp] = value
             print(f"Wetter-Prognose geladen: {len(weather_hourly)} Stunden-Slots verfuegbar.")
         except Exception as e:
-            print(f"Wetter-Prognose konnte nicht geladen werden ({e}) - nutze aktuelle Temp als Fallback.")
+            print(f"Wetter-Prognose konnte nicht geladen werden ({e}) - verwende die verfügbare Temperaturquelle je Slot.")
     else:
-        print(f"Keine Wetter-Prognose gefunden ({weather_path}) - nutze {current_temp}C gleichmaessig.")
+        print(f"Keine Wetter-Prognose gefunden ({weather_path}); Temperaturquelle wird je Slot bestimmt.")
 
     total_home_today = 0
     total_wp_today   = 0
@@ -1895,6 +2328,10 @@ def predict_today():
     timeline = []
     slots_with_forecast = 0
     slots_with_fallback = 0
+    temperature_sources = {}
+    temperature_fallback_used = False
+    temperature_model = (model_ready and not legacy_source
+                         and models.get("training_diagnostics", {}).get("temperature", {}).get("enabled", True))
     cfg = _load_v4_config_dict()
     climate_profile = _build_climate_forecast_profile(cfg)
     if climate_profile.get("enabled"):
@@ -1923,24 +2360,32 @@ def predict_today():
         slot_hour_ts = int(target_ts.replace(minute=0, second=0, microsecond=0).timestamp())
         if slot_hour_ts in weather_hourly:
             slot_temp = weather_hourly[slot_hour_ts]
+            slot_temp_source = "weather_forecast"
             slots_with_forecast += 1
         else:
-            slot_temp = current_temp  # Fallback: aktuelle Aussentemperatur
+            if temperature_model:
+                slot_temp, slot_temp_source = _training_temperature(models, target_ts.hour)
+            else:
+                slot_temp, slot_temp_source = current_temp, "current_temperature_fallback"
             slots_with_fallback += 1
+        temperature_sources[slot_temp_source] = temperature_sources.get(slot_temp_source, 0) + 1
+        slot_temperature_fallback = temperature_model and slot_temp_source != "weather_forecast"
+        temperature_fallback_used |= slot_temperature_fallback
         slot_key = target_ts.hour * 4 + int(target_ts.minute / 15)
 
         if forecast_mode == "verified_ml_model":
             # Feature-Vektor: [Stunde_GMT, Wochentag, Monat,
             # Aussentemperatur_Prognose]. Die Reihenfolge muss exakt dem
             # Training entsprechen.
-            X_pred = np.array([[time_gmt, d_of_w, m, slot_temp]])
+            uses_temperature = models.get("training_diagnostics", {}).get("temperature", {}).get("enabled", True)
+            X_pred = np.array([[time_gmt, d_of_w, m] + ([slot_temp] if uses_temperature else [])])
             power_home = max(0, model_home.predict(X_pred)[0])
             power_wp = max(0, model_wp.predict(X_pred)[0])
             consumption_slot = {
                 "home_source": "verified_ml_model",
-                "home_quality": "model",
+                "home_quality": "model_temperature_fallback" if slot_temperature_fallback else "model",
                 "wp_source": "verified_ml_model",
-                "wp_quality": "model",
+                "wp_quality": "model_temperature_fallback" if slot_temperature_fallback else "model",
                 "sample_count": None,
             }
         else:
@@ -1960,7 +2405,7 @@ def predict_today():
             if climate_profile.get("enabled")
             else "not_applicable"
         )
-        climate_quality = "empirical" if climate_profile.get("enabled") else "not_applicable"
+        climate_quality = ("model_temperature_fallback" if slot_temperature_fallback else "empirical") if climate_profile.get("enabled") else "not_applicable"
 
         # Energie in kWh = Leistung * 0.25h (für aufsummierte Tages-Statistik)
         energy_home = power_home * 0.25
@@ -1983,6 +2428,9 @@ def predict_today():
             "climate_forecast_active": bool(power_climate > 0.0),
             "forecast_temp_c": round(slot_temp,  1),  # NEU: verwendete Prognosetemp (Debug/Dashboard)
         })
+
+        if not legacy_source:
+            timeline[-1]["forecast_temp_source"] = slot_temp_source
 
         if offset < (24 * 4):  # Erste 24h für die Konsolen-Tagessumme
             total_home_today += energy_home
@@ -2012,6 +2460,13 @@ def predict_today():
         # Richtung wirken.
         print("Bias-Korrektur: für das empirische Historienprofil neutral.")
 
+    legacy_source = _legacy_training_enabled()
+    if not legacy_source:
+        sanity_factor, sanity_baseline = _apply_home_forecast_sanity(timeline)
+        total_home_today = sum(slot['home_kwh'] * 0.25 for slot in timeline[:24 * 4])
+
+    # Der Hausdeckel prüft die Modellausgabe, der belegte Bias folgt danach.
+    # Das Accuracy-Log bewertet weiterhin ausschließlich die ausgegebene Prognose.
     # Bias auf Timeline anwenden
     if bias_home != 1.0 or bias_wp != 1.0:
         for slot in timeline:
@@ -2020,8 +2475,9 @@ def predict_today():
         total_home_today *= bias_home
         total_wp_today   *= bias_wp
 
-    sanity_factor, sanity_baseline = _apply_home_forecast_sanity(timeline)
-    if sanity_factor != 1.0:
+    if legacy_source:
+        sanity_factor, sanity_baseline = _apply_home_forecast_sanity(timeline)
+    if legacy_source and sanity_factor != 1.0:
         total_home_today = sum(
             max(0.0, float(slot.get('home_kwh', 0.0) or 0.0)) * 0.25
             for slot in timeline[:24 * 4]
@@ -2033,7 +2489,15 @@ def predict_today():
             for slot in timeline[:24 * 4]
         )
 
-    _update_consumption_accuracy_log(timeline)
+    accuracy = _update_consumption_accuracy_log(timeline)
+    corrections = {"order": "bias_then_sanity" if legacy_source else "home_sanity_then_bias",
+                   "bias_home": round(bias_home, 3), "bias_wp": round(bias_wp, 3),
+                   "sanity_home_factor": round(sanity_factor, 3), "sanity_home_baseline_kwh": sanity_baseline,
+                   "sanity_wp_factor": round(sanity_wp_factor, 3)}
+    if isinstance(accuracy, dict):
+        accuracy["training_diagnostics"] = models.get("training_diagnostics")
+        accuracy["corrections"] = corrections
+        _write_consumption_eval_log(accuracy)
 
     pct_forecast = round(100 * slots_with_forecast / (slots_with_forecast + slots_with_fallback))
     print(
@@ -2042,7 +2506,7 @@ def predict_today():
     )
     print(
         f"     Temperatur-Prognose: {slots_with_forecast}/{slots_with_forecast+slots_with_fallback} Slots "
-        f"mit Wetter-Prognose ({pct_forecast}%), {slots_with_fallback} Slots mit Fallback ({current_temp}C)."
+        f"mit Wetter-Prognose ({pct_forecast}%), {slots_with_fallback} Slots aus weiteren Quellen: {temperature_sources}."
     )
 
     # Fuer den Energy Manager und Dashboard in der Ramdisk ablegen.
@@ -2070,13 +2534,23 @@ def predict_today():
             )
         }
 
+    temperature_diagnostics = {"sources": temperature_sources,
+                               "reasons": ["temperature_fallback_training_mean"] if temperature_fallback_used else []}
+    if isinstance(accuracy, dict):
+        accuracy["temperature_diagnostics"] = temperature_diagnostics
+        accuracy["retraining"] = retraining
+        _write_consumption_eval_log(accuracy)
     prediction_payload = {
         "schema_version": ML_PREDICTION_SCHEMA_VERSION,
         "ts":         datetime.datetime.now().isoformat(),
         "forecast_mode": forecast_mode,
         "model_ready": bool(model_ready),
         "model_reason": model_reason or None,
+        "temperature_diagnostics": temperature_diagnostics,
+        "retraining": retraining,
         "history_profile": history_profile_meta,
+        "training_diagnostics": models.get("training_diagnostics"),
+        "corrections": corrections,
         "consumer_sources": {
             "home": {
                 "sources": _timeline_values("home_source"),

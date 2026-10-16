@@ -175,6 +175,12 @@ class CommandExecutor:
         def driver_amp(name="amp", default=0.0):
             return _driver_current_amp(charger, cmd_amp(name, default))
 
+        from contextvars import ContextVar
+        protection_context = getattr(charger, "_command_protection_context", None)
+        if protection_context is None:
+            protection_context = ContextVar("openwb_command_protection", default=False)
+            charger._command_protection_context = protection_context
+        protection_token = protection_context.set(cmd.get("protection") is True)
         try:
             if method == "take_control":
                 return bool(charger.take_control())
@@ -254,4 +260,6 @@ class CommandExecutor:
                     "Wallbox-Treiberbefehl fehlgeschlagen (%s/%s): %s",
                     method or kind, reason, exc,
                 )
+        finally:
+            protection_context.reset(protection_token)
         return False

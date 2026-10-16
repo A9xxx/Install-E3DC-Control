@@ -3142,6 +3142,8 @@ def _start_window_fresh_core(plug_session_id: Any) -> Dict[str, Any]:
         "cycle": 0,
         "cycle_anchor_ts": 0.0,
         "retry_due_ts": 0.0,
+        "cp_reason": "",
+        "cp_reason_since": 0.0,
         "cp_in_cycle": 0,
         "cp_count_session": 0,
         "cp_settle_until": 0.0,
@@ -3247,6 +3249,10 @@ def start_window_contract(
     sequence_active = bool(inp.get("phase_sequence_active", False))
     reservation_active = bool(inp.get("reservation_active", False))
     cp_enabled = bool(inp.get("cp_enabled", False))
+    cp_reason = str(inp.get("cp_reason") or "")
+    if w.get("cp_reason") != cp_reason or now < _safe_float(w.get("cp_reason_since"), 0.0):
+        w["cp_reason_since"] = now
+    w["cp_reason"] = cp_reason
     start_blocked_by_session = bool(inp.get("start_blocked_by_session", False))
     slot_active = bool(inp.get("slot_active", False))
     command_ts = _safe_float(inp.get("command_ts"), 0.0)
@@ -3880,6 +3886,8 @@ def start_window_contract(
         "start_amp": float(start_amp),
         "reemit_due": bool(reemit_due),
         "cp_due": bool(cp_due),
+        "cp_enabled": cp_enabled,
+        "cp_reason": cp_reason,
         "hard_edge": bool(hard_edge and state == START_WINDOW_STATE_ABORTED_HARD),
         "hard_edge_reason": str(w.get("hard_edge_reason") or (hard_reason if hard_edge else "")),
         "min_offer_standing": bool(offered_rb >= 6.0),
@@ -4113,6 +4121,16 @@ def start_window_reason_text(window: Optional[Dict[str, Any]], now_ts: Any = 0) 
     now = _safe_float(now_ts, 0.0)
     offer = _safe_float(w.get("offer_amp"), 0.0)
     cycle = min(int(_safe_int(w.get("cycle"), 0)), START_WINDOW_CYCLES_MAX)
+    if state in (START_WINDOW_STATE_RETRY_WAIT, START_WINDOW_STATE_EXHAUSTED) and w.get("cp_enabled") is False:
+        cp_hint = {
+            "explicitly_disabled": "Der Weckimpuls ist ausgeschaltet; Ladung im Fahrzeug oder in der Hersteller-App starten.",
+            "auto_requires_explicit_vehicle_profile": "Weckimpuls nur mit Fahrzeugprofil ‚CP-Wakeup erforderlich‘; Ladung im Fahrzeug oder in der Hersteller-App starten.",
+            "requires_fresh_official_cp_surface": "Weckimpuls derzeit nicht verfügbar; Ladung im Fahrzeug oder in der Hersteller-App starten.",
+        }.get(str(w.get("cp_reason") or ""))
+        stable = w.get("cp_reason") != "requires_fresh_official_cp_surface" or now - _safe_float(w.get("cp_reason_since"), now) >= 60
+        if cp_hint and stable and _safe_float(w.get("power_rb"), 0.0) <= 100 and not w.get("charge_confirmed"):
+            retry_text = (" Start abgelehnt – Wiederholung %s (ohne CP)." % _start_window_hhmm(_safe_float(w.get("retry_next_ts"), 0.0))) if state == START_WINDOW_STATE_RETRY_WAIT else ""
+            return "Fahrzeug nimmt den angebotenen Strom nicht ab. " + cp_hint + retry_text
     if state == START_WINDOW_STATE_OFFER_PENDING:
         amp = offer if offer >= 6.0 else _safe_float(w.get("command_amp"), 6.0)
         return "Startangebot %.0f A gesendet; warte auf Bestätigung der Box." % max(6.0, amp)

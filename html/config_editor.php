@@ -59,6 +59,8 @@ function e3dc_config_editor_wallbox_toggle_checked(array $config, $key) {
 // wie es Install-Center (Passwortfelder) und Wallbox-Seite bereits tun. Koordinaten u. ä. bleiben Zahlen.
 function e3dc_config_editor_text_only_key($key) {
     $k = strtolower(trim((string)$key));
+    if ($k === 'mqtt_vehicle_allowlist') return true;
+    if (preg_match('/^wb[12]_openwb_(username|password|tls_binding)$/', $k)) return true;
     if (in_array($k, ['bluelink_user', 'bluelink_password', 'bluelink_pin', 'web_pin'], true)) {
         return true;
     }
@@ -66,7 +68,7 @@ function e3dc_config_editor_text_only_key($key) {
 }
 
 function e3dc_config_editor_store_posted_value($key, $value) {
-    $value = trim((string)$value);
+    $value = preg_match('/^wb[12]_openwb_(username|password)$/', (string)$key) ? (string)$value : trim((string)$value);
     if ($value === '' || e3dc_config_editor_text_only_key($key) || !is_numeric($value)) {
         return $value;
     }
@@ -388,6 +390,9 @@ $defaults = [
     "heat_heater_grid_boost_price_limit_ct" => "0.0", "heat_heater_grid_boost_max_w" => "3000",
     "heat_heater_min_temp_c" => "45.0", "heat_heater_max_temp_c" => "60.0", "heat_wp_daily_kwh" => "",
     "market_charge_profile" => "", "market_price_limit_ct" => "",
+    // Leer erhält den bisherigen Rückfall; wirksame Werte stehen am Eingabefeld.
+    "market_degradation_ct_per_kwh" => "", "market_roundtrip_efficiency_pct" => "",
+    "market_grid_charge_min_job_wh" => "", "market_grid_charge_min_job_pct" => "",
     "market_min_margin_pct" => "10.0", "market_safety_correction_ct_per_kwh" => "0.0",
     "market_autarky_first_enable" => "1", "market_autarky_low_soc_pct" => "20.0",
     "market_autarky_horizon_buffer_wh" => "500",
@@ -463,6 +468,8 @@ $defaults = [
     "pv_forecast_topology_config" => "",
     "forecast_diagnostics_enable" => "0",
     "ml_home_cap_kw" => "6.0",
+    "ml_home_daily_cap_kwh" => "24.0",
+    "ml_training_legacy_source" => "0",
 
     // V4 Smart Home / Energy Manager
     "luxtronik" => "0", "wp_type" => "-1", "wp_source_type" => "auto", "wp_page_preview_enable" => "0", "wp_buffer_sensor" => "none", "wp_heating_circuit_pump" => "hup", "luxtronik_ip" => "0.0.0.0", "idm_ip" => "0.0.0.0", "idm_port" => "502", "idm_e_total" => "0", "idm_cooling_boost_min_at" => "23.0", "idm_pv_surplus_enable" => "1", "idm_pv_surplus_max_kw" => "2.0", "idm_pv_surplus_min_kw" => "0.8", "idm_pv_surplus_ramp_kw" => "0.2", "idm_pv_surplus_deadband_kw" => "0.1", "idm_pv_surplus_heartbeat_s" => "60", "idm_pv_surplus_min_write_interval_s" => "10", "shelly_sg_ip" => "", "shelly_pause_ip" => "", "auto_mode" => "1", "grid_start_limit" => "-3500", "pv_boost_delay" => "30",
@@ -486,6 +493,7 @@ $defaults = [
     "heizstab" => "0", "heizstab_type" => "generic", "heizstab_ip" => "", "heizstab_port" => "502", "heizstab_max_w" => "3000", "shelly_heiz_ip" => "0.0.0.0", "shelly_heiz_w" => "1500",
     "hs_auto_mode" => "1", "hs_min_surplus_w" => "500", "hs_min_soc" => "20",
     "climate_enable" => "0", "climate_name" => "Klimaanlage", "climate_meter_ip" => "0.0.0.0", "climate_meter_type" => "shelly_pro3em",
+    "climate_meter2_name" => "Klimaanlage 2", "climate_meter2_ip" => "0.0.0.0", "climate_meter2_type" => "shelly_pro3em", "climate_meter2_phase" => "c",
     "climate_meter_phase" => "c", "climate_min_power_w" => "50", "climate_poll_s" => "15",
     "climate_history_enable" => "1", "climate_history_interval_s" => "60", "climate_forecast_enable" => "0",
     // Shelly Pro3EM WP-Integration (wp_type=3)
@@ -524,6 +532,14 @@ $defaults = [
     "wb_pcc_phase_basis" => "e3dc_pm_active_power", "wb_pcc_power_factor_margin" => "0.9", "grid_pcc_imbalance_max_a" => "20", // 1p-Deckel openWB Pro aus Netzphasenmessung
     "wb_surplus_target_grid_w" => "-125", "wb_surplus_noise_w" => "100", "phase_transition_safety_margin_w" => "0", "heatpump_start_settle_s" => "30",
     "wb_curve_pv_only_house_reserve_w" => "300", // Messreserve der PV-only-Entladeklemme
+    "storage_backup_hold_enable" => "0",
+    "storage_backup_energy_kwh" => "",
+    "storage_backup_reference_time" => "20:00",
+    "storage_backup_until_time" => "",
+    "storage_backup_grid_charge_enable" => "0",
+    "storage_backup_grid_price_limit_ct" => "",
+    "storage_central_pv_split_enable" => "0",
+    "storage_central_pv_split_gate_hold_s" => "60",
     "storage_home_wp_split" => "auto", // Wärmepumpe im Hauswert (auto/include/separate), Alias-Tabelle in storage_manager.py
     "wb_restart_delay_s" => "60", "wb_min_charge_time_s" => "300", "wb_cloud_stop_delay_s" => "180", "wb_phase_change_hold_s" => "180",
     "wb_phase_down_delay_s" => "480", "wb_phase_up_forecast_hold_s" => "60", "wb_phase_up_symmetry_enable" => "0", // Vorlauf 60 s (die 480 s sind die Sperre nach dem Wechsel), Symmetrie-Klausel aus
@@ -553,14 +569,26 @@ $defaults = [
 
     // Schnittstellen
     "mqtt_hub_ip" => "127.0.0.1", "mqtt_hub_port" => "1883", "mqtt_hub_user" => "", "mqtt_hub_pass" => "",
-    "mqtt_hub_topic" => "e3dc", "mqtt_hub_sub_soc_topic" => "", "mqtt_hub_sub_soc_name" => "Mqtt_car", "mqtt_hub_sub_soc_topic_2" => "", "mqtt_hub_sub_soc_name_2" => "Mqtt_car2",
+    "mqtt_hub_topic" => "e3dc", "mqtt_hub_repeat_interval_s" => "0", "mqtt_hub_sub_soc_topic" => "", "mqtt_hub_sub_soc_name" => "Mqtt_car", "mqtt_hub_sub_soc_topic_2" => "", "mqtt_hub_sub_soc_name_2" => "Mqtt_car2",
+    "wb1_openwb_username" => "", "wb1_openwb_password" => "", "wb1_openwb_tls_binding" => "",
+    "wb2_openwb_username" => "", "wb2_openwb_password" => "", "wb2_openwb_tls_binding" => "",
     "wb_ip" => "", "wb_topic" => "", "wb_user" => "", "wb_pass" => "", "wb2_ip" => "", "wb2_topic" => "", "wb2_user" => "", "wb2_pass" => "",
+    "wp_power_topic" => "",
+    "mqtt_vehicle_allowlist" => "",
     "mqtt_ha_inbound_enable" => "1", "mqtt_ha_inbound_history_enable" => "1",
     "ha_mode" => "off", "ha_peer_ip" => "", "ha_fail_timeout" => "15", "ha_sync_interval" => "60", "ha_auto_recover" => "1", "ha_auto_failover" => "1",
     "shadow_master_url" => "", "shadow_master_ip" => "", "shadow_sync_interval_s" => "5", "shadow_fetch_timeout_s" => "2.5", "shadow_snapshot_max_age_s" => "30", "shadow_snapshot_token" => ""
 ];
 
 $tooltips = [
+    "wb1_openwb_username" => "Eigenes openWB-Konto für diesen Slot. Bleibt lokal; leer lassen erhält den gespeicherten Wert. Keine Übernahme vom anderen Slot.",
+    "wb1_openwb_password" => "Passwort des openWB-Kontos für diesen Slot. Leer lassen erhält den Wert einschließlich Leerzeichen. Wird nur verschlüsselt übertragen.",
+    "wb1_openwb_tls_binding" => "Lokal bestätigtes vollständiges openWB-Zertifikat mit SHA-256 und Zielbindung. Änderungen und Ablauf sperren die Verbindung; kein automatischer Austausch.",
+    "wb2_openwb_username" => "Eigenes openWB-Konto für diesen Slot. Bleibt lokal; leer lassen erhält den gespeicherten Wert. Keine Übernahme vom anderen Slot.",
+    "wb2_openwb_password" => "Passwort des openWB-Kontos für diesen Slot. Leer lassen erhält den Wert einschließlich Leerzeichen. Wird nur verschlüsselt übertragen.",
+    "wb2_openwb_tls_binding" => "Lokal bestätigtes vollständiges openWB-Zertifikat mit SHA-256 und Zielbindung. Änderungen und Ablauf sperren die Verbindung; kein automatischer Austausch.",
+    "ui_openwb_copy" => "Übernimmt beim Speichern ausdrücklich die bisherigen HTTP-Zugangsdaten dieses Slots in das eigene openWB-Konto. Die bisherigen Werte bleiben erhalten.",
+    "ui_openwb_clear" => "Löscht beim Speichern Benutzer und Passwort des openWB-Kontos für diesen Slot. Die Zertifikatsbindung bleibt bestehen.",
     "cost_accounting_quarterhour_enable" => "Experimentelle Kostenhistorie mit festgeschriebenen Viertelstundenpreisen. Standard aus; erst ab Einschalten wird archiviert. Ältere Tage werden einmalig und schrittweise im Hintergrund nachberechnet. Kein Dienstneustart nötig.",
     "luxtronik_ip" => "Netzwerkadresse der Luxtronik-Steuerung. Vorgabe: nicht eingerichtet. Leer oder 0 ist keine nutzbare Geräteadresse; für die Verbindung eine erreichbare Adresse eintragen.",
     "idm_ip" => "IP-Adresse der iDM-Wärmepumpe für die Modbus-Verbindung. 0.0.0.0 = IP nicht konfiguriert.",
@@ -769,6 +797,8 @@ $tooltips = [
     "pv_e3dc_dc_inverter_limit_w" => "Optionales E3DC-DC-/Wechselrichterlimit in Watt, nur als Fallback wenn kein frischer PVI_DC_MAX_POWER-Readback verfügbar ist.",
     "pv_forecast_topology_config" => "Versionierter Vertrag für beliebig viele Generatorgruppen, physische PV-Flächen und Solcast-Providerbindungen. Ungültige oder unvollständige Topologien bleiben bewusst nicht bindbar.",
     "forecast_diagnostics_enable" => "Schaltet ausschließlich die lokale, read-only PV-Prognosediagnose ein. Sie vergleicht die E3/DC-DC-Punktprognose insgesamt und nach Erfassungs-Vorlauf mit gültigen Messwerten, behauptet kein P50 und ändert weder Regelentscheidungen noch Modelle oder Konfigurationswerte.",
+    "ml_home_daily_cap_kwh" => "Obergrenze der Referenzbasis für die Haus-Plausibilitätsprüfung, keine Grenze der ausgegebenen Prognose. Werte unter 8 oder über 80 kWh bitte auf Plausibilität prüfen. Standard: 24 kWh.",
+    "ml_training_legacy_source" => "Aus: Training aus den letzten 30 Tagen der gesicherten Minutenhistorie und dem laufenden Tag. Temperatur wird nur mit ausreichender Messabdeckung verwendet; die Haus-Plausibilitätsprüfung erfolgt vor der Bias-Korrektur. Ein: bisherige Trainingsquelle und bisherige Reihenfolge der Korrekturen. Beim Wechsel wird das Modell neu trainiert.",
     "ml_home_cap_kw"         => "ML-Training: Maximaler Hausverbrauch in kW der als Trainingswert akzeptiert wird. Verhindert dass Messspitzen (Wallbox, Sensor-Glitch) das ML-Modell verzerren. Standard: 6.0 kW (deckt Induktionskochfeld + Backofen ab). Bei reinem Standby-Haushalt: 2.0 kW.",
 
     // Tarife
@@ -819,6 +849,10 @@ $tooltips = [
     "cheap_grid_battery_max_w" => "Maximale Netzladeleistung in Watt. 0 = Systemlimit aus der Speicher-Konfiguration nutzen.",
     "market_charge_profile" => "Ladeprofil für preisbasiertes Speicher-Netzladen. Wirtschaftlich: nur bei Prognosedefizit und 10 % Marge. Ausgeglichen: nur bei Prognosedefizit, ohne Marge. Komfort: im Preisfenster bis zum Zielstand am Fensterende, PV wird zuerst angerechnet, kein Defizit nötig. Eigene Einstellungen: alle Felder frei. Notstromreserve, Hausanschluss und Reserven gelten in jedem Profil.",
     "market_price_limit_ct" => "Komfort-Preislimit in ct/kWh: bis zu diesem Abrechnungspreis wird im Preisfenster geladen. Leer = Mittelpreis des Tarifs (Octopus Heat aus den festen Fenstern) bzw. des gebundenen Preishorizonts, je Plan bestimmt. Nur im Profil Komfort wirksam; der Negativpreis-Boost nutzt weiterhin seine eigene Preisgrenze.",
+    "market_degradation_ct_per_kwh" => "Akkuverschleiß je später nutzbarer Kilowattstunde in ct/kWh, mindestens 0. Ohne eigenen Wert gilt der Wert aus der Direktvermarktung, sonst 4 ct/kWh. Bleibt bei jedem Profilwechsel unverändert.",
+    "market_roundtrip_efficiency_pct" => "Speicher-Wirkungsgrad für Laden und Entladen zusammen, 1 bis 100 %. Ohne eigenen Wert gilt der Wert aus der Direktvermarktung, sonst 85 %. Bleibt bei jedem Profilwechsel unverändert.",
+    "market_grid_charge_min_job_wh" => "Mindestmenge: kleinere Ladeaufträge werden nicht ausgeführt; gilt für die aus dem Netz bezogene Energie je Auftrag. Es gilt der größere Wert aus Wh-Mindestmenge und nutzbarer Speicherkapazität × Kapazitätsanteil / 100. Standard 0 Wh: 5 % der nutzbaren Kapazität ohne festen Sockel. 0 hebt das Minimum nur auf, wenn auch der Kapazitätsanteil 0 ist.",
+    "market_grid_charge_min_job_pct" => "Kapazitätsanteil der Mindestmenge, 0 bis 100 % der nutzbaren Speicherkapazität. Es gilt max(Wh-Wert, Kapazität × Prozent/100), bezogen auf die Netzenergie je Auftrag. Standard 5 %. Ein Wh-Wert von 0 deaktiviert bei positivem Kapazitätsanteil das Minimum nicht.",
     "market_min_margin_pct" => "Mindestmarge für preisbasierte Speicher-Netzladung nach Wirkungsgrad, Batteriekosten und Sicherheitskorrektur. Halten nutzt nur Preisabstand und Sicherheitskorrektur. Empfehlung und Standard: 10%. Wird vom Ladeprofil gesetzt; nur bei „Eigene Einstellungen“ frei.",
     "market_safety_correction_ct_per_kwh" => "Sicherheitskorrektur in ct/kWh für die normale Preisregelung. Positive Werte rechnen konservativer, negative Werte aggressiver. Negative Werte machen auch Normalpreis-Stunden rechnerisch lohnend und erhöhen das Ladevolumen. Wird vom Ladeprofil gesetzt; nur bei „Eigene Einstellungen“ frei.",
     "market_autarky_first_enable" => "PV-autark zuerst: blockiert normales Markt-Netzladen und Speicher-Halten, wenn Speicher plus erwarteter PV-Überschuss den restlichen Horizont decken. Negativpreis-Boost bleibt separat.",
@@ -945,7 +979,7 @@ $tooltips = [
 
     // Energy Manager / Smart Home
     "luxtronik"              => "Aktiviert WP-/Verbrauchslogging und, falls erlaubt, den Energy Manager. Historischer Config-Key: luxtronik. Muss bei Luxtronik, IDM, Stiebel, Dimplex oder SG-Ready per Shelly aktiv sein.",
-    "wp_type"                => "Wärmepumpen-Typ: -1=Keine WP, 0=Luxtronik (WebSocket), 1=IDM Navigator 2.0 (Modbus-TCP), 2=Heizstab/Shelly, 3=Shelly Pro3EM ohne native WP, 4=Stiebel Eltron ISG/WPM, 5=Dimplex WPM Touch/NWPM, 6=E3DC Leistungsmesser (PM).",
+    "wp_type"                => "Wärmepumpen-Typ: -1=Keine WP, 0=Luxtronik (WebSocket), 1=IDM Navigator 2.0 (Modbus-TCP), 2=Heizstab/Shelly, 3=Shelly Pro3EM ohne native WP, 4=Stiebel Eltron ISG/WPM, 5=Dimplex WPM Touch/NWPM, 6=E3DC Leistungsmesser (PM), 7=MQTT-Wärmepumpe (nur Anzeige, Steuerung weiter über SG-Ready/Shelly bzw. extern).",
     "wp_e3dc_pm_index"       => "PM-Index des E3DC-Leistungsmessers für die Wärmepumpe (0..7, üblich: 1..6). Plausibilität vor dem Speichern testen.",
     "wp_source_type"         => "Wärmequelle der Wärmepumpe. Sie bestimmt die Anzeige der Wärmequelle und die Farbbewertung von COP und Arbeitszahl; bei „Unbekannt“ werden die Werte nicht farblich bewertet. Quell-Erholung ist nur für speichernde Quellen wie Sole/Erdreich, Grundwasser oder Direktverdampfung sinnvoll; Luft blockiert diesen Pausenmodus.",
     "wp_page_preview_enable" => "Experimentell, Standard aus. Ein: Die Wärmepumpen-Seite zeigt einen Link zur neuen Ansicht mit Anlagenbild (Vorschau). Die neue Ansicht zeigt nur Messwerte; die Knöpfe Boost, Warmwasser und Automatik nutzen dieselben Aktionen wie die bisherige Seite.",
@@ -1019,8 +1053,8 @@ $tooltips = [
     "wp_pv_ww_hysteresis_k"  => "Schalthysterese der Wärmepumpe für Warmwasser in Kelvin, wie in der Anlage hinterlegt (Standard 8 K). E3DC-Control meldet Warmwasserbedarf erst, wenn die Ist-Temperatur um diesen Wert unter dem PV-Sollwert liegt.",
     "wp_pv_boost_release_s"  => "Wolkenüberbrückung des PV-Boosts (Sekunden, Standard 300, mindestens 30). Der Boost steht wie eine SG-Ready-Freigabe: Ohne Verdichterlauf muss die PV-Deckung die Startleistung tragen. Bei laufendem Verdichter genügt die Deckung ohne Netzbezug und Kurvendefizit. Fehlt die jeweilige Voraussetzung länger als diese Frist, wird die Rücknahme angefordert; die Mindestlaufzeit bleibt wirksam. Schutzfunktionen haben Vorrang. Ein Verdichterstopp oder eine erreichte Temperatur beenden den Boost nicht – die Anlage regelt intern.",
     "wp_pv_handoff_timeout_s" => "Wartefrist auf die tatsächlich gesunkene Wallboxleistung vor dem WP-Startauftrag (Sekunden, Standard 120). Gilt nur bei Wallbox-Vorrang; bei Wärmepumpen-Vorrang wird der Sollwert sofort gesetzt und die Wallbox regelt parallel auf ihr gesenktes Ziel. Diese Frist beginnt vor der gesonderten Prüfung des gesendeten WP-Befehls.",
-    "min_soc"                => "Minimaler Batterie-SoC (%) unter dem der WP-Boost nie gestartet wird. Dient dem Notreserve-Schutz.",
-    "heizgrenze_temp"        => "Mittlere Außentemperatur für die Sommer-/Winter-Umschaltung bei Luxtronik und iDM. Standard: 10 °C. Bei SG-Ready sperrt die Heizgrenze die Freigabe nicht: Es zählt der Bedarf aus gültiger, frischer Warmwasser- oder Rücklauftemperatur. Ohne Temperaturdaten keine automatische Freigabe.",
+    "min_soc"                => "Start-Tor für automatische Boost-Freigaben. Min SoC für automatische Zusatzfreigaben durch E3DC-Control (PV, Preis/Markt und Tariffenster). Unter diesem Akkustand beginnt keine solche Freigabe; die Eigenregelung der Wärmepumpe bleibt unabhängig. Bei aktivem Taktschutz (Mindestlaufzeit oder Wiedereinschaltsperre gesetzt) beendet ein laufender Verdichter seine belegte Mindestlaufzeit; das Signal bleibt mindestens zehn Minuten bestehen. Liegt der Akku danach unter Min SoC minus 5 Prozentpunkte (mindestens 5 %), endet die Freigabe. Ohne Taktschutz endet die Freigabe sofort unter dieser Stoppschwelle. Netz-, Hardware-, Quellen- und andere Schutzschranken bleiben vorrangig. Nutzeraufträge und Pre-Dump behalten ihre eigenen Startbedingungen.",
+    "heizgrenze_temp"        => "E3DC-Control nutzt die gemittelte Außentemperatur für die Sommer-/Winter-Umschaltung und Wahl der Boost-Ziele bei Luxtronik und iDM. Standard: 10 °C. Bei SG-Ready sperrt die Heizgrenze die Freigabe nicht: Es zählt der Bedarf aus gültiger, frischer Warmwasser- oder Rücklauftemperatur. Ohne Temperaturdaten keine automatische Freigabe.",
     "wws"                    => "Warmwasser-Solltemperatur Sommer (°C). Luxtronik/IDM: Register-Sollwert für Software-Thermostat.",
     "www"                    => "Warmwasser-Solltemperatur Winter (°C).",
     "hz"                     => "Heizungs-Rücklauf Solltemperatur Winter (°C).",
@@ -1063,7 +1097,7 @@ $tooltips = [
     "morning_boost_min_pv_pct" => "Legacy-Feld: PV-Schwellen werden in Storage Simulator und Storage Manager bewertet.",
     "super_intelligence_enable" => "Legacy-Feld: Die frühere Verbrauchsoptimierung ist durch Pre-Dump und Ladekurve ersetzt.",
     "super_intelligence_deadline" => "Legacy-Feld: Der Zielzeitpunkt wird heute durch Pre-Dump-Fenster und Kurvenstart geführt.",
-    "consumer_priority_order" => "Reihenfolge für flexibles PV-/Kurven-Budget: Wärmepumpe, Wallbox und Heizstab bekommen nur ihren zugeteilten Anteil. Standard: WP > Wallbox > Heizstab.",
+    "consumer_priority_order" => "Reihenfolge für flexibles PV-/Kurven-Budget, auch beim Start: Nach der Startqualifizierung erhält ein vorrangiger Verbraucher seinen Anteil vor rücknehmbaren nachrangigen Lasten. Die Wallbox senkt entsprechend ihren Strom und nutzt ihren Mindesthalt, Phasen- und Wiederanlaufschutz. Schutzfunktionen und die Akkuaufteilung bei „Kurve zuerst“ gehen vor. Standard: WP > Wallbox > Heizstab.",
     "consumer_priority_wp_runon_s" => "Nach Änderung der Verbraucherpriorität bleibt eine laufende Wärmepumpe für diese Sekunden bevorzugt, damit sie nicht hart taktet.",
 
     // Warmwasser-Timer
@@ -1101,6 +1135,14 @@ $tooltips = [
     "phase_transition_safety_margin_w" => "Zusätzliche Leistungsreserve während eines Phasenwechsels (W). 0 = automatisch aus Mindeststrom und Phasenzahl berechnet.",
     "heatpump_start_settle_s" => "Nach einem erkannten Wärmepumpenstart wird die Wallbox so lange nicht weiter hochgeregelt (Sekunden), damit der Verdichter seinen Anlaufstrom sicher bekommt.",
     "wb_curve_pv_only_house_reserve_w" => "Reserve unter der Ladekurve (W): Liegt der Hausspeicher unter seinem Zielkorridor und ist das Stützkontingent der Wallbox-Ladung verbraucht, deckt der Akku nur noch Hauslast und Wärmepumpe – plus diese Reserve, die er zusätzlich zur Hauslast liefern darf, damit Lastsprünge nicht ins Netz gehen. Die Wallboxen bekommen dann nur echten PV-Überschuss. Standard 300 W, Mindestwert 300 W (kleinere Werte hebt die Regelung automatisch an).",
+    "storage_central_pv_split_gate_hold_s" => "Versteckte Bestätigungsfrist der experimentellen zentralen PV-Aufteilung: Der letzte bestätigte Rahmen hält höchstens 60 Sekunden und kann im selben Zyklus sinken. Danach gilt höchstens der batterieneutrale PV-Rest ohne Stützung. Werte werden auf 0 bis 60 Sekunden begrenzt.",
+    "storage_backup_hold_enable" => "Experimentell, Standard aus. 0 = Aus, 1 = Beobachten ohne Speicherbefehle, 2 = Halten. Bestehendes Ein bleibt Beobachten. Halten bedeutet nachts mehr Netzbezug; Reserve-Netzladen kostet den Bezugspreis. Verluste und Notstromfähigkeit der Anlage prüft E3DC-Control nicht.",
+    "storage_backup_energy_kwh" => "Notstrom-Vorhalt am Abend in kWh Speicherinhalt. Kein zusätzlicher Entladewirkungsgrad; die Anzeige ergänzt Prozent der nutzbaren Kapazität. Ersatzlast = Speicherinhalt ÷ Bezugsdauer, kein gemessener AC-Verbrauch. Physikalischer Puffer: nicht bewertet.",
+    "storage_backup_reference_time" => "Bezugszeit des Abendziels in Ortszeit, Standard 20:00. Sommerzeit wird auf absolute UTC-Grenzen abgebildet.",
+    "storage_backup_until_time" => "Bewusst bestätigte Versorgung bis: Aus Speicherinhalt ÷ Bezugsdauer ab der Bezugszeit entsteht eine konstante rechnerische Ersatzlast aus Speicherinhalt. Prognostizierte PV-Übernahme, vier 15-Minuten-Slots, heuristisch: nur Kandidat einer Netzbetriebsprognose. Keine Bestätigung von Inselbetrieb, AC-Reichweite oder physischer Reservehaltung. Spätere Übernahme erhöht den Energiebedarf ohne Neuskalierung der Ersatzlast; frühere Übernahme verkürzt die Restaufgabe. Weitere Defizite bis zum nächsten Abendbezug werden getrennt ausgewiesen. Physikalischer Puffer: nicht bewertet.",
+    "storage_backup_grid_charge_enable" => "Eigener Schalter, Standard aus. Bei Beobachten nur Rechnung, bei Halten begrenzter Netzladeauftrag zum Bezugspreis. Gilt auch für feste und gleichpreisige Tarife. Preis- oder Tarifausfall verhindert Netzladen; der SoC muss frisch sein.",
+    "storage_backup_grid_price_limit_ct" => "Explizite Obergrenze des vollständigen Bezugspreises in ct/kWh. Nur Preise streng unter der Grenze sind Kandidaten; bei Gleichstand zuerst die frühere Zeit. Feste Tarife sind zulässig. Keine behauptete Arbitrageersparnis; nur verbleibendes Defizit nach einmaligen Ladebeiträgen, ohne Mindestmenge.",
+    "storage_central_pv_split_enable" => "Experimentell, Standard aus: Bei laufender oder startender geregelter Wallbox reserviert der Speicher zuerst seinen Kurvenbedarf und veröffentlicht den PV-Rest als absoluten Wallboxrahmen. Grundladung, Preis-/Slot-/Boostfenster, Pre-Dump und die Haltezone bleiben unverändert. Bei zu kleinem Rahmen bleibt die laufende Mindestladung zeitlich durch das Konto Kurvenrückstand begrenzt. An dessen Grenze folgt ein gedeckter Abstieg auf eine Phase oder Stop. Der Wiederanlauf verlangt einen stabil ausreichenden Rahmen mit Hysterese; Schutzregeln bleiben vorrangig. Zum Rückfall ausschalten.",
     "storage_home_wp_split" => "Wärmepumpe im Hauswert: Sagt dem Speicher-Manager, ob die Leistung der Wärmepumpe schon im Hauswert des E3DC steckt. „Wärmepumpe steckt im Hauswert“ (include): Das E3DC misst die Wärmepumpe im Hausverbrauch mit – typisch ohne separaten Wurzelzähler, wenn die Wärmepumpe hinter dem E3DC-Hausanschluss hängt; die Regelung rechnet die gemeldete WP-Leistung aus dem Hauswert heraus und führt Haus und Wärmepumpe getrennt. „Wärmepumpe getrennt gemessen“ (separate): Die Wärmepumpe hängt an einem eigenen Zähler außerhalb des E3DC-Hauswerts und zählt zusätzlich dazu. „Automatisch“ (auto, Standard): Die Regelung rät je Messung – die Wärmepumpe gilt als im Hauswert enthalten, wenn der rohe Hauswert mindestens 500 W bzw. 55 % der WP-Leistung erreicht. Achtung: Bei kleiner Rohhauslast (z. B. Verdichterstopp, der Hauswert fällt vor der WP-Leistung) kann die Automatik zwischen beiden Sichten springen; wer seine Anlage kennt, wählt deshalb fest include oder separate.",
     "grid_max_amps"          => "Hausabsicherung/SLS in Ampere je Phase (z. B. 35, 40, 50 oder 63 A). Dieses harte Hardwarelimit gilt in allen von E3DC-Control aktiv geregelten Lademodi. Nur ein ausdrücklich eingetragener Wert gibt den einphasigen Deckel der openWB Pro über 20 A frei – der Standard 35 A zählt dafür nicht. Maßgeblich bleiben Hausabsicherung minus konfigurierte Reserve sowie die Wallbox-Grenzen.",
     "grid_max_amps_l1"       => "Optionales abweichendes Betriebslimit für Netzphase L1. Leer verwendet die globale Hausabsicherung. Nur einen tatsächlich bekannten Wert eintragen.",
@@ -1167,6 +1209,9 @@ $tooltips = [
     "mqtt_hub_port"          => "MQTT-Port (Standard: 1883, MQTTS: 8883).",
     "mqtt_hub_user"          => "MQTT Benutzername (leer wenn kein Auth).",
     "mqtt_hub_pass" => "Passwort zur Anmeldung am zentralen MQTT-Broker.",
+    "mqtt_hub_repeat_interval_s" => "Werte zyklisch wiederholen: 0 = aus (Standard), sonst 10 bis 3600 Sekunden. Werte von 1 bis 9 wirken als 10, höhere als 3600. Wiederholung nur mit gültigen Live-Daten; Bei eingeschalteter Wiederholung verwenden Budgetwerte und Freigaben auf allen Sendewegen ausschließlich die höchstens 60 Sekunden alte Budgetdatei. Dienstneustart über den Einrichtungsplan der Installationszentrale.",
+    "mqtt_vehicle_allowlist" => "Kommagetrennte exakte NAME-Segmente unter Basis/vehicle/NAME/ATTRIBUT; Groß-/Kleinschreibung bleibt erhalten, keine Wildcards. Leer = offen. Syntaxfehler sperren nur diesen Eingang. Sofort nach dem Speichern wirksam, auch für alte MQTT-Werte und retained Nachrichten. Dedizierte SoC-Topics, Bluelink und native openWB-Daten bleiben unverändert. Ein ausgeschlossenes Fahrzeug gilt als ohne bestätigten SoC: Bei aktiver Zielplanung plant die Ladeplanung dann mit 0 % und kann Ladefenster mit Netzbezug einplanen. Vor dem Aktivieren die Namen aller genutzten Fahrzeuge prüfen.",
+    "wp_power_topic" => "Optionales exaktes MQTT-Topic am zentralen Broker für rohe endliche Zahlen in W. Leer: feste Eingänge heatpump/power_w und heatpump/electric_w. Gesetzt: ersetzt beide; Status- und Temperaturtopics bleiben. Keine HA-Entity-ID, kein JSON, keine Wildcards. Messwert für Anzeige und Aufteilung, keine Steuerung. Dienstneustart über den Einrichtungsplan der Installationszentrale.",
     "mqtt_hub_topic"         => "Basis-Topic für alle E3DC-Daten, z.B. 'e3dc'.",
     "mqtt_hub_sub_soc_topic" => "MQTT-Topic von dem der Fahrzeug-SoC abonniert wird (für externe SoC-Quellen ohne Bluelink).",
     "mqtt_hub_sub_soc_name"  => "Anzeigename für Fahrzeug 1 SoC aus MQTT.",
@@ -1202,6 +1247,10 @@ $tooltips = [
     "heizstab_type"          => "Modbus-Typ des Heizstabs: generic für einfache Register 1000/1014, mypv_elwa für AC ELWA-E mit echten Status- und Temperaturwerten.",
     "heizstab_max_w"         => "Max. Leistung des Heizstabs in Watt (für korrekte Verbrauchs-Anzeige).",
     "climate_enable"         => "Aktiviert die Klimaanlage als eigenen gemessenen Zusatzverbraucher. Der Dienst liest nur den Energiezähler; er schaltet weder Shelly noch Toshiba.",
+    "climate_meter2_name" => "Anzeigenamen für die zweite Klimaanlage festlegen. Nur messen; keine Steuerung ergänzen.",
+    "climate_meter2_ip" => "Adresse des optionalen zweiten Shelly-Zählers eintragen. Leer oder 0.0.0.0 lassen, um nur Zähler 1 zu verwenden.",
+    "climate_meter2_type" => "Zählertyp der zweiten Klimaanlage wählen: dieselben Typen wie bei Zähler 1.",
+    "climate_meter2_phase" => "Messkanal der zweiten Anlage wählen. EM Mini verwendet immer em1:0; beim Gen1 Kanal 0, Kanal 1 oder Summe wählen.",
     "climate_name"           => "Anzeigename der gemessenen Klimaanlage.",
     "climate_meter_ip"       => "IP-Adresse des Shelly-Zählers, der die Klimaanlage misst, z.B. 192.0.2.102.",
     "climate_meter_type"     => "Zählertyp für die Klimaanlage. Unterstützt Shelly EM Gen1 read-only über /status sowie Shelly Pro3EM/3EM Gen2, Shelly EM Mini Gen4 und Shelly PM Mini per lokaler RPC-API.",
@@ -1348,24 +1397,67 @@ function e3dc_openwb_chargepoint_prefix($cpId) {
     return 'openWB/simpleAPI/chargepoint/' . intval($cpId);
 }
 
-function e3dc_openwb_discover_chargepoints($ip) {
+function e3dc_openwb_transport_call(array $request) {
+    $paths = getInstallPaths();
+    $script = rtrim((string)($paths['install_path'] ?? ''), '/') . '/Installer/Wallbox/openwb_transport.py';
+    if (!is_file($script)) return ['success' => false, 'message' => 'openWB-Transport nicht verfügbar'];
+    $pipes = [];
+    $process = proc_open([getPythonInterpreter(), '-B', $script],
+        [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['file', '/dev/null', 'a']], $pipes);
+    if (!is_resource($process)) return ['success' => false, 'message' => 'openWB-Transport nicht verfügbar'];
+    fwrite($pipes[0], json_encode($request, JSON_UNESCAPED_SLASHES));
+    fclose($pipes[0]);
+    $raw = stream_get_contents($pipes[1], 131072);
+    fclose($pipes[1]);
+    $code = proc_close($process);
+    $result = json_decode((string)$raw, true);
+    return $code === 0 && is_array($result) ? $result : ['success' => false, 'message' => 'openWB-Verbindung nicht verfügbar'];
+}
+
+function e3dc_openwb_account_values(array $posted, array $current, array $actions = []) {
+    foreach ([1, 2] as $slot) {
+        $prefix = 'wb' . $slot . '_openwb_';
+        // Vertrauensdaten ausschließlich durch den gebundenen Bestätigungsdialog.
+        unset($posted[$prefix . 'tls_binding']);
+        foreach (['username', 'password'] as $field) {
+            $key = $prefix . $field;
+            if (array_key_exists($key, $posted) && $posted[$key] === '') unset($posted[$key]);
+            if (!empty($actions['openwb_clear_' . $slot])) $posted[$key] = '';
+        }
+        if (!empty($actions['openwb_copy_' . $slot])) {
+            $legacyUser = $slot === 1 ? 'wb_user' : 'wb2_user';
+            $legacyPass = $slot === 1 ? 'wb_pass' : 'wb2_pass';
+            $posted[$prefix . 'username'] = (string)($current['wb' . $slot . '_user'] ?? $current[$legacyUser] ?? '');
+            $posted[$prefix . 'password'] = (string)($current['wb' . $slot . '_pass'] ?? $current[$legacyPass] ?? '');
+        }
+    }
+    return $posted;
+}
+
+function e3dc_openwb_local_trust(array $current, array $next) {
+    // Der Dienst liest Schlüsselnamen ohne Beachtung der Groß-/Kleinschreibung.
+    foreach (array_keys($next) as $key) {
+        if (preg_match('/^wb[12]_openwb_tls_binding$/i', (string)$key)) unset($next[$key]);
+    }
+    foreach ([1, 2] as $slot) {
+        $key = 'wb' . $slot . '_openwb_tls_binding';
+        // Eine fremde Sicherung darf keine lokale Zertifikatsbestätigung ersetzen.
+        unset($next[$key]);
+        if (array_key_exists($key, $current)) $next[$key] = $current[$key];
+    }
+    return $next;
+}
+
+function e3dc_openwb_discover_chargepoints($ip, $slot = 1) {
     static $cache = [];
     $host = trim((string)$ip);
-    $host = preg_replace('#^https?://#i', '', $host);
-    $host = preg_replace('#/.*$#', '', $host);
-    if ($host === '' || preg_match('/\s/', $host)) return [];
-    if (isset($cache[$host])) return $cache[$host];
-
-    $url = 'http://' . $host . '/openWB/simpleAPI/simpleapi.php?get_chargepoint_all';
-    $ctx = stream_context_create([
-        'http' => [
-            'method' => 'GET',
-            'timeout' => 1.2,
-            'ignore_errors' => true,
-        ],
-    ]);
-    $raw = @file_get_contents($url, false, $ctx);
-    $payload = is_string($raw) ? @json_decode($raw, true) : null;
+    if ($host === '') return [];
+    $cacheKey = (int)$slot . ':' . $host;
+    if (isset($cache[$cacheKey])) return $cache[$cacheKey];
+    $current = e3dc_read_existing_v4_json('/var/www/html/data/e3dc_v4.json') ?? [];
+    $result = e3dc_openwb_transport_call(['action' => 'discover', 'address' => $host,
+        'config' => $current, 'slot' => (int)$slot]);
+    $payload = !empty($result['success']) ? ($result['payload'] ?? null) : null;
     $found = [];
     if (is_array($payload)) {
         foreach ($payload as $key => $value) {
@@ -1382,7 +1474,7 @@ function e3dc_openwb_discover_chargepoints($ip) {
         }
     }
     usort($found, fn($a, $b) => ((int)$a['id']) <=> ((int)$b['id']));
-    $cache[$host] = $found;
+    $cache[$cacheKey] = $found;
     return $found;
 }
 
@@ -1518,7 +1610,8 @@ function e3dc_config_auto_install_rules() {
         'climate_live' => [
             'label' => 'Klimaanlage Live',
             'service' => 'e3dc-climate-live',
-            'config_keys' => ['climate_enable', 'climate_meter_ip', 'climate_meter_phase'],
+            'live_config' => true,
+            'config_keys' => ['climate_enable', 'climate_meter_ip', 'climate_meter_phase', 'climate_meter2_name', 'climate_meter2_ip', 'climate_meter2_type', 'climate_meter2_phase'],
             'when' => ['all' => [['type' => 'enabled', 'key' => 'climate_enable'], ['type' => 'address', 'key' => 'climate_meter_ip']]],
         ],
         'climate_control' => [
@@ -1559,17 +1652,18 @@ function e3dc_config_auto_install_rules() {
             'label' => 'MQTT Hub',
             'service' => 'e3dc-mqtt-hub',
             'config_keys' => [
-                'mqtt_hub_ip', 'mqtt_hub_port', 'mqtt_hub_user', 'mqtt_hub_pass', 'mqtt_hub_topic',
+                'mqtt_hub_ip', 'mqtt_hub_port', 'mqtt_hub_user', 'mqtt_hub_pass', 'mqtt_hub_topic', 'mqtt_hub_repeat_interval_s',
                 'mqtt_hub_sub_soc_topic', 'mqtt_hub_sub_soc_topic_2',
                 'wb_ip', 'wb_topic', 'wb_user', 'wb_pass',
                 'wb2_ip', 'wb2_topic', 'wb2_user', 'wb2_pass',
-                'mqtt_ha_inbound_enable', 'mqtt_ha_inbound_history_enable',
+                'wp_power_topic', 'mqtt_ha_inbound_enable', 'mqtt_ha_inbound_history_enable',
             ],
             'when' => [
                 'any' => [
                     ['all' => [['type' => 'address', 'key' => 'mqtt_hub_ip'], ['type' => 'not_in', 'key' => 'mqtt_hub_ip', 'values' => ['127.0.0.1', 'localhost', '::1']]]],
                     ['type' => 'nonempty', 'key' => 'mqtt_hub_sub_soc_topic'],
                     ['type' => 'nonempty', 'key' => 'mqtt_hub_sub_soc_topic_2'],
+                    ['type' => 'nonempty', 'key' => 'wp_power_topic'],
                     ['type' => 'nonempty', 'key' => 'wb_topic'],
                     ['type' => 'nonempty', 'key' => 'wb2_topic'],
                 ],
@@ -1582,7 +1676,7 @@ function e3dc_config_setting_requirements() {
     // Anzeigevoraussetzungen aus Markt-/Tarifvertrag und vorhandenen Geräteprofilen.
     // Dieser Katalog erteilt keine Laufzeitfreigabe und verändert keine Werte.
     $eco = ['when' => ['type' => 'enabled', 'key' => 'grid_friendly_mode'], 'reason' => 'Netzdienlichen Eco-Modus aktivieren.'];
-    $marketTariff = ['when' => ['type' => 'in', 'key' => 'stromtarif_typ', 'values' => ['tibber', 'awattar', 'dynamic', 'epex', 'octopus_heat', 'special']], 'reason' => 'Einen zeitvariablen Tarif wählen: EPEX/Tibber, Octopus Heat oder Spezialtarif.'];
+    $marketTariff = ['when' => ['type' => 'in', 'key' => 'stromtarif_typ', 'values' => ['tibber', 'awattar', 'dynamic', 'epex', 'octopus_heat', 'special', 'spezial', 'special_tariff']], 'reason' => 'Einen zeitvariablen Tarif wählen: EPEX/Tibber, Octopus Heat oder Spezialtarif.'];
     $spotTariff = ['when' => ['type' => 'in', 'key' => 'stromtarif_typ', 'values' => ['tibber', 'awattar', 'dynamic', 'epex']], 'reason' => 'Ein Börsenpreistarif mit echten Negativpreis-Slots ist erforderlich; Octopus Heat und Spezialtarif zählen nicht dazu.'];
     $negativeBoost = ['when' => ['type' => 'enabled', 'key' => 'cheap_grid_boost_enable'], 'reason' => 'Negativpreis-Boost aktivieren.'];
     $wallbox = ['when' => ['type' => 'enabled', 'key' => 'wb_native_enable'], 'reason' => 'Native Wallbox-Regelung aktivieren.'];
@@ -1692,6 +1786,7 @@ function e3dc_config_auto_install_known_modules() {
             'config_keys' => $rule['config_keys'] ?? [],
             'when' => $rule['when'] ?? [],
             'system_update_only' => !empty($rule['system_update_only']),
+            'live_config' => !empty($rule['live_config']),
         ];
     }
     return $known;
@@ -1733,6 +1828,7 @@ function e3dc_config_auto_install_config_changed($data, $oldData, $keys) {
     foreach ((array)$keys as $key) {
         $oldVal = e3dc_config_auto_install_comparable_value(array_key_exists($key, $oldData) ? $oldData[$key] : '');
         $newVal = e3dc_config_auto_install_comparable_value(array_key_exists($key, $data) ? $data[$key] : '');
+        if ($key === 'wp_type' && in_array($oldVal, ['-1', '7'], true) && in_array($newVal, ['-1', '7'], true)) continue;
         if ($oldVal !== $newVal) return true;
     }
     return false;
@@ -1789,9 +1885,14 @@ function e3dc_config_auto_install_missing_candidates($data, $oldData = null, $in
     foreach (e3dc_config_auto_install_known_modules() as $module => $info) {
         $changed = e3dc_config_auto_install_config_changed($data, $oldData, $info['config_keys'] ?? []);
         if (!$changed && !$includeUnchangedMissing) continue;
-        if (!e3dc_config_auto_rule_matches($data, $info['when'] ?? [])) continue;
+        $wpTopicCleared = $module === 'mqtt'
+            && trim((string)($oldData['wp_power_topic'] ?? '')) !== ''
+            && trim((string)($data['wp_power_topic'] ?? '')) === '';
+        if (!e3dc_config_auto_rule_matches($data, $info['when'] ?? []) && !$wpTopicCleared) continue;
         $service = $info['service'] ?? '';
         $state = e3dc_service_unit_state($service);
+        if ($wpTopicCleared && empty($state['exists'])) continue;
+        if (!empty($info['live_config']) && !empty($state['exists']) && !empty($state['enabled']) && !empty($state['active'])) continue;
         $jobs = [];
         if ($service === '' || empty($state['exists'])) {
             $jobs[] = 'install_module';
@@ -1852,6 +1953,7 @@ function e3dc_apply_config_backup_dir_permissions($path, $install_user, $data = 
 }
 
 function e3dc_config_sensitive_key($key) {
+    if (preg_match('/^wb[12]_openwb_tls_/', (string)$key)) return true;
     $k = strtolower((string)$key);
     // Wie ha_manager.is_secret_config_key und die Installationszentrale:
     // *_pass, *_pw, *_pin und passwd sowie die Anmeldenamen von Geräte- und
@@ -1863,6 +1965,8 @@ function e3dc_config_sensitive_key($key) {
 }
 
 function e3dc_config_redact_export_value($key, $value) {
+    $vehicleKind = e3dcVehicleConfigPrivacyKind($key);
+    if ($vehicleKind !== null) return '***REDACTED***';
     if (e3dc_config_sensitive_key($key)) {
         return is_array($value) ? [] : '***REDACTED***';
     }
@@ -1984,6 +2088,36 @@ function e3dc_aux_inverter_prepare_config($data) {
     $data[$canonicalPrefix . 'contract_status'] = $status;
     $data[$canonicalPrefix . 'contract_reason'] = $reason;
     return $data;
+}
+
+function e3dc_market_storage_parameter_state(array $config, string $key): array {
+    $rules = [
+        'market_degradation_ct_per_kwh' => [4.0, 'direct_marketing_degradation_ct_per_kwh', 0.0, null],
+        'market_roundtrip_efficiency_pct' => [85.0, 'direct_marketing_roundtrip_efficiency_pct', 1.0, 100.0],
+        'market_grid_charge_min_job_wh' => [0.0, null, 0.0, null],
+        'market_grid_charge_min_job_pct' => [5.0, null, 0.0, 100.0],
+    ];
+    [$default, $fallback, $low, $high] = $rules[$key];
+    $stored = trim((string)($config[$key]['value'] ?? ''));
+    $raw = $stored;
+    $source = 'Eigener Wert';
+    if ($raw === '') {
+        $raw = $fallback !== null ? trim((string)($config[$fallback]['value'] ?? '')) : '';
+        $source = $raw !== '' ? 'Direktvermarktung' : 'Standard';
+    }
+    // Ungültige gesetzte Zahlen fallen wie im Planer auf den Standard zurück.
+    if (preg_match('/^[+-]?(?:nan|inf(?:inity)?)$/i', $raw)
+        || (is_numeric(str_replace(',', '.', $raw)) && !is_finite((float)str_replace(',', '.', $raw)))) {
+        $effective = null;
+        $source = 'Nicht verfügbar (ungültiger Wert)';
+    } elseif ($raw === '' || !is_numeric(str_replace(',', '.', $raw))) {
+        $effective = $default;
+        $source = $raw === '' ? 'Standard' : 'Standard bei ungültigem Wert';
+    } else {
+        $effective = max($low, (float)str_replace(',', '.', $raw));
+        if ($high !== null) $effective = min($high, $effective);
+    }
+    return ['stored' => $stored, 'effective' => $effective, 'source' => $source];
 }
 
 function e3dc_market_charge_profile_effective($data) {
@@ -3345,7 +3479,7 @@ function e3dc_config_import_merge(array $boundCurrent, array $import, bool $reda
     $secretStats = ['kept' => 0, 'missing' => 0, 'missing_keys' => [], 'dropped_keys' => [], 'kept_local_keys' => []];
     $import = e3dc_config_import_shadow_filter($import, $boundCurrent, $secretStats['dropped_keys'], $secretStats['kept_local_keys'], $options['anchor'] ?? null);
     $clean = e3dc_config_import_keep_local_secrets($import, $boundCurrent, $redactedExport, $secretStats);
-    $next = array_replace($boundCurrent, $clean);
+    $next = e3dc_openwb_local_trust($boundCurrent, array_replace($boundCurrent, $clean));
     $next = e3dc_config_preserve_local_keys($boundCurrent, $next);
     $next = e3dc_config_ha_off_after_confirmation($next, !empty($options['ha_off_confirmed']), $options['anchor'] ?? null);
     return $next;
@@ -3725,6 +3859,50 @@ $configUploadHaConflictRole = null;
 $configRollbackHaConflictRole = null;
 $configRollbackRejectedFile = null;
 if ($configEditorRequestMethod === 'POST') {
+    if (in_array($_POST['config_action'] ?? '', ['openwb_probe', 'openwb_confirm'], true)) {
+        header('Content-Type: application/json; charset=utf-8');
+        $slot = (int)($_POST['openwb_slot'] ?? 0);
+        if (!in_array($slot, [1, 2], true)) { http_response_code(400); echo '{"success":false}'; exit; }
+        $current = e3dc_read_existing_v4_json($v4_config_file_path);
+        $addressKey = $slot === 1 ? 'wb_native_ip' : 'wb_native_ip2';
+        $address = (string)($current[$addressKey] ?? '');
+        $trustKey = 'wb' . $slot . '_openwb_tls_binding';
+        $action = $_POST['config_action'];
+        if (!is_array($current) || $address === '') { echo json_encode(['success' => false, 'message' => 'Zuerst die openWB-Adresse speichern.']); exit; }
+        if ($action === 'openwb_probe') {
+            $result = e3dc_openwb_transport_call(['action' => 'probe', 'address' => $address]);
+            if (!empty($result['success'])) {
+                $_SESSION['openwb_candidate_' . $slot] = [
+                    'candidate' => $result['candidate'], 'address' => $address,
+                    'previous' => $current[$trustKey] ?? '', 'created' => time()];
+                // Öffentliches Zertifikat bleibt serverseitig; die Anzeige braucht nur den Hash.
+                $old = json_decode((string)($current[$trustKey] ?? ''), true);
+                $result = ['success' => true, 'sha256' => $result['candidate']['sha256'], 'previous_sha256' => $old['sha256'] ?? null];
+            }
+        } else {
+            $candidate = $_SESSION['openwb_candidate_' . $slot] ?? [];
+            unset($_SESSION['openwb_candidate_' . $slot]);
+            $result = ['success' => false, 'message' => 'Zertifikat oder Ziel geändert. Bitte erneut prüfen.'];
+            if (($candidate['address'] ?? null) === $address && ($candidate['previous'] ?? null) === ($current[$trustKey] ?? '')
+                    && time() - (int)($candidate['created'] ?? 0) >= 0 && time() - (int)($candidate['created'] ?? 0) <= 300
+                    && ($_POST['independent_confirmation'] ?? '') === '1') {
+                $verified = e3dc_openwb_transport_call(['action' => 'confirm', 'address' => $address,
+                    'candidate' => $candidate['candidate'], 'sha256' => (string)($_POST['sha256'] ?? '')]);
+                if (!empty($verified['success'])) {
+                    $result = e3dcMutateV4ConfigDetailed(
+                        static function($bound) use ($addressKey, $address, $trustKey, $candidate, $verified) {
+                            if (($bound[$addressKey] ?? '') !== $address || ($bound[$trustKey] ?? '') !== $candidate['previous'])
+                                return ['success' => false, 'status' => 'openwb_target_changed'];
+                            $bound[$trustKey] = $verified['binding'];
+                            return ['success' => true, 'data' => $bound];
+                        }, 'openwb_certificate', $v4_config_file_path, '/var/www/html/ramdisk/e3dc_config_cache.json', e3dc_config_write_options());
+                    $result = ['success' => !empty($result['success']), 'message' => !empty($result['success'])
+                        ? 'Zertifikat bestätigt. Die Verbindung wird mit dieser Bindung neu aufgebaut.' : 'Zertifikat nicht gespeichert. Bitte erneut prüfen.'];
+                } else $result = $verified;
+            }
+        }
+        echo json_encode($result, JSON_UNESCAPED_UNICODE); exit;
+    }
     if (($_POST['config_action'] ?? '') === 'test_tibber_api') {
         requireWebAuth(false);
         header('Content-Type: application/json; charset=utf-8');
@@ -3949,6 +4127,7 @@ if ($configEditorRequestMethod === 'POST') {
                         $keptLocal = [];
                         $backup_data = e3dc_config_import_shadow_filter($backup_data, $boundCurrent, $dropped, $keptLocal, $haAnchorMode);
                         $next = e3dc_config_preserve_local_keys($boundCurrent, $backup_data);
+                        $next = e3dc_openwb_local_trust($boundCurrent, $next);
                         $next = e3dc_config_ha_off_after_confirmation($next, $haPartnerOffConfirmed, $haAnchorMode);
                         return [
                             'success' => true,
@@ -4075,6 +4254,8 @@ if ($configEditorRequestMethod === 'POST') {
         unset($v4_data['stop']);
         $old_v4_data = $v4_data;
 
+        $posted_values = e3dc_openwb_account_values($posted_values, $v4_data, $_POST);
+
         // Alle geposteten Werte übernehmen & Typen konvertieren
         $guard_warnings = [];
         $posted_values = e3dc_config_editor_preserve_missing_wb2_type(
@@ -4083,7 +4264,7 @@ if ($configEditorRequestMethod === 'POST') {
         );
         $old_wp_type = e3dc_cfg_scalar($v4_data, 'wp_type', $defaults['wp_type'] ?? '-1');
         $new_wp_type = e3dc_cfg_scalar($posted_values, 'wp_type', $old_wp_type);
-        $safe_wp_type = in_array($old_wp_type, ['0', '1', '3', '4', '5', '6'], true)
+        $safe_wp_type = in_array($old_wp_type, ['0', '1', '3', '4', '5', '6', '7'], true)
             ? $old_wp_type
             : e3dc_cfg_detect_native_wp_type($v4_data, $defaults['wp_type'] ?? '-1');
         $native_wp_configured = e3dc_cfg_native_wp_configured($v4_data)
@@ -4101,6 +4282,10 @@ if ($configEditorRequestMethod === 'POST') {
         } elseif ($native_wp_configured && in_array($new_wp_type, ['2', '3'], true) && $new_wp_type !== $old_wp_type) {
             $posted_values['wp_type'] = $old_wp_type;
             $guard_warnings[] = 'Der Wärmepumpen-Typ wurde nicht überschrieben, weil bereits eine native Luxtronik/IDM/Stiebel/Dimplex-Konfiguration vorhanden ist.';
+        }
+
+        if ($new_wp_type === '7' && in_array($old_wp_type, ['0', '1', '4', '5'], true)) {
+            $guard_warnings[] = 'Wechsel zur MQTT-Anzeige: Bisherigen Herstellerdienst und Wärmepumpen-Manager über die Installationszentrale beenden und die zur neuen Konfiguration benötigten Dienste bewusst neu einrichten. In Docker den Container über Docker Compose neu starten. Ein laufender Herstellertreiber wird durch Speichern allein nicht umgestellt.';
         }
 
         if ($new_wp_type === '2') {
@@ -4297,6 +4482,12 @@ if ($configEditorRequestMethod === 'POST') {
             if (is_array($value) || is_object($value)) {
                 continue;
             }
+            // Leere optionale Preisfelder materialisieren beim Speichern keine Standards.
+            if (in_array($key, ['market_degradation_ct_per_kwh', 'market_roundtrip_efficiency_pct',
+                'market_grid_charge_min_job_wh', 'market_grid_charge_min_job_pct'], true)
+                && trim((string)$value) === '' && !array_key_exists($key, $v4_data)) {
+                continue;
+            }
             // Geheimnis-/PIN-Schlüssel bleiben Text, alles andere wie bisher Zahl/Text.
             $v4_data[$key] = e3dc_config_editor_store_posted_value($key, $value);
         }
@@ -4389,7 +4580,7 @@ if ($configEditorRequestMethod === 'POST') {
                 static function($boundCurrent) use ($v4_data) {
                     return [
                         'success' => true,
-                        'data' => e3dc_storage_market_prepare_config(e3dc_aux_inverter_prepare_config($v4_data)),
+                        'data' => e3dc_openwb_local_trust($boundCurrent, e3dc_storage_market_prepare_config(e3dc_aux_inverter_prepare_config($v4_data))),
                     ];
                 },
                 'save',
@@ -4517,7 +4708,7 @@ $groups = [
         "heat_tariff_shift_mode", "heat_tariff_shift_windows", "heat_tariff_shift_ww_lead_min", "heat_grid_boost_max_outdoor_c", "cheap_grid_heatpump_enable", "heat_policy_runtime_enable", "price_boost_enable", "heat_price_boost_scope", "heat_price_boost_windows", "price_limit", "price_hard_limit", "price_pause_limit", "price_min_duration", "price_max_daily",
         "luxtronik", "wp_type", "wp_source_type", "wp_page_preview_enable", "wp_buffer_sensor", "wp_heating_circuit_pump", "idm_ip", "idm_port", "idm_e_total", "luxtronik_ip",
         "heizstab", "heizstab_type", "heizstab_ip", "heizstab_port", "heizstab_max_w", "shelly_heiz_ip", "shelly_heiz_w", "hs_min_surplus_w", "hs_min_soc", "hs_auto_mode",
-        "climate_enable", "climate_name", "climate_meter_ip", "climate_meter_type", "climate_meter_phase", "climate_min_power_w", "climate_poll_s", "climate_history_enable", "climate_history_interval_s", "climate_forecast_enable",
+        "climate_enable", "climate_name", "climate_meter_ip", "climate_meter_type", "climate_meter_phase", "climate_meter2_name", "climate_meter2_ip", "climate_meter2_type", "climate_meter2_phase", "climate_min_power_w", "climate_poll_s", "climate_history_enable", "climate_history_interval_s", "climate_forecast_enable",
         "climate_control_enable", "climate_control_provider", "climate_control_mode", "climate_control_poll_s", "climate_toshiba_cloud_enable", "climate_toshiba_username", "climate_toshiba_password", "climate_toshiba_device_ids", "climate_day_temp_c", "climate_night_temp_c", "climate_night_start", "climate_night_end", "climate_night_eco_enable", "climate_night_quiet_enable", "climate_high_power_enable",
         "shelly_3em_ip", "shelly_3em_relay_id", "shelly_3em_wp_min_w", "shelly_3em_wp_max_w", "shelly_3em_enable",
         "stiebel_isg_ip", "stiebel_isg_port", "stiebel_isg_device_id", "stiebel_isg_power_heating_w", "stiebel_isg_power_dhw_w",
@@ -4546,6 +4737,8 @@ $groups = [
         "matter_bridge"
     ],
     "Wallbox & Fahrzeug" => [
+        "wb1_openwb_username", "wb1_openwb_password", "wb1_openwb_tls_binding",
+        "wb2_openwb_username", "wb2_openwb_password", "wb2_openwb_tls_binding",
         "wb_native_enable", "wb_native_mode", "wb_native_type", "wb_native_ip", "wb_native_cp_id", "wb1_topic_prefix", "wb_native_type2", "wb_native_ip2", "wb2_topic_prefix", "wb_native_eco", "dvcarlimit",
         "wb1_e3dc_wbchar6_compat_enable", "wb2_e3dc_wbchar6_compat_enable",
         "wb_e3dc_direct_phase_control_enable",
@@ -4604,7 +4797,7 @@ $groups = [
         "pv_forecast_coupling_fc1", "pv_forecast_coupling_fc2", "pv_forecast_coupling_fc3", "pv_forecast_coupling_fc4",
         "pv_external_ac_inverter_limit_w", "pv_e3dc_dc_inverter_limit_w", "pv_forecast_topology_config",
         "pv_external_ac_observation_mode",
-        "forecast_diagnostics_enable", "ml_home_cap_kw"
+        "forecast_diagnostics_enable", "ml_home_cap_kw", "ml_home_daily_cap_kwh", "ml_training_legacy_source"
     ],
     "Erweitertes Feintuning" => [
         // Trajektorienbegrenzung (Ladekurve aktiv verfolgen)
@@ -4631,6 +4824,8 @@ $groups = [
         "heat_heater_grid_boost_price_limit_ct", "heat_heater_grid_boost_max_w",
         "heat_heater_min_temp_c", "heat_heater_max_temp_c", "heat_wp_daily_kwh",
         "market_charge_profile", "market_price_limit_ct",
+        "market_degradation_ct_per_kwh", "market_roundtrip_efficiency_pct",
+        "market_grid_charge_min_job_wh", "market_grid_charge_min_job_pct",
         "market_min_margin_pct", "market_safety_correction_ct_per_kwh",
         "market_autarky_first_enable", "market_autarky_low_soc_pct", "market_autarky_horizon_buffer_wh",
         "market_battery_grid_charge_enable", "market_battery_hold_enable",
@@ -4685,9 +4880,9 @@ $groups = [
         "push_notify_soc", "push_notify_plugged", "push_notify_unplugged", "push_notify_autostart", "push_notify_warnings", "push_notify_notstrom", "push_notify_updates"
     ],
     "Schnittstellen & MQTT" => [
-        "mqtt_hub_ip", "mqtt_hub_port", "mqtt_hub_user", "mqtt_hub_pass", "mqtt_hub_topic", "mqtt_hub_sub_soc_topic", "mqtt_hub_sub_soc_name", "mqtt_hub_sub_soc_topic_2", "mqtt_hub_sub_soc_name_2",
+        "mqtt_hub_ip", "mqtt_hub_port", "mqtt_hub_user", "mqtt_hub_pass", "mqtt_hub_topic", "mqtt_hub_repeat_interval_s", "mqtt_hub_sub_soc_topic", "mqtt_hub_sub_soc_name", "mqtt_hub_sub_soc_topic_2", "mqtt_hub_sub_soc_name_2",
         "wb_ip", "wb_topic", "wb_user", "wb_pass", "wb2_ip", "wb2_topic", "wb2_user", "wb2_pass",
-        "mqtt_ha_inbound_enable", "mqtt_ha_inbound_history_enable"
+        "mqtt_vehicle_allowlist", "wp_power_topic", "mqtt_ha_inbound_enable", "mqtt_ha_inbound_history_enable"
     ],
     "HA Master/Slave Cluster" => [
         "ha_mode", "ha_peer_ip", "ha_fail_timeout", "ha_sync_interval", "ha_auto_recover", "ha_auto_failover",
@@ -4724,6 +4919,8 @@ $frontendHiddenKeys = [
     "storage_parallel_diff_enable", "storage_parallel_diff_min_w", "storage_parallel_diff_log_interval_s",
     "storage_live_stale_guard_s", "storage_auto_limit_heartbeat_enable", "storage_auto_limit_heartbeat_s",
     "storage_curve_frame_write_brake_enable",
+    "storage_backup_hold_enable", "storage_backup_energy_kwh", "storage_backup_reference_time", "storage_backup_until_time", "storage_backup_grid_charge_enable", "storage_backup_grid_price_limit_ct",
+    "storage_central_pv_split_enable", "storage_central_pv_split_gate_hold_s",
     "storage_decision_history_enable", "storage_decision_history_max_bytes", "storage_decision_history_retention_days", "storage_decision_history_interval_s",
     "wallbox_decision_history_enable", "wallbox_decision_history_max_bytes", "wallbox_decision_history_retention_days", "wallbox_decision_history_interval_s",
     "energy_decision_history_enable", "energy_decision_history_max_bytes", "energy_decision_history_retention_days", "energy_decision_history_interval_s",
@@ -4966,6 +5163,24 @@ function renderHeatpumpPvReservationStatus($entry, $runtime = null): string {
             <?php if (is_array($runtime)): ?>
             <h6 class="small fw-bold">Wh-Kontingente beim Laden der Seite</h6>
             <p class="small text-muted mb-1">Messzeit: <?= htmlspecialchars(date('d.m.Y H:i:s T', (int)$runtime['sample_ts'])) ?>. Für einen neuen Stand die Seite neu laden.</p>
+            <?php
+            $recoveryReason = $runtime['energy_recovery_reason'] ?? '';
+            $recoveryEnd = $runtime['energy_quarantine_until_wall_s'] ?? null;
+            ?>
+            <?php if ($recoveryReason === 'clock_unconfirmed'): ?>
+            <p class="small mb-1">WP-Energiekonto: Wartet auf Zeitbestätigung.</p>
+            <?php elseif ($recoveryReason === 'legacy_window_elapsed_clock_unconfirmed'): ?>
+            <p class="small mb-1">Konservative Sperrfrist abgelaufen; Zeitbestätigung im Container nicht belegt.</p>
+            <?php elseif ($recoveryReason === 'clock_implausible'): ?>
+            <p class="small mb-1">WP-Energiekonto: Wartet auf plausible Zeitbestätigung (widersprüchliche Zeitprobe).</p>
+            <?php elseif ($recoveryReason === 'checkpoint_wall_clock_resumed' && ($runtime['state']['uncertain_state'] ?? false) !== true): ?>
+            <p class="small mb-1">WP-Energiekonto nach Neustart fortgeführt.</p>
+            <?php elseif (!is_bool($recoveryEnd) && is_numeric($recoveryEnd) && is_finite((float)$recoveryEnd)): ?>
+            <p class="small mb-1">Konto gesperrt bis <?= htmlspecialchars(date('d.m.Y H:i:s T', (int)$recoveryEnd)) ?> (Grund: <?= htmlspecialchars($recoveryReason === 'checkpoint_loss_window' ? 'Checkpoint fehlt oder ist beschädigt' : ($recoveryReason === 'legacy_quarantine_window' ? 'Bestehende Kontosperre' : 'Checkpoint-Zeit liegt vor der bestätigten Uhr')) ?>).</p>
+            <?php endif; ?>
+            <?php if (($runtime['restart_gap_energy_source'] ?? '') === 'conservative_separate_source_bounds'): ?>
+            <p class="small mb-1">Ausfalllücke konservativ geschätzt: getrennte Obergrenzen für Hausakku und Stromnetz, keine gemessene Verbrauchssumme.</p>
+            <?php endif; ?>
             <?php foreach (['battery' => 'Hausakku', 'grid' => 'Stromnetz'] as $source => $label): ?>
             <p class="small mb-1"><?= htmlspecialchars($label) ?>: <?= $fmt($runtime['window_' . $source . '_used_wh'], 1) ?> Wh verbraucht · <?= $fmt($runtime[$source . '_remaining_wh'], 1) ?> Wh verbleibend · <?= $fmt($runtime[$source . '_overrun_wh'], 1) ?> Wh über dem Kontingent.</p>
             <?php endforeach; ?>
@@ -6078,7 +6293,7 @@ async function readConfirmedConfigJson(response) {
             elseif ($simpleHasAddress('shelly_3em_ip')) $simpleDetectedWpType = '3';
             $simpleWpType = trim($simpleRaw('wp_type', '-1'));
             if (is_numeric($simpleWpType)) $simpleWpType = (string)(int)$simpleWpType;
-            if (!in_array($simpleWpType, ['-1', '0', '1', '2', '3', '4', '5', '6'], true)) {
+            if (!in_array($simpleWpType, ['-1', '0', '1', '2', '3', '4', '5', '6', '7'], true)) {
                 $simpleWpType = $simpleDetectedWpType;
             } elseif ($simpleWpType === '-1' && $simpleLuxEnabled && $simpleDetectedWpType !== '-1') {
                 $simpleWpType = $simpleDetectedWpType;
@@ -6118,6 +6333,7 @@ async function readConfirmedConfigJson(response) {
                 '4' => 'Stiebel Eltron ISG',
                 '5' => 'Dimplex WPM Touch',
                 '6' => 'E3DC Leistungsmesser (PM)',
+                '7' => 'MQTT-Wärmepumpe (nur Anzeige)',
             ];
             $simpleWpIpKey = [
                 '0' => 'luxtronik_ip',
@@ -6545,12 +6761,13 @@ async function readConfirmedConfigJson(response) {
                     '3' => 'Shelly Pro3EM Monitoring',
                     '4' => 'Stiebel Eltron ISG / WPM',
                     '5' => 'Dimplex WPM Touch / NWPM',
-                    '6' => 'E3DC Leistungsmesser (PM)'
+                    '6' => 'E3DC Leistungsmesser (PM)',
+                    '7' => 'MQTT-Wärmepumpe (nur Anzeige)'
                 ][$wp_type_val] ?? 'Keine Wärmepumpe';
                 $showWpSourceControls = $isLuxEnabled && in_array($wp_type_val, ['0','1'], true);
                 // Die Wärmequelle ist eine Eigenschaft jeder Wärmepumpe (Anzeige, COP-Farben, Quell-Erholung).
                 $showWpSourceTypeSelector = $isLuxEnabled && in_array($wp_type_val, ['0','1','3','4','5','6'], true);
-                $showShellySgControls = $isLuxEnabled && in_array($wp_type_val, ['-1','0'], true);
+                $showShellySgControls = $isLuxEnabled && in_array($wp_type_val, ['-1','0','7'], true);
                 $shellySgConfigured = !in_array(strtolower(trim((string)$val('shelly_sg_ip'))), ['', '0', '0.0.0.0'], true);
                 $wpPriceBoostSeparateTargets = in_array($wp_type_val, ['0', '1'], true);
                 // Stiebel ISG schaltet über den eigenen SG-Ready-Ausgang, sobald das Schreiben eingeschaltet ist;
@@ -6561,6 +6778,18 @@ async function readConfirmedConfigJson(response) {
                     || $shellySgConfigured
                     || $stiebelIsgSgWrite;
                 $showWpBoostControls = $isLuxEnabled && $autoModeEnabled && $wpPriceBoostControllable;
+                if ($wpPriceBoostSeparateTargets) {
+                    $boostTargetUses = 'E3DC-Control setzt diesen Sollwert beim PV-Boost, manuellen Boost, Preis-Boost und im Tariffenster. ';
+                    $tooltipMap['wws'] = $boostTargetUses . 'Warmwasser-Ziel im Sommer; die gemittelte Außentemperatur liegt über der Heizgrenze.';
+                    $tooltipMap['www'] = $boostTargetUses . 'Warmwasser-Ziel im Winter; die gemittelte Außentemperatur liegt an oder unter der Heizgrenze.';
+                    $tooltipMap['hz'] = $boostTargetUses . 'Heizungsziel im Winter. Bei Luxtronik bildet das beobachtete Normalsoll die Untergrenze des PV-Heizungsziels.';
+                } else {
+                    $tooltipMap['wws'] = 'E3DC-Control nutzt den Wert als Bedarfsschwelle für Warmwasser beim SG-Ready-Boost (Shelly, Dimplex, Stiebel). Es wird kein Sollwert an die Anlage übertragen.';
+                    $tooltipMap['www'] = 'Beim SG-Ready-Boost (Shelly, Dimplex, Stiebel) überträgt E3DC-Control keinen Warmwasser-Sollwert an die Anlage. WW Winter ist dort keine eigene Bedarfsschwelle; dafür gelten WW Sommer und Heizung Soll.';
+                    $tooltipMap['hz'] = 'E3DC-Control nutzt den Wert als Bedarfsschwelle für Heizung beim SG-Ready-Boost (Shelly, Dimplex, Stiebel). Es wird kein Sollwert an die Anlage übertragen.';
+                }
+                $tooltipMap['khl'] = 'Kühlung Soll wirkt nur bei iDM. E3DC-Control setzt das Kühlungsziel im Sommer beim PV-Boost und manuellen Boost, wenn die iDM Kühlgrenze die Kühlung freigibt.';
+
 
                 $groupTitle = ($isLuxEnabled || $isClimateEnabled) ? "Smart Home & Verbrauchsprognose" : "Smart Home Monitoring (aus)";
         ?>
@@ -6572,7 +6801,7 @@ async function readConfirmedConfigJson(response) {
             </summary>
             <div class="p-3">
 
-                <?php if (!$isLuxEnabled && $wp_type_val !== '2'): ?>
+                <?php if (!$isLuxEnabled && !in_array($wp_type_val, ['2', '7'], true)): ?>
                 <div class="row g-2 mb-3" id="independentHeaterSettings">
                     <div class="col-12"><strong>Heizstab / Zusatzverbraucher</strong><div class="small text-muted">Die Einrichtung benötigt kein WP-/Verbrauchslogging. Die Gerätefreigaben bleiben separat eingestellt.</div></div>
                     <div class="col-md-4"><label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['heizstab'] ?? '') ?>">Heizstab aktiv</label><select name="values[heizstab]" class="form-select config-input"><option value="0" <?= $isTrue('heizstab') ? '' : 'selected' ?>>Aus</option><option value="1" <?= $isTrue('heizstab') ? 'selected' : '' ?>>Ein</option></select></div>
@@ -6594,16 +6823,18 @@ async function readConfirmedConfigJson(response) {
                             <label class="form-check-label ms-2 config-label" for="conf_auto" data-tooltip="<?= htmlspecialchars($tooltipMap['auto_mode'] ?? '') ?>">Automatik darf Geräte steuern</label>
                         </div>
                         <div class="small text-muted mt-2">
-                            <?= $isLuxEnabled
+                            <?= $wp_type_val === '7'
+                                ? "MQTT-Anzeige aktiv. Steuerung weiter über SG-Ready/Shelly bzw. extern gemäß den vorhandenen Einstellungen."
+                                : ($isLuxEnabled
                                 ? ($autoModeEnabled
                                     ? "Aktiv: Logging plus PV-/Preis-Regelung für " . htmlspecialchars($wpTypeName) . "."
                                     : "Nur Logging: Verbrauch wird für Prognose/ML erfasst, WP/WB/Heizstab bleiben autonom.")
                                 : ($isClimateEnabled
                                     ? "Klima-Messung aktiv: Verbrauch wird separat erfasst; WP-Schaltbefehle bleiben aus."
-                                    : "Aus: keine Smart-Home-Erfassung und keine WP-Schaltbefehle.") ?>
+                                    : "Aus: keine Smart-Home-Erfassung und keine WP-Schaltbefehle.")) ?>
                         </div>
                     </div>
-                    <?php if ($isLuxEnabled || $wp_type_val === '2'): ?>
+                    <?php if ($isLuxEnabled || in_array($wp_type_val, ['2', '7'], true)): ?>
                     <div class="col-md-6">
                         <div class="row g-2">
                             <div class="col-12">
@@ -6617,6 +6848,7 @@ async function readConfirmedConfigJson(response) {
                                     <option value="4" <?= ($wp_type_val === '4') ? 'selected' : '' ?>>Stiebel Eltron ISG / WPM</option>
                                     <option value="5" <?= ($wp_type_val === '5') ? 'selected' : '' ?>>Dimplex WPM Touch / NWPM</option>
                                     <option value="6" <?= ($wp_type_val === '6') ? 'selected' : '' ?>>E3DC Leistungsmesser (PM)</option>
+                                    <option value="7" <?= ($wp_type_val === '7') ? 'selected' : '' ?>>MQTT-Wärmepumpe (nur Anzeige)</option>
                                 </select>
                                 <div class="small text-muted mt-1">
                                     Heizstab/BWWP bitte nicht als Wärmepumpe auswählen, sondern unten als Zusatzverbraucher konfigurieren.
@@ -7152,15 +7384,15 @@ async function readConfirmedConfigJson(response) {
                                     Eigener Messpfad für Verbraucher mit Energiezähler. Die Messung trennt Klima-Verbrauch vom normalen Hausverbrauch; es wird nichts geschaltet.
                                 </div>
                                 <div class="row g-2">
-                                    <div class="col-12 col-md-4">
+                                    <div class="col-12 col-md-6 col-xl-3">
                                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['climate_name'] ?? '') ?>">Name</label>
                                         <input type="text" name="values[climate_name]" class="form-control config-input" value="<?= $val('climate_name') ?>" placeholder="Klimaanlage">
                                     </div>
-                                    <div class="col-12 col-md-4">
+                                    <div class="col-12 col-md-6 col-xl-3">
                                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['climate_meter_ip'] ?? '') ?>">Shelly-Zähler IP</label>
                                         <input type="text" name="values[climate_meter_ip]" class="form-control config-input" value="<?= $val('climate_meter_ip') ?>" placeholder="192.0.2.102">
                                     </div>
-                                    <div class="col-6 col-md-2">
+                                    <div class="col-12 col-md-6 col-xl-3">
                                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['climate_meter_phase'] ?? '') ?>">Phase / Kanal</label>
                                         <?php $climatePhase = strtolower((string)($val('climate_meter_phase') ?: 'c')); ?>
                                         <select name="values[climate_meter_phase]" class="form-select config-input">
@@ -7172,11 +7404,7 @@ async function readConfirmedConfigJson(response) {
                                             <option value="total" <?= $climatePhase === 'total' ? 'selected' : '' ?>>Summe</option>
                                         </select>
                                     </div>
-                                    <div class="col-6 col-md-2">
-                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['climate_min_power_w'] ?? '') ?>">Aktiv ab W</label>
-                                        <input type="number" min="0" step="10" name="values[climate_min_power_w]" class="form-control config-input" value="<?= $val('climate_min_power_w') ?>" placeholder="50">
-                                    </div>
-                                    <div class="col-12 col-md-4">
+                                    <div class="col-12 col-md-6 col-xl-3">
                                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['climate_meter_type'] ?? '') ?>">Zählertyp</label>
                                         <?php $climateMeterType = strtolower((string)($val('climate_meter_type') ?: 'shelly_pro3em')); ?>
                                         <select name="values[climate_meter_type]" class="form-select config-input">
@@ -7186,6 +7414,45 @@ async function readConfirmedConfigJson(response) {
                                             <option value="shelly_pm_mini" <?= in_array($climateMeterType, ['shelly_pm_mini','shelly_pm_mini_gen3','shelly_pm_mini_gen4','shelly_pm1'], true) ? 'selected' : '' ?>>Shelly PM Mini</option>
                                             <option value="auto" <?= $climateMeterType === 'auto' ? 'selected' : '' ?>>Auto-Erkennung</option>
                                         </select>
+                                    </div>
+                                </div>
+                                <div class="row g-2 mt-2">
+                                    <div class="col-12 col-md-6 col-xl-3">
+                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['climate_meter2_name'] ?? '') ?>">Name Anlage 2</label>
+                                        <input type="text" name="values[climate_meter2_name]" class="form-control config-input" value="<?= $val('climate_meter2_name') ?>" placeholder="Klimaanlage">
+                                    </div>
+                                    <div class="col-12 col-md-6 col-xl-3">
+                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['climate_meter2_ip'] ?? '') ?>">Zweiter Shelly-Zähler IP</label>
+                                        <input type="text" name="values[climate_meter2_ip]" class="form-control config-input" value="<?= $val('climate_meter2_ip') ?>" placeholder="0.0.0.0">
+                                    </div>
+                                    <div class="col-12 col-md-6 col-xl-3">
+                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['climate_meter2_phase'] ?? '') ?>">Phase / Kanal</label>
+                                        <?php $climatePhase2 = strtolower((string)($val('climate_meter2_phase') ?: 'c')); ?>
+                                        <select name="values[climate_meter2_phase]" class="form-select config-input">
+                                            <option value="a" <?= $climatePhase2 === 'a' ? 'selected' : '' ?>>A / L1</option>
+                                            <option value="b" <?= $climatePhase2 === 'b' ? 'selected' : '' ?>>B / L2</option>
+                                            <option value="c" <?= ($climatePhase2 === 'c' || $climatePhase2 === '') ? 'selected' : '' ?>>C / L3</option>
+                                            <option value="channel0" <?= in_array($climatePhase2, ['channel0','channel_0','ch0','emeter0','emeter:0','emeter/0'], true) ? 'selected' : '' ?>>Kanal 0 (Shelly EM Gen1)</option>
+                                            <option value="channel1" <?= in_array($climatePhase2, ['channel1','channel_1','ch1','emeter1','emeter:1','emeter/1'], true) ? 'selected' : '' ?>>Kanal 1 (Shelly EM Gen1)</option>
+                                            <option value="total" <?= $climatePhase2 === 'total' ? 'selected' : '' ?>>Summe</option>
+                                        </select>
+                                    </div>
+                                    <div class="col-12 col-md-6 col-xl-3">
+                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['climate_meter2_type'] ?? '') ?>">Zählertyp Anlage 2</label>
+                                        <?php $climateMeterType2 = strtolower((string)($val('climate_meter2_type') ?: 'shelly_pro3em')); ?>
+                                        <select name="values[climate_meter2_type]" class="form-select config-input">
+                                            <option value="shelly_pro3em" <?= in_array($climateMeterType2, ['shelly_pro3em','shelly_3em','shelly_gen2'], true) ? 'selected' : '' ?>>Shelly Pro3EM / 3EM Gen2</option>
+                                            <option value="shelly_em_gen1" <?= in_array($climateMeterType2, ['shelly_em_gen1','shelly_em','shelly_em_legacy','em_gen1','gen1_em'], true) ? 'selected' : '' ?>>Shelly EM Gen1 (2 Kanäle)</option>
+                                            <option value="shelly_em_mini_gen4" <?= in_array($climateMeterType2, ['shelly_em_mini_gen4','shelly_mini_em_gen4','shelly_em_mini'], true) ? 'selected' : '' ?>>Shelly EM Mini Gen4</option>
+                                            <option value="shelly_pm_mini" <?= in_array($climateMeterType2, ['shelly_pm_mini','shelly_pm_mini_gen3','shelly_pm_mini_gen4','shelly_pm1'], true) ? 'selected' : '' ?>>Shelly PM Mini</option>
+                                            <option value="auto" <?= $climateMeterType2 === 'auto' ? 'selected' : '' ?>>Auto-Erkennung</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div class="row g-2 mt-2">
+                                    <div class="col-6 col-md-2">
+                                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['climate_min_power_w'] ?? '') ?>">Aktiv ab W</label>
+                                        <input type="number" min="0" step="10" name="values[climate_min_power_w]" class="form-control config-input" value="<?= $val('climate_min_power_w') ?>" placeholder="50">
                                     </div>
                                     <div class="col-6 col-md-2">
                                         <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['climate_poll_s'] ?? '') ?>">Takt s</label>
@@ -7503,6 +7770,44 @@ async function readConfirmedConfigJson(response) {
                 </section>
                 <?php if ($showWpBoostControls): ?>
                 <h6 class="text-muted small fw-bold mt-4 mb-2 border-bottom pb-1">PV-Überschuss-Boost</h6>
+                <div class="border rounded p-3 mb-3" id="wpBoostTargets">
+                    <h6 class="small fw-bold mb-2">Boost-Zieltemperaturen</h6>
+                <div class="row g-2 mb-2">
+                    <div class="col-6 col-md-3">
+                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wws'] ?? '') ?>">WW Sommer</label>
+                        <input type="number" step="0.1" name="values[wws]" class="form-control config-input" value="<?= $val('wws') ?>">
+                    </div>
+                    <div class="col-6 col-md-3">
+                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['www'] ?? '') ?>">WW Winter</label>
+                        <input type="number" step="0.1" name="values[www]" class="form-control config-input" value="<?= $val('www') ?>">
+                    </div>
+                    <div class="col-6 col-md-3">
+                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['hz'] ?? '') ?>">Heizung Soll</label>
+                        <input type="number" step="0.1" name="values[hz]" class="form-control config-input" value="<?= $val('hz') ?>">
+                    </div>
+                    <div class="col-6 col-md-3">
+                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['khl'] ?? '') ?>">Kühlung Soll</label>
+                        <input type="number" step="0.1" name="values[khl]" class="form-control config-input" value="<?= $val('khl') ?>">
+                    </div>
+                </div>
+                    <h6 class="small fw-bold mt-3 mb-2">Freigabe und Saison</h6>
+                <div class="row g-2 mb-2">
+                    <div class="col-6 col-md-3">
+                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['min_soc'] ?? '') ?>">Min SoC (%)</label>
+                        <input type="number" name="values[min_soc]" class="form-control config-input" value="<?= $val('min_soc') ?>">
+                    </div>
+                    <div class="col-6 col-md-3">
+                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['heizgrenze_temp'] ?? '') ?>">Heizgrenze (°C)</label>
+                        <input type="number" step="0.1" name="values[heizgrenze_temp]" class="form-control config-input" value="<?= $val('heizgrenze_temp') ?>">
+                    </div>
+                    <?php if ($wp_type_val === '1'): ?>
+                    <div class="col-6 col-md-3">
+                        <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['idm_cooling_boost_min_at'] ?? '') ?>">iDM Kühlgrenze (°C)</label>
+                        <input type="number" step="0.1" name="values[idm_cooling_boost_min_at]" class="form-control config-input" value="<?= $val('idm_cooling_boost_min_at') ?>" placeholder="<?= $defaults['idm_cooling_boost_min_at'] ?>">
+                    </div>
+                    <?php endif; ?>
+                </div>
+                </div>
                 <?php if ($wp_type_val === '0'): ?>
                 <div class="border rounded p-3 mb-3" id="wpPvControls">
                     <h6 class="small fw-bold mb-2">Luxtronik: PV-Automatik und Wolkenüberbrückung</h6>
@@ -7672,38 +7977,6 @@ async function readConfirmedConfigJson(response) {
                 </div>
                 </div>
                 <?php endif; ?>
-                <div class="row g-2 mb-2">
-                    <div class="col-6 col-md-3">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['min_soc'] ?? '') ?>">Min SoC (%)</label>
-                        <input type="number" name="values[min_soc]" class="form-control config-input" value="<?= $val('min_soc') ?>">
-                    </div>
-                    <div class="col-6 col-md-3">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['heizgrenze_temp'] ?? '') ?>">Heizgrenze (°C)</label>
-                        <input type="number" step="0.1" name="values[heizgrenze_temp]" class="form-control config-input" value="<?= $val('heizgrenze_temp') ?>">
-                    </div>
-                    <?php if ($wp_type_val === '1'): ?>
-                    <div class="col-6 col-md-3">
-                        <label class="config-label text-info" data-tooltip="<?= htmlspecialchars($tooltipMap['idm_cooling_boost_min_at'] ?? '') ?>">iDM Kühlgrenze (°C)</label>
-                        <input type="number" step="0.1" name="values[idm_cooling_boost_min_at]" class="form-control config-input" value="<?= $val('idm_cooling_boost_min_at') ?>" placeholder="<?= $defaults['idm_cooling_boost_min_at'] ?>">
-                    </div>
-                    <?php endif; ?>
-                    <div class="col-4 col-md-2">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wws'] ?? '') ?>">WW Sommer</label>
-                        <input type="number" step="0.1" name="values[wws]" class="form-control config-input" value="<?= $val('wws') ?>">
-                    </div>
-                    <div class="col-4 col-md-2">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['www'] ?? '') ?>">WW Winter</label>
-                        <input type="number" step="0.1" name="values[www]" class="form-control config-input" value="<?= $val('www') ?>">
-                    </div>
-                    <div class="col-4 col-md-2">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['hz'] ?? '') ?>">Heizung Soll</label>
-                        <input type="number" step="0.1" name="values[hz]" class="form-control config-input" value="<?= $val('hz') ?>">
-                    </div>
-                    <div class="col-4 col-md-2">
-                        <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['khl'] ?? '') ?>">Kühlung Soll</label>
-                        <input type="number" step="0.1" name="values[khl]" class="form-control config-input" value="<?= $val('khl') ?>">
-                    </div>
-                </div>
 
                 <h6 class="text-muted small fw-bold mt-4 mb-2 border-bottom pb-1">Warmwasser & Zirkulation (Software-Timer)</h6>
                 <div class="form-check form-switch mb-2 config-item ps-5 border-0 bg-transparent">
@@ -7877,6 +8150,56 @@ async function readConfirmedConfigJson(response) {
                 <i class="fas fa-chevron-down small position-absolute" style="right: 15px;"></i>
             </summary>
             <div class="p-3">
+                <div class="row g-3 mb-3" id="openwb_accounts">
+                <?php foreach ([1, 2] as $openwbSlot):
+                    $prefix = 'wb' . $openwbSlot . '_openwb_';
+                    $type = $openwbSlot === 1 ? $wbTypeDisplay : $wbType2;
+                    if ($type !== 'openwb') continue;
+                    $trust = json_decode((string)$rawVal($prefix . 'tls_binding'), true);
+                    $transportFile = '/var/www/html/ramdisk/openwb_data' . ($openwbSlot === 1 ? '' : '_wb2') . '.json';
+                    $transportState = is_file($transportFile) && time() - filemtime($transportFile) < 30
+                        ? json_decode((string)@file_get_contents($transportFile), true) : [];
+
+                ?>
+                    <div class="col-md-6 border rounded p-3">
+                        <strong>Wallbox <?= $openwbSlot ?> – openWB Benutzerverwaltung</strong>
+                        <div class="small mt-2"><?= htmlspecialchars((string)($transportState['openwb_transport_notice'] ?? ''), ENT_QUOTES, 'UTF-8') ?></div>
+                        <label class="config-label mt-2" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_openwb_username'] ?? '') ?>">openWB Benutzer</label>
+                        <input type="text" class="form-control config-input" name="values[<?= $prefix ?>username]" value="" autocomplete="off" placeholder="<?= $rawVal($prefix . 'username') !== '' ? 'gesetzt – leer lassen zum Erhalten' : 'nicht gesetzt' ?>">
+                        <label class="config-label mt-2" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_openwb_password'] ?? '') ?>">openWB Passwort</label>
+                        <input type="password" class="form-control config-input" name="values[<?= $prefix ?>password]" value="" autocomplete="new-password" placeholder="<?= $rawVal($prefix . 'password') !== '' ? 'gesetzt – leer lassen zum Erhalten' : 'nicht gesetzt' ?>">
+                        <label class="d-block small mt-2" data-tooltip="<?= htmlspecialchars($tooltipMap['ui_openwb_copy'] ?? '') ?>"><input type="checkbox" name="openwb_copy_<?= $openwbSlot ?>" value="1"> Bestehende HTTP-Zugangsdaten dieses Slots ausdrücklich übernehmen</label>
+                        <label class="d-block small" data-tooltip="<?= htmlspecialchars($tooltipMap['ui_openwb_clear'] ?? '') ?>"><input type="checkbox" name="openwb_clear_<?= $openwbSlot ?>" value="1"> openWB-Konto dieses Slots löschen</label>
+                        <div class="mt-2">Zertifikat: <?= !empty($trust['sha256']) ? 'lokal bestätigt' : 'keine lokale Bindung (reguläre CA-Prüfung bleibt aktiv)' ?></div>
+                        <code><?= htmlspecialchars((string)($trust['sha256'] ?? ''), ENT_QUOTES, 'UTF-8') ?></code>
+                        <button type="button" class="btn btn-sm btn-outline-info mt-2" onclick="openwbCertificate(<?= $openwbSlot ?>)">Zertifikat prüfen und bestätigen</button>
+                        <div id="openwb_certificate_<?= $openwbSlot ?>" class="small mt-2" aria-live="polite"></div>
+                        <div class="small mt-2">Adresse zuerst speichern. Mit Benutzerkonto oder Zertifikatsbindung ist HTTPS verbindlich. Ohne Konto und Zertifikatsbindung sind unverschlüsselte Altanlagen mit http:// oder einer bloßen Adresse möglich. Zugangsdaten werden niemals unverschlüsselt gesendet.</div>
+                    </div>
+                <?php endforeach; ?>
+                </div>
+                <p class="small">openWB-Rollen für den Lesepfad: basic-system-data, chargepoint-&lt;Ladepunktnummer&gt;-access und graph-access. Für Akku- und Überschusshinweise zusätzlich active-bat-control-configuration-access und surplus-charge-configuration-access. Die Ladepunkt-, Akku- und Überschussrollen enthalten auch Schreibrechte; basic-system-data enthält Rechte für Meldungen und Passwort-Rücksetzung. Die HTTP-V1-Steuerung benötigt gesonderte Schreibrechte. Ein erfolgreicher Verbindungsaufbau allein belegt keine Leserechte.</p>
+                <script>
+                async function openwbCertificate(slot) {
+                    const box = document.getElementById('openwb_certificate_' + slot);
+                    const call = async (action, extra = {}) => {
+                        const body = new URLSearchParams({config_action: action, openwb_slot: String(slot),
+                            csrf_token: <?= json_encode(e3dcCsrfToken()) ?>, ...extra});
+                        const response = await fetch('config_editor.php', {method: 'POST', body,
+                            headers: {'X-Requested-With': 'XMLHttpRequest'}});
+                        return await response.json();
+                    };
+                    try {
+                        box.textContent = 'Zertifikat wird ohne Zugangsdaten ermittelt …';
+                        const probe = await call('openwb_probe');
+                        if (!probe.success) { box.textContent = probe.message; return; }
+                        box.textContent = 'Bisher: ' + (probe.previous_sha256 || 'keine Bindung') + ' · Neu: ' + probe.sha256;
+                        if (!window.confirm('SHA-256 des vollständigen Zertifikats: ' + probe.sha256 + '\nMit einem unabhängigen vertrauenswürdigen Weg vergleichen. Stimmt der Fingerabdruck überein und möchten Sie genau dieses Zertifikat bestätigen?')) return;
+                        const result = await call('openwb_confirm', {sha256: probe.sha256, independent_confirmation: '1'});
+                        box.textContent = result.message;
+                    } catch (_) { box.textContent = 'Zertifikatsprüfung nicht verfügbar. Bitte erneut versuchen.'; }
+                }
+                </script>
                 <div class="wallbox-device-grid mb-3" data-wallbox-count="<?= $hasSecondWallbox ? '2' : '1' ?>">
                     <div class="col-md-12 mb-2" data-wallbox-common>
                         <div class="form-check form-switch config-item border-0 p-0 ps-5">
@@ -9429,6 +9752,41 @@ async function readConfirmedConfigJson(response) {
                                 </div>
                                 <?= $configValidationMarker('market_safety_correction_ct_per_kwh') ?>
                             </div>
+                            <details class="border rounded p-2" data-market-storage-parameters>
+                                <summary class="config-label mb-2">Details zur Speicher-Netzladung</summary>
+                                <p class="small text-muted">Eigene Werte bleiben bei jedem Profilwechsel erhalten. Leer = bisherigen Rückfall verwenden. Die Angaben darunter zeigen den gespeicherten Stand.</p>
+                                <?php foreach ([
+                                    'market_degradation_ct_per_kwh' => ['Akkuverschleiß', 'ct/kWh'],
+                                    'market_roundtrip_efficiency_pct' => ['Speicher-Wirkungsgrad', '%'],
+                                    'market_grid_charge_min_job_wh' => ['Mindestmenge je Netzladeauftrag', 'Wh'],
+                                    'market_grid_charge_min_job_pct' => ['Kapazitätsanteil der Mindestmenge', '%'],
+                                ] as $marketParameterKey => [$marketParameterLabel, $marketParameterUnit]):
+                                    $marketParameterState = e3dc_market_storage_parameter_state($config, $marketParameterKey);
+                                    // Dieselbe Komma-/Zahlennormalisierung wie bei der wirksamen Lesung.
+                                    // Unlesbarer Bestand bleibt als Text bearbeitbar und wird nicht geleert.
+                                    $marketParameterInput = str_replace(',', '.', $marketParameterState['stored']);
+                                    $marketParameterIsNumber = $marketParameterInput === ''
+                                        || (is_numeric($marketParameterInput) && is_finite((float)$marketParameterInput));
+                                    if ($marketParameterInput !== '' && $marketParameterIsNumber) {
+                                        $marketParameterInput = (string)(float)$marketParameterInput;
+                                    } elseif (!$marketParameterIsNumber) {
+                                        $marketParameterInput = $marketParameterState['stored'];
+                                    }
+                                    $marketParameterEffective = $marketParameterState['effective'] === null
+                                        ? 'nicht verfügbar' : str_replace('.', ',', (string)$marketParameterState['effective']);
+                                ?>
+                                    <div class="mb-3">
+                                        <label class="config-label" for="conf_<?= $marketParameterKey ?>" data-tooltip="<?= htmlspecialchars($tooltipMap[$marketParameterKey] ?? '') ?>"><?= $marketParameterLabel ?></label>
+                                        <div class="input-group">
+                                            <input type="<?= $marketParameterIsNumber ? 'number' : 'text' ?>" step="any" name="values[<?= $marketParameterKey ?>]" id="conf_<?= $marketParameterKey ?>" class="form-control config-input" value="<?= htmlspecialchars($marketParameterInput) ?>" placeholder="<?= htmlspecialchars((string)$marketParameterState['effective']) ?>" aria-describedby="source_<?= $marketParameterKey ?>">
+                                            <span class="input-group-text bg-body-tertiary"><?= $marketParameterUnit ?></span>
+                                        </div>
+                                        <div class="small text-muted" id="source_<?= $marketParameterKey ?>">Wirksam: <?= htmlspecialchars($marketParameterEffective) ?> <?= $marketParameterUnit ?> · Herkunft: <?= htmlspecialchars($marketParameterState['source']) ?></div>
+                                        <?= $configValidationMarker($marketParameterKey) ?>
+                                    </div>
+                                <?php endforeach; ?>
+                                <p class="small text-muted mb-0">Kleinere Ladeaufträge werden nicht ausgeführt. Mindestmenge = max(Wh-Wert, Kapazität × Prozent/100), bezogen auf die aus dem Netz bezogene Energie je Auftrag. Beide Werte auf 0 setzen, um das Minimum aufzuheben.</p>
+                            </details>
                             <div>
                                 <div class="d-flex align-items-start gap-2">
                                     <i class="fas fa-shield-halved text-success mt-1"></i>
@@ -11368,12 +11726,13 @@ async function readConfirmedConfigJson(response) {
                             <div class="h-100 rounded-3 p-3 config-wizard-card">
                                 <div class="fw-bold text-success mb-2"><i class="fas fa-inbox me-2"></i>2. Messwerte annehmen</div>
                                 <div class="text-muted mb-2" style="font-size:0.78rem;">Heute direkt wirksam für Frontend, Live-History und Prognose:</div>
-                                <code class="d-block small mb-1"><?= $mqttBaseTopic ?>/in/heatpump/power_w</code>
-                                <code class="d-block small mb-1"><?= $mqttBaseTopic ?>/in/heatpump/ww_temp</code>
-                                <code class="d-block small mb-1"><?= $mqttBaseTopic ?>/in/heater/power_w</code>
-                                <code class="d-block small mb-1"><?= $mqttBaseTopic ?>/in/heater/water_temp</code>
-                                <code class="d-block small mb-1"><?= $mqttBaseTopic ?>/in/wallbox/power_w</code>
-                                <code class="d-block small"><?= $mqttBaseTopic ?>/in/wallbox2/power_w</code>
+                                <code class="d-block small mb-1" data-tooltip="Aktuelle elektrische Leistungsaufnahme der Wärmepumpe in W; kein Zählerstand und keine Heizleistung. Wird als WP-Messwert für Anzeige, Live-History und Prognose übernommen."><?= $mqttBaseTopic ?>/in/heatpump/power_w</code>
+                                <code class="d-block small mb-1" data-tooltip="Warmwasser-Isttemperatur in °C. Wird als gemessene Warmwassertemperatur übernommen."><?= $mqttBaseTopic ?>/in/heatpump/ww_temp</code>
+                                <code class="d-block small mb-1" data-tooltip="Leistung eines separat gemessenen Heizstabs in W. Wird als eigener Heizstab-Messwert übernommen. Nicht senden, wenn sie schon in der WP-Leistung steckt, sonst Doppelzählung."><?= $mqttBaseTopic ?>/in/heater/power_w</code>
+                                <code class="d-block small mb-1" data-tooltip="Wassertemperatur des Speichers, in dem der Heizstab sitzt, in °C. Wird als gemessene Heizstab-Speichertemperatur übernommen."><?= $mqttBaseTopic ?>/in/heater/water_temp</code>
+                                <code class="d-block small mb-1" data-tooltip="Leistung der externen Wallbox 1 in W. Wird als Wallbox-Messwert für Anzeige, Live-History und Prognose übernommen."><?= $mqttBaseTopic ?>/in/wallbox/power_w</code>
+                                <code class="d-block small" data-tooltip="Leistung der externen Wallbox 2 in W. Wird als Wallbox-Messwert für Anzeige, Live-History und Prognose übernommen."><?= $mqttBaseTopic ?>/in/wallbox2/power_w</code>
+                                <div class="small text-muted mt-2">Werte gelten 180 s. Unveränderte Werte regelmäßig erneut senden. „unavailable“ und „unknown“ werden ignoriert.</div>
                             </div>
                         </div>
                         <div class="col-12 col-lg-4">
@@ -11400,6 +11759,17 @@ async function readConfirmedConfigJson(response) {
                             <div class="col-6 col-md-5">
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['mqtt_hub_topic'] ?? '') ?>">Basis-Topic</label>
                                 <input type="text" name="values[mqtt_hub_topic]" class="form-control config-input" value="<?= $mv('mqtt_hub_topic') ?>" placeholder="e3dc">
+                            </div>
+                            <div class="col-12 col-md-6">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['mqtt_hub_repeat_interval_s'] ?? '') ?>">Werte zyklisch wiederholen (s)</label>
+                                <input type="number" step="1" name="values[mqtt_hub_repeat_interval_s]" class="form-control config-input" value="<?= $mv('mqtt_hub_repeat_interval_s') ?>" placeholder="0 = aus">
+                            </div>
+                            <div class="col-12">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['mqtt_vehicle_allowlist'] ?? '') ?>">MQTT-Fahrzeug-Freigabeliste (optional)</label>
+                                <input type="text" name="values[mqtt_vehicle_allowlist]" class="form-control config-input" value="<?= $mv('mqtt_vehicle_allowlist') ?>" placeholder="Leer = offen">
+                                <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['wp_power_topic'] ?? '') ?>">WP-Leistungs-Topic (optional)</label>
+                                <input type="text" name="values[wp_power_topic]" class="form-control config-input" value="<?= $mv('wp_power_topic') ?>" placeholder="z.B. ha/heatpump/power">
+                                <small class="text-muted">Rohe Zahl in W am zentralen Broker. Ersetzt beide festen WP-Leistungseingänge; eine HA-Entity-ID ist kein MQTT-Topic. Über den Einrichtungsplan neu starten.</small>
                             </div>
                             <div class="col-12 col-md-6">
                                 <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['mqtt_hub_user'] ?? '') ?>">Benutzer</label>
@@ -11760,6 +12130,44 @@ async function readConfirmedConfigJson(response) {
                                 </div>
                             </div>
                         </div>
+                        <details class="col-12 mt-2">
+                            <summary class="small fw-bold text-muted">Experimentelle Speicherregelung</summary>
+                            <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['storage_central_pv_split_enable'] ?? '') ?>">Zentrale PV-Aufteilung Akku/Wallbox (experimentell)</label>
+                            <select class="form-select config-input" name="values[storage_central_pv_split_enable]">
+                                <option value="0" <?= !$sbool('storage_central_pv_split_enable') ? 'selected' : '' ?>>Aus (Standard)</option>
+                                <option value="1" <?= $sbool('storage_central_pv_split_enable') ? 'selected' : '' ?>>Ein</option>
+                            </select>
+                            <?= $configValidationMarker('storage_central_pv_split_enable') ?>
+                            <div class="mt-3 fw-bold">Experimentell: Notstrom-Vorhaltung</div>
+                            <p class="small text-muted">Halten bedeutet nachts mehr Netzbezug; Netzladen kostet den Bezugspreis. Verluste und Notstromfähigkeit der Anlage prüft E3DC-Control nicht.</p>
+                            <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['storage_backup_hold_enable'] ?? '') ?>">Notstrom-Vorhaltung</label>
+                            <select class="form-select config-input" name="values[storage_backup_hold_enable]">
+                                <?php $backupHoldValue = strtolower(trim((string)$sv('storage_backup_hold_enable')));
+                                $backupHoldMode = $backupHoldValue === '2' ? 2 : (in_array($backupHoldValue, ['1', 'true', 'yes', 'on'], true) ? 1 : 0); ?>
+                                <option value="0" <?= $backupHoldMode === 0 ? 'selected' : '' ?>>Aus (Standard)</option>
+                                <option value="1" <?= $backupHoldMode === 1 ? 'selected' : '' ?>>Beobachten (keine Speicherbefehle)</option>
+                                <option value="2" <?= $backupHoldMode === 2 ? 'selected' : '' ?>>Halten</option>
+                            </select>
+                            <?= $configValidationMarker('storage_backup_hold_enable') ?>
+                            <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['storage_backup_energy_kwh'] ?? '') ?>">Notstrom-Vorhalt am Abend (kWh Speicherinhalt)</label>
+                            <input type="number" step="0.01" class="form-control config-input" name="values[storage_backup_energy_kwh]" value="<?= $sv('storage_backup_energy_kwh') ?>">
+                            <?= $configValidationMarker('storage_backup_energy_kwh') ?>
+                            <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['storage_backup_reference_time'] ?? '') ?>">Bezugszeit (Ortszeit)</label>
+                            <input type="time" class="form-control config-input" name="values[storage_backup_reference_time]" value="<?= $sv('storage_backup_reference_time') ?>">
+                            <?= $configValidationMarker('storage_backup_reference_time') ?>
+                            <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['storage_backup_until_time'] ?? '') ?>">Versorgung mindestens bis (bestätigte Ortszeit)</label>
+                            <input type="time" class="form-control config-input" name="values[storage_backup_until_time]" value="<?= $sv('storage_backup_until_time') ?>">
+                            <?= $configValidationMarker('storage_backup_until_time') ?>
+                            <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['storage_backup_grid_charge_enable'] ?? '') ?>">Reserve-Netzladen (bei Halten)</label>
+                            <select class="form-select config-input" name="values[storage_backup_grid_charge_enable]">
+                                <option value="0" <?= !$sbool('storage_backup_grid_charge_enable') ? 'selected' : '' ?>>Aus (Standard)</option>
+                                <option value="1" <?= $sbool('storage_backup_grid_charge_enable') ? 'selected' : '' ?>>Ein (bei Beobachten nur Rechnung)</option>
+                            </select>
+                            <?= $configValidationMarker('storage_backup_grid_charge_enable') ?>
+                            <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['storage_backup_grid_price_limit_ct'] ?? '') ?>">Höchster Bezugspreis (ct/kWh)</label>
+                            <input type="number" step="0.01" class="form-control config-input" name="values[storage_backup_grid_price_limit_ct]" value="<?= $sv('storage_backup_grid_price_limit_ct') ?>">
+                            <?= $configValidationMarker('storage_backup_grid_price_limit_ct') ?>
+                        </details>
                         <?php /* Später Vollstand nur mit Grund (nur Prognose auf 100%). */ ?>
                         <div class="col-12 d-none" data-forecast100-curve-setting>
                             <div class="rounded-3 p-2" style="background:rgba(14,165,233,0.07); border:1px solid rgba(14,165,233,0.18);">
@@ -12492,6 +12900,20 @@ async function readConfirmedConfigJson(response) {
                                     Deaktivierung nicht empfohlen.
                                 </div>
                             </div>
+                        </div>
+                    </div>
+
+                    <div class="row g-2 mb-3">
+                        <div class="col-md-6">
+                            <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['ml_home_daily_cap_kwh'] ?? '') ?>">Haus-Tagesreferenz für ML (kWh)</label>
+                            <input type="number" name="values[ml_home_daily_cap_kwh]" class="form-control config-input" min="1" step="1" value="<?= htmlspecialchars($config['ml_home_daily_cap_kwh']['value'] ?? $defaults['ml_home_daily_cap_kwh']) ?>">
+                        </div>
+                        <div class="col-md-6">
+                            <label class="config-label" data-tooltip="<?= htmlspecialchars($tooltipMap['ml_training_legacy_source'] ?? '') ?>">Bisheriges ML-Training verwenden</label>
+                            <select name="values[ml_training_legacy_source]" class="form-select config-input">
+                                <option value="0" <?= ($config['ml_training_legacy_source']['value'] ?? $defaults['ml_training_legacy_source']) === '0' ? 'selected' : '' ?>>Aus</option>
+                                <option value="1" <?= ($config['ml_training_legacy_source']['value'] ?? $defaults['ml_training_legacy_source']) === '1' ? 'selected' : '' ?>>Ein</option>
+                            </select>
                         </div>
                     </div>
 
@@ -13830,6 +14252,7 @@ foreach (e3dc_config_auto_install_known_modules() as $module => $info) {
         'config_keys' => $info['config_keys'] ?? [],
         'when' => $info['when'] ?? [],
         'system_update_only' => !empty($info['system_update_only']),
+        'live_config' => !empty($info['live_config']),
     ];
     foreach ((array)($info['config_keys'] ?? []) as $key) {
         $configAutoInstallKeys[] = (string)$key;
@@ -14137,6 +14560,7 @@ function configAutoInstallModuleChanged(form, meta) {
     return keys.some((key) => {
         const baseline = configAutoInstallComparableValue(CONFIG_AUTO_INSTALL_BASELINE[key] ?? '');
         const current = configAutoInstallComparableValue(configAutoInstallFieldValue(form, key));
+        if (key === 'wp_type' && ['-1', '7'].includes(baseline) && ['-1', '7'].includes(current)) return false;
         return baseline !== current;
     });
 }
@@ -14146,7 +14570,7 @@ function configAutoInstallReason(meta, changed) {
     if (!meta.installed) reasons.push('nicht installiert');
     if (meta.installed && !meta.enabled) reasons.push('deaktiviert');
     if (meta.installed && !meta.active) reasons.push('gestoppt');
-    if (meta.installed && meta.enabled && meta.active && changed) reasons.push('Konfiguration geändert');
+    if (meta.installed && meta.enabled && meta.active && changed && !meta.live_config) reasons.push('Konfiguration geändert');
     return reasons.join(', ');
 }
 
@@ -14156,6 +14580,7 @@ function collectConfigAutoInstallModules(form) {
     Object.entries(CONFIG_AUTO_INSTALL_MODULES || {}).forEach(([module, meta]) => {
         const changed = configAutoInstallModuleChanged(form, meta);
         if (!changed) return;
+        if (meta.live_config && meta.installed && meta.enabled && meta.active) return;
         if (!configAutoInstallRuleMatches(form, meta.when || {})) return;
         selected.push({
             module,
@@ -15169,6 +15594,7 @@ const MARKET_PATH_PREVIEW_KEYS = [
     'market_min_margin_pct', 'market_safety_correction_ct_per_kwh',
     'market_autarky_first_enable', 'market_autarky_low_soc_pct', 'market_autarky_horizon_buffer_wh',
     'market_roundtrip_efficiency_pct', 'market_degradation_ct_per_kwh',
+    'market_grid_charge_min_job_wh', 'market_grid_charge_min_job_pct',
     'direct_marketing_roundtrip_efficiency_pct', 'direct_marketing_degradation_ct_per_kwh',
     'stromtarif_typ', 'strompreis_basis', 'strompreis_cheap', 'strompreis_uht', 'strompreis_spezial'
 ];

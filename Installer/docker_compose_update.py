@@ -885,7 +885,9 @@ def _compose_secret_key(key: str) -> bool:
     # is_secret_config_key, ohne eine weitere lokale Installer-Datei vorauszusetzen.
     key = str(key).strip().lower()
     return (key in {"rscp_pw", "rscp_password", "telegram_chat_id", "web_pin",
-                    "bluelink_user", "bluelink_pin", "pass"}
+                    "bluelink_user", "bluelink_pin", "pass",
+                    "wb1_openwb_username", "wb2_openwb_username",
+                    "wb1_openwb_tls_binding", "wb2_openwb_tls_binding"}
             or key.endswith(("_pass", "_key", "_pin"))
             or any(part in key for part in ("password", "passwd", "passwort", "token",
                                            "secret", "api_key", "apikey", "aes", "private")))

@@ -22,11 +22,17 @@ from typing import Any, Callable, Iterable
 from urllib.parse import quote
 
 try:
+    from .pv_forecast_method import (FORECAST_METHOD_REVISION, EQUIVALENCE_PROOF_REVISION,
+        evaluation_method_revisions, validated_merge)
+    from . import pv_entity_archive
     from .pv_forecast_diagnostic_details import (
         archive_details, calculate_details, initialize_tables, sanitize_details,
         store_external, tables_ready,
     )
 except ImportError:  # Direkter Modulstart ohne Paketkontext.
+    from pv_forecast_method import (FORECAST_METHOD_REVISION, EQUIVALENCE_PROOF_REVISION,
+        evaluation_method_revisions, validated_merge)
+    import pv_entity_archive
     from pv_forecast_diagnostic_details import (
         archive_details, calculate_details, initialize_tables, sanitize_details,
         store_external, tables_ready,
@@ -170,16 +176,7 @@ def _valid_revision(value: Any) -> str | None:
     return "sha256:" + digest.lower()
 
 
-def _read_local_forecast_method_revision() -> str | None:
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pv_forecast_service.py")
-    try:
-        with open(path, "rb") as handle:
-            return "sha256:" + hashlib.sha256(handle.read()).hexdigest()
-    except OSError:
-        return None
-
-
-LOCAL_FORECAST_METHOD_REVISION = _read_local_forecast_method_revision()
+LOCAL_FORECAST_METHOD_REVISION = FORECAST_METHOD_REVISION
 
 
 def _local_forecast_method_revision() -> str | None:
@@ -386,6 +383,7 @@ def validate_forecast_issue_contract(
             raise EvidenceLimitError("forecast_issue_id_mixed")
         clean_slot = dict(slot)
         clean_slot.pop("forecast_issue_contract", None)
+        clean_slot.pop("pv_diagnostic_entities", None)
         clean_slot.pop("forecast_issue_id", None)
         if (
             clean_slot.get("forecast_value_stage") != FORECAST_VALUE_STAGE
@@ -1000,7 +998,7 @@ def archive_forecast_snapshot(
                 SELECT contract.producer_issued_at_utc_s
                 FROM forecast_issue_contracts AS contract
                 WHERE contract.topology_revision = ?
-                  AND contract.method_revision IS ?
+                  AND contract.method_revision IN (SELECT value FROM json_each(?))
                   AND contract.method_revision_status = ?
                   AND contract.producer_issued_at_utc_s IS NOT NULL
                 ORDER BY contract.producer_issued_at_utc_s DESC, contract.issue_id DESC
@@ -1008,7 +1006,7 @@ def archive_forecast_snapshot(
                 """,
                 (
                     revision,
-                    validated_contract.get("method_revision"),
+                    json.dumps(evaluation_method_revisions(validated_contract.get("method_revision"))),
                     validated_contract.get("method_revision_status"),
                 ),
             ).fetchone()
@@ -1375,6 +1373,12 @@ def enforce_retention(
             (cutoff,),
         )
         deleted["summaries"] = max(0, int(cursor.rowcount))
+    with database(database_path, write=True) as connection:
+        try:
+            from . import pv_entity_archive
+        except ImportError:
+            import pv_entity_archive
+        pv_entity_archive.retention(connection, now_s - pv_entity_archive.RETENTION_DAYS * 86400)
     return deleted
 
 
@@ -1601,7 +1605,7 @@ def _evidence_continuity(
     current_compared_slots: int,
     current_yield_relevant_days: int,
 ) -> dict[str, Any]:
-    """Hält frühere Kohorten sichtbar, ohne deren Kennzahlen zu vermischen."""
+    """Verbindet belegte Methoden und hält einen getrennten früheren Bericht."""
 
     current_topology = _valid_revision(topology_revision)
     current_method = _valid_revision(method_revision)
@@ -1624,14 +1628,34 @@ def _evidence_continuity(
             int(current_yield_relevant_days or 0),
         ),
     }
+    family = evaluation_method_revisions(current_method)
+    connected = [row[0] for row in connection.execute(
+        """SELECT DISTINCT method_revision FROM forecast_issue_contracts
+           WHERE topology_revision=? AND method_revision_status='complete'
+           AND method_revision IN (SELECT value FROM json_each(?))
+           AND method_revision != ? ORDER BY method_revision""",
+        (current_topology, json.dumps(family), current_method))]
+    result.update(
+        merged_into_current_metrics=bool(connected),
+        merged_method_revisions=connected,
+        merged_topology_revision=current_topology if connected else None,
+        method_family_revision=FORECAST_METHOD_REVISION if connected else None,
+        equivalence_proof_revision=EQUIVALENCE_PROOF_REVISION if connected else None,
+        current_method_since_utc_s=connection.execute(
+            """SELECT MIN(producer_issued_at_utc_s) FROM forecast_issue_contracts
+               WHERE topology_revision=? AND method_revision=?
+               AND producer_issue_time_status='complete' AND method_revision_status='complete'""",
+            (current_topology, current_method)).fetchone()[0],
+        previous_report=None,
+    )
+    historical = None
     rows = connection.execute(
         """
         SELECT topology_revision, calculated_at_utc_s, payload_json
         FROM diagnostic_summaries
         ORDER BY calculated_at_utc_s DESC, summary_id DESC
-        LIMIT 256
         """
-    ).fetchall()
+    )
     for row in rows:
         try:
             payload = json.loads(str(row["payload_json"]))
@@ -1654,7 +1678,7 @@ def _evidence_continuity(
         if (
             schema == SUMMARY_SCHEMA
             and previous_topology == current_topology
-            and previous_method == current_method
+            and previous_method in family
         ):
             continue
         previous_compared = _nonnegative_int(payload.get("compared_slots"))
@@ -1671,7 +1695,7 @@ def _evidence_continuity(
             reason = "method_revision_changed"
         else:
             continue
-        return {
+        candidate = {
             **result,
             "status": "cohort_transition",
             "reason": reason,
@@ -1682,7 +1706,62 @@ def _evidence_continuity(
             "previous_compared_slots": previous_compared,
             "previous_yield_relevant_days": previous_days,
         }
-    return result
+        report = _previous_report(payload, current_topology)
+        if report is not None:
+            candidate["previous_report"] = report
+            return candidate
+        if historical is None:
+            historical = candidate
+    return historical or result
+
+
+def _previous_report(value, topology_revision):
+    """Nur begrenzte öffentliche Kennzahlen einer gültigen früheren Kohorte."""
+    if not isinstance(value, dict) or value.get("available") is not True:
+        return None
+    if value.get("topology_revision") != topology_revision or _valid_revision(topology_revision) is None:
+        return None
+    schema = value.get("summary_schema", value.get("schema_version"))
+    if schema not in LEGACY_SUMMARY_SCHEMAS | {SUMMARY_SCHEMA}:
+        return None
+    method = value.get("method_revision")
+    if "forecast_issue_contract" in value:
+        contract = _public_issue_contract(value["forecast_issue_contract"], topology_revision)
+        method = contract.get("method_revision")
+        if schema == SUMMARY_SCHEMA and (contract.get("topology_revision") != topology_revision
+                or any(contract.get(k) != "complete" for k in ("producer_issue_time_status",
+                    "method_revision_status", "postprocessing_revision_status", "topology_revision_status",
+                    "source_composition_status", "target_slots_status"))):
+            return None
+    if schema == SUMMARY_SCHEMA and _valid_revision(method) is None:
+        return None
+    counts = {key: _nonnegative_int(value.get(key)) for key in
+        ("eligible_forecast_slots", "compared_slots", "yield_relevant_slots", "yield_relevant_days")}
+    if any(v is None for v in counts.values()) or counts["compared_slots"] <= 0:
+        return None
+    if not (counts["yield_relevant_days"] <= counts["yield_relevant_slots"] <= counts["compared_slots"] <= counts["eligible_forecast_slots"]):
+        return None
+    calculated = _nonnegative_int(value.get("calculated_at_utc_s"))
+    end = _nonnegative_int(value.get("evaluation_end_utc_s", (calculated or 0) - 3600))
+    start = _nonnegative_int(value.get("evaluation_start_utc_s", (calculated or 0) - EVALUATION_WINDOW_S))
+    if not calculated or calculated > time.time() + 300 or start is None or end is None or not start < end <= calculated:
+        return None
+    raw_metrics = value.get("metrics")
+    if not isinstance(raw_metrics, dict):
+        return None
+    metrics = {k: _finite_optional(raw_metrics.get(k)) for k in DIAGNOSTIC_LABELS}
+    required = ("trefferabweichung_wh", "richtungsversatz_wh", "vergleichsabdeckung_pct")
+    if schema == SUMMARY_SCHEMA:
+        required += ("quadratische_fehlerwurzel_wh",)
+    if any(metrics[k] is None for k in required):
+        return None
+    if any(metrics[k] is not None and metrics[k] < 0 for k in DIAGNOSTIC_LABELS if k not in ("richtungsversatz_wh", "persistenz_skill_score_pct")) or metrics["vergleichsabdeckung_pct"] > 100:
+        return None
+    return {"schema_version": "pv_forecast_previous_report_v1", "available": True,
+        "summary_schema": schema, "topology_revision": topology_revision,
+        "method_revision": _valid_revision(method), "calculated_at_utc_s": calculated,
+        "evaluation_start_utc_s": start, "evaluation_end_utc_s": end,
+        **counts, "metrics": metrics, "decision_use_allowed": False}
 
 
 def _sanitized_evidence_continuity(
@@ -1694,6 +1773,7 @@ def _sanitized_evidence_continuity(
     current_yield_relevant_days: int,
 ) -> dict[str, Any]:
     raw = value if isinstance(value, dict) else {}
+    merged = validated_merge(raw, topology_revision, method_revision)
     allowed_reasons = {
         "no_prior_cohort",
         "producer_contract_upgrade",
@@ -1728,6 +1808,13 @@ def _sanitized_evidence_continuity(
         previous_schema = ""
         previous_compared = 0
         previous_days = 0
+    previous_report = _previous_report(raw.get("previous_report"), topology_revision) if retained else None
+    if previous_report is not None and (
+            previous_report["method_revision"] != _valid_revision(raw.get("previous_method_revision"))
+            or previous_report["summary_schema"] != previous_schema
+            or previous_report["compared_slots"] != previous_compared
+            or previous_report["yield_relevant_days"] != previous_days):
+        previous_report = None
     return {
         "schema_version": CONTINUITY_SCHEMA,
         "status": (
@@ -1739,7 +1826,13 @@ def _sanitized_evidence_continuity(
         ),
         "reason": reason,
         "retained": retained,
-        "merged_into_current_metrics": False,
+        "merged_into_current_metrics": merged,
+        "merged_method_revisions": raw["merged_method_revisions"] if merged else [],
+        "merged_topology_revision": topology_revision if merged else None,
+        "method_family_revision": FORECAST_METHOD_REVISION if merged else None,
+        "equivalence_proof_revision": EQUIVALENCE_PROOF_REVISION if merged else None,
+        "current_method_since_utc_s": _nonnegative_int(raw.get("current_method_since_utc_s")),
+        "previous_report": previous_report,
         "previous_summary_schema": previous_schema or None,
         "previous_topology_revision": (
             _valid_revision(raw.get("previous_topology_revision"))
@@ -1925,7 +2018,7 @@ def calculate_diagnostic_summary(
             WHERE issue.topology_revision = :revision
               AND contract.producer_issue_time_status = 'complete'
               AND contract.method_revision_status = 'complete'
-              AND contract.method_revision = :method_revision
+              AND contract.method_revision IN (SELECT value FROM json_each(:method_revisions))
               AND contract.postprocessing_revision_status = 'complete'
               AND contract.topology_revision_status = 'complete'
               AND contract.source_composition_status = 'complete'
@@ -2035,7 +2128,7 @@ def calculate_diagnostic_summary(
         """,
         {
             "revision": revision,
-            "method_revision": current_method_revision,
+            "method_revisions": json.dumps(evaluation_method_revisions(current_method_revision)),
             "forecast_source": FORECAST_SOURCE_CONTRACT,
             "forecast_signal": FORECAST_SIGNAL_CONTRACT,
             "value_stage": FORECAST_VALUE_STAGE,
@@ -2069,7 +2162,7 @@ def calculate_diagnostic_summary(
             WHERE issue.topology_revision = :revision
               AND contract.producer_issue_time_status = 'complete'
               AND contract.method_revision_status = 'complete'
-              AND contract.method_revision = :method_revision
+              AND contract.method_revision IN (SELECT value FROM json_each(:method_revisions))
               AND contract.postprocessing_revision_status = 'complete'
               AND contract.topology_revision_status = 'complete'
               AND contract.source_composition_status = 'complete'
@@ -2262,7 +2355,7 @@ def calculate_diagnostic_summary(
         """,
         {
             "revision": revision,
-            "method_revision": current_method_revision,
+            "method_revisions": json.dumps(evaluation_method_revisions(current_method_revision)),
             "forecast_source": FORECAST_SOURCE_CONTRACT,
             "forecast_signal": FORECAST_SIGNAL_CONTRACT,
             "value_stage": FORECAST_VALUE_STAGE,
@@ -2493,6 +2586,10 @@ def append_summary_if_due(
             if (
                 isinstance(latest_payload, dict)
                 and latest_payload.get("schema_version") == SUMMARY_SCHEMA
+                # Alte Tagesberichte müssen die neue Auswertungszuordnung einmal neu berechnen,
+                # auch wenn innerhalb des Archivierungsabstands kein neues Issue gespeichert wird.
+                and "merged_method_revisions" in (latest_payload.get("evidence_continuity") or {})
+                and "previous_report" in (latest_payload.get("evidence_continuity") or {})
                 and (latest_payload.get("observation_quality") or {}).get("observation_source_contract") == HISTORY_SOURCE_CONTRACT
                 and isinstance(latest_payload.get("diagnostic_details"), dict)
                 and isinstance(latest_payload.get("forecast_issue_contract"), dict)
@@ -2630,7 +2727,7 @@ def current_quality_progress(summary, config, *, now_utc_s, database_path=EVIDEN
             deadline = time.monotonic() + QUALITY_PROGRESS_BUDGET_S
             connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
             contract = _latest_issue_contract(connection, topology)
-            if contract.get("method_revision") != method:
+            if contract.get("method_revision") not in evaluation_method_revisions(method):
                 progress["reason"] = "quality_progress_method_changed"
                 return progress
             latest = connection.execute("""SELECT slot_start_utc_s, payload_json
@@ -2973,6 +3070,8 @@ def _sanitized_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "observation_quality": _observation_quality_contract(sanitize_details(payload.get("diagnostic_details"))),
         "source_diagnostics": _source_diagnostics(compared_slots, sanitize_details(payload.get("diagnostic_details"))),
         "diagnostic_details": sanitize_details(payload.get("diagnostic_details")),
+        "entity_archive": pv_entity_archive.sanitize_public(payload.get("entity_archive")),
+        "entity_archive_reason": payload.get("entity_archive_reason") if payload.get("entity_archive_reason") in ("diagnostic_error", "entity_source_missing", "binding_changed") else None,
         "quality_progress": sanitize_quality_progress(payload.get("quality_progress"), topology_revision,
             issue_contract.get("method_revision")),
         "history_time_plausibility": sanitize_history_time_plausibility(payload.get("history_time_plausibility")),

@@ -13,6 +13,10 @@ from __future__ import annotations
 import json
 import logging
 import math
+try:
+    from Storage.regulation_switch import central_pv_split_scope
+except ImportError:
+    from .Storage.regulation_switch import central_pv_split_scope
 import os
 import time
 try:
@@ -3508,7 +3512,9 @@ class ParallelStorageRegulator:
                 ) % (headroom_discharge_gap_pct, headroom_discharge_w),
                 "headroom",
             )
-        elif (wb_auto_enter or wb_auto_keep) and wb_real_owner_active:
+        elif (wb_auto_enter or wb_auto_keep) and wb_real_owner_active and not central_pv_split_scope(
+            self.cfg, wb_intent, intent_wb_mode, soc, now_s
+        ):
             self.price_house_discharge_w = 0
             if i_fc_w > 0 and not shortfall_pv_catchup_active:
                 wb_charge_cap_w = int(min(self.max_charge_w, max(self.curve_charge_enter_w, i_fc_w)))
@@ -3654,25 +3660,6 @@ class ParallelStorageRegulator:
                 curve_hold_reason,
                 "curve",
             )
-        elif (wb_auto_enter or wb_auto_keep) and wb_real_owner_active:
-            self.price_house_discharge_w = 0
-            if i_fc_w > 0 and not shortfall_pv_catchup_active:
-                wb_charge_cap_w = int(min(self.max_charge_w, max(self.curve_charge_enter_w, i_fc_w)))
-                decision = choose(
-                    "parallel_wb_auto",
-                    MODE_AUTO,
-                    wb_charge_cap_w,
-                    f"Wallbox aktiv: E3DC-AUTO mit iFc-Führung {wb_charge_cap_w}W begrenzt, Entladestützung frei",
-                    "wallbox",
-                )
-            else:
-                decision = choose(
-                    "parallel_wb_auto",
-                    MODE_AUTO,
-                    self.max_charge_w,
-                    "Wallbox aktiv: E3DC-AUTO frei",
-                    "wallbox",
-                )
         elif curve_guard_active and i_fc_w >= self.max_charge_w - 50:
             self.price_house_discharge_w = 0
             if curve_soft_charge_active and curve_soft_charge_limit_w < self.max_charge_w - 50:
@@ -4130,7 +4117,8 @@ class ParallelStorageRegulator:
 
         decision = self._apply_transition_table(
             decision,
-            previous_state=previous_parallel_state,
+            previous_state=("" if central_pv_split_scope(self.cfg, wb_intent, intent_wb_mode, soc, now_s)
+                            and previous_parallel_state == "parallel_wb_auto" else previous_parallel_state),
             previous_mode=previous_parallel_mode,
             previous_val=previous_parallel_val,
             previous_age_s=previous_parallel_age_s,

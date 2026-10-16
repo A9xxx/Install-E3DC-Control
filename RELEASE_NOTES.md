@@ -1,3 +1,59 @@
+# E3DC-Control v5.5.5
+
+E3DC-Control 5.5.5 verbessert das Zusammenspiel von Speicher, Wallbox und Wärmepumpe und lernt die Lastprognose aus dem tatsächlichen Verlauf. Die eingestellte Verbraucherpriorität gilt auch beim Start. Fehlende oder langsam gemeldete Wallboxdaten bremsen den Speicher nicht mehr allein wegen der Datenlücke. Automatische Wärmepumpen-Zusatzfreigaben beachten „Min SoC“. Neu sind die Anzeige einer MQTT-Wärmepumpe, zwei getrennte Klima-Messpunkte und die openWB-Anmeldung über verschlüsselte Verbindungen. Die zentrale PV-Aufteilung und die Notstrom-Vorhaltung sind experimentell und standardmäßig aus.
+
+## Änderungen
+
+- **Speicher und Wallbox:**
+  - Die optionale zentrale PV-Aufteilung berücksichtigt zuerst den Speicher-Kurvenbedarf. Einstellung: „Speicher & Konfiguration“ → „Experimentelle Speicherregelung“ → „Zentrale PV-Aufteilung Akku/Wallbox (experimentell)“, standardmäßig „Aus (Standard)“.
+  - Fällt eine Wallboxmessung aus, regelt der Speicher ohne diesen Ladepunkt weiter; Dashboard und Wallbox-Kachel warnen. Bei externen Wallboxen bleiben solche Zeiten als „Haus inkl. Wallbox (unbekannt)“ in der Bilanz und gehen nicht in das Lernen der Hausverbrauchsprognose ein.
+- **Wallbox-Statusproben bis 30 Sekunden frisch:** Speicherregelung und Live-Anzeige akzeptieren gültige Wallbox-Statusproben bis zu einem Alter von 30 Sekunden.
+  - Langsam antwortende openWB-Boxen lösen dadurch kein Umschalten der Entladesperre und keine falsche Meldung „Wallbox ohne Daten“ mehr allein wegen des Probenalters aus.
+  - Die Frischegrenze für E3DC-Livedaten bleibt bei 15 Sekunden; ausdrücklich ungültige Messungen werden nicht gültig.
+- **Wiederanlauf und kurze Messwertlücken:** Auch nach einem ausgeführten Direktstopp einer laufenden Ladung gilt der bestehende Wiederanlauf-Abstand. Kurz unplausible Messwerte können unter engen Bedingungen ein bestätigtes Angebot ohne neuen Schreibbefehl halten, höchstens zehn Sekunden innerhalb von 60 Sekunden. Schutzstopps bleiben unmittelbar wirksam.
+- **Notstrom-Vorhaltung:**
+  - Im selben Einstellungsbereich bietet „Notstrom-Vorhaltung“ die Auswahl „Aus (Standard)“, „Beobachten (keine Speicherbefehle)“ und „Halten“. Den Bedarf legen „Notstrom-Vorhalt am Abend (kWh Speicherinhalt)“, „Bezugszeit (Ortszeit)“ und „Versorgung mindestens bis (bestätigte Ortszeit)“ fest.
+  - „Reserve-Netzladen (bei Halten)“ ist separat standardmäßig aus; dafür gilt „Höchster Bezugspreis (ct/kWh)“.
+  - Die Funktion ist experimentell. Halten erhöht unter Umständen den Netzbezug; Nachladen verursacht Bezugskosten. E3DC-Control prüft weder die Notstromfähigkeit noch die Verluste der Anlage.
+- **openWB und Fahrzeug:**
+  - Eigene Konten und eine Zertifikatsbestätigung je Wallbox stehen unter „Wallbox & Fahrzeug“ → „Wallbox 1 – openWB Benutzerverwaltung“ beziehungsweise „Wallbox 2 – openWB Benutzerverwaltung“ zur Verfügung. Mit Konto wird der Status bevorzugt über verschlüsseltes MQTT gelesen.
+  - Die Fahrzeuganzeige bevorzugt die laufende Stecksession. Cloud-Badges zeigen veraltete oder fehlgeschlagene Abfragen; Warnfarbe und Warnzeichen folgen dabei derselben Bedingung, auch bei zwischengespeicherten, veralteten Schätzwerten.
+  - Bluelink pausiert Anmeldeversuche nach einer Kontoabmeldung.
+- **Lastprognose:**
+  - E3DC-Control trainiert die Haus- und Wärmepumpenprognose aus bis zu 30 Tagen gesicherter Minutenhistorie aller Wochentage und ergänzt den laufenden Tag. Unvollständige Tage, größere Messlücken und Abschnitte mit unbekanntem Wallboxanteil werden ausgeschlossen.
+  - Gemessene Außentemperaturen fließen nur bei ausreichender Abdeckung ein. Fehlt für die Vorhersage die Wetterprognose, gilt das gemessene Trainingsmittel derselben Ortszeitstunde.
+  - Die Plausibilitätsprüfung greift vor der Korrektur anhand früherer Prognoseabweichungen. Ein fehlgeschlagenes Nachtraining wird frühestens nach sechs Stunden wiederholt.
+  - Unter „Standort & PV-Prognose“ stellt „Bisheriges ML-Training verwenden“ → „Ein“ das bisherige Verfahren wieder her; Standard ist „Aus“.
+- **Wärmepumpe:**
+  - Neue automatische PV-, Preis- und Tariffenster-Zusatzfreigaben beginnen erst ab „Min SoC (%)“ unter „PV-Überschuss-Boost“ → „Freigabe und Saison“. Bei aktivem Taktschutz behält ein laufender Verdichter seine belegte Mindestlaufzeit; vorübergehend sind dadurch Netzbezug oder Entladung unter Min SoC möglich. Schutzgrenzen bleiben vorrangig.
+  - Neu ist die Auswahl „MQTT-Wärmepumpe (nur Anzeige)“ unter „Wärmepumpen Typ“; sie wird nicht automatisch aktiviert und steuert kein Gerät. Liegt nur die elektrische Summe aus Wärmepumpe und Zusatzheizung vor, wird ausschließlich `in/heatpump/power_w` gesendet; daraus entsteht kein COP.
+  - Stiebel-ISG-Sollwerte werden nicht mehr als Isttemperaturen dargestellt; nicht belegte Messungen bleiben unbekannt.
+- **Preissteuerung:**
+  - Wirtschaftliches Netzladen berücksichtigt die tatsächlich benötigte Energiemenge und ausführbare spätere Ladefenster. Ohne eigene Bestandswerte beträgt die Mindestmenge 5 % der nutzbaren Speicherkapazität; die Werte stehen unter „Tarif & Strompreise“ → „Details zur Speicher-Netzladung“.
+  - Spezialtarif und Octopus Heat erhalten ihre lokale Preisachse auch ohne Börsendaten. Ein verbindliches externes Luox-Steuerungsrecht sperrt automatisches Markt- und Reserve-Netzladen.
+- **Klima, MQTT und Diagnose:**
+  - Ein zweiter Klima-Messpunkt ergänzt Einzelwerte und Langzeitaufteilungen; Einrichtung über „Name Anlage 2“, „Zweiter Shelly-Zähler IP“, „Zählertyp Anlage 2“ und „Phase / Kanal“ im Klima-Bereich.
+  - Unter „Schnittstellen & MQTT“ stehen „Werte zyklisch wiederholen (s)“ (Standard 0 = aus), „WP-Leistungs-Topic (optional)“ und „MQTT-Fahrzeug-Freigabeliste (optional)“.
+  - Die standardmäßig ausgeschaltete „PV-Prognosediagnose“ unter „Standort & PV-Prognose“ ergänzt Quellen- und Messlücken je Fläche und Tracker, ohne die Regelung zu ändern.
+- **Update und Betrieb:** Eine passende Web-Dienststeuerung wird nicht mehr allein durch einen alten Git-Stand blockiert. PiGuard-Bindung und Rechte zusätzlicher Webdateien werden beim Update berücksichtigt. Meldungen der Installationszentrale bleiben auch bei ungültigen Zeichen lesbar.
+
+## Updatehinweise
+
+- **Bare Metal:** Wie gewohnt über „System Update“ aktualisieren und anschließend die Seite neu laden. Meldet die Dienststeuerung eine tatsächliche Abweichung, nennt sie „System reparieren (Backup + Stable-Abgleich)“ als nächsten Schritt.
+- **Docker:** Mit eingerichtetem Watchtower über „System Update“, sonst im bestehenden Compose-Ordner auf dem Host mit `sudo docker compose pull` und `sudo docker compose up -d` aktualisieren. Ein fester Pin wird bewusst auf `E3DC_IMAGE_TAG=v5.5.5` geändert.
+- **Neue Optionen:** Zentrale PV-Aufteilung, Notstrom-Vorhaltung und Reserve-Netzladen werden nicht automatisch eingeschaltet. Eigene gespeicherte Mindestmengen für Netzladung bleiben erhalten.
+- **MQTT-Fahrzeugliste:** Eine leere Liste lässt den bisherigen generischen Eingang offen.
+  - Nach Aktivierung gelten ausgeschlossene oder noch nicht eindeutig zugeordnete alte Werte nicht als bestätigter Fahrzeug-SoC. Bei aktiver Zielplanung rechnet E3DC-Control dann mit 0 %; bestehende Netzladefenster bleiben möglich.
+  - Vor Aktivierung die exakten Fahrzeugnamen prüfen.
+- **Messwerte und Statistik:** Bei Stiebel können zuvor ersatzweise angezeigte Werte entfallen. Alte Klima-Zeiträume werden nicht nachträglich auf einzelne Anlagen verteilt. Bei fehlenden externen Wallboxdaten bleibt deren Verbrauch im Hauswert enthalten; für bekannte planbare Lasten steht „Tarif & Strompreise“ → „Geplante Lastfenster“ zur Verfügung.
+- **WebSocket-Dienst:** Der bisherige E3DC-WebSocket-Dienst wird mit Version 5.5.6 entfernt. Für externe Smart-Home-Anbindungen steht der MQTT-Hub mit den dokumentierten Topics zur Verfügung; das Webportal nutzt weiterhin HTTP-Abfragen. Die Luxtronik-Anbindung bleibt unverändert.
+
+## Rückfall
+
+Die freigegebenen Rückfallziele bleiben unverändert. Vor einem Rückfall die [Rückfall-Dokumentation](doc/Rollback.md) lesen, Abschnitt „Rückfall von 5.5.5 auf 5.5.4“. Ein Rückfall auf 5.5.4 entfernt die in 5.5.5 neuen Einstellungen aus der aktiven Konfiguration; die vorher angelegte Sicherung enthält sie weiterhin. Ist an der openWB die Benutzerverwaltung oder HTTPS-Zwang aktiv, fällt die openWB-Anbindung unter 5.5.4 aus.
+
+---
+
 # E3DC-Control v5.5.4
 
 5.5.4 bringt die Installationszentrale auf Bare Metal wieder in Betrieb: Module werden per Klick installiert und entfernt, die Dienste laufen mit dem Python-venv der Installation, und Karten, Dialoge und Konsolenmenüs sind gegen den tatsächlichen Stand geprüft. Die Speicherführung bei beobachteten Wallboxen und das Abendziel in `PV + Akku bis Untergrenze` sind neu geordnet, der Startknopf ändert den Lademodus nicht mehr, ein an der openWB gesetzter Stop gilt, und die openWB-Pro-Bereitschaft nach Ladeende hält nur noch mit Budget. Der PV-Boost der Wärmepumpe wird gehalten statt getaktet, das globale „Automatik darf steuern“ wirkt auch auf den Heizstab, die Lade- und Entladegrenzen folgen den Gerätegrenzen, unterhalb der Korridor-Untergrenze lädt der Speicher frei, und der Hausverbrauch der Tagesstatistik kommt aus der Energiebilanz. Neu und experimentell (Standard aus) ist eine Kostenhistorie je Viertelstunde. Dazu kommen Korrekturen für 32-Bit-Systeme, die Web-PIN-Sperrseite und eine „Jetzt“-Anzeige aus einer Quelle. Das Update benötigt keine zwingende Konfigurationsänderung.

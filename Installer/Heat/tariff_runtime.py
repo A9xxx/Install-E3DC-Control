@@ -158,6 +158,16 @@ class TariffShiftRuntime:
             evidence['ww']['target_c'] = number(ctx.get('CONF_WWS'))
         from .policy import decide_tariff_shift
         decision = decide_tariff_shift(cfg, evidence, state, now=now)
+        # Das zentrale SoC-Tor liefert die Schwellen und die Hysterese.
+        # Die Befehlsfreigabe endet sofort, die Rücknahme behält ihre Haltfristen.
+        soc_blocks = set(ctx.get('heatpump_positive_output_block_reasons') or [])
+        if soc_blocks & {'soc_minimum_hold', 'soc_below_stop_threshold'}:
+            decision['commands_allowed'] = False
+            decision['blockers'].append('tariff_soc_stop_blocked')
+        elif (not any(name == decision.get('target') for name, _ in owned)
+              and (ctx.get('heatpump_soc_state') or {}).get('start_allowed') is not True):
+            decision['commands_allowed'] = False
+            decision['blockers'].append('tariff_soc_start_blocked')
         if decision.get('commands_allowed') and (not fresh_grant or grant.get('intent_revision') != decision['intent_revision']):
             decision['commands_allowed'] = False
             decision['blockers'].append('storage_grant_pending')

@@ -4,6 +4,10 @@
 import os
 import json
 import math
+import hashlib
+import hmac
+import secrets
+import stat
 import logging
 import re
 import time
@@ -381,6 +385,11 @@ def _refresh_error_code(error):
     typed_code = getattr(error, "refresh_error_code", None)
     if typed_code == "vehicle_data_missing":
         return typed_code
+    # Die Bibliothek kennt für diese Serverantwort keinen eigenen Fehlertyp.
+    # Vor AuthenticationError prüfen, sonst verdeckt dessen Oberklasse den Grund.
+    text = str(error or "").strip().lower()
+    if "unusual activity" in text or "logged out" in text:
+        return "account_logged_out"
     library_code = _typed_refresh_error_code(error)
     if library_code is not None:
         return library_code
@@ -399,6 +408,10 @@ def _refresh_error_code(error):
 
 
 BLUELINK_ERROR_HINTS = {
+    "account_logged_out": (
+        "Hyundai/Kia hat die Sitzung wegen ungewöhnlicher Aktivität abgemeldet. "
+        "Einmal in der Hersteller-App anmelden."
+    ),
     "otp_required": (
         "Das Hyundai/Kia-Konto verlangt einen Einmalcode (Zwei-Faktor-Anmeldung/OTP); das wird nicht unterstützt. "
         "Bitte die Zwei-Faktor-Anmeldung für dieses Konto deaktivieren oder ein Konto ohne Zwei-Faktor-Anmeldung verwenden."
@@ -415,7 +428,11 @@ BLUELINK_ERROR_HINTS = {
 }
 
 
-def _refresh_error_message(code):
+def _refresh_error_message(code, retry_at=None):
+    if code == "account_logged_out":
+        local_time = datetime.fromtimestamp(retry_at, ZoneInfo("Europe/Berlin")).strftime("%H:%M") if retry_at else "--:--"
+        return (BLUELINK_ERROR_HINTS[code] + " E3DC-Control versucht es automatisch ab "
+                + local_time + " erneut oder sofort über ‚Fahrzeug aufwecken‘.")
     return {
         "timeout": "Hyundai/Kia-Cloud antwortet nicht rechtzeitig.",
         "rate_limited": "Hyundai/Kia-Cloud begrenzt weitere Abfragen.",
@@ -458,10 +475,11 @@ def _describe_bluelink_error(error, secrets=()):
     text = str(error or "").strip()
     if not text and response is not None:
         text = str(getattr(response, "text", "") or "")
+    for secret in sorted(secrets, key=len, reverse=True):
+        if secret:
+            text = re.sub(re.escape(secret), lambda match: "***", text, flags=re.IGNORECASE)
+    # Erst schwärzen, dann kürzen: auch ein Geheimnis über der Kürzungsgrenze.
     text = " ".join(text.split())[:300]
-    for secret in secrets:
-        if secret and secret in text:
-            text = text.replace(secret, "***")
     if text:
         parts.append(text)
     return " | ".join(parts)
@@ -510,21 +528,21 @@ def _ensure_vehicle_manager(session, config):
         session["logged_in"] = False
         logger.info(
             "Bluelink-Anmeldung vorbereitet (Konto %s, Marke %s, PIN %s).",
-            _mask_account(user),
+            "gesetzt" if user else "leer",
             "Kia" if brand_code == BLUELINK_BRAND_CODES["kia"] else "Hyundai",
             "gesetzt" if pin else "leer",
         )
     return manager
 
 
-def _handle_refresh_failure(session, error):
+def _handle_refresh_failure(session, error, retry_at=None):
     """Anmeldefehler verwerfen den Token-Cache (nächster Zyklus meldet sich neu an) und loggen den Handlungshinweis."""
     code = _refresh_error_code(error)
-    if code in ("otp_required", "consent_required", "pin_missing", "authentication_failed"):
+    if code in ("account_logged_out", "otp_required", "consent_required", "pin_missing", "authentication_failed"):
         session["vm"] = None
         session["fingerprint"] = None
         session["logged_in"] = False
-        logger.error("Bluelink: %s", BLUELINK_ERROR_HINTS.get(code, _refresh_error_message(code)))
+        logger.error("Bluelink: %s", _refresh_error_message(code, retry_at) if code == "account_logged_out" else BLUELINK_ERROR_HINTS.get(code, _refresh_error_message(code)))
     return code
 
 
@@ -647,7 +665,7 @@ def _vehicle_store_lock():
 
 
 _SOC_RUNTIME_FIELDS = frozenset({
-    "soc", "source", "soc_source",
+    "soc", "source", "soc_source", "mqtt_vehicle_origin", "mqtt_vehicle_id",
     "soc_source_ts", "last_updated_at", "soc_rule_confirmed",
     "soc_rule_usable", "soc_stale", "soc_age_s", "soc_meta",
     "soc_source_previous", "soc_source_original", "soc_source_class",
@@ -864,13 +882,159 @@ def load_bluelink_config():
                     config['laenge'] = value
     return config
 
+BLUELINK_RETRY_SCHEMA = "bluelink_retry_v1"
+BLUELINK_BACKOFF_CODES = {"authentication_failed", "otp_required", "consent_required", "pin_missing", "rate_limited"}
+
+
+def plan_bluelink_refresh(state, *, now, interval_minutes, fingerprint, manual=False, outcome=None):
+    """Reine Abrufplanung; alle Zeitentscheidungen hängen an der übergebenen Uhr."""
+    previous = state if isinstance(state, dict) else {}
+    interval = max(5, int(interval_minutes)) * 60
+    changed = previous.get("credential_hmac") != fingerprint
+    result = dict(previous) if previous.get("schema") == BLUELINK_RETRY_SCHEMA else {}
+    if changed or not result:
+        result = {"schema": BLUELINK_RETRY_SCHEMA, "credential_hmac": fingerprint,
+                  "failures": 0, "next_attempt_ts": float(now), "pause_until": 0, "error_code": None}
+    if manual:
+        # Nur den Termin aufheben; die Fehlerstufe endet erst mit einem Erfolg.
+        result.update(next_attempt_ts=float(now), pause_until=0, error_code=None)
+    if outcome is not None:
+        result["error_code"] = None if str(outcome).startswith("success_") else outcome
+        result["pause_until"] = 0
+        delay = interval
+        if str(outcome).startswith("success_"):
+            result["failures"] = 0
+        elif outcome == "account_logged_out":
+            result["pause_until"] = float(now) + 6 * 3600
+            delay = max(interval, 6 * 3600)
+        elif outcome in BLUELINK_BACKOFF_CODES:
+            stage = min(6, max(0, int(result.get("failures", 0))) + 1)
+            result["failures"] = stage
+            delay = max(interval, (30, 60, 120, 240, 360, 360)[stage - 1] * 60)
+        result["next_attempt_ts"] = float(now) + delay
+    return result
+
+
+def _retry_paths():
+    directory = os.path.dirname(V4_CONFIG_FILE)
+    return os.path.join(directory, "bluelink_retry.json"), os.path.join(directory, ".bluelink_retry.key")
+
+
+def _retry_fingerprint(config):
+    """Persistenter HMAC mit lokalem Zufallsschlüssel; keine Wörterbuch-Hashes."""
+    _, key_path = _retry_paths()
+    os.makedirs(os.path.dirname(key_path), exist_ok=True)
+    try:
+        fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        pass
+    else:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(secrets.token_bytes(32))
+    fd = os.open(key_path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as handle:
+        key_stat = os.fstat(handle.fileno())
+        if not stat.S_ISREG(key_stat.st_mode):
+            raise OSError("Ungültiger Bluelink-Pausenschlüssel")
+        if stat.S_IMODE(key_stat.st_mode) != 0o600:
+            os.fchmod(handle.fileno(), 0o600)
+        key = handle.read(33)
+    if len(key) != 32:
+        raise OSError("Ungültiger Bluelink-Pausenschlüssel")
+    material = json.dumps([*_credentials_fingerprint(config),
+                           config.get("region", BLUELINK_REGION_EUROPE)], ensure_ascii=False).encode("utf-8")
+    return hmac.new(key, material, hashlib.sha256).hexdigest()
+
+
+def _load_retry_state():
+    try:
+        with open(_retry_paths()[0], encoding="utf-8") as handle:
+            state = json.load(handle)
+        return state if isinstance(state, dict) else {}
+    except FileNotFoundError:
+        return {}
+
+
+def _save_retry_state(state):
+    # Gleicher Dienst als einziger Writer; temporäre Datei von Anfang an 0600.
+    path, _ = _retry_paths()
+    temporary = path + ".tmp." + str(os.getpid())
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            json.dump(state, handle)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _manual_force_refresh_requested(now):
+    try:
+        with open(FORCE_FLAG_FILE, encoding="utf-8") as handle:
+            raw = handle.read(4096).strip()
+        # Nur force_soc aus dem Web schreibt einen echten, frischen Zeitstempel.
+        # Das automatische „1“ und alte leere Flags beenden keine Pause.
+        return raw.isdigit() and int(raw) > 1 and -300 <= now - int(raw) <= 300
+    except OSError:
+        return False
+
+
+def _discard_paused_force_request():
+    try:
+        with open(FORCE_FLAG_FILE, encoding="utf-8") as handle:
+            raw = handle.read(4096)
+        try:
+            request = json.loads(raw)
+        except ValueError:
+            request = None
+        if (isinstance(request, dict) and request.get("schema") == "vehicle_soc_refresh_request_v1"
+                and request.get("source") == "openwb_plug" and type(request.get("wb")) is int
+                and request["wb"] in (1, 2) and request.get("plug_session_id")):
+            path = os.path.join(os.path.dirname(FORCE_FLAG_FILE), "vehicle_soc_cloud_refresh.json")
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    state = json.load(handle)
+                sessions = state.get("sessions", {})
+                if sessions.get(str(request["wb"])) == request["plug_session_id"]:
+                    sessions.pop(str(request["wb"]), None)
+                    write_json_atomic(path, state)
+            except (OSError, ValueError, AttributeError):
+                pass
+        # Einen zwischenzeitlich neu eingegangenen manuellen Auftrag erhalten.
+        with open(FORCE_FLAG_FILE, encoding="utf-8") as handle:
+            if handle.read(4096) == raw:
+                os.unlink(FORCE_FLAG_FILE)
+    except FileNotFoundError:
+        pass
+
+
+def _publish_refresh_pause(state, now):
+    """Lebenszeichen ohne Anmeldung; SoC-Quellanker und Bestandsdaten erhalten."""
+    with _vehicle_store_lock():
+        data = _read_existing_vehicle_data()
+        refresh = dict(data.get("refresh") or {})
+        code = state.get("error_code")
+        message = _refresh_error_message(code, state.get("next_attempt_ts"))
+        refresh.update({"schema": BLUELINK_REFRESH_SCHEMA, "status": "paused",
+                        "mode": refresh.get("mode", "cached"), "success": False,
+                        "pause_reason": code, "pause_until": state.get("pause_until", 0),
+                        "next_attempt_ts": state["next_attempt_ts"], "error_code": code,
+                        "message": message, "last_error_active": bool(code)})
+        if isinstance(refresh.get("last_error"), dict) and code == "account_logged_out":
+            refresh["last_error"]["message"] = message
+        data.update({"ts": int(now), "source": "bluelink", "refresh": refresh, "error": message})
+        write_json_atomic(VEHICLES_JSON_FILE, data)
+
+
 def main():
     if VehicleManager is None:
         logger.error(f"Fehler beim Laden der Bluelink-API: {IMPORT_ERROR}")
         logger.error("Bitte prüfe die Installation manuell auf der Konsole.")
         return
         
-    last_update = 0
+    last_heartbeat = 0
     missing_credentials_logged = False
     legacy_token_logged = False
     # VehicleManager samt Token im Prozess halten; Re-Login nur nach Anmeldefehler oder Änderung der Zugangsdaten.
@@ -903,14 +1067,36 @@ def main():
             
         now = time.time()
         force_requested = os.path.exists(FORCE_FLAG_FILE)
+        try:
+            fingerprint = _retry_fingerprint(config)
+            stored = _load_retry_state()
+            retry = plan_bluelink_refresh(stored, now=now, interval_minutes=interval,
+                                          fingerprint=fingerprint,
+                                          manual=force_requested and _manual_force_refresh_requested(now))
+            if retry != stored:
+                _save_retry_state(retry)
+            login_paused = (retry.get("error_code") == "account_logged_out"
+                            or retry.get("error_code") in BLUELINK_BACKOFF_CODES)
+            if now < retry["next_attempt_ts"] and not (force_requested and not login_paused):
+                if force_requested:
+                    _discard_paused_force_request()
+                if login_paused and now - last_heartbeat >= min(interval * 60, 900):
+                    _publish_refresh_pause(retry, now)
+                    last_heartbeat = now
+                time.sleep(5)
+                continue
+        except (OSError, ValueError, TypeError):
+            # Ohne sichere Persistenz keine Anmeldung, die eine Pause umgehen könnte.
+            logger.error("Bluelink-Pausenzustand nicht lesbar oder schreibbar; Anmeldung ausgesetzt.")
+            time.sleep(60)
+            continue
 
-        if force_requested or (now - last_update) >= (interval * 60):
+        if force_requested or now >= retry["next_attempt_ts"]:
             attempt_ts = int(time.time())
             refresh_mode = "force" if force_requested else "cached"
             # Jeder Cloudversuch setzt den nächsten regulären Termin. Ein
             # fehlgeschlagener Cached-Abruf darf sonst alle fünf Sekunden neu
             # anlaufen und API-Limit sowie Fahrzeugbatterie belasten.
-            last_update = float(attempt_ts)
             try:
                 force_request = _read_force_refresh_request() if force_requested else None
                 requested_vehicle_id = None
@@ -921,7 +1107,6 @@ def main():
                 if not session.get("logged_in"):
                     session["logged_in"] = True
                     logger.info("Bluelink-Anmeldung erfolgreich (%d Fahrzeug(e) im Konto).", len(getattr(vm, "vehicles", None) or {}))
-                
                 if force_requested:
                     logger.info(
                         "Automatischer SoC-Abruf für das angesteckte Fahrzeug angefordert."
@@ -1087,34 +1272,38 @@ def main():
                         completed_ts,
                         preserve_missing_cloud=requested_vehicle_id is not None or not bool(vin),
                     )
+                    retry = plan_bluelink_refresh(retry, now=completed_ts, interval_minutes=interval,
+                                                  fingerprint=fingerprint, outcome=data["refresh"]["status"])
+                    _save_retry_state(retry)
                     logger.info(f"{len(data['vehicles'])} Fahrzeuge erfolgreich aktualisiert (Force={force_requested}).")
                     
                     # --- DEBUG: Alle rohen Fahrzeugdaten für den Nutzer speichern ---
             except Exception as e:
                 # Typ, HTTP-Status und Server-Antwort ohne Geheimnisse; Anmeldefehler verwerfen den Token-Cache.
                 logger.error("Bluelink-Abruf fehlgeschlagen: %s", _describe_bluelink_error(e, _bluelink_secrets(config)))
-                _handle_refresh_failure(session, e)
+                retry = plan_bluelink_refresh(retry, now=time.time(), interval_minutes=interval,
+                                              fingerprint=fingerprint, outcome=_refresh_error_code(e))
+                _save_retry_state(retry)
+                _handle_refresh_failure(session, e, retry["next_attempt_ts"])
                 
                 # Letzten bestätigten SoC erhalten, aber Versuch und Fehler
                 # getrennt davon publizieren. Der neue Datei-Zeitpunkt ist
                 # ausdrücklich kein neuer Fahrzeugstand.
                 completed_ts = int(time.time())
-                _commit_bluelink_result(
+                failed = _commit_bluelink_result(
                     [],
                     refresh_mode,
                     attempt_ts,
                     completed_ts,
                     error=e,
                 )
-                
+                if retry.get("error_code") == "account_logged_out":
+                    _publish_refresh_pause(retry, completed_ts)
+                last_heartbeat = completed_ts
+
                 if force_requested:
                     try: os.remove(FORCE_FLAG_FILE)
                     except: pass
-            finally:
-                # Das reguläre Intervall beginnt nach Abschluss des Abrufs.
-                # Auch ein ungewöhnlich langer Timeout löst daher nicht fünf
-                # Sekunden später bereits den nächsten Cloudversuch aus.
-                last_update = time.time()
 
         time.sleep(5)
 

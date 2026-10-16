@@ -44,7 +44,7 @@ def project_plan_forecast(plan):
         for component in ("pv", "house", "heat", "wallbox"):
             if "point" in mapping(f.get(component)):
                 row[component + "_point_w"] = f[component]["point"]
-        for key in ("home_source", "home_quality", "climate_source", "climate_quality"):
+        for key in ("home_source", "home_quality", "wp_source", "wp_quality", "climate_source", "climate_quality"):
             row[key] = projection.get(key)
         row.update(pv_forecast_fresh=evidence.get("pv_fresh") is True,
                    load_valid=evidence.get("load_valid") is True,

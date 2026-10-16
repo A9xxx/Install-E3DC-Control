@@ -637,7 +637,7 @@ def wallbox_detail_status_contract(
         }
 
     openwb_pro_state = str(st.get("openwb_pro_session_state") or "")
-    if openwb_pro_state in ("starting", "offered", "phase_wait", "stopping", "ended"):
+    if openwb_pro_state in ("starting", "offered", "phase_wait", "stopping", "ended", "start_retry"):
         return {
             "state": str(st.get("openwb_pro_session_label") or "openWB Pro"),
             "state_level": str(st.get("openwb_pro_session_level") or "info"),
@@ -5473,7 +5473,8 @@ def deficit_restart_budget_stable_gate(
         marker_state = "other_owner"
     elif not session or str(marker.get("plug_session_id") or "").strip() != session:
         marker_state = "other_session"
-    elif stop_reason not in DEFICIT_RESTART_CASCADE_STOP_REASONS and not stop_reason.startswith(
+    elif (stop_reason != "curve_backlog_stop"
+          and stop_reason not in DEFICIT_RESTART_CASCADE_STOP_REASONS) and not stop_reason.startswith(
         DEFICIT_RESTART_CASCADE_STOP_REASON_PREFIXES
     ):
         marker_state = "not_cascade_stop"

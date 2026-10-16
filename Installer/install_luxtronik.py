@@ -595,7 +595,7 @@ def configure_luxtronik(wp_type=0, headless=False, *, explicit_install_path=None
     """Erfasst die Sollwerte; geschrieben werden sie erst in der Unit-Transaktion."""
     print("\n=== Energy Manager (Wärmepumpe & Lademanagement) ===\n")
 
-    if wp_type not in {-1, 0, 1, 2, 3, 4, 5, 6}:
+    if wp_type not in {-1, 0, 1, 2, 3, 4, 5, 6, 7}:
         print(f"✗ Nicht unterstützter Wärmepumpentyp: {wp_type}")
         return False
 
@@ -670,7 +670,7 @@ def setup_service(
     """Projiziert Config, Units und Dienstzustände als eine Transaktion."""
 
     print("\n→ Richte Services ein…")
-    if wp_type not in {-1, 0, 1, 2, 3, 4, 5, 6}:
+    if wp_type not in {-1, 0, 1, 2, 3, 4, 5, 6, 7}:
         print(f"✗ Nicht unterstützter Wärmepumpentyp: {wp_type}")
         return False
 
@@ -740,7 +740,7 @@ def setup_service(
                 (),
             )
         ]
-    elif wp_type in {-1, 6}:
+    elif wp_type in {-1, 6, 7}:
         service_specs = [
             (
                 SERVICE_NAME,
@@ -789,7 +789,7 @@ def setup_service(
     else:
         replacements.setdefault("wp_type", f"wp_type = {wp_type}")
     from .web_installer import heat_source_allowed_companions, has_shelly_sgready_config
-    if wp_type in {0, 1, 4, 5} or (wp_type in {-1, 6} and has_shelly_sgready_config(selected_config)):
+    if wp_type in {0, 1, 4, 5} or (wp_type in {-1, 6, 7} and has_shelly_sgready_config(selected_config)):
         replacements.setdefault("luxtronik", "luxtronik = 1")
 
     for key, replacement in replacements.items():
@@ -1193,6 +1193,7 @@ def install_luxtronik_menu(
         4: "Stiebel Eltron ISG / WPM",
         5: "Dimplex WPM Touch / NWPM",
         6: "E3DC Leistungsmesser (PM)",
+        7: "MQTT-Wärmepumpe (nur Anzeige)",
     }
     if headless:
         try:

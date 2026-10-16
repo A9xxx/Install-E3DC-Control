@@ -1045,6 +1045,7 @@ def _remove_bound_instance_role(binding):
     if identity != binding["identity"] or (parent.st_dev, parent.st_ino) != binding["parent_identity"]:
         raise RuntimeError("Rollenanker oder Verzeichnis wechselte; Entfernung abgebrochen")
     os.unlink(INSTANCE_ROLE_PATH.name, dir_fd=binding["parent_fd"])
+    binding["file_removed"] = True
     print("  ✓ Rollenanker entfernt: /etc/e3dc-control/instance_role.json")
     _remove_empty_instance_role_parent(binding)
     return True
@@ -1146,8 +1147,10 @@ def _uninstall_full_after_preflight(delete_data, binding):
         _remove_bound_instance_role(binding)
     except (RuntimeError, OSError) as exc:
         role_cleanup_pending = True
+        target = (f"Verzeichnis {INSTANCE_ROLE_PATH.parent}"
+                  if binding and binding.get("file_removed") else f"Datei {INSTANCE_ROLE_PATH}")
         print(f"  ⚠ Rollenanker-Bereinigung nicht abgeschlossen: {exc}. "
-              f"Datei {INSTANCE_ROLE_PATH} nach Abschluss prüfen.")
+              f"{target} nach Abschluss prüfen.")
 
     uninstall_ramdisk()
 

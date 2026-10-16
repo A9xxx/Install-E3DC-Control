@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import math
+from datetime import datetime, timezone
 
 
 # Aus der bestehenden PV-Startlogik im Energy Manager: 500 W Schaltabstand.
@@ -20,6 +21,9 @@ REQUEST_WITHDRAWAL_DEBOUNCE_S = 45.0
 # Die unabhängige Netzschranke erhält diese feste, zusammenhängende Frist.
 GRID_STOP_DEBOUNCE_S = 30.0
 GRID_STOP_THRESHOLD_W = 2500.0
+# /proc/stat rundet auf Sekunden; 120 s lassen Ableseversatz und kleine
+# Uhrkorrekturen zu, aber keinen unbelegten Zeitsprung für die Kontoalterung.
+TIME_PROBE_TOLERANCE_S = 120.0
 
 DEMAND_SCHEMA = "heatpump_pv_demand_v1"
 STATE_SCHEMA = "heatpump_pv_state_v1"
@@ -44,6 +48,18 @@ def _number(value, default=None, *, minimum=0.0):
 
 def _dict(value):
     return value if isinstance(value, dict) else {}
+
+
+def heatpump_pv_time_probe_plausible(probe):
+    """Boot-, Marker- und monotone Zeit müssen dieselbe Wanduhrprobe belegen."""
+    probe = _dict(probe)
+    wall = _number(probe.get("wall_s", probe.get("wall_ts")))
+    mono = _number(probe.get("monotonic_s", probe.get("monotonic_ts")))
+    boot = _number(probe.get("boot_wall_s"))
+    marker = _number(probe.get("time_confirmation_marker_wall_s"))
+    return bool(wall is not None and mono is not None and boot is not None
+                and marker is not None and boot <= marker <= wall
+                and abs(wall - boot - mono) <= TIME_PROBE_TOLERANCE_S)
 
 
 def _clock(value, state):
@@ -323,6 +339,7 @@ def heatpump_pv_config(cfg):
     result = {
         "max_power_w": maximum,
         "control_mode": mode,
+        "wp_type": _number(cfg.get("wp_type")),
         "start_power_w": start,
         "profile_tolerance_w": max(100.0, maximum * 0.05) if mode == "measured" else 1.0,
         "min_runtime_s": runtime,
@@ -374,6 +391,215 @@ def heatpump_pv_config(cfg):
     return result
 
 
+
+def prepare_heatpump_pv_recovery(state, *, kind="boot_checkpoint", gap_active=False):
+    """Bewahrt den Buchungsanker über falsche Uhrproben und weitere Neustarts."""
+    recovery = _dict(state.get("energy_recovery"))
+    if recovery and recovery.get("status") != "resumed":
+        recovery["gap_active"] = bool(recovery.get("gap_active") or gap_active)
+        return
+    clock = _dict(state.get("clock"))
+    wall = _number(clock.get("wall_s")) if kind == "boot_checkpoint" else None
+    if wall is None or wall < 1577836800:
+        wall = None
+        kind = "checkpoint_loss"
+    prior_uncertain = bool(state.get("uncertain_state"))
+    remaining = _number(state.get("quarantine_remaining_s"), 86400.0)
+    prior_end = _number(state.get("energy_quarantine_until_wall_s"))
+    if prior_uncertain and wall is not None:
+        # Die bestehende Restfrist und der Wächter für ältere Leser sind getrennt.
+        # Der frühere Endpunkt wird auch bei einem weiteren Boot nicht erneuert.
+        end = wall + remaining
+        prior_end = min(prior_end, end) if prior_end is not None else end
+    state["energy_recovery"] = {
+        "kind": kind, "status": "pending", "anchor_wall_s": wall,
+        "anchor_logical_s": state["last_ts"],
+        "saved_wall_s": _number(state.get("checkpoint_saved_ts"), wall),
+        "gap_active": bool(gap_active or state["active_command"] or state["cycle_owned"]
+                           or _dict(state.get("closed_command")).get("protection_unknown")),
+        "prior_uncertain": prior_uncertain,
+        "quarantine_until_wall_s": prior_end if prior_uncertain else None,
+        "gap_battery_wh": None, "gap_grid_wh": None,
+    }
+    state["uncertain_state"] = True
+    state["checkpoint_reconciliation_required"] = True
+    # Ein älterer Leser kennt die Rekonsiliation noch nicht. Sein bestehender
+    # Fensterwächter muss bis zur bestätigten Fortführung konservativ bleiben.
+    state["quarantine_remaining_s"] = remaining if prior_uncertain else 86400.0
+
+
+def _rebase_heatpump_energy_clock(state, logical, clock_sample):
+    # Energiealter wird fortgeführt. Hardwarefristen verdienen weiterhin nur
+    # monotone Zeit; die Wanduhrlücke lässt deren Restzeit nicht verschwinden.
+    shift = logical - state["last_ts"]
+    for key in ("running_since_s", "last_stop_s", "issued_ts", "offered_ts",
+                "request_withdrawn_since_s", "request_returned_since_s",
+                "wallbox_grid_defer_since_s", "reservation_started_ts",
+                "start_reservation_released_ts", "pv_unqualified_since_s",
+                "pv_covered_since_s", "stop_recheck_since_s"):
+        value = _number(state.get(key))
+        if value is not None:
+            state[key] = max(0.0, value + shift)
+    for episode in _dict(state.get("wallbox_grid_episodes")).values():
+        for key in ("since_s", "last_progress_s", "progress_deadline_s"):
+            value = _number(_dict(episode).get(key))
+            if value is not None:
+                episode[key] = max(0.0, value + shift)
+    marker = _dict(state.get("closed_command"))
+    for key in ("own_running_since_s", "own_signal_since_s"):
+        value = _number(marker.get(key))
+        if value is not None:
+            marker[key] = max(0.0, value + shift)
+    clear_since = _dict(state.get("energy_guard_clear_since_s"))
+    for source, value in clear_since.items():
+        if _number(value) is not None:
+            clear_since[source] = max(0.0, value + shift)
+    state["last_ts"] = logical
+    state["clock"] = {
+        "wall_s": clock_sample.get("wall_s", clock_sample.get("wall_ts")),
+        "monotonic_s": clock_sample.get("monotonic_s", clock_sample.get("monotonic_ts")),
+        "boot_id": clock_sample.get("boot_id"),
+    }
+
+
+def _charge_heatpump_recovery_gap(state, recovery, now, cfg):
+    window = _number(cfg.get("window_s"), 86400.0)
+    start = max(recovery["anchor_logical_s"], now - window)
+    entries = {}
+    for entry in state["energy_window"]:
+        if entry["until_s"] <= now - window:
+            continue
+        until = entry["until_s"]
+        if until not in entries:
+            entries[until] = copy.deepcopy(entry)
+        else:
+            # Das bestehende Format erlaubt mehrere Teilbuchungen je Minute.
+            # Alle belegten Wh erhalten, bevor neue Obergrenzen hinzukommen.
+            for key in ("battery_wh", "grid_wh", "battery_measured_wh", "grid_measured_wh"):
+                if key in entry:
+                    entries[until][key] = entries[until].get(key, 0.0) + entry[key]
+    for source in ("battery", "grid"):
+        limit = _number(cfg.get(source + "_limit_wh"), 0.0)
+        used = sum(entry[source + "_wh"] for entry in entries.values())
+        rate = min(_number(cfg.get("max_power_w"), state["max_power_w"]) or state["max_power_w"],
+                   _number(cfg.get(source + "_max_w"), 0.0))
+        charge = min(max(0.0, limit - used), rate * max(0.0, now - start) / 3600.0) if recovery["gap_active"] else 0.0
+        recovery["gap_" + source + "_wh"] = charge
+        state[source + "_used_wh"] += charge
+        state[source + "_reserved_wh"] = max(0.0, state[source + "_reserved_wh"] - charge)
+        # Obergrenzen möglichst spät im tatsächlichen Intervall ablegen.
+        # Das erhält eine konservative Alterung, ohne alte Ausfallteile neu zu buchen.
+        left, end = charge, now
+        while left > 1e-9 and end > start:
+            until = math.ceil(end / 60.0) * 60.0
+            begin = max(start, until - 60.0)
+            amount = min(left, rate * (end - begin) / 3600.0)
+            entry = entries.setdefault(until, {"until_s": until, "battery_wh": 0.0, "grid_wh": 0.0})
+            entry[source + "_wh"] += amount
+            left -= amount
+            end = begin
+    state["energy_window"] = [entries[key] for key in sorted(entries)]
+
+
+def _reconcile_heatpump_energy_clock(state, clock_sample, cfg):
+    recovery = _dict(state.get("energy_recovery"))
+    if not recovery or recovery.get("status") == "resumed":
+        return False
+    # Ältere Leser können den Wächter bereits abgebaut haben. Die noch offene
+    # Rekonsiliation braucht dieselbe frische Abschlussprüfung wie jeder Ablauf.
+    state["uncertain_state"] = True
+    state["checkpoint_reconciliation_required"] = True
+    probe = _dict(clock_sample)
+    wall = _number(probe.get("wall_s", probe.get("wall_ts")))
+    confirmed = bool(probe.get("wall_confirmed") is True and probe.get("valid") is True
+        and wall is not None and wall >= 1577836800
+        and _number(probe.get("monotonic_s", probe.get("monotonic_ts"))) is not None
+        and probe.get("boot_id") not in (None, "", "unknown")
+        and probe.get("time_confirmation_source") == "systemd_timesyncd_current_boot")
+    state["time_confirmation_source"] = probe.get("time_confirmation_source", "clock_unconfirmed")
+    state["energy_recovery_reason"] = "clock_unconfirmed"
+    if (probe.get("time_confirmation_source") == "clock_implausible"
+            or confirmed and not heatpump_pv_time_probe_plausible(probe)):
+        state["energy_recovery_reason"] = "clock_implausible"
+        state["energy_quarantine_until_wall_s"] = None
+        return True
+    if not confirmed:
+        state["energy_quarantine_until_wall_s"] = None
+        return True
+    window = _number(cfg.get("window_s"), 86400.0)
+    anchor = recovery["anchor_wall_s"]
+    if anchor is None:
+        # Datenverlust: erst die bestätigte Klärungszeit beginnt die Frist.
+        anchor = recovery["anchor_wall_s"] = wall
+        recovery["anchor_logical_s"] = state["last_ts"]
+        recovery["quarantine_until_wall_s"] = wall + window
+        recovery["status"] = "quarantine"
+    boundary = max(anchor, _number(recovery.get("saved_wall_s"), anchor))
+    if wall < boundary:
+        recovery["status"] = "quarantine"
+        if recovery["quarantine_until_wall_s"] is None:
+            recovery["quarantine_until_wall_s"] = boundary + window
+        state["energy_recovery_reason"] = "checkpoint_clock_regression"
+    elif recovery["kind"] == "boot_checkpoint" and recovery["status"] == "pending":
+        # Die Lücke darf nur die durch Bootzeit und monotone Dauer belegte
+        # Spanne umfassen; die Toleranz entspricht der gesamten Zeitprobe.
+        span = max(0.0, probe["boot_wall_s"] +
+                   probe.get("monotonic_s", probe.get("monotonic_ts")) - anchor)
+        if wall - anchor > span + TIME_PROBE_TOLERANCE_S:
+            state["energy_recovery_reason"] = "clock_implausible"
+            state["energy_quarantine_until_wall_s"] = None
+            return True
+        logical = recovery["anchor_logical_s"] + wall - anchor
+        _charge_heatpump_recovery_gap(state, recovery, logical, cfg)
+        _rebase_heatpump_energy_clock(state, logical, probe)
+        if recovery["prior_uncertain"] and recovery["quarantine_until_wall_s"] is None:
+            # Bereits mit früheren Lesern angelegte Fortführung bleibt begrenzt.
+            recovery["quarantine_until_wall_s"] = anchor + _number(state.get("quarantine_remaining_s"), window)
+        if not recovery["prior_uncertain"]:
+            recovery["status"] = "resumed"
+            state["uncertain_state"] = False
+            state["checkpoint_reconciliation_required"] = False
+            state["energy_recovery_reason"] = "checkpoint_wall_clock_resumed"
+            state["quarantine_remaining_s"] = 0.0
+            state["energy_quarantine_until_wall_s"] = None
+            return False
+        recovery["status"] = "quarantine"
+        state["energy_recovery_reason"] = "legacy_quarantine_window"
+    else:
+        state["energy_recovery_reason"] = ("checkpoint_loss_window" if recovery["kind"] == "checkpoint_loss"
+            else "legacy_quarantine_window" if recovery["prior_uncertain"] else "checkpoint_clock_regression")
+    end = recovery["quarantine_until_wall_s"]
+    state["quarantine_remaining_s"] = max(0.0, end - wall)
+    state["energy_quarantine_until_wall_s"] = end
+    if wall >= anchor:
+        _rebase_heatpump_energy_clock(state, recovery["anchor_logical_s"] + wall - anchor, probe)
+    return True
+
+
+def heatpump_energy_recovery_diagnostics(state):
+    recovery = _dict(state.get("energy_recovery"))
+    reason = state.get("energy_recovery_reason", "")
+    end = state.get("energy_quarantine_until_wall_s")
+    label = ("Checkpoint fehlt oder ist beschädigt" if reason == "checkpoint_loss_window" else
+             "Bestehende Kontosperre" if reason == "legacy_quarantine_window" else
+             "Checkpoint-Zeit liegt vor der bestätigten Uhr")
+    try:
+        endpoint = datetime.fromtimestamp(end, timezone.utc).isoformat() if end is not None else None
+    except (ValueError, OverflowError, OSError):
+        endpoint = None
+    text = ("Wartet auf Zeitbestätigung" if reason == "clock_unconfirmed" else
+            "Wartet auf plausible Zeitbestätigung (widersprüchliche Zeitprobe)" if reason == "clock_implausible" else
+            "WP-Energiekonto nach Neustart fortgeführt" if reason == "checkpoint_wall_clock_resumed" and not state.get("uncertain_state") else
+            "Konservative Sperrfrist abgelaufen; Zeitbestätigung im Container nicht belegt" if reason == "legacy_window_elapsed_clock_unconfirmed" else
+            "Konto gesperrt bis " + endpoint + " (Grund: " + label + ")" if endpoint is not None and state.get("uncertain_state") else "")
+    return {"time_confirmation_source": state.get("time_confirmation_source"),
+            "energy_recovery_reason": reason, "energy_recovery_text": text,
+            "energy_quarantine_until_wall_s": end,
+            "restart_gap_battery_upper_wh": recovery.get("gap_battery_wh"),
+            "restart_gap_grid_upper_wh": recovery.get("gap_grid_wh"),
+            "restart_gap_energy_source": "conservative_separate_source_bounds" if recovery.get("gap_active") else "inactive_checkpoint_no_open_intent" if recovery else None}
+
+
 def _identity(demand):
     demand = _dict(demand)
     identity = demand.get("request_id")
@@ -383,6 +609,120 @@ def _identity(demand):
     if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
         return None
     return identity, revision
+
+
+def heatpump_pv_historical_repair(command, *, wall_s):
+    """Neue Abfrage nach Rücknahme-ACK; die alte Rückgabezeit bleibt unbekannt."""
+    repair = _dict(_dict(command).get("historical_repair"))
+    try:
+        from .heatpump_channel_owner import validate_checkpoint, raw_mode
+    except ImportError:
+        from heatpump_channel_owner import validate_checkpoint, raw_mode
+    checkpoint = validate_checkpoint(repair.get("checkpoint"))
+    probe = _number(repair.get("probe_wall_s"))
+    if (not checkpoint or repair.get("load_status") != "valid"
+            or repair.get("durable") is not True or repair.get("clock_fault") is not False
+            or probe is None or not 0 <= wall_s - probe <= 45.0):
+        return {}
+    peers = checkpoint["channels"]
+    if any(v["possible_effect"] or v["inflight"] is not None or v["state"] != "frei"
+           or v["transport_uncertain"] or v["clock_fault"] for v in peers.values()):
+        return {}
+    observations = _dict(repair.get("observations"))
+    identity = _identity(command)
+    owned = {name for name, state in peers.items()
+             if state["owner"] == "pv" and _identity(state) == identity}
+    if set(_dict(command.get("channels"))) != owned:
+        return {}
+    times = {}
+    for name, proof in _dict(command.get("channel_completion")).items():
+        proof = _dict(proof)
+        state, obs = _dict(peers.get(name)), _dict(observations.get(name))
+        ack = _number(proof.get("withdraw_ack_ts"))
+        query, sample = _number(obs.get("query_ts")), _number(obs.get("sample_ts"))
+        if (not state or state.get("owner") != "pv" or _identity(state) != identity
+                or state.get("diagnostic") != "withdrawal_readback_confirmed"
+                or any(state.get(key) != proof.get(key) for key in (
+                    "prepared_ts", "withdraw_requested_ts", "withdraw_ack_ts"))
+                or state.get("sent_ts") != proof.get("issued_ts")
+                or obs.get("valid") is not True or obs.get("source") != "modbus_read"
+                or ack is None or query is None or sample is None
+                or not ack < query < sample <= probe
+                or not 0 <= wall_s - sample <= 45.0):
+            return {}
+        mode, target = raw_mode(obs.get("raw_mode")), _number(obs.get("target_c"))
+        if (name == "hz" and mode != 0 or name == "ww" and (
+                mode != 1 or target is None or state.get("baseline_target_c") is None
+                or abs(target - state["baseline_target_c"]) > 0.1)):
+            return {}
+        times[name] = sample
+    return times
+
+
+def heatpump_pv_terminal_completion(command, *, wall_s):
+    """Prüft den vollständigen Luxtronik-Rückgabebeleg unabhängig vom Summenflag.
+
+    Fremdbesitz, jüngere Besitzer und ungesendete Vorbereitung bleiben beim
+    bisherigen Stillstandsvertrag; keiner dieser Gründe ist eine Rücklesung.
+    Alte belegte Zeitpunkte bleiben alt. Eine neue kausal geprüfte Abfrage
+    erhält einen getrennten Reparaturbeleg für die historische Beleglücke.
+    """
+    command = _dict(command)
+    identity = _identity(command)
+    prepared = _number(command.get("prepared_ts"))
+    issued = _number(command.get("issued_ts"))
+    anchor = issued if issued is not None else prepared
+    channels = _dict(command.get("channels"))
+    completions = _dict(command.get("channel_completion"))
+    if (not identity or command.get("withdrawal_confirmed") is not True
+            or anchor is None or not 0 < anchor <= wall_s
+            or prepared is None or not 0 < prepared <= anchor
+            or not channels or not set(channels).issubset({"hz", "ww"})
+            or set(completions) != set(channels)):
+        return None
+    repairs = heatpump_pv_historical_repair(command, wall_s=wall_s)
+    times, preparations, outputs = [], [], []
+    for name, channel in channels.items():
+        proof = _dict(completions.get(name))
+        prep = _number(proof.get("prepared_ts"))
+        sent = _number(proof.get("issued_ts"))
+        requested = _number(proof.get("withdraw_requested_ts"))
+        ack = _number(proof.get("withdraw_ack_ts"))
+        readback = _number(proof.get("withdraw_readback_ts"), repairs.get(name))
+        if (not isinstance(channel, dict) or channel.get("active") is not True
+                or _number(channel.get("target_c")) is None
+                or proof.get("terminal") is not True or proof.get("state") != "frei"
+                or proof.get("reason") != "withdrawal_readback_confirmed"
+                or _identity(proof) != identity
+                or prep is None or not prepared <= prep <= wall_s
+                or sent is None or not prep <= sent <= wall_s
+                or requested is None or not sent <= requested <= wall_s
+                or ack is None or not requested <= ack < wall_s
+                or readback is None or not ack < readback <= wall_s
+                ):
+            return None
+        preparations.append(prep)
+        outputs.append(sent)
+        times.append(readback)
+    if min(preparations) != prepared or issued != min(outputs):
+        return None
+    return max(times)
+
+
+def heatpump_pv_closed_terminal(state, command=None, *, wall_s):
+    """Nur ein persistierter, identitätsgebundener Beleg beendet einen Altintent."""
+    marker = _dict(_dict(state).get("closed_command"))
+    evidence = _dict(marker.get("terminal_evidence"))
+    closed_wall = _number(marker.get("terminal_wall_s"))
+    # Antwortzeit und damalige Auswertung bleiben getrennt, auch beim Replay.
+    evaluated_wall = _number(marker.get("terminal_evaluated_wall_s", closed_wall))
+    if (evaluated_wall is None or closed_wall is None or not closed_wall <= evaluated_wall <= wall_s or not 0 < closed_wall <= wall_s or not _identity(marker) or _identity(evidence) != _identity(marker)
+            or marker.get("issued_ts") != evidence.get("issued_ts")
+            or heatpump_pv_terminal_completion(evidence, wall_s=evaluated_wall) != closed_wall):
+        return False
+    return command is None or (_identity(command) == _identity(marker)
+        and _number(command.get("issued_ts"), _number(command.get("prepared_ts")))
+        == marker.get("issued_ts"))
 
 
 def _fresh(sample, now_s, ttl):
@@ -436,6 +776,10 @@ def validate_heatpump_pv_state(state):
     if not isinstance(state, dict) or state.get("schema") != STATE_SCHEMA:
         return {}
     result = copy.deepcopy(state)
+    # Alte Zuteilung ist keine Messung; sie wird ohnehin nie wiederverwendet.
+    if "last_allocated_w" in result and result["last_allocated_w"] is not None and _number(result["last_allocated_w"]) is None:
+        result.pop("last_allocated_w")
+        result["validation_rejection_reason"] = "obsolete_allocation_invalid"
     for key in (
         "last_ts", "battery_used_wh", "grid_used_wh", "battery_reserved_wh",
         "grid_reserved_wh", "last_battery_w", "last_grid_w", "max_power_w",
@@ -455,6 +799,22 @@ def validate_heatpump_pv_state(state):
             return {}
     if not isinstance(result.get("request_id"), str) or type(result.get("revision")) is not int:
         return {}
+    recovery = result.get("energy_recovery")
+    if recovery is not None:
+        if (not isinstance(recovery, dict)
+                or recovery.get("kind") not in ("boot_checkpoint", "checkpoint_loss")
+                or recovery.get("status") not in ("pending", "quarantine", "resumed")
+                or _number(recovery.get("anchor_logical_s")) is None
+                or type(recovery.get("gap_active")) is not bool
+                or type(recovery.get("prior_uncertain")) is not bool):
+            return {}
+        for key in ("anchor_wall_s", "saved_wall_s", "quarantine_until_wall_s", "gap_battery_wh", "gap_grid_wh"):
+            if key not in recovery or recovery[key] is not None and _number(recovery[key]) is None:
+                return {}
+        if recovery["kind"] == "boot_checkpoint" and recovery["anchor_wall_s"] is None:
+            return {}
+        if recovery["status"] == "quarantine" and recovery["quarantine_until_wall_s"] is None:
+            return {}
     entries = result.get("energy_window")
     if not isinstance(entries, list) or len(entries) > 1500:
         return {}
@@ -505,6 +865,36 @@ def validate_heatpump_pv_state(state):
         return {}
     if "withdrawal_identity" in result and _identity(result["withdrawal_identity"]) is None:
         return {}
+    marker = _dict(result.get("closed_command"))
+    if "terminal_evidence" in marker:
+        closed_wall = _number(marker.get("terminal_wall_s"))
+        evaluated_wall = _number(marker.get("terminal_evaluated_wall_s", closed_wall))
+        rejected = bool(evaluated_wall is None or not heatpump_pv_closed_terminal(result, wall_s=evaluated_wall)
+                        or type(marker.get("protection_unknown")) is not bool)
+        for key in ("own_running_since_s", "own_signal_since_s"):
+            anchor = marker.get(key)
+            if key not in marker or anchor is not None and _number(anchor) is None:
+                rejected = True
+                marker["protection_unknown"] = True
+            marker[key] = _number(anchor) if anchor is not None else None
+            if marker[key] is not None and marker[key] > result["last_ts"]:
+                marker[key] = None
+                marker["protection_unknown"] = True
+        if rejected:
+            # Nur der neue Abschlussbeleg entfällt. Wh, Unsicherheit und
+            # Quarantäne bleiben erhalten; eigene Schutzanker werden bewahrt.
+            for target, source in (("running_since_s", "own_running_since_s"), ("issued_ts", "own_signal_since_s")):
+                anchor = _number(marker.get(source))
+                if anchor is not None and anchor <= result["last_ts"]:
+                    prior = result.get(target)
+                    result[target] = min(prior, anchor) if prior is not None else anchor
+            result["cycle_owned"] = True
+            marker["terminal_rejected"] = True
+            marker["protection_unknown"] = marker.get("protection_unknown") is not False
+            marker.pop("terminal_evidence", None)
+            marker.pop("terminal_wall_s", None)
+            marker.pop("terminal_evaluated_wall_s", None)
+            result["validation_rejection_reason"] = "terminal_evidence_invalid"
     return result
 
 
@@ -740,6 +1130,28 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
     corrupt = bool(previous) and not restored
     wall, now, current_clock, clock_uncertain = _clock(clock_sample, restored)
     state = restored or _empty_state(now, maximum)
+    live_command = _dict(demand.get("command"))
+    command_without_checkpoint = bool(not restored and _identity(live_command) == _identity(demand)
+        and _identity(demand) and live_command.get("withdrawal_confirmed") is not True
+        and _number(live_command.get("issued_ts"), _number(live_command.get("prepared_ts"), 0.0)) > 0)
+    legacy_container = _dict(clock_sample).get("time_confirmation_scope") == "docker_legacy"
+    if (corrupt or command_without_checkpoint) and not legacy_container:
+        prepare_heatpump_pv_recovery(state, kind="checkpoint_loss", gap_active=command_without_checkpoint)
+    if legacy_container and (corrupt or command_without_checkpoint or state.get("uncertain_state")):
+        state["time_confirmation_source"] = "clock_unconfirmed"
+        state["energy_recovery_reason"] = "clock_unconfirmed"
+    recovery = _dict(state.get("energy_recovery"))
+    live_intent = _dict(demand.get("command"))
+    preclosed = heatpump_pv_closed_terminal(state, live_intent, wall_s=wall)
+    if recovery and recovery.get("status") != "resumed" and live_intent and not preclosed:
+        recovery["gap_active"] = bool(recovery["gap_active"]
+            or live_intent.get("withdrawal_confirmed") is not True
+            or _number(live_intent.get("prepared_ts"), 0.0) > (recovery["anchor_wall_s"] or 0.0))
+    recovery_wait = _reconcile_heatpump_energy_clock(state, clock_sample, cfg)
+    wall, now, current_clock, clock_uncertain = _clock(clock_sample, state)
+    if recovery_wait:
+        now = state["last_ts"]
+        clock_uncertain = True
     # Alte Checkpoints haben noch keinen eigenen Identitätsanker der Vormerkung.
     # Vor dem unten erlaubten Sollwertwechsel an den bisherigen Auftrag binden.
     if (state.get("withdrawal_pending") and state.get("withdrawal_reason") == "request_withdrawn"
@@ -750,7 +1162,8 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
         state["battery_reserved_wh"] = state["grid_reserved_wh"] = 0.0
     # Alte Zuteilungen sind keine Messung und werden nicht wiederverwendet.
     state.pop("last_allocated_w", None)
-    blockers = []
+    rejection_reason = state.pop("validation_rejection_reason", "")
+    blockers = [rejection_reason] if rejection_reason else []
     identity = _identity(demand)
     ttl = _number(cfg.get("freshness_s"), 45.0)
     data_fresh = bool(observation.get("fresh") is True and _fresh(observation, wall, ttl))
@@ -758,21 +1171,38 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
     demand_fresh = bool(demand.get("schema") == DEMAND_SCHEMA and _fresh(demand, wall, ttl))
     backwards = now < state["last_ts"]
     dt = max(0.0, now - state["last_ts"])
-    clock_ok = not backwards and not clock_uncertain and now > 0
-    if backwards:
+    wall_backwards = cfg.get("wp_type") == 0 and wall < _number(_dict(state.get("clock")).get("wall_s"), wall)
+    clock_ok = not backwards and not wall_backwards and not clock_uncertain and now > 0
+    if backwards or wall_backwards:
         blockers.append("clock_regression")
     if clock_uncertain:
         blockers.append("clock_epoch_unconfirmed")
     if corrupt:
         blockers.append("energy_state_invalid")
         state["uncertain_state"] = True
-        state["quarantine_remaining_s"] = _number(cfg.get("window_s"), 86400.0)
-    elif state.get("uncertain_state") and clock_ok:
-        state["quarantine_remaining_s"] = max(0.0, _number(state.get("quarantine_remaining_s"), 86400.0) - dt)
+        if legacy_container:
+            state["quarantine_remaining_s"] = _number(cfg.get("window_s"), 86400.0)
+        else:
+            state.setdefault("quarantine_remaining_s", _number(cfg.get("window_s"), 86400.0))
+    if state.get("uncertain_state") and (clock_ok or recovery_wait and state.get("energy_recovery_reason") not in ("clock_unconfirmed", "clock_implausible")):
+        if not recovery_wait:
+            state["quarantine_remaining_s"] = max(0.0, _number(state.get("quarantine_remaining_s"), 86400.0) - dt)
         if (state["quarantine_remaining_s"] <= 0 and data_fresh and source_fresh
                 and observation.get("compressor_running") is False
                 and not state.get("cycle_owned") and not state.get("active_command")):
             state["uncertain_state"] = False
+            state["checkpoint_reconciliation_required"] = False
+            if legacy_container and not recovery_wait:
+                state["energy_recovery_reason"] = "legacy_window_elapsed_clock_unconfirmed"
+            if recovery_wait:
+                state["energy_recovery"]["status"] = "resumed"
+                state["energy_recovery_reason"] = "checkpoint_window_elapsed"
+                recovery_wait = False
+                wall, now, current_clock, clock_uncertain = _clock(clock_sample, state)
+                clock_ok = not clock_uncertain and now > 0
+                if clock_ok:
+                    blockers = [b for b in blockers if b != "clock_epoch_unconfirmed"]
+                state["energy_quarantine_until_wall_s"] = None
     if state.get("uncertain_state"):
         blockers.append("energy_state_requires_reconciliation")
     if cfg.get("valid") is not True:
@@ -790,7 +1220,24 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
     already_closed = bool(bound_command and closed_command.get("request_id") == command.get("request_id")
                           and closed_command.get("revision") == command.get("revision")
                           and closed_command.get("issued_ts") == issued)
-    if issued is not None and issued > 0 and issued <= wall and not already_closed:
+    direct = cfg.get("wp_type") == 0
+    terminal_ts = (heatpump_pv_terminal_completion(command, wall_s=wall)
+                   if direct and bound_command else None)
+    account_bound = bool(bound_command and _identity(state) == identity
+        and (state.get("issued_wall_s") is None or state["issued_wall_s"] == issued))
+    terminal_closed = bool(direct and heatpump_pv_closed_terminal(state, command, wall_s=wall))
+    repair_safe = bool(not command.get("historical_repair") or (restored and not corrupt
+        and clock_ok and state.get("signal_withdrawn") is True))
+    terminal = bool(terminal_ts is not None and account_bound and data_fresh and repair_safe
+                    and clock_ok and not rejection_reason)
+    own_running = state["running_since_s"]
+    own_signal = state["issued_ts"] if state["issued_ts"] is not None else state["offered_ts"]
+    history_invalid = bool(own_running is not None and own_running > state["last_ts"]
+                           or own_signal is not None and own_signal > state["last_ts"])
+    if history_invalid:
+        own_running = own_signal = None
+    if issued is not None and issued > 0 and issued <= wall and not already_closed and not terminal and not terminal_closed\
+            and not (direct and command.get("withdrawal_confirmed") is True):
         if not restored and command.get("withdrawal_confirmed") is not True:
             state["uncertain_state"] = True
             state["quarantine_remaining_s"] = _number(cfg.get("window_s"), 86400.0)
@@ -807,6 +1254,12 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
         if not state["signal_withdrawn"]:
             state["active_command"] = True
     withdrawn = bool(bound_command and command.get("withdrawal_confirmed") is True and data_fresh)
+    if direct:
+        # Auch bei mangelhafter Evidenz darf ein terminal deklarierter Intent
+        # keine erneute eigene Ausgabe oder Signalhaltezeit eröffnen.
+        withdrawn = terminal or terminal_closed
+        if command.get("withdrawal_confirmed") is True and not withdrawn:
+            blockers.append("terminal_channel_evidence_unconfirmed")
     active_before = state["cycle_owned"]
     physical = observation.get("compressor_running") if data_fresh else None
     if physical is not True and physical is not False:
@@ -878,7 +1331,7 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
     state["measurement_gap_battery_wh"] = 0.0
     state["measurement_gap_grid_wh"] = 0.0
     state["measurement_gap_reason"] = "no_gap"
-    if gap and active_before:
+    if gap and active_before and not recovery_wait:
         battery_bound = min(maximum or state["max_power_w"], _number(cfg.get("battery_max_w"), 0.0))
         grid_bound = min(maximum or state["max_power_w"], _number(cfg.get("grid_max_w"), 0.0))
         if measured and not measured_observation_valid and balance_fresh:
@@ -934,7 +1387,7 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
     if physical is True:
         state.pop("stop_recheck_since_s", None)
         state.pop("stop_recheck_wall_s", None)
-        if state["running_since_s"] is None:
+        if state["running_since_s"] is None and not (direct and (terminal or terminal_closed or command.get("withdrawal_confirmed") is True)):
             state["running_since_s"] = now
     elif physical is False:
         if state["compressor_running"] is True:
@@ -948,6 +1401,21 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
         state["running_since_s"] = None
     if physical is not None:
         state["compressor_running"] = physical
+    if terminal and not terminal_closed:
+        # Abschluss des eigenen Befehls; Hardwareanker bleiben unabhängig davon.
+        state["closed_command"] = {
+            "request_id": command["request_id"], "revision": command["revision"],
+            "issued_ts": issued, "terminal_wall_s": terminal_ts,
+            "terminal_evaluated_wall_s": wall,
+            "terminal_evidence": {key: copy.deepcopy(command.get(key)) for key in (
+                "request_id", "revision", "issued_ts", "prepared_ts", "channels",
+                "withdrawal_confirmed", "channel_completion", "historical_repair")},
+            "own_running_since_s": own_running if state["cycle_owned"] else None,
+            "own_signal_since_s": own_signal if state["cycle_owned"] else None,
+            "protection_unknown": bool(state["cycle_owned"] and (
+                history_invalid or own_signal is None or state["compressor_running"] is True and own_running is None)),
+        }
+        terminal_closed = True
     if withdrawn:
         state["active_command"] = False
         state["signal_withdrawn"] = True
@@ -963,19 +1431,37 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
         if measured:
             state["energy_guard_pending"] = False
             state["energy_guard_sources"] = []
-        if bound_command:
+        if (bound_command and account_bound and issued is not None and 0 < issued <= wall
+                and not terminal_closed):
             state["closed_command"] = {
                 "request_id": command["request_id"], "revision": command["revision"],
                 "issued_ts": issued,
             }
         _clear_start_reservation_release(state)
     runtime = _number(cfg.get("min_runtime_s"), 1800.0)
-    running_since = state["running_since_s"]
+    marker = _dict(state.get("closed_command"))
+    rejected_protection = marker.get("terminal_rejected") is True
+    closed_protection = bool(direct and (heatpump_pv_closed_terminal(state, wall_s=wall) or rejected_protection)
+                             and _identity(state) == _identity(marker))
+    if closed_protection and physical is False:
+        marker["own_running_since_s"] = None
+        marker["protection_unknown"] = False
+    running_since = (marker.get("own_running_since_s") if closed_protection
+                     else state["running_since_s"])
     remaining = max(0.0, running_since + runtime - now) if running_since is not None else 0.0
     # Unbekannt ist kein bestätigter Stopp. Ein bestehender Zeitanker bleibt stehen.
     if not data_fresh and state["compressor_running"] is True and remaining <= 0:
         blockers.append("running_observation_unconfirmed")
     signal_remaining = max(0.0, state["issued_ts"] + _number(cfg.get("signal_hold_s"), 600.0) - now) if state["issued_ts"] is not None else 0.0
+    if closed_protection:
+        signal_since = _number(marker.get("own_signal_since_s"))
+        signal_remaining = (max(0.0, signal_since + _number(cfg.get("signal_hold_s"), 600.0) - now)
+                            if signal_since is not None else 0.0)
+        if marker.get("protection_unknown"):
+            blockers.append("own_protection_history_unconfirmed")
+        # Nur belegte Restfristen besitzen weiter einen eigenen Zyklus.
+        if not rejected_protection:
+            state["cycle_owned"] = bool(max(remaining, signal_remaining) > 0)
     protected = max(remaining, signal_remaining)
     protection = source.get("protection_reason", "")
     if protection not in HARD_PROTECTIONS:
@@ -1150,6 +1636,8 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
         state["reservation_started_ts"] = None
         state["start_reservation_released"] = released
         state["start_reservation_released_ts"] = now if released else None
+    if direct and (terminal_closed or already_closed):
+        blockers.append("command_already_closed")
     start_candidate = bool(not blockers and qualified and not state["cycle_owned"]
                            and clock_ok and not state.get("withdrawal_pending"))
     if start_candidate:
@@ -1416,6 +1904,8 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
              "start_candidate" if start_candidate else (blockers[0] if blockers else "idle"))
     return {
         "schema": CONTRACT_SCHEMA, "sample_ts": wall,
+        **heatpump_energy_recovery_diagnostics(state),
+        "state_rejection_reason": rejection_reason or None,
         "control_mode": "measured" if measured else "reserved",
         "curve_forecast_hold": forecast_hold, "curve_forecast": copy.deepcopy(forecast),
         "start_power_w": start_power, "start_margin_w": start_margin_w,
@@ -1481,7 +1971,8 @@ def evaluate_heatpump_pv_request(demand, observation, previous, source, *, clock
         "measurement_gap_reason": state["measurement_gap_reason"],
         "battery_response_required_wh": battery_response_wh,
         "battery_response_required_w": battery_response_w,
-        "quarantine_remaining_s": state.get("quarantine_remaining_s", 0.0),
+        "quarantine_remaining_s": (None if recovery_wait and state.get("energy_recovery_reason") in ("clock_unconfirmed", "clock_implausible")
+                                   else state.get("quarantine_remaining_s", 0.0)),
         "window_battery_used_wh": window_battery, "window_grid_used_wh": window_grid,
         "energy_reservation_power_w": reserve_power,
         "energy_reservation_required_wh": reserve_power * reserve_duration / 3600.0,
@@ -1512,6 +2003,10 @@ def bind_heatpump_pv_grant(request_contract, *, allocated_w, shared_funded_w,
     battery = min(_number(battery_funded_w, 0.0), _number(result.get("battery_available_w"), 0.0))
     grid = min(_number(grid_funded_w, 0.0), _number(result.get("grid_available_w"), 0.0))
     required = _number(result.get("request_w"), 0.0)
+    if result.get("start_priority_reservation_required") is True:
+        priority_required = result.get("priority_start_required_w")
+        required = max(required, priority_required
+            if type(priority_required) is int and priority_required > 0 else math.inf)
     funded = allocation >= required and shared + battery + grid >= required
     if result.get("control_mode") == "measured" and result.get("start_candidate"):
         # Freigabe aus dem vorrangigen PV-Rahmen, ohne Vorabreservierung.

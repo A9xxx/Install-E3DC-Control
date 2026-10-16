@@ -2371,6 +2371,46 @@ function forecastDiagnosticIssueContractValid($contract, $expectedRevision) {
     return ($contract['status'] ?? '') === ($componentComplete ? 'complete' : 'EVIDENCE_LIMIT');
 }
 
+function forecastDiagnosticPreviousReportProjection($value, $topology) {
+    if ($value === null) return null;
+    if (!is_array($value) || ($value['schema_version'] ?? '') !== 'pv_forecast_previous_report_v1'
+        || ($value['available'] ?? null) !== true || ($value['decision_use_allowed'] ?? null) !== false
+        || ($value['topology_revision'] ?? null) !== $topology
+        || !in_array($value['summary_schema'] ?? '', ['pv_forecast_diagnostic_summary_v2',
+            'pv_forecast_diagnostic_summary_v3', 'pv_forecast_diagnostic_summary_v4'], true)) return null;
+    $method = $value['method_revision'] ?? null;
+    if (($method !== null && preg_match('/^sha256:[0-9a-f]{64}$/', (string)$method) !== 1)
+        || (($value['summary_schema'] ?? '') === 'pv_forecast_diagnostic_summary_v4' && $method === null)) return null;
+    $out = ['schema_version' => 'pv_forecast_previous_report_v1', 'available' => true,
+        'summary_schema' => $value['summary_schema'], 'topology_revision' => $topology,
+        'method_revision' => $method, 'decision_use_allowed' => false];
+    foreach (['eligible_forecast_slots', 'compared_slots', 'yield_relevant_slots', 'yield_relevant_days',
+            'calculated_at_utc_s', 'evaluation_start_utc_s', 'evaluation_end_utc_s'] as $key) {
+        if (!is_int($value[$key] ?? null) || $value[$key] < 0) return null;
+        $out[$key] = $value[$key];
+    }
+    if ($out['compared_slots'] <= 0 || $out['yield_relevant_days'] > $out['yield_relevant_slots']
+        || $out['yield_relevant_slots'] > $out['compared_slots']
+        || $out['compared_slots'] > $out['eligible_forecast_slots']
+        || $out['evaluation_start_utc_s'] >= $out['evaluation_end_utc_s']
+        || $out['evaluation_end_utc_s'] > $out['calculated_at_utc_s']
+        || $out['calculated_at_utc_s'] > time() + 300) return null;
+    $out['metrics'] = [];
+    foreach (['trefferabweichung_wh', 'richtungsversatz_wh', 'quadratische_fehlerwurzel_wh',
+            'persistenz_skill_score_pct', 'energiegewichtete_gesamtabweichung_pct', 'vergleichsabdeckung_pct'] as $key) {
+        $number = $value['metrics'][$key] ?? null;
+        if ($number === null && (in_array($key, ['persistenz_skill_score_pct', 'energiegewichtete_gesamtabweichung_pct'], true)
+            || ($key === 'quadratische_fehlerwurzel_wh' && $value['summary_schema'] !== 'pv_forecast_diagnostic_summary_v4'))) {
+            $out['metrics'][$key] = null; continue;
+        }
+        if ((!is_int($number) && !is_float($number)) || !is_finite((float)$number)
+            || (!in_array($key, ['richtungsversatz_wh', 'persistenz_skill_score_pct'], true) && $number < 0)
+            || ($key === 'vergleichsabdeckung_pct' && $number > 100)) return null;
+        $out['metrics'][$key] = $number;
+    }
+    return $out;
+}
+
 function forecastDiagnosticContinuityProjection(
     $value,
     $expectedTopologyRevision,
@@ -2390,7 +2430,7 @@ function forecastDiagnosticContinuityProjection(
     $currentDays = $value['current_yield_relevant_days'] ?? null;
     if (
         ($value['schema_version'] ?? '') !== 'pv_forecast_evidence_continuity_v1'
-        || $mergedIntoCurrentMetrics !== false
+        || !is_bool($mergedIntoCurrentMetrics)
         || !is_bool($value['retained'] ?? null)
         || !is_int($currentCompared)
         || !is_int($currentDays)
@@ -2404,6 +2444,28 @@ function forecastDiagnosticContinuityProjection(
     ) {
         return null;
     }
+    // Zulassung ausschließlich für den fest gebundenen Wertevergleich der Methodenfamilie.
+    $familyRevision = 'sha256:934e4b65c5a24c4e47b069782b03e4aa22740a0ccf80140e590e2d6536342bca';
+    $proofRevision = 'sha256:9c97e2b938bc605f299e4093ed97183b70c65115b8e11351e3cca65588ccca3f';
+    $family = ['sha256:934e4b65c5a24c4e47b069782b03e4aa22740a0ccf80140e590e2d6536342bca', 'sha256:2100e8987bd1c3d1c181d23ecc23a135db0b99690c35367ee9b4523def13fe75', 'sha256:14c1eb5a11250b6fbe2895cbcb1c0c8ee95582f593127a3ecd5469b3ff5b06fa', 'sha256:52aa0d6d9a4d81d1497e57909fb6287eefe95b3daee953bf6d2330caa6b4bb84'];
+    $mergedRevisions = $value['merged_method_revisions'] ?? [];
+    if ($mergedIntoCurrentMetrics) {
+        if (!is_array($mergedRevisions) || count($mergedRevisions) < 1 || count($mergedRevisions) > 3
+            || !in_array($currentMethod, $family, true)
+            || ($value['merged_topology_revision'] ?? null) !== $currentTopology
+            || ($value['method_family_revision'] ?? null) !== $familyRevision
+            || ($value['equivalence_proof_revision'] ?? null) !== $proofRevision) return null;
+        $seen = [];
+        foreach ($mergedRevisions as $revision) {
+            if (!is_string($revision) || !in_array($revision, $family, true)
+                || $revision === $currentMethod || in_array($revision, $seen, true)) return null;
+            $seen[] = $revision;
+        }
+    } elseif (!is_array($mergedRevisions) || count($mergedRevisions) !== 0) return null;
+    $methodSince = $value['current_method_since_utc_s'] ?? null;
+    if ($methodSince !== null && (!is_int($methodSince) || $methodSince <= 0 || $methodSince > time() + 300)) return null;
+    $previousReport = forecastDiagnosticPreviousReportProjection($value['previous_report'] ?? null, $currentTopology);
+    if (($value['previous_report'] ?? null) !== null && ($previousReport === null || !$retained)) return null;
     $previousSchema = $value['previous_summary_schema'] ?? null;
     $previousTopology = $value['previous_topology_revision'] ?? null;
     $previousMethod = $value['previous_method_revision'] ?? null;
@@ -2452,12 +2514,22 @@ function forecastDiagnosticContinuityProjection(
     ) {
         return null;
     }
+    if ($previousReport !== null && ($previousReport['method_revision'] !== $previousMethod
+        || $previousReport['summary_schema'] !== $previousSchema
+        || $previousReport['compared_slots'] !== $previousCompared
+        || $previousReport['yield_relevant_days'] !== $previousDays)) return null;
     return [
         'schema_version' => 'pv_forecast_evidence_continuity_v1',
         'status' => $status,
         'reason' => $reason,
         'retained' => $retained,
-        'merged_into_current_metrics' => false,
+        'merged_into_current_metrics' => $mergedIntoCurrentMetrics,
+        'merged_method_revisions' => $mergedRevisions,
+        'merged_topology_revision' => $mergedIntoCurrentMetrics ? $currentTopology : null,
+        'method_family_revision' => $mergedIntoCurrentMetrics ? $familyRevision : null,
+        'equivalence_proof_revision' => $mergedIntoCurrentMetrics ? $proofRevision : null,
+        'current_method_since_utc_s' => $methodSince,
+        'previous_report' => $previousReport,
         'previous_summary_schema' => $previousSchema,
         'previous_topology_revision' => $previousTopology,
         'previous_method_revision' => $previousMethod,
@@ -3032,6 +3104,7 @@ function loadPvForecastDiagnosticEvidence($currentTopologyRevision, $diagnostics
             'history_time_plausibility_legacy' => forecastHistoryTimePlausibilityProjection($payload['history_time_plausibility_legacy'] ?? null),
             'history_backfill' => forecastHistoryBackfillProjection($payload['history_backfill'] ?? null),
             'diagnostic_details' => $projectedDetails,
+            'entity_archive' => forecastEntityArchiveProjection($payload['entity_archive'] ?? null),
             'quality_progress' => forecastQualityProgressProjection($payload['quality_progress'] ?? null,
                 $expectedRevision, $expectedMethodRevision, null,
                 @filemtime('/var/www/html/data/e3dc_v4.json') ?: null),
@@ -3119,6 +3192,8 @@ function forecastHistoryTimePlausibilityProjection($raw) {
     }
     return $result;
 }
+
+require_once __DIR__ . '/pv_entity_projection.php';
 
 function forecastDiagnosticDetailsProjection($raw) {
     if (!is_array($raw) || ($raw['schema_version'] ?? '') !== 'pv_forecast_diagnostic_details_v1'
@@ -3473,6 +3548,44 @@ function addOctopusHeatRepeatPriceSegments(&$segments, &$uniquePrices, $conf) {
     addRepeatPriceSegment($segments, $uniquePrices, 1260, 1440, $basis);
 }
 
+// Spezialtarif-Tagesplan aus Paaren „Startzeit Preis“, gleiche Auslegung wie
+// parse_special_tariff_schedule in Installer/tariff_schedule.py.
+function forecastSpecialTariffSchedule($raw) {
+    $text = is_scalar($raw) ? trim((string)$raw) : '';
+    $entries = [];
+    if ($text === '' || !preg_match_all('/(?<!\d)([0-2]?\d)(?:[:.](\d{1,2}))?\s+(-?\d+(?:[,.]\d+)?)/u', $text, $matches, PREG_SET_ORDER)) {
+        return $entries;
+    }
+    foreach ($matches as $match) {
+        $hour = (int)$match[1];
+        $minute = (isset($match[2]) && $match[2] !== '') ? (int)$match[2] : 0;
+        if ($hour > 23 || $minute > 59) {
+            continue;
+        }
+        $entries[$hour * 60 + $minute] = (float)str_replace(',', '.', $match[3]);
+    }
+    ksort($entries);
+    return $entries;
+}
+
+function addSpecialTariffRepeatPriceSegments(&$segments, &$uniquePrices, $conf) {
+    $schedule = forecastSpecialTariffSchedule($conf['strompreis_spezial'] ?? '');
+    if (empty($schedule)) {
+        // Ohne lesbaren Tagesplan gilt wie bei der Abrechnung der Arbeitspreis.
+        addStaticRepeatPriceSegments($segments, $uniquePrices, $conf);
+        return;
+    }
+    $starts = array_keys($schedule);
+    $prices = array_values($schedule);
+    $count = count($starts);
+    // Vor dem ersten Eintrag des Tages gilt noch der letzte Preis des Vortags.
+    addRepeatPriceSegment($segments, $uniquePrices, 0, $starts[0], $prices[$count - 1]);
+    for ($i = 0; $i < $count; $i++) {
+        $end = ($i + 1 < $count) ? $starts[$i + 1] : 1440;
+        addRepeatPriceSegment($segments, $uniquePrices, $starts[$i], $end, $prices[$i]);
+    }
+}
+
 // V4 Eco-Score einlesen
 $ecoScores = null;
 if ($v4_prices_available) {
@@ -3509,6 +3622,13 @@ if (in_array($stromtarifTyp, ['static', 'fix', 'fixed', 'flat'], true)) {
 }
 if ($stromtarifTyp === 'octopus_heat') {
     addOctopusHeatRepeatPriceSegments($repeatPriceSegments, $repeatPriceUnique, $conf);
+}
+if (in_array($stromtarifTyp, ['special', 'spezial', 'special_tariff'], true)) {
+    // Der Tagesplan geht den eco_score-Segmenten vor; diese können nach einer Planänderung
+    // bis zum nächsten Marktlauf noch alte Preise tragen.
+    $specialTariffSegments = [];
+    addSpecialTariffRepeatPriceSegments($specialTariffSegments, $repeatPriceUnique, $conf);
+    $repeatPriceSegments = array_merge($specialTariffSegments, $repeatPriceSegments);
 }
 // Fixtarife und wiederholende Tarife (z.B. Octopus Heat) haben wenige Preisstufen.
 // Dynamische EPEX/Tibber-Reihen bleiben bewusst begrenzt, wenn der echte Horizont endet.
@@ -3638,6 +3758,9 @@ $data['direct_marketing_soc_projection'] = [
         ? null
         : ($directMarketingSocProjection['status'] ?? 'DIRECT_MARKETING_SOC_PROJECTION_INCOMPLETE'),
 ];
+$marketSocLiveRaw = e3dcReadRegularFileBound('/var/www/html/ramdisk/live_data_py.json', 2097152);
+$marketSocLive = is_string($marketSocLiveRaw) ? @json_decode($marketSocLiveRaw, true) : null;
+$data['market_soc_trajectory'] = e3dcMarketSocTrajectoryForDisplay($storagePlanMeta, $marketSocLive);
 $data['direct_marketing_trajectory'] = forecastDirectMarketingTrajectoryForDisplay(
     $storagePlanMeta,
     $forecastRequiresDirectMarketingPrice,

@@ -800,6 +800,15 @@ function applyForecastSocSmoothing(soc, startIndex = 0) {
     return smoothed.map(v => v !== null && v !== undefined ? Number(v.toFixed(2)) : v);
 }
 
+function vehicleSocBadgeAgeText(ageSeconds) {
+    if (ageSeconds === null || ageSeconds === undefined) return '';
+    const age = Number(ageSeconds);
+    if (!Number.isFinite(age) || age < 0) return '';
+    if (age < 3600) return `vor ${Math.floor(age / 60)} Min.`;
+    if (age < 48 * 3600) return `vor ${Math.floor(age / 3600)} Std.`;
+    return `vor ${Math.floor(age / 86400)} Tagen`;
+}
+
 function vehicleSocAgeText(ageSeconds) {
     const age = Number(ageSeconds);
     if (!Number.isFinite(age) || age < 0) return '';
@@ -835,6 +844,10 @@ function bluelinkRefreshDisplayInfo(data = {}, vehicle = null) {
         timeout: 'Zeitüberschreitung',
         rate_limited: 'Cloud-Limit erreicht',
         authentication_failed: 'Anmeldung abgewiesen',
+        account_logged_out: 'Hersteller-Sitzung abgemeldet',
+        otp_required: 'Einmalcode erforderlich',
+        consent_required: 'Bestätigung erforderlich',
+        pin_missing: 'PIN fehlt',
         vehicle_data_missing: 'Fahrzeugdaten fehlen',
         api_error: 'Cloud-Fehler'
     };
@@ -844,16 +857,16 @@ function bluelinkRefreshDisplayInfo(data = {}, vehicle = null) {
         return {
             available: true,
             warning: true,
-            detail: `${modeLabel}: ${errorLabel}${sourceAgeText ? `; Fahrzeugstand ${sourceAgeText}` : ''}`,
+            detail: (lastError.code === 'account_logged_out' ? (refresh.message || lastError.message) : '') || `${modeLabel}: ${errorLabel}${sourceAgeText ? `; Fahrzeugstand ${sourceAgeText}` : ''}`,
             shortText: errorLabel
         };
     }
-    if (refresh.status === 'failed') {
+    if (refresh.status === 'failed' || refresh.status === 'paused' || refresh.last_error_active === true) {
         const errorLabel = errorLabels[refresh.error_code] || 'Cloud-Abruf fehlgeschlagen';
         return {
             available: true,
             warning: true,
-            detail: `${errorLabel}${sourceAgeText ? `; Fahrzeugstand ${sourceAgeText}` : ''}`,
+            detail: (refresh.error_code === 'account_logged_out' ? refresh.message : '') || `${errorLabel}${sourceAgeText ? `; Fahrzeugstand ${sourceAgeText}` : ''}`,
             shortText: errorLabel
         };
     }
@@ -950,7 +963,7 @@ function vehicleSocDisplayInfo(vehicle, decimals = 1) {
     const estimateWarning = estimateUnconfirmed
         ? 'Schätzwert ohne neuen Fahrzeugwert mehr als 20 Prozentpunkte über dem letzten bestätigten Stand; steuert weder Ziel-SoC noch Ladeende'
         : '';
-    return {known: true, value, valueText, qualifier, standText, ageText, fullText, stale, sourceClass, transportClass, sourceTs,
+    return {known: true, value, valueText, qualifier, standText, ageText, fullText, stale, sourceClass, transportClass, sourceTs, ageSeconds: sourceAge,
         estimateState, estimateWarning};
 }
 
@@ -1231,6 +1244,18 @@ function updateVehiclePage(data) {
     });
 }
 
+// Farbe des Fahrzeug-SoC-Badges: Warnung (gelb) oder Normal (grün); Energiefluss-Badges (#f-…) mit Rahmen.
+function applyVehicleSocBadgeWarning(el, warning) {
+    el.toggleClass('soc-stale', warning);
+    if (String(el.attr('id') || '').startsWith('f-')) {
+        el.toggleClass('text-warning', warning).toggleClass('text-success', !warning)
+            .toggleClass('border-warning', warning).toggleClass('border-success', !warning)
+            .css('background', warning ? 'rgba(255, 193, 7, 0.15)' : 'rgba(16, 185, 129, 0.1)');
+    } else {
+        el.toggleClass('text-bg-warning', warning).toggleClass('text-bg-success', !warning);
+    }
+}
+
 function updateVehicleWidgets(data) {
     const badgesWb1 = [$('#val-car-soc'), $('#f-val-car-soc')];
     const badgesWb2 = [$('#val-car-soc2'), $('#f-val-car-soc2')];
@@ -1311,6 +1336,13 @@ function updateVehicleWidgets(data) {
                 const activeBluelinkRefreshInfo = activeIsCloud
                     ? bluelinkRefreshDisplayInfo(data, activeV)
                     : null;
+                // Warnfarbe und Warnzeichen folgen derselben Bedingung: veralteter oder unbekannter SoC (auch
+                // zwischengespeicherte Schätzwerte), Schätzwarnung oder Warnung bzw. Fehler des Cloud-Abrufs.
+                const cloudWarning = !!(activeSocInfo && (activeSocInfo.stale === true
+                    || (activeSocInfo.known && activeSocInfo.estimateWarning)
+                    || (activeBluelinkRefreshInfo && activeBluelinkRefreshInfo.warning)
+                    || (activeIsCloud && data.bluelink_refresh && (data.bluelink_refresh.last_error_active === true || data.bluelink_refresh.status === 'failed'))));
+                applyVehicleSocBadgeWarning(el, cloudWarning);
                 if (data.car_force_running && activeIsCloud) {
                     if (!el.html().includes('fa-spin')) el.html('<i class="fas fa-sync fa-spin"></i>').show();
                 } else if (isGuest && !activeV) {
@@ -1319,12 +1351,15 @@ function updateVehicleWidgets(data) {
                     const dispName = compactVehicleName(activeV.name);
                     const socInfo = vehicleSocDisplayInfo(activeV, 0);
                     const socKnown = socInfo.known;
-                    const soctxt = socKnown ? `${socInfo.valueText} ${socInfo.qualifier}` : '--';
+                    const cloudAge = socInfo.sourceClass === 'cloud' && socKnown ? vehicleSocBadgeAgeText(socInfo.ageSeconds) : '';
+                    const soctxt = socKnown ? `${socInfo.valueText} ${socInfo.qualifier}${cloudAge ? ` · ${cloudAge}` : ''}` : '--';
                     const socIsSessionEstimate = socKnown
                         && (socInfo.estimateState === 'confirmed' || socInfo.estimateState === 'unconfirmed');
                     const badgeParts = [];
                     if (dispName) badgeParts.push(`<strong>${escapeBadgeHtml(dispName)}</strong>`);
-                    badgeParts.push(socIsSessionEstimate ? escapeBadgeHtml(soctxt) : `${escapeBadgeHtml(soctxt)} SoC`);
+                    const badgeValue = socIsSessionEstimate ? escapeBadgeHtml(soctxt)
+                        : `${escapeBadgeHtml(soctxt)}${activeIsCloud ? '' : ' SoC'}`;
+                    badgeParts.push((cloudWarning ? '⚠ ' : '') + badgeValue);
                     const titleParts = [];
                     if (activeV.name) titleParts.push(String(activeV.name).trim());
                     titleParts.push(socKnown ? socInfo.fullText : 'Fahrzeug-SoC nicht verfügbar');
@@ -1343,7 +1378,8 @@ function updateVehicleWidgets(data) {
                             : '');
                     if (badgeWarningDetail) {
                         titleParts.push(badgeWarningDetail);
-                        txt += ` <i class="fas fa-exclamation-triangle text-warning ms-1" title="${escapeBadgeHtml(badgeWarningDetail)}"></i>`;
+                        if (!cloudWarning) badgeParts[badgeParts.length - 1] = '⚠ ' + badgeParts[badgeParts.length - 1];
+                        txt = badgeParts.join(' | ');
                     }
                     el.html(txt).css('cursor', 'pointer').attr('title', titleParts.filter(Boolean).join(' | ') + '\nSoC vom Auto abrufen (Aufwecken)').show();
                 } else {
@@ -1358,6 +1394,8 @@ function updateVehicleWidgets(data) {
         badgesWb1.forEach(el => {
             if (el.length) {
                 if (data.wb_soc && data.wb_soc > 0) {
+                    // Gespiegelter Wallbox-SoC ohne Fahrzeug: keine Warnfarbe eines vorherigen Fahrzeugs behalten.
+                    applyVehicleSocBadgeWarning(el, false);
                     el.html(`<strong>${data.wb_soc.toFixed(1)}%</strong> SoC`).css('cursor', 'default').attr('title', 'SoC (von Wallbox gespiegelt)').show();
                 } else {
                     el.hide();
@@ -2283,6 +2321,196 @@ function storageCurveBundleAssessment(data, planId) {
     };
 }
 
+// Die geprüfte Marktprojektion bleibt eine eigene Anzeigequelle.
+function marketSocDisplay(data = {}, nowMs = Date.now()) {
+    const t = data.market_soc_trajectory;
+    const fail = reason => ({complete: false, reasonCode: reason, points: [], windows: []});
+    if (data.direct_marketing_enabled === true || t?.reason_code === 'dv_active'
+        || data.direct_marketing?.enabled === true || data.direct_marketing?.active === true) return fail('dv_active');
+    if (!t || t.complete !== true) return fail(t?.reason_code || 'market_plan_unavailable');
+    const finite = value => typeof value === 'number' && Number.isFinite(value);
+    if (t.schema_version !== 'market_soc_trajectory_v1'
+        || !/^sha256:[a-f0-9]{64}$/.test(t.plan_id || '')
+        || t.plan_id !== data.storage_plan_meta?.plan_id) return fail('market_plan_binding_invalid');
+    if (!finite(t.valid_from_ts_ms) || !finite(t.valid_until_ts_ms)
+        || nowMs < t.valid_from_ts_ms || nowMs >= t.valid_until_ts_ms) return fail('market_plan_expired');
+    const sample = t.live_soc_check?.source_ts_ms;
+    if (!finite(sample) || nowMs - sample > 300000 || sample > nowMs + 1000) return fail('live_soc_stale');
+    if (!Array.isArray(t.slots) || !t.slots.length) return fail('market_projection_input_invalid');
+    const points = [];
+    let previous = null;
+    for (const slot of t.slots) {
+        if (!slot || ![slot.start_ts_ms, slot.end_ts_ms, slot.soc_start_pct, slot.soc_end_pct].every(finite)
+            || slot.end_ts_ms <= slot.start_ts_ms || slot.soc_start_pct < 0 || slot.soc_start_pct > 100
+            || slot.soc_end_pct < 0 || slot.soc_end_pct > 100) return fail('market_projection_input_invalid');
+        // Eine Lücke erhält einen Nullpunkt; weder Chart noch SVG verbindet sie.
+        if (previous && (previous.end_ts_ms !== slot.start_ts_ms
+            || previous.soc_end_pct !== slot.soc_start_pct)) {
+            points.push({x: (previous.end_ts_ms + slot.start_ts_ms) / 2, y: null});
+        }
+        points.push({x: slot.start_ts_ms, y: slot.soc_start_pct, action: slot.action, origin: slot.origin});
+        points.push({x: slot.end_ts_ms, y: slot.soc_end_pct, action: slot.action, origin: slot.origin});
+        previous = slot;
+    }
+    const windows = (Array.isArray(t.selected_actions) ? t.selected_actions : []).filter(action =>
+        action && ['hold_economic', 'grid_charge'].includes(action.action)
+        && ['hold_discharge', 'selected_grid_wait', 'grid_charge'].includes(action.origin)
+        && finite(action.start_ts_ms) && finite(action.end_ts_ms) && action.end_ts_ms > action.start_ts_ms);
+    return {complete: true, reasonCode: null, planId: t.plan_id, points, windows,
+        expiresAt: Math.min(t.valid_until_ts_ms, sample + 300001)};
+}
+
+// Eine Live-Entwertung sperrt nur die Marktanzeige bereits laufender Abrufe.
+function marketSocRequestData(data, requestEpoch) {
+    if (requestEpoch === (window._storageMarketEpoch || 0)) return data;
+    const liveView = marketSocDisplay(window._storageLiveData || {});
+    return {...data, market_soc_trajectory: {complete: false,
+        reason_code: liveView.reasonCode || 'market_plan_binding_invalid'}};
+}
+
+function marketSocHint(data = {}) {
+    const view = marketSocDisplay(data);
+    const reason = view.reasonCode || '';
+    if (reason === 'dv_active') return '';
+    let hint = '';
+    if (!view.complete) {
+        if (/expired|stale/.test(reason)) hint = 'Marktplan veraltet';
+        else if (reason === 'live_soc_mismatch') hint = 'Ist-Ladestand weicht vom Plan ab';
+        else if (reason.startsWith('live_soc_')) hint = 'Aktueller Ladestand für den Marktplan nicht verfügbar';
+        else if (reason === 'storage_override_active') hint = 'Sturm- bzw. Preisschutz übersteuert den Marktplan';
+        else if (reason === 'no_market_actions') hint = 'Keine Marktaktionen festgelegt';
+        else hint = 'Marktplan nicht verfügbar';
+    }
+    const candidate = data.storage_plan_meta?.market_plan?.grid_charge_candidate
+        || data.market_plan?.grid_charge_candidate;
+    if (candidate && typeof candidate === 'object') {
+        hint += (hint ? '. ' : '') + 'Weiteres Nachladen möglich, noch nicht festgelegt';
+    }
+    return hint;
+}
+
+function marketSocActionText(action, origin) {
+    if (action === 'grid_charge') return 'Nachladen bei günstigem Preis';
+    if (action === 'hold_economic') return origin === 'selected_grid_wait'
+        ? 'Speicher halten bis zum Nachladen' : 'Speicher halten für teurere Stunden';
+    return '';
+}
+
+function marketSocTooltip(ctx) {
+    if (!ctx.dataset?.marketSoc && !ctx.dataset?.marketWindow) return null;
+    const point = ctx.raw || {};
+    const action = marketSocActionText(point.action, point.origin);
+    if (ctx.dataset.marketWindow) return action;
+    // Zwei kurze Zeilen bleiben auch in schmalen Diagrammen lesbar.
+    return [`SoC-Prognose mit Marktplan: ${Number(point.y).toFixed(1)} %`, ...(action ? [action] : [])];
+}
+
+function marketSocTooltipTitle(items, fallback) {
+    const point = items?.find(item => item.dataset?.marketSoc || item.dataset?.marketWindow)?.raw;
+    return point && Number.isFinite(point.x)
+        ? new Date(point.x).toLocaleString('de-DE', {timeZone: 'Europe/Berlin', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit'})
+        : fallback(items);
+}
+
+const storageMarketWindowsPlugin = {
+    id: 'storageMarketWindows',
+    beforeDatasetsDraw(chart) {
+        const area = chart.chartArea;
+        if (!area || !chart.scales.x) return;
+        chart.ctx.save();
+        chart.ctx.beginPath();
+        chart.ctx.rect(area.left, area.top, area.right - area.left, area.bottom - area.top);
+        chart.ctx.clip();
+        chart.data.datasets.forEach((dataset, index) => {
+            if (!dataset.marketWindow || !chart.isDatasetVisible(index)) return;
+            const left = chart.scales.x.getPixelForValue(dataset.data[0].x);
+            const right = chart.scales.x.getPixelForValue(dataset.data[1].x);
+            chart.ctx.fillStyle = dataset.backgroundColor;
+            chart.ctx.fillRect(left, area.top, right - left, area.bottom - area.top);
+        });
+        chart.ctx.restore();
+    }
+};
+
+function appendMarketSocDatasets(datasets, data, timestamps, yAxisID = 'y1', historyLength = 0) {
+    const view = marketSocDisplay(data);
+    if (!view.complete) return view;
+    if (!timestamps.length || !timestamps.every(ts => typeof ts === 'number' && Number.isFinite(ts))) {
+        return {complete: false, reasonCode: 'market_projection_input_invalid'};
+    }
+    const baseline = datasets.find(dataset => /^Standard-SoC-Prognose|^SoC-Planung/.test(dataset.label));
+    if (baseline) {
+        // Messhistorie bleibt in der bisherigen Reihe; der Vergleich beginnt am Plan.
+        if (historyLength) datasets.push({...baseline, label: 'SoC-Historie (Messwerte) (%)',
+            data: baseline.data.map((value, index) => index < historyLength ? value : null)});
+        baseline.label = 'SoC ohne Marktaktionen (%)';
+        baseline.data = baseline.data.map((value, index) => index < historyLength ? null : value);
+        baseline.borderDash = [4, 4]; baseline.borderWidth = 1; baseline.segment = undefined;
+    }
+    const from = timestamps[0], until = timestamps[timestamps.length - 1];
+    const fullHorizon = yAxisID !== 'ySoc' && until >= data.timestamps?.[data.timestamps.length - 1];
+    view.chartEnd = fullHorizon ? Math.max(until, view.points[view.points.length - 1].x) : until;
+    // Auch Tages-/Hybridausschnitte behalten sämtliche echten Endpunkte.
+    // Die Achse begrenzt ausschließlich den sichtbaren Bereich.
+    datasets.push({label: 'SoC-Prognose mit Marktplan (%)', data: view.points,
+        marketSoc: true, borderColor: '#20c997', borderWidth: 2.5, pointRadius: 0,
+        tension: 0, spanGaps: false, fill: false, yAxisID, order: 3});
+    view.windows.forEach(action => {
+        const left = Math.max(from, action.start_ts_ms);
+        const right = fullHorizon ? action.end_ts_ms : Math.min(until, action.end_ts_ms);
+        if (left >= right) return;
+        const hold = action.action === 'hold_economic';
+        datasets.push({label: marketSocActionText(action.action, action.origin),
+            marketWindow: true, data: [{x: action.start_ts_ms, y: 0, action: action.action, origin: action.origin},
+                {x: action.end_ts_ms, y: 100, action: action.action, origin: action.origin}],
+            backgroundColor: hold ? 'rgba(245,158,11,0.08)' : 'rgba(59,130,246,0.08)',
+            borderColor: hold ? '#d49b31' : '#6495d4', showLine: false, pointRadius: 0,
+            pointHitRadius: 0, borderWidth: 0, yAxisID, order: 20});
+    });
+    datasets.forEach(dataset => {
+        dataset.data = dataset.data.map((value, index) => value && typeof value === 'object'
+            ? value : {x: timestamps[index], y: value});
+    });
+    if (typeof Chart !== 'undefined' && Chart.register) Chart.register(storageMarketWindowsPlugin);
+    return view;
+}
+
+function marketSocXScale(view, timestamps, fallback) {
+    if (!view.complete) return fallback;
+    const points = view.points.filter(point => point.y !== null);
+    return {type: 'linear', min: timestamps[0],
+        max: view.chartEnd ?? Math.max(timestamps[timestamps.length - 1], points[points.length - 1].x),
+        grid: {color: fallback.grid?.color}, ticks: {color: fallback.ticks?.color,
+            maxTicksLimit: 8, callback: value => new Date(value).toLocaleString('de-DE',
+                {timeZone: 'Europe/Berlin', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'})}};
+}
+
+function scheduleMarketSocExpiry(chart, view, refresh) {
+    if (chart.$marketExpiryTimer) clearTimeout(chart.$marketExpiryTimer);
+    if (view.complete) chart.$marketExpiryTimer = setTimeout(() => {
+        if (chart.data.datasets.some(dataset => dataset.marketSoc)) refresh();
+    }, Math.max(1, view.expiresAt - Date.now()));
+}
+
+function marketSocInteraction(view) {
+    return view.complete ? {mode: 'nearest', axis: 'x', intersect: false} : {mode: 'index', intersect: false};
+}
+
+function renderMarketSparklineSegments(line, points, domain) {
+    line.parentNode.querySelectorAll('[data-market-segment]').forEach(node => node.remove());
+    const segments = [[]];
+    points.forEach(point => {
+        if (point === null) segments.push([]);
+        else segments[segments.length - 1].push(point);
+    });
+    segments.forEach((segment, index) => {
+        const target = index === 0 ? line : line.cloneNode(false);
+        if (index) { target.removeAttribute('id'); target.dataset.marketSegment = '1'; line.parentNode.appendChild(target); }
+        target.setAttribute('points', storageSparklineSvgPoints(segment, domain));
+    });
+}
+
+
 function cacheStorageCurveData(data) {
     if (data && Object.prototype.hasOwnProperty.call(data, 'storage_corridor_now')) {
         window._storageCorridorReceivedAt = typeof performance !== 'undefined' ? performance.now() : null;
@@ -2299,6 +2527,9 @@ function cacheStorageCurveData(data) {
         : '';
     const planChanged = Boolean(previousPlanId && incomingPlanId && previousPlanId !== incomingPlanId);
     const mergedData = {...previousData, ...data};
+    // Teiltelegramme bestätigen keinen zuvor gelesenen Marktplan erneut.
+    mergedData.market_soc_trajectory = Object.prototype.hasOwnProperty.call(data, 'market_soc_trajectory')
+        ? data.market_soc_trajectory : null;
     const incomingHasBundleFields = Object.prototype.hasOwnProperty.call(data, 'storage_sim_curve')
         || Object.prototype.hasOwnProperty.call(data, 'storage_sim_curve_status')
         || (data.storage_plan_meta && Object.prototype.hasOwnProperty.call(
@@ -2464,9 +2695,24 @@ function cacheStorageCurveData(data) {
     if (mergedData.storage_curve_control_soc !== undefined && mergedData.storage_curve_control_soc !== null && !isNaN(parseFloat(mergedData.storage_curve_control_soc))) {
         window._storageControlSoc = parseFloat(mergedData.storage_curve_control_soc);
     }
+    const marketView = marketSocDisplay(mergedData);
+    if (!marketView.complete || planChanged
+        || (liveLineChart?.data.datasets.some(dataset => dataset.marketSoc)
+            && liveLineChart.$marketPlanId !== marketView.planId)) {
+        window._storageMarketEpoch = (window._storageMarketEpoch || 0) + 1;
+    }
+    if (liveLineChart?.data.datasets.some(dataset => dataset.marketSoc)
+        && (!marketView.complete || liveLineChart.$marketPlanId !== marketView.planId)) {
+        clearConfirmedMarketChart(liveLineChart);
+        const hintData = marketView.complete
+            ? {...mergedData, market_soc_trajectory: {complete: false, reason_code: 'market_plan_binding_invalid'}}
+            : mergedData;
+        renderMarketSocHint(hintData, document.getElementById('liveChartContainer'));
+    }
     renderStorageCurveSparkline(mergedData);
     const modal = document.getElementById('storageCurveModal');
-    if (modal && modal.classList.contains('show')) {
+    if ((modal && modal.classList.contains('show'))
+        || _storageCurveChartInstance?.data.datasets.some(dataset => dataset.marketSoc)) {
         _renderStorageCurveChart(_storageCurvePendingSocPoints);
     }
 }
@@ -2527,6 +2773,10 @@ function storageSparklineSeries(data = {}) {
             target: []
         };
     }
+    const market = marketSocDisplay(data);
+    if (market.complete) return {state: 'bound', reasonCode: null, planId: market.planId,
+        source: 'market_planned_soc', target: [],
+        forecast: market.points.map(point => point.y === null ? null : {ts: point.x, soc: point.y})};
     const projectionDisplay = storageSparklineProjectionDisplay(data);
     if (projectionDisplay) {
         return {state: 'projection_hidden', reasonCode: projectionDisplay.reasonCode, planId, forecast: [], target: []};
@@ -2769,7 +3019,10 @@ function renderStorageCurveSparkline(data = {}) {
     const targetLine = document.getElementById('stat-regler-sparkline-target');
     const state = document.getElementById('stat-regler-sparkline-state');
     if (!wrap || !forecastLine || !targetLine || !state) return;
+    forecastLine.parentNode.querySelectorAll('[data-market-segment]').forEach(node => node.remove());
+    if (wrap._marketExpiryTimer) clearTimeout(wrap._marketExpiryTimer);
     const neutralAriaLabel = 'Ladekurvenvorschau';
+    const marketHint = marketSocHint(data);
     let sourceLabel = 'Standard-SoC-Prognose';
     let sourceDetail = 'Basis-SoC ohne DV-, Pre-Dump- und Netzladewirkung';
     const clear = (curveState, text) => {
@@ -2779,9 +3032,11 @@ function renderStorageCurveSparkline(data = {}) {
         wrap.dataset.state = curveState;
         wrap.dataset.runtimeState = curveState;
         wrap.dataset.curveSource = '';
-        wrap.removeAttribute('title');
-        wrap.setAttribute('aria-label', text ? `${neutralAriaLabel}: ${text}` : neutralAriaLabel);
-        state.textContent = text || sourceLabel;
+        const detail = [text, marketHint].filter(Boolean).join('. ');
+        if (marketHint) wrap.title = detail;
+        else wrap.removeAttribute('title');
+        wrap.setAttribute('aria-label', detail ? `${neutralAriaLabel}: ${detail}` : neutralAriaLabel);
+        state.textContent = detail || sourceLabel;
     };
     const meta = data.storage_plan_meta && typeof data.storage_plan_meta === 'object' ? data.storage_plan_meta : {};
     let planTs = Number(meta.generated_at_ts ?? meta.ts ?? data.storage_plan_ts ?? 0);
@@ -2798,6 +3053,13 @@ function renderStorageCurveSparkline(data = {}) {
         clear(unavailable.curveState, unavailable.text);
         return;
     }
+    const plannedMarket = series.source === 'market_planned_soc';
+    if (plannedMarket) {
+        sourceLabel = 'SoC-Prognose mit Marktplan';
+        sourceDetail = 'Erwarteter Ladestand mit festgelegtem Halten und Nachladen';
+        const view = marketSocDisplay(data);
+        wrap._marketExpiryTimer = setTimeout(() => expireConfirmedMarketSoc(data), Math.max(1, view.expiresAt - Date.now()));
+    }
     const plannedDirectMarketing = series.source === 'direct_marketing_planned_soc';
     if (plannedDirectMarketing) {
         sourceLabel = 'DV-SoC · geplant';
@@ -2809,8 +3071,8 @@ function renderStorageCurveSparkline(data = {}) {
     } else {
         forecastLine.removeAttribute('stroke-dasharray');
     }
-    const domainPoints = series.forecast.concat(series.target);
-    const axisPoints = series.state === 'target_only' ? series.target : series.forecast;
+    const domainPoints = series.forecast.concat(series.target).filter(Boolean);
+    const axisPoints = (series.state === 'target_only' ? series.target : series.forecast).filter(Boolean);
     const minTs = axisPoints[0].ts;
     const maxTs = axisPoints[axisPoints.length - 1].ts;
     let minSoc = Math.min(...domainPoints.map(point => point.soc));
@@ -2827,7 +3089,8 @@ function renderStorageCurveSparkline(data = {}) {
         maxSoc = Math.min(100, maxSoc + pad);
     }
     const domain = {minTs, maxTs, minSoc, maxSoc};
-    forecastLine.setAttribute('points', storageSparklineSvgPoints(series.forecast, domain));
+    if (plannedMarket) renderMarketSparklineSegments(forecastLine, series.forecast, domain);
+    else forecastLine.setAttribute('points', storageSparklineSvgPoints(series.forecast, domain));
     targetLine.setAttribute('points', storageSparklineSvgPoints(
         series.target.filter(point => point.ts >= minTs && point.ts <= maxTs),
         domain
@@ -2837,13 +3100,22 @@ function renderStorageCurveSparkline(data = {}) {
         wrap.dataset.state = 'target-only';
         wrap.dataset.runtimeState = 'projection-unavailable';
         wrap.dataset.curveSource = 'target_curve';
-        state.textContent = 'Sollkurve · SoC-Prognose fehlt';
-        wrap.title = `Geplanter Soll-SoC, gestrichelt. ${unavailable.text}. Die Sollkurve ist keine SoC-Prognose.`;
+        state.textContent = 'Sollkurve · SoC-Prognose fehlt' + (marketHint ? '. ' + marketHint : '');
+        wrap.title = `Geplanter Soll-SoC, gestrichelt. ${unavailable.text}. Die Sollkurve ist keine SoC-Prognose.`
+            + (marketHint ? ' ' + marketHint : '');
         wrap.setAttribute('aria-label', wrap.title);
         return;
     }
     wrap.dataset.state = 'fresh';
     wrap.dataset.curveSource = series.source;
+    if (plannedMarket) {
+        state.textContent = sourceLabel;
+        wrap.title = sourceDetail;
+        wrap.setAttribute('aria-label', `${sourceLabel}. ${sourceDetail}`);
+        wrap.dataset.runtimeState = 'planned';
+        return;
+    }
+    if (marketHint) sourceDetail += '. ' + marketHint;
     if (plannedDirectMarketing) {
         const execution = storageSparklineProjectionDisplay(data);
         const executionText = execution ? execution.text : 'Aktuelle Ausführung wird getrennt bewertet';
@@ -3109,9 +3381,13 @@ function updateMobileRingFlow(data, values) {
         if (batIcon) batIcon.className = 'fas fa-car-battery';
         setRingRow('m-ring-bat-row', 'Speicher ruht', false, true);
     }
-    setRingRow('m-ring-home-row', 'Haus ' + formatRingPower(home), home > 20);
-    setRingRow('m-ring-wp-row', 'WP ' + formatRingPower(wpTotal), wpTotal > 20);
-    setRingRow('m-ring-climate-row', 'Klima ' + formatRingPower(climate), climate > 20);
+    setRingRow('m-ring-home-row', (data.home_includes_wp ? (data.home_includes_climate ? 'Haus inkl. WP und Klima ' : 'Haus inkl. WP ') : (data.home_includes_climate ? 'Haus inkl. Klima ' : 'Haus ')) + formatRingPower(home), home > 20);
+    if (String(data.wp_type) === '7') {
+        setRingRow('m-ring-wp-row', 'WP ' + (data.wp === null || data.wp_power_valid === false ? 'unbekannt' : formatRingPower(data.wp)), true);
+    } else {
+        setRingRow('m-ring-wp-row', 'WP ' + formatRingPower(wpTotal), wpTotal > 20);
+    }
+    setRingRow('m-ring-climate-row', 'Klima ' + (data.climate_power_valid === false ? 'unbekannt' : formatRingPower(climate)), data.climate_power_valid === false || climate > 20 || (Array.isArray(data.climate_meters) && data.climate_meters.length > 1));
     setRingRow('m-ring-wb-row', 'WB1 ' + (wbUnknown ? 'unbekannt' : formatRingPower(wb)), wbUnknown || wb > 50);
     setRingRow('m-ring-wb2-row', 'WB2 ' + (wb2Unknown ? 'unbekannt' : formatRingPower(wb2)), wb2Unknown || wb2 > 50);
     setRingText('m-ring-vehicle', '');
@@ -5229,7 +5505,7 @@ function storageOperationalDisplay(data = {}) {
         return {
             state: 'hold',
             label: confirmedHold.title,
-            detail: confirmedHold.status,
+            detail: [confirmedHold.status, data.storage_market_control_text].filter(Boolean).join(' '),
             badge: confirmedHold.badge,
             color: '#f59e0b',
             active: true,
@@ -5241,6 +5517,8 @@ function storageOperationalDisplay(data = {}) {
         };
     }
 
+    const marketText = typeof data.storage_market_control_text === 'string'
+        ? data.storage_market_control_text : '';
     const stateRaw = String(data.storage_state || '').trim();
     const state = stateRaw.toLowerCase();
     const unconfirmedHoldStates = new Set([
@@ -5279,7 +5557,7 @@ function storageOperationalDisplay(data = {}) {
         label: autoStates.has(state)
             ? 'AUTO'
             : storageStateDisplayLabel(stateRaw, data.storage_state_label),
-        detail: '',
+        detail: marketText,
         badge: autoStates.has(state) ? 'E3/DC regelt frei' : '',
         color: colors[state] || '#adb5bd',
         active: !autoStates.has(state),
@@ -6106,6 +6384,95 @@ function storageStateDisplayLabel(state, providedLabel = '') {
     return labels[normalized] || providedLabel || String(state || 'Speicherregelung').replace(/_/g, ' ');
 }
 
+function storageMarketPlanQualityText(data) {
+    const quality = data.storage_market_plan_quality;
+    if (!quality || typeof quality !== 'object') return '';
+    if (quality.status === 'unreadable_plan') return 'Preisplanung: Plan nicht lesbar.';
+    if (quality.status === 'invalid_contract') return 'Preisplanung: Plan ungültig.';
+    if (quality.status === 'other_owner') return 'Preisplanung: Keine Steuerungsfreigabe.';
+    if (quality.complete === true) return 'Preisplanung: Plan vollständig geprüft.';
+    if (quality.quality_bound === false) return 'Preisplanung: Qualität noch nicht bestätigt.';
+    return 'Preisplanung: Eingaben unvollständig.';
+}
+
+function storageBackupReasonText(code) {
+    const reasons = {"backup_live_unknown_or_stale":"Speichermessung unbekannt oder zu alt","backup_disabled": "Beobachtung ausgeschaltet", "backup_plan_missing": "Speicherplan fehlt", "backup_binding_config_or_age_invalid": "Planbindung, Konfiguration oder Planalter ungültig", "backup_switch_invalid": "Schalterwert ungültig", "backup_energy_missing_or_invalid": "Speicherinhalt fehlt oder ist ungültig", "backup_reference_times_missing_or_invalid": "Bestätigte Bezugszeiten fehlen oder sind ungültig", "backup_grid_price_missing_or_invalid": "Explizite Reservepreisgrenze fehlt oder ist ungültig", "backup_timezone_invalid": "Ortszeit ungültig", "backup_reference_duration_invalid": "Bezugsdauer nach Sommerzeitauflösung ungültig", "backup_capacity_energy_or_limits_unknown": "Kapazität, Speicherinhalt, Reserve oder Ladegrenze unbekannt", "backup_calculation_invalid": "Zusatzrechnung mit diesen Daten nicht möglich", "pv_forecast_age_unknown_or_stale": "PV-Prognosealter unbekannt oder zu alt", "load_forecast_age_unknown_or_stale": "Lastprognosealter unbekannt oder zu alt", "forecast_missing_or_invalid": "Prognose fehlt oder ist ungültig", "forecast_horizon_gap": "Prognosehorizont lückenhaft", "pv_forecast_value_or_provenance_invalid": "PV-Wert oder Quellenfrische ungültig", "load_forecast_value_invalid": "Lastprognosewert ungültig", "forecast_source_revision_invalid": "Quellenrevision ungültig", "pv_forecast_issue_mismatch": "PV-Prognose und Metadaten passen nicht zusammen", "chargeable_forecast_unbound": "Ladbarer PV-Anteil nicht gebunden", "chargeable_forecast_unknown": "Ladbarer PV-Anteil unbekannt", "chargeable_dc_forecast_unknown": "Ladbarer DC-Anteil unbekannt", "pv_takeover_unknown": "PV-Übernahme unbekannt", "recommendation_only": "Berechnete Empfehlung ohne Gerätewirkung", "target_exceeds_capacity": "Bedarf übersteigt Kapazität", "backup_observation_stale_or_unknown": "Beobachtung fehlt oder ist zu alt"};
+    return String(code || '').split(';').map(value => reasons[value] || 'Beobachtungsdaten unbekannt').join('; ');
+}
+
+function storageBackupControlText(c) {
+    const n = (v, scale = 1, unit = '') => typeof v === 'number' && Number.isFinite(v)
+        ? (v / scale).toLocaleString('de-DE', {maximumFractionDigits: 2}) + unit : 'unbekannt';
+    const reasons = {
+        backup_manual_suspended: 'manueller Befehl aktiv – Notstrom-Vorhaltung ausgesetzt',
+        backup_island: 'Inselbetrieb – E3DC regelt selbst',
+        backup_external_owner: 'externe Steuerung hat Vorrang',
+        backup_control_stale: 'Reglerstatus fehlt oder ist zu alt',
+        backup_forecast_missing_full_hold: 'Prognose fehlt – volle Notstrom-Vorhaltung wird gehalten',
+        backup_hard_grid_relief: 'harte Hausanschlussgrenze – Lockerung bis zur Gerätereserve angefordert',
+        backup_dc_only_grid_forbidden: 'Quellenbindung verbietet Reserve-Netzladen',
+        backup_forecast_change_pending: 'Reserve-Netzladen wartet auf bestätigte Prognoseänderung',
+        price_gap: 'Preisquelle lückenhaft', no_price_below_limit: 'kein Preis streng unter der Grenze',
+        tariff_stages_missing_or_invalid: 'Tarif fehlt oder ist ungültig', grid_charge_disabled: 'Reserve-Netzladen aus'
+    };
+    if (c.reason === 'backup_live_unknown_or_stale') {
+        return 'Notstrom-Vorhaltung pausiert: Speichermessung unbekannt – ' + (c.release_confirmed === true
+            ? 'E3DC regelt selbst' : c.remaining_protection === true ? 'bestehender Schutz bleibt wirksam' : 'Rückgabe angefordert, unbestätigt');
+    }
+    if (c.active !== true) return 'Notstrom-Vorhaltung · ' + (reasons[c.reason] || 'pausiert');
+    const job = c.grid_job;
+    const action = c.grid_charging === true && job
+        ? 'lädt aus dem Netz bis ' + n(job.target_energy_wh, 1000, ' kWh')
+            + ' (' + n(job.price_ct, 1, ' ct') + ' < ' + n(c.price_limit_ct, 1, ' ct') + ')'
+        : (typeof c.deficit_wh === 'number' && c.deficit_wh > 0 ? 'Aufbau/Defizit ' + n(c.deficit_wh, 1000, ' kWh') : 'Halten angefordert');
+    return 'Notstrom-Vorhaltung · ' + action + ' · Sollboden ' + n(c.floor_wh, 1000, ' kWh')
+        + ' · Grenze angefordert ' + n(c.requested_discharge_w, 1, ' W')
+        + ' · Readback ' + n(c.confirmed_discharge_w, 1, ' W')
+        + ' · gemessene Akkuleistung ' + n(c.measured_battery_w, 1, ' W')
+        + ' · ' + (reasons[c.reason] || '') + ' · ' + (reasons[c.grid_reason] || 'Reservebedarf geprüft')
+        + ' · keine Garantie physischer Nichtunterschreitung';
+}
+
+function storageBackupObservationText(data) {
+    const control = data?.storage_backup_hold_control;
+    if (control?.mode === 2) return storageBackupControlText(control);
+    const b = data?.storage_backup_hold_observation;
+    if (!b || b.enabled !== true) return '';
+    const n = (value, scale = 1, unit = '') => typeof value === 'number' && Number.isFinite(value)
+        ? (value / scale).toLocaleString('de-DE', {maximumFractionDigits: 2}) + unit : 'unbekannt';
+    const gridReasons = {price_gap: 'Preisquelle lückenhaft', no_price_below_limit: 'Kein Preisfenster unter der Grenze',
+        tariff_stages_missing_or_invalid: 'Tarifstufen fehlen oder sind ungültig', recommendation_only: 'nur gerechnet'};
+    const when = value => typeof value === 'number' && Number.isFinite(value)
+        ? new Date(value).toLocaleString('de-DE', {timeZone: b.timezone || 'Europe/Berlin'}) : 'unbekannt';
+    const utc = value => typeof value === 'number' && Number.isFinite(value)
+        ? new Date(value).toISOString() : 'unbekannt';
+    if (b.valid !== true) return 'Notstrom-Vorhaltung · nur Beobachtung · unbekannt: ' + storageBackupReasonText(b.reason);
+    return 'Notstrom-Vorhaltung · nur Beobachtung · berechnet um ' + when(b.calculated_at_ts_ms)
+        + ' mit ' + n(b.calculated_energy_wh, 1000, ' kWh') + ', aktuell ' + n(b.current_energy_wh, 1000, ' kWh')
+        + ' · jetzt ' + n(b.floor_wh, 1000, ' kWh')
+        + ' (' + n(b.floor_soc_pct, 1, ' %') + ') · Abendziel ' + n(b.evening_target_wh, 1000, ' kWh')
+        + ' (' + n(b.evening_target_soc_pct, 1, ' %') + ') · Defizit ' + n(b.evening_deficit_wh, 1000, ' kWh') + ' · prognostizierte PV-Übernahme, vier 15-Minuten-Slots, heuristisch: ' + when(b.pv_takeover_ts_ms)
+        + ' · Quellenalter ' + n(b.source_current_age_s ?? b.source_age_s, 60, ' min') + ' · Stand ' + when(b.generated_at_ts_ms)
+        + ' · Netzladeannahme ' + (b.grid_charge?.enabled === true ? n(b.grid_charge.required_kwh, 1, ' kWh')
+            + ' (' + (gridReasons[b.grid_charge.reason] || 'Annahme unbekannt') + ')' : 'aus')
+        + ' · konstante rechnerische Ersatzlast aus Speicherinhalt ' + n(b.emergency_load_w, 1000, ' kW')
+        + ' · Bezugsdauer ' + n(b.reference_duration_h, 1, ' h')
+        + ' · Bezug (UTC) ' + utc(b.cycle_start_ts_ms) + ' · Versorgung bis (UTC) ' + utc(b.reference_until_ts_ms)
+        + ' · PV-Kandidat (UTC) ' + utc(b.pv_takeover_ts_ms)
+        + ' · weitere Deckung nach Übernahme ' + (b.post_takeover_coverage?.status === 'checked'
+            ? 'geprüft bis (UTC) ' + utc(b.post_takeover_coverage.horizon_ts_ms) + ', Defizit '
+                + n(b.post_takeover_coverage.deficit_wh, 1000, ' kWh') : 'ungeprüft')
+        + ' · Punktprognose × 0,8; kein Quantil, CDF/Überschreitung nicht anwendbar; nicht kalibriert'
+        + ' · Quelle ' + (b.forecast_diagnostic?.source === 'pv_forecast.json' ? 'pv_forecast.json' : 'unbekannt')
+        + ' · ursprüngliche Ausgabe (UTC) ' + utc(b.forecast_diagnostic?.original_issue_ts_ms)
+        + ' · Prognosehorizont (UTC) ' + utc(b.forecast_diagnostic?.target_horizon_ts_ms)
+        + ' · Qualität ' + (b.forecast_diagnostic?.quality_status === 'valid' ? 'gültig' : 'unbekannt')
+        + ' · Energiebezug: Speicherinhalt, nutzbare Kapazität; physikalischer Puffer: nicht bewertet'
+        + ' · Netzbetriebsprognose; keine Bestätigung von Inselbetrieb, AC-Reichweite oder physischer Reservehaltung'
+        + ' · frühere Übernahme verkürzt die Restaufgabe ohne höhere Ersatzlast'
+        + ' · ' + storageBackupReasonText(b.reason);
+}
+
 function updateMobileStorageStrip(data) {
     const strip = document.getElementById('m-storage-strip');
     if (!strip || !data) return;
@@ -6263,8 +6630,20 @@ function updateMobileStorageStrip(data) {
     const reason = String(data.storage_reason || '').replace(/\s+/g, ' ').trim();
     const displayReason = directMarketingHold
         ? storageDisplay.detail
-        : (storageDisplay.plannedHint || reason || 'Noch kein Storage-Manager-Status vorhanden.');
+        : (data.storage_market_control_text || storageDisplay.plannedHint || reason || 'Noch kein Storage-Manager-Status vorhanden.');
     setMobileStorageText('m-storage-reason', displayReason);
+    const marketQualityText = storageMarketPlanQualityText(data);
+    setMobileStorageText('m-storage-market-quality', marketQualityText, !!marketQualityText);
+    let backupEl = document.getElementById('m-storage-backup-observation');
+    if (!backupEl) {
+        backupEl = document.createElement('div');
+        backupEl.id = 'm-storage-backup-observation';
+        backupEl.className = 'small text-muted mt-1';
+        strip.appendChild(backupEl);
+    }
+    const backupText = storageBackupObservationText(data);
+    backupEl.textContent = backupText;
+    backupEl.style.display = backupText ? '' : 'none';
     const reasonEl = document.getElementById('m-storage-reason');
     if (reasonEl) reasonEl.title = directMarketingHold ? storageDisplay.badge : (reason || storageDisplay.plannedHint || '');
 }
@@ -6273,6 +6652,82 @@ document.addEventListener('DOMContentLoaded', () => {
     initMobileFlowView();
     initMobileStorageCurveTrigger();
 });
+
+function climateLivePower(data) {
+    if (data.climate_power_valid === false) return null;
+    return Math.max(0, parseFloat(data.climate_power_w ?? data.climate ?? 0) || 0);
+}
+
+function climateMeterSummary(data) {
+    if (!Array.isArray(data.climate_meters)) return '';
+    return data.climate_meters.map(m => `${m.name}: ${m.power_valid ? flowPlainWatts(m.power_w) : 'unbekannt'} · heute ${m.energy_valid ? formatKwh(m.daily_kwh, 2) : 'unbekannt'}`).join(' | ');
+}
+
+function climateMeterRowsHtml(data) {
+    if (!Array.isArray(data.climate_meters) || data.climate_meters.length < 2) return '';
+    return data.climate_meters.map(m => {
+        const power = m.power_valid && m.power_w != null && Number.isFinite(Number(m.power_w)) ? flowPlainWatts(m.power_w) : 'unbekannt';
+        const energy = m.energy_valid && m.daily_kwh != null && Number.isFinite(Number(m.daily_kwh)) ? formatKwh(m.daily_kwh, 2) : 'unbekannt';
+        return `<div class="climate-meter-row" style="overflow-wrap:anywhere">${flowHoverEscape(m.name)}: ${flowHoverEscape(power)} · heute ${flowHoverEscape(energy)}</div>`;
+    }).join('');
+}
+
+function updateClimateMeterDisplay(data) {
+    const oldFlowDetails = document.getElementById('climate-flow-meters');
+    if (oldFlowDetails) oldFlowDetails.remove();
+    const rows = climateMeterRowsHtml(data);
+    const target = document.getElementById('val-climate-card');
+    if (target) {
+        let details = document.getElementById('climate-card-meters');
+        if (rows && !details) {
+            details = document.createElement('div');
+            details.id = 'climate-card-meters';
+            details.className = 'small text-muted';
+            target.parentElement.appendChild(details);
+        }
+        if (details) { details.innerHTML = rows; details.hidden = !rows; }
+    }
+    const ring = document.getElementById('m-ring-climate-row');
+    const ringDetails = document.getElementById('m-ring-climate-meters');
+    if (ring && ringDetails) {
+        ringDetails.innerHTML = rows;
+        if (rows) {
+            ring.setAttribute('role', 'button');
+            ring.setAttribute('tabindex', '0');
+            ring.setAttribute('aria-controls', ringDetails.id);
+            if (!ring.hasAttribute('aria-expanded')) ring.setAttribute('aria-expanded', 'false');
+        } else {
+            ['role', 'tabindex', 'aria-controls', 'aria-expanded'].forEach(key => ring.removeAttribute(key));
+        }
+        ringDetails.hidden = !rows || ring.getAttribute('aria-expanded') !== 'true';
+        if (!ring.dataset.climateDetailsBound) {
+            const toggle = () => {
+                if (!ring.hasAttribute('aria-expanded')) return;
+                const expanded = ring.getAttribute('aria-expanded') !== 'true';
+                ring.setAttribute('aria-expanded', String(expanded));
+                ringDetails.hidden = !expanded;
+            };
+            ring.addEventListener('click', toggle);
+            ring.addEventListener('keydown', event => {
+                if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggle(); }
+            });
+            ring.dataset.climateDetailsBound = '1';
+        }
+    }
+    for (const node of document.querySelectorAll('[data-flow-label-key="home"]')) {
+        node.textContent = data.home_includes_wp ? (data.home_includes_climate ? 'Haus inkl. WP und Klima' : 'Haus inkl. WP') : (data.home_includes_climate ? 'Haus inkl. Klima' : getFlowLabel('home'));
+    }
+}
+
+function climateMeterHistoryDatasets(data) {
+    if (!Array.isArray(data.climate_meters)) return [];
+    const names = {};
+    data.climate_meters.forEach(parts => parts.forEach(m => { names[m.id] = m.name; }));
+    return Object.entries(names).map(([id, name], index) => ({label: name + ' (W)',
+        data: data.climate_meters.map(parts => { const m = parts.find(m => m.id === id); return m && m.power_valid ? m.power_w : null; }),
+        borderColor: index === 0 ? '#0284c7' : '#a78bfa', fill: false, spanGaps: false,
+        tension: 0.3, pointRadius: 0, borderWidth: 1, yAxisID: 'y'}));
+}
 
 function formatWatts(w) {
     w = parseFloat(w);
@@ -6403,6 +6858,7 @@ function flowHoverHtml(card) {
             <strong>${flowHoverEscape(card.total || '--')}</strong>
         </div>
         ${flowHoverItemsHtml(card.items)}
+        ${card.climateMeters ? climateMeterRowsHtml({climate_meters: card.climateMeters}) : ''}
         ${card.note ? `<div class="flow-hover-note">${flowHoverEscape(card.note)}</div>` : ''}
     `;
 }
@@ -6460,7 +6916,7 @@ function updateEnergyFlowHoverCards(data, values = {}) {
     const wb1Total = preferKwh(data.wb_daily_kwh, stats.total_wb_kwh);
     const wb2Total = preferKwh(data.wb2_daily_kwh, stats.total_wb2_kwh);
     const wpTotal = preferKwh(data.wp_daily_display_kwh, stats.total_wp_display_kwh ?? stats.total_wp_kwh);
-    const climateTotal = preferKwh(data.climate_daily_kwh, stats.total_climate_kwh);
+    const climateTotal = data.climate_energy_valid === false ? null : preferKwh(data.climate_daily_kwh, stats.total_climate_kwh);
     const wpSourceItems = [
         {label: 'PV', value: kwh('pv_wp_kwh'), color: getFlowColor('pv')},
         {label: 'Batterie', value: kwh('bat_wp_kwh'), color: getFlowColor('battery')},
@@ -6520,7 +6976,7 @@ function updateEnergyFlowHoverCards(data, values = {}) {
     const gridNow = Math.round(values.grid ?? data.grid ?? 0);
     const batNow = Math.round(values.bat ?? data.bat ?? 0);
     const hsNow = Math.max(0, values.hs ?? data.hs_power ?? 0);
-    const climateNow = Math.max(0, values.climate ?? data.climate_power_w ?? data.climate ?? 0);
+    const climateNow = data.climate_power_valid === false ? null : Math.max(0, values.climate ?? data.climate_power_w ?? data.climate ?? 0);
     const cards = {
         pv: {
             title: hasExternalPvNode ? 'E3DC-PV' : 'Sonne',
@@ -6548,7 +7004,7 @@ function updateEnergyFlowHoverCards(data, values = {}) {
             ].filter(Boolean).join(' ')
         },
         home: {
-            title: 'Haus',
+            title: data.house_consumption_label || 'Haus',
             now: flowPlainWatts(values.home ?? data.home ?? 0),
             totalLabel: 'Verbrauch heute',
             total: flowHoverKwh(stats.total_home_kwh, 1),
@@ -6607,7 +7063,7 @@ function updateEnergyFlowHoverCards(data, values = {}) {
         },
         heatpump: {
             title: 'Wärmepumpe',
-            now: flowPlainWatts(values.wp ?? data.wp ?? 0),
+            now: String(data.wp_type) === '7' && (data.wp_power_valid === false || data.wp === null) ? 'unbekannt' : flowPlainWatts(values.wp ?? data.wp ?? 0),
             totalLabel: 'Verbrauch heute',
             total: flowHoverKwh(wpTotal, 1),
             items: wpSourceItems,
@@ -6623,15 +7079,16 @@ function updateEnergyFlowHoverCards(data, values = {}) {
         },
         climate: {
             title: data.climate_name || 'Klimaanlage',
-            now: flowPlainWatts(climateNow),
+            now: data.climate_power_valid === false ? 'unbekannt' : flowPlainWatts(climateNow),
             totalLabel: 'Verbrauch heute',
-            total: flowHoverKwh(climateTotal, 2),
+            total: data.climate_energy_valid === false ? 'unbekannt' : flowHoverKwh(climateTotal, 2),
             items: [
                 {label: 'PV', value: kwh('pv_climate_kwh'), color: getFlowColor('pv')},
                 {label: 'Batterie', value: kwh('bat_climate_kwh'), color: getFlowColor('battery')},
                 {label: 'Netz', value: kwh('grid_climate_kwh'), color: getFlowColor('grid')}
             ],
-            note: data.climate_online === false ? 'Zähler aktuell offline oder veraltet.' : (data.climate_phase ? `Phase ${String(data.climate_phase).toUpperCase()}` : '')
+            climateMeters: data.climate_meters,
+            note: data.climate_meters ? '' : (data.climate_online === false ? 'Zähler aktuell offline oder veraltet.' : (data.climate_phase ? `Phase ${String(data.climate_phase).toUpperCase()}` : ''))
         }
     };
     Object.entries(cards).forEach(([key, card]) => {
@@ -6647,6 +7104,9 @@ function updateDashboardDailyTiles(data) {
     updateKwhText('#pv-yield-today', pvToday, 1);
     updatePvYieldTitle(data, pvToday);
     updateKwhText('#home-today', stats.total_home_kwh, 1);
+    document.querySelectorAll('[data-house-daily-label]').forEach(el => { el.textContent = data.house_consumption_label || 'Hausverbrauch'; });
+    const homeDaily = document.getElementById('home-today');
+    if (homeDaily) homeDaily.title = data.house_consumption_label || 'Hausverbrauch';
     updateKwhText('#bat-in-today', stats.total_bat_in_kwh, 1);
     updateKwhText('#bat-out-today', stats.total_bat_out_kwh, 1);
     updateKwhText('#grid-in-today', stats.total_grid_in_kwh, 1);
@@ -9067,6 +9527,44 @@ function pushPredumpCandidateDataset(datasets, candidateW, segment = null) {
     datasets.push(dataset);
 }
 
+function renderMarketSocHint(data, container) {
+    if (!container) return;
+    let element = container.querySelector('[data-market-soc-hint]');
+    const text = marketSocHint(data);
+    if (!element && text) {
+        element = document.createElement('div');
+        element.dataset.marketSocHint = '1';
+        element.style.cssText = 'font-size:.78rem;text-align:center;padding:4px 8px;color:#d49b31;';
+        container.appendChild(element);
+    }
+    if (element) { element.textContent = text; element.hidden = !text; }
+}
+
+function expireMarketSocChart(chart, view, baseline, xScale, data, container) {
+    chart.$marketPlanId = view.complete ? view.planId : null;
+    chart.$marketBaseline = view.complete ? baseline : null;
+    chart.$marketBaselineXScale = xScale;
+    scheduleMarketSocExpiry(chart, view, () => expireConfirmedMarketSoc(data));
+}
+
+function expireConfirmedMarketSoc(data) {
+    const view = marketSocDisplay(data);
+    if (view.complete) return;
+    // Der erste Fristablauf entwertet die Bestätigung in allen Ansichten.
+    cacheStorageCurveData({market_soc_trajectory: {complete: false, reason_code: view.reasonCode}});
+}
+
+function clearConfirmedMarketChart(chart) {
+    if (!chart || !chart.$marketBaseline || !chart.data.datasets.some(dataset => dataset.marketSoc)) return;
+    chart.data.datasets = chart.$marketBaseline;
+    chart.options.scales.x = chart.$marketBaselineXScale;
+    chart.options.interaction = marketSocInteraction({complete: false});
+    if (chart.$marketExpiryTimer) clearTimeout(chart.$marketExpiryTimer);
+    chart.$marketBaseline = null;
+    chart.$marketPlanId = null;
+    chart.update('none');
+}
+
 function updateForecastProjectionStatus(data, directMarketingView = null) {
     const container = document.getElementById('liveChartContainer');
     if (!container) return;
@@ -9153,6 +9651,8 @@ function clearForecastProjectionStatus() {
     const status = container
         ? container.querySelector('[data-forecast-projection-status]')
         : null;
+    const marketHint = container ? container.querySelector('[data-market-soc-hint]') : null;
+    if (marketHint) { marketHint.hidden = true; marketHint.textContent = ''; }
     if (!status) return;
     status.hidden = true;
     status.textContent = '';
@@ -9656,7 +10156,8 @@ function energyFlowConsumptionValidity(data) {
     return {
         home: known(Number.isFinite(parseFloat(data.home)) ? data.home : data.home_raw),
         wallbox: !wallboxConfiguredFlag(data, 1) || (!wallboxObservationUnknown(data, 'wb') && known(data.wb)),
-        wallbox2: !wallboxConfiguredFlag(data, 2) || (!wallboxObservationUnknown(data, 'wb2') && known(data.wb2))
+        wallbox2: !wallboxConfiguredFlag(data, 2) || (!wallboxObservationUnknown(data, 'wb2') && known(data.wb2)),
+        ...(data.climate_power_valid === undefined ? {} : {climate: data.climate_power_valid === true})
     };
 }
 
@@ -10383,6 +10884,7 @@ function loadJsLiveChart(hours, file = null) {
                 datasets = [{ label: 'Heizstab Leistung (W)', data: data.hs || [], borderColor: getFlowColor('heater', '#fd7e14'), backgroundColor: flowColorAlpha('heater', 0.15, '#fd7e14'), fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y' }];
             } else if (CURRENT_VIEW === 'climate') {
                 datasets = [{ label: 'Klima Leistung (W)', data: data.climate || [], borderColor: getFlowColor('climate', '#38bdf8'), backgroundColor: flowColorAlpha('climate', 0.16, '#38bdf8'), fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y' }];
+                datasets.push(...climateMeterHistoryDatasets(data));
             } else if (CURRENT_VIEW === 'wp') {
                 datasets = [{ label: 'WP Leistung (W)', data: data.wp, borderColor: getFlowColor('heatpump', '#f97316'), backgroundColor: flowColorAlpha('heatpump', 0.16, '#f97316'), fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2, yAxisID: 'y' }];
                 if (data.wp_vl && data.wp_vl.some(v => v !== null)) {
@@ -10722,6 +11224,7 @@ function renderForecastKwhSummary(data = {}) {
 
 function loadJsForecastChart(file = '') {
     const requestGeneration = beginJsChartRequest('forecast');
+    const marketEpoch = window._storageMarketEpoch || 0;
     const url = file ? 'get_forecast_data.php?file=' + encodeURIComponent(file) : 'get_forecast_data.php';
     renderForecastKwhSummary({});
 
@@ -10729,10 +11232,16 @@ function loadJsForecastChart(file = '') {
         .then(r => r.json())
         .then(data => {
             if (!isCurrentJsChartRequest('forecast', requestGeneration)) return;
+            const marketData = marketSocRequestData(data, marketEpoch);
             renderForecastKwhSummary(data);
+            updatePvForecastDiagnostics(data);
             const directMarketingView = renderDirectMarketingForecastChart(data, {exclusive: true});
             updateForecastProjectionStatus(data, directMarketingView);
-            if (data.error || !data.labels || data.labels.length === 0) return;
+            renderMarketSocHint(marketData, document.getElementById('liveChartContainer'));
+            if (data.error || !data.labels || data.labels.length === 0) {
+                clearConfirmedMarketChart(liveLineChart);
+                return;
+            }
 
 
 
@@ -10833,12 +11342,17 @@ function loadJsForecastChart(file = '') {
                 yAxes['y2'] = { type: 'linear', display: true, position: 'right', grid: { drawOnChartArea: false }, ticks: { color: textColor } };
             }
 
+            const marketBaseline = datasets.map(dataset => ({...dataset, data: Array.isArray(dataset.data) ? dataset.data.slice() : []}));
+            const marketView = appendMarketSocDatasets(datasets, marketData, data.timestamps || []);
+            const marketXScale = marketSocXScale(marketView, data.timestamps || [], forecastTimeContext.xScale);
             datasets = applyHiddenState(datasets);
             const forecastTooltipFilter = function(item) {
                 if (item.dataset && item.dataset.label && item.dataset.label.includes('__HIDDEN__')) return false;
                 return true;
             };
             const forecastTooltipLabel = (ctx) => {
+                const marketText = marketSocTooltip(ctx);
+                if (marketText !== null) return marketText;
                 let unit = 'W'; let l = ctx.dataset.label;
                 if (l && l.includes('__HIDDEN__')) return '';
                 if (l.includes('(%)') || l.includes('SoC')) unit = '%'; else if (l.toLowerCase().includes('preis')) unit = 'ct/kWh';
@@ -10868,6 +11382,7 @@ function loadJsForecastChart(file = '') {
 
             if (liveLineChart) {
                 liveLineChart.resetZoom();
+                liveLineChart.options.interaction = marketSocInteraction(marketView);
                 liveLineChart.options.plugins.legend.display = true;
                 liveLineChart.data.labels = forecastTimeContext.labels; liveLineChart.data.datasets = datasets;
                 // Alle zeitabhängigen Optionen ersetzen, damit die Prognose
@@ -10876,18 +11391,18 @@ function loadJsForecastChart(file = '') {
                     ...(liveLineChart.options.plugins.tooltip || {}),
                     filter: forecastTooltipFilter,
                     callbacks: {
-                        title: forecastTimeContext.tooltipTitle,
+                        title: items => marketSocTooltipTitle(items, forecastTimeContext.tooltipTitle),
                         label: forecastTooltipLabel
                     }
                 };
-                liveLineChart.options.scales = { x: forecastTimeContext.xScale, ...yAxes };
+                liveLineChart.options.scales = { x: marketXScale, ...yAxes };
                 liveLineChart.update('none');
             } else {
                 const ctx = document.getElementById('liveChartCanvas').getContext('2d');
                 liveLineChart = new Chart(ctx, {
                     type: 'line', data: { labels: forecastTimeContext.labels, datasets: datasets },
                     options: {
-                        responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
+                        responsive: true, maintainAspectRatio: false, interaction: marketSocInteraction(marketView),
                         plugins: {
                             legend: {
                                 position: 'top',
@@ -10907,7 +11422,7 @@ function loadJsForecastChart(file = '') {
                             tooltip: {
                                 filter: forecastTooltipFilter,
                                 callbacks: {
-                                    title: forecastTimeContext.tooltipTitle,
+                                    title: items => marketSocTooltipTitle(items, forecastTimeContext.tooltipTitle),
                                     label: forecastTooltipLabel
                                 }
                             },
@@ -10915,12 +11430,14 @@ function loadJsForecastChart(file = '') {
                                 pan: { enabled: true, mode: 'x' },
                                 zoom: { wheel: { enabled: true }, pinch: { enabled: true }, mode: 'x' }
                             }
-                        }, scales: { x: forecastTimeContext.xScale, ...yAxes }
+                        }, scales: { x: marketXScale, ...yAxes }
                     }
                 });
                 const canvas = document.getElementById('liveChartCanvas');
                 if (canvas) canvas.ondblclick = () => { if (liveLineChart) liveLineChart.resetZoom(); };
             }
+            expireMarketSocChart(liveLineChart, marketView, marketBaseline, forecastTimeContext.xScale,
+                marketData, document.getElementById('liveChartContainer'));
         })
         .catch(err => {
             if (isCurrentJsChartRequest('forecast', requestGeneration)) {
@@ -10994,6 +11511,7 @@ function chartTooltipLines(context, text) {
 
 function loadJsHybridChart(hours, file = null) {
     const requestGeneration = beginJsChartRequest('hybrid');
+    const marketEpoch = window._storageMarketEpoch || 0;
     currentLiveHours = hours;
 
     // Hälfte der Zeit für Vergangenheit, Hälfte für Zukunft
@@ -11037,9 +11555,11 @@ function loadJsHybridChart(hours, file = null) {
         fetch(urlFore).then(r => r.json())
     ]).then(([data, forecastData]) => {
         if (!isCurrentJsChartRequest('hybrid', requestGeneration)) return;
-        if (data.error) return;
+        if (data.error) { clearConfirmedMarketChart(liveLineChart); return; }
+        const marketData = marketSocRequestData(forecastData, marketEpoch);
         const directMarketingView = renderDirectMarketingForecastChart(forecastData);
         updateForecastProjectionStatus(forecastData, directMarketingView);
+        renderMarketSocHint(marketData, document.getElementById('liveChartContainer'));
         updatePvForecastDiagnostics(forecastData);
         if (forecastData.error || !forecastData.labels) forecastData = { labels: [], pv: [], home: [], bat: [], grid: [], soc: [] };
 
@@ -11339,20 +11859,26 @@ function loadJsHybridChart(hours, file = null) {
             yAxes['y2'] = { type: 'linear', display: true, position: 'right', grid: { drawOnChartArea: false }, ticks: { color: textColor } };
         }
 
+        const marketBaseline = datasets.map(dataset => ({...dataset, data: Array.isArray(dataset.data) ? dataset.data.slice() : []}));
+        const marketView = appendMarketSocDatasets(datasets, marketData, timestamps, 'y1', historyLength);
         datasets = applyHiddenState(datasets);
         const hybridTimeContext = buildCompactChartTimeContext(timestamps, labels, gridColor, textColor, isDarkMode, 8);
         labels = hybridTimeContext.labels;
-        const hybridTooltipTitle = hybridTimeContext.tooltipTitle;
-        const buildHybridXScale = () => hybridTimeContext.xScale;
+        const hybridTooltipTitle = items => marketSocTooltipTitle(items, hybridTimeContext.tooltipTitle);
+        const buildHybridXScale = () => marketView.complete
+            ? marketSocXScale(marketView, timestamps, hybridTimeContext.xScale)
+            : hybridTimeContext.xScale;
         const hybridTooltipFilter = item => {
             if (!item.dataset || String(item.dataset.label || '').includes('__HIDDEN__') || item.raw === null) return false;
             if (item.dataset.label === 'Peak-Ersparnis') {
                 const limit = item.chart.data.datasets.find(dataset => dataset.label === '__HIDDEN__Abregel-Limit');
-                if (limit && chartRawY(item) <= limit.data[item.dataIndex]) return false;
+                if (limit && chartRawY(item) <= (typeof limit.data[item.dataIndex] === 'object' ? limit.data[item.dataIndex]?.y : limit.data[item.dataIndex])) return false;
             }
             return true;
         };
         const hybridTooltipLabel = ctx => {
+            const marketText = marketSocTooltip(ctx);
+            if (marketText !== null) return marketText;
             const label = String(ctx.dataset.label || '');
             if (label.includes('__HIDDEN__') || ctx.raw === null) return '';
             let cleanLabel = label.replace(/\s\([^)]+\)/, '');
@@ -11372,11 +11898,11 @@ function loadJsHybridChart(hours, file = null) {
                 value = Math.abs(value);
             } else if (cleanLabel === 'Peak-Ersparnis') {
                 const limit = ctx.chart.data.datasets.find(dataset => dataset.label === '__HIDDEN__Abregel-Limit');
-                if (limit) value = Math.round(value - limit.data[ctx.dataIndex]);
+                if (limit) value = Math.round(value - (typeof limit.data[ctx.dataIndex] === 'object' ? limit.data[ctx.dataIndex]?.y : limit.data[ctx.dataIndex]));
             }
             const measured = ctx.dataIndex < historyLength || label === 'Aktueller SoC (Messwert)';
             const forecastSeries = ['Sonne', 'PV betrieblich verfügbar', 'Hausverbrauch', 'Batterie', 'Netz', 'SoC',
-                'Standard-SoC-Prognose', 'DV-SoC-Prognose', 'SoC-Planung', 'Wallbox 1', 'Wallbox 2', 'Wärmepumpe', 'Klima', 'Heizstab'];
+                'Standard-SoC-Prognose', 'DV-SoC-Prognose', 'SoC-Planung', 'SoC ohne Marktaktionen', 'SoC-Historie', 'Wallbox 1', 'Wallbox 2', 'Wärmepumpe', 'Klima', 'Heizstab'];
             const sourceLabel = label.replace(/\s\([^)]+\)/g, '').trim();
             const sourceNote = forecastSeries.includes(sourceLabel)
                 ? (measured ? 'Messwert' : (directMarketing && ['PV betrieblich verfügbar', 'Batterie', 'Netz', 'DV-SoC-Prognose'].includes(sourceLabel) ? 'DV-Plan' : 'Prognose')) : '';
@@ -11384,10 +11910,14 @@ function loadJsHybridChart(hours, file = null) {
         };
         const hybridTooltip = {...chartTooltipPlacement(), filter: hybridTooltipFilter,
             callbacks: {title: hybridTooltipTitle,
-                label: ctx => chartTooltipLines(ctx, hybridTooltipLabel(ctx))}};
+                label: ctx => {
+                    const text = hybridTooltipLabel(ctx);
+                    return Array.isArray(text) ? text.flatMap(line => chartTooltipLines(ctx, line)) : chartTooltipLines(ctx, text);
+                }}};
 
         if (liveLineChart) {
             liveLineChart.resetZoom();
+            liveLineChart.options.interaction = marketSocInteraction(marketView);
             liveLineChart.options.plugins.legend.display = true;
             liveLineChart.data.labels = labels; liveLineChart.data.datasets = datasets;
             liveLineChart.options.plugins.tooltip = hybridTooltip;
@@ -11398,7 +11928,7 @@ function loadJsHybridChart(hours, file = null) {
             liveLineChart = new Chart(ctx, {
                 type: 'line', data: { labels: labels, datasets: datasets },
                 options: {
-                    responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false },
+                    responsive: true, maintainAspectRatio: false, interaction: marketSocInteraction(marketView),
                     plugins: {
                         legend: {
                             position: 'top',
@@ -11427,6 +11957,8 @@ function loadJsHybridChart(hours, file = null) {
             if (canvas) canvas.ondblclick = () => { if (liveLineChart) liveLineChart.resetZoom(); };
         }
 
+        expireMarketSocChart(liveLineChart, marketView, marketBaseline, hybridTimeContext.xScale,
+            marketData, document.getElementById('liveChartContainer'));
         scheduleJsChartAutoRefresh('hybrid', requestGeneration, () => {
             const container = document.getElementById('liveChartContainer');
             if (container && container.style.display === 'block') loadJsHybridChart(currentLiveHours, file);
@@ -12090,10 +12622,30 @@ function bindDashboardWallboxPauseButtons() {
     });
 }
 
+const wallboxForceStartMessages = new Map();
+
+function clearWallboxForceStartMessage(wbIdx) {
+    const state = wallboxForceStartMessages.get(String(wbIdx));
+    if (!state) return;
+    clearTimeout(state.timer);
+    $('#' + 'wb-force-start-status-' + wbIdx).text('');
+    $(`[data-dashboard-wb-force-start="${wbIdx}"]`).attr('title', state.title);
+    state.cleared = true;
+}
+
 function triggerWallboxForceStart(wbIdx) {
     wbIdx = String(wbIdx || '1');
     const btn = $(`[data-dashboard-wb-force-start="${wbIdx}"]`);
     if (btn.prop('disabled')) return;
+    const previous = wallboxForceStartMessages.get(wbIdx);
+    if (previous) clearTimeout(previous.timer);
+    const messageState = {title: previous ? previous.title : btn.attr('title'), timer: null, cleared: false};
+    wallboxForceStartMessages.set(wbIdx, messageState);
+    const expireMessage = delay => {
+        clearTimeout(messageState.timer);
+        if (messageState.cleared) return;
+        messageState.timer = setTimeout(() => clearWallboxForceStartMessage(wbIdx), delay);
+    };
     const icon = btn.find('i');
     const statusId = 'wb-force-start-status-' + wbIdx;
     let status = $('#' + statusId);
@@ -12153,14 +12705,20 @@ function triggerWallboxForceStart(wbIdx) {
         .then(payload => {
             const message = payload ? String(payload.message || 'Startanforderung angenommen') : timeoutMessage;
             icon.attr('class', payload ? 'fas fa-check text-success' : 'fas fa-clock text-warning');
-            btn.attr('title', message);
-            status.text(message);
+            if (!messageState.cleared) {
+                btn.attr('title', message);
+                status.text(message);
+            }
+            expireMessage(payload ? 20000 : 60000);
         })
         .catch(err => {
             const message = err && err.message ? err.message : 'Wallbox-Start ist fehlgeschlagen.';
             icon.attr('class', 'fas fa-exclamation-triangle text-danger');
-            btn.attr('title', message);
-            status.text(message);
+            if (!messageState.cleared) {
+                btn.attr('title', message);
+                status.text(message);
+            }
+            expireMessage(60000);
             alert(message);
         })
         .finally(() => {
@@ -12174,14 +12732,57 @@ function triggerWallboxForceStart(wbIdx) {
 window.triggerWallboxForceStart = triggerWallboxForceStart;
 if (typeof $ === 'function') bindDashboardWallboxPauseButtons();
 
+function updateWallboxDataOutage(data) {
+    let anyOutage = false;
+    for (const [slot, prefix] of [[1, 'wb'], [2, 'wb2']]) {
+        const observation = data?.[`${prefix}_observation`];
+        const storageGap = data?.storage_wallbox_data_outage?.active === true
+            && (data.storage_wallbox_data_outage.points || []).some(point => Number(point.id) === slot);
+        const kind = String(data?.[`${prefix}_native_type`] || '').trim().toLowerCase().replace(/[- ]/g, '_');
+        const external = !['native', 'e3dc', 'e3dc_easy', 'e3dc_easy_connect', 'e3dc_legacy', 'e3dc_efy', 'e3dc_auto', 'e3dc_multi', 'e3dc_multi_connect', 'e3dc_multi_connect_ii'].includes(kind);
+        const failed = external && wallboxConfiguredFlag(data, slot) && (storageGap || (!!observation
+            && (observation.valid !== true || data[prefix] === null)));
+        anyOutage = anyOutage || failed;
+        const message = observation?.hint || 'Wallbox ohne Daten – Regelung wie ohne Wallbox. Verbindung bzw. Sicherung der Wallbox prüfen. Externe Last bei Bedarf im Config-Editor unter „Tarif & Strompreise“ → „Geplante Lastfenster“ absichern.';
+        for (const id of [`card-${prefix}-wrapper`, `m-wallbox-outage-${slot}`]) {
+            const card = document.getElementById(id);
+            if (!card) continue;
+            card.classList.toggle('wallbox-data-outage', failed);
+            if (id.startsWith('m-wallbox-outage-')) card.hidden = !failed;
+            let notice = document.getElementById(`${id}-data-outage`);
+            if (failed && !notice) {
+                notice = document.createElement('span');
+                notice.id = `${id}-data-outage`;
+                notice.className = 'wallbox-data-outage-message wallbox-data-outage';
+                notice.setAttribute('role', 'status');
+                card.appendChild(notice);
+            }
+            if (notice) { notice.hidden = !failed; const nextText = failed ? message : ''; if (notice.textContent !== nextText) notice.textContent = nextText; }
+        }
+        const mobileBadge = document.getElementById(`m-wallbox-outage-badge-${slot}`);
+        if (mobileBadge) mobileBadge.classList.toggle('wallbox-data-outage', failed);
+    }
+    const badge = document.getElementById('head-icon-wb');
+    if (badge) {
+        badge.classList.toggle('wallbox-data-outage', anyOutage);
+        if (anyOutage) badge.setAttribute('title', 'Wallbox ohne Daten – Regelung wie ohne Wallbox');
+        else badge.removeAttribute('title');
+    }
+}
+
 function processLiveData(data) {
     if (!data) return;
+    if (data.wb_charging === true || (Number(data.wb) || 0) > 50) clearWallboxForceStartMessage('1');
+    if (data.wb2_charging === true || (Number(data.wb2) || 0) > 50) clearWallboxForceStartMessage('2');
     const wb1Configured = wallboxConfiguredFlag(data, 1);
     const wb2Configured = wallboxConfiguredFlag(data, 2);
     const consumptionValidity = energyFlowConsumptionValidity(data);
+    updateWallboxDataOutage(data);
+    updateClimateMeterDisplay(data);
     cacheStorageCurveData(data);
     renderDirectMarketingDashboardStatus(data);
     publishE3dcLiveData(data);
+    updateMqttHeatpumpDisplay(data);
     updateExtInverterCards(data);
 
     if (data.forecast && data.forecast.length > 0) {
@@ -12266,7 +12867,7 @@ function processLiveData(data) {
     const gridVal = Math.round(data.grid);
     const gridAbs = Math.abs(gridVal);
     const wpVal = parseFloat(data.wp) || 0;
-    const climateVal = Math.max(0, parseFloat(data.climate_power_w ?? data.climate ?? 0) || 0);
+    const climateVal = climateLivePower(data);
 
     // Live Autarkie
     let autarkieLive = calculateLiveAutarky(homeVal, wbVal, wpVal, gridVal, climateVal);
@@ -12278,7 +12879,7 @@ function processLiveData(data) {
         $('#head-pv').text(fmtHead(data.pv)); $('#head-bat').text(fmtHead(batAbs));
         $('#head-soc').text(Math.round(houseSocValue) + '%').attr('title', 'Hausakku-SoC');
         $('#head-home').text(fmtHead(homeVal)); $('#head-grid').text(fmtHead(gridAbs)); $('#head-wb').text((wb1Configured && wallboxObservationUnknown(data, 'wb')) || (wb2Configured && wallboxObservationUnknown(data, 'wb2')) ? '--' : fmtHead(wbVal));
-        if(document.getElementById('head-wp')) $('#head-wp').text(fmtHead(wpVal));
+        if(document.getElementById('head-wp')) $('#head-wp').text(data.wp_power_valid === false || data.wp === null ? '--' : fmtHead(wpVal));
         if(document.getElementById('head-climate')) $('#head-climate').text(fmtHead(climateVal));
     }
 
@@ -12450,7 +13051,7 @@ function processLiveData(data) {
         if (document.getElementById('climate-card-today-value') || document.getElementById('climate-today')) {
             const climateToday = normalizeKwh(data.climate_daily_kwh, null);
             const climateStatsToday = data.stats ? normalizeKwh(data.stats.total_climate_kwh, null) : null;
-            const climateTodayValue = climateToday !== null ? climateToday : climateStatsToday;
+            const climateTodayValue = data.climate_energy_valid === false ? null : (climateToday !== null ? climateToday : climateStatsToday);
             if (document.getElementById('climate-today')) {
                 $('#climate-today').text(formatKwh(climateTodayValue, 2));
             }
@@ -12472,7 +13073,8 @@ function processLiveData(data) {
             const climateStatus = $('#climate-card-status');
             if (climateStatus.length) {
                 const statusParts = [];
-                if (data.climate_online === false) statusParts.push('Zähler offline');
+                if (data.climate_power_valid === false) statusParts.push('unbekannt · Haus inkl. Klima');
+                else if (data.climate_online === false) statusParts.push('Zähler offline');
                 else if (climateVal > 50) statusParts.push('aktiv');
                 else statusParts.push('bereit');
                 const climateForecastKwh = normalizeKwh(data.ml_climate_kwh, null);
@@ -12516,7 +13118,7 @@ function processLiveData(data) {
                 const reason = String(observation?.reason || 'Messwert fehlt');
                 $(`#val-wb${suffix}`).text('--');
                 $(`#wb${suffix}-status`).text('Status unbekannt').attr('title', reason);
-                $(`#wb${suffix}-details`).text('Keine frischen Messwerte').attr('title', reason).show();
+                $(`#wb${suffix}-details`).text(observation?.hint || 'Keine frischen Messwerte').attr('title', reason).show();
                 $(`#icon-wb${suffix}`).removeClass('bg-info text-info bg-warning text-warning bg-success text-success pulsating').addClass('bg-secondary text-secondary');
                 $(`#wb${suffix}-lock-overlay`).hide();
                 $(`#wb${suffix}-kva`).hide();
@@ -12732,7 +13334,7 @@ function processLiveData(data) {
             $('#wb-session-container').hide();
         }
 
-        $('#val-wp').html(formatWatts(wpVal));
+        $('#val-wp').html(heatpumpPowerText(data, wpVal));
         if (wpVal < 100) {
             $('#icon-wp').removeClass('bg-info text-info bg-danger text-danger pulsating blink').addClass('bg-secondary text-muted').css('animation', 'none');
         } else {
@@ -12747,7 +13349,7 @@ function processLiveData(data) {
         const wpStatusBadge = $('#wp-status-badge');
 
         // Synthetisiere data.wp_mode für IDM/Luxtronik, falls das Backend nur Ext-Flags liefert.
-        if (data.wp_mode === undefined || data.wp_mode === null) {
+        if (data.wp_compressor_observation_valid !== false && (data.wp_mode === undefined || data.wp_mode === null)) {
             if (data.idm_ext_ww === 1) data.wp_mode = 1;
             else if (data.idm_ext_hz === 1) data.wp_mode = 0;
             else if (data.idm_ext_khl === 1) data.wp_mode = 2;
@@ -12755,7 +13357,12 @@ function processLiveData(data) {
         }
 
         // Beruhigte WP-Status Logik gegen Script-Flicker
-        if (data.wp_mode !== undefined && data.wp_mode !== null) {
+        if (String(data.wp_type) === '7') {
+            wpStatusBadge.show().removeClass('bg-warning bg-danger bg-primary bg-info pulsating blink').addClass('bg-secondary text-white')
+                .text(data.wp_state_text === null || data.wp_state_text === undefined ? 'unbekannt' : String(data.wp_state_text));
+        } else if (data.wp_compressor_observation_valid === false) {
+            wpStatusBadge.show().removeClass('bg-warning bg-danger bg-primary bg-info pulsating blink').addClass('bg-secondary text-white').text('unbekannt');
+        } else if (data.wp_mode !== undefined && data.wp_mode !== null) {
             wpStatusBadge.show();
             wpStatusBadge.removeClass('bg-secondary bg-warning bg-danger bg-primary bg-info text-dark text-white pulsating blink').css('animation', 'none');
             const luxStage = data.wp_operating_stage_status === 'OK'
@@ -12855,6 +13462,7 @@ function processLiveData(data) {
         } else { mbBadge.removeClass('pulsating').hide(); }
 
         if (data.wp_ww_temp != null) { $('#val-wp-ww').text(data.wp_ww_temp.toFixed(1)); $('#wp-temps').show(); }
+        else { $('#val-wp-ww').text('--'); }
         if (data.wp_rl_temp != null) { $('#wp-rl-label').text(data.wp_rl_source === 'external' ? 'RL-Ext:' : 'RL:'); $('#val-wp-rl').text(data.wp_rl_temp.toFixed(1)); $('#wp-rl-container').show(); $('#wp-temps').show(); }
         else { $('#wp-temps').hide(); }
 
@@ -12974,23 +13582,13 @@ function processLiveData(data) {
                 if (data.elwa_water_temp_c != null) content += ` | Wasser: ${Number(data.elwa_water_temp_c).toFixed(1)}°C`;
                 if (data.elwa_status) content += ` | Status: ${data.elwa_status}`;
             } else if (CURRENT_VIEW === 'climate') {
-                const climateActual = data.climate_power_w || data.climate || 0;
+                const climateActual = data.climate_power_valid === false ? "unbekannt" : (data.climate_power_w || data.climate || 0);
                 content = `Klima: ${climateActual}W`;
                 if (data.climate_daily_kwh != null) content += ` | Heute: ${Number(data.climate_daily_kwh).toFixed(3)} kWh`;
                 if (data.climate_source) content += ` | Quelle: ${data.climate_source}`;
                 if (data.climate_phase) content += ` | Phase: ${String(data.climate_phase).toUpperCase()}`;
             } else if (CURRENT_VIEW === 'wp') {
-                if (data.wp !== undefined) {
-                    content = `WP-Leistung: ${data.wp}W`;
-                    let ww = data.wp_ww_temp || (data.data && data.data.Warmwasser_Ist);
-                    let rl = data.wp_rl_temp || (data.data && data.data.Ruecklauf_Ist);
-                    let vl = data.wp_vl_temp || (data.data && data.data.Vorlauf_Ist);
-                    let khl = data.wp_kaelte_temp || (data.data && (data.data.Kaeltespeicher_Ist || data.data['Kältespeicher_Ist']));
-                    if (ww) content += ` | WW: ${ww.toFixed(1)}°C`;
-                    if (rl) content += ` | RL: ${rl.toFixed(1)}°C`;
-                    if (vl) content += ` | VL: ${vl.toFixed(1)}°C`;
-                    if (khl) content += ` | Kältespeicher: ${khl.toFixed(1)}°C`;
-                }
+                content = heatpumpLiveDetails(data);
             } else if (CURRENT_VIEW === 'bat') {
                 if (data.bat_v !== undefined) {
                     content = `K1: ${data.bat_v}V | ${data.bat_a}A`;
@@ -13064,7 +13662,7 @@ function processLiveData(data) {
         const flowAggregates = updateEnergyFlowAggregates({pv: pvFlow.mainPvW, external_pv: pvFlow.externalPvW, home: homeVal, wallbox: wb1Power, wallbox2: wb2Power, wp: wpVal, hs: hsVal, climate: climateVal, validity: consumptionValidity}, flowView);
         if (wb1Configured) $('#f-val-wb').text(wallboxObservationUnknown(data, 'wb') ? '--' : formatWatts(Math.abs(wb1Power)).replace(/<[^>]*>?/gm, ''));
         if (wb2Configured) $('#f-val-wb2').text(wallboxObservationUnknown(data, 'wb2') ? '--' : formatWatts(Math.abs(wb2Power)).replace(/<[^>]*>?/gm, ''));
-        $('#f-val-wp').text(formatWatts(wpVal).replace(/<[^>]*>?/gm, ''));
+        $('#f-val-wp').text(heatpumpPowerText(data, wpVal).replace(/<[^>]*>?/gm, ''));
         $('#f-val-climate').text(formatWatts(climateVal).replace(/<[^>]*>?/gm, ''));
         $('#f-val-grid').text(formatWatts(gridVal).replace(/<[^>]*>?/gm, '')); $('#f-val-bat').text(formatWatts(batAbs).replace(/<[^>]*>?/gm, ''));
         $('#f-val-hs').text(formatWatts(hsVal).replace(/<[^>]*>?/gm, '')); $('#f-lbl-soc').text(Math.round(data.soc) + '% SoC');
@@ -13181,7 +13779,9 @@ function processMobileData(data) {
         const wb1Configured = wallboxConfiguredFlag(data, 1);
         const wb2Configured = wallboxConfiguredFlag(data, 2);
         const consumptionValidity = energyFlowConsumptionValidity(data);
+    updateClimateMeterDisplay(data);
         publishE3dcLiveData(data);
+    updateMqttHeatpumpDisplay(data);
         updateExtInverterCards(data);
         const timeElem = document.getElementById('live-time');
         if (timeElem) timeElem.innerText = data.time;
@@ -13250,7 +13850,7 @@ function processMobileData(data) {
         let wb = wb1Configured ? (data.wb || 0) : 0;
         let wb2 = wb2Configured ? (data.wb2 || 0) : 0;
         let wp = data.wp || 0;
-        let climate = Math.max(0, parseFloat(data.climate_power_w ?? data.climate ?? 0) || 0);
+        let climate = climateLivePower(data);
 
         updateMobileStorageStrip(data);
         updateMobileRingFlow(data, {pv: pv, bat: bat, grid: grid, home: h, wb: wb, wb2: wb2, wp: wp, hs: hsVal, climate: climate});
@@ -13276,7 +13876,7 @@ function processMobileData(data) {
 
         if (wb1Configured) $('#f-val-wb').html(wallboxObservationUnknown(data, 'wb') ? '--' : formatWatts(wb));
         if (wb2Configured) $('#f-val-wb2').html(wallboxObservationUnknown(data, 'wb2') ? '--' : formatWatts(wb2));
-        $('#f-val-wp').html(formatWatts(wp)); $('#f-val-grid').html(formatWatts(grid));
+        $('#f-val-wp').html(heatpumpPowerText(data, wp)); $('#f-val-grid').html(formatWatts(grid));
         $('#f-val-hs').html(formatWatts(hsVal)); $('#f-val-climate').html(formatWatts(climate)); $('#f-val-bat').html(formatWatts(Math.abs(bat)));
         const hsTempNode = $('#f-val-hs-temp');
         if (hsTempNode.length) {
@@ -13516,8 +14116,8 @@ function processMobileData(data) {
             else if (CURRENT_VIEW === 'wb') { if (data.wb_p1 !== undefined) content = `WB 1 L1: ${livePhaseWattText(data.wb_p1)}W | L2: ${livePhaseWattText(data.wb_p2)}W | L3: ${livePhaseWattText(data.wb_p3)}W`; }
             else if (CURRENT_VIEW === 'wb2') { if (data.wb2_p1 !== undefined) content = `WB 2 L1: ${livePhaseWattText(data.wb2_p1)}W | L2: ${livePhaseWattText(data.wb2_p2)}W | L3: ${livePhaseWattText(data.wb2_p3)}W`; }
             else if (CURRENT_VIEW === 'hs') { const hsActual = data.hs_power || 0; const hsReq = data.hs_requested_w || data.hs_target_w || 0; content = `Heizstab Ist: ${hsActual}W`; if (hsReq > 0 && Math.abs(hsReq - hsActual) > 20) content += ` | Anforderung: ${hsReq}W`; if (data.elwa_water_temp_c != null) content += ` | Wasser: ${Number(data.elwa_water_temp_c).toFixed(1)}°C`; if (data.elwa_status) content += ` | Status: ${data.elwa_status}`; }
-            else if (CURRENT_VIEW === 'climate') { const climateActual = data.climate_power_w || data.climate || 0; content = `Klima: ${climateActual}W`; if (data.climate_daily_kwh != null) content += ` | Heute: ${Number(data.climate_daily_kwh).toFixed(3)} kWh`; if (data.climate_source) content += ` | Quelle: ${data.climate_source}`; if (data.climate_phase) content += ` | Phase: ${String(data.climate_phase).toUpperCase()}`; }
-            else if (CURRENT_VIEW === 'wp') { if (data.wp !== undefined) { content = `WP-Leistung: ${data.wp}W`; let ww = data.wp_ww_temp || (data.data && data.data.Warmwasser_Ist); let rl = data.wp_rl_temp || (data.data && data.data.Ruecklauf_Ist); let vl = data.wp_vl_temp || (data.data && data.data.Vorlauf_Ist); let khl = data.wp_kaelte_temp || (data.data && (data.data.Kaeltespeicher_Ist || data.data['Kältespeicher_Ist'])); if (ww) content += ` | WW: ${ww.toFixed(1)}°C`; if (rl) content += ` | RL: ${rl.toFixed(1)}°C`; if (vl) content += ` | VL: ${vl.toFixed(1)}°C`; if (khl) content += ` | Kältespeicher: ${khl.toFixed(1)}°C`; } }
+            else if (CURRENT_VIEW === 'climate') { const climateActual = data.climate_power_valid === false ? "unbekannt" : (data.climate_power_w || data.climate || 0); content = `Klima: ${climateActual}W`; if (data.climate_daily_kwh != null) content += ` | Heute: ${Number(data.climate_daily_kwh).toFixed(3)} kWh`; if (data.climate_source) content += ` | Quelle: ${data.climate_source}`; if (data.climate_phase) content += ` | Phase: ${String(data.climate_phase).toUpperCase()}`; }
+            else if (CURRENT_VIEW === 'wp') { content = heatpumpLiveDetails(data); }
             else if (CURRENT_VIEW === 'bat') { if (data.bat_v !== undefined) { content = `K1: ${data.bat_v}V | ${data.bat_a}A`; if (data.bat1_v && data.bat1_v > 0) content += ` &nbsp;&bull;&nbsp; K2: ${data.bat1_v}V | ${data.bat1_a}A`; } }
             if (content) { detailsEl.innerHTML = content; detailsEl.style.display = 'block'; } else { detailsEl.style.display = 'none'; }
         }
@@ -13536,6 +14136,47 @@ function showGridHealthModal() {
     if (typeof getCurrentLiveData === 'function' && getCurrentLiveData()) {
         updateGridHealthUI(getCurrentLiveData());
     }
+}
+
+// Beide MQTT-Detailansichten folgen dem vorhandenen Live-Polling.
+function updateMqttHeatpumpDisplay(data) {
+    if (String(data.wp_type) !== '7' || !data.wp_mqtt) return;
+    const units = {power_w:' W',electric_w:' W',heat_kw:' kW',ww_temp:' °C',ww_target_temp:' °C',flow_temp:' °C',return_temp:' °C',outside_temp:' °C'};
+    for (const row of document.querySelectorAll('.mqtt-heatpump [data-mqtt-field]')) {
+        const key = row.dataset.mqttField;
+        const f = key === 'power_w' ? data.wp_mqtt.power : data.wp_mqtt.fields[key];
+        if (!f) continue;
+        const v = f.value;
+        const text = v === null ? 'unbekannt' : (typeof v === 'boolean' ? (v ? 'Ein' : 'Aus') : (typeof v === 'number' ? v.toLocaleString('de-DE', {minimumFractionDigits:key === 'cop' ? 2 : 1,maximumFractionDigits:key === 'cop' ? 2 : 1}) : String(v)) + (units[key] || ''));
+        const parts = {'[data-mqtt-value]':text,'[data-mqtt-age]':f.age_s === null ? 'unbekannt' : `${Math.floor(f.age_s)} s`,
+            '[data-mqtt-source]':(f.topic || 'MQTT: Heizleistung / elektrische Leistung') + (f.reason ? ' · ' + f.reason : '')};
+        for (const [selector,value] of Object.entries(parts)) {
+            const cell = row.querySelector(selector);
+            if (cell) cell.textContent = value;
+        }
+    }
+}
+
+function heatpumpPowerText(data, watts) {
+    if (data.wp_power_valid === false || data.wp === null) return 'unbekannt';
+    return (data.wp_power_estimated === true ? 'ca. ' : '') + formatWatts(watts);
+}
+
+function heatpumpLiveDetails(data) {
+    if (String(data.wp_type) === '7' && data.wp_mqtt) {
+        const escape = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+        return Object.entries(data.wp_mqtt.fields || {}).map(([key, field]) => {
+            const value = field.value === null ? 'unbekannt' : (typeof field.value === 'boolean' ? (field.value ? 'Ein' : 'Aus') : field.value);
+            const age = field.age_s === null ? 'unbekannt' : `${Math.floor(field.age_s)} s`;
+            return `${escape(key)}: ${escape(value)} (${escape(age)}; ${escape(field.topic || field.source)}${field.reason ? '; ' + escape(field.reason) : ''})`;
+        }).join(' | ');
+    }
+    let text = `WP-Leistung: ${heatpumpPowerText(data, data.wp)}`;
+    for (const [label, key] of [['WW', 'wp_ww_temp'], ['RL', 'wp_rl_temp'], ['VL', 'wp_vl_temp'], ['Kältespeicher', 'wp_kaelte_temp']]) {
+        const value = data[key];
+        text += ` | ${label}: ${typeof value === 'number' && Number.isFinite(value) ? value.toFixed(1) + '°C' : 'unbekannt'}`;
+    }
+    return text;
 }
 
 function resolveGridFrequencyDisplay(data) {
@@ -14435,6 +15076,7 @@ function _renderStorageCurveChart(socPoints) {
     function doRender() {
         const currentSocPoints = _storageCurvePendingSocPoints;
         if (_storageCurveChartInstance) {
+            if (_storageCurveChartInstance.$marketExpiryTimer) clearTimeout(_storageCurveChartInstance.$marketExpiryTimer);
             _storageCurveChartInstance.destroy();
             _storageCurveChartInstance = null;
         }
@@ -14761,6 +15403,9 @@ function _renderStorageCurveChart(socPoints) {
                                 ? new Date(items[0].parsed.x).toLocaleTimeString('de-DE', {hour: '2-digit', minute: '2-digit', second: '2-digit'}) : '', 
                             label: ctx => {
                                 const label = ctx.dataset && ctx.dataset.label ? ctx.dataset.label : '';
+                                const marketText = marketSocTooltip(ctx);
+                                if (marketText !== null) return marketText;
+                                if (label === 'SoC ohne Marktaktionen (%)') return label + ': ' + Number(ctx.parsed.y).toFixed(1) + '%';
                                 if (label === 'Soll-SoC') return 'Soll: ' + (ctx.parsed.y !== null ? ctx.parsed.y.toFixed(1) + '%' : '--');
                                 if (label === 'Aktives Regelziel') return 'Aktives Regelziel: ' + (ctx.parsed.y !== null ? ctx.parsed.y.toFixed(1) + '%' : '--');
                                 if (label === 'Unterkante') return 'Unterkante: ' + (ctx.parsed.y !== null ? ctx.parsed.y.toFixed(1) + '%' : '--');
@@ -14836,11 +15481,16 @@ function _renderStorageCurveChart(socPoints) {
                 }
             }]
         };
+        const marketData = window._storageLiveData || {};
+        renderMarketSocHint(marketData, canvas.parentNode);
+        const marketView = appendMarketSocDatasets(chartConfig.data.datasets, marketData, sortedTs, 'ySoc');
+        chartConfig.options.interaction = marketSocInteraction(marketView);
         chartConfig.data.datasets.forEach(dataset => {
             dataset.data = dataset.data.map((value, index) =>
                 value && typeof value === 'object' ? value : {x: sortedTs[index], y: value});
         });
         _storageCurveChartInstance = new Chart(canvas, chartConfig);
+        scheduleMarketSocExpiry(_storageCurveChartInstance, marketView, () => expireConfirmedMarketSoc(marketData));
     }
 
     // Chart.js laden falls nicht vorhanden

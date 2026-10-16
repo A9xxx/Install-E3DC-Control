@@ -65,6 +65,7 @@ from Wallbox import decision as wallbox_decision  # noqa: E402
 import consumer_priority  # noqa: E402
 import heatpump_pv_contract as heatpump_pv_policy  # noqa: E402
 import heatpump_pv_state as heatpump_pv_checkpoint  # noqa: E402
+from Storage.regulation_switch import central_pv_split_scope  # noqa: E402
 from Storage.power_limits import (  # noqa: E402
     _configured_power_limit_w,
     _rscp_power_limit_w,
@@ -97,6 +98,7 @@ from config_validator import write_config_validation  # noqa: E402
 from market_economics import (  # noqa: E402
     PLAN_STALE_GRACE_MS as MARKET_PLAN_STALE_GRACE_MS,  # Eine Stale-Definition
     cfg_bool as market_cfg_bool,
+    reserve_grid_contract,
 )
 from tariff_schedule import (  # noqa: E402
     supports_spot_market_prices,
@@ -121,6 +123,11 @@ from data_models import (  # noqa: E402
     WallboxStatusSnapshot,
     live_power_plausibility,
 )
+try:
+    from Installer.Storage import backup_hold
+except ImportError:
+    from Storage import backup_hold
+
 try:
     from Installer.storage_dispatch_contract import (  # noqa: E402
         build_runtime_overlay,
@@ -406,7 +413,13 @@ WALLBOX_CURVE_PV_ONLY_DISCHARGE_IDLE_MAX_W = 300.0
 WALLBOX_CURVE_PV_ONLY_DISCHARGE_IDLE_HOLD_S = 45.0
 # Frische der Leerlaufbelege (fünf E3DC-Livezyklen); ältere Proben belegen
 # keinen Leerlauf.
-WALLBOX_CURVE_PV_ONLY_DISCHARGE_EVIDENCE_MAX_AGE_S = 15.0
+# Wallbox-Statusproben gelten bis zu diesem Alter als frisch. 30 s statt 15 s: langsame openWB-SimpleAPI-Antworten
+# (≈3,5 s) ergeben Probenabstände bis etwa 16 s; mit 15 s galt die Wallbox kurz vor jeder neuen Probe als veraltet,
+# und die Entladesperre schaltete im Takt der Proben um (fehlende Daten dürfen nichts freigeben).
+WALLBOX_STATUS_SAMPLE_MAX_AGE_S = 30.0
+WALLBOX_CURVE_PV_ONLY_DISCHARGE_EVIDENCE_MAX_AGE_S = WALLBOX_STATUS_SAMPLE_MAX_AGE_S
+# E3DC-Livedaten (live['_ts']) in denselben Wallbox-Belegen bleiben bei 15 s.
+WALLBOX_EVIDENCE_LIVE_MAX_AGE_S = 15.0
 # Größere Lücke zum Vorzyklus: keine durchgehende Beobachtung, neu bewerten.
 WALLBOX_CURVE_PV_ONLY_DISCHARGE_LATCH_MAX_GAP_S = 10.0
 WALLBOX_CURVE_PV_ONLY_DISCHARGE_LATCH_SCHEMA = "wallbox_pv_only_discharge_cap_latch_v1"
@@ -4489,6 +4502,9 @@ def augment_consumer_live(
         "Heatpump_Compressor_Running",
         "Heatpump_Compressor_Observation_Valid",
         "Heatpump_Start_Ready",
+        "Heatpump_Start_Qualified",
+        "Heatpump_Running_Reclaimable",
+        "Heatpump_Demand_Satisfied",
         "Heatpump_Start_Request_W",
         "Heatpump_Start_Demand_Class",
         "Heatpump_PV_Contract",
@@ -4560,6 +4576,16 @@ def augment_consumer_live(
         merged["Heatpump_Start_Ready"] = bool(
             native_status_contract_valid
             and heatpump.get("budget_start_ready") is True
+        )
+        merged["Heatpump_Running_Reclaimable"] = bool(
+            native_power_contract_valid
+            and heatpump.get("budget_running_reclaimable") is True
+        )
+        merged["Heatpump_Start_Qualified"] = bool(
+            native_status_contract_valid and heatpump.get("budget_start_qualified") is True
+        )
+        merged["Heatpump_Demand_Satisfied"] = bool(
+            native_status_contract_valid and heatpump.get("budget_demand_satisfied") is True
         )
         merged["Heatpump_Start_Request_W"] = (
             max(0, heatpump["budget_start_request_w"])
@@ -4970,6 +4996,7 @@ def augment_consumer_live(
             "Heater_Power_Known",
             "Heater_Status_Valid",
             "Heater_Start_Ready",
+            "Heater_Running_Reclaimable",
             "Heater_Start_Request_W",
             "Heizstab_Power",
         ):
@@ -4998,6 +5025,10 @@ def augment_consumer_live(
         )
         merged["Heater_Power_Known"] = heater_measurement_contract_valid
         merged["Heater_Status_Valid"] = heater_measurement_contract_valid
+        merged["Heater_Running_Reclaimable"] = bool(
+            heater_measurement_contract_valid
+            and heater.get("budget_running_reclaimable") is True
+        )
         merged["Heater_Start_Ready"] = bool(
             heater_measurement_contract_valid
             and heater.get("budget_start_ready") is True
@@ -5016,12 +5047,31 @@ def augment_consumer_live(
 
 
 
+def runtime_input_age_s(timestamp: Any, now_s: float) -> Optional[float]:
+    """Alter gelesener Laufzeitdaten; bis 2 s Vorlauf nach ms-Normalisierung.
+
+    Ein Erzeuger kann zwischen Zyklusbeginn und Dateilesen publizieren.
+    Größerer Vorlauf, fehlende und nicht endliche Zeitstempel sind ungültig.
+    Frischeobergrenzen und interne Regleruhren bestimmt weiterhin der Aufrufer.
+    """
+    if type(timestamp) not in (int, float) or type(now_s) not in (int, float):
+        return None
+    stamp, now = float(timestamp), float(now_s)
+    if not math.isfinite(stamp) or not math.isfinite(now) or stamp <= 0.0:
+        return None
+    if stamp > 100_000_000_000.0:
+        stamp /= 1000.0
+    age_s = now - stamp
+    return max(0.0, age_s) if age_s >= -2.0 else None
+
+
 def live_data_age_s(live: Dict[str, Any], now_s: Optional[float] = None) -> float:
     now_s = time.time() if now_s is None else float(now_s)
     ts = safe_float(live.get("_ts"), 0.0)
     if ts <= 0.0:
         return 0.0
-    return max(0.0, now_s - ts)
+    age_s = runtime_input_age_s(ts, now_s)
+    return age_s if age_s is not None else float("inf")
 
 
 @dataclass(frozen=True)
@@ -5081,7 +5131,11 @@ def storage_live_stale_decision(
             "mode": MODE_AUTO,
             "val": max_charge_w,
             "priority": "data_guard",
-            "reason": "Live-Daten %.0fs alt: keine neue aktive Speicher-Vorgabe, E3DC autonom" % live_age_s_value,
+            "reason": (
+                "Live-Daten %.0fs alt: keine neue aktive Speicher-Vorgabe, E3DC autonom" % live_age_s_value
+                if math.isfinite(live_age_s_value) else
+                "Live-Zeitstempel ungültig: keine neue aktive Speicher-Vorgabe, E3DC autonom"
+            ),
             "protected": False,
             "storage_req_w": 0,
             "budget_w": 0,
@@ -6890,9 +6944,9 @@ def build_decision_history_record_with_context(
         path_subcontracts.get("protection") if isinstance(path_subcontracts.get("protection"), dict) else {}
     )
     market_forecast = (
-        payload.get("market_economics_forecast")
-        if isinstance(payload.get("market_economics_forecast"), dict)
-        else {}
+        (payload.get("market_plan_quality") or {}).get("forecast")
+        if isinstance((payload.get("market_plan_quality") or {}).get("forecast"), dict)
+        else payload.get("market_economics_forecast") or {}
     )
     market_grid_job = (
         market_forecast.get("grid_charge_job")
@@ -7305,40 +7359,30 @@ def build_decision_history_record_with_context(
             "market_grid_observed_probe_request_w": max(0, safe_int(payload.get("market_grid_observed_probe_request_w"), 0)),
             "market_grid_observed_probe_reason": str(payload.get("market_grid_observed_probe_reason") or ""),
             "market_economics_charge_profile": str(payload.get("market_economics_charge_profile") or ""),
-            "market_energy_horizon_complete": bool(market_forecast.get("energy_horizon_complete")),
+            "market_control_active": bool(payload.get("market_control_active")),
+            "market_plan_quality": copy.deepcopy(payload.get("market_plan_quality")),
+            "market_control_end": copy.deepcopy(payload.get("market_control_end")),
+            "market_hold_bridge": copy.deepcopy(payload.get("market_hold_bridge")),
+            "market_energy_horizon_complete": market_forecast.get("energy_horizon_complete") if type(market_forecast.get("energy_horizon_complete")) is bool else None,
+            "market_energy_horizon_reason": None if type(market_forecast.get("energy_horizon_complete")) is bool else "forecast_missing_or_invalid",
             "market_energy_horizon_reasons": market_forecast.get("energy_horizon_reasons")
             if isinstance(market_forecast.get("energy_horizon_reasons"), list)
             else [],
-            "market_full_horizon_shortage_wh": safe_float(
-                market_forecast.get("full_horizon_shortage_wh"),
-                0.0,
-            ),
-            "market_economic_shift_need_wh": safe_float(
-                market_forecast.get("economic_shift_need_wh"),
-                0.0,
-            ),
-            "market_hard_available_discharge_wh": safe_float(
-                market_forecast.get("hard_available_discharge_wh"),
-                0.0,
-            ),
-            "market_policy_available_discharge_wh": safe_float(
-                market_forecast.get("policy_available_discharge_wh"),
-                0.0,
-            ),
-            "market_grid_charge_job_eligible": bool(
-                market_forecast.get("grid_charge_job_eligible")
-            ),
-            "market_grid_charge_min_job_wh": safe_float(
-                market_forecast.get("grid_charge_min_job_wh"),
-                0.0,
-            ),
-            "market_grid_charge_job_grid_wh": safe_float(
-                market_grid_job.get(
-                    "job_grid_wh",
-                    market_forecast.get("grid_charge_job_grid_wh"),
-                ),
-                0.0,
-            ),
+            "market_full_horizon_shortage_wh": market_diagnostic_number(market_forecast, "full_horizon_shortage_wh"),
+            "market_full_horizon_shortage_wh_reason": None if market_diagnostic_number(market_forecast, "full_horizon_shortage_wh") is not None else "forecast_value_missing_or_invalid",
+            "market_economic_shift_need_wh": market_diagnostic_number(market_forecast, "economic_shift_need_wh"),
+            "market_economic_shift_need_wh_reason": None if market_diagnostic_number(market_forecast, "economic_shift_need_wh") is not None else "forecast_value_missing_or_invalid",
+            "market_hard_available_discharge_wh": market_diagnostic_number(market_forecast, "hard_available_discharge_wh"),
+            "market_hard_available_discharge_wh_reason": None if market_diagnostic_number(market_forecast, "hard_available_discharge_wh") is not None else "forecast_value_missing_or_invalid",
+            "market_policy_available_discharge_wh": market_diagnostic_number(market_forecast, "policy_available_discharge_wh"),
+            "market_policy_available_discharge_wh_reason": None if market_diagnostic_number(market_forecast, "policy_available_discharge_wh") is not None else "forecast_value_missing_or_invalid",
+            "market_grid_charge_job_eligible": market_forecast.get("grid_charge_job_eligible"),
+            "market_grid_charge_min_job_wh": market_diagnostic_number(market_forecast, "grid_charge_min_job_wh"),
+            "market_grid_charge_min_job_wh_reason": None if market_diagnostic_number(market_forecast, "grid_charge_min_job_wh") is not None else "forecast_value_missing_or_invalid",
+            "market_grid_charge_job_grid_wh": market_diagnostic_number(
+                {"value": market_grid_job.get("job_grid_wh", market_forecast.get("grid_charge_job_grid_wh"))}, "value"),
+            "market_grid_charge_job_grid_wh_reason": None if market_diagnostic_number(
+                {"value": market_grid_job.get("job_grid_wh", market_forecast.get("grid_charge_job_grid_wh"))}, "value") is not None else "forecast_value_missing_or_invalid",
             "market_grid_charge_planned_charge_w": safe_int(
                 market_grid_job.get(
                     "planned_charge_w",
@@ -8455,7 +8499,7 @@ def ep_reserve_recovery_context(
     max_age_s = max(2.0, min(30.0, safe_float(cfg.get("storage_live_stale_guard_s"), 10.0)))
     fresh = bool(
         sample_valid and numeric_soc and source_ts > 0.0
-        and 0.0 <= now_s - source_ts <= max_age_s
+        and ((_input_age_s := runtime_input_age_s(source_ts, now_s)) is not None and _input_age_s <= max_age_s)
         and live.get("RSCP_Sample_Valid") is not False
         and live.get("Power_Decision_Usable") is not False
     )
@@ -9040,6 +9084,7 @@ def build_display(payload: Dict[str, Any], *, now_s: Optional[float] = None) -> 
         "peak_shaving_release": "Lastspitzenregelung freigegeben",
         "market_grid_charge": "Markt-Netzladen",
         "market_grid_wait": "Markt-Netzladen wartet",
+        "external_owner_grid_wait": "Netzladen gesperrt",
         "market_grid_done_hold": "Markt-Netzladen erreicht, halten",
         "market_negative_absorb_grid": "Negativpreis-Aufnahme",
         "market_negative_absorb_wait": "Negativpreis wartet",
@@ -9113,6 +9158,7 @@ def build_display(payload: Dict[str, Any], *, now_s: Optional[float] = None) -> 
         "peak_shaving_release": "Storage Manager",
         "market_grid_charge": "Storage Manager",
         "market_grid_wait": "Storage Manager",
+        "external_owner_grid_wait": "Storage Manager",
         "market_grid_done_hold": "Storage Manager",
         "market_negative_absorb_grid": "Storage Manager",
         "market_negative_absorb_wait": "Storage Manager",
@@ -9595,12 +9641,21 @@ def build_display(payload: Dict[str, Any], *, now_s: Optional[float] = None) -> 
             smartcharge_veto.get("display_text")
             or "E3DC-Wetterladen hält die Batterieladung zurück."
         )
+    central = payload.get("central_pv_split")
+    if isinstance(central, dict):
+        control_owner = "Speicher-Manager"
+        label = "Zentrale PV-Aufteilung (experimentell)"
+        frame = central.get("frame_w")
+        reason = "Kurve zuerst: Akku %d W, Wallbox %s" % (
+            safe_int(central.get("battery_share_w"), 0),
+            "%d W" % frame if frame is not None else "unbekannt (Messung fehlt)",
+        )
     return {
         "manager_title": "Speicher-Regelung",
         "control_owner": control_owner,
         "control_owner_label": f"{control_owner} führt" if control_owner else "",
         "state_label": label,
-        "display_reason": reason,
+        "display_reason": market_control_display_text(payload) or reason,
     }
 
 
@@ -12650,7 +12705,7 @@ def direct_marketing_external_derating_context(
         "sample_valid": sample_valid,
         "decision_usable": decision_usable,
         "timestamp_known": timestamp_known,
-        "live_age_s": round(live_age_s, 2),
+        "live_age_s": round(live_age_s, 2) if math.isfinite(live_age_s) else None,
         "max_age_s": round(max_age_s, 2),
     }
 
@@ -12880,6 +12935,45 @@ def direct_marketing_hard_export_owner_expected(
         or ""
     ).strip()
     return bool(hard and owner == "external_e3dc_luox")
+
+
+def direct_marketing_hard_export_owner_binding(plan, now_s):
+    """Einheitliche Besitzerbindung aus dem aktuellen DV-Planfenster."""
+    window = direct_marketing_current_window(direct_marketing_plan(plan), now_s) or {}
+    constraint = direct_marketing_window_export_constraint(window)
+    binding = {
+        "direct_marketing_hard_export_limit_active": bool(constraint.get("hard")),
+        "direct_marketing_export_constraint_execution_owner": constraint.get("execution_owner"),
+    }
+    return binding if direct_marketing_hard_export_owner_expected(binding) else {}
+
+
+def enforce_direct_marketing_grid_owner(payload):
+    """Automatisches Netzladen übernimmt keinen hart gebundenen DV-Besitzer."""
+    if not direct_marketing_hard_export_owner_expected(payload) or payload.get("mode") != MODE_GRID:
+        return payload
+    if str(payload.get("priority") or "") == "manual":
+        hint = "Manuelles Netzladen: externer Besitzer aktiv"
+        payload["direct_marketing_grid_owner_hint"] = hint
+        if hint not in str(payload.get("reason") or ""):
+            payload["reason"] = str(payload.get("reason") or "") + "; " + hint
+        return payload
+    market = str(payload.get("state") or "").startswith("market_")
+    reason = "Marktladen durch externen Besitzer gesperrt" if market else "Netzladen durch externen Besitzer gesperrt"
+    auto = dict(payload.get("auto_limit") or {})
+    charge_w = max(0, safe_int(payload.get("max_charge_w"), safe_int(payload.get("val"), 0)))
+    if not auto.get("enabled") or auto.get("release"):
+        auto = discharge_block_auto_limit({}, charge_w, reason)
+    payload.update(
+        mode=MODE_AUTO, val=max(0, safe_int(auto.get("max_charge_w"), charge_w)),
+        state="market_grid_wait" if market else "external_owner_grid_wait",
+        reason=reason, protected=True, storage_req_w=0, budget_w=0,
+        auto_limit=auto, direct_marketing_grid_blocked=True,
+        direct_marketing_grid_owner_reason=reason,
+    )
+    if market:
+        payload["market_economics_reason"] = reason
+    return payload
 
 
 def direct_marketing_bind_external_owner_auto_limit(
@@ -16923,7 +17017,12 @@ def market_grid_latched_hold_decision(
                 "grid_charge_job_capped_by_window_room",
                 "comfort_target_reached_by_pv",
                 "grid_charge_need_covered_until_next_low_window",
+                "grid_charge_job_below_minimum",
+                "grid_charge_window_too_short",
+                "margin_below_threshold",
             )
+            and (fill_blocked_reason != "margin_below_threshold"
+                 or previous_name in ("market_grid_charge", "market_grid_done_hold"))
         ):
             return None
         window_end_ms = previous_window_ms
@@ -16936,11 +17035,12 @@ def market_grid_latched_hold_decision(
             # Ende der nutzbaren Preisliste dieses Plans an den Latch binden.
             "market_grid_job_done_price_horizon_end_ts": max(0, safe_int(market_forecast.get("price_horizon_actual_end_ts_ms"), 0)),
         }
-        done_reason = (
-            "need_covered"
-            if fill_blocked_reason == "grid_charge_need_covered_until_next_low_window"
-            else "pv_fills_room"
-        )
+        done_reason = {
+            "grid_charge_need_covered_until_next_low_window": "need_covered",
+            "grid_charge_job_below_minimum": "below_minimum",
+            "grid_charge_window_too_short": "window_delivery_closed",
+            "margin_below_threshold": "margin_closed",
+        }.get(fill_blocked_reason, "pv_fills_room")
     contract = contract if isinstance(contract, dict) else {}
     action = str(contract.get("action") or "")
     if action and action not in MARKET_HOLD_ACTIONS:
@@ -16954,6 +17054,12 @@ def market_grid_latched_hold_decision(
         "Marktpfad: Netzladejob erreicht, Speicher wird bis zum Fensterende gehalten, "
         "PV lädt weiter (kein weiterer Netzladevertrag)"
     )
+    if done_reason == "below_minimum":
+        reason = "Marktpfad: Restauftrag unter Mindestmenge, Speicher wird bis zum Fensterende gehalten; PV lädt weiter"
+    elif done_reason == "window_delivery_closed":
+        reason = "Marktpfad: keine Lieferzeit mehr für einen neuen Auftrag, Speicher wird bis zum Fensterende gehalten; PV lädt weiter"
+    elif done_reason == "margin_closed":
+        reason = "Marktpfad: Restauftrag erreicht die Mindestmarge nicht mehr, Speicher wird bis zum Fensterende gehalten; PV lädt weiter"
     return {
         "state": "market_grid_done_hold",
         "mode": MODE_AUTO,
@@ -17089,7 +17195,10 @@ def market_grid_charge_completion(
         real_need = bool(uncovered_raw is None or safe_float(uncovered_raw, 0.0) > 0.001)
         min_job_wh = max(0.0, safe_float(job.get("min_job_wh"), safe_float(forecast.get("grid_charge_min_job_wh"), 0.0)))
         capacity_wh = max(0.0, safe_float((cfg or {}).get("speichergroesse"), 0.0)) * 1000.0
-        efficiency = min(1.0, max(0.01, safe_float((cfg or {}).get("market_roundtrip_efficiency_pct"), 85.0) / 100.0))
+        primary_efficiency = (cfg or {}).get("market_roundtrip_efficiency_pct")
+        efficiency = min(1.0, max(0.01, safe_float(
+            primary_efficiency if primary_efficiency is not None and str(primary_efficiency).strip() else
+            (cfg or {}).get("direct_marketing_roundtrip_efficiency_pct"), 85.0) / 100.0))
         rise_wh = max(0.0, target - previous_target) / 100.0 * capacity_wh
         job_growth_ok = bool(min_job_wh <= 0.0 or capacity_wh <= 0.0 or rise_wh + 0.001 >= min_job_wh * efficiency)
         # Zielanstieg aus einem Horizontsprung bewaffnet nicht neu – er stammt
@@ -17215,6 +17324,229 @@ def market_hold_slot_bridge_contract(
     return bridged
 
 
+def market_plan_quality(plan: Dict[str, Any], now_s: float) -> Dict[str, Any]:
+    """Planqualität unabhängig vom tatsächlichen Speicher-Owner feststellen."""
+    market = market_economics_plan(plan)
+    canonical = validate_canonical_plan(plan, now_ms=int(now_s * 1000)) if isinstance(plan, ValidatedCanonicalPlanSnapshot) or plan.get("schema_version") == "storage_dispatch_plan_v1" else None
+    errors = market_economics_contract_errors(market, now_s)
+    forecast = market.get("forecast") if isinstance(market.get("forecast"), dict) else {}
+    prices = market.get("price_quality") if isinstance(market.get("price_quality"), dict) else {}
+    blocked = market.get("blocked_reasons") if isinstance(market.get("blocked_reasons"), list) else []
+    legacy_complete = (forecast.get("energy_horizon_complete") is True
+                and prices.get("current_price_complete") is True
+                and prices.get("price_horizon_complete") is True
+                and not any(any(term in str(reason) for term in ("incomplete", "invalid", "missing", "unknown", "unusable")) for reason in blocked))
+    bound_quality = plan.get("market_quality") if isinstance(plan.get("market_quality"), dict) else {}
+    quality_bound = bool(canonical and canonical.get("valid") is True
+                         and canonical.get("market_quality_bound") is True
+                         and bound_quality.get("schema_version") == "market_plan_quality_v1")
+    bound_blocked = bound_quality.get("blocked_reasons")
+    # Ungebundene Legacyqualität kann nur vorsichtiger machen. Altpläne ohne
+    # gebundene Zusammenfassung bleiben lesbar, belegen aber kein Halteende.
+    bound_complete = (quality_bound
+                      and bound_quality.get("energy_horizon_complete") is True
+                      and bound_quality.get("current_price_complete") is True
+                      and bound_quality.get("price_horizon_complete") is True
+                      and isinstance(bound_blocked, list)
+                      and all(isinstance(reason, str) for reason in bound_blocked)
+                      and not any(any(term in reason for term in ("incomplete", "invalid", "missing", "unknown", "unusable")) for reason in bound_blocked))
+    complete = bool(bound_complete and legacy_complete)
+    contract = market_economics_current_contract(market, now_s)
+    authority = next((error for error in errors if error in {
+        "plan_disabled", "commands_not_allowed", "controller_owner_mismatch", "plan_owner_mismatch"}), None)
+    if market.get("shadow") is True:
+        authority = "shadow"
+    if authority:
+        status, reason = "other_owner", authority
+    elif canonical is not None and canonical.get("valid") is not True:
+        status, reason = "invalid_contract", canonical.get("block_reason_code")
+    elif not market:
+        status, reason = "unreadable_plan", "plan_missing"
+    elif errors:
+        status, reason = "invalid_contract", errors[0]
+    elif market.get("active_contract") is not None and not isinstance(market.get("active_contract"), dict):
+        status, reason = "invalid_contract", "contract_schema_invalid"
+    elif contract:
+        status, reason = "active_contract", contract.get("reason")
+    elif market.get("active_contract") is not None:
+        status, reason = "no_current_contract", "contract_not_current"
+    elif complete and bound_quality.get("active_contract_absent") is True:
+        status, reason = "deliberate_release", "complete_plan_without_hold"
+    else:
+        status, reason = "no_current_contract", "planning_inputs_incomplete" if quality_bound else "planning_quality_unbound"
+    # Diagnose bleibt kompakt; die vollständige Zeitreihe gehört zur Plandatei.
+    diagnostic_forecast = {key: copy.deepcopy(forecast[key]) for key in (
+        "energy_horizon_complete", "energy_horizon_reasons", "full_horizon_shortage_wh",
+        "economic_shift_need_wh", "hard_available_discharge_wh", "policy_available_discharge_wh",
+        "grid_charge_job", "grid_charge_job_eligible", "grid_charge_job_grid_wh",
+        "grid_charge_min_job_wh", "grid_charge_planned_charge_w",
+    ) if key in forecast}
+    for key in ("energy_horizon_complete", "grid_charge_job_eligible"):
+        if key in diagnostic_forecast and type(diagnostic_forecast[key]) is not bool:
+            diagnostic_forecast[key] = None
+            diagnostic_forecast[key + "_reason"] = "forecast_value_missing_or_invalid"
+    for key in ("full_horizon_shortage_wh", "economic_shift_need_wh", "hard_available_discharge_wh",
+                "policy_available_discharge_wh", "grid_charge_min_job_wh", "grid_charge_job_grid_wh"):
+        if key in diagnostic_forecast:
+            diagnostic_forecast[key] = market_diagnostic_number(forecast, key)
+            if diagnostic_forecast[key] is None:
+                diagnostic_forecast[key + "_reason"] = "forecast_value_missing_or_invalid"
+    return {"status": status, "reason": reason, "complete": complete,
+            "quality_bound": quality_bound,
+            "plan_id": plan.get("plan_id"),
+            "generated_at_ts_ms": plan.get("generated_at_ts_ms", market.get("created_ts")),
+            "contract_end_ts_ms": market["active_contract"].get("end_ts") if isinstance(market.get("active_contract"), dict) else None,
+            "energy_horizon_complete": forecast.get("energy_horizon_complete") if type(forecast.get("energy_horizon_complete")) is bool else None,
+            "energy_horizon_reason": None if type(forecast.get("energy_horizon_complete")) is bool else "forecast_missing_or_invalid",
+            "forecast": diagnostic_forecast if isinstance(market.get("forecast"), dict) else None, "blocked_reasons": list(blocked)}
+
+
+def market_hold_uncertain_bridge(cfg, plan, previous_state, now_s, max_charge_w):
+    """Nur die zuvor autorisierte Entladesperre zeitlich begrenzt fortführen."""
+    previous = previous_state or {}
+    if previous.get("state") != "market_discharge_hold":
+        return None
+    trust = previous.get("market_hold_trust") or {}
+    previous_limit = previous.get("auto_limit") or {}
+    if (previous_limit.get("enabled") is not True or previous_limit.get("release")
+            or safe_int(previous_limit.get("max_discharge_w"), -1) != 0
+            or safe_int(previous.get("mode"), MODE_AUTO) != MODE_AUTO):
+        return None
+    contract = previous.get("market_economics_contract") or {}
+    start_ms, end_ms = safe_int(contract.get("start_ts"), 0), safe_int(contract.get("end_ts"), 0)
+    now_ms = int(now_s * 1000)
+    if (not trust or contract.get("action") != "hold_discharge"
+            or start_ms <= 0
+            or end_ms - start_ms < MARKET_HOLD_SLOT_BRIDGE_SLOT_MS
+            or (end_ms - start_ms) % MARKET_HOLD_SLOT_BRIDGE_SLOT_MS
+            or end_ms % MARKET_HOLD_SLOT_BRIDGE_SLOT_MS
+            or safe_int(trust.get("contract_end_ts_ms"), 0) != end_ms
+            or str(trust.get("tariff") or "") != str(cfg.get("stromtarif_typ") or "").strip().lower()
+            or not market_economics_storage_action_authorized(cfg, "hold_discharge")
+            or not storage_regulation_enabled(cfg)):
+        return None
+    quality = market_plan_quality(plan, now_s)
+    if quality["status"] not in {"unreadable_plan", "invalid_contract", "no_current_contract"}:
+        return None
+    # Ein abgelaufener Termin bleibt abgelaufen. Kein neuer Slot aus Fehlerdaten.
+    memory = previous.get("market_hold_bridge") or {}
+    first_ms = safe_int(memory.get("first_uncertain_ts_ms"), now_ms)
+    deadline = safe_int(memory.get("deadline_ts_ms"),
+                        min(first_ms + 900000, safe_int(trust.get("expected_replan_ts_ms"), 0) + MARKET_PLAN_STALE_GRACE_MS))
+    last_ms = safe_int(memory.get("last_ts_ms"), safe_int(trust.get("last_ts_ms"), 0))
+    mono = time.monotonic()
+    trusted_mono = safe_float(trust.get("monotonic_s"), mono)
+    mono_deadline = safe_float(memory.get("deadline_monotonic_s"),
+        min(mono + 900.0, trusted_mono + (deadline - safe_int(trust.get("last_ts_ms"), now_ms)) / 1000.0))
+    # Die monotone Frist verhindert eine Verlängerung bei angehaltener Wanduhr.
+    if now_ms < last_ms or now_ms >= deadline or mono < trusted_mono or mono >= mono_deadline:
+        return None
+    contract = dict(contract)
+    contract["slot_bridge"] = True
+    contract["slot_bridge_until_ts"] = deadline
+    bridge = {"first_uncertain_ts_ms": first_ms, "deadline_ts_ms": deadline,
+              "last_ts_ms": now_ms, "deadline_monotonic_s": mono_deadline, "reason": quality["reason"]}
+    previous_limit = previous.get("auto_limit") or {}
+    charge_cap_w = min(max_charge_w, max(0, safe_int(previous_limit.get("max_charge_w"), max_charge_w)))
+    return {"state": "market_discharge_hold", "mode": MODE_AUTO, "val": charge_cap_w,
+            "priority": "market", "protected": True, "storage_req_w": 0, "budget_w": 0,
+            "reason": "Preisplanung wird geprüft. Die bisherige Entladesperre bleibt vorübergehend bestehen.",
+            "market_economics_active": True, "market_economics_action": "hold_discharge",
+            "market_economics_contract": copy.deepcopy(contract),
+            "market_hold_trust": copy.deepcopy(trust), "market_hold_bridge": bridge,
+            "auto_limit": discharge_block_auto_limit(cfg, charge_cap_w, "Preisplanung wird geprüft")}
+
+
+def market_end_fields(cfg, plan, decision, previous_state, now_s):
+    quality = market_plan_quality(plan, now_s)
+    previous = previous_state or {}
+    state = str(decision.get("state") or "")
+    bridge = copy.deepcopy(decision.get("market_hold_bridge") or {})
+    trust = copy.deepcopy(decision.get("market_hold_trust") or {})
+    contract = decision.get("market_economics_contract") or {}
+    limits = decision.get("auto_limit") or {}
+    if (state == "market_discharge_hold" and not bridge and quality["status"] == "active_contract"
+            and limits.get("enabled") is True and not limits.get("release")
+            and safe_int(limits.get("max_discharge_w"), -1) == 0
+            and safe_int(decision.get("mode"), MODE_AUTO) == MODE_AUTO):
+        generation = safe_int(quality.get("generated_at_ts_ms"), 0)
+        if generation > 0:
+            trust = {"plan_id": quality.get("plan_id"), "generated_at_ts_ms": generation,
+                     "expected_replan_ts_ms": (generation // 900000 + 1) * 900000 + 50,
+                     "tariff": str(cfg.get("stromtarif_typ") or "").strip().lower(),
+                     "last_ts_ms": int(now_s * 1000), "monotonic_s": time.monotonic(), "contract_end_ts_ms": contract.get("end_ts")}
+    if state != "market_discharge_hold":
+        trust, bridge = {}, {}
+    ending = copy.deepcopy(previous.get("market_control_end") or {})
+    if state.startswith("market_") and state != "market_house_supply_release" and not bridge:
+        ending = {}
+    elif (str(previous.get("state") or "").startswith("market_")
+          and previous.get("state") != "market_house_supply_release" and not bridge):
+        cause = quality["status"]
+        reason = quality["reason"]
+        if state not in {"market_house_supply_release", "parallel_auto", "parallel_grid_balance_auto"}:
+            cause, reason = "other_owner", state
+        elif quality["status"] != "deliberate_release" and (
+                previous.get("market_hold_bridge")
+                or (previous.get("market_hold_trust") and int(now_s * 1000) >=
+                    safe_int(previous["market_hold_trust"].get("expected_replan_ts_ms"), 0) + MARKET_PLAN_STALE_GRACE_MS)):
+            cause, reason = "bridge_expired", "bounded_hold_deadline_reached"
+        if (not storage_regulation_enabled(cfg)
+                or not market_economics_storage_action_authorized(cfg, "hold_discharge")
+                or ((previous.get("market_hold_trust") or {}).get("tariff") is not None
+                    and previous["market_hold_trust"]["tariff"] != str(cfg.get("stromtarif_typ") or "").strip().lower())):
+            cause, reason = "other_owner", "market_authority_withdrawn"
+        prior_contract = previous.get("market_economics_contract") or {}
+        prior_end = safe_int(prior_contract.get("end_ts"), 0)
+        prior_span = prior_end - safe_int(prior_contract.get("start_ts"), 0)
+        if (cause != "other_owner" and prior_end > 0 and int(now_s * 1000) >= prior_end
+                and (prior_span % MARKET_HOLD_SLOT_BRIDGE_SLOT_MS or prior_end % MARKET_HOLD_SLOT_BRIDGE_SLOT_MS)):
+            cause, reason = "deliberate_release", "partial_hold_ended"
+        ending = {"status": cause, "reason": reason, "ts_ms": int(now_s * 1000),
+                  "plan_id": quality.get("plan_id") or (previous.get("market_hold_trust") or {}).get("plan_id"),
+                  "generated_at_ts_ms": quality.get("generated_at_ts_ms") or (previous.get("market_hold_trust") or {}).get("generated_at_ts_ms"),
+                  "contract_end_ts_ms": (previous.get("market_economics_contract") or {}).get("end_ts")}
+    return {"market_plan_quality": quality, "market_hold_trust": trust,
+            "market_hold_bridge": bridge, "market_control_end": ending,
+            "market_control_active": state.startswith("market_") and state != "market_house_supply_release"}
+
+
+def market_diagnostic_number(forecast, key):
+    value = forecast.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    try:
+        return value if math.isfinite(value) else None
+    except (OverflowError, ValueError):
+        return None
+
+
+def market_control_display_text(payload):
+    state = str(payload.get("state") or "")
+    if state == "ep_reserve_discharge_hold":
+        return "Entladung gesperrt: Notstromreserve. Freigabe nach ausreichender Ladung und stabilen Messwerten."
+    if state == "market_discharge_hold":
+        return ("Preisplanung wird geprüft. Die bisherige Entladesperre bleibt vorübergehend bestehen."
+                if payload.get("market_hold_bridge") else "Akku bleibt für ein späteres teureres Preisfenster reserviert.")
+    ending = payload.get("market_control_end") or {}
+    if not ending:
+        return None
+    if ending.get("status") == "deliberate_release":
+        return "Akku darf das Haus versorgen. Für das spätere Preisfenster wird derzeit keine Energie zurückgehalten."
+    if ending.get("status") == "bridge_expired":
+        return "Preissteuerung beendet: Überbrückungsfrist abgelaufen. Akku darf das Haus versorgen."
+    if ending.get("status") == "other_owner":
+        return "Preissteuerung beendet: Andere Regelung oder Schutzfunktion führt."
+    reasons = {
+        "unreadable_plan": "Preisplan ist derzeit nicht lesbar",
+        "invalid_contract": "Preisvertrag ist ungültig",
+        "no_current_contract": "Kein aktueller Preisvertrag vorhanden",
+    }
+    if ending.get("status") in reasons:
+        return "Preissteuerung beendet: " + reasons[ending["status"]] + ". Akku darf das Haus versorgen."
+    return "Grund für das Ende der Preissteuerung derzeit nicht verfügbar."
+
+
 def market_economics_decision(
     cfg: Dict[str, Any],
     live: Dict[str, Any],
@@ -17226,17 +17558,45 @@ def market_economics_decision(
 ) -> Optional[Dict[str, Any]]:
     market = market_economics_plan(plan)
     contract = market_economics_current_contract(market, now_s)
+    owner_binding = direct_marketing_hard_export_owner_binding(plan, now_s)
+    reserve_contract = reserve_grid_contract(cfg.get('_backup_hold_control'), now_s,
+        capacity_wh=safe_float(cfg.get('speichergroesse'), 0) * 1000,
+        max_charge_w=max_charge_w)
+    reserve_active = bool(reserve_contract)
+    if reserve_active:
+        ordinary_cfg = dict(cfg, _backup_hold_control=None)
+        ordinary_decision = market_economics_decision(ordinary_cfg, live, plan, now_s,
+            max_charge_w, max_discharge_w, previous_state)
+        own_context = cfg.get('_backup_hold_control')
+        if isinstance(own_context, dict):
+            own_context['base_market_fields'] = {k:copy.deepcopy(v) for k,v in (ordinary_decision or {}).items()
+                if k.startswith('market_') or k in ('state','mode','val')}
+            backup_hold_add_limit_component(cfg, 'market', (ordinary_decision or {}).get('auto_limit'))
+        if (contract and contract.get('action') == 'grid_charge'
+                and not market_economics_contract_errors(market, now_s)
+                and market_economics_storage_action_authorized(cfg, 'grid_charge', market, contract)):
+            ordinary = contract.get('forecast') or {}
+            reserve_forecast = reserve_contract['forecast']
+            for key in ('grid_charge_target_soc_pct', 'grid_charge_planned_charge_w'):
+                reserve_forecast[key] = max(safe_float(reserve_forecast.get(key), 0), safe_float(ordinary.get(key), 0))
+        contract = reserve_contract
+        market = dict(market, commands_allowed=True, shadow=False,
+            reason='Reserve-Netzladen', active_contract=contract)
+    quality = market_plan_quality(plan, now_s)
+    if not reserve_active and quality["status"] in {"unreadable_plan", "invalid_contract", "no_current_contract"}:
+        bridged = market_hold_uncertain_bridge(cfg, plan, previous_state, now_s, max_charge_w)
+        if bridged is not None:
+            return bridged
+    if not reserve_active and quality["status"] in {"unreadable_plan", "invalid_contract", "other_owner"}:
+        return market_economics_release_decision(cfg, live, market, contract, max_charge_w,
+                                                max_discharge_w, previous_state, now_s=now_s)
     # Der Fertig-Latch hält bis zum Fensterende auch dann, wenn der Planer nach dem Replan
     # keinen Netzladevertrag mehr liefert (Raum am Fensterende durch PV gefüllt / Bedarf gedeckt) oder auf einen
     # Haltevertrag wechselt – sonst würde der Speicher im günstigen Fenster entladen. Negativpreis-Aufnahme
     # und ein neuer Netzladevertrag laufen weiter durch den regulären Zweig; fehlender/abgelaufener Plan hält nicht.
-    latched_hold = market_grid_latched_hold_decision(cfg, live, market, contract, max_charge_w, previous_state, now_s)
+    latched_hold = None if reserve_active else market_grid_latched_hold_decision(cfg, live, market, contract, max_charge_w, previous_state, now_s)
     if latched_hold is not None:
         return latched_hold
-    if not contract:
-        # Vollslot-Haltevertrag über die Slotgrenze halten, bis der Folgeplan entscheidet
-        # (höchstens MARKET_PLAN_STALE_GRACE_MS); sonst wie bisher Freigabe.
-        contract = market_hold_slot_bridge_contract(market, previous_state, now_s)
     if not contract:
         return market_economics_release_decision(
             cfg,
@@ -17248,7 +17608,7 @@ def market_economics_decision(
             previous_state,
         )
 
-    contract_errors = market_economics_contract_errors(market, now_s)
+    contract_errors = [] if reserve_active else market_economics_contract_errors(market, now_s)
     if contract_errors:
         return market_economics_release_decision(
             cfg,
@@ -17275,7 +17635,7 @@ def market_economics_decision(
         return None
     if not market_economics_storage_released(contract):
         return None
-    if not market_economics_storage_action_authorized(cfg, action, market, contract):
+    if not reserve_active and not market_economics_storage_action_authorized(cfg, action, market, contract):
         return market_economics_release_decision(
             cfg,
             live,
@@ -17286,14 +17646,12 @@ def market_economics_decision(
             previous_state,
         )
 
-    contract, action, dwell_context = market_economics_dwell_contract(
-        cfg,
-        contract,
-        action,
-        now_s,
-        previous_state,
-    )
-    if not market_economics_storage_action_authorized(cfg, action, market, contract):
+    if reserve_active:
+        dwell_context = {}
+    else:
+        contract, action, dwell_context = market_economics_dwell_contract(
+            cfg, contract, action, now_s, previous_state)
+    if not reserve_active and not market_economics_storage_action_authorized(cfg, action, market, contract):
         return market_economics_release_decision(
             cfg,
             live,
@@ -17331,6 +17689,10 @@ def market_economics_decision(
     # Untergrenze 1,0 = SoC-Auflösung (vorher 0,2).
     hysteresis = max(1.0, safe_float(cfg.get("market_target_hysteresis_pct"), MARKET_TARGET_HYSTERESIS_PCT))
     common = {
+        **market_end_fields(cfg, plan, {"state": MARKET_ECONOMICS_STATES.get(action),
+                                      "market_economics_contract": contract,
+                                      "mode": MODE_AUTO,
+                                      "auto_limit": discharge_block_auto_limit(cfg, max_charge_w, "Markthalten")}, previous_state, now_s),
         "priority": "market",
         "protected": True,
         "market_economics_active": True,
@@ -17356,6 +17718,14 @@ def market_economics_decision(
         **market_grid_job_done_fields(previous_state),
     }
 
+    if owner_binding and action in MARKET_GRID_ACTIONS:
+        # Besitz vor jeder Übernahme prüfen; der erlaubte Batterierahmen bleibt.
+        blocked = dict(common, **owner_binding, mode=MODE_GRID, val=max_charge_w,
+            state="market_grid_charge", storage_req_w=0, budget_w=0,
+            auto_limit=discharge_block_auto_limit(cfg, max_charge_w,
+                "Marktladen durch externen Besitzer gesperrt"))
+        return enforce_direct_marketing_grid_owner(blocked)
+
     if action in MARKET_GRID_ACTIONS:
         if action == "negative_price_absorb" and not cfg_bool(cfg, "cheap_grid_boost_enable", False):
             return market_economics_release_decision(
@@ -17372,7 +17742,7 @@ def market_economics_decision(
         # PV lädt weiter, es gibt keinen zweiten Netzladestart im selben Fenster. Ohne bekanntes Fensterende
         # (fehlende Daten) gilt die heutige Freigabe. Negativpreis-Aufnahme behält die reine SoC-Freigabe.
         completion: Dict[str, Any] = {}
-        if action == "grid_charge":
+        if action == "grid_charge" and not reserve_active:
             completion = market_grid_charge_completion(
                 cfg,
                 live,
@@ -17391,7 +17761,7 @@ def market_economics_decision(
             common["market_grid_horizon_change"] = str(completion.get("horizon_change") or "")
             job_done = bool(completion.get("done"))
         else:
-            job_done = bool(soc >= target_soc - hysteresis)
+            job_done = bool(soc >= target_soc if reserve_active else soc >= target_soc - hysteresis)
         if job_done:
             done_window_end_ms = safe_int(completion.get("window_end_ts"), 0)
             if action == "grid_charge" and done_window_end_ms > int(now_s * 1000.0):
@@ -17439,6 +17809,8 @@ def market_economics_decision(
             result.update(common)
             return result
         live_pv_guard = market_grid_charge_live_pv_guard(live)
+        if reserve_active:
+            live_pv_guard = dict(live_pv_guard, active=False)
         if not bool(live_pv_guard.get("frame_usable", True)):
             # Aus einem ungültigen oder stale Netzframe entsteht kein neuer
             # Marktbefehl; der äußere Plausibilitätsbesitzer hält sicher.
@@ -17453,6 +17825,8 @@ def market_economics_decision(
         # fehlende Jobdaten sind keine Freigabe.
         late_fill = forecast.get("late_fill") if isinstance(forecast.get("late_fill"), dict) else {}
         late_fill_start_ms = safe_int(late_fill.get("latest_start_ts"), 0)
+        # required_storage_wh ist ein historischer Late-Fill-Alias für job_grid_wh
+        # (Netzenergie). Alle drei Werte haben denselben Bezug; nicht erneut durch η teilen.
         export_override_job_wh = max(
             0.0,
             safe_float(late_fill.get("job_grid_wh"), 0.0),
@@ -17463,9 +17837,23 @@ def market_economics_decision(
             0.0,
             safe_float(late_fill.get("min_job_wh"), safe_float(forecast.get("grid_charge_min_job_wh"), 0.0)),
         )
+        continuation_job = forecast.get("grid_charge_job") if isinstance(forecast.get("grid_charge_job"), dict) else {}
+        late_fill_window_end_ms = safe_int(late_fill.get("window_end_ts"), safe_int(continuation_job.get("window_end_ts"), 0))
+        previous_grid_running_same_window = bool(
+            action == "grid_charge"
+            and str((previous_state or {}).get("state") or "") == "market_grid_charge"
+            and safe_int((previous_state or {}).get("mode"), -1) == MODE_GRID
+            and late_fill_window_end_ms > 0
+            and safe_int((previous_state or {}).get("market_late_fill_window_end_ts"), 0) == late_fill_window_end_ms
+            and soc < target_soc - hysteresis
+        )
+        continuation_minimum_wh = (
+            0.0 if previous_grid_running_same_window and continuation_job.get("job_running") is True
+            else export_override_min_job_wh
+        )
         export_override_job_open = bool(
-            export_override_job_wh > 100.0
-            and export_override_job_wh + 0.001 >= export_override_min_job_wh
+            export_override_job_wh > 0.001
+            and export_override_job_wh + 0.001 >= continuation_minimum_wh
         )
         export_override_due = bool(late_fill_start_ms <= int(now_s * 1000.0))
         export_absorb_hold_s = max(0.0, safe_float(cfg.get("market_live_export_absorb_hold_s"), 45.0))
@@ -17512,7 +17900,8 @@ def market_economics_decision(
                 or previous_export_absorb_hold
                 or late_fill_due_pv_override
             )
-            # Nicht bei erreichtem/gelatchtem Job, nur für Job >= Mindestjob.
+            # Nicht bei erreichtem/gelatchtem Job; Mindestmenge für Starts,
+            # frische Fortsetzung im identischen Fenster ohne zweites Startminimum.
             and not bool(completion.get("done"))
             and not bool(completion.get("latched"))
             and export_override_job_open
@@ -17565,15 +17954,6 @@ def market_economics_decision(
         # Einmal gestartet, bleibt gestartet – ein beim Replan geschrumpfter Job wirft
         # einen laufenden Netzladevorgang (MODE_GRID) im selben Fenster nicht in die Wartephase zurück, solange das
         # Ziel nicht erreicht ist. Fensterende als Fensteridentität (kein Übertrag in ein neues Fenster).
-        late_fill_window_end_ms = safe_int(late_fill.get("window_end_ts"), 0)
-        previous_grid_running_same_window = bool(
-            action == "grid_charge"
-            and str((previous_state or {}).get("state") or "") == "market_grid_charge"
-            and safe_int((previous_state or {}).get("mode"), -1) == MODE_GRID
-            and late_fill_window_end_ms > 0
-            and safe_int((previous_state or {}).get("market_late_fill_window_end_ts"), 0) == late_fill_window_end_ms
-            and soc < target_soc - hysteresis
-        )
         late_fill_wait_active = bool(
             bool(late_fill.get("wait_active"))
             and late_fill_start_ms > int(now_s * 1000.0)
@@ -17705,7 +18085,7 @@ def market_economics_decision(
             grid_charge_cap_w,
             live,
             max_charge_w=max_charge_w,
-            enabled=bool(action == "grid_charge" and not early_export_absorb),
+            enabled=bool(action == "grid_charge" and not early_export_absorb and not reserve_active),
         )
         if observed_probe["market_grid_observed_probe_active"]:
             charge_w = max(charge_w, min(grid_charge_cap_w, int(observed_probe["market_grid_observed_probe_request_w"])))
@@ -17735,6 +18115,10 @@ def market_economics_decision(
             result["market_forecast_grid_charge_need_wh"] = round(forecast_grid_need_wh, 1)
             # Diagnose – Job nach dem spätesten Start trotz PV-Laden fällig.
             result["market_late_fill_due_pv_override"] = bool(late_fill_due_pv_override)
+        if reserve_active:
+            result['backup_reserve_grid_active'] = True
+            result['backup_reserve_execution_binding'] = reserve_contract['execution_binding']
+            result['reason'] = 'Reserve-Netzladen innerhalb des Preis-Ladepfads'
         result.update(common)
         return result
 
@@ -19171,7 +19555,7 @@ def price_storage_hold_requested(
     request = str(wb_intent.get("battery_request", "") or "").strip().lower()
     if request == "allow_discharge":
         return False
-    intent_fresh = bool(wb_intent) and now_s - safe_float(wb_intent.get("ts"), 0.0) <= 60.0
+    intent_fresh = bool(wb_intent) and ((_input_age_s := runtime_input_age_s(safe_float(wb_intent.get("ts"), 0.0), now_s)) is not None and _input_age_s <= 60.0)
     wb_mode = normalize_wb_mode(wb_intent.get("wb_mode_active", cfg.get("wb1_mode", 0)))
     regulated_by_us = bool(
         intent_fresh
@@ -19255,7 +19639,7 @@ def controlled_wallbox_floor_pv_wait_requested(
 ) -> bool:
     """PV-curve behaviour for a controlled wallbox waiting below wbminSoC."""
     intent_ts = safe_float(wb_intent.get("ts"), 0.0)
-    intent_fresh = bool(wb_intent) and (intent_ts <= 0.0 or now_s - intent_ts <= 90.0)
+    intent_fresh = bool(wb_intent) and (intent_ts <= 0.0 or ((_input_age_s := runtime_input_age_s(intent_ts, now_s)) is not None and _input_age_s <= 90.0))
     if not intent_fresh:
         return False
     wb_mode = normalize_wb_mode(wb_intent.get("wb_mode_active", cfg.get("wb1_mode", 0)))
@@ -19301,7 +19685,7 @@ def controlled_wallbox_auto_freerun_requested(
     measurement_valid: bool = True,
 ) -> bool:
     if wb_intent_fresh is None:
-        wb_intent_fresh = bool(wb_intent) and 0 <= now_s - safe_float(wb_intent.get("ts"), 0.0) <= 60.0
+        wb_intent_fresh = bool(wb_intent) and ((_input_age_s := runtime_input_age_s(safe_float(wb_intent.get("ts"), 0.0), now_s)) is not None and _input_age_s <= 60.0)
     if not wb_intent_fresh or wb_mode == MODE_OFF:
         return False
 
@@ -19353,14 +19737,14 @@ def controlled_wallbox_real_power_active(
         wb_intent_fresh = bool(
             wb_intent
             and intent_ts > 0.0
-            and now_s >= intent_ts
+            and runtime_input_age_s(intent_ts, now_s) is not None
         )
     if not bool(
         measurement_valid
         and wb_intent_fresh
         and intent_ts > 0.0
-        and now_s >= intent_ts
-        and now_s - intent_ts <= 60.0
+        and runtime_input_age_s(intent_ts, now_s) is not None
+        and ((_input_age_s := runtime_input_age_s(intent_ts, now_s)) is not None and _input_age_s <= 60.0)
     ):
         return False
     # `wb_intent["wb_power_w"]` ist Teil des Wallbox-/Startvertrags und kann
@@ -19395,8 +19779,7 @@ def _wallbox_status_sample_fresh(
     if type(sample_ts) not in (int, float) or not math.isfinite(float(sample_ts)):
         return False
     sample_value = float(sample_ts)
-    if sample_value > 100_000_000_000.0:
-        sample_value /= 1000.0
+    # Die zentrale Altersprüfung normalisiert genau einmal.
     return bool(
         status.get("driver_status_valid") is True
         and status.get("driver_status_stale") is False
@@ -19407,7 +19790,7 @@ def _wallbox_status_sample_fresh(
         and math.isfinite(float(now_s))
         and math.isfinite(float(max_age_s))
         and float(max_age_s) > 0.0
-        and 0.0 <= float(now_s) - sample_value <= float(max_age_s)
+        and ((_input_age_s := runtime_input_age_s(sample_value, float(now_s))) is not None and _input_age_s <= float(max_age_s))
     )
 
 
@@ -20181,12 +20564,163 @@ def observed_wallbox_controlled_intent(wb_intent, observed_ids):
     return result
 
 
+def wallbox_data_outage_context(cfg, intent, native, now_s, previous=None):
+    """Bewertet jeden externen Messpunkt, ohne Last oder Freigaben zu erfinden."""
+    previous = previous or {}
+    rows = {safe_int(r.get("wb_id"), 0): r for r in intent.get("car_energy_needs", []) if isinstance(r, dict)}
+    details = {safe_int(d.get("id"), 0): d for d in native.get("wb_details", []) if isinstance(d, dict)}
+    prior = {p.get("id"): p for p in previous.get("points", []) if isinstance(p, dict)}
+    points = []
+    if "wb_native_enable" in cfg and not cfg_bool(cfg, "wb_native_enable", False):
+        return {"active": False, "points": []}
+    for cid, key in ((1, "wb_native_type"), (2, "wb_native_type2")):
+        kind = str(cfg.get(key) or "").strip().lower()
+        if key not in cfg:
+            # Altverträge können die Typbindung am einzelnen Ladepunkt tragen.
+            kind = next((str(p.get("type") or "").strip().lower()
+                         for p in intent.get("wallbox_storage_points", [])
+                         if isinstance(p, dict) and safe_int(p.get("id"), 0) == cid), "")
+            kind = kind or str(details.get(cid, {}).get("type") or "").strip().lower()
+            if not kind and cid == 1 and cid in (intent.get("openwb_primary_pv_mode_ids") or [1]) and (
+                    intent.get("openwb_primary_pv_mode_active") or intent.get("openwb_primary_observe_only")):
+                kind = "openwb"
+        if kind in ("", "none", "off", "disabled", "0", "false", "aus", "no", "nein", "deaktiviert", "keine", "keine_wallbox", "no_wallbox", "-1") or wallbox_type_is_e3dc(kind):
+            continue
+        row, detail = rows.get(cid), details.get(cid, {})
+        observation = detail.get("observation") or {}
+        if row is not None:
+            power = row.get("car_power_w")
+            ts = row.get("car_charging_last_valid_ts", intent.get("ts"))
+            valid = (row.get("car_power_valid") is True and ts is not None
+                     and ((_input_age_s := runtime_input_age_s(safe_float(ts, 0), now_s)) is not None and _input_age_s <= WALLBOX_STATUS_SAMPLE_MAX_AGE_S)
+                     and ((_input_age_s := runtime_input_age_s(safe_float(intent.get("ts"), 0), now_s)) is not None and _input_age_s <= 60))
+        else:
+            power = (observation.get("values") or {}).get("power_w") if observation else detail.get("power_w")
+            valid = (((_input_age_s := runtime_input_age_s(safe_float(intent.get("ts"), 0), now_s)) is not None and _input_age_s <= 60)
+                     and _wallbox_status_sample_fresh(detail, now_s=now_s, max_age_s=WALLBOX_STATUS_SAMPLE_MAX_AGE_S))
+        if row is not None and not valid and observation.get("valid") is True:
+            power = (observation.get("values") or {}).get("power_w")
+            valid = (((_input_age_s := runtime_input_age_s(safe_float(intent.get("ts"), 0), now_s)) is not None and _input_age_s <= 60)
+                     and _wallbox_status_sample_fresh(detail, now_s=now_s, max_age_s=WALLBOX_STATUS_SAMPLE_MAX_AGE_S))
+        valid = bool(valid and type(power) in (int, float) and math.isfinite(power) and power >= 0)
+        if detail:
+            valid = bool(valid and _wallbox_status_sample_fresh(detail, now_s=now_s, max_age_s=WALLBOX_STATUS_SAMPLE_MAX_AGE_S)
+                         and (not observation or observation.get("valid") is True))
+        if valid:
+            continue
+        # Diagnose enthält nur bekannte neutrale Codes, niemals URLs oder Fahrzeugdaten.
+        raw_reason = str(observation.get("reason") or detail.get("driver_status_reason") or "")
+        allowed = {"openwb_tls_required", "openwb_pin_changed", "openwb_target_changed",
+                   "openwb_tls_pin_mismatch", "openwb_certificate_expired", "openwb_auth_rejected",
+                   "openwb_acl_missing", "openwb_unavailable", "connection_refused", "status_timeout",
+                   "http_error", "partial_measurement", "last_good_within_grace", "openwb_redirect_rejected",
+                   "openwb_address_invalid", "openwb_mqtt_unavailable", "openwb_mqtt_waiting",
+                   "openwb_cleartext_credentials"}
+        reason = raw_reason if raw_reason in allowed else "wallbox_measurement_missing_or_stale"
+        since = prior.get(cid, {}).get("since_ts")
+        since = since if type(since) in (int, float) and 0 < since <= now_s else now_s
+        points.append({"id": cid, "since_ts": since, "reason": reason,
+                       "regulation": "Regelung wie ohne Wallbox"})
+    return {"active": bool(points), "points": points}
+
+
+def storage_inputs_without_failed_wallboxes(cfg, intent, native, outage):
+    """Entfernt ausgefallene Punkte ausschließlich aus der internen Regelungssicht.
+
+    Der gemessene Hausverbrauch bleibt vollständig erhalten. Ein separater
+    E3DC-Messpunkt und alle anderen Schutzkonfigurationen bleiben maßgeblich.
+    """
+    failed = {p["id"] for p in outage.get("points", [])}
+    if not failed:
+        return cfg, intent, native
+    cfg, native = dict(cfg), dict(native)
+    for cid in failed:
+        cfg["wb_native_type" if cid == 1 else "wb_native_type2"] = "none"
+        cfg[f"wb{cid}_mode"] = MODE_OFF
+        cfg[f"wb{cid}_observe_storage_policy"] = ""
+        cfg[f"wb{cid}_storage_observe_policy"] = ""
+    points = [p for p in intent.get("wallbox_storage_points", [])
+              if isinstance(p, dict) and safe_int(p.get("id"), 0) not in failed]
+    rows = [r for r in intent.get("car_energy_needs", [])
+            if isinstance(r, dict) and safe_int(r.get("wb_id"), 0) not in failed]
+    details = [d for d in native.get("wb_details", [])
+               if isinstance(d, dict) and safe_int(d.get("id"), 0) not in failed]
+    for key in ("wb_possible_power_w", "wb_max_amp", "wb_global_max_amp"):
+        native.pop(key, None)
+    native["wb_details"] = details
+    native["total_power_w"] = sum(max(0, safe_float(d.get("power_w"), 0)) for d in details)
+    native["charging_active"] = any(d.get("charging") for d in details)
+    if not points and not rows and details and intent:
+        # Beim Altschema bleiben einzeln belegte andere Ladepunkte erhalten.
+        primary_ids = intent.get("openwb_primary_pv_mode_ids") or [1]
+        for detail in details:
+            cid = safe_int(detail.get("id"), 0)
+            if cid <= 0:
+                continue
+            primary = cid in primary_ids and bool(intent.get("openwb_primary_pv_mode_active")
+                                                  or intent.get("openwb_primary_observe_only"))
+            points.append(dict(id=cid, configured=True, enabled=True, type=detail.get("type"),
+                mode=normalize_wb_mode(cfg.get(f"wb{cid}_mode", intent.get("wb_mode_active", 0))),
+                role="primary" if primary else "controlled",
+                observe_storage_policy=cfg.get(f"wb{cid}_observe_storage_policy", intent.get("observe_storage_policy")),
+                active=bool(detail.get("plug") or detail.get("charging")),
+                car_active=bool(detail.get("plug") or detail.get("charging")),
+                charging_active=bool(detail.get("charging")), power_w=detail.get("power_w")))
+    if not points and not rows:
+        return cfg, {}, native
+    filtered = dict(intent, wallbox_storage_points=points, car_energy_needs=rows)
+    # Aufträge einer ausgefallenen Box dürfen auch in Mischanlagen keinen
+    # Start- oder Phasenrahmen reservieren. Gebundene Gruppen mit einem
+    # ausgefallenen Mitglied müssen neu qualifiziert werden.
+    allowed = {safe_int(p.get("id"), 0) for p in points} | {safe_int(r.get("wb_id"), 0) for r in rows}
+    starts = [item for item in intent.get("start_hold_requests", [])
+              if isinstance(item, dict) and safe_int(item.get("wb_id"), 0) in allowed
+              and not any(safe_int(member.get("wb_id"), 0) in failed
+                          for member in item.get("group_members", []) if isinstance(member, dict))]
+    filtered["start_hold_requests"] = starts
+    filtered["start_hold_requested_group_minimum_w"] = max(
+        (max(0, safe_int(item.get("group_minimum_w"), 0)) for item in starts), default=0)
+    phases = [item for item in intent.get("phase_transition_reservations", [])
+              if isinstance(item, dict) and safe_int(item.get("wb_id"), 0) in allowed]
+    filtered["phase_transition_reservations"] = phases
+    filtered["phase_transition_active"] = any(item.get("active") for item in phases)
+    filtered["phase_transition_reserved_w"] = sum(max(0, safe_int(item.get("requested_w"), 0)) for item in phases)
+    filtered["phase_transition_charger_ids"] = [safe_int(item.get("wb_id"), 0) for item in phases]
+    filtered.pop("phase_transition_reservation", None)
+    for key in ("active", "car_active", "charging_active", "grid_allowed", "price_opt_active",
+                "scheduled_slot_active", "price_boost_active", "predump_wallbox_active"):
+        filtered[key] = any(p.get(key) for p in points)
+    filtered["connected"] = any(r.get("connected") is True for r in rows)
+    filtered["plugged"] = filtered["connected"]
+    filtered["wb_power_w"] = (sum(max(0, safe_float(r.get("car_power_w"), 0)) for r in rows)
+                                if rows else native["total_power_w"])
+    filtered["wb_mode_active"] = max((normalize_wb_mode(p.get("mode", 0)) for p in points), default=0)
+    filtered["wb_control_mode"] = controller_mode(filtered["wb_mode_active"])
+    primary = [p["id"] for p in points if p.get("role") == "primary"]
+    filtered["openwb_primary_pv_mode_ids"] = primary
+    filtered["openwb_primary_pv_mode_active"] = bool(primary)
+    filtered["openwb_primary_observe_only"] = bool(primary)
+    filtered["external_wallbox_manager"] = bool(primary) and len(primary) == len(points)
+    return cfg, filtered, native
+
+
 def observed_wallbox_discharge_context(cfg, live, wb_intent, wb_native, now_s,
                                         max_discharge_w, previous_state):
-    """Trennt bestätigte Abnahme, Messdeckel und Haus-/WP-Schutz bei Messlücken."""
+    """Bewertet verbleibende Ladepunkte; der E3DC-RSCP-Rückfall bleibt erhalten."""
+    outage = wallbox_data_outage_context(cfg, wb_intent, wb_native, now_s,
+                                         previous_state.get("wallbox_data_outage"))
+    cfg, wb_intent, wb_native = storage_inputs_without_failed_wallboxes(cfg, wb_intent, wb_native, outage)
+    failed = {str(p["id"]) for p in outage["points"]}
     previous = previous_state.get("observed_wallbox_discharge") or {}
+    if failed:
+        previous = dict(previous)
+        for key in ("points", "gap_points"):
+            previous[key] = [p for p in previous.get(key, []) if str(p.get("id")) not in failed]
+        previous["latches"] = {k: v for k, v in (previous.get("latches") or {}).items() if k not in failed}
+        for key in ("cap_w", "last_valid_cap_w", "last_valid_cap_ts", "raise_pending_since"):
+            previous.pop(key, None)
     enabled = "wb_native_enable" not in cfg or cfg_bool(cfg, "wb_native_enable", False)
-    fresh = bool(wb_intent) and 0 <= now_s-safe_float(wb_intent.get("ts"), 0) <= 60
+    fresh = bool(wb_intent) and ((_input_age_s := runtime_input_age_s(safe_float(wb_intent.get("ts"), 0), now_s)) is not None and _input_age_s <= 60)
     intent = wb_intent if fresh else {}
     points = observed_wallbox_storage_points(cfg, intent, for_discharge_cap=True) if intent else []
     if not intent and enabled:
@@ -20206,6 +20740,26 @@ def observed_wallbox_discharge_context(cfg, live, wb_intent, wb_native, now_s,
         return result
     rows = {safe_int(row.get("wb_id"), 0): row for row in intent.get("car_energy_needs", []) if isinstance(row, dict)}
     details = {safe_int(d.get("id"), 0): d for d in wb_native.get("wb_details", []) if isinstance(d, dict)}
+    live_fresh = ((_input_age_s := runtime_input_age_s(safe_float(live.get("_ts"), 0), now_s)) is not None and _input_age_s <= 15)
+    def measurement(cid):
+        row = rows.get(cid)
+        detail = details.get(cid, {})
+        disconnected = bool(row is not None and row.get("connected") is False)
+        if row is not None:
+            raw_w = row.get("car_power_w")
+            sample_ts = row.get("car_charging_last_valid_ts", intent.get("ts"))
+            valid = (fresh and row.get("car_power_valid") is True and sample_ts is not None
+                     and ((_input_age_s := runtime_input_age_s(safe_float(sample_ts, 0), now_s)) is not None and _input_age_s <= WALLBOX_STATUS_SAMPLE_MAX_AGE_S))
+        else:
+            observation = detail.get("observation")
+            raw_w = ((observation.get("values") or {}).get("power_w")
+                     if isinstance(observation, dict) else detail.get("power_w"))
+            valid = fresh and live_fresh and _wallbox_status_sample_fresh(detail, now_s=now_s, max_age_s=WALLBOX_STATUS_SAMPLE_MAX_AGE_S)
+        valid = bool(valid and not disconnected and type(raw_w) in (int, float)
+                     and math.isfinite(raw_w) and raw_w >= 0)
+        if detail:
+            valid = valid and _wallbox_status_sample_fresh(detail, now_s=now_s, max_age_s=WALLBOX_STATUS_SAMPLE_MAX_AGE_S)
+        return valid, float(raw_w) if valid else None, disconnected
     cap_points = list(points)
     # Geregelte Ladepunkte erhalten bei Messlücken denselben Haus-/WP-Schutz.
     # Sie werden dadurch nicht zu beobachteten Punkten für die Budgetaufteilung.
@@ -20222,15 +20776,28 @@ def observed_wallbox_discharge_context(cfg, live, wb_intent, wb_native, now_s,
                           if str(cfg.get(key) or "").strip().lower() not in ("", "none", "off", "aus", "disabled", "0", "false", "no", "nein", "deaktiviert", "keine", "keine_wallbox", "no_wallbox", "-1")]
     gap_points = []
     for raw in raw_points:
-        if not isinstance(raw, dict) or raw.get("enabled") is False or raw.get("writer_allowed") is False:
+        if not isinstance(raw, dict) or raw.get("enabled") is False:
             continue
         cid = safe_int(raw.get("id"), 0)
         mode = normalize_wb_mode(raw.get("mode", 0))
-        if cid <= 0 or cid in known_ids or mode not in (MODE_CURVE, MODE_TARGET):
+        if cid <= 0 or cid in known_ids:
+            continue
+        # Eine Statuslücke sperrt den Wallbox-Ausgang, nicht den Messlückenschutz
+        # des Speichers. Bei gültiger Messung bleibt die Writersperre maßgeblich.
+        if raw.get("writer_allowed") is False and measurement(cid)[0]:
+            continue
+        policy = "reserve" if mode == MODE_TARGET else "curve"
+        if mode == MODE_OFF:
+            observed = observed_wallbox_storage_points(cfg,
+                {"wallbox_storage_points": [dict(raw, writer_allowed=True)]}, for_discharge_cap=True)
+            if not observed:
+                continue
+            policy = observed[0]["policy"]
+        elif mode not in (MODE_CURVE, MODE_TARGET):
             continue
         if any(raw.get(k) for k in ("grid_allowed", "price_opt_active", "scheduled_slot_active", "predump_wallbox_active")):
             continue
-        point = dict(raw, id=cid, mode=mode, policy="reserve" if mode == MODE_TARGET else "curve", gap_only=True)
+        point = dict(raw, id=cid, mode=mode, policy=policy, gap_only=True)
         cap_points.append(point)
         gap_points.append({k: point[k] for k in ("id", "mode", "policy", "role") if k in point})
     result["gap_points"] = gap_points
@@ -20240,7 +20807,6 @@ def observed_wallbox_discharge_context(cfg, live, wb_intent, wb_native, now_s,
     baseline_w = max(max(300, safe_int(cfg.get("wb_curve_house_baseline_min_w"), 1500)),
                      safe_int(intent.get("house_baseline_w", previous.get("house_baseline_w")), 0)+200)
     result["house_baseline_w"] = intent.get("house_baseline_w", previous.get("house_baseline_w"))
-    live_fresh = 0 <= now_s-safe_float(live.get("_ts"), 0) <= 15
     wp_raw = live.get("WP_Power")
     wp_valid = (live_fresh and type(wp_raw) in (int, float) and math.isfinite(wp_raw)
                 and wp_raw >= 0 and live.get("WP_Power_Valid") is not False)
@@ -20258,21 +20824,12 @@ def observed_wallbox_discharge_context(cfg, live, wb_intent, wb_native, now_s,
         episode = row.get("car_plug_session_id") if row else None
         if episode and episode != prev.get("car_plug_session_id", episode):
             prev = {}
-        disconnected = bool(row is not None and row.get("connected") is False)
-        if row is not None:
-            raw_w = row.get("car_power_w")
-            sample_ts = row.get("car_charging_last_valid_ts", intent.get("ts"))
-            valid = (fresh and row.get("car_power_valid") is True and sample_ts is not None
-                     and 0 <= now_s-safe_float(sample_ts, 0) <= 15)
-        else:
-            raw_w = detail.get("power_w")
-            valid = fresh and live_fresh and _wallbox_status_sample_fresh(detail, now_s=now_s, max_age_s=15)
-        valid = bool(valid and not disconnected and type(raw_w) in (int, float)
-                     and math.isfinite(raw_w) and raw_w >= 0)
-        power_w = float(raw_w) if valid else None
+        valid, power_w, disconnected = measurement(point["id"])
         latch = wallbox_pv_only_discharge_cap_latch(prev,
             evidence={"valid": valid, "power_w": power_w, "disconnected": disconnected},
-            now_s=now_s, invalid_starts=False, gap_hold_s=600.0)
+            now_s=now_s, invalid_starts=False, gap_hold_s=600.0,
+            reset_on_gap=not wallbox_type_is_e3dc(point.get("type") or cfg.get(
+                "wb_native_type" if point["id"] == 1 else "wb_native_type2")))
         latch["car_plug_session_id"] = episode or prev.get("car_plug_session_id")
         result["latches"][cid] = latch
         result["discharge_cap_latch_active"] |= latch["active"]
@@ -20286,9 +20843,14 @@ def observed_wallbox_discharge_context(cfg, live, wb_intent, wb_native, now_s,
                             openwb_primary_pv_mode_active=point.get("role") == "primary")
         release = observe_wallbox_reserve_release_context(cfg, live, local_intent, point["mode"],
             {"observe_wallbox_storage_policy": point["policy"],
-             "observe_wallbox_reserve_release_active": prev.get("reserve_release", True)})
+             "observe_wallbox_reserve_release_active": prev.get("reserve_release", True)},
+            measurement_valid=valid)
         latch["reserve_release"] = bool(release.get("active"))
-        result["release"] = release
+        # Eine gültige zweite Box darf die Messlücke der ersten nicht verdecken.
+        prior_release = result.get("release") or {}
+        if (not prior_release or release.get("reason") == "wallbox_measurement_invalid"
+                or (prior_release.get("reason") != "wallbox_measurement_invalid" and release.get("active"))):
+            result["release"] = release
         need = (not disconnected and (not valid or latch["active"])
                 and (point["policy"] == "curve" or not release.get("active")))
         if point.get("gap_only") and valid:
@@ -20375,12 +20937,17 @@ def observe_wallbox_reserve_release_context(
     wb_intent: Dict[str, Any],
     wb_mode: int,
     previous_state: Optional[Dict[str, Any]] = None,
+    *,
+    measurement_valid: bool = False,
 ) -> Dict[str, Any]:
-    """Diagnose for observe-only PV+Akku: car may use battery above house reserve."""
+    """Beobachtete Akkustützung benötigt einen aktuellen Ladepunktbeleg."""
     previous_state = previous_state or {}
     requested = _observe_wallbox_storage_policy_requested(cfg, wb_intent, wb_mode)
     if not requested:
-        return {"requested": False, "active": False}
+        return {"requested": False, "active": False,
+                "reason": "wallbox_measurement_invalid" if measurement_valid is not True else "not_requested"}
+    if measurement_valid is not True:
+        return {"requested": True, "active": False, "reason": "wallbox_measurement_invalid"}
     floor_soc = safe_float(
         wb_intent.get("effective_wb_floor_soc", wb_intent.get("wbminsoc", cfg.get("wbminsoc"))),
         0.0,
@@ -20447,7 +21014,7 @@ def unmanaged_wallbox_wbminsoc_hold_decision(
     # wird in jedem Regelzyklus erneuert und darf die Grace-Periode deshalb
     # nicht selbst wieder aufziehen.
     previous_hold_grace = bool(previous_hold and previous_state_age_s <= owner_grace_s)
-    intent_fresh = bool(wb_intent) and now_s - safe_float(wb_intent.get("ts"), 0.0) <= 90.0
+    intent_fresh = bool(wb_intent) and ((input_age_s := runtime_input_age_s(safe_float(wb_intent.get("ts"), 0.0), now_s)) is not None and input_age_s <= 90.0)
     wb_mode = normalize_wb_mode(wb_intent.get("wb_mode_active", cfg.get("wb1_mode", 0)))
     if observed_wallbox_storage_policy(cfg, wb_intent, wb_mode) is not None:
         observed_ids = {p["id"] for p in observed_wallbox_storage_points(cfg, wb_intent)}
@@ -21373,7 +21940,7 @@ def wallbox_phase_transition_reservation_contract(
     intent = wb_intent if isinstance(wb_intent, dict) else {}
     now_value = float(now_s if now_s is not None else time.time())
     intent_ts = safe_float(intent.get("ts"), 0.0)
-    fresh = bool(intent) and (intent_ts <= 0.0 or (now_value - intent_ts) <= 60.0)
+    fresh = bool(intent) and (intent_ts <= 0.0 or ((_input_age_s := runtime_input_age_s(intent_ts, now_value)) is not None and _input_age_s <= 60.0))
     raw_items = intent.get("phase_transition_reservations")
     items: List[Dict[str, Any]] = []
     if isinstance(raw_items, list):
@@ -22357,7 +22924,8 @@ def wallbox_pv_only_discharge_evidence(
         live,
         wb_native,
         now_s=now_s,
-        max_age_s=max_age_s,
+        max_age_s=WALLBOX_EVIDENCE_LIVE_MAX_AGE_S,
+        sample_max_age_s=max_age_s,
         require_fresh_evidence=True,
     )
     details = (wb_native or {}).get("wb_details")
@@ -22413,6 +22981,7 @@ def wallbox_pv_only_discharge_cap_latch(
     now_s: float,
     invalid_starts: bool = True,
     gap_hold_s: float = 600.0,
+    reset_on_gap: bool = False,
 ) -> Dict[str, Any]:
     """Ein-/Aus-Zustand „Wallbox lädt“ für die PV-only-Entladegrenze.
 
@@ -22429,7 +22998,7 @@ def wallbox_pv_only_discharge_cap_latch(
         result = measured_charge_state(previous,
             power_w=evidence.get("power_w") if evidence.get("valid") is True else None,
             now_s=now_s, disconnected=evidence.get("disconnected") is True,
-            gap_hold_s=gap_hold_s)
+            gap_hold_s=gap_hold_s, reset_on_gap=reset_on_gap)
         return dict(result, schema=WALLBOX_CURVE_PV_ONLY_DISCHARGE_LATCH_SCHEMA)
     prev = previous if isinstance(previous, dict) else {}
     if prev.get("schema") != WALLBOX_CURVE_PV_ONLY_DISCHARGE_LATCH_SCHEMA:
@@ -22645,7 +23214,7 @@ def validated_wallbox_phase_probe_request(
         or not isinstance(hold_s, (int, float))
     ):
         return {**result, "reason": "phase_probe_time_invalid"}
-    age_s = float(now_s) - float(evidence_ts)
+    age_s = runtime_input_age_s(evidence_ts, now_s)
     max_age_s = min(
         45.0,
         max(
@@ -22684,7 +23253,7 @@ def validated_wallbox_phase_probe_request(
         and strict_ints["hysteresis_w"] >= 0
         and strict_ints["request_w"] == expected_w
         and float(hold_s) >= 20.0
-        and math.isfinite(age_s)
+        and age_s is not None
         and 0.0 <= age_s <= max_age_s
     )
     if not valid:
@@ -22800,7 +23369,7 @@ def heatpump_pv_source_contract(
     heater_ts = number(live.get("Heater_Evidence_TS"))
     heater_evidence_valid = bool(not heater_configured or (
         live.get("Heater_Power_Known") is True and live.get("Heater_Status_Valid") is True
-        and heater_ts is not None and 0.0 <= now_s - heater_ts <= 10.0
+        and heater_ts is not None and ((_input_age_s := runtime_input_age_s(heater_ts, now_s)) is not None and _input_age_s <= 10.0)
         and number(live.get("Heizstab_Power")) is not None
     ))
     sample_ts = number(live.get("_ts"))
@@ -22810,11 +23379,11 @@ def heatpump_pv_source_contract(
     soc = number(live.get("SOC"))
     # Die Netz-/Akkubilanz bleibt auch ohne die Aufteilung Haus/WP gültig.
     balance_fresh = bool(evidence_valid and sample_ts is not None
-                         and 0.0 <= now_s - sample_ts <= 10.0
+                         and ((_input_age_s := runtime_input_age_s(sample_ts, now_s)) is not None and _input_age_s <= 10.0)
                          and grid_w is not None and battery_w is not None)
     fresh = bool(
         evidence_valid and sample_ts is not None
-        and 0.0 <= now_s - sample_ts <= 10.0
+        and ((_input_age_s := runtime_input_age_s(sample_ts, now_s)) is not None and _input_age_s <= 10.0)
         and all(value is not None for value in (pv_w, battery_w, grid_w, soc))
         and live.get("Heatpump_Power_Known") is True
         and effective_wallbox_known and heater_evidence_valid
@@ -23137,6 +23706,8 @@ def build_flexible_consumer_budget_contract(
     wallbox_running_hold_support_w: int = 0,
     phase_transition_preoutput_only: bool = False,
     heatpump_source_contract: Optional[Dict[str, Any]] = None,
+    wallbox_frame_only: bool = False,
+    start_source_budget_w: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Projiziert Anlagenzustand auf genau einen flexiblen Wattvertrag."""
 
@@ -23314,7 +23885,7 @@ def build_flexible_consumer_budget_contract(
         return bool(
             math.isfinite(timestamp)
             and timestamp > 0.0
-            and 0.0 <= float(now_s) - timestamp <= evidence_max_age_s
+            and ((_input_age_s := runtime_input_age_s(timestamp, float(now_s))) is not None and _input_age_s <= evidence_max_age_s)
         )
 
     heatpump_evidence_fresh = fresh_evidence_ts("Heatpump_Evidence_TS")
@@ -23452,7 +24023,7 @@ def build_flexible_consumer_budget_contract(
         isinstance(heatpump_withdrawal_ts, (int, float))
         and not isinstance(heatpump_withdrawal_ts, bool)
         and math.isfinite(float(heatpump_withdrawal_ts))
-        and 0.0 <= float(now_s) - float(heatpump_withdrawal_ts) <= evidence_max_age_s
+        and ((_input_age_s := runtime_input_age_s(float(heatpump_withdrawal_ts), float(now_s))) is not None and _input_age_s <= evidence_max_age_s)
     )
     heatpump_withdrawal_confirmed = bool(
         live.get("Heatpump_Withdrawal_Confirmed") is True
@@ -23466,9 +24037,7 @@ def build_flexible_consumer_budget_contract(
         isinstance(heatpump_signal_readback_ts, (int, float))
         and not isinstance(heatpump_signal_readback_ts, bool)
         and math.isfinite(float(heatpump_signal_readback_ts))
-        and 0.0
-        <= float(now_s) - float(heatpump_signal_readback_ts)
-        <= evidence_max_age_s
+        and ((_input_age_s := runtime_input_age_s(float(heatpump_signal_readback_ts), float(now_s))) is not None and _input_age_s <= evidence_max_age_s)
     )
     heatpump_signal_active_confirmed = bool(
         live.get("Heatpump_Signal_Active_Confirmed") is True
@@ -23765,6 +24334,13 @@ def build_flexible_consumer_budget_contract(
             0.0,
             safe_float(prior.get("retry_not_before_s"), 0.0),
         )
+        if consumer == "heatpump" and episode_used:
+            # Ready-Pulse, Budgetrevisionen und der Ablauf der Vollreserve
+            # beenden den fachlichen Bedarf nicht und bewahren die Episode.
+            readiness_low_confirmed = False
+            ready = bool(ready and prior.get("offered") is True)
+        elif consumer == "heatpump" and episode_completed:
+            prior = {**prior, "rearm_required": False, "timeout_released": False}
         measured_w = measured_acceptance_w[consumer]
         current_wall_s = safe_float(
             current_clock_sample.get("wall_ts")
@@ -24445,6 +25021,23 @@ def build_flexible_consumer_budget_contract(
             "timebase_rearm_count": 0,
         }
 
+    previous_episode = previous_contract.get("priority_start_episode")
+    previous_episode = copy.deepcopy(previous_episode) if isinstance(previous_episode, dict) else {}
+    episode_used = bool(previous_episode.get("preempted") is True)
+    episode_completed = bool(
+        episode_used and heatpump_evidence_fresh
+        and (live.get("Heatpump_Demand_Satisfied") is True or not cfg_bool(cfg, "auto_mode", True))
+        and heatpump_withdrawal_confirmed and heatpump_withdrawal_ts_fresh
+        and safe_float(heatpump_withdrawal_ts, 0.0) > safe_float(previous_episode.get("started_s"), 0.0)
+        and live.get("Heatpump_Compressor_Observation_Valid") is True
+        and live.get("Heatpump_Compressor_Running") is False
+        and live.get("Heatpump_Power_Known") is True and heatpump_observed_w < 60
+    )
+    if episode_completed:
+        previous_episode = {"preempted": False, "ended_s": float(now_s),
+                            "end_reason": "confirmed_demand_end_and_idle"}
+        episode_used = False
+
     pv_demand = live.get("Heatpump_PV_Contract")
     previous_pv_contract = previous_contract.get("heatpump_pv_contract")
     previous_pv_contract = previous_pv_contract if isinstance(previous_pv_contract, dict) else {}
@@ -24478,17 +25071,37 @@ def build_flexible_consumer_budget_contract(
     heatpump_pv_path = bool(
         heatpump_pv_accounting_active and (pv_effect_outstanding or not other_heat_demand)
     )
+    recovery_probe = prior_pv_state.get("energy_recovery") or {}
+    needs_time_confirmation = bool(heatpump_pv_accounting_active and (
+        not prior_pv_state or prior_pv_state.get("uncertain_state")
+        or recovery_probe and recovery_probe.get("status") != "resumed"))
+    confirmed_pv_clock = (heatpump_pv_checkpoint.heatpump_pv_time_confirmation(current_clock_sample)
+                          if needs_time_confirmation else current_clock_sample)
     pv_clock = {
+        **confirmed_pv_clock,
         "wall_s": current_clock_sample.get("wall_ts", now_s),
         "monotonic_s": current_clock_sample.get("monotonic_ts"),
         "boot_id": current_clock_sample.get("boot_id"),
     }
+    recovery = prior_pv_state.get("energy_recovery") or {}
+    if recovery and recovery.get("status") != "resumed" and recovery.get("anchor_wall_s") is not None:
+        recovery["gap_active"] = bool(recovery.get("gap_active") or
+            heatpump_pv_checkpoint.heatpump_pv_gap_intent_uncertain(
+                anchor_wall_s=recovery["anchor_wall_s"], now_s=now_s, account_state=prior_pv_state))
+        previous_pv_contract = {**previous_pv_contract, "state": prior_pv_state}
     pv_request_contract = {}
     pv_source = copy.deepcopy(heatpump_source_contract) if isinstance(heatpump_source_contract, dict) else {
         "fresh": False, "sample_ts": now_s,
         "battery_available_w": 0, "battery_available_wh": 0,
         "grid_available_w": 0, "battery_actual_w": 0, "grid_actual_w": 0,
     }
+    pv_heater_reclaimable = bool(
+        heatpump_pv_path and heater_evidence_fresh
+        and live.get("Heater_Running_Reclaimable") is True
+        and heater_command_eligible and measured_acceptance_w["heater"] > 0
+        and configured_order.index("heatpump") < configured_order.index("heater")
+        and not phase_transition_active
+    )
     pv_wallbox_reclaimable = bool(
         heatpump_pv_path
         and configured_order.index("heatpump") < configured_order.index("wallbox")
@@ -24521,7 +25134,7 @@ def build_flexible_consumer_budget_contract(
             pv_shared_frame_w = max(0, int(available_w))
             if phase_transition_active and heatpump_running:
                 pv_shared_frame_w += max(0, int(heatpump_commitment_w))
-        other_claim_w = measured_acceptance_w["heater"]
+        other_claim_w = 0 if pv_heater_reclaimable else measured_acceptance_w["heater"]
         if not pv_heatpump_priority:
             other_claim_w += max(
                 measured_acceptance_w["wallbox"], int(wallbox_reserved_w),
@@ -24542,12 +25155,21 @@ def build_flexible_consumer_budget_contract(
                 + (heatpump_observed_w if heatpump_evidence_fresh
                    and live.get("Heatpump_Power_Known") is True else 0)
                 + (max(0, safe_int(pv_source.get("wallbox_measured_w"), 0))
-                   if pv_heatpump_priority else 0)))
+                   if pv_heatpump_priority else 0)
+                + (measured_acceptance_w["heater"] if pv_heater_reclaimable else 0)))
+        if (start_source_budget_w is not None and not heatpump_running
+                and not pv_effect_outstanding):
+            # Auch die direkte PV-Qualifizierung bleibt hinter dem bereits
+            # gebundenen Akkuanteil. Ein Messwertangebot ist kein Zweitbudget.
+            bounded_start_source_w = (start_source_budget_w
+                if type(start_source_budget_w) is int and start_source_budget_w >= 0 else 0)
+            pv_source["prospective_capacity_w"] = min(
+                pv_source["prospective_capacity_w"], max(0, bounded_start_source_w - other_claim_w))
         pv_source["shared_capacity_w"] = pv_source["prospective_capacity_w"]
         if not cfg_bool(cfg, "auto_mode", True):
             pv_source["protection_reason"] = "user_off"
         elif (isinstance(pv_demand, dict)
-              and 0.0 <= now_s - safe_float(pv_demand.get("sample_ts"), 0.0) <= 45.0
+              and ((_input_age_s := runtime_input_age_s(safe_float(pv_demand.get("sample_ts"), 0.0), now_s)) is not None and _input_age_s <= 45.0)
               and pv_demand.get("protection_reason") in heatpump_pv_policy.HARD_PROTECTIONS):
             pv_source["protection_reason"] = pv_demand["protection_reason"]
         pv_observation = pv_demand.get("observation") if isinstance(pv_demand, dict) else {}
@@ -24583,6 +25205,15 @@ def build_flexible_consumer_budget_contract(
     heatpump_start_ready = bool(
         heatpump_demand_ready
         and heatpump_new_start_allowed
+        and (live.get("Heatpump_Start_Demand_Class") != "pv_surplus"
+             or live.get("Heatpump_Start_Qualified") is True
+             or not (configured_order.index("heatpump") < configured_order.index("wallbox")
+                     and measured_acceptance_w["wallbox"] > 0
+                     and wallbox_command_eligible and wallbox_power_evidence_fresh
+                     or configured_order.index("heatpump") < configured_order.index("heater")
+                     and measured_acceptance_w["heater"] > 0
+                     and heater_command_eligible and heater_evidence_fresh
+                     and live.get("Heater_Running_Reclaimable") is True))
     )
     heater_start_ready = bool(
         heater_command_eligible
@@ -24614,6 +25245,19 @@ def build_flexible_consumer_budget_contract(
         max(0, int(wallbox_running_hold_support_w)),
         max(0, int(wallbox_cap_w)),
     )
+    wallbox_start_source_w = max(0, int(available_w))
+    if available_is_residual_after_running and not phase_transition_active:
+        reclaim_w = sum(measured_acceptance_w[name]
+            for name, fresh, marker in (
+                ("heatpump", heatpump_evidence_fresh, "Heatpump_Running_Reclaimable"),
+                ("heater", heater_evidence_fresh, "Heater_Running_Reclaimable"))
+            if fresh and live.get(marker) is True
+            and configured_order.index("wallbox") < configured_order.index(name)
+            and (name != "heatpump" or not priority_runon.get("active")))
+        # Nur im Restbudgetpfad fehlt diese bereits gemessene Last. Der
+        # absolute Quellenrahmen enthält sie schon; keine zweite Quelle.
+        wallbox_start_source_w = max(wallbox_start_source_w,
+            max(0, int(signed_residual_w) + reclaim_w))
     wallbox_start_offer_w = min(
         wallbox_cap_w,
         max(
@@ -24621,7 +25265,7 @@ def build_flexible_consumer_budget_contract(
             int(wallbox_start_hold_w),
             int(wallbox_reserved_w),
             wallbox_exclusive_start_support_w,
-            0 if phase_transition_active else int(available_w),
+            0 if phase_transition_active else wallbox_start_source_w,
         ),
     )
     wallbox_start_ready = bool(
@@ -24692,6 +25336,39 @@ def build_flexible_consumer_budget_contract(
             "rearm_required": False, "ready_latched": False,
             "withdrawal_watermark_s": 0.0, "timebase_rearm_count": 0,
         }
+        priority_pv_start = bool(
+            pv_request_contract.get("control_mode") == "measured"
+            and pv_request_contract.get("valid") is True
+            and pv_request_contract.get("power_accounting_source") == "measured"
+            and (pv_request_contract.get("start_candidate") is True
+                 or (previous_leases.get("heatpump") or {}).get("offered") is True)
+            and measured_acceptance_w["heatpump"] <= 0
+            and (measured_acceptance_w["wallbox"] > 0 and pv_wallbox_reclaimable
+                 or pv_heater_reclaimable)
+            and not phase_transition_active
+        )
+        if priority_pv_start:
+            # Der Messwertbetrieb bindet bei konkurrierendem Start einmalig
+            # die qualifizierte Startleistung. Das ist keine dauerhafte
+            # Profilreservierung und ersetzt niemals die spätere Istmessung.
+            priority_start_w = max(0, safe_int(pv_request_contract.get("start_power_w"), 0))
+            if priority_start_w <= 0:
+                priority_start_w = max(0, safe_int(pv_request_contract.get("max_power_w"), 0))
+            start_leases["heatpump"] = start_lease(
+                "heatpump", pv_request_contract.get("start_candidate") is True,
+                priority_start_w, heatpump_cap_w, duration_s=heatpump_lease_duration_s,
+                command_eligible=heatpump_command_eligible,
+                readiness_fresh=heatpump_evidence_fresh,
+                readiness_low_confirmed=False,
+                withdrawal_confirmed=heatpump_withdrawal_confirmed,
+                withdrawal_source=str(live.get("Heatpump_Withdrawal_Source") or ""),
+            )
+            pv_request_contract["start_priority_reservation_required"] = True
+            pv_request_contract["priority_start_required_w"] = priority_start_w
+            pv_request_contract["request_w"] = max(
+                safe_int(pv_request_contract.get("request_w"), 0),
+                safe_int(start_leases["heatpump"].get("request_w"), 0),
+            )
         heatpump_start_request_w = max(0, safe_int(pv_request_contract.get("request_w"), 0))
         heatpump_start_ready = pv_request_contract.get("start_candidate") is True
     start_leases["wallbox"]["request_generation"] = (
@@ -25147,6 +25824,29 @@ def build_flexible_consumer_budget_contract(
             else ()
         )
 
+    # Der Start erhält höchstens den frisch gebundenen gemeinsamen Rahmen.
+    # Eine für die Wallbox verzögerte Erhöhung ist keine WP-Stabilitätszeit.
+    # Der Akkuanteil wurde vom Erzeuger bereits vor diesem Rahmen abgezogen.
+    prospective_source_w = total_w
+    if start_source_budget_w is not None:
+        prospective_source_w = (
+            start_source_budget_w if type(start_source_budget_w) is int
+            and start_source_budget_w >= 0 and evidence_valid and not protected
+            and not phase_transition_active else 0
+        )
+    source_start_consumers = tuple(
+        consumer for consumer in ("heatpump", "heater")
+        if measured_acceptance_w[consumer] <= 0
+        and configured_order.index(consumer) < configured_order.index("wallbox")
+        and (start_leases[consumer].get("offered") is True
+             or consumer == "heatpump" and heatpump_pv_path and heatpump_start_ready)
+    )
+    if source_start_consumers:
+        total_w = max(total_w, prospective_source_w)
+        shared_source_total_w = max(shared_source_total_w, prospective_source_w)
+        for consumer in ("heatpump", "heater"):
+            requests_w[consumer] = min(request_caps_w[consumer], total_w)
+
     # Frisch gemessene, nicht wattgenau modulierbare Lasten sind bereits
     # physisch vorhanden. Wenn der berechnete flexible Rahmen kleiner ist,
     # wird nur der Accounting-Rahmen bis zu dieser Istlast angehoben; daraus
@@ -25212,10 +25912,42 @@ def build_flexible_consumer_budget_contract(
     # Wallbox-Rampe gebunden, unabhängig von der konfigurierten Startpriorität.
     # Eine lediglich startbereite Wärmepumpe landet hier ausdrücklich nicht:
     # Nur der oben aus frischer Annahme gebildete Accounting-Commitment zählt.
+    # Ohne konkurrierenden Start bleiben laufende Wärmeverbraucher wie
+    # bisher geschützt. Nur der frische Aktorvertrag nach Schutzablauf darf
+    # sie für einen höher priorisierten Start zurücknehmbar machen.
+    thermal_reclaim_ready = {
+        "heatpump": bool(evidence_valid and not protected and not phase_transition_active
+            and heatpump_evidence_fresh
+            and live.get("Heatpump_Running_Reclaimable") is True
+            and not priority_runon.get("active")),
+        "heater": bool(evidence_valid and not protected and not phase_transition_active
+            and heater_evidence_fresh
+            and live.get("Heater_Running_Reclaimable") is True),
+    }
+    def thermal_reclaim_candidates():
+        starts = tuple(name for name in configured_order
+            if allocation_commitments_w[name] <= 0
+            and command_eligible_map[name]
+            and start_leases[name].get("offered") is True
+            and 0 < safe_int(start_leases[name].get("request_w"), 0)
+            and (min(safe_int(start_leases[name].get("request_w"), 0), prospective_source_w)
+                 >= CONSUMER_MIN_W["wallbox"] if name == "wallbox"
+                 else safe_int(start_leases[name].get("request_w"), 0) <= prospective_source_w))
+        return tuple(name for name in ("heatpump", "heater")
+            if thermal_reclaim_ready[name] and command_eligible_map[name]
+            and fresh_running_commitments_w[name] > 0
+            and (any(configured_order.index(start) < configured_order.index(name)
+                     for start in starts)
+                 or any(configured_order.index(start) < configured_order.index(name)
+                     and measured_acceptance_w[start] > 0
+                     for start in (previous_contract.get("priority_running_reclaim_starters") or {}).get(name, [])
+                     if start in configured_order)))
+    thermal_reclaim = thermal_reclaim_candidates()
     fixed_running_priority_front = tuple(
         consumer
         for consumer in ("heatpump", "heater")
         if fresh_running_commitments_w[consumer] > 0
+        and consumer not in thermal_reclaim
     )
     if fixed_running_priority_front:
         priority_front = fixed_running_priority_front + tuple(
@@ -25405,13 +26137,13 @@ def build_flexible_consumer_budget_contract(
         "heatpump": min(
             original_fixed_requests_w["heatpump"],
             max(
-                fresh_running_commitments_w["heatpump"],
+                0 if "heatpump" in thermal_reclaim else fresh_running_commitments_w["heatpump"],
                 heatpump_start_transaction_bind_w,
             ),
         ),
         "heater": min(
             original_fixed_requests_w["heater"],
-            fresh_running_commitments_w["heater"],
+            0 if "heater" in thermal_reclaim else fresh_running_commitments_w["heater"],
         ),
     }
     fixed_source_protected_w = (
@@ -25518,6 +26250,26 @@ def build_flexible_consumer_budget_contract(
             request_caps_w["heatpump"], requests_w["heatpump"] + heatpump_exclusive_source_w,
         )
 
+    # Erst ein qualifizierter, verbindlicher Start darf die laufende
+    # nachrangige Wallbox zurücknehmen. Ihr Messwert bleibt im Quellenrahmen;
+    # Kommandobudget und physische Aufnahme sind getrennte Größen.
+    priority_start_consumers = tuple(
+        consumer for consumer in configured_order
+        if allocation_commitments_w[consumer] <= 0
+        and command_eligible_map[consumer]
+        and start_leases[consumer].get("offered") is True
+        and safe_int(start_leases[consumer].get("request_w"), 0) > 0
+    )
+    priority_wallbox_reclaim = bool(
+        evidence_valid and not phase_transition_active
+        and wallbox_online and wallbox_power_evidence_fresh
+        and command_eligible_map["wallbox"]
+        and any(configured_order.index(consumer) < configured_order.index("wallbox")
+                for consumer in priority_start_consumers)
+    )
+    if priority_wallbox_reclaim:
+        priority_front = tuple(consumer for consumer in priority_front if consumer != "wallbox")
+
     previous_active = previous_contract.get("active")
     if not isinstance(previous_active, dict):
         previous_active = {
@@ -25539,6 +26291,10 @@ def build_flexible_consumer_budget_contract(
                 CONSUMER_MIN_W[consumer],
                 allocation_commitments_w[consumer],
             )
+    if wallbox_frame_only:
+        # Ein absoluter Rahmen ist auch unter dem Startminimum nutzbar.
+        # Start, Mindesthalt und Phasen prüft weiterhin der Wallbox Manager.
+        minimums_for_contract["wallbox"] = 0
     if heatpump_start_transaction_bind_w > 0:
         # Die physische Mindestleistung gilt für eine neue Startfreigabe.
         # Hier wurde das Signal bereits im Vorzyklus voll finanziert und
@@ -25605,6 +26361,11 @@ def build_flexible_consumer_budget_contract(
         }
 
     def allocate_current_contract(*, forced_fail_closed: bool = False) -> Dict[str, Any]:
+        current_reclaim = thermal_reclaim_candidates()
+        current_fixed_front = tuple(name for name in ("heatpump", "heater")
+            if fresh_running_commitments_w[name] > 0 and name not in current_reclaim)
+        current_front = current_fixed_front + tuple(name for name in priority_front
+            if name not in current_fixed_front and name not in current_reclaim)
         return allocate_consumer_budget_contract(
             total_w,
             requests_w,
@@ -25623,15 +26384,18 @@ def build_flexible_consumer_budget_contract(
             now_s=float(now_s),
             wp_runon_s=priority_runon_s_from_config(cfg),
             wp_runon_active_override=bool(priority_runon.get("active")),
-            priority_front=priority_front,
+            priority_front=current_front,
             # Im Messwertbetrieb gilt der WP-Vorrang auch während der
             # Versandreservierung und bei laufender WP. Der Wallbox Manager
             # setzt das verbleibende Budget mit seinen Halte-/Schaltregeln um.
-            reclaimable_active=("wallbox",) if (
-                pv_wallbox_reclaimable and pv_request_contract.get("start_candidate") is True
+            reclaimable_active=current_reclaim + (("wallbox",) if (
+                priority_wallbox_reclaim
+                or pv_wallbox_reclaimable and pv_request_contract.get("start_candidate") is True
                 or pv_heatpump_priority and pv_request_contract.get("control_mode") == "measured"
                 and not pv_measurement_gap
-            ) else (),
+            ) else ()),
+            protected_active=tuple(name for name in ("heatpump", "heater")
+                if fresh_running_commitments_w[name] > 0 and not thermal_reclaim_ready[name]),
             heatpump_exclusive_budget_w=heatpump_exclusive_source_w,
         )
 
@@ -25670,6 +26434,7 @@ def build_flexible_consumer_budget_contract(
             consumer
             for consumer in running_commitment_unfunded
             if consumer in ("heatpump", "heater")
+            and consumer not in thermal_reclaim_candidates()
             and fresh_running_commitments_w[consumer]
             > safe_int(initial_allocations.get(consumer), 0)
         ]
@@ -26039,6 +26804,7 @@ def build_flexible_consumer_budget_contract(
             consumer
             for consumer in running_commitment_unfunded
             if consumer in ("heatpump", "heater")
+            and consumer not in thermal_reclaim_candidates()
             and fresh_running_commitments_w[consumer]
             > safe_int(final_allocations.get(consumer), 0)
         ]
@@ -26082,6 +26848,63 @@ def build_flexible_consumer_budget_contract(
                 for consumer in nonfresh_accounting_commitment_unfunded
             )
         contract["blockers"] = sorted(final_blockers)
+    current_episode = copy.deepcopy(previous_episode)
+    hp_lease = start_leases["heatpump"]
+    displaced = [name for name in ("wallbox", "heater")
+        if (name == "wallbox" and priority_wallbox_reclaim
+            or name in thermal_reclaim_candidates())
+        and safe_int((contract.get("allocations") or {}).get(name), 0) < measured_acceptance_w[name]]
+    if (displaced and hp_lease.get("offered") is True
+            and safe_int(hp_lease.get("request_w"), 0) > 0
+            and safe_int((contract.get("allocations") or {}).get("heatpump"), 0)
+                >= safe_int(hp_lease.get("request_w"), 0)
+            and not episode_used):
+        current_episode = {"preempted": True, "started_s": safe_float(hp_lease.get("started_s"), now_s),
+                           "demand_class": str(live.get("Heatpump_Start_Demand_Class") or "pv_surplus"),
+                           "displaced_consumer": displaced[0]}
+    contract["priority_start_episode"] = current_episode
+    contract["priority_running_reclaimable"] = list(thermal_reclaim_candidates())
+    contract["priority_running_reclaim_starters"] = {
+        name: [start for start in configured_order
+            if configured_order.index(start) < configured_order.index(name)
+            and (start_leases[start].get("offered") is True
+                 or measured_acceptance_w[start] > 0)]
+        for name in thermal_reclaim_candidates()
+    }
+    contract["priority_running_reclaim_ready"] = dict(thermal_reclaim_ready)
+
+    # Dieser Rahmen dient ausschließlich der Startqualifizierung. Er ist
+    # weder Kommandobudget noch zusätzliche Quelle und wird nicht addiert.
+    prospective_thermal = tuple(name for name in ("heater",)
+        if thermal_reclaim_ready[name] and command_eligible_map[name]
+        and heatpump_demand_ready and measured_acceptance_w[name] > 0
+        and configured_order.index("heatpump") < configured_order.index(name))
+    prospective_requests = dict(requests_w)
+    prospective_requests["heatpump"] = max(
+        prospective_requests["heatpump"],
+        min(heatpump_cap_w, max(0, heatpump_start_request_w))
+        if heatpump_demand_ready and heatpump_new_start_allowed else 0,
+    )
+    prospective_total_w = max(shared_command_source_w, prospective_source_w)
+    prospective = allocate_consumer_budget_contract(
+        prospective_total_w, prospective_requests, configured_order,
+        enabled={consumer: command_eligible_map[consumer] and prospective_requests[consumer] > 0
+                 for consumer in prospective_requests},
+        evidence_valid=bool(evidence_valid and not protected and not phase_transition_active
+                            and contract.get("valid") is True),
+        minimums_w=minimums_for_contract, maximums_w=maximums_map,
+        active=active_map(), reservations_w=reservations_map(),
+        priority_front=tuple(consumer for consumer in priority_front
+            if consumer not in prospective_thermal
+            and not (consumer == "wallbox"
+                and configured_order.index("heatpump") < configured_order.index("wallbox")))
+            if heatpump_demand_ready else priority_front,
+        reclaimable_active=prospective_thermal + (("wallbox",) if heatpump_demand_ready
+            and configured_order.index("heatpump") < configured_order.index("wallbox")
+            and wallbox_online and wallbox_power_evidence_fresh else ()) ,
+    )
+    contract["prospective_start_allocations"] = dict(prospective["allocations"])
+    contract["prospective_start_source_w"] = prospective_total_w if prospective.get("valid") is True else 0
     contract["consumer_priority_key"] = configured_key
     contract["consumer_priority_changed_at_s"] = float(changed_at_s)
     contract["consumer_priority_runon_guard_active"] = bool(
@@ -26587,6 +27410,15 @@ def build_flexible_consumer_budget_contract(
             # regelt parallel nach, der Sollwert wartet nicht auf sie.
             handoff_required=not pv_heatpump_priority,
         )
+        if (heatpump_pv_path and "heatpump" in thermal_reclaim_candidates()
+                and hp_cmd_w < measured_acceptance_w["heatpump"]
+                and heatpump_pv_policy._number(pv_grant.get("protected_remaining_s")) == 0.0):
+            # Die Mindestlaufzeit wurde vom frischen Aktorvertrag bestätigt.
+            # Rücknahme läuft weiterhin ausschließlich durch den vorhandenen
+            # Energy-Manager-Ausgang und dessen Kanal-/Readback-Schutz.
+            pv_grant.update(command_authorized=False, hold_required=False,
+                withdrawal_required=True, withdrawal_reason="consumer_priority",
+                reason="consumer_priority")
         pv_grant["allocation_owned"] = heatpump_pv_path
         if not heatpump_pv_path:
             pv_grant.update({"command_authorized": False, "hold_required": False,
@@ -26702,8 +27534,8 @@ def _external_openwb_primary_power_evidence(
             type(sample_ts) not in (int, float)
             or not math.isfinite(float(sample_ts))
             or float(sample_ts) <= 0.0
-            or now_value < float(sample_ts)
-            or now_value - float(sample_ts) > age_limit_s
+            or (sample_age_s := runtime_input_age_s(sample_ts, now_value)) is None
+            or sample_age_s > age_limit_s
         ):
             return blocked("primary_detail_sample_stale_or_invalid")
         power_w = detail.get("power_w")
@@ -26732,10 +27564,14 @@ def wallbox_actual_power_snapshot(
     now_s: Optional[float] = None,
     max_age_s: float = 45.0,
     require_fresh_evidence: bool = False,
+    cfg: Optional[Dict[str, Any]] = None,
+    sample_max_age_s: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Return the best current wallbox power, including native multi-WB slots."""
+    """Summiert belegte Ladepunkte; ein separater E3DC-Wert ersetzt keinen externen Slot."""
     wb_native = wb_native or {}
     now_value = time.time() if now_s is None else float(now_s)
+    # max_age_s gilt für die E3DC-Livedaten, sample_max_age_s für Wallbox-Statusproben (ohne Angabe wie max_age_s).
+    sample_age_limit_s = float(max_age_s if sample_max_age_s is None else sample_max_age_s)
     live_raw = live.get("Wallbox_Power")
     live_power_known = bool(
         isinstance(live_raw, (int, float))
@@ -26748,7 +27584,7 @@ def wallbox_actual_power_snapshot(
         type(live_sample_ts) in (int, float)
         and math.isfinite(float(live_sample_ts))
         and float(live_sample_ts) > 0.0
-        and 0.0 <= now_value - float(live_sample_ts) <= float(max_age_s)
+        and ((_input_age_s := runtime_input_age_s(float(live_sample_ts), now_value)) is not None and _input_age_s <= float(max_age_s))
         and live_power_plausibility(live).get("sample_valid") is True
         and live.get("Power_Decision_Usable", True) is not False
     )
@@ -26760,7 +27596,7 @@ def wallbox_actual_power_snapshot(
         _wallbox_status_sample_fresh(
             wb_native,
             now_s=now_value,
-            max_age_s=max_age_s,
+            max_age_s=sample_age_limit_s,
         )
         if require_fresh_evidence
         else bool(
@@ -26791,6 +27627,14 @@ def wallbox_actual_power_snapshot(
     native_details_complete = True
     native_running_details = 0
     details = wb_native.get("wb_details") or []
+    expected_external_ids = set()
+    if cfg and ("wb_native_enable" not in cfg or cfg_bool(cfg, "wb_native_enable", False)):
+        for cid, key in ((1, "wb_native_type"), (2, "wb_native_type2")):
+            kind = str(cfg.get(key) or "").strip().lower()
+            if kind not in ("", "none", "off", "aus", "disabled", "0", "false", "no", "nein", "deaktiviert", "keine", "keine_wallbox", "no_wallbox", "-1") and not wallbox_type_is_e3dc(kind):
+                expected_external_ids.add(cid)
+    present_ids = {safe_int(d.get("id"), 0) for d in details if isinstance(d, dict)} if isinstance(details, list) else set()
+    missing_external_ids = expected_external_ids - present_ids
     if require_fresh_evidence and not isinstance(details, list):
         native_details_complete = False
     if native_root_explicitly_invalid:
@@ -26807,7 +27651,7 @@ def wallbox_actual_power_snapshot(
                 _wallbox_status_sample_fresh(
                     detail,
                     now_s=now_value,
-                    max_age_s=max_age_s,
+                    max_age_s=sample_age_limit_s,
                 )
                 if require_fresh_evidence
                 else bool(
@@ -26817,9 +27661,16 @@ def wallbox_actual_power_snapshot(
                     and detail.get("driver_status_glitch") is not True
                 )
             )
+            if safe_int(detail.get("id"), 0) in expected_external_ids:
+                detail_status_usable = bool(detail_status_usable and _wallbox_status_sample_fresh(
+                    detail, now_s=now_value, max_age_s=sample_age_limit_s))
+            observation = detail.get("observation")
+            if isinstance(observation, dict):
+                measured_power = (observation.get("values") or {}).get("power_w")
+                detail_status_usable = bool(detail_status_usable and observation.get("valid") is True
+                    and type(measured_power) in (int, float) and math.isfinite(measured_power))
             if not detail_status_usable:
-                if bool(detail.get("charging")) or power > 250.0:
-                    native_details_complete = False
+                native_details_complete = False
                 continue
             if any(
                 isinstance(detail.get(key), (int, float))
@@ -26844,7 +27695,8 @@ def wallbox_actual_power_snapshot(
                 if power > 250.0:
                     native_running_details += 1
 
-    if require_fresh_evidence and details and not native_details_complete:
+    external_measurement_missing = bool(missing_external_ids or (details and not native_details_complete))
+    if external_measurement_missing:
         native_details_w = 0.0
         native_details_known = False
         native_running_details = 0
@@ -26852,6 +27704,7 @@ def wallbox_actual_power_snapshot(
     native_total_raw = wb_native.get("total_power_w")
     native_total_known = bool(
         native_status_usable
+        and not external_measurement_missing
         and isinstance(native_total_raw, (int, float))
         and not isinstance(native_total_raw, bool)
         and math.isfinite(float(native_total_raw))
@@ -26883,7 +27736,7 @@ def wallbox_actual_power_snapshot(
             "native_details_complete": bool(native_details_complete),
             "running_detail_count": int(native_running_details),
         }
-    if live_status_usable:
+    if live_status_usable and not external_measurement_missing:
         return {
             "power_w": live_w,
             "source": "live_data",
@@ -26912,10 +27765,11 @@ def wallbox_actual_power_snapshot(
             "running_detail_count": int(native_running_details),
         }
     return {
-        "power_w": 0.0,
+        "power_w": None,
         "source": "unknown",
+        "reason": "wallbox_measurement_invalid",
         "power_known": False,
-        "live_w": 0.0,
+        "live_w": live_w if live_status_usable else 0.0,
         "native_w": 0.0,
         "home_includes_wallbox": bool(live.get("Wallbox_Home_Includes", False)),
         "measurement_valid": False,
@@ -27102,6 +27956,115 @@ def pv_surplus_after_house_heatpump_w(live: Dict[str, Any], wallbox_w: float) ->
     """Return PV surplus after house and heat pump, excluding wallbox load."""
     pv_w = max(0.0, safe_float(live.get("PV_Power"), 0.0))
     return max(0, int(round(pv_w - house_heatpump_load_w(live, wallbox_w))))
+
+
+def central_pv_split_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) else None
+
+
+def central_pv_split_battery_share(i_fc_w, maximum_w, previous, now_s):
+    """Mehr Akkuanteil sofort; Wallbox-Freigaben mit Totband und 240 s Abstand."""
+    target = max(0, min(int(maximum_w), int(i_fc_w)))
+    prior = central_pv_split_number(previous.get("battery_share_w"))
+    stamp = central_pv_split_number(previous.get("battery_change_ts"))
+    if prior is not None and stamp is not None:
+        # Eine Gerätegrenze senkt den Akkuanteil sofort, auch im Totband.
+        bounded_prior = min(int(maximum_w), max(0, int(prior)))
+        if bounded_prior != prior:
+            return target, now_s
+        prior = bounded_prior
+        if target < prior and (
+            prior - target < max(300, int(prior * 0.10))
+            or not 240 <= now_s - stamp
+        ):
+            return prior, stamp
+    return target, now_s if prior != target or stamp is None else stamp
+
+
+def central_pv_split_split(*, pv_w, fixed_load_w, i_fc_w, maximum_w, support_w, min_power_w,
+          measurement_valid, live_valid, previous, now_s, step_w=690,
+          battery_w=None, battery_valid=False):
+    """Ein Akkuanteil für AUTO und Bilanz; Rahmen abwärts ohne Verzögerung."""
+    share, changed = central_pv_split_battery_share(i_fc_w, maximum_w, previous, now_s)
+    neutral = max(0, int(pv_w - fixed_load_w)) if live_valid else 0
+    candidate = max(0, neutral - share + int(support_w)) if live_valid else 0
+    battery = central_pv_split_number(battery_w) if battery_valid else None
+    conservative = min(candidate, max(0, int(neutral - max(0, battery)))) if battery is not None else None
+    prior = central_pv_split_number(previous.get("frame_w"))
+    frame = candidate
+    if live_valid and measurement_valid and prior is not None and candidate > prior:
+        delta = candidate - int(prior)
+        frame = int(prior) if delta < 200 else min(candidate, int(prior) + max(230, int(step_w)))
+    if not measurement_valid:
+        frame = None
+    return {
+        "battery_share_w": share, "frame_w": frame,
+        "frame_confirmed": False, "frame_age_s": None,
+        "min_power_w": int(min_power_w),
+        "reason": "wallbox_measurement_missing" if not measurement_valid else (
+            "live_measurement_invalid" if not live_valid else "curve_first"
+        ),
+        "ts": now_s, "battery_change_ts": changed,
+        "candidate_w": candidate, "neutral_pv_w": neutral,
+        "conservative_frame_w": conservative, "published_frame_w": prior,
+        "gate_pending_since_ts": previous.get("gate_pending_since_ts"),
+        "fixed_load_w": int(fixed_load_w), "support_w": int(support_w),
+        "requested_iFc_w": int(i_fc_w), "gate_hold_s": 60,
+        "confirmed_frame_w": previous.get("confirmed_frame_w"),
+        "confirmed_ts": previous.get("confirmed_ts"),
+    }
+
+
+def central_pv_split_gate(contract, confirmed, now_s):
+    """Unbestätigte Anstiege halten; nach 60 s nur gemessenen Rest freigeben."""
+    result = dict(contract)
+    frame = central_pv_split_number(result.get("frame_w"))
+    if frame is None or result.get("reason") == "live_measurement_invalid":
+        return result
+    stamp = central_pv_split_number(result.get("confirmed_ts"))
+    age = now_s - stamp if stamp is not None and stamp <= now_s else None
+    result["frame_age_s"] = age
+    if central_pv_split_number(result.get("conservative_frame_w")) is None:
+        published = central_pv_split_number(result.get("published_frame_w"))
+        result["frame_w"] = int(min(frame, published)) if published is not None else None
+        result["reason"] = "battery_measurement_missing"
+        return result
+    if confirmed:
+        result.update(frame_confirmed=True, frame_age_s=0,
+                      confirmed_frame_w=int(frame), confirmed_ts=now_s,
+                      gate_pending_since_ts=None)
+        return result
+    published = central_pv_split_number(result.get("published_frame_w"))
+    conservative = central_pv_split_number(result.get("conservative_frame_w"))
+    pending = central_pv_split_number(result.get("gate_pending_since_ts"))
+    if pending is None or pending > now_s:
+        pending = stamp if age is not None else now_s
+    result["gate_pending_since_ts"] = pending
+    ttl = min(60, max(0, int(result.get("gate_hold_s", 60))))
+    if conservative is None:
+        # Fehlende Batteriemessung ist keine gemessene Ladeleistung von 0 W.
+        result["frame_w"] = int(min(frame, published)) if published is not None else None
+        result["reason"] = "battery_measurement_missing"
+    elif 0 <= now_s - pending <= ttl:
+        result["frame_w"] = int(min(frame, published if published is not None else conservative))
+        result["reason"] = "auto_limit_confirmation_pending"
+    else:
+        result["frame_w"] = int(min(frame, conservative))
+        result["reason"] = "auto_limit_confirmation_expired"
+    return result
+
+class _CentralPvSplit:
+    """Reine Aufteilungsrechnung ohne Gerätezugriff."""
+    scope = staticmethod(central_pv_split_scope)
+    number = staticmethod(central_pv_split_number)
+    battery_share = staticmethod(central_pv_split_battery_share)
+    split = staticmethod(central_pv_split_split)
+    gate = staticmethod(central_pv_split_gate)
+
+
+central_pv_split = _CentralPvSplit()
 
 
 def wallbox_curve_reserve_budget(
@@ -27835,6 +28798,8 @@ def _curve_frame_brake_protective(
     eine schützende Absenkung.
     """
     inputs = _curve_frame_brake_inputs(decision)
+    if isinstance(decision.get("central_pv_split"), dict):
+        return "central_pv_split_battery_brake", "both"
     for key in CURVE_FRAME_WRITE_BRAKE_PROTECT_BOTH_INPUTS:
         if bool(inputs.get(key)) or bool(decision.get(key)):
             return key, "both"
@@ -28329,17 +29294,21 @@ def build_wallbox_budget_context(
     wp_w: int,
     pv_w: int,
     home_w: int,
+    now_s: Optional[float] = None,
 ) -> WallboxBudgetContext:
-    wb_power = wallbox_actual_power_snapshot(live, wb_native)
+    wb_power = wallbox_actual_power_snapshot(live, wb_native, cfg=cfg, now_s=now_s)
     wallbox_w = abs(safe_float(wb_power.get("power_w"), 0.0))
     wallbox_power_source = str(wb_power.get("source") or "live_data")
     wallbox_power_known = wb_power.get("power_known") is True
     live_wallbox_w = abs(safe_float(wb_power.get("live_w"), 0.0))
     native_wallbox_w = abs(safe_float(wb_power.get("native_w"), 0.0))
+    if not wallbox_power_known:
+        # Ein gültiger separater E3DC-Anteil bleibt Last, ohne die externe Box zu bestätigen.
+        wallbox_w = live_wallbox_w
     home_includes_wallbox = bool(wb_power.get("home_includes_wallbox"))
 
     live_with_wallbox = dict(live)
-    live_with_wallbox["Wallbox_Power"] = wallbox_w
+    live_with_wallbox["Wallbox_Power"] = wallbox_w if wallbox_power_known else None
     live_with_wallbox["Wallbox_Power_Source"] = wallbox_power_source
     live_with_wallbox["Wallbox_Power_Known"] = wallbox_power_known
     live_with_wallbox["Wallbox_Live_Power"] = live_wallbox_w
@@ -28818,6 +29787,7 @@ def protected_decision(
         now_s=now_s, recovery_context=reserve_recovery,
     )
     if reserve_hold is not None:
+        backup_hold_add_limit_component(cfg, 'device_reserve', reserve_hold.get('auto_limit'))
         if manual_decision is not None:
             return manual_decision_with_reserve_floor(manual_decision, reserve_hold)
         peak_owner = (
@@ -28938,11 +29908,25 @@ def protected_decision(
         max_discharge_w,
         previous_state,
     )
+    reserve_context = cfg.get('_backup_hold_control') or {}
+    if reserve_context.get('grid_job'):
+        source_limits = (direct_marketing_owner or {}).get('auto_limit') or {}
+        external = (reserve_context.get('hard_external_owner') is True
+                    or direct_marketing_hard_export_owner_expected(direct_marketing_owner)
+                    or source_limits.get('set_power_execution_owner') not in (None, '', 'storage_manager')
+                    or source_limits.get('suppress_set_power_auto') is True)
+        if not external and not ((direct_marketing_owner or {}).get('direct_marketing_pv_store_dc_only')
+                                 and not (plan.get('direct_marketing', {}).get('flags') or {}).get('grid_charge_enable')):
+            reserve_owner = market_economics_decision(cfg, live, plan, now_s,
+                max_charge_w, max_discharge_w, previous_state)
+            if reserve_owner is not None and reserve_owner.get('mode') == MODE_GRID:
+                backup_hold_add_limit_component(cfg, 'direct_marketing', source_limits)
+                return reserve_owner
     if direct_marketing_owner is not None:
         return direct_marketing_owner
 
     wb_intent_fresh = bool(wb_intent) and (
-        now_s - safe_float(wb_intent.get("ts"), 0.0) <= 90.0
+        ((_input_age_s := runtime_input_age_s(safe_float(wb_intent.get("ts"), 0.0), now_s)) is not None and _input_age_s <= 90.0)
     )
     wbminsoc_runtime_raise_active = bool(
         wb_intent_fresh
@@ -29040,7 +30024,7 @@ def protected_decision(
     if unmanaged_wb_floor_hold is not None:
         return unmanaged_wb_floor_hold
 
-    floor_intent_fresh = bool(wb_intent) and now_s - safe_float(wb_intent.get("ts"), 0.0) <= 90.0
+    floor_intent_fresh = bool(wb_intent) and ((_input_age_s := runtime_input_age_s(safe_float(wb_intent.get("ts"), 0.0), now_s)) is not None and _input_age_s <= 90.0)
     floor_wb_mode = normalize_wb_mode(wb_intent.get("wb_mode_active", cfg.get("wb1_mode", 0)))
     floor_request = str(wb_intent.get("battery_request", "") or "").strip().lower()
     controlled_local_floor_regulation = bool(
@@ -29834,14 +30818,14 @@ def storage_observation_payload(
             "PV_Power", "Grid_Power", "Bat_Power", "Home_Power",
         ))
         and _live_numeric_present(live, "_ts")
-        and 0 < safe_float(live.get("_ts"), 0) <= now_s
-        and now_s - safe_float(live.get("_ts"), 0) <= 10
+        and 0 < safe_float(live.get("_ts"), 0)
+        and ((_input_age_s := runtime_input_age_s(safe_float(live.get("_ts"), 0), now_s)) is not None and _input_age_s <= 10)
         and live_power_plausibility(live).get("sample_valid", True)
     )
     pv_w = max(0, safe_int(live.get("PV_Power"), 0))
     grid_w = safe_int(live.get("Grid_Power"), 0)
     bat_w = safe_int(live.get("Bat_Power"), 0)
-    fresh_intent = bool(wb_intent) and 0 <= now_s - safe_float(wb_intent.get("ts"), 0) <= 60
+    fresh_intent = bool(wb_intent) and ((_input_age_s := runtime_input_age_s(safe_float(wb_intent.get("ts"), 0), now_s)) is not None and _input_age_s <= 60)
     mode = normalize_wb_mode(wb_intent.get("wb_mode_active", cfg.get("wb1_mode", 0)))
     wb = build_wallbox_budget_context(
         cfg, live, wb_intent, wb_native, wb_intent_fresh=fresh_intent,
@@ -29928,7 +30912,7 @@ def d1_corridor_residual_context(plan, live, intent, previous_state, now_s,
                                            "price_opt_active", "price_boost_active", "grid_allowed"))):
         result["reason"] = "protection"
         return result
-    if not intent or not 0 <= now_s-safe_float(intent.get("ts"), 0) <= 60:
+    if not intent or not ((_input_age_s := runtime_input_age_s(safe_float(intent.get("ts"), 0), now_s)) is not None and _input_age_s <= 60):
         result["reason"] = "car_state_unknown"
         return result
     rows = intent.get("car_energy_needs")
@@ -29948,7 +30932,7 @@ def d1_corridor_residual_context(plan, live, intent, previous_state, now_s,
         power = row.get("car_power_w")
         if (row.get("connected") is not True or row.get("car_power_valid") is not True
                 or type(power) not in (int, float) or not math.isfinite(power) or power < 0
-                or sample_ts is None or not 0 <= now_s-safe_float(sample_ts, 0) <= 15):
+                or sample_ts is None or not ((_input_age_s := runtime_input_age_s(safe_float(sample_ts, 0), now_s)) is not None and _input_age_s <= WALLBOX_STATUS_SAMPLE_MAX_AGE_S)):
             result["reason"] = "car_state_unknown"
             return result
     # Frische veröffentlichte Fahrzeuggrenzen begrenzen einen älteren Planwert.
@@ -30009,6 +30993,266 @@ def d1_corridor_residual_context(plan, live, intent, previous_state, now_s,
     return result
 
 
+def backup_hold_add_limit_component(cfg, name, limits):
+    """Nur einen aktuellen Schutzanteil dieses Zyklus an den Ausgang reichen."""
+    context = cfg.get('_backup_hold_control')
+    if (isinstance(context, dict) and isinstance(limits, dict)
+            and limits.get('enabled') is True and limits.get('release') is not True):
+        context.setdefault('current_limit_components', {})[name] = copy.deepcopy(limits)
+
+
+def backup_hold_closed_account(state):
+    if not isinstance(state, dict):
+        return {}
+    value = (state.get('backup_hold_control') or {}).get('closed_account') or state.get('backup_hold_closed_account')
+    return copy.deepcopy(value) if isinstance(value, dict) else {}
+
+
+def backup_hold_prepare(cfg, live, plan, previous_state, manual, now_s):
+    capacity = backup_hold.number(cfg.get('speichergroesse'))
+    if capacity is None or capacity <= 0:
+        capacity = backup_hold.number(live.get('bat_full_cap_kwh'))
+    capacity_wh = None if capacity is None else capacity * 1000
+    reserve_wh = None if capacity_wh is None else capacity_wh * ep_reserve_soc(cfg, live) / 100
+    previous_control = dict((previous_state or {}).get('backup_hold_control') or {})
+    previous_control.setdefault('closed_account', backup_hold_closed_account(previous_state))
+    context = backup_hold.control_context(cfg, plan, now_s=now_s, monotonic_s=time.monotonic(),
+        live=live, reserve_wh=reserve_wh, capacity_wh=capacity_wh,
+        max_discharge_w=configured_discharge_limit_w(cfg, live, configured_charge_limit_w(cfg, live)),
+        previous=previous_control)
+    if context is None:
+        if (safe_int(live.get('Notstrom_Status', live.get('ems_emergency_power_status')), -1) in (1, 4)
+                and previous_control.get('applied')):
+            context = dict(active=False, valid=False, now_s=now_s, grid_job=None)
+        else:
+            return None
+    manual_decision = manual_override_storage_decision(cfg, live, manual,
+        configured_charge_limit_w(cfg, live), configured_discharge_limit_w(cfg, live, 12000), previous_state)
+    direct = plan.get('direct_marketing') or {}
+    flags = direct.get('flags') or {}
+    hard_owner = bool(direct_marketing_hard_export_owner_binding(plan, now_s))
+    context['hard_external_owner'] = hard_owner
+    if hard_owner:
+        # Der Bestandsvertrag erlaubt POWER_SETTINGS; nur der Reserve-GRID-Job
+        # darf den externen Besitzer nicht übernehmen.
+        context.update(grid_job=None, grid_reason='backup_external_owner')
+    dc_only = bool((context.get('grid_job') or {}).get('source_scope') == 'E3DC_DC_ONLY'
+        or cfg_bool(cfg, 'storage_dc_first_charge_limit_enable', False)
+        or (cfg_bool(cfg, 'direct_marketing_enable', False)
+            and (flags.get('pv_store_dc_only_enable') is True
+                or cfg_bool(cfg, 'direct_marketing_pv_store_dc_only_enable', False))))
+    if (context.get('grid_job') and dc_only and not flags.get('grid_charge_enable')):
+        context.update(grid_job=None, grid_reason='backup_dc_only_grid_forbidden')
+    if manual_decision is not None:
+        context.update(active=False, reason='backup_manual_suspended', grid_job=None, grid_reason='backup_manual_suspended')
+    if safe_int(live.get('Notstrom_Status', live.get('ems_emergency_power_status')), -1) in (1, 4):
+        context.update(active=False, reason='backup_island', grid_job=None, grid_reason='backup_island',
+            island_release_pending=bool(previous_control.get('applied')),
+            island_foreign_limits=copy.deepcopy(previous_control.get('independent_auto_limit') or {}))
+    return context
+
+
+def backup_hold_without_own_limits(previous_state):
+    """Nur den eigenen Rahmenanteil zurücknehmen; unabhängige Latches behalten."""
+    previous = dict(previous_state or {})
+    control = previous.get('backup_hold_control') or {}
+    if str(previous.get('market_economics_charge_profile') or '') == 'reserve':
+        for key in list(previous):
+            if key.startswith(('market_economics_', 'market_grid_', 'market_late_fill_')):
+                previous.pop(key, None)
+        previous.update(copy.deepcopy(control.get('base_market_fields') or {}))
+    if control.get('applied'):
+        previous['auto_limit'] = copy.deepcopy(control.get('independent_auto_limit') or {})
+        if 'independent_max_discharge_w' in control:
+            previous['max_discharge_w'] = control['independent_max_discharge_w']
+    return previous
+
+
+def apply_backup_hold_limits(cfg, live, payload, context, *, now_s=None, defer_output=False):
+    """Beschränkung im selben Entscheider, auch nach allen Finalisierungen."""
+    if context is None:
+        if safe_int(live.get('Notstrom_Status', live.get('ems_emergency_power_status')), -1) in (1, 4):
+            payload['suppress_rscp_output'] = True
+        return payload
+    context = copy.deepcopy(context)
+    payload['backup_hold_control'] = context
+    if not defer_output:
+        # Eigene Übernahme verdrängt keinen unabhängigen Schutz. Die Anteile
+        # stammen ausschließlich aus der aktuellen Entscheidung dieses Zyklus,
+        # niemals aus einem zuvor gespeicherten Gesamtrahmen.
+        limits = dict(payload.get('auto_limit') or {})
+        for part in (context.get('current_limit_components') or {}).values():
+            if not limits.get('enabled') or limits.get('release'):
+                limits = copy.deepcopy(part)
+            else:
+                for key, maximum in (('max_charge_w', configured_charge_limit_w(cfg, live)),
+                        ('max_discharge_w', configured_discharge_limit_w(cfg, live, 12000))):
+                    limits[key] = min(safe_int(limits.get(key), maximum), safe_int(part.get(key), maximum))
+                if part.get('suppress_set_power_auto') is True:
+                    limits['suppress_set_power_auto'] = True
+                    limits['set_power_execution_owner'] = part.get('set_power_execution_owner')
+        if limits.get('enabled') and not limits.get('release'):
+            payload['auto_limit'] = limits
+            payload['max_discharge_w'] = min(safe_int(payload.get('max_discharge_w'),
+                configured_discharge_limit_w(cfg, live, 12000)), limits['max_discharge_w'])
+    output_now = context['now_s'] if now_s is None else float(now_s)
+    stamp = backup_hold.number(live.get('_ts'))
+    reserve_output = payload.get('market_economics_charge_profile') == 'reserve'
+    if context.get('active') and (stamp is None or not 0 <= output_now - stamp < 30):
+        context.update(active=False, valid=False, grid_job=None, reason='backup_live_unknown_or_stale')
+        if reserve_output:
+            payload.update(mode=MODE_AUTO, val=configured_charge_limit_w(cfg, live), storage_req_w=0)
+    if context.get('hard_external_owner'):
+        payload['direct_marketing_hard_export_limit_active'] = True
+        payload['direct_marketing_export_constraint_execution_owner'] = 'external_e3dc_luox'
+    if (context.get('grid_job') and (context.get('hard_external_owner')
+            or direct_marketing_hard_export_owner_expected(payload))):
+        context.update(grid_job=None, grid_reason='backup_external_owner')
+    if reserve_output and payload.get('mode') == MODE_GRID:
+        job_contract = reserve_grid_contract(context, output_now,
+            capacity_wh=safe_float(cfg.get('speichergroesse'), 0) * 1000,
+            max_charge_w=configured_charge_limit_w(cfg, live))
+        ordinary = context.get('base_market_fields') or {}
+        ordinary_contract = ordinary.get('market_economics_contract') or {}
+        independent_grid = bool(ordinary.get('mode') == MODE_GRID
+            and safe_float(ordinary_contract.get('start_ts'), float('inf')) <= output_now * 1000
+            < safe_float(ordinary_contract.get('end_ts'), 0))
+        if job_contract is None:
+            context['grid_job'] = None
+            if independent_grid:
+                payload.update(mode=MODE_GRID, val=safe_int(ordinary.get('val'), 0),
+                    market_economics_charge_profile=ordinary.get('market_economics_charge_profile', ''))
+            else:
+                payload.update(mode=MODE_AUTO, val=configured_charge_limit_w(cfg, live), storage_req_w=0)
+        else:
+            output_cap = job_contract['forecast']['grid_charge_planned_charge_w']
+            if independent_grid:
+                output_cap = max(output_cap, safe_int(ordinary.get('val'), 0))
+            room = grid_charge_room_w(cfg, live)
+            if room is not None:
+                output_cap = min(output_cap, room)
+            payload['val'] = min(max(0, safe_int(payload.get('val'),0)), output_cap)
+            payload['storage_req_w'] = payload['val']
+            if payload['val'] < 300:
+                payload.update(mode=MODE_AUTO, val=configured_charge_limit_w(cfg, live), storage_req_w=0)
+    if context.get('reason') == 'backup_island' and not defer_output:
+        # Inselversorgung geht vor dem eigenen Halten. Der Übergang läuft
+        # durch den einzigen Ausgang; weitere Inselzyklen bleiben schreibfrei.
+        payload.update(mode=MODE_AUTO, storage_req_w=0, suppress_rscp_output=not context.get('island_release_pending'))
+        if context.get('island_release_pending'):
+            foreign = context.get('island_foreign_limits') or {}
+            current = dict(payload.get('auto_limit') or {})
+            if foreign.get('enabled') and not foreign.get('release'):
+                if current.get('enabled') and not current.get('release'):
+                    foreign = dict(foreign, max_charge_w=min(foreign['max_charge_w'],current['max_charge_w']),
+                        max_discharge_w=min(foreign['max_discharge_w'],current['max_discharge_w']))
+                payload['auto_limit'] = foreign
+        context['applied'] = False
+    if not context.get('active'):
+        limits = payload.get('auto_limit') or {}
+        context['remaining_protection'] = bool(limits.get('enabled') and not limits.get('release'))
+        return payload
+    cap = max(0, safe_int(context.get('discharge_cap_w'), 0))
+    if (safe_int(payload.get('mode'), MODE_AUTO) == MODE_DISCH
+            or payload.get('predump_active') is True
+            or str(payload.get('state') or '').startswith('pre_discharge')):
+        cap = min(cap, max(0, safe_int(context.get('export_cap_w'), 0)))
+    limits = dict(payload.get('auto_limit') or {})
+    if (limits.get('set_power_execution_owner') not in (None, '', 'storage_manager')
+            or limits.get('suppress_set_power_auto') is True
+            or payload.get('external_veto_active') is True):
+        context.update(active=False, reason='backup_external_owner', grid_job=None)
+        return payload
+    # Gewöhnlicher Netzbezug öffnet den Boden nicht. Erst die unregelbare
+    # Restlast über der harten Anschlussgrenze darf die physische Reserve nutzen.
+    amps = safe_float(cfg.get('grid_max_amps'), 0)
+    if amps > 0:
+        maximum = max(0, (amps - max(0, safe_float(cfg.get('grid_max_reserve_amp'), 2))) * 690)
+        grid = backup_hold.number(live.get('Grid_Power'))
+        battery = backup_hold.number(live.get('Battery_Power'))
+        if grid is not None and battery is not None:
+            overload = max(0, grid - battery - maximum)
+            if overload > 0 and context['current_energy_wh'] > context['physical_reserve_wh'] + context['entry_buffer_wh']:
+                physical_safe = max(0, context['current_energy_wh'] - context['physical_reserve_wh']
+                    - context['entry_buffer_wh']) * 3600 / context['reaction_s']
+                cap = max(cap, min(configured_discharge_limit_w(cfg, live, 12000), int(physical_safe), int(math.ceil(overload))))
+                context['reason'] = 'backup_hard_grid_relief'
+    if not defer_output:
+        context['applied'] = safe_int(payload.get('mode'), MODE_AUTO) not in (MODE_CHRG, MODE_GRID)
+        context['independent_auto_limit'] = copy.deepcopy(limits)
+        context['independent_max_discharge_w'] = payload.get('max_discharge_w', configured_discharge_limit_w(cfg, live, 12000))
+    charge_cap = configured_charge_limit_w(cfg, live)
+    existing_cap = configured_discharge_limit_w(cfg, live, charge_cap)
+    if limits.get('enabled') and not limits.get('release'):
+        charge_cap = min(charge_cap, max(0, safe_int(limits.get('max_charge_w'), charge_cap)))
+        existing_cap = min(existing_cap, max(0, safe_int(limits.get('max_discharge_w'), existing_cap)))
+    cap = min(cap, existing_cap)
+    context['requested_discharge_w'] = cap
+    mode = safe_int(payload.get('mode'), MODE_AUTO)
+    if mode == MODE_DISCH:
+        payload['val'] = min(max(0, safe_int(payload.get('val'), 0)), cap)
+        if cap == 0:
+            payload.update(mode=MODE_AUTO, val=charge_cap)
+    if not defer_output and mode not in (MODE_CHRG, MODE_GRID):
+        limits.update(discharge_cap_auto_limit(cfg, charge_cap, cap, 'Notstrom-Vorhaltung'))
+        payload['auto_limit'] = limits
+        payload['max_discharge_w'] = cap
+        payload['heatpump_pv_set_power_only'] = False
+        payload['wallbox_fixed_start_set_power_only'] = False
+    # Wattangebote werden begrenzt, Lastmessungen nicht erneut abgezogen.
+    for container in (payload, payload.get('budget') or {}):
+        container['backup_floor_wh'] = context['floor_wh']
+        container['backup_discharge_cap_w'] = cap
+        if cap == 0:
+            container['battery_support_authorized'] = False
+            container['battery_support_reason'] = 'backup_hold_floor'
+            container['battery_support_limit_w'] = 0
+        elif 'battery_support_limit_w' in container:
+            container['battery_support_limit_w'] = min(safe_int(container['battery_support_limit_w'],0),cap)
+    return payload
+
+
+def confirm_backup_hold_output(payload):
+    context = payload.get('backup_hold_control')
+    if not isinstance(context, dict):
+        return
+    diag = payload.get('rscp_power_settings') or {}
+    # Keine SET-Antwort als physische Nichtunterschreitung deklarieren.
+    target = diag.get('readback') or {}
+    stamp = backup_hold.number(diag.get('ts'))
+    context['grid_charging'] = bool(payload.get('mode') == MODE_GRID and context.get('grid_job')
+        and (payload.get('rscp_request_transaction') or {}).get('confirmed') is True)
+    expected = context.get('requested_discharge_w')
+    context['power_settings_confirmed'] = bool(diag.get('confirmed') is True
+        and stamp is not None and 0 <= context['now_s'] - stamp < 30
+        and (expected is None or (target.get('limits_used') is True
+            and safe_int(target.get('max_discharge_w'), -1) == expected)))
+    context['confirmed_discharge_w'] = (target.get('max_discharge_w')
+        if context['power_settings_confirmed'] else None)
+    context['release_confirmed'] = bool(context.get('reason') == 'backup_live_unknown_or_stale'
+        and not context.get('remaining_protection')
+        and context['power_settings_confirmed'] and target.get('limits_used') is False)
+
+
+def storage_cycle_fault_limits(cfg, live, previous_state, ctrl):
+    """Doppelter Regelfehler: keine ungebundene pauschale Freigabe."""
+    limits = bind_configured_power_limits(ctrl, cfg, live)
+    previous = backup_hold_without_own_limits(previous_state)
+    held = copy.deepcopy(previous.get('auto_limit') or {})
+    if not held.get('enabled') or held.get('release'):
+        held = {}
+    if (previous_state.get('ep_reserve_recovery') or {}).get('active') is True:
+        held.update(discharge_block_auto_limit(cfg,
+            safe_int(held.get('max_charge_w'), limits['maximumladeleistung']), 'Bestehender Notstromschutz'))
+    context = backup_hold_prepare(cfg, live, {}, previous_state, {}, time.time())
+    fallback = storage_observation_payload(cfg, live, {}, {}, previous, time.time())
+    fallback.update(state='live_stale_auto', mode=MODE_AUTO, mode_name='AUTO',
+        val=limits['maximumladeleistung'], max_discharge_w=limits['maximaleentladeleistung'],
+        auto_limit=held, reason='Regelfehler: unabhängige Schutzgrenzen bleiben erhalten',
+        storage_regulation_enabled=True, suppress_rscp_output=False)
+    return apply_backup_hold_limits(cfg, live, fallback, context)
+
+
 def decide_next_cycle(
     cfg: Dict[str, Any],
     live: Dict[str, Any],
@@ -30023,13 +31267,37 @@ def decide_next_cycle(
     wb_native = wb_native or {}
     manual_override = manual_override or {}
     previous_state = previous_state or {}
+    wallbox_outage = wallbox_data_outage_context(cfg, wb_intent, wb_native, now_s,
+                                                  previous_state.get("wallbox_data_outage"))
+    cfg, wb_intent, wb_native = storage_inputs_without_failed_wallboxes(
+        cfg, wb_intent, wb_native, wallbox_outage)
+    if wallbox_outage["active"] or (previous_state.get("wallbox_data_outage") or {}).get("active"):
+        previous_state = dict(previous_state)
+        failed = {str(p["id"]) for p in wallbox_outage["points"]}
+        prior = dict(previous_state.get("observed_wallbox_discharge") or {})
+        prior["latches"] = {k: v for k, v in (prior.get("latches") or {}).items() if k not in failed}
+        for key in ("points", "gap_points"):
+            prior[key] = [p for p in prior.get(key, []) if str(p.get("id")) not in failed]
+        for key in ("cap_w", "last_valid_cap_w", "last_valid_cap_ts", "raise_pending_since"):
+            prior.pop(key, None)
+        previous_state["observed_wallbox_discharge"] = prior
+        for key in ("wallbox_pv_only_discharge_cap_latch", "wallbox_pv_only_discharge_deadband",
+                    "wallbox_measurement_dip_confirmation"):
+            previous_state.pop(key, None)
     # Regler- und Rahmengedächtnis sehen den ungebremsten Kandidaten des
     # Vorzyklus; alle übrigen Leser sehen den ausgegebenen Gerätevertrag.
     curve_frame_memory_state = curve_frame_write_brake_memory_state(previous_state)
 
     if not storage_regulation_enabled(cfg):
-        return storage_observation_payload(cfg, live, wb_intent, wb_native, previous_state, now_s)
+        payload = storage_observation_payload(cfg, live, wb_intent, wb_native, previous_state, now_s)
+        payload["wallbox_data_outage"] = wallbox_outage
+        return payload
 
+    backup_live_source = dict(live)
+    backup_context = backup_hold_prepare(cfg, live, plan, previous_state, manual_override, now_s)
+    previous_state = backup_hold_without_own_limits(previous_state)
+    if backup_context is not None:
+        cfg = dict(cfg, _backup_hold_control=backup_context)
     input_snapshot = build_storage_input_snapshot(live, plan, wb_native, now_s=now_s)
     live_model = input_snapshot.live
     live = live_model.to_legacy_dict()
@@ -30053,12 +31321,12 @@ def decide_next_cycle(
     home_w = max(0, safe_int(live_model.home_w, 0))
     bat_w = safe_int(live_model.battery_w, 0)
     wp_w = max(0, safe_int(live_model.heatpump_w, 0))
-    live_age_s = live_model.age_s if live_model.ts > 0.0 else live_data_age_s(live, now_s)
+    live_age_s = live_data_age_s(live, now_s)
     live_stale_guard_s = max(0.0, safe_float(cfg.get("storage_live_stale_guard_s"), 10.0))
-    live_stale = bool(live_stale_guard_s > 0.0 and live_age_s > live_stale_guard_s)
+    live_stale = bool(not math.isfinite(live_age_s) or (live_stale_guard_s > 0.0 and live_age_s > live_stale_guard_s))
     soc_jump_guard = soc_jump_guard_context(cfg, live, previous_state, now_s)
     soc_unrealistic = bool(soc_jump_guard.get("invalid"))
-    wb_intent_fresh = bool(wb_intent) and 0 <= now_s - safe_float(wb_intent.get("ts"), 0.0) <= 60.0
+    wb_intent_fresh = bool(wb_intent) and ((_input_age_s := runtime_input_age_s(safe_float(wb_intent.get("ts"), 0.0), now_s)) is not None and _input_age_s <= 60.0)
     # Akkustützung nach Korridorlage: Meldet der Wallbox-Manager „unter dem
     # Kurvenkorridor, Kontingent aufgebraucht“, bekommt die Wallbox nur den
     # PV-Überschuss und der E3DC-AUTO-Freilauf darf sie nicht aus dem Akku
@@ -30135,6 +31403,7 @@ def decide_next_cycle(
         wp_w=wp_w,
         pv_w=pv_w,
         home_w=home_w,
+        now_s=now_s,
     )
     wallbox_w = wb_budget_context.wallbox_w
     wallbox_power_source = wb_budget_context.wallbox_power_source
@@ -30265,12 +31534,13 @@ def decide_next_cycle(
         wallbox_curve_pv_only_active
         and wallbox_pv_only_discharge_latch.get("active") is True
     )
-    observe_reserve_release = observe_wallbox_reserve_release_context(
+    observe_reserve_release = observed_discharge.get("release") or observe_wallbox_reserve_release_context(
         cfg,
         live_with_wallbox,
         wb_intent if wb_intent_fresh else {},
         wb_mode,
         previous_state,
+        measurement_valid=False,
     )
     observe_reserve_release_active = bool(observe_reserve_release.get("active")) and not observed_wallbox
     active_state = {}
@@ -31521,6 +32791,7 @@ def decide_next_cycle(
         )
         if (
             controlled_wb_auto_freerun
+            and not central_pv_split.scope(cfg, controlled_intent, wb_mode, soc, now_s)
             and str(decision.get("state") or "") in {
                 "parallel_curve_auto_hold",
                 "parallel_curve_auto_no_surplus",
@@ -32592,6 +33863,102 @@ def decide_next_cycle(
                 + "; "
                 + auto_limit_reason
             )[:220]
+    central_split = None
+    if (
+        central_pv_split.scope(cfg, controlled_intent, wb_mode, soc, now_s)
+        and not external_wallbox_manager_active
+        and not only_observed_wallbox and wb_car_present
+        and (controlled_wallbox_w > 250 or controlled_wb_start_pending
+             or controlled_intent.get("start_requested") is True
+             or controlled_intent.get("charging_active") is True)
+        and not decision.get("protected") and not decision.get("force_wallbox_stop")
+        and decision.get("predump_active") is not True
+        and str(decision.get("state") or "").startswith("parallel_")
+        and str(decision.get("state") or "") not in AUTO_LIMIT_REQUIRED_STATES
+        and not live_stale and not live_sample_invalid and not soc_unrealistic
+    ):
+        minimum = predump_wallbox_minimum_power_w(cfg, controlled_intent, controlled_native)
+        central_power = wallbox_actual_power_snapshot(
+            live, controlled_native, now_s=now_s, max_age_s=WALLBOX_EVIDENCE_LIVE_MAX_AGE_S,
+            sample_max_age_s=WALLBOX_STATUS_SAMPLE_MAX_AGE_S, require_fresh_evidence=True,
+        )
+        central_details = controlled_native.get("wb_details") or []
+        central_measurement_valid = bool(
+            central_power.get("measurement_valid") is True
+            and central_power.get("power_known") is True
+            and all(_wallbox_status_sample_fresh(d, now_s=now_s, max_age_s=WALLBOX_STATUS_SAMPLE_MAX_AGE_S)
+                    and _finite_non_negative_or_none(d.get("power_w")) is not None
+                    for d in central_details)
+            and (central_details or wallbox_type_is_e3dc(cfg.get("wb_native_type", "e3dc")))
+        )
+        # Jede externe geregelte Box steckt im Hauswert. Die E3DC-Boxen
+        # liegen am getrennten Messpunkt; auch eine gemischte Gruppe braucht
+        # deshalb die Zuordnung je Ladepunkt statt eines Summen-Ersatzwerts.
+        central_embedded_w = 0
+        central_e3dc_w = 0
+        central_ids = set()
+        # Typ je Ladepunkt aus dessen eigenem Schlüssel (WB2: wb_native_type2), nie vom
+        # Nachbarpunkt; ein ladender Punkt ohne bekannten Typ hat keinen klaren Messpunkt.
+        central_off_types = ("", "none", "off", "aus", "disabled", "0", "false", "no", "nein",
+                             "deaktiviert", "keine", "keine_wallbox", "no_wallbox", "-1")
+        central_type_keys = {1: "wb_native_type", 2: "wb_native_type2"}
+        for detail in central_details:
+            detail_id = safe_int(detail.get("id", detail.get("wb_id")), 1)
+            central_ids.add(detail_id)
+            detail_type = str(detail.get("type") or cfg.get(
+                central_type_keys.get(detail_id, ""), "e3dc" if detail_id == 1 else "") or "").strip()
+            detail_power_w = max(0, safe_int(detail.get("power_w"), 0))
+            if detail_type.lower() in central_off_types:
+                if detail_power_w > 0:
+                    central_measurement_valid = False
+            elif wallbox_type_is_e3dc(detail_type):
+                central_e3dc_w += detail_power_w
+            else:
+                central_embedded_w += detail_power_w
+        for detail_id, type_key in central_type_keys.items():
+            configured_type = str(cfg.get(type_key, "e3dc" if detail_id == 1 else "") or "").strip().lower()
+            if (configured_type not in central_off_types
+                    and normalize_wb_mode(cfg.get("wb%d_mode" % detail_id, wb_mode)) != MODE_OFF
+                    and detail_id not in observed_ids and detail_id not in central_ids
+                    and not (detail_id == 1 and not central_details
+                             and wallbox_type_is_e3dc(cfg.get("wb_native_type", "e3dc")))):
+                central_measurement_valid = False
+        # Home_Power ist im Erzeuger-/Lesepfad bereits WP-bereinigt.
+        # Heizstab und beobachtete externe Boxen bleiben im Hauswert enthalten.
+        observed_separate_w = (
+            max(0, safe_int(live.get("Wallbox_Power"), 0) - central_e3dc_w)
+            if observed_wallbox else 0
+        )
+        fixed_load_w = max(0, home_w - central_embedded_w) + wp_w + observed_separate_w
+        prior_split = previous_state.get("central_pv_split") or (previous_state.get("budget") or {}).get("central_pv_split") or {}
+        central_split = central_pv_split.split(
+            pv_w=pv_w, fixed_load_w=fixed_load_w, i_fc_w=i_fc_w,
+            maximum_w=max_charge_w, support_w=0,
+            battery_w=live.get("Battery_Power"),
+            battery_valid=live.get("Battery_Power_Valid", live.get("RSCP_Sample_Valid")) is True,
+            min_power_w=safe_int(minimum.get("power_w"), 0),
+            measurement_valid=central_measurement_valid, live_valid=True,
+            previous=prior_split, now_s=now_s,
+            step_w=safe_int(cfg.get("storage_wb_curve_reserve_step_w"), 230 * safe_int(minimum.get("phases"), 3)),
+        )
+        central_split["gate_hold_s"] = min(60, max(0, safe_int(cfg.get("storage_central_pv_split_gate_hold_s"), 60)))
+        share_w = central_split["battery_share_w"]
+        prior_limit = decision.get("auto_limit") or {}
+        decision.update(
+            state="parallel_curve_charge" if share_w else "parallel_curve_auto_hold",
+            priority="curve", mode=MODE_AUTO, val=share_w, storage_req_w=share_w,
+            controlled_wallbox_auto_freerun=False, controlled_wallbox_auto_limit_active=True,
+            wallbox_curve_reserve_w=share_w, wallbox_curve_reserve_target_w=share_w,
+            central_pv_split=central_split,
+            reason="Kurve zuerst: Akku %d W, Wallbox %s" % (
+                share_w, "unbekannt" if central_split["frame_w"] is None else "%d W" % central_split["frame_w"]),
+        )
+        decision["auto_limit"] = dict(
+            prior_limit, enabled=True, release=False, max_charge_w=share_w,
+            max_discharge_w=safe_int(prior_limit.get("max_discharge_w"), max_discharge_w),
+            discharge_start_w=0, bounded_zero_readback_max_w=EMS_POWER_SETTINGS_NONZERO_MIN_W if share_w == 0 else 0,
+            heartbeat_s=auto_limit_heartbeat_s(cfg), reason=decision["reason"],
+        )
     # Schreibbremse für nicht schützende Änderungen des AUTO-Laderahmens. Wächter-,
     # Notstrom-, Schutz- und manuelle Entscheidungen laufen nur beobachtend durch.
     try:
@@ -32669,6 +34036,10 @@ def decide_next_cycle(
         decision.update(market_hold_decision)
         auto_limit = dict(market_hold_decision["auto_limit"])
         auto_limit["max_charge_w"] = min(max_charge_w, charge_cap_w)
+        if market_hold_decision.get("market_hold_bridge"):
+            # Bei unklarer Planung auch den zuvor gebundenen PV-Rahmen erhalten.
+            auto_limit["max_charge_w"] = min(auto_limit["max_charge_w"],
+                max(0, safe_int(market_hold_decision["auto_limit"].get("max_charge_w"), 0)))
         auto_limit["bounded_zero_readback_max_w"] = (
             EMS_POWER_SETTINGS_NONZERO_MIN_W if auto_limit["max_charge_w"] == 0 else 0
         )
@@ -32683,6 +34054,7 @@ def decide_next_cycle(
         # nicht den ausschließlich für die Ladegrenze berechneten Kandidaten.
         decision = apply_peak_shaving_secondary_candidate(decision, peak_shaving_evaluation)
     decision["d1_corridor_residual"] = d1_corridor
+    decision["wallbox_data_outage"] = wallbox_outage
     decision["observed_wallbox_discharge"] = observed_discharge
     if observed_discharge.get("policy") and not (live_stale or live_sample_invalid or soc_unrealistic):
         decision = apply_observed_wallbox_discharge_cap(
@@ -32690,6 +34062,7 @@ def decide_next_cycle(
         )
         decision["observe_wallbox_storage_policy"] = observed_policy
         decision["observe_wallbox_reserve_release_active"] = bool(observe_reserve_release.get("active"))
+        decision["observe_wallbox_reserve_release_reason"] = observe_reserve_release.get("reason", "reserve_floor")
         decision["observe_wallbox_reserve_floor_soc"] = observe_reserve_release.get("floor_soc")
         decision["observe_wallbox_reserve_release_floor_soc"] = observe_reserve_release.get("release_floor_soc")
     decision = enforce_hard_mode_guard(
@@ -33676,6 +35049,26 @@ def decide_next_cycle(
         0, max(wallbox_exclusive_start_support_w, wallbox_running_hold_support_w) - fixed_start_grid_w
         - safe_int((heatpump_sources.get("source_assignments_w") or {}).get("wallbox", {}).get("pv"), 0),
     )
+    if central_split is not None:
+        final_limit = decision.get("auto_limit") or {}
+        central_split["battery_share_w"] = safe_int(final_limit.get("max_charge_w"), central_split["battery_share_w"])
+        central_split["candidate_w"] = max(0, central_split["neutral_pv_w"] - central_split["battery_share_w"])
+        if central_split["frame_w"] is not None:
+            central_split["frame_w"] = min(central_split["frame_w"], central_split["candidate_w"])
+        # Die Einzelmessungen der festen Verbraucher werden dem gemeinsamen
+        # Vertrag zurückgegeben; dort belegen sie ihren Anteil genau einmal.
+        budget_w = max(0, safe_int(central_split["frame_w"], 0))
+        budget_w += max(0, wp_w) + max(0, safe_int(live.get("Heizstab_Power"), 0))
+        if max_controllable_ceiling_w > 0 and not cfg.get("_test_mock_bypass"):
+            budget_w = min(budget_w, max_controllable_ceiling_w)
+        wallbox_running_hold_support_w = 0
+        wallbox_exclusive_start_support_w = 0
+        phase_transition_reserved_w = min(phase_transition_reserved_w, max(0, safe_int(central_split["frame_w"], 0)))
+        start_hold_required_w = min(start_hold_required_w, max(0, safe_int(central_split["frame_w"], 0)))
+    if backup_context and backup_context.get('active'):
+        # Vorhaltung ist ein Mindestbestand, kein zweiter Lastabzug.
+        budget_w = min(budget_w, max(0, int(consumer_signed_residual_w
+            + safe_int(backup_context.get('discharge_cap_w'), 0))))
     consumer_budget_contract = build_flexible_consumer_budget_contract(
         cfg,
         live,
@@ -33683,11 +35076,13 @@ def decide_next_cycle(
         available_w=budget_w,
         signed_residual_w=consumer_signed_residual_w,
         available_is_residual_after_running=bool(
+            central_split is None and (
             (
                 state.startswith("parallel_")
                 and not decision.get("protected")
             )
             or ep_reserve_wallbox_budget.get("running_pv_continuation") is True
+            )
         ),
         flexible_after_commitments_w=flexible_consumer_budget_w,
         wallbox_possible_w=wb_possible_w,
@@ -33734,6 +35129,16 @@ def decide_next_cycle(
             wallbox_running_hold_support_w
         ),
         heatpump_source_contract=heatpump_sources,
+        start_source_budget_w=(
+            min(max(0, safe_int(central_split["candidate_w"], 0))
+                + max(0, wp_w) + max(0, safe_int(live.get("Heizstab_Power"), 0)),
+                max_controllable_ceiling_w)
+            if central_split is not None and max_controllable_ceiling_w > 0
+            else max(0, safe_int(central_split["candidate_w"], 0))
+                + max(0, wp_w) + max(0, safe_int(live.get("Heizstab_Power"), 0))
+            if central_split is not None else None
+        ),
+        wallbox_frame_only=central_split is not None,
     )
     consumer_budget_contract["wallbox_fixed_start_grid_support_w"] = fixed_start_grid_w
     consumer_budget_contract["wallbox_fixed_start_support_w"] = fixed_start_support_w
@@ -33971,14 +35376,17 @@ def decide_next_cycle(
         "d1_corridor_charge_w": (max(0, bat_w)
             if decision.get("d1_corridor_residual", {}).get("active")
             and safe_int((decision.get("auto_limit") or {}).get("max_charge_w"), 0) > 0 else 0),
+        "wallbox_data_outage": decision.get("wallbox_data_outage", {}),
         "observed_wallbox_discharge": decision.get("observed_wallbox_discharge", {}),
         "observe_wallbox_storage_policy": decision.get("observe_wallbox_storage_policy"),
         "observe_wallbox_reserve_release_active": bool(decision.get("observe_wallbox_reserve_release_active")),
+        "observe_wallbox_reserve_release_reason": decision.get("observe_wallbox_reserve_release_reason"),
         "observe_wallbox_reserve_floor_soc": decision.get("observe_wallbox_reserve_floor_soc"),
         "observe_wallbox_reserve_release_floor_soc": decision.get("observe_wallbox_reserve_release_floor_soc"),
         "observe_wallbox_reserve_soc": decision.get("observe_wallbox_reserve_soc"),
         "wallbox_curve_pv_only": bool(decision.get("wallbox_curve_pv_only")),
         "target_corridor_fast_charge_active": bool(decision.get("target_corridor_fast_charge_active")),
+        **market_end_fields(cfg, plan, decision, previous_state, now_s),
         "market_economics_active": bool(decision.get("market_economics_active")),
         "market_economics_owner": decision.get("market_economics_owner"),
         "market_economics_contract_version": decision.get("market_economics_contract_version"),
@@ -34730,6 +36138,7 @@ def decide_next_cycle(
         "direct_marketing_ramp_step_w": safe_int(decision.get("direct_marketing_ramp_step_w"), 0),
         "direct_marketing_economics": decision.get("direct_marketing_economics") if isinstance(decision.get("direct_marketing_economics"), dict) else {},
         "direct_marketing_monitor": direct_marketing_monitor_state,
+        **market_end_fields(cfg, plan, decision, previous_state, now_s),
         "market_economics_active": bool(decision.get("market_economics_active")),
         "market_economics_owner": decision.get("market_economics_owner"),
         "market_economics_contract_version": decision.get("market_economics_contract_version"),
@@ -34763,7 +36172,7 @@ def decide_next_cycle(
         "storage_state": state,
         "reason": str(decision.get("reason") or "")[:160],
         "wb_possible_power_w": wb_possible_w,
-        "live_age_s": round(live_age_s, 1),
+        "live_age_s": round(live_age_s, 1) if math.isfinite(live_age_s) else None,
         "live_stale": live_stale,
         "live_sample_valid": bool(live_plausibility.get("sample_valid", True)),
         "live_sample_invalid": live_sample_invalid,
@@ -35076,7 +36485,7 @@ def decide_next_cycle(
         "wallbox_live_w": live_wallbox_w,
         "wallbox_native_w": native_wallbox_w,
         "wallbox_home_includes": home_includes_wallbox,
-        "live_age_s": round(live_age_s, 1),
+        "live_age_s": round(live_age_s, 1) if math.isfinite(live_age_s) else None,
         "live_stale": live_stale,
         "live_sample_valid": bool(live_plausibility.get("sample_valid", True)),
         "live_sample_invalid": live_sample_invalid,
@@ -35254,14 +36663,17 @@ def decide_next_cycle(
         "d1_corridor_charge_w": (max(0, bat_w)
             if decision.get("d1_corridor_residual", {}).get("active")
             and safe_int((decision.get("auto_limit") or {}).get("max_charge_w"), 0) > 0 else 0),
+        "wallbox_data_outage": decision.get("wallbox_data_outage", {}),
         "observed_wallbox_discharge": decision.get("observed_wallbox_discharge", {}),
         "observe_wallbox_storage_policy": decision.get("observe_wallbox_storage_policy"),
         "observe_wallbox_reserve_release_active": bool(decision.get("observe_wallbox_reserve_release_active")),
+        "observe_wallbox_reserve_release_reason": decision.get("observe_wallbox_reserve_release_reason"),
         "observe_wallbox_reserve_floor_soc": decision.get("observe_wallbox_reserve_floor_soc"),
         "observe_wallbox_reserve_release_floor_soc": decision.get("observe_wallbox_reserve_release_floor_soc"),
         "observe_wallbox_reserve_soc": decision.get("observe_wallbox_reserve_soc"),
         "wallbox_curve_pv_only": bool(decision.get("wallbox_curve_pv_only")),
         "target_corridor_fast_charge_active": bool(decision.get("target_corridor_fast_charge_active")),
+        **market_end_fields(cfg, plan, decision, previous_state, now_s),
         "market_economics_active": bool(decision.get("market_economics_active")),
         "market_economics_owner": decision.get("market_economics_owner"),
         "market_economics_contract_version": decision.get("market_economics_contract_version"),
@@ -35292,7 +36704,7 @@ def decide_next_cycle(
         # Beobachtete Markt-Ladeleistung (EWMA) über das payload-Dict fortführen;
         # der Simulator liest sie aus dem Zustandsfile als P_obs (nur Planung).
         # max_charge_w = Ladegrenze für den Grenzbeleg der EWMA; Latch-Grund
-        # (target_reached | latched | pv_fills_room | need_covered | rearmed) für Zustandsfile und Diagnose.
+        # (target_reached | latched | pv_fills_room | need_covered | below_minimum | window_delivery_closed | rearmed) für Zustandsfile und Diagnose.
         **market_grid_observed_charge_state(previous_state, decision, live, now_s, max_charge_w=max_charge_w),
         # Anhebeprobe über das payload-Dict fortführen; entscheidet ein anderer
         # Zustand/Besitzer, ruht die Probe und nur der Slot-Latch bleibt. Kein Restore nach einem Neustart.
@@ -35851,6 +37263,39 @@ def decide_next_cycle(
         "shadow_payload": decision.get("shadow_payload"),
         "market_hold_curve_context": decision.get("market_hold_curve_context"),
     }
+    if central_split is not None:
+        # Der absolute Rest bleibt auch unter der Allokator-Startschwelle
+        # erhalten. Andere Verbraucher belegen ihren Anteil nach Priorität;
+        # eine nicht ausführbare Wallboxleistung wird nicht als 0 W gemessen.
+        central_remaining_w = max(
+            0, consumer_total_budget_w
+            - safe_int(consumer_accounting_allocations.get("heatpump"), 0)
+            - safe_int(consumer_accounting_allocations.get("heater"), 0),
+        )
+        priority_rebooked_w = sum(
+            max(0, safe_int((consumer_budget_contract.get("measured_acceptance_w") or {}).get(name), 0)
+                - safe_int(consumer_allocations.get(name), 0))
+            for name in consumer_budget_contract.get("priority_running_reclaimable", [])
+            if name in ("heatpump", "heater")
+        ) if consumer_command_validation.get("valid") is True else 0
+        if priority_rebooked_w > 0 and consumer_allocations.get("wallbox", 0) > 0:
+            # Der gemeinsame Vertrag enthält diese gemessene Leistung schon.
+            # Nur den Wallbox-Kommandorahmen aus derselben Summe umschichten;
+            # der reale feste Verbrauch bleibt separat sichtbar.
+            central_split["actual_fixed_load_w"] = central_split["fixed_load_w"]
+            central_split["priority_rebooked_w"] = priority_rebooked_w
+            central_split["fixed_load_w"] = max(0, central_split["fixed_load_w"] - priority_rebooked_w)
+            central_split["neutral_pv_w"] += priority_rebooked_w
+            central_split["candidate_w"] += priority_rebooked_w
+            central_split["frame_w"] = min(consumer_allocations["wallbox"], central_remaining_w)
+        else:
+            central_split["frame_w"] = (min(central_split["frame_w"], central_remaining_w)
+                                        if central_split["frame_w"] is not None else None)
+        payload["central_pv_split"] = central_split
+        budget["central_pv_split"] = copy.deepcopy(central_split)
+        budget["wallbox_curve_reserve_w"] = central_split["battery_share_w"]
+        budget["storage_curve_budget_active"] = True
+        budget["budget_w"] = central_split["frame_w"]
     payload["smartcharge_external_veto"] = storage_smartcharge_external_veto_contract(
         live,
         payload,
@@ -35884,8 +37329,13 @@ def decide_next_cycle(
         "state_label": display["state_label"],
         "display_reason": display["display_reason"],
     })
-    return payload
-
+    payload.update(direct_marketing_hard_export_owner_binding(plan, now_s))
+    for key in ("direct_marketing_grid_blocked", "direct_marketing_grid_owner_reason",
+                "direct_marketing_grid_owner_hint"):
+        if key in decision:
+            payload[key] = decision[key]
+    enforce_direct_marketing_grid_owner(payload)
+    return apply_backup_hold_limits(cfg, backup_live_source, payload, backup_context, defer_output=True)
 
 
 
@@ -36304,6 +37754,36 @@ def _sanitize_wallbox_ifc_container(container: Dict[str, Any], block_reason: str
         container["phase_contract"] = phase_contract
 
 
+def apply_central_pv_split_projection(payload, *, in_place=False):
+    """Bindet den veröffentlichten Rahmen an denselben AUTO-Readback."""
+    projected = payload if in_place else dict(payload)
+    contract = payload["central_pv_split"]
+    readback = payload.get("wallbox_ifc_readback_gate") or {}
+    # Vor Geräteausgang keine Bestätigung und keine Verjüngung alter Belege.
+    # Auch ein 0-W-Wallboxrahmen kann an einem bestätigten AUTO-Limit hängen;
+    # das alte Gate nennt ihn mangels Wattangebot lediglich „not_required“.
+    proof_keys = ("auto_limit_contract_valid", "diagnostic_schema_matches",
+                  "diagnostic_contract_version_matches", "diagnostic_status_allowed",
+                  "confirmed", "same_cycle_proof", "readback_source_matches",
+                  "requested_matches", "readback_matches")
+    evidence_age = central_pv_split.number(readback.get("readback_age_s"))
+    confirmed = bool(
+        all(readback.get(key) is True for key in proof_keys)
+        and readback.get("readback_timestamp_future") is not True
+        and evidence_age is not None and 0 <= evidence_age <= 5
+    )
+    now_s = safe_float(payload.get("ts"), time.time())
+    result = central_pv_split.gate(contract, confirmed, now_s)
+    projected["central_pv_split"] = result
+    budget = dict(payload.get("budget") or {})
+    budget["central_pv_split"] = copy.deepcopy(result)
+    budget["budget_w"] = result["frame_w"]
+    budget["raw_iAVal_w"] = result["frame_w"]
+    budget["iAVal_w"] = result["frame_w"]
+    projected["budget"] = budget
+    return projected
+
+
 def apply_wallbox_ifc_safe_projection(
     payload: Dict[str, Any],
     *,
@@ -36313,6 +37793,8 @@ def apply_wallbox_ifc_safe_projection(
 
     if not isinstance(payload, dict):
         return {}
+    if isinstance(payload.get("central_pv_split"), dict):
+        return apply_central_pv_split_projection(payload, in_place=in_place)
     gate = (
         payload.get("wallbox_ifc_readback_gate")
         if isinstance(payload.get("wallbox_ifc_readback_gate"), dict)
@@ -36441,9 +37923,8 @@ def _storage_curve_cap_live_power_settings(
     raw_ts = _consumer_runtime_finite(snapshot.get("_ts"))
     if raw_ts is None or raw_ts <= 0.0:
         return None
-    sample_ts = raw_ts / 1000.0 if raw_ts > 100_000_000_000.0 else raw_ts
-    age_s = float(now_s) - sample_ts
-    if not math.isfinite(age_s) or not 0.0 <= age_s <= 5.0:
+    age_s = runtime_input_age_s(raw_ts, now_s)
+    if age_s is None or not 0.0 <= age_s <= 5.0:
         return None
     return _storage_curve_cap_power_settings({
         # Vor der ersten Managerentscheidung liegt der kanonische Live-Key
@@ -37326,6 +38807,14 @@ def _consumer_budget_runtime_projection(
             pv_state = {"schema": "heatpump_pv_state_invalid_v1"}
     return {
         **({"heatpump_pv_contract": {"state": pv_state}} if pv_state is not None else {}),
+        **({"priority_start_episode": copy.deepcopy(contract["priority_start_episode"])}
+           if isinstance(contract.get("priority_start_episode"), dict) else {}),
+        **({"priority_running_reclaim_starters": copy.deepcopy(contract["priority_running_reclaim_starters"])}
+           if isinstance(contract.get("priority_running_reclaim_starters"), dict)
+           and all(name in ("heatpump", "heater") and isinstance(starts, list)
+               and all(isinstance(start, str) for start in starts)
+               and len(starts) == len(set(starts)) and all(start in _FLEXIBLE_CONSUMERS for start in starts)
+               for name, starts in contract["priority_running_reclaim_starters"].items()) else {}),
         "schema_version": contract.get("schema_version"),
         "consumer_priority_key": priority_key,
         "consumer_priority_changed_at_s": float(priority_changed_at_s),
@@ -37433,6 +38922,8 @@ def restore_heatpump_pv_durable_state(
     durable = heatpump_pv_policy.validate_heatpump_pv_state(durable_state)
     ram = heatpump_pv_policy.validate_heatpump_pv_state(runtime_state)
     chosen = copy.deepcopy(durable or durable_state or {"schema": "heatpump_pv_state_invalid_v1"})
+    legacy_container = heatpump_pv_checkpoint.heatpump_pv_time_confirmation(clock_sample).get(
+        "time_confirmation_scope") == "docker_legacy"
 
     def quarantine(value: Dict[str, Any]) -> None:
         if value.get("uncertain_state") is not True:
@@ -37455,17 +38946,32 @@ def restore_heatpump_pv_durable_state(
             # Der jüngere flüchtige Stand darf eine fehlende oder beschädigte
             # dauerhafte Kontohistorie nicht als neues Wh-Kontingent freigeben.
             chosen = copy.deepcopy(ram)
-            quarantine(chosen)
+            if legacy_container:
+                quarantine(chosen)
+            else:
+                heatpump_pv_policy.prepare_heatpump_pv_recovery(chosen, kind="checkpoint_loss")
         else:
             # Ohne gemeinsame Zeitachse werden keine Wh gegeneinander verrechnet
             # oder Restfristen als abgelaufen angenommen. Die dauerhafte Bindung
             # bleibt samt Kompressorschutz erhalten.
             chosen = copy.deepcopy(durable)
-            quarantine(chosen)
+            if disk_clock.get("boot_id") == clock_sample.get("boot_id"):
+                quarantine(chosen)
     if durable:
         disk_clock = durable.get("clock") if isinstance(durable.get("clock"), dict) else {}
         if disk_clock.get("boot_id") != clock_sample.get("boot_id"):
-            quarantine(chosen)
+            if durable.get("checkpoint_saved_ts") is not None and not legacy_container:
+                recovery = durable.get("energy_recovery") or {}
+                anchor = recovery.get("anchor_wall_s") or disk_clock.get("wall_s")
+                gap_active = heatpump_pv_checkpoint.heatpump_pv_gap_intent_uncertain(
+                    anchor_wall_s=anchor or 0.0, account_state=chosen,
+                    now_s=clock_sample.get("wall_ts", clock_sample.get("wall_s")))
+                heatpump_pv_policy.prepare_heatpump_pv_recovery(chosen, gap_active=gap_active)
+            else:
+                quarantine(chosen)
+    if legacy_container and chosen.get("uncertain_state"):
+        chosen["time_confirmation_source"] = "clock_unconfirmed"
+        chosen["energy_recovery_reason"] = "clock_unconfirmed"
     contract["heatpump_pv_contract"] = {"state": chosen}
     result["heatpump_pv_checkpoint_restore"] = {
         "durable_valid": bool(durable), "runtime_valid": bool(ram),
@@ -37664,7 +39170,7 @@ def finalize_heatpump_pv_output_owner(
         or result.get("suppress_rscp_output")
         or result.get("storage_regulation_enabled") is False
         or source.get("fresh") is not True or source_ts is None
-        or not 0.0 <= now_s - source_ts <= 10.0
+        or not ((_input_age_s := runtime_input_age_s(source_ts, now_s)) is not None and _input_age_s <= 10.0)
     )
     if (changed and not output_hard_veto
             and grant.get("control_mode") == "measured"
@@ -37911,11 +39417,16 @@ def apply_heat_tariff_storage(cfg, live, payload, energy_decision, previous_stat
 
 
 def write_state(payload: Dict[str, Any], plan: Dict[str, Any]) -> None:
+    backup_live = payload.pop('_backup_hold_live', None)
     payload = apply_wallbox_ifc_safe_projection(payload)
-    state_ts = int(time.time())
+    state_now = time.time()
+    state_ts = int(state_now)
     payload["corridor_now"] = storage_corridor_now(payload, state_ts, plan.get("plan_id"))
     payload.update(build_display(payload, now_s=state_ts))
     prior_persisted_state = read_json_file(STATE_F)
+    closed_account = backup_hold_closed_account(payload) or backup_hold_closed_account(prior_persisted_state)
+    if closed_account:
+        payload['backup_hold_closed_account'] = closed_account
     curve_cap_handover = terminal_storage_curve_cap_handover_state(
         payload,
         prior_persisted_state,
@@ -37923,8 +39434,23 @@ def write_state(payload: Dict[str, Any], plan: Dict[str, Any]) -> None:
     )
     if payload.get("storage_regulation_enabled") is False:
         curve_cap_handover = {}
+    payload['backup_hold_observation'] = backup_hold.read_observation(
+        plan, read_storage_regulation_config(V4_CFG) or {}, state_now * 1000,
+        current_live=backup_live,
+    )
     state = {
+        **({'backup_hold_closed_account': copy.deepcopy(closed_account)} if closed_account else {}),
+        **({'backup_hold_control': copy.deepcopy(payload['backup_hold_control'])}
+           if isinstance(payload.get('backup_hold_control'), dict) else {}),
         "storage_regulation": copy.deepcopy(payload.get("storage_regulation")),
+        "market_plan_quality": copy.deepcopy(payload.get("market_plan_quality")),
+        "market_hold_trust": copy.deepcopy(payload.get("market_hold_trust") or {}),
+        "market_hold_bridge": copy.deepcopy(payload.get("market_hold_bridge") or {}),
+        "market_control_end": copy.deepcopy(payload.get("market_control_end") or {}),
+        "market_control_text": market_control_display_text(payload),
+        "market_control_active": bool(payload.get("market_control_active")),
+        **({"backup_hold_observation": copy.deepcopy(payload['backup_hold_observation'])}
+           if payload.get('backup_hold_observation', {}).get('enabled') is True else {}),
         "storage_plan_id": plan.get("plan_id"),
         "corridor_now": copy.deepcopy(payload.get("corridor_now"))
         if isinstance(payload.get("corridor_now"), dict)
@@ -38406,8 +39932,14 @@ def write_state(payload: Dict[str, Any], plan: Dict[str, Any]) -> None:
         "service": "storage_manager",
         "ladekurve": build_ladekurve_meta(plan),
     }
+    if isinstance(payload.get("central_pv_split"), dict):
+        state["central_pv_split"] = copy.deepcopy(payload["central_pv_split"])
     if isinstance(payload.get("heat_tariff_shift"), dict):
         state["heat_tariff_shift"] = copy.deepcopy(payload["heat_tariff_shift"])
+    for key in ("direct_marketing_grid_blocked", "direct_marketing_grid_owner_reason",
+                "direct_marketing_grid_owner_hint"):
+        if key in payload:
+            state[key] = payload[key]
     atomic_write_on_change(STATE_F, state, indent=2)
 
 
@@ -38474,7 +40006,7 @@ _WB_BUDGET_CONTROL_KEYS = {
     "wallbox_w", "wallbox_power_source", "auto_limit", "runtime_block_reason",
     "ems_budget_runtime_class", "ems_budget_runtime_cap_applied",
     "ems_budget_runtime_single_sink_superseded",
-    "wallbox_ifc_readback_gate",
+    "wallbox_ifc_readback_gate", "central_pv_split", "storage_curve_budget_active",
     "wbminsoc_runtime_raise_active", "wbminsoc_runtime_raise_pv_only_budget_w",
     "battery_support_authorized", "battery_support_reason",
     "pv_only_allowed_w", "pv_only_authorized_w",
@@ -38778,7 +40310,25 @@ def _wb_budget_control_payload(
     control["diagnostic_surface"] = os.path.basename(WB_DIAGNOSTIC_F)
     control["ts"] = safe_int(budget.get("ts"), int(time.time()))
     control["budget_w"] = max(0, safe_int(control.get("budget_w"), 0))
+    if isinstance(budget.get("central_pv_split"), dict):
+        control["budget_w"] = budget["central_pv_split"].get("frame_w")
+        control["raw_iAVal_w"] = control["budget_w"]
+        control["iAVal_w"] = control["budget_w"]
     payload = decision_payload if isinstance(decision_payload, dict) else budget
+    if (
+        str(payload.get("state") or control.get("storage_state") or "")
+        == "live_plausibility_auto"
+        and control.get("live_sample_invalid") is True
+        and control.get("budget_w") == 0
+        and not payload.get("protected")
+        and not control.get("force_wallbox_stop")
+        and not control.get("predump_floor_hold")
+    ):
+        # Der Datenwächter erteilt keinen neuen Verbraucherplan. Der bestehende
+        # kurze Ausgangshalt verlangt genau diese gebundene leere Nullhülle;
+        # Identität und Revision werden erst danach aus dem Drahtinhalt gebildet.
+        control["consumer_budget_contract"] = {}
+        control["consumer_budget_contract_valid"] = False
     control["producer_identity"] = _wb_budget_producer_identity(control, payload)
 
     # Der veröffentlichte Vertrag muss ein eigenständiger Draht-Snapshot sein.
@@ -38965,8 +40515,11 @@ def write_wb_budget(payload: Dict[str, Any]) -> None:
         budget["wallbox_ifc_readback_gate"] = copy.deepcopy(readback_gate)
     budget["ts"] = int(time.time())
     budget = _apply_consumer_budget_contract_projection(budget)
+    if isinstance(payload.get("central_pv_split"), dict):
+        budget.update(copy.deepcopy(payload["budget"]))
     w = max(0, safe_int(budget.get("budget_w"), 0))
-    budget["budget_w"] = w
+    if not (isinstance(budget.get("central_pv_split"), dict) and budget["central_pv_split"].get("frame_w") is None):
+        budget["budget_w"] = w
     budget.setdefault("budget_amp_1ph", max(6, min(32, int(w / 230))) if w >= 6 * 230 else 0)
     budget.setdefault("budget_amp_3ph", max(6, min(32, int(w / 690))) if w >= 6 * 690 else 0)
     budget.setdefault("manager_title", payload.get("manager_title", "Speicher-Regelung"))
@@ -39036,7 +40589,9 @@ def write_safe_start_state(
     """Publish a safe boot/update state without sending an RSCP command."""
     state_ts = int(time.time())
     prior_state = read_json_file(STATE_F)
+    closed_account = backup_hold_closed_account(prior_state)
     payload: Dict[str, Any] = {
+        **({'backup_hold_closed_account': closed_account} if closed_account else {}),
         "state": state,
         "mode": mode,
         "mode_name": mode_label(mode) if mode >= 0 else "UNKNOWN",
@@ -43906,7 +45461,7 @@ def _phase5_passive_normal_curve_charge_contract(
     ):
         result["reason"] = "live_measurement_contract_invalid"
         return result
-    live_age_s = float(now_s) - float(live_ts_raw)
+    live_age_s = runtime_input_age_s(live_ts_raw, now_s)
     live_max_age_s = max(
         1.0,
         min(30.0, safe_float(cfg.get("storage_live_stale_guard_s"), 10.0)),
@@ -43938,7 +45493,7 @@ def _phase5_passive_normal_curve_charge_contract(
             or (battery_w >= 100 and surplus_w >= 100)
         )
     if not bool(
-        0.0 <= live_age_s <= live_max_age_s
+        live_age_s is not None and 0.0 <= live_age_s <= live_max_age_s
         and export_backed
         and battery_w >= -100.0
     ):
@@ -44768,6 +46323,24 @@ def apply_storage_dispatch_phase5(
 
     now_value = time.time() if now_s is None else float(now_s)
     baseline = copy.deepcopy(legacy if isinstance(legacy, dict) else {})
+    reserve_context = baseline.get('backup_hold_control') or {}
+    reserve_job = reserve_context.get('grid_job') or {}
+    reserve_execution = backup_hold.read_execution(plan, cfg, now_value * 1000)
+    if (baseline.get('market_economics_charge_profile') == 'reserve'
+            and baseline.get('mode') == MODE_GRID and reserve_context.get('active') is True
+            and reserve_execution is not None
+            and reserve_job.get('execution_binding') == reserve_execution.get('binding')
+            and reserve_job.get('start_ts_ms', float('inf')) <= now_value * 1000
+            < min(reserve_job.get('end_ts_ms', 0), reserve_job.get('deadline_ts_ms', 0))):
+        # Der bereits geprüfte Reservegrund im Marktpfad hat Vorrang vor
+        # wirtschaftlicher Phase-5-Umschichtung. Keine neue Aktions-ID behaupten.
+        return _phase5_legacy_fallback(baseline, {
+            'schema_version': 'storage_dispatch_phase5_v1',
+            'activation': phase5_activation_contract(cfg), 'selected': False,
+            'executable': False, 'commands_allowed': False,
+            'selected_source': 'legacy_fallback', 'selected_action': None,
+            'selected_power_w': 0.0, 'blockers': ['BACKUP_RESERVE_GRID_OWNER_ACTIVE'],
+            'hardware_effect': False}, 'BACKUP_RESERVE_GRID_OWNER_ACTIVE')
     path_contract: Dict[str, Any] = {}
 
     def fallback(
@@ -46852,6 +48425,7 @@ def execute_rscp_cycle(
     ownership: Optional[StorageManagerOwnership] = None,
 ) -> Dict[str, Any]:
     """Bindet Live-Readback, Soll und Ausgang in genau einem Managerzyklus."""
+    enforce_direct_marketing_grid_owner(payload)
     for direction, modes in (("charge", (MODE_CHRG, MODE_GRID)), ("discharge", (MODE_DISCH,))):
         cap = payload.get("power_limit_" + direction + "_effective_w")
         if type(cap) is int and cap > 0:
@@ -47507,6 +49081,10 @@ def main() -> None:
         # Wallclock-Alter ist hier keine Ablaufquelle: Restzeit, Bootwechsel und
         # Uhrsprünge entscheidet der monotone Guard im ersten Producerzyklus.
         previous_state.update(restored_consumer_budget)
+    if isinstance(persisted_consumer_budget_state, dict):
+        closed = backup_hold_closed_account(persisted_consumer_budget_state)
+        if isinstance(closed, dict):
+            previous_state['backup_hold_control'] = {'closed_account': copy.deepcopy(closed)}
     previous_state = restore_heatpump_pv_durable_state(
         previous_state,
         heatpump_pv_checkpoint.load_heatpump_pv_checkpoint(now_s=time.time()),
@@ -47522,6 +49100,8 @@ def main() -> None:
         previous_state["wallbox_start_hold_grants"] = copy.deepcopy(
             persisted_manager_state["wallbox_start_hold_grants"]
         )
+    if cfg_bool(cfg, "storage_central_pv_split_enable", False) and isinstance(persisted_manager_state.get("central_pv_split"), dict):
+        previous_state["central_pv_split"] = copy.deepcopy(persisted_manager_state["central_pv_split"])
     if isinstance(persisted_manager_state, dict):
         # Beobachtete Markt-Ladeleistung überlebt einen Prozessneustart (reine
         # Planungsgröße, keine Freigabe); ohne frisches Zustandsfile bleibt sie leer -> P_cfg.
@@ -47577,6 +49157,11 @@ def main() -> None:
                 cfg, live, read_json_file(WB_INTENT_F, max_age_s=90),
                 read_json_file(WB_NATIVE_F, max_age_s=90), previous_state, start,
             )
+            observer_read_diagnostic: Dict[str, Any] = {}
+            observer_plan = load_validated_canonical_plan_snapshot(PLAN_F, max_age_s=1800,
+                                                                  diagnostic=observer_read_diagnostic) or {}
+            payload.update(market_end_fields(cfg, observer_plan, payload, previous_state, start))
+            payload["market_plan_quality"]["reader"] = observer_read_diagnostic
             payload.update(power_limit_state(cfg, live, previous_state, now_s=start))
             payload["storage_regulation"] = dict(regulation_switch.status)
             payload["ha_writer_admission"] = ha_admission
@@ -47613,7 +49198,7 @@ def main() -> None:
             # switch, just like wallbox and heat control.
             if requested_regulation is False:
                 try:
-                    plan = load_validated_canonical_plan_snapshot(PLAN_F, max_age_s=1800) or {}
+                    plan = observer_plan
                     payload["direct_marketing_aux_inverter_shelly"] = direct_marketing_aux_inverter_shelly_control(
                         cfg, start, live=payload, direct_plan=plan.get("direct_marketing"),
                     )
@@ -47629,7 +49214,10 @@ def main() -> None:
         if was_enabled is not True:
             # Only consumer acceptance state survives; no pre-pause storage
             # setpoint, battery grant, manual request or curve-cap handover.
+            closed = backup_hold_closed_account(previous_state) or backup_hold_closed_account(read_json_file(STATE_F))
             previous_state = {"budget": copy.deepcopy(previous_state.get("budget") or {})}
+            if closed:
+                previous_state['backup_hold_closed_account'] = closed
             pending_curve_cap_handover_state = None
             curve_cap_orphan_observation = {}
         ha_admission_sig = (
@@ -47649,6 +49237,15 @@ def main() -> None:
                     str(ha_admission.get("mode") or "nicht gebunden"),
                 )
             last_ha_admission_sig = ha_admission_sig
+            # Entzogene Schreibautorität beendet die Episode auch im Gedächtnis.
+            previous_state = dict(previous_state)
+            previous_state.update(state="ha_writer_blocked", market_hold_trust={}, market_hold_bridge={},
+                                  market_control_end={"status": "other_owner", "reason": "ha_writer_blocked",
+                                                      "ts_ms": int(start * 1000)})
+            previous_state.pop("market_economics_action", None)
+            previous_state.pop("market_economics_contract", None)
+            closed = backup_hold_closed_account(previous_state)
+            previous_state['backup_hold_control'] = {'closed_account': closed} if closed else {}
             write_safe_start_state(
                 state="ha_writer_blocked",
                 reason=(
@@ -47679,6 +49276,17 @@ def main() -> None:
             continue
         live = read_json_file(LIVE_F, max_age_s=30)
         if not live:
+            prior_backup = previous_state.get('backup_hold_control') or {}
+            if prior_backup.get('applied') or prior_backup.get('grid_job'):
+                # Auch ein fehlendes Livefile beendet ausschließlich den eigenen
+                # Anteil, am selben autorisierten Ausgang und ohne Alt-SoC.
+                fallback = storage_cycle_fault_limits(cfg, {}, previous_state, ctrl)
+                execute_rscp_cycle(ctrl, fallback, ownership)
+                confirm_backup_hold_output(fallback)
+                write_state(fallback, {})
+                previous_state = fallback
+                time.sleep(cycle_s)
+                continue
             write_safe_start_state(
                 state="no_data",
                 reason="Keine Live-Daten: warte auf frische Messwerte von e3dc-live.",
@@ -47766,7 +49374,8 @@ def main() -> None:
             log.debug("Config-Validierung konnte nicht geschrieben werden: %s", exc)
         # Pro Zyklus genau eine stabile, statisch validierte Planrevision.
         # Bei Replace, Hash- oder Generationsabweichung gibt es keinen Altplan-Fallback.
-        plan = load_validated_canonical_plan_snapshot(PLAN_F, max_age_s=1800) or {}
+        plan_read_diagnostic: Dict[str, Any] = {}
+        plan = load_validated_canonical_plan_snapshot(PLAN_F, max_age_s=1800, diagnostic=plan_read_diagnostic) or {}
         wb_intent = read_json_file(WB_INTENT_F, max_age_s=90)
         wb_native = read_json_file(WB_NATIVE_F, max_age_s=90)
         manual_max_age_s = manual_override_max_age_s(cfg)
@@ -47821,15 +49430,11 @@ def main() -> None:
                         and read_storage_regulation_enabled(V4_CFG) is True
                         and evaluate_writer_admission().get("allowed") is True
                     ):
-                        fallback_limits = bind_configured_power_limits(ctrl, cfg, live)
-                        ctrl.send(
-                            MODE_AUTO,
-                            fallback_limits["maximumladeleistung"],
-                            force=True,
-                            discharge_cap_w=fallback_limits["maximaleentladeleistung"],
-                            auto_limit={},
-                        )
-                        log.error("Regelzyklus-Fallback: E3DC-AUTO-Freilauf ohne EMS-Grenzen gesendet")
+                        fallback = storage_cycle_fault_limits(cfg, live, previous_state, ctrl)
+                        execute_rscp_cycle(ctrl, fallback, ownership)
+                        confirm_backup_hold_output(fallback)
+                        write_state(fallback, plan)
+                        log.error("Regelzyklus-Fallback: vorhandene Schutzgrenzen am gemeinsamen Ausgang erhalten")
                 except Exception as release_exc:
                     log.error("Regelzyklus-Fallback: AUTO-Freilauf nicht sendbar: %s", release_exc)
                 time.sleep(max(1.0, cycle_s - (time.time() - start)))
@@ -47855,6 +49460,8 @@ def main() -> None:
         # und unmittelbar vor dem einzigen RSCP-Ausgang. Der bestätigte
         # POWER_SETTINGS-Zustand stammt aus dem vorherigen Managerzyklus; ein
         # Phase-5-Fehler verändert die Legacyentscheidung nicht.
+        dv_owner_binding = direct_marketing_hard_export_owner_binding(plan, start)
+        backup_cycle_context = copy.deepcopy(payload.get('backup_hold_control'))
         heatpump_source_bound_payload = copy.deepcopy(payload)
         payload = apply_storage_dispatch_phase5(
             cfg,
@@ -47879,10 +49486,24 @@ def main() -> None:
         payload = apply_heat_tariff_storage(
             cfg, live, payload, energy_decision, previous_state,
             now=start, reserve_pct=ep_reserve_soc(cfg, live))
+        payload = apply_backup_hold_limits(cfg, live, payload, backup_cycle_context, now_s=time.time())
+        # Finalisierungen dürfen die Besitzerbindung des gelesenen Plans nicht verlieren.
+        payload.update(dv_owner_binding)
+        enforce_direct_marketing_grid_owner(payload)
         # Phase 5 und die unmittelbare Quellenprüfung liegen absichtlich vor
         # dem einzigen RSCP-Ausgang. Die veröffentlichte Anzeige muss deshalb
         # den finalen Hardwarevertrag und nicht die frühere Vorentscheidung
         # beschreiben.
+        payload.update(market_end_fields(cfg, plan, payload, previous_state, start))
+        payload["market_plan_quality"]["reader"] = plan_read_diagnostic
+        if not plan_read_diagnostic.get("valid"):
+            payload["market_plan_quality"]["status"] = "unreadable_plan"
+            payload["market_plan_quality"]["reason"] = plan_read_diagnostic.get("reason")
+            if payload.get("market_hold_bridge"):
+                payload["market_hold_bridge"]["reason"] = plan_read_diagnostic.get("reason")
+            if (payload.get("market_control_end") or {}).get("status") == "unreadable_plan":
+                payload["market_control_end"]["reason"] = plan_read_diagnostic.get("reason")
+        payload["market_control_text"] = market_control_display_text(payload)
         phase5_display = build_display(payload)
         payload.update(phase5_display)
         if isinstance(payload.get("storage_cycle_fault"), dict):
@@ -47908,6 +49529,7 @@ def main() -> None:
         # AUTO bleibt der einzige bewusst nicht ge-heartbeatete Freilaufpfad.
         checkpoint_heatpump_pv_grant(payload, now_s=start)
         execute_rscp_cycle(ctrl, payload, ownership)
+        confirm_backup_hold_output(payload)
         confirm_heatpump_pv_start_source_output(payload)
         confirm_storage_dc_first_charge_recovery_anchor(
             payload,
@@ -47987,6 +49609,19 @@ def main() -> None:
             }
             payload["direct_marketing_aux_inverter_shelly"] = fallback_state
             log.debug("DV-Shelly-Zusatz-WR-Check konnte nicht ausgeführt werden: %s", exc)
+        # Nur Diagnose nach dem Geräteausgang: Live-Werte dieses Zyklus, kein neuer Leser.
+        backup_soc = backup_hold.number(live.get("SOC"))
+        backup_capacity = backup_hold.number(cfg.get("speichergroesse"))
+        if backup_capacity is None or backup_capacity <= 0:
+            backup_capacity = backup_hold.number(live.get("bat_full_cap_kwh"))
+        backup_stamp = backup_hold.number(live.get("_ts"))
+        payload['_backup_hold_live'] = {
+            'valid': (live.get('RSCP_Sample_Valid') is True and live.get('Power_Decision_Usable') is True
+                and backup_soc is not None and 0 <= backup_soc <= 100
+                and backup_capacity is not None and backup_capacity > 0),
+            'measured_at_ts_ms': None if backup_stamp is None else backup_stamp * 1000,
+            'energy_wh': None if backup_soc is None or backup_capacity is None else backup_soc * backup_capacity * 10,
+        }
         for writer_name, writer in (
             ("write_state", lambda: write_state(payload, plan)),
             ("write_peak_shaving_interval_state", lambda: write_peak_shaving_interval_state(payload)),
@@ -48059,6 +49694,9 @@ def main() -> None:
     atomic_write(
         STATE_F,
         {
+            **({'backup_hold_closed_account': backup_hold_closed_account(previous_state)
+                or backup_hold_closed_account(persisted_terminal_state)}
+               if backup_hold_closed_account(previous_state) or backup_hold_closed_account(persisted_terminal_state) else {}),
             "state": "stopped",
             "storage_regulation": dict(regulation_switch.status),
             "reason": "Dienst beendet; POWER_SETTINGS ohne Freigabeschreiben übergeben",

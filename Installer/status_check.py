@@ -48,6 +48,7 @@ def show_system_status():
     status_logger.info("Starte System-Statusprüfung.")
 
     issues_found = []
+    docker_host_conflict_units = []
 
     # HA Status ermitteln
     is_standby = False
@@ -117,6 +118,7 @@ def show_system_status():
         else:
             print(f"{RED}[!]{RESET}  Service Status: Aktiv (FEHLER: Lokaler Dienst läuft trotz Docker!)")
             issues_found.append("docker_host_conflict")
+            docker_host_conflict_units.append("e3dc")
     elif is_standby:
         if not e3dc_srv["active"]:
             print(f"{GREEN}[OK]{RESET} Service Status: Inaktiv (Korrekt für {standby_label} im Standby)")
@@ -150,6 +152,13 @@ def show_system_status():
 
         print(f"{status_icon} Service Status: {'Aktiv (running)' if guard_srv['active'] else 'Inaktiv (stopped/failed)'}")
         print(f"{enabled_icon} Autostart:     {'Aktiviert (enabled)' if guard_srv['enabled'] else 'Deaktiviert (disabled)'}")
+
+        checksum = run_command(
+            "/usr/bin/sha256sum --check --strict /usr/local/lib/e3dc-control-watchdog.sha256"
+        )
+        if not checksum['success']:
+            print("  PiGuard: Prüfsummenliste passt nicht (z. B. nach einem Python-Update des Betriebssystems). Update ausführen oder Menü 15 → 1.")
+            issues_found.append("watchdog_checksum")
 
         if not guard_srv["active"]:
              print("\n  ⚠ Diagnose-Logs (letzte 10 Zeilen):")
@@ -304,6 +313,8 @@ def show_system_status():
                 print(f"{GREEN}✓{RESET} Service Status: Inaktiv (Korrekt für Docker-Modus)")
             else:
                 print(f"{RED}✗{RESET} Service Status: Aktiv (FEHLER: Lokaler Dienst läuft trotz Docker!)")
+                issues_found.append("docker_host_conflict")
+                docker_host_conflict_units.append("e3dc-websocket")
             print(f"{GREEN}✓{RESET} Autostart:     {'Deaktiviert (disabled)' if not ws_srv['enabled'] else 'Aktiviert (enabled)'}")
         else:
             status_icon = f"{GREEN}✓{RESET}" if ws_srv["active"] else f"{RED}✗{RESET}"
@@ -445,6 +456,7 @@ def show_system_status():
         if manager_srv["active"]:
             print(f"{RED}[!]{RESET} Storage Manager: Host-Unit läuft trotz Docker-Modus.")
             issues_found.append("docker_host_conflict")
+            docker_host_conflict_units.append("e3dc-storage-manager")
         else:
             print("ℹ Storage Manager läuft im Container; Host-Unit bleibt inaktiv.")
     else:
@@ -686,8 +698,8 @@ def show_system_status():
             print("  Altdienst stilllegen: sudo systemctl disable --now e3dc")
         if "docker_host_conflict" in issues_found:
             print("• Docker Konflikt: Es laufen noch alte, lokale Dienste!")
-            print("  Behebe dies mit: sudo systemctl stop e3dc e3dc-websocket")
-            print("  und: sudo systemctl disable e3dc e3dc-websocket")
+            print("  Lösung: Lokale Dienste stoppen: sudo systemctl stop " + " ".join(docker_host_conflict_units))
+            print("  Autostart deaktivieren: sudo systemctl disable " + " ".join(docker_host_conflict_units))
         if "internet" in issues_found:
             print("• Internet: Prüfe Netzwerkkabel/WLAN und Router. Prüfe DNS-Einstellungen.")
 

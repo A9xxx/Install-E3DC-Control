@@ -16,11 +16,13 @@ import re
 import base64
 import math
 import hashlib
+import threading
 
 import requests as _requests
 
 from .config import logger, RAMDISK_DIR
 from . import command_gate
+from .openwb_transport import OpenWBTransport, TransportError, MESSAGES, config_keys
 from .storage_intent import wallbox_type_is_e3dc
 from .soc_tracker import (
     vehicle_soc_source_trusted, resolve_openwb_pro_profile,
@@ -319,20 +321,25 @@ def _validated_e3dc_phase_power(sub, tag_name, validator):
     return float(value), True
 
 
-def discover_openwb_chargepoints(ip, timeout=3.0):
+def discover_openwb_chargepoints(ip, timeout=3.0, *, config=None, wb_id=1):
     """Read available openWB Software chargepoints without changing settings."""
-    import urllib.request
-
     ip = str(ip or "").strip()
     if not ip:
         return []
-    url = f"http://{ip}/openWB/simpleAPI/simpleapi.php?get_chargepoint_all"
     try:
-        with urllib.request.urlopen(url, timeout=float(timeout or 3.0)) as ctx:
-            raw = ctx.read().decode("utf-8", errors="replace")
-        payload = json.loads(raw)
+        if config is None:
+            # Der historische Manager-Aufruf übergibt nur die Adresse. Das Konto
+            # kommt aus demselben echten Config-Leser, ausschließlich für dieses Ziel.
+            from .config import get_config
+            loaded = get_config()
+            address_key = "wb_native_ip" if int(wb_id) == 1 else "wb_native_ip2"
+            config = loaded if str(loaded.get(address_key) or "").strip() == ip else {}
+        transport = OpenWBTransport(ip, config, wb_id)
+        payload = json.loads(transport.request(
+            "/openWB/simpleAPI/simpleapi.php?get_chargepoint_all", timeout=float(timeout or 3.0)))
     except Exception as exc:
-        logger.debug(f"openWB Discovery fehlgeschlagen ({ip}): {exc}")
+        reason = exc.reason if isinstance(exc, TransportError) else "openwb_unavailable"
+        logger.debug("openWB Discovery: %s", MESSAGES[reason])
         return []
     if not isinstance(payload, dict):
         return []
@@ -562,6 +569,12 @@ class GoECharger(WallboxDriver):
             status = {
                 'car':         car_status,
                 'amp':         _int('amp', 6),
+                # Bestätigter API-Readback des Stromangebots, keine Istleistung.
+                # Fehlende oder ungültige Rohwerte sind keine Ausgangsevidenz.
+                'amp_readback_confirmed': bool(
+                    type(data.get('amp')) is int
+                    and 6 <= data['amp'] <= 32
+                ),
                 'pha':         legacy_pha,
                 'phases_in_use': phases_in_use,
                 'phase_actual_source': phase_count_source,
@@ -701,8 +714,8 @@ class OpenWBCharger(WallboxDriver):
     Stromvorgaben sind dabei ein Primary-Direktpfad über openWB-Sofortladen
     (chargecurrent); openWB-SoC- und Energiemengenlimits bleiben wirksam.
 
-    Status lesen: GET  simpleapi.php?get_chargepoint_all=<ID>; Fahrzeug-SoC
-                  zusätzlich über einen strikt lesenden MQTT-Abonnenten.
+    Status lesen: Bei TLS und gebundener Ladepunkt-ID MQTT, sonst SimpleAPI.
+                  SimpleAPI bleibt bei ungültigem MQTT der Rückfall.
     Steuern:      HTTP-V1-Secondary-Topics; optional Modbus Secondary als
                   Rückfall, wenn der HTTP-Pfad nicht erreichbar ist.
     """
@@ -860,11 +873,11 @@ class OpenWBCharger(WallboxDriver):
         self.cp_suffix = f"/{self.cp_id}" if self.cp_id != "" else ""
         self.native_prefix   = f"openWB/chargepoint{self.cp_suffix}/get"
         self.simpleapi_prefix = f"openWB/simpleAPI/chargepoint{self.cp_suffix}"
-        self.http_api_url    = f"http://{self.ip}/openWB/simpleAPI/simpleapi.php"
-        self.http_v1_url     = f"https://{self.ip}:8443/v1/"
-        self.http_user       = self._config_first_nonempty(f"wb{wb_id}_user", "wb_user")
-        self.http_pass       = self._config_first_nonempty(f"wb{wb_id}_pass", "wb_pass", strip=False)
-        self.state["http_auth_configured"] = bool(self.http_user)
+        self.transport = None
+        self._transport_error = ""
+        self._transport_signature = None
+        self._transport_config_bound = False
+        self._configure_transport(config)
         self.api_duo_num     = int(self.config.get("openwb_api_duo_num", self.config.get("openwb_duo_num", 0)) or 0)
         self.auto_role_enabled = self._bool_value(
             self.config.get(
@@ -1013,7 +1026,7 @@ class OpenWBCharger(WallboxDriver):
         self._primary_pending_current_sent_ts = 0.0
         self._primary_pending_current_timeout_s = 30.0
 
-        logger.info(f"[WB{self.wb_id}] openWB 2.x HTTP SimpleAPI: IP={self.ip}, CP={self.cp_id if self.cp_id != '' else 'AUTO'}")
+        logger.info("[WB%d] openWB HTTP-Lesepfad bereit.", self.wb_id)
         logger.info(f"[WB{self.wb_id}]   Status-GET   : get_chargepoint_all={self.cp_id if self.cp_id != '' else 'auto'}")
         logger.info(f"[WB{self.wb_id}]   HTTP-API     : {self.http_api_url}")
         logger.info(f"[WB{self.wb_id}]   HTTP-Auth    : {'Basic konfiguriert' if self.http_user else 'aus'}")
@@ -1032,6 +1045,22 @@ class OpenWBCharger(WallboxDriver):
         self.state["openwb_status_reason"] = dict.fromkeys(
             self._OPENWB_DISPLAY_TOPICS.values(), "not_received"
         )
+        self.state.update(dict.fromkeys((
+            "openwb_mqtt_field_age_s", "openwb_mqtt_field_received_ts",
+            "openwb_mqtt_field_reason", "openwb_mqtt_status_reason",
+            "openwb_status_fallback_reason", "openwb_simpleapi_status_ts",
+        )))
+        self._openwb_mqtt_status_lock = threading.RLock()
+        self._openwb_mqtt_status_values = {}
+        self._openwb_mqtt_status_received_ts = {}
+        self._mqtt_callbacks_bound = False
+        self._status_http_fallback_active = False
+        self._last_status_http_error = ""
+        self._openwb_display_values = {}
+        self._openwb_display_context = {}
+        for key in set(self._OPENWB_DISPLAY_TOPICS.values()):
+            self.state[key + "_topic"] = None
+            self.state[key + "_ts"] = None
         self.mqtt_client = None
         self._mqtt_subscribed_topics = set()
         legacy_mqtt = str(
@@ -1041,21 +1070,404 @@ class OpenWBCharger(WallboxDriver):
         # Der Standardpfad ist ein strikt lesender SoC-Abonnent. Retained
         # Leistung, Plug- und Schaltzustände bleiben hinter dem ausdrücklichen
         # Legacy-Schalter, damit sie die HTTP-Wahrheit nicht überlagern.
-        mqtt_module = _get_mqtt_module()
-        if mqtt_module is not None:
+        self._start_mqtt()
+
+    _MQTT_STATUS_FIELDS = (
+        "plug_state", "charge_state", "power", "currents", "voltages",
+        "phases_in_use", "imported", "evse_current", "fault_state", "state_str",
+    )
+    _MQTT_STATUS_REQUIRED = ("plug_state", "charge_state", "power")
+    _MQTT_STATUS_MAX_AGE_S = 15.0
+
+    def _mqtt_status_enabled(self):
+        return bool(self.transport is not None and self.transport.tls_required and self.cp_id != "")
+
+    def _clear_mqtt_status(self):
+        with self._openwb_mqtt_status_lock:
+            self._openwb_mqtt_status_values.clear()
+            self._openwb_mqtt_status_received_ts.clear()
+
+    def _mqtt_callback_current(self, client):
+        # Ohne gestarteten Client bleiben explizite lesende Prüfdoppel möglich.
+        # Sobald ein Transport gestartet wurde, ist ausschließlich dessen Client gültig.
+        return client is self.mqtt_client or not self._mqtt_callbacks_bound and self.mqtt_client is None
+
+    @staticmethod
+    def _mqtt_status_value(field, value):
+        if field in ("plug_state", "charge_state"):
+            return _observation_flag(value) if type(value) in (bool, int, float, str) else None
+        if field in ("currents", "voltages"):
+            if not isinstance(value, list) or len(value) != 3:
+                return None
+            result = [_observation_number(v) for v in value]
+            return result if all(v is not None for v in result) else None
+        if field == "state_str":
+            return value.strip() if isinstance(value, str) else None
+        number = _observation_number(value)
+        if number is None:
+            return None
+        if field in ("phases_in_use", "fault_state"):
+            if number != int(number) or number < 0 or field == "phases_in_use" and number > 3:
+                return None
+            return int(number)
+        return number if number >= 0 else None
+
+    def _receive_mqtt_status(self, topic, payload, retained):
+        if not self._mqtt_status_enabled() or topic not in {
+            f"{self.native_prefix}/{field}" for field in self._MQTT_STATUS_FIELDS
+        }:
+            return False
+        field = topic.rsplit("/", 1)[-1]
+        try:
+            raw = json.loads(payload)
+        except (ValueError, TypeError):
+            raw = None
+        value = self._mqtt_status_value(field, raw)
+        with self._openwb_mqtt_status_lock:
+            self._openwb_mqtt_status_values[topic] = (value, time.monotonic(), retained)
+            self._openwb_mqtt_status_received_ts[topic] = time.time()
+        return True
+
+    def _mqtt_status_sample(self):
+        """Eine vollständige Quelle; fehlende oder alte Felder bleiben unbekannt."""
+        now = time.monotonic()
+        values, ages, reasons, received = {}, {}, {}, {}
+        with self._openwb_mqtt_status_lock:
+            for field in self._MQTT_STATUS_FIELDS:
+                topic = f"{self.native_prefix}/{field}"
+                entry = self._openwb_mqtt_status_values.get(topic)
+                age = now - entry[1] if entry is not None else None
+                reason = ("not_received" if entry is None else "retained" if entry[2]
+                          else "invalid" if entry[0] is None else "stale"
+                          if age < 0 or age > self._MQTT_STATUS_MAX_AGE_S else "fresh")
+                values[field] = entry[0] if reason == "fresh" else None
+                ages[field] = round(max(0.0, age), 3) if age is not None else None
+                reasons[field] = reason
+                received[field] = self._openwb_mqtt_status_received_ts.get(topic)
+            connected = self.state.get("mqtt_connected") is True
+        self.state["openwb_mqtt_field_age_s"] = {f: ages[f] for f in self._MQTT_STATUS_REQUIRED}
+        self.state["openwb_mqtt_field_received_ts"] = {f: received[f] for f in self._MQTT_STATUS_REQUIRED}
+        self.state["openwb_mqtt_field_reason"] = reasons
+        reason = ("openwb_mqtt_unavailable" if not connected else "openwb_mqtt_stale"
+                  if any(values[f] is None for f in self._MQTT_STATUS_REQUIRED) else "")
+        self.state["openwb_mqtt_status_reason"] = reason
+        return None if reason else values
+
+    def _update_from_mqtt(self, data):
+        """Normalisiert ausschließlich frische Ladepunktmessungen, ohne HTTP-Nebenwirkungen."""
+        power = data["power"]
+        plug, charging = data["plug_state"], data["charge_state"]
+        current, phases = data["evse_current"], data["phases_in_use"]
+        currents, voltages = data["currents"], data["voltages"]
+        apparent = ([abs(a * v) for a, v in zip(currents, voltages)]
+                    if currents is not None and voltages is not None else [None] * 3)
+        apparent_sum = sum(apparent) if all(v is not None for v in apparent) else None
+        self.state.update({
+            "plug_state": plug, "plug_state_raw": plug, "locked": None,
+            "charge_state": charging, "charging": charging, "car": 2 if plug else 1,
+            "real_power_w": power, "power_w": power, "powers": None,
+            "phase_power_l1_w": None, "phase_power_l2_w": None, "phase_power_l3_w": None,
+            "phase_power_sum_w": None, "phase_power_verified": False, "_phase_power_ts": 0.0,
+            "evse_current": current, "amp": int(round(current)) if current is not None else None,
+            "phases_in_use": phases, "phases_actual": phases,
+            "pha": (56 if phases >= 3 else 8 if phases >= 1 else 0) if phases is not None else None,
+            "currents": currents, "voltages": voltages,
+            "phase_apparent_l1_va": apparent[0], "phase_apparent_l2_va": apparent[1],
+            "phase_apparent_l3_va": apparent[2], "apparent_power_va": apparent_sum,
+            "power_factor": power / apparent_sum if apparent_sum and apparent_sum > 50 else None,
+            "daily_imported_wh": None, "daily_imported": None, "session_kwh": None,
+            "_session_start_wh": None, "_session_start_ts": None,
+            "imported_total_wh": data["imported"], "imported": data["imported"],
+            "vehicle_id": None, "car_id": None, "rfid_tag": None,
+            "vehicle_identity_current": False, "stable_vehicle_identity_current": False,
+            "chargemode": None, "chargemode_str": None, "openwb_chargemode": None,
+            "instant_charging_current": None, "primary_mode_observation": None,
+            "fault_state": data["fault_state"], "fault_text": None,
+            "manual_lock": None, "min_current": None, "pv_charging_min_current": None,
+            "instant_charging_limit": None, "instant_charging_soc": None,
+            "state_text": data["state_str"],
+            "state_text_ts": self._openwb_mqtt_status_received_ts.get(f"{self.native_prefix}/state_str")
+                             if data["state_str"] is not None else None,
+        })
+        readback = getattr(self, "_primary_http_readback", {})
+        for key in ("instant_charging_current", "primary_mode_observation", "openwb_chargemode", "chargemode_str"):
+            self.state[key] = readback.get(key)
+        for idx in range(3):
+            self.state[f"phase_current_l{idx + 1}_a"] = currents[idx] if currents is not None else None
+            self.state[f"phase_voltage_l{idx + 1}_v"] = voltages[idx] if voltages is not None else None
+        self._observation_values = _observation_channels(
+            power=power, currents=currents, phases=phases, plug=plug, charging=charging)
+        self._observation_source = "openwb_mqtt"
+        self._observe_openwb_display_episode(data)
+
+    def _primary_readback_needed(self):
+        command = self.state.get("primary_mode_command") or {}
+        return self.primary_mode_enabled and (
+            self._primary_pending_current_amp is not None
+            or command.get("active") is True and command.get("confirmed_ts") is None)
+
+    def _service_primary_readback(self):
+        """Nur ausstehende Primary-Bestätigungen lesen; der Hauptzyklus wartet nie auf HTTP."""
+        command = self.state.get("primary_mode_command") or {}
+        token = (self.transport, self.cp_id, self._primary_pending_current_sent_ts,
+                 command.get("ts"), command.get("mode"))
+        if getattr(self, "_primary_readback_token", None) != token:
+            self._primary_http_readback = {}
+        worker = getattr(self, "_primary_readback_thread", None)
+        if worker is not None:
+            if worker.is_alive():
+                return
+            result = self._primary_readback_result
+            self._primary_readback_thread = None
+            if result is not None and result[0] == token and self._primary_readback_needed():
+                _, data, received_ts = result
+                if isinstance(data, dict) and self._simpleapi_status_payload_valid(data):
+                    self._primary_mode_observe(data.get("chargemode"), received_ts)
+                    self.state["openwb_simpleapi_status_ts"] = received_ts
+                    self._primary_http_readback = {
+                        "instant_charging_current": self._mqtt_status_value("evse_current", data.get("instant_charging_current")),
+                        "primary_mode_observation": self.state.get("primary_mode_observation"),
+                        "openwb_chargemode": data.get("chargemode") if isinstance(data.get("chargemode"), str) else None,
+                        "chargemode_str": data.get("chargemode") if isinstance(data.get("chargemode"), str) else None,
+                    }
+                    return
+        if not self._primary_readback_needed() or self.transport is None:
+            return
+        self._primary_readback_token = token
+        self._primary_readback_result = None
+        transport, cp = self.transport, self.cp_id
+
+        def read():
             try:
-                self.mqtt_client = mqtt_module.Client()
-                self.mqtt_client.on_connect = self.on_connect
-                self.mqtt_client.on_disconnect = self.on_disconnect
-                self.mqtt_client.on_message = self.on_message
-                if hasattr(self.mqtt_client, "reconnect_delay_set"):
-                    self.mqtt_client.reconnect_delay_set(min_delay=2, max_delay=60)
-                self.mqtt_client.connect_async(self.ip, 1883, 60)
-                self.mqtt_client.loop_start()
-                logger.info(f"[WB{self.wb_id}] MQTT-Lesepfad für Fahrzeugdaten gestartet.")
-            except Exception as e:
+                # Acht Sekunden nur in diesem einzelnen Hintergrundabruf.
+                # Messrückfall und Steuerbefehle behalten ihre bestehende Frist.
+                raw = transport.request("/openWB/simpleAPI/simpleapi.php?get_chargepoint_all=" + str(cp), timeout=8)
+                received_ts = time.time()
+                data = json.loads(raw)
+                if isinstance(data, dict) and isinstance(data.get(f"chargepoint_{cp}"), dict):
+                    data = data[f"chargepoint_{cp}"]
+                self._primary_readback_result = (token, data, received_ts)
+            except Exception:
+                self._primary_readback_result = None
+
+        self._primary_readback_thread = threading.Thread(target=read, name="openwb-primary-readback", daemon=True)
+        self._primary_readback_thread.start()
+
+    def _replace_http_measurements(self, data):
+        """TLS-Messsatz vollständig aus dieser Antwort ersetzen, inklusive aller Aliase."""
+        values = {field: self._mqtt_status_value(field, data.get(field)) for field in self._MQTT_STATUS_FIELDS}
+        values["power"] = self._mqtt_status_value("power", data.get("power", data.get("charging_power")))
+        values["evse_current"] = self._mqtt_status_value("evse_current", data.get("evse_current", data.get("charging_current")))
+        currents, voltages = values["currents"], values["voltages"]
+        powers = self._mqtt_status_value("currents", data.get("powers"))
+        apparent = ([abs(a*v) for a,v in zip(currents, voltages)]
+                    if currents is not None and voltages is not None else [None]*3)
+        apparent_sum = sum(apparent) if all(v is not None for v in apparent) else None
+        total = sum(powers) if powers is not None else None
+        power = total if total is not None and total > 50 else values["power"]
+        phases, current = values["phases_in_use"], values["evse_current"]
+        daily = self._mqtt_status_value("imported", data.get("daily_imported"))
+        self.state.update({
+            "plug_state": values["plug_state"], "plug_state_raw": values["plug_state"],
+            "charge_state": values["charge_state"], "charging": values["charge_state"],
+            "locked": self._mqtt_status_value("plug_state", data.get("locked", data.get("lock_state", data.get("plug_locked")))),
+            "car": (2 if values["plug_state"] else 1) if values["plug_state"] is not None else None,
+            "real_power_w": power, "power_w": power, "powers": powers,
+            "currents": currents, "voltages": voltages,
+            "phase_power_sum_w": total, "phase_power_verified": total is not None and total > 50,
+            "_phase_power_ts": time.time() if powers is not None else 0.0,
+            "apparent_power_va": apparent_sum,
+            "power_factor": power/apparent_sum if power is not None and apparent_sum and apparent_sum > 50 else None,
+            "phases_in_use": phases, "phases_actual": phases,
+            "pha": (56 if phases >= 3 else 8 if phases >= 1 else 0) if phases is not None else None,
+            "evse_current": current, "amp": int(round(current)) if current is not None else None,
+            "imported_total_wh": values["imported"], "imported": values["imported"],
+            "daily_imported_wh": daily, "daily_imported": daily,
+            "fault_state": values["fault_state"],
+            "fault_text": data.get("fault_str") if isinstance(data.get("fault_str"), str) else None,
+            "state_text": values["state_str"],
+            "state_text_ts": time.time() if values["state_str"] is not None else None,
+            "instant_charging_current": self._mqtt_status_value("evse_current", data.get("instant_charging_current")),
+            "chargemode": data.get("chargemode"), "chargemode_str": data.get("chargemode"),
+            "vehicle_id": data.get("vehicle_id", data.get("connected_vehicle_id")),
+            "car_id": data.get("vehicle_id", data.get("connected_vehicle_id")),
+            "rfid_tag": data.get("rfid_tag", data.get("rfid")),
+        })
+        if daily is None:
+            self.state["session_kwh"] = None
+        for key in ("manual_lock", "min_current", "pv_charging_min_current", "instant_charging_limit", "instant_charging_soc"):
+            self.state[key] = data.get(key)
+        for idx in range(3):
+            self.state[f"phase_power_l{idx+1}_w"] = powers[idx] if powers is not None else None
+            self.state[f"phase_current_l{idx+1}_a"] = currents[idx] if currents is not None else None
+            self.state[f"phase_voltage_l{idx+1}_v"] = voltages[idx] if voltages is not None else None
+            self.state[f"phase_apparent_l{idx+1}_va"] = apparent[idx]
+
+    def _fresh_status(self, source):
+        now = time.time()
+        self.state.update({
+            "driver_status_valid": True, "driver_status_stale": False,
+            "driver_status_degraded": False, "driver_status_age_s": 0.0,
+            "driver_status_reason": "fresh", "driver_status_source": source,
+            "driver_status_last_ok_ts": int(now), "driver_status_last_sample_ts": int(now),
+        })
+        result = _observation_status(self._sanitize_measurement_status(self.state),
+                                     self._observation_values, self._observation_source)
+        self.write_openwb_status()
+        return result
+
+    def _transport_config_signature(self, config):
+        keys = config_keys(self.wb_id) + [f"wb{self.wb_id}_user", f"wb{self.wb_id}_pass",
+                f"wb{self.wb_id}_openwb_mqtt_port", f"wb{self.wb_id}_openwb_v1_port"]
+        if int(self.wb_id) == 1:
+            keys += ["wb_user", "wb_pass"]
+        values = []
+        for key in keys:
+            value = config.get(key, "")
+            if key == f"wb{self.wb_id}_openwb_tls_binding":
+                try:
+                    value = json.dumps(json.loads(value), sort_keys=True, separators=(",", ":"))
+                except (TypeError, ValueError):
+                    # Ungültige Bindungen werden weiterhin als Rohtext verglichen.
+                    pass
+            values.append(value)
+        return tuple(values)
+
+    def _configure_transport(self, config):
+        self._transport_signature = self._transport_config_signature(config)
+        try:
+            self.transport = OpenWBTransport(self.ip, config, self.wb_id)
+            self._transport_error = ""
+            self.http_api_url = self.transport.resolved_base + "/openWB/simpleAPI/simpleapi.php"
+            self.http_v1_url = self.transport.address.base(tls=True, port=8443) + "/v1/"
+            self.http_user = self.transport.http_user
+            self.http_pass = self.transport.http_password
+        except TransportError as exc:
+            self.transport = None
+            self._transport_error = exc.reason
+            self.http_api_url = self.http_v1_url = ""
+            self.http_user = self.http_pass = ""
+        self.state["http_auth_configured"] = bool(self.http_user)
+        # Nur eine tatsächlich gelesene kanonische Konfiguration beobachten.
+        from .config import V4_CONFIG_FILE, get_config
+        if os.path.isfile(V4_CONFIG_FILE):
+            current = get_config()
+            key = "wb_native_ip" if int(self.wb_id) == 1 else "wb_native_ip2"
+            self._transport_config_bound = (str(current.get(key) or "").strip() == str(self.ip).strip())
+
+    def _refresh_transport(self):
+        if not self._transport_config_bound:
+            return
+        from .config import get_config
+        current = get_config()
+        key = "wb_native_ip" if int(self.wb_id) == 1 else "wb_native_ip2"
+        changed_target = str(current.get(key) or "").strip() != str(self.ip).strip()
+        if changed_target or self._transport_config_signature(current) != self._transport_signature:
+            with self._openwb_mqtt_status_lock:
+                old = self.mqtt_client
                 self.mqtt_client = None
-                logger.debug(f"[WB{self.wb_id}] MQTT-Lesepfad nicht verfügbar: {e}")
+            if old is not None:
+                old.disconnect()
+                old.loop_stop()
+            self._clear_openwb_display_session()
+            self._clear_mqtt_status()
+            self.state["mqtt_connected"] = False
+            logger.info("[WB%d] openWB-Transport wird nach %s neu aufgebaut.",
+                        self.wb_id, "Zieländerung" if changed_target else "Konfigurationsänderung")
+            if changed_target:
+                self.transport = None
+                self._transport_error = "openwb_target_changed"
+                return
+            self.config = current
+            self._configure_transport(current)
+            self._start_mqtt()
+
+    def _mqtt_error(self, reason):
+        self.state["openwb_mqtt_reason"] = reason
+        self.state["mqtt_connected"] = False
+
+    def _start_mqtt(self):
+        mqtt_module = _get_mqtt_module()
+        if mqtt_module is None or self.transport is None:
+            self._mqtt_error(self._transport_error or "openwb_mqtt_unavailable")
+            return
+        try:
+            host, port = self.transport.mqtt_endpoint()
+            client = self.transport.mqtt_client(
+                mqtt_module, lambda reason: self._mqtt_error(reason) if self.mqtt_client is client else None)
+            self.mqtt_client = client
+            self._mqtt_callbacks_bound = True
+            self.mqtt_client.on_connect = self.on_connect
+            self.mqtt_client.on_disconnect = self.on_disconnect
+            self.mqtt_client.on_message = self.on_message
+            self.mqtt_client.on_subscribe = self.on_subscribe
+            self.mqtt_client.reconnect_delay_set(min_delay=2, max_delay=60)
+            self.mqtt_client.connect_async(host, port, 60)
+            self.mqtt_client.loop_start()
+        except Exception as exc:
+            self.mqtt_client = None
+            self._mqtt_error(exc.reason if isinstance(exc, TransportError) else "openwb_mqtt_unavailable")
+
+    def _transport_request(self, path, *, method="GET", body=None, headers=None, v1=False, timeout=5, protection=None):
+        self._refresh_transport()
+        if self.transport is None:
+            raise TransportError(self._transport_error or "openwb_unavailable")
+        try:
+            was_tls = self.transport.tls_required
+            if protection is None:
+                context = getattr(self, "_command_protection_context", None)
+                protection = context.get() if context is not None else False
+            result = self.transport.request(path, method=method, body=body, headers=headers,
+                                            v1=v1, timeout=timeout, protection=protection)
+            self.state["openwb_http_reason"] = getattr(self.transport, "last_request_reason", "")
+            return result
+        except TransportError as exc:
+            fallback_reason = getattr(self.transport, "last_request_reason", "")
+            self.state["openwb_http_reason"] = (
+                fallback_reason + ":" + exc.reason if fallback_reason else exc.reason)
+            raise
+        finally:
+            # Eine gelesene HTTPS-Umleitung entzieht auch einem alten MQTT-Kanal
+            # die Klartextfreigabe, selbst wenn die folgende TLS-Prüfung scheitert.
+            if not was_tls and self.transport.tls_required:
+                with self._openwb_mqtt_status_lock:
+                    old = self.mqtt_client
+                    self.mqtt_client = None
+                if old is not None:
+                    old.disconnect()
+                    old.loop_stop()
+                self._clear_mqtt_status()
+                self._clear_openwb_display_session()
+                self.state["mqtt_connected"] = False
+                self._start_mqtt()
+
+    def _mqtt_required_topics(self):
+        """Kernthemen des aktuell gebundenen Lesepfads."""
+        topics = {"openWB/system/version", "openWB/general/extern"}
+        if self.cp_id != "":
+            topics.add(f"{self.native_prefix}/connected_vehicle/soc")
+        return topics
+
+    def on_subscribe(self, client, userdata, mid, granted_qos, properties=None):
+        with self._openwb_mqtt_status_lock:
+            if not self._mqtt_callback_current(client):
+                return
+            topic = getattr(self, "_mqtt_subscription_mids", {}).get(mid)
+            required = self._mqtt_required_topics()
+            if topic in required and any(int(getattr(code, "value", code)) >= 128 for code in granted_qos):
+                self.state["openwb_mqtt_reason"] = "openwb_acl_missing"
+
+    def _transport_notice(self):
+        if (self.state.get("driver_status_valid") is True
+                and self.state.get("driver_status_source") == "openwb_mqtt"):
+            return ""
+        reason = self.state.get("openwb_http_reason") or self._transport_error
+        if not reason:
+            reason = self.state.get("openwb_mqtt_reason", "")
+            if (self.state.get("mqtt_connected") is True and reason == "openwb_mqtt_waiting"
+                    and time.time() - self.state.get("openwb_mqtt_connected_ts", time.time()) >= 10):
+                reason = "openwb_acl_missing"
+        return MESSAGES.get(reason, "")
 
     def _config_first_nonempty(self, *keys, strip=True):
         """Ermittelt den ersten gesetzten Konfigwert ohne leere Fallbacks."""
@@ -1082,6 +1494,7 @@ class OpenWBCharger(WallboxDriver):
             return False
         if self.cp_id == cp_int:
             return False
+        self._clear_mqtt_status()
         old_cp = self.cp_id
         self.cp_id = cp_int
         self.cp_suffix = f"/{self.cp_id}"
@@ -1114,6 +1527,14 @@ class OpenWBCharger(WallboxDriver):
             self.mqtt_client is not None
             and self.state.get("mqtt_connected") is True
         ):
+            # Das gebundene SoC-Thema ist ab jetzt Kernthema. Seine Zustellung
+            # belegt erst ein neuer Empfang; echte Transportfehler bleiben stehen.
+            received = getattr(self, "_mqtt_received_topics", set())
+            received.discard(f"{self.native_prefix}/connected_vehicle/soc")
+            self._mqtt_received_topics = received
+            if self.state.get("openwb_mqtt_reason", "") in ("", "openwb_mqtt_waiting"):
+                self.state["openwb_mqtt_reason"] = "openwb_mqtt_waiting"
+                self.state["openwb_mqtt_connected_ts"] = time.time()
             self._sync_mqtt_subscriptions(self.mqtt_client)
         return True
 
@@ -1330,18 +1751,69 @@ class OpenWBCharger(WallboxDriver):
 
     # Diese Konfiguration wird ausschließlich für Anzeige und Beratung gelesen.
     _OPENWB_DISPLAY_TOPICS = {
-        "openWB/general/chargemode_config/pv_charging/bat_mode": "openwb_bat_mode",
+        # Reihenfolge ist der Vorrang: gültiges 2.3-Topic vor gültigem 2.2-Topic.
         "openWB/general/chargemode_config/bat/mode": "openwb_bat_mode",
+        "openWB/general/chargemode_config/bat/min_soc": "openwb_bat_min_soc",
+        "openWB/general/chargemode_config/bat/max_soc": "openwb_bat_max_soc",
+        "openWB/general/chargemode_config/bat/power_discharge": "openwb_bat_power_discharge",
+        "openWB/general/chargemode_config/bat/power_discharge_active": "openwb_bat_power_discharge_active",
+        "openWB/general/chargemode_config/pv_charging/bat_mode": "openwb_bat_mode",
+        "openWB/general/chargemode_config/pv_charging/min_bat_soc": "openwb_bat_min_soc",
+        "openWB/general/chargemode_config/pv_charging/max_bat_soc": "openwb_bat_max_soc",
+        "openWB/general/chargemode_config/pv_charging/bat_power_discharge": "openwb_bat_power_discharge",
+        "openWB/general/chargemode_config/pv_charging/bat_power_discharge_active": "openwb_bat_power_discharge_active",
         "openWB/general/extern": "openwb_extern",
         "openWB/system/version": "openwb_software_version",
-        "openWB/general/chargemode_config/pv_charging/switch_off_delay": "openwb_switch_off_delay_s",
         "openWB/general/chargemode_config/surplus/vehicle/switch_off_delay": "openwb_switch_off_delay_s",
+        "openWB/general/chargemode_config/pv_charging/switch_off_delay": "openwb_switch_off_delay_s",
     }
 
-    def _read_openwb_display_topic(self, topic, payload):
+    def _clear_openwb_display_session(self):
+        """Verwirft Einstellungen und Aktivitätsbeleg nach jeder Sitzungsunterbrechung."""
+        self._openwb_display_values.clear()
+        for key in set(self._OPENWB_DISPLAY_TOPICS.values()):
+            for suffix, value in (("", None), ("_topic", None), ("_ts", None),
+                                  ("_valid", False), ("_retained", False), ("_session_valid", False)):
+                self.state[key + suffix] = value
+            self.state.setdefault("openwb_status_reason", {})[key] = "disconnected"
+        for key in ("_openwb_display_profile", "_openwb_display_vehicle"):
+            self._openwb_display_context.pop(key, None)
+        self.state["openwb_control_source_ts"] = None
+        self.state["openwb_control_received_ts"] = None
+        self.state["openwb_profile_observation"] = None
+
+    def _read_openwb_control_activity(self, topic, payload):
+        # Nach jeder Regelberechnung erzeugtes Lesethema mit Produzentenzeitstempel.
+        if topic not in ("openWB/system/lastlivevaluesJson", "openWB/graph/lastlivevaluesJson"):
+            return False
+        try:
+            data = json.loads(payload)
+        except (ValueError, TypeError):
+            data = None
+        now = time.time()
+        ts = data.get("timestamp") if isinstance(data, dict) else None
+        try:
+            ts = float(ts) if type(ts) in (int, float) else None
+        except (ValueError, OverflowError):
+            ts = None
+        valid = (self.state.get("mqtt_connected") is True and type(ts) in (int, float)
+                 and math.isfinite(ts) and ts > 0 and 0 <= now - ts < 30)
+        self.state["openwb_control_source_ts"] = ts if valid else None
+        self.state["openwb_control_received_ts"] = now if valid else None
+        return True
+
+    def _openwb_control_activity_valid(self, now):
+        return self.state.get("mqtt_connected") is True and all(
+            type(ts) in (int, float) and math.isfinite(ts) and ts > 0 and 0 <= now - ts < 30
+            for ts in (self.state.get("openwb_control_source_ts"),
+                       self.state.get("openwb_control_received_ts")))
+
+    def _read_openwb_display_topic(self, topic, payload, *, retained=False):
         key = self._OPENWB_DISPLAY_TOPICS.get(topic)
         if key is None:
             return False
+        if self.state.get("mqtt_connected") is not True:
+            return True
         try:
             value = json.loads(payload)
         except (ValueError, TypeError):
@@ -1350,9 +1822,17 @@ class OpenWBCharger(WallboxDriver):
             value = value if isinstance(value, str) and value in (
                 "ev_mode", "bat_mode", "min_soc_bat_mode"
             ) else None
-            self.state["openwb_bat_mode_topic"] = topic
-            # Empfangszeit der Konfiguration, kein Messzeitpunkt der openWB.
-            self.state["openwb_bat_mode_ts"] = int(time.time())
+        elif key in ("openwb_bat_min_soc", "openwb_bat_max_soc", "openwb_bat_power_discharge"):
+            # Nur dokumentierte numerische Skalare, keine geratenen Ersatzwerte.
+            try:
+                value = float(value) if type(value) in (int, float) else None
+                value = value if value is not None and math.isfinite(value) and value >= 0 else None
+            except (TypeError, ValueError, OverflowError):
+                value = None
+            if key.endswith("_soc") and value is not None and value > 100:
+                value = None
+        elif key == "openwb_bat_power_discharge_active":
+            value = value if isinstance(value, bool) else None
         elif key == "openwb_extern":
             if isinstance(value, str) and value in ("true", "false"):
                 value = value == "true"
@@ -1368,15 +1848,131 @@ class OpenWBCharger(WallboxDriver):
             value = value.strip() if isinstance(value, str) else None
             if not value or not re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:[-+][A-Za-z0-9.]+)?", value):
                 value = None
+        # Leere/ungültige Nachrichten verwerfen ausschließlich ihr eigenes Topic.
+        if value is None:
+            self._openwb_display_values.pop(topic, None)
+        else:
+            self._openwb_display_values[topic] = (value, int(time.time()), bool(retained))
+        selected = next((candidate for candidate, field in self._OPENWB_DISPLAY_TOPICS.items()
+                         if field == key and candidate in self._openwb_display_values), None)
+        value, received_ts, retained = self._openwb_display_values.get(selected, (None, None, False))
         self.state[key] = value
+        self.state[key + "_topic"] = selected
+        # Empfangszeit des verwendeten Werts, kein Änderungszeitpunkt der openWB.
+        self.state[key + "_ts"] = received_ts
+        self.state[key + "_valid"] = value is not None
+        self.state[key + "_retained"] = retained
+        # Für neue Beratung ausschließlich das dokumentierte aktuelle Einstellungsfeld.
+        modern = next((candidate for candidate, field in self._OPENWB_DISPLAY_TOPICS.items()
+                       if field == key), None)
+        self.state[key + "_session_valid"] = value is not None and (
+            selected == modern or selected in {
+                "openWB/general/chargemode_config/pv_charging/" + name
+                for name in ("bat_mode", "min_bat_soc", "max_bat_soc", "bat_power_discharge", "bat_power_discharge_active")
+            })
         self.state.setdefault("openwb_status_reason", {})[key] = (
             "received" if value is not None else "missing_or_invalid"
         )
         return True
 
+    def _read_openwb_profile_topic(self, topic, payload, *, retained=False):
+        """Nur Anzeige-Skalare; Fahrzeugbindung bleibt ausschließlich im Arbeitsspeicher."""
+        fields = {
+            f"{self.native_prefix}/connected_vehicle/config": "_openwb_display_profile",
+            f"{self.native_prefix}/connected_vehicle/info": "_openwb_display_vehicle",
+        }
+        key = fields.get(topic)
+        if key is None:
+            return False
+        if self.state.get("mqtt_connected") is not True:
+            return True
+        try:
+            data = json.loads(payload)
+        except (ValueError, TypeError):
+            data = None
+        value = None
+        if isinstance(data, dict):
+            if key == "_openwb_display_profile":
+                template = data.get("charge_template")
+                mode = data.get("chargemode")
+                if type(template) is int and template >= 0 and isinstance(mode, str) and mode in (
+                    "instant_charging", "scheduled_charging", "pv_charging", "eco_charging", "stop", "time_charging"
+                ):
+                    value = {"template": template, "mode": mode, "ts": time.time(), "cp": self.cp_id}
+            else:
+                vehicle = data.get("id")
+                if type(vehicle) is int and vehicle >= 0:
+                    value = {"vehicle": vehicle, "ts": time.time(), "cp": self.cp_id}
+        self._openwb_display_context[key] = value
+        episode = self._openwb_display_context.get("_openwb_display_episode")
+        if value is None and episode:
+            episode["invalidated"] = True
+        if value is not None and episode and episode.get("binding") is not None:
+            bound = episode["binding"]
+            changed = (value["vehicle"] != bound[0] if key == "_openwb_display_vehicle"
+                       else (value["template"], value["mode"]) != bound[1:])
+            if changed:
+                episode["invalidated"] = True
+        # Ein Teiltelegramm darf niemals einen früheren vollständigen Hinweis erhalten.
+        self.state["openwb_profile_observation"] = None
+        # Den ausdrücklich aktivierten Legacy-Infovertrag unverändert weiterführen.
+        return key != "_openwb_display_vehicle" or not bool(getattr(self, "_mqtt_legacy_enabled", False))
+
+    def _observe_openwb_display_episode(self, data):
+        """Beobachtet eine Ansteckepisode, ohne den Regler-/Sessionzustand zu verändern."""
+        now = time.time()
+        self.state["openwb_display_observation_ts"] = now if isinstance(data, dict) else None
+        plug = data.get("plug_state") if isinstance(data, dict) else None
+        previous = self._openwb_display_context.get("_openwb_display_plug")
+        last = self._openwb_display_context.get("_openwb_display_plug_ts")
+        episode = self._openwb_display_context.get("_openwb_display_episode")
+        self.state["openwb_profile_observation"] = None
+        if not isinstance(plug, bool):
+            # Ausfall ist keine neue Ab-/Ansteckkante.
+            return
+        if plug is False:
+            self._openwb_display_context["_openwb_display_episode"] = None
+        elif previous is False and last is not None and 0 <= now - last < 30:
+            episode = {"token": os.urandom(16).hex(), "start": now, "cp": self.cp_id,
+                       "binding": None, "invalidated": False}
+            # Bindung an den aktuellen Stand bereits an der belegten Ansteckkante.
+            profile = self._openwb_display_context.get("_openwb_display_profile")
+            vehicle = self._openwb_display_context.get("_openwb_display_vehicle")
+            if all(isinstance(v, dict) and v["cp"] == self.cp_id and 0 < v["ts"] <= now
+                   for v in (profile, vehicle)):
+                episode["binding"] = (vehicle["vehicle"], profile["template"], profile["mode"])
+            self._openwb_display_context["_openwb_display_episode"] = episode
+        self._openwb_display_context["_openwb_display_plug"] = plug
+        self._openwb_display_context["_openwb_display_plug_ts"] = now
+        if not plug or not episode or episode["cp"] != self.cp_id or episode["invalidated"]:
+            return
+        profile = self._openwb_display_context.get("_openwb_display_profile")
+        vehicle = self._openwb_display_context.get("_openwb_display_vehicle")
+        if not all(isinstance(v, dict) and v["cp"] == self.cp_id
+                   and 0 < v["ts"] <= now
+                   for v in (profile, vehicle)):
+            return
+        binding = (vehicle["vehicle"], profile["template"], profile["mode"])
+        if episode["binding"] is not None and binding != episode["binding"]:
+            episode["invalidated"] = True
+            return
+        episode["binding"] = binding
+        # Zwei frische, identische Plug-Beobachtungen belegen die stabile Episode.
+        if (previous is not True or last is None or not 0 <= now - last < 30
+                or not self._openwb_control_activity_valid(now)):
+            return
+        self.state["openwb_profile_observation"] = {
+            "episode": episode["token"], "chargemode": profile["mode"],
+            "ts": now, "valid": True,
+        }
+
     def _mqtt_subscription_topics(self):
         topics = [
+            "openWB/system/lastlivevaluesJson",
+            "openWB/graph/lastlivevaluesJson",
             f"{self.native_prefix}/connected_vehicle/soc",
+            f"{self.native_prefix}/connected_vehicle/config",
+            f"{self.native_prefix}/connected_vehicle/info",
             f"{self.simpleapi_prefix}/soc/soc",
             f"{self.simpleapi_prefix}/soc/timestamp",
         ]
@@ -1398,7 +1994,13 @@ class OpenWBCharger(WallboxDriver):
                 f"{self.simpleapi_prefix}/chargemode",
                 f"openWB/chargepoint{self.cp_suffix}/config",
             ])
+        if self._mqtt_status_enabled():
+            topics.extend(f"{self.native_prefix}/{field}" for field in self._MQTT_STATUS_FIELDS)
+            topics.append("openWB/system/time")
         topics.extend(self._OPENWB_DISPLAY_TOPICS)
+        # Vor der Autoerkennung nur globale Themen, niemals ein ungebundener Ladepunkt.
+        if self.cp_id == "":
+            topics = [topic for topic in topics if "/chargepoint" not in topic]
         return topics
 
     def _sync_mqtt_subscriptions(self, client, *, reconnect=False):
@@ -1413,359 +2015,393 @@ class OpenWBCharger(WallboxDriver):
                 except Exception as exc:
                     logger.debug(
                         f"[WB{self.wb_id}] MQTT-Leseabonnement konnte nicht "
-                        f"abgemeldet werden ({topic}): {exc}"
+                        f"abgemeldet werden ({topic}): {type(exc).__name__}"
                     )
         subscribed = set(previous & desired)
+        self._mqtt_subscription_mids = {}
         for topic in sorted(desired - subscribed):
             try:
-                client.subscribe(topic)
+                result = client.subscribe(topic)
+                if isinstance(result, tuple) and len(result) == 2:
+                    self._mqtt_subscription_mids[result[1]] = topic
                 subscribed.add(topic)
             except Exception as exc:
                 logger.warning(
                     f"[WB{self.wb_id}] MQTT-Leseabonnement konnte nicht "
-                    f"gebunden werden ({topic}): {exc}"
+                    f"gebunden werden ({topic}): {type(exc).__name__}"
                 )
         self._mqtt_subscribed_topics = subscribed
         return len(subscribed)
 
     def on_connect(self, client, userdata, flags, reason_code, properties=None):
-        rc = reason_code if isinstance(reason_code, int) else (0 if str(reason_code) == 'Success' else 1)
-        if rc == 0:
-            self.state["mqtt_reconnect_backoff_s"] = 0
-            self.state["mqtt_reconnect_backoff_max_s"] = 60
-            self.state["mqtt_connected"] = True
-            logger.info(f"[WB{self.wb_id}] MQTT: Verbunden mit openWB ({self.ip}), CP={self.cp_id}")
-            topic_count = self._sync_mqtt_subscriptions(client, reconnect=True)
-            logger.info(f"[WB{self.wb_id}] MQTT: {topic_count} Topics abonniert (incl. Auto-SoC)")
-        else:
-            self.state["mqtt_connected"] = False
-            logger.error(f"[WB{self.wb_id}] MQTT: Connection failed (rc={rc})")
+        with self._openwb_mqtt_status_lock:
+            if not self._mqtt_callback_current(client):
+                return
+            self._clear_mqtt_status()
+            rc = reason_code if isinstance(reason_code, int) else (0 if str(reason_code) == 'Success' else 1)
+            self._clear_openwb_display_session()
+            if rc == 0:
+                self.state["mqtt_reconnect_backoff_s"] = 0
+                self.state["mqtt_reconnect_backoff_max_s"] = 60
+                self.state["mqtt_connected"] = True
+                self.state["openwb_mqtt_reason"] = "openwb_mqtt_waiting"
+                self.state["openwb_mqtt_connected_ts"] = time.time()
+                self._mqtt_received_topics = set()
+                logger.info(f"[WB{self.wb_id}] MQTT: Verbunden mit openWB ({self.ip}), CP={self.cp_id}")
+                topic_count = self._sync_mqtt_subscriptions(client, reconnect=True)
+                logger.info(f"[WB{self.wb_id}] MQTT: {topic_count} Topics abonniert (incl. Auto-SoC)")
+            else:
+                self.state["mqtt_connected"] = False
+                self.state["openwb_mqtt_reason"] = "openwb_auth_rejected"
+                logger.error("[WB%d] %s", self.wb_id, MESSAGES["openwb_auth_rejected"])
 
     def on_disconnect(self, client, userdata, *args):
-        reason_code = args[-2] if len(args) >= 2 else (args[0] if args else None)
-        rc_text = str(reason_code if reason_code is not None else "")
-        self.state["mqtt_connected"] = False
-        for key in self._OPENWB_DISPLAY_TOPICS.values():
-            self.state[key] = None
-            self.state.setdefault("openwb_status_reason", {})[key] = "disconnected"
-        self.state["openwb_bat_mode_topic"] = None
-        self.state["openwb_bat_mode_ts"] = None
-        self.state["mqtt_reconnect_backoff_s"] = 2
-        self.state["mqtt_reconnect_backoff_max_s"] = 60
-        logger.warning(
-            f"[WB{self.wb_id}] MQTT: Verbindung getrennt (rc={rc_text}); "
-            "Reconnect läuft mit Backoff 2s..60s."
-        )
+        with self._openwb_mqtt_status_lock:
+            if not self._mqtt_callback_current(client):
+                return
+            self._clear_mqtt_status()
+            if self.state.get("driver_status_source") == "openwb_mqtt":
+                self.state.update(driver_status_valid=False, driver_status_stale=True,
+                                  driver_status_degraded=True, driver_status_reason="openwb_mqtt_unavailable")
+            reason_code = args[-2] if len(args) >= 2 else (args[0] if args else None)
+            rc_text = str(reason_code if reason_code is not None else "")
+            self.state["mqtt_connected"] = False
+            if self.state.get("openwb_mqtt_reason") not in ("openwb_auth_rejected", "openwb_pin_changed", "openwb_certificate_expired", "openwb_tls_required"):
+                self.state["openwb_mqtt_reason"] = "openwb_mqtt_unavailable"
+            self._clear_openwb_display_session()
+            self.state["mqtt_reconnect_backoff_s"] = 2
+            self.state["mqtt_reconnect_backoff_max_s"] = 60
+            logger.warning(
+                f"[WB{self.wb_id}] MQTT: Verbindung getrennt (rc={rc_text}); "
+                "Reconnect läuft mit Backoff 2s..60s."
+            )
 
     def on_message(self, client, userdata, msg):
-        try:
-            topic       = msg.topic
-            payload_str = msg.payload.decode('utf-8').strip()
-            if self._read_openwb_display_topic(topic, payload_str):
+        with self._openwb_mqtt_status_lock:
+            if not self._mqtt_callback_current(client):
                 return
-            if not payload_str:
-                return
+            try:
+                topic       = msg.topic
+                if not hasattr(self, "_mqtt_received_topics"):
+                    self._mqtt_received_topics = set()
+                self._mqtt_received_topics.add(topic)
+                # CONNECT/SUBACK allein beweist keine Zustellung. Fehlende optionale
+                # Einzelthemen bleiben unabhängig davon in openwb_status_reason unbekannt.
+                core = self._mqtt_required_topics()
+                if core <= self._mqtt_received_topics:
+                    self.state["openwb_mqtt_reason"] = ""
+                payload_str = msg.payload.decode('utf-8').strip()
+                if self._receive_mqtt_status(topic, payload_str, bool(getattr(msg, 'retain', False))):
+                    return
+                if self._read_openwb_control_activity(topic, payload_str):
+                    return
+                if self._read_openwb_display_topic(topic, payload_str, retained=bool(getattr(msg, "retain", False))):
+                    return
+                if self._read_openwb_profile_topic(topic, payload_str, retained=bool(getattr(msg, "retain", False))):
+                    return
+                if not payload_str:
+                    return
 
-            # --- Skalare SoC-Projektion der openWB simpleAPI ---
-            # openWB liefert Wert und echten Produzentenzeitpunkt in zwei
-            # Topics. Sie werden nur innerhalb eines engen Empfangsfensters
-            # gepaart. Der Lesepfad publiziert selbst keinerlei MQTT-Befehle.
-            if topic in (
-                f"{self.simpleapi_prefix}/soc/soc",
-                f"{self.simpleapi_prefix}/soc/timestamp",
-            ):
-                observed_ts = time.time()
-                pending = self.state.setdefault('_simpleapi_soc_pending', {})
-                if topic == f"{self.simpleapi_prefix}/soc/soc":
-                    car_soc = self._soc_percent_value(payload_str.strip('"'))
-                    if car_soc is None:
-                        return
-                    pending.update({
-                        "value": car_soc,
-                        "value_received_ts": observed_ts,
-                    })
-                else:
-                    source_ts = self._soc_source_timestamp(
-                        payload_str.strip('"'),
-                        now_ts=observed_ts,
-                    )
-                    if source_ts is None:
-                        return
-                    pending.update({
-                        "source_ts": source_ts,
-                        "timestamp_received_ts": observed_ts,
-                    })
-                self._apply_simpleapi_soc_pair(observed_ts=observed_ts)
-                return
-
-            # --- Auto-SoC aus openWB (MQTT JSON) ---
-            if topic == f"{self.native_prefix}/connected_vehicle/soc":
-                try:
-                    soc_data = json.loads(payload_str)
-                    if not isinstance(soc_data, dict):
-                        return
-                    car_soc = self._soc_percent_value(soc_data.get("soc"))
-                    if car_soc is not None:
-                        observed_ts = time.time()
-                        openwb_ts = soc_data.get("timestamp", None)
-                        explicit_soc_ts = self._soc_source_timestamp(
-                            openwb_ts,
+                # --- Skalare SoC-Projektion der openWB simpleAPI ---
+                # openWB liefert Wert und echten Produzentenzeitpunkt in zwei
+                # Topics. Sie werden nur innerhalb eines engen Empfangsfensters
+                # gepaart. Der Lesepfad publiziert selbst keinerlei MQTT-Befehle.
+                if topic in (
+                    f"{self.simpleapi_prefix}/soc/soc",
+                    f"{self.simpleapi_prefix}/soc/timestamp",
+                ):
+                    observed_ts = time.time()
+                    pending = self.state.setdefault('_simpleapi_soc_pending', {})
+                    if topic == f"{self.simpleapi_prefix}/soc/soc":
+                        car_soc = self._soc_percent_value(payload_str.strip('"'))
+                        if car_soc is None:
+                            return
+                        pending.update({
+                            "value": car_soc,
+                            "value_received_ts": observed_ts,
+                        })
+                    else:
+                        source_ts = self._soc_source_timestamp(
+                            payload_str.strip('"'),
                             now_ts=observed_ts,
                         )
-                        retained = bool(getattr(msg, "retain", False))
-                        previous_soc_ts = self._soc_source_timestamp(
-                            self.state.get("car_soc_source_ts"),
-                            now_ts=observed_ts,
-                        )
-                        previous_confirmed = bool(
-                            self.state.get("car_soc_rule_confirmed") is True
-                            and previous_soc_ts is not None
-                        )
-                        soc_ts = (
-                            explicit_soc_ts
-                            if explicit_soc_ts is not None
-                            else (int(observed_ts) if not retained else None)
-                        )
-                        source = "openwb_mqtt_retained" if retained else "openwb_mqtt"
-                        self._record_soc_observation(
-                            car_soc,
-                            source="openwb_mqtt",
-                            observed_ts=observed_ts,
-                            # Für die reine Anzeige niemals Empfangszeit als
-                            # Produzentenzeit ausgeben. Der Legacy-Regelpfad
-                            # darf sein bisheriges Verhalten separat behalten.
-                            source_ts=explicit_soc_ts,
-                            retained=retained,
-                        )
-                        if not bool(getattr(self, "_mqtt_legacy_enabled", False)):
-                            # Der neue Standard-Abonnent ist reine Anzeige.
-                            # Nur der explizit aktivierte alte MQTT-Pfad darf
-                            # seinen bisherigen Regelvertrag weiterführen.
+                        if source_ts is None:
                             return
-                        if (
-                            retained
-                            and previous_confirmed
-                        ):
-                            # Ein Retain ist kein neuer Fahrzeugmesswert. Eine
-                            # bereits bestätigte Live-Wahrheit bleibt erhalten.
-                            self.state["mqtt_retained_received_at"] = int(observed_ts)
+                        pending.update({
+                            "source_ts": source_ts,
+                            "timestamp_received_ts": observed_ts,
+                        })
+                    self._apply_simpleapi_soc_pair(observed_ts=observed_ts)
+                    return
+
+                # --- Auto-SoC aus openWB (MQTT JSON) ---
+                if topic == f"{self.native_prefix}/connected_vehicle/soc":
+                    try:
+                        soc_data = json.loads(payload_str)
+                        if not isinstance(soc_data, dict):
                             return
-                        rule_confirmed = bool(not retained and soc_ts is not None)
-                        if (
-                            rule_confirmed
-                            and previous_confirmed
-                            and soc_ts < previous_soc_ts
-                        ):
-                            # Ein später empfangenes, aber älter gemessenes
-                            # Ereignis darf den frischeren SoC nicht ersetzen.
-                            self.state["car_soc_unconfirmed_observed"] = car_soc
-                            self.state["car_soc_unconfirmed_source"] = source
-                            self.state["car_soc_unconfirmed_observed_ts"] = int(observed_ts)
-                            return
-                        vehicle_key = self._current_range_vehicle_key()
-                        self.state['car_soc'] = car_soc
-                        self.state['car_soc_source'] = source
-                        self.state['car_soc_source_ts'] = soc_ts
-                        self.state['car_soc_raw_ts'] = soc_ts
-                        self.state['car_soc_rule_confirmed'] = rule_confirmed
-                        if "range_charged" in soc_data:
-                            self._set_charged_range(
-                                soc_data.get("range_charged"),
-                                "mqtt_charged",
-                                observed_ts=observed_ts,
-                                source_ts=openwb_ts,
-                                vehicle_key=vehicle_key,
+                        car_soc = self._soc_percent_value(soc_data.get("soc"))
+                        if car_soc is not None:
+                            observed_ts = time.time()
+                            openwb_ts = soc_data.get("timestamp", None)
+                            explicit_soc_ts = self._soc_source_timestamp(
+                                openwb_ts,
+                                now_ts=observed_ts,
                             )
-                        range_val, range_present = self._extract_total_range(soc_data)
-                        if range_present:
+                            retained = bool(getattr(msg, "retain", False))
+                            previous_soc_ts = self._soc_source_timestamp(
+                                self.state.get("car_soc_source_ts"),
+                                now_ts=observed_ts,
+                            )
+                            previous_confirmed = bool(
+                                self.state.get("car_soc_rule_confirmed") is True
+                                and previous_soc_ts is not None
+                            )
+                            soc_ts = (
+                                explicit_soc_ts
+                                if explicit_soc_ts is not None
+                                else (int(observed_ts) if not retained else None)
+                            )
+                            source = "openwb_mqtt_retained" if retained else "openwb_mqtt"
+                            self._record_soc_observation(
+                                car_soc,
+                                source="openwb_mqtt",
+                                observed_ts=observed_ts,
+                                # Für die reine Anzeige niemals Empfangszeit als
+                                # Produzentenzeit ausgeben. Der Legacy-Regelpfad
+                                # darf sein bisheriges Verhalten separat behalten.
+                                source_ts=explicit_soc_ts,
+                                retained=retained,
+                            )
+                            if not bool(getattr(self, "_mqtt_legacy_enabled", False)):
+                                # Der neue Standard-Abonnent ist reine Anzeige.
+                                # Nur der explizit aktivierte alte MQTT-Pfad darf
+                                # seinen bisherigen Regelvertrag weiterführen.
+                                return
+                            if (
+                                retained
+                                and previous_confirmed
+                            ):
+                                # Ein Retain ist kein neuer Fahrzeugmesswert. Eine
+                                # bereits bestätigte Live-Wahrheit bleibt erhalten.
+                                self.state["mqtt_retained_received_at"] = int(observed_ts)
+                                return
+                            rule_confirmed = bool(not retained and soc_ts is not None)
+                            if (
+                                rule_confirmed
+                                and previous_confirmed
+                                and soc_ts < previous_soc_ts
+                            ):
+                                # Ein später empfangenes, aber älter gemessenes
+                                # Ereignis darf den frischeren SoC nicht ersetzen.
+                                self.state["car_soc_unconfirmed_observed"] = car_soc
+                                self.state["car_soc_unconfirmed_source"] = source
+                                self.state["car_soc_unconfirmed_observed_ts"] = int(observed_ts)
+                                return
+                            vehicle_key = self._current_range_vehicle_key()
+                            self.state['car_soc'] = car_soc
+                            self.state['car_soc_source'] = source
+                            self.state['car_soc_source_ts'] = soc_ts
+                            self.state['car_soc_raw_ts'] = soc_ts
+                            self.state['car_soc_rule_confirmed'] = rule_confirmed
+                            if "range_charged" in soc_data:
+                                self._set_charged_range(
+                                    soc_data.get("range_charged"),
+                                    "mqtt_charged",
+                                    observed_ts=observed_ts,
+                                    source_ts=openwb_ts,
+                                    vehicle_key=vehicle_key,
+                                )
+                            range_val, range_present = self._extract_total_range(soc_data)
+                            if range_present:
+                                self._set_total_range(
+                                    range_val,
+                                    "mqtt_total",
+                                    observed_ts=observed_ts,
+                                    source_ts=openwb_ts,
+                                    vehicle_key=vehicle_key,
+                                )
+                            is_plugged = self.state.get('plug_state', False)
+                            soc_age_h = max(
+                                0.0,
+                                (observed_ts - float(soc_ts or observed_ts)) / 3600.0,
+                            )
+
+                            self._write_manual_soc(
+                                car_soc,
+                                is_plugged,
+                                soc_ts,
+                                source=source,
+                                soc_source_ts=soc_ts,
+                                raw_soc_ts=soc_ts,
+                                rule_confirmed=rule_confirmed,
+                            )
+                            state_str = "eingesteckt" if is_plugged else f"nicht eingesteckt (letzter Wert vor {soc_age_h:.1f}h)"
+                            last_soc = self.state.get('_last_logged_soc', -100)
+                            if abs(car_soc - last_soc) >= 5.0:
+                                logger.info(f"[WB{self.wb_id}] Auto-SoC aus openWB: {car_soc:.1f}% ({state_str})")
+                                self.state['_last_logged_soc'] = car_soc
+                    except Exception:
+                        pass
+                    return
+
+                # --- Auto-Range aus openWB ---
+                if topic in (f"{self.native_prefix}/connected_vehicle/range", f"{self.simpleapi_prefix}/soc/range"):
+                    try:
+                        range_val = float(payload_str)
+                        if range_val > 0:
+                            observed_ts = time.time()
                             self._set_total_range(
                                 range_val,
                                 "mqtt_total",
                                 observed_ts=observed_ts,
-                                source_ts=openwb_ts,
-                                vehicle_key=vehicle_key,
+                                source_ts=None,
+                                vehicle_key=self._current_range_vehicle_key(),
                             )
-                        is_plugged = self.state.get('plug_state', False)
-                        soc_age_h = max(
-                            0.0,
-                            (observed_ts - float(soc_ts or observed_ts)) / 3600.0,
+                            last_range = self.state.get('_last_logged_range', -1)
+                            if abs(range_val - last_range) >= 10.0:
+                                logger.info(f"[WB{self.wb_id}] Auto-Range aus openWB: {int(range_val)} km")
+                                self.state['_last_logged_range'] = range_val
+                    except Exception:
+                        pass
+                    return
+
+                # --- Fahrzeug-Info aus openWB (Name, ID, Kapazitaet) ---
+                if topic == f"{self.native_prefix}/connected_vehicle/info":
+                    try:
+                        info = json.loads(payload_str)
+                        name = info.get('name', '') or info.get('vehicle_name', '')
+                        vid  = info.get('id', None)
+                        cap  = float(info.get('capacity', 0) or info.get('bat_capacity', 0) or 0)
+                        if name:
+                            old_name = self.state.get('car_name', '')
+                            self.state['car_name'] = name
+                            self.state['car_id']   = vid
+                            if cap > 0:
+                                self.state['car_capacity_kwh'] = cap
+                            if name != old_name:
+                                logger.info(f"[WB{self.wb_id}] Fahrzeug: '{name}' (ID={vid}, {cap:.0f}kWh)")
+                    except Exception:
+                        pass
+                    return
+
+                # --- openWB Config (Phasen-Capability) ---
+                if topic == f"openWB/chargepoint{self.cp_suffix}/config":
+                    try:
+                        cfg = json.loads(payload_str)
+                        connected_phases = int(cfg.get('connected_phases', 1) or 1)
+                        # Normale openWB wird als Secondary-Energiemanager gefuehrt:
+                        # Wir senden nur Sollstrom + Heartbeat, keine internen
+                        # Phasenbefehle. Die Capability bleibt nur Diagnose.
+                        self.state['can_switch_phases'] = False
+                        self.state['phase_switch_capability'] = 'secondary_current_only'
+                        self.state['phase_switch_source'] = 'openwb_config_mqtt'
+                        self.state['connected_phases'] = connected_phases
+                    except Exception:
+                        pass
+                    return
+
+                # --- Boolean-Felder ---
+                if topic == f"{self.native_prefix}/plug_state":
+                    val      = payload_str.lower() in ('true', '1')
+                    prev_plug = self.state['plug_state']
+                    plug_observed = bool(self.state.get('_plug_state_observed', False))
+                    self.state['plug_state'] = val
+                    self.state['car']        = 2 if val else 1
+                    if val and plug_observed and not prev_plug:
+                        self.state['_session_start_wh'] = (
+                            self.state['daily_imported_wh']
+                            if self.state.get('_daily_imported_observed', False)
+                            else None
                         )
+                        self.state['_session_start_ts'] = int(time.time())
+                        self.state['session_kwh']        = 0.0
+                        logger.info(f"[WB{self.wb_id}] Auto eingesteckt! Session-Zähler gestartet.")
+                    elif not val:
+                        self.state['_session_start_wh'] = None
+                        self.state['_session_start_ts'] = None
+                        self._clear_total_range()
+                        self._clear_charged_range()
+                    self.state['_plug_state_observed'] = True
+                    return
 
-                        self._write_manual_soc(
-                            car_soc,
-                            is_plugged,
-                            soc_ts,
-                            source=source,
-                            soc_source_ts=soc_ts,
-                            raw_soc_ts=soc_ts,
-                            rule_confirmed=rule_confirmed,
-                        )
-                        state_str = "eingesteckt" if is_plugged else f"nicht eingesteckt (letzter Wert vor {soc_age_h:.1f}h)"
-                        last_soc = self.state.get('_last_logged_soc', -100)
-                        if abs(car_soc - last_soc) >= 5.0:
-                            logger.info(f"[WB{self.wb_id}] Auto-SoC aus openWB: {car_soc:.1f}% ({state_str})")
-                            self.state['_last_logged_soc'] = car_soc
-                except Exception:
-                    pass
-                return
+                if topic == f"{self.native_prefix}/charge_state":
+                    self.state['charge_state'] = payload_str.lower() in ('true', '1')
+                    self.state['charging']     = self.state['charge_state']
+                    if not self.state['charge_state']:
+                        self.state['real_power_w'] = 0.0
+                        self.state['phase_power_l1_w'] = 0.0
+                        self.state['phase_power_l2_w'] = 0.0
+                        self.state['phase_power_l3_w'] = 0.0
+                        self.state['phase_power_sum_w'] = 0.0
+                        self.state['phase_power_verified'] = False
+                    return
 
-            # --- Auto-Range aus openWB ---
-            if topic in (f"{self.native_prefix}/connected_vehicle/range", f"{self.simpleapi_prefix}/soc/range"):
+                if topic == f"{self.native_prefix}/powers":
+                    try:
+                        powers = json.loads(payload_str)
+                        if not isinstance(powers, list):
+                            return
+                        p1 = float(powers[0]) if len(powers) > 0 and powers[0] is not None else 0.0
+                        p2 = float(powers[1]) if len(powers) > 1 and powers[1] is not None else 0.0
+                        p3 = float(powers[2]) if len(powers) > 2 and powers[2] is not None else 0.0
+                        total = p1 + p2 + p3
+                        self.state['phase_power_l1_w'] = p1
+                        self.state['phase_power_l2_w'] = p2
+                        self.state['phase_power_l3_w'] = p3
+                        self.state['phase_power_sum_w'] = total
+                        self.state['_phase_power_ts'] = time.time()
+                        self.state['phase_power_verified'] = bool(total > 50.0)
+                        self.state['real_power_w'] = total if total > 50.0 else 0.0
+                        if total > 50.0:
+                            self.state['charging'] = True
+                        elif not self.state.get('charge_state', False):
+                            self.state['charging'] = False
+                    except Exception:
+                        pass
+                    return
+
+                # --- Lademodus (simpleAPI) ---
+                if topic == f"{self.simpleapi_prefix}/chargemode":
+                    self.state['chargemode_str'] = payload_str.strip('"')
+                    self.state['frc'] = 0 if payload_str.lower() in ('stop', '0') else 2
+                    return
+
+                # --- Numerische Felder ---
                 try:
-                    range_val = float(payload_str)
-                    if range_val > 0:
-                        observed_ts = time.time()
-                        self._set_total_range(
-                            range_val,
-                            "mqtt_total",
-                            observed_ts=observed_ts,
-                            source_ts=None,
-                            vehicle_key=self._current_range_vehicle_key(),
-                        )
-                        last_range = self.state.get('_last_logged_range', -1)
-                        if abs(range_val - last_range) >= 10.0:
-                            logger.info(f"[WB{self.wb_id}] Auto-Range aus openWB: {int(range_val)} km")
-                            self.state['_last_logged_range'] = range_val
-                except Exception:
-                    pass
-                return
+                    num_val = float(payload_str)
+                except (ValueError, TypeError):
+                    return
 
-            # --- Fahrzeug-Info aus openWB (Name, ID, Kapazitaet) ---
-            if topic == f"{self.native_prefix}/connected_vehicle/info":
-                try:
-                    info = json.loads(payload_str)
-                    name = info.get('name', '') or info.get('vehicle_name', '')
-                    vid  = info.get('id', None)
-                    cap  = float(info.get('capacity', 0) or info.get('bat_capacity', 0) or 0)
-                    if name:
-                        old_name = self.state.get('car_name', '')
-                        self.state['car_name'] = name
-                        self.state['car_id']   = vid
-                        if cap > 0:
-                            self.state['car_capacity_kwh'] = cap
-                        if name != old_name:
-                            logger.info(f"[WB{self.wb_id}] Fahrzeug: '{name}' (ID={vid}, {cap:.0f}kWh)")
-                except Exception:
-                    pass
-                return
+                if topic == f"{self.native_prefix}/power":
+                    if self.state.get('charge_state', False) or self.state.get('phase_power_verified', False):
+                        self.state['real_power_w'] = num_val if num_val > 50.0 else 0.0
+                    else:
+                        self.state['real_power_w'] = 0.0
+                elif topic == f"{self.native_prefix}/evse_current":
+                    self.state['evse_current'] = num_val
+                    self.state['amp']          = int(num_val)
+                elif topic == f"{self.native_prefix}/phases_in_use":
+                    self.state['phases_in_use'] = int(num_val)
+                    self.state['pha']           = 56 if int(num_val) >= 3 else 8
+                elif topic == f"{self.native_prefix}/daily_imported":
+                    self.state['daily_imported_wh'] = num_val
+                    self.state['_daily_imported_observed'] = True
+                    start = self.state.get('_session_start_wh')
+                    if (
+                        start is None
+                        and self.state.get('plug_state', False)
+                        and self.state.get('_session_start_ts') is not None
+                    ):
+                        self.state['_session_start_wh'] = num_val
+                        start = num_val
+                    if start is not None and self.state['plug_state']:
+                        self.state['session_kwh'] = max(0.0, (num_val - start) / 1000.0)
+                elif topic == f"{self.native_prefix}/imported":
+                    self.state['imported_total_wh'] = num_val
 
-            # --- openWB Config (Phasen-Capability) ---
-            if topic == f"openWB/chargepoint{self.cp_suffix}/config":
-                try:
-                    cfg = json.loads(payload_str)
-                    connected_phases = int(cfg.get('connected_phases', 1) or 1)
-                    # Normale openWB wird als Secondary-Energiemanager gefuehrt:
-                    # Wir senden nur Sollstrom + Heartbeat, keine internen
-                    # Phasenbefehle. Die Capability bleibt nur Diagnose.
-                    self.state['can_switch_phases'] = False
-                    self.state['phase_switch_capability'] = 'secondary_current_only'
-                    self.state['phase_switch_source'] = 'openwb_config_mqtt'
-                    self.state['connected_phases'] = connected_phases
-                except Exception:
-                    pass
-                return
-
-            # --- Boolean-Felder ---
-            if topic == f"{self.native_prefix}/plug_state":
-                val      = payload_str.lower() in ('true', '1')
-                prev_plug = self.state['plug_state']
-                plug_observed = bool(self.state.get('_plug_state_observed', False))
-                self.state['plug_state'] = val
-                self.state['car']        = 2 if val else 1
-                if val and plug_observed and not prev_plug:
-                    self.state['_session_start_wh'] = (
-                        self.state['daily_imported_wh']
-                        if self.state.get('_daily_imported_observed', False)
-                        else None
-                    )
-                    self.state['_session_start_ts'] = int(time.time())
-                    self.state['session_kwh']        = 0.0
-                    logger.info(f"[WB{self.wb_id}] Auto eingesteckt! Session-Zähler gestartet.")
-                elif not val:
-                    self.state['_session_start_wh'] = None
-                    self.state['_session_start_ts'] = None
-                    self._clear_total_range()
-                    self._clear_charged_range()
-                self.state['_plug_state_observed'] = True
-                return
-
-            if topic == f"{self.native_prefix}/charge_state":
-                self.state['charge_state'] = payload_str.lower() in ('true', '1')
-                self.state['charging']     = self.state['charge_state']
-                if not self.state['charge_state']:
-                    self.state['real_power_w'] = 0.0
-                    self.state['phase_power_l1_w'] = 0.0
-                    self.state['phase_power_l2_w'] = 0.0
-                    self.state['phase_power_l3_w'] = 0.0
-                    self.state['phase_power_sum_w'] = 0.0
-                    self.state['phase_power_verified'] = False
-                return
-
-            if topic == f"{self.native_prefix}/powers":
-                try:
-                    powers = json.loads(payload_str)
-                    if not isinstance(powers, list):
-                        return
-                    p1 = float(powers[0]) if len(powers) > 0 and powers[0] is not None else 0.0
-                    p2 = float(powers[1]) if len(powers) > 1 and powers[1] is not None else 0.0
-                    p3 = float(powers[2]) if len(powers) > 2 and powers[2] is not None else 0.0
-                    total = p1 + p2 + p3
-                    self.state['phase_power_l1_w'] = p1
-                    self.state['phase_power_l2_w'] = p2
-                    self.state['phase_power_l3_w'] = p3
-                    self.state['phase_power_sum_w'] = total
-                    self.state['_phase_power_ts'] = time.time()
-                    self.state['phase_power_verified'] = bool(total > 50.0)
-                    self.state['real_power_w'] = total if total > 50.0 else 0.0
-                    if total > 50.0:
-                        self.state['charging'] = True
-                    elif not self.state.get('charge_state', False):
-                        self.state['charging'] = False
-                except Exception:
-                    pass
-                return
-
-            # --- Lademodus (simpleAPI) ---
-            if topic == f"{self.simpleapi_prefix}/chargemode":
-                self.state['chargemode_str'] = payload_str.strip('"')
-                self.state['frc'] = 0 if payload_str.lower() in ('stop', '0') else 2
-                return
-
-            # --- Numerische Felder ---
-            try:
-                num_val = float(payload_str)
-            except (ValueError, TypeError):
-                return
-
-            if topic == f"{self.native_prefix}/power":
-                if self.state.get('charge_state', False) or self.state.get('phase_power_verified', False):
-                    self.state['real_power_w'] = num_val if num_val > 50.0 else 0.0
-                else:
-                    self.state['real_power_w'] = 0.0
-            elif topic == f"{self.native_prefix}/evse_current":
-                self.state['evse_current'] = num_val
-                self.state['amp']          = int(num_val)
-            elif topic == f"{self.native_prefix}/phases_in_use":
-                self.state['phases_in_use'] = int(num_val)
-                self.state['pha']           = 56 if int(num_val) >= 3 else 8
-            elif topic == f"{self.native_prefix}/daily_imported":
-                self.state['daily_imported_wh'] = num_val
-                self.state['_daily_imported_observed'] = True
-                start = self.state.get('_session_start_wh')
-                if (
-                    start is None
-                    and self.state.get('plug_state', False)
-                    and self.state.get('_session_start_ts') is not None
-                ):
-                    self.state['_session_start_wh'] = num_val
-                    start = num_val
-                if start is not None and self.state['plug_state']:
-                    self.state['session_kwh'] = max(0.0, (num_val - start) / 1000.0)
-            elif topic == f"{self.native_prefix}/imported":
-                self.state['imported_total_wh'] = num_val
-
-        except Exception:
-            pass  # Stille Fehlerbehandlung in High-Volume MQTT Threads
+            except Exception:
+                pass  # Stille Fehlerbehandlung in High-Volume MQTT Threads
 
     def _configured_role(self):
         if self.configured_primary_mode_enabled:
@@ -1871,12 +2507,6 @@ class OpenWBCharger(WallboxDriver):
         ):
             return False
         try:
-            req = urllib.request.Request(
-                self.http_api_url,
-                data=post_data.encode('ascii'),
-                headers=self._http_headers({'Content-Type': 'application/x-www-form-urlencoded'}),
-                method='POST',
-            )
             if not command_gate.allow_command(
                 self,
                 action="openwb_http_post_wire",
@@ -1901,34 +2531,28 @@ class OpenWBCharger(WallboxDriver):
                 # Ein Timeout kann nach Annahme eintreten. Den tatsächlich
                 # zugelassenen Sendeversuch schon vor der Rückmeldung sichern.
                 self.write_openwb_status(command_only=True)
-            with urllib.request.urlopen(req, timeout=5) as ctx:
-                resp = ctx.read().decode('utf-8', errors='replace')
-            if '"success":true' in resp:
-                logger.debug(f"[WB{self.wb_id}] HTTP OK: {post_data} -> {resp[:80]}")
-                return True
-            logger.warning(f"[WB{self.wb_id}] HTTP Fehler: {post_data} -> {resp[:120]}")
-            return False
-        except Exception as e:
-            logger.error(f"[WB{self.wb_id}] HTTP POST fehlgeschlagen: {e}")
+            resp = self._transport_request(
+                "/openWB/simpleAPI/simpleapi.php", method="POST", body=post_data.encode("ascii"),
+                headers={"Content-Type": "application/x-www-form-urlencoded"})
+            return json.loads(resp).get("success") is True
+        except Exception as exc:
+            reason = exc.reason if isinstance(exc, TransportError) else "openwb_unavailable"
+            if not str(self.state.get("openwb_http_reason") or "").startswith(
+                    "openwb_protection_post_after_failed_probe"):
+                self.state["openwb_http_reason"] = reason
+            logger.error("[WB%d] %s", self.wb_id, MESSAGES[reason])
             return False
 
     def _http_get_json(self, query: str):
         """Liest JSON aus der openWB HTTP simpleAPI."""
-        import urllib.parse
-        import urllib.request
-        sep = "&" if "?" in self.http_api_url else "?"
-        url = self.http_api_url + sep + query
         try:
-            req = urllib.request.Request(
-                url,
-                headers=self._http_headers(),
-                method="GET",
-            )
-            with urllib.request.urlopen(req, timeout=5) as ctx:
-                raw = ctx.read().decode("utf-8", errors="replace")
+            raw = self._transport_request("/openWB/simpleAPI/simpleapi.php?" + query)
             return json.loads(raw)
-        except Exception as e:
-            logger.error(f"[WB{self.wb_id}] HTTP GET fehlgeschlagen ({query}): {e}")
+        except Exception as exc:
+            reason = exc.reason if isinstance(exc, TransportError) else "openwb_unavailable"
+            self.state["openwb_http_reason"] = reason
+            if not self._status_http_fallback_active:
+                logger.error("[WB%d] %s", self.wb_id, MESSAGES[reason])
             return None
 
     def _openwb_chargepoint_nr(self):
@@ -2052,12 +2676,13 @@ class OpenWBCharger(WallboxDriver):
         try:
             target = float(target_amp)
             reported = float(self.state.get("instant_charging_current"))
-            readback_ts = float(self.state.get("driver_status_last_ok_ts") or 0.0)
+            readback_ts = float(self.state.get("openwb_simpleapi_status_ts") or 0.0)
         except (TypeError, ValueError):
             return False
         sent_ts = float(self._primary_pending_current_sent_ts or 0.0)
         if (
             sent_ts <= 0.0
+            or self._mqtt_status_enabled() and not 0.0 <= time.time() - readback_ts <= 15.0
             or readback_ts <= sent_ts
             or self.state.get("driver_status_valid") is not True
             or bool(self.state.get("driver_status_stale", False))
@@ -2190,14 +2815,7 @@ class OpenWBCharger(WallboxDriver):
         if message is not None:
             payload["message"] = json.dumps(message)
         data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            self.http_v1_url,
-            data=data,
-            headers=self._http_headers({"Content-Type": "application/json"}),
-            method="POST",
-        )
         try:
-            ctx = ssl._create_unverified_context()
             if not command_gate.allow_command(
                 self,
                 action="openwb_http_v1_post_wire",
@@ -2205,11 +2823,13 @@ class OpenWBCharger(WallboxDriver):
                 audit_allowed=False,
             ):
                 return None
-            with urllib.request.urlopen(req, timeout=5, context=ctx) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
+            raw = self._transport_request("/v1/", method="POST", body=data,
+                                          headers={"Content-Type": "application/json"}, v1=True)
             return json.loads(raw)
-        except Exception as e:
-            logger.error(f"[WB{self.wb_id}] HTTP V1 fehlgeschlagen ({topic}): {e}")
+        except Exception as exc:
+            reason = exc.reason if isinstance(exc, TransportError) else "openwb_unavailable"
+            self.state["openwb_http_reason"] = reason
+            logger.debug("[WB%d] %s", self.wb_id, MESSAGES[reason])
             return None
 
     def _http_v1_read(self, topic: str):
@@ -2218,19 +2838,14 @@ class OpenWBCharger(WallboxDriver):
         import urllib.request
         payload = {"topic": topic}
         data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            self.http_v1_url,
-            data=data,
-            headers=self._http_headers({"Content-Type": "application/json"}),
-            method="POST",
-        )
         try:
-            ctx = ssl._create_unverified_context()
-            with urllib.request.urlopen(req, timeout=3, context=ctx) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
+            raw = self._transport_request("/v1/", method="POST", body=data,
+                                          headers={"Content-Type": "application/json"}, v1=True)
             return json.loads(raw)
-        except Exception as e:
-            logger.debug(f"[WB{self.wb_id}] HTTP V1 Read fehlgeschlagen ({topic}): {e}")
+        except Exception as exc:
+            reason = exc.reason if isinstance(exc, TransportError) else "openwb_unavailable"
+            self.state["openwb_http_reason"] = reason
+            logger.debug("[WB%d] %s", self.wb_id, MESSAGES[reason])
             return None
 
     def _openwb_backend_pro_ip(self):
@@ -2481,7 +3096,7 @@ class OpenWBCharger(WallboxDriver):
                 ok = self._modbus_write_register(10171, int(round(amp * 100)))
             except Exception as e:
                 logger.warning(
-                    f"[WB{self.wb_id}] openWB Modbus-Strom {amp_text}A fehlgeschlagen: {e}"
+                    f"[WB{self.wb_id}] openWB Modbus-Strom {amp_text}A fehlgeschlagen: {type(e).__name__}"
                 )
                 ok = False
         else:
@@ -2797,7 +3412,7 @@ class OpenWBCharger(WallboxDriver):
                     os.remove(tmp)
             except OSError:
                 pass
-            logger.debug(f"[WB{self.wb_id}] Auto-SoC schreiben fehlgeschlagen: {e}")
+            logger.debug(f"[WB{self.wb_id}] Auto-SoC schreiben fehlgeschlagen: {type(e).__name__}")
             return False
 
     def _update_from_simpleapi(self, payload, *, observe_only=False):
@@ -2845,6 +3460,12 @@ class OpenWBCharger(WallboxDriver):
             discovery["status_confirmed"] = True
             discovery["status_confirmed_ts"] = confirmed_ts
             self.state["chargepoint_discovery_contract"] = discovery
+        whole_source = self._mqtt_status_enabled()
+        if whole_source:
+            cp_data = dict(cp_data)
+            for field in ("phases_in_use", "fault_state"):
+                cp_data[field] = self._mqtt_status_value(field, cp_data.get(field))
+        self.state["openwb_simpleapi_status_ts"] = time.time()
         self._apply_role_detection(cp_data)
         self.physical_output_identity_contract()
 
@@ -2863,7 +3484,7 @@ class OpenWBCharger(WallboxDriver):
             p2 = self._float_value(powers[1], 0.0) if len(powers) > 1 else 0.0
             p3 = self._float_value(powers[2], 0.0) if len(powers) > 2 else 0.0
             self.state["_phase_power_ts"] = time.time()
-        elif time.time() - float(self.state.get("_phase_power_ts", 0.0) or 0.0) < 15.0:
+        elif not whole_source and time.time() - float(self.state.get("_phase_power_ts", 0.0) or 0.0) < 15.0:
             p1 = self.state.get("phase_power_l1_w", 0.0)
             p2 = self.state.get("phase_power_l2_w", 0.0)
             p3 = self.state.get("phase_power_l3_w", 0.0)
@@ -2895,7 +3516,7 @@ class OpenWBCharger(WallboxDriver):
         if phases <= 0 and currents:
             phases = sum(1 for v in currents if self._float_value(v, 0.0) > 0.2)
         if phases <= 0:
-            phases = self.state.get("phases_in_use", 0)
+            phases = 0 if whole_source else (self.state.get("phases_in_use") or 0)
 
         # Auch ein hinter openWB angebundener Pro-Reader erneuert via
         # connect.php eine Steuerlease. Beobachten bleibt beim SimpleAPI-GET.
@@ -2958,7 +3579,7 @@ class OpenWBCharger(WallboxDriver):
 
         prev_plug = self.state.get("plug_state", False)
         plug_observed = bool(self.state.get("_plug_state_observed", False))
-        daily_imported = self._float_value(cp_data.get("daily_imported"), self.state.get("daily_imported_wh", 0.0))
+        daily_imported = self._float_value(cp_data.get("daily_imported"), 0.0 if whole_source else self.state.get("daily_imported_wh", 0.0))
         effective_plug_state = bool(plug_state or locked or charge_state or power_w > 50.0)
         if not effective_plug_state:
             evse_current = 0.0
@@ -3152,7 +3773,7 @@ class OpenWBCharger(WallboxDriver):
             # Getrennt von intern gesetzten Sollmodi: nur die HTTP-Rückmeldung.
             "openwb_chargemode": self._text_value(cp_data.get("chargemode"), "") if isinstance(cp_data.get("chargemode"), str) else None,
             "fault_text": self._text_value(cp_data.get("fault_str"), self.state.get("fault_text", "")),
-            "fault_state": int(self._float_value(cp_data.get("fault_state"), self.state.get("fault_state", 0))),
+            "fault_state": int(self._float_value(cp_data.get("fault_state"), 0 if whole_source else (self.state.get("fault_state") or 0))),
             "manual_lock": self._bool_value(cp_data.get("manual_lock"), self.state.get("manual_lock", False)),
             "min_current": self._float_value(cp_data.get("min_current"), self.state.get("min_current", 0.0)),
             "pv_charging_min_current": self._float_value(cp_data.get("pv_charging_min_current"), self.state.get("pv_charging_min_current", 0.0)),
@@ -3165,13 +3786,19 @@ class OpenWBCharger(WallboxDriver):
             "rfid_tag": (live_rfid_tag or self.state.get("rfid_tag")) if effective_plug_state else None,
             "car_range": self.state.get("car_range", 0.0),
         })
+        if whole_source and pro_backend is None:
+            self._replace_http_measurements(cp_data)
         if self.primary_mode_enabled:
             self._primary_mode_observe(cp_data.get("chargemode"), time.time())
+        self._observe_openwb_display_episode(cp_data)
         self.write_openwb_status()
         return True
 
     def write_openwb_status(self, *, command_only=False):
         """Schreibt aktuellen openWB-Status als JSON in die Ramdisk."""
+        def rounded(value, digits=0):
+            return round(value, digits) if value is not None else None
+
         out_file  = os.path.join(RAMDISK_DIR, f"openwb_data_wb{self.wb_id}.json")
         out_alias = os.path.join(RAMDISK_DIR, "openwb_data.json") if self.wb_id == 1 else None
         payload = {
@@ -3179,18 +3806,18 @@ class OpenWBCharger(WallboxDriver):
             'plug_state_raw':    bool(self.state.get('plug_state_raw', self.state['plug_state'])),
             'locked':            bool(self.state.get('locked', False)),
             'charge_state':      self.state['charge_state'],
-            'power_w':           round(self.state['real_power_w'], 1),
-            'phase_power_l1_w':  round(self.state.get('phase_power_l1_w', 0.0), 1),
-            'phase_power_l2_w':  round(self.state.get('phase_power_l2_w', 0.0), 1),
-            'phase_power_l3_w':  round(self.state.get('phase_power_l3_w', 0.0), 1),
-            'phase_power_sum_w': round(self.state.get('phase_power_sum_w', self.state['real_power_w']), 1),
+            'power_w':           rounded(self.state['real_power_w'], 1),
+            'phase_power_l1_w':  rounded(self.state.get('phase_power_l1_w', 0.0), 1),
+            'phase_power_l2_w':  rounded(self.state.get('phase_power_l2_w', 0.0), 1),
+            'phase_power_l3_w':  rounded(self.state.get('phase_power_l3_w', 0.0), 1),
+            'phase_power_sum_w': rounded(self.state.get('phase_power_sum_w', self.state['real_power_w']), 1),
             'phase_power_verified': bool(self.state.get('phase_power_verified', False)),
-            'phase_apparent_l1_va': round(self.state.get('phase_apparent_l1_va', 0.0), 1),
-            'phase_apparent_l2_va': round(self.state.get('phase_apparent_l2_va', 0.0), 1),
-            'phase_apparent_l3_va': round(self.state.get('phase_apparent_l3_va', 0.0), 1),
-            'apparent_power_va': round(self.state.get('apparent_power_va', 0.0), 1),
-            'apparent_power_kva': round(self.state.get('apparent_power_va', 0.0) / 1000.0, 2),
-            'power_factor': round(self.state.get('power_factor', 0.0), 2),
+            'phase_apparent_l1_va': rounded(self.state.get('phase_apparent_l1_va', 0.0), 1),
+            'phase_apparent_l2_va': rounded(self.state.get('phase_apparent_l2_va', 0.0), 1),
+            'phase_apparent_l3_va': rounded(self.state.get('phase_apparent_l3_va', 0.0), 1),
+            'apparent_power_va': rounded(self.state.get('apparent_power_va', 0.0), 1),
+            'apparent_power_kva': rounded(self.state.get('apparent_power_va') / 1000.0, 2) if self.state.get('apparent_power_va') is not None else None,
+            'power_factor': rounded(self.state.get('power_factor', 0.0), 2),
             'evse_current':      self.state['evse_current'],
             'phases_in_use':     self.state['phases_in_use'],
             'can_switch_phases': self.state['can_switch_phases'],
@@ -3199,7 +3826,10 @@ class OpenWBCharger(WallboxDriver):
             'api_surface':        self.state.get('api_surface', 'openwb_primary_simpleapi' if self.primary_mode_enabled else 'openwb_secondary_set_current_heartbeat'),
             'control_status':     self.state.get('control_status', ''),
             'control_label':      self.state.get('control_label', ''),
-            'control_detail':     self.state.get('control_detail', ''),
+            'control_detail':     self._transport_notice() or self.state.get('control_detail', ''),
+            'openwb_http_reason': self.state.get('openwb_http_reason', '') or self._transport_error,
+            'openwb_mqtt_reason': self.state.get('openwb_mqtt_reason', ''),
+            'openwb_transport_notice': self._transport_notice(),
             'control_level':      self.state.get('control_level', 'info'),
             'control_ts':         self.state.get('control_ts', 0),
             'last_command_ok':    self.state.get('last_command_ok', None),
@@ -3223,8 +3853,8 @@ class OpenWBCharger(WallboxDriver):
             'physical_output_identity': self.physical_output_identity_contract(),
             'physical_output_blocked': bool(getattr(self, '_physical_output_blocked', False)),
             'physical_output_block_reason': str(getattr(self, '_physical_output_block_reason', '') or ''),
-            'daily_imported_wh': round(self.state['daily_imported_wh'], 0),
-            'imported_total_wh': round(self.state['imported_total_wh'], 0),
+            'daily_imported_wh': rounded(self.state['daily_imported_wh'], 0),
+            'imported_total_wh': rounded(self.state['imported_total_wh'], 0),
             'chargemode':        self.state['chargemode_str'],
             'primary_mode_command': self.state.get('primary_mode_command'),
             'primary_mode_observation': self.state.get('primary_mode_observation'),
@@ -3250,7 +3880,7 @@ class OpenWBCharger(WallboxDriver):
             'instant_charging_current': self.state.get('instant_charging_current', 0.0),
             'instant_charging_limit': self.state.get('instant_charging_limit', ''),
             'instant_charging_soc': self.state.get('instant_charging_soc', 0.0),
-            'session_kwh':       round(self.state['session_kwh'], 3),
+            'session_kwh':       rounded(self.state['session_kwh'], 3),
             'session_start_ts':  self.state.get('_session_start_ts') if self.state.get('plug_state') else None,
             'cp_id':             self.cp_id,
             'wb_id':             self.wb_id,
@@ -3293,6 +3923,18 @@ class OpenWBCharger(WallboxDriver):
             'car_capacity_kwh':  self.state.get('car_capacity_kwh', 0.0),
             'car_consumption_kwh_100km': self.state.get('car_consumption_kwh_100km', 0.0),
         }
+        # Zusätzliche Anzeige-Metadaten durch den bestehenden Manager-Export.
+        for key in ("openwb_bat_mode", "openwb_bat_min_soc", "openwb_bat_max_soc",
+                    "openwb_bat_power_discharge", "openwb_bat_power_discharge_active"):
+            for suffix in ("", "_ts", "_valid", "_retained", "_session_valid"):
+                payload[key + suffix] = self.state.get(key + suffix)
+        payload["openwb_profile_observation"] = self.state.get("openwb_profile_observation")
+        payload["openwb_display_observation_ts"] = self.state.get("openwb_display_observation_ts")
+        payload["openwb_settings_session_valid"] = self.state.get("mqtt_connected") is True
+        for key in ("openwb_control_source_ts", "openwb_control_received_ts"):
+            payload[key] = self.state.get(key)
+        for key in ('openwb_mqtt_field_age_s', 'openwb_mqtt_field_received_ts', 'openwb_mqtt_field_reason', 'openwb_mqtt_status_reason', 'openwb_status_fallback_reason', 'openwb_simpleapi_status_ts', 'driver_status_source', 'driver_status_valid', 'driver_status_stale', 'driver_status_degraded', 'driver_status_reason', 'driver_status_age_s', 'driver_status_last_ok_ts', 'driver_status_last_sample_ts'):
+            payload[key] = self.state.get(key)
         if command_only:
             # Ein Sendeversuch erneuert weder Messwerte noch deren Zeitstempel.
             try:
@@ -3317,7 +3959,7 @@ class OpenWBCharger(WallboxDriver):
                     json.dump(payload, alias_handle)
                 os.replace(alias_tmp, out_alias)
         except Exception as e:
-            logger.debug(f"[WB{self.wb_id}] openwb_data.json schreiben fehlgeschlagen: {e}")
+            logger.debug(f"[WB{self.wb_id}] openwb_data.json schreiben fehlgeschlagen: {type(e).__name__}")
 
     def get_observation_status(self):
         """Liest ohne Lease-Refresh eines eventuell angebundenen Pro-Backends."""
@@ -3327,34 +3969,52 @@ class OpenWBCharger(WallboxDriver):
         return self._read_status()
 
     def _read_status(self, *, observe_only=False):
+        self._refresh_transport()
+        mqtt_path = self._mqtt_status_enabled()
+        self.state["openwb_status_fallback_reason"] = None
+        if mqtt_path:
+            sample = self._mqtt_status_sample()
+            if sample is not None:
+                self._service_primary_readback()
+                self._update_from_mqtt(sample)
+                self._last_status_http_error = ""
+                return self._fresh_status("openwb_mqtt")
+            self.state["openwb_status_fallback_reason"] = self.state["openwb_mqtt_status_reason"]
         cp = self.cp_id if self.cp_id != "" else "auto"
-        payload = self._http_get_json(f"get_chargepoint_all={cp}")
-        if payload is not None and self._update_from_simpleapi(payload, observe_only=observe_only):
-            now_ts = int(time.time())
-            self.state.update({
-                "driver_status_valid": True,
-                "driver_status_stale": False,
-                "driver_status_degraded": False,
-                "driver_status_age_s": 0.0,
-                "driver_status_reason": "fresh",
-                "driver_status_last_ok_ts": now_ts,
-                "driver_status_last_sample_ts": now_ts,
-            })
-            return _observation_status(
-                self._sanitize_measurement_status(self.state),
-                self._observation_values, self._observation_source,
-            )
+        self._status_http_fallback_active = mqtt_path
+        try:
+            payload = self._http_get_json(f"get_chargepoint_all={cp}")
+        finally:
+            self._status_http_fallback_active = False
+        # Daten können während der bestehenden Socketfrist eintreffen.
+        # Der Zyklus übernimmt genau eine ganze Quelle, niemals Teilfelder.
+        if self._mqtt_status_enabled():
+            sample = self._mqtt_status_sample()
+            if sample is not None:
+                self._service_primary_readback()
+                self._update_from_mqtt(sample)
+                self._last_status_http_error = ""
+                return self._fresh_status("openwb_mqtt")
+        try:
+            http_valid = payload is not None and self._update_from_simpleapi(payload, observe_only=observe_only)
+        except (TypeError, ValueError, ArithmeticError):
+            http_valid = False
+        if http_valid:
+            self._last_status_http_error = ""
+            return self._fresh_status(self._observation_source)
+        self._observe_openwb_display_episode(None)
+        reason = ((self.state.get("openwb_http_reason") or self._transport_error or "openwb_http_status_unavailable")
+                  if payload is None else "openwb_http_status_invalid")
         self.state.update({
-            "driver_status_valid": False,
-            "driver_status_stale": True,
-            "driver_status_degraded": True,
-            "driver_status_reason": (
-                "openwb_http_status_unavailable"
-                if payload is None
-                else "openwb_http_status_invalid"
-            ),
+            "openwb_chargemode": None, "driver_status_valid": False,
+            "driver_status_stale": True, "driver_status_degraded": True,
+            "driver_status_source": None, "driver_status_reason": reason,
             "driver_status_last_sample_ts": int(time.time()),
         })
+        if mqtt_path and reason != self._last_status_http_error:
+            logger.warning("[WB%d] openWB-Statusrückfall: %s", self.wb_id, MESSAGES.get(reason, "Status nicht verfügbar"))
+            self._last_status_http_error = reason
+        self.write_openwb_status()
         return None
 
     def set_amp_and_state(self, target_amp, force_state=None):
@@ -3381,7 +4041,7 @@ class OpenWBCharger(WallboxDriver):
                 return self._primary_set_instant_current(amp)
             return self._secondary_set_current(amp)
         except Exception as e:
-            logger.error(f"[WB{self.wb_id}] set_amp_and_state Fehler: {e}")
+            logger.error(f"[WB{self.wb_id}] set_amp_and_state Fehler: {type(e).__name__}")
             return False
 
     def set_pv_mode(self):
@@ -4168,6 +4828,11 @@ class E3DCCharger(WallboxDriver):
         # Read, Lease-Prüfung und Wire bleiben unter derselben reentranten
         # Sperre wie STOP/Aus/Nullautorität.
         with self.lock:
+            fresh_until = getattr(self, "_manager_measurement_fresh_until", None)
+            if fresh_until is not None and (fresh_until <= 0 or time.time() > fresh_until):
+                # Die Messgültigkeit kommt vom Manager; ohne sie wird kein
+                # alter Sollstrom durch den Hintergrund-Heartbeat erneuert.
+                return False
             if self.external_suspended or self.last_amp is None:
                 return False
             if not self._heartbeat_preflight_locked():

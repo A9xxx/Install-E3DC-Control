@@ -34,6 +34,8 @@ SECRET_CONFIG_EXACT_KEYS = {
     # Bluelink-Konto (E-Mail) und PIN bleiben lokal; das Passwort greift über "password".
     "bluelink_user",
     "bluelink_pin",
+    "wb1_openwb_username", "wb2_openwb_username",
+    "wb1_openwb_tls_binding", "wb2_openwb_tls_binding",
 }
 
 

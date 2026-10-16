@@ -66,6 +66,11 @@ except ImportError:  # Aufruf als Script-Modul direkt aus dem Installer-Verzeich
         uses_recurring_tariff_axis,
     )
 
+try:
+    from data_models import parse_mqtt_vehicle_allowlist, mqtt_vehicle_record_allowed
+except ImportError:
+    from Installer.data_models import parse_mqtt_vehicle_allowlist, mqtt_vehicle_record_allowed
+
 logger = logging.getLogger("WallboxManager.Planer")
 
 # ---------------------------------------------------------------------------
@@ -398,6 +403,7 @@ def _vehicle_soc_rule_sample(
     """Akzeptiert nur explizit bestätigten SoC mit eigenem Quellzeitpunkt."""
     if (
         not isinstance(vehicle, dict)
+        or not mqtt_vehicle_record_allowed(vehicle, config)
         or vehicle.get("soc_rule_confirmed") is not True
         or _soc_record_vetoed(vehicle)
     ):
@@ -529,6 +535,9 @@ def _manual_soc_rule_sample(
         source_ts = data.get("ts")
 
     normalized = {
+        "id": data.get("id") or data.get("car_id"),
+        "mqtt_vehicle_origin": data.get("mqtt_vehicle_origin"),
+        "mqtt_vehicle_id": data.get("mqtt_vehicle_id"),
         "soc": data.get("soc"),
         "soc_source": source,
         "soc_source_ts": source_ts,
@@ -1031,8 +1040,7 @@ def generate_native_charging_schedule(config, wb_id=None):
                                 v, sample = bound[0]
                                 current_soc = sample["soc"]
                                 logger.info(
-                                    f"[Scheduler] WB{wb_id}: Spezifischer SoC für "
-                                    f"{v.get('name', wb_car_id)} aus vehicles.json: "
+                                    f"[Scheduler] WB{wb_id}: Spezifischer SoC aus vehicles.json: "
                                     f"{current_soc}% ({sample['source']}, "
                                     f"{sample['age_s'] / 3600:.1f}h)"
                                 )

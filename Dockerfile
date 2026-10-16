@@ -109,6 +109,7 @@ RUN find -P /app/pi/Install -xdev -type d -exec chmod 0755 -- {} + && \
         /app/pi/Install/Installer/web_update_launcher.sh && \
     find -P /app/pi/Install/Installer -xdev -type f -name "*.py" -exec chmod 0755 -- {} + && \
     test -f /app/pi/Install/Installer/matter/package-lock.json && \
+    test -f /app/pi/Install/Installer/Storage/backup_hold.py && \
     test -f /app/pi/Install/Installer/Storage/power_limits.py && \
     test -f /app/pi/Install/Installer/apache/e3dc-control-security.conf && \
     test -f /app/pi/Install/Installer/apache/e3dc-control-access-log.conf && \
@@ -118,6 +119,7 @@ RUN find -P /app/pi/Install -xdev -type d -exec chmod 0755 -- {} + && \
     test -f /app/pi/Install/Installer/Wallbox/fixed_phase_session.py && \
     test -f /app/pi/Install/Installer/Wallbox/fixed_phase_runtime.py && \
     test -f /app/pi/Install/Installer/Wallbox/fixed_start_energy.py && \
+    test -f /app/pi/Install/Installer/Wallbox/openwb_transport.py && \
     test -f /app/pi/Install/Installer/control_time.py && \
     test -f /app/pi/Install/Installer/heatpump_channel_owner.py && \
     test -f /app/pi/Install/Installer/heatpump_em_dispatch.py && \
@@ -139,6 +141,9 @@ RUN find -P /app/pi/Install -xdev -type d -exec chmod 0755 -- {} + && \
     test -f /app/pi/Install/html/daily_stats_cli.php && \
     test -f /app/pi/Install/html/get_cost_history.php && \
     test -f /app/pi/Install/html/heatpump_season.php && \
+    test -f /app/pi/Install/html/pv_entity_projection.php && \
+    test -f /app/pi/Install/Installer/Forecast/pv_entity_archive.py && \
+    test -f /app/pi/Install/Installer/Forecast/pv_forecast_method.py && \
     test -f /app/pi/Install/Installer/battery_vitals_history.py && \
     test -f /app/pi/Install/Installer/probe_pm.py && \
     test -f /app/pi/Install/Installer/secure_file_transaction.py && \

@@ -1,12 +1,14 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.5.4</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.5.5</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.5.4**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.5.5**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+
+5.5.5 verbessert das Zusammenspiel von Speicher, Wallbox und Wärmepumpe: Die Lastprognose lernt aus bis zu 30 Tagen Verlauf mit gemessener Außentemperatur, die eingestellte Verbraucherpriorität gilt auch beim Start, fehlende oder langsam gemeldete Wallboxdaten bremsen den Speicher nicht mehr allein wegen der Datenlücke, und automatische Wärmepumpen-Zusatzfreigaben beachten „Min SoC“. Neu sind die Anzeige einer MQTT-Wärmepumpe, zwei getrennte Klima-Messpunkte und die openWB-Anmeldung über verschlüsselte Verbindungen; zentrale PV-Aufteilung und Notstrom-Vorhaltung sind experimentell und standardmäßig aus. Bestehende Installationen aktualisieren wie gewohnt über **System Update** bzw. das Docker-Update; eine Konfigurationsänderung ist nicht nötig. Der bisherige E3DC-WebSocket-Dienst wird mit Version 5.5.6 entfernt; für Smart-Home-Anbindungen steht der MQTT-Hub zur Verfügung.
 
 5.5.4 bringt die Installationszentrale auf Bare Metal wieder in Betrieb (Module per Klick, Dienste im Python-venv, geprüfte Karten und Konsolenmenüs), ordnet Speicherführung und Abendziel bei Wallboxen neu, hält den PV-Boost der Wärmepumpe, lässt das globale „Automatik darf steuern“ auch auf den Heizstab wirken, bindet die Lade- und Entladegrenzen an die Gerätegrenzen und berechnet den Hausverbrauch der Tagesstatistik aus der Energiebilanz. Neu und experimentell (Standard aus) ist eine Kostenhistorie je Viertelstunde. Bestehende Installationen aktualisieren wie gewohnt über **System Update** bzw. das Docker-Update; eine Konfigurationsänderung ist nicht nötig.
 
@@ -49,6 +51,8 @@ sondern eine eindeutige Auswahl verlangt.
 > **Config-Schutz:** Standardinstallationen speichern `data/e3dc_v4.json` und lokale Config-Backups mit `660` für Install-User und `www-data`, damit WebUI und Dienste weiter automatisch starten, die Datei aber nicht mehr weltlesbar ist. Der normale Config-Download „Einstellungen ohne Zugangsdaten“ enthält keine Zugangsdaten, aber weiterhin IP-Adressen und Gerätekennungen und ist nicht zum Teilen gedacht; der Raw-Download enthält Zugangsdaten und wird nur angeboten, wenn eine Web-PIN gesetzt ist. Der Kompatibilitätsmodus (`664`) ist nur für eigene externe Leser gedacht. Import, Rollback und normales Speichern im Config-Editor prüfen die fertig zusammengeführte JSON-Datei auf höchstens 64 KiB; eine bestandene Rollenprüfung beweist keinen laufenden Regelbetrieb. Für HA-Sicherungen und Ersatzhardware gilt [Rolle und Rollenanker](doc/High_Availability_Dokumentation.md#rolle-und-rollenanker).
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
+
+> **Neu in 5.5.5:** Lastprognose aus dem Verlauf mit gemessener Außentemperatur, Verbraucherpriorität auch beim Start, Wallbox-Statusproben bis 30 Sekunden frisch, Speicher ohne Bremse bei fehlenden Wallboxdaten, Wärmepumpen-Zusatzfreigaben ab „Min SoC“, MQTT-Wärmepumpe (nur Anzeige), zwei Klima-Messpunkte, openWB mit Benutzerkonto, experimentelle zentrale PV-Aufteilung und Notstrom-Vorhaltung (beide Standard aus). Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
 
 > **Neu in 5.5.4:** Installationszentrale mit Modul-Installation per Klick, Startknopf ohne Moduswechsel, Stop an der openWB gilt, openWB-Pro-Bereitschaft nur mit Budget, gehaltener Wärmepumpen-PV-Boost, globales „Automatik aus“ auch für den Heizstab, Lade-/Entladegrenzen an den Gerätegrenzen, freies Laden unterhalb der Korridor-Untergrenze, Hausverbrauch der Tagesstatistik aus der Energiebilanz, experimentelle Kostenhistorie (Standard aus), Korrekturen für 32-Bit-Systeme und die Web-PIN-Sperrseite. Einzelheiten stehen in den [Release Notes](RELEASE_NOTES.md).
 
@@ -546,7 +550,7 @@ sudo docker compose logs --tail=80 e3dc-control
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin oder Rückfall wird
-> `E3DC_IMAGE_TAG=v5.5.4` in `.env` gesetzt und `sudo docker compose up -d`
+> `E3DC_IMAGE_TAG=v5.5.5` in `.env` gesetzt und `sudo docker compose up -d`
 > ausgeführt. `config --images` zeigt vor dem Pull das tatsächlich gewählte
 > Image.
 

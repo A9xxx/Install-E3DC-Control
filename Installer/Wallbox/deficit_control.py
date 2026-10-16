@@ -391,6 +391,91 @@ def action_for_wb(state: Mapping[str, Any], wb_id: Any) -> Dict[str, Any]:
     return _hold_action(candidate, "not_marginal_action_owner", stage=stage)
 
 
+CURVE_BACKLOG_SCHEMA = "wallbox_curve_backlog_v1"
+
+
+def advance_curve_backlogs(previous, inputs, *, now_ts, sample_valid=True,
+                           counted_component="none", floor_event=False, max_dt_s=30.0):
+    """Bucht Rückstand je Stecksession; erteilt selbst keinen Ausgang.
+
+    Nur bestätigte Mindestladung zählt. Unbekannte Rahmen oder Eigenmessungen
+    frieren Energie und Rücksetzuhr ein; der Zeitanker wandert ohne Nachbuchung.
+    Eine eigene Phasensequenz erhält die Episode bis zum bestätigten Wiederanlauf.
+    """
+    states = deepcopy(dict(previous or {}))
+    now = _finite(now_ts)
+    if now is None:
+        return states
+    for key, raw in (inputs or {}).items():
+        data = dict(raw or {})
+        key = str(key)
+        session = str(data.get("plug_session_id") or "")
+        old = states.get(key) or {}
+        bound = bool(old.get("schema") == CURVE_BACKLOG_SCHEMA
+                     and old.get("plug_session_id") == session and session)
+        limit = max(50.0, _finite(data.get("limit_wh")) or 50.0)
+        state = deepcopy(old) if bound else {
+            "schema": CURVE_BACKLOG_SCHEMA, "plug_session_id": session,
+            "used_wh": 0.0, "inactive_valid_s": 0.0, "stage": "3p",
+            "last_action": "", "action_pending": "", "reason": "initialized",
+        }
+        last = _finite(state.get("last_sample_ts")) if bound else None
+        dt = min(max(0.0, now-last), max_dt_s) if last is not None else 0.0
+        if last is not None and now <= last:
+            continue
+        state.update(last_sample_ts=now, limit_wh=limit, minimum_amp=data.get("minimum_amp", 6.0), overrun_w=None,
+                     booked_wh=0.0, hold_allowed=False)
+        frame = _finite(data.get("frame_w"))
+        power = _finite(data.get("measured_power_w"))
+        phases = _finite(data.get("actual_phases"))
+        minimum_w = _finite(data.get("minimum_w"))
+        applicable = data.get("applicable") is True
+        sequence = data.get("sequence_active") is True
+        known = bool(sample_valid and data.get("measurement_valid") is True
+                     and (not applicable or frame is not None and frame >= 0.0)
+                     and power is not None and power >= 0.0)
+        state.update(applicable=applicable, frame_w=frame, measurement_valid=known)
+        if (session and known and not sequence and state.get("action_pending") == "phase_down"
+                and phases == 1 and data.get("phase_switch_confirmed") is True
+                and data.get("real_charging") is True):
+            state.update(used_wh=0.0, stage="1p", action_pending="", inactive_valid_s=0.0,
+                         reason="one_phase_restart_confirmed")
+        if not session or not known:
+            state["reason"] = "central_frame_unknown" if frame is None and applicable else "measurement_unknown"
+        elif sequence:
+            state.update(reason="phase_sequence_active", hold_allowed=True)
+        elif not applicable or data.get("real_charging") is not True:
+            state["inactive_valid_s"] += dt
+            state["reason"] = "await_valid_episode_end"
+            if state["inactive_valid_s"] >= 60.0:
+                state.update(used_wh=0.0, inactive_valid_s=60.0, action_pending="",
+                             last_action="", reason="episode_ended", stage="1p" if phases == 1 else "3p")
+        else:
+            state["inactive_valid_s"] = 0.0
+            # Ist-Phasen UND reale Ladung bestätigen die neue Stufe.
+            if (state.get("action_pending") == "phase_down" and phases == 1
+                    and data.get("phase_switch_confirmed") is True):
+                state.update(used_wh=0.0, stage="1p", action_pending="",
+                             reason="one_phase_restart_confirmed")
+            elif not state.get("action_pending"):
+                state["stage"] = "1p" if phases == 1 else "3p"
+            confirmed_minimum = bool(data.get("minimum_confirmed") is True
+                                     and phases in (1, 3) and minimum_w is not None and minimum_w > 0.0)
+            state["hold_allowed"] = bool(confirmed_minimum and frame < minimum_w and state.get("action_pending") != "stop")
+            if floor_event:
+                state.update(used_wh=0.0, reason="curve_floor_contingent_end")
+            elif counted_component in ("grid", "battery"):
+                state["reason"] = counted_component + "_priority"
+            elif confirmed_minimum and not state.get("action_pending"):
+                overrun = max(0.0, min(power, minimum_w)-frame)
+                booked = overrun*dt/3600.0
+                state.update(used_wh=state["used_wh"]+booked, overrun_w=overrun,
+                             booked_wh=booked, reason="curve_backlog_hold")
+        state["exhausted"] = bool(state["used_wh"]+1e-9 >= limit)
+        states[key] = state
+    return states
+
+
 def step_group_deficit(
     previous_state: Any,
     *,
@@ -409,6 +494,7 @@ def step_group_deficit(
     battery_contract_valid: bool = False,
     battery_threshold_wh: Any = None,
     curve_floor_end: Optional[Mapping[str, Any]] = None,
+    curve_backlog_inputs: Optional[Mapping[str, Any]] = None,
     export_rest_contract_valid: bool = False,
     battery_not_discharging: bool = False,
     export_margin_w: Any = 200.0,
@@ -619,6 +705,10 @@ def step_group_deficit(
     pcc_value = _finite(pcc_import_w)
     valid = bool(sample_valid and sample_fresh and timestamp_monotonic and pcc_value is not None)
     if not valid:
+        if curve_backlog_inputs is not None:
+            ledger["curve_backlog_by_wb"] = advance_curve_backlogs(
+                ledger.get("curve_backlog_by_wb"), curve_backlog_inputs,
+                now_ts=timestamp, sample_valid=False, max_dt_s=max_dt)
         # Ungültige oder veraltete Messwerte werden nie in eine echte Null
         # umgedeutet. Konto und letzter gültiger Zeitstempel bleiben stehen.
         ledger.update({
@@ -678,6 +768,12 @@ def step_group_deficit(
         and budget_overrun is not None
         and budget_overrun >= 0.0
     )
+    curve_owner_input = (curve_backlog_inputs or {}).get(str(wb_id), {})
+    central_active = curve_owner_input.get("central_active", curve_owner_input.get("applicable")) is True
+    if central_active:
+        budget_contract_valid = False
+        direct_candidate = False
+        floor_direct_minimum_immediate_by_wb = {}
     grid_deficit = max(0.0, float(pcc_value) - tolerance)
     # Einschwingfrist der sofortigen Absenkung: Beginn der Bezugsepisode und
     # Beginn der Ruhe danach. Die Episode endet erst nach einer vollen Frist
@@ -843,6 +939,8 @@ def step_group_deficit(
 
     raw_dt = 0.0 if last_timestamp is None else max(0.0, timestamp - last_timestamp)
     dt_s = min(raw_dt, max_dt)
+    if central_active:
+        budget_rest = False
     # Netz- und Budgetenergie besitzen getrennte Konten. Dadurch kann eine
     # beinahe volle Budgetüberziehung nicht durch einen kleinen späteren
     # Netzimpuls zur Netzabschaltung umgedeutet werden. Der Netzpunkt ist bei
@@ -1017,6 +1115,16 @@ def step_group_deficit(
         ),
     })
 
+    # Bei gleichzeitigem Ende hat die Netzaktion Vorrang vor dem Wolkenkonto.
+    if counted_component == "grid" and threshold_reached:
+        floor_event = False
+    if curve_backlog_inputs is not None:
+        ledger["curve_backlog_by_wb"] = advance_curve_backlogs(
+            ledger.get("curve_backlog_by_wb"), curve_backlog_inputs,
+            now_ts=timestamp, counted_component=counted_component,
+            floor_event=floor_event, max_dt_s=max_dt)
+    curve_account = (ledger.get("curve_backlog_by_wb") or {}).get(str(wb_id), {})
+
     if floor_applicable and not floor_exhausted:
         # Vor dem Endereignis gehört der Stand zum gemeinsamen Kontingent.
         floor_used = _finite(floor_end.get("used_wh"))
@@ -1044,6 +1152,12 @@ def step_group_deficit(
             float(timestamp),
         )
 
+    if (central_active and curve_account.get("action_pending") == "phase_down"
+            and previous_owner == wb_id):
+        # Eine erneute Allokationsbindung beendet die eigene Sequenz nicht.
+        cascade.update(marginal_wb_id=wb_id, topology=topology,
+                       stage=STAGE_PHASE_DOWN_PENDING, phase_down_requested=True)
+        previous_owner = wb_id
     owner_changed = previous_owner != wb_id
     topology_changed = str(cascade.get("topology") or topology) != topology
     old_stage = str(cascade.get("stage") or physical_stage)
@@ -1065,6 +1179,14 @@ def step_group_deficit(
             pending_since = last_timestamp if last_timestamp is not None else timestamp
             cascade["phase_down_requested_sample_ts"] = pending_since
         pending_age_s = max(0.0, float(timestamp) - float(pending_since))
+        if (central_active and curve_owner_input.get("frame_w") is None
+                and not (grid_deficit > 0.0 or counted_component == "battery" and threshold_reached)):
+            # Die Rahmenlücke friert auch die Ausgangsfrist ein.
+            gap = max(0.0, timestamp - last_timestamp) if last_timestamp is not None else 0.0
+            cascade["phase_down_requested_sample_ts"] = pending_since + gap
+            return _result(snapshot_id=sid, sample_ts=timestamp, wb_id=wb_id,
+                           ledger=ledger, cascade=cascade,
+                           action=_hold_action(wb_id, "central_frame_unknown", stage=STAGE_PHASE_DOWN_PENDING))
         if phases == 1 and phase_switch_confirmed:
             cascade.update({
                 "marginal_wb_id": wb_id,
@@ -1091,8 +1213,17 @@ def step_group_deficit(
         if phase_switch_sequence_active:
             cascade["phase_output_started"] = True
         pending_pv = _finite(floor_end.get("pv_budget_w"))
+        curve_frame = _finite(curve_owner_input.get("frame_w"))
+        curve_required = _finite(curve_owner_input.get("phase_down_required_w"))
+        curve_pending_deficit = bool(
+            central_active and curve_account.get("exhausted")
+            and curve_account.get("action_pending") == "phase_down"
+            and curve_account.get("measurement_valid") is True
+            and curve_frame is not None and curve_required is not None
+            and curve_frame < curve_required and previous_owner == wb_id
+        )
         deficit_persists = bool(
-            grid_deficit > 0.0
+            curve_pending_deficit or grid_deficit > 0.0
             or (counted_component == "battery" and threshold_reached)
             or (float(pcc_value) >= 0.0 and (
                 direct_candidate
@@ -1104,7 +1235,7 @@ def step_group_deficit(
             not cascade.get("phase_output_started") and pending_age_s >= 30.0
             and deficit_persists
         )
-        if phase_switch_sequence_active and pending_age_s < pending_timeout:
+        if phase_switch_sequence_active and (central_active or pending_age_s < pending_timeout):
             cascade.update({
                 "marginal_wb_id": wb_id,
                 "topology": topology,
@@ -1127,7 +1258,7 @@ def step_group_deficit(
                 cascade=cascade,
                 action=action,
             )
-        if budget_rest and not phase_switch_failed:
+        if budget_rest and not phase_switch_failed and not curve_pending_deficit:
             # Die Defizitepisode ist abgeschlossen: Einspeisung bei ladendem
             # oder ruhendem Akku, stabil über ``export_rest_min_s``. Ein noch
             # nicht angelaufener Phasenabstieg verfällt, statt bis zum
@@ -1203,6 +1334,7 @@ def step_group_deficit(
                 grid_deficit > 0.0
                 or counted_component == "battery"
                 or floor_pending_stop
+                or curve_pending_deficit
                 or no_output_timeout
                 or (floor_applicable and deficit_persists)
             ) and current > 1e-6:
@@ -1236,6 +1368,11 @@ def step_group_deficit(
                         else "phase_down_timeout_%s_stop" % _pending_kind
                     ),
                 })
+                if (curve_pending_deficit and grid_deficit <= 0.0
+                        and counted_component != "battery" and not floor_pending_stop):
+                    cascade.update(reason="curve_backlog_stop", phase_output_started=False)
+                    curve_account.update(last_action=ACTION_STOP, action_pending=ACTION_STOP,
+                                         reason="curve_backlog_stop")
                 _reset_bucket(ledger, reason="phase_pending_grid_stop")
                 return _result(
                     snapshot_id=sid,
@@ -1350,6 +1487,54 @@ def step_group_deficit(
                          **({"target_phases": 1} if down else {"target_amp": target}))
         return _result(snapshot_id=sid, sample_ts=timestamp, wb_id=wb_id,
                        ledger=ledger, cascade=cascade, action=action)
+
+    if central_active and not (counted_component in ("grid", "battery") and threshold_reached):
+        # Keine zweite Endentscheidung während einer ausführbaren Sequenz.
+        if phase_switch_sequence_active or curve_account.get("action_pending"):
+            reason = "curve_backlog_action_pending"
+        elif curve_owner_input.get("frame_w") is None:
+            reason = "central_frame_unknown"
+        elif (current > minimum+1e-6
+                and _finite(curve_owner_input.get("frame_w")) is not None
+                and float(curve_owner_input["frame_w"]) < minimum*voltage*phases):
+            # Erst auf den bestätigbaren Mindeststrom absenken; dessen Buchung
+            # beginnt mit dem realen Readback, niemals aus dem neuen Angebot.
+            cascade.update(marginal_wb_id=wb_id, topology=topology, stage=_stage_for_physics(phases, minimum, minimum),
+                           generation=int(cascade.get("generation",0) or 0)+1,
+                           reason="curve_backlog_reduce_to_minimum")
+            return _result(snapshot_id=sid, sample_ts=timestamp, wb_id=wb_id,
+                           ledger=ledger, cascade=cascade,
+                           action=_action(ACTION_CURRENT_DOWN,wb_id,"curve_backlog_reduce_to_minimum",
+                                          stage=str(cascade["stage"]),target_amp=minimum))
+        elif (counted_component not in ("grid", "battery")
+              and curve_account.get("exhausted") and curve_account.get("hold_allowed")):
+            required = _finite(curve_owner_input.get("phase_down_required_w"))
+            frame = _finite(curve_owner_input.get("frame_w"))
+            down = bool(phases == 3 and topology == TOPOLOGY_SWITCHABLE
+                        and curve_owner_input.get("phase_down_surface") is True
+                        and cooldown <= 0.0 and required is not None
+                        and frame is not None and frame >= required)
+            kind = ACTION_PHASE_DOWN if down else ACTION_STOP
+            next_stage = STAGE_PHASE_DOWN_PENDING if down else STAGE_STOP_PENDING
+            reason = "curve_backlog_phase_down" if down else "curve_backlog_stop"
+            curve_account.update(last_action=kind, action_pending=kind, reason=reason)
+            cascade.update(marginal_wb_id=wb_id, topology=topology, stage=next_stage,
+                           generation=int(cascade.get("generation", 0) or 0)+1,
+                           phase_down_requested=down,
+                           phase_down_requested_sample_ts=float(timestamp) if down else None,
+                           phase_output_started=False, reason=reason)
+            return _result(snapshot_id=sid, sample_ts=timestamp, wb_id=wb_id,
+                           ledger=ledger, cascade=cascade,
+                           action=_action(kind, wb_id, reason, stage=next_stage,
+                                          **({"target_phases": 1} if down else {"target_amp": 0.0})))
+        else:
+            reason = str(curve_account.get("reason") or "curve_backlog_hold")
+        if counted_component not in ("grid", "battery"):
+            cascade.update(marginal_wb_id=wb_id, topology=topology, stage=physical_stage,
+                           reason=reason)
+            return _result(snapshot_id=sid, sample_ts=timestamp, wb_id=wb_id,
+                           ledger=ledger, cascade=cascade,
+                           action=_hold_action(wb_id, reason, stage=physical_stage))
 
     if owner_changed or topology_changed:
         # Die Untergrenzen-Episoden laufen je Wallbox weiter; ein je Zyklus

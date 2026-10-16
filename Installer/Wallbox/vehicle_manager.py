@@ -133,11 +133,15 @@ def request_missing_openwb_cloud_soc(wb_id, config, status, soc_info=None, now=N
     state = wallbox_soc_tracker._read_json(state_path, {})
     state = state if isinstance(state, dict) else {}
     sessions = state.get("sessions") if isinstance(state.get("sessions"), dict) else {}
-    if sessions.get(str(wb_id)) == session_id:
-        return False
     cloud = wallbox_soc_tracker._read_json(os.path.join(base, "vehicles.json"), {})
     refresh = cloud.get("refresh", {}) if isinstance(cloud, dict) else {}
     refresh = refresh if isinstance(refresh, dict) else {}
+    # Während einer Anmeldepause bleibt der Steckauftrag offen. Der Dienst
+    # bestätigt bereits eingereichte Flags und entfernt deren Session-Marke.
+    if wallbox_soc_tracker._timestamp(refresh.get("next_attempt_ts"), 0) > now:
+        return False
+    if sessions.get(str(wb_id)) == session_id:
+        return False
     last_force = wallbox_soc_tracker._timestamp(refresh.get("attempt_ts"), 0) if refresh.get("mode") == "force" else 0
     last_request = max(wallbox_soc_tracker._timestamp(state.get("last_request_ts"), 0), last_force)
     interval_s = max(5.0, wallbox_soc_tracker._safe_float(config.get("bluelink_interval"), 15)) * 60

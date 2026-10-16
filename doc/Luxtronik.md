@@ -577,11 +577,15 @@ eigenen Schutzablauf der Wallbox; seine Sperrzeit wird nicht auf jede
 Ladestromanpassung übertragen. Nach einer Signalrücknahme bleiben eine noch
 ungeklärte Startwirkung und ein weiterlaufender Verdichter berücksichtigt.
 
-Der vollständige Minutenverlauf bleibt als begrenzter Live-Puffer in der
-RAM-Disk. Das persistente Luxtronik-Betriebsarchiv schreibt höchstens eine
-kompakte Stützstelle je fünf Minuten und bewahrt diese Tagesdateien sieben Tage
-auf. Es ist damit ein kurzzeitiges Betriebsarchiv, kein Langzeit- oder
-Sicherungsarchiv.
+Der begrenzte Minutenpuffer in der RAM-Disk enthält die für Diagramme,
+Tages-Min/Max, COP und Tages-Energiezähler gelesenen Datenfelder sowie den
+vollständigen Status (`luxtronik_ramdisk_v3`). Fehlende Datenfelder bleiben
+`null`; ältere volle Zeilen bleiben bis zur Begrenzung lesbar. Der aktuelle
+Vollzustand steht weiterhin in `luxtronik.json`. Das persistente
+Luxtronik-Betriebsarchiv behält alle Datenfelder einschließlich Fehlerhistorie
+und Betriebsstunden (`luxtronik_archive_v2`), schreibt höchstens eine kompakte
+Stützstelle je fünf Minuten und bewahrt die Tagesdateien sieben Tage auf.
+Es ist ein kurzzeitiges Betriebsarchiv, kein Langzeit- oder Sicherungsarchiv.
 
 ### Das Web-Interface (`waermepumpe.php`)
 Die PHP-Datei visualisiert die Daten:
@@ -966,3 +970,65 @@ PV-, Preis- und Hochpreis-Pausen mit abgesenktem Sollwert bleiben davon unberüh
 Sommer, wenn der Mittelwert über der Heizgrenze liegt; bei Gleichstand Winter.
 Dashboard, Wärmepumpenseite und Vorschau zeigen vorrangig die Saisonentscheidung des Energy Managers mit den dazugehörigen Temperaturen, etwa „gemittelt 15,0 °C, Heizgrenze 15 °C“.
 Ist die Entscheidung älter als 15 Minuten oder ungültig, berechnet die Anzeige die Saison mit derselben Regel aus den Wärmepumpendaten und der konfigurierten Heizgrenze. Der Mittelwert hat Vorrang; fehlt er, wird der vorhandene Momentanwert verwendet und als „Außen“ bezeichnet. Ohne gültige Temperatur oder Heizgrenze bleibt das Saisonabzeichen ausgeblendet. Die Regelung bleibt unverändert.
+
+## MQTT-Wärmepumpe (nur Anzeige)
+
+`wp_type=7` zeigt eine extern betriebene Wärmepumpe dauerhaft in Kachel,
+Energiefluss und beiden Detailansichten. Ohne Messung erscheint „unbekannt“.
+Die Auswahl aktiviert keinen Herstellertreiber und sendet keine MQTT-Steuerbefehle.
+Eine bestehende Steuerung über SG-Ready/Shelly bleibt wie bei „Keine Wärmepumpe“
+erhalten. Der reine Wechsel zwischen −1 und 7 benötigt keine Dienstaktion;
+der Wechsel von einer nativen Anbindung nutzt den bisherigen bewussten Dienstwechsel.
+
+Der vorhandene MQTT-Hub nimmt bei aktiviertem Eingang unter `<Basis>/in/heatpump/`
+folgende einzelne Rohwerte an (keine JSON-Objekte):
+
+| Topic-Ende | Einheit / Typ |
+|---|---|
+| `power_w` | elektrische Leistung ohne Zusatzheizung in W, Vorrang für die Leistungsanzeige |
+| `electric_w` | elektrische Leistung ohne Zusatzheizung in W, Eingang für COP |
+| `heat_kw` | Heizleistung in kW |
+| `state`, `mode` | Status und Modus als Text, ohne abgeleitete Verdichterfreigabe |
+| `boost_active` | Wahrheitswert `true`/`false` oder `1`/`0` |
+| `ww_temp`, `ww_target_temp` | Warmwasser Ist / Soll in °C |
+| `flow_temp`, `return_temp`, `outside_temp` | Vorlauf / Rücklauf / Außentemperatur in °C |
+
+Die elektrische Leistung unter `in/heatpump/power_w` bzw. `electric_w` umfasst die
+Wärmepumpe **ohne Zusatzheizung**. Eine elektrische Zusatzheizung (Heizstab) wird
+getrennt unter `<Basis>/in/heater/power_w` in W gesendet. Beide Werte werden für die
+Anzeige jeweils genau einmal aus dem gemessenen Hausverbrauch herausgerechnet;
+die Summe aus Haus, Wärmepumpe und Heizstab bleibt gleich.
+
+Liefert die Quelle nur die Summe aus Wärmepumpe und Zusatzheizung, wird diese
+**nur als `in/heatpump/power_w`** gesendet. `electric_w` und `in/heater/power_w`
+bleiben dann aus. Die Aufteilung fehlt, die Gesamtbilanz bleibt richtig; aus der
+Summenleistung wird kein COP berechnet.
+**`heat_kw` ist die thermische Heizleistung in kW, nicht in W**:
+3200 W Heizleistung werden als `3.2` gesendet.
+
+Bei Typ 7 speist ein gesetztes `wp_power_topic` ausschließlich die Leistungsanzeige
+und Bilanz (`power_w`). Es ersetzt den festen Eingang `in/heatpump/power_w`.
+`electric_w` bleibt ohne eigene Nachricht unter `in/heatpump/electric_w` unbekannt,
+mit Grund; aus der Summenquelle wird kein COP berechnet. Ein getrenntes frisches
+`electric_w` bleibt der COP-Eingang. Temperaturen, Heizleistung und Status bleiben
+auf den festen Topics. Andere WP-Typen behalten ihre bisherige Quellenwahl.
+MQTT-Eingang und Broker werden über die vorhandene MQTT-Einrichtung aktiviert;
+ein zusätzlicher Wärmepumpendienst ist für die Anzeige nicht erforderlich.
+
+Bei Typ 7 sind negative Leistungswerte ungültig und bleiben `null`; die bisherigen
+Normalisierungsregeln anderer WP-Typen bleiben erhalten.
+Jedes Feld benötigt einen endlichen, typgültigen Wert, passende Herkunft sowie
+Datei- und Feldalter jeweils **unter 180 Sekunden**. Exakt 180 Sekunden sind alt.
+Neue Leistung verjüngt keine alte Temperatur. Ungültige, fehlende, alte oder
+abgeschaltete Daten ergeben `null` mit Grund; gültige 0 und `false` bleiben erhalten.
+Alter und Herkunft stehen je Wert auf der Detailseite. COP ist ausschließlich
+`heat_kw * 1000 / electric_w`, mit beiden Eingängen frisch und `electric_w > 0`.
+Es gibt keinen Schätz-COP und keine JAZ aus fremden Herstellerarchiven.
+Die Ansichten enthalten keine Bedienelemente; Steuer-POSTs werden abgewiesen.
+
+Die WP steckt im gemessenen Hausverbrauch. Nur die Darstellung teilt eine gültige
+WP-Messung einmal ab; das Verbrauchsbudget erhält keinen zusätzlichen Abzug.
+Ohne Einzelmessung bleibt der Hauswert einschließlich WP stehen.
+Im Diagnose-Export enthält `mqtt_ha_inbound.json` zusätzlich `heatpump_display`
+mit Typ, Frische, Gültigkeit und Gründen. Freie Status-/Modustexte sind ausgelassen,
+Topics werden wie bisher bereinigt.

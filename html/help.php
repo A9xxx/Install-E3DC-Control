@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.5.4 Stable</span>
+            <span class="badge bg-success text-light">v5.5.5 Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.5.4</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.5.5</code> in <code>.env</code> gesetzt.</p>
                 <p><strong>Update-Knopf und Auto-Update:</strong> Der Container tauscht sein Image nicht selbst. Läuft das Compose-Profil <code>auto-update</code> (Watchtower-Fork <code>ghcr.io/nicholas-fedor/watchtower</code>), gibt der Knopf <strong>System Update</strong> Watchtower über dessen lokale HTTP-API das Signal: Watchtower lädt das Image, erstellt den Container neu, und die Oberfläche lädt nach dem Start neu. Mit <strong>Auto-Update</strong> im Config-Editor passiert dasselbe täglich zur eingestellten Uhrzeit; Watchtower selbst pollt nicht. Gibt es kein neues Image, passiert nichts.</p>
                 <p>Einmalige Freischaltung auf dem Docker-Host im Compose-Ordner (Token für beide Dienste in <code>.env</code>, Container mit Token neu erstellen, Watchtower starten):</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
@@ -227,6 +227,30 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
             </div>
         </div>
 
+        <div class="alert alert-info"><strong>MQTT-Wärmepumpe (nur Anzeige):</strong>
+        Typ 7 zeigt Leistung, Heizleistung, COP, Status und Temperaturen aus MQTT.
+        Fehlende oder mindestens 180 Sekunden alte Werte bleiben unbekannt; gültige 0 bleibt 0.
+        Die Detailansichten zeigen Alter und Herkunft je Feld. Die Steuerung bleibt bei SG-Ready/Shelly bzw. extern.
+        <code>in/heatpump/power_w</code> bzw. <code>electric_w</code> enthält die elektrische Leistung
+        <strong>ohne Zusatzheizung</strong>. Der Heizstab wird getrennt unter <code>in/heater/power_w</code> in W gesendet.
+        Liefert die Quelle nur die Summe, wird nur <code>in/heatpump/power_w</code> gesendet;
+        <code>electric_w</code> und der Heizstabwert bleiben aus. Die Aufteilung fehlt dann, die Gesamtbilanz bleibt richtig.
+        <strong><code>heat_kw</code> ist die Heizleistung in kW, nicht in W</strong> (3200 W = <code>3.2</code> kW).
+        Bei Typ 7 speist ein eigenes WP-Leistungstopic ausschließlich Leistungsanzeige und Bilanz.
+        Ohne getrennte Nachricht unter <code>in/heatpump/electric_w</code> bleiben elektrische Einzelleistung und COP unbekannt.
+        Ein getrenntes frisches <code>electric_w</code> ermöglicht den COP bei ebenfalls frischer Heizleistung.
+        <?= e3dcDocLink('Smart_Home_Mqtt_Websockets.md', 'MQTT-Topics und Einheiten') ?></div>
+        <h4 class="mb-4 text-accent">Stable 5.5.5: Lastprognose, Wallbox und Wärmepumpe</h4>
+        <div class="col-12 faq-item" data-tags="5.5.5 stable lastprognose temperatur wallbox openwb fahrzeug soc mqtt wärmepumpe klima notstrom vorhaltung preis update websocket">
+            <div class="card bg-card border-0 shadow-sm"><div class="card-body">
+                <h5 class="card-title">Was bringt Stable-Release 5.5.5?</h5>
+                <p>E3DC-Control verbessert das Zusammenspiel von Speicher, Wallbox und Wärmepumpe. Die eingestellte Verbraucherpriorität gilt auch beim Start. Fehlende Wallboxdaten bremsen den Speicher nicht mehr allein wegen der Datenlücke; gültige Wallbox-Statusproben gelten in Speicherregelung und Anzeige bis 30 Sekunden als frisch. Die E3DC-Livedaten bleiben bei 15 Sekunden. Nach einem Direktstopp einer laufenden Ladung gilt der bestehende Wiederanlauf-Abstand. Warnfarbe und Warnzeichen beim Fahrzeug-SoC passen auch bei veralteten Schätzwerten und Cloud-Warnungen zusammen. openWB unterstützt eigene Konten und verschlüsselte Verbindungen.</p>
+                <p>Die Lastprognose lernt aus bis zu 30 Tagen Verlauf aller Wochentage mit gemessenen Außentemperaturen bei ausreichender Abdeckung. Fehlende Wetterprognosen werden bei Temperaturmodellen durch gemessene Trainingsmittel ersetzt. Die Haus-Plausibilitätsprüfung greift vor der Korrektur anhand früherer Prognoseabweichungen. Ein fehlgeschlagenes automatisches Nachtraining aus der Prognose wird frühestens nach sechs Stunden wiederholt; nach einem Neustart ist ein neuer Versuch möglich. Unter „Standort &amp; PV-Prognose“ stehen „Haus-Tagesreferenz für ML (kWh)“ und der Rückweg „Bisheriges ML-Training verwenden“ → „Ein“. Der Validator warnt beratend unter 8 oder über 80 kWh; die Referenz ist keine feste Obergrenze der Prognose.</p>
+                <p>Neu sind die Auswahl „MQTT-Wärmepumpe (nur Anzeige)“, zwei getrennte Klima-Messpunkte und eine ausführlichere, standardmäßig ausgeschaltete PV-Prognosediagnose. Automatische Wärmepumpen-Zusatzfreigaben beginnen erst ab „Min SoC (%)“; ein laufender Verdichter behält bei aktivem Taktschutz seine belegte Mindestlaufzeit. Preisplanung und Dienststeuerung sind korrigiert.</p>
+                <p><strong>Update:</strong> Wie gewohnt über <strong>System Update</strong> beziehungsweise das Docker-Update. Zentrale PV-Aufteilung und Notstrom-Vorhaltung sind experimentell und standardmäßig aus; Reserve-Netzladen ist separat aus. Die MQTT-Wärmepumpenanzeige wird nicht automatisch aktiviert. Stiebel-Messwerte können entfallen, wenn zuvor ersatzweise Sollwerte angezeigt wurden. Alte Klima-Zeiträume werden nicht nachträglich aufgeteilt. Bei aktivierter MQTT-Fahrzeug-Freigabeliste gelten ausgeschlossene oder noch nicht eindeutig zugeordnete alte Werte nicht als bestätigter SoC; eine aktive Zielplanung rechnet dann mit 0 %, bestehende Netzladefenster bleiben möglich.</p>
+                <p>Der bisherige E3DC-WebSocket-Dienst wird mit Version 5.5.6 entfernt. Für externe Smart-Home-Anbindungen steht der MQTT-Hub mit den dokumentierten Topics zur Verfügung; das Webportal nutzt weiterhin HTTP-Abfragen. Die Luxtronik-Anbindung bleibt unverändert.</p>
+            </div></div>
+        </div>
         <h4 class="mb-4 text-accent">Stable 5.5.4: Installationszentrale, Wallbox, Wärmepumpe, Statistik</h4>
         <div class="col-12 faq-item" data-tags="5.5.4 stable installationszentrale modul launcher venv konsole wallbox startknopf openwb stop bereitschaft abendziel wbminsoc wärmepumpe pv-boost heizstab elwa automatik tarif-halt leistungsgrenzen korridor untergrenze tagesstatistik hausverbrauch kostenhistorie 32 bit web-pin sperrseite websocket update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
@@ -304,6 +328,15 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
                 <p>Die Sperre nach Fehlversuchen (5 falsche Versuche, danach 10 Minuten Sperre) gilt jetzt auch für den API-Zugriff per Header (<code>X-API-PIN</code>). Der Sperrschlüssel hängt nur noch von der Client-Adresse ab (IPv4-Adresse bzw. IPv6-/64-Netz); ein wechselnder User-Agent umgeht die Sperre nicht mehr. <code>CF-Connecting-IP</code> wird nur bei Verbindungen von <code>127.0.0.1</code> bzw. <code>::1</code> berücksichtigt, also bei einem lokal angebundenen Tunnel. Parallele Anfragen können die Sperre nicht mehr überholen; Fehlversuche werden auch unter Last vollständig gezählt.</p>
                 <p><strong>Empfehlung:</strong> Eine Web-PIN mit mindestens 6 Zeichen verwenden; Buchstaben und Ziffern sind erlaubt. Die Sperre gilt je Client-Adresse, ein Widget mit veralteter PIN sperrt deshalb auch die Browser-Anmeldung vom selben Gerät bzw. Netz. Hinweise für Widgets, Skripte und einen weiteren lokalen Reverse-Proxy stehen in <?= e3dcDocLink('API_Documentation.md') ?>.</p>
                 <p><strong>Update:</strong> Wie gewohnt über <strong>System Update</strong> bzw. das Docker-Update; eine Konfigurationsänderung ist nicht nötig. Wallbox-, Speicher-, Wärmepumpen- und Hardwarelogik entsprechen unverändert 5.5.0. Für ein Update von 5.4.x gelten zusätzlich die Hinweise zu 5.5.0.</p>
+            </div></div>
+        </div>
+
+        <div class="col-12 faq-item" data-tags="tarif strompreise speicher netzladen akkuverschleiß wirkungsgrad mindestmenge ladeprofil">
+            <div class="card bg-card border-0 shadow-sm"><div class="card-body">
+                <h5 class="card-title">Welche Kosten und Mindestmengen gelten beim Speicher-Netzladen?</h5>
+                <p>Im Config-Editor unter <strong>Tarif &amp; Strompreise → Details zur Speicher-Netzladung</strong> lassen sich Akkuverschleiß (ct/kWh), Speicher-Wirkungsgrad (%), Mindestmenge je Netzladeauftrag (Wh) und Kapazitätsanteil (%) einstellen. Ohne eigene Werte gelten für Verschleiß und Wirkungsgrad die bisherigen Direktvermarktungswerte, sonst 4 ct/kWh und 85 %. Der Standard ist 0 Wh und 5 % der nutzbaren Kapazität ohne festen Sockel: 11,7 kWh → 585 Wh, 35 kWh → 1 750 Wh. Gespeicherte eigene Werte bleiben erhalten. Leere Felder zeigen den wirksamen Wert mit Herkunft; das Speichern anderer Felder verändert diesen Rückfall nicht.</p>
+                <p><strong>Mindestmenge = max(Wh-Wert, Kapazität × Prozent/100).</strong> Kleinere Ladeaufträge werden nicht ausgeführt. Es zählt die aus dem Netz bezogene Energie je Auftrag. Beispiel: Bei 40 kWh Kapazität und 5 % gilt mindestens 2 000 Wh, auch wenn die Wh-Mindestmenge auf 0 steht. Nur beide Werte 0 heben das Minimum auf.</p>
+                <p>Wirkungsgrad: 1 bis 100 %; Akkuverschleiß und Wh-Mindestmenge: mindestens 0; Kapazitätsanteil: 0 bis 100 %. Unplausible Werte erzeugen beratende Warnungen und bleiben speicherbar. Die Planung begrenzt Werte außerhalb ihres Bereichs. Alle vier Einstellungen bleiben bei jedem Ladeprofilwechsel unverändert. Die bestehende Profilwirkung auf Marge, Sicherheitskorrektur, Mindestpreisabstand, Autarkie und Komfort bleibt erhalten. Speichern ändert nur die Konfiguration; die Parameter starten oder installieren keinen Dienst.</p>
             </div></div>
         </div>
 
@@ -1426,6 +1459,9 @@ WB1 hat Ladevorgang physisch abgebrochen (Versuch 1/3)!</pre>
                 </div>
                 <div class="faq-answer">
                     <p>Optionale Dienste wie <strong>Heizstab</strong>, <strong>Shelly Pro3EM</strong>, <strong>IDM/Luxtronik/Stiebel/Dimplex W&auml;rmepumpe</strong> oder <strong>Wallbox Manager</strong> werden im Docker nur einmalig beim Container-Start durch <code>entrypoint.sh</code> gestartet. Die Aktivierung erfolgt in zwei Schritten:</p>
+
+                    <p><strong>Zwei Klimaanlagen messen:</strong> Unter Klima optional Name, Adresse, Zählertyp und Kanal eines zweiten Shelly-Zählers eintragen. Leer oder <code>0.0.0.0</code> lassen, um nur den bisherigen Zähler zu verwenden. Die gültigen Werte gemeinsam als „Klima“ und je Anlage im Dashboard, mobil und auf der Klima-Seite ablesen. Bei fehlender Leistung die Summe als unbekannt und den Hausanteil als „Haus inkl. Klima“ anzeigen; gültige Einzelwerte bleiben sichtbar. Leistung und Energie getrennt prüfen. Gleiche oder überlappende Messkanäle vermeiden.</p>
+                    <p>Den Verlauf mit beiden Anlagen in der Klima-Ansicht öffnen. Neue Live-Historienzeilen enthalten die Aufteilung; Altdaten bleiben Gesamtwerte. Tages-/Monatswerte, Langzeit, Telegram und Kosten weiterhin als Gesamtsumme führen. Nur messen: Die zweite Anlage erhält keine Steuerfunktion, der vorhandene Toshiba-Status bleibt an Zähler 1 gebunden. Für die Tagesenergie vorhandene Messpunktbasen beibehalten; neue Messziele, Zählerreset und Mitternacht mit einer neuen Basis beginnen.</p>
                     <p><strong>Klimaverbrauchsmessung:</strong> Ein bereits gestarteter read-only Worker &uuml;bernimmt Deaktivierung und Shelly-Kanalwechsel im n&auml;chsten Zyklus. Wird die Klimamessung aus <code>Aus</code> erstmals aktiviert, ist auch daf&uuml;r ein Container-Neustart erforderlich. Eine aktive Klimasteuerung ist davon nicht umfasst.</p>
                     <ol>
                         <li><strong>Konfigurations-Editor:</strong> Im passenden Bereich die sichtbaren Schalter und Auswahlfelder setzen und speichern:
@@ -1934,25 +1970,8 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
                     <p>Das Wärmepumpen-Dashboard zeigt in Echtzeit ganz unten im Block <strong>"MODBUS SET-WERTE (VORGABEN)"</strong> exakt die Werte an, die durch den E3DC-Manager via Modbus auf die Anlage geschrieben werden:</p>
                     <ul>
                         <li><strong>Bei IDM-Anlagen:</strong> Drei getrennte Kacheln für Heizung, Warmwasser und Kühlung (0 = Auto-Betrieb der Anlage, 1 = PV-Überschuss-Anforderung aktiv).</li>
-                        <li><strong>Bei Luxtronik-Anlagen:</strong> Den gesetzten Boost-Modus (z. B. "Setpoint") und die konkret vom Dashboard aufoktroyierte Soll-Temperatur für Heiz- und Warmwasserkreise.</li>
+                        <li><strong>Bei Luxtronik-Anlagen:</strong> Das Dashboard zeigt die vom Energy Manager gesetzten Sollwerte und die ausgelesenen Betriebsmodi für Heizung und Warmwasser an.</li>
                     </ul>
-                </div>
-            </div>
-        </div>
-
-        <!-- Status-Check Log -->
-        <div class="col-12 faq-item" data-tags="wärmepumpe log status-check boost ohne software-anforderung reset error idm luxtronik spam">
-            <div class="faq-card">
-                <div class="faq-question">
-                    <div>
-                        <span class="tag">Wärmepumpe</span>
-                        Was bedeutet die Log-Meldung: "Status-Check: WP ist im Boost ... ohne Software-Anforderung"?
-                    </div>
-                    <i class="fas fa-chevron-down"></i>
-                </div>
-                <div class="faq-answer">
-                    <p>Wenn Sie (bei Luxtronik-Anlagen) eigene Zeitschaltuhren oder Komfort-Temperatur-Timer im Display der Wärmepumpe eingestellt haben, springt die Anlage physisch in den "Boost/Party-Modus". Da dieser Befehl nicht von E3DC-Control stammte, hat die Sicherheitslogik in der Vergangenheit ständig vor einem Modbus-Konflikt gewarnt ("spam").</p>
-                    <p>Ab v3.9.6 erkennt E3DC-Control nun eigenständig, ob ein hoher Setpoint (>22°C) von einer WP-internen Zeitschaltung stammt und loggt diese Information <strong>nur noch lautlos</strong> im Hintergrund (DEBUG Level), anstatt das Log zu überfluten.</p>
                 </div>
             </div>
         </div>
@@ -2270,25 +2289,24 @@ journalctl -u e3dc-live -n 80 --no-pager</pre>
             </div>
         </div>
 
-        <!-- Wallbox AUTO und wbminSoC -->
-        <div class="col-12 faq-item" data-tags="wallbox auto openwb wbminsoc hysterese heartbeat netzbezug freilauf">
+        <!-- Speicher AUTO und Heartbeat -->
+        <div class="col-12 faq-item" data-tags="speicher auto predump hysterese heartbeat netzbezug freilauf preisfenster">
             <div class="faq-card">
                 <div class="faq-question">
                     <div>
-                        <span class="tag">Wallbox</span>
+                        <span class="tag">Speicher</span>
                         Warum sendet E3DC-Control im AUTO-Modus keinen Heartbeat mehr?
                     </div>
                     <i class="fas fa-chevron-down"></i>
                 </div>
                 <div class="faq-answer">
-                    <p>Ab v4.9.0 ist <code>AUTO</code> nur noch ein Freigabe-Befehl. Wenn der E3DC bereits im AUTO-Modus ist, sendet Python keinen wiederholten RSCP-Befehl mehr. Die E3DC-Firmware regelt Hausversorgung, Speicher und Netzpunkt dann allein.</p>
+                    <p><code>AUTO</code> ist ein Freigabe-Befehl. Wenn der E3DC bereits im AUTO-Modus ist, sendet Python keinen wiederholten RSCP-Befehl mehr. Die E3DC-Firmware regelt Hausversorgung, Speicher und Netzpunkt dann allein.</p>
                     <p><strong>Wetterbasiertes Laden im E3/DC:</strong> Wenn E3DC-Control die Ladekurve führt, sollte diese E3/DC-Funktion ausgeschaltet sein. Sie ist ein zweiter Ladeplaner und kann Ladekapazität zurückhalten, obwohl E3DC-Control bereits eine passende AUTO-Ladeobergrenze bereitstellt. Die Open-Meteo-/Forecast-Prognose von E3DC-Control bleibt davon unabhängig aktiv. Bei gleichzeitigem E3/DC-Status <em>Laden gesperrt</em> und <em>Warten auf Sonnenschein</em> zeigt E3DC-Control das externe Veto an, verändert die Geräteeinstellung aber nicht automatisch.</p>
-                    <p>Ab v4.9.1a gibt die Nachtfreigabe den E3DC bei <code>PV=0W</code> wieder in <code>AUTO</code> frei, statt die Tagesladekurve nachts mit <code>IDLE</code> oder Autodump zu erzwingen. Aktiver Pre-Discharge ist davon ausgenommen und läuft weiter.</p>
-                    <p>Ab v4.9.1b folgt Pre-Discharge einer eigenen Entladerampe mit Hysterese. Die normale Ladekurve kann den morgendlichen Pre-Dump dadurch nicht mehr zu früh pausieren.</p>
-                    <p>Ab v4.9.1c sendet die aktive Ladekurve ihren berechneten <code>iFc</code>-Wert direkt als Lade- oder Entlade-Führung. Dadurch entstehen keine kurzen Gegenkorrekturen mehr, bei denen zuerst ein um 100 W versetzter Wert und danach sofort der begrenzte Wert an den E3DC gesendet wird.</p>
-                    <p>Ab v4.9.2 nutzt der Preis-Boost das Verhalten des C++-Vorgängers <code>awtest=3</code>: Im günstigen Preisfenster bleibt der Speicher per <code>GRID</code> im Ladepfad, während freigegebene Wallboxen und Wärmepumpen Netzleistung nutzen dürfen. Nach Ende des Preisfensters prüfen alle Dienste die Fensterzeit selbst und fallen wieder auf Ladekurve bzw. Autonom-Regelung zurück.</p>
+                    <p>Die Nachtfreigabe gibt den E3DC bei <code>PV=0W</code> wieder in <code>AUTO</code> frei, statt die Tagesladekurve nachts mit <code>IDLE</code> oder Autodump zu erzwingen. Aktiver Pre-Dump ist davon ausgenommen und läuft weiter.</p>
+                    <p>Pre-Dump folgt einer eigenen Entladerampe mit Hysterese. Die normale Ladekurve kann den morgendlichen Pre-Dump dadurch nicht mehr zu früh pausieren.</p>
+                    <p>Die aktive Ladekurve sendet ihren berechneten <code>iFc</code>-Wert direkt als Lade- oder Entlade-Führung. Dadurch entstehen keine kurzen Gegenkorrekturen mehr, bei denen zuerst ein um 100 W versetzter Wert und danach sofort der begrenzte Wert an den E3DC gesendet wird.</p>
+                    <p>Im günstigen Preisfenster berücksichtigt der Storage Manager die erwartete PV-Erzeugung und den Bedarf bis zum nächsten nutzbaren günstigen Fenster. Vor dem berechneten spätesten Ladestart bleibt der Speicher entladegesperrt und nimmt PV auf; der verbleibende Netzladebedarf wird am Ende des Fensters geladen. Über <code>market_wallbox_enable</code> freigegebene Wallboxen in <code>Sofort bis Preislimit</code> dürfen Netzstrom nutzen. Der normale Marktpfad gibt die Wärmepumpe nicht frei; sie behält ihre Prognose-, PV- und Pre-Dump-Führung mit Taktschutz. Der Negativpreis-Boost kann sie gesondert freigeben.</p>
                     <p>Das ist wichtig, weil wiederholte AUTO-Befehle bestimmte Anlagen alle 30 Sekunden leicht anstoßen konnten. Sichtbar war das als kurze Welle aus Batterie-Laden und Netzeinspeisung.</p>
-                    <p>Für openWB und openWB Pro trennt V4 jetzt öffentliche Modi von der internen Treiberlogik. <code>Aus / autonom</code> sendet keine Ladebefehle, <code>PV-Kurve ruhig</code> regelt weich entlang der Speicher-Kurve, und <code>Sofort bis Preislimit</code> öffnet Netzstrom nur bei freigegebener Preisgrenze. Die Batterieentladung hat eine SoC-Hysterese, damit sie an wbminSoC nicht taktet.</p>
                 </div>
             </div>
         </div>

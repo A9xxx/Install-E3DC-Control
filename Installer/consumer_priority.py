@@ -127,14 +127,17 @@ def allocate_consumer_budget_contract(
     wp_runon_active_override=None,
     priority_front=(),
     reclaimable_active=(),
+    start_candidates=(),
+    protected_active=(),
     heatpump_exclusive_budget_w=0,
 ):
     """Teilt genau einen versiegelbaren Verbraucherrahmen deterministisch auf.
 
     Die Funktion besitzt weder Datei- noch Hardware-I/O. Unvollständige oder
     untypisierte Evidenz erzeugt ausschließlich einen 0-W-Vertrag. Bereits
-    aktive Mindestlasten werden vor neuen Starts berücksichtigt; darüber
-    hinaus entscheidet die konfigurierte Reihenfolge strikt und reproduzierbar.
+    aktive Mindestlasten bleiben ohne konkurrierenden Start erhalten. Ein
+    qualifizierter vorrangiger Start darf rücknehmbare nachrangige Lasten
+    zurücknehmen; ausdrücklich geschützte Lasten behalten ihren Mindestanteil.
     """
 
     total = _strict_nonnegative_int(total_budget_w)
@@ -167,10 +170,18 @@ def allocate_consumer_budget_contract(
     reclaimable = list(reclaimable_active or ())
     reclaimable_valid = bool(
         len(reclaimable) == len(set(reclaimable))
-        and all(consumer == "wallbox" for consumer in reclaimable)
+        and all(consumer in CONSUMERS for consumer in reclaimable)
+    )
+    starts = list(start_candidates or ())
+    protected = list(protected_active or ())
+    start_policy_valid = bool(
+        len(starts) == len(set(starts)) and len(protected) == len(set(protected))
+        and all(consumer in CONSUMERS for consumer in starts + protected)
     )
     reason = None
-    if total is None:
+    if not start_policy_valid:
+        reason = "consumer_start_priority_evidence_invalid"
+    elif total is None:
         reason = "total_budget_type_invalid"
     elif hp_exclusive is None or hp_exclusive > total:
         reason = "heatpump_exclusive_source_invalid"
@@ -237,6 +248,17 @@ def allocate_consumer_budget_contract(
         effective_order = front + [
             item for item in effective_order if item not in front
         ]
+
+    # Nur der fachlich qualifizierte Start verändert die aktiven Minima.
+    # Schutzzeiten werden vom jeweiligen Entscheider frisch gebunden.
+    for consumer in CONSUMERS:
+        if consumer not in protected and any(
+            not active_map[start] and requests[start] >= minimums[start]
+            and effective_order.index(start) < effective_order.index(consumer)
+            for start in starts
+        ) and consumer not in reclaimable:
+            reclaimable.append(consumer)
+    reclaimable = [consumer for consumer in reclaimable if consumer not in protected]
 
     remaining = total - hp_exclusive
     exclusive_remaining = hp_exclusive
@@ -350,6 +372,8 @@ def allocate_consumer_budget_contract(
         "consumer_priority_wp_runon_active": wp_runon_active,
         "priority_front": front,
         "reclaimable_active": reclaimable,
+        "start_candidates": starts,
+        "protected_active": protected,
         "heatpump_exclusive_budget_w": hp_exclusive,
         "heatpump_exclusive_allocated_w": hp_exclusive - exclusive_remaining,
         "heatpump_exclusive_remaining_w": exclusive_remaining,
@@ -792,7 +816,8 @@ def priority_order_from_config(config):
 
 def priority_runon_s_from_config(config, default=600.0):
     try:
-        raw = float((config or {}).get("consumer_priority_wp_runon_s", default) or default)
+        configured = (config or {}).get("consumer_priority_wp_runon_s", default)
+        raw = float(default if configured in (None, "") else configured)
         return max(0.0, min(7200.0, raw))
     except (TypeError, ValueError):
         return float(default)

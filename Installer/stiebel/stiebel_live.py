@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import http.cookiejar
 import json
+import math
 import os
 import re
 import signal
@@ -108,7 +109,7 @@ def none_marker(value: int | None) -> bool:
 
 
 def plausible_temp(value: float) -> float | None:
-    if value < -100.0 or value > 200.0:
+    if value == -99.0 or value < -100.0 or value > 200.0:
         return None
     return round(value, 1)
 
@@ -272,7 +273,10 @@ def valid_power_meter_type(value: Any) -> str:
 
 
 def normalise_meter_power(value: Any) -> float:
-    power = safe_float(value, 0.0)
+    power = finite_value(value)
+    if power is None:
+        raise ValueError("Leistungsmesswert fehlt oder ist ungültig")
+
     return round(abs(power), 1)
 
 
@@ -285,8 +289,30 @@ def phase_power_value(value: int | None) -> float | None:
     return round(max(0.0, float(power)), 1)
 
 
-def read_wpmg_phase_power(ip: str, port: int, unit_id: int) -> dict[str, Any]:
-    """Try optional WPMG direct electric phase-power registers, read-only."""
+def wpmg_profile_bound(controller_id: int | None) -> bool:
+    """Ohne dokumentierte WPM-G-Kennung ist kein Registerprofil freigegeben.
+
+    Die Herstellerquelle ordnet 390/391/449 WPM 3/3i/system zu, nennt aber
+    keine WPM-G-Kennung. Eine plausible Antwort ersetzt diese Bindung nicht.
+    Die Prüfung erfolgt für jede aktuelle Kennung, ohne gespeichertes Profil.
+    """
+    return False
+
+
+def finite_value(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (ValueError, TypeError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def read_wpmg_phase_power(ip: str, port: int, unit_id: int, controller_id: int | None = None) -> dict[str, Any]:
+    """WPM-G-Phasenleistung nur mit dokumentierter aktueller Reglerbindung."""
+    if not wpmg_profile_bound(controller_id):
+        return {"power_w": None, "reason": "controller_unknown" if controller_id is None else "register_not_documented_for_controller"}
     blocks = [
         ("wpmg_phase_power_primary", 6118),
         ("wpmg_phase_power_secondary_1", 6268),
@@ -328,18 +354,17 @@ def read_shelly_power_meter(ip: str, meter_type: str = "auto") -> dict[str, Any]
             data = read_http_json(f"http://{ip}/rpc/EM.GetStatus?id=0")
             total = data.get("total_act_power")
             if total is None:
-                total = (
-                    safe_float(data.get("a_act_power"), 0.0)
-                    + safe_float(data.get("b_act_power"), 0.0)
-                    + safe_float(data.get("c_act_power"), 0.0)
-                )
+                phases = [finite_value(data.get(key)) for key in ("a_act_power", "b_act_power", "c_act_power")]
+                if any(value is None for value in phases):
+                    raise ValueError("Phasenleistung des Zählers ist unvollständig")
+                total = sum(phases)
             return {
                 "power_w": normalise_meter_power(total),
                 "raw_power_w": round(safe_float(total, 0.0), 1),
                 "source": "shelly_3em_rpc",
-                "phase_a_w": round(safe_float(data.get("a_act_power"), 0.0), 1),
-                "phase_b_w": round(safe_float(data.get("b_act_power"), 0.0), 1),
-                "phase_c_w": round(safe_float(data.get("c_act_power"), 0.0), 1),
+                "phase_a_w": round(finite_value(data.get("a_act_power")), 1) if finite_value(data.get("a_act_power")) is not None else None,
+                "phase_b_w": round(finite_value(data.get("b_act_power")), 1) if finite_value(data.get("b_act_power")) is not None else None,
+                "phase_c_w": round(finite_value(data.get("c_act_power")), 1) if finite_value(data.get("c_act_power")) is not None else None,
                 "voltage_a_v": round(safe_float(data.get("a_voltage"), 0.0), 1),
                 "voltage_b_v": round(safe_float(data.get("b_voltage"), 0.0), 1),
                 "voltage_c_v": round(safe_float(data.get("c_voltage"), 0.0), 1),
@@ -350,8 +375,10 @@ def read_shelly_power_meter(ip: str, meter_type: str = "auto") -> dict[str, Any]
         try:
             data = read_http_json(f"http://{ip}/status")
             emeters = data.get("emeters")
-            if isinstance(emeters, list) and emeters:
-                phase_powers = [safe_float(item.get("power"), 0.0) for item in emeters if isinstance(item, dict)]
+            if isinstance(emeters, list) and len(emeters) == 3:
+                phase_powers = [finite_value(item.get("power")) if isinstance(item, dict) else None for item in emeters]
+                if any(value is None for value in phase_powers):
+                    return {"error": "shelly_phase_incomplete", "reason": "shelly_phase_incomplete"}
                 total = sum(phase_powers)
                 result = {
                     "power_w": normalise_meter_power(total),
@@ -362,6 +389,8 @@ def read_shelly_power_meter(ip: str, meter_type: str = "auto") -> dict[str, Any]
                     if idx < len(phase_powers):
                         result[f"phase_{phase}_w"] = round(phase_powers[idx], 1)
                 return result
+            if meter_type == "shelly_3em" or isinstance(emeters, list):
+                return {"error": "shelly_phase_incomplete", "reason": "shelly_phase_incomplete"}
         except Exception:
             pass
 
@@ -373,7 +402,7 @@ def read_shelly_power_meter(ip: str, meter_type: str = "auto") -> dict[str, Any]
         ):
             try:
                 data = read_http_json(f"http://{ip}{path}")
-                power = data.get("apower", data.get("power", 0.0))
+                power = data.get("apower", data.get("power"))
                 return {
                     "power_w": normalise_meter_power(power),
                     "raw_power_w": round(safe_float(power, 0.0), 1),
@@ -516,30 +545,37 @@ def read_stiebel_payload(cfg: dict[str, Any]) -> dict[str, Any]:
         operating_mode = uint_or_none(value_at_doc(param_regs, 1501, 1501))
     except Exception:
         pass
-    try:
-        dyn = read_regs(ip, port, unit_id, 4, code_address(6128), 1)
-        raw_percent = uint_or_none(dyn[0] if dyn else None)
-        if raw_percent is not None and 0 <= raw_percent <= 100:
-            compressor_percent = raw_percent
-    except Exception:
-        pass
+    controller_id = uint_or_none(value_at_doc(info, 5001, 5002))
+    if wpmg_profile_bound(controller_id):
+        try:
+            dyn = read_regs(ip, port, unit_id, 4, code_address(6128), 1)
+            raw_percent = uint_or_none(dyn[0] if dyn else None)
+            if raw_percent is not None and 0 <= raw_percent <= 100:
+                compressor_percent = raw_percent
+        except Exception:
+            pass
     compressor_hz = scrape_compressor_hz(cfg, ip)
-    direct_power = read_wpmg_phase_power(ip, port, unit_id)
+    direct_power = read_wpmg_phase_power(ip, port, unit_id, controller_id)
     external_power = read_external_power_meter(cfg)
 
     return {
+        "temperature_registers": {
+            key: next((address for address in addresses
+                       if temp_01k(value_at_doc(system, 501, address)) is not None), None)
+            for key, addresses in {"flow_c": (515, 513), "source_c": (536,)}.items()
+        },
         "system": {
             "outside_c": temp_from_doc(system, 501, 507),
             "heating_circuit_1_c": temp_from_doc(system, 501, 508),
             "heating_circuit_1_set_c": temp_from_doc(system, 501, 510, 509),
             "heating_circuit_2_set_c": temp_from_doc(system, 501, 512),
-            "flow_c": temp_from_doc(system, 501, 515, 513, 517),
+            "flow_c": temp_from_doc(system, 501, 515, 513),
             "return_c": temp_from_doc(system, 501, 516),
             "buffer_c": temp_from_doc(system, 501, 518),
             "buffer_set_c": temp_from_doc(system, 501, 519),
             "dhw_c": temp_from_doc(system, 501, 522),
             "dhw_set_c": temp_from_doc(system, 501, 523),
-            "source_c": temp_from_doc(system, 501, 536, 537),
+            "source_c": temp_from_doc(system, 501, 536),
         },
         "state": {
             "operating_status": uint_or_none(value_at_doc(state, 2501, 2501)),
@@ -597,21 +633,26 @@ def normalise_payload(payload: dict[str, Any], cfg: dict[str, Any]) -> dict[str,
     max_hz = max(1.0, safe_float(cfg.get("stiebel_isg_max_hz", 60), 60.0))
     hz_power_map = parse_power_map(cfg.get("stiebel_isg_hz_power_map", ""))
 
-    operating = safe_int(state.get("operating_status"), 0)
+    operating = uint_or_none(state.get("operating_status"))
+    controller_id = sg.get("controller_id")
+    profile_bound = wpmg_profile_bound(controller_id)
+    profile_reason = "controller_unknown" if controller_id is None else "register_not_documented_for_controller"
     operating_mode = safe_int(payload.get("operating_mode", -1), -1)
-    compressor_percent = dynamic.get("compressor_percent")
+    compressor_percent = dynamic.get("compressor_percent") if profile_bound else None
     compressor_hz = dynamic.get("compressor_hz")
-    compressor_percent_f = safe_float(compressor_percent, -1.0)
-    compressor_hz_f = safe_float(compressor_hz, -1.0)
+    compressor_percent_f = finite_value(compressor_percent)
+    compressor_percent_f = compressor_percent_f if compressor_percent_f is not None and 0 <= compressor_percent_f <= 100 else -1.0
+    compressor_hz_f = finite_value(compressor_hz)
+    compressor_hz_f = compressor_hz_f if compressor_hz_f is not None and compressor_hz_f >= 0 else -1.0
     direct_power_w = safe_float(direct_power.get("power_w") if isinstance(direct_power, dict) else None, -1.0)
-    direct_power_ok = isinstance(direct_power, dict) and direct_power_w >= 0.0 and not direct_power.get("error")
+    direct_power_ok = isinstance(direct_power, dict) and profile_bound and math.isfinite(direct_power_w) and direct_power_w >= 0.0 and not direct_power.get("error")
     external_power_w = safe_float(external_power.get("power_w") if isinstance(external_power, dict) else None, -1.0)
-    external_power_ok = isinstance(external_power, dict) and external_power_w >= 0.0 and not external_power.get("error")
-    status_heating = status_bit(operating, WPM_STATUS_HEATING)
-    status_dhw = status_bit(operating, WPM_STATUS_DHW)
-    status_compressor = status_bit(operating, WPM_STATUS_COMPRESSOR)
-    status_summer = status_bit(operating, WPM_STATUS_SUMMER)
-    status_cooling = status_bit(operating, WPM_STATUS_COOLING)
+    external_power_ok = isinstance(external_power, dict) and math.isfinite(external_power_w) and external_power_w >= 0.0 and not external_power.get("error")
+    status_heating = status_bit(operating or 0, WPM_STATUS_HEATING)
+    status_dhw = status_bit(operating or 0, WPM_STATUS_DHW)
+    status_compressor = status_bit(operating or 0, WPM_STATUS_COMPRESSOR)
+    status_summer = status_bit(operating or 0, WPM_STATUS_SUMMER)
+    status_cooling = status_bit(operating or 0, WPM_STATUS_COOLING)
     compressor_on = bool(
         status_compressor
         or safe_int(state.get("compressor_1"), 0) == 1
@@ -619,14 +660,26 @@ def normalise_payload(payload: dict[str, Any], cfg: dict[str, Any]) -> dict[str,
         or compressor_percent_f > 0.0
         or compressor_hz_f > 0.0
     )
+    # Positive Einzelsignale belegen Lauf. Stillstand braucht einen vollständigen
+    # Status oder beide gültigen Einzelverdichter; fehlend ist kein Aus.
+    compressor_valid = bool(
+        compressor_on or operating is not None
+        or all(state.get(key) in (0, 1) for key in ("compressor_1", "compressor_2"))
+        or compressor_hz_f >= 0.0 or compressor_percent_f >= 0.0
+    )
+    dhw_actual = finite_value(system.get("dhw_c"))
+    dhw_target = finite_value(system.get("dhw_set_c"))
+    flow_actual = finite_value(system.get("flow_c"))
+    return_actual = finite_value(system.get("return_c"))
     dhw_requested = bool(
         status_dhw
         or safe_int(state.get("dhw_pump"), 0) == 1
         or (
             compressor_on
-            and safe_float(system.get("dhw_set_c"), -99.0) >= 35.0
-            and safe_float(system.get("dhw_c"), -99.0) < safe_float(system.get("dhw_set_c"), -99.0) - 0.3
-            and (safe_float(system.get("flow_c"), -99.0) >= 48.0 or safe_float(system.get("return_c"), -99.0) >= 45.0)
+            and dhw_actual is not None and dhw_actual != -99.0 and dhw_target is not None
+            and dhw_target >= 35.0 and dhw_actual < dhw_target - 0.3
+            and ((flow_actual is not None and flow_actual >= 48.0)
+                 or (return_actual is not None and return_actual >= 45.0))
         )
     )
     cooling_requested = bool(status_cooling or safe_int(state.get("cooling_mode"), 0) == 1)
@@ -636,7 +689,10 @@ def normalise_payload(payload: dict[str, Any], cfg: dict[str, Any]) -> dict[str,
     heating_active = bool((status_heating or compressor_on) and compressor_on and not dhw_active and not cooling_active)
     mode_max_w = dhw_w if dhw_active else (heating_w if heating_active else max(heating_w, dhw_w))
 
-    if external_power_ok:
+    if external_power.get("reason") == "shelly_phase_incomplete":
+        power_w = None
+        power_source = "unknown"
+    elif external_power_ok:
         power_w = max(0, int(round(external_power_w)))
         power_source = str(external_power.get("source") or "external_power_meter")
     elif direct_power_ok:
@@ -648,6 +704,9 @@ def normalise_payload(payload: dict[str, Any], cfg: dict[str, Any]) -> dict[str,
     elif compressor_hz_f >= 0.0:
         power_w = estimate_from_hz(compressor_hz_f, mode_max_w, standby_w, max_hz, hz_power_map)
         power_source = "compressor_hz"
+    elif not compressor_valid:
+        power_w = None
+        power_source = "unknown"
     elif passive_cooling_active:
         power_w = standby_w
         power_source = "passive_cooling_standby"
@@ -661,9 +720,9 @@ def normalise_payload(payload: dict[str, Any], cfg: dict[str, Any]) -> dict[str,
         power_w = heating_w
         power_source = "status_nominal_heating"
 
-    estimated_thermal_kw = 0.0
+    estimated_thermal_kw = 0.0 if compressor_valid else None
     thermal_power_estimated = False
-    if compressor_on and power_w > standby_w and cop_estimate > 0.0:
+    if compressor_on and power_w is not None and power_w > standby_w and cop_estimate > 0.0:
         estimated_thermal_kw = round((power_w * cop_estimate) / 1000.0, 3)
         thermal_power_estimated = True
 
@@ -676,8 +735,13 @@ def normalise_payload(payload: dict[str, Any], cfg: dict[str, Any]) -> dict[str,
             else ("WW" if dhw_active else ("Kühlen" if cooling_active else ("Heizen" if heating_active else "Standby")))
         )
     )
-    heat_day = safe_float(energy.get("heat_day_kwh"), 0.0) + safe_float(energy.get("dhw_day_kwh"), 0.0)
-    consumed_day = safe_float(energy.get("heat_consumed_day_kwh"), 0.0) + safe_float(energy.get("dhw_consumed_day_kwh"), 0.0)
+    if not compressor_valid:
+        mode_text = "unbekannt"
+    def day_sum(*keys):
+        values = [finite_value(energy.get(key)) for key in keys]
+        return sum(values) if all(value is not None for value in values) else None
+    heat_day = day_sum("heat_day_kwh", "dhw_day_kwh")
+    consumed_day = day_sum("heat_consumed_day_kwh", "dhw_consumed_day_kwh")
 
     data = {
         "Hersteller": "Stiebel Eltron",
@@ -698,14 +762,14 @@ def normalise_payload(payload: dict[str, Any], cfg: dict[str, Any]) -> dict[str,
         "Quellentemperatur": system.get("source_c"),
         "Waermequelle_Temperatur": system.get("source_c"),
         "Betriebszustand": mode_text,
-        "Verdichter_Ein": 1 if compressor_on else 0,
-        "Verdichter": 1 if compressor_on else 0,
+        "Verdichter_Ein": (1 if compressor_on else 0) if compressor_valid else None,
+        "Verdichter": (1 if compressor_on else 0) if compressor_valid else None,
         "Leistung_Verdichter_W": power_w,
-        "Leistungsaufnahme": round(power_w / 1000.0, 3),
-        "Leistung_Heiz_kW": estimated_thermal_kw if (heating_active or dhw_active) else 0.0,
-        "Leistung_Kuehl_kW": estimated_thermal_kw if cooling_active else 0.0,
-        "Kuehlung_Aktiv": 1 if cooling_active else 0,
-        "Passive_Kuehlung_Aktiv": 1 if passive_cooling_active else 0,
+        "Leistungsaufnahme": round(power_w / 1000.0, 3) if power_w is not None else None,
+        "Leistung_Heiz_kW": (estimated_thermal_kw if (heating_active or dhw_active) else 0.0) if compressor_valid else None,
+        "Leistung_Kuehl_kW": (estimated_thermal_kw if cooling_active else 0.0) if compressor_valid else None,
+        "Kuehlung_Aktiv": (1 if cooling_active else 0) if compressor_valid else None,
+        "Passive_Kuehlung_Aktiv": (1 if passive_cooling_active else 0) if compressor_valid else None,
         "Waerme_Tag_kWh": heat_day,
         "Strom_Tag_kWh": consumed_day,
         "wp_mode_text": mode_text,
@@ -714,13 +778,13 @@ def normalise_payload(payload: dict[str, Any], cfg: dict[str, Any]) -> dict[str,
         "stiebel_heat_power_source": "estimated_from_electric_cop" if thermal_power_estimated else None,
         "stiebel_cop_estimate": cop_estimate,
         "stiebel_operating_status": operating,
-        "stiebel_heating_active": 1 if heating_active else 0,
-        "stiebel_dhw_active": 1 if dhw_active else 0,
-        "stiebel_cooling_active": 1 if cooling_active else 0,
-        "stiebel_passive_cooling_active": 1 if passive_cooling_active else 0,
-        "stiebel_dhw_requested": 1 if dhw_requested else 0,
-        "stiebel_cooling_requested": 1 if cooling_requested else 0,
-        "stiebel_compressor_running": 1 if compressor_on else 0,
+        "stiebel_heating_active": (1 if heating_active else 0) if compressor_valid else None,
+        "stiebel_dhw_active": (1 if dhw_active else 0) if compressor_valid else None,
+        "stiebel_cooling_active": (1 if cooling_active else 0) if compressor_valid else None,
+        "stiebel_passive_cooling_active": (1 if passive_cooling_active else 0) if compressor_valid else None,
+        "stiebel_dhw_requested": (1 if dhw_requested else 0) if compressor_valid else None,
+        "stiebel_cooling_requested": (1 if cooling_requested else 0) if compressor_valid else None,
+        "stiebel_compressor_running": (1 if compressor_on else 0) if compressor_valid else None,
         "stiebel_summer_mode_active": 1 if status_summer else 0,
         "stiebel_operating_mode": operating_mode if operating_mode >= 0 else None,
         "stiebel_operating_mode_text": WPM_OPERATING_MODE_TEXT.get(operating_mode),
@@ -733,11 +797,11 @@ def normalise_payload(payload: dict[str, Any], cfg: dict[str, Any]) -> dict[str,
         "stiebel_controller_id": sg.get("controller_id"),
         "stiebel_compressor_percent": compressor_percent if compressor_percent_f >= 0.0 else None,
         "stiebel_compressor_hz": compressor_hz if compressor_hz_f >= 0.0 else None,
-        "stiebel_direct_power_w": round(direct_power_w, 1) if direct_power_w >= 0.0 else None,
-        "stiebel_direct_power_source": direct_power.get("source") if isinstance(direct_power, dict) else None,
-        "stiebel_direct_power_phase_a_w": direct_power.get("phase_a_w") if isinstance(direct_power, dict) else None,
-        "stiebel_direct_power_phase_b_w": direct_power.get("phase_b_w") if isinstance(direct_power, dict) else None,
-        "stiebel_direct_power_phase_c_w": direct_power.get("phase_c_w") if isinstance(direct_power, dict) else None,
+        "stiebel_direct_power_w": round(direct_power_w, 1) if direct_power_ok else None,
+        "stiebel_direct_power_source": direct_power.get("source") if direct_power_ok else None,
+        "stiebel_direct_power_phase_a_w": direct_power.get("phase_a_w") if direct_power_ok else None,
+        "stiebel_direct_power_phase_b_w": direct_power.get("phase_b_w") if direct_power_ok else None,
+        "stiebel_direct_power_phase_c_w": direct_power.get("phase_c_w") if direct_power_ok else None,
         "stiebel_comfort_temp_hk1_c": params.get("comfort_temp_hk1_c"),
         "stiebel_eco_temp_hk1_c": params.get("eco_temp_hk1_c"),
         "stiebel_comfort_temp_hk2_c": params.get("comfort_temp_hk2_c"),
@@ -752,23 +816,54 @@ def normalise_payload(payload: dict[str, Any], cfg: dict[str, Any]) -> dict[str,
         "stiebel_external_power_phase_b_w": external_power.get("phase_b_w") if isinstance(external_power, dict) else None,
         "stiebel_external_power_phase_c_w": external_power.get("phase_c_w") if isinstance(external_power, dict) else None,
     }
-    data = {key: value for key, value in data.items() if value is not None}
+    def quality(value, registers=None, source=None, reason="missing_or_invalid_register", estimated=False):
+        return {"valid": value is not None, "reason": None if value is not None else reason,
+                "registers": registers or [], "source": source, "estimated": estimated}
+    field_quality = {}
+    temperature_fields = {
+        "outside_c": ([507], ["Aussentemp", "Aussentemperatur"]),
+        "heating_circuit_1_c": ([508], ["Heizkreis1_Ist"]),
+        "flow_c": ([515, 513], ["Vorlauf_Ist"]),
+        "return_c": ([516], ["Ruecklauf_Ist"]),
+        "buffer_c": ([518], ["Puffer_Ist", "Kaeltespeicher_Ist"]),
+        "dhw_c": ([522], ["Warmwasser_Ist"]),
+        "source_c": ([536], ["Quellentemperatur", "Waermequelle_Temperatur"]),
+    }
+    for key, (registers, aliases) in temperature_fields.items():
+        for alias in aliases:
+            field_quality[alias] = quality(data[alias], registers, payload.get("temperature_registers", {}).get(key))
+    compressor_quality = quality(data["Verdichter_Ein"], [2501, 2542, 2543], "status_or_hz")
+    power_estimated = not (external_power_ok or direct_power_ok)
+    power_quality = quality(power_w, source=power_source, reason=external_power.get("reason") or "compressor_unknown_and_no_power_meter", estimated=power_estimated)
+    for alias in ("Verdichter_Ein", "Verdichter", "stiebel_compressor_running"):
+        field_quality[alias] = dict(compressor_quality)
+    for alias in ("Leistung_Verdichter_W", "Leistungsaufnahme"):
+        field_quality[alias] = dict(power_quality)
+    field_quality["stiebel_compressor_percent"] = quality(data["stiebel_compressor_percent"], [6128], reason=profile_reason if not profile_bound else "missing_or_invalid_register")
+    field_quality["stiebel_direct_power_w"] = quality(data["stiebel_direct_power_w"], [6118, 6119, 6120], reason=profile_reason if not profile_bound else "missing_or_invalid_register")
+    field_quality["Waerme_Tag_kWh"] = quality(heat_day, [3501, 3504], reason="missing_energy_summand")
+    field_quality["Strom_Tag_kWh"] = quality(consumed_day, [3511, 3514], reason="missing_energy_summand")
+    data["stiebel_power_estimated"] = power_estimated if power_w is not None else None
+    measurement_quality = {"temperature": {"valid": all(field_quality[key]["valid"] for key in ("Vorlauf_Ist", "Ruecklauf_Ist", "Warmwasser_Ist")),
+                                           "reason": None if all(field_quality[key]["valid"] for key in ("Vorlauf_Ist", "Ruecklauf_Ist", "Warmwasser_Ist")) else "missing_or_invalid_temperature"},
+                           "compressor": compressor_quality, "power": power_quality, "fields": field_quality}
     return {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "success": True,
         "error": "",
         "source": "stiebel_live",
         "data": data,
+        "quality": measurement_quality,
         "status": {
-            "valid": True,
+            "valid": compressor_valid,
             "Mode": mode_text,
-            "Compressor": 1 if compressor_on else 0,
-            "Heating": 1 if heating_active else 0,
-            "DHW": 1 if dhw_active else 0,
-            "Cooling": 1 if cooling_active else 0,
-            "Passive_Cooling": 1 if passive_cooling_active else 0,
-            "DHW_Request": 1 if dhw_requested else 0,
-            "Cooling_Request": 1 if cooling_requested else 0,
+            "Compressor": (1 if compressor_on else 0) if compressor_valid else None,
+            "Heating": (1 if heating_active else 0) if compressor_valid else None,
+            "DHW": (1 if dhw_active else 0) if compressor_valid else None,
+            "Cooling": (1 if cooling_active else 0) if compressor_valid else None,
+            "Passive_Cooling": (1 if passive_cooling_active else 0) if compressor_valid else None,
+            "DHW_Request": (1 if dhw_requested else 0) if compressor_valid else None,
+            "Cooling_Request": (1 if cooling_requested else 0) if compressor_valid else None,
             "Summer_Mode": 1 if status_summer else 0,
             "SG_State": sg.get("state"),
             "Operating_Mode": operating_mode if operating_mode >= 0 else None,
@@ -777,14 +872,14 @@ def normalise_payload(payload: dict[str, Any], cfg: dict[str, Any]) -> dict[str,
         "stiebel": {
             "estimated_power_w": power_w,
             "power_source": power_source,
-            "direct_power_w": round(direct_power_w, 1) if direct_power_w >= 0.0 else None,
-            "direct_power_source": direct_power.get("source") if isinstance(direct_power, dict) else None,
+            "direct_power_w": round(direct_power_w, 1) if direct_power_ok else None,
+            "direct_power_source": direct_power.get("source") if direct_power_ok else None,
             "external_power_w": round(external_power_w, 1) if external_power_w >= 0.0 else None,
             "external_power_source": external_power.get("source") if isinstance(external_power, dict) else None,
             "external_power_error": external_power.get("error") if isinstance(external_power, dict) else None,
             "compressor_percent": compressor_percent if compressor_percent_f >= 0.0 else None,
             "compressor_hz": compressor_hz if compressor_hz_f >= 0.0 else None,
-            "compressor_running": bool(compressor_on),
+            "compressor_running": bool(compressor_on) if compressor_valid else None,
             "heating_active": bool(heating_active),
             "dhw_active": bool(dhw_active),
             "cooling_active": bool(cooling_active),

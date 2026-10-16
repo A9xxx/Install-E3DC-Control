@@ -54,6 +54,7 @@ Abschnitt „Ladeprofil“).
 Bei **Octopus Heat** und einem konfigurierten **Spezialtarif** sind die täglich
 wiederkehrenden Abrechnungspreise über den vollständigen Planungshorizont
 bekannt. Fehlende morgige Börsenpreise verkürzen diese Tarifachse nicht.
+Ohne Börsendaten veröffentlicht der Marktdienst auch beim Spezialtarif die lokale Tarifachse. Ein ungültiger Tagesplan oder ungültige Tarifstufen verhindern diese lokale Veröffentlichung, und Preis-Netzladen erhält keine Freigabe.
 Börsenpreise für Direktvermarktung bleiben davon getrennt; aus einem
 konfigurierten Kundentarif wird kein Börsenpreis abgeleitet.
 
@@ -106,6 +107,31 @@ Speicherregelung geben kein manuelles Netzladen frei.
 Ziel-SoC und Ablaufzeit beenden den manuellen Auftrag. Ein gespeicherter
 Ladeauftrag beziehungsweise eine angeforderte Leistung bestätigt noch keine
 physische Batterieladung; dafür ist die gemessene Batterieleistung maßgeblich.
+
+## Experimentelle zentrale PV-Aufteilung
+
+`storage_central_pv_split_enable` ist standardmäßig aus. Bei eingeschalteter
+Aufteilung gilt für laufende oder startende geregelte Wallboxen auf dem
+Kurvenpfad: Akkuanteil nach `iFc`, absoluter Wallboxrahmen aus PV minus Haus
+ohne diese Wallbox minus Akkuanteil. Dieselbe Zahl steht im flüchtigen
+AUTO-Limit und im Budgetabzug. Die Messpunkte werden je Wallboxtyp gebunden;
+Wärmepumpe und Heizstab zählen genau einmal. Ohne frische eigene
+Wallboxmessung bleibt der Rahmen `null` mit Grund `wallbox_measurement_missing`.
+Die Wallboxregelung behält ihre Frischeverträge.
+
+Ein bestätigter Rahmen wird bei fehlendem AUTO-Readback höchstens 60 s
+gehalten und im selben Zyklus auf einen kleineren Kandidaten gesenkt.
+Danach gilt höchstens der batterieneutrale PV-Rest ohne Stützung. Das
+Akku-Totband und die 30-s-Schreibbremse beruhigen den AUTO-Laderahmen;
+der Wallboxrahmen steigt gerampt und fällt sofort. Die Anzeige und der
+Unterschlüssel `central_pv_split` nennen Akkuanteil, Rahmen, Bestätigung,
+Alter, Mindestleistung, Grund und Zeitstempel. Der Rahmen darf unter das
+Wallboxminimum fallen; die derzeitige Wallboxregelung kann dann weiter
+Mindeststrom halten. Eine reine Kurvenunterdeckung stoppt die Box noch nicht.
+
+Grundladung, Preis-/Slot-/Boost-/Netzfenster, `Akku bis Abfahrt`, Pre-Dump,
+Haltezone und offenes Tor oberhalb der Haltezone bleiben unverändert.
+Details und kurze Testanleitung stehen in der Konfigurationsdokumentation.
 
 ## Beobachtete Wallbox und Speichergrenzen
 
@@ -168,7 +194,7 @@ nicht wieder aufgenommen. Technisch wird der Schalter als
 bindet die Übernahme mit `storage_regulation_changed_ts` an die aktuelle
 Bedienaktion. Ein Dienststopp allein ersetzt diese geordnete Abschaltung nicht.
 
-> **Stand:** v5.5.4
+> **Stand:** v5.5.5
 >
 > **Dateien:** `Installer/storage_simulator.py`,
 > `Installer/storage_manager.py`, `Installer/storage_parallel_regulator.py`
@@ -584,7 +610,8 @@ In `PV + Akku bis Untergrenze` und in `Sofort bis Preislimit` ohne Preis- oder
 Netzfenster gilt direkt über `wbminsoc` die Haltezone
 (`doc/V4_Konfiguration_und_Regelung.md`, Akkustützung, Punkt 5), nicht in
 `Akku bis Abfahrt`:
-Das Restbudget ist dort PV minus alle laufenden Verbraucher ohne Abzug des
+Die experimentelle zentrale PV-Aufteilung nimmt diese Haltezone aus.
+Das Restbudget ist dort weiterhin PV minus alle laufenden Verbraucher ohne Abzug des
 Kurvenbedarfs, der Stütz- und Startrahmen aus dem Akku entfällt, und die
 laufende Wallbox wird höchstens mit ihrem batterieneutralen PV-Rahmen
 gehalten; kurze Schwankungen überbrückt das Wolken-Kontingent. Den
@@ -672,8 +699,11 @@ ausdrückliche Batterie-Freigabe finanziert ist.
 
 ### Pre-Dump, Direktvermarktung und Zusatzwechselrichter
 
-Im Sonnenmodus bleibt der batterieneutrale PV-Überschuss ein unantastbarer
-Wallbox-Mindestrahmen. Das Storage-Budget autorisiert ausschließlich darüber
+Im bisherigen Sonnenmodus bleibt der batterieneutrale PV-Überschuss ein
+Wallbox-Mindestrahmen. Bei aktiver experimenteller zentraler PV-Aufteilung
+auf dem Kurvenpfad begrenzt dagegen deren absoluter Rahmen auch den
+Stromdeckel der E3DC-Wallbox; Mindeststrom und Geräteverzögerungen bleiben
+wirksam. Pre-Dump ist von dieser Aufteilung ausgenommen. Das Storage-Budget autorisiert ausschließlich darüber
 hinausgehende Leistung; Pre-Dump liefert diese Batterieentladung als
 typisierten, frischen `predump_discharge_add_contract_v1`, damit PV-Anteil und
 Entladezusatz nicht doppelt gezählt werden. Die Verbraucherpriorität weist einen
@@ -813,3 +843,68 @@ Bei Auffälligkeiten zuerst diese Reihenfolge prüfen:
    künftiger beziehungsweise diagnostischer Kandidat?
 8. Ist die Lastspitzen-Viertelstunde lückenlos belegt und liegt der Puffer
    oberhalb der Notstromreserve?
+
+### Trainingsbasis der Verbrauchsprognose
+
+Das Verbrauchsmodell lernt aus den vollständigen Minutenhistorien der letzten
+30 Tage und ergänzt sie um den laufenden Tag aus der RAM-Disk. Das entspricht
+der Aufbewahrung der Tagesdateien und enthält bei vollständiger Historie jeden
+Wochentag mindestens viermal. Unvollständige Tage, größere Messlücken, grobe
+Leistungsausreißer und Abschnitte mit unbekanntem Wallboxanteil werden verworfen.
+Gemessene Leistungen werden genau einmal integriert. Fehlt das bereinigte
+Hausfeld, wird das Intervall als `home_missing` verworfen. Der Hausrohwert
+ersetzt es nicht. Zeitplätze folgen dem tatsächlichen Zeitpunkt; beide Stunden
+der Winterzeitumstellung bleiben getrennt, das Stundenmerkmal bleibt lokal.
+
+Als Temperaturmerkmal dienen gemessene Außentemperaturen aus der Historie oder
+dem Wärmepumpenarchiv sowie tatsächlich vorhandene Temperaturmessungen der
+Klima-Historie. Liegen für weniger als 80 % der gültigen Intervalle Messungen vor,
+fehlt ein gelernter Wochentag in diesen Messungen oder ist die Temperatur ohne
+Variation, lernt das gesamte Modell ohne Temperaturmerkmal. Fehlende Werte
+werden nicht durch eine konstante Temperatur ersetzt. Künftige Wetterwerte
+werden ausschließlich für die Vorhersage verwendet. Das wöchentliche Training
+bleibt sonntags um 03:00 Uhr. Ein vorhandenes älteres Modell ohne diese
+Trainingsdiagnose wird bei der nächsten Prognose neu trainiert; bei noch
+unvollständigen Wochentagen wird nach erfolgreichem Training frühestens am
+nächsten Kalendertag erneut trainiert. Ein fehlgeschlagenes Neutraining wird als
+ausstehend diagnostiziert. Nach einem fehlgeschlagenen oder abgebrochenen Versuch
+aus der Prognose ist ein neuer Versuch frühestens nach sechs Stunden möglich.
+Gleichzeitige Prognoseprozesse prüfen die Identität des veröffentlichten Modells
+und reservieren den Versuch unter derselben Dateisperre. Der Versuchszustand liegt
+flüchtig unter `/var/www/html/ramdisk/ml_training_attempt.json` und gehört nicht zum
+Modellstore oder Backup. Nach einem Neustart fehlt die Datei; ein neuer Versuch ist
+dann erlaubt. Beschädigte Inhalte sperren nicht. Spezialdateien bleiben unverändert
+und werden als `attempt_state_unusable` diagnostiziert. Ein erfolgreiches Training
+löscht den regulären Versuchszustand erst nach sicherer Veröffentlichung;
+ein ausdrücklich gestartetes Training bleibt jederzeit möglich.
+
+Bei Temperaturmodellen verwendet jeder Vorhersageplatz zuerst die vorhandene
+Wetterprognose, bei Lücken das beim Training gemessene Mittel derselben lokalen
+Stunde. Fehlt ein Stundenmittel, gilt das gemessene Gesamtmittel des Trainings.
+Quelle und Anzahl dieser Messwerte sind im hashgeschützten Modell gespeichert.
+`forecast_temp_source` weist die verwendete Quelle je Platz aus.
+`temperature_diagnostics` zählt die Quellen und nennt einen Rückfallgrund.
+Betroffene Haus-, Wärmepumpen- und Klimaprognosen tragen dann das
+Qualitätskennzeichen `model_temperature_fallback`; die Modellquelle bleibt
+`verified_ml_model`. Ein unvollständiges älteres Temperaturmodell wird erneuert;
+bis dahin ist nur ein vorhandenes gemessenes Gesamtmittel oder der ausgewiesene
+Historienrückfall zulässig.
+
+Die Plausibilitätsprüfung begrenzt grobe Ausreißer der Haus-Modellausgabe vor
+der Bias-Korrektur. Der Bias bewertet weiterhin die tatsächlich ausgegebene
+Prognose anhand des Bewertungslogs. Die Wärmepumpen-Plausibilitätsprüfung bleibt
+unverändert. Die Grenze `ml_home_daily_cap_kwh` (Standard 24 kWh) beschreibt
+die Obergrenze der Referenzbasis, keine Grenze der ausgegebenen Prognose und
+keine Leistungs- oder Schutzgrenze des Speichers. Der Validator berät bei Werten
+unter 8 oder über 80 kWh, ohne sie zu sperren.
+
+Im Config-Editor stellt „Bisheriges ML-Training verwenden“
+(`ml_training_legacy_source=1`, Standard aus) Trainingsquelle, Temperaturbehandlung
+und Reihenfolge der Haus-Korrekturen auf das bisherige Verhalten zurück. Ein
+Wechsel trainiert das Modell bei der nächsten Prognose neu.
+`ml_prediction.json` und `ml_consumption_eval.json` enthalten unter
+`training_diagnostics` das Fenster, die Wochentage (0 = Montag bis 6 = Sonntag)
+sowie Quelle und Abdeckung der Temperatur. Unter `corrections` sind Bias,
+Hausdeckel und Reihenfolge getrennt sichtbar. Der Diagnose-Export „Prognose“
+enthält beide Dateien. Notstromreserve, Hausanschluss und Gerätefreigaben
+werden durch diese Prognoseeinstellungen nicht verändert.

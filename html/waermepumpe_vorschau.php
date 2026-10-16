@@ -375,7 +375,8 @@ function wpv_build_state(array $conf, array $in): array
         } elseif ($wpType === 0 && ($json['wp_compressor_observation_valid'] ?? null) === true && is_bool($json['wp_compressor_running'] ?? null)) {
             $running = $json['wp_compressor_running'];
             $runningWhy = 'Verdichterbeobachtung des Energy Managers';
-        } elseif (array_key_exists('Verdichter_Ein', $d) || array_key_exists('Verdichter', $d)) {
+        } elseif (($wpType !== 4 || ($json['quality']['compressor']['valid'] ?? null) === true)
+            && (isset($d['Verdichter_Ein']) || isset($d['Verdichter']))) {
             $running = !empty($d['Verdichter_Ein']) || !empty($d['Verdichter']);
             $runningWhy = 'Verdichtermeldung der Wärmepumpe';
         }
@@ -438,10 +439,11 @@ function wpv_build_state(array $conf, array $in): array
         if ($elecW !== null && $wpType !== 4 && empty($d['Verdichter_Ein']) && empty($d['Verdichter'])) $elecW = 0.0;
     } elseif ($success && $wpType === 6) {
         $elecW = wpv_num($d['WP_Power'] ?? null);
-    } elseif ($success) {
+    } elseif ($success && $wpType !== 4) {
         $elecW = is_numeric($in['history_wp_w'] ?? null) ? (float)$in['history_wp_w'] : null;
         $elecWhy = 'Kein WP-Wert im Live-Verlauf';
     }
+    if ($wpType === 4 && ($json['quality']['power']['valid'] ?? null) !== true) $elecW = null;
     if ($success && $wpType === 4 && ($heizKw === null || $heizKw <= 0) && $elecW !== null && $elecW > 0 && $running === true) {
         $powerSource = strtolower((string)($d['stiebel_power_source'] ?? ''));
         $copEstimate = max(0.0, (float)($conf['stiebel_isg_cop_estimate'] ?? 3.0));
@@ -730,6 +732,7 @@ function wpv_build_state(array $conf, array $in): array
             'hz_soll' => $val($hzSoll, $why($hzWhy)),
         ],
         'heiz_estimated' => $heizEstimated,
+        'elec_estimated' => ($wpType === 4) && ($json['quality']['power']['estimated'] ?? false) === true,
         'taz_label' => $tazLabel,
         'taz_note' => $tazNote,
         'ww_window' => $wwWindow,
@@ -859,7 +862,7 @@ function wpv_render(array $s): string
         $srcSub = ' ';
     }
     $heizText = ($s['heiz_estimated'] && $v['heiz_kw']['v'] !== null ? 'ca. ' : '') . $f1($v['heiz_kw'], ' kW');
-    $wpSub = ($v['elec_kw']['v'] === null ? '--' : wpv_fmt($v['elec_kw']['v'], 2)) . ' kW el. · COP ' . ($v['cop']['v'] === null ? '--' : wpv_fmt($v['cop']['v'], 1));
+    $wpSub = ($v['elec_kw']['v'] === null ? '--' : ((!empty($s['elec_estimated']) ? 'ca. ' : '') . wpv_fmt($v['elec_kw']['v'], 2))) . ' kW el. · COP ' . ($v['cop']['v'] === null ? '--' : wpv_fmt($v['cop']['v'], 1));
     $vlText = $f1($v['vl']) . ' / ' . $f1($v['rl']) . (($v['vl']['v'] ?? $v['rl']['v']) === null ? '' : ' °C');
     $vlSub = ($s['wp_type'] === 1)
         ? 'Vorlauf-Soll ' . $f1($v['vl_soll'], ' °C')
@@ -1332,7 +1335,7 @@ function wpv_render(array $s): string
         <?= wpv_tile('Pufferspeicher', wpv_span($buffer, 1, ' °C'), '<div class="s">' . wpv_h($buffer['label']) . '</div>', ' id="wpvBufTile"') ?>
         <?php endif; ?>
         <?= wpv_tile('Heizleistung' . ($s['heiz_estimated'] ? ' (geschätzt)' : ''), wpv_span($v['heiz_kw'], 1, ' kW')) ?>
-        <?= wpv_tile('Verbrauch', wpv_span($v['elec_kw'], 2, ' kW', 't-ww')) ?>
+        <?= wpv_tile('Verbrauch' . (!empty($s['elec_estimated']) ? ' (geschätzt)' : ''), wpv_span($v['elec_kw'], 2, ' kW', 't-ww')) ?>
         <?= wpv_tile('COP (jetzt)', wpv_span($v['cop'], 2, '', $s['cop_class'])) ?>
         <?= wpv_tile(wpv_h($s['taz_label']) . ' / JAZ', wpv_span($v['taz'], 2, '', $s['taz_class']) . ' <span class="s">/ ' . wpv_span($v['jaz'], 2, '', $s['jaz_class']) . '</span>', $s['taz_note'] !== '' ? '<div class="s">' . wpv_h($s['taz_note']) . '</div>' : '') ?>
       </div>
@@ -1610,6 +1613,15 @@ if (!defined('WPV_LIBRARY_ONLY')) {
     requireWebAuth(false);
     $wpvConfResult = loadE3dcConfig();
     $wpvConf = (empty($wpvConfResult['error']) && is_array($wpvConfResult['config'] ?? null)) ? $wpvConfResult['config'] : [];
+    if (getHeatpumpTypeConfig($wpvConf) === 7) {
+        if (!in_array($_SERVER['REQUEST_METHOD'] ?? 'GET', ['GET', 'HEAD'], true)) {
+            http_response_code(403);
+            echo 'MQTT-Wärmepumpe: nur Anzeige.';
+            return;
+        }
+        echo e3dcRenderMqttHeatpump(e3dcMqttHeatpumpFields($wpvConf));
+        return;
+    }
     $wpvAllowed = wpv_page_allowed($wpvConf);
     if (!$wpvAllowed['ok']) {
         echo '<div class="alert alert-info">' . wpv_h($wpvAllowed['why'])

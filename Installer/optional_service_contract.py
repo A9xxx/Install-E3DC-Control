@@ -78,6 +78,7 @@ def optional_service_configured(service: str, config: Mapping[str, object]) -> b
             )
         )
     if name == "e3dc-climate-live":
+        # climate_meter2_ip ist optional; Zähler 1 aktiviert weiterhin den Dienst.
         return _enabled(config, "climate_enable") and _has_address(config, "climate_meter_ip")
     if name == "e3dc-climate-control":
         return _enabled(config, "climate_control_enable")
@@ -96,6 +97,7 @@ def optional_service_configured(service: str, config: Mapping[str, object]) -> b
             (_has_address(config, "mqtt_hub_ip") and mqtt_ip not in LOCAL_MQTT_ADDRESSES)
             or _nonempty(config, "mqtt_hub_sub_soc_topic")
             or _nonempty(config, "mqtt_hub_sub_soc_topic_2")
+            or _nonempty(config, "wp_power_topic")
             or _nonempty(config, "wb_topic")
             or _nonempty(config, "wb2_topic")
         )
@@ -116,6 +118,7 @@ def preinstalled_optional_service_expected(
             _has_address(config, "mqtt_hub_ip")
             or _nonempty(config, "mqtt_hub_sub_soc_topic")
             or _nonempty(config, "mqtt_hub_sub_soc_topic_2")
+            or _nonempty(config, "wp_power_topic")
             or _nonempty(config, "wb_topic")
             or _nonempty(config, "wb2_topic")
         )

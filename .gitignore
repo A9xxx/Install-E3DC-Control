@@ -51,6 +51,8 @@
 !/Installer/apache/e3dc-control-security.conf
 !/Installer/apache_security.py
 !/Installer/Forecast/pv_forecast_evidence.py
+!/Installer/Forecast/pv_entity_archive.py
+!/Installer/Forecast/pv_forecast_method.py
 !/Installer/Forecast/pv_forecast_diagnostic_details.py
 !/Installer/Forecast/pv_forecast_service.py
 !/Installer/Heat/__init__.py
@@ -64,6 +66,7 @@
 !/Installer/Heat/plan_forecast.py
 !/html/heat_tariff_diagnostics.php
 !/Installer/Storage/__init__.py
+!/Installer/Storage/backup_hold.py
 !/Installer/Storage/charge_curve.py
 !/Installer/Storage/common.py
 !/Installer/Storage/power_limits.py
@@ -94,6 +97,7 @@
 !/Installer/Wallbox/openwb_pro_session.py
 !/Installer/Wallbox/openwb_pro_control_lease.py
 !/Installer/Wallbox/openwb_session.py
+!/Installer/Wallbox/openwb_transport.py
 !/Installer/Wallbox/output_ledger.py
 !/Installer/Wallbox/phase_balancing.py
 !/Installer/Wallbox/phase_sequencer.py
@@ -380,6 +384,7 @@
 !/html/get_chart_data.php
 !/html/get_cost_history.php
 !/html/get_forecast_data.php
+!/html/pv_entity_projection.php
 !/html/get_live_json.php
 !/html/get_shadow_snapshot.php
 !/html/help.php

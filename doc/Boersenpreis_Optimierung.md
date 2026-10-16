@@ -144,8 +144,21 @@ auf, steigt der Wert sofort, sonst bleibt er. Hausanschluss- und Ladegrenzen
 gelten dabei unverändert. Es zählt nur die Fehlmenge, deren späterer Bezugspreis
 mindestens die effektiven Ladekosten erreicht (mittlerer Preis des Fensters
 durch Wirkungsgrad plus Akkukosten plus Sicherheitskorrektur); als günstiges
-Folgefenster gelten Slots, deren Preis höchstens um die Mindestmarge über dem
-mittleren Preis des laufenden Fensters liegt. Dieser mittlere Preis wird beim
+Folgefenster gelten nur vom Ladeprofil erkannte, ausführbare Ladefenster, deren
+Preis höchstens um die Mindestmarge über dem mittleren Preis des laufenden
+Fensters liegt. Eine Gutschrift setzt vollständige Prognosen und Preise,
+Ladefreigabe, verfügbare Leistung, freien Speicherraum und ausreichende Restzeit
+einschließlich Sicherheitszeit voraus. Der spätere Auftrag muss seinen Bedarf
+unabhängig von seiner eigenen Gutschrift belegen und das Startminimum an
+Netzenergie erreichen. Ein positiver Rest unter dem Minimum bleibt als kleiner
+Auftrag sichtbar und bedeutet keine vollständige Bedarfsdeckung. Für das
+Ladeziel wird zusätzlich der notwendige Bestand ohne anfänglichen Vorrat
+berechnet. Diese Vergleichsrechnung und die aus dem tatsächlichen Vorrat
+geplante spätere Netzladung werden getrennt ausgewiesen; ein bereits höherer
+Ladezustand verschiebt dadurch nicht das Ziel. Ein frisch nachgewiesener,
+laufender Auftrag darf im selben Fenster auch unter dem Startminimum bis zum
+Ziel weiterlaufen, spätestens bis zum Fensterende. Die Sicherheitszeit wird
+für neue Starts und für die Zukunftsgutschrift abgezogen. Dieser mittlere Preis wird beim
 ersten Plan im Fenster über alle zusammenhängenden Fensterslots gebildet und
 bis zum Fensterende beibehalten; er wandert bei Börsentarifen nicht mit den
 ablaufenden Slots, sodass Ladeziel und Netzladejob im Fenster stabil bleiben.
@@ -180,6 +193,55 @@ betroffenen Feld; die Eingaben bleiben erhalten. Im Komfortprofil beendet
 jeder Preiswechsel das bisherige Tarifsegment, auch wenn die nächste Stufe
 noch unter dem Preislimit liegt. Dort wird ein eigener Ladejob mit neuem
 Fensterende und eigenem Referenzpreis berechnet; das Komfortziel bleibt gleich.
+
+Ohne belegte physische Ladeleistung entsteht kein Netzladeauftrag. Die
+Marktobergrenze begrenzt eine frische Geräte-, BMS- oder eingestellte Nutzergrenze
+nur nach oben. Die Mindestmarge wird am gewichteten Nutzen der tatsächlich
+versorgten Defizitslots geprüft; ein einzelner Spitzenpreis reicht nicht.
+Ein reiner Zielpuffer ohne belegten Mengennutzen eröffnet keinen neuen Auftrag.
+Frisch nachgewiesene laufende Aufträge behalten ihren Fortsetzungsvertrag.
+Schließt die Mengenprüfung einen Rest nach bereits erfolgter Netzladung, bleibt
+der Speicher im selben Fenster gehalten; daraus entsteht kein neuer Start.
+
+### Kosten und Mindestmenge der Speicher-Netzladung
+
+Im Config-Editor unter **Tarif & Strompreise → Details zur Speicher-Netzladung**
+sind folgende profilunabhängige Werte einstellbar. Die Mindestmenge beträgt
+standardmäßig 5 % der nutzbaren Kapazität ohne festen Sockel: bei 11,7 kWh
+585 Wh, bei 35 kWh 1 750 Wh. Gespeicherte eigene Werte bleiben erhalten:
+
+| Parameter | Schlüssel | Standard ohne Bestandswert | Sinnvoller Bereich |
+|---|---|---|---|
+| Akkuverschleiß | `market_degradation_ct_per_kwh` | 4 ct/kWh | mindestens 0 |
+| Speicher-Wirkungsgrad (Laden und Entladen zusammen) | `market_roundtrip_efficiency_pct` | 85 % | 1 bis 100 % |
+| Mindestmenge je Netzladeauftrag | `market_grid_charge_min_job_wh` | 0 Wh | mindestens 0 |
+| Kapazitätsanteil der Mindestmenge | `market_grid_charge_min_job_pct` | 5 % | 0 bis 100 % |
+
+Fehlende oder leere Werte für Verschleiß und Wirkungsgrad verwenden weiterhin
+`direct_marketing_degradation_ct_per_kwh` beziehungsweise
+`direct_marketing_roundtrip_efficiency_pct`, sofern dort ein Wert gesetzt ist,
+sonst den Standard. Ausdrückliche Werte einschließlich 0 bleiben erhalten;
+0 % Wirkungsgrad wird in der Planung auf 1 % begrenzt. Leere Eingabefelder
+zeigen den wirksamen Wert und seine Herkunft. Bloßes Öffnen oder Speichern
+anderer Felder trägt keine abweichenden Standards ein. Bereinigung und Import
+erhalten die vier Parameter. Unplausible Werte erzeugen beratende Warnungen,
+keine Speichersperre; die Planung begrenzt Werte außerhalb ihres Bereichs.
+
+**Mindestmenge = max(Wh-Wert, Kapazität × Prozent/100).** Kleinere Ladeaufträge
+werden nicht ausgeführt. Es gilt die **aus dem Netz bezogene Energie je Auftrag**,
+nicht die nach Wandlungsverlusten gespeicherte Menge. Bei 40 kWh Kapazität und
+5 % beträgt das Minimum 2 000 Wh, auch bei einer Wh-Mindestmenge von 0.
+Nur wenn beide Mindestwerte 0 sind, ist das Minimum aufgehoben. Die Schwelle
+vermeidet kleine Ladeaufträge; ihre Einstellung löst selbst keine Ladung aus.
+
+Die Ladekosten je später nutzbarer Kilowattstunde berücksichtigen den
+Bezugspreis geteilt durch den Wirkungsgrad, zuzüglich Akkuverschleiß und
+Sicherheitskorrektur. Die Mindestmarge kommt anschließend hinzu. Diese
+Parameter ändern keine Freigaben oder Schutzgrenzen. Alle vier bleiben bei
+jedem Profilwechsel unverändert; die bestehende Profilwirkung auf Marge,
+Sicherheit, Mindestpreisabstand, Autarkie und Komfort bleibt erhalten.
+Speichern ändert nur die Konfiguration. Die Parameter starten oder installieren
+keinen Dienst; Einrichtung erfolgt über die Installationszentrale.
 
 ### Ladeprofil
 
@@ -272,3 +334,16 @@ Wenn ein System bei günstigem Preis nicht lädt, zuerst prüfen:
 3. Ist das Speicherziel bereits erreicht?
 4. Blockiert Pre-Dump, Notreserve, Abregelschutz oder ein manueller Zustand?
 5. Wird der aktuelle Nutzerpreis oder nur der Rohmarktpreis betrachtet?
+
+### Ende eines laufenden Markthalts
+
+Ein vollständig geprüfter Folgeplan kann die Entladesperre bewusst beenden; der
+Akku darf dann wieder das Haus versorgen. Ist der Plan vorübergehend nicht lesbar
+oder unvollständig, bleibt ausschließlich ein bereits gültiger Vollslot-Markthalt
+bis zum fest erwarteten nächsten Plan plus 20 Sekunden Übergangsfrist bestehen,
+höchstens 15 Minuten ab dem ersten ungeklärten Übergang. Wiederholte Fehler
+verlängern diese Frist nicht. Danach wird die Entladung mit einem benannten
+Ablaufgrund freigegeben. Anteilige Halteenden, Nutzer-Aus, Notstromreserve und
+andere vorrangige Regelungen wirken sofort. Ein Neustart nimmt eine alte
+Fehlerbrücke nicht wieder auf. Planqualität und tatsächlich aktive Steuerung
+werden getrennt angezeigt.

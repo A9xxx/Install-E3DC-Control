@@ -19,6 +19,12 @@ import time
 from datetime import datetime
 
 from .config import RAMDISK_DIR, logger
+try:
+    from data_models import parse_mqtt_vehicle_allowlist, mqtt_vehicle_record_allowed
+except ImportError:
+    from Installer.data_models import parse_mqtt_vehicle_allowlist, mqtt_vehicle_record_allowed
+
+
 
 SAVED_CARS_FILE = "/var/www/html/data/saved_cars.json"
 TMP_DIR = "/var/www/html/tmp"
@@ -78,6 +84,8 @@ SESSION_CORRECTION_SOC_RISE_TOLERANCE_PP = 3.0
 SESSION_CORRECTION_MIN_CAPACITY_SHARE = 0.8
 SESSION_SOC_CONTRADICTION_REASON = "cloud_soc_contradicts_session"
 TRACKER_CHECKPOINT_SEMANTIC_KEYS = (
+    "mqtt_vehicle_origin",
+    "mqtt_vehicle_id",
     "vehicle_key",
     "car_id",
     "vehicle_id",
@@ -468,6 +476,7 @@ def _vehicle_soc_rule_sample(vehicle, config=None, now=None):
     """Akzeptiert nur explizite Fahrzeugquelle, Quellzeit und Freigabe."""
     if (
         not isinstance(vehicle, dict)
+        or not mqtt_vehicle_record_allowed(vehicle, config)
         or vehicle.get("soc_rule_confirmed") is not True
         or _soc_record_vetoed(vehicle)
     ):
@@ -606,6 +615,8 @@ def _tracker_anchor_state_valid(
     """
 
     if not isinstance(state, dict):
+        return False
+    if not mqtt_vehicle_record_allowed(state, config):
         return False
     raw_soc = state.get("anchor_soc")
     if isinstance(raw_soc, bool):
@@ -2252,7 +2263,8 @@ class VehicleSocTracker:
         source = str(data.get("source") or "").strip()
         source_text = source.lower()
         if (
-            not source_text
+            not mqtt_vehicle_record_allowed(data, config)
+            or not source_text
             or source_text.startswith(ESTIMATED_PREFIX)
             or source_text in OPENWB_PRO_SOURCES
             or any(token in source_text for token in UNTRUSTED_SOC_SOURCE_TOKENS)
@@ -2317,6 +2329,8 @@ class VehicleSocTracker:
         )
         bound_profile = profile_binding["profile"] if profile_binding else {}
         return {
+            "mqtt_vehicle_origin": data.get("mqtt_vehicle_origin"),
+            "mqtt_vehicle_id": data.get("mqtt_vehicle_id") or data.get("car_id"),
             "soc": _clamp_percent(soc),
             "ts": sample_ts,
             "source": source,
@@ -2367,6 +2381,8 @@ class VehicleSocTracker:
                     self._anchor_detail[int(wb_id)] = CLOUD_SAMPLE_TIME_UNKNOWN_REASON
                 return None
             return {
+                "mqtt_vehicle_origin": vehicle.get("mqtt_vehicle_origin"),
+                "mqtt_vehicle_id": vehicle.get("mqtt_vehicle_id") or vehicle.get("id"),
                 "soc": sample["soc"],
                 "ts": sample["source_ts"],
                 "source": sample["source"],
@@ -2403,6 +2419,9 @@ class VehicleSocTracker:
                 else (status or {}).get("car_soc_raw_ts")
             )
             status_sample_record = {
+                "id": (status or {}).get("car_id") or selected_id,
+                "mqtt_vehicle_origin": (status or {}).get("mqtt_vehicle_origin"),
+                "mqtt_vehicle_id": (status or {}).get("mqtt_vehicle_id"),
                 "soc": status_soc,
                 "soc_source": source,
                 "soc_source_ts": source_ts,
@@ -2428,6 +2447,8 @@ class VehicleSocTracker:
                 and _status_connected(status)
                 and status_sample is not None):
                 return {
+                    "mqtt_vehicle_origin": (status or {}).get("mqtt_vehicle_origin"),
+                    "mqtt_vehicle_id": (status or {}).get("mqtt_vehicle_id") or (status or {}).get("car_id"),
                     "soc": status_sample["soc"],
                     "ts": status_sample["source_ts"],
                     "source": status_sample["source"],
@@ -2674,6 +2695,8 @@ class VehicleSocTracker:
                 "anchor_soc": _clamp_percent(sample.get("soc")),
                 "anchor_sample_ts": _timestamp(sample.get("ts"), 0.0),
                 "anchor_source": str(sample.get("source") or ""),
+                "mqtt_vehicle_origin": sample.get("mqtt_vehicle_origin"),
+                "mqtt_vehicle_id": sample.get("mqtt_vehicle_id") or sample.get("car_id"),
                 "anchor_meter_wh": anchor_meter_wh,
                 "anchor_meter_basis": anchor_meter_basis,
                 "last_meter_wh": meter_wh,
@@ -2849,6 +2872,8 @@ class VehicleSocTracker:
         if age_contract is None:
             return None
         result = {
+            "mqtt_vehicle_origin": state.get("mqtt_vehicle_origin"),
+            "mqtt_vehicle_id": state.get("mqtt_vehicle_id") or state.get("car_id"),
             "soc": round(estimated_soc, 1),
             "source": source,
             "soc_rule_confirmed": (

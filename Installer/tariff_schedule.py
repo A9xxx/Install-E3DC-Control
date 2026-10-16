@@ -26,6 +26,9 @@ RECURRING_TARIFF_TYPES = frozenset({
     "spezial",
     "special_tariff",
 })
+CONFIGURED_SCHEDULE_TARIFF_TYPES = frozenset({
+    "octopus_heat", "special", "spezial", "special_tariff",
+})
 SPOT_MARKET_TARIFF_TYPES = frozenset({
     "awattar",
     "dynamic",
@@ -64,6 +67,11 @@ def tariff_type(config):
 def uses_recurring_tariff_axis(config):
     """True, wenn die vollständige Tagespreisachse lokal definiert ist."""
     return tariff_type(config) in RECURRING_TARIFF_TYPES
+
+
+def uses_configured_schedule_tariff(config):
+    """True für Tarife mit lokal konfigurierten täglichen Preisstufen."""
+    return tariff_type(config) in CONFIGURED_SCHEDULE_TARIFF_TYPES
 
 
 def supports_spot_market_prices(config):
@@ -111,7 +119,7 @@ def recurring_tariff_stages(config):
     """
     config = config or {}
     tariff = tariff_type(config)
-    if tariff not in {"octopus_heat", "special", "spezial", "special_tariff"}:
+    if tariff not in CONFIGURED_SCHEDULE_TARIFF_TYPES:
         return None
     def invalid(reason):
         return {"valid": False, "reason": reason, "stages": None, "revision": None}

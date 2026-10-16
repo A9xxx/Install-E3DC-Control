@@ -301,7 +301,8 @@ function installCenterModuleConfigFields($moduleKey) {
         ['value' => '3', 'label' => 'Shelly Pro3EM ohne native WP'],
         ['value' => '4', 'label' => 'Stiebel Eltron ISG / WPM'],
         ['value' => '5', 'label' => 'Dimplex WPM Touch / NWPM'],
-        ['value' => '6', 'label' => 'E3DC Leistungsmesser (PM)']
+        ['value' => '6', 'label' => 'E3DC Leistungsmesser (PM)'],
+        ['value' => '7', 'label' => 'MQTT-Wärmepumpe (nur Anzeige)']
     ];
     $relayOptions = [
         ['value' => '-1', 'label' => '-1 = nur messen'],
@@ -462,6 +463,23 @@ function installCenterModuleConfigFields($moduleKey) {
                 ['value' => 'channel1', 'label' => 'Kanal 1 (Shelly EM Gen1)'],
                 ['value' => 'total', 'label' => 'Summe'],
             ]),
+            installCenterConfigField('climate_meter2_name', 'Name Anlage 2', 'text', [], '', false, 'Klimaanlage'),
+            installCenterConfigField('climate_meter2_ip', 'Zweiter Shelly-Zähler IP', 'text', [], '', false, '0.0.0.0'),
+            installCenterConfigField('climate_meter2_type', 'Zählertyp', 'select', [
+                ['value' => 'shelly_pro3em', 'label' => 'Shelly Pro3EM / 3EM Gen2'],
+                ['value' => 'shelly_em_gen1', 'label' => 'Shelly EM Gen1 (2 Kanäle)'],
+                ['value' => 'shelly_em_mini_gen4', 'label' => 'Shelly EM Mini Gen4'],
+                ['value' => 'shelly_pm_mini', 'label' => 'Shelly PM Mini'],
+                ['value' => 'auto', 'label' => 'Auto-Erkennung'],
+            ]),
+            installCenterConfigField('climate_meter2_phase', 'Phase / Kanal', 'select', [
+                ['value' => 'a', 'label' => 'A / L1'],
+                ['value' => 'b', 'label' => 'B / L2'],
+                ['value' => 'c', 'label' => 'C / L3'],
+                ['value' => 'channel0', 'label' => 'Kanal 0 (Shelly EM Gen1)'],
+                ['value' => 'channel1', 'label' => 'Kanal 1 (Shelly EM Gen1)'],
+                ['value' => 'total', 'label' => 'Summe'],
+            ]),
             installCenterConfigField('climate_min_power_w', 'Aktiv ab W', 'number', [], '', false, '50'),
             installCenterConfigField('climate_poll_s', 'Leseintervall (s)', 'number', [], '', false, '15'),
             installCenterConfigField('climate_history_enable', 'History speichern', 'select', $bool),
@@ -550,6 +568,8 @@ function installCenterModuleConfigFields($moduleKey) {
             installCenterConfigField('mqtt_hub_ip', 'MQTT Broker IP', 'text', [], '', false, '127.0.0.1'),
             installCenterConfigField('mqtt_hub_port', 'MQTT Port', 'number', [], '', false, '1883'),
             installCenterConfigField('mqtt_hub_topic', 'Basis-Topic', 'text', [], '', false, 'e3dc'),
+            installCenterConfigField('mqtt_vehicle_allowlist', 'MQTT-Fahrzeug-Freigabeliste', 'text', [], 'Kommagetrennte exakte NAME-Segmente unter Basis/vehicle/NAME/ATTRIBUT; Groß-/Kleinschreibung bleibt erhalten, keine Wildcards. Leer = offen. Syntaxfehler sperren nur diesen Eingang. Sofort nach dem Speichern wirksam, auch für alte MQTT-Werte und retained Nachrichten. Dedizierte SoC-Topics, Bluelink und native openWB-Daten bleiben unverändert.'),
+            installCenterConfigField('wp_power_topic', 'WP-Leistungs-Topic', 'text', [], 'Optional: exaktes Topic am zentralen Broker, rohe Zahl in W; ersetzt beide festen WP-Leistungseingänge.'),
             installCenterConfigField('mqtt_hub_user', 'MQTT Benutzer', 'password', [], 'Leer lassen = unverändert.', true),
             installCenterConfigField('mqtt_hub_pass', 'MQTT Passwort', 'password', [], 'Leer lassen = unverändert.', true),
             installCenterConfigField('mqtt_hub_sub_soc_topic', 'SoC-Topic Fahrzeug 1'),
@@ -608,7 +628,7 @@ function installCenterGuardWpTypeUpdates($config, $updates) {
     $current = installCenterConfigScalar($config, 'wp_type', '-1');
     $requested = (string)$updates['wp_type'];
     $nativeLock = installCenterNativeWpLockType($config);
-    $safeCurrent = in_array($current, ['-1', '0', '1', '3', '4', '5', '6'], true) ? $current : ($nativeLock ?? '-1');
+    $safeCurrent = in_array($current, ['-1', '0', '1', '3', '4', '5', '6', '7'], true) ? $current : ($nativeLock ?? '-1');
 
     if ($requested === '-1') {
         return [$updates, $warnings];
@@ -877,7 +897,7 @@ function installCenterRedactText($text) {
     $text = (string)$text;
     // Auch teilmaskierte Kontonamen wie „t***@<Domain>“ (bluelink_client).
     $text = preg_replace('/[A-Z0-9._%+\-*]+@[A-Z0-9.\-]+\.[A-Z]{2,}/i', '[redacted-email]', $text);
-    $locationKeys = 'lat|lon|lng|long|latitude|longitude|breitengrad|laenge|länge|laengengrad|längengrad|height|hoehe|höhe|elevation|altitude';
+    $locationKeys = 'odometer|mileage|kilometerstand|lat|lon|lng|long|latitude|longitude|breitengrad|laenge|länge|laengengrad|längengrad|height|hoehe|höhe|elevation|altitude';
     $text = preg_replace('/([?&](?:' . $locationKeys . ')=)[^&\s"\']+/iu', '$1[redacted]', $text);
     $text = preg_replace('/("?(?:' . $locationKeys . ')"?\s*[:=]\s*)-?\d+(?:[.,]\d+)?/iu', '$1[redacted]', $text);
     $secretKeys = 'password|passwort|pwd|pass|pw|token|secret|api[_-]?key|apikey|aes_password|chat[_-]?id|credential|auth'
@@ -982,6 +1002,11 @@ function installCenterRedactText($text) {
     // ignoriert: <topic>“), gleiches Pseudonym wie das Topic in der Konfiguration.
     // Groß geschrieben und ohne /i: bereits pseudonymisierte "…topic"-Werte in
     // JSON-Text bleiben unberührt.
+    $text = preg_replace_callback(
+        '/(Abonniere SoC Topic auf Broker:\s*)(?!\[)([^\s"\',;]+)/u',
+        fn($match) => (string)$match[1] . e3dcVehicleConfigRedactValue('vehicle_topic', (string)$match[2], '[redacted]'),
+        $text
+    );
     $text = preg_replace_callback(
         '/(\bTopic\b[^:\r\n]{0,40}:\s*)(?!\[)([^\s"\',;]+)/u',
         fn($match) => (string)$match[1] . installCenterDiagnosticPseudonymizeValue('topic', (string)$match[2]),
@@ -1155,6 +1180,7 @@ function installCenterDiagnosticIdentifierKind($key, $value = null) {
     if (preg_match('/(?:^|[_-])mac(?:[_-]?addr(?:ess)?)?$/', $key)) return 'mac';
     if (preg_match('/(?:^|[_-])rfid(?:[_-]?tag)?$/', $key)) return 'rfid';
     if (preg_match('/(?:^|[_-])(?:device[_-]?ids|device[_-]?unique[_-]?id|unique[_-]?id[_-]?tail|ac[_-]?id(?:[_-]?tail)?|config[_-]?selector)$/', $key)) return 'device';
+    if (preg_match('/^(?:surface_id|group_id|binding_id|resource_key)$/', $key)) return 'pv';
     if (preg_match('/(?:^|[_-])(?:home[_-]?id|resource[_-]?id(?:[_-]?\d+)?|client[_-]?id)$/', $key)) return 'account';
     if (preg_match('/(?:^|[_-])(?:vin|profile[_-]?id)$/', $key)) return 'vehicle';
     // Anzeigenamen der MQTT-SoC-Fahrzeuge (mqtt_hub_sub_soc_name[_2]); der MQTT-Hub
@@ -1227,12 +1253,38 @@ function installCenterDiagnosticPseudonymizeValue($kind, $value) {
     return installCenterDiagnosticPseudonym($kind, $text);
 }
 
+function e3dcVehicleConfigRedactValue($kind, $value, $mask) {
+    if ($kind === 'private' || !is_scalar($value)) return $mask;
+    $text = trim((string)$value);
+    if ($text === '') return $value;
+    if ($kind === 'vehicle_list') {
+        return implode(',', array_map(fn($name) => installCenterDiagnosticPseudonym('vehicle', trim($name)), explode(',', $text)));
+    }
+    if ($kind === 'vehicle_topic') {
+        // Jedes freie Segment verwendet denselben Fahrzeug-Namensraum wie die Liste.
+        // Die feste generische Strecke und bekannte Attribute bleiben erkennbar.
+        $parts = explode('/', $text);
+        $route = count($parts) - 3;
+        $generic = $route >= 0 && $parts[$route] === 'vehicle';
+        foreach ($parts as $index => $part) {
+            if ($part === '' || ($generic && $index === $route)
+                || ($generic && $index === $route + 2
+                    && in_array($part, ['soc', 'plugged', 'range', 'target', 'capacity'], true))) continue;
+            $parts[$index] = installCenterDiagnosticPseudonym('vehicle', $part);
+        }
+        return implode('/', $parts);
+    }
+    return installCenterDiagnosticPseudonymizeValue('vehicle', $value);
+}
+
 function installCenterIsPseudonymousDiagnosticKey($key) {
     return installCenterDiagnosticIdentifierKind($key) !== null;
 }
 
 function installCenterIsSensitiveConfigKey($key) {
     $key = (string)$key;
+    if (preg_match('/(?:^|[_-])(?:odometer|mileage|kilometerstand)$/i', $key)) return true;
+    if (preg_match('/^wb[12]_openwb_tls_/', $key)) return true;
     // Umfasst die Muster von ha_manager.is_secret_config_key und dem
     // Config-Editor: jede *_pin (web_pin ist zugleich API-Token), passwd, aes
     // und private Schlüssel. Zusätzlich HTTP-/Web-Authentifizierung als ganzes
@@ -1248,7 +1300,156 @@ function installCenterIsSensitiveConfigKey($key) {
     return preg_match('/(password|passwort|pwd|token|secret|api.?key|apikey|mail|email|chat.?id|latitude|longitude|breitengrad|laenge|länge|laengengrad|längengrad|^lat$|^lon$|^lng$|^long$|[_-](?:lat|lon|lng)$|height|hoehe|höhe|elevation|altitude)/iu', (string)$key) === 1;
 }
 
+require_once __DIR__ . '/pv_entity_projection.php';
+
+function installCenterBackupControlProjection($value) {
+    if (!is_array($value)) return null;
+    $out = ['schema' => 'storage_backup_control_export_v1'];
+    foreach (['mode', 'current_energy_wh', 'floor_wh', 'physical_reserve_wh', 'discharge_cap_w',
+        'requested_discharge_w', 'confirmed_discharge_w', 'measured_battery_w', 'deficit_wh',
+        'remaining_energy_wh', 'grid_required_wh', 'entry_buffer_wh', 'hysteresis_wh',
+        'energy_quantum_wh', 'reaction_s', 'price_limit_ct', 'pv_recharge_credit_wh', 'export_cap_w', 'accounted_energy_wh'] as $key) {
+        $out[$key] = (is_int($value[$key] ?? null) || is_float($value[$key] ?? null)) && is_finite((float)$value[$key]) ? $value[$key] : null;
+    }
+    foreach (['active', 'valid', 'locked', 'release_confirmed', 'remaining_protection', 'power_settings_confirmed', 'grid_charging', 'takeover_confirmed'] as $key) {
+        $out[$key] = is_bool($value[$key] ?? null) ? $value[$key] : null;
+    }
+    $reasons = ['backup_hold', 'backup_forecast_missing_full_hold', 'backup_live_unknown_or_stale',
+        'backup_manual_suspended', 'backup_island', 'backup_external_owner', 'backup_hard_grid_relief',
+        'backup_dc_only_grid_forbidden', 'backup_forecast_change_pending', 'grid_charge_disabled', 'price_gap', 'no_price_below_limit',
+        'recommendation_only', 'tariff_stages_missing_or_invalid', 'backup_control_stale'];
+    foreach (['reason', 'grid_reason'] as $key) $out[$key] = in_array($value[$key] ?? '', $reasons, true) ? $value[$key] : 'unknown';
+    $now = is_numeric($value['now_s'] ?? null) ? (float)$value['now_s'] : null;
+    foreach (['deadline_ts_ms', 'takeover_ts_ms'] as $key) {
+        $out[str_replace('_ts_ms', '_in_s', $key)] = $now !== null && is_numeric($value[$key] ?? null) ? $value[$key] / 1000 - $now : null;
+    }
+    $job = is_array($value['grid_job'] ?? null) ? $value['grid_job'] : [];
+    $out['grid_job'] = [];
+    foreach (['remaining_storage_wh', 'target_energy_wh', 'grid_wh', 'price_ct', 'efficiency'] as $key) {
+        $out['grid_job'][$key] = is_numeric($job[$key] ?? null) ? (float)$job[$key] : null;
+    }
+    $out['export_hash'] = 'sha256:' . hash('sha256', json_encode($out, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+    return $out;
+}
+
+function installCenterBackupObservationProjection($value) {
+    if (!is_array($value)) return null;
+    $out = ['schema_version' => 'storage_backup_hold_export_v1', 'observation_only' => true];
+    foreach (['enabled', 'valid', 'would_hold', 'quantiles_used'] as $key) {
+        $out[$key] = is_bool($value[$key] ?? null) ? $value[$key] : null;
+    }
+    foreach (['capacity_wh', 'floor_wh', 'floor_soc_pct', 'evening_target_wh', 'evening_target_soc_pct',
+        'evening_deficit_wh', 'capacity_deficit_wh', 'reachable_evening_wh', 'recharge_pv_wh',
+        'remaining_energy_wh', 'recharge_if_hold_wh', 'pv_charge_potential_wh', 'projected_evening_wh', 'source_age_s', 'emergency_load_w', 'physical_reserve_wh', 'point_factor',
+        'calculated_energy_wh', 'current_energy_wh', 'charge_efficiency', 'live_source_age_s', 'source_current_age_s', 'configured_energy_wh', 'reference_duration_h', 'takeover_energy_wh'] as $key) {
+        $out[$key] = is_int($value[$key] ?? null) || is_float($value[$key] ?? null) ? $value[$key] : null;
+    }
+    foreach (['plan_id', 'config_revision', 'source_revision', 'binding'] as $key) {
+        $out['origin_' . $key] = is_string($value[$key] ?? null) && preg_match('/^sha256:[0-9a-f]{64}$/D', $value[$key]) ? $value[$key] : null;
+    }
+    $reasons = ['recommendation_only', 'pv_takeover_unknown', 'target_exceeds_capacity', 'backup_disabled',
+        'backup_plan_missing', 'backup_binding_config_or_age_invalid', 'backup_switch_invalid', 'backup_live_unknown_or_stale', 'backup_reference_duration_invalid', 'backup_calculation_invalid',
+        'backup_energy_missing_or_invalid', 'backup_reference_times_missing_or_invalid',
+        'backup_grid_price_missing_or_invalid', 'backup_timezone_invalid', 'backup_capacity_energy_or_limits_unknown',
+        'pv_forecast_age_unknown_or_stale', 'load_forecast_age_unknown_or_stale', 'forecast_missing_or_invalid',
+        'forecast_horizon_gap', 'pv_forecast_value_or_provenance_invalid', 'load_forecast_value_invalid',
+        'chargeable_forecast_unbound', 'chargeable_forecast_unknown', 'chargeable_dc_forecast_unknown',
+        'forecast_source_revision_invalid', 'pv_forecast_issue_mismatch'];
+    $out['reason'] = in_array($value['reason'] ?? '', $reasons, true) ? $value['reason'] : 'unknown';
+    $start = is_numeric($value['cycle_start_ts_ms'] ?? null) ? (float)$value['cycle_start_ts_ms'] : null;
+    foreach (['cycle_end_ts_ms', 'reference_until_ts_ms', 'generated_at_ts_ms', 'valid_until_ts_ms',
+        'pv_takeover_ts_ms', 'next_pv_takeover_ts_ms', 'read_at_ts_ms', 'calculated_at_ts_ms'] as $key) {
+        $out[str_replace('_ts_ms', '_offset_s', $key)] = $start !== null && is_numeric($value[$key] ?? null)
+            ? ((float)$value[$key] - $start) / 1000 : null;
+    }
+    $out['physical_buffer_status'] = 'not_evaluated';
+    $out['earlier_takeover_semantics'] = 'shortens_task_without_rescaling_load';
+    $forecast = is_array($value['forecast_diagnostic'] ?? null) ? $value['forecast_diagnostic'] : [];
+    $out['forecast_diagnostic'] = ['mode' => 'point_derating', 'formula' => 'point_forecast_w * 0.8',
+        'quantile' => null, 'convention' => 'not_applicable_point_forecast', 'calibrated' => false,
+        'source' => 'pv_forecast.json', 'quality_status' => ($forecast['quality_status'] ?? '') === 'valid' ? 'valid' : 'invalid'];
+    foreach (['original_issue_ts_ms', 'target_horizon_ts_ms'] as $key) {
+        $out['forecast_diagnostic'][str_replace('_ts_ms', '_offset_s', $key)] =
+            $start !== null && is_numeric($forecast[$key] ?? null) ? ((float)$forecast[$key] - $start) / 1000 : null;
+    }
+    $coverage = is_array($value['post_takeover_coverage'] ?? null) ? $value['post_takeover_coverage'] : [];
+    $out['post_takeover_coverage'] = ['status' => in_array($coverage['status'] ?? '', ['checked', 'no_candidate'], true)
+        ? $coverage['status'] : 'not_checked', 'deficit_wh' => is_numeric($coverage['deficit_wh'] ?? null) ? (float)$coverage['deficit_wh'] : null,
+        'horizon_offset_s' => $start !== null && is_numeric($coverage['horizon_ts_ms'] ?? null)
+            ? ((float)$coverage['horizon_ts_ms'] - $start) / 1000 : null, 'deficits' => []];
+    foreach (array_slice(is_array($coverage['deficits'] ?? null) ? $coverage['deficits'] : [], 0, 105) as $row) {
+        if (!is_array($row)) continue;
+        $entry = ['deficit_wh' => is_numeric($row['deficit_wh'] ?? null) ? (float)$row['deficit_wh'] : null];
+        foreach (['start_ts_ms', 'end_ts_ms'] as $key) $entry[str_replace('_ts_ms', '_offset_s', $key)] =
+            $start !== null && is_numeric($row[$key] ?? null) ? ((float)$row[$key] - $start) / 1000 : null;
+        $out['post_takeover_coverage']['deficits'][] = $entry;
+    }
+    $allowedChanges = array_merge($reasons, ['pv_takeover_candidate_found', 'later_emergency_deficit', 'grid_residual_deficit', 'grid_price_gap']);
+    $out['change_reasons'] = array_values(array_filter(array_slice(is_array($value['change_reasons'] ?? null)
+        ? $value['change_reasons'] : [], 0, 12), function ($reason) use ($allowedChanges) { return in_array($reason, $allowedChanges, true); }));
+    $out['energy_basis'] = 'stored_energy_wh';
+    $out['pv_scope'] = 'grid_operation_heuristic';
+    $out['probability'] = null;
+    $out['curve'] = [];
+    foreach (array_slice(is_array($value['curve'] ?? null) ? $value['curve'] : [], 0, 105) as $row) {
+        if (!is_array($row)) continue;
+        $out['curve'][] = [
+            'offset_s' => $start !== null && is_numeric($row['ts_ms'] ?? null) ? ((float)$row['ts_ms'] - $start) / 1000 : null,
+            'floor_wh' => is_numeric($row['floor_wh'] ?? null) ? (float)$row['floor_wh'] : null,
+            'floor_soc_pct' => is_numeric($row['floor_soc_pct'] ?? null) ? (float)$row['floor_soc_pct'] : null,
+        ];
+    }
+    $grid = is_array($value['grid_charge'] ?? null) ? $value['grid_charge'] : [];
+    $out['grid_charge'] = ['enabled' => ($grid['enabled'] ?? null) === true, 'commands_allowed' => false];
+    foreach (['required_kwh', 'price_limit_ct', 'available_grid_kwh', 'remaining_deficit_wh', 'missing_price_slots', 'unfillable_capacity_wh'] as $key) {
+        $out['grid_charge'][$key] = is_int($grid[$key] ?? null) || is_float($grid[$key] ?? null) ? $grid[$key] : null;
+    }
+    $out['grid_charge']['horizon_complete'] = ($grid['horizon_complete'] ?? null) === true;
+    $out['grid_charge']['price_comparison'] = 'strictly_less';
+    $out['grid_charge']['price_basis'] = 'full_import_price_ct_per_kwh';
+    $out['grid_charge']['selection_order'] = 'price_then_time';
+    $out['grid_charge']['energy_basis'] = 'grid_import_before_explicit_charge_efficiency';
+    $out['grid_charge']['reason'] = in_array($grid['reason'] ?? '', ['grid_charge_disabled', 'tariff_stages_missing_or_invalid',
+        'price_gap', 'recommendation_only', 'no_price_below_limit'], true) ? $grid['reason'] : 'unknown';
+    foreach (['selected', 'candidates'] as $kind) {
+        $out['grid_charge'][$kind] = [];
+        foreach (array_slice(is_array($grid[$kind] ?? null) ? $grid[$kind] : [], 0, 105) as $row) {
+            if (!is_array($row)) continue;
+            $entry = [];
+            foreach (['start_ts_ms', 'end_ts_ms'] as $key) $entry[str_replace('_ts_ms', '_offset_s', $key)] =
+                $start !== null && is_numeric($row[$key] ?? null) ? ((float)$row[$key] - $start) / 1000 : null;
+            foreach (['price_ct', 'grid_wh'] as $key) $entry[$key] = is_numeric($row[$key] ?? null) ? (float)$row[$key] : null;
+            $out['grid_charge'][$kind][] = $entry;
+        }
+    }
+    $out['export_hash'] = 'sha256:' . hash('sha256', json_encode($out, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+    return $out;
+}
+
 function installCenterRedactConfigValue($key, $value, $context = '') {
+    if ($key === 'backup_hold_closed_account') return null;
+    if ($key === 'backup_hold_control') return installCenterBackupControlProjection($value);
+    if ($key === 'storage_backup_hold_enable' && (string)$value === '2') return 2;
+    if ($key === 'backup_hold_observation') return installCenterBackupObservationProjection($value);
+    if (in_array($key, ['storage_backup_energy_kwh', 'storage_backup_grid_price_limit_ct'], true)) {
+        return (is_int($value) || is_float($value) || is_string($value)) && is_numeric(str_replace(',', '.', (string)$value))
+            ? (float)str_replace(',', '.', (string)$value) : null;
+    }
+    if (in_array($key, ['storage_backup_reference_time', 'storage_backup_until_time'], true)) {
+        return is_string($value) && preg_match('/^(?:[01][0-9]|2[0-3]):[0-5][0-9]$/D', $value) ? $value : null;
+    }
+    if (in_array($key, ['storage_backup_hold_enable', 'storage_backup_grid_charge_enable'], true)) {
+        if (is_bool($value)) return $value;
+        if (!is_scalar($value)) return null;
+        $toggle = strtolower(trim((string)$value));
+        if (in_array($toggle, ['1', 'true', 'yes', 'on'], true)) return true;
+        return in_array($toggle, ['0', 'false', 'no', 'off'], true) ? false : null;
+    }
+
+    $vehicleKind = e3dcVehicleConfigPrivacyKind($key);
+    if ($vehicleKind !== null) return e3dcVehicleConfigRedactValue($vehicleKind, $value, '[redacted]');
+    if ($key === 'pv_diagnostic_entities' || $key === 'diagnostic_entities') return '[Einzelreihen nur lokal; bereinigter Auszug in der Prognosediagnose]';
+    if ($key === 'entity_archive') return forecastEntityArchiveProjection($value);
     // Ein Wahrheitswert enthält kein Geheimnis; Prüfergebnisse wie
     // phase5_boundary_pass oder http_auth_configured bleiben lesbar.
     if (is_bool($value)) {
@@ -1265,6 +1466,7 @@ function installCenterRedactConfigValue($key, $value, $context = '') {
     if ($kind === null && $context === 'vehicle_item' && in_array($normalizedKey, ['id', 'name'], true)) {
         $kind = 'vehicle'; // Cloud-Fahrzeug-ID und Fahrzeugname in vehicles.json
     }
+    if ($kind === null && $context === 'pv_item' && in_array($normalizedKey, ['id', 'name', 'label'], true)) $kind = 'pv';
     if ($kind === null && $context === 'topic_map') {
         $kind = 'topic'; // Werte unter _topics (mqtt_ha_inbound.json) sind MQTT-Topics
     }
@@ -1282,6 +1484,12 @@ function installCenterRedactConfigValue($key, $value, $context = '') {
             $childContext = 'vehicle_list';
         } elseif ($context === 'vehicle_list' && ctype_digit((string)$key)) {
             $childContext = 'vehicle_item';
+        } elseif (in_array($normalizedKey, ['generator_groups', 'surfaces', 'pv_resources', 'allocations', 'bindings'], true)) {
+            $childContext = 'pv_items';
+        } elseif ($context === 'pv_items' && ctype_digit((string)$key)) {
+            $childContext = 'pv_item';
+        } elseif ($context === 'pv_map' || in_array($normalizedKey, ['resource_data', 'resource_values', 'pv_resource_raw_w', 'group_shares'], true)) {
+            $childContext = 'pv_map';
         } elseif ($context === 'topic_map' || preg_match('/(?:^|[_-])topics$/', $normalizedKey)) {
             $childContext = 'topic_map';
         } elseif (!array_is_list($value)
@@ -1292,7 +1500,9 @@ function installCenterRedactConfigValue($key, $value, $context = '') {
         }
         $out = [];
         foreach ($value as $childKey => $childValue) {
-            $out[$childKey] = installCenterRedactConfigValue((string)$childKey, $childValue, $childContext);
+            $safeKey = $childContext === 'pv_map' && !ctype_digit((string)$childKey)
+                ? installCenterDiagnosticPseudonymizeValue('pv', (string)$childKey) : $childKey;
+            $out[$safeKey] = installCenterRedactConfigValue((string)$childKey, $childValue, $childContext);
         }
         return $out;
     }
@@ -2774,6 +2984,7 @@ function installCenterDiagnosticCandidates() {
         'climate_control.json',
         'epex_daten.json',
         'pv_forecast.json',
+        'pv_forecast_diagnostic_summary.json',
         'ml_prediction.json',
         'web_install_status.json',
         'web_install_jobs.json'
@@ -3032,6 +3243,7 @@ function installCenterDiagnosticPresets($items) {
                 'ramdisk:wallbox_storage_intent.json',
                 'ramdisk:wallbox_decision_latest.json',
                 'ramdisk:pv_forecast.json',
+                'ramdisk:pv_forecast_diagnostic_summary.json',
                 'ramdisk:ml_prediction.json',
                 'ramdisk:epex_daten.json',
             ], $storageRecent, $emsRecent, $glitchRecent)
@@ -3081,6 +3293,7 @@ function installCenterDiagnosticPresets($items) {
                 'log:pv_forecast_eval.json',
                 'log:ml_consumption_eval.json',
                 'ramdisk:pv_forecast.json',
+                'ramdisk:pv_forecast_diagnostic_summary.json',
                 'ramdisk:ml_prediction.json',
                 'ramdisk:epex_daten.json',
                 'ramdisk:storage_plan.json',
@@ -3502,9 +3715,34 @@ function installCenterDiagnosticIncidentTimeline($context = []) {
     )) . "\n";
 }
 
+
+function installCenterMqttHeatpumpDiagnostic(): array {
+    $loaded = loadE3dcConfig();
+    $cfg = is_array($loaded['config'] ?? null) ? $loaded['config'] : [];
+    $contract = e3dcMqttHeatpumpFields($cfg);
+    $out = ['wp_type' => getHeatpumpTypeConfig($cfg), 'max_age_s' => 180, 'fields' => []];
+    foreach ($contract['fields'] as $key => $field) {
+        $out['fields'][$key] = ['valid' => $field['valid'], 'reason' => $field['reason'],
+            'age_s' => $field['age_s'], 'file_age_s' => $field['file_age_s'], 'source' => 'mqtt_ha',
+            'value' => in_array($key, ['state', 'mode'], true) ? null : $field['value']];
+    }
+    return $out;
+}
+
 function installCenterDiagnosticItemPayloadRaw($id, $context = []) {
     $archiveName = installCenterDiagnosticArchiveName($id);
     if ($archiveName === null) return null;
+    if ($id === 'ramdisk:mqtt_ha_inbound.json') {
+        $raw = @json_decode((string)@file_get_contents('/var/www/html/ramdisk/mqtt_ha_inbound.json'), true);
+        $raw = is_array($raw) ? $raw : [];
+        // Status und Modus sind freie externe Texte und können Anlagenbezüge enthalten.
+        foreach (['state', 'mode'] as $key) {
+            if (isset($raw['sources']['heatpump'][$key])) $raw['sources']['heatpump'][$key] = '[Freitext ausgelassen]';
+        }
+        $raw['heatpump_display'] = installCenterMqttHeatpumpDiagnostic();
+        return installCenterDiagnosticGeneratedPayload($id, $archiveName,
+            json_encode(installCenterRedactConfigValue('', $raw), JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . "\n");
+    }
     if ($id === 'config:redacted') {
         return installCenterDiagnosticGeneratedPayload(
             $id,
@@ -3940,7 +4178,9 @@ if (isset($_GET['action']) && $_GET['action'] === 'diagnostic_bundle') {
 if (in_array($_GET['action'] ?? '', ['setup_plan_start', 'setup_plan_step', 'setup_plan_retry'], true)) {
     header('Content-Type: application/json; charset=utf-8');
     $action = substr($_GET['action'], strlen('setup_plan_'));
-    echo json_encode(e3dc_setup_plan_action($action, $_POST['setup_token'] ?? ''), JSON_UNESCAPED_UNICODE);
+    $flags = JSON_UNESCAPED_UNICODE;
+    if (defined('JSON_INVALID_UTF8_SUBSTITUTE')) $flags |= JSON_INVALID_UTF8_SUBSTITUTE;
+    echo json_encode(e3dc_setup_plan_action($action, $_POST['setup_token'] ?? ''), $flags);
     exit;
 }
 $setupPlan = isset($_GET['setup_token']) ? e3dc_setup_read_plan($_GET['setup_token']) : null;
@@ -4282,13 +4522,27 @@ if (isset($_GET['action']) && $_GET['action'] === 'check_runtime_permissions_rep
         .diagnostic-file-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 8px; margin-top: 12px; }
         .diagnostic-file-item { background: #111417; border: 1px solid #303840; border-radius: 8px; padding: 9px; }
         .diagnostic-file-item label { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; }
-        .diagnostic-file-item input { margin-top: 3px; }
+        .diagnostic-file-item input { margin-top: 3px; flex: 0 0 auto; width: 1em; height: 1em; }
+        .diagnostic-file-item label > span { min-width: 0; overflow-wrap: anywhere; }
         .diagnostic-file-meta { color: #8f98a3; font-size: .75rem; line-height: 1.3; margin-top: 4px; }
         .job-progress-box { background: #101315; border: 1px solid #2c343b; border-radius: 8px; padding: 10px 12px; }
         .d-none { display: none !important; }
     </style>
 </head>
 <body>
+<div class="container my-2 small">
+<?php foreach ([1, 2] as $openwbSlot):
+    $openwbFile = '/var/www/html/ramdisk/openwb_data' . ($openwbSlot === 1 ? '' : '_wb2') . '.json';
+    $openwbRuntime = is_file($openwbFile) && time() - filemtime($openwbFile) < 30
+        ? json_decode((string)@file_get_contents($openwbFile), true) : [];
+    $openwbNotice = (string)($openwbRuntime['openwb_transport_notice'] ?? '');
+    if ($openwbNotice === '') continue;
+?>
+    <div>Wallbox <?= $openwbSlot ?>: <?= htmlspecialchars($openwbNotice, ENT_QUOTES, 'UTF-8') ?>
+        <a href="config_editor.php#group-native-wallbox">Zertifikat und Konto im Wallbox-Abschnitt prüfen</a></div>
+<?php endforeach; ?>
+</div>
+
 <main class="page-shell">
     <nav class="return-nav" aria-label="Zurück zur Konfiguration">
             <a class="back-btn" href="<?= htmlspecialchars(installCenterDashboardReturnUrl(), ENT_QUOTES, 'UTF-8') ?>"><i class="fas fa-arrow-left me-1"></i> Zurück zur Konfiguration</a>

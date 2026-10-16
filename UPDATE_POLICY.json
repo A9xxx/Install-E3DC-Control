@@ -1,9 +1,9 @@
 {
-  "version": "5.5.4",
+  "version": "5.5.5",
   "min_version": "4.0.0",
-  "stable_release": "v5.5.4",
-  "release_date": "2026-10-12",
-  "description": "v5.5.4 - Installationszentrale, Wallbox- und Wärmepumpenregelung, Tagesstatistik nach Bilanz",
+  "stable_release": "v5.5.5",
+  "release_date": "2026-10-17",
+  "description": "v5.5.5 - Lastprognose aus dem Verlauf, Wallbox- und Wärmepumpenregelung, openWB mit Benutzerkonto",
   "update_strategy": "backup_replace_restart_v1",
   "installer_requires": "python3",
   "sanitized_republication": false,

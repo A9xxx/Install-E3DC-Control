@@ -190,7 +190,7 @@ Quelle: `https://www.stiebel-eltron.de/toolbox/content/docs/anleitungen/installa
 | FC04 Input | `2501` | `2500` | Statuswerte, u.a. Verdichter und Pumpen |
 | FC04 Input | `3501` | `3500` | Energiezähler für Tag/Verbrauch |
 | FC04 Input | `5001` | `5000` | SG-Ready-/Reglerinformation |
-| FC04 Input | `6128` | `6127` | Verdichterleistung in Prozent, falls Firmware/Register vorhanden |
+| FC04 Input | `6128` | `6127` | Prozentuale Verdichterdrehzahl, nur WPM G mit belegter Typbindung; derzeit deaktiviert |
 | FC03 Holding | `1501..1511` | `1500..1510` | Betriebsart und Soll-/Komfortparameter, read-only im Live-Dienst |
 | FC03 Holding | `4001..4003` | `4000..4002` | SG-Ready-Schalter/Eingaenge, read-only im Live-Dienst |
 | FC06 Holding | `4002` | `4001` | Nur der experimentelle SG-Ready-Ausgang des Wärmepumpen-Managers, Wert `0` oder `1` |
@@ -209,7 +209,11 @@ Wichtige Einzelwerte:
 | SG-Ready Betriebszustand | `5001` | `5000` |
 
 Nicht jede ISG-/Firmware-Version liefert alle Register. Fehlende optionale
-Werte werden ausgelassen oder als unbekannt behandelt.
+Messfelder bleiben mit `null` und einem Grund in `quality.fields` erhalten.
+`success` beschreibt den Transport, nicht die Messgültigkeit. Temperatur,
+Verdichterstatus und Leistung haben getrennte Qualitätsangaben; Schätzleistung
+belegt keinen Verdichterlauf. Unbekannter Lauf erzeugt keine Start-/Stoppanker
+und erlaubt keinen neuen Start. Fehlende Tagesenergie-Summanden ergeben `null`.
 
 Der Betriebsstatus `2501` ist ein Bitfeld mit der Zählung ab `B0`. Der
 Live-Dienst wertet daraus laut Herstellerdoku `B4` Heizen, `B5` Warmwasser,
@@ -227,10 +231,10 @@ wichtig: Passive Kühlung bedeutet Pumpenbetrieb über Sole/Fußbodenheizung,
 nicht Verdichterleistung. Ein KNX-/WPM-Status `Kühlbetrieb=1` entspricht dem
 Stiebel-Register `2520` und wird als aktive passive Kühlung übernommen.
 
-Bekannte ISG-/FHEM-Mappings werden bevorzugt beruecksichtigt, u.a.
-`i506` Aussen und `i521` Warmwasser-Ist. Die Quellentemperatur kommt nach
-offizieller Tabelle von `536`, also als Codeadresse `535`; `537`/`536` bleibt
-als Fallback für abweichende Firmware erhalten.
+Die Vorlauf-Isttemperatur kommt aus `515`, ersatzweise `513`. `517` ist
+Festwert-Soll und wird nicht als Istwert verwendet. Die Quellentemperatur kommt
+nur aus `536` (Codeadresse `535`); `537` ist die Mindestgrenze und kein Messwert.
+Fehlen die Istregister, zeigt die Anzeige unbekannte Werte.
 
 ## Leistungsaufnahme
 
@@ -238,9 +242,10 @@ Viele Stiebel-ISG liefern keine direkte elektrische Live-Leistung in Watt. Der
 Treiber schaetzt deshalb die Aufnahme in dieser Reihenfolge:
 
 1. Externer Shelly-Leistungsmesser, wenn aktiviert und erreichbar.
-2. Direkte WPMG-Aufnahmeleistung je Phase, wenn die ISG-Firmware diese
-   Register bereitstellt.
-3. Verdichterleistung in Prozent (Doku `6128`, Code `6127`), wenn vorhanden.
+2. Direkte WPMG-Aufnahmeleistung je Phase ausschließlich mit belegtem Reglerprofil.
+3. Prozentuale Verdichterdrehzahl (Doku `6128`, Code `6127`) ausschließlich
+   bei WPM G (WPE-I 33–87 H 400 Premium) mit belegtem Reglerprofil; daraus
+   berechnete elektrische Leistung ist eine Schätzung, keine Messung.
 4. Verdichterfrequenz in Hz aus der ISG-Prozessdaten-Seite, wenn aktiviert.
 5. Standby-Leistung, wenn der Verdichter aus ist.
 6. Konfigurierter Nennwert für WW oder Heizen als Fallback.
@@ -268,8 +273,13 @@ Die Quelle steht im JSON-Feld `stiebel_power_source`, z.B.:
 ### Direkte WPMG-Leistungsregister
 
 Einige ISG-Plus-/WPMG-Dokumentationen enthalten direkte elektrische
-Aufnahmeleistungen je Phase. Der Treiber probiert diese Werte read-only und
-summiert L1+L2+L3, wenn alle drei Phasen plausibel lesbar sind.
+Aufnahmeleistungen je Phase. Die vorliegende Herstellerquelle dokumentiert
+keine WPM-G-Reglerkennung. Daher sind dieses Profil und `6128` derzeit nicht
+aktiviert, auch nicht bei plausiblen Antworten. WPM 3 (`390`), WPM 3i (`391`)
+und WPMsystem (`449`) sind kein WPM G. Ohne Typbindung stehen die Werte auf
+`null` mit `register_not_documented_for_controller` bzw. `controller_unknown`.
+Eine spätere belegte Bindung muss bei jedem Reglerwechsel neu geprüft werden.
+Der externe Zähler und die bisherigen gültigen Status-/Hz-Pfade bleiben nutzbar.
 
 | Quelle | L1 Doku | L2 Doku | L3 Doku | L1 Code |
 | --- | ---: | ---: | ---: | ---: |
@@ -281,9 +291,10 @@ summiert L1+L2+L3, wenn alle drei Phasen plausibel lesbar sind.
 | Sekundäre Wärmepumpe 5 | `6868` | `6869` | `6870` | `6867` |
 | System-/Sammeladresse | `36118` | `36119` | `36120` | `36117` |
 
-Auf manchen ISG Plus sind diese Register nicht freigeschaltet
-(`Modbus exception 2`). Das ist kein Fehler im Treiber; dann faellt E3DC-Control
-automatisch auf Verdichterstatus, Prozent/Hz, Shelly oder Nennwerte zurück.
+Die Register bleiben ohne belegte WPM-G-Typbindung ungeprüft. Auch eine
+plausible Antwort oder `Modbus exception 2` ersetzt diese Bindung nicht.
+Der Dienst nutzt externe Messwerte oder schätzt aus gültigen Status-/Hz-Daten;
+fehlen auch diese, bleibt die Leistung unbekannt.
 
 Wenn eine Anlage kalibriert werden soll, ist `stiebel_isg_hz_power_map` der
 genaueste Weg. Beispiel:
@@ -629,8 +640,9 @@ Prüfen:
 
 ### Leistungsaufnahme wirkt ungenau
 
-Das ist normal, wenn das ISG weder Verdichter-Prozent noch Verdichter-Hz
-liefert. Dann nutzt E3DC-Control die konfigurierten Nennwerte. Für bessere
+Ohne externe Messung bzw. belegtes WPM-G-Profil ist die elektrische Leistung
+eine Schätzung aus gültigem Verdichterstatus oder Verdichter-Hz. Fehlt auch
+der Laufstatus, bleibt die Leistung unbekannt. Für bessere
 Werte die Hz-Erkennung aktivieren oder eine Kennlinie in
 `stiebel_isg_hz_power_map` eintragen.
 

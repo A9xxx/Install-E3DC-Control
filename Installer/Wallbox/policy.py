@@ -286,6 +286,7 @@ class EnergyPolicyInput:
     # Wolkenkontingent (gehaltene Leistung).
     wbminsoc_hold_zone_frame_w: Optional[float] = None
     wbminsoc_hold_zone_bridging: bool = False
+    central_pv_split: Optional[Dict[str, Any]] = None
 
 
 def _identity_bound_wallbox_source_budget(
@@ -1239,6 +1240,29 @@ def decide_energy_policy(ctx: EnergyPolicyInput) -> Dict[str, Any]:
         final_allowed = min(final_allowed, peak_cap_w)
         if peak_shaving_wallbox_minimum_blocked:
             final_allowed = 0.0
+
+    central = ctx.central_pv_split
+    if isinstance(central, dict):
+        # Der absolute Zentralrahmen enthält die laufende Eigenleistung bereits.
+        # Sämtliche alten Quellen und Entlastungen sind hier nur Diagnose.
+        frame = central.get("frame_w")
+        frame_known = bool(isinstance(frame, (int, float)) and not isinstance(frame, bool)
+                           and math.isfinite(float(frame)) and frame >= 0)
+        central_w = float(frame) if frame_known else 0.0
+        final_allowed = min(central_w, max_phys_wb_w)
+        if peak_shaving_wallbox.get("active"):
+            final_allowed = min(final_allowed, peak_cap_w)
+        if mode == 0:
+            final_allowed = 0.0
+        effective_auth_w = central_w
+        curve_wb_relief_active = False
+        forecast_auto_relief_active = False
+        openwb_pro_curve_direct_candidate_w = central_w
+        openwb_pro_curve_direct_battery_neutral_w = central_w
+        openwb_pro_curve_direct_real_pv_w = final_allowed
+        openwb_pro_curve_direct_w = final_allowed
+        openwb_pro_curve_direct_pv_start_ready = bool(frame_known and final_allowed >= openwb_pro_curve_direct_start_min_w)
+        openwb_pro_curve_direct_storage_soft_release = False
 
     auth_budget_limited = bool(final_allowed < pre_auth_cap)
 

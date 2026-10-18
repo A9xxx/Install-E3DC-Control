@@ -16,6 +16,40 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
+## Rückfall von 5.5.5b auf 5.5.5a
+
+**Docker:** Auf dem Host in `.env` `E3DC_IMAGE_TAG=v5.5.5a` setzen und
+`sudo docker compose up -d` ausführen; die vorhandenen Daten-Volumes bleiben
+erhalten.
+
+**Bare Metal:** Der Rückweg ist das beim Update angelegte verifizierte Backup
+(siehe „Betriebsdaten wiederherstellen“). Es stellt Programmstand,
+Konfiguration und die darin gesicherten Betriebsdaten von vor dem Update
+wieder her; nach dem Update geänderte Einstellungen und hinzugekommene
+Statistik- und Diagnosedaten sind darin nicht enthalten und vorher gesondert zu
+sichern.
+
+**Konfiguration:** 5.5.5b führt das Feld „Modell“ für die E3/DC Multi Connect
+ein. Ein dort gespeicherter Wert bleibt beim Rückfall in der Konfiguration
+stehen; 5.5.5a wertet ihn für die Phasenumschaltung nicht vollständig aus, die
+eigene 6-A-Phasenerkennung läuft dann wieder parallel zur Wallbox. Nach einem
+erneuten Update gilt die gespeicherte Auswahl wieder. Eigene Standortwerte
+bleiben unverändert; ohne eigenen Standort nutzt 5.5.5a wieder seine bisherige
+Vorgabe.
+
+**Betriebsdaten:** 5.5.5b ergänzt den Zustand des Heizstab-Managers um einen
+Laufzeitbeleg für das Wärmepumpen-Relais am Shelly Pro3EM. 5.5.5a wertet ihn
+nicht aus und kann ihn beim nächsten Speichern entfernen. Nach einem erneuten
+Update beginnt bei fehlendem Beleg einmalig der konservative Mindestlaufhalt.
+
+**Verhalten unter 5.5.5a:** Die Korrekturen von 5.5.5b stehen dort nicht zur
+Verfügung: Ein fehlender Ladezustand des Hausakkus wird im Heizstab-Manager
+wieder als 0 % gelesen, eine Wärmepumpe am Shelly-Pro3EM-Relais kann dann ohne
+Mindestlaufzeit abgeschaltet werden, und bei „Mindest-SOC (%)“ = 0 kann ein
+unbekannter Wert wieder eine Freigabe ergeben.
+
+**Dienste:** 5.5.5b führt keine neuen Dienste oder systemd-Units ein.
+
 ## Rückfall von 5.5.5a auf 5.5.5
 
 **Docker:** Auf dem Host in `.env` `E3DC_IMAGE_TAG=v5.5.5` setzen und
@@ -409,7 +443,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand ist `v5.5.5a`.
+Der aktuelle Stable-Stand ist `v5.5.5b`.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

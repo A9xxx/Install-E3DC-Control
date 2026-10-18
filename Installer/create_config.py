@@ -4,6 +4,7 @@ import os
 import pwd
 
 from .core import register_command
+from .location_defaults import DEFAULT_LATITUDE, DEFAULT_LONGITUDE
 from .installer_config import (
     get_home_dir,
     get_install_path,
@@ -420,8 +421,8 @@ def create_e3dc_config(headless=False, *, install_path=None, install_user=None):
     cfg["openmeteo"] = (om.lower() == "j")
 
     if cfg["openmeteo"]:
-        cfg["hoehe"] = ask("Breitengrad (°N)", "48.00000", headless)
-        cfg["laenge"] = ask("Längengrad (°E)", "13.00000", headless)
+        cfg["hoehe"] = ask("Breitengrad (°N)", str(DEFAULT_LATITUDE), headless)
+        cfg["laenge"] = ask("Längengrad (°E)", str(DEFAULT_LONGITUDE), headless)
 
         print("\n--- Forecast Parameter ---")
         cfg["forecast1"] = ask("Forecast1 (Neigung/Azimut/kWp)", "35/0/10.0", headless)

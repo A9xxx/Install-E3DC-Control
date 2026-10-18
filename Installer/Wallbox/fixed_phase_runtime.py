@@ -11,6 +11,11 @@ import uuid
 
 from .fixed_phase_session import STATE_SCHEMA, update_fixed_phase_session
 
+try:
+    from .decision import e3dc_autonomous_solar_provenance
+except ImportError:  # pragma: no cover - direkter Installer-Import
+    from Wallbox.decision import e3dc_autonomous_solar_provenance
+
 
 CHECKPOINT_FILE = "fixed_phase_control.json"
 CHECKPOINT_SCHEMA = "fixed_phase_control_checkpoint_v1"
@@ -187,6 +192,7 @@ def _eligible(box, status):
     return bool(name in {"E3DCCharger", "E3DCMultiConnectCharger"}
                 and family != "efy" and status.get("can_switch_phases") is not True
                 and status.get("autonomous_phase_switch_capable") is not True
+                and not e3dc_autonomous_solar_provenance(status)
                 # Lesender ALG-/Phasenstatus ist keine Python-Stromfreigabe.
                 # Statusbeleg und tatsächlich gebundener Treiber müssen den
                 # ausdrücklich gewählten flüchtigen WBchar6-Pfad bestätigen.

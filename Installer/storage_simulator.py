@@ -2,6 +2,10 @@
 # -*- coding: utf-8 -*-
 
 import os
+try:
+    from .location_defaults import DEFAULT_LATITUDE, DEFAULT_LONGITUDE
+except ImportError:
+    from location_defaults import DEFAULT_LATITUDE, DEFAULT_LONGITUDE
 import sys
 import json
 import copy
@@ -4074,8 +4078,8 @@ class StorageSimulator:
         return event, new_anchors, grid_charge
 
     def _configured_location(self):
-        lat = self._safe_float(self.v4_config.get('hoehe', self.v4_config.get('latitude', 49.0)), 49.0)
-        lon = self._safe_float(self.v4_config.get('laenge', self.v4_config.get('longitude', 10.0)), 10.0)
+        lat = self._safe_float(self.v4_config.get('hoehe', self.v4_config.get('latitude', DEFAULT_LATITUDE)), DEFAULT_LATITUDE)
+        lon = self._safe_float(self.v4_config.get('laenge', self.v4_config.get('longitude', DEFAULT_LONGITUDE)), DEFAULT_LONGITUDE)
         return lat, lon
 
     def _configured_pv_peak_kw(self):

@@ -65,8 +65,10 @@ import urllib.request
 import urllib.error
 
 try:
+    from Installer.control_time import system_boot_id
     from Installer.shelly_relay_owner import shelly_relay_conflict, SHELLY_OWNER_WARNING
 except ModuleNotFoundError:
+    from control_time import system_boot_id
     from shelly_relay_owner import shelly_relay_conflict, SHELLY_OWNER_WARNING
 
 _INSTALLER_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -478,30 +480,39 @@ def optional_live_float(data, *keys):
 # ---------------------------------------------------------------------------
 
 def read_live():
-    """
-    Liest aktuelle Leistungswerte aus live_data_py.json (Python RSCP).
-    Kennzeichnet fehlenden oder ungültigen SoC separat. Die Rechenwerte
-    bleiben für den bisherigen Regelpfad erhalten.
-    """
-    if os.path.exists(LIVE_PY_FILE):
-        if time.time() - os.path.getmtime(LIVE_PY_FILE) <= 30:
-            try:
+    """Liest frische RSCP-Daten; unbekannter SoC bleibt null mit Grund."""
+    reason = "live_missing"
+    try:
+        if os.path.exists(LIVE_PY_FILE):
+            reason = "live_stale"
+            if 0 <= time.time() - os.path.getmtime(LIVE_PY_FILE) <= 30:
+                reason = "live_invalid"
                 with open(LIVE_PY_FILE, "r") as f:
                     data = json.load(f)
-                    return {
-                        "pv_w":   float(data.get("PV_Power", 0)),
-                        "grid_w": float(data.get("Grid_Power", 0)),
-                        "soc":    float(data.get("SOC", 0)),
-                        "soc_valid": (optional_live_float(data, "SOC") is not None
-                                      and 0 <= float(data["SOC"]) <= 100),
-                        "price_ct": optional_live_float(data, "price_ct", "billing_price_ct"),
-                        "heater_temp_c": optional_live_float(data, "heater_temp_c"),
-                        "source": "live_data_py.json",
-                    }
-            except Exception:
-                pass
-    return {"pv_w": 0, "grid_w": 0, "soc": 0, "soc_valid": False,
-            "price_ct": None, "heater_temp_c": None, "source": "none"}
+                soc, valid, soc_reason = _soc_evidence(data.get("SOC"), data)
+                return {
+                    "pv_w": float(data.get("PV_Power", 0)),
+                    "grid_w": float(data.get("Grid_Power", 0)),
+                    "soc": soc, "soc_valid": valid, "soc_reason": soc_reason,
+                    "price_ct": optional_live_float(data, "price_ct", "billing_price_ct"),
+                    "heater_temp_c": optional_live_float(data, "heater_temp_c"),
+                    "source": "live_data_py.json",
+                }
+    except Exception:
+        pass
+    return {"pv_w": 0, "grid_w": 0, "soc": None, "soc_valid": False,
+            "soc_reason": reason, "price_ct": None, "heater_temp_c": None, "source": "none"}
+
+
+def _soc_evidence(value, data):
+    """Eine echte Null bleibt gültig; explizit ungültige Belege sperren."""
+    number = _strict_finite_number(value)
+    if number is None or not 0 <= number <= 100:
+        return None, False, "soc_missing_or_invalid"
+    for key in ("SOC_valid", "SOC_Valid", "soc_valid", "RSCP_Sample_Valid"):
+        if key in data and data[key] is not True:
+            return None, False, "soc_explicitly_invalid"
+    return number, True, "soc_valid"
 
 
 # ---------------------------------------------------------------------------
@@ -1146,7 +1157,9 @@ def reconcile_shelly_3em_relay_state(
 
     if relay_state:
         if not prior_known or not prior_on:
-            hs_state["s3em_last_on_ts"] = observed_ts
+            if prior_known or float(hs_state.get("s3em_last_on_ts", 0) or 0) <= 0:
+                hs_state["s3em_last_on_ts"] = observed_ts
+                hs_state.pop("s3em_on_clock", None)
             hs_state["s3em_restart_rearm_count"] = 1
             status["wp_relay_runtime_evidence"] = (
                 "restart_conservative_min_runtime_rearm"
@@ -1169,6 +1182,8 @@ def reconcile_shelly_3em_relay_state(
             )
         elif prior_on:
             hs_state["s3em_last_off_ts"] = observed_ts
+            hs_state["s3em_owned"] = False
+            hs_state["s3em_auto_off_confirmed"] = True
             status["wp_relay_runtime_evidence"] = "external_off_readback"
         else:
             status["wp_relay_runtime_evidence"] = "confirmed_off_readback"
@@ -1907,8 +1922,91 @@ def _elwa_offline_status(status, state):
         status["hs_reason"] = status["modbus_reason"]
 
 
+def _s3em_remaining(state, kind, duration, now_ts):
+    """Nur bootgebundene, plausible Uhren belegen das Alter einer Laufepisode."""
+    anchor = float(state.get("s3em_last_" + kind + "_ts", 0) or 0)
+    if anchor <= 0:
+        return 0.0
+    key = "s3em_" + kind + "_clock"
+    clock = state.get(key)
+    mono = time.monotonic()
+    boot = system_boot_id()
+    plausible = (
+        isinstance(clock, dict) and clock.get("boot") == boot
+        and all(_strict_finite_number(clock.get(field)) is not None and clock[field] >= 0
+                for field in ("anchor", "mono", "remaining"))
+        and clock["anchor"] == anchor and clock["mono"] <= mono
+    )
+    if not plausible:
+        # Fremder Boot oder kaputter Beleg: Besitz bleibt erhalten, Alter ist
+        # unbekannt. Genau einen konservativen Ersatz setzen und persistieren.
+        # Ein lokaler Altzustand ohne Uhrbeleg stammt aus diesem Prozess.
+        # Sein Wandzeitanker wird einmalig in einen monotonen Beleg überführt.
+        # Wiederhergestellte Episoden ohne Uhrbeleg tragen dagegen {} und
+        # behalten mangels Bootnachweis die volle konservative Schutzfrist.
+        remaining = (max(0.0, duration - max(0.0, now_ts - anchor))
+                     if clock is None else duration)
+        clock = {"anchor": anchor, "mono": mono, "boot": boot, "remaining": remaining}
+        state[key] = clock
+    # Weder Pendeldaten noch eine erhöhte Konfiguration verlängern die Episode.
+    return max(0.0, min(duration, float(clock["remaining"])) - (mono - float(clock["mono"])))
+
+
+def _s3em_episode(cfg, state):
+    """Bindet den Laufzeitbeleg auch über einen geordneten Dienststopp."""
+    return {
+        "schema": 1,
+        "endpoint": [str(cfg.get("shelly_3em_ip", "")).strip(), cfg_int(cfg, "shelly_3em_relay_id", -1)],
+        "state": {key: state[key] for key in (
+            "s3em_on", "s3em_owned", "s3em_last_on_ts", "s3em_last_off_ts",
+            "s3em_on_clock", "s3em_off_clock", "s3em_startup_checked") if key in state},
+    }
+
+
+def _restore_s3em_episode(cfg, state):
+    """Übernimmt nur den eigenen, zum konfigurierten Relais passenden Beleg."""
+    if (state.get("s3em_episode_loaded") or str(cfg.get("wp_type")) != "3"
+            or "s3em_on" in state):
+        return
+    state["s3em_episode_loaded"] = True
+    try:
+        with open(RAMDISK_FILE, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict):
+            return
+        episode = payload.get("wp_relay_episode", {})
+        if not isinstance(episode, dict):
+            return
+        endpoint = [str(cfg.get("shelly_3em_ip", "")).strip(), cfg_int(cfg, "shelly_3em_relay_id", -1)]
+        if episode.get("schema") != 1 or episode.get("endpoint") != endpoint:
+            return
+        saved = episode.get("state", {})
+        if not isinstance(saved, dict):
+            return
+        for key in ("s3em_last_on_ts", "s3em_last_off_ts"):
+            if key in saved and (_strict_finite_number(saved[key]) is None or saved[key] < 0):
+                return
+        if type(saved.get("s3em_on")) is not bool or type(saved.get("s3em_owned")) is not bool:
+            return
+        for key in ("s3em_on", "s3em_owned", "s3em_last_on_ts", "s3em_last_off_ts",
+                    "s3em_on_clock", "s3em_off_clock", "s3em_startup_checked"):
+            if key in saved:
+                state[key] = saved[key]
+        # Fehlende oder ungültige Uhrdaten entziehen nicht den eigenen Besitz.
+        # Ein fehlender Altbeleg bekommt dieselbe konservative Behandlung wie
+        # ein fremder Boot; die Fristprüfung ersetzt ihn einmalig im Dienstpfad.
+        for kind in ("on", "off"):
+            if state.get("s3em_last_" + kind + "_ts", 0) > 0:
+                key = "s3em_" + kind + "_clock"
+                if state.get(key) is None:
+                    state[key] = {}
+    except (OSError, ValueError, TypeError):
+        pass
+
+
 def control_cycle(cfg, live, hs_state, safety_gate=None):
     """Bindet ELWA-Lesen, bestätigte Schreibvorgänge und Abschluss an einen Socket."""
+    _restore_s3em_episode(cfg, hs_state)
     hs_state.setdefault("s3em_owned", bool(hs_state.get("s3em_on", False)))
     is_elwa = str(cfg.get("heizstab_type", "generic")).strip().lower() == "mypv_elwa"
     endpoint = str(cfg.get("heizstab_ip", "0.0.0.0")).strip()
@@ -1937,6 +2035,8 @@ def control_cycle(cfg, live, hs_state, safety_gate=None):
         status["pymodbus"] = modbus_compatibility()
         if endpoint not in ("", "0.0.0.0") and not status["pymodbus"]["compatible"]:
             status["modbus_diagnostic"] = status["pymodbus"]["reason"]
+        if str(cfg.get("wp_type")) == "3":
+            status["wp_relay_episode"] = _s3em_episode(cfg, hs_state)
         return status
     finally:
         try:
@@ -2010,9 +2110,11 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
         sh_nominal_w,
     )
     market_heater_budget_w = 0
-    soc       = live["soc"]
-    pv_w      = live["pv_w"]
-    soc_ok = soc >= min_soc
+    soc, soc_valid, soc_reason = _soc_evidence(live.get("soc"), live)
+    pv_w = live["pv_w"]
+    soc_ok = soc_valid and soc >= min_soc
+    soc_low = soc_valid and not soc_ok
+    soc_text = f"{soc:.0f}%" if soc_valid else "unbekannt"
 
     # Hysterese-Schwellen: Einschalten >= min_surplus, Ausschalten < (min_surplus - deadband)
     is_currently_on     = hs_state.get('is_on', False)
@@ -2052,8 +2154,9 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
         "surplus_w":        round(surplus_w),
         "grid_surplus_w":   round(netpoint_surplus_w),
         "pv_w":             round(pv_w),
-        "soc":              soc if live.get("soc_valid", True) else None,
-        "soc_valid":        live.get("soc_valid", True),
+        "soc":              soc,
+        "soc_valid":        soc_valid,
+        "soc_reason":       live.get("soc_reason", soc_reason),
         "live_source":      live.get("source", "none"),
         "process_success":  True,
         "success":          True,
@@ -2082,7 +2185,7 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
         current_ts = time.time() if now_ts is None else float(now_ts)
         last_off_ts = float(hs_state.get("s3em_last_off_ts", 0) or 0)
         restart_left_s = (
-            max(0.0, s3_restart_block_s - (current_ts - last_off_ts))
+            _s3em_remaining(hs_state, "off", s3_restart_block_s, current_ts)
             if last_off_ts > 0
             else 0.0
         )
@@ -2288,18 +2391,18 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
             if last_on <= 0:
                 last_on = now_ts
                 hs_state["s3em_last_on_ts"] = last_on
-            remaining = max(0.0, s3_min_runtime_s - (now_ts - last_on))
+            remaining = _s3em_remaining(hs_state, "on", s3_min_runtime_s, now_ts)
             confirmed_off = status.get("wp_relay_readback_valid") is True and status.get("wp_relay_readback_on") is False
             if confirmed_off:
                 hs_state["s3em_owned"] = False
                 hs_state["s3em_auto_off_confirmed"] = True
-            elif remaining > 0 and not (live.get("soc_valid", True) and not soc_ok):
+            elif remaining > 0 and not (soc_low):
                 status["wp_takt_protect_active"] = True
                 status["wp_min_runtime_remaining_s"] = round(remaining)
                 if release_ok:
                     status["hs_reason"] = f"Globale Automatik aus – WP-Mindestlaufzeit noch {remaining/60:.1f} Min"
             elif _invoke_actuator(shelly_3em_set_relay, s3_ip, s3_relay, False, safety_gate=safety_gate):
-                if release_ok and live.get("soc_valid", True) and not soc_ok:
+                if release_ok and soc_low:
                     status["hs_reason"] = "Globale Automatik aus – WP-SoC-Sicherheitsabschaltung"
                 hs_state["s3em_on"] = False
                 hs_state["s3em_auto_off_confirmed"] = True
@@ -2314,7 +2417,36 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
             _elwa_offline_status(status, hs_state)
         return _with_actuator_safety_status(status, safety_gate)
 
-    if not heater_module_enabled:
+    unknown_manual = read_manual_override() if heater_module_enabled else None
+    unknown_manual_full = bool(unknown_manual and str(unknown_manual.get("mode", "")).strip().lower() == "full")
+    if not soc_valid and not unknown_manual_full:
+        # Unbekannte Daten nehmen nur eigene Ausgänge zurück. Die WP wird
+        # anschließend unabhängig mit ihrer unveränderten Laufepisode behandelt.
+        status["hs_mode"] = "soc_unknown"
+        status["hs_reason"] = "SoC unbekannt – automatische Heizstab-Freigabe zurückgenommen"
+        status["predump_heater_active"] = False
+        status["market_heater_active"] = False
+        release_ok = True
+        legacy_owned = bool(hs_state.get("is_on") or float(hs_state.get("current_w", 0) or 0) > 0)
+        if hs_configured and hs_state.get("heater_owned_modbus", legacy_owned):
+            if MODBUS_OK and elwa_modbus_available:
+                release_ok = bool(_invoke_actuator(
+                    elwa_set_power if is_elwa else heizstab_set_power,
+                    hs_ip, hs_port, 0, safety_gate=safety_gate)) and release_ok
+            else:
+                release_ok = False
+        if sh_configured and hs_state.get("heater_owned_shelly", legacy_owned):
+            release_ok = bool(_invoke_actuator(shelly_set_state, sh_ip, False,
+                                             safety_gate=safety_gate)) and release_ok
+        if release_ok:
+            hs_state["is_on"] = False
+            hs_state["current_w"] = 0
+        else:
+            status["success"] = False
+            status["hs_reason"] = "SoC unbekannt – eigene Heizstab-Rücknahme nicht bestätigt"
+        has_hs = has_sh = False
+
+    if not heater_module_enabled and soc_valid:
         status["hs_mode"] = "disabled"
         status["hs_reason"] = "Heizstab/BWWP deaktiviert"
         release_ok = True
@@ -2375,7 +2507,7 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
     heater_empty_soc = cfg_float(cfg, "heat_price_block_empty_soc", 10.0)
     live_price_ct = live.get("price_ct") if isinstance(live, dict) else None
     expensive_price_window_active = bool(live_price_ct is not None and float(live_price_ct) >= heater_price_block_limit_ct)
-    battery_empty_for_price_block = bool(soc <= heater_empty_soc)
+    battery_empty_for_price_block = bool(soc_valid and soc <= heater_empty_soc)
     if expensive_price_window_active and battery_empty_for_price_block:
         if float(hs_state.get("heat_price_block_started_ts", 0) or 0) <= 0:
             hs_state["heat_price_block_started_ts"] = time.time()
@@ -2431,7 +2563,7 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
         "raw_market_budget_w": int(raw_market_heater_budget_w),
     })
     status["heat_policy"] = heat_policy_export
-    status["market_heater_active"] = market_heater_budget_w > 0
+    status["market_heater_active"] = soc_valid and market_heater_budget_w > 0
     status["market_plan_action"] = market_heater_ctx.get("action")
     status["market_plan_reason"] = market_heater_ctx.get("reason")
     status["market_plan_negative_price"] = bool(market_heater_ctx.get("negative_price"))
@@ -2534,7 +2666,7 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
 
     if auto_mode:
         hs_state["heater_auto_off_confirmed"] = False
-    else:
+    elif soc_valid:
         # Der lokale Heizstab-Schalter stoppt ausschließlich Heizstab/BWWP.
         # Eine separat freigegebene Pro3EM-WP bleibt davon unabhängig.
         status["hs_reason"] = (
@@ -2613,7 +2745,7 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
         should_run = (soc_ok and surplus_w > threshold_off_w) or ((not soc_ok) and surplus_w >= threshold_on_w)
     else:
         should_run = surplus_w >= threshold_on_w
-    if not auto_mode:
+    if not auto_mode or not soc_valid:
         should_run = False
     if heat_policy_runtime_enabled and heat_policy_decision.target_state == heat_policy.TARGET_BLOCKED:
         should_run = False
@@ -2628,7 +2760,7 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
         should_run = False
 
     hyst_info = f"(Hyst: Ein>={threshold_on_w:.0f}W, Aus<{threshold_off_w:.0f}W, akt={'EIN' if is_currently_on else 'AUS'})"
-    print(f"  PV-Ueberschuss: {surplus_w:.0f}W | SOC: {soc:.0f}% (Min: {min_soc}%) | "
+    print(f"  PV-Ueberschuss: {surplus_w:.0f}W | SOC: {soc_text} (Min: {min_soc}%) | "
           f"Regelung: {'AKTIV' if should_run else 'STOP'} {hyst_info}")
 
     if should_run:
@@ -2721,6 +2853,8 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
     else:
         if not auto_mode:
             pass
+        elif not soc_valid:
+            pass
         elif measurement_blocked:
             status["hs_reason"] = (
                 "Heizstab-Istwert unbekannt/ungültig; Start bleibt fail-closed"
@@ -2809,18 +2943,25 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
             now_ts = time.time()
             last_on_ts = float(hs_state.get("s3em_last_on_ts", 0) or 0)
             last_off_ts = float(hs_state.get("s3em_last_off_ts", 0) or 0)
-            runtime_left_s = max(0.0, s3_min_runtime_s - (now_ts - last_on_ts)) if last_on_ts > 0 else 0.0
-            restart_left_s = max(0.0, s3_restart_block_s - (now_ts - last_off_ts)) if last_off_ts > 0 else 0.0
+            runtime_left_s = _s3em_remaining(hs_state, "on", s3_min_runtime_s, now_ts)
+            restart_left_s = _s3em_remaining(hs_state, "off", s3_restart_block_s, now_ts)
             # SoC-Schutz und manuelles/Auto-Aus bleiben harte Stops. Reine Wolkenkanten
             # halten wir bis zur Mindestlaufzeit, damit das WP-Relais nicht taktet.
-            relay_emergency_stop = not soc_ok
+            relay_emergency_stop = soc_low
+            soc_withdrawal_due = not soc_valid and runtime_left_s <= 0
 
-            if s3_wallbox_transition and wp_is_on and not relay_emergency_stop:
+            if s3_wallbox_transition and wp_is_on and not relay_emergency_stop and not soc_withdrawal_due:
                 status["wp_relay_on"] = bool(managed_relay_on)
                 status["wp_takt_protect_active"] = True
                 status["hs_reason"] = "WP läuft weiter: Wallbox-Übergang darf sie nicht stoppen"
                 refresh_shelly_3em_provider(now_ts)
                 return _with_actuator_safety_status(status, safety_gate)
+
+            if not soc_valid:
+                should_wp = False
+                if not hs_state.get("s3em_owned", False):
+                    refresh_shelly_3em_provider(now_ts)
+                    return _with_actuator_safety_status(status, safety_gate)
 
             if should_wp and not wp_is_on:
                 if not relay_readback_valid:
@@ -2860,6 +3001,8 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
                 if ok:
                     hs_state["s3em_on"] = True
                     hs_state["s3em_last_on_ts"] = now_ts
+                    hs_state.pop("s3em_on_clock", None)
+                    _s3em_remaining(hs_state, "on", s3_min_runtime_s, now_ts)
                     hs_state["s3em_auto_off_confirmed"] = False
                     update_shelly_3em_relay_evidence(
                         status,
@@ -2882,7 +3025,7 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
                     status["success"] = False
                     status["wp_relay_on"] = bool(managed_relay_on)
                     status["hs_reason"] = "WP EIN blockiert oder Readback nicht bestätigt"
-            elif not should_wp and managed_relay_on:
+            elif not should_wp and (managed_relay_on or (not soc_valid and hs_state.get("s3em_owned", False))):
                 if runtime_left_s > 0 and not relay_emergency_stop:
                     hs_state["s3em_on"] = True
                     status["wp_relay_on"] = True
@@ -2917,7 +3060,8 @@ def _control_cycle(cfg, live, hs_state, safety_gate=None):
                     status["wp_relay_on"] = False
                     status["wp_takt_protect_active"] = False
                     status["wp_restart_block_remaining_s"] = round(s3_restart_block_s)
-                    reason_off = (f"SOC zu niedrig ({soc:.0f}% < {min_soc}%)" if not soc_ok
+                    reason_off = ("SoC unbekannt – Mindestlaufzeit beendet" if not soc_valid
+                                  else f"SOC zu niedrig ({soc:.0f}% < {min_soc}%)" if soc_low
                                   else f"kein zugewiesenes WP-Budget ({s3_surplus_w:.0f}W)")
                     status["hs_reason"] = f"WP AUS: {reason_off}"
                     print(f"  [3EM] -> WP Relais {s3_relay} AUSgeschaltet ({reason_off})")
@@ -3113,6 +3257,7 @@ def main():
             "hs_measurement_valid": False,
             "source_fresh": False,
             "safe_release_confirmed": bool(release_ok),
+            "wp_relay_episode": _s3em_episode(cfg, hs_state) if wp_type == "3" else None,
         })
     _signal.signal(_signal.SIGTERM, _handle_stop)
     _signal.signal(_signal.SIGINT,  _handle_stop)
@@ -3133,7 +3278,7 @@ def main():
 
             live = read_live()
             print(f"\n[{time.strftime('%H:%M:%S')}] PV={live['pv_w']:.0f}W "
-                  f"Grid={live['grid_w']:+.0f}W SOC={live['soc']:.0f}% "
+                  f"Grid={live['grid_w']:+.0f}W SOC={live['soc']}% "
                   f"[{live['source']}]")
 
             status = control_cycle(cfg, live, hs_state)

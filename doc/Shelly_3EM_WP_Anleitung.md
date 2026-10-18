@@ -196,7 +196,33 @@ Wenn genügend PV-Überschuss vorhanden und SOC >= Minimum:
 Ab 5.1.8b nutzt das Pro3EM-Relais die allgemeinen Wärmepumpen-Taktschutzwerte
 `wp_min_runtime_min` und `wp_restart_block_min`. Kurze Wolkenkanten halten das
 Relais deshalb bis zur Mindestlaufzeit und blockieren direkte Neustarts nach
-einem Stop; SoC-Schutz und manuelles/Auto-Aus bleiben harte Stopps.
+einem Stopp. Ein gültig gemessener SoC unter `hs_min_soc` stoppt sofort.
+Nutzer-Aus nimmt die Freigabe zurück; eine eigene laufende WP behält dabei
+ihre Mindestlaufzeit.
+
+Auch bei eingeschalteter Automatik gibt unbekannter SoC keine neuen Starts
+frei. Dazu zählen fehlende, beschädigte oder veraltete Livedaten, fehlende,
+explizit ungültige oder unplausible Werte. Gültige 0 % bleiben ein Messwert,
+auch bei `hs_min_soc = 0`. Eine eigene laufende WP beendet ihre bestehende
+Mindestlaufzeit und erhält danach einen Aus-Auftrag, auch bei weiterhin
+positivem Budget oder einem Wallbox-Übergang. Fehlende Bestätigung lässt den
+Auftrag offen. Kehrt ein gültiger SoC vorher zurück, gelten wieder die
+normalen Regeln; nach bestätigtem Aus gilt die Wiedereinschaltsperre.
+Die Relaisrücklesung und gemessene Lastannahme beweisen keinen Verdichterlauf.
+Der zum Relais gehörende Laufzeitbeleg bleibt über Dienstneustarts erhalten;
+fehlt das Einschaltalter, beginnt einmalig der konservative Mindestlaufhalt.
+Nach einem Neustart des Rechners lässt sich das Alter einer Lauf- oder
+Ausschaltphase nicht aus der Systemuhr belegen. Eine laufende eigene WP behält
+dann ab dem Neustart ihre volle Mindestlaufzeit, und eine bereits abgelaufene
+Wiedereinschaltsperre (`wp_restart_block_min`) beginnt erneut mit voller Dauer.
+Ein Start kann sich dadurch nach einem Neustart um bis zu diese Sperrzeit
+verzögern.
+
+Ein unabhängiger automatisch geregelter Heizstab wird bei unbekanntem SoC
+ohne Verdichter-Mindestlaufhalt zurückgenommen. Das betrifft eigene ELWA-,
+generische Modbus- und Shelly-Ausgänge; Markt-, Pre-Dump- und Preisbudgets
+geben dabei keine neue Leistung frei. Der manuelle Vollgasauftrag hat einen
+eigenen Regelpfad.
 
 Wenn das zugewiesene WP-Budget wegfällt oder der SOC zu niedrig ist:
 

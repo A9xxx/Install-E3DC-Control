@@ -2,6 +2,7 @@ import os
 import json
 
 from .core import register_command
+from .location_defaults import DEFAULT_LATITUDE, DEFAULT_LONGITUDE
 from .config_secret_permissions import apply_config_secret_permissions
 from .installer_config import get_install_path
 from .logging_manager import get_or_create_logger, log_task_completed, log_error
@@ -23,8 +24,8 @@ WIZARD_KEYS = [
     ('wurzelzaehler_invertiert', 'Legacy-PM-Phasen invertiert (0/1)', '0'),
 
     # === PFLICHT: Standort fuer PV-Prognose ===
-    ('hoehe',          'Breitengrad (Latitude, z.B. 48.604)', '48.60442'),
-    ('laenge',         'Laengengrad (Longitude, z.B. 13.415)', '13.41513'),
+    ('hoehe', 'Breitengrad (Latitude), z.B. %s' % DEFAULT_LATITUDE, str(DEFAULT_LATITUDE)),
+    ('laenge', 'Längengrad (Longitude), z.B. %s' % DEFAULT_LONGITUDE, str(DEFAULT_LONGITUDE)),
     ('forecast1',      'PV-Anlage: Neigung/Azimuth/kWp (z.B. 40/-50/15.4)', '40/-50/15.4'),
     ('speichergroesse','Speichergroesse in kWh (Fallback)',   '15'),
     ('ems_budget_runtime_enable', 'EMS-Budget-Runtime (0=Shadow, 1=zentraler Budget-Executor)', '0'),

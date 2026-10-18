@@ -5,12 +5,23 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.5.5a`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.5.5b`. Das Dashboard startet ausschließlich
 den root-eigenen Systemjob ohne freie Argumente. Die einzige Ausnahme ist
 die tokengebundene Driftfreigabe. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
+
+5.5.5b ist ein Korrekturupdate zu 5.5.5a (Wärmepumpe und Heizstab bei
+unbekanntem Ladezustand des Hausakkus, Modellauswahl für die E3/DC Multi Connect
+II, neutrale Standortvorgabe für die PV-Prognose). Bestehende Installationen
+aktualisieren wie gewohnt über **System Update** bzw. das
+[Docker-Update](#docker-update); eine Konfigurationsänderung ist nicht nötig.
+Wer eine Multi Connect II betreibt, wählt danach im Config-Editor im Feld
+„Modell“ „Multi Connect II“; ohne eigenen Standort unter „Standort &
+PV-Prognose“ gilt die neutrale Vorgabe. Der bisherige E3DC-WebSocket-Dienst wird
+mit Version 5.5.6 entfernt. Einzelheiten stehen in den [Release
+Notes](../RELEASE_NOTES.md).
 
 5.5.5a ist ein Korrekturupdate zu 5.5.5 (Wallbox-Stromregelung und einphasiger
 Wiederanlauf, Flatter-Korrektur der experimentellen zentralen PV-Aufteilung,

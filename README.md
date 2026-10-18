@@ -1,12 +1,14 @@
 # E3DC-Control Web-Portal & Installer
 
-Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.5.5a</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
+Ein hochperformantes, modulares Dashboard und Installations-System für die **native Python-Architektur** [A9xxx/Install-E3DC-Control](https://github.com/A9xxx/Install-E3DC-Control) <kbd>Version 5.5.5b</kbd>. Es verwandelt das System in ein intelligentes Smart-Home-Zentrum mit moderner Web-Oberfläche, eigenem Energy Manager und proaktivem Systemschutz.
 
 ![E3DC-Control Dashboard](html/app-icon-512.png)
 
 ## Aktuelle Version und Update
 
-Die aktuelle stabile Version ist **5.5.5a**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+Die aktuelle stabile Version ist **5.5.5b**. Hinweise zum Web-, Konsolen- und Docker-Update sowie zur Wiederherstellung stehen in [doc/Update.md](doc/Update.md). Die vollständigen Änderungen dokumentieren [RELEASE_NOTES.md](RELEASE_NOTES.md) und [CHANGELOG.md](CHANGELOG.md). Der sanitierte Root **v5.3.2b** bleibt ausschließlich als Docker-Rückfall-Image verfügbar. Ein Bare-Metal-Programm-Rückfall auf diesen Stand wird nicht angeboten; dort bleibt die Wiederherstellung aus einem verifizierten Datei-Backup der sichere Rückweg.
+
+5.5.5b ist ein Korrekturupdate zu 5.5.5a: Wärmepumpe und Heizstab erhalten bei unbekanntem Ladezustand des Hausakkus keine neuen Freigaben mehr, eine von E3DC-Control eingeschaltete Wärmepumpe am Shelly-Pro3EM-Relais beendet dabei ihre Mindestlaufzeit statt sofort abzuschalten. Für die E3/DC Multi Connect II lässt sich im Config-Editor das Modell wählen; dann schaltet im Sonnenmodus nur die Wallbox die Phasen. Ohne eigenen Standort nutzt die PV-Prognose eine neutrale Vorgabe, und die Konfigurationsprüfung empfiehlt, den eigenen Standort einzutragen. Bestehende Installationen aktualisieren wie gewohnt über **System Update** bzw. das Docker-Update. Der bisherige E3DC-WebSocket-Dienst wird mit Version 5.5.6 entfernt; für Smart-Home-Anbindungen steht der MQTT-Hub zur Verfügung.
 
 5.5.5a ist ein Korrekturupdate „Hardwareschutz“ zu 5.5.5: Die gewählte Strom-Schrittweite der Wallbox bleibt bis zum Strombefehl erhalten, eine laufende Ladung erreicht den freigegebenen Zielstrom nach bestätigter Deckung ohne 2-A-Treppe, und bei umschaltfähigen Wallboxen wird der einphasige Wiederanlauf geprüft. Ein Start-Stopp-Flattern der experimentellen zentralen PV-Aufteilung ist behoben. Native E3DC-Wallboxen erhalten einen wirksamen Schutzstopp auch bei selbständiger Ladung, brechen bei unbekanntem Stromdeckel nicht mehr ab, behalten die Phasenwechsel-Sperre nach einem Neustart und bilden die Sitzungsenergie aus der Ladeleistung. Speicherregler und Wärmepumpe erhalten zusätzliche Schutzfälle (Haltefrist bei ungültigen Messwerten, Vorrang eines gemeldeten Inselbetriebs, Beachtung fremder Sperren bei automatischen Wärmepumpen-Starts). Bestehende Installationen aktualisieren wie gewohnt über **System Update** bzw. das Docker-Update; eine Konfigurationsänderung ist nicht nötig. Der bisherige E3DC-WebSocket-Dienst wird mit Version 5.5.6 entfernt; für Smart-Home-Anbindungen steht der MQTT-Hub zur Verfügung.
 
@@ -53,6 +55,8 @@ sondern eine eindeutige Auswahl verlangt.
 > **Config-Schutz:** Standardinstallationen speichern `data/e3dc_v4.json` und lokale Config-Backups mit `660` für Install-User und `www-data`, damit WebUI und Dienste weiter automatisch starten, die Datei aber nicht mehr weltlesbar ist. Der normale Config-Download „Einstellungen ohne Zugangsdaten“ enthält keine Zugangsdaten, aber weiterhin IP-Adressen und Gerätekennungen und ist nicht zum Teilen gedacht; der Raw-Download enthält Zugangsdaten und wird nur angeboten, wenn eine Web-PIN gesetzt ist. Der Kompatibilitätsmodus (`664`) ist nur für eigene externe Leser gedacht. Import, Rollback und normales Speichern im Config-Editor prüfen die fertig zusammengeführte JSON-Datei auf höchstens 64 KiB; eine bestandene Rollenprüfung beweist keinen laufenden Regelbetrieb. Für HA-Sicherungen und Ersatzhardware gilt [Rolle und Rollenanker](doc/High_Availability_Dokumentation.md#rolle-und-rollenanker).
 
 > **Bedienansichten:** Config-Editor und Wallbox-Seite unterscheiden zwischen einfacher Ansicht für Einrichtung und täglichen Betrieb sowie erweiterter Ansicht für alle Detailparameter. Die Logik und Abgrenzung sind in [doc/Frontend_Ansichten.md](doc/Frontend_Ansichten.md) dokumentiert.
+
+> **Neu in 5.5.5b:** Wärmepumpe und Heizstab ohne neue Freigaben bei unbekanntem Ladezustand des Hausakkus (laufende Wärmepumpe behält ihre Mindestlaufzeit), Modellauswahl für die E3/DC Multi Connect II mit Phasenumschaltung allein durch die Wallbox, neutrale Standortvorgabe für die PV-Prognose mit beratendem Hinweis.
 
 > **Neu in 5.5.5a:** Korrekturupdate „Hardwareschutz“: feine Wallbox-Stromstufen bleiben erhalten, bestätigte Stromanhebung ohne 2-A-Treppe, gedeckter einphasiger Wiederanlauf, kein Start-Stopp-Flattern mehr bei der experimentellen zentralen PV-Aufteilung, native E3DC-Wallbox mit wirksamem Schutzstopp, neustartfester Phasenwechsel-Sperre und Sitzungsenergie aus der Ladeleistung, Haltefrist und Inselvorrang im Speicherregler, automatische Wärmepumpen-Starts beachten fremde Sperren. Keine neuen Einstellungen.
 
@@ -554,7 +558,7 @@ sudo docker compose logs --tail=80 e3dc-control
 > `ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}`. Ohne Eintrag
 > folgt sie dem geprüften Stable-Tag `latest`. Ein fester Versions-Tag wechselt
 > bei `pull` absichtlich nicht; für einen bewussten Pin oder Rückfall wird
-> `E3DC_IMAGE_TAG=v5.5.5a` in `.env` gesetzt und `sudo docker compose up -d`
+> `E3DC_IMAGE_TAG=v5.5.5b` in `.env` gesetzt und `sudo docker compose up -d`
 > ausgeführt. `config --images` zeigt vor dem Pull das tatsächlich gewählte
 > Image.
 

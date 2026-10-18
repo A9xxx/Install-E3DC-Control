@@ -6,6 +6,35 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.5.5b] – 2026-10-19
+
+Korrekturupdate zu 5.5.5a: Wärmepumpe und Heizstab bei unbekanntem Ladezustand des Hausakkus, Modellauswahl für die E3/DC Multi Connect II und eine neutrale Standortvorgabe für die PV-Prognose.
+
+### Wärmepumpe und Heizstab: unbekannter Ladezustand des Hausakkus
+
+- **Unbekannt gibt nichts frei:** Fehlen die Livedaten des Speichers, sind sie beschädigt oder veraltet, oder ist der Ladezustand fehlend, ausdrücklich ungültig oder unplausibel, erteilt der automatische Regelpfad des Heizstab-Managers keine neuen Starts und keine Leistungs-, Boost-, Markt- oder Vorab-Entladefreigaben. Bisher wurde ein fehlender Wert als 0 % gelesen; bei „Mindest-SOC (%)“ = 0 konnte daraus sogar eine Freigabe entstehen. Ein gültig gemessener Wert von 0 % bleibt ein Messwert.
+- **Wärmepumpe am Shelly-Pro3EM-Relais:** Eine von E3DC-Control eingeschaltete, laufende Wärmepumpe wird bei unbekanntem Ladezustand nicht mehr sofort abgeschaltet. Sie beendet ihre eingestellte Mindestlaufzeit und erhält danach einen Aus-Auftrag, auch wenn noch Budget vorhanden ist oder gerade eine Wallbox umschaltet. Ohne Bestätigung bleibt der Auftrag offen. Kehrt vorher ein gültiger Ladezustand zurück, gelten wieder die normalen Regeln; nach bestätigtem Aus gilt die Wiedereinschaltsperre.
+- **Laufzeit über Neustarts:** Der Laufzeitbeleg des Relais bleibt über Dienstneustarts erhalten. Fehlt das Einschaltalter, gilt einmalig der konservative Mindestlaufhalt. Nach einem Neustart des Rechners lässt sich das Alter einer Lauf- oder Ausschaltphase nicht aus der Systemuhr belegen: Eine laufende eigene Wärmepumpe behält dann ab dem Neustart ihre volle Mindestlaufzeit, und eine schon abgelaufene Wiedereinschaltsperre beginnt erneut. Ein Start kann sich dadurch nach einem Neustart um bis zu diese Sperrzeit verzögern.
+- **Heizstab:** Ein unabhängiger, automatisch geregelter Heizstab (ELWA, generisch per Modbus oder Shelly) wird bei unbekanntem Ladezustand ohne Verdichter-Mindestlaufhalt zurückgenommen; Markt-, Vorab-Entlade- und Preisbudgets geben dabei keine neue Leistung frei. Fremde Ausgänge werden nicht geschaltet. Der manuelle Vollgasauftrag hat einen eigenen Regelpfad und ist nicht betroffen.
+- **Unverändert:** Ein gültig gemessener Ladezustand unter „Mindest-SOC (%)“ stoppt wie bisher sofort. Nutzer-Aus nimmt die Freigabe zurück; eine laufende eigene Wärmepumpe behält dabei ihre Mindestlaufzeit.
+
+### Wallbox: E3/DC Multi Connect II
+
+- **Neue Auswahl „Modell“:** Bei „Wallbox 1 Modell / API“ beziehungsweise „Wallbox 2 Modell / API“ = „E3/DC Multi Connect I/II“ gibt es das Feld „Modell“ mit der Auswahl „nicht festgelegt“, „Multi Connect I“ und „Multi Connect II“. „nicht festgelegt“ ist der Standard und behält das bisherige Verhalten. Bei anderen Wallbox-Typen ist das Feld gesperrt; ein vorhandener Wert bleibt dort unverändert gespeichert.
+- **Ein Entscheider für die Phasen:** Bei ausdrücklich gewählter „Multi Connect II“ übernimmt die Wallbox im Sonnenmodus die Phasenumschaltung selbst. E3DC-Control führt dann keine eigene 6-A-Phasenerkennung und keinen festen Sitzungsvertrag parallel dazu. Bisher konnten beide gleichzeitig wirken. Die Modellwahl wird nie aus dem Gerätenamen oder dem gemeldeten Typ abgeleitet.
+- **Wechsel der Modellwahl:** Eine geänderte Modellwahl wird wie ein Wechsel des Wallbox-Typs übernommen: Der Wallbox-Manager startet einmal neu und baut den Treiber mit der neuen Auswahl auf; im Docker-Betrieb startet dabei wie bisher der Container einmal neu. Eine zusätzliche Aktion in der Installationszentrale ist nicht nötig. Die andere Wallbox behält ihre Einstellung.
+- **Diagnose:** Die Konfigurationsprüfung zeigt je Ladepunkt den Eintrag „E3/DC-Modell“ mit der wirksamen Modellwahl; ein unbekannter Wert erscheint als Warnung.
+
+### PV-Prognose: neutrale Standortvorgabe
+
+- Ist unter „Standort & PV-Prognose“ kein eigener Breiten- und Längengrad eingetragen, nutzen Einrichtungsassistent, Konfigurationsvorlage, PV-Prognose und Speichersimulation eine neutrale Vorgabe (Mitte Deutschlands). Wer bisher ohne eigenen Standort gearbeitet hat, erhält dadurch eine andere Prognose; für eine passende Prognose den eigenen Standort eintragen.
+- Die Konfigurationsprüfung weist beratend darauf hin, wenn der Standort fehlt, nicht lesbar ist oder noch einer Vorgabe entspricht („Standort für die PV-Prognose prüfen“). Sie blockiert nichts und gibt keine Koordinaten im Diagnosepaket aus. Gespeicherte eigene Werte bleiben unverändert.
+
+### Grenzen
+
+- Die Änderungen sind mit Simulationen, Gerätemodellen und Regressionstests geprüft. Ein Praxisnachweis auf mehreren Anlagen liegt noch nicht vor; die Multi Connect II ist noch auf keiner realen Anlage erprobt.
+- Die in 5.5.5a genannten bekannten Grenzen der Wallbox-Regelung bestehen weiter.
+
 ## [5.5.5a] – 2026-10-18
 
 Korrekturupdate „Hardwareschutz“ für Wallbox, Speicherregler und Wärmepumpe. Neue Konfigurationseinstellungen, Dienste oder Dateiformate gibt es nicht.

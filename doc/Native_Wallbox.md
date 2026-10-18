@@ -529,6 +529,10 @@ beobachtend. Eine erfolgreiche Anmeldung allein erteilt keine Steuerfreigabe.
 Bei ausdrücklich ausgewählter **efy** oder **Multi Connect II** erkennt die
 Regelung die vom Hersteller dokumentierte automatische 1-/3-Phasenumschaltung.
 Ein zusätzlicher versteckter Nachweis-Schalter ist dafür nicht erforderlich.
+Multi Connect II im Konfigurationseditor unter „Wallbox 1 Modell / API“ bzw.
+„Wallbox 2 Modell / API“ als „E3/DC Multi Connect I/II“ auswählen und im Feld
+„Modell“ ausdrücklich „Multi Connect II“ angeben. „Multi Connect I“ und
+„nicht festgelegt“ behalten das bisherige Verhalten.
 Im freigegebenen PV-Betrieb kann der vorhandene Sonnenmodus die Phasenwahl an
 die E3/DC-Automatik übergeben. Die Diagnose unterscheidet diese Herstellerfähigkeit
 von einem tatsächlich beobachteten Phasenwechsel. Die automatische

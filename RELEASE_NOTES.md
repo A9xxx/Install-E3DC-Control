@@ -1,3 +1,39 @@
+# E3DC-Control v5.5.5b
+
+E3DC-Control 5.5.5b ist ein Korrekturupdate auf Basis von 5.5.5a. Wärmepumpe und Heizstab erhalten bei unbekanntem Ladezustand des Hausakkus keine neuen Freigaben mehr, eine laufende Wärmepumpe behält dabei ihre Mindestlaufzeit. Für die E3/DC Multi Connect II lässt sich das Modell auswählen, damit nur noch die Wallbox die Phasen umschaltet. Ohne eigenen Standort nutzt die PV-Prognose eine neutrale Vorgabe.
+
+## Änderungen
+
+- **Wärmepumpe und Heizstab bei unbekanntem Ladezustand:**
+  - Fehlende, beschädigte oder veraltete Livedaten sowie fehlende, ungültige oder unplausible Werte geben im automatischen Regelpfad des Heizstab-Managers keine neuen Starts, Leistungs-, Boost-, Markt- oder Vorab-Entladefreigaben. Bisher galt ein fehlender Wert als 0 %; bei „Mindest-SOC (%)“ = 0 konnte daraus eine Freigabe entstehen. Gültige 0 % bleiben ein Messwert.
+  - Eine von E3DC-Control eingeschaltete Wärmepumpe am Shelly-Pro3EM-Relais läuft ihre Mindestlaufzeit zu Ende und erhält danach einen Aus-Auftrag, statt sofort abgeschaltet zu werden. Kehrt vorher ein gültiger Wert zurück, gelten die normalen Regeln; nach bestätigtem Aus gilt die Wiedereinschaltsperre.
+  - Der Laufzeitbeleg bleibt über Dienstneustarts erhalten. Nach einem Neustart des Rechners beginnen Mindestlaufzeit und Wiedereinschaltsperre konservativ mit voller Dauer; ein Start kann sich dadurch verzögern.
+  - Ein unabhängiger, automatisch geregelter Heizstab (ELWA, generisch per Modbus, Shelly) wird bei unbekanntem Ladezustand zurückgenommen; fremde Ausgänge und der manuelle Vollgasauftrag sind nicht betroffen.
+- **E3/DC Multi Connect II:**
+  - Neues Feld „Modell“ bei „Wallbox 1 Modell / API“ beziehungsweise „Wallbox 2 Modell / API“ = „E3/DC Multi Connect I/II“, Auswahl „nicht festgelegt“ (Standard, bisheriges Verhalten), „Multi Connect I“ oder „Multi Connect II“.
+  - Mit „Multi Connect II“ schaltet im Sonnenmodus nur die Wallbox die Phasen; die eigene 6-A-Phasenerkennung von E3DC-Control läuft dann nicht mehr parallel.
+  - Eine geänderte Modellwahl übernimmt der Wallbox-Manager mit einem einmaligen automatischen Neustart, wie bei einem Wechsel des Wallbox-Typs; im Docker-Betrieb startet dabei der Container einmal neu.
+- **PV-Prognose:** Ohne eigenen Breiten- und Längengrad unter „Standort & PV-Prognose“ gilt eine neutrale Vorgabe (Mitte Deutschlands). Die Konfigurationsprüfung empfiehlt dann, den eigenen Standort einzutragen; sie blockiert nichts. Gespeicherte eigene Werte bleiben unverändert.
+
+## Hinweise
+
+- **Update:** Von 5.5.5a ist keine Konfigurationsänderung nötig. Wer eine Multi Connect II betreibt, wählt nach dem Update im Config-Editor im Feld „Modell“ „Multi Connect II“. Wer bisher keinen eigenen Standort eingetragen hat, trägt ihn unter „Standort & PV-Prognose“ nach, sonst gilt die Prognose für die neutrale Vorgabe.
+- **Nachweisgrenze:** Die Änderungen sind mit Simulationen, Gerätemodellen und Regressionstests geprüft. Ein Praxisnachweis auf mehreren Anlagen liegt noch nicht vor; die Multi Connect II ist noch auf keiner realen Anlage erprobt.
+- **Bekannte Grenzen der Wallbox-Regelung:** Die in 5.5.5a beschriebenen Grenzen bestehen weiter.
+- **WebSocket-Dienst:** Der bisherige E3DC-WebSocket-Dienst wird mit Version 5.5.6 entfernt. Für externe Smart-Home-Anbindungen steht der MQTT-Hub mit den dokumentierten Topics zur Verfügung; das Webportal nutzt weiterhin HTTP-Abfragen.
+
+## Updatehinweise
+
+- **Bare Metal:** Wie gewohnt über „System Update“ aktualisieren und anschließend die Seite neu laden.
+- **Docker:** Mit eingerichtetem Watchtower über „System Update“, sonst im bestehenden Compose-Ordner auf dem Host mit `sudo docker compose pull` und `sudo docker compose up -d` aktualisieren. Ein fester Pin wird bewusst auf `E3DC_IMAGE_TAG=v5.5.5b` geändert.
+- **Von 5.5.5 oder älter:** Das Update führt direkt auf 5.5.5b; die Updatehinweise von 5.5.5a und 5.5.5 gelten weiter.
+
+## Rückfall
+
+Rückfall auf 5.5.5a: Docker in `.env` `E3DC_IMAGE_TAG=v5.5.5a` setzen und `sudo docker compose up -d` ausführen; auf Bare Metal ist das beim Update angelegte verifizierte Backup der Rückweg. Einzelheiten stehen in der [Rückfall-Dokumentation](doc/Rollback.md), Abschnitt „Rückfall von 5.5.5b auf 5.5.5a“. Unter 5.5.5a entfallen die oben genannten Korrekturen wieder.
+
+---
+
 # E3DC-Control v5.5.5a
 
 E3DC-Control 5.5.5a ist ein Korrekturupdate „Hardwareschutz“ auf Basis von 5.5.5. Es verfeinert die Stromregelung der Wallbox, behebt ein Start-Stopp-Flattern bei der experimentellen zentralen PV-Aufteilung, sichert nativ angebundene E3DC-Wallboxen gegen einen nicht ankommenden Schutzstopp, einen Regelabbruch und einen verlorenen Phasenwechsel-Schutz nach Neustart und ergänzt Schutzfälle im Speicherregler und im Energy Manager der Wärmepumpe. Neue Einstellungen, Dienste oder Dateiformate gibt es nicht.

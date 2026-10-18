@@ -10,6 +10,11 @@ werden jedoch in der WebUI deutlich angezeigt.
 from __future__ import annotations
 
 import ipaddress
+import hashlib
+try:
+    from .location_defaults import DEFAULT_LATITUDE, DEFAULT_LONGITUDE, LEGACY_LOCATION_HASHES
+except ImportError:
+    from location_defaults import DEFAULT_LATITUDE, DEFAULT_LONGITUDE, LEGACY_LOCATION_HASHES
 try:
     from data_models import parse_mqtt_vehicle_allowlist, mqtt_vehicle_record_allowed
 except ImportError:
@@ -1034,6 +1039,43 @@ try:
 except ImportError:
     from Storage import backup_hold
 
+def validate_forecast_location_config(cfg):
+    """Beratender Standortcheck ohne Koordinaten im Diagnosepaket."""
+    values = (cfg.get('hoehe'), cfg.get('laenge'))
+    missing = any(value is None or str(value).strip() == '' for value in values)
+    readable = False
+    default_pair = False
+    if not missing:
+        try:
+            lat, lon = (float(value) for value in values)
+            readable = bool(not any(isinstance(value, bool) for value in values)
+                            and math.isfinite(lat) and math.isfinite(lon)
+                            and -90 <= lat <= 90 and -180 <= lon <= 180)
+            if readable:
+                fingerprint = hashlib.sha256(('%.5f|%.5f' % (lat, lon)).encode('utf-8')).hexdigest()
+                default_pair = bool((lat, lon) in {
+                    (DEFAULT_LATITUDE, DEFAULT_LONGITUDE), (51.163375, 10.447683),
+                } or fingerprint in LEGACY_LOCATION_HASHES)
+        except (TypeError, ValueError, OverflowError):
+            pass
+    if missing:
+        message = 'Standort für die PV-Prognose prüfen: Standort fehlt.'
+    elif not readable:
+        message = 'Standort nicht lesbar. Standort für die PV-Prognose prüfen.'
+    elif default_pair:
+        message = 'Standort für die PV-Prognose prüfen: Es ist noch eine Vorgabe eingetragen.'
+    else:
+        message = 'Eigener Standort für die PV-Prognose eingetragen.'
+    warning = missing or not readable or default_pair
+    return {'hoehe': _entry(
+        key='hoehe', label='Standort für die PV-Prognose', unit='',
+        configured='[privat]', live_value=None, live_key=None,
+        effective='Standort prüfen' if warning else 'Eigener Standort',
+        source='default' if missing else 'user', severity='warning' if warning else 'ok',
+        message=message,
+    )}
+
+
 def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Liefert die beratende Prüfung der Speicherkonfiguration.
 
@@ -1072,6 +1114,7 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         message="Obergrenze der Referenzbasis für die Haus-Plausibilitätsprüfung, keine Grenze der ausgegebenen Prognose."
                 + (" Werte unter 8 oder über 80 kWh bitte auf Plausibilität prüfen." if cap_warning else ""),
     )}
+    forecast.update(validate_forecast_location_config(cfg))
     forecast.update(validate_solcast_config(cfg))
     forecast.update(validate_pv_forecast_topology_config(cfg))
     forecast.update(validate_ext_inverter_config(cfg))
@@ -1960,6 +2003,47 @@ def validate_storage_config(cfg: Optional[Dict[str, Any]], live: Optional[Dict[s
         severity=_rm_direct_severity,
         message=_rm_direct_message,
     )
+
+    # Dieselbe Normalisierung wie im Treiber, einschließlich seiner Aliase.
+    _family_rows = []
+    _family_severity = 'ok'
+    _family_configured = {}
+    _family_effective = {}
+    for _family_id in (1, 2):
+        _family_key = 'wb%d_e3dc_device_family' % _family_id
+        _family_type_key = 'wb_native_type' + ('2' if _family_id == 2 else '')
+        _family_type = str(cfg.get(_family_type_key) or '').strip().lower()
+        _family_multi = _family_type in {'e3dc_multi', 'e3dc_multi_connect', 'e3dc-multi', 'e3dc multi'}
+        if not _family_multi and _family_key not in cfg:
+            continue
+        try:
+            from .Wallbox.drivers import _normalize_e3dc_device_family
+        except ImportError:  # pragma: no cover - direkter Installer-Import
+            from Wallbox.drivers import _normalize_e3dc_device_family
+        _family_choice = cfg.get(_family_key)
+        _family_raw = _family_choice
+        if _family_raw in (None, ''):
+            _family_raw = cfg.get('e3dc_device_family')
+        _family_default = {
+            'e3dc_efy': 'efy', 'e3dc_easy': 'easy_connect',
+            'e3dc_easy_connect': 'easy_connect', 'e3dc_multi_connect_ii': 'multi_connect_ii',
+        }.get(_family_type, 'multi_connect' if _family_multi else 'unknown')
+        _family_value = _normalize_e3dc_device_family(_family_raw, _family_default)
+        _family_known = _normalize_e3dc_device_family(_family_raw, '__invalid__') != '__invalid__'
+        _family_item_severity = 'info' if _family_choice in (None, '') else ('ok' if _family_known else 'warning')
+        if {'ok': 0, 'info': 1, 'warning': 2}[_family_item_severity] > {'ok': 0, 'info': 1, 'warning': 2}[_family_severity]:
+            _family_severity = _family_item_severity
+        _family_configured['WB%d' % _family_id] = cfg.get(_family_key)
+        _family_effective['WB%d' % _family_id] = _family_value
+        _family_note = 'nicht festgelegt' if _family_item_severity == 'info' else ('unbekannter Wert' if _family_item_severity == 'warning' else 'festgelegt')
+        _family_rows.append('WB%d: %s; wirksame Familie: %s.' % (_family_id, _family_note, _family_value))
+    if _family_rows:
+        wallbox['e3dc_device_family'] = _entry(
+            key='e3dc_device_family', label='E3/DC-Modell', unit='',
+            configured=_family_configured, live_value=None, live_key=None,
+            effective=_family_effective, source='user', severity=_family_severity,
+            message=' '.join(_family_rows),
+        )
 
     # Startfenster der openWB Pro – Startfenster, Wiederholzyklus,
     # CP-Karenz (Untergrenze 60 s) und Deckel der Weckimpulse je Stecksession.

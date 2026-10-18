@@ -24,6 +24,8 @@ if REPO_ROOT not in sys.path:
 if INSTALLER_DIR not in sys.path:
     sys.path.insert(0, INSTALLER_DIR)
 
+from location_defaults import DEFAULT_LATITUDE, DEFAULT_LONGITUDE
+
 from Forecast.pv_forecast_diagnostic_details import build_stage_metadata, provider_resource_samples
 from Forecast import pv_entity_archive as entity_archive
 
@@ -945,8 +947,8 @@ class EnsemblePVForecaster:
         self.pv_topology_explicit = has_explicit_topology_config(self.v4_config)
 
         # Favorisiere v4_config für Standortdaten
-        self.lat = float(self.v4_config.get('hoehe', self.config.get('hoehe', 48.6)))
-        self.lon = float(self.v4_config.get('laenge', self.config.get('laenge', 13.4)))
+        self.lat = float(self.v4_config.get('hoehe', self.config.get('hoehe', DEFAULT_LATITUDE)))
+        self.lon = float(self.v4_config.get('laenge', self.config.get('laenge', DEFAULT_LONGITUDE)))
         def configured_coordinate_present(source, key):
             return bool(
                 key in source

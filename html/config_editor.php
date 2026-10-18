@@ -456,7 +456,7 @@ $defaults = [
     "planned_load_windows" => "",
 
     // Standort
-    "openmeteo" => "true", "hoehe" => "48.60442", "laenge" => "13.41513",
+    "hoehe" => "51.16", "laenge" => "10.45",
     "forecast1" => "40/-50/15.4", "forecast2" => "", "forecast3" => "",
     "solcast_api_key" => "", "solcast_api_key_2" => "",
     "solcast_calls_per_day" => "10", "solcast_calls_per_day_2" => "10",
@@ -775,8 +775,8 @@ $tooltips = [
 
 
     // Standort
-    "hoehe"                  => "Geografische Breite (Latitude) des Standorts, z.B. 48.604 für Südbayern. Benötigt für PV-Prognose.",
-    "laenge"                 => "Geografische Länge (Longitude) des Standorts, z.B. 13.415.",
+    "hoehe" => "Breitengrad des Standorts für die PV-Prognose, z.B. " . $defaults['hoehe'] . " (Latitude).",
+    "laenge" => "Längengrad des Standorts für die PV-Prognose, z.B. " . $defaults['laenge'] . " (Longitude).",
     "openmeteo"              => "Aktiviert Open-Meteo als Wetter-Backend für Prognosen (true, empfohlen, kostenlos).",
     "forecast1"              => "PV-Anlage 1: Neigung/Azimuth/kWp, z.B. '40/-50/15.4'. Azimuth: Süd=0, Ost=-90, West=+90.",
     "forecast2"              => "Zweite PV-Anlage (optional). Format wie forecast1.",
@@ -1117,6 +1117,8 @@ $tooltips = [
     "wb_native_mode"         => "Regelpriorität bei 2 Wallboxen: 0=Ausgeglichen, 1=WB1 bevorzugt, 2=WB2 bevorzugt.",
     "dvcarlimit"             => "Netzpreislimit nur für den Wallbox-Modus 'Sofort bis Preislimit'. Geplante Ladefenster werden dadurch nicht gekürzt, blockiert oder gelöscht.",
     "wb_native_type" => "Wallbox-Typ und zugehörige Anbindung für Wallbox 1 auswählen. Die Auswahl bestimmt den Treiber und die verfügbaren Funktionen für den jeweiligen Wallbox-Typ.",
+    "wb1_e3dc_device_family" => "Modell der Multi Connect angeben. Nur bei Multi Connect II übernimmt die Wallbox im Sonnenmodus die Phasenumschaltung selbst. Ohne Angabe gilt das bisherige Verhalten.",
+    "wb2_e3dc_device_family" => "Modell der Multi Connect angeben. Nur bei Multi Connect II übernimmt die Wallbox im Sonnenmodus die Phasenumschaltung selbst. Ohne Angabe gilt das bisherige Verhalten.",
     "wb1_e3dc_wbchar6_compat_enable" => "Empfohlene Community-Regelung für E3/DC efy, Easy Connect und bestehende E3/DC-Anlagen: Modus und Strom laufen über den flüchtigen WBchar6-Rahmen. Startimpulse sind je bestätigter Stop-Episode begrenzt.",
     "wb_e3dc_direct_phase_control_enable" => "Experimentell, Standard aus. Ein: E3DC-Control schaltet bei ausdrücklich gewählter E3/DC efy oder Multi Connect die Phasen selbst. Je Phasenwechsel werden die Geräteeinstellungen Sonnenmodus, automatische Phasenumschaltung und Phasenzahl geschrieben und bei der Rückgabe wiederhergestellt. Ob die Wallbox diese Einstellungen dauerhaft speichert, ist nicht belegt – nicht für den Dauerbetrieb empfohlen. Solange der Schalter an ist, gibt es keine Sonnenmodus-Übergabe an die E3/DC-Automatik. Je Wallbox überschreibbar mit wb1_/wb2_e3dc_direct_phase_control_enable.",
     "wb_native_ip"           => "IP-Adresse Wallbox 1 (leer bei E3DC-eigener Wallbox, die per RSCP gesteuert wird).",
@@ -4478,6 +4480,40 @@ if ($configEditorRequestMethod === 'POST') {
         // eine spätere Runtime- oder Plan-Action vorbereiten.
         $posted_values['storage_forecast_shortfall_aux_ac_charge_enable'] = '0';
 
+        $normalize_wb_type_for_save = function($type) {
+            $type = strtolower(trim((string)$type));
+            $aliases = [
+                'goe' => 'go-e',
+                'openwb-pro' => 'openwb_pro',
+                'openwbpro' => 'openwb_pro',
+                'e3dc_multi_connect' => 'e3dc_multi',
+                'e3dc-multi' => 'e3dc_multi',
+                'e3dc multi' => 'e3dc_multi',
+                'e3dc_easy' => 'e3dc_easy_connect', // Wie config_manager.WALLBOX_TYPE_ALIASES
+                'e3dc_legacy' => 'e3dc',
+                'native' => 'e3dc',
+                'off' => 'none',
+                'disabled' => 'none',
+            ];
+            return $aliases[$type] ?? $type;
+        };
+        // Die Modellwahl gehört nur zum ausdrücklich geposteten Multi-Connect-Typ.
+        // Bei anderen Typen bleibt eine vorhandene Familienbindung unverändert.
+        foreach ([1 => 'wb_native_type', 2 => 'wb_native_type2'] as $wbId => $typeKey) {
+            if ($normalize_wb_type_for_save($posted_values[$typeKey] ?? '') !== 'e3dc_multi') {
+                unset($posted_values['wb' . $wbId . '_e3dc_device_family']);
+            } else {
+                $modelKey = 'wb' . $wbId . '_e3dc_device_family';
+                $modelValue = $posted_values[$modelKey] ?? null;
+                // Unveränderte Fremdwerte auch mit Leerraum oder Ziffern bytegleich erhalten.
+                if (array_key_exists($modelKey, $v4_data)
+                    && !in_array($modelValue, ['', 'multi_connect', 'multi_connect_ii'], true)
+                    && (string)$modelValue === (string)$v4_data[$modelKey]) {
+                    unset($posted_values[$modelKey]);
+                }
+            }
+        }
+
         foreach ($posted_values as $key => $value) {
             if (is_array($value) || is_object($value)) {
                 continue;
@@ -4523,23 +4559,6 @@ if ($configEditorRequestMethod === 'POST') {
             $v4_data['planned_load_windows'] = $plannedLoadWindowsPosted;
         }
 
-        $normalize_wb_type_for_save = function($type) {
-            $type = strtolower(trim((string)$type));
-            $aliases = [
-                'goe' => 'go-e',
-                'openwb-pro' => 'openwb_pro',
-                'openwbpro' => 'openwb_pro',
-                'e3dc_multi_connect' => 'e3dc_multi',
-                'e3dc-multi' => 'e3dc_multi',
-                'e3dc multi' => 'e3dc_multi',
-                'e3dc_easy' => 'e3dc_easy_connect', // Wie config_manager.WALLBOX_TYPE_ALIASES
-                'e3dc_legacy' => 'e3dc',
-                'native' => 'e3dc',
-                'off' => 'none',
-                'disabled' => 'none',
-            ];
-            return $aliases[$type] ?? $type;
-        };
         if ($normalize_wb_type_for_save($v4_data['wb_native_type'] ?? '') !== 'openwb') {
             $v4_data['wb1_topic_prefix'] = '';
         }
@@ -4737,6 +4756,7 @@ $groups = [
         "matter_bridge"
     ],
     "Wallbox & Fahrzeug" => [
+        "wb1_e3dc_device_family", "wb2_e3dc_device_family",
         "wb1_openwb_username", "wb1_openwb_password", "wb1_openwb_tls_binding",
         "wb2_openwb_username", "wb2_openwb_password", "wb2_openwb_tls_binding",
         "wb_native_enable", "wb_native_mode", "wb_native_type", "wb_native_ip", "wb_native_cp_id", "wb1_topic_prefix", "wb_native_type2", "wb_native_ip2", "wb2_topic_prefix", "wb_native_eco", "dvcarlimit",
@@ -4903,6 +4923,7 @@ $groups = [
     "Sonstiges" => []
 ];
 $frontendHiddenKeys = [
+    'e3dc_device_family',
     "direct_marketing_e3dc_export_execution_owner",
     "storage_absorb_pct", "storage_release_pct", "storage_hysteresis_cycles",
     "netz_laden_enable", "grid_discharge_enable", "netz_laden_price_limit", "netz_entladen_price_limit",
@@ -8241,6 +8262,19 @@ async function readConfirmedConfigJson(response) {
                         </select>
                     </div>
 
+                    <div class="col-md-6" data-wallbox-column="1" id="wb_model_1_wrap"  style="<?= ($wbTypeDisplay === 'e3dc_multi') ? '' : 'display: none;' ?>">
+                        <label class="config-label" for="wb_model_1" data-tooltip="<?= htmlspecialchars($tooltipMap['wb1_e3dc_device_family'] ?? '') ?>">Modell</label>
+                        <?php $multiFamily1 = (string)$rawVal('wb1_e3dc_device_family'); ?>
+                        <select id="wb_model_1" name="values[wb1_e3dc_device_family]" class="form-select config-input" <?= ($wbTypeDisplay === 'e3dc_multi') ? '' : 'disabled' ?>>
+                            <option value="" <?= $multiFamily1 === '' ? 'selected' : '' ?>>nicht festgelegt</option>
+                            <option value="multi_connect" <?= $multiFamily1 === 'multi_connect' ? 'selected' : '' ?>>Multi Connect I</option>
+                            <option value="multi_connect_ii" <?= $multiFamily1 === 'multi_connect_ii' ? 'selected' : '' ?>>Multi Connect II</option>
+                            <?php if (!in_array($multiFamily1, ['', 'multi_connect', 'multi_connect_ii'], true)): ?>
+                                <option value="<?= htmlspecialchars($multiFamily1) ?>" selected>bisheriger Wert: <?= htmlspecialchars($multiFamily1) ?></option>
+                            <?php endif; ?>
+                        </select>
+                    </div>
+
                     <div class="col-md-6" data-wallbox-column="1">
                         <label class="config-label text-warning" data-tooltip="<?= htmlspecialchars($tooltipMap['wb_native_ip'] ?? '') ?>">Wallbox 1 IP-Adresse</label>
                         <input type="text" id="wb_ip_1" name="values[wb_native_ip]" class="form-control config-input" value="<?= htmlspecialchars($val('wb_native_ip')) ?>" placeholder="z.B. 192.0.2.50">
@@ -8307,6 +8341,19 @@ async function readConfirmedConfigJson(response) {
                             <option value="e3dc_multi" <?= ($wbType2 === 'e3dc_multi') ? 'selected' : '' ?>>E3/DC Multi Connect I/II</option>
                             <option value="e3dc" <?= ($wbType2 === 'e3dc') ? 'selected' : '' ?>>E3/DC-Altbestand / WBchar6 explizit</option>
                             <option value="dummy" <?= ($wbType2 === 'dummy') ? 'selected' : '' ?>>Dummy / Test</option>
+                        </select>
+                    </div>
+
+                    <div class="col-md-6" data-wallbox-column="2" id="wb_model_2_wrap" <?= $hasSecondWallbox ? '' : 'hidden' ?> style="<?= ($wbType2 === 'e3dc_multi') ? '' : 'display: none;' ?>">
+                        <label class="config-label" for="wb_model_2" data-tooltip="<?= htmlspecialchars($tooltipMap['wb2_e3dc_device_family'] ?? '') ?>">Modell</label>
+                        <?php $multiFamily2 = (string)$rawVal('wb2_e3dc_device_family'); ?>
+                        <select id="wb_model_2" name="values[wb2_e3dc_device_family]" class="form-select config-input" <?= ($wbType2 === 'e3dc_multi') ? '' : 'disabled' ?>>
+                            <option value="" <?= $multiFamily2 === '' ? 'selected' : '' ?>>nicht festgelegt</option>
+                            <option value="multi_connect" <?= $multiFamily2 === 'multi_connect' ? 'selected' : '' ?>>Multi Connect I</option>
+                            <option value="multi_connect_ii" <?= $multiFamily2 === 'multi_connect_ii' ? 'selected' : '' ?>>Multi Connect II</option>
+                            <?php if (!in_array($multiFamily2, ['', 'multi_connect', 'multi_connect_ii'], true)): ?>
+                                <option value="<?= htmlspecialchars($multiFamily2) ?>" selected>bisheriger Wert: <?= htmlspecialchars($multiFamily2) ?></option>
+                            <?php endif; ?>
                         </select>
                     </div>
 
@@ -8510,6 +8557,10 @@ async function readConfirmedConfigJson(response) {
                                 const typeSelect = document.getElementById('wb_type_' + id);
                                 const ipInput = document.getElementById('wb_ip_' + id);
                                 if (!typeSelect || !ipInput) return;
+                                const modelWrap = document.getElementById('wb_model_' + id + '_wrap');
+                                const modelSelect = document.getElementById('wb_model_' + id);
+                                if (modelWrap) modelWrap.style.display = typeSelect.value === 'e3dc_multi' ? '' : 'none';
+                                if (modelSelect) modelSelect.disabled = typeSelect.value !== 'e3dc_multi';
 
                                 if (typeSelect.value === 'e3dc' || typeSelect.value === 'e3dc_auto' || typeSelect.value === 'e3dc_multi') {
                                     ipInput.disabled = true;
@@ -12634,7 +12685,7 @@ async function readConfirmedConfigJson(response) {
                     $cur_fc1      = $config['forecast1']['value'] ?? '';
                     $cur_fc2      = $config['forecast2']['value'] ?? '';
                     $cur_fc3      = $config['forecast3']['value'] ?? '';
-                    // Standardmitte Deutschland (Wald bei Fulda)
+                    // Mitte Deutschlands
                     $de_mitte_lat = '51.163375';
                     $de_mitte_lon = '10.447683';
                     // Vorschlag für forecast1: kWp aus RSCP, Süd=0°, Dach 35°

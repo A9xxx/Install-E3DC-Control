@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.5.5a Stable</span>
+            <span class="badge bg-success text-light">v5.5.5b Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.5.5a</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.5.5b</code> in <code>.env</code> gesetzt.</p>
                 <p><strong>Update-Knopf und Auto-Update:</strong> Der Container tauscht sein Image nicht selbst. Läuft das Compose-Profil <code>auto-update</code> (Watchtower-Fork <code>ghcr.io/nicholas-fedor/watchtower</code>), gibt der Knopf <strong>System Update</strong> Watchtower über dessen lokale HTTP-API das Signal: Watchtower lädt das Image, erstellt den Container neu, und die Oberfläche lädt nach dem Start neu. Mit <strong>Auto-Update</strong> im Config-Editor passiert dasselbe täglich zur eingestellten Uhrzeit; Watchtower selbst pollt nicht. Gibt es kein neues Image, passiert nichts.</p>
                 <p>Einmalige Freischaltung auf dem Docker-Host im Compose-Ordner (Token für beide Dienste in <code>.env</code>, Container mit Token neu erstellen, Watchtower starten):</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
@@ -240,6 +240,16 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
         Ohne getrennte Nachricht unter <code>in/heatpump/electric_w</code> bleiben elektrische Einzelleistung und COP unbekannt.
         Ein getrenntes frisches <code>electric_w</code> ermöglicht den COP bei ebenfalls frischer Heizleistung.
         <?= e3dcDocLink('Smart_Home_Mqtt_Websockets.md', 'MQTT-Topics und Einheiten') ?></div>
+        <h4 class="mb-4 text-accent">Stable 5.5.5b: Wärmepumpe bei unbekanntem Ladezustand, Multi Connect II, Standortvorgabe</h4>
+        <div class="col-12 faq-item" data-tags="5.5.5b stable wärmepumpe heizstab soc ladezustand unbekannt mindestlaufzeit shelly pro3em relais elwa multi connect ii modell phasen sonnenmodus standort pv-prognose breitengrad längengrad update">
+            <div class="card bg-card border-0 shadow-sm"><div class="card-body">
+                <h5 class="card-title">Was bringt Stable-Release 5.5.5b?</h5>
+                <p>5.5.5b ist ein Korrekturupdate zu 5.5.5a. Ist der Ladezustand des Hausakkus unbekannt (fehlende, beschädigte oder veraltete Livedaten, ungültiger oder unplausibler Wert), erteilt der automatische Regelpfad des Heizstab-Managers keine neuen Starts oder Leistungsfreigaben. Bisher galt ein fehlender Wert als 0 %; bei „Mindest-SOC (%)“ = 0 konnte daraus eine Freigabe entstehen. Eine von E3DC-Control eingeschaltete Wärmepumpe am Shelly-Pro3EM-Relais beendet ihre Mindestlaufzeit und erhält danach einen Aus-Auftrag, statt sofort abgeschaltet zu werden. Ein unabhängiger, automatisch geregelter Heizstab wird zurückgenommen; der manuelle Vollgasauftrag ist nicht betroffen.</p>
+                <p>Für die E3/DC Multi Connect II gibt es bei „Wallbox 1 Modell / API“ beziehungsweise „Wallbox 2 Modell / API“ = „E3/DC Multi Connect I/II“ das neue Feld „Modell“. Mit „Multi Connect II“ schaltet im Sonnenmodus nur die Wallbox die Phasen; die eigene 6-A-Phasenerkennung läuft dann nicht mehr parallel. Eine geänderte Auswahl übernimmt der Wallbox-Manager mit einem einmaligen automatischen Neustart, im Docker-Betrieb mit einem Neustart des Containers. „nicht festgelegt“ behält das bisherige Verhalten.</p>
+                <p>Ohne eigenen Breiten- und Längengrad unter „Standort & PV-Prognose“ nutzt die PV-Prognose eine neutrale Vorgabe (Mitte Deutschlands). Die Konfigurationsprüfung empfiehlt dann, den eigenen Standort einzutragen, und blockiert nichts.</p>
+                <p><strong>Update:</strong> Wie gewohnt über <strong>System Update</strong> beziehungsweise das Docker-Update. Eine Konfigurationsänderung ist nicht nötig. Die Änderungen sind mit Simulationen und Gerätemodellen geprüft, ein Praxisnachweis auf mehreren Anlagen steht noch aus.</p>
+            </div></div>
+        </div>
         <h4 class="mb-4 text-accent">Stable 5.5.5a: Hardwareschutz für Wallbox, Speicher und Wärmepumpe</h4>
         <div class="col-12 faq-item" data-tags="5.5.5a stable hardwareschutz wallbox stromstufen schrittweite phasen einphasig pv-aufteilung flattern kurve native e3dc sitzungsenergie lademenge speicher halt notstrom wärmepumpe fremdsperre pause shelly dimplex update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">

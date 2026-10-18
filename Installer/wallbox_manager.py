@@ -9040,8 +9040,10 @@ def _unique_positive_openwb_chargepoints(discovered):
 _PERSISTENT_WALLBOX_STRUCTURE_KEYS = (
     "wb_native_type",
     "wb_native_ip",
+    "wb1_e3dc_device_family",
     "wb_native_type2",
     "wb_native_ip2",
+    "wb2_e3dc_device_family",
     "wb_MQTT_Topic",
     "wb_native_cp_id",
     "wb1_topic_prefix",

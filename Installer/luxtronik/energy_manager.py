@@ -4475,6 +4475,35 @@ def build_central_heatpump_start_budget_gate(
     }
 
 
+def heatpump_foreign_start_lock(wp, wp_type, wp_data, wp_status, *,
+                                own_pause=False, automatic=False, now_ts=None):
+    """Eine fremde Sperre bleibt zu; automatische Starts brauchen frische Rücklesung."""
+    now_value = time.time() if now_ts is None else _safe_float(now_ts, 0.0)
+    if isinstance(wp, ShellyHeatpump) and ShellyHeatpump._relay_configured(wp.pause_ip):
+        # Ohne SG-Kontakt gibt es bisher keine zyklische Pause-Rücklesung.
+        if automatic and not ShellyHeatpump._relay_configured(wp.sg_ip):
+            return ""
+        age_s = now_value - _safe_float(wp.last_live_pause_ts, 0.0)
+        fresh = bool(0.0 <= age_s <= 90.0)
+        if automatic and (type(wp.last_live_pause_state) is not bool or not fresh):
+            return "shelly_pause_readback_unknown_or_stale"
+        if not own_pause and wp.last_live_pause_state is False and fresh:
+            return "shelly_pause_contact_off"
+    elif wp_type == 5 and isinstance(wp, DimplexHeatpump):
+        if automatic:
+            source_ts = _strict_storage_budget_ts((wp_status or {}).get("source_ts"))
+            if (not isinstance(wp_status, dict) or wp_status.get("valid") is not True
+                    or source_ts is None or not 0.0 <= now_value - source_ts <= 90.0
+                    or _safe_int(wp_data.get("dimplex_sg_value"), -1)
+                    not in (wp.SG_NORMAL, wp.SG_GREEN, wp.SG_RED, wp.SG_DARK_GREEN)):
+                return "dimplex_sg_readback_unknown_or_stale"
+        if (not own_pause and isinstance(wp_status, dict)
+                and wp_status.get("valid") is True
+                and _safe_int(wp_data.get("dimplex_sg_value"), -1) == DimplexHeatpump.SG_RED):
+            return "dimplex_sg_red"
+    return ""
+
+
 def bound_central_heatpump_command_cap_w(
     storage_budget_contract,
     projected_heatpump_budget_w,
@@ -10394,6 +10423,8 @@ def cleanup_legacy_energy_state_file(path=LEGACY_ENERGY_STATE_FILE):
 
 
 ENERGY_RESTART_CHECKPOINT_KEYS = (
+    "automatic_heat_foreign_sg_release_pending",
+    "automatic_heat_foreign_restart_not_before_ts",
     "wp_compressor_observation_valid",
     "wp_compressor_running",
     "wp_compressor_last_start_ts",
@@ -10436,6 +10467,8 @@ ENERGY_RESTART_CHECKPOINT_KEYS = (
 # und im erzwungenen Neustartcheckpoint. Nur die gemessenen Start-/Stoppanker
 # erzeugen eine Laufwechselkante; Messlücken allein schreiben nicht erneut.
 ENERGY_RESTART_SEMANTIC_KEYS = (
+    "automatic_heat_foreign_sg_release_pending",
+    "automatic_heat_foreign_restart_not_before_ts",
     "wp_compressor_last_start_ts",
     "wp_compressor_last_stop_ts",
     "heatpump_pv_transition",
@@ -11510,6 +11543,14 @@ def main():
     last_idm_cooling_gate_log_time = 0.0
     pv_boost_pending_start = None
     pv_boost_retry_not_before_ts = 0.0
+    # Ohne bestätigten Neustartbeleg gibt nur frisches SG-Aus wieder frei.
+    automatic_heat_foreign_sg_configured = bool(
+        isinstance(wp, ShellyHeatpump) and ShellyHeatpump._relay_configured(wp.sg_ip)
+    )
+    automatic_heat_foreign_lock_seen = automatic_heat_foreign_sg_configured
+    automatic_heat_foreign_sg_release_confirmed = not automatic_heat_foreign_sg_configured
+    automatic_heat_foreign_sg_release_requested_this_process = False
+    automatic_heat_foreign_restart_not_before_ts = 0.0
     # Stiebel-ISG: die Warnung „Start PV-Boost nicht bestätigt … gesperrt“ nur
     # einmal je Sperr-Episode des Treibers, danach DEBUG.
     pv_boost_unconfirmed_warned_episode = None
@@ -11596,6 +11637,31 @@ def main():
         auto_mode_enabled=startup_auto_mode_enabled,
     )
     previous_state = load_previous_energy_state()
+    saved_foreign_sg = (previous_state or {}).get("data") or {}
+    if (automatic_heat_foreign_sg_configured
+            and saved_foreign_sg.get("schema_version") in (None, "energy_manager_restart_checkpoint_v1")):
+        saved_foreign_restart_floor = (
+            _luxtronik_pv_number(saved_foreign_sg.get("automatic_heat_foreign_restart_not_before_ts"))
+            if "automatic_heat_foreign_restart_not_before_ts" in saved_foreign_sg else 0.0
+        )
+        # Eine korrigierte Uhr darf keine beliebig lange Zusatzsperre erben.
+        # Ohne plausiblen Zeitbezug verdient frisches SG-Aus beide Fristen neu.
+        restart_revalidation_window_s = (
+            max(0.0, _safe_float(get_cfg_value(startup_config, 'wp_restart_block_min', 20.0), 20.0)) * 60.0
+            + max(0.0, get_cfg_int(startup_config, 'pv_boost_delay', 30))
+        )
+        saved_foreign_checkpoint_ts = _heat_contract_ts(saved_foreign_sg.get("ts"))
+        latest_plausible_foreign_ts = time.time() + restart_revalidation_window_s
+        if (saved_foreign_restart_floor is not None
+                and 0.0 <= saved_foreign_restart_floor <= latest_plausible_foreign_ts
+                and (saved_foreign_checkpoint_ts is None
+                     or saved_foreign_checkpoint_ts <= latest_plausible_foreign_ts)):
+            automatic_heat_foreign_restart_not_before_ts = saved_foreign_restart_floor
+            if saved_foreign_sg.get("automatic_heat_foreign_sg_release_pending") is False:
+                # Nur der explizite Abschluss belegt eine abgeschlossene Episode.
+                # Eine offene Rücknahme verfällt auch bei altem Checkpoint nicht.
+                automatic_heat_foreign_sg_release_confirmed = True
+                automatic_heat_foreign_lock_seen = False
     heatpump_pv_state = copy.deepcopy(((previous_state or {}).get("data") or {}).get("heatpump_pv_state") or {})
     if not isinstance(heatpump_pv_state, dict):
         heatpump_pv_state = {}
@@ -15723,8 +15789,91 @@ def main():
                     if heatpump_soc_state["below_stop_threshold"]:
                         automatic_soc_start_allowed = False
                     central_heatpump_start_budget_gate["soc"] = dict(heatpump_soc_state)
+                    automatic_heat_foreign_lock = heatpump_foreign_start_lock(
+                        wp, wp_type, wp_data, wp_status,
+                        own_pause=bool(pre_pause_active or pv_pause_active),
+                        automatic=True, now_ts=time.time(),
+                    )
+                    automatic_heat_restart_left_s = heatpump_takt_start_block(
+                        WP_TAKT_PROTECT,
+                        heatpump_restart_anchor_ts(
+                            wp_last_pv_boost_stop_ts,
+                            observation_valid=wp_compressor_observation_valid,
+                            compressor_stop_ts=wp_compressor_last_stop_ts,
+                        ),
+                        WP_RESTART_BLOCK_MIN,
+                    )
+                    if automatic_heat_foreign_lock in (
+                        "shelly_pause_contact_off", "dimplex_sg_red",
+                    ):
+                        if (not automatic_heat_foreign_lock_seen
+                                and automatic_heat_foreign_sg_release_confirmed
+                                and not manual_ww_active
+                                and isinstance(wp, ShellyHeatpump)
+                                and (wp.sg_state is True or wp.last_live_sg_state is True)):
+                            # Nur das eigene SG-Angebot zurücknehmen. set_boost(0)
+                            # würde den fremden Pause-Kontakt wieder einschalten.
+                            automatic_heat_foreign_sg_release_requested_this_process = True
+                            automatic_heat_foreign_sg_release_confirmed = bool(
+                                wp_write_allowed and wp.release_sg_contact("foreign_pause_contact_off")
+                            )
+                            if automatic_heat_foreign_sg_release_confirmed:
+                                automatic_heat_foreign_sg_release_requested_this_process = False
+                                last_wp_command_time = time.time()
+                                # Bestätigte Befehlsrücknahme ist kein
+                                # gemessener Verdichterstopp.
+                                wp_last_pv_boost_stop_ts = time.time()
+                            else:
+                                logger.warning(
+                                    "Fremde Wärmepumpensperre: SG-Rücknahme nicht bestätigt; "
+                                    "keine neue automatische Freigabe."
+                                )
+                        automatic_heat_foreign_lock_seen = True
+                        if (automatic_heat_foreign_sg_configured
+                                and not (wp.last_live_sg_state is False
+                                         and 0.0 <= time.time() - _safe_float(wp.last_live_sg_ts, 0.0) <= 90.0)):
+                            # Auch eine gesehene Sperre ohne lesbaren SG-Zustand
+                            # bleibt offen, bis die Rücklesung SG-Aus bestätigt.
+                            automatic_heat_foreign_sg_release_confirmed = False
+                    elif not automatic_heat_foreign_lock and automatic_heat_foreign_lock_seen:
+                        automatic_heat_foreign_lock_seen = False
+                        # Nur automatische Neustarts qualifizieren neu. Der
+                        # Nutzerknopf behält seinen eigenen unveränderten Pfad.
+                        automatic_heat_foreign_restart_not_before_ts = max(
+                            automatic_heat_foreign_restart_not_before_ts,
+                            time.time() + automatic_heat_restart_left_s + max(0.0, PV_BOOST_DELAY),
+                        )
+                    if (not automatic_heat_foreign_sg_release_confirmed
+                            and automatic_heat_foreign_sg_configured
+                            and wp.last_live_sg_state is False
+                            and 0.0 <= time.time() - _safe_float(wp.last_live_sg_ts, 0.0) <= 90.0):
+                        automatic_heat_foreign_sg_release_confirmed = True
+                        automatic_heat_foreign_lock_seen = True
+                        if automatic_heat_foreign_sg_release_requested_this_process:
+                            # Nur die Quittung einer hier angeforderten Rücknahme
+                            # gehört in den gemeinsamen Befehls-Stoppanker.
+                            wp_last_pv_boost_stop_ts = time.time()
+                        automatic_heat_foreign_sg_release_requested_this_process = False
+                        # Neustartprüfung schützt automatische Starts; sie erzeugt
+                        # keinen neuen Stoppanker für den unveränderten Nutzerknopf.
+                        automatic_heat_foreign_restart_not_before_ts = max(
+                            automatic_heat_foreign_restart_not_before_ts,
+                            time.time() + heatpump_takt_start_block(
+                                WP_TAKT_PROTECT, time.time(), WP_RESTART_BLOCK_MIN,
+                            ) + max(0.0, PV_BOOST_DELAY),
+                        )
+                    automatic_heat_foreign_start_floor_ts = automatic_heat_foreign_restart_not_before_ts
+                    if heatpump_budget_demand_class == "pv_surplus" and automatic_heat_foreign_start_floor_ts > 0:
+                        # Der PV-Pfad verdient seine eigene Qualifikation erst
+                        # nach dem Wiederanlaufende; sie zählt hier nicht doppelt.
+                        automatic_heat_foreign_start_floor_ts -= max(0.0, PV_BOOST_DELAY)
                     automatic_heat_start_allowed = bool(
                         automatic_soc_start_allowed
+                        and not automatic_heat_foreign_lock
+                        and not automatic_heat_foreign_lock_seen
+                        and automatic_heat_foreign_sg_release_confirmed
+                        and automatic_heat_restart_left_s <= 0.0
+                        and time.time() >= automatic_heat_foreign_start_floor_ts
                         and heat_demand_owner_allowed
                         and central_heatpump_start_budget_gate.get("allowed")
                         is True
@@ -16555,6 +16704,10 @@ def main():
                             and heatpump_positive_signal_window.get("active")
                             is True
                             and not heatpump_positive_output_blocked_this_cycle
+                            and not automatic_heat_foreign_lock
+                            and not automatic_heat_foreign_lock_seen
+                            and automatic_heat_foreign_sg_release_confirmed
+                            and time.time() >= automatic_heat_foreign_restart_not_before_ts
                             and (time.time() - last_wp_command_time) > 25
                         ):
                             if sg_ready_temperature_control:
@@ -16757,26 +16910,11 @@ def main():
                         # Der Knopf überschreibt keine fremde externe Sperre (Netz-/EVU-
                         # Schutz vor Nutzerwunsch): Ein ausgeschalteter Pause-Kontakt am
                         # Shelly bzw. Dimplex-SG „Rot“ (12) ohne eigene Pause ist fremd.
-                        manual_ww_foreign_lock = ""
-                        if not (pre_pause_active or pv_pause_active):
-                            if (
-                                isinstance(wp, ShellyHeatpump)
-                                and ShellyHeatpump._relay_configured(wp.pause_ip)
-                                and wp.last_live_pause_state is False
-                                and 0.0
-                                <= time.time() - _safe_float(wp.last_live_pause_ts, 0.0)
-                                <= 90.0
-                            ):
-                                manual_ww_foreign_lock = "shelly_pause_contact_off"
-                            elif (
-                                wp_type == 5
-                                and isinstance(wp, DimplexHeatpump)
-                                and isinstance(wp_status, dict)
-                                and wp_status.get("valid") is True
-                                and _safe_int(wp_data.get("dimplex_sg_value"), -1)
-                                == DimplexHeatpump.SG_RED
-                            ):
-                                manual_ww_foreign_lock = "dimplex_sg_red"
+                        manual_ww_foreign_lock = heatpump_foreign_start_lock(
+                            wp, wp_type, wp_data, wp_status,
+                            own_pause=bool(pre_pause_active or pv_pause_active),
+                            now_ts=time.time(),
+                        )
                         manual_ww_wait_reason = (
                             heatpump_user_boost_emergency_veto
                             or manual_ww_foreign_lock
@@ -17115,7 +17253,7 @@ def main():
                                             pv_boost_last_outcome.get("readback_confirmed"),
                                             pv_boost_last_outcome.get("reason"),
                                         )
-                        elif restart_block_left_s <= 0 and (heatpump_budget_demand_class != "pv_surplus" or not prospective_start_active):
+                        elif automatic_heat_foreign_lock or (restart_block_left_s <= 0 and (heatpump_budget_demand_class != "pv_surplus" or not prospective_start_active)):
                             pv_boost_pending_start = None
 
                     # Der direkte PV-Vertrag besitzt ausschließlich seine HZ-
@@ -18303,6 +18441,8 @@ def main():
                 "heatpump_pv_hold_decision": copy.deepcopy(heatpump_pv_hold_decision),
                 "heatpump_pv_last_signal_release": copy.deepcopy(heatpump_pv_last_signal_release),
                 "ts": now.isoformat(), "data": wp_data, "status": wp_status,
+                "automatic_heat_foreign_sg_release_pending": not automatic_heat_foreign_sg_release_confirmed,
+                "automatic_heat_foreign_restart_not_before_ts": automatic_heat_foreign_restart_not_before_ts,
                 "boost_active": boost_active, "auto_mode": AUTO_MODE,
                 "daily_boost_counter": daily_boost_counter,
                 "last_pv_boost_time": last_pv_boost_time,

@@ -6297,8 +6297,9 @@ if (is_array($liveData) && isset($liveData['PV_Power'])) {
                 }
                 // RSCP Session-kWh direkt ans Frontend weitergeben (verhindert Integrations-Fehler)
                 if (($wbLiveSession['source'] ?? '') === 'rscp' && $carConnected) {
-                    $rscp_session_kwh = (float)($wbLiveSession['session_kwh'] ?? 0);
-                    if ($rscp_session_kwh >= 0) {
+                    $rscp_session_kwh = $wbLiveSession['session_kwh'] ?? null;
+                    if (is_numeric($rscp_session_kwh) && $rscp_session_kwh >= 0
+                        && ($wbLiveSession['session_kwh_valid'] ?? true) === true) {
                         $data['python_wb1_session_kwh'] = round($rscp_session_kwh, 3);
                     }
                 }
@@ -7996,10 +7997,30 @@ $nativeWbSession = isset($liveData) ? ($liveData['Wallbox_Energy_kWh'] ?? $liveD
 // NEU: Verwende priorisiert den direkten Wallbox Total-Zähler, falls Python uns diesen für eine Fremd-Wallbox holt!
 if (isset($data['python_wb1_total_kwh'])) {
     $nativeWbSession = $data['python_wb1_total_kwh'];
-} elseif (isset($data['python_wb1_session_kwh'])) {
-    $nativeWbSession = $data['python_wb1_session_kwh'];
 } else if (!empty($data['is_external_wb'])) {
     $nativeWbSession = null;
+}
+
+// Sitzungsenergie ist bereits relativ zur Stecksession, kein Gesamtzähler.
+$managerSessionKwh = [];
+$managerSession = liveJsonReadNativeRscpSession(20.0);
+if (is_array($managerSession) && ($managerSession['source'] ?? '') === 'rscp'
+    && time() - (float)($managerSession['ts'] ?? 0) <= 20
+    && (float)($managerSession['ts'] ?? 0) <= time() + 5) {
+    $sessionMembers = $managerSession['wallboxes'] ?? [(string)($managerSession['wb_id'] ?? 1) => $managerSession];
+    foreach ([1 => $wbConfigured, 2 => $wb2Configured] as $slot => $configured) {
+        $slotType = normalizeWallboxTypeConfig($confData['config'][$slot === 1 ? 'wb_native_type' : 'wb_native_type2'] ?? '');
+        $member = $sessionMembers[(string)$slot] ?? null;
+        if ($configured && strpos($slotType, 'e3dc') === 0 && is_array($member)
+            && ($member['source'] ?? '') === 'rscp'
+            && time() - (float)($member['ts'] ?? 0) <= 20
+            && (float)($member['ts'] ?? 0) <= time() + 5
+            && ($member['session_kwh_valid'] ?? false) === true
+            && is_numeric($member['session_kwh'] ?? null)
+            && is_finite((float)$member['session_kwh']) && $member['session_kwh'] >= 0) {
+            $managerSessionKwh[$slot] = (float)$member['session_kwh'];
+        }
+    }
 }
 
 // Vor Session-Integratoren und Statistikschreibpfaden gilt bereits derselbe
@@ -8067,7 +8088,9 @@ if ($validData && !$isStandby) {
                     $wbState['daily_kwh'] = max(0.0, (float)($wbState['daily_kwh'] ?? 0)) + ($currentWbPower * $dailyDt) / 3600000;
                 }
                 $wbState['daily_last_ts'] = $nowTs;
-                if ($nativeWbSession !== null && (float)$nativeWbSession > 0.001) {
+                if (isset($managerSessionKwh[1])) {
+                    $wbState['kwh'] = $managerSessionKwh[1];
+                } elseif ($nativeWbSession !== null && (float)$nativeWbSession > 0.001) {
                     $startKwh = $wbState['start_kwh'] ?? 0;
                     if ((float)$nativeWbSession < $startKwh) { $wbState['start_kwh'] = 0; $startKwh = 0; }
                     $wbState['kwh'] = (float)$nativeWbSession - $startKwh;
@@ -8077,6 +8100,7 @@ if ($validData && !$isStandby) {
                 }
                 $wbState['last_ts'] = $nowTs;
             }
+            if (isset($managerSessionKwh[1])) { $wbState['kwh'] = $managerSessionKwh[1]; }
         } else {
             if ($wbState['is_locked']) {
                 // Grace-Period: Session wird erst nach 90s zuverlässig fehlender Verbindung beendet.
@@ -8149,9 +8173,11 @@ if ($validData && !$isStandby) {
                 $wb2State['last_ts'] = $nowTs; $wb2State['kwh'] = 0;
             } else {
                 $dt = $nowTs - $wb2State['last_ts'];
-                if ($dt > 0 && $dt < 3600) { $wb2State['kwh'] += ($currentWb2Power * $dt) / 3600000; }
+                if (isset($managerSessionKwh[2])) { $wb2State['kwh'] = $managerSessionKwh[2]; }
+                elseif ($dt > 0 && $dt < 3600) { $wb2State['kwh'] += ($currentWb2Power * $dt) / 3600000; }
                 $wb2State['last_ts'] = $nowTs;
             }
+            if (isset($managerSessionKwh[2])) { $wb2State['kwh'] = $managerSessionKwh[2]; }
         } else {
             if ($wb2State['is_locked']) {
                 if ($wb2State['kwh'] > 0.01 && !empty($wb2State['start_ts'])) {
@@ -8190,6 +8216,9 @@ if ($validData && !$isStandby) {
 } elseif ($wb2Configured && file_exists($wb2StateFile)) {
     $parsed2 = @json_decode(file_get_contents($wb2StateFile), true);
     $data['wb2_session_kwh'] = round($parsed2['kwh'] ?? 0, 2);
+}
+foreach ($managerSessionKwh as $slot => $energyKwh) {
+    $data[$slot === 1 ? 'wb_session_kwh' : 'wb2_session_kwh'] = round($energyKwh, 2);
 }
 
 // --- MQTT/HA Eingangs-Telemetrie: kontrollierte Smart-Home-Bruecke ---

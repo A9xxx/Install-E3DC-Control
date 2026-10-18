@@ -1934,98 +1934,102 @@ def step_group_deficit(
 
 
 def raise_settle_contract(
-    *,
-    target_amp: Any,
-    base_amp: Any,
-    running: bool,
-    now_ts: Any,
-    last_raise_ts: Any,
-    settle_s: Any,
-    max_step_a: Any = 2.0,
-    current_step_amp: Any = 1.0,
-    grid_import_w: Any = None,
-    import_tolerance_w: Any = 200.0,
-    import_episode_active: bool = False,
-    live_valid: bool = False,
-    bypass: bool = False,
+    *, target_amp: Any, base_amp: Any, running: bool, now_ts: Any,
+    last_raise_ts: Any, settle_s: Any, max_step_a: Any = 2.0,
+    current_step_amp: Any = 1.0, grid_import_w: Any = None,
+    import_tolerance_w: Any = 200.0, import_episode_active: bool = False,
+    live_valid: bool = False, bypass: bool = False,
+    previous: Any = None, sample_ts: Any = None, watts_per_amp: Any = 690.0,
+    actual_power_w: Any = None, command_confirmed: bool = True,
 ) -> Dict[str, Any]:
-    """Anhebung einer laufenden Ladung erst nach Beruhigung, in kleinen Stufen.
+    """Eine gemeinsame Anhebungsfreigabe nach 45 s kohärenter Deckung.
 
-    Gegenstück zur Einschwingfrist des Defizitreglers: Eine Anhebung zieht
-    zusätzliche Leistung, die der Speicher erst nach seiner Reaktionszeit
-    ausgleicht. Die nächste Anhebung folgt deshalb erst, wenn seit der letzten
-    ausgeführten Anhebung ``settle_s`` vergangen sind, kein Netzbezug über der
-    Toleranz gemessen wird und keine Bezugsepisode des Defizitreglers offen
-    ist; sie beträgt höchstens ``max_step_a`` über dem zuletzt gesetzten
-    Strom. Fehlen gültige Live-Daten, wird nicht angehoben. Absenkungen, ein
-    Start aus dem Stillstand und freigegebene Netz-/Preisfenster (``bypass``)
-    bleiben unberührt.
+    Reine Stromänderungen verdienen keine zusätzliche Ampere-Treppe. Vor
+    einer Anhebung muss der Netzpunkt die zusätzliche Leistung aber bereits
+    tragen: Akkuladung ist keine sofort verfügbare Einspeisung. Dadurch wird
+    die Totzeit des Speichers nicht auf Kosten von Netzbezug übersprungen.
+    Absenkung, Mindeststart und ausdrücklich freigegebene Netzfenster bleiben
+    an ihre vorhandenen Ausgangsverträge gebunden.
     """
+    def num(value, default=0.0):
+        result = _finite(value)
+        return float(default) if result is None else float(result)
 
-    def _num(value: Any, default: float) -> float:
-        number = _finite(value)
-        return float(default) if number is None else float(number)
-
-    step = max(0.1, min(16.0, _num(current_step_amp, 1.0)))
-    target = max(0.0, _num(target_amp, 0.0))
-    base = max(0.0, _num(base_amp, 0.0))
-    settle = max(0.0, _num(settle_s, 0.0))
-    max_step = max(step, _num(max_step_a, 2.0))
-    now = _num(now_ts, 0.0)
-    last = _finite(last_raise_ts)
-    since_raise_s = (now - float(last)) if last is not None and last > 0.0 else None
+    step = max(0.1, min(1.0, num(current_step_amp, 1.0)))
+    target = _round_down_to_step(max(0.0, num(target_amp)), step)
+    base = max(0.0, num(base_amp))
+    now = num(now_ts)
+    sample = _finite(sample_ts)
     grid = _finite(grid_import_w)
-    tolerance = max(0.0, _num(import_tolerance_w, 200.0))
-    result: Dict[str, Any] = {
-        "contract": "wallbox_raise_settle_v1",
-        "target_amp": round(target, 3),
-        "base_amp": round(base, 3),
-        "applied_amp": round(target, 3),
-        "limited": False,
-        "reason": "",
-        "settle_s": round(settle, 3),
-        "max_step_a": round(max_step, 3),
-        "since_last_raise_s": (
-            round(since_raise_s, 3) if since_raise_s is not None else None
-        ),
+    tolerance = max(0.0, num(import_tolerance_w, 200.0))
+    per_amp = max(230.0, num(watts_per_amp, 690.0))
+    settle = max(0.0, num(settle_s))
+    last = _finite(last_raise_ts)
+    since = now - last if last is not None and last > 0 else None
+    prior = previous if isinstance(previous, dict) else {}
+    confirmation_s = max(45.0, settle)
+    result = {
+        "contract": "wallbox_raise_settle_v1", "target_amp": target,
+        "base_amp": base, "applied_amp": target, "limited": False,
+        "reason": "no_raise", "settle_s": settle,
+        "since_last_raise_s": since, "confirmation_s": confirmation_s,
+        "sample_ts": sample, "candidate_since_ts": None,
+        "candidate_amp": None, "confirmed_frames": 0,
+        "released_ts": None, "released_target_amp": None,
+        "source_ready": False,
     }
     if target <= base + step * 0.5:
-        result["reason"] = "no_raise"
         return result
     if bypass:
         result["reason"] = "bypass"
         return result
-    if settle <= 0.0:
-        result["reason"] = "disabled"
-        return result
-    if not running or base <= 0.0:
+    if not running or base < 6.0:
+        # Der Mindeststart wird durch die vorhandenen Start- und Ausgangsgates
+        # begrenzt. Ein alter angebotener Strom darf den Wiederanlauf nicht
+        # als vermeintliche Anhebung einer laufenden Ladung blockieren.
         result["reason"] = "not_running"
         return result
-    hold_reason = ""
-    if not live_valid or grid is None:
-        hold_reason = "live_invalid"
+    blocker = ""
+    if not live_valid or grid is None or sample is None or not 0 <= now - sample <= 15.0:
+        blocker = "live_invalid"
+    elif not command_confirmed:
+        blocker = "command_readback_wait"
     elif grid > tolerance:
-        hold_reason = "grid_import"
+        blocker = "grid_import"
     elif import_episode_active:
-        hold_reason = "import_episode_open"
-    elif since_raise_s is not None and since_raise_s + 1e-9 < settle:
-        hold_reason = "settle_wait"
-    if hold_reason:
-        result.update({
-            "applied_amp": round(base, 3),
-            "limited": True,
-            "reason": hold_reason,
-        })
+        blocker = "import_episode_open"
+    elif since is not None and since + 1e-9 < settle:
+        blocker = "settle_wait"
+    # Kein Akku-Sollwert und keine doppelte Verbrauchersubtraktion: nur der
+    # jetzt am PCC belegte zusätzliche Spielraum, innerhalb des Wattvertrags.
+    measured = _finite(actual_power_w)
+    required_w = max(0.0, target * per_amp - (measured if measured is not None else base * per_amp))
+    source_ready = grid is not None and required_w <= max(0.0, -grid) + tolerance
+    result["source_ready"] = source_ready
+    if not blocker and not source_ready:
+        blocker = "source_reaction_wait"
+    if blocker:
+        result.update(applied_amp=base, limited=True, reason=blocker)
         return result
-    ceiling = _round_down_to_step(base + max_step, step)
-    applied = min(target, ceiling)
-    if applied <= base + 1e-9:
-        applied = min(target, base + step)
-    result.update({
-        "applied_amp": round(applied, 3),
-        "limited": bool(applied + 1e-9 < target),
-        "reason": "raise_step" if applied + 1e-9 < target else "raise",
-    })
+    candidate = _finite(prior.get("candidate_amp"))
+    since_sample = _finite(prior.get("candidate_since_ts"))
+    previous_sample = _finite(prior.get("sample_ts"))
+    same_candidate = bool(candidate is not None and since_sample is not None
+        and previous_sample is not None and 0 <= sample - previous_sample <= 15.0
+        and abs(target - candidate) * per_amp <= 100.0
+        and abs(base - num(prior.get("base_amp"))) < step * 0.5)
+    if same_candidate:
+        frames = int(prior.get("confirmed_frames", 0)) + int(sample > previous_sample)
+        candidate = min(candidate, target)
+    else:
+        since_sample, candidate, frames = sample, target, 1
+    result.update(candidate_since_ts=since_sample, candidate_amp=candidate,
+                  confirmed_frames=frames)
+    if frames >= 2 and sample - since_sample >= confirmation_s:
+        result.update(applied_amp=candidate, limited=bool(candidate + 1e-9 < target), reason="measurement_confirmed",
+                      confirmed_ts=now, released_target_amp=candidate)
+    else:
+        result.update(applied_amp=base, limited=True, reason="confirmation_wait")
     return result
 
 

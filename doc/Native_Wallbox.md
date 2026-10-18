@@ -1653,3 +1653,43 @@ erhalten. Sofortladen wird für die jeweilige Wallbox über den Modus
 Die Konfigurationsvariablen `wbhour`, `wb_sofort`, `wbvon` und `wbbis` bleiben
 für die Ladeplanung verfügbar. Veraltete Direktsteuerungsformulare ändern
 keine Einstellungen.
+
+### Stromauflösung, bestätigte Anhebung und gedeckter 1p-Wiederanlauf
+
+Die aktive Regelung erhält die vom Treiber unterstützte, mit
+`wb1_current_step_amp` beziehungsweise `wb2_current_step_amp` gewählte
+Schrittweite (0,1, 0,5 oder 1 A) bis zum Strombefehl. Sicherheitsdeckel werden
+immer abwärts auf die Gerätestufe gerundet. Ganze Ampere bleiben für Geräte
+mit 1-A-Fähigkeit verbindlich.
+
+Eine gemeinsame Anhebungsentscheidung gilt für den direkten und den allgemeinen
+Regelpfad. Eine laufende Ladung erhält nach mindestens 45 s kohärenter Deckung
+und verschiedenen frischen Messframes den freigegebenen Zielstrom ohne weitere
+2-A-Treppe. Der Netzpunkt muss den zusätzlichen Strom tragen; Akkuladung allein
+ist kein Beleg für sofort verfügbare Leistung. Ungültige Daten, Bezug über der
+Toleranz, ein offenes Defizitkonto oder ein gesunkener Rahmen setzen die
+Bestätigung zurück. Watt-, Hausanschluss-, Phasen- und Startfenstergrenzen sowie
+Option B bleiben bindend. Absenkungen warten nicht auf diese Bestätigung.
+
+Reicht der individuelle Anteil nicht für das dreiphasige Mindestangebot, wird
+im selben Verbrauchervertrag die einphasige Fortsetzung geprüft. Benötigt
+werden der konfigurierte Mindeststrom mal 230 V und die bestehende Reserve
+`max(150 W, 2 × Schrittweite × 230 W/A)`. Bei 6 A ergibt das 1530, 1610 oder
+1840 W. Diese Reserve ist eine Deckungsbedingung und kein zusätzlicher
+Verbraucherabzug. Eine Transitionsgeneration bleibt über Lease und Retry
+gebunden; sie darf weder ein ungedecktes 3p-Angebot noch einen verfrühten
+Phasenwechsel erzeugen. Ein echter Nullvertrag, fehlende Quellen und Nutzer-Aus
+geben weder Reserve noch Start oder Phasenwechsel frei.
+
+Die bestehende 600-s-Prognosebeobachtung vor dem Abstieg und die mindestens
+480-s-Sperre nach einem Pro-Phasenwechsel bleiben getrennte Schutzzeiten.
+Der Nutzen ist der gedeckte Wiederanlauf nach dem regulären Wechsel; ein
+früherer Abstieg wird daraus nicht abgeleitet. CP-Folge und frischer Zielreadback
+bleiben Voraussetzung, auch nach einem Neustart.
+
+Je Ladepunkt enthält die vorhandene RAM-Diagnose `fine_regulation`: Dauer und
+Export-Wh bei 3p/0 A mit gedeckter 1p-Fortsetzung, individuellen Anteil,
+Mindestangebot, Freigabegrund, Phasenbeleg mit Frist und Herkunft des letzten
+Stromausgangs. `openwb_pro_curve_direct_active` zeigt die Policyfreigabe;
+`direct_path_entered` und der Ausgangsbeleg zeigen den tatsächlich genutzten
+Pfad. Fehlende Quellen stehen als `null` mit Grund in der Diagnose.

@@ -1,3 +1,48 @@
+# E3DC-Control v5.5.5a
+
+E3DC-Control 5.5.5a ist ein Korrekturupdate „Hardwareschutz“ auf Basis von 5.5.5. Es verfeinert die Stromregelung der Wallbox, behebt ein Start-Stopp-Flattern bei der experimentellen zentralen PV-Aufteilung, sichert nativ angebundene E3DC-Wallboxen gegen einen nicht ankommenden Schutzstopp, einen Regelabbruch und einen verlorenen Phasenwechsel-Schutz nach Neustart und ergänzt Schutzfälle im Speicherregler und im Energy Manager der Wärmepumpe. Neue Einstellungen, Dienste oder Dateiformate gibt es nicht.
+
+## Änderungen
+
+- **Wallbox, Stromregelung:**
+  - Die gewählte Schrittweite („WB1 Strom-Schritt“ / „WB2 Strom-Schritt“ unter „Wallbox & Fahrzeug“ → „Ladepunkte: Ströme und Phasen (optional)“, Auswahl „1 A“, „0,5 A“, „0,1 A“) bleibt bis zum Strombefehl erhalten. Sicherheitsgrenzen werden immer abgerundet.
+  - Eine laufende Ladung erreicht den freigegebenen Zielstrom nach mindestens 45 Sekunden kohärenter Deckung und bestätigten Messzyklen ohne weitere 2-A-Treppe. Absenkungen warten nicht auf diese Bestätigung; Watt-, Hausanschluss- und Phasengrenzen bleiben bindend.
+  - Kurze ungültige Wallbox-Messproben (höchstens 15 Sekunden) setzen die laufende Bestätigung einer Anhebung nicht zurück. Dabei wird weder ein Strombefehl gesendet noch ein ungültiger Wert übernommen.
+  - Die Ladeleistung einer externen Wallbox (zum Beispiel go-e) wird nicht ein zweites Mal vom Budget abgezogen; ein Pendeln des Sollstroms nach einem Lastsprung entfällt.
+- **Wallbox, einphasiger Wiederanlauf:** Bei umschaltfähigen Wallboxen wird die einphasige Fortsetzung geprüft, wenn der Anteil für das dreiphasige Mindestangebot nicht reicht. Die Sperre von mindestens 480 Sekunden nach einem Phasenwechsel der openWB Pro und die 600-Sekunden-Prognosebeobachtung vor dem Abstieg bleiben unverändert. Der Hilfetext zu „Beharrung 3p→1p (s)“ erklärt diese Verlängerung jetzt.
+- **Zentrale PV-Aufteilung (experimentell, standardmäßig aus):** Nur bei eingeschalteter Option wirkt die Korrektur. Eine Wallbox im Modus „PV-Kurve ruhig“ startete teils für wenige Sekunden und wurde sofort wieder gestoppt, im Abstand von wenigen Minuten wiederholt. E3DC-Control rechnet die Aufteilung jetzt bereits bei gestecktem Fahrzeug; der Akku wird nur bei Ladung, bestätigtem Start oder ausreichendem Kandidaten zusätzlich begrenzt. Der Prognosestopp läuft bei aktivem Rahmen über das begrenzte Energiekonto; Schutzstopps bleiben sofort wirksam. Einstellung: „Speicher & Konfiguration“ → „Experimentelle Speicherregelung“ → „Zentrale PV-Aufteilung Akku/Wallbox (experimentell)“, Auswahl „Aus (Standard)“ oder „Ein“.
+- **Native E3DC-Wallbox:**
+  - Ein Schutzstopp (zum Beispiel wegen der Untergrenze „wbminSoC“) erreicht jetzt auch eine Box, die nach einer Freigabe selbständig mit hohem Strom zu laden beginnt. Zuvor konnte er beim ersten Versuch herabgestuft werden und danach verloren gehen, sodass das Fahrzeug ohne PV aus dem Akku weiterlud. Der Stopp bleibt jetzt vorgemerkt und wird gesendet, sobald ein frischer Status (höchstens 15 Sekunden) eine laufende Ladung belegt; bleibt die Wirkung aus, folgt er nach 30 Sekunden einmal erneut. Eine Box ohne belegte Ladung erhält keinen Stoppbefehl, weil dieser die Box umschaltet. Der Fehler bestand bereits in 5.5.5.
+  - Ein unbekannter rückgemeldeter Stromdeckel bricht den Regelzyklus nicht mehr ab und erteilt keine Startfreigabe.
+  - Die Sperre nach einem Phasenwechsel (mindestens 480 Sekunden) bleibt nach einem Dienst- oder Rechnerneustart erhalten.
+  - Die Sitzungsenergie wird aus der gemeldeten Ladeleistung gebildet, wenn der Gerätezähler fehlt oder bei Leistung 0 meldet. Sie wird neustartfest gesichert, für beide Ladepunkte im Dashboard angezeigt und vom Ladeziel „Lademenge“ („Wallbox & Fahrzeug“ → „Fahrzeug und Ladeziel“ → „Ladeziel festlegen als“ → „Lademenge“) sowie der Fahrzeug-SoC-Schätzung genutzt. Messlücken bleiben als Untergrenze gekennzeichnet.
+- **Speicherregler:**
+  - Der Halt eines geschützten Entlade- oder Lademodus bei ungültigen Messwerten endet nach der Haltefrist (Standard 20 Sekunden) ab dem letzten gültigen Messzeitpunkt und verlängert sich nicht mehr bei jedem Folgewert; ein Uhrrücksprung verlängert ihn nicht.
+  - Ein gemeldeter Inselbetrieb (Code 1 oder 4) hat auch bei einem unplausiblen Messwert Vorrang; gerundete oder nicht ganzzahlige Werte zählen nicht.
+- **Wärmepumpe (Energy Manager):** Automatische Starts (PV-Überschuss, Preis/Markt, Vorab-Entladung, Erneuerung eines positiven Signals) beachten wie der Knopf „WW sofort“ eine fremde Sperre, also einen von außen ausgeschalteten Pause-Kontakt („EVU-Pause Shelly IP (Sperre)“) oder das Dimplex-Signal „Rot“. Unbekannte oder über 90 Sekunden alte Rücklesung hält den automatischen Start zurück. E3DC-Control nimmt ein eigenes SG-Ready-Angebot („SG-Ready Shelly IP (Boost)“) einmal zurück und schreibt den fremden Kontakt nicht; danach gelten Wiederanlaufsperre und neue PV-Qualifikation, auch nach einem Neustart des Energy Managers. Ein Pause-Kontakt ohne SG-Kontakt behält das bisherige Verhalten. Mindestlaufzeit eines laufenden Verdichters und Nutzer-Aus bleiben unverändert.
+- **Diagnose:** Die Wallbox-Diagnose enthält je Ladepunkt den Block `fine_regulation` mit Dauer und Einspeisung im Zustand „drei Phasen, 0 A, einphasig gedeckt“, Freigabegrund, Phasenbeleg und Herkunft des letzten Stromausgangs.
+
+## Hinweise
+
+- **Update:** Von 5.5.5 ist keine Konfigurationsänderung nötig. Alle Einstellungen bleiben erhalten; es kommen keine neuen Einstellungen, Dienste oder Dateiformate hinzu.
+- **Nachweisgrenze:** Die Änderungen sind mit Simulationen, Gerätemodellen und Regressionstests geprüft. Ein Praxisnachweis auf mehreren Anlagen liegt noch nicht vor.
+- **Feine Stromstufen:** Eine Schrittweite unter 1 A nur wählen, wenn Wallbox und Firmware Dezimal-Ampere umsetzen.
+- **Wärmepumpe:** Die Fremdsperren-Erkennung gilt für Shelly-Pausekontakte mit eingerichtetem SG-Kontakt und für Dimplex-SG. Andere Stopp-Wege der Wärmepumpe sind nicht verändert.
+- **Bekannte Grenzen der Wallbox-Regelung:** Nach dem Start erhöht die Wallbox den Strom in bestätigten Schritten; bis dahin kann PV-Leistung ins Netz gehen. Bei einer kurzen Wolke kann eine Ladung in Einzelfällen stoppen und nach der Wiedereinschaltverzögerung neu starten. Die experimentelle „Zentrale PV-Aufteilung Akku/Wallbox“ (standardmäßig aus) kann die Ladegrenze des Akkus häufig wechseln und PV für einen noch nicht gestarteten Ladevorgang zurückhalten.
+- **WebSocket-Dienst:** Der bisherige E3DC-WebSocket-Dienst wird mit Version 5.5.6 entfernt. Für externe Smart-Home-Anbindungen steht der MQTT-Hub mit den dokumentierten Topics zur Verfügung; das Webportal nutzt weiterhin HTTP-Abfragen. Die Luxtronik-Anbindung bleibt unverändert.
+
+## Updatehinweise
+
+- **Bare Metal:** Wie gewohnt über „System Update“ aktualisieren und anschließend die Seite neu laden. Meldet die Dienststeuerung eine tatsächliche Abweichung, nennt sie „System reparieren (Backup + Stable-Abgleich)“ als nächsten Schritt.
+- **Docker:** Mit eingerichtetem Watchtower über „System Update“, sonst im bestehenden Compose-Ordner auf dem Host mit `sudo docker compose pull` und `sudo docker compose up -d` aktualisieren. Ein fester Pin wird bewusst auf `E3DC_IMAGE_TAG=v5.5.5a` geändert.
+- **Von 5.5.4 oder älter:** Das Update führt direkt auf 5.5.5a; die Updatehinweise von 5.5.5 gelten weiter.
+
+## Rückfall
+
+Rückfall auf 5.5.5: Docker in `.env` `E3DC_IMAGE_TAG=v5.5.5` setzen und `sudo docker compose up -d` ausführen; auf Bare Metal ist das beim Update angelegte verifizierte Backup der Rückweg. Einzelheiten stehen in der [Rückfall-Dokumentation](doc/Rollback.md), Abschnitt „Rückfall von 5.5.5a auf 5.5.5“. Die Einstellungen bleiben dabei unverändert, weil 5.5.5a keine neuen Einstellungen einführt. Unter 5.5.5 entfallen die oben genannten Korrekturen wieder.
+
+---
+
 # E3DC-Control v5.5.5
 
 E3DC-Control 5.5.5 verbessert das Zusammenspiel von Speicher, Wallbox und Wärmepumpe und lernt die Lastprognose aus dem tatsächlichen Verlauf. Die eingestellte Verbraucherpriorität gilt auch beim Start. Fehlende oder langsam gemeldete Wallboxdaten bremsen den Speicher nicht mehr allein wegen der Datenlücke. Automatische Wärmepumpen-Zusatzfreigaben beachten „Min SoC“. Neu sind die Anzeige einer MQTT-Wärmepumpe, zwei getrennte Klima-Messpunkte und die openWB-Anmeldung über verschlüsselte Verbindungen. Die zentrale PV-Aufteilung und die Notstrom-Vorhaltung sind experimentell und standardmäßig aus.

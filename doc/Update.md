@@ -5,12 +5,22 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.5.5`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.5.5a`. Das Dashboard startet ausschließlich
 den root-eigenen Systemjob ohne freie Argumente. Die einzige Ausnahme ist
 die tokengebundene Driftfreigabe. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
+
+5.5.5a ist ein Korrekturupdate zu 5.5.5 (Wallbox-Stromregelung und einphasiger
+Wiederanlauf, Flatter-Korrektur der experimentellen zentralen PV-Aufteilung,
+native E3DC-Wallbox, Schutzfälle in Speicherregler und
+Wärmepumpen-Energy-Manager). Bestehende Installationen aktualisieren wie gewohnt
+über **System Update** bzw. das [Docker-Update](#docker-update); eine
+Konfigurationsänderung ist nicht nötig, und es gibt keine neuen Einstellungen,
+Dienste oder Dateiformate. Experimentelle Funktionen bleiben so eingestellt, wie
+sie sind. Der bisherige E3DC-WebSocket-Dienst wird mit Version 5.5.6 entfernt.
+Einzelheiten stehen in den [Release Notes](../RELEASE_NOTES.md).
 
 5.5.5 ist ein Funktions- und Korrekturupdate (Lastprognose aus dem Verlauf,
 Wallbox- und Wärmepumpenregelung, openWB mit Benutzerkonto, MQTT-Wärmepumpe,

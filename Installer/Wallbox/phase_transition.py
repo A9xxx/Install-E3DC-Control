@@ -1630,3 +1630,101 @@ __all__ = [
     "rehydrate_reservation", "reservation_lease_contract", "set_stage", "status_dimensions", "update_reservation",
     "normalize_charge_truth", "explicit_inhibit_owner",
 ]
+
+
+def prospective_one_phase_budget(points, group_w, *, valid, now_ts, priority=0):
+    """Projiziert denselben Gruppenrahmen ohne zusätzlichen Verbraucherabzug.
+
+    Nur bestätigte Fähigkeiten und frische individuelle Steckbindungen zählen.
+    Das Ergebnis autorisiert keinen 3p-Strom und keine vorzeitige Umschaltung.
+    """
+    from .controller import allocate_power
+
+    result = {"valid": False, "reason": "source_invalid", "points": {}}
+    if not valid or not isinstance(points, list) or not points:
+        return result
+    budget = _float(group_w, -1.0)
+    if not math.isfinite(budget) or budget <= 0.0:
+        return {**result, "reason": "source_zero"}
+    statuses, phases, actual_phases, steps, limits = [], {}, {}, {}, {}
+    valid_points = []
+    rejected_ids = set()
+    for point in points:
+        if not isinstance(point, dict):
+            continue
+        wb_id = _int(point.get("id"))
+        stamp = _float(point.get("ts"), 0.0)
+        actual = _int(point.get("phases"))
+        if (wb_id not in (1, 2) or wb_id in phases or actual not in (1, 3)
+                or not 0 <= _float(now_ts) - stamp <= 15.0
+                or point.get("fresh") is not True
+                or not point.get("session_id") or point.get("enabled") is not True):
+            if wb_id in (1, 2):
+                rejected_ids.add(wb_id)
+            continue
+        valid_points.append(point)
+        actual_phases[wb_id] = actual
+        phases[wb_id] = 1 if point.get("can_switch") is True else actual
+        steps[wb_id] = normalize_current_step(point.get("step_amp"))
+        limits[wb_id] = max(0.0, _float(point.get("max_amp")))
+        statuses.append({"id": wb_id, "status": {"connected": True, "plug_state": True}})
+    # Doppelte Kennungen sind auch dann ungültig, wenn ein Exemplar frisch ist.
+    valid_points = [point for point in valid_points if _int(point.get("id")) not in rejected_ids]
+    for wb_id in rejected_ids:
+        phases.pop(wb_id, None)
+        actual_phases.pop(wb_id, None)
+        steps.pop(wb_id, None)
+        limits.pop(wb_id, None)
+    statuses = [entry for entry in statuses if entry["id"] in phases]
+    if not valid_points:
+        return {**result, "reason": "point_binding_invalid"}
+    allocations = allocate_power(budget, statuses, priority, 32,
+        {wb_id: 2 for wb_id in phases}, phase_count_by_id=phases,
+        max_amp_by_id=limits, current_step_amp_by_id=steps)
+    # Der hypothetische 1p-Maximalstrom darf keinen 3p-Mangel erfinden.
+    # Beide Projektionen teilen denselben Rahmen, ohne Verbraucherabzug.
+    actual_allocations = allocate_power(budget, statuses, priority, 32,
+        {wb_id: 2 for wb_id in phases}, phase_count_by_id=actual_phases,
+        max_amp_by_id=limits, current_step_amp_by_id=steps)
+    remainder_w = max(0.0, budget - sum(
+        _float(item.get("target_power_w")) for item in allocations.values()))
+    for point in valid_points:
+        wb_id = _int(point["id"])
+        minimum = max(6.0, _float(point.get("min_amp"), 6.0))
+        share = max(0.0, _float((allocations.get(wb_id) or {}).get("target_power_w")))
+        # Der Wattanteil enthält auch den Rest unterhalb einer Gerätestufe.
+        # Die Reserve ist Deckung, kein zusätzliches Stromangebot.
+        extra = min(remainder_w, max(0.0, limits[wb_id] * 230 * phases[wb_id] - share))
+        share += extra
+        remainder_w -= extra
+        # Auch beim hypothetischen Wechsel dieses Punkts müssen die anderen
+        # Punkte mit ihren tatsächlich gebundenen Phasen finanzierbar bleiben.
+        candidate_phases = dict(actual_phases)
+        candidate_phases[wb_id] = 1
+        if candidate_phases != phases:
+            candidate_allocations = allocate_power(budget, statuses, priority, 32,
+                {key: 2 for key in phases}, phase_count_by_id=candidate_phases,
+                max_amp_by_id=limits, current_step_amp_by_id=steps)
+            candidate_share = max(0.0, _float((candidate_allocations.get(wb_id) or {}).get("target_power_w")))
+            candidate_rest = max(0.0, budget - sum(_float(value.get("target_power_w"))
+                for value in candidate_allocations.values()))
+            share = min(share, candidate_share + min(candidate_rest,
+                max(0.0, limits[wb_id] * 230.0 - candidate_share)))
+        required = planned_reservation_power_w(restart_amp=minimum, target_phases=1,
+            current_step_amp=steps[wb_id], from_phases=3)
+        actual_share = max(0.0, _float((actual_allocations.get(wb_id) or {}).get("target_power_w")))
+        eligible = bool(actual_phases[wb_id] == 3 and point.get("can_switch") is True
+                        and actual_share < minimum * 690 and share >= required)
+        result["points"][str(wb_id)] = {
+            "session_id": str(point["session_id"]), "share_w": share,
+            "transition_id": str(point.get("transition_id") or ""),
+            "actual_allocation_w": actual_share,
+            "minimum_3p_w": minimum * 690.0, "required_1p_w": required,
+            "minimum_amp": minimum, "authorized": eligible,
+            "reason": ("one_phase_covered" if eligible else "already_one_phase"
+                if actual_phases[wb_id] == 1 else "three_phase_covered"
+                if actual_share >= minimum * 690 else "one_phase_not_covered"),
+            "generation": str(point["session_id"]), "ts": _float(now_ts),
+        }
+    result.update(valid=True, reason="same_consumer_contract")
+    return result

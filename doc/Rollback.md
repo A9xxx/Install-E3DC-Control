@@ -16,6 +16,47 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
+## Rückfall von 5.5.5a auf 5.5.5
+
+**Docker:** Auf dem Host in `.env` `E3DC_IMAGE_TAG=v5.5.5` setzen und
+`sudo docker compose up -d` ausführen; die vorhandenen Daten-Volumes bleiben
+erhalten.
+
+**Bare Metal:** Der Rückweg ist das beim Update angelegte verifizierte Backup
+(siehe „Betriebsdaten wiederherstellen“). Es stellt Programmstand,
+Konfiguration und die darin gesicherten Betriebsdaten von vor dem Update
+wieder her; nach dem Update geänderte Einstellungen und hinzugekommene
+Statistik- und Diagnosedaten sind darin nicht enthalten und vorher gesondert zu
+sichern.
+
+**Konfiguration:** 5.5.5a führt keine neuen Einstellungen ein. Es entfallen
+deshalb keine Einstellungen beim Rückfall, und nach einer erneuten
+Aktualisierung müssen keine Werte neu eingetragen werden.
+
+**Betriebsdaten:** 5.5.5a ergänzt vorhandene Statusdateien um optionale Felder
+(Phasenwechsel-Sperre und Sitzungsenergie nativer E3DC-Wallboxen, Haltezeitpunkt
+des Speicherreglers, offene SG-Rücknahme und Wiederanlauffrist der
+Wärmepumpe). Die Statusdateien und ihre Schemakennungen bleiben kompatibel; ein
+Rückfall auf 5.5.5 und ein späteres erneutes Update auf 5.5.5a sind möglich.
+5.5.5 wertet die zusätzlichen Felder nicht aus und kann sie beim nächsten
+Speichern entfernen. Diese Schutzfristen und Sitzungsenergiedetails bleiben über
+einen Rückfall deshalb nicht zuverlässig erhalten; währenddessen gilt das
+bisherige Verhalten von 5.5.5. Nach dem erneuten Update prüft 5.5.5a fehlende
+Angaben neu; eine unbekannte Sitzungsenergie gilt nicht als bestätigte 0 kWh.
+
+**Verhalten unter 5.5.5:** Die Korrekturen von 5.5.5a stehen dort nicht zur
+Verfügung: Die Strom-Schrittweite kann im allgemeinen Regelpfad wieder auf ganze
+Ampere gerundet werden, die zentrale PV-Aufteilung kann wieder das beschriebene
+Start-Stopp-Flattern zeigen, die Phasenwechsel-Sperre einer nativen
+E3DC-Wallbox entfällt nach einem Neustart, ein unbekannter Stromdeckel kann den
+Regelzyklus einer nativen E3DC-Wallbox abbrechen, und automatische
+Wärmepumpen-Starts prüfen keine fremde Sperre. Wer die zentrale PV-Aufteilung
+eingeschaltet hat, schaltet sie vor dem Rückfall im Config-Editor unter
+„Speicher & Konfiguration“ → „Experimentelle Speicherregelung“ →
+„Zentrale PV-Aufteilung Akku/Wallbox (experimentell)“ auf „Aus (Standard)“.
+
+**Dienste:** 5.5.5a führt keine neuen Dienste oder systemd-Units ein.
+
 ## Rückfall von 5.5.5 auf 5.5.4
 
 **Docker:** Auf dem Host in `.env` `E3DC_IMAGE_TAG=v5.5.4` setzen und
@@ -368,7 +409,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand ist `v5.5.5`.
+Der aktuelle Stable-Stand ist `v5.5.5a`.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

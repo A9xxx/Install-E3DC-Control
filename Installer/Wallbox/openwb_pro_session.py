@@ -206,7 +206,7 @@ def _current_step(value: Any, default: float = 1.0) -> float:
 
 def _round_to_step(value: float, step: float) -> float:
     step = _current_step(step)
-    rounded = round(float(value or 0.0) / step) * step
+    rounded = math.floor((max(0.0, float(value or 0.0)) + 1e-9) / step) * step
     return float(int(round(rounded))) if step >= 0.99 else round(rounded, 1)
 
 
@@ -4060,7 +4060,7 @@ def start_window_output_rule(
         physical = 0.0
     # Absenkung gegen das physisch stehende Angebot: die sichere Richtung, im
     # Fenster nie gesperrt (Netzbezug statt Festhalten).
-    physical_reduction = bool(physical >= 6.0 and amp <= physical - 0.5)
+    physical_reduction = bool(physical >= 6.0 and amp < physical - 1e-9)
 
     def _allow_physical_reduction() -> Dict[str, Any]:
         result["allowed"] = True
@@ -4069,7 +4069,7 @@ def start_window_output_rule(
         result["physical_offer_amp"] = float(physical)
         return result
 
-    if offer >= 6.0 and abs(amp - offer) < 0.5:
+    if offer >= 6.0 and abs(amp - offer) < 0.05:
         result["change"] = "same"
         result["reason"] = "identical_offer"
         return result

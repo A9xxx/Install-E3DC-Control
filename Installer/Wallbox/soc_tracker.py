@@ -2757,8 +2757,21 @@ class VehicleSocTracker:
                 )
                 return None
 
+        native_session_energy = bool(
+            charger_class in ("E3DCCharger", "E3DCMultiConnectCharger")
+            and "session_kwh_valid" in status
+        )
+        if native_session_energy and meter_wh is not None and state.get("anchor_meter_wh") is None:
+            # Erst die gültige native Sitzungsenergie eröffnet einen Zähleranker.
+            # Energie vor einem später gesetzten SoC-Anker wird nicht geschätzt.
+            start = _status_session_start_ts(status)
+            anchor_at_start = bool(start > 0.0
+                and _timestamp(state.get("anchor_sample_ts"), now) <= start
+                and status.get("session_kwh_lower_bound") is False)
+            state["anchor_meter_wh"] = 0.0 if anchor_at_start else meter_wh
+            state["anchor_meter_basis"] = "native_session_first_valid"
         last_update = _timestamp(state.get("last_update_ts"), now)
-        if not raw_cloud_only and charging and now > last_update:
+        if not native_session_energy and not raw_cloud_only and charging and now > last_update:
             dt_s = min(max(0.0, now - last_update), 300.0)
             power_w = _status_power_w(status)
             if power_w > 50.0 and dt_s > 0.0:
@@ -2770,9 +2783,12 @@ class VehicleSocTracker:
             meter_delta_wh = max(0.0, meter_wh - _safe_float(anchor_meter, 0.0))
             state["last_meter_wh"] = meter_wh
             state["meter_source"] = meter_source
-        delivered_wh = 0.0 if raw_cloud_only else max(
-            meter_delta_wh, _safe_float(state.get("power_integrated_wh"), 0.0),
-        )
+        delivered_wh = (meter_delta_wh if native_session_energy else
+            0.0 if raw_cloud_only else max(
+                meter_delta_wh, _safe_float(state.get("power_integrated_wh"), 0.0),
+            ))
+        if native_session_energy:
+            state["power_integrated_wh"] = meter_delta_wh
 
         state["wb"] = wb_id
         state["connected"] = connected

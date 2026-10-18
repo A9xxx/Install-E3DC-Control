@@ -94,7 +94,8 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                    grid_phase_limit_vector=None, phase_rotation_by_id=None,
                    unmanaged_phase_amps=None,
                    electrical_reservation_phase_count_by_id=None,
-                   pv_total_cap_w=None, storage_total_cap_w=None):
+                   pv_total_cap_w=None, storage_total_cap_w=None,
+                   current_step_amp_by_id=None):
     """
     Verteilt 'available_watts' auf alle verbundenen Wallboxen.
 
@@ -302,7 +303,7 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
         rotation=None,
         source_mode=None,
     ):
-        target = max(0, int(target_amp or 0))
+        target = round(max(0.0, float(target_amp or 0.0)), 3)
         reservation_phases = int(
             electrical_phases if electrical_phases is not None else phases or 0
         )
@@ -526,10 +527,17 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
         w_per_amp = _watts_per_amp(c_id, phases)
         min_w = 6 * w_per_amp
         try:
-            charger_max_amp = int(per_charger_limits.get(c_id, max_amp) or max_amp)
+            charger_max_amp = float(per_charger_limits.get(c_id, max_amp) or max_amp)
         except (TypeError, ValueError):
             charger_max_amp = int(max_amp)
-        charger_max_amp = max(0, min(int(max_amp), charger_max_amp))
+        step = _mapped_value(current_step_amp_by_id or {}, c_id, 1.0)
+        try:
+            step = float(step)
+        except (TypeError, ValueError):
+            step = 1.0
+        if not math.isfinite(step) or step not in (0.1, 0.5, 1.0):
+            step = 1.0
+        charger_max_amp = math.floor((max(0.0, min(float(max_amp), charger_max_amp)) + 1e-9) / step) * step
         if strict_watt_contract and charger_max_amp < 6:
             alloc[c_id] = _allocation_result(
                 0,
@@ -559,6 +567,7 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                 'min_w': min_w,
                 'max_w': max_w,
                 'max_amp': charger_max_amp,
+                'step_amp': step,
                 'fairness_weight': fairness_weight,
                 'mode': c_mode,
                 'behavior': behavior,
@@ -579,6 +588,7 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                 'min_w':         min_w,
                 'max_w':         max_w,
                 'max_amp':       charger_max_amp,
+                'step_amp': step,
                 'fairness_weight': fairness_weight,
                 'mode':          c_mode,
                 'behavior':      behavior,
@@ -599,6 +609,7 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                 'min_w':         min_w,
                 'max_w':         max_w,
                 'max_amp':       charger_max_amp,
+                'step_amp': step,
                 'fairness_weight': fairness_weight,
                 'mode':          c_mode,
                 'behavior':      behavior,
@@ -652,7 +663,7 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
 
     def _apply_delta(c, delta_a):
         nonlocal remaining_watts, pv_only_allocated_w
-        c['allocated_amp'] += delta_a
+        c['allocated_amp'] = round(c['allocated_amp'] + delta_a, 3)
         if math.isfinite(remaining_watts):
             remaining_watts -= delta_a * c['w_per_amp']
         if (
@@ -713,7 +724,7 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                 candidates = [
                     c for c in active_chargers
                     if c['state'] == 2
-                    and _can_allocate_delta(c, 1)
+                    and _can_allocate_delta(c, c['step_amp'])
                 ]
                 if not candidates:
                     break
@@ -728,7 +739,7 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                         c['id'],
                     ),
                 )
-                _apply_delta(chosen, 1)
+                _apply_delta(chosen, chosen['step_amp'])
         else:
             extra_order = sorted(
                 active_chargers,
@@ -741,8 +752,8 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
             while remaining_watts > 0:
                 allocated_any = False
                 for c in extra_order:
-                    if c['state'] == 2 and _can_allocate_delta(c, 1):
-                        _apply_delta(c, 1)
+                    if c['state'] == 2 and _can_allocate_delta(c, c['step_amp']):
+                        _apply_delta(c, c['step_amp'])
                         allocated_any = True
                 if not allocated_any:
                     break
@@ -759,7 +770,7 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
             candidates = [
                 c for c in active_chargers
                 if c['state'] == 2
-                and _can_allocate_delta(c, 1)
+                and _can_allocate_delta(c, c['step_amp'])
             ]
             if not candidates:
                 break
@@ -770,7 +781,7 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
                     c['id'],
                 ),
             )
-            _apply_delta(chosen, 1)
+            _apply_delta(chosen, chosen['step_amp'])
     else:
         if priority_id:
             for c in active_chargers:
@@ -789,8 +800,8 @@ def allocate_power(available_watts, chargers_status, mode, max_amp,
         while remaining_watts > 0:
             allocated_any = False
             for c in active_chargers:
-                if c['state'] == 2 and _can_allocate_delta(c, 1):
-                    _apply_delta(c, 1)
+                if c['state'] == 2 and _can_allocate_delta(c, c['step_amp']):
+                    _apply_delta(c, c['step_amp'])
                     allocated_any = True
             if not allocated_any:
                 break

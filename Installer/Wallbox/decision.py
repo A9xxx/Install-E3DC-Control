@@ -859,6 +859,13 @@ def _current_step(value: Any, default: float = 1.0) -> float:
     return 1.0
 
 
+def _round_down_to_step(value: float, step: float) -> float:
+    """Sicherheitsgrenzen erhalten die Fähigkeit und öffnen niemals aufwärts."""
+    if not math.isfinite(value):
+        return 0.0
+    return round(math.floor((max(0.0, value) + 1e-9) / step) * step, 3)
+
+
 def _amp_value(value: float, step: float) -> float:
     if step >= 0.99:
         return int(round(value))
@@ -3149,7 +3156,7 @@ def budget_to_target_current(
     budget_w = max(0.0, _safe_float(allowed_w, 0.0))
     phases = valid_phase_count(detected_phases, 1) or 1
     min_amp_int = max(1, int(round(_safe_float(min_amp, 6))))
-    max_amp_int = max(0, int(round(_safe_float(max_amp, 16))))
+    max_amp_int = max(0.0, _round_down_to_step(_safe_float(max_amp, 16), _current_step(current_step_amp, 1.0)))
     step_amp = _current_step(current_step_amp, 1.0)
     nominal_w_per_amp = float(230 * phases)
     measured_w_per_amp = _safe_float(watts_per_amp, 0.0)
@@ -3198,7 +3205,7 @@ def budget_to_target_current(
 
     house_fuse_limited = False
     if apply_house_fuse and house_fuse_cap_amp is not None and target_amp > 0:
-        cap_amp = max(0, int(round(_safe_float(house_fuse_cap_amp, max_amp_int))))
+        cap_amp = max(0.0, _round_down_to_step(_safe_float(house_fuse_cap_amp, max_amp_int), step_amp))
         if cap_amp < target_amp:
             target_amp = _amp_value(float(cap_amp), step_amp)
             house_fuse_limited = True
@@ -3484,6 +3491,7 @@ def stable_wallbox_amp_contract(
     storage_floor_amp_up_hold_s: Any = 15.0,
     stable_budget_jump_deadband_a: Any = 3,
     stable_budget_jump_hold_s: Any = 6.0,
+    current_step_amp: Any = 1.0,
 ) -> Dict[str, Any]:
     """Dämpft Stromänderungen der Wallbox während eines aktiv geregelten Ladevorgangs."""
 
@@ -3493,8 +3501,9 @@ def stable_wallbox_amp_contract(
         except Exception:
             return int(default)
 
-    proposed_i = amp_int(proposed_amp, 0)
-    current_i = amp_int(current_amp, 0)
+    step = _current_step(current_step_amp, 1.0)
+    proposed_i = _round_down_to_step(max(0.0, _safe_float(proposed_amp, 0.0)), step)
+    current_i = max(0.0, _safe_float(current_amp, 0.0))
     now = _safe_float(now_ts, 0.0)
     grid_w = _safe_float(grid_power_w, 0.0)
     threshold_w = _safe_float(fast_grid_threshold_w, 150.0)
@@ -3512,14 +3521,14 @@ def stable_wallbox_amp_contract(
     )
     state_updates: Dict[str, Any] = {}
 
-    def result(applied: int, reason: str) -> Dict[str, Any]:
+    def result(applied: float, reason: str) -> Dict[str, Any]:
         return {
             "schema_version": "wallbox_stable_amp_v1",
-            "applied_amp": int(applied),
-            "proposed_amp": int(proposed_i),
-            "current_amp": int(current_i),
-            "limited": bool(int(applied) != proposed_i),
-            "direction": "up" if int(applied) > current_i else ("down" if int(applied) < current_i else "flat"),
+            "applied_amp": round(float(applied), 3),
+            "proposed_amp": round(float(proposed_i), 3),
+            "current_amp": round(float(current_i), 3),
+            "limited": bool(round(float(applied), 3) != proposed_i),
+            "direction": "up" if round(float(applied), 3) > current_i else ("down" if round(float(applied), 3) < current_i else "flat"),
             "reason": reason,
             "real_confirmed": bool(real_confirmed),
             "status_fresh": bool(status_fresh),
@@ -3696,10 +3705,10 @@ def pv_hybrid_energy_gate(
 
     budget = max(0.0, _safe_float(budget_w, 0.0))
     min_power = max(1.0, _safe_float(min_power_w, 1380.0))
-    cap = max(0, _safe_int(cap_amp, 0))
+    cap = max(0, _safe_float(cap_amp, 0.0))
     minimum = max(1, _safe_int(min_amp, 6))
-    current = max(0, _safe_int(current_amp, 0))
-    set_amp = max(0, _safe_int(current_set_amp, 0))
+    current = max(0, _safe_float(current_amp, 0.0))
+    set_amp = max(0, _safe_float(current_set_amp, 0.0))
     hw_power = max(0.0, _safe_float(hw_power_w, 0.0))
     grid_w = _safe_float(grid_power_w, 0.0)
     start_hold = max(0.0, _safe_float(start_hold_s, 60.0))
@@ -3812,7 +3821,7 @@ def pv_hybrid_energy_gate(
         "dt_s": float(dt_s),
         "budget_w": float(budget),
         "min_power_w": float(min_power),
-        "cap_amp": int(cap),
+        "cap_amp": float(cap),
         "min_amp": int(minimum),
         "running": bool(running),
         "running_power_w": float(running_power_w),
@@ -3863,11 +3872,11 @@ def pv_hybrid_hold_action(
         except Exception:
             return int(default)
 
-    cap = max(0, amp_int(cap_amp, 0))
+    cap = max(0, _safe_float(cap_amp, 0))
     minimum = max(1, amp_int(min_amp, 6))
-    maximum = max(minimum, amp_int(max_amp, 32))
-    current = max(0, amp_int(current_amp, 0))
-    set_amp = max(0, amp_int(current_set_amp, 0))
+    maximum = max(minimum, _safe_float(max_amp, 32))
+    current = max(0, _safe_float(current_amp, 0))
+    set_amp = max(0, _safe_float(current_set_amp, 0))
     min_power = max(0.0, _safe_float(min_power_w, 1380.0))
     budget_w = max(0.0, _safe_float(allowed_w, 0.0))
     running = bool(gate_running or st.get("running", False))
@@ -3945,7 +3954,7 @@ def pv_hybrid_hold_action(
 
     return {
         "action": "ALLOW_PV_HYBRID",
-        "target_amp": int(cap),
+        "target_amp": float(cap),
         "allowed_w": budget_w,
         "min_power_w": min_power,
         "log_key": "",

@@ -1168,7 +1168,7 @@ class OpenWBCharger(WallboxDriver):
             "real_power_w": power, "power_w": power, "powers": None,
             "phase_power_l1_w": None, "phase_power_l2_w": None, "phase_power_l3_w": None,
             "phase_power_sum_w": None, "phase_power_verified": False, "_phase_power_ts": 0.0,
-            "evse_current": current, "amp": int(round(current)) if current is not None else None,
+            "evse_current": current, "amp": round(current, 1) if current is not None else None,
             "phases_in_use": phases, "phases_actual": phases,
             "pha": (56 if phases >= 3 else 8 if phases >= 1 else 0) if phases is not None else None,
             "currents": currents, "voltages": voltages,
@@ -1280,7 +1280,7 @@ class OpenWBCharger(WallboxDriver):
             "power_factor": power/apparent_sum if power is not None and apparent_sum and apparent_sum > 50 else None,
             "phases_in_use": phases, "phases_actual": phases,
             "pha": (56 if phases >= 3 else 8 if phases >= 1 else 0) if phases is not None else None,
-            "evse_current": current, "amp": int(round(current)) if current is not None else None,
+            "evse_current": current, "amp": round(current, 1) if current is not None else None,
             "imported_total_wh": values["imported"], "imported": values["imported"],
             "daily_imported_wh": daily, "daily_imported": daily,
             "fault_state": values["fault_state"],
@@ -2380,7 +2380,7 @@ class OpenWBCharger(WallboxDriver):
                         self.state['real_power_w'] = 0.0
                 elif topic == f"{self.native_prefix}/evse_current":
                     self.state['evse_current'] = num_val
-                    self.state['amp']          = int(num_val)
+                    self.state['amp']          = round(num_val, 1)
                 elif topic == f"{self.native_prefix}/phases_in_use":
                     self.state['phases_in_use'] = int(num_val)
                     self.state['pha']           = 56 if int(num_val) >= 3 else 8
@@ -2708,7 +2708,7 @@ class OpenWBCharger(WallboxDriver):
         })
         ok = self._http_post(post_data)
         if ok:
-            self.state["amp"] = int(round(amp))
+            self.state["amp"] = round(amp, 1)
             self.state["evse_current"] = amp
             self.state["last_command_amp"] = amp
             self.state["current_step_amp"] = self.current_step_amp
@@ -3106,7 +3106,7 @@ class OpenWBCharger(WallboxDriver):
             )
             ok = bool(result and result.get("status") == "success")
         if ok:
-            self.state["amp"] = int(round(amp))
+            self.state["amp"] = round(amp, 1)
             self.state["evse_current"] = amp
             self.state["chargemode_str"] = "secondary_current"
             self.state["api_surface"] = (
@@ -3738,7 +3738,7 @@ class OpenWBCharger(WallboxDriver):
             "apparent_power_va": apparent_power_va,
             "power_factor": power_factor,
             "evse_current": evse_current,
-            "amp": int(round(evse_current)) if evse_current > 0 else 0,
+            "amp": round(evse_current, 1) if evse_current > 0 else 0,
             "phases_in_use": int(phases),
             "pha": 56 if int(phases) >= 3 else (8 if int(phases) >= 1 else 0),
             "can_switch_phases": bool(self.state.get("can_switch_phases", False)),
@@ -8704,7 +8704,7 @@ class OpenWBProCharger(WallboxDriver):
             "apparent_power_va": apparent_power_va,
             "power_factor": power_factor,
             "evse_current": visible_current,
-            "amp": int(round(visible_current)) if visible_current > 0 else 0,
+            "amp": round(visible_current, 1) if visible_current > 0 else 0,
             "phases_in_use": int(phases_in_use),
             "phases_actual": int(phases_actual),
             "phases_target": int(phases_target),
@@ -8833,7 +8833,7 @@ class OpenWBProCharger(WallboxDriver):
             visible_current = evse_current
         self.state.update({
             "car": 2 if plug_state else 1,
-            "amp": int(round(visible_current)),
+            "amp": round(visible_current, 1),
             "pha": 56 if phases >= 3 else (8 if phases >= 1 else 0),
             "charging": bool(charging or phase_power_verified),
             "frc": 2 if visible_current >= 6 else 0,
@@ -9031,7 +9031,7 @@ class OpenWBProCharger(WallboxDriver):
         # must be sent explicitly via trigger_cp_interrupt().
         ok = self._post_control({"ampere": f"{amp:.1f}" if amp else "0"})
         if ok:
-            self.state["amp"] = int(round(amp))
+            self.state["amp"] = round(amp, 1)
             self.state["evse_current"] = amp
             self.state["offered_current_raw"] = amp
             self.state["offered_current_confirmed"] = False

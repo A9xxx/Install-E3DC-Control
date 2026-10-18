@@ -115,7 +115,7 @@ $paths = getInstallPaths();
     <div class="container">
         <div class="d-flex justify-content-between align-items-center mb-4">
             <a href="index.php" class="nav-link-back"><i class="fas fa-arrow-left me-2"></i>Dashboard</a>
-            <span class="badge bg-success text-light">v5.5.5 Stable</span>
+            <span class="badge bg-success text-light">v5.5.5a Stable</span>
         </div>
         <h1 class="display-4 fw-bold">Hilfe & Support</h1>
         <p class="lead opacity-75">Häufige Fragen und Lösungen rund um E3DC-Control.</p>
@@ -134,7 +134,7 @@ $paths = getInstallPaths();
         <div class="col-12 faq-item" data-tags="docker image stable rollback update">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">
                 <h5 class="card-title"><span class="tag">Docker</span> Wie prüfe ich Image und Update?</h5>
-                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.5.5</code> in <code>.env</code> gesetzt.</p>
+                <p>Die mitgelieferte Compose-Datei verwendet standardmäßig <code>image: "ghcr.io/a9xxx/install-e3dc-control:${E3DC_IMAGE_TAG:-latest}"</code>. Ohne Pin folgt sie dem Stable-Tag <code>latest</code>. Ein fester Tag bleibt bei <code>pull</code> absichtlich fest; für einen bewussten Pin wird zum Beispiel <code>E3DC_IMAGE_TAG=v5.5.5a</code> in <code>.env</code> gesetzt.</p>
                 <p><strong>Update-Knopf und Auto-Update:</strong> Der Container tauscht sein Image nicht selbst. Läuft das Compose-Profil <code>auto-update</code> (Watchtower-Fork <code>ghcr.io/nicholas-fedor/watchtower</code>), gibt der Knopf <strong>System Update</strong> Watchtower über dessen lokale HTTP-API das Signal: Watchtower lädt das Image, erstellt den Container neu, und die Oberfläche lädt nach dem Start neu. Mit <strong>Auto-Update</strong> im Config-Editor passiert dasselbe täglich zur eingestellten Uhrzeit; Watchtower selbst pollt nicht. Gibt es kein neues Image, passiert nichts.</p>
                 <p>Einmalige Freischaltung auf dem Docker-Host im Compose-Ordner (Token für beide Dienste in <code>.env</code>, Container mit Token neu erstellen, Watchtower starten):</p>
                 <pre>cd "${E3DC_DOCKER_PATH:-$HOME/e3dc-docker}"
@@ -240,6 +240,18 @@ sudo docker compose logs --tail=80 e3dc-control</pre>
         Ohne getrennte Nachricht unter <code>in/heatpump/electric_w</code> bleiben elektrische Einzelleistung und COP unbekannt.
         Ein getrenntes frisches <code>electric_w</code> ermöglicht den COP bei ebenfalls frischer Heizleistung.
         <?= e3dcDocLink('Smart_Home_Mqtt_Websockets.md', 'MQTT-Topics und Einheiten') ?></div>
+        <h4 class="mb-4 text-accent">Stable 5.5.5a: Hardwareschutz für Wallbox, Speicher und Wärmepumpe</h4>
+        <div class="col-12 faq-item" data-tags="5.5.5a stable hardwareschutz wallbox stromstufen schrittweite phasen einphasig pv-aufteilung flattern kurve native e3dc sitzungsenergie lademenge speicher halt notstrom wärmepumpe fremdsperre pause shelly dimplex update">
+            <div class="card bg-card border-0 shadow-sm"><div class="card-body">
+                <h5 class="card-title">Was bringt Stable-Release 5.5.5a?</h5>
+                <p>5.5.5a ist ein Korrekturupdate zu 5.5.5. Die gewählte Strom-Schrittweite („WB1 Strom-Schritt“ beziehungsweise „WB2 Strom-Schritt“) bleibt bis zum Strombefehl erhalten, Sicherheitsgrenzen werden abgerundet. Eine laufende Ladung erreicht den freigegebenen Zielstrom nach mindestens 45 Sekunden bestätigter Deckung ohne 2-A-Treppe; Absenkungen warten nicht. Kurze ungültige Messproben (höchstens 15 Sekunden) setzen diese Bestätigung nicht zurück. Bei umschaltfähigen Wallboxen wird der einphasige Wiederanlauf geprüft, wenn der Anteil für drei Phasen nicht reicht; die Sperre von mindestens 480 Sekunden nach einem Phasenwechsel der openWB Pro und die 600-Sekunden-Prognosebeobachtung bleiben unverändert. Die Ladeleistung einer externen Wallbox, etwa einer go-e, wird nicht doppelt vom Budget abgezogen.</p>
+                <p>Bei eingeschalteter „Zentrale PV-Aufteilung Akku/Wallbox (experimentell)“ konnte eine Wallbox im Modus „PV-Kurve ruhig“ nach dem Start sofort wieder gestoppt werden und das in Abständen von wenigen Minuten wiederholen. E3DC-Control rechnet die Aufteilung jetzt bereits bei gestecktem Fahrzeug; Schutzstopps bleiben sofort wirksam. Bei ausgeschalteter Aufteilung (Standard) ändert sich nichts.</p>
+                <p>Bei einer nativen E3DC-Wallbox bricht ein unbekannter Stromdeckel den Regelzyklus nicht mehr ab, die Phasenwechsel-Sperre bleibt nach einem Neustart erhalten, und die Sitzungsenergie wird aus der gemeldeten Ladeleistung gebildet, wenn der Gerätezähler fehlt oder 0 meldet. Das Ladeziel „Lademenge“ und die Fahrzeug-SoC-Schätzung nutzen diese Energie; Messlücken bleiben als Untergrenze gekennzeichnet. Ein Schutzstopp wegen der Untergrenze „wbminSoC“ erreicht jetzt auch eine Box, die nach einer Freigabe selbständig mit hohem Strom zu laden beginnt; bleibt er ohne Wirkung, folgt er nach 30 Sekunden einmal erneut.</p>
+                <p>Der Speicherregler beendet den Halt eines geschützten Entlade- oder Lademodus bei ungültigen Messwerten nach der Haltefrist (Standard 20 Sekunden) ab dem letzten gültigen Messzeitpunkt; ein gemeldeter Inselbetrieb (Code 1 oder 4) hat Vorrang. Automatische Starts der Wärmepumpe beachten wie der Knopf „WW sofort“ eine fremde Sperre, also einen von außen ausgeschalteten Pause-Kontakt am Shelly oder das Dimplex-Signal „Rot“; unbekannte oder über 90 Sekunden alte Rücklesung hält sie zurück.</p>
+                <p><strong>Update:</strong> Wie gewohnt über <strong>System Update</strong> beziehungsweise das Docker-Update. Eine Konfigurationsänderung ist nicht nötig; es gibt keine neuen Einstellungen. Die Änderungen sind mit Simulationen und Gerätemodellen geprüft, ein Praxisnachweis auf mehreren Anlagen steht noch aus.</p>
+                <p>Der bisherige E3DC-WebSocket-Dienst wird mit Version 5.5.6 entfernt. Für externe Smart-Home-Anbindungen steht der MQTT-Hub mit den dokumentierten Topics zur Verfügung; das Webportal nutzt weiterhin HTTP-Abfragen. Die Luxtronik-Anbindung bleibt unverändert.</p>
+            </div></div>
+        </div>
         <h4 class="mb-4 text-accent">Stable 5.5.5: Lastprognose, Wallbox und Wärmepumpe</h4>
         <div class="col-12 faq-item" data-tags="5.5.5 stable lastprognose temperatur wallbox openwb fahrzeug soc mqtt wärmepumpe klima notstrom vorhaltung preis update websocket">
             <div class="card bg-card border-0 shadow-sm"><div class="card-body">

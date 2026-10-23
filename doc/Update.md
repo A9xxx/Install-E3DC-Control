@@ -5,12 +5,23 @@ Updates werden ausschließlich über den Installer ausgeführt. Ein manuelles
 Nutzerinstallation ist für den regulären Ziel-Updater weder Voraussetzung noch
 Updateautorität.
 
-Der aktuelle Stable-Stand ist `v5.5.5b`. Das Dashboard startet ausschließlich
+Der aktuelle Stable-Stand ist `v5.5.5c`. Das Dashboard startet ausschließlich
 den root-eigenen Systemjob ohne freie Argumente. Die einzige Ausnahme ist
 die tokengebundene Driftfreigabe. Dieser installiert den neuesten
 veröffentlichten Stable-Stand oder repariert dieselbe Version. Der
 Stable-Versionscheck ist nur eine Anzeige und keine Startfreigabe. Freie Pfade,
 Release-Tags, Neuinstallationen und Rückfälle bleiben im Web gesperrt.
+
+5.5.5c ist ein Sicherheitsupdate zu 5.5.5b: Das Docker-Image enthält PHP 8.2.35
+mit den Korrekturen für die kritischen Lücken CVE-2026-109618 und
+CVE-2026-109619; die Funktionen sind unverändert. Docker-Installationen
+aktualisieren wie gewohnt über das [Docker-Update](#docker-update). Bei
+Installationen direkt auf dem Raspberry Pi stammt PHP aus dem Betriebssystem:
+Nach dem **System Update** zusätzlich `sudo apt update` und `sudo apt upgrade`
+ausführen und danach `sudo systemctl restart apache2`; behoben ist die Lücke ab
+PHP 8.4.27 (Debian 13) bzw. 8.2.35 (Debian 12). Meldet apt „dpkg was
+interrupted“, vorher `sudo dpkg --configure -a` ausführen. Einzelheiten stehen
+in den [Release Notes](../RELEASE_NOTES.md).
 
 5.5.5b ist ein Korrekturupdate zu 5.5.5a (Wärmepumpe und Heizstab bei
 unbekanntem Ladezustand des Hausakkus, Modellauswahl für die E3/DC Multi Connect

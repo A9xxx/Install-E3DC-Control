@@ -50,8 +50,9 @@ RUN python3 -m venv --system-site-packages /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 ENV E3DC_CONTAINER_MODE=1
 ENV E3DC_CONTAINER_INSTALL_USER=root
+# Python-Bibliotheken mit festen Versionen (Stand 5.5.5b); ein Neubau übernimmt nur Sicherheitsupdates des Systems.
 RUN pip3 install --upgrade pip wheel setuptools && \
-    pip3 install --prefer-binary paho-mqtt requests websocket-client websockets luxtronik hyundai_kia_connect_api pywebpush pycryptodome pymodbus pyserial
+    pip3 install --prefer-binary paho-mqtt==2.1.0 requests==2.34.2 websocket-client==1.9.2 websockets==17.2 luxtronik==0.3.14 hyundai_kia_connect_api==4.23.0 pywebpush==2.5.0 pycryptodome==4.0.1 pymodbus==3.16.1 pyserial==3.5
 
 # Feste Laufzeitidentität; Installation und unveränderlicher Produktcode bleiben Root.
 # Rechtemodell im Container: Produktcode root:root ohne Gruppen-/Weltschreibbit,

@@ -1,9 +1,9 @@
 {
-  "version": "5.5.5b",
+  "version": "5.5.5c",
   "min_version": "4.0.0",
-  "stable_release": "v5.5.5b",
-  "release_date": "2026-10-19",
-  "description": "v5.5.5b - Wärmepumpe und Heizstab bei unbekanntem Ladezustand, Modellauswahl Multi Connect II, neutrale Standortvorgabe",
+  "stable_release": "v5.5.5c",
+  "release_date": "2026-10-23",
+  "description": "v5.5.5c - Sicherheitsupdate: Docker-Image mit PHP 8.2.35 (CVE-2026-109618, CVE-2026-109619)",
   "update_strategy": "backup_replace_restart_v1",
   "installer_requires": "python3",
   "sanitized_republication": false,

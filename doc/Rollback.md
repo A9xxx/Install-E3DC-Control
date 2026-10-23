@@ -16,6 +16,24 @@ export E3DC_INSTALL_PATH="/absoluter/pfad/zur/installation"
 test -f "$E3DC_INSTALL_PATH/e3dc-setup"
 ```
 
+## Rückfall von 5.5.5c auf 5.5.5b
+
+**Docker:** Auf dem Host in `.env` `E3DC_IMAGE_TAG=v5.5.5b` setzen und
+`sudo docker compose up -d` ausführen; die vorhandenen Daten-Volumes bleiben
+erhalten. Das Image von 5.5.5b enthält PHP 8.2.34 und damit die mit 5.5.5c
+geschlossenen Lücken CVE-2026-109618 und CVE-2026-109619; ein Rückfall ist
+deshalb nur für eine kurze Diagnose sinnvoll.
+
+**Bare Metal:** Der Rückweg ist das beim Update angelegte verifizierte Backup
+(siehe „Betriebsdaten wiederherstellen“). 5.5.5c ändert hier nur die
+Versionsangabe; das PHP des Betriebssystems bleibt beim Rückfall auf dem
+installierten Stand.
+
+**Konfiguration und Betriebsdaten:** 5.5.5c ändert weder Konfiguration noch
+Betriebsdaten.
+
+**Dienste:** 5.5.5c führt keine neuen Dienste oder systemd-Units ein.
+
 ## Rückfall von 5.5.5b auf 5.5.5a
 
 **Docker:** Auf dem Host in `.env` `E3DC_IMAGE_TAG=v5.5.5a` setzen und
@@ -443,7 +461,7 @@ oder einen Prozessabbruch außerhalb des erkannten Fehlerpfads.
 
 ## Programmstand zurücksetzen
 
-Der aktuelle Stable-Stand ist `v5.5.5b`.
+Der aktuelle Stable-Stand ist `v5.5.5c`.
 
 Beim Rücklauf wird der tatsächliche Dateisystemzustand einer Unit weiterhin
 streng gegen reguläre Unit-Datei, kanonische `/dev/null`-Maske, unerwarteten

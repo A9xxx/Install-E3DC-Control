@@ -1,3 +1,29 @@
+# E3DC-Control v5.5.5c
+
+E3DC-Control 5.5.5c ist ein Sicherheitsupdate auf Basis von 5.5.5b. Das Docker-Image enthält PHP mit den Korrekturen für die kritischen Lücken CVE-2026-109618 und CVE-2026-109619 („PHP2Shell“). Die Funktionen sind gegenüber 5.5.5b unverändert.
+
+## Änderungen
+
+- **Docker-Image mit PHP 8.2.35:** Die Lücken erlaubten einem Angreifer ohne Anmeldung, Programmcode auf dem Webserver auszuführen. Das Image von 5.5.5b enthält noch PHP 8.2.34.
+- **Feste Python-Bibliotheken im Image:** Die Bibliotheken sind auf die Versionen von 5.5.5b festgelegt, damit ein Neubau des Images nur die Sicherheitsupdates des Betriebssystems übernimmt.
+
+## Hinweise
+
+- **Installation direkt auf dem Raspberry Pi:** PHP stammt hier aus dem Betriebssystem. Die Lücken schließt ein Systemupdate mit `sudo apt update` und `sudo apt upgrade`, danach `sudo systemctl restart apache2`. Behoben sind sie ab PHP 8.4.27 (Debian 13) bzw. 8.2.35 (Debian 12); `php -v` zeigt die Version. Meldet apt „dpkg was interrupted“, vorher `sudo dpkg --configure -a` ausführen.
+- **Weboberfläche nicht ungeschützt ins Internet:** Für den Zugriff von unterwegs ein VPN nutzen und keine Portfreigabe im Router einrichten.
+
+## Updatehinweise
+
+- **Docker:** Mit eingerichtetem Watchtower über „System Update“, sonst im bestehenden Compose-Ordner auf dem Host mit `sudo docker compose pull` und `sudo docker compose up -d` aktualisieren. Ein fester Pin wird bewusst auf `E3DC_IMAGE_TAG=v5.5.5c` geändert.
+- **Bare Metal:** Wie gewohnt über „System Update“; zusätzlich das Systemupdate wie oben beschrieben.
+- **Von 5.5.5a oder älter:** Das Update führt direkt auf 5.5.5c; die Updatehinweise von 5.5.5b und 5.5.5a gelten weiter.
+
+## Rückfall
+
+Rückfall auf 5.5.5b: Docker in `.env` `E3DC_IMAGE_TAG=v5.5.5b` setzen und `sudo docker compose up -d` ausführen; das Image von 5.5.5b enthält jedoch das verwundbare PHP. Auf Bare Metal ist das beim Update angelegte verifizierte Backup der Rückweg. Einzelheiten stehen in der [Rückfall-Dokumentation](doc/Rollback.md), Abschnitt „Rückfall von 5.5.5c auf 5.5.5b“.
+
+---
+
 # E3DC-Control v5.5.5b
 
 E3DC-Control 5.5.5b ist ein Korrekturupdate auf Basis von 5.5.5a. Wärmepumpe und Heizstab erhalten bei unbekanntem Ladezustand des Hausakkus keine neuen Freigaben mehr, eine laufende Wärmepumpe behält dabei ihre Mindestlaufzeit. Für die E3/DC Multi Connect II lässt sich das Modell auswählen, damit nur noch die Wallbox die Phasen umschaltet. Ohne eigenen Standort nutzt die PV-Prognose eine neutrale Vorgabe.

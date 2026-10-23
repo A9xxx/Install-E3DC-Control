@@ -6,6 +6,24 @@ Dieser Changelog dokumentiert die nutzerrelevante Produktgeschichte aller veröf
 
 Danke an die Community für Rückmeldungen, Praxiserfahrungen und die gemeinsame Weiterentwicklung. Historische Einzelzuordnungen werden in diesem bereinigten Changelog nicht geführt.
 
+## [5.5.5c] – 2026-10-23
+
+Sicherheitsupdate zu 5.5.5b für das Docker-Image. Die Funktionen von E3DC-Control sind gegenüber 5.5.5b unverändert.
+
+### Docker-Image: PHP-Sicherheitsupdate
+
+- Das Docker-Image enthält PHP 8.2.35 aus den Debian-Sicherheitsupdates. Damit sind die kritischen PHP-Lücken CVE-2026-109618 und CVE-2026-109619 („PHP2Shell“) im Image geschlossen; über sie konnte ein Angreifer ohne Anmeldung Programmcode auf dem Webserver ausführen. Das Image von 5.5.5b enthält noch PHP 8.2.34.
+- Die Python-Bibliotheken im Image sind auf die Versionen von 5.5.5b festgelegt. Ein Neubau des Images übernimmt dadurch nur die Sicherheitsupdates des Betriebssystems und ändert die Bibliotheken nicht unbemerkt.
+
+### Installation direkt auf dem Raspberry Pi
+
+- Bei Installationen ohne Docker stammt PHP aus dem Betriebssystem und wird nicht durch E3DC-Control aktualisiert. Die Lücken schließt ein Systemupdate: `sudo apt update` und `sudo apt upgrade`, danach `sudo systemctl restart apache2`. Behoben sind sie ab PHP 8.4.27 (Debian 13) bzw. 8.2.35 (Debian 12); prüfen lässt sich das mit `php -v`. Meldet apt „dpkg was interrupted“, vorher `sudo dpkg --configure -a` ausführen.
+- Das Update auf 5.5.5c ändert bei diesen Installationen nur die Versionsangabe.
+
+### Grenzen
+
+- Keine funktionale Änderung gegenüber 5.5.5b; die dort und in 5.5.5a genannten Grenzen gelten weiter.
+
 ## [5.5.5b] – 2026-10-19
 
 Korrekturupdate zu 5.5.5a: Wärmepumpe und Heizstab bei unbekanntem Ladezustand des Hausakkus, Modellauswahl für die E3/DC Multi Connect II und eine neutrale Standortvorgabe für die PV-Prognose.
